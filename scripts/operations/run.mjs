@@ -23,6 +23,12 @@
  * derived from the declaration — including which operations have a juror to point at a lane at all.
  */
 
+import { appendEntry } from './ruled-weakened-store.mjs';
+import { ruledWeakenedAddOperation, RULED_WEAKENED_ADD_OP, RULED_WEAKENED_ADD_EFFECT, finishRuledWeakenedAdd } from './ruled-weakened-add.mjs';
+import { OPERATOR_OVERRIDE_OPS, OPERATOR_OVERRIDE_EFFECT, operatorOverrideOperation } from './operator-override.mjs';
+import { lastOverrideReason, readOperatorOverrides, writeOperatorOverride, clearOperatorOverride } from '../lib/operator-override-store.mjs';
+import { aiRoutingOperation, AI_ROUTING_OP, finishAiRouting } from './ai-routing.mjs';
+import { resolveAiRouting, aiRoutingInputs, AI_ROUTING_ROLES } from '../lib/ai-routing.mjs';
 import { routingOverrideOperation, ROUTING_OVERRIDE_OP } from './routing-override.mjs';
 import { createRoutingOverrideSinks } from './routing-override-file.mjs';
 import { execFileSync } from 'node:child_process';
@@ -31,7 +37,7 @@ import { readLatestDecisions } from '../conveyor/health-responder-state.mjs';
 import { healthRespondOperation, HEALTH_RESPOND_OP } from './health-respond.mjs';
 import { resolve, join, dirname } from 'node:path';
 import { readFileSync } from 'node:fs';
-import { loadavg } from 'node:os';
+import { loadavg, userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 import { operatorSessionBootstrapOperation, finishBootstrap } from './operator-session-bootstrap.mjs';
@@ -89,6 +95,13 @@ import { resourceStatusOperation, RESOURCE_STATUS_OP, finishResourceStatus } fro
 import { readSnapshot, loadResourcePolicy, resourcePaths, appendResourceLog } from '../lib/resource-admission.mjs';
 import { workerCapacityOperation, finishWorkerCapacity, WORKER_CAPACITY_OP } from './worker-capacity.mjs';
 import { resolveWorkerCapacitySettings } from '../lib/worker-capacity.mjs';
+import { deliveryCapacityOperation, finishDeliveryCapacity, DELIVERY_CAPACITY_OP } from './delivery-capacity.mjs';
+import { DELIVERY_CAPACITY_OVERRIDE_OPS, DELIVERY_CAPACITY_OVERRIDE_EFFECT, deliveryCapacityOverrideOperation } from './delivery-capacity-override.mjs';
+import { createDeliveryCapacityTune } from './delivery-capacity-tune-shell.mjs';
+import { resolveDeliveryCapacity, assessCapacity } from '../lib/delivery-capacity.mjs';
+import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
+import { ghRepoSlug, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
+import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 import { prePrCheckOperation, PRE_PR_CHECK_OP, finishPrePrCheckOutcome } from './pre-pr-check.mjs';
 import { createPrePrCheckReader } from './pre-pr-check-io.mjs';
@@ -141,6 +154,8 @@ import { verifyOperation, VERIFY_OP } from './verify.mjs';
 import { createChecksRunner } from './verify-io.mjs';
 import { prSizeOperation, PR_SIZE_OP, finishPrSize } from './pr-size.mjs';
 import { createPrSizeReader } from './pr-size-io.mjs';
+import { deliveryFlowOperation, DELIVERY_FLOW_OP, finishDeliveryFlow } from './delivery-flow.mjs';
+import { createDeliveryFlowReader } from './delivery-flow-io.mjs';
 import { mutationCheckOperation, MUTATION_CHECK_OP, revertRedCheckOperation, REVERT_RED_CHECK_OP } from './mutation-check.mjs';
 import { createMutationCheckSinks, createRevertRedCheckSinks } from './mutation-check-io.mjs';
 import { exploreOperation, EXPLORE_OP } from './explore.mjs';
@@ -227,7 +242,35 @@ export function finishCodexAudit({ run, code, lines, json }) {
 }
 
 
+export const CLI_ONLY_OPERATIONS = Object.freeze({
+  [RULED_WEAKENED_ADD_OP]: () => ({ declaration: ruledWeakenedAddOperation(),
+    sinks: { [RULED_WEAKENED_ADD_EFFECT]: entry => appendEntry(entry) }, finish: finishRuledWeakenedAdd }),
+  ...Object.fromEntries(OPERATOR_OVERRIDE_OPS.filter(name => name !== 'operator-override-show').map(name => [name, () => ({
+    declaration: operatorOverrideOperation(name, { readOverrides: () => readOperatorOverrides() }),
+    sinks: {
+      [OPERATOR_OVERRIDE_EFFECT]: ({ clear, ...input }) => (clear ? clearOperatorOverride : writeOperatorOverride)(input),
+    },
+  })])),
+  ...Object.fromEntries(DELIVERY_CAPACITY_OVERRIDE_OPS.map(name => [name, () => ({
+    declaration: deliveryCapacityOverrideOperation(name),
+    sinks: {
+      [DELIVERY_CAPACITY_OVERRIDE_EFFECT]: ({ writes, clears, reason }) => {
+        const actor = userInfo().username;
+        for (const { key, value } of writes) writeOperatorOverride({ key, value, reason, actor });
+        for (const key of clears) clearOperatorOverride({ key, reason, actor });
+        return { writes, clears };
+      },
+    },
+  })])),
+});
+
 export const OPERATIONS = Object.freeze({
+  [AI_ROUTING_OP]: () => ({ declaration: aiRoutingOperation({ collect: () => {
+    const routing = resolveAiRouting();
+    return { settings: routing.value, sources: routing.sources, invalid: routing.invalid,
+      inputs: Object.fromEntries(AI_ROUTING_ROLES.map(role => [role, aiRoutingInputs(role, routing)])) };
+  } }), sinks: {}, finish: finishAiRouting }),
+  'operator-override-show': () => ({ declaration: operatorOverrideOperation('operator-override-show', { readOverrides: () => readOperatorOverrides() }), sinks: {} }),
   [ROUTING_OVERRIDE_OP]: () => ({ declaration: routingOverrideOperation(), sinks: createRoutingOverrideSinks() }),
   [MANUAL_DAEMON_PASS_OP]: () => ({ declaration: manualDaemonPassOperation(), sinks: createManualDaemonPassSinks() }),
   [PR_TRACE_OP]: () => ({ declaration: prTraceOperation({ readFacts: createPrTraceReader() }), sinks: {}, finish: finishPrTrace }),
@@ -271,7 +314,7 @@ export const OPERATIONS = Object.freeze({
     // normally instead of this builder aborting resolveOperation with the root usage.
     let savedRun = null;
     if (resumeId) { try { savedRun = createFileRunStore().read(resumeId); } catch { savedRun = null; } }
-    const seatSettings = loadReviewSeatSettings();
+    const seatSettings = loadReviewSeatSettings({ aiRouting: aiRoutingInputs('review', resolveAiRouting()).coordinator });
     const live = { codexAdvisory: codexAdvisoryFromEnv(), correctnessAdvisory: correctnessAdvisoryFromEnv(),
       antigravityReview: antigravityReviewFromEnv() };
     // A saved run keeps the roster it started with at every cursor position (`reviewSeatOptionsForRun`).
@@ -306,6 +349,11 @@ export const OPERATIONS = Object.freeze({
   [PR_SIZE_OP]: () => ({
     declaration: prSizeOperation({ readDiff: createPrSizeReader() }),
     finish: finishPrSize,
+  }),
+  [DELIVERY_FLOW_OP]: () => ({
+    declaration: deliveryFlowOperation({ readFlow: createDeliveryFlowReader() }),
+    sinks: {},
+    finish: finishDeliveryFlow,
   }),
   // #x4omld5 — put the bug back and prove the guard goes red. UNLIKE `verify` above it has a SINK, and that
   // is deliberate: its probe writes to a source file, so declaring the transaction as an `effect` keeps the
@@ -482,6 +530,51 @@ export const OPERATIONS = Object.freeze({
     } }),
     sinks: {},
     finish: finishWorkerCapacity({ log: (row) => appendResourceLog(join(dirname(resourcePaths().history), 'worker-capacity-shadow.jsonl'), row) }),
+  }),
+  [DELIVERY_CAPACITY_OP]: () => ({
+    declaration: deliveryCapacityOperation({ collect: () => {
+      const policy = resolveDeliveryCapacity();
+      const fields = 'number,headRefName,body,labels,files,additions,deletions,updatedAt';
+      const repo = ghRepoSlug(DEFAULT_REPO_KEY);
+      const failures = [];
+      let prs = null;
+      let host = null;
+      let incomplete = false;
+      try { prs = readSharedOpenPrs({ repo, fields }); }
+      catch { failures.push('shared PR reader failed'); }
+      if (prs === null) {
+        try {
+          prs = JSON.parse(String(execFileSyncThrottled('gh', ['pr', 'list', '--repo', repo,
+            '--state', 'open', '--limit', '200', '--json', fields],
+          { encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] })));
+          incomplete = Array.isArray(prs) && prs.length >= 200;
+          if (!Array.isArray(prs) || incomplete) failures.push('PR list unreadable or at 200-PR limit; inspect full population');
+        } catch { failures.push('open PR collection failed'); }
+      }
+      try {
+        const probe = (file, args) => String(execFileSync(file, args,
+          { encoding: 'utf8', timeout: 5000, maxBuffer: 262144, stdio: ['ignore', 'pipe', 'pipe'] }));
+        const top = probe('top', ['-l', '2', '-s', '1', '-n', '0']);
+        const idle = [...top.matchAll(/CPU usage:.*?([\d.]+)% idle/g)].at(-1);
+        const vm = probe('vm_stat', []);
+        const pageSize = /page size of (\d+)/.exec(vm);
+        const free = /Pages free:\s*(\d+)/.exec(vm);
+        const inactive = /Pages inactive:\s*(\d+)/.exec(vm);
+        if (!idle || !pageSize || !free || !inactive) throw new Error('incomplete host evidence');
+        host = { idlePct: Number(idle[1]), memGb: (Number(free[1]) + Number(inactive[1])) * Number(pageSize[1]) / 2 ** 30 };
+        if (!Number.isFinite(host.idlePct) || !Number.isFinite(host.memGb)) throw new Error('invalid host evidence');
+      } catch { failures.push('host CPU/memory collection failed; inspect top/vm_stat'); }
+      let overrides = { readable: false, values: {} };
+      try {
+        overrides = { ...readOperatorOverrides(), holdReason: lastOverrideReason('deliveryCapacity.holdUntil') };
+      } catch { /* unreadable stays fail-closed */ }
+      const result = assessCapacity({ prs, host, policy, incomplete, overrides,
+        ...(failures.length ? { fallbackReason: `${failures.join('; ')}; count-mode fallback` } : {}) });
+      // Reads never write: an expired override is ignored and shown in the readout until the next hold, pin or clear.
+      return result;
+    } }),
+    sinks: {},
+    finish: (args) => finishDeliveryCapacity(args, { tune: createDeliveryCapacityTune() }),
   }),
   // xcbwt4r — "is this lane's head gated by the pre-PR review, and what do I run?". Read-only (every step is
   // `compute`, so no sinks); the real `checkPrePrReview` read is bound here, and ONLY here.
@@ -755,7 +848,8 @@ export function resolveOperation(name, opts = {}) {
   // `Object.hasOwn`, never a bare bracket read: `OPERATIONS['toString']` on a normal-prototype object returns an
   // INHERITED function, which a `typeof … === 'function'` test then accepts as a real operation. Same hazard the
   // jury enums guard with null-prototype tables (`we:scripts/lib/jury-core.mjs`, #xdompzx).
-  const build = Object.hasOwn(OPERATIONS, String(name ?? '')) ? OPERATIONS[name] : undefined;
+  const table = opts.cli === true ? { ...OPERATIONS, ...CLI_ONLY_OPERATIONS } : OPERATIONS;
+  const build = Object.hasOwn(table, String(name ?? '')) ? table[name] : undefined;
   if (typeof build !== 'function') {
     throw new Error(
       `operations: no operation named ${JSON.stringify(name)} (known: ${Object.keys(OPERATIONS).sort().join(', ')})`
@@ -778,7 +872,7 @@ export function rootUsage() {
   return [
     'usage: run.mjs <operation> [--flags]',
     '',
-    `operations: ${Object.keys(OPERATIONS).sort().join(', ')}`,
+    `operations: ${Object.keys({ ...OPERATIONS, ...CLI_ONLY_OPERATIONS }).sort().join(', ')}`,
     '',
     'Run `run.mjs <operation> --help` for an operation\'s flags — they are derived from its declaration.',
   ].join('\n');
@@ -820,6 +914,8 @@ const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLTo
 if (IS_CLI) {
   const [name, ...rest] = process.argv.slice(2);
   if (name === 'worker-pause') { const { main: pause } = await import('./worker-pause.mjs'); const pauseCode = pause(rest); process.exit(pauseCode); } // R480: tiny flag CLI, not a run-record operation
+  if (name === 'await-checks') { const { main } = await import('./await-checks.mjs'); const code = main(rest); process.exit(code); } // worker CI wait (guard-bash refuses raw --watch)
+  if (name === 'await') { const { main } = await import('./await.mjs'); const code = main(rest); process.exit(code); }
   if (!name || name === '--help' || name === '-h') {
     writeAllSync(1, `${rootUsage()}\n`);
     process.exit(name ? 0 : 2);
@@ -836,7 +932,7 @@ if (IS_CLI) {
     const resumeId = name === REVIEW_PR_OP
       ? rest.findLast((a) => a === '--resume' || a.startsWith('--resume='))?.slice('--resume='.length) : undefined;
     controlPolicy = rest.includes('--help') ? { zeroWrites: false, memoryStore: false } : operatorControlCliPolicy(name, rest);
-    resolved = resolveOperation(name, { preview: controlPolicy.zeroWrites, json: hasJsonFlag(rest), cwd: cwdFlagValue(rest), resumeId });
+    resolved = resolveOperation(name, { cli: true, preview: controlPolicy.zeroWrites, json: hasJsonFlag(rest), cwd: cwdFlagValue(rest), resumeId });
   } catch (e) {
     writeAllSync(1, `error: ${String(e.message ?? e)}\n\n${rootUsage()}\n`);
     process.exit(2);
@@ -851,7 +947,7 @@ if (IS_CLI) {
   try {
     cliPreflight(name);
     assertRunnerFreshness({ declaration, moduleUrl: import.meta.url,
-      zeroWrites: controlPolicy.zeroWrites || [PR_TRACE_OP, ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP].includes(name) });
+      zeroWrites: controlPolicy.zeroWrites || [DELIVERY_FLOW_OP, PR_TRACE_OP, ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP].includes(name) });
   } catch (e) {
     writeAllSync(2, `${String(e?.message ?? e)}\n`);
     process.exit(1);
@@ -861,7 +957,7 @@ if (IS_CLI) {
   const controlPreview = controlPolicy.memoryStore;
   const cliStores = controlPreview ? { store: createMemoryRunStore(), callLog: undefined }
     : name === RUNNER_ACTIVITY_OP ? createRunnerActivityCliStores()
-    : [PR_TRACE_OP, ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP, PR_SIZE_OP].includes(name) ? { store: createMemoryRunStore(), callLog: undefined }
+    : [DELIVERY_FLOW_OP, PR_TRACE_OP, ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP, PR_SIZE_OP].includes(name) ? { store: createMemoryRunStore(), callLog: undefined }
     : { store: createFileRunStore(), callLog: createFileCallLogStore() };
   runOperationCli({
     declaration,

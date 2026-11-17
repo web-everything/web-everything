@@ -2,6 +2,8 @@
 import { RED_TEAM_STATUS_LABELS, syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { readDrainRedTeamEvidence, redTeamStatusDir, settleUnknownEvidenceByComment } from '../lib/drain-red-team-evidence.mjs';
 import { needsPublish, publishStoredRedTeamResult } from '../lib/red-team-withheld-publish.mjs';
+import { redTeamCarrySources } from '../lib/red-team-gate.mjs';
+import { readSealedStatus } from '../lib/red-team-sealed-status.mjs';
 /**
  * @file scripts/conveyor/advisory-label-sweep.mjs
  * @description THE `advisory:*` STALENESS SWEEP — drops `advisory:accepted` / `advisory:changes` from any open PR
@@ -157,6 +159,7 @@ export function defaultListUnpublishedStatuses({ dir = redTeamStatusDir() } = {}
 export function sweepAdvisoryLabels({
   repo = null, listPrs = defaultListPrs, readPr = defaultReadPr, provider = createGhProvider(), dryRun = false, readStatusEvidence = readDrainRedTeamEvidence,
   publishStored = publishStoredRedTeamResult, listUnpublishedStatuses = defaultListUnpublishedStatuses,
+  readSeal = key => readSealedStatus({ ...key, env: process.env }),
   log = line => process.stderr.write(`${line}\n`),
 } = {}) {
   const prs = listPrs({ repo });
@@ -197,9 +200,35 @@ export function sweepAdvisoryLabels({
           publication.publishStatus = published.status;
           if (['retry', 'failed'].includes(published.status)) log(`red-team publication #${pr.number}: ${published.status}`);
           if (published.status === 'posted') comments = provider.readComments(resolvedRepo, pr.number);
+          // The publish just wrote the status (a seal, a hold): plan from what is stored NOW, not the pre-publish snapshot (PR #6622).
+          if (published.status !== 'skipped') {
+            try { evidence = readStatusEvidence({ repo: resolvedRepo, pr: pr.number, head: live.headRefOid }); } catch { /* the planner re-reads the stored seal itself */ }
+          }
         } catch (e) {
           publication.publishError = String(e?.message ?? e).replace(/[\p{Cc}\p{Cf}]/gu, ' ').slice(0, 300);
           log(`red-team publication #${pr.number}: ${publication.publishError}`);
+        }
+      }
+      // A carried result holds on the seal of the head it came from, and only the live head is published above: seal
+      // those source heads too (seal only, nothing posted for a superseded head), or the carried head holds forever.
+      if (!dryRun) {
+        for (const from of redTeamCarrySources({ comments, pr: pr.number, head: live.headRefOid })) {
+          try {
+            // Pick by the READER's own view of the raw status file (never the run-evidence summary, which can omit a status
+            // that exists): the heads every reader holds as unsealed, and the sealed heads still carrying the legacy hold
+            // flag (only the publisher lifts it, once the thread agrees with the seal, so a corrected comment must be
+            // re-compared every pass or the carried head holds forever). The publisher re-reads the file under its lock.
+            const seal = readSeal({ repo: resolvedRepo, pr: pr.number, head: from });
+            if (seal?.unsealed !== true && seal?.legacyHold !== true) continue;
+            const sealed = publishStored({ status: { repo: resolvedRepo, pr: pr.number, head: from }, sealOnly: true,
+              // The thread this pass already read in full (re-read after a post): no extra GitHub call per held source,
+              // and the sources are compared on the same snapshot the planner reads.
+              listComments: () => comments,
+              postComment: () => { throw Error('a seal-only pass never posts'); } });
+            if (sealed.status !== 'skipped') (publication.sourceSeals ??= []).push(`${from.slice(0, 9)}:${sealed.status}`);
+          } catch (e) {
+            log(`red-team source seal #${pr.number}@${from.slice(0, 9)}: ${String(e?.message ?? e).replace(/[\p{Cc}\p{Cf}]/gu, ' ').slice(0, 200)}`);
+          }
         }
       }
       evidence = settleUnknownEvidenceByComment(evidence, comments, pr.number, live.headRefOid, live.reviews);

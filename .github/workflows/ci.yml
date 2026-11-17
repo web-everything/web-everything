@@ -46,8 +46,8 @@ on:
     branches: [main, 'lane/**']  # lane/**: a GitHub-stacked PR runs its own required checks while its base is open (stack.reviewWhileBaseOpen)
   # GitHub merge queue (merge-delivery strategy `github-merge-queue`): the required checks `test`, `smoke` and
   # `daemon-soak` re-run on each merge-group commit (main + the entries ahead + this PR). Check names unchanged so
-  # the ruleset requires the same names. A merge_group is never card-only-light (ci-card-only.mjs: not a
-  # pull_request) and always runs the full soak (daemon-soak-scope: not a pull_request ⇒ run=true).
+  # the ruleset requires the same names. A merge_group can be light for a validated cards-only diff,
+  # and always runs the full soak (daemon-soak-scope: not a pull_request ⇒ run=true).
   merge_group:
   workflow_dispatch:
 
@@ -64,8 +64,8 @@ jobs:
   # CARD-ONLY LIGHT PATH (actions-queue-relief, 2026-10-03). A PR that changes only `backlog/**` runs the
   # independent `standards` job's `check:standards` (the backlog/card guards) but NOT the unit shards, coverage merge,
   # integration suite, docs build or Playwright lane. Detection is `scripts/ci-card-only.mjs` (tested):
-  # light ONLY for a `pull_request` whose every changed path is under `backlog/`; a push to main, a manual
-  # dispatch, an empty diff, or any other path is the full suite. Fail closed: if this job fails, `light` is
+  # PRs permit cards/docs; merge_group permits only cards against its validated ancestor base.
+  # A push to main, manual dispatch, empty or unreadable diff runs the full suite. Fail closed: if this job fails, `light` is
   # empty (not 'true'), and `test` / `smoke` below fail on `needs.changes.result != 'success'`.
   #
   # REQUIRED CHECKS STILL REPORT FROM REAL RUNNING JOBS: `test` and `smoke` keep running as jobs (they do
@@ -82,6 +82,7 @@ jobs:
         with:
           fetch-depth: 50
       - name: Is this a card-only PR?
+        timeout-minutes: 4
         id: detect
         # FRESH MAIN BASIS (#5619): the event's base.sha can be frozen far behind main, so for a main-targeted PR
         # the detector diffs from the merge base with the main tip fetched IN THIS RUN. Event values arrive via
@@ -90,11 +91,15 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           FRESH_MAIN_SHA=""
+          if [ "$EVENT_NAME" = "merge_group" ]; then
+            BASE_SHA="$MG_BASE_SHA"
+          fi
           if [ "$BASE_REF" = "main" ]; then
-            if git fetch --no-tags --filter=blob:none --depth=1000000 origin '+refs/heads/main:refs/remotes/origin/main'; then
+            if sh scripts/ci/fetch-main-history.sh; then
               FRESH_MAIN_SHA=$(git rev-parse --verify --end-of-options 'refs/remotes/origin/main^{commit}') || FRESH_MAIN_SHA=""
             else
               echo "ci-card-only: main fetch failed; full suite" >&2
@@ -121,8 +126,9 @@ jobs:
           path: web-everything
           fetch-depth: 50 # backlog scope guards compare the PR against origin/main
       - name: Fetch main history (blobless)
+        timeout-minutes: 4
         working-directory: web-everything
-        run: git fetch --no-tags --filter=blob:none --depth=1000000 origin +refs/heads/main:refs/remotes/origin/main
+        run: sh scripts/ci/fetch-main-history.sh
       - name: Mint FUI read token (GitHub App)
         id: fui-app-token
         if: vars.WE_APP_ID != ''
@@ -213,9 +219,10 @@ jobs:
           path: web-everything
           fetch-depth: 50 # live-git tests use the HEAD window; main's full history comes from the blobless fetch below
       - name: Fetch main history (blobless)
+        timeout-minutes: 4
         if: ${{ needs.changes.outputs.light != 'true' }}
         working-directory: web-everything
-        run: git fetch --no-tags --filter=blob:none --depth=1000000 origin +refs/heads/main:refs/remotes/origin/main
+        run: sh scripts/ci/fetch-main-history.sh
       - name: Mint FUI read token (GitHub App)
         id: fui-app-token
         if: ${{ needs.changes.outputs.light != 'true' && (vars.WE_APP_ID != '') }}
@@ -440,9 +447,10 @@ jobs:
           path: web-everything
           fetch-depth: 50
       - name: Fetch main history (blobless)
+        timeout-minutes: 4
         if: ${{ steps.gate.outputs.run == 'true' }}
         working-directory: web-everything
-        run: git fetch --no-tags --filter=blob:none --depth=1000000 origin +refs/heads/main:refs/remotes/origin/main
+        run: sh scripts/ci/fetch-main-history.sh
       - name: Mint FUI read token (GitHub App)
         id: fui-app-token
         if: vars.WE_APP_ID != ''
@@ -535,7 +543,8 @@ jobs:
         with:
           fetch-depth: 50
       - name: Fetch main history (blobless)
-        run: git fetch --no-tags --filter=blob:none --depth=1000000 origin +refs/heads/main:refs/remotes/origin/main
+        timeout-minutes: 4
+        run: sh scripts/ci/fetch-main-history.sh
 
       - name: Check soak scope safeguards (Node builtins only)
         run: node scripts/conveyor/soak/soak-scope.mjs --self-test
@@ -588,7 +597,8 @@ jobs:
           # (below); quarantine-skip deepens further, or fails closed (runs everything), if the base is unprovable.
           fetch-depth: 50
       - name: Fetch main history (blobless)
-        run: git fetch --no-tags --filter=blob:none --depth=1000000 origin +refs/heads/main:refs/remotes/origin/main
+        timeout-minutes: 4
+        run: sh scripts/ci/fetch-main-history.sh
 
       - uses: actions/setup-node@v4
         with:
@@ -656,6 +666,10 @@ jobs:
     # 3x146s≈7.3min, rounded up to 10min.
     # Raised 10->20: today's cancellations at the 10m limit (#6005 merge group 00:16-00:26Z; #5980 10m19s).
     timeout-minutes: 20
+    # Version-locked Playwright container (same pin as the `visual` job; `npm run check:standards` fails
+    # loud on drift from `@playwright/test`): browsers + system libs are pre-installed, so no apt at run time.
+    container:
+      image: mcr.microsoft.com/playwright:v1.58.1-jammy
     steps:
       - name: Gate on card-only detection
         run: |
@@ -724,29 +738,12 @@ jobs:
         working-directory: web-everything
         run: npm run build:docs
 
-      # Cache the Playwright browser bundle keyed on the installed @playwright/test version, so the ~19s
-      # `playwright install` only re-downloads chromium when the version actually changes. `--with-deps`
-      # (apt system libs) still runs each time — those aren't cacheable across runners — but the browser
-      # download, the bulk of the cost, is served from cache on a hit.
-      - name: Resolve Playwright version
-        if: ${{ needs.changes.outputs.light != 'true' }}
-        id: pw
-        working-directory: web-everything
-        run: echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
-      - name: Cache Playwright browsers
-        if: ${{ needs.changes.outputs.light != 'true' }}
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
-
       # Deterministic Playwright interaction lane (#2070): drives the client-side backlog-table behaviour
       # over a fixed fixture page served by tests/interaction/serve.mjs. WE_INTERACTION_ONLY skips the app
       # dev-server webServer entry (see playwright.config.ts) so no build/live-data is needed.
-      - name: Install Playwright chromium
-        if: ${{ needs.changes.outputs.light != 'true' }}
-        working-directory: web-everything
-        run: npx playwright install --with-deps chromium
+      # No "Install Playwright chromium" step: the pinned container (see `container:` above) already ships
+      # chromium at the exact `@playwright/test` version, so smoke no longer runs `apt` / depends on the
+      # Ubuntu mirror (every merge-queue batch failed on azure.archive.ubuntu.com resolution).
 
       - name: Interaction lane
         if: ${{ needs.changes.outputs.light != 'true' }}

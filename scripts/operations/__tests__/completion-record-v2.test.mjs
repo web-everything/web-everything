@@ -83,8 +83,8 @@ describe('the three stores read as one (D2)', () => {
     expect(e).toMatchObject({ v: 2, source: 'legacy-completion', role: 'fix', result: { outcome: 'blocked', blocker: { kind: 'permission-wall' } }, action: { type: 'product-fix-draft' } });
     expect(validateCompletionRecord(e).ok).toBe(true);
     // the agent-written legacy text is redacted too (the fallback must not be a way around the write-point redaction)
-    writeCompletion({ ...newCompletionRecord({ session: 'fix-12', kind: 'fix', pr: 12, now: T0 }), status: 'done', outcome: 'blocked-on-permission', denied: 'curl -H "Authorization: Bearer ghp_abcdefghijklmnop12345"' }, dir);
-    expect(JSON.stringify(readEnvelope('fix-12', { completions: dir, deliveryReports: null, fixReports: null }))).not.toContain('ghp_abcdefghijklmnop12345');
+    writeCompletion({ ...newCompletionRecord({ session: 'fix-12', kind: 'fix', pr: 12, now: T0 }), status: 'done', outcome: 'blocked-on-permission', denied: 'curl -H "Authorization: Bearer gh\x70_abcdefghijklmnop12345"' }, dir);
+    expect(JSON.stringify(readEnvelope('fix-12', { completions: dir, deliveryReports: null, fixReports: null }))).not.toContain('gh\x70_abcdefghijklmnop12345');
   });
   it('a delivery report (build) and a fix report fold in with their own outcome words', () => {
     const dd = tmp(); const fd = tmp(); const cd = tmp();

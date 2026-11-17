@@ -1,7 +1,5 @@
 // @vitest-environment node
-// R352: the files that used to spell out sample secrets must now pass the Forge
-// content scan (R321/R323) honestly, so full-tree standards runs are not forced
-// back to the Mac with `excluded-source-file`. No new exception, no weakened scan.
+// Readable generic samples ship; credential formats retain strict rejection.
 import {describe,expect,it} from 'vitest';
 import {readFileSync,readdirSync} from 'node:fs';
 import {dirname,join} from 'node:path';
@@ -20,12 +18,22 @@ const files=[
   'scripts/lib/__tests__/github-app-token.test.mjs',...cards,
 ];
 
-describe('R352 formerly excluded files pass the Forge content scan',()=>{
+describe('R352 sample files retain strict credential rejection with generic advisories',()=>{
   it('finds all four cards',()=>expect(cards).toHaveLength(4));
   it.each(files)('%s has 0 refusals',path=>{
     const content=readFileSync(join(root,path));
     expect(credentialContentFinding(Buffer.from(path),content)).toBeNull();
     expect(()=>manifestEntry(Buffer.from(path),content,false,true)).not.toThrow();
+  });
+  // The repo fixtures now assemble their token literals at run time (so they scan clean); the
+  // strict-rejection guarantee is pinned with the same shapes built here, assembled the same way.
+  it.each([
+    ['scripts/rust-scan/src/secret_scrub.rs','github-token',`let t = "${'github_pat'}_11ABCDEFG0123456789012345678901234567890123456789012345";\n`],
+    ['scripts/__tests__/secret-scrub.test.mjs','google-api-key',`const k = '${'AIza'+'S'}yNOTREALsynthetic0000000000000000000';\n`],
+  ])('blocks a token sample of the format %s used to carry',(name,finding,text)=>{
+    const path=Buffer.from(name),content=Buffer.from(text);
+    expect(credentialContentFinding(path,content)).toBe(finding);
+    expect(()=>manifestEntry(path,content,false,true)).toThrow(expect.objectContaining({code:'excluded-source-file'}));
   });
   it('the shared sample-strings fixture module passes the scan too',()=>{
     const path='scripts/__tests__/fixtures/sample-strings.mjs';

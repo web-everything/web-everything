@@ -144,9 +144,9 @@
  *     fresh resource snapshot permits it. Status and release scan every slot that scaling may hand out.
  */
 import '../lib/tools-root-guard.mjs';
-import { constants, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync, renameSync } from 'node:fs';
+import { constants, existsSync, mkdirSync, mkdtempSync, rmdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync, renameSync } from 'node:fs';
 import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
-import { execSync, execFile } from 'node:child_process';
+import { execSync, execFile, spawn } from 'node:child_process';
 import { hostname, homedir, userInfo, loadavg, cpus, constants as osConstants } from 'node:os';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
@@ -175,7 +175,7 @@ import {
 import { routeNeedsGit } from './needs-git-route.mjs';
 import { capabilityBundleVerdict, capabilityRecord } from './remote-git-bundle.mjs'; // R501: test files that spawn git cannot run on Forge's .git-less snapshot
 import { recordRemoteRun } from '../lib/forge-share.mjs'; // R501: the one durable remote-success row forgeShare reads
-import { createMarkerReaper, markerContent, recordMarkerRun, blockedSlots, heldTombstone } from './forge-slot-markers.mjs';
+import { createMarkerReaper, markerContent, recordMarkerRun, blockedSlots, heldTombstone, runVerdict } from './forge-slot-markers.mjs';
 import { classifyWaiterPriority, waiterPriorityClass, validRepairPatterns, DEFAULT_REPAIR_PATTERNS, ADMISSION_PRIORITY_MODES } from './heavy-repair-priority.mjs'; // red-main repair class — kept out of the projection (which the read-only `heavy-queue` op imports) because it needs `node:vm`
 export * from './heavy-queue-projection.mjs';
 export * from './heavy-repair-priority.mjs';
@@ -240,6 +240,7 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
   // heavy-run-wait — how long `run` keeps re-trying admission (load gate + slot queue) before exiting 75. 0 = today's
   // behavior (defer at once on host load). Per caller: it only bounds this caller's own wait, never shared capacity.
   runWaitMs: 0,
+  wholeSuite: 'allow',
   fastScale: Object.freeze({ maxSlots: null, minShortWaiters: 3, minShortShare: 0.6, minCpuIdlePct: 30, maxMemPressureLevel: 1 }),
   // main-fix-queue-priority — a red-main repair waiter (P0) is admitted to the next free slot ahead of all others.
   priority: Object.freeze({ mode: 'enforce', repairPatterns: DEFAULT_REPAIR_PATTERNS }),
@@ -251,7 +252,10 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
     elasticSlots: Object.freeze({ enabled: true }), autoSlotUnits: 3, backoffMs: 120000, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15,
     // R475: raise a health event (coroner trigger) when >= stuckMinSlots dead-owner unconfirmed slots are older than stuckAgeMs,
     // or when a slot is kept because the Forge probe was unknown; at most one event per kind per stuckSignalEveryMs.
-    stuckMinSlots: 2, stuckAgeMs: 600000, stuckSignalEveryMs: 600000 }),
+    stuckMinSlots: 2, stuckAgeMs: 600000, stuckSignalEveryMs: 600000,
+    // forge-busy-wait: a Forge `forge-busy` rejection waits (backoff between tries, no local slot held) up to busyWaitMs
+    // before falling back to the Mac. 0 = old behaviour. A busy Forge is not a health failure, so it never arms the backoff window.
+    busyWaitMs: 600000, busyBackoffMs: 45000 }),
 });
 
 /** Upper bound on a `run --wait-ms` budget (24h): a typo must not turn into an unbounded wait. */
@@ -269,6 +273,7 @@ const admissionInt = (min) => (v) => Number.isInteger(v) && v >= min && v <= ADM
 const ADMISSION_VALID = {
   cap: admissionInt(1), fastSlots: admissionInt(0), onTimeout: (v) => v === 'defer' || v === 'run',
   runWaitMs: (v) => isValidRunWaitMs(v),
+  wholeSuite: (v) => v === 'refuse' || v === 'allow',
   'fastScale.maxSlots': (v) => v === null || admissionInt(0)(v),
   'fastScale.minShortWaiters': admissionInt(1),
   'fastScale.minShortShare': (v) => Number.isFinite(v) && v >= 0 && v <= 1,
@@ -294,19 +299,22 @@ const ADMISSION_VALID = {
   'remote.stuckMinSlots': admissionInt(1),
   'remote.stuckAgeMs': isValidRunWaitMs,
   'remote.stuckSignalEveryMs': isValidRunWaitMs,
+  'remote.busyWaitMs': isValidRunWaitMs,
+  'remote.busyBackoffMs': (v) => isValidRunWaitMs(v) && v >= 1000,
 };
 const ADMISSION_ENV = {
   cap: 'WE_HEAVY_ADMISSION_CAP', fastSlots: 'WE_HEAVY_ADMISSION_FAST_SLOTS', onTimeout: 'WE_HEAVY_ADMISSION_ON_TIMEOUT',
   runWaitMs: 'WE_HEAVY_ADMISSION_RUN_WAIT_MS',
+  wholeSuite: 'WE_HEAVY_ADMISSION_WHOLE_SUITE',
   'priority.mode': 'WE_HEAVY_ADMISSION_PRIORITY', 'priority.repairPatterns': 'WE_HEAVY_ADMISSION_REPAIR_PATTERNS',
 };
-/** Leaves that only shape this caller's timeout response, never shared capacity or queue ordering. */
-const PER_CALLER_LEAVES = new Set(['onTimeout', 'runWaitMs']);
+/** Leaves that shape this caller's execution policy, never shared capacity or queue ordering. */
+const PER_CALLER_LEAVES = new Set(['onTimeout', 'runWaitMs', 'wholeSuite']);
 /** Env text → a leaf value: a JSON array (or one bare pattern) for the repair patterns, lower-case for words. */
 function parseAdmissionEnv(leaf, raw) {
   const s = String(raw).trim();
   if (leaf === 'priority.repairPatterns') { if (!s.startsWith('[')) return s ? [s] : NaN; try { return JSON.parse(s); } catch { return NaN; } }
-  if (leaf === 'onTimeout' || leaf === 'priority.mode') return s.toLowerCase();
+  if (leaf === 'onTimeout' || leaf === 'priority.mode' || leaf === 'wholeSuite') return s.toLowerCase();
   return s === '' ? NaN : Number(s);
 }
 const admissionObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -467,12 +475,288 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
 }
 
 export function formatAdmissionPolicy({ settings, sources, ignored = [], invalid = [] }) {
-  const values = ['cap', 'fastSlots', 'onTimeout', 'fastScale.maxSlots', 'priority.mode',
+  const values = ['cap', 'fastSlots', 'onTimeout', 'wholeSuite', 'fastScale.maxSlots', 'priority.mode',
     ...Object.keys(ADMISSION_POLICY_STANDARD.remote)
       .filter(key => key !== 'clientPath' || settings.remote?.clientPath != null)
       .map(key => key === 'elasticSlots' ? 'remote.elasticSlots.enabled' : key === 'bundle' ? 'remote.bundle.mainMaxAgeMin' : `remote.${key}`)]
     .map((leaf) => `${leaf}=${leaf === 'remote.clientPath' ? clientPathForLog(admissionLeaf(settings, leaf)) : admissionObject(admissionLeaf(settings, leaf)) ? JSON.stringify(admissionLeaf(settings, leaf)) : admissionLeaf(settings, leaf)} (${sources[leaf] ?? 'standard'})`);
   return `heavy-admission policy · ${values.join(', ')}${ignored.length ? ` · ignored: ${ignored.join('; ')}` : ''}${invalid.length ? ` · invalid: ${invalid.join('; ')}` : ''}`;
+}
+
+/** Vitest's boolean `--coverage.*` leaves accept only true/false as a separate value. */
+const COVERAGE_BOOLEAN_LEAVES = new Set(['enabled', 'clean', 'cleanOnRerun', 'all', 'skipFull', 'reportOnFailure', 'allowExternal',
+  'excludeAfterRemap', 'ignoreEmptyLines', 'experimentalAstAwareRemapping', 'autoUpdate', 'perFile', '100']);
+/**
+ * Decode shell wrappers BEFORE removing coverage options and their values. Work on words so closing quotes, escaped
+ * characters and spaces in values cannot change option boundaries. Re-quote retained words for the shared classifier
+ * and filter analysis; `test:coverage` is read as `test:unit`. Unreadable input stays unreadable and fails closed.
+ */
+function stripCoverageOptions(command) {
+  const segments = shellSegments(command);
+  if (!segments) return String(command);
+  return segments.map(raw => {
+    // npm's first `--` forwards options to Vitest; only Vitest's own `--` ends option parsing.
+    const words = forwardedNpmAsVitestRun(raw.map(word => word === 'test:coverage' ? 'test:unit' : word));
+    const kept = [];
+    for (let i = 0; i < words.length; i++) {
+      const word = words[i];
+      if (word === '--') { kept.push(...words.slice(i)); break; }
+      const option = /^--coverage((?:\.[\w-]+)*)(=.*)?$/.exec(word);
+      if (!option) { kept.push(word); continue; }
+      if (option[2] !== undefined) continue;
+      const boolean = !option[1] || COVERAGE_BOOLEAN_LEAVES.has(option[1].split('.').pop());
+      const next = words[i + 1];
+      if (next !== undefined && (boolean ? /^(?:true|false)$/.test(next) : !next.startsWith('-'))) i++;
+    }
+    return kept.map(shellQuoteWord).join(' ');
+  }).join(' ; ');
+}
+
+// Boolean Vitest flags consume a following true/false, but leave a directory or substring filter as a filter.
+const BOOLEAN_FILTER_FLAGS = new Set(['--run', '--passWithNoTests', '--silent', '-u', '--update', '--no-color', '--color', '--globals',
+  '--allowOnly', '--no-file-parallelism', '--no-isolate', '--no-cache', '--hideSkippedTests', '--dangerouslyIgnoreUnhandledErrors',
+  '--no-watch', '--ui', '--no-coverage', '--']);
+// A word that selects (nearly) every test, or that a shell expands to something unknown: never a targeted filter.
+const MATCH_ALL_FILTER = /^(?:\.{1,2}\/?|\/|\*{1,2})$|[$`]/;
+/**
+ * Whether EVERY `vitest run` segment of `command` carries a positional filter of any shape: a file, a directory
+ * (`scripts/readiness/`) or a name substring (`heavy-admission`). Vitest runs each as a targeted run, so the whole-suite
+ * guard must not read a missing `.ts`/`.mjs` suffix as "no filter". A flag's value (`--config x`, `--reporter verbose`,
+ * `-t name`) and a shell redirection are never filters. False when there is no `vitest run` segment: a bare
+ * `npm run test:unit` has none and stays a whole suite (a command this cannot read fails toward refusing).
+ */
+function vitestRunNamesFilter(command) {
+  const analysis = vitestRunAnalysis(command);
+  // A chain exempts nothing while any segment is itself a whole suite; an unreadable command fails toward refusing.
+  if (!analysis || analysis.wholeSuiteSegment || !analysis.runs.length) return false;
+  return analysis.runs.every((run) => run.filter);
+}
+
+/**
+ * Whether `command` has at least one `vitest run` segment WITHOUT a positional filter, read with the same quote-aware
+ * words as {@link vitestRunNamesFilter}. The shared kind classifier splits on whitespace, so a quoted option value that
+ * holds a space (`--outputFile 'a b.ts'`) can read there as a test file and call a whole suite `files`; this is the
+ * independent check. An unreadable command (unbalanced quote) counts as filterless: it fails toward refusing.
+ */
+function vitestRunHasFilterlessSegment(command, { unreadable = true } = {}) {
+  const analysis = vitestRunAnalysis(command);
+  return analysis ? analysis.wholeSuiteSegment || analysis.runs.some((run) => !run.filter) : unreadable;
+}
+
+const SHELL_NAME = /(?:^|\/)(?:sh|bash|zsh|dash|ksh)$/;
+const SHELL_COMMAND_FLAG = /^-[a-zA-Z]*c$/;
+const MAX_SHELL_NESTING = 4;
+/**
+ * Split a shell command line into pipeline segments of WORDS, keeping argument boundaries: single and double quotes,
+ * `$'…'`, backslash escapes, `$(…)` and backtick spans stay inside one word, and only an unquoted newline, `;`, `|`,
+ * `&&`, `||` or a lone `&` (not a `>&` / `&>` redirection) ends a segment. `sh -c '<script>'` is read through, so a
+ * script's own quoting is parsed in its own right. `null` when a quote or substitution is unbalanced or the nesting is
+ * too deep: the caller must not guess where its words end. Unquoted redirection operators and their operands are
+ * removed here, before coverage normalization re-quotes words and loses the distinction between syntax and arguments.
+ */
+function shellSegments(command, depth = 0) {
+  if (depth > MAX_SHELL_NESTING) return null;
+  const s = String(command ?? '');
+  const segments = [[]];
+  let word = null;
+  let plainWord = true, redirectOperand = false, incompleteRedirect = false;
+  const endWord = () => {
+    if (word !== null) {
+      if (redirectOperand) redirectOperand = false;
+      else segments.at(-1).push(word);
+      word = null;
+    }
+    plainWord = true;
+  };
+  const endSegment = () => {
+    endWord();
+    if (redirectOperand) incompleteRedirect = true;
+    if (segments.at(-1).length) segments.push([]);
+  };
+  const closing = (from, close) => { const end = s.indexOf(close, from); return end < 0 ? null : end; };
+  // End index of the `$(…)`, `${…}` or backtick span that starts at `at` (quotes, escapes and nested spans inside it are
+  // skipped); `undefined` when no span starts there, `null` when it is unbalanced.
+  function spanEnd(at) {
+    const first = s[at];
+    if (first === '`') {
+      for (let j = at + 1; j < s.length; j++) { if (s[j] === '\\') j++; else if (s[j] === '`') return j; }
+      return null;
+    }
+    if (first !== '$' || (s[at + 1] !== '(' && s[at + 1] !== '{')) return undefined;
+    const open = s[at + 1], close = open === '(' ? ')' : '}';
+    let level = 0;
+    for (let j = at + 1; j < s.length; j++) {
+      const d = s[j];
+      if (d === '\\') j++;
+      else if (d === "'") { const end = closing(j + 1, "'"); if (end === null) return null; j = end; }
+      else if (d === '"') {
+        for (j++; j < s.length && s[j] !== '"'; j++) {
+          if (s[j] === '\\') { j++; continue; }
+          const end = spanEnd(j);
+          if (end === null) return null;
+          if (end !== undefined) j = end;
+        }
+        if (j >= s.length) return null;
+      } else if (d === '`' || d === '$') {
+        const end = spanEnd(j);
+        if (end === null) return null;
+        if (end !== undefined) j = end;
+      } else if (d === open) level++;
+      else if (d === close && --level === 0) return j;
+    }
+    return null;
+  }
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === "'") {
+      plainWord = false;
+      const end = closing(i + 1, "'");
+      if (end === null) return null;
+      word = (word ?? '') + s.slice(i + 1, end); i = end;
+    } else if (c === '"') {
+      plainWord = false;
+      let out = '', j = i + 1;
+      for (; j < s.length && s[j] !== '"'; j++) {
+        if (s[j] === '\\' && j + 1 < s.length) {
+          if ('$`"\\'.includes(s[j + 1])) { out += s[j + 1]; j++; } else if (s[j + 1] === '\n') j++; else out += s[j];
+          continue;
+        }
+        // A substitution inside double quotes keeps its own (possibly quoted, possibly spaced) text in this word.
+        const end = spanEnd(j);
+        if (end === null) return null;
+        if (end !== undefined) { out += s.slice(j, end + 1); j = end; continue; }
+        out += s[j];
+      }
+      if (j >= s.length) return null;
+      word = (word ?? '') + out; i = j;
+    } else if (c === '$' && s[i + 1] === "'") {
+      plainWord = false;
+      let out = '', j = i + 2;
+      for (; j < s.length && s[j] !== "'"; j++) { if (s[j] === '\\' && j + 1 < s.length) j++; out += s[j]; }
+      if (j >= s.length) return null;
+      word = (word ?? '') + out; i = j;
+    } else if ((c === '$' && (s[i + 1] === '(' || s[i + 1] === '{')) || c === '`') {
+      // A substitution or `${…}` expansion stays opaque, including when concatenated with a path prefix/suffix.
+      // Filter analysis must reject unknown expansions anywhere in the resulting word.
+      const end = spanEnd(i);
+      if (end === null) return null;
+      word = (word ?? '') + s.slice(i, end + 1); i = end;
+    } else if (c === '#' && word === null) {
+      // A comment runs to the end of the line; its words are not arguments.
+      const nl = s.indexOf('\n', i);
+      i = nl < 0 ? s.length : nl - 1;
+    } else if (c === '\\') {
+      if (i + 1 >= s.length) return null;
+      if (s[i + 1] !== '\n') { plainWord = false; word = (word ?? '') + s[i + 1]; }
+      i++;
+    } else if (c === '<' || c === '>' || (c === '&' && s[i + 1] === '>')) {
+      // Only an unquoted adjacent IO descriptor is syntax; `2 >out`, `'2'>out` and `2&>out` retain argument 2.
+      if (c !== '&' && !redirectOperand && plainWord && /^(?:\d+|\{[a-zA-Z_]\w*\})$/.test(word ?? '')) word = null;
+      endWord();
+      if (redirectOperand) return null;
+      const operator = /^(?:&>>?|>>|>\||>&|<<<|<<-?|<>|<&|[<>])/.exec(s.slice(i))[0];
+      // Heredoc bodies and process substitutions need a full shell grammar; keep these unreadable/fail-closed.
+      if (operator.startsWith('<<') || s[i + operator.length] === '(') return null;
+      redirectOperand = true;
+      i += operator.length - 1;
+    } else if (c === '\n' || c === ';' || c === '|') {
+      endSegment();
+      if (c === '|' && s[i + 1] === '&') i++; // Bash's stderr-and-stdout pipeline
+    } else if (c === '&') {
+      endSegment();
+    } else if (/\s/.test(c)) {
+      endWord();
+    } else word = (word ?? '') + c;
+  }
+  endWord();
+  if (redirectOperand || incompleteRedirect) return null;
+  const out = [];
+  for (const words of segments) {
+    if (!words.length) continue;
+    const flag = words.findIndex((w, k) => k > 0 && SHELL_COMMAND_FLAG.test(w) && words.slice(0, k).some((p) => SHELL_NAME.test(p)));
+    if (flag < 0 || flag + 1 >= words.length) { out.push(words); continue; }
+    const inner = shellSegments(words[flag + 1], depth + 1);
+    if (!inner) return null;
+    out.push(...inner);
+  }
+  return out;
+}
+
+/** `npm [run] test[:unit] -- …` forwards its arguments to `vitest run`; read it as that command (word form). */
+function forwardedNpmAsVitestRun(words) {
+  const at = words.findIndex((w) => /(?:^|\/)npm$/.test(w));
+  if (at < 0) return words;
+  let next = at + 1;
+  if (words[next] === 'run') next++;
+  if ((words[next] === 'test' || words[next] === 'test:unit') && words[next + 1] === '--') return [...words.slice(0, at), 'vitest', 'run', ...words.slice(next + 2)];
+  return words;
+}
+
+/** Per-Vitest run/--run/related segment `{filter}` and whether another segment is a whole suite; `null` if unreadable. */
+function vitestRunAnalysis(command) {
+  const parsed = shellSegments(command);
+  if (!parsed) return null;
+  const runs = [];
+  let wholeSuiteSegment = false;
+  for (const raw of parsed) {
+    const words = forwardedNpmAsVitestRun(raw);
+    const at = words.findIndex((w) => /(?:^|\/)vitest$/.test(w));
+    const args = words.slice(at + 1);
+    const end = args.indexOf('--');
+    const subcommand = args[0] === 'run' || args[0] === 'related';
+    if (at < 0 || !(subcommand || args.slice(0, end < 0 ? args.length : end).includes('--run'))) {
+      // Bare npm tests and unrecognized Vitest invocations cannot exempt another segment's whole suite.
+      // Match executable words, not substrings in a pipeline's log filename such as `tee vitest.log`.
+      const npmAt = words.findIndex((w) => /(?:^|\/)npm$/.test(w));
+      const npmTask = words[npmAt + (words[npmAt + 1] === 'run' ? 2 : 1)];
+      if (at >= 0 || (npmAt >= 0 && ['test', 'test:unit'].includes(npmTask))) wholeSuiteSegment = true;
+      continue;
+    }
+    const tokens = subcommand ? args.slice(1) : args;
+    const endOptions = tokens.indexOf('--');
+    const filters = tokens.filter((t, k) => {
+      // A lone grouping word (`( vitest run )`, `{ …; }`) closes the command; it is not an argument.
+      if (!t || /^[(){}]+$/.test(t)) return false;
+      const prev = tokens[k - 1];
+      if (endOptions >= 0 && k > endOptions) return true;
+      if (t.startsWith('-')) return false;
+      if (BOOLEAN_FILTER_FLAGS.has(prev) && /^(?:true|false)$/.test(t)) return false;
+      return !(prev && prev.startsWith('-') && !prev.includes('=') && !BOOLEAN_FILTER_FLAGS.has(prev));
+    });
+    // Vitest unions positional filters: one broad/unknown filter cannot be made safe by another selected file.
+    runs.push({ filter: filters.length > 0 && filters.every(t => !MATCH_ALL_FILTER.test(t)) });
+  }
+  return { runs, wholeSuiteSegment };
+}
+
+function isWholeSuiteCommand(command, env) {
+  // Reuse the shared target parser, suppressing only its size-based FULL promotion.
+  // A selected list remains selected regardless of how many files it names.
+  // `--coverage` only changes the kind label; an untargeted coverage run is still a whole suite.
+  const bare = stripCoverageOptions(command);
+  const kind = classifyCommandKind(bare, { ...env, WE_HEAVY_ADMISSION_FAST_MAX_FILES: String(Number.MAX_SAFE_INTEGER) });
+  if (kind === 'FULL') {
+    // Any positional filter (a directory or a name substring, not only a test file) is a targeted run.
+    if (vitestRunNamesFilter(bare)) return false;
+  } else if (!(kind === 'files' || kind === 'selected' || kind === 'coverage' ? vitestRunHasFilterlessSegment(bare)
+    // `other` is a command the classifier could not see a `vitest` in (`vit"est" run`): only a readable one can be judged.
+    : kind === 'other' && vitestRunHasFilterlessSegment(bare, { unreadable: false }))) return false;
+  // else: the classifier split on whitespace and read a quoted option value as a test file (or missed a quote-split
+  // `vitest`); the quote-aware words say a `vitest run` segment has no filter.
+  return true;
+}
+
+/** Keep admission, retry/refusal and diagnostic kinds consistent with the quote-aware whole-suite policy. */
+function classifyAdmissionCommandKind(command, env) {
+  const kind = classifyCommandKind(command, env);
+  return kind === 'FULL' || kind === 'coverage' || !isWholeSuiteCommand(command, env) ? kind : 'FULL';
+}
+
+function wholeSuiteRefused({ command, policy, env, log }) {
+  if (policy.settings.wholeSuite !== 'refuse' || !isWholeSuiteCommand(command, env)) return false;
+  log(formatAdmissionPolicy(policy) + '\n');
+  log("heavy-admission: whole suite is CI's job (R913); run selected/related tests\n");
+  return true;
 }
 
 /** Pure remote routing decision; unreadable load keeps threshold routing local. */
@@ -856,9 +1140,13 @@ function recordRemoteFallback({lockRoot, reason, detail = null, cwd, argv, env, 
   try {
     const file = join(lockRoot, 'remote-fallbacks.jsonl');
     const bounded = value => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, '?').slice(0, 4096);
+    const sandbox = Object.fromEntries(['CODEX_SANDBOX', 'CODEX_SANDBOX_NETWORK_DISABLED', 'SANDBOX_RUNTIME']
+      .filter(key => (env ?? process.env)[key] != null)
+      .map(key => [key, bounded((env ?? process.env)[key]).slice(0, 256)]));
     const row = {ts:new Date(clock()).toISOString(), reason:bounded(reason),
-      detail:detail == null ? null : bounded(detail), lane:basename(cwd),
-      kind:classifyCommandKind(argv.map(shellQuoteWord).join(' '), env)};
+      detail:detail == null ? null : bounded(detail), lane:bounded(basename(cwd)),
+      pid:process.pid, ppid:process.ppid, sandbox:Object.keys(sandbox).length ? sandbox : null,
+      kind:classifyAdmissionCommandKind(argv.map(shellQuoteWord).join(' '), env)};
     mkdirSync(lockRoot, {recursive:true});
     const tail = existsSync(file) ? readTailBytes(file, 512 * 1024) : '';
     if (existsSync(file) && statSync(file).size > 512 * 1024) writeFileSync(file, tail, 'utf8');
@@ -870,8 +1158,8 @@ function recordRemoteFallback({lockRoot, reason, detail = null, cwd, argv, env, 
  * Only { mode: 'remote', code: <integer 0..254> } exits with that code. Local admission requires
  * { mode: 'not-started', terminated: true } or { mode: 'cancelled', terminated: true }.
  * After timeout-abort, allow up to one second for cancelled+terminated acknowledgement.
- * Everything else (including legacy fallback, throws, malformed results and unacknowledged
- * timeouts) refuses local reruns with exit 124. */
+ * Otherwise a fresh settled per-run telemetry result can confirm termination for a local rerun;
+ * missing or incomplete evidence still refuses local reruns with exit 124. */
 const CLIENT_SIGNAL_NUMBERS = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 };
 /** x40a9dk: how long a killed client waits for its remote cancel to be confirmed (default 90s; the protected finish took 14s live). */
 function resolveSignalCancelWaitMs(env) {
@@ -882,7 +1170,7 @@ function resolveSignalCancelWaitMs(env) {
 export async function runWithRemoteDecision({
   argv, policy, cwd, env, host = 'forge', clock = Date.now,
   lockRoot = admissionLockRoot(cwd, env), readTelemetry,
-  timeoutMs = classifyCommandKind(argv.map(shellQuoteWord).join(' '), env) === 'files'
+  timeoutMs = classifyAdmissionCommandKind(argv.map(shellQuoteWord).join(' '), env) === 'files'
     ? resolveFastRunTimeoutMs(env)
     : env ? resolveCeilingMs(env) : DEFAULT_ADMISSION_CEILING_MS,
   loadPerCore = () => loadavg()[0] / cpus().length,
@@ -892,6 +1180,7 @@ export async function runWithRemoteDecision({
   hostOverloaded = () => !isUnderTest(env ?? {}) && hostOverloadedForRemote(env),
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 }) {
+  if (wholeSuiteRefused({ command: argv.map(shellQuoteWord).join(' '), policy, env, log })) return { handled: true, exitCode: 125 };
   let load;
   try { load = loadPerCore(); } catch { /* unreadable load stays local */ }
   // 7579: a host the local admission would refuse is a reason to use Forge, not to defer. Only a definite
@@ -910,23 +1199,35 @@ export async function runWithRemoteDecision({
   log(`heavy-admission: ${decision.remote ? 'remote' : 'local'} (${decision.reason})\n`);
   if (decision.needsGit) recordRemoteFallback({lockRoot, reason: 'needs-git', cwd, argv, env, clock});
   if (!decision.remote) return { handled: false };
-  // Local heartbeat workers can be terminated during import. Keep Forge's top-level awaits out of
-  // that import graph: terminating an evaluating async module can crash Node with SIGTRAP.
-  const { checkRemoteHealth, recordRemoteResult, peekRemoteTelemetry } = await import('./forge-remote-health.mjs');
   const remoteRoot = join(dirname(lockRoot), 'remote');
-  const localFallback = (reason) => {
-    recordRemoteFallback({lockRoot, reason, cwd, argv, env, clock});
+  const localFallback = (reason, detail = null) => {
+    recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock});
     log(`heavy-admission: remote unavailable (${oneLine(reason)}) - falling back to local admission\n`);
     return { handled: false };
   };
+  // Caller confinement is local evidence, not a Forge health failure. Exercise writes before
+  // importing health code so a denied caller cannot mutate the host-shared health state.
+  try {
+    mkdirSync(remoteRoot, {recursive:true});
+    const probe = mkdtempSync(join(remoteRoot, '.write-probe-'));
+    rmdirSync(probe);
+  } catch (error) {
+    if (['EPERM', 'EACCES', 'EROFS'].includes(error?.code)) {
+      return localFallback('confined-local', `${error.code} ${oneLine(basename(remoteRoot))}`);
+    }
+    // A race or other failure still belongs to the normal remote-health path.
+  }
+  // Local heartbeat workers can be terminated during import. Keep Forge's top-level awaits out of
+  // that import graph: terminating an evaluating async module can crash Node with SIGTRAP.
+  const { checkRemoteHealth, recordRemoteResult, peekRemoteTelemetry } = await import('./forge-remote-health.mjs');
   const health = () => checkRemoteHealth({root:remoteRoot,settings:policy.settings.remote,clock,readTelemetry,host});
   const healthy = await health();
-  if (!healthy.ok) return localFallback(healthy.reason);
+  if (!healthy.ok) return localFallback(healthy.reason, healthy.detail);
   const owner = `remote-${process.pid}-${randomBytes(12).toString('hex')}`;
   const cap = policy.settings.remote.maxConcurrent;
   const slotOptions = {lockRoot:remoteRoot,cap,owner,pid:process.pid};
   let unitPolicy;
-  const kind = classifyCommandKind(argv.map(shellQuoteWord).join(' '), env);
+  const kind = classifyAdmissionCommandKind(argv.map(shellQuoteWord).join(' '), env);
   let lease = null;
   try { lease = readLaneLease(cwd); } catch { /* unknown identity grants no priority */ }
   const priority = classifyWaiterPriority({purpose:lease?.purpose,session:lease?.session,holder:lease?.holder,
@@ -934,12 +1235,13 @@ export async function runWithRemoteDecision({
   try {
     if (!admissionInt(1)(cap)) throw new Error('Unreadable slot count');
     unitPolicy = resolveRemoteSlotUnits({policy, kind, telemetry: peekRemoteTelemetry({root:remoteRoot,host}), priority});
-  } catch { return localFallback('remote-slot-unreadable'); }
+  } catch (error) { return localFallback('remote-slot-unreadable', `${error?.code ?? ''} ${error?.message ?? error}`.trim()); }
   const units = unitPolicy.units;
   if (['FULL', 'soak', 'standards'].includes(kind)) log(`${formatAdmissionPolicy(policy)} · remote.slotUnits=${units} (${unitPolicy.source}; ${priority ? 'priority' : 'idle-or-single'})\n`);
   const releaseUnits = () => { for (let i = 0; i < units; i++) releaseOwnedSlot({...slotOptions,fastSlots:0}); };
   const waitAt = clock();
   let slot;
+  let admissionWaitReason = 'none';
   let healthAt = waitAt;
   let reapedAt = -Infinity;
   const stuck = policy.settings.remote;
@@ -960,7 +1262,9 @@ export async function runWithRemoteDecision({
       }
       // file-locks treats corrupt entries as reclaimable. Remote admission requires readable
       // evidence instead: an unknown holder could still have an outstanding Forge execution.
-      for (let n = 0; n < cap; n++) {
+      // A slot dir being released (lock.json removed, then the dir) is momentarily entryless and old: a read racing a
+      // release, not unreadable evidence. Re-check a few times; only evidence that stays unreadable fails closed.
+      const slotUnreadable = (n) => {
         let present = false, ageMs = 0;
         const dir = lockDirFor(remoteRoot,slotPath(n));
         try { ageMs = Date.now() - statSync(dir).mtimeMs; present = true; }
@@ -972,14 +1276,23 @@ export async function runWithRemoteDecision({
         // exclusive create and the write) in a young dir. A future mtime (clock skew) is never "young".
         const entry = present ? readLockEntry(remoteRoot,slotPath(n)) : null;
         const initializing = present && !entry && ageMs >= 0 && ageMs < ENTRYLESS_LOCK_DIR_GRACE_MS
-          && (!existsSync(join(dir,'lock.json')) || statSync(join(dir,'lock.json')).size === 0);
-        if (present && !entry && !initializing) throw new Error('Unreadable remote slot');
+          && (() => { try { return statSync(join(dir,'lock.json')).size === 0; } catch (error) { if (error.code === 'ENOENT') return true; throw error; } })();
+        return present && !entry && !initializing;
+      };
+      // Any wait restarts the whole scan, so every slot is validated in one pass with no wait before acquisition.
+      for (let attempt = 0; ; attempt++) {
+        let unreadable = false;
+        for (let n = 0; n < cap && !unreadable; n++) unreadable = slotUnreadable(n);
+        if (!unreadable) break;
+        if (attempt >= 4) throw new Error('Unreadable remote slot');
+        await sleep(25);
       }
       const blocked=blockedSlots(remoteRoot,cap),slots=Array.from({length:cap},(_,i)=>i).filter(i=>!blocked.has(i));
       slot = tryAcquireRemoteUnits({units,slots,
         acquire: available => tryAcquireSlot({...slotOptions,slots:available,nowMs,nowIso:new Date(nowMs).toISOString()}),
         release: () => releaseOwnedSlot({...slotOptions,fastSlots:0})});
       if(slot.ok)break;
+      admissionWaitReason = 'remote-busy';
       const waited = nowMs - waitAt;
       if (waited >= REMOTE_FULL_WAIT_MS) {
         // 7579: local admission would defer an overloaded host at once, so keep queueing for a Forge slot
@@ -993,13 +1306,15 @@ export async function runWithRemoteDecision({
         }
         if (nowMs - healthAt >= 10000) {
           const checked = await health();
-          if (!checked.ok) return localFallback(checked.reason);
+          if (!checked.ok) return localFallback(checked.reason, checked.detail);
           healthAt = clock();
         }
       }
       await sleep(waited >= REMOTE_FULL_WAIT_MS ? 1000 : Math.min(1000, REMOTE_FULL_WAIT_MS - waited));
     }
-  } catch { return localFallback('remote-slot-unreadable'); }
+  } catch (error) { return localFallback('remote-slot-unreadable', `${error?.code ?? ''} ${error?.message ?? error}`.trim()); }
+  recordAdmissionWait({ lockRoot, kind, waitMs: Math.max(0, clock() - waitAt), route: 'remote',
+    waitReason: admissionWaitReason, owner, lane: lease?.lane ?? null, at: new Date(clock()).toISOString() });
   const heartbeat = setInterval(() => {
     for (const n of slot.slots) {
       const entry = readLockEntry(remoteRoot, slotPath(n));
@@ -1008,6 +1323,11 @@ export async function runWithRemoteDecision({
   },60000);
   heartbeat.unref();
   const record = async result => {
+    // A busy Forge is healthy, just occupied: with the busy wait enabled it never counts toward the failure backoff.
+    // Filtered here so every call site (normal result, client signal, timeout grace) gets it.
+    // Only a CONFIRMED non-start is exempt; an unconfirmed or unterminated answer that merely carries the busy reason is a real failure.
+    if ((policy.settings.remote.busyWaitMs ?? 0) > 0 && result?.mode === 'not-started' && result.terminated === true
+      && (result.reason === 'forge-busy' || result.reason === 'forge-busy-after-wait')) return;
     // A repeated client signal stops waiting for the health write too (the marker stays for the reaper).
     try {await Promise.race([recordRemoteResult({root:remoteRoot,settings:policy.settings.remote,clock,result,host}),escalatePromise]);}
     catch {log('heavy-admission: remote-health-unreadable; subsequent remote admission requires readable health state\n');}
@@ -1017,6 +1337,7 @@ export async function runWithRemoteDecision({
   let primaryCreated = false;
   let outstanding = false;
   let terminated = false;
+  let executionRun = null;
   const executor = remoteExec ?? createRemoteExec({ policy, cwd, env, lockRoot, log, runOverride: remoteClientOverride });
   remoteExec = options => executor({...options,slotUnits:units,onRun:run => {
     options.onRun(run);
@@ -1037,12 +1358,32 @@ export async function runWithRemoteDecision({
   let signalHandlers = [];
   // A kill that lands while a result is being recorded is honoured: exit with the signal code, keeping `terminated` as is.
   const killedExit = () => signalled ? { handled: true, exitCode: 128 + CLIENT_SIGNAL_NUMBERS[signalled], signal: signalled } : null;
+  const confirmFinished = async () => {
+    if (!executionRun || signalled) return false;
+    const gaveUpAt = clock();
+    let probeTimer;
+    try {
+      // Bypass the health cache: only a sample taken after this failure can settle this execution.
+      const telemetry = await Promise.race([
+        Promise.resolve().then(async () => (readTelemetry ?? (await import('./forge-telemetry.mjs')).readForgeTelemetry)({host})),
+        new Promise(resolve => { probeTimer = setTimeout(() => resolve(null), 1000); }),
+        signalPromise,
+      ]);
+      const sampledAt = Date.parse(telemetry?.sampledAtET), age = clock() - sampledAt;
+      if (signalled || !(sampledAt > gaveUpAt && age >= -60_000 && age <= 30_000)
+        || runVerdict(telemetry, executionRun) !== 'finished') return false;
+      terminated = true;
+      log(`heavy-admission: remote run ${executionRun} finished per fresh telemetry; termination confirmed without a verified receipt, rerunning through local admission\n`);
+      return true;
+    } catch { return false; }
+    finally { clearTimeout(probeTimer); }
+  };
   const timedOut = Symbol('remote-timeout');
   try {
     // Waiting for a remote slot can outlive the cached sample. Recheck before dispatch.
-    if(clock()-waitAt>=10000){const checked=await health();if(!checked.ok)return localFallback(checked.reason);}
+    if(clock()-waitAt>=10000){const checked=await health();if(!checked.ok)return localFallback(checked.reason,checked.detail);}
     try { resolveRemoteSlotUnits({policy,kind,telemetry:peekRemoteTelemetry({root:remoteRoot,host}),priority}); }
-    catch { return localFallback('remote-slot-unreadable'); }
+    catch (error) { return localFallback('remote-slot-unreadable', `${error?.code ?? ''} ${error?.message ?? error}`.trim()); }
     // Persist dispatch intent BEFORE invoking the executor. SIGKILL bypasses
     // finally, and a dead client PID cannot prove a Forge job has terminated.
     // Exclusive creation also catches a marker created after the slot scan;
@@ -1071,9 +1412,44 @@ export async function runWithRemoteDecision({
         controller.abort();
       }, timeoutMs);
     });
-    const remote = Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, cancelSignal: cancelController.signal, transport: policy.settings.remote.transport, bundleMainMaxAgeMs: policy.settings.remote.bundle.mainMaxAgeMin * 60_000,
-      onCapabilities: capabilities => writeRunnerCapabilities({ root: remoteRoot, host, capabilities, clock }), onRun: run => recordMarkerRun(executionMarker, {owner, run}) }));
-    const result = await Promise.race([remote, timeout, signalPromise]);
+    const dispatch = () => {
+      executionRun = null;
+      return Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, cancelSignal: cancelController.signal, transport: policy.settings.remote.transport, bundleMainMaxAgeMs: policy.settings.remote.bundle.mainMaxAgeMin * 60_000,
+      onWarning: (reason, detail) => recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock}),
+      onCapabilities: capabilities => writeRunnerCapabilities({ root: remoteRoot, host, capabilities, clock }), onRun: run => {
+        if (recordMarkerRun(executionMarker, {owner, run})) executionRun = run;
+      } }));
+    };
+    let remote = dispatch();
+    let result = await Promise.race([remote, timeout, signalPromise]);
+    // forge-busy-wait: an explicit, confirmed non-start (never 'unconfirmed') waits and retries Forge within a total
+    // budget. Only the remote slot marker is held meanwhile, no local heavy slot. A client signal ends the wait.
+    const busyBudget = policy.settings.remote.busyWaitMs ?? 0;
+    const busyStart = clock();
+    const isBusy = (r) => r?.mode === 'not-started' && r.terminated === true && (r.reason === 'forge-busy'
+      || ((kind === 'FULL' || kind === 'coverage') && ['sibling-inventory-failed', 'git-head-unavailable'].includes(r.reason)));
+    while (isBusy(result) && busyBudget > 0) {
+      const spent = clock() - busyStart;
+      const backoff = Math.max(1000, policy.settings.remote.busyBackoffMs ?? 45000);
+      if (spent + backoff > busyBudget) {
+        if (result.reason === 'forge-busy') result = { ...result, reason: 'forge-busy-after-wait' };
+        break;
+      }
+      const waitReason = result.reason;
+      log(`heavy-admission: remote ${oneLine(waitReason)}; waiting ${Math.round(backoff / 1000)}s then retrying Forge (${Math.round(spent / 1000)}s of ${Math.round(busyBudget / 1000)}s used, no local slot held)\n`);
+      // The run timeout also ends the wait: nothing is in flight (the last answer was a confirmed non-start), so fall
+      // back like an exhausted budget instead of dispatching with an already-aborted signal.
+      const slept = await Promise.race([sleep(backoff).then(() => 'slept'), timeout, signalPromise]);
+      if (slept === timedOut || (slept === 'slept' && controller.signal.aborted && !signalled)) {
+        if (result.reason === 'forge-busy') result = { ...result, reason: 'forge-busy-after-wait' };
+        break;
+      }
+      if (slept !== 'slept') { result = slept; break; }
+      if (signalled) { result = { clientSignal: signalled }; break; }
+      remote = dispatch();
+      result = await Promise.race([remote, timeout, signalPromise]);
+      if (result?.mode === 'remote') log(`heavy-admission: Forge accepted the run after ${Math.round((clock() - busyStart) / 1000)}s of ${oneLine(waitReason)} waiting\n`);
+    }
     const cancelOnClientSignal = async (signalName) => {
       clearTimeout(timer);
       let cancelTimer;
@@ -1103,26 +1479,34 @@ export async function runWithRemoteDecision({
       // A client kill during the timeout grace period still cancels and exits with the signal code.
       if (typeof termination?.clientSignal === 'string') return await cancelOnClientSignal(termination.clientSignal);
       if (termination?.mode !== 'cancelled' || termination.terminated !== true) {
-        await record({mode:'unconfirmed'});
-        return killedExit() ?? refuseLocal('remote-timeout');
+        if (!await confirmFinished()) {
+          await record({mode:'unconfirmed'});
+          return killedExit() ?? refuseLocal('remote-timeout');
+        }
       }
       reason = 'remote-timeout';
       terminated = true;
-      await record(termination);
+      await record({mode:'cancelled',terminated:true,reason:'remote-timeout'});
       if (killedExit()) return killedExit();
     } else {
       terminated = (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254)
         || ((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true);
-      await record(result);
+      const confirmedByTelemetry = !terminated && await confirmFinished();
+      await record(confirmedByTelemetry ? {mode:'cancelled',terminated:true,reason:result?.reason} : result); // record() itself skips a busy Forge result when the busy wait is enabled
       if (killedExit()) return killedExit();
       if (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254) return { handled: true, exitCode: result.code, remoteResult: result };
-      // Only explicit non-start or cancellation with confirmed termination is safe. Throws and malformed
-      // replies may come from an executor whose remote child is still alive.
-      if (!((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true)) return killedExit() ?? refuseLocal(result?.reason ?? 'unconfirmed remote result');
+      // Explicit acknowledgement or a fresh settled per-run result must confirm termination. Throws and
+      // malformed replies alone may come from an executor whose remote child is still alive.
+      if (!terminated) return killedExit() ?? refuseLocal(result?.reason ?? 'unconfirmed remote result');
       reason = result?.reason ?? 'unconfirmed remote result';
       detail = result?.detail;
     }
-  } catch (error) { await record({mode:'unconfirmed'}); return killedExit() ?? refuseLocal(error?.message ?? error); }
+  } catch (error) {
+    reason = error?.message ?? String(error);
+    if (!await confirmFinished()) { await record({mode:'unconfirmed'}); return killedExit() ?? refuseLocal(reason); }
+    await record({mode:'cancelled',terminated:true,reason});
+    if (killedExit()) return killedExit();
+  }
   finally {
     clearTimeout(timer); clearInterval(heartbeat);
     for (const [name, h] of signalHandlers) process.removeListener(name, h);
@@ -1143,6 +1527,10 @@ export async function runWithRemoteDecision({
     }
   }
   recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock});
+  if ((kind === 'FULL' || kind === 'coverage') && ['sibling-inventory-failed', 'bundle-credential-hit', 'bundle-credential-scan-too-large', 'git-head-unavailable'].includes(reason)) {
+    log(`heavy-admission: refusing local fallback (${oneLine(reason)})\n`);
+    return { handled: true, exitCode: 125 };
+  }
   const failure = reason === 'remote-timeout' ? reason : `fallback: ${oneLine(reason)}${detail ? ` (${oneLine(detail)})` : ''}`;
   log(`heavy-admission: remote failed (${failure}) - falling back to local admission\n`);
   return { handled: false };
@@ -1999,6 +2387,7 @@ export async function acquireSlotBlocking({
   let hostMaxWaitMs = DEFAULT_HOST_MAX_WAIT_MS;
   let hostWaitSource = 'standard';
   let hostLoadBypassed = false;
+  let admissionWaitReason = 'none';
   let lastProgressAt = startedAt;
   try {
     for (;;) {
@@ -2007,6 +2396,7 @@ export async function acquireSlotBlocking({
         if (!hostPolicyLogged) { log(`${m}\n`); hostPolicyLogged = true; }
       } });
       if (!host.admitted) {
+        admissionWaitReason = 'host-load';
         // A slow rejected host check counts against the budget too (3rd audit): re-read the clock. Budget mode only.
         if (canDefer && budgetMs > 0) attempt = now();
         const waited = attempt - startedAt;
@@ -2073,6 +2463,9 @@ export async function acquireSlotBlocking({
         const meta = { kind: jobKind, acquiredAt: nowIso, lane: lane ?? null, ...(command ? { command: String(command).slice(0, 200) } : {}), ...(holder ? { holder } : {}), ...(location ? { location } : {}), ...identity, ...(cls.class !== 'P3' ? { priority: cls.class } : {}) };
         const r = tryAcquireSlot({ lockRoot, cap, owner, nowMs: attempt, nowIso, pid, leaseMinutes, meta, slots: slotOrder });
         if (r.ok) {
+          const admittedAt = now();
+          recordAdmissionWait({ lockRoot, kind: jobKind, waitMs: Math.max(0, admittedAt - startedAt), route: 'local',
+            waitReason: admissionWaitReason, owner, lane, at: new Date(admittedAt).toISOString() });
           if (cls.class === 'P0') log(`heavy-command admission: red-main repair admitted — class P0, slot ${r.slot}, after ${Math.round((attempt - startedAt) / 1000)}s [${prioritySrc}]\n`);
           return { ok: true, slot: r.slot, timedOut: false, waitedMs: attempt - startedAt };
         }
@@ -2083,6 +2476,7 @@ export async function acquireSlotBlocking({
           log(`heavy-command admission: yielding to red-main repair waiter ${repair.lane ? `lane ${repair.lane}` : repair.owner} (class P0) [${prioritySrc}]\n`);
         }
       }
+      if (admissionWaitReason === 'none') admissionWaitReason = 'cap-full';
       if (atCeiling) {
         ceilingChecked = true;
         const m = Math.round(ceilingMs / 60_000);
@@ -2115,6 +2509,50 @@ export async function acquireSlotBlocking({
 // line to `durations.jsonl` beside the slots: `{kind, ms, lane, repo, at}`. {@link readStandardMinutes} turns the
 // tail of that log into the rolling typical time per kind. Best-effort on both sides: a write failure never
 // fails a release, and an unreadable log reads as "no samples" (the seeds apply).
+
+const WAITS_LOG = 'waits.jsonl';
+
+/** One row per acquired local or remote slot, beside the unchanged hold-duration ledger. Never throws. */
+export function recordAdmissionWait({ lockRoot, kind, waitMs, route, waitReason = 'none', owner = null, lane = null, at = new Date().toISOString() }) {
+  if (!Number.isFinite(waitMs) || waitMs < 0 || !['local', 'remote'].includes(route)) return false;
+  try {
+    mkdirSync(lockRoot, { recursive: true });
+    appendFileSync(join(lockRoot, WAITS_LOG), JSON.stringify({ at, kind: normalizeKind(kind), waitMs: Math.round(waitMs), route, waitReason, owner, lane }) + '\n', 'utf8');
+    return true;
+  } catch { return false; }
+}
+
+/** Pure nearest-rank summary. Accepts JSONL or parsed rows; malformed and out-of-window rows are ignored.
+ * Empty samples have null percentiles, so missing evidence is never reported as a zero wait.
+ * If several causes blocked an admission, the row records host-load in preference to local capacity.
+ */
+export function summarizeRecentWaits(rows, { windowMinutes = 60, nowMs = Date.now() } = {}) {
+  if (!Number.isFinite(windowMinutes) || windowMinutes <= 0) windowMinutes = 60;
+  const samples = { local: [], remote: [] };
+  for (let row of typeof rows === 'string' ? rows.split('\n') : rows ?? []) {
+    try {
+      if (typeof row === 'string') row = JSON.parse(row);
+      const at = typeof row?.at === 'string' ? Date.parse(row.at) : NaN;
+      if (!Number.isFinite(at) || at < nowMs - windowMinutes * 60_000 || at > nowMs
+        || !['local', 'remote'].includes(row?.route) || !Number.isFinite(row.waitMs) || row.waitMs < 0) continue;
+      samples[row.route].push(row.waitMs);
+    } catch { /* corrupt lines do not hide valid admissions */ }
+  }
+  const summarize = values => {
+    values.sort((a, b) => a - b);
+    const rank = p => values.length ? values[Math.ceil(p * values.length) - 1] : null;
+    return { count: values.length, p50Ms: rank(0.5), p90Ms: rank(0.9) };
+  };
+  return { windowMinutes, ...summarize([...samples.local, ...samples.remote]),
+    byRoute: { local: summarize(samples.local), remote: summarize(samples.remote) } };
+}
+
+/** Ledger IO stays outside the pure summary; missing/unreadable evidence yields an empty sample. */
+export function readRecentWaits(lockRoot, options) {
+  let rows = '';
+  try { rows = readFileSync(join(lockRoot, WAITS_LOG), 'utf8'); } catch { /* best effort telemetry */ }
+  return summarizeRecentWaits(rows, options);
+}
 
 const DURATIONS_LOG = 'durations.jsonl';
 /** Keep the log bounded: once it passes this many lines, the next append rewrites it to the newest half. */
@@ -2436,25 +2874,74 @@ function childExitCode(e) {
   return Number.isInteger(n) ? 128 + n : 1;
 }
 
+const defaultExec = (cmd, o) => execSync(cmd, o);
+
+/**
+ * Run `command` under a hard run ceiling that kills its WHOLE process group (the shell plus vitest and its workers), so a
+ * timed-out run cannot outlive the wrapper while the caller restores a mutated tree. An injected `exec` (tests, the
+ * container hook) keeps its own seam and gets a plain exec timeout. Rejects with `code:'ETIMEDOUT'` on expiry.
+ */
+function execWithRunCeiling(command, opts, ceilingMs, exec) {
+  if (exec !== defaultExec) {
+    return Promise.resolve().then(() => exec(command, { ...opts, timeout: ceilingMs, killSignal: 'SIGKILL' }));
+  }
+  return new Promise((resolveRun, rejectRun) => {
+    // An inherited exec `timeout` (the fast-run limit) must not reach spawn: its SIGTERM hits only the shell. Both limits
+    // are enforced through the group kill instead, so the effective ceiling is the smaller of the two.
+    const { timeout: inheritedTimeout, killSignal: _ks, ...spawnOpts } = opts;
+    const effectiveMs = inheritedTimeout > 0 ? Math.min(ceilingMs, inheritedTimeout) : ceilingMs;
+    const child = spawn('/bin/sh', ['-c', command], { ...spawnOpts, detached: true });
+    const killGroup = () => { try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* gone */ } } };
+    // Independent parent-death protection: a SIGKILLed wrapper runs no handlers, so a tiny watchdog outside the group
+    // kills the group when the wrapper is gone or the deadline passes. It is local to this process, never part of the argv.
+    const watchdog = spawn(process.execPath, ['-e',
+      'const [g,p,ms]=process.argv.slice(1).map(Number);const end=Date.now()+ms;const k=()=>{try{process.kill(-g,"SIGKILL")}catch{}};'
+      + 'const i=setInterval(()=>{let alive=true;try{process.kill(p,0)}catch{alive=false}if(!alive||Date.now()>end){k();process.exit(0)}},500);',
+      String(child.pid), String(process.pid), String(effectiveMs + 5000)], { detached: true, stdio: 'ignore' });
+    watchdog.unref();
+    let expired = false;
+    const timer = setTimeout(() => { expired = true; killGroup(); }, effectiveMs);
+    const forward = (sig) => () => { killGroup(); process.exit(128 + (sig === 'SIGINT' ? 2 : sig === 'SIGHUP' ? 1 : 15)); };
+    const sigs = ['SIGTERM', 'SIGINT', 'SIGHUP'].map((sig) => [sig, forward(sig)]);
+    for (const [sig, h] of sigs) process.once(sig, h);
+    const done = () => { clearTimeout(timer); try { watchdog.kill('SIGKILL'); } catch { /* gone */ } for (const [sig, h] of sigs) process.removeListener(sig, h); };
+    child.on('error', (e) => { done(); rejectRun(e); });
+    child.on('exit', (code, signal) => {
+      done();
+      if (expired) { killGroup(); return rejectRun(Object.assign(new Error('run ceiling exceeded'), { code: 'ETIMEDOUT', status: null })); }
+      if (code === 0) return resolveRun();
+      return rejectRun(Object.assign(new Error(`Command failed: ${command}`), { status: code ?? undefined, signal }));
+    });
+  });
+}
+
 export async function runUnderAdmission({
   lockRoot, cap, owner, lane = null, num = null, repo = null, ceilingMs = DEFAULT_ADMISSION_CEILING_MS, leaseMinutes = ADMISSION_LEASE_MINUTES,
-  kind = null, command, cwd = process.cwd(), exec = (cmd, o) => execSync(cmd, o), log = (m) => process.stderr.write(m),
+  kind = null, command, cwd = process.cwd(), exec = defaultExec, log = (m) => process.stderr.write(m),
   now = () => Date.now(), sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   bypass = null, env = process.env, policy = loadAdmissionPolicy({ env }), waitMs = 0, waitSource = 'standard', location = null,
+  runCeilingMs = 0,
 }) {
+  if (wholeSuiteRefused({ command, policy, env, log })) return { exitCode: 125 };
   // The child always runs with the re-entrancy flag, so anything it runs that is itself wrapped passes through.
   const childEnv = { ...env, [ADMISSION_HELD_ENV]: '1' };
   if (bypass) {
     let exitCode = 0;
-    try { exec(command, { cwd, stdio: 'inherit', env: bypass === 'held' ? env : childEnv }); }
-    catch (e) { exitCode = childExitCode(e); }
+    try {
+      const bypassOpts = { cwd, stdio: 'inherit', env: bypass === 'held' ? env : childEnv };
+      if (runCeilingMs > 0) await execWithRunCeiling(command, bypassOpts, runCeilingMs, exec);
+      else exec(command, bypassOpts);
+    } catch (e) {
+      exitCode = childExitCode(e);
+      if (e && e.code === 'ETIMEDOUT') { exitCode = 124; log(`⚠ heavy-command admission: run exceeded ${runCeilingMs}ms and was stopped.\n`); }
+    }
     return { exitCode, admission: { ok: false, slot: null, timedOut: false, waitedMs: 0, bypassed: bypass } };
   }
   mkdirSync(lockRoot, { recursive: true });
   // xhlriy2: `log`/`env` threaded through so acquireSlotBlocking's still-waiting/ceiling warnings and its own
   // `WE_HEAVY_ADMISSION=off` check apply to the `run` wrapper's wait too, not just this function's own messages.
   // Card xkyw1x4 — the kind is read off the wrapped command itself unless the caller names it.
-  const runKind = kind ?? classifyCommandKind(command, env);
+  const runKind = kind ?? classifyAdmissionCommandKind(command, env);
   const admission = await acquireSlotBlocking({ lockRoot, cap, owner, lane, num, repo, kind: runKind, command, ceilingMs, leaseMinutes, now, sleep, log, env, policy, canDefer: true, waitMs, waitSource, location });
   if (admission.deferred) return { exitCode: ADMISSION_DEFERRED_EXIT, admission };
   if (admission.timedOut) {
@@ -2463,14 +2950,18 @@ export async function runUnderAdmission({
     log(`heavy-command admission: acquired slot-${admission.slot} after waiting ${admission.waitedMs}ms (cap=${cap}).\n`);
   }
   let exitCode = 0;
+  let execOptsTimeout = 0;
   try {
     // x1ds37v — a single-test debug run (`files`) is bounded to fit under the 10-minute Bash cap.
     const execOpts = { cwd, stdio: 'inherit', env: childEnv };
     if (runKind === 'files') execOpts.timeout = resolveFastRunTimeoutMs(env);
-    exec(command, execOpts);
+    // The caller's RUN ceiling starts at slot grant (queue wait is already over), unlike an exec timeout around the wrapper.
+    execOptsTimeout = execOpts.timeout ?? 0;
+    if (runCeilingMs > 0) { execOptsTimeout = runCeilingMs; await execWithRunCeiling(command, execOpts, runCeilingMs, exec); }
+    else exec(command, execOpts);
   } catch (e) {
     exitCode = childExitCode(e);
-    if (e && e.code === 'ETIMEDOUT') { exitCode = 124; log(`⚠ heavy-command admission: single-test run exceeded ${resolveFastRunTimeoutMs(env)}ms and was stopped.\n`); }
+    if (e && e.code === 'ETIMEDOUT') { exitCode = 124; log(`⚠ heavy-command admission: run exceeded ${execOptsTimeout}ms and was stopped.\n`); }
   } finally {
     if (admission.ok) releaseOwnedSlot({ lockRoot, cap, owner, fastSlots: resolveSlotSpan({ ...policy.settings, cap }) - cap });
   }
@@ -2484,8 +2975,9 @@ export async function runUnderAdmission({
  * `e.status` keeps working unchanged. Pass it as `execFileSync(r.file, r.args, opts)`.
  * @returns {{ file:string, args:string[] }}
  */
-export function admittedArgv(file, args = []) {
-  return { file: process.execPath, args: [HEAVY_ADMISSION_CLI, 'run', '--', file, ...args] };
+export function admittedArgv(file, args = [], { runCeilingMs = 0 } = {}) {
+  const ceiling = Number.isFinite(runCeilingMs) && runCeilingMs > 0 ? [`--run-ceiling-ms=${Math.floor(runCeilingMs)}`] : [];
+  return { file: process.execPath, args: [HEAVY_ADMISSION_CLI, 'run', ...ceiling, '--', file, ...args] };
 }
 
 /** The shell command line that runs a shell command string through the `run` wrapper (as `sh -c <cmd>`, so
@@ -2600,7 +3092,17 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
     // Card xkyw1x4 — the queue baseline (backlog in slot-minutes, standard times per kind, pending dispatched
     // sessions) that `tick-core.mjs`'s IO shell feeds to planTick's `queue-cap` gate. Read-only.
     const b = resolveQueueBaseline({ lockRoot, cap, checkoutRoot: repo });
-    if (asJson) { emit(b); return; }
+    const windowMinutes = flags['window-minutes'] == null ? 60 : Number(flags['window-minutes']);
+    if (typeof flags['window-minutes'] === 'boolean' || !Number.isFinite(windowMinutes) || windowMinutes <= 0) {
+      process.stderr.write('heavy-admission queue-status: --window-minutes must be a positive number\n');
+      process.exitCode = 2;
+      return;
+    }
+    const recentWaits = readRecentWaits(lockRoot, { windowMinutes });
+    if (asJson) { emit({ ...b, recentWaits }); return; }
+    const seconds = ms => ms == null ? 'n/a' : `${(ms / 1000).toFixed(1)}s`;
+    const routeText = route => `${route} p50 ${seconds(recentWaits.byRoute[route].p50Ms)} p90 ${seconds(recentWaits.byRoute[route].p90Ms)} over ${recentWaits.byRoute[route].count}`;
+    process.stdout.write(`recent waits (last ${windowMinutes}m): p50 ${seconds(recentWaits.p50Ms)} p90 ${seconds(recentWaits.p90Ms)} over ${recentWaits.count} admissions (${routeText('local')}, ${routeText('remote')})\n`);
     if (b.bypassed) { process.stdout.write(`queue admission bypassed (${b.bypassed})\n`); return; }
     process.stdout.write(`projected wait if you start now: ~${b.projectedWaitMinutes}m for a dispatch's short checks (max ${b.maxWaitMinutes}m), ~${b.heavyWaitMinutes}m for a full suite — `
       + `short ${b.shortBacklogMinutes} slot-min over ${b.shortCapacity} slot(s) (${b.fastSlots} fast + ${b.freeHeavySlots} free heavy), `
@@ -2645,6 +3147,10 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
       process.exit(3);
     }
     const command = argv.slice(dashDashIdx + 1).map(shellQuoteWord).join(' ');
+    if (wholeSuiteRefused({ command, policy, env: process.env, log: (line) => process.stderr.write(line) })) {
+      process.exit(125);
+    }
+    const runCeilingMs = /^\d+$/.test(String(flags['run-ceiling-ms'] ?? '')) ? Number(flags['run-ceiling-ms']) : 0;
     // xhlriy2: the hard give-up ceiling (default 120 minutes); `--timeout-ms` is kept as a legacy fallback.
     const ceilingMs = flags['ceiling-ms'] != null ? Number(flags['ceiling-ms'])
       : flags['timeout-ms'] != null ? Number(flags['timeout-ms'])
@@ -2710,10 +3216,10 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
         argv: remoteArgv, policy, cwd: repo ?? process.cwd(),
         env: process.env, remoteExec, readTelemetry, lockRoot, remoteClientOverride,
         onDecision: decision => { reportLocalExecution ||= decision.remote; },
-        timeoutMs: classifyCommandKind(command, process.env) === 'files' ? resolveFastRunTimeoutMs(process.env) : ceilingMs,
+        timeoutMs: runCeilingMs > 0 ? runCeilingMs : classifyAdmissionCommandKind(command, process.env) === 'files' ? resolveFastRunTimeoutMs(process.env) : ceilingMs,
       });
       if (result.handled) {
-        if (result.remoteResult?.mode === 'remote') recordRemoteRun({ lockRoot, ms: Date.now() - remoteStartedAt, kind: classifyCommandKind(command, process.env),
+        if (result.remoteResult?.mode === 'remote') recordRemoteRun({ lockRoot, ms: Date.now() - remoteStartedAt, kind: classifyAdmissionCommandKind(command, process.env),
           receiptId: result.remoteResult.receiptId ?? result.remoteResult.run });
         if (result.remoteResult?.mode === 'remote') appendVerifyRemoteReport(process.env, {
           location: 'remote', receiptId: result.remoteResult.receiptId ?? result.remoteResult.run, exitCode: result.exitCode,
@@ -2745,13 +3251,13 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
         }
       }
     }
-    const runOpts = { lockRoot, cap, owner, policy, lane: lane ?? (/lane-(\d+)/.exec(repo) || [])[1] ?? null, num, repo, ceilingMs, command, cwd: repo, bypass, kind: typeof flags.kind === 'string' ? flags.kind : null, waitMs, waitSource, ...(forceLocal ? { location: 'local' } : {}) };
+    const runOpts = { lockRoot, cap, owner, policy, lane: lane ?? (/lane-(\d+)/.exec(repo) || [])[1] ?? null, num, repo, ceilingMs, command, cwd: repo, bypass, kind: typeof flags.kind === 'string' ? flags.kind : null, waitMs, waitSource, runCeilingMs, ...(forceLocal ? { location: 'local' } : {}) };
     if (useContainer) runOpts.exec = (cmd, o) => execContainerized(cmd, { ...o, nodeModulesVolume: useNodeModulesVolume });
     const { exitCode } = await runUnderAdmission(runOpts);
     if (reportLocalExecution) appendVerifyRemoteReport(process.env, { location: 'local-fallback', exitCode });
     process.exit(exitCode);
   }
-  process.stderr.write(`usage: heavy-admission.mjs <status|load-status|queue-status|acquire|release|run|reap> [--apply] [--ttl-minutes=] [--repo=] [--cap=] [--max-per-core=] [--min-idle-pct=] [--min-pressure-level=] [--window=] [--owner=] [--lane=] [--num=] [--json] [--ceiling-ms=] [--wait-ms=] [--local] [-- <command…>]\n`);
+  process.stderr.write(`usage: heavy-admission.mjs <status|load-status|queue-status|acquire|release|run|reap> [--window-minutes=] [--apply] [--ttl-minutes=] [--repo=] [--cap=] [--max-per-core=] [--min-idle-pct=] [--min-pressure-level=] [--window=] [--owner=] [--lane=] [--num=] [--json] [--ceiling-ms=] [--wait-ms=] [--local] [-- <command…>]\n`);
   process.exit(3);
 }
 

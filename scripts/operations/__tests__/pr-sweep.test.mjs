@@ -147,6 +147,16 @@ describe('referral hold evidence (#5530: stale or unsaved hold)', () => {
     expect(r).toMatchObject({ waitingOn: 'ruling-needed:referral-hold', actor: 'operator', stalled: true });
     expect(r.next.command).toContain('record-referral-ruling');
   });
+  // Operator ruling R907 (PR #6724): a re-posted pause notice is NOT settled by older same-head rulings (it cannot be linked
+  // to its findings), so a newer unsaved hold with the same count on the same head must stay with the operator.
+  it('an equal count of older same-head auto-policy rulings does not settle a re-posted hold (R907)', () => {
+    const auto = c('plateau-reviewer[bot]', '2026-10-21T08:46:37Z', buildOperatorRulingComment({ version: 1, repo: REPO, pr: 5530, head: HEAD,
+      rulings: [{ runId: 'review-pr-1', key, result: 'block' }], actor: 'auto-policy', channel: 'review daemon', reason: 'auto-blocked by policy', at: '2026-10-21T11:46:28Z', clearerId: 's1' }));
+    const later = { ...plainHold, createdAt: '2026-10-21T09:00:00Z' };
+    const r = row(sweep([pr([recordComment, auto, later], { labels: L('review:changes', 'status:fixing') })]), 5530);
+    expect(r).toMatchObject({ waitingOn: 'ruling-needed:referral-hold', actor: 'operator', stalled: true });
+    expect(r.next.command).toContain('record-referral-ruling');
+  });
   it('a failed referral save is the system\'s even while a finding is open, and still names it', () => {
     const r = row(sweep([pr([recordComment, failedHold])]), 5530);
     expect(r).toMatchObject({ waitingOn: 'system:ledger-write-miss', actor: 'system' });

@@ -34,6 +34,7 @@
  * match) could never recognize a real non-WE heal session as live, so a genuinely in-flight sibling-repo heal
  * would have been re-planned every tick. Threading `repo` through here is what makes the two sides agree.
  */
+import { safeAdoptYield } from '../lib/daemon-rebuild/adopt-yield.mjs';
 import { appendBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 import { pollHealAttempts } from './probation-heal-run.mjs';
@@ -58,6 +59,7 @@ import {
   agentArgsFromEnv, briefPath, createDispatchSinks, defaultLoadItems, findItem, REPO_ROOT,
 } from './dispatch-lane-io.mjs';
 import { resolveDispatchRoute as decideDispatchRoute, readRoutingPolicy, resolveOperationRoute } from '../lib/dispatch-routing-policy-io.mjs';
+import { aiRoutingInputs, resolveAiRouting } from '../lib/ai-routing.mjs';
 import { assertMainNotStale } from './review-dispatch.mjs';
 import { armSelfReexecOnFastForward } from '../lib/main-staleness.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
@@ -122,14 +124,24 @@ function postFixLoopParkComment({ repoSlug, pr, body }) {
 }
 /** Use the fixer's existing stronger rung, otherwise the routing policy's native Claude heal route. */
 export function resolveStrongerCiHealRoute({ loadLadder = loadFixerLadder, readPolicy = readRoutingPolicy,
-  resolveRoute = resolveOperationRoute } = {}) {
+  resolveRoute = resolveOperationRoute, resolveRouting = resolveAiRouting, log = message => console.error(message) } = {}) {
   let table;
   try { table = fixerTableFor(planRoundEscalation({ round: 3, fromRound: 3, fixerLadder: loadLadder() })); }
   catch { table = null; }
   if (table) return { policyRoute: { provider: 'claude', model: table.model, effort: table.effort, fallback: [] }, source: table.reason };
   const policy = readPolicy();
-  const route = resolveRoute({ operation: 'ci-heal', available: ['claude'],
-    gateClosed: policy.criticalWorkGate.kinds.includes('ci-heal'), policy });
+  const options = { operation: 'ci-heal', available: ['claude'],
+    gateClosed: policy.criticalWorkGate.kinds.includes('ci-heal'), policy };
+  let route;
+  let routed = false;
+  try {
+    const { coordinator } = aiRoutingInputs('ci-heal', resolveRouting({ log }));
+    if (coordinator !== undefined) {
+      route = resolveRoute({ ...options, aiRouting: coordinator, operatorKeys: readPolicy.operatorKeys?.() });
+      routed = true;
+    }
+  } catch (error) { log(`ci-heal aiRouting unavailable; using existing route: ${error.message}`); }
+  if (!routed) route = resolveRoute(options);
   if (route?.provider !== 'claude') throw new Error('CI-heal stronger-model route did not resolve to Claude');
   return { policyRoute: { provider: 'claude', model: route.model, effort: route.effort, fallback: [] }, source: 'routing-policy ci-heal default' };
 }
@@ -399,6 +411,13 @@ export function orderCiHealEntriesOldestFirst(entries) {
  *   `ci:failed` with the daemon logging only "dispatched 0, refused N" — #2635's real reason
  *   (`owed-ci-rerun`) lived exclusively in here and nowhere the daemon ever printed.
  */
+// A repo whose durable flushes were skipped for the deadline runs them unconditionally next pass (never starved).
+const flushSkippedRepos = new Set();
+/** Test seam: forget which repos had a flush skipped. */
+export const resetCiHealFlushDeadlineState = () => flushSkippedRepos.clear();
+
+const LAUNCH_WAVE = 4;
+
 export async function runReconcileCiHealDispatch({
   root = REPO_ROOT,
   repo = null,
@@ -428,24 +447,42 @@ export async function runReconcileCiHealDispatch({
   fixConfig = fixLoopConfig(),
   currentBuild = () => currentCheckoutBuild(root),
   postParkComment = postFixLoopParkComment,
-  now = Date.now(),
+  now = Date.now,
+  deadlineAt, cursor, shouldYield,
+  gateSliceMs,
 } = {}) {
+  const clock = typeof now === 'function' ? now : () => now;
+  const startedAt = clock();
+  let yieldedForAdoption = false;
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`ci-heal-pr-dispatch: --repo ${repo} is not a constellation repo`);
+  let flushForced = flushSkippedRepos.has(repoKey);
+  // A forced flush (a previously deferred owedFlush/timeout pass) is never skipped again, not even for an adoption yield.
+  const pastDeadline = () => !flushForced && ((yieldedForAdoption ||= safeAdoptYield(shouldYield))
+    || (deadlineAt != null && clock() > deadlineAt));
+  let owedFlush = {}, timeoutFollowups = [];
+  const deadlineResult = () => (flushSkippedRepos.add(repoKey), { handled: 0, deferred: cursor == null ? [] : [cursor],
+    nextCursor: cursor ?? null, ...(yieldedForAdoption ? { yieldedForAdoption: true } : {}), ...(cursor == null ? { deadlineSkipped: true } : {}),
+    dispatched: [], refusals: [], reconcileRefusals: 0, reconcileRefusalDetails: [], owedFlush, timeoutFollowups });
+  if (pastDeadline()) return deadlineResult();
   // #x1rr9rh (multi-repo slice 2) — guards the DISPATCHING checkout (this WE checkout's own import path), not
   // the target repo; see `runReconcileFixDispatch`'s identical note for why this runs for every repo.
   assertMainNotStale(root, checkStaleness);
   // #4352 — retry any budget-refused CI-heal/escalation comment owed on this repo (see the docblock above).
   const healObservations = pollAttempts({ repo: repoKey });
-  const owedFlush = flushOwed(repoKey);
-  const timeoutFollowups = await flushTimeouts({ root, repo: CONSTELLATION_REPOS[repoKey].slug });
+  // The durable flushes are skipped only once per overrun: a flush skipped last pass runs now regardless of the
+  // clock, so a slow poll can never starve owed-write publication or timeout follow-ups (they are idempotent).
+  owedFlush = flushOwed(repoKey);
+  timeoutFollowups = await flushTimeouts({ root, repo: CONSTELLATION_REPOS[repoKey].slug });
+  flushSkippedRepos.delete(repoKey);
+  flushForced = false;
   const reconciled = reconcile({ repo, ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
   // A DEFERRED read planned nothing: owed is UNKNOWN, not zero. Skip the tick — no timeout reruns, no dispatch, no
   // unsupported-row rewrite (that would RELEASE rows the unread PRs still owe) — and say so.
   if (reconciled?.deferred === true) {
     const readDeferred = String(reconciled.message ?? reconciled.reason ?? 'deferred').split('\n')[0];
     console.error(`ci-heal-pr-dispatch: open-PR read deferred — owed unknown, skipping this tick: ${readDeferred}`);
-    return { dispatched: [], refusals: [], readDeferred, timeoutFollowups, reconcileRefusals: 0, reconcileRefusalDetails: [], owedFlush };
+    return { handled: 0, deferred: [], nextCursor: null, dispatched: [], refusals: [], readDeferred, timeoutFollowups, reconcileRefusals: 0, reconcileRefusalDetails: [], owedFlush };
   }
   const timeoutResults = [];
   for (const entry of (reconciled.dispatch ?? []).filter((row) => row.kind === 'ci-timeout-rerun')) {
@@ -462,9 +499,13 @@ export async function runReconcileCiHealDispatch({
       timeoutResults.push({ kind: 'ci-timeout-rerun', pr: entry.prNumber, status: 'refused', reason: error.message });
     }
   }
-  const ciHealEntries = orderCiHealEntriesOldestFirst((reconciled.dispatch ?? []).filter((entry) => entry.kind === 'ci-heal'));
+  let ciHealEntries = orderCiHealEntriesOldestFirst((reconciled.dispatch ?? []).filter((entry) => entry.kind === 'ci-heal'));
+  if (cursor != null) {
+    const start = ciHealEntries.findIndex(entry => entry.prNumber === cursor);
+    if (start > 0) ciHealEntries = [...ciHealEntries.slice(start), ...ciHealEntries.slice(0, start)];
+  }
   if (!ciHealEntries.length && timeoutResults.length) return {
-    dispatched: timeoutResults.filter((r) => r.status === 'requested'),
+    handled: 0, deferred: [], nextCursor: null, dispatched: timeoutResults.filter((r) => r.status === 'requested'),
     refusals: timeoutResults.filter((r) => r.status !== 'requested'), timeoutFollowups,
     reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals, owedFlush,
   };
@@ -480,7 +521,7 @@ export async function runReconcileCiHealDispatch({
       why: 'CI-heal dispatch requires a repo-specific brief and gate; the existing worker is WE-only.',
     }));
     recordUnsupported({ repo: repoKey, rows: [...otherRows, ...refusals], path: unsupportedPath });
-    return { dispatched: [], refusals, reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals, owedFlush };
+    return { handled: ciHealEntries.length, deferred: [], nextCursor: null, dispatched: [], refusals, reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals, owedFlush };
   }
   // `ci-heal` IS supported here — clear any stale `ci-heal` unsupported rows, preserving `fix`/`review` rows.
   recordUnsupported({ repo: repoKey, rows: otherRows, path: unsupportedPath });
@@ -488,148 +529,249 @@ export async function runReconcileCiHealDispatch({
   const resolveDiffPaths = fetchDiffPaths ?? ((pr) => fetchPrDiffPaths(pr, { root, repo: repoKey }));
   const lanes = [...(typeof pickFreeLanes === 'function' ? pickFreeLanes() : freeLaneNumbers({ root, lanePoolRepo: profile.lanePoolRepo }))];
   const queueBudget = queueBudgetFrom(queueAdmission, { root, repo: repoKey });
-  const dispatched = [];
-  const refusals = [];
+  const outcomes = [];
+  const launches = [];
+  const waitingForLane = [];
+  // Every ledger mutation shares one chain; a failed write must not poison later writes.
+  let ledgerWrites = Promise.resolve();
+  const appendLoop = row => {
+    const write = ledgerWrites.then(() => fixLoop.append(row));
+    ledgerWrites = write.catch(() => {});
+    return write;
+  };
   let build = null;
   try { build = await (fixLoop.currentBuild ?? currentBuild)(); } catch { /* Build lookup is best effort. */ }
+  let handled = 0;
+  let deferred = [];
+  console.error(`ci-heal-pr-dispatch: timing pre-loop ms=${clock() - startedAt}`);
+  // Phase A: finish admission and assign lanes before any expensive launch.
+  // Polling and flushes may have spent the phase budget already; admission gets its own bounded slice.
+  const effectiveGateSliceMs = gateSliceMs ?? 120_000;
+  const gateDeadlineAt = clock() + effectiveGateSliceMs;
+  console.error(`ci-heal-pr-dispatch: gate slice ms=${effectiveGateSliceMs} source=${gateSliceMs == null ? 'default' : 'option'}`);
   for (const entry of ciHealEntries) {
-    if (fixLoop.killed()) {
-      refusals.push({ pr: entry.prNumber, kind: 'fix-dispatch-killed', why: `kill file ${fixDispatchKillFile()} present` });
-      continue;
+    const entryNow = clock();
+    // Always finish the first entry: a plan that alone outlasts the budget must still make progress each pass.
+    if (handled > 0) yieldedForAdoption ||= safeAdoptYield(shouldYield);
+    if ((entryNow > gateDeadlineAt && handled > 0) || yieldedForAdoption) {
+      deferred = ciHealEntries.slice(handled).map(row => row.prNumber);
+      break;
     }
-    // TODO: expose PR labels in reconcile entries; the current plan only returns a PR count.
-    if (hasFixHoldLabel(entry.labels)) {
-      refusals.push({ pr: entry.prNumber, kind: 'fix-hold-label' });
-      continue;
-    }
-    const unsettled =healObservations.find(row => row.pr === entry.prNumber && row.status !== 'resolved');
-    if (unsettled) { refusals.push({ prNumber: entry.prNumber, kind: 'heal-unsettled', why: unsettled.error ?? 'owned wrapper still running' }); continue; }
-    if ((owedFlush.kept ?? []).some(row => row.pr === entry.prNumber)) { refusals.push({ prNumber: entry.prNumber, kind: 'heal-accounting-owed', why: 'durable heal accounting is not confirmed' }); continue; }
-    const hold = timeoutHold({ repo: CONSTELLATION_REPOS[repoKey].slug, pr: entry.prNumber, head: entry.headRefOid });
-    if (hold) { refusals.push({ pr: entry.prNumber, kind: 'ci-timeout-rerun', ...hold }); continue; }
-    if (salvageEnabled()) {
-      let recovered = null;
-      try { recovered = await salvage({ entry, root, repoKey, profile }); } catch { /* Fall through to dispatch. */ }
-      if (recovered?.pushed === true) {
-        dispatched.push({ kind: 'ci-heal-salvage', pr: entry.prNumber, sha: recovered.sha,
-          laneDir: recovered.laneDir, headRefName: entry.headRefName });
+    handled += 1;
+    const outcome = { dispatched: [], refusals: [] };
+    outcomes.push(outcome);
+    const { dispatched, refusals } = outcome;
+    let launch = null;
+    try {
+      if (fixLoop.killed()) {
+        refusals.push({ pr: entry.prNumber, kind: 'fix-dispatch-killed', why: `kill file ${fixDispatchKillFile()} present` });
         continue;
       }
-      if (recovered?.pushed === false && recovered.sha) {
-        refusals.push({ pr: entry.prNumber, kind: 'ci-heal-salvage-failed', why: recovered.reason });
+      // TODO: expose PR labels in reconcile entries; the current plan only returns a PR count.
+      if (hasFixHoldLabel(entry.labels)) {
+        refusals.push({ pr: entry.prNumber, kind: 'fix-hold-label' });
+        continue;
       }
-    }
-    let loopRows = [];
-    try { loopRows = fixLoop.readRows(); } catch { /* An unreadable ledger never blocks dispatch. */ }
-
-    const identity = { rows: loopRows, repo: repoKey, pr: entry.prNumber, head: entry.headRefOid, now, config: fixConfig };
-    const raw = fixLoopState(identity);
-    const infraRows = [], sessionRows = fixLoopSessionRows(identity);
-    for (const session of new Set(raw.sessions)) {
-      let logText = '';
-      try { logText = await (fixLoop.readSessionLog ?? (slug => readSessionLog(slug, root, { allowTruncated: false })))(session); } catch { /* Unreadable logs never block. */ }
-      const matching = sessionRows.filter(row => row.session === session);
-      // These logs are shared across heads and runs and have no dispatch IDs.
-      // Never align a partial history, an older head, or a rolling-window slice.
-      const history = loopRows.filter(row => row?.repo === repoKey && row.pr === entry.prNumber
-        && row.session === session && ['ci-heal', 'fix'].includes(row.kind));
-      if (history.length !== matching.length || history.some(row => !matching.includes(row))) continue;
-      const terminals = String(logText ?? '').split('\n').map(classifyFixRunOutcome)
-        .filter(row => row?.pr === entry.prNumber);
-      if (terminals.length !== matching.length) continue;
-      terminals.forEach((outcome, i) => {
-        if (outcome.infra) infraRows.push(matching[i]);
-      });
-    }
-    const infraFailures = infraRows.length;
-    const loop = fixLoopState({ ...identity, infraFailures });
-    const disposition = fixLoopDisposition({ ...identity, infraFailures, infraRows, build });
-    const shortHead = String(entry.headRefOid ?? '').slice(0, 7);
-    const counts = `${loop.count} ci-heal/fix sessions (${loop.rawCount} raw, ${loop.infraFailures} infrastructure discount) on head ${shortHead}`;
-    if (disposition.action === 'park' || disposition.action === 'parked') {
-      const why = `stood down to the operator queue on head ${shortHead}`;
-      try {
-        if (disposition.action === 'park') {
-          await postParkComment({ repoSlug: CONSTELLATION_REPOS[repoKey].slug, pr: entry.prNumber,
-            body: buildStandDownComment({ head: entry.headRefOid, actor: 'ci-heal fix-loop hold', reason: 'fix-loop-exhausted',
-              detail: `${counts}; ${disposition.reason}. Head: ${entry.headRefOid}.` }) });
-          await fixLoop.append({ repo: repoKey, pr: entry.prNumber, head: entry.headRefOid, kind: 'park', reason: disposition.reason });
+      const unsettled =healObservations.find(row => row.pr === entry.prNumber && row.status !== 'resolved');
+      if (unsettled) { refusals.push({ prNumber: entry.prNumber, kind: 'heal-unsettled', why: unsettled.error ?? 'owned wrapper still running' }); continue; }
+      if ((owedFlush.kept ?? []).some(row => row.pr === entry.prNumber)) { refusals.push({ prNumber: entry.prNumber, kind: 'heal-accounting-owed', why: 'durable heal accounting is not confirmed' }); continue; }
+      const hold = timeoutHold({ repo: CONSTELLATION_REPOS[repoKey].slug, pr: entry.prNumber, head: entry.headRefOid });
+      if (hold) { refusals.push({ pr: entry.prNumber, kind: 'ci-timeout-rerun', ...hold }); continue; }
+      if (salvageEnabled()) {
+        let recovered = null;
+        try { recovered = await salvage({ entry, root, repoKey, profile }); } catch { /* Fall through to dispatch. */ }
+        if (recovered?.pushed === true) {
+          dispatched.push({ kind: 'ci-heal-salvage', pr: entry.prNumber, sha: recovered.sha,
+            laneDir: recovered.laneDir, headRefName: entry.headRefName });
+          continue;
         }
-        refusals.push({ pr: entry.prNumber, kind: 'fix-loop-parked', why });
-      } catch (error) { refusals.push({ pr: entry.prNumber, kind: 'fix-loop-park-failed', why: error.message }); }
-      continue;
-    }
-    if (disposition.action === 'hold') {
-      refusals.push({ pr: entry.prNumber, kind: 'fix-loop-hold',
-        why: `${counts}; re-arms on the stronger-model rung at ${disposition.until} or when the fixer build changes; rearmAfterMinutes=${fixConfig.rearmAfterMinutes ?? 120} (source ${fixConfig.rearmAfterMinutesSource ?? 'default'})` });
-      continue;
-    }
-    const strongerModel = infraFailures >= 2 || disposition.action === 'rearm'
-      || loopRows.some(row => row.kind === 'rearm' && row.repo === repoKey && row.pr === entry.prNumber && row.head === entry.headRefOid);
-    let t = dispatchThrottle ? dispatchThrottle.tryAdmit('ci-heal') : { admit: true };
-    if (!t.admit && t.kind === 'fix-cap' && ciHealReserve) t = ciHealReserve.tryAdmit();
-    if (!t.admit) { refusals.push({ pr: entry.prNumber, kind: t.kind, why: t.why }); continue; }
-    if (t.note) console.error(`ci-heal-pr-dispatch: PR #${entry.prNumber} ci-heal launch admitted: ${t.note}`);
-    const q = queueBudget.tryAdmit('ci-heal', { id: entry.prNumber });
-    if (!q.admit) {
-      refusals.push({ pr: entry.prNumber, kind: 'queue-cap', why: queueCapWhy(q) });
-      continue;
-    }
-    let unit = null;
-    try {
-      unit = resolveWorkUnit({
-        repo: repoKey,
-        pr: { number: entry.prNumber, headRefName: entry.headRefName },
-        findItem: (n) => findItem(n, loadItems),
-        fetchDiffPaths: resolveDiffPaths,
-      });
-    } catch { unit = null; }
-    const planned = {
-      itemNum: unit?.itemNum ?? null, pr: entry.prNumber, laneRef: entry.headRefName,
-      scope: Array.isArray(unit?.scope) ? unit.scope : [], reason: entry.reason === 'codeql' ? 'codeql' : 'red-ci',
-      ...(entry.reason === 'codeql' && entry.codeql ? { codeql: entry.codeql } : {}), // card x8cnbii — the alert for the brief
-      ...(entry.owedMainRule ? { owedMainRule: entry.owedMainRule } : {}), // PR #5082 — drain numbers the healer must keep
-      // #x0jphk5 — carried through so `dispatchCiHeal` can key its `(repo, pr, headRefOid)` claim; dropped
-      // before this slice, even though `reconcile-core.mjs`'s own `base` object already carries it on every
-      // entry (see this function's own docblock — "a CI-heal entry carries neither on `reconcile-core.mjs`'s
-      // own `dispatch` row" was true of item/scope, never of `headRefOid`).
-      headRefOid: entry.headRefOid ?? null,
-      ...(strongerModel ? { strongerModel: true } : {}),
-      ...(entry.altBranch ? { altBranch: entry.altBranch } : {}), // fix procedure — saved repair of a re-armed pause.
-    };
-
-    if (lanes.length === 0) {
-      refusals.push({ pr: entry.prNumber, kind: 'no-lane', why: `no free lane to dispatch a CI-heal agent for PR #${entry.prNumber}` });
-      continue;
-    }
-    planned.lane = lanes.shift();
-    try {
-      if (disposition.action === 'rearm') {
-        await fixLoop.append({ repo: repoKey, pr: entry.prNumber, head: entry.headRefOid, kind: 'rearm', reason: disposition.reason });
-        console.error(`ci-heal-pr-dispatch: PR #${entry.prNumber} fix-loop-hold re-armed on head ${shortHead} (${disposition.reason}) → stronger-model rung (claude); rearmAfterMinutes=${fixConfig.rearmAfterMinutes ?? 120} (source ${fixConfig.rearmAfterMinutesSource ?? 'default'})`);
+        if (recovered?.pushed === false && recovered.sha) {
+          refusals.push({ pr: entry.prNumber, kind: 'ci-heal-salvage-failed', why: recovered.reason });
+        }
       }
-      if (infraFailures >= 2) console.error(`ci-heal-pr-dispatch: PR #${entry.prNumber} codex launcher failed ${infraFailures}× on head ${shortHead} (infrastructure) → stronger-model rung (claude)`);
-      // eslint-disable-next-line no-await-in-loop -- sequential by design: each entry gets its own lane.
-      const result = await dispatch(planned, { root, repo: repoKey, extraArgs: agentArgsFromEnv() });
-      if (result?.held) {
-        // #x0jphk5 — nothing was spawned, so the lane this iteration popped went unused — return it to the
-        // pool for the NEXT entry (mirrors `runReconcileFixDispatch`'s identical fix, `reconcile-fix-
-        // dispatch.mjs`).
-        lanes.unshift(planned.lane);
-        refusals.push({ pr: entry.prNumber, kind: 'held', why: result.reason ?? `a CI-heal for PR #${entry.prNumber} is already in flight` });
+      let loopRows = [];
+      try { loopRows = fixLoop.readRows(); } catch { /* An unreadable ledger never blocks dispatch. */ }
+
+      const identity = { rows: loopRows, repo: repoKey, pr: entry.prNumber, head: entry.headRefOid, now: entryNow, config: fixConfig };
+      const raw = fixLoopState(identity);
+      const infraRows = [], sessionRows = fixLoopSessionRows(identity);
+      for (const session of new Set(raw.sessions)) {
+        let logText = '';
+        try { logText = await (fixLoop.readSessionLog ?? (slug => readSessionLog(slug, root, { allowTruncated: false })))(session); } catch { /* Unreadable logs never block. */ }
+        const matching = sessionRows.filter(row => row.session === session);
+        // These logs are shared across heads and runs and have no dispatch IDs.
+        // Never align a partial history, an older head, or a rolling-window slice.
+        const history = loopRows.filter(row => row?.repo === repoKey && row.pr === entry.prNumber
+          && row.session === session && ['ci-heal', 'fix'].includes(row.kind));
+        if (history.length !== matching.length || history.some(row => !matching.includes(row))) continue;
+        const terminals = String(logText ?? '').split('\n').map(classifyFixRunOutcome)
+          .filter(row => row?.pr === entry.prNumber);
+        if (terminals.length !== matching.length) continue;
+        terminals.forEach((outcome, i) => {
+          if (outcome.infra) infraRows.push(matching[i]);
+        });
+      }
+      const infraFailures = infraRows.length;
+      const loop = fixLoopState({ ...identity, infraFailures });
+      const disposition = fixLoopDisposition({ ...identity, infraFailures, infraRows, build });
+      const shortHead = String(entry.headRefOid ?? '').slice(0, 7);
+      const counts = `${loop.count} ci-heal/fix sessions (${loop.rawCount} raw, ${loop.infraFailures} infrastructure discount) on head ${shortHead}`;
+      if (disposition.action === 'park' || disposition.action === 'parked') {
+        const why = `stood down to the operator queue on head ${shortHead}`;
+        try {
+          if (disposition.action === 'park') {
+            await postParkComment({ repoSlug: CONSTELLATION_REPOS[repoKey].slug, pr: entry.prNumber,
+              body: buildStandDownComment({ head: entry.headRefOid, actor: 'ci-heal fix-loop hold', reason: 'fix-loop-exhausted',
+                detail: `${counts}; ${disposition.reason}. Head: ${entry.headRefOid}.` }) });
+            await appendLoop({ repo: repoKey, pr: entry.prNumber, head: entry.headRefOid, kind: 'park', reason: disposition.reason });
+          }
+          refusals.push({ pr: entry.prNumber, kind: 'fix-loop-parked', why });
+        } catch (error) { refusals.push({ pr: entry.prNumber, kind: 'fix-loop-park-failed', why: error.message }); }
         continue;
       }
-      dispatched.push(result);
+      if (disposition.action === 'hold') {
+        refusals.push({ pr: entry.prNumber, kind: 'fix-loop-hold',
+          why: `${counts}; re-arms on the stronger-model rung at ${disposition.until} or when the fixer build changes; rearmAfterMinutes=${fixConfig.rearmAfterMinutes ?? 120} (source ${fixConfig.rearmAfterMinutesSource ?? 'default'})` });
+        continue;
+      }
+      const strongerModel = infraFailures >= 2 || disposition.action === 'rearm'
+        || loopRows.some(row => row.kind === 'rearm' && row.repo === repoKey && row.pr === entry.prNumber && row.head === entry.headRefOid);
+      let t = dispatchThrottle ? dispatchThrottle.tryAdmit('ci-heal') : { admit: true };
+      if (!t.admit && t.kind === 'fix-cap' && ciHealReserve) t = ciHealReserve.tryAdmit();
+      if (!t.admit) { refusals.push({ pr: entry.prNumber, kind: t.kind, why: t.why }); continue; }
+      if (t.note) console.error(`ci-heal-pr-dispatch: PR #${entry.prNumber} ci-heal launch admitted: ${t.note}`);
+      const q = queueBudget.tryAdmit('ci-heal', { id: entry.prNumber });
+      if (!q.admit) {
+        refusals.push({ pr: entry.prNumber, kind: 'queue-cap', why: queueCapWhy(q) });
+        continue;
+      }
+      let unit = null;
       try {
-        await fixLoop.append({ repo: repoKey, pr: entry.prNumber, kind: 'ci-heal', head: entry.headRefOid,
-          session: result?.session ?? result?.sessionSlug ?? sessionSlugFor(null, 'ci-heal', entry.prNumber, '', repoKey), build });
-      } catch { /* Dispatch succeeded; ledger writes are best effort. */ }
-    } catch (e) {
-      refusals.push({ pr: entry.prNumber, kind: 'dispatch-failed', why: describeDispatchFailure(e) });
+        unit = resolveWorkUnit({
+          repo: repoKey,
+          pr: { number: entry.prNumber, headRefName: entry.headRefName },
+          findItem: (n) => findItem(n, loadItems),
+          fetchDiffPaths: resolveDiffPaths,
+        });
+      } catch { unit = null; }
+      const planned = {
+        itemNum: unit?.itemNum ?? null, pr: entry.prNumber, laneRef: entry.headRefName,
+        scope: Array.isArray(unit?.scope) ? unit.scope : [], reason: entry.reason === 'codeql' ? 'codeql' : 'red-ci',
+        ...(entry.reason === 'codeql' && entry.codeql ? { codeql: entry.codeql } : {}), // card x8cnbii — the alert for the brief
+        ...(entry.owedMainRule ? { owedMainRule: entry.owedMainRule } : {}), // PR #5082 — drain numbers the healer must keep
+        // #x0jphk5 — carried through so `dispatchCiHeal` can key its `(repo, pr, headRefOid)` claim; dropped
+        // before this slice, even though `reconcile-core.mjs`'s own `base` object already carries it on every
+        // entry (see this function's own docblock — "a CI-heal entry carries neither on `reconcile-core.mjs`'s
+        // own `dispatch` row" was true of item/scope, never of `headRefOid`).
+        headRefOid: entry.headRefOid ?? null,
+        ...(strongerModel ? { strongerModel: true } : {}),
+        ...(entry.altBranch ? { altBranch: entry.altBranch } : {}), // fix procedure — saved repair of a re-armed pause.
+      };
+
+      const prepare = async () => {
+        if (disposition.action === 'rearm') {
+          await appendLoop({ repo: repoKey, pr: entry.prNumber, head: entry.headRefOid, kind: 'rearm', reason: disposition.reason });
+          console.error(`ci-heal-pr-dispatch: PR #${entry.prNumber} fix-loop-hold re-armed on head ${shortHead} (${disposition.reason}) → stronger-model rung (claude); rearmAfterMinutes=${fixConfig.rearmAfterMinutes ?? 120} (source ${fixConfig.rearmAfterMinutesSource ?? 'default'})`);
+        }
+        if (infraFailures >= 2) console.error(`ci-heal-pr-dispatch: PR #${entry.prNumber} codex launcher failed ${infraFailures}× on head ${shortHead} (infrastructure) → stronger-model rung (claude)`);
+      };
+      launch = { entry, planned, outcome, gateMs: 0, prepare };
+      if (lanes.length === 0) {
+        // Admission is already counted. Only a held launch can free a lane in this pass.
+        waitingForLane.push(launch);
+        continue;
+      }
+      planned.lane = lanes.shift();
+      try {
+        await prepare();
+        launch.prepare = null;
+        launches.push(launch);
+      } catch (e) {
+        launch = null;
+        refusals.push({ pr: entry.prNumber, kind: 'dispatch-failed', why: describeDispatchFailure(e) });
+      }
+    } finally {
+      const gateMs = clock() - entryNow;
+      if (launch) launch.gateMs = gateMs;
+      else console.error(`ci-heal-pr-dispatch: timing PR #${entry.prNumber} gate-ms=${gateMs} dispatch-ms=0`);
     }
   }
 
-  return { dispatched: [...dispatched, ...timeoutResults.filter((r) => r.status === 'requested')],
+  // Phase B: launch all admitted entries together, keeping their output in Phase A order.
+  let launchStarted = false;
+  let hostRefused = null;
+  const runLaunch = async ({ entry, planned, outcome, gateMs, prepare }) => {
+    let dispatchMs = 0;
+    try {
+      // Admission ran up front, so a stop requested meanwhile (kill file, adoption yield) is honoured before each launch.
+      if (fixLoop.killed()) {
+        outcome.refusals.push({ pr: entry.prNumber, kind: 'fix-dispatch-killed', why: `kill file ${fixDispatchKillFile()} present` });
+        return;
+      }
+      // The first launch is exempt from adoption yield; host capacity guards still apply.
+      if (launchStarted && (yieldedForAdoption ||= safeAdoptYield(shouldYield))) {
+        deferred.push(entry.prNumber);
+        outcome.refusals.push({ pr: entry.prNumber, kind: 'adoption-yield', why: 'daemon adoption requested a yield before this launch' });
+        return;
+      }
+      launchStarted = true;
+      if (prepare) await prepare();
+      if (!hostRefused && dispatchThrottle) {
+        let recheck;
+        try {
+          if (typeof dispatchThrottle.recheckHost !== 'function') throw new Error('host recheck method missing');
+          recheck = dispatchThrottle.recheckHost('ci-heal');
+        } catch (e) {
+          recheck = { admit: false, kind: 'host-load', why: `host recheck unreadable (${String(e?.message ?? e).slice(0, 120)})` };
+        }
+        if (recheck?.admit !== true) {
+          hostRefused = { kind: recheck?.kind ?? 'host-load', why: recheck?.why ?? 'host recheck unreadable; launch deferred' };
+        }
+      }
+      if (hostRefused) {
+        outcome.refusals.push({ pr: entry.prNumber, ...hostRefused });
+        console.error(`ci-heal-pr-dispatch: PR #${entry.prNumber} refused (${hostRefused.kind}): ${hostRefused.why}`);
+        return;
+      }
+      const dispatchStartedAt = clock();
+      let result;
+      try {
+        result = await dispatch(planned, { root, repo: repoKey, extraArgs: agentArgsFromEnv() });
+      } finally { dispatchMs = clock() - dispatchStartedAt; }
+      if (result?.held) {
+        outcome.refusals.push({ pr: entry.prNumber, kind: 'held', why: result.reason ?? `a CI-heal for PR #${entry.prNumber} is already in flight` });
+        const next = waitingForLane.shift();
+        if (next) {
+          next.planned.lane = planned.lane;
+          await runLaunch(next);
+        }
+        return;
+      }
+      outcome.dispatched.push(result);
+      try {
+        await appendLoop({ repo: repoKey, pr: entry.prNumber, kind: 'ci-heal', head: entry.headRefOid,
+          session: result?.session ?? result?.sessionSlug ?? sessionSlugFor(null, 'ci-heal', entry.prNumber, '', repoKey), build });
+      } catch { /* Dispatch succeeded; ledger writes are best effort. */ }
+    } catch (e) {
+      outcome.refusals.push({ pr: entry.prNumber, kind: 'dispatch-failed', why: describeDispatchFailure(e) });
+    } finally {
+      console.error(`ci-heal-pr-dispatch: timing PR #${entry.prNumber} gate-ms=${gateMs} dispatch-ms=${dispatchMs}`);
+    }
+  };
+  // Waves of at most LAUNCH_WAVE concurrent launches: the kill switch and adoption yield are re-read between waves.
+  for (let i = 0; i < launches.length; i += LAUNCH_WAVE) await Promise.all(launches.slice(i, i + LAUNCH_WAVE).map(runLaunch));
+  for (const { entry, outcome, gateMs } of waitingForLane) {
+    outcome.refusals.push({ pr: entry.prNumber, kind: 'no-lane', why: `no free lane to dispatch a CI-heal agent for PR #${entry.prNumber}` });
+    console.error(`ci-heal-pr-dispatch: timing PR #${entry.prNumber} gate-ms=${gateMs} dispatch-ms=0`);
+  }
+  const dispatched = outcomes.flatMap(row => row.dispatched);
+  const refusals = outcomes.flatMap(row => row.refusals);
+  // Phase B can yield an earlier admitted PR than the first Phase A deferral.
+  // Resume from the earliest untouched PR in this pass's (possibly rotated) order.
+  const deferredPrs = new Set(deferred);
+  deferred = ciHealEntries.filter(entry => deferredPrs.has(entry.prNumber)).map(entry => entry.prNumber);
+
+  return { ...(yieldedForAdoption ? { yieldedForAdoption: true } : {}), handled, deferred, nextCursor: deferred[0] ?? null, dispatched: [...dispatched, ...timeoutResults.filter((r) => r.status === 'requested')],
     refusals: [...refusals, ...timeoutResults.filter((r) => r.status !== 'requested')], timeoutFollowups,
     reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals, owedFlush };
 }

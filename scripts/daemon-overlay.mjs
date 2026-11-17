@@ -421,9 +421,15 @@ export function removeRegistration({ root, ref, by = null, reason = null, env = 
   if (state.corrupt) throw new Error('overlay state is corrupt — refusing removal');
   const entry = state.overlays.find((o) => o.ref === ref);
   if (!entry) return { removed: false, list: state.overlays };
+  // Preserve the exact tip for reasoned removal bookkeeping; this path supplies no operator retirement proof.
+  let tip = null;
+  if (typeof reason === 'string' && reason.trim()) {
+    try { tip = (deps.tip ?? ((r) => remoteTip({ root, ref: r, env })))(ref) ?? null; }
+    catch { /* Unknown tip leaves a removal record without retirement proof. */ }
+  }
   const result = (deps.remove ?? removeOverlay)(root, ref, { env, why: reason || 'operator', expectedOverlay: entry });
   if (result.removed && entry.pinned === true) writeRebuildRequest(root, { by, reason: reason || 'operator', ref, lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT });
-  if (result.removed) appendOverlayEvent(root, { kind: 'removed', ref, by, reason }, { env });
+  if (result.removed) appendOverlayEvent(root, { kind: 'removed', ref, by, reason, tip }, { env });
   return result;
 }
 
@@ -437,7 +443,9 @@ export function removeRegistration({ root, ref, by = null, reason = null, env = 
  * Same race class as the rebuild's own auto-drop (`daemon-rebuild/prepare.mjs` removes `in-main`/`pr-merged` decisions by
  * name with no tip re-check at all); this path adds a re-proof, a pre- and post-drop tip check and a durable intent.
  */
-export async function retireRegistration({ root, ref, expectedTip, expectedEntry, by = null, env = process.env, deps = {} }) {
+// `actor` is the authenticated lowercase login verified by the explicit withdrawal caller.
+// Automatic retirement callers omit it and cannot produce operator retirement evidence.
+export async function retireRegistration({ root, ref, expectedTip, expectedEntry, by = null, actor, env = process.env, deps = {} }) {
   const prove = deps.prove ?? ((entry) => proveRetirement({ root, entry, env }));
   const tip = deps.tip ?? ((r) => remoteTip({ root, ref: r, env }));
   return withAddGuardLock(root, env, async () => {
@@ -470,7 +478,9 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
     }
     clearPending(root, env, ref);
     if (entry.pinned === true) writeRebuildRequest(root, { by, reason: proof.reason, ref, lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT });
-    appendOverlayEvent(root, { kind: 'auto-retired', ref, pr: entry.pr ?? null, by, reason: proof.reason, tip: expectedTip, evidence: proof.evidence }, { env });
+    appendOverlayEvent(root, { kind: 'auto-retired', ref, pr: entry.pr ?? null, by, reason: proof.reason, tip: expectedTip, evidence: proof.evidence,
+      ...(typeof actor === 'string' && actor.trim() && typeof proof.reason === 'string' && proof.reason.trim()
+        ? { actor, operatorReason: true } : {}) }, { env });
     return { retired: true, refused: null, reason: proof.reason, evidence: proof.evidence, settled, list: readOverlays(root, { env }) };
   });
 }

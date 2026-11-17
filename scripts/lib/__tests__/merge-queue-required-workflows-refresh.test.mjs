@@ -48,6 +48,23 @@ describe('required-workflows refusal (ruleset 24930207)', () => {
     try { s.enqueue({ num: 42 }, HEAD, { comments: [] }); expect.fail('must throw'); }
     catch (e) { expect(e.code).toBe('required-workflows-unsatisfied'); expect(e.headSha).toBe(HEAD); expect(e.message).toBe(`github-merge-queue enqueue FAILED (${LIVE}) — NOT merged directly; retried next pass`); }
   });
+  it('marks the candidate when the refusal is the "merge-gate is expected" shape, so recovery can route it to the verified path', () => {
+    const GATE = `gh: Pull request Required workflows 'Merge gate' failed Required status check "merge-gate" is expected.`;
+    const exec = (cmd, args) => {
+      if (args[1] === 'graphql') throw Object.assign(new Error('gh failed'), { stderr: GATE });
+      return execFor()(cmd, args);
+    };
+    const s = createDrainMergeStrategy({
+      localSlug: 'owner/repo', isLocalRepo: () => true, exec,
+      readRedTeamEvidence: () => ({ loopPayload: null, inFlight: false, recorded: false }),
+      batching: { gate: () => ({ admit: true }) },
+      readFile: () => '{"pending":[],"followedUp":[]}', statePath: '/unused', writeState: () => {}, log: { write() {} },
+      resolved: { policy: resolveMergeDeliveryPolicy({ tool: { strategy: 'github-merge-queue' } }), note: null },
+    });
+    const c = { num: 42 };
+    try { s.enqueue(c, HEAD, { comments: [] }); expect.fail('must throw'); }
+    catch (e) { expect(e.code).toBe('required-workflows-unsatisfied'); expect(c.mergeGateExpected).toBe(true); }
+  });
   it('decides off, fresh, already refreshed and repeated refusal', () => {
     const base = { key: KEY, headSha: HEAD, state: {}, setting: 'on' };
     expect(q.decideRequiredWorkflowsRefresh({ ...base, setting: 'off' }).action).toBe('off');

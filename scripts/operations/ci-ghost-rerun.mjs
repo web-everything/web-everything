@@ -1,0 +1,397 @@
+#!/usr/bin/env node
+/**
+ * @file scripts/operations/ci-ghost-rerun.mjs
+ * @description Standalone, audited recovery of completed-step GitHub Actions ghost jobs.
+ * One invocation recovers one workflow; every in-progress Actions check must be a ghost.
+ * Incomplete/oversized evidence requires manual inspection in GitHub. A busy state lock
+ * requires retry, or operator cleanup after confirming its owner is no longer running.
+ * Shared allowance: timeout-retry-state.mjs#readTimeoutStates reads ci-timeout-reruns
+ * under ghThrottleLockRoot(), keyed by repo/PR/head (including legacy state files).
+ * Confirmed plus unreleased rejected requests spend the once-per-head allowance;
+ * pending or unreadable evidence refuses. Shared reservations are written under the
+ * conveyor's per-head lock before any POST and confirmed only after an accepted rerun.
+ * Our attempts.jsonl also enforces a lifetime per-head cap independently of the
+ * rolling window; window expiry never resets it.
+ * On shared-budget refusal, an operator must inspect the shared state and workflow
+ * before resolving pending/unreadable evidence or recovering the run manually.
+ */
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmdirSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { setTimeout as sleepDefault } from 'node:timers/promises';
+import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
+import { isValidCiGhostRerunSettings, readCiGhostRerunSettings } from '../lib/ci-ghost-rerun-settings.mjs';
+import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
+import { timeoutStateDir, timeoutKey, readTimeoutStates } from '../conveyor/timeout-retry-state.mjs';
+
+const positiveId = value => Number.isSafeInteger(value) && value > 0;
+const oneLine = value => typeof value === 'string' && value.trim().length > 0
+  && !/[\x00-\x1f\x7f\u0085\u2028\u2029]/u.test(value);
+const failure = (reason, exitCode = 2) => ({ reason, exitCode });
+
+/** Pure, conservative classification. No candidate is returned if any job is real/unknown. */
+export function detectGhostJobs({ jobs, now, thresholdMin }) {
+  const time = Number(now);
+  if (!Array.isArray(jobs) || !Number.isFinite(time) || !(thresholdMin > 0)) return failure('not-ghost');
+  const pending = jobs.filter(job => job?.status === 'in_progress');
+  if (!pending.length) return failure('no-in-progress-job');
+  for (const job of pending) {
+    if (!Array.isArray(job.steps) || !job.steps.length) return failure('no-steps');
+    if (job.steps.some(step => step?.status !== 'completed')) return failure('not-ghost');
+    if (job.steps.some(step => !['success', 'skipped', 'neutral'].includes(step.conclusion))) return failure('step-failed');
+    const dates = job.steps.map(step => typeof step.completed_at === 'string' ? Date.parse(step.completed_at) : NaN);
+    if (dates.some(date => !Number.isFinite(date))) return failure('not-ghost');
+    if (time - Math.max(...dates) <= thresholdMin * 60_000) return failure('too-young');
+  }
+  return { exitCode: 0, reason: 'ghost', jobs: pending };
+}
+
+/** A single JSONL ledger holds audit and counted attempt reservations; the lock spans the effect. */
+export function createStateStore(dir = join(homedir(), '.claude', 'ci-ghost-rerun'), io = {
+  appendFileSync, mkdirSync, readFileSync, rmdirSync, statSync,
+}) {
+  const ledger = join(dir, 'attempts.jsonl');
+  const lock = join(dir, 'operation.lock');
+  return {
+    read() {
+      let contents;
+      try {
+        if (io.statSync(ledger).size > 8 * 1024 * 1024) throw new Error('state oversized; archive ledger before retry');
+        contents = io.readFileSync(ledger, 'utf8');
+      } catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+      return contents.split('\n').filter(Boolean).map(line => {
+        const row = JSON.parse(line);
+        if (!row || !Number.isFinite(Date.parse(row.ts)) || typeof row.outcome !== 'string'
+          || !Object.hasOwn(row, 'counted') || typeof row.counted !== 'boolean'
+          || (row.counted && (typeof row.repo !== 'string' || !row.repo.trim() || !positiveId(row.pr)
+            || typeof row.head !== 'string' || row.head.length !== 40 || !/^[a-f\d]{40}$/i.test(row.head)))) {
+          throw new Error('state unreadable; inspect ledger before retry');
+        }
+        return row;
+      });
+    },
+    append(row) {
+      io.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      io.appendFileSync(ledger, `${JSON.stringify(row)}\n`, { mode: 0o600 });
+    },
+    async withLock(fn) {
+      io.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      try { io.mkdirSync(lock, { mode: 0o700 }); }
+      catch (error) { if (error.code === 'EEXIST') return failure('state-busy', 3); throw error; }
+      try { return await fn(); } finally { io.rmdirSync(lock); }
+    },
+  };
+}
+
+// Same transaction and lock as ci-heal-pr-dispatch: both writers serialize per head.
+function timeoutTransaction(path, initial, fn) {
+  return withFileLock(`${path}.lock`, () => {
+    const state = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : initial();
+    if (state.version !== 1 || !Array.isArray(state.requests)) throw new Error('corrupt-timeout-state');
+    const result = fn(state);
+    writeJsonAtomic(path, state);
+    return result;
+  });
+}
+
+function validateSharedState(state, evidence) {
+  if (!state || typeof state !== 'object' || Array.isArray(state) || state.version !== 1
+    || !state.evidence || !Object.entries(evidence).every(([key, value]) => state.evidence[key] === value)
+    || !Array.isArray(state.requests)) throw new Error('corrupt-timeout-state');
+  for (const request of state.requests) {
+    if (!request || typeof request !== 'object' || Array.isArray(request)
+      || !['confirmed', 'pending', 'rejected'].includes(request.status)
+      || (Object.hasOwn(request, 'released') && typeof request.released !== 'boolean')) {
+      throw new Error('corrupt-timeout-request');
+    }
+  }
+}
+
+/** Injectable runner takes argv, never shell text. POSTs intentionally have no JSON response. */
+export function defaultGh(args) {
+  // Recovery requires fresh evidence. The memo consults throttle.env, while
+  // nested gh shims inherit env; disable caches in both without mutating process.env.
+  const env = { ...process.env, WE_FINISHED_CI_CACHE: '0' };
+  delete env.WE_GH_READ_MEMO_DIR;
+  const output = execFileSyncThrottled('gh', args, {
+    env, throttle: { env },
+    encoding: 'utf8', timeout: 30_000, maxBuffer: 8 * 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  return output.trim() ? JSON.parse(output) : null;
+}
+
+export async function runCiGhostRerun(options, {
+  gh = defaultGh, clock = Date.now, sleep = sleepDefault,
+  state = createStateStore(), settings = readCiGhostRerunSettings(),
+  readSharedRerunStates = readTimeoutStates, sharedStateDir,
+} = {}) {
+  const { actor, channel, pr, repo, dryRun = false } = options;
+  const audit = { ts: new Date(clock()).toISOString(), actor: actor ?? null, channel: channel ?? null,
+    repo, pr: pr ?? null, head: null, runId: null, jobId: null };
+  let before = null;
+  const finish = result => {
+    state.append({ ...audit, ts: new Date(clock()).toISOString(), outcome: result.reason, counted: false });
+    return { ...result, ...audit, before, newRunAttempt: result.newRunAttempt ?? null };
+  };
+  const api = (endpoint, method = 'GET') => gh(['api', `repos/${repo}/${endpoint}`, '--method', method]);
+  try {
+    if (sharedStateDir === undefined) {
+      const current = timeoutStateDir();
+      // All environment inputs consulted by ghThrottleLockRoot (including defaultPoolRoot).
+      // Resolve synchronously and restore before any IO or await can observe the clean env.
+      const inputs = ['WE_GH_THROTTLE_LOCK_ROOT', 'LANE_POOL_ROOT', 'HOME'];
+      const saved = inputs.map(key => [key, process.env[key]]);
+      let canonical;
+      try {
+        inputs.forEach(key => { delete process.env[key]; });
+        canonical = timeoutStateDir();
+      } finally {
+        for (const [key, value] of saved) {
+          if (value !== undefined) process.env[key] = value;
+        }
+      }
+      if (current !== canonical) return finish(failure('shared-state-env-override'));
+      sharedStateDir = current;
+    }
+    if (options.invalid || !oneLine(actor) || !/^[a-z\d](?:[a-z\d-]*)(?:\[bot\])?$/i.test(actor)
+      || !oneLine(channel)) return finish(failure('invalid-attribution'));
+    if (!positiveId(pr) || !/^[a-z\d_.-]+\/[a-z\d_.-]+$/i.test(repo)) return finish(failure('invalid-target'));
+    if (!isValidCiGhostRerunSettings(settings)) {
+      return finish(failure('invalid-settings'));
+    }
+    const result = await state.withLock(async () => {
+      const pull = await api(`pulls/${pr}`);
+      if (!['OPEN', 'open'].includes(pull?.state)) return failure('pr-not-open', 4);
+      audit.head = pull?.head?.sha ?? null;
+      if (typeof audit.head !== 'string' || !/^[a-f\d]{40}$/i.test(audit.head)) return failure('head-unreadable');
+      const checks = await api(`commits/${audit.head}/check-runs?per_page=100`);
+      // No partial first-page evidence: the operator must inspect larger runs manually.
+      if (!Array.isArray(checks?.check_runs) || !Number.isSafeInteger(checks.total_count)
+        || checks.total_count !== checks.check_runs.length || checks.total_count > 100) return failure('checks-incomplete');
+      const jobs = [];
+      const jobsByRun = new Map();
+      const runsById = new Map();
+      for (const check of checks.check_runs) {
+        if (check?.app?.slug !== 'github-actions' || check.status !== 'in_progress') continue;
+        if (!positiveId(check.id)) return failure('job-unreadable');
+        // Checks and Actions jobs have independent IDs. Locate the workflow from
+        // its details URL, then join its jobs to the check via check_run_url.
+        const checkUrl = `https://api.github.com/repos/${repo}/check-runs/${check.id}`;
+        let details;
+        try { details = new URL(check.details_url); } catch { return failure('job-unreadable'); }
+        const runId = Number(/^\/(.+)\/actions\/runs\/([1-9]\d*)(?:\/job\/[1-9]\d*)?$/.exec(details.pathname)?.[2]);
+        if (check.url !== checkUrl || details.origin !== 'https://github.com' || !positiveId(runId)
+          || !details.pathname.startsWith(`/${repo}/actions/runs/`)) return failure('job-unreadable');
+        if (!jobsByRun.has(runId)) {
+          const run = await api(`actions/runs/${runId}`);
+          if (run?.id !== runId || !positiveId(run.run_attempt)) return failure('run-unreadable');
+          runsById.set(runId, run);
+          const listed = await api(`actions/runs/${runId}/attempts/${run.run_attempt}/jobs?per_page=100`);
+          if (!Array.isArray(listed?.jobs) || !Number.isSafeInteger(listed.total_count)
+            || listed.total_count !== listed.jobs.length || listed.total_count > 100) return failure('jobs-incomplete');
+          if (listed.jobs.some(job => job?.run_attempt !== run.run_attempt)) return failure('run-attempt-mismatch');
+          jobsByRun.set(runId, listed.jobs);
+        }
+        const matches = jobsByRun.get(runId).filter(job => job?.check_run_url === checkUrl);
+        if (matches.length !== 1 || !positiveId(matches[0].id) || matches[0].run_id !== runId) return failure('job-unreadable');
+        const job = await api(`actions/jobs/${matches[0].id}`);
+        if (job?.id !== matches[0].id || job.run_id !== runId || job.check_run_url !== checkUrl) return failure('job-unreadable');
+        if (job.run_attempt !== runsById.get(runId).run_attempt) return failure('run-attempt-mismatch');
+        if (job.status !== 'in_progress') return failure('not-ghost');
+        jobs.push(job);
+      }
+      const decision = detectGhostJobs({ jobs, now: clock(), thresholdMin: settings.thresholdMin });
+      if (decision.exitCode) return decision;
+      // Cancellation affects the entire workflow, including siblings absent from checks.
+      for (const [runId, listedJobs] of jobsByRun) {
+        const validated = new Set(decision.jobs.filter(job => job.run_id === runId).map(job => job.id));
+        if (listedJobs.some(job => job?.status === 'completed'
+          && !['success', 'skipped', 'neutral'].includes(job.conclusion))) return failure('sibling-failed');
+        if (listedJobs.some(job => !job || (job.status !== 'completed'
+          && !(job.status === 'in_progress' && validated.has(job.id))))) return failure('sibling-active');
+      }
+      const job = decision.jobs[0];
+      audit.jobId = job.id;
+      audit.runId = job.run_id;
+      const runPath = `actions/runs/${job.run_id}`;
+      const run = await api(runPath);
+      before = { status: run?.status ?? null, jobStatus: job.status, runAttempt: run?.run_attempt ?? null };
+      if (run?.head_sha !== audit.head) return failure('head-sha-mismatch');
+      if (run.id !== job.run_id || !positiveId(run.run_attempt) || run.status !== 'in_progress') return failure('run-unreadable');
+      if (job.run_attempt !== run.run_attempt) return failure('run-attempt-mismatch');
+      let attempts;
+      try { attempts = await state.read(); }
+      catch { return failure('state-unreadable', 4); }
+      const since = clock() - settings.windowHours * 3_600_000;
+      const perHead = attempts.filter(row => row.counted && row.repo === repo && row.pr === pr && row.head === audit.head);
+      if (perHead.length >= settings.maxPerHead
+        || perHead.filter(row => Date.parse(row.ts) > since).length >= settings.maxPerWindow) return failure('rate-capped', 3);
+      const evidence = { repo, pr, head: audit.head };
+      const path = join(sharedStateDir, `${timeoutKey(evidence)}.json`);
+      const initial = () => {
+        const legacy = readSharedRerunStates(evidence, sharedStateDir);
+        if (!Array.isArray(legacy)) throw new Error('corrupt-timeout-state');
+        legacy.forEach(entry => validateSharedState(entry, evidence));
+        const mergedEvidence = legacy.length
+          ? Object.assign({}, ...legacy.map(entry => entry.evidence))
+          : { ...evidence, failures: [] };
+        return { version: 1, evidence: mergedEvidence, card: legacy.find(entry => entry.card)?.card,
+          requests: legacy.flatMap(entry => entry.requests).map((request, id) => ({ ...request, id })) };
+      };
+      let reservation;
+      try {
+        mkdirSync(sharedStateDir, { recursive: true });
+        const allowed = timeoutTransaction(path, initial, shared => {
+          validateSharedState(shared, evidence);
+          if (shared.requests.some(request => request.status !== 'rejected' || request.released !== true)) return false;
+          if (!dryRun) {
+            reservation = { id: shared.requests.length, signature: 'ci-ghost-rerun',
+              target: { run: job.run_id, job: job.id, attempt: run.run_attempt }, status: 'pending',
+              reservedAt: new Date(clock()).toISOString(), outcome: 'reserved; API outcome unknown' };
+            shared.requests.push(reservation);
+          }
+          return true;
+        });
+        if (!allowed) return failure('shared-rerun-budget', 3);
+      } catch { return failure('shared-rerun-budget', 3); }
+      if (dryRun) return { exitCode: 0, reason: 'dry-run' };
+      let rerunSent = false;
+      try {
+        const checkPull = async () => {
+          const current = await api(`pulls/${pr}`);
+          if (!['OPEN', 'open'].includes(current?.state)) return failure('pr-not-open', 4);
+          if (current?.head?.sha !== audit.head) return failure('head-moved', 4);
+          return null;
+        };
+        const preflight = async status => {
+          try {
+            const pullFailure = await checkPull();
+            if (pullFailure) return pullFailure;
+            const current = await api(runPath);
+            if (current?.id !== job.run_id || current.head_sha !== audit.head
+              || current.run_attempt !== run.run_attempt || current.status !== status
+              || (status === 'completed' && !['cancelled', 'success'].includes(current.conclusion))) {
+              return failure('run-changed', 4);
+            }
+            const listed = await api(`${runPath}/attempts/${run.run_attempt}/jobs?per_page=100`);
+            if (!Array.isArray(listed?.jobs) || !Number.isSafeInteger(listed.total_count)
+              || listed.total_count !== listed.jobs.length || listed.total_count > 100) {
+              return failure('run-changed', 4);
+            }
+            const inspectedJobs = decision.jobs.filter(candidate => candidate.run_id === job.run_id);
+            const validated = new Map(inspectedJobs.map(candidate => [candidate.id, candidate]));
+            if (inspectedJobs.some(candidate => !listed.jobs.some(entry => entry?.id === candidate.id))) {
+              return failure('run-changed', 4);
+            }
+            const ids = new Set();
+            for (const listedJob of listed.jobs) {
+              if (!positiveId(listedJob?.id) || ids.has(listedJob.id)
+                || listedJob.run_id !== job.run_id || listedJob.run_attempt !== run.run_attempt) {
+                return failure('run-changed', 4);
+              }
+              ids.add(listedJob.id);
+              if (listedJob.status === 'completed') {
+                const conclusions = validated.has(listedJob.id)
+                  ? ['success', 'skipped', 'neutral', 'cancelled'] : ['success', 'skipped', 'neutral'];
+                if (!conclusions.includes(listedJob.conclusion)) return failure('run-changed', 4);
+                continue;
+              }
+              // Queued, unknown, or newly active siblings cannot inherit ghost validation.
+              const inspected = validated.get(listedJob.id);
+              if (listedJob.status !== 'in_progress' || !inspected
+                || listedJob.check_run_url !== inspected.check_run_url) return failure('run-changed', 4);
+              const currentJob = await api(`actions/jobs/${listedJob.id}`);
+              if (currentJob?.id !== inspected.id || currentJob.run_id !== inspected.run_id
+                || currentJob.run_attempt !== run.run_attempt || currentJob.check_run_url !== inspected.check_run_url
+                || detectGhostJobs({ jobs: [currentJob], now: clock(), thresholdMin: settings.thresholdMin }).exitCode) {
+                return failure('run-changed', 4);
+              }
+            }
+            return null;
+          } catch { return failure('run-changed', 4); }
+        };
+        const waitCompleted = async () => {
+          // At most 13 reads per phase, regardless of injected clock behavior.
+          const ticks = Math.min(12, Math.ceil(settings.cancelWaitSec / 5));
+          for (let tick = 0; tick <= ticks; tick++) {
+            const current = await api(runPath);
+            if (current?.id !== job.run_id || current.head_sha !== audit.head) throw new Error('run evidence changed');
+            if (current.run_attempt !== run.run_attempt) return failure('run-attempt-changed', 4);
+            if (current.status === 'completed') {
+              return ['cancelled', 'success'].includes(current.conclusion)
+                ? true : failure('run-failed-on-cancel', 4);
+            }
+            if (tick < ticks) await sleep(settings.cancelWaitSec * 1000 / ticks);
+          }
+          return false;
+        };
+        const cancelRun = await preflight('in_progress');
+        if (cancelRun) return cancelRun;
+        // Known-unsent preflight refusals spend no local allowance. Reserve durably
+        // before the first POST so ambiguous failures and process death still count.
+        await state.append({ ...audit, ts: new Date(clock()).toISOString(), outcome: 'attempt', counted: true });
+        try { await api(`${runPath}/cancel`, 'POST'); } catch { /* force-cancel remains available */ }
+        let completed = await waitCompleted();
+        if (typeof completed !== 'boolean') return completed;
+        if (!completed) {
+          const forceCancelRun = await preflight('in_progress');
+          if (forceCancelRun) return forceCancelRun;
+          try {
+            await api(`${runPath}/force-cancel`, 'POST');
+          } catch { /* still poll to confirm cancellation */ }
+          completed = await waitCompleted();
+          if (typeof completed !== 'boolean') return completed;
+        }
+        if (!completed) return failure('cancel-unconfirmed', 4);
+        const rerunRun = await preflight('completed');
+        if (rerunRun) return rerunRun;
+        rerunSent = true;
+        await api(`${runPath}/rerun`, 'POST');
+        timeoutTransaction(path, initial, shared => {
+          const request = shared.requests[reservation.id];
+          request.status = 'confirmed';
+          request.outcome = 'API accepted; retry result not yet observed';
+        });
+        return { exitCode: 0, reason: 'rerun', newRunAttempt: run.run_attempt + 1 };
+      } finally {
+        if (!rerunSent) timeoutTransaction(path, initial, shared => {
+          const request = shared.requests[reservation.id];
+          if (request.status === 'pending') { request.status = 'rejected'; request.released = true; }
+        });
+      }
+    });
+    return finish(result);
+  } catch {
+    // Do not print child output (which can contain untrusted terminal escapes or credentials).
+    try { return finish(failure('evidence-or-state-unreadable', 4)); }
+    catch { return { ...failure('audit-unwritable', 4), before, newRunAttempt: null }; }
+  }
+}
+
+export function parseArgs(args) {
+  const options = {};
+  const seen = new Set();
+  for (const arg of args) {
+    const match = /^--(pr|actor|channel|repo)=(.*)$/s.exec(arg);
+    const key = match?.[1] ?? (arg === '--dry-run' ? 'dryRun' : arg === '--json' ? 'json' : null);
+    if (!key || seen.has(key)) { options.invalid = true; continue; }
+    seen.add(key);
+    options[key] = match ? (key === 'pr' ? Number(match[2]) : match[2]) : true;
+  }
+  return options;
+}
+
+if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
+  const options = parseArgs(process.argv.slice(2));
+  const result = await runCiGhostRerun(options);
+  console.log(options.json ? JSON.stringify(result) :
+    `${result.reason}; before=${JSON.stringify(result.before)}; newRunAttempt=${result.newRunAttempt ?? 'none'}`);
+  if (result.reason === 'invalid-settings') console.error('Correct or remove invalid ciGhostRerun overrides before retrying: thresholdMin >= 5, maxPerWindow integer 1..3, maxPerHead integer 1..2, windowHours 1..24, cancelWaitSec 5..300.');
+  else if (result.reason === 'shared-state-env-override') console.error('Restore WE_GH_THROTTLE_LOCK_ROOT, LANE_POOL_ROOT and HOME to the host defaults before retrying so recovery uses the shared budget location.');
+  else if (result.reason === 'shared-rerun-budget') console.error('Inspect the shared ci-timeout-reruns state and workflow; resolve pending/unreadable evidence or recover manually.');
+  else if (result.reason === 'rate-capped') console.error('Inspect the ledger and workflow; a lifetime per-head cap requires a new head or manual recovery. Window expiry only clears the rolling cap.');
+  else if (result.exitCode) console.error('Inspect workflow evidence in GitHub; retry after the cap/window or state lock clears. Inspect state before removing a stale lock.');
+  process.exitCode = result.exitCode;
+}

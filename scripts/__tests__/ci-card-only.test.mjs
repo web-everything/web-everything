@@ -69,7 +69,7 @@ describe('docs-only light path', () => {
       });
     });
 
-  it.each(['push', 'merge_group', 'schedule', 'workflow_dispatch', undefined])(
+  it.each(['push', 'schedule', 'workflow_dispatch', undefined])(
     'fails closed for event %s even with docs and cards', (event) => {
       expect(classifyLight({ event, files: ['docs/agent/a.md', 'backlog/1-x.md'] })).toEqual({
         light: false, reason: expect.any(String),
@@ -220,7 +220,7 @@ describe('fresh main basis (#5619: frozen event base.sha after the drain merged 
     expect(step).toContain('BASE_REF: ${{ github.event.pull_request.base.ref }}');
     expect(step).toContain('BASE_SHA: ${{ github.event.pull_request.base.sha }}');
     expect(step.slice(step.indexOf('run: |'))).not.toContain('${{'); // no expression interpolated into the script
-    expect(step).toContain("if git fetch --no-tags --filter=blob:none --depth=1000000 origin '+refs/heads/main:refs/remotes/origin/main'; then");
+    expect(step).toContain('if sh scripts/ci/fetch-main-history.sh; then');
     expect(step).toContain('--base-ref="$BASE_REF" --fresh-main-sha="$FRESH_MAIN_SHA"');
   });
 });
@@ -240,5 +240,113 @@ describe('review-gate workflow label fast path', () => {
     const m = yml.match(/HOLD_LABELS_LIST='([^']*)'/);
     expect(m).toBeTruthy();
     expect(m[1].split(',').sort()).toEqual([...REVIEW_HOLD_LABELS].sort());
+  });
+});
+
+
+describe('merge_group card-only light path', () => {
+  it('classifies a non-empty card-only group as light', () => {
+    expect(classifyLight({ event: 'merge_group', files: ['backlog/1-a.md', 'backlog/2-b.md'] }))
+      .toEqual({ light: true, reason: expect.any(String) });
+  });
+  it.each(['scripts/x.mjs', 'docs/agent/a.md', 'README.md', 'backlog/../scripts/x.mjs', 'backlog/tool.mjs'])(
+    'runs the full suite when a group also changes %s', (path) => {
+      expect(classifyLight({ event: 'merge_group', files: ['backlog/1-a.md', path] }).light).toBe(false);
+    });
+  it.each([[], undefined, null].map(files => ({ files })))(
+    'fails closed for an empty or unreadable group diff: $files', ({ files }) => {
+      expect(classifyLight({ event: 'merge_group', files }).light).toBe(false);
+    });
+  it.each(['push', 'schedule', 'workflow_dispatch'])(
+    '%s remains full even for cards alone', event => {
+      expect(classifyLight({ event, files: ['backlog/1-a.md'] }).light).toBe(false);
+    });
+
+  function fixture(check) {
+    const cwd = mkdtempSync(join(tmpdir(), 'ci-merge-group-'));
+    const git = (...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    const commit = message => {
+      git('add', '-A');
+      git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', message);
+      return git('rev-parse', 'HEAD');
+    };
+    const cli = resolve(import.meta.dirname, '../ci-card-only.mjs');
+    const out = (base, head, extra = []) => execFileSync(process.execPath,
+      [cli, '--event=merge_group', ...(base === undefined ? [] : [`--base=${base}`]), `--head=${head}`, ...extra],
+      { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    try {
+      git('init', '-q', '-b', 'main');
+      writeFileSync(join(cwd, 'README.md'), 'base');
+      const base = commit('base');
+      mkdirSync(join(cwd, 'backlog'));
+      writeFileSync(join(cwd, 'backlog/1-a.md'), 'card');
+      const head = commit('card group');
+      check({ cwd, git, commit, base, head, out });
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  }
+
+  it('CLI diffs the supplied group base against the supplied head, rather than checkout HEAD', () => {
+    fixture(({ cwd, commit, base, head, out }) => {
+      mkdirSync(join(cwd, 'scripts'));
+      writeFileSync(join(cwd, 'scripts/x.mjs'), 'export {};');
+      commit('later checkout contains code');
+      expect(out(base, head)).toBe('light=true');
+    });
+  });
+  it('CLI accepts cards with the empty PR-only flags supplied by the workflow', () => {
+    fixture(({ base, head, out }) => {
+      expect(out(base, head, ['--base-ref=', '--fresh-main-sha='])).toBe('light=true');
+    });
+  });
+  it.each(['scripts/x.mjs', 'docs/a.md', 'README.md'])(
+    'CLI runs full when the group changes %s', path => {
+      fixture(({ cwd, commit, base, out }) => {
+        mkdirSync(dirname(join(cwd, path)), { recursive: true });
+        writeFileSync(join(cwd, path), 'non-card change');
+        expect(out(base, commit('mixed group'))).toBe('light=false');
+      });
+    });
+  it.each(['missing', 'empty', 'short', 'ref', 'option', 'unknown', 'non-ancestor'])(
+    'CLI fails closed for a %s base even when its net diff would contain only cards', kind => {
+      fixture(({ git, commit, base, head, out }) => {
+        let candidate = { missing: undefined, empty: '', short: base.slice(0, 8), ref: 'main', option: '--help', unknown: 'f'.repeat(40) }[kind];
+        if (kind === 'non-ancestor') {
+          git('checkout', '-q', '-b', 'sibling', base);
+          git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '--allow-empty', '-qm', 'sibling');
+          candidate = git('rev-parse', 'HEAD');
+          expect(git('diff', '--name-only', candidate, head)).toBe('backlog/1-a.md');
+        }
+        expect(out(candidate, head)).toBe('light=false');
+      });
+    });
+  it('CLI fails closed for an empty group diff', () => {
+    fixture(({ base, out }) => expect(out(base, base)).toBe('light=false'));
+  });
+  it('CLI fails closed when the group head cannot be read', () => {
+    fixture(({ base, out }) => expect(out(base, 'e'.repeat(40))).toBe('light=false'));
+  });
+  it('CLI does not hide a rename from code into backlog', () => {
+    fixture(({ cwd, git, commit, base, out }) => {
+      git('mv', 'README.md', 'backlog/renamed.md');
+      expect(out(base, commit('move non-card into backlog'))).toBe('light=false');
+    });
+  });
+
+  it('workflow passes merge_group.base_sha via env and uses it as the detector base', () => {
+    const yml = readFileSync(resolve(import.meta.dirname, '../../.github/workflows/ci.yml'), 'utf8');
+    const step = yml.slice(yml.indexOf('- name: Is this a card-only PR?'), yml.indexOf('# Sharded unit suite'));
+    expect.soft(step).toContain('MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}');
+    const script = step.slice(step.indexOf('run: |') + 'run: |'.length).trimEnd()
+      .split('\n').slice(1).map(line => line.replace(/^          /, '')).join('\n');
+    const cwd = mkdtempSync(join(tmpdir(), 'ci-group-workflow-'));
+    try {
+      writeFileSync(join(cwd, 'node'), '#!/bin/sh\nprintf "%s\n" "$@" > "$CAPTURE"\n', { mode: 0o755 });
+      const capture = join(cwd, 'args');
+      const base = 'a'.repeat(40);
+      execFileSync('bash', ['-e', '-c', script], { cwd, env: { ...process.env, PATH: `${cwd}:${process.env.PATH}`,
+        EVENT_NAME: 'merge_group', MG_BASE_SHA: base, BASE_SHA: '', BASE_REF: '',
+        CAPTURE: capture, GITHUB_OUTPUT: join(cwd, 'output') }, stdio: ['ignore', 'pipe', 'pipe'] });
+      expect(readFileSync(capture, 'utf8').split('\n')).toContain(`--base=${base}`);
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
   });
 });

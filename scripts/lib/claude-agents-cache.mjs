@@ -12,13 +12,18 @@ export function claudeAgentsCacheTtlMs(env = process.env) {
 }
 
 /** Return the raw stdout string; cache failures never replace the caller's fetch result/error. */
-export function cachedClaudeAgents({ all = false, fetch, env = process.env, now = Date.now, dir } = {}) {
+export function cachedClaudeAgents({ all = false, fetch, env = process.env, now = Date.now, dir, storeKey, fresh = false } = {}) {
   const ttl = claudeAgentsCacheTtlMs(env);
-  if (!ttl) return String(fetch());
+  // `fresh`: destructive paths and absence claims never trust a cached listing.
+  if (!ttl || fresh) return String(fetch());
   dir ??= join(tmpdir(), `we-claude-agents-cache-${process.getuid?.() ?? 'unknown'}`);
   // Scope the file to the environment that resolves `claude` (PATH/HOME/CLAUDE_CONFIG_DIR): a test pointing
   // PATH at a fake `claude` must never read, or poison, the live daemons' cache.
-  const scope = createHash('sha1').update(JSON.stringify([env.PATH ?? '', env.HOME ?? '', env.CLAUDE_CONFIG_DIR ?? '']))
+  // `storeKey` (multi-store listing) is appended only when given, so a single-store caller keeps its
+  // pre-existing file name and entries written under the old key are simply never read by a keyed call.
+  const parts = [env.PATH ?? '', env.HOME ?? '', env.CLAUDE_CONFIG_DIR ?? ''];
+  if (storeKey !== undefined) parts.push(storeKey);
+  const scope = createHash('sha1').update(JSON.stringify(parts))
     .digest('hex').slice(0, 12);
   const file = join(dir, `${all ? 'agents-all' : 'agents'}-${scope}.json`);
   try {

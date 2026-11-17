@@ -151,7 +151,8 @@ export const strictGh = (gh) => (bin, args, opts) => {
   const ok = args[0] === 'api' && /\/events\?/.test(path) ? json().flat().every((e) => typeof e?.event === 'string' && time(e.created_at) && (e.event !== 'labeled' || typeof e.label?.name === 'string'))
     : args[0] === 'api' && /\/comments\?/.test(path) ? json().flat().every((c) => typeof c?.user?.login === 'string' && typeof c.body === 'string' && time(c.created_at))
       : args[0] === 'pr' && args[1] === 'view' && args.includes('commits') ? Array.isArray(json()?.commits) && json().commits.every((c) => typeof c?.oid === 'string' && time(c.committedDate))
-        : true;
+        : args[0] === 'api' && /\/pulls\/\d+\/files\?/.test(path) ? filePageValid(json())
+          : true;
   if (!ok) throw new Error(`malformed gh response: ${args.slice(0, 3).join(' ')}`);
   return out;
 };
@@ -163,12 +164,28 @@ export const strictDrainText = (readText = tailOf) => (path) => {
   if (!Array.isArray(rows) || !rows.every((r) => Number.isSafeInteger(r?.num) && r.num > 0 && typeof r.kind === 'string')) throw new Error('malformed drain skip row');
   return text;
 };
+const FILE_LIST_CAP = 3000;
+const filePageValid = (page) => Array.isArray(page) && page.length <= 100
+  && page.every((f) => typeof f?.filename === 'string' && f.filename.length > 0);
 const ghFiles = (gh) => (repo, n) => {
-  const view = JSON.parse(gh('gh', ['pr', 'view', String(n), '-R', repo, '--json', 'files,changedFiles'], { encoding: 'utf8', timeout: 120_000, maxBuffer: 64 * 1024 * 1024 }));
-  // Every entry must name a path: a partial list is unreadable evidence, and the whole pass then plans nothing.
-  // `gh` returns at most 100 files: a list shorter than `changedFiles` is truncated evidence, never "all the files".
-  if (!Array.isArray(view?.files) || view.files.length !== view.changedFiles || !view.files.every((f) => typeof f?.path === 'string' && f.path)) throw new Error('unreadable or truncated file list');
-  return view.files.map((f) => f.path);
+  const run = strictGh(gh);
+  const opts = { encoding: 'utf8', timeout: 120_000, maxBuffer: 64 * 1024 * 1024 };
+  const view = JSON.parse(run('gh', ['pr', 'view', String(n), '-R', repo, '--json', 'changedFiles'], opts));
+  if (!Number.isSafeInteger(view?.changedFiles) || view.changedFiles < 0) throw new Error('unreadable changedFiles count');
+  const list = [];
+  const overCap = () => Object.assign(new Error('file-list-over-cap: operator must inspect the full PR diff'), {
+    code: 'file-list-over-cap', fileList: { state: 'file-list-over-cap', cap: FILE_LIST_CAP, changedFiles: view.changedFiles, listedFiles: list.length },
+  });
+  // At GitHub's ceiling completeness cannot be proven, even if the count says exactly 3000.
+  if (view.changedFiles >= FILE_LIST_CAP) throw overCap();
+  for (let page = 1; page <= FILE_LIST_CAP / 100; page += 1) {
+    const batch = JSON.parse(run('gh', ['api', `repos/${repo}/pulls/${n}/files?per_page=100&page=${page}`], opts));
+    list.push(...batch.map((f) => f.filename));
+    if (list.length >= FILE_LIST_CAP) throw overCap();
+    if (batch.length < 100) break;
+  }
+  if (list.length !== view.changedFiles) throw new Error('unreadable or truncated file list');
+  return list;
 };
 
 /**
@@ -280,17 +297,27 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
     const pr = prs.get(`${row.repo}#${row.number}`);
     const head = String(pr?.headRefOid ?? '');
     const trigger = JUDGED_STATES[row.waitingOn];
-    let verdict = null; let list = [];
+    let verdict = null; let list = []; let fileListFailure = null;
     if (trigger) {
       try {
         list = await files(row.repo, row.number);
         if (!Array.isArray(list) || !list.length || !list.every((x) => typeof x === 'string' && x)) throw new Error('unreadable or empty file list');
         const cap = detectRoundCap({ comments: pr.comments, pr: row.number, head, state: row.waitingOn === 'at-round-limit' ? 'at-round-limit' : null, repo: row.repo });
-        verdict = cap?.trigger === trigger ? judge({ pr: row.number, repo: row.repo, head, trigger, comments: pr.comments, files: list, setting: breaks.value, maxGrants: judgeCfg.maxGrants }) : null;
-      } catch (e) { base.errors.push(`judge ${row.repo}#${row.number}: ${msg(e)}`); verdict = null; readFailed = true; }
+        // A PR in a judged state whose thread shows no cap record (e.g. a findings-less settled referral notice) still gets the judge, run for the state's own trigger with NO thread evidence (an unmatched thread may hold already-ruled findings); the judge fails closed on no evidence, never null (null = the classifier's "not an object" operator park).
+        verdict = (cap?.trigger === trigger || !cap) ? judge({ pr: row.number, repo: row.repo, head, trigger, comments: cap ? pr.comments : [], files: list, setting: breaks.value, maxGrants: judgeCfg.maxGrants }) : null;
+      } catch (e) {
+        base.errors.push(`judge ${row.repo}#${row.number}: ${msg(e)}`); readFailed = true;
+        if (e?.code === 'file-list-over-cap') fileListFailure = e.fileList;
+        else verdict = null;
+      }
     }
     const context = { row, head, verdict, files: list, card: null, settings: classifierSettings(cfg) };
     const metadata = { repo: row.repo, pr: row.number, head, prHead: `${row.repo}#${row.number}@${head.toLowerCase()}`, state: row.waitingOn, title: String(row.title ?? '').slice(0, 120), verdict: verdict?.verdict ?? null };
+    if (fileListFailure) {
+      items.push({ ...metadata, lane: 'operator', action: 'ruling-needed', key: `${metadata.prHead}:file-list-over-cap`,
+        reason: 'file-list-over-cap: complete file evidence unavailable; operator must inspect the full PR diff', fileList: fileListFailure });
+      continue;
+    }
     if (['red-team-pending', 'drain-skip:red-team-pending'].includes(row.waitingOn)) {
       const { status, ownerAlive } = await pendingEvidence(row, head);
       pending.push({ context, metadata, status, ownerAlive, statusSnapshot: JSON.stringify(status) });
@@ -358,7 +385,8 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
       lanes: Object.fromEntries(['system', 'policy', 'operator'].map((l) => [l, items.filter((i) => i.lane === l).length])) },
     ...plan.act.filter(i => !live(i)).map((i) => ({ ts, phase: 'would-do', mode: cfg.mode, ...note, ...i })),
     ...plan.held.map((i) => ({ ts, phase: 'would-skip', mode: cfg.mode, ...i })).filter(fresh),
-    ...(incomplete ? [] : items.filter((i) => i.lane === 'operator').map((i) => ({ ts, phase: 'operator', mode: cfg.mode, ...i })).filter(fresh)),
+    ...items.filter((i) => i.lane === 'operator' && (!incomplete || i.fileList?.state === 'file-list-over-cap'))
+      .map((i) => ({ ts, phase: 'operator', mode: cfg.mode, ...i })).filter(fresh),
   ];
   // An action that is not durably recorded would escape the rate limits next pass: an unwritten log plans nothing.
   try { appendAudit(outDir, now, records); } catch (e) { return failed(e); }

@@ -7,6 +7,7 @@ import { cliReviewTickOpts, defaultReviewHostAdmission, runReviewTick, sharedHos
 import * as reviewJob from '../../../scripts/operations/review-job.mjs';
 import * as redTeamEvidence from '../../../scripts/lib/drain-red-team-evidence.mjs';
 import * as resultLabelSync from '../../../scripts/lib/red-team-result-label-sync.mjs';
+import * as gateCatchUp from '../../../scripts/lib/red-team-gate-catchup.mjs';
 import * as redTeamRecovery from '../../../scripts/lib/review-red-team-on-skip.mjs';
 import * as hostSample from '../../../scripts/lib/host-sample.mjs';
 import { planReconcile } from '../../../scripts/conveyor/reconcile-core.mjs';
@@ -25,6 +26,31 @@ beforeEach(() => {
   vi.spyOn(hostSample, 'sampleHost').mockReturnValue({ idlePct: 0 });
 });
 const readQueueFile = () => existsSync(QUEUE_FILE) ? readFileSync(QUEUE_FILE, 'utf8') : null;
+
+it('CLI catches up gates after label repair, before capacity recovery, and survives catch-up exceptions', () => {
+  const repo = 'web-everything/web-everything', rawPrs = [], repaired = [], refusals = [];
+  const order = [];
+  vi.spyOn(resultLabelSync, 'syncResultOnHeadLabels').mockImplementation(() => {
+    order.push('labels'); return { rawPrs: repaired };
+  });
+  const catchUp = vi.spyOn(gateCatchUp, 'runGateCatchUp').mockImplementation(() => {
+    order.push('gate'); throw Error('catch-up failure');
+  });
+  vi.spyOn(redTeamRecovery, 'runRedTeamOnSkip').mockImplementation(() => {
+    order.push('capacity'); return { dispatched: [] };
+  });
+  vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', 'off');
+  try {
+    const production = cliReviewTickOpts({ log: { error: vi.fn() } });
+    const input = { repo, rawPrs, plan: { refusals } };
+    expect(() => production.redTeamOnSkip(input)).not.toThrow();
+    expect(order).toEqual(['labels', 'gate', 'capacity']);
+    const history = catchUp.mock.calls[0][0].history;
+    expect(catchUp).toHaveBeenCalledWith({ repo, refusals, rawPrs: repaired, history, log: expect.any(Function) });
+    production.redTeamOnSkip(input);
+    expect(catchUp.mock.calls[1][0].history).toBe(history);
+  } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
+});
 
 /** Mocks evidence for N owed PRs (heads derived per PR) and returns the owed plan/rawPrs. */
 function owedPrs(repo, prs) {

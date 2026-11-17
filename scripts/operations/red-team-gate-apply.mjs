@@ -40,11 +40,11 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  GATE_OUTCOMES, gateRoundCap, gateRoundGrants, liveResultGateState, classOnlyCards, planRedTeamActions, readConfirmedBreaks, redTeamGateMarker,
+  GATE_OUTCOMES, gateRoundGrants, liveResultGateState, classOnlyCards, planRedTeamActions, readConfirmedBreaks, redTeamGateMarker,
 } from '../lib/red-team-gate.mjs';
 import { cleanFindingFile, qualifyLocusRefs, sanitizeCardField } from '../lib/review-loop-policy.mjs';
 import { IN_REPO_LOCUS } from '../lib/citation-check.mjs';
-import { DEFAULT_ROUND_CAP } from '../lib/jury-core.mjs';
+import { resolveRoundCap, effectiveRoundCap } from '../lib/round-cap.mjs';
 import { ACTOR_ENV } from '../lib/review-independence.mjs';
 import { EVENT_TYPES, buildLedgerEvent } from '../lib/verdict-ledger.mjs';
 import { spawnPreventionLandingJob } from '../lib/prevention-landing-job.mjs';
@@ -57,6 +57,20 @@ import { publishAttention } from './needs-you-feed.mjs';
 
 const THIS_FILE = fileURLToPath(import.meta.url);
 const REPO_ROOT = resolve(dirname(THIS_FILE), '..', '..');
+// Transport/runtime noise only (git-transport warnings, hints, node deprecation lines). A line that says "error" is never noise.
+const SEND_BACK_NOISE = /^\s*(?:[\w.-]+:\s*)?(?:warning|hint)\b|^\s*\(node:|^\s*\(Use `node --trace/i;
+const SEND_BACK_REAL = /error|refus|denied|fatal|cannot|failed/i;
+/** The most informative failure line of a failed send-back (the old last-line pick surfaced a trailing git WARNING). */
+export function pickSendBackError(stderr, stdout, status) {
+  for (const text of [stderr, stdout]) {
+    const lines = String(text ?? '').split('\n').map((l) => l.trim()).filter(Boolean);
+    const live = lines.filter((l) => SEND_BACK_REAL.test(l) || !SEND_BACK_NOISE.test(l));
+    const hit = [...live].reverse().find((l) => SEND_BACK_REAL.test(l)) ?? live.at(-1);
+    if (hit) return hit.slice(0, 300);
+  }
+  return `exit ${status}`;
+}
+
 export const RED_TEAM_GATE_ACTOR = 'agent (red-team gate)';
 export const RED_TEAM_GATE_CHANNEL = 'review daemon (redTeam.confirmedBreaks)';
 
@@ -106,7 +120,7 @@ export function buildSendBackArgv({ repo, pr, bodyPath }) {
 }
 
 /** The gate's own record for ONE action on the head. PURE. */
-export function buildGateComment({ pr, head, outcome, plan, round, result = null, grantIds = null, cardResult = null, sendBackResult = null, cap = DEFAULT_ROUND_CAP, classCards = null }) {
+export function buildGateComment({ pr, head, outcome, plan, round, result = null, grantIds = null, cardResult = null, sendBackResult = null, cap = resolveRoundCap(process.env), classCards = null }) {
   const lines = [redTeamGateMarker(pr, head, outcome, result, grantIds, classCards),`**Red-team gate** (setting \`redTeam.confirmedBreaks\`, card x1b8hlo) on head \`${String(head).slice(0, 12)}\`:`];
   if (plan.sendBack.length) {
     lines.push(outcome === GATE_OUTCOMES.ROUND_CAP
@@ -135,7 +149,7 @@ export async function applyRedTeamGate(input = {}, io = createRedTeamGateIo()) {
   return result;
 }
 
-async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_ROUND_CAP } = {}, io = createRedTeamGateIo()) {
+async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = resolveRoundCap(process.env) } = {}, io = createRedTeamGateIo()) {
   try {
     const view = io.readPr({ repo, pr });
     const head = String(view?.headRefOid ?? '').toLowerCase();
@@ -162,7 +176,7 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
     // The operator's audited grants raise the cap with the same grant-time anchor fix dispatch uses. The anchor counts
     // this head like `readRound` does when the thread shows its review before the grant (thread order, not clocks).
     const grants = sendPending ? gateRoundGrants(view?.comments, pr, repo, standingRuling) : [];
-    const effectiveCap = gateRoundCap({ cap, grants, roundAt: (at, g) => {
+    const effectiveCap = effectiveRoundCap({ env: { WE_REVIEW_ROUND_CAP: String(cap) }, grants, roundAt: (at, g) => {
       const reviewed = Number.isInteger(headReviewIndex) && Number.isInteger(g?.index) && headReviewIndex < g.index;
       try { return io.readRoundAsOf?.({ repo, pr, at, head: reviewed ? head : null }) ?? null; } catch { return null; }
     } });
@@ -177,6 +191,7 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
       return { status: 'dry-run', head, round, cap: sendPending ? effectiveCap : null, reopened, outcome, plan, wouldSendBack: sendPending && outcome === GATE_OUTCOMES.SENT_BACK, sendBody, cardInput, setting };
     }
     let sendBackResult = null;
+    let wrongHead = null;
     let marker = null;
     const record = (recordOutcome, recordPlan, extra = {}) => {
       try { io.postComment({ repo, pr, body: buildGateComment({ pr, head, outcome: recordOutcome, plan: recordPlan, round, result: resultId,
@@ -196,6 +211,15 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
           if (live !== head) return { status: 'head-moved', head, liveHead: live, plan };
           sendBackResult = io.sendBack({ repo, pr, head, body: sendBody });
           if (!sendBackResult?.ok) return { status: 'send-back-failed', head, round, plan, error: sendBackResult?.error ?? 'unknown' };
+          // The writer cannot pin the head, so verify after the write: a push inside the window put the label on a head
+          // the findings were not judged on. The result stays recorded against the JUDGED head (below), and the wrong-head
+          // write is logged and returned so the new head's own review supersedes it (it never reads as a clean send-back).
+          let after = null;
+          try { after = String(io.readHead({ repo, pr }) ?? '').toLowerCase(); } catch { after = null; }
+          if (after !== head) {
+            wrongHead = after || 'unreadable';
+            io.log?.(`red-team gate: head of #${pr} moved to ${wrongHead} during the send-back write; findings were judged on ${head}`);
+          }
           try { await io.appendSendBackEvent({ repo, pr, head }); } catch (e) { io.log(`red-team gate: send-back of #${pr} applied but the ledger event missed: ${e.message}`); }
         }
       }
@@ -209,7 +233,7 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
       }
       // The label is written but its record is not: without it the operator queue never learns the fixer owns the break.
       // Retry-safe: the next run sees review:changes, takes the `already` path (no second label write) and records.
-      if (marker !== 'posted') return { status: 'send-back-record-failed', head, round, outcome, plan, sendBack: sendBackResult, marker, error: marker };
+      if (marker !== 'posted') return { status: 'send-back-record-failed', head, round, outcome, plan, sendBack: sendBackResult, marker, error: marker, ...(wrongHead ? { headMovedAfterWrite: wrongHead } : {}) };
     }
     let cardResult = null;
     let cardMarker = null;
@@ -221,14 +245,14 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = DEFAULT_R
       // The job is spawned but its record is not on the PR: the next run would queue a DUPLICATE card. Say so, loudly.
       if (cardMarker !== 'posted') return { status: 'card-record-failed', head, round, outcome, plan, sendBack: sendBackResult, card: cardResult, marker, cardMarker, error: cardMarker };
     }
-    return { status: 'applied', head, round, outcome, plan, sendBack: sendBackResult, card: cardResult, marker, cardMarker };
+    return { status: wrongHead ? 'send-back-wrong-head' : 'applied', head, round, outcome, plan, sendBack: sendBackResult, card: cardResult, marker, cardMarker, ...(wrongHead ? { headMovedAfterWrite: wrongHead, error: `review:changes may sit on a newer head than ${head}` } : {}) };
   } catch (e) {
     return { status: 'error', reason: String(e?.message ?? e).slice(0, 500) };
   }
 }
 
 /** Statuses the CLI reports with a nonzero exit: every failure, including a record that could not be posted. */
-export const GATE_FAILURE_STATUSES = Object.freeze(['error', 'send-back-failed', 'send-back-record-failed', 'card-failed', 'card-record-failed']);
+export const GATE_FAILURE_STATUSES = Object.freeze(['error', 'send-back-failed', 'send-back-record-failed', 'send-back-wrong-head', 'card-failed', 'card-record-failed']);
 
 /** The CLI exit code for a gate result: 1 on any failure status, else 0. PURE. */
 export const gateExitCode = (r) => (GATE_FAILURE_STATUSES.includes(r?.status) ? 1 : 0);
@@ -273,7 +297,7 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
         const r = spawnSync(process.execPath, [...heapCapArgs('review-set-label'), join(root, 'scripts', 'review-set-label.mjs'), ...buildSendBackArgv({ repo, pr, bodyPath: path })],
           { cwd: root, encoding: 'utf8', timeout: 180_000, env: { ...env, [ACTOR_ENV]: `red-team-gate-${randomUUID()}` } });
         if (r.status === 0) return { ok: true };
-        return { ok: false, error: String(r.stderr || r.stdout || `exit ${r.status}`).trim().split('\n').pop() };
+        return { ok: false, error: pickSendBackError(r.stderr, r.stdout, r.status) };
       } finally { rmSync(dir, { recursive: true, force: true }); }
     },
     appendSendBackEvent: ({ repo, pr }) => appendLedgerEvents([buildLedgerEvent({

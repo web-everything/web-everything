@@ -9,6 +9,7 @@ import { decideRearm } from '../conveyor/rearm-review.mjs';
 import { CONSTELLATION_REPOS, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
 import { previousCiFailurePending } from '../conveyor/await-verify.mjs';
 import { AWAIT_VERIFY_LIMITS } from '../conveyor/await-verify-pass.mjs';
+import { buildOperatorActionComment } from './operator-action-shape.mjs';
 
 export const CONTROL_OPS = Object.freeze(['unpark', 'retry-prepare', 'rearm', 'refresh', 'grant-rounds', 'clear-claim', 'ci-heal-reset']);
 export const MAX_OPERATOR_RESETS = 2;
@@ -19,14 +20,8 @@ export function validateOperatorAttribution({ actor, channel, reason }) {
   if (typeof channel !== 'string' || !channel.trim() || /[\r\n\u2028\u2029]/.test(channel)) throw new Error('--channel is required and must be one line');
   return { actor: actor.toLowerCase(), channel: channel.trim(), reason };
 }
-export function buildOperatorActionComment(record) {
-  // Quoted prose is still scanned for trusted review markers. Escape every angle bracket (not
-  // strip delimiters) so no HTML comment of any form (`-->`, `--!>`, nested, partial) can appear.
-  const escapeProse = value => String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  return [`🛠 operator action — ${record.op}`, '', `Operator @${escapeProse(record.actor)} via ${escapeProse(record.channel)}:`,
-    `> ${escapeProse(record.reason).replace(/\r\n|[\r\n\u2028\u2029]/g, '\n> ')}`, '', `Undo: ${escapeProse(record.details.undo)}`, '',
-    `<!-- operator-action: ${JSON.stringify(record).replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029')} -->`].join('\n');
-}
+// The renderer lives in the leaf module so the carry-forward reader can re-render and compare a note (no import cycle).
+export { buildOperatorActionComment };
 export function parseOperatorActions(comments = []) {
   return comments.filter(isTrustedMarkerAuthor).flatMap(c => String(c.body ?? '').split(/\r\n|[\r\n\u2028\u2029]/).flatMap(line => {
     const m = /^<!-- operator-action: (.*?) -->$/.exec(line);
@@ -42,6 +37,7 @@ export function controlFingerprint(name, read, input) {
   if (name === 'clear-claim') return stateDigest(read.claims ?? []);
   if (name === 'ci-heal-reset') return stateDigest({ head: read.head, awaitVerify: read.awaitVerify });
   return stateDigest({ head: read.head, state: read.state, labels: [...(read.labels ?? [])].sort(),
+    ...(name === 'rearm' && read.sameHeadHold ? { sameHeadHold: [read.sameHeadHold.kind, read.sameHeadHold.head] } : {}),
     ...(name === 'refresh' ? { main: read.main, containsMain: read.containsMain, crossRepo: read.crossRepo, headRef: read.headRef, requiredCheck: read.requiredCheck } : {}),
     ...(name === 'grant-rounds' ? { granted: countGrantedRoundExtensions(read.comments, input) } : {}) });
 }
@@ -63,7 +59,7 @@ export function validateControlInput(name, input) {
 export function planOperatorControl(name, read, input) {
   validateControlInput(name, input);
   const attribution = validateOperatorAttribution(input), target = input.item ? `item:${input.item}` : input.file ? `file:${input.file}` : `pr:${input.pr}`;
-  let why = '', steps = [], undo = '', extension, resets;
+  let why = '', steps = [], undo = '', extension, resets, wake = false;
   if (name === 'unpark') {
     undo = input.item ? 'the daemon re-parks on the next failure; to re-hold now: placeBuildDispatchHold' : 'restore review:human through the review ceremony';
     if (input.item) {
@@ -83,8 +79,15 @@ export function planOperatorControl(name, read, input) {
     undo = 'request changes again through review-set-label.mjs --to=changes';
     const decision = decideRearm({ currentLabels: read.labels });
     if (read.state !== 'OPEN') why = 'PR is not open';
-    else if (!decision.allowed) why = decision.reason;
-    else steps.push(`rearm-review.mjs ${input.pr} --actor=${attribution.actor}; add ${decision.addLabel || 'no label'}; remove ${(decision.removeLabels ?? []).filter(label => read.labels.includes(label)).join(', ') || 'no labels'}; keep the human hold`);
+    else if (!decision.allowed) {
+      // A review:pending PR whose same-head pause is spent: wake it with a comment. Only the same-head kind on the live head
+      // (never a referral hold) and never beside review:human; labels stay untouched.
+      const hold = read.sameHeadHold, labels = read.labels ?? [];
+      if (labels.includes('review:pending') && !labels.includes('review:human') && hold?.kind === 'same-head' && hold.noVerdict && hold.head === read.head) {
+        wake = true;
+        steps.push(`post the re-arm wake comment (same-head pause on ${String(read.head).slice(0, 9)}); no label change`);
+      } else why = decision.reason;
+    } else steps.push(`rearm-review.mjs ${input.pr} --actor=${attribution.actor}; add ${decision.addLabel || 'no label'}; remove ${(decision.removeLabels ?? []).filter(label => read.labels.includes(label)).join(', ') || 'no labels'}; keep the human hold`);
   } else if (name === 'refresh') {
     undo = 'restore the previous head only through a reviewed content-preserving git repair';
     if (read.crossRepo) throw new Error('refresh refuses cross-repo heads');
@@ -132,7 +135,7 @@ export function planOperatorControl(name, read, input) {
   const records = name === 'clear-claim' ? (read.claims ?? []).map(c => ({ ...record, pr: c.meta.pr, key: `${name}:${input.repo}:pr:${c.meta.pr}:${planKey(stateDigest(c))}`, details: { ...record.details, kind: c.meta.kind } })) : [record];
   if (!why) steps.push(input.item ? 'append operator-action record to operator-actions.jsonl' : 'post one operator-action comment per PR target');
   return { op: name, target, action: why ? 'noop' : 'apply', ...(why ? { why } : {}), steps, undo, record, records,
-    body: buildOperatorActionComment(record), fingerprint, input, claims: read.claims, extension, ...(resets ? { resets } : {}) };
+    body: buildOperatorActionComment(record), ...(wake ? { wake } : {}), fingerprint, input, claims: read.claims, extension, ...(name === 'refresh' ? { refreshExpect: { head: read.head, main: read.main } } : {}), ...(resets ? { resets } : {}) };
 }
 export function operatorControlOperation(name, { readContext } = {}) {
   const optional = (type, value) => ({ type, required: false, default: value });

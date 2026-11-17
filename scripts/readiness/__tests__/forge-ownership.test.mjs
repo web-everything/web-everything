@@ -4,6 +4,7 @@ import * as fs from 'node:fs/promises';
 import {join} from 'node:path';
 import {spawnSync} from 'node:child_process';
 import * as runnerAPI from '../forge-exec-run.mjs';
+import {opsSudoMissing, opsSudoPythonArgs} from './fixtures/ops-sudo-precondition.mjs';
 import {exerciseGitMetadataAttack} from './fixtures/forge-git-metadata-attack.mjs';
 
 let root;
@@ -21,7 +22,7 @@ it('keeps privileged Git in protected metadata when the worker substitutes a rea
   await exerciseGitMetadataAttack(root);
 },30000);
 
-it.skipIf(process.platform!=='linux')('a surviving actual worker UID cannot substitute protected Git metadata or execute an fsmonitor payload as root',()=>{
+it.skipIf(process.platform!=='linux'||opsSudoMissing)('a surviving actual worker UID cannot substitute protected Git metadata or execute an fsmonitor payload as root',()=>{
   const driver=`import {exerciseGitMetadataAttack} from ${JSON.stringify(new URL('./fixtures/forge-git-metadata-attack.mjs',import.meta.url).href)};
 await exerciseGitMetadataAttack(process.env.TMPDIR,{workerUid:65533});
 console.log('distinct-uid-git-metadata-safe');`;
@@ -33,7 +34,7 @@ with tempfile.TemporaryDirectory(prefix='forge-ownership-',dir='/tmp') as fixtur
  result=subprocess.run([sys.argv[1],'--input-type=module','-e',sys.argv[2]],env={'PATH':os.environ['PATH'],'TMPDIR':fixture},timeout=25)
  sys.exit(result.returncode)
 `;
-  const result=spawnSync('/usr/bin/sudo',['-n','/usr/bin/python3','-I','-c',python,process.execPath,driver],{encoding:'utf8',timeout:30000,maxBuffer:1024*1024});
+  const result=spawnSync('/usr/bin/sudo',opsSudoPythonArgs(python,process.execPath,driver),{encoding:'utf8',timeout:30000,maxBuffer:1024*1024});
   expect(result.status,result.stderr).toBe(0);expect(result.stdout).toContain('distinct-uid-git-metadata-safe');
 },40000);
 
@@ -158,7 +159,7 @@ os.fchown=swapped
 
 // Required on Linux under the same passwordless-python sudo contract as the
 // existing cross-identity runner tests. Real numeric UIDs; no accounts created.
-it.skipIf(process.platform!=='linux')('a surviving actual worker UID cannot swap prepare work/container paths or take another slot ownership',async()=>{
+it.skipIf(process.platform!=='linux'||opsSudoMissing)('a surviving actual worker UID cannot swap prepare work/container paths or take another slot ownership',async()=>{
   const driver=`
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs/promises';
@@ -197,10 +198,10 @@ const after=await fs.stat(victim);assert.equal(after.uid,before.uid);assert.equa
 console.log('distinct-uid-prepare-safe');
 `;
   const python=`import os,sys; os.execve(sys.argv[1],[sys.argv[1],'--input-type=module','-e',sys.argv[2]],{'PATH':os.environ['PATH'],'TMPDIR':sys.argv[3]})`;
-  const result=spawnSync('/usr/bin/sudo',['-n','/usr/bin/python3','-I','-c',python,process.execPath,driver,process.env.TMPDIR],{encoding:'utf8',timeout:20000,maxBuffer:1024*1024});
+  const result=spawnSync('/usr/bin/sudo',opsSudoPythonArgs(python,process.execPath,driver,process.env.TMPDIR),{encoding:'utf8',timeout:20000,maxBuffer:1024*1024});
   try{expect(result.status,result.stderr).toBe(0);expect(result.stdout).toContain('distinct-uid-prepare-safe');}
   finally{
-    const clean=spawnSync('/usr/bin/sudo',['-n','/usr/bin/python3','-I','-c','import shutil,sys; shutil.rmtree(sys.argv[1])',root],{encoding:'utf8',timeout:10000});
+    const clean=spawnSync('/usr/bin/sudo',opsSudoPythonArgs('import shutil,sys; shutil.rmtree(sys.argv[1])',root),{encoding:'utf8',timeout:10000});
     expect(clean.status,clean.stderr).toBe(0);
   }
 },30000);

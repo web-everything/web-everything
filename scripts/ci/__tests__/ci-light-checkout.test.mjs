@@ -3,13 +3,13 @@ import { describe, expect, it } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import yaml from 'js-yaml';
 
 const raw = readFileSync(new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8');
 const { jobs } = yaml.load(raw);
-const fetchMain = 'git fetch --no-tags --filter=blob:none --depth=1000000 origin +refs/heads/main:refs/remotes/origin/main';
+const fetchMain = 'sh scripts/ci/fetch-main-history.sh';
 // Historical full-history WE checkouts; `test` is intentionally gone from this roster.
 const historyJobs = ['changes', 'standards', 'integration', 'daemon-soak-scope', 'soak-shard'];
 
@@ -35,7 +35,7 @@ describe('ci.yml shallow checkouts with blobless main history', () => {
         const next = job.steps[index + 1];
         if (name === 'changes') {
           expect(job.steps.some((s) => s.name === 'Fetch main history (blobless)')).toBe(false);
-          expect(next.run).toMatch(/git fetch --no-tags --filter=blob:none --depth=1000000 origin ['"]?\+refs\/heads\/main:refs\/remotes\/origin\/main['"]?/);
+          expect(next.run).toContain(`if ${fetchMain}; then`);
         } else {
           expect(next.name, name).toBe('Fetch main history (blobless)');
           expect(next.run.trim(), name).toBe(fetchMain);
@@ -74,7 +74,10 @@ describe('ci.yml shallow checkouts with blobless main history', () => {
       expect(git(checkout, ['rev-parse', '--is-shallow-repository'])).toBe('true');
       // The ref is absent before the additional fetch, so this cannot pass on clone defaults alone.
       expect(() => git(checkout, ['rev-parse', '--verify', 'origin/main'])).toThrow();
-      git(checkout, fetchMain.split(' ').slice(1));
+      execFileSync('sh', [fileURLToPath(new URL('../fetch-main-history.sh', import.meta.url))], {
+        cwd: checkout, encoding: 'utf8', timeout: 15_000, stdio: 'pipe',
+        env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
+      });
       expect(git(checkout, ['rev-parse', 'origin/main'])).toBe(main);
       expect(git(checkout, ['merge-base', 'origin/main', 'HEAD'])).toBe(base);
     } finally {

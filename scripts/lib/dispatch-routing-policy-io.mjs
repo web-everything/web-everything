@@ -8,16 +8,19 @@ import { decideDispatchRoute, MARKER_KINDS } from './dispatch-contracts.mjs';
 import { BUILD_KINDS, effectiveBuilder } from './routing-settings.mjs';
 import { providerQuotaHold } from './provider-quota-hold.mjs';
 import { resolveRoutingOverrideRoute } from './dispatch-routing-override-route.mjs';
-function initialPolicy() {
-  return trustedSnapshot(process.env.WE_DISPATCH_ROUTING_SNAPSHOT) ?? DEFAULT_ROUTING_POLICY;
+function initialPolicy(env) {
+  return trustedSnapshot(env.WE_DISPATCH_ROUTING_SNAPSHOT) ?? DEFAULT_ROUTING_POLICY;
 }
-export function createRoutingPolicyReader({ path = ROUTING_POLICY_PATH, read = readFileSync, log = message => console.error(message), initial = initialPolicy(), env = process.env,
+export function createRoutingPolicyReader({ path = ROUTING_POLICY_PATH, read = readFileSync, log = message => console.error(message), env = process.env, initial = initialPolicy(env),
   preferences = () => readPlatformPreferences({ env }), emit = event => appendDaemonEvent(event, { env }),
 } = {}) {
   let good = validateRoutingPolicy(initial), seen, lastError, applied = {};
+  // Legacy/forwarded snapshots carry values without override provenance. Protect
+  // every operation until one successful read supplies values and keys together.
+  let operatorKeys = Object.keys(good.operations);
   const signature = value => JSON.stringify(value, (_, v) => v && typeof v === 'object' && !Array.isArray(v)
     ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => a.localeCompare(b))) : v);
-  return () => {
+  const reader = () => {
     try {
       const text = read(path, 'utf8');
       const { prefs, errors } = preferences();
@@ -39,6 +42,7 @@ export function createRoutingPolicyReader({ path = ROUTING_POLICY_PATH, read = r
         }
         good = next;
         applied = structuredClone(overrides);
+        operatorKeys = Object.keys(applied);
         seen = nextSeen;
       }
       lastError = null;
@@ -50,12 +54,16 @@ export function createRoutingPolicyReader({ path = ROUTING_POLICY_PATH, read = r
     }
     return good;
   };
+  reader.operatorKeys = () => [...operatorKeys];
+  return reader;
 }
 export const readRoutingPolicy = createRoutingPolicyReader();
 
 
-export function resolveOperationRoute(options = {}) {
-  return resolvePureRoute({ ...options, policy: options.policy ?? readRoutingPolicy() });
+export function resolveOperationRoute(options = {}, { readPolicy = readRoutingPolicy } = {}) {
+  const policy = options.policy ?? readPolicy();
+  return resolvePureRoute({ ...options, policy,
+    operatorKeys: options.operatorKeys ?? (options.policy === undefined ? readPolicy.operatorKeys() : undefined) });
 }
 export function resolvePolicyModel(provider, model, policy = readRoutingPolicy()) {
   return resolvePureModel(provider, model, policy);

@@ -4,6 +4,16 @@ import { vi, it, expect, describe } from 'vitest';
 vi.mock('node:child_process', async (importOriginal) => ({
   ...await importOriginal(), execFileSync: vi.fn(),
 }));
+vi.mock('../../lib/pid-alive.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  const { execFileSync } = await import('node:child_process');
+  return {
+    ...actual,
+    // pid-alive can already be loaded by the test setup, before the subprocess mock.
+    // Keep its real parser and the default probe wiring; inject only the ps reader.
+    pidIdentity: (pid, opts) => actual.pidIdentity(pid, { exec: execFileSync, ...opts }),
+  };
+});
 vi.mock('../../lib/gh-throttle.mjs', async (importOriginal) => {
   const { execFileSync } = await import('node:child_process');
   return {
@@ -1701,23 +1711,45 @@ describe('pid reuse: a process that started after the session registered is not 
 
 it('enrichAgents default probe path: reused pid (process newer than session) is marked pidAlive:false', async () => {
   const { enrichAgents } = await import('../reconcile-pass.mjs');
-  // pid of THIS test process; claim a session that registered long before this process started.
+  const { execFileSync } = await import('node:child_process');
+  // Keep the default probe/identity wiring, supplying ps through this file's subprocess mock.
+  // The current pid exists; the fixture process started after the registered session.
+  execFileSync.mockReturnValueOnce('S Tue Nov  3 15:00:00 2026 claude bg-spare x\n');
   const out = enrichAgents([{ pid: process.pid, startedAt: Date.parse('2020-01-01T00:00:00Z'), state: 'working' }],
     { readLaneHead: () => null })[0];
   expect(out.pidAlive).toBe(false);
+  expect(execFileSync).toHaveBeenLastCalledWith('ps', ['-p', String(process.pid), '-o', 'stat=,lstart=,command='], expect.any(Object));
 });
 
 it('enrichAgents reads ISO-string and numeric-string startedAt for the reuse guard', async () => {
   const { enrichAgents } = await import('../reconcile-pass.mjs');
+  const { execFileSync } = await import('node:child_process');
   for (const startedAt of ['2020-01-01T00:00:00Z', String(Date.parse('2020-01-01T00:00:00Z'))]) {
+    execFileSync.mockReturnValueOnce('S Tue Nov  3 15:00:00 2026 claude bg-spare x\n');
     expect(enrichAgents([{ pid: process.pid, startedAt, state: 'working' }], { readLaneHead: () => null })[0].pidAlive).toBe(false);
+    expect(execFileSync).toHaveBeenLastCalledWith('ps', ['-p', String(process.pid), '-o', 'stat=,lstart=,command='], expect.any(Object));
   }
+});
+
+it.each(['malformed ps output', new Error('ps unavailable')])('enrichAgents default probe keeps unreadable identity unknown (%s)', async snapshot => {
+  const { enrichAgents } = await import('../reconcile-pass.mjs');
+  const { execFileSync } = await import('node:child_process');
+  execFileSync.mockImplementationOnce(() => {
+    if (snapshot instanceof Error) throw snapshot;
+    return snapshot;
+  });
+  const row = { pid: process.pid, pidAlive: true, startedAt: '2020-01-01T00:00:00Z', state: 'working' };
+  const out = enrichAgents([row], { readLaneHead: () => null })[0];
+  expect(out).not.toHaveProperty('pidAlive');
+  expect(out).toMatchObject({ pid: process.pid, startedAt: row.startedAt, state: 'working' });
+  expect(execFileSync).toHaveBeenLastCalledWith('ps', ['-p', String(process.pid), '-o', 'stat=,lstart=,command='], expect.any(Object));
 });
 
 // Red-team round 5 (PR #6346): a wrapped worker resumed by the harness keeps its first-launch startedAt while its new
 // child pid started later. The reuse guard must not call that live child a recycled pid.
 it('enrichAgents keeps a resumed wrapped worker alive: its startedAt is the first launch, its child pid is newer', async () => {
   const { enrichAgents } = await import('../reconcile-pass.mjs');
+  const { execFileSync } = await import('node:child_process');
   const { wrappedRecordToAgentRow } = await import('../../operations/worker-wrapper-launch.mjs');
   const { COMPLETION_RECORD_V2 } = await import('../../operations/completion-store.mjs');
   const firstLaunch = Date.parse('2020-01-01T00:00:00Z');
@@ -1726,9 +1758,14 @@ it('enrichAgents keeps a resumed wrapped worker alive: its startedAt is the firs
     startedAt: new Date(firstLaunch).toISOString(), cwd: '/lane',
   }, { isAlive: () => true });
   expect(row).toMatchObject({ kind: 'wrapped-worker', pid: process.pid, startedAt: firstLaunch });
+  const snapshot = 'S Tue Nov  3 15:00:00 2026 claude bg-spare x\n';
+  execFileSync.mockReturnValueOnce(snapshot);
   expect(enrichAgents([row], { readLaneHead: () => null })[0].pidAlive).toBe(true);
+  expect(execFileSync).toHaveBeenLastCalledWith('ps', ['-p', String(process.pid), '-o', 'stat=,lstart=,command='], expect.any(Object));
   // the same pid on a NON-wrapped row with the same old start is still a reused pid (the guard stays armed there)
+  execFileSync.mockReturnValueOnce(snapshot);
   expect(enrichAgents([{ ...row, kind: 'bg' }], { readLaneHead: () => null })[0].pidAlive).toBe(false);
+  expect(execFileSync).toHaveBeenLastCalledWith('ps', ['-p', String(process.pid), '-o', 'stat=,lstart=,command='], expect.any(Object));
 });
 
 it('holderStartedBy: null for a wrapped worker, the parsed start for any other row, null when unreadable', async () => {
@@ -1819,4 +1856,20 @@ describe('defaultReadAgents — the production default wires the reconcile-only 
       rmSync(root, { recursive: true, force: true });
     }
   });
+});
+
+it('logs one timing line per planner step (name, repo, ms, startedAt) so a slow step is visible', async () => {
+  const { runReconcilePass } = await import('../reconcile-pass.mjs');
+  let time = 1000;
+  const lines = [];
+  runReconcilePass({ ...xxOptions(), env: {}, readPrs: () => [],
+    stepNow: () => time, stepLog: line => lines.push(line),
+    enrichMainRed: prs => { time += 250; return { prs, mainRedWindows: [] }; },
+    enrichTimeouts: prs => { time += 4000; return prs; },
+    readAgents: () => { time += 7; return []; } });
+  const text = lines.join('\n');
+  expect(text).toMatch(/planner-step name=enrich-timeouts repo=we ms=4000 startedAt=/);
+  expect(text).toMatch(/planner-step name=enrich-main-red repo=we ms=250 startedAt=/);
+  expect(text).toMatch(/planner-step name=read-agents repo=we ms=7 startedAt=/);
+  for (const name of ['required-checks', 'hydrate-checks', 'plan']) expect(text).toContain(`planner-step name=${name} `);
 });

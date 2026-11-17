@@ -15,8 +15,11 @@ import { refreshOntoMain } from '../conveyor/ci-red-recovery-watch.mjs';
 import { recordRefreshed, refreshedStatePath, requiredCheckFact, loadMergeQueueSettings } from '../lib/merge-queue-hook.mjs';
 import { createExtendRoundsSinks, runRedTeamGateForPr } from './extend-rounds-io.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
+import { enrichPrsWithReferralHolds } from '../conveyor/review-referral-hold.mjs';
+import { buildSameHeadWakeComment, REARM_COMMENT_MARKER } from '../conveyor/rearm-review.mjs';
+import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { listStoredAwaitVerify, writeStoredAwaitVerify } from '../conveyor/await-verify.mjs';
-import { planOperatorControl, validateControlInput, controlFingerprint, parseOperatorActions, buildOperatorActionComment, isPrepareHold, OPERATOR_CONTROL_EFFECT } from './operator-controls.mjs';
+import { planOperatorControl, validateOperatorAttribution, validateControlInput, controlFingerprint, parseOperatorActions, buildOperatorActionComment, isPrepareHold, OPERATOR_CONTROL_EFFECT } from './operator-controls.mjs';
 
 export const CONTROL_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const gh = args => execFileSyncThrottled('gh', args, { encoding: 'utf8', timeout: 60000, maxBuffer: 64 * 1024 * 1024 });
@@ -27,6 +30,11 @@ export function createOperatorControlsReader({ root = CONTROL_ROOT, coord = reso
   readHolds = () => listBuildDispatchHolds({ lockRoot: join(coord, 'build-dispatch-holds') }),
   listClaims = () => listFixDispatchClaims(join(coord, 'fix-dispatch-claims')),
   listAwaitVerify = listStoredAwaitVerify,
+  // The daemon's own enrichment decides which hold applies (referral outranks same-head): only a same-head hold is returned.
+  readSameHeadHold = ({ repo, pr, head, labels, comments }) => {
+    const [row] = enrichPrsWithReferralHolds([{ number: pr, headRefOid: head, labels: labels.map(name => ({ name })), comments }], { repo, readComments: () => comments });
+    return row.referralHold?.kind === 'same-head' ? row.referralHold : null;
+  },
   readClaim = args => readFixDispatchClaim({ ...args, lockRoot: join(coord, 'fix-dispatch-claims') }),
   readAgents = () => JSON.parse(execFileSync('claude', ['agents', '--json', '--all'], { encoding: 'utf8', timeout: 30000 })),
   readCheck = (repo, head) => {
@@ -66,6 +74,10 @@ export function createOperatorControlsReader({ root = CONTROL_ROOT, coord = reso
     }
     const p = readPr(input.repo, input.pr);
     if (name === 'ci-heal-reset') return { ...p, awaitVerify: listAwaitVerify().filter(({ record }) => record.repo === input.repo && record.pr === input.pr), now: at };
+    if (name === 'rearm' && p.state === 'OPEN' && p.labels.includes('review:pending') && !p.labels.includes('review:human')) {
+      // Fail closed: an unreadable run store means no hold is proven, so rearm stays a noop.
+      try { p.sameHeadHold = readSameHeadHold({ repo: input.repo, pr: input.pr, head: p.head, labels: p.labels, comments: p.comments }); } catch { p.sameHeadHold = null; }
+    }
     if (name === 'refresh' && p.state === 'OPEN' && !p.crossRepo) {
       const checkout = input.checkout || root;
       // Read the repository's live main, not a potentially stale local tracking ref.
@@ -98,6 +110,7 @@ export function createOperatorControlsSinks({ root = CONTROL_ROOT, coord = resol
   refreshStatePath = refreshedStatePath,
   extensionSink = createExtendRoundsSinks({ readThread: (repo, pr) => readContext('grant-rounds', { repo, pr }), regate: runRedTeamGateForPr })['github.round-extension'],
   readRecords, writeRecord, mutate, verify,
+  sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), refreshVerifyBudgetMs = 30000,
 } = {}) {
   const actionPath = join(coord, 'operator-actions.jsonl');
   const readItemRecords = () => pathExists(actionPath) ? readText(actionPath).split('\n').filter(Boolean).map(line => JSON.parse(line)) : [];
@@ -150,14 +163,22 @@ export function createOperatorControlsSinks({ root = CONTROL_ROOT, coord = resol
         const result = await writeAwaitVerify({ ...record, resumeFailures: 0, operatorResets: (record.operatorResets ?? 0) + 1 });
         if (result?.ok !== true) throw new Error(`await-verify write failed: ${result?.reason ?? 'unconfirmed'}`);
       }
-    } else if (name === 'rearm') child('scripts/conveyor/rearm-review.mjs', [String(i.pr), ...attribution]);
+    } else if (name === 'rearm' && p.wake) runGh(['pr', 'comment', String(i.pr), '--repo', i.repo, '--body', buildSameHeadWakeComment({ actor: i.actor, key: p.record.key })]);
+    else if (name === 'rearm') child('scripts/conveyor/rearm-review.mjs', [String(i.pr), ...attribution]);
     else if (name === 'refresh') {
       const before = await readContext(name, i);
       if (controlFingerprint(name, before, i) !== p.fingerprint) throw new Error('refresh state changed before mutation');
       const result = await refresh(before.headRef, { root: i.checkout || root, base: before.main, prNumber: i.pr, repo: i.repo });
       if (!result.ok) throw new Error(result.error || 'refresh failed');
-      const after = await readContext(name, i);
-      if (!after.containsMain || !after.head || (result.newCommit && result.newCommit !== after.head)) throw new Error('could not verify refreshed PR head');
+      // GitHub's PR head read lags the push by seconds: re-read within a bounded budget, accepting only the expected head.
+      let after = await readContext(name, i), waited = 0, delay = 1000;
+      const headOk = a => a.containsMain && a.head && (!result.newCommit || result.newCommit === a.head);
+      while (!headOk(after) && waited < refreshVerifyBudgetMs) {
+        const ms = Math.min(delay, refreshVerifyBudgetMs - waited);
+        await sleep(ms); waited += ms; delay = Math.min(delay * 2, 5000);
+        after = await readContext(name, i);
+      }
+      if (!headOk(after)) throw new Error(`could not verify refreshed PR head after ${waited}ms (expected ${result.newCommit ?? 'a head containing main'}, read ${after.head ?? 'none'})`);
       await rememberRefresh(refreshStatePath(), `${i.repo}#${i.pr}`, after.head, { pass: before.requiredCheck ?? null });
     } else if (name === 'grant-rounds') await extensionSink(p.extension);
     else for (const c of p.claims) {
@@ -178,6 +199,7 @@ export function createOperatorControlsSinks({ root = CONTROL_ROOT, coord = resol
     if (p.op === 'refresh') return after.state === 'OPEN' && after.containsMain;
     if (p.op === 'grant-rounds') return true; // wrapped extension sink proves the trusted count and exact body
     if (p.op === 'clear-claim') return !after.claims.some(c => p.claims.some(old => old.meta.repo === c.meta.repo && old.meta.pr === c.meta.pr && old.meta.kind === c.meta.kind));
+    if (p.op === 'rearm' && p.wake) return (after.comments ?? []).some(c => isTrustedMarkerAuthor(c) && Number.isFinite(Date.parse(c.updatedAt ?? c.createdAt)) && String(c?.body ?? '').trimStart().startsWith(REARM_COMMENT_MARKER) && String(c.body).includes(p.record.key));
     if (p.op === 'rearm') return !after.labels.includes('review:changes') && (after.labels.includes('review:pending') || after.labels.includes('review:human'));
     if (p.op === 'unpark') return p.input.item ? !after.holds.length && !after.failures.length : !after.labels.includes('review:human');
     return !after.failures.some(f => f.held && !f.completed) && !after.holds.some(isPrepareHold);
@@ -188,6 +210,23 @@ export function createOperatorControlsSinks({ root = CONTROL_ROOT, coord = resol
     const before = await readContext(p.op, p.input), existing = await getRecords(p, before);
     if (p.records.every(r => existing.some(old => old.key === r.key))) return { action: 'noop', why: 'operator action key already recorded' };
     if (p.op === 'ci-heal-reset') planOperatorControl(p.op, before, p.input);
+    // Resume of a refresh whose push landed but whose head verify lagged: the PR head moved off the planned head
+    // and now contains main, so the effect is already applied. Record it; any other drift still fails closed.
+    if (p.op === 'refresh' && controlFingerprint(p.op, before, p.input) !== p.fingerprint
+      && before.state === 'OPEN' && !before.crossRepo && before.containsMain && before.head
+      && (!p.refreshExpect?.head || before.head !== p.refreshExpect.head)) {
+      // Attribution must still match: the stored record must be exactly what the input's operator, channel and reason produce.
+      const rec = p.record, who = validateOperatorAttribution(p.input);
+      if (!rec || p.records.length !== 1 || JSON.stringify(p.records[0]) !== JSON.stringify(rec) || p.body !== buildOperatorActionComment(rec) || rec.op !== 'refresh'
+        || rec.key !== `refresh:${p.input.repo}:pr:${p.input.pr}:${p.fingerprint}@${rec.at}` || rec.version !== 1 || rec.headRef !== undefined
+        || (p.refreshExpect && (rec.details?.previousHead !== p.refreshExpect.head || rec.details?.main !== p.refreshExpect.main))
+        || rec.details?.headRef !== before.headRef
+        || JSON.stringify(Object.keys(rec).sort()) !== JSON.stringify(['actor', 'at', 'channel', 'details', 'key', 'op', 'pr', 'reason', 'repo', 'version'])
+        || rec.repo !== p.input.repo || rec.pr !== p.input.pr || rec.actor !== who.actor || rec.channel !== who.channel || rec.reason !== who.reason) throw new Error('operator plan no longer valid');
+      await rememberRefresh(refreshStatePath(), `${p.input.repo}#${p.input.pr}`, before.head, { pass: before.requiredCheck ?? null });
+      for (const record of p.records) if (!existing.some(r => r.key === record.key)) await putRecord(record);
+      return { action: 'apply', resumed: true, keys: p.records.map(r => r.key) };
+    }
     if (controlFingerprint(p.op, before, p.input) !== p.fingerprint) throw new Error('state changed since operator plan; re-run');
     const validated = planOperatorControl(p.op, { ...before, now: p.record.at }, p.input);
     if (validated.body !== p.body || JSON.stringify(validated.records) !== JSON.stringify(p.records) || validated.action !== 'apply') throw new Error('operator plan no longer valid');

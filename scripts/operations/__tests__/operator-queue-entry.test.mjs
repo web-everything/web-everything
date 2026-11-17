@@ -42,7 +42,7 @@ const stage = (root) => {
   copyFileSync(join(dirname(LEAF), 'marker-authorship.mjs'), join(root, 'lib/marker-authorship.mjs'));
   // PR #4834 — `marker-authorship.mjs` / `stand-down.mjs` now import `../lib/github-app-identity.mjs` (the
   // automation-login list), which pulls in more leaves — stage the whole chain, same failure mode as above.
-  for (const f of ['github-app-identity.mjs', 'settings-files.mjs', 'policy-cascade.mjs', 'under-test.mjs', 'under-test.cjs', 'github-app-installations.mjs']) {
+  for (const f of ['github-app-identity.mjs', 'settings-files.mjs', 'policy-cascade.mjs', 'operator-override-reader.mjs', 'under-test.mjs', 'under-test.cjs', 'github-app-installations.mjs']) {
     copyFileSync(join(dirname(LEAF), f), join(root, 'lib', f));
   }
   // card 89 S1 — daemon-last-good.mjs now imports the daemon-clone-layout leaf (logical clone identity).
@@ -55,6 +55,10 @@ const stage = (root) => {
     copyFileSync(join(dirname(LEAF), '../conveyor', f), join(root, 'conveyor', f));
   }
   copyFileSync(join(dirname(LEAF), 'secret-scrub.mjs'), join(root, 'lib/secret-scrub.mjs'));
+  // PR #6622 — red-team-gate.mjs reads the sealed stored evidence through this leaf, which resolves the runs dir via
+  // `../operations/coordination-root.mjs` — stage both, or the staged copy fails to import and `main()` never runs.
+  copyFileSync(join(dirname(LEAF), 'red-team-sealed-status.mjs'), join(root, 'lib/red-team-sealed-status.mjs'));
+  copyFileSync(join(dirname(LEAF), '../operations/coordination-root.mjs'), join(root, 'operations/coordination-root.mjs'));
   // #4077 continuation — `health-watch-core.mjs` now imports `./health-smells-notify-list.mjs` (the ONE
   // declared place for the notify-in-shadow list; a plain data file, no further leaf needs staging) — stage
   // it too, or the staged copy fails to import and `main()` silently never runs (same failure mode as every

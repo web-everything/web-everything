@@ -18,7 +18,7 @@ const pending = () => ({ ...run(103, null, '2026-11-01T13:50:00Z'), status: 'in_
 
 // Model the API's filters/limits, including the historical query used to judge main at removal.
 // All reads are injected; quarantine is disabled so no developer state is consulted.
-function fixture(runs, events = [removal()]) {
+function fixture(runs, events = [removal()], mainHead = null) {
   const log = vi.fn();
   const exec = vi.fn((command, args) => {
     if (command !== 'gh') throw new Error('unexpected non-GitHub IO');
@@ -36,6 +36,7 @@ function fixture(runs, events = [removal()]) {
       return JSON.stringify({ headRefOid: head, mergeStateStatus: 'CLEAN' });
     }
     const endpoint = args.find(arg => arg.startsWith(`repos/${repo}/`));
+    if (endpoint === `repos/${repo}/git/ref/heads/main` && mainHead) return JSON.stringify({ object: { sha: mainHead } });
     if (endpoint?.startsWith(`repos/${repo}/commits/${mergeCommit}/check-runs?`)) {
       return JSON.stringify({ total_count: 1, check_runs: [{
         id: 21, name: failedName, status: 'completed', conclusion: 'failure',
@@ -73,7 +74,7 @@ describe('same-head retry uses fresh completed main CI evidence', () => {
   it('accepts a recent completed green run while the newest main push is in progress', () => {
     const f = fixture([pending(), run(102)]);
     expect(f.guard().hold).toBe(false);
-    expect(f.retryLog()).toContain('failed_checks infra retry 1/1 (main green, PR CLEAN');
+    expect(f.retryLog()).toContain('failed_checks infra retry 1/2 (main green, PR CLEAN');
     expect(f.retryLog()).toContain('102');
     expect(f.retryLog()).toContain(failedName);
   });
@@ -127,15 +128,52 @@ describe('same-head retry uses fresh completed main CI evidence', () => {
     expect(f.declineLog()).toContain(failedName);
   });
 
-  it('still holds a second removal on the same head despite fresh green main CI', () => {
+  it('still holds a third removal on the same head despite fresh green main CI', () => {
     const f = fixture([pending(), run(102)], [removal(), {
       __typename: 'AddedToMergeQueueEvent', createdAt: '2026-11-01T13:46:00Z',
+    }, removal('2026-11-01T13:50:00Z'), {
+      __typename: 'AddedToMergeQueueEvent', createdAt: '2026-11-01T13:51:00Z',
     }, removal('2026-11-01T13:55:00Z')]);
     const result = f.guard();
     expect(result.hold).toBe(true);
-    expect(result.line).toContain('2 removals on this head');
+    expect(result.line).toContain('3 removals on this head');
     expect(result.line).toContain('operator must inspect history and enqueue manually');
     expect(f.declineLog()).toContain('retry bound reached');
     expect(f.retryLog()).toBeUndefined();
+  });
+});
+
+describe('same-head retry judges main freshness by main HEAD, not wall-clock', () => {
+  const mainHead = 'd'.repeat(40);
+  const old = (id, conclusion, sha) => ({ ...run(id, conclusion, '2026-11-01T04:14:00Z', '2026-11-01T04:30:00Z'), head_sha: sha });
+  beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(now); });
+  afterEach(() => vi.useRealTimers());
+
+  it('accepts an old green run when it is for the current main head (nothing merged since)', () => {
+    const f = fixture([old(102, 'success', mainHead)], [removal()], mainHead);
+    expect(f.guard().hold).toBe(false);
+    expect(f.retryLog()).toContain('102');
+  });
+
+  it('keeps the age rule when main head moved past the newest completed run', () => {
+    const f = fixture([old(102, 'success', 'e'.repeat(40))], [removal()], mainHead);
+    expect(f.guard().hold).toBe(true);
+    expect(f.declineLog()).toMatch(/stale/i);
+  });
+
+  it('declines when the newest run for the current head was cancelled, even with an older green run for it', () => {
+    const f = fixture([old(102, 'cancelled', mainHead), { ...old(101, 'success', mainHead), created_at: '2026-11-01T03:00:00Z', updated_at: '2026-11-01T03:10:00Z' }], [removal()], mainHead);
+    expect(f.guard().hold).toBe(true);
+  });
+
+  it('declines when the current head run is still unfinished', () => {
+    const f = fixture([{ ...pending(), head_sha: mainHead }, old(102, 'success', mainHead)], [removal()], mainHead);
+    expect(f.guard().hold).toBe(true);
+  });
+
+  it('fails closed when main head is unreadable', () => {
+    const f = fixture([old(102, 'success', mainHead)]);
+    expect(f.guard().hold).toBe(true);
+    expect(f.declineLog()).toMatch(/stale/i);
   });
 });

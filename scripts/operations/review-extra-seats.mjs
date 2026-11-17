@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 import { FINDING_CLASSES, classAction, stricterClass, readFindingClassPolicy, validAlsoClasses } from '../lib/finding-class-policy.mjs';
 import { decodeRecoveryAdmission } from '../lib/drain-red-team-evidence.mjs';
-import { recordRedTeamStatus, readRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
+import { recordRedTeamStatus, readRedTeamStatus, redTeamStatusDir } from '../lib/drain-red-team-evidence.mjs';
+import { publishStoredRedTeamResult } from '../lib/red-team-withheld-publish.mjs';
+import { redTeamCheckRunIsEvidence } from '../lib/red-team-check-run.mjs';
 import { normalizeRedTeamResult } from '../lib/review-red-team-on-skip.mjs';
 import { failedRedTeamRetry, completedRedTeamSeat, redTeamStatusWithoutRun } from '../lib/red-team-run-result.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
+import { PR_COMMENTS_PAGE_SIZE } from '../lib/review-label-provider.mjs';
 import { execRead } from '../lib/proc-read.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { redTeamCardOnly } from '../lib/review-red-team-policy.mjs';
@@ -59,6 +62,8 @@ import { providerQuotaHold, QUOTA_COOLOFF_MS, CODEX_QUOTA_FULL_PERCENT } from '.
  */
 
 import { resolveOperationEffort, resolveOperationRoute, readRoutingPolicy } from '../lib/dispatch-routing-policy-io.mjs';
+import { resolveAiRouting, aiRoutingInputs } from '../lib/ai-routing.mjs';
+import { resolveOperationRoute as validateAiSeatRoute } from '../lib/dispatch-routing-policy.mjs';
 import { rosterForKey } from '../lib/dispatch-routing-providers.mjs';
 import { agyRunEvidence, pickAgyEvidence } from '../lib/antigravity-run-evidence.mjs';
 import { spawn, spawnSync } from 'node:child_process';
@@ -215,6 +220,18 @@ export function reserveSeatCalls({ ledger, records, want, dailyCap, now, newId, 
   // to the shared ledger file, never drops another provider's outstanding entries.
   const otherProviders = (Array.isArray(ledger?.reservations) ? ledger.reservations : []).filter((r) => r && capDay(r.at) === day && !sameProvider(r));
   return { callIds, used: ids.size, ledger: { version: 1, reservations: [...otherProviders, ...kept, ...fresh] } };
+}
+
+/** Is the red-team check run merge evidence in this mode? Publish-first binds only then (every mode but the
+ * drain-scan rollback). Logs the effective value and its source (policy cascade). */
+function checkRunIsEvidence(env, log = () => {}) {
+  return redTeamCheckRunIsEvidence({ env, log });
+}
+
+/** Drop unspent reservations (a round that never started must not burn the day's budget). PURE. */
+export function releaseSeatCalls({ ledger, callIds }) {
+  const drop = new Set(callIds ?? []);
+  return { version: 1, reservations: (Array.isArray(ledger?.reservations) ? ledger.reservations : []).filter((r) => r && !drop.has(r.callId)) };
 }
 
 /**
@@ -1061,6 +1078,15 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
         return r;
       }, { timeoutMs: lockTimeoutMs });
     },
+    releaseCalls: ({ provider, callIds }) => {
+      const ledgerPath = ledgerPathFor(provider);
+      return withLedgerLock(ledgerPath, () => {
+        if (!existsSync(ledgerPath)) return;
+        const tmp = `${ledgerPath}.${process.pid}.tmp`;
+        writeFileSync(tmp, `${JSON.stringify(releaseSeatCalls({ ledger: JSON.parse(readFileSync(ledgerPath, 'utf8')), callIds }), null, 2)}\n`);
+        renameSync(tmp, ledgerPath);
+      }, { timeoutMs: lockTimeoutMs });
+    },
     cliAvailable: (provider) => {
       const r = spawnSync(CLI_BIN[provider], ['--version'], { env, encoding: 'utf8', timeout: 20_000, stdio: ['ignore', 'pipe', 'pipe'] });
       return r.status === 0;
@@ -1165,6 +1191,70 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
 // The `red-team-replay` CLI never writes the store at all.
 
 export const RED_TEAM_SEAT = Object.freeze({ seat: 'red-team', lens: 'red-team', key: 'red-team' });
+
+// These are single seats: executor settings have no bearing on their route.
+let loggedIgnoredAiSeatOptions = false;
+function aiSeatRoute(role, current, { env, io, available, operation, taskType, policy, operatorKeys }) {
+  let resolved, coordinator;
+  try {
+    resolved = (io.readAiRouting ?? resolveAiRouting)({ env, log: io.log });
+    if (resolved.invalid?.length) {
+      io.log(`aiRouting.${role}: ignored invalid settings: ${resolved.invalid.join('; ')}`);
+    }
+    ({ coordinator } = aiRoutingInputs(role, resolved));
+  } catch (error) {
+    io.log(`aiRouting.${role}: invalid routing (${error.message}); inheriting today's route`);
+    return current;
+  }
+  if ((coordinator?.model !== undefined || coordinator?.effort !== undefined) && !loggedIgnoredAiSeatOptions) {
+    loggedIgnoredAiSeatOptions = true;
+    io.log('aiRouting red-team/red-team-recheck: overlay model/effort ignored; only coordinator.provider is honoured');
+  }
+  if (!coordinator?.provider) return current;
+  if (role === 'red-team-recheck' && coordinator.provider !== 'claude') {
+    io.log(`aiRouting.${role}: ${coordinator.provider} cannot enforce Claude's tool, budget and environment restrictions; inheriting today's route`);
+    return current;
+  }
+  const roster = rosterForKey(taskType ? `${operation}:${taskType}` : operation);
+  if (roster && !roster.includes(coordinator.provider)) {
+    io.log(`aiRouting.${role}: ${coordinator.provider} unavailable; inheriting today's route`);
+    return current;
+  }
+  // Reapply roster, counting-seat, disabled-provider and operator-override rules.
+  const reader = io.readRoutingPolicy ?? readRoutingPolicy;
+  const effectivePolicy = policy ?? reader();
+  const effectiveOperatorKeys = operatorKeys ?? reader.operatorKeys?.() ?? [];
+  const lookupKeys = [`${operation}:${taskType}`, operation, String(operation).split(':')[0], '*'];
+  if (lookupKeys.some(key => effectiveOperatorKeys.includes(key))) {
+    // Resolve the operator's chain before deriving defaults for the overlay's provider.
+    const route = validateAiSeatRoute({ operation, taskType, available, policy: effectivePolicy,
+      aiRouting: {}, operatorKeys: effectiveOperatorKeys });
+    io.log(`policy-cascade · aiRouting.${role}: operator routing override takes precedence; inheriting ${route?.provider}/${route?.model}/${route?.effort}`);
+    return route ?? current;
+  }
+  const provider = coordinator.provider;
+  const configured = current?.provider === provider ? current : resolveOperationRoute({
+    operation, taskType, policy: effectivePolicy,
+  });
+  // The overlay may select a provider absent from the repository's route chain.
+  // Retain matching policy defaults, otherwise use the seat's provider defaults.
+  const defaults = [configured, ...(configured?.fallback ?? [])].find(route => route?.provider === provider);
+  const model = defaults?.model ?? (role === 'red-team-recheck' ? RECHECK_MODEL : RED_TEAM_MODELS[provider].model);
+  // Operation effort may be a scalar belonging to a different provider (e.g. Codex xhigh).
+  const effort = defaults?.effort ?? (role === 'red-team-recheck' ? RECHECK_EFFORT : RED_TEAM_MODELS[provider].effort);
+  // A policy disable must reject the overlay even when it also made the provider
+  // unavailable via a zero cap. Do not let a fallback mask that rejection.
+  const route = validateAiSeatRoute({ operation, taskType, available: [provider], policy: effectivePolicy,
+    aiRouting: { provider, model, effort }, operatorKeys: effectiveOperatorKeys });
+  if (!available.includes(provider)) {
+    io.log(`aiRouting.${role}: ${provider} unavailable; inheriting today's route`);
+    return current;
+  }
+  const sources = Object.fromEntries(Object.entries(resolved.sources ?? {}).filter(([path]) => path.startsWith(`${role}.coordinator.`)));
+  io.log(`policy-cascade · aiRouting.${role}: ${route?.provider}/${route?.model}/${route?.effort} (${JSON.stringify(sources)})`);
+  // Validation expands model aliases; keep the launch boundary's existing defaults.
+  return route?.provider === provider ? { ...route, model, effort } : route ?? current;
+}
 export const RED_TEAM_RUBRIC = 'review-red-team.1';
 export const RED_TEAM_MISS_DISPATCH_KIND = 'red-team-miss';
 /** The red team digs deeper than an advisory lens, so it runs at the higher effort each provider offers. */
@@ -1784,8 +1874,16 @@ export async function speculateRedTeam({
     let lastReason = null;
     let configuredRoute = null;
     for (let attempt = 0; attempt <= providers.length && available.length && !callId; attempt += 1) {
+      let routeError = null;
       try { configuredRoute = resolveOperationRoute({ operation: 'review-seat', taskType: RED_TEAM_SEAT.key, available, policy: routingPolicy }); }
-      catch (error) { lastReason = error.message; break; }
+      catch (error) { configuredRoute = null; routeError = error; }
+      try {
+        configuredRoute = aiSeatRoute('red-team', configuredRoute, { env, io, available,
+          operation: 'review-seat', taskType: RED_TEAM_SEAT.key, policy: routingPolicy });
+        // A valid overlay can supply a route even when the default chain is exhausted.
+        // Without one, preserve the policy failure rather than selecting outside its chain.
+        if (routeError && !configuredRoute) throw routeError;
+      } catch (error) { lastReason = error.message; break; }
       const pick = configuredRoute ? { provider: configuredRoute.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: RED_TEAM_SEAT.key, available, scorecards: records });
       if (!pick.provider) { lastReason = pick.reasoning; break; }
       let reservation;
@@ -1811,8 +1909,21 @@ export async function speculateRedTeam({
       try { onReserved({ callId, provider, model, effort, rev, reservedAt: new Date(io.now()).toISOString() }); } catch { /* best effort */ }
     }
     if (record && post) {
-      try { io.redTeamStatus?.({ repo, pr, loopPayload: { findings: { read } }, status: 'running' }); }
-      catch (e) { io.log(`red-team status: ${e.message}`); }
+      // Publish-first (#6535): the round starts only once its in_progress check is posted, so CI can never pass
+      // an older success while this round runs unseen. Fail closed; the next tick retries.
+      // The real io (createRedTeamIo) throws unless the post is confirmed; only an explicit false/throw is read here.
+      // Only where the check run is evidence: the drain-scan rollback never reads it, so there a failed publication
+      // is logged and the round starts, as before #6535 (a check outage must not stall the rollback).
+      let published = { published: true };
+      try { published = io.redTeamStatus?.({ repo, pr, loopPayload: { findings: { read } }, status: 'running' }) ?? published; }
+      catch (e) { published = { published: false, reason: String(e?.message ?? e) }; }
+      if (published?.published === false && !checkRunIsEvidence(env, io.log)) io.log(`red-team status: ${String(published?.reason ?? 'publication not confirmed').slice(0, 300)} (redTeamGate.source=drain-scan: round starts)`);
+      else if (published?.published === false) {
+        const reason = `red-team round not started: in_progress check not posted (${String(published?.reason ?? 'publication not confirmed').slice(0, 300)}); retried next tick`;
+        io.log(reason);
+        try { io.releaseCalls?.({ provider, callIds: [callId] }); } catch (e) { io.log(`red-team reservation release failed: ${e.message}`); }
+        return { status: 'skipped', deferredByGuard: true, reason };
+      }
     }
     const timeoutMs = resolveSeatTimeoutMs(env);
 
@@ -2030,7 +2141,10 @@ export function renderRedTeamSummary(r) {
 }
 
 /** The red team's effects: the added seats' io, plus the Claude re-check, the head message and the PR comment. */
-export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath, spawnRecheck = null, ...rest } = {}) {
+export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath, spawnRecheck = null, recordStatus = recordRedTeamStatus, sealResult = null,
+  readAiRouting = resolveAiRouting,
+  readCompleteComments = ({ pr, repo }) => readCompletePrComments(pr, { repo,
+    exec: (file, args, options) => execRead(file, args, { ...options, cwd: root, env }) }), ...rest } = {}) {
   const base = createExtraSeatsIo({ env, root, storePath, ...rest });
   const gh = (args, input) => {
     // maxBuffer: long-lived PRs carry multi-MB comment lists (`pr view --json comments`); the 1 MiB default made
@@ -2039,18 +2153,31 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
     if (r.status !== 0) throw new Error(`gh ${args[0]} ${args[1]} failed: ${String(r.stderr || r.error?.message || '').trim().slice(0, 300)}`);
     return String(r.stdout ?? '');
   };
+  // Seal at finish (#6535, operator ruling R907): the finished result is sealed AND, when its comment was withheld or
+  // its post failed, published by the shared publisher (the sweep's own path, bounded by its attempt count), so the
+  // red-team check written once at finish reads the sealed breaks and the posted result, not an unsealed bare `ran`.
+  const sealFinished = sealResult ?? (({ repo, pr, head }) => publishStoredRedTeamResult({
+    status: { repo, pr, head }, statusDir: redTeamStatusDir(env),
+    listComments: () => readCompleteComments({ pr, repo }),
+    postComment: ({ repo: r, pr: p, body }) => gh(['pr', 'comment', String(p), `--repo=${r}`, '--body-file', '-'], body),
+    readSeatRow: key => priorRedTeamRow(readStore({ path: storePath ?? resolveScorecardStorePath(env), strict: true }).records,
+      key.pr, key.head, key.repo),
+  }));
   return {
     ...base,
+    readAiRouting,
     readRecords: ({ strict = false } = {}) => strict
       ? readStore({ path: storePath ?? resolveScorecardStorePath(env), strict: true }).records : base.readRecords(),
     readRedTeamStatus: input => readRedTeamStatus({ ...input, env }),
-    readRecoveryComments: ({ pr, repo }) => readCompletePrComments(pr, { repo,
-      exec: (file, args, options) => execRead(file, args, { ...options, cwd: root, env }) }),
+    readRecoveryComments: readCompleteComments,
     redTeamStatus: input => {
-      recordRedTeamStatus(input, { env });
+      const outcome = recordStatus(input, { env, sealFinished });
+      if (input.status === 'running' && outcome?.published !== true && checkRunIsEvidence(env, base.log))
+        throw new Error(`red-team in_progress check not published: ${String(outcome?.reason ?? 'publication not confirmed').slice(0, 300)}`);
       try { syncRedTeamStatusLabels({ repo: input.repo, pr: input.pr, head: input.loopPayload.findings.read.netBasis.rev,
         evidence: { scheduled: true, inFlight: input.status === 'running', recorded: input.result === 'ran' }, env, log: base.log }); }
       catch (e) { base.log(`red-team status labels: ${e.message}`); }
+      return outcome;
     },
     readHeadMessage: (dir) => {
       const r = spawnSync('git', ['-C', dir, 'log', '-1', '--format=%B'], { encoding: 'utf8', timeout: 20_000 });
@@ -2058,7 +2185,9 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
     },
     runRecheck: async ({ pr, lanePath, rev, readsRepo = true, mandate, input, shape }) => {
       const { judgeSpawn } = await import('../lib/judge-spawn.mjs');
-      const configured = resolveOperationRoute({ operation: 'review-recheck', available: ['claude', 'codex', 'antigravity'] });
+      let configured = resolveOperationRoute({ operation: 'review-recheck', available: ['claude', 'codex', 'antigravity'] });
+      configured = aiSeatRoute('red-team-recheck', configured, { env, io: { readAiRouting, log: base.log, readRoutingPolicy: rest.readRoutingPolicy },
+        available: ['claude', 'codex', 'antigravity'], operation: 'review-recheck' });
       // Repo tools require Claude's enforceable allow-list. Other providers cannot honor it.
       if (readsRepo && configured && configured.provider !== 'claude') throw new Error('repo re-check requires the Claude read-only tool allow-list');
       const spawnJudge = spawnRecheck ?? (configured ? (await import('./cli-adapter.mjs')).resolveJudgeProvider(configured.provider) : judgeSpawn);
@@ -2099,7 +2228,14 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
       }
     },
     logTrial: (row) => logDelegationTrial(row, storePath ? { path: storePath } : {}),
-    listComments: ({ pr, repo }) => JSON.parse(gh(['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'comments']) || '{}').comments ?? [],
+    // The duplicate check reads this list. `pr view --json comments` stops at one page, so a full page is re-read
+    // through the complete reader (which throws rather than return a partial thread): a result past comment 100
+    // must stay visible here, because the review barrier (`review-pr-io.mjs#postPendingRedTeam`) skips its
+    // pending check when the complete thread already holds this head's result.
+    listComments: ({ pr, repo }) => {
+      const page = JSON.parse(gh(['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'comments']) || '{}').comments ?? [];
+      return Array.isArray(page) && page.length >= PR_COMMENTS_PAGE_SIZE ? readCompleteComments({ pr, repo }) : page;
+    },
     postComment: ({ pr, repo, body }) => gh(['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'], body),
   };
 }

@@ -16,7 +16,7 @@ export const readReviewHead = ({ repo, pr, run = gh }) => JSON.parse(run(['pr', 
 /** Fetch labels with the head so the default gate needs no separate label request. */
 export const readReviewHeadAndLabels = ({ repo, pr, run = gh }) => JSON.parse(run(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid,labels']));
 /**
- * Every check run PLUS every legacy commit status (`{context, state}`) for the SHA: a required context may be
+ * Every check run PLUS every legacy commit status (`{context, state, target_url}`) for the SHA: a required context may be
  * published through either, and a reader of check runs alone would call a green commit-status context missing.
  * The combined-status endpoint already reports only the latest state per context.
  */
@@ -31,7 +31,7 @@ export const readReviewChecks = ({ repo, headSha, run = gh }) => [
     'api', '--paginate', '--slurp', `repos/${repo}/commits/${headSha}/status?per_page=100`,
   ])).flatMap(page => {
     if (!Array.isArray(page.statuses)) throw new Error('unreadable commit statuses');
-    return page.statuses.map(({ context, state }) => ({ context, state }));
+    return page.statuses.map(({ context, state, target_url }) => ({ context, state, target_url }));
   }),
 ];
 

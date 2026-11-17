@@ -131,7 +131,9 @@ import { reduceCheckState, CI_TRUTH_EXCLUDED_CHECKS } from '../operations/pr-sta
 import { collapseRollupToLatestPerName, FAILED_CHECK_CONCLUSIONS } from '../lib/rollup-collapse.mjs';
 import { isForeignCompletionSessionId, sanitizeDeniedCommand } from '../operations/completion-record.mjs';
 import { NEGOTIATION_ROUND_CAP } from '../lib/jury-core.mjs';
+import { resolveRoundCap } from '../lib/round-cap.mjs';
 import { countRearmComments, REARM_COMMENT_MARKER } from './rearm-review.mjs';
+import { isFixRoundRearmComment } from './rearm-round-count.mjs';
 // #3383 — see this module's own REFUSAL 3 note below, and `advisory-round-count.mjs`'s header for the
 // `#2117`/`#2298` incident this closes.
 import { countAdvisoryComments, ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
@@ -188,6 +190,7 @@ import {
 import {
   parseReviewedSha, headEverHumanCleared, planConvertSupersededVerdict, targetedCheckQuestion, findAcceptVerdictComment, REVIEW_LABELS,
 } from '../lib/review-escalation.mjs';
+import { loadExternalCheckApps, isExternalAppCheck } from './external-check-apps.mjs';
 // live incident, web-everything/web-everything PR #2752 (#4034/#2748) — a PR whose own content is ALREADY on `main`,
 // carried there by a different PR that stacked on its branch and merged first, never owes a fix or a review.
 // The verdict itself (`pr.alreadyLandedInMain`, per-file blob-identity evidence) is computed by the IO shell
@@ -425,7 +428,7 @@ const OWED_ELSEWHERE = Object.freeze({
 export { CI_HEAL_ROUND_CAP, CI_HEAL_ATTEMPT_CAP_ENV, CI_HEAL_RESET_ON_FIX_HEAD_ENV, resolveCiHealBudget, ciHealBudgetResetAt };
 
 /**
- * Pure durable review-round evidence. Each trusted re-arm closes (start, rearmAt], where
+ * Pure durable review-round evidence. Each trusted fix re-arm (never a same-head wake) closes (start, rearmAt], where
  * start is the earliest review fix-begin after the previous re-arm (never ci-heal), else the previous re-arm.
  * Invalid evidence leaves the historical cap accounting untouched. `real` counts the rounds that SPENT an attempt:
  * every round except one proven mechanical (its window holds only upstream merges git reproduces cleanly, plain drain
@@ -457,7 +460,7 @@ export function countRealFixRounds(pr) {
     if (i + 1 === facts.commits.length && !shaPattern.test(next ?? '')) return fail('truncated-history');
   }
   const comments = (Array.isArray(pr?.comments) ? pr.comments : []).filter(isTrustedMarkerAuthor);
-  const rearms = comments.filter((c) => typeof c.body === 'string' && c.body.trimStart().startsWith(REARM_COMMENT_MARKER));
+  const rearms = comments.filter(isFixRoundRearmComment);
   const begins = comments.filter((c) => typeof c.body === 'string' && c.body.trimStart().startsWith(FIX_BEGIN_MARKER)
     && /^fix-\d+$/.test(FIX_MARKER_WHO_RE.exec(c.body)?.[1] ?? ''));
   const time = (c) => Date.parse(c.createdAt);
@@ -1566,12 +1569,8 @@ function reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra = {} }
   return allowed;
 }
 
-/** Positive integer cap override; malformed or absent configuration keeps the shared default. */
-export function resolveRoundCap(env = {}) {
-  const value = env.WE_REVIEW_ROUND_CAP;
-  return typeof value === 'string' && /^\d+$/.test(value.trim())
-    && Number.isSafeInteger(Number(value)) && Number(value) > 0 ? Number(value) : NEGOTIATION_ROUND_CAP;
-}
+// The shared resolver (card 8062): every round-cap reader goes through we:scripts/lib/round-cap.mjs.
+export { resolveRoundCap };
 
 function advisoryHeadState(pr) {
   const headSha = typeof pr?.headRefOid === 'string' ? pr.headRefOid.trim().toLowerCase() : '';
@@ -2025,12 +2024,39 @@ function operatorSendBackRearm(pr, operatorBudget) {
  *  truncated hydration, `rollupIncomplete`) so a live run past the page limit cannot be seen. GitHub rejects (HTTP 422) a re-run of a workflow that is still
  *  running, and the executor counts that rejection against the head's retry budget — so every mechanical re-run
  *  branch (`owed-ci-rerun`, `stale-ci-rerun`) must hold while this is true, never dispatch. Case-insensitive. */
-const hasLiveCheck = (pr) => pr?.rollupIncomplete === true || (pr?.statusCheckRollup ?? []).some(c => {
-  if (!c) return false;
-  if (c.status) return String(c.status).toUpperCase() !== 'COMPLETED';
-  // No `status`: a CheckRun that lost it is unknown (fail closed); a commit status is live while PENDING/EXPECTED.
-  return c.__typename === 'CheckRun' || ['PENDING', 'EXPECTED'].includes(String(c.state ?? '').toUpperCase());
-});
+const EXTERNAL_CHECK_APPS = loadExternalCheckApps();
+const liveCheckNames = (pr, { requiredChecks, now = 0, externalCheckApps = EXTERNAL_CHECK_APPS } = {}) => {
+  if (pr?.rollupIncomplete === true) return ['<rollup incomplete>'];
+  const rollup = pr?.statusCheckRollup ?? [];
+  const required = Array.isArray(requiredChecks) && requiredChecks.length ? new Set(requiredChecks) : null;
+  // GitHub rejects a re-run only while a run of the SAME workflow is live, so an auxiliary check (red-team,
+  // review-gate, CodeQL) that is not required and runs in a different named workflow never defers it.
+  const workflows = new Set(rollup.filter(c => c && required?.has(c.name) && c.workflowName).map(c => c.workflowName));
+  // Proof must cover EVERY required check on the head (one workflow-less required check leaves the retried run unknown),
+  // and a live check linking to the same run as any required check is part of that run, whatever workflow it names.
+  const requiredRows = rollup.filter(c => c && required?.has(c.name));
+  // EVERY configured required check must be in the rollup and name its workflow; a missing one leaves the proof incomplete.
+  const proven = workflows.size > 0 && !!required && [...required].every(n => { const rows = requiredRows.filter(c => c.name === n); return rows.length > 0 && rows.every(c => c.workflowName); });
+  const runOf = (c) => /\/actions\/runs\/(\d+)/.exec(String(c?.detailsUrl ?? c?.targetUrl ?? ''))?.[1];
+  const requiredRuns = new Set(requiredRows.map(runOf).filter(Boolean));
+  return rollup.filter(c => {
+    if (!c) return false;
+    const live = c.status ? String(c.status).toUpperCase() !== 'COMPLETED'
+      // No `status`: a CheckRun that lost it is unknown (fail closed); a commit status is live while PENDING/EXPECTED.
+      : c.__typename === 'CheckRun' || ['PENDING', 'EXPECTED'].includes(String(c.state ?? '').toUpperCase());
+    if (!live) return false;
+    // Fail closed unless the required workflow is PROVEN (some required check names it) and this check names another.
+    if (!(required && c.status && !required.has(c.name) && proven)) return true;
+    if (runOf(c) && requiredRuns.has(runOf(c))) return true;
+    // A check naming a different workflow is not a live run of ours. A check with NO workflow (an app/API check such as
+    // red-team) is external only when its check-suite app (id or slug) is the configured poster of that exact check
+    // name (fix.externalCheckApps). A name or link alone, or missing app metadata, keeps the hold.
+    if (c.workflowName) return workflows.has(c.workflowName);
+    return !isExternalAppCheck(c, externalCheckApps);
+  }).map(c => String(c.name ?? c.context ?? '?'));
+};
+const hasLiveCheck = (pr, opts) => liveCheckNames(pr, opts).length > 0;
+const liveWhy = (pr, opts) => ` (live: ${liveCheckNames(pr, opts).slice(0, 5).join(', ')})`;
 
 /**
  * we:scripts/conveyor/reconcile-core.mjs#planReconcile — THE PASS. Given every open PR, every live session, and
@@ -3203,7 +3229,7 @@ export function planReconcile({
         let owedRerunSpent = false;
         const retry = pr.owedCiRerunRetry;
         // Same still-running guard as the `stale-ci-rerun` branch: a live run rejects the re-run and burns the budget.
-        const rerunLive = hasLiveCheck(pr);
+        const rerunLive = hasLiveCheck(pr, { requiredChecks, now });
         if (owedCiRerun.rerun === 'on' && pr.mainGreenNow?.red === false && !rerunLive
             && retry?.eligible && retry.head === pr.headRefOid && retry.pr === prNumber) {
           const foldReview = row => {
@@ -3405,11 +3431,11 @@ export function planReconcile({
       if (staleRerunActive) {
         const staleSpent = retryBudget?.confirmed === undefined ? undefined : retryBudget.confirmed + (retryBudget.rejected ?? 0);
         const staleCap = incompleteFailureInventory ? 1 : staleRetry.jobs.length;
-        if (staleSpent < staleCap && hasLiveCheck(pr)) {
+        if (staleSpent < staleCap && hasLiveCheck(pr, { requiredChecks, now })) {
           // The owed re-run is deferred, not skipped: hold (never fall through to a heal that spends heal budget on a
           // head whose fresh result is still on its way) and re-plan next tick.
           refuse('ci-timeout-rerun-in-flight', { ...withPhase,
-            why: 'another check on this head is still running — the one-time re-run of the failed required jobs waits until it completes' });
+            why: 'another check on this head is still running — the one-time re-run of the failed required jobs waits until it completes' + liveWhy(pr, { requiredChecks, now }) });
           continue;
         }
         if (staleSpent < staleCap) {
@@ -3446,9 +3472,9 @@ export function planReconcile({
       }
       if (partialFailureInventory && pr.mainGreenNow?.red !== true && staleRetry?.eligible
           && staleRetry.head === pr.headRefOid && staleRetry.pr === prNumber) {
-        if (hasLiveCheck(pr)) {
+        if (hasLiveCheck(pr, { requiredChecks, now })) {
           refuse('ci-timeout-rerun-in-flight', { ...withPhase,
-            why: 'another check on this head is still running — the incomplete inventory recovery rerun waits until it completes' });
+            why: 'another check on this head is still running — the incomplete inventory recovery rerun waits until it completes' + liveWhy(pr, { requiredChecks, now }) });
           continue;
         }
         const variant = 'incomplete-inventory-rerun';

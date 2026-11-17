@@ -4,8 +4,9 @@
  *   throws. Every fs call is injected — no real filesystem touched, mirroring `gh-app-shim.test.mjs`'s own
  *   in-memory-store convention for `ensureSettingsFileEnv`/`ensureSettingsFilePermissions`.
  */
+import { pinnedHookScript } from '../pinned-hook-command.mjs';
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, readFileSync, existsSync, rmSync, mkdirSync, readdirSync, copyFileSync, symlinkSync, realpathSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, mkdirSync, readdirSync, copyFileSync, symlinkSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -103,26 +104,26 @@ describe('hasWorktreeIsolationOff', () => {
 });
 
 // xl5reby — a dispatched worker starts in a scratch dir with no repo settings; its OWN settings must carry the
-// repo's PreToolUse guards, by absolute path.
+// repo's PreToolUse guards, preserving pinned launcher commands.
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 
 describe('xl5reby dispatched worker effective settings include the repo guard hooks', () => {
-  it('isolateDispatchSession (the one call every dispatch path makes) writes guard-bash and guard-lane by absolute path', () => {
+  it('isolateDispatchSession (the one call every dispatch path makes) preserves pinned guard-bash and guard-lane commands', () => {
     const cwd = mkdtempSync(join(tmpdir(), 'dispatch-guards-'));
     try {
-      const r = isolateDispatchSession(cwd);
+      const r = isolateDispatchSession(cwd, {
+        ensureHooks: (options) => ensureDispatchGuardHooks({ ...options, repoRoot: REPO }),
+      });
       expect(r.hooks.ok).toBe(true);
       const settings = JSON.parse(readFileSync(join(cwd, '.claude', 'settings.local.json'), 'utf8'));
       const cmds = settings.hooks.PreToolUse.flatMap((g) => g.hooks.map((h) => h.command));
       expect(cmds.some((c) => c.includes('guard-bash.mjs'))).toBe(true);
       expect(cmds.some((c) => c.includes('guard-lane.mjs'))).toBe(true);
-      for (const c of cmds) {
-        const m = /^node "(\/[^"]+\.mjs)"/.exec(c);
-        expect(m, c).not.toBeNull();
-        expect(existsSync(m[1]), m[1]).toBe(true);
-      }
+      const repo = JSON.parse(readFileSync(join(REPO, '.claude', 'settings.json'), 'utf8'));
+      expect(settings.hooks.PreToolUse).toEqual(repo.hooks.PreToolUse);
+      for (const c of cmds) expect(pinnedHookScript(c), c).not.toBeNull();
       const bash = settings.hooks.PreToolUse.find((g) => g.matcher === 'Bash');
-      expect(bash.hooks[0].command).toMatch(/guard-bash\.mjs"$/);
+      expect(pinnedHookScript(bash.hooks[0].command)).toBe('scripts/guard-bash.mjs');
       expect(settings.worktree).toEqual({ bgIsolation: 'none' });
     } finally { rmSync(cwd, { recursive: true, force: true }); }
   });
@@ -134,9 +135,29 @@ describe('xl5reby dispatched worker effective settings include the repo guard ho
   it('only PreToolUse deny guards are carried, never bookkeeping hooks', () => {
     const repo = JSON.parse(readFileSync(join(REPO, '.claude', 'settings.json'), 'utf8'));
     const all = dispatchGuardHooks({ preToolUse: repo.hooks.PreToolUse, repoRoot: '/r' }).flatMap((g) => g.hooks.map((h) => h.command));
-    expect(all).toContain('node "/r/scripts/guard-bash.mjs"');
-    expect(all).toContain('node "/r/scripts/lint-locus-prefix.mjs" --pre');
+    expect(all).toEqual(repo.hooks.PreToolUse.flatMap((g) => g.hooks.map((h) => h.command)));
+    expect(all.map(pinnedHookScript)).toContain('scripts/guard-bash.mjs');
+    expect(all.some((c) => c.includes('scripts/lint-locus-prefix.mjs --pre;'))).toBe(true);
     expect(all.join(' ')).not.toMatch(/bootstrap-session|session-reaper|broadcast-inject/);
+  });
+
+  it('rejects unknown and incomplete pinned wrappers while retaining legacy direct hooks', () => {
+    const repo = JSON.parse(readFileSync(join(REPO, '.claude', 'settings.json'), 'utf8'));
+    const command = repo.hooks.PreToolUse.find((g) => g.matcher === 'Bash').hooks[0].command;
+    const invalid = [
+      `echo ${command}`,
+      command.replace('run-pinned-guard.mjs', 'other-launcher.mjs'),
+      command.replace(' || exit 2', ''),
+      command.replace('scripts/guard-bash.mjs;', 'scripts/guard-bash.mjs-extra;'),
+      command.replace('scripts/guard-bash.mjs;', 'scripts/guard-bash.mjs\n;'),
+      // The non-blocking Stop form must never become a PreToolUse guard.
+      repo.hooks.Stop[0].hooks[0].command.replace('guard-stop-passive-wait.mjs', 'guard-bash.mjs'),
+    ];
+    expect(dispatchGuardHooks({ repoRoot: '/r', preToolUse: [{ matcher: 'Bash', hooks: [
+      ...invalid.map((command) => ({ type: 'command', command })),
+      { type: 'prompt', command },
+      { type: 'command', command: 'node scripts/guard-bash.mjs' },
+    ] }] })).toEqual([{ matcher: 'Bash', hooks: [{ type: 'command', command: 'node "/r/scripts/guard-bash.mjs"' }] }]);
   });
 
   it('falls back to the Bash and Edit/Write guards when the repo settings are unreadable', () => {

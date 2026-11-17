@@ -1,10 +1,11 @@
 /** R247: a declared, single-PR manual daemon pass. All effects live in the IO shell. */
 import { op } from './registry.mjs';
 import { compute, effect } from './step-kinds.mjs';
+import { MANUAL_PASS_DAEMONS } from './operator-action-shape.mjs';
 
 export const MANUAL_DAEMON_PASS_OP = 'manual-daemon-pass';
 export const MANUAL_DAEMON_PASS_EFFECT = 'manual-daemon-pass.run';
-export const MANUAL_DAEMONS = Object.freeze(['review', 'red-team', 'fix', 'verify']);
+export const MANUAL_DAEMONS = MANUAL_PASS_DAEMONS;
 
 export function validateManualPass(input = {}) {
   if (!MANUAL_DAEMONS.includes(input.daemon)) throw new Error('manual-daemon-pass: --daemon must be review|red-team|fix|verify');

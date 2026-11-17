@@ -299,8 +299,10 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
           // A symbolic ref (origin/HEAD, or one aimed at the unrefreshed ops namespace) is never reachability evidence.
           .split('\n').some(line => line && !line.split('\t')[1]));
     },
-    push: (dir, ref, sha) => {
-      transportGit(dir, 'push', '--recurse-submodules=no', origin, `${sha}:refs/heads/${ref}`);
+    push: (dir, ref, sha, { createOnly = false } = {}) => {
+      // An empty expected SHA atomically requires absence, even if another writer wins after remoteSha().
+      const condition = createOnly ? [`--force-with-lease=refs/heads/${ref}:`] : [];
+      transportGit(dir, 'push', '--recurse-submodules=no', ...condition, origin, `${sha}:refs/heads/${ref}`);
       return { ok: true };
     },
     remoteSha: ref => {

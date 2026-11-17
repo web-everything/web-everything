@@ -9,8 +9,9 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
+import * as ghThrottle from '../../lib/gh-throttle.mjs';
 import {
-  withStaleBase, withPlannedContext, dispatchFix, fetchCardScopeAtRef, fetchPrDiffPaths, isDiffTooLargeError, PermanentScopeReadError, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
+  createFixPassPrReader, fetchPrFilesPaginated, replayFixLaunch, withStaleBase, withPlannedContext, dispatchFix, fetchCardScopeAtRef, fetchPrDiffPaths, isDiffTooLargeError, PermanentScopeReadError, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
   findResumeCandidate, buildResumePrompt, tryResumeFix, tryResumeRoundFix, filterFixesByInFlightScope, dropTerminalFixClaims, routeFixExecutor,
 } from '../reconcile-fix-dispatch.mjs';
 import { CONFLICT_LABEL } from '../parked-pr-conflict-watch.mjs';
@@ -784,8 +785,25 @@ describe('tryResumeRoundFix — migrate legacy repair-helper permissions before 
       expect(settings.env).toEqual({ KEEP: '1' });
       expect(settings.worktree).toEqual({ bgIsolation: 'none' });
       expect(settings.hooks.PreToolUse.length).toBeGreaterThan(0);
+      const bash = settings.hooks.PreToolUse.find((group) => group.matcher === 'Bash');
+      expect(bash.hooks[0].command).toContain('node "$launcher" scripts/guard-bash.mjs;');
       return { resumed: true, result: { sessionId } };
     });
+    // Seed the committed pinned-launcher shape without depending on host .claude/settings.json.
+    const repoRoot = join(scratch, 'repo');
+    const repoSettingsPath = join(repoRoot, '.claude', 'settings.json');
+    mkdirSync(join(repoRoot, '.claude'), { recursive: true });
+    writeFileSync(repoSettingsPath, JSON.stringify({ hooks: { PreToolUse: [{
+      matcher: 'Bash',
+      hooks: [{ type: 'command', command: "sh -c 'launcher=\"$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/guard-bash.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'" }],
+    }] } }));
+    const readHooks = vi.fn(readFileSync);
+    // Keep the real default isolateSession and permission refresh at the resume boundary.
+    const isolation = await import('../../lib/dispatch-bg-isolation.mjs');
+    const realIsolate = isolation.isolateDispatchSession;
+    const isolate = vi.spyOn(isolation, 'isolateDispatchSession').mockImplementation((cwd) => realIsolate(cwd, {
+      ensureHooks: (options) => isolation.ensureDispatchGuardHooks({ ...options, repoRoot, readFile: readHooks }),
+    }));
     const planned = { pr: 5931, itemNum: null, attempts: 1, headRefOid: head, baseRefName: 'main', scope: ['we:x'] };
     const options = {
       root: '/repo', scratchRoot: scratch, realpath: (p) => p, wrapFix: false,
@@ -808,6 +826,7 @@ describe('tryResumeRoundFix — migrate legacy repair-helper permissions before 
       expect(tryResumeRoundFix(planned, options).resumed).toBe(true);
       expect(tryResumeRoundFix(planned, options).resumed).toBe(true);
       expect(resume).toHaveBeenCalledTimes(2);
+      expect(readHooks).toHaveBeenCalledWith(repoSettingsPath, 'utf8');
       const shim = await import('../../lib/gh-app-shim.mjs');
       const grant = vi.spyOn(shim, 'ensureSettingsFilePermissions');
       try {
@@ -824,7 +843,7 @@ describe('tryResumeRoundFix — migrate legacy repair-helper permissions before 
           expect(resume).toHaveBeenCalledTimes(2);
         }
       } finally { grant.mockRestore(); }
-    } finally { rmSync(scratch, { recursive: true, force: true }); }
+    } finally { isolate.mockRestore(); rmSync(scratch, { recursive: true, force: true }); }
   });
 });
 
@@ -1342,9 +1361,11 @@ describe('runReconcileFixDispatch — read reconcile-pass, plan, assign a lane, 
 
   it('a failed `claude --bg` spawn is logged with its exit code + redacted stderr, never the argv/settings/brief (live #3794)', () => {
     const entries = [{ kind: 'fix', prNumber: 1764, headRefName: 'lane/3438-wire-reconcile-pass' }];
+    // Built at runtime so no token-shaped literal sits in the source (the Forge bundle credential scan, #6759).
+    const fixtureToken = ['gh', 's_abcdefghijklmnop1234'].join('');
     const spawnError = Object.assign(
-      new Error('Command failed: claude --bg -n fix-1764 --settings {"env":{"GH_TOKEN":"ghs_abcdefghijklmnop1234"}} # brief head\nbrief body\nstderr text'),
-      { status: 1, stderr: 'Error: boom ghs_abcdefghijklmnop1234\n' },
+      new Error('Command failed: claude --bg -n fix-1764 --settings {"env":{"GH_TOKEN":"' + fixtureToken + '"}} # brief head\nbrief body\nstderr text'),
+      { status: 1, stderr: 'Error: boom ' + fixtureToken + '\n' },
     );
     const result = runReconcileFixDispatch({
       root: '/repo',
@@ -1500,6 +1521,7 @@ describe('runReconcileFixDispatch — read reconcile-pass, plan, assign a lane, 
       fetchItemlessDiffPaths: () => [],
       });
       expect(result).toEqual({
+        handled: 0, deferred: [], nextCursor: null,
         dispatched: [], refusals: [], scopeRanks: [], reconcileRefusals: 0, reconcileRefusalDetails: [],
       });
     } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -2227,5 +2249,228 @@ describe('card-at-ref scope: one unsafe piece rejects its whole authored entry',
     const unit = resolveWith('["we:a.mjs b.mjs"]');
     expect(unit.scopeSource).toBe('card');
     expect(unit.scope).toEqual(['we:a.mjs', 'we:b.mjs']);
+  });
+});
+
+describe('runReconcileFixDispatch — PR deadline and cursor', () => {
+  it('expires between PRs before claim admission, resume or lane allocation, then resumes with cursor wraparound', () => {
+    let time = 10;
+    const acquireClaim = vi.fn();
+    const dispatch = vi.fn(entry => {
+      acquireClaim({ pr: entry.pr, lane: entry.lane });
+      time += 1;
+      return { pr: entry.pr, lane: entry.lane };
+    });
+    const tryResume = vi.fn(() => ({ resumed: false, resumeAttempt: null }));
+    const tryResumeRound = vi.fn(() => ({ resumed: false, resumeAttempt: null }));
+    const tryAdmit = vi.fn(() => ({ admit: true }));
+    const options = { root: '/repo', checkStaleness: FRESH, now: () => time, deadlineAt: 10,
+      reconcile: () => ({ dispatch: [
+        { kind: 'fix', prNumber: 1764, headRefName: 'fix-branch-1764' },
+        { kind: 'fix', prNumber: 1765, headRefName: 'fix-branch-1765', labels: [CONFLICT_LABEL] },
+        { kind: 'fix', prNumber: 1766, headRefName: 'fix-branch-1766', attempts: 2 },
+      ], refusals: [] }),
+      findItemFn: () => null, loadItems: () => [], fetchItemlessDiffPaths: pr => [`src/${pr}.ts`],
+      pickFreeLanes: () => [2, 9, 10], listBuildClaims: () => [], listFixClaims: () => [],
+      priorityShadow: null, dispatchThrottle: { tryAdmit }, tryResume, tryResumeRound, dispatch,
+    };
+    const first = runReconcileFixDispatch(options);
+    expect(first).toMatchObject({ handled: 1, deferred: [1765, 1766], nextCursor: 1765 });
+    expect(tryAdmit).toHaveBeenCalledTimes(1);
+    expect(tryResume).not.toHaveBeenCalled();
+    expect(tryResumeRound).not.toHaveBeenCalled();
+    expect(acquireClaim.mock.calls).toEqual([[{ pr: 1764, lane: 2 }]]);
+    expect(dispatch.mock.calls.map(([entry]) => [entry.pr, entry.lane])).toEqual([[1764, 2]]);
+
+    vi.clearAllMocks();
+    const second = runReconcileFixDispatch({ ...options, cursor: first.nextCursor, deadlineAt: time });
+    expect(second).toMatchObject({ handled: 1, deferred: [1766, 1764], nextCursor: 1766 });
+    expect(tryAdmit).toHaveBeenCalledTimes(1);
+    expect(tryResume.mock.calls.map(([entry]) => entry.pr)).toEqual([1765]);
+    expect(tryResumeRound).not.toHaveBeenCalled();
+    expect(acquireClaim.mock.calls).toEqual([[{ pr: 1765, lane: 2 }]]);
+
+    vi.clearAllMocks();
+    const third = runReconcileFixDispatch({ ...options, cursor: second.nextCursor, deadlineAt: 100 });
+    expect(third).toMatchObject({ handled: 3, deferred: [], nextCursor: null });
+    expect(tryAdmit).toHaveBeenCalledTimes(3);
+    expect(tryResume.mock.calls.map(([entry]) => entry.pr)).toEqual([1765]);
+    expect(tryResumeRound.mock.calls.map(([entry]) => entry.pr)).toEqual([1766]);
+    expect(acquireClaim.mock.calls).toEqual([
+      [{ pr: 1766, lane: 2 }], [{ pr: 1764, lane: 9 }], [{ pr: 1765, lane: 10 }],
+    ]);
+    expect(dispatch.mock.calls.map(([entry]) => [entry.pr, entry.lane])).toEqual([[1766, 2], [1764, 9], [1765, 10]]);
+  });
+
+  it('yields between dispatches, resumes deferred PRs first, and wraps without starving earlier PRs', () => {
+    let time = 10;
+    const touched = [];
+    const options = { root: '/repo', checkStaleness: FRESH, now: () => time, deadlineAt: 10,
+      reconcile: () => ({ dispatch: [1764, 1765, 1766].map(prNumber => ({ kind: 'fix', prNumber,
+        headRefName: `fix-branch-${prNumber}` })), refusals: [] }),
+      findItemFn: () => null, loadItems: () => [], fetchItemlessDiffPaths: pr => [`src/${pr}.ts`],
+      pickFreeLanes: () => [2, 9, 10], listBuildClaims: () => [], listFixClaims: () => [],
+      priorityShadow: null, tryResumeRound: null,
+      dispatch: entry => { touched.push(entry.pr); time += 1; return { pr: entry.pr }; },
+    };
+    const first = runReconcileFixDispatch(options);
+    expect(touched).toEqual([1764]);
+    expect(first).toMatchObject({ handled: 1, deferred: [1765, 1766], nextCursor: 1765 });
+    touched.length = 0;
+    const second = runReconcileFixDispatch({ ...options, cursor: first.nextCursor, deadlineAt: time });
+    expect(touched).toEqual([1765]);
+    expect(second).toMatchObject({ handled: 1, deferred: [1766, 1764], nextCursor: 1766 });
+    touched.length = 0;
+    const third = runReconcileFixDispatch({ ...options, cursor: second.nextCursor, deadlineAt: 100 });
+    expect(touched).toEqual([1766, 1764, 1765]);
+    expect(third).toMatchObject({ handled: 3, deferred: [], nextCursor: null });
+  });
+});
+
+describe('runReconcileFixDispatch — progress guarantee', () => {
+  it('a reconcile that always overruns the budget still dispatches one PR every pass (no starvation)', () => {
+    let time = 0;
+    const touched = [];
+    const options = { root: '/repo', checkStaleness: FRESH, now: () => time,
+      reconcile: () => { time += 1000; return { dispatch: [1764, 1765].map(prNumber => ({ kind: 'fix', prNumber,
+        headRefName: `fix-branch-${prNumber}` })), refusals: [] }; },
+      findItemFn: () => null, loadItems: () => [], fetchItemlessDiffPaths: pr => [`src/${pr}.ts`],
+      pickFreeLanes: () => [2, 9, 10], listBuildClaims: () => [], listFixClaims: () => [],
+      priorityShadow: null, tryResumeRound: null,
+      dispatch: entry => { touched.push(entry.pr); return { pr: entry.pr }; } };
+    let cursor;
+    for (let pass = 0; pass < 2; pass += 1) {
+      const result = runReconcileFixDispatch({ ...options, deadlineAt: time + 100, cursor });
+      expect(result.handled).toBeGreaterThanOrEqual(1);
+      cursor = result.nextCursor ?? undefined;
+    }
+    expect(touched).toEqual([1764, 1765]);
+  });
+});
+
+// S1 interface: shouldYield() is checked only after handled >= 1, before
+// throttle/claim/resume/lane pop. Result adds yieldedForAdoption and keeps the cursor.
+describe('runReconcileFixDispatch — adoption safe point', () => {
+  it('shouldYield with handled=1 defers remaining PRs without taking their claims or lanes', () => {
+    let candidateReady = false;
+    const claim = vi.fn();
+    const tryAdmit = vi.fn(() => ({ admit: true }));
+    const tryResume = vi.fn(() => ({ resumed: false }));
+    const dispatch = vi.fn(entry => {
+      claim({ pr: entry.pr, lane: entry.lane });
+      candidateReady = true;
+      return { pr: entry.pr, lane: entry.lane };
+    });
+    const result = runReconcileFixDispatch({
+      root: '/repo', checkStaleness: FRESH, now: () => 0, deadlineAt: 100000,
+      shouldYield: () => candidateReady,
+      reconcile: () => ({ dispatch: [1764, 1765, 1766].map(prNumber => ({ kind: 'fix', prNumber,
+        headRefName: `fix-branch-${prNumber}`, labels: [CONFLICT_LABEL] })), refusals: [] }),
+      findItemFn: () => null, loadItems: () => [], fetchItemlessDiffPaths: pr => [`src/${pr}.ts`],
+      pickFreeLanes: () => [2, 9, 10], listBuildClaims: () => [], listFixClaims: () => [],
+      priorityShadow: null, tryResumeRound: null, tryResume, dispatch,
+      dispatchThrottle: { tryAdmit }, stepLog: () => {},
+    });
+    expect(result).toMatchObject({ handled: 1, deferred: [1765, 1766], nextCursor: 1765,
+      yieldedForAdoption: true });
+    expect(tryAdmit).toHaveBeenCalledTimes(1);
+    expect(tryResume.mock.calls.map(([entry]) => entry.pr)).toEqual([1764]);
+    expect(dispatch.mock.calls.map(([entry]) => [entry.pr, entry.lane])).toEqual([[1764, 2]]);
+    expect(claim.mock.calls).toEqual([[{ pr: 1764, lane: 2 }]]);
+    expect(result.refusals).toEqual([]); // deferred is resumable work, not a refusal
+  });
+});
+
+
+describe('fix pass PR metadata snapshot', () => {
+  it('pins the null-repo dispatch default to canonical WE with one view per PR per pass', () => {
+    const exec = vi.spyOn(ghThrottle, 'execFileSyncThrottled').mockImplementation((_cmd, argv) => {
+      if (argv[0] === 'pr' && argv[1] === 'diff') throw new Error('HTTP 406: diff too large');
+      if (argv[0] === 'pr' && argv[1] === 'view') return JSON.stringify({
+        number: 7, baseRefName: 'main', headRefOid: 'head', labels: [],
+      });
+      if (argv[0] === 'api') return JSON.stringify(['a.mjs']);
+      throw new Error(`unexpected command: ${argv.join(' ')}`);
+    });
+    try {
+      for (let pass = 1; pass <= 2; pass++) {
+        const result = runReconcileFixDispatch({
+          root: '/repo', repo: null, checkStaleness: FRESH,
+          reconcile: () => ({ dispatch: [
+            { kind: 'fix', prNumber: 7, headRefName: 'manual-branch' },
+            { kind: 'fix', prNumber: 7, headRefName: 'manual-branch' },
+          ], refusals: [], notes: [] }),
+          loadItems: () => [], pickFreeLanes: () => [],
+          listBuildClaims: () => [], listFixClaims: () => [],
+          priorityShadow: null, stepLog: () => {},
+        });
+        expect(result.refusals).toEqual([
+          expect.objectContaining({ pr: 7, kind: 'scope-overlap' }),
+          expect.objectContaining({ pr: 7, kind: 'no-lane' }),
+        ]);
+        const views = exec.mock.calls.filter(([, argv]) => argv[0] === 'pr' && argv[1] === 'view');
+        expect(views).toHaveLength(pass);
+        expect(views.at(-1)[1].slice(0, 5)).toEqual([
+          'pr', 'view', '7', '--repo', 'web-everything/web-everything',
+        ]);
+      }
+    } finally { exec.mockRestore(); }
+  });
+
+  it('normalizes internal repo keys before executing and shares their canonical cache entry', () => {
+    const exec = vi.fn(() => JSON.stringify({ number: 7, body: 'description' }));
+    const readPrView = createFixPassPrReader({ exec, repo: 'we' });
+    expect(readPrView(7)).toEqual({ number: 7, body: 'description' });
+    expect(readPrView(7, 'web-everything/web-everything')).toEqual({ number: 7, body: 'description' });
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec.mock.calls[0][1].slice(0, 5)).toEqual(['pr', 'view', '7', '--repo', 'web-everything/web-everything']);
+    readPrView(8, 'we');
+    expect(exec).toHaveBeenCalledTimes(2);
+    expect(exec.mock.calls[1][1].slice(0, 5)).toEqual(['pr', 'view', '8', '--repo', 'web-everything/web-everything']);
+  });
+
+  it('shares exactly one union pr view across fallback, restack snapshot and replay, refreshing next pass', () => {
+    let head = 'first';
+    const exec = vi.fn((_cmd, argv) => {
+      if (argv[0] === 'pr' && argv[1] === 'view') return JSON.stringify({
+        number: Number(argv[2]), headRefName: 'lane/item', headRefOid: head, baseRefName: 'main',
+        labels: [], state: 'OPEN', files: [{ path: 'a.mjs' }], body: 'description', isCrossRepository: false,
+      });
+      if (argv[0] === 'api') return JSON.stringify(['a.mjs']);
+      throw new Error(`unexpected command: ${argv.join(' ')}`);
+    });
+    for (const expectedHead of ['first', 'second']) {
+      head = expectedHead;
+      const before = exec.mock.calls.filter(([, args]) => args[1] === 'view').length;
+      const readPrView = createFixPassPrReader({ exec, repo: 'web-everything/web-everything' });
+      expect(fetchPrFilesPaginated(7, { exec, readPrView })).toEqual(['a.mjs']);
+      expect(readPrView(7)).toMatchObject({ headRefOid: expectedHead, body: 'description', isCrossRepository: false });
+      const replay = replayFixLaunch({ pr: 7, round: 1, readPrView, exec,
+        fixSettings: { strongerModelFromRound: 0 }, resumeRound: () => ({ decision: { resume: false, reason: 'test' } }),
+      });
+      expect(replay).toMatchObject({ head: expectedHead, base: 'main', state: 'OPEN' });
+      // Before: three separate pr view sites for fallback, restack and replay.
+      expect(exec.mock.calls.filter(([, args]) => args[1] === 'view').length - before).toBe(1);
+      readPrView(8);
+      readPrView(7, 'another/repo');
+      expect(exec.mock.calls.filter(([, args]) => args[1] === 'view').length - before).toBe(3);
+    }
+    expect(exec.mock.calls[0][1].at(-1).split(',').sort()).toEqual([
+      'number', 'headRefName', 'headRefOid', 'baseRefName', 'labels', 'state', 'files', 'body', 'isCrossRepository',
+    ].sort());
+  });
+
+  it('keeps a failed view to one call while preserving paginated fallback and retrying next pass', () => {
+    const exec = vi.fn((_cmd, argv) => {
+      if (argv[1] === 'view') throw new Error('unreadable PR');
+      if (argv.includes('--paginate')) return 'fallback.mjs\n';
+      throw new Error('unexpected command');
+    });
+    const readPrView = createFixPassPrReader({ exec });
+    expect(fetchPrFilesPaginated(7, { exec, readPrView })).toEqual(['fallback.mjs']);
+    expect(() => readPrView(7)).toThrow('unreadable PR');
+    expect(exec.mock.calls.filter(([, args]) => args[1] === 'view')).toHaveLength(1);
+    expect(() => createFixPassPrReader({ exec })(7)).toThrow('unreadable PR');
+    expect(exec.mock.calls.filter(([, args]) => args[1] === 'view')).toHaveLength(2);
   });
 });

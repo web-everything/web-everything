@@ -104,7 +104,7 @@
  * Detached job records preserve the task's nonzero code; timeout, a red gate or a failed transcript check falls back to 1.
  */
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { writeLineSync } from './lib/write-all-sync.mjs';
 import { formatCascadeSourcesLine } from './lib/policy-cascade.mjs';
 import { resolveTranscriptCheckPolicy, transcriptCheckError } from './lib/codex-transcript-policy.mjs';
@@ -1240,6 +1240,7 @@ async function runCodexDirectTask({
   scratchGuard,
   caller = 'codex-direct-task.mjs', repo, pr, card, usageTaskKind,
   task,
+  taskFile = null,
   outputSchemaFile,
   dir,
   repoRoot,
@@ -1405,6 +1406,7 @@ async function runCodexDirectTask({
 
   return {
     model, effort, route,
+    ...taskMetadata(task, taskFile),
     dir: targetDir,
     scratch: scratch ? {
       created: true,
@@ -1441,6 +1443,14 @@ async function runCodexDirectTask({
 }
 
 // ── detached jobs ────────────────────────────────────────────────────────────────────────────────
+function taskMetadata(task, taskFile = null) {
+  return {
+    taskFile: taskFile === null ? null : resolve(taskFile),
+    taskSha256: typeof task === 'string' ? createHash('sha256').update(task).digest('hex') : null,
+    taskHead: typeof task === 'string' ? task.slice(0, 200) : null,
+  };
+}
+
 export const MAX_JOB_WAIT_MS = 540000;
 const MIN_JOB_WAIT_MS = 250;
 function jobWaitBudget(maxMs = MAX_JOB_WAIT_MS) {
@@ -1473,6 +1483,10 @@ function validateJobRecord(record, id) {
     || !Number.isInteger(record.pid) || record.pid <= 0
     // Optional: records written before PID start times were captured carry none.
     || (record.pidStart != null && (typeof record.pidStart !== 'string' || !record.pidStart))
+    // Optional for older records and briefs the detached worker could not read.
+    || (record.taskFile != null && typeof record.taskFile !== 'string')
+    || (record.taskSha256 != null && (typeof record.taskSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(record.taskSha256)))
+    || (record.taskHead != null && (typeof record.taskHead !== 'string' || record.taskHead.length > 200))
     || (record.status === 'done' && record.exitCode !== 0)
     || (record.status === 'running' && record.exitCode !== null)
     || (record.status === 'failed' && record.exitCode !== null
@@ -1486,6 +1500,11 @@ export async function startDetachedJob({
   random = randomUUID, jobsDir = resolveJobsDir(), nodePath = process.execPath,
   scriptPath = fileURLToPath(import.meta.url), env = process.env, readStart = readPidStart,
 } = {}) {
+  const flags = parseFlags(args);
+  const taskFile = flags['task-file'] ? resolve(flags['task-file']) : null;
+  // The launcher never reads the brief (a large, stalled or FIFO file must not delay the job id); the worker fills sha/head.
+  const task = taskFile ? undefined : flags.task;
+  const metadata = taskMetadata(task, taskFile);
   const startedAt = new Date(now()).toISOString();
   const id = `${Date.parse(startedAt)}-${random()}`;
   const recordPath = jobRecordPath(jobsDir, id);
@@ -1504,7 +1523,7 @@ export async function startDetachedJob({
     });
     // The start time pins the PID to this child, so `wait` can tell a reused PID from a live job.
     const record = { id, pid: child.pid, pidStart: pidStartOrNull(readStart, child.pid), status: 'running', startedAt, resultPath,
-      exitCode: null };
+      exitCode: null, ...metadata };
     writeJobRecord(record, { jobsDir, fsDeps });
     child.unref();
     return { ...record, recordPath };
@@ -1576,10 +1595,15 @@ export async function waitForJob({
     JSON.parse(await jobAsyncFs.readFile(jobRecordPath(jobsDir, id), 'utf8')), id);
   const expired = Symbol('wait budget exhausted');
   // Every read, probe, mutation, cleanup and poll shares the requested deadline.
+  // A budget timer can fire up to a millisecond before `now()` reaches the deadline. Once ANY timer has
+  // declared the budget spent, every nested step must agree, or an inner step that still sees the clock
+  // short of the deadline would carry on (e.g. rename after the caller was already told 75).
+  let spent = false;
+  const pastDeadline = () => spent || now() >= deadline;
   const withinBudget = async operation => {
-    if (now() >= deadline) return expired;
+    if (pastDeadline()) return expired;
     const pending = operation();
-    if (!pending || typeof pending.then !== 'function') return now() >= deadline ? expired : pending;
+    if (!pending || typeof pending.then !== 'function') return pastDeadline() ? expired : pending;
     const remaining = deadline - now();
     if (remaining <= 0) {
       Promise.resolve(pending).catch(() => {});
@@ -1588,18 +1612,18 @@ export async function waitForJob({
     let timer;
     try {
       const value = await Promise.race([pending, new Promise(resolveTimer => {
-        timer = setTimeout(() => resolveTimer(expired), remaining);
+        timer = setTimeout(() => { spent = true; resolveTimer(expired); }, remaining);
       })]);
-      return now() >= deadline ? expired : value;
+      return pastDeadline() ? expired : value;
     } catch (error) {
-      if (now() >= deadline) return expired;
+      if (pastDeadline()) return expired;
       throw error;
     } finally {
       clearTimeout(timer);
     }
   };
   const budgeted = async operation => {
-    if (now() >= deadline) throw expired;
+    if (pastDeadline()) throw expired;
     const value = await withinBudget(operation);
     if (value === expired) throw expired;
     return value;
@@ -1775,11 +1799,16 @@ async function main() {
     process.exitCode = 0;
     return;
   }
-  const task = flags['task-file'] ? readFileSync(resolve(flags['task-file']), 'utf8') : flags.task;
+  const taskFile = flags['task-file'] ? resolve(flags['task-file']) : null;
+  const task = taskFile ? readFileSync(taskFile, 'utf8') : flags.task;
   if (!task || typeof task !== 'string' || !task.trim()) {
     console.error('codex-direct-task: pass --task=<text> or --task-file=<path>');
     process.exitCode = 2;
     return;
+  }
+  if (flags.job) {
+    const record = readJobRecord(flags.job);
+    writeJobRecord({ ...record, ...taskMetadata(task, taskFile) });
   }
   const dir = flags.dir ? resolve(flags.dir) : undefined;
   const repoRoot = flags['repo-root'] ? resolve(flags['repo-root']) : (dir ? undefined : repoRootFromCwd());
@@ -1789,6 +1818,7 @@ async function main() {
   try {
     report = await codexDirectTask({
       task,
+      taskFile,
       dir,
       repoRoot,
       outputSchemaFile: flags['output-schema-file'] ? resolve(flags['output-schema-file']) : undefined,

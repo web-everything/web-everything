@@ -23,7 +23,16 @@ import { isUnderTest } from '../lib/under-test.mjs';
 import { createActionStore } from '../operations/action-store.mjs';
 import { actionResource } from '../operations/action-record.mjs';
 import { isQuotaError } from '../lib/provider-quota-hold.mjs';
+import { isBodyFileRefusal } from '../operations/review-pr-io.mjs';
 import { reverifyStaleReferrals } from './referral-reverify.mjs';
+
+/** Maximum drives of a saved run before its resume budget is exhausted. Shared with the driver. */
+export const RESUME_MAX_ATTEMPTS = 3;
+
+/** Saved retry evidence must prove both counters; never coerce corrupt state into a fresh budget. */
+export function ciHeldRecordRetryCountersValid(evidence) {
+  return [evidence?.attempts, evidence?.resumeAttempts].every(n => Number.isSafeInteger(n) && n >= 0);
+}
 
 export const REFERRAL_HOLD_MARKER = 'review paused:';
 export const GH_LIST_COMMENT_CAP = 100;
@@ -46,6 +55,23 @@ export function reviewRunEvidence(run) {
   if (run?.op !== 'review-pr') return null;
   const read = run.findings?.read;
   const suspendedReferralEffect = !run.resumeOf && run.pending?.kind === 'effect' && run.pending.step === 'mandatoryReferrals';
+  let retryableRecordEffect = false;
+  let ciHeldRecordRetry;
+  try {
+    if (run.pending?.kind === 'effect' && run.pending.step === 'record' && Array.isArray(run.effects)) {
+      const outstanding = run.effects.filter(e => !['applied', 'declared'].includes(e?.status));
+      retryableRecordEffect = !run.resumeOf && outstanding.length > 0 && outstanding.every(e => e?.type === 'review.label-swap'
+        && e.status === 'pending' && e.unknownAttempts === 0 && isBodyFileRefusal(e.error));
+      if (outstanding.length > 0 && outstanding.every(e => e?.type === 'review.label-swap'
+        && e.status === 'failed' && (run.ciHeldRecord === true
+          || typeof e.error === 'string' && /CI still pending on reviewed head/.test(e.error)))) {
+        const resumeAttempts = Object.hasOwn(run, 'recordEffectResumeAttempts') ? run.recordEffectResumeAttempts : 0;
+        ciHeldRecordRetry = { attempts: outstanding.every(e => ciHeldRecordRetryCountersValid({
+          attempts: e.unknownAttempts, resumeAttempts,
+        })) ? Math.max(...outstanding.map(e => e.unknownAttempts)) : null, resumeAttempts };
+      }
+    }
+  } catch { /* Unreadable effects cannot prove a safe record retry. */ }
   const head = read?.netBasis?.rev ?? (suspendedReferralEffect ? run.input?.head : undefined);
   // A rewind drops the referral result. Use the saved pass until this pass finishes referralVerdict; an unrelated
   // advisory failure must not hide a successful persist behind the saved persistence failure (PR #5771).
@@ -97,6 +123,8 @@ export function reviewRunEvidence(run) {
     // inventing a completed panel or clean referral evidence for acceptance/carry readers.
     return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt: null,
       ...(suspendedReferralEffect ? { suspendedReferralEffect: true } : {}),
+      ...(retryableRecordEffect ? { retryableRecordEffect: true } : {}),
+      ...(ciHeldRecordRetry ? { ciHeldRecordRetry } : {}),
       incomplete: true, quotaOnly, parked: false, attempted: false, persistenceFailed: false, count: 0,
       pending: ['review-incomplete'], rulings: [] };
   }
@@ -113,6 +141,8 @@ export function reviewRunEvidence(run) {
   } catch { /* unreadable effects cannot establish a CI-held publish */ }
   return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt,
     quotaOnly,
+    ...(retryableRecordEffect ? { retryableRecordEffect: true } : {}),
+    ...(ciHeldRecordRetry ? { ciHeldRecordRetry } : {}),
     // A throwing stage has no pending confirm left. Keep this durable shape wakeable without caching live rulings.
     ...(pending.length && !run.pending && run.stepTimings?.some(t => t?.step === 'stageVerdict'
       && t.startedAt && !t.finishedAt) ? { referralStageRefused: true } : {}),
@@ -139,7 +169,8 @@ const evidenceCache = new Map();
 export const REVIEW_EVIDENCE_CACHE_FILE = '.review-run-evidence.cache';
 /** A warm process with at most this many changed records parses them directly instead of the whole on-disk file. */
 export const EVIDENCE_DISK_MIN_MISSES = 32;
-const EVIDENCE_CODE = createHash('sha256').update(String(reviewRunEvidence)).update(String(isQuotaError)).digest('hex').slice(0, 16);
+const EVIDENCE_CODE = createHash('sha256').update(String(reviewRunEvidence)).update(String(ciHeldRecordRetryCountersValid))
+  .update(String(isQuotaError)).digest('hex').slice(0, 16);
 function readEvidenceDiskCache(file) {
   try {
     const c = JSON.parse(readFileSync(file, 'utf8'));
@@ -287,10 +318,17 @@ function latestReviewAttempt(history) {
  * (unless the operator in person asked for a fresh look): the retry budget picks the time, and the retry re-runs the persist step only. Pure.
  * @returns {{id: string, head: string}|null}
  */
-export function findResumableParkedRun(pr, runs, { repo, cardReadable } = {}) {
+export function findResumableParkedRun(pr, runs, { repo, cardReadable, ciHeldRecordRetryMax = 0 } = {}) {
   const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number));
   const last = latestReviewAttempt(history);
-  if ((!last?.parked && !last?.resumeAdvise && !last?.suspendedReferralEffect) || last.head !== pr.headRefOid) return null;
+  const ciHeldRetry = ciHeldRecordRetryMax > 0 && ciHeldRecordRetryCountersValid(last?.ciHeldRecordRetry)
+    && last.ciHeldRecordRetry.attempts <= ciHeldRecordRetryMax
+    && last.ciHeldRecordRetry.resumeAttempts < RESUME_MAX_ATTEMPTS;
+  if ((!last?.parked && !last?.resumeAdvise && !last?.suspendedReferralEffect && !last?.retryableRecordEffect && !ciHeldRetry) || last.head !== pr.headRefOid) return null;
+  // A saved record retry only replays its label swap, but an operator comment after the run began (e.g. "run a fresh
+  // review") asks for a fresh look on this head, so it is never answered by resuming the stale verdict (PR #6784).
+  // Automated wakes (the run's own write-up, a re-arm) do not count: they cannot turn a record retry into a panel.
+  if (last.retryableRecordEffect || ciHeldRetry) return operatorWakeTime(pr, last) > last.startedAt ? null : { id: last.id, head: last.head };
   // A run whose referral persist failed already holds its panel's verdict; what it owes is the persist step again,
   // not a new panel (live 2026-10-20, #5752: two ledger-push misses on one head each cost a full panel, and the
   // operator's Accept was refused until a person noticed). The hold decides WHEN (its 15/30/60 retry budget); once a

@@ -1,14 +1,23 @@
+import { failClosedCapacity } from './operator-override-reader.mjs';
+import { readOperatorPolicy } from './policy-cascade.mjs';
 import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { isRealHead } from './red-team-skip-outcome.mjs';
+import { readBacklogOnlyNetFiles } from './red-team-backlog-only.mjs';
+import { isCardOnlyDiff } from '../ci-card-only.mjs';
+import { isUnderTest } from './under-test.mjs';
+import { readRedTeamProbes } from './red-team-gate.mjs';
 
 const transactions = new WeakMap();
+const operatorFloors = new WeakSet();
+const cardOnlyHeads = new Map();
+const MAX_CARD_ONLY_HEADS = 256;
 // Holds where the runner cannot start a review for this head at all (no job, no capacity spent). Such an entry is
 // still probed every tick, but it must not occupy one of the capacity-bound admissions.
-const NON_RUNNABLE_REASONS = new Set(['review-unfinished']);
+const NON_RUNNABLE_REASONS = new Set(['review-unfinished', 'planner-skip']);
 // At most this many probes ride along per repo per tick; attempts rotation (maxAttempts) moves a probe that stays
 // blocked to the tail, so every blocked entry is re-checked in turn.
 const MAX_PROBES = 2;
@@ -18,8 +27,9 @@ const note = (log, message) => {
   catch { /* Diagnostics must not interrupt recovery. */ }
 };
 
-export const RED_TEAM_QUEUE_MIN_CONCURRENT_CAP = 4;
-export const RED_TEAM_QUEUE_REVIEW_STARTS_CAP = 4;
+export const RED_TEAM_QUEUE_MIN_CONCURRENT_MAX = 12;
+export const RED_TEAM_QUEUE_MIN_CONCURRENT_CAP = 6;
+export const RED_TEAM_QUEUE_REVIEW_STARTS_CAP = 6;
 
 /** Invalid or missing minimums disable the floor; an invalid threshold falls back to 10%. */
 export function loadRedTeamQueueFloor({ env = process.env,
@@ -33,18 +43,22 @@ export function loadRedTeamQueueFloor({ env = process.env,
   const reviewStartsEnv = env.WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE;
   const parseEnv = value => typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN;
   const reviewStarts = reviewStartsEnv === undefined ? settings?.reviewStartsPerTickWhileIdle : parseEnv(reviewStartsEnv);
-  const minimum = minimumEnv === undefined ? settings?.minConcurrent : parseEnv(minimumEnv);
+  const operator = readOperatorPolicy('redTeamQueue', { env, log });
+  const operatorMinimum = operator?.minConcurrent;
+  if (operator === null) return { minConcurrent: failClosedCapacity('redTeamQueue.minConcurrent', 0, { log }), idlePct: 10, reviewStartsPerTick: 0 };
+  const minimum = operatorMinimum ?? (minimumEnv === undefined ? settings?.minConcurrent : parseEnv(minimumEnv));
   const validIdle = value => Number.isInteger(value) && value >= 0 && value <= 100;
   // An invalid override never replaces a valid file threshold with a looser one: it is ignored.
   const idle = idleEnv !== undefined && validIdle(parseEnv(idleEnv)) ? parseEnv(idleEnv) : settings?.minConcurrentIdlePct;
   const floor = {
     // A missing threshold means the default 10; a present but invalid one disables the floor (never a looser guess).
     minConcurrent: (idle === undefined || validIdle(idle)) && Number.isInteger(minimum) && minimum >= 0
-      ? Math.min(minimum, RED_TEAM_QUEUE_MIN_CONCURRENT_CAP) : 0,
+      ? Math.min(minimum, operatorMinimum === undefined ? RED_TEAM_QUEUE_MIN_CONCURRENT_CAP : RED_TEAM_QUEUE_MIN_CONCURRENT_MAX) : 0,
     idlePct: validIdle(idle) ? idle : 10,
     reviewStartsPerTick: Number.isInteger(reviewStarts) && reviewStarts >= 0 ? Math.min(reviewStarts, RED_TEAM_QUEUE_REVIEW_STARTS_CAP) : 0,
   };
-  note(log, `floor minConcurrent=${floor.minConcurrent} (source: ${minimumEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing disables' : 'env WE_RED_TEAM_QUEUE_MIN_CONCURRENT'}), idlePct=${floor.idlePct} (source: ${idleEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing defaults to 10' : 'env WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT'}), reviewStartsPerTick=${floor.reviewStartsPerTick} (source: ${reviewStartsEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing disables' : 'env WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE'})`);
+  note(log, `floor minConcurrent=${floor.minConcurrent} (source: ${operatorMinimum !== undefined ? 'operator-db' : minimumEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing disables' : 'env WE_RED_TEAM_QUEUE_MIN_CONCURRENT'}), idlePct=${floor.idlePct} (source: ${idleEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing defaults to 10' : 'env WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT'}), reviewStartsPerTick=${floor.reviewStartsPerTick} (source: ${reviewStartsEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing disables' : 'env WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE'})`);
+  if (operatorMinimum !== undefined) operatorFloors.add(floor);
   return floor;
 }
 
@@ -65,7 +79,7 @@ export function applyRedTeamQueueFloor(capacity, { floor, cpuIdlePct, log = () =
     || !Number.isInteger(floor?.minConcurrent) || floor.minConcurrent <= 0
     || !Number.isInteger(floor.idlePct) || floor.idlePct < 0 || floor.idlePct > 100
     || !Number.isFinite(cpuIdlePct) || cpuIdlePct < floor.idlePct || cpuIdlePct > 100) return;
-  const minimum = Math.min(floor.minConcurrent, RED_TEAM_QUEUE_MIN_CONCURRENT_CAP, capacity.startsCeiling);
+  const minimum = Math.min(floor.minConcurrent, operatorFloors.has(floor) ? RED_TEAM_QUEUE_MIN_CONCURRENT_MAX : RED_TEAM_QUEUE_MIN_CONCURRENT_CAP, capacity.startsCeiling);
   if (capacity.remainingStarts >= minimum) return;
   const before = capacity.remainingStarts;
   capacity.remainingStarts = minimum;
@@ -166,15 +180,17 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         if (!entry) continue;
         const matches = row => Number(row.prNumber) === entry.pr;
         const row = rows.find(matches);
-        const failure = notStarted.find(matches) ?? (row?.action === 'skip' ? { reason: row.why ?? 'planner skip' } : undefined);
-        if (entry.blocked && (dispatched.some(matches) || !NON_RUNNABLE_REASONS.has(failure?.reason))) { delete entry.blocked; changed(`unblocked ${entry.key}`); }
+        const failure = notStarted.find(matches) ?? (row?.action === 'skip' ? { reason: row.why ?? 'planner skip', skipped: true } : undefined);
+        // A planner skip (e.g. later verdict supersedes acceptance) starts nothing, so it must not keep a capacity slot.
+        const nonRunnable = f => !!f && f.reason !== 'no review capacity left' && (f.skipped === true || NON_RUNNABLE_REASONS.has(f.reason));
+        if (entry.blocked && (dispatched.some(matches) || !nonRunnable(failure))) { delete entry.blocked; changed(`unblocked ${entry.key}`); }
         if (dispatched.some(matches)) remove(entry, 'dispatch started');
         else if (row?.action === 'clear' || row?.action === 'carry') remove(entry, row.action);
         else if (failure) {
           if (failure.reason === 'no review capacity left') continue;
-          if (NON_RUNNABLE_REASONS.has(failure.reason)) {
+          if (nonRunnable(failure)) {
             // The slot is released (see admit); the normal attempts rotation still bounds how long it stays in front.
-            entry.blocked = failure.reason;
+            entry.blocked = failure.skipped ? 'planner-skip' : failure.reason;
           }
           entry.attempts++;
           if (entry.attempts >= limit) {
@@ -259,14 +275,39 @@ const readableCapacity = capacity => !!capacity && typeof capacity.lanes === 'nu
   && (capacity.budget == null || (typeof capacity.budget.left === 'number' && !Number.isNaN(capacity.budget.left)));
 
 export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCapacity, run, log = () => {},
-  floor, readCpuIdlePct, ...rest }) {
-  const candidates = [];
+  floor, readCpuIdlePct, readSkipCardOnly = () => readRedTeamProbes().value.skipCardOnly, readNetFiles = args => isUnderTest() ? { ok: false } : readBacklogOnlyNetFiles(args), ...rest }) {
+  const candidates = [], cardOnlyCandidates = [];
   for (const row of plan?.refusals ?? []) {
     if (row.kind !== 'already-reviewed-head') continue;
     const head = row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid;
-    if (isRealHead(head)) candidates.push({ pr: Number(row.prNumber), head });
+    if (!isRealHead(head)) continue;
+    const number = Number(row.prNumber), key = `${repo}#${number}@${head}`;
+    let cardOnly = cardOnlyHeads.get(key) === true;
+    if (!cardOnlyHeads.has(key)) {
+      try {
+        const net = readNetFiles({ repo, number, headRefOid: head });
+        cardOnly = net?.ok === true && isCardOnlyDiff(net.files);
+        // Only readable evidence is cached; an unreadable read retries next tick.
+        if (net?.ok === true) {
+          cardOnlyHeads.set(key, cardOnly);
+          // Oldest evidence is re-read on demand after eviction.
+          if (cardOnlyHeads.size > MAX_CARD_ONLY_HEADS) cardOnlyHeads.delete(cardOnlyHeads.keys().next().value);
+        }
+      } catch { /* Unreadable evidence retains normal queue admission. */ }
+    }
+    if (cardOnly) cardOnlyCandidates.push({ pr: number, head });
+    else candidates.push({ pr: number, head });
   }
   const capacity = normalizeCapacity(rawCapacity);
+  // Unreadable capacity admits nothing (fail closed), so a card-only PR queues like any other then.
+  // The bypass also needs the live card-only skip policy on (the one the red-team pass itself follows).
+  let skipCardOnly = false;
+  if (cardOnlyCandidates.length) { try { skipCardOnly = readSkipCardOnly() === true; } catch { /* fail closed */ } }
+  const bypassed = new Set();
+  for (const entry of cardOnlyCandidates) {
+    if (skipCardOnly && readableCapacity(capacity)) { bypassed.add(entry.pr); note(log, `card-only ${repo}#${entry.pr} bypasses red-team queue`); }
+    else candidates.push(entry);
+  }
   if (floor?.minConcurrent > 0 && typeof readCpuIdlePct === 'function') {
     let cpuIdlePct;
     try { cpuIdlePct = readCpuIdlePct(); } catch { /* An unreadable sample leaves capacity unchanged. */ }
@@ -287,7 +328,9 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
     const allowed = new Set(admitted.map(entry => entry.pr));
     const held = new Set(candidates.filter(candidate => !allowed.has(candidate.pr)).map(candidate => candidate.pr));
     for (const pr of held) note(log, `hold ${repo}#${pr}: capacity; waiting for a later tick`);
-    const refusals = (plan?.refusals ?? []).filter(row => !held.has(Number(row.prNumber)));
+    // Bypassed card-only rows go last so queued code PRs claim the runner's capacity first.
+    const kept = (plan?.refusals ?? []).filter(row => !held.has(Number(row.prNumber)));
+    const refusals = [...kept.filter(row => !bypassed.has(Number(row.prNumber))), ...kept.filter(row => bypassed.has(Number(row.prNumber)))];
     // Replace admitted candidate slots in FIFO order while preserving unrelated rows and metadata.
     const queuedRows = admitted.flatMap(entry => refusals.filter(row =>
       row.kind === 'already-reviewed-head' && Number(row.prNumber) === entry.pr));

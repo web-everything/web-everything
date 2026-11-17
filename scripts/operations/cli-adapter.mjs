@@ -63,7 +63,7 @@ import { assertNoForbiddenArgv, EFFORT_LEVELS, judgeSpawn } from '../lib/judge-s
 // `requireAllProperties` from `jury-core.mjs` here and broke all three of those tests with
 // `ERR_MODULE_NOT_FOUND: markdown-it` — a real, live-caught regression, not a hypothetical one; see
 // `codex-judge-spawn.mjs`'s own header for the full account. Do not re-introduce that edge.
-import { codexJudgeSpawn, requireAllProperties } from '../lib/codex-judge-spawn.mjs';
+import { codexJudgeSpawn, requireAllProperties, resolveRaiseOnlyJudgeRoute } from '../lib/codex-judge-spawn.mjs';
 // #3383 probation — the ratified Codex model pin (`#x8wbivt`), a leaf constant with no jury/markdown-it edge
 // (same safety property `codex-judge-spawn.mjs`'s own header discusses for this file). Needed so the
 // advisory judge seat's `{provider, model}` identity is a STAMPABLE fact rather than whatever `codex exec`
@@ -229,7 +229,7 @@ export const JUROR_FLAG_HELP = Object.freeze([
 export function buildCliSpec(declaration) {
   const fields = Object.entries(declaration.input).map(([name, spec]) => ({
     name, type: spec.type, required: spec.required, default: spec.default, enum: spec.enum ?? null,
-    atConfirm: !!spec.atConfirm,
+    atConfirm: !!spec.atConfirm, repeatable: !!spec.repeatable,
   }));
   // A compute/effect operation may configure a target model/provider as real inputs.
   // Judged operations keep these names reserved for juror controls.
@@ -244,7 +244,7 @@ export function buildCliSpec(declaration) {
   // A field with a declared value set PRINTS THE SET, not its type: `--lens=<string>` tells the operator
   // nothing they can act on, and the four valid lenses were already declared — the help just never read them.
   // The default is shown alongside, so "what happens if I omit it" is answered in the same line.
-  const placeholder = (f) => (f.enum ? f.enum.map(String).join('|') : `<${f.type}>`);
+  const placeholder = (f) => f.repeatable ? '<string> (repeatable)' : (f.enum ? f.enum.map(String).join('|') : `<${f.type}>`);
   // A CONFIRM-TIME FIELD IS NOT PRINTED ON THE OPENING LINE, for the same reason `--cwd` is not printed where
   // there is no juror: the adapter REFUSES it there, so advertising it would document a refusal. It is printed
   // on the resume line instead, which is the call it actually rides.
@@ -455,6 +455,7 @@ export function parseOperationArgv(declaration, argv = []) {
       continue;
     }
     const field = spec.fields.find((f) => f.name === name);
+    if (field.repeatable) { (raw[name] ??= []).push(value); continue; }
     const coerced = coerceInputValue(field.type, value);
     if (coerced === undefined) { errors.push(`--${name} must be a ${field.type}, got ${JSON.stringify(value)}`); continue; }
     raw[name] = coerced;
@@ -819,7 +820,11 @@ export function createDefaultJudge({
     }
     // An explicit pin (request-level provider, factory provider/providerName, or factory model) outranks the policy default.
     const pinned = request?.providerName !== undefined || factoryProviderName !== undefined || provider !== undefined || model !== undefined;
-    const configured = pinned ? null : resolveOperationRoute({ operation: operation === 'judge' ? 'judge' : `judge:${operation}`, taskType: request?.mandate?.lens ?? request?.lens, available: JUDGE_PROVIDER_NAMES });
+    const routeOptions = { operation: operation === 'judge' ? 'judge' : `judge:${operation}`, taskType: request?.mandate?.lens ?? request?.lens, available: JUDGE_PROVIDER_NAMES };
+    const configured = pinned ? null : resolveRaiseOnlyJudgeRoute({
+      skip: Boolean(request?.mandatoryLens) || request?.care != null || request?.model !== undefined || request?.effort !== undefined,
+      resolve: aiRouting => resolveOperationRoute({ ...routeOptions, ...(aiRouting ? { aiRouting } : {}) }),
+    });
     const effectiveProviderName = configured?.provider ?? request?.providerName ?? providerName;
     // #xqa9ttq (PR #2115 review, CONFIRMED) - `allowedTools: []` is the explicit "no tools" signal
     // `assertNoCodexToolAllowlist` documents as tool-free. `assertSafeJudgeRequest` is shared with claude and
@@ -1015,7 +1020,7 @@ function stampFinish(run, stepIndex, clock) {
  *   `stampStart`/`stampFinish` below and `we:scripts/operations/run-record.mjs#withStepStart`.
  * @returns {Promise<{run: object, stopped: string, error: (Error|null), applied: string[], step?: string,
  *   priorConfirm?: ({step: string, value: *}|null), inFlight?: string[]}>}
- *   `stopped` is one of `'complete'`, `'confirm'`, `'stuck'`, `'effect-halted'`, `'effect-in-flight'` or
+ *   `stopped` is one of `'complete'`, `'confirm'`, `'stuck'`, `'effect-halted'`, `'effect-refused'`, `'effect-in-flight'` or
  *   `'step-refused'` — the last one is a declaration fn (a `compute`, `judge`, `confirm` or `effect` step)
  *   throwing deterministically once its answer is already committed to the record (#3063). `step` and
  *   `priorConfirm` ride only on `step-refused`, because that is the one stop `renderOutcome` cannot describe
@@ -1098,7 +1103,16 @@ export async function driveRun({
   for (let turn = 0; turn < maxTurns; turn += 1) {
     const status = runStatus(current, { registry });
 
-    if (status === 'complete') return { run: current, stopped: 'complete', error: null, applied };
+    if (status === 'complete') {
+      // The engine settles permanent refusals too. Preserve that distinction on every drive,
+      // including a terminal resume, without replaying effects or losing this drive's applied prefix.
+      if (current.outcome === 'refused') {
+        const refusal = current.effects.find((entry) => entry.status === 'refused');
+        return { run: current, stopped: 'effect-refused',
+          error: new Error(refusal?.error || 'effect permanently refused'), applied };
+      }
+      return { run: current, stopped: 'complete', error: null, applied };
+    }
 
     if (status === 'awaiting-confirm') {
       // AN UNATTENDED ANSWER, WHEN AND ONLY WHEN THE DECLARATION SAID AN AGENT MAY GIVE ONE. The policy is
@@ -1199,7 +1213,10 @@ export async function driveRun({
       const outcome = await applyPendingEffects(current, { sinks, store, attemptedBy });
       current = outcome.run;
       applied.push(...outcome.applied);
-      if (outcome.error) return { run: current, stopped: 'effect-halted', error: outcome.error, applied };
+      // Permanent guard refusals must reach advance so the engine can settle the run.
+      if (outcome.error && outcome.halted?.status !== 'refused') {
+        return { run: current, stopped: 'effect-halted', error: outcome.error, applied };
+      }
       // PARKED ON A DISPATCH (#3073). An in-flight halt is a SUCCESSFUL stop, not an error: the sink started
       // work that outlives this process, so `error` is null and the halt reports itself through `inFlight`.
       // Without this branch the loop falls through to `advance`, which returns the run UNCHANGED (in-flight
@@ -1419,6 +1436,7 @@ export function outcomePayload({ run, stopped, error = null, applied = [], owned
   const owner = run.pending?.ownedBy ?? ownedBy ?? null;
   return {
     runId: run.id, op: run.op, stopped, applied,
+    ...(run.outcome != null ? { outcome: run.outcome } : {}),
     // WHICH STEP refused — carried on a `step-refused` stop so a headless caller (the build daemon) can name it
     // instead of reporting "no verdict". Omitted on every other stop, so their payloads stay byte-identical.
     ...(stopped === 'step-refused' && step ? { step: String(step) } : {}),
@@ -1574,6 +1592,19 @@ export function renderOutcome({ outcome, json = false, declaration = null }) {
         `${run.effects.filter((e) => e.status === 'applied').length} effect(s) have landed and are recorded as applied.`,
         `resume with: node scripts/operations/run.mjs ${run.op} --resume=${run.id} — it reports the same park `
         + 'until the work reports back, and never re-dispatches.',
+        ...spend,
+        ...ownerLines,
+      ],
+    };
+  }
+  if (stopped === 'effect-refused') {
+    return {
+      code: 1,
+      lines: [
+        `run ${run.id} — REFUSED: ${redactSpawnText(error?.message ?? error)}`,
+        ...run.effects.filter((entry) => entry.status === 'refused' || entry.status === 'failed')
+          .map((entry) => `  ${entry.type} (step ${entry.step}): ${entry.status} — ${redactSpawnText(entry.error ?? 'no failure reason supplied')}`),
+        `${applied.length} effect(s) landed and are recorded as applied; this run is terminal.`,
         ...spend,
         ...ownerLines,
       ],

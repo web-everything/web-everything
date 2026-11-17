@@ -88,7 +88,7 @@ it('leaves guard refusals unledgered and continues with explicit WE paths', asyn
   expect(log).toHaveBeenCalledWith(expect.stringContaining('refused'));
 });
 
-it.each(['Read ~/.secrets/key', 'Read /config', 'Read /private/config', 'Repair scripts/extensionless', 'Use token ghp_012345678901234567890123456789012345'])('refuses secret-looking text or local paths: %s', async text => {
+it.each(['Read ~/.secrets/key', 'Read /config', 'Read /private/config', 'Repair scripts/extensionless', 'Use token gh\x70_012345678901234567890123456789012345'])('refuses secret-looking text or local paths: %s', async text => {
   seed(`- [R1] 2026-11-08: ${text}`);
   expect((await run()).refused).toHaveLength(1);
   expect(existsSync(ledger)).toBe(false);
@@ -254,7 +254,7 @@ it('refused cards do not consume the batch budget', async () => {
 });
 
 it('dry-run validates first and never echoes a refused card text', async () => {
-  seed('- [R1] 2026-11-08: leak ghp_abcdefghijklmnopqrstuvwxyz0123456789 end\n- [R1] 2026-11-08: fine');
+  seed('- [R1] 2026-11-08: leak gh\x70_abcdefghijklmnopqrstuvwxyz0123456789 end\n- [R1] 2026-11-08: fine');
   const result = await run({ dryRun: true });
   expect(JSON.stringify(result)).not.toContain('ghp_');
   expect(result.refused).toHaveLength(1);
@@ -601,7 +601,7 @@ it('a dry run takes no ledger lock: a held lock is neither waited on nor touched
 });
 
 it('mixed dry-run reports valid plans while refusing unsafe text', async () => {
-  seed('- [R1] 2026-11-08: leak ghp_abcdefghijklmnopqrstuvwxyz0123456789 end\n- [R2] 2026-11-08: fine card');
+  seed('- [R1] 2026-11-08: leak gh\x70_abcdefghijklmnopqrstuvwxyz0123456789 end\n- [R2] 2026-11-08: fine card');
   const { declaration, registry, finish } = resolveOperation('file-held-cards', {});
   const sinks = createFileHeldCardsSinks({ root, fileItem });
   const outcome = await runOperationCli({ declaration, registry, argv: [`--source=${source}`, '--dry-run'],

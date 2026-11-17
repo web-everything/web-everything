@@ -11,6 +11,7 @@ import {fileURLToPath} from 'node:url';
 import {cpus, loadavg, freemem, totalmem} from 'node:os';
 import {BASE_RETENTION, baseGuard, readyBases, readBase, copyLeaves, baseFile, createBasePin, claimPrewarm, materializeWorktree, mirrorReadOnlyForSlots, validBundleEvidence, readMainFetchStamp} from './forge-exec-bases.mjs';
 import {decodeManifest} from './forge-exec-manifest.mjs';
+import {readPruneStatus, validPruneStatus} from './forge-cache-prune.mjs';
 const LIMIT = 4 * 1024 * 1024;
 const FORGE_RUN_WALL_MS = 1_740_000;
 const hex = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
@@ -206,16 +207,51 @@ export async function stableActiveRunIds(list,tries=5) {
   }
   return {stable:false,ids:undefined,count:Math.max(1,union.size)};
 }
+const validDeploySet = v => v && typeof v === 'object' && !Array.isArray(v)
+  && (v.forgeSetSha === null || (typeof v.forgeSetSha === 'string' && /^[a-f0-9]{40}$/i.test(v.forgeSetSha)))
+  && (v.setDigest === null || (typeof v.setDigest === 'string' && /^[a-f0-9]{64}$/i.test(v.setDigest)))
+  && Number.isSafeInteger(v.hostTier) && v.hostTier > 0;
+const validDeploy = v => (exactKeys(v,'draining') && typeof v.draining === 'boolean')
+  || ((exactKeys(v,'forgeSetSha,hostTier,setDigest')
+    || (exactKeys(v,'draining,forgeSetSha,hostTier,setDigest') && typeof v.draining === 'boolean')) && validDeploySet(v));
+// Bound the read itself, including a file growing after stat. State is evidence only.
+async function readDeployState(path) {
+  let file;
+  try {
+    file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const st = await file.stat();
+    if (!st.isFile() || st.size > 4096) return null;
+    const bytes = Buffer.alloc(4097);
+    let size = 0;
+    while (size < bytes.length) {
+      const {bytesRead} = await file.read(bytes, size, bytes.length - size, null);
+      if (!bytesRead) break;
+      size += bytesRead;
+    }
+    if (size > 4096) return null;
+    const raw = bytes.subarray(0,size), text = raw.toString('utf8');
+    if (!Buffer.from(text).equals(raw)) return null;
+    const state = JSON.parse(text);
+    if (!exactKeys(state,'forgeSetSha,hostTier,installedAtET,schema,setDigest')
+      || state.schema !== 1 || !validET(state.installedAtET) || !validDeploySet(state)) return null;
+    return {forgeSetSha:state.forgeSetSha,setDigest:state.setDigest,hostTier:state.hostTier};
+  } catch { return null; }
+  finally { try { await file?.close(); } catch { /* evidence unavailable */ } }
+}
 export function parseTelemetry(text) {
   if ((!Buffer.isBuffer(text) && typeof text !== 'string') || Buffer.byteLength(text)>65536
     || (Buffer.isBuffer(text) && !Buffer.from(text.toString('utf8')).equals(text))) throw new Error('Invalid telemetry size or encoding');
   const v=JSON.parse(text.toString());
   const legacy = {...v}; delete legacy.limits;
+  delete legacy.diskUsedPct; delete legacy.prune; delete legacy.deploy;
   // R518: activeRunIds is optional (an older Forge omits it); when present it must be exactly the active runs.
   const withIds=exactKeys(legacy,'activeRunIds,activeRuns,cores,loadPerCore,memFreePct,recent,sampledAtET');
   if (!(withIds||exactKeys(legacy,'activeRuns,cores,loadPerCore,memFreePct,recent,sampledAtET')) || !validET(v.sampledAtET)
     || !Number.isSafeInteger(v.cores) || v.cores<1 || !Number.isFinite(v.loadPerCore) || v.loadPerCore<0
     || !Number.isFinite(v.memFreePct) || v.memFreePct<0 || v.memFreePct>100 || !duration(v.activeRuns)
+    || ('diskUsedPct' in v && (typeof v.diskUsedPct !== 'number' || !Number.isFinite(v.diskUsedPct) || v.diskUsedPct < 0 || v.diskUsedPct > 100))
+    || ('prune' in v && !validPruneStatus(v.prune))
+    || ('deploy' in v && !validDeploy(v.deploy))
     || (withIds&&(!Array.isArray(v.activeRunIds)||v.activeRunIds.length!==v.activeRuns
       ||v.activeRunIds.some(id=>!runName(id))||new Set(v.activeRunIds).size!==v.activeRunIds.length))
     || !Array.isArray(v.recent) || v.recent.length>50 || v.recent.some(r=>!(exactKeys(r,'code,runId,stageMs,startedAtET')
@@ -229,7 +265,7 @@ export function formatTelemetry(value,host='forge') {
   const v=parseTelemetry(JSON.stringify(value));
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host)) throw new Error('Invalid host');
   const last=v.recent.find(r=>r.code!==null);
-  return `${host} ${v.sampledAtET.slice(11,16)} ET load/core ${v.loadPerCore.toFixed(2)} ram free ${Math.round(v.memFreePct)}% runs ${v.activeRuns} last-run ${last ? Math.round((last.stageMs.install+last.stageMs.run)/1000)+'s' : 'none'}`;
+  return `${host} ${v.sampledAtET.slice(11,16)} ET load/core ${v.loadPerCore.toFixed(2)} ram free ${Math.round(v.memFreePct)}% runs ${v.activeRuns} last-run ${last ? Math.round((last.stageMs.install+last.stageMs.run)/1000)+'s' : 'none'}${v.deploy?.forgeSetSha ? `\ndeploy ${v.deploy.forgeSetSha}` : ''}`;
 }
 const ENV_KEYS = ['CI','NODE_ENV','TZ','LANG','LC_ALL','FORCE_COLOR','NO_COLOR','DIFF_COVERAGE_BASE','WE_VITEST_MAX_WORKERS','VERIFY_SCAN_FILES'];
 // R309: the repo-scanning tests' changed-file list. verify-lane sends a JSON array of repo-relative
@@ -746,11 +782,19 @@ export function execute(file,args,{cwd,env,input,inherit=false,detached=false,pa
 // from its environment, nor transports them in requests.
 // R333: leaked reservations/receipts are reaped only on proof the owner is gone.
 const REAP_GRACE_MS = 15*60*1000;
+// reservation.json is written once at prepare and never refreshed, while each supervisor command gets its own
+// FORGE_RUN_WALL_MS. One run issues at most 3 such commands (warm: npm ci --dry-run + tar extract, cold: npm ci +
+// cache tar; plus the test command), so the hard max runtime is their sum plus the grace for preparation.
+const RUN_MAX_COMMANDS = 3;
+const PAST_MAX_RUNTIME_MS = RUN_MAX_COMMANDS*FORGE_RUN_WALL_MS+REAP_GRACE_MS;
 async function procStart(pid) {
   // string = start ticks of a live pid, null = provably no such pid, undefined = cannot tell (fail closed)
   try {const data=(await filesystem.readFile('/proc/'+pid+'/stat')).toString('latin1');return data.slice(data.lastIndexOf(')')+2).split(' ')[19];}
   catch(error) {if(error.code!=='ENOENT')return undefined; return filesystem.access('/proc/self/stat').then(()=>null,()=>undefined);}
 }
+// A zombie whose thread group has exactly one thread is wholly dead. A zombie leader with a missing or larger
+// Threads count may still have live threads (Linux keeps the leader's State: Z while other threads run).
+const singleThreadZombie=status=>/^State:\s+Z/m.test(status)&&/^Threads:\s+1\s*$/m.test(status);
 // procFs is direct test injection only; production always uses the real process filesystem.
 export async function uidBusy(uid, procFs=filesystem) {
   // A process can fork and exit between listing /proc and reading its entry. Any vanished entry
@@ -766,12 +810,58 @@ export async function uidBusy(uid, procFs=filesystem) {
         const ids=/^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/m.exec(status);
         if(!ids)return true; // credentials undeterminable: keep the reservation
         if(!ids.slice(1).some(id=>Number(id)===uid))continue;
-        return true; // any matching entry, even a zombie leader whose threads may live, keeps the slot
+        // A zombie with exactly one thread holds nothing and cannot be killed: it is dead, not busy.
+        // A zombie leader whose Threads count is absent or >1 may still have live threads: keep the slot.
+        if(singleThreadZombie(status))continue;
+        return true;
       } catch(error) {if(error.code!=='ENOENT')return true; vanished=true;}
     }
     if(!vanished)return false;
   }
   return true;
+}
+// Reaper kill for one slot UID past its hard max runtime. Zombies cannot be killed, so a zombie's live
+// PARENT is killed too, but only when that parent runs as the same slot UID. Never touches other UIDs.
+export async function killUid(uid, procFs=filesystem, kill=process.kill.bind(process)) {
+  // Slot accounts come from `useradd --system`, so their UIDs may sit below 1000: refuse only root, invalid ids and
+  // the calling process's own uid (an unisolated runner reports its own uid as the "slot"). Callers pass identities
+  // that identity() already proved are not root and not the operator.
+  if(!Number.isSafeInteger(uid)||uid<1||(typeof process.getuid==='function'&&uid===process.getuid()))throw new Error('killUid refuses a root, own or invalid uid');
+  const victims=new Set(),zombieParents=new Set(),owner=new Map();
+  for(const entry of await procFs.readdir('/proc')) {
+    if(!/^\d+$/.test(entry))continue;
+    try {
+      const status=(await procFs.readFile('/proc/'+entry+'/status')).toString('latin1');
+      const ids=/^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/m.exec(status);
+      if(!ids||!ids.slice(1).every(id=>Number(id)===uid))continue; // all four ids must be this slot UID
+      const pid=Number(entry);
+      owner.set(pid,true);
+      // Same predicate as uidBusy, so a slot it calls busy is one this can clear. SIGKILL to a zombie leader's pid
+      // takes down its remaining live threads; a wholly dead zombie cannot be signalled, so only its parent is.
+      if(!singleThreadZombie(status))victims.add(pid);
+      if(/^State:\s+Z/m.test(status)){const pp=/^PPid:\s+(\d+)/m.exec(status);if(pp)zombieParents.add(Number(pp[1]));}
+    } catch(error) {if(error.code!=='ENOENT')throw error;}
+  }
+  for(const pp of zombieParents)if(pp>1&&owner.has(pp))victims.add(pp);
+  for(const pid of victims) {try{kill(pid,'SIGKILL');}catch(error){if(error.code!=='ESRCH')throw error;}}
+  return victims.size;
+}
+// Past max runtime the owner (a root runner that holds the slot's flock) is wedged: kill it and its
+// descendants (only if its pid still has the recorded start time) plus the slot UID's processes.
+export async function killRun({uid,ownerPid,ownerStart}, procFs=filesystem, kill=process.kill.bind(process), start=procStart) {
+  let killed=await killUid(uid,procFs,kill);
+  if(Number.isSafeInteger(ownerPid)&&ownerPid>1&&typeof ownerStart==='string'&&await start(ownerPid)===ownerStart) {
+    const parents=new Map();
+    for(const entry of await procFs.readdir('/proc')) {
+      if(!/^\d+$/.test(entry))continue;
+      try {const data=(await procFs.readFile('/proc/'+entry+'/stat')).toString('latin1');parents.set(Number(entry),Number(data.slice(data.lastIndexOf(')')+2).split(' ')[1]));}
+      catch(error) {if(error.code!=='ENOENT')throw error;}
+    }
+    const tree=new Set([ownerPid]);
+    for(let grew=true;grew;) {grew=false;for(const [pid,pp] of parents)if(tree.has(pp)&&!tree.has(pid)){tree.add(pid);grew=true;}}
+    for(const pid of tree) {try{kill(pid,'SIGKILL');killed++;}catch(error){if(error.code!=='ESRCH')throw error;}}
+  }
+  return killed;
 }
 async function unitActive(unit) {
   const result=await execute('/usr/bin/systemctl',['is-active',unit]);
@@ -779,7 +869,9 @@ async function unitActive(unit) {
   if(['inactive','failed'].includes(word))return false;
   return ['active','activating','deactivating','reloading'].includes(word)?true:undefined;
 }
-export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec, testIdExec, testWorkerIdentity, testSlotStat, testWorkerExec, testOwnershipExec, testGitExec, testEgressProbe, testExecute, testLimits, clock=Date.now} = {}) {
+// Deploy drain (designs/forge-self-deploy.md 2.6): fixed path, never taken from a request.
+export const DRAIN_MARKER='/run/forge-deploy/drain';
+export function createRunner({testRoot, testDrainStat, testDeployStatePath, testPath, testReapProbe, testCleanupExec, testIdExec, testWorkerIdentity, testSlotStat, testWorkerExec, testOwnershipExec, testGitExec, testEgressProbe, testExecute, testLimits, testDiskStat, clock=Date.now} = {}) {
   const bases=testRoot ? join(testRoot,'bases') : '/srv/forge-base';
   const runs = testRoot ? join(testRoot,'runs') : '/srv/forge-exec';
   const receipts = testRoot ? join(testRoot,'receipts') : '/srv/forge-receipts';
@@ -856,7 +948,26 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       return await action();
     }finally{await guard.close();}
   }
+  // Draining only when a root-owned regular file sits at the fixed path. A symlink or foreign owner is
+  // ignored; an unreadable stat (anything but ENOENT) fails safe to draining.
+  async function isDraining() {
+    try {
+      const info=await (testRoot&&testDrainStat?testDrainStat:lstat)(DRAIN_MARKER);
+      return info.isFile()&&!info.isSymbolicLink()&&info.uid===0;
+    } catch(error) {return error?.code!=='ENOENT';}
+  }
+  const draining=()=>Object.assign(new Error('Forge is draining for a deploy; use local fallback'),{code:'forge-draining'});
   async function reserveWorker(run,nonce,slot) {
+    if(await isDraining())throw draining();
+    const worker=await reserveWorkerSlot(run,nonce,slot);
+    // The marker may appear while the reservation is being written: re-check, and give the fresh lock back.
+    if(await isDraining()){
+      if(worker.active)await releaseWorker({run,nonce,slot:worker.user});
+      throw draining();
+    }
+    return worker;
+  }
+  async function reserveWorkerSlot(run,nonce,slot) {
     const pool=await workers();
     if(slot!==undefined&&!pool.some(w=>w.user===slot))throw new Error('Invalid slot');
     if(!pool.length)return {user:'forge-exec',root:runs};
@@ -884,7 +995,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     try {await writeFile(pending,JSON.stringify(value),{flag:'wx',mode:0o600});await rename(pending,file);}
     finally {await rm(pending,{force:true});}
   }
-  async function publishTelemetry(record) {
+  async function publishTelemetry(record, {allowCacheFailure = false} = {}) {
     if(record)await atomicJSON(statePath(record.runId,'telemetry'),record);
     const names=await readdir(receipts);
     const recent=[];
@@ -896,11 +1007,29 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     const value={sampledAtET:easternTimestamp(clock()),cores,loadPerCore:loadavg()[0]/cores,
       memFreePct:freemem()/totalmem()*100,
       activeRuns:active.count,...(active.stable?{activeRunIds:active.ids}:{}),recent:recent.slice(0,50)};
+    // Sample / locally on Forge. Independent failures leave just that field unknown;
+    // a broken prune status must not swallow a disk alarm (or vice versa).
+    try {
+      const disk = await (testRoot && testDiskStat ? testDiskStat : filesystem.statfs)('/');
+      const {blocks, bfree, bavail} = disk;
+      if (![blocks, bfree, bavail].every(n => Number.isSafeInteger(n) && n >= 0)
+        || bfree > blocks || bavail > bfree || blocks - bfree + bavail <= 0) throw new Error('Invalid root disk evidence');
+      value.diskUsedPct = Math.ceil((blocks - bfree) / (blocks - bfree + bavail) * 100);
+    } catch { process.stderr.write('forge-exec-run: root disk telemetry unavailable\n'); }
+    value.deploy = {draining: await isDraining()};
+    try { value.prune = await readPruneStatus(receipts); }
+    catch { process.stderr.write('forge-exec-run: cache prune telemetry unavailable\n'); }
     parseTelemetry(JSON.stringify(value));
-    await atomicJSON(join(receipts,'telemetry.json'),value);
+    try { await atomicJSON(join(receipts,'telemetry.json'),value); }
+    catch (error) {
+      // The read-only telemetry request must still report a full disk when the
+      // Forge-side cache cannot be written. Run-record publication stays strict.
+      if (!allowCacheFailure) throw error;
+      process.stderr.write('forge-exec-run: telemetry cache write unavailable; returning live sample\n');
+    }
     return value;
   }
-  const reapProbe={start:procStart,uidBusy,unitActive,...testReapProbe};
+  const reapProbe={start:procStart,uidBusy,unitActive,killRun,...testReapProbe};
   async function reapLog(line) {
     const text='forge-exec-run: reaped '+line;
     process.stderr.write(text.replace(/[\x00-\x1f\x7f]/g,' ')+'\n');
@@ -961,22 +1090,38 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       // Empty, malformed or pre-lease (no writerGuard) reservations stay for operator cleanup, as the pruner does.
       if(!reservation||reservation.writerGuard!==1||reservation.slot!=='forge-exec-'+slotNumber||!runName(reservation.run)||!nonceOK(reservation.nonce))continue;
       const entries=reservation?found.filter(e=>e.run===reservation.run):[];
+      // A run past its hard max runtime is dead whatever its owner or UID still show (zombies, wedged children).
+      const pastMax=async()=>(await lstat(join(lockPath,'reservation.json')).then(st=>clock()-st.mtimeMs,()=>0))>=PAST_MAX_RUNTIME_MS;
       const decide=async()=>{
         if(await keepReceipt(reservation.run))return false;
         if(entries.length>1)return false;
+        if(await pastMax())return true;
         if(entries.length){const record=await readRecord(entries[0].file);return !!record&&await ownerGone(record,entries[0].file,{allowAge:true});}
         const age=await lstat(join(lockPath,'reservation.json')).then(st=>clock()-st.mtimeMs,()=>0);
         return age>=REAP_GRACE_MS;
       };
       if(!await decide())continue;
+      let killed=0,viaMax=false;
+      // The wedged owner holds the slot flock, so the kill cannot wait for the lock; re-read the reservation
+      // right before it and kill only if it is still the same run and nonce (a new run would differ).
+      const stillSame=async()=>{const now=await readRecord(join(lockPath,'reservation.json'));return now?.run===reservation.run&&now?.nonce===reservation.nonce;};
+      if(await pastMax()) {
+        viaMax=true;
+        try {
+          const record=entries.length?await readRecord(entries[0].file):null;
+          const slotUid=(await identity('forge-exec-'+slotNumber)).uid;
+          if(await stillSame())killed=await reapProbe.killRun({uid:slotUid,ownerPid:record?.owner?.pid,ownerStart:record?.owner?.start});
+        } catch(error) {process.stderr.write('forge-exec-run: past-max kill skipped '+lock+': '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n');continue;}
+      }
       await withWorkerExclusive(lock,async()=>{
         const again=await readRecord(join(lockPath,'reservation.json'));
         if(again?.run!==reservation.run||again?.nonce!==reservation.nonce||again?.writerGuard!==1)return;
-        if(slotNumber&&await reapProbe.uidBusy((await identity('forge-exec-'+slotNumber)).uid))return;
+        const slotUid=(await identity('forge-exec-'+slotNumber)).uid;
+        if(await reapProbe.uidBusy(slotUid))return;
         if(!await decide())return;
         await tombstone(lockPath);
         if(reservation?.run){await dropRecords(reservation.run);taken.add(reservation.run);}
-        await reapLog(`${lock} run=${reservation?.run??'none'} reason=owner-gone`);
+        await reapLog(`${lock} run=${reservation?.run??'none'} reason=${viaMax?'past-max-runtime killed='+killed:'owner-gone'}`);
       }).catch(error=>process.stderr.write('forge-exec-run: reap skipped '+lock+': '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n'));
     }
     // Records whose own reservation is gone can no longer own a run.
@@ -1223,10 +1368,16 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       // actual host on every SSH request; the Mac health cache bounds reads.
       await init();
       await reap();
-      const value = await publishTelemetry();
-      if (request?.capabilities?.limits !== 1) return value;
-      const {limits,warnings} = await readLimits();
-      return {...value,limits:warnings.length ? null : {parent:{cpuQuota:limits.parent.cpuQuota},slot:{cpuQuota:limits.slot.cpuQuota}}};
+      const value = await publishTelemetry(undefined, {allowCacheFailure: true});
+      if (request?.capabilities?.deploy === 1) {
+        const state = await readDeployState(testDeployStatePath ?? '/var/lib/forge-deploy/state.json');
+        if (state) value.deploy = {...value.deploy,...state};
+      }
+      if (request?.capabilities?.limits === 1) {
+        const {limits,warnings} = await readLimits();
+        value.limits = warnings.length ? null : {parent:{cpuQuota:limits.parent.cpuQuota},slot:{cpuQuota:limits.slot.cpuQuota}};
+      }
+      return value;
     },
     async bases() {
       try{return {delta:1,bases:(await readyBases(bases)).slice(0,BASE_RETENTION).map(({sha,manifestDigest})=>({sha,manifestDigest}))};}
@@ -1442,7 +1593,9 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       await rename(statePath(request.run,'prepared'),statePath(request.run,'running'));
       // Owner evidence for the reaper: this process (pid + start time) outlives no live run.
       const ownerStart=await reapProbe.start(process.pid);
-      if(typeof ownerStart==='string')await atomicJSON(statePath(request.run,'running'),{...prepared,owner:{pid:process.pid,start:ownerStart}});
+      // The cache pruner needs the lock and profile digests of every live run in `.running`.
+      await atomicJSON(statePath(request.run,'running'),{...prepared,lock:request.lock,manifestDigest:request.manifestDigest,inputDigest:request.inputDigest,siblings:!!request.manifest?.siblings,
+        ...(typeof ownerStart==='string'?{owner:{pid:process.pid,start:ownerStart}}:{})});
       let phase='install',result={code:97,stdout:'',stderr:''};
       const installAt=clock();let installMs=0,runMs=0,runAt;
       const startedAtET=easternTimestamp(installAt);
@@ -1489,7 +1642,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
         const stillPrepared = await lstat(statePath(request.run,'prepared')).catch(e => {if(e.code !== 'ENOENT') throw e;});
         if (stillPrepared) {
           const reason=['git-head-unavailable','diff-coverage-base-unavailable'].includes(error.code) ? error.code
-            : error.code==='forge-busy' && !(request.argv?.[0]==='npm' && request.argv?.[2]==='test:unit') ? 'forge-busy' : 'snapshot-rejected';
+            : error.code==='forge-draining' ? 'forge-draining' : error.code==='forge-busy' && !(request.argv?.[0]==='npm' && request.argv?.[2]==='test:unit') ? 'forge-busy' : 'snapshot-rejected';
           if(reason==='git-head-unavailable')process.stderr.write(`forge-exec-run: ${reason}: ${String(error.cause?.message??error.message).replace(/[\x00-\x1f\x7f-\x9f]/g,'')}\n`);
           if(error.code==='egress-table-absent')process.stderr.write('forge-exec-run: egress-table-absent\n');
           await writeFile(statePath(request.run,'rejected'),JSON.stringify({v:prepared.v,nonce:prepared.nonce,run:prepared.run,phase:'rejected',reason,siblings:!!request.manifest?.siblings,...(request.baseSha!==undefined?{delta:true}:{})}),{flag:'wx',mode:0o600}).catch(async e => {if (e.code !== 'EEXIST') throw e; await state(request,'rejected');});
@@ -1556,7 +1709,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       await publishTelemetry();
       // Legacy callers retain their null finish response for non-sibling failures.
       // Never certify rejection once the protected run phase has started.
-      return receipt ?? (phase === 'prepared' && (rejected?.siblings||rejected?.delta||['forge-busy','git-head-unavailable','diff-coverage-base-unavailable'].includes(rejected?.reason)) ? {...rejected,started:false} : null) ?? (request.cancel===true ? {v:1,nonce:request.nonce,run:request.run,cancelAck:true} : null);
+      return receipt ?? (phase === 'prepared' && (rejected?.siblings||rejected?.delta||['forge-busy','forge-draining','git-head-unavailable','diff-coverage-base-unavailable'].includes(rejected?.reason)) ? {...rejected,started:false} : null) ?? (request.cancel===true ? {v:1,nonce:request.nonce,run:request.run,cancelAck:true} : null);
       }finally{if(finishingWorker&&settled)await rmdir(join(finishingWorker.active,'executing'));}
       });
     },
@@ -1565,7 +1718,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
 // The CLI's failure mapping, exported so tests can pin what the Mac sees (exit 254, stderr, forge-busy stdout).
 export function cliFailure(subcommand,error) {
   return {
-    stdout:subcommand==='prepare'&&error.code==='forge-busy'?JSON.stringify({reason:'forge-busy'})+'\n':'',
+    stdout:subcommand==='prepare'&&(error.code==='forge-busy'||error.code==='forge-draining')?JSON.stringify({reason:error.code})+'\n':'',
     stderr:'forge-exec-run: '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n',
     exitCode:254,
   };

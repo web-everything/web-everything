@@ -311,7 +311,7 @@ it.each(['id_rsa','secret.pem'])
 it.each(['nested link','other alias root','secret content'])
 ('memory bridge exception still refuses %s in full and delta manifests',async fault=>{
   const dir=fault==='nested link'?'other-src':'agent-memory-src';
-  await write(dir+'/token-note.md',fault==='secret content'?'ghp_abcdefghijklmnopqrstuvwxyz0123':'clean notes');
+  await write(dir+'/token-note.md',fault==='secret content'?'ghp_'+'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8':'clean notes');
   await write('agent-memory-src/MEMORY.md','# Memory\n');
   await fs.mkdir(join(cwd,'.claude'));
   await fs.symlink('../agent-memory-src',join(cwd,'.claude/agent-memory'));

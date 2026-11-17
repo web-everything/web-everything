@@ -132,3 +132,58 @@ describe('claimBuildLease candidate teardown (leaseOwnerIsGone pid-reuse guard)'
     expect(calls).not.toContain(`worktree remove --force ${OLD_PATH}`);
   });
 });
+
+describe('R830 adopt-only lease never blocks a rebuild job', () => {
+  const plan = { finalSha: 'a'.repeat(40), inputsKey: 'k' };
+  // The pid MUST count as a live, long-running owner for these tests to reach the adoptOnly guard: without a start
+  // time before the lease, the default reader reports the keepalive child as a reused pid and the lease is dead anyway.
+  const OLDER = () => nowMs - 3_600_000;
+  const ROOT = '/nonexistent/clone';
+  const ENV = { WE_DAEMON_STATE_DIR: '/nonexistent/state', HOME: '/nonexistent/home' };
+  const OLD_PATH = candidateWorktreePath(ROOT, ENV, 'old-token');
+  const runTo = (calls) => (args) => { calls.push(args.join(' ')); return { status: 0, stdout: '', stderr: '' }; };
+  it('an adopt-only lease from another LIVE pid (the daemon) is not live, and is reclaimable at once', () => {
+    // Control: the identical lease without the flag IS live, so only the adoptOnly guard can make this false.
+    expect(buildLeaseIsLive(lease(livePid), { nowMs, startTimeOf: OLDER })).toBe(true);
+    expect(buildLeaseIsLive(lease(livePid, { adoptOnly: true }), { nowMs, startTimeOf: OLDER })).toBe(false);
+    const state = { building: lease(livePid, { adoptOnly: true }) };
+    const got = claimBuildLease({ state, plan, root: '/nonexistent-root', run: () => ({ status: 0 }), env: {}, nowMs, startTimeOf: OLDER });
+    expect(got).toBeTruthy();
+    expect(got.pid).toBe(process.pid);
+    expect(state.building.token).toBe(got.token);
+    ACTIVE_BUILD_TOKENS.delete(got.token);
+  });
+  it('reclaiming an adopt-only lease from another live pid tears down its candidate path (leaseOwnerIsGone adoptOnly branch)', () => {
+    const calls = [];
+    const state = { building: lease(livePid, { adoptOnly: true, token: 'old-token', path: OLD_PATH }) };
+    const got = claimBuildLease({ state, plan, root: ROOT, run: runTo(calls), env: ENV, nowMs, startTimeOf: OLDER });
+    if (got) ACTIVE_BUILD_TOKENS.delete(got.token);
+    expect(got).not.toBeNull();
+    expect(calls).toContain(`worktree remove --force ${OLD_PATH}`);
+  });
+  it('a non-adopt-only lease from the same live, older owner keeps its candidate tree (the teardown is adopt-only specific)', () => {
+    const calls = [];
+    const aged = new Date(nowMs - 3_600_000).toISOString();
+    const state = { building: lease(livePid, { token: 'old-token', path: OLD_PATH, startedAt: aged }) };
+    const got = claimBuildLease({ state, plan, root: ROOT, run: runTo(calls), env: ENV, nowMs, startTimeOf: () => nowMs - 7_200_000 });
+    if (got) ACTIVE_BUILD_TOKENS.delete(got.token);
+    expect(got).not.toBeNull();
+    expect(calls).not.toContain(`worktree remove --force ${OLD_PATH}`);
+  });
+  it('a lease this process holds (token active) does not block itself after release, and records adoptOnly when asked', () => {
+    const state = { building: null };
+    const got = claimBuildLease({ state, plan, root: '/x', run: () => ({ status: 0 }), env: {}, nowMs, adoptOnly: true });
+    expect(got.token).toBeTruthy();
+    expect(state.building.adoptOnly).toBe(true);
+    ACTIVE_BUILD_TOKENS.delete(got.token);
+    expect(buildLeaseIsLive(state.building, { nowMs })).toBe(false);
+  });
+  it('a dead job pid is reclaimable at once', () => {
+    expect(buildLeaseIsLive(lease(2 ** 22 + 12345), { nowMs })).toBe(false);
+  });
+  it('a live OTHER non-adopt-only job still blocks', () => {
+    expect(buildLeaseIsLive(lease(livePid), { nowMs, startTimeOf: () => nowMs - 3_600_000 })).toBe(true);
+    const state = { building: lease(livePid) };
+    expect(claimBuildLease({ state, plan, root: '/x', run: () => ({ status: 0 }), env: {}, nowMs, startTimeOf: () => nowMs - 3_600_000 })).toBeNull();
+  });
+});

@@ -87,6 +87,7 @@ import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { laneJournalPath, readLaneJournalTail, reconcileLaneJournalEntry } from '../lib/lane-history.mjs';
 import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
 import { laneIndicesIn, poolsWithLanes } from '../lib/lane-pool-scan.mjs';
+import { probeLaneCheckouts } from './lane-checkout-probe.mjs';
 import { readVerifyMarker } from '../lib/lane-verify.mjs';
 // #4317 — the same "which paths are DAEMON clones" registry `guard-lane.mjs`/`guard-bash.mjs` already use, so
 // this probe's notion of "a daemon clone" can never drift from the guards'.
@@ -119,6 +120,11 @@ import { readBacklogCards } from '../backlog-stranded-sweep.mjs';
 import { readPrEventsStatuses } from '../lib/pr-events.mjs';
 import { readSeatCapUsage } from '../operations/review-extra-seats.mjs';
 import { runSessionWatchdogPass, resolveSessionWatchdogConfig } from './session-watchdog.mjs';
+// Keep the watchdog's IO behind its probe boundary, outside the lane-action helper inventory.
+export async function probeLiveOwnerWatch(options) {
+  const { probeLiveOwnerWatch: probe } = await import('./pr-live-owner-watch.mjs');
+  return probe(options);
+}
 import { runGhProbeJobs, resolveHealthJobSwitches, GH_GROUP_PROBE_NAMES } from './health-watch-job.mjs';
 import { runPrSweepJob, resolvePrSweepSettings, prSweepTickAllowed } from './pr-sweep-job.mjs';
 import { runNightlyCoronerJob, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed, publishCoronerFailure, coronerNightDue } from './nightly-coroner-job.mjs';
@@ -1227,6 +1233,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   probes.laneVerifyMarkers = attempt('laneVerifyMarkers', () => probeLaneVerifyMarkers({
     poolRoot: flags['lane-pool-root'] || (fixtureTick ? null : defaultPoolRoot(REPO_ROOT)),
   }));
+  probes.laneCheckouts = attempt('laneCheckouts', () => probeLaneCheckouts({ poolRoot: flags['lane-pool-root'] || (fixtureTick ? null : defaultPoolRoot(REPO_ROOT)), repoRoot: REPO_ROOT }));
   // #4200-ish — cheap, fs-only, every tick: catches a shim baked with a lane-clone path BEFORE that lane resets.
   probes.ghShimLanes = attempt('ghShimLanes', () => probeGhShimLanes());
   // #4317 — cheap, every tick: an aged untracked backlog card sitting inside a daemon clone (the exact class of
@@ -1257,6 +1264,11 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   probes.heavyRunSamples = attempt('heavyRunSamples', () => readRecentSamples(heavyRunSamplesPath, {
     now, windowMs: config.heavyRunUngatedWindowMs ?? 10 * MINUTE,
   }));
+  probes.liveOwnerWatch = await attempt('liveOwnerWatch', () => probeLiveOwnerWatch({
+    dir, now, config, flags, remainingMs: Math.max(0, (config.tickBudgetMs ?? DEFAULT_HEALTH_CONFIG.tickBudgetMs) - (Date.now() - started)),
+    ...(deps.liveOwnerWatchPass ? { runPass: deps.liveOwnerWatchPass } : {}),
+  }));
+  if (probes.liveOwnerWatch?.error) probeErrors.liveOwnerWatch = probes.liveOwnerWatch.error;
   // `gh-call-failures` — fs-only, every tick: the gh-throttle call log's tail (`--gh-calls-log=FILE` in tests).
   probes.ghCalls = attempt('ghCalls', () => probeGhCalls(flags['gh-calls-log'] ? { logPath: flags['gh-calls-log'] } : {}));
   // #4309 — alongside (never replacing) the 2 MB tail above: persist every fully closed hour of GitHub spend once,

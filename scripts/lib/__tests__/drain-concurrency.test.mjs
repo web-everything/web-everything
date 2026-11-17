@@ -1,6 +1,8 @@
 // @vitest-environment node
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { mapWithConcurrency, runEnqueueCandidates, canParallelEnqueue, createBranchPreparationRequired, shouldPrepareBranchBeforeEnqueue, formatConcurrencySources } from '../drain-concurrency.mjs';
 import { decideHoldApprovedHumanSurfaceHead } from '../approved-human-surface-hold.mjs';
 import { hashBacklogFiles, prepareBranchBeforeEnqueue, finishBranchPreparation } from '../queue-branch-numbering.mjs';
@@ -50,7 +52,14 @@ describe('bounded drain concurrency', () => {
         if (failure === 'inventory unreadable') throw new Error(failure);
         return (args[1] === 'backlog/' ? cards : [...cards, '.github/workflows/ci.yml', 'assets/logo.svg']).join('\n');
       }
-      if (['check-ref-format', 'fetch', 'worktree'].includes(args[0])) return '';
+      if (args[0] === 'ls-tree') {
+        // Whole-tree validation reads git objects now; keep the same symlink the old lstat mock reported.
+        if (args.includes('--name-only')) return '';
+        return [...cards, '.github/workflows/ci.yml', 'assets/logo.svg']
+          .map(path => `${path === link ? '120000' : '100644'} blob ${'a'.repeat(40)}\t${path}\0`).join('');
+      }
+      if (args[0] === 'rev-parse') return join(tmpdir(), 'serial-numbering-sparse-checkout');
+      if (['check-ref-format', 'fetch', 'worktree', '-c'].includes(args[0])) return '';
       throw new Error(`unexpected git command: ${args[0]}`);
     });
     const fs = {

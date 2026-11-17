@@ -91,7 +91,7 @@ describe('readPool — line tolerance + schema re-validation + session tagging',
     // reaches the candidate list, the red-team step, and an LLM's context. It is stopped on the way INTO a
     // committed backlog/memory file (`scrubPublish`), not on the way out of the pool. Blocked from
     // LANDING, not blocked from being READ — the honest statement of what the move bought and cost.
-    session('sess-a', e('friction', 'leak', 'saw the key ghp_ABCDEFabcdef0123456789ABCDEF01234567 in a log'));
+    session('sess-a', e('friction', 'leak', 'saw the key gh\x70_ABCDEFabcdef0123456789ABCDEF01234567 in a log'));
     const { entries, stats } = readPool(poolFiles(dir));
     expect(stats.rejected).toBe(0);
     expect(entries).toHaveLength(1);

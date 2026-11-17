@@ -2,9 +2,10 @@
 bornAs: x920b18
 kind: story
 size: 2
-status: open
+status: resolved
 scope: ["we:scripts/conveyor/reconcile-core.mjs"]
 dateOpened: "2026-10-15"
+dateResolved: "2026-11-13"
 tags: []
 ---
 

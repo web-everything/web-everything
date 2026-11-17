@@ -4,6 +4,7 @@ import { withRealRepo, withBareOrigin } from './helpers/real-repo.mjs';
 import { refreshOntoMain } from '../../conveyor/ci-red-recovery-watch.mjs';
 import { placeBuildDispatchHold } from '../../conveyor/build-dispatch-claim.mjs';
 import { describe, it, expect, vi } from 'vitest';
+import { REARM_COMMENT_MARKER } from '../../conveyor/rearm-review.mjs';
 import { CONTROL_OPS, planOperatorControl, buildOperatorActionComment, parseOperatorActions, operatorControlOperation } from '../operator-controls.mjs';
 import { createOperatorControlsSinks, createOperatorControlsReader } from '../operator-controls-io.mjs';
 
@@ -63,8 +64,8 @@ describe('operator controls', () => {
   });
 });
 
-function sinkFixture(name, extra = {}) {
-  let state = structuredClone(contexts[name]);
+function sinkFixture(name, extra = {}, initial = contexts[name]) {
+  let state = structuredClone(initial);
   const calls = [];
   const readContext = () => state;
   const writeRecord = vi.fn(record => { calls.push(['record', record]); });
@@ -90,6 +91,80 @@ describe('sanctioned wrappers', () => {
     await f.sink(p);
     expect(f.calls[0]).toEqual(['lane/a', { root: '/tmp/clone', base: 'm', prNumber: 7, repo: input.repo }]);
     expect(f.calls[1].slice(0, 3)).toEqual(['/tmp/refresh-state', `${input.repo}#7`, 'new']);
+  });
+  it('refresh retries a lagging PR head read within a bounded budget', async () => {
+    let reads = 0; const sleeps = [];
+    const f = sinkFixture('refresh', ({ set, calls }) => ({ sleep: async ms => { sleeps.push(ms); if (sleeps.length === 2) set({ head: 'new', containsMain: true }); },
+      refresh: async () => ({ ok: true, newCommit: 'new' }), refreshStatePath: () => '/tmp/rs', rememberRefresh: (...a) => calls.push(a) }));
+    await f.sink(planOperatorControl('refresh', contexts.refresh, input));
+    expect(sleeps.length).toBe(2);
+    expect(f.calls[0].slice(0, 3)).toEqual(['/tmp/rs', `${input.repo}#7`, 'new']);
+    expect(reads).toBe(0);
+  });
+  it('refresh fails closed after the budget when the head never matches', async () => {
+    const sleeps = [];
+    const f = sinkFixture('refresh', ({ set }) => ({ sleep: async ms => { sleeps.push(ms); }, refreshVerifyBudgetMs: 3000,
+      refresh: async () => { set({ head: 'other', containsMain: true }); return { ok: true, newCommit: 'new' }; }, rememberRefresh: vi.fn() }));
+    await expect(f.sink(planOperatorControl('refresh', contexts.refresh, input))).rejects.toThrow(/could not verify refreshed PR head after 3000ms/);
+    expect(sleeps.reduce((a, b) => a + b, 0)).toBe(3000);
+    expect(f.writeRecord).not.toHaveBeenCalled();
+  });
+  it('refresh fails closed when the expected head is read but never contains main', async () => {
+    const sleeps = [];
+    const f = sinkFixture('refresh', ({ set }) => ({ sleep: async ms => { sleeps.push(ms); }, refreshVerifyBudgetMs: 3000,
+      refresh: async () => { set({ head: 'new', containsMain: false }); return { ok: true, newCommit: 'new' }; }, rememberRefresh: vi.fn() }));
+    await expect(f.sink(planOperatorControl('refresh', contexts.refresh, input))).rejects.toThrow(/could not verify refreshed PR head after 3000ms \(expected new, read new\)/);
+    expect(sleeps.reduce((a, b) => a + b, 0)).toBe(3000);
+    expect(f.writeRecord).not.toHaveBeenCalled();
+  });
+  it('refresh with no reported newCommit still fails closed when the read head does not contain main', async () => {
+    const sleeps = [];
+    const f = sinkFixture('refresh', ({ set }) => ({ sleep: async ms => { sleeps.push(ms); }, refreshVerifyBudgetMs: 3000,
+      refresh: async () => { set({ head: 'h2', containsMain: false }); return { ok: true }; }, rememberRefresh: vi.fn() }));
+    await expect(f.sink(planOperatorControl('refresh', contexts.refresh, input))).rejects.toThrow(/could not verify refreshed PR head after 3000ms \(expected a head containing main, read h2\)/);
+    expect(sleeps.reduce((a, b) => a + b, 0)).toBe(3000);
+    expect(f.writeRecord).not.toHaveBeenCalled();
+  });
+  it('refresh does not remember the head or write a record when the expected head never contains main', async () => {
+    const remember = vi.fn();
+    const f = sinkFixture('refresh', ({ set }) => ({ sleep: async () => {}, refreshVerifyBudgetMs: 1000,
+      refresh: async () => { set({ head: 'new', containsMain: false }); return { ok: true, newCommit: 'new' }; }, rememberRefresh: remember }));
+    await expect(f.sink(planOperatorControl('refresh', contexts.refresh, input))).rejects.toThrow(/expected new, read new/);
+    expect(remember).not.toHaveBeenCalled();
+    expect(f.writeRecord).not.toHaveBeenCalled();
+  });
+  it('refresh keeps retrying while the expected head is read without main, then accepts once main is contained', async () => {
+    const sleeps = [];
+    const f = sinkFixture('refresh', ({ set, calls }) => ({ sleep: async ms => { sleeps.push(ms); if (sleeps.length === 2) set({ head: 'new', containsMain: true }); },
+      refresh: async () => { set({ head: 'new', containsMain: false }); return { ok: true, newCommit: 'new' }; }, refreshStatePath: () => '/tmp/rs', rememberRefresh: (...a) => calls.push(a) }));
+    await f.sink(planOperatorControl('refresh', contexts.refresh, input));
+    expect(sleeps.length).toBe(2);
+    expect(f.calls[0].slice(0, 3)).toEqual(['/tmp/rs', `${input.repo}#7`, 'new']);
+  });
+  it('resume records a refresh whose head already moved onto main without re-running it', async () => {
+    const refresh = vi.fn(), calls = [];
+    const f = sinkFixture('refresh', ({ set }) => { set({ head: 'moved', containsMain: true }); return { refresh, refreshStatePath: () => '/tmp/rs', rememberRefresh: (...a) => calls.push(a) }; });
+    await f.sink(planOperatorControl('refresh', contexts.refresh, input));
+    expect(refresh).not.toHaveBeenCalled();
+    expect(calls[0].slice(0, 3)).toEqual(['/tmp/rs', `${input.repo}#7`, 'moved']);
+    expect(f.writeRecord).toHaveBeenCalledTimes(1);
+  });
+  it('resume refuses a tampered operator attribution in the stored plan', async () => {
+    const f = sinkFixture('refresh', ({ set }) => { set({ head: 'moved', containsMain: true }); return { refresh: vi.fn(), rememberRefresh: vi.fn() }; });
+    const p = planOperatorControl('refresh', contexts.refresh, input);
+    p.record = { ...p.record, actor: 'intruder' }; p.records = [p.record];
+    await expect(f.sink(p)).rejects.toThrow(/operator plan no longer valid/);
+    expect(f.writeRecord).not.toHaveBeenCalled();
+  });
+  it('resume refuses a forged record key', async () => {
+    const f = sinkFixture('refresh', ({ set }) => { set({ head: 'moved', containsMain: true }); return { refresh: vi.fn(), rememberRefresh: vi.fn() }; });
+    const p = planOperatorControl('refresh', { ...contexts.refresh, now: '2026-11-11' }, input);
+    p.record = { ...p.record, key: 'refresh:x:pr:7:forged@2026-11-11' }; p.records = [p.record]; p.body = buildOperatorActionComment(p.record);
+    await expect(f.sink(p)).rejects.toThrow(/operator plan no longer valid/);
+  });
+  it('resume still refuses when the head moved but does not contain main', async () => {
+    const f = sinkFixture('refresh', ({ set }) => { set({ head: 'moved', containsMain: false }); return { refresh: vi.fn(), rememberRefresh: vi.fn() }; });
+    await expect(f.sink(planOperatorControl('refresh', contexts.refresh, input))).rejects.toThrow(/state changed since operator plan/);
   });
   it('grant-rounds delegates by=n to extension sink', async () => {
     const extensionSink = vi.fn();
@@ -240,5 +315,39 @@ it('refresh does not noop when remote main advances beyond local origin/main', a
     expect(refresh).toHaveBeenCalledTimes(1);
     expect(git(['show', 'lane/operator-fixture:main-fix.txt'], { cwd: origin })).toBe('main fix\n');
     expect(git(['show', 'lane/operator-fixture:feature.txt'], { cwd: origin })).toBe('feature\n');
+  });
+});
+
+describe('rearm of a same-head no-verdict pause (review:pending)', () => {
+  const paused = { state: 'OPEN', labels: ['review:pending'], head: 'h', comments: [], sameHeadHold: { kind: 'same-head', head: 'h', noVerdict: { exhausted: false } } };
+  const planPaused = read => planOperatorControl('rearm', { ...read, now: '2026-10-13' }, input);
+  it('plans a wake comment, not a label change, when the same-head hold applies to the live head', () => {
+    const p = planPaused(paused);
+    expect(p.action).toBe('apply');
+    expect(p.wake).toBe(true);
+    expect(p.steps.join(' ')).toMatch(/wake/);
+  });
+  it('stays a noop with no hold, a different head, or a non same-head hold (a real referral hold is never woken)', () => {
+    expect(planPaused({ ...paused, sameHeadHold: null }).action).toBe('noop');
+    expect(planPaused({ ...paused, sameHeadHold: { kind: 'same-head', head: 'old' } }).action).toBe('noop');
+    expect(planPaused({ ...paused, sameHeadHold: { kind: 'referral', head: 'h' } }).action).toBe('noop');
+    expect(planPaused({ ...paused, labels: ['review:pending', 'review:human'] }).action).toBe('noop');
+    expect(planPaused({ ...paused, sameHeadHold: { kind: 'same-head', head: 'h' } }).action).toBe('noop');
+  });
+  it('the sink posts one REARM_COMMENT_MARKER wake comment and never runs the label child', async () => {
+    const f = sinkFixture('rearm', ({ set, calls }) => ({
+      run: () => { throw new Error('label child must not run'); },
+      runGh: args => { calls.push(['gh', args]); const body = args[args.indexOf('--body') + 1]; if (body.startsWith(REARM_COMMENT_MARKER)) set({ comments: [{ body, createdAt: '2026-11-15T12:00:00Z', author: { login: 'chalbert' } }] }); return ''; },
+    }), paused);
+    await f.sink(planPaused(paused));
+    const posts = f.calls.filter(c => c[0] === 'gh' && c[1][0] === 'pr' && c[1][1] === 'comment');
+    expect(posts.some(c => c[1][c[1].indexOf('--body') + 1].startsWith(REARM_COMMENT_MARKER))).toBe(true);
+  });
+  it('refuses to verify a wake posted by an untrusted author', async () => {
+    const f = sinkFixture('rearm', ({ set, calls }) => ({
+      run: () => { throw new Error('label child must not run'); },
+      runGh: args => { calls.push(['gh', args]); const body = args[args.indexOf('--body') + 1]; set({ comments: [{ body, author: { login: 'stranger' } }] }); return ''; },
+    }), paused);
+    await expect(f.sink(planPaused(paused))).rejects.toThrow(/could not verify/);
   });
 });

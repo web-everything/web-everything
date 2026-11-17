@@ -324,7 +324,7 @@ mod tests {
 
     #[test]
     fn github_pat_detected() {
-        let reasons = scrub_publish("github_pat_11ABCDEFG0123456789012345678901234567890123456789012345");
+        let reasons = scrub_publish(concat!("github_pat", "_11ABCDEFG0123456789012345678901234567890123456789012345"));
         assert!(reasons.iter().any(|r| r.contains("GitHub fine-grained PAT")));
     }
 

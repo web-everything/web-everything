@@ -7,7 +7,8 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { pushFailedDetail, mergeMethodFlag, buildCreateArgs, prCreateBodyGuard, buildMergeArgs, buildRenumberHealArgs, buildRegenArgs, buildAddLabelArgs, classifyChecks, planPrLand, pollVerdict, isPostLandTreeDirty, postLandSkips, postLandReport, scopeHealChangedPaths, resolveProducerReviewLabel, resolveRosterReconcile, resolveParkLabel, withAuthorStamp, composePrBody, PARK_LABELS, decideHoldReadyStrip, resolveDraft, isMainFixPr, decideReadyOnOpen, applyLabelWithRetry, unlabelledHandOffLabel } from '../pr-land.mjs';
+import { pushFailedDetail, mergeMethodFlag, buildCreateArgs, prCreateBodyGuard, liveBodyLandGuard, buildMergeArgs, buildRenumberHealArgs, buildRegenArgs, buildAddLabelArgs, classifyChecks, planPrLand, pollVerdict, isPostLandTreeDirty, postLandSkips, postLandReport, scopeHealChangedPaths, resolveProducerReviewLabel, resolveRosterReconcile, resolveParkLabel, withAuthorStamp, composePrBody, PARK_LABELS, decideHoldReadyStrip, isAcceptedAtHead, resolveDraft, isMainFixPr, decideReadyOnOpen, applyLabelWithRetry, unlabelledHandOffLabel, landTimeBodyGate } from '../pr-land.mjs';
+import { HOME_REASONS } from '../operations/pr-land-reasons.mjs';
 import { REVIEW_LABELS, REVIEW_LABEL_META, READY_TO_MERGE_LABEL, scoreEscalation } from '../lib/review-escalation.mjs';
 import { buildAuthorActorMarker, parseAuthorActorId } from '../lib/review-independence.mjs';
 import { PANEL_LENSES } from '../lib/review-core.mjs';
@@ -60,7 +61,8 @@ describe('#2844 — pr-land stamps the PR author into the body at open', () => {
     // Belt-and-braces on the one thing a pure test cannot see: that the module-scope CREATE_BODY, and the
     // best-effort edit that backfills an already-open PR, are built by the composer rather than around it.
     const src = readFileSync(resolve(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
-    expect(src).toMatch(/const CREATE_BODY = composePrBody\(BODY\)/);
+    expect(src).toMatch(/(?:const|let) CREATE_BODY = composePrBody\(BODY\)/); // R893: let, reassigned only to append the deferred-to-CI disclosure
+    expect(src.match(/^\s*CREATE_BODY = /gm)).toHaveLength(1);
     expect(src).toMatch(/const updated = composePrBody\(liveBody\)/);
   });
 });
@@ -234,6 +236,7 @@ describe('postLandReport — the success line never throws when regen/heal is sk
 });
 
 describe('pr-land pure helpers (#2138 Fork 5 / #2153)', () => {
+  const src = readFileSync(resolve(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
   it('maps merge methods to gh flags (default = --merge, the no-ff history the drain wants)', () => {
     expect(mergeMethodFlag('merge')).toBe('--merge');
     expect(mergeMethodFlag('squash')).toBe('--squash');
@@ -267,6 +270,131 @@ describe('pr-land pure helpers (#2138 Fork 5 / #2153)', () => {
     expect(titleOnly).toContain('--body');                    // a body is always present…
     expect(titleOnly[titleOnly.indexOf('--body') + 1]).toBe(''); // …an explicit empty body (non-interactive)
     expect(titleOnly).not.toContain('--fill');                // never --fill for a lane/* head
+  });
+
+  it('#6774 prCreateBodyGuard — refuses a body with a closing keyword + #N (would auto-close a PR on merge)', () => {
+    expect(prCreateBodyGuard('Fixes #6774 sitting ready').ok).toBe(false);
+    expect(prCreateBodyGuard('resolves: #12').ok).toBe(false);
+    expect(prCreateBodyGuard('Fixes card 6774, see PR 6774 and #6774').ok).toBe(true);
+  });
+
+  it('#6774 round 2 — qualified and URL closing refs are refused too', () => {
+    expect(prCreateBodyGuard('Fixes web-everything/web-everything#6774').ok).toBe(false);
+    expect(prCreateBodyGuard('closes https://github.com/web-everything/web-everything/pull/6774').ok).toBe(false);
+    expect(prCreateBodyGuard('See web-everything/web-everything#6774 for context').ok).toBe(true);
+  });
+
+  describe('#6774 round 2 — liveBodyLandGuard (the land-time check on an EXISTING PR body)', () => {
+    const viewing = (body) => vi.fn(() => ({ body }));
+    const guard = (viewPr) => liveBodyLandGuard({ viewPr, prNum: '42', base: 'main' });
+
+    it('refuses an existing PR body carrying a closing keyword + reference (every GitHub ref shape)', () => {
+      for (const body of [
+        'Fixes #6774 sitting ready',
+        'closes: #12',
+        'Resolves web-everything/web-everything#6774',
+        'fixed https://github.com/web-everything/web-everything/issues/6774',
+        '## Summary\n- tidy\n\nCLOSES https://github.com/o/r/pull/9',
+      ]) {
+        const viewPr = viewing(body);
+        const g = guard(viewPr);
+        expect(g.ok).toBe(false);
+        expect(g.reason).toBe('closing-keyword-body');
+        expect(g.detail).toMatch(/#42/);
+        expect(viewPr).toHaveBeenCalledWith('42', 'body'); // the LIVE body was read, not the invocation's
+      }
+    });
+
+    it('fails closed when the live body cannot be read (gh throws, no body field, non-string body)', () => {
+      const unreadable = [
+        vi.fn(() => { throw new Error('gh: HTTP 502'); }),
+        vi.fn(() => ({})),
+        vi.fn(() => ({ body: null })),
+        vi.fn(() => ({ body: 17 })),
+        vi.fn(() => null),
+        vi.fn(() => undefined),
+      ];
+      for (const viewPr of unreadable) {
+        const g = guard(viewPr);
+        expect(g.ok).toBe(false);
+        expect(g.reason).toBe('live-body-unconfirmed');
+        expect(g.detail).toMatch(/could not be read/);
+      }
+    });
+
+    it('a closing ref outranks an otherwise real body; an empty live body is still refused as empty-body', () => {
+      expect(guard(viewing('## Real summary\n\nlong text… Fixes #1')).reason).toBe('closing-keyword-body');
+      for (const empty of ['', '   ', '\n\t ']) expect(guard(viewing(empty)).reason).toBe('empty-body');
+    });
+
+    it('allows a real body that names cards/PRs without a closing keyword', () => {
+      const g = guard(viewing('## Summary\nReinforces card 6774; see PR 6818 and web-everything/web-everything#6774.'));
+      expect(g).toEqual({ ok: true });
+    });
+
+    it('runCli routes the label-when-green step through the guard and emits its refusal (exit 3) before labelling', () => {
+      const src = readFileSync(resolve('scripts/pr-land.mjs'), 'utf8');
+      const cli = src.slice(src.indexOf('async function runCli('));
+      // The gate's own result (same variable) drives the refusal, uses the REAL forge port, and sits inside
+      // the label-when-green block, before applyLabel(). Both helper names share this decision.
+      const wired = cli.match(/if \(PLAN\.labelWhenGreen\) \{\s*const (\w+) = landTimeBodyGate\(\{ forge, prNum, base: BASE \}\);\s*if \(!\1\.ok\) emit\(\{[^}]*reason: \1\.reason[^}]*detail: \1\.detail[^}]*\}, 3\);\s*\}/);
+      expect(wired).not.toBeNull();
+      expect(cli.indexOf(wired[0])).toBeLessThan(cli.indexOf('applyLabel();'));
+    });
+  });
+
+  it('#6774 round 3 — prCreateBodyGuard names WHICH refusal it is (code), and the create path emits that code', () => {
+    expect(prCreateBodyGuard('Fixes #6774').code).toBe('closing-keyword-body');
+    expect(prCreateBodyGuard('   ').code).toBe('empty-body');
+    expect(prCreateBodyGuard('## Real body').code).toBeUndefined();
+    // every code is a registered pr-land reason (routes to `refused`)
+    for (const b of ['Fixes #1', '']) expect(HOME_REASONS[prCreateBodyGuard(b).code]).toBe('refused');
+    // the create-path emit uses the guard's code, never a hard-coded 'empty-body'
+    expect(src).toMatch(/if \(!bodyGuard\.ok\) emit\(\{ repo: REPO, merged: false, reason: bodyGuard\.code,/);
+  });
+
+  describe('#6774 round 3 — landTimeBodyGate (the land-time live-body decision, behavioural)', () => {
+    const forgeReturning = (impl) => {
+      const calls = [];
+      return { calls, viewPr: (n, field) => { calls.push([n, field]); return impl(); } };
+    };
+
+    it('refuses a closing ref on an EXISTING PR body, even when the supplied body is safe', () => {
+      const forge = forgeReturning(() => ({ body: '## Summary\nFixes #6774' }));
+      const g = landTimeBodyGate({ forge, prNum: 42, base: 'main' });
+      expect(g.ok).toBe(false);
+      expect(g.reason).toBe('closing-keyword-body');
+      expect(g.detail).toMatch(/PR #42/);
+      expect(forge.calls).toEqual([[42, 'body']]);
+    });
+
+    it.each([
+      ['a thrown read', () => { throw new Error('gh: HTTP 502'); }],
+      ['a non-string body', () => ({ body: null })],
+      ['a missing body field', () => ({})],
+      ['a numeric body', () => ({ body: 7 })],
+    ])('refuses an unreadable live body (%s) — never falls back to the supplied body', (_label, impl) => {
+      const g = landTimeBodyGate({ forge: forgeReturning(impl), prNum: 7, base: 'main' });
+      expect(g).toMatchObject({ ok: false, reason: 'live-body-unconfirmed' });
+    });
+
+    it('refuses an empty live body', () => {
+      const g = landTimeBodyGate({ forge: forgeReturning(() => ({ body: '  \n ' })), prNum: 7, base: 'main' });
+      expect(g).toMatchObject({ ok: false, reason: 'empty-body' });
+    });
+
+    it('allows a safe, non-empty live body', () => {
+      expect(landTimeBodyGate({ forge: forgeReturning(() => ({ body: 'Card 6774, PR 6774' })), prNum: 7, base: 'main' })).toEqual({ ok: true });
+    });
+
+    it('every refusal reason is registered and routes to refused', () => {
+      for (const r of ['closing-keyword-body', 'live-body-unconfirmed', 'empty-body']) expect(HOME_REASONS[r]).toBe('refused');
+    });
+
+    it('runCli consults the gate and exits BEFORE applyLabel() in the labelWhenGreen path', () => {
+      expect(src).toMatch(/const bodyGate = landTimeBodyGate\(\{ forge, prNum, base: BASE \}\);\s*if \(!bodyGate\.ok\) emit\(\{ repo: REPO, merged: false, reason: bodyGate\.reason, pr: Number\(prNum\), detail: bodyGate\.detail \}, 3\);/);
+      expect(src.indexOf('landTimeBodyGate({ forge, prNum')).toBeLessThan(src.lastIndexOf('applyLabel();'));
+    });
   });
 
   it('#2332 prCreateBodyGuard — refuses a bodyless create, allows a non-empty body (producer fail-fast)', () => {
@@ -492,7 +620,10 @@ describe('pr-land contract guards (source-level, mirrors gated-push-wiring)', ()
   const src = readFileSync(resolve(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
   it('#2199: the label is applied only after the green-wait — never eagerly at PR open', () => {
     // applyLabel() must be invoked AFTER the check-wait loop (`labelWhenGreen`), not in the open/3b block.
-    expect(src).toMatch(/if \(PLAN\.labelWhenGreen\) applyLabel\(\)/);
+    // R893: the call is now preceded, in the same labelWhenGreen block, by the deferred-to-ci green-CI refusal, so the
+    // label is still applied only after the green-wait AND (for a deferred PR) only after that refusal check passes.
+    expect(src).toMatch(/if \(PLAN\.labelWhenGreen\) \{\s*const deferredRefusal = deferredLabelRefusal\([^)]*\);[^]*?\n\s*applyLabel\(\);\s*\n\s*\}/);
+    expect(src.match(/^\s*applyLabel\(\);/gm)).toHaveLength(1);
     // the open-only (--no-wait) path emits UNLABELLED
     expect(src).toMatch(/opened UNLABELLED|UNLABELLED — CI not confirmed/);
     // the eager pre-CI add-label call is gone from the open path (applyLabel is a deferred closure)
@@ -520,7 +651,7 @@ describe('pr-land contract guards (source-level, mirrors gated-push-wiring)', ()
     // the OBSERVED label set (`currentLabels`) — so a stale go-ahead on an already-ready held PR is stripped even
     // when this run's add hit a transient gh failure (#984 #5) — AND, belt-and-braces, on this run's `labelApplied`
     // so a PR THIS run just stamped is stripped even if the live label read failed OPEN to `[]` (#984 minor 1).
-    expect(src).toMatch(/const holdDecision = decideHoldReadyStrip\(verdict\.label, currentLabels, \{ labelApplied \}\)/);
+    expect(src).toMatch(/const holdDecision = decideHoldReadyStrip\(verdict\.label, currentLabels, \{ labelApplied, acceptedAtHead: !!verdict\.acceptedAtHead \}\)/);
     expect(src).toMatch(/if \(holdDecision\.strip\)/);
     expect(src).toMatch(/forge\.removeLabel\(prNum, READY_TO_MERGE_LABEL\)/);
     // The pre-#984 round-1 guard (strip gated SOLELY on this-run's applyLabel via a forked predicate) stays gone.
@@ -737,7 +868,9 @@ describe('pr-land contract guards (source-level, mirrors gated-push-wiring)', ()
     expect(src).toMatch(/forge\.viewPr\(prNum, 'body'\)/);
     expect(src).toMatch(/forge\.viewPr\(prNum, 'labels'\)/);
     expect(src).toMatch(/forge\.viewPr\(prNum, 'mergeable,mergeStateStatus'\)/);
-    expect(src).toMatch(/forge\.editBody\(prNum, updated\)/);
+    // R893: the live-body backfill edit goes through syncDeferredBody, which itself calls forge.editBody (pinned in
+    // lane-verify-deferred.test.mjs) — the call site must still hand it the forge port, never a bare gh literal.
+    expect(src).toMatch(/syncDeferredBody\(\{ forge, prNum, liveBody, composed: updated, deferred: DEFERRED_TO_CI \}\)/);
     expect(src).toMatch(/forge\.editBody\(prNum, reconciled\.body\)/);
     expect(src).toMatch(/forge\.addLabel\(prNum, LABEL\)/);
     expect(src).toMatch(/forge\.addLabel\(prNum, verdict\.label\)/);
@@ -940,5 +1073,27 @@ describe('R502 ready-on-open allowlist wiring', () => {
     const src = readFileSync(resolve(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
     expect(src).toMatch(/gitC\(\['show', `\$\{REMOTE\}\/\$\{BASE\}:scripts\/settings\/pr-land-ready\.json`\]\)/);
     expect(src).not.toMatch(/readSettings\(\)\.prLandReady/);
+  });
+});
+
+describe('accepted-head carry — a fresh hold verdict must not re-hold a PR already accepted for THIS head', () => {
+  const sha = 'ee88bd213c0123456789abcdef0123456789abcd';
+  const mk = (s) => [{ body: `accepted\n<!-- reviewed-sha: ${s} -->`, viewerDidAuthor: true, author: { login: 'github-actions' } }];
+  it('accepted + marker == head: verdict review:pending gives held:false', () => {
+    const acceptedAtHead = isAcceptedAtHead([REVIEW_LABELS.accepted], mk(sha), sha);
+    expect(acceptedAtHead).toBe(true);
+    expect(decideHoldReadyStrip(REVIEW_LABELS.pending, [REVIEW_LABELS.accepted], { acceptedAtHead })).toEqual({ held: false, strip: false });
+  });
+  it('marker sha != head: still held', () => {
+    const acceptedAtHead = isAcceptedAtHead([REVIEW_LABELS.accepted], mk('1'.repeat(40)), sha);
+    expect(acceptedAtHead).toBe(false);
+    expect(decideHoldReadyStrip(REVIEW_LABELS.pending, [REVIEW_LABELS.accepted], { acceptedAtHead }).held).toBe(true);
+  });
+  it('no marker, or no accepted label: still held', () => {
+    expect(isAcceptedAtHead([REVIEW_LABELS.accepted], [], sha)).toBe(false);
+    expect(isAcceptedAtHead([], mk(sha), sha)).toBe(false);
+  });
+  it('an observed review:human stays held even when accepted at head', () => {
+    expect(decideHoldReadyStrip(REVIEW_LABELS.pending, [REVIEW_LABELS.accepted, REVIEW_LABELS.human], { acceptedAtHead: true }).held).toBe(true);
   });
 });

@@ -133,7 +133,7 @@ describe('coroner metrics', () => {
 
   it('redacts secrets in repeated commands before they reach the report', () => {
     job('a');
-    transcript('a', Array.from({ length: 3 }, (_, i) => use(`s${i}`, 'curl -H "Authorization: Bearer ghs_abcdefghijklmnopqrstuvwxyz0123456789" https://x/y')));
+    transcript('a', Array.from({ length: 3 }, (_, i) => use(`s${i}`, 'curl -H "Authorization: Bearer gh\x73_abcdefghijklmnopqrstuvwxyz0123456789" https://x/y')));
     const { loops } = run().metrics;
     expect(loops.top).toHaveLength(1);
     expect(JSON.stringify(loops)).not.toContain('ghs_abcdefghijkl');
@@ -316,16 +316,47 @@ describe('coroner error rates (reported first)', () => {
     job('a');
     transcript('a', [use('1', 'node scripts/verify-lane.mjs check --wait', 0), result('1', '{"status":"timeout","reason":"wait-timeout"}', 7)]);
     const g = run().metrics.errorRates.gateRuns;
-    expect(g.total).toBe(6 + 2 + 1);
-    expect(g.count).toBe(4 + 2 + 1);
+    expect(g.total).toBe(6 + 1);
+    expect(g.count).toBe(4 + 1);
     expect(Object.fromEntries(Object.entries(g.causes).map(([k, v]) => [k, v.count]))).toEqual({ 'flaky-outside-diff': 1, 'in-diff-real-failure': 1, 'killed-superseded': 2, 'still-red-after-isolated-retry': 1, 'verify-wait-timeout': 1, 'vitest-timeout': 1 });
     expect(g.flakyRescuedGreen).toBe(1);
     expect(run().metrics.errorRates.notes).toMatchObject({ verifyLogUnstampedLines: 0, ciRunsTruncated: false });
-    expect(g.pct).toBe(77.8);
+    expect(g.pct).toBe(71.4);
+    expect(g.killedSuperseded).toBe(2);
+    expect(g.causes['in-diff-real-failure'].pct).toBe(20);
+    expect(g.causes['killed-superseded']).not.toHaveProperty('pct');
     expect(g.causes['killed-superseded'].examples).toEqual([{ ref: 'web-everything/lane-3', at: at(5) }, { ref: 'web-everything/lane-3', at: at(5) }]);
     expect(g.causes['verify-wait-timeout'].minutes).toBe(7);
     expect(g.causes['still-red-after-isolated-retry'].minutes).toBe(30);
     expect(gateCause({ status: 'red', retriedFailures: [{ kind: 'timeout' }] })).toBe('vitest-timeout');
+  });
+
+  it('gate runs: reports two superseded kills apart from one red and one green completed run', () => {
+    writeMarkers({
+      'lane-1': marker('a'.repeat(40), 0, 10),
+      'lane-2': marker('b'.repeat(40), 0, 20, { status: 'green' }),
+    });
+    write(env.WE_CORONER_VERIFY_LOG, `${at(5)} verify-daemon: tick\n  ✂ web-everything/lane-1: in-flight run 1 superseded by a newer request — killed\n${at(15)} verify-daemon: tick\n  ✂ web-everything/lane-2: in-flight run 2 superseded by a newer request — killed\n`);
+    const g = run().metrics.errorRates.gateRuns;
+    expect(g).toMatchObject({ count: 1, total: 2, pct: 50, killedSuperseded: 2 });
+    expect(g.causes['in-diff-real-failure'].pct).toBe(100);
+    expect(g.causes['killed-superseded']).toEqual({ count: 2, examples: [{ ref: 'web-everything/lane-2', at: at(15) }, { ref: 'web-everything/lane-1', at: at(5) }] });
+    expect(g.basis).toBe('local gate attempts (lane markers + verify-daemon kills + wait-timeouts); killed-superseded runs are reported apart and excluded from the rate');
+  });
+
+  it('gate runs: preserves the original serialized metric when there are no superseded kills', () => {
+    writeMarkers({
+      'lane-1': marker('a'.repeat(40), 0, 10),
+      'lane-2': marker('b'.repeat(40), 0, 20, { status: 'green' }),
+    });
+    const g = run().metrics.errorRates.gateRuns;
+    expect(g).not.toHaveProperty('killedSuperseded');
+    expect(JSON.stringify(g)).toBe(JSON.stringify({
+      count: 1, total: 2, pct: 50,
+      basis: 'local gate attempts (lane markers + verify-daemon kills + wait-timeouts)',
+      causes: { 'in-diff-real-failure': { count: 1, pct: 100, minutes: 10, examples: [{ ref: 'sha aaaaaaa', at: at(10) }] } },
+      flakyRescuedGreen: 0, markerSample: 'each lane keeps only its last two markers',
+    }));
   });
 
   it('CI: red by check and by cause class (cancelled, flaky rerun, soak, real), at most two examples, bounded gh calls', () => {

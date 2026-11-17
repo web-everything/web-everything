@@ -25,6 +25,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { breakById } from './breaks/index.mjs';
+import { execGitRetrying } from '../../lib/git-retry-transient.mjs';
 
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..', '..');
 
@@ -72,7 +73,7 @@ export function copyTree(root = REPO_ROOT) {
 export function restoreAtParent(dest, shas, paths, root = REPO_ROOT) {
   if (!paths.length) throw new Error('red-green: --at-parent needs --paths (or the break\'s fixedBy.paths)');
   for (const rel of paths) {
-    const content = execFileSync('git', ['show', `${shas[0]}^:${rel}`], { cwd: root, maxBuffer: 64 * 1024 * 1024 });
+    const content = execGitRetrying(['show', `${shas[0]}^:${rel}`], { cwd: root, maxBuffer: 64 * 1024 * 1024 });
     writeFileSync(join(dest, rel), content);
   }
   return paths.map((p) => `${p}@${shas[0]}^`);

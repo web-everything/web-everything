@@ -6,18 +6,19 @@
  *   discipline of proving the atomic fs layer for real, not just its pure decision logic).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, realpathSync, symlinkSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, realpathSync, symlinkSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
 import { execFileSync, execSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir, userInfo } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
+  classifyCommandKind, DEFAULT_FAST_MAX_FILES,
   DEFAULT_ADMISSION_CAP, DEFAULT_TIMEOUT_MS, DEFAULT_ADMISSION_CEILING_MS, ADMISSION_SWITCH_ENV,
   ADMISSION_LEASE_MINUTES, resolveCap, resolveTimeoutMs, resolveCeilingMs, isAdmissionOff, slotPath,
   tryAcquireSlot, releaseOwnedSlot, heldSlots, probeSlotHolderLiveness,
   markWaiting, clearWaiting, listWaiting,
   acquireSlotBlocking, admissionStatus, isOldestLiveWaiter, isDeadOwnerWaiter,
-  runUnderAdmission, shellQuoteWord,
+  runUnderAdmission, runWithRemoteDecision, shellQuoteWord,
   WAITING_TTL_MINUTES, ADMISSION_HELD_ENV, classifyWaiter, reapStaleWaiters, reapHistory, waiterRepo,
   admissionLockRoot, admissionBypassReason, poolRootOf, admittedArgv, admittedShellCommand, HEAVY_ADMISSION_CLI,
   DEFAULT_LOAD_ADMISSION_BACKSTOP_PER_CORE, LOAD_ADMISSION_BACKSTOP_PER_CORE_ENV, LOAD_ADMISSION_SWITCH_ENV,
@@ -1505,6 +1506,285 @@ describe('the `load-status` CLI mode as a real process (#4343)', () => {
 // WE_HEAVY_ADMISSION_CAP=4 / FAST_SLOTS=2 (six slots), every agent session read 2 + 1 (three slots): each side
 // scanned a different slot range, so the daemon's slot-3…5 holders were invisible to the rest of the host.
 
+const bigSelectedArgv = ['npx', 'vitest', 'run', ...Array.from({length:DEFAULT_FAST_MAX_FILES + 1}, (_, i) => `selected-${i}.test.mjs`)];
+const quotedFilterlessArgv = [
+  ['npm test-name containing a test filename', ['npm', 'run', 'test:unit', '--', '-t', 'loads a.test.ts']],
+  ['Vitest test-name containing a test filename', ['npx', 'vitest', 'run', '-t', 'loads a.test.ts']],
+  ['inline test-name containing a test filename', ['npx', 'vitest', 'run', '--testNamePattern=loads a.test.ts']],
+  ['single-quoted shell option value', ['sh', '-c', "npx vitest run -t 'loads a.test.ts'"]],
+  ['double-quoted shell option value', ['sh', '-c', 'npx vitest run -t "loads a.test.ts"']],
+  ['escaped space in shell option value', ['sh', '-c', 'npx vitest run -t loads\\ a.test.ts']],
+  ['concatenated shell option value', ['sh', '-c', 'npx vitest run -t loads" a.test.ts"']],
+];
+const wholeSuiteArgv = [
+  ...quotedFilterlessArgv,
+  ...['./${TEST_FILTER}', './$TEST_FILTER', './"${TEST_FILTER}"', './$(printf "")', './`printf ""`',
+    './${TEST_FILTER}/', '../${TEST_FILTER}', 'prefix${TEST_FILTER}suffix'].map(filter =>
+    [`unresolved prefixed filter ${filter}`, ['sh', '-c', `npx vitest run ${filter}`]]),
+  ['unresolved prefix alongside a selected file', ['sh', '-c', 'npx vitest run a.test.ts ./${TEST_FILTER}']],
+  ['selected file after an unresolved prefix', ['sh', '-c', 'npx vitest run ./${TEST_FILTER} a.test.ts']],
+  ['selected file alongside a match-all filter', ['npx', 'vitest', 'run', 'a.test.ts', './']],
+  ['npm run test:unit', ['npm', 'run', 'test:unit']],
+  ['npm test', ['npm', 'test']],
+  ['vitest run', ['npx', 'vitest', 'run']],
+  ...['&>out', '&> out', '&>>out', '&>> out', '>out', '>> out', '2>&1 | tee out', '2>err | tee out', '| tee out', '|& tee out', '> "test results.ts"', '{log}>out', '<input'].map(suffix =>
+    [`untargeted vitest with shell redirection ${suffix}`, ['bash', '-c', `npx vitest run ${suffix}`]]),
+  ...['&&', ';', '||', '\n'].flatMap(separator => [
+    [`selected run ${separator} untargeted --run`, ['sh', '-c', `npx vitest run a.test.mjs ${separator} npx vitest --run`]],
+    [`untargeted --run ${separator} selected run`, ['sh', '-c', `npx vitest --run ${separator} npx vitest run a.test.mjs`]],
+  ]),
+  ...['>','> ; echo done','> >out','<<EOF','>(cat)'].map(suffix =>
+    [`unreadable redirection fails closed ${suffix}`, ['bash', '-c', `npx vitest run a.test.mjs ${suffix}`]]),
+  ['npm run test:coverage', ['npm', 'run', 'test:coverage']],
+  ['vitest run --coverage (no files)', ['npx', 'vitest', 'run', '--coverage']],
+  ['shell-wrapped coverage', ['sh', '-c', 'npx vitest run --coverage']],
+  ['nested shell-wrapped coverage', ['bash', '-lc', "sh -c 'npx vitest run --coverage'"]],
+  ['shell-wrapped quoted coverage option', ['sh', '-c', 'npx vitest run "--coverage"']],
+  ['shell-wrapped split coverage option', ['sh', '-c', 'npx vitest run --cov"erage"']],
+  ['shell-wrapped escaped coverage option', ['sh', '-c', 'npx vitest run --cov\\erage']],
+  ['unreadable shell-wrapped coverage', ['sh', '-c', "npx vitest run --coverage '"]],
+  ['shell-wrapped coverage value with spaces', ['sh', '-c', "npx vitest run --coverage.include 'src/a b.ts'"]],
+  ['shell-wrapped npm coverage', ['sh', '-c', 'npm run test:coverage']],
+  ['shell-wrapped npm coverage forwarding', ['sh', '-c', 'npm run test:coverage -- --coverage.include src/foo.ts']],
+  ['coverage chain with one whole suite', ['sh', '-c', 'npx vitest run a.test.mjs --coverage && npx vitest run --coverage']],
+  ...['true', 'false'].flatMap(value => [
+    [`separate boolean --silent ${value}`, ['npx', 'vitest', 'run', '--silent', value]],
+    [`equals boolean --silent=${value}`, ['npx', 'vitest', 'run', `--silent=${value}`]],
+    [`short boolean -u ${value}`, ['npx', 'vitest', 'run', '-u', value]],
+    [`shell-wrapped quoted boolean ${value}`, ['sh', '-c', `npx vitest run --silent '${value}'`]],
+    [`forwarded npm boolean ${value}`, ['npm', 'run', 'test:unit', '--', '--silent', value]],
+    [`coverage boolean ${value}`, ['npx', 'vitest', 'run', '--coverage', value]],
+    [`nested coverage boolean ${value}`, ['npx', 'vitest', 'run', '--coverage.enabled', value]],
+  ]),
+  ['vitest run --coverage --coverage.thresholds.lines=0', ['npx', 'vitest', 'run', '--coverage', '--coverage.thresholds.lines=0']],
+  ['vitest run --coverage.thresholds.lines 0', ['npx', 'vitest', 'run', '--coverage', '--coverage.thresholds.lines', '0']],
+  ['vitest run --coverage --coverage.include src/foo.ts', ['npx', 'vitest', 'run', '--coverage', '--coverage.include', 'src/foo.ts']],
+  ['vitest run --coverage.include=src/foo.ts', ['npx', 'vitest', 'run', '--coverage.include=src/foo.ts']],
+  ['vitest run --coverage.include "src/a b.ts"', ['npx', 'vitest', 'run', '--coverage.include', 'src/a b.ts']],
+  ['vitest run --coverage.exclude=\'x y.ts\'', ['npx', 'vitest', 'run', '--coverage', '--coverage.exclude=x y.ts']],
+  ['npm run test:coverage -- --coverage.include src/foo.ts', ['npm', 'run', 'test:coverage', '--', '--coverage.include', 'src/foo.ts']],
+  // A quoted option value that holds a space is ONE word: its second half is never a positional filter.
+  ['vitest run --reporter json --outputFile <spaced>', ['npx', 'vitest', 'run', '--reporter', 'json', '--outputFile', 'test results.json']],
+  ['vitest run --outputFile=<spaced>', ['npx', 'vitest', 'run', '--outputFile=test results.json']],
+  ['vitest run -t <spaced name>', ['npx', 'vitest', 'run', '-t', 'some test name']],
+  ['vitest run --outputFile <spaced, test-file-like>', ['npx', 'vitest', 'run', '--outputFile', 'my.test results.ts']],
+  ['npm run test:unit -- --outputFile <spaced>', ['npm', 'run', 'test:unit', '--', '--outputFile', 'test results.json']],
+  ['sh -c with a quoted spaced value', ['sh', '-c', "npx vitest run --outputFile 'test results.json'"]],
+  ['a separator inside a quoted value', ['npx', 'vitest', 'run', '-t', 'a; b && c | d']],
+  ['a lone & inside a quoted value', ['npx', 'vitest', 'run', '--outputFile', 'a & b.json']],
+  // Words that are not arguments: a comment, a closing group word.
+  ['a trailing comment', ['sh', '-c', 'npx vitest run # only foo']],
+  ['a comment after a flag', ['sh', '-c', 'npx vitest run --silent # foo']],
+  ['a closing group word', ['sh', '-c', '( npx vitest run )']],
+  // A substitution or expansion keeps its own spaced, quoted text inside one word.
+  ['a quoted $(…) holding a nested quoted space', ['sh', '-c', 'npx vitest run --outputFile "$(mktemp -p "/tmp/x y")"']],
+  ['a quoted $(…) holding a nested echo', ['sh', '-c', 'npx vitest run --outputFile "$(echo "a b")"']],
+  ['a quoted backtick span holding a nested quoted space', ['sh', '-c', 'npx vitest run --outputFile "`mktemp "/tmp/a b"`"']],
+  ['an unquoted ${…} expansion holding a space', ['sh', '-c', 'npx vitest run --outputFile ${X:-foo bar}']],
+  // A command word split by quotes is still `vitest`, though the shared classifier does not see it.
+  ['a double-quote-split command word', ['sh', '-c', 'npx vit"est" run']],
+  ['a single-quote-split command word', ['sh', '-c', "npx v'itest' run"]],
+];
+// Coverage options never hide or replace an explicit test target.
+const coverageSelectedArgv = [
+  ['coverage + file', ['npx', 'vitest', 'run', '--coverage', 'a.test.mjs']],
+  ['nested option + file', ['npx', 'vitest', 'run', '--coverage', '--coverage.thresholds.lines=0', 'a.test.mjs']],
+  ['value-taking nested option + file', ['npx', 'vitest', 'run', '--coverage', '--coverage.include', 'src/foo.ts', 'a.test.mjs']],
+  ['boolean nested option + file', ['npx', 'vitest', 'run', '--coverage.enabled', 'a.test.mjs']],
+  ['shell coverage + file', ['sh', '-c', 'npx vitest run --coverage a.test.mjs']],
+  ['shell coverage value + file', ['sh', '-c', "npx vitest run --coverage.include 'src/a b.ts' a.test.mjs"]],
+  ['coverage boolean value + file', ['npx', 'vitest', 'run', '--coverage.enabled', 'false', 'a.test.mjs']],
+  ['npm forwarded coverage + file', ['npm', 'run', 'test:coverage', '--', '--coverage', 'a.test.mjs']],
+];
+// Any positional filter is targeted: a directory or a name substring, not only a test file (docs/agent/testing.md).
+const filterSelectedArgv = [
+  ['single targeted run control', ['sh', '-c', 'npx vitest run a.test.mjs']],
+  ['targeted --run control', ['sh', '-c', 'npx vitest --run a.test.mjs']],
+  ['targeted mixed run chain', ['sh', '-c', 'npx vitest run a.test.mjs && npx vitest --run b.test.mjs']],
+  ...['&>out', '2>&1 | tee out', '| tee vitest.log', '> "test results.ts"'].map(suffix =>
+    [`targeted run with shell redirection ${suffix}`, ['bash', '-c', `npx vitest run a.test.mjs ${suffix}`]]),
+  ['quoted shell operators are a filter', ['sh', '-c', 'npx vitest run "a&>b|c.test.mjs"']],
+  ['escaped shell operators are a filter', ['sh', '-c', 'npx vitest run a\\&\\>b\\|c.test.mjs']],
+  ['redirection before the filter', ['sh', '-c', 'npx vitest run >out a.test.mjs']],
+  ['redirection between an option and its value', ['sh', '-c', 'npx vitest run --reporter >out verbose a.test.mjs']],
+  ['quoted descriptor is a filter', ['sh', '-c', 'npx vitest run "2">out']],
+  ['number before combined redirection is a filter', ['bash', '-c', 'npx vitest run 2&>out']],
+  ['related run in a selected chain', ['sh', '-c', 'npx vitest run a.test.mjs && npx vitest related src/a.mjs --run']],
+  ['vitest run <directory>', ['npx', 'vitest', 'run', 'scripts/readiness/']],
+  ['vitest run <substring>', ['npx', 'vitest', 'run', 'heavy-admission']],
+  ['npm run test:unit -- <directory>', ['npm', 'run', 'test:unit', '--', 'scripts/readiness/']],
+  ['npm run test:unit -- <substring>', ['npm', 'run', 'test:unit', '--', 'heavy-admission']],
+  ['vitest run --silent <directory>', ['npx', 'vitest', 'run', '--silent', 'scripts/readiness/']],
+  ['vitest run --silent false <substring>', ['npx', 'vitest', 'run', '--silent', 'false', 'heavy-admission']],
+  ['vitest run --silent true <directory>', ['npx', 'vitest', 'run', '--silent', 'true', 'scripts/readiness/']],
+  ['vitest run --silent=false <substring>', ['npx', 'vitest', 'run', '--silent=false', 'heavy-admission']],
+  ['vitest run -- false', ['npx', 'vitest', 'run', '--', 'false']],
+  ['vitest run -- --silent false', ['npx', 'vitest', 'run', '--', '--silent', 'false']],
+  ['vitest run -- --coverage', ['npx', 'vitest', 'run', '--', '--coverage']],
+  ['vitest run --coverage <substring>', ['npx', 'vitest', 'run', '--coverage', 'heavy-admission']],
+  ['vitest run --reporter verbose <substring>', ['npx', 'vitest', 'run', '--reporter', 'verbose', 'heavy-admission']],
+  ['vitest run --no-coverage <directory>', ['npx', 'vitest', 'run', '--no-coverage', 'scripts/readiness/']],
+  ['vitest run -- <substring>', ['npx', 'vitest', 'run', '--', 'heavy-admission']],
+  // A quoted spaced value is one word, so a real filter after it is still found, and a spaced filter is one filter.
+  ['vitest run --outputFile <spaced> <substring>', ['npx', 'vitest', 'run', '--outputFile', 'test results.json', 'heavy-admission']],
+  ['vitest run -t <spaced name> <directory>', ['npx', 'vitest', 'run', '-t', 'some test name', 'scripts/readiness/']],
+  ['npm test-name plus an explicit file', ['npm', 'run', 'test:unit', '--', '-t', 'loads a.test.ts', 'real.test.ts']],
+  ['vitest run <spaced directory>', ['npx', 'vitest', 'run', 'my dir/']],
+  ['sh -c with a quoted spaced value and a filter', ['sh', '-c', "npx vitest run --outputFile 'a b.json' heavy-admission"]],
+  ['a file followed by a comment', ['sh', '-c', 'npx vitest run a.test.mjs # note']],
+  ['a substring inside a group', ['sh', '-c', '( npx vitest run heavy-admission )']],
+  ['a nested-quote $(…) value then a filter', ['sh', '-c', 'npx vitest run --outputFile "$(mktemp -p "/tmp/x y")" heavy-admission']],
+  ['a # inside a word is not a comment', ['sh', '-c', 'npx vitest run a#b.test.mjs']],
+  ['a selected chain naming a file', ['sh', '-c', 'npm run check:standards && npx vitest run a.test.mjs']],
+];
+// A flag value or a redirection is never a filter: these remain whole suites.
+const filterlessWholeSuiteArgv = [
+  ['vitest run --reporter verbose', ['npx', 'vitest', 'run', '--reporter', 'verbose']],
+  ['vitest run --silent', ['npx', 'vitest', 'run', '--silent']],
+  ['vitest run > out.log', ['sh', '-c', 'npx vitest run > out.log']],
+  // A filtered `vitest run` never exempts a whole-suite segment chained next to it.
+  ['a filtered vitest run && npm run test:unit', ['sh', '-c', 'npx vitest run foo.test.mjs && npm run test:unit']],
+  ['npm run test:unit; a filtered vitest run', ['sh', '-c', 'npm run test:unit; npx vitest run heavy-admission']],
+  // A word that matches (nearly) every test, or expands to something unknown, is not a targeted filter.
+  ['vitest run .', ['npx', 'vitest', 'run', '.']],
+  ['vitest run ./', ['npx', 'vitest', 'run', './']],
+  ['vitest run *', ['npx', 'vitest', 'run', '*']],
+  ['vitest run $UNSET', ['sh', '-c', 'npx vitest run $UNSET']],
+];
+const wholeSuiteRefusal = "whole suite is CI's job (R913); run selected/related tests";
+
+describe('heavyAdmission.wholeSuite policy cascade', () => {
+  it('defaults to allow and logs its standard source', () => {
+    const p = resolveAdmissionPolicy({env:{}});
+    expect.soft(ADMISSION_POLICY_STANDARD.wholeSuite).toBe('allow');
+    expect.soft(p.settings.wholeSuite).toBe('allow');
+    expect.soft(p.sources.wholeSuite).toBe('standard');
+    expect(formatAdmissionPolicy(p)).toContain('wholeSuite=allow (standard)');
+  });
+
+  it.each([
+    ['platform', {platform:{wholeSuite:'refuse'}}],
+    ['tool', {platform:{wholeSuite:'allow'}, tool:{wholeSuite:'refuse'}}],
+    ['env WE_HEAVY_ADMISSION_WHOLE_SUITE', {platform:{wholeSuite:'allow'}, tool:{wholeSuite:'allow'}, env:{WE_HEAVY_ADMISSION_WHOLE_SUITE:'refuse'}}],
+  ])('resolves refuse from %s on the shared pool and logs its source', (source, options) => {
+    const p = resolveAdmissionPolicy({env:{}, ...options});
+    expect.soft(p.settings.wholeSuite).toBe('refuse');
+    expect.soft(p.sources.wholeSuite).toBe(source);
+    expect.soft(p.ignored).toEqual([]);
+    expect(formatAdmissionPolicy(p)).toContain(`wholeSuite=refuse (${source})`);
+  });
+
+  it.each([
+    ['platform.wholeSuite', {platform:{wholeSuite:'sometimes'}}],
+    ['tool.wholeSuite', {tool:{wholeSuite:'sometimes'}}],
+    ['env WE_HEAVY_ADMISSION_WHOLE_SUITE', {env:{WE_HEAVY_ADMISSION_WHOLE_SUITE:'sometimes'}}],
+  ])('invalid %s falls back to allow and logs the invalid value and default source', (source, options) => {
+    const p = resolveAdmissionPolicy({env:{}, ...options});
+    expect.soft(p.settings.wholeSuite).toBe('allow');
+    expect.soft(p.sources.wholeSuite).toBe('standard');
+    expect.soft(p.invalid.join(' ')).toContain(source);
+    const line = formatAdmissionPolicy(p);
+    expect.soft(line).toContain('wholeSuite=allow (standard)');
+    expect(line).toMatch(/invalid:.*sometimes/);
+  });
+
+  it('loads wholeSuite from the heavyAdmission preferences block', () => {
+    const prefs = join(lockRoot, 'whole-suite-preferences.json');
+    writeFileSync(prefs, JSON.stringify({heavyAdmission:{wholeSuite:'refuse'}}));
+    const p = loadAdmissionPolicy({env:{WE_PLATFORM_PREFERENCES:prefs}, checkoutRoot:lockRoot});
+    expect.soft(p.settings.wholeSuite).toBe('refuse');
+    expect.soft(p.sources.wholeSuite).toBe('platform');
+    expect(formatAdmissionPolicy(p)).toContain('wholeSuite=refuse (platform)');
+  });
+});
+
+describe('wholeSuite local admission and CLI entry', () => {
+  it.each(filterSelectedArgv)('wholeSuite guard passes targeted %s independently of host capacity', async (_label, argv) => {
+    const policy = resolveAdmissionPolicy({platform:{wholeSuite:'refuse', remote:{enabled:false}}, env:{}});
+    const log = vi.fn();
+    expect(await runWithRemoteDecision({argv, policy, cwd:lockRoot, lockRoot, env:{}, log})).toEqual({handled:false});
+    expect(log.mock.calls.flat().join('')).not.toContain(wholeSuiteRefusal);
+  });
+
+  it.each([
+    ['shell-wrapped coverage', ['sh', '-c', 'npx vitest run --coverage']],
+    ['separate boolean value', ['npx', 'vitest', 'run', '--silent', 'false']],
+  ])('refuses %s even when remote execution is disabled', async (_label, argv) => {
+    const remoteExec = vi.fn();
+    const policy = resolveAdmissionPolicy({platform:{wholeSuite:'refuse', remote:{enabled:false}}, env:{}});
+    const root = join(lockRoot, 'remote-disabled');
+    const result = await runWithRemoteDecision({argv, policy, env:{}, cwd:lockRoot, lockRoot:root, remoteExec, log:vi.fn()});
+    expect(result).toEqual({handled:true, exitCode:125});
+    expect(remoteExec).not.toHaveBeenCalled();
+    expect(existsSync(root)).toBe(false);
+  });
+
+  it.each(wholeSuiteArgv)('refuse blocks %s before a local slot is acquired or a child runs', async (_label, argv) => {
+    const root = join(lockRoot, 'not-yet-acquired');
+    const exec = vi.fn(); const log = vi.fn();
+    const policy = resolveAdmissionPolicy({platform:{wholeSuite:'refuse'}, env:{}});
+    const result = await runUnderAdmission({lockRoot:root, cap:2, owner:'WHOLE', command:argv.map(shellQuoteWord).join(' '),
+      cwd:lockRoot, policy, env:{}, exec, log, now:() => T0, sleep:async () => { throw Error('must not wait'); }});
+    expect.soft(exec).not.toHaveBeenCalled();
+    expect.soft(existsSync(root)).toBe(false);
+    expect.soft(log.mock.calls.flat().join('')).toContain(wholeSuiteRefusal);
+    expect.soft(log.mock.calls.flat().join('')).toContain('wholeSuite=refuse (platform)');
+    expect(result.exitCode).toBe(125);
+  });
+
+  it.each(filterSelectedArgv)('refuse admits the targeted %s to run locally', async (_label, argv) => {
+    const exec = vi.fn(); const log = vi.fn();
+    const policy = resolveAdmissionPolicy({platform:{wholeSuite:'refuse'}, env:{}});
+    const result = await runUnderAdmission({lockRoot:join(lockRoot, 'filter-admitted'), cap:2, owner:'FILTER', command:argv.map(shellQuoteWord).join(' '),
+      cwd:lockRoot, policy, env:{}, exec, log, now:() => T0, sleep:async () => {}});
+    expect.soft(log.mock.calls.flat().join('')).not.toContain(wholeSuiteRefusal);
+    expect.soft(exec).toHaveBeenCalledTimes(1);
+    expect(result.exitCode).toBe(0);
+  });
+
+  it.each(filterlessWholeSuiteArgv)('refuse still blocks %s: a flag value or redirection is not a filter', async (_label, argv) => {
+    const exec = vi.fn(); const log = vi.fn();
+    const policy = resolveAdmissionPolicy({platform:{wholeSuite:'refuse'}, env:{}});
+    const result = await runUnderAdmission({lockRoot:join(lockRoot, 'filterless-refused'), cap:2, owner:'FILTERLESS', command:argv.map(shellQuoteWord).join(' '),
+      cwd:lockRoot, policy, env:{}, exec, log, now:() => T0, sleep:async () => { throw Error('must not wait'); }});
+    expect.soft(exec).not.toHaveBeenCalled();
+    expect.soft(log.mock.calls.flat().join('')).toContain(wholeSuiteRefusal);
+    expect(result.exitCode).toBe(125);
+  });
+
+  it.each([
+    ['npm whole suite', ['npm', 'run', 'test:unit']],
+    ['combined Bash redirection', ['bash', '-c', 'npx vitest run &>out']],
+    ['spaced combined Bash redirection', ['bash', '-c', 'npx vitest run &> out']],
+    ['descriptor duplication and pipe', ['bash', '-c', 'npx vitest run 2>&1 | tee out']],
+    ['selected run chained with untargeted --run', ['sh', '-c', 'npx vitest run a.test.mjs && npx vitest --run']],
+    ['shell-wrapped coverage', ['sh', '-c', 'npx vitest run --coverage']],
+    ['separate boolean value', ['npx', 'vitest', 'run', '--silent', 'false']],
+  ])('CLI run refuses %s before executing the child or taking a local slot', (_label, argv) => {
+    const pool = join(lockRoot, '.lanes');
+    const root = join(pool, '.admission', 'heavy');
+    mkdirSync(root, {recursive:true});
+    const bin = join(lockRoot, 'bin'); mkdirSync(bin);
+    const ran = join(lockRoot, 'child-ran');
+    // If admission regresses, this harmless stand-in records execution instead of launching a suite.
+    writeFileSync(join(bin, 'npm'), '#!/bin/sh\n: > "$WHOLE_SUITE_CHILD_MARKER"\n', {mode:0o755});
+    writeFileSync(join(bin, 'npx'), '#!/bin/sh\n: > "$WHOLE_SUITE_CHILD_MARKER"\n', {mode:0o755});
+    const prefs = join(lockRoot, 'cli-whole-suite.json');
+    writeFileSync(prefs, JSON.stringify({heavyAdmission:{wholeSuite:'refuse', remote:{enabled:false}}}));
+    const r = spawnSync(process.execPath, [CLI, 'run', '--local', '--wait-ms=0', '--', ...argv], {
+      cwd:lockRoot, env:cliEnv(pool, {PATH:bin + ':' + process.env.PATH, WHOLE_SUITE_CHILD_MARKER:ran,
+        WE_PLATFORM_PREFERENCES:prefs, VITEST:'true', WE_HEAVY_ADMISSION_WHOLE_SUITE:'refuse'}),
+      encoding:'utf8', timeout:10000, maxBuffer:1024*1024,
+    });
+    expect.soft(r.error).toBeUndefined();
+    expect.soft(existsSync(ran)).toBe(false);
+    expect.soft(readdirSync(root)).toEqual([]);
+    expect.soft(r.stderr).toContain(wholeSuiteRefusal);
+    expect.soft(r.stderr).toContain('wholeSuite=refuse (env WE_HEAVY_ADMISSION_WHOLE_SUITE)');
+    expect(r.status).toBe(125);
+  });
+});
+
 describe('resolveAdmissionPolicy — the one cascade every process reads (standard → platform → tool → env)', () => {
   it('the standard: cap 2, 1 fast slot, a queue timeout DEFERS, no fast-lane scaling', () => {
     const p = resolveAdmissionPolicy({});
@@ -1540,6 +1820,16 @@ describe('resolveAdmissionPolicy — the one cascade every process reads (standa
     expect(bad.settings).toMatchObject({ onTimeout: 'defer', cap: 2 });
     expect(bad.invalid.join('\n')).toMatch(/WE_HEAVY_ADMISSION_ON_TIMEOUT/);
     expect(bad.invalid.join('\n')).toMatch(/platform\.cap/);
+  });
+
+  it.each([
+    ['busyBackoffMs', 999, false], ['busyBackoffMs', 1000, true], ['busyBackoffMs', 'x', false],
+    ['busyWaitMs', 0, true], ['busyWaitMs', -1, false], ['busyWaitMs', 24 * 60 * 60_000, true], ['busyWaitMs', 24 * 60 * 60_000 + 1, false],
+  ])('forge-busy wait setting remote.%s=%s is %s', (key, value, ok) => {
+    const p = resolveAdmissionPolicy({ platform: { remote: { [key]: value } } });
+    const dflt = { busyWaitMs: 600000, busyBackoffMs: 45000 }[key];
+    expect(p.settings.remote[key]).toBe(ok ? value : dflt); // an invalid value never overrides the default
+    expect(p.invalid.join('\n').includes(key)).toBe(!ok);
   });
 
   it('formatAdmissionPolicy names every value with its source (the logged line)', () => {
@@ -2308,4 +2598,353 @@ describe('heavy-run-wait — a wait budget re-tries the load gate and the slot q
     expect(mine[0].owner).toMatch(/#\d+$/); // the run wrapper's own per-process owner
     expect(r.stderr).toMatch(/acquired slot-\d after waiting/);
   }, 30_000);
+});
+
+// forge-busy wait-retry: a Forge `forge-busy` rejection waits and retries Forge (bounded) before any local run.
+describe('forge-busy wait-retry (runWithRemoteDecision)', () => {
+  const NOW = Date.parse('2026-10-29T21:40:00-04:00');
+  const roots = [];
+  afterEach(() => { for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true }); });
+  const busy = { mode: 'not-started', terminated: true, reason: 'forge-busy' };
+  async function fixture(remote) {
+    const { runWithRemoteDecision, resolveAdmissionPolicy } = await import('../heavy-admission.mjs');
+    const runner = await import('../forge-exec-run.mjs');
+    const cwd = mkdtempSync(join(tmpdir(), 'forge-busy-wait-')); roots.push(cwd);
+    const state = { time: NOW, sleeps: [] };
+    const sample = () => ({ sampledAtET: runner.easternTimestamp(state.time), cores: 8, loadPerCore: 0.12, memFreePct: 96, activeRuns: 3,
+      recent: [{ runId: 'r-' + 'a'.repeat(32), startedAtET: runner.easternTimestamp(state.time - 41000), stageMs: { install: 1000, run: 40000 }, code: 0 }] });
+    const f = { argv: ['npx', 'vitest', 'run', 'a.test.mjs'], cwd, env: {}, lockRoot: join(cwd, 'heavy'), state, run: runWithRemoteDecision,
+      policy: resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode: 'always', ...remote } } }),
+      clock: () => state.time, readTelemetry: vi.fn(async () => sample()), remoteExec: vi.fn(async () => ({ mode: 'remote', code: 0 })), log: vi.fn(),
+      sleep: async (ms) => { state.sleeps.push(ms); state.time += ms; } };
+    return f;
+  }
+  const go = (f, extra = {}) => f.run({ argv: f.argv, policy: f.policy, cwd: f.cwd, env: f.env, lockRoot: f.lockRoot, clock: f.clock, readTelemetry: f.readTelemetry, remoteExec: f.remoteExec, log: f.log, sleep: f.sleep, ...extra });
+  const health = (f) => JSON.parse(readFileSync(join(f.cwd, 'remote', 'health-g2.json'), 'utf8'));
+  const remoteMarkers = (f) => readdirSync(join(f.cwd, 'remote')).filter((n) => n.endsWith('.unconfirmed'));
+  // Anything a local heavy slot would leave behind under the admission lock root.
+  const localEntries = (f) => (existsSync(f.lockRoot) ? readdirSync(f.lockRoot) : []).filter((n) => /slot/.test(n));
+
+  const fullCommandCases = [['whole suite', ['npx', 'vitest', 'run']], ['big selected list', bigSelectedArgv], ...quotedFilterlessArgv];
+  const fullCases = reasons => reasons.flatMap(reason => fullCommandCases.map(([label, argv]) => [reason, label, argv]));
+  const refusalReasons = ['sibling-inventory-failed', 'bundle-credential-hit', 'bundle-credential-scan-too-large', 'git-head-unavailable'];
+  const retryableReasons = ['sibling-inventory-failed', 'git-head-unavailable'];
+  const fallbackRows = (f) => readFileSync(join(f.lockRoot, 'remote-fallbacks.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+
+  it('big selected fixture is FULL only because its explicit file count exceeds the fast cap', () => {
+    const command = bigSelectedArgv.map(shellQuoteWord).join(' ');
+    expect(classifyCommandKind(command, {})).toBe('FULL');
+    expect(classifyCommandKind(command, {WE_HEAVY_ADMISSION_FAST_MAX_FILES:String(bigSelectedArgv.length)})).toBe('files');
+  });
+
+  it.each(wholeSuiteArgv.flatMap(([label, argv]) => [
+    [label, 'platform', argv, {platform:{wholeSuite:'refuse'}}],
+    [label, 'env WE_HEAVY_ADMISSION_WHOLE_SUITE', argv, {env:{WE_HEAVY_ADMISSION_WHOLE_SUITE:'refuse'}}],
+  ]))('wholeSuite refuse blocks %s from %s before any remote dispatch or local slot', async (_label, source, argv, options) => {
+    const f = await fixture({});
+    f.argv = argv;
+    f.policy = resolveAdmissionPolicy({platform:{...options.platform, remote:{enabled:true, mode:'always'}}, env:options.env ?? {}});
+    const result = await go(f);
+    expect.soft(f.remoteExec).not.toHaveBeenCalled();
+    expect.soft(localEntries(f)).toEqual([]);
+    expect.soft(f.state.sleeps).toEqual([]);
+    const logs = f.log.mock.calls.flat().join('');
+    expect.soft(logs).toContain(wholeSuiteRefusal);
+    expect.soft(logs).toContain(`wholeSuite=refuse (${source})`);
+    expect(result).toEqual({handled:true, exitCode:125});
+  });
+
+  it.each([
+    ['selected', ['npx', 'vitest', 'run', 'a.test.mjs']],
+    ['big selected', bigSelectedArgv],
+    ['npm selected', ['npm', 'run', 'test:unit', '--', 'a.test.mjs']],
+    ['related', ['npx', 'vitest', 'related', 'src/a.mjs', '--run']],
+    ...coverageSelectedArgv,
+    ...filterSelectedArgv,
+  ])('wholeSuite refuse permits %s files to dispatch', async (_label, argv) => {
+    const f = await fixture({}); f.argv = argv;
+    f.policy = resolveAdmissionPolicy({platform:{wholeSuite:'refuse', remote:{enabled:true, mode:'always'}}, env:{}});
+    expect(await go(f)).toMatchObject({handled:true, exitCode:0});
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(f.log.mock.calls.flat().join('')).not.toContain(wholeSuiteRefusal);
+  });
+
+  it.each(wholeSuiteArgv)('wholeSuite allow preserves remote dispatch for %s', async (_label, argv) => {
+    const f = await fixture({}); f.argv = argv;
+    // Broad selections may need Git; use the transport that can provide it instead of rsync's Git-less snapshot.
+    f.policy = resolveAdmissionPolicy({platform:{wholeSuite:'allow', remote:{enabled:true, mode:'always', transport:'git-bundle'}}, env:{}});
+    expect(await go(f)).toMatchObject({handled:true, exitCode:0});
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(f.log.mock.calls.flat().join('')).not.toContain(wholeSuiteRefusal);
+  });
+
+  it('wholeSuite allow preserves the rsync needs-git refusal for a selected file alongside a match-all filter', async () => {
+    const f = await fixture({});
+    f.argv = ['npx', 'vitest', 'run', 'a.test.ts', './'];
+    f.policy = resolveAdmissionPolicy({platform:{wholeSuite:'allow', remote:{enabled:true, mode:'always', transport:'rsync'}}, env:{}});
+    expect(await go(f)).toEqual({handled:false});
+    expect(f.remoteExec).not.toHaveBeenCalled();
+    expect(fallbackRows(f)).toEqual([expect.objectContaining({reason:'needs-git', kind:'FULL'})]);
+    expect(localEntries(f)).toEqual([]);
+    expect(f.state.sleeps).toEqual([]);
+    expect(f.log.mock.calls.flat().join('')).not.toContain(wholeSuiteRefusal);
+  });
+
+  it.each(fullCases(refusalReasons))('FULL kind refuses local fallback on %s (%s)', async (reason, _label, fullArgv) => {
+    // Credential refusals must ignore even a positive retry budget.
+    const credential = reason.startsWith('bundle-credential-');
+    const f = await fixture({busyWaitMs:credential ? 60000 : 0, busyBackoffMs:30000});
+    f.argv = [...fullArgv];
+    f.remoteExec.mockResolvedValue({mode:'not-started', terminated:true, reason, detail:'unavailable'});
+    const result = await go(f);
+    expect.soft(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect.soft(f.state.sleeps).toEqual([]);
+    expect.soft(localEntries(f)).toEqual([]);
+    expect.soft(remoteMarkers(f)).toEqual([]);
+    expect.soft(fallbackRows(f)).toEqual([expect.objectContaining({reason, detail:'unavailable', kind:'FULL'})]);
+    expect.soft(f.log).toHaveBeenCalledWith(expect.stringMatching(new RegExp(`refusing local fallback.*${reason}|${reason}.*refusing local fallback`)));
+    expect(result).toEqual({handled:true, exitCode:125});
+  });
+
+  it.each(fullCases(retryableReasons))('FULL kind retries %s within the busy wait bound and accepts a second successful dispatch (%s)', async (reason, _label, fullArgv) => {
+    const f = await fixture({busyWaitMs:60000, busyBackoffMs:30000});
+    f.argv = [...fullArgv];
+    const during = [];
+    f.sleep = async ms => {
+      during.push({markers:remoteMarkers(f), local:localEntries(f)});
+      f.state.sleeps.push(ms); f.state.time += ms;
+    };
+    f.remoteExec.mockResolvedValueOnce({mode:'not-started', terminated:true, reason})
+      .mockResolvedValueOnce({mode:'remote', code:0});
+    const result = await go(f);
+    expect.soft(f.remoteExec).toHaveBeenCalledTimes(2);
+    expect.soft(f.state.sleeps).toEqual([30000]);
+    expect.soft(during).toEqual([{markers:[expect.stringMatching(/\.unconfirmed$/)], local:[]}]);
+    expect.soft(remoteMarkers(f)).toEqual([]);
+    expect.soft(localEntries(f)).toEqual([]);
+    expect(result).toMatchObject({handled:true, exitCode:0});
+  });
+
+  it.each(fullCases(retryableReasons))('FULL kind refuses local fallback on %s after the busy wait bound expires (%s)', async (reason, _label, fullArgv) => {
+    // A non-multiple budget proves that another whole backoff cannot overshoot the bound.
+    const f = await fixture({busyWaitMs:75000, busyBackoffMs:30000});
+    f.argv = [...fullArgv];
+    f.remoteExec.mockResolvedValue({mode:'not-started', terminated:true, reason});
+    const result = await go(f);
+    expect.soft(f.remoteExec).toHaveBeenCalledTimes(3);
+    expect.soft(f.state.sleeps).toEqual([30000, 30000]);
+    expect.soft(f.state.time - NOW).toBeLessThanOrEqual(75000);
+    expect.soft(localEntries(f)).toEqual([]);
+    expect.soft(remoteMarkers(f)).toEqual([]);
+    expect.soft(fallbackRows(f)).toEqual([expect.objectContaining({reason, kind:'FULL'})]);
+    expect.soft(f.log).toHaveBeenCalledWith(expect.stringMatching(new RegExp(`refusing local fallback.*${reason}|${reason}.*refusing local fallback`)));
+    expect(result).toEqual({handled:true, exitCode:125});
+  });
+
+  // The `kind === 'coverage'` arms of the same guard: a coverage run is as heavy as a whole suite, so it never falls back
+  // to a local run on these reasons either. Every FULL test above uses a plain suite; these use coverage commands.
+  const coverageCommandCases = [
+    ['bare --coverage', ['npx', 'vitest', 'run', '--coverage']],
+    ['test:coverage script', ['npm', 'run', 'test:coverage']],
+    ['--coverage naming a test file', ['npx', 'vitest', 'run', '--coverage', 'a.test.mjs']],
+  ];
+  const coverageCases = reasons => reasons.flatMap(reason => coverageCommandCases.map(([label, argv]) => [reason, label, argv]));
+
+  it.each(coverageCommandCases)('coverage fixture %s classifies as the coverage kind', (_label, argv) => {
+    expect(classifyCommandKind(argv.map(shellQuoteWord).join(' '), {})).toBe('coverage');
+  });
+
+  it.each(coverageCases(refusalReasons))('coverage kind refuses local fallback on %s (%s)', async (reason, _label, argv) => {
+    const credential = reason.startsWith('bundle-credential-');
+    const f = await fixture({busyWaitMs:credential ? 60000 : 0, busyBackoffMs:30000});
+    f.argv = [...argv];
+    f.remoteExec.mockResolvedValue({mode:'not-started', terminated:true, reason, detail:'unavailable'});
+    const result = await go(f);
+    expect.soft(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect.soft(f.state.sleeps).toEqual([]);
+    expect.soft(localEntries(f)).toEqual([]);
+    expect.soft(remoteMarkers(f)).toEqual([]);
+    expect.soft(fallbackRows(f)).toEqual([expect.objectContaining({reason, detail:'unavailable', kind:'coverage'})]);
+    expect.soft(f.log).toHaveBeenCalledWith(expect.stringMatching(new RegExp(`refusing local fallback.*${reason}|${reason}.*refusing local fallback`)));
+    expect(result).toEqual({handled:true, exitCode:125});
+  });
+
+  it.each(coverageCases(retryableReasons))('coverage kind retries %s within the busy wait bound and accepts a second successful dispatch (%s)', async (reason, _label, argv) => {
+    const f = await fixture({busyWaitMs:60000, busyBackoffMs:30000});
+    f.argv = [...argv];
+    f.remoteExec.mockResolvedValueOnce({mode:'not-started', terminated:true, reason})
+      .mockResolvedValueOnce({mode:'remote', code:0});
+    const result = await go(f);
+    expect.soft(f.remoteExec).toHaveBeenCalledTimes(2);
+    expect.soft(f.state.sleeps).toEqual([30000]);
+    expect.soft(remoteMarkers(f)).toEqual([]);
+    expect.soft(localEntries(f)).toEqual([]);
+    expect(result).toMatchObject({handled:true, exitCode:0});
+  });
+
+  it.each(coverageCases(retryableReasons))('coverage kind refuses local fallback on %s after the busy wait bound expires (%s)', async (reason, _label, argv) => {
+    const f = await fixture({busyWaitMs:75000, busyBackoffMs:30000});
+    f.argv = [...argv];
+    f.remoteExec.mockResolvedValue({mode:'not-started', terminated:true, reason});
+    const result = await go(f);
+    expect.soft(f.remoteExec).toHaveBeenCalledTimes(3);
+    expect.soft(f.state.sleeps).toEqual([30000, 30000]);
+    expect.soft(f.state.time - NOW).toBeLessThanOrEqual(75000);
+    expect.soft(localEntries(f)).toEqual([]);
+    expect.soft(fallbackRows(f)).toEqual([expect.objectContaining({reason, kind:'coverage'})]);
+    expect.soft(f.log).toHaveBeenCalledWith(expect.stringMatching(new RegExp(`refusing local fallback.*${reason}|${reason}.*refusing local fallback`)));
+    expect(result).toEqual({handled:true, exitCode:125});
+  });
+
+  it('coverage kind keeps local fallback on an unrelated forge-busy-after-wait', async () => {
+    const f = await fixture({busyWaitMs:60000, busyBackoffMs:30000});
+    f.argv = ['npx', 'vitest', 'run', '--coverage'];
+    f.remoteExec.mockResolvedValue(busy);
+    expect(await go(f)).toEqual({handled:false});
+    expect(fallbackRows(f)).toEqual([expect.objectContaining({reason:'forge-busy-after-wait', kind:'coverage'})]);
+  });
+
+  it.each(refusalReasons.flatMap(reason => [
+    [reason, 'selected file', ['npx', 'vitest', 'run', 'a.test.mjs']],
+    [reason, 'quoted option and selected file', ['npm', 'run', 'test:unit', '--', '-t', 'loads a.test.ts', 'real.test.ts']],
+  ]))('non-FULL unit kind keeps local fallback on %s without retry (%s)', async (reason, _label, argv) => {
+    const f = await fixture({busyWaitMs:60000, busyBackoffMs:30000});
+    f.argv = argv;
+    f.remoteExec.mockResolvedValue({mode:'not-started', terminated:true, reason});
+    expect(await go(f)).toEqual({handled:false});
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(f.state.sleeps).toEqual([]);
+    expect(fallbackRows(f)).toEqual([expect.objectContaining({reason, kind:'files'})]);
+    expect(f.log).not.toHaveBeenCalledWith(expect.stringContaining('refusing local fallback'));
+  });
+
+  it('FULL kind keeps local fallback on unrelated forge-busy-after-wait after exhausting the busy budget', async () => {
+    const f = await fixture({busyWaitMs:60000, busyBackoffMs:30000});
+    f.argv = ['npx', 'vitest', 'run'];
+    f.remoteExec.mockResolvedValue(busy);
+    expect(await go(f)).toEqual({handled:false});
+    expect(f.remoteExec).toHaveBeenCalledTimes(3);
+    expect(f.state.sleeps).toEqual([30000, 30000]);
+    expect(fallbackRows(f)).toEqual([expect.objectContaining({reason:'forge-busy-after-wait', kind:'FULL'})]);
+  });
+
+  it('FULL kind keeps local fallback on remote timeout with confirmed cancellation', async () => {
+    const f = await fixture({busyWaitMs:60000});
+    f.argv = ['npx', 'vitest', 'run'];
+    f.remoteExec.mockImplementation(({signal}) => new Promise(resolve => {
+      signal.addEventListener('abort', () => resolve({mode:'cancelled', terminated:true}), {once:true});
+    }));
+    expect(await go(f, {timeoutMs:10})).toEqual({handled:false});
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(f.state.sleeps).toEqual([]);
+    expect(fallbackRows(f)).toEqual([expect.objectContaining({reason:'remote-timeout', kind:'FULL'})]);
+  });
+
+  it('retries Forge after forge-busy and returns the remote result with no local run', async () => {
+    const f = await fixture({ busyWaitMs: 600000, busyBackoffMs: 30000 });
+    f.remoteExec.mockResolvedValueOnce(busy).mockResolvedValueOnce(busy).mockResolvedValueOnce({ mode: 'remote', code: 0 });
+    expect(await go(f)).toMatchObject({ handled: true, exitCode: 0 });
+    expect(f.remoteExec).toHaveBeenCalledTimes(3);
+    expect(f.state.sleeps).toEqual([30000, 30000]); // the configured busyBackoffMs, exactly
+    expect(f.log).toHaveBeenCalledWith(expect.stringContaining('forge-busy; waiting'));
+    expect(health(f).failures).toBe(0);
+  });
+  it('holds only the remote marker (no local heavy slot) during the busy wait and clears it afterwards', async () => {
+    const f = await fixture({ busyWaitMs: 600000, busyBackoffMs: 30000 });
+    const during = [];
+    f.sleep = async (ms) => { during.push({ markers: remoteMarkers(f), local: localEntries(f) }); f.state.sleeps.push(ms); f.state.time += ms; };
+    f.remoteExec.mockResolvedValueOnce(busy).mockResolvedValueOnce({ mode: 'remote', code: 0 });
+    expect(await go(f)).toMatchObject({ handled: true, exitCode: 0 });
+    expect(during).toHaveLength(1);
+    expect(during[0].markers).toHaveLength(1);
+    expect(during[0].local).toEqual([]);
+    expect(remoteMarkers(f)).toEqual([]);
+  });
+  it('uses the default busy budget and backoff when the settings are omitted, and busyWaitMs:0 keeps the old no-wait path', async () => {
+    const f = await fixture({});
+    expect(f.policy.settings.remote).toMatchObject({ busyWaitMs: 600000, busyBackoffMs: 45000 });
+    f.remoteExec.mockResolvedValueOnce(busy).mockResolvedValueOnce({ mode: 'remote', code: 0 });
+    expect(await go(f)).toMatchObject({ handled: true, exitCode: 0 });
+    expect(f.state.sleeps).toEqual([45000]);
+    const off = await fixture({ busyWaitMs: 0 });
+    off.remoteExec.mockResolvedValue(busy);
+    expect(await go(off)).toEqual({ handled: false });
+    expect(off.remoteExec).toHaveBeenCalledTimes(1);
+    expect(off.state.sleeps).toEqual([]);
+    expect(health(off).failures).toBe(1); // with the wait off a busy Forge still counts as a failure (old behaviour)
+  });
+  it.each([
+    ['unconfirmed mode', { mode: 'unconfirmed', terminated: true, reason: 'forge-busy' }],
+    ['terminated absent', { mode: 'not-started', reason: 'forge-busy' }],
+    ['terminated false', { mode: 'not-started', terminated: false, reason: 'forge-busy' }],
+  ])('never retries a forge-busy answer that does not prove a confirmed non-start (%s)', async (_name, answer) => {
+    const f = await fixture({ busyWaitMs: 600000, busyBackoffMs: 30000 });
+    f.remoteExec.mockResolvedValue(answer);
+    expect(await go(f)).toEqual({ handled: true, exitCode: 124 });
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(f.state.sleeps).toEqual([]);
+    // Such an answer is a real Forge failure: it is still recorded (the busy exemption covers confirmed non-starts only).
+    expect(health(f).failures).toBe(1);
+  });
+  it('the busy exemption is busy-only: another confirmed non-start reason still counts as a failure with the wait enabled', async () => {
+    const f = await fixture({ busyWaitMs: 600000, busyBackoffMs: 30000 });
+    f.remoteExec.mockResolvedValue({ mode: 'not-started', terminated: true, reason: 'copy-failed' });
+    expect(await go(f)).toEqual({ handled: false });
+    expect(health(f).failures).toBe(1);
+  });
+  it('the run timeout ends the busy wait: a timeout shorter than the busy budget falls back locally, never exit 124', async () => {
+    const f = await fixture({ busyWaitMs: 600000, busyBackoffMs: 30000 });
+    f.remoteExec.mockResolvedValue(busy);
+    f.sleep = () => new Promise((resolve) => setTimeout(resolve, 150)); // outlives the 40ms run timeout below
+    expect(await go(f, { timeoutMs: 40 })).toEqual({ handled: false });
+    expect(f.remoteExec).toHaveBeenCalledTimes(1); // no dispatch with an already-aborted signal
+    expect(f.log).toHaveBeenCalledWith(expect.stringContaining('forge-busy-after-wait'));
+    expect(f.log).not.toHaveBeenCalledWith(expect.stringContaining('exit 124'));
+    expect(remoteMarkers(f)).toEqual([]);
+    expect(health(f).failures).toBe(0);
+  });
+  it('falls back locally with forge-busy-after-wait once the budget is spent', async () => {
+    const f = await fixture({ busyWaitMs: 90000, busyBackoffMs: 30000 });
+    f.remoteExec.mockResolvedValue(busy);
+    expect(await go(f)).toEqual({ handled: false });
+    expect(f.remoteExec.mock.calls.length).toBeGreaterThan(1);
+    expect(f.remoteExec.mock.calls.length).toBeLessThanOrEqual(4);
+    expect(f.log).toHaveBeenCalledWith(expect.stringContaining('forge-busy-after-wait'));
+  });
+  it('a busy Forge never arms the failure backoff: later runs still try Forge instead of going straight to the Mac', async () => {
+    const f = await fixture({ busyWaitMs: 60000, busyBackoffMs: 30000 });
+    f.remoteExec.mockResolvedValue(busy);
+    for (let i = 0; i < 4; i++) expect(await go(f)).toEqual({ handled: false });
+    const before = f.remoteExec.mock.calls.length;
+    f.remoteExec.mockResolvedValue({ mode: 'remote', code: 0 });
+    expect(await go(f)).toMatchObject({ handled: true, exitCode: 0 });
+    expect(f.remoteExec.mock.calls.length).toBe(before + 1);
+    expect(f.log).not.toHaveBeenCalledWith(expect.stringContaining('backoff-forge-busy'));
+  });
+  it('a client signal during the forge-busy wait ends it at once with the signal exit code and no further Forge try', async () => {
+    const f = await fixture({ busyWaitMs: 600000, busyBackoffMs: 30000 });
+    f.remoteExec.mockResolvedValue(busy);
+    f.sleep = () => { setImmediate(() => process.emit('SIGTERM', 'SIGTERM')); return new Promise(() => {}); };
+    expect(await go(f)).toMatchObject({ handled: true, exitCode: 143 });
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    // The interrupted wait is not a Forge health failure, and it leaves no marker or local slot behind.
+    expect(health(f).failures).toBe(0);
+    expect(health(f).backoffUntil).toBe(0);
+    expect(remoteMarkers(f)).toEqual([]);
+    expect(localEntries(f)).toEqual([]);
+  });
+  it('repeated interrupted busy waits never arm backoff-forge-busy', async () => {
+    const f = await fixture({ busyWaitMs: 600000, busyBackoffMs: 30000 });
+    f.remoteExec.mockResolvedValue(busy);
+    f.sleep = () => { setImmediate(() => process.emit('SIGTERM', 'SIGTERM')); return new Promise(() => {}); };
+    for (let i = 0; i < 4; i++) expect(await go(f)).toMatchObject({ handled: true, exitCode: 143 });
+    expect(health(f)).toMatchObject({ failures: 0, backoffUntil: 0, trigger: '' });
+  });
+  it('keeps today\'s behaviour for other not-started reasons (no wait)', async () => {
+    const f = await fixture({ busyWaitMs: 600000 });
+    f.remoteExec.mockResolvedValue({ mode: 'not-started', terminated: true, reason: 'copy-failed' });
+    expect(await go(f)).toEqual({ handled: false });
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(f.state.sleeps).toHaveLength(0);
+  });
 });

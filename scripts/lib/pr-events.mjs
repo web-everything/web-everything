@@ -91,6 +91,30 @@ export async function pollEvents(cursor, { url, token, fetchImpl = globalThis.fe
   }
 }
 
+/** POST one runtime record with an explicitly supplied internal-writer token. Never logs credentials or retries. */
+export async function appendRuntimeEvent(event, { url, token, fetchImpl = globalThis.fetch, timeoutMs = PR_EVENTS_DEFAULTS.timeoutMs } = {}) {
+  if (!url || !token) return { ok: false, error: 'not configured' };
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const res = await fetchImpl(`${url.replace(/\/+$/, '')}/runtime-events`, {
+      method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify(event), signal: ac.signal,
+    });
+    if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
+    const body = await res.json();
+    if (!body || typeof body.duplicate !== 'boolean' ||
+        (body.duplicate ? body.seq !== null : !Number.isSafeInteger(body.seq) || body.seq <= 0)) {
+      return { ok: false, error: 'malformed response' };
+    }
+    return { ok: true, seq: body.seq, duplicate: body.duplicate };
+  } catch (e) {
+    return { ok: false, error: e?.name === 'AbortError' ? `timeout after ${timeoutMs}ms` : 'runtime event request failed' };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** PURE: 'unreachable' (last poll failed / never succeeded) | 'stale' (reachable but nothing delivered lately) | 'healthy'. */
 export function classifyFeedHealth({ lastOkAt, lastFailAt, lastDeliveryAt, now, staleAfterMs = PR_EVENTS_DEFAULTS.staleAfterMs }) {
   if (lastOkAt == null || (lastFailAt != null && lastFailAt >= lastOkAt)) return 'unreachable';
@@ -127,6 +151,7 @@ export const ROLE_RELEVANCE = Object.freeze({
 export function isRelevantEvent(event, role, opts = {}) {
   const { repos = null } = opts;
   if (!event || typeof event !== 'object') return false;
+  if (event.class === 'runtime') return false;
   if (Array.isArray(repos) && repos.length && !repos.includes(event.repo)) return false;
   const rule = typeof opts.rule === 'function' ? opts.rule : ROLE_RELEVANCE[role];
   return rule ? !!rule(event) : true;

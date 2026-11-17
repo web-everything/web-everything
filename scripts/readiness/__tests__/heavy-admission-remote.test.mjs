@@ -2,7 +2,7 @@
 /** Contract tests for the pending remote admission exports; all execution and load IO is injected. */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { execSync, spawnSync } from 'node:child_process';
-import { readdirSync, mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, readFileSync, utimesSync, statSync } from 'node:fs';
+import { readdirSync, mkdtempSync, mkdirSync, chmodSync, writeFileSync, existsSync, rmSync, readFileSync, utimesSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { main, decideRemote, runWithRemoteDecision, adaptLegacyRemoteResult, resolveAdmissionPolicy, heldSlots, shellQuoteWord, DEFAULT_ADMISSION_CEILING_MS, DEFAULT_FAST_RUN_TIMEOUT_MS } from '../heavy-admission.mjs';
@@ -10,6 +10,10 @@ import { runRemote } from '../remote-exec.mjs';
 import { bindingEvidence } from './fixtures/forge-bound-git.mjs';
 import { execContainerized } from '../../lib/container-exec.mjs';
 
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {...actual, mkdtempSync:vi.fn(actual.mkdtempSync)};
+});
 vi.mock('node:child_process', async (importOriginal) => ({
   ...await importOriginal(), execSync: vi.fn(),
 }));
@@ -21,10 +25,11 @@ vi.mock('../../lib/container-exec.mjs', async (importOriginal) => ({
   containerCliAvailable: vi.fn(() => true), containerImageAvailable: vi.fn(() => true),
 }));
 
-const argv = ['npm', 'run', 'test:unit', '--', 'a file.test.mjs', '$(must-stay-literal)'];
+// Keep this a selected run: the shell-looking text is a test-name value, not an unknown positional filter.
+const argv = ['npm', 'run', 'test:unit', '--', 'a file.test.mjs', '-t', '$(must-stay-literal)'];
 const remoteDefaults = { enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null,
   slotUnitsByKind:{FULL:"auto",soak:"auto",standards:"auto"},elasticSlots:{enabled:true},autoSlotUnits:3,
-  maxConcurrent:8, backoffMs:120000, backoffFailures:3, maxLoadPerCore:0.8, minFreeRamPct:15, stuckMinSlots:2, stuckAgeMs:600000, stuckSignalEveryMs:600000, transport:'rsync', bundle:{ mainMaxAgeMin:10 } };
+  maxConcurrent:8, backoffMs:120000, backoffFailures:3, maxLoadPerCore:0.8, minFreeRamPct:15, stuckMinSlots:2, stuckAgeMs:600000, stuckSignalEveryMs:600000, busyWaitMs:600000, busyBackoffMs:45000, transport:'rsync', bundle:{ mainMaxAgeMin:10 } };
 const testRoots=[];
 afterEach(()=>{for(const root of testRoots.splice(0))rmSync(root,{recursive:true,force:true});});
 const healthyRead=async()=>({sampledAtET:(await import('../forge-exec-run.mjs')).easternTimestamp(Date.now()),
@@ -188,9 +193,9 @@ describe('remote admission policy', () => {
       expect(remoteExec).toHaveBeenCalledWith(expect.objectContaining({ argv:expected, cwd: root, signal: expect.any(AbortSignal) }));
       expect(exit).toHaveBeenCalledWith(23);
       expect(JSON.parse(readFileSync(join(root, 'verify-report.jsonl'), 'utf8'))).toEqual({ location: 'remote', receiptId: 'run-123456', exitCode: 23 });
-      // R501: the only thing a remote success may leave in the heavy root is the forgeShare record
+      // R501: a remote success leaves only the forgeShare record and its admission-wait row in the heavy root
       expect(existsSync(join(pool, '.admission','heavy','slot-0'))).toBe(false);
-      expect(readdirSync(join(pool, '.admission','heavy'))).toEqual(['remote-runs.jsonl']);
+      expect(readdirSync(join(pool, '.admission','heavy')).sort()).toEqual(['remote-runs.jsonl', 'waits.jsonl']);
       expect(heldSlots({lockRoot:join(pool,'.admission','remote'),cap:8})).toHaveLength(0);
     } finally { exit.mockRestore(); stderr.mockRestore(); vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); }
   });
@@ -398,6 +403,28 @@ describe('runWithRemoteDecision', () => {
     expectLines(f.log, 1, 'remote');
   });
 
+  it('keeps an opaque positional filter FULL while passing its literal argv unchanged', async () => {
+    const f = fixture();
+    f.argv = ['npm', 'run', 'test:unit', '--', 'a file.test.mjs', '$(must-stay-literal)'];
+    const originalArgv = [...f.argv];
+    const remoteRoot = join(f.lockRoot, '..', 'remote');
+    f.remoteExec.mockImplementation(async ({ argv, slotUnits }) => {
+      expect(argv).toBe(f.argv);
+      expect(argv).toEqual(originalArgv);
+      expect(slotUnits).toBe(3);
+      expect(readdirSync(remoteRoot).filter(n => n.endsWith('.unconfirmed')).sort())
+        .toEqual(['slot-0.unconfirmed', 'slot-1.unconfirmed', 'slot-2.unconfirmed']);
+      return { mode: 'remote', code: 0 };
+    });
+    expect(await runWithRemoteDecision(f)).toMatchObject({ handled: true, exitCode: 0 });
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(f.argv).toEqual(originalArgv);
+    expectLines(f.log, 2, 'remote');
+    expect(f.log.mock.calls[1][0]).toContain('remote.slotUnits=3');
+    expect(readdirSync(remoteRoot).filter(n => n.endsWith('.unconfirmed'))).toEqual([]);
+    expect(heldSlots({ lockRoot: remoteRoot, cap: 8 })).toEqual([]);
+  });
+
   it.each([0, 254])('accepts remote completion at valid exit boundary %s', async code => {
     expect(await runWithRemoteDecision(fixture({result:{mode:'remote', code}})))
       .toEqual({handled:true, exitCode:code, remoteResult: { mode: 'remote', code }});
@@ -424,11 +451,81 @@ describe('runWithRemoteDecision', () => {
   ('records exactly one structured fallback for %s / %s', async (mode, reason) => {
     const f = fixture({result:{mode,terminated:true,reason,detail:'fixture-file.mjs'}});
     const now = Date.now();
-    expect(await runWithRemoteDecision({...f,clock:()=>now})).toEqual({handled:false});
+    expect(await runWithRemoteDecision({...f,env:{},clock:()=>now})).toEqual({handled:false});
     const lines = readFileSync(join(f.lockRoot,'remote-fallbacks.jsonl'),'utf8').trim().split('\n');
     expect(lines).toHaveLength(1);
     expect(JSON.parse(lines[0])).toEqual({ts:new Date(now).toISOString(),reason,
-      detail:'fixture-file.mjs',lane:'fixture-checkout',kind:'files'});
+      detail:'fixture-file.mjs',lane:'fixture-checkout',kind:'files',
+      pid:process.pid,ppid:process.ppid,sandbox:null});
+  });
+
+  it.each(['EPERM', 'EACCES', 'EROFS'])('falls back confined-local on probe %s before health or remote dispatch', async code => {
+    const f = fixture();
+    const remoteRoot = join(f.lockRoot, '..', 'remote');
+    const readTelemetry = vi.fn(healthyRead);
+    vi.mocked(mkdtempSync).mockImplementationOnce(() => {throw Object.assign(new Error('denied'), {code});});
+    expect(await runWithRemoteDecision({...f, readTelemetry, env:{}})).toEqual({handled:false});
+    expect(readTelemetry).not.toHaveBeenCalled();
+    expect(f.remoteExec).not.toHaveBeenCalled();
+    expect(readdirSync(remoteRoot)).toEqual([]);
+    expect(f.log).toHaveBeenLastCalledWith(expect.stringContaining('(confined-local)'));
+    const row = JSON.parse(readFileSync(join(f.lockRoot, 'remote-fallbacks.jsonl'), 'utf8').trim());
+    expect(row).toMatchObject({reason:'confined-local', detail:`${code} remote`,
+      pid:process.pid, ppid:process.ppid, sandbox:null});
+  });
+
+  it('lets a non-permission probe error fall through to normal remote health and execution', async () => {
+    const f = fixture();
+    const readTelemetry = vi.fn(healthyRead);
+    vi.mocked(mkdtempSync).mockImplementationOnce(() => {throw Object.assign(new Error('race'), {code:'ENOENT'});});
+    expect(await runWithRemoteDecision({...f, readTelemetry})).toEqual({handled:true, exitCode:0,
+      remoteResult:{mode:'remote', code:0}});
+    expect(readTelemetry).toHaveBeenCalledTimes(1);
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(readdirSync(join(f.lockRoot, '..', 'remote')).some(name => name.startsWith('.write-probe-'))).toBe(false);
+  });
+
+  it.skipIf(process.getuid?.() === 0).each([false, true])(
+    'falls back confined-local without dispatch or health writes for an unwritable remote root (existing health: %s)',
+    async existingHealth => {
+      const f = fixture();
+      const remoteRoot = join(f.lockRoot, '..', 'remote');
+      const { remoteHealthFile } = await import('../forge-remote-health.mjs');
+      const healthFile = remoteHealthFile(remoteRoot);
+      const original = 'existing health evidence must remain byte-identical\n';
+      mkdirSync(remoteRoot, { recursive: true });
+      if (existingHealth) writeFileSync(healthFile, original);
+      const before = readdirSync(remoteRoot);
+      const readTelemetry = vi.fn(healthyRead);
+      chmodSync(remoteRoot, 0o500);
+      try {
+        expect(await runWithRemoteDecision({...f, readTelemetry, env:{CODEX_SANDBOX:'seatbelt'}}))
+          .toEqual({handled:false});
+        expect(f.remoteExec).not.toHaveBeenCalled();
+        expect(readTelemetry).not.toHaveBeenCalled();
+        expect(readdirSync(remoteRoot)).toEqual(before);
+        if (existingHealth) expect(readFileSync(healthFile, 'utf8')).toBe(original);
+        else expect(existsSync(healthFile)).toBe(false);
+        expect(f.log).toHaveBeenLastCalledWith(expect.stringContaining('(confined-local)'));
+        const rows = readFileSync(join(f.lockRoot, 'remote-fallbacks.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({reason:'confined-local', detail:expect.stringMatching(/^(EPERM|EACCES|EROFS) remote$/),
+          lane:'fixture-checkout', pid:process.pid, ppid:process.ppid, sandbox:{CODEX_SANDBOX:'seatbelt'}});
+      } finally {
+        chmodSync(remoteRoot, 0o700);
+      }
+    },
+  );
+
+  it('bounds and sanitizes only the named sandbox evidence, including oversized input', async () => {
+    const f = fixture({result:{mode:'not-started',terminated:true,reason:'copy-failed'}});
+    const env = {CODEX_SANDBOX:'seatbelt\n\x1b' + 'x'.repeat(1000),
+      CODEX_SANDBOX_NETWORK_DISABLED:'1', SANDBOX_RUNTIME:'runtime\u2028name', SECRET:'must not appear'};
+    expect(await runWithRemoteDecision({...f, env})).toEqual({handled:false});
+    const row = JSON.parse(readFileSync(join(f.lockRoot, 'remote-fallbacks.jsonl'), 'utf8').trim());
+    expect(row.sandbox).toEqual({CODEX_SANDBOX:('seatbelt??' + 'x'.repeat(1000)).slice(0,256),
+      CODEX_SANDBOX_NETWORK_DISABLED:'1', SANDBOX_RUNTIME:'runtime?name'});
+    expect(row).toMatchObject({pid:process.pid, ppid:process.ppid});
   });
 
   it('records health refusals without dispatching remotely', async () => {
@@ -437,7 +534,7 @@ describe('runWithRemoteDecision', () => {
     expect(f.remoteExec).not.toHaveBeenCalled();
     const rows = readFileSync(join(f.lockRoot,'remote-fallbacks.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({reason:expect.any(String),detail:null,lane:'fixture-checkout',kind:'files'});
+    expect(rows[0]).toMatchObject({reason:expect.any(String),detail:expect.any(String),lane:'fixture-checkout',kind:'files'});
   });
 
   it('bounds fallback log growth and tolerates an unwritable log', async () => {
@@ -664,6 +761,94 @@ describe('runWithRemoteDecision', () => {
       } finally { vi.useRealTimers(); }
     },
   );
+
+  describe('fresh telemetry confirms termination without a verified receipt', () => {
+    const run = 'r-' + 'a'.repeat(32);
+    const otherRun = 'r-' + 'b'.repeat(32);
+    it('does not reuse a prior attempt run ID when a busy retry fails before reporting its own ID', async () => {
+      const f = fixture({remote: {busyWaitMs: 2000, busyBackoffMs: 1000}});
+      f.sleep = async () => {};
+      f.remoteExec.mockImplementationOnce(async ({onRun}) => {
+        onRun(run);
+        return {mode: 'not-started', terminated: true, reason: 'forge-busy'};
+      }).mockRejectedValueOnce(new Error('retry lost'));
+      f.readTelemetry = vi.fn(healthyRead);
+      expect(await runWithRemoteDecision(f)).toEqual({handled: true, exitCode: 124});
+      expect(f.remoteExec).toHaveBeenCalledTimes(2);
+      expect(f.readTelemetry).toHaveBeenCalledTimes(1);
+      expect(existsSync(join(f.lockRoot, '..', 'remote', 'slot-0.unconfirmed'))).toBe(true);
+      expect(f.log.mock.calls.map(([line]) => line).join('')).toContain('retry lost');
+    });
+    const cases = [
+      ['finished', false], ['inflight', true], ['supervisor 97', true], ['supervisor 254', true],
+      ['unreadable', true], ['missing', true], ['stale', true], ['predates failure', true],
+      ['future', true], ['absent', true], ['malformed', true], ['stalled', true], ['no run id', true],
+    ];
+    it.each(['timeout', 'unconfirmed', 'throw', 'synchronous throw'].flatMap(outcome =>
+      cases.map(([evidence, refuses]) => ({outcome, evidence, refuses}))))(
+      '$outcome with $evidence telemetry retains quarantine=$refuses', async ({outcome, evidence, refuses}) => {
+        vi.useFakeTimers();
+        try {
+          const f = fixture();
+          const initialAt = Date.now();
+          let dispatched = false;
+          f.readTelemetry = vi.fn(async () => {
+            if (!dispatched) return healthyRead();
+            if (evidence === 'unreadable') throw new Error('telemetry unreadable');
+            if (evidence === 'missing') return null;
+            if (evidence === 'stalled') return new Promise(() => {});
+            // The probe samples after the client gives up, even when fake timers share a millisecond.
+            vi.setSystemTime(Date.now() + 1);
+            const sampledAt = evidence === 'stale' ? Date.now() - 30_001
+              : evidence === 'predates failure' ? initialAt : evidence === 'future' ? Date.now() + 60_001 : Date.now();
+            return {sampledAtET: new Date(sampledAt).toISOString(), activeRuns: 2, activeRunIds: [run, otherRun],
+              recent: [
+                {runId: otherRun, startedAtET: new Date(initialAt).toISOString(), code: null},
+                ...(evidence === 'absent' ? [] : [{runId: run, startedAtET: new Date(initialAt).toISOString(),
+                  code: evidence === 'inflight' ? null : evidence === 'supervisor 97' ? 97 : evidence === 'supervisor 254' ? 254 : 0}]),
+              ], ...(evidence === 'malformed' ? {activeRuns: 3} : {})};
+          });
+          f.remoteExec.mockImplementation(({onRun}) => {
+            dispatched = true;
+            if (evidence !== 'no run id') onRun(run);
+            if (outcome === 'timeout') return new Promise(() => {});
+            if (outcome === 'throw') return Promise.reject(new Error('transport lost'));
+            if (outcome === 'synchronous throw') throw new Error('transport lost');
+            return Promise.resolve({mode: 'unconfirmed', reason: 'receipt unavailable'});
+          });
+          const remoteRoot = join(f.lockRoot, '..', 'remote');
+          const marker = join(remoteRoot, 'slot-0.unconfirmed');
+          const local = vi.fn(() => {
+            expect(existsSync(marker)).toBe(false);
+            expect(existsSync(marker + '.run')).toBe(false);
+            expect(heldSlots({lockRoot: remoteRoot, cap: 8})).toHaveLength(0);
+          });
+          const pending = runWithRemoteDecision({...f, timeoutMs: 20}).then(result => {
+            if (!result.handled) local();
+            return result;
+          });
+          await vi.advanceTimersByTimeAsync(2025);
+          expect(await pending).toEqual(refuses ? {handled: true, exitCode: 124} : {handled: false});
+          expect(f.remoteExec).toHaveBeenCalledTimes(1);
+          expect(f.readTelemetry).toHaveBeenCalledTimes(evidence === 'no run id' ? 1 : 2);
+          expect(existsSync(marker)).toBe(refuses);
+          expect(local).toHaveBeenCalledTimes(refuses ? 0 : 1);
+          const logs = f.log.mock.calls.map(([line]) => line).join('');
+          if (refuses) expect(logs).toContain('termination unconfirmed; refusing local rerun (exit 124)');
+          else {
+            expect(logs).toContain('termination confirmed without a verified receipt');
+            expect(logs).toContain('falling back to local admission');
+            expect(logs).not.toContain('exit 124');
+            const reason = outcome === 'timeout' ? 'remote-timeout' : outcome === 'unconfirmed' ? 'receipt unavailable' : 'transport lost';
+            expect(JSON.parse(readFileSync(join(f.lockRoot, 'remote-fallbacks.jsonl'), 'utf8'))).toMatchObject({reason});
+            const health = JSON.parse(readFileSync(join(remoteRoot, 'health-g2.json'), 'utf8'));
+            expect(health).toMatchObject({failures: 0, backoffUntil: 0});
+          }
+          expect(vi.getTimerCount()).toBe(0);
+        } finally { vi.useRealTimers(); }
+      },
+    );
+  });
 
   it.each([
     ['default ceiling without env', undefined, ['npm', 'run', 'build'], DEFAULT_ADMISSION_CEILING_MS],
@@ -923,4 +1108,20 @@ describe('hostOverloadedForRemote (7579)', () => {
     expect(hostOverloadedForRemote({}, () => ({ admitted: false, reason: 'host capacity: cpu idle 5%; host.capacitySignal=cpu-mem (platform)' }))).toBe(false);
     expect(hostOverloadedForRemote({}, () => ({ admitted: false }))).toBe(false);
   });
+});
+
+
+it.each([false,true])('R857 credential warnings reach the fallbacks log without changing a remote result (unwritable: %s)',async unwritable=>{
+  const f=fixture(),file=join(f.lockRoot,'remote-fallbacks.jsonl');
+  if(unwritable)mkdirSync(file,{recursive:true});
+  f.remoteExec=vi.fn(async({onWarning})=>{
+    expect(()=>onWarning('credential-warn','notes.md: high-entropy-key')).not.toThrow();
+    return {mode:'remote',code:0};
+  });
+  expect(await runWithRemoteDecision(f)).toEqual({handled:true,exitCode:0,remoteResult:{mode:"remote",code:0}});
+  expect(f.remoteExec).toHaveBeenCalledTimes(1);
+  if(!unwritable) {
+    const rows=readFileSync(file,'utf8').trim().split('\n').map(JSON.parse);
+    expect(rows).toEqual([expect.objectContaining({reason:'credential-warn',detail:'notes.md: high-entropy-key'})]);
+  }
 });

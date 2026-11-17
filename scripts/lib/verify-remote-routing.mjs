@@ -51,55 +51,129 @@ function segmentParts(command) {
   return words ? { prefix, words } : null;
 }
 
-function wrappedVitestCommand(command) {
+function wrappedVitestCommand(command, checkoutWrapped, checkoutTestUnitWrapped) {
   const parts = segmentParts(command);
   if (!parts) return null;
   const { prefix, words } = parts;
-  if (words[0] !== 'npx' || words[1] !== 'vitest' || words[2] !== 'run') return null;
+  if (words[0] !== 'npx' || words[1] !== 'vitest' || !['run', 'related'].includes(words[2])) return null;
+  // Both rewrites below name the TARGET checkout's own WE wrapper (directly, or via its self-wrapped `test:unit`).
+  if (!checkoutWrapped()) return null;
+  const related = words[2] === 'related';
   const args = words.slice(3);
   // The nested wrapper and Forge both receive every original argument; Forge's allowlist accepts the
   // gate options (R314), so nothing is stripped. Options must be literal words: a quoted spelling stays local.
-  if (!args.length || args.some(arg => arg.startsWith("'-") || (arg.startsWith('-') && arg.includes("'")))) return null;
+  if (!args.length || args.some(arg => arg.startsWith("'-") || (arg.startsWith('-') && arg.includes("'") && !arg.startsWith("--outputFile.json='/")))) return null;
   // R335 widened the runner allowlist for the soak guard only (json report, --config); verify keeps those local.
-  if (args.some(arg => /^(?:--reporter=json|--outputFile|--config)\b/.test(unquote(arg)))) return null;
-  if (!allowedCommand(['npx', 'vitest', 'run', ...args.map(unquote)])) return null;
+  // The always-run guard (`run` + json reporter + ONE absolute outputFile, no config) is the one exception: the
+  // nested wrapper strips the path before Forge and writes the returned report back locally (fail-closed there).
+  const unquoted = args.map(unquote);
+  const reportArgs = unquoted.filter(arg => arg.startsWith('--outputFile'));
+  const guard = !related && reportArgs.length === 1 && /^--outputFile\.json=\/[^\0]+$/.test(reportArgs[0])
+    && !reportArgs[0].split('/').includes('..') && unquoted.includes('--reporter=json') && !unquoted.includes('--config');
+  if (!guard && unquoted.some(arg => /^(?:--reporter=json|--outputFile|--config)\b/.test(arg))) return null;
+  const checked = guard ? unquoted.map(arg => arg.startsWith('--outputFile') ? '--outputFile.json=guard-report.json' : arg) : unquoted;
+  if (!allowedCommand(['npx', 'vitest', words[2], ...checked])) return null;
+  if (guard) return `${prefix}node scripts/readiness/heavy-admission.mjs run -- npx vitest run ${args.join(' ')}`;
+  // `vitest related` has no package script: the nested heavy-admission wrapper maps `npx vitest related` itself
+  // (remote first, then its own local fallback), and Forge's allowlist already requires `--run` for it.
+  if (related) return `${prefix}node scripts/readiness/heavy-admission.mjs run -- npx vitest related ${args.join(' ')}`;
+  // `npm run test:unit` exists only where the checkout declares it, and owns admission only where it wraps itself.
+  // Any other checkout (plateau-app: `test` only) gets the wrapper directly, never a missing script (PR #6772).
+  if (!checkoutTestUnitWrapped()) return `${prefix}node scripts/readiness/heavy-admission.mjs run -- npx vitest run ${args.join(' ')}`;
   return `${prefix}npm run test:unit -- ${args.join(' ')}`;
 }
 
 // A package script that already wraps itself in heavy-admission (`npm run test:unit|check:standards`):
 // the nested wrapper owns remote dispatch and local fallback, so the segment is passed through verbatim.
-function wrappedNpmScript(command) {
+function wrappedNpmScript(command, checkoutStandardsWrapped = () => false) {
   const words = simpleShellWords(command)?.map(unquote);
   if (!words || words[0] !== 'npm' || words[1] !== 'run' || !['test:unit', 'check:standards'].includes(words[2])) return null;
   if (words.length > 3 && words[3] !== '--') return null;
   if (words[2] === 'test:unit' && words.slice(4).some(arg => arg.startsWith('-') && !allowedCommand(['npm', 'run', 'test:unit', '--', arg]))) return null;
-  return allowedCommand(words) ? command : null;
+  if (allowedCommand(words)) return command;
+  // `check:standards -- --scope=<session>` is a session-claim gate Forge's allowlist refuses by design. The package script
+  // wraps itself in heavy-admission, which owns that segment's remote-or-local choice, so it passes through verbatim and
+  // leaves the chain's vitest segments free to run remote. Only plain scope words; anything else keeps the chain local.
+  if (words[2] === 'check:standards' && words[3] === '--' && words.length > 4 && checkoutStandardsWrapped()
+    && words.slice(4).every(arg => /^--scope=[A-Za-z0-9_.\/:@%+,-]+$/.test(arg) && !arg.includes('..'))) return command;
+  return null;
 }
 
 // A gate built as `vitest run … && npm run check:standards && …` (the scan phase, the default gate's
 // phases, the whole `verify` gate `npm run test:unit && npm run check:standards`) is remote-eligible only
 // when EVERY top-level segment is; the shell keeps `&&` short-circuiting and each nested wrapper owns its
 // own fallback.
-function wrappedChain(command) {
-  const wrapped = command.split(' && ').map(segment => wrappedVitestCommand(segment) ?? wrappedNpmScript(segment));
+function wrappedChain(command, checkoutWrapped, checkoutTestUnitWrapped, checkoutStandardsWrapped) {
+  const wrapped = command.split(' && ').map(segment => wrappedVitestCommand(segment, checkoutWrapped, checkoutTestUnitWrapped) ?? wrappedNpmScript(segment, checkoutStandardsWrapped));
   return wrapped.every(Boolean) ? wrapped.join(' && ') : null;
 }
 
 // Only THIS checkout-independent wrapper (beside this module) owns its own admission; any other path is an ordinary command.
 export const SHARD_RUN_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'verify-shard-run.mjs');
-// Why a phase the wrapper cannot take stays local. `vitest related` is local by design today: Forge's allowlist
-// accepts it, but the nested heavy-admission wrapper maps only `vitest run`, so it never reaches the remote path.
-export function localPhaseReason(command) {
-  return command.split(' && ').some(segment => /^npx vitest related(?=\s|$)/.test(segment.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '')))
-    ? 'vitest-related-local-only' : 'raw-command';
+// The `npx vitest related|run` rewrites above name the TARGET checkout's own admission wrapper: `node <this path> run`
+// directly, or WE's self-wrapped `npm run test:unit`. A sibling checkout (plateau-app, frontierui) has neither, so a
+// rewrite there dies on a missing module before any test runs (PR #6769). Resolved against the checkout the gate runs in.
+export const CHECKOUT_ADMISSION_WRAPPER = 'scripts/readiness/heavy-admission.mjs';
+// Fail closed: an unreadable probe counts as absent, so the phase stays an ordinary local command under our own slot.
+function checkoutHasAdmissionWrapper(cwd, fileExists = existsSync) {
+  try { return fileExists(resolve(cwd, CHECKOUT_ADMISSION_WRAPPER)) === true; } catch { return false; }
+}
+// The checkout's own `test:unit` must be exactly WE's self-wrapped `vitest run`: a script that only mentions the wrapper
+// (`echo … && vitest run`) or wraps another runner (`… -- jest`, watch-mode `… -- vitest`) would run something else.
+// Unreadable, oversized (64 KiB bounded read, regular file only), malformed or missing counts as not wrapped.
+const SELF_WRAPPED_TEST_UNIT = /^node scripts\/readiness\/heavy-admission\.mjs run -- vitest run$/;
+const readCheckoutPackageJson = cwd => readBoundedReport(resolve(cwd, 'package.json'));
+const SELF_WRAPPED_STANDARDS = /^node scripts\/readiness\/heavy-admission\.mjs run -- node scripts\/check-standards\.mjs$/;
+function checkoutHasSelfWrappedStandards(cwd, readPackageJson = readCheckoutPackageJson) {
+  try {
+    const script = JSON.parse(readPackageJson(cwd))?.scripts?.['check:standards'];
+    return typeof script === 'string' && SELF_WRAPPED_STANDARDS.test(script);
+  } catch { return false; }
+}
+function checkoutHasSelfWrappedTestUnit(cwd, readPackageJson = readCheckoutPackageJson) {
+  try {
+    const script = JSON.parse(readPackageJson(cwd))?.scripts?.['test:unit'];
+    return typeof script === 'string' && SELF_WRAPPED_TEST_UNIT.test(script);
+  } catch { return false; }
+}
+const REWRITTEN_VITEST_SEGMENT = /^npx vitest (?:related|run)(?=\s|$)/;
+// Why a phase the wrapper cannot take stays local. A `vitest related` phase whose args Forge cannot run as written
+// (no `--run`, unknown flag, quoted option) still stays local; a clean one is wrapped in heavy-admission above.
+// With `cwd`, a vitest phase in a checkout without the admission wrapper names that as its reason instead.
+export function localPhaseReason(command, { cwd, fileExists } = {}) {
+  const segments = command.split(' && ').map(segment => segment.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, ''));
+  if (cwd !== undefined && segments.some(s => REWRITTEN_VITEST_SEGMENT.test(s)) && !checkoutHasAdmissionWrapper(cwd, fileExists)) {
+    return 'no-checkout-admission-wrapper';
+  }
+  return segments.some(segment => /^npx vitest related(?=\s|$)/.test(segment)) ? 'vitest-related-local-only' : 'raw-command';
 }
 
-export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {
+// Names the shape of a phase command for the fallback log: per `&&` segment, the tool, subcommand and flag NAMES only
+// (no env values, paths, test names or flag values), so an unwrapped shape is visible without leaking arguments.
+export function localPhaseShape(command) {
+  const shape = String(command ?? '').split(' && ').map((segment) => {
+    const rest = segment.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=(?:'(?:[^']|'\\'')*'|\S*)\s+)+/, '');
+    const words = rest.split(/\s+/).filter(Boolean);
+    const flags = [...new Set(words.filter(w => w.startsWith('--')).map(w => w.replace(/[=.].*$/, '')))];
+    const head = words.filter(w => !w.startsWith('-')).slice(0, words[0] === 'node' ? 1 : 3).map(w => w.replace(/[^\w:./-]/g, '').slice(0, 40));
+    return [...head, ...flags].join(' ');
+  });
+  return shape.join(' && ').slice(0, 200);
+}
+
+export function phaseAdmissionPlan({ command, decision, cwd = process.cwd(), fileExists = existsSync, readPackageJson = readCheckoutPackageJson }) {
   if (!/[;&|<>`$()\r\n]/.test(command.replace(/'(?:[^']|'\\'')*'/g, "''")) && command.startsWith(`node ${shellQuote(SHARD_RUN_SCRIPT)} `)) {
     return { command, takeLocalSlot: false, setHeld: false, shardWrapper: true };
   }
   if (command.split(' && ').every(segment => isVitestSegment(segment) || /^npm run (?:test:unit|check:standards)(?=\s|$)/.test(segment))) {
-    const wrapped = decision?.remote === true ? wrappedChain(command) : null;
+    // Probed lazily, only for a remote decision with a vitest segment to rewrite; a local decision never rewrites.
+    let probed;
+    const checkoutWrapped = () => (probed ??= checkoutHasAdmissionWrapper(cwd, fileExists));
+    let testUnitProbed;
+    const checkoutTestUnitWrapped = () => (testUnitProbed ??= checkoutHasSelfWrappedTestUnit(cwd, readPackageJson));
+    let standardsProbed;
+    const checkoutStandardsWrapped = () => (standardsProbed ??= checkoutHasSelfWrappedStandards(cwd, readPackageJson) && checkoutTestUnitWrapped());
+    const wrapped = decision?.remote === true ? wrappedChain(command, checkoutWrapped, checkoutTestUnitWrapped, checkoutStandardsWrapped) : null;
     if (wrapped || command.split(' && ').some(isVitestSegment)) {
       return { command: wrapped ?? command, takeLocalSlot: !wrapped, setHeld: !wrapped };
     }

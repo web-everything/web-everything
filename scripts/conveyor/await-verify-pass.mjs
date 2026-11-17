@@ -22,12 +22,16 @@
  *
  * The gate is never weakened: nothing is pushed unless {@link classifyAwaitVerdict} answers `push`, and the push
  * names the verdict's own sha. Pure core + injectable IO, like we:scripts/conveyor/load-flake-reverify.mjs.
+ * Settings: fix.awaitDeliveredStaleMs via policy-cascade (standard 30 min → platform → tool → env WE_AWAIT_VERIFY_DELIVERED_STALE_MS); invalid layers fall through.
  */
 import { execFileSync } from 'node:child_process';
+import { isDeepStrictEqual } from 'node:util';
 import { lstatSync, mkdtempSync, rmSync, existsSync, mkdirSync, copyFileSync, realpathSync } from 'node:fs';
 import { tmpdir, loadavg, cpus } from 'node:os';
 import { legacyLoadQuiet, reverifyConfig } from './load-flake-reverify.mjs';
 import { join, resolve, dirname, sep } from 'node:path';
+import { resolveCascade, platformPreference } from '../lib/policy-cascade.mjs';
+import { readSettings } from '../lib/settings-files.mjs';
 import { fileURLToPath } from 'node:url';
 import {
   listStoredAwaitVerify, writeStoredAwaitVerify, clearStoredAwaitVerify, clearStoredAwaitVerifyIf,
@@ -50,6 +54,8 @@ import { fixPushGate } from '../lib/review-timing.mjs';
 import { fenceUntrusted, FENCED_DATA_RULE } from '../lib/mandate-fence.mjs';
 import { readReviewHead, readReviewChecks } from '../lib/review-ci-gate-io.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
+import { headCiVerdict } from './fix-push-ci.mjs';
+import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { listSalvage, writeSalvage, clearSalvage, planSalvage, resolveSalvageTuning, salvageKey, stashCommit, salvageStoreDir } from './verified-push-salvage.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -57,7 +63,26 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 /** Policy limits. `maxReds` counts the record's own `attempt` (the fixer bumps it on each re-mark). */
 /** Longest one load deferral may wait for a quiet host before the red follows the normal ladder (2h). */
 export const AWAIT_LOAD_DEFER_MAX_MS = 2 * 60 * 60_000;
-export const AWAIT_VERIFY_LIMITS = Object.freeze({ maxReds: 3, maxRetries: 2, maxResumeFailures: 3, selfReviewMaxMs: 30 * 60_000 });
+export const AWAIT_VERIFY_LIMITS = Object.freeze({ maxReds: 3, maxRetries: 2, maxResumeFailures: 3, selfReviewMaxMs: 30 * 60_000, deliveredStaleMs: 30 * 60_000 });
+/** Delivered-stale window through policy-cascade (standard → platform → tool `fix.awaitDeliveredStaleMs` → env). Returns ms and source layer. */
+export function resolveDeliveredStale(env = process.env, { platform, tool, defaultMs = AWAIT_VERIFY_LIMITS.deliveredStaleMs } = {}) {
+  const raw = env?.WE_AWAIT_VERIFY_DELIVERED_STALE_MS;
+  const envMs = /^\d+$/.test(String(raw ?? '')) ? Number(raw) : undefined;
+  const r = resolveCascade({
+    standard: { awaitDeliveredStaleMs: defaultMs }, platform, tool,
+    envValues: { awaitDeliveredStaleMs: envMs },
+    valid: { awaitDeliveredStaleMs: v => Number.isSafeInteger(v) && v > 0 },
+  });
+  return { ms: r.value.awaitDeliveredStaleMs, source: r.sources.awaitDeliveredStaleMs ?? 'standard' };
+}
+export function resolveDeliveredStaleMs(env = process.env, opts = {}) { return resolveDeliveredStale(env, opts).ms; }
+/** IO only: read the platform/tool layers (missing or unreadable ones fall back). */
+function readDeliveredStale(env = process.env, defaultMs) {
+  let tool, platform;
+  try { tool = readSettings()?.fix; } catch { /* absent tool layer */ }
+  try { platform = platformPreference('fix', { env }); } catch { /* absent platform layer */ }
+  return resolveDeliveredStale(env, { platform, tool, defaultMs });
+}
 /** Repo keys with a quiet-host reverify worker (mirrors stand-down.mjs#LOAD_FLAKE_REVERIFY_REPOS). */
 export const AWAIT_LOAD_FLAKE_REPO_KEYS = Object.freeze(['we']);
 const repoKeyOrNull = (slug) => { try { return repoKeyForSlug(slug) ?? null; } catch { return null; } };
@@ -217,6 +242,10 @@ export function buildAwaitVerifyResumePrompt({ kind, record, marker = null, deta
   switch (kind) {
     case 'previous-ci':
       return `${head}\n\nThe previous PR head's CI completed with failures. The harness has withheld this push. Repair these failures in the same lane, commit, run \`verify-lane.mjs request\`, then ${next.charAt(0).toLowerCase()}${next.slice(1)} Do not push ${record.ref} yourself.\n\nPrevious-head CI failures:\n${FENCED_DATA_RULE}\n${fenceUntrusted('material', JSON.stringify(record.previousCi.ready.ciFailures))}`;
+    case 'ci-red': {
+      const c = record.pendingResume?.ciRed ?? {};
+      return `${head}\n\nLocal verify failed only on infrastructure (no test verdict), but the required CI check on this same head (${c.sha ?? record.sha}) FAILED for real (CI run ${c.runId}). The harness has stopped re-requesting local verify. ${c.escalate ? `This is attempt ${record.attempt} (limit ${AWAIT_VERIFY_LIMITS.maxReds}): do not attempt another repair. Take your ${brief(record)}'s gate-red exit (stand-down --reason=gate-red with the failing jobs below, completion report, fix-end).` : `Repair these failing jobs in the same lane, commit, run \`verify-lane.mjs request\`, then ${next.charAt(0).toLowerCase()}${next.slice(1)} Do not push ${record.ref} yourself.`}\n\nFailing CI jobs (run ${c.runId}):\n${FENCED_DATA_RULE}\n${fenceUntrusted('material', JSON.stringify(c.failures ?? []))}${c.escalate ? '' : earlyRed}`;
+    }
     case 'green': {
       const pushed = `Verify is GREEN for exactly this sha and the harness has PUSHED it to ${record.ref}${detail ? ` (${detail})` : ''}. Do not push ${record.ref} again.`;
       // The two briefs end differently: a CI-heal's only PR write is the restart-surviving tally comment (no evidence comment, no hand-back).
@@ -224,7 +253,7 @@ export function buildAwaitVerifyResumePrompt({ kind, record, marker = null, deta
         ? `${head}\n\n${pushed} Continue your ${brief(record)} at step 7: post the durable CI-heal comment (\`ci-heal-mark.mjs\` — the attempt tally that survives restarts), then its completion report (\`--outcome=no-change|healed\`) and fix-end. Touch no label.`
         : record.pendingResume?.selfReviewOverdue
           ? `${head}\n\n${pushed} BUT your parallel self-review has not reported (${record.pendingResume.selfReviewOverdue}). Do not hand back yet: if it is still running, wait for its report; if it was lost, run it again now (blocking). Record its verdict with \`node "${ROOT}/scripts/conveyor/await-verify.mjs" self-review clean|must-fix --repo=${record.repo} --pr=${record.pr} --who=${record.who}\`. must-fix → repair with a NEW commit, \`verify-lane.mjs request\`, mark again (same --attempt) and end your turn. clean → continue your ${brief(record)} from the step after the push. fix-end refuses a hand-back release while the self-review is open.`
-          : `${head}\n\n${pushed} Continue your ${brief(record)} from the step after the push: post the before/after evidence comment (cite this green verdict), then the hand-back and the closing completion report + fix-end.`;
+          : `${head}\n\n${pushed} Continue your ${brief(record)} from the step after the push: post the before/after evidence comment (cite this green verdict), then the hand-back and the closing completion report + fix-end. If the PR has an open operator send-back (the quoted must-fix bodies at the top of your brief), that comment must ALSO start with the standalone heading \`## Fix evidence\`, carry \`Head: ${record.sha}\`, one \`<!-- addresses-operator-send-back: <id> -->\` marker per open send-back you addressed, and a file:line citation per item; without it the review reads the send-back as unaddressed and the PR is sent back to another fixer.`;
     }
     case 'no-new-commit': {
       const remote = `The remote branch (${record.ref}) already had this exact sha when the harness tried to push it (upToDate).`;
@@ -428,6 +457,102 @@ async function previousCiPushGate({ io, record, nowMs, policy, persist }) {
   return decision;
 }
 
+/** verify.infraFallbackToCi: standard ON; WE_VERIFY_INFRA_FALLBACK_TO_CI=0|false|off, else the tool layer's `verify.infraFallbackToCi`. */
+export function resolveInfraFallbackToCi({ env = process.env, tool } = {}) {
+  const raw = String(env?.WE_VERIFY_INFRA_FALLBACK_TO_CI ?? '').trim().toLowerCase();
+  if (['0', 'false', 'off'].includes(raw)) return { enabled: false, source: 'environment' };
+  if (['1', 'true', 'on'].includes(raw)) return { enabled: true, source: 'environment' };
+  if (typeof tool?.infraFallbackToCi === 'boolean') return { enabled: tool.infraFallbackToCi, source: 'tool' };
+  return { enabled: true, source: 'standard' };
+}
+/**
+ * An infrastructure-only local verify failure (no test verdict) whose retries are spent is settled by CI: the exact pushed
+ * head's required `test` check must be green (and every other required check). Anything unreadable, partial, for another
+ * head, or not a plain infrastructure failure returns null, so today's infra ladder stands. A real red is never masked.
+ */
+async function infraCiGreenFallback({ io, record, marker, lane }) {
+  try {
+    if (!lane?.head || lower(lane.head) !== lower(record.sha) || lane.dirty) return null; // the lane must still be the pushed head, clean
+    const setting = typeof io.infraFallbackToCi === 'function' ? io.infraFallbackToCi() : null;
+    if (setting?.enabled !== true || record?.kind !== 'fix' || marker?.status !== 'infrastructure-failure') return null;
+    // Plainly: the fallback applies ONLY to a process the harness killed (an infrastructure block with a timeout or signal
+    // reason, no verdict). verifyFinishBody drops failing-test names for an infrastructure failure, so their absence proves
+    // nothing; the kill reason is the evidence. Any other infra reason (e.g. verify-unsettled) keeps the retry ladder.
+    if (!['verify-timeout', 'verify-signal'].includes(marker.infrastructure?.reason)) return null;
+    if (!record.earlyPush?.ok || lower(record.earlyPush.sha) !== lower(record.sha)) return null;
+    if (typeof io.readPreviousHead !== 'function' || typeof io.readPreviousRequired !== 'function' || typeof io.readPreviousChecks !== 'function') return null;
+    if (lower(await io.readPreviousHead({ repo: record.repo, pr: record.pr })) !== lower(record.sha)) return null;
+    const requiredRead = await io.readPreviousRequired({ repo: record.repo, ttlMs: 0 });
+    if (requiredRead?.source !== 'live') return null; // cache / fallback / declared sets are not proof of what is required now
+    const required = requiredRead.checks ?? [];
+    if (!required.includes('test')) return null;
+    const checks = await io.readPreviousChecks({ repo: record.repo, headSha: record.sha });
+    if (headCiVerdict(checks, required) !== 'green') return null;
+    // SKIPPED / NEUTRAL count as passed to the push gate; a fallback for a failed local verify needs a real pass.
+    const strict = name => (Array.isArray(checks) ? checks : []).filter(r => (r?.name || r?.context) === name).every(r =>
+      (r.status ? String(r.status).toUpperCase() === 'COMPLETED' && String(r.conclusion).toUpperCase() === 'SUCCESS' : String(r.state).toUpperCase() === 'SUCCESS'));
+    if (!required.every(name => (checks ?? []).some(r => (r?.name || r?.context) === name) && strict(name))) return null;
+    // The reads above are async: the PR head, lane and verdict must still be what was decided on.
+    if (lower(await io.readPreviousHead({ repo: record.repo, pr: record.pr })) !== lower(record.sha)) return null;
+    const nowLane = io.laneState(record.lane);
+    if (!nowLane?.head || lower(nowLane.head) !== lower(record.sha) || nowLane.dirty) return null;
+    if (io.readMarker(record.lane)?.status !== 'infrastructure-failure') return null;
+    return `required CI green on pushed head ${String(record.sha).slice(0, 8)}; verify.infraFallbackToCi=on (${setting.source ?? 'standard'})`;
+  } catch { return null; }
+}
+
+const CI_RUN_RE = /\/actions\/runs\/(\d+)(?:\/|$|\?)/;
+/**
+ * The opposite of the CI-green fallback: an infrastructure-only local verify failure while the required `test` check on the
+ * SAME pushed head has really failed (conclusion exactly FAILURE, with no upstream infra/unknown results).
+ * Returns `{ sha, runId, failures }` or null (fails closed: unreadable / partial / other head / no run id keeps the ladder).
+ */
+async function infraCiRedEvidence({ io, record, marker, lane, limits = AWAIT_VERIFY_LIMITS }) {
+  try {
+    if (record?.kind !== 'fix' || marker?.status !== 'infrastructure-failure' || lower(marker.sha) !== lower(record.sha)) return null;
+    if (!lane?.head || lower(lane.head) !== lower(record.sha) || lane.dirty) return null;
+    if (typeof io.readPreviousHead !== 'function' || typeof io.readPreviousRequired !== 'function' || typeof io.readPreviousChecks !== 'function') return null;
+    if (lower(await io.readPreviousHead({ repo: record.repo, pr: record.pr })) !== lower(record.sha)) return null;
+    const required = (await io.readPreviousRequired({ repo: record.repo, ttlMs: 0 }));
+    if (required?.source !== 'live' || !(required.checks ?? []).includes('test')) return null;
+    const rows = collapseRollupToLatestPerName(await io.readPreviousChecks({ repo: record.repo, headSha: record.sha }));
+    const isFailure = r => (r?.status ? String(r.status).toUpperCase() === 'COMPLETED' && String(r.conclusion).toUpperCase() === 'FAILURE' : String(r?.state).toUpperCase() === 'FAILURE');
+    const test = rows.find(r => (r?.name || r?.context) === 'test');
+    if (!test || !isFailure(test)) return null;
+    // `test` can be an aggregate: ci.yml fails it when a dependency merely times out or does not run.
+    // FAILURE alone (even on multiple aggregates) cannot distinguish that from a repairable red.
+    // Without a dependency graph, conservatively require every latest row to have run to success/failure;
+    // infra, skipped/neutral, pending and unknown evidence all leave the existing infra ladder in charge.
+    const isSuccess = r => (r?.status ? String(r.status).toUpperCase() === 'COMPLETED'
+      && String(r.conclusion).toUpperCase() === 'SUCCESS' : String(r?.state).toUpperCase() === 'SUCCESS');
+    if (rows.some(r => !isFailure(r) && !isSuccess(r))) return null;
+    const runId = CI_RUN_RE.exec(String(test.detailsUrl ?? test.details_url ?? test.targetUrl ?? test.target_url ?? ''))?.[1];
+    if (!runId) return null;
+    const failures = rows.filter(isFailure).map(r => String(r.name || r.context)).slice(0, 20);
+    // The reads are async: the PR head and lane must still be what was decided on.
+    if (lower(await io.readPreviousHead({ repo: record.repo, pr: record.pr })) !== lower(record.sha)) return null;
+    const now = io.laneState(record.lane);
+    if (!now?.head || lower(now.head) !== lower(record.sha) || now.dirty) return null;
+    const again = io.readMarker(record.lane);
+    if (again?.status !== 'infrastructure-failure' || lower(again.sha) !== lower(record.sha)) return null;
+    return { sha: lower(record.sha), runId, failures, ...((record.attempt ?? 1) >= limits.maxReds ? { escalate: true } : {}) };
+  } catch { return null; }
+}
+
+/**
+ * A persisted ci-red resume may be delivered many ticks later (busy / paused session). Reuse every admission guard,
+ * including the local lane and marker checks before and after async CI reads, then bind delivery to the SAME failed run.
+ * Delivery is once per wait record (cleared on success); a new verify request is evaluated independently.
+ */
+async function ciRedStillFailing({ io, record, limits }) {
+  try {
+    const c = record?.pendingResume?.ciRed;
+    if (!c?.runId || lower(c.sha) !== lower(record.sha)) return false;
+    const current = await infraCiRedEvidence({ io, record, lane: io.laneState(record.lane), marker: io.readMarker(record.lane), limits });
+    return current?.runId === c.runId;
+  } catch { return false; }
+}
+
 /**
  * Apply the policy to every stored record once. Every effect is an injected port, so the whole pass replays
  * offline (see the test's fix-4115 replay).
@@ -451,12 +576,29 @@ export async function runAwaitVerifyPass({
   // fix.pushBeforeGate (we:scripts/lib/fix-push-policy.mjs): an injected policy wins; else the IO's own; else OFF (today's flow).
   const policy = pushPolicy ?? (typeof io.pushPolicy === 'function' ? io.pushPolicy() : null);
   const recovery = retryPolicy ?? io.retryPolicy?.() ?? loadVerifyRecoverySettings();
+  const deliveredStale = readDeliveredStale(process.env, limits.deliveredStaleMs ?? AWAIT_VERIFY_LIMITS.deliveredStaleMs);
+  const deliveredStaleMs = deliveredStale.ms;
   for (const { key, record: stored } of io.listRecords()) {
     let record = stored;
     const row = { key, pr: record?.pr ?? null, repo: record?.repo ?? null, sha: record?.sha ?? null };
     try {
       if (previousCiFailurePending(record) && record.pendingResume?.delivered) {
-        rows.push({ ...row, action: 'wait', reason: 'previous-head CI repair must be verified and re-marked' });
+        Object.assign(row, { action: 'wait', reason: 'previous-head CI repair must be verified and re-marked' });
+        const session = lookupAwaitSession(record, io.listSessions());
+        const deliveredAt = Date.parse(record.pendingResume.deliveredAt ?? record.requestedAt);
+        const stale = Number.isFinite(deliveredAt) && nowMs - deliveredAt > deliveredStaleMs;
+        if (!session || (!isSessionBusy(session) && stale)) {
+          // A fresh fixer reads live CI; retire the inventory even though clearOrNote would retain it.
+          // Compare-and-delete when the IO offers it: a concurrent re-mark must never lose its newer record.
+          const retired = typeof io.clearStoredRecordIf === 'function' ? io.clearStoredRecordIf(key, record) : io.clearRecord(key, record);
+          if ((await retired)?.cleared !== false && (typeof io.clearStoredRecordIf !== 'function' || (await retired)?.cleared === true)) {
+            const why = session ? 'session idle past stale window' : 'session gone';
+            rows.push({ ...row, action: 'resume', reason: 'delivered-repair-abandoned',
+              result: `delivered previous-head CI repair abandoned (${why}); record retired so a fresh fixer is admitted; fix.awaitDeliveredStaleMs=${deliveredStaleMs} (${deliveredStale.source})` });
+            continue;
+          }
+        }
+        rows.push(row);
         continue;
       }
       if (previousCiFailurePending(record) && (record.resumeFailures ?? 0) >= limits.maxResumeFailures) {
@@ -464,7 +606,7 @@ export async function runAwaitVerifyPass({
         continue;
       }
       // Adopt an infra resume left by an older daemon before it can spend another model turn.
-      if (record?.kind === 'fix' && record.pendingResume?.kind === 'infra') {
+      if (record?.kind === 'fix' && record.pendingResume?.kind === 'infra' && !record.infraRetry?.blocked) {
         record = { ...record }; delete record.pendingResume;
       }
       const pendingNoOp = record?.pendingResume?.kind === 'no-new-commit';
@@ -558,15 +700,69 @@ export async function runAwaitVerifyPass({
         }
         rows.push(row); continue;
       }
-      if (record?.kind === 'fix' && (d.resume === 'infra' || (record.infraRetry?.scheduled && d.action === 'wait'))) {
+      // Either CI fallback may await remote reads. Snapshot the evidence behind the local infra decision,
+      // including in-place mutations, so rejection cannot fall through to an obsolete terminal infra exit.
+      const infraLocalEvidence = record?.kind === 'fix' && !record.pendingResume
+        && (marker?.status === 'infrastructure-failure' || d.resume === 'infra')
+        ? structuredClone({ lane, marker }) : null;
+      // "Retries spent" means the infra ladder is spent (exhausted, or attempts >= maxAttempts); a first kill keeps the ladder.
+      if (record?.kind === 'fix' && d.resume !== 'void' && !record.pendingResume && (record.infraRetry?.exhausted
+        || (record.infraRetry?.attempts ?? 0) >= (recovery.value.infraRetry?.maxAttempts ?? Infinity))) {
+        const fallback = await infraCiGreenFallback({ io, record, marker, lane });
+        if (fallback) {
+          // skipPush: the head is already on the remote (early push, PR head re-read above); a second push would be refused by the
+          // claim binding (live #6693 08:12Z, push-refused) and adds nothing, so the round is handed back as the post-push path does.
+          d = { action: 'push', skipPush: true, reason: `infra-ci-green-fallback: ${fallback}` };
+          Object.assign(row, { action: d.action, reason: d.reason });
+        }
+      }
+      if (record?.kind === 'fix' && !record.pendingResume && marker?.status === 'infrastructure-failure'
+        && ['rerequest', 'wait'].includes(d.action) || (record?.kind === 'fix' && !record.pendingResume && d.resume === 'infra')) {
+        const ciRed = await infraCiRedEvidence({ io, record, marker, lane, limits });
+        if (ciRed) {
+          d = { action: 'resume', resume: 'ci-red', ciRed, reason: `infra-ci-red: required CI failed on pushed head ${ciRed.sha.slice(0, 8)} (run ${ciRed.runId}): ${ciRed.failures.join(', ')}` };
+          Object.assign(row, { action: d.action, reason: d.reason });
+        }
+      }
+      if (infraLocalEvidence && !isDeepStrictEqual(infraLocalEvidence,
+        { lane: io.laneState(record.lane), marker: io.readMarker(record.lane) })) {
+        // Retain the waiter: the next tick classifies the current verdict, including red/load/void handling.
+        rows.push({ ...row, action: 'wait', reason: 'infra-local-evidence-changed' });
+        continue;
+      }
+      if (record?.kind === 'fix' && d.resume !== 'ci-red' && (d.resume === 'infra'
+        || (record.infraRetry?.scheduled && d.action === 'wait')
+        || (record.infraRetry?.freshVerify && ['wait', 'rerequest'].includes(d.action)))) {
         const { maxAttempts, backoffMinutes } = recovery.value.infraRetry;
         const source = key => recovery.sources?.[`infraRetry.${key}`] ?? 'standard';
-        row.reason = `${d.reason}; verify.infraRetry.maxAttempts=${maxAttempts} (${source('maxAttempts')}), backoffMinutes=${backoffMinutes} (${source('backoffMinutes')})`;
         const retry = record.infraRetry;
-        if ((retry?.attempts ?? 0) >= maxAttempts) {
-          row.action = retry?.exhausted ? 'wait' : 'infra-retry-exhausted';
-          // Preserve the same-head wait. Exhaustion is an infrastructure hold, never new fixer work.
-          if (!retry?.exhausted) persist({ ...record, infraRetry: { ...retry, exhausted: true } });
+        const step = retry?.blocked?.step ?? marker?.infrastructure?.reason ?? 'unknown';
+        const detail = String(retry?.blocked?.detail ?? marker?.infrastructure?.detail ?? '').slice(0, 160);
+        row.reason = `${d.reason}; verify.infraRetry.maxAttempts=${maxAttempts} (${source('maxAttempts')}), backoffMinutes=${backoffMinutes} (${source('backoffMinutes')}); step=${step} detail=${detail}`;
+        if (retry?.exhausted || (retry?.attempts ?? 0) >= maxAttempts) {
+          if (!retry?.freshVerify && !retry?.blocked) {
+            row.action = 'infra-fresh-verify';
+            // Persist intent before the effect: even an unconfirmed request is never sent twice for this head.
+            if (persist({ ...record, requestedAt: new Date(nowMs).toISOString(), infraRetry: {
+              ...retry, exhausted: true, freshVerify: { requestedAt: new Date(nowMs).toISOString() },
+            } })) {
+              const r = io.rerequest(record.lane);
+              row.result = r?.status ?? (r?.ok ? 'requested' : 'request-failed');
+            }
+            rows.push(row); continue;
+          }
+          if (!retry.blocked && d.action === 'wait'
+            && nowMs - Date.parse(retry.freshVerify.requestedAt) <= ttlMs) {
+            row.action = 'infra-fresh-verify';
+            rows.push(row); continue;
+          }
+          row.action = 'infra-blocked';
+          row.blocked = retry.blocked ?? { at: new Date(nowMs).toISOString(), step, detail };
+          if (!retry.blocked && !persist({ ...record, infraRetry: { ...retry, blocked: row.blocked } })) {
+            rows.push(row); continue;
+          }
+          // Use the normal terminal infra handoff below; it delivers the blocked-on-infra exit and clears the wait.
+          d = { action: 'resume', resume: 'infra', reason: row.reason };
         } else if (!retry?.scheduled) {
           row.action = 'infra-retry-scheduled';
           persist({ ...record, requestedAt: new Date(nowMs).toISOString(), infraRetry: {
@@ -584,7 +780,7 @@ export async function runAwaitVerifyPass({
             row.result = r?.status ?? (r?.ok ? 'requested' : 'request-failed');
           }
         }
-        rows.push(row); continue;
+        if (row.action !== 'infra-blocked') { rows.push(row); continue; }
       }
       if (record?.kind === 'fix' && !record.pendingResume && record.earlyPush?.ok && record.earlyPush.upToDate
         && (record.attempt ?? 1) === 1 && record.earlyPush.attempts === 1
@@ -625,7 +821,8 @@ export async function runAwaitVerifyPass({
         const srNote = gate.note;
         const attempt = record.pushRetries ?? 0;
         if (!persist({ ...record, pushRetries: attempt + 1 })) { rows.push(row); continue; }
-        const pushed = io.push({ lane: record.lane, sha: record.sha, ref: record.ref, repo: record.repo, pr: record.pr, who: record.who, sessionId: record.sessionId });
+        const pushed = d.skipPush ? { ok: true, upToDate: true }
+          : io.push({ lane: record.lane, sha: record.sha, ref: record.ref, repo: record.repo, pr: record.pr, who: record.who, sessionId: record.sessionId });
         if (!pushed?.ok && pushed?.transient && attempt < limits.maxRetries) {
           // A network/auth hiccup is not a moved branch: retry the same push next tick (the attempt is already counted).
           row.result = `push-retry (${pushed.reason})`;
@@ -644,7 +841,7 @@ export async function runAwaitVerifyPass({
         if (pushed?.ok && srNote) row.result += `; ${srNote}`;
         if (pushed?.ok && srOverdue) row.result += `; ${srOverdue} — OVERDUE, resumed with finish-the-review`;
       } else if (!pending) {
-        pending = { kind: d.resume, detail: d.reason, ...(d.selfReviewOverdue ? { selfReviewOverdue: d.selfReviewOverdue } : {}) };
+        pending = { kind: d.resume, detail: d.reason, ...(d.ciRed ? { ciRed: d.ciRed } : {}), ...(d.selfReviewOverdue ? { selfReviewOverdue: d.selfReviewOverdue } : {}) };
       }
       if (!record.pendingResume) {
         // Keep the marker's failure detail on the record: the next tick may need to re-send this message.
@@ -656,6 +853,12 @@ export async function runAwaitVerifyPass({
         const gate = selfReviewGate({ io, record, nowMs, limits });
         if (gate.hold && !gate.overdue) { holdHandBack(row, record, gate, persist, nowMs, record.pendingResume.kind); rows.push(row); continue; }
         if (gate.overdue && !persist({ ...record, pendingResume: { ...record.pendingResume, selfReviewOverdue: gate.overdue } })) { rows.push(row); continue; }
+      }
+      if (record.pendingResume?.kind === 'ci-red' && !d.ciRed && !(await ciRedStillFailing({ io, record, limits }))) {
+        // Superseded (local evidence changed / CI went green / head moved / another run): re-decide live next tick.
+        const { pendingResume: _dropped, ...rest } = record;
+        if (persist(rest)) row.result = 'ci-red-superseded; resume dropped';
+        rows.push(row); continue;
       }
       const session = lookupAwaitSession(record, io.listSessions());
       if (!session) {
@@ -674,7 +877,7 @@ export async function runAwaitVerifyPass({
         if (previousCiFailurePending(record)) {
           // Retain the inventory until the fixer re-marks and the follow-up push succeeds.
           // A delivered message must not wake the session again on every daemon tick.
-          if (persist({ ...record, pendingResume: { ...record.pendingResume, delivered: true } })) {
+          if (persist({ ...record, pendingResume: { ...record.pendingResume, delivered: true, deliveredAt: new Date(nowMs).toISOString() } })) {
             row.result = `resumed:${record.pendingResume.kind}; previous-head CI failures retained`;
           }
           rows.push(row); continue;
@@ -953,6 +1156,7 @@ export async function defaultAwaitVerifyIo({
     readPreviousChecks: readReviewChecks,
     readPreviousRequired: getRequiredStatusChecks,
     retryPolicy: () => loadVerifyRecoverySettings({ env }),
+    infraFallbackToCi: () => { let tool; try { tool = readSettings()?.verify; } catch { /* absent tool layer */ } return resolveInfraFallbackToCi({ env, tool }); },
     loadHigh: () => {
       try { return !legacyLoadQuiet(loadavg(), cpus().length, reverifyConfig(env)); }
       catch { return false; }

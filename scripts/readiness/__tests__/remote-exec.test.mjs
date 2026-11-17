@@ -2054,6 +2054,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     return vi.fn(async call => {
       expect(call.file).toBe('git');
       const binding=bindingEvidence(call);if(binding)return binding;
+      if (gitArgs(call)[0] === 'merge-base') return {code:1, stdout:Buffer.alloc(0)};
       expect(call.args).toContain('-z');
       if (gitArgs(call)[0] === 'ls-tree') {
         expect(gitArgs(call)).toEqual(['ls-tree', '-r', '-z', 'origin/main']);
@@ -2110,7 +2111,10 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     if (parts.length > 1) mkdirSync(join(cwd, parts[0]));
     writeFileSync(join(cwd, name), 'must run');
     f.listFiles.mockResolvedValue(['package-lock.json', name]);
-    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+    const result = await runRemote(f);
+    expect(result).toMatchObject({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+    expect(result.detail).toMatch(/^.+: (credential-named-not-identical-to-main|excluded-policy-test)$/);
+    expect(result.detail.startsWith(name + ': ')).toBe(true);
     expect(callsOf(f.exec).some(isRun)).toBe(false);
     expect(callsOf(f.exec).some(call => call.file === 'rsync')).toBe(false);
     expect(await runRemoteCli({...f, log:vi.fn()})).toBe(7);
@@ -2129,7 +2133,10 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     writeFileSync(join(cwd, name), 'must run locally');
     f.listFiles.mockResolvedValue(['package-lock.json', 'a.test.mjs', name]);
 
-    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+    const result = await runRemote(f);
+    expect(result).toMatchObject({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+    expect(result.detail).toMatch(/^.+: (credential-named-not-identical-to-main|excluded-policy-test)$/);
+    expect(result.detail.startsWith(name + ': ')).toBe(true);
     expect(await runRemoteCli({...f, log:vi.fn()})).toBe(7);
     expect(f.local).toHaveBeenCalledTimes(1);
     expect(f.local).toHaveBeenCalledWith(f.argv);
@@ -2197,7 +2204,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
         .rejects.toMatchObject({message:'Excluded source: use local fallback', code:'excluded-source-file'});
       const exec = acceptingTransport(paths, index);
       expect(await runRemote({argv, cwd, runId, exec}))
-        .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+        .toMatchObject({mode:'not-started', terminated:true, reason:'excluded-source-file', detail:expect.stringMatching(/^.+: [a-z-]+$/)});
       const local = vi.fn(async () => 7);
       expect(await runRemoteCli({argv, cwd, runId, exec, local, lockRoot:join(cwd,'heavy'), log:vi.fn()})).toBe(7);
       expect(local).toHaveBeenCalledWith(argv);
@@ -2267,7 +2274,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     const exec = acceptingTransport(paths, indexRecord(name, 'must run locally'));
     await expect(build({cwd, exec})).rejects.toMatchObject({code:'excluded-source-file'});
     expect(await runRemote({argv, cwd, runId, exec}))
-      .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+      .toMatchObject({mode:'not-started', terminated:true, reason:'excluded-source-file', detail:expect.stringMatching(/^.+: [a-z-]+$/)});
     expect(callsOf(exec).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
   });
 
@@ -2340,6 +2347,44 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     const manifest = await build({cwd, exec:gitInventory(paths, indexRecord(name, data), {code:0, stdout:treeRecord(name, data)})});
     expect(manifest.entries.map(entry => entry.path)).toEqual(paths);
     expect(manifest.excluded).toEqual([]);
+  });
+
+  // R907: identical to the branch's merge-base blob = already public (main changed it after the fork).
+  describe('credential-named file vs merge-base', () => {
+    const base = 'b'.repeat(40);
+    const baseExec = (paths, index, mainTree, baseTree) => {
+      const inner = gitInventory(paths, index);
+      return vi.fn(async call => {
+        const args = gitArgs(call);
+        if (call.file === 'git' && args[0] === 'merge-base') return {code:0, stdout:Buffer.from(base+'\n')};
+        if (call.file === 'git' && args[0] === 'ls-tree') return {code:0, stdout:args.at(-1) === base ? baseTree : mainTree};
+        return inner(call);
+      });
+    };
+    it('ships a file untouched by the branch although main changed it since the fork', async () => {
+      const name = 'scripts/__tests__/secret-scrub.test.mjs';
+      mkdirSync(join(cwd,'scripts/__tests__'),{recursive:true});
+      writeFileSync(join(cwd,name),'old public');
+      const paths = [Buffer.from(name)];
+      const manifest = await build({cwd, exec:baseExec(paths, indexRecord(name,'old public'), treeRecord(name,'new public on main'), treeRecord(name,'old public'))});
+      expect(manifest.entries.map(entry => entry.path)).toEqual(paths);
+    });
+    it('still falls back locally when the branch changed the file', async () => {
+      const name = 'scripts/__tests__/secret-scrub.test.mjs';
+      mkdirSync(join(cwd,'scripts/__tests__'),{recursive:true});
+      writeFileSync(join(cwd,name),'branch edit');
+      const paths = [Buffer.from(name)];
+      await expect(build({cwd, exec:baseExec(paths, indexRecord(name,'branch edit'), treeRecord(name,'new public on main'), treeRecord(name,'old public'))}))
+        .rejects.toMatchObject({code:'excluded-source-file', detail:expect.stringContaining('credential-named-not-identical-to-main')});
+    });
+    it('refuses private working bytes even when the index equals the merge-base blob', async () => {
+      const name = 'scripts/__tests__/secret-scrub.test.mjs';
+      mkdirSync(join(cwd,'scripts/__tests__'),{recursive:true});
+      writeFileSync(join(cwd,name),'unstaged private');
+      const paths = [Buffer.from(name)];
+      await expect(build({cwd, exec:baseExec(paths, indexRecord(name,'old public'), treeRecord(name,'new public on main'), treeRecord(name,'old public'))}))
+        .rejects.toMatchObject({code:'excluded-source-file', detail:expect.stringContaining('credential-named-content-differs-from-main')});
+    });
   });
 
   it.each(['secret.pem', '.secrets/safe.md', 'secret.key/safe.md'])
@@ -2434,7 +2479,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
       .rejects.toMatchObject({message:'Excluded source: use local fallback', code:'excluded-source-file'});
     const refused = acceptingTransport(excludedPaths, excludedStage);
     expect(await runRemote({argv, cwd, runId, exec:refused}))
-      .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+      .toMatchObject({mode:'not-started', terminated:true, reason:'excluded-source-file', detail:expect.stringMatching(/^.+: [a-z-]+$/)});
     expect(callsOf(refused).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
   });
 
@@ -2505,7 +2550,9 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
 });
 
 
-describe('allowlisted sibling snapshots', () => {
+// Every test builds a real git repo (init/add/commit via spawnSync). On a loaded coverage shard that outran the
+// 5s default (main red @ 1d981dd0e), so this describe carries the same explicit budget as the other git-backed suites.
+describe('allowlisted sibling snapshots', { timeout: 30_000 }, () => {
   let parent, sibling;
   function git(...args) {
     const result = spawnSync('git', ['-C', sibling, ...args], {encoding:'utf8'});
@@ -2542,6 +2589,295 @@ describe('allowlisted sibling snapshots', () => {
     return f;
   }
   afterEach(() => {if (parent) rmSync(parent, {recursive:true,force:true}); parent=undefined;});
+
+  it.each([
+    ['no sibling references', 'export const shared = {};'],
+    ['a sibling reference', "resolve(repoRoot, '../frontierui/plugs');"],
+  ])('full manifest with %s omits siblings when frontierui is absent (ENOENT)', async (_label, config) => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), config);
+    rmSync(sibling, {recursive:true,force:true});
+    await expect(filesystem.lstat(sibling)).rejects.toMatchObject({code:'ENOENT'});
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest.entries.map(entry => entry.path.toString())).toContain('vitest.shared.ts');
+    expect(manifest).not.toHaveProperty('siblings');
+  });
+
+  it('full manifest without sibling references skips an existing sibling', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), 'export const shared = {};');
+    await expect(filesystem.lstat(sibling)).resolves.toBeTruthy();
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest).not.toHaveProperty('siblings');
+    expect(callsOf(f.exec).some(call => call.cwd === sibling)).toBe(false);
+  });
+
+  it.each([
+    ['an import-only binding', "import { SIBLING_PATHS } from './x.mjs';\nexport const shared = {};"],
+    ['a renamed import', "import { SIBLING_PATHS as P } from './x.mjs';\nexport const a = P.plugs;"],
+    ['a renamed import, bracket use', "import { SIBLING_PATHS as P } from './x.mjs';\nexport const a = P['plugs'];"],
+    ['a use hidden between two comments that look like an import', '/* import {\n*/ const a = resolve(SIBLING_PATHS.plugs); /*\n} from "x" */'],
+    ['a path built by concatenation', "resolve(repoRoot, '..', 'frontierui', 'plugs');"],
+    ['a path built from string parts', "const dir = '../' + 'frontierui';"],
+  ])('%s keeps sibling inventory (fails toward shipping)', async (_label, config) => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), config);
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest.siblings.frontierui.sha).toBe(git('rev-parse', 'HEAD'));
+  });
+
+  it('the scoped package alias @frontierui/plugs alone is not a sibling reference', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), "export const alias = {'@frontierui/plugs': 'pkg'};");
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest).not.toHaveProperty('siblings');
+  });
+
+  it.each([
+    ['split path with no recognizable sibling text', "const parent = '..'; const repo = 'front' + 'ierui'; export const alias = {pkg: resolve(repoRoot, parent, repo, 'plugs')};"],
+    ['variable target', 'export const alias = {pkg: target};'],
+    ['template target', 'export const alias = {pkg: `${parent}/${repo}/plugs`};'],
+    ['path.join with non-literal parts', "import path from 'node:path'; export const alias = {pkg: path.join(root, parent, repo, 'plugs')};"],
+    ['aliased path builder', "import {resolve as locate} from 'node:path'; export const alias = {pkg: locate(root, target)};"],
+    ['computed dynamic import beginning with a literal', "const aliases = await import('front' + name);"],
+    ['computed dynamic import template', 'const aliases = await import(`${name}`);'],
+    ['computed require beginning with a literal', "const aliases = require('front' + name);"],
+    ['escaped identifier', 'export const alias = {pkg: t\\u0061rget};'],
+    ['computed object key', 'export const alias = {[key]: value};'],
+    ['spread alias', 'export const alias = {...aliases};'],
+    ['opaque helper result', 'export const alias = makeAliases();'],
+    ['malformed config', 'export const alias = {pkg:'],
+  ])('%s requires all exempt sibling roots', async (_label, config) => {
+    const f = siblingsFixture();
+    // These must exercise uncertainty itself, not the old text heuristics.
+    expect(config).not.toMatch(/frontierui|SIBLING_PATHS|\.\.\//);
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), config);
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest.siblings?.frontierui?.sha).toBe(git('rev-parse', 'HEAD'));
+    expect(manifest.siblings.frontierui.entries.map(entry => entry.path.toString())).toEqual([
+      'plugs/index.js', 'webtheme/index.js', 'webtheme/sub/dir/x.md',
+    ]);
+  });
+
+  it('an unresolved computed target refuses a dirty sibling before remote dispatch', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), "const parent = '..'; const repo = 'front' + 'ierui'; export const alias = {pkg: resolve(repoRoot, parent, repo, 'plugs')};");
+    writeFileSync(join(sibling, 'plugs/index.js'), 'dirty');
+    expect(await runRemote(f)).toMatchObject({mode:'not-started', reason:'sibling-inventory-failed'});
+    expect(callsOf(f.exec).some(isRun)).toBe(false);
+  });
+
+  it.each([
+    ['escaped relative path', "export const alias = {pkg: '\\x2e\\x2e/\\x66rontierui/plugs'};"],
+    ['oversized static proof', '/*' + 'x'.repeat(64 * 1024) + '*/ export const shared = {};'],
+    ['deep static proof', 'export const shared = ' + '['.repeat(80) + '0' + ']'.repeat(80) + ';'],
+  ])('%s cannot exempt siblings', async (_label, config) => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), config);
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest.siblings?.frontierui?.sha).toBe(git('rev-parse', 'HEAD'));
+  });
+
+  it('a fully static config still exempts an existing dirty sibling', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), "export const shared = {alias: {'@frontierui/plugs': 'pkg'}, count: 1, enabled: true, values: ['pkg', null]} as const;");
+    writeFileSync(join(sibling, 'plugs/index.js'), 'dirty');
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest).not.toHaveProperty('siblings');
+    expect(callsOf(f.exec).some(call => call.cwd === sibling)).toBe(false);
+  });
+
+  it.each(['import {', 'export {', 'SIBLING_PATHS[ ', 'SIBLING_PATHS["', '../'])('scans a hostile %s config in linear time', async piece => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), piece.repeat(Math.ceil(400_000 / piece.length)) + 'x');
+    rmSync(sibling, {recursive:true,force:true});
+    const started = Date.now();
+    await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false}).catch(() => {});
+    expect(Date.now() - started).toBeLessThan(5000);
+  });
+
+  it('bracket-form sibling references keep sibling inventory', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), [
+      "import { SIBLING_PATHS } from './scripts/readiness/forge-exec-siblings.mjs';",
+      'export const a = resolve(repoRoot, SIBLING_PATHS["plugs"]);',
+      "export const b = resolve(repoRoot, SIBLING_PATHS[ 'webtheme' ]);",
+    ].join('\n'));
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest.siblings.frontierui.sha).toBe(git('rev-parse', 'HEAD'));
+    expect(manifest.siblings.frontierui.entries.map(entry => entry.path.toString())).toEqual([
+      'plugs/index.js', 'webtheme/index.js', 'webtheme/sub/dir/x.md',
+    ]);
+  });
+
+  it.each([
+    ['dot form', 'resolve(repoRoot, SIBLING_PATHS.plugs);'],
+    ['optional-chained dot form', 'resolve(repoRoot, SIBLING_PATHS?.plugs);'],
+    ['spaced dot form', 'resolve(repoRoot, SIBLING_PATHS . webtheme);'],
+    ['backtick bracket form', 'resolve(repoRoot, SIBLING_PATHS[`plugs`]);'],
+    ['computed key', 'const key = "plugs"; resolve(repoRoot, SIBLING_PATHS[key]);'],
+    ['destructuring', 'const { plugs } = SIBLING_PATHS;'],
+    ['Object.values', 'Object.values(SIBLING_PATHS).map(p => resolve(repoRoot, p));'],
+    ['spread', 'const all = { ...SIBLING_PATHS };'],
+  ])('%s of SIBLING_PATHS keeps sibling inventory', async (_label, body) => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), `import { SIBLING_PATHS } from './x.mjs';\n${body}`);
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest.siblings.frontierui.sha).toBe(git('rev-parse', 'HEAD'));
+  });
+
+  it.each([
+    ['a literal ../frontierui path beside a bracket reference', "resolve(repoRoot, '../frontierui/plugs'); resolve(repoRoot, SIBLING_PATHS[\"webtheme\"]);"],
+    ['a namespace-import member access', "import * as S from './x.mjs';\nresolve(repoRoot, S.SIBLING_PATHS.plugs);"],
+    ['a namespace-import bracket member access', "import * as S from './x.mjs';\nresolve(repoRoot, S.SIBLING_PATHS['webtheme']);"],
+  ])('%s keeps sibling inventory', async (_label, body) => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), body);
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest.siblings.frontierui.sha).toBe(git('rev-parse', 'HEAD'));
+  });
+
+  it.each([
+    ['namespace dot access', "import * as S from './scripts/readiness/forge-exec-siblings.mjs';\nresolve(repoRoot, S.SIBLING_PATHS.plugs);"],
+    ['namespace bracket access', "import * as S from './scripts/readiness/forge-exec-siblings.mjs';\nresolve(repoRoot, S['SIBLING_PATHS']['webtheme']);"],
+    ['namespace computed access', "import * as S from './scripts/readiness/forge-exec-siblings.mjs';\nresolve(repoRoot, S[member][key]);"],
+    ['namespace optional access', "import * as S from './scripts/readiness/forge-exec-siblings.mjs';\nresolve(repoRoot, S?.SIBLING_PATHS?.plugs);"],
+    ['namespace alias', "import * as S from './scripts/readiness/forge-exec-siblings.mjs';\nconst paths = S; consume(paths);"],
+    ['renamed named import', "import { SIBLING_PATHS as paths } from './scripts/readiness/forge-exec-siblings.mjs';\nresolve(repoRoot, paths.plugs);"],
+    ['dynamic import', "const S = await import('./scripts/readiness/forge-exec-siblings.mjs');\nresolve(repoRoot, S.SIBLING_PATHS.plugs);"],
+    ['require', "const S = require('./scripts/readiness/forge-exec-siblings.mjs');\nresolve(repoRoot, S.SIBLING_PATHS.plugs);"],
+    ['side-effect import beside namespace import', "import './scripts/readiness/forge-exec-siblings.mjs';\nimport * as S from './scripts/readiness/forge-exec-siblings.mjs';\nresolve(repoRoot, S.SIBLING_PATHS.plugs);"],
+    ['computed export name', "import * as S from './scripts/readiness/forge-exec-siblings.mjs';\nconst member = 'SIBLING_' + 'PATHS'; resolve(repoRoot, S[member].plugs);"],
+    ['dynamic import with computed export name', "const S = await import('./scripts/readiness/forge-exec-siblings.mjs');\nconst member = 'SIBLING_' + 'PATHS'; resolve(repoRoot, S[member].plugs);"],
+    ['require with computed export name', "const S = require('./scripts/readiness/forge-exec-siblings.mjs');\nconst member = 'SIBLING_' + 'PATHS'; resolve(repoRoot, S[member].plugs);"],
+    ['namespace re-export', "export * as paths from './scripts/readiness/forge-exec-siblings.mjs';"],
+    ['namespace import with an import-looking comment', "import * as S from // import\n'./scripts/readiness/forge-exec-siblings.mjs';\nconst member = 'SIBLING_' + 'PATHS'; resolve(repoRoot, S[member].plugs);"],
+  ])('%s of the exempt sibling module requires sibling inventory', async (_label, config) => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), config);
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest.siblings?.frontierui?.sha).toBe(git('rev-parse', 'HEAD'));
+    expect(manifest.siblings.frontierui.entries.map(entry => entry.path.toString())).toEqual([
+      'plugs/index.js', 'webtheme/index.js', 'webtheme/sub/dir/x.md',
+    ]);
+  });
+
+  // A template-literal key with a `${…}` hole is computed, never an unknown literal key (which would name no path).
+  // No relative import here, so only the key itself can keep the snapshot.
+  it.each([
+    ['a lone interpolation', 'resolve(repoRoot, SIBLING_PATHS[`${name}`]);'],
+    ['an interpolation with a literal prefix', 'resolve(repoRoot, SIBLING_PATHS[`web${suffix}`]);'],
+    ['an interpolation with an unknown literal prefix', 'resolve(repoRoot, SIBLING_PATHS[`nope${suffix}`]);'],
+    ['two interpolations', 'resolve(repoRoot, SIBLING_PATHS[`${a}${b}`]);'],
+    ['a spaced bracket', 'resolve(repoRoot, SIBLING_PATHS[ `${name}` ]);'],
+    ['an optional-chained bracket', 'resolve(repoRoot, SIBLING_PATHS?.[`${name}`]);'],
+  ])('%s as a SIBLING_PATHS key keeps sibling inventory', async (_label, body) => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), body);
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest.siblings.frontierui.sha).toBe(git('rev-parse', 'HEAD'));
+    expect(manifest.siblings.frontierui.entries.map(entry => entry.path.toString())).toEqual([
+      'plugs/index.js', 'webtheme/index.js', 'webtheme/sub/dir/x.md',
+    ]);
+  });
+
+  it('a template-literal key without a hole is still a literal key', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), 'resolve(repoRoot, SIBLING_PATHS[`nope`]);');
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest).not.toHaveProperty('siblings');
+  });
+
+  // The dependency lives in a module the config re-exports or imports (vitest.aliases.ts), which is not scanned:
+  // unresolved, so the sibling snapshot is kept rather than silently dropped.
+  it.each([
+    ['a re-export', "export { weAlias } from './vitest.aliases.ts';"],
+    ['a star re-export', "export * from './vitest.aliases';"],
+    ['a named import', "import { weAlias } from './vitest.aliases.ts';\nexport const shared = { alias: weAlias };"],
+    ['a side-effect import', "import './vitest.aliases.ts';"],
+    ['a dynamic import', "const { weAlias } = await import('./vitest.aliases.ts');"],
+    ['a require', "const { weAlias } = require('./vitest.aliases.cjs');"],
+    ['a namespace re-export', "export * as aliases from './vitest.aliases.ts';"],
+    ['a multi-line import', "import {\n  weAlias,\n} from\n  './vitest.aliases.ts';"],
+    ['a URL-resolved module', "const aliases = new URL('./vitest.aliases.ts', import.meta.url);"],
+    // Unresolvable loads keep the sibling: nothing proves the module they reach holds no sibling use.
+    ['an index re-export', "export * from '..';"],
+    ['a current-directory index import', "import { weAlias } from '.';"],
+    ['a subpath import', "import { weAlias } from '#aliases';"],
+    ['a path alias import', "import { weAlias } from '@/aliases';"],
+    ['a computed dynamic import', "const m = await import(join(dirname(fileURLToPath(import.meta.url)), 'vitest.aliases.ts'));"],
+    ['a computed require', "const m = require(join(__dirname, 'vitest.aliases.cjs'));"],
+    ['an import.meta.resolve', "const where = import.meta.resolve(name);"],
+    ['a createRequire load', "const m = createRequire(import.meta.url)(name);"],
+  ])('%s of a relative config module keeps sibling inventory', async (_label, config) => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), config);
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest.siblings.frontierui.sha).toBe(git('rev-parse', 'HEAD'));
+    expect(manifest.siblings.frontierui.entries.map(entry => entry.path.toString())).toEqual([
+      'plugs/index.js', 'webtheme/index.js', 'webtheme/sub/dir/x.md',
+    ]);
+  });
+
+  it('a relative re-export with the sibling absent still omits siblings (ENOENT)', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), "export { weAlias } from './vitest.aliases.ts';");
+    rmSync(sibling, {recursive:true,force:true});
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest).not.toHaveProperty('siblings');
+  });
+
+  it('importing only the data-only SIBLING_PATHS module does not by itself name a sibling', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), "import './scripts/readiness/forge-exec-siblings.mjs';\nexport const shared = {};");
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest).not.toHaveProperty('siblings');
+  });
+
+  it('node: builtins, bare packages and the data-only module alone name no sibling', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), [
+      "import './scripts/readiness/forge-exec-siblings.mjs';",
+      "import { fileURLToPath } from 'node:url';",
+      "import { dirname, join, resolve } from 'node:path';",
+      "import { defineConfig } from 'vitest/config';",
+      "import tsconfigPaths from '@scope/plugin';",
+      'export const here = dirname(fileURLToPath(import.meta.url));',
+    ].join('\n'));
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest).not.toHaveProperty('siblings');
+  });
+
+  it('an unknown literal SIBLING_PATHS key is not a sibling dependency', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), 'resolve(repoRoot, SIBLING_PATHS.nope); resolve(repoRoot, SIBLING_PATHS["nope"]);');
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest).not.toHaveProperty('siblings');
+  });
+
+  it.each(['ls-files', 'rev-parse', 'dirty'])('full manifest fails closed on existing shipped sibling with %s failure', async fault => {
+    const f = siblingsFixture();
+    if (fault === 'dirty') writeFileSync(join(sibling, 'plugs/index.js'), 'dirty');
+    else {
+      const original = f.exec;
+      f.exec = vi.fn(async call => call.file === 'git' && call.cwd === sibling && gitArgs(call)[0] === fault
+        ? {code:128, stdout:Buffer.alloc(0)} : original(call));
+    }
+    await expect(remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false}))
+      .rejects.toMatchObject({code:'sibling-inventory-failed'});
+    if (fault !== 'dirty') expect(callsOf(f.exec).some(call => call.cwd === sibling && gitArgs(call)[0] === fault)).toBe(true);
+  });
+
+  it('full manifest fails closed on non-ENOENT sibling lstat failure (EACCES)', async () => {
+    const f = siblingsFixture();
+    const lstat = vi.fn(async (path, ...args) => {
+      if (path.toString() === sibling) throw Object.assign(new Error('Permission denied'), {code:'EACCES', path:sibling});
+      return filesystem.lstat(path, ...args);
+    });
+    await expect(remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false, fs:{...filesystem,lstat}}))
+      .rejects.toMatchObject({code:'sibling-inventory-failed'});
+    expect(lstat.mock.calls.some(([path]) => path.toString() === sibling)).toBe(true);
+  });
 
   it('ships sibling snapshots for the real repository Vitest shared config', async () => {
     const f = siblingsFixture();
@@ -2686,7 +3022,7 @@ node -e "const fs=require('fs'); for(const name of ['plugs','webtheme']) {if(!fs
     const f = siblingsFixture();
     if (fault === 'dirty' || fault === 'staged') writeFileSync(join(sibling,'plugs/index.js'), 'changed');
     if (fault === 'staged') git('add','.');
-    if (fault === 'untracked') writeFileSync(join(sibling,'untracked'), 'new');
+    if (fault === 'untracked') writeFileSync(join(sibling,'plugs/untracked'), 'new');
     if (fault === 'missing' || fault === 'symlink') rmSync(join(sibling,'plugs'), {recursive:true});
     if (fault === 'symlink') symlinkSync(join(sibling,'webtheme'), join(sibling,'plugs'));
     if (fault === 'root symlink') {
@@ -2701,6 +3037,11 @@ node -e "const fs=require('fs'); for(const name of ['plugs','webtheme']) {if(!fs
     if (fault === 'unresolvable') rmSync(join(sibling,'.git'), {recursive:true});
     expect(await runRemote(f)).toMatchObject({mode:'not-started',terminated:true,reason:'sibling-inventory-failed'});
     expect(callsOf(f.exec).some(call => call.file === 'rsync' || isRun(call))).toBe(false);
+  });
+  it('ignores untracked files outside the shipped sibling roots (daemon .claude/)', async () => {
+    const f = siblingsFixture();
+    mkdirSync(join(sibling,'.claude')); writeFileSync(join(sibling,'.claude/state'), 'x');
+    expect(await runRemote(f)).toMatchObject({mode:'remote',code:0, run: expect.any(String)});
   });
   it.each(['bytes','symlink','directory'])('refuses a sibling swapped to %s after inventory before any rsync', async kind => {
     const f = siblingsFixture();
@@ -2891,6 +3232,14 @@ describe('safeFallbackDetail', () => {
     'a/'+'z'.repeat(40)+': f', 'a.js: x=secretvalue', undefined, 42,
   ])('yields unavailable for hostile bundle input %j', raw => {
     expect(remoteManifestAPI.safeFallbackDetail('bundle-credential-hit',raw)).toBe('unavailable');
+  });
+  it('passes path: rule for an excluded source file', () => {
+    expect(remoteManifestAPI.safeFallbackDetail('excluded-source-file','backlog/1-x.md: credential-named-not-identical-to-main')).toBe('backlog/1-x.md: credential-named-not-identical-to-main');
+  });
+  it.each([
+    'a\nb: x', '/etc/passwd: x', '../x: y', 'a.js: bad rule', 'a.js: '+'x'.repeat(250), 'a/'+'z'.repeat(40)+': f', 'a.js: ghp_'+'A1'.repeat(20), undefined, 42,
+  ])('yields unavailable for hostile excluded-source input %j', raw => {
+    expect(remoteManifestAPI.safeFallbackDetail('excluded-source-file',raw)).toBe('unavailable');
   });
   it('sibling detail is a safe relative path or unavailable', () => {
     expect(remoteManifestAPI.safeFallbackDetail('sibling-inventory-failed','plugs/index.js')).toBe('plugs/index.js');

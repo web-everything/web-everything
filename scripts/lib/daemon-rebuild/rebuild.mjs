@@ -10,6 +10,7 @@ import { basename } from 'node:path';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { runLiveSmokeWithRetry } from '../daemon-live-smoke.mjs';
+import { acquireSmokeSlot } from '../daemon-smoke-slots.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
 import { runForceWatchTick } from '../daemon-force-adopt.mjs';
 import { finalizeRebuild } from './adopt.mjs';
@@ -37,7 +38,7 @@ export const FAILURE_REASONS = new Set([
   'established-overlay-conflict', 'existing-overlays-unresolved', 'fetch-failed', 'force-adopt-refused',
   'git-common-dir-failed', 'git-dir-unreadable', 'head-unresolved', 'launch-failed',
   'main-unresolved', 'merge-tree-failed', 'no-origin-url', 'not-built',
-  'overlay-state-corrupt', 'pinned-overlay-conflict', 'pinned-overlay-unavailable',
+  'overlay-state-corrupt', 'pinned-overlay-conflict', 'pinned-overlay-hold-marker-failed', 'pinned-overlay-unavailable',
   'pinned-unparsable', 'pinned-unreadable', 'pinned-write-failed', 'quarantined',
   'rebuild-error', 'rebuild-interrupted-unrecoverable', 'rebuild-job-queue-failed',
   'reader-wait-timeout', 'rebuild-threw', 'remote-termination-unconfirmed', 'reset-failed', 'reset-rollback-failed', 'restore-failed',
@@ -192,7 +193,17 @@ async function rebuildCloneInternal({
   // Card 89 S5: a versioned clone never moves in place — it builds a version and flips `current`, taking no
   // clone lock at all. `versions: null` forces the legacy path; unset resolves from the settings (default off).
   const vctx = versions === undefined ? resolveVersionedContext({ root, env }) : versions;
-  if (vctx) return versionedRebuild({ ctx: vctx, log });
+  if (vctx) {
+    // Versioned builds take no clone lease to renew while queued, but their live smoke
+    // shares the same host capacity and deadline as an unversioned candidate.
+    const slot = await acquireSmokeSlot({ env: { ...env, ...(stateOpts?.env || {}) }, log, now, sleep });
+    try {
+      if (!slot.acquired) return { moved: false, reason: 'smoke-queue-timeout' };
+      return await versionedRebuild({ ctx: vctx, log });
+    } finally {
+      await slot.release();
+    }
+  }
   // daemonRebuild.skipUnrelated (default on): `skipCheck` is injectable; else built from the daemon's `entries`.
   // #4126 readyOnly (the rebuild job) never moves `root`: no skip-unrelated adoption here (the tick's adopt-only
   // pass does that), and a ready candidate already waiting is the tick's to adopt — nothing to build.
@@ -241,7 +252,7 @@ async function rebuildCloneInternal({
     && pendingReady.prevHead === verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
   const startedMs = now();
   const prep = await withWriteLock(root, () => prepareRebuild({
-    root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck: skipDecider, readyOnly,
+    root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck: skipDecider, readyOnly, adoptOnly,
   }), readyOnHead ? finalizeLockOpts : admissionLockOpts);
 
   if (prep.ok) {
@@ -282,10 +293,36 @@ async function rebuildCloneInternal({
 
   // ── Phase 2 (UNLOCKED — the whole point of xa4qo7n): build + smoke a disposable candidate ───────────────
   try {
-    return await smokeAndAdopt({
-      root, env, stEnv, log, run, runSmoke, stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
-      finalLockOpts, finalizeLockOpts, dispatchSmoke, readyOnly,
+    const slot = await acquireSmokeSlot({ env: stEnv, log, now, sleep,
+      onWait: async () => {
+        const renewed = await withWriteLock(root, () => {
+          const st = readRebuildState(root, stEnv);
+          if (st.building?.token !== lease.token) return;
+          st.building.startedAt = new Date(now()).toISOString();
+          writeRebuildState(root, st, stEnv);
+        }, finalLockOpts);
+        if (!renewed.ok) throw new Error(`daemon-rebuild: could not renew queued build lease (${renewed.reason}) — the next tick retries`);
+      },
     });
+    try {
+      if (!slot.acquired) {
+        try {
+          await withWriteLock(root, () => {
+            const st = readRebuildState(root, stEnv);
+            releaseBuildLease(st, lease);
+            writeRebuildState(root, st, stEnv);
+          }, finalLockOpts);
+        } catch { /* the owner's next call takes an unreleased lease back anyway */ }
+        return { moved: false, adopted: false, reason: 'smoke-queue-timeout', plan, alerts: prepAlerts };
+      }
+      return await smokeAndAdopt({
+        root, env, stEnv, log, run, runSmoke,
+        stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
+        finalLockOpts, finalizeLockOpts, dispatchSmoke, readyOnly,
+      });
+    } finally {
+      await slot.release();
+    }
   } catch (e) {
     // Best-effort: never leave a thrown build's lease on disk to hold a sibling off until it ages out.
     try {

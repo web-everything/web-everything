@@ -1,3 +1,15 @@
+
+const operatorFixture = vi.hoisted(() => ({ file: undefined }));
+vi.mock('../operator-override-reader.mjs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, readOperatorOverrides: options => {
+    const file = options?.file ?? operatorFixture.file;
+    if (!file) throw new Error('Test must inject an operator-store file');
+    return actual.readOperatorOverrides({ ...options, file });
+  } };
+});
+// Exercise the real reader/cascade with a temporary store via its explicit file seam.
+const operatorEnv = file => { operatorFixture.file = file; return {}; };
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -6,6 +18,7 @@ import {
   RESOURCE_GATE_STANDARD, resolveResourceGateSettings, loadResourceGateSettings, logGateSettingsOnce,
   cutoverDecision, gateLaunch, decideFixCap, createResourceFixThrottle, resolveCutoverMode,
 } from '../resource-gate.mjs';
+import { resolveHostOverloadSettings } from '../host-overload-settings.mjs';
 import { admitLaunch, resolveCostAdmissionSettings } from '../cost-admission.mjs';
 import { lightResourceDecision } from '../cost-admission-facts.mjs';
 
@@ -20,10 +33,41 @@ const writeSnap = (s) => { mkdirSync(join(root, 'resource'), { recursive: true }
 const quiet = () => {};
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'resource-gate-'));
+  operatorFixture.file = join(root, 'missing-operator-overrides.json');
   vi.stubEnv('WE_RESOURCE_SHADOW', 'on');
   vi.stubEnv('WE_RESOURCE_CUTOVER', '');
 });
 afterEach(() => { vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); });
+
+describe('R907 host/resource readers retain operator authority under test flags', () => {
+  it('applies restrictive injected host and resource limits with both flags set', () => {
+    const file = join(root, 'restrictive-operator.json');
+    writeFileSync(file, JSON.stringify({
+      'host.maxReviewDispatchPerTick': 1,
+      'resourceGate.fixCap.ceiling': 1,
+    }));
+    const env = { ...operatorEnv(file), VITEST: 'true', WE_UNDER_TEST: '1', NODE_ENV: 'test',
+      WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK: '8', WE_FIX_DISPATCH_MAX_CONCURRENT: '8', WE_FIX_DISPATCH_MAX_CEILING: '12' };
+    const host = resolveHostOverloadSettings({ env, log: quiet });
+    const resource = resolveResourceGateSettings({ env, log: quiet });
+    expect(host.settings.host.maxReviewDispatchPerTick).toBe(1);
+    expect(host.sources['host.maxReviewDispatchPerTick']).toBe('operator-db');
+    expect(resource.settings.fixCap).toMatchObject({ floor: 1, ceiling: 1 });
+    expect(resource.sources['fixCap.ceiling']).toBe('operator-db');
+  });
+
+  it('fails closed for malformed injected host and resource stores with both flags set', () => {
+    const file = join(root, 'malformed-operator.json'); writeFileSync(file, '{');
+    const env = { ...operatorEnv(file), VITEST: 'true', WE_UNDER_TEST: '1', NODE_ENV: 'test',
+      WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK: '8', WE_FIX_DISPATCH_MAX_CONCURRENT: '8', WE_FIX_DISPATCH_MAX_CEILING: '12' };
+    const log = vi.fn();
+    const host = resolveHostOverloadSettings({ env, log });
+    const resource = resolveResourceGateSettings({ env, log });
+    expect(host.settings.host.maxReviewDispatchPerTick).toBe(2);
+    expect(resource.settings.fixCap).toMatchObject({ floor: 2, ceiling: 6 });
+    expect(log.mock.calls.flat().join(' ')).toContain('operator-db-unreadable');
+  });
+});
 
 // The legacy gate always says the OPPOSITE of the fixture, so each test proves which side decided.
 const legacyAdmit = () => ({ admit: true, note: 'legacy admit' });
@@ -417,4 +461,165 @@ describe('dynamic fixer cap', () => {
       expect(run(6.9)).toMatchObject({ lowered: true, raised: false });
     });
   });
+});
+
+
+describe('operator-db host and resource capacity leaves', () => {
+  const overrideFile = values => {
+    const file = join(root, 'operator-overrides.json'); writeFileSync(file, JSON.stringify(values)); return file;
+  };
+  it('host.maxReviewDispatchPerTick overrides environment and logs operator-db', () => {
+    const log = vi.fn();
+    const r = resolveHostOverloadSettings({ env: { WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK: '2',
+      ...operatorEnv(overrideFile({ 'host.maxReviewDispatchPerTick': 7 })) }, log });
+    expect(r.settings.host.maxReviewDispatchPerTick).toBe(7);
+    expect(r.sources['host.maxReviewDispatchPerTick']).toBe('operator-db');
+    expect(log.mock.calls.flat().join(' ')).toContain('host.maxReviewDispatchPerTick=7 (operator-db)');
+  });
+  it('resourceGate fixCap floor, ceiling and memory percentage override environment with source labels', () => {
+    const r = resolveResourceGateSettings({ env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '2', WE_FIX_DISPATCH_MAX_CEILING: '4',
+      WE_FIX_CAP_RAISE_MIN_MEM_FREE_PCT: '80', ...operatorEnv(overrideFile({
+        'resourceGate.fixCap.floor': 7, 'resourceGate.fixCap.ceiling': 11, 'resourceGate.fixCap.raiseMinMemFreePct': 35.5 })) } });
+    expect(r.settings.fixCap).toMatchObject({ floor: 7, ceiling: 11, raiseMinMemFreePct: 35.5 });
+    expect(r.sources).toMatchObject({ 'fixCap.floor': 'operator-db', 'fixCap.ceiling': 'operator-db', 'fixCap.raiseMinMemFreePct': 'operator-db' });
+    const log = vi.fn(); logGateSettingsOnce(r, log);
+    expect(log.mock.calls.flat().join(' ')).toContain('fixCap.floor=7 (operator-db)');
+    expect(log.mock.calls.flat().join(' ')).toContain('fixCap.raiseMinMemFreePct=35.5 (operator-db)');
+  });
+  it('fails closed on oversized capacity and guard keys despite looser lower layers', () => {
+    const env = { WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK: '3', WE_FIX_DISPATCH_MAX_CONCURRENT: '4',
+      ...operatorEnv(overrideFile({ 'host.maxReviewDispatchPerTick': 9, 'host.capacity.memAvailableFloorMb': 1,
+        'resourceGate.fixCap.floor': 13, 'resourceGate.cutover': 'shadow' })) };
+    const host = resolveHostOverloadSettings({ env, log: quiet });
+    expect(host.settings.host.maxReviewDispatchPerTick).toBe(2);
+    expect(host.settings.host.capacity.memAvailableFloorMb).toBe(2048);
+    const resource = resolveResourceGateSettings({ env });
+    expect(resource.settings.fixCap.floor).toBe(2); expect(resource.settings.cutover).toBe('enforce');
+  });
+  it('host and resource readers re-read operator capacity changes without restart', () => {
+    const file = overrideFile({ 'host.maxReviewDispatchPerTick': 7, 'resourceGate.fixCap.floor': 6 });
+    const env = { ...operatorEnv(file) };
+    expect(resolveHostOverloadSettings({ env, log: quiet }).settings.host.maxReviewDispatchPerTick).toBe(7);
+    expect(resolveResourceGateSettings({ env }).settings.fixCap.floor).toBe(6);
+    writeFileSync(file, '{}');
+    expect(resolveHostOverloadSettings({ env, log: quiet }).settings.host.maxReviewDispatchPerTick).toBe(2);
+    expect(resolveResourceGateSettings({ env, legacyFloor: 3 }).settings.fixCap.floor).toBe(3);
+  });
+});
+
+it('corrupt operator store forces every host/resource capacity leaf to code defaults despite lower raises', () => {
+  const file = join(root, 'operator-corrupt.json'); writeFileSync(file, '{');
+  const log = vi.fn();
+  const env = { ...operatorEnv(file), WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK: '7',
+    WE_FIX_DISPATCH_MAX_CONCURRENT: '12', WE_FIX_DISPATCH_MAX_CEILING: '12', WE_FIX_CAP_RAISE_MIN_MEM_FREE_PCT: '25' };
+  const host = resolveHostOverloadSettings({ platform: { host: { maxReviewDispatchPerTick: 8 } }, env, log });
+  expect(host.settings.host.maxReviewDispatchPerTick).toBe(2);
+  expect(host.sources['host.maxReviewDispatchPerTick']).toBe('standard');
+  const resource = resolveResourceGateSettings({ platform: { fixCap: { floor: 12, ceiling: 12, raiseMinMemFreePct: 25 } },
+    tool: { fixCap: { ceilingAboveFloor: 100 } }, env, legacyFloor: 12, log });
+  expect(resource.settings.fixCap).toMatchObject({ floor: 2, ceiling: 6, raiseMinMemFreePct: 40 });
+  expect(resource.sources['fixCap.raiseMinMemFreePct']).toBe('standard');
+  expect(log.mock.calls.flat().join(' ')).toContain('operator-db-unreadable');
+});
+it('resolved operator ceiling stays at least the floor when only one bound overrides lower layers', () => {
+  const file = join(root, 'operator-bounds.json');
+  writeFileSync(file, JSON.stringify({ 'resourceGate.fixCap.floor': 9 }));
+  const r = resolveResourceGateSettings({ platform: { fixCap: { ceiling: 3 } }, env: { ...operatorEnv(file) } });
+  expect(r.settings.fixCap).toMatchObject({ floor: 9, ceiling: 9 });
+});
+
+
+it('floor-only operator override 12 derives a ceiling no higher than 12', () => {
+  const file = join(root, 'operator-floor-only.json');
+  writeFileSync(file, JSON.stringify({ 'resourceGate.fixCap.floor': 12 }));
+  const r = resolveResourceGateSettings({ env: { ...operatorEnv(file) } });
+  expect(r.settings.fixCap).toMatchObject({ floor: 12, ceiling: 12 });
+});
+
+it.each(['corrupt', 'unreadable'])('%s operator store preserves configured fixCap 1/1 and memory 60 percent', kind => {
+  const file = join(root, 'operator-strict.json');
+  if (kind === 'corrupt') writeFileSync(file, '{'); else mkdirSync(file);
+  const log = vi.fn();
+  const env = { ...operatorEnv(file), WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK: '1',
+    WE_FIX_DISPATCH_MAX_CONCURRENT: '1', WE_FIX_DISPATCH_MAX_CEILING: '1', WE_FIX_CAP_RAISE_MIN_MEM_FREE_PCT: '60' };
+  expect(resolveResourceGateSettings({ env, log }).settings.fixCap).toMatchObject({ floor: 1, ceiling: 1, raiseMinMemFreePct: 60 });
+  expect(resolveHostOverloadSettings({ env, log }).settings.host.maxReviewDispatchPerTick).toBe(1);
+  for (const leaf of ['resourceGate.fixCap.floor', 'resourceGate.fixCap.ceiling', 'resourceGate.fixCap.raiseMinMemFreePct', 'host.maxReviewDispatchPerTick'])
+    expect(log.mock.calls.flat().join(' ')).toContain(`operator-db-unreadable ${leaf}`);
+});
+
+
+it.each([undefined, 8])('R907 operator ceiling 1 lowers the default/configured floor %j', floor => {
+  const file = join(root, 'operator-ceiling.json');
+  writeFileSync(file, JSON.stringify({ 'resourceGate.fixCap.ceiling': 1 }));
+  operatorEnv(file);
+  const r = resolveResourceGateSettings({ env: {}, tool: floor === undefined ? undefined : { fixCap: { floor } } });
+  expect(r.settings.fixCap).toMatchObject({ floor: 1, ceiling: 1 });
+  expect(r.sources['fixCap.ceiling']).toBe('operator-db');
+});
+
+describe('R907 malformed host/resource policy evidence', () => {
+  it.each([
+    ['wrong type', 'fixCap.floor', '1'],
+    ['out of range', 'fixCap.ceiling', 13],
+    ['unknown key', 'unknownCapacity', 1],
+    ['non-allowlisted guard', 'cutover', 'shadow'],
+  ])('%s closes every capacity leaf in the affected policy, direction-aware', (_label, key, value) => {
+    const file = join(root, 'operator-invalid.json');
+    for (const strict of [false, true]) {
+      const env = { ...operatorEnv(file),
+        WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK: strict ? '1' : '8',
+        WE_FIX_DISPATCH_MAX_CONCURRENT: strict ? '1' : '12',
+        WE_FIX_DISPATCH_MAX_CEILING: strict ? '1' : '12',
+        WE_FIX_CAP_RAISE_MIN_MEM_FREE_PCT: strict ? '60' : '25' };
+      const log = vi.fn();
+      // A valid sibling in the affected policy must not bypass the policy-wide fallback.
+      writeFileSync(file, JSON.stringify({
+        'resourceGate.fixCap.raiseMinMemFreePct': 25, ['resourceGate.' + key]: value,
+        'host.maxReviewDispatchPerTick': 7,
+      }));
+      const resource = resolveResourceGateSettings({ env, log });
+      expect(resource.settings.fixCap).toMatchObject(strict
+        ? { floor: 1, ceiling: 1, raiseMinMemFreePct: 60 }
+        : { floor: 2, ceiling: 6, raiseMinMemFreePct: 40 });
+      // An unrelated policy retains its valid override.
+      expect(resolveHostOverloadSettings({ env, log }).settings.host.maxReviewDispatchPerTick).toBe(7);
+      for (const leaf of ['floor', 'ceiling', 'raiseMinMemFreePct'])
+        expect(log.mock.calls.flat().join(' ')).toMatch(new RegExp('operator-db-(unreadable|invalid).*resourceGate\\.fixCap\\.' + leaf));
+    }
+  });
+  it.each([
+    ['host.maxReviewDispatchPerTick', '1'],
+    ['host.maxReviewDispatchPerTick', 9],
+    ['host.unknownCapacity', 1],
+    ['host.capacity.memAvailableFloorMb', 1],
+  ])('malformed %s=%j bounds host dispatch by the finite fallback', (key, value) => {
+    const file = join(root, 'host-invalid.json');
+    writeFileSync(file, JSON.stringify({ [key]: value }));
+    const log = vi.fn();
+    for (const configured of ['8', '1']) {
+      const env = { ...operatorEnv(file), WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK: configured };
+      expect(resolveHostOverloadSettings({ env, log }).settings.host.maxReviewDispatchPerTick)
+        .toBe(configured === '1' ? 1 : 2);
+    }
+    expect(log.mock.calls.flat().join(' ')).toMatch(/operator-db-(unreadable|invalid)/);
+  });
+});
+
+it('no operator store leaves a non-operator fixCap ceiling above 12 unchanged', () => {
+  const file = join(root, 'operator-absent.json');
+  const r = resolveResourceGateSettings({
+    platform: { fixCap: { floor: 14, ceiling: 16 } }, env: { ...operatorEnv(file), WE_FIX_DISPATCH_MAX_CEILING: '16' },
+  });
+  expect(r.settings.fixCap).toMatchObject({ floor: 14, ceiling: 16 });
+  expect(r.invalid).toEqual([]);
+  const tool = resolveResourceGateSettings({ tool: { fixCap: { ceiling: 20 } }, env: { ...operatorEnv(file) } });
+  expect(tool.settings.fixCap.ceiling).toBe(20);
+});
+
+it('an operator floor keeps a non-operator ceiling above 12 and clamps only a ceiling derived from it', () => {
+  const file = join(root, 'operator-floor-mixed.json');
+  writeFileSync(file, JSON.stringify({ 'resourceGate.fixCap.floor': 5 }));
+  const r = resolveResourceGateSettings({ env: { ...operatorEnv(file), WE_FIX_DISPATCH_MAX_CEILING: '16' } });
+  expect(r.settings.fixCap).toMatchObject({ floor: 5, ceiling: 16 });
 });

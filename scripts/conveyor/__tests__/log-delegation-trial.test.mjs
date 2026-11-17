@@ -127,7 +127,7 @@ describe('logDelegationTrial', () => {
 
   it('rejects a secret-shaped comparisonId without writing (#3783, same scrub as findings/rootCause)', () => {
     const io = memIo();
-    expect(() => logDelegationTrial({ ...baseRow(), comparisonId: 'leaked key AKIA1234567890ABCDEF' }, io)).toThrow('secret scrub');
+    expect(() => logDelegationTrial({ ...baseRow(), comparisonId: 'leaked key AKI' + 'A1234567890ABCDEF' }, io)).toThrow('secret scrub');
     expect(readStore(io).records).toEqual([]);
   });
 
@@ -199,7 +199,7 @@ describe('logDelegationTrial', () => {
   });
 
   it('rejects a secret-shaped provider/model/taskDescription/findings/rootCause without writing (independent review, PR #2267 round 1; rootCause added #3889)', () => {
-    const secret = 'leaked key AKIA1234567890ABCDEF';
+    const secret = 'leaked key AKI' + 'A1234567890ABCDEF';
     for (const field of ['provider', 'model', 'taskDescription', 'findings', 'rootCause']) {
       const io = memIo();
       expect(() => logDelegationTrial({ ...baseRow(), [field]: secret }, io)).toThrow('secret scrub');

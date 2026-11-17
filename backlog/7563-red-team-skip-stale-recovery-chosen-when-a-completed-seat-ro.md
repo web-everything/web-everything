@@ -2,7 +2,7 @@
 bornAs: xwlvcva
 kind: task
 status: open
-scope: ["we:scripts/conveyor/review-red-team-on-skip.mjs"]
+scope: ["we:scripts/lib/review-red-team-on-skip.mjs"]
 dateOpened: "2026-10-31"
 tags: []
 ---

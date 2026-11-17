@@ -13,7 +13,7 @@ import {
 } from './lease.mjs';
 import {
   staleAlertDetail, matchReadyCandidate, readyBuildVerified, finalizeRebuild, dropSuspectOverlays,
-  overlayGraduated, reportDiscardedCandidate,
+  overlayGraduated, overlayRetiredByOperator, reportDiscardedCandidate,
 } from './adopt.mjs';
 import { hostname } from 'node:os';
 import { forceRequestFor, forceBlockedReason, dropReadyCandidate, forcedWatchStatus } from '../daemon-force-adopt.mjs';
@@ -27,6 +27,7 @@ import {
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
+import { makeAuditedTipGate, tipInMain } from './audited-tip.mjs';
 import { carriedBeyondMain } from '../../operations/prototype-retire.mjs';
 import * as realAutoRebase from './auto-rebase.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
@@ -89,7 +90,7 @@ export function contentContainedInBuild(git, sha, build) {
  * but clone-tree mutations defer to the next normal daemon tick.
  */
 export async function prepareRebuild({
-  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase, readyOnly = false,
+  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase, readyOnly = false, adoptOnly = false,
 }) {
   // Tests reaching the hold must opt in before launching a detached repair or cleaning up swaps.
   if (process.env.VITEST === 'true' && env?.WE_DAEMON_AUTO_REBASE === undefined) {
@@ -369,6 +370,7 @@ export async function prepareRebuild({
   const stack = resolveOverlayStackMode(env);
   const chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysBefore, env });
   const plan = await planRebuild({
+    auditedTip: makeAuditedTipGate(env),
     git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysBefore, prState, mainOnly, edgeResolve,
     stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
     prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
@@ -387,12 +389,16 @@ export async function prepareRebuild({
   // already emitted, even though this plan will not be adopted.
   if (!plan.ok) Object.assign(pinnedNow, pinnedBefore);
   for (const event of plan.alerts || []) {
-    if (event.kind === 'overlay-pinned') {
+    // unaudited-tip shares the once-per-(ref, new tip) record, but under a kind-tagged value: a tip held back for
+    // audit on one tick can be pinned on the next (its record lands, then it conflicts), and that pin notice must
+    // still log. The record is pruned as soon as a plan stops reporting it.
+    if (event.kind === 'overlay-pinned' || event.kind === 'overlay-unaudited-tip') {
       const { ref, pr, newTip, files } = event.detail;
-      pinnedNow[ref] = newTip;
+      const noticeKey = event.kind === 'overlay-pinned' ? newTip : `unaudited-tip:${newTip}`;
+      pinnedNow[ref] = noticeKey;
       // The branch's own fixer still learns its new head conflicts (the wake keeps its first `at`).
-      if (pr != null) markOverlayConflictWake(env, { pr, ref, files, at: nowIso(), clone: root });
-      if (Object.hasOwn(pinnedBefore, ref) && pinnedBefore[ref] === newTip) continue;
+      if (event.kind === 'overlay-pinned' && pr != null) markOverlayConflictWake(env, { pr, ref, files, at: nowIso(), clone: root });
+      if (Object.hasOwn(pinnedBefore, ref) && pinnedBefore[ref] === noticeKey) continue;
     }
     alert(event.kind, event.detail);
     if (event.kind === 'overlay-conflict-unresolved' && event.detail.pr != null) {
@@ -561,6 +567,10 @@ export async function prepareRebuild({
         rejected: state.rejected,
         nowMs: nowMs(),
         maxAgeMs,
+        // unaudited-tip: the record's own tips are re-judged against the evidence at adoption time (a red record appended since
+        // the smoke revokes it even when the live alert names only a later tip), by a fresh gate so the snapshot is current.
+        auditedTip: makeAuditedTipGate(env),
+        tipInMain: (sha) => tipInMain(git, plan.mainSha, sha),
         // the overlays the RUNNING build applies: its own rebuild-committed merge records above main (hard data — an
         // empty list for a plain-main HEAD), plus the recorded adopted set when HEAD is that adopted build
         liveApplied: liveOverlaysOf(prevHead, plan.mainSha),
@@ -568,6 +578,10 @@ export async function prepareRebuild({
         leftForMain: (a, build) => overlayGraduated({
           readyAt: ready.at ?? ready.passedAt,
           ref: a.ref, sha: a.sha, build, registered: (r) => registeredRefs.has(r) || overlaysBefore.some((o) => o?.ref === r), events: readOverlayEvents(), git,
+        }),
+        retiredByOperator: (a) => overlayRetiredByOperator({
+          ref: a.ref, sha: a.sha, events: readOverlayEvents(),
+          registered: (r) => registeredRefs.has(r) || overlaysBefore.some((o) => o?.ref === r),
         }),
         contentInBuild: (sha, build) => contentContainedInBuild(git, sha, build),
         removedForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
@@ -739,7 +753,7 @@ export async function prepareRebuild({
   // could build + smoke the same candidate at the same time. Claimed HERE, under the write lock, so exactly one
   // caller wins; the loser returns at once and its next tick finds the winner's result.
   const lease = claimBuildLease({
-    state, plan, root, run, env: stEnv, nowMs: nowMs(),
+    state, plan, root, run, env: stEnv, nowMs: nowMs(), adoptOnly,
   });
   if (!lease) {
     const b = state.building;

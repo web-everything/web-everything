@@ -98,6 +98,7 @@ import { loadHostOverloadSettings } from '../../scripts/lib/host-overload-settin
 import { runRedTeamOnSkip } from '../../scripts/lib/review-red-team-on-skip.mjs';
 import { createRedTeamDispatchQueue, loadRedTeamQueueFloor, raiseReviewStartsPerTick, runWithRedTeamQueue } from '../../scripts/lib/red-team-dispatch-queue.mjs';
 import { syncResultOnHeadLabels } from '../../scripts/lib/red-team-result-label-sync.mjs';
+import { runGateCatchUp } from '../../scripts/lib/red-team-gate-catchup.mjs';
 import { tagReviewRound } from '../../scripts/conveyor/review-round-tag.mjs';
 import { tagReviewStatus } from '../../scripts/conveyor/review-status-tag.mjs';
 import { PR_STATUS_LABEL_RE } from '../../scripts/conveyor/pr-status-label.mjs';
@@ -1273,7 +1274,8 @@ export function defaultReviewHostAdmission({ env = process.env, admission = host
 /** The real effects the CLI daemon's review pass runs with (the default `runReview` of {@link buildCliDaemonEffects}
  *  spreads these under its per-tick opts). Builds nothing that does IO until a tick calls it. */
 let redTeamDispatchQueue;
-let redTeamQueueFloor;
+const redTeamGateRetryHistory = new Map();
+let lastRedTeamQueueFloorLine;
 export function cliReviewTickOpts({ log = console, factCache = null } = {}) {
   const factsProvider = withFactsLabels(createGhProvider());
   return {
@@ -1287,6 +1289,10 @@ export function cliReviewTickOpts({ log = console, factCache = null } = {}) {
         ({ rawPrs } = syncResultOnHeadLabels({ repo: o.repo, refusals: o.plan?.refusals,
           rawPrs, log: line => log.error(line) }));
       } catch { /* Label repair must never block red-team recovery. */ }
+      try {
+        runGateCatchUp({ repo: o.repo, refusals: o.plan?.refusals, rawPrs,
+          history: redTeamGateRetryHistory, log: line => log.error(line) });
+      } catch { /* Gate catch-up must never block the capacity queue. */ }
       const options = { ...o, rawPrs,
         dispatch: d => dispatchReviewJob(d), log: line => log.error(line) };
       // Operator escape hatch: WE_RED_TEAM_DISPATCH_QUEUE=off runs the recovery directly, with no queue filtering or IO.
@@ -1305,12 +1311,23 @@ export function cliReviewTickOpts({ log = console, factCache = null } = {}) {
         options.log(`review-daemon: red-team queue on (source: ${queueSetting === undefined ? 'default' : 'env WE_RED_TEAM_DISPATCH_QUEUE'})`);
         redTeamDispatchQueue = createRedTeamDispatchQueue({ log: options.log });
       }
-      if (redTeamQueueFloor === undefined) {
-        try { redTeamQueueFloor = loadRedTeamQueueFloor({ log: options.log }); }
-        catch { redTeamQueueFloor = null; }
+      // Reload operator policy every tick; retain only the diagnostic, never admission evidence.
+      let floor = null;
+      let floorLine;
+      try {
+        floor = loadRedTeamQueueFloor({ log: line => {
+          if (line.startsWith('review-daemon: red-team queue floor minConcurrent=')) floorLine = line;
+          else options.log(line);
+        } });
+      } catch { /* Unreadable floor evidence disables raises for this tick. */ }
+      if (floorLine !== lastRedTeamQueueFloorLine) {
+        if (floorLine !== undefined) {
+          try { options.log(floorLine); } catch { /* Diagnostics must not interrupt recovery. */ }
+        }
+        lastRedTeamQueueFloorLine = floorLine;
       }
       return runWithRedTeamQueue({ ...options, queue: redTeamDispatchQueue, run: runRedTeamOnSkip,
-        floor: redTeamQueueFloor, readCpuIdlePct: () => sampleHost().idlePct });
+        floor, readCpuIdlePct: () => sampleHost().idlePct });
     },
     poolExhaustion: DAEMON_POOL_EXHAUSTION,
     refreshScopeBloat: refreshScopeBloatedPr,

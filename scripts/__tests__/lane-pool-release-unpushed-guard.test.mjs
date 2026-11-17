@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { sharedRepos, withGhStub } from './fixtures/shared-git-fixture.mjs';
@@ -340,6 +340,293 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     refused(result, older);
     expect(result.stderr).not.toContain(newer.slice(0, 12));
     expect(git(['stash', 'list', '--format=%H'], laneDir).split('\n')).toEqual([newer, older]);
+  });
+  // Stale stash entries must not pin a lane: with recovery on, release bundles every stash entry into the backup root
+  // (verified) and proceeds, while a genuine unpushed branch commit still refuses.
+  it('with recovery on, salvages stash entries to a bundle and releases', () => {
+    const stash = text => {
+      writeFileSync(join(laneDir, 'seed.txt'), text);
+      git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'stash', '--quiet'], laneDir);
+      return git(['rev-parse', 'refs/stash'], laneDir);
+    };
+    const older = stash('older stashed edit\n');
+    const newer = stash('newer stashed edit\n');
+    const result = release([], '', '', RECOVERY_ON);
+    released(result);
+    const dir = join(base, 'backups', 'lane-1-preserve');
+    const record = readFileSync(join(dir, 'stash-bundles.txt'), 'utf8');
+    expect(record).toContain(older);
+    expect(record).toContain(newer);
+    const bundle = record.split('\n')[0].split(' ')[1];
+    expect(spawnSync('git', ['bundle', 'verify', join(dir, bundle)], { cwd: laneDir }).status).toBe(0);
+    expect(git(['stash', 'list', '--format=%H'], laneDir).split('\n')).toEqual([newer, older]);
+  });
+  it.each(['truncated header', 'truncated pack', 'replaced bundle', 'deleted bundle'])(
+    'with recovery on, refuses a recorded stash backup with a %s', damage => {
+      writeFileSync(join(laneDir, 'seed.txt'), 'cached stashed edit\n');
+      git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'stash', '--quiet'], laneDir);
+      const sha = git(['rev-parse', 'refs/stash'], laneDir);
+      const dir = join(base, 'backups', 'lane-1-preserve');
+      mkdirSync(dir, { recursive: true });
+      const bundle = join(dir, 'cached.bundle');
+      git(['bundle', 'create', bundle, 'refs/stash'], laneDir);
+      const record = `${sha} cached.bundle\n`;
+      writeFileSync(join(dir, 'stash-bundles.txt'), record);
+      if (damage === 'truncated header') writeFileSync(bundle, 'truncated');
+      if (damage === 'truncated pack') {
+        const content = readFileSync(bundle);
+        writeFileSync(bundle, content.subarray(0, content.length - 20));
+        // Header verification alone accepts this; the pack must actually be imported into an empty repository.
+        expect(spawnSync('git', ['bundle', 'verify', bundle], { cwd: laneDir }).status).toBe(0);
+      }
+      if (damage === 'replaced bundle') {
+        git(['bundle', 'create', bundle, 'HEAD'], laneDir);
+        expect(spawnSync('git', ['bundle', 'verify', bundle], { cwd: laneDir }).status).toBe(0);
+      }
+      if (damage === 'deleted bundle') rmSync(bundle);
+      refused(release([], '', '', RECOVERY_ON), sha);
+      expect(readFileSync(join(dir, 'stash-bundles.txt'), 'utf8')).toBe(record);
+      expect(git(['rev-parse', 'refs/stash'], laneDir)).toBe(sha);
+    },
+  );
+  it('with recovery on, revalidates and reuses a recorded stash bundle without recreating it', () => {
+    writeFileSync(join(laneDir, 'seed.txt'), 'cached stashed edit\n');
+    git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'stash', '--quiet'], laneDir);
+    released(release([], '', '', RECOVERY_ON));
+    expect(runPool(['acquire', '--lane=1', '--no-reset']).status).toBe(0);
+    const fault = `if (args[0] === 'bundle' && args[1] === 'create') throw new Error('unexpected rebundle');`;
+    released(release([], fault, '', RECOVERY_ON));
+  });
+  const stashText = text => {
+    writeFileSync(join(laneDir, 'seed.txt'), text);
+    git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'stash', '--quiet'], laneDir);
+    return git(['rev-parse', 'refs/stash'], laneDir);
+  };
+  const strayStashRefs = () => git(['for-each-ref', '--format=%(refname)', 'refs/release-stash'], laneDir);
+  // The index of bundled stashes is append-only evidence: a later release must never drop the lines of earlier
+  // bundles whose stash entries were since dropped.
+  it('with recovery on, keeps the index lines of earlier bundles when later stashes are bundled', () => {
+    const first = stashText('first stashed edit\n');
+    released(release([], '', '', RECOVERY_ON));
+    const recordFile = join(base, 'backups', 'lane-1-preserve', 'stash-bundles.txt');
+    const firstLine = readFileSync(recordFile, 'utf8').trim();
+    expect(firstLine.startsWith(`${first} `)).toBe(true);
+    expect(runPool(['acquire', '--lane=1', '--no-reset']).status).toBe(0);
+    git(['stash', 'drop', '--quiet'], laneDir);
+    const second = stashText('second stashed edit\n');
+    released(release([], '', '', RECOVERY_ON));
+    const lines = readFileSync(recordFile, 'utf8').trim().split('\n');
+    expect(lines[0]).toBe(firstLine);
+    expect(lines).toHaveLength(2);
+    expect(lines[1].startsWith(`${second} `)).toBe(true);
+    expect(existsSync(join(base, 'backups', 'lane-1-preserve', firstLine.split(' ')[1]))).toBe(true);
+    // The record is appended in place, so no temp file is left behind.
+    expect(readdirSync(join(base, 'backups', 'lane-1-preserve')).filter(name => name.endsWith('.tmp'))).toEqual([]);
+  });
+  it('with recovery on, closes a torn final index line instead of merging the new line into it', () => {
+    const dir = join(base, 'backups', 'lane-1-preserve');
+    mkdirSync(dir, { recursive: true });
+    const torn = `${'a'.repeat(40)} old-stash.bund`;
+    writeFileSync(join(dir, 'stash-bundles.txt'), torn);
+    const sha = stashText('fresh stashed edit\n');
+    released(release([], '', '', RECOVERY_ON));
+    const lines = readFileSync(join(dir, 'stash-bundles.txt'), 'utf8').split('\n');
+    expect(lines[0]).toBe(torn);
+    expect(lines[1].startsWith(`${sha} stash-`)).toBe(true);
+  });
+  // Fail closed: a stash that cannot be bundled and verified stays unproven, the lane keeps refusing, nothing is
+  // recorded, and the temporary refs are removed even on the failure path.
+  it.each([
+    ['update-ref fails', `if (args.includes('update-ref') && args.includes('--no-deref') && !args.includes('-d')) throw new Error('injected update-ref failure');`],
+    ['bundle create fails', `if (args.includes('bundle') && args.includes('create')) throw new Error('injected bundle failure');`],
+    ['bundle create writes a corrupt file', `if (args.includes('bundle') && args.includes('create')) { fs.writeFileSync(args[args.indexOf('create') + 1], 'garbage'); return ''; }`],
+  ])('with recovery on, refuses and records nothing when %s', (_name, fault) => {
+    const sha = stashText('unbundlable stashed edit\n');
+    refused(release([], fault, '', RECOVERY_ON), sha);
+    expect(existsSync(join(base, 'backups', 'lane-1-preserve', 'stash-bundles.txt'))).toBe(false);
+    expect(git(['rev-parse', 'refs/stash'], laneDir)).toBe(sha);
+    expect(strayStashRefs()).toBe('');
+  });
+  it('with recovery on, uses a fresh temporary ref namespace per release and leaves none behind', () => {
+    const log = join(base, 'update-refs.log');
+    const fault = `if (args.includes('update-ref') && !args.includes('-d')) fs.appendFileSync(${JSON.stringify(log)}, args.join(' ') + '\\n');`;
+    stashText('first stashed edit\n');
+    released(release([], fault, '', RECOVERY_ON));
+    expect(strayStashRefs()).toBe('');
+    expect(runPool(['acquire', '--lane=1', '--no-reset']).status).toBe(0);
+    stashText('second stashed edit\n');
+    released(release([], fault, '', RECOVERY_ON));
+    expect(strayStashRefs()).toBe('');
+    const namespaces = readFileSync(log, 'utf8').split('\n').map(line => /refs\/release-stash\/([^/\s]+)\//.exec(line)?.[1]).filter(Boolean);
+    expect(new Set(namespaces).size).toBe(2);
+  });
+  // `bundle verify` and `unbundle` accept a bundle holding only the stash commit objects; the reachability walk
+  // (rev-list --objects) is what rejects one whose parents/trees/blobs are missing.
+  it('with recovery on, refuses a recorded stash bundle that holds the commit but not its history', () => {
+    const sha = stashText('cached stashed edit\n');
+    const dir = join(base, 'backups', 'lane-1-preserve');
+    mkdirSync(dir, { recursive: true });
+    const pack = spawnSync('git', ['pack-objects', '--stdout', '-q'], { cwd: laneDir, input: `${sha}\n` });
+    expect(pack.status).toBe(0);
+    writeFileSync(join(dir, 'partial.bundle'), Buffer.concat([Buffer.from(`# v2 git bundle\n${sha} refs/stash\n\n`), pack.stdout]));
+    const record = `${sha} partial.bundle\n`;
+    writeFileSync(join(dir, 'stash-bundles.txt'), record);
+    const probe = join(base, 'probe.git');
+    git(['init', '--quiet', '--bare', probe]);
+    expect(spawnSync('git', ['bundle', 'unbundle', join(dir, 'partial.bundle')], { cwd: probe }).status).toBe(0);
+    expect(spawnSync('git', ['rev-list', '--objects', '--quiet', sha], { cwd: probe }).status).not.toBe(0);
+    refused(release([], '', '', RECOVERY_ON), sha);
+    expect(readFileSync(join(dir, 'stash-bundles.txt'), 'utf8')).toBe(record);
+  });
+  // Builds a hand-made bundle of the stash commit and all its reachable objects (optionally minus blobs, optionally
+  // plus extra loose objects), records it, and returns what a probe repository sees of it.
+  const handMadeBundle = (sha, { skipBlobs = false, extra = [] } = {}) => {
+    const dir = join(base, 'backups', 'lane-1-preserve');
+    mkdirSync(dir, { recursive: true });
+    const objects = git(['rev-list', '--objects', sha], laneDir).split('\n').map(line => line.split(' ')[0]);
+    const types = spawnSync('git', ['cat-file', '--batch-check=%(objectname) %(objecttype)'], { cwd: laneDir, encoding: 'utf8', input: `${objects.join('\n')}\n` })
+      .stdout.trim().split('\n');
+    const kept = types.filter(line => !(skipBlobs && line.endsWith(' blob'))).map(line => line.split(' ')[0]);
+    if (skipBlobs) expect(kept.length).toBeLessThan(objects.length);
+    const pack = spawnSync('git', ['pack-objects', '--stdout', '-q'], { cwd: laneDir, input: `${[...kept, ...extra].join('\n')}\n` });
+    expect(pack.status).toBe(0);
+    writeFileSync(join(dir, 'hand.bundle'), Buffer.concat([Buffer.from(`# v2 git bundle\n${sha} refs/stash\n\n`), pack.stdout]));
+    const record = `${sha} hand.bundle\n`;
+    writeFileSync(join(dir, 'stash-bundles.txt'), record);
+    const probe = join(base, 'probe.git');
+    git(['init', '--quiet', '--bare', probe]);
+    // Isolated from the developer's git config (e.g. transfer.fsckObjects would reject the malformed fixture on unbundle).
+    const run = args => spawnSync('git', args, { cwd: probe, encoding: 'utf8', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' } });
+    expect(run(['bundle', 'verify', join(dir, 'hand.bundle')]).status).toBe(0);
+    expect(run(['bundle', 'unbundle', join(dir, 'hand.bundle')]).status).toBe(0);
+    return { dir, record, walk: run(['rev-list', '--objects', '--quiet', sha]), fsck: run(['fsck', '--full', '--no-dangling', '--no-progress']) };
+  };
+  // The reachability walk (rev-list --objects) rejects a bundle whose trees point at blobs it does not hold, even though
+  // `bundle verify` and `unbundle` accept it.
+  it('with recovery on, refuses a recorded stash bundle whose trees point at missing blobs', () => {
+    const sha = stashText('cached stashed edit\n');
+    const { dir, record, walk } = handMadeBundle(sha, { skipBlobs: true });
+    expect(walk.status).not.toBe(0);
+    expect(walk.stderr).toContain('missing blob');
+    refused(release([], '', '', RECOVERY_ON), sha);
+    expect(readFileSync(join(dir, 'stash-bundles.txt'), 'utf8')).toBe(record);
+  });
+  // fsck is a separate guard: this bundle holds everything the stash reaches (the walk passes) plus one malformed,
+  // unreachable tree (entries out of order), which only `fsck --full` rejects.
+  it('with recovery on, refuses a recorded stash bundle carrying a malformed object (fsck, not the walk)', () => {
+    const sha = stashText('cached stashed edit\n');
+    const blob = Buffer.from(git(['rev-parse', `${sha}:seed.txt`], laneDir), 'hex');
+    const entry = name => Buffer.concat([Buffer.from(`100644 ${name}\0`), blob]);
+    const bad = spawnSync('git', ['hash-object', '-t', 'tree', '-w', '--literally', '--stdin'], { cwd: laneDir, input: Buffer.concat([entry('b'), entry('a')]) });
+    expect(bad.status).toBe(0);
+    const { dir, record, walk, fsck } = handMadeBundle(sha, { extra: [bad.stdout.toString().trim()] });
+    expect(walk.status, walk.stderr).toBe(0);
+    expect(fsck.status).not.toBe(0);
+    refused(release([], '', '', RECOVERY_ON), sha);
+    expect(readFileSync(join(dir, 'stash-bundles.txt'), 'utf8')).toBe(record);
+  });
+  // A record line may only name a file directly inside the backup directory; anything else is refused even when the
+  // named bundle is a perfectly valid backup of the stash.
+  it.each(['../outside.bundle', 'sub/inner.bundle'])('with recovery on, refuses a stash record naming %s', name => {
+    const sha = stashText('cached stashed edit\n');
+    const dir = join(base, 'backups', 'lane-1-preserve');
+    mkdirSync(join(dir, 'sub'), { recursive: true });
+    git(['bundle', 'create', join(dir, name), 'refs/stash'], laneDir);
+    expect(spawnSync('git', ['bundle', 'verify', join(dir, name)], { cwd: laneDir }).status).toBe(0);
+    const record = `${sha} ${name}\n`;
+    writeFileSync(join(dir, 'stash-bundles.txt'), record);
+    refused(release([], '', '', RECOVERY_ON), sha);
+    expect(readFileSync(join(dir, 'stash-bundles.txt'), 'utf8')).toBe(record);
+  });
+  // Two releases bundling the same first stash sha in the same second (clock frozen below) must not share a file:
+  // only the per-release nonce keeps the second from replacing the first's verified bundle.
+  it('with recovery on, gives same-sha same-second bundles distinct names so neither replaces the other', () => {
+    const sha = stashText('cached stashed edit\n');
+    const freeze = `if (args[0] === 'reflog') Date.prototype.toISOString = function () { return '2026-01-01T00:00:00.000Z'; };`;
+    const dir = join(base, 'backups', 'lane-1-preserve');
+    released(release([], freeze, '', RECOVERY_ON));
+    const first = readFileSync(join(dir, 'stash-bundles.txt'), 'utf8').trim().split(' ')[1];
+    expect(runPool(['acquire', '--lane=1', '--no-reset']).status).toBe(0);
+    rmSync(join(dir, 'stash-bundles.txt'));
+    released(release([], freeze, '', RECOVERY_ON));
+    const second = readFileSync(join(dir, 'stash-bundles.txt'), 'utf8').trim().split(' ')[1];
+    expect(second).not.toBe(first);
+    expect(first).toContain('20260101T000000');
+    expect(second).toContain('20260101T000000');
+    expect(first).toContain(sha.slice(0, 8));
+    for (const file of [first, second]) expect(spawnSync('git', ['bundle', 'verify', join(dir, file)], { cwd: laneDir }).status).toBe(0);
+  });
+  // A concurrent release appends its own index line while this one is bundling (after this one read the index). The
+  // append-only write keeps that line; a read-modify-write of the whole file would silently drop it.
+  it('with recovery on, retains an index line another release appends while this one is bundling', () => {
+    const sha = stashText('first stashed edit\n');
+    const dir = join(base, 'backups', 'lane-1-preserve');
+    mkdirSync(dir, { recursive: true });
+    const recordFile = join(dir, 'stash-bundles.txt');
+    const earlier = `${'b'.repeat(40)} earlier.bundle`;
+    const racing = `${'c'.repeat(40)} racing.bundle`;
+    writeFileSync(recordFile, `${earlier}\n`);
+    const fault = `if (args.includes('bundle') && args.includes('create')) fs.appendFileSync(${JSON.stringify(recordFile)}, ${JSON.stringify(`${racing}\n`)});`;
+    released(release([], fault, '', RECOVERY_ON));
+    const lines = readFileSync(recordFile, 'utf8').trim().split('\n');
+    expect(lines.slice(0, 2)).toEqual([earlier, racing]);
+    expect(lines).toHaveLength(3);
+    expect(lines[2].startsWith(`${sha} stash-`)).toBe(true);
+  });
+  // The stash's first parent (the commit it was made on) is a tip in its own right. Here that commit has no branch, no
+  // HEAD and no remote ref — the stash is the only thing still pointing at it — so only the first-parent rule sees it.
+  it('with recovery on, refuses an unpushed commit reachable only as the base of a stash', () => {
+    git(['checkout', '--quiet', '-b', 'work/doomed'], laneDir);
+    writeFileSync(join(laneDir, 'real.txt'), 'real work\n');
+    git(['add', 'real.txt'], laneDir);
+    git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '--quiet', '-m', 'real'], laneDir);
+    const sha = git(['rev-parse', 'HEAD'], laneDir);
+    stashText('stashed edit on top\n');
+    git(['checkout', '--quiet', '--detach', 'origin/main'], laneDir);
+    git(['branch', '-D', 'work/doomed'], laneDir);
+    expect(git(['for-each-ref', '--contains', sha, '--format=%(refname)', 'refs/heads', 'refs/remotes'], laneDir)).toBe('');
+    expect(git(['rev-parse', 'refs/stash^1'], laneDir)).toBe(sha);
+    refused(release([], '', '', RECOVERY_ON), sha);
+  });
+  // The same rule must cover older reflog entries, not only refs/stash: the newest stash here sits on a pushed commit, so
+  // only stash@{1}^1 still points at the unpushed one.
+  it('with recovery on, refuses an unpushed commit reachable only as the base of an older stash entry', () => {
+    git(['checkout', '--quiet', '-b', 'work/older'], laneDir);
+    writeFileSync(join(laneDir, 'real.txt'), 'real work\n');
+    git(['add', 'real.txt'], laneDir);
+    git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '--quiet', '-m', 'real'], laneDir);
+    const sha = git(['rev-parse', 'HEAD'], laneDir);
+    stashText('older stashed edit\n');
+    git(['checkout', '--quiet', '--detach', 'origin/main'], laneDir);
+    stashText('newer stashed edit\n');
+    git(['branch', '-D', 'work/older'], laneDir);
+    expect(git(['for-each-ref', '--contains', sha, '--format=%(refname)', 'refs/heads', 'refs/remotes'], laneDir)).toBe('');
+    expect(git(['rev-parse', 'refs/stash^1'], laneDir)).not.toBe(sha);
+    expect(git(['rev-parse', 'stash@{1}^1'], laneDir)).toBe(sha);
+    refused(release([], '', '', RECOVERY_ON), sha);
+  });
+  it('with recovery on, still refuses a genuine unpushed commit when a stash is also present', () => {
+    writeFileSync(join(laneDir, 'seed.txt'), 'stashed edit\n');
+    git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'stash', '--quiet'], laneDir);
+    git(['checkout', '--quiet', '-b', 'work/keep'], laneDir);
+    writeFileSync(join(laneDir, 'real.txt'), 'real work\n');
+    git(['add', 'real.txt'], laneDir);
+    git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '--quiet', '-m', 'real'], laneDir);
+    const sha = git(['rev-parse', 'HEAD'], laneDir);
+    git(['checkout', '--quiet', '--detach', 'origin/main'], laneDir);
+    const result = release([], '', '', RECOVERY_ON);
+    refused(result, sha);
+  });
+  it('with recovery on, still refuses an unpushed branch commit that sits beneath a stash entry', () => {
+    git(['checkout', '--quiet', '-b', 'work/under'], laneDir);
+    writeFileSync(join(laneDir, 'real.txt'), 'real work\n');
+    git(['add', 'real.txt'], laneDir);
+    git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '--quiet', '-m', 'real'], laneDir);
+    const sha = git(['rev-parse', 'HEAD'], laneDir);
+    writeFileSync(join(laneDir, 'seed.txt'), 'stashed edit on top\n');
+    git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'stash', '--quiet'], laneDir);
+    git(['checkout', '--quiet', '--detach', 'origin/main'], laneDir);
+    refused(release([], '', '', RECOVERY_ON), sha);
   });
   it('releases a lane whose HEAD is behind an origin tip it has not fetched yet', () => {
     const other = join(base, 'other');
@@ -961,8 +1248,9 @@ describe('lane git hardening blocks lane credential helpers; the primary-only fo
   });
 
   it('the primary form drops every inherited GIT_CONFIG_COUNT entry, so an inherited helper cannot outlive the missing reset', () => {
-    const inherited = { ...base, GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: `!f() { touch '${evilRan}'; }; f`,
-      GIT_CONFIG_KEY_1: 'core.askPass', GIT_CONFIG_VALUE_1: join(root, 'evil'), GIT_CONFIG_KEY_7: 'credential.helper', GIT_CONFIG_VALUE_7: 'orphan' };
+    const pre = 'GIT_CONFIG_';
+    const inherited = { ...base, GIT_CONFIG_COUNT: '2', [`${pre}KEY_0`]: 'credential.helper', [`${pre}VALUE_0`]: `!f() { touch '${evilRan}'; }; f`,
+      [`${pre}KEY_1`]: 'core.askPass', [`${pre}VALUE_1`]: join(root, 'evil'), [`${pre}KEY_7`]: 'credential.helper', [`${pre}VALUE_7`]: 'orphan' };
     const env = laneGitHardeningEnv(inherited, { credentialPins: false, home });
     expect(pinsOf(env).map(([k]) => k)).not.toContain('credential.helper');
     expect(Object.keys(env).filter(k => /^GIT_CONFIG_(KEY|VALUE)_/.test(k))).toHaveLength(2 * Number(env.GIT_CONFIG_COUNT));

@@ -17,15 +17,15 @@ describe('prototype-load real IO', () => {
         env: { HOME: root },
         settings: {
           daemons: { control: { clone: root } }, workspaceRoot: root,
-          recordPath, readyRecordPath: join(root, 'missing-ready.jsonl'),
+          recordPath, auditRecordPath: join(root, 'missing-audits.jsonl'), readyRecordPath: join(root, 'missing-ready.jsonl'),
           adoption: { timeoutMs: 30, pollMs: 10 },
         },
       });
       const result = await load(input);
-      expect(result).toMatchObject({ ok: false, stopReason: 'no-ready', registered: false, adopted: false });
+      expect(result).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', registered: false, adopted: false });
       const records = readFileSync(recordPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
       expect(records).toHaveLength(1);
-      expect(records[0]).toMatchObject({ ...input, ok: false, stopReason: 'no-ready', registered: false, adopted: false });
+      expect(records[0]).toMatchObject({ ...input, ok: false, stopReason: 'no-canonical-audit', registered: false, adopted: false });
     });
   });
 });

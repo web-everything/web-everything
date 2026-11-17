@@ -342,9 +342,11 @@ export function classifySubmit({ status, signal, stdout = '', stderr = '', error
     // pr-land exits 3 for a guard refusal AND for an environment failure, so neither signal separates them.
     // #79 — `check-timeout` AFTER the PR opened is not "not opened": the PR is real, only the green-wait label
     // step is pending, and the drain's ci-lifecycle reconcile finishes it (#2421). Report that truthfully.
-    if (parsed.reason === 'check-timeout' && parsed.pr) {
+    // R893 - `deferred-ci-not-green` is the same shape: opened with lane verify deferred to CI, ready-to-merge
+    // withheld until a green CI `test` check-run exists on the exact sha.
+    if ((parsed.reason === 'check-timeout' || parsed.reason === 'deferred-ci-not-green') && parsed.pr) {
       return {
-        outcome: 'opened', reason: 'check-timeout', labelStep: 'deferred',
+        outcome: 'opened', reason: parsed.reason, labelStep: 'deferred',
         detail: `PR #${parsed.pr} open; label step deferred to the drain's ci-lifecycle reconcile`,
         pr: parsed.pr, url: parsed.url ?? null,
       };

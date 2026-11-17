@@ -206,6 +206,7 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
         const childEnv = { ...env, WE_VERIFY_REMOTE_REPORT: remoteReport, PATH: `${join(cwd, 'node_modules', '.bin')}:${env.PATH ?? ''}` };
         delete childEnv[ADMISSION_HELD_ENV];
         let lastResult = null, observedFailure = false, loadDeferred = false;
+        let observedUnsettledExit = false, retryReportsPassed = true;
         async function attempt(local, attemptFiles = files, retry = '') {
           if (!remaining()) return 'NOT-RUN';
           const report = join(directory, `${index}.${retry}${local ? 'local' : 'initial'}.json`);
@@ -227,6 +228,8 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
             files: attemptFiles, report, remoteReport: attemptRemoteReport, cwd, env: local ? { ...attemptEnv, [ADMISSION_HELD_ENV]: '1' } : attemptEnv,
             timeoutMs: remaining(), prefix: `[verify-shard ${index + 1}/${shards.length}] `, log });
           lastResult = result;
+          // Passing split inventory cannot explain an earlier admission/child exit 75.
+          observedUnsettledExit ||= result.exitCode === SHARD_UNSETTLED_EXIT;
           // A waited deferral ran nothing: splitting the shard cannot help and would only queue for another full wait,
           // spending the verify budget until the shard reports 124 instead of the contractual 75.
           if (waitMs > 0 && result.exitCode === SHARD_UNSETTLED_EXIT) loadDeferred = true;
@@ -253,6 +256,9 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
           observedFailure ||= result.exitCode !== 0 && result.exitCode !== SHARD_UNSETTLED_EXIT;
           try {
             const report = JSON.parse(reportText);
+            if (retry) retryReportsPassed &&= Array.isArray(report?.testResults) && report.testResults.length > 0
+              && report.testResults.every(r => Array.isArray(r?.assertionResults) && r.assertionResults.length > 0
+                && r.assertionResults.every(a => a?.status === 'passed'));
             const reportFailed = report?.success === false || report?.numRuntimeErrors > 0
               || report?.numFailedTestSuites > 0 || report?.numFailedTests > 0
               || (Array.isArray(report?.testResults) && report.testResults.some(r => r?.status === 'failed'
@@ -272,7 +278,10 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
               for (const test of details.tests) log(`FAIL ${clean(test.file)}${test.name ? ` > ${clean(test.name)}` : ''}\n`);
               log(`verify-shard ${index + 1}/${shards.length}: observed failure ${clean(details.summary)}\n`);
             }
-          } catch { /* Unparseable reports contain no observed test failure. */ }
+          } catch {
+            if (retry) retryReportsPassed = false;
+            /* Unparseable reports contain no observed test failure. */
+          }
           if (inventory === 'INVENTORY-INCOMPLETE') return inventory;
           return result.exitCode === 0 && !result.signal && inventory === 'PASS' ? 'PASS' : 'FAIL';
         }
@@ -315,15 +324,20 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
             const middle = Math.ceil(files.length / 2);
             const halves = files.length === 1 ? [files] : [files.slice(0, middle), files.slice(middle)];
             const retried = [];
-            // One split level only, to surface failures; passing halves cannot settle the shard.
+            const retriedFiles = new Set();
+            // One split level only; green requires complete, strictly passed evidence for the whole shard.
             for (const [half, selected] of halves.entries()) {
               const verdict = await attempt(false, selected, `retry-${half + 1}.`);
               retried.push(verdict);
+              for (const file of selected) retriedFiles.add(file);
               // A deferred half already spent its wait; the other half would queue for a second full wait.
               if (infraExit || loadDeferred || !['PASS', 'INVENTORY-INCOMPLETE'].includes(verdict)) break;
             }
+            const completePass = retried.length === halves.length && retried.every(r => r === 'PASS')
+              && !observedFailure && !infraExit && !loadDeferred && !observedUnsettledExit && retryReportsPassed
+              && retriedFiles.size === files.length && files.every(file => retriedFiles.has(file));
             status = retried.find(r => ['TIMEOUT', 'NOT-RUN', 'FAIL'].includes(r))
-              ?? (observedFailure ? 'FAIL' : 'UNSETTLED');
+              ?? (observedFailure ? 'FAIL' : completePass ? 'PASS' : 'UNSETTLED');
           }
           // Ordinary complete remote reds remain clearable by local confirmation.
           // Incomplete shards retain their failure evidence even if confirmation passes.

@@ -1,6 +1,6 @@
 import { JUDGE_ACTOR, JUDGE_ATTRIBUTION, readJudgeActorPolicy, readJudgeWriterPolicy, assertJudgeAuthority, isJudgeAuthored } from '../lib/marker-authorship.mjs';
 import { assertJudgeReason, judgeEvidenceComment } from './record-referral-ruling.mjs';
-import { judgeRulingSink, judgeConfirm as defaultJudgeConfirm, readJudgeNotRealMode, readJudgeEvidence, readCardRulingFileMode, landRulingCard as defaultLandRulingCard, rulingCardFilingSink } from './record-referral-ruling-io.mjs';
+import { judgeRulingSink, judgeConfirm as defaultJudgeConfirm, readJudgeNotRealMode, readJudgeEvidence, readCardRulingFileMode, readCardAllowNonRegression, landRulingCard as defaultLandRulingCard, rulingCardFilingSink } from './record-referral-ruling-io.mjs';
 /**
  * @file scripts/operations/record-red-team-ruling-io.mjs
  * @description The IMPURE half of `record-red-team-ruling` (see `./record-red-team-ruling.mjs`): the reader (live
@@ -78,7 +78,9 @@ const resolveCardDefault = (card, { runGit = git, readOnPr = readCardAtPrHead } 
   const hasFrontmatter = text => /^---\r?\n[\s\S]+?\r?\n---\r?\n/.test(text);
   const readable = ref => {
     if (!CARD_REF_RE.test(ref)) return false;
-    if (/@pr\d+$/.test(ref)) return referralCardReadable(ref, REPO_ROOT, { readOnPr });
+    // No published-card lookup here: the sink re-resolves the unsuffixed ref through the fresh origin/main fetch
+    // below (bornAs included), so a renumbered card still releases; a probe of its own would be a live git read.
+    if (/@pr\d+$/.test(ref)) return referralCardReadable(ref, REPO_ROOT, { readOnPr, readMainByBornAs: () => null });
     try { return hasFrontmatter(readText(ref)); }
     catch {
       // Preserve references to provisional cards renumbered on landing, using only main's content.
@@ -145,7 +147,7 @@ export function createRecordRedTeamRulingReader({ tool, log = line => console.er
       return { head, ...(actor === JUDGE_ACTOR ? { judgeActorPolicy: readJudgeWriterPolicy({ env, tool: tool?.judgeActor, log }) } : {}),
         ...(asJudge ? { judgeNotRealMode: readJudgeNotRealMode({ env, tool, log }),
           evidence: readJudgeEvidence(evidenceFile, readFile), disagreements } : {}),
-        cardFileMode: readCardRulingFileMode({ env, tool, log }), labels: thread.labels ?? [], comments: thread.comments ?? [],
+        cardFileMode: readCardRulingFileMode({ env, tool, log }), cardAllowNonRegression: readCardAllowNonRegression({ env, tool, log }), labels: thread.labels ?? [], comments: thread.comments ?? [],
         standingRuling,
         setting: readSetting().value, scope: { value: scope.value, sources: scope.sources ?? {} }, now: now(), identity: resolveIdentity(actor),
         card: card === undefined || card === '' ? null : resolveCard(card, { repo, pr, head }) };

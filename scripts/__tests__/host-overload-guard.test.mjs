@@ -92,10 +92,13 @@ it('gc command runs one pass and watch re-resolves policy with interactive bypas
 // Exercise each scheduled-pass refusal in both command modes, including the next watch tick.
 it.each([false, true])('gc recovery only follows completed scheduled passes (watch=%s)', async watch => {
   for (const reason of ['host overloaded', 'unreadable policy', 'gc lock held', 'gc schedule not due']) {
-    const scheduledLaneGc = vi.fn().mockReturnValueOnce({ ran: false, reason }).mockReturnValue({ ran: true });
-    const recoverRepoPool = vi.fn(async () => {}), timers = [], log = vi.fn();
+    // A completed pass admits lane 1 by running its gc through the injected `exec`; a refused pass never does.
+    const scheduledLaneGc = vi.fn().mockReturnValueOnce({ ran: false, reason })
+      .mockImplementation((dirs, opts) => { opts.exec('git', ['gc'], { cwd: dirs[0] }); return { ran: true }; });
+    const recoverRepoPool = vi.fn(async () => {}), salvageUnpushed = vi.fn(async () => true), timers = [], log = vi.fn();
     const command = poolFunction('cmdGc', {
       scheduledLaneGc, flags: { watch }, existingLanes: () => [1], laneDir: () => '/pool/lane-1',
+      execFileSync: () => '', salvageUnpushed, salvageRefName: () => 'ref',
       recoveryEnabled: () => true, recoverRepoPool, log, process: { stdin: {} },
       loadHostOverloadSettings: () => ({ settings: { lanes: { gc: { schedule: 60000 } } } }),
       setTimeout: (fn, ms) => timers.push({ fn, ms }),
@@ -103,13 +106,17 @@ it.each([false, true])('gc recovery only follows completed scheduled passes (wat
     const repo = { originUrl: 'https://example.org/canonical.git' };
     await command(repo);
     expect(recoverRepoPool).not.toHaveBeenCalled();
+    expect(salvageUnpushed).not.toHaveBeenCalled();
     if (watch) {
       expect(timers[0].ms).toBe(60000);
       await timers[0].fn();
       expect(timers[1].ms).toBe(60000);
     } else await command(repo);
     expect(recoverRepoPool).toHaveBeenCalledTimes(1);
-    expect(recoverRepoPool).toHaveBeenCalledWith(repo);
+    // Recovery and salvage act only on the lanes the completed pass admitted.
+    expect(recoverRepoPool).toHaveBeenCalledWith(repo, [1]);
+    expect(salvageUnpushed).toHaveBeenCalledTimes(1);
+    expect(salvageUnpushed).toHaveBeenCalledWith(repo, expect.objectContaining({ lanes: [1] }));
   }
 });
 

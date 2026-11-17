@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { proveCardOnlyHeadMove } from '../lib/card-only-head-move.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
-import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus, redTeamStatusDir, readRecoveryWitness, restoreRecoveryWriter } from '../lib/drain-red-team-evidence.mjs';
+import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus, redTeamStatusDir, readRecoveryWitness, restoreRecoveryWriter, createCarriedCheckPublisher, markCarriedCheckUnpublished } from '../lib/drain-red-team-evidence.mjs';
 import { pidNamespace } from '../lib/pid-alive.mjs';
 import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
@@ -91,7 +91,7 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
-import { liveResultGateState, readRedTeamProbes, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
+import { isPublishableRedTeamResult, liveResultGateState, parseRedTeamComment, readRedTeamProbes, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
 import { planRedTeamRecovery, recoveryProbe as defaultRecoveryProbe, staleRunDeadlineMs, normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
@@ -315,6 +315,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
   readWitness = key => readRecoveryWitness({ ...key, env, readScorecards: readSeatRecords }), recoveryProbe = defaultRecoveryProbe(),
   queueBaseline = () => resolveLiveQueueBaseline({ checkoutRoot: root, env }),
   seatAvailable = provider => createRedTeamIo({ root, env }).cliAvailable(provider),
+  log = line => writeLineSync(2, `[${new Date().toISOString()}] ${line}`),
 } = {}) {
   // Keep rollback authority in this process; the runner's admission file is untrusted.
   const recoveryAdmissions = new Map();
@@ -372,6 +373,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
           if (input.redTeamMode) {
             witness = readWitness(key);
             recovery = planRedTeamRecovery(witness, { now: Date.now(), probe: recoveryProbe, deadlineMs: staleRunDeadlineMs(env), env });
+            if (recovery.abandon) log(`red-team run dead (infra): pid=${witness.rawWriter.parsed.pid} head=${head} reason=${recovery.deathReason}; requeued once`);
             if (recovery.mode === 'skip' || recovery.abandon || recovery.mode !== input.redTeamMode
               || JSON.stringify(recovery.payload?.findings?.read) !== JSON.stringify(input.loopPayload?.findings?.read)) throw Error(recovery.why ?? 'recovery evidence changed; retry next tick');
           }
@@ -495,6 +497,11 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       return { ok: r.status === 0, reason: String(r.stderr || r.stdout || r.error || `exit ${r.status}`) };
     },
     postCarryComment: ({ pr, repo, body }) => execRead('gh', ['pr', 'comment', String(pr), `--repo=${repo}`, '--body', body], { cwd: root, env }),
+    // The outbox marker outlives a failed attempt, so the on-skip recovery pass retries the carried check (#6606). The
+    // write takes the writers' host lock, so a settlement in progress can never delete it (send-back item 2).
+    markCarriedCheckOwed: ({ pr, repo, headSha }) => markCarriedCheckUnpublished({ repo, pr, head: headSha, env }),
+    // The shared writer resolves the App id from the setting and lets the writer env (the WE App) win (#6606).
+    publishCarriedCheck: createCarriedCheckPublisher({ env, run: (args, options) => exec('gh', args, { cwd: root, ...options }) }),
     now: () => Date.now(),
     newActorId: () => randomUUID(),
     readPrevCompletion: (slug) => { try { return tryReadCompletion(slug); } catch { return null; } },
@@ -702,7 +709,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       for (const row of rows) run = withSeatTiming(run, row);
       writeRun(run);
     },
-    log: (line) => writeLineSync(2, `[${new Date().toISOString()}] ${line}`),
+    log,
   };
 }
 
@@ -843,6 +850,13 @@ function tail(text, n = 400) {
  *   loopOutcome:(string|null), runId:(string|null), lanePath:(string|null), label:(string|null), refused?:boolean,
  *   timings:{acquireMs:(number|null), loopMs:(number|null), totalMs:number}}}
  */
+/** Bounded single-line ` (reason)` suffix naming the red-team result-comment error; absent/empty reason adds nothing. PURE. */
+export function commentReasonSuffix(value, text = (v, fb) => { try { return String(v ?? fb); } catch { return fb; } }) {
+  if (value === undefined || value === null) return '';
+  const line = text(value, '').replace(/\s+/g, ' ').trim().slice(0, 200);
+  return line ? ` (${line})` : '';
+}
+
 export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   const seatsBox = {};
   // Card xbizuci — `review.speculativeRedTeam` (policy cascade; the layer that set it is logged). Off, or an io
@@ -937,7 +951,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
       const deferred = Boolean(redTeam?.deferredByGuard || redTeam?.deferredByCap);
       // A completion claim remains unpublished until all derivations and live evidence succeed.
       settlementOutcome = completed
-        ? { status: 'unpublished', reason: `red team ${status} but its result comment is ${diagnosticText(redTeam?.comment?.status, 'unknown')}` }
+        ? { status: 'unpublished', reason: `red team ${status} but its result comment is ${diagnosticText(redTeam?.comment?.status, 'unknown')}${commentReasonSuffix(redTeam?.comment?.reason, diagnosticText)}` }
         : redTeam;
       // A stored review run is not evidence of an unpublished red-team run.
       const reviewOnly = completed && !deferred && reviewOnlyRedTeamResult(redTeam);
@@ -1128,6 +1142,12 @@ function runReviewArc({
             const headPatchId = io.contributionPatchId({ sha: evidence.headSha, repo: planned.repo });
             const decision = decideRebaseVerdictCarry({ setting: setting.value, prior, priorPatchId, headPatchId });
             if (decision.carry) {
+              // #6606: carry only a result the live publisher accepts once re-keyed to this head (the same predicate),
+              // decided before any restamp, owed marker or comment. Anything else re-reviews instead of stranding.
+              const carriedAdvisory = prior.advisoryBody
+                ? prior.advisoryBody.replace(redTeamMarker(planned.pr, prior.sha), redTeamMarker(planned.pr, evidence.headSha)) : null;
+              if (!isPublishableRedTeamResult(parseRedTeamComment(carriedAdvisory)))
+                throw Error('carried red-team result is not publishable on the new head');
               const stamped = io.restampVerdict({ pr: planned.pr, repo: planned.repo, newHead: evidence.headSha,
                 reason: `${decision.reason}; from ${prior.sha}; patch-id ${headPatchId}` });
               if (!stamped?.ok) throw Error(`restamp refused: ${stamped?.reason ?? 'unknown error'}`);
@@ -1138,9 +1158,21 @@ function runReviewArc({
                   : [...decided.outcomes].map(outcome => redTeamGateMarker(planned.pr, evidence.headSha, outcome, decided.resultId));
               const body = [...gate, buildVerdictCarriedMarker({ fromSha: prior.sha, toSha: evidence.headSha, patchId: headPatchId }),
                 'Review verdict carried across an identical contribution.',
-                ...(prior.advisoryBody ? [prior.advisoryBody.replace(redTeamMarker(planned.pr, prior.sha), redTeamMarker(planned.pr, evidence.headSha))] : [])].join('\n');
+                carriedAdvisory].join('\n');
+              // #6606: mark the check owed BEFORE the comment. Recovery skips a head whose result is on it, so a crash
+              // between the comment and the publication must still leave a marker for the retry to find.
+              try { io.markCarriedCheckOwed?.({ pr: planned.pr, repo: planned.repo, headSha: evidence.headSha }); }
+              catch (error) { io.log(`review-job ${slug}: carried-check retry marker not written (${tail(safeErrorText(error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' '), 300)})`); }
               io.postCarryComment({ pr: planned.pr, repo: planned.repo, body });
-              classified = { outcome: 'carried', fromSha: prior.sha, headSha: evidence.headSha, patchId: headPatchId };
+              let checkPublished = false;
+              try {
+                const published = io.publishCarriedCheck({ pr: planned.pr, repo: planned.repo, headSha: evidence.headSha });
+                checkPublished = published?.ok === true;
+                if (!checkPublished) io.log(`review-job ${slug}: carried check not published (${tail(safeErrorText(published?.reason ?? 'unknown error').replace(/[\x00-\x1f\x7f-\x9f]/g, ' '), 300)})`);
+              } catch (error) {
+                io.log(`review-job ${slug}: carried check not published (${tail(safeErrorText(error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' '), 300)})`);
+              }
+              classified = { outcome: 'carried', fromSha: prior.sha, headSha: evidence.headSha, patchId: headPatchId, checkPublished };
               return result(classified);
             }
           }

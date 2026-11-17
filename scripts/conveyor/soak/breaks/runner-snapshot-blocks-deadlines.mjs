@@ -9,6 +9,23 @@ import { createJobStore } from '../../../lib/daemon-jobs-runtime.mjs';
 import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
 import { keepAliveScript } from '../../../lib/test-keepalive.mjs';
 
+/** Attempts allowed before a timing violation counts. The defect blocks the loop for the full 400ms on EVERY
+ * attempt, so it never passes; a one-off ~200ms host stall (CI shard under load, main red @ aab47a34a:
+ * returnedAt 210 / stopAt 205 against the 200ms bars) clears on the next attempt. Thresholds are unchanged. */
+export const TIMING_ATTEMPTS = 3;
+
+/** Run `attempt` until a report judges clean, up to `attempts` times; return the first clean report, else the last. */
+export async function settleAttempts(attempt, judge, attempts = TIMING_ATTEMPTS) {
+  let report;
+  for (let i = 0; i < attempts; i++) {
+    report = await attempt();
+    if (judge(report).length === 0) return report;
+  }
+  return report;
+}
+
+const judgeReport = report => report.violations;
+
 export default {
   id: 'runner-snapshot-blocks-deadlines',
   title: 'blocking PR discovery delays unrelated launches and existing timed-pass deadlines',
@@ -18,7 +35,13 @@ export default {
     return readFileSync(join(root, 'skills-src/conveyor/runner.mjs'), 'utf8')
       .includes("owned.ready = runRepo('conveyor/open-pr-snapshot.mjs'");
   },
-  async run({ log } = {}) {
+  run({ log } = {}) {
+    return settleAttempts(() => runOnce({ log }), judgeReport);
+  },
+  judge: judgeReport,
+};
+
+async function runOnce({ log } = {}) {
     const root = mkdtempSync(join(tmpdir(), 'runner-snapshot-deadline-'));
     const store = createJobStore(join(root, 'jobs'));
     const children = new Map();
@@ -103,6 +126,4 @@ export default {
       await existing;
       rmSync(root, { recursive: true, force: true });
     }
-  },
-  judge: report => report.violations,
-};
+}

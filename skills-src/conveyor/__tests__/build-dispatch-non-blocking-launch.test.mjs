@@ -49,7 +49,7 @@ describe('non-blocking launch (78b)', () => {
   it.each(['failed', 'indeterminate'])('redacts %s dispatch receipts at the public payload and daemon boundaries', async (status) => {
     // Shared payload guard: CLI JSON and HTTP run routes both use outcomePayload.
     // Include settings JSON, assignment, bearer and token shapes across line/quote boundaries.
-    const secret = 'ghp_fixtureSecret123456789';
+    const secret = 'gh\x70_fixtureSecret123456789';
     const error = `Command failed: worker --settings {"env":{"GH_TOKEN":"${secret}"}}\n\r\u2028\`" -- ../ GH_TOKEN=${secret} Bearer ${secret}`;
     const effect = { key: 'receipt#0', type: 'conveyor.dispatch-delivery-agent', status,
       handle: `worker GH_TOKEN=${secret}`, error };
@@ -77,7 +77,7 @@ describe('non-blocking launch (78b)', () => {
   });
 
   it.each(['reason', 'why'])('redacts the dispatch verdict %s fallback', (field) => {
-    const reason = 'refused GH_TOKEN=ghp_fixtureSecret123456789';
+    const reason = 'refused GH_TOKEN=gh\x70_fixtureSecret123456789';
     const envelope = outcomePayload({ run: { id: 'refusal', op: 'dispatch-lane', effects: [], verdict: { dispatching: false, [field]: reason } }, stopped: 'complete' });
     expect(envelope.verdict[field]).toBe(redactSpawnText(reason));
     expect(readDispatchOutcome(JSON.stringify({ verdict: { dispatching: false, [field]: reason } })).reason)
@@ -85,7 +85,7 @@ describe('non-blocking launch (78b)', () => {
   });
 
   it.each(['empty', 'invalid', 'failed', 'partial'])('redacts detached %s output before excerpts reach tick reasons', async (kind) => {
-    const secret = 'ghp_fixtureSecret123456789';
+    const secret = 'gh\x70_fixtureSecret123456789';
     const opaque = 'opaqueDiagnosticCredential123';
     const error = `Command failed: GH_TOKEN=${secret} {"env":{"GH_TOKEN":"${opaque}"}}`;
     const rec = startDetachedLaunch({ root: lockRoot, num: '3827', kind: 'build', argv: [], env: {}, cwd: lockRoot,

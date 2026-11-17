@@ -36,7 +36,12 @@ describe('CI consumes quarantine for every automatically quarantined suite', () 
     const steps = jobs['soak-shard'].steps;
     const i = steps.findIndex((s) => s.uses?.startsWith('actions/checkout@'));
     expect(steps[i].with?.['fetch-depth']).toBe(50);
-    expect(steps[i + 1].run).toMatch(/--filter=blob:none --depth=1000000 origin \+refs\/heads\/main:refs\/remotes\/origin\/main/);
+    const fetch = steps[i + 1];
+    expect(fetch.run).toBe('sh scripts/ci/fetch-main-history.sh');
+    expect(fetch['timeout-minutes']).toBe(4);
+    expect(fetch['continue-on-error']).toBeUndefined();
+    const helper = readFileSync(new URL('../fetch-main-history.sh', import.meta.url), 'utf8');
+    expect(helper).toMatch(/--filter=blob:none --depth=1000000 origin '\+refs\/heads\/main:refs\/remotes\/origin\/main'/);
   });
 
   it.each([['integration', integrationFile], ['soak-shard (1)', soakFile]])('%s retains fail-closed guards', (job, file) => {

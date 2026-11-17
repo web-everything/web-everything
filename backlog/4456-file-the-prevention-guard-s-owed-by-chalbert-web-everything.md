@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/check-standards-rules-retired-fields.test.mjs", "we:scripts/check-standards.mjs", "we:scripts/__tests__/check-standards.test.mjs", "we:scripts/__tests__/check-standards-backlog-schema.test.mjs", "we:backlog/1683-implement-the-js-first-token-runtime-webinjectors-resolves-t.md"]
 dateOpened: "2026-09-28"
-preparedDate: "2026-11-08"
-preparedAgainstSha: "7cf64add2e939aa00bb940bdd61ca428c0b16937"
+preparedDate: "2026-11-15"
+preparedAgainstSha: "7a92d9600ec0da5ef600045686b9a22ca975a082"
 tags: []
 ---
 
@@ -29,6 +29,10 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2
 - Re-prepare 2026-11-05 against origin/main 27e2ab3d: premise still open (no `backlog-retired-field` guard on main; `workItem: epic` still at we:backlog/1683-implement-the-js-first-token-runtime-webinjectors-resolves-t.md:3). Only drift: later-scan citations shifted about 8 lines (now :1482, :1525, :1567, :1748, :1805, :1962); raw loop (:1058-1061) and parse scan (:999-1000) unchanged. No scope, size or goal change.
 
 - Re-prepare 2026-11-08 against origin/main 7cf64add: premise still open (no `backlog-retired-field` in scripts/; `workItem: epic` still at we:backlog/1683-implement-the-js-first-token-runtime-webinjectors-resolves-t.md:3). `git diff 27e2ab3d..HEAD` shows no change to we:scripts/check-standards.mjs, we:scripts/check-standards-rules.mjs or the 1683 card, so every citation above holds. No scope, size or goal change; only the stamp is refreshed.
+
+- Re-prepare 2026-11-10 against origin/main 42b15b8a: premise still open (no `backlog-retired-field` or `backlog-unreadable-card` in scripts/; `workItem: epic` still at we:backlog/1683-implement-the-js-first-token-runtime-webinjectors-resolves-t.md:3). `git diff 7cf64add..HEAD` over we:scripts/check-standards.mjs, we:scripts/readiness/claimScope.mjs, we:src/_data/backlog.js and the 1683 card is empty; we:scripts/check-standards-rules.mjs gained only two `LEASH_PIN_SNAPSHOT` entries (~:4456), below every cited line. Raw loop (:1058-1061) and parse scan (:999-1000) unchanged. No scope, size or goal change; only the stamp is refreshed.
+
+- Re-prepare 2026-11-14 against origin/main 432c9452: premise still open (no `backlog-retired-field` in scripts/; `workItem: epic` still at we:backlog/1683-implement-the-js-first-token-runtime-webinjectors-resolves-t.md:3). `git diff 42b15b8a..HEAD` over we:scripts/check-standards.mjs, we:scripts/check-standards-rules.mjs, we:scripts/readiness/claimScope.mjs, we:src/_data/backlog.js and the 1683 card is empty, so every citation holds. No scope, size or goal change; only the stamp is refreshed.
 
 ## Design
 
@@ -70,3 +74,5 @@ Save red/green output for A1–A5 using the added tests first with the pre-build
 - Report any newly discovered corpus occurrences for explicit scope adjustment; do not silently migrate unrelated cards or choose their classifications.
 
 revalidated: The supplied diff only extends template badge and kind-filter checks; it does not alter the preparation’s frontmatter validation, backlog readers, corpus repair, or test/proof premises.
+
+revalidated: The diff adds scope-basename warning counts and regression coverage without changing the frontmatter guard premise, backlog reader design, corpus repair, or test/proof plan.
