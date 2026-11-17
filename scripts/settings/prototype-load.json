@@ -78,14 +78,6 @@
   "loaderCli": "scripts/daemon-overlay.mjs",
   "ruledWeakened": [
     {
-      "ref": "lane/forge-orphan-markers-r1017",
-      "sha": "083831dbc5de37c8f68bb15b016978f29576e580",
-      "ruling": "R1017a",
-      "findings": [
-        "scripts/readiness/forge-slot-markers.mjs:430 \u2014 New runlessDeadGrace bypasses the 120-minute-plus-skew retention bound after 15 minutes. Remote dispatch has no enforced start deadline, so a delayed run can fall outside the ownership window and remain active while its marker is released, allowing additional admission. The new regression test explicitly accepts this loss of capacity protection."
-      ]
-    },
-    {
       "ref": "lane/redteam-check-run",
       "sha": "dc7a0efb1c64862460b26d141815dbaf84c55d36",
       "ruling": "R787+R773",
