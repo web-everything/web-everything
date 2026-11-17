@@ -1444,15 +1444,16 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
       log(`manifest: ${delta ? `git-delta (${delta.changedCount} changed of ${delta.baseCount})` : `full-scan (${manifestReason})`}\n`);
       manifestDone({...(!delta?{manifestReason}:{}),substages:[...substages.values].map(([stage,ms])=>({stage,ms:Math.round(ms)}))});
       // Exclusion must not turn a requested test run green by omitting its tests.
-      // Vitest run filters are substrings; related/full-suite discovery needs all tests.
+      // Only file filters and known no-value flags prove a narrower scope. Any
+      // other option (including a value-taking flag) may select excluded tests.
+      // Related/full-suite discovery needs all tests. Vitest folds filter case.
       if(argv[2]!=='check:standards') {
-        const filters=[];
-        for(let i=argv[0]==='npm'?4:3;i<argv.length;i++) {
-          if(argv[i]==='-t'||argv[i]==='--config'){i++;continue;}
-          if(!argv[i].startsWith('-'))filters.push(argv[i]);
-        }
+        const args=argv.slice(argv[0]==='npm'?4:3);
+        const fileOnly=argv[2]!=='related'&&args.every(arg=>!arg.startsWith('-')
+          ||['--run','--silent','--no-color','--passWithNoTests'].includes(arg));
+        const filters=fileOnly?args.filter(arg=>!arg.startsWith('-')).map(arg=>arg.toLocaleLowerCase()):[];
         const missing=manifest.excluded.find(path=>isTestFile(path)
-          &&(argv[2]==='related'||!filters.length||filters.some(filter=>path.toString('utf8').includes(filter))));
+          &&(!filters.length||filters.some(filter=>path.toString('utf8').toLocaleLowerCase().includes(filter))));
         if(missing)return fallback('unshipped-test-file',missing.toString('utf8'));
       }
       // Scanners may skip nonexistent paths. Require the entire requested scope

@@ -833,9 +833,10 @@ export function manifestEntry(path,content,executable,tracked,onWarning) {
   pathParts(path);
   if(typeof tracked!=='boolean')throw new Error('Missing manifest tracking evidence');
   const {credentialSource}=classifyManifestPath(path);
+  const keyFinding=ordinaryPathKeyFinding(content);
   const finding=credentialSource
-    ?!tracked?'untracked':credentialContentFinding(path,content)
-    :ordinaryPathKeyFinding(content);
+    ?!tracked?'untracked':credentialContentFinding(path,content)||keyFinding
+    :keyFinding;
   // The additive all-path gate blocks structures. Legacy text, JSON and encoding requirements
   // remain credential-name policy; their findings must neither reject ordinary files nor mask keys.
   if(finding)

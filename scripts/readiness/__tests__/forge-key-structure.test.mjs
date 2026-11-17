@@ -91,7 +91,7 @@ describe('shared algorithm OIDs distinguish public and private containers',()=>{
       });
       if(algorithm==='dsa'||algorithm==='dh')
         it(`still refuses ${algorithm} PKCS#8 in ${view}`,()=>{
-          // A preceding public container must not short-circuit a later private key.
+          // A preceding public container must not short-circuit a later secret container.
           for(const bytes of [privateDer,Buffer.concat([publicDer,privateDer,Buffer.from('tail')])]) {
             const content=Buffer.from(encode(bytes));
             expect(credentialBufferFinding(content)).toBe(FINDING);
@@ -153,6 +153,8 @@ describe('forge-key-structure: structured keys without a label',()=>{
           const buf=Buffer.from(body);
           expect(credentialBufferFinding(buf),body.slice(0,60)).toBe(FINDING);
           expect(credentialContentFinding(Buffer.from('docs/notes.md'),buf)).toBe(FINDING);
+          expect(()=>manifestEntry(Buffer.from('credentials.yaml'),buf,false,true))
+            .toThrow(expect.objectContaining({code:'excluded-source-file'}));
         }
       });
     }
@@ -823,7 +825,7 @@ describe('forge-key-structure: fixture paths never waive content scanning',()=>{
     expect(ordinaryPathKeyFinding(publicBlock)).toBeNull();
     expect(ordinaryPathKeyFinding(Buffer.from('prose mentions '+head.trim()+' as a header'))).toBeNull();
   });
-  it('refuses a base64- or hex-wrapped PEM secret-key block under an ordinary name',()=>{
+  it('refuses base64- or hex-wrapped PEM secret-key blocks under ordinary and credential names',()=>{
     const pem='-----'+'BEGIN PRIVATE '+'KEY-----\n'+('A'.repeat(8)+'\n').repeat(3)+'-----'+'END PRIVATE '+'KEY-----\n';
     const pgp='-----'+'BEGIN PGP PRIVATE'+' KEY BLOCK-----\n\n'+('B'.repeat(8)+'\n').repeat(3);
     for(const text of [pem,pgp]) {
@@ -841,14 +843,25 @@ describe('forge-key-structure: fixture paths never waive content scanning',()=>{
       for(const content of wrapped) {
         const bytes=Buffer.from(content);
         expect(ordinaryPathKeyFinding(bytes),content.slice(0,40)).toBe('private-key');
-        for(const tracked of [false,true])
-          expect(()=>manifestEntry(Buffer.from('config/material.yaml'),bytes,false,tracked))
-            .toThrow(expect.objectContaining({code:'excluded-source-file'}));
+        for(const path of ['config/material.yaml','k8s/secret.yaml','credentials.yaml'])
+          for(const tracked of [false,true])
+            expect(()=>manifestEntry(Buffer.from(path),bytes,false,tracked))
+              .toThrow(expect.objectContaining({code:'excluded-source-file'}));
       }
     }
     // Base64 of ordinary prose, and an over-limit view that is skipped rather than decoded, stay admitted.
     expect(ordinaryPathKeyFinding(Buffer.from('data: '+Buffer.from('just some ordinary prose, nothing secret here at all').toString('base64')))).toBeNull();
     expect(ordinaryPathKeyFinding(Buffer.from('A'.repeat(4*1024*1024+16)))).toBeNull();
+  });
+  it.each(['base64','hex'])('credential-named %s PEM refuses full shipping before transport',async encoding=>{
+    const pem=Buffer.from('-----'+'BEGIN PRIVATE '+'KEY-----\n'+('A'.repeat(8)+'\n').repeat(3));
+    const f=dispatchFixture(Buffer.from('tls.key: '+pem.toString(encoding)),{name:'k8s/secret.yaml'});
+    try {
+      await expect(buildManifest(f.options)).rejects.toMatchObject({code:'excluded-source-file'});
+      expect(await runRemote(f.options)).toMatchObject({mode:'not-started',reason:'excluded-source-file'});
+      expect(f.options.exec.mock.calls.some(([call])=>call.file==='rsync'
+        ||call.file==='ssh'&&/ (?:prepare|run)$/.test(call.args.at(-1)))).toBe(false);
+    } finally {rmSync(f.root,{recursive:true,force:true});}
   });
   it('the manifest and this test carry no blocking finding of their own',()=>{
     for(const file of ['../forge-exec-manifest.mjs','./forge-key-structure.test.mjs']) {
@@ -869,14 +882,44 @@ const keyBearingFixtureNames=redactionFixtureNames.filter(name=>/\/(?:ci-heal-ma
 describe('operator send-back IC_kwDORBt1-c8AAAABnW58dw: tracked fixture exclusion',()=>{
   it.each([
     ['npm','run','test:unit','--','fixture.test.mjs'],
+    ['npm','run','test:unit','--','FIXTURE.test.mjs','--silent'],
     ['npm','run','test:unit'],
     ['npx','vitest','related','src/index.mjs','--run'],
+    ['npm','run','test:unit','--','--reporter=verbose'],
+    ['npm','run','test:unit','--','-t','verbose'],
+    ['npx','vitest','run','other.test.mjs','-t','verbose'],
+    ['npx','vitest','run','other.test.mjs','--testNamePattern=verbose'],
+    ['npx','vitest','run','other.test.mjs','--config','vitest.soak.config.ts'],
+    ['npx','vitest','run','other.test.mjs','--reporter=verbose'],
   ])('runs locally when the excluded fixture belongs to requested scope %j',async(...argv)=>{
     const f=dispatchFixture(ed,{name:'fixture.test.mjs'});
     try {
       expect(await runRemote({...f.options,argv})).toMatchObject({mode:'not-started',reason:'unshipped-test-file'});
       expect(f.options.exec.mock.calls.some(([call])=>call.file==='rsync'
         ||call.file==='ssh'&&/ (?:prepare|run)$/.test(call.args.at(-1)))).toBe(false);
+    } finally {rmSync(f.root,{recursive:true,force:true});}
+  });
+  it.each([
+    ...['--reporter','--pool','--project','--dir','--config','--testNamePattern','--unknown-flag']
+      .map(flag=>['npm','run','test:unit','--',flag,'verbose']),
+    ...['--pool','--project','--dir','--config','--unknown-flag']
+      .map(flag=>['npx','vitest','run','other.test.mjs',`${flag}=verbose`]),
+  ])('refuses unsupported valued flags before any transport %j',async(...argv)=>{
+    const f=dispatchFixture(ed,{name:'fixture.test.mjs'});
+    try {
+      expect(await runRemote({...f.options,argv})).toMatchObject({mode:'not-started',reason:'command-not-allowed'});
+      expect(f.options.exec).not.toHaveBeenCalled();
+    } finally {rmSync(f.root,{recursive:true,force:true});}
+  });
+  it.each([
+    ['npm','run','test:unit','--','other.test.mjs'],
+    ['npx','vitest','run','other.test.mjs','--run','--silent','--no-color','--passWithNoTests'],
+  ])('permits file-only scope disjoint from excluded tests to reach prepare %j',async(...argv)=>{
+    const f=dispatchFixture(ed,{name:'fixture.test.mjs',extraFiles:{'other.test.mjs':Buffer.from('export const test = 1;')}});
+    try {
+      // The injected transport stops at prepare; it never contacts Forge.
+      expect(await runRemote({...f.options,argv})).toMatchObject({mode:'not-started',reason:'copy-failed'});
+      expect(f.options.exec.mock.calls.some(([call])=>call.file==='ssh'&&/ prepare$/.test(call.args.at(-1)))).toBe(true);
     } finally {rmSync(f.root,{recursive:true,force:true});}
   });
   it('excludes a new tracked key-bearing test without throwing or shipping its bytes',async()=>{
@@ -970,13 +1013,17 @@ describe('forge-key-structure: perf and tracked files',()=>{
 });
 
 describe('forge-key-structure: warm-base export',()=>{
-  for(const shape of ['repository fixtures','DER','base64','PEM'])
-    it(`publishes a ready warm base with key-bearing ${shape} excluded`,async()=>{
+  for(const shape of ['repository fixtures','DER','base64','PEM','credential-wrapped-PEM'])
+    it(shape==='credential-wrapped-PEM'?'refuses warm-base publication for credential-named encoded PEM'
+      :`publishes a ready warm base with key-bearing ${shape} excluded`,async()=>{
       const root=realpathSync(mkdtempSync(join(process.env.TMPDIR??tmpdir(),'forge-key-warm-')));
       const sha='a'.repeat(40),fixtures=shape==='repository fixtures';
       const material=shape==='DER'?ed:shape==='base64'?Buffer.from(ed.toString('base64'))
         :Buffer.from(['-----'+'BEGIN PRIVATE '+'KEY-----',ed.toString('base64'),'-----'+'END PRIVATE '+'KEY-----'].join('\n'));
-      const files={'package-lock.json':Buffer.from('{}'),...(fixtures
+      const credential=shape==='credential-wrapped-PEM';
+      const wrappedPem=Buffer.from('-----'+'BEGIN PRIVATE '+'KEY-----\n'+('A'.repeat(8)+'\n').repeat(3));
+      const files={'package-lock.json':Buffer.from('{}'),...(credential
+        ? {'credentials.yaml':Buffer.from('tls.key: '+wrappedPem.toString('base64'))}:fixtures
         ? Object.fromEntries(redactionFixtureNames.map((name,i)=>[`fixture-${i}.test.mjs`,readFileSync(name)]))
         : {'material.bin':material})};
       const inventory=Object.entries(files).map(([name,bytes])=>{
@@ -998,6 +1045,12 @@ describe('forge-key-structure: warm-base export',()=>{
       try {
         const tick=()=>warmTick({root,exec,install,clock:()=>Date.parse('2026-11-15T00:01:00Z'),
           runs:join(root,'runs'),receipts:join(root,'receipts'),log:vi.fn()});
+        if(credential) {
+          await expect(tick()).rejects.toMatchObject({code:'excluded-source-file'});
+          expect(install).not.toHaveBeenCalled();
+          await expect(filesystem.lstat(join(root,sha,'READY'))).rejects.toMatchObject({code:'ENOENT'});
+          return;
+        }
         await expect(tick()).resolves.toMatchObject({sha});
         expect(install).toHaveBeenCalledOnce();
         expect(JSON.parse(readFileSync(join(root,sha,'READY'),'utf8'))).toMatchObject({sha});
