@@ -212,7 +212,7 @@ describe('report-only tick', () => {
     ['invalid repo', makeClaim({ repo: 123 }), 'Missing or invalid meta.repo', false],
     ['missing PR', makeClaim({ pr: undefined }), 'Missing or invalid meta.pr', false],
     ['invalid PR', makeClaim({ pr: 'bad' }), 'Missing or invalid meta.pr', false],
-    ['missing kind', makeClaim({ kind: undefined }), 'Missing or invalid meta.kind', true],
+    ['invalid kind', makeClaim({ kind: 7 }), 'Missing or invalid meta.kind', true],
     ['invalid claim time', makeClaim({ claimedAt: 'bad' }), 'Invalid claimedAt', true],
     ['missing claim time', makeClaim({ claimedAt: undefined }), 'Invalid claimedAt', true],
     ['invalid heartbeat', makeClaim({}, { heartbeatAt: 'bad' }), 'Invalid heartbeatAt', true],

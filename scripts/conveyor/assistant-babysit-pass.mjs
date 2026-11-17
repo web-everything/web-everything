@@ -48,6 +48,8 @@ function loadClaims(io, coordDir) {
       if (['number', 'string'].includes(typeof meta?.pr) && Number.isInteger(Number(meta.pr)) && Number(meta.pr) > 0) pr = Number(meta.pr);
       if (!repo) throw new Error('Missing or invalid meta.repo');
       if (!pr) throw new Error('Missing or invalid meta.pr');
+      // Legacy claim files without a kind are skipped by the canonical store reader too; they are not bad claims.
+      if (meta.kind === undefined) continue;
       if (typeof meta.kind !== 'string' || !meta.kind.trim()) throw new Error('Missing or invalid meta.kind');
       if (typeof lock.owner !== 'string' || !lock.owner.trim()) throw new Error('Missing or invalid owner');
       const ttlMinutes = meta.ttlMinutes ?? DEFAULT_CLAIM_TTL_MIN;
