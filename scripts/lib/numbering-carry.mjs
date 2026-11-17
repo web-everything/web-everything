@@ -119,6 +119,11 @@ function isCodeLineSwap(before, after, map) {
       if (!after.startsWith(segment, cursor)) return false;
       cursor += segment.length;
     } else {
+      // Literal Unicode escapes can extend identifiers: the backslash and the closing brace
+      // are not proven delimiters. Conservatively refuse adjacency without parsing file syntax.
+      // Scan only the neighbouring segments, keeping total work linear even with padded escapes.
+      if (/\\u(?:[0-9a-fA-F]{4}|\{[0-9a-fA-F]+\})$/.test(segments[i - 1])
+        || /^\\u(?:[0-9a-fA-F]{4}|\{[0-9a-fA-F]+\})/.test(segments[i + 1])) return false;
       const number = map.get(segment);
       if (typeof number !== 'string' || !after.startsWith(number, cursor)) return false;
       cursor += number.length;

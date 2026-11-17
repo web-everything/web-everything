@@ -29,6 +29,9 @@ it('keeps numbering acceptance writes in the shared review-label provider', () =
   expect(checkReviewLabelSingleHomeCode(files).errors).toEqual([]);
 });
 const map = new Map([['xf74q20', '6053'], ['xztd0mv', '6054']]);
+const identifierEscapes = [String.raw`\u0061`, String.raw`\u{61}`, String.raw`\u{000000061}`,
+  String.raw`\u0301`, String.raw`\u{301}`, String.raw`\u200C`, String.raw`\u{200D}`,
+  String.raw`\u{1D165}`, String.raw`\u{10400}`, String.raw`\u{00AA}`];
 const rewrite = (text, pairs = map) => text.replace(/\bx[0-9a-z]{6}\b/g, (hash) => pairs.get(hash) ?? hash);
 const stamp = (text, hash) => text.replace(/^---\n/, `---\nbornAs: ${hash}\n`);
 function live() {
@@ -170,6 +173,20 @@ describe('checkNumberingCommit', () => {
           { status: 'M', path: 'scripts/app.mjs', before, after },
         ],
       }), /id rewrite/);
+    });
+    it.each(identifierEscapes)('refuses swaps touching a literal identifier escape on either side: %s', (escape) => {
+      for (const [hash, number] of [['xf74q20', '6053'], ['x1b8hlo', '5726']]) {
+        const before = `const ${hash}${escape} = 1;`;
+        const after = `const ${number}${escape} = 1;`;
+        expect(() => new Function(before)).not.toThrow();
+        expect(() => new Function(after)).toThrow(SyntaxError);
+        refused(checkNumberingCommit(withCode(before, after)), /id rewrite/);
+        refused(checkNumberingCommit(withCode(`const a${escape}${hash} = 1;`, `const a${escape}${number} = 1;`)), /id rewrite/);
+        expect(checkNumberingCommit(withCode(`'xf74q20'; ${before}`, `'6053'; ${before}`)).ok).toBe(true);
+      }
+    });
+    it('carries a swap separated from an escape by a real delimiter', () => {
+      expect(checkNumberingCommit(withCode(String.raw`\u{61}/xf74q20-\u0061`, String.raw`\u{61}/6053-\u0061`)).ok).toBe(true);
     });
     it.each(['scripts/guard.mjs', '.github/workflows/run.yml', 'scripts/lib/numbering-carry.mjs', 'CODEOWNERS'])(
       'knowingly carries the behaviour-changing typeof counterexample under R953: %s', (path) => {
@@ -373,6 +390,16 @@ function proofReader({ changes = live().changes, commitSubject = subject, subjec
 describe('proveNumberingOnlyMove read-only regressions', () => {
   const codeChanges = (hash = 'x1b8hlo', number = '5726') => [...live().changes,
     { status: 'M', path: 'scripts/app.mjs', before: `card: '${hash}';\n`, after: `card: '${number}';\n` }];
+  it.each(identifierEscapes)('refuses escaped identifier swaps through the full read-only proof: %s', (escape) => {
+    for (const [prefix, suffix] of [['', escape], [`a${escape}`, '']]) {
+      const changes = [
+        { status: 'D', path: 'backlog/xf74q20-card.md', before: 'card' },
+        { status: 'A', path: 'backlog/6053-card.md', after: 'card' },
+        { status: 'M', path: 'scripts/app.mjs', before: `const ${prefix}xf74q20${suffix} = 1;`, after: `const ${prefix}6053${suffix} = 1;` },
+      ];
+      refused(proofReader({ changes, commitSubject: 'drain: JIT-number xf74q20→#6053 at land (#2288)' }).prove(), /id rewrite/);
+    }
+  });
   it.each(['5726', '5727'])('refuses an ambiguous main hash by dropping it through the reader: %s', (number) => {
     const mainAliases = [5726, 5727, 5726].map((n, i) => `origin/main:backlog/${n}-alias-${i}.md:bornAs: x1b8hlo\n`).join('');
     refused(proofReader({ changes: codeChanges('x1b8hlo', number), mainAliases }).prove(), /id rewrite/);
