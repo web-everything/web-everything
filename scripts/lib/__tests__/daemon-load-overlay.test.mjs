@@ -153,7 +153,7 @@ describe('mergeOverlayRef — injected git', () => {
     const { run, calls } = runner();
     const r = mergeOverlayRef({ root: '/x', ref: 'lane/xkse05k-gh-app-shim-401-fallback', run });
     expect(r).toEqual({ merged: true, commits: 2, reason: 'merged' });
-    expect(calls).toContain('fetch --quiet -- origin lane/xkse05k-gh-app-shim-401-fallback');
+    expect(calls).toContain('fetch --quiet -- origin +refs/heads/lane/xkse05k-gh-app-shim-401-fallback:refs/remotes/origin/lane/xkse05k-gh-app-shim-401-fallback');
     expect(calls.some((c) => c.startsWith('merge origin/lane/xkse05k-gh-app-shim-401-fallback'))).toBe(true);
   });
 
@@ -200,6 +200,16 @@ describe('mergeOverlayRef — injected git', () => {
     expect(calls.some((c) => c.startsWith('merge') && !c.includes('--abort'))).toBe(false);
   });
 
+  it.each([1, null])('a failed or partial fetch (%s) refuses before counting stale refs, with one exact refspec', (status) => {
+    const { run, calls } = runner({ fetch: { status, stdout: 'partial fetch output', signal: status === null ? 'SIGKILL' : null }, 'rev-list': { status: 0, stdout: '0\n' } });
+    expect(mergeOverlayRef({ root: '/x', ref: 'lane/x', run }))
+      .toEqual({ merged: false, commits: 0, reason: 'fetch-failed' });
+    const fetch = calls.find((c) => c.startsWith('fetch'));
+    expect(fetch).toBe('fetch --quiet -- origin +refs/heads/lane/x:refs/remotes/origin/lane/x');
+    expect(fetch).not.toContain('*');
+    expect(calls.some((c) => /^(rev-list|merge) /.test(c))).toBe(false);
+  });
+
   it('a `--ref` that looks like a git option is refused before any git runs (argv injection)', () => {
     expect(() => mergeOverlayRef({ root: '/x', ref: '--upload-pack=touch /tmp/pwned;', run: () => ({ status: 0, stdout: '' }) })).toThrow(/not a safe branch name/);
   });
@@ -219,7 +229,22 @@ describe('dryRunOverlay — injected git, never merges', () => {
     };
     const r = dryRunOverlay({ root: '/x', ref: 'lane/x', run });
     expect(r).toEqual({ onHome: true, dirty: false, fetched: true, behind: 3, headSha: 'deadbeef', wouldMerge: true });
+    expect(calls).toContain('fetch --quiet -- origin +refs/heads/lane/x:refs/remotes/origin/lane/x');
     expect(calls.some((c) => c.startsWith('merge'))).toBe(false);
+  });
+
+  it('a failed preview fetch never counts a stale tracking ref or proposes a merge', () => {
+    const calls = [];
+    const run = (args) => {
+      calls.push(args);
+      if (args[0] === 'fetch') return { status: 1, stdout: 'partial fetch output' };
+      return { status: 0, stdout: args[0] === 'symbolic-ref' ? 'main\n' : args[0] === 'rev-parse' ? 'deadbeef\n' : '' };
+    };
+    expect(dryRunOverlay({ root: '/x', ref: 'lane/x', run }))
+      .toMatchObject({ fetched: false, behind: null, wouldMerge: false });
+    expect(calls.find((args) => args[0] === 'fetch'))
+      .toEqual(['fetch', '--quiet', '--', 'origin', '+refs/heads/lane/x:refs/remotes/origin/lane/x']);
+    expect(calls.some((args) => args[0] === 'rev-list' || args[0] === 'merge')).toBe(false);
   });
 
   it('not on home branch → wouldMerge:false, still read-only', () => {
@@ -288,6 +313,34 @@ describe('mergeOverlayRef / dryRunOverlay — REAL git (temp repos), proving the
       expect(realRun(['merge-base', '--is-ancestor', tip, 'HEAD'], { cwd: daemon }).status).toBe(followUpRebuilds ? 0 : 1);
       if (!followUpRebuilds) expect(result).toMatchObject({ reason: 'installed-build-lacks-overlay', pending: true });
     });
+  });
+
+  it.each(['merge', 'preview'])('refreshes an excluded overlay tracking ref before %s (plain fetch falsely says up-to-date)', (mode) => {
+    const d = join(dir, 'daemon');
+    const up = join(dir, 'upstream');
+    // The previously registered tip is already installed, but this clone only tracks main.
+    expect(mergeOverlayRef({ root: d, ref: 'lane/overlay', run: realRun }).reason).toBe('merged');
+    git(d, 'config', 'remote.origin.fetch', '+refs/heads/main:refs/remotes/origin/main');
+    const oldTip = git(d, 'rev-parse', 'origin/lane/overlay').trim();
+    git(up, 'checkout', '-q', 'lane/overlay');
+    commit(up, 'overlay.txt', 'new remote tip\n');
+    git(up, 'push', '-q', 'origin', 'lane/overlay');
+    const tip = git(up, 'rev-parse', 'HEAD').trim();
+    // Regression proof: the old plain fetch succeeds but only FETCH_HEAD advances.
+    git(d, 'fetch', '--quiet', '--', 'origin', 'lane/overlay');
+    expect(git(d, 'rev-parse', 'FETCH_HEAD').trim()).toBe(tip);
+    expect(git(d, 'rev-parse', 'origin/lane/overlay').trim()).toBe(oldTip);
+    expect(git(d, 'rev-list', '--count', 'HEAD..origin/lane/overlay').trim()).toBe('0');
+    if (mode === 'preview') {
+      expect(dryRunOverlay({ root: d, ref: 'lane/overlay', run: realRun }))
+        .toMatchObject({ fetched: true, behind: 1, wouldMerge: true, headSha: oldTip });
+      expect(git(d, 'rev-parse', 'HEAD').trim()).toBe(oldTip);
+    } else {
+      expect(mergeOverlayRef({ root: d, ref: 'lane/overlay', run: realRun }))
+        .toEqual({ merged: true, commits: 1, reason: 'merged' });
+      expect(git(d, 'rev-parse', 'HEAD').trim()).toBe(tip);
+    }
+    expect(git(d, 'rev-parse', 'origin/lane/overlay').trim()).toBe(tip);
   });
 
   it('a clean overlay merges into `main` while the clone stays ON `main` the whole time', () => {

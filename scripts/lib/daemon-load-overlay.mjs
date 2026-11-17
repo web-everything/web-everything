@@ -109,6 +109,11 @@ function assertSafeRef(ref, source) {
   return ref;
 }
 
+// Explicitly refresh only this validated overlay, even in single-branch clones.
+function overlayFetchRefspec(ref) {
+  return `+refs/heads/${ref}:refs/remotes/origin/${ref}`;
+}
+
 /**
  * The IO: verify the clone is on `homeBranch` and clean, fetch `origin/<ref>`, and merge it in. Never leaves
  * the tree mid-merge — a conflicting merge is ALWAYS aborted before this returns. Mirrors
@@ -137,7 +142,7 @@ export function mergeOverlayRef({ root, ref, homeBranch = 'main', run = gitRun, 
   // `--` ends option parsing (same defense-in-depth as daemon-self-sync.mjs's POC fetch): even a `ref` that
   // slipped past assertSafeRef somehow is never read as a git OPTION.
   repairCloneRefs(root, { log: (m) => console.error(m) }); // prune dangling remote-tracking refs before any fetch (no re-clone: this CLI does not hold the clone write lock)
-  const fetched = git(['fetch', '--quiet', '--', 'origin', ref]).status === 0;
+  const fetched = git(['fetch', '--quiet', '--', 'origin', overlayFetchRefspec(ref)]).status === 0;
   if (!fetched) return { merged: false, commits: 0, reason: 'fetch-failed' };
 
   const count = (range) => {
@@ -173,7 +178,7 @@ export function dryRunOverlay({ root, ref, homeBranch = 'main', run = gitRun, ti
   const onHome = head.status === 0 ? String(head.stdout ?? '').trim() === homeBranch : null;
   const status = git(['status', '--porcelain']);
   const dirty = status.status === 0 ? !!String(status.stdout ?? '').trim() : null;
-  const fetched = git(['fetch', '--quiet', '--', 'origin', ref]).status === 0;
+  const fetched = git(['fetch', '--quiet', '--', 'origin', overlayFetchRefspec(ref)]).status === 0;
   const count = (range) => {
     const r = git(['rev-list', '--count', range]);
     const out = String(r.stdout ?? '').trim();

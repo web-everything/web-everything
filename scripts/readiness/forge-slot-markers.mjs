@@ -50,14 +50,15 @@ function sidecarRun(file, owner) {
 /**
  * What Forge's recent-run telemetry says about one run: `finished` (a settled result), `inflight` (listed
  * without a code), `absent` (not listed, with no active runs) or `unknown` (incomplete evidence).
- * The caller guarantees the sample postdates the owner's death by a margin.
+ * The caller guarantees sample freshness (and the reaper also requires its owner-death margin).
  */
 export function runVerdict(telemetry, run) {
   const evidence = recentEvidence(telemetry, run);
   if (!evidence) return 'unknown';
-  // R518: Forge lists its active run ids, so a run in the list is executing, whatever recent says.
-  if (evidence.active) return 'inflight';
   const entry = telemetry.recent.find(item => item?.runId === run);
+  // A normal result is published only after the worker tree exits and its receipt is written. The
+  // prepared/running state can linger until finish, so activeRunIds alone cannot override that result.
+  if (evidence.active && (!Number.isInteger(entry?.code) || entry.code === 97 || entry.code === 254)) return 'inflight';
   if (!entry) return evidence.complete ? 'absent' : 'unknown';
   // The install/supervisor catch paths publish 97/254 even when descendants may survive. Their executing lock
   // and prepared/running state remain until finish confirms worker cleanup. Only zero active runs proves that
@@ -266,6 +267,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
       let names;
       try { names = fs.readdirSync(root); } catch { return []; }
       const dead = [], reaped = [], held = [];
+      let finishedStillActive = false;
       for (const name of names) {
         const m = NAME.exec(name);
         if (!m) continue;
@@ -334,6 +336,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
             // swapped in meanwhile is put straight back (or kept as a held tombstone that still blocks its slot), so no
             // dispatch marker is ever lost, whatever the timing and without any lease or lock.
             if (!claimAndRemove(entry)) continue;
+            if (verdict === 'finished' && telemetry.activeRunIds?.includes(entry.run)) finishedStillActive = true;
             forget(entry.file, entry.key);
             reaped.push(entry.name);
             log(`heavy-admission: released unconfirmed remote slot ${JSON.stringify({slot: entry.index, runId: entry.run ?? null, verdict, activeRuns: telemetry.activeRuns, sampledAtET: telemetry.sampledAtET})} activeRuns=${telemetry.activeRuns}\n`);
@@ -342,7 +345,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
       }
       const stuck = held.filter(h => !reaped.includes(h.name));
       if (stuck.length >= stuckMinSlots) raise('stuck-slots', {slots: stuck.map(h => h.name), minAgeMs: stuckAgeMs}, now);
-      if (reaped.length) log(`heavy-admission: reaped stale remote slot marker(s) ${reaped.join(', ')} (owner dead; its Forge run is finished or absent)\n`);
+      if (reaped.length) log(`heavy-admission: reaped stale remote slot marker(s) ${reaped.join(', ')} (owner dead; its Forge run is finished${finishedStillActive ? ' (still listed active)' : ''} or absent)\n`);
       return reaped;
     },
   };
