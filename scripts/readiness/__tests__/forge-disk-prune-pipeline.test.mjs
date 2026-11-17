@@ -36,7 +36,7 @@ async function receive(producer) {
   }});
   expect(await checkRemoteHealth({root: remote, settings, clock: () => now, readTelemetry})).toEqual({ok: true});
   expect(peekRemoteTelemetry({root: remote})).toBeTruthy();
-  const health = JSON.parse(await readFile(join(remote, 'health.json'), 'utf8'));
+  const health = JSON.parse(await readFile(join(remote, 'health-g2.json'), 'utf8'));
   const wired = {...smell, evaluate: (probes, ctx) => smell.evaluate(probes, {...ctx, readForgeHealth: () => health})};
   return runHealthTick(emptyHealthState(), {}, [wired], now);
 }
