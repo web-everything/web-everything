@@ -1,3 +1,4 @@
+import { assertLaunchDescriptor } from '../conveyor/conflict-rebase-launch-gate.mjs';
 /**
  * @file scripts/operations/worker-wrapper-launch.mjs
  * @description ITEM 117 S3b — the fix, ci-heal and review LAUNCHES move off `claude --bg` onto the unified detached
@@ -141,6 +142,7 @@ export function launchWrappedClaudeWorker({
     console.error(refused);
     return { handle: `refused:smoke-sentinel-${sentinelPr}`, wrapperPid: null, sessionId, argv: [], refused };
   }
+  assertLaunchDescriptor({ mode, launchGuard });
   const argv = wrappedArgvFromBg(bgArgv, { sessionId });
   const { wrapperPid } = launch({
     mode, launchGuard, role, launcher: 'claude-p', session, command: 'claude', argv, cwd, env, timeoutMs: wrappedTimeoutMs(role, env),

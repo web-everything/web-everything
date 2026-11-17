@@ -1,3 +1,5 @@
+import { readLaunchEvidence } from '../operations/launch-evidence.mjs';
+import { assertLaunchDescriptor } from './conflict-rebase-launch-gate.mjs';
 /**
  * The fix daemon's verify-verdict pass — we:backlog/5137-harness-owns-the-verify-wait-not-the-model.md slices 2+3.
  *
@@ -1080,7 +1082,7 @@ export function pushShaFromScratch({ laneGitDir, url, sha, ref, exec = execFileS
 export async function defaultAwaitVerifyIo({
   weRoot = ROOT, exec = execFileSync, env = process.env, sleep = sleepSync,
   dispatchIo = null, stopSessionFn = null, pushRefusalFn = null, readClaimFn = null, poolRoot = null, realpath = realpathSync,
-  pidAliveFn = pidAlive,
+  pidAliveFn = pidAlive, readSavedLaunch = readLaunchEvidence,
   listWrappedWorkers = listWrappedWorkerAgents, requestWrappedResumeFn = requestWrappedResume,
 } = {}) {
   /** The lane pool the daemon acts in. A record's `lane` is agent-typed, so a path outside the pool is never touched. */
@@ -1299,6 +1301,11 @@ export async function defaultAwaitVerifyIo({
     },
     resume: ({ session, prompt }) => {
       if (session?.kind === 'wrapped-worker') return requestWrappedResumeFn({ session, prompt });
+      let saved;
+      try {
+        saved = readSavedLaunch(session.id || session.sessionId);
+        assertLaunchDescriptor(saved);
+      } catch (e) { return { resumed: false, reason: String(e?.message ?? e).split('\n')[0] }; }
       // Every read this port makes of the session list is UNCACHED: the 20s agents cache would otherwise show a
       // pre-stop / pre-spawn row and misjudge both the exit wait and the resume confirmation.
       const liveEnv = { ...env, WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' };
@@ -1337,7 +1344,7 @@ export async function defaultAwaitVerifyIo({
       }
       const argv = io.buildAgentArgv({ payload: { prompt }, resumeSessionId: session.sessionId });
       let stdout = '';
-      try { stdout = String(io.defaultSpawnAgent(argv, { cwd: session.cwd }) ?? ''); } catch (e) { return { resumed: false, reason: String(e?.message ?? e).split('\n')[0] }; }
+      try { stdout = String(io.defaultSpawnAgent(argv, { cwd: session.cwd, mode: saved.mode, launchGuard: saved.launchGuard, launchContext: saved.launchContext }) ?? ''); } catch (e) { return { resumed: false, reason: String(e?.message ?? e).split('\n')[0] }; }
       const printedId = io.parseBackgroundedId(stdout);
       let outcome = { resumed: false };
       for (let attempt = 1; attempt <= 3; attempt += 1) {

@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { launchWrappedClaudeWorker, WRAPPED_ROLES_DEFAULT_ON } from '../worker-wrapper-launch.mjs';
 
 const options = (launch, over = {}) => ({
-  role: 'fix', session: 'fix-900002', pr: 900002, env: {},
+  mode: 'fix', launchGuard: null, role: 'fix', session: 'fix-900002', pr: 900002, env: {},
   bgArgv: ['--bg', '-n', 'fix-900002', 'PROMPT'], specDir: 'unused-specs', launch, ...over,
 });
 const refusal = 'operations: refusing to launch a real claude worker for smoke sentinel PR #900002 (set smokeRealWorker.allowSentinel or WE_SMOKE_ALLOW_REAL_WORKER=1 to allow)';

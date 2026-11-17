@@ -89,7 +89,7 @@ describe('a codex borrow launches through fix-run with the filled brief', () => 
 });
 
 describe('runFixCli', () => {
-  const argv = ['--pr=7', '--session=fix-7', '--ref=lane/7-x', '--prompt-file=/p.md', '--provider=codex', '--repo=o/r', '--lane-repo=/w'];
+  const argv = ['--mode=ordinary', '--launch-guard=null', '--pr=7', '--session=fix-7', '--ref=lane/7-x', '--prompt-file=/p.md', '--provider=codex', '--repo=o/r', '--lane-repo=/w'];
   const mk = (heads) => {
     const initialHead = heads.shift();
     let laneHead = initialHead;
@@ -1942,7 +1942,7 @@ describe('runFixCli', () => {
     await runFixCli(argv, { ...bad.io, removePrompt: rm2 });
     expect(rm2).toHaveBeenCalledWith('/p.md');
     const rm3 = vi.fn();
-    await runFixCli(['--pr=7', '--prompt-file=/q.md'], { ...ok.io, removePrompt: rm3 });   // missing required flags
+    await runFixCli(['--mode=ordinary', '--launch-guard=null', '--pr=7', '--prompt-file=/q.md'], { ...ok.io, removePrompt: rm3 });   // missing required flags
     expect(rm3).toHaveBeenCalledWith('/q.md');
   });
   it('refuses to push when the agent changed the lane repo-local git config (remote url, sshCommand, insteadOf...)', async () => {

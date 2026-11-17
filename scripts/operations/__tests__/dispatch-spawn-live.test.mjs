@@ -47,7 +47,7 @@ import { buildAgentArgv, defaultSpawnAgent, defaultListAgents, parseBackgrounded
 function spawnVia(fake, argv, extraEnv = {}) {
   const env = { ...process.env, ...fake.env, ...extraEnv };
   fake.assertWins(env);
-  return defaultSpawnAgent(argv, { env });
+  return defaultSpawnAgent(argv, { mode: 'ordinary', launchGuard: null, env });
 }
 
 let fake = null;

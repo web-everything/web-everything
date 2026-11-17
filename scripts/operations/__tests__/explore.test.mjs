@@ -910,7 +910,7 @@ describe('the provider port — #3579', () => {
   it('defaultClaudeProvider is ONE implementation of the port, composing buildInvestigatorArgv + spawnAgent', () => {
     const spawned = [];
     const handle = defaultClaudeProvider(
-      { sessionId: 'sess-c9', runId: 'run-explore-b', panelist: 'p2', cwd: '/primary/webeverything', prompt: 'go investigate' },
+      { mode: 'ordinary', launchGuard: null, sessionId: 'sess-c9', runId: 'run-explore-b', panelist: 'p2', cwd: '/primary/webeverything', prompt: 'go investigate' },
       { spawnAgent: (argv, opts) => { spawned.push({ argv, opts }); return ''; } },
     );
     expect(handle).toBe('sess-c9');
@@ -918,7 +918,7 @@ describe('the provider port — #3579', () => {
       argv: buildInvestigatorArgv({
         sessionId: 'sess-c9', runId: 'run-explore-b', payload: { panelist: 'p2' }, prompt: 'go investigate',
       }),
-      opts: { cwd: '/primary/webeverything' },
+      opts: { cwd: '/primary/webeverything', mode: 'investigate', launchGuard: null },
     }]);
   });
 
@@ -971,7 +971,7 @@ describe('the provider port — #3579', () => {
     });
     const spawned = [];
     defaultClaudeProvider(
-      { sessionId: 'sess-parity', runId: 'run-explore-parity', panelist: richPayload.panelist, cwd: '/primary/webeverything', prompt: 'go investigate' },
+      { mode: 'ordinary', launchGuard: null, sessionId: 'sess-parity', runId: 'run-explore-parity', panelist: richPayload.panelist, cwd: '/primary/webeverything', prompt: 'go investigate' },
       { spawnAgent: (argv) => { spawned.push(argv); return ''; } },
     );
     expect(spawned[0]).toEqual(directArgv);

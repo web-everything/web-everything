@@ -70,17 +70,17 @@ describe('createFakeClaude — spawn/list/stop through the real production seams
     fake = createFakeClaude();
     const argv = bg(1, 'fix-effort', { table: { model: 'claude-sonnet-5-5', effort: 'high' } });
     expect(argv).toContain('--effort');
-    expect(defaultSpawnAgent(argv, { env: envFor(fake) })).toMatch(/backgrounded/);
+    expect(defaultSpawnAgent(argv, { mode: 'ordinary', launchGuard: null, env: envFor(fake) })).toMatch(/backgrounded/);
     expect(fake.sessions()[0].argv).toEqual(argv);
     for (const flags of [['--effort', 'invalid'], ['--not-a-cli-option']]) {
-      expect(() => defaultSpawnAgent(['--bg', ...flags, 'brief'], { env: envFor(fake) })).toThrow();
+      expect(() => defaultSpawnAgent(['--bg', ...flags, 'brief'], { mode: 'ordinary', launchGuard: null, env: envFor(fake) })).toThrow();
     }
     expect(fake.sessions()).toHaveLength(1);
   });
 
   it('a real `--bg` dispatch is listed with a genuinely live pid', () => {
     fake = createFakeClaude();
-    const stdout = defaultSpawnAgent(bg(1, 'review-501'), { env: envFor(fake) });
+    const stdout = defaultSpawnAgent(bg(1, 'review-501'), { mode: 'ordinary', launchGuard: null, env: envFor(fake) });
     expect(stdout).toMatch(/backgrounded/);
 
     const listing = defaultListAgents({ env: envFor(fake) });
@@ -95,7 +95,7 @@ describe('createFakeClaude — spawn/list/stop through the real production seams
 
   it('`dispatch-abort.mjs#stopSession` kills the sleeper and deregisters the session from the default listing, but `--all` still remembers it', () => {
     fake = createFakeClaude();
-    defaultSpawnAgent(bg(2, 'review-502'), { env: envFor(fake) });
+    defaultSpawnAgent(bg(2, 'review-502'), { mode: 'ordinary', launchGuard: null, env: envFor(fake) });
     const [row] = defaultListAgents({ env: envFor(fake) });
 
     const env = envFor(fake);
@@ -111,7 +111,7 @@ describe('createFakeClaude — spawn/list/stop through the real production seams
 
   it('`killPid` (the JS API) kills the sleeper directly, no `claude stop` involved', () => {
     fake = createFakeClaude();
-    defaultSpawnAgent(bg(3, 'review-503'), { env: envFor(fake) });
+    defaultSpawnAgent(bg(3, 'review-503'), { mode: 'ordinary', launchGuard: null, env: envFor(fake) });
     const [row] = fake.sessions();
     expect(() => process.kill(row.pid, 0)).not.toThrow();
 
@@ -121,8 +121,8 @@ describe('createFakeClaude — spawn/list/stop through the real production seams
 
   it('`--all` vs no-`--all`: multiple sessions, one stopped, one still working', () => {
     fake = createFakeClaude();
-    defaultSpawnAgent(bg(41, 'review-541'), { env: envFor(fake) });
-    defaultSpawnAgent(bg(42, 'review-542'), { env: envFor(fake) });
+    defaultSpawnAgent(bg(41, 'review-541'), { mode: 'ordinary', launchGuard: null, env: envFor(fake) });
+    defaultSpawnAgent(bg(42, 'review-542'), { mode: 'ordinary', launchGuard: null, env: envFor(fake) });
     const env = envFor(fake);
     const [first] = defaultListAgents({ env });
     stopSession({ handle: first.id, exec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, env }) });
@@ -147,7 +147,7 @@ describe('createFakeClaude — spawn/list/stop through the real production seams
     // `defaultSpawnAgent` strips GH_TOKEN/GITHUB_TOKEN before the child ever sees them
     // (we:scripts/lib/gh-app-shim.mjs#sanitizeSpawnEnv) — this proves the STRIPPED value never reaches the
     // session, not merely that the shim can record one when handed one directly (the case above).
-    defaultSpawnAgent(bg(6, 'review-506'), { env: envFor(fake, { GH_TOKEN: 'ambient-should-be-stripped' }) });
+    defaultSpawnAgent(bg(6, 'review-506'), { mode: 'ordinary', launchGuard: null, env: envFor(fake, { GH_TOKEN: 'ambient-should-be-stripped' }) });
     const [row] = fake.sessions();
     expect(sessionEnvToken(row)).toBeNull();
   });
@@ -156,7 +156,7 @@ describe('createFakeClaude — spawn/list/stop through the real production seams
     it('spawn-fails: the dispatch throws, and nothing is registered', () => {
       fake = createFakeClaude();
       fake.fault('spawn-fails');
-      expect(() => defaultSpawnAgent(bg(10, 'review-510'), { env: envFor(fake) })).toThrow();
+      expect(() => defaultSpawnAgent(bg(10, 'review-510'), { mode: 'ordinary', launchGuard: null, env: envFor(fake) })).toThrow();
       expect(fake.sessions()).toHaveLength(0);
     });
 
@@ -166,7 +166,7 @@ describe('createFakeClaude — spawn/list/stop through the real production seams
       const start = Date.now();
       // `opts.timeout` overrides `defaultSpawnAgent`'s internal 60s default (spread order — see that
       // function's own body): a short override here proves the property fast, without waiting a real 60s+.
-      expect(() => defaultSpawnAgent(bg(11, 'review-511'), { env: envFor(fake), timeout: 300 })).toThrow();
+      expect(() => defaultSpawnAgent(bg(11, 'review-511'), { mode: 'ordinary', launchGuard: null, env: envFor(fake), timeout: 300 })).toThrow();
       expect(Date.now() - start).toBeLessThan(5_000);
     }, 10_000);
 
@@ -178,14 +178,14 @@ describe('createFakeClaude — spawn/list/stop through the real production seams
 
     it('list-empty: `agents --json` reports nothing, even with real sessions registered', () => {
       fake = createFakeClaude();
-      defaultSpawnAgent(bg(12, 'review-512'), { env: envFor(fake) });
+      defaultSpawnAgent(bg(12, 'review-512'), { mode: 'ordinary', launchGuard: null, env: envFor(fake) });
       fake.fault('list-empty');
       expect(defaultListAgents({ env: envFor(fake) })).toEqual([]);
     });
 
     it('stop-fails: `stop` always reports "No job matching", mapped by stopSession to alreadyGone (not a throw), and the session is left untouched', () => {
       fake = createFakeClaude();
-      defaultSpawnAgent(bg(13, 'review-513'), { env: envFor(fake) });
+      defaultSpawnAgent(bg(13, 'review-513'), { mode: 'ordinary', launchGuard: null, env: envFor(fake) });
       const env = envFor(fake);
       const [row] = defaultListAgents({ env });
       fake.fault('stop-fails');
@@ -201,7 +201,7 @@ describe('createFakeClaude — spawn/list/stop through the real production seams
   it('cleanup kills every sleeper THIS instance spawned, and only those', () => {
     const local = createFakeClaude();
     for (const n of [21, 22, 23]) {
-      defaultSpawnAgent(bg(n, `review-5${n}`), { env: envFor(local) });
+      defaultSpawnAgent(bg(n, `review-5${n}`), { mode: 'ordinary', launchGuard: null, env: envFor(local) });
     }
     const pids = local.sessions().map((s) => s.pid);
     expect(pids).toHaveLength(3);
@@ -213,7 +213,7 @@ describe('createFakeClaude — spawn/list/stop through the real production seams
 describe('scripted actions — writeCompletion / exit / setState, through the real completion-store', () => {
   it('exit({writeCompletion:false}) leaves no completion record; exit({writeCompletion:true}) writes one readable by tryReadCompletion', async () => {
     fake = createFakeClaude();
-    defaultSpawnAgent(bg(8, 'fix-508'), { env: envFor(fake) });
+    defaultSpawnAgent(bg(8, 'fix-508'), { mode: 'ordinary', launchGuard: null, env: envFor(fake) });
     const completionsDir = mkdtempSync(join(tmpdir(), 'fake-claude-completions-'));
     try {
       const ctx = ctxFor(fake, completionsDir);
@@ -225,7 +225,7 @@ describe('scripted actions — writeCompletion / exit / setState, through the re
       expect(fake.session('fix-508').state).toBe('done');
       expect(pidGoneWithin(session.pid)).toBe(true);
 
-      defaultSpawnAgent(bg(18, 'fix-518'), { env: envFor(fake) });
+      defaultSpawnAgent(bg(18, 'fix-518'), { mode: 'ordinary', launchGuard: null, env: envFor(fake) });
       const session2 = fake.session('fix-518');
       await exitAction({ state: 'done', writeCompletion: true, outcome: 'resolved' }).run(ctx, session2);
       const record = tryReadCompletion('fix-518', completionsDir);
@@ -240,7 +240,7 @@ describe('scripted actions — writeCompletion / exit / setState, through the re
 
   it('setState updates the listing, and stepSessions pops exactly one scripted action per session per call', async () => {
     fake = createFakeClaude();
-    defaultSpawnAgent(bg(10, 'fix-610'), { env: envFor(fake) });
+    defaultSpawnAgent(bg(10, 'fix-610'), { mode: 'ordinary', launchGuard: null, env: envFor(fake) });
     const completionsDir = mkdtempSync(join(tmpdir(), 'fake-claude-completions-'));
     try {
       const ctx = ctxFor(fake, completionsDir);
@@ -264,7 +264,7 @@ describe('scripted actions — writeCompletion / exit / setState, through the re
 
   it('an unscripted session is left alone by stepSessions', async () => {
     fake = createFakeClaude();
-    defaultSpawnAgent(bg(11, 'review-711'), { env: envFor(fake) });
+    defaultSpawnAgent(bg(11, 'review-711'), { mode: 'ordinary', launchGuard: null, env: envFor(fake) });
     const completionsDir = mkdtempSync(join(tmpdir(), 'fake-claude-completions-'));
     try {
       const ctx = ctxFor(fake, completionsDir);

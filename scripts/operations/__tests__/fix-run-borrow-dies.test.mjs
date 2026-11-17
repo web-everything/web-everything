@@ -37,7 +37,7 @@ describe('(4) the launch bug: the agent is given the reviewer finding', () => {
     expect(() => renderPrContext({ title: 'T', body: 'B', comments: [{ body: 'hi' }] })).toThrow(/no-finding/);
   });
   it('runFixCli hands the finding to the provider and fails (no lane taken) when there is none', async () => {
-    const argv = ['--pr=7', '--session=fix-7', '--ref=lane/7-x', '--prompt-file=/p.md', '--repo=o/r', '--claim-repo=we'];
+    const argv = ['--mode=ordinary', '--launch-guard=null', '--pr=7', '--session=fix-7', '--ref=lane/7-x', '--prompt-file=/p.md', '--repo=o/r', '--claim-repo=we'];
     const spawn = vi.fn(async () => {});
     const calls = [];
     const mkIo = (json) => ({
@@ -53,7 +53,7 @@ describe('(4) the launch bug: the agent is given the reviewer finding', () => {
 });
 
 describe('(1) a borrowed fix that ends releases its claim and records a reason', () => {
-  const argv = ['--pr=7', '--session=fix-7', '--ref=lane/7-x', '--prompt-file=/p.md', '--repo=o/r', '--claim-repo=we'];
+  const argv = ['--mode=ordinary', '--launch-guard=null', '--pr=7', '--session=fix-7', '--ref=lane/7-x', '--prompt-file=/p.md', '--repo=o/r', '--claim-repo=we'];
   const io = (over = {}) => {
     const heads = ['aaa'];
     return {

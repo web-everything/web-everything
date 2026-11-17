@@ -35,7 +35,7 @@ const printing = (text) => ['-e', `process.stdout.write(${JSON.stringify(text)})
 
 function spec(over = {}, dir = tmp()) {
   return {
-    role: 'build', launcher: 'claude-p', session: 'build-4001', command: process.execPath, argv: printing(claudeStdout(DONE)), model: 'sonnet', item: 4001,
+    mode: 'build', launchGuard: null, role: 'build', launcher: 'claude-p', session: 'build-4001', command: process.execPath, argv: printing(claudeStdout(DONE)), model: 'sonnet', item: 4001,
     timeoutMs: 20_000, completionsDir: dir, draftsDir: join(dir, 'drafts'), postmortemMode: 'draft', ...over,
   };
 }
@@ -134,7 +134,7 @@ describe('runWorker: the job record and the result channels', () => {
   it('a blocked tooling-defect makes ONE deduped draft under postmortem draft, and none under off', async () => {
     const dir = tmp();
     const s = spec({ argv: printing(claudeStdout(BLOCKED('tooling-defect'))) }, dir);
-    await runWorker(s); await runWorker({ ...s, session: 'build-4002', item: 4002 });
+    await runWorker(s); await runWorker({ mode: 'ordinary', launchGuard: null, ...s, session: 'build-4002', item: 4002 });
     expect(listDraftKeys(s.draftsDir)).toHaveLength(1);
     const off = spec({ argv: printing(claudeStdout(BLOCKED('tooling-defect'))), postmortemMode: 'off', draftsDir: join(dir, 'd2') }, dir);
     expect((await runWorker(off)).action).toMatchObject({ type: 'product-fix-draft', mode: 'off' });
@@ -466,7 +466,7 @@ describe('runWorker: the job record and the result channels', () => {
   });
 
   it('rejects a bad spec instead of writing a record', async () => {
-    await expect(runWorker({ role: 'build' })).rejects.toThrow(/spec\.launcher/);
+    await expect(runWorker({ mode: 'ordinary', launchGuard: null, role: 'build' })).rejects.toThrow(/spec\.launcher/);
   });
 });
 

@@ -627,7 +627,7 @@ export async function runFixCli(argv = [], {
   removePrompt = removePromptFile,
   pendingRearm = defaultPendingRearm(),
   resolveProvider = resolveFixProvider,
-  spawnCodex = async (...args) => (await import('./codex-delivery-provider.mjs')).defaultSpawnCodexAgent(...args),
+  spawnCodex = async (argv, opts, io) => (await import('./codex-delivery-provider.mjs')).defaultSpawnCodexAgent(argv, { ...opts, mode: opts.mode, launchGuard: opts.launchGuard }, io),
   readComments = readAllComments,
   readCiHeal = readCiHealInputs,
   timingPolicy = resolveTimingPolicy().fix,

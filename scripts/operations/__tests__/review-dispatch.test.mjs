@@ -143,7 +143,7 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
 
     expect(calls).toHaveLength(1);
     // #4174 — cwd is a scratch directory outside `root`, never `root` itself.
-    expect(calls[0].opts).toEqual({ cwd: dispatchSessionCwd('11111111-1111-4111-8111-111111111111', { root: '/repo' }) });
+    expect(calls[0].opts).toEqual({ cwd: dispatchSessionCwd('11111111-1111-4111-8111-111111111111', { root: '/repo' }), mode: 'review', launchGuard: null });
     expect(calls[0].argv).toEqual([
       // #3331 — no `--session-id`: `claude --bg` discards it and assigns its own id.
       '--bg',

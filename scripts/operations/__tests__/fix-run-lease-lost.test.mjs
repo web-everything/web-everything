@@ -42,7 +42,7 @@ function fixture({ head = prHead, owner = holder, lanePath = '/lanes/lane-10' } 
   return { state, calls, run, readLease, spawn, recordOutcome, appendLoopRow, releaseClaim, io,
     renewLease, lanePath };
 }
-const argv = ['--pr=5759', '--session=fix-5759', '--ref=lane/pr', '--prompt-file=/p', '--provider=codex'];
+const argv = ['--mode=ordinary', '--launch-guard=null', '--pr=5759', '--session=fix-5759', '--ref=lane/pr', '--prompt-file=/p', '--provider=codex'];
 
 function diskLeaseFixture() {
   const lanePath = mkdtempSync(join(tmpdir(), 'fix-renew-lease-'));

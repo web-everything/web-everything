@@ -1,3 +1,4 @@
+import { launchGuardFor } from '../conflict-rebase-launch-gate.mjs';
 import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
@@ -142,7 +143,7 @@ describe('conflict-rebase dispatch demotion', () => {
     const events = [], candidate = 'cand-0000-0000-0000-000000000000';
     const demote = () => { events.push('demote'); if (!success) throw new Error('write refused'); return proof(); };
     const options = deps(events, demote);
-    const resume = (entry, io) => tryResumeFix({ ...entry, body: buildAuthorActorMarker(candidate) }, {
+    const resume = (entry, io) => tryResumeFix({ ...entry, body: buildAuthorActorMarker(candidate) }, { readSavedLaunch: () => ({ mode: 'conflict-rebase', launchGuard: launchGuardFor(planned, { repo: 'we' }) }),
       ...options, demote: io.demote, readCompletion: () => null, resolveHead: () => head,
       listAgentsAll: () => [{ sessionId: candidate, id: 'candxxxx', name: 'fix-1764', cwd: '/lanes/lane-4', state: 'running', kind: 'background' }],
       spawnAgent: () => { events.push('resume'); return `backgrounded · ${outcome === 'fallback' ? 'forkedid' : 'candxxxx'}`; }, wait: () => {}, stop: () => {},
@@ -230,7 +231,7 @@ describe('single fresh conflict-rebase launch gate', () => {
       return '';
     });
     const result = pass({ demote, readLive,
-      tryResume: (entry, io) => resumeBgSession(entry, { ...options, ...io, candidate: 'candidate', prompt: 'repair',
+      tryResume: (entry, io) => resumeBgSession(entry, { readSavedLaunch: () => ({ mode: 'conflict-rebase', launchGuard: launchGuardFor(planned, { repo: 'we' }) }), ...options, ...io, candidate: 'candidate', prompt: 'repair',
         spawnAgent: resumedSpawn, listAgentsAll: () => [], wait: () => {}, stop: () => {} }),
       dispatch: (entry, io) => dispatchFix(entry, { ...options, ...io }),
     });
@@ -290,11 +291,25 @@ describe('single fresh conflict-rebase launch gate', () => {
   it('resume gate runs after settings preparation and releases its claim on refusal', () => {
     const options = deps([]), spawnAgent = vi.fn();
     let live = liveState(['review:pending']);
-    expect(() => resumeBgSession(planned, { ...options, candidate: 'candidate', prompt: 'repair', spawnAgent,
+    expect(() => resumeBgSession(planned, { readSavedLaunch: () => ({ mode: 'conflict-rebase', launchGuard: launchGuardFor(planned, { repo: 'we' }) }), ...options, candidate: 'candidate', prompt: 'repair', spawnAgent,
       prepareResume: () => { live = liveState(['review:pending', 'review:changes']); },
       readLive: () => live,
     })).toThrow(expect.objectContaining({ kind: 'conflict-rebase-launch-refused' }));
     expect(spawnAgent).not.toHaveBeenCalled();
     expect(options.releaseClaim).toHaveBeenCalledOnce();
   });
+});
+
+
+it('reconciler resume refuses missing saved launch evidence, releases its claim, and never launches', () => {
+  const events = [], options = deps(events);
+  const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    expect(() => resumeBgSession(planned, { ...options, candidate: 'candidate', prompt: 'repair',
+      readSavedLaunch: () => undefined,
+    })).toThrow(expect.objectContaining({ kind: 'conflict-rebase-launch-refused' }));
+    expect(options.spawnAgent).not.toHaveBeenCalled();
+    expect(options.releaseClaim).toHaveBeenCalledOnce();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('restore original launch evidence'));
+  } finally { log.mockRestore(); }
 });

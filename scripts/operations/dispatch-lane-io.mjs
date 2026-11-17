@@ -1,3 +1,5 @@
+import { assertLaunchDescriptor } from '../conveyor/conflict-rebase-launch-gate.mjs';
+import { saveLaunchEvidence } from './launch-evidence.mjs';
 import { appendBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { execGuardedFixer, spawnFixerToCompletion } from './fixer-process.mjs';
 import { applyTestsFirstPolicy } from '../lib/tests-first-policy.mjs';
@@ -1502,7 +1504,7 @@ export function releaseReservedLane(reservation, { run = execFileSync, root = RE
 export function createDispatchSinks({
   root = REPO_ROOT,
   exec = execFileSync,
-  spawnAgent = (argv, opts) => defaultSpawnAgent(argv, opts, { exec }),
+  spawnAgent = (argv, opts) => defaultSpawnAgent(argv, { ...opts, mode: opts.mode, launchGuard: opts.launchGuard }, { exec }),
   // #3645/#3906 — EVERY REGISTERED KIND'S MODE, read from the environment ONCE, here, at sink-construction
   // time rather than per dispatch, so one tick cannot straddle two modes. Every row defaults to `agent` on main
   // (see `dispatch-provider-registry.mjs`), so an unset environment keeps every kind on `claude --bg`.
@@ -1610,7 +1612,7 @@ export function createDispatchSinks({
       let handle;
       try {
         handle = await provider({
-          ...(payload?.mode == null && payload?.launchGuard == null ? {} : { mode: payload.mode, launchGuard: payload.launchGuard }),
+          mode: payload?.mode ?? 'ordinary', launchGuard: payload?.launchGuard ?? null,
           reportAttempt: (id) => { attemptId = id; },
           // 117 S3b — the provider ran this launch through the detached worker wrapper (its pid is the runner).
           reportWrapped: (pid) => { wrappedPid = Number.isInteger(pid) ? pid : null; },
@@ -1949,7 +1951,7 @@ export function routeDispatchProvider(request, {
  * @returns {string}
  */
 export function defaultClaudeProvider(request, {
-  spawnAgent = (argv, opts) => defaultSpawnAgent(argv, opts),
+  spawnAgent = (argv, opts) => defaultSpawnAgent(argv, { ...opts, mode: opts.mode, launchGuard: opts.launchGuard }),
   // 117 S3b (D7 FINAL) — a fix / ci-heal launched here runs to completion through the detached worker wrapper instead
   // of `claude --bg` (same argv, `-p` + `--json-schema`, a v2 completion record). `false` keeps the old spawn exactly.
   wrapKind = (kind) => WRAPPABLE_LAUNCH_KINDS.includes(kind) && workerWrapperEnabledFor(kind),
@@ -2013,7 +2015,7 @@ export function defaultClaudeProvider(request, {
   const kind = String(request.launchKind || 'build');
   if (wrapKind(kind)) {
     const launched = launchWrapped({
-      ...(request.mode == null && request.launchGuard == null ? {} : { mode: request.mode, launchGuard: request.launchGuard }),
+      mode: request.mode, launchGuard: request.launchGuard,
       role: kind, session: request.sessionSlug, bgArgv: argv, cwd: request.cwd, env: workerSpawnEnv(request.spawnEnv ?? process.env), pr: request.pr ?? null,
       item: request.num ?? null, model: launchedModel, sessionId: request.sessionId,
     });
@@ -2022,7 +2024,7 @@ export function defaultClaudeProvider(request, {
     return launched.handle || request.sessionId;
   }
   const stdout = String(spawnAgent(argv, { cwd: request.cwd, ...(request.spawnEnv ? { env: request.spawnEnv } : {}),
-    ...(request.mode == null && request.launchGuard == null ? {} : { mode: request.mode, launchGuard: request.launchGuard }) }) ?? '');
+    mode: request.mode, launchGuard: request.launchGuard }) ?? '');
   return parseBackgroundedId(stdout) || request.sessionId;
 }
 
@@ -2053,7 +2055,8 @@ export const WRAPPABLE_LAUNCH_KINDS = Object.freeze(['fix', 'ci-heal']);
  *   retry) can be asserted.
  * @returns {string}
  */
-export function defaultSpawnAgent(argv, opts = {}, { exec = execFileSync, grantTrust = grantDispatchTrust, gate } = {}) {
+export function defaultSpawnAgent(argv, opts = {}, { exec = execFileSync, grantTrust = grantDispatchTrust, gate, saveEvidence = saveLaunchEvidence } = {}) {
+  assertLaunchDescriptor(opts);
   const execOpts = {
     encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: SPAWN_TIMEOUT_MS, killSignal: 'SIGKILL',
     // #x8mpubm follow-up (live-caught 2026-09-24) — this call inherits `process.env` unless told otherwise,
@@ -2070,14 +2073,19 @@ export function defaultSpawnAgent(argv, opts = {}, { exec = execFileSync, grantT
     // GH_TOKEN env `sanitizeSpawnEnv` returns is what gets marked, so neither guard undoes the other's work.
     env: markWorkerEnv(sanitizeSpawnEnv(opts.env || process.env)),
   };
-  const launch = () => execGuardedFixer('claude', argv, execOpts, { exec, gate });
+  const launch = () => execGuardedFixer('claude', argv, { ...execOpts, mode: opts.mode, launchGuard: opts.launchGuard }, { exec, gate });
+  let stdout;
   try {
-    return launch();
+    stdout = launch();
   } catch (e) {
     if (!opts.cwd || !isTrustRefusal(e)) throw e;
     try { grantTrust(opts.cwd); } catch { /* grantDispatchTrust itself never throws; belt-and-suspenders */ }
-    return launch();
+    stdout = launch();
   }
+  // Persistence is outside the trust retry: a failed evidence write must never launch a second agent.
+  const sessionId = parseBackgroundedId(String(stdout ?? ''));
+  if (sessionId) saveEvidence(sessionId, { mode: opts.mode, launchGuard: opts.launchGuard, launchContext: opts.launchContext });
+  return stdout;
 }
 
 /**
@@ -2105,9 +2113,10 @@ export function workerSpawnEnv(env = process.env) {
  * @param {{spawnFn?: Function}} [io] - injected ONLY so a test can assert the spawn without a real `claude`.
  * @returns {Promise<{stdout: string, stderr: string, resourceUsage: object|null}>}
  */
-export function spawnAgentToCompletion(argv, opts = {}, io = {}) {
+export async function spawnAgentToCompletion(argv, opts = {}, io = {}) {
+  assertLaunchDescriptor(opts);
   return spawnFixerToCompletion('claude', argv, {
-    encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: SPAWN_TIMEOUT_MS, killSignal: 'SIGKILL', ...opts,
+    encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: SPAWN_TIMEOUT_MS, killSignal: 'SIGKILL', ...opts, mode: opts.mode, launchGuard: opts.launchGuard,
     env: markWorkerEnv(sanitizeSpawnEnv(opts.env || process.env)),
   }, io);
 }

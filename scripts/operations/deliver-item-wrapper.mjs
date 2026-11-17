@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { workerLaunchEvidence } from './launch-evidence.mjs';
 /**
  * @file scripts/operations/deliver-item-wrapper.mjs
  * @description The wrapper a MINIMAL delivery agent (`we:skills-src/conveyor/delivery-agent-brief-v2.md`) runs
@@ -612,7 +613,7 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
         { cwd: gate.lanePath, env: laneGitHardeningEnv(), maxBuffer: SELF_REVIEW_MAX_DIFF_BYTES + 1 })),
       review: reviewBuild,
       fix: async prompt => {
-        const resumed = await provider.spawn({ sessionId: claudeSessionId, resumeSessionId: claudeSessionId,
+        const resumed = await provider.spawn({ mode: 'build', launchGuard: null, sessionId: claudeSessionId, resumeSessionId: claudeSessionId,
           prompt: appendBuildRequirements(prompt, { policy: buildPolicy, selfReview: false }),
           lane, sessionSlug, item, attemptTag, lanePathOverride: implLanePath });
         const updated = resumed?.envelope ? buildReportFromEnvelope(resumed, sessionSlug)
@@ -1229,6 +1230,7 @@ const CLAUDE_RESTRICTED_PROVIDER = {
     {
       ensureSettingsFile = ensureDeliveryHooksSettingsFile,
       spawnAgent = spawnAgentToCompletion,
+      readSavedLaunch, saveEvidence,
       resolveLane = resolveLanePath,
       run: runFn = run,
       persistFailure = persistDeliverySpawnFailure,
@@ -1295,6 +1297,7 @@ const CLAUDE_RESTRICTED_PROVIDER = {
     const deliveryEnv = buildDeliveryAgentEnv({
       sessionSlug, item, lanePath: weLanePath, attemptTag, reportsDir, implLane: lanePathOverride,
     });
+    ({ mode, launchGuard } = workerLaunchEvidence({ sessionId, resumeSessionId, mode, launchGuard }, { readSavedLaunch, saveEvidence }));
     if (workerWrapper) {
       const turnStartedAt = Date.now();
       // The wrapper owns the process, the timeout and the record; it never rejects on a worker failure (the v2
@@ -1307,7 +1310,7 @@ const CLAUDE_RESTRICTED_PROVIDER = {
           env: { ...process.env, ...deliveryEnv }, timeoutMs: DELIVERY_AGENT_SPAWN_TIMEOUT_MS, model, item, sessionId,
         }, {
           // keep the SAME env hygiene as the old path (GH_TOKEN stripped, worker marker) via the existing spawn primitive
-          spawnToCompletionFn: (_cmd, a, opts, spawnIo) => spawnAgent(a, opts, spawnIo),
+          spawnToCompletionFn: (_cmd, a, opts, spawnIo) => spawnAgent(a, { ...opts, mode, launchGuard }, spawnIo),
           // On a RESUMED turn the report on disk is the first turn's unless the agent rewrote it: only one written since
           // this turn started counts, or a resume that ended with no result would read as the stale `done`.
           legacyRead: () => {
@@ -1342,7 +1345,7 @@ const CLAUDE_RESTRICTED_PROVIDER = {
       // forward compatibility.
       const { resourceUsage } = (await spawnAgent(argv, {
         cwd: lanePath,
-        ...(mode == null && launchGuard == null ? {} : { mode, launchGuard }),
+        mode, launchGuard,
         env: { ...process.env, ...deliveryEnv },
         timeout: DELIVERY_AGENT_SPAWN_TIMEOUT_MS,
       })) || {};
@@ -1412,6 +1415,7 @@ const CODEX_PROVIDER = {
     } = {},
     {
       spawnAgent = defaultSpawnCodexAgent,
+      readSavedLaunch, saveEvidence,
       resolveLane = resolveLanePath,
       run: runFn = run,
       persistFailure = persistDeliverySpawnFailure,
@@ -1476,6 +1480,7 @@ const CODEX_PROVIDER = {
     const argv = buildCodexDeliveryArgv({
       prompt, cwd: lanePath, denyPaths: deny, resumeThreadId, writableRoots: [...extraLanes, admissionLockRoot(lanePath)], model, effort,
     });
+    ({ mode, launchGuard } = workerLaunchEvidence({ sessionId, resumeSessionId, mode, launchGuard }, { readSavedLaunch, saveEvidence }));
     let stdout;
     try {
       // #3383 mechanical-dispatcher follow-up — ASYNC now (was `execFileSync`); the `await` is still the only
@@ -1486,7 +1491,7 @@ const CODEX_PROVIDER = {
       // for forward compatibility.
       const spawned = (await withCodexUsage({ model, effort, taskKind: usageTaskKind ?? taskKind, caller, repo, pr, card: item, cwd: lanePath }, () => spawnAgent(argv, {
         cwd: lanePath,
-        ...(mode == null && launchGuard == null ? {} : { mode, launchGuard }),
+        mode, launchGuard,
         env: { ...process.env, ...deliveryEnv },
         timeout: DELIVERY_AGENT_SPAWN_TIMEOUT_MS,
       }))) || {};
@@ -1680,7 +1685,7 @@ export async function runAgentToCompletion(
   // real lane path (`cwd`) and mint the real env vars the brief needs (`buildDeliveryAgentEnv`) — see
   // `CLAUDE_RESTRICTED_PROVIDER.spawn`'s own docblock.
   const spawned = await provider.spawn({
-    sessionId: claudeSessionId, prompt, lane, sessionSlug, item, attemptTag, lanePathOverride,
+    mode: 'build', launchGuard: null, sessionId: claudeSessionId, prompt, lane, sessionSlug, item, attemptTag, lanePathOverride,
   }); // AWAITS — see DeliveryAgentProvider's own docblock.
 
   // 117 S3a — a provider that ran through the unified worker wrapper hands back its v2 envelope: the report the
@@ -1854,6 +1859,7 @@ async function resumeAgentWithGateFailure({
   // cwd/env treatment (`lane`/`sessionSlug`/`item`/`attemptTag` threaded through to the provider) or a resumed
   // agent hits the identical "no real $LANE to cd into" failure the fresh spawn did.
   return provider.spawn({
+    mode: 'build', launchGuard: null,
     sessionId: claudeSessionId, prompt, resumeSessionId: claudeSessionId, lane, sessionSlug, item, attemptTag,
     lanePathOverride,
   }); // AWAITS. Returned (not dropped): a wrapped provider hands back its v2 envelope for the resumed turn.

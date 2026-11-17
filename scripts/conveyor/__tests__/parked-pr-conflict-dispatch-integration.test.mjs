@@ -163,7 +163,7 @@ describe('#xu2krte end-to-end — a REAL merge conflict, dispatched through the 
         // models that), so a chosen id names no session — and production never chose one either: the id
         // `findResumeCandidate` matches on comes off the PR body's `authored-by-actor` stamp, which the AGENT
         // writes from its own real session id. Reading it out of the listing is what that actually looks like.
-        defaultSpawnAgent(['--bg', '-n', 'fix-8801', 'original build work'], { env, cwd: root });
+        defaultSpawnAgent(['--bg', '-n', 'fix-8801', 'original build work'], { mode: 'ordinary', launchGuard: null, env, cwd: root });
         const listedBefore = defaultListAgents({ env, all: true });
         const seeded = listedBefore.find((a) => a.name === 'fix-8801');
         expect(seeded).toBeTruthy();
@@ -186,9 +186,9 @@ describe('#xu2krte end-to-end — a REAL merge conflict, dispatched through the 
         // so `fake.lastArgv()` by the time it RETURNS would read that follow-up `agents` call, not the spawn.
         // Captured here instead, at the moment it happens.
         let resumeArgvSeen = null;
-        const attempt = tryResumeFix(planned, {
+        const attempt = tryResumeFix(planned, { readSavedLaunch: () => ({ mode: 'ordinary', launchGuard: null }),
           root,
-          spawnAgent: (argv, opts) => { resumeArgvSeen = argv; return defaultSpawnAgent(argv, { ...opts, env }); },
+          spawnAgent: (argv, opts) => { resumeArgvSeen = argv; return defaultSpawnAgent(argv, { mode: 'ordinary', launchGuard: null, ...opts, env }); },
           listAgentsAll: () => defaultListAgents({ env, all: true }),
           // resolveHead is NOT injected here — the REAL default (`resolveLaneHead`, a genuine `git -C <cwd>
           // rev-parse HEAD`) runs against the real fixture repo, proving the ownership check for real.
@@ -226,7 +226,7 @@ describe('#xu2krte end-to-end — a REAL merge conflict, dispatched through the 
         // First, the SAME lane-free check `runReconcileFixDispatch` runs before ever popping a lane: with no
         // resume candidate at all, it must report `resumed: false` having made no spawn call whatsoever.
         let resumeSpawnCalls = 0;
-        const attempt = tryResumeFix(planned, {
+        const attempt = tryResumeFix(planned, { readSavedLaunch: () => ({ mode: 'ordinary', launchGuard: null }),
           root,
           spawnAgent: () => { resumeSpawnCalls += 1; return ''; },
           listAgentsAll: () => defaultListAgents({ env, all: true }),
@@ -240,7 +240,7 @@ describe('#xu2krte end-to-end — a REAL merge conflict, dispatched through the 
           root,
           readBrief: () => FIX_BRIEF_STUB,
           mintSessionId: () => 'ffffffff-0000-0000-0000-000000000000',
-          spawnAgent: (argv, opts) => defaultSpawnAgent(argv, { ...opts, env }),
+          spawnAgent: (argv, opts) => defaultSpawnAgent(argv, { mode: 'ordinary', launchGuard: null, ...opts, env }),
         });
 
         expect(result.resumed).toBe(false);

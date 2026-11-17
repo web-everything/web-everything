@@ -4399,3 +4399,17 @@ Missing conflict launch evidence refuses before process creation; refresh PR evi
 The live PR read uses `throttle.noMemo: true` to retain throttling while bypassing the smoke memo.
 `conflict-rebase-launch-boundaries.test.mjs` enumerates execution sites; wrapper, borrowed-launch
 and memo regressions change evidence across the preparation/resume boundary with injected IO.
+
+Every low-level worker launch now requires an explicit known `mode` and `launchGuard` (null for
+non-conflict modes). Adding a purpose requires extending the shared mode table and reviewing its
+callers. The whole-tree TypeScript AST audit resolves imports, member access, lexical aliases and
+injected defaults; its site inventory requires review for every new reference. Background launches
+save their descriptor under the CLI-assigned handle beside completion evidence, as wrapped workers
+retain their spec on their envelope. Both verification and reconciler resumes read that original
+descriptor; historical sessions without evidence refuse and require operator recovery or a newly
+admitted launch. Never reconstruct a resume's pin from a current PR read.
+
+Blocking Claude/Codex delivery providers save the descriptor before their initial turn and load it
+by the original session id on repair resumes. Provider-native thread ids do not replace the saved
+launch descriptor. Background evidence persistence happens outside the trust-retry block, so an
+unwritable evidence store cannot create a duplicate agent.

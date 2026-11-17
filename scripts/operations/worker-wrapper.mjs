@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { assertLaunchDescriptor } from '../conveyor/conflict-rebase-launch-gate.mjs';
 /**
  * @file scripts/operations/worker-wrapper.mjs
  * @description THE UNIFIED WORKER WRAPPER (item 117, slice S3a; decision D7 FINAL, operator 2026-10-08).
@@ -384,6 +385,7 @@ async function runWorkerOnce(spec, io, stop) {
   const run = async (argv) => {
     try {
       const launch = () => spawnToCompletionFn(spec.command, argv, {
+        mode: spec.mode, launchGuard: spec.launchGuard,
         // EVERY launch path gets the same env hygiene (a static GH_TOKEN stripped, the worker marker set), not just the callers that
         // happen to pass a sanitising spawn: the detached CLI and any future launcher inherit it here.
         cwd: spec.cwd, env: markWorkerEnv(sanitizeSpawnEnv(spec.env ?? process.env)), timeout: Math.max(1, deadlineMs - clock()), killSignal: 'SIGKILL',
@@ -574,6 +576,7 @@ export function preserveLegacyWords(envelope, legacy) {
  */
 export function launchDetached(spec, { specDir, spawnFn = spawn, nodePath = process.execPath, entry = fileURLToPath(import.meta.url) } = {}) {
   if (!specDir) throw new TypeError('operations: launchDetached needs specDir');
+  assertLaunchDescriptor(spec);
   if (!isValidSessionSlug(spec?.session)) throw new TypeError(`operations: launchDetached: invalid session slug ${JSON.stringify(spec?.session)}`);
   mkdirSync(specDir, { recursive: true, mode: 0o700 });
   const specFile = join(specDir, `${spec.session}.spec.json`);

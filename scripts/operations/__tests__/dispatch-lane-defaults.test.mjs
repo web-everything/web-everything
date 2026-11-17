@@ -74,7 +74,7 @@ describe('the default subprocess calls are BOUNDED — every one of them', () =>
 
   it('the agent spawn is bounded — `claude --bg` returns immediately, so a hang here is a hang in the executor', () => {
     const { exec, calls } = spyExec('');
-    defaultSpawnAgent(['--bg', '--session-id', 'sess-x', '-n', 'conveyor-3037', 'go'], { cwd: '/repo' }, { exec });
+    defaultSpawnAgent(['--bg', '--session-id', 'sess-x', '-n', 'conveyor-3037', 'go'], { mode: 'ordinary', launchGuard: null, cwd: '/repo' }, { exec });
     expect(calls[0].file).toBe('claude');
     expect(calls[0].opts).toMatchObject({ timeout: SPAWN_TIMEOUT_MS, killSignal: 'SIGKILL' });
     expect(calls[0].opts.cwd).toBe('/repo');

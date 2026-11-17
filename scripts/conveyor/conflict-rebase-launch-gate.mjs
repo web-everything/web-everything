@@ -17,19 +17,47 @@ export function launchGuardFor(planned, { repo = 'we', root = REPO_ROOT } = {}) 
     conflictRebase: planned.conflictRebase };
 }
 
-/** At execution, a declared conflict repair must carry complete original planning evidence. */
-export function assertFixerLaunch({ mode, launchGuard, pr, repo } = {}, options = {}) {
-  if (mode !== 'conflict-rebase' && launchGuard == null) return;
-  const refuse = () => {
-    throw Object.assign(new Error('conflict-rebase launch refused: missing or mismatched mode, pinned head, PR or repository; refresh PR evidence before retrying'),
-      { kind: 'conflict-rebase-launch-refused' });
-  };
-  if (launchGuard?.mode !== 'conflict-rebase' || (mode != null && mode !== launchGuard.mode)
+/** Reviewed launch purposes. New purposes require boundary and caller review. */
+export const FIXER_LAUNCH_MODES = Object.freeze([
+  'conflict-rebase', 'ordinary', 'fix', 'advisory-fix', 'ci-heal', 'round-fix',
+  'stale-base', 'stale-base-rebase', 'stacked-rebase', 'scope-bloat-rebase', 'takeover',
+  'ruling-not-addressed', 'mq-failure-recovery', 'operator-send-back', 'block-ruled-referral',
+  'build', 'delivery', 'review', 'inspect', 'investigate', 'prepare', 'verify-resume',
+]);
+
+export function refuseFixerLaunch(reason) {
+  const error = Object.assign(new Error(`conflict-rebase launch refused: ${reason}; restore original launch evidence or start a newly admitted session`),
+    { kind: 'conflict-rebase-launch-refused' });
+  console.error(error.message);
+  throw error;
+}
+
+/** Validate even when a test/provider injects the live gate. Absence is never permission. */
+export function assertLaunchDescriptor(descriptor) {
+  if (!descriptor || !Object.hasOwn(descriptor, 'mode') || !Object.hasOwn(descriptor, 'launchGuard')
+      || !FIXER_LAUNCH_MODES.includes(descriptor.mode)) {
+    refuseFixerLaunch('missing launch descriptor, launchGuard, or unknown mode');
+  }
+  const { mode, launchGuard, pr, repo } = descriptor;
+  if (mode !== 'conflict-rebase') {
+    if (launchGuard !== null) refuseFixerLaunch('non-conflict mode requires an explicit null launchGuard');
+    return;
+  }
+  const refuse = () => refuseFixerLaunch('missing or mismatched mode, pinned head, PR or repository; refresh PR evidence before retrying');
+  if (launchGuard?.mode !== mode
       || !/^[0-9a-f]{40}$/i.test(launchGuard.pinnedHead ?? '')
       || !/^[1-9][0-9]*$/.test(String(launchGuard.pr ?? '')) || !launchGuard.repo
+      || !launchGuard.conflictRebase
       || (pr != null && String(pr) !== String(launchGuard.pr))) refuse();
   try { if (repo != null && ghRepoSlug(repo) !== ghRepoSlug(launchGuard.repo)) refuse(); }
   catch { refuse(); }
+}
+
+/** At execution, every launch declares its purpose; conflict repairs also re-read live evidence. */
+export function assertFixerLaunch(descriptor, options = {}) {
+  assertLaunchDescriptor(descriptor);
+  const { mode, launchGuard } = descriptor;
+  if (mode !== 'conflict-rebase') return;
   assertLaunchable({ ...launchGuard, headRefOid: launchGuard.pinnedHead }, {
     ...options, repo: launchGuard.repo, root: launchGuard.root ?? REPO_ROOT,
   });

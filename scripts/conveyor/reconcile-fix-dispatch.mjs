@@ -1,3 +1,5 @@
+import { readLaunchEvidence } from '../operations/launch-evidence.mjs';
+import { assertLaunchDescriptor, refuseFixerLaunch } from './conflict-rebase-launch-gate.mjs';
 import { safeAdoptYield } from '../lib/daemon-rebuild/adopt-yield.mjs';
 import { admitMqFailureRoute } from './mq-failure-intake.mjs';
 import { refreshMqFailureHeadSync, mqFailureRefreshIo } from '../lib/mq-failure-refresh.mjs';
@@ -908,6 +910,7 @@ export function tryResumeFix(planned, {
   demote = demoteConflictRebase,
   readLive = readConflictRebaseLive,
   readCompletion,
+  readSavedLaunch = readLaunchEvidence,
   repo = 'we',
   root = REPO_ROOT,
   postNotice = postRulingNotice,
@@ -990,6 +993,7 @@ export function tryResumeFix(planned, {
 
   postNotice({ repo, pr: planned.pr, ruling: planned.rulingNotAddressed });
   return resumeBgSession(planned, {
+    readSavedLaunch, launchEvidenceId: candidateRow?.id || candidate,
     candidate,
     prepareResume: () => {
       // The agent reloads its own cwd, not the trigger's scratch directory. Legacy builders and
@@ -1015,7 +1019,7 @@ export function resumeBgSession(planned, {
   stop = stopSession, wait = defaultConfirmWait, claimOwner = fixDispatchClaimOwner(), acquireClaim = acquireFixDispatchClaim,
   releaseClaim = releaseFixDispatchClaim, claimRoot, sessionCwdFor = (id) => dispatchSessionCwd(id, { root: REPO_ROOT }),
   ensureSessionCwd = ensureDispatchSessionCwd,
-  prepareResume = () => {},
+  prepareResume = () => {}, readSavedLaunch = readLaunchEvidence, launchEvidenceId = candidate,
 } = {}) {
   // #x0jphk5 — TAKE THE CLAIM before ever issuing `--resume`. Ownership is confirmed above (both HEAD-sha and
   // name), so what remains is a genuine race: two dispatchers reading the same stale listing could BOTH reach
@@ -1044,7 +1048,14 @@ export function resumeBgSession(planned, {
 
   // Serialize settings migration with the resume attempt; a failed write must not launch the old session
   // or strand its claim. The reconciler reports the error for this entry and continues the pass.
-  try { prepareResume(); } catch (e) { releaseOurClaim(); throw e; }
+  let saved;
+  try {
+    saved = readSavedLaunch(launchEvidenceId);
+    assertLaunchDescriptor(saved);
+    if (planned.mode === 'conflict-rebase' && (saved.mode !== planned.mode
+        || saved.launchGuard.pinnedHead !== planned.headRefOid)) refuseFixerLaunch('resume evidence differs from the admitted conflict episode');
+    prepareResume();
+  } catch (e) { releaseOurClaim(); throw e; }
 
   const resumeArgv = buildAgentArgv({
     payload: { prompt },
@@ -1056,7 +1067,7 @@ export function resumeBgSession(planned, {
   const resumeCwd = ensureSessionCwd(sessionCwdFor(candidate));
   let stdout = '';
   try { assertLaunchable(planned, { repo, root, demote, readLive }); } catch (e) { releaseOurClaim(); throw e; }
-  try { stdout = String(spawnAgent(resumeArgv, { cwd: resumeCwd, ...(planned.mode === 'conflict-rebase' ? { mode: planned.mode, launchGuard: launchGuardFor(planned, { repo, root }), launchGateOptions: { demote, readLive } } : {}) }) ?? ''); } catch (e) {
+  try { stdout = String(spawnAgent(resumeArgv, { cwd: resumeCwd, mode: saved.mode, launchGuard: saved.launchGuard, launchContext: { ...saved.launchContext, pr: planned.pr, repo }, launchGateOptions: { demote, readLive } }) ?? ''); } catch (e) {
     if (e?.kind?.startsWith('conflict-rebase-')) { releaseOurClaim(); throw e; }
     stdout = '';
   }
@@ -1638,7 +1649,7 @@ export function dispatchFix(planned, {
         launchAttempted = true;
         handle = spawnBorrowed({
           pr: planned.pr, num: planned.itemNum, sessionSlug, cwd: root,
-          ...(planned.mode === 'conflict-rebase' ? { mode: planned.mode, launchGuard: launchGuardFor(planned, { repo, root }) } : {}),
+          mode: planned.mode ?? 'ordinary', launchGuard: launchGuardFor(planned, { repo, root }) ?? null,
           ref: planned.laneRef, repo: ghRepoSlug(repo), laneRepo: tokens.LANE_REPO, scope: planned.scope.join(','),
           promptFile, claimRepo: repo,
           mergeOnto: mergeOntoFor(planned),
@@ -1703,7 +1714,7 @@ export function dispatchFix(planned, {
       assertLaunchable(planned, { repo, root, demote, readLive });
       launchAttempted = true;
       const launched = launchWrapped({
-        ...(planned.mode === 'conflict-rebase' ? { mode: planned.mode, launchGuard: launchGuardFor(planned, { repo, root }) } : {}),
+        mode: planned.mode ?? 'ordinary', launchGuard: launchGuardFor(planned, { repo, root }) ?? null,
         role: 'fix', session: sessionSlug, bgArgv: argv, cwd: sessionCwd, env: workerSpawnEnv(), pr: planned.pr, item: planned.itemNum,
         model: argv[argv.indexOf('--model') + 1] ?? null, sessionId,
       });
@@ -1720,7 +1731,7 @@ export function dispatchFix(planned, {
     // `claude agents`/`logs`/`stop` take. `sessionId` stays on the result for callers that already read it.
     assertLaunchable(planned, { repo, root, demote, readLive });
     launchAttempted = true;
-    const stdout = String(spawnAgent(argv, { cwd: sessionCwd, ...(planned.mode === 'conflict-rebase' ? { mode: planned.mode, launchGuard: launchGuardFor(planned, { repo, root }), launchGateOptions: { demote, readLive } } : {}) }) ?? '');
+    const stdout = String(spawnAgent(argv, { cwd: sessionCwd, mode: planned.mode ?? 'ordinary', launchGuard: launchGuardFor(planned, { repo, root }) ?? null, launchGateOptions: { demote, readLive } }) ?? '');
     // #x0jphk5 — the claim is DELIBERATELY NOT released here on success: see this function's own docblock for
     // why it must outlive this call (the 26+s listing-lag window a fresh spawn is exposed to).
     return {

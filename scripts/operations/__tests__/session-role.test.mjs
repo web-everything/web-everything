@@ -56,9 +56,9 @@ describe('markWorkerEnv', () => {
 describe('every claude spawn site sets the marker', () => {
   it('defaultSpawnAgent (claude --bg) passes a marked env, keeping the caller\'s other keys', () => {
     let seen;
-    defaultSpawnAgent(['--bg', 'x'], { env: { KEEP: 'me' } }, { exec: (_cmd, _argv, opts) => { seen = opts; return ''; } });
+    defaultSpawnAgent(['--bg', 'x'], { mode: 'ordinary', launchGuard: null, env: { KEEP: 'me' } }, { exec: (_cmd, _argv, opts) => { seen = opts; return ''; } });
     expect(seen.env).toEqual({ KEEP: 'me', [WORKER_MARKER_ENV]: '1' });
-    defaultSpawnAgent(['--bg', 'x'], {}, { exec: (_c, _a, opts) => { seen = opts; return ''; } });
+    defaultSpawnAgent(['--bg', 'x'], { mode: 'ordinary', launchGuard: null,}, { exec: (_c, _a, opts) => { seen = opts; return ''; } });
     expect(classifySession(seen.env).role).toBe('worker');
     expect(seen.env.PATH).toBe(process.env.PATH);
   });
@@ -73,7 +73,7 @@ describe('every claude spawn site sets the marker', () => {
       });
       return child;
     };
-    await spawnAgentToCompletion(['-p', 'x'], {}, { spawnFn });
+    await spawnAgentToCompletion(['-p', 'x'], { mode: 'ordinary', launchGuard: null,}, { spawnFn });
     expect(classifySession(seen.env).role).toBe('worker');
   });
   it('defaultSpawnDetached (the node wrapper that runs the agent) passes a marked env', () => {
