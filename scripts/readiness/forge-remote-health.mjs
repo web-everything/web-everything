@@ -7,9 +7,12 @@ import {reserve, readLockEntry, releaseLockDir} from './file-locks.mjs';
 import {parseTelemetry} from './forge-exec-run.mjs';
 import {readForgeTelemetry, pingForge} from './forge-telemetry.mjs';
 
+const STATE_GENERATION='g2';
+const stateKey=host=>'health-'+STATE_GENERATION+(host==='forge'?'':'-'+createHash('sha256').update(host).digest('hex'));
+export const remoteHealthFile=(root,host='forge')=>join(root,stateKey(host)+'.json');
 const freshState=()=>({v:1,lastReadAt:null,telemetry:null,failures:0,backoffUntil:0,trigger:''});
 const integer=v=>Number.isSafeInteger(v)&&v>=0;
-function readState(file) {
+function readState(file,onMissing=freshState) {
   let parsed=null;
   try {
     const st=lstatSync(file);
@@ -21,7 +24,7 @@ function readState(file) {
     if(s.telemetry!==null)parseTelemetry(JSON.stringify(s.telemetry));
     return s;
   } catch(error){
-    if(error.code==='ENOENT')return freshState();
+    if(error.code==='ENOENT')return onMissing();
     const e=new Error('remote-health-unreadable');e.detail=String(error.message||error).slice(0,200);
     // Circuit-breaker evidence survives only when each field is individually valid; telemetry and any
     // lastGood* data are never carried over.
@@ -30,6 +33,22 @@ function readState(file) {
       trigger:typeof parsed.trigger==='string'&&/^[a-zA-Z0-9.-]{0,80}$/.test(parsed.trigger)?parsed.trigger:''};
     throw e;
   }
+}
+// Legacy state is read-only: retain individually valid breaker fields, never telemetry or cache metadata.
+function seedLegacyBackoff(root,host) {
+  const state=freshState();
+  const file=join(root,'health'+(host==='forge'?'':'-'+createHash('sha256').update(host).digest('hex'))+'.json');
+  try {
+    const st=lstatSync(file);
+    if(!st.isFile() || st.isSymbolicLink() || st.size>70000)return state;
+    const parsed=JSON.parse(readFileSync(file,'utf8'));
+    if(parsed&&typeof parsed==='object') {
+      state.failures=integer(parsed.failures)?parsed.failures:0;
+      state.backoffUntil=integer(parsed.backoffUntil)?parsed.backoffUntil:0;
+      state.trigger=typeof parsed.trigger==='string'&&/^[a-zA-Z0-9.-]{0,80}$/.test(parsed.trigger)?parsed.trigger:'';
+    }
+  } catch {} // Missing, unreadable or malformed legacy evidence is ignored without mutation or logging.
+  return state;
 }
 // A malformed state file can never repair itself (the write path needs a readable state), so it is moved aside,
 // never deleted or followed, and the run continues from a fresh state: that forces a new telemetry read which must
@@ -43,8 +62,8 @@ function quarantine(root,key,file,detail) {
   console.error(`forge-remote-health: quarantined malformed state ${key}.json (${detail}); continuing from fresh state`);
 }
 const UNREACHABLE_BACKOFF_MS=15000;
-async function transaction(root,action,host='forge') {
-  const key=host==='forge'?'health':'health-'+createHash('sha256').update(host).digest('hex');
+async function transaction(root,action,host='forge',onQuarantine=()=>{}) {
+  const key=stateKey(host);
   const owner='remote-health-'+randomBytes(16).toString('hex'),start=Date.now();
   async function acquire() {
     const now=Date.now(),entry=readLockEntry(root,key);
@@ -56,14 +75,15 @@ async function transaction(root,action,host='forge') {
     await new Promise(resolve=>setTimeout(resolve,50));return acquire();
   }
   await acquire();
-  const file=join(root,key+'.json'),pending=file+'-'+randomBytes(8).toString('hex');
+  const file=remoteHealthFile(root,host),pending=file+'-'+randomBytes(8).toString('hex');
   try {
     let state;
-    try{state=readState(file);}
+    try{state=readState(file,()=>seedLegacyBackoff(root,host));}
     catch(error){
       if(error.message!=='remote-health-unreadable')throw error;
       try{quarantine(root,key,file,error.detail);}
       catch(qe){const e=new Error('remote-health-unreadable');e.detail=`${error.detail}; quarantine failed: ${qe.message}`.slice(0,300);throw e;}
+      onQuarantine(`quarantined:${error.detail}`.slice(0,212));
       state={...freshState(),...error.salvage};
     }
     const result=await action(state);
@@ -72,7 +92,15 @@ async function transaction(root,action,host='forge') {
   } finally {rmSync(pending,{force:true});releaseLockDir(root,key);}
 }
 export async function checkRemoteHealth({root,settings,clock=Date.now,readTelemetry=readForgeTelemetry,host='forge',ping=pingForge}) {
-  try{return await transaction(root,async state=>{
+  let quarantineDetail='';
+  const finish=result=>{
+    if(result.ok)return result;
+    const detail=quarantineDetail
+      ? [result.detail?.slice(0,300-quarantineDetail.length-2),quarantineDetail].filter(Boolean).join('; ')
+      : result.detail;
+    return detail?{...result,detail:detail.slice(0,300)}:result;
+  };
+  try{return finish(await transaction(root,async state=>{
     const now=clock();
     let probeDetail='';
     if(now<state.backoffUntil){
@@ -121,9 +149,9 @@ export async function checkRemoteHealth({root,settings,clock=Date.now,readTeleme
     }
     if(state.trigger==='forge-unreachable'){state.trigger='';state.failures=0;}
     return {ok:true};
-  },host);}catch(error){
-    if(error.message==='remote-health-busy')return {ok:false,reason:error.message};
-    return {ok:false,reason:'remote-health-unreadable',detail:error.detail||String(error.message||error).slice(0,200)};
+  },host,detail=>{quarantineDetail=detail;}));}catch(error){
+    if(error.message==='remote-health-busy')return finish({ok:false,reason:error.message});
+    return finish({ok:false,reason:'remote-health-unreadable',detail:error.detail||String(error.message||error).slice(0,200)});
   }
 }
 export async function recordRemoteResult({root,settings,clock=Date.now,result,host='forge'}) {
@@ -142,6 +170,5 @@ export async function recordRemoteResult({root,settings,clock=Date.now,result,ho
 
 /** Latest persisted Forge telemetry sample (read-only; null when absent or unreadable). */
 export function peekRemoteTelemetry({root,host='forge'}) {
-  const key=host==='forge'?'health':'health-'+createHash('sha256').update(host).digest('hex');
-  try{return readState(join(root,key+'.json')).telemetry;}catch{return null;}
+  try{return readState(remoteHealthFile(root,host)).telemetry;}catch{return null;}
 }
