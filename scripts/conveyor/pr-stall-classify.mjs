@@ -299,6 +299,7 @@ function judged({ head, verdict, trigger, files, card, grantsSoFar, acts, out, o
   const latest = ev.latest;
   if (!latest.length) {
     if (!(Number.isInteger(ev.rounds) && ev.rounds > 0 && typeof ev.trend === 'string' && ev.trend !== 'no-evidence')
+      || ev.latestUnparsed !== 0 || ev.latestComplete !== true
       || !Array.isArray(verdict.reasons) || verdict.reasons.includes('no-parseable-findings-for-trigger')) {
       return operator(verdict.verdict, "fail-closed: the judge's open findings are missing or malformed");
     }

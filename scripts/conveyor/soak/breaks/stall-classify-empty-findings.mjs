@@ -16,7 +16,7 @@ function emptyFindingsInput() {
     head, files: ['scripts/foo.mjs'],
     verdict: { verdict: 'send-back', reasons: ['no open findings after carding'], evidence: {
       rounds: 1, trend: 'first-round', trigger: 'red-team-cap', head: head.slice(0, 12), filesKnown: true, crossBroken: 0, grantsSoFar: 0,
-      guardFiles: [], latest: [], latestCount: 0, classes: { broken: 0, degraded: 0, unconfirmed: 0 },
+      guardFiles: [], latest: [], latestCount: 0, latestUnparsed: 0, latestComplete: true, classes: { broken: 0, degraded: 0, unconfirmed: 0 },
     } },
   };
 }
@@ -62,6 +62,7 @@ export default {
     };
     for (const patch of [
       { rounds: 0, trend: 'no-evidence' },
+      { latestUnparsed: 1 }, { latestComplete: false }, { latestUnparsed: undefined, latestComplete: undefined },
       { latestCount: 1 },
       ...['broken', 'degraded', 'unconfirmed'].map(cls => ({ classes: { broken: 0, degraded: 0, unconfirmed: 0, [cls]: 1 } })),
       { crossBroken: 1 }, { crossBroken: undefined },

@@ -4,6 +4,7 @@
 import { describe, expect, it } from 'vitest';
 import { detectRoundCap, extractRounds, formatJudgeLine, isGuardPath, judgeRound, parseReviewFindings, sameFinding, validateVerdict } from '../round-judge.mjs';
 import { redTeamGateMarker } from '../red-team-gate.mjs';
+import { classifyStall } from '../../conveyor/pr-stall-classify.mjs';
 
 const PR = 900;
 const H = (n) => String(n).repeat(40).slice(0, 40);
@@ -16,7 +17,7 @@ const at = () => new Date(Date.UTC(2026, 9, 20, 0, t++, 0)).toISOString();
 function rt(head, findings) {
   const lines = findings.map(([file, line, summary, impact = 'broken', confirmed = true, category = 'failing-input'], i) =>
     `${i + 1}. [${confirmed ? '**confirmed**' : 'not confirmed'}] (${category}, ${impact}) \`${file}:${line}\` — ${summary}\n   - Scenario: s\n   - Re-check: demonstrated break`);
-  return bot(`<!-- we:red-team-advisory pr=${PR} rev=${head} -->\n### Post-accept red team\n\n${lines.join('\n')}\n`, at());
+  return bot(`<!-- we:red-team-advisory pr=${PR} rev=${head} -->\n### Post-accept red team\n\n${lines.join('\n')}\nAdvisory only: red team · recorded verdict \`changes\`.\n`, at());
 }
 const cap = (head) => bot(`${redTeamGateMarker(PR, head, 'round-cap', 'abcdef0123456789')}\n**Red-team gate** cap`, at());
 const review = (bullets) => bot(`🔁 review — changes requested\n\nRecorded by agent (unattended review-loop) via the declared \`review-pr\` operation.\n\n### Findings\n${bullets.join('\n')}\n`, at());
@@ -307,6 +308,78 @@ describe('detectRoundCap', () => {
 });
 
 describe('helpers', () => {
+  it('exposes unparsed red-team findings and the classifier fails closed on real judge output', () => {
+    const head = H(9);
+    const verdict = judge([bot(`<!-- we:red-team-advisory pr=${PR} rev=${head} -->
+1. [confirmed] (failing-input, broken) \`src/a.mjs:1\` — parser is broken
+Advisory only: red team · recorded verdict \`changes\`.`, at())]);
+    expect(verdict).toMatchObject({ verdict: 'send-back', evidence: { rounds: 1, latest: [], crossBroken: 1, latestComplete: false } });
+    expect(verdict.evidence.latestUnparsed).toBeGreaterThanOrEqual(1);
+    expect(classifyStall({ head, files: ['src/q.mjs'], verdict,
+      row: { repo: REPO, number: PR, waitingOn: 'ruling-needed:red-team-round-cap', actor: 'operator',
+        stalled: true, liveJob: null, why: 'round cap', evidence: [], next: { command: 'operator-next' } },
+    })).toMatchObject({ lane: 'operator', action: verdict.verdict, command: 'operator-next',
+      reason: "fail-closed: the judge's open findings are missing or malformed" });
+  });
+  it('reports unknown parse evidence when no same-source round exists', () => {
+    expect(judge([review(['- `src/a.mjs:1` — broken'])]).evidence)
+      .toMatchObject({ rounds: 0, latestUnparsed: null, latestComplete: false });
+  });
+  it('the #6957 shape: a complete latest red-team review with zero open findings still clears', () => {
+    const earlier = rt(H(1), [['a.mjs', 1, 'earlier break']]);
+    const complete = bot(`<!-- we:red-team-advisory pr=${PR} rev=${H(9)} -->
+The red team tried to break this change and reported nothing.
+Advisory only: red team · recorded verdict \`accept\`.`, at());
+    expect(judge([earlier, complete]))
+      .toMatchObject({ verdict: 'card-the-rest', evidence: { rounds: 2, latest: [], latestUnparsed: 0, latestComplete: true, crossBroken: 0 } });
+  });
+  it.each(['review', 'referral'])('counts rejected finding bullets in %s rounds, including entirely unparsed rounds', (source) => {
+    const bullets = ['- `src/a.mjs:1` - rejected hyphen', '2. `src/b.mjs:2` missing separator'];
+    const comment = (lines) => source === 'review' ? review(lines)
+      : bot(`review paused: mandatory referrals\nWaiting on your ruling\n${lines.join('\n')}`, at());
+    const comments = [comment(['- `src/ok.mjs:3` — parsed', ...bullets]), comment(bullets)];
+    expect(extractRounds(comments, PR).map(({ findings, unparsed, complete }) => ({ count: findings.length, unparsed, complete })))
+      .toEqual([{ count: 1, unparsed: 2, complete: true }, { count: 0, unparsed: 2, complete: true }]);
+    expect(judge(comments, { trigger: source === 'review' ? 'review-cap' : 'referral-hold' }).evidence)
+      .toMatchObject({ rounds: 2, latest: [{ file: 'src/ok.mjs', line: 3, cls: 'broken' }], latestUnparsed: 2, latestComplete: true, crossBroken: 2 });
+  });
+  it.each(['review', 'referral', 'red-team'])('a malformed latest %s round preserves prior breaks and blocks grants for every trigger', (source) => {
+    const comment = (malformed) => source === 'review'
+      ? review([malformed ? '- `src/open.mjs:1` - malformed break' : '- `src/open.mjs:1` — confirmed break'])
+      : source === 'referral'
+        ? bot(`review paused: mandatory referrals\nWaiting on your ruling\n${malformed ? '- `src/open.mjs:1` - malformed break' : '- `src/open.mjs:1` — confirmed break'}`, at())
+        : malformed
+          ? bot(`<!-- we:red-team-advisory pr=${PR} rev=${H(9)} -->\n1. [confirmed] (failing-input, broken) \`src/open.mjs:1\` — malformed break\nAdvisory only: red team · recorded verdict \`changes\`.`, at())
+          : rt(H(9), [['src/open.mjs', 1, 'confirmed break']]);
+    const shrinking = () => [
+      rt(H(1), [['a.mjs', 1, 'one aaaa broke'], ['b.mjs', 2, 'two bbbb broke'], ['c.mjs', 3, 'three cccc broke'], ['d.mjs', 4, 'four dddd broke']]),
+      rt(H(9), [['z.mjs', 9, 'brand new zzzz problem']]),
+    ];
+    const baseline = shrinking();
+    expect(judge(baseline)).toMatchObject({ verdict: 'grant', k: 2 });
+    const earlier = comment(false);
+    const malformed = comment(true);
+    for (const trigger of ['red-team-cap', 'review-cap', 'referral-hold']) {
+      const result = judge([...baseline, earlier, malformed], { trigger });
+      expect(result.verdict).toBe('send-back');
+      expect(result.evidence.crossBroken).toBeGreaterThan(0);
+      expect(result.reasons).toContain('human-review-required');
+      const ownTrigger = { review: 'review-cap', referral: 'referral-hold', 'red-team': 'red-team-cap' }[source];
+      if (trigger === ownTrigger) {
+        expect(result.evidence.latest).toEqual([expect.objectContaining({ file: 'src/open.mjs', cls: 'broken' })]);
+        expect(result.evidence.latestUnparsed).toBeGreaterThan(0);
+      }
+    }
+  });
+  it('an unfinished older-head round blocks grants even after complete findings-bearing rounds', () => {
+    const unfinished = bot(`<!-- we:red-team-advisory pr=${PR} rev=${H(2)} -->\nReview interrupted.`, at());
+    const comments = [unfinished,
+      rt(H(1), [['a.mjs', 1, 'one aaaa broke'], ['b.mjs', 2, 'two bbbb broke']]),
+      rt(H(9), [['z.mjs', 9, 'brand new zzzz problem']]),
+    ];
+    expect(judge(comments.slice(1)).verdict).toBe('grant');
+    expect(judge(comments)).toMatchObject({ verdict: 'send-back', evidence: { crossBroken: 1, latestUnparsed: 0, latestComplete: true } });
+  });
   it('sameFinding: same file:line, or near-identical summary in the same file', () => {
     expect(sameFinding({ file: 'a', line: 1, summary: 'x' }, { file: 'a', line: 1, summary: 'totally different words here' })).toBe(true);
     expect(sameFinding({ file: 'a', line: 1, summary: 'cursor advances before the write lands' }, { file: 'a', line: 9, summary: 'the cursor advances before write lands' })).toBe(true);

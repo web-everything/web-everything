@@ -77,6 +77,8 @@ export function sameFinding(a, b) {
 // ── Evidence from the PR thread ─────────────────────────────────────────────────────────────────────────────────
 
 const REVIEW_BULLET = /^(?:- |\d+\. )`([^`\s]+?)(?::(\d+))?`(?: \([^)]*\))? — (.*)$/;
+const unparsedReviewBullets = (body) => String(body ?? '').replace(/\r\n/g, '\n').split('\n')
+  .filter((line) => /^(?:- |\d+\. )`/.test(line) && !REVIEW_BULLET.test(line)).length;
 
 /** Findings from one `review — changes requested` comment from the reviewer. PURE. */
 export function parseReviewFindings(body) {
@@ -96,12 +98,14 @@ export function parseReviewFindings(body) {
 }
 
 function classify(f) { return breakClass({ confirmed: f.confirmed, impact: f.impact }); }
+const incompleteRound = (r) => r.unparsed > 0 || r.complete === false;
+const carriesFindingsEvidence = (r) => !incompleteRound(r) || r.findings.length > 0;
 
 /**
  * Every round of findings in the thread, oldest first. A red-team round is one trusted advisory comment (per head);
  * a review round is one reviewer `changes requested` comment. Conflict-watch bounces, the red-team gate's own
  * send-back copy and operator decisions are not review rounds. PURE.
- * @returns {Array<{source:'red-team'|'review', at:number, rev:(string|null), findings:object[]}>}
+ * @returns {Array<{source:'red-team'|'review'|'referral', at:number, rev:(string|null), findings:object[], unparsed:number, complete:boolean}>}
  */
 export function extractRounds(comments, pr) {
   const out = [];
@@ -113,19 +117,22 @@ export function extractRounds(comments, pr) {
       if (rt.pr !== Number(pr)) return;
       const findings = rt.findings.map((f) => ({ file: f.file, line: f.line, summary: f.summary, confirmed: f.confirmed,
         impact: f.impact, category: f.category, detail: [f.scenario, f.recheck].filter(Boolean).join(' ').slice(0, 700) }));
-      out.push({ source: 'red-team', at: timeOf(c), i, rev: rt.rev, findings });
+      out.push({ source: 'red-team', at: timeOf(c), i, rev: rt.rev, findings, unparsed: rt.shapedLines.length, complete: rt.completedReview });
       return;
     }
     const head = body.trimStart();
     if (/^review paused:/.test(head) && /Waiting on your ruling/.test(head)) {
-      const findings = parseReviewFindings(head.split('Waiting on your ruling')[1] ?? '');
-      if (findings.length) out.push({ source: 'referral', at: timeOf(c), i, rev: null, findings });
+      const bullets = head.split('Waiting on your ruling')[1] ?? '';
+      const findings = parseReviewFindings(bullets);
+      const unparsed = unparsedReviewBullets(bullets);
+      if (findings.length || unparsed) out.push({ source: 'referral', at: timeOf(c), i, rev: null, findings, unparsed, complete: true });
       return;
     }
     if (!head.startsWith(REVIEW_CHANGES_PREFIX)) return;
     if (/Recorded by (?:parked-pr-conflict|agent \(red-team gate\)|chalbert|auto-policy)/i.test(head.slice(0, 400))) return;
     const findings = parseReviewFindings(head);
-    if (findings.length) out.push({ source: 'review', at: timeOf(c), i, rev: null, findings });
+    const unparsed = unparsedReviewBullets(head);
+    if (findings.length || unparsed) out.push({ source: 'review', at: timeOf(c), i, rev: null, findings, unparsed, complete: true });
   });
   return out.sort((a, b) => a.at - b.at || a.i - b.i);
 }
@@ -235,8 +242,11 @@ function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = []
   const rounds = extractRounds(comments, pr);
   const sourceOf = { 'red-team-cap': 'red-team', 'review-cap': 'review', 'referral-hold': 'referral' }[trigger];
   const same = rounds.filter((r) => r.source === sourceOf);
-  const latest = same.at(-1) ?? null;
-  const prior = latest ? same.slice(0, -1) : [];
+  const trueLatest = same.at(-1) ?? null;
+  // An unreadable empty round cannot erase earlier open findings. Complete empty rounds can clear them.
+  const findingsRounds = same.filter(carriesFindingsEvidence);
+  const latest = findingsRounds.at(-1) ?? null;
+  const prior = latest ? findingsRounds.slice(0, -1) : [];
   const prev = prior.at(-1) ?? null;
   const grants = repo ? roundExtensionGrants(comments ?? [], { repo, pr }) : [];
   // The shared reader clamps its running total at 10; the judge's ceiling is its own, so validate each grant alone.
@@ -268,9 +278,14 @@ function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = []
   // must never be carded or granted over, whichever source tripped the cap.
   const liveHead = String(head ?? '').toLowerCase();
   const crossBroken = ['red-team', 'review', 'referral'].filter((src) => src !== sourceOf).flatMap((src) => {
-    const r = rounds.filter((x) => x.source === src && (src !== 'red-team' || !liveHead || x.rev === liveHead)).at(-1);
+    const r = rounds.filter((x) => x.source === src && (src !== 'red-team' || !liveHead || x.rev === liveHead))
+      .filter(carriesFindingsEvidence).at(-1);
     return r && (!latest || r.at >= latest.at - 7 * 864e5) ? open(r).filter((f) => classify(f) === 'broken') : [];
   });
+  // Unknown evidence in ANY round/source counts as a possible break, including old heads/history.
+  // Keep it visible to downstream policy through crossBroken; a person must resolve incomplete evidence.
+  const incomplete = rounds.filter(incompleteRound);
+  crossBroken.push(...incomplete.map((r) => ({ file: `unknown-${r.source}-round`, line: null })));
 
   // Mechanical refutation (operator 2026-10-21, #5768): every open finding provably false on the live head.
   const checks = typeof verify === 'function' && annotated.length
@@ -302,6 +317,7 @@ function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = []
     trigger, head: String(head ?? '').slice(0, 12), rounds: same.length, otherSourceRounds: rounds.length - same.length,
     latest: annotated.map((f) => ({ file: f.file, line: f.line, summary: f.summary.slice(0, 140), cls: f.cls, priorAppearances: f.priorAppearances })),
     latestCount: latestOpen.length, prevCount: prev ? prevOpen.length : null, trend,
+    latestUnparsed: trueLatest?.unparsed ?? null, latestComplete: trueLatest?.complete ?? false,
     repeated: repeated.length, unfixedAfterSendBacks: unfixedAfterSendBacks.length, newFiles,
     classes: Object.fromEntries(['broken', 'degraded', 'unconfirmed'].map((k) => [k, annotated.filter((f) => f.cls === k).length])),
     policy: { sendBack: plan.sendBack.length, card: plan.card.length, advisory: plan.advisory.length },
@@ -310,6 +326,7 @@ function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = []
   };
 
   const done = (verdict, why, k, withProof) => ({ verdict, ...(verdict === 'grant' ? { k } : {}), ...(withProof ? { proof: withProof } : {}), reasons: [...why, ...reasons], evidence });
+  if (incomplete.length) return done('send-back', [`incomplete-round-evidence:${incomplete[0].source}`, 'human-review-required']);
   const statuteTouched = fileList.filter(isStatutePath);
   // Grants need file evidence and no statute edit we cannot inspect (no hunks in a thread) and no cross-source break.
   const noGrant = () => (!fileList.length ? 'no-file-evidence-no-grant'

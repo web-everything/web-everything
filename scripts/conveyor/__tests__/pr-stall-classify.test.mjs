@@ -27,7 +27,7 @@ const counts = (latest) => ({ latestCount: latest.length, classes: Object.fromEn
 const verdict = (v, trigger = 'red-team-cap', o = {}) => {
   const latest = [finding(v === 'card-the-rest' ? 'degraded' : 'broken')];
   return { verdict: v, reasons: [`why-${v}`], ...(v === 'grant' ? { k: 1 } : {}), ...(v === 'not-real-verified' ? { proof: ['scripts/foo.mjs:3 -> absent'] } : {}),
-    evidence: { trigger, head: HEAD.slice(0, 12).toLowerCase(), filesKnown: true, crossBroken: 0, grantsSoFar: 0, guardFiles: [], latest, ...counts(latest) }, ...o };
+    evidence: { trigger, head: HEAD.slice(0, 12).toLowerCase(), filesKnown: true, crossBroken: 0, grantsSoFar: 0, guardFiles: [], latest, latestUnparsed: 0, latestComplete: true, ...counts(latest) }, ...o };
 };
 const hold = 'referral-hold';
 /** Patch the evidence; a patched `latest` keeps the judge's tallies in step unless the patch sets them itself. */
@@ -304,6 +304,18 @@ describe('fail closed', () => {
 });
 
 describe('consistent empty judge findings', () => {
+  it.each([
+    { latestUnparsed: 1 }, { latestComplete: false },
+    { latestUnparsed: undefined }, { latestComplete: undefined },
+    { latestUnparsed: undefined, latestComplete: undefined },
+  ])('empty findings with incomplete parse evidence fail closed: %j', (patch) => {
+    const v = ev('send-back', 'red-team-cap', { latest: [], rounds: 1, trend: 'first-round', ...patch });
+    for (const key of Object.keys(patch)) if (patch[key] === undefined) delete v.evidence[key];
+    expect(at('ruling-needed:red-team-round-cap', { verdict: v })).toMatchObject({
+      lane: 'operator', action: 'send-back', command: 'next-for ruling-needed:red-team-round-cap',
+      reason: "fail-closed: the judge's open findings are missing or malformed",
+    });
+  });
   it.each(Object.entries(TRIGGER).flatMap(([state, trigger]) => ['send-back', 'card-the-rest'].map((v) => [state, trigger, v])))
   ('%s with %s and verdict %s routes nothing open to extend-rounds', (state, trigger, v) => {
     const result = at(state, { verdict: ev(v, trigger, { rounds: 1, trend: 'first-round', latest: [] }) });
