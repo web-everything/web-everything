@@ -1193,10 +1193,15 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
 export const RED_TEAM_SEAT = Object.freeze({ seat: 'red-team', lens: 'red-team', key: 'red-team' });
 
 // These are single seats: executor settings have no bearing on their route.
+let loggedIgnoredAiSeatOptions = false;
 function aiSeatRoute(role, current, { env, io, available, operation, taskType, policy, operatorKeys }) {
   try {
     const resolved = (io.readAiRouting ?? resolveAiRouting)({ env, log: false });
     const { coordinator } = aiRoutingInputs(role, resolved);
+    if ((coordinator?.model !== undefined || coordinator?.effort !== undefined) && !loggedIgnoredAiSeatOptions) {
+      loggedIgnoredAiSeatOptions = true;
+      io.log('aiRouting red-team/red-team-recheck: overlay model/effort ignored; only coordinator.provider is honoured');
+    }
     if (!coordinator?.provider) return current;
     if (role === 'red-team-recheck' && coordinator.provider !== 'claude') {
       io.log(`aiRouting.${role}: ${coordinator.provider} cannot enforce Claude's tool, budget and environment restrictions; inheriting today's route`);
@@ -1206,35 +1211,21 @@ function aiSeatRoute(role, current, { env, io, available, operation, taskType, p
       io.log(`aiRouting.${role}: ${coordinator.provider} unavailable; inheriting today's route`);
       return current;
     }
-    const effortSuffix = model => typeof model === 'string'
-      ? model.trim().match(/-(low|medium|high|xhigh|max|ultra)$/)?.[1] : undefined;
-    const rejectSuffixedModel = model => {
-      if (!effortSuffix(model)) return false;
-      io.log(`aiRouting.${role}: model ${model} carries an effort suffix; keeping today's route model`);
-      return true;
-    };
-    if (rejectSuffixedModel(coordinator.model)) return current;
     // Reapply roster, counting-seat, disabled-provider and operator-override rules.
     const reader = io.readRoutingPolicy ?? readRoutingPolicy;
     const effectivePolicy = policy ?? reader();
+    const provider = coordinator.provider;
+    const defaults = current?.provider === provider ? current : resolveOperationRoute({
+      operation, taskType, available: [provider], policy: effectivePolicy,
+    });
+    const model = defaults?.model ?? (role === 'red-team-recheck' ? RECHECK_MODEL : RED_TEAM_MODELS[provider].model);
+    const effort = defaults?.effort ?? resolveOperationEffort(operation, provider, taskType, effectivePolicy);
     const route = validateAiSeatRoute({ operation, taskType, available, policy: effectivePolicy,
-      aiRouting: coordinator, operatorKeys: operatorKeys ?? reader.operatorKeys?.() ?? [] });
-    if (route) {
-      // Check the resolved model too: policy aliases can hide an effort suffix.
-      if (rejectSuffixedModel(route.model)) return current;
-      // The launcher drops --effort for suffixed models, so today's suffix wins.
-      const todayEffort = effortSuffix(current?.model) ?? current?.effort
-        ?? resolveOperationEffort(operation, current?.provider ?? route.provider, taskType, effectivePolicy)
-        ?? (role === 'red-team-recheck' ? RECHECK_EFFORT : RED_TEAM_MODELS[route.provider].effort);
-      const efforts = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
-      if (efforts.indexOf(route.effort) < efforts.indexOf(todayEffort)) {
-        io.log(`aiRouting.${role}: effort ${route.effort} below today's ${todayEffort}; keeping today's effort`);
-        route.effort = todayEffort;
-      }
-    }
+      aiRouting: { provider, model, effort }, operatorKeys: operatorKeys ?? reader.operatorKeys?.() ?? [] });
     const sources = Object.fromEntries(Object.entries(resolved.sources ?? {}).filter(([path]) => path.startsWith(`${role}.coordinator.`)));
     io.log(`policy-cascade · aiRouting.${role}: ${route?.provider}/${route?.model}/${route?.effort} (${JSON.stringify(sources)})`);
-    return route ?? current;
+    // Validation expands model aliases; keep the launch boundary's existing defaults.
+    return route?.provider === provider ? { ...route, model, effort } : route ?? current;
   } catch (error) {
     io.log(`aiRouting.${role}: invalid routing (${error.message}); inheriting today's route`);
     return current;

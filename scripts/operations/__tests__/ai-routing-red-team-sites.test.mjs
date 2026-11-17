@@ -7,8 +7,7 @@ import { DEFAULT_ROUTING_POLICY } from '../../lib/dispatch-routing-policy.mjs';
 import { resolveOperationRoute, resolveOperationEffort } from '../../lib/dispatch-routing-policy-io.mjs';
 import * as routingPolicyIo from '../../lib/dispatch-routing-policy-io.mjs';
 import { selectReviewSeatProvider } from '../../lib/provider-routing.mjs';
-import { createRedTeamIo, speculateRedTeam, reserveSeatCalls, seatCallArgv, RED_TEAM_MODELS, RECHECK_MODEL } from '../review-extra-seats.mjs';
-import { buildAgyDirectTaskArgv, parseFlags } from '../../gemini-direct-task.mjs';
+import { createRedTeamIo, speculateRedTeam, reserveSeatCalls, RED_TEAM_MODELS, RECHECK_MODEL } from '../review-extra-seats.mjs';
 
 const NOW = Date.parse('2026-11-16T15:00:00Z');
 const read = { title: 'guard', body: '', diffText: 'diff --git a/x.mjs b/x.mjs\n+guard();',
@@ -18,8 +17,9 @@ const setting = (role, coordinator, executors = 'inherit') => resolveAiRouting({
 const empty = () => resolveAiRouting({ env: {}, platform: {}, tool: {}, accountMap: { accounts: {} }, log: false });
 const inherit = { provider: 'inherit', model: 'inherit', effort: 'inherit', account: 'inherit' };
 const route = { provider: 'agy-claude', model: 'claude-sonnet-5-5', effort: 'medium' };
+const providerOnly = (role, provider) => () => ({ value: { [role]: { coordinator: { provider } } } });
 
-async function seat(readAiRouting = empty, overrides = {}, env = {}) {
+async function seat(readAiRouting = empty, overrides = {}, env = {}, speculate = speculateRedTeam) {
   const calls = [], reservations = [], logs = [];
   const io = {
     readAiRouting, readRoutingPolicy: () => structuredClone(DEFAULT_ROUTING_POLICY),
@@ -37,7 +37,7 @@ async function seat(readAiRouting = empty, overrides = {}, env = {}) {
     },
     ...overrides,
   };
-  const result = await speculateRedTeam({ pr: 1, repo: 'test/repo', read, env, post: false, record: false }, io);
+  const result = await speculate({ pr: 1, repo: 'test/repo', read, env, post: false, record: false }, io);
   return { result, calls, reservations, logs };
 }
 
@@ -72,88 +72,69 @@ test('recheck empty and all-inherit match today’s model and effort', async () 
   }
 });
 
-test('red-team overlays provider/model/effort and ignores executors', async () => {
-  const { calls, reservations } = await seat(() => setting('red-team', { ...route, effort: 'high' }, ['codex']));
+test('overlay model/effort warning logs once across both roles and repeated calls', async () => {
+  // A fresh module represents a fresh process without exposing a reset hook in production.
+  vi.resetModules();
+  const fresh = await import('../review-extra-seats.mjs');
+  const logs = [];
+  const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(line => { logs.push(line); return true; });
+  try {
+    const io = fresh.createRedTeamIo({ env: {},
+      readAiRouting: () => setting('red-team-recheck', { provider: 'claude', model: 'claude-sonnet-4-6', effort: 'low' }),
+      readRoutingPolicy: () => DEFAULT_ROUTING_POLICY,
+      spawnRecheck: async () => ({ value: { checks: [] } }),
+    });
+    await io.runRecheck({ pr: 1, readsRepo: false });
+    await io.runRecheck({ pr: 1, readsRepo: false });
+    await seat(() => setting('red-team', route), { log: line => logs.push(line) }, {}, fresh.speculateRedTeam);
+    assert.equal(logs.filter(line => line.includes('overlay model/effort ignored')).length, 1);
+  } finally { stderr.mockRestore(); }
+});
+
+test('red-team overlays only provider and ignores executors', async () => {
+  const { calls, reservations } = await seat(() => ({ value: { 'red-team': { coordinator: { provider: 'agy-claude' }, executors: ['codex'] } } }));
   assert.deepEqual(reservations, ['agy-claude']);
   assert.equal(calls[0].provider, 'agy-claude');
-  assert.equal(calls[0].model, route.model);
-  assert.equal(calls[0].effort, 'high');
+  const configured = resolveOperationRoute({ operation: 'review-seat', taskType: 'red-team', available: ['agy-claude'], policy: DEFAULT_ROUTING_POLICY });
+  assert.equal(calls[0].model, configured?.model ?? RED_TEAM_MODELS['agy-claude'].model);
+  assert.equal(calls[0].effort, configured?.effort ?? resolveOperationEffort('review-seat', 'agy-claude', 'red-team'));
 });
 
-// Exercise the production seat CLI options, parser and final agy argv builder.
-function agyLaunch(options) {
-  const flags = parseFlags(seatCallArgv(options).slice(1));
-  return buildAgyDirectTaskArgv({ ...flags, review: flags.review });
-}
-const option = (argv, name) => argv.includes(name) ? argv[argv.indexOf(name) + 1] : undefined;
-
-for (const suffix of ['low', 'medium', 'high']) {
-  test(`red-team rejects ${suffix}-suffixed overlay through real launcher options and retains launched high effort`, async () => {
-    const today = { ...route, effort: 'high' };
-    const resolved = vi.spyOn(routingPolicyIo, 'resolveOperationRoute').mockReturnValueOnce(today);
-    try {
-      const model = `${route.model}-${suffix}`;
-      const { calls, logs } = await seat(() => setting('red-team', { ...today, model }));
-      // Demonstrate the real bypass that the overlay guard must prevent.
-      const unsafe = agyLaunch({ ...calls[0], model });
-      assert.equal(option(unsafe, '--model'), model);
-      assert.equal(option(unsafe, '--effort'), undefined);
-      const launched = agyLaunch(calls[0]);
-      assert.equal(option(launched, '--model'), today.model);
-      assert.equal(option(launched, '--effort'), 'high');
-      assert.ok(logs.some(line => line.includes(`model ${model} carries an effort suffix; keeping today's route model`)));
-    } finally { resolved.mockRestore(); }
+for (const model of ['claude-opus-5-5', 'claude-sonnet-4-6',
+  ...['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].map(suffix => `${route.model}-${suffix}`)]) {
+  test(`both roles ignore overlay model ${model} and effort`, async () => {
+    // Raw input also covers values outside the settings reader's model catalog.
+    const raw = (role, provider, effort) => () => ({ value: { [role]: { coordinator: { provider, model, effort } } } });
+    const baseline = await seat(providerOnly('red-team', 'agy-claude'));
+    const baselineRecheck = await recheck(providerOnly('red-team-recheck', 'claude'));
+    for (const effort of ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']) {
+      assert.deepEqual((await seat(raw('red-team', 'agy-claude', effort))).calls, baseline.calls);
+      const call = await recheck(raw('red-team-recheck', 'claude', effort));
+      assert.deepEqual({ ...call, runId: baselineRecheck.runId, spawnFn: baselineRecheck.spawnFn }, baselineRecheck);
+    }
   });
 }
 
-for (const suffix of ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']) {
-  test(`both sites fail closed on raw ${suffix}-suffixed overlay models`, async () => {
-    // Bypass the settings reader's catalog validation to pin the local closed path.
-    const raw = role => () => ({ value: { [role]: { coordinator: {
-      provider: role === 'red-team' ? 'agy-claude' : 'claude',
-      model: `${route.model}-${suffix}`, effort: 'high',
-    } } } });
-    const baseline = await seat();
-    const actual = await seat(raw('red-team'));
-    assert.deepEqual(actual.calls, baseline.calls);
-    assert.ok(actual.logs.some(line => line.includes('carries an effort suffix')));
-    const baselineRecheck = await recheck();
-    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    try {
-      const call = await recheck(raw('red-team-recheck'));
-      assert.equal(call.model, baselineRecheck.model);
-      assert.equal(call.effort, baselineRecheck.effort);
-      assert.ok(stderr.mock.calls.some(([line]) => line.includes('carries an effort suffix')));
-    } finally { stderr.mockRestore(); }
-  });
-}
+test('catalog-valid overlay model and effort are ignored through the settings reader for both roles', async () => {
+  const baseline = await seat(providerOnly('red-team', 'agy-claude'));
+  assert.deepEqual((await seat(() => setting('red-team', { ...route, model: 'claude-sonnet-4-6', effort: 'max' }))).calls, baseline.calls);
+  const baselineRecheck = await recheck();
+  const call = await recheck(() => setting('red-team-recheck', { provider: 'claude', model: 'claude-sonnet-4-6', effort: 'max' }));
+  assert.deepEqual({ ...call, runId: baselineRecheck.runId, spawnFn: baselineRecheck.spawnFn }, baselineRecheck);
+});
 
-test('red-team checks policy-resolved aliases for effort suffixes', async () => {
-  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
-  policy.aliases['agy-claude'].hidden = `${route.model}-medium`;
+test('model and effort without a provider retain inherited options for both roles', async () => {
   const baseline = await seat();
-  const { calls, logs } = await seat(() => ({ value: { 'red-team': { coordinator: {
-    ...route, model: 'hidden', effort: 'high',
-  } } } }), { readRoutingPolicy: () => policy });
-  assert.deepEqual(calls, baseline.calls);
-  assert.ok(logs.some(line => line.includes('carries an effort suffix')));
+  assert.deepEqual((await seat(() => setting('red-team', { model: 'claude-sonnet-4-6', effort: 'max' }))).calls, baseline.calls);
+  const baselineRecheck = await recheck();
+  const call = await recheck(() => setting('red-team-recheck', { model: 'claude-sonnet-4-6', effort: 'max' }));
+  assert.deepEqual({ ...call, runId: baselineRecheck.runId, spawnFn: baselineRecheck.spawnFn }, baselineRecheck);
 });
 
-test('red-team floor uses today’s launched model suffix over its lower effort option', async () => {
-  const today = { ...route, model: `${route.model}-high`, effort: 'low' };
-  const resolved = vi.spyOn(routingPolicyIo, 'resolveOperationRoute').mockReturnValueOnce(today);
-  try {
-    const { calls, logs } = await seat(() => setting('red-team', route));
-    assert.equal(option(agyLaunch({ ...calls[0], ...today }), '--effort'), undefined);
-    assert.equal(option(agyLaunch(calls[0]), '--effort'), 'high');
-    assert.ok(logs.some(line => line.includes("effort medium below today's high")));
-  } finally { resolved.mockRestore(); }
-});
-
-test('recheck overlays provider/model/effort and ignores executors', async () => {
-  const call = await recheck(() => setting('red-team-recheck', { provider: 'claude', model: 'claude-opus-5-5', effort: 'high' }, ['codex']));
-  assert.equal(call.model, 'claude-opus-5-5');
-  assert.equal(call.effort, 'high');
+test('recheck provider overlay ignores executors', async () => {
+  const baseline = await recheck();
+  const call = await recheck(() => ({ value: { 'red-team-recheck': { coordinator: { provider: 'claude' }, executors: ['codex'] } } }));
+  assert.deepEqual({ ...call, runId: baseline.runId, spawnFn: baseline.spawnFn }, baseline);
 });
 
 for (const reason of ['held', 'capped', 'CLI unavailable', 'reservation denied']) {
@@ -201,28 +182,6 @@ test('non-Claude configured recheck route still refuses repository reads before 
   } finally { resolved.mockRestore(); }
 });
 
-for (const effort of ['low', 'medium']) {
-  test(`red-team ${effort} overlay retains today's effort and logs the floor`, async () => {
-    const baseline = await seat();
-    const { calls, logs } = await seat(() => setting('red-team', { ...route, effort }));
-    assert.equal(calls[0].provider, route.provider);
-    assert.equal(calls[0].model, route.model);
-    assert.equal(calls[0].effort, baseline.calls[0].effort);
-    assert.ok(logs.some(line => line.includes(`effort ${effort} below today's ${baseline.calls[0].effort}; keeping today's effort`)));
-  });
-
-  test(`recheck ${effort} overlay retains today's effort and logs the floor`, async () => {
-    const baseline = await recheck();
-    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    try {
-      const call = await recheck(() => setting('red-team-recheck', { provider: 'claude', model: 'claude-opus-5-5', effort }));
-      assert.equal(call.model, 'claude-opus-5-5');
-      assert.equal(call.effort, baseline.effort);
-      assert.ok(stderr.mock.calls.some(([line]) => line.includes(`effort ${effort} below today's ${baseline.effort}; keeping today's effort`)));
-    } finally { stderr.mockRestore(); }
-  });
-}
-
 test('red-team roster rejects native Claude so counting Claude review seats remain separate', async () => {
   const { calls, logs } = await seat(() => setting('red-team', { provider: 'claude', model: 'sonnet' }));
   assert.deepEqual(calls, (await seat()).calls);
@@ -231,8 +190,7 @@ test('red-team roster rejects native Claude so counting Claude review seats rema
 });
 
 for (const resolver of [() => { throw new Error('unreadable'); }, () => ({}),
-  () => setting('red-team', { provider: 'codex', model: 'not-a-model' }),
-  () => ({ value: { 'red-team': { coordinator: { provider: 'codex', model: 'not-a-model' } } } })]) {
+  () => setting('red-team', { provider: 'codex', model: 'not-a-model' })]) {
   test('invalid or throwing resolution inherits at both sites', async () => {
     const baseline = await seat();
     const actual = await seat(resolver);
@@ -259,18 +217,14 @@ test('all-inherit retains byte-identical recheck call options apart from per-cal
   assert.equal(JSON.stringify({ ...call, runId: baseline.runId }), JSON.stringify(baseline));
 });
 
-test('red-team effort floor follows today’s resolved xhigh effort rather than a fixed high floor', async () => {
-  const resolved = vi.spyOn(routingPolicyIo, 'resolveOperationRoute').mockReturnValueOnce({ provider: 'codex', model: 'gpt-6-astra', effort: 'xhigh' });
+test('provider-only overlay preserves today’s resolved model and xhigh effort', async () => {
+  const today = { provider: 'codex', model: 'gpt-6-astra', effort: 'xhigh' };
+  const resolved = vi.spyOn(routingPolicyIo, 'resolveOperationRoute').mockReturnValueOnce(today);
   try {
-    const { calls, logs } = await seat(() => setting('red-team', { provider: 'codex', model: 'gpt-6-astra', effort: 'high' }));
-    assert.equal(calls[0].effort, 'xhigh');
-    assert.ok(logs.some(line => line.includes("effort high below today's xhigh; keeping today's effort")));
+    const { calls } = await seat(() => setting('red-team', { provider: 'codex', model: 'gpt-6-sol', effort: 'max' }));
+    assert.equal(calls[0].model, today.model);
+    assert.equal(calls[0].effort, today.effort);
   } finally { resolved.mockRestore(); }
-});
-
-test('red-team overlay may raise effort above today’s floor', async () => {
-  const { calls } = await seat(() => setting('red-team', { provider: 'codex', model: 'gpt-6-astra', effort: 'max' }));
-  assert.equal(calls[0].effort, 'max');
 });
 
 test('overlay validation preserves the mandatory counting-Claude-seat rule', async () => {
