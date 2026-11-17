@@ -2231,6 +2231,14 @@ Model the surviving job with `keepAliveScript()` anchored to the test runner, wi
 lifetime; anchoring to the simulated client would invalidate the crash-survival assertion.
 The local host's heavy semaphore is acquired only on a safe local fallback.
 
+A settled integer receipt can coexist with its run in `activeRunIds` when finish has not removed
+the prepared/running state. `runVerdict` treats that as finished, except supervisor codes 97/254,
+which retain their conservative cleanup rules. Preserve the reaper's death margin and two-sample
+guards. After a client failure, a local rerun needs the current execution's run ID and a fresh
+telemetry sample taken after the failure; a bounded probe that stalls or returns incomplete evidence
+keeps exit 124 and the marker. Telemetry confirms termination, never a verified remote success.
+Regressions live in `forge-slot-markers-per-run.test.mjs` and `heavy-admission-remote.test.mjs`.
+
 ### Forge warm bases and delta snapshots
 
 The Mac client and public-base warmer share `forge-exec-manifest.mjs`: path bytes,
@@ -4396,3 +4404,10 @@ automatic discovery and explicit resume behind both guards and both retry budget
 Exercise pending CI after timing settings change, revoked clearance, green completion,
 and budget exhaustion after that intervening failure. Unknown pending outcomes remain
 non-replayable; CI-held provenance does not establish that a write was never applied.
+
+Operator prototype-load waiver tests live in `scripts/operations/__tests__/ruled-weakened-store.test.mjs`.
+Use an injected HOME and filesystem: the append-only ops store lives under
+`~/workspace/.operations/coordination/ruled-weakened.jsonl`. Tool, platform, then ops entries
+share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
+The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
+`--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.

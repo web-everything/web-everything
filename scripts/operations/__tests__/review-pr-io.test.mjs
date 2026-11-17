@@ -3596,6 +3596,7 @@ describe('#5135 fix range read wiring', () => {
 // ── Card 5469 — the scoped re-review shadow sink (finding-identity ledger rows + would-block/would-card journal) ──────
 describe('card 5469: recordScopedRereviewShadow (shadow only, never a decision)', async () => {
   const { recordScopedRereviewShadow, readFixRange, resolveScopedRereviewMode } = await import('../review-pr-io.mjs');
+  const { FINDING_STATUS_VALUES } = await import('../../lib/verdict-ledger.mjs');
   const { scopedRereviewFacts } = await import('../review-pr.mjs');
   const P = 'a'.repeat(40);
   const H = 'b'.repeat(40);
@@ -3618,6 +3619,17 @@ describe('card 5469: recordScopedRereviewShadow (shadow only, never a decision)'
       appendJournal: (e) => journal.push(e), out: (l) => lines.push(l), now: () => '2026-10-08T22:00:00.000Z' });
     return { summary, appended, journal, lines };
   };
+
+  it.each([...FINDING_STATUS_VALUES, 'unknown', undefined])('scoped rereview counts only review finding status %s', (status) => {
+    const plain = [{ type: 'review-run', pr: 7, headSha: P }];
+    const extra = { type: 'finding', pr: 7, headSha: 'c'.repeat(40), status, source: 'red-team', findingId: 'fi-0123456789ab' };
+    if (['raised', 'tolerated', 'fixed', 'carded'].includes(status)) {
+      expect(run(facts(), [...plain, extra]).summary).toMatchObject({ round: 3, priorHead: extra.headSha });
+    } else {
+      expect(run(facts(), [...plain, extra])).toEqual(run(facts(), plain));
+      expect(run(facts({ latestFix: null }), [extra])).toEqual(run(facts({ latestFix: null }), []));
+    }
+  });
 
   it('journals a late finding on unchanged code as would-card, with a finding row carrying its identity', () => {
     const { summary, appended, journal, lines } = run(facts());
@@ -3687,6 +3699,8 @@ describe('card 5469: the advise step declares the shadow effect only when the se
 // ── Cards 5471 / 5470 — the read carries the round budget, the ledger round, and the `on` mode ───────────────────────
 describe('cards 5471 + 5470: the io read resolves the round settings and the ledger round', async () => {
   const { readReviewRound, resolveRoundBudget, resolveScopedRereviewMode } = await import('../review-pr-io.mjs');
+  const { readReviewRoundAsOf } = await import('../review-pr-io.mjs');
+  const { FINDING_STATUS_VALUES } = await import('../../lib/verdict-ledger.mjs');
   const H = 'd'.repeat(40);
   const rows = [
     { type: 'review-run', pr: 7, headSha: 'a'.repeat(40) },
@@ -3696,6 +3710,18 @@ describe('cards 5471 + 5470: the io read resolves the round settings and the led
     { type: 'review-run', pr: 7, headSha: H },
     { type: 'ruling', pr: 7, headSha: 'e'.repeat(40) },
   ];
+
+  it.each([...FINDING_STATUS_VALUES, 'unknown', undefined])('live and historical rounds count only review finding status %s', (status) => {
+    const plain = [{ type: 'review-run', pr: 7, headSha: 'a'.repeat(40), at: '2026-10-01T00:00:00Z' }];
+    const extra = { type: 'finding', pr: 7, headSha: 'b'.repeat(40), at: '2026-10-02T00:00:00Z', status, source: 'red-team' };
+    const reviewed = ['raised', 'tolerated', 'fixed', 'carded'].includes(status);
+    const live = rs => readReviewRound({ repo: 'o/r', pr: 7, head: H, readLedgerRows: () => rs });
+    const past = (rs, head = null) => readReviewRoundAsOf({ repo: 'o/r', pr: 7, at: '2026-10-03T00:00:00Z', head, readLedgerRows: () => rs });
+    expect(live([...plain, extra])).toBe(reviewed ? 3 : live(plain));
+    expect(past([...plain, extra])).toBe(reviewed ? 2 : past(plain));
+    expect(past([...plain, extra], H)).toBe(reviewed ? 3 : past(plain, H));
+    expect(past([extra])).toBe(reviewed ? 1 : null);
+  });
 
   it('the round is 1 + the distinct earlier heads this PR was reviewed on (review-run and finding rows only)', () => {
     expect(readReviewRound({ repo: 'o/r', pr: 7, head: H, readLedgerRows: () => rows })).toBe(3);
