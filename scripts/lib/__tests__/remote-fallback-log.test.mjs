@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ADVISORY_REASONS, recordLocalSlotFallback, summarize, readFallbackRows } from '../remote-fallback-log.mjs';
+import { ADVISORY_REASONS, recordLocalSlotFallback, summarize, readFallbackLog, readFallbackRows } from '../remote-fallback-log.mjs';
 
 describe('summarize', () => {
   it('excludes credential warnings from real counts and the top cause', () => {
@@ -36,7 +36,7 @@ describe('summarize', () => {
   });
 });
 
-describe('readFallbackRows', () => {
+describe('readFallbackLog', () => {
   const roots = [];
   afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
   const fixture = () => {
@@ -45,21 +45,43 @@ describe('readFallbackRows', () => {
     return join(root, 'remote-fallbacks.jsonl');
   };
 
-  it('reads valid JSONL around malformed and partial lines, including a complete final line without newline', () => {
+  it('counts corrupt interior lines and retains a complete final object without newline', () => {
     const file = fixture();
     writeFileSync(file, '{"reason":"needs-git"}\ninvalid\n\n{"reason":\n{"reason":"credential-warn"}');
     expect(readFallbackRows(file)).toEqual([{ reason: 'needs-git' }, { reason: 'credential-warn' }]);
+    expect(readFallbackLog(file)).toEqual({ rows: [{ reason: 'needs-git' }, { reason: 'credential-warn' }],
+      invalid: 2, missing: false, partial: 0 });
   });
 
-  it('returns no rows when missing or empty', () => {
+  it('distinguishes a missing log from an empty readable log', () => {
     const file = fixture();
+    expect(readFallbackLog(file)).toEqual({ rows: [], invalid: 0, missing: true, partial: 0 });
     expect(readFallbackRows(file)).toEqual([]);
     writeFileSync(file, '');
+    expect(readFallbackLog(file)).toEqual({ rows: [], invalid: 0, missing: false, partial: 0 });
     expect(readFallbackRows(file)).toEqual([]);
+  });
+
+  it.each(['null', '1', 'true', '"text"', '[]'])('counts parsed non-object %s as invalid even without a final newline', line => {
+    const file = fixture();
+    writeFileSync(file, `${line}\n${line}`);
+    expect(readFallbackLog(file)).toEqual({ rows: [], invalid: 2, missing: false, partial: 0 });
+  });
+
+  it('counts only the unterminated final parse failure as partial, ignoring blank lines', () => {
+    const file = fixture();
+    writeFileSync(file, '{"reason":\n \t\n{"reason":"needs-git"}\n{"reason":');
+    expect(readFallbackLog(file)).toEqual({ rows: [{ reason: 'needs-git' }], invalid: 1, missing: false, partial: 1 });
+  });
+
+  it('counts a malformed final line with a trailing newline as invalid', () => {
+    const file = fixture();
+    writeFileSync(file, '{"reason":\n');
+    expect(readFallbackLog(file)).toEqual({ rows: [], invalid: 1, missing: false, partial: 0 });
   });
 
   it('surfaces non-missing read failures instead of reporting zero fallbacks', () => {
-    expect(() => readFallbackRows(join(fixture(), 'bad\0path'))).toThrow();
+    expect(() => readFallbackLog(join(fixture(), 'bad\0path'))).toThrow();
   });
 });
 

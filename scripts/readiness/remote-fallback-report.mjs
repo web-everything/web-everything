@@ -7,21 +7,25 @@
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { admissionLockRoot } from './heavy-admission.mjs';
-import { readFallbackRows, summarize } from '../lib/remote-fallback-log.mjs';
+import { readFallbackLog, summarize } from '../lib/remote-fallback-log.mjs';
 
 /** IO boundary: resolve the shared admission log, read it, and emit text or JSON. */
 export function main(argv = process.argv.slice(2), {
   cwd = process.cwd(), env = process.env, resolveLockRoot = admissionLockRoot,
-  readRows = readFallbackRows, log = line => console.log(line),
+  readLog = readFallbackLog, log = line => console.log(line),
 } = {}) {
   const override = argv.find(arg => arg.startsWith('--file='));
   const file = override ? override.slice('--file='.length) : join(resolveLockRoot(cwd, env), 'remote-fallbacks.jsonl');
-  const report = summarize(readRows(file));
+  const { rows, missing, invalid, partial } = readLog(file);
+  const report = { ...summarize(rows), missing, invalid, partial };
   if (argv.includes('--json')) {
     log(JSON.stringify(report));
   } else {
     // Reasons are log data: strip terminal control characters only at the text output boundary.
     const clean = value => value.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, '?');
+    if (missing) log(`log missing: ${clean(file)}`);
+    log(`invalid lines: ${invalid}`);
+    log(`partial lines: ${partial}`);
     log('Real fallbacks by reason:');
     for (const [reason, count] of Object.entries(report.byReason)) log(`  ${clean(reason)}: ${count}`);
     log('Advisory rows by reason:');
@@ -29,7 +33,7 @@ export function main(argv = process.argv.slice(2), {
     log(`real fallbacks = ${report.real}`);
     log(report.topReal ? `top cause: ${clean(report.topReal.reason)} (${report.topReal.count})` : 'top cause: none (0)');
   }
-  return 0;
+  return missing || invalid > 0 ? 3 : 0;
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {

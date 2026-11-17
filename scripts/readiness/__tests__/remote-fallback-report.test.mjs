@@ -32,30 +32,60 @@ describe('remote-fallback-report', () => {
   it('prints real per-reason counts before advisory counts and names the top real cause', () => {
     const { file } = fixture(rows.map(row => JSON.stringify(row)).join('\n'));
     expect(run(file)).toEqual({ code: 0, output: [
+      'invalid lines: 0', 'partial lines: 0',
       'Real fallbacks by reason:', '  needs-git: 2', '  remote-disabled: 1',
       'Advisory rows by reason:', '  credential-warn: 2', 'real fallbacks = 3', 'top cause: needs-git (2)',
     ].join('\n') });
   });
 
-  it('prints exactly the summarize output with --json', () => {
+  it('prints the summary and log integrity fields with --json', () => {
     const { file } = fixture(rows.map(row => JSON.stringify(row)).join('\n'));
     const result = run(file, ['--json']);
     expect(result.code).toBe(0);
-    expect(JSON.parse(result.output)).toEqual(summarize(rows));
+    expect(JSON.parse(result.output)).toEqual({ ...summarize(rows), missing: false, invalid: 0, partial: 0 });
   });
 
-  it('reports zero rows and exits successfully for a missing file', () => {
+  it('reports the missing log explicitly and exits 3 while still printing the summary', () => {
     const { file } = fixture();
     expect(run(file).output).toContain('real fallbacks = 0\ntop cause: none (0)');
-    expect(run(file).code).toBe(0);
-    expect(JSON.parse(run(file, ['--json']).output)).toEqual(summarize([]));
+    expect(run(file).output).toContain(`log missing: ${file}`);
+    expect(run(file).code).toBe(3);
+    expect(run(file, ['--json']).code).toBe(3);
+    expect(JSON.parse(run(file, ['--json']).output)).toEqual({ ...summarize([]), missing: true, invalid: 0, partial: 0 });
   });
 
-  it('skips an interrupted final append and malformed lines while retaining valid rows', () => {
+  it('exits 3 for corrupt lines, counting the partial tail separately and retaining valid rows', () => {
     const { file } = fixture('{"reason":"needs-git"}\nnot-json\n{"reason":"credential-warn"}\n{"reason":');
-    expect(JSON.parse(run(file, ['--json']).output)).toEqual(summarize([
+    expect(run(file).code).toBe(3);
+    expect(run(file).output).toContain('invalid lines: 1\npartial lines: 1');
+    expect(run(file, ['--json']).code).toBe(3);
+    expect(JSON.parse(run(file, ['--json']).output)).toEqual({ ...summarize([
       { reason: 'needs-git' }, { reason: 'credential-warn' },
-    ]));
+    ]), missing: false, invalid: 1, partial: 1 });
+  });
+
+  it.each(['null', '42', 'true', '"text"', '[]', 'not-json\n'])('exits 3 for invalid evidence %s', content => {
+    const { file } = fixture(content);
+    expect(run(file).code).toBe(3);
+    expect(run(file).output).toContain('invalid lines: 1');
+    const result = run(file, ['--json']);
+    expect(result.code).toBe(3);
+    expect(JSON.parse(result.output)).toEqual({ ...summarize([]), missing: false, invalid: 1, partial: 0 });
+  });
+
+  it('exits zero for a readable log with only a partial tail', () => {
+    const { file } = fixture('{"reason":"needs-git"}\n{"reason":');
+    expect(run(file).code).toBe(0);
+    expect(run(file).output).toContain('invalid lines: 0\npartial lines: 1');
+    const result = run(file, ['--json']);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.output)).toEqual({ ...summarize([{ reason: 'needs-git' }]), missing: false, invalid: 0, partial: 1 });
+  });
+
+  it('exits zero for an empty readable log', () => {
+    const { file } = fixture('');
+    expect(run(file).code).toBe(0);
+    expect(JSON.parse(run(file, ['--json']).output)).toEqual({ ...summarize([]), missing: false, invalid: 0, partial: 0 });
   });
 
   it('uses the shared heavy-admission resolver by default, including its pool override', () => {
@@ -63,13 +93,13 @@ describe('remote-fallback-report', () => {
     const env = { LANE_POOL_ROOT: root };
     let readFile;
     expect(main(['--json'], { cwd: root, env,
-      readRows: file => { readFile = file; return []; }, log: () => {},
+      readLog: file => { readFile = file; return { rows: [], missing: false, invalid: 0, partial: 0 }; }, log: () => {},
     })).toBe(0);
     expect(readFile).toBe(join(admissionLockRoot(root, env), 'remote-fallbacks.jsonl'));
   });
 
   it('does not resolve the default root when --file overrides it', () => {
-    const { file } = fixture();
+    const { file } = fixture('');
     expect(main([`--file=${file}`], {
       resolveLockRoot: () => { throw new Error('unexpected resolution'); }, log: () => {},
     })).toBe(0);
@@ -82,13 +112,17 @@ describe('remote-fallback-report', () => {
     expect(JSON.parse(run(file, ['--json']).output).topReal.reason).toBe(reason);
   });
 
-  it('runs the CLI with --file and --json and exits zero for missing evidence', () => {
-    const { file } = fixture();
+  it.each([
+    [undefined, 3, true, 0, 0],
+    ['not-json\n', 3, false, 1, 0],
+    ['{"reason":', 0, false, 0, 1],
+  ])('runs the CLI for evidence %s with exit %s', (content, code, missing, invalid, partial) => {
+    const { file } = fixture(content);
     const child = spawnSync(process.execPath, [join(process.cwd(), 'scripts/readiness/remote-fallback-report.mjs'),
       `--file=${file}`, '--json'], { encoding: 'utf8', timeout: 15000, maxBuffer: 64 * 1024 });
     expect(child.error).toBeUndefined();
-    expect(child.status).toBe(0);
-    expect(JSON.parse(child.stdout)).toEqual(summarize([]));
+    expect(child.status).toBe(code);
+    expect(JSON.parse(child.stdout)).toEqual({ ...summarize([]), missing, invalid, partial });
   });
 
   it('surfaces unreadable evidence instead of producing a successful empty report', () => {

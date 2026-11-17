@@ -36,18 +36,34 @@ export function summarize(rows) {
     advisoryByReason: Object.fromEntries(advisoryCounts), topReal };
 }
 
-/** IO boundary: tolerate missing logs and interrupted JSONL writes, but surface other read errors. */
-export function readFallbackRows(file) {
+/** IO boundary: expose missing/corrupt evidence and count an interrupted final append separately. */
+export function readFallbackLog(file) {
   let raw;
   try { raw = readFileSync(file, 'utf8'); } catch (error) {
-    if (error.code === 'ENOENT') return [];
+    if (error.code === 'ENOENT') return { rows: [], invalid: 0, missing: true, partial: 0 };
     throw error;
   }
   const rows = [];
-  for (const line of raw.split('\n')) {
-    try { rows.push(JSON.parse(line)); } catch { /* malformed or partial append */ }
+  let invalid = 0;
+  let partial = 0;
+  const lines = raw.split('\n');
+  for (const [index, line] of lines.entries()) {
+    if (!line.trim()) continue;
+    let row;
+    try { row = JSON.parse(line); } catch {
+      if (index === lines.length - 1 && !raw.endsWith('\n')) partial++;
+      else invalid++;
+      continue;
+    }
+    if (row === null || typeof row !== 'object' || Array.isArray(row)) invalid++;
+    else rows.push(row);
   }
-  return rows;
+  return { rows, invalid, missing: false, partial };
+}
+
+/** Compatibility view for callers that only need valid rows. */
+export function readFallbackRows(file) {
+  return readFallbackLog(file).rows;
 }
 
 export function recordLocalSlotFallback({ lockRoot, reason, detail, repo, kind, now = () => Date.now() } = {}) {
