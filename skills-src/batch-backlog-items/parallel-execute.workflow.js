@@ -1,3 +1,131 @@
+// BEGIN generated no-prompt runtime: scripts/lib/no-prompt-command-rules.mjs
+const NO_PROMPT_COMMAND_RULES = "<!-- no-prompt-command-rules:begin -->\n## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.\n- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`.\n- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.\n<!-- no-prompt-command-rules:end -->";
+const NO_PROMPT_COMMAND_RULES_BODY = "## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.\n- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`.\n- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.";
+const NO_PROMPT_COMMAND_RULES_SENTINEL = "<!-- no-prompt-command-rules:begin -->";
+const NO_PROMPT_COMMAND_RULES_END = "<!-- no-prompt-command-rules:end -->";
+const NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT = "<!-- Generated from scripts/lib/no-prompt-command-rules.mjs; whole-tree test pins this copy. -->";
+const NO_GIT_COMMAND_RULES = "<!-- no-prompt-command-rules:no-git:begin -->\n## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.\n- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.\n<!-- no-prompt-command-rules:no-git:end -->";
+const NO_GIT_COMMAND_RULES_BODY = "## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.\n- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.";
+const NO_GIT_COMMAND_RULES_SENTINEL = "<!-- no-prompt-command-rules:no-git:begin -->";
+const NO_GIT_COMMAND_RULES_END = "<!-- no-prompt-command-rules:no-git:end -->";
+const COMMAND_RULE_VARIANTS = ["<!-- no-prompt-command-rules:begin -->\n## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.\n- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`.\n- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.\n<!-- no-prompt-command-rules:end -->","<!-- no-prompt-command-rules:no-git:begin -->\n## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.\n- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.\n<!-- no-prompt-command-rules:no-git:end -->"];
+const LAUNCH_BRIEF_PROPERTIES = {"scripts/conveyor/await-verify-pass.mjs":{"allowsGit":true},"scripts/conveyor/convert-advisory-dispatch.mjs":{"allowsGit":false},"scripts/conveyor/fix-context-pack.mjs":{"allowsGit":true},"scripts/conveyor/fix-resume.mjs":{"allowsGit":true},"scripts/conveyor/health-investigate-dispatch.mjs":{"allowsGit":false},"scripts/conveyor/main-ci-red-core.mjs":{"allowsGit":true},"scripts/conveyor/prep-review.mjs":{"allowsGit":true},"scripts/conveyor/reconcile-fix-dispatch.mjs":{"allowsGit":true},"scripts/conveyor/referral-reverify.mjs":{"allowsGit":true},"scripts/conveyor/stuck-pr-inspect-dispatch.mjs":{"allowsGit":false},"scripts/lib/brief-red-team.mjs":{"allowsGit":false},"scripts/lib/build-self-review.mjs":{"allowsGit":true},"scripts/lib/converge-transports.mjs":{"allowsGit":true},"scripts/lib/daemon-load-overlay.mjs":{"allowsGit":true},"scripts/lib/decision-prose-adapter.mjs":{"allowsGit":false},"scripts/lib/design-pixels-adapter.mjs":{"allowsGit":true},"scripts/lib/judge-spawn.mjs":{"allowsGit":true},"scripts/lib/jury-core.mjs":{"allowsGit":true},"scripts/lib/review-core.mjs":{"allowsGit":true},"scripts/operations/ci-heal-pr-dispatch.mjs":{"allowsGit":true},"scripts/operations/coroner-judge.mjs":{"allowsGit":false},"scripts/operations/coroner-sample.mjs":{"allowsGit":false},"scripts/operations/deliver-item-wrapper.mjs":{"allowsGit":true},"scripts/operations/dispatch-lane-io.mjs":{"allowsGit":true},"scripts/operations/dispatch-lane.mjs":{"allowsGit":true},"scripts/operations/explore-io.mjs":{"allowsGit":false},"scripts/operations/explore.mjs":{"allowsGit":false},"scripts/operations/fix-run.mjs":{"allowsGit":true},"scripts/operations/maintenance-io.mjs":{"allowsGit":true},"scripts/operations/operator-session-bootstrap-io.mjs":{"allowsGit":true},"scripts/operations/operator-session/pr-movement-sweep.prompt.md":{"allowsGit":true},"scripts/operations/operator-task-brief.mjs":{"allowsGit":true},"scripts/operations/perf-velocity-io.mjs":{"allowsGit":false},"scripts/operations/probation-build-run.mjs":{"allowsGit":true},"scripts/operations/record-referral-ruling-io.mjs":{"allowsGit":false},"scripts/operations/review-dispatch.mjs":{"allowsGit":true},"scripts/operations/review-extra-seats.mjs":{"allowsGit":false},"scripts/operations/review-prep.mjs":{"allowsGit":true},"scripts/operations/worker-wrapper.mjs":{"allowsGit":true},"scripts/operator/converge.py":{"allowsGit":true},"scripts/operator/dispatch.mjs":{"allowsGit":true},"scripts/probes/worker-result-probe.mjs":{"allowsGit":false},"scripts/worker-brief.mjs":{"allowsGit":true},"scripts/workflows/review-parked-prs.mjs":{"allowsGit":true},"skills-src/batch-backlog-items/SKILL.md":{"allowsGit":true},"skills-src/batch-backlog-items/parallel-execute.workflow.js":{"allowsGit":true},"skills-src/brand-mark-loop/SKILL.md":{"allowsGit":true},"skills-src/build-ui/SKILL.md":{"allowsGit":true},"skills-src/converge/SKILL.md":{"allowsGit":true},"skills-src/conveyor/SKILL.md":{"allowsGit":true},"skills-src/conveyor/canary-agent-brief.md":{"allowsGit":true},"skills-src/conveyor/delivery-agent-brief-v2.md":{"allowsGit":true},"skills-src/conveyor/delivery-agent-brief.md":{"allowsGit":true},"skills-src/conveyor/dispatched-agent-system-prompt.md":{"allowsGit":true},"skills-src/conveyor/fix-agent-brief.md":{"allowsGit":true},"skills-src/conveyor/fix-agent-ci-brief.md":{"allowsGit":true},"skills-src/conveyor/health-investigate-brief.md":{"allowsGit":false},"skills-src/conveyor/investigation-agent-brief.md":{"allowsGit":true},"skills-src/conveyor/opus-sweep-brief.md":{"allowsGit":false},"skills-src/conveyor/prepare-decision-agent-brief.md":{"allowsGit":true},"skills-src/conveyor/prepare-item-agent-brief.md":{"allowsGit":true},"skills-src/conveyor/prepare-item-worker-brief.md":{"allowsGit":true},"skills-src/conveyor/prepare-scope-agent-brief.md":{"allowsGit":true},"skills-src/conveyor/role-test-soak-author-brief.md":{"allowsGit":true},"skills-src/conveyor/stuck-pr-inspect-brief.md":{"allowsGit":false},"skills-src/conveyor/stuck-pr-inspect-system-prompt.md":{"allowsGit":false},"skills-src/drain/SKILL.md":{"allowsGit":true},"skills-src/harvest-learnings/SKILL.md":{"allowsGit":true},"skills-src/jury/SKILL.md":{"allowsGit":true},"skills-src/jury/panel-fanout.mjs":{"allowsGit":false},"skills-src/jury/subject-jury.workflow.js":{"allowsGit":true},"skills-src/next-backlog-item/SKILL.md":{"allowsGit":true},"skills-src/prepare-decision-item/SKILL.md":{"allowsGit":true},"skills-src/review/SKILL.md":{"allowsGit":true},"skills-src/review/review-agent-brief.md":{"allowsGit":true},"skills-src/review/review-agent-system-prompt.md":{"allowsGit":true},"skills-src/worker-brief/SKILL.md":{"allowsGit":true},"scripts/lib/judge-spawn.mjs#tool-free":{"allowsGit":false},"scripts/lib/review-core.mjs#plan":{"allowsGit":false},"scripts/lib/build-self-review.mjs#review":{"allowsGit":false}};
+function noPromptRulePlacement(brief) {
+  const blocks = [];
+  const tags = [];
+  let markdown = null, inline = 0, comment = false, malformed = false, offset = 0;
+  while (offset < brief.length) {
+    const newline = brief.indexOf('\n', offset);
+    const end = newline < 0 ? brief.length : newline;
+    const line = brief.slice(offset, end).replace(/\r$/, '');
+    const rules = COMMAND_RULE_VARIANTS.find(block => line === block.split('\n')[0] && brief.startsWith(block, offset));
+    if (!markdown && !inline && !comment && !tags.length && !malformed
+      && rules) {
+      const blockEnd = offset + rules.length;
+      if (blockEnd === brief.length || brief[blockEnd] === '\n' || brief.slice(blockEnd, blockEnd + 2) === '\r\n') {
+        blocks.push({ start: offset, end: blockEnd });
+        offset = blockEnd;
+        if (brief[offset] === '\r') offset++;
+        if (brief[offset] === '\n') offset++;
+        continue;
+      }
+    }
+    const fence = !inline && !comment && line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (markdown) {
+      if (fence && fence[1][0] === markdown.char && fence[1].length >= markdown.length && !fence[2].trim()) markdown = null;
+    } else if (fence) {
+      markdown = { char: fence[1][0], length: fence[1].length };
+    } else {
+      let at = 0;
+      while (at < line.length) {
+        if (comment) {
+          const close = line.indexOf('-->', at);
+          const nested = line.indexOf('<!--', at);
+          if (nested >= 0 && (close < 0 || nested < close)) malformed = true;
+          if (close < 0) break;
+          comment = false;
+          at = close + 3;
+          continue;
+        }
+        if (line[at] === '`') {
+          let next = at + 1;
+          while (line[next] === '`') next++;
+          const length = next - at;
+          // An unmatched backtick is literal Markdown, not an open code span.
+          const remaining = COMMAND_RULE_VARIANTS.reduce((text, block) => text.replaceAll(block, ''), brief.slice(offset + next));
+          const closes = remaining.match(/`+/g)?.some(run => run.length === length);
+          if (!inline && closes) inline = length;
+          else if (inline === length) inline = 0;
+          at = next;
+          continue;
+        }
+        if (inline) { at++; continue; }
+        if (line.startsWith('<!--', at)) { comment = true; at += 4; continue; }
+        const tag = line[at] === '<' && line.slice(at).match(/^<\s*(\/?)\s*([A-Za-z][\w:-]*)(?:\s[^<>]*?)?\s*(\/?)>/);
+        if (tag) {
+          const name = tag[2].toLowerCase();
+          // Runtime placeholders such as <branch> are prose, not labelled data fences.
+          const dataTag = /^(task|concerns|approach|findings|goal|material)$/.test(name)
+            || brief.slice(offset + at + tag[0].length).includes(`</${name}>`);
+          if (!dataTag && !tags.includes(name)) { at += tag[0].length; continue; }
+          if (tag[1]) {
+            if (tags.at(-1) === name) tags.pop();
+            else malformed = true;
+          } else if (!tag[3]) tags.push(name);
+          at += tag[0].length;
+          continue;
+        }
+        at++;
+      }
+    }
+    offset = newline < 0 ? brief.length : end + 1;
+  }
+  return { blocks, closed: !markdown && !inline && !comment && !tags.length && !malformed };
+}
+function stripTrustedNoPromptCommandRules(brief) {
+  const { blocks } = noPromptRulePlacement(brief);
+  let result = brief;
+  for (const { start, end } of blocks.reverse()) result = result.slice(0, start) + result.slice(end);
+  return result;
+}
+function assertBriefTaskContent(brief) {
+  if (typeof brief !== 'string') throw new TypeError('no-prompt rules require a string brief');
+  const task = brief.replaceAll(NO_PROMPT_COMMAND_RULES, '')
+    .replaceAll(NO_GIT_COMMAND_RULES, '')
+    .replaceAll(NO_PROMPT_COMMAND_RULES_BODY, '')
+    .replaceAll(NO_GIT_COMMAND_RULES_BODY, '')
+    .replaceAll(NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT, '')
+    .replaceAll(NO_PROMPT_COMMAND_RULES_SENTINEL, '')
+    .replaceAll(NO_PROMPT_COMMAND_RULES_END, '')
+    .replaceAll(NO_GIT_COMMAND_RULES_SENTINEL, '')
+    .replaceAll(NO_GIT_COMMAND_RULES_END, '');
+  if (!task.trim()) {
+    throw new Error('empty task content — refusing a brief containing only whitespace or command rules');
+  }
+  return brief;
+}
+function renderNoPromptCommandRules(brief, source) {
+  assertBriefTaskContent(brief);
+  const properties = typeof source === 'string' ? LAUNCH_BRIEF_PROPERTIES[source] : source;
+  if (source !== undefined && (!properties || typeof properties.allowsGit !== 'boolean')) {
+    throw new Error('no-prompt rules require a registered brief or an explicit allowsGit boolean');
+  }
+  const rules = properties?.allowsGit === false ? NO_GIT_COMMAND_RULES : NO_PROMPT_COMMAND_RULES;
+  const placement = noPromptRulePlacement(brief);
+  // An outer transport without a new declaration preserves the already-declared trusted variant.
+  if (placement.blocks.length) {
+    if (source === undefined) return brief;
+    let result = brief;
+    for (const [index, { start, end }] of Array.from(placement.blocks.entries()).reverse()) {
+      result = result.slice(0, start) + (index === 0 ? rules : '') + result.slice(end);
+    }
+    return result;
+  }
+  return placement.closed ? `${brief}\n\n${rules}\n` : `${rules}\n\n${brief}`;
+}
+// END generated no-prompt runtime
+
+
 export const meta = {
   name: 'batch-parallel-execute',
   description: 'Execute a /workflow (parallel) batch on the #2183 PR-fan-out model: a light probe detects the constellation repos each item spans → provision a lane pool per affected repo (+ create the ready-to-merge label once) → work each item as its OWN agent in its coupled lane CLONE (claim-in-lane, work, resolve, write the lane manifest to a SCRATCH file, push lane/<n> per repo), then OPEN A READY-TO-MERGE PR per pushed ref (pr-land --label-on-green embeds the manifest in the WE PR body — xnsk54v — and waits for required checks, labels only when green — #2199). The producer makes ZERO commits to main, never integrates inline, and never launches or waits on the drain — it completes when every item is an open ready-to-merge PR. A separate, optional drain lands them later in blockedBy order. Per-item progress. Returns a ledger.',
@@ -272,7 +400,7 @@ log(`Probing ${items.length} packed item(s) for the constellation repos they spa
 let probedCount = 0;
 const probedRaw = await parallel(items.map((it) => () =>
   agent(
-    [
+    renderNoPromptCommandRules([
       RETURN_HYGIENE,
       RELAY_GUARD,
       NO_FULL_SUITE_NO_SUBAGENT_GUARD,
@@ -289,7 +417,7 @@ const probedRaw = await parallel(items.map((it) => () =>
       `(subtle cross-cutting design, dense algorithmic/protocol reasoning, or a large multi-file refactor where a`,
       `cheaper model would plausibly ship a wrong-but-plausible edit) → that lane escalates to Opus. Rare; when in`,
       `doubt, false. Return ONLY the structured object { num, extraRepos, complex }.`,
-    ].join(' '),
+    ].join(' ')),
     { label: `probe:${it.num}`, phase: 'Probe', schema: PROBE_SCHEMA, effort: 'low' },
   ).then((p) => {
     probedCount++;
@@ -330,7 +458,7 @@ const provisionPlan = INTEGRATION_ORDER
 let lanePools = {}; // repo -> [absolute lane dir, …] (index-aligned to lanePlan[repo])
 
 const setup = await agent(
-  [
+  renderNoPromptCommandRules([
     RETURN_HYGIENE,
     RELAY_GUARD,
     NO_FULL_SUITE_NO_SUBAGENT_GUARD,
@@ -355,7 +483,7 @@ const setup = await agent(
     `whose value is the ORDERED array of that repo's absolute ACQUIRABLE lane-clone dirs, EXACTLY as`,
     `\`list --json --acquirable\` printed them (foreign-leased lanes are already filtered out; do NOT re-add them).`,
     `Return ONLY the object.`,
-  ].join(' '),
+  ].join(' ')),
   {
     label: 'setup:provision+label', phase: 'Provision',
     schema: {
@@ -611,7 +739,7 @@ function laneItemPrompt(it, laneDirs) {
     `resolveCommit (git rev-parse HEAD in the WE clone after the manifest commit), changedFiles (REPO-QUALIFIED`,
     `"<repo>:<path>"), gate (green/red). Return ONLY the structured object.`,
   );
-  return lines.join('\n');
+  return renderNoPromptCommandRules(lines.join('\n'));
 }
 
 const laneSchedule = buildLaneSchedule(workItems);
@@ -641,7 +769,7 @@ const results = await parallel(workItems.map((it) => () => {
   const laneDirs = Object.fromEntries(Object.entries(assign.perRepo).map(([r, p]) => [r, p.dir]));
   const releaseAll = () => { for (const p of Object.values(assign.perRepo)) p.release(); };
   return Promise.all(Object.values(assign.perRepo).map((p) => p.waitFor))
-    .then(() => agent(laneItemPrompt(it, laneDirs), { label: `lane:${disp}`, phase: 'Lanes', schema: ITEM_RESULT_SCHEMA, model: laneModelFor(it) }))
+    .then(() => agent(renderNoPromptCommandRules(laneItemPrompt(it, laneDirs)), { label: `lane:${disp}`, phase: 'Lanes', schema: ITEM_RESULT_SCHEMA, model: laneModelFor(it) }))
     .then((r) => {
       itemsDone++;
       releaseAll();
@@ -717,7 +845,7 @@ if (toReconcile.length) {
   const implPaths = Object.fromEntries(Object.entries(REPOS).filter(([k]) => k !== 'we').map(([k, v]) => [k, v.path]));
   log(`#2216 label reconcile: ${toReconcile.length} PR(s) came up labelled:false (check-timeout) — labelling the now-green ones, carrying the rest for /resume…`);
   const res = await agent(
-    [
+    renderNoPromptCommandRules([
       RETURN_HYGIENE, RELAY_GUARD, NO_FULL_SUITE_NO_SUBAGENT_GUARD, ``,
       `#2478/#2216 LABEL RECONCILE. Some /workflow lanes OPENED a PR but could NOT apply the \`${READY_LABEL}\``,
       `label: their \`pr-land --label-on-green\` wait outlasted the required checks (check-timeout), so the PR is`,
@@ -741,7 +869,7 @@ if (toReconcile.length) {
       `   \`carried\` (reason "check-red" | "still-pending"). It rides forward for /resume; never a silent drop.`,
       ``,
       `Return { labelled: [pr nums you labelled], carried: [{ pr, reason }] }.`,
-    ].join('\n'),
+    ].join('\n')),
     {
       label: 'finalize:label-reconcile', phase: 'Finalize',
       schema: {
@@ -778,7 +906,7 @@ if (toReconcile.length) {
 const queued = [];
 if (toQueue.length) {
   const res = await agent(
-    [
+    renderNoPromptCommandRules([
       RETURN_HYGIENE, RELAY_GUARD, NO_FULL_SUITE_NO_SUBAGENT_GUARD, ``,
       `In the PRIMARY WE checkout (${PRIMARY_ROOT}) on branch main, record a LOCAL ready-to-merge signal for the`,
       `items that opened a PR this run — WITHOUT committing or pushing anything (main must stay clean, #2183).`,
@@ -788,7 +916,7 @@ if (toQueue.length) {
       `ready-to-merge PRs (it reads each item's manifest off its pushed lane ref) and stops the next readiness`,
       `pack from re-offering them. Do NOT merge, do NOT integrate, do NOT delete any lane/* ref. Return`,
       `{ queued: [nums written], notes }.`,
-    ].join(' '),
+    ].join(' ')),
     {
       label: 'finalize:local-queue-signal', phase: 'Finalize',
       schema: { type: 'object', required: ['queued'], additionalProperties: true, properties: { queued: { type: 'array', items: { type: 'string' } }, notes: { type: 'string' } } },

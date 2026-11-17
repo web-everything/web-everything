@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 import { applyTestsFirstPolicy } from '../lib/tests-first-policy.mjs';
 import { resolveOperationRoute, resolvePolicyModel, readRoutingPolicy } from '../lib/dispatch-routing-policy-io.mjs';
 import { parseAgyReportEvidence } from '../lib/antigravity-run-evidence.mjs';
@@ -1042,7 +1043,7 @@ export function realIo({ session, runId = null, taskType = 'doc-fix', env = proc
       }),
     }),
     readCommittedCard: (dir, path) => sh('git', ['-C', dir, 'show', `HEAD:${path}`], { cwd: dir, env: laneEnv }),
-    readPrepareBrief: (dir) => applyTestsFirstPolicy(readFileSync(join(dir, 'skills-src/conveyor/prepare-item-worker-brief.md'), 'utf8')),
+    readPrepareBrief: (dir) => renderNoPromptCommandRules(applyTestsFirstPolicy(assertBriefTaskContent(readFileSync(join(dir, 'skills-src/conveyor/prepare-item-worker-brief.md'), 'utf8')))),
     stampPrepare: (n, dir) => node('scripts/backlog.mjs', ['prepare-stamp', String(n)], { cwd: dir, env: laneEnv }),
     claim: (n, s, dir) => node('scripts/backlog.mjs', ['claim', String(n), `--session=${s}`], { cwd: dir, env: laneEnv }).ok,
     headSha: (dir) => sh('git', ['-C', dir, 'rev-parse', 'HEAD'], { cwd: dir, env: laneEnv }).trim(),

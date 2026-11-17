@@ -93,3 +93,13 @@ JSON
 
 After `record` succeeds you are done. End your turn. Do not start anything else; the health watch stops this
 session and renders your finding into the episode report.
+
+<!-- Generated from scripts/lib/no-prompt-command-rules.mjs; whole-tree test pins this copy. -->
+<!-- no-prompt-command-rules:no-git:begin -->
+## No-prompt command rules
+
+- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.
+- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.
+- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.
+- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.
+<!-- no-prompt-command-rules:no-git:end -->

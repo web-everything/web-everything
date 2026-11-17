@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 import { FINDING_CLASSES, classAction, stricterClass, readFindingClassPolicy, validAlsoClasses } from '../lib/finding-class-policy.mjs';
 import { decodeRecoveryAdmission } from '../lib/drain-red-team-evidence.mjs';
 import { recordRedTeamStatus, readRedTeamStatus, redTeamStatusDir } from '../lib/drain-red-team-evidence.mjs';
@@ -1447,7 +1448,7 @@ export function buildRecheckRequest({ pr, repo, title, diffText, findings, reads
     capText(diffText, INLINE_DIFF_MAX),
     '=== END ===',
   ].join('\n');
-  return { mandate, input, shape: RECHECK_SHAPE };
+  return { mandate: renderNoPromptCommandRules(mandate, "scripts/operations/review-extra-seats.mjs"), input, shape: RECHECK_SHAPE };
 }
 
 /** One policy for model-reported paths, including legacy rows at publication sinks.

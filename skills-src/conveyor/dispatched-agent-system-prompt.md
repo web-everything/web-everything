@@ -58,3 +58,14 @@ session:
   this session's `--settings`, but do not rely on it: always pass the timeout explicitly. If a
   command is moved anyway, re-run it once in the foreground (the gates and `pr-land`/`open-pr` are idempotent)
   instead of polling its output.
+
+<!-- Generated from scripts/lib/no-prompt-command-rules.mjs; whole-tree test pins this copy. -->
+<!-- no-prompt-command-rules:begin -->
+## No-prompt command rules
+
+- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.
+- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.
+- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.
+- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`.
+- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.
+<!-- no-prompt-command-rules:end -->

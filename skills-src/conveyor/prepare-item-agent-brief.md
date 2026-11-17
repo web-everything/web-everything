@@ -294,3 +294,14 @@ gate-red | could-not-prepare)`, or, for the `already-done` exit (*The method*, s
 <!-- tests-first:requireExecutableAcceptance -->
 Require at least one [A<n>] Executable line per stated guarantee in Acceptance, each naming a command or test that fails before the build and passes after. Replace the scaffold TODO before stamping preparedDate. Include changed defaults, callers, and fail-closed paths among the guarantees.
 <!-- /tests-first -->
+
+<!-- Generated from scripts/lib/no-prompt-command-rules.mjs; whole-tree test pins this copy. -->
+<!-- no-prompt-command-rules:begin -->
+## No-prompt command rules
+
+- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.
+- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.
+- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.
+- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`.
+- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.
+<!-- no-prompt-command-rules:end -->

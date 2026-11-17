@@ -1,3 +1,131 @@
+// BEGIN generated no-prompt runtime: scripts/lib/no-prompt-command-rules.mjs
+const NO_PROMPT_COMMAND_RULES = "<!-- no-prompt-command-rules:begin -->\n## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.\n- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`.\n- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.\n<!-- no-prompt-command-rules:end -->";
+const NO_PROMPT_COMMAND_RULES_BODY = "## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.\n- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`.\n- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.";
+const NO_PROMPT_COMMAND_RULES_SENTINEL = "<!-- no-prompt-command-rules:begin -->";
+const NO_PROMPT_COMMAND_RULES_END = "<!-- no-prompt-command-rules:end -->";
+const NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT = "<!-- Generated from scripts/lib/no-prompt-command-rules.mjs; whole-tree test pins this copy. -->";
+const NO_GIT_COMMAND_RULES = "<!-- no-prompt-command-rules:no-git:begin -->\n## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.\n- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.\n<!-- no-prompt-command-rules:no-git:end -->";
+const NO_GIT_COMMAND_RULES_BODY = "## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.\n- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.";
+const NO_GIT_COMMAND_RULES_SENTINEL = "<!-- no-prompt-command-rules:no-git:begin -->";
+const NO_GIT_COMMAND_RULES_END = "<!-- no-prompt-command-rules:no-git:end -->";
+const COMMAND_RULE_VARIANTS = ["<!-- no-prompt-command-rules:begin -->\n## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.\n- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`.\n- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.\n<!-- no-prompt-command-rules:end -->","<!-- no-prompt-command-rules:no-git:begin -->\n## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.\n- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.\n<!-- no-prompt-command-rules:no-git:end -->"];
+const LAUNCH_BRIEF_PROPERTIES = {"scripts/conveyor/await-verify-pass.mjs":{"allowsGit":true},"scripts/conveyor/convert-advisory-dispatch.mjs":{"allowsGit":false},"scripts/conveyor/fix-context-pack.mjs":{"allowsGit":true},"scripts/conveyor/fix-resume.mjs":{"allowsGit":true},"scripts/conveyor/health-investigate-dispatch.mjs":{"allowsGit":false},"scripts/conveyor/main-ci-red-core.mjs":{"allowsGit":true},"scripts/conveyor/prep-review.mjs":{"allowsGit":true},"scripts/conveyor/reconcile-fix-dispatch.mjs":{"allowsGit":true},"scripts/conveyor/referral-reverify.mjs":{"allowsGit":true},"scripts/conveyor/stuck-pr-inspect-dispatch.mjs":{"allowsGit":false},"scripts/lib/brief-red-team.mjs":{"allowsGit":false},"scripts/lib/build-self-review.mjs":{"allowsGit":true},"scripts/lib/converge-transports.mjs":{"allowsGit":true},"scripts/lib/daemon-load-overlay.mjs":{"allowsGit":true},"scripts/lib/decision-prose-adapter.mjs":{"allowsGit":false},"scripts/lib/design-pixels-adapter.mjs":{"allowsGit":true},"scripts/lib/judge-spawn.mjs":{"allowsGit":true},"scripts/lib/jury-core.mjs":{"allowsGit":true},"scripts/lib/review-core.mjs":{"allowsGit":true},"scripts/operations/ci-heal-pr-dispatch.mjs":{"allowsGit":true},"scripts/operations/coroner-judge.mjs":{"allowsGit":false},"scripts/operations/coroner-sample.mjs":{"allowsGit":false},"scripts/operations/deliver-item-wrapper.mjs":{"allowsGit":true},"scripts/operations/dispatch-lane-io.mjs":{"allowsGit":true},"scripts/operations/dispatch-lane.mjs":{"allowsGit":true},"scripts/operations/explore-io.mjs":{"allowsGit":false},"scripts/operations/explore.mjs":{"allowsGit":false},"scripts/operations/fix-run.mjs":{"allowsGit":true},"scripts/operations/maintenance-io.mjs":{"allowsGit":true},"scripts/operations/operator-session-bootstrap-io.mjs":{"allowsGit":true},"scripts/operations/operator-session/pr-movement-sweep.prompt.md":{"allowsGit":true},"scripts/operations/operator-task-brief.mjs":{"allowsGit":true},"scripts/operations/perf-velocity-io.mjs":{"allowsGit":false},"scripts/operations/probation-build-run.mjs":{"allowsGit":true},"scripts/operations/record-referral-ruling-io.mjs":{"allowsGit":false},"scripts/operations/review-dispatch.mjs":{"allowsGit":true},"scripts/operations/review-extra-seats.mjs":{"allowsGit":false},"scripts/operations/review-prep.mjs":{"allowsGit":true},"scripts/operations/worker-wrapper.mjs":{"allowsGit":true},"scripts/operator/converge.py":{"allowsGit":true},"scripts/operator/dispatch.mjs":{"allowsGit":true},"scripts/probes/worker-result-probe.mjs":{"allowsGit":false},"scripts/worker-brief.mjs":{"allowsGit":true},"scripts/workflows/review-parked-prs.mjs":{"allowsGit":true},"skills-src/batch-backlog-items/SKILL.md":{"allowsGit":true},"skills-src/batch-backlog-items/parallel-execute.workflow.js":{"allowsGit":true},"skills-src/brand-mark-loop/SKILL.md":{"allowsGit":true},"skills-src/build-ui/SKILL.md":{"allowsGit":true},"skills-src/converge/SKILL.md":{"allowsGit":true},"skills-src/conveyor/SKILL.md":{"allowsGit":true},"skills-src/conveyor/canary-agent-brief.md":{"allowsGit":true},"skills-src/conveyor/delivery-agent-brief-v2.md":{"allowsGit":true},"skills-src/conveyor/delivery-agent-brief.md":{"allowsGit":true},"skills-src/conveyor/dispatched-agent-system-prompt.md":{"allowsGit":true},"skills-src/conveyor/fix-agent-brief.md":{"allowsGit":true},"skills-src/conveyor/fix-agent-ci-brief.md":{"allowsGit":true},"skills-src/conveyor/health-investigate-brief.md":{"allowsGit":false},"skills-src/conveyor/investigation-agent-brief.md":{"allowsGit":true},"skills-src/conveyor/opus-sweep-brief.md":{"allowsGit":false},"skills-src/conveyor/prepare-decision-agent-brief.md":{"allowsGit":true},"skills-src/conveyor/prepare-item-agent-brief.md":{"allowsGit":true},"skills-src/conveyor/prepare-item-worker-brief.md":{"allowsGit":true},"skills-src/conveyor/prepare-scope-agent-brief.md":{"allowsGit":true},"skills-src/conveyor/role-test-soak-author-brief.md":{"allowsGit":true},"skills-src/conveyor/stuck-pr-inspect-brief.md":{"allowsGit":false},"skills-src/conveyor/stuck-pr-inspect-system-prompt.md":{"allowsGit":false},"skills-src/drain/SKILL.md":{"allowsGit":true},"skills-src/harvest-learnings/SKILL.md":{"allowsGit":true},"skills-src/jury/SKILL.md":{"allowsGit":true},"skills-src/jury/panel-fanout.mjs":{"allowsGit":false},"skills-src/jury/subject-jury.workflow.js":{"allowsGit":true},"skills-src/next-backlog-item/SKILL.md":{"allowsGit":true},"skills-src/prepare-decision-item/SKILL.md":{"allowsGit":true},"skills-src/review/SKILL.md":{"allowsGit":true},"skills-src/review/review-agent-brief.md":{"allowsGit":true},"skills-src/review/review-agent-system-prompt.md":{"allowsGit":true},"skills-src/worker-brief/SKILL.md":{"allowsGit":true},"scripts/lib/judge-spawn.mjs#tool-free":{"allowsGit":false},"scripts/lib/review-core.mjs#plan":{"allowsGit":false},"scripts/lib/build-self-review.mjs#review":{"allowsGit":false}};
+function noPromptRulePlacement(brief) {
+  const blocks = [];
+  const tags = [];
+  let markdown = null, inline = 0, comment = false, malformed = false, offset = 0;
+  while (offset < brief.length) {
+    const newline = brief.indexOf('\n', offset);
+    const end = newline < 0 ? brief.length : newline;
+    const line = brief.slice(offset, end).replace(/\r$/, '');
+    const rules = COMMAND_RULE_VARIANTS.find(block => line === block.split('\n')[0] && brief.startsWith(block, offset));
+    if (!markdown && !inline && !comment && !tags.length && !malformed
+      && rules) {
+      const blockEnd = offset + rules.length;
+      if (blockEnd === brief.length || brief[blockEnd] === '\n' || brief.slice(blockEnd, blockEnd + 2) === '\r\n') {
+        blocks.push({ start: offset, end: blockEnd });
+        offset = blockEnd;
+        if (brief[offset] === '\r') offset++;
+        if (brief[offset] === '\n') offset++;
+        continue;
+      }
+    }
+    const fence = !inline && !comment && line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (markdown) {
+      if (fence && fence[1][0] === markdown.char && fence[1].length >= markdown.length && !fence[2].trim()) markdown = null;
+    } else if (fence) {
+      markdown = { char: fence[1][0], length: fence[1].length };
+    } else {
+      let at = 0;
+      while (at < line.length) {
+        if (comment) {
+          const close = line.indexOf('-->', at);
+          const nested = line.indexOf('<!--', at);
+          if (nested >= 0 && (close < 0 || nested < close)) malformed = true;
+          if (close < 0) break;
+          comment = false;
+          at = close + 3;
+          continue;
+        }
+        if (line[at] === '`') {
+          let next = at + 1;
+          while (line[next] === '`') next++;
+          const length = next - at;
+          // An unmatched backtick is literal Markdown, not an open code span.
+          const remaining = COMMAND_RULE_VARIANTS.reduce((text, block) => text.replaceAll(block, ''), brief.slice(offset + next));
+          const closes = remaining.match(/`+/g)?.some(run => run.length === length);
+          if (!inline && closes) inline = length;
+          else if (inline === length) inline = 0;
+          at = next;
+          continue;
+        }
+        if (inline) { at++; continue; }
+        if (line.startsWith('<!--', at)) { comment = true; at += 4; continue; }
+        const tag = line[at] === '<' && line.slice(at).match(/^<\s*(\/?)\s*([A-Za-z][\w:-]*)(?:\s[^<>]*?)?\s*(\/?)>/);
+        if (tag) {
+          const name = tag[2].toLowerCase();
+          // Runtime placeholders such as <branch> are prose, not labelled data fences.
+          const dataTag = /^(task|concerns|approach|findings|goal|material)$/.test(name)
+            || brief.slice(offset + at + tag[0].length).includes(`</${name}>`);
+          if (!dataTag && !tags.includes(name)) { at += tag[0].length; continue; }
+          if (tag[1]) {
+            if (tags.at(-1) === name) tags.pop();
+            else malformed = true;
+          } else if (!tag[3]) tags.push(name);
+          at += tag[0].length;
+          continue;
+        }
+        at++;
+      }
+    }
+    offset = newline < 0 ? brief.length : end + 1;
+  }
+  return { blocks, closed: !markdown && !inline && !comment && !tags.length && !malformed };
+}
+function stripTrustedNoPromptCommandRules(brief) {
+  const { blocks } = noPromptRulePlacement(brief);
+  let result = brief;
+  for (const { start, end } of blocks.reverse()) result = result.slice(0, start) + result.slice(end);
+  return result;
+}
+function assertBriefTaskContent(brief) {
+  if (typeof brief !== 'string') throw new TypeError('no-prompt rules require a string brief');
+  const task = brief.replaceAll(NO_PROMPT_COMMAND_RULES, '')
+    .replaceAll(NO_GIT_COMMAND_RULES, '')
+    .replaceAll(NO_PROMPT_COMMAND_RULES_BODY, '')
+    .replaceAll(NO_GIT_COMMAND_RULES_BODY, '')
+    .replaceAll(NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT, '')
+    .replaceAll(NO_PROMPT_COMMAND_RULES_SENTINEL, '')
+    .replaceAll(NO_PROMPT_COMMAND_RULES_END, '')
+    .replaceAll(NO_GIT_COMMAND_RULES_SENTINEL, '')
+    .replaceAll(NO_GIT_COMMAND_RULES_END, '');
+  if (!task.trim()) {
+    throw new Error('empty task content — refusing a brief containing only whitespace or command rules');
+  }
+  return brief;
+}
+function renderNoPromptCommandRules(brief, source) {
+  assertBriefTaskContent(brief);
+  const properties = typeof source === 'string' ? LAUNCH_BRIEF_PROPERTIES[source] : source;
+  if (source !== undefined && (!properties || typeof properties.allowsGit !== 'boolean')) {
+    throw new Error('no-prompt rules require a registered brief or an explicit allowsGit boolean');
+  }
+  const rules = properties?.allowsGit === false ? NO_GIT_COMMAND_RULES : NO_PROMPT_COMMAND_RULES;
+  const placement = noPromptRulePlacement(brief);
+  // An outer transport without a new declaration preserves the already-declared trusted variant.
+  if (placement.blocks.length) {
+    if (source === undefined) return brief;
+    let result = brief;
+    for (const [index, { start, end }] of Array.from(placement.blocks.entries()).reverse()) {
+      result = result.slice(0, start) + (index === 0 ? rules : '') + result.slice(end);
+    }
+    return result;
+  }
+  return placement.closed ? `${brief}\n\n${rules}\n` : `${rules}\n\n${brief}`;
+}
+// END generated no-prompt runtime
+
+
 /**
  * subject-jury.workflow.js — the SUBJECT-AGNOSTIC jury harness (#2658, S6 / F1 front door of epic #2649).
  *
@@ -474,7 +602,7 @@ function carePrompt(reasons) {
   // Pass the reasons as a JSON `{reasons}` file, NOT on the command line — a reason string may contain $,
   // backticks, or quotes a shell would expand/execute. Write it with a QUOTED heredoc terminator so nothing is
   // interpolated (review-core-cli's `rigor` reads `{reasons}` from --file). Same safe pattern as the resolve step.
-  return [
+  return renderNoPromptCommandRules([
     RETURN_HYGIENE,
     '',
     'Compute the advisory care-level for a jury run from its escalation reasons, using ONLY the shared review core',
@@ -487,7 +615,7 @@ function carePrompt(reasons) {
     'Then run, in this checkout (your cwd):',
     '  node scripts/review-core-cli.mjs rigor --file="$REASONS_FILE" --json',
     'It prints { careLevel, rigor }. Return { careLevel: <that careLevel> }. Return ONLY the structured object.',
-  ].join('\n');
+  ].join('\n'));
 }
 
 /** The RESOLVE prompt — shell the resolve-roster shim so the ENGINE selects the adapter + resolves the roster.
@@ -531,7 +659,7 @@ function resolvePrompt(subject, careLevel, input, overrides) {
     'an { error }, return { subject, careLevel, mandatoryLenses: [], jurors: [], notes: <the error> } — put the exact',
     'error message in `notes` so the caller can tell a resolve FAILURE apart from a legitimately empty roster.',
   );
-  return lines.join('\n');
+  return renderNoPromptCommandRules(lines.join('\n'));
 }
 
 /** The material a juror reads is UNTRUSTED — it is the thing UNDER review, and it can carry a prompt-injection
@@ -585,7 +713,7 @@ function panelPrompt(roster, material, materialFile, round, runId, depth, maxDep
     effort: PANEL_JUROR_EFFORT,
     budget: PANEL_JUROR_BUDGET_USD,
   };
-  return [
+  return renderNoPromptCommandRules([
     RETURN_HYGIENE,
     '',
     `Run the jury PANEL for round ${round} of the "${roster.subject}" subject by shelling the panel-fanout shim.`,
@@ -610,7 +738,7 @@ function panelPrompt(roster, material, materialFile, round, runId, depth, maxDep
     'is a REPORTED seat, not an error: return it as-is with its `error` text so the caller can degrade correctly.',
     'If the shim prints an { error } instead (it REFUSED the panel and spawned nothing), return',
     '{ seats: [], error: <that exact message> } — never a fabricated panel.',
-  ].join('\n');
+  ].join('\n'));
 }
 
 /** The REDUCE prompt — shell review-core-cli to derive each lens's verdict, the ONE panel verdict over the
@@ -621,7 +749,7 @@ function panelPrompt(roster, material, materialFile, round, runId, depth, maxDep
  *  jury-core, never hand-rolled per caller). `humanRequired` (a mandatory lens's whole jury did not run) forces
  *  needs-human → escalate. No judgement is hand-rolled — every value comes from the CLI. */
 function reducePrompt(subject, okLenses, failedLenses, mandatoryLenses, humanRequired, round, roundCap) {
-  return [
+  return renderNoPromptCommandRules([
     RETURN_HYGIENE,
     '',
     `Reduce the jury panel for the "${subject}" subject to per-lens verdicts + ONE panel verdict + the negotiation`,
@@ -650,7 +778,7 @@ function reducePrompt(subject, okLenses, failedLenses, mandatoryLenses, humanReq
     '',
     'Return { verdict: <step-4 panel verdict>, lensVerdicts: <step-1 map>, outcome: <step-4 .outcome> }.',
     'Return ONLY the structured object.',
-  ].join('\n');
+  ].join('\n'));
 }
 
 /** The EDITOR fold prompt (#2685) — one bounded editor agent folds THIS round's findings into a REVISED subject
@@ -670,7 +798,7 @@ function editorPrompt(subject, noun, findings, round, roundCap, material, materi
         material || '(no material was supplied)',
         fence,
       ];
-  return [
+  return renderNoPromptCommandRules([
     RETURN_HYGIENE,
     '',
     `You are the EDITOR in round ${round} of ${roundCap} of a jury convergence loop on a ${noun} for the "${subject}" subject.`,
@@ -683,7 +811,7 @@ function editorPrompt(subject, noun, findings, round, roundCap, material, materi
     '',
     `Return { revisedMaterial: "<the FULL revised ${noun} as text>" }. Return the COMPLETE revised subject (not a`,
     'diff, not a summary) so the next jury round can judge it standalone. Return ONLY the structured object.',
-  ].filter((l) => l !== '').join('\n');
+  ].filter((l) => l !== '').join('\n'));
 }
 
 /** The RED-TEAM prompt (#2707) — the adversarial pass that runs AFTER the jury ACCEPTS, before the loop ratifies.
@@ -705,7 +833,7 @@ function redTeamPrompt(subject, noun, material, materialFile) {
         material || '(no material was supplied — say so and return no findings you cannot ground)',
         fence,
       ];
-  return [
+  return renderNoPromptCommandRules([
     RETURN_HYGIENE,
     '',
     `You are the RED TEAM for the "${subject}" subject. A jury just ACCEPTED this ${noun}. Your job is NOT to`,
@@ -724,7 +852,7 @@ function redTeamPrompt(subject, noun, material, materialFile) {
     'rootCause + prevention + preventionCaptured on each. Return an EMPTY findings array ONLY if you tried hard and',
     'genuinely could not break the accept (do NOT pad with nitpicks — a red-team finding must be a real reason to',
     'withhold ratification). Return ONLY the structured object.',
-  ].filter((l) => l !== '').join('\n');
+  ].filter((l) => l !== '').join('\n'));
 }
 
 /**
@@ -752,7 +880,7 @@ async function panelReview(roster, material, materialFile, round, panelDial) {
   const jurorsPerLens = lensGroups.length ? Math.max(...lensGroups.map((g) => g.jurors.length)) : 0;
 
   const panel = await agent(
-    panelPrompt(roster, material, materialFile, round, panelDial.runId, panelDial.depth, panelDial.maxDepth, panelDial.maxTotalBudgetUsd),
+    renderNoPromptCommandRules(panelPrompt(roster, material, materialFile, round, panelDial.runId, panelDial.depth, panelDial.maxDepth, panelDial.maxTotalBudgetUsd)),
     { label: `panel:${subject}:r${round}`, phase: 'Panel', schema: PANEL_SCHEMA },
   ).catch(() => null);
 
@@ -824,7 +952,7 @@ async function reducePanel(panel, round, roundCap) {
 
   const okLenses = lensResults.filter((r) => r.ok).map((r) => ({ lens: r.lens, findings: r.findings }));
   const r = await agent(
-    reducePrompt(subject, okLenses, failedLenses, mandatoryLenses, degrade, round, roundCap),
+    renderNoPromptCommandRules(reducePrompt(subject, okLenses, failedLenses, mandatoryLenses, degrade, round, roundCap)),
     { label: `reduce:${subject}:r${round}`, phase: 'Reduce', schema: VERDICT_SCHEMA },
   ).catch(() => null);
 
@@ -863,7 +991,7 @@ async function redTeamGate(roster, material, materialFile, round, roundCap) {
   log(`  ${subject}: jury accepted at round ${round} — running the mandatory red-team before ratifying…`);
 
   const rt = await agent(
-    redTeamPrompt(subject, subjectNoun, material, materialFile),
+    renderNoPromptCommandRules(redTeamPrompt(subject, subjectNoun, material, materialFile)),
     { label: `redteam:${subject}:r${round}`, phase: 'Red-team', schema: RED_TEAM_SCHEMA },
   ).catch(() => null);
 
@@ -884,7 +1012,7 @@ async function redTeamGate(roster, material, materialFile, round, roundCap) {
   // reduce uses; the harness derives neither the verdict nor the continue/escalate call.
   const okLenses = [{ lens: RED_TEAM_LENS, findings }];
   const r = await agent(
-    reducePrompt(subject, okLenses, [], [RED_TEAM_LENS], false, round, roundCap),
+    renderNoPromptCommandRules(reducePrompt(subject, okLenses, [], [RED_TEAM_LENS], false, round, roundCap)),
     { label: `redteam-reduce:${subject}:r${round}`, phase: 'Red-team', schema: VERDICT_SCHEMA },
   ).catch(() => null);
 
@@ -925,7 +1053,7 @@ phase('Resolve');
 let careLevel = launch.careLevel;
 if (!careLevel && launch.reasons.length) {
   log(`No careLevel given — deriving it from ${launch.reasons.length} escalation reason(s) via the shared review core.`);
-  const c = await agent(carePrompt(launch.reasons), { label: 'care:derive', phase: 'Resolve', schema: CARE_SCHEMA }).catch(() => null);
+  const c = await agent(renderNoPromptCommandRules(carePrompt(launch.reasons)), { label: 'care:derive', phase: 'Resolve', schema: CARE_SCHEMA }).catch(() => null);
   // Whitelist the agent-returned care-level too — it is interpolated into the resolve shell command, and an
   // unexpected token from a misbehaving agent must not flow through unchecked. Fall back to the baseline band.
   careLevel = (c && typeof c.careLevel === 'string' && CARE_LEVELS.includes(c.careLevel)) ? c.careLevel : DEFAULT_CARE_LEVEL;
@@ -934,7 +1062,7 @@ if (!CARE_LEVELS.includes(careLevel)) careLevel = DEFAULT_CARE_LEVEL;
 log(`Subject "${launch.subject}" at care-level "${careLevel}" — resolving the jury roster through its adapter…`);
 
 const resolved = await agent(
-  resolvePrompt(launch.subject, careLevel, launch.input, launch.overrides),
+  renderNoPromptCommandRules(resolvePrompt(launch.subject, careLevel, launch.input, launch.overrides)),
   { label: `resolve:${launch.subject}`, phase: 'Resolve', schema: ROSTER_SCHEMA },
 ).catch(() => null);
 
@@ -1081,7 +1209,7 @@ while (true) {
   phase('Fold');
   log(`  ${result.subject}: verdict changes at round ${round}/${roundCap} — folding ${result.findings.length} finding(s) into a revised subject…`);
   const folded = await agent(
-    editorPrompt(result.subject, subjectNoun, result.findings, round, roundCap, material, materialFile),
+    renderNoPromptCommandRules(editorPrompt(result.subject, subjectNoun, result.findings, round, roundCap, material, materialFile)),
     { label: `editor:${result.subject}:r${round}`, phase: 'Fold', schema: EDITOR_SCHEMA },
   ).catch(() => null);
 

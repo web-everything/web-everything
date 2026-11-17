@@ -1,3 +1,4 @@
+import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 /**
  * @file ci-heal-pr-dispatch.mjs
  * Dispatch ONE ci-heal for a PR that carries `ci:failed`, from `reconcile-core.mjs`'s own durable `kind:'ci-heal'`
@@ -203,7 +204,9 @@ export function routeAvailableCiHeal(p, { readHolds = readAgyHold, readScores = 
 
 /** The ci-heal brief `dispatchCiHeal` sends by default: the template, its context pack, then the build requirements once. */
 export function readCiHealBriefTemplate(root = REPO_ROOT, pack = (template) => template) {
-  return appendBuildRequirements(pack(readFileSync(briefPath(root, 'ci-heal'), 'utf8')), { policy: resolveBuildPolicy({ log: line => console.error(line) }) });
+  const template = assertBriefTaskContent(readFileSync(briefPath(root, 'ci-heal'), 'utf8'));
+  const packed = assertBriefTaskContent(pack(template));
+  return renderNoPromptCommandRules(appendBuildRequirements(packed, { policy: resolveBuildPolicy({ log: line => console.error(line) }) }));
 }
 
 /**
