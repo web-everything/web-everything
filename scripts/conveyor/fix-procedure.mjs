@@ -61,7 +61,7 @@ import { resolve } from 'node:path';
 
 import { isLeaseExpired, readLockEntry, heartbeat, releaseLockDir, reserve } from '../readiness/file-locks.mjs';
 import {
-  fixDispatchClaimRoot, fixDispatchResource, listFixDispatchClaims, readFixDispatchClaim,
+  fixDispatchClaimRoot, fixDispatchResource, listFixDispatchClaims, readFixDispatchClaim, readFixDispatchClaimStrict,
   fixDispatchSessionName, DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES,
 } from './fix-claim-store.mjs';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from '../lib/constellation-repos.mjs';
@@ -137,6 +137,12 @@ export function isLiveFixClaim(entry, nowMs = Date.now()) {
 /** Read the LIVE fix claim for one PR, or `null` (absent or expired). */
 export function readLiveFixClaim({ repo, pr, lockRoot = fixDispatchClaimRoot(), nowMs = Date.now() } = {}) {
   const entry = readFixDispatchClaim({ repo: repoKeyOf(repo), pr: Number(pr), kind: FIXING_KIND, lockRoot });
+  return isLiveFixClaim(entry, nowMs) ? entry : null;
+}
+
+/** Watcher admission must hold on corrupt/unreadable evidence, while absent/expired claims are free. */
+export function readLiveFixClaimStrict({ repo, pr, lockRoot = fixDispatchClaimRoot(), nowMs = Date.now() } = {}) {
+  const entry = readFixDispatchClaimStrict({ repo: repoKeyOf(repo), pr: Number(pr), kind: FIXING_KIND, lockRoot });
   return isLiveFixClaim(entry, nowMs) ? entry : null;
 }
 

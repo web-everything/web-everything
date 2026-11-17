@@ -28,7 +28,7 @@ const isolated = iso.isolateDispatchSession(cwd);
 const resolveEnv = io.resolveDispatchSettingsEnv || io.resolveGhShimSettingsEnv;
 let wrapperPid = null;
 const handle = io.defaultClaudeProvider({
-  sessionId, cwd, prompt, sessionSlug: slug, launchKind: kind, pr,
+  mode: kind, launchGuard: null, sessionId, cwd, prompt, sessionSlug: slug, launchKind: kind, pr,
   table: { model, reason: 'overlay smoke: routing-policy cheapest Claude alias' },
   systemPromptFile: io.DISPATCHED_AGENT_SYSTEM_PROMPT_FILE, settingsEnv: resolveEnv(cwd),
   worktreeSettings: (isolated && isolated.worktreeSettings) || null,

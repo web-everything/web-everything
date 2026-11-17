@@ -1932,7 +1932,7 @@ function runGhSyncReadMemo(args, opts = {}) {
   const { throttle = {}, ...execOpts } = opts;
   const env = throttle.env || process.env;
   const dir = env[WE_GH_READ_MEMO_DIR];
-  if (!dir || throttle.exec || execOpts.input !== undefined || ghReadMemoHasFileInput(args)
+  if (throttle.noMemo === true || !dir || throttle.exec || execOpts.input !== undefined || ghReadMemoHasFileInput(args)
       || isGhLocalOnly(args) || !(classifyGhRead(args) || isGhGraphqlReadQuery(args))
       // Personal routing can fall back to another identity as budget/access state changes.
       || (classifyGhRead(args) && (throttle.personalRoute ?? resolvePersonalRouteEnabled(env)))) {

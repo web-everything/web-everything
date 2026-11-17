@@ -607,7 +607,7 @@ describe('(e) buildAgentArgv with a table, and resolveWorkerModel\'s own shape',
 
   it.each(LAUNCH_KINDS)('the Claude provider forwards the %s kind to model resolution', (launchKind) => {
     let argv;
-    defaultClaudeProvider({ prompt: payload.prompt, launchKind }, {
+    defaultClaudeProvider({ mode: 'ordinary', launchGuard: null, prompt: payload.prompt, launchKind }, {
       spawnAgent: (args) => { argv = args; return 'backgrounded · abc123 · worker'; },
     });
     expect(argv.filter((arg) => arg === '--model')).toHaveLength(1);
@@ -626,7 +626,7 @@ describe('(e) buildAgentArgv with a table, and resolveWorkerModel\'s own shape',
 
   it('refuses an unresolved model before the provider can spawn', () => {
     const spawnAgent = vi.fn();
-    expect(() => defaultClaudeProvider({ prompt: payload.prompt, launchKind: 'unregistered-kind' }, { spawnAgent }))
+    expect(() => defaultClaudeProvider({ mode: 'ordinary', launchGuard: null, prompt: payload.prompt, launchKind: 'unregistered-kind' }, { spawnAgent }))
       .toThrow(/resolvable --model/);
     expect(spawnAgent).not.toHaveBeenCalled();
   });

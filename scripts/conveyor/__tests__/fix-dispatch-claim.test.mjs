@@ -453,7 +453,7 @@ describe('tryResumeFix — a racing resume attempt is claim-refused, never a dup
     const spawnAgent = (argv) => {
       resumeCalls.push(argv);
       if (!bResult) {
-        bResult = tryResumeFix(planned, {
+        bResult = tryResumeFix(planned, { readSavedLaunch: () => ({ mode: 'ordinary', launchGuard: null }),
           ...baseOpts, claimOwner: 'dispatcher-B',
           spawnAgent: (bArgv) => { resumeCalls.push(bArgv); return 'backgrounded · candxxxx\n'; },
         });
@@ -461,7 +461,7 @@ describe('tryResumeFix — a racing resume attempt is claim-refused, never a dup
       return 'backgrounded · candxxxx\n';
     };
 
-    const a = tryResumeFix(planned, { ...baseOpts, spawnAgent, claimOwner: 'dispatcher-A' });
+    const a = tryResumeFix(planned, { readSavedLaunch: () => ({ mode: 'ordinary', launchGuard: null }), ...baseOpts, spawnAgent, claimOwner: 'dispatcher-A' });
 
     expect(resumeCalls).toHaveLength(1); // ← THE PROOF: B raced in mid-flight and did NOT get to `--resume`.
     expect(a.resumed).toBe(true);

@@ -358,7 +358,7 @@ describe('Claude verify harness honors fix.pushAfterCi', () => {
   });
 
   it('loads the timing cascade on the production IO with environment provenance', async () => {
-    const io = await defaultAwaitVerifyIo({ env: { WE_FIX_PUSH_AFTER_CI: 'true', WE_FIX_PUSH_AFTER_CI_MAX_MIN: '3' },
+    const io = await defaultAwaitVerifyIo({ readSavedLaunch: () => ({ mode: 'ordinary', launchGuard: null }), env: { WE_FIX_PUSH_AFTER_CI: 'true', WE_FIX_PUSH_AFTER_CI_MAX_MIN: '3' },
       dispatchIo: {}, stopSessionFn: () => {}, pushRefusalFn: () => null, readClaimFn: () => null });
     expect(io.fixTimingPolicy()).toMatchObject({ pushAfterCi: true, pushAfterCiMaxMin: 3,
       sources: { pushAfterCi: 'env', pushAfterCiMaxMin: 'env' } });

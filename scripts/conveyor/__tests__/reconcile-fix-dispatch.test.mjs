@@ -865,7 +865,7 @@ describe('dispatchFix — the composition: plan → fill → mint → spawn', ()
     expect(grantConflictHelper).toHaveBeenCalledWith(calls[0].opts.cwd);
     expect(calls).toHaveLength(1);
     // #4174 — cwd is a scratch directory outside `root`, never `root` itself.
-    expect(calls[0].opts).toEqual({ cwd: dispatchSessionCwd('11111111-1111-4111-8111-111111111111', { root: '/repo' }) });
+    expect(calls[0].opts).toEqual({ cwd: dispatchSessionCwd('11111111-1111-4111-8111-111111111111', { root: '/repo' }), mode: 'ordinary', launchGuard: null, launchGateOptions: { demote: expect.any(Function), readLive: expect.any(Function) } });
     expect(calls[0].argv).toEqual([
       // #3331 — no `--session-id`: `claude --bg` discards it and assigns its own id.
       '--bg',
@@ -1005,7 +1005,7 @@ describe('tryResumeFix — #xu2krte Fork 1, and #xazl9u3\'s whole reason to exis
       fetchItemlessDiffPaths: () => [], listFixClaims: () => [],
       reconcile: () => ({ dispatch: [entry], refusals: [], notes: [] }),
       pickFreeLanes: () => [], dispatch, tryResumeRound: null, fixExecutorRoute: null,
-      tryResume: (planned, options) => tryResumeFix(planned, { ...options, ...resumeOptions }),
+      tryResume: (planned, options) => tryResumeFix(planned, { readSavedLaunch: () => ({ mode: 'ordinary', launchGuard: null }), ...options, ...resumeOptions }),
     });
     try {
       for (const candidateName of ['fix-1764', 'conveyor-3438']) {
@@ -1053,7 +1053,7 @@ describe('tryResumeFix — #xu2krte Fork 1, and #xazl9u3\'s whole reason to exis
     let listAgentsAllCalls = 0;
     const result = tryResumeFix(
       { itemNum: '3438', pr: 1764, laneRef: 'lane/3438-wire-reconcile-pass', scope: ['we:x'], isConflict: false, body: null },
-      { root: '/repo', listAgentsAll: () => { listAgentsAllCalls += 1; return []; } },
+      { readSavedLaunch: () => ({ mode: 'ordinary', launchGuard: null }), root: '/repo', listAgentsAll: () => { listAgentsAllCalls += 1; return []; } },
     );
     expect(listAgentsAllCalls).toBe(0);
     expect(result).toEqual({ resumed: false, resumeAttempt: null });
@@ -1062,7 +1062,7 @@ describe('tryResumeFix — #xu2krte Fork 1, and #xazl9u3\'s whole reason to exis
   it('a conflict entry with no resume candidate at all reports `resumed: false`/no attempt (straight to a fresh dispatch, per the ratified default)', () => {
     const result = tryResumeFix(
       { itemNum: '3438', pr: 1764, laneRef: 'lane/3438-wire-reconcile-pass', scope: ['we:x'], isConflict: true, body: 'no stamp here', headRefOid: null },
-      { root: '/repo', listAgentsAll: () => [] },
+      { readSavedLaunch: () => ({ mode: 'ordinary', launchGuard: null }), root: '/repo', listAgentsAll: () => [] },
     );
     expect(result).toEqual({ resumed: false, resumeAttempt: null });
   });
@@ -1081,7 +1081,7 @@ describe('tryResumeFix — #xu2krte Fork 1, and #xazl9u3\'s whole reason to exis
           head: 'e5ed9cb74', url: 'https://example.invalid/send-back', body: 'MUST FIX the operator’s original guard.' }],
         rulingNotAddressed: { source: 'operator-send-back', matches: [{}] },
       },
-      {
+      { readSavedLaunch: () => ({ mode: 'ordinary', launchGuard: null }),
         root: '/repo',
         postNotice: notice => notices.push(notice),
         grantConflictHelper: () => ({ ok: true }),
@@ -1113,7 +1113,7 @@ describe('tryResumeFix — #xu2krte Fork 1, and #xazl9u3\'s whole reason to exis
         itemNum: '3438', pr: 1764, laneRef: 'lane/3438-wire-reconcile-pass', scope: ['we:x'],
         isConflict: true, body: `some PR body\n\n${marker}\n`, headRefOid: MATCHING_HEAD,
       },
-      {
+      { readSavedLaunch: () => ({ mode: 'ordinary', launchGuard: null }),
         root: '/repo',
         spawnAgent: (argv) => { spawnCalls.push(argv); return 'backgrounded · x\n'; },
         // The candidate IS listed under the stamped id, but its checkout sits on a DIFFERENT commit — an
@@ -1139,7 +1139,7 @@ describe('tryResumeFix — #xu2krte Fork 1, and #xazl9u3\'s whole reason to exis
         itemNum: '3438', pr: 1764, laneRef: 'lane/3438-wire-reconcile-pass', scope: ['we:x'],
         isConflict: true, body: `some PR body\n\n${marker}\n`, headRefOid: MATCHING_HEAD,
       },
-      {
+      { readSavedLaunch: () => ({ mode: 'ordinary', launchGuard: null }),
         root: '/repo',
         spawnAgent: (argv) => { spawnCalls.push(argv); return 'backgrounded · x\n'; },
         // Same HEAD as the pr (a coincidence PR #1966's review named explicitly: two lanes CAN share a commit),
@@ -1165,7 +1165,7 @@ describe('tryResumeFix — #xu2krte Fork 1, and #xazl9u3\'s whole reason to exis
         itemNum: '3438', pr: 1764, laneRef: 'lane/3438-wire-reconcile-pass', scope: ['we:x'],
         isConflict: true, body: `some PR body\n\n${marker}\n`, headRefOid: MATCHING_HEAD,
       },
-      {
+      { readSavedLaunch: () => ({ mode: 'ordinary', launchGuard: null }),
         root: '/repo',
         spawnAgent: (argv) => { spawnCalls.push(argv); return 'backgrounded · forkedid\n'; },
         grantConflictHelper: () => ({ ok: true }),
@@ -1199,7 +1199,7 @@ describe('tryResumeFix — #xu2krte Fork 1, and #xazl9u3\'s whole reason to exis
         itemNum: '3438', pr: 1764, laneRef: 'lane/3438-wire-reconcile-pass', scope: ['we:x'],
         isConflict: true, body: `some PR body\n\n${marker}\n`, headRefOid: MATCHING_HEAD,
       },
-      {
+      { readSavedLaunch: () => ({ mode: 'ordinary', launchGuard: null }),
         root: '/repo',
         spawnAgent: () => 'backgrounded · candxxxx\n',
         grantConflictHelper: () => ({ ok: true }),
@@ -1232,7 +1232,7 @@ describe('tryResumeFix — #xu2krte Fork 1, and #xazl9u3\'s whole reason to exis
         itemNum: '3438', pr: 1764, laneRef: 'lane/3438-wire-reconcile-pass', scope: ['we:x'],
         isConflict: true, body: `some PR body\n\n${marker}\n`, headRefOid: MATCHING_HEAD,
       },
-      {
+      { readSavedLaunch: () => ({ mode: 'ordinary', launchGuard: null }),
         root: '/repo',
         spawnAgent: () => 'backgrounded · candxxxx\n',
         grantConflictHelper: () => ({ ok: true }),
@@ -1269,7 +1269,7 @@ describe('tryResumeFix — #xu2krte Fork 1, and #xazl9u3\'s whole reason to exis
         itemNum: '3438', pr: 1764, laneRef: 'lane/3438-wire-reconcile-pass', scope: ['we:x'],
         isConflict: true, body: `some PR body\n\n${marker}\n`, headRefOid: MATCHING_HEAD,
       },
-      {
+      { readSavedLaunch: () => ({ mode: 'ordinary', launchGuard: null }),
         root: '/repo',
         grantConflictHelper: () => ({ ok: true }),
         // The CLI actually forked a copy under `forkedid`, but that fork's row never shows up within this
@@ -1291,7 +1291,7 @@ describe('tryResumeFix — #xu2krte Fork 1, and #xazl9u3\'s whole reason to exis
   it('refuses to run from inside a lane checkout, same guard dispatch-lane-io.mjs uses — even for a conflict entry', () => {
     expect(() => tryResumeFix(
       { itemNum: '3438', pr: 1, laneRef: 'lane/3438-x', scope: ['we:x'], isConflict: true, body: null },
-      { root: '/some/path/.lanes/web-everything/lane-3', spawnAgent: () => { throw new Error('must not be called'); } },
+      { readSavedLaunch: () => ({ mode: 'ordinary', launchGuard: null }), root: '/some/path/.lanes/web-everything/lane-3', spawnAgent: () => { throw new Error('must not be called'); } },
     )).toThrow(/lane/i);
   });
 });
@@ -1569,7 +1569,7 @@ describe('conflict resume permission-blocked completion', () => {
     expect(onDecline).toHaveBeenCalledWith(expect.objectContaining({ reason: 'prior-blocked-on-permission' }));
     const spawnAgent = vi.fn();
     const resolveHead = vi.fn();
-    const result = tryResumeFix({ pr: 1764, isConflict: true, body }, {
+    const result = tryResumeFix({ pr: 1764, isConflict: true, body }, { readSavedLaunch: () => ({ mode: 'ordinary', launchGuard: null }),
       root: '/repo', listAgentsAll: () => agentsAll, readCompletion, spawnAgent, resolveHead,
     });
     expect(result).toMatchObject({ resumed: false, resumeAttempt: {
@@ -1750,7 +1750,7 @@ it('same PR number in two different repos mints distinct session slugs — plate
 
 it('tryResumeFix no longer throws for a sibling repo — a non-conflict entry still short-circuits at no IO cost', () => {
   const calls = [];
-  const result = tryResumeFix({ pr: 49, isConflict: false }, {
+  const result = tryResumeFix({ pr: 49, isConflict: false }, { readSavedLaunch: () => ({ mode: 'ordinary', launchGuard: null }),
     repo: 'frontierui', root: '/repo',
     listAgentsAll: () => { calls.push('list'); return []; }, spawnAgent: () => calls.push('spawn'),
   });
@@ -1827,7 +1827,7 @@ describe('runReconcileFixDispatch — repo capability gate (#x33jgwt multi-repo 
 
 it('tryResumeFix no longer throws for a sibling repo\'s conflict-caused entry either — no candidate found falls through cleanly', () => {
   const calls = [];
-  const result = tryResumeFix({ pr: 49, isConflict: true, body: null }, {
+  const result = tryResumeFix({ pr: 49, isConflict: true, body: null }, { readSavedLaunch: () => ({ mode: 'ordinary', launchGuard: null }),
     repo: 'frontierui', root: '/repo',
     listAgentsAll: () => { calls.push('list'); return []; }, spawnAgent: () => calls.push('spawn'),
   });

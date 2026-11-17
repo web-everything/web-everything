@@ -7,6 +7,11 @@
  *   stacked-base round and an ordinary main-base conflict-fix round bind on the exact same durable
  *   `CONFLICT_FIX_ROUND_CAP` floor, and states plainly that it touches no `review:*` label.
  */
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, it, expect } from 'vitest';
 import { countConflictFixComments, CONFLICT_FIX_COMMENT_MARKER as ROUND_COUNT_MARKER } from '../conflict-fix-round-count.mjs';
 import { buildConflictFixMarkComment, CONFLICT_FIX_COMMENT_MARKER } from '../conflict-fix-mark.mjs';
@@ -46,5 +51,35 @@ describe('buildConflictFixMarkComment — the durable STACKED-BASE conflict-fix 
   it('a human quoting the marker mid-body never inflates the count (leading-line narrowing, shared with the round-count reader)', () => {
     const quoted = `> ${CONFLICT_FIX_COMMENT_MARKER}\na human quoting it in a reply`;
     expect(countConflictFixComments([{ body: quoted }])).toBe(0);
+  });
+});
+
+describe('conflict-fix-mark CLI — retired accepted conflict hand-backs fail closed', () => {
+  const script = resolve(dirname(fileURLToPath(import.meta.url)), '../conflict-fix-mark.mjs');
+  it.each([
+    ['retired conflict-rebase mode', ['--mode=conflict-rebase']],
+    ['malformed accepted-conflict-rebase actor receipt', ['--actor=accepted-conflict-rebase:incomplete']],
+    ['duplicate mode cannot hide a retired invocation', ['--mode=conflict-rebase', '--mode=stacked-rebase']],
+    ['duplicate actor cannot hide a retired receipt', ['--actor=accepted-conflict-rebase:old-receipt', '--actor=fixer']],
+  ])('rejects %s with nonzero exit, a rearm-review fallback and no comment', (_name, args) => {
+    const dir = mkdtempSync(join(tmpdir(), 'conflict-mark-retired-cli-'));
+    try {
+      const log = join(dir, 'gh-calls');
+      // Any attempted write reaches this recording fake, never the real GitHub CLI.
+      writeFileSync(join(dir, 'gh'), '#!/usr/bin/env node\n'
+        + "require('node:fs').appendFileSync(process.env.FAKE_GH_LOG, JSON.stringify(process.argv.slice(2)) + '\\n');\n",
+      { mode: 0o755 });
+      const result = spawnSync(process.execPath, [script, '6911', '--repo=o/n', ...args], {
+        env: { ...process.env, PATH: `${dir}${process.platform === 'win32' ? ';' : ':'}${process.env.PATH}`, FAKE_GH_LOG: log },
+        encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('run rearm-review.mjs --round=conflict-start');
+      expect(result.stdout).not.toContain('"commented":true');
+      expect(existsSync(log)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

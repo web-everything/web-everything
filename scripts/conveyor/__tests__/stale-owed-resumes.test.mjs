@@ -280,7 +280,7 @@ describe('stale owed resumes (R618)', () => {
     ['OPEN', { open: true, headSha: null }], ['MERGED', { open: false }], ['CLOSED', { open: false }],
     ['UNKNOWN', null], ['PENDING', null], ['', null],
   ])('real PR-state port retains unknown evidence and classifies %j explicitly', async (state, expected) => {
-    const io = await defaultAwaitVerifyIo({
+    const io = await defaultAwaitVerifyIo({ readSavedLaunch: () => ({ mode: 'ordinary', launchGuard: null }),
       exec: vi.fn(() => `${state} https://github.com/web-everything/web-everything/pull/1 false lane/test`),
       env: {}, dispatchIo: {}, stopSessionFn: () => {}, pushRefusalFn: () => null, readClaimFn: () => null,
     });
@@ -309,7 +309,7 @@ describe('stale owed resumes (R618)', () => {
     vi.stubEnv('WE_AWAIT_VERIFY_STORE', dir);
     try {
       expect(writeStoredAwaitVerify(old.record, { dir }).ok).toBe(true);
-      const io = await defaultAwaitVerifyIo({ poolRoot: root, dispatchIo: {}, stopSessionFn: () => {},
+      const io = await defaultAwaitVerifyIo({ readSavedLaunch: () => ({ mode: 'ordinary', launchGuard: null }), poolRoot: root, dispatchIo: {}, stopSessionFn: () => {},
         pushRefusalFn: () => null, readClaimFn: () => null });
       if (mode === 'stored-only') {
         // Exercise the loop with the real store ports, leaving the lane's newer waiter alone.

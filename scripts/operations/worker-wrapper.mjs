@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { assertLaunchDescriptor } from '../conveyor/conflict-rebase-launch-gate.mjs';
 /**
  * @file scripts/operations/worker-wrapper.mjs
  * @description THE UNIFIED WORKER WRAPPER (item 117, slice S3a; decision D7 FINAL, operator 2026-10-08).
@@ -26,6 +27,7 @@
  * `runWorker` takes every effect as an injectable (spawn, clock, record store, drafts sink, file reader, head probe),
  * so the tests run it against a fake child. The CLI at the bottom runs a JSON spec detached.
  */
+import { execGuardedFixer } from './fixer-process.mjs';
 import { spawn } from 'node:child_process';
 import { appendFileSync, closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -299,11 +301,13 @@ async function runWorkerOnce(spec, io, stop) {
   let started = newEnvelopeRecord({ ...base, headBefore, timeoutMs, now });
   const deadlineMs = Date.parse(started.startedAt) + timeoutMs;
   started.deadlineAt = new Date(deadlineMs).toISOString();
+  if (spec.mode !== undefined) started.mode = spec.mode;
+  if (spec.launchGuard !== undefined) started.launchGuard = spec.launchGuard;
   let recordWriteFailure = null; // an infrastructure fault (lock timeout), not a worker failure: runWorker rejects with it
   // The job record: written the moment the child has a pid (the spawn seam below), before it can finish.
   let graceTimer = null;
   const spawnWithPid = (cmd, argv, opts) => {
-    const child = spawnFn(cmd, argv, opts);
+    const child = execGuardedFixer(cmd, argv, { ...opts, mode: spec.mode, launchGuard: spec.launchGuard, launchContext: { pr: spec.pr, repo: spec.repo } }, { exec: spawnFn, gate: io.launchGate, ...io.launchGateOptions });
     // Opt-in smoke evidence: persist the first byte time and stderr while the worker is still running.
     if (spec.diagnosticsDir) {
       let first = true;
@@ -381,6 +385,7 @@ async function runWorkerOnce(spec, io, stop) {
   const run = async (argv) => {
     try {
       const launch = () => spawnToCompletionFn(spec.command, argv, {
+        mode: spec.mode, launchGuard: spec.launchGuard,
         // EVERY launch path gets the same env hygiene (a static GH_TOKEN stripped, the worker marker set), not just the callers that
         // happen to pass a sanitising spawn: the detached CLI and any future launcher inherit it here.
         cwd: spec.cwd, env: markWorkerEnv(sanitizeSpawnEnv(spec.env ?? process.env)), timeout: Math.max(1, deadlineMs - clock()), killSignal: 'SIGKILL',
@@ -571,6 +576,7 @@ export function preserveLegacyWords(envelope, legacy) {
  */
 export function launchDetached(spec, { specDir, spawnFn = spawn, nodePath = process.execPath, entry = fileURLToPath(import.meta.url) } = {}) {
   if (!specDir) throw new TypeError('operations: launchDetached needs specDir');
+  assertLaunchDescriptor(spec);
   if (!isValidSessionSlug(spec?.session)) throw new TypeError(`operations: launchDetached: invalid session slug ${JSON.stringify(spec?.session)}`);
   mkdirSync(specDir, { recursive: true, mode: 0o700 });
   const specFile = join(specDir, `${spec.session}.spec.json`);

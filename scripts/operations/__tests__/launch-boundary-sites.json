@@ -1,0 +1,161 @@
+{
+  "scripts/conveyor/await-verify-pass.mjs": {
+    "calls": [
+      "defaultSpawnAgent:io.defaultSpawnAgent"
+    ],
+    "references": [
+      "defaultSpawnAgent:io.defaultSpawnAgent"
+    ]
+  },
+  "scripts/conveyor/reconcile-fix-dispatch.mjs": {
+    "calls": [
+      "defaultSpawnAgent:spawnAgent",
+      "defaultSpawnAgent:spawnAgent"
+    ],
+    "references": [
+      "defaultSpawnAgent:defaultSpawnAgent",
+      "defaultSpawnAgent:spawnAgent",
+      "defaultSpawnAgent:defaultSpawnAgent",
+      "defaultSpawnAgent:spawnAgent",
+      "defaultSpawnAgent:spawnAgent",
+      "defaultSpawnAgent:defaultSpawnAgent",
+      "defaultSpawnAgent:spawnAgent",
+      "defaultSpawnAgent:spawnAgent",
+      "defaultSpawnAgent:defaultSpawnAgent",
+      "defaultSpawnAgent:spawnAgent"
+    ]
+  },
+  "scripts/conveyor/soak/breaks/ci-heal-owner-inherits-observer-role.mjs": {
+    "calls": [
+      "defaultSpawnAgent:io.defaultSpawnAgent"
+    ],
+    "references": [
+      "defaultSpawnAgent:io.defaultSpawnAgent"
+    ]
+  },
+  "scripts/conveyor/stuck-pr-inspect-dispatch.mjs": {
+    "calls": [
+      "defaultSpawnAgent:spawnAgent"
+    ],
+    "references": [
+      "defaultSpawnAgent:defaultSpawnAgent",
+      "defaultSpawnAgent:spawnAgent",
+      "defaultSpawnAgent:defaultSpawnAgent",
+      "defaultSpawnAgent:spawnAgent"
+    ]
+  },
+  "scripts/operations/codex-delivery-provider.mjs": {
+    "calls": [
+      "spawnFixerToCompletion:spawnFixerToCompletion"
+    ],
+    "references": [
+      "spawnFixerToCompletion:spawnFixerToCompletion",
+      "defaultSpawnCodexAgent:defaultSpawnCodexAgent",
+      "spawnFixerToCompletion:spawnFixerToCompletion"
+    ]
+  },
+  "scripts/operations/deliver-item-wrapper.mjs": {
+    "calls": [
+      "spawnAgentToCompletion:spawnAgent",
+      "spawnAgentToCompletion:spawnAgent",
+      "defaultSpawnCodexAgent:spawnAgent"
+    ],
+    "references": [
+      "spawnAgentToCompletion:spawnAgentToCompletion",
+      "defaultSpawnCodexAgent:defaultSpawnCodexAgent",
+      "spawnAgentToCompletion:spawnAgent",
+      "spawnAgentToCompletion:spawnAgentToCompletion",
+      "spawnAgentToCompletion:spawnAgent",
+      "spawnAgentToCompletion:spawnAgent",
+      "defaultSpawnCodexAgent:spawnAgent",
+      "defaultSpawnCodexAgent:defaultSpawnCodexAgent",
+      "defaultSpawnCodexAgent:spawnAgent"
+    ]
+  },
+  "scripts/operations/dispatch-lane-io.mjs": {
+    "calls": [
+      "defaultSpawnAgent:defaultSpawnAgent",
+      "defaultSpawnAgent:defaultSpawnAgent",
+      "defaultSpawnAgent:spawnAgent",
+      "execGuardedFixer:execGuardedFixer",
+      "spawnFixerToCompletion:spawnFixerToCompletion"
+    ],
+    "references": [
+      "execGuardedFixer:execGuardedFixer",
+      "spawnFixerToCompletion:spawnFixerToCompletion",
+      "defaultSpawnAgent:spawnAgent",
+      "defaultSpawnAgent:defaultSpawnAgent",
+      "defaultSpawnAgent:spawnAgent",
+      "defaultSpawnAgent:spawnAgent",
+      "defaultSpawnAgent:defaultSpawnAgent",
+      "defaultSpawnAgent:spawnAgent",
+      "defaultSpawnAgent:defaultSpawnAgent",
+      "execGuardedFixer:execGuardedFixer",
+      "spawnAgentToCompletion:spawnAgentToCompletion",
+      "spawnFixerToCompletion:spawnFixerToCompletion"
+    ]
+  },
+  "scripts/operations/explore-io.mjs": {
+    "calls": [
+      "defaultSpawnAgent:defaultSpawnAgent",
+      "execGuardedFixer:execGuardedFixer",
+      "defaultSpawnAgent:defaultSpawnAgent",
+      "defaultSpawnAgent:spawnAgent"
+    ],
+    "references": [
+      "execGuardedFixer:execGuardedFixer",
+      "defaultSpawnAgent:spawnAgent",
+      "defaultSpawnAgent:defaultSpawnAgent",
+      "defaultSpawnAgent:spawnAgent",
+      "defaultSpawnAgent:defaultSpawnAgent",
+      "execGuardedFixer:execGuardedFixer",
+      "defaultSpawnAgent:spawnAgent",
+      "defaultSpawnAgent:defaultSpawnAgent",
+      "defaultSpawnAgent:spawnAgent"
+    ]
+  },
+  "scripts/operations/fix-run.mjs": {
+    "calls": [
+      "defaultSpawnCodexAgent:(await import('./codex-delivery-provider.mjs')).defaultSpawnCodexAgent",
+      "execGuardedFixer:execGuardedFixer",
+      "defaultSpawnCodexAgent:spawnCodex"
+    ],
+    "references": [
+      "execGuardedFixer:execGuardedFixer",
+      "defaultSpawnCodexAgent:spawnCodex",
+      "defaultSpawnCodexAgent:(await import('./codex-delivery-provider.mjs')).defaultSpawnCodexAgent",
+      "execGuardedFixer:execGuardedFixer",
+      "defaultSpawnCodexAgent:spawnCodex"
+    ]
+  },
+  "scripts/operations/fixer-process.mjs": {
+    "calls": [
+      "execGuardedFixer:execGuardedFixer"
+    ],
+    "references": [
+      "execGuardedFixer:execGuardedFixer",
+      "spawnFixerToCompletion:spawnFixerToCompletion",
+      "execGuardedFixer:execGuardedFixer"
+    ]
+  },
+  "scripts/operations/review-dispatch.mjs": {
+    "calls": [
+      "defaultSpawnAgent:spawnAgent"
+    ],
+    "references": [
+      "defaultSpawnAgent:defaultSpawnAgent",
+      "defaultSpawnAgent:spawnAgent",
+      "defaultSpawnAgent:defaultSpawnAgent",
+      "defaultSpawnAgent:spawnAgent"
+    ]
+  },
+  "scripts/operations/worker-wrapper.mjs": {
+    "calls": [
+      "execGuardedFixer:execGuardedFixer"
+    ],
+    "references": [
+      "execGuardedFixer:execGuardedFixer",
+      "execGuardedFixer:execGuardedFixer"
+    ]
+  }
+}

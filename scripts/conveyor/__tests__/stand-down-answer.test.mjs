@@ -202,7 +202,7 @@ it('carries the ruling into an ownership-confirmed resumed fix as well', () => {
   const grantConflictHelper = vi.fn(() => ({ ok: true }));
   const spawnAgent = vi.fn(() => 'backgrounded · candxxxx\n');
   const result = tryResumeFix({ pr: 3181, itemNum: null, laneRef: 'lane/answer-test', scope: ['we:scripts/prepare.mjs'],
-    isConflict: true, body: buildAuthorActorMarker(candidate), headRefOid: head, operatorAnswer: record }, {
+    isConflict: true, body: buildAuthorActorMarker(candidate), headRefOid: head, operatorAnswer: record }, { readSavedLaunch: () => ({ mode: 'ordinary', launchGuard: null }),
     root: '/repo', spawnAgent, grantConflictHelper,
     listAgentsAll: () => [{ sessionId: candidate, id: 'candxxxx', cwd: '/lanes/lane-4', name: 'fix-3181' }],
     resolveHead: () => head, acquireClaim: () => ({ ok: true }), releaseClaim: () => {},

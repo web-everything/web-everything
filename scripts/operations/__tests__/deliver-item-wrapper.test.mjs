@@ -271,7 +271,7 @@ describe('CODEX_PROVIDER.spawn (#3580 — the real second provider)', () => {
     ...over,
   });
 
-  const REQ = { sessionId: 'claude-uuid', prompt: 'BUILD IT', lane: 9, sessionSlug: 'sess-9', item: '3580', attemptTag: 'b' };
+  const REQ = { mode: 'build', launchGuard: null, sessionId: 'claude-uuid', prompt: 'BUILD IT', lane: 9, sessionSlug: 'sess-9', item: '3580', attemptTag: 'b' };
 
   it.each([
     [{}, 'gpt-6.1-sol', 'medium'],
@@ -280,7 +280,7 @@ describe('CODEX_PROVIDER.spawn (#3580 — the real second provider)', () => {
     [{ taskKind: 'trivial', model: 'x', effort: 'max' }, 'x', 'max'],
   ])('routes the actual spawn and scorecard %j', async (request, model, effort) => {
     const o = io();
-    await DELIVERY_AGENT_PROVIDERS.codex.spawn({ ...REQ, ...request }, o);
+    await DELIVERY_AGENT_PROVIDERS.codex.spawn({ mode: 'build', launchGuard: null, ...REQ, ...request }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...o });
     const argv = o.spawnAgent.mock.calls[0][0];
     expect(argv[argv.indexOf('-m') + 1]).toBe(model);
     expect(argv).toContain(`model_reasoning_effort=${effort}`);
@@ -289,7 +289,7 @@ describe('CODEX_PROVIDER.spawn (#3580 — the real second provider)', () => {
 
   it('spawns `codex exec` in the RESOLVED lane clone, not wherever the wrapper process happens to sit', async () => {
     const o = io();
-    await DELIVERY_AGENT_PROVIDERS.codex.spawn(REQ, o);
+    await DELIVERY_AGENT_PROVIDERS.codex.spawn({ mode: 'build', launchGuard: null, ...REQ }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...o });
     expect(o.resolveLane).toHaveBeenCalledWith(9, { run: o.run });
     const [argv, opts] = o.spawnAgent.mock.calls[0];
     expect(argv.slice(0, 3)).toEqual(['exec', '-C', LANE_PATH]);
@@ -300,7 +300,7 @@ describe('CODEX_PROVIDER.spawn (#3580 — the real second provider)', () => {
   // so the second provider must not silently re-introduce either of them.
   it('stamps the SAME real delivery env vars the Claude provider does, including the reports-dir override', async () => {
     const o = io();
-    await DELIVERY_AGENT_PROVIDERS.codex.spawn(REQ, o);
+    await DELIVERY_AGENT_PROVIDERS.codex.spawn({ mode: 'build', launchGuard: null, ...REQ }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...o });
     expect(o.spawnAgent.mock.calls[0][1].env).toMatchObject({
       WE_DISPATCH_KIND: 'delivery',
       DELIVERY_SESSION: 'sess-9',
@@ -316,13 +316,13 @@ describe('CODEX_PROVIDER.spawn (#3580 — the real second provider)', () => {
   // regression test, above, for the full root-cause account — this is the same bug, in the second provider).
   it('resolves the reports dir WITH the resolved lane path — never bare', async () => {
     const o = io();
-    await DELIVERY_AGENT_PROVIDERS.codex.spawn(REQ, o);
+    await DELIVERY_AGENT_PROVIDERS.codex.spawn({ mode: 'build', launchGuard: null, ...REQ }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...o });
     expect(o.resolveReportsDir).toHaveBeenCalledWith(LANE_PATH);
   });
 
   it('blocks on the DELIVERY budget, never dispatch-lane-io\'s 60s fire-and-forget one (#3627 bug 6)', async () => {
     const o = io();
-    await DELIVERY_AGENT_PROVIDERS.codex.spawn(REQ, o);
+    await DELIVERY_AGENT_PROVIDERS.codex.spawn({ mode: 'build', launchGuard: null, ...REQ }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...o });
     expect(o.spawnAgent.mock.calls[0][1].timeout).toBe(DELIVERY_AGENT_SPAWN_TIMEOUT_MS);
     expect(DELIVERY_AGENT_SPAWN_TIMEOUT_MS).not.toBe(SPAWN_TIMEOUT_MS);
   });
@@ -331,7 +331,7 @@ describe('CODEX_PROVIDER.spawn (#3580 — the real second provider)', () => {
   // its own run, stamped `dispatchKind: 'build'`.
   it('scores + records this run via recordScorecard, stamped as the build kind/role', async () => {
     const o = io();
-    await DELIVERY_AGENT_PROVIDERS.codex.spawn(REQ, o);
+    await DELIVERY_AGENT_PROVIDERS.codex.spawn({ mode: 'build', launchGuard: null, ...REQ }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...o });
     expect(o.recordScorecard).toHaveBeenCalledWith(expect.objectContaining({
       stdout: THREAD_EVENT, dispatchKind: 'build', role: 'delivery', provider: 'codex', item: '3580', handle: 'sess-9',
     }));
@@ -339,13 +339,13 @@ describe('CODEX_PROVIDER.spawn (#3580 — the real second provider)', () => {
 
   it('records the thread id Codex minted, keyed by sessionSlug, on a FRESH spawn', async () => {
     const o = io();
-    await DELIVERY_AGENT_PROVIDERS.codex.spawn(REQ, o);
+    await DELIVERY_AGENT_PROVIDERS.codex.spawn({ mode: 'build', launchGuard: null, ...REQ }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...o });
     expect(o.writeThreadId).toHaveBeenCalledWith('sess-9', '01a0-live-thread');
   });
 
   it('resumes on the RECORDED Codex thread id — never on the Claude UUID the port hands it', async () => {
     const o = io({ readThreadId: vi.fn(() => 'recorded-tid') });
-    await DELIVERY_AGENT_PROVIDERS.codex.spawn({ ...REQ, resumeSessionId: 'claude-uuid' }, o);
+    await DELIVERY_AGENT_PROVIDERS.codex.spawn({ mode: 'build', launchGuard: null, ...REQ, resumeSessionId: 'claude-uuid' }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...o });
     expect(o.readThreadId).toHaveBeenCalledWith('sess-9');
     const argv = o.spawnAgent.mock.calls[0][0];
     expect(argv.slice(0, 3)).toEqual(['exec', 'resume', 'recorded-tid']);
@@ -358,7 +358,7 @@ describe('CODEX_PROVIDER.spawn (#3580 — the real second provider)', () => {
   // to carry — the agent would be handed "your gate failed" with no memory of what it built.
   it('REFUSES to resume when no thread id was recorded, instead of silently starting a new session', async () => {
     const o = io({ readThreadId: vi.fn(() => null) });
-    await expect(DELIVERY_AGENT_PROVIDERS.codex.spawn({ ...REQ, resumeSessionId: 'claude-uuid' }, o))
+    await expect(DELIVERY_AGENT_PROVIDERS.codex.spawn({ mode: 'build', launchGuard: null, ...REQ, resumeSessionId: 'claude-uuid' }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...o }))
       .rejects.toThrow(/cannot resume session sess-9/);
     expect(o.spawnAgent).not.toHaveBeenCalled();
   });
@@ -366,19 +366,19 @@ describe('CODEX_PROVIDER.spawn (#3580 — the real second provider)', () => {
   it('captures the child\'s output on a spawn failure and rethrows untouched (same as the Claude provider)', async () => {
     const boom = new Error('spawnSync codex ETIMEDOUT');
     const o = io({ spawnAgent: vi.fn(() => { throw boom; }) });
-    await expect(DELIVERY_AGENT_PROVIDERS.codex.spawn(REQ, o)).rejects.toThrow(boom);
+    await expect(DELIVERY_AGENT_PROVIDERS.codex.spawn({ mode: 'build', launchGuard: null, ...REQ }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...o })).rejects.toThrow(boom);
     expect(o.persistFailure).toHaveBeenCalledWith('sess-9', boom, { resumeSessionId: null });
   });
 
   it('refuses a deny map that would cover the agent\'s own lane, before any spawn happens', async () => {
     const o = io({ denyPaths: ['/tmp/**'] }); // LANE_PATH is /tmp/lane-9 — covered.
-    await expect(DELIVERY_AGENT_PROVIDERS.codex.spawn(REQ, o)).rejects.toThrow(/covers the agent's own lane/);
+    await expect(DELIVERY_AGENT_PROVIDERS.codex.spawn({ mode: 'build', launchGuard: null, ...REQ }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...o })).rejects.toThrow(/covers the agent's own lane/);
     expect(o.spawnAgent).not.toHaveBeenCalled();
   });
 
   it('tolerates a stream with no thread.started rather than failing a build that already succeeded', async () => {
     const o = io({ spawnAgent: vi.fn(() => ({ stdout: '{"type":"turn.completed"}', resourceUsage: null })) });
-    await DELIVERY_AGENT_PROVIDERS.codex.spawn(REQ, o); // a throw here fails the test naturally.
+    await DELIVERY_AGENT_PROVIDERS.codex.spawn({ mode: 'build', launchGuard: null, ...REQ }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...o }); // a throw here fails the test naturally.
     expect(o.writeThreadId).not.toHaveBeenCalled();
   });
 
@@ -394,7 +394,7 @@ describe('CODEX_PROVIDER.spawn (#3580 — the real second provider)', () => {
 
     it('spawns with cwd = the OVERRIDE (the WE lane is still resolved, for $LANE — #4348)', async () => {
       const o = io({ stageDeliveryReportCli: vi.fn() });
-      await DELIVERY_AGENT_PROVIDERS.codex.spawn({ ...REQ, lanePathOverride: IMPL_LANE_PATH }, o);
+      await DELIVERY_AGENT_PROVIDERS.codex.spawn({ mode: 'build', launchGuard: null, ...REQ, lanePathOverride: IMPL_LANE_PATH }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...o });
       expect(o.resolveLane).toHaveBeenCalledWith(9, { run: o.run });
       const [argv, opts] = o.spawnAgent.mock.calls[0];
       expect(argv.slice(0, 3)).toEqual(['exec', '-C', IMPL_LANE_PATH]);
@@ -403,14 +403,14 @@ describe('CODEX_PROVIDER.spawn (#3580 — the real second provider)', () => {
 
     it('stamps IMPL_LANE (never present for an ordinary we-locus spawn) alongside LANE = the WE lane', async () => {
       const o = io({ stageDeliveryReportCli: vi.fn() });
-      await DELIVERY_AGENT_PROVIDERS.codex.spawn({ ...REQ, lanePathOverride: IMPL_LANE_PATH }, o);
+      await DELIVERY_AGENT_PROVIDERS.codex.spawn({ mode: 'build', launchGuard: null, ...REQ, lanePathOverride: IMPL_LANE_PATH }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...o });
       expect(o.spawnAgent.mock.calls[0][1].env).toMatchObject({
         LANE: LANE_PATH, IMPL_LANE: IMPL_LANE_PATH,
       });
       // the ordinary (no override) spawn from the describe block above never sets IMPL_LANE at all —
       // asserted there via `.toMatchObject` with no `IMPL_LANE` key; re-asserted here for contrast.
       const plain = io();
-      await DELIVERY_AGENT_PROVIDERS.codex.spawn(REQ, plain);
+      await DELIVERY_AGENT_PROVIDERS.codex.spawn({ mode: 'build', launchGuard: null, ...REQ }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...plain });
       expect(plain.spawnAgent.mock.calls[0][1].env.IMPL_LANE).toBeUndefined();
     });
 
@@ -418,7 +418,7 @@ describe('CODEX_PROVIDER.spawn (#3580 — the real second provider)', () => {
       + 'frontierui/plateau-app clone never carried this WE-only CLI to begin with', async () => {
       const stageDeliveryReportCli = vi.fn();
       const o = io({ stageDeliveryReportCli });
-      await DELIVERY_AGENT_PROVIDERS.codex.spawn({ ...REQ, lanePathOverride: IMPL_LANE_PATH }, o);
+      await DELIVERY_AGENT_PROVIDERS.codex.spawn({ mode: 'build', launchGuard: null, ...REQ, lanePathOverride: IMPL_LANE_PATH }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...o });
       expect(stageDeliveryReportCli).toHaveBeenCalledWith(IMPL_LANE_PATH);
       expect(stageDeliveryReportCli.mock.invocationCallOrder[0])
         .toBeLessThan(o.spawnAgent.mock.invocationCallOrder[0]);
@@ -427,16 +427,16 @@ describe('CODEX_PROVIDER.spawn (#3580 — the real second provider)', () => {
     it('never stages anything for an ordinary we-locus spawn (no lanePathOverride)', async () => {
       const stageDeliveryReportCli = vi.fn();
       const o = io({ stageDeliveryReportCli });
-      await DELIVERY_AGENT_PROVIDERS.codex.spawn(REQ, o);
+      await DELIVERY_AGENT_PROVIDERS.codex.spawn({ mode: 'build', launchGuard: null, ...REQ }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...o });
       expect(stageDeliveryReportCli).not.toHaveBeenCalled();
     });
 
     it('the deny-map seals off the OVERRIDE lane\'s own primary checkout (plateau-app\'s), not WE\'s', async () => {
       const o = io({ stageDeliveryReportCli: vi.fn(), denyPaths: null });
-      await DELIVERY_AGENT_PROVIDERS.codex.spawn({
+      await DELIVERY_AGENT_PROVIDERS.codex.spawn({ mode: 'build', launchGuard: null,
         ...REQ,
         lanePathOverride: `${process.env.HOME}/workspace/.lanes/plateau-app/lane-4`,
-      }, o);
+      }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...o });
       const argv = o.spawnAgent.mock.calls[0][0];
       const permissionsArg = argv.find((a) => typeof a === 'string' && a.startsWith('permissions='));
       expect(permissionsArg).toContain(`${process.env.HOME}/workspace/plateau-app`);
@@ -474,8 +474,8 @@ describe('CLAUDE_RESTRICTED_PROVIDER.spawn timeout (#3627 bug 6)', () => {
     + '`claude --bg` caller)', async () => {
     const io = fakeIo();
     await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(
-      { sessionId: '55555555-5555-4555-8555-555555555555', prompt: 'build item #3371', lane: 3, sessionSlug: 'conveyor-3371', item: '3371', attemptTag: '' },
-      io,
+      { mode: 'build', launchGuard: null, sessionId: '55555555-5555-4555-8555-555555555555', prompt: 'build item #3371', lane: 3, sessionSlug: 'conveyor-3371', item: '3371', attemptTag: '' },
+      { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...io },
     );
 
     expect(io.spawnAgent).toHaveBeenCalledTimes(1);
@@ -496,8 +496,8 @@ describe('CLAUDE_RESTRICTED_PROVIDER.spawn timeout (#3627 bug 6)', () => {
     + 'unaffected by the timeout fix)', async () => {
     const io = fakeIo();
     await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(
-      { sessionId: '66666666-6666-4666-8666-666666666666', prompt: 'build item #3371', lane: 3, sessionSlug: 'conveyor-3371', item: '3371', attemptTag: '' },
-      io,
+      { mode: 'build', launchGuard: null, sessionId: '66666666-6666-4666-8666-666666666666', prompt: 'build item #3371', lane: 3, sessionSlug: 'conveyor-3371', item: '3371', attemptTag: '' },
+      { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...io },
     );
     const [, opts] = io.spawnAgent.mock.calls[0];
     expect(opts.env.WE_DISPATCH_KIND).toBe('delivery');
@@ -540,8 +540,8 @@ describe('CLAUDE_RESTRICTED_PROVIDER.spawn real cwd + env (#3627 bug 7)', () => 
     + 'seam) and passes it as `cwd` to the underlying spawn call — never the wrapper\'s own REPO_ROOT', async () => {
     const io = fakeIo();
     await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(
-      { sessionId: '77777777-7777-4777-8777-777777777777', prompt: 'build item #3371', lane: 3, sessionSlug: 'conveyor-3371', item: '3371', attemptTag: '' },
-      io,
+      { mode: 'build', launchGuard: null, sessionId: '77777777-7777-4777-8777-777777777777', prompt: 'build item #3371', lane: 3, sessionSlug: 'conveyor-3371', item: '3371', attemptTag: '' },
+      { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...io },
     );
     expect(io.resolveLane).toHaveBeenCalledWith(3, expect.objectContaining({ run: expect.any(Function) }));
     const [, opts] = io.spawnAgent.mock.calls[0];
@@ -552,8 +552,8 @@ describe('CLAUDE_RESTRICTED_PROVIDER.spawn real cwd + env (#3627 bug 7)', () => 
     + 'process env vars, never only the old text-appended `[env: ...]` prompt footer', async () => {
     const io = fakeIo();
     await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(
-      { sessionId: '88888888-8888-4888-8888-888888888888', prompt: 'build item #3371', lane: 3, sessionSlug: 'conveyor-3371', item: '3371', attemptTag: 'b' },
-      io,
+      { mode: 'build', launchGuard: null, sessionId: '88888888-8888-4888-8888-888888888888', prompt: 'build item #3371', lane: 3, sessionSlug: 'conveyor-3371', item: '3371', attemptTag: 'b' },
+      { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...io },
     );
     const [, opts] = io.spawnAgent.mock.calls[0];
     expect(opts.env.DELIVERY_SESSION).toBe('conveyor-3371');
@@ -565,8 +565,8 @@ describe('CLAUDE_RESTRICTED_PROVIDER.spawn real cwd + env (#3627 bug 7)', () => 
   it('ATTEMPT_TAG falls back to the empty string, matching the old footer\'s `attemptTag ?? \'\'` behavior', async () => {
     const io = fakeIo();
     await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(
-      { sessionId: '99999999-9999-4999-8999-999999999999', prompt: 'p', lane: 3, sessionSlug: 's', item: '1' },
-      io,
+      { mode: 'build', launchGuard: null, sessionId: '99999999-9999-4999-8999-999999999999', prompt: 'p', lane: 3, sessionSlug: 's', item: '1' },
+      { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...io },
     );
     const [, opts] = io.spawnAgent.mock.calls[0];
     expect(opts.env.ATTEMPT_TAG).toBe('');
@@ -583,8 +583,8 @@ describe('CLAUDE_RESTRICTED_PROVIDER.spawn real cwd + env (#3627 bug 7)', () => 
     + 'OPERATION_DELIVERY_REPORTS_DIR to the underlying spawn call', async () => {
     const io = fakeIo({ resolveReportsDir: vi.fn(() => '/real/repo/.operations/delivery-reports') });
     await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(
-      { sessionId: '55555555-5555-4555-8555-555555555555', prompt: 'p', lane: 3, sessionSlug: 'conveyor-3371', item: '3371', attemptTag: '' },
-      io,
+      { mode: 'build', launchGuard: null, sessionId: '55555555-5555-4555-8555-555555555555', prompt: 'p', lane: 3, sessionSlug: 'conveyor-3371', item: '3371', attemptTag: '' },
+      { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...io },
     );
     expect(io.resolveReportsDir).toHaveBeenCalledTimes(1);
     const [, opts] = io.spawnAgent.mock.calls[0];
@@ -601,8 +601,8 @@ describe('CLAUDE_RESTRICTED_PROVIDER.spawn real cwd + env (#3627 bug 7)', () => 
     + 'to is the AGENT\'s own lane, not wherever the wrapper process happens to be running from', async () => {
     const io = fakeIo({ resolveReportsDir: vi.fn(() => '/real/pool/lane-3/.operations/delivery-reports') });
     await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(
-      { sessionId: '55555555-5555-4555-8555-555555555555', prompt: 'p', lane: 3, sessionSlug: 'conveyor-3371', item: '3371', attemptTag: '' },
-      io,
+      { mode: 'build', launchGuard: null, sessionId: '55555555-5555-4555-8555-555555555555', prompt: 'p', lane: 3, sessionSlug: 'conveyor-3371', item: '3371', attemptTag: '' },
+      { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...io },
     );
     expect(io.resolveReportsDir).toHaveBeenCalledWith('/real/pool/lane-3'); // io.resolveLane's own fixed return
   });
@@ -612,11 +612,11 @@ describe('CLAUDE_RESTRICTED_PROVIDER.spawn real cwd + env (#3627 bug 7)', () => 
     + 'the wrapper reads it', async () => {
     const io = fakeIo({ resolveReportsDir: vi.fn(() => '/real/repo/.operations/delivery-reports') });
     await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(
-      {
+      { mode: 'build', launchGuard: null,
         sessionId: '66666666-6666-4666-8666-666666666666', resumeSessionId: '66666666-6666-4666-8666-666666666666',
         prompt: 'fix the gate failure', lane: 3, sessionSlug: 'conveyor-3371', item: '3371', attemptTag: '',
       },
-      io,
+      { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...io },
     );
     const [, opts] = io.spawnAgent.mock.calls[0];
     expect(opts.env.OPERATION_DELIVERY_REPORTS_DIR).toBe('/real/repo/.operations/delivery-reports');
@@ -635,8 +635,8 @@ describe('CLAUDE_RESTRICTED_PROVIDER.spawn real cwd + env (#3627 bug 7)', () => 
     const persistFailure = vi.fn();
 
     await expect(DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(
-      { sessionId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', prompt: 'p', lane: 3, sessionSlug: 'conveyor-3371', item: '3371', attemptTag: '' },
-      { ...io, persistFailure },
+      { mode: 'build', launchGuard: null, sessionId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', prompt: 'p', lane: 3, sessionSlug: 'conveyor-3371', item: '3371', attemptTag: '' },
+      { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...{ ...io, persistFailure } },
     )).rejects.toThrow('spawnSync claude ETIMEDOUT');
 
     expect(persistFailure).toHaveBeenCalledTimes(1);
@@ -651,8 +651,8 @@ describe('CLAUDE_RESTRICTED_PROVIDER.spawn real cwd + env (#3627 bug 7)', () => 
   it('still throws the original error after capturing it — the capture is observability, never a swallow', async () => {
     const io = fakeIo({ spawnAgent: vi.fn(() => { throw new Error('boom'); }) });
     await expect(DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(
-      { sessionId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', prompt: 'p', lane: 3, sessionSlug: 's', item: '1', attemptTag: '' },
-      { ...io, persistFailure: vi.fn() },
+      { mode: 'build', launchGuard: null, sessionId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', prompt: 'p', lane: 3, sessionSlug: 's', item: '1', attemptTag: '' },
+      { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...{ ...io, persistFailure: vi.fn() } },
     )).rejects.toThrow('boom');
   });
 
@@ -661,11 +661,11 @@ describe('CLAUDE_RESTRICTED_PROVIDER.spawn real cwd + env (#3627 bug 7)', () => 
     const io = fakeIo({ spawnAgent: vi.fn(() => { throw new Error('resume boom'); }) });
     const persistFailure = vi.fn();
     await expect(DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(
-      {
+      { mode: 'build', launchGuard: null,
         sessionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', resumeSessionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
         prompt: 'fix the gate failure', lane: 3, sessionSlug: 'conveyor-3371', item: '3371', attemptTag: '',
       },
-      { ...io, persistFailure },
+      { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...{ ...io, persistFailure } },
     )).rejects.toThrow('resume boom');
     const [, , optsArg] = persistFailure.mock.calls[0];
     expect(optsArg.resumeSessionId).toBe('cccccccc-cccc-4ccc-8ccc-cccccccccccc');
@@ -681,11 +681,11 @@ describe('CLAUDE_RESTRICTED_PROVIDER.spawn real cwd + env (#3627 bug 7)', () => 
     it('cwd is the override, LANE is the (still-resolved) WE lane, IMPL_LANE the override — #4348', async () => {
       const io = fakeIo({ stageDeliveryReportCli: vi.fn() });
       await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(
-        {
+        { mode: 'build', launchGuard: null,
           sessionId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', prompt: 'p', lane: 3, sessionSlug: 'conveyor-2385',
           item: '2385', attemptTag: '', lanePathOverride: IMPL_LANE_PATH,
         },
-        io,
+        { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...io },
       );
       expect(io.resolveLane).toHaveBeenCalled();
       const [, opts] = io.spawnAgent.mock.calls[0];
@@ -699,11 +699,11 @@ describe('CLAUDE_RESTRICTED_PROVIDER.spawn real cwd + env (#3627 bug 7)', () => 
       const stageDeliveryReportCli = vi.fn();
       const io = fakeIo({ stageDeliveryReportCli });
       await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(
-        {
+        { mode: 'build', launchGuard: null,
           sessionId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', prompt: 'p', lane: 3, sessionSlug: 's', item: '1',
           attemptTag: '', lanePathOverride: IMPL_LANE_PATH,
         },
-        io,
+        { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...io },
       );
       expect(stageDeliveryReportCli).toHaveBeenCalledWith(IMPL_LANE_PATH);
     });
@@ -712,8 +712,8 @@ describe('CLAUDE_RESTRICTED_PROVIDER.spawn real cwd + env (#3627 bug 7)', () => 
       const stageDeliveryReportCli = vi.fn();
       const io = fakeIo({ stageDeliveryReportCli });
       await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(
-        { sessionId: 'ffffffff-ffff-4fff-8fff-ffffffffffff', prompt: 'p', lane: 3, sessionSlug: 's', item: '1', attemptTag: '' },
-        io,
+        { mode: 'build', launchGuard: null, sessionId: 'ffffffff-ffff-4fff-8fff-ffffffffffff', prompt: 'p', lane: 3, sessionSlug: 's', item: '1', attemptTag: '' },
+        { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...io },
       );
       expect(stageDeliveryReportCli).not.toHaveBeenCalled();
       expect(io.spawnAgent.mock.calls[0][1].env.IMPL_LANE).toBeUndefined();
@@ -736,7 +736,7 @@ describe('cross-locus delivery reaches BOTH lanes (#4348)', () => {
   // The pool root is hermetic (`LANE_POOL_ROOT` -> a per-file tmp dir), so the lock folder is derived, not a fixed `.lanes/...` path.
   const ADMISSION_LOCK = admissionLockRoot(L7);
   const P2 = `${HOME}/workspace/.lanes/plateau-app/lane-2`;
-  const REQ = {
+  const REQ = { mode: 'build', launchGuard: null,
     sessionId: '43484348-4348-4348-8348-434843484348', prompt: 'BUILD #2720', lane: 7, sessionSlug: 'conveyor-2720',
     item: '2720', attemptTag: '',
   };
@@ -768,7 +768,7 @@ describe('cross-locus delivery reaches BOTH lanes (#4348)', () => {
 
   it('CODEX_PROVIDER: LANE=WE lane, IMPL_LANE=impl lane, cwd=impl lane, and the WE lane is a writable root', async () => {
     const o = codexIo();
-    await DELIVERY_AGENT_PROVIDERS.codex.spawn({ ...REQ, lanePathOverride: P2 }, o);
+    await DELIVERY_AGENT_PROVIDERS.codex.spawn({ mode: 'build', launchGuard: null, ...REQ, lanePathOverride: P2 }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...o });
     const [argv, opts] = o.spawnAgent.mock.calls[0];
     expect(opts.cwd).toBe(P2);
     expect(argv.slice(0, 3)).toEqual(['exec', '-C', P2]);
@@ -780,7 +780,7 @@ describe('cross-locus delivery reaches BOTH lanes (#4348)', () => {
 
   it('CODEX_PROVIDER: the deny map seals BOTH repos\' primary checkouts, and covers neither lane', async () => {
     const o = codexIo();
-    await DELIVERY_AGENT_PROVIDERS.codex.spawn({ ...REQ, lanePathOverride: P2 }, o);
+    await DELIVERY_AGENT_PROVIDERS.codex.spawn({ mode: 'build', launchGuard: null, ...REQ, lanePathOverride: P2 }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...o });
     const perms = permissionsOf(o.spawnAgent.mock.calls[0][0]);
     expect(perms).toContain(`"${HOME}/workspace/plateau-app/**"="deny"`);
     // WE's primary is whatever repo-profile resolves for the web-everything pool (REPO_ROOT-derived).
@@ -790,14 +790,14 @@ describe('cross-locus delivery reaches BOTH lanes (#4348)', () => {
 
   it('CODEX_PROVIDER: refuses (before spawning) a deny map that would cover the WE lane', async () => {
     const o = codexIo({ denyPaths: [`${HOME}/workspace/.lanes/web-everything/**`] });
-    await expect(DELIVERY_AGENT_PROVIDERS.codex.spawn({ ...REQ, lanePathOverride: P2 }, o))
+    await expect(DELIVERY_AGENT_PROVIDERS.codex.spawn({ mode: 'build', launchGuard: null, ...REQ, lanePathOverride: P2 }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...o }))
       .rejects.toThrow(/covers the agent's own lane/);
     expect(o.spawnAgent).not.toHaveBeenCalled();
   });
 
   it('CODEX_PROVIDER: the gate-failure RESUME keeps the WE-lane grant (`exec resume` takes no --add-dir)', async () => {
     const o = codexIo();
-    await DELIVERY_AGENT_PROVIDERS.codex.spawn({ ...REQ, lanePathOverride: P2, resumeSessionId: REQ.sessionId }, o);
+    await DELIVERY_AGENT_PROVIDERS.codex.spawn({ mode: 'build', launchGuard: null, ...REQ, lanePathOverride: P2, resumeSessionId: REQ.sessionId }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...o });
     const [argv, opts] = o.spawnAgent.mock.calls[0];
     expect(argv.slice(0, 3)).toEqual(['exec', 'resume', 'tid-4348']);
     expect(permissionsOf(argv)).toContain(`"${L7}"="write"`);
@@ -807,7 +807,7 @@ describe('cross-locus delivery reaches BOTH lanes (#4348)', () => {
   it('CODEX_PROVIDER: the ONLY writable grant added for the heavy queue is the admission lock folder (operator ruling 2026-10-07)', async () => {
     for (const request of [{ ...REQ }, { ...REQ, lanePathOverride: P2 }, { ...REQ, lanePathOverride: P2, resumeSessionId: REQ.sessionId }]) {
       const o = codexIo();
-      await DELIVERY_AGENT_PROVIDERS.codex.spawn(request, o);
+      await DELIVERY_AGENT_PROVIDERS.codex.spawn({ mode: 'build', launchGuard: null, ...request }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...o });
       const argv = o.spawnAgent.mock.calls[0][0];
       const perms = permissionsOf(argv);
       const writes = [...perms.matchAll(/"([^"]+)"="write"/g)].map((m) => m[1]);
@@ -824,7 +824,7 @@ describe('cross-locus delivery reaches BOTH lanes (#4348)', () => {
 
   it('CLAUDE_RESTRICTED_PROVIDER: LANE=WE lane, IMPL_LANE=impl lane, cwd=impl lane, and --add-dir <WE lane>', async () => {
     const o = claudeIo();
-    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ ...REQ, lanePathOverride: P2 }, o);
+    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ mode: 'build', launchGuard: null, ...REQ, lanePathOverride: P2 }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...o });
     const [argv, opts] = o.spawnAgent.mock.calls[0];
     expect(opts.cwd).toBe(P2);
     expect(opts.env).toMatchObject({ LANE: L7, IMPL_LANE: P2 });
@@ -834,7 +834,7 @@ describe('cross-locus delivery reaches BOTH lanes (#4348)', () => {
 
   it('CLAUDE_RESTRICTED_PROVIDER: the resume keeps the --add-dir grant', async () => {
     const o = claudeIo();
-    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ ...REQ, lanePathOverride: P2, resumeSessionId: REQ.sessionId }, o);
+    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ mode: 'build', launchGuard: null, ...REQ, lanePathOverride: P2, resumeSessionId: REQ.sessionId }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...o });
     const argv = o.spawnAgent.mock.calls[0][0];
     expect(argv).toContain('--resume');
     expect(argv[argv.indexOf('--add-dir') + 1]).toBe(L7);
@@ -842,7 +842,7 @@ describe('cross-locus delivery reaches BOTH lanes (#4348)', () => {
 
   it('a we-locus spawn is unchanged: LANE = WE lane, no IMPL_LANE, no --add-dir, no write grant', async () => {
     const c = claudeIo();
-    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(REQ, c);
+    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ mode: 'build', launchGuard: null, ...REQ }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...c });
     const [cArgv, cOpts] = c.spawnAgent.mock.calls[0];
     expect(cOpts.cwd).toBe(L7);
     expect(cOpts.env.LANE).toBe(L7);
@@ -852,7 +852,7 @@ describe('cross-locus delivery reaches BOTH lanes (#4348)', () => {
     }));
 
     const x = codexIo();
-    await DELIVERY_AGENT_PROVIDERS.codex.spawn(REQ, x);
+    await DELIVERY_AGENT_PROVIDERS.codex.spawn({ mode: 'build', launchGuard: null, ...REQ }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...x });
     const [xArgv, xOpts] = x.spawnAgent.mock.calls[0];
     expect(xOpts.cwd).toBe(L7);
     expect(xOpts.env.LANE).toBe(L7);
@@ -2904,7 +2904,7 @@ describe('runGateWithOneRetry (#3627 bug 2 — threads the injected run through 
 
     // The fresh spawn (mirrors what deliverItem's runAgentToCompletion call does).
     const freshProvider = { spawn: vi.fn() };
-    freshProvider.spawn({ sessionId: claudeSessionId, prompt: 'build it' });
+    freshProvider.spawn({ mode: 'build', launchGuard: null, sessionId: claudeSessionId, prompt: 'build it' });
 
     // The resume, driven through the real runGateWithOneRetry with the SAME id threaded in, as deliverItem
     // threads it (both calls originate from one claudeSessionId minted once at the top of deliverItem).
@@ -4574,7 +4574,7 @@ describe('117 S3a: CLAUDE_RESTRICTED_PROVIDER on the unified worker wrapper', ()
 
   it('knob OFF: no schema flags, the old spawn runs, and nothing is returned (byte-identical)', async () => {
     const io = fakeIo({ workerWrapper: false, runWorkerFn: vi.fn() });
-    const out = await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(REQUEST, io);
+    const out = await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ mode: 'build', launchGuard: null, ...REQUEST }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...io });
     expect(out).toBeUndefined();
     expect(io.runWorkerFn).not.toHaveBeenCalled();
     const [argv] = io.spawnAgent.mock.calls[0];
@@ -4585,7 +4585,7 @@ describe('117 S3a: CLAUDE_RESTRICTED_PROVIDER on the unified worker wrapper', ()
   it('knob ON: runWorker gets role build, launcher claude-p, the 60-minute budget, the delivery env and a schema argv', async () => {
     const runWorkerFn = vi.fn(async () => ({ envelope: { v: 2 } }));
     const io = fakeIo({ workerWrapper: true, runWorkerFn });
-    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(REQUEST, io);
+    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ mode: 'build', launchGuard: null, ...REQUEST }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...io });
     expect(io.spawnAgent).not.toHaveBeenCalled(); // the wrapper owns the process
     const [spec, wio] = runWorkerFn.mock.calls[0];
     expect(spec).toMatchObject({ role: 'build', launcher: 'claude-p', session: 'conveyor-4001', command: 'claude', cwd: '/fake/pool/lane-3', timeoutMs: DELIVERY_AGENT_SPAWN_TIMEOUT_MS, item: '4001' });
@@ -4605,7 +4605,7 @@ describe('117 S3a: CLAUDE_RESTRICTED_PROVIDER on the unified worker wrapper', ()
     process.env.OPERATION_COMPLETIONS_DIR = dir;
     try {
       const io = fakeIo({ workerWrapper: true, spawnAgent: vi.fn(async () => ({ stdout, stderr: '' })) });
-      await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(REQUEST, io);
+      await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ mode: 'build', launchGuard: null, ...REQUEST }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...io });
       expect(io.spawnAgent).toHaveBeenCalledTimes(1);
       const [, opts, spawnIo] = io.spawnAgent.mock.calls[0];
       expect(opts.env.WE_DISPATCH_KIND).toBe('delivery');
@@ -4683,7 +4683,7 @@ describe('117 S3a: CLAUDE_RESTRICTED_PROVIDER on the unified worker wrapper', ()
     const runWorkerFn = vi.fn(async () => ({ envelope: { v: 2 } }));
     const stale = { v: 1, session: 'conveyor-4001', status: 'done', outcome: 'done', updatedAt: '2020-01-01T00:00:00.000Z', filesTouched: ['a.mjs'] };
     vi.mocked(tryReadDeliveryReport).mockReturnValue(stale);
-    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ ...REQUEST, resumeSessionId: 'abc-resume' }, fakeIo({ workerWrapper: true, runWorkerFn }));
+    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ mode: 'build', launchGuard: null, ...REQUEST, resumeSessionId: 'abc-resume' }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...fakeIo({ workerWrapper: true, runWorkerFn }) });
     const [, io] = runWorkerFn.mock.calls[0];
     expect(io.legacyRead()).toBeNull();
     const fresh = { ...stale, updatedAt: new Date(Date.now() + 60_000).toISOString() };
@@ -4691,14 +4691,14 @@ describe('117 S3a: CLAUDE_RESTRICTED_PROVIDER on the unified worker wrapper', ()
     expect(io.legacyRead()).toBe(fresh);
     // a FRESH (non-resume) spawn keeps reading whatever report is there, as before
     vi.mocked(tryReadDeliveryReport).mockReturnValue(stale);
-    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(REQUEST, fakeIo({ workerWrapper: true, runWorkerFn }));
+    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ mode: 'build', launchGuard: null, ...REQUEST }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...fakeIo({ workerWrapper: true, runWorkerFn }) });
     expect(runWorkerFn.mock.calls[1][1].legacyRead()).toBe(stale);
     vi.mocked(tryReadDeliveryReport).mockReset();
   });
 
   it('knob ON, resumed turn: --resume is kept and the schema is on it too (D7: resume with the schema)', async () => {
     const runWorkerFn = vi.fn(async () => ({ envelope: { v: 2 } }));
-    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ ...REQUEST, resumeSessionId: 'abc-resume' }, fakeIo({ workerWrapper: true, runWorkerFn }));
+    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ mode: 'build', launchGuard: null, ...REQUEST, resumeSessionId: 'abc-resume' }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...fakeIo({ workerWrapper: true, runWorkerFn }) });
     const [spec] = runWorkerFn.mock.calls[0];
     expect(spec.argv).toContain('--resume');
     expect(spec.argv).toContain('-p');
@@ -4711,7 +4711,7 @@ describe('117 S3a: CLAUDE_RESTRICTED_PROVIDER on the unified worker wrapper', ()
     process.env.OPERATION_COMPLETIONS_DIR = dir;
     try {
       const stdout = JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'done', structured_output: DONE });
-      const provider = { ...DELIVERY_AGENT_PROVIDERS['claude-restricted'], spawn: (req) => DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(req, fakeIo({ workerWrapper: true, spawnAgent: vi.fn(async () => ({ stdout, stderr: '' })) })) };
+      const provider = { ...DELIVERY_AGENT_PROVIDERS['claude-restricted'], spawn: (req) => DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ mode: 'build', launchGuard: null, ...req }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...fakeIo({ workerWrapper: true, spawnAgent: vi.fn(async () => ({ stdout, stderr: '' })) }) }) };
       const readReport = vi.fn(() => { throw new Error('the delivery report must not be read in wrapped mode'); });
       const report = await runAgentToCompletion(
         { item: '4001', sessionSlug: 'conveyor-4001', lane: 3, attemptTag: '', provider, claudeSessionId: REQUEST.sessionId },
@@ -4735,20 +4735,20 @@ describe('117 S3a: CLAUDE_RESTRICTED_PROVIDER on the unified worker wrapper', ()
       const usage = { userCPUTime: 7, systemCPUTime: 3 };
       const stdout = JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'done', structured_output: DONE });
       const ok = fakeIo({ workerWrapper: true, recordCpu: vi.fn(), persistFailure: vi.fn(), spawnAgent: vi.fn(async () => ({ stdout, stderr: '', resourceUsage: usage })) });
-      await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(REQUEST, ok);
+      await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ mode: 'build', launchGuard: null, ...REQUEST }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...ok });
       expect(ok.recordCpu).toHaveBeenCalledWith(usage);
       expect(ok.persistFailure).not.toHaveBeenCalled();
 
       const boom = Object.assign(new Error('Command failed'), { status: 3, stdout: 'out', stderr: 'err', resourceUsage: usage });
       const bad = fakeIo({ workerWrapper: true, recordCpu: vi.fn(), persistFailure: vi.fn(), spawnAgent: vi.fn(async () => { throw boom; }) });
-      await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ ...REQUEST, sessionSlug: 'conveyor-4002' }, bad);
+      await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ mode: 'build', launchGuard: null, ...REQUEST, sessionSlug: 'conveyor-4002' }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...bad });
       expect(bad.recordCpu).toHaveBeenCalledWith(usage);
       expect(bad.persistFailure).toHaveBeenCalledWith('conveyor-4002', boom, { resumeSessionId: null });
 
       // runWorker itself rejecting (a record it could not write) is also a failed turn: same telemetry + capture, then the error propagates
       const fault = Object.assign(new Error('lock timeout'), { resourceUsage: usage });
       const rej = fakeIo({ workerWrapper: true, recordCpu: vi.fn(), persistFailure: vi.fn(), runWorkerFn: vi.fn(async () => { throw fault; }) });
-      await expect(DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(REQUEST, rej)).rejects.toBe(fault);
+      await expect(DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ mode: 'build', launchGuard: null, ...REQUEST }, { readSavedLaunch: () => ({ mode: 'build', launchGuard: null }), saveEvidence: () => {}, ...rej })).rejects.toBe(fault);
       expect(rej.recordCpu).toHaveBeenCalledWith(usage);
       expect(rej.persistFailure).toHaveBeenCalledWith('conveyor-4001', fault, { resumeSessionId: null });
     } finally {

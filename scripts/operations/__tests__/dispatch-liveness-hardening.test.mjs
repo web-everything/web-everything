@@ -388,7 +388,7 @@ describe('hardening 6: a `--bg` handle is read back off stdout (#3331)', () => {
 
   it('defaultClaudeProvider answers with the PRINTED id, never the minted one', () => {
     const handle = defaultClaudeProvider(
-      { sessionId: 'minted-1111-2222-3333-444444444444', cwd: '/repo', prompt: '# go', sessionSlug: 'conveyor-3037' },
+      { mode: 'ordinary', launchGuard: null, sessionId: 'minted-1111-2222-3333-444444444444', cwd: '/repo', prompt: '# go', sessionSlug: 'conveyor-3037' },
       { spawnAgent: () => BANNER('fe8b4df8', 'conveyor-3037') },
     );
     expect(handle).toBe('fe8b4df8');
@@ -399,7 +399,7 @@ describe('hardening 6: a `--bg` handle is read back off stdout (#3331)', () => {
     // The fallback is the PRE-#3331 behaviour on purpose: an unparseable spawn must still record something
     // `in-flight`, because a null handle lands in the executor's `unknown` bucket that only a person can close.
     expect(defaultClaudeProvider(
-      { sessionId: 'minted-z9', cwd: '/repo', prompt: '# go', sessionSlug: 'conveyor-3037' },
+      { mode: 'ordinary', launchGuard: null, sessionId: 'minted-z9', cwd: '/repo', prompt: '# go', sessionSlug: 'conveyor-3037' },
       { spawnAgent: () => '' },
     )).toBe('minted-z9');
   });

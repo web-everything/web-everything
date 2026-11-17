@@ -372,13 +372,13 @@ describe('defaultSpawnCodexAgent — the blocking primitive', () => {
   // (i.e. /dev/null, immediate EOF) is the only thing standing between this provider and a 60-minute hang.
   it('hands the child an IGNORED stdin — the stdin-trap avoidance the positional prompt depends on', async () => {
     const spawnFn = vi.fn(() => fakeChildProcess({}));
-    await defaultSpawnCodexAgent(['exec', 'x'], { cwd: LANE }, { spawnFn });
+    await defaultSpawnCodexAgent(['exec', 'x'], { mode: 'ordinary', launchGuard: null, cwd: LANE }, { spawnFn });
     expect(spawnFn.mock.calls[0][2].stdio).toEqual(['ignore', 'pipe', 'pipe']);
   });
 
   it('calls the `codex` binary and returns the child\'s stdout (the thread id lives nowhere else)', async () => {
     const spawnFn = vi.fn(() => fakeChildProcess({ stdout: 'STDOUT-BACK' }));
-    const result = await defaultSpawnCodexAgent(['exec'], {}, { spawnFn });
+    const result = await defaultSpawnCodexAgent(['exec'], { mode: 'ordinary', launchGuard: null,}, { spawnFn });
     expect(result.stdout).toBe('STDOUT-BACK');
     expect(spawnFn.mock.calls[0][0]).toBe(CODEX_CLI);
     expect(CODEX_CLI).toBe('codex');
@@ -391,7 +391,7 @@ describe('defaultSpawnCodexAgent — the blocking primitive', () => {
   // a real `getrusage`-shaped `resourceUsage` coming back out, proving the whole chain is wired end to end.
   it('keeps SIGKILL reclamation and a caller-supplied timeout, mirroring dispatch-lane-io.mjs#spawnAgentToCompletion', async () => {
     const spawnFn = vi.fn(() => fakeChildProcess({ resourceUsage: { userCPUTime: 4200, systemCPUTime: 800 } }));
-    const result = await defaultSpawnCodexAgent(['exec'], { timeout: 1234 }, { spawnFn });
+    const result = await defaultSpawnCodexAgent(['exec'], { mode: 'ordinary', launchGuard: null, timeout: 1234 }, { spawnFn });
     // `timeout`/`killSignal`/`encoding`/`maxBuffer` are extracted by `spawnToCompletion` before the raw
     // `spawn()` call, so they never appear in `spawnFn`'s own opts — only genuine child-process options
     // (`cwd`, `env`, `stdio`) do. `stdio` is the one this file's own defaults set unconditionally.

@@ -1,3 +1,4 @@
+import { buildConflictRearmComment } from '../rearm-review.mjs';
 /**
  * @file scripts/conveyor/__tests__/reconcile-core.test.mjs
  * @description Pins the resident reconcile pass (WE #3296) — the dispatch and, mostly, its FOUR REFUSALS.
@@ -29,6 +30,7 @@
  *   say when.
  */
 import { describe, it, expect } from 'vitest';
+import { OPERATOR_LOGINS } from '../../lib/marker-authorship.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER, buildFixBeginComment, buildFixEndComment } from '../fix-procedure.mjs';
 import {
   staleRequiredBaseRepair, planReconcile as planReconcileCore, fixWaitingSince, countFindings, bindAgents, assessLiveness, isAwaitingPermission, startedAtMs, releasedFixClaim, isReleasedClaimSession,
@@ -4701,4 +4703,69 @@ describe('R359 early start shadow refusal diagnostics (xtxt36v / xrz0ezn)', () =
     expect(off.refusals[0]).not.toHaveProperty('earlyStartShadow');
     expect(off.dispatch).toEqual(baseline.dispatch);
   });
+});
+
+
+describe('accepted main-base conflict-rebase hook', () => {
+  const mainSha = 'b'.repeat(40);
+  const accepted = over => pr1563({ baseRefName: 'main', mergeStateStatus: 'DIRTY',
+    labels: lbl('review:accepted', 'red-team:clear', 'status:ready-to-merge'), files: [{ path: 'scripts/example.mjs' }], statusCheckRollup: [], comments: [], ...over });
+  const run = over => planReconcile({ prs: [accepted(over)], agents: [], now: NOW, mainSha });
+  it('dispatches exactly one conflict repair for the accepted DIRTY head without CI', () => {
+    const result = run();
+    expect(result.refusals).toEqual([]);
+    expect(result.dispatch).toMatchObject([{ kind: 'fix', isConflict: true, mode: 'conflict-rebase' }]);
+    expect(result.dispatch).toHaveLength(1);
+    expect(result.dispatch[0].labels).toContain('review:accepted');
+  });
+  it.each(['docs/agent/platform-decisions.md', 'docs/agent/conflict-statute.md', 'scripts/lib/gate-config.mjs'])('leaves a PR touching %s to the statute watcher even alongside ordinary files', path => {
+    const result = run({ files: [{ path: 'scripts/example.mjs' }, { path }] });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toMatchObject([{ kind: 'owed-elsewhere', why: 'the branch needs a rebase before it can merge' }]);
+  });
+  it.each([null, [{}], Array.from({ length: 100 }, (_, i) => ({ path: `scripts/file${i}.mjs` }))])('leaves incomplete or capped file evidence to the watcher (case %#)', files => {
+    const result = run({ files });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toMatchObject([{ kind: 'owed-elsewhere', why: 'the branch needs a rebase before it can merge' }]);
+  });
+  it('dispatches one repair for mergeable CONFLICTING without DIRTY', () => {
+    expect(run({ mergeStateStatus: 'UNKNOWN', mergeable: 'CONFLICTING' }).dispatch)
+      .toMatchObject([{ mode: 'conflict-rebase' }]);
+  });
+  it('suppresses a completed trusted head even when main advances', () => {
+    const head = 'a'.repeat(40);
+    const result = run({ headRefOid: head, comments: [{ author: AUTOMATION,
+      body: buildConflictRearmComment({ actor: `accepted-conflict-rebase:${head}@${'c'.repeat(40)}`, decision: { keepsHuman: false }, mainRef: 'main', mainSha: 'c'.repeat(40) }) }] });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals[0].why).toContain('already completed for this head');
+  });
+  it('honours the live fixer claim and draft/referral guards', () => {
+    for (const over of [{ fixClaim: { who: 'fixer' } }, { isDraft: true }, { referralHold: { why: 'ruling' } }]) {
+      expect(run(over).dispatch).toEqual([]);
+    }
+  });
+  it('holds accepted conflicts with unknown claim evidence without dispatch', () => {
+    const result = run({ fixClaimUnknown: true });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals[0].why).toContain('claim evidence unknown');
+  });
+  it('honours a head-bound stand-down', () => {
+    const result = run({ comments: [{ author: AUTOMATION, body: STAND_DOWN_MARKER + '\n\nreason: conflict' }] });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals[0].kind).toBe('stood-down');
+  });
+  it('uses the existing cap refusal with conflict-rebase capKind', () => {
+    const comments = Array.from({ length: CONFLICT_FIX_ROUND_CAP }, () => ({ body: CONFLICT_FIX_COMMENT_MARKER, author: AUTOMATION }));
+    expect(run({ comments }).refusals).toMatchObject([{ kind: 'cap-exhausted', capKind: 'conflict-rebase' }]);
+  });
+});
+
+it('accepted conflict repair remains owed after a trusted human clearance of the old head', () => {
+  const oldHead = 'a'.repeat(40);
+  const operator = OPERATOR_LOGINS[0];
+  const result = planReconcile({ agents: [], now: NOW, mainSha: 'b'.repeat(40), prs: [pr1563({
+    headRefOid: oldHead, baseRefName: 'main', mergeStateStatus: 'DIRTY', labels: lbl('review:accepted'), files: ['scripts/example.mjs'],
+    comments: [{ author: { login: operator }, body: `${buildReviewedShaMarker(oldHead)}\n${buildClearedHumanMarker(operator)}` }],
+  })] });
+  expect(result.dispatch).toMatchObject([{ mode: 'conflict-rebase' }]);
 });

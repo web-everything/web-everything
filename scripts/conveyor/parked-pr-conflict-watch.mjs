@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { readLiveFixClaimStrict } from './fix-procedure.mjs';
+import { isAcceptedConflictRebase, hasReconcileConflictRebaseFiles, isPendingConflictRebase, hasConflictRebaseReceipt } from './accepted-conflict-rebase.mjs';
 import { buildConflictFindingBody, defaultPostConflictFinding } from '../lib/conflict-finding.mjs';
 export { buildConflictFindingBody, defaultPostConflictFinding };
 /**
@@ -220,7 +222,7 @@ export const QUEUED_CONFLICT_GRACE_MS = 30 * 60 * 1000;
 export function isQueuedConflictTarget(pr) {
   if (String(pr?.mergeable || '').toUpperCase() !== 'CONFLICTING') return false;
   if (hasUnclearedReviewLabel(pr?.labels, { allowPending: false })) return false; // the parked path owns it
-  return hasReviewLabel(pr?.labels, REVIEW_LABELS.accepted) || hasReviewLabel(pr?.labels, 'ready-to-merge');
+  return hasReviewLabel(pr?.labels, REVIEW_LABELS.accepted) || hasReviewLabel(pr?.labels, 'ready-to-merge') || hasReviewLabel(pr?.labels, 'status:ready-to-merge');
 }
 
 /**
@@ -1285,12 +1287,12 @@ function classifyStatuteConflict(files, {
 export function defaultListParkedPrs({ exec = execFileSyncThrottled, repo = null } = {}) {
   // #gh-graphql-budget — read the host-shared open-PR snapshot (one right-sized list per repo per TTL for the
   // whole fleet) instead of a private `gh pr list`; null = not applicable (tests, cwd repo) → the direct read below.
-  if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: 'number,headRefName,baseRefName,mergeable,mergeStateStatus,labels,files', allowDeferred: true }); if (shared) return shared; }
+  if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: 'number,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,labels,files', allowDeferred: true }); if (shared) return shared; }
   // `baseRefName` (#3383) — the queued-grace routing below reads it to tell a STACKED PR (base isn't `main`, the
   // drain will never land it regardless of labels) apart from an ordinary conflict against `main`; costs nothing
   // extra since it comes off the same `gh pr list` call this pass already makes.
   const argv = ['pr', 'list', '--state', 'open', '--limit', String(PR_LIST_LIMIT),
-    '--json', 'number,headRefName,baseRefName,mergeable,mergeStateStatus,labels,files'];
+    '--json', 'number,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,labels,files'];
   if (repo) argv.push('--repo', repo);
   // #x5n4zn3 — was bare (no timeout).
   const out = exec('gh', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', throttle: { deferrable: true } });
@@ -1361,6 +1363,7 @@ export function defaultPostConflictRearm({ pr, repo, exec = execFileSync }) {
  * @returns {Array<{num:number, isConflicting:boolean, add:string|null, remove:string[], newlyDetected:boolean, newlyResolved?:boolean, commented:boolean, error?:string, routedTo?:string, supersededStandDown?:boolean, conflictDisposition?:string}>}
  */
 export function watchParkedPrConflicts({
+  defaultBranch = 'main',
   repo = null, listPrs = defaultListParkedPrs, provider = createGhProvider(), dryRun = false,
   inCardGroupFn = readInCardGroup, // xym8nt4 — open card-group members are the drain grouping's to handle
   cardGroupStateUnreadable = () => readCardGroupStateUnreadable(), // membership unknown → hold (fail closed)
@@ -1381,6 +1384,9 @@ export function watchParkedPrConflicts({
   computeConflictingPaths = defaultConflictingFilePaths,
   attemptMechanicalRebase = defaultAttemptUnownedConflictRebase,
   listAgents = defaultListAgents,
+  // Inject for hermetic callers; the live reader validates constellation repos and reads the claim store.
+  // An unreadable claim must retain the hold below, never be treated as an absent claim.
+  readFixClaim = readLiveFixClaimStrict,
   now = Date.now(),
   queueScope = {},
   // Card xkugvzd — the declared setting (`conflict-reassert-settings.json`, env `WE_CONFLICT_REASSERT_REVIEW_HUMAN`).
@@ -1468,6 +1474,69 @@ export function watchParkedPrConflicts({
       && hasReviewLabel(pr?.labels, CONFLICT_LABEL) && !hasReviewLabel(pr?.labels, REVIEW_LABELS.human);
     if (!plan.add && plan.remove.length === 0 && !graceDue && !recheckCandidate && !idleConflictBounce && !sameLineRecovery) continue;
     const entry = { num: pr?.number, isConflicting, ...plan, commented: false };
+    let recoveryComments = null;
+    // Demotion does not start a second episode. Keep ordinary pending-conflict routing
+    // when neither a live claim nor a trusted receipt for this head exists.
+    if (isPendingConflictRebase(pr, defaultBranch)) {
+      try {
+        if (readFixClaim({ repo: resolvedRepo, pr: pr.number, nowMs: now })) {
+          entry.routedTo = 'held (live fix claim)';
+          results.push(entry);
+          continue;
+        }
+        const comments = listPrComments({ number: pr.number, repo: resolvedRepo });
+        if (!Array.isArray(comments)) throw new Error('comments unreadable');
+        recoveryComments = comments;
+        if (hasConflictRebaseReceipt({ ...pr, comments })) {
+          entry.routedTo = 'held (conflict-rebase already admitted for this head — refresh merge evidence or ask a person to inspect)';
+          results.push(entry);
+          continue;
+        }
+      } catch {
+        process.stderr.write('parked-pr-conflict-watch: pending conflict held — claim or receipt evidence unreadable; retry next sweep\n');
+        continue;
+      }
+    }
+    // Reconcile owns accepted main-base conflicts, including already-labelled retries and dry runs.
+    if (isAcceptedConflictRebase(pr, defaultBranch)) {
+      // A live fixer owns all mutations, including a same-line finding that would strip approval.
+      let claim;
+      try { claim = readFixClaim({ repo: resolvedRepo, pr: pr.number, nowMs: now }); }
+      catch { entry.routedTo = 'held (fix claim unreadable — retry next sweep)'; results.push(entry); continue; }
+      if (claim) {
+        entry.routedTo = 'held (live fix claim)';
+        results.push(entry);
+        continue;
+      }
+      let classification;
+      try {
+        let files = pr.files;
+        if (!Array.isArray(files) || files.length >= GH_FILES_GRAPHQL_CAP || graceDue) {
+          files = listPrFiles({ number: pr.number, repo: resolvedRepo });
+        }
+        if (!Array.isArray(files)) throw new Error('files unreadable');
+        let conflictingPaths = null;
+        try { conflictingPaths = computeConflictingPaths({ pr, repo: resolvedRepo }); } catch { /* whole-file check */ }
+        classification = classifyStatuteConflict(files, {
+          number: pr.number, repo: resolvedRepo, listPrPatches, listMainStatutePatches, conflictingPaths,
+        });
+      } catch {
+        entry.routedTo = 'held (statute classification unreadable — retry next sweep)';
+        results.push(entry);
+        continue;
+      }
+      const standDown = classification.isStatuteTier && !classification.appendOnlyStatute
+        && !classification.reviewHumanFixable;
+      // Deferral must imply reconcile admission on the SAME whole-PR snapshot.
+      // Precise conflict narrowing and statute exceptions remain watcher-owned.
+      if (!standDown && hasReconcileConflictRebaseFiles(pr)) {
+        entry.routedTo = 'deferred-to-reconcile (accepted conflict-rebase — review labels untouched)';
+        results.push(entry);
+        continue;
+      }
+      // Whole-PR statute files and incomplete snapshots retain the existing watcher routing below.
+    }
+
     // The #2793 idle re-assert, shared with card xkugvzd's `review:human` case (`variant` only names the route).
     // Same round cap, same once-per-round guard, same `postFinding` (which keeps `review:human`). Pushes `entry`.
     const reassertIdleConflict = (comments, variant) => {
@@ -1517,10 +1586,9 @@ export function watchParkedPrConflicts({
         results.push(entry);
       }
     };
-    let recoveryComments = null;
     if (sameLineRecovery) {
       try {
-        recoveryComments = listPrComments({ number: pr?.number, repo });
+        recoveryComments ??= listPrComments({ number: pr?.number, repo });
         if (!Array.isArray(recoveryComments)) continue;
         // A historical supersede finishes recovery only; idle retries and expired grace still own routing.
         if (findWatcherStandDownComment(recoveryComments) && !isWatcherMarkerAlreadySuperseded(recoveryComments)) {

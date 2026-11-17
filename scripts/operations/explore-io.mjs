@@ -1,3 +1,5 @@
+import { assertLaunchDescriptor } from '../conveyor/conflict-rebase-launch-gate.mjs';
+import { execGuardedFixer } from './fixer-process.mjs';
 /**
  * @file scripts/operations/explore-io.mjs
  * @description THE IO SHELL of the `explore` declaration (#3150, under epic #3029) — the SINK that starts one
@@ -441,7 +443,7 @@ export function isPreSpawnRefusal(error) {
 export function createExploreSinks({
   root = REPO_ROOT,
   exec = execFileSync,
-  spawnAgent = (argv, opts) => defaultSpawnAgent(argv, opts, { exec }),
+  spawnAgent = (argv, opts) => defaultSpawnAgent(argv, { ...opts, mode: opts.mode, launchGuard: opts.launchGuard }, { exec }),
   provider = (request) => defaultClaudeProvider(request, { spawnAgent }),
   scaffoldItem = (args) => defaultScaffoldItem(args, { exec, root }),
   writeText = (path, text) => writeFileSync(path, text, 'utf8'),
@@ -522,9 +524,10 @@ export function createExploreSinks({
  * `defaultSpawnAgent`).
  */
 export function defaultSpawnAgent(argv, opts = {}, { exec = execFileSync } = {}) {
-  return exec('claude', argv, {
-    encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: SPAWN_TIMEOUT_MS, killSignal: 'SIGKILL', ...opts,
-  });
+  assertLaunchDescriptor(opts);
+  return execGuardedFixer('claude', argv, {
+    encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: SPAWN_TIMEOUT_MS, killSignal: 'SIGKILL', ...opts, mode: opts.mode, launchGuard: opts.launchGuard,
+  }, { exec });
 }
 
 /**
@@ -537,7 +540,7 @@ export function defaultSpawnAgent(argv, opts = {}, { exec = execFileSync } = {})
  * @param {{spawnAgent?: Function}} [io]
  * @returns {string}
  */
-export function defaultClaudeProvider(request, { spawnAgent = (argv, opts) => defaultSpawnAgent(argv, opts) } = {}) {
+export function defaultClaudeProvider(request, { spawnAgent = (argv, opts) => defaultSpawnAgent(argv, { ...opts, mode: opts.mode, launchGuard: opts.launchGuard }) } = {}) {
   const argv = buildInvestigatorArgv({
     sessionId: request.sessionId,
     runId: request.runId,
@@ -545,7 +548,7 @@ export function defaultClaudeProvider(request, { spawnAgent = (argv, opts) => de
     prompt: request.prompt,
     extraArgs: request.extraArgs,
   });
-  spawnAgent(argv, { cwd: request.cwd });
+  spawnAgent(argv, { cwd: request.cwd, mode: 'investigate', launchGuard: null });
   return request.sessionId;
 }
 

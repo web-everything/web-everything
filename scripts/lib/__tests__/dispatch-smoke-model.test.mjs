@@ -30,11 +30,12 @@ describe('overlay smoke model pin', () => {
       export const dispatchSessionCwd = () => ${JSON.stringify(tree)};
       export const ensureDispatchSessionCwd = p => p;
       export const resolveGhShimSettingsEnv = () => ({});
-      export const defaultClaudeProvider = request => { console.log(JSON.stringify(request.table)); return 'fake'; };
+      export const defaultClaudeProvider = request => { console.log(JSON.stringify({ ...request.table, mode: request.mode, launchGuard: request.launchGuard })); return 'fake'; };
     `);
     writeFileSync(join(tree, 'scripts/lib/dispatch-bg-isolation.mjs'), 'export const isolateDispatchSession = () => ({});');
     const stdout = execFileSync(process.execPath, [resolve('scripts/lib/dispatch-smoke-launch.mjs'),
       tree, 'fix-999998', 'fix', '999998', 'fake-id', 'smoke', DEFAULT_ROUTING_POLICY.aliases.claude.haiku], { encoding: 'utf8' });
     expect(JSON.parse(stdout.trim().split('\n')[0])).toMatchObject({ model: DEFAULT_ROUTING_POLICY.aliases.claude.haiku });
+    expect(JSON.parse(stdout.trim().split('\n')[0])).toMatchObject({ mode: 'fix', launchGuard: null });
   });
 });

@@ -33,7 +33,7 @@ import { describe, it, expect } from 'vitest';
 
 describe('group member launch capability contract', () => {
   it.each(LAUNCH_KINDS)('%s direct agent provider refuses group members', launchKind => {
-    expect(() => defaultClaudeProvider({ launchKind, groupMembers: ['124'] }, {
+    expect(() => defaultClaudeProvider({ mode: 'ordinary', launchGuard: null, launchKind, groupMembers: ['124'] }, {
       spawnAgent: () => { throw new Error('must not spawn'); },
     })).toThrow(/group/i);
   });

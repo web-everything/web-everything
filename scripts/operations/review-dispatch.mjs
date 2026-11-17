@@ -680,7 +680,7 @@ export function dispatchReview({
   // only so an existing caller reading that field still gets the old, documented shape.
   if (wrapReview) {
     const launched = launchWrapped({
-      role: 'review', session: planned.sessionSlug, bgArgv: argv, cwd: sessionCwd, env: workerSpawnEnv(), pr: planned.pr,
+      mode: 'review', launchGuard: null, role: 'review', session: planned.sessionSlug, bgArgv: argv, cwd: sessionCwd, env: workerSpawnEnv(), pr: planned.pr,
       model: argv[argv.indexOf('--model') + 1] ?? null, sessionId,
     });
     return {
@@ -688,7 +688,7 @@ export function dispatchReview({
       unknownTokens, judgeProvider, wrapped: true,
     };
   }
-  const stdout = String(spawnAgent(argv, { cwd: sessionCwd }) ?? '');
+  const stdout = String(spawnAgent(argv, { cwd: sessionCwd, mode: 'review', launchGuard: null }) ?? '');
   const agentId = parseBackgroundedId(stdout);
   return {
     sessionId, agentId, sessionSlug: planned.sessionSlug, pr: planned.pr, repo: planned.repo, repoKey: planned.repoKey, prompt,

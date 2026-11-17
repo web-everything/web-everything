@@ -55,7 +55,7 @@ export default {
         seen.push(rec);
         const settingsOf = (argv) => JSON.parse(argv[argv.indexOf('--settings') + 1]).env?.[ROLE];
         return io.defaultClaudeProvider(request, {
-          spawnAgent: (argv, opts) => io.defaultSpawnAgent(argv, opts, {
+          spawnAgent: (argv, opts) => io.defaultSpawnAgent(argv, { ...opts, mode: opts.mode, launchGuard: opts.launchGuard }, {
             exec: (_c, args, options) => { rec.argv = settingsOf(args); rec.spawn = options.env[ROLE]; return 'backgrounded 22222222-2222-4222-8222-000000000000'; },
             grantTrust: () => {},
           }),

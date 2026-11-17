@@ -45,7 +45,7 @@ describe('#x2psfwz — defaultClaudeProvider resets a PR_KIND session\'s complet
     expect(existsSync(completionPath('review-1234', dir))).toBe(true);
 
     const handle = defaultClaudeProvider(
-      { sessionId: 'minted-1', cwd: '/repo', prompt: '# go', sessionSlug: 'review-1234' },
+      { mode: 'ordinary', launchGuard: null, sessionId: 'minted-1', cwd: '/repo', prompt: '# go', sessionSlug: 'review-1234' },
       { spawnAgent: () => BANNER('abcd1234', 'review-1234') },
     );
 
@@ -57,7 +57,7 @@ describe('#x2psfwz — defaultClaudeProvider resets a PR_KIND session\'s complet
   it('every PR_KIND resets (review/fix/ci-heal/inspect), never an item-kind session (conveyor-/prepare- have no reuse problem to begin with)', () => {
     for (const [slug, kind] of [['fix-99', 'fix'], ['ci-heal-99', 'fix'], ['inspect-99', 'inspect']]) {
       writeCompletion({ ...newCompletionRecord({ session: slug, kind, pr: 99, now: () => '2026-09-24T10:00:00Z' }), status: 'done' }, dir);
-      defaultClaudeProvider({ sessionId: 'm', cwd: '/repo', prompt: '# go', sessionSlug: slug }, { spawnAgent: () => BANNER('x', slug) });
+      defaultClaudeProvider({ mode: 'ordinary', launchGuard: null, sessionId: 'm', cwd: '/repo', prompt: '# go', sessionSlug: slug }, { spawnAgent: () => BANNER('x', slug) });
       expect(existsSync(completionPath(slug, dir))).toBe(false);
     }
 
@@ -65,13 +65,13 @@ describe('#x2psfwz — defaultClaudeProvider resets a PR_KIND session\'s complet
     // retries), and completion records are only ever written for review/fix/inspect kinds anyway (#3436) — but
     // the guard must still leave any (foreign/unrelated) file alone rather than assuming it may always delete.
     writeCompletion({ ...newCompletionRecord({ session: 'conveyor-500', kind: 'review', pr: null, item: 500, now: () => '2026-09-24T10:00:00Z' }), status: 'done' }, dir);
-    defaultClaudeProvider({ sessionId: 'm', cwd: '/repo', prompt: '# go', sessionSlug: 'conveyor-500' }, { spawnAgent: () => BANNER('y', 'conveyor-500') });
+    defaultClaudeProvider({ mode: 'ordinary', launchGuard: null, sessionId: 'm', cwd: '/repo', prompt: '# go', sessionSlug: 'conveyor-500' }, { spawnAgent: () => BANNER('y', 'conveyor-500') });
     expect(existsSync(completionPath('conveyor-500', dir))).toBe(true);
   });
 
   it('no existing record for this name → still spawns cleanly, no error (the common, non-reuse case)', () => {
     expect(() =>
-      defaultClaudeProvider({ sessionId: 'm', cwd: '/repo', prompt: '# go', sessionSlug: 'review-777' }, { spawnAgent: () => BANNER('z', 'review-777') }),
+      defaultClaudeProvider({ mode: 'ordinary', launchGuard: null, sessionId: 'm', cwd: '/repo', prompt: '# go', sessionSlug: 'review-777' }, { spawnAgent: () => BANNER('z', 'review-777') }),
     ).not.toThrow();
   });
 });

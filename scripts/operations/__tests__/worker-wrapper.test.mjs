@@ -11,6 +11,7 @@ import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { writeStoredAwaitVerify, clearStoredAwaitVerify, awaitVerifyStoreKey } from '../../conveyor/await-verify.mjs';
+import { assertFixerLaunch, launchGuardFor } from '../../conveyor/conflict-rebase-launch-gate.mjs';
 import { validateCompletionRecord } from '../completion-record.mjs';
 import { tryReadCompletion, writeCompletion } from '../completion-store.mjs';
 import { WORKER_MARKER_ENV, WORKER_MARKER_VALUE } from '../session-role.mjs';
@@ -34,7 +35,7 @@ const printing = (text) => ['-e', `process.stdout.write(${JSON.stringify(text)})
 
 function spec(over = {}, dir = tmp()) {
   return {
-    role: 'build', launcher: 'claude-p', session: 'build-4001', command: process.execPath, argv: printing(claudeStdout(DONE)), model: 'sonnet', item: 4001,
+    mode: 'build', launchGuard: null, role: 'build', launcher: 'claude-p', session: 'build-4001', command: process.execPath, argv: printing(claudeStdout(DONE)), model: 'sonnet', item: 4001,
     timeoutMs: 20_000, completionsDir: dir, draftsDir: join(dir, 'drafts'), postmortemMode: 'draft', ...over,
   };
 }
@@ -133,7 +134,7 @@ describe('runWorker: the job record and the result channels', () => {
   it('a blocked tooling-defect makes ONE deduped draft under postmortem draft, and none under off', async () => {
     const dir = tmp();
     const s = spec({ argv: printing(claudeStdout(BLOCKED('tooling-defect'))) }, dir);
-    await runWorker(s); await runWorker({ ...s, session: 'build-4002', item: 4002 });
+    await runWorker(s); await runWorker({ mode: 'ordinary', launchGuard: null, ...s, session: 'build-4002', item: 4002 });
     expect(listDraftKeys(s.draftsDir)).toHaveLength(1);
     const off = spec({ argv: printing(claudeStdout(BLOCKED('tooling-defect'))), postmortemMode: 'off', draftsDir: join(dir, 'd2') }, dir);
     expect((await runWorker(off)).action).toMatchObject({ type: 'product-fix-draft', mode: 'off' });
@@ -465,7 +466,7 @@ describe('runWorker: the job record and the result channels', () => {
   });
 
   it('rejects a bad spec instead of writing a record', async () => {
-    await expect(runWorker({ role: 'build' })).rejects.toThrow(/spec\.launcher/);
+    await expect(runWorker({ mode: 'ordinary', launchGuard: null, role: 'build' })).rejects.toThrow(/spec\.launcher/);
   });
 });
 
@@ -573,6 +574,39 @@ describe('wrapped verification waits', () => {
     };
     return { s, io, calls, writes, drafts, heads, advance: (delay) => { ms += delay; } };
   };
+  it.each(['moved head', 'new hold'])('verification resume re-gates and refuses %s before creating another child', async change => {
+    const h = harness();
+    const head = 'a'.repeat(40);
+    h.s.mode = 'conflict-rebase';
+    h.s.launchGuard = launchGuardFor({ mode: h.s.mode, pr: 7, headRefOid: head,
+      conflictRebase: { oldHead: head, defaultBranch: 'main' } }, { repo: 'o/r' });
+    let live = { headRefOid: head, labels: ['review:pending'], state: 'OPEN', isDraft: false,
+      baseRefName: 'main', mergeable: 'CONFLICTING' };
+    h.io.launchGate = vi.fn(request => assertFixerLaunch(request, { readLive: () => live }));
+    const spawn = vi.fn(h.io.spawnFn);
+    h.io.spawnFn = spawn;
+    const sleep = h.io.sleep;
+    h.io.sleep = async ms => {
+      await sleep(ms);
+      live = change === 'moved head' ? { ...live, headRefOid: 'b'.repeat(40) }
+        : { ...live, labels: ['review:pending', 'review:held-mechanical'] };
+    };
+    const out = await runWorker(h.s, h.io);
+    expect(h.io.launchGate).toHaveBeenCalledTimes(2);
+    expect(spawn).toHaveBeenCalledOnce(); // zero resume children
+    expect(out.envelope.outcome).not.toBe('done');
+    expect(out.failure).toMatchObject({ kind: 'conflict-rebase-launch-refused' });
+    expect(out.envelope).toMatchObject({ mode: h.s.mode, launchGuard: h.s.launchGuard });
+  });
+  it('a conflict wrapper with no saved guard refuses its initial child', async () => {
+    const h = harness();
+    h.s.mode = 'conflict-rebase';
+    const spawn = vi.fn(h.io.spawnFn);
+    h.io.spawnFn = spawn;
+    const out = await runWorker(h.s, h.io);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(out.envelope.outcome).not.toBe('done');
+  });
   it('keeps its own live pid while waiting, resumes the same session, and finalizes only the last output', async () => {
     const h = harness();
     const out = await runWorker(h.s, h.io);

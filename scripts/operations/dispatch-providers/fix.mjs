@@ -122,6 +122,8 @@ export function fixDetachedProvider(request, {
   if (request.policyRoute?.effort) argv.push(`--effort=${request.policyRoute.effort}`);
   if (request.policyRoute?.model) argv.push(`--model=${request.policyRoute.model}`);
   // Card 87 follow-up — a BORROWED fix hands its already-filled brief and lane facts to the launcher (see `fix-run.mjs`).
+  argv.push(`--mode=${request.mode ?? (request.launchKind === 'ci-heal' ? 'ci-heal' : 'ordinary')}`);
+  argv.push(`--launch-guard=${JSON.stringify(request.launchGuard ?? null)}`);
   if (request.promptFile) argv.push(`--prompt-file=${request.promptFile}`);
   if (request.ref) argv.push(`--ref=${request.ref}`);
   if (request.mergeOnto) argv.push(`--merge-onto=${request.mergeOnto}`);

@@ -1,3 +1,4 @@
+import { assertLaunchDescriptor } from '../conveyor/conflict-rebase-launch-gate.mjs';
 /**
  * @file scripts/operations/codex-delivery-provider.mjs
  * @description The REAL Codex implementation of `we:scripts/operations/deliver-item-wrapper.mjs`'s
@@ -122,10 +123,10 @@
  * `buildCodexDeliveryArgv`, `parseCodexThreadId` and `assertDenyPathsUsable` are PURE — no fs, no spawn, no
  * clock — so the argv, which IS the contract with the CLI, is assertable by a test with no subprocess at all.
  */
+import { spawnFixerToCompletion } from './fixer-process.mjs';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
-import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
 import {
   CODEX_EFFORT_MAP, CODEX_MODEL, assertCodexModel, resolveCodexEffort,
 } from '../lib/codex-model-routing.mjs';
@@ -452,13 +453,14 @@ export function readCodexThreadId(sessionSlug, repoRoot = REPO_ROOT) {
  * note. `killSignal: 'SIGKILL'` mirrors `dispatch-lane-io.mjs#spawnAgentToCompletion`: a wedged agent is still
  * reclaimed when the caller's `timeout` fires.
  */
-export function defaultSpawnCodexAgent(argv, opts = {}, io = {}) {
-  return spawnToCompletion(CODEX_CLI, argv, {
+export async function defaultSpawnCodexAgent(argv, opts = {}, io = {}) {
+  assertLaunchDescriptor(opts);
+  return spawnFixerToCompletion(CODEX_CLI, argv, {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     maxBuffer: 64 * 1024 * 1024,
     killSignal: 'SIGKILL',
-    ...opts,
+    ...opts, mode: opts.mode, launchGuard: opts.launchGuard,
   }, io);
 }
 

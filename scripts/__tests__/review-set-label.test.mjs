@@ -315,7 +315,7 @@ describe('decideSetLabel — rearm (#2644, folded in from the conveyor decideRea
     // #2832 — re-arm applies review:pending (a hold), so ready-to-merge is stripped in the same swap. #2811 —
     // the remove set now unconditionally names `accepted` too (narrowed to what the PR actually carries by
     // `presentRemoveLabels`), so the SAME swap also covers a stale-accepted re-arm with no second code path.
-    expect(d.removeLabels).toEqual([REVIEW_LABELS.changes, REVIEW_LABELS.accepted, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL, 'red-team:pending', 'red-team:clear', 'red-team:blocked']);
+    expect(d.removeLabels).toEqual([REVIEW_LABELS.changes, REVIEW_LABELS.accepted, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL, 'status:ready-to-merge', 'red-team:pending', 'red-team:clear', 'red-team:blocked']);
     expect(d.keepsHuman).toBe(false);
   });
 
@@ -323,7 +323,7 @@ describe('decideSetLabel — rearm (#2644, folded in from the conveyor decideRea
     const d = decideSetLabel({ to: 'rearm', currentLabels: humanChanges });
     expect(d.allowed).toBe(true);
     expect(d.addLabel).not.toBe(REVIEW_LABELS.accepted);
-    expect(d.removeLabels).toEqual([REVIEW_LABELS.changes, REVIEW_LABELS.accepted, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL, 'red-team:pending', 'red-team:clear', 'red-team:blocked']);
+    expect(d.removeLabels).toEqual([REVIEW_LABELS.changes, REVIEW_LABELS.accepted, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL, 'status:ready-to-merge', 'red-team:pending', 'red-team:clear', 'red-team:blocked']);
     expect(d.removeLabels).not.toContain(REVIEW_LABELS.human);
     expect(d.keepsHuman).toBe(true);
   });
@@ -374,7 +374,7 @@ describe('decideSetLabel — rearm (#2644, folded in from the conveyor decideRea
     const d = decideSetLabel({ to: 'rearm', currentLabels: accepted });
     expect(d.allowed).toBe(true);
     expect(d.addLabel).toBe(REVIEW_LABELS.pending);
-    expect(d.removeLabels).toEqual([REVIEW_LABELS.changes, REVIEW_LABELS.accepted, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL, 'red-team:pending', 'red-team:clear', 'red-team:blocked']);
+    expect(d.removeLabels).toEqual([REVIEW_LABELS.changes, REVIEW_LABELS.accepted, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL, 'status:ready-to-merge', 'red-team:pending', 'red-team:clear', 'red-team:blocked']);
     expect(presentRemoveLabels(d.removeLabels, accepted)).toEqual(
       expect.arrayContaining([REVIEW_LABELS.accepted, READY_TO_MERGE_LABEL]),
     );

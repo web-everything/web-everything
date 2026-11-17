@@ -35,7 +35,7 @@ function fixture({ head = prHead, owner = holder, lanePath = '/lanes/lane-10' } 
     recordPush: () => {}, write: () => {}, writeErr: () => {}, weRoot: '/we' };
   return { state, calls, run, readLease, spawn, recordOutcome, appendLoopRow, releaseClaim, io };
 }
-const argv = ['--pr=5759', '--session=fix-5759', '--ref=lane/pr', '--prompt-file=/p', '--provider=codex'];
+const argv = ['--mode=ordinary', '--launch-guard=null', '--pr=5759', '--session=fix-5759', '--ref=lane/pr', '--prompt-file=/p', '--provider=codex'];
 
 // Keep subprocesses stubbed, but omit io.readLease to exercise the production disk reader.
 function diskLeaseFixture(options = {}) {

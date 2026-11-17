@@ -352,7 +352,7 @@ describe('push-before-gate: the early push', () => {
         mkdirSync(dir);
         writeFileSync(file, { 'malformed-json': '{', 'invalid-state': '{"state":"unknown"}', 'null-json': 'null' }[failure]);
       }
-      const production = await defaultAwaitVerifyIo({ env, dispatchIo: {}, stopSessionFn: () => {},
+      const production = await defaultAwaitVerifyIo({ readSavedLaunch: () => ({ mode: 'ordinary', launchGuard: null }), env, dispatchIo: {}, stopSessionFn: () => {},
         pushRefusalFn: () => null, readClaimFn: () => null,
         exec: () => { throw new Error('unexpected external command'); } });
       const h = harness({ records: [rec(path.startsWith('saved-')
@@ -383,7 +383,7 @@ describe('push-before-gate: the early push', () => {
   it('allows an absent production self-review record for the existing serial flow', async () => {
     const root = mkdtempSync(join(tmpdir(), 'await-no-self-review-'));
     try {
-      const production = await defaultAwaitVerifyIo({ env: { WE_AWAIT_VERIFY_STORE: root }, dispatchIo: {},
+      const production = await defaultAwaitVerifyIo({ readSavedLaunch: () => ({ mode: 'ordinary', launchGuard: null }), env: { WE_AWAIT_VERIFY_STORE: root }, dispatchIo: {},
         stopSessionFn: () => {}, pushRefusalFn: () => null, readClaimFn: () => null });
       const h = harness();
       h.io.readSelfReview = production.readSelfReview;

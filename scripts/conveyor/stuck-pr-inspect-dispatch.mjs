@@ -302,7 +302,7 @@ export function dispatchInspection({
   const { planned, prompt, unknownTokens, sessionId, argv, sessionCwd } = prepared;
   let stdout;
   try {
-    stdout = String(spawnAgent(argv, { cwd: sessionCwd }) ?? '');
+    stdout = String(spawnAgent(argv, { cwd: sessionCwd, mode: 'inspect', launchGuard: null }) ?? '');
   } catch (e) {
     // Only ENOENT/EACCES prove `claude` never ran. A timeout or non-zero exit may still have started a session.
     throw isPreSpawnRefusal(e) ? markNoInspectionStarted(e) : e;

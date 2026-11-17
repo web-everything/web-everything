@@ -81,7 +81,7 @@ describe('launchWrappedClaudeWorker', () => {
   it('passes the wrapper spec to the injected launcher and returns a pid handle', () => {
     const specDir = tmp();
     const launch = vi.fn(() => ({ wrapperPid: 4321 }));
-    const options = { role: 'fix', session: 'fix-12', bgArgv: ['--bg', '-n', 'fix-12', 'PROMPT'], pr: 12, sessionId: SESSION_ID, env: {}, specDir, launch };
+    const options = { mode: 'build', launchGuard: null, role: 'fix', session: 'fix-12', bgArgv: ['--bg', '-n', 'fix-12', 'PROMPT'], pr: 12, sessionId: SESSION_ID, env: {}, specDir, launch };
     expect(launchWrappedClaudeWorker(options)).toMatchObject({ handle: 'pid:4321', wrapperPid: 4321, sessionId: SESSION_ID });
     expect(launch).toHaveBeenCalledTimes(1);
     expect(launch).toHaveBeenCalledWith(expect.objectContaining({
@@ -163,7 +163,7 @@ describe('preserveLegacyWords', () => {
 describe('runWorker legacy words with an injected child', () => {
   it.each([true, false])('preserveLegacyWords enabled: %s', async (preserve) => {
     const dir = tmp();
-    const spec = {
+    const spec = { mode: 'build', launchGuard: null,
       role: 'fix', launcher: 'claude-p', session: 'fix-9', command: 'claude', argv: ['-p', 'x'],
       completionsDir: dir, draftsDir: tmp(), postmortemMode: 'off', legacyFromCompletion: true,
       ...(preserve ? { preserveLegacyWords: true } : {}),

@@ -1166,7 +1166,7 @@ describe('the declared effect is a dispatch', () => {
     const priorEnv = process.env;
     try {
       process.env = { ...priorEnv, GH_TOKEN: 'ghs_daemon_own_token', GITHUB_TOKEN: 'also_should_go', OTHER_VAR: 'kept' };
-      defaultSpawnAgent(['--bg'], {}, { exec });
+      defaultSpawnAgent(['--bg'], { mode: 'ordinary', launchGuard: null,}, { exec });
     } finally {
       process.env = priorEnv;
     }
@@ -1180,7 +1180,7 @@ describe('the declared effect is a dispatch', () => {
     // The exact shape `deliver-item-wrapper.mjs` passes: `env: { ...process.env, ...deliveryEnv }`.
     let seenOpts = null;
     const exec = (cmd, args, opts) => { seenOpts = opts; return ''; };
-    defaultSpawnAgent(['--bg'], { env: { GH_TOKEN: 'ghs_daemon_own_token', GITHUB_TOKEN: 'x', DELIVERY_VAR: 'kept' } }, { exec });
+    defaultSpawnAgent(['--bg'], { mode: 'ordinary', launchGuard: null, env: { GH_TOKEN: 'ghs_daemon_own_token', GITHUB_TOKEN: 'x', DELIVERY_VAR: 'kept' } }, { exec });
     expect(seenOpts.env.GH_TOKEN).toBeUndefined();
     expect(seenOpts.env.GITHUB_TOKEN).toBeUndefined();
     expect(seenOpts.env.DELIVERY_VAR).toBe('kept'); // the caller's own env is still what the child gets
@@ -1189,7 +1189,7 @@ describe('the declared effect is a dispatch', () => {
   it('#x8mpubm follow-up — an explicit opts.cwd from the caller is preserved alongside the stripped env', () => {
     let seenOpts = null;
     const exec = (cmd, args, opts) => { seenOpts = opts; return ''; };
-    defaultSpawnAgent(['--bg'], { cwd: '/some/lane' }, { exec });
+    defaultSpawnAgent(['--bg'], { mode: 'ordinary', launchGuard: null, cwd: '/some/lane' }, { exec });
     expect(seenOpts.cwd).toBe('/some/lane');
   });
 
@@ -1213,7 +1213,7 @@ describe('the declared effect is a dispatch', () => {
         return 'backgrounded · sess-handle · n\n';
       };
       const grantTrust = (dir) => grants.push(dir);
-      const out = defaultSpawnAgent(['--bg'], { cwd: '/scratch/dispatch/sess-1' }, { exec, grantTrust });
+      const out = defaultSpawnAgent(['--bg'], { mode: 'ordinary', launchGuard: null, cwd: '/scratch/dispatch/sess-1' }, { exec, grantTrust });
       expect(calls).toBe(2);
       expect(grants).toEqual(['/scratch/dispatch/sess-1']);
       expect(out).toBe('backgrounded · sess-handle · n\n');
@@ -1226,7 +1226,7 @@ describe('the declared effect is a dispatch', () => {
       let calls = 0;
       const exec = () => { calls += 1; throw trustRefusalError('/scratch/dispatch/sess-2'); };
       const grantTrust = () => {};
-      expect(() => defaultSpawnAgent(['--bg'], { cwd: '/scratch/dispatch/sess-2' }, { exec, grantTrust }))
+      expect(() => defaultSpawnAgent(['--bg'], { mode: 'ordinary', launchGuard: null, cwd: '/scratch/dispatch/sess-2' }, { exec, grantTrust }))
         .toThrow(/Workspace not trusted|Command failed/);
       expect(calls).toBe(2);
     });
@@ -1235,7 +1235,7 @@ describe('the declared effect is a dispatch', () => {
       let calls = 0;
       let granted = false;
       const exec = () => { calls += 1; throw new Error('exit 1'); };
-      expect(() => defaultSpawnAgent(['--bg'], { cwd: '/scratch/dispatch/sess-3' }, { exec, grantTrust: () => { granted = true; } }))
+      expect(() => defaultSpawnAgent(['--bg'], { mode: 'ordinary', launchGuard: null, cwd: '/scratch/dispatch/sess-3' }, { exec, grantTrust: () => { granted = true; } }))
         .toThrow('exit 1');
       expect(calls).toBe(1);
       expect(granted).toBe(false);
@@ -1250,7 +1250,7 @@ describe('the declared effect is a dispatch', () => {
         // The exact shape execFileSync produces: argv folded into .message, the CLI's real output on .stderr.
         throw Object.assign(new Error(`Command failed: claude ${argv.join(' ')}\nSegmentation fault`), { stderr: 'Segmentation fault\n' });
       };
-      expect(() => defaultSpawnAgent(argv, { cwd: '/scratch/dispatch/sess-5' }, { exec, grantTrust: () => { granted = true; } }))
+      expect(() => defaultSpawnAgent(argv, { mode: 'ordinary', launchGuard: null, cwd: '/scratch/dispatch/sess-5' }, { exec, grantTrust: () => { granted = true; } }))
         .toThrow(/Segmentation fault/);
       expect(calls).toBe(1);
       expect(granted).toBe(false);
@@ -1261,7 +1261,7 @@ describe('the declared effect is a dispatch', () => {
       const exec = () => { calls += 1; throw trustRefusalError('/wherever'); };
       let thrown = null;
       try {
-        defaultSpawnAgent(['--bg'], {}, { exec, grantTrust: () => { throw new Error('must not be called'); } });
+        defaultSpawnAgent(['--bg'], { mode: 'ordinary', launchGuard: null,}, { exec, grantTrust: () => { throw new Error('must not be called'); } });
       } catch (e) { thrown = e; }
       expect(thrown?.stderr).toMatch(/Workspace not trusted/);
       expect(calls).toBe(1);
@@ -1560,7 +1560,7 @@ describe('the provider port — #3579', () => {
   it('defaultClaudeProvider is ONE implementation of the port, composing buildAgentArgv + spawnAgent', () => {
     const spawned = [];
     const handle = defaultClaudeProvider(
-      { sessionId: 'sess-c9', cwd: PRIMARY, prompt: '# build #9', sessionSlug: 'conveyor-9', num: '9', extraArgs: ['--model', 'sonnet'] },
+      { mode: 'ordinary', launchGuard: null, sessionId: 'sess-c9', cwd: PRIMARY, prompt: '# build #9', sessionSlug: 'conveyor-9', num: '9', extraArgs: ['--model', 'sonnet'] },
       { spawnAgent: (argv, opts) => { spawned.push({ argv, opts }); return ''; } },
     );
     expect(handle).toBe('sess-c9');
@@ -1570,7 +1570,7 @@ describe('the provider port — #3579', () => {
         payload: { prompt: '# build #9', sessionSlug: 'conveyor-9', num: '9' },
         extraArgs: ['--model', 'sonnet'],
       }),
-      opts: { cwd: PRIMARY },
+      opts: { cwd: PRIMARY, mode: 'ordinary', launchGuard: null },
     }]);
   });
 
@@ -1621,7 +1621,7 @@ describe('the provider port — #3579', () => {
     const directArgv = buildAgentArgv({ sessionId: 'sess-parity', payload: richPayload, extraArgs: ['--model', 'sonnet'] });
     const spawned = [];
     defaultClaudeProvider(
-      {
+      { mode: 'ordinary', launchGuard: null,
         sessionId: 'sess-parity', cwd: PRIMARY, prompt: richPayload.prompt, sessionSlug: richPayload.sessionSlug,
         num: richPayload.num, extraArgs: ['--model', 'sonnet'],
       },

@@ -21,6 +21,8 @@
  * `--actor`, and the optional-`--repo` fallback. The refusal STILL lives in the pure core, so the CLI cannot
  * route around it. Scripted per [we:docs/agent/platform-decisions.md#deterministic-core-thin-judgment] (#2607).
  */
+import { isConflictRebaseHoldLabel } from '../lib/review-labels.mjs';
+import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { readGit, readGh } from '../lib/proc-read.mjs';
 import { writeLineSync } from '../lib/write-all-sync.mjs';
 import { resolve } from 'node:path';
@@ -309,10 +311,43 @@ export function buildRearmComment({ actor, decision }) {
   ].join('\n');
 }
 
+/** Admission records ownership without counting an unfinished repair as a completed round. */
+export function buildConflictStartComment({ actor }) {
+  return `Conflict-rebase repair admitted by ${actor}; approval is removed before repair.\n\nIndependent review is owed. A crash or unchanged conflicting head requires an operator to inspect before retrying.`;
+}
+
+/** Durable conflict-round comment, shared by the CLI and receipt regression fixtures. */
+export function buildConflictRearmComment({ actor, decision, mainRef = null, mainSha = null }) {
+  return [
+    CONFLICT_FIX_COMMENT_MARKER,
+    '',
+    `A mechanical conflict-resolution round (no other edits) was applied by ${actor}; ${decision.keepsHuman
+      ? '`review:human` is KEPT as the sole hold — `review:pending` was not added (an independent review is already owed while the human hold stands; only a human `/review` ceremony clears it).'
+      : 'the PR is re-armed `review:pending` (an independent re-review is owed).'}`,
+    '',
+    'The fix agent did NOT clear the review — a human `/review` (or the drain AI-review convergence pass) re-verdicts. ' +
+      'This round is counted against its OWN, smaller conflict-fix cap (#xkmu3gv), never the ordinary negotiation cap.',
+    // #2787-live-incident — the trailer below records what this round actually resolved against, so a
+    // LATER round against a NEWER `main` (main moved and created a fresh conflict, the mechanism working
+    // exactly as intended) is not misread as this same round recurring — see
+    // `conflict-fix-round-count.mjs#countStaleConflictFixRounds`'s own docblock. Omitted (no trailer at
+    // all) when the local sha is unresolvable — see `resolveLocalRefSha`'s own docblock.
+  ].join('\n') + conflictFixTargetTrailer(mainRef, mainSha);
+}
+
 // we:scripts/conveyor/rearm-review.mjs — allow importing the pure decider without running the CLI (the test file
 // imports this module). The standard main check used across the conveyor scripts.
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname);
-if (IS_CLI) {
+/** Fresh conflict admission evidence; deliberately independent of the shared CLI's tolerant re-read. */
+function readConflictStartLabels(repo, pr) {
+  return JSON.parse(readGh(['pr', 'view', String(pr), ...(repo ? [`--repo=${repo}`] : []), '--json', 'labels'], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+  })).labels;
+}
+
+/** Run the rearm entrypoint with injectable label IO for strict conflict-start verification. */
+export function runRearmReviewCli({ argv = process.argv.slice(2), readLabels = readConflictStartLabels,
+  labelCliOptions = {}, resolveMainSha = resolveLocalRefSha } = {}) {
   // #xkmu3gv — `--round=conflict` selects the MECHANICAL conflict-resolution comment/marker
   // (`CONFLICT_FIX_COMMENT_MARKER`, its own smaller `we:scripts/conveyor/reconcile-core.mjs#CONFLICT_FIX_ROUND_CAP`,
   // #xkmu3gv) instead of the ordinary rearm marker. THE LABEL SWAP ITSELF IS IDENTICAL EITHER WAY — the SAME
@@ -320,25 +355,32 @@ if (IS_CLI) {
   // `decideSetLabel({ to: 'rearm' })` decides; only which durable floor this completed round counts against, and
   // the comment text explaining why, differs. See `conflict-fix-round-count.mjs`'s own header for why a
   // mechanical conflict-resolution round needs its own cap rather than sharing `countRearmComments`'s.
-  const roundArg = (process.argv.find((a) => a.startsWith('--round=')) || '').slice('--round='.length);
+  const roundArg = (argv.find((a) => a.startsWith('--round=')) || '').slice('--round='.length);
   const isConflictRound = roundArg === 'conflict';
+  const isConflictStart = roundArg === 'conflict-start';
   // #2787-live-incident — the ordinary conflict-fix round is, by construction, always against the repo's
   // default branch; `--main-ref=` lets a non-`main`-default repo say so, defaulting to `'main'` (every
   // constellation repo today) so no existing caller needs to change.
-  const mainRefArg = (process.argv.find((a) => a.startsWith('--main-ref=')) || '').slice('--main-ref='.length) || 'main';
+  const mainRefArg = (argv.find((a) => a.startsWith('--main-ref=')) || '').slice('--main-ref='.length) || 'main';
   // we:scripts/conveyor/rearm-review.mjs — the fix-agent re-arm CLI: the shared harness with the three deltas
   // this caller supplies (the comment body, the default --actor, the optional --repo fallback). The re-arm
-  // swap + its refusal are the shared pure `decideSetLabel({ to: 'rearm' })` — this file adds no invariant.
+  // swap + its refusal are shared; conflict-start additionally requires its own fresh demotion proof.
   // #6713 — refuse an EMPTY ordinary fix round before any label write. Fail-open on every READ problem; once an
   // empty round is PROVEN the refusal is unconditional (a failed note never lets the re-arm through).
-  const argOf = (n) => (process.argv.find((a) => a.startsWith(`--${n}=`)) || '').slice(n.length + 3);
+  const argOf = (n) => (argv.find((a) => a.startsWith(`--${n}=`)) || '').slice(n.length + 3);
   // A stray/extra positional would let the shared CLI act on a PR this guard never inspected: refuse before any write.
-  if (hasUnexpectedPositionals(process.argv.slice(2)) || hasInvalidArgs(process.argv.slice(2))) {
+  if (hasUnexpectedPositionals(argv) || hasInvalidArgs(argv)) {
     writeLineSync(1, JSON.stringify({ ok: false, reason: 'refused: expected exactly one positional <pr> (a positive integer) and well-formed flags' }));
     process.exit(1);
   }
-  const prArg = process.argv.slice(2).find((a) => !a.startsWith('--'));
+  const prArg = argv.find((a) => !a.startsWith('--'));
   const repoVal = argOf('repo');
+  if (isConflictStart && (!/^[0-9a-f]{40}$/i.test(argOf('expect-head'))
+      || !['accepted', 'missing'].includes(argOf('only-if'))
+      || !new RegExp(`^accepted-conflict-rebase:${argOf('expect-head')}@[0-9a-f]{40}$`, 'i').test(argOf('actor')))) {
+    writeLineSync(1, JSON.stringify({ ok: false, reason: 'conflict-start requires a pinned head, accepted/missing guard and matching head receipt; refresh before repair' }));
+    process.exit(1);
+  }
   if (prArg && !isConflictRound && !argOf('only-if')) {
     const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' };
     let verdict = { empty: false };
@@ -359,11 +401,29 @@ if (IS_CLI) {
       process.exit(1);
     }
   }
+  // Guard each fresh state read, including the reads immediately before demotion.
+  // The shared CLI otherwise tolerates holds on ordinary completed fix rounds.
+  const provider = isConflictStart ? (labelCliOptions.provider ?? createGhProvider()) : null;
   runReviewLabelCli({
+    ...labelCliOptions,
+    ...(isConflictStart ? { provider: {
+      ...provider,
+      readPrState: (...args) => {
+        const state = provider.readPrState(...args);
+        if (!Array.isArray(state?.labels) || !state.labels.every(l =>
+          typeof (typeof l === 'string' ? l : l?.name) === 'string'
+          && (typeof l === 'string' ? l : l.name).length > 0)
+          || state.labels.some(l => isConflictRebaseHoldLabel(typeof l === 'string' ? l : l.name))) {
+          throw new Error('conflict-start labels unreadable or held; STOP repair and refresh PR labels before retrying');
+        }
+        return state;
+      },
+    } } : {}),
+    argv,
     fixedTo: 'rearm',
     defaultActor: 'conveyor fix agent',
     repoOptional: true, // the fix agent runs inside its WE lane clone, so a missing --repo derives from cwd.
-    usage: 'usage: rearm-review.mjs <pr> [--repo=<owner/name>] [--actor=<name>] [--round=conflict] [--main-ref=<name>] [--only-if=accepted|missing] [--expect-head=<sha>]  (pr must be a positive integer)',
+    usage: 'usage: rearm-review.mjs <pr> [--repo=<owner/name>] [--actor=<name>] [--round=conflict|conflict-start] [--main-ref=<name>] [--only-if=accepted|missing] [--expect-head=<sha>]  (pr must be a positive integer)',
     // The DURABLE re-arm comment — a readable record that the bounce was repaired and re-armed (not a silent
     // flip), AND the durable tally the matching counter reads back to survive a restart (#2643). Its first line
     // MUST be the matching marker (single-sourced) so posting and counting can never drift.
@@ -372,24 +432,33 @@ if (IS_CLI) {
     // pending-review signal; see that function's own comment for the live bug — PR #2549, 2026-09-24 — this
     // closure's old unconditional "re-armed `review:pending`" text used to describe verbatim). Both branches read
     // `decision.keepsHuman` once and render one of two true sentences instead of one sentence plus a footnote.
-    buildComment: isConflictRound
-      ? ({ actor, decision }) => [
-          CONFLICT_FIX_COMMENT_MARKER,
-          '',
-          `A mechanical conflict-resolution round (no other edits) was applied by ${actor}; ${decision.keepsHuman
-            ? '`review:human` is KEPT as the sole hold — `review:pending` was not added (an independent review is already owed while the human hold stands; only a human `/review` ceremony clears it).'
-            : 'the PR is re-armed `review:pending` (an independent re-review is owed).'}`,
-          '',
-          'The fix agent did NOT clear the review — a human `/review` (or the drain AI-review convergence pass) re-verdicts. ' +
-            'This round is counted against its OWN, smaller conflict-fix cap (#xkmu3gv), never the ordinary negotiation cap.',
-          // #2787-live-incident — the trailer below records what this round actually resolved against, so a
-          // LATER round against a NEWER `main` (main moved and created a fresh conflict, the mechanism working
-          // exactly as intended) is not misread as this same round recurring — see
-          // `conflict-fix-round-count.mjs#countStaleConflictFixRounds`'s own docblock. Omitted (no trailer at
-          // all) when the local sha is unresolvable — see `resolveLocalRefSha`'s own docblock.
-        ].join('\n') + conflictFixTargetTrailer(mainRefArg, resolveLocalRefSha(mainRefArg))
+    buildComment: isConflictStart ? buildConflictStartComment : isConflictRound
+      ? ({ actor, decision }) => buildConflictRearmComment({ actor, decision,
+          mainRef: mainRefArg, mainSha: resolveMainSha(mainRefArg) })
       : buildRearmComment,
-    successResult: ({ pr, labels }) => ({ ok: true, pr, rearmed: true, labels, round: isConflictRound ? 'conflict' : 'ordinary' }),
+    successResult: ({ pr, labels }) => {
+      if (isConflictStart) {
+        try {
+          // Never accept the shared helper's observed OR locally inferred labels as demotion proof.
+          const fresh = readLabels(repoVal, pr);
+          if (!Array.isArray(fresh) || !fresh.every(l =>
+            typeof (typeof l === 'string' ? l : l?.name) === 'string'
+            && (typeof l === 'string' ? l : l.name).length > 0)) throw new Error('invalid labels');
+          labels = fresh.map(l => typeof l === 'string' ? l : l.name);
+          if (labels.some(isConflictRebaseHoldLabel) || !labels.includes('review:pending') ||
+            ['review:accepted', 'ready-to-merge', 'status:ready-to-merge'].some(l => labels.includes(l))) {
+            throw new Error('demotion was not observed');
+          }
+        } catch {
+          const result = { ok: false, pr, reason: 'conflict-start demotion could not be verified; STOP repair and refresh PR labels before retrying' };
+          (labelCliOptions.emit || (line => writeLineSync(1, line.trimEnd())))(`${JSON.stringify(result)}\n`);
+          process.exit(1);
+        }
+      }
+      return { ok: true, pr, rearmed: true, labels, round: isConflictStart ? 'conflict-start' : isConflictRound ? 'conflict' : 'ordinary' };
+    },
     refusalResult: ({ pr, decision }) => ({ ok: false, pr, reason: decision.reason }),
   });
 }
+
+if (IS_CLI) runRearmReviewCli();
