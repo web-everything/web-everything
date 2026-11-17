@@ -1,4 +1,5 @@
 ---
+bornAs: x5n902w
 kind: decision
 size: 3
 status: open
@@ -132,7 +133,7 @@ All paths below are repository-qualified planned files; these tests and gates ar
 |---|---|---|
 | Ordered rollout and observations between groups | `we:scripts/__tests__/studio-capacity-rollout.test.mjs` | `studio_rollout_observes_between_groups`: accepts C2 → D2 → B2 → A2, one group per write; rejects a multi-group request, skip/reorder and pre-application evidence, with zero writes to the next group until a fresh qualifying post-stage window completes. |
 | Continuous raise eligibility, including B2 | `we:scripts/__tests__/studio-capacity-rollout.test.mjs` | `raise_requires_thirty_minutes_above_both_floors`: 22 min and 1799 s are ineligible; a complete 1800 s window with both metrics strictly above their floors is eligible; one idle or memory dip, equality, missing/nonfinite/out-of-range fields, invalid/duplicate/reordered/future timestamps, a gap > 30 s or stale end sample denies the raise despite high medians, with no preference write. |
-| [A1] Prepared-state CLI output | `we:scripts/__tests__/studio-capacity-decision.test.mjs` | `studio_decision_show_reports_prepared`: invoke `node we:scripts/backlog.mjs show x5n902w` against the prepared card fixture; assert successful exit, this card's identity, prepared state and prepared date in output. |
+| [A1] Prepared-state CLI output | `we:scripts/__tests__/studio-capacity-decision.test.mjs` | `studio_decision_show_reports_prepared`: invoke `node we:scripts/backlog.mjs show 8536` against the prepared card fixture; assert successful exit, this card's identity, prepared state and prepared date in output. |
 | [A1] Exact ratified values across all owners | `we:scripts/__tests__/studio-capacity-rollout.test.mjs` | `studio_ratification_applies_exact_values`: after ratification and each stage's proof, read back every A2–D2 key from its owning store/script/prompt and compare with the exact ratified manifest, including the verified pre-revert fix cap; unchanged defaults stay unchanged. Missing/unverified fix-cap values deny B2 with no B2 writes. |
 | [N1] No settings changed before ratification | `we:scripts/__tests__/studio-capacity-decision.test.mjs` | `studio_preparation_does_not_apply_preferences`: prepare/show an unratified card with settings writers spied; assert zero writes and byte-identical preference/settings fixtures. |
 | Edge 4: restoration and retry | `we:scripts/__tests__/studio-capacity-rollout.test.mjs` | `studio_restores_snapshot_after_sustained_low_resources`: separately inject 30 min of low idle, low free memory and alternating low metrics; assert exact pre-stage values restored for every key in the last group, earlier groups preserved and no next-stage write or handoff. At 1799 s do not restore; a healthy sample resets the timer. After restoration deny retry until a new qualifying window completes. |
@@ -144,7 +145,7 @@ Prevention work recorded here from PR #6951 (owed, not shipped): (1) implement t
 
 ## Acceptance
 
-- [A1] **Executable (planned rollout acceptance)** — once implemented, `node we:scripts/backlog.mjs show x5n902w` shows this decision prepared (`we:scripts/__tests__/studio-capacity-decision.test.mjs`, `studio_decision_show_reports_prepared`). After ratification and successful staged rollout, every owning store carries its exact ratified values (`we:scripts/__tests__/studio-capacity-rollout.test.mjs`, `studio_ratification_applies_exact_values`); ratification alone does not authorize simultaneous application.
+- [A1] **Executable (planned rollout acceptance)** — once implemented, `node we:scripts/backlog.mjs show 8536` shows this decision prepared (`we:scripts/__tests__/studio-capacity-decision.test.mjs`, `studio_decision_show_reports_prepared`). After ratification and successful staged rollout, every owning store carries its exact ratified values (`we:scripts/__tests__/studio-capacity-rollout.test.mjs`, `studio_ratification_applies_exact_values`); ratification alone does not authorize simultaneous application.
 
 ## Non-goals
 
