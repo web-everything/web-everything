@@ -8,7 +8,7 @@ import { daemonCloneRoots } from '../lib/daemon-clone-registry.mjs';
 import { defaultCachePath } from '../lib/github-app-auth-env.mjs';
 
 const MAX_BUFFER = 1024 * 1024;
-const clean = (value) => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
+export const clean = (value) => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
 
 /** All effects are injected reads. A failed check never prevents later checks. */
 export async function runPreflight({ thisHost, io, env = process.env, now = Date.now() } = {}) {
@@ -76,11 +76,20 @@ export function formatPreflight(result) {
   return result.checks.map(({ name, ok, detail }) => `${ok ? 'ok  ' : 'FAIL'} ${clean(name)} ${clean(detail)}`).join('\n');
 }
 
-function cliIO(env) {
+export function cliIO(env = process.env, {
+  readOwnerRemote: readRemote = readOwnerRemote,
+  execFileSync: exec = execFileSync,
+  spawnSync: spawn = spawnSync,
+  daemonCloneRoots: cloneRoots = daemonCloneRoots,
+} = {}) {
   const checkout = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
   return {
     resolveRole: async ({ thisHost, now }) => {
-      const remote = await readOwnerRemote();
+      let remote;
+      try { remote = await readRemote(); } catch { /* Unreadable startup evidence fails closed. */ }
+      const readable = (remote?.status === 'ok' && typeof remote.owner === 'string' && remote.owner !== '')
+        || remote?.status === 'unset';
+      if (!readable) return { ...decideHostRole({ thisHost, now }), source: 'remote-failed' };
       return { ...decideHostRole({ thisHost, now, atStart: true,
         owner: remote.status === 'ok' ? remote.owner : remote.status === 'unset' ? '' : null,
         ownerReadAt: remote.status === 'error' ? undefined : now }),
@@ -99,24 +108,29 @@ function cliIO(env) {
       { name: 'github-app-token-cache', path: defaultCachePath() },
     ],
     statFile: (path) => statSync(path).isFile(),
-    cloneDirs: () => daemonCloneRoots(env.WE_WORKSPACE_ROOT || dirname(checkout), { env }),
+    cloneDirs: () => cloneRoots(env.WE_WORKSPACE_ROOT || dirname(checkout), { env }),
     readHead: (dir) => {
-      const git = (...args) => execFileSync('git', ['-C', dir, ...args], {
-        encoding: 'utf8', timeout: 15_000, maxBuffer: MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'],
+      const git = (...args) => exec('git', ['-C', dir, ...args], {
+        env, encoding: 'utf8', timeout: 15_000, maxBuffer: MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'],
       }).trim();
       // A plain directory inside another checkout must not pass via the parent repo's HEAD.
       if (realpathSync(git('rev-parse', '--show-toplevel')) !== realpathSync(dir)) throw new Error('not a git checkout root');
       return git('rev-parse', 'HEAD');
     },
     parsePreferences: () => JSON.parse(readFileSync(new URL('../lib/delivery-platform-preferences.json', import.meta.url), 'utf8')),
-    sshForge: () => spawnSync('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', 'forge', 'true'], {
-      timeout: 15_000, maxBuffer: MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'],
+    sshForge: () => spawn('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', 'forge', 'true'], {
+      env, timeout: 15_000, maxBuffer: MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'],
     }),
   };
 }
 
+export async function main({ thisHost = getThisHost(), env = process.env,
+  io = cliIO(env), log = console.log, now = Date.now() } = {}) {
+  const result = await runPreflight({ thisHost, env, io, now });
+  log(formatPreflight(result));
+  return result.ok ? 0 : 1;
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  const result = await runPreflight({ thisHost: getThisHost(), io: cliIO(process.env) });
-  console.log(formatPreflight(result));
-  process.exitCode = result.ok ? 0 : 1;
+  process.exitCode = await main();
 }
