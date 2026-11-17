@@ -2,23 +2,18 @@
  * Pool-lane stale checkout evidence and alert boundaries, with hermetic filesystem/Git fixtures.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import smell from '../lane-stale-checkout.mjs';
 import { probeLaneCheckouts } from '../../lane-checkout-probe.mjs';
 import { stepEpisodes } from '../../health-watch-core.mjs';
 
 const now = 1_800_000_000_000;
-const freshSource = `export function parseTelemetry(text) {
-  const v = JSON.parse(text);
-  const legacy = {...v};
-  delete legacy.diskUsedPct; delete legacy.prune;
-  if (('prune' in v && !validPruneStatus(v.prune))
-    || ('diskUsedPct' in v && !Number.isFinite(v.diskUsedPct))) throw new Error('invalid');
-  return v;
-}
-`;
+// Exercise the actual post-#6913 parser, including its schema guards.
+const freshSource = readFileSync(resolve('scripts/readiness/forge-exec-run.mjs'), 'utf8');
 const staleSource = 'export function parseTelemetry(text) { return JSON.parse(text); }';
 const lane = (overrides = {}) => ({ pool: 'web-everything', lane: 1, head: 'abcdef123', behind: 0, behindSinceMs: null, headLagMs: 0, forgeExecHasPrune: true, ...overrides });
 const evaluate = (row, model = smell) => model.evaluate({ laneCheckouts: [row] }, { now })[0];
@@ -78,10 +73,10 @@ describe('lane-stale-checkout', () => {
     expect(result.summary).toContain('lag unverifiable');
   });
 
-  it('alerts for HEAD over 24 hours behind the real main tip even with zero local lag', () => {
+  it('alerts for fork point or local main over 24 hours behind the real main tip even with zero local lag', () => {
     const result = evaluate(lane({ headLagMs: smell.maxBehindMs + 1 }));
     expect(result.breach).toBe(true);
-    expect(result.summary).toContain('lane HEAD trails main tip');
+    expect(result.summary).toContain('lane fork point or local origin/main trails main tip');
     expect(result.measure.headLagMs).toBe(smell.maxBehindMs + 1);
   });
 
@@ -134,7 +129,7 @@ describe('probeLaneCheckouts', () => {
   const gitFixture = () => vi.fn((args, { cwd }) => {
     const stale = basename(cwd) === 'lane-1';
     if (args[0] === 'rev-parse') return stale ? '111111111111' : '222222222222';
-    if (args[0] === 'merge-base') return '';
+    if (args[0] === 'merge-base') return 'fork-sha';
     if (args[0] === 'rev-list') return stale ? '201\n' : '0\n';
     if (args[0] === 'log' && args[1] === '-1') return `${now / 1000}\n`;
     if (args[0] === 'log') return `${(now - 2 * smell.maxBehindMs) / 1000}\n${now / 1000}\n`;
@@ -160,17 +155,18 @@ describe('probeLaneCheckouts', () => {
     expect(git).toHaveBeenCalledWith(['rev-list', '--count', 'HEAD..origin/main'], expect.objectContaining({ cwd: join(root, 'pool', 'lane-1') }));
   });
 
-  it('measures lag for divergent HEADs without requiring ancestry', () => {
+  it('preserves commit lag when the fork point is unreadable', () => {
     addLane(root, 1, freshSource);
     const fixture = gitFixture();
     const git = vi.fn((args, options) => {
       if (args[0] === 'merge-base') throw new Error('not an ancestor');
       return fixture(args, options);
     });
-    const [row] = probeLaneCheckouts({ poolRoot: root, git, now });
+    const [row] = probeLaneCheckouts({ poolRoot: root, git, now, mainTipTimeMs: now });
     expect(row).toMatchObject({ head: '111111111', behind: 201, behindSinceMs: now - 2 * smell.maxBehindMs, forgeExecHasPrune: true });
     expect(evaluate(row).breach).toBe(true);
-    expect(git.mock.calls.some(([args]) => args[0] === 'merge-base')).toBe(false);
+    expect(git).toHaveBeenCalledWith(['merge-base', 'HEAD', 'origin/main'], expect.any(Object));
+    expect(row.headLagMs).toBe(null);
     expect(git).toHaveBeenCalledWith(['log', '--reverse', '--format=%ct', 'HEAD..origin/main'], expect.any(Object));
   });
 
@@ -202,12 +198,12 @@ describe('probeLaneCheckouts', () => {
   it('uses the host main-tip time when the lane origin/main is stale', () => {
     addLane(root, 2, freshSource);
     const fixture = gitFixture();
-    const git = vi.fn((args, options) => args[0] === 'log' && args[1] === '-1'
+    const git = vi.fn((args, options) => args[0] === 'log' && args.at(-1) === 'origin/main'
       ? String((now - 2 * smell.maxBehindMs) / 1000) : fixture(args, options));
     const [row] = probeLaneCheckouts({ poolRoot: root, git, now, mainTipTimeMs: now });
     expect(row).toMatchObject({ behind: 0, behindSinceMs: null, headLagMs: 2 * smell.maxBehindMs });
     expect(evaluate(row).breach).toBe(true);
-    expect(git).toHaveBeenCalledWith(['log', '-1', '--format=%ct', 'HEAD'], expect.any(Object));
+    expect(git).toHaveBeenCalledWith(['log', '-1', '--format=%ct', 'origin/main'], expect.any(Object));
   });
 
   it('preserves unknown head lag when the host main-tip time is unavailable', () => {
@@ -216,21 +212,140 @@ describe('probeLaneCheckouts', () => {
     expect(row.headLagMs).toBe(null);
   });
 
+  const tokens = `const legacy = {...v}; delete legacy.prune; delete legacy.diskUsedPct;
+    validPruneStatus(v.prune); Number.isFinite(v.diskUsedPct);`;
+
   it('does not mistake unrelated prune/disk fields outside parseTelemetry for support', () => {
-    addLane(root, 1, `${staleSource}\n${freshSource.replace('parseTelemetry', 'otherParser')}`);
+    addLane(root, 1, `${staleSource}\nfunction otherParser(text) { const v = JSON.parse(text); ${tokens} return v; }`);
     expect(probeLaneCheckouts({ poolRoot: root, git: gitFixture(), now })[0].forgeExecHasPrune).toBe(false);
   });
 
   it.each([
-    `export function parseTelemetry(text) { /* ${freshSource} */ return JSON.parse(text); }`,
-    `// ${freshSource.replaceAll('\n', '\n// ')}\n${staleSource}`,
-    `export function parseTelemetry(text) { const mention = ${JSON.stringify(freshSource)}; return JSON.parse(text); }`,
-    `${staleSource}\n${freshSource.slice(freshSource.indexOf('{') + 1, freshSource.lastIndexOf('}'))}`,
-    `const mention = ${JSON.stringify(freshSource)};\n${staleSource}`,
-  ])('breaches when parser support appears only in comments, strings or outside its body: %s', (source) => {
+    `export function parseTelemetry(text) { /* ${tokens} */ return JSON.parse(text); }`,
+    `// ${tokens.replaceAll('\n', '\n// ')}\n${staleSource}`,
+    `export function parseTelemetry(text) { const mention = ${JSON.stringify(tokens)}; return JSON.parse(text); }`,
+    `${staleSource}\nconst v = {}; ${tokens}`,
+    `const mention = ${JSON.stringify(tokens)};\n${staleSource}`,
+    `export function parseTelemetry(text) { return JSON.parse(text); const v = {}; ${tokens} }`,
+  ])('rejects unreachable tokens, comments, strings and code outside the parser: %s', (source) => {
     addLane(root, 2, source);
     const [row] = probeLaneCheckouts({ poolRoot: root, git: gitFixture(), now });
     expect(row.forgeExecHasPrune).toBe(false);
+    expect(evaluate(row).breach).toBe(true);
+  });
+
+  it.each([
+    'export function parseTelemetry(text) { throw new Error("broken"); }',
+    'export function parseTelemetry(text) { while (true) {} }',
+    'export function parseTelemetry(text) { return process.env; }',
+    'export function parseTelemetry(text) { return JSON.constructor("return process")(); }',
+  ])('handles VM throws, timeout and unavailable host globals: %s', source => {
+    addLane(root, 2, source);
+    expect(probeLaneCheckouts({ poolRoot: root, git: gitFixture(), now })[0].forgeExecHasPrune).toBe(false);
+  });
+
+  it('terminates infinite Promise microtasks and proceeds with subsequent health work', () => {
+    const scheduleLoop = 'Promise.resolve().then(() => { while (true) {} });';
+    // Cover both the reported raw-JSON bypass and an otherwise valid parser:
+    // neither a false nor a true synchronous result may let queued work escape.
+    addLane(root, 1, `export function parseTelemetry(text) { ${scheduleLoop} return JSON.parse(text); }`);
+    addLane(root, 2, freshSource.replace('export function parseTelemetry(text) {',
+      `export function parseTelemetry(text) { ${scheduleLoop}`));
+    addLane(root, 3, freshSource);
+    const output = execFileSync(process.execPath, ['--input-type=module', '-e', `
+      const probeUrl = process.argv[1];
+      const { probeLaneCheckouts } = await import(probeUrl);
+      const { default: smell } = await import(new URL('./health-smells/lane-stale-checkout.mjs', probeUrl));
+      const now = 1800000000000;
+      const rows = probeLaneCheckouts({
+        poolRoot: process.argv[2], now, mainTipTimeMs: now,
+        git: args => args[0] === 'rev-parse' ? 'abcdef123'
+          : args[0] === 'merge-base' ? 'fork'
+          : args[0] === 'rev-list' ? '0' : String(now / 1000),
+      });
+      // A later event-loop turn proves no queued infinite microtask escaped.
+      setImmediate(() => {
+        const health = smell.evaluate({ laneCheckouts: rows }, { now });
+        process.stdout.write(JSON.stringify({
+          parsers: rows.map(row => row.forgeExecHasPrune),
+          breaches: health.map(row => row.breach),
+          recommendation: health[0].recommendation,
+          subsequentHealthWork: true,
+        }));
+      });
+    `, pathToFileURL(resolve('scripts/conveyor/lane-checkout-probe.mjs')).href, root], {
+      encoding: 'utf8', timeout: 5000, killSignal: 'SIGKILL', maxBuffer: 64 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    expect(JSON.parse(output)).toMatchObject({
+      parsers: [false, false, true], breaches: [true, true, false], subsequentHealthWork: true,
+      recommendation: expect.stringContaining('lane-pool refresh/reclaim'),
+    });
+  }, 10_000);
+
+  it('survives parser memory exhaustion and continues subsequent health work', () => {
+    addLane(root, 1, 'export function parseTelemetry(text) { return new Array(4294967295).fill(0); }');
+    addLane(root, 2, `export function parseTelemetry(text) {
+      const held = []; while (true) held.push(new Array(100000).fill(0));
+    }`);
+    addLane(root, 3, freshSource);
+    // Bound the test's parent too: a regression must fail this subprocess, never
+    // take down Vitest. Production parser children have their own smaller cap.
+    const output = execFileSync(process.execPath, ['--max-old-space-size=128', '--input-type=module', '-e', `
+      const probeUrl = process.argv[1];
+      const { probeLaneCheckouts } = await import(probeUrl);
+      const { default: smell } = await import(new URL('./health-smells/lane-stale-checkout.mjs', probeUrl));
+      const now = 1800000000000;
+      const rows = probeLaneCheckouts({
+        poolRoot: process.argv[2], now, mainTipTimeMs: now,
+        git: args => args[0] === 'rev-parse' ? 'abcdef123'
+          : args[0] === 'merge-base' ? 'fork'
+          : args[0] === 'rev-list' ? '0' : String(now / 1000),
+      });
+      setImmediate(() => {
+        const health = smell.evaluate({ laneCheckouts: rows }, { now });
+        process.stdout.write(JSON.stringify({
+          parsers: rows.map(row => row.forgeExecHasPrune),
+          breaches: health.map(row => row.breach),
+          recommendation: health[0].recommendation,
+          subsequentHealthWork: true,
+        }));
+      });
+    `, pathToFileURL(resolve('scripts/conveyor/lane-checkout-probe.mjs')).href, root], {
+      encoding: 'utf8', timeout: 8000, killSignal: 'SIGKILL', maxBuffer: 64 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    expect(JSON.parse(output)).toMatchObject({
+      parsers: [false, false, true], breaches: [true, true, false], subsequentHealthWork: true,
+      recommendation: expect.stringContaining('lane-pool refresh/reclaim'),
+    });
+  }, 10_000);
+
+  it.each(['// no parser', 'export function parseTelemetry('])('keeps unextractable source unknown: %s', source => {
+    addLane(root, 2, source);
+    expect(probeLaneCheckouts({ poolRoot: root, git: gitFixture(), now })[0].forgeExecHasPrune).toBe(null);
+  });
+
+  it('breaches for a fresh lane commit on an old fork point', () => {
+    addLane(root, 2, freshSource);
+    const fixture = gitFixture();
+    const git = vi.fn((args, options) => args[0] === 'log' && args.at(-1) === 'fork-sha'
+      ? String((now - 2 * smell.maxBehindMs) / 1000) : fixture(args, options));
+    const [row] = probeLaneCheckouts({ poolRoot: root, git, now, mainTipTimeMs: now });
+    expect(row).toMatchObject({ head: '222222222', behind: 0, headLagMs: 2 * smell.maxBehindMs });
+    expect(evaluate(row).breach).toBe(true);
+    expect(git).toHaveBeenCalledWith(['merge-base', 'HEAD', 'origin/main'], expect.any(Object));
+    expect(git).toHaveBeenCalledWith(['log', '-1', '--format=%ct', 'fork-sha'], expect.any(Object));
+    expect(git.mock.calls.some(([args]) => args[0] === 'log' && args.at(-1) === 'HEAD')).toBe(false);
+  });
+
+  it('keeps freshness unknown if either timestamp is unreadable', () => {
+    addLane(root, 2, freshSource);
+    const fixture = gitFixture();
+    const git = (args, options) => args[0] === 'log' && args.at(-1) === 'origin/main'
+      ? 'invalid' : fixture(args, options);
+    const [row] = probeLaneCheckouts({ poolRoot: root, git, now, mainTipTimeMs: now });
+    expect(row.headLagMs).toBe(null);
     expect(evaluate(row).breach).toBe(true);
   });
 
@@ -247,10 +362,24 @@ describe('probeLaneCheckouts', () => {
     expect(evaluate(row).recommendation).toContain('lane-pool refresh/reclaim');
   });
 
-  it('returns no lanes for null, missing or non-directory roots', () => {
+  it('returns no lanes only when the pool root is unconfigured', () => {
     expect(probeLaneCheckouts({ poolRoot: null })).toEqual([]);
-    expect(probeLaneCheckouts({ poolRoot: join(root, 'missing') })).toEqual([]);
+  });
+
+  it('throws for missing, non-directory or unreadable configured roots', () => {
+    expect(() => probeLaneCheckouts({ poolRoot: '' })).toThrow();
+    expect(() => probeLaneCheckouts({ poolRoot: join(root, 'missing') })).toThrow();
     writeFileSync(join(root, 'file'), '');
-    expect(probeLaneCheckouts({ poolRoot: join(root, 'file') })).toEqual([]);
+    expect(() => probeLaneCheckouts({ poolRoot: join(root, 'file') })).toThrow();
+    expect(() => probeLaneCheckouts({ poolRoot: root, readdir: () => { throw new Error('EACCES'); } })).toThrow('EACCES');
+  });
+
+  it('throws when an existing root yields zero pools, including swallowed child read failures', () => {
+    expect(() => probeLaneCheckouts({ poolRoot: root })).toThrow('no pools');
+    addLane(root, 2, freshSource);
+    expect(() => probeLaneCheckouts({ poolRoot: root, readdir: path => {
+      if (path === root) return ['pool'];
+      throw new Error('EACCES');
+    } })).toThrow('no pools');
   });
 });
