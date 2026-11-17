@@ -46,6 +46,7 @@ const log5008 = `main CI (ci.yml@main): green
 merge-gate: HOLD — held`;
 const log4965 = complete(log4965Raw);
 const candidacy = complete(log4965Raw.split('\n').filter(l => !l.includes('test-gaming')).join('\n'));
+const candidacyWithCodeqlHold = candidacy.replace(/^(  )pass(\s+codeql\s)/m, '$1hold$2');
 const sha = 'a'.repeat(40);
 const row = { name: 'merge-gate', id: 123, status: 'COMPLETED', conclusion: 'FAILURE' };
 const green = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' };
@@ -265,13 +266,13 @@ describe('fast draft promotion merge-gate holds', () => {
       mergeGateSetting: kind === 'off' ? 'off' : 'on',
       readMergeGateVerdict: () => {
         if (kind === 'throws') throw Error('offline');
-        return kind === 'unreadable' ? { error: 'missing' } : verdict(kind === 'real' ? candidacy.replace('candidate-label', 'codeql') : candidacy);
+        return kind === 'unreadable' ? { error: 'missing' } : verdict(kind === 'real' ? candidacyWithCodeqlHold : candidacy);
       } });
     expect(out.result.rows[0].action).toBe('skip');
     expect(out.ready).not.toHaveBeenCalled();
   });
   it('keeps a real hold red at the first head read', () => {
-    const out = step({ readMergeGateVerdict: () => verdict(candidacy.replace('candidate-label', 'codeql')) });
+    const out = step({ readMergeGateVerdict: () => verdict(candidacyWithCodeqlHold) });
     expect(out.result.rows[0]).toMatchObject({ action: 'skip', why: expect.stringContaining('read red') });
     expect(out.ready).not.toHaveBeenCalled();
   });
@@ -377,7 +378,7 @@ describe('fresh review CI merge-gate holds', () => {
       readLabels: () => kind === 'candidate' ? [{ name: 'ready-to-merge' }] : [],
       readMergeGateVerdict: () => {
         if (kind === 'throws') throw Error('offline');
-        return kind === 'unreadable' ? { error: 'missing' } : verdict(kind === 'real' ? candidacy.replace('candidate-label', 'codeql') : candidacy);
+        return kind === 'unreadable' ? { error: 'missing' } : verdict(kind === 'real' ? candidacyWithCodeqlHold : candidacy);
       } });
     expect(result).toMatchObject({ allowed: false, reason: 'required-checks-not-successful',
       affected: [{ name: 'merge-gate', reason: 'failure' }] });
