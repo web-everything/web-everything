@@ -18,8 +18,8 @@
  *   WHY a subprocess and not an import: the block factories (`createCard`/`createBadge`/`createTag`) live
  *   in FUI; a WE→FUI code import is a banned backward DAG edge (constellation-placement). So WE
  *   orchestrates the FUI compute over a process boundary — keyed-batch JSON in on stdin, keyed-batch
- *   `{producer, results:[{key, html|error}]}` out on stdout. ONE subprocess renders every component on a
- *   page (no per-tile spawn storm).
+ *   `{producer, results:[{key, html|error}]}` out on stdout. Bounded batches share subprocesses across
+ *   components (no per-tile spawn storm).
  *
  *   The CLI is resolved as a LOCKED build-artifact at a FIXED relative path, never PATH-resolved (the
  *   #1867 reproducibility amendment carried over). FUI's `npm run build:tools` (#1946/#2016) emits it; a
@@ -66,6 +66,11 @@ function resolveFuiRoot(repoRoot) {
  *  Kept in sync with `frontierui/blocks/renderers/component-render/buildHarness.ts:BUILD_HARNESS_PRODUCER`. */
 const EXPECTED_PRODUCER = 'frontierui/component-render-build-harness/1';
 
+// Whole-site output grows with the backlog and can exceed the CLI's 64 MiB buffer. Keep the same
+// per-process output limit and amortize startup over bounded batches instead of the entire site.
+// An oversized individual batch still fails the build; reduce its content or batch size to recover.
+const COMPONENT_BATCH_SIZE = 512;
+
 /**
  * Shell out to the pinned FUI build-CLI: keyed-batch JSON on stdin, keyed-batch envelope on stdout.
  * `repoRoot` is the WE repo root the fixed relative artifact path is resolved against. Throws a hard
@@ -98,23 +103,25 @@ function runBuildBatch(entries, repoRoot, runner = execFileSync) {
 }
 
 /**
- * Render a keyed batch of component specs to a `{ key -> html }` map in one subprocess call. Each spec is
+ * Render component specs to a `{ key -> html }` map in batches of at most 512 specs. Each spec is
  * `{ key, component: 'card'|'badge'|'tag', config }`. A per-entry error is surfaced to the build log and
  * that key is omitted from the map (keyed-batch isolation — one bad spec never poisons the others).
  */
 function renderComponents(specs, repoRoot, runner = execFileSync) {
   if (!Array.isArray(specs) || specs.length === 0) return new Map();
-  const batch = runBuildBatch(specs, repoRoot, runner);
   const byKey = new Map();
-  for (const res of batch.results) {
-    if (!res || res.error || !res.html) {
-      if (res && res.error) {
-        // eslint-disable-next-line no-console
-        console.warn(`[component-render build] spec "${res && res.key}" failed, omitted: ${res.error}`);
+  for (let offset = 0; offset < specs.length; offset += COMPONENT_BATCH_SIZE) {
+    const batch = runBuildBatch(specs.slice(offset, offset + COMPONENT_BATCH_SIZE), repoRoot, runner);
+    for (const res of batch.results) {
+      if (!res || res.error || !res.html) {
+        if (res && res.error) {
+          // eslint-disable-next-line no-console
+          console.warn(`[component-render build] spec "${res && res.key}" failed, omitted: ${res.error}`);
+        }
+        continue;
       }
-      continue;
+      byKey.set(res.key, res.html);
     }
-    byKey.set(res.key, res.html);
   }
   return byKey;
 }
@@ -616,7 +623,7 @@ function findComponentPlaceholders(html) {
 
 /**
  * The `weComponentSSR` Eleventy transform body (#2098): batch every generic `<we-card|we-badge
- * data-we-spec>` placeholder on one page through the pinned FUI CLI in ONE subprocess call and splice each
+ * data-we-spec>` placeholder on one page through bounded batches in the pinned FUI CLI and splice each
  * returned SSR fragment in place of its placeholder. Returns `content` unchanged when the page carries no
  * placeholder (a single substring check — the common case pays nothing). Per-entry errors are isolated:
  * a failed spec leaves its original placeholder intact (the client CE + `style.css` SSR baseline still
@@ -651,16 +658,17 @@ function spliceComponents(content, repoRoot, runner = execFileSync) {
 
 /**
  * Build-level generalization of {@link spliceComponents} (#2185) — splice EVERY generic `<we-card|we-badge|
- * we-tag data-we-spec>` placeholder across the WHOLE written site in ONE subprocess call, instead of one
+ * we-tag data-we-spec>` placeholder across the written site in bounded batches, instead of one
  * cold `node` spawn per page.
  *
  * WHY: the former `weComponentSSR` per-page transform paid a full `node`+happy-dom cold start (~0.2–0.4s)
  * on every page carrying a placeholder. The backlog dogfood (#2102) put 4 `weCard` placeholders on all
  * ~2167 backlog item pages, so a cold `build:docs` serially spawned ~2167 subprocesses (~16 min) — long
  * enough that the 11ty dev server never bound its port in a usable time and the Vite `/backlog/…` proxy
- * ECONNREFUSED'd the whole window. Batching every page's placeholders into a single keyed subprocess pays
- * the cold start ONCE; output is byte-identical (the placeholder's `data-we-spec` is self-describing, so
- * re-extracting + splicing post-write yields the same SSR fragment the per-page transform produced).
+ * ECONNREFUSED'd the whole window. Sharing keyed batches across pages amortizes cold starts without
+ * exceeding the whole-site output buffer; output is byte-identical (the placeholder's `data-we-spec`
+ * is self-describing, so re-extracting + splicing post-write yields the same SSR fragment the per-page
+ * transform produced).
  *
  * Driven off the `eleventy.after` event's `results` (each `{ outputPath, content }` — the final written
  * page). In `--serve` incremental rebuilds `results` is just the changed pages, so a dev edit re-splices
@@ -674,7 +682,7 @@ function spliceComponents(content, repoRoot, runner = execFileSync) {
 function spliceComponentsBatch(results, repoRoot, runner = execFileSync, writeFile = fs.writeFileSync) {
   if (!Array.isArray(results) || results.length === 0) return { pages: 0, components: 0 };
 
-  // Pass 1 — collect every placeholder across every written HTML page into ONE globally-keyed batch.
+  // Pass 1 — collect every placeholder across every written HTML page with globally unique keys.
   const perPage = []; // { outputPath, content, spliced: [{ globalKey, match }] }
   const specs = [];
   let gk = 0;
@@ -694,7 +702,8 @@ function spliceComponentsBatch(results, repoRoot, runner = execFileSync, writeFi
   }
   if (specs.length === 0) return { pages: 0, components: 0 };
 
-  // ONE subprocess for the entire site (keyed-batch in / keyed-batch out).
+  // Bounded subprocess batches for the site. Finish all rendering before rewriting any page, so a
+  // later batch failure still fails the build without writing a partially SSR-spliced site.
   const rendered = renderComponents(specs, repoRoot, runner);
 
   // Pass 2 — splice each page's placeholders and write the finished page back over itself. A per-entry

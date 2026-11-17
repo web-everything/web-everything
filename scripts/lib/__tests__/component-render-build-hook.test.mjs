@@ -507,12 +507,53 @@ describe('spliceComponents — one subprocess per page, splice each placeholder 
   });
 });
 
-describe('spliceComponentsBatch — one subprocess for the WHOLE build (#2185)', () => {
+describe('spliceComponentsBatch — bounded subprocess batches across the build (#2185)', () => {
   // Capture what the (injected) writeFile would persist, keyed by outputPath.
   function makeWriter() {
     const written = new Map();
     return { writeFile: (p, c) => written.set(p, c), written };
   }
+
+  const largeSite = () => Array.from({ length: 1025 }, (_, i) => ({
+    outputPath: `/site/${i}/index.html`,
+    content: `<we-card data-we-spec='${JSON.stringify({ component: 'card', config: { title: `Card ${i}` } })}'>fallback</we-card>`,
+  }));
+
+  it('bounds large renders and preserves every global key and page across batch boundaries', () => {
+    const batches = [];
+    const boundedRunner = (_cmd, _args, opts) => {
+      const entries = JSON.parse(opts.input);
+      // Model the CLI output limit without allocating a site-sized HTML response in this fixture.
+      if (entries.length > 512) throw Object.assign(new Error('output buffer exceeded'), { code: 'ENOBUFS' });
+      batches.push(entries.map(e => e.key));
+      expect(opts.maxBuffer).toBe(64 * 1024 * 1024);
+      return JSON.stringify({ producer: EXPECTED_PRODUCER,
+        results: entries.map(e => ({ key: e.key, html: `<article>${e.config.title} $&</article>` })) });
+    };
+    const { writeFile, written } = makeWriter();
+    expect(spliceComponentsBatch(largeSite(), stubRoot, boundedRunner, writeFile))
+      .toEqual({ pages: 1025, components: 1025 });
+    expect(batches).toHaveLength(3);
+    expect(batches.flat()).toEqual(Array.from({ length: 1025 }, (_, i) => `we-c-${i}`));
+    for (let i = 0; i < 1025; i++) {
+      expect(written.get(`/site/${i}/index.html`)).toBe(`<article>Card ${i} $&</article>`);
+    }
+  });
+
+  it.each(['buffer', 'producer'])('a later batch %s failure aborts before any SSR page is rewritten', (failure) => {
+    let calls = 0;
+    const failingRunner = (_cmd, _args, opts) => {
+      calls++;
+      if (calls === 2 && failure === 'buffer') throw Object.assign(new Error('output buffer exceeded'), { code: 'ENOBUFS' });
+      return JSON.stringify({ producer: calls === 2 ? 'stale/0' : EXPECTED_PRODUCER,
+        results: JSON.parse(opts.input).map(e => ({ key: e.key, html: '<article>rendered</article>' })) });
+    };
+    const { writeFile, written } = makeWriter();
+    expect(() => spliceComponentsBatch(largeSite(), stubRoot, failingRunner, writeFile))
+      .toThrow(failure === 'buffer' ? /output buffer exceeded/ : /producer pin mismatch/);
+    expect(calls).toBe(2);
+    expect(written.size).toBe(0);
+  });
 
   it('collects placeholders across MANY pages and renders them in ONE subprocess, writing each page back', () => {
     let calls = 0;
