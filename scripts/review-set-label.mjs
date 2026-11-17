@@ -4,7 +4,7 @@ import { standingRulingScope } from './conveyor/standing-ruling-io.mjs';
 import { signalFixDispatch } from './lib/fix-handoff.mjs';
 import { mandatoryReferralState, readReferralRecords, referralRecordState } from './lib/jury-core.mjs';
 import { referralSeatDisabled } from './operations/review-seat-policy.mjs';
-import { readReviewRunEvidence } from './conveyor/review-referral-hold.mjs';
+import { readReviewRunEvidence, blockRuledReferralsFor } from './conveyor/review-referral-hold.mjs';
 /**
  * review-set-label.mjs — swap a PR's review label, INVARIANT-2 guarded (#2470, increment 2 of 2). Also the
  * SINGLE HOME of the shared review-label CLI harness (#2644): a PURE `decideSetLabel` decides the swap for a
@@ -2007,6 +2007,10 @@ export function runReviewLabelCli({
       || !names?.includes(REVIEW_LABELS.pending)
       || [REVIEW_LABELS.human, REVIEW_LABELS.changes].some(l => names.includes(l))) {
       throw new Error('pinned changes head or pending labels changed; nothing further written');
+    }
+    // A withdrawn ruling or a newly pending referral since the caller read it must not authorize the bounce.
+    if (!blockRuledReferralsFor({ ...fresh, number: Number(pr) }, { repo }).length) {
+      throw new Error('pinned changes: referral state no longer owes a block; nothing further written');
     }
   };
   const assertPinnedRearmHead = (fresh) => {

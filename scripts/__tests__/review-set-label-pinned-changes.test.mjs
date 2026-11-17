@@ -1,5 +1,6 @@
 import { afterEach, describe, it, expect, vi } from 'vitest';
 vi.mock('../lib/verdict-ledger.mjs', async original => ({ ...(await original()), appendVerdict: vi.fn(() => ({ ok: true })) }));
+vi.mock('../conveyor/review-referral-hold.mjs', async original => ({ ...(await original()), blockRuledReferralsFor: () => (globalThis.__noBlock ? [] : [{ key: 'k', finding: { summary: 'x' } }]) }));
 import { runReviewLabelCli } from '../review-set-label.mjs';
 import { appendVerdict } from '../lib/verdict-ledger.mjs';
 const head = 'a'.repeat(40);
@@ -26,6 +27,12 @@ describe('guarded changes through sanctioned CLI', () => {
     const r = run(); expect(r.exit).toBe(0);
     expect(r.provider.postComment).toHaveBeenCalledWith('o/n', '7', 'Fix the blocked case');
     expect(r.provider.setLabels).toHaveBeenCalledTimes(1);
+  });
+  it('refuses when referral state no longer owes a block', () => {
+    globalThis.__noBlock = true;
+    let r; try { r = run(); } finally { delete globalThis.__noBlock; }
+    expect(r.exit).toBe(1);
+    expect(r.provider.postComment).not.toHaveBeenCalled(); expect(r.provider.setLabels).not.toHaveBeenCalled();
   });
   it('refuses a malformed pin before reading or writing', () => {
     const r = run({ pin: 'bad' }); expect(r.exit).toBe(2);
