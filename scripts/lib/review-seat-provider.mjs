@@ -17,8 +17,10 @@
  * with no entry the seat is Claude-only and there is no agy seat (native-first). The policy file is the project
  * layer that extends it; this module holds no other default.
  *
- * PURE apart from {@link loadReviewSeatSettings}, which reads the live (last-good, validated) policy.
+ * Routing inputs default to live aiRouting; callers can inject a coordinator and snapshot operatorKeys.
+ * {@link loadReviewSeatSettings} also reads the live (last-good, validated) routing policy.
  */
+import { aiRoutingInputs, resolveAiRouting } from './ai-routing.mjs';
 import { createHash } from 'node:crypto';
 import { resolveReviewSeatSafeguards, resolveShadowSeatModel } from './review-seat-settings.mjs';
 import { readRoutingPolicy } from './dispatch-routing-policy-io.mjs';
@@ -47,26 +49,26 @@ export const REVIEW_SEAT_PLATFORM_DEFAULT = Object.freeze({
   agyCorrectnessAdvisory: false,
 });
 
-function routeFor(policy, task) {
-  return resolveOperationRoute({ operation: REVIEW_SEAT_OPERATION, taskType: task, available: ['claude', ...AGY_PROVIDERS], policy });
+function routeFor(policy, task, aiRouting, operatorKeys) {
+  return resolveOperationRoute({ operation: REVIEW_SEAT_OPERATION, taskType: task, available: ['claude', ...AGY_PROVIDERS], policy, aiRouting, operatorKeys });
 }
 
 /**
- * Derive the seat settings from a validated routing policy. PURE.
+ * Derive the seat settings from a validated routing policy (inject aiRouting for a pure projection).
  * @param {object} policy - a `validateRoutingPolicy` result.
  * @returns {{seatProvider: {correctness: string, security: string}, seatModel: Object<string,string>,
  *   agyModel: string|null, agyCorrectnessAdvisory: boolean, shadowModelOverride: object|null}}
  */
-export function settingsFromRoutingPolicy(policy, { shadowModel = null } = {}) {
+export function settingsFromRoutingPolicy(policy, { shadowModel = null, aiRouting = aiRoutingInputs('review', resolveAiRouting()).coordinator, operatorKeys = Object.keys(policy.operations) } = {}) {
   const seatProvider = { ...REVIEW_SEAT_PLATFORM_DEFAULT.seatProvider };
   const seatModel = {};
   for (const lens of SEAT_PROVIDER_LENSES) {
-    const route = routeFor(policy, mandatorySeatTask(lens));
+    const route = routeFor(policy, mandatorySeatTask(lens), aiRouting, operatorKeys);
     if (!route || !AGY_PROVIDERS.includes(route.provider)) continue;
     seatProvider[lens] = route.mode === 'shadow' ? 'shadow' : 'agy';
     seatModel[lens] = route.model;
   }
-  const advisory = routeFor(policy, AGY_ADVISORY_SEAT_TASK);
+  const advisory = routeFor(policy, AGY_ADVISORY_SEAT_TASK, aiRouting, operatorKeys);
   const advisoryOn = Boolean(advisory && AGY_PROVIDERS.includes(advisory.provider));
   return Object.freeze({
     seatProvider: Object.freeze(seatProvider),
@@ -89,9 +91,13 @@ export function logReviewSeat(log, message) {
 }
 
 /** The live routing settings plus the advisory shadow model cascade; log each distinct selection once. */
-export function loadReviewSeatSettings({ policy = readRoutingPolicy(), shadowModel = resolveShadowSeatModel(), safeguards = null, log = (m) => console.error(m) } = {}) {
+export function loadReviewSeatSettings({ policy, operatorKeys, aiRouting = aiRoutingInputs('review', resolveAiRouting()).coordinator, shadowModel = resolveShadowSeatModel(), safeguards = null, log = (m) => console.error(m) } = {}) {
+  if (policy === undefined) {
+    policy = readRoutingPolicy();
+    operatorKeys ??= readRoutingPolicy.operatorKeys();
+  }
   const resolved = safeguards ?? resolveReviewSeatSafeguards({ log });
-  const settings = Object.freeze({ ...settingsFromRoutingPolicy(policy, { shadowModel }),
+  const settings = Object.freeze({ ...settingsFromRoutingPolicy(policy, { shadowModel, aiRouting, operatorKeys }),
     shadowPolicy: resolved.value, minNonClaudeSeats: resolved.value.minNonClaudeSeats });
   const lenses = SEAT_PROVIDER_LENSES.filter((lens) => settings.seatProvider[lens] === 'shadow');
   if (lenses.length) {
