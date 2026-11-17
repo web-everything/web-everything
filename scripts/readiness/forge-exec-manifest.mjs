@@ -219,8 +219,6 @@ const SIGNATURES=[
   '1020d3ec8468a270603103001020','1020d3ec8468a270600103001020',
   // Encrypted PKCS#8 (EncryptedPrivateKeyInfo): PKCS#5 PBE/PBES2 algorithm OID
   '5010d07f688468a29060',
-  // DSA and DH algorithm OIDs (PKCS#8 AlgorithmIdentifier)
-  '104083ec8468a27060','103010d07f688468a29060',
   // SEC1 ECPrivateKey: version 1 + OCTET STRING of 32, 48, 66 bytes
   '0240101020','0340101020','2440101020',
   // OpenSSH key-v1 magic (with NUL) and the PuTTY key-file header
@@ -248,6 +246,26 @@ function derElement(bytes,start,limit) {
     for(let i=0;i<count;i++)length=length*256+bytes[start++];
   }
   return start+length<=limit?{tag,start,end:start+length,length}:null;
+}
+// DSA/DH AlgorithmIdentifiers are shared by SPKI public keys. Require the PKCS#8
+// version, AlgorithmIdentifier and private OCTET STRING instead of a bare OID.
+const DSA_DH_OIDS=['104083ec8468a27060','103010d07f688468a29060'].map(unreverse);
+function hasDsaDhPrivateKey(bytes) {
+  if(!DSA_DH_OIDS.some(oid=>bytes.includes(oid)))return false;
+  for(let start=0;start<bytes.length;start++) {
+    if(bytes[start]!==0x30)continue;
+    const sequence=derElement(bytes,start,bytes.length);
+    if(!sequence)continue;
+    const version=derElement(bytes,sequence.start,sequence.end);
+    if(!version||version.tag!==2||version.length!==1||bytes[version.start]>1)continue;
+    const algorithm=derElement(bytes,version.end,sequence.end);
+    if(!algorithm||algorithm.tag!==0x30)continue;
+    const oid=derElement(bytes,algorithm.start,algorithm.end);
+    if(!oid||!DSA_DH_OIDS.some(value=>bytes.subarray(algorithm.start,oid.end).equals(value)))continue;
+    const privateKey=derElement(bytes,algorithm.end,sequence.end);
+    if(privateKey?.tag===4&&privateKey.length>0)return true;
+  }
+  return false;
 }
 // RSA modulus lengths are not an enumeration. Require a complete SEQUENCE containing the version
 // and eight positive INTEGERs of RSAPrivateKey (also present in multi-prime version 1). Headers alone
@@ -283,7 +301,7 @@ function hasRsaPrivateKey(bytes) {
   }
   return false;
 }
-const hasSignature=bytes=>SIGNATURES.some(signature=>bytes.includes(signature))||hasRsaPrivateKey(bytes);
+const hasSignature=bytes=>SIGNATURES.some(signature=>bytes.includes(signature))||hasRsaPrivateKey(bytes)||hasDsaDhPrivateKey(bytes);
 // Require an exact private member and a known kty in the SAME object, in either order. Keep duplicate
 // members visible, including in JS-style objects; JSON.parse would discard earlier duplicate members.
 function hasJwkSecret(bytes) {

@@ -64,6 +64,45 @@ const views={
 };
 const embed=s=>`// config\nconst value = "${s}";\n`;
 const embedPlain=s=>`# data\nvalue: ${s}\n`;
+describe('shared algorithm OIDs distinguish public and private containers',()=>{
+  const algorithms=[
+    ['dsa',{modulusLength:1024,divisorLength:160}],['dh',{group:'modp14'}],
+    ['rsa',{modulusLength:1024}],['ed25519',{}],['x25519',{}],['ed448',{}],['x448',{}],
+    ...['prime256v1','secp384r1','secp521r1','secp256k1'].map(namedCurve=>['ec',{namedCurve}]),
+  ];
+  const containerViews={
+    der:bytes=>bytes,
+    ...views,
+    'unicode-escape':bytes=>[...bytes].map(byte=>'\\u'+byte.toString(16).padStart(4,'0')).join(''),
+    'utf16le-base64':bytes=>Buffer.from(bytes.toString('base64'),'utf16le'),
+    'utf16be-base64':bytes=>Buffer.from(bytes.toString('base64'),'utf16le').swap16(),
+  };
+  for(const [algorithm,options] of algorithms) {
+    const {publicKey,privateKey}=generateKeyPairSync(algorithm,options);
+    const publicDer=publicKey.export({format:'der',type:'spki'});
+    const privateDer=privateKey.export({format:'der',type:'pkcs8'});
+    for(const [view,encode] of Object.entries(containerViews)) {
+      it(`admits ${algorithm} ${options.namedCurve??''} SPKI in ${view}`,()=>{
+        const content=Buffer.from(encode(publicDer));
+        expect(credentialBufferFinding(content)).toBeNull();
+        expect(ordinaryPathKeyFinding(content)).toBeNull();
+        for(const tracked of [false,true])
+          expect(()=>manifestEntry(Buffer.from('docs/public-material.dat'),content,false,tracked)).not.toThrow();
+      });
+      if(algorithm==='dsa'||algorithm==='dh')
+        it(`still refuses ${algorithm} PKCS#8 in ${view}`,()=>{
+          // A preceding public container must not short-circuit a later private key.
+          for(const bytes of [privateDer,Buffer.concat([publicDer,privateDer,Buffer.from('tail')])]) {
+            const content=Buffer.from(encode(bytes));
+            expect(credentialBufferFinding(content)).toBe(FINDING);
+            for(const tracked of [false,true])
+              expect(()=>manifestEntry(Buffer.from('docs/material.dat'),content,false,tracked))
+                .toThrow(expect.objectContaining({code:'excluded-source-file'}));
+          }
+        });
+    }
+  }
+});
 const escapedRsaViews={
   unicode:b=>'\\u'+b.toString(16).padStart(4,'0'),
   'code point':b=>'\\u{'+b.toString(16)+'}',
