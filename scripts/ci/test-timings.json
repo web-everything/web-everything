@@ -1712,6 +1712,7 @@
  },
  "soak": {
   "scripts/conveyor/soak/breaks/lane-acquire-default-wait.soak.test.mjs": 2,
+  "scripts/conveyor/soak/breaks/ci-rerun-ignores-external-red-team.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/stall-sweep-pages-files-past-100.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/rebuild-operator-retired-live-overlay-adopts.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/restamp-comment-does-not-retrigger-merge-gate.soak.test.mjs": 2,
