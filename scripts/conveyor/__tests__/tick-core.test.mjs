@@ -14,6 +14,8 @@
  *     {@link planTick} composition — including the free-lane exclusion shared across builds and prepares.
  */
 import { describe, it, expect } from 'vitest';
+import { SessionsUnknown } from '../../lib/claude-sessions.mjs';
+import { aggregate } from '../../lib/claude-stores.mjs';
 import {
   retireBuildGuards,
   filterLaunches,
@@ -35,6 +37,7 @@ import {
   planTick,
   HELD_NOTE_EXCLUDED_REASONS,
   durableBuildNums,
+  readLiveAgentSessions,
   DEFAULT_BUILD_TTL_TICKS,
   DEFAULT_PREPARE_TTL_TICKS,
   DEFAULT_PREPARE_ITEM_TTL_TICKS,
@@ -2538,5 +2541,39 @@ describe('no-size item preparation policy', () => {
     ] });
     expect(out.decisions.spawnPrepareItems).toEqual([]);
     expect(out.nextState.prepareGuards).toEqual(expect.arrayContaining([expect.objectContaining({ num: 5745, kind: 'prepare-item' })]));
+  });
+});
+
+
+describe('partial session discovery preserves the durable build floor', () => {
+  const row = { sessionId: 'aaaaaaaa-1111-2222-3333-444444444444', storeKey: '/stores/a', name: 'conveyor-77' };
+  const read = (sessions) => ({ store: { key: '/stores/a' }, status: 'ok', sessions });
+  it('keeps positive rows on SessionsUnknown and blocks redispatch after restart', () => {
+    const evidence = aggregate([read([row]), { store: { key: '/stores/b' }, status: 'unreadable' }], { planProblems: [] });
+    expect(evidence.status).toBe('unknown');
+    const liveAgentSessions = readLiveAgentSessions(() => { throw new SessionsUnknown(evidence); });
+    expect(liveAgentSessions).toEqual([row]);
+    const out = planTick({
+      state: { queue: [{ num: 77, buildQueued: true }], lanes: [], prs: [] },
+      plan: { launch: [{ num: 77, lane: 4 }] }, freeLanes: [4], bookkeeping: {}, liveAgentSessions,
+    });
+    expect(out.decisions.spawnBuilds).toEqual([]);
+    expect(out.decisions.suppressedBuilds).toEqual([{ num: 77, lane: 4, by: 'num' }]);
+    expect(out.nextState.buildGuards).toEqual(expect.arrayContaining([expect.objectContaining({ num: '77', lane: null })]));
+  });
+  it('does not restore conflicting duplicates when carrying positive evidence', () => {
+    const evidence = aggregate([read([row, { ...row, name: 'conveyor-78' }, row,
+      { ...row, sessionId: 'bbbbbbbb-1111-2222-3333-444444444444', name: 'conveyor-99' }])], { planProblems: [] });
+    expect(evidence.status).toBe('unknown');
+    expect(evidence.problems).toEqual([expect.stringContaining('conflicting-duplicate-session')]);
+    const rows = readLiveAgentSessions(() => { throw new SessionsUnknown(evidence); });
+    expect(rows).toEqual([{ ...row, sessionId: 'bbbbbbbb-1111-2222-3333-444444444444', name: 'conveyor-99' }]);
+    expect(durableBuildNums(rows)).toEqual(['99']);
+  });
+  it('returns complete rows unchanged and propagates unrelated failures', () => {
+    const rows = [row];
+    expect(readLiveAgentSessions(options => { expect(options).toEqual({}); return rows; })).toBe(rows);
+    const failure = new Error('read failed');
+    expect(() => readLiveAgentSessions(() => { throw failure; })).toThrow(failure);
   });
 });

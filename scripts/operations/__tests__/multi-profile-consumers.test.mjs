@@ -250,9 +250,15 @@ describe('resume confirmation ownership table', () => {
   });
   it('resume spawn retains the owning profile through worker marking', () => {
     const exec = vi.fn(() => 'ok');
-    defaultSpawnAgent(['--bg', '--resume', sid, 'continue'], {
-      env: { CLAUDE_CONFIG_DIR: '/stores/a', ANTHROPIC_API_KEY: 'inherited' }, owningStore: '/stores/b',
-    }, { exec });
+    const mapSpy = vi.spyOn(claudeAccount, 'loadAccountMap').mockReturnValue({
+      accounts: { a: { configDir: '/stores/a' }, b: { configDir: '/stores/b' } },
+      daemons: {}, routing: { accountB: true },
+    });
+    try {
+      defaultSpawnAgent(['--bg', '--resume', sid, 'continue'], {
+        env: { CLAUDE_CONFIG_DIR: '/stores/a', ANTHROPIC_API_KEY: 'inherited' }, owningStore: '/stores/b',
+      }, { exec });
+    } finally { mapSpy.mockRestore(); }
     expect(exec.mock.calls[0][2].env).toMatchObject({ CLAUDE_CONFIG_DIR: '/stores/b', WE_CONVEYOR_WORKER: '1' });
     expect(exec.mock.calls[0][2].env.ANTHROPIC_API_KEY).toBeUndefined();
   });

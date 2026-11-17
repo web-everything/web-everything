@@ -1,4 +1,4 @@
-import { resolveLaunchAccount, applyWorkerEnv } from '../lib/claude-stores.mjs';
+import { resolveLaunchAccount, applyWorkerEnv, storeKey } from '../lib/claude-stores.mjs';
 import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 /** #3383 — Worker marker: tells an ORCHESTRATOR session apart from a spawned WORKER, so a hook-driven
@@ -36,13 +36,28 @@ export const WORKER_MARKER_VALUE = '1';
  *  Keychain in-process) replaces any inherited credential env; a refused label throws; otherwise `env` is unchanged. */
 export function markWorkerEnv(env = process.env, { map = loadAccountMap(), readKeychain, owningStore } = {}) {
   const out = { ...(env ?? {}), [WORKER_MARKER_ENV]: WORKER_MARKER_VALUE };
-  if (owningStore) return applyWorkerEnv(out, { kind: 'account', env: { CLAUDE_CONFIG_DIR: owningStore } });
   let launch;
   try {
     launch = resolveLaunchAccount({ env, map, home: env.HOME || homedir(), realpath: realpathSync });
     const selected = resolveAccount(env, map);
     if (selected.kind === 'account' && selected.account === 'b' && map.routing?.accountB !== true) {
       throw new AccountRefusal('account-b-routing-disabled');
+    }
+    if (owningStore !== undefined) {
+      const options = { home: env.HOME || homedir(), realpath: realpathSync };
+      let key, owners;
+      try {
+        // An override selects a configured store; it cannot invent a selector or auth identity.
+        if (typeof owningStore !== 'string' || !owningStore) throw new Error('Invalid owner');
+        key = storeKey(owningStore, options);
+        owners = Object.entries(map.accounts).filter(([, entry]) =>
+          Object.hasOwn(entry, 'configDir') && storeKey(entry.configDir, options) === key);
+      } catch { throw new AccountRefusal('owning-store-unavailable'); }
+      if (!owners.length) throw new AccountRefusal('owning-store-unavailable');
+      if (owners.some(([account]) => account === 'b') && map.routing?.accountB !== true) {
+        throw new AccountRefusal('account-b-routing-disabled');
+      }
+      return applyWorkerEnv(out, { kind: 'account', env: { CLAUDE_CONFIG_DIR: key } });
     }
   }
   catch (error) {

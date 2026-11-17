@@ -147,6 +147,7 @@
  *   mechanism.
  */
 
+import { SessionsUnknown } from '../lib/claude-sessions.mjs';
 import { planningRead, PLANNING_SNAPSHOT_ENV } from '../lib/planning-snapshot.mjs';
 import { childFailure } from '../lib/child-failure.mjs';
 import { mintSessionSlug } from './session-slug.mjs';
@@ -515,6 +516,16 @@ export function durableBuildNums(sessions) {
   }
   return out;
 }
+
+/** Keep confirmed rows when another store is unknown; never reinterpret an incomplete read as absence. */
+export function readLiveAgentSessions(listAgents) {
+  try { return listAgents({}); }
+  catch (error) {
+    if (error instanceof SessionsUnknown) return error.rows;
+    throw error;
+  }
+}
+
 
 /**
  * RETIRE the in-flight BUILD guard entries (SKILL §2 — three ways). Given the live build guards and the tick's
@@ -2123,13 +2134,13 @@ async function main(argv) {
   if (lanePoolError) process.stderr.write(`⚠ free-lane read failed (${lanePoolError}) — 0 free lanes this tick\n`);
 
   // #3403 — DURABLE build-guard floor: the live `claude agents --json` listing, fed to `durableBuildNums` inside
-  // `planTick`. Best-effort like the `gh` comment reads below — a failure (no `claude` on PATH, a timeout) leaves
+  // `planTick`. Incomplete discovery retains confirmed rows from readable stores. A total failure leaves
   // the floor unset (`[]`); the in-session guard + its TTL still cover the common case, exactly as an unset
   // `prRearmCounts` floor leaves the in-session `fixAttempts` tally as the sole guard.
   let liveAgentSessions = [];
   try {
     const { defaultListAgents } = await import('../operations/dispatch-lane-io.mjs');
-    liveAgentSessions = time('agentsReadMs', () => defaultListAgents({}));
+    liveAgentSessions = time('agentsReadMs', () => readLiveAgentSessions(defaultListAgents));
     // #3383 FOLLOW-UP — resolve REAL pid liveness for this same listing, feeding `durableBuildNums`'s new
     // `pidAlive === false` exclusion (see its own doc): a live audit found `conveyor-*` rows still listed 6-13.5
     // DAYS after their process died, which the durable floor's original "the listing clears itself" assumption

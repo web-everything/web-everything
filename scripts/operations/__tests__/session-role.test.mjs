@@ -233,3 +233,38 @@ describe('markWorkerEnv — account split (PR1)', () => {
     }
   });
 });
+
+
+describe('owningStore cannot bypass account validation or routing', () => {
+  const map = { accounts: { a: { configDir: '/stores/a' }, b: { configDir: '/stores/b' } },
+    daemons: { 'com.we.build-dispatch-daemon': 'a', 'com.we.fix-daemon': 'b' },
+    routing: { accountB: true }, '*': 'refuse', enforce: true };
+  const daemon = { XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' };
+  it.each([
+    ['null map and relative owner', {}, null, 'relative/store', 'map-unavailable'],
+    ['invalid map', {}, { ...map, accounts: { a: { configDir: 'relative/store' } } }, '/stores/a', 'map-unavailable'],
+    ['refused daemon', { XPC_SERVICE_NAME: 'com.we.refused' }, map, '/stores/a', 'account-unavailable'],
+    ['relative owner', daemon, map, 'relative/store', 'owning-store-unavailable'],
+    ['unmapped owner', daemon, map, '/stores/unmapped', 'owning-store-unavailable'],
+    ['empty owner', daemon, map, '', 'owning-store-unavailable'],
+    ['null owner', daemon, map, null, 'owning-store-unavailable'],
+    ['selected B disabled even when overriding to A', { XPC_SERVICE_NAME: 'com.we.fix-daemon' }, { ...map, routing: { accountB: false } }, '/stores/a', 'account-b-routing-disabled'],
+    ['override to B disabled', daemon, { ...map, routing: { accountB: false } }, '/stores/b', 'account-b-routing-disabled'],
+    ['override to B routing missing', daemon, { ...map, routing: undefined }, '/stores/b', 'account-b-routing-disabled'],
+  ])('refuses %s before reading credentials', (_name, env, accountMap, owningStore, reason) => {
+    let reads = 0;
+    expect(() => markWorkerEnv(env, { map: accountMap, owningStore, readKeychain: () => { reads++; return 'secret'; } }))
+      .toThrow(expect.objectContaining({ name: 'AccountRefusal', notApplied: true, reason }));
+    expect(reads).toBe(0);
+  });
+  it('selects a mapped owner after validation, scrubs credentials, and preserves the input', () => {
+    const env = { ...daemon, CLAUDE_CONFIG_DIR: '/stores/a', CLAUDE_CODE_OAUTH_TOKEN: 'old', ANTHROPIC_API_KEY: 'key', ANTHROPIC_AUTH_TOKEN: 'auth', KEEP: 'yes' };
+    expect(markWorkerEnv(env, { map, owningStore: '/stores/b' })).toEqual({
+      ...daemon, CLAUDE_CONFIG_DIR: '/stores/b', KEEP: 'yes', WE_CONVEYOR_WORKER: '1',
+    });
+    expect(env.CLAUDE_CONFIG_DIR).toBe('/stores/a');
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe('old');
+    expect(env.ANTHROPIC_API_KEY).toBe('key');
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe('auth');
+  });
+});
