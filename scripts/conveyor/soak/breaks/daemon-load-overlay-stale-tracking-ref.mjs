@@ -3,7 +3,7 @@
  * Plain fetch updates FETCH_HEAD but leaves origin/<ref> stale: the old count
  * reports up-to-date and never adopts the new tip. Exercise real local Git only.
  */
-import { mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -19,16 +19,9 @@ export default {
     where: 'lane/g12-overlay-refspec',
     paths: ['scripts/lib/daemon-load-overlay.mjs'],
   },
-  fixPresent(root) {
-    try {
-      return readFileSync(join(root, 'scripts/lib/daemon-load-overlay.mjs'), 'utf8')
-        
-        .split('\n').filter((l) => /\['fetch', '--quiet', '--', 'origin', /.test(l))
-        .every((l) => l.includes('overlayFetchRefspec(ref)'))
-        && readFileSync(join(root, 'scripts/lib/daemon-load-overlay.mjs'), 'utf8')
-          .includes('+refs/heads/${ref}:refs/remotes/origin/${ref}');
-    } catch { return false; }
-  },
+  // The fix ships in the same change as this break, so the probe is unconditional: the scenario is a REQUIRED
+  // pass. A source-marker probe would let a revert flip the test to `it.fails` and accept the regression.
+  fixPresent() { return true; },
   async run({ log, runGit = gitRun } = {}) {
     const dir = mkdtempSync(join(tmpdir(), 'soak-overlay-stale-tracking-'));
     const remote = join(dir, 'remote');
