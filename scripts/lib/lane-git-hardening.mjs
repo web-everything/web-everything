@@ -172,6 +172,8 @@ export function laneGitHardeningEnv(env = process.env, { remoteProbe = false, cr
   // No prompt either: an inherited askpass program (a caller inside a lane controls its env) would run on a credential
   // request, and a terminal prompt would hang an unattended transport.
   const out = { ...env, GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' };
+  // Lane-owned replace refs must never substitute the commits used by history and review proofs.
+  out.GIT_NO_REPLACE_OBJECTS = '1';
   delete out.GIT_EXTERNAL_DIFF;
   delete out.GIT_ASKPASS;
   delete out.SSH_ASKPASS;
