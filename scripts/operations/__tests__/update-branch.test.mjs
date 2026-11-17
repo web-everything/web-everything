@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createUpdateBranchSinks } from '../update-branch-io.mjs';
-import { updateBranchOperation, UPDATE_BRANCH_OP, finishUpdateBranch, fixAlreadyOnMain } from '../update-branch.mjs';
+import { updateBranchOperation, UPDATE_BRANCH_OP, finishUpdateBranch } from '../update-branch.mjs';
 import { parseOperationArgv, runOperationCli } from '../cli-adapter.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { withRealRepo } from './helpers/real-repo.mjs';
@@ -185,11 +185,5 @@ describe('update-branch', () => {
     expect(printed.split('\n')).toHaveLength(1);
     expect(JSON.parse(printed).reason).toBe(reason);
     expect(f.gh.mock.calls.flatMap(([args]) => args)).not.toContain(reason);
-  });
-
-  it('only identifies a fix already on main with positive behind count and a successful check', () => {
-    expect(fixAlreadyOnMain({ behindBy: 1, mainCheckConclusion: 'success' })).toBe(true);
-    for (const behindBy of [undefined, '1', 0, -1, NaN]) expect(fixAlreadyOnMain({ behindBy, mainCheckConclusion: 'success' })).toBe(false);
-    expect(fixAlreadyOnMain({ behindBy: 1, mainCheckConclusion: 'failure' })).toBe(false);
   });
 });

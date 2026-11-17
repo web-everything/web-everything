@@ -5,10 +5,6 @@ import { CONSTELLATION_REPOS, DEFAULT_REPO_KEY } from '../lib/constellation-repo
 
 export const UPDATE_BRANCH_OP = 'update-branch';
 
-export function fixAlreadyOnMain({ behindBy, mainCheckConclusion }) {
-  return Number.isSafeInteger(behindBy) && behindBy > 0 && mainCheckConclusion === 'success';
-}
-
 function validate({ pr, reason }) {
   if (!Number.isSafeInteger(pr) || pr < 1) throw new TypeError('update-branch: --pr must be a positive integer');
   if (typeof reason !== 'string' || !reason.trim()) throw new TypeError('update-branch: --reason is required and must be non-empty');
