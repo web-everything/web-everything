@@ -106,6 +106,15 @@ export function parsePrResultTable(log, prNumber) {
     if (summaries.length !== 1 || summaries[0] !== 'merge-gate: HOLD — held' || !footerAfterLast) {
       return { error: 'missing, ambiguous or job-level merge-gate failure' };
     }
+    // Every table precedes the sole footer, so ANY row-like line after it (even past another PR's header)
+    // is unreadable evidence, not noise.
+    const footerAt = lines.findIndex((line, i) => i > start && /^merge-gate:/.test(line));
+    for (const line of lines.slice(footerAt + 1)) {
+      const words = line.trim().split(/\s+/).filter(Boolean);
+      if (words.length && (statuses.has(words[0]) || (words.some(w => statuses.has(w)) && words.some(w => gates.has(w))))) {
+        return { error: 'verdict rows after the merge-gate footer' };
+      }
+    }
   }
   // A manual freeze takes precedence over main-CI red in combineRedMain, so the table row alone cannot prove main
   // CI passed. Green needs exactly one green diagnostic for THIS invocation (between the previous summary and the

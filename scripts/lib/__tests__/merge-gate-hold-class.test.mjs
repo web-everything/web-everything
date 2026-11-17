@@ -117,6 +117,14 @@ describe('all matching PR tables fail closed', () => {
       expect(read(log).mainCiGreen).toBe(false);
     }
   });
+  it('rejects late rows even when another PR header sits between the table and the footer', () => {
+    const other = table(8, 'HOLD', { 'review-acceptance': ['hold', 'human-only: y'] });
+    const late = '  hold              codeql                 security check failed';
+    for (const log of [`${review}\n${other}${footer}\n${late}`, `${review}\n${other}${footer}\nrunner diagnostic\n${late.trim()}`, `${review}\n${other}${footer}\n#9: HOLD\n${late}`]) {
+      expect(read(log).error).toMatch(/after the merge-gate footer/);
+      expect(excuse(log)).toEqual({ rows: [row], excused: false });
+    }
+  });
   it('rejects gate rows after the footer (round 3 audit)', () => {
     const late = '  hold              codeql                 CodeQL failed';
     for (const log of [`${review}${footer}\n${late}`, `${review}${footer}\n\n${late}`, `${review}${footer}\nrunner diagnostic\n${late}`, `${review}${footer}\nrunner diagnostic\n${late.trim()}`, `${review}${footer}\n  hold codeql`, `${review}${footer}\nrunner diagnostic\nhold codeql`, `${review}${footer}\nnote: codeql hold`]) {
