@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getThisHost } from '../../lib/daemon-host-guard.mjs';
 import { keepAliveScript } from '../../lib/test-keepalive.mjs';
+import { pidIdentity } from '../../lib/pid-alive.mjs';
 import {
   parseGateArgs, runGate, isEntrypoint, makeFileOwnerReader, POLL_MS,
 } from '../daemon-host-gate.mjs';
@@ -458,10 +459,6 @@ describe('real daemon process group', () => {
     while (!predicate() && Date.now() < deadline) await delay(10);
     expect(predicate()).toBe(true);
   }
-  const running = (pid) => {
-    try { process.kill(pid, 0); return true; }
-    catch (error) { if (error.code === 'ESRCH') return false; throw error; }
-  };
 
   it.each(['revoke', 'SIGTERM', 'SIGINT', 'SIGHUP', 'exit', 'leader-exit', 'shell-revoke', 'resistant-leader'])(
     '%s leaves no live descendant, including a worker that ignores SIGTERM', async (reason) => {
@@ -497,12 +494,14 @@ describe('real daemon process group', () => {
         });
         await waitFor(() => existsSync(ready));
         descendant = Number(readFileSync(ready, 'utf8'));
-        expect(running(descendant)).toBe(true);
+        expect(pidIdentity(descendant).alive).toBe(true);
         if (['revoke', 'shell-revoke', 'resistant-leader'].includes(reason)) { owner = 'macbook'; releaseWatch(); }
         else if (reason === 'leader-exit') child.kill('SIGTERM');
         else procSignals.emit(reason);
         await Promise.race([run, delay(3000).then(() => { throw new Error('gate did not settle'); })]);
-        await waitFor(() => !running(descendant));
+        // A killed orphan can remain a zombie until Linux's subreaper reaps it.
+        // Require positive death evidence; an unreadable probe is not success.
+        await waitFor(() => pidIdentity(descendant).alive === false);
         expect(procSignals.eventNames()).toEqual([]);
       } finally {
         if (child?.pid) {
