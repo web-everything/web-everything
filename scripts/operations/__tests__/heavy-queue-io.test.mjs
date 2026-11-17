@@ -132,6 +132,9 @@ describe('remote fallback summary', () => {
       mkdirSync(lockRoot,{recursive:true});
       const row = (age,reason) => JSON.stringify({ts:new Date(nowMs-age).toISOString(),reason});
       writeFileSync(join(lockRoot,'remote-fallbacks.jsonl'), [row(1,'ignored-test-file'),row(2,'ignored-test-file'),
+        row(1,'remote.enabled=true (platform); loadPerCore=2 <= 3'), row(1,'remote.enabled=false (standard)'),
+        row(1,'remote.enabled=true (platform); load-unreadable'), row(1,'explicit-local'),
+        ...['explicit-container','admission-off','ci-bypass','no-pool'].map(reason => row(1,reason)),
         row(3600000,'copy-failed'),row(86400001,'expired'),row(-1,'future'),'broken',JSON.stringify({reason:'no-ts'})].join('\n')+'\n');
       const collect = () => collectHeavyQueue({repo:root,env,now:()=>nowMs,readBaseline:null,
         readAdmission:()=>({cap:1,heldCount:0,freeCount:1,held:[],waiting:[]})});

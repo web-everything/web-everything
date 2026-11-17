@@ -23,6 +23,22 @@ describe('normalizeFallbackReason', () => {
 });
 
 describe('computeForgeShare', () => {
+  it.each([
+    'remote.enabled=true (platform); loadPerCore=2 <= 3',
+    'remote.enabled=false (standard)',
+    'remote.enabled=true (platform); load-unreadable',
+    'explicit-local', 'explicit-container', 'admission-off', 'ci-bypass', 'no-pool',
+  ])('does not let advisory %s consume a later copy-failed completion', reason => {
+    const r = computeForgeShare({...base, remoteRuns: [remote()],
+      localRuns: [{...local(5, 1000), lane: '7'}],
+      fallbacks: [{...fb(reason, 7), lane: 'lane-7'}, {...fb('copy-failed', 6), lane: 'lane-7'}]});
+    expect(r).toMatchObject({share: 0.5, byReason: {'copy-failed': 1},
+      expectedLocalByReason: {}, runs: {expectedLocal: 0, expectedLocalPending: 0, counted: 2}});
+    // Even a settings allowlist cannot turn a local advisory into a remote attempt.
+    expect(computeForgeShare({...base, expectedLocalReasons: [normalizeFallbackReason(reason)],
+      remoteRuns: [remote()], localRuns: [{...local(5, 1000), lane: '7'}],
+      fallbacks: [{...fb(reason, 6), lane: 'lane-7'}]}).runs.expectedLocal).toBe(0);
+  });
   it('is remote / (remote + counted local) with a by-reason breakdown', () => {
     const r = computeForgeShare({ ...base, remoteRuns: [remote(), remote(), remote()], localRuns: [local()], fallbacks: [fb('remote-full (30s wait exhausted)')] });
     expect(r.status).toBe('ok');

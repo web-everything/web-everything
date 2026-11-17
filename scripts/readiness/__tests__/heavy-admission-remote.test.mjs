@@ -211,23 +211,41 @@ describe('remote admission policy', () => {
   });
 
   it.each([
-    ['CI with Forge gate handoff', {CI:'true',WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'}, [], true, false, true],
-    ['admission off with Forge gate handoff', {WE_HEAVY_ADMISSION:'off',WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'}, [], true, false, true],
-    ['CI bypass without Forge gate handoff', { CI: 'true' }, [], true, false, false],
-    ['WE_HEAVY_ADMISSION=off bypass', { WE_HEAVY_ADMISSION: 'off' }, [], true, false, false],
-    ['--container', {}, ['--container'], true, true, false],
-    ['WE_HEAVY_ADMISSION_HELD=1', { WE_HEAVY_ADMISSION_HELD: '1' }, [], true, false, false],
-    ['WE_HEAVY_ADMISSION_HELD set to another truthy value', { WE_HEAVY_ADMISSION_HELD: 'true' }, [], true, true, false],
+    ['CI with Forge gate handoff', {CI:'true',WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'}, [], true, false, true, 'ci-bypass'],
+    ['admission off with Forge gate handoff', {WE_HEAVY_ADMISSION:'off',WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'}, [], true, false, true, 'admission-off'],
+    ['CI bypass without Forge gate handoff', { CI: 'true' }, [], true, false, false, 'ci-bypass'],
+    ['WE_HEAVY_ADMISSION=off bypass', { WE_HEAVY_ADMISSION: 'off' }, [], true, false, false, 'admission-off'],
+    ['no-pool leaves the pool absent', {}, [], true, false, false, null],
+    ['no-pool with --local', {}, ['--local'], true, false, false, null],
+    ['no-pool with --container', {}, ['--container'], true, false, false, null],
+    ['no-pool with container env', {WE_HEAVY_ADMISSION_CONTAINER:'1'}, [], true, false, false, null],
+    ['no-pool with CI', {CI:'true'}, [], true, false, false, null],
+    ['no-pool with admission off', {WE_HEAVY_ADMISSION:'off'}, [], true, false, false, null],
+    ['--local', {}, ['--local'], true, true, false, 'explicit-local'],
+    ['--local held wrapper', {WE_HEAVY_ADMISSION_HELD: '1'}, ['--local'], true, false, false, null],
+    ['--container held wrapper', {WE_HEAVY_ADMISSION_HELD: '1'}, ['--container'], true, false, false, null],
+    ['CI held wrapper', {CI:'true',WE_HEAVY_ADMISSION_HELD:'1'}, [], true, false, false, null],
+    ['admission off held wrapper', {WE_HEAVY_ADMISSION:'off',WE_HEAVY_ADMISSION_HELD:'1'}, [], true, false, false, null],
+    ['--local unwritable log', {}, ['--local'], true, true, false, 'explicit-local'],
+    ['--container unwritable log', {}, ['--container'], true, true, false, 'explicit-container'],
+    ['admission-off unwritable log', {WE_HEAVY_ADMISSION:'off'}, [], true, false, false, 'admission-off'],
+    ['ci-bypass unwritable log', {CI:'1'}, [], true, false, false, 'ci-bypass'],
+    ['--container', {}, ['--container'], true, true, false, 'explicit-container'],
+    ['container env', {WE_HEAVY_ADMISSION_CONTAINER:'1'}, [], true, true, false, 'explicit-container'],
+    ['--local with --container and CI', {CI:'true'}, ['--local','--container'], true, false, false, 'explicit-local'],
+    ['WE_HEAVY_ADMISSION_HELD=1', { WE_HEAVY_ADMISSION_HELD: '1' }, [], true, false, false, null],
+    ['WE_HEAVY_ADMISSION_HELD set to another truthy value', { WE_HEAVY_ADMISSION_HELD: 'true' }, [], true, true, false, null],
     ['remote disabled by default', {}, [], false, true, false],
     ['remote.* env vars cannot enable remote', {
       'remote.enabled': 'true', 'remote.mode': 'always',
       WE_HEAVY_ADMISSION_REMOTE_ENABLED: 'true', WE_HEAVY_ADMISSION_REMOTE_MODE: 'always',
     }, [], false, true, false],
-  ])('main run keeps %s local with the expected slot and execution report', async (_name, env, flags, enableRemote, acquiresSlot, reportsLocalCompletion) => {
+  ])('main run keeps %s local with the expected slot and execution report', async (_name, env, flags, enableRemote, acquiresSlot, reportsLocalCompletion, expectedReason) => {
     const root = mkdtempSync(join(tmpdir(), 'remote-main-local-'));
     const pool = join(root, 'pool');
     const lockRoot = join(pool, '.admission', 'heavy');
-    mkdirSync(pool);
+    const noPool = _name.startsWith('no-pool');
+    if (!noPool) mkdirSync(pool);
     const prefs = join(root, 'preferences.json');
     writeFileSync(prefs, JSON.stringify({ heavyAdmission: {
       ...(enableRemote ? { remote: { enabled: true, mode: 'always' } } : {}),
@@ -239,8 +257,11 @@ describe('remote admission policy', () => {
     for (const [key, value] of Object.entries({ LANE_POOL_ROOT: pool, WE_PLATFORM_PREFERENCES: prefs,
       CI: '', WE_HEAVY_ADMISSION: 'on', WE_HEAVY_ADMISSION_HELD: '', WE_FORGE_GATE_DISPATCH: '', WE_HEAVY_ADMISSION_CONTAINER: '',
       WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES: '', WE_HEAVY_ADMISSION_RUN_WAIT_MS: '0', WE_VERIFY_REMOTE_REPORT: join(root, 'verify-report.jsonl'), ...env })) vi.stubEnv(key, value);
-    const localExec = flags.includes('--container') ? execContainerized : execSync;
+    const fallbackFile = join(lockRoot, 'remote-fallbacks.jsonl');
+    if (_name.endsWith('unwritable log')) mkdirSync(fallbackFile, {recursive: true});
+    const localExec = flags.includes('--container') || env.WE_HEAVY_ADMISSION_CONTAINER === '1' ? execContainerized : execSync;
     vi.mocked(localExec).mockImplementation(() => {
+      if (noPool) expect(existsSync(pool)).toBe(false);
       expect(heldSlots({ lockRoot, cap: 2, fastSlots: 1 })).toHaveLength(acquiresSlot ? 1 : 0);
       throw Object.assign(new Error('local command exit'), { status: 17 });
     });
@@ -254,6 +275,13 @@ describe('remote admission policy', () => {
       }));
       expect(localExec.mock.calls[0][1].env).not.toHaveProperty('WE_FORGE_GATE_DISPATCH');
       expect(exit).toHaveBeenCalledWith(17);
+      if (expectedReason && !_name.endsWith('unwritable log')) {
+        const rows = readFileSync(fallbackFile, 'utf8').trim().split('\n').map(JSON.parse);
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({reason: expectedReason, kind: 'files'});
+      } else if (expectedReason === null) {
+        expect(existsSync(fallbackFile)).toBe(false);
+      }
       // A consumed Forge handoff must preserve the first local verdict even on a bypass.
       if (reportsLocalCompletion) {
         expect(JSON.parse(readFileSync(join(root, 'verify-report.jsonl'), 'utf8')))
@@ -262,6 +290,7 @@ describe('remote admission policy', () => {
         expect(existsSync(join(root, 'verify-report.jsonl'))).toBe(false);
       }
       expect(heldSlots({ lockRoot, cap: 2, fastSlots: 1 })).toHaveLength(0);
+      if (noPool) expect(existsSync(pool)).toBe(false);
       if (!enableRemote) expect(stderr).toHaveBeenCalledWith(expect.stringContaining('remote.enabled=false (standard)'));
     } finally {
       vi.mocked(execSync).mockReset(); vi.mocked(execContainerized).mockReset();
@@ -373,18 +402,54 @@ describe('runWithRemoteDecision', () => {
     expect(f.remoteExec).not.toHaveBeenCalled();
     expectLines(f.log, 1, 'local');
     expect(f.log.mock.calls[0][0]).toContain('remote.enabled=false (standard)');
+    expect(JSON.parse(readFileSync(join(f.lockRoot, 'remote-fallbacks.jsonl'), 'utf8').trim()))
+      .toMatchObject({reason: 'remote.enabled=false (standard)', lane: 'fixture-checkout', kind: 'files'});
   });
   it.each([
     ['below threshold -> local', {}, 2.9],
     ['at threshold -> local', {}, 3],
     ['disabled -> local', { enabled: false }, 100],
     ['unreadable load -> local', {}, NaN],
+    ['infinite load -> local', {}, Infinity],
   ])('%s without calling remoteExec', async (_name, remote, load) => {
     const f = fixture({ remote, load });
     expect(await runWithRemoteDecision(f)).toEqual({ handled: false });
     expect(f.remoteExec).not.toHaveBeenCalled();
     expectLines(f.log, 1, 'local');
     if (Number.isNaN(load)) expect(f.log.mock.calls[0][0]).toContain('load-unreadable');
+    const rows = readFileSync(join(f.lockRoot, 'remote-fallbacks.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(rows).toEqual([expect.objectContaining({reason: decideRemote({policy: f.policy, loadPerCore: load}).reason,
+      lane: 'fixture-checkout', kind: 'files', detail: null})]);
+  });
+
+  it('records exactly one load-unreadable row when the load probe throws', async () => {
+    const f = fixture();
+    f.loadPerCore.mockImplementation(() => { throw new Error('unreadable'); });
+    expect(await runWithRemoteDecision(f)).toEqual({handled: false});
+    expect(f.remoteExec).not.toHaveBeenCalled();
+    expect(JSON.parse(readFileSync(join(f.lockRoot, 'remote-fallbacks.jsonl'), 'utf8').trim()).reason)
+      .toContain('load-unreadable');
+  });
+
+  it('does not log whole-suite refusal as a local run', async () => {
+    const f = fixture();
+    expect(await runWithRemoteDecision({...f, argv: ['npx', 'vitest', 'run'],
+      policy: resolveAdmissionPolicy({platform: {wholeSuite: 'refuse'}})})).toEqual({handled: true, exitCode: 125});
+    expect(f.remoteExec).not.toHaveBeenCalled();
+    expect(existsSync(join(f.lockRoot, 'remote-fallbacks.jsonl'))).toBe(false);
+  });
+
+  it('keeps initial local logging bounded and best-effort', async () => {
+    const f = fixture({remote: {enabled: false}});
+    mkdirSync(f.lockRoot, {recursive: true});
+    const file = join(f.lockRoot, 'remote-fallbacks.jsonl');
+    writeFileSync(file, 'x'.repeat(2 * 1024 * 1024));
+    expect(await runWithRemoteDecision(f)).toEqual({handled: false});
+    expect(statSync(file).size).toBeLessThan(1024 * 1024);
+    expect(JSON.parse(readFileSync(file, 'utf8').trim().split('\n').at(-1)).reason).toContain('remote.enabled=false');
+    rmSync(file); mkdirSync(file);
+    expect(await runWithRemoteDecision(f)).toEqual({handled: false});
+    expect(f.remoteExec).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -401,6 +466,7 @@ describe('runWithRemoteDecision', () => {
     expect(f.remoteExec.mock.calls[0][0].argv).toBe(f.argv);
     expect(f.argv).toEqual(originalArgv);
     expectLines(f.log, 1, 'remote');
+    expect(existsSync(join(f.lockRoot, 'remote-fallbacks.jsonl'))).toBe(false);
   });
 
   it('keeps an opaque positional filter FULL while passing its literal argv unchanged', async () => {
@@ -457,6 +523,66 @@ describe('runWithRemoteDecision', () => {
     expect(JSON.parse(lines[0])).toEqual({ts:new Date(now).toISOString(),reason,
       detail:'fixture-file.mjs',lane:'fixture-checkout',kind:'files',
       pid:process.pid,ppid:process.ppid,sandbox:null});
+  });
+
+  it.each(['not-started', 'cancelled'])('records only the final local reason after warnings and confirmed %s', async mode => {
+    const f = fixture();
+    f.remoteExec.mockImplementation(async ({onWarning}) => {
+      onWarning('credential-warn', 'first warning');
+      onWarning('credential-warn', 'second warning');
+      return {mode, terminated: true, reason: 'copy-failed', detail: 'copy diagnostic'};
+    });
+    expect(await runWithRemoteDecision(f)).toEqual({handled: false});
+    expect(JSON.parse(readFileSync(join(f.lockRoot, 'remote-fallbacks.jsonl'), 'utf8').trim()))
+      .toMatchObject({reason: 'copy-failed', lane: 'fixture-checkout', kind: 'files',
+        detail: 'warnings: credential-warn: first warning; credential-warn: second warning; copy diagnostic'});
+  });
+
+  it('preserves bounded first warnings and fallback detail under oversized warning input', async () => {
+    const f = fixture();
+    f.remoteExec.mockImplementation(async ({onWarning}) => {
+      onWarning('credential-warn', 'first warning');
+      for (let n = 0; n < 200; n++) onWarning('advisory-' + n, 'x'.repeat(20000));
+      return {mode: 'not-started', terminated: true, reason: 'copy-failed', detail: 'y'.repeat(20000)};
+    });
+    expect(await runWithRemoteDecision(f)).toEqual({handled: false});
+    const rows = readFileSync(join(f.lockRoot, 'remote-fallbacks.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].detail).toContain('credential-warn: first warning');
+    expect(rows[0].detail).toContain('advisory-0:');
+    expect(rows[0].detail).toContain('advisory-1:');
+    expect(rows[0].detail).not.toContain('advisory-2:');
+    expect(rows[0].detail).toContain('y'.repeat(2048));
+    expect(rows[0].detail.length).toBeLessThanOrEqual(4096);
+  });
+
+  it('retains a bounded tail of oversized remote warnings without changing the remote result', async () => {
+    const f = fixture();
+    f.remoteExec.mockImplementation(async ({onWarning}) => {
+      for (let n = 0; n < 200; n++) onWarning('credential-warn' + 'x'.repeat(20000), `${n}:` + 'x'.repeat(20000));
+      onWarning('credential-warn', 'last warning');
+      return {mode: 'remote', code: 0};
+    });
+    expect(await runWithRemoteDecision(f)).toMatchObject({handled: true, exitCode: 0});
+    const file = join(f.lockRoot, 'remote-fallbacks.jsonl');
+    expect(statSync(file).size).toBeLessThan(1024 * 1024);
+    const rows = readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse);
+    expect(rows.length).toBeLessThan(201);
+    expect(rows.at(-1)).toMatchObject({reason: 'credential-warn', detail: 'last warning'});
+    expect(rows.every(row => row.reason.length <= 4096 && row.detail.length <= 4096)).toBe(true);
+  });
+
+  it.each([true, false])('late warnings respect the completed local=%s routing decision', async local => {
+    const f = fixture();
+    let warn;
+    f.remoteExec.mockImplementation(async ({onWarning}) => {
+      warn = onWarning;
+      return local ? {mode: 'not-started', terminated: true, reason: 'copy-failed'} : {mode: 'remote', code: 0};
+    });
+    expect(await runWithRemoteDecision(f)).toMatchObject({handled: !local});
+    warn('credential-warn', 'late warning');
+    expect(JSON.parse(readFileSync(join(f.lockRoot, 'remote-fallbacks.jsonl'), 'utf8').trim()).reason)
+      .toBe(local ? 'copy-failed' : 'credential-warn');
   });
 
   it.each(['EPERM', 'EACCES', 'EROFS'])('falls back confined-local on probe %s before health or remote dispatch', async code => {
@@ -723,6 +849,8 @@ describe('runWithRemoteDecision', () => {
       expect(await pending).toEqual({ handled: false });
       expect(local).toHaveBeenCalledTimes(1);
       expect(events).toEqual(['remote started', 'abort requested', 'remote stopped', 'local started']);
+      expect(JSON.parse(readFileSync(join(f.lockRoot, 'remote-fallbacks.jsonl'), 'utf8').trim()).reason)
+        .toBe('remote-timeout');
       expect(vi.getTimerCount()).toBe(0);
     } finally { vi.useRealTimers(); }
   });
@@ -1028,12 +1156,16 @@ it.each([false,true])('R857 credential warnings reach the fallbacks log without 
   if(unwritable)mkdirSync(file,{recursive:true});
   f.remoteExec=vi.fn(async({onWarning})=>{
     expect(()=>onWarning('credential-warn','notes.md: high-entropy-key')).not.toThrow();
+    expect(()=>onWarning('credential-warn','second.md: high-entropy-key')).not.toThrow();
     return {mode:'remote',code:0};
   });
   expect(await runWithRemoteDecision(f)).toEqual({handled:true,exitCode:0,remoteResult:{mode:"remote",code:0}});
   expect(f.remoteExec).toHaveBeenCalledTimes(1);
   if(!unwritable) {
     const rows=readFileSync(file,'utf8').trim().split('\n').map(JSON.parse);
-    expect(rows).toEqual([expect.objectContaining({reason:'credential-warn',detail:'notes.md: high-entropy-key'})]);
+    expect(rows).toEqual([
+      expect.objectContaining({reason:'credential-warn',detail:'notes.md: high-entropy-key'}),
+      expect.objectContaining({reason:'credential-warn',detail:'second.md: high-entropy-key'}),
+    ]);
   }
 });

@@ -29,6 +29,13 @@ const rows = [{ reason: 'credential-warn' }, { reason: 'needs-git' },
   { reason: 'remote-disabled' }, { reason: 'needs-git' }, { reason: 'credential-warn' }];
 
 describe('remote-fallback-report', () => {
+  it.each(['explicit-container', 'admission-off', 'ci-bypass', 'no-pool', 'explicit-local', 'remote.enabled=true (platform); loadPerCore=2 <= 3'])('reports %s as advisory rather than a remote failure', reason => {
+    const {file} = fixture(JSON.stringify({reason}) + '\n');
+    const result = run(file, ['--json']);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.output)).toMatchObject({total: 1, real: 0, advisory: 1,
+      byReason: {}, advisoryByReason: {[reason]: 1}, topReal: null});
+  });
   it('prints real per-reason counts before advisory counts and names the top real cause', () => {
     const { file } = fixture(rows.map(row => JSON.stringify(row)).join('\n'));
     expect(run(file)).toEqual({ code: 0, output: [

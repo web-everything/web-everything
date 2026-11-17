@@ -2,7 +2,32 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ADVISORY_REASONS, recordLocalSlotFallback, summarize, readFallbackLog, readFallbackRows } from '../remote-fallback-log.mjs';
+import { ADVISORY_REASONS, isLocalDecisionReason, recordLocalSlotFallback, summarize, readFallbackLog, readFallbackRows } from '../remote-fallback-log.mjs';
+
+describe('local decision reasons', () => {
+  it.each([
+    'explicit-local', 'explicit-container', 'admission-off', 'ci-bypass', 'no-pool',
+    'remote.enabled=false (standard)',
+    'remote.enabled=false (platform)',
+    'remote.enabled=true (platform); loadPerCore=2.9 <= 3',
+    'remote.enabled=true (platform); loadPerCore=3 <= 3',
+    'remote.enabled=true (platform); load-unreadable',
+  ])('classifies %s as diagnostic evidence rather than a remote failure', reason => {
+    expect(isLocalDecisionReason(reason)).toBe(true);
+    expect(summarize([{reason}])).toMatchObject({total: 1, real: 0, advisory: 1, topReal: null});
+  });
+  it.each([
+    undefined, 'unknown', 'remote-disabled', 'explicit-local extra',
+    'remote.enabled=true (platform); loadPerCore=NaN <= 3',
+    'remote.enabled=true (platform); loadPerCore=0x1 <= 3',
+    'remote.enabled=true (platform); loadPerCore=4 <= 3',
+    'remote.enabled=true (platform); loadPerCore=2 <= 3; needs-git',
+    'remote.enabled=true (platform); loadPerCore=2 <= 3; host overloaded',
+  ])('keeps unknown or nonlocal reason %s as a real fallback', reason => {
+    expect(isLocalDecisionReason(reason)).toBe(false);
+    expect(summarize([{reason}]).real).toBe(1);
+  });
+});
 
 describe('summarize', () => {
   it('excludes credential warnings from real counts and the top cause', () => {
