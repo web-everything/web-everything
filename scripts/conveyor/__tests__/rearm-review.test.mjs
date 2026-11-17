@@ -6,6 +6,8 @@
  *   strongest thing an auto-fix can do is re-arm the review, never clear it. Also pins idempotency (a PR with
  *   no `review:changes` refuses) and the `presentRemoveLabels` narrowing.
  */
+import * as conflictLabels from '../../lib/review-labels.mjs';
+import { isAcceptedConflictRebase } from '../accepted-conflict-rebase.mjs';
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, chmodSync, rmSync } from 'node:fs';
@@ -640,6 +642,9 @@ describe('conflict-start independently verifies demotion before permitting repai
   const approvals = ['review:accepted', 'ready-to-merge', 'status:ready-to-merge'];
   const cases = [
     ...approvals.map(label => [label + ' still present', ['review:pending', label], false]),
+    ...['review:held-mechanical', 'status:held', 'held', 'status:hold', 'hold',
+      'review:human', 'review:changes', 'review:pending-with-bounce'].map(label =>
+      [label + ' arrived after planning', ['review:pending', label], false]),
     ['pending missing', [], false],
     ['unreadable strict read', new Error('read failed'), false],
     ['missing label evidence', undefined, false],
@@ -689,6 +694,30 @@ describe('conflict-start independently verifies demotion before permitting repai
         else expect(output[0].reason).toContain('STOP repair and refresh PR labels');
       } finally { exit.mockRestore(); }
     }
+  });
+
+  it('admission and fresh verification both call the shared hold predicate', () => {
+    const hold = 'review:held-mechanical';
+    const predicate = vi.spyOn(conflictLabels, 'isConflictRebaseHoldLabel');
+    const readLabels = vi.fn(() => ['review:pending', hold]);
+    const exit = vi.spyOn(process, 'exit').mockImplementation(code => { throw new Error(`exit:${code}`); });
+    try {
+      expect(isAcceptedConflictRebase({ labels: ['review:accepted', hold] })).toBe(false);
+      expect(predicate).toHaveBeenCalledWith(hold);
+      predicate.mockClear();
+      expect(() => runRearmReviewCli({
+        argv: ['6911', '--repo=o/n', '--round=conflict-start', '--only-if=accepted',
+          `--expect-head=${head}`, `--actor=accepted-conflict-rebase:${head}@${'b'.repeat(40)}`],
+        readLabels,
+        labelCliOptions: { provider: {
+          readPrState: () => ({ state: 'OPEN', headRefOid: head, comments: [], labels: approvals }),
+          readLabels: () => ['review:pending'], setLabels: () => {}, postComment: () => {},
+        }, emit: () => {} },
+      })).toThrow('exit:1');
+      expect(readLabels).toHaveBeenCalledWith('o/n', 6911);
+      // Array.some also passes the index and array to the shared predicate.
+      expect(predicate.mock.calls.map(([label]) => label)).toContain(hold);
+    } finally { exit.mockRestore(); predicate.mockRestore(); }
   });
 
   it.each(['ordinary', 'conflict'])('%s keeps the existing tolerant label behavior', round => {

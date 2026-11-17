@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { demoteConflictRebase, dispatchFix, runReconcileFixDispatch, tryResumeFix } from '../reconcile-fix-dispatch.mjs';
+import { runRearmReviewCli } from '../rearm-review.mjs';
 import { buildAuthorActorMarker } from '../../lib/review-independence.mjs';
 
 const head = 'a'.repeat(40), target = 'b'.repeat(40);
@@ -49,6 +50,59 @@ describe('conflict-rebase dispatch demotion', () => {
     expect(result.dispatched).toHaveLength(1);
     expect(events).toEqual(['claim', 'demote', 'launch']);
   });
+  it.each(['accepted', 'missing'])('hold arriving after planning at a fresh %s read refuses before demotion and launch', guard => {
+    const events = [], output = [];
+    let reads = 0;
+    const setLabels = vi.fn(), postComment = vi.fn();
+    const exit = vi.spyOn(process, 'exit').mockImplementation(code => { throw new Error(`exit:${code}`); });
+    const demote = () => runRearmReviewCli({
+      argv: [String(planned.pr), '--repo=o/n', '--round=conflict-start', `--only-if=${guard}`,
+        `--expect-head=${head}`, `--actor=${planned.conflictRebase.receipt}`],
+      labelCliOptions: { provider: {
+        readPrState: () => ({ state: 'OPEN', isDraft: false, headRefOid: head, comments: [],
+          labels: [...(guard === 'accepted' ? ['review:accepted'] : ['ready-to-merge']),
+            ...(++reads > 1 ? ['review:held-mechanical'] : [])] }),
+        setLabels, postComment,
+      }, emit: line => output.push(JSON.parse(line)) },
+    });
+    const options = deps(events, demote);
+    try {
+      const result = pass({ tryResume: () => ({ resumed: false }), demote,
+        dispatch: (entry, io) => dispatchFix(entry, { ...options, demote: io.demote }) });
+      expect(reads).toBeGreaterThan(1);
+      expect(output).toEqual([expect.objectContaining({ error: expect.stringContaining('STOP repair') })]);
+      expect(result.refusals).toMatchObject([{ kind: 'conflict-rebase-demotion-failed' }]);
+      expect(result.dispatched).toEqual([]);
+      expect(setLabels).not.toHaveBeenCalled();
+      expect(postComment).not.toHaveBeenCalled();
+      expect(options.spawnAgent).not.toHaveBeenCalled();
+      expect(options.releaseClaim).toHaveBeenCalledOnce();
+    } finally { exit.mockRestore(); }
+  });
+
+  it('hold arriving during demotion refuses verification and dispatcher launch', () => {
+    const events = [], output = [];
+    const exit = vi.spyOn(process, 'exit').mockImplementation(code => { throw new Error(`exit:${code}`); });
+    const demote = () => runRearmReviewCli({
+      argv: [String(planned.pr), '--repo=o/n', '--round=conflict-start', '--only-if=accepted',
+        `--expect-head=${head}`, `--actor=${planned.conflictRebase.receipt}`],
+      readLabels: () => ['review:pending', 'review:held-mechanical'],
+      labelCliOptions: { provider: {
+        readPrState: () => ({ state: 'OPEN', headRefOid: head, comments: [], labels: planned.labels }),
+        readLabels: () => ['review:pending'], setLabels: () => events.push('demote'), postComment: () => {},
+      }, emit: line => output.push(JSON.parse(line)) },
+    });
+    const options = deps(events, demote);
+    try {
+      const result = pass({ tryResume: () => ({ resumed: false }), demote,
+        dispatch: (entry, io) => dispatchFix(entry, { ...options, demote: io.demote }) });
+      expect(events).toEqual(['claim', 'demote', 'release']);
+      expect(output).toEqual([expect.objectContaining({ ok: false, reason: expect.stringContaining('STOP repair') })]);
+      expect(result.refusals).toMatchObject([{ kind: 'conflict-rebase-demotion-failed' }]);
+      expect(options.spawnAgent).not.toHaveBeenCalled();
+    } finally { exit.mockRestore(); }
+  });
+
   it.each([
     ['failed', () => { throw new Error('write failed'); }, 'write failed'],
     ['refused', () => ({ ok: false, reason: 'head moved' }), 'head moved'],

@@ -7,7 +7,7 @@
 import { countStaleConflictFixRounds, CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { isStatutePath, isDeclarativeLeashPath } from '../lib/gate-config.mjs';
-import { REVIEW_LABELS } from '../lib/review-labels.mjs';
+import { REVIEW_LABELS, isConflictRebaseHoldLabel } from '../lib/review-labels.mjs';
 
 const SHA = /^[0-9a-f]{40}$/i;
 
@@ -27,8 +27,7 @@ export function isAcceptedConflictRebase(pr, defaultBranch = 'main') {
   if (!Array.isArray(pr?.labels) || !pr.labels.length) return false;
   const labels = pr.labels.map(l => typeof l === 'string' ? l : l?.name);
   if (labels.some(l => typeof l !== 'string' || !l)) return false;
-  if (labels.some(l => [REVIEW_LABELS.pending, REVIEW_LABELS.changes, REVIEW_LABELS.human].includes(l)
-      || /held|pending-with-bounce/.test(l))) return false;
+  if (labels.some(l => l === REVIEW_LABELS.pending || isConflictRebaseHoldLabel(l))) return false;
   return !pr.isDraft && pr.baseRefName === defaultBranch
     && String(pr.state ?? 'OPEN').toUpperCase() === 'OPEN'
     && (String(pr.mergeStateStatus ?? '').toUpperCase() === 'DIRTY'

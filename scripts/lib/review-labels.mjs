@@ -33,3 +33,9 @@ export const REVIEW_LABELS = {
   heldMechanical: 'review:held-mechanical',
 };
 
+/** Holds that prohibit conflict repair, even when review:pending is also present. */
+export function isConflictRebaseHoldLabel(label) {
+  return [REVIEW_LABELS.changes, REVIEW_LABELS.human].includes(label)
+    || /held|hold|pending-with-bounce/.test(label);
+}
+

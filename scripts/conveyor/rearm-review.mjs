@@ -21,6 +21,8 @@
  * `--actor`, and the optional-`--repo` fallback. The refusal STILL lives in the pure core, so the CLI cannot
  * route around it. Scripted per [we:docs/agent/platform-decisions.md#deterministic-core-thin-judgment] (#2607).
  */
+import { isConflictRebaseHoldLabel } from '../lib/review-labels.mjs';
+import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { readGit, readGh } from '../lib/proc-read.mjs';
 import { writeLineSync } from '../lib/write-all-sync.mjs';
 import { resolve } from 'node:path';
@@ -399,8 +401,24 @@ export function runRearmReviewCli({ argv = process.argv.slice(2), readLabels = r
       process.exit(1);
     }
   }
+  // Guard each fresh state read, including the reads immediately before demotion.
+  // The shared CLI otherwise tolerates holds on ordinary completed fix rounds.
+  const provider = isConflictStart ? (labelCliOptions.provider ?? createGhProvider()) : null;
   runReviewLabelCli({
     ...labelCliOptions,
+    ...(isConflictStart ? { provider: {
+      ...provider,
+      readPrState: (...args) => {
+        const state = provider.readPrState(...args);
+        if (!Array.isArray(state?.labels) || !state.labels.every(l =>
+          typeof (typeof l === 'string' ? l : l?.name) === 'string'
+          && (typeof l === 'string' ? l : l.name).length > 0)
+          || state.labels.some(l => isConflictRebaseHoldLabel(typeof l === 'string' ? l : l.name))) {
+          throw new Error('conflict-start labels unreadable or held; STOP repair and refresh PR labels before retrying');
+        }
+        return state;
+      },
+    } } : {}),
     argv,
     fixedTo: 'rearm',
     defaultActor: 'conveyor fix agent',
@@ -427,7 +445,7 @@ export function runRearmReviewCli({ argv = process.argv.slice(2), readLabels = r
             typeof (typeof l === 'string' ? l : l?.name) === 'string'
             && (typeof l === 'string' ? l : l.name).length > 0)) throw new Error('invalid labels');
           labels = fresh.map(l => typeof l === 'string' ? l : l.name);
-          if (!labels.includes('review:pending') ||
+          if (labels.some(isConflictRebaseHoldLabel) || !labels.includes('review:pending') ||
             ['review:accepted', 'ready-to-merge', 'status:ready-to-merge'].some(l => labels.includes(l))) {
             throw new Error('demotion was not observed');
           }

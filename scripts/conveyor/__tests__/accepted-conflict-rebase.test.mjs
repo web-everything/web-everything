@@ -29,7 +29,7 @@ describe('accepted conflict-rebase planner', () => {
     expect(plan({ labels: [{ name: label }] })).toMatchObject({ kind: 'fix', isConflict: true, mode: 'conflict-rebase', attempts: 0 });
   });
   it.each(['review:changes', 'review:human', 'review:pending', 'review:pending-with-bounce',
-    'review:held-mechanical', 'status:held', 'held'])('refuses approval combined with %s', label => {
+    'review:held-mechanical', 'status:held', 'held', 'status:hold', 'hold'])('refuses approval combined with %s', label => {
     expect(plan({ labels: ['review:accepted', label] })).toBeNull();
   });
   it.each([{ labels: null }, { labels: ['review:accepted', {}] }, { isDraft: true },
