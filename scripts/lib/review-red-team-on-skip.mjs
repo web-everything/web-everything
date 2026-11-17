@@ -1,3 +1,4 @@
+import { emptyNetDiffSkip, provenEmptyNetDiff, verifyEmptyNetDiff, EMPTY_NET_DIFF_SKIP } from './red-team-empty-net-diff.mjs';
 /** Recover an owed red-team result on an already-reviewed head through the existing review job. */
 import { execFileSync } from 'node:child_process';
 import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
@@ -25,7 +26,7 @@ import { createPolicyClearPublisher, readRedTeamGateSource, readRedTeamRecoveryF
   POLICY_CLEAR_HOLD_OWED } from './red-team-check-run.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
-import { failedRedTeamRetry, redTeamStatusWithoutRun, completedRedTeamSeat } from './red-team-run-result.mjs';
+import { skippedRedTeamRetry, failedRedTeamRetry, redTeamStatusWithoutRun, completedRedTeamSeat } from './red-team-run-result.mjs';
 
 import { redTeamRequired, VERDICTS } from './jury-core.mjs';
 import { isLaterVerdictBody, latestAcceptRecord, laterReviewHold } from './accept-carry-forward.mjs';
@@ -337,6 +338,7 @@ export function normalizeRedTeamResult(result) {
 
 /** Historical card-only skips need a result comment, not a resumed model pass. PURE. */
 export function redTeamSkipNeedsSettlement(status) {
+  if (emptyNetDiffSkip(status)) return true;
   const read = status?.loopPayload?.findings?.read;
   const result = status?.result;
   if (result && typeof result === 'object' && result.policy !== 'card-only') return false;
@@ -364,7 +366,7 @@ export function cardOnlyHeadMoveCandidate(evidence, head) {
 export function cardOnlySkipSettlementCandidate(evidence, head) {
   const read = evidence?.loopPayload?.findings?.read;
   return !evidence?.carryConflict && isRealHead(head) && read?.netBasis?.rev === head
-    && redTeamCardOnly(read) && redTeamSkipNeedsSettlement(evidence?.status)
+    && (redTeamCardOnly(read) || provenEmptyNetDiff(read, head)) && redTeamSkipNeedsSettlement(evidence?.status)
     && evidence.status.head === head
     && evidence.recorded === false && evidence.seatRecorded === false
     && !evidence.inFlight && !evidence.queued;
@@ -479,7 +481,7 @@ export function storedSealRefusal({ repo, pr, head, env, readSeal, readStatus, s
  */
 export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, readStatus, now, env = process.env,
   readSeal = isUnderTest() || isUnderTest(env) ? null : readSealedStatus,
-  setting, lastDispatch, readCheckFact, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions,
+  gitExec = execFileSync, cwd, setting, lastDispatch, readCheckFact, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions,
   headNeverReviewed = headNeverReviewedFromRuns, readReviewRuns = defaultReadReviewRuns, readCarriedCheck = () => false }) {
   return refusals.filter(r => r?.kind === 'already-reviewed-head').map(refusal => {
     const pr = Number(refusal.prNumber);
@@ -703,6 +705,18 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         if (ruled) return fullReviewDecision('stored review needs-human only on referrals now ruled; resume the parked run',
           { referralsRuled: true });
       }
+      if (emptyNetDiffSkip(status, head) && emptyNetDiffSkip(evidence.status, head)
+        && provenEmptyNetDiff(evidence.loopPayload?.findings?.read, head)
+        && evidence.recorded === false && evidence.seatRecorded === false
+        && evidence.inFlight === false && !evidence.queued && !evidence.carryConflict
+        && acceptedReview && acceptance?.sha === head) {
+        const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance,
+          comments: rawPr.comments, reviews, settlesPending: true });
+        if (refusal) return guardedSkip(refusal);
+        if (!verifyEmptyNetDiff(evidence.loopPayload?.findings?.read, head, { exec: gitExec, cwd }))
+          return skip('empty net diff not proven for this head; inspect stored evidence');
+        return { ...row, action: 'clear', policy: EMPTY_NET_DIFF_SKIP.policy, why: EMPTY_NET_DIFF_SKIP.reason };
+      }
       if (!movedCardOnly && !pendingCardOnly && (!owed || accepted || finishedNotOwed)) {
         if (evidence?.inFlight || evidence?.queued) return skip('red-team pass in flight');
         if (evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
@@ -748,7 +762,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (comment === 'posted') return skip('result posted; comment not visible yet');
       // Only one explicitly failed seat permits a fresh retry. Successful execution
       // can resume effects even when its verdict contains confirmed breaks.
-      if (movedCardOnly || failedRedTeamRetry(status, evidence)) mode = 'fresh';
+      if (movedCardOnly || skippedRedTeamRetry(status, evidence) || failedRedTeamRetry(status, evidence)) mode = 'fresh';
       else if (status?.status === 'finished' && (['ran', 'resumed'].includes(prior) || status.result === 'resumed')
         && (completedSeat || (!placeholder && typeof status.result === 'object'
           && evidence.recorded === true && evidence.completedRecorded !== false))) {
@@ -945,7 +959,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       return { ...rawPr, reviews };
     });
     const planningOptions = { repo, refusals, rawPrs: planningPrs,
-      readEvidence, readStatus, readReviewRuns, readCheckFact, readSeal, env,
+      readEvidence, readStatus, readReviewRuns, readCheckFact, readSeal, env, gitExec: exec, cwd,
       now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, readWitness, headNeverReviewed, readCarriedCheck,
       recoveryOptions: { now: at, probe: recoveryProbe(), deadlineMs: staleRunDeadlineMs(env), env } };
     rows.push(...planRedTeamOnSkip(planningOptions));
@@ -993,7 +1007,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
         holdUnfinishedReview(row);
         return null;
       }
-      if (fresh?.action !== row.action || fresh.settle !== row.settle || fresh.head !== row.head) {
+      if (fresh?.action !== row.action || fresh.settle !== row.settle || fresh.policy !== row.policy || fresh.head !== row.head) {
         throw Error('evidence changed before settlement');
       }
       return rawPr;
@@ -1106,9 +1120,9 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
             const sealRefusal = storedSealRefusal({ repo, pr: row.prNumber, head: row.head, env, readSeal, readStatus });
             if (sealRefusal) throw Error(sealRefusal);
             let publishFailure = null;
-            const result = settle({ redTeam: { status: 'not-owed' }, repo, pr: row.prNumber,
+            const result = settle({ redTeam: row.policy === EMPTY_NET_DIFF_SKIP.policy ? { ...EMPTY_NET_DIFF_SKIP } : { status: 'not-owed' }, repo, pr: row.prNumber,
               head: row.head, readHead: row.head, accepted: true, storedReviewPolicyClear: true, comments: rawPr.comments, reason: row.why,
-              io: { env, log: note,
+              io: { env, log: note, readStatus, gitExec: exec, cwd,
                 // settleRedTeamSkip reaches this only once it decided policy-clear and the head shows no result.
                 postComment: ({ repo, pr, body }) => {
                   // settleRedTeamSkip bounds its reason to 80 chars for the needs-you feed, which would cut a yield's

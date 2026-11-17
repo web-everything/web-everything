@@ -1,3 +1,4 @@
+import { emptyNetDiffSkip } from './red-team-empty-net-diff.mjs';
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
 import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher } from './red-team-check-run.mjs';
 import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
@@ -920,7 +921,7 @@ function writeRedTeamStatusLocked(path, { repo, pr, head, loopPayload, status, r
 /** Each conjunct is independently pinned by the historical fallback predicate tests. PURE. */
 export function historicalCardOnlySkipCandidate(old) {
   const prior = old?.status;
-  return prior?.status === 'finished' && prior.skipCardOnly === true
+  return prior?.status === 'finished' && (prior.skipCardOnly === true || emptyNetDiffSkip(prior))
     && (typeof prior.result === 'string' ? prior.result : prior.result?.status) === 'skipped'
     && !old.recorded && !old.inFlight && !old.queued;
 }

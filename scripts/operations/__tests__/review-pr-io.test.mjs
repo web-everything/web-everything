@@ -3588,7 +3588,7 @@ describe('#5135 fix range read wiring', () => {
     }) });
     expect(result.net.revSha).toBe(head);
     expect(result.latestFix).toEqual({ priorHead, head, files: {} });
-    expect(calls.filter(args => args.at(-1) === `${result.net.rev}^{commit}`)).toHaveLength(1);
+    expect(calls.filter(args => args.at(-1) === 'origin/lane/x^{commit}')).toHaveLength(1);
     expect(calls).toContainEqual(['diff', '--no-ext-diff', '--no-color', '--no-renames', '--src-prefix=a/', '--dst-prefix=b/', '--unified=0', priorHead, head]);
   });
 });
@@ -4367,5 +4367,46 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
       decorate: gate => ({ ...gate, reason: 'untrusted-required-set' }) });
     await expect(f.publish()).rejects.toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });
     expect(f.runNode).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('R979 pinned net diff evidence', () => {
+  const oldHead = 'a'.repeat(40), newHead = 'b'.repeat(40), base = 'c'.repeat(40);
+  const view = () => ({ number: 7, title: 't', body: '', headRefName: 'lane/x', labels: [], files: [], comments: [] });
+  function read(exec) {
+    return readPr({ pr: 7, repo: 'o/n', exec, originRepo: () => 'o/n', readView: view, readStack: () => null });
+  }
+  it('never stamps an empty text read with a concurrently advanced nonempty head', () => {
+    let liveHead = oldHead;
+    const calls = [];
+    const result = read((_file, args) => {
+      calls.push(args);
+      if (args[0] === 'rev-parse') return liveHead;
+      if (args[0] === 'merge-base') return base;
+      if (args[0] === 'diff' && args.includes('--no-ext-diff')) {
+        const target = args.at(-1);
+        liveHead = newHead;
+        return target === newHead ? '+code' : '';
+      }
+      if (args.includes('--name-only')) return args.at(-1).endsWith(newHead) ? 'code.mjs\0' : '';
+      return '';
+    });
+    expect(liveHead).toBe(newHead);
+    expect(result.net).toMatchObject({ rev: oldHead, revSha: oldHead, paths: [], scored: true, base });
+    expect(result.diff).toMatchObject({ rev: oldHead, text: '', scored: true, base });
+    expect(calls.filter(args => args[0] === 'rev-parse')).toHaveLength(1);
+    expect(calls.findIndex(args => args[0] === 'rev-parse')).toBeLessThan(calls.findIndex(args => args.includes('--no-ext-diff')));
+  });
+  it.each(['unresolvable head', 'unreadable text', 'unreadable paths'])('leaves both scores false for %s', failure => {
+    const result = read((_file, args) => {
+      if (args[0] === 'rev-parse') return failure === 'unresolvable head' ? '' : oldHead;
+      if (args[0] === 'merge-base') return base;
+      if (failure === 'unreadable text' && args.includes('--no-ext-diff')
+        || failure === 'unreadable paths' && args.includes('--name-only')) throw Error('unreadable');
+      return '';
+    });
+    expect(result.net.scored).toBe(false);
+    expect(result.diff.scored).toBe(false);
   });
 });

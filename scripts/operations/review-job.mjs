@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { provenEmptyNetDiff, EMPTY_NET_DIFF_SKIP } from '../lib/red-team-empty-net-diff.mjs';
 import { proveCardOnlyHeadMove } from '../lib/card-only-head-move.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus, redTeamStatusDir, readRecoveryWitness, restoreRecoveryWriter, createCarriedCheckPublisher, markCarriedCheckUnpublished } from '../lib/drain-red-team-evidence.mjs';
@@ -346,6 +347,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       env,
       log: line => process.stderr.write(`${line}\n`),
       readComments,
+      readStatus,
       postComment,
       ...(input.carry ? { carry: createRedTeamCarryIo({ env, readStatus, writeStatus, readEvidence,
         readLive: ({ repo, pr }) => provider.readPrState(repo, pr), readComments,
@@ -797,7 +799,7 @@ export function summarizeRedTeam(r) {
     ...(r.deferredByCap ? { deferredByCap: true } : {}),
     ...(r.deferredByGuard ? { deferredByGuard: true } : {}),
     ...(r.reason ? { reason: r.reason } : {}),
-    ...(r.status === 'skipped' && classifyRedTeamSkip(r).kind === 'policy' ? { policy: 'card-only' } : {}),
+    ...(r.status === 'skipped' && classifyRedTeamSkip(r).kind === 'policy' ? { policy: r.policy } : {}),
     ...(r.status === 'ran' ? {
       provider: r.provider, model: r.model, seatStatus: r.seat?.status ?? null, foldedVerdict: r.foldedVerdict ?? null,
       recheckStatus: r.recheckStatus ?? null, confirmedMissCount: r.confirmedMissCount ?? 0,
@@ -1005,7 +1007,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
       const result = admissionDeferred && prior ? prior.result
         : seatsBox.priorRedTeamResult != null && !['ran', 'resumed', 'failed'].includes(out.redTeam?.status)
           ? seatsBox.priorRedTeamResult : out.redTeam?.status === 'skipped'
-            ? { status: 'skipped', ...(out.redTeam.policy === 'card-only' ? { policy: 'card-only' } : {}) }
+            ? { status: 'skipped', ...(classifyRedTeamSkip(out.redTeam).kind === 'policy' ? { policy: out.redTeam.policy, ...(out.redTeam.reason ? { reason: out.redTeam.reason } : {}) } : {}) }
             : out.redTeam?.status ?? null;
       // A cap or guard deferral (including a disabled switch) precedes the model call. Return this
       // admission's retry spend so the failed seat stays eligible once the cap, switch or transient read
@@ -1280,13 +1282,14 @@ function runReviewArc({
         // potentially slow proof/fetch, before admission writes or settlement.
         let skipCardOnly = false;
         try { skipCardOnly = io.redTeamSkipCardOnlySetting?.() === true; } catch { /* fail closed */ }
-        if (!skipCardOnly) {
+        if (!skipCardOnly && !provenEmptyNetDiff(loopPayload?.findings?.read, head)) {
           classified = { outcome: 'red-team-not-owed', reason: 'live card-only skip policy is disabled or unreadable' };
           return result({ ...classified, lanePath });
         }
         // Carry publication owns its journal, compatibility status, label and comment while
         // this job still holds the lane/claim. It never enters queued model admission.
-        const redTeam = { status: 'skipped', policy: 'card-only', reason: 'red team skipped: card-only' };
+        const redTeam = provenEmptyNetDiff(loopPayload?.findings?.read, head) ? { ...EMPTY_NET_DIFF_SKIP }
+          : { status: 'skipped', policy: 'card-only', reason: 'red team skipped: card-only' };
         const settled = io.settleRedTeamSkip({ repo: planned.repo, pr: planned.pr, head, readHead: head,
           redTeam, carry: { loopPayload, lanePath } });
         classified = { outcome: 'red-team-only' };

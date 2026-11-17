@@ -1,3 +1,4 @@
+import { redTeamOwedFor } from './review-red-team-policy.mjs';
 /** A successful seat execution can have a failing verdict. Reuse it without another model call. */
 export function completedRedTeamSeat(row) {
   return row?.status === 'ok' && (row.seatStatus === undefined || row.seatStatus === 'ok');
@@ -28,7 +29,20 @@ export function redTeamStatusWithoutRun(row, { originalStatus } = {}) {
 export function failedRedTeamRetry(status, { failedSeatCount, completedRecorded } = {}) {
   const result = status?.result;
   return (status?.retryCount === undefined || status.retryCount === 0)
-    && status?.status === 'finished' && ['failed', 'ran'].includes(typeof result === 'string' ? result : result?.status)
+    && (skippedRedTeamRetry(status, { failedSeatCount, completedRecorded }) || (status?.status === 'finished' && ['failed', 'ran'].includes(typeof result === 'string' ? result : result?.status)
     && completedRecorded === false && failedSeatCount === 1
-    && (result?.comment?.status ?? result?.comment) !== 'posted';
+    && (result?.comment?.status ?? result?.comment) !== 'posted'));
+}
+
+/** A deterministic non-policy skip launched no seat. Its single fresh retry still spends the durable budget. */
+export function skippedRedTeamRetry(status, { failedSeatCount, completedRecorded } = {}) {
+  const result = status?.result;
+  const read = status?.loopPayload?.findings?.read;
+  return status?.status === 'finished' && (typeof result === 'string' ? result : result?.status) === 'skipped'
+    && !result?.policy && !result?.deferredByGuard && !result?.deferredByCap
+    && (result?.comment?.status ?? result?.comment) !== 'posted'
+    && completedRecorded === false && failedSeatCount === 0
+    && typeof status.head === 'string' && /^[a-f0-9]{40}$/i.test(status.head)
+    && read?.netBasis?.rev === status.head && typeof read.diffText === 'string' && read.diffText.trim().length > 0
+    && redTeamOwedFor(status.loopPayload);
 }
