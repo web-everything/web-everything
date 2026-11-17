@@ -309,6 +309,25 @@ export function buildRearmComment({ actor, decision }) {
   ].join('\n');
 }
 
+/** Durable conflict-round comment, shared by the CLI and receipt regression fixtures. */
+export function buildConflictRearmComment({ actor, decision, mainRef = null, mainSha = null }) {
+  return [
+    CONFLICT_FIX_COMMENT_MARKER,
+    '',
+    `A mechanical conflict-resolution round (no other edits) was applied by ${actor}; ${decision.keepsHuman
+      ? '`review:human` is KEPT as the sole hold — `review:pending` was not added (an independent review is already owed while the human hold stands; only a human `/review` ceremony clears it).'
+      : 'the PR is re-armed `review:pending` (an independent re-review is owed).'}`,
+    '',
+    'The fix agent did NOT clear the review — a human `/review` (or the drain AI-review convergence pass) re-verdicts. ' +
+      'This round is counted against its OWN, smaller conflict-fix cap (#xkmu3gv), never the ordinary negotiation cap.',
+    // #2787-live-incident — the trailer below records what this round actually resolved against, so a
+    // LATER round against a NEWER `main` (main moved and created a fresh conflict, the mechanism working
+    // exactly as intended) is not misread as this same round recurring — see
+    // `conflict-fix-round-count.mjs#countStaleConflictFixRounds`'s own docblock. Omitted (no trailer at
+    // all) when the local sha is unresolvable — see `resolveLocalRefSha`'s own docblock.
+  ].join('\n') + conflictFixTargetTrailer(mainRef, mainSha);
+}
+
 // we:scripts/conveyor/rearm-review.mjs — allow importing the pure decider without running the CLI (the test file
 // imports this module). The standard main check used across the conveyor scripts.
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname);
@@ -373,21 +392,8 @@ if (IS_CLI) {
     // closure's old unconditional "re-armed `review:pending`" text used to describe verbatim). Both branches read
     // `decision.keepsHuman` once and render one of two true sentences instead of one sentence plus a footnote.
     buildComment: isConflictRound
-      ? ({ actor, decision }) => [
-          CONFLICT_FIX_COMMENT_MARKER,
-          '',
-          `A mechanical conflict-resolution round (no other edits) was applied by ${actor}; ${decision.keepsHuman
-            ? '`review:human` is KEPT as the sole hold — `review:pending` was not added (an independent review is already owed while the human hold stands; only a human `/review` ceremony clears it).'
-            : 'the PR is re-armed `review:pending` (an independent re-review is owed).'}`,
-          '',
-          'The fix agent did NOT clear the review — a human `/review` (or the drain AI-review convergence pass) re-verdicts. ' +
-            'This round is counted against its OWN, smaller conflict-fix cap (#xkmu3gv), never the ordinary negotiation cap.',
-          // #2787-live-incident — the trailer below records what this round actually resolved against, so a
-          // LATER round against a NEWER `main` (main moved and created a fresh conflict, the mechanism working
-          // exactly as intended) is not misread as this same round recurring — see
-          // `conflict-fix-round-count.mjs#countStaleConflictFixRounds`'s own docblock. Omitted (no trailer at
-          // all) when the local sha is unresolvable — see `resolveLocalRefSha`'s own docblock.
-        ].join('\n') + conflictFixTargetTrailer(mainRefArg, resolveLocalRefSha(mainRefArg))
+      ? ({ actor, decision }) => buildConflictRearmComment({ actor, decision,
+          mainRef: mainRefArg, mainSha: resolveLocalRefSha(mainRefArg) })
       : buildRearmComment,
     successResult: ({ pr, labels }) => ({ ok: true, pr, rearmed: true, labels, round: isConflictRound ? 'conflict' : 'ordinary' }),
     refusalResult: ({ pr, decision }) => ({ ok: false, pr, reason: decision.reason }),
