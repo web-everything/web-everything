@@ -382,6 +382,38 @@ describe('R972 UTF-16 and latin1 views', () => {
   });
 });
 
+// Windows separators are joined at runtime so this source holds no literal home path.
+const win = (separator, ...parts) => parts.join(separator);
+describe('R972 Windows home paths', () => {
+  const homePaths = text => scanText(text).filter(hit => hit.pattern === 'home-path').map(hit => hit.match);
+  it('detects a backslash home path copied from Windows diagnostics', () => {
+    expect(homePaths(win('\\', 'C:', 'Users', 'alice', 'project'))).toContain(win('\\', '', 'Users', 'alice'));
+  });
+  it('detects JSON-escaped, lowercase-drive and mixed-separator Windows home paths', () => {
+    for (const text of [win('\\\\', 'C:', 'Users', 'alice', 'project'), win('\\', 'c:', 'users', 'alice', 'project'),
+      'C:/Users' + win('\\', '', 'alice', 'project'), win('\\', '', '', 'host', 'c$', 'Users', 'alice'),
+      win('\\', '', '', 'host', 'c$', 'users', 'alice'), win('&bsol;', 'C:', 'Users', 'alice'),
+      win('/', '', 'c', 'users', 'alice'), win('/', '', 'mnt', 'c', 'users', 'alice'), win('\\', 'D:', 'USERS', 'alice')]) {
+      expect(homePaths(text).some(match => match.endsWith('alice'))).toBe(true);
+    }
+  });
+  it('keeps a bare lowercase web route out of the home-path category', () => {
+    for (const text of [win('/', 'https:', '', 'api.github.com', 'users', 'octocat'), win('/', '', 'api', 'users', 'octocat')]) {
+      expect(homePaths(text)).toEqual([]);
+    }
+  });
+  it('exempts complete template tokens behind Windows separators', () => {
+    for (const token of ['<name>', 'username', '${user}']) {
+      expect(homePaths(win('\\', 'C:', 'Users', token, 'project'))).toEqual([]);
+    }
+  });
+  it('does not count a JSON-escaped forward slash as a second, raw backslash path', () => {
+    for (const escaped of ['\\u002f', '\\/']) {
+      expect(homePaths(['', 'home', 'alice', ''].join(escaped))).toEqual(['/home' + '/alice']);
+    }
+  });
+});
+
 describe('R972 tier-three patterns', () => {
   it.each(['>/home/alice<', '(/home/alice)', '"/Users/alice"', '`/Users/alice`',
     'prefix/home/alice', '/home/alice', '[/Users/alice]'])('finds home paths regardless of surrounding delimiters: %s', text => {
@@ -446,6 +478,15 @@ describe('R972 tier-three patterns', () => {
     expect(scanText('privateXoperator', { operatorUsername: 'private.operator' })).toEqual([]);
     expect(scanText('prefixprivate.operator', { operatorUsername: 'private.operator' })).toEqual([]);
     expect(scanText('example', { operatorUsername: 'example' })).toEqual([]);
+  });
+  // A generic execution account (container root, CI images) is not a private identity.
+  it.each(['root', 'Root', 'admin', 'administrator', 'node', 'ubuntu', 'vscode', 'codespace', 'jenkins', 'nobody'])(
+    'never turns the generic execution account %s into an operator-username pattern', account => {
+      expect(scanText(`const ${account.toLowerCase()} = document.documentElement;`, { operatorUsername: account })).toEqual([]);
+    });
+  it('still blocks committed identity digests when running as a generic account', () => {
+    expect(scanText('syntheticoperator', { operatorUsername: 'root', allowlist: policy() })
+      .map(hit => hit.pattern)).toEqual(['operator-username']);
   });
   it('detects hashed operator tokens on CI with an unrelated or unavailable local account', () => {
     const allowlist = loadAllowlist(JSON.stringify(policy()));
@@ -674,6 +715,18 @@ describe('R971 standards producer', () => {
         expect(result.demoted).toEqual([]);
       }
     }
+  });
+  it('blocks a Windows home path and its JSON-escaped form in a changed file', () => {
+    for (const separator of ['\\', '\\\\']) {
+      expect(gate({ contents: { 'changed.md': win(separator, 'C:', 'Users', 'alice', 'project') } }).err)
+        .toHaveBeenCalledWith(expect.stringContaining('home-path'), { kind: 'privacy-terms', file: 'changed.md' });
+    }
+  });
+  it('accepts ordinary identifiers when the gate runs as a generic root account', () => {
+    expect(gate({ username: 'root', contents: { 'changed.md': 'const root = document.documentElement;' } }).err)
+      .not.toHaveBeenCalled();
+    expect(gate({ username: 'root', contents: { 'changed.md': 'syntheticoperator' } }).err)
+      .toHaveBeenCalledWith(expect.stringContaining('operator-username'), { kind: 'privacy-terms', file: 'changed.md' });
   });
   it('uses committed identity hashes under a different executing account', () => {
     expect(gate({ contents: { 'changed.md': 'syntheticoperator' }, username: 'unrelated-ci-account' }).err)
