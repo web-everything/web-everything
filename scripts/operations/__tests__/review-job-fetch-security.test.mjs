@@ -44,9 +44,9 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s fetch command isolation',
       expect(isolated.GIT_CONFIG_NOSYSTEM).toBe('1');
       expect(readFileSync(isolated.GIT_CONFIG_GLOBAL, 'utf8')).toBe('');
       if (args.includes('fetch')) {
-        expect(args).toEqual(['-c', 'protocol.ext.allow=never', 'fetch', '--upload-pack=git-upload-pack',
+        expect(args).toEqual(['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', 'fetch', '--no-recurse-submodules', '--upload-pack=git-upload-pack',
           '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`]);
-        fetchedUrls.push(args[5]);
+        fetchedUrls.push(args[args.length - 2]);
       }
       // Serve the genuine SSH URL locally. A surviving rewrite would select the marker helper instead.
       const actual = args.includes('fetch') ? ['-c', 'ssh.variant=ssh', '-c', `core.sshCommand=${ssh}`, ...args] : args;
