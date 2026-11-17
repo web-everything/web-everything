@@ -28,7 +28,7 @@ describe('computeForgeShare', () => {
     'remote.enabled=true (platform); loadPerCore=2 <= 3',
     'remote.enabled=false (standard)',
     'remote.enabled=true (platform); load-unreadable',
-    'explicit-local', 'explicit-container', 'admission-off', 'ci-bypass', 'no-pool',
+    'explicit-local', 'explicit-container', 'admission-off', 'ci-bypass', 'admission-bypass', 'no-pool',
   ])('does not let advisory %s consume a later copy-failed completion', reason => {
     const r = computeForgeShare({...base, remoteRuns: [remote()],
       localRuns: [{...local(5, 1000), lane: '7'}],

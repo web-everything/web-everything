@@ -4428,3 +4428,17 @@ automatic discovery and explicit resume behind both guards and both retry budget
 Exercise pending CI after timing settings change, revoked clearance, green completion,
 and budget exhaustion after that intervening failure. Unknown pending outcomes remain
 non-replayable; CI-held provenance does not establish that a write was never applied.
+
+
+## Verify-lane attribution storage and canonical reasons
+
+Every `recordLocalSlotFallback` row goes to the pool-specific attribution directory,
+including unknown and real-failure reasons; advisory classification never chooses its
+storage or authorizes creating `lockRoot`. Admission-wrapper remote failures still use
+`remote-fallbacks.jsonl`. `admission-bypass` and all `localPhaseReason` bypasses are advisory.
+Both local-decision producers use `localDecisionLogReason` to canonicalize the structured
+`needsGit` decision to `needs-git`, retaining its real-failure classification and Forge-share
+expected-local completion matching. The fallback-log producer regression exercises
+verify-lane's acquisition function, checks one row without pool creation, and compares
+its Forge-share result against a canonical row. Storage tests cover both absent and
+existing pools with advisory, real and unknown reasons.

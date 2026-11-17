@@ -1,12 +1,15 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
+import { runInNewContext } from 'node:vm';
 import { mkdtempSync, mkdirSync, existsSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { attributionLogPath, ADVISORY_REASONS, isLocalDecisionReason, recordLocalSlotFallback, summarize, readFallbackLog, readFallbackRows } from '../remote-fallback-log.mjs';
+import { attributionLogPath, ADVISORY_REASONS, isLocalDecisionReason, localDecisionLogReason, recordLocalSlotFallback, summarize, readFallbackLog, readFallbackRows } from '../remote-fallback-log.mjs';
+import { decidePhaseRemote, localPhaseReason, phaseAdmissionPlan } from '../verify-remote-routing.mjs';
+import { computeForgeShare } from '../forge-share.mjs';
 
 describe('local decision reasons', () => {
   it.each([
-    'explicit-local', 'explicit-container', 'admission-off', 'ci-bypass', 'no-pool',
+    'explicit-local', 'explicit-container', 'admission-off', 'ci-bypass', 'admission-bypass', 'no-pool',
     'raw-command', 'vitest-related-local-only', 'no-checkout-admission-wrapper', 'base-comparison-rerun',
     'remote.enabled=false (standard)',
     'remote.enabled=false (platform)',
@@ -117,7 +120,7 @@ describe('recordLocalSlotFallback', () => {
     try {
       recordLocalSlotFallback({ lockRoot: root, reason: 'remote-disabled', repo: '/x/lane-43', kind: 'test-unit', now: () => 0 });
       recordLocalSlotFallback({ lockRoot: root, reason: 'r2', repo: '/x/lane-43', kind: 'k' });
-      const rows = readFileSync(join(root, 'remote-fallbacks.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+      const rows = readFileSync(attributionLogPath(root), 'utf8').trim().split('\n').map(JSON.parse);
       expect(rows).toHaveLength(2);
       expect(rows[0]).toEqual({ ts: '1970-01-01T00:00:00.000Z', reason: 'remote-disabled', detail: null, lane: 'lane-43', kind: 'test-unit' });
     } finally { rmSync(root, { recursive: true, force: true }); }
@@ -140,6 +143,56 @@ describe('recordLocalSlotFallback detail', () => {
 });
 
 describe('verify-lane local-slot paths', () => {
+  it('classifies every routing bypass producer as advisory', async () => {
+    const decision = await decidePhaseRemote({cwd: process.cwd(), env: {WE_HEAVY_ADMISSION: 'off'}});
+    expect(decision).toEqual({remote: false, reason: 'admission-bypass'});
+    const reasons = [decision.reason,
+      localPhaseReason('node scripts/example.mjs'),
+      localPhaseReason('npx vitest related example.mjs'),
+      localPhaseReason('npx vitest run example.test.mjs', {cwd: '.', fileExists: () => false}),
+    ];
+    expect(reasons).toEqual(['admission-bypass', 'raw-command', 'vitest-related-local-only', 'no-checkout-admission-wrapper']);
+    expect(reasons.every(isLocalDecisionReason)).toBe(true);
+    expect(summarize(reasons.map(reason => ({reason})))).toMatchObject({real: 0, advisory: 4});
+  });
+
+  it('verify-lane logs exactly one canonical needs-git row and Forge-share matches it identically', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'verify-needs-git-'));
+    const lockRoot = join(root, 'pool', '.admission', 'heavy');
+    const now = Date.parse('2026-11-03T16:00:00Z');
+    const decision = {remote: false, needsGit: true, reason: 'remote.enabled=true (platform); mode=always; needs-git: scripts'};
+    const source = readFileSync(join(process.cwd(), 'scripts/verify-lane.mjs'), 'utf8');
+    const start = source.indexOf('async function acquireAdmission(');
+    const end = source.indexOf('const admission = await acquireAdmission(', start);
+    const record = vi.fn(args => recordLocalSlotFallback({...args, now: () => now - 20_000}));
+    const acquireSlotBlocking = vi.fn(async () => ({ok:true, slot:0, waitedMs:0}));
+    try {
+      const acquire = runInNewContext(`${source.slice(start, end)}; acquireAdmission`, {
+        localPhaseReason, phaseAdmissionPlan, localDecisionLogReason, recordLocalSlotFallback: record,
+        decidePhaseRemote: vi.fn(async () => decision), acquireSlotBlocking,
+        REPO: process.cwd(), ADMISSION_LOCK_ROOT: lockRoot, ADMISSION_CAP: 1, ADMISSION_TIMEOUT_MS: 1000,
+        phaseAdmission: false, GATE: 'npx vitest run scripts/example.test.mjs',
+        classifyCommandKind: () => 'files', laneMatch: null,
+        process: {env:{}, stderr:{write:vi.fn()}},
+      });
+      await acquire('vitest', 'npx vitest run scripts/example.test.mjs');
+      expect(record).toHaveBeenCalledTimes(1);
+      expect(acquireSlotBlocking).toHaveBeenCalledTimes(1);
+      expect(existsSync(join(root, 'pool'))).toBe(false);
+      const rows = readFallbackRows(join(lockRoot, 'remote-fallbacks.jsonl'));
+      expect(rows).toHaveLength(1);
+      expect(rows[0].reason).toBe('needs-git');
+      expect(summarize(rows)).toMatchObject({real:1, advisory:0});
+      const input = {now, windowMs:60_000, target:0.9, expectedLocalReasons:['needs-git'],
+        coverage:{remoteRuns:true, localRuns:true, fallbacks:true},
+        remoteRuns:[{ts:new Date(now - 30_000).toISOString(), ms:1000}],
+        localRuns:[{at:new Date(now - 1000).toISOString(), ms:10_000, lane:rows[0].lane, kind:'files'}]};
+      const share = computeForgeShare({...input, fallbacks:rows});
+      expect(share).toEqual(computeForgeShare({...input, fallbacks:[{...rows[0], reason:'needs-git'}]}));
+      expect(share).toMatchObject({share:1, expectedLocalByReason:{'needs-git':1}, runs:{expectedLocal:1, counted:1}});
+    } finally { rmSync(root, {recursive:true, force:true}); }
+  });
+
   it('every acquireSlotBlocking call in verify-lane.mjs is preceded by recordLocalSlotFallback', () => {
     const src = readFileSync(join(process.cwd(), 'scripts', 'verify-lane.mjs'), 'utf8');
     const lines = src.split('\n');
@@ -153,7 +206,23 @@ describe('verify-lane local-slot paths', () => {
 });
 
 describe('separate local attribution', () => {
-  it.each(['raw-command', 'vitest-related-local-only', 'no-checkout-admission-wrapper', 'base-comparison-rerun'])(
+  it.each(['needs-git', 'remote-client-unusable', 'remote-health-unreadable', 'remote-preflight-unreadable', 'unknown', 'credential-warn'])(
+    'stores %s only in attribution regardless of classification or existing pool', reason => {
+      const root = mkdtempSync(join(tmpdir(), 'verify-storage-'));
+      const lockRoot = join(root, 'pool', '.admission', 'heavy');
+      try {
+        const first = recordLocalSlotFallback({lockRoot, reason, repo:'lane-1'});
+        expect(first).toMatchObject({reason});
+        expect(existsSync(join(root, 'pool'))).toBe(false);
+        expect(readFallbackRows(join(lockRoot, 'remote-fallbacks.jsonl'))).toEqual([first]);
+        mkdirSync(lockRoot, {recursive:true});
+        const second = recordLocalSlotFallback({lockRoot, reason, repo:'lane-1'});
+        expect(second).toMatchObject({reason});
+        expect(existsSync(join(lockRoot, 'remote-fallbacks.jsonl'))).toBe(false);
+        expect(readFallbackRows(join(lockRoot, 'remote-fallbacks.jsonl'))).toEqual([second, first]);
+      } finally { rmSync(root, {recursive:true, force:true}); }
+    });
+  it.each(['admission-bypass', 'raw-command', 'vitest-related-local-only', 'no-checkout-admission-wrapper', 'base-comparison-rerun'])(
     'records exactly one advisory %s row without creating the pool', reason => {
       const root = mkdtempSync(join(tmpdir(), 'verify-attribution-'));
       const lockRoot = join(root, 'pool', '.admission', 'heavy');

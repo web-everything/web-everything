@@ -145,7 +145,7 @@
  */
 import '../lib/tools-root-guard.mjs';
 import { ADMISSION_HELD_ENV, isAdmissionHeld } from '../lib/admission-held.mjs';
-import { attributionLogPath, prepareAttributionLog } from '../lib/remote-fallback-log.mjs';
+import { attributionLogPath, prepareAttributionLog, localDecisionLogReason } from '../lib/remote-fallback-log.mjs';
 import { constants, existsSync, mkdirSync, mkdtempSync, rmdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync, renameSync } from 'node:fs';
 import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
 import { execSync, execFile, spawn } from 'node:child_process';
@@ -1202,7 +1202,7 @@ export async function runWithRemoteDecision({
   onDecision?.(decision);
   log(`heavy-admission: ${decision.remote ? 'remote' : 'local'} (${decision.reason})\n`);
   if (!decision.remote) {
-    recordRemoteFallback({lockRoot, reason: decision.needsGit ? 'needs-git' : decision.reason, cwd, argv, env, clock, attribution: true});
+    recordRemoteFallback({lockRoot, reason: localDecisionLogReason(decision), cwd, argv, env, clock, attribution: true});
     return { handled: false };
   }
   const remoteRoot = join(dirname(lockRoot), 'remote');

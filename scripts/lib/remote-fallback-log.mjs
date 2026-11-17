@@ -1,6 +1,6 @@
 /**
  * @file scripts/lib/remote-fallback-log.mjs
- * @description Best-effort row in `<lockRoot>/remote-fallbacks.jsonl` when verify-lane takes a LOCAL heavy slot, so
+ * @description Best-effort attribution row when verify-lane takes a LOCAL heavy slot, so
  *   the heavy report no longer shows "NO FALLBACK LOGGED". Same row shape as heavy-admission's recorder
  *   (ts, reason, detail, lane, kind). Logging only: never throws, changes no routing decision.
  *   Local decisions go to separate heavy-attribution/ history without creating pool directories.
@@ -34,10 +34,13 @@ export function prepareAttributionLog(file) {
 
 export const ADVISORY_REASONS = new Set(['credential-warn']);
 
+/** Match the admission wrapper's canonical reason without changing its routing decision. */
+export const localDecisionLogReason = decision => decision.needsGit ? 'needs-git' : decision.reason;
+
 /** Recognize only local decision strings produced by heavy-admission and verify-lane, not unknown failures. */
 export function isLocalDecisionReason(reason) {
   if (typeof reason !== 'string') return false;
-  if (['explicit-local', 'explicit-container', 'admission-off', 'ci-bypass', 'no-pool', 'held', 'raw-command', 'vitest-related-local-only', 'no-checkout-admission-wrapper', 'base-comparison-rerun'].includes(reason)) return true;
+  if (['explicit-local', 'explicit-container', 'admission-off', 'ci-bypass', 'admission-bypass', 'no-pool', 'held', 'raw-command', 'vitest-related-local-only', 'no-checkout-admission-wrapper', 'base-comparison-rerun'].includes(reason)) return true;
   if (/^remote\.enabled=false \([^()\r\n]+\)$/.test(reason)) return true;
   const match = /^remote\.enabled=true \([^()\r\n]+\); (.+)$/.exec(reason);
   if (!match) return false;
@@ -112,12 +115,10 @@ export function readFallbackRows(file) {
 
 export function recordLocalSlotFallback({ lockRoot, reason, detail, repo, kind, now = () => Date.now() } = {}) {
   try {
-    const attribution = isLocalDecisionReason(reason);
-    const file = attribution ? attributionLogPath(lockRoot) : join(lockRoot, 'remote-fallbacks.jsonl');
+    // Storage describes the producer, independently of advisory/failure classification.
+    const file = attributionLogPath(lockRoot);
     const row = { ts: new Date(now()).toISOString(), reason: bounded(reason ?? 'unknown'), detail: detail == null ? null : bounded(detail), lane: basename(String(repo)), kind: kind == null ? null : bounded(kind) };
-    if (attribution) {
-      prepareAttributionLog(file);
-    } else mkdirSync(lockRoot, { recursive: true });
+    prepareAttributionLog(file);
     // Append (atomic for one small write); trim only when oversized, so concurrent writers never rewrite each other.
     if (existsSync(file) && statSync(file).size > MAX_BYTES) writeFileSync(file, readFileSync(file, 'utf8').slice(-MAX_BYTES / 2), 'utf8');
     appendFileSync(file, JSON.stringify(row) + '\n', 'utf8');
