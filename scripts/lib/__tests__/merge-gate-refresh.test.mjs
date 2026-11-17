@@ -205,6 +205,44 @@ describe('merge-gate refresh after restamp', () => {
     expect(adds).toBe(2);
     expect(gh.mock.calls.at(-1)[1]).toContain('--remove-label');
   });
+  it.each(['present', 'unreadable', 'malformed', 'incomplete', 'oversized'])(
+    'treats an add timeout with %s label evidence as triggered and attempts cleanup once', evidence => {
+      const base = fixture();
+      let added = false;
+      const sleep = vi.fn();
+      const gh = vi.fn((file, args, opts) => {
+        if (args.includes('--add-label')) { added = true; throw new Error('add timed out'); }
+        if (added && args[1] === 'view') {
+          if (evidence === 'unreadable') throw new Error('offline');
+          if (evidence === 'oversized') throw new Error('ENOBUFS');
+          if (evidence === 'malformed') return '{';
+          return JSON.stringify(evidence === 'incomplete' ? {} : { labels: [{ name: 'gate:refresh' }] });
+        }
+        if (args.includes('--remove-label')) throw new Error('cleanup denied');
+        return base(file, args, opts);
+      });
+      const result = run(gh, { sleep });
+      expect(result).toMatchObject({ ok: true, refreshed: true, note: expect.stringContaining('treated as triggered') });
+      expect(result.note).toContain(evidence === 'present' ? 'gate:refresh is present' : 'label read failed');
+      expect(result.note).toContain('operator to inspect the gate');
+      expect(result.note).toContain('operator to remove gate:refresh');
+      expect(gh.mock.calls.filter(([, args]) => args.includes('--add-label'))).toHaveLength(1);
+      expect(gh.mock.calls.filter(([, args]) => args[1] === 'view')).toHaveLength(2);
+      expect(gh.mock.calls.filter(([, args]) => args.includes('--remove-label'))).toHaveLength(1);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+  it('fails after bounded add errors only when each follow-up label read confirms absence', () => {
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const base = fixture();
+    const gh = vi.fn((file, args, opts) => {
+      if (args.includes('--add-label')) throw new Error('add denied');
+      return base(file, args, opts);
+    });
+    expect(run(gh)).toMatchObject({ ok: false, error: expect.stringContaining('add denied') });
+    expect(gh.mock.calls.filter(([, args]) => args.includes('--add-label'))).toHaveLength(3);
+    expect(gh.mock.calls.filter(([, args]) => args[1] === 'view')).toHaveLength(4);
+    expect(gh.mock.calls.some(([, args]) => args.includes('--remove-label'))).toBe(false);
+  });
   it('refreshes a still-running gate that began before the restamp (it may have read the old thread)', () => {
     const gh = fixture([gate({ status: 'in_progress', conclusion: null })]);
     expect(run(gh)).toEqual({ ok: true, refreshed: true });

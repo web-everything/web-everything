@@ -26,6 +26,8 @@ export function planGateRefresh({ checkRuns, head, restampedAtMs } = {}) {
  * Three bounded reads, then at most three attempts for each label call (including
  * a pre-removal if the label is already present),
  * plus one final removal attempt after the gate has already been triggered.
+ * Each failed add gets one label read before retrying; present or unreadable
+ * evidence consumes the trigger and gets just one cleanup attempt.
  * restampedAtMs is captured before posting, conservatively excluding racing runs.
  */
 export function refreshMergeGateAfterRestamp({ repo, pr, head, gh = execFileSyncThrottled,
@@ -60,28 +62,50 @@ export function refreshMergeGateAfterRestamp({ repo, pr, head, gh = execFileSync
 /** Shared bounded trigger; callers must verify the PR head before toggling. */
 export function toggleMergeGateRefresh({ repo, pr, gh = execFileSyncThrottled, sleep = sleepSync }) {
   const options = { encoding: 'utf8', stdio: 'pipe', timeout: 30_000, maxBuffer: 2 * 1024 * 1024 };
-  const labelCall = (args, alreadyExistsOk = false) => {
+  const labelCall = (args, alreadyExistsOk = false, onError = null) => {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         gh('gh', args, options);
         return;
       } catch (error) {
         if (alreadyExistsOk && /already exists/i.test(errorText(error))) return;
+        const recovered = onError?.(error);
+        if (recovered) return recovered;
         if (attempt === 2) throw error;
         sleep(1000 * (attempt + 1));
       }
     }
   };
-  const live = JSON.parse(gh('gh', ['pr', 'view', String(pr), '--repo', repo, '--json', 'labels'], options));
-  if (!Array.isArray(live?.labels) || live.labels.some(label => typeof label?.name !== 'string' || !label.name)) {
-    throw new Error('incomplete PR label evidence');
-  }
+  const readLabels = () => {
+    const live = JSON.parse(gh('gh', ['pr', 'view', String(pr), '--repo', repo, '--json', 'labels'], options));
+    if (!Array.isArray(live?.labels) || live.labels.some(label => typeof label?.name !== 'string' || !label.name)) {
+      throw new Error('incomplete PR label evidence');
+    }
+    return live.labels;
+  };
+  const labels = readLabels();
   const removeArgs = ['pr', 'edit', String(pr), '--repo', repo, '--remove-label', LABEL];
   // A successful add only triggers the gate when the label was absent.
-  if (live.labels.some(label => label.name === LABEL)) labelCall(removeArgs);
+  if (labels.some(label => label.name === LABEL)) labelCall(removeArgs);
   labelCall(['label', 'create', LABEL, '--repo', repo, '--color', 'ededed',
     '--description', 'Refresh merge-gate after acceptance restamp'], true);
-  labelCall(['pr', 'edit', String(pr), '--repo', repo, '--add-label', LABEL]);
+  const recovered = labelCall(['pr', 'edit', String(pr), '--repo', repo, '--add-label', LABEL], false, error => {
+    let evidence;
+    try {
+      if (!readLabels().some(label => label.name === LABEL)) return null;
+      evidence = `${LABEL} is present`;
+    } catch (readError) {
+      evidence = `label read failed: ${errorText(readError)}`;
+    }
+    // GitHub may have dispatched before the add failed locally. Never re-arm
+    // the caller's once-per-head claim without confirmed absence.
+    return { note: `merge-gate treated as triggered after add error: ${errorText(error)}; ${evidence}; ask an operator to inspect the gate if it remains held` };
+  });
+  if (recovered) {
+    try { gh('gh', removeArgs, options); }
+    catch (error) { recovered.note += `; ${LABEL} removal failed: ${errorText(error)}; ask an operator to remove ${LABEL}`; }
+    return { ok: true, note: recovered.note };
+  }
   // The add has dispatched the gate. Cleanup failure must not re-arm its once-per-head claim.
   try { labelCall(removeArgs); }
   catch {
