@@ -159,7 +159,7 @@ describe('startup-failure stale merge-gate refresh', () => {
       execGh: args => {
         calls.push(args);
         if (refused || args.includes('POST')) throw new Error('HTTP 403: This workflow run cannot be retried');
-        return JSON.stringify(args[0] === 'pr' && args[1] === 'view' ? { labels: [] } : { head: { sha: HEAD } });
+        return JSON.stringify(args[0] === 'pr' && args[1] === 'view' ? { labels: calls.some(call => call.includes('--add-label')) ? [{ name: 'gate:refresh' }] : [] } : { head: { sha: HEAD } });
       } }));
     const o = options({ refreshStalePr, readState: () => state,
       record: vi.fn((_path, key, entry) => { state[key] = entry; }) });
@@ -175,84 +175,39 @@ describe('startup-failure stale merge-gate refresh', () => {
     expect(refreshStalePr).toHaveBeenCalledTimes(2);
     expect(calls.filter(args => args.includes('POST'))).toHaveLength(0);
   });
-  it.each(['present', 'unreadable'])('keeps the claim and ledger after an add timeout with %s labels and never adds again', async evidence => {
+  it.each(['timeout', 'unreadable', 'removal', 'denied'])('%s holds only uncertain claims and re-reads pending next pass', async kind => {
     const state = {}, calls = [];
-    let addAttempted = false;
+    let added = false, secondPass = false;
     const refreshStalePr = vi.fn(options => refreshRealStalePr({ ...options, prNumber: 5006,
       readTip: () => HEAD, refresh: () => ({ ok: true, action: 'current' }),
       execGh: args => {
         calls.push(args);
-        if (args.includes('--add-label')) { addAttempted = true; throw new Error('add timed out'); }
+        if (args.includes('--add-label')) {
+          added = true;
+          if (!secondPass && kind === 'denied') throw new Error('HTTP 403: denied');
+          if (!secondPass && kind === 'timeout') throw new Error('add timed out');
+        }
+        if (args.includes('--remove-label') && !secondPass && kind === 'removal') throw new Error('cleanup denied');
         if (args[1] === 'view') {
-          if (addAttempted && evidence === 'unreadable') throw new Error('label read offline');
-          return JSON.stringify({ labels: addAttempted ? [{ name: 'gate:refresh' }] : [] });
+          if (!secondPass && added && kind === 'unreadable') throw new Error('offline');
+          return JSON.stringify({ labels: added && (secondPass || kind !== 'timeout') ? [{ name: 'gate:refresh' }] : [] });
         }
         return JSON.stringify({ head: { sha: HEAD } });
       } }));
     const o = options({ refreshStalePr, readState: () => state,
       record: vi.fn((_path, key, entry) => { state[key] = entry; }) });
     try {
-      expect(await handleStaleMergeGate(o)).toMatchObject({ reason: expect.stringContaining('treated as triggered') });
-      expect(state['o/r#5006']).toMatchObject({ fromHead: HEAD, newHead: null, action: 'gate-refresh' });
-      expect(readdirSync(dirname(o.statePath)).filter(name => name.includes('-claim-head-'))).toHaveLength(1);
-      expect(await handleStaleMergeGate(o)).toMatchObject({ reason: expect.stringContaining('a person should look') });
-      delete state['o/r#5006'];
-      expect(await handleStaleMergeGate(o)).toMatchObject({ handled: false, reason: expect.stringContaining('already claimed') });
-      expect(o.record).toHaveBeenCalledTimes(1);
-      expect(refreshStalePr).toHaveBeenCalledTimes(1);
-      expect(calls.filter(args => args.includes('--add-label'))).toHaveLength(1);
-      expect(calls.filter(args => args.includes('--remove-label'))).toHaveLength(1);
-    } finally { rmSync(dirname(o.statePath), { recursive: true, force: true }); }
-  });
-  it('releases the claim and leaves the ledger empty when add fails and labels confirm absence', async () => {
-    const state = {}, calls = [];
-    let failAdd = true;
-    const refreshStalePr = vi.fn(options => refreshRealStalePr({ ...options, prNumber: 5006,
-      readTip: () => HEAD, refresh: () => ({ ok: true, action: 'current' }),
-      execGh: args => {
-        calls.push(args);
-        if (failAdd && args.includes('--add-label')) throw new Error('add denied');
-        return JSON.stringify(args[1] === 'view' ? { labels: [] } : { head: { sha: HEAD } });
-      } }));
-    const o = options({ refreshStalePr, readState: () => state,
-      record: vi.fn((_path, key, entry) => { state[key] = entry; }) });
-    try {
-      expect(await handleStaleMergeGate(o)).toMatchObject({ reason: expect.stringContaining('refresh FAILED') });
+      const first = await handleStaleMergeGate(o);
+      expect(first.reason).toContain(kind === 'denied' ? 'refresh FAILED' : 'gate-refresh-pending');
       expect(o.record).not.toHaveBeenCalled();
       expect(state).toEqual({});
-      expect(readdirSync(dirname(o.statePath)).some(name => name.includes('-claim-'))).toBe(false);
-      expect(calls.filter(args => args.includes('--add-label'))).toHaveLength(3);
-      expect(calls.filter(args => args[1] === 'view')).toHaveLength(4);
-      failAdd = false;
-      expect(await handleStaleMergeGate(o)).toMatchObject({ reason: expect.stringContaining('refresh gate-refresh') });
-      expect(o.record).toHaveBeenCalledTimes(1);
-      expect(refreshStalePr).toHaveBeenCalledTimes(2);
-    } finally { rmSync(dirname(o.statePath), { recursive: true, force: true }); }
-  });
-  it('records add-ok/remove-fails as success and retains the head claim even if the ledger is lost', async () => {
-    const state = {}, calls = [];
-    const refreshStalePr = vi.fn(options => refreshRealStalePr({ ...options, prNumber: 5006,
-      readTip: () => HEAD, refresh: () => ({ ok: true, action: 'current' }),
-      execGh: args => {
-        calls.push(args);
-        if (args.includes('--remove-label')) throw new Error('cleanup denied');
-        return JSON.stringify(args[0] === 'pr' && args[1] === 'view' ? { labels: [] } : { head: { sha: HEAD } });
-      } }));
-    const o = options({ refreshStalePr, readState: () => state,
-      record: vi.fn((_path, key, entry) => { state[key] = entry; }) });
-    try {
-      const result = await handleStaleMergeGate(o);
-      expect(result.reason).toContain('refresh gate-refresh');
-      expect(result.reason).toContain('ask an operator to remove gate:refresh');
-      expect(o.record).toHaveBeenCalledTimes(1);
-      expect(state['o/r#5006']).toMatchObject({ fromHead: HEAD, newHead: null, action: 'gate-refresh' });
+      expect(readdirSync(dirname(o.statePath)).filter(name => name.includes('-claim-head-'))).toHaveLength(kind === 'denied' ? 0 : 1);
       expect(calls.filter(args => args.includes('--add-label'))).toHaveLength(1);
-      expect(calls.filter(args => args.includes('--remove-label'))).toHaveLength(4);
-      expect(await handleStaleMergeGate(o)).toMatchObject({ reason: expect.stringContaining('a person should look') });
-      delete state['o/r#5006'];
-      expect(await handleStaleMergeGate(o)).toMatchObject({ handled: false, reason: expect.stringContaining('already claimed') });
-      expect(refreshStalePr).toHaveBeenCalledTimes(1);
+      secondPass = true;
+      expect((await handleStaleMergeGate(o)).reason).toContain('refresh gate-refresh');
       expect(o.record).toHaveBeenCalledTimes(1);
+      expect(calls.filter(args => args.includes('--add-label'))).toHaveLength(kind === 'denied' ? 2 : 1);
+      expect(refreshStalePr).toHaveBeenCalledTimes(2);
     } finally { rmSync(dirname(o.statePath), { recursive: true, force: true }); }
   });
   it('refuses when the required-check set is unknown (gate not allowed)', async () => {

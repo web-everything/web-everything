@@ -357,7 +357,7 @@ export function recordRefreshed(path, key, headSha, { max = 500, pass = null, no
  * use the shared gate:refresh trigger, with live head verification, to produce a fresh gate.
  * @returns {Promise<{ok: boolean, action: string, newCommit?: string|null, error?: string}>}
  */
-export async function refreshStalePr({ laneRef, root, repo = null, prNumber = null, runId = null, runConclusion = null, expectedHead = null, readTip, refresh, rerun, execGh }) {
+export async function refreshStalePr({ laneRef, root, repo = null, prNumber = null, runId = null, runConclusion = null, expectedHead = null, readTip, refresh, rerun, execGh, gateRefreshPending = null }) {
   if (!laneRef) return { ok: false, action: 'error', error: 'no head ref' };
   // The same-repo guard needs the PR number; without one a fork PR could be rebased, so refuse (fail closed).
   if (!Number.isSafeInteger(prNumber)) return { ok: false, action: 'unverified-pr', error: 'no verifiable PR number for the same-repo check' };
@@ -370,9 +370,9 @@ export async function refreshStalePr({ laneRef, root, repo = null, prNumber = nu
     if (tip !== expectedHead) return { ok: false, action: 'head-moved', error: `branch tip ${tip ? tip.slice(0, 9) : 'unreadable'} is not the judged head ${expectedHead.slice(0, 9)}` };
   }
   const doRefresh = refresh ?? (await import('../conveyor/ci-red-recovery-watch.mjs')).refreshOntoMain;
-  const r = doRefresh(laneRef, { ...(root ? { root } : {}), prNumber, repo });
+  const r = gateRefreshPending ? { ok: true, action: 'current' } : doRefresh(laneRef, { ...(root ? { root } : {}), prNumber, repo });
   if (!r?.ok) return { ok: false, action: r?.action ?? 'error', error: r?.error ?? 'refresh failed' };
-  if (r.action !== 'current') return { ok: true, action: r.action, newCommit: r.newCommit ?? null };
+  if (!gateRefreshPending && r.action !== 'current') return { ok: true, action: r.action, newCommit: r.newCommit ?? null };
   if (!runId) return { ok: false, action: 'current-no-run', error: 'branch already on main and the required run id is unknown' };
   let call = execGh;
   if (!call) {
@@ -385,8 +385,8 @@ export async function refreshStalePr({ laneRef, root, repo = null, prNumber = nu
         || !/^[0-9a-f]{40}$/.test(expectedHead || '')) throw new Error('no verified repo, PR and head for gate refresh');
       const live = JSON.parse(call(['api', `repos/${repo}/pulls/${prNumber}`]));
       if (live?.head?.sha !== expectedHead) throw new Error('live PR head differs from judged head');
-      const result = toggleMergeGateRefresh({ repo, pr: prNumber, gh: (_bin, args) => call(args) });
-      return { ok: true, action: 'gate-refresh', newCommit: null, ...(result.note ? { note: result.note } : {}) };
+      const result = toggleMergeGateRefresh({ repo, pr: prNumber, gh: (_bin, args) => call(args), pending: gateRefreshPending });
+      return { ...result, action: result.state === 'pending-unknown' ? 'gate-refresh-pending' : result.ok ? 'gate-refresh' : 'gate-refresh-failed', newCommit: null };
     } catch (e) {
       return { ok: false, action: 'gate-refresh-failed', error: `${firstLine(e)}; ask an operator to toggle gate:refresh` };
     }

@@ -592,14 +592,15 @@ describe('refreshStalePr rerun uses the repo REST endpoint, never `gh run`', () 
       execGh: args => {
         calls.push(args);
         if (args.at(-1).endsWith('/rerun')) throw Object.assign(new Error('gh api failed'), { stderr: 'HTTP 403: This workflow run cannot be retried' });
-        return JSON.stringify(args[0] === 'pr' && args[1] === 'view' ? { labels: [] } : { head: { sha: head } });
+        return JSON.stringify(args[0] === 'pr' && args[1] === 'view' ? { labels: calls.some(call => call.includes('--add-label')) ? [{ name: 'gate:refresh' }] : [] } : { head: { sha: head } });
       } });
-    expect(out).toEqual({ ok: true, action: 'gate-refresh', newCommit: null });
+    expect(out).toEqual({ ok: true, state: 'confirmed', action: 'gate-refresh', newCommit: null });
     expect(calls).toEqual([
       ['api', 'repos/o/r/pulls/7'],
       ['pr', 'view', '7', '--repo', 'o/r', '--json', 'labels'],
       ['label', 'create', 'gate:refresh', '--repo', 'o/r', '--color', 'ededed', '--description', 'Refresh merge-gate after acceptance restamp'],
       ['pr', 'edit', '7', '--repo', 'o/r', '--add-label', 'gate:refresh'],
+      ['pr', 'view', '7', '--repo', 'o/r', '--json', 'labels'],
       ['pr', 'edit', '7', '--repo', 'o/r', '--remove-label', 'gate:refresh'],
     ]);
   });
@@ -609,7 +610,7 @@ describe('refreshStalePr rerun uses the repo REST endpoint, never `gh run`', () 
       execGh: args => {
         calls.push(args);
         if (args.includes('POST')) throw Object.assign(new Error('gh api failed'), { stderr: 'HTTP 403: This workflow run cannot be retried' });
-        return JSON.stringify(args[0] === 'pr' && args[1] === 'view' ? { labels: [] } : { head: { sha: head } });
+        return JSON.stringify(args[0] === 'pr' && args[1] === 'view' ? { labels: calls.some(call => call.includes('--add-label')) ? [{ name: 'gate:refresh' }] : [] } : { head: { sha: head } });
       } });
     expect(out).toMatchObject({ ok: false, action: 'rerun-failed' });
     expect(calls).toEqual([['api', '-X', 'POST', 'repos/o/r/actions/runs/123/rerun']]);
@@ -628,7 +629,7 @@ describe('refreshStalePr rerun uses the repo REST endpoint, never `gh run`', () 
       runConclusion: 'startup_failure', execGh: args => {
         calls.push(args);
         if (args[0] === 'label') throw new Error('HTTP 403: Forbidden');
-        return JSON.stringify(args[0] === 'pr' && args[1] === 'view' ? { labels: [] } : { head: { sha: head } });
+        return JSON.stringify(args[0] === 'pr' && args[1] === 'view' ? { labels: calls.some(call => call.includes('--add-label')) ? [{ name: 'gate:refresh' }] : [] } : { head: { sha: head } });
       } });
     expect(out).toMatchObject({ ok: false, action: 'gate-refresh-failed', error: expect.stringContaining('operator') });
     expect(calls.filter(args => args[0] === 'label')).toHaveLength(3);

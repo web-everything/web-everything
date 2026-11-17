@@ -23,11 +23,9 @@ export function planGateRefresh({ checkRuns, head, restampedAtMs } = {}) {
 /**
  * Best effort after a durable restamp; failure never undoes the acceptance.
  * No attempt markers: later restamps consult live checks and can retry naturally.
- * Three bounded reads, then at most three attempts for each label call (including
- * a pre-removal if the label is already present),
- * plus one final removal attempt after the gate has already been triggered.
- * Each failed add gets one label read before retrying; present or unreadable
- * evidence consumes the trigger and gets just one cleanup attempt.
+ * Label creation and stale-label clearing are bounded. The add is attempted once;
+ * only a readable post-add label confirms dispatch. Unknown outcomes require a
+ * read-only reconciliation on a later pass, never another add.
  * restampedAtMs is captured before posting, conservatively excluding racing runs.
  */
 export function refreshMergeGateAfterRestamp({ repo, pr, head, gh = execFileSyncThrottled,
@@ -51,7 +49,7 @@ export function refreshMergeGateAfterRestamp({ repo, pr, head, gh = execFileSync
     if (live?.head?.sha !== head) throw new Error('live PR head differs from restamped head');
 
     const result = toggleMergeGateRefresh({ repo, pr, gh, sleep });
-    return { ok: true, refreshed: true, ...(result.note ? { note: result.note } : {}) };
+    return result.ok ? { ok: true, refreshed: true } : { ...result, refreshed: false };
   } catch (error) {
     const message = `${errorText(error)}; acceptance restamp retained — retry restamp or ask an operator to toggle ${LABEL}`;
     process.stderr.write(`merge-gate refresh FAILED for ${repo}#${pr}: ${message}\n`);
@@ -60,17 +58,15 @@ export function refreshMergeGateAfterRestamp({ repo, pr, head, gh = execFileSync
 }
 
 /** Shared bounded trigger; callers must verify the PR head before toggling. */
-export function toggleMergeGateRefresh({ repo, pr, gh = execFileSyncThrottled, sleep = sleepSync }) {
+export function toggleMergeGateRefresh({ repo, pr, gh = execFileSyncThrottled, sleep = sleepSync, pending = null }) {
   const options = { encoding: 'utf8', stdio: 'pipe', timeout: 30_000, maxBuffer: 2 * 1024 * 1024 };
-  const labelCall = (args, alreadyExistsOk = false, onError = null) => {
+  const labelCall = (args, alreadyExistsOk = false) => {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         gh('gh', args, options);
         return;
       } catch (error) {
         if (alreadyExistsOk && /already exists/i.test(errorText(error))) return;
-        const recovered = onError?.(error);
-        if (recovered) return recovered;
         if (attempt === 2) throw error;
         sleep(1000 * (attempt + 1));
       }
@@ -83,37 +79,31 @@ export function toggleMergeGateRefresh({ repo, pr, gh = execFileSyncThrottled, s
     }
     return live.labels;
   };
-  const labels = readLabels();
+  const pendingResult = (error, confirmed = false) => ({ ok: false, state: 'pending-unknown', confirmed,
+    error: `${error}; re-read labels next pass; ask an operator to inspect ${LABEL}` });
   const removeArgs = ['pr', 'edit', String(pr), '--repo', repo, '--remove-label', LABEL];
-  // A successful add only triggers the gate when the label was absent.
+  const reconcile = () => {
+    let present;
+    try { present = readLabels().some(label => label.name === LABEL); }
+    catch (error) { return pendingResult(`label read failed: ${errorText(error)}`, pending?.confirmed ?? false); }
+    if (!present) return pending?.confirmed ? { ok: true, state: 'confirmed' }
+      : pendingResult('trigger not confirmed by label read');
+    try { gh('gh', removeArgs, options); }
+    catch (error) { return pendingResult(`${LABEL} removal failed: ${errorText(error)}; ask an operator to remove ${LABEL}`, true); }
+    return { ok: true, state: 'confirmed' };
+  };
+  // A pending trigger may already have dispatched. Never clear and re-add it.
+  if (pending) return reconcile();
+  const labels = readLabels();
   if (labels.some(label => label.name === LABEL)) labelCall(removeArgs);
   labelCall(['label', 'create', LABEL, '--repo', repo, '--color', 'ededed',
     '--description', 'Refresh merge-gate after acceptance restamp'], true);
-  const recovered = labelCall(['pr', 'edit', String(pr), '--repo', repo, '--add-label', LABEL], false, error => {
-    let evidence;
-    try {
-      if (!readLabels().some(label => label.name === LABEL)) return null;
-      evidence = `${LABEL} is present`;
-    } catch (readError) {
-      evidence = `label read failed: ${errorText(readError)}`;
+  try { gh('gh', ['pr', 'edit', String(pr), '--repo', repo, '--add-label', LABEL], options); }
+  catch (error) {
+    if (/\bHTTP(?:\/[^ ]+)?\s+4\d\d\b/i.test(errorText(error)) || (error?.status >= 400 && error?.status < 500)) {
+      return { ok: false, state: 'denied', error: errorText(error) };
     }
-    // GitHub may have dispatched before the add failed locally. Never re-arm
-    // the caller's once-per-head claim without confirmed absence.
-    return { note: `merge-gate treated as triggered after add error: ${errorText(error)}; ${evidence}; ask an operator to inspect the gate if it remains held` };
-  });
-  if (recovered) {
-    try { gh('gh', removeArgs, options); }
-    catch (error) { recovered.note += `; ${LABEL} removal failed: ${errorText(error)}; ask an operator to remove ${LABEL}`; }
-    return { ok: true, note: recovered.note };
+    // The write may have reached GitHub. Read once, without retrying the add.
   }
-  // The add has dispatched the gate. Cleanup failure must not re-arm its once-per-head claim.
-  try { labelCall(removeArgs); }
-  catch {
-    try { gh('gh', removeArgs, options); }
-    catch (error) {
-      return { ok: true, note: `merge-gate triggered; ${LABEL} removal failed: ${errorText(error)}; ask an operator to remove ${LABEL}` };
-    }
-    return { ok: true, note: `merge-gate triggered; ${LABEL} cleanup succeeded on the final removal attempt` };
-  }
-  return { ok: true };
+  return reconcile();
 }

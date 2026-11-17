@@ -146,6 +146,9 @@ async function handleQueueRefresh({ c, key, headSha, setting, statePath = requir
     out = !cloneDir ? { ok: false, error: `no ${c.repo} clone provisioned` }
       : await refreshStalePr({ laneRef: c.headRef, root: cloneDir, repo: c.repo, runId, ...(runConclusion ? { runConclusion } : {}), expectedHead: headSha });
   } catch (e) { out = { ok: false, error: errText(e) }; }
+  if (out.action === 'gate-refresh-pending') return { handled: true, action: out.action,
+    reason: `merge-queue: ${wording} → gate-refresh-pending: ${out.error}`,
+    line: `  ⏸ ${label}: PR ${tag}${c.num} — gate-refresh-pending: ${out.error}` };
   if (!out.ok) {
     const reason = `merge-queue: ${wording} → refresh FAILED: ${out.error}`;
     return { handled: true, reason, line: `  ↻ ${label}: refresh PR ${tag}${c.num} (${decision.reason}) → refresh FAILED: ${out.error}` };
@@ -542,20 +545,38 @@ async function refreshStartupFailure({ c, headSha, classification, setting, stat
   try { readFileSync(prMarker); return { handled: false, reason: 'merge-gate startup_failure refresh blocked: an earlier produced-head claim could not be written — a person should look' }; }
   catch (e) { if (e?.code !== 'ENOENT') return { handled: false, reason: `merge-gate refresh claim unreadable: ${errText(e)}` }; }
   const claim = claimFor('head', headSha);
+  let pending = null;
   try { writeClaim(claim); }
-  catch (e) { return { handled: false, reason: e?.code === 'EEXIST' ? 'merge-gate startup_failure refresh already claimed for this head' : `merge-gate refresh claim unusable: ${errText(e)}` }; }
-  let dispatched = false, failed = false, produced = null;
+  catch (e) {
+    if (e?.code !== 'EEXIST') return { handled: false, reason: `merge-gate refresh claim unusable: ${errText(e)}` };
+    try { const saved = JSON.parse(readFileSync(claim, 'utf8')); if (saved?.state === 'pending-unknown') pending = saved; } catch { /* historical/active claims stay closed */ }
+    if (!pending) return { handled: false, reason: 'merge-gate startup_failure refresh already claimed for this head' };
+  }
+  const readLock = `${claim}-reread`;
+  if (pending) {
+    try { writeClaim(readLock); }
+    catch { return { handled: false, reason: 'merge-gate refresh already claimed for label re-read' }; }
+  }
+  let dispatched = false, failed = false, uncertain = Boolean(pending), produced = null;
   const refreshStalePr = async options => {
     dispatched = true;
-    try { const out = await refreshOptions.refreshStalePr(options); if (!out?.ok) failed = true; else produced = out.newCommit; return out; }
-    catch (e) { failed = true; throw e; }
+    try {
+      const out = await refreshOptions.refreshStalePr({ ...options, ...(pending ? { gateRefreshPending: pending } : {}) });
+      if (out?.state === 'pending-unknown') {
+        uncertain = true;
+        // Persist uncertainty in the existing claim, never in the success ledger.
+        writeFileSync(claim, JSON.stringify({ state: out.state, confirmed: out.confirmed === true }));
+      } else if (!out?.ok) { failed = !pending; }
+      else { produced = out.newCommit; if (pending) writeFileSync(claim, ''); }
+      return out;
+    } catch (e) { failed = !uncertain; throw e; }
   };
   let result;
   try {
     result = await handleQueueRefresh({ ...handleArgs, refreshStalePr });
-  } catch (e) { failed = true; throw e; }
-  // An infra refusal (including a failed label fallback) consumes neither the claim nor the catch-up ledger.
-  finally { if (!dispatched || failed) { try { unlinkSync(claim); } catch { /* already gone */ } } }
+  } catch (e) { failed = !uncertain; throw e; }
+  // Only definite failures release the head; uncertain label dispatches keep it without a success record.
+  finally { if (pending) { try { unlinkSync(readLock); } catch { /* already gone */ } } if (!dispatched || failed) { try { unlinkSync(claim); } catch { /* already gone */ } } }
   // The produced head is a different head: claim it durably so a lost ledger write cannot re-arm it. If even that fails, block the whole PR.
   if (dispatched && !failed && produced && produced !== headSha) {
     try { writeClaim(claimFor('head', produced)); }
