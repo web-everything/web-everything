@@ -7,7 +7,7 @@ import { URL as NodeURL } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
 import { readSettings } from '../lib/settings-files.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
-import { ghThrottleLockRoot, resolveGhCap, acquireGhSlotSync, releaseGhSlotSync } from '../lib/gh-throttle.mjs';
+import { ghThrottleLockRoot, resolveGhCap, acquireGhSlotSync, releaseGhSlotSync, deriveGhCaller } from '../lib/gh-throttle.mjs';
 import { randomUUID } from 'node:crypto';
 
 // Unlike runGhSync, this round trip must never fail open. Busy slots also select serial.
@@ -174,7 +174,8 @@ export function runTimeoutEvidencePool(prs, { repo, concurrency = 4, deadlineMs 
           stderrPaths.push(join(folder, `${index}.stderr`));
           writeFileSync(output + '.watchdog', '');
           const child = launch('/bin/sh', ['-c', WRAPPER, 'timeout-worker', process.execPath, WORKER, WATCHDOG, String(expires), folder, input, output], {
-            detached: true, env, stdio: ['ignore', stdout, stderr],
+            detached: true, env: { ...env, GH_CALLER: deriveGhCaller({}, env) }, // workers share the planner's caller identity and its per-caller throttle allowance
+            stdio: ['ignore', stdout, stderr],
           });
           child.on('error', () => {});
           if (child.pid) active.set(index, { child, output, stderrPath: join(folder, `${index}.stderr`) });

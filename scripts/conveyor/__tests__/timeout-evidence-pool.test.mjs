@@ -392,6 +392,20 @@ syncBuiltinESMExports();
 });
 
 
+describe('worker throttle caller identity', () => {
+  it('gives every worker the planner caller so the per-caller throttle allowance is shared', () => {
+    const seen = [];
+    const launch = vi.fn((file, args, opts) => { seen.push(opts.env.GH_CALLER); return {}; });
+    runTimeoutEvidencePool([{ number: 1 }, { number: 2 }], { launch, concurrency: 2, deadlineMs: 200, env: { GH_CALLER: 'planner-under-test' } });
+    expect(seen).toEqual(['planner-under-test', 'planner-under-test']);
+    seen.length = 0;
+    runTimeoutEvidencePool([{ number: 1 }], { launch, concurrency: 2, deadlineMs: 200, env: Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== 'GH_CALLER')) });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).not.toMatch(/\.input\.json$/);
+    expect(seen[0]).not.toBe('unknown');
+  });
+});
+
 describe('real collector API fixture parity', () => {
   const fixture = JSON.parse(readFileSync('scripts/conveyor/__tests__/fixtures/timeout-evidence-api.json', 'utf8'));
   it.each(fixture.cases)('$case: real collector serial and injected worker path deep-equal', row => scratch(dir => {
