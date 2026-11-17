@@ -1782,7 +1782,8 @@ describe('explicit remote CLI decision', () => {
     try {
       const pending = remoteManifestAPI.main({argv,cwd,lockRoot:join(cwd,'heavy'), timeoutMs:10, remoteExec:() => new Promise(() => {}), local, log:vi.fn()});
       await vi.dynamicImportSettled();
-      await vi.advanceTimersByTimeAsync(1010);
+      // An unconfirmed remote still exits 124 after the default 30s cancellation wait.
+      await vi.advanceTimersByTimeAsync(30010);
       expect(await pending).toBe(124);
       expect(local).not.toHaveBeenCalled();
     } finally { vi.useRealTimers(); }

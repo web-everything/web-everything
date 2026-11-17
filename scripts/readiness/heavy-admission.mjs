@@ -107,7 +107,8 @@
  * REMOTE ROUTING CONTRACT — remote stays disabled by default (heavyAdmission.remote.enabled=false).
  * Only { mode: 'remote', code: <integer 0..254> } exits with that code. Local admission may follow only
  * { mode: 'not-started', terminated: true } or { mode: 'cancelled', terminated: true }. After a timeout,
- * only the cancelled+terminated acknowledgement permits local admission. Everything else, including
+ * confirmed cancellation or fresh finished telemetry permits local admission. R989 also accepts a late
+ * remote result within the cancel wait only when its run matches this dispatch's recorded run ID. Everything else, including
  * legacy { mode: 'fallback' }, throws, malformed results and unacknowledged timeouts, exits 124.
  *
  * THE LOAD-ADMISSION GATE (#4076, revised #4343) — a SECOND, DIFFERENT admission axis this module now also
@@ -1157,7 +1158,8 @@ function recordRemoteFallback({lockRoot, reason, detail = null, cwd, argv, env, 
 /** Attempt remote execution before taking a local slot; remote is disabled by default.
  * Only { mode: 'remote', code: <integer 0..254> } exits with that code. Local admission requires
  * { mode: 'not-started', terminated: true } or { mode: 'cancelled', terminated: true }.
- * After timeout-abort, allow up to one second for cancelled+terminated acknowledgement.
+ * After timeout-abort, wait within a bounded cancel window for confirmed termination or (R989) a
+ * verified remote result whose string run ID matches this dispatch's non-null recorded run ID.
  * Otherwise a fresh settled per-run telemetry result can confirm termination for a local rerun;
  * missing or incomplete evidence still refuses local reruns with exit 124. */
 const CLIENT_SIGNAL_NUMBERS = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 };
@@ -1165,6 +1167,20 @@ const CLIENT_SIGNAL_NUMBERS = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 };
 function resolveSignalCancelWaitMs(env) {
   const n = Number((env ?? {}).WE_HEAVY_SIGNAL_CANCEL_WAIT_MS);
   return Number.isInteger(n) && n >= 0 ? n : 90000;
+}
+
+function abortableSleep(ms, signal) {
+  return new Promise((resolve) => {
+    const done = () => { clearTimeout(timer); signal?.removeEventListener('abort', done); resolve(); };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener('abort', done, {once: true});
+    if (signal?.aborted) done();
+  });
+}
+
+function resolveTimeoutCancelWaitMs(env) {
+  const n = Number((env ?? {}).WE_HEAVY_TIMEOUT_CANCEL_WAIT_MS);
+  return Number.isInteger(n) && n >= 0 ? Math.min(n, 90000) : 30000;
 }
 
 export async function runWithRemoteDecision({
@@ -1358,16 +1374,20 @@ export async function runWithRemoteDecision({
   let signalHandlers = [];
   // A kill that lands while a result is being recorded is honoured: exit with the signal code, keeping `terminated` as is.
   const killedExit = () => signalled ? { handled: true, exitCode: 128 + CLIENT_SIGNAL_NUMBERS[signalled], signal: signalled } : null;
-  const confirmFinished = async () => {
+  const confirmFinished = async (stopped = new Promise(() => {}), signal) => {
     if (!executionRun || signalled) return false;
     const gaveUpAt = clock();
     let probeTimer;
+    const probeController = new AbortController();
+    const abortProbe = () => probeController.abort();
+    signal?.addEventListener('abort', abortProbe, {once: true});
+    if (signal?.aborted) abortProbe();
     try {
       // Bypass the health cache: only a sample taken after this failure can settle this execution.
       const telemetry = await Promise.race([
-        Promise.resolve().then(async () => (readTelemetry ?? (await import('./forge-telemetry.mjs')).readForgeTelemetry)({host})),
+        Promise.resolve().then(async () => (readTelemetry ?? (await import('./forge-telemetry.mjs')).readForgeTelemetry)({host, signal: probeController.signal})),
         new Promise(resolve => { probeTimer = setTimeout(() => resolve(null), 1000); }),
-        signalPromise,
+        signalPromise, stopped,
       ]);
       const sampledAt = Date.parse(telemetry?.sampledAtET), age = clock() - sampledAt;
       if (signalled || !(sampledAt > gaveUpAt && age >= -60_000 && age <= 30_000)
@@ -1376,7 +1396,7 @@ export async function runWithRemoteDecision({
       log(`heavy-admission: remote run ${executionRun} finished per fresh telemetry; termination confirmed without a verified receipt, rerunning through local admission\n`);
       return true;
     } catch { return false; }
-    finally { clearTimeout(probeTimer); }
+    finally { clearTimeout(probeTimer); probeController.abort(); signal?.removeEventListener('abort', abortProbe); }
   };
   const timedOut = Symbol('remote-timeout');
   try {
@@ -1469,20 +1489,40 @@ export async function runWithRemoteDecision({
     };
     if (typeof result?.clientSignal === 'string') return await cancelOnClientSignal(result.clientSignal);
     if (result === timedOut) {
-      const termination = await Promise.race([
-        remote.catch(() => null),
-        new Promise((resolve) => {
-          timer = setTimeout(() => resolve(null), 1000);
-        }),
-        signalPromise,
-      ]);
-      // A client kill during the timeout grace period still cancels and exits with the signal code.
-      if (typeof termination?.clientSignal === 'string') return await cancelOnClientSignal(termination.clientSignal);
-      if (termination?.mode !== 'cancelled' || termination.terminated !== true) {
-        if (!await confirmFinished()) {
-          await record({mode:'unconfirmed'});
-          return killedExit() ?? refuseLocal('remote-timeout');
+      const waitMs = resolveTimeoutCancelWaitMs(env);
+      log(`heavy-admission: remote timeout; waiting up to ${waitMs}ms for confirmed cancellation (${env?.WE_HEAVY_TIMEOUT_CANCEL_WAIT_MS === undefined ? 'default' : 'WE_HEAVY_TIMEOUT_CANCEL_WAIT_MS'})\n`);
+      const polling = new AbortController();
+      let stop;
+      const stopped = new Promise(resolve => { stop = resolve; });
+      const deadline = new Promise(resolve => { timer = setTimeout(() => resolve(null), waitMs); });
+      const confirmed = remote.catch(() => null).then(answer => {
+        if (answer?.mode === 'cancelled' && answer.terminated === true) return answer;
+        // R989: remote-exec already verifies the head-bound receipt; bind a late result to THIS dispatch too.
+        if (answer?.mode === 'remote' && Number.isInteger(answer.code) && answer.code >= 0 && answer.code <= 254
+          && executionRun !== null && typeof answer.run === 'string' && answer.run === executionRun) return answer;
+        return new Promise(() => {}); // an ambiguous answer cannot stop the fresh telemetry probes
+      });
+      const probe = (async () => {
+        while (!polling.signal.aborted) {
+          if (await confirmFinished(stopped, polling.signal)) return {mode: 'cancelled', terminated: true};
+          if (!polling.signal.aborted) await abortableSleep(2000, polling.signal); // own timer: the injected busy-wait `sleep` seam is not the cancel-wait poll
         }
+        return null;
+      })();
+      let termination;
+      try { termination = await Promise.race([confirmed, probe, deadline, signalPromise]); }
+      finally { clearTimeout(timer); stop(null); polling.abort(); }
+      // A client kill during the timeout cancel wait still cancels and exits with the signal code.
+      if (signalled) return await cancelOnClientSignal(signalled);
+      if (!termination) {
+        await record({mode:'unconfirmed'});
+        return killedExit() ?? refuseLocal('remote-timeout');
+      }
+      if (termination.mode === 'remote') {
+        terminated = true;
+        await record(termination);
+        if (killedExit()) return killedExit();
+        return { handled: true, exitCode: termination.code, remoteResult: termination };
       }
       reason = 'remote-timeout';
       terminated = true;
