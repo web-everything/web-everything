@@ -277,16 +277,20 @@ it.each(['missing', 'different'])('quarantines null-sha recovery with %s digest 
   }
 });
 
-it('preserves a saved verified sha for a null manifest only when its digest matches', async () => {
+it('rejects null-sha manifest with a cached sha and unknown provenance without changing either record', async () => {
   const f = fixture(), id = f.bundle('unknown');
   await f.run('install', {id, unknown: true}); await f.run('switch', {id, unknown: true});
   const saved = {...f.read('state.json'), forgeSetSha: sha};
   fs.writeFileSync(path.join(f.root, 'state.json'), JSON.stringify(saved));
-  await f.run('switch', {id, unknown: true});
-  expect(f.read('state.json')).toEqual(saved);
-  await f.run('recover', {unknown: true});
-  expect(f.read('state.json')).toEqual(saved);
-  expect(f.read('deploy.json')).toEqual({previous: null});
+  expect(f.read(`versions/${id}/manifest.json`).sha).toBeNull();
+  expect(f.read('deploy.json').provenance).toBe('unknown');
+  const cacheBefore = fs.readFileSync(path.join(f.root, 'state.json'), 'utf8');
+  const deployBefore = fs.readFileSync(path.join(f.root, 'deploy.json'), 'utf8');
+  for (const command of ['status', 'preflight', 'recover']) {
+    await expect(f.run(command, {unknown: true})).rejects.toThrow('stale provenance cache; inspect the remote runner and run recover');
+    expect(fs.readFileSync(path.join(f.root, 'state.json'), 'utf8')).toBe(cacheBefore);
+    expect(fs.readFileSync(path.join(f.root, 'deploy.json'), 'utf8')).toBe(deployBefore);
+  }
 });
 
 it('writes the exact S0 state shape with ET milliseconds, preserves tier, and keeps matching recovery timestamps', async () => {

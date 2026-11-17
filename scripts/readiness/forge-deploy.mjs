@@ -163,7 +163,7 @@ export async function deploy({command, root, source, id, sha: legacyId, shaMeta 
     const active = current(), saved = cache(), savedDeploy = record();
     const version = active ? readVersion(root, active, {fs, uid}) : null;
     if (artifacts().length || (active ? (!saved || saved.setDigest !== active || !savedDeploy) : saved?.setDigest != null)) fail('stale deploy');
-    if (version?.sha && saved.forgeSetSha !== version.sha) fail('stale provenance cache');
+    if (version && saved.forgeSetSha !== version.sha) fail('stale provenance cache');
     if (savedDeploy?.previous) readVersion(root, savedDeploy.previous, {fs, uid});
     return {current: active, previous: savedDeploy?.previous ?? null};
   };
@@ -199,6 +199,7 @@ export async function deploy({command, root, source, id, sha: legacyId, shaMeta 
       // A null-sha manifest cannot borrow provenance from another content set.
       // Recovery has no authority to declare an interrupted switch unknown.
       if (active && !manifest.sha && command === 'recover' && saved?.setDigest !== active) fail('missing matching provenance cache');
+      if (active && !manifest.sha && command === 'recover' && saved.forgeSetSha !== null) fail('stale provenance cache');
       const provenance = manifest?.sha ?? (command === 'recover' ? saved?.forgeSetSha : null);
       syncDir(root);
       if (active) atomic('state.json', {schema: 1, forgeSetSha: provenance, setDigest: active,
