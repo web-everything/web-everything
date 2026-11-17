@@ -162,6 +162,67 @@ describe('numberPendingHashes read source', () => {
   });
 });
 
+describe('numberPendingHashes git grep failures', () => {
+  function seed() {
+    write('backlog/2200-legacy.md', '---\nkind: story\n---\n');
+    write('backlog/xhash01-alpha.md', '---\nkind: story\n---\n# Alpha\n');
+    write(QUEUED_REL, JSON.stringify({ queued: [] }));
+    git('add', '.'); git('commit', '-qm', 'pending card');
+  }
+
+  function failingGrep(details) {
+    return vi.fn((command, args, options) => {
+      if (command === 'git' && args[0] === 'grep' && args.includes('-nE')) {
+        expect(options).toMatchObject({ stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024 });
+        throw Object.assign(new Error('git grep failed'), details);
+      }
+      return execFileSync(command, args, options);
+    });
+  }
+
+  it('proceeds with numbering and commits after a clean grep exit 1 (no match)', () => {
+    seed();
+    const execFile = failingGrep({ status: 1, stderr: Buffer.alloc(0) });
+    const result = numberPendingHashes(repo, { execFile });
+    expect(execFile.mock.calls.some(([, args]) => args[0] === 'grep' && args.includes('-nE'))).toBe(true);
+    expect(result).toMatchObject({ assigned: [{ hash: 'xhash01', nnn: '2201' }], committed: true });
+    expect(result.error).toBeUndefined();
+    expect(backlogNames()).toEqual(['2200-legacy.md', '2201-alpha.md']);
+  });
+
+  it.each([
+    ['exit 2', { status: 2 }, 'status=2'],
+    ['ENOBUFS maxBuffer overflow', { status: null, code: 'ENOBUFS', signal: 'SIGTERM' }, 'status=unknown, code=ENOBUFS, signal=SIGTERM'],
+    ['ERR_CHILD_PROCESS_STDIO_MAXBUFFER overflow', { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' }, 'status=unknown, code=ERR_CHILD_PROCESS_STDIO_MAXBUFFER'],
+    ['ENOENT spawn error', { code: 'ENOENT' }, 'status=unknown, code=ENOENT'],
+    ['signal', { status: null, signal: 'SIGTERM' }, 'status=unknown, signal=SIGTERM'],
+    ['timeout', { code: 'ETIMEDOUT', signal: 'SIGTERM' }, 'status=unknown, code=ETIMEDOUT, signal=SIGTERM'],
+    ['exit 1 with stderr', { status: 1, stderr: Buffer.from('fatal: unreadable input') }, 'status=1, stderr present'],
+    ['exit 1 with maxBuffer overflow', { status: 1, code: 'ENOBUFS' }, 'status=1, code=ENOBUFS'],
+    ['unknown failure', {}, 'status=unknown'],
+  ])('refuses the whole numbering pass on grep %s without assigning or committing', (_label, details, reason) => {
+    seed();
+    const head = git('rev-parse', 'HEAD');
+    const alpha = readFileSync(join(repo, 'backlog/xhash01-alpha.md'), 'utf8');
+    const execFile = failingGrep(details);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const result = numberPendingHashes(repo, { execFile });
+      expect(result).toMatchObject({ assigned: [], committed: false, error: `git-grep-failed: ${reason}` });
+      expect(result.phaseMs).toMatchObject({ resolve: 0, apply: 0, write: 0 });
+      expect(warn).toHaveBeenCalledWith(`[numberPendingHashes] refusing this pass — git-grep-failed: ${reason}. Restore a complete git grep check, then retry numbering.`);
+      expect(execFile.mock.calls.at(-1)[1]).toContain('-nE');
+      expect(git('rev-parse', 'HEAD')).toBe(head);
+      expect(git('status', '--porcelain').trim()).toBe('');
+      expect(backlogNames()).toEqual(['2200-legacy.md', 'xhash01-alpha.md']);
+      expect(readFileSync(join(repo, 'backlog/xhash01-alpha.md'), 'utf8')).toBe(alpha);
+      expect(existsSync(join(repo, LEDGER_REL))).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
 describe('numberPendingHashes — drain JIT numbering wire (#2288)', () => {
   it('numbers pending cards on main with soak-definition citations and repairs those citations atomically', () => {
     write('backlog/2200-legacy.md', '---\nkind: story\n---\n# Legacy\n');

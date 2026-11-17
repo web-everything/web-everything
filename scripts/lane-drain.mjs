@@ -876,7 +876,7 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1, execFile
   try {
     const hits = execFile(
       'git', ['grep', '--threads=1', '-nE', HASH_PATH_CITE_SOURCE, ...(readSource === 'head' ? ['HEAD'] : []), '--', '.', ':!node_modules', ':!backlog'],
-      { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 },
+      { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024 },
     ).split('\n').filter(Boolean);
     unsweptHashPathCites = findHashPathCitesInGrepLines(readSource === 'head'
       ? hits.map((line) => line.replace(/^HEAD:/, '')) : hits)
@@ -886,7 +886,20 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1, execFile
         ? remainingBreakCites.get(c.file).has(citeKey(c))
         : !sweptRelPaths.has(c.file)))
       .map((c) => ({ path: c.file, hash: c.hash }));
-  } catch { /* git grep exits 1 on no match, or git unavailable — no findings either way, never abort on that alone */ }
+  } catch (err) {
+    // Only a clean no-match exit proves there are no citations. Incomplete output is unsafe to number.
+    const stderr = String(err?.stderr ?? '').trim();
+    if (err?.status !== 1 || err?.code || err?.signal || stderr) {
+      const reason = [`status=${err?.status ?? 'unknown'}`,
+        ...(err?.code ? [`code=${err.code}`] : []),
+        ...(err?.signal ? [`signal=${err.signal}`] : []),
+        ...(stderr ? ['stderr present'] : []),
+      ].join(', ');
+      const error = `git-grep-failed: ${reason}`;
+      console.warn(`[numberPendingHashes] refusing this pass — ${error}. Restore a complete git grep check, then retry numbering.`);
+      return finish({ assigned: [], committed: false, error });
+    }
+  }
   const held = [];
   const heldHashes = new Set();
   if (unsweptHashPathCites.length) {
