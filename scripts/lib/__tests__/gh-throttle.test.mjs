@@ -35,7 +35,7 @@ function readJsonl(path) {
 // ── env tuning ───────────────────────────────────────────────────────────────────────────────────────────
 describe('resolveGhCap / resolveAcquireTimeoutMs / resolveRetryMaxAttempts — env override, clamped sane', () => {
   it('defaults when unset', () => {
-    expect(resolveGhCap({})).toBe(DEFAULT_GH_CONCURRENCY_CAP);
+    expect(resolveGhCap({}, { tool: {} })).toBe(DEFAULT_GH_CONCURRENCY_CAP);
     expect(resolveAcquireTimeoutMs({})).toBe(DEFAULT_ACQUIRE_TIMEOUT_MS);
     expect(resolveRetryMaxAttempts({})).toBe(DEFAULT_RETRY_MAX_ATTEMPTS);
   });
@@ -45,8 +45,8 @@ describe('resolveGhCap / resolveAcquireTimeoutMs / resolveRetryMaxAttempts — e
     expect(resolveRetryMaxAttempts({ WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS: '2' })).toBe(2);
   });
   it('falls back on a non-finite or invalid value', () => {
-    expect(resolveGhCap({ WE_GH_THROTTLE_CAP: 'nope' })).toBe(DEFAULT_GH_CONCURRENCY_CAP);
-    expect(resolveGhCap({ WE_GH_THROTTLE_CAP: '0' })).toBe(DEFAULT_GH_CONCURRENCY_CAP);
+    expect(resolveGhCap({ WE_GH_THROTTLE_CAP: 'nope' }, { tool: {} })).toBe(DEFAULT_GH_CONCURRENCY_CAP);
+    expect(resolveGhCap({ WE_GH_THROTTLE_CAP: '0' }, { tool: {} })).toBe(DEFAULT_GH_CONCURRENCY_CAP);
     expect(resolveRetryMaxAttempts({ WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS: '0' })).toBe(DEFAULT_RETRY_MAX_ATTEMPTS);
   });
 });
