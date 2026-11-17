@@ -127,7 +127,7 @@ const DEFAULT_FIXER_LADDER = Object.freeze({
 });
 import { OPERATOR_ANSWER_MARKER, isOperatorAnswerStandDownSuperseded, latestOperatorAnswer } from './stand-down-answer-core.mjs';
 import { classifyPr } from '../progress-board.mjs';
-import { reduceCheckState, CI_TRUTH_EXCLUDED_CHECKS } from '../operations/pr-status.mjs';
+import { reduceCheckState, CI_TRUTH_EXCLUDED_CHECKS, GATE_CLASS_CHECKS } from '../operations/pr-status.mjs';
 import { collapseRollupToLatestPerName, FAILED_CHECK_CONCLUSIONS } from '../lib/rollup-collapse.mjs';
 import { isForeignCompletionSessionId, sanitizeDeniedCommand } from '../operations/completion-record.mjs';
 import { NEGOTIATION_ROUND_CAP } from '../lib/jury-core.mjs';
@@ -492,8 +492,8 @@ export function countRealFixRounds(pr) {
 }
 
 /**
- * PURE: split the head's failing checks (latest run per name) into the REQUIRED ones a ci-heal repairs and the
- * non-required ones it only reports. Live PR #4631: `merge-gate` (not required, red by design until #4715) was
+ * PURE: split the head's failing checks (latest run per name) into the real REQUIRED ones a ci-heal repairs and the
+ * gate-class/non-required ones it only reports. Live PR #4631: `merge-gate` (not required, red by design until #4715) was
  * named four times as a failure to heal. Without a required set, the `reduceCheckState` exclusion list applies.
  * @returns {{required:string[], nonRequired:string[]}}
  */
@@ -501,28 +501,37 @@ export function splitFailingChecks(rollup, requiredChecks) {
   const required = Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks : null;
   const out = { required: [], nonRequired: [] };
   for (const name of failingCheckNames(collapseRollupToLatestPerName(rollup))) {
-    const isRequired = required ? required.includes(name) : !CI_TRUTH_EXCLUDED_CHECKS.includes(name);
+    const isRequired = !GATE_CLASS_CHECKS.includes(name)
+      && (required ? required.includes(name) : !CI_TRUTH_EXCLUDED_CHECKS.includes(name));
     out[isRequired ? 'required' : 'nonRequired'].push(name);
   }
   return out;
 }
 
-/** PURE: every failing required check is a review-owned hold (review-gate, or an annotated merge-gate). */
-export function reviewHoldGatesOnlyRed(rollup, requiredChecks) {
+/** Required failures before excluding gate-class checks from CI repair. */
+function requiredFailingCheckNames(rollup, requiredChecks) {
+  const required = Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks : null;
+  return failingCheckNames(collapseRollupToLatestPerName(rollup))
+    .filter(name => required ? required.includes(name) : !CI_TRUTH_EXCLUDED_CHECKS.includes(name));
+}
+
+/** PURE: every failing required check is a review-owned hold (or a gate when explicitly allowed). */
+export function reviewHoldGatesOnlyRed(rollup, requiredChecks, allowUnannotated = false) {
   if (!Array.isArray(rollup)) return false;
   const latest = collapseRollupToLatestPerName(rollup);
   if (latest.some(row => !row || typeof (row.name || row.context) !== 'string')) return false;
-  const failing = splitFailingChecks(latest, requiredChecks).required;
+  const failing = requiredFailingCheckNames(latest, requiredChecks);
   const mergeGate = latest.find(row => row?.name === 'merge-gate');
+  if (allowUnannotated) return failing.length > 0 && failing.every(name => GATE_CLASS_CHECKS.includes(name));
   return failing.length > 0 && failing.every(name => name === 'review-gate'
     || (name === 'merge-gate' && Boolean(mergeGate?.mergeGateReviewHold)));
 }
 
 /** PURE: required reds are exclusively review-owned holds, with all other required evidence green. */
-export function reviewHoldOnlyRed(rollup, requiredChecks) {
-  if (!reviewHoldGatesOnlyRed(rollup, requiredChecks)) return false;
+export function reviewHoldOnlyRed(rollup, requiredChecks, allowUnannotated = false) {
+  if (!reviewHoldGatesOnlyRed(rollup, requiredChecks, allowUnannotated)) return false;
   const latest = collapseRollupToLatestPerName(rollup);
-  const failing = splitFailingChecks(latest, requiredChecks).required;
+  const failing = requiredFailingCheckNames(latest, requiredChecks);
   // Removing the proven holds must leave complete, readable green CI, never pending or unknown evidence.
   return reduceCheckState(latest.map(row => failing.includes(row?.name || row?.context)
     ? { ...row, conclusion: 'success' } : row), requiredChecks).state === 'green'
@@ -537,7 +546,7 @@ export function isBouncedRealRed({ pr, phase, check, requiredChecks }) {
   return phase === 'bounced' && !labelNames(pr?.labels).includes(CONFLICT_LABEL)
     && check?.state === 'red'
     && splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required
-      .some(name => name !== 'review-gate' && name !== 'merge-gate');
+      .length > 0;
 }
 
 /** PURE: settled head CI missing a required job introduced after this PR's base. */
@@ -1561,7 +1570,7 @@ function reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra = {} }
   // Excuse only failed conclusions, preserving missing-head, wrong-head and incomplete-evidence refusals.
   const onlyFailures = ci.reason === 'ci-red' || (ci.affected.length > 0
     && ci.affected.every(row => FAILED_CHECK_CONCLUSIONS.includes(row.reason.toUpperCase())));
-  const allowed = ci.allowed || (onlyFailures && reviewHoldOnlyRed(pr?.statusCheckRollup, requiredChecks));
+  const allowed = ci.allowed || (onlyFailures && reviewHoldOnlyRed(pr?.statusCheckRollup, requiredChecks, labelNames(pr?.labels).includes('review:pending')));
   if (!allowed) refuse('review-ci', {
     ...withPhase, ...extra, ci, ...earlyStartShadowFields(pr, requiredChecks),
     why: `${ci.reason}: ${ci.affected.map(row => `${row.name}=${row.reason}`).join(', ')}`,
@@ -2992,9 +3001,11 @@ export function planReconcile({
     const bouncedRealRed = isBouncedRealRed({ pr, phase, check, requiredChecks });
     // At the review-fix cap an unused operator-directed round still belongs to the existing fix path below.
     // Routing it through CI healing would refuse at the cap before that path can carry the allowance.
-    const ciRepairOwed = phase === 'ci-red' || (phase === 'needs-human' && check.state === 'red')
+    const gateOnlyRed = reviewHoldGatesOnlyRed(pr?.statusCheckRollup, requiredChecks, true);
+    const ciRepairCandidate = phase === 'ci-red' || (phase === 'needs-human' && check.state === 'red')
       || (bouncedRealRed && !(sendBackRound && roundAttempts() >= effectiveRoundCap));
-    if (!(advisoryReviewOnHumanHandoff === 'on' && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))) && ciRepairOwed && reviewCi.reason === 'required-review-gate-conflict'
+    const ciRepairOwed = ciRepairCandidate && !gateOnlyRed;
+    if (!(advisoryReviewOnHumanHandoff === 'on' && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))) && ciRepairCandidate && !(gateOnlyRed && phase === 'ci-red' && withPhase.labels.includes('review:pending')) && reviewCi.reason === 'required-review-gate-conflict'
         && reviewCi.affected.every(row => row.name === 'review-gate')) {
       refuse('review-ci', { ...withPhase, ci: reviewCi, why: 'required review-gate must succeed before review; resolve the review-dependent required-check configuration' });
       continue;
@@ -3132,8 +3143,14 @@ export function planReconcile({
       continue;
     }
 
-    const heldGates = ciRepairOwed ? splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required : [];
-    const reviewHoldRed = ciRepairOwed
+    // Gate-only red must reach the ordinary review guards, never the CI-heal owner.
+    if (gateOnlyRed && phase === 'ci-red' && withPhase.labels.includes('review:pending') && !pr.isDraft) {
+      dispatchReviewRow({ pr, requiredChecks, withPhase, base, attempts: roundAttempts(),
+        roundCap: effectiveRoundCap, refuse, refuseCapExhausted, dispatch, now });
+      continue;
+    }
+    const heldGates = ciRepairCandidate ? requiredFailingCheckNames(pr?.statusCheckRollup, requiredChecks) : [];
+    const reviewHoldRed = ciRepairCandidate
       && withPhase.labels.some(l => ['review:human', 'review:pending', 'review:changes', 'review:held-mechanical'].includes(l))
       && reviewHoldGatesOnlyRed(pr?.statusCheckRollup, requiredChecks);
     if (reviewHoldRed) {
@@ -3145,7 +3162,8 @@ export function planReconcile({
         continue;
       }
     }
-    if (ciRepairOwed && !reviewHoldRed) {
+    // Preserve non-review-pending holds/escalations, but never dispatch a heal for gate-only red.
+    if (ciRepairCandidate && !reviewHoldRed) {
       // The numbering proof covers only the `test` job: any other failing required check keeps its ci-heal.
       const onlyTestRed = (r => r.length === 1 && r[0] === 'test')(splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required);
       const owedMainRuleHold = !!(pr?.owedMainRule?.owed && pr.owedMainRule.ownsRepair === true && pr.owedMainRule.head === pr?.headRefOid && pr.mergeStateStatus !== 'DIRTY' && !pr.isCrossRepository && /^lane\/.+/.test(pr.headRefName ?? ''));
@@ -3494,6 +3512,10 @@ export function planReconcile({
       if ((bouncedRealRed || (fixTiming.joinCiAndReview && readiness.ciFailed && readiness.reviewFindings)) && roundAttempts() >= effectiveRoundCap) {
         refuseCapExhausted({ ...withPhase, attempts: roundAttempts(), cap: effectiveRoundCap, capKind: 'fix',
           why: 'joined CI/review repair cannot bypass the review-fix round cap' });
+        continue;
+      }
+      if (!ciRepairOwed) {
+        refuse('nothing-owed', { ...withPhase, why: 'only gate-class checks are failing; no CI repair is owed' });
         continue;
       }
       const failing = splitFailingChecks(pr?.statusCheckRollup, requiredChecks);

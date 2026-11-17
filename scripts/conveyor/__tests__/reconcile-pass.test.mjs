@@ -1375,6 +1375,18 @@ describe('timeout re-run eligibility — card-only diff + derived red checks (PR
   it('card-only still refuses an unresolvable relative import of the failing test', () => {
     expect(timeoutImpact({ ...base, sources: { 'a.test.mjs': 'import "./gone.mjs";' }, changed: [{ filename: 'backlog/x.md' }] }, timeoutTs)).toMatch(/^unresolved-dependency:/);
   });
+  it.each(['merge-gate', 'review-gate'])('does not collect repair evidence or budget for %s-only red', gate => {
+    const pr = { number: 7029, statusCheckRollup: [
+      { name: 'test', status: 'completed', conclusion: 'success' },
+      { name: gate, status: 'completed', conclusion: 'failure' },
+    ] };
+    const read = vi.fn();
+    const readBudget = vi.fn();
+    expect(enrichPrsWithTimeoutEvidence([pr], { repo: 'o/r', enabled: true, read, readBudget })).toEqual([pr]);
+    expect(read).not.toHaveBeenCalled();
+    expect(readBudget).not.toHaveBeenCalled();
+  });
+
   it('review-gate and the shard-derived aggregate `test` are not primary failure evidence', () => {
     const checks = [{ name: 'review-gate', conclusion: 'failure' }, { name: 'test-shard (2)', conclusion: 'failure' }, { name: 'test', conclusion: 'failure' }];
     expect(checks.filter((c) => !isDerivedTimeoutCheck(c, checks)).map((c) => c.name)).toEqual(['test-shard (2)']);
@@ -1609,14 +1621,14 @@ describe('readTimeoutEvidence — authoritative cancelled check suites (#4651)',
     expect(exec.mock.calls.some(([, args]) => args[1].includes('/actions/'))).toBe(false);
   });
 
-  it('review-gate as the only red check is no-primary-failed-checks, never an incomplete inventory (live 2026-11-09 #6612/#6621)', () => {
+  it.each(['review-gate', 'merge-gate'])('%s as the only red check is no-primary-failed-checks, never an incomplete inventory', gate => {
     const json = JSON.stringify;
     const exec = vi.fn((_c, [, path]) => {
       if (/\/pulls\/7$/.test(path)) return json({ head: { sha: head }, base: { sha: 'b' }, state: 'open', changed_files: 1 });
       if (/pulls\/7\/files/.test(path)) return json([{ filename: 'a.ts' }]);
       if (/check-runs/.test(path)) return json({ total_count: 2, check_runs: [
         { id: 1, name: 'test', status: 'completed', conclusion: 'success', details_url: url(50, 1), check_suite: { id: 5 } },
-        { id: 2, name: 'review-gate', status: 'completed', conclusion: 'failure', details_url: url(60, 2), check_suite: { id: 6 } },
+        { id: 2, name: gate, status: 'completed', conclusion: 'failure', details_url: url(60, 2), check_suite: { id: 6 } },
       ] });
       if (/\/status$/.test(path)) return json({ total_count: 0 });
       throw new Error(`unexpected ${path}`);

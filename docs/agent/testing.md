@@ -4425,3 +4425,10 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+## Gate-class CI repair regressions
+
+`merge-gate` and `review-gate` failures never owe CI healing, even when required and
+unannotated. Pin gate-only review-pending dispatch separately from annotated draft
+promotion; mixed real/gate failures must name only real checks in the heal. Keep
+missing/pending required evidence and missing-head review refusals covered.

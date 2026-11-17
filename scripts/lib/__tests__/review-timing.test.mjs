@@ -273,7 +273,7 @@ describe('parallel review start and void', () => {
   it.each([
     ['review-gate red', [check('review-gate', 'failure')], false],
     ['merge-gate red on a review hold', [check('merge-gate', 'failure', { mergeGateReviewHold: { holds: ['review-gate'], jobId: 1 } })], false],
-    ['plain merge-gate red', [check('merge-gate', 'failure')], true],
+    ['plain merge-gate red', [check('merge-gate', 'failure')], false],
   ])('required %s: healable=%s, the same rule the CI heal uses (#5463)', (_name, rows, healable) => {
     const requiredChecks = ['test', 'review-gate', 'merge-gate'];
     const checks = [...rows, check('test'), ...fast.map(n => check(n))];

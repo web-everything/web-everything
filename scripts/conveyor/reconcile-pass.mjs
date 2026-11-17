@@ -61,7 +61,7 @@ import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { readMainRedPriority } from '../lib/main-red-priority.mjs'; // card xu1nixv
 import { fetchPrCommits } from '../lib/pr-limit.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
-import { FAILING_CONCLUSIONS, NON_BLOCKING_CONCLUSIONS, reduceCheckState } from '../operations/pr-status.mjs';
+import { FAILING_CONCLUSIONS, NON_BLOCKING_CONCLUSIONS, reduceCheckState, GATE_CLASS_CHECKS } from '../operations/pr-status.mjs';
 import { checksArgv, parseJsonLines, GH_TIMEOUT_MS } from '../operations/pr-status-io.mjs';
 import { isGhDeferred } from '../lib/gh-deferred.mjs';
 import { readTimeoutBudget } from './timeout-retry-state.mjs';
@@ -2055,10 +2055,10 @@ export function resolveCheckOrigin(c, { repo, api }) {
   return [m[0], m[1], m[2], String(jobs[0].id)];
 }
 
-/** A failed check that is not primary evidence: `review-gate` (red by design under a review hold) and the
+/** A failed check that is not primary evidence: gate-class policy checks and the
  *  aggregate `test` job when at least one `test-shard (N)` or `integration` job also failed (it only mirrors its shards). */
 export function isDerivedTimeoutCheck(check, checks = []) {
-  if (check?.name === 'review-gate') return true;
+  if (GATE_CLASS_CHECKS.includes(check?.name)) return true;
   // LIVE INCIDENT 2026-10-06, PR #4141: `daemon-soak` is the aggregator over `soak-shard (N)` exactly as `test` is over
   // `test-shard (N)`. Its own ~4 s log has no vitest summary, so counting it as evidence made every real soak failure an
   // `incomplete-failure-inventory` refusal that masked the PR's real owner state. The failed shard carries the evidence.
@@ -2133,7 +2133,7 @@ function readTimeoutEvidenceOnce(pr, { repo, exec = execFileSyncThrottled, ts, r
     // PR #4651 (2026-10-09): judge only the run GitHub's branch protection judges (newest check suite per name), so a
     // cancelled run already superseded by a newer suite is never re-run, and a newest-suite cancel always is.
     const redChecks = authoritativeCheckRuns(checks).filter((c) => !['success', 'skipped', 'neutral'].includes(c.conclusion));
-    const reviewHoldOnly = redChecks.every((c) => c.name === 'review-gate');
+    const reviewHoldOnly = redChecks.every((c) => GATE_CLASS_CHECKS.includes(c.name));
     const failed = redChecks.filter((c) => !isDerivedTimeoutCheck(c, checks));
     const jobs = failed.map((c) => {
       const match = resolveCheckOrigin(c, { repo, api });
@@ -2162,7 +2162,7 @@ function readTimeoutEvidenceOnce(pr, { repo, exec = execFileSyncThrottled, ts, r
     // Nothing left after dropping derived checks (review-gate red BY DESIGN under a review hold, or a superseded
     // cancelled suite) is not an unreadable inventory: say so, or reconcile files an operator ruling-needed event
     // ("incomplete failure inventory ... rerun spent") for a PR whose CI is green (live 2026-11-09, #6612/#6621).
-    // Only when review-gate is the SOLE red check; any other empty-jobs case (e.g. a superseded shard hiding a red aggregate) stays an incomplete inventory.
+    // Only when gate-class checks are the sole reds; any other empty-jobs case (e.g. a superseded shard hiding a red aggregate) stays an incomplete inventory.
     if (!jobs.length && reviewHoldOnly) throw new Error('no-primary-failed-checks');
     if (!jobs.length || jobs.some((j) => !parseTimeoutFailures(j.log).complete)) throw new Error('incomplete-failure-inventory');
     const tree = api(`repos/${repo}/git/trees/${head}?recursive=1`);
@@ -2217,7 +2217,7 @@ export function enrichPrsWithTimeoutEvidence(prs, {
   // heal budget was dead code and a flaky-timeout PR burned 3/3 heals. On by default now; `=0` is the kill switch.
   if (!enabled) return prs;
   return prs.map((pr) => {
-    if (!(pr.statusCheckRollup ?? []).some((c) => c.name !== 'review-gate'
+    if (!(pr.statusCheckRollup ?? []).some((c) => !GATE_CLASS_CHECKS.includes(c.name)
       && ['failure', 'timed_out', 'cancelled', 'startup_failure'].includes(String(c.conclusion).toLowerCase()))) return pr;
     const timeoutRetryBudget = readBudget({ repo, pr: pr.number, head: pr.headRefOid });
     if (!(pr.statusCheckRollup ?? []).some((c) => c.detailsUrl?.startsWith(`https://github.com/${repo}/actions/runs/`))) {
