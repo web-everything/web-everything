@@ -2620,7 +2620,7 @@ describe('forge-busy wait-retry (runWithRemoteDecision)', () => {
     return f;
   }
   const go = (f, extra = {}) => f.run({ argv: f.argv, policy: f.policy, cwd: f.cwd, env: f.env, lockRoot: f.lockRoot, clock: f.clock, readTelemetry: f.readTelemetry, remoteExec: f.remoteExec, log: f.log, sleep: f.sleep, ...extra });
-  const health = (f) => JSON.parse(readFileSync(join(f.cwd, 'remote', 'health.json'), 'utf8'));
+  const health = (f) => JSON.parse(readFileSync(join(f.cwd, 'remote', 'health-g2.json'), 'utf8'));
   const remoteMarkers = (f) => readdirSync(join(f.cwd, 'remote')).filter((n) => n.endsWith('.unconfirmed'));
   // Anything a local heavy slot would leave behind under the admission lock root.
   const localEntries = (f) => (existsSync(f.lockRoot) ? readdirSync(f.lockRoot) : []).filter((n) => /slot/.test(n));

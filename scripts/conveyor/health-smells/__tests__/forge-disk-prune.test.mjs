@@ -89,7 +89,7 @@ describe('forge-disk-prune smell', () => {
     try {
       const remote = join(root, '.admission', 'remote');
       mkdirSync(remote, { recursive: true });
-      const file = join(remote, 'health.json');
+      const file = join(remote, 'health-g2.json');
       const json = JSON.stringify({ telemetry: { sampledAtET: fresh, diskUsedPct: 100, prune: { consecutiveRefused: 0 } } });
       writeFileSync(file, json);
       expect(smell.evaluate({}, { now: NOW })[0].escalation?.status).toBe('needs-you');
