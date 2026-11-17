@@ -1198,14 +1198,29 @@ function aiSeatRoute(role, current, { env, io, available, operation, taskType, p
     const resolved = (io.readAiRouting ?? resolveAiRouting)({ env, log: false });
     const { coordinator } = aiRoutingInputs(role, resolved);
     if (!coordinator?.provider) return current;
+    if (role === 'red-team-recheck' && coordinator.provider !== 'claude') {
+      io.log(`aiRouting.${role}: ${coordinator.provider} cannot enforce Claude's tool, budget and environment restrictions; inheriting today's route`);
+      return current;
+    }
     if (!available.includes(coordinator.provider)) {
       io.log(`aiRouting.${role}: ${coordinator.provider} unavailable; inheriting today's route`);
       return current;
     }
     // Reapply roster, counting-seat, disabled-provider and operator-override rules.
     const reader = io.readRoutingPolicy ?? readRoutingPolicy;
-    const route = validateAiSeatRoute({ operation, taskType, available, policy: policy ?? reader(),
+    const effectivePolicy = policy ?? reader();
+    const route = validateAiSeatRoute({ operation, taskType, available, policy: effectivePolicy,
       aiRouting: coordinator, operatorKeys: operatorKeys ?? reader.operatorKeys?.() ?? [] });
+    if (route) {
+      const todayEffort = current?.effort
+        ?? resolveOperationEffort(operation, current?.provider ?? route.provider, taskType, effectivePolicy)
+        ?? (role === 'red-team-recheck' ? RECHECK_EFFORT : RED_TEAM_MODELS[route.provider].effort);
+      const efforts = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+      if (efforts.indexOf(route.effort) < efforts.indexOf(todayEffort)) {
+        io.log(`aiRouting.${role}: effort ${route.effort} below today's ${todayEffort}; keeping today's effort`);
+        route.effort = todayEffort;
+      }
+    }
     const sources = Object.fromEntries(Object.entries(resolved.sources ?? {}).filter(([path]) => path.startsWith(`${role}.coordinator.`)));
     io.log(`policy-cascade · aiRouting.${role}: ${route?.provider}/${route?.model}/${route?.effort} (${JSON.stringify(sources)})`);
     return route ?? current;
