@@ -1,0 +1,343 @@
+{
+  "$schema": "permission-policy/1",
+  "kind": "ci-heal",
+  "description": "CI-heal session: repairs a red check on one PR in a lane clone.",
+  "allow": {
+    "bash": [
+      "cat *",
+      "cat",
+      "cd *",
+      "cut *",
+      "date *",
+      "TZ=* date *",
+      "diff *",
+      "echo *",
+      "grep *",
+      "head *",
+      "id -u",
+      "jq *",
+      "ls *",
+      "pgrep *",
+      "ps *",
+      "seq *",
+      "sort *",
+      "sed -n *",
+      "tail *",
+      "tr *",
+      "wc *",
+      "plutil *",
+      "kill -0 *",
+      "git -C *",
+      "git diff *",
+      "git fetch *",
+      "git grep *",
+      "git log *",
+      "git rev-parse *",
+      "git show *",
+      "git status*",
+      "git ls-files*",
+      "git ls-remote *",
+      "git merge-base *",
+      "git rev-list *",
+      "git remote *",
+      "git cat-file *",
+      "git config --get*",
+      "git describe*",
+      "git blame *",
+      "git reflog*",
+      "git shortlog*",
+      "git worktree list*",
+      "git for-each-ref*",
+      "git symbolic-ref *",
+      "git count-objects*",
+      "git branch *",
+      "gh api *",
+      "gh issue *",
+      "gh pr *",
+      "gh run *",
+      "launchctl list *",
+      "launchctl print *",
+      "node scripts/lib/*",
+      "node scripts/readiness/*",
+      "node scripts/operations/*",
+      "node scripts/conveyor/*",
+      "node scripts/lane-pool.mjs *",
+      "node scripts/codex-*",
+      "LANE_SESSION=* node scripts/*",
+      "npm run *",
+      "npx vitest *",
+      "mkdir -p *",
+      "node report.mjs *",
+      "node sample.mjs *",
+      "node ~/workspace/.operations/*",
+      "node ~/workspace/.operations/handoff/*",
+      "bash ~/workspace/.operations/backup/*",
+      "bash ~/workspace/.operations/handoff/*",
+      "git add *",
+      "git checkout *",
+      "git commit *",
+      "git merge*",
+      "git pull *",
+      "git push *",
+      "git stash*",
+      "git tag *",
+      "git cherry-pick *",
+      "git rebase *",
+      "git restore *",
+      "git apply *",
+      "git reset --soft *",
+      "git reset HEAD*",
+      "git mv *",
+      "git rm *",
+      "git notes *",
+      "git update-index *",
+      "codex *",
+      "cp *",
+      "node scripts/lane-drain.mjs *",
+      "node scripts/pr-land.mjs *",
+      "gh pr merge*",
+      "node -e ' *",
+      "perl -e *",
+      "python3 -",
+      "python3 -c *",
+      "python3 -c ' *"
+    ],
+    "builtins": [
+      "echo",
+      "true",
+      "false",
+      "break",
+      "continue",
+      "cd",
+      "test",
+      "[",
+      "printf",
+      "exit",
+      ":",
+      "export",
+      "unset",
+      "local"
+    ],
+    "redirect_targets": [
+      "^\\/dev\\/null$",
+      "^&\\d$",
+      "^(~|\\$HOME|@HOME@)\\/workspace\\/",
+      "^\\/private\\/tmp\\/",
+      "^\\/tmp\\/",
+      "^(~|\\$HOME|@HOME@)\\/\\.claude\\/(?!hooks\\/|settings)"
+    ],
+    "relative_redirect_cwd": "^(@HOME@\\/workspace\\/|\\/private\\/tmp\\/|\\/tmp\\/)",
+    "lane_message_rm": "^@HOME@\\/workspace\\/\\.lanes\\/[A-Za-z0-9_.-]+\\/lane-\\d+\\/(\\.git\\/)?(fix-msg|commit-msg|pr-body|msg|heal|scratch|tmp)[A-Za-z0-9_.-]*$",
+    "lane_scratch_rm_cwd": [
+      "^@HOME@\\/workspace\\/\\.lanes\\/",
+      "^\\/private\\/tmp\\/claude-501\\/"
+    ],
+    "lane_scratch_rm_name": "^\\.?[A-Za-z0-9_][A-Za-z0-9._-]*\\*?$",
+    "lane_scratch_rm_name_strict": "^(\\.[A-Za-z0-9_][A-Za-z0-9._-]*|(tmp|scratch|out|log|logs|heal|fix|msg)[A-Za-z0-9._-]*)\\*?$",
+    "edit": [
+      "^@HOME@\\/workspace\\/",
+      "^@HOME@\\/\\.plateau\\/",
+      "^\\/private\\/tmp\\/",
+      "^\\/tmp\\/",
+      "^@HOME@\\/\\.claude\\/(agents|projects|conveyor|jobs|daemon-overlays|commands|skills)\\/",
+      "^@HOME@\\/\\.claude\\/platform-preferences\\.json$"
+    ],
+    "proposed": [
+      {
+        "id": "repo-script-abs",
+        "re": "^node\\s+([\"']?)(?:~|@HOME@)\\/workspace\\/(?:wev-[A-Za-z0-9-]+|webeverything|\\.lanes\\/[\\w.-]+\\/lane-\\d+)\\/(?:scripts|skills-src)\\/[A-Za-z0-9_./-]+\\.mjs\\1(?:\\s|$)",
+        "noDotDot": true,
+        "note": "hook-proposals #1"
+      },
+      {
+        "id": "handoff-tool-abs",
+        "re": "^(?:node|bash)\\s+(?:~|@HOME@)\\/workspace\\/\\.operations\\/(?:handoff|backup)\\/[\\w.-]+\\.(?:mjs|sh)(?:\\s|$)",
+        "noDotDot": true,
+        "note": "hook-proposals #2 (absolute)"
+      },
+      {
+        "id": "handoff-tool-rel",
+        "re": "^(?:node|bash)\\s+[\\w.-]+\\.(?:mjs|sh)(?:\\s|$)",
+        "cwd": "^@HOME@\\/workspace\\/\\.operations\\/",
+        "note": "hook-proposals #2 (relative, cwd under .operations)"
+      },
+      {
+        "id": "sed-readonly",
+        "re": "^sed\\s+(?:-E\\s+|-r\\s+)?(?:'[^']*'|\"[^\"$`]*\")(?:\\s+[\\w./~-]+)*$",
+        "forbid": "(^|\\s)-i|--in-place|\\/[a-z]*[wer]([a-z]*['\"]|\\s)",
+        "note": "hook-proposals #5"
+      },
+      {
+        "id": "sed-inplace-scoped",
+        "re": "^sed\\s+-i\\s*(?:''|\"\")?\\s+(?:-E\\s+)?(?:'[^']*'|\"[^\"$`]*\")\\s+(.+)$",
+        "pathsGroup": 1,
+        "forbid": "\\/[a-z]*[wer]([a-z]*['\"]|\\s)|;\\s*w\\s",
+        "note": "hook-proposals #4, files must stay under the workspace"
+      }
+    ],
+    "workspace_write_never": [
+      "\\/\\.git\\/",
+      "\\.\\."
+    ],
+    "lane_git_message_ok": "^(@HOME@\\/workspace\\/\\.lanes\\/[A-Za-z0-9_.-]+\\/lane-\\d+\\/)?\\.git\\/(fix-msg|commit-msg|pr-body|msg|heal|scratch|tmp)[A-Za-z0-9_.-]*$"
+  },
+  "always_ask": {
+    "bash": [
+      {
+        "re": "RAW_PR_CREATE_OK|WE_LAND_UNVERIFIED|WE_PR_OPEN_SOAK_PRECHECK|MAIN_SESSION_BUILD_OK|--skipPrePrReview",
+        "why": "delivery-gate override env/flag"
+      },
+      {
+        "re": "\\b(pkill|killall|sudo|eval|exec)\\b",
+        "why": "process kill, privilege or eval"
+      },
+      {
+        "re": "\\bkill\\s+-(9|KILL)\\b",
+        "why": "forced kill"
+      },
+      {
+        "re": "\\brm\\s+-[a-zA-Z]*[rf]",
+        "why": "rm -r/-f"
+      },
+      {
+        "re": "\\b(ba|z)?sh\\s+-c\\b",
+        "why": "shell -c runs unjudged code"
+      },
+      {
+        "re": "\\bgit\\s+push\\b.*(--force|-f\\b)",
+        "why": "force push"
+      },
+      {
+        "re": "\\.claude\\/settings(\\.local)?\\.json",
+        "why": "settings file"
+      },
+      {
+        "re": "\\.claude\\/hooks\\/",
+        "why": "hooks directory"
+      },
+      {
+        "re": "\\|\\s*(ba|z)?sh\\b",
+        "why": "pipe into a shell"
+      },
+      {
+        "re": "\\bgit\\s+reset\\b[^;&|\\n]*--hard",
+        "why": "hard reset",
+        "strict": true
+      },
+      {
+        "re": "\\bgit\\s+clean\\b",
+        "why": "git clean",
+        "strict": true
+      },
+      {
+        "re": "\\bgit\\s+push\\b[^;&|\\n]*--force-with-lease",
+        "why": "force push variant",
+        "strict": true
+      },
+      {
+        "re": "\\bgh\\s+(release|repo\\s+delete)\\b|\\bnpm\\s+publish\\b",
+        "why": "publish or destructive gh",
+        "strict": true
+      },
+      {
+        "re": "--dangerously-skip-permissions|--allow-conflict|\\bMAIN_PUSH_OK\\b",
+        "why": "bypass flag",
+        "strict": true
+      },
+      {
+        "re": "--no-verify\\b|core\\.hooksPath",
+        "why": "hook bypass",
+        "strict": true
+      },
+      {
+        "re": "CLAUDE\\.md\\b[^|;&\\n]*(<<|>>?\\s*[~\\/\\w])|>>?\\s*\\S*\\.claude\\/CLAUDE\\.md",
+        "why": "CLAUDE.md write",
+        "strict": true
+      },
+      {
+        "re": "(~|@HOME@|\\$HOME)\\/\\.(ssh|aws|gnupg|netrc|npmrc|config\\/gh)\\b",
+        "why": "credentials path",
+        "strict": true
+      }
+    ],
+    "edit": [
+      {
+        "re": "\\/\\.plateau\\/hooks\\/",
+        "why": "permission hook directory"
+      },
+      {
+        "re": "\\/\\.git\\/(hooks|config)(\\/|$)",
+        "why": "git hooks or config"
+      },
+      {
+        "re": "\\/\\.claude\\/(settings[^/]*\\.json|hooks\\/(?!allow-compound\\.mjs$)|CLAUDE\\.md$)|\\.\\.\\/",
+        "why": "settings, hooks, CLAUDE.md or path traversal"
+      },
+      {
+        "re": "\\/\\.(ssh|aws|gnupg)\\/|\\/\\.(netrc|npmrc)$",
+        "why": "credentials file"
+      }
+    ],
+    "rm_recursive": true
+  },
+  "deny": {
+    "bash": [
+      {
+        "re": "(~|@HOME@|\\$HOME)\\/\\.secrets\\b",
+        "why": "credential store"
+      },
+      {
+        "re": "--dangerously-skip-permissions",
+        "why": "permission bypass flag"
+      },
+      {
+        "re": "RAW_PR_CREATE_OK|WE_LAND_UNVERIFIED|WE_PR_OPEN_SOAK_PRECHECK|MAIN_SESSION_BUILD_OK|MAIN_PUSH_OK|--skipPrePrReview|--allow-conflict",
+        "why": "delivery-gate override: orchestrator-only"
+      }
+    ],
+    "edit": [
+      {
+        "re": "\\/\\.secrets(\\/|$)",
+        "why": "credential store"
+      }
+    ]
+  },
+  "settings": {
+    "ask": [
+      "Bash(*--no-verify*)",
+      "Bash(*--allow-conflict*)",
+      "Bash(*MAIN_PUSH_OK=*)",
+      "Bash(*git push*--force-with-lease*)",
+      "Edit(**/.git/hooks/**)",
+      "Write(**/.git/hooks/**)",
+      "Edit(~/.plateau/hooks/**)",
+      "Write(~/.plateau/hooks/**)",
+      "Bash(git push --force*)",
+      "Bash(git push -f*)",
+      "Bash(git reset --hard*)",
+      "Bash(git clean *)",
+      "Bash(sudo *)",
+      "Bash(pkill *)",
+      "Bash(killall *)",
+      "Bash(gh release *)",
+      "Bash(gh repo delete*)",
+      "Bash(npm publish*)",
+      "Bash(MAIN_SESSION_BUILD_OK=*)",
+      "Bash(RAW_PR_CREATE_OK=*)",
+      "Bash(WE_LAND_UNVERIFIED=*)",
+      "Bash(WE_PR_OPEN_SOAK_PRECHECK=*)",
+      "Edit(~/.claude/CLAUDE.md)",
+      "Edit(~/.claude/settings.json)",
+      "Edit(~/.claude/settings.local.json)",
+      "Write(~/.claude/CLAUDE.md)",
+      "Write(~/.claude/settings.json)",
+      "Write(~/.claude/settings.local.json)"
+    ],
+    "deny": [
+      "Bash(*--dangerously-skip-permissions*)",
+      "Read(~/.secrets/**)",
+      "Edit(~/.secrets/**)",
+      "Write(~/.secrets/**)"
+    ]
+  }
+}
