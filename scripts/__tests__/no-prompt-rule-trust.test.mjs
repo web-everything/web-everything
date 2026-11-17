@@ -3,7 +3,7 @@ import {
   NO_PROMPT_COMMAND_RULES, NO_PROMPT_COMMAND_RULES_BODY, NO_PROMPT_COMMAND_RULES_SENTINEL,
   NO_PROMPT_COMMAND_RULES_END, NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT,
   assertBriefTaskContent, renderNoPromptCommandRules, noPromptRulePlacement,
-  stripTrustedNoPromptCommandRules, NO_GIT_COMMAND_RULES,
+  stripTrustedNoPromptCommandRules,
 } from '../lib/no-prompt-command-rules.mjs';
 import { buildPlanCritiqueMandate, buildPlanMandate } from '../lib/review-core.mjs';
 import { fenceUntrusted } from '../lib/mandate-fence.mjs';
@@ -16,13 +16,12 @@ describe('no-prompt rules retain instruction position', () => {
     const prompt = build();
     const closing = prompt.indexOf(`</${tag}>`);
     expect(prompt).toContain(fenceUntrusted(tag, NO_PROMPT_COMMAND_RULES));
-    expect(prompt.split(NO_PROMPT_COMMAND_RULES)).toHaveLength(2);
-    expect(prompt.split(NO_GIT_COMMAND_RULES)).toHaveLength(2);
+    expect(prompt.split(NO_PROMPT_COMMAND_RULES)).toHaveLength(3);
     const { blocks } = noPromptRulePlacement(prompt);
     expect(blocks).toHaveLength(1);
     const opening = prompt.indexOf(`<${tag}>\n`);
     expect(blocks[0].end <= opening || blocks[0].start > closing).toBe(true);
-    expect(prompt.slice(blocks[0].start, blocks[0].end)).toBe(NO_GIT_COMMAND_RULES);
+    expect(prompt.slice(blocks[0].start, blocks[0].end)).toBe(NO_PROMPT_COMMAND_RULES);
     expect(renderNoPromptCommandRules(prompt)).toBe(prompt);
   });
 

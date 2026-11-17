@@ -188,7 +188,7 @@ parked PR is [`/review`](../review/SKILL.md); a judge-only opinion with no fixes
 
 - Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.
 - Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.
-- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.
-- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`.
-- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.
+- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting.
+- Never run destructive history or working-tree resets, forced pushes, or cleans.
+- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`.
 <!-- no-prompt-command-rules:end -->

@@ -196,7 +196,7 @@ export function jurorMandate({
     'worseThanBase, parallelizable. Omitting any of the three leaves the finding BLOCKING; they are the only way',
     'to route one to a carve-out. Return an EMPTY findings array if the subject survives your lens\'s scrutiny',
     '(do not pad with nitpicks).',
-  ].filter((l) => l !== '').join('\n'), "skills-src/jury/panel-fanout.mjs");
+  ].filter((l) => l !== '').join('\n'));
 }
 
 /**

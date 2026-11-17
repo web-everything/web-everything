@@ -337,7 +337,7 @@ export function buildPanelistBrief({ question, lens, panelist, panelSize } = {})
     CODE_PATH_PREFIX_RULE,
     FENCED_DATA_RULE,
     fenceUntrusted('task', q),
-  ].join('\n\n'), "scripts/operations/explore.mjs");
+  ].join('\n\n'));
 }
 
 /**
@@ -374,7 +374,7 @@ export function buildSynthesisMandate({ question, lenses = [], filing = false } 
     CODE_PATH_PREFIX_RULE,
     FENCED_DATA_RULE,
     fenceUntrusted('task', String(question ?? '')),
-  ].join('\n\n'), "scripts/operations/explore.mjs");
+  ].join('\n\n'));
 }
 
 /**

@@ -6,7 +6,6 @@ import ts from 'typescript';
 import {
   NO_PROMPT_COMMAND_RULES, renderNoPromptCommandRules, renderNoPromptCommandRulesRuntime, noPromptRulePlacement,
   LAUNCH_BRIEF_SOURCES, LAUNCH_BRIEF_EXCLUSIONS,
-  LAUNCH_BRIEF_PROPERTIES, NO_GIT_COMMAND_RULES,
 } from '../lib/no-prompt-command-rules.mjs';
 import { renderWorkerBrief } from '../worker-brief.mjs';
 import { readCiHealBriefTemplate } from '../operations/ci-heal-pr-dispatch.mjs';
@@ -60,31 +59,20 @@ function unregistered(files) {
     && !LAUNCH_BRIEF_SOURCES.includes(path) && !LAUNCH_BRIEF_EXCLUSIONS[path]).map(([path]) => path);
 }
 
-function expectBlock(text, rules = NO_PROMPT_COMMAND_RULES) {
-  expect(text).toContain(rules);
+function expectBlock(text) {
+  expect(text).toContain(NO_PROMPT_COMMAND_RULES);
   expect(text.split('## No-prompt command rules')).toHaveLength(2);
 }
 
-// This audit checks authored restrictions; variant selection always uses the declared property.
-function forbiddenWorkerGit(files) {
-  return files.filter(([path, text]) => {
-    if (!path.endsWith('.md') || !LAUNCH_BRIEF_SOURCES.includes(path)) return false;
-    const task = text.replaceAll(NO_PROMPT_COMMAND_RULES, '').replaceAll(NO_GIT_COMMAND_RULES, '')
-      .replace(/[*`]/g, '').replace(/\s+/g, ' ');
-    const forbids = /\bno git\b|\bgit commands? (?:is|are) denied\b|\bany other git command yourself\b|\b(?:do not|never)\b[^.!?]{0,100}\b(?:push|re-push)\b/i.test(task);
-    return forbids && LAUNCH_BRIEF_PROPERTIES[path]?.allowsGit !== false;
-  }).map(([path]) => path);
-}
-
 describe('no-prompt command rules', () => {
-  it('carries every command restriction and safe branch continuation', () => {
+  it('carries every approval-avoidance restriction without branch or raw kill instructions', () => {
     for (const rule of ['no `$(...)`', 'no shell variables or arrays', 'no loops', 'no trailing `&`',
       'Edit/Write tools', '`sed -i`', '`perl -i`', 'redirect writes', '`rm -rf` / `rm -r`',
-      'NEW uniquely named dir', '`git reset --hard`', '`git push --force`', '`git clean`',
-      '`git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`',
-      '`HEAD:refs/heads/<branch>`', 'TaskStop', '`kill <exact pid>`', '`pkill`/`killall`']) {
+      'NEW uniquely named dir', 'destructive history or working-tree resets', 'forced pushes', 'cleans',
+      'TaskStop', '`pkill`/`killall`']) {
       expect(NO_PROMPT_COMMAND_RULES).toContain(rule);
     }
+    expect(NO_PROMPT_COMMAND_RULES).not.toMatch(/`git |fetch|merge|HEAD:refs|`kill /);
   });
 
   it('renders once even when several brief transforms compose it', () => {
@@ -95,12 +83,20 @@ describe('no-prompt command rules', () => {
     expect(() => renderNoPromptCommandRules(undefined)).toThrow(TypeError);
   });
 
+  it('keeps one trusted block when composing separately rendered briefs', () => {
+    const prompt = renderNoPromptCommandRules(`${renderNoPromptCommandRules('First task')}\n${renderNoPromptCommandRules('Second task')}`);
+    expectBlock(prompt);
+    expect(noPromptRulePlacement(prompt).blocks).toHaveLength(1);
+    expect(prompt).toContain('First task');
+    expect(prompt).toContain('Second task');
+  });
+
   it('includes the complete block in a rendered worker brief', () => {
     expectBlock(renderWorkerBrief({ purpose: 'command-rules', files: ['scripts/example.mjs'], owner: 'rules-test' }));
   });
 
-  it('includes the no-git block in the real ci-heal brief after packing', () => {
-    expectBlock(readCiHealBriefTemplate(ROOT, template => `Packed context\n${template}`), NO_GIT_COMMAND_RULES);
+  it('includes the shared block in the real ci-heal brief after packing', () => {
+    expectBlock(readCiHealBriefTemplate(ROOT, template => `Packed context\n${template}`));
   });
 
   it('covers fresh and resumed daemon launches at the argv boundary', () => {
@@ -116,7 +112,7 @@ describe('no-prompt command rules', () => {
     for (const allowedTools of [null, ['Read']]) {
       const argv = buildJudgeArgv({ mandate: 'Review task', shape: { type: 'object', properties: {} },
         sessionId: deriveSessionId('command-rules'), allowedTools });
-      expectBlock(argv[argv.indexOf('--append-system-prompt') + 1], NO_GIT_COMMAND_RULES);
+      expectBlock(argv[argv.indexOf('--append-system-prompt') + 1]);
     }
   });
 
@@ -138,19 +134,9 @@ describe('no-prompt command rules', () => {
     expect(() => tree('scripts', { readdirSync() { throw new Error('read denied'); } })).toThrow('read denied');
   });
 
-  it('rejects full-rules declarations for briefs forbidding worker Git or publication', () => {
-    for (const text of ['Do NOT run git commit, git add, or any other git command yourself.',
-      'Do not claim, resolve, acquire another lane, stamp, commit, push, or open a PR.',
-      'Never push yourself; the wrapper publishes.', 'There are no git commands for this worker.']) {
-      expect(forbiddenWorkerGit([['skills-src/worker-brief/SKILL.md', text]]))
-        .toEqual(['skills-src/worker-brief/SKILL.md']);
-    }
-  });
-
   it('audits the whole scripts/ and skills-src/ trees with explicit exclusions', () => {
     const files = new Map([...tree('scripts'), ...tree('skills-src')]);
     expect(unregistered([...files])).toEqual([]);
-    expect(forbiddenWorkerGit([...files])).toEqual([]);
     expect(new Set(LAUNCH_BRIEF_SOURCES).size).toBe(LAUNCH_BRIEF_SOURCES.length);
     for (const [path, reason] of Object.entries(LAUNCH_BRIEF_EXCLUSIONS)) {
       expect(reason.trim().length, path).toBeGreaterThan(20);
@@ -160,30 +146,8 @@ describe('no-prompt command rules', () => {
     for (const path of LAUNCH_BRIEF_SOURCES) {
       const text = files.get(path);
       expect(typeof text, path).toBe('string');
-      const properties = LAUNCH_BRIEF_PROPERTIES[path];
-      expect(typeof properties?.allowsGit, path).toBe('boolean');
-      const rules = properties.allowsGit ? NO_PROMPT_COMMAND_RULES : NO_GIT_COMMAND_RULES;
-      const rendered = renderNoPromptCommandRules('Concrete task', path);
-      expectBlock(rendered, rules);
-      if (!properties.allowsGit) {
-        expect(rendered, path).not.toMatch(/`git |HEAD:refs\/heads\//);
-        if (!path.endsWith('.md')) {
-          const source = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
-          let calls = 0;
-          function visit(node) {
-            if (ts.isCallExpression(node) && node.expression.getText(source) === 'renderNoPromptCommandRules') {
-              calls++;
-              expect(node.arguments[1]?.text, path).toBe(path);
-            }
-            ts.forEachChild(node, visit);
-          }
-          visit(source);
-          expect(calls, path).toBeGreaterThan(0);
-        }
-      }
       if (path.endsWith('.md')) {
-        expectBlock(text, rules);
-        if (!properties.allowsGit) expect(text, path).not.toContain(NO_PROMPT_COMMAND_RULES);
+        expectBlock(text);
         expect(noPromptRulePlacement(text).blocks, path).toHaveLength(1);
       }
       else if (path.endsWith('.py')) {

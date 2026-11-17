@@ -1595,7 +1595,7 @@ export function envelopeReportOrNull(envelope, sessionSlug) {
 /** Read the delivery task before adding generic build instructions. */
 export function readDeliveryBriefTemplate(root = REPO_ROOT) {
   const template = assertBriefTaskContent(readFileSync(`${root}/skills-src/conveyor/delivery-agent-brief-v2.md`, 'utf8'));
-  return renderNoPromptCommandRules(appendBuildRequirements(template, { selfReview: false }), "scripts/operations/deliver-item-wrapper.mjs");
+  return renderNoPromptCommandRules(appendBuildRequirements(template, { selfReview: false }));
 }
 
 /**
@@ -1737,7 +1737,7 @@ export function fillMinimalBrief(template, { item, sessionSlug, lane, attemptTag
   const basename = resolveItemSpecPathBasename(item, loadItems);
   const { prompt } = fillBrief(template, { ITEM_SPEC_PATH_BASENAME: basename }, V2_BRIEF_REQUIRED_NAMES, V2_BRIEF_OPTIONAL_NAMES);
   const groupSection = groupMembers.length ? `\n\nGROUPED BUILD\n${groupMembers.map((num) => `#${num} — backlog/${resolveItemSpecPathBasename(num, loadItems)}`).join('\n')}\nImplement ALL these cards in this one lane/PR; keep each card status: active (the merge resolves each one). If a member cannot be delivered, append a line <num>: <reason> to .delivery-group-drop in the lane root (never commit it) and leave that card's files untouched.` : '';
-  return renderNoPromptCommandRules(`${prompt}${groupSection}\n\n[env: DELIVERY_SESSION=${sessionSlug} DELIVERY_ITEM=${item} LANE=${lane} ATTEMPT_TAG=${attemptTag ?? ''}]`, "scripts/operations/deliver-item-wrapper.mjs");
+  return renderNoPromptCommandRules(`${prompt}${groupSection}\n\n[env: DELIVERY_SESSION=${sessionSlug} DELIVERY_ITEM=${item} LANE=${lane} ATTEMPT_TAG=${attemptTag ?? ''}]`);
 }
 
 // ================================================================================================
@@ -1876,7 +1876,7 @@ export function gateFailureResumePrompt({ failureOutput, gateOutcome = 'fail' })
       + `\`outcome: 'blocked'\` and a precise \`reason\` describing what you observed instead.`
     : `Your gate failed:\n\n${failureOutput}\n\nFix it in $LANE, then send a fresh \`done\` report exactly `
       + `as before — do NOT run \`git commit\` yourself; the wrapper commits your fix for you.`;
-  return renderNoPromptCommandRules(appendBuildRequirements(prompt, { selfReview: false }), "scripts/operations/deliver-item-wrapper.mjs");
+  return renderNoPromptCommandRules(appendBuildRequirements(prompt, { selfReview: false }));
 }
 
 // #xu2pp2m — `resolveLanePath` EXTRACTED to `./minimal-context-provider.mjs` (imported above), unchanged: the
@@ -2077,7 +2077,7 @@ export function buildConvergeEditorArgv({ sessionId, prompt, settingsFile }) {
   return [
     '--restricted', '--tools', RESTRICTED_PROVIDER_TOOLS, '--strict-mcp-config', '--disable-slash-commands',
     '--settings', settingsFile, '--output-format', 'json', '--model', 'sonnet',
-    '-p', '--session-id', String(sessionId), renderNoPromptCommandRules(prompt, "scripts/operations/deliver-item-wrapper.mjs"),
+    '-p', '--session-id', String(sessionId), renderNoPromptCommandRules(prompt),
   ];
 }
 

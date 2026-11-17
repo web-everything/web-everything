@@ -207,7 +207,7 @@ export async function dispatchInvestigation(target, {
   }, BRIEF_REQUIRED_BY_KIND[HEALTH_INVESTIGATE_KIND], []);
   const routing = route();
   const out = await sinks[DISPATCH_EFFECT]({
-    launchKind: HEALTH_INVESTIGATE_KIND, prompt: renderNoPromptCommandRules(prompt, "scripts/conveyor/health-investigate-dispatch.mjs"), sessionSlug: session, lane: null, scope: [], routing,
+    launchKind: HEALTH_INVESTIGATE_KIND, prompt: renderNoPromptCommandRules(prompt), sessionSlug: session, lane: null, scope: [], routing,
     expectedWithinMinutes: Math.ceil(cfg.investigateWallClockMs / 60_000),
   });
   return { handle: out?.handle ?? null, session, unknownTokens, routing };

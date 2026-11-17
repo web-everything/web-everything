@@ -52,11 +52,12 @@ scenario is tedious to write.
 - Always leave the lane's other files untouched.
 
 <!-- Generated from scripts/lib/no-prompt-command-rules.mjs; whole-tree test pins this copy. -->
-<!-- no-prompt-command-rules:no-git:begin -->
+<!-- no-prompt-command-rules:begin -->
 ## No-prompt command rules
 
 - Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.
 - Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.
-- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.
-- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.
-<!-- no-prompt-command-rules:no-git:end -->
+- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting.
+- Never run destructive history or working-tree resets, forced pushes, or cleans.
+- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`.
+<!-- no-prompt-command-rules:end -->

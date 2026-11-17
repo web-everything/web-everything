@@ -3201,18 +3201,18 @@
         },
         {
           "brief": "skills-src/conveyor/canary-agent-brief.md",
-          "key": "32dfd02397",
-          "text": "- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting."
+          "key": "178945e42d",
+          "text": "- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting."
         },
         {
           "brief": "skills-src/conveyor/canary-agent-brief.md",
-          "key": "aa95ccfe83",
-          "text": "- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`."
+          "key": "cfb3987a6d",
+          "text": "- Never run destructive history or working-tree resets, forced pushes, or cleans."
         },
         {
           "brief": "skills-src/conveyor/canary-agent-brief.md",
-          "key": "cc1d43da6a",
-          "text": "- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`."
+          "key": "aa22eb35c9",
+          "text": "- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`."
         },
         {
           "brief": "skills-src/conveyor/delivery-agent-brief-v2.md",
@@ -3221,13 +3221,18 @@
         },
         {
           "brief": "skills-src/conveyor/delivery-agent-brief-v2.md",
-          "key": "32dfd02397",
-          "text": "- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting."
+          "key": "178945e42d",
+          "text": "- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting."
         },
         {
           "brief": "skills-src/conveyor/delivery-agent-brief-v2.md",
-          "key": "cc1d43da6a",
-          "text": "- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`."
+          "key": "cfb3987a6d",
+          "text": "- Never run destructive history or working-tree resets, forced pushes, or cleans."
+        },
+        {
+          "brief": "skills-src/conveyor/delivery-agent-brief-v2.md",
+          "key": "aa22eb35c9",
+          "text": "- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`."
         },
         {
           "brief": "skills-src/conveyor/delivery-agent-brief.md",
@@ -3236,13 +3241,18 @@
         },
         {
           "brief": "skills-src/conveyor/delivery-agent-brief.md",
-          "key": "32dfd02397",
-          "text": "- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting."
+          "key": "178945e42d",
+          "text": "- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting."
         },
         {
           "brief": "skills-src/conveyor/delivery-agent-brief.md",
-          "key": "cc1d43da6a",
-          "text": "- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`."
+          "key": "cfb3987a6d",
+          "text": "- Never run destructive history or working-tree resets, forced pushes, or cleans."
+        },
+        {
+          "brief": "skills-src/conveyor/delivery-agent-brief.md",
+          "key": "aa22eb35c9",
+          "text": "- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`."
         },
         {
           "brief": "skills-src/conveyor/dispatched-agent-system-prompt.md",
@@ -3251,18 +3261,18 @@
         },
         {
           "brief": "skills-src/conveyor/dispatched-agent-system-prompt.md",
-          "key": "32dfd02397",
-          "text": "- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting."
+          "key": "178945e42d",
+          "text": "- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting."
         },
         {
           "brief": "skills-src/conveyor/dispatched-agent-system-prompt.md",
-          "key": "aa95ccfe83",
-          "text": "- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`."
+          "key": "cfb3987a6d",
+          "text": "- Never run destructive history or working-tree resets, forced pushes, or cleans."
         },
         {
           "brief": "skills-src/conveyor/dispatched-agent-system-prompt.md",
-          "key": "cc1d43da6a",
-          "text": "- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`."
+          "key": "aa22eb35c9",
+          "text": "- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`."
         },
         {
           "brief": "skills-src/conveyor/fix-agent-brief.md",
@@ -3271,13 +3281,18 @@
         },
         {
           "brief": "skills-src/conveyor/fix-agent-brief.md",
-          "key": "32dfd02397",
-          "text": "- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting."
+          "key": "178945e42d",
+          "text": "- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting."
         },
         {
           "brief": "skills-src/conveyor/fix-agent-brief.md",
-          "key": "cc1d43da6a",
-          "text": "- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`."
+          "key": "cfb3987a6d",
+          "text": "- Never run destructive history or working-tree resets, forced pushes, or cleans."
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "aa22eb35c9",
+          "text": "- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`."
         },
         {
           "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
@@ -3286,13 +3301,18 @@
         },
         {
           "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
-          "key": "32dfd02397",
-          "text": "- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting."
+          "key": "178945e42d",
+          "text": "- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting."
         },
         {
           "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
-          "key": "cc1d43da6a",
-          "text": "- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`."
+          "key": "cfb3987a6d",
+          "text": "- Never run destructive history or working-tree resets, forced pushes, or cleans."
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "aa22eb35c9",
+          "text": "- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`."
         },
         {
           "brief": "skills-src/conveyor/health-investigate-brief.md",
@@ -3301,13 +3321,18 @@
         },
         {
           "brief": "skills-src/conveyor/health-investigate-brief.md",
-          "key": "32dfd02397",
-          "text": "- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting."
+          "key": "178945e42d",
+          "text": "- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting."
         },
         {
           "brief": "skills-src/conveyor/health-investigate-brief.md",
-          "key": "cc1d43da6a",
-          "text": "- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`."
+          "key": "cfb3987a6d",
+          "text": "- Never run destructive history or working-tree resets, forced pushes, or cleans."
+        },
+        {
+          "brief": "skills-src/conveyor/health-investigate-brief.md",
+          "key": "aa22eb35c9",
+          "text": "- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`."
         },
         {
           "brief": "skills-src/conveyor/investigation-agent-brief.md",
@@ -3316,18 +3341,18 @@
         },
         {
           "brief": "skills-src/conveyor/investigation-agent-brief.md",
-          "key": "32dfd02397",
-          "text": "- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting."
+          "key": "178945e42d",
+          "text": "- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting."
         },
         {
           "brief": "skills-src/conveyor/investigation-agent-brief.md",
-          "key": "aa95ccfe83",
-          "text": "- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`."
+          "key": "cfb3987a6d",
+          "text": "- Never run destructive history or working-tree resets, forced pushes, or cleans."
         },
         {
           "brief": "skills-src/conveyor/investigation-agent-brief.md",
-          "key": "cc1d43da6a",
-          "text": "- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`."
+          "key": "aa22eb35c9",
+          "text": "- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`."
         },
         {
           "brief": "skills-src/conveyor/opus-sweep-brief.md",
@@ -3336,13 +3361,18 @@
         },
         {
           "brief": "skills-src/conveyor/opus-sweep-brief.md",
-          "key": "32dfd02397",
-          "text": "- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting."
+          "key": "178945e42d",
+          "text": "- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting."
         },
         {
           "brief": "skills-src/conveyor/opus-sweep-brief.md",
-          "key": "cc1d43da6a",
-          "text": "- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`."
+          "key": "cfb3987a6d",
+          "text": "- Never run destructive history or working-tree resets, forced pushes, or cleans."
+        },
+        {
+          "brief": "skills-src/conveyor/opus-sweep-brief.md",
+          "key": "aa22eb35c9",
+          "text": "- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`."
         },
         {
           "brief": "skills-src/conveyor/prepare-decision-agent-brief.md",
@@ -3351,18 +3381,18 @@
         },
         {
           "brief": "skills-src/conveyor/prepare-decision-agent-brief.md",
-          "key": "32dfd02397",
-          "text": "- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting."
+          "key": "178945e42d",
+          "text": "- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting."
         },
         {
           "brief": "skills-src/conveyor/prepare-decision-agent-brief.md",
-          "key": "aa95ccfe83",
-          "text": "- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`."
+          "key": "cfb3987a6d",
+          "text": "- Never run destructive history or working-tree resets, forced pushes, or cleans."
         },
         {
           "brief": "skills-src/conveyor/prepare-decision-agent-brief.md",
-          "key": "cc1d43da6a",
-          "text": "- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`."
+          "key": "aa22eb35c9",
+          "text": "- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`."
         },
         {
           "brief": "skills-src/conveyor/prepare-item-agent-brief.md",
@@ -3371,18 +3401,18 @@
         },
         {
           "brief": "skills-src/conveyor/prepare-item-agent-brief.md",
-          "key": "32dfd02397",
-          "text": "- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting."
+          "key": "178945e42d",
+          "text": "- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting."
         },
         {
           "brief": "skills-src/conveyor/prepare-item-agent-brief.md",
-          "key": "aa95ccfe83",
-          "text": "- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`."
+          "key": "cfb3987a6d",
+          "text": "- Never run destructive history or working-tree resets, forced pushes, or cleans."
         },
         {
           "brief": "skills-src/conveyor/prepare-item-agent-brief.md",
-          "key": "cc1d43da6a",
-          "text": "- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`."
+          "key": "aa22eb35c9",
+          "text": "- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`."
         },
         {
           "brief": "skills-src/conveyor/prepare-item-worker-brief.md",
@@ -3391,13 +3421,18 @@
         },
         {
           "brief": "skills-src/conveyor/prepare-item-worker-brief.md",
-          "key": "32dfd02397",
-          "text": "- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting."
+          "key": "178945e42d",
+          "text": "- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting."
         },
         {
           "brief": "skills-src/conveyor/prepare-item-worker-brief.md",
-          "key": "cc1d43da6a",
-          "text": "- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`."
+          "key": "cfb3987a6d",
+          "text": "- Never run destructive history or working-tree resets, forced pushes, or cleans."
+        },
+        {
+          "brief": "skills-src/conveyor/prepare-item-worker-brief.md",
+          "key": "aa22eb35c9",
+          "text": "- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`."
         },
         {
           "brief": "skills-src/conveyor/prepare-scope-agent-brief.md",
@@ -3406,18 +3441,18 @@
         },
         {
           "brief": "skills-src/conveyor/prepare-scope-agent-brief.md",
-          "key": "32dfd02397",
-          "text": "- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting."
+          "key": "178945e42d",
+          "text": "- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting."
         },
         {
           "brief": "skills-src/conveyor/prepare-scope-agent-brief.md",
-          "key": "aa95ccfe83",
-          "text": "- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`."
+          "key": "cfb3987a6d",
+          "text": "- Never run destructive history or working-tree resets, forced pushes, or cleans."
         },
         {
           "brief": "skills-src/conveyor/prepare-scope-agent-brief.md",
-          "key": "cc1d43da6a",
-          "text": "- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`."
+          "key": "aa22eb35c9",
+          "text": "- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`."
         },
         {
           "brief": "skills-src/conveyor/role-test-soak-author-brief.md",
@@ -3426,13 +3461,18 @@
         },
         {
           "brief": "skills-src/conveyor/role-test-soak-author-brief.md",
-          "key": "32dfd02397",
-          "text": "- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting."
+          "key": "178945e42d",
+          "text": "- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting."
         },
         {
           "brief": "skills-src/conveyor/role-test-soak-author-brief.md",
-          "key": "cc1d43da6a",
-          "text": "- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`."
+          "key": "cfb3987a6d",
+          "text": "- Never run destructive history or working-tree resets, forced pushes, or cleans."
+        },
+        {
+          "brief": "skills-src/conveyor/role-test-soak-author-brief.md",
+          "key": "aa22eb35c9",
+          "text": "- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`."
         },
         {
           "brief": "skills-src/conveyor/stuck-pr-inspect-brief.md",
@@ -3441,13 +3481,18 @@
         },
         {
           "brief": "skills-src/conveyor/stuck-pr-inspect-brief.md",
-          "key": "32dfd02397",
-          "text": "- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting."
+          "key": "178945e42d",
+          "text": "- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting."
         },
         {
           "brief": "skills-src/conveyor/stuck-pr-inspect-brief.md",
-          "key": "cc1d43da6a",
-          "text": "- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`."
+          "key": "cfb3987a6d",
+          "text": "- Never run destructive history or working-tree resets, forced pushes, or cleans."
+        },
+        {
+          "brief": "skills-src/conveyor/stuck-pr-inspect-brief.md",
+          "key": "aa22eb35c9",
+          "text": "- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`."
         },
         {
           "brief": "skills-src/conveyor/stuck-pr-inspect-system-prompt.md",
@@ -3456,13 +3501,18 @@
         },
         {
           "brief": "skills-src/conveyor/stuck-pr-inspect-system-prompt.md",
-          "key": "32dfd02397",
-          "text": "- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting."
+          "key": "178945e42d",
+          "text": "- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting."
         },
         {
           "brief": "skills-src/conveyor/stuck-pr-inspect-system-prompt.md",
-          "key": "cc1d43da6a",
-          "text": "- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`."
+          "key": "cfb3987a6d",
+          "text": "- Never run destructive history or working-tree resets, forced pushes, or cleans."
+        },
+        {
+          "brief": "skills-src/conveyor/stuck-pr-inspect-system-prompt.md",
+          "key": "aa22eb35c9",
+          "text": "- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`."
         },
         {
           "brief": "skills-src/review/review-agent-brief.md",
@@ -3471,18 +3521,18 @@
         },
         {
           "brief": "skills-src/review/review-agent-brief.md",
-          "key": "32dfd02397",
-          "text": "- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting."
+          "key": "178945e42d",
+          "text": "- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting."
         },
         {
           "brief": "skills-src/review/review-agent-brief.md",
-          "key": "aa95ccfe83",
-          "text": "- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`."
+          "key": "cfb3987a6d",
+          "text": "- Never run destructive history or working-tree resets, forced pushes, or cleans."
         },
         {
           "brief": "skills-src/review/review-agent-brief.md",
-          "key": "cc1d43da6a",
-          "text": "- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`."
+          "key": "aa22eb35c9",
+          "text": "- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`."
         },
         {
           "brief": "skills-src/review/review-agent-system-prompt.md",
@@ -3491,18 +3541,18 @@
         },
         {
           "brief": "skills-src/review/review-agent-system-prompt.md",
-          "key": "32dfd02397",
-          "text": "- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting."
+          "key": "178945e42d",
+          "text": "- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting."
         },
         {
           "brief": "skills-src/review/review-agent-system-prompt.md",
-          "key": "aa95ccfe83",
-          "text": "- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`."
+          "key": "cfb3987a6d",
+          "text": "- Never run destructive history or working-tree resets, forced pushes, or cleans."
         },
         {
           "brief": "skills-src/review/review-agent-system-prompt.md",
-          "key": "cc1d43da6a",
-          "text": "- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`."
+          "key": "aa22eb35c9",
+          "text": "- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`."
         }
       ]
     },

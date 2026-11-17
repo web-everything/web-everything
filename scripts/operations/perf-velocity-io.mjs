@@ -156,7 +156,7 @@ export function heldItemText(title, body, heldFileText) {
 
 /** One size from a brief via the cheap model; `{size, reason, costUsd}`, or throws. */
 export async function estimateOne(brief, { spawn = judgeSpawn, model = estimateModel(), runId = 'perf-estimate', lens = 'size' } = {}) {
-  const r = await spawn({ mandate: renderNoPromptCommandRules(ESTIMATE_MANDATE, "scripts/operations/perf-velocity-io.mjs"), input: brief, shape: ESTIMATE_SHAPE, model, effort: 'low', budget: ESTIMATE_BUDGET_USD, runId, lens });
+  const r = await spawn({ mandate: renderNoPromptCommandRules(ESTIMATE_MANDATE), input: brief, shape: ESTIMATE_SHAPE, model, effort: 'low', budget: ESTIMATE_BUDGET_USD, runId, lens });
   const size = snapFibonacci(Number(r.value?.size));
   if (!size) throw new Error('the estimator returned no usable size');
   return { size, reason: String(r.value?.reason ?? '').slice(0, 240), costUsd: r.costUsd ?? 0 };

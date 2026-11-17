@@ -349,7 +349,7 @@ export function composeInvestigationPrompt(brief, reportPath) {
     + `END THE FILE WITH THIS LINE, alone, and nothing after it: ${REPORT_END_MARKER}\n`
     + 'That line is how the committee knows your report is finished rather than half-written. A report without '
     + 'it is read as an investigation that died mid-sentence.',
-  ].join('\n\n'), "scripts/operations/explore-io.mjs");
+  ].join('\n\n'));
 }
 
 /**

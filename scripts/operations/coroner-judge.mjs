@@ -81,7 +81,7 @@ export async function judgeFrictions({ ranked, held, openPrs, recentCards, judge
   try {
     validateCoronerCoverage({ held, openPrs, recentCards });
     const answer = await judge({
-      mandate: renderNoPromptCommandRules(`${FENCED_DATA_RULE}\nUse only the supplied evidence. This judge runs with the tool-free provider (--tools ""); no tools are available. Compare each cause against held items, open PRs, then recent cards. Return NEW only for a concrete actionable cause with examples that no existing item would remove. For each NEW verdict, supply a non-empty proposedFix describing the concrete change to the daemon or tooling that handles the cause automatically. Otherwise return COVERED-BY with its reference (proposedFix may be empty), or omit uncertain candidates. Return only the requested schema.`, "scripts/operations/coroner-judge.mjs"),
+      mandate: renderNoPromptCommandRules(`${FENCED_DATA_RULE}\nUse only the supplied evidence. This judge runs with the tool-free provider (--tools ""); no tools are available. Compare each cause against held items, open PRs, then recent cards. Return NEW only for a concrete actionable cause with examples that no existing item would remove. For each NEW verdict, supply a non-empty proposedFix describing the concrete change to the daemon or tooling that handles the cause automatically. Otherwise return COVERED-BY with its reference (proposedFix may be empty), or omit uncertain candidates. Return only the requested schema.`),
       input: fenceUntrusted('material', JSON.stringify({ ranked, held, openPrs, recentCards })), shape: SHAPE,
     });
     const verdicts = answer?.value?.verdicts;

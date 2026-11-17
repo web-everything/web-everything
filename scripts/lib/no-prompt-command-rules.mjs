@@ -8,16 +8,10 @@ export const NO_PROMPT_COMMAND_RULES_BODY = `## No-prompt command rules
 
 - Plain single commands only: no \`$(...)\`, no shell variables or arrays, no loops, no trailing \`&\`.
 - Edit files with the Edit/Write tools, never \`sed -i\`, \`perl -i\`, or redirect writes.
-- Never \`rm -rf\` / \`rm -r\`: write scratch into a NEW uniquely named dir instead of deleting.
-- Never \`git reset --hard\`, \`git push --force\`, \`git clean\`. To continue a branch in a lane: \`git fetch origin <branch>\` then \`git merge --no-edit FETCH_HEAD\`, then push \`HEAD:refs/heads/<branch>\`.
-- Stop background jobs with the job tool (TaskStop or \`kill <exact pid>\`), never \`pkill\`/\`killall\`.`;
+- Never \`rm -rf\` / \`rm -r\`: write scratch to a NEW uniquely named dir instead of deleting.
+- Never run destructive history or working-tree resets, forced pushes, or cleans.
+- Stop background jobs with the job tool (TaskStop), never \`pkill\`/\`killall\`.`;
 export const NO_PROMPT_COMMAND_RULES = `${NO_PROMPT_COMMAND_RULES_SENTINEL}\n${NO_PROMPT_COMMAND_RULES_BODY}\n${NO_PROMPT_COMMAND_RULES_END}`;
-export const NO_GIT_COMMAND_RULES_SENTINEL = '<!-- no-prompt-command-rules:no-git:begin -->';
-export const NO_GIT_COMMAND_RULES_END = '<!-- no-prompt-command-rules:no-git:end -->';
-export const NO_GIT_COMMAND_RULES_BODY = NO_PROMPT_COMMAND_RULES_BODY.split('\n').filter(line => !line.startsWith('- Never `git ')).join('\n');
-export const NO_GIT_COMMAND_RULES = `${NO_GIT_COMMAND_RULES_SENTINEL}\n${NO_GIT_COMMAND_RULES_BODY}\n${NO_GIT_COMMAND_RULES_END}`;
-const COMMAND_RULE_VARIANTS = [NO_PROMPT_COMMAND_RULES, NO_GIT_COMMAND_RULES];
-
 /** Locate complete canonical blocks by their own-line sentinel in instruction position.
  * Track data tags, Markdown fences/spans, and HTML comments; none can donate a trusted sentinel.
  * Incomplete or mismatched fences retain an open scope, requiring a prefix on rendering.
@@ -30,10 +24,10 @@ export function noPromptRulePlacement(brief) {
     const newline = brief.indexOf('\n', offset);
     const end = newline < 0 ? brief.length : newline;
     const line = brief.slice(offset, end).replace(/\r$/, '');
-    const rules = COMMAND_RULE_VARIANTS.find(block => line === block.split('\n')[0] && brief.startsWith(block, offset));
     if (!markdown && !inline && !comment && !tags.length && !malformed
-      && rules) {
-      const blockEnd = offset + rules.length;
+      && line === NO_PROMPT_COMMAND_RULES_SENTINEL
+      && brief.startsWith(NO_PROMPT_COMMAND_RULES, offset)) {
+      const blockEnd = offset + NO_PROMPT_COMMAND_RULES.length;
       if (blockEnd === brief.length || brief[blockEnd] === '\n' || brief.slice(blockEnd, blockEnd + 2) === '\r\n') {
         blocks.push({ start: offset, end: blockEnd });
         offset = blockEnd;
@@ -64,7 +58,7 @@ export function noPromptRulePlacement(brief) {
           while (line[next] === '`') next++;
           const length = next - at;
           // An unmatched backtick is literal Markdown, not an open code span.
-          const remaining = COMMAND_RULE_VARIANTS.reduce((text, block) => text.replaceAll(block, ''), brief.slice(offset + next));
+          const remaining = brief.slice(offset + next).replaceAll(NO_PROMPT_COMMAND_RULES, '');
           const closes = remaining.match(/`+/g)?.some(run => run.length === length);
           if (!inline && closes) inline = length;
           else if (inline === length) inline = 0;
@@ -107,14 +101,10 @@ export function stripTrustedNoPromptCommandRules(brief) {
 export function assertBriefTaskContent(brief) {
   if (typeof brief !== 'string') throw new TypeError('no-prompt rules require a string brief');
   const task = brief.replaceAll(NO_PROMPT_COMMAND_RULES, '')
-    .replaceAll(NO_GIT_COMMAND_RULES, '')
     .replaceAll(NO_PROMPT_COMMAND_RULES_BODY, '')
-    .replaceAll(NO_GIT_COMMAND_RULES_BODY, '')
     .replaceAll(NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT, '')
     .replaceAll(NO_PROMPT_COMMAND_RULES_SENTINEL, '')
-    .replaceAll(NO_PROMPT_COMMAND_RULES_END, '')
-    .replaceAll(NO_GIT_COMMAND_RULES_SENTINEL, '')
-    .replaceAll(NO_GIT_COMMAND_RULES_END, '');
+    .replaceAll(NO_PROMPT_COMMAND_RULES_END, '');
   if (!task.trim()) {
     throw new Error('empty task content — refusing a brief containing only whitespace or command rules');
   }
@@ -122,24 +112,15 @@ export function assertBriefTaskContent(brief) {
 }
 
 /** Reuse only a trusted sentinel block. Prefix when an unfinished fence makes appending unsafe. */
-export function renderNoPromptCommandRules(brief, source) {
+export function renderNoPromptCommandRules(brief) {
   assertBriefTaskContent(brief);
-  const properties = typeof source === 'string' ? LAUNCH_BRIEF_PROPERTIES[source] : source;
-  if (source !== undefined && (!properties || typeof properties.allowsGit !== 'boolean')) {
-    throw new Error('no-prompt rules require a registered brief or an explicit allowsGit boolean');
-  }
-  const rules = properties?.allowsGit === false ? NO_GIT_COMMAND_RULES : NO_PROMPT_COMMAND_RULES;
   const placement = noPromptRulePlacement(brief);
-  // An outer transport without a new declaration preserves the already-declared trusted variant.
   if (placement.blocks.length) {
-    if (source === undefined) return brief;
     let result = brief;
-    for (const [index, { start, end }] of Array.from(placement.blocks.entries()).reverse()) {
-      result = result.slice(0, start) + (index === 0 ? rules : '') + result.slice(end);
-    }
+    for (const { start, end } of placement.blocks.slice(1).reverse()) result = result.slice(0, start) + result.slice(end);
     return result;
   }
-  return placement.closed ? `${brief}\n\n${rules}\n` : `${rules}\n\n${brief}`;
+  return placement.closed ? `${brief}\n\n${NO_PROMPT_COMMAND_RULES}\n` : `${NO_PROMPT_COMMAND_RULES}\n\n${brief}`;
 }
 
 /** Generated import-free runtime for the workflow sandbox; pinned against this source by the tree test. */
@@ -150,8 +131,6 @@ export function renderNoPromptCommandRulesRuntime() {
     `const NO_PROMPT_COMMAND_RULES_SENTINEL = ${JSON.stringify(NO_PROMPT_COMMAND_RULES_SENTINEL)};`,
     `const NO_PROMPT_COMMAND_RULES_END = ${JSON.stringify(NO_PROMPT_COMMAND_RULES_END)};`,
     `const NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT = ${JSON.stringify(NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT)};`,
-    ...Object.entries({ NO_GIT_COMMAND_RULES, NO_GIT_COMMAND_RULES_BODY, NO_GIT_COMMAND_RULES_SENTINEL,
-      NO_GIT_COMMAND_RULES_END, COMMAND_RULE_VARIANTS, LAUNCH_BRIEF_PROPERTIES }).map(([name, value]) => `const ${name} = ${JSON.stringify(value)};`),
     noPromptRulePlacement.toString(), stripTrustedNoPromptCommandRules.toString(),
     assertBriefTaskContent.toString(), renderNoPromptCommandRules.toString(),
   ].join('\n');
@@ -237,47 +216,6 @@ export const LAUNCH_BRIEF_SOURCES = Object.freeze([
   "skills-src/review/review-agent-system-prompt.md",
   "skills-src/worker-brief/SKILL.md"
 ]);
-
-/** Declared launch capabilities; role keys cover files that build both tool-bearing and tool-free briefs. */
-export const LAUNCH_BRIEF_PROPERTIES = Object.freeze({
-  ...Object.fromEntries(LAUNCH_BRIEF_SOURCES.map(source => [source, Object.freeze({ allowsGit: true })])),
-  ...Object.fromEntries([
-    'skills-src/conveyor/delivery-agent-brief-v2.md',
-    'skills-src/conveyor/prepare-item-worker-brief.md',
-    'skills-src/conveyor/role-test-soak-author-brief.md',
-    'skills-src/conveyor/fix-agent-brief.md',
-    'skills-src/conveyor/fix-agent-ci-brief.md',
-    'skills-src/conveyor/delivery-agent-brief.md',
-    'skills-src/batch-backlog-items/SKILL.md',
-    'skills-src/drain/SKILL.md',
-    'scripts/conveyor/await-verify-pass.mjs',
-    'scripts/lib/converge-transports.mjs',
-    'scripts/lib/build-self-review.mjs',
-    'scripts/operations/deliver-item-wrapper.mjs',
-    'scripts/operations/fix-run.mjs',
-    'scripts/conveyor/stuck-pr-inspect-dispatch.mjs',
-    'scripts/conveyor/health-investigate-dispatch.mjs',
-    'skills-src/conveyor/stuck-pr-inspect-brief.md',
-    'skills-src/conveyor/stuck-pr-inspect-system-prompt.md',
-    'skills-src/conveyor/health-investigate-brief.md',
-    'skills-src/conveyor/opus-sweep-brief.md',
-    'scripts/operations/coroner-judge.mjs',
-    'scripts/operations/coroner-sample.mjs',
-    'scripts/operations/explore.mjs',
-    'scripts/operations/explore-io.mjs',
-    'scripts/operations/perf-velocity-io.mjs',
-    'scripts/operations/record-referral-ruling-io.mjs',
-    'scripts/operations/review-extra-seats.mjs',
-    'scripts/lib/brief-red-team.mjs',
-    'scripts/lib/decision-prose-adapter.mjs',
-    'skills-src/jury/panel-fanout.mjs',
-    'scripts/conveyor/convert-advisory-dispatch.mjs',
-    'scripts/probes/worker-result-probe.mjs',
-    'scripts/lib/judge-spawn.mjs#default',
-    'scripts/lib/review-core.mjs#plan',
-    'scripts/lib/build-self-review.mjs#review',
-  ].map(source => [source, Object.freeze({ allowsGit: false })])),
-});
 
 /** Detected non-briefs and provider-only paths: every exception needs a reason. */
 export const LAUNCH_BRIEF_EXCLUSIONS = Object.freeze({

@@ -599,8 +599,8 @@ describe('review.currentLevel interim mandates', () => {
   it('public-preview omits the stanza and preserves both original mandates byte for byte', () => {
     vi.stubEnv('WE_REVIEW_CURRENT_LEVEL', 'public-preview');
     const originalHashes = {
-      security: 'c1ccf0e538f77169524a87084a5289934b93900d0b83bc2dd75cc2706700597e',
-      correctness: 'b06142d971907a9a1aa58ec377703bb270a8a2e73209eed2804e971c3b60879a',
+      security: '07d184ee77d700cbc45c5524a0674221438c0aa453ee759314b6d44f63f4eb65',
+      correctness: 'ac80dae5aebca406c4ae568835542690375847f2ab36edef6cfca0adc702964c',
     };
     for (const [lens, hash] of Object.entries(originalHashes)) {
       const mandate = buildPanelMandate({ lens });
