@@ -1,27 +1,46 @@
 /** Holder attribution, bounded holds and caller admission for the shared gh semaphore. */
-import { basename } from 'node:path';
+import { readdirSync } from 'node:fs';
+import { basename, join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { readLockEntry, releaseLockDirIf } from '../readiness/file-locks.mjs';
 import { slotPath } from '../readiness/heavy-admission.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
-import { cascadePolicy } from './policy-cascade.mjs';
+import { cascadePolicy, logCascadeSources } from './policy-cascade.mjs';
 import { ghCommandWords } from './gh-argv.mjs';
 export { ghCommandWords } from './gh-argv.mjs';
 
-export const GH_HOLDER_DEFAULTS = Object.freeze({ maxHoldSeconds: 90, reapGraceSeconds: 15, perCallerMax: 4 });
+export const GH_HOLDER_DEFAULTS = Object.freeze({ maxHoldSeconds: 90, reapGraceSeconds: 15, perCallerMax: 4, installationCap: 12 });
 const cached = new WeakMap();
 export function loadGhThrottleSettings({ file, env = process.env } = {}) {
   const settings = file ?? readDeclaredSettings().settings;
   const number = (key) => env[key] == null || env[key] === '' ? undefined : Number(env[key]);
   return cascadePolicy('ghThrottle', settings?.ghThrottle, {
     env, standard: GH_HOLDER_DEFAULTS,
-    envValues: { maxHoldSeconds: number('WE_GH_THROTTLE_MAX_HOLD_SECONDS'), perCallerMax: number('WE_GH_THROTTLE_PER_CALLER_MAX') },
-    valid: (v) => Number.isFinite(v) && v >= 0 && Number.isInteger(v),
+    envValues: { maxHoldSeconds: number('WE_GH_THROTTLE_MAX_HOLD_SECONDS'), perCallerMax: number('WE_GH_THROTTLE_PER_CALLER_MAX'), installationCap: number('WE_GH_THROTTLE_INSTALLATION_CAP') },
+    valid: Object.fromEntries(Object.keys(GH_HOLDER_DEFAULTS).map(key => [key, v => Number.isInteger(v) && v >= (key === 'installationCap' ? 1 : 0) && (key !== 'installationCap' || v <= 50)])),
   });
 }
-export function ghHolderPolicy(env = process.env) {
-  if (!cached.has(env)) cached.set(env, loadGhThrottleSettings({ env }).value);
+function holderSettings(env) {
+  if (!cached.has(env)) cached.set(env, loadGhThrottleSettings({ env }));
   return cached.get(env);
+}
+export function ghHolderPolicy(env = process.env) {
+  return holderSettings(env).value;
+}
+
+/** Effective cap for EACH installation; there is deliberately no aggregate installation ceiling. */
+export function ghInstallationCap({ cap, explicitCap = false, env = process.env, settings = holderSettings(env) }) {
+  const source = settings.sources.installationCap;
+  const genericEnv = Number(env.WE_GH_THROTTLE_CAP);
+  const explicitEnv = env.WE_GH_THROTTLE_CAP != null && String(env.WE_GH_THROTTLE_CAP).trim() !== '' && Number.isInteger(genericEnv) && genericEnv >= 1 && genericEnv <= 50;
+  // Explicit throttle.cap is a caller/tool override; the legacy env cap overrides the file.
+  // Only the more specific installation env override outranks either. Thus WE_GH_THROTTLE_CAP=6
+  // remains the per-installation revert switch even with installationCap=12 in the tool file.
+  const generic = explicitCap || explicitEnv;
+  const useGeneric = generic && source !== 'env' && source !== 'operator-db';
+  const value = useGeneric ? cap : settings.value.installationCap;
+  logCascadeSources('ghThrottle.slotCap', { value: { installationCap: value }, sources: { installationCap: useGeneric ? (explicitCap ? 'caller' : 'env') : source }, invalid: [] }, { env });
+  return value;
 }
 
 // Telemetry records command vocabulary only. Endpoints, flags, fields, headers and positional
@@ -58,7 +77,7 @@ export function sanitizeHolderField(value, kind = 'identity') {
 export function sanitizeGhHolder(h) {
   const op = sanitizeHolderField(h.op || h.args, 'op');
   const integer = (v, min) => Number.isInteger(v) && v >= min ? v : null;
-  return { slot: integer(h.slot, 0), pid: integer(h.pid, 1), alive: h.alive === true, caller: sanitizeHolderField(h.caller), op,
+  return { ...(h.bucket === 'shared' || /^\d+$/.test(h.bucket ?? '') ? { bucket: h.bucket } : {}), slot: integer(h.slot, 0), pid: integer(h.pid, 1), alive: h.alive === true, caller: sanitizeHolderField(h.caller), op,
     args: `${op} <redacted>`, parent: sanitizeHolderField(h.parent, 'parent'), ppid: integer(h.ppid, 1),
     heldMs: Number.isFinite(h.heldMs) && h.heldMs >= 0 ? h.heldMs : 0, ...(Number.isFinite(h.timeoutMs) && h.timeoutMs >= 0 ? { timeoutMs: h.timeoutMs } : {}) };
 }
@@ -120,11 +139,31 @@ function holder(slot, entry, nowMs) {
   const acquired = Date.parse(m.acquiredAt || entry.heartbeatAt);
   return sanitizeGhHolder({ slot, pid: entry.pid, alive: alive(entry.pid), caller: m.caller ?? 'unknown', op: m.op ?? m.args ?? '', parent: m.parent ?? '', ppid: m.ppid ?? null, heldMs: Number.isFinite(acquired) ? Math.max(0, nowMs - acquired) : 0, timeoutMs: m.timeoutMs });
 }
-export function readGhSlotHolders({ lockRoot, cap, nowMs = Date.now() }) {
-  return Array.from({ length: cap }, (_, slot) => { const e = readLockEntry(lockRoot, slotPath(slot)); return e ? holder(slot, e, nowMs) : null; }).filter(Boolean);
+/** Shared pool descriptor used by acquisition and release. Unknown labels keep the legacy pool. */
+export function ghSlotPool({ lockRoot, cap, bucket, installationCap = 12 }) {
+  return typeof bucket === 'string' && /^\d+$/.test(bucket)
+    ? { lockRoot: join(lockRoot, 'installations', bucket), cap: installationCap, bucket, callerLockRoot: lockRoot }
+    : { lockRoot, cap, bucket: 'shared', callerLockRoot: lockRoot };
+}
+
+/** Numeric directories only; unrelated budget/log files can never become pools. */
+export function ghInstallationPools(lockRoot) {
+  try { return readdirSync(join(lockRoot, 'installations'), { withFileTypes: true }).filter(e => e.isDirectory() && /^\d+$/.test(e.name)).map(e => e.name); }
+  catch { return []; }
+}
+
+export function readGhSlotHolders({ lockRoot, cap, installationCap = ghHolderPolicy().installationCap, nowMs = Date.now(), includeInstallations = true }) {
+  const read = (root, limit, bucket) => {
+    // Include reserved and persisted slots after a cap reduction, without inventing free capacity.
+    // Lock directories are hashed by file-locks, so probe logical slot paths. The setting's
+    // upper bound is 50 ordinary slots plus one reserved slot, including historical larger caps.
+    const slots = Array.from({ length: Math.max(limit, 51) }, (_, i) => i);
+    return slots.flatMap(slot => { const e = readLockEntry(root, slotPath(slot)); return e ? [{ ...holder(slot, e, nowMs), ...(bucket ? { bucket } : {}) }] : []; });
+  };
+  return [...read(lockRoot, cap), ...(includeInstallations ? ghInstallationPools(lockRoot).flatMap(bucket => read(join(lockRoot, 'installations', bucket), installationCap, bucket)) : [])];
 }
 export function ghHoldersSummary(holders = []) {
-  return holders.map(sanitizeGhHolder).map(h => `${h.caller}(${h.op}, ${Math.round(h.heldMs / 1000)}s)`).join(' ');
+  return holders.map(sanitizeGhHolder).map(h => `${h.bucket ? `[${h.bucket}] ` : ''}${h.caller}(${h.op}, ${Math.round(h.heldMs / 1000)}s)`).join(' ');
 }
 
 /** A holder from older code has no meta. Only on a timeout (never per poll), name it from the process table:
@@ -140,7 +179,7 @@ export function describeLegacyHolders(holders, ps = (pid) => execFileSync('ps', 
 }
 
 /** Each poll snapshots and checks attribution before attempting the existing atomic slot primitive. */
-export function acquireGhHolderSlot({ lockRoot, cap, owner, pid, pollMs, timeoutMs, now, sleep, meta, policy, trySlot, onReap = () => {} }) {
+export function acquireGhHolderSlot({ lockRoot, cap, owner, pid, pollMs, timeoutMs, now, sleep, meta, policy, trySlot, onReap = () => {}, onWait = () => {}, callerLockRoot = lockRoot }) {
   const startedAt = now();
   const safe = sanitizeGhHolder(meta);
   const slotMeta = { caller: safe.caller, op: safe.op, args: safe.args, parent: safe.parent, pid, ppid: safe.ppid, ...(safe.timeoutMs !== undefined ? { timeoutMs: safe.timeoutMs } : {}) };
@@ -149,7 +188,8 @@ export function acquireGhHolderSlot({ lockRoot, cap, owner, pid, pollMs, timeout
     const nowMs = now();
     const entries = Array.from({ length: cap }, (_, slot) => readLockEntry(lockRoot, slotPath(slot)));
     let holders = entries.flatMap((e, slot) => e ? [holder(slot, e, nowMs)] : []);
-    const capped = () => policy.perCallerMax > 0 && holders.filter((h) => h.alive && ghCallerKey(h) === ghCallerKey(slotMeta)).length >= policy.perCallerMax;
+    // The caller bound spans the shared pool and every installation, while pool caps stay independent.
+    const capped = () => policy.perCallerMax > 0 && readGhSlotHolders({ lockRoot: callerLockRoot, cap, nowMs }).filter(h => h.alive && ghCallerKey(h) === ghCallerKey(slotMeta)).length >= policy.perCallerMax;
     let r = capped() ? { ok: false } : trySlot({ lockRoot, cap, owner, pid, nowMs, nowIso: new Date(nowMs).toISOString(), meta: { ...slotMeta, acquiredAt: new Date(nowMs).toISOString() } });
     if (!r.ok && (capped() || holders.length >= cap) && policy.maxHoldSeconds > 0) {
       for (const h of holders) {
@@ -158,10 +198,11 @@ export function acquireGhHolderSlot({ lockRoot, cap, owner, pid, pollMs, timeout
         if (!entry || entry.owner !== entries[h.slot]?.owner || entry.heartbeatAt !== entries[h.slot]?.heartbeatAt || !overAge(holder(h.slot, entry, nowMs))) continue;
         if (releaseLockDirIf(lockRoot, slotPath(h.slot), entry)) onReap(holder(h.slot, entry, nowMs));
       }
-      holders = readGhSlotHolders({ lockRoot, cap, nowMs });
+      holders = readGhSlotHolders({ lockRoot, cap, nowMs, includeInstallations: false });
       if (!capped()) r = trySlot({ lockRoot, cap, owner, pid, nowMs, nowIso: new Date(nowMs).toISOString(), meta: { ...slotMeta, acquiredAt: new Date(nowMs).toISOString() } });
     }
     if (r.ok) return { ok: true, slot: r.slot, timedOut: false, waitedMs: nowMs - startedAt };
+    onWait();
     if (nowMs - startedAt >= timeoutMs) return { ok: false, slot: null, timedOut: true, waitedMs: nowMs - startedAt, holders: describeLegacyHolders(holders) };
     sleep(pollMs);
   }
