@@ -227,7 +227,8 @@ const SIGNATURES=[
 ].map(unreverse);
 const JWK_TYPE=/^(?:RSA|EC|OKP|oct)$/;
 const JWK_MEMBER=/^(?:d|p|q|dp|dq|qi|k)$/;
-const mayHaveJwkValue=text=>/[A-Za-z0-9_-]{22}/.test(text.replace(/\s/g,''));
+// Match across whitespace without allocating a compacted copy of a large prose file.
+const mayHaveJwkValue=text=>/[A-Za-z0-9_-](?:\s*[A-Za-z0-9_-]){15}/.test(text);
 // Every JWK needs kty, including when its name is escaped inside serialized strings.
 // A backslash alone is not evidence: binary views and ordinary source contain many of
 // them, and retrying their unrelated braces can exhaust recovery's fail-closed budget.
@@ -359,9 +360,11 @@ function hasJwkSecret(bytes) {
   return hasJwkSecretText(text);
 }
 function hasJwkSecretText(text) {
-  if(!mayHaveJwkText(text))return false;
   // An object needs a literal opening brace, or a quoted token that can decode to one.
+  // Check syntax before decoding hints: object-free escape runs otherwise decode the same
+  // multi-megabyte view here and again in privateKeyStructureFinding's escape expansion.
   if(!text.includes('{')&&!text.includes('"')&&!text.includes("'")&&!text.includes('`'))return false;
+  if(!mayHaveJwkText(text))return false;
   const pending=[{text,comments:true}];
   let budget=8*text.length;
   while(pending.length) {
@@ -391,7 +394,7 @@ function hasJwkSecretText(text) {
           const parent=stack.at(-1);
           if(parent?.computed)parent.invalid=true;
           stack.push({object:token==='{',computed:token==='['&&parent?.object&&!parent.value,
-            type:false,secret:false});
+            type:false,secret:false,symmetric:false,shortSymmetricSecret:false});
           continue;
         }
         if(token==='}'||token===']') {
@@ -417,9 +420,9 @@ function hasJwkSecretText(text) {
           if(candidate.text[next]==='{')tokens.lastIndex=cursor-1;
         }
         // Outside an object, only a complete serialized JWK can contribute a finding. Its private
-        // value alone needs 22 characters; decoding shorter strings cannot supply one. Avoid a
+        // value alone needs 16 characters; decoding shorter strings cannot supply one. Avoid a
         // decoded-string allocation per escaped property name in object-free adversarial text.
-        if(!stack.length&&(!quoted||token.length<24))continue;
+        if(!stack.length&&(!quoted||token.length<18))continue;
         // Decode within whole string tokens so escaped quotes/braces cannot alter the enclosing scope.
         const value=quoted?decodeEscapes(token.slice(1,-1)):token;
         // A serialized object is its own scope: never combine its members with the enclosing object.
@@ -445,9 +448,13 @@ function hasJwkSecretText(text) {
         if(token===':') {frame.value=true;continue;}
         if(!frame.value) {frame.member=value;continue;}
         if(frame.member==='kty'&&JWK_TYPE.test(value))frame.type=true;
+        if(frame.member==='kty'&&value==='oct')frame.symmetric=true;
         if(JWK_MEMBER.test(frame.member)&&quoted&&/^[A-Za-z0-9_-]{22,}/.test(value.replace(/\s/g,'')))frame.secret=true;
+        // Short HMAC material is usable too. Keep the lower floor scoped to oct/k in this
+        // object, independently of member order; other private members retain their old floor.
+        if(frame.member==='k'&&quoted&&/^[A-Za-z0-9_-]{16,}/.test(value.replace(/\s/g,'')))frame.shortSymmetricSecret=true;
         frame.member=undefined;frame.value=false;
-        if(frame.type&&frame.secret)return true;
+        if(frame.type&&frame.secret||frame.symmetric&&frame.shortSymmetricSecret)return true;
       }
       // A failed final regex search still traverses the suffix, even if it is only whitespace.
       if(!closedScope)budget-=candidate.text.length-cursor;
@@ -463,7 +470,17 @@ const hasKey=bytes=>hasSignature(bytes)||hasJwkSecret(bytes);
 // Drop whole-line and trailing comments (a marker followed by whitespace) so a comment inside a wrapped body
 // cannot split it. Returns the text unchanged when there is none.
 function stripComments(text) {
-  return text.replace(/^[ \t]*(?:#|\/\/|;|\*)[ \t].*$/gm,'').replace(/[ \t](?:#|\/\/)[ \t].*$/gm,'');
+  // Bound replacement's temporary string pieces on dense comment files. Split only after
+  // a line terminator, so both whole-line and trailing-comment matches remain identical.
+  const chunks=[],lineEnd=/[\r\n\u2028\u2029]/g;
+  for(let start=0;start<text.length;) {
+    lineEnd.lastIndex=start+64*1024;
+    const boundary=lineEnd.exec(text),end=boundary?boundary.index+1:text.length;
+    chunks.push(text.slice(start,end).replace(/^[ \t]*(?:#|\/\/|;|\*)[ \t].*$/gm,'')
+      .replace(/[ \t](?:#|\/\/)[ \t].*$/gm,''));
+    start=end;
+  }
+  return chunks.join('');
 }
 const decodeAligned=(view,encoding,alignments)=>{
   const out=[];
