@@ -1,9 +1,10 @@
 /** Bounded synchronous child pool for the existing timeout evidence collector. */
-import { readFileSync, writeFileSync, statSync, mkdtempSync, rmSync, openSync, closeSync, existsSync } from 'node:fs';
+import { readFileSync, readSync, writeFileSync, statSync, mkdtempSync, rmSync, openSync, closeSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawn, execFileSync } from 'node:child_process';
 import { URL as NodeURL } from 'node:url';
+import { stripVTControlCharacters } from 'node:util';
 import { readSettings } from '../lib/settings-files.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 
@@ -29,14 +30,22 @@ const WORKER = `
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { readTimeoutEvidence } from ${JSON.stringify(new NodeURL('./reconcile-pass.mjs', import.meta.url).href)};
 const [input, output] = process.argv.slice(1);
+let degraded = false;
+const stderrWrite = process.stderr.write.bind(process.stderr);
+process.stderr.write = (chunk, ...args) => {
+  if (/gh-throttle:.*(?:fail-open|running this call ungated)/.test(String(chunk))) degraded = true;
+  return stderrWrite(chunk, ...args);
+};
+const failure = () => ({ workerError: true, ...(degraded ? { reason: 'throttle-degraded' } : {}) });
 try {
   const { pr, repo } = JSON.parse(readFileSync(input, 'utf8'));
-  writeFileSync(output + '.tmp', JSON.stringify({ value: readTimeoutEvidence(pr, { repo }) }));
+  const value = readTimeoutEvidence(pr, { repo });
+  writeFileSync(output + '.tmp', JSON.stringify(degraded ? failure() : { value }));
   renameSync(output + '.tmp', output);
   process.exit(0);
 } catch {
   try {
-    writeFileSync(output + '.tmp', JSON.stringify({ workerError: true }));
+    writeFileSync(output + '.tmp', JSON.stringify(failure()));
     renameSync(output + '.tmp', output);
   } catch {}
   process.exit(1);
@@ -74,7 +83,7 @@ trap 'code=$?; printf "%s" "$code" > "$7.done"; exec /bin/sleep 180' 0
 export function runTimeoutEvidencePool(prs, { repo, concurrency = 4, deadlineMs = 180_000,
   launch = spawn, remove = rmSync, env = process.env, groupAlive = workerGroupAlive, now = Date.now, pause = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms),
 } = {}) {
-  const results = new Array(prs.length), active = new Map();
+  const results = new Array(prs.length), active = new Map(), stderrPaths = [];
   const limit = validConcurrency(concurrency) ? concurrency : 1;
   let folder;
   const kill = child => {
@@ -95,15 +104,16 @@ export function runTimeoutEvidencePool(prs, { repo, concurrency = 4, deadlineMs 
     folder = mkdtempSync(join(tmpdir(), 'timeout-evidence-'));
     const deadline = now() + deadlineMs;
     const expires = Date.now() + Math.max(0, deadlineMs) + 5000;
-    let next = 0;
-    while ((next < prs.length || active.size) && now() < deadline) {
-      while (next < prs.length && active.size < limit && now() < deadline) {
+    let next = 0, degraded = false;
+    while ((!degraded && next < prs.length || active.size) && now() < deadline) {
+      while (!degraded && next < prs.length && active.size < limit && now() < deadline) {
         const index = next++, input = join(folder, `${index}.input.json`), output = join(folder, `${index}.result.json`);
         let stdout, stderr;
         try {
           writeFileSync(input, JSON.stringify({ pr: prs[index], repo }));
           stdout = openSync(join(folder, `${index}.stdout`), 'w');
           stderr = openSync(join(folder, `${index}.stderr`), 'w');
+          stderrPaths.push(join(folder, `${index}.stderr`));
           writeFileSync(output + '.watchdog', '');
           const child = launch('/bin/sh', ['-c', WRAPPER, 'timeout-worker', process.execPath, WORKER, WATCHDOG, String(expires), folder, input, output], {
             detached: true, env, stdio: ['ignore', stdout, stderr],
@@ -119,6 +129,7 @@ export function runTimeoutEvidencePool(prs, { repo, concurrency = 4, deadlineMs 
           try {
             if (statSync(output).size <= MAX_RESULT_BYTES) {
               const row = JSON.parse(readFileSync(output, 'utf8'));
+              if (row.workerError && row.reason === 'throttle-degraded') degraded = true;
               const value = row.value ?? row;
               if (typeof value?.eligible === 'boolean') {
                 results[index] = value;
@@ -142,6 +153,16 @@ export function runTimeoutEvidencePool(prs, { repo, concurrency = 4, deadlineMs 
       if (cleanupError) throw cleanupError;
     } finally {
       if (folder) {
+        for (const path of stderrPaths) {
+          let fd;
+          try {
+            fd = openSync(path, 'r');
+            const size = statSync(path).size, tail = Buffer.alloc(Math.min(size, 4096));
+            const bytes = readSync(fd, tail, 0, tail.length, Math.max(0, size - tail.length));
+            if (bytes) console.error('timeout-evidence worker stderr:', stripVTControlCharacters(tail.subarray(0, bytes).toString('utf8')).replace(/[\x00-\x08\x0b-\x1f\x7f]/g, ''));
+          } catch (error) { console.error(`timeout-evidence worker stderr: read failed: ${error.message}`); }
+          finally { if (fd !== undefined) closeSync(fd); }
+        }
         try { remove(folder, { recursive: true, force: true }); }
         catch (error) { console.error(`timeout-evidence: temp dir cleanup failed: ${error.message}`); }
       }

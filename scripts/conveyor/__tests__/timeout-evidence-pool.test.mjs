@@ -79,6 +79,63 @@ it.each([false, true])('logs failed temp removal without replacing the result or
 });
 
 describe('production worker with local gh stub', () => {
+  it('falls back serially for degraded throttle workers and all remaining PRs without launching more workers', () => scratch(dir => {
+    const env = realFixture(dir), unusableRoot = join(dir, 'not-a-directory');
+    writeFileSync(unusableRoot, 'fixture');
+    const expected = readTimeoutEvidence(pr, { repo });
+    const prs = Array.from({ length: 5 }, (_, i) => ({ ...pr, number: pr.number + i }));
+    const launch = vi.fn((file, args, opts) => spawn(file, args, opts));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    let pooled, workerRows, forwardedBeforeCleanup;
+    try {
+      const poolRunner = (rows, opts) => {
+        pooled = runTimeoutEvidencePool(rows, { ...opts, launch, deadlineMs: 20_000,
+          env: { ...env, WE_GH_THROTTLE_LOCK_ROOT: unusableRoot },
+          remove: (folder, options) => {
+            workerRows = [0, 1].map(index => JSON.parse(readFileSync(join(folder, `${index}.result.json`), 'utf8')));
+            forwardedBeforeCleanup = log.mock.calls.filter(([prefix]) => prefix === 'timeout-evidence worker stderr:').length;
+            rmSync(folder, options);
+          },
+        });
+        return pooled;
+      };
+      const results = enrichPrsWithTimeoutEvidence(prs, { ...options, concurrency: 2, poolRunner });
+      expect(launch).toHaveBeenCalledTimes(2);
+      expect(workerRows).toEqual(Array(2).fill({ workerError: true, reason: 'throttle-degraded' }));
+      expect(forwardedBeforeCleanup).toBe(2);
+      expect(Array.from(pooled)).toEqual(Array(5).fill(undefined));
+      expect(results.map(row => row.timeoutRetry)).toEqual(prs.map(() => expected));
+      expect(log.mock.calls.filter(([prefix]) => prefix === 'timeout-evidence worker stderr:')
+        .every(([, text]) => text.includes('gh-throttle: lock-root setup failed') && text.includes('(fail-open)'))).toBe(true);
+      const calls = readFileSync(join(dir, 'throttle', 'calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+      // One baseline read plus one serial fallback per PR, through the parent's healthy throttle.
+      expect(calls.filter(c => c.outcome === 'call')).toHaveLength(4 * 6);
+    } finally { log.mockRestore(); }
+  }), 30_000);
+
+  it('forwards only the last 4 KB of non-empty worker stderr before cleanup', () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const tail = 'x'.repeat(4092) + 'tail';
+    let folder;
+    try {
+      runTimeoutEvidencePool([pr, pr], {
+        launch: (_file, args, opts) => {
+          folder = join(args.at(-1), '..');
+          if (args.at(-1).endsWith('0.result.json')) writeFileSync(opts.stdio[2], 'omitted' + tail);
+          return { on() {} };
+        },
+        remove: (path, options) => {
+          expect(existsSync(path)).toBe(true);
+          expect(log.mock.calls).toEqual([['timeout-evidence worker stderr:', tail]]);
+          rmSync(path, options);
+        },
+      });
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(log).toHaveBeenCalledWith('timeout-evidence worker stderr:', tail);
+      expect(existsSync(folder)).toBe(false);
+    } finally { log.mockRestore(); if (folder) rmSync(folder, { recursive: true, force: true }); }
+  });
+
   it.each(['SIGKILL', 'SIGTERM', 'SIGSTOP'])('supervises worker groups and removes their directory after planner %s (SIGSTOP exercises hard lifetime)', async signal => {
     const dir = mkdtempSync(join(tmpdir(), 'timeout-orphan-test-'));
     let planner, groups = [], folder;
