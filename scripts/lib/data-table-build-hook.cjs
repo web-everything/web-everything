@@ -141,7 +141,7 @@ function runBuildBatch(entries, repoRoot, runner = execFileSync) {
     );
   }
   const input = JSON.stringify(entries);
-  const out = runner('node', [cliPath], { input, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  const out = runner('node', [cliPath], { input, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
   let batch;
   try {
     batch = JSON.parse(out);

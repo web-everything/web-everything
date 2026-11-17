@@ -1756,6 +1756,16 @@ function fail(m, code = 1) {
 }
 
 // ── commands ──────────────────────────────────────────────────────────────────────────────────────
+function tryLaneWork(n, work, failedLanes) {
+  try {
+    return work();
+  } catch (error) {
+    log(`lane-${n}: FAILED (${error.message || String(error)})`);
+    failedLanes.push(n);
+    return null;
+  }
+}
+
 // Provision one lane (clone if missing, refresh, write env, ensure deps). Returns refreshLane's result so the
 // caller can tell an actually-reset lane (safe to unmap its stale item mapping) from a skipped/leased one.
 function provisionLane(repo, n, force) {
@@ -1821,6 +1831,7 @@ function cmdProvision(repo) {
   mkdirSync(repo.poolDir, { recursive: true });
   const force = !!flags.force;
   const resetLanes = []; // only lanes actually reset lose their stale mapping — a skipped lane still serves it
+  const failedLanes = [];
 
   // #2426 — `--acquirable` provisions until `count` lanes are ACQUIRABLE (not foreign-leased / busy), growing the
   // pool PAST held lanes rather than stopping at lane-<count>. This is what lets the parallel /workflow couple N
@@ -1862,9 +1873,10 @@ function cmdProvision(repo) {
         if (newLanesCloned >= maxNew) { growthStoppedReason = 'new-lane-cap'; break; }
       }
       n = next;
-      const result = provisionLane(repo, n, force);
-      if (!result.skipped) resetLanes.push(n);
+      const result = tryLaneWork(n, () => provisionLane(repo, n, force), failedLanes);
       if (isNewLane) newLanesCloned++;
+      if (!result) continue;
+      if (!result.skipped) resetLanes.push(n);
       if (isLaneAcquirable(laneAcquirableInfo(repo, n, remoteShasBox, nowMs, ttlMs), nowMs, ttlMs)) acquirable++;
     }
     if (growthStoppedReason === 'remote-probe-failed') {
@@ -1889,33 +1901,44 @@ function cmdProvision(repo) {
   } else {
     log(`provisioning ${count} lane(s) for "${repo.name}" under ${repo.poolDir} (branch ${repo.branch})`);
     for (let n = 1; n <= count; n++) {
-      const result = provisionLane(repo, n, force);
-      if (!result.skipped) resetLanes.push(n);
+      const result = tryLaneWork(n, () => provisionLane(repo, n, force), failedLanes);
+      if (result && !result.skipped) resetLanes.push(n);
     }
   }
   unmapLanes(repo, resetLanes); // refreshed lanes lose stale mappings (#2139); skipped lanes keep theirs
   invalidateListCache(repo); // #xn432dz — reset lanes may have gone dirty→clean with no lease change
   ensureRepoSiblings(repo, { force }); // pushable+built constellation siblings at the pool root (#2166/#2282/#2349)
   printStatus(repo);
+  if (failedLanes.length) process.exitCode = 1;
 }
 
 function cmdRefresh(repo) {
-  const lanes = existingLanes(repo);
+  let lanes = existingLanes(repo);
+  if (flags.lane !== undefined) {
+    const n = Number(flags.lane);
+    if (!lanes.includes(n)) fail(`lane-${flags.lane} does not exist under ${repo.poolDir}`);
+    lanes = [n];
+  }
   if (lanes.length === 0) fail(`no lanes to refresh under ${repo.poolDir} (run provision first)`);
   log(`refreshing ${lanes.length} lane(s) for "${repo.name}" → origin/${repo.branch}`);
   const force = !!flags.force;
   const resetLanes = []; // only lanes actually reset lose their stale mapping — a skipped lane still serves it
+  const failedLanes = [];
   for (const n of lanes) {
-    const result = refreshLane(repo, n, { force });
-    if (!result.skipped) resetLanes.push(n);
-    writeLaneEnv(repo, n);
-    writeLaneClaudeSettings(repo, n);
-    if (!flags['no-install']) ensureDeps(laneDir(repo, n));
+    const result = tryLaneWork(n, () => {
+      const refreshed = refreshLane(repo, n, { force });
+      writeLaneEnv(repo, n);
+      writeLaneClaudeSettings(repo, n);
+      if (!flags['no-install']) ensureDeps(laneDir(repo, n));
+      return refreshed;
+    }, failedLanes);
+    if (result && !result.skipped) resetLanes.push(n);
   }
   unmapLanes(repo, resetLanes); // a reset lane no longer renders its old item (#2139); a skipped one still does
   invalidateListCache(repo); // #xn432dz — see cmdProvision
   ensureRepoSiblings(repo, { force }); // keep the WE pool's constellation siblings current on refresh too
   printStatus(repo);
+  if (failedLanes.length) process.exitCode = 1;
 }
 
 // ── acquire / release (#2275) — the exclusive-lease allocator any flow consumes ─────────────────────
@@ -5790,6 +5813,16 @@ if (unknownFlags.length) {
     `unrecognized flag(s): ${unknownFlags.map((f) => `--${f}`).join(', ')} — run \`node scripts/lane-pool.mjs help\` for the ` +
       `full flag list. A silently-ignored flag on a destructive command like \`acquire\` is exactly the footgun this check exists to close.`,
   );
+}
+
+// Validate before repo resolution or dispatch so every flags.lane consumer is protected.
+// A bare --lane is true, and Number(true) would silently select lane 1 even with --force.
+// Use an absolute end assertion: `$` alone also accepts a trailing newline.
+if (flags.lane !== undefined && (
+  typeof flags.lane !== 'string' || !/^[1-9]\d*(?![\s\S])/.test(flags.lane) ||
+  !Number.isSafeInteger(Number(flags.lane))
+)) {
+  fail('--lane requires a lane number');
 }
 
 await COMMANDS[cmd](resolveRepo());
