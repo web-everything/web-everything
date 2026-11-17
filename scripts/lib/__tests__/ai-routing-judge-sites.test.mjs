@@ -7,7 +7,14 @@ import { resolveCodexTaskRoute as codexRoute } from '../codex-task-route.mjs';
 import { buildCodexJudgeArgv, codexJudgeSpawn, resolveJudgeRoutingInput } from '../codex-judge-spawn.mjs';
 import { createDefaultJudge } from '../../operations/cli-adapter.mjs';
 
-const state = vi.hoisted(() => ({ tool: {}, throwing: false, operation: vi.fn(), codex: vi.fn() }));
+const state = vi.hoisted(() => ({ tool: {}, throwing: false, operation: vi.fn(), codex: vi.fn(), route: vi.fn() }));
+vi.mock('../codex-task-route.mjs', async original => {
+  const actual = await original();
+  return { ...actual, resolveCodexTaskRoute: options => {
+    state.route(options);
+    return actual.resolveCodexTaskRoute(options);
+  } };
+});
 vi.mock('../ai-routing.mjs', async original => {
   const actual = await original();
   return { ...actual, resolveAiRouting: options => {
@@ -62,8 +69,14 @@ describe('judge aiRouting consumers', () => {
       expect(state.operation.mock.calls[0][0].aiRouting).toBeUndefined();
       expect(call.model).toBeUndefined();
       const argv = buildCodexJudgeArgv({ ...paths, route: baseline() });
+      state.route.mockClear();
       expect(buildCodexJudgeArgv({ ...paths, env })).toEqual(argv);
+      expect(state.route).toHaveBeenCalledTimes(1);
+      expect(state.route.mock.calls[0][0]).not.toHaveProperty('aiRouting');
+      state.route.mockClear();
       expect((await spawn()).argv).toEqual(argv);
+      expect(state.route).toHaveBeenCalledTimes(1);
+      expect(state.route.mock.calls[0][0]).not.toHaveProperty('aiRouting');
     });
   it('a set coordinator reaches the operation resolver and both Codex sites', async () => {
     state.tool = setting;
@@ -71,10 +84,27 @@ describe('judge aiRouting consumers', () => {
     expect(state.operation.mock.calls[0][0].aiRouting).toEqual(setting.judge.coordinator);
     const route = operationRoute({ operation: 'judge', policy: DEFAULT_ROUTING_POLICY, operatorKeys: [], aiRouting: setting.judge.coordinator });
     expect(call).toMatchObject({ model: route.model, effort: route.effort });
-    const expected = buildCodexJudgeArgv({ ...paths, route: codexRoute({ kind: 'review', env, log: false, aiRouting: setting.judge.coordinator }) });
-    expect(buildCodexJudgeArgv({ ...paths, env })).toEqual(expected);
-    expect((await spawn()).argv).toEqual(expected);
+    const routeEnv = { WE_CODEX_MODEL_BY_TASK: JSON.stringify({ review: { model: 'gpt-6-astra', effort: 'medium' } }) };
+    const expected = buildCodexJudgeArgv({ ...paths, route: codexRoute({ kind: 'review', env: routeEnv, log: false, aiRouting: setting.judge.coordinator }) });
+    expect(buildCodexJudgeArgv({ ...paths, env: routeEnv })).toEqual(expected);
+    expect((await spawn({ env: routeEnv })).argv).toEqual(expected);
     expect(expected).toContain('gpt-6-astra');
+    expect(expected).toContain('model_reasoning_effort=high');
+  });
+  it.each([
+    ['gpt-6-luna', 'low'],
+    ['gpt-6-luna', 'high'],
+    ['gpt-6-astra', 'low'],
+    ['gpt-6-astra', 'high'],
+  ])('preserves Astra/high without mandatoryLens/care for %s/%s, including downstream requests', async (model, effort) => {
+    const routeEnv = { WE_CODEX_MODEL_BY_TASK: JSON.stringify({ review: { model: 'gpt-6-astra', effort: 'high' } }) };
+    state.tool = { judge: { coordinator: { provider: 'codex', model, effort } } };
+    const expected = buildCodexJudgeArgv({ ...paths, route: baseline({ env: routeEnv }) });
+    expect(expected).toContain('gpt-6-astra');
+    expect(expected).toContain('model_reasoning_effort=high');
+    expect(buildCodexJudgeArgv({ ...paths, env: routeEnv })).toEqual(expected);
+    expect((await spawn({ env: routeEnv })).argv).toEqual(expected);
+    expect((await spawn({ env: routeEnv, repo: 'owner/repo', pr: 123, lens: 'referral-reverify' })).argv).toEqual(expected);
   });
   it.each([
     { mandatoryLens: true },
@@ -131,17 +161,37 @@ describe('judge aiRouting consumers', () => {
     expect(resolveJudgeRoutingInput({ env, log })).toBeUndefined();
     expect(log.mock.calls).toEqual([['ai-routing judge: resolver failed, using inherit: unreadable']]);
   });
-  it.each(['invalid', 'throwing'])('log:false keeps %s resolver failures silent', kind => {
+  it('both quiet Codex sites report resolver failure and retain the baseline route', async () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      state.throwing = true;
+      const expected = buildCodexJudgeArgv({ ...paths, route: baseline() });
+      expect(buildCodexJudgeArgv({ ...paths, env })).toEqual(expected);
+      expect((await spawn()).argv).toEqual(expected);
+      expect(log.mock.calls).toEqual([
+        ['ai-routing judge: resolver failed, using inherit: unreadable'],
+        ['ai-routing judge: resolver failed, using inherit: unreadable'],
+      ]);
+    } finally {
+      log.mockRestore();
+    }
+  });
+  it.each(['inherit', 'set', 'invalid', 'throwing'])('log:false emits only resolver failure diagnostics: %s', kind => {
+    state.tool = kind === 'set' ? setting : {};
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       const resolve = ({ log: emit }) => {
         expect(emit).toBe(false);
         if (kind === 'throwing') throw new Error('unreadable');
         if (emit !== false) emit('invalid coordinator setting ignored');
-        return snapshot({});
+        return snapshot(state.tool);
       };
-      expect(resolveJudgeRoutingInput({ log: false, resolve })).toBeUndefined();
-      expect(log).not.toHaveBeenCalled();
+      expect(resolveJudgeRoutingInput({ log: false, resolve })).toEqual(kind === 'set' ? setting.judge.coordinator : undefined);
+      if (kind === 'throwing') {
+        expect(log.mock.calls).toEqual([['ai-routing judge: resolver failed, using inherit: unreadable']]);
+      } else {
+        expect(log).not.toHaveBeenCalled();
+      }
     } finally {
       log.mockRestore();
     }

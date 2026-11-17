@@ -109,11 +109,22 @@ export function resolveJudgeRoutingInput({ env = process.env, resolve = resolveA
     }
     return input;
   } catch (error) {
-    if (log !== false) {
-      try { log(`ai-routing judge: resolver failed, using inherit: ${error?.message ?? error}`); } catch { /* diagnostic only */ }
-    }
+    try { (log === false ? console.error : log)(`ai-routing judge: resolver failed, using inherit: ${error?.message ?? error}`); } catch { /* diagnostic only */ }
     return undefined;
   }
+}
+
+/** aiRouting may only raise effort on the baseline model, as in the fixer ladder. */
+function resolveCodexJudgeRoute({ mandatoryLens, care, model, effort, env, log }) {
+  const options = { kind: 'review', mandatoryLens, care, model, effort, env, log };
+  const baseline = resolveCodexTaskRoute(options);
+  if (mandatoryLens || care != null) return baseline;
+  const aiRouting = resolveJudgeRoutingInput({ env, log });
+  if (!aiRouting) return baseline;
+  const routed = resolveCodexTaskRoute({ ...options, aiRouting });
+  const rank = effort => Object.keys(CODEX_EFFORT_MAP).indexOf(effort);
+  return routed.model === baseline.model && rank(routed.effort) >= rank(baseline.effort)
+    ? routed : baseline;
 }
 
 /**
@@ -399,8 +410,7 @@ export function buildCodexJudgeArgv({
     '--ephemeral',                  // no session persistence — the `--no-session-persistence` analogue.
     '-C', cwd,
   ];
-  route ??= resolveCodexTaskRoute({ kind: 'review', mandatoryLens, care, model, effort, env, log: false,
-    aiRouting: mandatoryLens || care != null ? undefined : resolveJudgeRoutingInput({ env, log: false }) });
+  route ??= resolveCodexJudgeRoute({ mandatoryLens, care, model, effort, env, log: false });
   // #3635 Fork 1: unconditional `-m`; an inherited default can be re-ranked server-side with no diff.
   // The old "effort deliberately optional" residual is CLOSED: the review route always emits effort.
   argv.push('-m', assertCodexModel(route.model, 'codex-judge-spawn'));
@@ -694,8 +704,7 @@ export async function codexJudgeSpawn({
   }
   assertNoCodexToolAllowlist(allowedTools);
 
-  const route = resolveCodexTaskRoute({ kind: 'review', mandatoryLens, care, model, effort, env: env ?? process.env, log,
-    aiRouting: mandatoryLens || care != null ? undefined : resolveJudgeRoutingInput({ env: env ?? process.env, log }) });
+  const route = resolveCodexJudgeRoute({ mandatoryLens, care, model, effort, env: env ?? process.env, log });
   ({ model, effort } = route);
 
   const workDir = mkTempDir(join(tmpdir(), 'codex-judge-'));
