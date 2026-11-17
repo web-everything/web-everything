@@ -3,7 +3,7 @@
  * Defaults to dry-run; --apply writes verified daily archives and removes originals.
  * Later batches for a day use receipts-DAY-N.jsonl.gz; all batches expire by UTC day.
  * --now=<date> overrides the clock for dry-run only; it cannot be used with --apply.
- * FORGE_RECEIPTS_DIR supplies the root when omitted. Timer wiring is a later slice.
+ * Requires --root or FORGE_RECEIPTS_DIR; there is no implicit root. Timer wiring is a later slice.
  */
 import * as fs from 'node:fs/promises';
 import {constants} from 'node:fs';
@@ -125,7 +125,14 @@ export async function runArchive({root, now = Date.now(), apply = false, io = fs
   const entries = [], stats = new Map();
   const directory = await io.opendir(root);
   for await (const entry of directory) {
-    const stat = await io.lstat(join(root, entry.name));
+    let stat;
+    try { stat = await io.lstat(join(root, entry.name)); }
+    catch (error) {
+      // The exec sweeper can remove a receipt after opendir yields its name.
+      // Only absence during listing is benign; later validation still fails closed.
+      if (error.code === 'ENOENT') continue;
+      throw error;
+    }
     const kind = stat.isSymbolicLink() ? 'symlink' : stat.isFile() ? 'file' : stat.isDirectory() ? 'dir' : 'other';
     entries.push({name: entry.name, kind, mtimeMs: stat.mtimeMs, size: stat.size});
     stats.set(entry.name, stat);

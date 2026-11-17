@@ -18,6 +18,13 @@ const bucket = (time, files) => ({day: dayOf(time), archiveName: archiveName(day
 const decode = bytes => gunzipSync(bytes).toString('utf8').trimEnd().split('\n').map(line => JSON.parse(line));
 
 describe('planArchive', () => {
+  it.each(['.tmp-x', '.tmp-receipts-2026-11-08.jsonl.gz', '.tmp-receipts-2026-11-08.jsonl.gz-uuid'])
+  ('skips aged temporary file %s before applying receipt retention', name => {
+    expect(planArchive([entry(name, now - 90 * DAY)], now)).toEqual({
+      archive: [], deleteArchives: [], skipped: [{name, reason: 'temporary-file'}],
+    });
+  });
+
   it('archives a receipt exactly 7 days old but skips one just under 7 days', () => {
     expect(planArchive([entry('exact', now - 7 * DAY), entry('under', now - 7 * DAY + 1)], now)).toEqual({
       archive: [bucket(now - 7 * DAY, ['exact'])], deleteArchives: [],
@@ -159,6 +166,53 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     for (const original of originals) expect(await fs.readFile(join(root, original.name))).toEqual(original.data);
     expect((await fs.readdir(root)).filter(name => name.startsWith('.tmp-'))).toEqual([]);
   }
+
+  it.each([false, true])('continues after an entry vanishes during listing (apply=%s)', async apply => {
+    const gone = await receipt('gone.receipt');
+    const survivor = await receipt('survivor.receipt', Buffer.from('survivor'), now - 9 * DAY);
+    const io = {...fs,
+      // Snapshot the names so the race does not depend on filesystem iteration order.
+      async opendir() { return [{name: gone.name}, {name: survivor.name}]; },
+      async lstat(path) {
+        if (path === join(root, gone.name)) await fs.unlink(path);
+        return fs.lstat(path);
+      },
+    };
+    const result = await runArchive({root, now, apply, io});
+    expect(result.ok).toBe(true);
+    expect(result.plan.archive).toEqual([bucket(survivor.mtimeMs, [survivor.name])]);
+    expect(result.counts.archivedFiles).toBe(apply ? 1 : 0);
+    if (apply) {
+      const records = decode(await fs.readFile(join(root, archiveName(dayOf(survivor.mtimeMs)))));
+      expect(records).toEqual([expect.objectContaining({name: survivor.name, sha256: hash(survivor.data)})]);
+      await expect(fs.lstat(join(root, survivor.name))).rejects.toMatchObject({code: 'ENOENT'});
+    } else await expectOriginals([survivor]);
+  });
+
+  it.each(['EACCES', 'EIO'])('refuses a listing stat failure other than ENOENT: %s', async code => {
+    const original = await receipt('unreadable.receipt');
+    const error = Object.assign(new Error('listing stat failed'), {code});
+    const io = {...fs, async lstat(path) {
+      if (path === join(root, original.name)) throw error;
+      return fs.lstat(path);
+    }};
+    await expect(runArchive({root, now, apply: true, io})).rejects.toBe(error);
+    await expectOriginals([original]);
+    expect(await fs.readdir(root)).toEqual([original.name]);
+  });
+
+  it('refuses a missing root rather than treating it as an empty listing', async () => {
+    await expect(runArchive({root: join(tmp, 'missing'), now, apply: true}))
+      .rejects.toMatchObject({code: 'ENOENT'});
+  });
+
+  it('requires an explicit CLI root when neither argv nor env supplies one', async () => {
+    const output = vi.spyOn(process.stdout, 'write').mockReturnValue(true);
+    expect(await main(['--json'], {})).toBe(2);
+    expect(JSON.parse(output.mock.calls[0][0])).toEqual({
+      ok: false, errors: [{message: 'Root must be an absolute nonempty path'}],
+    });
+  });
 
   it.each(['already-present', 'late-arrival'])
   ('archives later same-day receipts on a second run: %s', async variant => {
