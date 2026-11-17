@@ -189,9 +189,9 @@ describe('remote admission policy', () => {
       expect(remoteExec).toHaveBeenCalledWith(expect.objectContaining({ argv:expected, cwd: root, signal: expect.any(AbortSignal) }));
       expect(exit).toHaveBeenCalledWith(23);
       expect(JSON.parse(readFileSync(join(root, 'verify-report.jsonl'), 'utf8'))).toEqual({ location: 'remote', receiptId: 'run-123456', exitCode: 23 });
-      // R501: the only thing a remote success may leave in the heavy root is the forgeShare record
+      // R501: a remote success leaves only the forgeShare record and its admission-wait row in the heavy root
       expect(existsSync(join(pool, '.admission','heavy','slot-0'))).toBe(false);
-      expect(readdirSync(join(pool, '.admission','heavy'))).toEqual(['remote-runs.jsonl']);
+      expect(readdirSync(join(pool, '.admission','heavy')).sort()).toEqual(['remote-runs.jsonl', 'waits.jsonl']);
       expect(heldSlots({lockRoot:join(pool,'.admission','remote'),cap:8})).toHaveLength(0);
     } finally { exit.mockRestore(); stderr.mockRestore(); vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); }
   });
@@ -460,7 +460,7 @@ describe('runWithRemoteDecision', () => {
     expect(f.remoteExec).not.toHaveBeenCalled();
     const rows = readFileSync(join(f.lockRoot,'remote-fallbacks.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({reason:expect.any(String),detail:null,lane:'fixture-checkout',kind:'files'});
+    expect(rows[0]).toMatchObject({reason:expect.any(String),detail:expect.any(String),lane:'fixture-checkout',kind:'files'});
   });
 
   it('bounds fallback log growth and tolerates an unwritable log', async () => {

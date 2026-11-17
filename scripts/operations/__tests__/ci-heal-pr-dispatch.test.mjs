@@ -124,9 +124,12 @@ describe('oldest owed CI-heal first', () => {
     })) });
     expect(plan.dispatch.map(e => e.prNumber)).toEqual([5087, 5082, 5017]);
     const dispatch = vi.fn(async planned => ({ pr: planned.pr }));
+    const recheckHost = vi.fn(() => ({ admit: true }));
     try {
       const result = await runReconcileCiHealDispatch({ root: '/repo', reconcile: () => plan,
-        checkStaleness: FRESH, dispatch, dispatchThrottle: { tryAdmit: () => ({ admit: false, kind: 'fix-cap' }) },
+        checkStaleness: FRESH, dispatch, dispatchThrottle: {
+          tryAdmit: () => ({ admit: false, kind: 'fix-cap' }), recheckHost,
+        },
         ciHealReserve: createCiHealReserve({ env: { WE_CI_HEAL_RESERVE: '3' }, gate: () => ({ admit: true }),
           listClaims: () => [5042, 5051].map(pr => ({ meta: { kind: 'ci-heal', pr } })) }),
         pickFreeLanes: () => [1, 2, 3], resolveWorkUnit: () => ({ itemNum: null, scope: [] }),
@@ -136,6 +139,7 @@ describe('oldest owed CI-heal first', () => {
         fixLoop: { killed: () => false, readRows: () => [], append: vi.fn() },
       });
       expect(dispatch).toHaveBeenCalledTimes(1);
+      expect(recheckHost.mock.calls).toEqual([['ci-heal']]);
       expect(dispatch.mock.calls[0][0].pr).toBe(5017);
       expect(result.dispatched).toEqual([{ pr: 5017 }]);
       expect(result.refusals.map(r => [r.pr, r.kind])).toEqual([[5082, 'fix-cap'], [5087, 'fix-cap']]);
@@ -1246,7 +1250,7 @@ it('preserves oldest-owed order with a deadline and resumes at the exact PR curs
   const dir = mkdtempSync(join(tmpdir(), 'ci-heal-budget-'));
   let time = 10, inEffect = false;
   const touched = [];
-  const now = vi.fn(() => { expect(inEffect).toBe(false); return time; });
+  const now = vi.fn(() => time); // launches run concurrently now, so the old serial inEffect interleave no longer applies
   const options = { root: '/repo', checkStaleness: FRESH, now, deadlineAt: 10,
     reconcile: () => ({ dispatch: [3, 1, 2].map(prNumber => ({ kind: 'ci-heal', prNumber, headRefOid: 'a',
       waitingSince: { 3: '2026-10-13T01:00:00Z', 1: '2026-10-13T02:00:00Z', 2: '2026-10-13T03:00:00Z' }[prNumber],
@@ -1256,16 +1260,15 @@ it('preserves oldest-owed order with a deadline and resumes at the exact PR curs
     resolveProfile: () => ({ capabilities: { ciHeal: true } }), unsupportedPath: join(dir, 'u.json'),
     flushOwed: () => ({}), pollAttempts: () => [], flushTimeouts: async () => [], timeoutHold: () => null,
     salvage: async () => null, currentBuild: () => null,
-    fixLoop: { killed: () => false, readRows: () => [], append: async () => { expect(inEffect).toBe(true); inEffect = false; } },
+    fixLoop: { killed: () => false, readRows: () => [], append: async () => { inEffect = false; } },
   };
   try {
     const first = await runReconcileCiHealDispatch(options);
-    expect(first).toMatchObject({ handled: 1, deferred: [1, 2], nextCursor: 1 });
-    expect(touched).toEqual([3]);
-    // The entry check, then each PR's clock read.
-    expect(now).toHaveBeenCalledTimes(3);
+    // Dispatch time no longer starves later owed PRs: every cheap-gated entry launches, oldest first (ci-heal-starvation.test.mjs).
+    expect(first).toMatchObject({ handled: 3, deferred: [], nextCursor: null });
+    expect(touched).toEqual([3, 1, 2]);
     touched.length = 0;
-    const second = await runReconcileCiHealDispatch({ ...options, cursor: first.nextCursor, deadlineAt: 20 });
+    const second = await runReconcileCiHealDispatch({ ...options, cursor: 1, deadlineAt: 20 });
     expect(touched).toEqual([1, 2, 3]);
     expect(second).toMatchObject({ handled: 3, deferred: [], nextCursor: null });
     touched.length = 0;
@@ -1310,7 +1313,7 @@ it('past deadline without a cursor skips every blocking prelude (including recon
   for (const fn of [reconcile, pollAttempts, flushOwed, flushTimeouts, dispatch]) expect(fn).not.toHaveBeenCalled();
 });
 
-it('a flush skipped at the deadline runs on the next pass even if still past deadline, and that pass still handles one PR', async () => {
+it('a flush skipped at the deadline runs on the next pass even if still past deadline, with a fresh gate slice for all PRs', async () => {
   resetCiHealFlushDeadlineState();
   const flushOwed = vi.fn(() => ({})), flushTimeouts = vi.fn(async () => []);
   const reconcile = vi.fn(() => ({ dispatch: [{ kind: 'ci-heal', prNumber: 7, headRefOid: 'a' }, { kind: 'ci-heal', prNumber: 8, headRefOid: 'a' }], refusals: [] }));
@@ -1325,10 +1328,11 @@ it('a flush skipped at the deadline runs on the next pass even if still past dea
   const second = await runReconcileCiHealDispatch(options);
   expect(flushOwed).toHaveBeenCalledTimes(1);
   expect(flushTimeouts).toHaveBeenCalledTimes(1);
-  expect(second).toMatchObject({ handled: 1, deferred: [8], nextCursor: 8 });
+  expect(second).toMatchObject({ handled: 2, deferred: [], nextCursor: null });
+  expect(dispatch.mock.calls.map(([p]) => p.pr)).toEqual([7, 8]);
 });
 
-it('ci-heal: a prelude that always overruns the budget still handles one PR every pass (no starvation)', async () => {
+it('ci-heal: a prelude that always overruns the budget still handles all PRs every pass (no starvation)', async () => {
   resetCiHealFlushDeadlineState();
   let time = 0;
   const handledPrs = [];
@@ -1342,13 +1346,13 @@ it('ci-heal: a prelude that always overruns the budget still handles one PR ever
   let cursor;
   for (let pass = 0; pass < 2; pass += 1) {
     const result = await runReconcileCiHealDispatch({ ...options, deadlineAt: time + 100, cursor });
-    expect(result.handled).toBeGreaterThanOrEqual(1);
+    expect(result).toMatchObject({ handled: 2, deferred: [], nextCursor: null });
     cursor = result.nextCursor ?? undefined;
   }
-  expect(handledPrs).toEqual([5, 6]);
+  expect(handledPrs).toEqual([5, 6, 5, 6]);
 });
 
-it('still heals the oldest-owed PR when the deadline already passed before the loop, so every pass makes progress', async () => {
+it('heals all PRs oldest first when the deadline passes before the loop', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'ci-heal-budget-min-'));
   const touched = [];
   let time = 0;
@@ -1364,7 +1368,7 @@ it('still heals the oldest-owed PR when the deadline already passed before the l
   };
   try {
     const result = await runReconcileCiHealDispatch(options);
-    expect(touched).toEqual([1]);
-    expect(result).toMatchObject({ handled: 1, deferred: [2], nextCursor: 2 });
+    expect(touched).toEqual([1, 2]);
+    expect(result).toMatchObject({ handled: 2, deferred: [], nextCursor: null });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

@@ -14,7 +14,7 @@
     "enqueueOnEvent": { "enabled": true, "debounceSeconds": 15, "debounceMaxWaitMs": 60000, "timeoutSeconds": 600, "catchUp": { "enabled": true, "intervalMinutes": 10, "concurrency": 3, "busyIntervalSeconds": 60, "maxQueued": 12, "missSmellAfter": 3, "timeoutBackoffRounds": 3, "missBackoff": { "enabled": true, "ttlMinutes": 30 }, "order": "priority-then-first-accept" } },
     "enabled": true,
     "batchSize": 1,
-    "classOrder": ["main-fix", "normal"],
+    "classOrder": ["main-fix", "normal", "cards"],
     "defaultClass": "normal",
     "strategy": "drain-direct"
   },

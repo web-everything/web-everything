@@ -27,7 +27,21 @@ async function runtime(persist, legacy = false) {
     import {createEventLog} from './core.mjs';
     export class PrEventLog extends Base {
       fault(on) { this.ctx.storage.sql.exec(on ? "CREATE TRIGGER fail_projection BEFORE INSERT ON projection BEGIN SELECT RAISE(ABORT, 'injected projection failure'); END" : 'DROP TRIGGER fail_projection'); }
-      retention(maxEvents, retentionMs) { this.log = createEventLog(this.storageAdapter, {maxEvents, retentionMs}); }
+      // Miniflare's Node RPC bridge masks rejected RPCs with a Promise-header
+      // assertion. Capture the real append error inside workerd instead.
+      async tryAppend(record, now, runtime = false) {
+        try { return {result: await (runtime ? this.appendRuntime(record, now) : this.append(record, now))}; }
+        catch (error) { return {error: error.message}; }
+      }
+      retention(maxEvents, retentionMs, options = {}) { this.log = createEventLog(this.storageAdapter, {maxEvents, retentionMs, ...options}); }
+      stored() { return this.ctx.storage.sql.exec('SELECT seq, keep FROM events ORDER BY seq').toArray(); }
+      pruneRows(rows, limits) {
+        return this.storageAdapter.transaction(() => {
+          for (const [seq, at, keep] of rows) this.storageAdapter.insert(seq, 'row-' + seq, at, JSON.stringify({seq}), keep);
+          const highest = this.storageAdapter.prune(...limits);
+          return {highest, rows: this.stored(), again: this.storageAdapter.prune(...limits)};
+        });
+      }
     }
     export default worker;`;
   const output = await build({ stdin: { contents, resolveDir: directory, sourcefile: 'runtime-test.mjs' }, bundle: true,
@@ -49,6 +63,128 @@ async function deliver(mf, type, payload, id) {
   } });
 }
 
+const runtimeEvent = (cause) => ({ class: 'runtime', type: 'action-requested', repo: 'o/r', number: 1,
+  head: 'a'.repeat(40), action: 'review', cause, writer: { role: 'decider' } });
+const fact = (id) => ({ id, repo: 'o/r', prs: [1], type: 'pull_request', action: 'opened', sha: 'fact' });
+
+// These cases run worker.mjs's SQL verbatim inside a SQLite Durable Object. The
+// test RPCs expose observations/retention controls; they do not implement SQL pruning.
+it.each([false, true])('SQLite keep schema: legacy=%s, mixed rows survive migration and restart', async (legacy) => {
+  const persist = await mkdtemp(join(tmpdir(), 'pr-keep-migration-'));
+  let mf;
+  try {
+    if (legacy) {
+      mf = await runtime(persist, true);
+      await (await stub(mf)).seed();
+      await mf.dispose();
+    }
+    mf = await runtime(persist);
+    const object = await stub(mf);
+    const head = legacy ? 8 : 0;
+    expect(await object.stored()).toEqual(legacy ? [{ seq: 8, keep: 0 }] : []);
+    const response = await mf.dispatchFetch('http://local/runtime-events', { method: 'POST',
+      headers: { authorization: 'Bearer local-write', 'content-type': 'application/json' },
+      body: JSON.stringify(runtimeEvent(1)) });
+    expect(response.status).toBe(202);
+    expect(await object.append(fact('new-fact'))).toEqual({ seq: head + 2, duplicate: false });
+    const expected = [...(legacy ? [{ seq: 8, keep: 0 }] : []),
+      { seq: head + 1, keep: 1 }, { seq: head + 2, keep: 0 }];
+    expect(await object.stored()).toEqual(expected);
+    await mf.dispose();
+    mf = await runtime(persist);
+    const restarted = await stub(mf);
+    expect(await restarted.stored()).toEqual(expected);
+    expect(await restarted.appendRuntime(runtimeEvent(1))).toEqual({ seq: null, duplicate: true });
+    expect(await restarted.read(head)).toMatchObject({ head: head + 2, gap: false,
+      events: [{ seq: head + 1, class: 'runtime' }, { seq: head + 2, id: 'new-fact' }] });
+  } finally { if (mf) await mf.dispose(); await rm(persist, { recursive: true, force: true }); }
+}, 60000);
+
+it.each([
+  { name: 'empty table', rows: [], limits: [2, 0, 2, 0], kept: [], highest: 0 },
+  { name: 'exact class caps', rows: [[1, 100, false], [2, 100, true], [3, 100, false], [4, 100, true]],
+    limits: [2, 0, 2, 0], kept: [[1, 0], [2, 1], [3, 0], [4, 1]], highest: 0 },
+  { name: 'independent OFFSET caps with interleaved classes',
+    rows: [[1, 100, true], [2, 100, false], [3, 100, true], [4, 100, false], [5, 100, true], [6, 100, false]],
+    limits: [1, 0, 2, 0], kept: [[3, 1], [5, 1], [6, 0]], highest: 4 },
+  { name: 'zero runtime cap preserves facts', rows: [[1, 100, false], [2, 100, true], [3, 100, false], [4, 100, true]],
+    limits: [2, 0, 0, 0], kept: [[1, 0], [3, 0]], highest: 4 },
+  { name: 'age cutoffs are strict and class specific even with unordered timestamps',
+    rows: [[1, 200, false], [2, 100, true], [3, 199, false], [4, 100, false], [5, 99, true], [6, 200, true]],
+    limits: [10, 200, 10, 100], kept: [[1, 0], [2, 1], [6, 1]], highest: 5 },
+  { name: 'age and count predicates combine across both classes',
+    rows: [[1, 300, true], [2, 300, false], [3, 99, true], [4, 199, false], [5, 300, true], [6, 300, false]],
+    limits: [2, 200, 2, 100], kept: [[5, 1], [6, 0]], highest: 4 },
+])('SQLite prune: $name', async ({ rows, limits, kept, highest }) => {
+  const mf = await runtime(false);
+  try {
+    expect(await (await stub(mf)).pruneRows(rows, limits)).toEqual({ highest,
+      rows: kept.map(([seq, keep]) => ({ seq, keep })), again: 0 });
+  } finally { await mf.dispose(); }
+}, 60000);
+
+it('SQLite append persists highest pruned seq and reports holes behind retained runtime rows', async () => {
+  const persist = await mkdtemp(join(tmpdir(), 'pr-runtime-gap-'));
+  let mf;
+  try {
+    mf = await runtime(persist);
+    let object = await stub(mf);
+    await object.retention(1, 1000, { maxRuntimeEvents: 2, runtimeRetentionMs: 1000 });
+    await object.append(fact('one'), 100);
+    await object.appendRuntime(runtimeEvent(2), 101);
+    await object.append(fact('three'), 102);
+    await object.appendRuntime(runtimeEvent(4), 103);
+    await object.append(fact('five'), 104);
+    expect(await object.stored()).toEqual([{ seq: 2, keep: 1 }, { seq: 4, keep: 1 }, { seq: 5, keep: 0 }]);
+    // MIN(seq)=2 cannot reveal the missing fact at 3 to a reader at cursor 2.
+    expect(await object.read(2)).toMatchObject({ head: 5, gap: true, events: [{ seq: 4 }, { seq: 5 }] });
+    expect(await object.read(3)).toMatchObject({ gap: false });
+    await object.retention(1, 1000, { maxRuntimeEvents: 0 });
+    await object.appendRuntime(runtimeEvent(6), 105);
+    expect(await object.stored()).toEqual([{ seq: 5, keep: 0 }]);
+    expect(await object.read(5)).toMatchObject({ head: 6, cursor: 6, gap: true, events: [] });
+    await mf.dispose();
+    mf = await runtime(persist);
+    object = await stub(mf);
+    expect(await object.read(5)).toMatchObject({ head: 6, cursor: 6, gap: true, events: [] });
+    expect(await object.read(6)).toMatchObject({ head: 6, gap: false, events: [] });
+    expect(await object.appendRuntime(runtimeEvent(6), 106)).toEqual({ seq: null, duplicate: true });
+    // A subsequent prune returning zero must not erase the persisted watermark.
+    expect(await object.appendRuntime(runtimeEvent(7), 107)).toEqual({ seq: 7, duplicate: false });
+    expect(await object.read(5)).toMatchObject({ head: 7, gap: true, events: [{ seq: 7 }] });
+  } finally { if (mf) await mf.dispose(); await rm(persist, { recursive: true, force: true }); }
+}, 60000);
+
+it('SQLite runtime rollback restores pruned rows, watermark, head and idempotency before retry', async () => {
+  const mf = await runtime(false);
+  try {
+    const object = await stub(mf);
+    await object.retention(1, 1000, { maxRuntimeEvents: 1, runtimeRetentionMs: 1000 });
+    expect(await object.tryAppend(fact('one'), 100)).toEqual({ result: { seq: 1, duplicate: false } });
+    await object.appendRuntime(runtimeEvent(2), 101);
+    await object.append(fact('three'), 102);
+    const before = await object.read(1);
+    expect(before).toMatchObject({ head: 3, gap: false, events: [{ seq: 2 }, { seq: 3 }] });
+    const retained = [{ seq: 2, keep: 1 }, { seq: 3, keep: 0 }];
+    expect(await object.stored()).toEqual(retained);
+
+    // Runtime projection writes happen AFTER insert/prune/watermark. Failing the
+    // idempotency write must roll back the actual SQL DELETE as well as the INSERT.
+    await object.fault(true);
+    expect(await object.tryAppend(runtimeEvent(4), 103, true))
+      .toEqual({ error: expect.stringContaining('injected projection failure') });
+    expect(await object.stored()).toEqual(retained);
+    expect(await object.read(1)).toEqual(before);
+    await object.fault(false);
+
+    expect(await object.appendRuntime(runtimeEvent(4), 103)).toEqual({ seq: 4, duplicate: false });
+    expect(await object.stored()).toEqual([{ seq: 3, keep: 0 }, { seq: 4, keep: 1 }]);
+    expect(await object.read(1)).toMatchObject({ head: 4, gap: true, events: [{ seq: 3 }, { seq: 4 }] });
+    expect(await object.read(2)).toMatchObject({ gap: false });
+    expect(await object.appendRuntime(runtimeEvent(4), 104)).toEqual({ seq: null, duplicate: true });
+  } finally { await mf.dispose(); }
+}, 60000);
+
 it('SQLite upgrade, rollback, signed observations, restart, count/age pruning and bootstrap race soak', async () => {
   const persist = await mkdtemp(join(tmpdir(), 'pr-ledger-'));
   let mf;
@@ -61,7 +197,8 @@ it('SQLite upgrade, rollback, signed observations, restart, count/age pruning an
       coverage: { partial: true, retainedReplayBoundary: 8, observedSince: 8, bootstrap: [] } });
     const object = await stub(mf);
     await object.fault(true);
-    await expect(object.append({ repo: 'o/r', prs: [1], type: 'pull_request', action: 'synchronize', sha: 'rollback' }, Date.now())).rejects.toThrow();
+    expect(await object.tryAppend({ repo: 'o/r', prs: [1], type: 'pull_request', action: 'synchronize', sha: 'rollback' }, Date.now()))
+      .toEqual({ error: expect.stringContaining('injected projection failure') });
     expect(await read(mf, '?cursor=8')).toMatchObject({ stateCursor: 8, events: [], lastEventAt: null, prs: [{ sha: 'old', seq: 8 }] });
     await object.fault(false);
     await object.retention(3, 1000);
