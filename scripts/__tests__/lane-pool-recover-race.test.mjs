@@ -72,10 +72,10 @@ function backupFiles(dir = join(base, 'backups')) {
 }
 
 describe('acquire default automatic recovery with private IO', () => {
-  it('acquires a recovered lane after the omitted-flag wait expires without starting another scan', () => {
+  it.each(['cached', '--cache-ttl-ms=0', '--cache-ttl-ms=1', '--no-cache'])('acquires a recovered lane after default expiry with %s', (cacheFlag) => {
     const card = join(laneDir, 'backlog', 'new-card.md');
     writeFileSync(card, original);
-    const result = acquire({ LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS: '1500', LANE_POOL_ACQUIRE_DEBUG: '1' }, []);
+    const result = acquire({ LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS: '100', LANE_POOL_ACQUIRE_DEBUG: '1' }, cacheFlag === 'cached' ? [] : [cacheFlag]);
     expect(result.status, result.stderr).toBe(0);
     expect(JSON.parse(result.stdout)).toMatchObject({ lane: 1, path: laneDir });
     expect(result.stderr.match(/auto-recover: reclaimed 1/g)).toHaveLength(1);

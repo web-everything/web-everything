@@ -123,6 +123,21 @@ afterEach(() => {
 });
 
 describe('lane-pool acquire (#3383) — growth-on-empty, bounded by a per-call cap', () => {
+  it.each(['--cache-ttl-ms=0', '--cache-ttl-ms=1', '--no-cache'])(
+    'default expiry with %s still grows from a completed empty scan', (cacheFlag) => {
+      provision(1);
+      leaseLane(1);
+      const r = runPool(['acquire', ...REPO(), '--session=picker', '--growth-max-new=1', '--no-free-list', cacheFlag], {
+        LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS: '100',
+      });
+      expect(r.code, r.err).toBe(0);
+      expect(r.out.trim()).toMatch(/lane-2$/);
+      expect(r.err).toMatch(/growing by up to 1 new lane/);
+      expect(r.err).not.toContain('capacity is unknown');
+      expect(listLanes([])).toEqual([1, 2]);
+    },
+  );
+
   it('a fully-held pool grows by new lanes and acquire succeeds against one of them, instead of failing', () => {
     provision(1);
     leaseLane(1); // the only lane is held — auto-pick has nothing to choose from

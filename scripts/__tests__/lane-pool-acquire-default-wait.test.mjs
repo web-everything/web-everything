@@ -6,6 +6,8 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runInNewContext } from 'node:vm';
+import { pathToFileURL } from 'node:url';
+import { replayAcquireDeadline } from '../conveyor/soak/breaks/lane-acquire-default-wait.mjs';
 
 const SCRIPT = resolve(process.cwd(), 'scripts/lane-pool.mjs');
 // Mirrors the fixed `ACQUIRE_POLL_MS` in `we:scripts/lane-pool.mjs` — the test's own timing budgets are
@@ -78,6 +80,42 @@ describe('default acquire scan startup policy', () => {
   });
 });
 
+describe('acquire deadline integration with private IO', () => {
+  it('a slow reaper does not consume the polling budget or prevent the first scan', async () => {
+    const result = await replayAcquireDeadline({ reaperMs: 60 });
+    expect(result.error).toBeNull();
+    expect(result.scans).toBe(1);
+    expect(result.polls).toBeGreaterThan(0);
+    expect(result.claimed).toBe('/fixture/lane-2');
+  });
+
+  it('a zero default still scans and claims a free lane without polling', async () => {
+    const result = await replayAcquireDeadline({ waitMs: 0, free: true });
+    expect(result.error).toBeNull();
+    expect(result.scans).toBe(1);
+    expect(result.polls).toBe(0);
+    expect(result.claimed).toBe('/fixture/lane-1');
+  });
+
+  it.each([false, true])('an expired uncached rescan preserves completed evidence for recovery=%s', async (recovery) => {
+    const result = await replayAcquireDeadline({ recovery });
+    expect(result.error).toBeNull();
+    expect(result.scans).toBe(1);
+    expect(result.grown).toBe(1);
+    expect(result.recovered).toBe(recovery ? 1 : 0);
+    expect(result.claimed).toBe(`/fixture/lane-${recovery ? 1 : 2}`);
+  });
+
+  it.each(['scanTimeout', 'lockContention'])('never grows or recovers after %s', async (scanFailure) => {
+    const result = await replayAcquireDeadline({ scanFailure, recovery: true });
+    expect(result.error).not.toBeNull();
+    expect(result.claimed).toBeNull();
+    expect(result.grown).toBe(0);
+    expect(result.recovered).toBe(0);
+  });
+});
+
+describe('CLI integration with temporary Git repositories', () => {
 function git(args, cwd) {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
 }
@@ -167,16 +205,59 @@ function expectDefaultWait(result) {
   expect(result.elapsed).toBeLessThan(20_000);
 }
 
+it('env=0 acquires a free lane on the first uncached scan', () => {
+  const provision = runPool(['provision', '--count=1', ...poolArgs()]);
+  expect(provision.code, provision.err).toBe(0);
+  const result = runPool(['acquire', ...poolArgs(), '--session=picker', '--no-free-list', '--cache-ttl-ms=0'], {
+    LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS: '0',
+  });
+  expect(result.code, result.err).toBe(0);
+  expect(result.out.trim()).toMatch(/lane-1$/);
+  expect(result.err.match(/__SCAN_LOCK_HELD_MS__=/g)).toHaveLength(1);
+  expect(pollCount(result)).toBe(0);
+});
+
+it('a slow reaper IO read still allows the first CLI scan to acquire a free lane', () => {
+  fullyHeldPool();
+  const provision = runPool(['provision', '--count=2', ...poolArgs()]);
+  expect(provision.code, provision.err).toBe(0);
+  const preload = join(base, 'slow-reaper.mjs');
+  // Delay one lease read specifically inside the reaper; use the real clock and CLI wiring.
+  writeFileSync(preload, `
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+const read = fs.readFileSync;
+let delayed = false;
+fs.readFileSync = function (...args) {
+  if (!delayed && String(args[0]).endsWith('.lane-lease') && new Error().stack.includes('deadLeasePlan')) {
+    delayed = true;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
+    process.stderr.write('__SLOW_REAPER__=1200\\n');
+  }
+  return read.apply(this, args);
+};
+syncBuiltinESMExports();
+`);
+  const result = runPool(['acquire', ...poolArgs(), '--session=picker', '--no-free-list', '--cache-ttl-ms=0'], {
+    LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS: '1000',
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} --import=${pathToFileURL(preload).href}`,
+  });
+  expect(result.err).toContain('__SLOW_REAPER__=1200');
+  expect(result.code, result.err).toBe(0);
+  expect(result.out.trim()).toMatch(/lane-2$/);
+  expect(result.err.match(/__SCAN_LOCK_HELD_MS__=/g)).toHaveLength(1);
+}, 30_000);
+
 describe('lane-pool acquire default bounded wait', () => {
   beforeEach(fullyHeldPool);
 
-  it('an expired omitted-flag default refuses scan startup with an unknown-capacity diagnosis', () => {
+  it('a zero environment default scans a held pool once and reports known capacity without polling', () => {
     const result = runPool(['acquire', ...poolArgs(), '--session=picker', '--hard-max=1', '--no-free-list', '--cache-ttl-ms=0'], {
       LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS: '0',
     });
     expect(result.code).toBe(1);
-    expect(result.err).toContain('default acquire deadline elapsed before a new acquirability scan could start; capacity is unknown');
-    expect(result.err).not.toContain('__SCAN_LOCK_HELD_MS__');
+    expect(result.err).toContain('no free lane in pool "waitms" (1 all held/dirty)');
+    expect(result.err.match(/__SCAN_LOCK_HELD_MS__=/g)).toHaveLength(1);
     expect(pollCount(result)).toBe(0);
   });
 
@@ -206,8 +287,9 @@ describe('lane-pool acquire default bounded wait', () => {
     }, 30_000,
   );
 
-  it('a valid override or an unset variable prints no fallback warning', () => {
-    const result = exhaustedAcquire(['--wait-ms=0'], { LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS: '1500' });
+  it.each([undefined, '1000'])('omitted --wait-ms with environment %s prints no fallback warning', (value) => {
+    const result = exhaustedAcquire([], value === undefined ? {} : { LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS: value });
     expect(result.err).not.toContain('falling back to 8000ms');
-  });
+  }, 30_000);
+});
 });

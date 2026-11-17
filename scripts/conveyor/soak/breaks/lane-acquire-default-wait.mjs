@@ -14,10 +14,59 @@ import { chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { runInNewContext } from 'node:vm';
 
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..', '..', '..');
 const MARKER = 'scripts/lane-pool.mjs';
 const DEFAULT_WAIT_MS = 2500;
+
+// Exercise the production acquire loop AND cached-scan implementation with private IO. This also
+// runs in a sandbox that forbids spawning the CLI or creating temporary Git repositories.
+export async function replayAcquireDeadline({ waitMs = 30, reaperMs = 0, free = false, recovery = false, scanFailure = null } = {}, root = REPO_ROOT) {
+  const source = readFileSync(join(root, MARKER), 'utf8');
+  const extract = (name) => {
+    const start = source.indexOf(`function ${name}(`);
+    return source.slice(start, source.indexOf('\n}', start) + 2);
+  };
+  const report = { scans: 0, polls: 0, grown: 0, recovered: 0, claimed: null, error: null };
+  const claimed = new Error('fixture claim boundary');
+  const sleep = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  const context = {
+    flags: { 'no-free-list': true }, repo: { name: 'fixture', poolDir: '/fixture' },
+    process: { env: {}, cwd: () => '/caller', stderr: { write() {} } },
+    Date, Set, Number, Math, basename: path => path.split('/').pop(), sep: '/',
+    defaultSession: () => 'picker', ttlMsFromFlags: () => 60_000,
+    reapDeadLeasesInPool: () => sleep(reaperMs), parseScopeFlag: () => [],
+    existingLanes: () => [1], resolveReal: value => value, ownLaneNumber: () => null,
+    acquireDefaultWaitMs: waitMs, acquireDefaultWaitInvalid: false,
+    ACQUIRE_POLL_MS: 1000, LIST_LOCK_ORPHAN_GRACE_MS: 1000,
+    laneDir: (repo, n) => `${repo.poolDir}/lane-${n}`, isHistoryQuarantined: () => false,
+    listScanTimeoutMs: () => 120_000, listCacheTtlMs: () => 0,
+    lastListWasLockPartial: false, lastScanPartial: false,
+    readListCache: () => null, tryTakeListLock: () => true, readLockOwner: () => null,
+    releaseListLock() {}, writeListCache() {},
+    scanAcquirable: () => {
+      report.scans++;
+      if (scanFailure) throw Object.assign(new Error(scanFailure), { [scanFailure]: true });
+      return free ? ['/fixture/lane-1'] : [];
+    },
+    sleepSyncMs: ms => { report.polls++; sleep(ms); }, jitteredDelayMs: ms => ms,
+    tryClaimLane: dir => { report.claimed = dir; throw claimed; },
+    liveRemoteShasProbe: () => ({ ok: true }),
+    growPoolOnEmpty: () => { report.grown++; return recovery ? [] : [2]; },
+    recoveryEnabled: () => recovery, readdirSync: () => ['lane-1'],
+    classifyLaneNames: () => ({ valid: [1], rejected: [] }), acquireHardMaxFor: () => 2,
+    recoverRepoPool: async () => { report.recovered++; return { reclaimed: [1] }; },
+    invalidateListCache() {}, laneAcquirableInfo: () => ({}), isLaneAcquirable: () => true,
+    log() {}, fail: message => { throw new Error(message); },
+  };
+  try {
+    await runInNewContext(`${extract('acquirableListCachedRaw')}\n${extract('acquirableListCached')}\nasync ${extract('cmdAcquire')}\ncmdAcquire(repo)`, context);
+  } catch (error) {
+    if (error !== claimed) report.error = error.message;
+  }
+  return report;
+}
 
 export async function replay(root = REPO_ROOT) {
   const script = join(root, 'scripts', 'lane-pool.mjs');
@@ -61,6 +110,12 @@ export default {
       const report = await replay();
       log?.(JSON.stringify(report));
       const violations = [];
+      for (const options of [{ reaperMs: 60 }, { waitMs: 0, free: true }, {}, { recovery: true }]) {
+        const deadline = await replayAcquireDeadline(options);
+        if (!deadline.claimed || deadline.error || deadline.scans !== 1 || (options.reaperMs && deadline.polls === 0)) {
+          violations.push({ invariant: 'default-deadline-preserves-first-scan-and-fallback', detail: JSON.stringify({ options, ...deadline }) });
+        }
+      }
       if (!report.harness) violations.push({ invariant: 'harness', detail: report.detail || 'pool did not provision' });
       else if (report.code === 0) violations.push({ invariant: 'unexpected-lane', detail: 'acquire returned a lane from a fully held 1-lane pool' });
       else if (report.ms < DEFAULT_WAIT_MS - 500) violations.push({ invariant: 'instant-fail-without-wait-ms', detail: `acquire without --wait-ms gave up after ${report.ms}ms, before the ${DEFAULT_WAIT_MS}ms default wait: ${report.err.replace(/\s+/g, ' ')}` });
