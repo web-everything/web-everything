@@ -57,6 +57,7 @@ export const OBSERVATION_ONLY = Object.freeze({
   "heavy-run-ungated": "Route the named program's runs through heavy admission; never kill the run or raise the cap.",
   "lane-destructive-unpushed": "Possible loss needs recovery judgment; preserve reflogs and do not clean anything.",
   "lane-pool-growth": "Dirty/unleased is not proof of abandoned work; no trim/reset/provision.",
+  "lane-stale-checkout": "Stale pool checkouts are refreshed through the owning lane-pool refresh/reclaim path; the responder never resets, refreshes or reclaims a lane.",
   "lane-worker-without-lease": "A live worker needs ownership investigation, never release or fabricated adoption.",
   "ledger-readiness-regressed": "Report the readiness regression and inspect replay evidence; never promote the ledger, change review authority or relax readiness thresholds from the responder.",
   "live-process-stale-transcript": "Silence does not prove death; owning job watchdog/reaper alone handles the worker.",
