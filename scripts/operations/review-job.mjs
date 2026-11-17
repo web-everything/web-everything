@@ -357,8 +357,10 @@ function fetchPinnedPrHead({ lanePath, repo, pr, head, headChangedError, env, ex
       } catch { throw Error(identityError); }
     }
     const iso = join(configDir, 'iso.git');
-    exec('git', ['init', '--bare', '--quiet', iso], { ...gitOptions, cwd: configDir });
-    const isoOptions = { ...gitOptions, cwd: iso };
+    // An empty template and no inherited template dir: a hostile template must never seed iso.git/config.
+    const { GIT_TEMPLATE_DIR: _template, ...isolatedEnv } = gitOptions.env;
+    exec('git', ['init', '--bare', '--quiet', '--template=', iso], { ...gitOptions, env: isolatedEnv, cwd: configDir });
+    const isoOptions = { ...gitOptions, env: isolatedEnv, cwd: iso };
     const objects = resolve(lanePath, exec('git', ['rev-parse', '--git-path', 'objects'], gitOptions).trim());
     // Git alternates are line-delimited paths. Quote the path using Git's C-style quoting.
     mkdirSync(join(iso, 'objects', 'info'), { recursive: true });

@@ -105,7 +105,9 @@ describe('lane Git hardening', () => {
       expect(() => config('review.fixture')).toThrow();
       expect(options.env.GIT_CONFIG_NOSYSTEM).toBe('1');
       expect(options.env.GIT_CONFIG_SYSTEM).toBe(options.env.GIT_CONFIG_GLOBAL);
-      expect(options.env).toBe(gitCalls[0].options.env);
+      const { GIT_TEMPLATE_DIR: _template, ...templateFree } = gitCalls[0].options.env;
+      expect(options.env).toEqual(args[0] === 'init' || args.includes('index-pack') || /iso\.git$/.test(options.cwd)
+        ? templateFree : gitCalls[0].options.env);
       expect(options.env.GIT_EXTERNAL_DIFF).toBeUndefined();
       expect(options.env.GIT_NO_LAZY_FETCH).toBe('1');
       expect(options.env.REVIEW_FIXTURE_TOKEN).toBe('preserved');
@@ -379,7 +381,7 @@ describe('red-team-only review job', () => {
         ['git', ['config', '--includes', '--name-only', '--get-regexp', '^(fetch|transfer|receive)\\.fsck\\.|^fsck\\.']],
         ['git', ['config', '--show-scope', '--list', '--includes', '-z']],
         ['git', ['remote', 'get-url', 'origin']],
-        ['git', ['init', '--bare', '--quiet', expect.stringMatching(/iso\.git$/)]],
+        ['git', ['init', '--bare', '--quiet', '--template=', expect.stringMatching(/iso\.git$/)]],
         ['git', ['rev-parse', '--git-path', 'objects']],
         ['git', ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}']],
         ['git', ['update-ref', 'refs/haves/lane', head]],
@@ -1159,7 +1161,7 @@ describe('red-team-only review job', () => {
           ['git', ['config', '--includes', '--name-only', '--get-regexp', '^(fetch|transfer|receive)\\.fsck\\.|^fsck\\.']],
           ['git', ['config', '--show-scope', '--list', '--includes', '-z']],
           ['git', ['remote', 'get-url', 'origin']],
-          ['git', ['init', '--bare', '--quiet', expect.stringMatching(/iso\.git$/)]],
+          ['git', ['init', '--bare', '--quiet', '--template=', expect.stringMatching(/iso\.git$/)]],
           ['git', ['rev-parse', '--git-path', 'objects']],
           ['git', ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}']],
           ['git', ['update-ref', 'refs/haves/lane', head]],

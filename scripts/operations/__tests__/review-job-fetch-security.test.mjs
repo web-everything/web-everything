@@ -7,6 +7,10 @@ import { createReviewJobIo } from '../review-job.mjs';
 import { laneGitHardeningEnv } from '../../lib/lane-git-hardening.mjs';
 
 const roots = [], repo = 'plateauapp/plateau-app', pr = 229;
+function expectGitEnv(options, args, env) {
+  const { GIT_TEMPLATE_DIR: _template, ...templateFree } = env;
+  expect(options.env).toEqual(args[0] === 'init' || args.includes('index-pack') || /iso\.git$/.test(options.cwd) ? templateFree : env);
+}
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
 describe.each(['prepareLane', 'fetchRedTeamHead'])('%s fetch command isolation', method => {
@@ -38,7 +42,7 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s fetch command isolation',
     const exec = (file, args, options) => {
       if (file === 'gh') return JSON.stringify({ headRefOid: head });
       isolated ??= options.env;
-      expect(options.env).toBe(isolated);
+      expectGitEnv(options, args, isolated);
       expect(isolated.GIT_CONFIG_GLOBAL).not.toBe(globalConfig);
       expect(isolated.GIT_CONFIG_SYSTEM).toBe(isolated.GIT_CONFIG_GLOBAL);
       expect(isolated.GIT_CONFIG_NOSYSTEM).toBe('1');
@@ -148,7 +152,7 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s fetch command isolation',
       const exec = (file, args, options) => {
         if (file === 'gh') return JSON.stringify({ headRefOid: head });
         isolated ??= options.env;
-        expect(options.env).toBe(isolated);
+        expectGitEnv(options, args, isolated);
         expect(isolated.GIT_CONFIG_GLOBAL).not.toBe(env.GIT_CONFIG_GLOBAL);
         expect(isolated.GIT_CONFIG_SYSTEM).toBe(isolated.GIT_CONFIG_GLOBAL);
         expect(isolated.GIT_CONFIG_NOSYSTEM).toBe('1');
@@ -188,7 +192,7 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s isolated object handoff',
     mkdirSync(lane); mkdirSync(source);
     writeFileSync(join(root, 'ssh'), '#!/bin/sh\nexec git-upload-pack "$REVIEW_TEST_SOURCE"\n', { mode: 0o755 });
     const helper = join(root, 'git-remote-review-marker');
-    writeFileSync(helper, '#!/bin/sh\nprintf contacted > "$REVIEW_HELPER_MARKER"\nexit 1\n', { mode: 0o755 });
+    writeFileSync(helper, '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$REVIEW_HELPER_MARKER"\nexit 1\n', { mode: 0o755 });
     const env = { ...process.env, PATH: `${root}:${process.env.PATH}`, REVIEW_TEST_SOURCE: source,
       REVIEW_HELPER_MARKER: marker, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
     const git = (cwd, args) => execFileSync('git', args, { cwd, env: laneGitHardeningEnv(env),
@@ -209,12 +213,48 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s isolated object handoff',
     const head = git(source, ['rev-parse', 'HEAD']).trim();
     git(source, ['update-ref', `refs/pull/${pr}/head`, head]);
     git(lane, ['remote', 'add', 'origin', `git@github.com:${repo}.git`]);
+    const templatePoison = poison.startsWith('template-');
+    const template = join(root, 'template'), poisonUrl = 'git://template-poison.invalid/';
+    if (templatePoison) {
+      mkdirSync(template);
+      writeFileSync(join(template, 'config'), `[url "${poisonUrl}"]\n\tinsteadOf = git@github.com:\n[core]\n\tgitProxy = ${helper}\n`);
+      if (poison === 'template-env') env.GIT_TEMPLATE_DIR = template;
+      else {
+        env.GIT_CONFIG_GLOBAL = join(root, 'global');
+        writeFileSync(env.GIT_CONFIG_GLOBAL, `[init]\n\ttemplateDir = ${template}\n`);
+      }
+    }
     let iso, networkCalls = 0, packCalls = 0, indexCalls = 0;
     const exec = (file, args, options) => {
       if (file === 'gh') return JSON.stringify({ headRefOid: failure === 'moved-head' ? laneHead : head });
+      if (args[0] === 'init' && templatePoison) {
+        expect(args).toContain('--template=');
+        expect(options.env).not.toHaveProperty('GIT_TEMPLATE_DIR');
+        expect(options.env.GIT_CONFIG_GLOBAL).not.toBe(env.GIT_CONFIG_GLOBAL);
+        expect(readFileSync(options.env.GIT_CONFIG_GLOBAL, 'utf8')).toBe('');
+        // Even a template setting replanted in the isolated global file loses to --template=.
+        if (poison === 'template-global') {
+          writeFileSync(options.env.GIT_CONFIG_GLOBAL, `[init]\n\ttemplateDir = ${template}\n`);
+        }
+        const control = join(root, 'control.git');
+        const controlEnv = { ...options.env, ...(poison === 'template-env' ? { GIT_TEMPLATE_DIR: template } : {}) };
+        execFileSync('git', ['init', '--bare', '--quiet', control], { ...options, env: controlEnv });
+        // The rewrite selects git:// and its proxy helper, which exits before any connection.
+        expect(() => execFileSync('git', ['ls-remote', `git@github.com:${repo}.git`], {
+          ...options, cwd: control, env: controlEnv, stdio: ['ignore', 'pipe', 'pipe'],
+        })).toThrow();
+        expect(readFileSync(marker, 'utf8')).toContain('template-poison.invalid'); rmSync(marker);
+      }
       const output = gitExec(file, args, options);
       if (args[0] === 'init') {
         iso = args.at(-1);
+        if (templatePoison) {
+          if (poison === 'template-global') writeFileSync(options.env.GIT_CONFIG_GLOBAL, '');
+          const config = readFileSync(join(iso, 'config'), 'utf8');
+          expect(config).not.toContain(poisonUrl);
+          expect(config).not.toContain(helper);
+          return output;
+        }
         const included = join(root, 'included');
         let target = ['--local'];
         if (poison === 'worktree') {
@@ -279,7 +319,7 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s isolated object handoff',
     return { run, git, lane, head, marker, counts: () => ({ networkCalls, packCalls, indexCalls }), iso: () => iso };
   }
 
-  it.each(['local', 'worktree', 'includeIf', 'unborn'])('ignores replanted %s config and imports the genuine commit', poison => {
+  it.each(['local', 'worktree', 'includeIf', 'unborn', 'template-env', 'template-global'])('ignores replanted %s config and imports the genuine commit', poison => {
     const f = fixture({ poison });
     expect(f.run()).toEqual({ head: f.head });
     expect(f.git(f.lane, ['rev-parse', '--verify', `${f.head}^{commit}`]).trim()).toBe(f.head);
@@ -374,7 +414,7 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s fsck config validation', 
     const exec = (file, args, options) => {
       calls.push(args);
       if (file === 'gh') return JSON.stringify({ headRefOid: head });
-      expect(options.env).toBe(isolated);
+      expectGitEnv(options, args, isolated);
       if (args[0] === 'config') return '';
       if (args[0] === 'remote') return `git@github.com:${repo}.git`;
       return args.includes('fetch') ? '' : head;
@@ -433,7 +473,7 @@ describe('red-team fetch refusals', () => {
       const exec = (file, args, options) => {
         calls.push(args);
         isolated ??= options.env;
-        expect(options.env).toBe(isolated);
+        expectGitEnv(options, args, isolated);
         expect(readFileSync(isolated.GIT_CONFIG_GLOBAL, 'utf8')).toBe('');
         if (args[0] === 'config') {
           if (failure === 'scrub-failure') throw Error('unreadable config');
@@ -481,7 +521,7 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s canonical repository iden
       if (file === 'gh' && args[0] === 'pr') return JSON.stringify({ headRefOid: head });
       if (args[0] === 'config') { isolated = options.env; configs.push(isolated.GIT_CONFIG_GLOBAL); return ''; }
       expect(options.cwd).toEqual(args.includes('fetch') || args[0] === 'update-ref' || args[1] === 'FETCH_HEAD^{commit}' ? expect.stringMatching(/iso\.git$/) : args[0] === 'init' ? expect.stringMatching(/review-git-config-/) : 'fixture-lane');
-      expect(options.env).toBe(isolated);
+      expectGitEnv(options, args, isolated);
       expect(options).toMatchObject({ timeout: 180_000, maxBuffer: 1024 * 1024 });
       expect(isolated.GIT_CONFIG_NOSYSTEM).toBe('1');
       expect(isolated.GIT_CONFIG_SYSTEM).toBe(isolated.GIT_CONFIG_GLOBAL);
