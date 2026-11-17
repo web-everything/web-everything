@@ -32,7 +32,8 @@
  * `deliver-item-wrapper.mjs`'s own convention) so every export here is unit-testable with no real subprocess.
  */
 import { execFileSync } from 'node:child_process';
-import { claudeSpawnAlias } from '../lib/dispatch-routing-policy.mjs';
+import { resolveAiRouting, aiRoutingInputs } from '../lib/ai-routing.mjs';
+import { claudeSpawnAlias, resolvePolicyModel, resolvePolicyEffort } from '../lib/dispatch-routing-policy.mjs';
 import { mkdirSync, writeFileSync } from 'node:fs';
 
 // #3383 — the delivery-telemetry recorder. Imported here, in the ONE module all six dispatch wrappers share,
@@ -169,9 +170,55 @@ export const RESTRICTED_PROVIDER_TOOLS = 'Bash,Edit,Write,Read,Glob,Grep';
  * delivery whose cwd is the impl lane needs its WE lane (the spec, the `## Progress` bookkeeping) added here or
  * the agent cannot read it. Omitted → argv byte-identical to before.
  */
+/** Shared guard for the four Claude-only helper launchers. Resolve first; validate before launch.
+ * Keep inherited bytes (including omitted flags). Unsupported providers refuse rather than
+ * silently launching a different model. Account selection is deliberately outside this role.
+ */
+export function resolveHelperRouting(current, { env = process.env, resolved, log = console.error } = {}) {
+  resolvePolicyModel('claude', current.model);
+  const lines = [];
+  resolved ??= resolveAiRouting({ env, log: line => lines.push(line) });
+  const { coordinator } = aiRoutingInputs('helper', resolved);
+  if (!coordinator) return current;
+  const report = line => { if (log !== false) { try { log(line); } catch { /* diagnostic only */ } } };
+  for (const line of lines) report(line);
+  report(`policy-cascade · aiRouting.helper: ${JSON.stringify(coordinator)} (${JSON.stringify(
+    Object.fromEntries(Object.entries(resolved.sources ?? {}).filter(([key]) => key.startsWith('helper.coordinator.'))))})`);
+  if (coordinator.provider !== undefined && coordinator.provider !== 'claude') {
+    throw new TypeError(`aiRouting.helper: unsupported provider ${coordinator.provider}; this launcher requires Claude`);
+  }
+  const next = { ...current };
+  // claudeSpawnAlias alone passes unknown values through: validate the catalogue first.
+  const tiers = ['haiku', 'sonnet', 'opus'];
+  const tier = model => tiers.indexOf(claudeSpawnAlias(resolvePolicyModel('claude', model)));
+  if (coordinator.model !== undefined) {
+    const proposed = tier(coordinator.model), floor = tier(current.model);
+    if (proposed < floor) report(`aiRouting.helper: model ${coordinator.model} below current ${current.model}; ignoring lowering override`);
+    else next.model = claudeSpawnAlias(resolvePolicyModel('claude', coordinator.model));
+  }
+  if (coordinator.effort !== undefined) {
+    const efforts = ['low', 'medium', 'high', 'xhigh', 'max'];
+    resolvePolicyEffort('claude', coordinator.effort);
+    if (current.effort === undefined) {
+      report('aiRouting.helper: implicit CLI effort has no proven floor; ignoring effort override');
+    } else {
+      resolvePolicyEffort('claude', current.effort);
+      if (efforts.indexOf(coordinator.effort) < efforts.indexOf(current.effort)) {
+        report(`aiRouting.helper: effort ${coordinator.effort} below current ${current.effort}; ignoring lowering override`);
+      } else next.effort = coordinator.effort;
+    }
+  }
+  // Validate the final model even when only effort/provider was overridden.
+  tier(next.model);
+  return next;
+}
+
 export function buildRestrictedProviderArgv({
   sessionId, prompt, resumeSessionId = null, settingsFile, tools = RESTRICTED_PROVIDER_TOOLS, addDirs = [], model = 'sonnet', effort = 'medium',
+  env = process.env, resolved, log,
 }) {
+  // A resumed session keeps its existing model and effort; no routing flags are emitted.
+  if (!resumeSessionId) ({ model, effort } = resolveHelperRouting({ model, effort }, { env, resolved, log }));
   const RESTRICTED_FLAGS = [
     '--restricted', '--tools', tools, '--strict-mcp-config',
     '--disable-slash-commands', '--settings', settingsFile,

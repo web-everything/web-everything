@@ -22,6 +22,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { redact } from './coroner-transcripts.mjs';
+import { resolveHelperRouting } from './minimal-context-provider.mjs';
 import { modelSetting } from '../lib/model-settings.mjs';
 
 export const KNOB = 'coroner.sampleSize';
@@ -243,10 +244,11 @@ export function appendRankingRow(file, row, { io = fs } = {}) {
 
 // ---------------------------------------------------------------------------------------------------------------
 // The real summariser: tool-free headless Claude via the repo's judge helper, `--json-schema` enforced.
-export async function makeSummariser(knobs, { runId } = {}) {
-  const { judgeSpawn } = await import('../lib/judge-spawn.mjs');
+export async function makeSummariser(knobs, { runId, env = process.env, resolved, log, spawn } = {}) {
+  const { model, effort } = resolveHelperRouting({ model: knobs.model, effort: knobs.effort }, { env, resolved, log });
+  const judgeSpawn = spawn ?? (await import('../lib/judge-spawn.mjs')).judgeSpawn;
   return async (rec) => {
-    const r = await judgeSpawn({ mandate: MANDATE, input: sessionInput(rec), shape: SAMPLE_SHAPE, model: knobs.model, effort: knobs.effort, budget: knobs.budgetUsd, runId: runId ?? 'coroner-sample', lens: String(rec.session) });
+    const r = await judgeSpawn({ mandate: MANDATE, input: sessionInput(rec), shape: SAMPLE_SHAPE, model, effort, budget: knobs.budgetUsd, runId: runId ?? 'coroner-sample', lens: String(rec.session) });
     return { value: r.value, costUsd: r.costUsd };
   };
 }
@@ -267,7 +269,7 @@ export async function main(argv, { env = process.env, home = homedir(), now = ()
   const state = replay(readRankingRows(file), knobs);
   const { collectInputs } = await import('./coroner-extract.mjs');
   const inputs = collectInputs({ since: new Date(since).toISOString(), until: new Date(until).toISOString() }, { env, home, gh: null });
-  const report = await runSample({ records: sessionRecords(inputs), n: state.n, knobs, summarise: summarise ?? await makeSummariser(knobs, { runId: `coroner-sample-${until}` }) });
+  const report = await runSample({ records: sessionRecords(inputs), n: state.n, knobs, summarise: summarise ?? await makeSummariser(knobs, { runId: `coroner-sample-${until}`, env }) });
   const top = report.top.map((t) => t.kind);
   const next = top.length ? step(state, top, knobs) : state;
   const out = { knob: KNOB, window: { since, until }, ...report, stability: { before: state, after: next, stableRuns: knobs.stableRuns, floor: knobs.floor, largeN: knobs.sampleSize }, store: file };

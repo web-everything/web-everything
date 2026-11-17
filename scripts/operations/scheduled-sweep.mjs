@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolveHelperRouting } from './minimal-context-provider.mjs';
 /**
  * @file scripts/operations/scheduled-sweep.mjs
  * @description Card 106 — durable schedules. The PR movement sweep, the coroner sweep and the Opus sweep as
@@ -276,17 +277,18 @@ export function runCoronerJob({ env, dryRun, now = Date.now(), spawn = spawnSync
  * built-in set is restricted with `--restricted --tools`, the mutating/networked tools are denied by name as a
  * second wall, user/project settings are ignored (`--restricted`) and the permission mode is pinned to default.
  */
-export function opusCommand() {
+export function opusCommand({ env = process.env, resolved, log } = {}) {
+  const { model } = resolveHelperRouting({ model: 'opus' }, { env, resolved, log });
   return {
     cmd: 'claude',
-    args: ['-p', '--model', 'opus', '--restricted', '--tools', 'Read,Grep,Glob',
+    args: ['-p', '--model', model, '--restricted', '--tools', 'Read,Grep,Glob',
       '--allowedTools', 'Read,Grep,Glob', '--disallowedTools', 'Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch',
       '--permission-mode', 'default', '--strict-mcp-config', '--no-session-persistence', '--max-budget-usd', '5', '--add-dir', REPO_ROOT],
     briefPath: join(REPO_ROOT, 'skills-src/conveyor/opus-sweep-brief.md'),
   };
 }
-function runOpus({ dryRun }) {
-  const { cmd, args, briefPath } = opusCommand();
+function runOpus({ dryRun, env }) {
+  const { cmd, args, briefPath } = opusCommand({ env });
   if (dryRun) return { attention: [], sections: [{ title: 'Would run', lines: [`${cmd} ${args.join(' ')} < ${briefPath}`] }] };
   const r = spawnSync(cmd, args, { input: readFileSync(briefPath, 'utf8'), encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 30 * MIN, cwd: REPO_ROOT });
   if (r.status !== 0) return { attention: [`opus sweep failed (exit ${r.status}): ${r.error?.message ?? String(r.stderr ?? '').split('\n')[0]}`], sections: [] };

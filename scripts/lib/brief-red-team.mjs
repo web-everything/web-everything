@@ -3,7 +3,9 @@ import { openSync, fstatSync, readSync, closeSync, constants } from 'node:fs';
 import { isGuardPath } from './round-judge.mjs';
 import { readSettings } from './settings-files.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
-import { judgeSpawn } from './judge-spawn.mjs';
+import { resolveHelperRouting } from '../operations/minimal-context-provider.mjs';
+import { resolveClaudeHelperRoute } from './claude-helper-route.mjs';
+import { DEFAULT_EFFORT, judgeSpawn } from './judge-spawn.mjs';
 import { fenceUntrusted, FENCED_DATA_RULE } from './mandate-fence.mjs';
 
 const DEFAULTS = Object.freeze({ enabled: true, timeoutMs: 120000, maxClasses: 6 });
@@ -79,18 +81,23 @@ const SHAPE = {
   } } },
 };
 
-async function defaultRun({ files, prep, acceptance, policy, log }) {
-  const result = await judgeSpawn({
+export async function defaultRun({ files, prep, acceptance, policy, log, env = process.env, resolved, spawn = judgeSpawn }) {
+  const current = { model: resolveClaudeHelperRoute({ env, log: false }).model, effort: DEFAULT_EFFORT };
+  const route = resolveHelperRouting(current, { env, resolved, log });
+  const result = await spawn({
     mandate: `Find adversarial attack classes against the supplied prep and acceptance. Each class must have a concrete test. Return only {classes:[{attack,test}]}, at most ${policy.maxClasses} classes. You have no tools.\n${FENCED_DATA_RULE}`,
     input: fenceUntrusted('material', JSON.stringify({ files, prep, acceptance })),
     shape: SHAPE, allowedTools: null, runId: 'brief-red-team', timeoutMs: policy.timeoutMs,
     retries: 0, log,
+    // Omit inherited pins so judgeSpawn retains its exact existing defaults.
+    ...(route.model !== current.model ? { model: route.model } : {}),
+    ...(route.effort !== DEFAULT_EFFORT ? { effort: route.effort } : {}),
   });
   return result.value;
 }
 
 export async function redTeamBrief({ files = [], prep = '', acceptance = '', policy,
-  run = defaultRun, log = () => {} } = {}) {
+  run = defaultRun, log = () => {}, env = process.env, resolved } = {}) {
   let timer;
   try {
     policy = { ...DEFAULTS, ...select(policy ?? readBriefRedTeamPolicy()) };
@@ -99,7 +106,7 @@ export async function redTeamBrief({ files = [], prep = '', acceptance = '', pol
     if (!policy.enabled) return skipped('disabled');
     if (![prep, acceptance].some(text => typeof text === 'string' && text.trim())) return skipped('no prep or acceptance text');
     const result = await Promise.race([
-      Promise.resolve().then(() => run({ files, prep, acceptance, policy, log })),
+      Promise.resolve().then(() => run({ files, prep, acceptance, policy, log, env, resolved })),
       new Promise((_, reject) => {
         timer = setTimeout(() => reject(new Error('timed out')), policy.timeoutMs);
       }),
