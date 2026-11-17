@@ -770,6 +770,56 @@ it('inherits the same scenario after whitespace normalization and cited-line dri
 describe('summary canonicalization strips only whitespace and line-location tokens (R952)', () => {
   const fp = summary => findingFingerprint({ file: 'scripts/x.mjs', summary, category: 'edge-case', confirmed: true, impact: 'broken' });
   it.each([
+    ['bare identifier', 'Reject key L1.', 'Reject key L2.'],
+    ['single-quoted identifier', "Reject key 'L1'.", "Reject key 'L2'."],
+    ['double-quoted identifier', 'Reject key "L1".', 'Reject key "L2".'],
+    ['backticked identifier', 'Reject key `L1`.', 'Reject key `L2`.'],
+    ['bare compact location-like token', 'Parser drops input at L10', 'Parser drops input at L11'],
+    ['ambiguous spaced L', 'Reject key L 12.', 'Reject key L 40.'],
+    ['ambiguous line prose', 'Reject key line 12.', 'Reject key line 40.'],
+    ['quoted line', "Reject key 'line 12'.", "Reject key 'line 40'."],
+    ['backticked citation', 'Reject `at line 12`.', 'Reject `at line 40`.'],
+    ['quoted own-path citation', 'Reject "scripts/x.mjs line 12".', 'Reject "scripts/x.mjs line 40".'],
+    ['escaped quotes', 'Reject \\"at line 12\\".', 'Reject \\"at line 40\\".'],
+    ['Unicode quotes', 'Reject “at line 12”.', 'Reject “at line 40”.'],
+    ['modifier apostrophes', 'Reject ʼ at line 12 ʼ.', 'Reject ʼ at line 40 ʼ.'],
+    ['encoded quotes', 'Reject &quot; at line 12 &quot;.', 'Reject &quot; at line 40 &quot;.'],
+    ['encoded backticks', 'Reject %60 at line 12 %60.', 'Reject %60 at line 40 %60.'],
+    ['unclosed quote', 'Reject `at line 12', 'Reject `at line 40'],
+    ['code expression', 'Reject fn(at line 12).', 'Reject fn(at line 40).'],
+    ['tilde code fence', '~~~\nat line 12\n~~~', '~~~\nat line 40\n~~~'],
+    ['HTML code', '<code> at line 12 </code>', '<code> at line 40 </code>'],
+    ['concatenation', 'Reject key=at line 12', 'Reject key=at line 40'],
+    ['option prefix', '--at line 12', '--at line 40'],
+    ['another file', 'scripts/other.mjs L 12', 'scripts/other.mjs L 40'],
+    ['parent path', '../scripts/x.mjs L 12', '../scripts/x.mjs L 40'],
+    ['URL path', 'https://host/scripts/x.mjs L 12', 'https://host/scripts/x.mjs L 40'],
+    ['NFKC lookalike', 'at ｌｉｎｅ 12', 'at ｌｉｎｅ 40'],
+    ['decimal suffix', 'Parser drops input at line 1.2', 'Parser drops input at line 2.2'],
+    ['invisible prefix', 'Parser drops input at \u200bline 12', 'Parser drops input at \u200bline 40'],
+    ['over-long quoted line', `${'a'.repeat(2100)} 'at line 12'`, `${'a'.repeat(2100)} 'at line 40'`],
+    ['over-long citation', `${'a'.repeat(2100)} at line 12`, `${'a'.repeat(2100)} at line 40`],
+  ])('preserves uncertain or literal line digits: %s', (_name, a, b) => {
+    expect(fp(a)).not.toBeNull();
+    expect(fp(a)).not.toBe(fp(b));
+  });
+  it.each([
+    ["Reject key 'L1'.", "Reject key 'L2'.", false],
+    ['Parser drops input at line 12', 'Parser drops input at line 40', true],
+  ])('binds line-token changes through parsed card carry: %s → %s', (before, after, carries) => {
+    const fresh = (head, summary, at) => bot(renderRedTeamComment({ pr: P, rev: head,
+      provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+      findings: [{ ...F(159, 'broken'), summary }] }), at);
+    const source = fresh(H, before, result.created_at);
+    const next = fresh(N, after, '2026-10-21T21:00:00Z');
+    const id = liveResultGateState([source], P, H).resultId;
+    const comments = [source, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z', id), next];
+    const d = readRedTeamDisposition({ comments, pr: P, head: N, setting: CONFIRMED_BREAKS_DEFAULTS,
+      operatorRulings: { anyState: true }, sealed: null });
+    expect(d.dispositions.get(1).state === 'released carded').toBe(carries);
+    expect(held(d)).toEqual(carries ? [] : [1]);
+  });
+  it.each([
     ['https port', 'Probe hits https://api.example.com:443/v1 and fails', 'Probe hits https://api.example.com:8443/v1 and fails'],
     ['bare host port', 'Connects to api.example.com:443 and fails', 'Connects to api.example.com:8443 and fails'],
     ['localhost port', 'Binds localhost:8080 twice', 'Binds localhost:9090 twice'],
@@ -791,7 +841,13 @@ describe('summary canonicalization strips only whitespace and line-location toke
   });
   it.each([
     ['line N', 'Parser drops input at line 10', 'Parser drops input at line 11'],
-    ['L N', 'Parser drops input at L10', 'Parser drops input at L 11'],
+    ['line 12 to line 40 citation', 'Parser drops input at line 12', 'Parser drops input at line 40'],
+    ['leading line citation', 'line 12: Parser drops input', 'line 40: Parser drops input'],
+    ['newline citation', 'Parser drops input at line\n12', 'Parser drops input at line\n40'],
+    ['CR citation', 'Parser drops input at line\r12', 'Parser drops input at line\r40'],
+    ['Unicode separator citation', 'Parser drops input at line\u202812', 'Parser drops input at line\u202840'],
+    ['own path line N', 'Parser drops input at scripts/x.mjs line 12', 'Parser drops input at scripts/x.mjs line 40'],
+    ['own path L N', 'Parser drops input at scripts/x.mjs L 12', 'Parser drops input at scripts/x.mjs L 40'],
     ['file:line', 'Parser drops input at scripts/parser.mjs:10', 'Parser drops input at scripts/parser.mjs:20'],
     ['backtick file:line', 'Parser drops input at `scripts/parser.mjs:10`', 'Parser drops input at `scripts/parser.mjs:20`'],
     ['quoted file:line', 'Parser drops input at "scripts/parser.mjs:10"', 'Parser drops input at "scripts/parser.mjs:20"'],

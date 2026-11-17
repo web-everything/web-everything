@@ -885,11 +885,15 @@ export function redTeamBreaksAgree({ comments, pr, head, breaks } = {}) {
 }
 
 const collapseWhitespace = value => String(value ?? '').replace(/\s+/g, ' ').trim();
-// A cited location is `line N` / `L N`, or `:N[:M]` right after a FILE PATH. Fail closed on what a path is:
+// A cited location is plain `at line N`, `line N` at the start, `line N` / `L N` after the finding's file,
+// or `:N[:M]` right after a FILE PATH. Fail closed on what a path is:
 // a token with a directory separator that is not inside a URL, or a bare `name.ext` that IS the finding's own file.
 // Any other `host.tld:443` (`example.md`, `deploy.sh` are real TLDs/names too) keeps its number.
 const PATH_COLON_LOCATION = /((?:[\w.@~+-]+\/)*[\w@~+-][\w.@~+-]*\.[a-z0-9]{1,8})(:\d+(?::\d+)*)(?=\b)/gi;
-const LINE_WORD_LOCATION = /\b(?:line|L)\s*\d+\b/gi;
+const LINE_WORD_LOCATION = /\b(line|L) +\d+(?=$|[ ,;)]|[.:](?: |$))/gi;
+// Do not guess where code/quotes end (including unmatched, escaped or Unicode quotes).
+// Conservatively retain word-style locations throughout such a summary; explicit path:line handling is separate.
+const AMBIGUOUS_LINE_CONTEXT = /[\p{Quotation_Mark}\p{Cf}\u02bb\u02bc`~\\()[\]{}<>&%]/u;
 const SUMMARY_PATH_SCAN_MAX = 2000;
 const SOURCE_PATH_EXT = /\.(?:mjs|cjs|js|jsx|mts|cts|ts|tsx|json|jsonc|md|mdx|ya?ml|toml|html?|css|scss|vue|svelte|sh|bash|py|rb|go|rs|java|kt|swift|c|h|cc|cpp|hpp|cs|php|sql|txt)$/i;
 /**
@@ -898,11 +902,12 @@ const SOURCE_PATH_EXT = /\.(?:mjs|cjs|js|jsx|mts|cts|ts|tsx|json|jsonc|md|mdx|ya
  * snippet is a different finding. `file` is the finding's own file, so a bare `name.ext:N` citing it is a location. PURE.
  */
 export function summaryCanonical(summary, file = '') {
-  const own = String(file ?? '').replace(/`/g, '').replace(/\\/g, '/').replace(/:\d+(?::\d+)?$/, '').split('/').pop().toLowerCase();
+  const ownPath = String(file ?? '').replace(/`/g, '').replace(/\\/g, '/').replace(/:\d+(?::\d+)?$/, '');
+  const own = ownPath.split('/').pop().toLowerCase();
   const text = collapseWhitespace(summary);
   // The path scan backtracks quadratically on a long run of path characters; an over-long summary (a published one is
-  // capped at 600) keeps its path citations as written, so a drifted `:N` re-holds instead of stalling the gate.
-  if (text.length > SUMMARY_PATH_SCAN_MAX) return text.replace(LINE_WORD_LOCATION, '#');
+  // capped at 600) keeps all citations as written, so a drifted location re-holds instead of stalling the gate.
+  if (text.length > SUMMARY_PATH_SCAN_MAX) return text;
   return text
     .replace(PATH_COLON_LOCATION, (match, path, _location, offset) => {
       // A URL's own path is not a source file reference. Look throughout the prefix so
@@ -913,7 +918,15 @@ export function summaryCanonical(summary, file = '') {
       const repoPath = path.includes('/') && SOURCE_PATH_EXT.test(path) && !/^[^/.]+\.[^/]+\//.test(path);
       return repoPath || (own && path.toLowerCase() === own) ? `${path}#` : match;
     })
-    .replace(LINE_WORD_LOCATION, '#');
+    .replace(LINE_WORD_LOCATION, (match, word, offset, input) => {
+      if (AMBIGUOUS_LINE_CONTEXT.test(text)) return match;
+      const prefix = input.slice(0, offset);
+      const previousToken = prefix.trimEnd().split(' ').at(-1);
+      // Require a separate, exact file token. A suffix of a URL or another file is not evidence.
+      const afterOwnPath = ownPath && prefix.endsWith(' ') && previousToken === ownPath;
+      const plainLineCitation = word.toLowerCase() === 'line' && (offset === 0 || /(?:^| )at $/i.test(prefix));
+      return afterOwnPath || plainLineCitation ? '#' : match;
+    });
 }
 
 /**
