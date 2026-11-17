@@ -5,7 +5,7 @@ import { createReviewJobIo, dispatchReviewJob, runReviewJobCli, writeJobRecord }
 import { readReviewJobRetry, writeReviewJobRetry, rearmReviewJobRetry, settleReviewJobRetry } from '../review-job-retry.mjs';
 import { tryReadCompletion } from '../completion-store.mjs';
 import { writeReviewJobDone, writeReviewJobStarted } from '../review-job-envelope.mjs';
-import { laneGitHardeningEnv } from '../../lib/lane-git-hardening.mjs';
+import { laneGitHardeningEnv, scrubGitRepoEnv } from '../../lib/lane-git-hardening.mjs';
 
 const head = 'a'.repeat(40), repo = 'plateauapp/plateau-app', pr = 229;
 const roots = [];
@@ -26,36 +26,53 @@ function fixture(overrides = {}) {
 }
 
 describe('private review lane fetch', () => {
-  function lane({ originFails = false, fallbackFails = false, fetched = head, originRepo = repo } = {}) {
+  function lane({ originFails = false, fallbackFails = false, fetched = head, originRepo = repo, env = {} } = {}) {
     const exec = vi.fn((file, args) => {
       if (file === 'gh') return JSON.stringify({ headRefOid: head });
+      if (args[0] === 'config') return '';
       if (args[0] === 'remote') return `git@github.com:${originRepo}.git`;
-      if (args[0] === 'fetch') {
-        if ((args[2] === 'origin' && originFails) || (args[2] !== 'origin' && fallbackFails)) throw Error('transport failed');
+      if (args.includes('fetch')) {
+        if ((args[5].startsWith('git@') && originFails) || (args[5].startsWith('https:') && fallbackFails)) throw Error('transport failed');
         return '';
       }
       if (args[0] === 'rev-parse') return fetched;
       throw Error('unexpected command');
     });
-    return { exec, prepare: () => createReviewJobIo({ exec, env: {} }).prepareLane({ pr, repo, lanePath: '/lane' }) };
+    return { exec, prepare: () => createReviewJobIo({ exec, env }).prepareLane({ pr, repo, lanePath: '/lane' }) };
   }
-  it('uses the SSH origin first and retains every hardening pin', () => {
-    const f = lane(); expect(f.prepare()).toEqual({ head });
+  it('uses the explicit SSH repository URL first and retains every hardening pin', () => {
+    const env = { GIT_REF_PARANOIA: '0', GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'core.fsmonitor', GIT_CONFIG_VALUE_0: 'lane-owned-command' };
+    const f = lane({ env }); expect(f.prepare()).toEqual({ head });
     const calls = f.exec.mock.calls.filter(([file]) => file === 'git');
-    expect(calls.filter(([, args]) => args[0] === 'fetch').map(([, args]) => args[2])).toEqual(['origin']);
-    for (const [, , options] of calls) expect(options.env).toEqual(laneGitHardeningEnv({}));
+    expect(calls.filter(([, args]) => args.includes('fetch')).map(([, args]) => args)).toEqual([
+      ['-c', 'protocol.ext.allow=never', 'fetch', '--upload-pack=git-upload-pack', '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`],
+    ]);
+    for (const [, args, options] of calls) {
+      // The scrub must see the actual lane config; fetch retains the standard hardening semantics.
+      expect(options.env).toEqual(laneGitHardeningEnv(args[0] === 'config' ? scrubGitRepoEnv(env) : env));
+    }
   });
-  it('uses HTTPS only after origin transport fails, still checks FETCH_HEAD', () => {
+  it('uses equally restricted HTTPS only after SSH transport fails, still checks FETCH_HEAD', () => {
     const f = lane({ originFails: true }); expect(f.prepare()).toEqual({ head });
-    expect(f.exec.mock.calls.filter(([, args]) => args[0] === 'fetch').map(([, args]) => args[2]))
-      .toEqual(['origin', `https://github.com/${repo}.git`]);
+    expect(f.exec.mock.calls.filter(([, args]) => args.includes('fetch')).map(([, args]) => args))
+      .toEqual([`git@github.com:${repo}.git`, `https://github.com/${repo}.git`].map(url =>
+        ['-c', 'protocol.ext.allow=never', 'fetch', '--upload-pack=git-upload-pack', '--no-tags', url, `refs/pull/${pr}/head`]));
+    for (const [, , options] of f.exec.mock.calls.filter(([, args]) => args.includes('fetch'))) {
+      expect(options.env).toEqual(laneGitHardeningEnv({}));
+    }
     expect(() => lane({ originFails: true, fetched: 'b'.repeat(40) }).prepare()).toThrow(/head changed/);
     expect(() => lane({ originFails: true, fallbackFails: true }).prepare()).toThrow(/transport failed/);
   });
   it('refuses a lane from another repository before either fetch', () => {
     const f = lane({ originRepo: 'web-everything/web-everything' });
     expect(f.prepare).toThrow(/repository mismatch/);
-    expect(f.exec.mock.calls.some(([, args]) => args[0] === 'fetch')).toBe(false);
+    expect(f.exec.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(false);
+  });
+  it('refuses an invalid repository argument before executing commands', () => {
+    const exec = vi.fn();
+    expect(() => createReviewJobIo({ exec }).prepareLane({ pr, repo: 'ext::lane-command', lanePath: '/lane' })).toThrow(/invalid review repository/);
+    expect(exec).not.toHaveBeenCalled();
   });
 });
 

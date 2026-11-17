@@ -4435,3 +4435,10 @@ process's started record before handler installation and compares its bytes afte
 The lifecycle receipt for red-team-only jobs is separate so it cannot replace a panel verdict.
 The operation retry/lifecycle suites and conveyor retry regression cover repeated ticks, pruning,
 missing records, early claim/import failure, explicit re-arm, and healthy WE review dispatch.
+
+Review lane setup reuses `scrubRiskyLaneConfig` before fetching. Retained `origin.uploadpack` and
+`origin.vcs` must never select a command: fetch the validated repository's explicit SSH URL, then
+HTTPS on transport failure, with the lane-pool transport pins (`protocol.ext.allow=never` and
+`--upload-pack=git-upload-pack`). `review-job-fetch-security.test.mjs` uses real local repositories
+and marker-writing helpers, proves the hostile fixtures execute through a remote-name fetch,
+then exercises both production URL paths without networking and verifies the marker stays absent.

@@ -81,14 +81,15 @@ describe('lane Git hardening', () => {
     const exec = (file, args, options) => {
       calls.push({ file, args, options });
       if (file === 'gh') return JSON.stringify({ headRefOid: head });
+      if (args[0] === 'config') return '';
       if (args[0] === 'remote') return `git@github.com:${repo}.git`;
       return args.includes('fetch') ? '' : `${head}\n`;
     };
     const io = createReviewJobIo({ env, exec });
     expect(io[method]({ lanePath: '/lanes/lane-7', repo, pr, head })).toEqual({ head });
     const gitCalls = calls.filter(call => call.file === 'git');
-    expect(gitCalls).toHaveLength(3);
-    for (const { options } of gitCalls) {
+    expect(gitCalls).toHaveLength(method === 'prepareLane' ? 4 : 3);
+    for (const { args, options } of gitCalls) {
       // Read Git's effective configuration, not just our helper's object shape.
       // This executes no fetch, callback, or repository write.
       const config = key => execFileSync('git', ['config', '--get', key], {
@@ -97,7 +98,8 @@ describe('lane Git hardening', () => {
       expect(config('core.alternateRefsCommand')).toBe('true');
       expect(config('core.fsmonitor')).toBe('false');
       expect(config('core.hooksPath')).toBe('/dev/null');
-      expect(config('review.fixture')).toBe('preserved');
+      if (args[0] === 'config') expect(options.env.GIT_CONFIG_VALUE_1).not.toBe('preserved');
+      else expect(config('review.fixture')).toBe('preserved');
       expect(options.env.GIT_EXTERNAL_DIFF).toBeUndefined();
       expect(options.env.GIT_NO_LAZY_FETCH).toBe('1');
       expect(options.env.REVIEW_FIXTURE_TOKEN).toBe('preserved');
@@ -1105,8 +1107,9 @@ describe('red-team-only review job', () => {
         expect(options.maxBuffer).toBe(1024 * 1024);
         if (kind === 'oversized-output') throw Object.assign(Error('output exceeded maxBuffer'), { code: 'ENOBUFS' });
         if (file === 'gh') return JSON.stringify({ headRefOid: kind === 'missing-head' ? null : head });
+        if (argv[0] === 'config') return '';
         if (argv[0] === 'remote') return `git@github.com:${repo}.git`;
-        if (argv[0] === 'fetch') {
+        if (argv.includes('fetch')) {
           if (kind === 'fetch-error') throw Error('not our ref');
           return '';
         }
@@ -1122,8 +1125,9 @@ describe('red-team-only review job', () => {
       if (kind === 'ok') {
         expect(calls).toEqual([
           ['gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid']],
+          ['git', ['config', '--show-scope', '--list', '--includes', '-z']],
           ['git', ['remote', 'get-url', 'origin']],
-          ['git', ['fetch', '--no-tags', 'origin', `refs/pull/${pr}/head`]],
+          ['git', ['-c', 'protocol.ext.allow=never', 'fetch', '--upload-pack=git-upload-pack', '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`]],
           ['git', ['rev-parse', 'FETCH_HEAD^{commit}']], ['red-team'],
         ]);
         expect(out.redTeam.status).toBe('ran');
