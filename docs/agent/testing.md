@@ -4419,3 +4419,9 @@ Any scrub read/removal failure refuses fetching and records an infrastructure fa
 lane inspection/repair. Only the scrubber's intentionally retained exact origin keys are exempt.
 SSH transport failure surfaces directly; there is no HTTPS fallback. The job suites
 cover unreadable/oversized config, inherited global and lane URL rewrites, no fallback, and terminal failure labels.
+Operator prototype-load waiver tests live in `scripts/operations/__tests__/ruled-weakened-store.test.mjs`.
+Use an injected HOME and filesystem: the append-only ops store lives under
+`~/workspace/.operations/coordination/ruled-weakened.jsonl`. Tool, platform, then ops entries
+share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
+The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
+`--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.

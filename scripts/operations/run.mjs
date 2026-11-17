@@ -23,6 +23,8 @@
  * derived from the declaration — including which operations have a juror to point at a lane at all.
  */
 
+import { appendEntry } from './ruled-weakened-store.mjs';
+import { ruledWeakenedAddOperation, RULED_WEAKENED_ADD_OP, RULED_WEAKENED_ADD_EFFECT, finishRuledWeakenedAdd } from './ruled-weakened-add.mjs';
 import { OPERATOR_OVERRIDE_OPS, OPERATOR_OVERRIDE_EFFECT, operatorOverrideOperation } from './operator-override.mjs';
 import { lastOverrideReason, readOperatorOverrides, writeOperatorOverride, clearOperatorOverride } from '../lib/operator-override-store.mjs';
 import { aiRoutingOperation, AI_ROUTING_OP, finishAiRouting } from './ai-routing.mjs';
@@ -241,6 +243,8 @@ export function finishCodexAudit({ run, code, lines, json }) {
 
 
 export const CLI_ONLY_OPERATIONS = Object.freeze({
+  [RULED_WEAKENED_ADD_OP]: () => ({ declaration: ruledWeakenedAddOperation(),
+    sinks: { [RULED_WEAKENED_ADD_EFFECT]: entry => appendEntry(entry) }, finish: finishRuledWeakenedAdd }),
   ...Object.fromEntries(OPERATOR_OVERRIDE_OPS.filter(name => name !== 'operator-override-show').map(name => [name, () => ({
     declaration: operatorOverrideOperation(name, { readOverrides: () => readOperatorOverrides() }),
     sinks: {
