@@ -2826,7 +2826,8 @@ describe('detached jobs', () => {
     expect(launcher.status, launcher.stderr).toBe(0);
     const job = readJobRecord(JSON.parse(launcher.stdout).id, { jobsDir });
     try {
-      expect(job).toMatchObject(metadata);
+      // The launcher never reads a --task-file; the worker fills sha/head in once it starts.
+      expect(job).toMatchObject(taskFromFile ? { taskFile: metadata.taskFile } : metadata);
       const outcome = await waitForJob({ jobId: job.id, jobsDir, maxMs: 10000 });
       expect(outcome, JSON.stringify(outcome)).toMatchObject({
         status: runCode === 0 ? 'done' : 'failed', exitCode: runCode, code: runCode,
