@@ -97,7 +97,7 @@ export function isAcceptedQuestionHash(hash, { priorQuestionHashes = [], now = D
  * prior question hash qualify only while inside their window; a prior WEAKENED is returned (and so blocks). */
 export function findAudit(records, { head, base, questionHash, priorQuestionHashes = resolvePriorQuestionHashes(), now = Date.now() }) {
   if (typeof base !== 'string' || typeof head !== 'string' || !SHA.test(base) || !SHA.test(head) || questionHash !== QUESTION_HASH) return null;
-  let latest = null, latestOpen = null, prior = null, sawCurrent = false;
+  let latest = null, latestOpen = null, prior = null, priorOpen = null, sawCurrent = false;
   for (const record of records) {
     if (record?.head !== head || record.base !== base) continue;
     const isCurrent = record.questionHash === QUESTION_HASH;
@@ -110,13 +110,17 @@ export function findAudit(records, { head, base, questionHash, priorQuestionHash
       ...(Array.isArray(record.followUps) ? record.followUps.map(line => `FOLLOW-UP: ${line}`) : []),
     ])) continue;
     if (isCurrent && record.scope !== 'invariants' && (!latestOpen || Date.parse(record.at) >= Date.parse(latestOpen.at))) latestOpen = record;
+    if (!isCurrent && record.scope !== 'invariants' && (!priorOpen || Date.parse(record.at) >= Date.parse(priorOpen.at))) priorOpen = record;
     if (isCurrent && (!latest || Date.parse(record.at) >= Date.parse(latest.at))) latest = record;
     if (!isCurrent && (!prior || Date.parse(record.at) >= Date.parse(prior.at))) prior = record;
   }
-  // A current-question record always decides; a prior-question record only speaks when no current-question record exists (even an unusable one blocks the fallback).
-  // R973: a scoped (invariants) record never supersedes or erases the latest open-mode WEAKENED for the same range.
-  if (sawCurrent && latest?.scope === 'invariants' && latestOpen?.verdict === 'WEAKENED') return latestOpen;
-  return sawCurrent ? latest : prior;
+  // Current-question evidence decides first; even an unusable current record blocks the prior fallback.
+  const selected = sawCurrent ? latest : prior;
+  // R973: scoped evidence cannot erase an open WEAKENED, including under an accepted prior question hash.
+  // A usable current-question open re-audit still takes precedence over every prior-question open record.
+  const open = latestOpen ?? priorOpen;
+  if (selected?.scope === 'invariants' && open?.verdict === 'WEAKENED') return open;
+  return selected;
 }
 
 /** Inject resolveSha, runCodex, appendRecord, now, stdout and stderr for hermetic execution. */

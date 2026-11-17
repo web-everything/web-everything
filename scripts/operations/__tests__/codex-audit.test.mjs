@@ -597,6 +597,39 @@ describe('prior question hashes (AU1 PR-B)', () => {
   it('a prior WEAKENED still blocks (is returned as WEAKENED)', () => {
     expect(find([rec('WEAKENED', { findings: ['x.mjs:1 gap'] })], open)?.verdict).toBe('WEAKENED');
   });
+  it.each([QUESTION_HASH, PRIOR])('a scoped pass under %s cannot supersede an accepted prior open WEAKENED', questionHash => {
+    const weak = rec('WEAKENED', { findings: ['x.mjs:1 gap'] });
+    for (const at of [AT, '2026-11-03T12:00:00.000Z']) {
+      const pass = rec('NOT WEAKENED', { questionHash, at, scope: 'invariants', invariantsHash: 'e'.repeat(64), followUps: [] });
+      expect(find([weak, pass], open)).toBe(weak);
+      expect(find([pass, weak], open)).toBe(weak);
+    }
+  });
+  it('a current open pass resolves prior open WEAKENED before a scoped pass', () => {
+    const weak = rec('WEAKENED', { at: '2026-11-03T12:00:00.000Z', findings: ['x.mjs:1 gap'] });
+    const fixed = rec('NOT WEAKENED', { questionHash: QUESTION_HASH, at: '2026-11-02T12:00:00.000Z' });
+    const scoped = rec('NOT WEAKENED', { questionHash: QUESTION_HASH, at: '2026-11-04T12:00:00.000Z', scope: 'invariants' });
+    expect(find([weak, fixed, scoped], open)).toBe(scoped);
+    expect(find([scoped, fixed, weak], open)).toBe(scoped);
+  });
+  it('a later prior open pass resolves prior open WEAKENED before a scoped pass', () => {
+    const weak = rec('WEAKENED', { findings: ['x.mjs:1 gap'] });
+    const fixed = rec('NOT WEAKENED', { at: '2026-11-02T12:00:00.000Z' });
+    const scoped = rec('NOT WEAKENED', { questionHash: QUESTION_HASH, at: '2026-11-03T12:00:00.000Z', scope: 'invariants' });
+    expect(find([weak, fixed, scoped], open)).toBe(scoped);
+    expect(find([scoped, fixed, weak], open)).toBe(scoped);
+  });
+  it('a scoped pass ignores unusable or unrelated prior open WEAKENED records', () => {
+    const scoped = rec('NOT WEAKENED', { questionHash: QUESTION_HASH, at: '2026-11-03T12:00:00.000Z', scope: 'invariants' });
+    const weak = rec('WEAKENED', { findings: ['x.mjs:1 gap'] });
+    for (const over of [
+      { questionHash: 'd'.repeat(64) }, { head: BASE }, { base: HEAD },
+      { at: 'not-a-date' }, { at: '2020-01-01T00:00:00.000Z' },
+      { at: '2026-11-11T00:00:00.000Z' }, { findings: ['NOT WEAKENED'] },
+    ]) expect(find([{ ...weak, ...over }, scoped], open)).toBe(scoped);
+    expect(find([weak, scoped], [])).toBe(scoped);
+    expect(find([weak, scoped], window('2026-11-04T11:59:59.000Z'))).toBe(scoped);
+  });
   it('a later prior WEAKENED beats an earlier prior NOT WEAKENED', () => {
     const later = rec('WEAKENED', { at: '2026-11-02T12:00:00.000Z', findings: ['x.mjs:1 gap'] });
     expect(find([rec('NOT WEAKENED'), later], open)).toBe(later);

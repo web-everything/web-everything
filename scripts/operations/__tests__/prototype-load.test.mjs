@@ -2233,6 +2233,14 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
     it('the carried prior pass alone is a pass (the setting is live in this path)', () => {
       expect(carry(prior())).toEqual({ ok: true, record: prior() });
     });
+    it.each([SHA, 'd'.repeat(40)])('a scoped pass on head %s cannot hide its accepted prior open WEAKENED from the canonical gate', head => {
+      const weak = old({ head, questionHash: PRIOR, verdict: 'WEAKENED', findings: ['x.mjs:1 guard removed'] });
+      for (const questionHash of [QUESTION_HASH, PRIOR]) {
+        const scoped = old({ head, questionHash, at: '2026-10-21T12:00:00Z', scope: 'invariants', invariantsHash: 'e'.repeat(64), followUps: [] });
+        expect(carry(weak, scoped)).toEqual({ ok: false, reason: 'weakened' });
+        expect(carry(scoped, weak)).toEqual({ ok: false, reason: 'weakened' });
+      }
+    });
     it.each([
       ['no fingerprint', { fingerprint: undefined }],
       ['a differing fingerprint', { fingerprint: '1'.repeat(64) }],
