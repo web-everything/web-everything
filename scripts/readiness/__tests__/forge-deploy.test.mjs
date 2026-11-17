@@ -147,6 +147,57 @@ it.each(['tampered', 'extra', 'missing', 'symlink', 'foreign', 'writable', 'mani
   expect(f.read('state.json').forgeSetSha).toBe(sha);
 });
 
+it.each([
+  ...['status', 'preflight', 'recover'].flatMap(command =>
+    ['manifest', 'payload', 'state.json', 'deploy.json'].map(kind => [command, kind])),
+  ['preflight', 'source'], ['install', 'source'], ['recover', 'transaction'],
+])('%s opens %s evidence without blocking and rejects an injected FIFO before reading', async (command, kind) => {
+  const f = await seeded();
+  const name = kind === 'manifest' || kind === 'payload'
+    ? path.join(f.root, 'versions', f.a, kind === 'manifest' ? 'manifest.json' : payloads[0])
+    : kind === 'source' ? path.join(f.source, payloads[0])
+    : path.join(f.root, kind === 'transaction' ? '.publish-fifo' : kind);
+  if (kind === 'transaction') fs.writeFileSync(name, JSON.stringify({from: null, to: f.a}));
+  const descriptors = new Set(), openedFlags = [];
+  let inspected = 0, reads = 0, closed = 0;
+  const io = new Proxy(f.io, {get(target, key) {
+    if (key === 'openSync') return (file, flags, ...args) => {
+      const fd = target.openSync(file, flags, ...args);
+      if (file === name) { descriptors.add(fd); openedFlags.push(flags); }
+      return fd;
+    };
+    if (key === 'fstatSync') return fd => {
+      const st = target.fstatSync(fd);
+      if (descriptors.has(fd)) {
+        inspected++;
+        st.mode = (st.mode & ~fs.constants.S_IFMT) | fs.constants.S_IFIFO;
+        st.isFile = () => false;
+        st.isFIFO = () => true;
+      }
+      return st;
+    };
+    if (key === 'readSync' || key === 'readFileSync') return (fd, ...args) => {
+      if (descriptors.has(fd) || fd === name) { reads++; throw new Error('read attempted on FIFO'); }
+      return target[key](fd, ...args);
+    };
+    if (key === 'closeSync') return fd => {
+      if (descriptors.delete(fd)) closed++;
+      return target.closeSync(fd);
+    };
+    return target[key];
+  }});
+  await expect(f.run(command, {id: f.b, shaMeta: sha, fs: io}))
+    .rejects.toThrow('untrusted or oversized file; inspect the remote runner and run recover');
+  expect(openedFlags).toHaveLength(1);
+  expect(openedFlags[0] & fs.constants.O_NONBLOCK).toBe(fs.constants.O_NONBLOCK);
+  expect(openedFlags[0] & fs.constants.O_NOFOLLOW).toBe(fs.constants.O_NOFOLLOW);
+  expect(inspected).toBe(1);
+  expect(reads).toBe(0);
+  expect(closed).toBe(1);
+  expect(descriptors.size).toBe(0);
+  if (command === 'recover') expect(fs.existsSync(path.join(f.root, 'quarantine'))).toBe(true);
+});
+
 it('status and preflight take no lock and perform zero mutations, including absent roots and stale evidence', async () => {
   const f = fixture(), probe = faults(f.io);
   f.bundle('one');

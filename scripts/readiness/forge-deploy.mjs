@@ -42,7 +42,7 @@ export function trustDirectory(name, {fs = nativeFs, uid = 0, missing = false} =
   return absolute;
 }
 function safeRead(fs, name, uid, limit = 8 * 1024 * 1024) {
-  const fd = fs.openSync(name, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  const fd = fs.openSync(name, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
   try {
     const st = fs.fstatSync(fd);
     if (!trusted(st, uid) || st.size > limit) fail('untrusted or oversized file');
@@ -82,7 +82,7 @@ export function readVersion(root, id, {fs = nativeFs, uid = 0} = {}) {
 // flock holds an inherited, owner-checked file description until the child exits.
 // No mkdir-lock fallback: platforms without flock must provision it first.
 export async function flockLock(name, action, {fs = nativeFs, uid = 0, spawnImpl = spawn} = {}) {
-  const fd = fs.openSync(name, fs.constants.O_CREAT | fs.constants.O_RDWR | fs.constants.O_NOFOLLOW, 0o600);
+  const fd = fs.openSync(name, fs.constants.O_CREAT | fs.constants.O_RDWR | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK, 0o600);
   let child;
   try {
     if (!trusted(fs.fstatSync(fd), uid)) fail('untrusted lock file');
@@ -114,7 +114,7 @@ export async function deploy({command, root, source, id, sha: legacyId, shaMeta 
   const at = name => path.join(root, name);
   const present = name => stat(fs, at(name));
   const syncDir = name => {
-    const fd = fs.openSync(name, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const fd = fs.openSync(name, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     try { if (!trusted(fs.fstatSync(fd), uid, true)) fail('untrusted directory'); fs.fsyncSync(fd); }
     finally { fs.closeSync(fd); }
   };
