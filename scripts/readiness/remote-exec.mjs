@@ -1497,7 +1497,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
       run = preparation.run;
       if(typeof run !== 'string' || !/^r-[a-f0-9]{32}$/.test(run)) {run=undefined; throw new Error('Invalid server run');}
       // Tell the admission wrapper which Forge run this client now owns, so a stale slot marker can be judged per run.
-      try {onRun?.(run);} catch { /* advisory only */ }
+      try {onRun?.(run, {nonce});} catch { /* advisory only */ }
       const slot=preparation.slot??'forge-exec';
       if(slot!=='forge-exec'&&(!/^forge-exec-[1-9]\d*$/.test(slot)||!Array.isArray(preparation.capabilities?.workers)||!preparation.capabilities.workers.includes(slot)))throw new Error('Invalid server slot');
       const runRoot=slot==='forge-exec'?ROOT:ROOT+'/'+slot.replace('forge-exec-','slot-');

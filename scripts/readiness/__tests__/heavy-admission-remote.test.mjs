@@ -9,6 +9,10 @@ import { main, decideRemote, runWithRemoteDecision, adaptLegacyRemoteResult, res
 import { runRemote } from '../remote-exec.mjs';
 import { bindingEvidence } from './fixtures/forge-bound-git.mjs';
 import { execContainerized } from '../../lib/container-exec.mjs';
+import { LEASE_FILENAME } from '../../lib/lane-lease.mjs';
+import { createRunFinisher } from '../forge-run-finish.mjs';
+
+vi.mock('../forge-run-finish.mjs', () => ({createRunFinisher: vi.fn(() => vi.fn(async () => ({finished: true})))}));
 
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal();
@@ -67,6 +71,92 @@ function expectFallback(log, reason) {
   if (reason) expect(log.mock.calls[1][0]).toContain(reason);
   else expect(log.mock.calls[1][0].replace(/fallback/gi, '').replace(/[^a-z0-9]/gi, '')).not.toBe('');
 }
+
+describe('R1017 remote marker provenance and nonce plumbing', () => {
+  function multiUnitFixture() {
+    const f = fixture({remote: {mode: 'always', slotUnitsByKind: {FULL: 2, soak: 'auto', standards: 'auto'}}});
+    f.cwd = mkdtempSync(join(process.env.TMPDIR, 'marker-provenance-')); testRoots.push(f.cwd);
+    f.argv = ['npm', 'run', 'test:unit'];
+    f.env = {WE_HEAVY_SESSION: 'fixture-session', WE_HEAVY_SIGNAL_CANCEL_WAIT_MS: '200'};
+    mkdirSync(join(f.cwd, '.git'));
+    writeFileSync(join(f.cwd, '.git', LEASE_FILENAME), JSON.stringify({lane: 14, session: 'lease-session', pr: 1017}));
+    return {...f, remoteRoot: join(f.lockRoot, '..', 'remote')};
+  }
+  it('persists nonce and trace tags for the primary and every extra unit marker, then removes sidecars', async () => {
+    const f = multiUnitFixture(), nonce = 'a'.repeat(32), run = 'r-' + 'b'.repeat(32);
+    let files;
+    f.remoteExec = vi.fn(async options => {
+      options.onRun(run, {nonce});
+      files = readdirSync(f.remoteRoot).filter(name => name.endsWith('.unconfirmed'));
+      expect(files).toHaveLength(2);
+      for (const name of files) {
+        const file = join(f.remoteRoot, name), marker = JSON.parse(readFileSync(file, 'utf8'));
+        expect(marker).toMatchObject({pid: process.pid, caller: {kind: 'FULL', session: 'fixture-session', ppid: process.ppid, cmd: 'npm'}, lane: 14, pr: 1017});
+        expect(JSON.parse(readFileSync(file + '.run', 'utf8'))).toEqual({owner: marker.owner, run, nonce});
+        expect(statSync(file + '.run').mode & 0o777).toBe(0o600);
+      }
+      return {mode: 'remote', code: 0};
+    });
+    expect(await runWithRemoteDecision(f)).toMatchObject({handled: true, exitCode: 0});
+    for (const name of files) {
+      expect(existsSync(join(f.remoteRoot, name))).toBe(false);
+      expect(existsSync(join(f.remoteRoot, name + '.run'))).toBe(false);
+    }
+  });
+  it.each(['SIGTERM', 'SIGINT', 'SIGHUP'])('writes synchronous .exit evidence for every outstanding marker on %s', async signal => {
+    const f = multiUnitFixture();
+    f.remoteExec = vi.fn(async () => {
+      process.emit(signal);
+      const files = readdirSync(f.remoteRoot).filter(name => name.endsWith('.unconfirmed'));
+      expect(files).toHaveLength(2);
+      for (const name of files) {
+        const marker = JSON.parse(readFileSync(join(f.remoteRoot, name), 'utf8'));
+        expect(JSON.parse(readFileSync(join(f.remoteRoot, name + '.exit'), 'utf8'))).toMatchObject({owner: marker.owner, signal, code: expect.any(Number), at: expect.any(Number)});
+      }
+      return {mode: 'unconfirmed'};
+    });
+    expect(await runWithRemoteDecision(f)).toMatchObject({handled: true, signal});
+    expect(readdirSync(f.remoteRoot).filter(name => name.endsWith('.exit'))).toHaveLength(2);
+  });
+  it('uses PR environment provenance when no lease PR is known and omits unknown lane', async () => {
+    const f = fixture();
+    f.env = {PR_NUMBER: '1017'};
+    f.remoteExec = vi.fn(async () => {
+      const marker = JSON.parse(readFileSync(join(f.lockRoot, '..', 'remote', 'slot-0.unconfirmed'), 'utf8'));
+      expect(marker.pr).toBe(1017);
+      expect(marker).not.toHaveProperty('lane');
+      expect(marker.caller).not.toHaveProperty('session');
+      return {mode: 'remote', code: 0};
+    });
+    expect(await runWithRemoteDecision(f)).toMatchObject({handled: true, exitCode: 0});
+  });
+  it('wires the finish transport into admission reaping for an old cancelled active run', async () => {
+    const f = fixture({remote: {maxConcurrent: 1}}), root = join(f.lockRoot, '..', 'remote'), run = 'r-' + 'c'.repeat(32), nonce = 'd'.repeat(32);
+    const {easternTimestamp} = await import('../forge-exec-run.mjs');
+    let now = Date.now();
+    f.clock = () => now;
+    f.sleep = vi.fn(async () => { now += 10_000; });
+    mkdirSync(root, {recursive: true});
+    const file = join(root, 'slot-0.unconfirmed');
+    const child = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))']);
+    writeFileSync(file, JSON.stringify({v: 1, host: 'forge', owner: 'dead', pid: Number(child.stdout.toString()), at: now - 600_000}));
+    utimesSync(file, (now - 600_000) / 1000, (now - 600_000) / 1000);
+    const st = statSync(file);
+    writeFileSync(file + '.run', JSON.stringify({owner: 'dead', run, nonce}));
+    writeFileSync(file + '.dead', JSON.stringify({key: `slot-0.unconfirmed:${st.ino}:${st.mtimeMs}`, at: now - 120_000}));
+    f.readTelemetry = async () => ({...await healthyRead(), sampledAtET: easternTimestamp(now), activeRuns: 1, activeRunIds: [run],
+      recent: [{runId: run, code: f.sleep.mock.calls.length ? 97 : null, startedAtET: easternTimestamp(now - 500_000), stageMs: {install: 0, run: 0}}]});
+    const finish = vi.fn(async () => ({finished: true}));
+    vi.mocked(createRunFinisher).mockReturnValueOnce(finish);
+    expect(await runWithRemoteDecision(f)).toMatchObject({handled: true, exitCode: 0});
+    expect(createRunFinisher).toHaveBeenLastCalledWith({host: 'forge'});
+    expect(finish).toHaveBeenCalledTimes(1);
+    expect(finish).toHaveBeenCalledWith({run, nonce});
+    expect(f.log.mock.calls.some(([line]) => line.includes("finished on owner's behalf"))).toBe(true);
+    expect(f.sleep).toHaveBeenCalledTimes(1);
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe('remote admission policy', () => {
   it.each([

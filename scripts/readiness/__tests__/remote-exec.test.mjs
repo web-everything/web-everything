@@ -104,6 +104,31 @@ function fixture({ probeCode = 0, copyCode = 0, prepareCode = 0, runCode = 0, re
   return {exec, local, listFiles, argv:[...argv], cwd, lockRoot:join(cwd,'heavy'), env:{...allowedEnv,...forbiddenEnv}, runId};
 }
 // Simulate umask 077 without changing the test worker's process-wide umask.
+describe('R1017 advisory run identity', () => {
+  it('passes the prepare nonce with onRun before dispatch and finish', async () => {
+    const f = fixture();
+    const onRun = vi.fn((run, metadata) => {
+      const prepare = JSON.parse(callsOf(f.exec).find(isPrepare).input);
+      expect(metadata).toEqual({nonce: prepare.nonce});
+      expect(metadata.nonce).toMatch(/^[a-f0-9]{32}$/);
+      expect(run).toBe('r-' + prepare.nonce);
+      expect(callsOf(f.exec).some(isRun)).toBe(false);
+      expect(callsOf(f.exec).some(isCleanup)).toBe(false);
+    });
+    expect(await runRemote({...f, onRun})).toMatchObject({mode: 'remote', code: 0});
+    expect(onRun).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(callsOf(f.exec).find(isCleanup).input).nonce).toBe(onRun.mock.calls[0][1].nonce);
+  });
+  it('keeps nonce persistence advisory when onRun throws', async () => {
+    const f = fixture();
+    const onRun = vi.fn(() => { throw new Error('marker unavailable'); });
+    expect(await runRemote({...f, onRun})).toMatchObject({mode: 'remote', code: 0});
+    expect(onRun).toHaveBeenCalledTimes(1);
+    expect(onRun.mock.calls[0][1].nonce).toMatch(/^[a-f0-9]{32}$/);
+    expect(callsOf(f.exec).filter(isCleanup)).toHaveLength(1);
+  });
+});
+
 function restrictiveStageFs() {
   return {...filesystem,
     mkdir:(path, options) => filesystem.mkdir(path, {...options, mode:0o700}),
