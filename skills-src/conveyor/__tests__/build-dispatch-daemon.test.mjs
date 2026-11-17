@@ -1727,7 +1727,13 @@ describe('build-dispatch-daemon.mjs boots as a fresh `node` process — the clas
       status = e.status;
     }
     expect(stderr).not.toMatch(/ReferenceError|before initialization/);
-    expect(stderr).toMatch(/^(?:\d{4}-\d\d-\d\dT\S+Z )?usage: build-dispatch-daemon\.mjs/m); // 68b: main() stamps its output
+    // 68b: main() stamps its output. Host policy-cascade log lines may print first, and ONLY those may precede the usage line.
+    const lines = stderr.split('\n');
+    const usageAt = lines.findIndex(l => /^(?:\d{4}-\d\d-\d\dT\S+Z )?usage: build-dispatch-daemon\.mjs/.test(l));
+    expect(usageAt).toBeGreaterThanOrEqual(0);
+    // Known host noise only: policy-cascade log lines and Node deprecation warnings; any other line (a startup error) fails.
+    expect(lines.slice(0, usageAt).every(l => l.startsWith('policy-cascade ·')
+      || /^\(node:\d+\) \[DEP\d+\] DeprecationWarning: /.test(l) || l.startsWith('(Use `node --trace-deprecation'))).toBe(true);
     expect(status).toBe(2);
   });
 });
