@@ -95,7 +95,7 @@ import { dispatchReviewJob, dispatchReviewByMode } from '../../scripts/operation
 import { hostLoadAdmission } from '../../scripts/lib/host-load.mjs';
 import { pidAlive } from '../../scripts/lib/pid-alive.mjs';
 import { sampleHost } from '../../scripts/lib/host-sample.mjs';
-import { loadHostOverloadSettings } from '../../scripts/lib/host-overload-settings.mjs';
+import { DEFAULT_MAX_REVIEW_DISPATCH_PER_TICK, loadHostOverloadSettings } from '../../scripts/lib/host-overload-settings.mjs';
 import { runRedTeamOnSkip } from '../../scripts/lib/review-red-team-on-skip.mjs';
 import { createRedTeamDispatchQueue, loadRedTeamQueueFloor, raiseReviewStartsPerTick, runWithRedTeamQueue } from '../../scripts/lib/red-team-dispatch-queue.mjs';
 import { syncResultOnHeadLabels } from '../../scripts/lib/red-team-result-label-sync.mjs';
@@ -926,14 +926,29 @@ export const REVIEW_DAEMON_APP_AUTH_OPTS = FLEET_APP_AUTH_OPTS;
  */
 /** Wrap a host admission so it is evaluated once and its `maxPerTick` is a budget shared by every caller: each
  *  call returns the SAME verdict with what is left, and `take(n)` spends it. A throwing check fails closed. */
-export function sharedHostBudget(hostAdmission) {
+const malformedReviewStartBudgets = new Set();
+export function sharedHostBudget(hostAdmission, log = console.error) {
   let verdict = null;
   let left = 0;
   return () => {
     if (!verdict) {
       try { verdict = hostAdmission() ?? { admitted: false, reason: 'host admission returned nothing' }; }
       catch (e) { verdict = { admitted: false, reason: `host admission unknown: ${String(e?.message ?? e).split('\n')[0]}` }; }
-      left = verdict.admitted ? (Number.isFinite(verdict.maxPerTick) && verdict.maxPerTick >= 0 ? verdict.maxPerTick : Infinity) : 0;
+      let budget = verdict.maxPerTick;
+      if (verdict.admitted && !(Number.isInteger(budget) && budget >= 0)) {
+        let got;
+        try { got = String(budget); } catch { got = typeof budget; }
+        const reason = `${typeof budget}:${got}`;
+        budget = Number.isInteger(DEFAULT_MAX_REVIEW_DISPATCH_PER_TICK) && DEFAULT_MAX_REVIEW_DISPATCH_PER_TICK >= 0
+          ? DEFAULT_MAX_REVIEW_DISPATCH_PER_TICK : 1;
+        if (!malformedReviewStartBudgets.has(reason)) {
+          malformedReviewStartBudgets.add(reason);
+          try { log(`review-daemon: review-start-budget-malformed (got ${got}) - using safe default ${budget}`); }
+          catch { /* Diagnostics must not interrupt admission. */ }
+        }
+      }
+      verdict = { ...verdict, maxPerTick: budget };
+      left = verdict.admitted ? budget : 0;
     }
     return { ...verdict, startBudget: verdict.maxPerTick, maxPerTick: left, take: (n) => { left = Math.max(0, left - n); } };
   };
@@ -951,7 +966,7 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
   const perRepoMs = {};
   // verify-admission (audit) — ONE host verdict and ONE dispatch budget per daemon tick, shared by every repo, so
   // the per-tick cap is host-wide (never cap × repos).
-  if (typeof tickOpts.hostAdmission === 'function') tickOpts.hostAdmission = sharedHostBudget(tickOpts.hostAdmission);
+  if (typeof tickOpts.hostAdmission === 'function') tickOpts.hostAdmission = sharedHostBudget(tickOpts.hostAdmission, tickOpts.log);
   const perRepo = forEachRepo(repos, (repo) => {
     const started = Date.now();
     try { return tick({ ...tickOpts, repo, paused: authGate.paused, pauseReason: authGate.reason }); }

@@ -992,10 +992,48 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     expect(check).toHaveBeenCalledTimes(1);
   });
 
-  it.each([[0, 0], [0.5, 0.5], [2, 2], [Infinity, Infinity], [-Infinity, Infinity], [NaN, Infinity], [-1, Infinity], [undefined, Infinity]])('shared host budget normalizes maxPerTick=%s to %s', async (maxPerTick, expected) => {
+  it.each([NaN, -1, 2.5, '3', undefined, Infinity, -Infinity])('malformed shared budget %s fails closed and warns once across ticks', async (maxPerTick) => {
     const { sharedHostBudget } = await import('../review-daemon.mjs');
-    const hostAdmission = sharedHostBudget(() => ({ admitted: true, maxPerTick }));
-    expect(hostAdmission().maxPerTick).toBe(expected);
+    const { DEFAULT_MAX_REVIEW_DISPATCH_PER_TICK: expected } = await import('../../../scripts/lib/host-overload-settings.mjs');
+    const log = vi.fn();
+    const check = () => ({ admitted: true, maxPerTick });
+    const hostAdmission = sharedHostBudget(check, log);
+    expect(hostAdmission()).toMatchObject({ maxPerTick: expected, startBudget: expected });
+    hostAdmission().take(expected);
+    expect(hostAdmission()).toMatchObject({ maxPerTick: 0, startBudget: expected });
+    expect(sharedHostBudget(check, log)()).toMatchObject({ maxPerTick: expected, startBudget: expected });
+    expect(log).toHaveBeenCalledOnce();
+    expect(log).toHaveBeenCalledWith(`review-daemon: review-start-budget-malformed (got ${String(maxPerTick)}) - using safe default ${expected}`);
+  });
+
+  it('an unavailable standard budget falls back to one start', async () => {
+    const settings = await import('../../../scripts/lib/host-overload-settings.mjs');
+    const standard = vi.spyOn(settings, 'DEFAULT_MAX_REVIEW_DISPATCH_PER_TICK', 'get').mockReturnValue(undefined);
+    try {
+      const { sharedHostBudget } = await import('../review-daemon.mjs');
+      const log = vi.fn();
+      expect(sharedHostBudget(() => ({ admitted: true, maxPerTick: false }), log)())
+        .toMatchObject({ maxPerTick: 1, startBudget: 1 });
+      expect(log).toHaveBeenCalledWith('review-daemon: review-start-budget-malformed (got false) - using safe default 1');
+    } finally { standard.mockRestore(); }
+  });
+
+  it.each([0, 3])('valid shared budget %s is preserved without a warning', async (maxPerTick) => {
+    const { sharedHostBudget } = await import('../review-daemon.mjs');
+    const log = vi.fn();
+    const hostAdmission = sharedHostBudget(() => ({ admitted: true, maxPerTick }), log);
+    expect(hostAdmission()).toMatchObject({ maxPerTick, startBudget: maxPerTick });
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it('a throwing malformed-budget logger cannot break admission or retry its warning', async () => {
+    const { sharedHostBudget } = await import('../review-daemon.mjs');
+    const { DEFAULT_MAX_REVIEW_DISPATCH_PER_TICK: expected } = await import('../../../scripts/lib/host-overload-settings.mjs');
+    const log = vi.fn(() => { throw Error('logger unavailable'); });
+    const check = () => ({ admitted: true, maxPerTick: null });
+    expect(sharedHostBudget(check, log)()).toMatchObject({ maxPerTick: expected, startBudget: expected });
+    expect(sharedHostBudget(check, log)()).toMatchObject({ maxPerTick: expected, startBudget: expected });
+    expect(log).toHaveBeenCalledOnce();
   });
 
   it('host admission (verify-admission): runReviewTickAllRepos wraps one check into a host-wide budget across every repo', () => {
