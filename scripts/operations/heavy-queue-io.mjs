@@ -29,6 +29,7 @@ import {
 import { SELECTED_GATE_MERGE_SHA } from './heavy-queue.mjs';
 import { redactCommandLine } from './command-redact.mjs';
 import { probeForgeShare } from '../lib/forge-share.mjs';
+import { isLocalDecisionReason } from '../lib/remote-fallback-log.mjs';
 
 /** The owner→repo derivation `heavy-admission.mjs#waiterRepo` already uses for a waiting marker with no
  *  explicit `repo` field — reused here (not reimplemented) for a HELD slot's owner, which never carries a
@@ -100,6 +101,7 @@ function readRemoteFallbacks(lockRoot, nowMs) {
       try {
         const row = JSON.parse(line), ts = Date.parse(row.ts);
         if (!Number.isFinite(ts) || ts < nowMs - 86400000 || ts > nowMs || typeof row.reason !== 'string' || !row.reason) continue;
+        if (isLocalDecisionReason(row.reason)) continue;
         byReason[row.reason] = (byReason[row.reason] ?? 0) + 1;
         total++;
       } catch { /* skip malformed line */ }

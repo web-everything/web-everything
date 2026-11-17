@@ -1197,8 +1197,10 @@ export async function runWithRemoteDecision({
     && Number.isFinite(load) && isOverloaded()) decision = withNeedsGit({ remote: true, reason: `${decision.reason}; host overloaded` }, argv, cwd, policy.settings.remote.transport === 'git-bundle' && runnerBundleOk);
   onDecision?.(decision);
   log(`heavy-admission: ${decision.remote ? 'remote' : 'local'} (${decision.reason})\n`);
-  if (decision.needsGit) recordRemoteFallback({lockRoot, reason: 'needs-git', cwd, argv, env, clock});
-  if (!decision.remote) return { handled: false };
+  if (!decision.remote) {
+    recordRemoteFallback({lockRoot, reason: decision.needsGit ? 'needs-git' : decision.reason, cwd, argv, env, clock});
+    return { handled: false };
+  }
   const remoteRoot = join(dirname(lockRoot), 'remote');
   const localFallback = (reason, detail = null) => {
     recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock});
@@ -1348,6 +1350,30 @@ export async function runWithRemoteDecision({
     return { handled: true, exitCode: 124 };
   };
   let reason; let detail; let timer;
+  // Keep remote advisory rows; local runs fold bounded warning evidence into their final row.
+  const warnings = [];
+  const localWarnings = [];
+  let warningBytes = 0;
+  let warningRoute = 'pending';
+  const deferWarning = (reason, detail) => {
+    if (warningRoute === 'local') return;
+    if (warningRoute === 'remote') return recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock});
+    try {
+      const warning = {reason: String(reason).slice(0, 4096), detail: detail == null ? null : String(detail).slice(0, 4096)};
+      warningBytes += warning.reason.length + (warning.detail?.length ?? 0) + 1;
+      warnings.push(warning);
+      // Separate first-three summary survives eviction from the remote diagnostic tail.
+      if (localWarnings.length < 3) localWarnings.push(`${warning.reason.slice(0, 128)}: ${warning.detail ?? ''}`.slice(0, 512));
+      // Retain a bounded diagnostic tail, like the on-disk recorder.
+      while (warningBytes > 512 * 1024) {
+        const oldest = warnings.shift();
+        warningBytes -= oldest.reason.length + (oldest.detail?.length ?? 0) + 1;
+      }
+    } catch { /* Observability must never affect execution. */ }
+  };
+  const refusesFallback = reason => (kind === 'FULL' || kind === 'coverage')
+    && ['sibling-inventory-failed', 'bundle-credential-hit', 'bundle-credential-scan-too-large', 'git-head-unavailable'].includes(reason);
+  let fallingBackLocally = false;
   const controller = new AbortController();
   // x40a9dk: a killed client (SIGTERM/SIGINT/SIGHUP) cancels its own remote run and clears its marker only on
   // confirmed termination; otherwise the marker stays for the reaper. Installed only while a marker is outstanding.
@@ -1415,7 +1441,7 @@ export async function runWithRemoteDecision({
     const dispatch = () => {
       executionRun = null;
       return Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, cancelSignal: cancelController.signal, transport: policy.settings.remote.transport, bundleMainMaxAgeMs: policy.settings.remote.bundle.mainMaxAgeMin * 60_000,
-      onWarning: (reason, detail) => recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock}),
+      onWarning: deferWarning,
       onCapabilities: capabilities => writeRunnerCapabilities({ root: remoteRoot, host, capabilities, clock }), onRun: run => {
         if (recordMarkerRun(executionMarker, {owner, run})) executionRun = run;
       } }));
@@ -1501,14 +1527,20 @@ export async function runWithRemoteDecision({
       reason = result?.reason ?? 'unconfirmed remote result';
       detail = result?.detail;
     }
+    fallingBackLocally = !refusesFallback(reason);
   } catch (error) {
     reason = error?.message ?? String(error);
     if (!await confirmFinished()) { await record({mode:'unconfirmed'}); return killedExit() ?? refuseLocal(reason); }
     await record({mode:'cancelled',terminated:true,reason});
     if (killedExit()) return killedExit();
+    fallingBackLocally = !refusesFallback(reason);
   }
   finally {
     clearTimeout(timer); clearInterval(heartbeat);
+    warningRoute = fallingBackLocally ? 'local' : 'remote';
+    if (warningRoute === 'remote') {
+      for (const warning of warnings) recordRemoteFallback({lockRoot, ...warning, cwd, argv, env, clock});
+    }
     for (const [name, h] of signalHandlers) process.removeListener(name, h);
     if (!outstanding || terminated) {
       for (const file of extraMarkers) {
@@ -1526,8 +1558,13 @@ export async function runWithRemoteDecision({
       if(!outstanding)releaseUnits();
     }
   }
+  if (warningRoute === 'local' && localWarnings.length) {
+    try {
+      detail = `warnings: ${localWarnings.join('; ')}${detail == null ? '' : `; ${String(detail).slice(0, 2048)}`}`;
+    } catch { /* Diagnostic formatting must not change admission. */ }
+  }
   recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock});
-  if ((kind === 'FULL' || kind === 'coverage') && ['sibling-inventory-failed', 'bundle-credential-hit', 'bundle-credential-scan-too-large', 'git-head-unavailable'].includes(reason)) {
+  if (refusesFallback(reason)) {
     log(`heavy-admission: refusing local fallback (${oneLine(reason)})\n`);
     return { handled: true, exitCode: 125 };
   }
@@ -3189,8 +3226,11 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
     // `--local`: explicit per-job opt-out of remote dispatch ONLY. It is read from this CLI's own flag, never from
     // env or settings, and the job still queues for a LOCAL slot under the normal cap (it never skips admission).
     const forceLocal = flags.local === true;
-    if (forceLocal) process.stderr.write(`heavy-admission run: location=local reason=--local (source: flag --local; remote dispatch skipped, a local admission slot is still required)\n`);
-    const bypass = admissionBypassReason({ env: process.env, poolExists: existsSync(poolRootOf(lockRoot)) });
+    if (forceLocal) {
+      process.stderr.write(`heavy-admission run: location=local reason=--local (source: flag --local; remote dispatch skipped, a local admission slot is still required)\n`);
+    }
+    const poolExists = existsSync(poolRootOf(lockRoot));
+    const bypass = admissionBypassReason({ env: process.env, poolExists });
     // The Mac verify driver holds local phase capacity, but its gate may run on
     // Forge. Consume this internal handoff once; local fallback stays reentrant.
     const forgeGate=process.env.WE_FORGE_GATE_DISPATCH==='1';
@@ -3229,6 +3269,14 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
         await settleClientProvenance();
         process.exit(result.exitCode);
       }
+    } else if (poolExists && (bypass !== 'held' || forgeGate)) {
+      // The outer held wrapper owns the row, except when it hands logging to this Forge gate.
+      // These paths skip remote decisions entirely; recording must never affect routing/admission.
+      // Leave an absent pool unrecorded, including overlapping bypasses: logging would create it and change later routing.
+      const reason = forceLocal ? 'explicit-local' : useContainer ? 'explicit-container'
+        : /^(true|1)$/i.test(process.env.CI ?? '') ? 'ci-bypass'
+        : isAdmissionOff(process.env) ? 'admission-off' : null;
+      if (reason) recordRemoteFallback({lockRoot, reason, cwd: repo, argv: argv.slice(dashDashIdx + 1), env: process.env, clock: Date.now});
     }
     if (useContainer) {
       // Fail with a clear, actionable message rather than a raw ENOENT/"image not found" surfaced from deep

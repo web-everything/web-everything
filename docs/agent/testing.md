@@ -3681,6 +3681,21 @@ before any escalation comment is posted. The read-error fallback never catches r
 `ci-heal-escalation-mark.test.mjs` pins both preflights and both CLI outcomes with nameless evidence beside a required failure.
 ## Remote client import failures
 
+Local heavy-admission decisions write exactly one `remote-fallbacks.jsonl` reason row, including disabled
+remote routing, threshold-local and unreadable-load decisions. A `needs-git` row replaces the verbose
+decision reason. Executor warnings remain advisory rows for remote results; confirmed local fallbacks
+record their final reason with the first three warnings (512 characters each) and bounded fallback
+detail in that same row. Explicit `--local`, container, admission-off and CI bypasses record
+`explicit-local`, `explicit-container`, `admission-off` and `ci-bypass` best effort. The `no-pool`
+bypass writes no row and leaves the pool absent so later routing stays unchanged, including when
+combined with explicit local, container, CI or admission-off bypasses. Held
+re-entrant wrappers add no row unless consuming a Forge gate handoff that delegates logging. Keep routine local
+decisions advisory in the fallback report/queue; exclude them from Forge-share completion matching
+so they cannot claim a later failed remote attempt's local completion. Verify-lane owns its
+direct local slot's row; held nested admission wrappers bypass remote decision logging, while remote
+handoffs leave fallback logging to the nested wrapper. The remote admission, R501, fallback-log,
+fallback-report, queue IO and Forge-share tests cover these producer/consumer guarantees.
+
 Importing a host-selected remote client executes its top-level code. Neither an import exception nor
 a missing or non-callable `runRemote` export establishes that remote work never started: preserve
 exit 124 and the operator instruction to confirm termination before retrying. Changes to this boundary must run

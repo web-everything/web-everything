@@ -13,6 +13,20 @@ const bounded = value => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]
 
 export const ADVISORY_REASONS = new Set(['credential-warn']);
 
+/** Recognize only the local decision strings produced by heavy-admission, not unknown failures. */
+export function isLocalDecisionReason(reason) {
+  if (typeof reason !== 'string') return false;
+  if (['explicit-local', 'explicit-container', 'admission-off', 'ci-bypass', 'no-pool'].includes(reason)) return true;
+  if (/^remote\.enabled=false \([^()\r\n]+\)$/.test(reason)) return true;
+  const match = /^remote\.enabled=true \([^()\r\n]+\); (.+)$/.exec(reason);
+  if (!match) return false;
+  if (match[1] === 'load-unreadable') return true;
+  const number = '[+-]?(?:\\d+(?:\\.\\d*)?|\\.\\d+)(?:e[+-]?\\d+)?';
+  const load = new RegExp(`^loadPerCore=(${number}) <= (${number})$`).exec(match[1]);
+  return !!load && Number.isFinite(Number(load[1])) && Number.isFinite(Number(load[2]))
+    && Number(load[1]) <= Number(load[2]);
+}
+
 /** Pure aggregation. Unknown reasons remain real; ties keep the first encountered cause. */
 export function summarize(rows) {
   const realCounts = new Map();
@@ -22,7 +36,7 @@ export function summarize(rows) {
   for (const row of rows) {
     if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
     const reason = typeof row.reason === 'string' && row.reason ? row.reason : 'unknown';
-    const isAdvisory = ADVISORY_REASONS.has(reason);
+    const isAdvisory = ADVISORY_REASONS.has(reason) || isLocalDecisionReason(reason);
     const counts = isAdvisory ? advisoryCounts : realCounts;
     counts.set(reason, (counts.get(reason) ?? 0) + 1);
     total++;

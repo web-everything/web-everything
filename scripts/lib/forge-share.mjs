@@ -18,6 +18,7 @@
 import { appendFileSync, closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isLocalDecisionReason } from './remote-fallback-log.mjs';
 
 export const DEFAULT_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'forge-share.json');
 const MIN = 60_000;
@@ -71,6 +72,8 @@ export function computeForgeShare({ now, windowMs, target, expectedLocalReasons 
     const t = Date.parse(row?.ts);
     if (!Number.isFinite(t) || t > now) continue;
     const reason = normalizeFallbackReason(row.reason);
+    // Local decisions are advisory, not remote attempts; they cannot claim a later failure's completion.
+    if (isLocalDecisionReason(row.reason)) continue;
     const isExpected = expected.has(reason);
     if (!isExpected) { if (t > from) byReason[reason] = (byReason[reason] ?? 0) + 1; continue; }
     const key = laneKey(row.lane);
