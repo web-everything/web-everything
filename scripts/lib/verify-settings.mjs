@@ -59,6 +59,8 @@ export const BUILT_IN_VERIFY_SETTINGS = Object.freeze({
   // How often verify-lane refreshes the heavy-admission slot it holds while the gate runs. Capped at half the
   // 60-min slot lease (ADMISSION_LEASE_MINUTES), so a live gate always beats before its lease can expire.
   slotHeartbeatMs: 5 * 60_000,
+  // A live verify PID always wins over this heartbeat deadline.
+  orphanHeartbeatStaleMinutes: 3,
 });
 
 /** Use the WE root RUNNING verify-lane, never the target lane REPO or cwd:
@@ -89,6 +91,7 @@ const rules = {
   revertRedMaxFiles: value => Number.isSafeInteger(value) && value >= 1 && value <= 200,
   selection: value => ['since-last-green', 'pr'].includes(value),
   phaseTimeoutMs: value => Number.isSafeInteger(value) && value >= 1_000 && value <= 6 * 60 * 60_000,
+  orphanHeartbeatStaleMinutes: value => Number.isSafeInteger(value) && value >= 1 && value <= 60,
   slotHeartbeatMs: value => Number.isSafeInteger(value) && value >= 1_000 && value <= 30 * 60_000,
   alwaysRunTests: value => Array.isArray(value) && value.length <= 50
     // Each entry becomes a vitest file argument: it must start with a word character (never `-`, so `-u` / `--bail`
@@ -106,6 +109,7 @@ const envKeys = {
   alwaysRunTests: 'WE_VERIFY_ALWAYS_RUN_TESTS', skipLocalForCardOnly: 'WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY',
   revertRed: 'WE_VERIFY_REVERT_RED', revertRedSince: 'WE_VERIFY_REVERT_RED_SINCE', revertRedMaxFiles: 'WE_VERIFY_REVERT_RED_MAX_FILES',
   selection: 'WE_VERIFY_SELECTION', phaseTimeoutMs: 'WE_VERIFY_PHASE_TIMEOUT_MS', slotHeartbeatMs: 'WE_VERIFY_SLOT_HEARTBEAT_MS',
+  orphanHeartbeatStaleMinutes: 'WE_VERIFY_ORPHAN_HEARTBEAT_STALE_MINUTES',
 };
 const booleanKeys = new Set(['phaseAdmission', 'matchRequestVariants', 'runAllPhases', 'skipLocalForCardOnly']);
 // Preserve which keys survived validation without adding configuration keys to the file shape.
@@ -146,7 +150,7 @@ export function resolveVerifySettings({ fileConfig, env = {} } = {}) {
     sources[key] = fileKeys.get(validated).has(key) ? 'file' : 'default';
     let value = env?.[envKeys[key]];
     if (booleanKeys.has(key)) value = value === '0' ? false : value === '1' ? true : undefined;
-    else if (['shardMinTests', 'shardSize', 'shardParallel', 'testTimeoutFactor', 'fastTargets', 'relatedMaxTests', 'relatedDepth', 'revertRedMaxFiles', 'phaseTimeoutMs', 'slotHeartbeatMs'].includes(key)) {
+    else if (['shardMinTests', 'shardSize', 'shardParallel', 'testTimeoutFactor', 'fastTargets', 'relatedMaxTests', 'relatedDepth', 'revertRedMaxFiles', 'phaseTimeoutMs', 'slotHeartbeatMs', 'orphanHeartbeatStaleMinutes'].includes(key)) {
       value = value != null && String(value).trim() !== '' ? Number(value) : undefined;
     }
     else if (key === 'alwaysRunTests') {

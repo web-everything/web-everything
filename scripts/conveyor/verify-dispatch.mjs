@@ -135,6 +135,7 @@ import { homedir, loadavg, cpus } from 'node:os';
 import { smokeLoadFactor } from '../lib/daemon-live-smoke.mjs';
 import { loadVerifyRecoverySettings } from '../lib/verify-recovery-settings.mjs';
 import { randomUUID, randomBytes } from 'node:crypto';
+import { markerLockWithRetry } from '../lib/lane-verify-lifecycle.mjs';
 import { readVerifyMarker, VERIFY_FILENAME, verifyFinishBody, verificationInfrastructureFailure, VERIFY_MARKER_NONCE_ENV, markerNonceSuffix } from '../lib/lane-verify.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { resolveCeilingMs as resolveAdmissionCeilingMs } from '../readiness/heavy-admission.mjs';
@@ -372,25 +373,32 @@ function ownsMarker(current, expected) {
 }
 
 /** A killed child cannot write its result. Settle only the still-owned request; never requeue it silently. */
-export function recordKilledVerification(dir, expected, error, ceilingMs) {
+export function recordKilledVerification(dir, expected, error, ceilingMs, lockOptions = {}) {
   const infrastructure = verificationInfrastructureFailure({ exitCode: error?.status, signal: error?.signal,
     timedOutPhase: error?.timedOutPhase, ceilingMs });
   if (!infrastructure) return;
   const gitDir = tryGit(['rev-parse', '--absolute-git-dir'], dir) || join(dir, '.git');
-  const current = readVerifyMarker(gitDir);
-  if (!current || current.status !== 'running') return;
-  // A marker bearing OUR runId was stamped by our own child, so it is ours whatever tree/sha that child captured at
-  // its start (the agent may have edited the tree after `request`). Anything else must still match, field for
-  // field, the request we observed — and settle under that request's sha.
-  const ours = !!expected.runId && current.runId === expected.runId;
-  if (!ours && (current.sha !== expected.sha || current.suites !== expected.suites
-      || current.treeHash !== expected.treeHash || !ownsMarker(current, expected))) return;
-  const finished = verifyFinishBody(current, { sha: ours ? current.sha : expected.sha, exitCode: error?.status,
-    infrastructure, finishedAt: new Date().toISOString(), treeHash: null });
-  const path = join(gitDir, VERIFY_FILENAME);
-  const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(finished, null, 2) + '\n');
-  renameSync(tmp, path);
+  const release = markerLockWithRetry(gitDir, lockOptions);
+  if (!release) {
+    process.stderr.write('verify-dispatch: marker lock still busy after bounded wait; leaving marker for orphan detection; rerun node scripts/verify-lane.mjs.\n');
+    return;
+  }
+  try {
+    const current = readVerifyMarker(gitDir);
+    if (!current || current.status !== 'running') return;
+    // A marker bearing OUR runId was stamped by our own child, so it is ours whatever tree/sha that child captured at
+    // its start (the agent may have edited the tree after `request`). Anything else must still match, field for
+    // field, the request we observed — and settle under that request's sha.
+    const ours = !!expected.runId && current.runId === expected.runId;
+    if (!ours && (current.sha !== expected.sha || current.suites !== expected.suites
+        || current.treeHash !== expected.treeHash || !ownsMarker(current, expected))) return;
+    const finished = verifyFinishBody(current, { sha: ours ? current.sha : expected.sha, exitCode: error?.status,
+      infrastructure, finishedAt: new Date().toISOString(), treeHash: null });
+    const path = join(gitDir, VERIFY_FILENAME);
+    const tmp = `${path}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(finished, null, 2) + '\n');
+    renameSync(tmp, path);
+  } finally { release(); }
 }
 
 function parseFlags(argv) {

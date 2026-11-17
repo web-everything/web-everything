@@ -352,7 +352,7 @@ describe('wiring (source pins)', () => {
   });
   it('verify-lane records the terminal outcome right after the marker write, and reset clears the deferred file on both paths', () => {
     const src = readFileSync('scripts/verify-lane.mjs', 'utf8');
-    expect(src).toMatch(/writeMarker\(\{ \.\.\.finished,[^\n]*\n\s*maybeRecordGreen\([^\n]*\n(?:\s*\/\/[^\n]*\n)*\s*try \{ recordTerminalVerifyOutcome\(GIT_DIR, finished\); \}/);
+    expect(src).toMatch(/updateOwnedMarker\(\{ gitDir: GIT_DIR, expected: ownedStart, readMarker, writeMarker,[^\n]*\n[^\n]*\.\.\.finished,[^\n]*\n[^\n]*\n[^\n]*\n(?:\s*lifecycle\?\.stop\(\);\n)?\s*maybeRecordGreen\([^\n]*\n(?:\s*\/\/[^\n]*\n)*\s*try \{ recordTerminalVerifyOutcome\(GIT_DIR, finished\); \}/);
     const reset = src.slice(src.indexOf("if (MODE === 'reset') {"), src.indexOf("emit({ sha: headSha, status: 'reset'"));
     expect(reset.match(/clearDeferredMarker\(GIT_DIR\)/g)).toHaveLength(2);
   });

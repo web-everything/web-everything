@@ -16,6 +16,7 @@ import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 import { tmpdir } from 'node:os';
 import { resolveGateCeiling, runLaneGate, laneNeedsVerifyDispatch, inFlightSuperseded, sameVerifyRequest, resolveSupersedePolicy, resolveMaxInFlight, laneIndicesIn, spawnGateBounded, runVerifyDispatch, recordKilledVerification, GATE_STARTED_MARKER, GATE_QUEUED_MARKER, processGroupMayExist, killOrphanGroup, dispatchedRunState, killAdoptedGroup } from '../verify-dispatch.mjs';
 import { heldSlots, admissionLockRoot } from '../../readiness/heavy-admission.mjs';
+import { markerLock } from '../../lib/lane-verify-lifecycle.mjs';
 import { acquireRunnerLease, makeOwner } from '../../../skills-src/conveyor/runner-lock.mjs';
 import { VERIFY_DAEMON_LEASE_KEY, buildCliDaemonEffects, wireGateJobs } from '../../../skills-src/conveyor/verify-daemon.mjs';
 import { createVerifyGateJobs, VERIFY_GATE_JOB_KIND, gatePath } from '../verify-gate-job.mjs';
@@ -756,6 +757,56 @@ describe('verify-dispatch — no second admission chokepoint (#4373)', () => {
 });
 
 describe('killed verification ownership', () => {
+  it.each([false, true])('retries a contended marker lock and rechecks ownership after acquiring it (replaced: %s)', replaced => {
+    const root = mkdtempSync(join(tmpdir(), 'killed-verify-contention-'));
+    let held;
+    try {
+      makeLane(root);
+      const gitDir = join(root, '.git');
+      const path = join(gitDir, '.lane-verify');
+      const expected = { sha: git(['rev-parse', 'HEAD'], root), status: 'running', suites: 'true',
+        treeHash: 'same', startedAt: 'old', runId: 'ours' };
+      const replacement = { ...expected, startedAt: 'new', runId: 'replacement' };
+      writeFileSync(path, JSON.stringify(expected));
+      held = markerLock(gitDir);
+      expect(held).toBeTypeOf('function');
+      let clock = 0;
+      const lock = vi.fn(dir => markerLock(dir));
+      recordKilledVerification(root, expected, { signal: 'SIGKILL', timedOutPhase: 'gate' }, 1000,
+        { lock, now: () => clock, wait: ms => {
+          clock += ms;
+          expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual(expected);
+          if (replaced) writeFileSync(path, JSON.stringify(replacement));
+          held();
+        } });
+      expect(clock).toBe(50);
+      expect(lock).toHaveBeenCalledTimes(2);
+      const record = JSON.parse(readFileSync(path, 'utf8'));
+      if (replaced) expect(record).toEqual(replacement);
+      else expect(record).toMatchObject({ status: 'infrastructure-failure', infrastructure: { reason: 'verify-timeout' } });
+      const released = markerLock(gitDir);
+      expect(released).toBeTypeOf('function');
+      released();
+    } finally { held?.(); rmSync(root, { recursive: true, force: true }); }
+  });
+  it('bounds killed-marker lock contention to 2s, preserves the marker and prints the orphan fallback', () => {
+    const root = mkdtempSync(join(tmpdir(), 'killed-verify-busy-'));
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      makeLane(root);
+      const path = join(root, '.git', '.lane-verify');
+      const expected = { sha: git(['rev-parse', 'HEAD'], root), status: 'running', runId: 'ours' };
+      writeFileSync(path, JSON.stringify(expected));
+      let clock = 0;
+      const lock = vi.fn(() => null);
+      recordKilledVerification(root, expected, { signal: 'SIGKILL', timedOutPhase: 'gate' }, 1000,
+        { lock, now: () => clock, wait: ms => { clock += ms; } });
+      expect(clock).toBe(2000);
+      expect(lock).toHaveBeenCalledTimes(41);
+      expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual(expected);
+      expect(stderr).toHaveBeenCalledWith(expect.stringMatching(/marker lock still busy.*leaving marker for orphan detection.*rerun/));
+    } finally { stderr.mockRestore(); rmSync(root, { recursive: true, force: true }); }
+  });
   it('never overwrites a newer request for the same SHA and gate', () => {
     const root = mkdtempSync(join(tmpdir(), 'killed-verify-owner-'));
     try {
@@ -1378,9 +1429,10 @@ describe('PR 4764 round 10 — a held lane never spends the global in-flight bud
       input: { pool: 'flagtest', lane: 1, dir: laneDir, headSha, suites: 'true', treeHash: null, requestStartedAt: null, runId: 'run-a' } });
     store.update(a.id, (r) => markFailed(r, { at: new Date().toISOString(), reason: 'handle dead; 2/2 attempts used' }));
     writeFileSync(gatePath(store.dir, a.id), JSON.stringify({ pid: 910, handle: 'h:910:x', runId: 'run-a' })); // A's gate survives
+    const scanLane = vi.fn(() => []);
     const { gateJobs, gateAsJob } = wireGateJobs({ WE_VERIFY_GATE_AS_JOB: '0' }, () => createVerifyGateJobs({ store,
       reattach: async () => ({ actions: [] }), readHead: () => 'c0de', log: () => {}, evict: () => {}, snapshot: {},
-      probe: (h) => (h === 'h:910:x' ? 'alive' : 'dead'), pidExists: () => false, groupExists: () => false, kill: () => {} }));
+      probe: (h) => (h === 'h:910:x' ? 'alive' : 'dead'), pidExists: () => false, groupExists: () => false, kill: () => {}, scanLane }));
     const spawnGate = vi.fn(() => new Promise(() => {}));
     const effects = buildCliDaemonEffects({ gateJobs, gateAsJob, isDraining: () => false, log: { error: () => {} },
       runVerify: (o) => runVerifyDispatch({ ...o, poolRoot, spawnGate, maxInFlight: 1 }) });
@@ -1388,6 +1440,7 @@ describe('PR 4764 round 10 — a held lane never spends the global in-flight bud
     expect(effects.inFlight.get(laneDir)).toMatchObject({ jobId: a.id });
     expect(result.dispatched).toMatchObject([{ lane: 2 }]);
     expect(spawnGate).toHaveBeenCalledTimes(1);
+    expect(scanLane).toHaveBeenCalledWith(lane2);
   });
 });
 

@@ -653,6 +653,8 @@ Verify-daemon orphan fixtures must inject both `isAlive` and `groupAlive`: a fak
 does not imply its host process group is gone. Signal-zero probes can return `EPERM` in a
 restricted execution environment, which correctly retains the entry. The real-process adoption
 test additionally requires permission to inspect child argv with `ps`.
+Rollback gate-job fixtures with synthetic processes must also inject `scanLane`; an unreadable
+host process list correctly holds the lane, so assert the injected scan reaches the healthy lane.
 
 Runner fixtures using synthetic PIDs must inject `identity` alongside `alive`: a successful
 existence probe still checks process identity. Stamp fixtures must also inject `identityOf`
@@ -4404,3 +4406,34 @@ automatic discovery and explicit resume behind both guards and both retry budget
 Exercise pending CI after timing settings change, revoked clearance, green completion,
 and budget exhaustion after that intervening failure. Unknown pending outcomes remain
 non-replayable; CI-held provenance does not establish that a write was never applied.
+
+## Verify marker orphan recovery
+
+Modern `.lane-verify` running records carry the verify process PID, run ID and a 30-second
+heartbeat. A proven live verify PID wins over heartbeat age; a dead PID or an expired heartbeat
+without live PID evidence is orphaned, never green. Legacy records keep their startedAt TTL behavior.
+Unstarted requests get at least 30 minutes and require readable evidence of no dispatcher entry
+before recovery. `orphanHeartbeatStaleMinutes` in the verify settings cascade defaults to 3.
+
+`verify-lane.mjs check` (including `--wait`) takes over a current-HEAD orphan under the shared
+marker lock and runs verification in the foreground. A refusal includes the exact rerun command.
+`status` scans the lane pool read-only. Heartbeats, terminal writes and dispatcher kill settlement
+use the same lock and run ownership checks; a dead lock holder is recoverable, a live one never
+expires. Keep liveness and exit-path tests clock/PID-injected in
+`scripts/lib/__tests__/lane-verify-lifecycle.test.mjs`; the hermetic CLI takeover/status cases live
+in `scripts/__tests__/verify-lane-orphan.test.mjs`. Run these through heavy admission.
+
+Successful kernel PID probes stay alive when argv or start-time evidence is unreadable. Only ESRCH,
+an explicit different argv run ID, or a process start proven after the marker's second disproves
+ownership; equal-second start times stay indeterminate and alive. Cover these with stale heartbeats
+so unreadable identity cannot orphan a live run. Signal handlers kill the active gate tree before
+exiting with infrastructure code 3. Normal completion, lifecycle terminal writes and dispatcher kill settlement retry the lock
+for at most two seconds, then leave the marker for dead-PID orphan detection and log an inspect/rerun
+instruction. Heartbeat read/CAS/write also holds the lock; no writer bypasses it.
+Normal-completion contention tests must exercise the CLI caller without supplying its retry option.
+`scripts/__tests__/verify-lane-admission-timeout.test.mjs` is a required verification guard:
+its CLI subprocesses force `timedOut` at both `acquireAdmission` and `withBaseRerunSlot`,
+assert exit 3 and the persisted infrastructure failure, and prove the corresponding gate never starts.
+Keep successful-admission controls so a missing gate sentinel cannot hide an unreachable fixture.
+Early refusal and card-only terminal writes share the marker lock and preserve executing
+runs. Handoff readers accept both legacy arrays and the daemon's `{ writtenAt, records }` envelope.

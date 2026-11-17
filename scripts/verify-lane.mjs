@@ -28,7 +28,8 @@
  *   node scripts/verify-lane.mjs --repo=~/workspace/.lanes/web-everything/lane-3   # verify a specific lane clone
  *   node scripts/verify-lane.mjs run                  # xpnhz4o — run the SAME default gate foreground, but record NO marker (the fix/ci-heal gate)
  *   node scripts/verify-lane.mjs --json              # machine-readable {sha, status, exitCode} on stdout
- *   node scripts/verify-lane.mjs check               # READ-ONLY: print the current marker's gate verdict for HEAD, run nothing
+ *   node scripts/verify-lane.mjs check               # report the verdict; take over a proven orphan in the foreground
+ *   node scripts/verify-lane.mjs status              # read-only liveness across the lane pool
  *   node scripts/verify-lane.mjs check --require-verified   # exit non-zero unless HEAD has a fresh GREEN marker (the gate pr-land applies)
  *   node scripts/verify-lane.mjs check --wait=<ms>   # #4358 — BLOCK internally (polling the marker, not your turn loop),
  *     but ONLY while the marker is `running` — the one status a background process can still move off of. Returns the
@@ -47,9 +48,8 @@
  *     The sanctioned call for an interactive agent session: the actual suite run is picked up and executed by
  *     `scripts/conveyor/verify-dispatch.mjs` (via the verify daemon, unbound by the agent tool's foreground
  *     window) on its next tick, which runs the SAME `verify` mode below to completion. An agent that called
- *     `request` then polls `check` across its own turns — each `check` call is a fast marker read, never a
- *     suite run, so no single call can ever exceed the foreground window, no matter how long the gate itself
- *     takes. `request` reuses the exact START-write guard `verify` already applies (a foreign terminal marker is
+ *     `request` then polls `check` across its own turns. Live and legacy markers remain fast reads; a proven
+ *     orphan is recovered by running the same verification in the foreground. `request` reuses the exact START-write guard `verify` already applies (a foreign terminal marker is
  *     archived, never clobbered) — it is that guard's own first half, factored out, not a new decision.
  *
  * Exit codes: 0 = green (marker recorded green) / `check` verdict ok / `reset` cleared or was a no-op / `request`
@@ -90,7 +90,12 @@ import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
 import { SHARD_RUN_SCRIPT, localPhaseReason, localPhaseShape, phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
 import { startTreeWatchdog } from './lib/tree-watchdog.mjs';
+import { killProcessTree, ownProcessGroup } from './lib/bounded-child.mjs';
 import { shellQuote, isShardWrapperCommand } from './lib/verify-lane-gate.mjs';
+import { markerLock, sameVerifyRun, updateOwnedMarker, startVerifyLifecycle } from './lib/lane-verify-lifecycle.mjs';
+import { classifyRunningMarker, verifyPidAlive } from './lib/lane-verify.mjs';
+import { readLaneClaim, verifyJobsDir } from './conveyor/verify-gate-job.mjs';
+import { VERIFY_DAEMON_INFLIGHT_FILE } from '../skills-src/conveyor/verify-daemon.mjs';
 import { randomBytes } from 'node:crypto';
 import { summarizeSelection, selectionNotice, verdictNotice } from './lib/verify-selection-log.mjs';
 const verificationInfrastructureFailure = result => baseInfrastructureFailure(result) ?? remoteInfrastructureFailure(result);
@@ -103,10 +108,11 @@ const positionals = [];
 if (process.argv.slice(2).some((a) => a === '--help' || a === '-h')) {
   process.stdout.write(`verify-lane — verify a lane clone before it lands (writes the .lane-verify marker).
 
-Usage: node scripts/verify-lane.mjs [verify|request|check|reset|run] [flags]
+Usage: node scripts/verify-lane.mjs [verify|request|check|status|reset|run] [flags]
   (none)    run the diff-selected gate here and stamp the marker
   request   stamp a running marker; the verify daemon runs the gate
-  check     read-only verdict for HEAD (--wait=<ms> blocks until it settles)
+  check     verdict for HEAD; recover an orphan in the foreground (--wait=<ms>)
+  status    read-only marker liveness across the lane pool
   reset     clear a stale marker
   run       synchronous marker-less run
 Flags: --repo=<dir> --json --require-verified --dry-run (print default gate only) --help/-h
@@ -133,8 +139,8 @@ const { requireVerified: REQUIRE_VERIFIED, breakGlass: VERIFY_BREAK_GLASS } = re
 // commands nor any other child we spawn can read it. Later in-band queue markers echo it (see `timedRunGate`).
 const MARKER_NONCE_SUFFIX = markerNonceSuffix(process.env[VERIFY_MARKER_NONCE_ENV]);
 delete process.env[VERIFY_MARKER_NONCE_ENV];
-const MODE = flags['dry-run'] ? 'print-gate' : positionals[0] === 'check' ? 'check' : positionals[0] === 'reset' ? 'reset'
-  : positionals[0] === 'request' ? 'request' : positionals[0] === 'run' ? 'run' : 'verify';
+let MODE = flags['dry-run'] ? 'print-gate' : positionals[0] === 'check' ? 'check' : positionals[0] === 'reset' ? 'reset'
+  : positionals[0] === 'status' ? 'status' : positionals[0] === 'request' ? 'request' : positionals[0] === 'run' ? 'run' : 'verify';
 
 // The lane is agent-writable, and the fix daemon runs `request` against it: its `.git/config` must never be able to execute
 // a command here (`core.fsmonitor`, hooks, `diff.external`/textconv). Env-pinned config + argument rewrites; a lane that defines a
@@ -154,6 +160,59 @@ const MARKER = join(GIT_DIR, VERIFY_FILENAME);
 // pr-land's finish-guard can never drift. It resolves `<gitDir>/.lane-verify`, folds a valid-JSON non-object to
 // `{ corrupt: true }` (never `absent`, which would fail OPEN), and returns null only for a genuinely missing file.
 const readMarker = () => readVerifyMarker(GIT_DIR);
+
+const ORPHAN_STALE_MS = verifySetting('orphanHeartbeatStaleMinutes', process.env) * 60_000;
+process.stderr.write(`verify-lane: orphan heartbeat deadline ${ORPHAN_STALE_MS}ms (orphanHeartbeatStaleMinutes, ${verifySettingSource('orphanHeartbeatStaleMinutes', process.env)})\n`);
+
+// Both durable gate jobs and the legacy daemon handoff can hold an unstarted request.
+function dispatcherRunFor(repo) {
+  try {
+    const claim = readLaneClaim(verifyJobsDir(), repo);
+    if (claim.unreadable) return null;
+    if (claim.claim && !claim.released) return true;
+    let entries;
+    try { entries = JSON.parse(readFileSync(VERIFY_DAEMON_INFLIGHT_FILE, 'utf8')); }
+    catch (e) { return e.code === 'ENOENT' ? false : null; }
+    if (!Array.isArray(entries)) entries = entries?.records;
+    if (!Array.isArray(entries)) return null;
+    return entries.some(entry => entry.dir === repo && verifyPidAlive(entry.pid) !== false);
+  } catch { return null; }
+}
+const liveness = (record, repo = REPO) => classifyRunningMarker({ record, nowMs: Date.now(), staleMs: ORPHAN_STALE_MS,
+  pidAlive: record?.pid ? verifyPidAlive(record.pid, { record }) : null,
+  dispatcherRun: record?.requestedAt && !record?.pid ? dispatcherRunFor(repo) : undefined });
+let ownedStart = null;
+let lifecycle = null;
+let terminateGate = null;
+function ownLifecycle(record) {
+  ownedStart = record;
+  lifecycle ??= startVerifyLifecycle({ expected: record, terminateGate: () => {
+    const stopGate = terminateGate;
+    terminateGate = null;
+    stopGate?.();
+  }, update: (update, options) => updateOwnedMarker({
+    gitDir: GIT_DIR, expected: ownedStart, readMarker, writeMarker, update, ...options,
+  }) });
+}
+const rerunCommand = () => `node scripts/verify-lane.mjs --repo=${shellQuote(REPO)}`;
+
+if (MODE === 'status') {
+  const markers = [];
+  for (const pool of tryReaddir(defaultPoolRoot(REPO))) {
+    for (const lane of tryReaddir(join(defaultPoolRoot(REPO), pool))) {
+      if (!/^lane-\d+$/.test(lane)) continue;
+      const repo = join(defaultPoolRoot(REPO), pool, lane);
+      const record = readVerifyMarker(join(repo, '.git'));
+      if (!record) continue;
+      const state = record.status === 'running' ? liveness(record, repo)
+        : { state: record.status === 'green' ? 'green' : 'red', reason: record.infrastructure?.reason ?? (record.corrupt ? 'verify-corrupt' : record.status) };
+      markers.push({ pool, lane, sha: record.sha ?? null, ...state });
+    }
+  }
+  if (AS_JSON) writeAllSync(1, JSON.stringify({ markers }) + '\n');
+  else writeAllSync(1, markers.map((marker) => `${marker.pool}/${marker.lane} ${marker.state} (${marker.reason})\n`).join(''));
+  process.exit(0);
+}
 
 // #5141 — older/corrupt markers have no phase telemetry to transport.
 function markerPhases(record) {
@@ -186,11 +245,29 @@ function writeMarker(record) {
   renameSync(tmp, MARKER);
 }
 
+// Early refusal/card-only results have not claimed a run yet. Serialize with all other writers
+// and refuse a live/unknown executing owner, including one that appeared during gate selection.
+function writeEarlyTerminal(record) {
+  const release = markerLock(GIT_DIR);
+  if (!release) emit({ sha: headSha, status: 'running', ok: false, reason: 'marker-busy', detail: 'marker ownership busy; retry verification.' }, 3);
+  try {
+    const current = readMarker();
+    if (ownedStart && (!sameVerifyRun(current, ownedStart) || current?.status !== 'running')) {
+      emit({ sha: headSha, status: 'superseded', ok: false, detail: 'marker ownership changed during gate selection.' }, 3);
+    }
+    if (current?.status === 'running' && current.pid && current.pid !== process.pid && liveness(current).state !== 'orphaned') {
+      emit({ sha: headSha, status: 'running', ok: false, reason: 'live-pid', detail: 'verification already running; use check --wait=<ms>.' }, 2);
+    }
+    writeMarker(record);
+  } finally { release(); }
+}
+
 // #xlewnhs — a daemon-dispatched run (`--run-id`) says which selection it used on its selection and verdict lines, as
 // `⚠ verify-lane:` notices the dispatcher copies into the daemon log (we:scripts/lib/verify-selection-log.mjs).
 const DISPATCHED_RUN = typeof flags['run-id'] === 'string';
 let SELECTION = null;
 function emit(result, exitCode) {
+  if (ownedStart && exitCode !== 0) result.rerun ??= rerunCommand();
   if (DISPATCHED_RUN && MODE === 'verify') {
     try { process.stderr.write(`${verdictNotice({ sha: result.sha, status: result.status, summary: SELECTION })}\n`); } catch { /* logging only */ }
   }
@@ -202,21 +279,47 @@ function emit(result, exitCode) {
 const headSha = tryGit(['rev-parse', 'HEAD']);
 if (!headSha) emit({ sha: null, status: 'error', reason: 'no-head', detail: `could not resolve HEAD in ${REPO} — is this a git checkout?` }, 3);
 
-// #5466 — a revert-red run that was killed mid-revert left a journal: put the fixed content back from git BEFORE this run
-// hashes or tests the tree, whatever the current revert-red mode. If it cannot be put back, refuse to verify that tree.
-if (MODE === 'verify' || MODE === 'run') {
-  const recovery = recoverRevertRed({ checkout: REPO });
-  if (recovery.pending) process.stderr.write(`revert-red: restored a revert a killed run left behind (${recovery.restored.length} file(s))${recovery.ok ? '' : ` — FAILED: ${recovery.detail}`}\n`);
-  if (!recovery.ok) emit({ sha: headSha, status: 'error', reason: 'revert-red-unrecovered', detail: `a revert-red run left reverted files in ${REPO} and they could not be restored (${recovery.detail}); the tree is not the commit being verified.` }, 3);
-}
-
-// ── `check` — READ-ONLY: report the finish-guard verdict for HEAD, run nothing. This is exactly the gate
+// ── `check` — report the finish-guard verdict, recovering a proven orphan for this HEAD. The gate
 //    pr-land applies, exposed so a delivery step can pre-flight it (and so it is directly testable end-to-end).
+let recoverOrphan;
+if (MODE === 'check') {
+  recoverOrphan = record => {
+    if (record?.sha !== headSha || record.status !== 'running' || liveness(record).state !== 'orphaned') return false;
+    const rerun = rerunCommand();
+    let release;
+    try { release = markerLock(GIT_DIR); } catch (e) {
+      emit({ sha: headSha, status: 'orphaned', ok: false, reason: liveness(record).reason, takeoverReason: 'takeover-failed', rerun,
+        detail: `cannot acquire marker ownership (${e.message}); rerun ${rerun}` }, 3);
+    }
+    if (!release) emit({ sha: headSha, status: 'orphaned', ok: false, reason: liveness(record).reason, takeoverReason: 'takeover-busy', rerun,
+      detail: `another check owns takeover; rerun ${rerun}` }, 2);
+    try {
+      const current = readMarker();
+      if (JSON.stringify(current) !== JSON.stringify(record) || liveness(current).state !== 'orphaned'
+        || tryGit(['rev-parse', 'HEAD']) !== headSha) return false;
+      const claimed = verifyStartBody({ sha: headSha, suites: null, startedAt: new Date().toISOString(),
+        pid: process.pid, runId: randomBytes(16).toString('hex'), heartbeatAt: new Date().toISOString() });
+      writeMarker(claimed);
+      ownLifecycle(claimed);
+      MODE = 'verify';
+      process.stderr.write(`verify-lane: recovered orphan (${liveness(record).reason}); running foreground verification\n`);
+      return true;
+    } catch (e) {
+      release();
+      emit({ sha: headSha, status: 'orphaned', ok: false, reason: liveness(record).reason, takeoverReason: 'takeover-failed', rerun,
+        detail: `cannot start verification (${e.message}); rerun ${rerun}` }, 3);
+    } finally { release(); }
+  };
+  // Validate wait syntax before taking ownership.
+  if (flags.wait !== undefined && (typeof flags.wait !== 'string' || !Number.isFinite(Number(flags.wait)) || Number(flags.wait) <= 0)) {
+    emit({ sha: headSha, status: 'error', reason: 'bad-wait', ok: false, detail: '--wait must be a positive number of milliseconds.' }, 3);
+  }
+  recoverOrphan(readMarker());
+}
 if (MODE === 'check') {
   // #4358 — `--wait=<ms>` is a FLAG on this existing subcommand, not a new one (see the usage banner above for
   // why that shape specifically matters to the guard). Bare `check` (no `--wait`) below is completely
-  // unchanged: one fast, non-blocking marker read, exactly as every other caller (humans, other scripts) already
-  // relies on.
+  // unchanged for live/legacy markers; a proven orphan is recovered above.
   if (flags.wait !== undefined) {
     // #4358 — a BARE `--wait` (no `=<ms>`) parses to the boolean `true` (see the tiny arg parser above), and
     // `Number(true) === 1` would otherwise sail past the finite/positive check as a silent ~1ms wait. Only a
@@ -238,7 +341,7 @@ if (MODE === 'check') {
       headSha,
       breakGlass: VERIFY_BREAK_GLASS,
       requireVerified: REQUIRE_VERIFIED,
-      ceilingMs,
+      ceilingMs, staleMs: ORPHAN_STALE_MS, dispatcherRun: () => dispatcherRunFor(REPO),
       // #4296 (converge round 2, standards-conformance juror) — `base` is explicit here, never the wrapper's own
       // default: this file's default gate (`resolveDefaultGate`, above) already hardcodes `origin/main` as the
       // ONLY base a WE lane clone verifies against (there is no `--base=` flag on this CLI), so naming it here
@@ -246,14 +349,17 @@ if (MODE === 'check') {
       resolveLaneRelevantChangeSince: (record) => laneRelevantChangeSinceForRecord({ record, headSha, base: 'origin/main', runGit: git }),
     });
     const settled = readMarker();
-    emit({ ...result, ...markerPhases(settled), ...markerRedCause(settled), ...markerRevertRed(settled) }, result.ok ? 0 : 2);
+    if (result.status === 'orphaned') recoverOrphan(settled);
+    if (MODE === 'check') emit({ ...result, ...markerPhases(settled), ...markerRedCause(settled), ...markerRevertRed(settled) }, result.ok ? 0 : 2);
   }
-  const bareCheckRecord = readMarker();
-  const v = verifyGateDecision({
-    record: bareCheckRecord, headSha, breakGlass: VERIFY_BREAK_GLASS, requireVerified: REQUIRE_VERIFIED,
-    laneRelevantChangeSince: laneRelevantChangeSinceForRecord({ record: bareCheckRecord, headSha, base: 'origin/main', runGit: git }),
-  });
-  emit({ sha: headSha, ...v, ...markerPhases(bareCheckRecord), ...markerRedCause(bareCheckRecord), ...markerRevertRed(bareCheckRecord) }, v.ok ? 0 : 2);
+  if (MODE === 'check') {
+    const bareCheckRecord = readMarker();
+    const v = verifyGateDecision({
+      record: bareCheckRecord, headSha, breakGlass: VERIFY_BREAK_GLASS, requireVerified: REQUIRE_VERIFIED, staleMs: ORPHAN_STALE_MS, dispatcherRun: dispatcherRunFor(REPO),
+      laneRelevantChangeSince: laneRelevantChangeSinceForRecord({ record: bareCheckRecord, headSha, base: 'origin/main', runGit: git }),
+    });
+    emit({ sha: headSha, ...v, ...markerPhases(bareCheckRecord), ...markerRedCause(bareCheckRecord), ...markerRevertRed(bareCheckRecord) }, v.ok ? 0 : 2);
+  }
 }
 
 // #3378 review (rounds 2-4) — `isConfirmedOwnLease` itself now refuses an `ownerSession` match that is either
@@ -326,6 +432,14 @@ if (MODE === 'reset') {
   clearDeferredMarker(GIT_DIR);
   const desc = record && !record.corrupt ? `${record.status || 'stranded'} marker for ${String(record.sha || '?').slice(0, 8)}` : 'a corrupt marker';
   emit({ sha: headSha, status: 'reset', reason: 'cleared', detail: `cleared ${desc} — ${MARKER} removed.` }, 0);
+}
+
+// #5466 — a revert-red run that was killed mid-revert left a journal: put the fixed content back from git BEFORE this run
+// hashes or tests the tree, whatever the current revert-red mode. If it cannot be put back, refuse to verify that tree.
+if (MODE === 'verify' || MODE === 'run') {
+  const recovery = recoverRevertRed({ checkout: REPO });
+  if (recovery.pending) process.stderr.write(`revert-red: restored a revert a killed run left behind (${recovery.restored.length} file(s))${recovery.ok ? '' : ` — FAILED: ${recovery.detail}`}\n`);
+  if (!recovery.ok) emit({ sha: headSha, status: 'error', reason: 'revert-red-unrecovered', detail: `a revert-red run left reverted files in ${REPO} and they could not be restored (${recovery.detail}); the tree is not the commit being verified.` }, 3);
 }
 
 // ── `verify` — run the suites SYNCHRONOUSLY and record the outcome ───────────────────────────────────
@@ -444,7 +558,7 @@ if (typeof flags.gate === 'string') {
       // A dispatched child must leave a TERMINAL record (red, exit 3) — leaving the `running` request as it was would
       // make the dispatcher re-spawn this same refusal on every sweep. A plain `request` records nothing.
       if (dispatchedChild) {
-        writeMarker({ ...verifyFinishBody(verifyStartBody({ sha: headSha, suites: GATE, startedAt: new Date().toISOString(), treeHash: null }),
+        writeEarlyTerminal({ ...verifyFinishBody(verifyStartBody({ sha: headSha, suites: GATE, startedAt: new Date().toISOString(), treeHash: null }),
           { finishedAt: new Date().toISOString(), exitCode: 3, sha: headSha, suites: GATE, treeHash: null }), redCause: 'refused', redCauseFiles: [] });
       }
       emit({ sha: headSha, status: 'gate-refused', reason: 'explicit-gate-not-affected-test', ok: false, redCause: 'refused', redCauseFiles: [], detail: `${refusal}. The default selection is blocked for this diff, so supply an affected-test gate such as \`--gate="npx vitest related <files> --run"\`; ${dispatchedChild ? 'recorded a red marker so it is not re-dispatched' : 'no marker was recorded'}.` }, 3);
@@ -606,7 +720,7 @@ if (testsFirstAdvisory) process.stderr.write(`⚠ ${testsFirstAdvisory}\n`);
 if (resolvedGate?.decision?.mode === 'card-only-skip') {
   const now = new Date().toISOString();
   const detail = `card-only diff (CI's definition) - local gate skipped for ${headSha.slice(0, 8)}; CI's check:standards stays the merge authority.`;
-  writeMarker({ ...verifyFinishBody(verifyStartBody({ sha: headSha, suites: GATE, startedAt: now, treeHash: currentTreeHash }),
+  writeEarlyTerminal({ ...verifyFinishBody(verifyStartBody({ sha: headSha, suites: GATE, startedAt: now, treeHash: currentTreeHash }),
     { finishedAt: now, exitCode: 0, sha: headSha, suites: GATE, treeHash: currentTreeHash }), skipped: 'card-only', executedGate: resolvedGate.command });
   maybeRecordGreen({ status: 'green', treeHash: currentTreeHash, skipped: 'card-only' });
   emit({ sha: headSha, status: 'green', reason: 'card-only-skip', exitCode: 0, detail }, 0);
@@ -626,7 +740,24 @@ if (MODE === 'request') {
   }
 }
 
-if (MODE !== 'run') writeMarker(verifyStartBody({ sha: headSha, suites: GATE, startedAt: new Date().toISOString(), treeHash: currentTreeHash, runId: typeof flags['run-id'] === 'string' ? flags['run-id'] : undefined }));
+if (MODE !== 'run') {
+  const release = markerLock(GIT_DIR);
+  if (!release) emit({ sha: headSha, status: 'running', ok: false, reason: 'marker-busy', rerun: rerunCommand(), detail: `marker ownership busy; rerun ${rerunCommand()}` }, 3);
+  try {
+    const current = readMarker();
+    const active = current?.status === 'running' && current.pid && liveness(current).state === 'alive';
+    if (MODE === 'verify' && active && !sameVerifyRun(current, ownedStart)) {
+      emit({ sha: headSha, status: 'running', ok: false, reason: 'live-pid', detail: 'verification already running; use check --wait=<ms>.' }, 2);
+    }
+    const now = new Date().toISOString();
+    const record = verifyStartBody({ sha: headSha, suites: GATE, startedAt: now, treeHash: currentTreeHash,
+      runId: MODE === 'request' ? (active ? current.runId : undefined) : ownedStart?.runId ?? (typeof flags['run-id'] === 'string' ? flags['run-id'] : randomBytes(16).toString('hex')),
+      pid: MODE === 'request' ? (active ? current.pid : undefined) : process.pid,
+      heartbeatAt: now, ...(MODE === 'request' ? { requestedAt: now } : {}) });
+    writeMarker(record);
+    if (MODE === 'verify') ownLifecycle(record);
+  } finally { release(); }
+}
 
 // #3105 — `request` stops HERE: the marker is stamped, nothing has run yet, and this call already returns
 // (`emit` calls `process.exit`). The actual suite run is picked up by `scripts/conveyor/verify-dispatch.mjs`
@@ -643,9 +774,8 @@ if (MODE === 'request') {
 }
 
 // 2. Admission: queue on the #3461 heavy-command capacity semaphore BEFORE running the gate — `check:standards`
-//    and `test:unit` (this GATE) are named members of the closed heavy-command set, so this is the invocation-time
-//    (never lane-acquire-time) chokepoint the semaphore gates. Fails OPEN on a queuing timeout (proceeds unslotted
-//    with a stderr warning) — the residual-risk tradeoff `heavy-admission.mjs`'s own header names.
+//    and `test:unit` (this GATE) are named members of the closed heavy-command set. Admission timeout is a
+//    terminal infrastructure failure; it never leaves a running marker or starts work without capacity.
 //
 // #4360 — THIS `acquireSlotBlocking` CALL IS THE SOLE ADMISSION CHOKEPOINT FOR THE WHOLE DISPATCH PATH,
 // including `scripts/conveyor/verify-dispatch.mjs`'s daemon-side dispatch of several lanes' gates at once.
@@ -682,7 +812,8 @@ async function acquireAdmission(phase, command) {
     lane: laneMatch ? laneMatch[1] : null, kind: routing.kind,
   });
   if (acquired.timedOut) {
-    process.stderr.write(`⚠ heavy-command admission: timed out after ${acquired.waitedMs}ms waiting for capacity (cap=${ADMISSION_CAP}) — proceeding unslotted.\n`);
+    lifecycle?.terminal('admission-timeout');
+    emit({ sha: headSha, status: 'infrastructure-failure', ok: false, reason: 'admission-timeout', detail: `admission timed out; rerun ${rerunCommand()}` }, 3);
   } else if (acquired.waitedMs > 0) {
     process.stderr.write(`heavy-command admission: acquired slot-${acquired.slot} after waiting ${acquired.waitedMs}ms (cap=${ADMISSION_CAP}).\n`);
   }
@@ -727,6 +858,10 @@ const HEAVY_ADMISSION_MODULE = new URL('./readiness/heavy-admission.mjs', import
 // gate". Never remove or reword this line without updating `verify-dispatch.mjs`'s own `GATE_STARTED_MARKER`.
 // PR #2982 round-2 review — re-sample the tree hash after the admission wait (and again after the gate, below):
 // a worker editing while this run queued or ran means the gate did not see the start-of-run tree.
+if (MODE === 'verify' && tryGit(['rev-parse', 'HEAD']) !== headSha) {
+  lifecycle?.terminal('head-moved');
+  emit({ sha: headSha, status: 'head-moved', ok: false, reason: 'head-moved', detail: `HEAD changed before the gate; rerun ${rerunCommand()}` }, 3);
+}
 const preGateTreeHash = MODE === 'run' ? null : treeHashNow();
 process.stderr.write(`⏱ gate execution starting (suites: ${GATE})\n`);
 let exitCode = 0;
@@ -763,6 +898,12 @@ async function runGate(command, args, { forgeDispatch = false } = {}) {
   const result = await new Promise((resolveGate, reject) => {
     const child = spawn(command, args ?? [], { shell: !args, cwd: REPO, stdio: ['inherit', 'pipe', 'pipe'],
       env: { ...childEnv, [GATE_PHASE_MARKER_ENV]: phaseToken } });
+    const stopChild = () => {
+      const group = ownProcessGroup();
+      killProcessTree(child.pid, 'SIGKILL', { orphansOfGroup: group === process.pid ? group : null,
+        marker: phaseMarker, outputFds: [child.stdout?._handle?.fd, child.stderr?._handle?.fd].filter(fd => Number.isInteger(fd) && fd > 2) });
+    };
+    terminateGate = stopChild;
     for (const [name, fd] of [['stdout', 1], ['stderr', 2]]) {
       child[name].setEncoding('utf8');
       child[name].on('data', chunk => {
@@ -792,6 +933,7 @@ async function runGate(command, args, { forgeDispatch = false } = {}) {
     const finish = (code, closeSignal) => {
       if (settled) return;
       settled = true;
+      if (terminateGate === stopChild) terminateGate = null;
       const stopped = watchdog?.stop();
       clearTimeout(grace);
       const timedOut = Boolean(watchdog?.fired());
@@ -818,6 +960,7 @@ async function runGate(command, args, { forgeDispatch = false } = {}) {
       },
     }) : null;
     child.on('error', (e) => {
+      if (terminateGate === stopChild) terminateGate = null;
       const stopped = watchdog?.stop();
       clearTimeout(grace);
       if (!settled) { settled = true; Promise.resolve(stopped).then(() => reject(e)); }
@@ -924,7 +1067,10 @@ async function withBaseRerunSlot(run) {
     lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO, timeoutMs: ADMISSION_TIMEOUT_MS,
     lane: laneMatch ? laneMatch[1] : null, kind: baseKind,
   });
-  if (acquired.timedOut) process.stderr.write(`⚠ heavy-command admission: base comparison timed out after ${acquired.waitedMs}ms waiting for capacity (cap=${ADMISSION_CAP}) — proceeding unslotted.\n`);
+  if (acquired.timedOut) {
+    lifecycle?.terminal('admission-timeout');
+    emit({ sha: headSha, status: 'infrastructure-failure', ok: false, reason: 'admission-timeout', detail: `admission timed out; rerun ${rerunCommand()}` }, 3);
+  }
   const heartbeat = acquired.ok ? setInterval(() => {
     try { heartbeatOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO }); } catch { /* best-effort */ }
   }, SLOT_HEARTBEAT_MS) : null;
@@ -1113,8 +1259,12 @@ if (MODE === 'run') {
 //    (b) refuse to overwrite a marker whose sha is not ours — an older/overlapping run must never clobber a
 //        newer run's record (compare-and-set on the sha). A slow GREEN run at X must NOT stamp green over a
 //        RED record for Y.
+if (tryGit(['rev-parse', 'HEAD']) !== headSha) {
+  lifecycle?.terminal('head-moved');
+  emit({ sha: headSha, status: 'head-moved', ok: false, reason: 'head-moved', detail: `HEAD changed during the gate; rerun ${rerunCommand()}` }, 3);
+}
 const onDisk = readMarker();
-if (onDisk && !onDisk.corrupt && onDisk.sha && onDisk.sha !== headSha) {
+if (!sameVerifyRun(onDisk, ownedStart)) {
   emit(
     {
       sha: headSha, status: 'superseded', reason: 'superseded', exitCode, ...redCauseFields,
@@ -1139,7 +1289,11 @@ const finished = verifyFinishBody(startBody, {
   suites: GATE,
   treeHash: stableTreeHash(currentTreeHash, preGateTreeHash, treeHashNow()),
 });
-writeMarker({ ...finished, ranOn: overallRunLocation(ranOnPhases), executedGate: resolvedGate?.command ?? GATE, ...redCauseFields, phases, ...(revertRed ? { revertRed } : {}) });
+const recorded = updateOwnedMarker({ gitDir: GIT_DIR, expected: ownedStart, readMarker, writeMarker,
+  retryMs: 2_000,
+  update: () => ({ ...finished, ranOn: overallRunLocation(ranOnPhases), executedGate: resolvedGate?.command ?? GATE, ...redCauseFields, phases, ...(revertRed ? { revertRed } : {}) }) });
+if (!recorded) emit({ sha: headSha, status: 'superseded', ok: false, reason: 'superseded', detail: 'marker ownership changed; no result recorded.' }, 3);
+lifecycle?.stop();
 maybeRecordGreen({ status: finished.status, treeHash: finished.treeHash });
 // R893 — an infra-failed/unsettled verify (never red) also records the distinct deferred-to-ci marker; red/green clear it.
 try { recordTerminalVerifyOutcome(GIT_DIR, finished); } catch { /* advisory record; never changes the verdict */ }

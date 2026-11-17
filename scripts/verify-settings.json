@@ -18,6 +18,7 @@
   "selection": "since-last-green",
   "phaseTimeoutMs": 1800000,
   "slotHeartbeatMs": 300000,
+  "orphanHeartbeatStaleMinutes": 3,
   "alwaysRunTests": [
     "skills-src/conveyor/__tests__/runner-pass-coverage.test.mjs",
     "skills-src/conveyor/__tests__/launchd-templates.test.mjs",
@@ -25,6 +26,7 @@
     "scripts/lib/__tests__/exec-output-guard.test.mjs",
     "scripts/__tests__/repo-scan-tests.test.mjs",
     "scripts/lib/__tests__/verify-settings.test.mjs",
+    "scripts/__tests__/verify-lane-admission-timeout.test.mjs",
     "scripts/lib/__tests__/no-search-backed-pr-list.test.mjs"
   ]
 }

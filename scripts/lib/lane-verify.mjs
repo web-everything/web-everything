@@ -129,6 +129,7 @@ import { join, sep } from 'node:path';
 import { constants } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { boundFailureDetails } from './verify-failures.mjs';
+import { loadVerifySettingsFile, resolveVerifySettings } from './verify-settings.mjs';
 import { SHARD_UNSETTLED_EXIT } from './verify-exit-codes.mjs';
 
 /** 75c — the isolated-retry audit fields a record carries forward to every reader (marker, check, verdict). */
@@ -320,7 +321,7 @@ export const DEFAULT_VERIFY_TTL_MINUTES = 30;
  *  `computeWorkingTreeHash`) the IO shell computed BEFORE this call — carried through so a later `request`/
  *  `verify` can tell "the tree is byte-identical to what this record verified" apart from "same commit, tree
  *  moved since"; omitted/`null` (every existing caller) never enables that fast path. */
-export function verifyStartBody({ sha, suites, startedAt, treeHash, runId }) {
+export function verifyStartBody({ sha, suites, startedAt, treeHash, runId, pid, heartbeatAt, requestedAt }) {
   return {
     sha: sha || null,
     status: 'running',
@@ -332,6 +333,9 @@ export function verifyStartBody({ sha, suites, startedAt, treeHash, runId }) {
     // `runId` (optional) identifies the dispatcher run that stamped this marker, so the dispatcher can later tell
     // its own marker from a newer same-sha/suites/tree `request`. Omitted when absent — existing shapes unchanged.
     ...(runId ? { runId } : {}),
+    ...(pid ? { pid } : {}),
+    ...(heartbeatAt ? { heartbeatAt } : {}),
+    ...(requestedAt ? { requestedAt } : {}),
   };
 }
 
@@ -376,6 +380,9 @@ export function verifyFinishBody(prev, { finishedAt, exitCode, sha, treeHash, su
     ...retryAuditOf({ retriedTimeouts, retriedFailures, isolatedRetry }),
     // A test verdict only: an infrastructure failure produced no verdict, so it carries no failing-test names.
     ...(!green && !failure && failureDetails ? { failureDetails: boundFailureDetails(failureDetails) } : {}),
+    ...(base.runId ? { runId: base.runId } : {}),
+    ...(base.pid ? { pid: base.pid } : {}),
+    ...(base.heartbeatAt ? { heartbeatAt: base.heartbeatAt } : {}),
     startedAt: base.startedAt ?? null,
     finishedAt: finishedAt || null,
     // #4473 — `suites` is part of the cache key too, so the gate THIS run executed wins (PR #2982 round-2 review):
@@ -402,6 +409,51 @@ export function isVerifyAbandoned(record, nowMs, ttlMs = DEFAULT_VERIFY_TTL_MINU
   if (Number.isNaN(at)) return true;
   return nowMs - at >= ttlMs;
 }
+
+/** Three-valued PID evidence: unreadable process identity is never proof of death. */
+export function verifyPidAlive(pid, { kill = process.kill.bind(process), exec = execFileSync,
+  record } = {}) {
+  if (!Number.isSafeInteger(pid) || pid <= 1) return null;
+  try { kill(pid, 0); } catch (e) { return e.code === 'ESRCH' ? false : null; }
+  try {
+    const argv = String(exec('ps', ['-ww', '-o', 'stat=,command=', '-p', String(pid)],
+      { encoding: 'utf8', timeout: 1_000, maxBuffer: 64 * 1024, stdio: ['ignore', 'pipe', 'ignore'] })).trim();
+    if (!record?.runId) return true;
+    const runId = argv.match(/(?:^|\s)--run-id(?:=|\s+)(\S+)/)?.[1];
+    if (runId) return runId === record.runId;
+    // Foreground takeovers generate their run ID after launch, so argv cannot carry it. The PID
+    // must predate the marker; a newer verify process at a reused PID does not own this run.
+    const started = Date.parse(String(exec('ps', ['-o', 'lstart=', '-p', String(pid)],
+      { encoding: 'utf8', timeout: 1_000, maxBuffer: 1024, stdio: ['ignore', 'pipe', 'ignore'] })).trim());
+    const marked = Date.parse(record.startedAt);
+    // ps lstart has only second precision. Equal seconds and unreadable evidence cannot
+    // disprove ownership of a PID the kernel has just confirmed exists.
+    return !(Number.isFinite(started) && Number.isFinite(marked)
+      && Math.floor(started / 1000) > Math.floor(marked / 1000));
+  } catch { return true; }
+}
+
+/** Pure liveness classification. Legacy markers retain their startedAt/TTL gate behavior. */
+export function classifyRunningMarker({ record, nowMs, pidAlive = null, staleMs = 3 * 60_000,
+  dispatcherRun = null, requestStaleMs = Math.max(30 * 60_000, staleMs) } = {}) {
+  if (pidAlive === true) return { state: 'alive', reason: 'live-pid' };
+  if (record?.pid && pidAlive === false) return { state: 'orphaned', reason: 'dead-pid' };
+  const modern = !!(record?.pid || record?.heartbeatAt || record?.requestedAt);
+  if (!modern) return { state: 'alive', reason: 'legacy-marker' };
+  const heartbeat = Date.parse(record?.heartbeatAt);
+  const since = Number.isFinite(heartbeat) ? heartbeat : Date.parse(record?.requestedAt ?? record?.startedAt);
+  const age = Number.isFinite(since) ? nowMs - since : Infinity;
+  if (record?.requestedAt && !record?.pid) {
+    // null means the dispatcher evidence could not be read: fail closed, never steal its lane.
+    if (age < requestStaleMs || dispatcherRun !== false) return { state: 'requested', reason: 'awaiting-dispatch' };
+    return { state: 'orphaned', reason: 'stale-heartbeat' };
+  }
+  return age > staleMs ? { state: 'orphaned', reason: 'stale-heartbeat' }
+    : { state: 'alive', reason: 'fresh-heartbeat' };
+}
+
+const orphanSettings = loadVerifySettingsFile();
+const defaultOrphanStaleMs = () => resolveVerifySettings({ fileConfig: orphanSettings, env: process.env }).values.orphanHeartbeatStaleMinutes * 60_000;
 
 /** How often `waitForVerifySettle` re-checks the marker inside one bounded wait (#4358). This is an INTERNAL
  *  poll cadence, not a per-turn one: the whole point of the wait is that a single call absorbs however many of
@@ -474,6 +526,9 @@ export async function waitForVerifySettle({
   breakGlass = false,
   requireVerified = true,
   resolveLaneRelevantChangeSince,
+  pidAlive = verifyPidAlive,
+  staleMs = defaultOrphanStaleMs(),
+  dispatcherRun,
   ceilingMs,
   pollIntervalMs = DEFAULT_WAIT_POLL_INTERVAL_MS,
   now = () => Date.now(),
@@ -501,7 +556,8 @@ export async function waitForVerifySettle({
     const laneRelevantChangeSince = resolveLaneRelevantChangeSince
       ? resolveLaneRelevantChangeSince(currentRecord)
       : undefined;
-    const v = verifyGateDecision({ record: currentRecord, headSha, breakGlass, requireVerified, laneRelevantChangeSince });
+    const v = verifyGateDecision({ record: currentRecord, headSha, breakGlass, requireVerified, laneRelevantChangeSince,
+      nowMs: now(), pidAlive, staleMs, dispatcherRun: typeof dispatcherRun === 'function' ? dispatcherRun(currentRecord) : dispatcherRun });
 
     if (v.status === 'green' || v.status === 'red' || v.status === 'infrastructure-failure') {
       return { ...v, sha: headSha, settled: true, waited: { ms: now() - startedAt, polls } };
@@ -589,7 +645,7 @@ export async function waitForVerifySettle({
  * tell) never does — fail closed, exactly like every other "unknown" cell in this gate.
  * @returns {{ ok:boolean, status:string, reason:string, detail:string }}
  */
-export function verifyGateDecision({ record, headSha, nowMs = Date.now(), ttlMs = DEFAULT_VERIFY_TTL_MINUTES * 60_000, breakGlass = false, requireVerified = true, laneRelevantChangeSince, ciCheckRuns, ciWorkflowRuns, ciRequired, ciStuckQueuedMs } = {}) {
+export function verifyGateDecision({ record, headSha, nowMs = Date.now(), ttlMs = DEFAULT_VERIFY_TTL_MINUTES * 60_000, breakGlass = false, requireVerified = true, laneRelevantChangeSince, ciCheckRuns, ciWorkflowRuns, ciRequired, ciStuckQueuedMs, pidAlive = verifyPidAlive, staleMs = defaultOrphanStaleMs(), dispatcherRun } = {}) {
   if (breakGlass) {
     return { ok: true, status: 'break-glass', reason: 'break-glass', detail: 'WE_LAND_UNVERIFIED=1 — verification gate overridden (deliberate break-glass; the PR still rides the required CI check).' };
   }
@@ -617,6 +673,11 @@ export function verifyGateDecision({ record, headSha, nowMs = Date.now(), ttlMs 
       detail: `lane verified green for ${String(headSha).slice(0, 8)}${carriedForwardNote} (suites: ${rec.suites || 'recorded'}).${describeIsolatedRetry(rec)}` };
   }
   if (matches && rec.status === 'running') {
+    const liveness = classifyRunningMarker({ record: rec, nowMs, staleMs, dispatcherRun,
+      pidAlive: typeof pidAlive === 'function' ? (rec.pid ? pidAlive(rec.pid, { record: rec }) : null) : pidAlive });
+    if (liveness.state === 'orphaned') return { ok: false, status: 'orphaned', reason: liveness.reason,
+      detail: `verification for ${String(headSha).slice(0, 8)} is orphaned (${liveness.reason}); rerun node scripts/verify-lane.mjs to completion.` };
+    const modern = !!(rec.pid || rec.heartbeatAt || rec.requestedAt);
     const abandoned = isVerifyAbandoned(rec, nowMs, ttlMs);
     // #2833 finding 1 — the TTL must actually GATE, not just re-word. A stranded `running` marker that has
     // outlived its TTL (the writer is presumed gone) must NOT wedge the CI-gated drain forever: past-TTL AND
@@ -624,7 +685,7 @@ export function verifyGateDecision({ record, headSha, nowMs = Date.now(), ttlMs 
     // gates the merge). Fail-CLOSED otherwise: a FRESH (in-flight) `running` marker is the exact observed stall
     // and is always refused; and under `requireVerified` (the solo/conveyor build gate) even an abandoned run is
     // refused — that flow demands a real local green, never a timed-out one.
-    if (abandoned && !requireVerified) {
+    if (!modern && abandoned && !requireVerified) {
       return {
         ok: true, status: 'untracked', reason: 'untracked',
         detail: `verification for ${String(headSha).slice(0, 8)} was left UNFINISHED (a backgrounded run that never completed; started ${rec.startedAt || '?'}) and has outlived its TTL (${Math.round(ttlMs / 60_000)}m) — treating it as untracked so a stranded marker cannot wedge the CI-gated drain (#2833 finding 1); the PR's required CI check still gates the merge. Re-run \`node scripts/verify-lane.mjs\` to record a fresh green.`,
@@ -637,7 +698,8 @@ export function verifyGateDecision({ record, headSha, nowMs = Date.now(), ttlMs 
   }
   const infrastructure = rec?.infrastructure || verificationInfrastructureFailure({ exitCode: rec?.exitCode, signal: rec?.signal, failureDetails: rec?.failureDetails });
   if (matches && (rec.status === 'infrastructure-failure' || (rec.status === 'red' && infrastructure))) {
-    const reason = infrastructure?.reason || 'verify-infrastructure';
+    // Keep the public signal verdict stable; the terminal record retains the precise killed-SIG* cause.
+    const reason = infrastructure?.reason?.startsWith('killed-') ? 'verify-signal' : infrastructure?.reason || 'verify-infrastructure';
     const detail = infrastructure?.detail || 'verification infrastructure failed; no test verdict. Inspect the runner log before retrying.';
     if (requireVerified) return { ok: false, status: 'infrastructure-failure', reason, detail };
     // Advisory mode — same contract as a red marker below: a killed/timed-out gate is a terminal record with no TTL
