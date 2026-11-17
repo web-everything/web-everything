@@ -9,9 +9,18 @@ export const NO_PROMPT_COMMAND_RULES = `## No-prompt command rules
 - Never \`git reset --hard\`, \`git push --force\`, \`git clean\`. To continue a branch in a lane: \`git fetch origin <branch>\` then \`git merge --no-edit FETCH_HEAD\`, then push \`HEAD:refs/heads/<branch>\`.
 - Stop background jobs with the job tool (TaskStop or \`kill <exact pid>\`), never \`pkill\`/\`killall\`.`;
 
+/** Refuse missing task content before adding context, policy, or command rules. */
+export function assertBriefTaskContent(brief) {
+  if (typeof brief !== 'string') throw new TypeError('no-prompt rules require a string brief');
+  if (!brief.replaceAll(NO_PROMPT_COMMAND_RULES, '').trim()) {
+    throw new Error('empty task content — refusing a brief containing only whitespace or command rules');
+  }
+  return brief;
+}
+
 /** Append once, preserving the task's leading context and any existing complete copy. */
 export function renderNoPromptCommandRules(brief) {
-  if (typeof brief !== 'string') throw new TypeError('no-prompt rules require a string brief');
+  assertBriefTaskContent(brief);
   return brief.includes(NO_PROMPT_COMMAND_RULES) ? brief : `${brief}\n\n${NO_PROMPT_COMMAND_RULES}\n`;
 }
 

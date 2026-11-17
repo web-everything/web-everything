@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
+import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 import { buildStandDownComment } from '../conveyor/stand-down.mjs';
 import { repeatedFindingPlan, applyScopeReset, resolveFixSafety } from '../conveyor/repeated-finding-reset.mjs';
 /**
@@ -715,7 +715,7 @@ export async function runFixCli(argv = [], {
   const { pr, sessionSlug, ref } = launch;
   write(`fix-run: starting borrowed repair of PR #${pr} (session ${sessionSlug}, provider ${launch.provider}) - pid ${process.pid}\n`);
   try {
-    const brief = readPrompt(launch.promptFile);
+    const brief = assertBriefTaskContent(readPrompt(launch.promptFile));
     // The launcher has the network, the agent does not: fetch the reviewer's finding here and hand it over in the brief.
     const prHead = JSON.parse(run('gh', ['pr', 'view', pr, '--json', 'title,body,baseRefName,mergeable,headRefOid', ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot }) || '{}');
     prHeadSha = prHead.headRefOid ?? null;

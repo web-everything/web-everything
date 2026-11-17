@@ -1,4 +1,4 @@
-import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
+import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 /**
  * @file scripts/operations/explore-io.mjs
  * @description THE IO SHELL of the `explore` declaration (#3150, under epic #3029) — the SINK that starts one
@@ -340,6 +340,7 @@ export function reclaimExploreScratch({
 export function composeInvestigationPrompt(brief, reportPath) {
   const body = String(brief ?? '').trim();
   if (!body) throw notApplied('explore: refusing to start an investigator with an empty brief');
+  assertBriefTaskContent(body);
   return renderNoPromptCommandRules([
     body,
     `WRITE YOUR REPORT TO EXACTLY THIS PATH, as markdown: ${reportPath}\n`

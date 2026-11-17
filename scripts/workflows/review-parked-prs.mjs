@@ -1,6 +1,10 @@
 // Generated no-prompt rules: source scripts/lib/no-prompt-command-rules.mjs; pinned by the whole-tree test.
 const NO_PROMPT_COMMAND_RULES = "## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.\n- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`.\n- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.";
-function renderNoPromptCommandRules(brief) { return brief.includes(NO_PROMPT_COMMAND_RULES) ? brief : brief + '\n\n' + NO_PROMPT_COMMAND_RULES + '\n'; }
+function renderNoPromptCommandRules(brief) {
+  if (typeof brief !== 'string') throw new TypeError('no-prompt rules require a string brief');
+  if (!brief.replaceAll(NO_PROMPT_COMMAND_RULES, '').trim()) throw new Error('empty task content');
+  return brief.includes(NO_PROMPT_COMMAND_RULES) ? brief : brief + '\n\n' + NO_PROMPT_COMMAND_RULES + '\n';
+}
 
 /**
  * review-parked-prs.mjs — encode the drain's PARKED-PR review loop as a Workflow-harness script (#2437,

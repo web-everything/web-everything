@@ -50,6 +50,10 @@ import subprocess
 NO_PROMPT_COMMAND_RULES = "## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.\n- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`.\n- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`."
 
 def render_no_prompt_command_rules(brief):
+    if not isinstance(brief, str):
+        raise TypeError('no-prompt rules require a string brief')
+    if not brief.replace(NO_PROMPT_COMMAND_RULES, '').strip():
+        raise ValueError('empty task content')
     return brief if NO_PROMPT_COMMAND_RULES in brief else brief + "\n\n" + NO_PROMPT_COMMAND_RULES
 
 import sys

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
+import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 /**
  * @file scripts/operations/deliver-item-wrapper.mjs
  * @description The wrapper a MINIMAL delivery agent (`we:skills-src/conveyor/delivery-agent-brief-v2.md`) runs
@@ -1242,6 +1242,7 @@ const CLAUDE_RESTRICTED_PROVIDER = {
       runWorkerFn = runWorker,
     } = {},
   ) {
+    assertBriefTaskContent(prompt);
     const settingsFile = ensureSettingsFile();
     // #3627 bug 7(a) (live #3371 attempt) — resolve the REAL lane clone path through the SAME single source
     // of truth `resolveLanePath` already gives every other caller in this file (`runGateWithOneRetry`), never
@@ -1591,6 +1592,12 @@ export function envelopeReportOrNull(envelope, sessionSlug) {
   }
 }
 
+/** Read the delivery task before adding generic build instructions. */
+export function readDeliveryBriefTemplate(root = REPO_ROOT) {
+  const template = assertBriefTaskContent(readFileSync(`${root}/skills-src/conveyor/delivery-agent-brief-v2.md`, 'utf8'));
+  return renderNoPromptCommandRules(appendBuildRequirements(template, { selfReview: false }));
+}
+
 /**
  * SKETCH. Spawns the minimal-brief agent through the given provider and BLOCKS until it exits — no separate
  * wait step, because there is nothing left to wait for once the blocking call itself returns. This is the
@@ -1631,7 +1638,7 @@ export async function runAgentToCompletion(
     resume = false,
   },
   {
-    readBrief = () => appendBuildRequirements(readFileSync(`${REPO_ROOT}/skills-src/conveyor/delivery-agent-brief-v2.md`, 'utf8'), { selfReview: false }),
+    readBrief = readDeliveryBriefTemplate,
     readReport = tryReadDeliveryReport,
     resolveLane = resolveLanePath,
     resolveReportsDir = resolveDeliveryReportsDir,

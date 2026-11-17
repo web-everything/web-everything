@@ -1,4 +1,4 @@
-import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
+import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 /** Card-driven additions to the existing delivery brief; no alternate build prompt. */
 import { homedir } from 'node:os';
 import { resolve, isAbsolute } from 'node:path';
@@ -52,6 +52,7 @@ export function planOperatorPostBuild(item, { settings = readSettings().build, o
 }
 
 export function composeOperatorTaskBrief(template, item, options = {}) {
+  assertBriefTaskContent(template);
   const steps = options.steps ?? planOperatorPostBuild(item, options);
   if (!steps.length) return renderNoPromptCommandRules(template);
   if (item.deliveryBase && item.deliveryBase !== 'main') throw new Error('operator post-build requires a PR delivery target');

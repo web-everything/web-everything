@@ -1,4 +1,4 @@
-import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
+import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 import { appendBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { applyTestsFirstPolicy } from '../lib/tests-first-policy.mjs';
 import { readPreparePolicy } from '../conveyor/prepare-policy-settings.mjs';
@@ -244,6 +244,15 @@ export function briefPath(root = REPO_ROOT, kind = 'build') {
  * for the OBSERVER's two constants; it just no longer spans both readers.
  */
 export const LISTING_GRACE_MS = DISPATCH_LISTING_GRACE_MINUTES * 60 * 1000;
+
+/** Validate the authored task before policy sections and build requirements can mask an empty file. */
+export function readDispatchBriefTemplate(root, kind, readText = path => readFileSync(path, 'utf8')) {
+  const template = assertBriefTaskContent(readText(briefPath(root, kind)));
+  const rendered = assertBriefTaskContent(applyTestsFirstPolicy(template));
+  return ['build', 'fix', 'ci-heal'].includes(kind)
+    ? appendBuildRequirements(rendered, { policy: resolveBuildPolicy({ log: line => console.error(line) }) })
+    : rendered;
+}
 
 /**
  * READ ONE TICK and select this item's row. The `readTick` the declaration is injected with.
@@ -596,9 +605,7 @@ export function readTick({
     dispatchedGuard,
     item,
     groupItems,
-    briefTemplate: composeOperatorTaskBrief(['build', 'fix', 'ci-heal'].includes(launchKind)
-      ? appendBuildRequirements(applyTestsFirstPolicy(String(readText(briefPath(root, launchKind)))), { policy: resolveBuildPolicy({ log: line => console.error(line) }) })
-      : applyTestsFirstPolicy(String(readText(briefPath(root, launchKind)))), item ?? {}, { ...operatorOptions, steps: operatorSteps }),
+    briefTemplate: composeOperatorTaskBrief(readDispatchBriefTemplate(root, launchKind, readText), item ?? {}, { ...operatorOptions, steps: operatorSteps }),
     // Derived from the card record, never from prompt text: shapeDispatchRead reads this, not the filled prompt.
     operatorPostBuild: operatorSteps.length > 0,
     nextState,

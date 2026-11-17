@@ -156,7 +156,7 @@ describe('no-prompt command rules', () => {
         }
         visit(source);
       } else {
-        expect(text, path).toMatch(/import \{ renderNoPromptCommandRules \} from ['"].*no-prompt-command-rules\.mjs['"]/);
+        expect(text, path).toMatch(/import \{[^}]*\brenderNoPromptCommandRules\b[^}]*\} from ['"].*no-prompt-command-rules\.mjs['"]/);
         expect(text, path).toMatch(/renderNoPromptCommandRules\(/);
       }
     }

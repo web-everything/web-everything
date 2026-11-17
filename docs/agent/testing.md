@@ -4409,7 +4409,8 @@ non-replayable; CI-held provenance does not establish that a write was never app
 
 `scripts/lib/no-prompt-command-rules.mjs` owns the shared no-prompt command block and the
 launch-source registry. Append it with `renderNoPromptCommandRules` when authoring a Claude
-brief, including resume and review mandates. Markdown briefs and import-free workflow harnesses
+brief, including resume and review mandates. Validate task content before adding context or suffixes:
+`assertBriefTaskContent` refuses blank and rules-only inputs. Markdown briefs and import-free workflow harnesses
 carry generated literal copies; `scripts/__tests__/no-prompt-command-rules.test.mjs` pins them
 against the shared text. When the block changes, refresh those copies and the imperative ledger.
 The whole-tree audit scans `scripts/` and `skills-src/` for launch/prompt signatures and refuses
