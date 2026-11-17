@@ -11,18 +11,18 @@ import { readCiGhostRerunSettings } from '../../lib/ci-ghost-rerun-settings.mjs'
 import { readDeclaredSettings, SETTINGS_DIR } from '../../lib/settings-files.mjs';
 import { readPlatformPreferences } from '../../lib/policy-cascade.mjs';
 import { execFileSyncThrottled } from '../../lib/gh-throttle.mjs';
-import { readTimeoutBudget } from '../../conveyor/timeout-retry-state.mjs';
+import { readTimeoutStates } from '../../conveyor/timeout-retry-state.mjs';
 
 vi.mock('../../lib/gh-throttle.mjs', () => ({ execFileSyncThrottled: vi.fn() }));
-vi.mock('../../conveyor/timeout-retry-state.mjs', () => ({ readTimeoutBudget: vi.fn() }));
+vi.mock('../../conveyor/timeout-retry-state.mjs', () => ({ readTimeoutStates: vi.fn() }));
 
 const NOW = Date.parse('2026-11-16T12:00:00Z');
 const HEAD = 'a'.repeat(40);
-const settings = { thresholdMin: 15, maxPerWindow: 1, windowHours: 2, cancelWaitSec: 10 };
+const settings = { thresholdMin: 15, maxPerWindow: 1, maxPerHead: 1, windowHours: 2, cancelWaitSec: 10 };
 const options = { pr: 42, actor: 'operator', channel: 'manual recovery' };
 const ghost = () => ({ id: 7, run_id: 9, run_attempt: 2, status: 'in_progress', steps: [
-  { status: 'completed', completed_at: '2026-11-16T11:30:00Z' },
-  { status: 'completed', completed_at: '2026-11-16T11:40:00Z' },
+  { status: 'completed', conclusion: 'success', completed_at: '2026-11-16T11:30:00Z' },
+  { status: 'completed', conclusion: 'success', completed_at: '2026-11-16T11:40:00Z' },
 ] });
 
 function fixture() {
@@ -56,7 +56,7 @@ function fixture() {
   });
   f.state = { read: () => f.rows, append: row => f.rows.push(structuredClone(row)), withLock: fn => fn() };
   f.deps = { gh: f.gh, state: f.state, clock: () => f.now, settings,
-    readSharedRerunBudget: vi.fn(() => ({ confirmed: 0, rejected: 0, pending: false })),
+    readSharedRerunStates: vi.fn(() => []),
     sleep: async ms => { f.trace.push('wait'); f.now += ms; } };
   f.run = (overrides = {}) => runCiGhostRerun({ ...options, ...overrides }, f.deps);
   return f;
@@ -99,6 +99,20 @@ describe('ghost recovery', () => {
     expect(await f.run()).toMatchObject({ exitCode: 0, reason: 'rerun', newRunAttempt: 3,
       before: { status: 'in_progress', jobStatus: 'in_progress', runAttempt: 2 } });
     expect(f.trace).toEqual(['cancel', 'wait', 'rerun']);
+  });
+
+  it.each(['failure', 'cancelled', 'timed_out', null, undefined, 'unknown'])(
+    'refuses completed step conclusion %s before posting or reserving', async conclusion => {
+      const f = fixture(); f.job.steps[0].conclusion = conclusion;
+      expect(detectGhostJobs({ jobs: [f.job], now: NOW, thresholdMin: 15 }).reason).toBe('step-failed');
+      expect(await f.run()).toMatchObject({ reason: 'step-failed', exitCode: 2 });
+      expect(f.posts).toEqual([]);
+      expect(f.rows.some(row => row.counted)).toBe(false);
+    });
+
+  it.each(['success', 'skipped', 'neutral'])('accepts completed step conclusion %s', async conclusion => {
+    const f = fixture(); f.job.steps[0].conclusion = conclusion;
+    expect(await f.run()).toMatchObject({ reason: 'rerun', exitCode: 0 });
   });
 
   it('recovers distinct check-run and Actions job IDs through check_run_url and reads the actual job endpoint', async () => {
@@ -156,42 +170,61 @@ describe('ghost recovery', () => {
     });
 
   it.each([
-    ['confirmed allowance exhausted', { confirmed: 1, rejected: 0, pending: false }],
-    ['rejected allowance exhausted', { confirmed: 0, rejected: 1, pending: false }],
-    ['pending reservation', { confirmed: 0, rejected: 0, pending: true }],
-    ['unreadable state', { pending: true, reason: 'timeout-state-unreadable:corrupt' }],
-    ['unknown budget', undefined],
-    ['incomplete budget', { confirmed: 0 }],
-    ['invalid count', { confirmed: -1, rejected: 0, pending: false }],
-    ['oversized count', { confirmed: Number.MAX_SAFE_INTEGER + 1, rejected: 0, pending: false }],
-    ['invalid rejected count', { confirmed: 0, rejected: null, pending: false }],
-    ['read error despite zero counts', { confirmed: 0, rejected: 0, pending: false, reason: 'unreadable' }],
-  ])('refuses shared rerun budget: %s; requires operator inspection before manual recovery', async (_name, budget) => {
-    const f = fixture(); f.deps.readSharedRerunBudget.mockReturnValue(budget);
+    ['confirmed allowance exhausted', [{ status: 'confirmed' }]],
+    ['rejected allowance exhausted', [{ status: 'rejected', released: false }]],
+    ['pending reservation', [{ status: 'pending' }]],
+    ['empty request', [{}]],
+    ['unknown status', [{ status: 'unknown' }]],
+    ['null request', [null]],
+    ['array request', [[]]],
+    ['primitive request', ['confirmed']],
+    ['nonboolean released', [{ status: 'rejected', released: 'true' }]],
+  ])('refuses shared rerun evidence: %s; requires operator inspection before manual recovery', async (_name, requests) => {
+    const f = fixture();
+    f.deps.readSharedRerunStates.mockReturnValue([{ version: 1,
+      evidence: { repo: 'web-everything/web-everything', pr: 42, head: HEAD }, requests }]);
     expect(await f.run()).toMatchObject({ exitCode: 3, reason: 'shared-rerun-budget' });
-    expect(f.deps.readSharedRerunBudget).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', pr: 42, head: HEAD });
+    expect(f.deps.readSharedRerunStates).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', pr: 42, head: HEAD });
     expect(f.posts).toEqual([]);
     expect(f.rows).toEqual([expect.objectContaining({ outcome: 'shared-rerun-budget', counted: false })]);
   });
 
-  it('refuses a throwing shared budget reader before any POST or local reservation', async () => {
-    const f = fixture(); f.deps.readSharedRerunBudget.mockRejectedValue(new Error('unreadable'));
+  it.each([undefined, {}, [null], [{}], [{ version: 2, requests: [] }],
+    [{ version: 1, evidence: { repo: 'other/repo', pr: 42, head: HEAD }, requests: [] }],
+    [{ version: 1, evidence: { repo: 'web-everything/web-everything', pr: 42, head: HEAD }, requests: {} }],
+  ])('refuses unvalidated shared states %j without reserving or posting', async states => {
+    const f = fixture(); f.deps.readSharedRerunStates.mockReturnValue(states);
     expect(await f.run()).toMatchObject({ exitCode: 3, reason: 'shared-rerun-budget' });
     expect(f.posts).toEqual([]);
     expect(f.rows.some(row => row.counted)).toBe(false);
   });
 
-  it('uses the existing shared budget reader by default with the exact target identity', async () => {
-    const f = fixture(); delete f.deps.readSharedRerunBudget;
-    readTimeoutBudget.mockReturnValueOnce({ confirmed: 0, rejected: 0, pending: false });
+  it('refuses a throwing shared state reader before any POST or local reservation', async () => {
+    const f = fixture(); f.deps.readSharedRerunStates.mockRejectedValue(new Error('unreadable'));
+    expect(await f.run()).toMatchObject({ exitCode: 3, reason: 'shared-rerun-budget' });
+    expect(f.posts).toEqual([]);
+    expect(f.rows.some(row => row.counted)).toBe(false);
+  });
+
+  it('uses readTimeoutStates by default with the exact target identity', async () => {
+    const f = fixture(); delete f.deps.readSharedRerunStates;
+    readTimeoutStates.mockReturnValueOnce([]);
     expect(await f.run({ repo: 'other/repo', pr: 43 })).toMatchObject({ reason: 'rerun', exitCode: 0 });
-    expect(readTimeoutBudget).toHaveBeenCalledTimes(1);
-    expect(readTimeoutBudget).toHaveBeenCalledWith({ repo: 'other/repo', pr: 43, head: HEAD });
+    expect(readTimeoutStates).toHaveBeenCalledTimes(1);
+    expect(readTimeoutStates).toHaveBeenCalledWith({ repo: 'other/repo', pr: 43, head: HEAD });
     expect(f.rows.filter(row => row.counted)).toHaveLength(1);
   });
 
-  it('checks the shared budget even for a dry run', async () => {
-    const f = fixture(); f.deps.readSharedRerunBudget.mockReturnValue({ confirmed: 1, rejected: 0, pending: false });
+  it('allows explicitly released rejected requests', async () => {
+    const f = fixture();
+    f.deps.readSharedRerunStates.mockReturnValue([{ version: 1,
+      evidence: { repo: 'web-everything/web-everything', pr: 42, head: HEAD },
+      requests: [{ status: 'rejected', released: true }] }]);
+    expect(await f.run()).toMatchObject({ reason: 'rerun', exitCode: 0 });
+  });
+
+  it('checks shared evidence even for a dry run', async () => {
+    const f = fixture(); f.deps.readSharedRerunStates.mockReturnValue([{}]);
     expect(await f.run({ dryRun: true })).toMatchObject({ reason: 'shared-rerun-budget', exitCode: 3 });
     expect(f.posts).toEqual([]);
   });
@@ -266,7 +299,7 @@ describe('ghost recovery', () => {
     expect(f.posts).toEqual([]);
   });
 
-  it('caps attempts per repo/pr/head, while allowing a new head, PR, repo and expired window', async () => {
+  it('caps attempts per repo/pr/head while allowing a new head, PR and repo', async () => {
     const f = fixture();
     expect((await f.run()).reason).toBe('rerun');
     expect(await f.run()).toMatchObject({ reason: 'rate-capped', exitCode: 3 });
@@ -275,7 +308,37 @@ describe('ghost recovery', () => {
     expect((await f.run({ pr: 43 })).reason).toBe('rerun');
     expect((await f.run({ repo: 'other/repo' })).reason).toBe('rerun');
     f.now += 2 * 3_600_000;
+    expect((await f.run()).reason).toBe('rate-capped');
+  });
+
+  it('refuses a second attempt on the same head after window expiry with default settings', async () => {
+    const f = fixture();
+    f.deps.settings = readCiGhostRerunSettings({ platform: {}, tool: {}, env: {} });
     expect((await f.run()).reason).toBe('rerun');
+    f.now += 3 * 3_600_000;
+    const posts = [...f.posts];
+    expect(await f.run()).toMatchObject({ reason: 'rate-capped', exitCode: 3 });
+    expect(f.posts).toEqual(posts);
+    expect(f.rows.filter(row => row.counted)).toHaveLength(1);
+  });
+
+  it('counts historical ledger reservations toward the lifetime cap', async () => {
+    const f = fixture();
+    f.rows.push({ ts: '2026-11-01T12:00:00Z', outcome: 'attempt', counted: true,
+      repo: 'web-everything/web-everything', pr: 42, head: HEAD });
+    expect(await f.run()).toMatchObject({ reason: 'rate-capped', exitCode: 3 });
+    expect(f.posts).toEqual([]);
+  });
+
+  it('retains the window cap with maxPerHead=2 and refuses a third lifetime attempt', async () => {
+    const f = fixture(); f.deps.settings = { ...settings, maxPerHead: 2 };
+    expect((await f.run()).reason).toBe('rerun');
+    expect((await f.run()).reason).toBe('rate-capped');
+    f.now += 3 * 3_600_000;
+    expect((await f.run()).reason).toBe('rerun');
+    f.now += 3 * 3_600_000;
+    expect((await f.run()).reason).toBe('rate-capped');
+    expect(f.rows.filter(row => row.counted)).toHaveLength(2);
   });
 
   it('force-cancels after a bounded wait, and confirms completion before rerun', async () => {
@@ -465,11 +528,20 @@ describe('settings cascade', () => {
       expect(f.rows.at(-1)).toMatchObject({ outcome: 'invalid-settings', counted: false });
     });
 
+  it.each(['standard', 'platform', 'tool', 'env'])('resolves and logs maxPerHead from %s', layer => {
+    const log = vi.fn();
+    const input = { platform: {}, tool: {}, env: { WE_POLICY_CASCADE_LOG: '1' }, log };
+    if (layer === 'env') input.env.WE_CI_GHOST_RERUN_MAX_PER_HEAD = '2';
+    else if (layer !== 'standard') input[layer].maxPerHead = 2;
+    expect(readCiGhostRerunSettings(input).maxPerHead).toBe(layer === 'standard' ? 1 : 2);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining(`maxPerHead=${layer === 'standard' ? 1 : 2} (${layer})`));
+  });
+
   it('loads tool settings after the settings directory is successfully listed', () => {
     const readDirectory = vi.fn(() => ['ci-ghost-rerun.json']);
     const readTool = vi.fn(() => ({ settings: { ciGhostRerun: { thresholdMin: 25 } }, errors: [] }));
     expect(readCiGhostRerunSettings({ env: {}, platform: {}, readDirectory, readTool }))
-      .toEqual({ thresholdMin: 25, maxPerWindow: 1, windowHours: 2, cancelWaitSec: 60 });
+      .toEqual({ thresholdMin: 25, maxPerWindow: 1, maxPerHead: 1, windowHours: 2, cancelWaitSec: 60 });
     expect(readDirectory).toHaveBeenCalledWith(SETTINGS_DIR);
     expect(readDirectory.mock.invocationCallOrder[0]).toBeLessThan(readTool.mock.invocationCallOrder[0]);
   });
@@ -499,14 +571,14 @@ describe('settings cascade', () => {
   it.each([undefined, null])('accepts absent layers %s', value => {
     expect(readCiGhostRerunSettings({ env: {}, platform: value, tool: value,
       readPlatform: () => ({ prefs: {}, errors: [] }), readTool: () => ({ settings: {}, errors: [] }) }))
-      .toEqual({ thresholdMin: 15, maxPerWindow: 1, windowHours: 2, cancelWaitSec: 60 });
+      .toEqual({ thresholdMin: 15, maxPerWindow: 1, maxPerHead: 1, windowHours: 2, cancelWaitSec: 60 });
   });
 
   it('accepts plain ciGhostRerun blocks and preserves their layer provenance', () => {
     const log = vi.fn();
     expect(readCiGhostRerunSettings({ env: { WE_POLICY_CASCADE_LOG: '1' }, log,
       platform: { ciGhostRerun: { thresholdMin: 20 } }, tool: { ciGhostRerun: { windowHours: 3 } } }))
-      .toEqual({ thresholdMin: 20, maxPerWindow: 1, windowHours: 3, cancelWaitSec: 60 });
+      .toEqual({ thresholdMin: 20, maxPerWindow: 1, maxPerHead: 1, windowHours: 3, cancelWaitSec: 60 });
     expect(log).toHaveBeenCalledWith(expect.stringContaining('thresholdMin=20 (platform)'));
     expect(log).toHaveBeenCalledWith(expect.stringContaining('windowHours=3 (tool)'));
   });
@@ -555,7 +627,7 @@ describe('settings cascade', () => {
     const log = vi.fn();
     expect(readCiGhostRerunSettings({ platform: { thresholdMin: 20, windowHours: 3 },
       tool: { thresholdMin: 25 }, env: { WE_CI_GHOST_RERUN_THRESHOLD_MIN: '30', WE_POLICY_CASCADE_LOG: '1' }, log }))
-      .toEqual({ thresholdMin: 30, maxPerWindow: 1, windowHours: 3, cancelWaitSec: 60 });
+      .toEqual({ thresholdMin: 30, maxPerWindow: 1, maxPerHead: 1, windowHours: 3, cancelWaitSec: 60 });
     expect(log).toHaveBeenCalledWith(expect.stringContaining('thresholdMin=30 (env)'));
     expect(log).toHaveBeenCalledWith(expect.stringContaining('windowHours=3 (platform)'));
   });
@@ -564,7 +636,7 @@ describe('settings cascade', () => {
     expect(readCiGhostRerunSettings({ platform: { thresholdMin: 20 }, tool: { thresholdMin: -1 }, env: {
       WE_CI_GHOST_RERUN_THRESHOLD_MIN: 'NaN', WE_CI_GHOST_RERUN_MAX_PER_WINDOW: '1.5',
       WE_CI_GHOST_RERUN_WINDOW_HOURS: '0', WE_CI_GHOST_RERUN_CANCEL_WAIT_SEC: 'Infinity',
-    } })).toEqual({ thresholdMin: 20, maxPerWindow: 1, windowHours: 2, cancelWaitSec: 60,
+    } })).toEqual({ thresholdMin: 20, maxPerWindow: 1, maxPerHead: 1, windowHours: 2, cancelWaitSec: 60,
       invalid: expect.arrayContaining(['tool.thresholdMin', 'env.thresholdMin', 'env.maxPerWindow',
         'env.windowHours', 'env.cancelWaitSec']) });
   });
@@ -572,6 +644,7 @@ describe('settings cascade', () => {
 
 const invalidOverrides = [
   ['thresholdMin', 4.99], ['thresholdMin', -1], ['thresholdMin', NaN], ['thresholdMin', Infinity],
+  ['maxPerHead', 0], ['maxPerHead', 3], ['maxPerHead', 1.5],
   ['maxPerWindow', 0], ['maxPerWindow', 4], ['maxPerWindow', 1.5],
   ['windowHours', 0.99], ['windowHours', 24.01],
   ['cancelWaitSec', 4.99], ['cancelWaitSec', 300.01],
@@ -599,8 +672,8 @@ describe.each(['platform', 'tool', 'env', 'injected'])('%s invalid settings', la
 });
 
 it.each([
-  { thresholdMin: 5, maxPerWindow: 1, windowHours: 1, cancelWaitSec: 5 },
-  { thresholdMin: 5, maxPerWindow: 3, windowHours: 24, cancelWaitSec: 300 },
+  { thresholdMin: 5, maxPerWindow: 1, maxPerHead: 1, windowHours: 1, cancelWaitSec: 5 },
+  { thresholdMin: 5, maxPerWindow: 3, maxPerHead: 2, windowHours: 24, cancelWaitSec: 300 },
 ])('accepts inclusive settings bounds %j', async valid => {
   const f = fixture();
   f.deps.settings = readCiGhostRerunSettings({ platform: {}, tool: valid, env: {} });

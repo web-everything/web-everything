@@ -11,6 +11,7 @@ const isPlainObject = value => value !== null && typeof value === 'object'
 
 const bounds = {
   thresholdMin: value => Number.isFinite(value) && value >= 5,
+  maxPerHead: value => Number.isInteger(value) && value >= 1 && value <= 2,
   maxPerWindow: value => Number.isInteger(value) && value >= 1 && value <= 3,
   windowHours: value => Number.isFinite(value) && value >= 1 && value <= 24,
   cancelWaitSec: value => Number.isFinite(value) && value >= 5 && value <= 300,
@@ -24,7 +25,7 @@ export function isValidCiGhostRerunSettings(settings) {
 export function readCiGhostRerunSettings({ env = process.env, platform, tool, log,
   readPlatform = readPlatformPreferences, readTool = readDeclaredSettings,
   readDirectory = readdirSync } = {}) {
-  const standard = { thresholdMin: 15, maxPerWindow: 1, windowHours: 2, cancelWaitSec: 60 };
+  const standard = { thresholdMin: 15, maxPerWindow: 1, maxPerHead: 1, windowHours: 2, cancelWaitSec: 60 };
   const invalid = [];
   const load = (name, read, key) => {
     try {

@@ -1,8 +1,9 @@
 {
-  "$comment": "Ghost CI recovery: standard -> platform -> tool -> environment. Positive WE_CI_GHOST_RERUN_THRESHOLD_MIN, WE_CI_GHOST_RERUN_MAX_PER_WINDOW (integer), WE_CI_GHOST_RERUN_WINDOW_HOURS, WE_CI_GHOST_RERUN_CANCEL_WAIT_SEC override these leaves.",
+  "$comment": "Ghost CI recovery: standard -> platform -> tool -> environment. Positive WE_CI_GHOST_RERUN_THRESHOLD_MIN, WE_CI_GHOST_RERUN_MAX_PER_WINDOW (integer), WE_CI_GHOST_RERUN_MAX_PER_HEAD (integer 1..2, lifetime per repo/PR/head), WE_CI_GHOST_RERUN_WINDOW_HOURS, WE_CI_GHOST_RERUN_CANCEL_WAIT_SEC override these leaves.",
   "ciGhostRerun": {
     "thresholdMin": 15,
     "maxPerWindow": 1,
+    "maxPerHead": 1,
     "windowHours": 2,
     "cancelWaitSec": 60
   }

@@ -5,11 +5,13 @@
  * One invocation recovers one workflow; every in-progress Actions check must be a ghost.
  * Incomplete/oversized evidence requires manual inspection in GitHub. A busy state lock
  * requires retry, or operator cleanup after confirming its owner is no longer running.
- * Shared allowance: timeout-retry-state.mjs#readTimeoutBudget reads ci-timeout-reruns
+ * Shared allowance: timeout-retry-state.mjs#readTimeoutStates reads ci-timeout-reruns
  * under ghThrottleLockRoot(), keyed by repo/PR/head (including legacy state files).
  * Confirmed plus unreleased rejected requests spend the once-per-head allowance;
  * pending or unreadable evidence refuses. That module exposes no record/consume API:
- * this integration is read-only; our own attempts.jsonl still caps this operation.
+ * this integration checks the conveyor budget read-only before recovery; ci-heal's
+ * per-head allowance applies after. Our attempts.jsonl also enforces a lifetime
+ * per-head cap independently of the rolling window; window expiry never resets it.
  * On shared-budget refusal, an operator must inspect the shared state and workflow
  * before resolving pending/unreadable evidence or recovering the run manually.
  */
@@ -20,7 +22,7 @@ import { pathToFileURL } from 'node:url';
 import { setTimeout as sleepDefault } from 'node:timers/promises';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { isValidCiGhostRerunSettings, readCiGhostRerunSettings } from '../lib/ci-ghost-rerun-settings.mjs';
-import { readTimeoutBudget } from '../conveyor/timeout-retry-state.mjs';
+import { readTimeoutStates } from '../conveyor/timeout-retry-state.mjs';
 
 const positiveId = value => Number.isSafeInteger(value) && value > 0;
 const oneLine = value => typeof value === 'string' && value.trim().length > 0
@@ -36,6 +38,7 @@ export function detectGhostJobs({ jobs, now, thresholdMin }) {
   for (const job of pending) {
     if (!Array.isArray(job.steps) || !job.steps.length) return failure('no-steps');
     if (job.steps.some(step => step?.status !== 'completed')) return failure('not-ghost');
+    if (job.steps.some(step => !['success', 'skipped', 'neutral'].includes(step.conclusion))) return failure('step-failed');
     const dates = job.steps.map(step => typeof step.completed_at === 'string' ? Date.parse(step.completed_at) : NaN);
     if (dates.some(date => !Number.isFinite(date))) return failure('not-ghost');
     if (time - Math.max(...dates) <= thresholdMin * 60_000) return failure('too-young');
@@ -96,7 +99,7 @@ export function defaultGh(args) {
 export async function runCiGhostRerun(options, {
   gh = defaultGh, clock = Date.now, sleep = sleepDefault,
   state = createStateStore(), settings = readCiGhostRerunSettings(),
-  readSharedRerunBudget = readTimeoutBudget,
+  readSharedRerunStates = readTimeoutStates,
 } = {}) {
   const { actor, channel, pr, repo = 'web-everything/web-everything', dryRun = false } = options;
   const audit = { ts: new Date(clock()).toISOString(), actor: actor ?? null, channel: channel ?? null,
@@ -175,17 +178,29 @@ export async function runCiGhostRerun(options, {
       if (job.run_attempt !== run.run_attempt) return failure('run-attempt-mismatch');
       const attempts = await state.read();
       const since = clock() - settings.windowHours * 3_600_000;
-      if (attempts.filter(row => row.counted && row.repo === repo && row.pr === pr
-        && row.head === audit.head && Date.parse(row.ts) > since).length >= settings.maxPerWindow) return failure('rate-capped', 3);
+      const perHead = attempts.filter(row => row.counted && row.repo === repo && row.pr === pr && row.head === audit.head);
+      if (perHead.length >= settings.maxPerHead
+        || perHead.filter(row => Date.parse(row.ts) > since).length >= settings.maxPerWindow) return failure('rate-capped', 3);
       // Match the conveyor's once-per-head recovery allowance, counting rejected
       // requests too. Unknown fields must never be interpreted as unused budget.
-      let shared;
-      try { shared = await readSharedRerunBudget({ repo, pr, head: audit.head }); }
-      catch { return failure('shared-rerun-budget', 3); }
-      if (!shared || shared.reason || shared.pending !== false
-        || !Number.isSafeInteger(shared.confirmed) || shared.confirmed < 0
-        || !Number.isSafeInteger(shared.rejected) || shared.rejected < 0
-        || shared.confirmed + shared.rejected >= 1) return failure('shared-rerun-budget', 3);
+      try {
+        const evidence = { repo, pr, head: audit.head };
+        const shared = await readSharedRerunStates(evidence);
+        if (!Array.isArray(shared)) return failure('shared-rerun-budget', 3);
+        for (const entry of shared) {
+          if (!entry || typeof entry !== 'object' || Array.isArray(entry) || entry.version !== 1
+            || !entry.evidence || !Object.entries(evidence).every(([key, value]) => entry.evidence[key] === value)
+            || !Array.isArray(entry.requests)) return failure('shared-rerun-budget', 3);
+          for (const request of entry.requests) {
+            if (!request || typeof request !== 'object' || Array.isArray(request)
+              || !['confirmed', 'pending', 'rejected'].includes(request.status)
+              || (Object.hasOwn(request, 'released') && typeof request.released !== 'boolean')) {
+              return failure('shared-rerun-budget', 3);
+            }
+            if (request.status !== 'rejected' || request.released !== true) return failure('shared-rerun-budget', 3);
+          }
+        }
+      } catch { return failure('shared-rerun-budget', 3); }
       if (dryRun) return { exitCode: 0, reason: 'dry-run' };
       // Durable reservation precedes all POSTs, including ambiguous failures and process death.
       await state.append({ ...audit, ts: new Date(clock()).toISOString(), outcome: 'attempt', counted: true });
@@ -241,8 +256,9 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
   const result = await runCiGhostRerun(options);
   console.log(options.json ? JSON.stringify(result) :
     `${result.reason}; before=${JSON.stringify(result.before)}; newRunAttempt=${result.newRunAttempt ?? 'none'}`);
-  if (result.reason === 'invalid-settings') console.error('Correct or remove invalid ciGhostRerun overrides before retrying: thresholdMin >= 5, maxPerWindow integer 1..3, windowHours 1..24, cancelWaitSec 5..300.');
+  if (result.reason === 'invalid-settings') console.error('Correct or remove invalid ciGhostRerun overrides before retrying: thresholdMin >= 5, maxPerWindow integer 1..3, maxPerHead integer 1..2, windowHours 1..24, cancelWaitSec 5..300.');
   else if (result.reason === 'shared-rerun-budget') console.error('Inspect the shared ci-timeout-reruns state and workflow; resolve pending/unreadable evidence or recover manually.');
+  else if (result.reason === 'rate-capped') console.error('Inspect the ledger and workflow; a lifetime per-head cap requires a new head or manual recovery. Window expiry only clears the rolling cap.');
   else if (result.exitCode) console.error('Inspect workflow evidence in GitHub; retry after the cap/window or state lock clears. Inspect state before removing a stale lock.');
   process.exitCode = result.exitCode;
 }
