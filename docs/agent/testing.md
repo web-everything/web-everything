@@ -4422,3 +4422,9 @@ an unpublished local head, an exact-head pass, and another head's fingerprinted 
 the resolved local SHA without fetching the unpublished lane ref. A failed diff or main fetch still
 refuses. Include valid JSON negative records with invalid timestamps or contradictory findings next
 to an older pass, plus carried and waived paths; malformed records require repair before re-auditing.
+Operator prototype-load waiver tests live in `scripts/operations/__tests__/ruled-weakened-store.test.mjs`.
+Use an injected HOME and filesystem: the append-only ops store lives under
+`~/workspace/.operations/coordination/ruled-weakened.jsonl`. Tool, platform, then ops entries
+share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
+The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
+`--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
