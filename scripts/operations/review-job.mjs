@@ -457,19 +457,19 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       if (!/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('review head missing; inspect PR evidence before retrying');
       // Acquisition scrubs unsafe config, but command-valued pins must also apply to every lane Git call.
       const gitOptions = { ...options, env: laneGitHardeningEnv(env) };
-      scrubRiskyLaneConfig(lanePath, { log, run: (args, opts) => exec('git', args,
+      const { kept } = scrubRiskyLaneConfig(lanePath, { log, run: (args, opts) => exec('git', args,
         { ...gitOptions, ...opts, env: laneGitHardeningEnv(scrubGitRepoEnv(env)) }) });
+      // Only these exact origin keys are intentionally retained by the scrubber. Everything else
+      // reports a failed read/removal, including failures that leave transport URL rewrites active.
+      if (kept.some(key => !/^remote\.origin\.(?:url|pushurl|proxy|receivepack|uploadpack|vcs)$/i.test(key))) {
+        throw Error('review lane config scrub failed; inspect and repair lane configuration before retrying');
+      }
       const origin = exec('git', ['remote', 'get-url', 'origin'], gitOptions).trim();
       const originRepo = /^(?:git@github\.com:|ssh:\/\/git@github\.com\/|https:\/\/github\.com\/)([^/]+\/[^/]+?)(?:\.git)?\/?$/i.exec(origin)?.[1];
       if (originRepo?.toLowerCase() !== repo.toLowerCase()) throw Error('review lane origin repository mismatch or unreadable; inspect lane before retrying');
       // Never resolve a remote name: retained origin.uploadpack/vcs can execute lane-owned commands.
-      const fetch = url => exec('git', ['-c', 'protocol.ext.allow=never', 'fetch', '--upload-pack=git-upload-pack',
-        '--no-tags', url, `refs/pull/${pr}/head`], gitOptions);
-      try {
-        fetch(`git@github.com:${repo}.git`);
-      } catch {
-        fetch(`https://github.com/${repo}.git`);
-      }
+      exec('git', ['-c', 'protocol.ext.allow=never', 'fetch', '--upload-pack=git-upload-pack',
+        '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`], gitOptions);
       const fetched = exec('git', ['rev-parse', 'FETCH_HEAD^{commit}'], gitOptions).trim();
       if (fetched !== head) throw Error('review head changed during fetch; retry shared setup on the live head');
       return { head };

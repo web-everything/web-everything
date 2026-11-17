@@ -26,13 +26,20 @@ function fixture(overrides = {}) {
 }
 
 describe('private review lane fetch', () => {
-  function lane({ originFails = false, fallbackFails = false, fetched = head, originRepo = repo, env = {} } = {}) {
+  function lane({ originFails = false, scrubFailure = null, fetched = head, originRepo = repo, env = {} } = {}) {
     const exec = vi.fn((file, args) => {
       if (file === 'gh') return JSON.stringify({ headRefOid: head });
-      if (args[0] === 'config') return '';
+      if (args[0] === 'config') {
+        if (scrubFailure === 'list' || scrubFailure === 'oversized') throw Error(`config ${scrubFailure}`);
+        if (scrubFailure === 'unset') {
+          if (args.includes('--unset-all')) throw Error('config is read-only');
+          return 'local\0url.review-marker::fixture.insteadof\nhttps://github.com/\0';
+        }
+        return '';
+      }
       if (args[0] === 'remote') return `git@github.com:${originRepo}.git`;
       if (args.includes('fetch')) {
-        if ((args[5].startsWith('git@') && originFails) || (args[5].startsWith('https:') && fallbackFails)) throw Error('transport failed');
+        if (originFails) throw Error('transport failed');
         return '';
       }
       if (args[0] === 'rev-parse') return fetched;
@@ -53,18 +60,24 @@ describe('private review lane fetch', () => {
       expect(options.env).toEqual(laneGitHardeningEnv(args[0] === 'config' ? scrubGitRepoEnv(env) : env));
     }
   });
-  it('uses equally restricted HTTPS only after SSH transport fails, still checks FETCH_HEAD', () => {
-    const f = lane({ originFails: true }); expect(f.prepare()).toEqual({ head });
+  it('surfaces SSH fetch failure without attempting HTTPS or reading FETCH_HEAD', () => {
+    const f = lane({ originFails: true }); expect(f.prepare).toThrow('transport failed');
     expect(f.exec.mock.calls.filter(([, args]) => args.includes('fetch')).map(([, args]) => args))
-      .toEqual([`git@github.com:${repo}.git`, `https://github.com/${repo}.git`].map(url =>
-        ['-c', 'protocol.ext.allow=never', 'fetch', '--upload-pack=git-upload-pack', '--no-tags', url, `refs/pull/${pr}/head`]));
+      .toEqual([['-c', 'protocol.ext.allow=never', 'fetch', '--upload-pack=git-upload-pack', '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`]]);
     for (const [, , options] of f.exec.mock.calls.filter(([, args]) => args.includes('fetch'))) {
       expect(options.env).toEqual(laneGitHardeningEnv({}));
     }
-    expect(() => lane({ originFails: true, fetched: 'b'.repeat(40) }).prepare()).toThrow(/head changed/);
-    expect(() => lane({ originFails: true, fallbackFails: true }).prepare()).toThrow(/transport failed/);
+    expect(f.exec.mock.calls.some(([, args]) => args[0] === 'rev-parse')).toBe(false);
   });
-  it('refuses a lane from another repository before either fetch', () => {
+  it('still refuses a fetched commit that does not match the reviewed head', () => {
+    expect(() => lane({ fetched: 'b'.repeat(40) }).prepare()).toThrow(/head changed/);
+  });
+  it.each(['list', 'oversized', 'unset'])('surfaces scrub %s failure and refuses every fetch', scrubFailure => {
+    const f = lane({ scrubFailure });
+    expect(f.prepare).toThrow(/config scrub failed; inspect and repair/);
+    expect(f.exec.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(false);
+  });
+  it('refuses a lane from another repository before fetching', () => {
     const f = lane({ originRepo: 'web-everything/web-everything' });
     expect(f.prepare).toThrow(/repository mismatch/);
     expect(f.exec.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(false);

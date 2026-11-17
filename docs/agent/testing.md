@@ -4437,8 +4437,12 @@ The operation retry/lifecycle suites and conveyor retry regression cover repeate
 missing records, early claim/import failure, explicit re-arm, and healthy WE review dispatch.
 
 Review lane setup reuses `scrubRiskyLaneConfig` before fetching. Retained `origin.uploadpack` and
-`origin.vcs` must never select a command: fetch the validated repository's explicit SSH URL, then
-HTTPS on transport failure, with the lane-pool transport pins (`protocol.ext.allow=never` and
+`origin.vcs` must never select a command: fetch only the validated repository's explicit SSH URL,
+with the lane-pool transport pins (`protocol.ext.allow=never` and
 `--upload-pack=git-upload-pack`). `review-job-fetch-security.test.mjs` uses real local repositories
 and marker-writing helpers, proves the hostile fixtures execute through a remote-name fetch,
-then exercises both production URL paths without networking and verifies the marker stays absent.
+then exercises the production SSH URL without networking and verifies the marker stays absent.
+Any scrub read/removal failure refuses fetching and records an infrastructure failure requiring
+lane inspection/repair. Only the scrubber's intentionally retained exact origin keys are exempt.
+SSH transport failure surfaces directly; there is no HTTPS fallback. The retry and job suites
+cover unreadable/oversized config, surviving URL rewrites, no fallback, and terminal failure labels.
