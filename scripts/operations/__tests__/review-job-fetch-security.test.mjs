@@ -171,6 +171,63 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s fetch command isolation',
     });
 });
 
+describe.each(['prepareLane', 'fetchRedTeamHead'])('%s fsck config validation', method => {
+  const head = 'a'.repeat(40);
+  const scrubError = 'review lane config scrub failed; inspect and repair lane configuration before retrying';
+
+  it.each([
+    ['fetch.fsck.missingEmail', 'ignore'],
+    ['fetch.fsck.skipList', 'skip-list'],
+    ['fsck.badTimezone', 'ignore'],
+    ['transfer.fsck.missingEmail', 'ignore'],
+    ['receive.fsck.skipList', 'skip-list'],
+  ])('refuses lane-local %s before any fetch', (key, value) => {
+    const lane = mkdtempSync(join(process.env.TMPDIR, 'review-fetch-fsck-')); roots.push(lane);
+    const env = laneGitHardeningEnv(process.env);
+    const git = args => execFileSync('git', args, { cwd: lane, env, encoding: 'utf8',
+      timeout: 10_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
+    git(['init', '--quiet']);
+    git(['remote', 'add', 'origin', `git@github.com:${repo}.git`]);
+    git(['config', '--local', key, value]);
+    const calls = [];
+    const exec = (file, args, options) => {
+      calls.push(args);
+      if (file === 'gh') return JSON.stringify({ headRefOid: head });
+      if (args.includes('fetch')) throw Error('unexpected fetch');
+      return execFileSync(file, args, { ...options, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    };
+    expect(() => createReviewJobIo({ env, exec, log: () => {} })[method]({ repo, pr, lanePath: lane, head }))
+      .toThrow(scrubError);
+    expect(calls.some(args => args.includes('fetch'))).toBe(false);
+  });
+
+  it.each(['clean', 'no-match', 'unreadable', 'status-one-output', 'status-one-stderr', 'oversized'])(
+    'fails closed except for clean or empty no-match config (%s)', kind => {
+      const calls = [];
+      const exec = (file, args) => {
+        calls.push(args);
+        if (file === 'gh') return JSON.stringify({ headRefOid: head });
+        if (args.includes('--name-only')) {
+          if (kind === 'clean') return '';
+          throw Object.assign(Error('config read failed'), {
+            status: kind === 'unreadable' ? 2 : kind === 'oversized' ? null : 1,
+            stdout: kind === 'status-one-output' ? 'fsck.badtimezone\n' : '',
+            stderr: kind === 'status-one-stderr' ? 'read error' : '',
+            ...(kind === 'oversized' ? { code: 'ENOBUFS' } : {}),
+          });
+        }
+        if (args[0] === 'config') return '';
+        if (args[0] === 'remote') return `git@github.com:${repo}.git`;
+        return args.includes('fetch') ? '' : head;
+      };
+      const run = () => createReviewJobIo({ env: {}, exec, log: () => {} })[method]({ repo, pr, lanePath: 'fixture-lane', head });
+      const clean = ['clean', 'no-match'].includes(kind);
+      if (clean) expect(run()).toEqual({ head });
+      else expect(run).toThrow(scrubError);
+      expect(calls.some(args => args.includes('fetch'))).toBe(clean);
+    });
+});
+
 describe('red-team fetch refusals', () => {
   it.each(['invalid-repo', 'invalid-head', 'scrub-failure', 'origin-mismatch', 'fetch-failure', 'moved-head', 'missing-commit', 'wrong-commit'])(
     'throws and removes isolated config on %s', failure => {

@@ -88,7 +88,7 @@ describe('lane Git hardening', () => {
     const io = createReviewJobIo({ env, exec });
     expect(io[method]({ lanePath: '/lanes/lane-7', repo, pr, head })).toEqual({ head });
     const gitCalls = calls.filter(call => call.file === 'git');
-    expect(gitCalls).toHaveLength(5);
+    expect(gitCalls).toHaveLength(6);
     for (const { args, options } of gitCalls) {
       // Read Git's effective configuration, not just our helper's object shape.
       // This executes no fetch, callback, or repository write.
@@ -365,13 +365,14 @@ describe('red-team-only review job', () => {
       });
       const io = fakeIo({ fetchRedTeamHead: createReviewJobIo({ env: {}, exec }).fetchRedTeamHead });
       const out = runReviewJob({ repo, pr, redTeamOnly: true }, io);
-      expect(calls.slice(0, 3)).toEqual([
+      expect(calls.slice(0, 4)).toEqual([
         ['git', ['config', '--show-scope', '--list', '--includes', '-z']],
+        ['git', ['config', '--local', '--name-only', '--get-regexp', '^(fetch|transfer|receive)\\.fsck\\.|^fsck\\.']],
         ['git', ['remote', 'get-url', 'origin']],
         ['git', ['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true', 'fetch', '--no-recurse-submodules', '--no-auto-gc', '--no-auto-maintenance', '--upload-pack=git-upload-pack', '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`]],
       ]);
       if (kind === 'ok') {
-        expect(calls.slice(3)).toEqual([
+        expect(calls.slice(4)).toEqual([
           ['git', ['rev-parse', 'FETCH_HEAD^{commit}']],
           ['git', ['rev-parse', '--verify', `${head}^{commit}`]],
         ]);
@@ -1138,6 +1139,7 @@ describe('red-team-only review job', () => {
         expect(calls).toEqual([
           ['gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid']],
           ['git', ['config', '--show-scope', '--list', '--includes', '-z']],
+          ['git', ['config', '--local', '--name-only', '--get-regexp', '^(fetch|transfer|receive)\\.fsck\\.|^fsck\\.']],
           ['git', ['remote', 'get-url', 'origin']],
           ['git', ['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true', 'fetch', '--no-recurse-submodules', '--no-auto-gc', '--no-auto-maintenance', '--upload-pack=git-upload-pack', '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`]],
           ['git', ['rev-parse', 'FETCH_HEAD^{commit}']],

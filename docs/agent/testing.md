@@ -4415,7 +4415,10 @@ Review lane setup uses one hardened environment for the config scrub, origin val
 Global and system config point at the same temporary empty file, system config is disabled, and
 inherited indexed config and config-source overrides are removed before applying the hardening
 pins. The empty file is removed on success or failure. Lane setup reuses `scrubRiskyLaneConfig`
-before fetching. Retained `origin.uploadpack` and
+before fetching. After the scrub, reject lane-local `fetch.fsck.*`, `transfer.fsck.*`,
+`receive.fsck.*`, and `fsck.*` keys: object-checking pins do not override severities or skip lists.
+An unreadable check refuses fetching; only status 1 with empty output proves no matches.
+Retained `origin.uploadpack` and
 `origin.vcs` must never select a command: fetch only the validated repository's explicit SSH URL,
 with the lane-pool transport pins (`protocol.ext.allow=never` and
 `--upload-pack=git-upload-pack`), plus `submodule.recurse=false` and `--no-recurse-submodules`:

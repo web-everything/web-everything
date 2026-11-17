@@ -327,6 +327,20 @@ function fetchPinnedPrHead({ lanePath, repo, pr, env, exec, log, repoIds }) {
     if (kept.some(key => !/^remote\.origin\.(?:url|pushurl|proxy|receivepack|uploadpack|vcs)$/i.test(key))) {
       throw Error('review lane config scrub failed; inspect and repair lane configuration before retrying');
     }
+    // Object checking pins do not override per-message severities or skip lists.
+    let fsckConfig;
+    try {
+      fsckConfig = exec('git', ['config', '--local', '--name-only', '--get-regexp',
+        '^(fetch|transfer|receive)\\.fsck\\.|^fsck\\.'], gitOptions);
+    } catch (error) {
+      if (error.status !== 1 || String(error.stdout ?? '') !== '' || String(error.stderr ?? '') !== '') {
+        throw Error('review lane config scrub failed; inspect and repair lane configuration before retrying');
+      }
+      fsckConfig = '';
+    }
+    if (fsckConfig.trim()) {
+      throw Error('review lane config scrub failed; inspect and repair lane configuration before retrying');
+    }
     const origin = exec('git', ['remote', 'get-url', 'origin'], gitOptions).trim();
     const originRepo = /^(?:git@github\.com:|ssh:\/\/git@github\.com\/|https:\/\/github\.com\/)([^/]+\/[^/]+?)(?:\.git)?\/?$/i.exec(origin)?.[1];
     const identityError = 'review lane origin repository mismatch or unreadable; inspect lane before retrying';
