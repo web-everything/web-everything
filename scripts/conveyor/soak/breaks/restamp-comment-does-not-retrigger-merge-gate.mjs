@@ -38,6 +38,7 @@ export default {
         ['pr', 'edit', String(PR), '--repo', REPO, '--add-label', 'gate:refresh'],
         ['pr', 'edit', String(PR), '--repo', REPO, '--remove-label', 'gate:refresh'],
       ];
+      const labelRead = ['pr', 'view', String(PR), '--repo', REPO, '--json', 'labels'];
       for (const [name, checkRuns, expectedPlan] of [
         ['newest gate failed before restamp', [{ ...failed, id: 1, conclusion: 'success' }, failed], { checkRunId: 2 }],
         ['failed gate beyond the first unfiltered CI page', [...unrelatedChecks, failed], { checkRunId: 2 }],
@@ -48,6 +49,7 @@ export default {
         ['unreadable gate timestamp refuses refresh', [{ ...failed, started_at: 'unreadable' }], null],
       ]) {
         const calls = [];
+        let labels = [];
         const gh = (command, args) => {
           if (command !== 'gh') throw new Error('unexpected command');
           calls.push(args);
@@ -56,8 +58,11 @@ export default {
             return JSON.stringify({ total_count: gates.length, check_runs: gates.slice(0, 100) });
           }
           if (isDeepStrictEqual(args, ['api', `repos/${REPO}/pulls/${PR}`])) return JSON.stringify({ head: { sha: HEAD } });
+          if (isDeepStrictEqual(args, labelRead)) return JSON.stringify({ labels });
+          if (isDeepStrictEqual(args, expectedEdits[0])) { labels = [{ name: 'gate:refresh' }]; return ''; }
+          if (isDeepStrictEqual(args, expectedEdits[1])) { labels = []; return ''; }
           if (isDeepStrictEqual(args, ['label', 'create', 'gate:refresh', '--repo', REPO, '--color', 'ededed',
-            '--description', 'Refresh merge-gate after acceptance restamp']) || expectedEdits.some(edit => isDeepStrictEqual(args, edit))) return '';
+            '--description', 'Refresh merge-gate after acceptance restamp'])) return '';
           throw new Error(`unexpected fake gh args: ${JSON.stringify(args)}`);
         };
         const plan = planGateRefresh({ checkRuns, head: HEAD, restampedAtMs: RESTAMP_AT });
@@ -68,10 +73,12 @@ export default {
           sleep: () => { throw new Error('unexpected retry'); } });
         const expectedCalls = [['api', checkPath], ...(expectedPlan ? [
           ['api', `repos/${REPO}/pulls/${PR}`],
+          labelRead,
           ['label', 'create', 'gate:refresh', '--repo', REPO, '--color', 'ededed',
-            '--description', 'Refresh merge-gate after acceptance restamp'], ...expectedEdits,
+            '--description', 'Refresh merge-gate after acceptance restamp'],
+          expectedEdits[0], labelRead, expectedEdits[1],
         ] : [])];
-        if (result?.ok !== true || result.refreshed !== !!expectedPlan || !isDeepStrictEqual(calls, expectedCalls)) {
+        if (result?.ok !== true || result.refreshed !== !!expectedPlan || !isDeepStrictEqual(calls, expectedCalls) || labels.length !== 0) {
           violations.push(`${name}: restamp did not issue exactly the required refresh calls`);
         }
         log?.(`${name}: refreshed=${result?.refreshed}; fake gh calls=${calls.length}`);
