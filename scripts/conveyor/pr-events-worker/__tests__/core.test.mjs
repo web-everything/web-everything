@@ -703,3 +703,85 @@ describe('advisory and operator-ruling PR comments', () => {
     expect(parseGithubEvent('issue_comment', payload(advisory, { action: 'edited' }))).toBeNull();
   });
 });
+
+describe('runtime retention bounds — cards 8367, 8369', () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  const causes = (log) => log.read(0, 500).events.filter((e) => e.class === 'runtime').map((e) => e.cause);
+  const storedCauses = (storage) => storage._rows().filter((r) => r.keep).map((r) => JSON.parse(r.json).cause);
+  const bad = [NaN, Infinity, -Infinity, -1];
+
+  it.each([
+    ...bad.map((v) => ['maxRuntimeEvents', v]), ['maxRuntimeEvents', 1.5],
+    ...bad.map((v) => ['runtimeRetentionMs', v]),
+    ...bad.map((v) => ['runtimeKeyRetentionMs', v]),
+    ...bad.map((v) => ['maxRuntimeKeys', v]), ['maxRuntimeKeys', 1.5], ['maxRuntimeKeys', 0],
+  ])('rejects invalid runtime retention bounds: %s=%s', (name, value) => {
+    const storage = createMemoryStorage();
+    const writes = [];
+    for (const m of ['insert', 'setMeta', 'putProjection', 'prune']) {
+      const original = storage[m];
+      storage[m] = (...args) => { writes.push(m); return original(...args); };
+    }
+    expect(() => createEventLog(storage, { [name]: value })).toThrow('invalid runtime retention bounds');
+    expect(writes).toEqual([]);
+  });
+
+  it('valid edge maxRuntimeEvents 0 retains no runtime rows but still dedupes', () => {
+    const log = createEventLog(createMemoryStorage(), { maxRuntimeEvents: 0 });
+    expect(log.appendRuntime(runtime(), 1)).toEqual({ seq: 1, duplicate: false });
+    expect(causes(log)).toEqual([]);
+    expect(log.appendRuntime(runtime(), 2)).toEqual({ seq: null, duplicate: true });
+  });
+
+  it('default runtime row count retains exactly 5000 rows and evicts the oldest at 5001', () => {
+    const storage = createMemoryStorage();
+    const log = createEventLog(storage);
+    // Seed 5000 retained rows directly (looping the public append is quadratic and takes ~20s).
+    for (let c = 1; c <= 5000; c++) storage.insert(c, `seed:${c}`, 1000, JSON.stringify({ ...runtime({ cause: c }), seq: c }), true);
+    storage.setMeta('head', '5000');
+    expect(storedCauses(storage)).toHaveLength(5000);
+    expect(storedCauses(storage)[0]).toBe(1);
+    log.appendRuntime(runtime({ cause: 5001 }), 1000);
+    const kept = storedCauses(storage);
+    expect(kept).toHaveLength(5000);
+    expect(kept[0]).toBe(2);
+    expect(kept.at(-1)).toBe(5001);
+  });
+
+  it('default runtime key count retains exactly 20000 keys and evicts the oldest at 20001', () => {
+    const storage = createMemoryStorage();
+    const log = createEventLog(storage);
+    const keyOf = (c) => `rt:${JSON.stringify([REPO.full_name, 5453, 'a'.repeat(40), 'review', c, 'action-requested'])}`;
+    const seeded = {};
+    for (let c = 1; c <= 19_999; c++) seeded[keyOf(c)] = c;
+    storage.putProjection('runtimeKeys', 'all', { keys: seeded });
+    log.appendRuntime(runtime({ cause: 20_000 }), 20_000);
+    expect(Object.keys(storage.getProjection('runtimeKeys', 'all').keys)).toHaveLength(20_000);
+    expect(log.appendRuntime(runtime({ cause: 1 }), 20_001)).toEqual({ seq: null, duplicate: true });
+    log.appendRuntime(runtime({ cause: 20_001 }), 20_002);
+    const keys = storage.getProjection('runtimeKeys', 'all').keys;
+    expect(Object.keys(keys)).toHaveLength(20_000);
+    expect(keys[keyOf(1)]).toBeUndefined();
+    expect(keys[keyOf(2)]).toBe(2);
+  });
+
+  it('default runtime row cutoff is 30 days: kept at exactly 30 days, pruned one ms later', () => {
+    const kept = createEventLog(createMemoryStorage());
+    kept.appendRuntime(runtime({ cause: 1 }), 1000);
+    kept.appendRuntime(runtime({ cause: 2 }), 1000 + 30 * DAY);
+    expect(causes(kept)).toEqual([1, 2]);
+    const pruned = createEventLog(createMemoryStorage());
+    pruned.appendRuntime(runtime({ cause: 1 }), 1000);
+    pruned.appendRuntime(runtime({ cause: 2 }), 1000 + 30 * DAY + 1);
+    expect(causes(pruned)).toEqual([2]);
+  });
+
+  it('default runtime key cutoff is 60 days: duplicate at exactly 60 days, fresh one ms later', () => {
+    const edge = createEventLog(createMemoryStorage());
+    edge.appendRuntime(runtime(), 1000);
+    expect(edge.appendRuntime(runtime(), 1000 + 60 * DAY)).toEqual({ seq: null, duplicate: true });
+    const past = createEventLog(createMemoryStorage());
+    past.appendRuntime(runtime(), 1000);
+    expect(past.appendRuntime(runtime(), 1000 + 60 * DAY + 1)).toMatchObject({ duplicate: false });
+  });
+});

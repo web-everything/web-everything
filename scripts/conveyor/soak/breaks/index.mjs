@@ -40,6 +40,7 @@
  * `await-verify-delivered-previous-ci-never-retired.mjs` uses the same automatic registration.
  * `hung-ci-completed-run-reselect.mjs` uses the same automatic registration.
  * `judge-runs-without-cap-record.mjs` uses the same automatic registration.
+ * `stall-sweep-pages-files-past-100.mjs` uses the same automatic registration.
  * `red-team-gate-send-back-failed-never-retried.mjs` uses the same automatic registration.
  * `ready-candidate-diagnostic-event-masks-drop.mjs` uses the same automatic registration.
  * `restamp-comment-does-not-retrigger-merge-gate.mjs` uses the same automatic registration.

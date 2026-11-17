@@ -207,6 +207,37 @@ export async function stableActiveRunIds(list,tries=5) {
   }
   return {stable:false,ids:undefined,count:Math.max(1,union.size)};
 }
+const validDeploySet = v => v && typeof v === 'object' && !Array.isArray(v)
+  && (v.forgeSetSha === null || (typeof v.forgeSetSha === 'string' && /^[a-f0-9]{40}$/i.test(v.forgeSetSha)))
+  && (v.setDigest === null || (typeof v.setDigest === 'string' && /^[a-f0-9]{64}$/i.test(v.setDigest)))
+  && Number.isSafeInteger(v.hostTier) && v.hostTier > 0;
+const validDeploy = v => (exactKeys(v,'draining') && typeof v.draining === 'boolean')
+  || ((exactKeys(v,'forgeSetSha,hostTier,setDigest')
+    || (exactKeys(v,'draining,forgeSetSha,hostTier,setDigest') && typeof v.draining === 'boolean')) && validDeploySet(v));
+// Bound the read itself, including a file growing after stat. State is evidence only.
+async function readDeployState(path) {
+  let file;
+  try {
+    file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const st = await file.stat();
+    if (!st.isFile() || st.size > 4096) return null;
+    const bytes = Buffer.alloc(4097);
+    let size = 0;
+    while (size < bytes.length) {
+      const {bytesRead} = await file.read(bytes, size, bytes.length - size, null);
+      if (!bytesRead) break;
+      size += bytesRead;
+    }
+    if (size > 4096) return null;
+    const raw = bytes.subarray(0,size), text = raw.toString('utf8');
+    if (!Buffer.from(text).equals(raw)) return null;
+    const state = JSON.parse(text);
+    if (!exactKeys(state,'forgeSetSha,hostTier,installedAtET,schema,setDigest')
+      || state.schema !== 1 || !validET(state.installedAtET) || !validDeploySet(state)) return null;
+    return {forgeSetSha:state.forgeSetSha,setDigest:state.setDigest,hostTier:state.hostTier};
+  } catch { return null; }
+  finally { try { await file?.close(); } catch { /* evidence unavailable */ } }
+}
 export function parseTelemetry(text) {
   if ((!Buffer.isBuffer(text) && typeof text !== 'string') || Buffer.byteLength(text)>65536
     || (Buffer.isBuffer(text) && !Buffer.from(text.toString('utf8')).equals(text))) throw new Error('Invalid telemetry size or encoding');
@@ -220,7 +251,7 @@ export function parseTelemetry(text) {
     || !Number.isFinite(v.memFreePct) || v.memFreePct<0 || v.memFreePct>100 || !duration(v.activeRuns)
     || ('diskUsedPct' in v && (typeof v.diskUsedPct !== 'number' || !Number.isFinite(v.diskUsedPct) || v.diskUsedPct < 0 || v.diskUsedPct > 100))
     || ('prune' in v && !validPruneStatus(v.prune))
-    || ('deploy' in v && !(exactKeys(v.deploy,'draining') && typeof v.deploy.draining==='boolean'))
+    || ('deploy' in v && !validDeploy(v.deploy))
     || (withIds&&(!Array.isArray(v.activeRunIds)||v.activeRunIds.length!==v.activeRuns
       ||v.activeRunIds.some(id=>!runName(id))||new Set(v.activeRunIds).size!==v.activeRunIds.length))
     || !Array.isArray(v.recent) || v.recent.length>50 || v.recent.some(r=>!(exactKeys(r,'code,runId,stageMs,startedAtET')
@@ -234,7 +265,7 @@ export function formatTelemetry(value,host='forge') {
   const v=parseTelemetry(JSON.stringify(value));
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host)) throw new Error('Invalid host');
   const last=v.recent.find(r=>r.code!==null);
-  return `${host} ${v.sampledAtET.slice(11,16)} ET load/core ${v.loadPerCore.toFixed(2)} ram free ${Math.round(v.memFreePct)}% runs ${v.activeRuns} last-run ${last ? Math.round((last.stageMs.install+last.stageMs.run)/1000)+'s' : 'none'}`;
+  return `${host} ${v.sampledAtET.slice(11,16)} ET load/core ${v.loadPerCore.toFixed(2)} ram free ${Math.round(v.memFreePct)}% runs ${v.activeRuns} last-run ${last ? Math.round((last.stageMs.install+last.stageMs.run)/1000)+'s' : 'none'}${v.deploy?.forgeSetSha ? `\ndeploy ${v.deploy.forgeSetSha}` : ''}`;
 }
 const ENV_KEYS = ['CI','NODE_ENV','TZ','LANG','LC_ALL','FORCE_COLOR','NO_COLOR','DIFF_COVERAGE_BASE','WE_VITEST_MAX_WORKERS','VERIFY_SCAN_FILES'];
 // R309: the repo-scanning tests' changed-file list. verify-lane sends a JSON array of repo-relative
@@ -842,7 +873,7 @@ async function unitActive(unit) {
 }
 // Deploy drain (designs/forge-self-deploy.md 2.6): fixed path, never taken from a request.
 export const DRAIN_MARKER='/run/forge-deploy/drain';
-export function createRunner({testRoot, testDrainStat, testPath, testReapProbe, testCleanupExec, testIdExec, testWorkerIdentity, testSlotStat, testWorkerExec, testOwnershipExec, testGitExec, testEgressProbe, testExecute, testLimits, testDiskStat, clock=Date.now} = {}) {
+export function createRunner({testRoot, testDrainStat, testDeployStatePath, testPath, testReapProbe, testCleanupExec, testIdExec, testWorkerIdentity, testSlotStat, testWorkerExec, testOwnershipExec, testGitExec, testEgressProbe, testExecute, testLimits, testDiskStat, clock=Date.now} = {}) {
   const bases=testRoot ? join(testRoot,'bases') : '/srv/forge-base';
   const runs = testRoot ? join(testRoot,'runs') : '/srv/forge-exec';
   const receipts = testRoot ? join(testRoot,'receipts') : '/srv/forge-receipts';
@@ -1340,9 +1371,15 @@ export function createRunner({testRoot, testDrainStat, testPath, testReapProbe, 
       await init();
       await reap();
       const value = await publishTelemetry(undefined, {allowCacheFailure: true});
-      if (request?.capabilities?.limits !== 1) return value;
-      const {limits,warnings} = await readLimits();
-      return {...value,limits:warnings.length ? null : {parent:{cpuQuota:limits.parent.cpuQuota},slot:{cpuQuota:limits.slot.cpuQuota}}};
+      if (request?.capabilities?.deploy === 1) {
+        const state = await readDeployState(testDeployStatePath ?? '/var/lib/forge-deploy/state.json');
+        if (state) value.deploy = {...value.deploy,...state};
+      }
+      if (request?.capabilities?.limits === 1) {
+        const {limits,warnings} = await readLimits();
+        value.limits = warnings.length ? null : {parent:{cpuQuota:limits.parent.cpuQuota},slot:{cpuQuota:limits.slot.cpuQuota}};
+      }
+      return value;
     },
     async bases() {
       try{return {delta:1,bases:(await readyBases(bases)).slice(0,BASE_RETENTION).map(({sha,manifestDigest})=>({sha,manifestDigest}))};}

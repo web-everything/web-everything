@@ -2,7 +2,7 @@
 /** Contract tests for the pending remote admission exports; all execution and load IO is injected. */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { execSync, spawnSync } from 'node:child_process';
-import { readdirSync, mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, readFileSync, utimesSync, statSync } from 'node:fs';
+import { readdirSync, mkdtempSync, mkdirSync, chmodSync, writeFileSync, existsSync, rmSync, readFileSync, utimesSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { main, decideRemote, runWithRemoteDecision, adaptLegacyRemoteResult, resolveAdmissionPolicy, heldSlots, shellQuoteWord, DEFAULT_ADMISSION_CEILING_MS, DEFAULT_FAST_RUN_TIMEOUT_MS } from '../heavy-admission.mjs';
@@ -10,6 +10,10 @@ import { runRemote } from '../remote-exec.mjs';
 import { bindingEvidence } from './fixtures/forge-bound-git.mjs';
 import { execContainerized } from '../../lib/container-exec.mjs';
 
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {...actual, mkdtempSync:vi.fn(actual.mkdtempSync)};
+});
 vi.mock('node:child_process', async (importOriginal) => ({
   ...await importOriginal(), execSync: vi.fn(),
 }));
@@ -189,9 +193,9 @@ describe('remote admission policy', () => {
       expect(remoteExec).toHaveBeenCalledWith(expect.objectContaining({ argv:expected, cwd: root, signal: expect.any(AbortSignal) }));
       expect(exit).toHaveBeenCalledWith(23);
       expect(JSON.parse(readFileSync(join(root, 'verify-report.jsonl'), 'utf8'))).toEqual({ location: 'remote', receiptId: 'run-123456', exitCode: 23 });
-      // R501: the only thing a remote success may leave in the heavy root is the forgeShare record
+      // R501: a remote success leaves only the forgeShare record and its admission-wait row in the heavy root
       expect(existsSync(join(pool, '.admission','heavy','slot-0'))).toBe(false);
-      expect(readdirSync(join(pool, '.admission','heavy'))).toEqual(['remote-runs.jsonl']);
+      expect(readdirSync(join(pool, '.admission','heavy')).sort()).toEqual(['remote-runs.jsonl', 'waits.jsonl']);
       expect(heldSlots({lockRoot:join(pool,'.admission','remote'),cap:8})).toHaveLength(0);
     } finally { exit.mockRestore(); stderr.mockRestore(); vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); }
   });
@@ -447,11 +451,81 @@ describe('runWithRemoteDecision', () => {
   ('records exactly one structured fallback for %s / %s', async (mode, reason) => {
     const f = fixture({result:{mode,terminated:true,reason,detail:'fixture-file.mjs'}});
     const now = Date.now();
-    expect(await runWithRemoteDecision({...f,clock:()=>now})).toEqual({handled:false});
+    expect(await runWithRemoteDecision({...f,env:{},clock:()=>now})).toEqual({handled:false});
     const lines = readFileSync(join(f.lockRoot,'remote-fallbacks.jsonl'),'utf8').trim().split('\n');
     expect(lines).toHaveLength(1);
     expect(JSON.parse(lines[0])).toEqual({ts:new Date(now).toISOString(),reason,
-      detail:'fixture-file.mjs',lane:'fixture-checkout',kind:'files'});
+      detail:'fixture-file.mjs',lane:'fixture-checkout',kind:'files',
+      pid:process.pid,ppid:process.ppid,sandbox:null});
+  });
+
+  it.each(['EPERM', 'EACCES', 'EROFS'])('falls back confined-local on probe %s before health or remote dispatch', async code => {
+    const f = fixture();
+    const remoteRoot = join(f.lockRoot, '..', 'remote');
+    const readTelemetry = vi.fn(healthyRead);
+    vi.mocked(mkdtempSync).mockImplementationOnce(() => {throw Object.assign(new Error('denied'), {code});});
+    expect(await runWithRemoteDecision({...f, readTelemetry, env:{}})).toEqual({handled:false});
+    expect(readTelemetry).not.toHaveBeenCalled();
+    expect(f.remoteExec).not.toHaveBeenCalled();
+    expect(readdirSync(remoteRoot)).toEqual([]);
+    expect(f.log).toHaveBeenLastCalledWith(expect.stringContaining('(confined-local)'));
+    const row = JSON.parse(readFileSync(join(f.lockRoot, 'remote-fallbacks.jsonl'), 'utf8').trim());
+    expect(row).toMatchObject({reason:'confined-local', detail:`${code} remote`,
+      pid:process.pid, ppid:process.ppid, sandbox:null});
+  });
+
+  it('lets a non-permission probe error fall through to normal remote health and execution', async () => {
+    const f = fixture();
+    const readTelemetry = vi.fn(healthyRead);
+    vi.mocked(mkdtempSync).mockImplementationOnce(() => {throw Object.assign(new Error('race'), {code:'ENOENT'});});
+    expect(await runWithRemoteDecision({...f, readTelemetry})).toEqual({handled:true, exitCode:0,
+      remoteResult:{mode:'remote', code:0}});
+    expect(readTelemetry).toHaveBeenCalledTimes(1);
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(readdirSync(join(f.lockRoot, '..', 'remote')).some(name => name.startsWith('.write-probe-'))).toBe(false);
+  });
+
+  it.skipIf(process.getuid?.() === 0).each([false, true])(
+    'falls back confined-local without dispatch or health writes for an unwritable remote root (existing health: %s)',
+    async existingHealth => {
+      const f = fixture();
+      const remoteRoot = join(f.lockRoot, '..', 'remote');
+      const { remoteHealthFile } = await import('../forge-remote-health.mjs');
+      const healthFile = remoteHealthFile(remoteRoot);
+      const original = 'existing health evidence must remain byte-identical\n';
+      mkdirSync(remoteRoot, { recursive: true });
+      if (existingHealth) writeFileSync(healthFile, original);
+      const before = readdirSync(remoteRoot);
+      const readTelemetry = vi.fn(healthyRead);
+      chmodSync(remoteRoot, 0o500);
+      try {
+        expect(await runWithRemoteDecision({...f, readTelemetry, env:{CODEX_SANDBOX:'seatbelt'}}))
+          .toEqual({handled:false});
+        expect(f.remoteExec).not.toHaveBeenCalled();
+        expect(readTelemetry).not.toHaveBeenCalled();
+        expect(readdirSync(remoteRoot)).toEqual(before);
+        if (existingHealth) expect(readFileSync(healthFile, 'utf8')).toBe(original);
+        else expect(existsSync(healthFile)).toBe(false);
+        expect(f.log).toHaveBeenLastCalledWith(expect.stringContaining('(confined-local)'));
+        const rows = readFileSync(join(f.lockRoot, 'remote-fallbacks.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({reason:'confined-local', detail:expect.stringMatching(/^(EPERM|EACCES|EROFS) remote$/),
+          lane:'fixture-checkout', pid:process.pid, ppid:process.ppid, sandbox:{CODEX_SANDBOX:'seatbelt'}});
+      } finally {
+        chmodSync(remoteRoot, 0o700);
+      }
+    },
+  );
+
+  it('bounds and sanitizes only the named sandbox evidence, including oversized input', async () => {
+    const f = fixture({result:{mode:'not-started',terminated:true,reason:'copy-failed'}});
+    const env = {CODEX_SANDBOX:'seatbelt\n\x1b' + 'x'.repeat(1000),
+      CODEX_SANDBOX_NETWORK_DISABLED:'1', SANDBOX_RUNTIME:'runtime\u2028name', SECRET:'must not appear'};
+    expect(await runWithRemoteDecision({...f, env})).toEqual({handled:false});
+    const row = JSON.parse(readFileSync(join(f.lockRoot, 'remote-fallbacks.jsonl'), 'utf8').trim());
+    expect(row.sandbox).toEqual({CODEX_SANDBOX:('seatbelt??' + 'x'.repeat(1000)).slice(0,256),
+      CODEX_SANDBOX_NETWORK_DISABLED:'1', SANDBOX_RUNTIME:'runtime?name'});
+    expect(row).toMatchObject({pid:process.pid, ppid:process.ppid});
   });
 
   it('records health refusals without dispatching remotely', async () => {
