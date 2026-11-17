@@ -62,7 +62,7 @@ describe('conflict-rebase keep-review hand-back enforcement', () => {
     `--old-head=${oldHead}`, `--old-base=${oldBase}`];
   const fixture = (after = patch) => {
     const pushed = { headRefOid: newHead, baseRefOid: newBase, baseRefName: 'main',
-      labels: [{ name: 'review:accepted' }],
+      labels: [{ name: 'review:accepted' }], reviews: [],
       comments: [{ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${oldHead} -->` }] };
     const gh = vi.fn(argv => argv[1] === 'view' ? JSON.stringify(pushed) : '');
     const git = vi.fn(argv => argv[0] === 'merge-base' ? oldBase : argv.at(-2) === oldHead ? patch : after);
@@ -85,6 +85,10 @@ describe('conflict-rebase keep-review hand-back enforcement', () => {
   });
   describe.each(['before proof', 'during proof'])('clean acceptance %s', phase => {
     it.each([
+      ['standing formal changes request', pr => { pr.reviews.push({ author: { login: 'chalbert' },
+        state: 'CHANGES_REQUESTED', commit: { oid: oldHead }, submittedAt: '2026-10-09T09:00:00Z' }); }],
+      ['unreadable formal reviews', pr => { delete pr.reviews; }],
+      ['malformed formal reviews', pr => { pr.reviews = {}; }],
       ['superseding verdict', pr => { pr.comments.push({ author: { login: 'chalbert' }, body: 'Changes requested: fix the remaining bug.' }); }],
       ['later body-derived hold', pr => { pr.comments.push({ author: { login: 'web-everything' },
         body: '<!-- drain-skip-reason --> manifest baseline mismatch — post-review tamper suspected' }); }],
@@ -101,7 +105,7 @@ describe('conflict-rebase keep-review hand-back enforcement', () => {
       if (phase === 'during proof') io.gh.mockReturnValueOnce(initial);
       expect(() => runConflictFixMark(args, io)).toThrow('rearm-review.mjs --round=conflict');
       expect(io.gh.mock.calls.some(([argv]) => argv[1] === 'comment')).toBe(false);
-      expect(io.gh.mock.calls[0][0]).toContain('headRefOid,baseRefOid,baseRefName,comments,labels');
+      expect(io.gh.mock.calls[0][0]).toContain('headRefOid,baseRefOid,baseRefName,comments,labels,reviews');
       if (phase === 'before proof') expect(io.git).not.toHaveBeenCalled();
       else expect(io.gh).toHaveBeenCalledTimes(2);
     });
@@ -171,7 +175,7 @@ describe('conflict-rebase keep-review hand-back enforcement', () => {
       const reviewed = commit(changedTree, base, 'reviewed');
       const target = commit(baseTree, base, 'advanced target');
       const rebased = commit(changedTree, target, 'rebased');
-      const pushed = { headRefOid: rebased, baseRefOid: target, baseRefName: 'main', labels: ['review:accepted'], comments: [
+      const pushed = { headRefOid: rebased, baseRefOid: target, baseRefName: 'main', labels: ['review:accepted'], reviews: [], comments: [
         { author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${reviewed} -->` },
       ] };
       const gh = vi.fn(argv => argv[1] === 'view' ? JSON.stringify(pushed) : '');

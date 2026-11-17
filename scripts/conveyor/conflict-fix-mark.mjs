@@ -106,12 +106,12 @@ export function runConflictFixMark(argv, { gh = (args) => execFileSyncThrottled(
     }
     const readPr = () => JSON.parse(gh(['pr', 'view', String(pr),
       ...(typeof flags.repo === 'string' ? [`--repo=${flags.repo}`] : []),
-      '--json', 'headRefOid,baseRefOid,baseRefName,comments,labels']));
+      '--json', 'headRefOid,baseRefOid,baseRefName,comments,labels,reviews']));
     const cleanAcceptance = pr => {
-      const record = latestAcceptRecord(pr.comments);
+      const record = latestAcceptRecord(pr.comments, Array.isArray(pr.reviews) ? pr.reviews : null);
       const labels = Array.isArray(pr.labels)
         ? pr.labels.map(label => typeof label === 'string' ? label : label?.name) : [];
-      if (!record || record.laterVerdict || record.laterBodyDerivedHold
+      if (!record || record.reviewsUnreadable || record.laterVerdict || record.laterBodyDerivedHold
           || labels.some(label => typeof label !== 'string' || !label)
           || !labels.includes(REVIEW_LABELS.accepted)
           || [REVIEW_LABELS.changes, REVIEW_LABELS.human, REVIEW_LABELS.pending].some(label => labels.includes(label))) {
