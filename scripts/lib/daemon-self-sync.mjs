@@ -1140,7 +1140,12 @@ export function withSelfSync(effects, {
           const result = await applyPendingRollback({ root, env, log, now, bootHead: bootSha, bootSha, bootAt });
           if (result?.ok === false) log.error?.(`daemon-self-sync: boot rollback deferred (${result.reason})`);
           return result;
-        } catch (error) { log.error?.(`daemon-self-sync: boot rollback failed: ${error?.message || error}`); }
+        } catch (error) {
+          log.error?.(`daemon-self-sync: boot rollback failed: ${error?.message || error}`);
+          // Recovery may have partially changed disk. Keep this refusal cached so
+          // neither this tick nor later polls can run with unknown recovery state.
+          return { ok: false, reason: 'boot-rollback-failed' };
+        }
       })());
       if (rollback?.ok === true || rollback?.restartRequired === true) {
         // Recovery may have moved disk while this process kept the failed build's modules loaded.

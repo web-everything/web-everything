@@ -1,4 +1,4 @@
-/** PR #6882: a successful boot rollback must retire the failed process before its first tick. */
+/** PR #6882: boot rollback must restart or refuse before failed code reaches its first tick. */
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,21 +9,25 @@ import { readRebuildState, writeRebuildState } from '../../../lib/daemon-rebuild
 
 export default {
   id: 'probation-boot-rollback-restart',
-  title: 'boot rollback restarts before failed in-memory code can tick, without restart spacing',
+  title: 'boot rollback restarts on success and refuses ticks on exceptions across daemon modes',
   card: '5726 / PR #6882 send-back item 1',
   fixedBy: { sha: 'HEAD', where: 'lane/blue-green-s2-probation-r928',
     paths: ['scripts/lib/daemon-self-sync.mjs', 'scripts/lib/daemon-rebuild/probation.mjs'] },
   fixPresent(root) {
     return readFileSync(join(root, 'scripts/lib/daemon-self-sync.mjs'), 'utf8')
       .includes('rollback?.restartRequired === true')
+      && readFileSync(join(root, 'scripts/lib/daemon-self-sync.mjs'), 'utf8').includes("reason: 'boot-rollback-failed'")
       && readFileSync(join(root, 'scripts/lib/daemon-rebuild/probation.mjs'), 'utf8').includes('rollback-request-changed');
   },
   async run({ log, phases = ['before-hook', 'under-lock', 'replacement-under-lock', 'superseded-under-lock'] } = {}) {
     const base = mkdtempSync(join(tmpdir(), 'soak-boot-rollback-'));
     const violations = [];
     try {
-      for (const mode of ['default', 'background', 'poc', 'versioned', 'already-restored']) {
-        const clone = join(base, mode);
+      const cases = ['default', 'background', 'poc', 'versioned', 'already-restored']
+        .flatMap(mode => ['restored', 'throws', 'rejects'].map(outcome => ({ mode, outcome })));
+      for (const { mode, outcome } of cases) {
+        const label = `${mode}/${outcome}`;
+        const clone = join(base, mode, outcome);
         const root = mode === 'versioned' ? join(clone, 'versions', 'failed') : clone;
         const restored = 'a'.repeat(40);
         let head = mode === 'already-restored' ? restored : 'b'.repeat(40);
@@ -51,11 +55,14 @@ export default {
           rebuild: async () => { rebuilds++; return { moved: false, reason: 'still-rejected' }; },
           syncPoc: async () => { rebuilds++; return { merged: false, reason: 'up-to-date' }; },
           acquireRead: () => { reads++; return { ok: true }; }, releaseRead() {},
-          applyPendingRollback: async () => {
+          applyPendingRollback: () => {
             rollbacks++;
-            await pending;
-            head = restored;
-            return { ok: true, head };
+            if (outcome === 'throws') throw new Error('boot recovery threw before reset');
+            return pending.then(() => {
+              head = restored;
+              if (outcome === 'rejects') throw new Error('boot recovery rejected after reset');
+              return { ok: true, head };
+            });
           },
           onRestart: info => {
             restarts++;
@@ -65,14 +72,20 @@ export default {
         });
         // Both entries must wait for the same boot hook; neither may reach failed code afterwards.
         const first = wrapped.tickOnce(), second = wrapped.tickOnce();
-        if (ticks || restarts || reads || rebuilds) violations.push(`${mode}: work ran before rollback completed`);
+        if (ticks || restarts || reads || rebuilds) violations.push(`${label}: work ran before rollback completed`);
         finishRollback();
         const results = await Promise.all([first, second]);
-        if (results.some(result => result !== 'restarted') || rollbacks !== 1 || restarts !== 1
+        results.push(await wrapped.tickOnce()); // The settled promise must retain the refusal on later polls.
+        const expected = result => outcome === 'restored' ? result === 'restarted'
+          : result?.skipped === true && result.reason === 'boot-rollback-failed';
+        if (results.some(result => !expected(result)) || rollbacks !== 1 || restarts !== (outcome === 'restored' ? 1 : 0)
           || ticks || reads || rebuilds) {
-          violations.push(`${mode}: rollbacks=${rollbacks}, restarts=${restarts}, ticks=${ticks}, reads=${reads}, rebuilds=${rebuilds}`);
+          violations.push(`${label}: rollbacks=${rollbacks}, restarts=${restarts}, ticks=${ticks}, reads=${reads}, rebuilds=${rebuilds}`);
         }
-        log?.(`${mode}: rollback=${rollbacks}, restarts=${restarts}, failed ticks=${ticks}`);
+        if (outcome !== 'restored' && !messages.some(message => message.includes('boot rollback failed:'))) {
+          violations.push(`${label}: recovery exception was not logged`);
+        }
+        log?.(`${label}: rollback=${rollbacks}, restarts=${restarts}, failed ticks=${ticks}`);
         if (ticks) for (const message of messages.filter(message => message.includes('restart deferred'))) log?.(message);
       }
       // Exercise the production boot hook and clone lock, with only Git IO

@@ -173,24 +173,30 @@ describe('withSelfSync — DEFAULT path: rebuild-driven (#4044 Module E)', () =>
     expect(bootRollbackBreak.judge(report)).toEqual([]);
   });
 
-  it.each(['none', 'superseded', 'refused', 'throws'])('boot rollback runs once before any read lease and refusals skip ticks: %s', async kind => {
+  it.each(['none', 'superseded', 'refused', 'throws', 'rejects'])('boot rollback runs once before any read lease and refusals skip ticks: %s', async kind => {
     const events = [];
-    const applyPendingRollback = vi.fn(async () => {
+    const applyPendingRollback = vi.fn(() => {
       events.push('rollback');
       if (kind === 'throws') throw new Error('boot apply failed');
+      if (kind === 'rejects') return Promise.reject(new Error('boot apply failed'));
       return kind === 'refused' ? { ok: false, reason: 'rollback-lock-timeout' } : { action: kind };
     });
     const log = { error: vi.fn() };
+    const onRestart = vi.fn(), rebuild = vi.fn(async () => ({ moved: false, reason: 'up-to-date' }));
+    const checkProbation = vi.fn(() => ({ action: 'none' }));
     const w = withSelfSync({ tickOnce: () => 'ticked' }, {
-      root: '/x', env: {}, onRestart: vi.fn(), log, applyPendingRollback,
-      rebuild: async () => ({ moved: false, reason: 'up-to-date' }),
+      root: '/x', env: {}, onRestart, log, applyPendingRollback, rebuild, checkProbation,
       readHead: () => 'boot', acquireRead: () => { events.push('read'); return { ok: true }; },
       releaseRead: vi.fn(), readState: emptyState,
     });
-    if (kind === 'refused') {
-      await expect(w.tickOnce()).resolves.toMatchObject({ skipped: true, reason: 'rollback-lock-timeout' });
-      await expect(w.tickOnce()).resolves.toMatchObject({ skipped: true, reason: 'rollback-lock-timeout' });
+    if (['refused', 'throws', 'rejects'].includes(kind)) {
+      const reason = kind === 'refused' ? 'rollback-lock-timeout' : 'boot-rollback-failed';
+      await expect(w.tickOnce()).resolves.toMatchObject({ skipped: true, reason });
+      await expect(w.tickOnce()).resolves.toMatchObject({ skipped: true, reason });
       expect(events).toEqual(['rollback']);
+      expect(rebuild).not.toHaveBeenCalled();
+      expect(checkProbation).not.toHaveBeenCalled();
+      expect(onRestart).not.toHaveBeenCalled();
     } else {
       await expect(w.tickOnce()).resolves.toBe('ticked');
       await expect(w.tickOnce()).resolves.toBe('ticked');
@@ -198,7 +204,7 @@ describe('withSelfSync — DEFAULT path: rebuild-driven (#4044 Module E)', () =>
     }
     expect(applyPendingRollback).toHaveBeenCalledTimes(1);
     expect(applyPendingRollback).toHaveBeenCalledWith(expect.objectContaining({ root: '/x', env: {}, log }));
-    if (kind === 'refused' || kind === 'throws') expect(log.error).toHaveBeenCalledWith(expect.stringContaining('rollback'));
+    if (['refused', 'throws', 'rejects'].includes(kind)) expect(log.error).toHaveBeenCalledWith(expect.stringContaining('rollback'));
   });
 
   it.each([false, true])('boot rollback bypasses restart debounce before rebuilding or ticking (swap spacing: %s)', async swapSpaced => {
