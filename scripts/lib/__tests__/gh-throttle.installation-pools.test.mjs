@@ -30,7 +30,9 @@ const acquire = (bucket, owner, extra = {}) => acquireGhSlotSync({ ...pool(bucke
 const rows = name => readFileSync(join(root, name), 'utf8').trim().split('\n').map(JSON.parse);
 const ok = () => ({ status: 0, stdout: Buffer.from('[]'), stderr: Buffer.alloc(0) });
 function invoke(mode, env, execute, extra = {}) {
-  const throttle = { lockRoot: root, cap: 1, env: { ...baseEnv(), ...env }, personalRoute: false, acquireTimeoutMs: 0, warn: () => {}, budgetPerMin: 10000, ...extra };
+  // Installation calls use a high explicit cap so installationCap (2) binds (R1011: explicit cap = upper bound);
+  // shared-pool fallbacks keep the tiny cap.
+  const throttle = { lockRoot: root, cap: env.GH_TOKEN ? 20 : 1, env: { ...baseEnv(), ...env }, personalRoute: false, acquireTimeoutMs: 0, warn: () => {}, budgetPerMin: 10000, ...extra };
   const callArgs = extra.args ?? args;
   return mode === 'sync'
     ? runGhSync(callArgs, { cwd: extra.cwd, env: throttle.env, throttle: { ...throttle, exec: execute } })
@@ -455,6 +457,14 @@ describe('settings and compatibility', () => {
     expect(ghInstallationCap({ cap: 3, explicitCap: true, env, settings })).toBe(3);
     expect(ghInstallationCap({ cap: 6, env: { ...env, WE_GH_THROTTLE_CAP: '6' }, settings })).toBe(6);
     expect(ghInstallationCap({ cap: 6, env: { ...env, WE_GH_THROTTLE_CAP: 'invalid' }, settings })).toBe(9);
+  });
+  it('R1011: an explicit throttle.cap always bounds the pool, even above a specific installation setting', () => {
+    const env = { WE_PLATFORM_PREFERENCES_FILE: join(root, 'none.json'), WE_GH_THROTTLE_INSTALLATION_CAP: '9' };
+    const settings = loadGhThrottleSettings({ file: {}, env });
+    expect(ghInstallationCap({ cap: 3, explicitCap: true, env, settings })).toBe(3);
+    expect(ghInstallationCap({ cap: 20, explicitCap: true, env, settings })).toBe(9);
+    const fileSettings = loadGhThrottleSettings({ file: { ghThrottle: { installationCap: 8 } }, env: { WE_PLATFORM_PREFERENCES_FILE: join(root, 'none.json') } });
+    expect(ghInstallationCap({ cap: 2, explicitCap: true, env: {}, settings: fileSettings })).toBe(2);
   });
   it('removes the obsolete single-installation assertion', () => {
     const source = readFileSync(new NodeURL('../gh-throttle.mjs', import.meta.url), 'utf8');

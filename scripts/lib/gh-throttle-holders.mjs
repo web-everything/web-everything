@@ -38,7 +38,9 @@ export function ghInstallationCap({ cap, explicitCap = false, env = process.env,
   // remains the per-installation revert switch even with installationCap=12 in the tool file.
   const generic = explicitCap || explicitEnv;
   const useGeneric = generic && source !== 'env' && source !== 'operator-db';
-  const value = useGeneric ? cap : settings.value.installationCap;
+  const chosen = useGeneric ? cap : settings.value.installationCap;
+  // R1011: an explicit throttle.cap always bounds the pool, even above a specific installation setting.
+  const value = explicitCap ? Math.min(chosen, cap) : chosen;
   logCascadeSources('ghThrottle.slotCap', { value: { installationCap: value }, sources: { installationCap: useGeneric ? (explicitCap ? 'caller' : 'env') : source }, invalid: [] }, { env });
   return value;
 }
