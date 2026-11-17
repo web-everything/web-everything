@@ -884,21 +884,56 @@ export function redTeamBreaksAgree({ comments, pr, head, breaks } = {}) {
     && JSON.stringify([...(breaks ?? [])].sort()) === JSON.stringify(keys) };
 }
 
+const collapseWhitespace = value => String(value ?? '').replace(/\s+/g, ' ').trim();
+// A cited location is `line N` / `L N`, or `:N[:M]` right after a FILE PATH: a path holds a directory
+// separator or a source extension and never sits inside a URL, so a host `example.com:443` keeps its port.
+const SOURCE_EXT = 'mjs|cjs|js|jsx|mts|cts|ts|tsx|json|jsonc|md|mdx|ya?ml|toml|html?|css|scss|vue|svelte|sh|bash|zsh|py|rb|go|rs|java|kt|swift|c|h|cc|cpp|hpp|cs|php|sql|txt';
+const PATH_COLON_LOCATION = new RegExp(`((?:[\\w.@~+-]+/)+[\\w@~+-][\\w.@~+-]*\\.[a-z0-9]{1,8}|[\\w@~+-][\\w.@~+-]*\\.(?:${SOURCE_EXT}))(:\\d+(?::\\d+)*)(?=\\b)`, 'gi');
+const LINE_WORD_LOCATION = /\b(?:line|L)\s*\d+\b/gi;
+/**
+ * The summary with ONLY two edits (operator ruling R952): whitespace collapsed, and cited line locations
+ * replaced by `#`. No other digit, punctuation, case or URL rewriting: a changed port, retry count, operator or
+ * snippet is a different finding. PURE.
+ */
+export function summaryCanonical(summary) {
+  return collapseWhitespace(summary)
+    .replace(PATH_COLON_LOCATION, (match, path, _location, offset, text) => {
+      // A URL's own path is not a source file reference: `https://h/a/b.js:443` keeps its port.
+      const tokenStart = text.lastIndexOf(' ', offset) + 1;
+      return text.slice(tokenStart, offset).includes('://') ? match : `${path}#`;
+    })
+    .replace(LINE_WORD_LOCATION, '#');
+}
+
+/**
+ * One approval per finding: the key is the fingerprint plus the finding's occurrence rank among findings sharing it,
+ * ranked by cited line (then index). Two same-fingerprint findings need two approvals; a line drift keeps the rank. PURE.
+ * @returns {Map<object,string>} finding → key (findings without a fingerprint are omitted)
+ */
+export function findingOccurrenceKeys(findings) {
+  const groups = new Map();
+  for (const f of findings ?? []) {
+    const fingerprint = findingFingerprint(f);
+    if (fingerprint) groups.set(fingerprint, [...(groups.get(fingerprint) ?? []), f]);
+  }
+  const keys = new Map();
+  for (const [fingerprint, group] of groups) {
+    const rank = f => (Number.isInteger(f.line) ? f.line : Infinity);
+    group.sort((a, b) => (rank(a) === rank(b) ? 0 : rank(a) < rank(b) ? -1 : 1) || a.index - b.index)
+      .forEach((f, n) => keys.set(f, `${fingerprint}#${n}`));
+  }
+  return keys;
+}
+
 // A path is required: missing file evidence must never equate unrelated findings.
-// Preserve semantic numbers in titles, removing only explicit line references.
 export const FINDING_FINGERPRINT_FIELDS = Object.freeze(['confirmed', 'recheckOutcome', 'category', 'impact', 'scenario',
   'recheck', 'securityReachableToday', 'findingClass', 'classBasis', 'alsoClasses']);
 export function findingFingerprint(f) {
   const file = String(f.file ?? '').replace(/`/g, '').replace(/\\/g, '/').replace(/:\d+(?::\d+)?$/g, '').trim();
-  // Keep case and punctuation: changed identifiers, snippets and operator tokens
-  // are distinct findings. Only explicit cited-line drift and whitespace normalize.
-  const normalize = value => String(value ?? '')
-    .replace(/(\.[a-z0-9]{1,6}):\d+(?::\d+)?\b/gi, '$1')
-    .replace(/\s+/g, ' ').trim();
   const path = posix.normalize(file);
-  const title = normalize(f.summary);
+  const title = summaryCanonical(f.summary);
   return file && path.replace(/\/+$/, '') !== '.' && title && f.category
-    ? JSON.stringify([path, normalize(f.category), breakClass(f), title,
+    ? JSON.stringify([path, collapseWhitespace(f.category), breakClass(f), title,
       // Preserve presence as well as value: missing security/class evidence cannot match an explicit value.
       ...FINDING_FINGERPRINT_FIELDS.map(key => [Object.hasOwn(f, key),
         Array.isArray(f[key]) ? [...f[key]].sort() : typeof f[key] === 'string'
@@ -976,16 +1011,16 @@ function priorOperatorCards(records, pr, liveHit, grants, anyState) {
     const hit = { ...r, parsed };
     const gates = gateRecordsFor(prior, pr, parsed.rev, hit);
     const source = headActionEvidence(hit, gates, grants, anyState);
-    // Rebuild once per result. An unapproved duplicate cannot erase a release retained
-    // by its sibling, and a result without the finding retires the old card.
-    const nextCards = new Map(), spentCards = new Set();
+    // Rebuild once per result, keyed by fingerprint + occurrence (a multiset of approvals): each card is single-use,
+    // an unapproved duplicate cannot erase a release retained by its sibling, and a result without the finding retires it.
+    const nextCards = new Map();
+    const occurrence = findingOccurrenceKeys(parsed.findings);
     for (const f of parsed.findings) {
-      const fingerprint = findingFingerprint(f);
+      const fingerprint = occurrence.get(f);
       if (!fingerprint) continue;
       // Carries keep exact-head bindings; only fresh results inherit by fingerprint.
-      const previous = !spentCards.has(fingerprint) ? cards.get(fingerprint) : null;
+      const previous = cards.get(fingerprint);
       const inherited = !hit.from && previous?.head !== parsed.rev ? previous : null;
-      if (inherited) spentCards.add(fingerprint);
       if (!f.confirmed || parsed.shapedLines?.length) continue;
       const evidence = [...source.rulings, ...(inherited
         ? [{ kind: 'card', source: 'operator', keys: [f.index], at: inherited.at, action: 'card' }] : [])];
@@ -1060,7 +1095,7 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
   // Without a repo there is no grant credit and the cap keeps winning.
   const outcome = sendBackStepState(liveGates, grants).outcome;
   const dispositions = new Map(), findingRulings = new Map();
-  const spentCards = new Set();
+  const occurrenceKeys = findingOccurrenceKeys(result?.findings);
   const sendBack = [], held = [];
   for (const f of result?.findings ?? []) {
     const classDeferred = classAction(f, findingClasses) === 'defer-card';
@@ -1074,10 +1109,9 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
         ? outcome === GATE_OUTCOMES.ROUND_CAP ? 'held' : 'send-back' : null);
     // Indexed gate holds retire older releases; legacy unindexed holds are only
     // fallback evidence. Operator blocks remain live across ordinary gate holds.
-    // One carded finding releases ONE fresh finding: a second finding sharing the fingerprint was never approved.
-    const fingerprint = findingFingerprint(f);
-    const priorCard = fingerprint && !spentCards.has(fingerprint) ? priorCards.get(fingerprint) : undefined;
-    if (priorCard) spentCards.add(fingerprint);
+    // Approvals are a multiset: the Nth same-fingerprint finding (ranked by line) is released only by the Nth approval.
+    const occurrenceKey = occurrenceKeys.get(f);
+    const priorCard = occurrenceKey ? priorCards.get(occurrenceKey) : undefined;
     const evidence = liveFindingEvidence([...rulings, ...(priorCard
       ? [{ kind: 'card', source: 'operator', keys: [f.index], at: priorCard.at, action: 'card' }] : [])]
       .filter(r => !(revokedClassCard && r.kind === 'card' && r.source === 'automatic')), ordinaryHolds, f.index);

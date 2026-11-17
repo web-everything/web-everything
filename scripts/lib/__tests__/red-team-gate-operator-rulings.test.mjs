@@ -653,8 +653,8 @@ describe('fresh-head card regression paths', () => {
   const read = (comments, head = N) => readRedTeamDisposition({ comments, pr: P, head,
     setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true }, sealed: null });
 
-  it.each([['line 1', 'line 2'], ['lines 1–2', 'lines 2–3'], ['ln 1', 'ln 2']])(
-    'does not inherit when semantic line numbers change (%s → %s)', (before, after) => {
+  it.each([['lines 1–2', 'lines 2–3'], ['ln 1', 'ln 2'], ['retries 3', 'retries 5']])(
+    'does not inherit when non-location numbers change (%s → %s)', (before, after) => {
       const source = freshResult(H, [{ ...F(159, 'broken'), summary: `Parser drops ${before} of multiline input` }], result.created_at);
       const next = freshResult(N, [{ ...F(165, 'broken'), summary: `Parser drops ${after} of multiline input` }]);
       expect(held(read([...carded(source), next]))).toEqual([1]);
@@ -740,4 +740,66 @@ it('inherits the same scenario after whitespace normalization and cited-line dri
   const d = readRedTeamDisposition({ comments, pr: P, head: N, setting: CONFIRMED_BREAKS_DEFAULTS,
     operatorRulings: { anyState: true }, sealed: null });
   expect(d.dispositions.get(3).state).toBe('released carded');
+});
+
+describe('summary canonicalization strips only whitespace and line-location tokens (R952)', () => {
+  const fp = summary => findingFingerprint({ file: 'scripts/x.mjs', summary, category: 'edge-case', confirmed: true, impact: 'broken' });
+  it.each([
+    ['https port', 'Probe hits https://api.example.com:443/v1 and fails', 'Probe hits https://api.example.com:8443/v1 and fails'],
+    ['bare host port', 'Connects to api.example.com:443 and fails', 'Connects to api.example.com:8443 and fails'],
+    ['localhost port', 'Binds localhost:8080 twice', 'Binds localhost:9090 twice'],
+    ['retries', 'Gives up after retries 3', 'Gives up after retries 5'],
+    ['timeout digits', 'Waits 30 seconds then aborts', 'Waits 300 seconds then aborts'],
+    ['punctuation-only snippet', 'Reject `a?.b` input', 'Reject `a.b` input'],
+    ['punctuation-only call', 'Reject foo(x, y)', 'Reject foo(x y)'],
+    ['url path colon', 'Fetches https://example.com/a/b.js:443', 'Fetches https://example.com/a/b.js:8443'],
+  ])('keeps distinct: %s', (_name, a, b) => {
+    expect(fp(a)).not.toBeNull();
+    expect(fp(a)).not.toBe(fp(b));
+  });
+  it.each([
+    ['line N', 'Parser drops input at line 10', 'Parser drops input at line 11'],
+    ['L N', 'Parser drops input at L10', 'Parser drops input at L 11'],
+    ['file:line', 'Parser drops input at scripts/parser.mjs:10', 'Parser drops input at scripts/parser.mjs:20'],
+    ['bare file:line:col', 'Parser drops input in parser.mjs:10:5', 'Parser drops input in parser.mjs:20:7'],
+    ['whitespace', 'Parser   drops\tinput', 'Parser drops input'],
+  ])('treats a location-only or whitespace-only change as the same: %s', (_name, a, b) => {
+    expect(fp(a)).toBe(fp(b));
+  });
+});
+
+describe('carded approvals are a multiset keyed by fingerprint and occurrence (R952)', () => {
+  const dup = line => ({ ...F(line, 'broken'), summary: 'Parser drops multiline input' });
+  const freshResult = (head, findings, at = '2026-10-21T21:00:00Z') => bot(renderRedTeamComment({ pr: P, rev: head,
+    provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes', findings }), at);
+  const cardedTwo = () => {
+    const source = freshResult(H, [dup(159), dup(160)], result.created_at);
+    const id = liveResultGateState([source], P, H).resultId;
+    return [source,
+      gate(bot, 'round-cap', '- 2 confirmed break(s) NOT sent back: cap (#1, #2).', '2026-10-21T17:30:00Z', id),
+      gate(human, 'operator-card', cardLine([1, 2]), '2026-10-21T20:30:00Z', id)];
+  };
+  const read = comments => readRedTeamDisposition({ comments, pr: P, head: N,
+    setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true }, sealed: null });
+  it('releases two carded findings that each move one line', () => {
+    const d = read([...cardedTwo(), freshResult(N, [dup(160), dup(161)])]);
+    expect(held(d)).toEqual([]);
+    expect([1, 2].map(i => d.dispositions.get(i).state)).toEqual(['released carded', 'released carded']);
+  });
+  it('does not release a third, new finding with the same fingerprint', () => {
+    const d = read([...cardedTwo(), freshResult(N, [dup(160), dup(161), dup(300)])]);
+    expect(held(d)).toEqual([3]);
+    expect([1, 2].map(i => d.dispositions.get(i).state)).toEqual(['released carded', 'released carded']);
+  });
+  it('keeps occurrences stable when the findings reorder: lines decide the rank, not the index', () => {
+    const d = read([...cardedTwo(), freshResult(N, [dup(300), dup(160), dup(161)])]);
+    expect(held(d)).toEqual([1]);
+  });
+  it('one approval releases only one of two same-fingerprint findings', () => {
+    const source = freshResult(H, [dup(159)], result.created_at);
+    const id = liveResultGateState([source], P, H).resultId;
+    const comments = [source, gate(bot, 'round-cap', '- 1 confirmed break(s) NOT sent back: cap (#1).', '2026-10-21T17:30:00Z', id),
+      gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z', id), freshResult(N, [dup(160), dup(161)])];
+    expect(held(read(comments))).toEqual([2]);
+  });
 });
