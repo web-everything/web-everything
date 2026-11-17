@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { execGuardedFixer } from './fixer-process.mjs';
 import { buildStandDownComment } from '../conveyor/stand-down.mjs';
 import { repeatedFindingPlan, applyScopeReset, resolveFixSafety } from '../conveyor/repeated-finding-reset.mjs';
 /**
@@ -117,6 +118,7 @@ export function parseFixRunArgv(argv = []) {
   const repairKind = flags['repair-kind'] === undefined ? 'fix' : String(flags['repair-kind']).trim();
   if (!['fix', 'ci-heal'].includes(repairKind)) throw new TypeError(`fix-run: invalid --repair-kind=${repairKind} (supported: fix|ci-heal)`);
   return {
+    mode: opt('mode'), launchGuard: flags['launch-guard'] === undefined ? undefined : JSON.parse(flags['launch-guard']),
     repairKind, pr: String(flags.pr).trim(), sessionSlug: String(flags.session).trim(), ref: String(flags.ref).trim(),
     promptFile: String(flags['prompt-file']).trim(),
     item: opt('num'), repo: opt('repo'), claimRepo: opt('claim-repo'), laneRepo: opt('lane-repo'), scope: opt('scope'),
@@ -619,6 +621,7 @@ export async function resolveFixProvider(name) {
  */
 export async function runFixCli(argv = [], {
   run = sh,
+  launchGate, launchGateOptions,
   recordPush = undefined,
   readPrompt = (p) => readFileSync(p, 'utf8'),
   removePrompt = removePromptFile,
@@ -1058,7 +1061,8 @@ export async function runFixCli(argv = [], {
       }, heartbeatMs);
       heartbeat.unref();
       try {
-        spawned = await provider.spawn({
+        spawned = await execGuardedFixer(launch.provider, [{
+          mode: launch.mode, launchGuard: launch.launchGuard,
           taskKind: launch.taskKind, usageTaskKind: launch.repairKind === 'ci-heal' ? 'ci-heal' : launch.taskKind, repo: launch.repo, pr, caller: 'fix-run.mjs',
           sessionId: undefined, prompt: mergePrompt + (launch.repairKind === 'ci-heal'
             ? SANDBOX_PREAMBLE.replace(/The reviewer's finding[\s\S]*?authoritative ask\.\n/, 'The failing checks and tests are in the CI FAILURE CONTEXT section below.\n')
@@ -1069,12 +1073,16 @@ export async function runFixCli(argv = [], {
         }, { resolveLane: () => lanePath, ...(launch.provider === 'codex' ? {
           spawnAgent: async (...args) => {
             try {
-              const result = await spawnCodex(...args);
+              const [argv, opts, io] = args;
+              const result = await spawnCodex(argv, { ...opts, mode: launch.mode, launchGuard: launch.launchGuard,
+                launchContext: { pr, repo: launch.repo }, launchGateOptions }, { ...io, gate: launchGate });
               finalMessage = agentFinalMessage(result);
               return result;
             } catch (e) { finalMessage = agentFinalMessage(e); throw e; }
           },
-        } : {}) });
+        } : {}) }], { mode: launch.mode, launchGuard: launch.launchGuard, launchContext: { pr, repo: launch.repo }, launchGateOptions }, {
+          gate: launchGate, exec: (_provider, [request, io]) => provider.spawn(request, io),
+        });
       } finally {
         clearInterval(heartbeat);
       }

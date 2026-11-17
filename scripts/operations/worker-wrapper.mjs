@@ -26,6 +26,7 @@
  * `runWorker` takes every effect as an injectable (spawn, clock, record store, drafts sink, file reader, head probe),
  * so the tests run it against a fake child. The CLI at the bottom runs a JSON spec detached.
  */
+import { execGuardedFixer } from './fixer-process.mjs';
 import { spawn } from 'node:child_process';
 import { appendFileSync, closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -299,11 +300,13 @@ async function runWorkerOnce(spec, io, stop) {
   let started = newEnvelopeRecord({ ...base, headBefore, timeoutMs, now });
   const deadlineMs = Date.parse(started.startedAt) + timeoutMs;
   started.deadlineAt = new Date(deadlineMs).toISOString();
+  if (spec.mode !== undefined) started.mode = spec.mode;
+  if (spec.launchGuard !== undefined) started.launchGuard = spec.launchGuard;
   let recordWriteFailure = null; // an infrastructure fault (lock timeout), not a worker failure: runWorker rejects with it
   // The job record: written the moment the child has a pid (the spawn seam below), before it can finish.
   let graceTimer = null;
   const spawnWithPid = (cmd, argv, opts) => {
-    const child = spawnFn(cmd, argv, opts);
+    const child = execGuardedFixer(cmd, argv, { ...opts, mode: spec.mode, launchGuard: spec.launchGuard, launchContext: { pr: spec.pr, repo: spec.repo } }, { exec: spawnFn, gate: io.launchGate, ...io.launchGateOptions });
     // Opt-in smoke evidence: persist the first byte time and stderr while the worker is still running.
     if (spec.diagnosticsDir) {
       let first = true;

@@ -71,7 +71,8 @@ import { FENCED_DATA_RULE, fenceUntrusted } from '../lib/mandate-fence.mjs';
  * infra-blocked recovery / the lease-reaper / the session-reaper / the hiccup sink — best-effort, never gating
  * the tick.
  */
-import { isLaunchableConflictRebase } from './accepted-conflict-rebase.mjs';
+import { assertLaunchable, demoteConflictRebase, readConflictRebaseLive, launchGuardFor } from './conflict-rebase-launch-gate.mjs';
+export { assertLaunchable, demoteConflictRebase } from './conflict-rebase-launch-gate.mjs';
 import { appendBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { repeatedFindingPlan, resolveFixSafety } from './repeated-finding-reset.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
@@ -1055,7 +1056,10 @@ export function resumeBgSession(planned, {
   const resumeCwd = ensureSessionCwd(sessionCwdFor(candidate));
   let stdout = '';
   try { assertLaunchable(planned, { repo, root, demote, readLive }); } catch (e) { releaseOurClaim(); throw e; }
-  try { stdout = String(spawnAgent(resumeArgv, { cwd: resumeCwd }) ?? ''); } catch { stdout = ''; }
+  try { stdout = String(spawnAgent(resumeArgv, { cwd: resumeCwd, ...(planned.mode === 'conflict-rebase' ? { mode: planned.mode, launchGuard: launchGuardFor(planned, { repo, root }), launchGateOptions: { demote, readLive } } : {}) }) ?? ''); } catch (e) {
+    if (e?.kind?.startsWith('conflict-rebase-')) { releaseOurClaim(); throw e; }
+    stdout = '';
+  }
   const printedId = parseBackgroundedId(stdout);
 
   // Hardening (2) — see the docblock above. A bounded retry, not an unbounded poll: each attempt is a
@@ -1263,85 +1267,6 @@ export function fixerTableFor(ruling) {
     throw new Error(`fixer-escalation: rung ${ruling.rung?.id} routes to ${route.provider}, which the fix dispatch cannot launch (only claude --bg is wired)`);
   }
   return { model: route.model, effort: route.effort, reason: `fixer-escalation rung ${ruling.rung?.id ?? '?'}` };
-}
-
-/** Run the sanctioned demotion CLI; it posts the admission receipt and verifies fresh labels. */
-export function demoteConflictRebase(planned, { repo = 'we', root = REPO_ROOT, exec = execFileSync } = {}) {
-  const head = planned.headRefOid;
-  const evidence = planned.conflictRebase;
-  if (!/^[0-9a-f]{40}$/i.test(head ?? '') || evidence?.oldHead !== head
-      || !/^[0-9a-f]{40}$/i.test(evidence?.mainSha ?? '')
-      || evidence?.receipt !== `accepted-conflict-rebase:${head.toLowerCase()}@${evidence.mainSha.toLowerCase()}`) {
-    throw new Error('incomplete or mismatched dispatched head receipt; refresh conflict evidence before retrying');
-  }
-  const result = JSON.parse(exec(process.execPath, [join(root, 'scripts/conveyor/rearm-review.mjs'), String(planned.pr),
-    `--repo=${ghRepoSlug(repo)}`, '--round=conflict-start',
-    `--only-if=${planned.labels?.includes('review:accepted') ? 'accepted' : 'missing'}`,
-    `--expect-head=${head}`, `--actor=${evidence.receipt}`], {
-    cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
-    timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
-  }));
-  return result;
-}
-
-/** Uncached, bounded live read at the launch boundary; shared GitHub throttle applies. */
-function readConflictRebaseLive(pr, repo) {
-  return JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(pr), '--repo', ghRepoSlug(repo),
-    '--json', 'headRefOid,labels,state,isDraft,baseRefName,mergeStateStatus,mergeable'], {
-    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(),
-    killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
-  }));
-}
-
-/** The sole conflict-rebase launch gate. Proof is local to this call, never reusable by a retry. */
-export function assertLaunchable(planned, {
-  repo = 'we', root = REPO_ROOT, demote = demoteConflictRebase, readLive = readConflictRebaseLive,
-} = {}) {
-  if (planned.mode !== 'conflict-rebase') return;
-  const approvals = ['review:accepted', 'ready-to-merge', 'status:ready-to-merge'];
-  const names = live => live.labels.map(l => typeof l === 'string' ? l : l.name);
-  try {
-    const live = readLive(planned.pr, repo);
-    if (!isLaunchableConflictRebase(live, planned)) {
-      throw new Error('live head, labels, or conflict admission state changed or is incomplete');
-    }
-    const labels = names(live);
-    if (labels.some(l => approvals.includes(l))) {
-      requireConflictRebaseDemotion({ ...planned, labels }, { repo, root }, demote);
-    }
-    // Even an already-demoted episode needs a second fresh read: pending is not a cached proof.
-    const verified = readLive(planned.pr, repo);
-    if (!isLaunchableConflictRebase(verified, planned)
-        || !names(verified).includes('review:pending')
-        || names(verified).some(l => approvals.includes(l))) {
-      throw new Error('fresh live verification requires unchanged head, review:pending, no approvals or holds, and conflict admission');
-    }
-  } catch (cause) {
-    const error = cause?.kind === 'conflict-rebase-demotion-failed' ? cause
-      : Object.assign(new Error(`conflict-rebase launch refused: ${describeDispatchFailure(cause)}; refresh PR evidence before retrying`),
-        { kind: 'conflict-rebase-launch-refused' });
-    console.error(error.message);
-    throw error;
-  }
-}
-
-/** A CLI refusal or incomplete proof must never reach any fixer launch path. */
-function requireConflictRebaseDemotion(planned, options, demote) {
-  if (planned.mode !== 'conflict-rebase') return;
-  try {
-    const result = demote(planned, options);
-    if (result?.ok !== true || result.round !== 'conflict-start' || result.pr !== planned.pr
-        || !Array.isArray(result.labels) || !result.labels.every(l => typeof l === 'string' && l.length > 0)
-        || !result.labels.includes('review:pending')
-        || ['review:accepted', 'ready-to-merge', 'status:ready-to-merge'].some(l => result.labels.includes(l))) {
-      throw new Error(result?.reason || 'demotion could not be confirmed from conflict-start result');
-    }
-    return result;
-  } catch (cause) {
-    const error = new Error(`conflict-rebase demotion failed: ${describeDispatchFailure(cause)}; refresh PR labels and conflict evidence before retrying`);
-    error.kind = 'conflict-rebase-demotion-failed';
-    throw error;
-  }
 }
 
 /** Every per-entry section a fix prompt carries in front of the brief (fresh launch, borrowed launch and round resume alike). */
@@ -1713,6 +1638,7 @@ export function dispatchFix(planned, {
         launchAttempted = true;
         handle = spawnBorrowed({
           pr: planned.pr, num: planned.itemNum, sessionSlug, cwd: root,
+          ...(planned.mode === 'conflict-rebase' ? { mode: planned.mode, launchGuard: launchGuardFor(planned, { repo, root }) } : {}),
           ref: planned.laneRef, repo: ghRepoSlug(repo), laneRepo: tokens.LANE_REPO, scope: planned.scope.join(','),
           promptFile, claimRepo: repo,
           mergeOnto: mergeOntoFor(planned),
@@ -1777,6 +1703,7 @@ export function dispatchFix(planned, {
       assertLaunchable(planned, { repo, root, demote, readLive });
       launchAttempted = true;
       const launched = launchWrapped({
+        ...(planned.mode === 'conflict-rebase' ? { mode: planned.mode, launchGuard: launchGuardFor(planned, { repo, root }) } : {}),
         role: 'fix', session: sessionSlug, bgArgv: argv, cwd: sessionCwd, env: workerSpawnEnv(), pr: planned.pr, item: planned.itemNum,
         model: argv[argv.indexOf('--model') + 1] ?? null, sessionId,
       });
@@ -1793,7 +1720,7 @@ export function dispatchFix(planned, {
     // `claude agents`/`logs`/`stop` take. `sessionId` stays on the result for callers that already read it.
     assertLaunchable(planned, { repo, root, demote, readLive });
     launchAttempted = true;
-    const stdout = String(spawnAgent(argv, { cwd: sessionCwd }) ?? '');
+    const stdout = String(spawnAgent(argv, { cwd: sessionCwd, ...(planned.mode === 'conflict-rebase' ? { mode: planned.mode, launchGuard: launchGuardFor(planned, { repo, root }), launchGateOptions: { demote, readLive } } : {}) }) ?? '');
     // #x0jphk5 — the claim is DELIBERATELY NOT released here on success: see this function's own docblock for
     // why it must outlive this call (the 26+s listing-lag window a fresh spawn is exposed to).
     return {

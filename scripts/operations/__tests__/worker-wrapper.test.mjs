@@ -11,6 +11,7 @@ import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { writeStoredAwaitVerify, clearStoredAwaitVerify, awaitVerifyStoreKey } from '../../conveyor/await-verify.mjs';
+import { assertFixerLaunch, launchGuardFor } from '../../conveyor/conflict-rebase-launch-gate.mjs';
 import { validateCompletionRecord } from '../completion-record.mjs';
 import { tryReadCompletion, writeCompletion } from '../completion-store.mjs';
 import { WORKER_MARKER_ENV, WORKER_MARKER_VALUE } from '../session-role.mjs';
@@ -573,6 +574,39 @@ describe('wrapped verification waits', () => {
     };
     return { s, io, calls, writes, drafts, heads, advance: (delay) => { ms += delay; } };
   };
+  it.each(['moved head', 'new hold'])('verification resume re-gates and refuses %s before creating another child', async change => {
+    const h = harness();
+    const head = 'a'.repeat(40);
+    h.s.mode = 'conflict-rebase';
+    h.s.launchGuard = launchGuardFor({ mode: h.s.mode, pr: 7, headRefOid: head,
+      conflictRebase: { oldHead: head, defaultBranch: 'main' } }, { repo: 'o/r' });
+    let live = { headRefOid: head, labels: ['review:pending'], state: 'OPEN', isDraft: false,
+      baseRefName: 'main', mergeable: 'CONFLICTING' };
+    h.io.launchGate = vi.fn(request => assertFixerLaunch(request, { readLive: () => live }));
+    const spawn = vi.fn(h.io.spawnFn);
+    h.io.spawnFn = spawn;
+    const sleep = h.io.sleep;
+    h.io.sleep = async ms => {
+      await sleep(ms);
+      live = change === 'moved head' ? { ...live, headRefOid: 'b'.repeat(40) }
+        : { ...live, labels: ['review:pending', 'review:held-mechanical'] };
+    };
+    const out = await runWorker(h.s, h.io);
+    expect(h.io.launchGate).toHaveBeenCalledTimes(2);
+    expect(spawn).toHaveBeenCalledOnce(); // zero resume children
+    expect(out.envelope.outcome).not.toBe('done');
+    expect(out.failure).toMatchObject({ kind: 'conflict-rebase-launch-refused' });
+    expect(out.envelope).toMatchObject({ mode: h.s.mode, launchGuard: h.s.launchGuard });
+  });
+  it('a conflict wrapper with no saved guard refuses its initial child', async () => {
+    const h = harness();
+    h.s.mode = 'conflict-rebase';
+    const spawn = vi.fn(h.io.spawnFn);
+    h.io.spawnFn = spawn;
+    const out = await runWorker(h.s, h.io);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(out.envelope.outcome).not.toBe('done');
+  });
   it('keeps its own live pid while waiting, resumes the same session, and finalizes only the last output', async () => {
     const h = harness();
     const out = await runWorker(h.s, h.io);

@@ -4387,3 +4387,15 @@ helper finishes: all three approval labels must be absent and `review:pending` p
 helper remains tolerant for other callers. The rearm entrypoint tests inject separate shared and
 strict readers to cover unchanged approvals, inferred success after a read failure, malformed
 evidence and a failed strict read; any refusal stops repair and asks for fresh PR labels.
+
+
+## Conflict-rebase execution admission
+
+Carry the original `mode` and `launchGuard` (pinned head, PR, repository and conflict receipt)
+through provider requests, borrowed-launch argv and worker specs/records. `fixer-process.mjs`
+is the execution authority: every exec, including a trust retry or verification resume, runs
+`assertFixerLaunch` again. A dispatcher check is early feedback, never execution permission.
+Missing conflict launch evidence refuses before process creation; refresh PR evidence before retrying.
+The live PR read uses `throttle.noMemo: true` to retain throttling while bypassing the smoke memo.
+`conflict-rebase-launch-boundaries.test.mjs` enumerates execution sites; wrapper, borrowed-launch
+and memo regressions change evidence across the preparation/resume boundary with injected IO.

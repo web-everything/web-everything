@@ -1,4 +1,5 @@
 import { appendBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
+import { execGuardedFixer, spawnFixerToCompletion } from './fixer-process.mjs';
 import { applyTestsFirstPolicy } from '../lib/tests-first-policy.mjs';
 import { readPreparePolicy } from '../conveyor/prepare-policy-settings.mjs';
 import { resolveClaudeHelperRoute } from '../lib/claude-helper-route.mjs';
@@ -125,7 +126,6 @@ import { parseGroupMembers, dispatchStillHolds, DEFAULT_EXPECTED_WITHIN_MINUTES,
 import { markWorkerEnv, workerMarkerSettingsEnv } from './session-role.mjs';
 // #3902 — the blocking-spawn primitive `spawnAgentToCompletion` (below) is built on, for the same reason
 // `codex-delivery-provider.mjs#spawnCodexToCompletion` is (see that file's own header).
-import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
 // #3717/#3906 — the ROUTING DECISION's inputs are read HERE (io) and handed to the pure router as data: the
 // scorecards (the shared store, #4155), the checked-in size policy (#3843), the checked-in promotion record
 // (#3784) and the supervision-enforcement switch (OFF by default; turning it on is #4180). The decision itself
@@ -1610,6 +1610,7 @@ export function createDispatchSinks({
       let handle;
       try {
         handle = await provider({
+          ...(payload?.mode == null && payload?.launchGuard == null ? {} : { mode: payload.mode, launchGuard: payload.launchGuard }),
           reportAttempt: (id) => { attemptId = id; },
           // 117 S3b — the provider ran this launch through the detached worker wrapper (its pid is the runner).
           reportWrapped: (pid) => { wrappedPid = Number.isInteger(pid) ? pid : null; },
@@ -2012,6 +2013,7 @@ export function defaultClaudeProvider(request, {
   const kind = String(request.launchKind || 'build');
   if (wrapKind(kind)) {
     const launched = launchWrapped({
+      ...(request.mode == null && request.launchGuard == null ? {} : { mode: request.mode, launchGuard: request.launchGuard }),
       role: kind, session: request.sessionSlug, bgArgv: argv, cwd: request.cwd, env: workerSpawnEnv(request.spawnEnv ?? process.env), pr: request.pr ?? null,
       item: request.num ?? null, model: launchedModel, sessionId: request.sessionId,
     });
@@ -2019,7 +2021,8 @@ export function defaultClaudeProvider(request, {
     // `pid:<wrapper>` is the detached-handle shape the run store and liveness already read (route `detached`).
     return launched.handle || request.sessionId;
   }
-  const stdout = String(spawnAgent(argv, request.spawnEnv ? { cwd: request.cwd, env: request.spawnEnv } : { cwd: request.cwd }) ?? '');
+  const stdout = String(spawnAgent(argv, { cwd: request.cwd, ...(request.spawnEnv ? { env: request.spawnEnv } : {}),
+    ...(request.mode == null && request.launchGuard == null ? {} : { mode: request.mode, launchGuard: request.launchGuard }) }) ?? '');
   return parseBackgroundedId(stdout) || request.sessionId;
 }
 
@@ -2050,7 +2053,7 @@ export const WRAPPABLE_LAUNCH_KINDS = Object.freeze(['fix', 'ci-heal']);
  *   retry) can be asserted.
  * @returns {string}
  */
-export function defaultSpawnAgent(argv, opts = {}, { exec = execFileSync, grantTrust = grantDispatchTrust } = {}) {
+export function defaultSpawnAgent(argv, opts = {}, { exec = execFileSync, grantTrust = grantDispatchTrust, gate } = {}) {
   const execOpts = {
     encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: SPAWN_TIMEOUT_MS, killSignal: 'SIGKILL',
     // #x8mpubm follow-up (live-caught 2026-09-24) — this call inherits `process.env` unless told otherwise,
@@ -2067,12 +2070,13 @@ export function defaultSpawnAgent(argv, opts = {}, { exec = execFileSync, grantT
     // GH_TOKEN env `sanitizeSpawnEnv` returns is what gets marked, so neither guard undoes the other's work.
     env: markWorkerEnv(sanitizeSpawnEnv(opts.env || process.env)),
   };
+  const launch = () => execGuardedFixer('claude', argv, execOpts, { exec, gate });
   try {
-    return exec('claude', argv, execOpts);
+    return launch();
   } catch (e) {
     if (!opts.cwd || !isTrustRefusal(e)) throw e;
     try { grantTrust(opts.cwd); } catch { /* grantDispatchTrust itself never throws; belt-and-suspenders */ }
-    return exec('claude', argv, execOpts);
+    return launch();
   }
 }
 
@@ -2102,7 +2106,7 @@ export function workerSpawnEnv(env = process.env) {
  * @returns {Promise<{stdout: string, stderr: string, resourceUsage: object|null}>}
  */
 export function spawnAgentToCompletion(argv, opts = {}, io = {}) {
-  return spawnToCompletion('claude', argv, {
+  return spawnFixerToCompletion('claude', argv, {
     encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: SPAWN_TIMEOUT_MS, killSignal: 'SIGKILL', ...opts,
     env: markWorkerEnv(sanitizeSpawnEnv(opts.env || process.env)),
   }, io);

@@ -3,6 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as gh from '../gh-throttle.mjs';
+import { readConflictRebaseLive } from '../../conveyor/conflict-rebase-launch-gate.mjs';
 
 const made = [];
 afterEach(() => {
@@ -46,6 +47,24 @@ process.stdout.write(process.env.MEMO_TEST_OUTPUT || 'héllo\\n');
 const read = ['api', 'repos/example/project', '--method', 'GET'];
 
 describe('smoke-scoped gh read memo', () => {
+  it('conflict-rebase live reads bypass a stale memo through the real throttle and fake gh', () => {
+    const f = fixture();
+    const current = { headRefOid: 'a'.repeat(40), labels: ['review:pending'], state: 'OPEN' };
+    const stale = { ...current, headRefOid: 'b'.repeat(40), labels: ['review:accepted'] };
+    const env = { ...f.opts.env, MEMO_TEST_OUTPUT: JSON.stringify(current) };
+    const exec = (file, args, opts) => gh.execFileSyncThrottled(file, args, { ...opts, env });
+    const primingExec = (file, args, opts) => exec(file, args, { ...opts, throttle: { ...opts.throttle, noMemo: false } });
+    expect(readConflictRebaseLive(7, 'example/project', { exec: primingExec, throttle: f.opts.throttle })).toEqual(current);
+    expect(f.entries()).toHaveLength(1);
+    const path = join(f.memo, f.entries()[0]);
+    const entry = JSON.parse(readFileSync(path, 'utf8'));
+    writeFileSync(path, JSON.stringify({ ...entry, stdout: JSON.stringify(stale) }));
+    expect(readConflictRebaseLive(7, 'example/project', { exec: primingExec, throttle: f.opts.throttle })).toEqual(stale);
+    expect(f.count()).toBe(1);
+    expect(readConflictRebaseLive(7, 'example/project', { exec, throttle: f.opts.throttle })).toEqual(current);
+    expect(f.count()).toBe(2);
+    expect(f.logs().filter(row => row.outcome === 'memo_hit')).toHaveLength(1);
+  });
   it('exports the opt-in env name and shares identical reads', () => {
     const f = fixture();
     expect(gh.WE_GH_READ_MEMO_DIR).toBe('WE_GH_READ_MEMO_DIR');

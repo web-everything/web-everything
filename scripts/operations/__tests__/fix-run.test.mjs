@@ -11,6 +11,8 @@ import { openOperatorSendBacks } from '../../lib/operator-send-backs.mjs';
 import { dispatchFix, writePrivateBorrowedPrompt } from '../../conveyor/reconcile-fix-dispatch.mjs';
 import { buildFixEndComment } from '../../conveyor/fix-procedure.mjs';
 import { resolveFixBorrowSettings } from '../../lib/dispatch-throttle.mjs';
+import { defaultSpawnCodexAgent } from '../codex-delivery-provider.mjs';
+import { assertFixerLaunch, launchGuardFor } from '../../conveyor/conflict-rebase-launch-gate.mjs';
 import { fixDetachedProvider, fixLauncherAvailable, FIX_RUN_SCRIPT, FIX_RUN_EXECUTORS, FIX_RUN_CONFINEMENT } from '../dispatch-providers/fix.mjs';
 import { resolveDeliveryAgentProvider } from '../deliver-item-wrapper.mjs';
 import { childFailureReason, resolveAcquireWaitPolicy, parseFixRunArgv, readCiHealInputs, renderCiHealContext, renderPrContext, runFixCli, SANDBOX_PREAMBLE, HARDENED_GIT_ARGS, defaultPendingRearm, removePromptFile, riskyLaneConfig, changedPaths, escalationComment, readLaneFileSafe, laneStageEntry, unmergedPaths, MAX_CONFLICTED_PATHS, BLOB_MAX_BYTES, STAGE_MAX_BYTES } from '../fix-run.mjs';
@@ -114,6 +116,55 @@ describe('runFixCli', () => {
     };
     return { calls, envs, run, spawn, owed, pendingRearm, io: { persistEvidence: () => {}, readLease: () => ({ holder: 'test-holder' }), recordPush: () => {}, run, pendingRearm, readComments: async () => [{ createdAt: '2026-01-01', body: '🔁 review — changes requested\nFIX THE THING' }], releaseClaim: async () => ({ released: [] }), recordOutcome: () => {}, recordRouted: () => ({}), appendLoopRow: () => {}, removePrompt: () => {}, readPrompt: () => 'BRIEF', resolveProvider: () => ({ spawn }), weRoot: '/we', write: () => {}, writeErr: () => {} } };
   };
+  it.each(['moved head', 'new hold'])('rechecks %s inside a borrowed provider immediately before the actual Codex exec', async change => {
+    const head = 'a'.repeat(40), m = mk([head, head]);
+    const live = { headRefOid: head, labels: ['review:pending'], state: 'OPEN', isDraft: false,
+      baseRefName: 'main', mergeable: 'CONFLICTING' };
+    const guard = launchGuardFor({ mode: 'conflict-rebase', pr: 7, headRefOid: head,
+      conflictRebase: { oldHead: head, defaultBranch: 'main' } }, { repo: 'o/r' });
+    const spawnFn = vi.fn();
+    const providerSpawn = vi.fn(async (request, io) => {
+      expect(request).toMatchObject({ mode: 'conflict-rebase', launchGuard: guard });
+      await Promise.resolve();
+      if (change === 'moved head') live.headRefOid = 'b'.repeat(40);
+      else live.labels.push('review:held-mechanical');
+      return io.spawnAgent(['exec', 'brief'], {});
+    });
+    const launchGate = vi.fn((request, options) => assertFixerLaunch(request, options));
+    const result = await runFixCli([...argv, '--mode=conflict-rebase', `--launch-guard=${JSON.stringify(guard)}`], {
+      ...m.io, resolveProvider: () => ({ spawn: providerSpawn }), launchGate,
+      launchGateOptions: { readLive: () => live },
+      spawnCodex: (argv, opts, io) => defaultSpawnCodexAgent(argv, opts, { ...io, spawnFn }),
+    });
+    expect(result.code).toBe(1);
+    expect(providerSpawn).toHaveBeenCalledOnce();
+    expect(launchGate).toHaveBeenCalledTimes(2);
+    expect(spawnFn).not.toHaveBeenCalled();
+  });
+  it.each(['moved head', 'new hold', 'missing mode', 'missing pin', 'missing guard'])('borrowed launch refuses %s at the provider boundary after async preparation', async change => {
+    const head = 'a'.repeat(40);
+    const m = mk([head, head]);
+    let live = { headRefOid: head, labels: ['review:pending'], state: 'OPEN', isDraft: false,
+      baseRefName: 'main', mergeable: 'CONFLICTING' };
+    const guard = launchGuardFor({ mode: 'conflict-rebase', pr: 7, headRefOid: head,
+      conflictRebase: { oldHead: head, defaultBranch: 'main' } }, { repo: 'o/r' });
+    if (change === 'missing mode') delete guard.mode;
+    if (change === 'missing pin') delete guard.pinnedHead;
+    const readComments = m.io.readComments;
+    m.io.readComments = async (...args) => {
+      const comments = await readComments(...args);
+      if (change === 'moved head') live.headRefOid = 'b'.repeat(40);
+      if (change === 'new hold') live.labels.push('review:held-mechanical');
+      return comments;
+    };
+    const launchGate = vi.fn((request, options) => assertFixerLaunch(request, options));
+    const result = await runFixCli([...argv, '--mode=conflict-rebase',
+      ...(change === 'missing guard' ? [] : [`--launch-guard=${JSON.stringify(guard)}`])],
+    { ...m.io, launchGate, launchGateOptions: { readLive: () => live } });
+    expect(result.code).toBe(1);
+    expect(launchGate).toHaveBeenCalledOnce();
+    expect(m.spawn).not.toHaveBeenCalled();
+  });
   it.each([false, true])('pushAfterCi=%s waits with injected time and folds failures before the agent', async enabled => {
     const m = mk(['a'.repeat(40), 'b'.repeat(40)]);
     let now = 1000;

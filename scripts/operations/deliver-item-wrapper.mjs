@@ -1222,7 +1222,7 @@ const CLAUDE_RESTRICTED_PROVIDER = {
   // attemptTag }` — `lane`/`sessionSlug`/`item`/`attemptTag` added by bug 7's fix, below.
   async spawn(
     {
-      sessionId, prompt, resumeSessionId = null, lane, sessionSlug, item, attemptTag, model = 'sonnet', effort = 'medium',
+      mode, launchGuard, sessionId, prompt, resumeSessionId = null, lane, sessionSlug, item, attemptTag, model = 'sonnet', effort = 'medium',
       // build-path-codex-isolation-locus — see `runAgentToCompletion`'s own docblock for what sets this.
       lanePathOverride = null,
     } = {},
@@ -1303,7 +1303,7 @@ const CLAUDE_RESTRICTED_PROVIDER = {
       let ran;
       try {
         ran = await runWorkerFn({
-          role: 'build', launcher: 'claude-p', session: sessionSlug, command: 'claude', argv, cwd: lanePath,
+          mode, launchGuard, role: 'build', launcher: 'claude-p', session: sessionSlug, command: 'claude', argv, cwd: lanePath,
           env: { ...process.env, ...deliveryEnv }, timeoutMs: DELIVERY_AGENT_SPAWN_TIMEOUT_MS, model, item, sessionId,
         }, {
           // keep the SAME env hygiene as the old path (GH_TOKEN stripped, worker marker) via the existing spawn primitive
@@ -1342,6 +1342,7 @@ const CLAUDE_RESTRICTED_PROVIDER = {
       // forward compatibility.
       const { resourceUsage } = (await spawnAgent(argv, {
         cwd: lanePath,
+        ...(mode == null && launchGuard == null ? {} : { mode, launchGuard }),
         env: { ...process.env, ...deliveryEnv },
         timeout: DELIVERY_AGENT_SPAWN_TIMEOUT_MS,
       })) || {};
@@ -1405,7 +1406,7 @@ const CODEX_PROVIDER = {
   // what this spawns without a real `codex` process or a real filesystem.
   async spawn(
     {
-      sessionId, prompt, resumeSessionId = null, lane, sessionSlug, item, attemptTag, model, effort, taskKind = 'build', usageTaskKind, size, epic, decision, care, mandatoryLens, repo, pr, caller = 'deliver-item-wrapper.mjs',
+      mode, launchGuard, sessionId, prompt, resumeSessionId = null, lane, sessionSlug, item, attemptTag, model, effort, taskKind = 'build', usageTaskKind, size, epic, decision, care, mandatoryLens, repo, pr, caller = 'deliver-item-wrapper.mjs',
       // build-path-codex-isolation-locus — see `runAgentToCompletion`'s own docblock for what sets this.
       lanePathOverride = null,
     } = {},
@@ -1485,6 +1486,7 @@ const CODEX_PROVIDER = {
       // for forward compatibility.
       const spawned = (await withCodexUsage({ model, effort, taskKind: usageTaskKind ?? taskKind, caller, repo, pr, card: item, cwd: lanePath }, () => spawnAgent(argv, {
         cwd: lanePath,
+        ...(mode == null && launchGuard == null ? {} : { mode, launchGuard }),
         env: { ...process.env, ...deliveryEnv },
         timeout: DELIVERY_AGENT_SPAWN_TIMEOUT_MS,
       }))) || {};
