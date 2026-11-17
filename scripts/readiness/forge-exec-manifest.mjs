@@ -781,7 +781,19 @@ export function warnCredential(onWarning,path,finding) {
 }
 // Every path, not only credential-named ones: a structured key or a PEM private-key block with a body.
 // Linear scans only; binary bytes get the structured-signature check, the PEM text check is a bounded regex.
-const pemPrivateBlock=new RegExp('-----'+'BEGIN [A-Z0-9 ]*PRIVATE'+' KEY-----\\s*(?:(?:[A-Za-z0-9+/=]{8,}\\s*){3,}|Proc-Type:|DEK-Info:)');
+// The label may end in ` BLOCK` (ASCII-armoured PGP). Armour allows `Name: value` header lines before the base64 body.
+const pemPrivateBlock=new RegExp('-----'+'BEGIN [A-Z0-9 ]*PRIVATE'+' KEY(?: BLOCK)?-----\\s*(?:(?:[A-Za-z][A-Za-z-]*: [^\\r\\n]*\\r?\\n)*\\s*(?:[A-Za-z0-9+/=]{8,}\\s*){3,}|Proc-Type:|DEK-Info:)');
+// A PEM wrapped in base64 (a Kubernetes Secret value) or hex spells the header only after decoding.
+// A decoded view is never longer than its text, so a text view over the scan limit is skipped.
+function encodedPemFinding(views) {
+  for(const text of views) {
+    if(text.length>LIMIT)continue;
+    // Fresh dedupe state: the structure scan already consumed these views and would yield nothing again.
+    for(const decoded of decodedBuffers(text,new Map()))
+      if(pemPrivateBlock.test(decoded.toString('latin1')))return true;
+  }
+  return false;
+}
 export function ordinaryPathKeyFinding(content) {
   if(!Buffer.isBuffer(content))return null;
   const recent=new Map(),structured=privateKeyStructureFinding(content,{escapes:true,recent});
@@ -794,7 +806,8 @@ export function ordinaryPathKeyFinding(content) {
     for(const view of [decodeEscapes(text,recent),withoutBackslashes(text,recent)])
       if(view!==text&&pemPrivateBlock.test(view))return KEY_STRUCTURE_FINDING;
   }
-  return null;
+  // Last, so an escaped spelling keeps its escape finding rather than the encoded-view one.
+  return encodedPemFinding(views)?'private-key':null;
 }
 export function manifestEntry(path,content,executable,tracked,onWarning) {
   pathParts(path);

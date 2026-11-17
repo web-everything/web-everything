@@ -759,6 +759,48 @@ describe('forge-key-structure: shipped sources are scan-clean',()=>{
         expect(credentialContentFinding(Buffer.from('docs/material.md'),bytes)).toBe(FINDING);
       }
   });
+  it('refuses an armoured PGP secret-key block under an ordinary name',()=>{
+    const head='-----'+'BEGIN PGP PRIVATE'+' KEY BLOCK-----\n',tail='\n-----'+'END PGP PRIVATE'+' KEY BLOCK-----\n';
+    const body='lQOYBGRx'+'A'.repeat(56)+'\n'+'B'.repeat(64)+'\n=abcd';
+    for(const text of [head+'\n'+body+tail,head+'Version: GnuPG v2\nComment: kept\n\n'+body+tail,
+      head.replace('\n','\r\n')+'\r\n'+body.replaceAll('\n','\r\n')+tail]) {
+      const bytes=Buffer.from(text);
+      expect(ordinaryPathKeyFinding(bytes)).toBe('private-key');
+      for(const tracked of [false,true])
+        expect(()=>manifestEntry(Buffer.from('docs/material.md'),bytes,false,tracked))
+          .toThrow(expect.objectContaining({code:'excluded-source-file'}));
+    }
+    const publicBlock=Buffer.from(head.replace('PRIVATE','PUBLIC')+'\n'+body+tail.replace('PRIVATE','PUBLIC'));
+    expect(ordinaryPathKeyFinding(publicBlock)).toBeNull();
+    expect(ordinaryPathKeyFinding(Buffer.from('prose mentions '+head.trim()+' as a header'))).toBeNull();
+  });
+  it('refuses a base64- or hex-wrapped PEM secret-key block under an ordinary name',()=>{
+    const pem='-----'+'BEGIN PRIVATE '+'KEY-----\n'+('A'.repeat(8)+'\n').repeat(3)+'-----'+'END PRIVATE '+'KEY-----\n';
+    const pgp='-----'+'BEGIN PGP PRIVATE'+' KEY BLOCK-----\n\n'+('B'.repeat(8)+'\n').repeat(3);
+    for(const text of [pem,pgp]) {
+      const raw=Buffer.from(text);
+      const wrapped=[
+        'apiVersion: v1\nkind: Secret\ndata:\n  tls.key: '+raw.toString('base64')+'\n',
+        'data:\n  tls.key: '+raw.toString('base64').replace(/(.{60})/g,'$1\n  ')+'\n',
+        'x'+raw.toString('base64')+'\n',
+        'xy'+raw.toString('base64')+'\n',
+        'xyz'+raw.toString('base64')+'\n',
+        'key: '+raw.toString('base64url')+'\n',
+        'key: '+raw.toString('hex')+'\n',
+        'key: 0x'+raw.toString('hex').replace(/(..)/g,'$1 ')+'\n',
+      ];
+      for(const content of wrapped) {
+        const bytes=Buffer.from(content);
+        expect(ordinaryPathKeyFinding(bytes),content.slice(0,40)).toBe('private-key');
+        for(const tracked of [false,true])
+          expect(()=>manifestEntry(Buffer.from('config/material.yaml'),bytes,false,tracked))
+            .toThrow(expect.objectContaining({code:'excluded-source-file'}));
+      }
+    }
+    // Base64 of ordinary prose, and an over-limit view that is skipped rather than decoded, stay admitted.
+    expect(ordinaryPathKeyFinding(Buffer.from('data: '+Buffer.from('just some ordinary prose, nothing secret here at all').toString('base64')))).toBeNull();
+    expect(ordinaryPathKeyFinding(Buffer.from('A'.repeat(4*1024*1024+16)))).toBeNull();
+  });
   it('the manifest and this test carry no blocking finding of their own',()=>{
     for(const file of ['../forge-exec-manifest.mjs','./forge-key-structure.test.mjs']) {
       const bytes=readFileSync(new URL(file,import.meta.url));
