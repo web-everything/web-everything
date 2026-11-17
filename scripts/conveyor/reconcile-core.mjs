@@ -3073,7 +3073,7 @@ export function planReconcile({
     // read `queued` → `nothing-owed`, and the drain skipped it as "owned by the ci-heal / review daemons". Nobody owned
     // the re-run. A queued PR GitHub holds BLOCKED whose only red is an infra-cancelled newest-suite run (the evidence
     // reader judges `authoritativeCheckRuns` and refuses while any run is still in flight) gets a mechanical re-run,
-    // bounded to {@link BLOCKED_CANCELLED_RERUN_CAP} per head; past the cap it is a surfaced note, never a silent skip.
+    // bounded to one retry for timeouts, otherwise {@link BLOCKED_CANCELLED_RERUN_CAP} per head; past the cap it is a surfaced note, never a silent skip.
     if (!ciRepairOwed && phase === 'queued' && String(pr?.mergeStateStatus ?? '').toUpperCase() === 'BLOCKED'
         && pr?.timeoutRetry?.eligible && pr.timeoutRetry.infraCancelled
         && pr.timeoutRetry.head === pr.headRefOid && pr.timeoutRetry.pr === prNumber) {
@@ -3083,18 +3083,19 @@ export function planReconcile({
           why: `PR #${prNumber}: GitHub holds it BLOCKED on a cancelled required check; a re-run was already requested and its result is not observed yet` });
         continue;
       }
+      const cap = pr.timeoutRetry.timeoutKind ? 1 : BLOCKED_CANCELLED_RERUN_CAP;
       const spent = budget?.confirmed === undefined ? undefined : budget.confirmed + (budget.rejected ?? 0);
-      if (spent !== undefined && spent < BLOCKED_CANCELLED_RERUN_CAP) {
+      if (spent !== undefined && spent < cap) {
         dispatch.push({ ...base, ...withPhase, kind: 'ci-timeout-rerun', variant: 'blocked-cancelled',
-          timeoutRetry: { ...pr.timeoutRetry, cap: BLOCKED_CANCELLED_RERUN_CAP },
+          timeoutRetry: { ...pr.timeoutRetry, cap },
           why: `GitHub holds this queued PR BLOCKED on a required check whose newest run on head \`${String(pr.headRefOid).slice(0, 8)}\` is CANCELLED`
-            + ` (no newer run in flight) — mechanical re-run ${spent + 1}/${BLOCKED_CANCELLED_RERUN_CAP}, no heal budget` });
+            + ` (no newer run in flight) — mechanical re-run ${spent + 1}/${cap}, no heal budget` });
         continue;
       }
       if (spent !== undefined) {
-        const text = `PR #${prNumber}: GitHub still holds it BLOCKED on a cancelled required check after ${spent}/${BLOCKED_CANCELLED_RERUN_CAP} re-runs on this head — a person must look`;
-        refuse('cap-exhausted', { ...withPhase, attempts: spent, cap: BLOCKED_CANCELLED_RERUN_CAP, why: text });
-        notes.push({ kind: 'blocked-cancelled-rerun-exhausted', prNumber, attempts: spent, cap: BLOCKED_CANCELLED_RERUN_CAP, text });
+        const text = `PR #${prNumber}: GitHub still holds it BLOCKED on a cancelled required check after ${spent}/${cap} re-runs on this head — a person must look`;
+        refuse('cap-exhausted', { ...withPhase, attempts: spent, cap, why: text });
+        notes.push({ kind: 'blocked-cancelled-rerun-exhausted', prNumber, attempts: spent, cap, text });
         continue;
       }
     }

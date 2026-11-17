@@ -86,6 +86,14 @@ describe('infrastructure step timeout', () => {
     expect(isInfraStepTimeoutJob(job)).toBe(false);
     expect(isInfraCancelledJob(job)).toBe(false);
   });
+  it.each([';', '&&', '||', '|', '`', '$(', '\n', ' + ', ','])('rejects compound infrastructure step names containing %j', separator => {
+    for (const name of ['Check out repository', 'Fetch main history', 'Run actions/checkout@v4']) {
+      const job = infraStepJob(`${name}${separator} npm test`);
+      expect(isInfraStepTimeoutJob(job)).toBe(false);
+      expect(isInfraCancelledJob(job)).toBe(false);
+    }
+    expect(isInfraStepTimeoutJob(infraStepJob(`Checkout${separator}`))).toBe(false);
+  });
   it('fast checkout failure remains real', () => {
     expect(isInfraStepTimeoutJob(infraStepJob('Checkout', 179_999))).toBe(false);
     expect(isInfraCancelledJob(infraStepJob('Checkout', 1000))).toBe(false);

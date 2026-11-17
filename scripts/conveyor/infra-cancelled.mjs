@@ -51,7 +51,7 @@ export function hasCleanCancellationSteps(job) {
 }
 
 // Whole infrastructure names only: compound build/test steps carry real failure evidence.
-const INFRA_STEP_NAME = /^(?:checkout|check out (?!.* and ).+|(?:run )?actions\/(?:checkout|(?:download|upload)-artifact|cache\/restore)@\S+|fetch (?!.*(?: and |\b(?:run|test|assert)\b)).+|(?:download|upload)[ -]+artifacts?|restore cache|actions\/cache restore)$/i;
+const INFRA_STEP_NAME = /^(?![\s\S]*(?:[;|`,\r\n]|&&|\$\(| \+ ))(?:checkout|check out (?!.* and ).+|(?:run )?actions\/(?:checkout|(?:download|upload)-artifact|cache\/restore)@\S+|fetch (?!.*(?: and |\b(?:run|test|assert)\b)).+|(?:download|upload)[ -]+artifacts?|restore cache|actions\/cache restore)$/i;
 
 /** A terminal infrastructure step timed out before any later step ran. Missing evidence stays real. */
 export function isInfraStepTimeoutJob(job) {

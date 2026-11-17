@@ -4212,6 +4212,23 @@ describe('queued PR blocked by a cancelled newest-suite check (#4651)', () => {
       timeoutRetry: { ...retry, cap: BLOCKED_CANCELLED_RERUN_CAP } })]);
   });
 
+  it('caps a blocked-cancelled job-timeout dispatch at one retry', () => {
+    const result = plan({ timeoutRetry: { ...retry, timeoutKind: 'job-timeout' } });
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'ci-timeout-rerun',
+      variant: 'blocked-cancelled', timeoutRetry: { ...retry, timeoutKind: 'job-timeout', cap: 1 },
+      why: expect.stringContaining('re-run 1/1') })]);
+  });
+
+  it('exhausts a blocked-cancelled job-timeout after one confirmed retry without dispatching a second', () => {
+    const result = plan({ timeoutRetry: { ...retry, timeoutKind: 'job-timeout' },
+      timeoutRetryBudget: { confirmed: 1, pending: false } });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted',
+      prNumber: 4651, attempts: 1, cap: 1, why: expect.stringContaining('after 1/1 re-runs') }));
+    expect(result.notes).toContainEqual(expect.objectContaining({ kind: 'blocked-cancelled-rerun-exhausted',
+      prNumber: 4651, attempts: 1, cap: 1, text: expect.stringContaining('after 1/1 re-runs') }));
+  });
+
   it('counts confirmed and rejected attempts toward the cap and surfaces exhaustion', () => {
     const result = plan({ timeoutRetryBudget: { confirmed: 1, rejected: 1 } });
     expect(result.dispatch).toEqual([]);
