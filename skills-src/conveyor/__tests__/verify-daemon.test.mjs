@@ -11,6 +11,23 @@
  *   advancing (at least every 2 minutes) throughout, rather than lapsing mid-gate.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+// Only the scheduling describe installs this seam. Other describes retain real fs contracts.
+const schedulingFs = vi.hoisted(() => ({ current: null }));
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal();
+  const routed = Object.fromEntries([
+    'mkdirSync', 'readFileSync', 'writeFileSync', 'renameSync', 'watchFile', 'unwatchFile',
+  ].map(name => [name, (...args) => {
+    const fs = schedulingFs.current;
+    const path = String(args[0]);
+    return fs && (path === fs.dir || path.startsWith(`${fs.dir}/`))
+      ? fs[name](...args)
+      : actual[name](...args);
+  }]));
+  return { ...actual, ...routed };
+});
+
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, chmodSync, watch, unwatchFile } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { EventEmitter } from 'node:events';
@@ -175,7 +192,23 @@ describe('createVerifyWakeSleep — deterministic scheduling guarantees', () => 
 
   beforeEach(() => {
     vi.useFakeTimers({ now: 0 });
-    dir = mkdtempSync(join(tmpdir(), 'verify-wake-scheduler-'));
+    dir = join(tmpdir(), 'verify-wake-scheduler-virtual');
+    const files = new Map();
+    const statWatchers = new Map();
+    schedulingFs.current = {
+      dir, statWatchers,
+      mkdirSync: () => {},
+      readFileSync: path => {
+        if (!files.has(path)) throw Object.assign(new Error('missing mailbox'), { code: 'ENOENT' });
+        return files.get(path);
+      },
+      writeFileSync: (path, value) => files.set(path, value),
+      renameSync: (from, to) => { files.set(to, files.get(from)); files.delete(from); },
+      watchFile: (path, _options, check) => statWatchers.set(path, check),
+      unwatchFile: (path, check) => {
+        if (statWatchers.get(path) === check) statWatchers.delete(path);
+      },
+    };
     watchers = [];
     log = vi.fn();
     watchDir = vi.fn((_dir, check) => {
@@ -188,15 +221,16 @@ describe('createVerifyWakeSleep — deterministic scheduling guarantees', () => 
   });
 
   afterEach(() => {
-    unwatchFile(join(dir, 'wake'));
+    const fs = schedulingFs.current;
+    schedulingFs.current = null;
     vi.clearAllTimers();
     vi.useRealTimers();
-    rmSync(dir, { recursive: true, force: true });
+    expect(fs.statWatchers.size).toBe(0);
   });
 
   const request = async () => {
     expect(signalVerifyRequest({ dir, log })).toBe(true);
-    notify(); // Inject the directory event; mailbox reads and scheduler timers remain real code.
+    notify(); // Real handoff code reads the in-memory mailbox; all timers use the virtual clock.
     await vi.advanceTimersByTimeAsync(0);
   };
   const wakeSleep = (options = {}) => createVerifyWakeSleep({
