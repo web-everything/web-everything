@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { getThisHost, LEGACY_OWNER_VALUES } from '../../lib/daemon-host-guard.mjs';
+import { getThisHost } from '../../lib/daemon-host-guard.mjs';
 import { runPreflight, formatPreflight, clean, cliIO, main } from '../daemon-preflight.mjs';
 
 const ME = '11111111-1111-4111-8111-111111111111';
@@ -347,11 +347,27 @@ describe('preflight CLI IO hooks', () => {
   });
 
   it('preflight supports migration aliases through the same resolver', async () => {
-    for (const alias of LEGACY_OWNER_VALUES) {
-      const io = cliIO({}, { source: { readOwner: () => ({ host: alias, version: VERSION }) }, legacyHost: alias });
+    for (const alias of ['legacy-alpha', 'legacy-beta']) {
+      const io = cliIO({ WE_DAEMON_LEGACY_OWNER_VALUES: 'legacy-alpha,legacy-beta' }, {
+        source: { readOwner: () => ({ host: alias, version: VERSION }) }, legacyHost: alias,
+      });
       expect((await io.resolveRole({ thisHost: ME })).role).toBe('active');
     }
   });
+
+  it.each([undefined, '', 'legacy-beta', 'legacy-alpha\n', 'legacy-alpha'])(
+    'default source and resolver share the preflight alias configuration %j', async (configured) => {
+      const alias = 'legacy-alpha';
+      const env = configured === undefined ? {} : { WE_DAEMON_LEGACY_OWNER_VALUES: configured };
+      const adapter = cliIO(env, { legacyHost: alias, execFileSync: (_file, args) => JSON.stringify(
+        args[1].includes('/git/ref/') ? { object: { type: 'commit', sha: VERSION } }
+          : { type: 'file', encoding: 'base64', content: Buffer.from(alias + '\n').toString('base64') },
+      ) });
+      expect(await adapter.resolveRole({ thisHost: ME })).toMatchObject(configured === alias
+        ? { role: 'active', reason: 'fresh-owner-is-this-host' }
+        : { role: 'standby', reason: 'owner-unreadable' });
+    },
+  );
 
   it('default source wires bounded GitHub reads and pinned contents into preflight', async () => {
     const calls = [];

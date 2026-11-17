@@ -11,6 +11,7 @@ const ME = '11111111-1111-4111-8111-111111111111';
 const OTHER = '22222222-2222-4222-8222-222222222222';
 const NOW = 1_800_000_000_000;
 const VERSION = 'a'.repeat(40);
+const LEGACY_ALIASES = ['legacy-alpha', 'legacy-beta'];
 const record = (host = ME) => ({ host, version: VERSION });
 const resolve = (readOwner, extra = {}) => guard.resolveHostRole({
   thisHost: ME, source: { readOwner }, ...extra,
@@ -172,22 +173,50 @@ describe('opaque local identity', () => {
   });
 
   it('legacy migration matches only the locally established alias', async () => {
-    for (const alias of guard.LEGACY_OWNER_VALUES) {
-      expect((await resolve(() => record(alias), { legacyHost: alias })).role).toBe('active');
-      expect((await resolve(() => record(alias), { legacyHost: '' })).role).toBe('standby');
+    for (const alias of LEGACY_ALIASES) {
+      expect((await resolve(() => record(alias), { legacyOwnerValues: LEGACY_ALIASES, legacyHost: alias })).role).toBe('active');
+      expect((await resolve(() => record(alias), { legacyOwnerValues: LEGACY_ALIASES, legacyHost: '' })).role).toBe('standby');
     }
-    expect((await resolve(() => record(guard.LEGACY_OWNER_VALUES[0]), {
-      legacyHost: guard.LEGACY_OWNER_VALUES[1],
+    expect((await resolve(() => record(LEGACY_ALIASES[0]), {
+      legacyOwnerValues: LEGACY_ALIASES, legacyHost: LEGACY_ALIASES[1],
     })).role).toBe('standby');
   });
 
+  it('legacy aliases come only from local environment configuration, defaulting to none', () => {
+    expect(guard.getLegacyOwnerValues({})).toEqual([]);
+    expect(guard.getLegacyOwnerValues({ WE_DAEMON_LEGACY_OWNER_VALUES: LEGACY_ALIASES.join(',') })).toEqual(LEGACY_ALIASES);
+    vi.stubEnv('WE_DAEMON_LEGACY_OWNER_VALUES', LEGACY_ALIASES.join(','));
+    try { expect(guard.getLegacyOwnerValues()).toEqual(LEGACY_ALIASES); }
+    finally { vi.unstubAllEnvs(); }
+  });
+
+  it.each(['', 'legacy-alpha,', 'legacy-alpha\n', 'legacy-alpha\r', 'legacy-alpha\u2028',
+    '`legacy-alpha', '"legacy-alpha', '--legacy-alpha', '../legacy-alpha', '\u200blegacy-alpha',
+    'ｌegacy-alpha', 'legacy-alpha legacy-beta', 'x'.repeat(1025), ME])(
+    'invalid local alias configuration %j disables migration', (value) => {
+      expect(guard.getLegacyOwnerValues({ WE_DAEMON_LEGACY_OWNER_VALUES: value })).toEqual([]);
+    },
+  );
+
+  it('unconfigured aliases fail closed even when the local name matches', async () => {
+    const owner = LEGACY_ALIASES[0];
+    expect(await resolve(() => record(owner), { legacyOwnerValues: [], legacyHost: owner }))
+      .toMatchObject({ role: 'standby', reason: 'owner-unreadable' });
+    expect(guard.decideHostRole({ thisHost: ME, owner, ownerReadAt: NOW, now: NOW, legacyHost: owner }))
+      .toEqual({ role: 'standby', reason: 'owner-unreadable' });
+  });
+
   it('legacy discovery bounds argv execution and fails closed on unknown names', () => {
-    const alias = guard.LEGACY_OWNER_VALUES[0];
+    const alias = LEGACY_ALIASES[0];
+    const legacyOwnerValues = LEGACY_ALIASES;
     const exec = vi.fn(() => alias + '\n');
-    expect(guard.getLegacyHost({ exec })).toBe(alias);
+    expect(guard.getLegacyHost({ exec, legacyOwnerValues })).toBe(alias);
     expect(exec).toHaveBeenCalledWith('scutil', ['--get', 'HostName'], expect.objectContaining({ timeout: 15000, maxBuffer: 1024 * 1024 }));
-    expect(guard.getLegacyHost({ exec: () => { throw new Error('unavailable'); }, hostname: () => alias })).toBe(alias);
-    expect(guard.getLegacyHost({ exec: () => 'unrecognized', hostname: () => alias })).toBe('');
+    expect(guard.getLegacyHost({ legacyOwnerValues, exec: () => { throw new Error('unavailable'); }, hostname: () => alias })).toBe(alias);
+    expect(guard.getLegacyHost({ legacyOwnerValues, exec: () => 'unrecognized', hostname: () => alias })).toBe('');
+    exec.mockClear();
+    expect(guard.getLegacyHost({ exec, legacyOwnerValues: [] })).toBe('');
+    expect(exec).not.toHaveBeenCalled();
   });
 });
 

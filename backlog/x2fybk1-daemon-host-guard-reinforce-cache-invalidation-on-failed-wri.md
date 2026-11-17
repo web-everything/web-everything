@@ -24,8 +24,12 @@ the daemon on standby. Cached ownership, throttles, locks and fences are removed
   adapter reads `host` on `daemon-host-owner`, pinning contents to the observed commit.
 - Generate a random UUID once in `~/.claude/host-id`, mode 600. Publish without
   overwriting another process's ID. Malformed or inaccessible identity fails closed.
-- Deprecated aliases are migration constants only; a fresh legacy owner value must
-  match the locally established alias.
+- Deprecated aliases come only from the local, uncommitted environment variable
+  `WE_DAEMON_LEGACY_OWNER_VALUES` (exact comma-separated lowercase names, at most
+  1024 characters total; each name at most 253 letters, digits, dots or hyphens,
+  starting and ending with a letter or digit; UUIDs are excluded). Unset or malformed
+  configuration disables migration. A fresh legacy owner must match a configured
+  alias and the locally established name; otherwise it cannot activate this host.
 - Preflight reads existing identity without provisioning it, uses the same resolver,
   reports unreadable ownership as a failed check, and continues unrelated checks.
 - Clone discovery errors remain explicit failures; valid stale overlays and sidecars

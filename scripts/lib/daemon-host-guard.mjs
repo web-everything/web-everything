@@ -12,15 +12,24 @@ import { randomUUID } from 'node:crypto';
 export const FRESH_READ_MS = 60_000;
 export const OWNER_REF = 'daemon-host-owner';
 export const OWNER_FILE = 'host';
-// Deprecated: legacy owner aliases are accepted only until the owner branch migrates.
-export const LEGACY_OWNER_VALUES = Object.freeze(['studio', 'macbook']);
 const MAX_BUFFER = 1024 * 1024;
 const READ_TIMEOUT_MS = 15_000;
 const validId = (value) => typeof value === 'string' && value.length === 36
   && /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value);
-const validOwner = (value) => validId(value) || LEGACY_OWNER_VALUES.includes(value);
+const validAlias = (value) => typeof value === 'string' && value.length <= 253
+  && /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?![\s\S])/.test(value) && !validId(value);
+const legacyOwner = (value, aliases) => validAlias(value) && Array.isArray(aliases) && aliases.includes(value);
+const validOwner = (value, aliases) => validId(value) || legacyOwner(value, aliases);
 const standby = (reason) => ({ role: 'standby', reason });
 const lineValue = (value) => value.replace(/\r?\n$/, '');
+
+/** Deprecated migration aliases: exact comma-separated names in local env only. */
+export function getLegacyOwnerValues(env = process.env) {
+  const raw = env.WE_DAEMON_LEGACY_OWNER_VALUES;
+  if (typeof raw !== 'string' || raw.length > 1024) return Object.freeze([]);
+  const aliases = raw.split(',');
+  return Object.freeze(aliases.every(validAlias) ? aliases : []);
+}
 
 export function defaultHostIdPath(home = homedir()) {
   return join(home, '.claude', 'host-id');
@@ -58,7 +67,9 @@ export function getThisHost({ home = homedir(), create = true } = {}) {
 }
 
 /** Local names are consulted only for the deprecated migration aliases. */
-export function getLegacyHost({ exec = execFileSync, hostname: fallback = hostname } = {}) {
+export function getLegacyHost({ exec = execFileSync, hostname: fallback = hostname,
+  legacyOwnerValues = getLegacyOwnerValues() } = {}) {
+  if (!Array.isArray(legacyOwnerValues) || legacyOwnerValues.length === 0) return '';
   let name;
   try {
     name = String(exec('scutil', ['--get', 'HostName'], {
@@ -68,18 +79,18 @@ export function getLegacyHost({ exec = execFileSync, hostname: fallback = hostna
   if (!name) {
     try { name = String(fallback()).trim(); } catch { return ''; }
   }
-  return LEGACY_OWNER_VALUES.includes(name) ? name : '';
+  return legacyOwner(name, legacyOwnerValues) ? name : '';
 }
 
 /** Pure decision over fresh evidence; timestamps in the future fail closed. */
-export function decideHostRole({ thisHost, owner, ownerReadAt, now, legacyHost = '' } = {}) {
+export function decideHostRole({ thisHost, owner, ownerReadAt, now, legacyHost = '', legacyOwnerValues = [] } = {}) {
   if (!validId(thisHost) || !Number.isFinite(now)) return standby('invalid-input');
   if (!Number.isFinite(ownerReadAt) || ownerReadAt > now || now - ownerReadAt > FRESH_READ_MS) {
     return standby('owner-unreadable');
   }
   if (owner === '') return standby('owner-unset');
-  if (!validOwner(owner)) return standby('owner-unreadable');
-  return owner === thisHost || (LEGACY_OWNER_VALUES.includes(owner) && owner === legacyHost)
+  if (!validOwner(owner, legacyOwnerValues)) return standby('owner-unreadable');
+  return owner === thisHost || (legacyOwner(owner, legacyOwnerValues) && owner === legacyHost)
     ? { role: 'active', reason: 'fresh-owner-is-this-host' }
     : standby('owner-is-other-host');
 }
@@ -98,7 +109,7 @@ export function runGhApi(path, { execFile = execFileSync } = {}) {
 }
 
 /** OwnershipSource: readOwner() -> Promise<{host: string, version: string}>. */
-export function createGitHubOwnershipSource({ ghApi: api = runGhApi } = {}) {
+export function createGitHubOwnershipSource({ ghApi: api = runGhApi, legacyOwnerValues = getLegacyOwnerValues() } = {}) {
   return {
     async readOwner() {
       const base = `repos/${CONSTELLATION_REPOS.we.slug}`;
@@ -119,14 +130,15 @@ export function createGitHubOwnershipSource({ ghApi: api = runGhApi } = {}) {
       const bytes = Buffer.from(encoded, 'base64');
       if (bytes.toString('base64') !== encoded) throw new Error('noncanonical owner encoding');
       const host = lineValue(bytes.toString('utf8'));
-      if (host !== '' && !validOwner(host)) throw new Error('invalid owner ID');
+      if (host !== '' && !validOwner(host, legacyOwnerValues)) throw new Error('invalid owner ID');
       return { host, version };
     },
   };
 }
 
 /** Each invocation performs its own bounded read, including startup and retries. */
-export async function resolveHostRole({ thisHost = getThisHost(), source = createGitHubOwnershipSource(),
+export async function resolveHostRole({ thisHost = getThisHost(), legacyOwnerValues = getLegacyOwnerValues(),
+  source = createGitHubOwnershipSource({ legacyOwnerValues }),
   legacyHost, clock = () => performance.now(), timeoutMs = READ_TIMEOUT_MS } = {}) {
   let timer;
   try {
@@ -139,16 +151,17 @@ export async function resolveHostRole({ thisHost = getThisHost(), source = creat
       new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('owner read timeout')), timeoutMs); }),
     ]);
     if (!result || Object.keys(result).some((key) => !['host', 'version'].includes(key))
-      || (result.host !== '' && !validOwner(result.host))
+      || (result.host !== '' && !validOwner(result.host, legacyOwnerValues))
       || typeof result.version !== 'string' || result.version.length < 1 || result.version.length > 128
       || /[^A-Za-z0-9._-]/.test(result.version)) {
       throw new Error('unexpected owner result');
     }
-    const localAlias = LEGACY_OWNER_VALUES.includes(result.host) ? legacyHost ?? getLegacyHost() : '';
+    const localAlias = legacyOwner(result.host, legacyOwnerValues) ? legacyHost ?? getLegacyHost({ legacyOwnerValues }) : '';
     const finished = clock();
     if (!Number.isFinite(started) || !Number.isFinite(finished) || finished < started
       || finished - started >= timeoutMs) throw new Error('owner read expired');
-    return { ...decideHostRole({ thisHost, owner: result.host, ownerReadAt: started, now: finished, legacyHost: localAlias }),
+    return { ...decideHostRole({ thisHost, owner: result.host, ownerReadAt: started, now: finished,
+      legacyHost: localAlias, legacyOwnerValues }),
       source: 'remote' };
   } catch {
     return { ...standby('owner-unreadable'), source: 'remote-failed' };

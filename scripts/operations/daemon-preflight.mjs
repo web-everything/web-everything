@@ -4,7 +4,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { dirname, delimiter, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createGitHubOwnershipSource, getThisHost, resolveHostRole, runGhApi } from '../lib/daemon-host-guard.mjs';
+import { createGitHubOwnershipSource, getLegacyOwnerValues, getThisHost, resolveHostRole, runGhApi } from '../lib/daemon-host-guard.mjs';
 import { DAEMON_CLONE_SEED, classifyOverlayRecord } from '../lib/daemon-clone-registry.mjs';
 import { defaultCachePath } from '../lib/github-app-auth-env.mjs';
 
@@ -108,9 +108,11 @@ export function cliIO(env = process.env, options = {}) {
   const { source, legacyHost, execFileSync: exec = execFileSync,
     spawnSync: spawn = spawnSync, daemonCloneRoots: cloneRoots = discoverCloneDirs } = options;
   const checkout = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+  const legacyOwnerValues = getLegacyOwnerValues(env);
   return {
     resolveRole: ({ thisHost = getThisHost({ home: env.HOME || homedir(), create: false }) } = {}) =>
-      resolveHostRole({ thisHost, legacyHost, source: source ?? createGitHubOwnershipSource({
+      resolveHostRole({ thisHost, legacyHost, legacyOwnerValues, source: source ?? createGitHubOwnershipSource({
+        legacyOwnerValues,
         ghApi: (path) => runGhApi(path, { execFile: (file, args, options) => exec(file, args, { ...options, env }) }),
       }) }),
     which: (tool) => (env.PATH ?? '').split(delimiter).filter(Boolean).some((dir) => {

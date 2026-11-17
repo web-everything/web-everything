@@ -40,6 +40,18 @@ export default {
         });
       }
       if (reads !== 10) violations.push('a call reused earlier ownership');
+      for (const [configured, expected] of [[undefined, 'standby'], ['legacy-alpha\n', 'standby'],
+        ['legacy-beta', 'standby'], ['legacy-alpha', 'active']]) {
+        const env = { HOME: join(home, 'first'), WE_DAEMON_LEGACY_OWNER_VALUES: configured };
+        const migration = cliIO(env, { legacyHost: 'legacy-alpha', execFileSync: (_file, args) => JSON.stringify(
+          args[1].includes('/git/ref/') ? { object: { type: 'commit', sha: 'a'.repeat(40) } }
+            : { type: 'file', encoding: 'base64', content: Buffer.from('legacy-alpha\n').toString('base64') },
+        ) });
+        const decision = await migration.resolveRole();
+        if (decision.role !== expected || (expected === 'standby' && decision.reason !== 'owner-unreadable')) {
+          violations.push('legacy migration ignored local alias configuration');
+        }
+      }
       owner = null;
       const io = cliIO({ HOME: join(home, 'first') }, { source });
       const lines = [];
