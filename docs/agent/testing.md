@@ -1,3 +1,11 @@
+## Canonical audit before opening PRs
+
+`open-pr` and direct `pr-land` require the canonical codex-audit JSONL evidence configured by
+`prototype-load`, including in dry runs and for docs-only changes. They resolve the published head to a
+full SHA and use the shared canonical evaluator and origin/main coverage check. WEAKENED requires a
+platform/repo `ruledWeakened` entry matching ref, full SHA, and findings exactly; another head cannot
+supply the audit. Refusals name the missing evidence and the exact `codex-audit` command to run.
+
 # Testing — Three-Tier Strategy
 
 > Authors: APPEND new sections at the END of this file, never right after the title (`.gitattributes` union-merges it, but appending avoids overlapping insertions).
@@ -4404,6 +4412,16 @@ automatic discovery and explicit resume behind both guards and both retry budget
 Exercise pending CI after timing settings change, revoked clearance, green completion,
 and budget exhaustion after that intervening failure. Unknown pending outcomes remain
 non-replayable; CI-held provenance does not establish that a write was never applied.
+
+## Canonical audit admission regression fixtures
+
+Keep the default canonical checker in producer integration tests and replace only filesystem and
+Git effects. Exercise both `open-pr` and direct `pr-land`, including dry runs, with a docs-only
+changed-file list and missing evidence; refusal must precede publication. First-open fixtures need
+an unpublished local head, an exact-head pass, and another head's fingerprinted history: fingerprint
+the resolved local SHA without fetching the unpublished lane ref. A failed diff or main fetch still
+refuses. Include valid JSON negative records with invalid timestamps or contradictory findings next
+to an older pass, plus carried and waived paths; malformed records require repair before re-auditing.
 
 ## Bounded red-team probe fairness
 
