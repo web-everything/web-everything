@@ -68,6 +68,32 @@ describe('conflict-rebase keep-review hand-back enforcement', () => {
     const git = vi.fn(argv => argv[0] === 'merge-base' ? oldBase : argv.at(-2) === oldHead ? patch : after);
     return { pushed, gh, git };
   };
+  describe.each(['before proof', 'during proof'])('100-comment acceptance %s', phase => {
+    it.each(['unreadable', 'count mismatch', 'later hold', 'complete'])('handles %s evidence without trusting the capped view', evidence => {
+      const io = fixture();
+      const initial = JSON.stringify(io.pushed);
+      io.pushed.comments = Array.from({ length: 100 }, (_, i) => ({
+        id: `IC_${i}`, author: { login: 'web-everything' },
+        body: i === 0 ? io.pushed.comments[0].body : 'discussion',
+      }));
+      const later = evidence === 'later hold' ? [{ id: 'IC_100', author: { login: 'chalbert' },
+        body: 'Changes requested: fix the remaining bug.' }] : [];
+      io.gh.mockImplementation(argv => {
+        if (argv[1] === 'view') return JSON.stringify(io.pushed);
+        if (argv[0] !== 'api') return '';
+        if (evidence === 'unreadable') throw new Error('thread unavailable');
+        if (argv[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequest: {
+          comments: { totalCount: evidence === 'count mismatch' ? 101 : 100 + later.length },
+        } } } });
+        return JSON.stringify(argv[1].endsWith('page=1') ? io.pushed.comments : later);
+      });
+      if (phase === 'during proof') io.gh.mockReturnValueOnce(initial);
+      if (evidence === 'complete') expect(runConflictFixMark(args, io)).toMatchObject({ ok: true });
+      else expect(() => runConflictFixMark(args, io)).toThrow('rearm-review.mjs --round=conflict');
+      expect(io.gh.mock.calls.filter(([argv]) => argv[1] === 'comment')).toHaveLength(evidence === 'complete' ? 1 : 0);
+      expect(io.gh.mock.calls.some(([argv]) => argv[0] === 'api')).toBe(true);
+    });
+  });
   it.each([
     ['unchanged head', io => { io.pushed.headRefOid = oldHead; }],
     ['different reviewed head', io => { io.pushed.comments[0].body = `<!-- reviewed-sha: ${newHead} -->`; }],

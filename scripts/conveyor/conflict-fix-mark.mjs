@@ -38,6 +38,7 @@ import { conflictRebaseReceipt } from './accepted-conflict-rebase.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
 import { resolveLocalRefSha, conflictFixTargetTrailer } from './rearm-review.mjs';
+import { enrichPrsWithCompleteComments, readCompletePrComments } from './pr-comments-complete.mjs';
 
 export { CONFLICT_FIX_COMMENT_MARKER };
 
@@ -104,9 +105,17 @@ export function runConflictFixMark(argv, { gh = (args) => execFileSyncThrottled(
     if (![flags['old-head'], flags['old-base']].every(sha => typeof sha === 'string' && /^[0-9a-f]{40}$/i.test(sha))) {
       fail(`keep-review refused: pinned --old-head and --old-base required — ${fallback}`);
     }
-    const readPr = () => JSON.parse(gh(['pr', 'view', String(pr),
-      ...(typeof flags.repo === 'string' ? [`--repo=${flags.repo}`] : []),
-      '--json', 'headRefOid,baseRefOid,baseRefName,comments,labels,reviews']));
+    const readPr = () => {
+      const snapshot = JSON.parse(gh(['pr', 'view', String(pr),
+        ...(typeof flags.repo === 'string' ? [`--repo=${flags.repo}`] : []),
+        '--json', 'headRefOid,baseRefOid,baseRefName,comments,labels,reviews']));
+      if (!Array.isArray(snapshot.comments)) throw new Error('comments unreadable');
+      return enrichPrsWithCompleteComments([{ ...snapshot, number: pr }], {
+        repo: typeof flags.repo === 'string' ? flags.repo : null, annotate: pr => pr,
+        readComments: (number, options) => readCompletePrComments(number, { ...options, gh: args => JSON.parse(gh(args)) }),
+        onError: (_pr, error) => { throw error; },
+      })[0];
+    };
     const cleanAcceptance = pr => {
       const record = latestAcceptRecord(pr.comments, Array.isArray(pr.reviews) ? pr.reviews : null);
       const labels = Array.isArray(pr.labels)
