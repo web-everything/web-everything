@@ -141,7 +141,7 @@ export function matchReadyCandidate({
     if (a.sha && carries(a.sha, ready.adopt.finalSha)) return false;
     if (a.sha && leftForMain(a, ready.adopt.finalSha) === true) return false;
     if (a.sha && removedForMain(a.ref) && contentInBuild(a.sha, ready.adopt.finalSha)) { retired.push(a.ref); return false; }
-    if (a.sha && registered(a.ref) === false && retiredByOperator(a) === true) { retired.push(a.ref); return false; }
+    if (a.sha && retiredByOperator(a) === true) { retired.push(a.ref); return false; }
     return true;
   });
   if (omitted.length > 0) {

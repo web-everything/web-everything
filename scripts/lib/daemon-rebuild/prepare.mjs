@@ -511,7 +511,7 @@ export async function prepareRebuild({
       if (hit && committer === REBUILD_IDENTITY_ENV.GIT_COMMITTER_EMAIL && [2, 3].includes(ps.length)) live.push({ ref: hit[1], sha: ps[1] });
     }
     if (state.adopted?.head === head) for (const a of state.adopted.applied ?? []) if (a?.ref && a.sha) live.push({ ref: a.ref, sha: a.sha });
-    return [...new Map(live.map((a) => [JSON.stringify([a.ref, a.sha]), a])).values()];
+    return live;
   }
 
   // ── Step 4: up-to-date / still-rejected short-circuits ──────────────────────────────────────────────
@@ -537,23 +537,34 @@ export async function prepareRebuild({
       if (readyOnly) return mutationDue('ready-candidate-adopt');
       // Still wanted = registered AFTER this tick's own list edits (a same-tick `pr-closed`/`ref-gone` removal is
       // NOT wanted), plus overlays that left because main now has them. A mainOnly rebuild wants no overlay.
-      const currentOverlayState = readOverlayState(root, { env });
-      if (currentOverlayState.corrupt && !mainOnly) {
-        alert('overlay-state-corrupt', { file: overlayFilePath(root, env) });
-        return terminal({ moved: false, reason: 'overlay-state-corrupt' });
-      }
-      const registeredRefs = new Set(currentOverlayState.overlays.map((o) => o?.ref));
+      const registeredRefs = new Set((overlaysBefore || []).map((o) => o?.ref));
+      for (const d of plan.decisions) if (d.action === 'remove') registeredRefs.delete(d.ref);
       const wantedRefs = new Set(mainOnly ? [] : registeredRefs);
       for (const d of plan.decisions) {
         if (d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')) wantedRefs.add(d.ref);
       }
-      const wantedTips = new Map([...wantedRefs].map((ref) => [ref, verifyRev(git, `refs/remotes/origin/${ref}^{commit}`)]));
+      const wantedTips = new Map();
+      const wantedTip = (ref) => {
+        if (!wantedTips.has(ref)) wantedTips.set(ref, verifyRev(git, `refs/remotes/origin/${ref}^{commit}`));
+        return wantedTips.get(ref);
+      };
+      let currentOverlayState;
       const stillWanted = (ref, sha) => {
         if (!wantedRefs.has(ref)) return false;
         if (!sha) return true; // fallback registration check
-        const tip = wantedTips.get(ref);
+        currentOverlayState ??= readOverlayState(root, { env });
+        if (currentOverlayState.corrupt) return false;
+        if (registeredRefs.has(ref) && !currentOverlayState.overlays.some((o) => o?.ref === ref)) return false;
+        const tip = wantedTip(ref);
         return tip ? tip === sha || git(['merge-base', '--is-ancestor', sha, tip]).status === 0
           : !registeredRefs.has(ref) && tipInMain(git, plan.mainSha, sha);
+      };
+      const registeredForOmission = (ref) => {
+        currentOverlayState ??= readOverlayState(root, { env });
+        // Unreadable evidence cannot authorize dropping a live tip. Both snapshots retain their veto.
+        return currentOverlayState.corrupt || registeredRefs.has(ref)
+          || overlaysBefore.some((o) => o?.ref === ref)
+          || currentOverlayState.overlays.some((o) => o?.ref === ref);
       };
       const maxAgeMs = Number(env?.[READY_MAX_AGE_ENV]) > 0 ? Number(env[READY_MAX_AGE_ENV]) : DEFAULT_READY_MAX_AGE_MS;
       let overlayEvents;
@@ -589,11 +600,11 @@ export async function prepareRebuild({
         carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,
         leftForMain: (a, build) => overlayGraduated({
           readyAt: ready.at ?? ready.passedAt,
-          ref: a.ref, sha: a.sha, build, registered: (r) => registeredRefs.has(r) || overlaysBefore.some((o) => o?.ref === r), events: readOverlayEvents(), git,
+          ref: a.ref, sha: a.sha, build, registered: registeredForOmission, events: readOverlayEvents(), git,
         }),
         retiredByOperator: (a) => overlayRetiredByOperator({
           ref: a.ref, sha: a.sha, events: readOverlayEvents(),
-          registered: (r) => registeredRefs.has(r),
+          registered: registeredForOmission,
         }),
         contentInBuild: (sha, build) => contentContainedInBuild(git, sha, build),
         removedForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
@@ -653,7 +664,7 @@ export async function prepareRebuild({
         const { alerts: finAlerts = [], ...finResult } = fin;
         if (finResult.adopted && ready.kind !== 'fallback') {
           const pending = [...registeredRefs].filter((ref) => wantedRefs.has(ref)
-            && !m.adopt.applied?.some((a) => a.ref === ref && a.sha === wantedTips.get(ref)));
+            && !m.adopt.applied?.some((a) => a.ref === ref && a.sha === wantedTip(ref)));
           if (pending.length) alert('ready-candidate-adopted-partial', { target: m.adopt.finalSha, pending });
         }
         return {
