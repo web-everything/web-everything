@@ -4381,3 +4381,9 @@ the watcher must request `headRefOid`. Pending conflicts without that episode ev
 the existing watcher route. Incomplete live claim metadata means unknown ownership and holds.
 The `accepted-conflict-rebase*` tests cover production claim reads, shared label decisions,
 brief ordering, producer receipts, both routing consumers and historical rearm receipts.
+
+Conflict-start success additionally requires an independent fresh label read after the shared label
+helper finishes: all three approval labels must be absent and `review:pending` present. The shared
+helper remains tolerant for other callers. The rearm entrypoint tests inject separate shared and
+strict readers to cover unchanged approvals, inferred success after a read failure, malformed
+evidence and a failed strict read; any refusal stops repair and asks for fresh PR labels.

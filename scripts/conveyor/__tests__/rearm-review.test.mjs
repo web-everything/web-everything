@@ -12,7 +12,7 @@ import { mkdtempSync, writeFileSync, readFileSync, existsSync, chmodSync, rmSync
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments, REARM_COMMENT_MARKER, buildSameHeadWakeComment, SAME_HEAD_WAKE_TRAILER, decideEmptyFixRound, rearmWindow, hasUnexpectedPositionals, hasInvalidArgs, buildNoChangeComment, NO_CHANGE_COMMENT_MARKER } from '../rearm-review.mjs';
+import { runRearmReviewCli, decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments, REARM_COMMENT_MARKER, buildSameHeadWakeComment, SAME_HEAD_WAKE_TRAILER, decideEmptyFixRound, rearmWindow, hasUnexpectedPositionals, hasInvalidArgs, buildNoChangeComment, NO_CHANGE_COMMENT_MARKER } from '../rearm-review.mjs';
 import { REVIEW_LABELS, READY_TO_MERGE_LABEL } from '../../lib/review-escalation.mjs';
 import { RED_TEAM_STATUS_LABELS } from '../../lib/red-team-status-label-meta.mjs';
 
@@ -631,5 +631,84 @@ describe('buildSameHeadWakeComment — the same-head pause wake', () => {
     expect(countRearmComments([{ body, author: { login: 'chalbert' } }])).toBe(0);
     const quoted = `${REARM_COMMENT_MARKER}\n\nquoted ${SAME_HEAD_WAKE_TRAILER} mid-body`;
     expect(countRearmComments([{ body: quoted, author: { login: 'chalbert' } }])).toBe(1);
+  });
+});
+
+
+describe('conflict-start independently verifies demotion before permitting repair', () => {
+  const head = 'a'.repeat(40);
+  const approvals = ['review:accepted', 'ready-to-merge', 'status:ready-to-merge'];
+  const cases = [
+    ...approvals.map(label => [label + ' still present', ['review:pending', label], false]),
+    ['pending missing', [], false],
+    ['unreadable strict read', new Error('read failed'), false],
+    ['missing label evidence', undefined, false],
+    ['malformed label evidence', ['review:pending', {}], false],
+    ['non-array label evidence', 'review:pending', false],
+    ['verified demotion', [{ name: 'review:pending' }, 'unrelated'], true],
+  ];
+  it.each(cases.flatMap(c => ['accepted', 'missing'].map(guard => [...c, guard])))(
+    '%s: evidence=%j, success=%s, guard=%s', (_name, freshLabels, ok, guard) => {
+    for (const sharedReadFails of [false, true]) {
+      const events = [], output = [], comments = [];
+      let stateLabels = guard === 'accepted' ? approvals : approvals.slice(1);
+      const provider = {
+        readPrState: () => ({ state: 'OPEN', isDraft: false, headRefOid: head,
+          headRefName: 'lane/test', baseRefName: 'main', comments, labels: stateLabels }),
+        readLabels: () => {
+          events.push('shared-read');
+          if (sharedReadFails) throw new Error('shared read failed');
+          return approvals; // The shared helper tolerates unchanged approval labels too.
+        },
+        setLabels: () => { stateLabels = ['review:pending']; events.push('demote'); },
+        postComment: (_repo, _pr, body) => {
+          comments.push({ author: { login: 'web-everything' }, body });
+          events.push('receipt');
+        },
+      };
+      const readLabels = vi.fn(() => {
+        events.push('strict-read');
+        if (freshLabels instanceof Error) throw freshLabels;
+        return freshLabels;
+      });
+      const exit = vi.spyOn(process, 'exit').mockImplementation(code => { throw new Error(`exit:${code}`); });
+      try {
+        expect(() => runRearmReviewCli({
+          argv: ['6911', '--repo=o/n', '--round=conflict-start', `--only-if=${guard}`,
+            `--expect-head=${head}`, `--actor=accepted-conflict-rebase:${head}@${'b'.repeat(40)}`],
+          readLabels, labelCliOptions: { provider, emit: line => output.push(JSON.parse(line)) },
+        })).toThrow(`exit:${ok ? 0 : 1}`);
+        expect(readLabels).toHaveBeenCalledTimes(1);
+        expect(readLabels).toHaveBeenCalledWith('o/n', 6911);
+        expect(events).toEqual(guard === 'accepted'
+          ? ['demote', 'receipt', 'shared-read', 'strict-read']
+          : ['receipt', 'demote', 'strict-read']);
+        expect(output).toHaveLength(1);
+        expect(output[0]).toMatchObject({ ok, pr: 6911 });
+        if (ok) expect(output[0].labels).toEqual(['review:pending', 'unrelated']);
+        else expect(output[0].reason).toContain('STOP repair and refresh PR labels');
+      } finally { exit.mockRestore(); }
+    }
+  });
+
+  it.each(['ordinary', 'conflict'])('%s keeps the existing tolerant label behavior', round => {
+    const readLabels = vi.fn(() => { throw new Error('strict reader must not run'); });
+    const exit = vi.spyOn(process, 'exit').mockImplementation(code => { throw new Error(`exit:${code}`); });
+    const output = [];
+    try {
+      expect(() => runRearmReviewCli({
+        argv: ['6911', '--repo=o/n', '--only-if=accepted', `--expect-head=${head}`,
+          ...(round === 'conflict' ? ['--round=conflict'] : [])], readLabels, resolveMainSha: () => null,
+        labelCliOptions: {
+          provider: {
+            readPrState: () => ({ state: 'OPEN', headRefOid: head, comments: [], labels: approvals }),
+            readLabels: () => { throw new Error('read failed'); },
+            setLabels: () => {}, postComment: () => {},
+          }, emit: line => output.push(JSON.parse(line)),
+        },
+      })).toThrow('exit:0');
+      expect(readLabels).not.toHaveBeenCalled();
+      expect(output[0]).toMatchObject({ ok: true, labels: ['review:pending'], round });
+    } finally { exit.mockRestore(); }
   });
 });

@@ -336,7 +336,16 @@ export function buildConflictRearmComment({ actor, decision, mainRef = null, mai
 // we:scripts/conveyor/rearm-review.mjs — allow importing the pure decider without running the CLI (the test file
 // imports this module). The standard main check used across the conveyor scripts.
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname);
-if (IS_CLI) {
+/** Fresh conflict admission evidence; deliberately independent of the shared CLI's tolerant re-read. */
+function readConflictStartLabels(repo, pr) {
+  return JSON.parse(readGh(['pr', 'view', String(pr), ...(repo ? [`--repo=${repo}`] : []), '--json', 'labels'], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+  })).labels;
+}
+
+/** Run the rearm entrypoint with injectable label IO for strict conflict-start verification. */
+export function runRearmReviewCli({ argv = process.argv.slice(2), readLabels = readConflictStartLabels,
+  labelCliOptions = {}, resolveMainSha = resolveLocalRefSha } = {}) {
   // #xkmu3gv — `--round=conflict` selects the MECHANICAL conflict-resolution comment/marker
   // (`CONFLICT_FIX_COMMENT_MARKER`, its own smaller `we:scripts/conveyor/reconcile-core.mjs#CONFLICT_FIX_ROUND_CAP`,
   // #xkmu3gv) instead of the ordinary rearm marker. THE LABEL SWAP ITSELF IS IDENTICAL EITHER WAY — the SAME
@@ -344,25 +353,25 @@ if (IS_CLI) {
   // `decideSetLabel({ to: 'rearm' })` decides; only which durable floor this completed round counts against, and
   // the comment text explaining why, differs. See `conflict-fix-round-count.mjs`'s own header for why a
   // mechanical conflict-resolution round needs its own cap rather than sharing `countRearmComments`'s.
-  const roundArg = (process.argv.find((a) => a.startsWith('--round=')) || '').slice('--round='.length);
+  const roundArg = (argv.find((a) => a.startsWith('--round=')) || '').slice('--round='.length);
   const isConflictRound = roundArg === 'conflict';
   const isConflictStart = roundArg === 'conflict-start';
   // #2787-live-incident — the ordinary conflict-fix round is, by construction, always against the repo's
   // default branch; `--main-ref=` lets a non-`main`-default repo say so, defaulting to `'main'` (every
   // constellation repo today) so no existing caller needs to change.
-  const mainRefArg = (process.argv.find((a) => a.startsWith('--main-ref=')) || '').slice('--main-ref='.length) || 'main';
+  const mainRefArg = (argv.find((a) => a.startsWith('--main-ref=')) || '').slice('--main-ref='.length) || 'main';
   // we:scripts/conveyor/rearm-review.mjs — the fix-agent re-arm CLI: the shared harness with the three deltas
   // this caller supplies (the comment body, the default --actor, the optional --repo fallback). The re-arm
-  // swap + its refusal are the shared pure `decideSetLabel({ to: 'rearm' })` — this file adds no invariant.
+  // swap + its refusal are shared; conflict-start additionally requires its own fresh demotion proof.
   // #6713 — refuse an EMPTY ordinary fix round before any label write. Fail-open on every READ problem; once an
   // empty round is PROVEN the refusal is unconditional (a failed note never lets the re-arm through).
-  const argOf = (n) => (process.argv.find((a) => a.startsWith(`--${n}=`)) || '').slice(n.length + 3);
+  const argOf = (n) => (argv.find((a) => a.startsWith(`--${n}=`)) || '').slice(n.length + 3);
   // A stray/extra positional would let the shared CLI act on a PR this guard never inspected: refuse before any write.
-  if (hasUnexpectedPositionals(process.argv.slice(2)) || hasInvalidArgs(process.argv.slice(2))) {
+  if (hasUnexpectedPositionals(argv) || hasInvalidArgs(argv)) {
     writeLineSync(1, JSON.stringify({ ok: false, reason: 'refused: expected exactly one positional <pr> (a positive integer) and well-formed flags' }));
     process.exit(1);
   }
-  const prArg = process.argv.slice(2).find((a) => !a.startsWith('--'));
+  const prArg = argv.find((a) => !a.startsWith('--'));
   const repoVal = argOf('repo');
   if (isConflictStart && (!/^[0-9a-f]{40}$/i.test(argOf('expect-head'))
       || !['accepted', 'missing'].includes(argOf('only-if'))
@@ -391,6 +400,8 @@ if (IS_CLI) {
     }
   }
   runReviewLabelCli({
+    ...labelCliOptions,
+    argv,
     fixedTo: 'rearm',
     defaultActor: 'conveyor fix agent',
     repoOptional: true, // the fix agent runs inside its WE lane clone, so a missing --repo derives from cwd.
@@ -405,9 +416,31 @@ if (IS_CLI) {
     // `decision.keepsHuman` once and render one of two true sentences instead of one sentence plus a footnote.
     buildComment: isConflictStart ? buildConflictStartComment : isConflictRound
       ? ({ actor, decision }) => buildConflictRearmComment({ actor, decision,
-          mainRef: mainRefArg, mainSha: resolveLocalRefSha(mainRefArg) })
+          mainRef: mainRefArg, mainSha: resolveMainSha(mainRefArg) })
       : buildRearmComment,
-    successResult: ({ pr, labels }) => ({ ok: true, pr, rearmed: true, labels, round: isConflictStart ? 'conflict-start' : isConflictRound ? 'conflict' : 'ordinary' }),
+    successResult: ({ pr, labels }) => {
+      if (isConflictStart) {
+        try {
+          // Never accept the shared helper's observed OR locally inferred labels as demotion proof.
+          const fresh = readLabels(repoVal, pr);
+          if (!Array.isArray(fresh) || !fresh.every(l =>
+            typeof (typeof l === 'string' ? l : l?.name) === 'string'
+            && (typeof l === 'string' ? l : l.name).length > 0)) throw new Error('invalid labels');
+          labels = fresh.map(l => typeof l === 'string' ? l : l.name);
+          if (!labels.includes('review:pending') ||
+            ['review:accepted', 'ready-to-merge', 'status:ready-to-merge'].some(l => labels.includes(l))) {
+            throw new Error('demotion was not observed');
+          }
+        } catch {
+          const result = { ok: false, pr, reason: 'conflict-start demotion could not be verified; STOP repair and refresh PR labels before retrying' };
+          (labelCliOptions.emit || (line => writeLineSync(1, line.trimEnd())))(`${JSON.stringify(result)}\n`);
+          process.exit(1);
+        }
+      }
+      return { ok: true, pr, rearmed: true, labels, round: isConflictStart ? 'conflict-start' : isConflictRound ? 'conflict' : 'ordinary' };
+    },
     refusalResult: ({ pr, decision }) => ({ ok: false, pr, reason: decision.reason }),
   });
 }
+
+if (IS_CLI) runRearmReviewCli();
