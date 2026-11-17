@@ -2239,6 +2239,13 @@ telemetry sample taken after the failure; a bounded probe that stalls or returns
 keeps exit 124 and the marker. Telemetry confirms termination, never a verified remote success.
 Regressions live in `forge-slot-markers-per-run.test.mjs` and `heavy-admission-remote.test.mjs`.
 
+After a run timeout, allow 30 seconds for cancellation (`WE_HEAVY_TIMEOUT_CANCEL_WAIT_MS`,
+validated as a nonnegative integer and capped at 90 seconds), probing fresh per-run telemetry
+about every two seconds while also waiting for the executor. Only confirmed cancellation,
+a settled integer result, or fresh `finished` telemetry permits local fallback; deadline expiry
+keeps exit 124 and both marker files. Dead-owner markers with an `inflight` verdict remain
+quarantined but are exempt from `stuck-slots`; unknown evidence and failed releases still count.
+
 ### Forge warm bases and delta snapshots
 
 The Mac client and public-base warmer share `forge-exec-manifest.mjs`: path bytes,

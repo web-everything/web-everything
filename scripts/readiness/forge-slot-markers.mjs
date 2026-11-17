@@ -265,7 +265,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
     async step(getTelemetry, now = clock()) {
       let names;
       try { names = fs.readdirSync(root); } catch { return []; }
-      const dead = [], reaped = [], held = [];
+      const dead = [], reaped = [], held = [], verdicts = new Map();
       let finishedStillActive = false;
       for (const name of names) {
         const m = NAME.exec(name);
@@ -301,11 +301,12 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
         if (Number.isFinite(sampledAt) && evidence) {
           dead.sort((a, b) => a.mtimeMs - b.mtimeMs);
           for (const entry of dead) {
+            verdicts.set(entry.name, entry.run ? runVerdict(telemetry, entry.run) : 'run-less');
             const diedBy = firstDead.get(entry.key);
             if (now - entry.mtimeMs < graceMs || sampledAt < diedBy + DEATH_SAMPLE_MARGIN_MS) { resetIdle(entry); continue; }
             let verdict = 'run-less';
             if (entry.run) {
-              verdict = runVerdict(telemetry, entry.run);
+              verdict = verdicts.get(entry.name);
               // A per-run verdict taken while Forge is busy rests on ONE directory listing, which can miss a prepared->running
               // rename: 'absent' and the supervisor failure codes 97/254 need the second own sample too.
               const code = telemetry.recent.find(item => item?.runId === entry.run)?.code;
@@ -338,7 +339,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
           }
         }
       }
-      const stuck = held.filter(h => !reaped.includes(h.name));
+      const stuck = held.filter(h => verdicts.get(h.name) !== 'inflight' && !reaped.includes(h.name));
       if (stuck.length >= stuckMinSlots) raise('stuck-slots', {slots: stuck.map(h => h.name), minAgeMs: stuckAgeMs}, now);
       if (reaped.length) log(`heavy-admission: reaped stale remote slot marker(s) ${reaped.join(', ')} (owner dead; its Forge run is finished${finishedStillActive ? ' (still listed active)' : ''} or absent)\n`);
       return reaped;

@@ -686,8 +686,96 @@ describe('runWithRemoteDecision', () => {
     }));
     expect(await runWithRemoteDecision({ ...f, timeoutMs: 20 })).toEqual({ handled: false });
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
-    expectLines(f.log, 2, 'remote');
-    expect(f.log.mock.calls[1][0]).toBe('heavy-admission: remote failed (remote-timeout) - falling back to local admission\n');
+    expectLines(f.log, 3, 'remote');
+    expect(f.log.mock.calls[2][0]).toBe('heavy-admission: remote failed (remote-timeout) - falling back to local admission\n');
+  });
+
+  it.each([
+    ['cancelled', 5000], ['cancelled', 18000], ['remote', 5000], ['remote', 18000],
+    ['telemetry', 5000], ['telemetry', 18000], ['inflight', 30000],
+  ])('files timeout waits for %s after %i ms without releasing a live run', async (completion, delay) => {
+    vi.useFakeTimers();
+    try {
+      const f = fixture();
+      const run = 'r-' + 'd'.repeat(32);
+      const startedAt = Date.now(), timeoutMs = DEFAULT_FAST_RUN_TIMEOUT_MS;
+      let dispatched = false;
+      f.readTelemetry = vi.fn(async () => {
+        if (!dispatched) return healthyRead();
+        vi.setSystemTime(Date.now() + 1); // fresh sample strictly after this probe began
+        return {sampledAtET: new Date().toISOString(), activeRuns: 1, activeRunIds: [run],
+          recent: [{runId: run, startedAtET: new Date(startedAt).toISOString(),
+            code: completion === 'telemetry' && Date.now() >= startedAt + timeoutMs + delay ? 0 : null}]};
+      });
+      f.remoteExec.mockImplementation(({onRun, signal}) => new Promise(resolve => {
+        dispatched = true;
+        onRun(run);
+        if (completion === 'cancelled' || completion === 'remote') signal.addEventListener('abort', () => {
+          setTimeout(() => resolve(completion === 'remote' ? {mode: 'remote', code: 0}
+            : {mode: 'cancelled', terminated: true}), delay);
+        }, {once: true});
+      }));
+      const pending = runWithRemoteDecision(f);
+      await vi.advanceTimersByTimeAsync(timeoutMs + 4000);
+      const remoteRoot = join(f.lockRoot, '..', 'remote'), marker = join(remoteRoot, 'slot-0.unconfirmed');
+      const content = JSON.parse(readFileSync(marker, 'utf8'));
+      expect(content).toMatchObject({v: 1, note: 'remote termination unconfirmed', host: 'forge', pid: process.pid});
+      expect(content.owner).toMatch(/^remote-\d+-[0-9a-f]+$/);
+      expect(JSON.parse(readFileSync(marker + '.run', 'utf8'))).toEqual({owner: content.owner, run});
+      expect(heldSlots({lockRoot: remoteRoot, cap: 8})).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(28_000);
+      const kept = completion === 'inflight';
+      expect(await pending).toEqual(kept ? {handled: true, exitCode: 124} : {handled: false});
+      expect(existsSync(marker)).toBe(kept);
+      expect(existsSync(marker + '.run')).toBe(kept);
+      expect(heldSlots({lockRoot: remoteRoot, cap: 8})).toHaveLength(kept ? 1 : 0);
+      expect(f.readTelemetry.mock.calls.length).toBeGreaterThan(2);
+      if (!kept) expect(JSON.parse(readFileSync(join(f.lockRoot, 'remote-fallbacks.jsonl'), 'utf8')))
+        .toMatchObject({reason: 'remote-timeout'});
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each([
+    [undefined, 30000], ['invalid', 30000], ['-1', 30000], ['1.5', 30000], ['999999', 90000], ['0', 0], ['6000', 6000],
+  ])('bounds timeout cancel-wait setting %s to %i ms and retains unknown execution', async (setting, waitMs) => {
+    vi.useFakeTimers();
+    try {
+      const f = fixture();
+      f.remoteExec.mockImplementation(() => new Promise(() => {}));
+      const pending = runWithRemoteDecision({...f, timeoutMs: 20,
+        env: setting === undefined ? {} : {WE_HEAVY_TIMEOUT_CANCEL_WAIT_MS: setting}});
+      await vi.advanceTimersByTimeAsync(20);
+      if (waitMs) {
+        await vi.advanceTimersByTimeAsync(waitMs - 1);
+        expect(f.log.mock.calls.some(([line]) => line.includes('exit 124'))).toBe(false);
+        await vi.advanceTimersByTimeAsync(1);
+      } else await vi.advanceTimersByTimeAsync(1); // fake timers schedule a nested zero delay on the next tick
+      expect(await pending).toEqual({handled: true, exitCode: 124});
+      expect(existsSync(join(f.lockRoot, '..', 'remote', 'slot-0.unconfirmed'))).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each([true, false])('client signal wins during timeout cancel-wait with confirmed cancellation=%s', async confirmed => {
+    vi.useFakeTimers();
+    try {
+      const f = fixture();
+      f.remoteExec.mockImplementation(({onRun, cancelSignal}) => new Promise(resolve => {
+        onRun('r-' + 'e'.repeat(32));
+        if (confirmed) cancelSignal.addEventListener('abort', () => resolve({mode: 'cancelled', terminated: true}), {once: true});
+      }));
+      const pending = runWithRemoteDecision({...f, timeoutMs: 20,
+        env: {WE_HEAVY_SIGNAL_CANCEL_WAIT_MS: '1000'}});
+      await vi.advanceTimersByTimeAsync(5020);
+      process.emit('SIGTERM');
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(await pending).toEqual({handled: true, exitCode: 143, signal: 'SIGTERM'});
+      const marker = join(f.lockRoot, '..', 'remote', 'slot-0.unconfirmed');
+      expect(existsSync(marker)).toBe(!confirmed);
+      expect(existsSync(marker + '.run')).toBe(!confirmed);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
   });
 
   it('confirms active remote execution has stopped before local execution starts', async () => {
@@ -727,7 +815,7 @@ describe('runWithRemoteDecision', () => {
     } finally { vi.useRealTimers(); }
   });
 
-  it.each(['never resolves', 'missing acknowledgement', 'false acknowledgement', 'not-started acknowledgement', 'legacy fallback', 'rejection', 'late success'])(
+  it.each(['never resolves', 'missing acknowledgement', 'false acknowledgement', 'not-started acknowledgement', 'legacy fallback', 'rejection'])(
     'refuses a local rerun after timeout when remote termination is uncertain: %s', async (outcome) => {
       vi.useFakeTimers();
       try {
@@ -741,7 +829,6 @@ describe('runWithRemoteDecision', () => {
             if (outcome === 'not-started acknowledgement') resolve({ mode: 'not-started', terminated: true });
             if (outcome === 'legacy fallback') resolve({ mode: 'fallback', terminated: true });
             if (outcome === 'rejection') reject(new Error('transport closed'));
-            if (outcome === 'late success') resolve({ mode: 'remote', code: 0 });
           }, { once: true });
         }));
         const local = vi.fn();
@@ -749,14 +836,14 @@ describe('runWithRemoteDecision', () => {
           if (!result.handled) local();
           return result;
         });
-        await vi.advanceTimersByTimeAsync(1020);
+        await vi.advanceTimersByTimeAsync(30_020);
         expect(await pending).toEqual({ handled: true, exitCode: 124 });
         expect(signal.aborted).toBe(true);
         expect(local).not.toHaveBeenCalled();
-        expectLines(f.log, 2, 'remote');
-        expect(f.log.mock.calls[1][0]).toContain('remote-timeout');
-        expect(f.log.mock.calls[1][0]).toContain('termination unconfirmed; refusing local rerun');
-        expect(f.log.mock.calls[1][0]).toContain('Confirm remote termination before retrying');
+        expectLines(f.log, 3, 'remote');
+        expect(f.log.mock.calls[2][0]).toContain('remote-timeout');
+        expect(f.log.mock.calls[2][0]).toContain('termination unconfirmed; refusing local rerun');
+        expect(f.log.mock.calls[2][0]).toContain('Confirm remote termination before retrying');
         expect(vi.getTimerCount()).toBe(0);
       } finally { vi.useRealTimers(); }
     },
@@ -823,7 +910,7 @@ describe('runWithRemoteDecision', () => {
             expect(existsSync(marker + '.run')).toBe(false);
             expect(heldSlots({lockRoot: remoteRoot, cap: 8})).toHaveLength(0);
           });
-          const pending = runWithRemoteDecision({...f, timeoutMs: 20}).then(result => {
+          const pending = runWithRemoteDecision({...f, env: {WE_HEAVY_TIMEOUT_CANCEL_WAIT_MS: '1000'}, timeoutMs: 20}).then(result => {
             if (!result.handled) local();
             return result;
           });
@@ -875,7 +962,7 @@ describe('runWithRemoteDecision', () => {
         if (outcome === 'synchronous throw') f.remoteExec.mockImplementation(() => { throw new Error('unavailable'); });
         if (outcome === 'timeout') f.remoteExec.mockImplementation(() => new Promise(() => {}));
         const pending = runWithRemoteDecision({ ...f, timeoutMs: 20 });
-        if (outcome === 'timeout') await vi.advanceTimersByTimeAsync(1020);
+        if (outcome === 'timeout') await vi.advanceTimersByTimeAsync(30_020);
         const expected = outcome === 'success' ? { handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) } : { handled: true, exitCode: 124 };
         expect(await pending).toEqual(expected);
         expect(vi.getTimerCount()).toBe(0);
