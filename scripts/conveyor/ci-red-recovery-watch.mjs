@@ -72,6 +72,7 @@ import { resolveExhaustedRetry, exhaustionFacts, countExhaustedRetries, planExha
   realRequiredFailures, retryOutcome, wrongSpentStandDowns, buildResolvedSpentComment,
   buildExhaustedRetryRecoveredComment, EXHAUSTED_RETRY_RECOVERED_MARKER } from './exhausted-retry.mjs';
 import { excusePrMergeGateHolds } from '../lib/merge-gate-hold-class.mjs';
+import { waitingOnReview } from './ci-heal-verdict-recheck.mjs';
 import { ownerInstallationToken, pushMissingRunCommit } from './missing-run-push.mjs';
 import { recoveryPreflight } from './recovery-preflight.mjs';
 import { installationForOwner, ownerOfSlug } from '../lib/github-app-installations.mjs';
@@ -154,6 +155,7 @@ export function buildCandidates(prs, {
   const checks = requiredCheck ? [requiredCheck] : requiredChecks;
   const out = [];
   for (const pr of Array.isArray(prs) ? prs : []) {
+    if (waitingOnReview({ rollup: pr?.statusCheckRollup, requiredChecks: checks })) continue;
     if (!isAnyRequiredCheckFailed(pr, checks)) continue;
     const prNumber = Number(pr?.number);
     if (!Number.isInteger(prNumber) || prNumber <= 0) continue;
@@ -248,6 +250,7 @@ export function sweepCiRedRecovery({
   ciHealBudget = defaultCiHealBudget(), ciHealCap = ciHealBudget.cap,
   readComments = defaultReadPrComments, refresh = refreshOntoMain, postComment = defaultPostRebaseComment,
   readIsCrossRepository = defaultReadIsCrossRepository,
+  excuseHolds = excusePrMergeGateHolds,
   maxRebaseRetriesPerSha = resolveRecoveryCaps().rebaseRetriesPerSha, checkClaim = pushRefusal,
   // #2811 — injectable so a test can pin the restamp-first/rearm-fallback chain with no `gh`/child-process.
   reconcileAcceptance = reconcileAcceptanceAfterRebase,
@@ -269,7 +272,7 @@ export function sweepCiRedRecovery({
   // soak-main-red — judge every REQUIRED check (shared ruleset ∪ classic-protection set when available, else
   // DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS), so a `daemon-soak`-only red PR is refreshed like a `test`-red one.
   // Required checks also judge terminal retry outcomes when the CLI shares green PRs with the next pass.
-  const prList = Array.isArray(prs) ? prs : [];
+  const prList = excuseHolds(Array.isArray(prs) ? prs : [], { repo });
   const anyRed = prList.some((pr) => collapseRollupToLatestPerName(pr?.statusCheckRollup).some((c) => isRequiredCheckFailed(pr, c?.name || c?.context)));
   const checks = requiredCheck ? [requiredCheck]
     : (((anyRed || (exhaustedRetrySettings?.enabled && exhaustedRetrySettings.maxRetries > 0 && prList.length))
@@ -286,7 +289,7 @@ export function sweepCiRedRecovery({
   // read here at all — see `main-red-recovery.mjs`'s own file header for the incident this closes). Reuses the
   // run list just read (PR #2793 review — no second `gh run list`).
   const mainLatestCheckRuns = needWindows ? readMainLatestCheckRuns({ repo, branch: defaultBranch, mainRuns }) : [];
-  const rawCandidates = buildCandidates(prs, { requiredChecks: checks, mainRedWindows, readAheadBy, repo, defaultBranch });
+  const rawCandidates = buildCandidates(prList, { requiredChecks: checks, mainRedWindows, readAheadBy, repo, defaultBranch });
   // x5uqim1 follow-up (#4075/#3383) — the durable per-sha rebase-attempt count (`rebaseAttemptsForSha`,
   // {@link DEFAULT_MAX_REBASE_RETRIES_PER_SHA}'s own safety net) only matters for a candidate that would
   // otherwise actually be dispatched: attributable to a red-`main` window (or, landing-freeze fix, main's own

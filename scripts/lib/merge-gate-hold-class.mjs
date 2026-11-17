@@ -132,7 +132,11 @@ export function excuseMergeGateRows(rows, { prNumber, headSha, labels, readVerdi
       || verdict.head_sha.toLowerCase() !== headSha.toLowerCase() || verdict.ok !== false) return unchanged;
     const currentFreeze = verdict.results?.some(manualFreeze) && typeof freeze === 'function' ? freeze() : freeze;
     const classification = classifyMergeGateHold({ results: verdict.results, prLabels: labels, freeze: currentFreeze, verdictCompletedAt: verdict.completed_at, mainCiGreen: verdict.mainCiGreen });
-    if (!classification.excused) {
+    // A workflow edit's human-only acceptance must stay red, even when its gate
+    // id also belongs to candidacy. Carry ownership instead of erasing the hold.
+    const humanOnlyAcceptance = verdict.results?.some(r => r.id === 'review-acceptance'
+      && r.status === 'hold' && r.reason?.startsWith('human-only:'));
+    if (!classification.excused || humanOnlyAcceptance) {
       const holds = verdict.results?.filter(blocking) ?? [];
       // Card 273, #5157: annotation rides on candidacyHoldIsNotCiFailure; off never annotates.
       if (holds.length && holds.every(r => r.status === 'hold' && HUMAN_REVIEW_HOLD_GATES.includes(r.id))) {

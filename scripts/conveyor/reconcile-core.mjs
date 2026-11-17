@@ -141,7 +141,7 @@ import {
   ciHealBudgetEvidence, resolveCiHealBudgetRestore, resolveCodeqlOwnBudget, CI_HEAL_COMMENT_MARKER, CI_HEAL_FAILURE_MARKER,
   CI_HEAL_ROUND_CAP, CI_HEAL_ATTEMPT_CAP_ENV, CI_HEAL_RESET_ON_FIX_HEAD_ENV, resolveCiHealBudget, ciHealBudgetResetAt, FIX_MARKER_WHO_RE,
 } from './ci-heal-mark.mjs';
-import { ciGreenForEscalation, resolveCiHealVerdictSettings } from './ci-heal-verdict-recheck.mjs';
+import { ciGreenForEscalation, resolveCiHealVerdictSettings, gateOnlyRedStates, waitingOnReview } from './ci-heal-verdict-recheck.mjs';
 import { latestCiHealEscalationForHead, CI_HEAL_ESCALATION_MARKER } from './ci-heal-escalation-mark.mjs';
 import {
   isStandDownSuperseded, STAND_DOWN_MARKER, SUPERSEDE_STAND_DOWN_MARKER,
@@ -507,22 +507,19 @@ export function splitFailingChecks(rollup, requiredChecks) {
   return out;
 }
 
-/** PURE: every failing required check is a review-owned hold (review-gate, or an annotated merge-gate). */
+/** PURE: every failing check is a review-owned hold, including gates outside the required roster. */
 export function reviewHoldGatesOnlyRed(rollup, requiredChecks) {
   if (!Array.isArray(rollup)) return false;
   const latest = collapseRollupToLatestPerName(rollup);
   if (latest.some(row => !row || typeof (row.name || row.context) !== 'string')) return false;
-  const failing = splitFailingChecks(latest, requiredChecks).required;
-  const mergeGate = latest.find(row => row?.name === 'merge-gate');
-  return failing.length > 0 && failing.every(name => name === 'review-gate'
-    || (name === 'merge-gate' && Boolean(mergeGate?.mergeGateReviewHold)));
+  return gateOnlyRedStates({ rollup: latest, requiredChecks }).gateOnlyRed;
 }
 
 /** PURE: required reds are exclusively review-owned holds, with all other required evidence green. */
 export function reviewHoldOnlyRed(rollup, requiredChecks) {
   if (!reviewHoldGatesOnlyRed(rollup, requiredChecks)) return false;
   const latest = collapseRollupToLatestPerName(rollup);
-  const failing = splitFailingChecks(latest, requiredChecks).required;
+  const failing = failingCheckNames(latest);
   // Removing the proven holds must leave complete, readable green CI, never pending or unknown evidence.
   return reduceCheckState(latest.map(row => failing.includes(row?.name || row?.context)
     ? { ...row, conclusion: 'success' } : row), requiredChecks).state === 'green'
@@ -3132,15 +3129,14 @@ export function planReconcile({
       continue;
     }
 
-    const heldGates = ciRepairOwed ? splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required : [];
-    const reviewHoldRed = ciRepairOwed
-      && withPhase.labels.some(l => ['review:human', 'review:pending', 'review:changes', 'review:held-mechanical'].includes(l))
-      && reviewHoldGatesOnlyRed(pr?.statusCheckRollup, requiredChecks);
+    const reviewHoldRed = !pr.codeqlFailure
+      && waitingOnReview({ rollup: collapseRollupToLatestPerName(pr?.statusCheckRollup), requiredChecks });
     if (reviewHoldRed) {
-      refuse('review-hold-red', { ...withPhase, why: `review daemon owns held gates: ${heldGates.join(', ')}` });
+      refuse('review-hold-red', { ...withPhase, ciClassification: 'waiting-on-review', owner: 'review/orchestrator',
+        why: `review daemon owns held gates: ${failingCheckNames(collapseRollupToLatestPerName(pr?.statusCheckRollup)).join(', ')}` });
       // An admitted advisory owns a repair next. Keep the existing finding/cap/ruling
       // guards below reachable, without healing held gates or dispatching a second review.
-      if (!(phase === 'needs-human' && withPhase.labels.includes(ADVISORY_LABELS.CHANGES))) {
+      if (phase !== 'bounced' && !(phase === 'needs-human' && withPhase.labels.includes(ADVISORY_LABELS.CHANGES))) {
         humanHandoffAdvisory('review-hold');
         continue;
       }

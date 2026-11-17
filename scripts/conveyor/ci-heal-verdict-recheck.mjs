@@ -75,7 +75,11 @@ export function resolveVoidNeedsHumanWhenCiGreen(env = process.env, {
 export function ciGreenForEscalation({ rollup, requiredChecks }) {
   if (!Array.isArray(requiredChecks) || !requiredChecks.length) return false;
   const { red, pending, missing } = requiredCheckStates({ rollup, requiredChecks });
-  return !red.length && !pending.length && !missing.length;
+  if (red.length || pending.length || missing.length) return false;
+  const { checks, holdGateNames } = checkEvidence(rollup, requiredChecks);
+  return summarize(checks.filter(row => !holdGateNames.includes(row.name)), {
+    requiredNames: checks.map(row => row.name).filter(name => !holdGateNames.includes(name)),
+  }).allRequiredGreen;
 }
 
 export const sameSha = (a, b) => {
@@ -84,7 +88,6 @@ export const sameSha = (a, b) => {
   return x.length >= 7 && y.length >= 7 && (x.startsWith(y) || y.startsWith(x));
 };
 
-const gateNames = [REVIEW_GATE_CHECK, 'merge-gate'];
 const lowerState = state => String(state ?? '').toLowerCase();
 const normalizeRollupCheck = row => {
   const check = { ...row, name: row?.name || row?.context };
@@ -142,9 +145,20 @@ export function requiredCheckStates({ rollup, requiredChecks }) {
 /** Include gates and CodeQL evidence, even outside the required roster. */
 export function gateOnlyRedStates({ rollup, requiredChecks }) {
   const { checks, roster, holdGateNames } = checkEvidence(rollup, requiredChecks);
-  const requiredNames = [...roster, ...gateNames];
+  // Review-wait is a claim about the whole rollup, not just branch protection.
+  // In particular review-gate and real optional failures must not disappear.
+  const requiredNames = [...new Set([...roster, ...checks.map(row => row.name)])];
   const { gateOnlyRed, redSet } = summarize(checks, { requiredNames, holdGateNames });
   return { gateOnlyRed, red: [...redSet] };
+}
+
+/** Proven review-only failure, with complete green evidence for every other check. */
+export function waitingOnReview({ rollup, requiredChecks }) {
+  if (!Array.isArray(rollup) || !rollup.length) return false;
+  const { checks, roster, holdGateNames } = checkEvidence(rollup, requiredChecks);
+  const requiredNames = [...new Set([...roster, ...checks.map(row => row.name)])];
+  const { gateOnlyRed, pendingSet } = summarize(checks, { requiredNames, holdGateNames });
+  return gateOnlyRed && pendingSet.size === 0;
 }
 
 /**

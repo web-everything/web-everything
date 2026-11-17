@@ -4435,3 +4435,12 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+## Review waits are not CI repairs
+
+`gate-wait-not-ci-fail.test.mjs` uses node:test and head-bound merge-gate job-log fixtures.
+Run it through heavy-admission with `node --test`. Workflow-edit human-only acceptance
+remains red and carries review ownership; review-gate may be outside branch protection,
+and a proven hold does not require a review label. Other red or unreadable checks retain
+CI ownership. The regression also covers recovery candidate hydration, escalation CLI
+classification, and retirement of an already-escalated review-only head without a new needs-you event.
