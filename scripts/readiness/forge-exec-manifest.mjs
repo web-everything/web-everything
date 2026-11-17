@@ -227,8 +227,24 @@ const SIGNATURES=[
 const JWK_TYPE=/^(?:RSA|EC|OKP|oct)$/;
 const JWK_MEMBER=/^(?:d|p|q|dp|dq|qi|k)$/;
 const mayHaveJwkValue=text=>/[A-Za-z0-9_-]{22}/.test(text.replace(/\s/g,''));
-// Escapes can spell every member and value, so raw-text hints cannot reject escaped candidates.
-const mayHaveJwkText=text=>text.includes('\\')||text.includes('kty')&&mayHaveJwkValue(text);
+// Every JWK needs kty, including when its name is escaped inside serialized strings.
+// A backslash alone is not evidence: binary views and ordinary source contain many of
+// them, and retrying their unrelated braces can exhaust recovery's fail-closed budget.
+function mayHaveJwkText(text) {
+  if(text.includes('kty'))return text.includes('\\')||mayHaveJwkValue(text);
+  let budget=8*text.length;
+  while(text.includes('\\')) {
+    // Inspect successive serialization layers without unbounded repeated decoding.
+    // An incomplete hint scan still proceeds to the conservative structural scan.
+    budget-=text.length;
+    if(budget<0)return true;
+    const decoded=decodeEscapes(text);
+    if(decoded===text)return false;
+    if(decoded.includes('kty'))return true;
+    text=decoded;
+  }
+  return false;
+}
 // Tokenize strings and comments whole so their braces cannot change object scope. Unclosed block
 // comments consume the remaining text, avoiding repeated suffix scans on malformed input.
 const JWK_DATA_TOKEN=/"(?:[^"\\]|\\[^])*(?:"|\\?$)|'(?:[^'\\]|\\[^])*(?:'|\\?$)|`(?:[^`\\]|\\[^])*(?:`|\\?$)|[{}[\]:,]|[^\s{}[\]:,"'`\\/]+/g;

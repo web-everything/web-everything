@@ -208,6 +208,25 @@ describe('forge-key-structure: JWK recovery after unrelated quotes',()=>{
         }));
     }
   });
+  it('keeps unrelated escaped braces clean without a literal or decoded JWK type member',()=>{
+    const noise=Buffer.from("`*:}`',/{/*`".repeat(6000)+' \\ other '+'a'.repeat(22));
+    for(const bytes of [noise,Buffer.from(noise.toString(),'utf16le'),
+      Buffer.concat([Buffer.from([0xff,0]),noise])]) {
+      expect(credentialBufferFinding(bytes)).toBeNull();
+      for(const tracked of [false,true])
+        expect(manifestEntry(path,bytes,false,tracked)).toMatchObject({tracked});
+    }
+  });
+  it('retains escaped type names through nested serialization and recovery',()=>{
+    let text=JSON.stringify(staticJwk).replace('"kty"','"\\u006b\\u0074\\u0079"');
+    for(let depth=0;depth<4;depth++,text=JSON.stringify(text))
+      for(const encode of [encodings.raw,encodings.base64,encodings.utf16le]) {
+        const bytes=encode(Buffer.from('"unfinished '+text));
+        expect(credentialBufferFinding(bytes)).toBe(FINDING);
+        expect(credentialContentFinding(path,bytes)).toBe(FINDING);
+        expect(()=>manifestEntry(path,bytes,false,true)).toThrow(expect.objectContaining({code:'excluded-source-file'}));
+      }
+  });
 });
 
 describe('forge-key-structure: structured keys without a label',()=>{
