@@ -310,7 +310,7 @@ export function execReadRaw(file, args, options = {}) {
 }
 
 /** Fetch only the explicit PR transport under scrubbed, isolated lane Git configuration. */
-function fetchPinnedPrHead({ lanePath, repo, pr, env, exec, log }) {
+function fetchPinnedPrHead({ lanePath, repo, pr, env, exec, log, repoIds }) {
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo ?? '')) throw Error('invalid review repository; inspect repo argument before retrying');
   const options = { cwd: lanePath, env, timeout: 180_000, maxBuffer: 1024 * 1024 };
   const configDir = mkdtempSync(join(tmpdir(), 'review-git-config-'));
@@ -329,7 +329,23 @@ function fetchPinnedPrHead({ lanePath, repo, pr, env, exec, log }) {
     }
     const origin = exec('git', ['remote', 'get-url', 'origin'], gitOptions).trim();
     const originRepo = /^(?:git@github\.com:|ssh:\/\/git@github\.com\/|https:\/\/github\.com\/)([^/]+\/[^/]+?)(?:\.git)?\/?$/i.exec(origin)?.[1];
-    if (originRepo?.toLowerCase() !== repo.toLowerCase()) throw Error('review lane origin repository mismatch or unreadable; inspect lane before retrying');
+    const identityError = 'review lane origin repository mismatch or unreadable; inspect lane before retrying';
+    if (!/^[\w.-]+\/[\w.-]+$/.test(originRepo ?? '')) throw Error(identityError);
+    if (originRepo.toLowerCase() !== repo.toLowerCase()) {
+      const resolveId = slug => {
+        const key = slug.toLowerCase();
+        if (repoIds.has(key)) return repoIds.get(key);
+        const output = exec('gh', ['api', `repos/${slug}`, '--jq', '.id'], gitOptions).trim();
+        const id = Number(output);
+        if (!/^\d+$/.test(output) || !Number.isSafeInteger(id) || id <= 0) throw Error(identityError);
+        repoIds.set(key, id);
+        return id;
+      };
+      try {
+        const originId = resolveId(originRepo), expectedId = resolveId(repo);
+        if (originId !== expectedId) throw Error(identityError);
+      } catch { throw Error(identityError); }
+    }
     // Never resolve a remote name: retained origin.uploadpack/vcs can execute lane-owned commands.
     exec('git', ['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true', 'fetch', '--no-recurse-submodules', '--no-auto-gc', '--no-auto-maintenance', '--upload-pack=git-upload-pack',
       '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`], gitOptions);
@@ -350,6 +366,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
 } = {}) {
   // Keep rollback authority in this process; the runner's admission file is untrusted.
   const recoveryAdmissions = new Map();
+  const repoIds = new Map();
   const restoreAdmission = ({ repo, pr, head }) => {
     const path = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
     const admission = recoveryAdmissions.get(path);
@@ -472,7 +489,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     root,
     fetchRedTeamHead: ({ lanePath, repo, pr, head }) => {
       if (!/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('missing pinned red-team head');
-      const fetched = fetchPinnedPrHead({ lanePath, repo, pr, env, exec, log });
+      const fetched = fetchPinnedPrHead({ lanePath, repo, pr, env, exec, log, repoIds });
       if (fetched !== head) throw Error('red-team head changed during fetch');
       return { head };
     },
@@ -481,7 +498,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       const options = { cwd: lanePath, env, timeout: 180_000, maxBuffer: 1024 * 1024 };
       const { headRefOid: head } = JSON.parse(exec('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], options));
       if (!/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('review head missing; inspect PR evidence before retrying');
-      const fetched = fetchPinnedPrHead({ lanePath, repo, pr, env, exec, log });
+      const fetched = fetchPinnedPrHead({ lanePath, repo, pr, env, exec, log, repoIds });
       if (fetched !== head) throw Error('review head changed during fetch; retry shared setup on the live head');
       return { head };
     },

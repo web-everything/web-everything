@@ -186,6 +186,7 @@ describe('red-team fetch refusals', () => {
           return '';
         }
         if (args[0] === 'remote') return `git@github.com:${failure === 'origin-mismatch' ? 'other/repo' : repo}.git`;
+        if (file === 'gh' && args[0] === 'api') return args[1] === `repos/${repo}` ? '1' : '2';
         if (args.includes('fetch')) {
           if (failure === 'fetch-failure') throw Error('fetch refused');
           return '';
@@ -211,4 +212,90 @@ describe('red-team fetch refusals', () => {
         expect(calls.some(args => args.includes('fetch'))).toBe(false);
       }
     });
+});
+
+describe.each(['prepareLane', 'fetchRedTeamHead'])('%s canonical repository identity', method => {
+  const canonical = 'web-everything/web-everything', legacy = 'chalbert/web-everything';
+  const head = 'a'.repeat(40);
+  const identityError = 'review lane origin repository mismatch or unreadable; inspect lane before retrying';
+  function fixture({ origin = `git@github.com:${legacy}.git`, lookup = () => '123\n' } = {}) {
+    const calls = [], apiCalls = [], configs = [];
+    let isolated;
+    const exec = (file, args, options) => {
+      calls.push([file, args]);
+      if (file === 'gh' && args[0] === 'pr') return JSON.stringify({ headRefOid: head });
+      if (args[0] === 'config') { isolated = options.env; configs.push(isolated.GIT_CONFIG_GLOBAL); return ''; }
+      expect(options.cwd).toBe('fixture-lane');
+      expect(options.env).toBe(isolated);
+      expect(options).toMatchObject({ timeout: 180_000, maxBuffer: 1024 * 1024 });
+      expect(isolated.GIT_CONFIG_NOSYSTEM).toBe('1');
+      expect(isolated.GIT_CONFIG_SYSTEM).toBe(isolated.GIT_CONFIG_GLOBAL);
+      expect(isolated.GIT_CONFIG_KEY_0).toBe('core.fsmonitor');
+      expect(isolated.GIT_CONFIG_VALUE_0).toBe('false');
+      expect(readFileSync(isolated.GIT_CONFIG_GLOBAL, 'utf8')).toBe('');
+      if (file === 'gh') {
+        expect(args).toEqual(['api', expect.stringMatching(/^repos\/[\w.-]+\/[\w.-]+$/), '--jq', '.id']);
+        apiCalls.push(args[1]);
+        return lookup(args[1]);
+      }
+      if (args[0] === 'remote') return origin;
+      if (args.includes('fetch')) return '';
+      if (args[0] === 'rev-parse') return head;
+      throw Error('unexpected command');
+    };
+    const io = createReviewJobIo({ env: { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'unsafe', GIT_CONFIG_VALUE_0: 'unsafe' }, exec, log: () => {} });
+    const run = (repo = canonical, entry = method) => io[entry]({ repo, pr, lanePath: 'fixture-lane', head });
+    return { run, calls, apiCalls, configs };
+  }
+
+  it('accepts a transferred legacy-owner origin with the same numeric repository id', () => {
+    const f = fixture();
+    expect(f.run()).toEqual({ head });
+    expect(f.apiCalls).toEqual([`repos/${legacy}`, `repos/${canonical}`]);
+    expect(f.calls.some(([, args]) => args.includes('fetch'))).toBe(true);
+    expect(f.configs.every(path => !existsSync(path))).toBe(true);
+  });
+
+  it('refuses a different repository id before fetching', () => {
+    const f = fixture({ lookup: path => path === `repos/${legacy}` ? '123' : '456' });
+    expect(() => f.run()).toThrow(identityError);
+    expect(f.apiCalls).toHaveLength(2);
+    expect(f.calls.some(([, args]) => args.includes('fetch'))).toBe(false);
+  });
+
+  it.each([legacy, canonical])('fails closed on invalid or unreadable id evidence for %s', slug => {
+    for (const output of [null, 'not-a-number', '', '0', '-1', '1.5', '1e2', '9007199254740992']) {
+      const f = fixture({ lookup: path => {
+        if (path !== `repos/${slug}`) return '123';
+        if (output === null) throw Error('API unavailable');
+        return output;
+      } });
+      expect(() => f.run()).toThrow(identityError);
+      expect(f.calls.some(([, args]) => args.includes('fetch'))).toBe(false);
+      expect(f.configs.every(path => !existsSync(path))).toBe(true);
+    }
+  });
+
+  it.each(['git@github.com:', 'ssh://git@github.com/', 'https://github.com/'])(
+    'accepts a case-insensitive matching slug without an API call (%s)', prefix => {
+      const f = fixture({ origin: `${prefix}${canonical.toUpperCase()}.git` });
+      expect(f.run()).toEqual({ head });
+      expect(f.apiCalls).toEqual([]);
+    });
+
+  it.each(['git://github.com/chalbert/web-everything.git', 'https://evil.example/chalbert/web-everything.git',
+    'git@github.com:chalbert/web-everything?query.git', 'git@github.com:chalbert/web-everything/extra.git'])(
+    'refuses unsupported URLs or malformed origin slugs without API calls (%s)', origin => {
+      const f = fixture({ origin });
+      expect(() => f.run()).toThrow(identityError);
+      expect(f.apiCalls).toEqual([]);
+      expect(f.calls.some(([, args]) => args.includes('fetch'))).toBe(false);
+    });
+
+  it('caches both ids by lowercase slug across jobs and entry points in the same IO instance', () => {
+    const f = fixture();
+    expect(f.run()).toEqual({ head });
+    expect(f.run(canonical.toUpperCase(), method === 'prepareLane' ? 'fetchRedTeamHead' : 'prepareLane')).toEqual({ head });
+    expect(f.apiCalls).toEqual([`repos/${legacy}`, `repos/${canonical}`]);
+  });
 });
