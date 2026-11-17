@@ -95,8 +95,8 @@ export const STUCK_THRESHOLD_ENV = Object.freeze({
 
 /**
  * Resolve env > scripts/settings/stuck-pr-watch.json > built-in default, per-stage.
- * Invalid settings fall back with a named diagnostic; missing settings retain the built-in defaults.
- * Throws on a non-positive/non-finite override — a bad knob should fail loud, not silently disable a stage.
+ * Malformed files or parents fall back with a named diagnostic; missing settings retain the built-in defaults.
+ * Throws on invalid per-stage settings or env overrides — a bad knob should fail loud, not silently disable a stage.
  * @param {NodeJS.ProcessEnv} [env]
  * @param {{readSettings?:Function, log?:Function}} [options] - lazy settings reader and warning sink.
  * @returns {Record<string, number>}
@@ -137,7 +137,7 @@ export function stuckThresholdMinutes(env = process.env, { readSettings: read = 
       } else {
         out[stage] = DEFAULT_STUCK_THRESHOLD_MINUTES[stage];
         if (value !== undefined) {
-          log(`[stuck-pr-watch:invalid-threshold] stuckPrWatch.thresholdMinutes.${stage} must be a positive finite number; using built-in ${out[stage]} minutes`);
+          throw new TypeError(`stuckPrWatch.thresholdMinutes.${stage} must be a positive finite number, got ${typeof value === 'number' ? value : JSON.stringify(value)}`);
         }
       }
       continue;

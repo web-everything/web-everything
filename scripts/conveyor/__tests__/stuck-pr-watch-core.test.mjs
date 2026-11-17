@@ -89,15 +89,22 @@ describe('stuckThresholdMinutes', () => {
   });
 
   it.each([0, -1, NaN, Infinity, -Infinity, '20', null, false, {}, []])(
-    'invalid settings value %j falls back for that stage with a named diagnostic', value => {
+    'invalid settings value %j throws a TypeError naming the stage and bad value', value => {
       const log = vi.fn();
-      expect(stuckThresholdMinutes({}, { readSettings: settings({ review: value, fix: 17 }), log }))
-        .toEqual({ ...defaults, fix: 17 });
-      expect(log).toHaveBeenCalledTimes(1);
-      expect(log).toHaveBeenCalledWith(expect.stringContaining('[stuck-pr-watch:invalid-threshold] stuckPrWatch.thresholdMinutes.review'));
-      expect(log).toHaveBeenCalledWith(expect.stringContaining('using built-in 45 minutes'));
+      expect(() => stuckThresholdMinutes({}, { readSettings: settings({ review: value, fix: 17 }), log }))
+        .toThrow(new TypeError(`stuckPrWatch.thresholdMinutes.review must be a positive finite number, got ${typeof value === 'number' ? value : JSON.stringify(value)}`));
+      expect(log).not.toHaveBeenCalled();
     },
   );
+
+  it.each(Object.values(STUCK_STAGES))('env override wins over a bad %s settings value without reading it', stage => {
+    const get = vi.fn(() => 'invalid');
+    const configured = Object.defineProperty({}, stage, { get });
+    expect(stuckThresholdMinutes({ [STUCK_THRESHOLD_ENV[stage]]: '9' }, {
+      readSettings: settings(configured),
+    })).toEqual({ ...defaults, [stage]: 9 });
+    expect(get).not.toHaveBeenCalled();
+  });
 
   it('missing settings use defaults; malformed JSON logs its file error and uses defaults through the real reader', () => {
     const dir = mkdtempSync(join(tmpdir(), 'stuck-pr-settings-'));
