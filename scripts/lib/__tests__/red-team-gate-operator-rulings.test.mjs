@@ -653,6 +653,31 @@ describe('fresh-head card regression paths', () => {
   const read = (comments, head = N) => readRedTeamDisposition({ comments, pr: P, head,
     setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true }, sealed: null });
 
+  it.each([
+    ['bare', '', ''],
+    ['backticks', '`', '`'],
+    ['single quotes', "'", "'"],
+    ['double quotes', '"', '"'],
+    ['brackets', '[', ']'],
+    ['call expression', 'fetch("', '")'],
+    ['escaped quotes', '\\"', '\\"'],
+    ['Unicode quotes', '“', '”'],
+    ['invisible prefix', '\u200b', ''],
+    ['option prefix', '--url=', ''],
+    ['concatenated expression', 'base+"', '"'],
+    ['newline', '\n`', '`'],
+    ['carriage return', '\r`', '`'],
+    ['Unicode line separator', '\u2028`', '`'],
+  ])('holds changed protocol-relative URL ports through parser and card lookup (%s)', (_name, open, close) => {
+    const summary = port => `Parser accepts ${open}//cdn/a.js:${port}${close} incorrectly`;
+    const source = freshResult(H, [{ ...F(159, 'broken'), summary: summary(8080) }], result.created_at);
+    const next = freshResult(N, [{ ...F(165, 'broken'), summary: summary(8443) }]);
+    const comments = [...carded(source), next];
+    expect(read(comments, H).dispositions.get(1).state).toBe('released carded');
+    expect(held(read(comments))).toEqual([1]);
+    expect(read(comments).dispositions.get(1).state).not.toBe('released carded');
+  });
+
   it.each([['lines 1–2', 'lines 2–3'], ['ln 1', 'ln 2'], ['retries 3', 'retries 5']])(
     'does not inherit when non-location numbers change (%s → %s)', (before, after) => {
       const source = freshResult(H, [{ ...F(159, 'broken'), summary: `Parser drops ${before} of multiline input` }], result.created_at);
@@ -768,6 +793,8 @@ describe('summary canonicalization strips only whitespace and line-location toke
     ['line N', 'Parser drops input at line 10', 'Parser drops input at line 11'],
     ['L N', 'Parser drops input at L10', 'Parser drops input at L 11'],
     ['file:line', 'Parser drops input at scripts/parser.mjs:10', 'Parser drops input at scripts/parser.mjs:20'],
+    ['backtick file:line', 'Parser drops input at `scripts/parser.mjs:10`', 'Parser drops input at `scripts/parser.mjs:20`'],
+    ['quoted file:line', 'Parser drops input at "scripts/parser.mjs:10"', 'Parser drops input at "scripts/parser.mjs:20"'],
     ['own bare file:line:col', 'Parser drops input in x.mjs:10:5', 'Parser drops input in x.mjs:20:7'],
     ['whitespace', 'Parser   drops\tinput', 'Parser drops input'],
   ])('treats a location-only or whitespace-only change as the same: %s', (_name, a, b) => {

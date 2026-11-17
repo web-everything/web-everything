@@ -905,9 +905,10 @@ export function summaryCanonical(summary, file = '') {
   if (text.length > SUMMARY_PATH_SCAN_MAX) return text.replace(LINE_WORD_LOCATION, '#');
   return text
     .replace(PATH_COLON_LOCATION, (match, path, _location, offset) => {
-      // A URL's own path is not a source file reference: `https://h/a/b.js:443` keeps its port.
+      // A URL's own path is not a source file reference. Look throughout the prefix so
+      // quotes, backticks or expressions before `//cdn/a.js:443` cannot hide the URL.
       const tokenStart = text.lastIndexOf(' ', offset) + 1;
-      if (text.slice(tokenStart, offset).includes('://') || text.startsWith('//', tokenStart)) return match;
+      if (text.slice(tokenStart, offset).includes('//')) return match;
       // A slash path needs a source extension and a non-host first segment (`cdn.example.com/x.js:8080` is a URL).
       const repoPath = path.includes('/') && SOURCE_PATH_EXT.test(path) && !/^[^/.]+\.[^/]+\//.test(path);
       return repoPath || (own && path.toLowerCase() === own) ? `${path}#` : match;
