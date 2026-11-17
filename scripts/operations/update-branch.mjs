@@ -19,7 +19,9 @@ function behind(value) {
   return value.behind_by;
 }
 
-/** Injected IO only, like maintenance. At most one write and two post-write PR reads. */
+/** Injected IO only, like maintenance. At most one write and two post-write PR reads.
+ * Not a merge/refresh path: it only merges base into the head (expected_head_sha-locked, so a moved head is refused
+ * by GitHub). The new head voids any approval and re-runs every check, so no merge guard is bypassed. */
 export async function runUpdateBranch(input, io) {
   validate(input);
   const { pr, reason } = input;
@@ -58,8 +60,9 @@ export async function runUpdateBranch(input, io) {
             result.afterHead = next.head.sha;
             if (!next.base?.sha) throw new Error('missing updated base SHA');
             result.behindAfter = behind(await io.compare(repo, next.base.sha, next.head.sha));
-            result.status = 'updated';
-            delete result.detail;
+            if (result.behindAfter === 0) { result.status = 'updated'; delete result.detail; }
+            else Object.assign(result, { ok: false, refused: true, status: 'partially-updated',
+              detail: 'New head observed but still behind the base; inspect the PR before retrying.' });
             break;
           }
         }

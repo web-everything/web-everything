@@ -78,6 +78,11 @@ describe('update-branch', () => {
     for (const [, options] of f.gh.mock.calls) expect(options).toMatchObject({ timeout: 30_000, maxBuffer: 4 * 1024 * 1024, throttle: { maxAttempts: 1 } });
   });
 
+  it('does not report updated when the new head is still behind', async () => {
+    const f = fixture([pull, { behind_by: 2 }, accepted, next, { behind_by: 2 }]);
+    expect(await f.run()).toMatchObject({ ok: false, refused: true, status: 'partially-updated', behindAfter: 2 });
+  });
+
   it('observes a new head on the second read', async () => {
     const f = fixture([pull, { behind_by: 1 }, accepted, pull, next, { behind_by: 0 }]);
     expect(await f.run()).toMatchObject({ status: 'updated', afterHead: newHead });
