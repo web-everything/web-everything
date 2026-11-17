@@ -1,3 +1,4 @@
+import { renderNoPromptCommandRules } from './no-prompt-command-rules.mjs';
 import { readTestsFirstPolicy, GUARANTEE_TEST_RULE } from './tests-first-policy.mjs';
 import { cascadePolicy, logCascadeSources, platformPreference } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
@@ -318,7 +319,7 @@ export function buildMandate({ contextIsolation = 'diff-only', mandate = DEFAULT
   // isolation line, the `file` finding anchor, and the #2336 no-checkout body. The output is byte-identical to the
   // prior inline form. #2336: a review subagent runs inside the drain's shared primary checkout, so it must NEVER
   // `git checkout` the PR branch there (that moves the shared HEAD and violates the never-branch-a-shared-checkout guard).
-  return buildSubjectMandate({
+  return renderNoPromptCommandRules(buildSubjectMandate({
     subjectNoun: 'diff',
     mandate,
     defaultMandate: DEFAULT_MANDATE,
@@ -340,7 +341,7 @@ export function buildMandate({ contextIsolation = 'diff-only', mandate = DEFAULT
       PROSE_IMPRECISION_RULE,
       GUARANTEE_NEEDS_A_TEST_RULE,
     ],
-  });
+  }));
 }
 
 /**
@@ -389,7 +390,7 @@ export function buildEditorMandate({
   const findingLines = list.length
     ? list.map((f, i) => `  ${i + 1}. ${f.file ? `${f.file}: ` : ''}${f.summary}${f.failure_scenario ? ` — ${f.failure_scenario}` : ''}`).join('\n')
     : '  (none — the reviewer reported no findings; this mandate should not be built in that case)';
-  return [
+  return renderNoPromptCommandRules([
     `You are the EDITOR in round ${round}/${roundCap} of a bounded editor↔reviewer negotiation over a PR diff.`,
     ...(fenced ? [FENCED_DATA_RULE] : []),
     'A reviewer subagent (independent of you and of the PR\'s original author) reported these findings:',
@@ -399,7 +400,7 @@ export function buildEditorMandate({
     ...(writeTarget ? [writeTarget] : []),
     'A fresh-context reviewer will re-review your revised diff next round; you will not see their internal',
     'reasoning, only their next findings list (or acceptance).',
-  ].join(' ');
+  ].join(' '));
 }
 
 /**
@@ -461,7 +462,7 @@ export function buildPlanMandate({ task = '', concerns = [], round = 1, roundCap
     'A fresh-context peer will judge this approach next (accept it, or push back with concerns) — you will not',
     'see their internal reasoning, only their verdict and any concerns they raise.',
   );
-  return lines.join('\n');
+  return renderNoPromptCommandRules(lines.join('\n'));
 }
 
 /**
@@ -475,7 +476,7 @@ export function buildPlanMandate({ task = '', concerns = [], round = 1, roundCap
  * @returns {string}
  */
 export function buildPlanCritiqueMandate({ approach = '', round = 1, roundCap = PLAN_ROUND_CAP } = {}) {
-  return [
+  return renderNoPromptCommandRules([
     `You are the CRITIC in round ${round}/${roundCap} of a plan handshake, independent of the peer who proposed`,
     'the fix approach quoted in the <approach> block below.',
     FENCED_DATA_RULE,
@@ -485,7 +486,7 @@ export function buildPlanCritiqueMandate({ approach = '', round = 1, roundCap = 
     'Report concrete concerns (what\'s wrong with the approach, what it would miss) in the same finding shape',
     '(summary, failure_scenario) used elsewhere in this module, or report none if the approach is sound — do',
     'not pad acceptance with stylistic nitpicks about an approach you\'d have written differently.',
-  ].join('\n');
+  ].join('\n'));
 }
 
 /**
@@ -1579,7 +1580,7 @@ export function buildRosterCritiqueMandate({ subjectNoun = 'change', roster = []
   const seated = rosterLensList(roster);
   const seatedText = seated.length ? seated.join(', ') : '(none)';
   const availText = (Array.isArray(availableLenses) ? availableLenses : ROSTER_CRITIQUE_LENSES).join(', ');
-  return [
+  return renderNoPromptCommandRules([
     'You are the ROSTER COMPLETENESS CRITIC (#2637) — one cheap adversarial pass that runs BEFORE the jury fans out.',
     `A jury roster has been picked to review this ${subjectNoun}. The lenses currently seated on the roster are: ${seatedText}.`,
     `The full lens vocabulary a roster can draw from is: ${availText}.`,
@@ -1589,7 +1590,7 @@ export function buildRosterCritiqueMandate({ subjectNoun = 'change', roster = []
     `this ${subjectNoun}. Do NOT propose a lens already seated, do NOT invent a lens outside the vocabulary, and`,
     'report an EMPTY list if the roster is already complete — do not pad it to look thorough.',
     'You judge only: you NAME the gaps; adding the surfaced lenses to the roster is the caller\'s action, not yours.',
-  ].join(' ');
+  ].join(' '));
 }
 
 /**

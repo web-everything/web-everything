@@ -1,3 +1,4 @@
+import { renderNoPromptCommandRules } from './no-prompt-command-rules.mjs';
 /**
  * design-pixels-adapter.mjs — the DESIGN-PIXELS subject adapter (#2657, S5 of epic #2649).
  *
@@ -271,14 +272,14 @@ export function buildDesignMandate({ lens, mandate } = {}) {
       'ungrounded (a skip is never a fail).',
     );
   }
-  return buildSubjectMandate({
+  return renderNoPromptCommandRules(buildSubjectMandate({
     subjectNoun: 'rendered design',
     mandate: effectiveMandate,
     defaultMandate: DESIGN_PIXEL_LENSES.USABILITY,
     isolationLine: 'You see the RENDERED design (screenshots / DOM) — not the source that produced it, no author framing.',
     findingAnchor: 'region',
     bodyLines,
-  });
+  }));
 }
 
 /**

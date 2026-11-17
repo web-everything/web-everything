@@ -73,3 +73,14 @@ looked at.
   part — integrate and review the whole at full scale before calling any of it done.
 - **Stalled convergence is a finding.** If alternating-lens rounds won't go two-clean-in-a-row, stop honestly:
   the state model may be wrong (back to phase 1) or the ceiling is the model — say so, don't ship the churn.
+
+<!-- Generated from scripts/lib/no-prompt-command-rules.mjs; whole-tree test pins this copy. -->
+<!-- no-prompt-command-rules:begin -->
+## No-prompt command rules
+
+- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.
+- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.
+- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting.
+- Never run destructive history or working-tree resets, forced pushes, or cleans.
+- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`.
+<!-- no-prompt-command-rules:end -->

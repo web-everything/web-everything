@@ -45,6 +45,21 @@ import json
 import os
 import re
 import subprocess
+
+# Generated from scripts/lib/no-prompt-command-rules.mjs; pinned by the whole-tree test.
+NO_PROMPT_COMMAND_RULES = "<!-- no-prompt-command-rules:begin -->\n## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting.\n- Never run destructive history or working-tree resets, forced pushes, or cleans.\n- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`.\n<!-- no-prompt-command-rules:end -->"
+NO_PROMPT_COMMAND_RULES_BODY = "## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting.\n- Never run destructive history or working-tree resets, forced pushes, or cleans.\n- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`."
+NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT = "<!-- Generated from scripts/lib/no-prompt-command-rules.mjs; whole-tree test pins this copy. -->"
+NO_PROMPT_COMMAND_RULES_SENTINEL = "<!-- no-prompt-command-rules:begin -->"
+NO_PROMPT_COMMAND_RULES_END = "<!-- no-prompt-command-rules:end -->"
+
+def render_no_prompt_command_rules(brief):
+    if not isinstance(brief, str):
+        raise TypeError('no-prompt rules require a string brief')
+    if not brief.strip():
+        raise ValueError('empty task content')
+    return NO_PROMPT_COMMAND_RULES + "\n\n" + brief
+
 import sys
 import threading
 import time
@@ -123,6 +138,7 @@ def unlease(lane, slug):
 
 
 def run_agent(prompt, lane, tag, timeout=3600, verify=None):
+    prompt = render_no_prompt_command_rules(prompt)
     """One headless agent. Its own process, so its own session id.
 
     It also CLAIMS the lane on disk for the duration. Attribution used to be inferred from git state — match
@@ -287,6 +303,7 @@ better than one with none.
 
 Report: which findings you addressed, which you did not and why, and the commit sha.
 """
+FIX = render_no_prompt_command_rules(FIX)
 
 CI_HEAL = """You are healing a REAL CI FAILURE on pull request #{pr} in `web-everything/web-everything`. Its review
 already ACCEPTED this diff's content — do not re-review it, do not second-guess the accepted changes. Your
@@ -339,6 +356,7 @@ git push origin HEAD:{branch}
 
 Report the failing check's name, what was actually wrong, and the commit sha.
 """
+CI_HEAL = render_no_prompt_command_rules(CI_HEAL)
 
 REVIEW = """You are an INDEPENDENT reviewer for pull request #{pr} in `web-everything/web-everything`. You did not
 write it and you did not fix it — those were other sessions.
@@ -446,6 +464,7 @@ round's blocking findings are addressed and what remains is prose, ACCEPT and li
 
 Report the verdict and the run id.
 """
+REVIEW = render_no_prompt_command_rules(REVIEW)
 
 
 def make_landable(pr, branch, lane):

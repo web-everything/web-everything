@@ -1,3 +1,4 @@
+import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
 /**
  * @file scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs — #3438: dispatch the fix agent
  *   `reconcile-pass.mjs` decides is owed for a bounced PR nothing live is working.
@@ -876,7 +877,7 @@ describe('dispatchFix — the composition: plan → fill → mint → spawn', ()
       // unfilled template and the agent self-aborts (live 3/3: fix-2127/fix-2130/fix-2003).
       '--append-system-prompt-file', DISPATCHED_AGENT_SYSTEM_PROMPT_FILE,
       '--effort', 'high', '--model', 'sonnet',
-      '# fix brief for 1764 (item 3438)\n'
+      `${NO_PROMPT_COMMAND_RULES}\n\n${NO_PROMPT_COMMAND_RULES}\n\n` + '# fix brief for 1764 (item 3438)\n'
       + 'acquire: node scripts/lane-pool.mjs acquire --lane=9 --session=fix-1764 '
       + '--scope=we:scripts/conveyor/reconcile-fix-dispatch.mjs --base=lane/3438-wire-reconcile-pass\n'
       + 'this brief documents {{LIKE_THIS}} as an example convention, not a real token',

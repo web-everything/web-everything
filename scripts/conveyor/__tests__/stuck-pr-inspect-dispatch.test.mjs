@@ -1,3 +1,4 @@
+import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
 /**
  * @file scripts/conveyor/__tests__/stuck-pr-inspect-dispatch.test.mjs
  * @description Pins the diagnosis-only inspection dispatch (epic #3383): brief-fill refusals, the `inspect-*`
@@ -47,7 +48,7 @@ describe('fillInspectBrief', () => {
 
   it('substitutes every declared placeholder', () => {
     const { prompt, unknownTokens } = fillInspectBrief(template, values);
-    expect(prompt).toBe('PR 2505 in web-everything/web-everything as inspect-2505 — stage conflict, 390m over 45m.');
+    expect(prompt).toBe(`${NO_PROMPT_COMMAND_RULES}\n\nPR 2505 in web-everything/web-everything as inspect-2505 — stage conflict, 390m over 45m.`);
     expect(unknownTokens).toEqual([]);
   });
 

@@ -1,3 +1,4 @@
+import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 /**
  * @file scripts/operations/dispatch-lane.mjs
  * @description THE `dispatch-lane` DECLARATION — the effect that STARTS rather than completes (#3037, epic #3029).
@@ -716,7 +717,7 @@ export function fillBrief(
       + `as one of ${BRIEF_PLACEHOLDERS.map((n) => `{{${n}}}`).join(', ')}.`,
     );
   }
-  return { prompt, unknownTokens: [...unknown].sort() };
+  return { prompt: renderNoPromptCommandRules(prompt), unknownTokens: [...unknown].sort() };
 }
 
 /**

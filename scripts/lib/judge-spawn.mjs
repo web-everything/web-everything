@@ -1,3 +1,4 @@
+import { renderNoPromptCommandRules } from './no-prompt-command-rules.mjs';
 /**
  * judge-spawn.mjs — the tool-free juror spawn behind one function (#3028, under #3029).
  *
@@ -684,7 +685,7 @@ export function buildJudgeArgv({
     ...(budget === null ? [] : ['--max-budget-usd', String(budget)]),
     '--no-session-persistence',
     '--session-id', sessionId,
-    '--append-system-prompt', mandate,
+    '--append-system-prompt', renderNoPromptCommandRules(mandate),
     '--json-schema', JSON.stringify(shape),
   ];
 }

@@ -534,3 +534,14 @@ stranded legacy couple.
   This landed 3 of 4 overlapping PRs in a single pass. A genuinely BEHIND straggler is then left as a skip;
   land it on a follow-up pass (a normal rebase-drop pass rebuilds the LAST one cleanly, no siblings left to
   race). Relates to #2391 (drain dual-lock / whole-process critical section).
+
+<!-- Generated from scripts/lib/no-prompt-command-rules.mjs; whole-tree test pins this copy. -->
+<!-- no-prompt-command-rules:begin -->
+## No-prompt command rules
+
+- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.
+- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.
+- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting.
+- Never run destructive history or working-tree resets, forced pushes, or cleans.
+- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`.
+<!-- no-prompt-command-rules:end -->
