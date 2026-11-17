@@ -4,7 +4,7 @@ export const OWED_KINDS = Object.freeze(['review-changes', 'red-team-blocked', '
 const finite = (value) => typeof value === 'number' && Number.isFinite(value);
 const human = (labels) => labels.includes('review:human') || labels.some((l) => ['status:stood-down', 'review-status:stood-down'].includes(l));
 const live = (claim, now) => finite(claim.heartbeatAtMs) && finite(claim.ttlMinutes)
-  && claim.ttlMinutes >= 0 && now - claim.heartbeatAtMs <= claim.ttlMinutes * 60000;
+  && claim.ttlMinutes >= 0 && now - claim.heartbeatAtMs >= -120000 && now - claim.heartbeatAtMs <= claim.ttlMinutes * 60000;
 
 export function nextActor(snapshot, why) {
   if (why?.owner) return why.owner;

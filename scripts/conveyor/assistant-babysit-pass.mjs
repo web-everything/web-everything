@@ -7,6 +7,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { classifyPr, nextActor } from './assistant-babysit-rules.mjs';
 
 const DEFAULT_REPOS = ['web-everything/web-everything', 'plateauapp/plateau-app'];
+export const DEFAULT_CLAIM_TTL_MIN = 20;
+const PR_LIST_LIMIT = 500;
 const stamp = (value) => {
   const ms = typeof value === 'number' ? value : Date.parse(value);
   if (!Number.isFinite(ms)) throw new Error('Invalid timestamp evidence');
@@ -32,12 +34,15 @@ function loadClaims(io, coordDir) {
   try { entries = io.readdirSync(root); }
   catch (error) { if (error.code === 'ENOENT') return []; throw error; }
   return entries.flatMap((entry) => {
-    const lock = readJson(io, join(root, entry, 'lock.json'), null);
-    if (!lock || !['fix', 'fixing', 'ci-heal'].includes(lock.meta?.kind)) return [];
-    const { meta } = lock;
-    if (!meta.repo || !Number.isInteger(Number(meta.pr)) || !Number.isFinite(meta.ttlMinutes) || meta.ttlMinutes < 0) throw new Error('Incomplete claim evidence');
-    return [{ repo: meta.repo, pr: Number(meta.pr), kind: meta.kind === 'ci-heal' ? 'ci-heal' : 'fix',
-      claimedAtMs: stamp(meta.claimedAt), heartbeatAtMs: stamp(lock.heartbeatAt), ttlMinutes: meta.ttlMinutes, headShaAtClaim: meta.headSha }];
+    try {
+      const lock = readJson(io, join(root, entry, 'lock.json'), null);
+      if (!lock || !['fix', 'fixing', 'ci-heal'].includes(lock.meta?.kind)) return [];
+      const { meta } = lock;
+      if (typeof meta.repo !== 'string' || !meta.repo.trim() || !Number.isInteger(Number(meta.pr)) || Number(meta.pr) <= 0) return [];
+      const ttlMinutes = Number.isFinite(meta.ttlMinutes) && meta.ttlMinutes >= 0 ? meta.ttlMinutes : DEFAULT_CLAIM_TTL_MIN;
+      return [{ repo: meta.repo, pr: Number(meta.pr), kind: meta.kind === 'ci-heal' ? 'ci-heal' : 'fix',
+        claimedAtMs: stamp(meta.claimedAt), heartbeatAtMs: stamp(lock.heartbeatAt), ttlMinutes, headShaAtClaim: meta.headSha }];
+    } catch { return []; } // One unreadable or malformed claim cannot suppress the tick.
   });
 }
 const cell = (value) => String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').replace(/\|/g, '\\|');
@@ -57,18 +62,22 @@ export function runTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plat
   state.events ??= {};
   state.heads ??= {};
   state.lastReported ??= {};
+  state.lastDetailAt ??= {};
   const claims = loadClaims(io, coordDir);
   const whyPath = whyCli === undefined ? findWhy(io) : whyCli;
   const gh = (args) => exec('gh', args, { encoding: 'utf8', timeout: 60000, maxBuffer: 32 * 1024 * 1024, env: { ...env, GH_CALLER: 'wev-assistant' } });
   const at = new Date(nowMs).toISOString();
-  const summary = { type: 'tick', at, repos, open: 0, owing: 0, reports: 0, skipped: 0 };
+  const summary = { type: 'tick', at, repos, open: 0, owing: 0, reports: 0, skipped: 0, truncated: false, repoSummaries: [] };
   const reports = [];
+  const candidates = [];
   let detailed = 0;
   for (const repo of repos) {
-    const prs = JSON.parse(gh(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '200', '--json', 'number,labels,isDraft,mergeable,headRefOid,updatedAt,statusCheckRollup']));
+    const prs = JSON.parse(gh(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', String(PR_LIST_LIMIT), '--json', 'number,labels,isDraft,mergeable,headRefOid,updatedAt,statusCheckRollup']));
     if (!Array.isArray(prs)) throw new Error('Incomplete PR list evidence');
+    const truncated = prs.length >= PR_LIST_LIMIT;
+    summary.repoSummaries.push({ repo, open: prs.length, truncated });
+    summary.truncated ||= truncated;
     summary.open += prs.length;
-    const candidates = [];
     for (const pr of prs) {
       if (!Number.isInteger(pr.number) || !Array.isArray(pr.labels) || !Array.isArray(pr.statusCheckRollup)
         || typeof pr.isDraft !== 'boolean' || !['MERGEABLE', 'CONFLICTING', 'UNKNOWN'].includes(pr.mergeable)
@@ -82,43 +91,49 @@ export function runTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plat
       if (owed.length) summary.owing++;
       const needsDetail = owed.length || labels.includes('ready-to-merge') || snapshot.claims.length
         || labels.some((label) => ['status:fixing', 'review-status:fixing'].includes(label));
-      if (needsDetail) candidates.push({ snapshot, updatedAt: pr.updatedAt, updatedMs: stamp(pr.updatedAt) });
+      if (needsDetail) {
+        const detailKey = JSON.stringify([repo, pr.number]);
+        const lastDetailAt = Number.isFinite(state.lastDetailAt[detailKey]) ? state.lastDetailAt[detailKey] : -Infinity;
+        candidates.push({ snapshot, updatedAt: pr.updatedAt, updatedMs: stamp(pr.updatedAt), detailKey, lastDetailAt });
+      }
     }
-    candidates.sort((a, b) => a.updatedMs - b.updatedMs || a.snapshot.number - b.snapshot.number);
-    for (const { snapshot, updatedAt } of candidates) {
-      if (detailed >= maxDetail) { summary.skipped++; continue; }
-      detailed++;
-      const key = JSON.stringify([repo, snapshot.number, updatedAt]);
-      if (!Object.hasOwn(state.events, key)) {
-        // gh follows all Link pages sequentially; timeout/maxBuffer bound the read.
-        // Any failed or oversized read aborts the tick rather than caching a prefix.
-        const pages = JSON.parse(gh(['api', `repos/${repo}/issues/${snapshot.number}/events?per_page=100`, '--paginate', '--slurp']));
-        if (!Array.isArray(pages) || !pages.length || pages.some((page) => !Array.isArray(page))) throw new Error('Incomplete events evidence');
-        const times = pages.flat().filter((event) => ['labeled', 'unlabeled'].includes(event.event)).map((event) => stamp(event.created_at));
-        state.events[key] = times.length ? Math.max(...times) : null;
-      }
-      if (!Object.hasOwn(state.heads, snapshot.headSha)) {
-        state.heads[snapshot.headSha] = stamp(String(gh(['api', `repos/${repo}/commits/${snapshot.headSha}`, '--jq', '.commit.committer.date'])).trim());
-      }
-      snapshot.labelChangedAtMs = state.events[key];
-      snapshot.headChangedAtMs = state.heads[snapshot.headSha];
-      const current = classifyPr(snapshot).reports;
-      if (current.length && whyPath && io.existsSync(whyPath)) {
-        try {
-          const why = JSON.parse(exec('node', [whyPath, 'why', `--pr=${snapshot.number}`, `--repo=${repo}`, '--json'], { encoding: 'utf8', timeout: 90000, maxBuffer: 32 * 1024 * 1024, env }));
-          const verdict = why.verdict;
-          const daemons = (verdict?.sections ?? why.sections)?.find((section) => section.name === 'daemons')?.lines ?? why.daemons;
-          const lines = typeof daemons === 'string' ? daemons.split('\n') : Array.isArray(daemons) ? daemons : [];
-          const fixLogLine = lines.find((line) => typeof line === 'string' && /^fix:/.test(line));
-          for (const report of current) {
-            if (verdict?.owner) report.owner = nextActor(snapshot, verdict);
-            if (verdict?.waitingFor !== undefined) report.waitingFor = verdict.waitingFor;
-            if (fixLogLine !== undefined) report.fixLogLine = fixLogLine;
-          }
-        } catch { /* Optional local explanation cannot invalidate observed reports. */ }
-      }
-      reports.push(...current);
+  }
+  candidates.sort((a, b) => a.lastDetailAt - b.lastDetailAt || a.updatedMs - b.updatedMs || a.snapshot.number - b.snapshot.number);
+  for (const { snapshot, updatedAt, detailKey } of candidates) {
+    if (detailed >= maxDetail) { summary.skipped++; continue; }
+    detailed++;
+    const { repo } = snapshot;
+    const key = JSON.stringify([repo, snapshot.number, updatedAt]);
+    if (!Object.hasOwn(state.events, key)) {
+      // gh follows all Link pages sequentially; timeout/maxBuffer bound the read.
+      // Any failed or oversized read aborts the tick rather than caching a prefix.
+      const pages = JSON.parse(gh(['api', `repos/${repo}/issues/${snapshot.number}/events?per_page=100`, '--paginate', '--slurp']));
+      if (!Array.isArray(pages) || !pages.length || pages.some((page) => !Array.isArray(page))) throw new Error('Incomplete events evidence');
+      const times = pages.flat().filter((event) => ['labeled', 'unlabeled'].includes(event.event)).map((event) => stamp(event.created_at));
+      state.events[key] = times.length ? Math.max(...times) : null;
     }
+    if (!Object.hasOwn(state.heads, snapshot.headSha)) {
+      state.heads[snapshot.headSha] = stamp(String(gh(['api', `repos/${repo}/commits/${snapshot.headSha}`, '--jq', '.commit.committer.date'])).trim());
+    }
+    snapshot.labelChangedAtMs = state.events[key];
+    snapshot.headChangedAtMs = state.heads[snapshot.headSha];
+    const current = classifyPr(snapshot).reports;
+    if (current.length && whyPath && io.existsSync(whyPath)) {
+      try {
+        const why = JSON.parse(exec('node', [whyPath, 'why', `--pr=${snapshot.number}`, `--repo=${repo}`, '--json'], { encoding: 'utf8', timeout: 90000, maxBuffer: 32 * 1024 * 1024, env }));
+        const verdict = why.verdict;
+        const daemons = (verdict?.sections ?? why.sections)?.find((section) => section.name === 'daemons')?.lines ?? why.daemons;
+        const lines = typeof daemons === 'string' ? daemons.split('\n') : Array.isArray(daemons) ? daemons : [];
+        const fixLogLine = lines.find((line) => typeof line === 'string' && /^fix:/.test(line));
+        for (const report of current) {
+          if (verdict?.owner) report.owner = nextActor(snapshot, verdict);
+          if (verdict?.waitingFor !== undefined) report.waitingFor = verdict.waitingFor;
+          if (fixLogLine !== undefined) report.fixLogLine = fixLogLine;
+        }
+      } catch { /* Optional local explanation cannot invalidate observed reports. */ }
+    }
+    reports.push(...current);
+    state.lastDetailAt[detailKey] = nowMs;
   }
   summary.reports = reports.length;
   const lines = [];
@@ -131,7 +146,8 @@ export function runTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plat
   lines.push(JSON.stringify(summary));
   io.appendFileSync(join(outDir, 'reports.jsonl'), `${lines.join('\n')}\n`);
   const rows = reports.slice(0, 50).map((r) => `| ${[`${r.repo}#${r.pr}`, r.rule, r.minutes === null ? '' : Math.floor(r.minutes), r.owner, r.reason, r.fixLogLine].map(cell).join(' | ')} |`);
-  io.writeFileSync(join(outDir, 'digest.md'), `# Assistant digest — ${at}\n\nOpen: ${summary.open}; owing: ${summary.owing}; reports: ${summary.reports}; skipped: ${summary.skipped}.\n\nSkipped PRs need operator inspection or a higher --max-detail; table limited to 50 current reports.\n\n| PR | rule | min | owner | reason | fix-log |\n| --- | --- | --- | --- | --- | --- |\n${rows.join('\n')}\n`);
+  const truncation = summary.truncated ? ' — TRUNCATED: some open PRs not seen' : '';
+  io.writeFileSync(join(outDir, 'digest.md'), `# Assistant digest — ${at}${truncation}\n\nOpen: ${summary.open}; owing: ${summary.owing}; reports: ${summary.reports}; skipped: ${summary.skipped}.\n\nSkipped PRs need operator inspection or a higher --max-detail; table limited to 50 current reports.${summary.truncated ? '\n\nTruncated repositories need operator inspection of the full open PR list: ' + summary.repoSummaries.filter((r) => r.truncated).map((r) => cell(r.repo)).join(', ') + '.' : ''}\n\n| PR | rule | min | owner | reason | fix-log |\n| --- | --- | --- | --- | --- | --- |\n${rows.join('\n')}\n`);
   io.writeFileSync(join(outDir, 'state.json'), JSON.stringify(state, null, 2));
   return { summary, reports };
 }

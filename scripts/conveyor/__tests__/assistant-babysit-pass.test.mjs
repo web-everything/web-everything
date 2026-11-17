@@ -1,7 +1,7 @@
 /** Hermetic IO fixtures: report-only, no actions, no GitHub writes. */
 import { describe, it, expect } from 'vitest';
 import { join } from 'node:path';
-import { runTick } from '../assistant-babysit-pass.mjs';
+import { runTick, DEFAULT_CLAIM_TTL_MIN } from '../assistant-babysit-pass.mjs';
 
 const nowMs = Date.parse('2026-01-01T12:00:00Z');
 const old = '2026-01-01T10:00:00Z';
@@ -67,7 +67,7 @@ describe('report-only tick', () => {
       }
       expect(options).toMatchObject({ timeout: 60000, maxBuffer: 32 * 1024 * 1024, env: { GH_CALLER: 'wev-assistant', FIXTURE: 'yes' } });
     }
-    expect(gh[0].args).toEqual(['pr', 'list', '--repo', 'web-everything/web-everything', '--state', 'open', '--limit', '200', '--json', 'number,labels,isDraft,mergeable,headRefOid,updatedAt,statusCheckRollup']);
+    expect(gh[0].args).toEqual(['pr', 'list', '--repo', 'web-everything/web-everything', '--state', 'open', '--limit', '500', '--json', 'number,labels,isDraft,mergeable,headRefOid,updatedAt,statusCheckRollup']);
     expect(w.calls.at(-1)).toMatchObject({ command: 'node', args: ['why.mjs', 'why', '--pr=1', '--repo=web-everything/web-everything', '--json'], options: { timeout: 90000 } });
   });
 
@@ -87,7 +87,7 @@ describe('report-only tick', () => {
     expect(w.calls.filter((c) => c.command === 'gh' && c.args[0] === 'api')).toHaveLength(1);
   });
 
-  it('caps detail across sequential repos, oldest first, and exposes skipped fallback', () => {
+  it('caps detail across repos, oldest first, and exposes skipped fallback', () => {
     const w = fixture();
     w.prs = [
       { ...w.prs[0], number: 2, updatedAt: '2026-01-01T11:00:00Z' },
@@ -95,9 +95,61 @@ describe('report-only tick', () => {
     ];
     const { summary } = w.tick({ repos: ['org/first', 'org/second'], maxDetail: 1 });
     expect(summary).toMatchObject({ open: 4, owing: 4, skipped: 3 });
-    expect(w.calls.filter((c) => c.command === 'gh').map((c) => c.args[0])).toEqual(['pr', 'api', 'api', 'pr']);
-    expect(w.calls[1].args[1]).toContain('issues/1/events');
+    expect(w.calls.filter((c) => c.command === 'gh').map((c) => c.args[0])).toEqual(['pr', 'pr', 'api', 'api']);
+    expect(w.calls[2].args[1]).toContain('issues/1/events');
     expect(w.files.get(join('output', 'digest.md'))).toContain('Skipped PRs need operator inspection');
+  });
+
+  it.each([499, 500, 501])('flags truncation per repo and in the tick log and digest at %i open PRs', (count) => {
+    const w = fixture();
+    w.prs = Array.from({ length: count }, (_, index) => ({ ...w.prs[0], number: index + 1, labels: [] }));
+    const exec = (command, args, options) => {
+      const result = w.exec(command, args, options);
+      return args[0] === 'pr' && args[3] === 'org/other' ? JSON.stringify(w.prs.slice(0, 1)) : result;
+    };
+    const { summary } = w.tick({ repos: ['org/many', 'org/other'], exec });
+    expect(summary).toMatchObject({ open: count + 1, truncated: count >= 500, repoSummaries: [
+      { repo: 'org/many', open: count, truncated: count >= 500 },
+      { repo: 'org/other', open: 1, truncated: false },
+    ] });
+    expect(w.log().at(-1)).toEqual(summary);
+    const digest = w.files.get(join('output', 'digest.md'));
+    expect(digest.split('\n')[0].includes('TRUNCATED: some open PRs not seen')).toBe(count >= 500);
+    if (count >= 500) expect(digest).toContain('operator inspection of the full open PR list: org/many.');
+  });
+
+  it('rotates 26 candidates with the default cap of 25 so the skipped PR is checked on tick 2', () => {
+    const w = fixture();
+    const repo = 'web-everything/web-everything';
+    w.prs = Array.from({ length: 26 }, (_, index) => ({ ...w.prs[0], number: index + 1,
+      updatedAt: new Date(Date.parse(old) + index * 1000).toISOString() }));
+    expect(w.tick().summary).toMatchObject({ skipped: 1, reports: 25 });
+    const firstState = JSON.parse(w.files.get(join('output', 'state.json')));
+    expect(Object.keys(firstState.lastDetailAt)).toHaveLength(25);
+    expect(firstState.lastDetailAt[JSON.stringify([repo, 26])]).toBeUndefined();
+    w.calls.length = 0;
+    expect(w.tick({ nowMs: nowMs + 60000 }).summary).toMatchObject({ skipped: 1, reports: 25 });
+    const eventReads = w.calls.filter((c) => c.args[1]?.includes('/events?'));
+    expect(eventReads).toHaveLength(1);
+    expect(eventReads[0].args[1]).toContain('issues/26/events');
+    expect(w.calls.find((c) => c.command === 'node').args).toContain('--pr=26');
+    const secondState = JSON.parse(w.files.get(join('output', 'state.json')));
+    expect(Object.keys(secondState.lastDetailAt)).toHaveLength(26);
+    expect(secondState.lastDetailAt[JSON.stringify([repo, 26])]).toBe(nowMs + 60000);
+    expect(secondState.lastDetailAt[JSON.stringify([repo, 25])]).toBe(nowMs);
+  });
+
+  it('rotates the shared detail budget across repos with the same PR number', () => {
+    const w = fixture();
+    const options = { repos: ['org/first', 'org/second'], maxDetail: 1 };
+    w.tick(options);
+    w.calls.length = 0;
+    w.tick({ ...options, nowMs: nowMs + 60000 });
+    expect(w.calls.find((c) => c.args[1]?.includes('/events?')).args[1]).toContain('repos/org/second/issues/1/events');
+    expect(JSON.parse(w.files.get(join('output', 'state.json'))).lastDetailAt).toEqual({
+      [JSON.stringify(['org/first', 1])]: nowMs,
+      [JSON.stringify(['org/second', 1])]: nowMs + 60000,
+    });
   });
 
   it('limits digest to 50 reports and defaults detail to 25', () => {
@@ -114,6 +166,57 @@ describe('report-only tick', () => {
     w.claims = [{ heartbeatAt: new Date(nowMs).toISOString(), meta: { repo, pr: 1, kind: 'fixing', claimedAt: '2026-01-01T11:55:00Z', headSha: 'abc', ttlMinutes: 10 } }];
     expect(w.tick().reports).toEqual([]);
     expect(w.calls.some((c) => c.command === 'node')).toBe(false);
+  });
+
+  it.each([
+    ['missing', undefined], ['null', null], ['negative', -1], ['string', '10'], ['boolean', false],
+    ['NaN', NaN], ['infinite', Infinity], ['object', {}],
+  ])('defaults %s claim TTL to 20 minutes without aborting other PR reports', (_, ttlMinutes) => {
+    const w = fixture();
+    expect(DEFAULT_CLAIM_TTL_MIN).toBe(20);
+    w.prs.push({ ...w.prs[0], number: 2 });
+    w.claims = [{ heartbeatAt: new Date(nowMs - 20 * 60000).toISOString(), meta: {
+      repo: 'we', pr: 1, kind: 'fix', claimedAt: '2026-01-01T11:30:00Z', headSha: 'abc', ttlMinutes,
+    } }];
+    expect(w.tick().reports.map((r) => [r.pr, r.rule])).toEqual([[2, 'no-worker']]);
+    expect(w.log().at(-1)).toMatchObject({ type: 'tick', open: 2, reports: 1 });
+    expect(w.tick({ nowMs: nowMs + 1 }).reports.map((r) => [r.pr, r.rule])).toEqual([[1, 'no-worker'], [2, 'no-worker']]);
+  });
+
+  it.each([0, 10, 30])('preserves a valid claim TTL of %i minutes', (ttlMinutes) => {
+    const w = fixture();
+    w.claims = [{ heartbeatAt: new Date(nowMs - ttlMinutes * 60000).toISOString(), meta: {
+      repo: 'we', pr: 1, kind: 'fix', claimedAt: '2026-01-01T11:30:00Z', ttlMinutes,
+    } }];
+    expect(w.tick().reports).toEqual([]);
+    expect(w.tick({ nowMs: nowMs + 1 }).reports.map((r) => r.rule)).toEqual(['no-worker']);
+  });
+
+  it.each([
+    ['incomplete metadata', { meta: { kind: 'fix' } }],
+    ['invalid repo', { meta: { kind: 'fix', repo: 123, pr: 1 } }],
+    ['invalid PR', { meta: { kind: 'fix', repo: 'we', pr: 'bad' } }],
+    ['invalid claim time', { heartbeatAt: old, meta: { kind: 'fix', repo: 'we', pr: 1, claimedAt: 'bad' } }],
+    ['invalid heartbeat', { heartbeatAt: 'bad', meta: { kind: 'fix', repo: 'we', pr: 1, claimedAt: old } }],
+    ['corrupt JSON', '{'],
+    ['unreadable file', new Error('denied')],
+  ])('skips one malformed claim (%s) while reading valid claims and reporting other PRs', (_, malformed) => {
+    const w = fixture();
+    w.prs.push({ ...w.prs[0], number: 2 });
+    w.claims = [malformed, { heartbeatAt: new Date(nowMs).toISOString(), meta: {
+      repo: 'we', pr: 1, kind: 'fix', claimedAt: '2026-01-01T11:55:00Z',
+    } }];
+    if (typeof malformed === 'string') w.files.set(join('coord', 'fix-dispatch-claims', '0', 'lock.json'), malformed);
+    if (malformed instanceof Error) {
+      const readFileSync = w.io.readFileSync;
+      w.io.readFileSync = (path, ...args) => {
+        if (path === join('coord', 'fix-dispatch-claims', '0', 'lock.json')) throw malformed;
+        return readFileSync(path, ...args);
+      };
+    }
+    expect(w.tick().reports.map((r) => [r.pr, r.rule])).toEqual([[2, 'no-worker']]);
+    expect(w.log().at(-1)).toMatchObject({ type: 'tick', open: 2, reports: 1 });
+    expect(w.files.get(join('output', 'digest.md'))).toContain('no-worker');
   });
 
   it('handles missing claims directory and absent why CLI', () => {
@@ -152,7 +255,9 @@ describe('report-only tick', () => {
     w.eventPages = [[], [{ event: 'labeled', created_at: '2026-01-01T11:59:00Z' }]];
     expect(w.tick().reports).toEqual([]);
     expect(w.calls.filter((call) => call.args.includes('--paginate'))).toHaveLength(1);
-    expect(JSON.parse(w.files.get(join('output', 'state.json')))).toMatchObject({ labelEventsVersion: 2 });
+    expect(JSON.parse(w.files.get(join('output', 'state.json')))).toMatchObject({ labelEventsVersion: 2, lastDetailAt: {
+      [JSON.stringify(['web-everything/web-everything', 1])]: nowMs,
+    } });
   });
   it('reports a stale claim without owed-work or ready-to-merge labels', () => {
     const w = fixture();
@@ -200,7 +305,6 @@ describe('report-only tick', () => {
 
   it.each([
     ['unreadable claims', (w) => { w.io.readdirSync = () => { throw new Error('denied'); }; }],
-    ['malformed claim', (w) => { w.claims = [{ meta: { kind: 'fix' } }]; }],
     ['incomplete labels', (w) => { w.prs[0].labels = null; }],
     ['incomplete checks', (w) => { w.prs[0].statusCheckRollup = null; }],
     ['malformed events', (w) => { w.events = {}; }],
