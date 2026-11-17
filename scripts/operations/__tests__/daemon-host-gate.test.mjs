@@ -47,7 +47,10 @@ function harness({ owners, self = HOST_A }) {
       children.push(child);
       return child;
     },
-    killGroup: (pid, signal) => children.find((child) => child.pid === pid).kill(signal),
+    killGroup: (pid, signal) => {
+      if (signal === 0) throw Object.assign(new Error('gone'), { code: 'ESRCH' });
+      return children.find((child) => child.pid === pid).kill(signal);
+    },
     processSignals: procSignals,
     watchSleep: () => new Promise(() => {}),
     maxPolls: 50,
@@ -345,6 +348,78 @@ describe('runGate while the daemon runs', () => {
     h.deps.killGraceMs = 10;
     return { h, ticks };
   }
+  it.each(['leader-exit', 'revoke', 'shutdown'])('%s waits for ESRCH after SIGKILL before releasing the gate', async (reason) => {
+    const { h, ticks } = watched([
+      { host: HOST_A, version: 'file' }, { host: HOST_B, version: 'file' },
+    ]);
+    h.deps.maxPolls = 2;
+    let alive = true;
+    const probes = [];
+    const waits = [];
+    const killGroup = h.deps.killGroup;
+    h.deps.killGroup = (pid, signal) => {
+      if (signal === 0) {
+        probes.push(pid);
+        if (alive) return true;
+      }
+      return killGroup(pid, signal);
+    };
+    h.deps.sleep = (ms) => {
+      h.sleeps.push(ms);
+      if (ms === 100) return new Promise((resolve) => waits.push(resolve));
+      return Promise.resolve();
+    };
+    let settled = false;
+    const run = runGate({ cmd: 'd', args: [] }, h.deps).then((code) => { settled = true; return code; });
+    await tick();
+    if (reason === 'revoke') { ticks[0](); await tick(); }
+    if (reason === 'shutdown') h.procSignals.emit('SIGTERM');
+    h.children[0].emit('exit', 0, null);
+    await tick();
+    expect(h.children[0].kills).toContain('SIGKILL');
+    expect(probes).toEqual([h.children[0].pid]);
+    expect(settled).toBe(false);
+    expect(h.spawns).toHaveLength(1);
+    expect(h.polls()).toBe(reason === 'revoke' ? 2 : 1);
+    waits[0]();
+    await tick();
+    expect(probes).toHaveLength(2);
+    expect(settled).toBe(false);
+    alive = false;
+    waits[1]();
+    expect(await run).toBe(reason === 'revoke' ? 75 : 0);
+    expect(probes).toHaveLength(3);
+    expect(h.procSignals.eventNames()).toEqual([]);
+  });
+
+  it.each(['alive', 'unreadable'])('exits nonzero without a second spawn when group death is %s after revocation', async (state) => {
+    const { h, ticks } = watched([
+      { host: HOST_A, version: 'file' }, { host: HOST_B, version: 'file' },
+      { host: HOST_A, version: 'file' },
+    ]);
+    let probes = 0;
+    const killGroup = h.deps.killGroup;
+    h.deps.killGroup = (pid, signal) => {
+      if (signal !== 0) return killGroup(pid, signal);
+      probes += 1;
+      if (state === 'unreadable') throw Object.assign(new Error('denied'), { code: 'EPERM' });
+      return true;
+    };
+    const run = runGate({ cmd: 'd', args: [] }, h.deps);
+    await tick();
+    ticks[0]();
+    await tick();
+    h.children[0].emit('exit', 0, null);
+    expect(await run).toBe(1);
+    expect(probes).toBe(state === 'alive' ? 301 : 1);
+    expect(h.sleeps.filter((ms) => ms === 100)).toHaveLength(state === 'alive' ? 300 : 0);
+    expect(h.spawns).toHaveLength(1);
+    expect(h.polls()).toBe(2);
+    expect(h.logs.at(-1)).toContain(state === 'alive' ? 'still alive after 30000 ms' : 'death probe failed (EPERM)');
+    expect(h.logs.at(-1)).toContain('exiting 1, operator cleanup required');
+    expect(h.procSignals.eventNames()).toEqual([]);
+  });
+
   it.each([['SIGTERM', 143], ['SIGINT', 130], ['SIGHUP', 129]])(
     '%s during revocation returns the child exit code without a second spawn or standby sleep',
     async (signal, code) => {
@@ -486,6 +561,7 @@ describe('real daemon process group', () => {
       let releaseWatch;
       let owner = HOST_A;
       let run;
+      const logs = [];
       try {
         // The leader does not forward signals. The grandchild advertises readiness
         // only after installing its SIGTERM handler.
@@ -504,7 +580,11 @@ describe('real daemon process group', () => {
           : { cmd: process.execPath, args: ['-e', leader, worker, ready] };
         run = runGate(parsed, {
           thisHost: HOST_A, source: { readOwner: async () => ({ host: owner, version: 'file' }) },
-          processSignals: procSignals, log: () => {}, maxPolls: 1, killGraceMs: 30,
+          processSignals: procSignals, log: (line) => logs.push(line), maxPolls: 1, killGraceMs: 30,
+          // Exercise the full probe budget without a 30-second fixture wait.
+          // Linux can retain a dead orphan's group until its subreaper reaps it;
+          // that must produce a closed failure, never an unconfirmed release.
+          sleep: (ms) => delay(ms === 100 ? 1 : ms),
           watchSleep: () => new Promise((resolve) => { releaseWatch = resolve; }),
           spawn: (...args) => { child = spawn(...args); return child; },
         });
@@ -514,7 +594,8 @@ describe('real daemon process group', () => {
         if (['revoke', 'shell-revoke', 'resistant-leader'].includes(reason)) { owner = HOST_B; releaseWatch(); }
         else if (reason === 'leader-exit') child.kill('SIGTERM');
         else procSignals.emit(reason);
-        await Promise.race([run, delay(3000).then(() => { throw new Error('gate did not settle'); })]);
+        const code = await Promise.race([run, delay(3000).then(() => { throw new Error('gate did not settle'); })]);
+        if (logs.some((line) => line.includes('still alive after 30000 ms'))) expect(code).toBe(1);
         // A killed orphan can remain a zombie until Linux's subreaper reaps it.
         // Require positive death evidence; an unreadable probe is not success.
         await waitFor(() => descendantAlive(descendant) === false);

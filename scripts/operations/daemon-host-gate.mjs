@@ -21,6 +21,8 @@ import { getThisHost, resolveHostRole } from '../lib/daemon-host-guard.mjs';
 export const POLL_MS = 60_000;
 const SIGNALS = ['SIGTERM', 'SIGINT', 'SIGHUP'];
 const SIGNUM = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15, SIGKILL: 9, SIGQUIT: 3 };
+const GROUP_PROBE_MS = 100;
+const GROUP_DEATH_TIMEOUT_MS = 30_000;
 export function parseGateArgs(argv) {
   const at = argv.indexOf('--');
   if (at === -1) return null;
@@ -35,11 +37,12 @@ const describeOwner = (reason) => {
   return 'unreadable';
 };
 
-function startChild({ cmd, args }, { spawn, killGroup, processSignals, sleep, killGraceMs }) {
+function startChild({ cmd, args }, { spawn, killGroup, processSignals, sleep, killGraceMs, log }) {
   let child;
   let finish;
   let ended = false;
   let stopping = false;
+  let cleanupFailed = false;
   const grace = new AbortController();
   const done = new Promise((resolve) => { finish = resolve; });
   const stop = (sig) => {
@@ -65,6 +68,21 @@ function startChild({ cmd, args }, { spawn, killGroup, processSignals, sleep, ki
   });
   const onExit = () => stop('SIGKILL');
   processSignals.on('exit', onExit);
+  const confirmGroupDeath = async () => {
+    if (!child?.pid) return true;
+    for (let waited = 0; ; waited += GROUP_PROBE_MS) {
+      try { killGroup(child.pid, 0); } catch (error) {
+        if (error?.code === 'ESRCH') return true;
+        log(`host-gate: process group ${child.pid} death probe failed (${error?.code ?? 'unknown'}); exiting 1, operator cleanup required`);
+        return false;
+      }
+      if (waited >= GROUP_DEATH_TIMEOUT_MS) {
+        log(`host-gate: process group ${child.pid} still alive after ${GROUP_DEATH_TIMEOUT_MS} ms; exiting 1, operator cleanup required`);
+        return false;
+      }
+      await sleep(GROUP_PROBE_MS);
+    }
+  };
   const end = (code) => {
     if (ended) return;
     // The leader can exit before workers (including on a natural exit). Do not
@@ -74,7 +92,14 @@ function startChild({ cmd, args }, { spawn, killGroup, processSignals, sleep, ki
     grace.abort();
     for (const [sig, fn] of handlers) processSignals.removeListener(sig, fn);
     processSignals.removeListener('exit', onExit);
-    finish(code);
+    void confirmGroupDeath().then((dead) => {
+      cleanupFailed = !dead;
+      finish(dead ? code : 1);
+    }, () => {
+      cleanupFailed = true;
+      log(`host-gate: process group death confirmation failed; exiting 1, operator cleanup required`);
+      finish(1);
+    });
   };
   try {
     child = spawn(cmd, args, { stdio: 'inherit', detached: true });
@@ -82,7 +107,7 @@ function startChild({ cmd, args }, { spawn, killGroup, processSignals, sleep, ki
     child.on('error', () => { if (!child.pid) end(127); });
     child.on('exit', (code, signal) => end(signal ? 128 + (SIGNUM[signal] ?? 15) : (code ?? 1)));
   } catch { end(127); }
-  return { done, stop };
+  return { done, stop, get cleanupFailed() { return cleanupFailed; } };
 }
 
 async function pollRole(thisHost, source) {
@@ -108,8 +133,9 @@ async function watchChild(child, ctx) {
   }
   child.stop('SIGTERM');
   const exited = await Promise.race([child.done.then(() => true), sleep(killGraceMs).then(() => false)]);
-  if (!exited) { child.stop('SIGKILL'); await child.done; }
-  return null;
+  if (!exited) child.stop('SIGKILL');
+  const code = await child.done;
+  return child.cleanupFailed ? code : null;
 }
 
 /**
@@ -118,6 +144,7 @@ async function watchChild(child, ctx) {
  * (other, unset, unreadable or invalid input) immediately stops the daemon process group
  * (SIGTERM, then SIGKILL after killGraceMs) and returns the gate to standby.
  * A leader exit also kills any remaining group members before releasing the gate.
+ * Release requires ESRCH from a group probe; unconfirmed death exits 1 after 30 s.
  */
 export async function runGate(parsed, deps = {}) {
   const {
@@ -156,7 +183,7 @@ export async function runGate(parsed, deps = {}) {
       }
       log(`host-gate: active owner=${owner} self=${thisHost}`);
       if (shutdownCode !== null) return shutdownCode;
-      const child = startChild(parsed, { spawn, killGroup, processSignals, sleep, killGraceMs });
+      const child = startChild(parsed, { spawn, killGroup, processSignals, sleep, killGraceMs, log });
       const code = await watchChild(child, { thisHost, source, watchSleep, sleep, killGraceMs, log });
       // Revocation discards the exit code, but must not discard wrapper shutdown.
       if (shutdownCode !== null) return await child.done;
