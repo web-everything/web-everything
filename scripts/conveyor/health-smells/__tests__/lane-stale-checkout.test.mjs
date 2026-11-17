@@ -242,6 +242,51 @@ describe('probeLaneCheckouts', () => {
     expect(git).toHaveBeenCalledWith(['log', '-1', '--format=%ct', 'origin/main'], expect.any(Object));
   });
 
+  it('reads the host main tip once through injected Git using repoRoot when no time is supplied', () => {
+    addLane(root, 1, freshSource);
+    addLane(root, 2, freshSource);
+    const repoRoot = join(root, 'host');
+    const fixture = gitFixture();
+    const git = vi.fn((args, options) => options.cwd === repoRoot
+      ? `${now / 1000}\n` : fixture(args, options));
+    const rows = probeLaneCheckouts({ poolRoot: root, repoRoot, git, now });
+    expect(rows).toHaveLength(2);
+    expect(rows.every(row => row.headLagMs === 0)).toBe(true);
+    expect(git.mock.calls.filter(([, options]) => options.cwd === repoRoot)).toEqual([
+      [['log', '-1', '--format=%ct', 'origin/main'], {
+        cwd: repoRoot, encoding: 'utf8', timeout: 2_000, maxBuffer: 64 * 1024, stdio: ['ignore', 'pipe', 'ignore'],
+      }],
+    ]);
+  });
+
+  it.each(['timeout', 'maxBuffer exceeded', 'invalid', 'non-finite'])(
+    'preserves unknown lag and recommends refresh when the host main-tip read fails: %s', failure => {
+      addLane(root, 2, freshSource);
+      const repoRoot = join(root, 'host');
+      const fixture = gitFixture();
+      const git = vi.fn((args, options) => {
+        if (options.cwd !== repoRoot) return fixture(args, options);
+        if (failure === 'invalid') return 'invalid';
+        if (failure === 'non-finite') return '9'.repeat(400);
+        throw new Error(failure);
+      });
+      const [row] = probeLaneCheckouts({ poolRoot: root, repoRoot, git, now });
+      expect(row).toMatchObject({ head: '222222222', behind: 0, headLagMs: null });
+      expect(evaluate(row).breach).toBe(true);
+      expect(evaluate(row).recommendation).toContain('lane-pool refresh/reclaim');
+      expect(git.mock.calls.some(([args]) => args[0] === 'merge-base')).toBe(false);
+    },
+  );
+
+  it.each([now, null])('skips the host main-tip read for an explicit time: %s', mainTipTimeMs => {
+    addLane(root, 2, freshSource);
+    const repoRoot = join(root, 'host');
+    const git = gitFixture();
+    const [row] = probeLaneCheckouts({ poolRoot: root, repoRoot, git, now, mainTipTimeMs });
+    expect(row.headLagMs).toBe(mainTipTimeMs === null ? null : 0);
+    expect(git.mock.calls.some(([, options]) => options.cwd === repoRoot)).toBe(false);
+  });
+
   it('preserves unknown head lag when the host main-tip time is unavailable', () => {
     addLane(root, 2, freshSource);
     const [row] = probeLaneCheckouts({ poolRoot: root, git: gitFixture(), now, mainTipTimeMs: null });
@@ -399,7 +444,11 @@ describe('probeLaneCheckouts', () => {
   });
 
   it('returns no lanes only when the pool root is unconfigured', () => {
-    expect(probeLaneCheckouts({ poolRoot: null })).toEqual([]);
+    const git = vi.fn();
+    const readdir = vi.fn();
+    expect(probeLaneCheckouts({ poolRoot: null, repoRoot: root, git, readdir })).toEqual([]);
+    expect(git).not.toHaveBeenCalled();
+    expect(readdir).not.toHaveBeenCalled();
   });
 
   it('throws for missing, non-directory or unreadable configured roots', () => {

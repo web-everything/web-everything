@@ -79,12 +79,23 @@ function probeTelemetry(source) {
 }
 
 /**
- * @param {{poolRoot?: string|null, readFile?: Function, readdir?: Function, git?: Function, now?: number, mainTipTimeMs?: number|null}} [options]
+ * @param {{poolRoot?: string|null, repoRoot?: string, readFile?: Function, readdir?: Function, git?: Function, now?: number, mainTipTimeMs?: number|null}} [options]
  * `git(args, {cwd, timeout, maxBuffer})` returns stdout or throws; readFile follows readFileSync.
  * @returns {Array<{pool:string, unreadable:true, path:string}|{pool:string, lane:number, head:string|null, behind:number|null, behindSinceMs:number|null, headLagMs:number|null, forgeExecHasPrune:boolean|null}>}
  */
-export function probeLaneCheckouts({ poolRoot, readFile = readFileSync, readdir = readdirSync, git = (args, options) => execFileSync('git', args, options), now = Date.now(), mainTipTimeMs = null } = {}) {
+export function probeLaneCheckouts({ poolRoot, repoRoot, readFile = readFileSync, readdir = readdirSync, git = (args, options) => execFileSync('git', args, options), now = Date.now(), mainTipTimeMs } = {}) {
   if (poolRoot == null) return [];
+  if (mainTipTimeMs === undefined) {
+    mainTipTimeMs = null;
+    if (repoRoot != null) {
+      try {
+        const ct = String(git(['log', '-1', '--format=%ct', 'origin/main'], {
+          cwd: repoRoot, encoding: 'utf8', timeout: 2_000, maxBuffer: 64 * 1024, stdio: ['ignore', 'pipe', 'ignore'],
+        })).trim();
+        if (/^\d+$/.test(ct) && Number.isFinite(Number(ct) * 1000)) mainTipTimeMs = Number(ct) * 1000;
+      } catch { /* unreadable host main tip stays unknown */ }
+    }
+  }
   // The shared scanner deliberately swallows IO errors. Verify the root first,
   // and refuse an empty scan so health-watch records probe failure, not a clean tick.
   const entries = readdir(poolRoot);
