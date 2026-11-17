@@ -83,7 +83,7 @@ function probeTelemetry(source) {
  * `git(args, {cwd, timeout, maxBuffer})` returns stdout or throws; readFile follows readFileSync.
  * @returns {Array<{pool:string, unreadable:true, path:string}|{pool:string, lane:number, head:string|null, behind:number|null, behindSinceMs:number|null, headLagMs:number|null, forgeExecHasPrune:boolean|null}>}
  */
-export function probeLaneCheckouts({ poolRoot, repoRoot, readFile = readFileSync, readdir = readdirSync, git = (args, options) => execFileSync('git', args, options), now = Date.now(), mainTipTimeMs } = {}) {
+export function probeLaneCheckouts({ poolRoot, repoRoot, readFile = readFileSync, readdir = readdirSync, git = (args, options) => execFileSync('git', args, { encoding: 'utf8', timeout: 2_000, maxBuffer: 64 * 1024, stdio: ['ignore', 'pipe', 'ignore'], ...options }), now = Date.now(), mainTipTimeMs } = {}) {
   if (poolRoot == null) return [];
   if (mainTipTimeMs === undefined) {
     mainTipTimeMs = null;
