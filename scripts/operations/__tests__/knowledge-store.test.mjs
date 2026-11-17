@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { main as check, projectKey } from '../knowledge-store-check.mjs';
-import { main as sync, planMerge } from '../knowledge-store-sync.mjs';
+import { entryName, main as sync, planMerge } from '../knowledge-store-sync.mjs';
 
 function fixture() {
   const home = mkdtempSync(join(tmpdir(), 'ks-'));
@@ -52,6 +52,10 @@ describe('knowledge-store-check', () => {
     f.store(f.big, many(60));
     expect(run(check, [`--home=${f.home}`, `--cwd=${join(f.home, 'elsewhere')}`]).code).toBe(1);
   });
+  it('fails when the canonical store does not exist', () => {
+    const f = fixture();
+    expect(run(check, [`--home=${f.home}`, `--cwd=${f.big}`]).code).toBe(1);
+  });
   it('rejects bad flags', () => {
     expect(run(check, ['--nope']).code).toBe(2);
   });
@@ -68,6 +72,13 @@ describe('knowledge-store-sync', () => {
     expect(plan.same).toEqual(['b.md']);
     expect(plan.conflict.map((c) => c.file)).toEqual(['c.md', 'z.md']);
   });
+  it('reads CRLF names and catches duplicate names among incoming entries', () => {
+    const crlf = (n, body) => ({ file: `${n}.md`, slug: n, name: entryName(`---\r\nname: shared\r\n---\r\n${body}`), text: body });
+    expect(crlf('a', '1').name).toBe('shared');
+    const plan = planMerge([crlf('a', '1'), crlf('b', '2')], [entry('t', 'x')]);
+    expect(plan.add).toEqual(['a.md']);
+    expect(plan.conflict.map((c) => c.file)).toEqual(['b.md']);
+  });
   it('writes nothing by default; --apply copies only adds', () => {
     const f = fixture();
     const to = f.store(f.big, { 'MEMORY.md': '- [K](k.md) - kept\n', 'k.md': '---\nname: k\n---\nold' });
@@ -81,6 +92,6 @@ describe('knowledge-store-sync', () => {
     run(sync, [...base, '--apply']);
     expect(existsSync(join(to, 'n.md'))).toBe(true);
     expect(readFileSync(join(to, 'k.md'), 'utf8')).toContain('old');
-    expect(readFileSync(join(to, 'MEMORY.md'), 'utf8')).toContain('(n.md)');
+    expect(readFileSync(join(to, 'MEMORY.md'), 'utf8')).not.toContain('(n.md)');
   });
 });

@@ -72,6 +72,7 @@ export function evaluate({ stores, cwd, home, canonicalDir, minEntries = DEFAULT
   const isCanonical = loaded.key === canonical.key || loaded.real === canonical.real;
   const larger = stores.filter((s) => s.real !== loaded.real && s.count > loaded.count).sort((a, b) => b.count - a.count)[0];
   const problems = [];
+  if (canonical.missing) problems.push(`canonical store "${canonical.key}" does not exist`);
   if (!isCanonical) problems.push(`session loads store "${loaded.key}" (${loaded.count} entries), not the canonical "${canonical.key}" (${canonical.count} entries)`);
   if (loaded.count < minEntries && larger) problems.push(`loaded store has ${loaded.count} entries (< ${minEntries}) while "${larger.key}" has ${larger.count}`);
   const fixes = [];

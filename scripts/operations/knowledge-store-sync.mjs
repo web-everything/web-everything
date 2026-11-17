@@ -6,7 +6,8 @@
  * and by frontmatter `name:`. Per entry: "add" (only in source), "same" (identical), "conflict"
  * (same slug or name, different content). Conflicts are listed and NEVER overwritten.
  * `--apply` is an explicit flag that copies only the "add" entries into the target and appends their
- * index lines to the target MEMORY.md. It is not run automatically anywhere.
+ * files. It never edits MEMORY.md or category indexes (those go through the memory gate). It is not
+ * run automatically anywhere.
  *
  * Feeds card 0k (the private, versioned knowledge repo): the plan output is the reviewable diff to
  * commit into that repo before it becomes the one canonical store.
@@ -15,15 +16,15 @@
  *          [--cwd=DIR] [--home=DIR] [--canonical-dir=DIR] [--apply] [--json]
  *   defaults: from = the store this session would load; to = the canonical store
  */
-import { appendFileSync, copyFileSync, existsSync, readFileSync } from 'node:fs';
+import { constants, copyFileSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { listEntries, parseArgs as parseCheckArgs, projectKey } from './knowledge-store-check.mjs';
 
 /** Frontmatter `name:` of an entry, or ''. */
 export function entryName(text) {
-  const fm = /^---\n([\s\S]*?)\n---/.exec(text);
-  const m = fm && /^name:\s*(.+)$/m.exec(fm[1]);
+  const fm = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text);
+  const m = fm && /^name:[ \t]*(.+)$/m.exec(fm[1]);
   return m ? m[1].trim().replace(/^["']|["']$/g, '') : '';
 }
 
@@ -41,8 +42,11 @@ export function planMerge(source, target) {
   const plan = { add: [], same: [], conflict: [] };
   for (const e of source) {
     const hit = bySlug.get(e.slug) || (e.name && byName.get(e.name));
-    if (!hit) plan.add.push(e.file);
-    else if (hit.text === e.text) plan.same.push(e.file);
+    if (!hit) {
+      plan.add.push(e.file);
+      bySlug.set(e.slug, e);
+      if (e.name) byName.set(e.name, e);
+    } else if (hit.text === e.text) plan.same.push(e.file);
     else plan.conflict.push({ file: e.file, against: hit.file });
   }
   return plan;
@@ -58,9 +62,7 @@ export function indexLinesFor(memoryDir, files) {
 /** Copy "add" entries only; never overwrites. Returns the files written. */
 export function applyPlan(plan, fromDir, toDir) {
   for (const file of plan.add) if (existsSync(join(toDir, file))) throw new Error(`refusing to overwrite ${file}`);
-  for (const file of plan.add) copyFileSync(join(fromDir, file), join(toDir, file));
-  const lines = indexLinesFor(fromDir, plan.add);
-  if (lines.length) appendFileSync(join(toDir, 'MEMORY.md'), `${lines.join('\n')}\n`);
+  for (const file of plan.add) copyFileSync(join(fromDir, file), join(toDir, file), constants.COPYFILE_EXCL);
   return plan.add;
 }
 
@@ -68,7 +70,7 @@ export function formatPlan(plan, fromDir, toDir, applied) {
   const lines = [`merge plan: ${fromDir} -> ${toDir}`, `add: ${plan.add.length}  same: ${plan.same.length}  conflict: ${plan.conflict.length}`];
   for (const f of plan.add) lines.push(`  + ${f}`);
   for (const c of plan.conflict) lines.push(`  ! ${c.file} conflicts with ${c.against} (kept as-is in target; resolve by hand)`);
-  lines.push(applied ? `APPLIED: copied ${plan.add.length} entries` : 'proposal only: nothing written (add --apply to copy the "add" entries)');
+  lines.push(applied ? `APPLIED: copied ${plan.add.length} entries. MEMORY.md and its category indexes are NOT touched: add index links through the memory gate (credential, index-budget and tree-shape checks), then re-run the check.` : 'proposal only: nothing written (add --apply to copy the "add" entries)');
   return lines.join('\n');
 }
 
