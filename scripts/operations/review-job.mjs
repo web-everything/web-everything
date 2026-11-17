@@ -361,17 +361,6 @@ function fetchPinnedPrHead({ lanePath, repo, pr, head, headChangedError, env, ex
     const { GIT_TEMPLATE_DIR: _template, ...isolatedEnv } = gitOptions.env;
     exec('git', ['init', '--bare', '--quiet', '--template=', iso], { ...gitOptions, env: isolatedEnv, cwd: configDir });
     const isoOptions = { ...gitOptions, env: isolatedEnv, cwd: iso };
-    const objects = resolve(lanePath, exec('git', ['rev-parse', '--git-path', 'objects'], gitOptions).trim());
-    // Git alternates are line-delimited paths. Quote the path using Git's C-style quoting.
-    mkdirSync(join(iso, 'objects', 'info'), { recursive: true });
-    writeFileSync(join(iso, 'objects', 'info', 'alternates'), `${JSON.stringify(objects)}\n`);
-    let laneHead;
-    try { laneHead = exec('git', ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}'], gitOptions).trim(); }
-    catch (error) { if (error.status !== 1 || error.signal) throw error; }
-    if (laneHead !== undefined) {
-      if (!/^[a-f0-9]{40}$/i.test(laneHead)) throw Error('pinned review commit unavailable');
-      exec('git', ['update-ref', 'refs/haves/lane', laneHead], isoOptions);
-    }
     const pins = ['-c', 'protocol.allow=never', '-c', 'protocol.ssh.allow=always', '-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'gc.auto=0',
       '-c', 'maintenance.auto=false', '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true',
       '-c', 'core.sshCommand=ssh', '-c', 'ssh.variant=ssh'];
@@ -389,14 +378,25 @@ function fetchPinnedPrHead({ lanePath, repo, pr, head, headChangedError, env, ex
       }
       return result.stdout;
     };
-    const pack = checkedSpawn([...pins, 'pack-objects', '--revs', '--thin', '--stdout'], {
-      ...packOptions, input: `${fetched}\n${laneHead ? `^${laneHead}\n` : ''}`,
+    const pack = checkedSpawn([...pins, 'pack-objects', '--revs', '--stdout'], {
+      ...packOptions, input: `${fetched}\n`,
     });
-    checkedSpawn([...pins, 'index-pack', '--stdin', '--fix-thin', '--strict'], {
+    checkedSpawn([...pins, 'index-pack', '--stdin', '--strict'], {
       ...packOptions, cwd: lanePath, input: pack,
     });
-    const resolved = exec('git', ['rev-parse', '--verify', `${fetched}^{commit}`], gitOptions).trim();
-    if (resolved !== fetched) throw Error('pinned review commit unavailable');
+    // A lane loose object can shadow the genuine object just imported in the pack.
+    // Compare against the independently fetched commit, including its exact bytes.
+    try {
+      const tree = exec('git', ['rev-parse', `${fetched}^{tree}`], isoOptions).trim();
+      const laneTree = exec('git', ['rev-parse', `${fetched}^{tree}`], gitOptions).trim();
+      const commit = checkedSpawn([...pins, 'cat-file', 'commit', fetched], packOptions);
+      const laneCommit = checkedSpawn([...pins, 'cat-file', 'commit', fetched], { ...packOptions, cwd: lanePath });
+      if (!/^[a-f0-9]{40}$/i.test(tree) || tree !== laneTree || !commit.equals(laneCommit)) {
+        throw Error('commit content mismatch');
+      }
+    } catch (cause) {
+      throw Error('pinned review commit unavailable; inspect lane and retry shared setup', { cause });
+    }
     return fetched;
   } finally { rmSync(configDir, { recursive: true, force: true }); }
 }
