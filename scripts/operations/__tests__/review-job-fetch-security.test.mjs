@@ -218,30 +218,79 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s fsck config validation', 
     expect(calls.some(args => args.includes('fetch'))).toBe(false);
   });
 
-  it.each(['clean', 'no-match', 'unreadable', 'status-one-output', 'status-one-stderr', 'oversized'])(
-    'fails closed except for clean or empty no-match config (%s)', kind => {
-      const calls = [];
-      const exec = (file, args) => {
-        calls.push(args);
-        if (file === 'gh') return JSON.stringify({ headRefOid: head });
-        if (args.includes('--name-only')) {
-          if (kind === 'clean') return '';
-          throw Object.assign(Error('config read failed'), {
-            status: kind === 'unreadable' ? 2 : kind === 'oversized' ? null : 1,
-            stdout: kind === 'status-one-output' ? 'fsck.badtimezone\n' : '',
-            stderr: kind === 'status-one-stderr' ? 'read error' : '',
-            ...(kind === 'oversized' ? { code: 'ENOBUFS' } : {}),
-          });
-        }
-        if (args[0] === 'config') return '';
-        if (args[0] === 'remote') return `git@github.com:${repo}.git`;
-        return args.includes('fetch') ? '' : head;
-      };
-      const run = () => createReviewJobIo({ env: {}, exec, log: () => {} })[method]({ repo, pr, lanePath: 'fixture-lane', head });
-      const clean = ['clean', 'no-match'].includes(kind);
-      if (clean) expect(run()).toEqual({ head });
+  it.each([
+    ['no-match', { status: 1, stdout: '', stderr: '' }, true],
+    ['keys-exist', { status: 0, stdout: 'fsck.badtimezone\n', stderr: '' }, false],
+    ['status-zero-empty', { status: 0, stdout: '', stderr: '' }, false],
+    ['status-one-output', { status: 1, stdout: 'fsck.badtimezone\n', stderr: '' }, false],
+    ['status-one-stderr', { status: 1, stdout: '', stderr: 'read error' }, false],
+    ['unreadable', { status: 128, stdout: '', stderr: '' }, false],
+    ['signal', { status: 1, signal: 'SIGTERM', stdout: '', stderr: '' }, false],
+    ['timeout', { status: 1, error: Object.assign(Error('timeout'), { code: 'ETIMEDOUT' }), stdout: '', stderr: '' }, false],
+    ['oversized', { status: null, error: Object.assign(Error('oversized'), { code: 'ENOBUFS' }), stdout: '', stderr: '' }, false],
+    ['missing-output', { status: 1 }, false],
+  ])('fails closed except for empty no-match config (%s)', (kind, result, clean) => {
+    const calls = [];
+    let isolated;
+    const readConfig = (file, args, options) => {
+      expect(file).toBe('git');
+      expect(args).toEqual(['config', '--includes', '--name-only', '--get-regexp',
+        '^(fetch|transfer|receive)\\.fsck\\.|^fsck\\.']);
+      expect(options).toEqual({ cwd: 'fixture-lane', env: expect.any(Object), encoding: 'utf8',
+        timeout: 30_000, maxBuffer: 1024 * 1024 });
+      isolated = options.env;
+      return result;
+    };
+    const exec = (file, args, options) => {
+      calls.push(args);
+      if (file === 'gh') return JSON.stringify({ headRefOid: head });
+      expect(options.env).toBe(isolated);
+      if (args[0] === 'config') return '';
+      if (args[0] === 'remote') return `git@github.com:${repo}.git`;
+      return args.includes('fetch') ? '' : head;
+    };
+    const run = () => createReviewJobIo({ env: {}, exec, readConfig, log: () => {} })[method]({ repo, pr, lanePath: 'fixture-lane', head });
+    if (clean) expect(run()).toEqual({ head });
+    else expect(run).toThrow(scrubError);
+    expect(calls.some(args => args.includes('fetch'))).toBe(clean);
+    if (!clean) expect(calls).toHaveLength(method === 'prepareLane' ? 1 : 0);
+  });
+
+  it.each(['clean', 'local', 'worktree', 'includeIf'])(
+    'uses the real default readers and refuses unsafe config before fetch (%s)', scope => {
+      const root = mkdtempSync(join(process.env.TMPDIR, 'review-default-config-')); roots.push(root);
+      const lane = join(root, 'lane'), bin = join(root, 'bin'), marker = join(root, 'fetch-ran');
+      mkdirSync(lane); mkdirSync(bin);
+      const realGit = execFileSync('/usr/bin/which', ['git'], { encoding: 'utf8' }).trim();
+      const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null',
+        GIT_CONFIG_NOSYSTEM: '1', REVIEW_REAL_GIT: realGit, REVIEW_FETCH_MARKER: marker };
+      const git = args => execFileSync(realGit, args, { cwd: lane, env: laneGitHardeningEnv(env),
+        encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024 });
+      git(['init', '--quiet']);
+      git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false',
+        'commit', '--quiet', '--allow-empty', '-m', 'fixture']);
+      const pinned = git(['rev-parse', 'HEAD']).trim();
+      writeFileSync(join(lane, '.git', 'FETCH_HEAD'), `${pinned}\n`);
+      git(['remote', 'add', 'origin', `git@github.com:${repo}.git`]);
+      if (scope === 'local') git(['config', '--local', 'fetch.fsck.missingEmail', 'ignore']);
+      if (scope === 'worktree') {
+        git(['config', '--local', 'extensions.worktreeConfig', 'true']);
+        git(['config', '--worktree', 'fetch.fsck.missingEmail', 'ignore']);
+      }
+      if (scope === 'includeIf') {
+        const included = join(root, 'included');
+        git(['config', '--file', included, 'fetch.fsck.missingEmail', 'ignore']);
+        git(['config', '--local', `includeIf.gitdir:${realpathSync(lane)}/.path`, included]);
+      }
+      // Only transport and PR lookup are fixtures; both default config readers execute real Git.
+      writeFileSync(join(bin, 'git'), '#!/bin/sh\nfor arg do\n  if [ "$arg" = fetch ]; then\n    printf fetched > "$REVIEW_FETCH_MARKER"\n    exit 0\n  fi\ndone\nexec "$REVIEW_REAL_GIT" "$@"\n', { mode: 0o755 });
+      writeFileSync(join(bin, 'gh'), `#!/bin/sh\nprintf '%s' '{"headRefOid":"${pinned}"}'\n`, { mode: 0o755 });
+      env.PATH = `${bin}:${process.env.PATH}`;
+      const run = () => createReviewJobIo({ env, log: () => {} })[method]({ repo, pr, lanePath: lane, head: pinned });
+      if (scope === 'clean') expect(run()).toEqual({ head: pinned });
       else expect(run).toThrow(scrubError);
-      expect(calls.some(args => args.includes('fetch'))).toBe(clean);
+      expect(existsSync(marker)).toBe(scope === 'clean');
+      if (scope !== 'clean') expect(git(['config', '--includes', '--get', 'fetch.fsck.missingEmail']).trim()).toBe('ignore');
     });
 });
 
@@ -277,7 +326,7 @@ describe('red-team fetch refusals', () => {
         'fetch-failure': /fetch refused/, 'moved-head': /red-team head changed during fetch/,
         'missing-commit': /unknown commit/, 'wrong-commit': /pinned review commit unavailable/,
       };
-      expect(() => createReviewJobIo({ env: {}, exec, log: () => {} }).fetchRedTeamHead({
+      expect(() => createReviewJobIo({ env: {}, exec, readConfig: () => ({ status: 1, stdout: '', stderr: '' }), log: () => {} }).fetchRedTeamHead({
         lanePath: 'fixture-lane', repo: failure === 'invalid-repo' ? 'invalid' : repo, pr,
         head: failure === 'invalid-head' ? 'invalid' : head,
       })).toThrow(errors[failure]);
@@ -317,7 +366,7 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s canonical repository iden
       if (args[0] === 'rev-parse') return head;
       throw Error('unexpected command');
     };
-    const io = createReviewJobIo({ env: { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'unsafe', GIT_CONFIG_VALUE_0: 'unsafe' }, exec, log: () => {} });
+    const io = createReviewJobIo({ readConfig: () => ({ status: 1, stdout: '', stderr: '' }), env: { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'unsafe', GIT_CONFIG_VALUE_0: 'unsafe' }, exec, log: () => {} });
     const run = (repo = canonical, entry = method) => io[entry]({ repo, pr, lanePath: 'fixture-lane', head });
     return { run, calls, apiCalls, configs };
   }

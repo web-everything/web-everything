@@ -193,7 +193,7 @@ describe('runReviewJob — the arc, no Claude wrapper session', () => {
       }
       throw Error('must not reach transport');
     });
-    const prepareLane = createReviewJobIo({ exec, env: {}, log: () => {} }).prepareLane;
+    const prepareLane = createReviewJobIo({ exec, readConfig: () => ({ status: 1, stdout: '', stderr: '' }), env: {}, log: () => {} }).prepareLane;
     const { io, calls } = fakeIo({ prepareLane });
     const out = runReviewJob({ pr: 229, repo: 'web-everything/web-everything' }, io);
     const label = 'review lane setup failed: review lane config scrub failed; inspect and repair lane configuration before retrying; inspect the PR head and retry';

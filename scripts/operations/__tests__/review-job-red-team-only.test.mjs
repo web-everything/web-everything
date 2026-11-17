@@ -85,7 +85,11 @@ describe('lane Git hardening', () => {
       if (args[0] === 'remote') return `git@github.com:${repo}.git`;
       return args.includes('fetch') ? '' : `${head}\n`;
     };
-    const io = createReviewJobIo({ env, exec });
+    const io = createReviewJobIo({ env, exec, readConfig: (file, args, options) => {
+      calls.push({ file, args, options });
+      expect(options.timeout).toBe(30_000);
+      return { status: 1, stdout: '', stderr: '' };
+    } });
     expect(io[method]({ lanePath: '/lanes/lane-7', repo, pr, head })).toEqual({ head });
     const gitCalls = calls.filter(call => call.file === 'git');
     expect(gitCalls).toHaveLength(6);
@@ -105,7 +109,7 @@ describe('lane Git hardening', () => {
       expect(options.env.GIT_EXTERNAL_DIFF).toBeUndefined();
       expect(options.env.GIT_NO_LAZY_FETCH).toBe('1');
       expect(options.env.REVIEW_FIXTURE_TOKEN).toBe('preserved');
-      expect(options).toMatchObject({ cwd: '/lanes/lane-7', timeout: 180_000, maxBuffer: 1024 * 1024 });
+      expect(options).toMatchObject({ cwd: '/lanes/lane-7', timeout: args.includes('--name-only') ? 30_000 : 180_000, maxBuffer: 1024 * 1024 });
     }
     expect(env).toEqual(original);
   });
@@ -363,7 +367,10 @@ describe('red-team-only review job', () => {
         if (kind === 'missing-commit') throw Error('unknown commit');
         return kind === 'wrong-commit' ? 'b'.repeat(40) : `${head}\n`;
       });
-      const io = fakeIo({ fetchRedTeamHead: createReviewJobIo({ env: {}, exec }).fetchRedTeamHead });
+      const io = fakeIo({ fetchRedTeamHead: createReviewJobIo({ env: {}, exec, readConfig: (file, args) => {
+        calls.push([file, args]);
+        return { status: 1, stdout: '', stderr: '' };
+      } }).fetchRedTeamHead });
       const out = runReviewJob({ repo, pr, redTeamOnly: true }, io);
       expect(calls.slice(0, 4)).toEqual([
         ['git', ['config', '--includes', '--name-only', '--get-regexp', '^(fetch|transfer|receive)\\.fsck\\.|^fsck\\.']],
@@ -1129,7 +1136,10 @@ describe('red-team-only review job', () => {
         if (argv[0] === 'rev-parse') return kind === 'moved-head' ? 'b'.repeat(40) : head;
         throw Error('unexpected command');
       });
-      const prepareLane = createReviewJobIo({ env: {}, exec }).prepareLane;
+      const prepareLane = createReviewJobIo({ env: {}, exec, readConfig: (file, args) => {
+        calls.push([file, args]);
+        return { status: 1, stdout: '', stderr: '' };
+      } }).prepareLane;
       const io = fakeIo({ prepareLane, runRedTeam: vi.fn(() => {
         calls.push(['red-team']);
         return { status: 'ran' };

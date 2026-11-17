@@ -310,7 +310,7 @@ export function execReadRaw(file, args, options = {}) {
 }
 
 /** Fetch only the explicit PR transport under scrubbed, isolated lane Git configuration. */
-function fetchPinnedPrHead({ lanePath, repo, pr, env, exec, log, repoIds }) {
+function fetchPinnedPrHead({ lanePath, repo, pr, env, exec, readConfig, log, repoIds }) {
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo ?? '')) throw Error('invalid review repository; inspect repo argument before retrying');
   const options = { cwd: lanePath, env, timeout: 180_000, maxBuffer: 1024 * 1024 };
   const configDir = mkdtempSync(join(tmpdir(), 'review-git-config-'));
@@ -322,17 +322,12 @@ function fetchPinnedPrHead({ lanePath, repo, pr, env, exec, log, repoIds }) {
       GIT_CONFIG_GLOBAL: emptyConfig, GIT_CONFIG_SYSTEM: emptyConfig, GIT_CONFIG_NOSYSTEM: '1' }) };
     // Object checking pins do not override per-message severities or skip lists.
     // Check before scrubbing can remove include directives and hide prohibited settings.
-    let fsckConfig;
-    try {
-      fsckConfig = exec('git', ['config', '--includes', '--name-only', '--get-regexp',
-        '^(fetch|transfer|receive)\\.fsck\\.|^fsck\\.'], gitOptions);
-    } catch (error) {
-      if (error.status !== 1 || String(error.stdout ?? '') !== '' || String(error.stderr ?? '') !== '') {
-        throw Error('review lane config scrub failed; inspect and repair lane configuration before retrying');
-      }
-      fsckConfig = '';
-    }
-    if (fsckConfig.trim()) {
+    const fsckConfig = readConfig('git', ['config', '--includes', '--name-only', '--get-regexp',
+      '^(fetch|transfer|receive)\\.fsck\\.|^fsck\\.'], {
+      cwd: lanePath, env: gitOptions.env, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
+    });
+    if (fsckConfig.error || fsckConfig.signal || fsckConfig.status !== 1
+      || fsckConfig.stdout !== '' || fsckConfig.stderr !== '') {
       throw Error('review lane config scrub failed; inspect and repair lane configuration before retrying');
     }
     const { kept } = scrubRiskyLaneConfig(lanePath, { log, run: (args, opts) => exec('git', args,
@@ -372,7 +367,7 @@ function fetchPinnedPrHead({ lanePath, repo, pr, env, exec, log, repoIds }) {
 }
 
 /** The real effects, each one command. `root` is the checkout the arc runs from (the daemon's clone). */
-export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync, exec = execReadRaw, readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readEvidence = readDrainRedTeamEvidence,
+export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync, exec = execReadRaw, readConfig = spawnSync, readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readEvidence = readDrainRedTeamEvidence,
   readSeatRecords = () => createRedTeamIo({ root, env }).readRecords({ strict: true }),
   readWitness = key => readRecoveryWitness({ ...key, env, readScorecards: readSeatRecords }), recoveryProbe = defaultRecoveryProbe(),
   queueBaseline = () => resolveLiveQueueBaseline({ checkoutRoot: root, env }),
@@ -504,7 +499,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     root,
     fetchRedTeamHead: ({ lanePath, repo, pr, head }) => {
       if (!/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('missing pinned red-team head');
-      const fetched = fetchPinnedPrHead({ lanePath, repo, pr, env, exec, log, repoIds });
+      const fetched = fetchPinnedPrHead({ lanePath, repo, pr, env, exec, readConfig, log, repoIds });
       if (fetched !== head) throw Error('red-team head changed during fetch');
       return { head };
     },
@@ -513,7 +508,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       const options = { cwd: lanePath, env, timeout: 180_000, maxBuffer: 1024 * 1024 };
       const { headRefOid: head } = JSON.parse(exec('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], options));
       if (!/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('review head missing; inspect PR evidence before retrying');
-      const fetched = fetchPinnedPrHead({ lanePath, repo, pr, env, exec, log, repoIds });
+      const fetched = fetchPinnedPrHead({ lanePath, repo, pr, env, exec, readConfig, log, repoIds });
       if (fetched !== head) throw Error('review head changed during fetch; retry shared setup on the live head');
       return { head };
     },
