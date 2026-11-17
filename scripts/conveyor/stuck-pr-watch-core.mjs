@@ -48,7 +48,7 @@ import { REVIEW_LABELS, hasReviewLabel, READY_TO_MERGE_LABEL } from '../lib/revi
 import { countStandDownComments } from './stand-down.mjs';
 import { isLegacyLoadFlakeHoldSuperseded } from './load-flake-hold.mjs';
 import { assessLiveness, bindAgents } from './reconcile-core.mjs';
-import { readSettings } from '../lib/settings-files.mjs';
+import { readDeclaredSettings } from '../lib/settings-files.mjs';
 // The dispatch-marker builder/reader lives in its OWN lightweight file — see that file's own header for why:
 // `we:scripts/operations/operator-queue.mjs` needs it too, and must NOT pull in this file's much heavier
 // `reconcile-core.mjs` import (a real module-load crash, confirmed live, under that file's own mocked
@@ -101,10 +101,29 @@ export const STUCK_THRESHOLD_ENV = Object.freeze({
  * @param {{readSettings?:Function, log?:Function}} [options] - lazy settings reader and warning sink.
  * @returns {Record<string, number>}
  */
-export function stuckThresholdMinutes(env = process.env, { readSettings: read = readSettings, log = console.warn } = {}) {
+export function stuckThresholdMinutes(env = process.env, { readSettings: read = readDeclaredSettings, log = console.warn } = {}) {
   let configured;
   try {
-    configured = read()?.stuckPrWatch?.thresholdMinutes;
+    const result = read();
+    const settings = result && Object.hasOwn(result, 'settings') ? result.settings : result;
+    for (const { source, error } of result?.errors ?? []) {
+      if (source === 'settings/stuck-pr-watch.json') {
+        log(`[stuck-pr-watch:settings-file-invalid] ${source}: ${error}`);
+      }
+    }
+    const isPlainObject = value => value !== null && typeof value === 'object'
+      && [Object.prototype, null].includes(Object.getPrototypeOf(value));
+    if (settings && Object.hasOwn(settings, 'stuckPrWatch')) {
+      if (!isPlainObject(settings.stuckPrWatch)) {
+        log('[stuck-pr-watch:invalid-threshold] stuckPrWatch must be a plain object; using built-in threshold defaults');
+      } else if (Object.hasOwn(settings.stuckPrWatch, 'thresholdMinutes')) {
+        if (!isPlainObject(settings.stuckPrWatch.thresholdMinutes)) {
+          log('[stuck-pr-watch:invalid-threshold] stuckPrWatch.thresholdMinutes must be a plain object; using built-in threshold defaults');
+        } else {
+          configured = settings.stuckPrWatch.thresholdMinutes;
+        }
+      }
+    }
   } catch {
     log('[stuck-pr-watch:settings-read-failed] using built-in threshold defaults');
   }
