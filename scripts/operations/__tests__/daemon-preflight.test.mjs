@@ -327,13 +327,17 @@ describe('preflight CLI IO hooks', () => {
   it.each(['missing', 'present'])('main reads %s identity without provisioning or changing files', async (state) => {
     const root = mkdtempSync(join(tmpdir(), 'preflight-identity-'));
     try {
+      const env = { ...ENV, HOME: root };
       const id = state === 'present' ? getThisHost({ home: root }) : ME;
-      const adapter = cliIO({ HOME: root }, { source: { readOwner: () => ({ host: id, version: VERSION }) } });
+      const adapter = cliIO(env, { source: { readOwner: () => ({ host: id, version: VERSION }) } });
       const before = readdirSync(root);
       const { io } = fixture({ resolveRole: adapter.resolveRole });
       const lines = [];
-      expect(await main({ env: { HOME: root }, io, log: (line) => lines.push(line) })).toBe(state === 'present' ? 0 : 1);
+      expect(await main({ env, io, log: (line) => lines.push(line) })).toBe(state === 'present' ? 0 : 1);
       expect(lines[0]).toContain(state === 'present' ? 'role=active' : 'role=standby reason=invalid-input');
+      expect(lines[0].split('\n').filter((line) => line.startsWith('FAIL'))).toEqual(
+        state === 'present' ? [] : ['FAIL role role=standby reason=invalid-input'],
+      );
       expect(readdirSync(root)).toEqual(before);
       if (state === 'present') {
         expect(readdirSync(join(root, '.claude'))).toEqual(['host-id']);
