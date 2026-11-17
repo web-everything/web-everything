@@ -2145,7 +2145,7 @@ function readTimeoutEvidenceOnce(pr, { repo, exec = execFileSyncThrottled, ts, r
       // was refused forever. Classify first; never read a log that cannot exist.
       const cancelledShard = /^(?:test|soak)-shard(?:\s|$)/.test(job.name ?? '') && String(job.conclusion).toLowerCase() === 'cancelled';
       const timeoutKind = isHungJob(job) ? 'job-timeout' : isInfraStepTimeoutJob(job) ? 'step-timeout' : undefined;
-      const infra = cancelledShard || isInfraCancelledJob(job);
+      const infra = cancelledShard || isInfraCancelledJob(job) || timeoutKind;
       return { repo, head, run: run.id, job: job.id, name: job.name, attempt: job.run_attempt, workflow: run.path,
         aggregateGate: isAggregateGateFailure(job), status: job.status, conclusion: job.conclusion, logJob: job.id, logAttempt: job.run_attempt,
         url: job.html_url, infra, cancelledShard, timeoutKind, log: infra ? '' : readLog(job) };

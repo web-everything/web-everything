@@ -5,19 +5,20 @@ import {
   isInfraCancelledJob, isInfraStepTimeoutJob, isAggregateGateFailure, classifyInfraCancelled, isInfraCancelledOnlyRun, resolveInfraCancelledMode,
   authoritativeCheckRuns, isHungJob, DEFAULT_INFRA_CANCELLED_MODE, DEFAULT_INFRA_CANCELLED_MAX_RERUNS,
 } from '../infra-cancelled.mjs';
-import { computeMainRedWindows } from '../main-red-recovery.mjs';
+import { computeMainRedWindows, currentMainGreen } from '../main-red-recovery.mjs';
 import { enrichPrsWithTimeoutEvidence, readTimeoutEvidence, defaultReadMainRuns } from '../reconcile-pass.mjs';
 
 const cancelledJob = { name: 'daemon-soak', status: 'completed', conclusion: 'cancelled', runner_name: '', steps: [] };
 const realFail = { name: 'test-shard (1)', status: 'completed', conclusion: 'failure', runner_name: 'GitHub Actions 1', steps: [{}] };
 
-describe('hung job (ran to its own timeout) is infra with a bounded retry', () => {
+describe('hung job (ran to its own timeout) is NOT an infra cancellation', () => {
   const ran = (mins, extra = {}) => ({ name: 'soak-shard (1)', status: 'completed', conclusion: 'cancelled', runner_name: 'GitHub Actions 7',
     started_at: '2026-10-07T20:32:52Z', completed_at: new Date(Date.parse('2026-10-07T20:32:52Z') + mins * 60_000).toISOString(),
     steps: [{ name: 'Soak shard 1/4', conclusion: 'cancelled' }], ...extra });
-  it('a cancelled job that held a runner for 15 min is hung and classified before logs', () => {
-    expect(isInfraCancelledJob(ran(15))).toBe(true);
+  it('a cancelled job that held a runner for 15 min is hung, not infra-only', () => {
+    expect(isInfraCancelledJob(ran(15))).toBe(false);
     expect(isHungJob(ran(15))).toBe(true);
+    expect(isInfraCancelledOnlyRun([ran(15)])).toBe(false);
   });
   it('a short cancel, a no-runner cancel and a disabled knob stay infra', () => {
     expect(isInfraCancelledJob(ran(2))).toBe(true);
@@ -36,10 +37,17 @@ const infraStepJob = (name = 'Fetch main history (blobless)', duration = 180_000
 });
 
 describe('infrastructure step timeout', () => {
-  it.each(['Checkout', 'Run actions/checkout@v4', 'Fetch main history (blobless)', 'Setup Node', 'Install dependencies',
-    'Cache dependencies', 'Download artifact', 'Upload artifacts'])('recognizes a three-minute %s failure', name => {
+  it.each(['Checkout', 'Run actions/checkout@v4', 'Check out repository', 'Fetch main history (blobless)',
+    'Download artifact', 'Upload artifacts', 'actions/download-artifact@v4', 'actions/upload-artifact@v4',
+    'Run actions/cache/restore@v4', 'actions/cache restore'])('recognizes a three-minute %s failure for PR retry only', name => {
     expect(isInfraStepTimeoutJob(infraStepJob(name))).toBe(true);
-    expect(isInfraCancelledJob(infraStepJob(name))).toBe(true);
+    expect(isInfraCancelledJob(infraStepJob(name))).toBe(false);
+  });
+  it.each(['Install + build FUI tools', 'Install dependencies', 'Setup Node', 'Set up Node', 'Build tools',
+    'Cache dependencies', 'Run actions/setup-node@v4', 'actions/cache@v4', 'Fetch'])('%s five-minute failure stays real', name => {
+    const job = infraStepJob(name, 5 * 60_000);
+    expect(isInfraStepTimeoutJob(job)).toBe(false);
+    expect(isInfraCancelledJob(job)).toBe(false);
   });
   it('fast checkout failure remains real', () => {
     expect(isInfraStepTimeoutJob(infraStepJob('Checkout', 179_999))).toBe(false);
@@ -136,6 +144,24 @@ describe('infra-cancelled classifier', () => {
 });
 
 describe('main-red judgement', () => {
+  it('a hung-test main run stays red after an earlier green run', () => {
+    const at = '2026-11-17T10:15:00Z';
+    const list = JSON.stringify([
+      { databaseId: 7, conclusion: 'failure', status: 'completed', workflowName: 'CI', updatedAt: at },
+      { databaseId: 6, conclusion: 'success', status: 'completed', workflowName: 'CI', updatedAt: '2026-11-17T09:00:00Z' },
+    ]);
+    const jobs = JSON.stringify({ total_count: 2, jobs: [
+      { name: 'test-shard (1)', status: 'completed', conclusion: 'cancelled', runner_name: 'runner',
+        started_at: '2026-11-17T10:00:00Z', completed_at: at,
+        steps: [{ name: 'Run tests', conclusion: 'cancelled' }] },
+      { name: 'test', status: 'completed', conclusion: 'failure', runner_name: 'runner',
+        steps: [{ name: 'Gate on shard results', conclusion: 'failure' }] },
+    ] });
+    const runs = defaultReadMainRuns({ repo: 'o/r', exec: (_c, argv) => (argv[0] === 'api' ? jobs : list) });
+    expect(runs[0].infraCancelledOnly).toBeUndefined();
+    expect(currentMainGreen(runs)).toEqual({ red: true, sha: null, at: null });
+    expect(computeMainRedWindows(runs)).toEqual([{ start: at, end: null }]);
+  });
   it('an outage-cancelled main run neither opens nor extends a red window', () => {
     const runs = [
       { status: 'completed', conclusion: 'success', updatedAt: '2026-10-05T19:14:00Z' },
@@ -226,6 +252,11 @@ describe('infra-cancelled evidence + planning', () => {
     };
   };
   const step = (name, conclusion) => ({ name, status: 'completed', conclusion });
+
+  it('reconcile evidence keeps a five-minute Install + build FUI tools failure real', () => {
+    const e = readTimeoutEvidence(pr, { repo, exec: withTestJob(infraStepJob('Install + build FUI tools', 5 * 60_000).steps) });
+    expect(e).toEqual({ eligible: false, reason: 'mixed-infra-cancelled-and-real-failure' });
+  });
 
   it('a real failure in a job merely named `test` beside a cancelled job is NOT classed infra-only (no free mechanical re-runs)', () => {
     const e = readTimeoutEvidence(pr, { repo, exec: withTestJob([step('Gate on shard results', 'success'), step('Run check:standards', 'failure')]) });

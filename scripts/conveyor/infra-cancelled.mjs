@@ -40,8 +40,8 @@ export function isHungJob(job, { hungMinutes = resolveHungJobMinutes() } = {}) {
   return Number.isFinite(start) && Number.isFinite(end) && end - start >= hungMinutes * 60_000;
 }
 
-// Only pre-test infrastructure steps qualify; durations alone never excuse a test failure.
-const INFRA_STEP_NAME = /^(?:(?:run\s+)?actions\/(?:checkout|setup-[\w-]+|cache|(?:download|upload)-artifact)(?:@|\s|$)|checkout\b|check out\b|fetch\b|setup\b|set up\b|install\b|cache\b|(?:download|upload)[\s-]+artifacts?\b)/i;
+// Only network infrastructure steps qualify; durations alone never excuse a build or test failure.
+const INFRA_STEP_NAME = /^(?:(?:run\s+)?actions\/(?:checkout|(?:download|upload)-artifact|cache(?:\/restore| restore))(?:@|\s|$)|checkout\b|check out\b|fetch |(?:download|upload)[\s-]+artifacts?\b)/i;
 
 /** A terminal infrastructure step timed out before any later step ran. Missing evidence stays real. */
 export function isInfraStepTimeoutJob(job) {
@@ -68,7 +68,8 @@ const INFRA_CONCLUSIONS = Object.freeze(['cancelled', 'startup_failure']);
  */
 export function isInfraCancelledJob(job, opts) {
   if (!job || String(job.status ?? 'completed').toLowerCase() !== 'completed') return false;
-  if (isHungJob(job, opts) || isInfraStepTimeoutJob(job)) return true;
+  // A job that ran to its own timeout is a hang (a real failure with a log), not infra: it goes to ci-heal.
+  if (isHungJob(job, opts)) return false;
   const conclusion = String(job.conclusion ?? '').toLowerCase();
   if (INFRA_CONCLUSIONS.includes(conclusion)) return true;
   if (['success', 'skipped', 'neutral'].includes(conclusion)) return false;
