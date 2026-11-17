@@ -1,0 +1,45 @@
+{
+  "note": "Modelled on live #6911 evidence from the R115 brief; synthetic SHA and branch, no invented live snapshot.",
+  "mainSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "pr": {
+    "number": 6911,
+    "state": "OPEN",
+    "isDraft": false,
+    "baseRefName": "main",
+    "headRefName": "lane/r115-replay",
+    "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "mergeable": "CONFLICTING",
+    "mergeStateStatus": "DIRTY",
+    "labels": [
+      {
+        "name": "ready-to-merge"
+      },
+      {
+        "name": "review:accepted"
+      },
+      {
+        "name": "red-team:clear"
+      },
+      {
+        "name": "status:ready-to-merge"
+      },
+      {
+        "name": "merge-status:conflicting"
+      }
+    ],
+    "statusCheckRollup": [],
+    "files": [
+      {
+        "path": "scripts/example.mjs"
+      }
+    ],
+    "comments": [
+      {
+        "author": {
+          "login": "web-everything"
+        },
+        "body": "\ud83d\udea6 conveyor missing-run-recovery\n\nbranch: lane/r115-replay\nsha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nconveyor missing-run-recovery attempted to trigger CI; no required-check run observed."
+      }
+    ]
+  }
+}

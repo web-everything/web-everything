@@ -7,14 +7,14 @@
  *   stacked-base round and an ordinary main-base conflict-fix round bind on the exact same durable
  *   `CONFLICT_FIX_ROUND_CAP` floor, and states plainly that it touches no `review:*` label.
  */
-import { mkdtempSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { execFileSync, spawnSync } from 'node:child_process';
-import { planAcceptedConflictRebase, MAX_REBASE_DIFF_BYTES } from '../accepted-conflict-rebase.mjs';
-import { describe, it, expect, vi } from 'vitest';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { describe, it, expect } from 'vitest';
 import { countConflictFixComments, CONFLICT_FIX_COMMENT_MARKER as ROUND_COUNT_MARKER } from '../conflict-fix-round-count.mjs';
-import { buildConflictFixMarkComment, runConflictFixMark, CONFLICT_FIX_COMMENT_MARKER } from '../conflict-fix-mark.mjs';
+import { buildConflictFixMarkComment, CONFLICT_FIX_COMMENT_MARKER } from '../conflict-fix-mark.mjs';
 
 describe('conflict-fix-mark.mjs#CONFLICT_FIX_COMMENT_MARKER — single-sourced, never a fourth marker (#3383)', () => {
   it('is the IDENTICAL marker conflict-fix-round-count.mjs exports — never redeclared', () => {
@@ -54,178 +54,32 @@ describe('buildConflictFixMarkComment — the durable STACKED-BASE conflict-fix 
   });
 });
 
-
-describe('conflict-rebase keep-review hand-back enforcement', () => {
-  const oldHead = 'a'.repeat(40), newHead = 'b'.repeat(40), oldBase = 'c'.repeat(40), newBase = 'd'.repeat(40);
-  const patch = 'diff --git a/a b/a\nindex 111..222 100644\n--- a/a\n+++ b/a\n@@ -1,3 +1,3 @@\n before\n-old\n+new\n after\n';
-  const args = ['6911', '--repo=web-everything/web-everything', '--mode=conflict-rebase',
-    `--old-head=${oldHead}`, `--old-base=${oldBase}`];
-  const fixture = (after = patch) => {
-    const pushed = { headRefOid: newHead, baseRefOid: newBase, baseRefName: 'main',
-      labels: [{ name: 'review:accepted' }], reviews: [],
-      comments: [{ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${oldHead} -->` }] };
-    const gh = vi.fn(argv => argv[1] === 'view' ? JSON.stringify(pushed) : '');
-    const git = vi.fn(argv => argv[0] === 'merge-base' ? oldBase : argv.at(-2) === oldHead ? patch : after);
-    return { pushed, gh, git };
-  };
-  describe.each(['before proof', 'during proof'])('100-comment acceptance %s', phase => {
-    it.each(['unreadable', 'count mismatch', 'later hold', 'complete'])('handles %s evidence without trusting the capped view', evidence => {
-      const io = fixture();
-      const initial = JSON.stringify(io.pushed);
-      io.pushed.comments = Array.from({ length: 100 }, (_, i) => ({
-        id: `IC_${i}`, author: { login: 'web-everything' },
-        body: i === 0 ? io.pushed.comments[0].body : 'discussion',
-      }));
-      const later = evidence === 'later hold' ? [{ id: 'IC_100', author: { login: 'chalbert' },
-        body: 'Changes requested: fix the remaining bug.' }] : [];
-      io.gh.mockImplementation(argv => {
-        if (argv[1] === 'view') return JSON.stringify(io.pushed);
-        if (argv[0] !== 'api') return '';
-        if (evidence === 'unreadable') throw new Error('thread unavailable');
-        if (argv[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequest: {
-          comments: { totalCount: evidence === 'count mismatch' ? 101 : 100 + later.length },
-        } } } });
-        return JSON.stringify(argv[1].endsWith('page=1') ? io.pushed.comments : later);
-      });
-      if (phase === 'during proof') io.gh.mockReturnValueOnce(initial);
-      if (evidence === 'complete') expect(runConflictFixMark(args, io)).toMatchObject({ ok: true });
-      else expect(() => runConflictFixMark(args, io)).toThrow('rearm-review.mjs --round=conflict');
-      expect(io.gh.mock.calls.filter(([argv]) => argv[1] === 'comment')).toHaveLength(evidence === 'complete' ? 1 : 0);
-      expect(io.gh.mock.calls.some(([argv]) => argv[0] === 'api')).toBe(true);
-    });
-  });
+describe('conflict-fix-mark CLI — retired accepted conflict hand-backs fail closed', () => {
+  const script = resolve(dirname(fileURLToPath(import.meta.url)), '../conflict-fix-mark.mjs');
   it.each([
-    ['unchanged head', io => { io.pushed.headRefOid = oldHead; }],
-    ['different reviewed head', io => { io.pushed.comments[0].body = `<!-- reviewed-sha: ${newHead} -->`; }],
-    ['missing reviewed head', io => { io.pushed.comments = []; }],
-    ['untrusted reviewed head', io => { io.pushed.comments[0].author.login = 'untrusted'; }],
-    ['unreachable original history', io => { io.git.mockImplementation(() => { throw new Error('no merge base'); }); }],
-    ['caller target narrows the original patch', io => {
-      io.git.mockImplementation(argv => argv[0] === 'merge-base' ? (argv[2] === oldBase ? newBase : oldBase) : patch);
-    }],
-  ])('refuses %s without posting and names the review fallback', (_name, change) => {
-    const io = fixture();
-    change(io);
-    expect(() => runConflictFixMark(args, io)).toThrow('rearm-review.mjs --round=conflict');
-    expect(io.gh.mock.calls.some(([argv]) => argv[1] === 'comment')).toBe(false);
-  });
-  describe.each(['before proof', 'during proof'])('clean acceptance %s', phase => {
-    it.each([
-      ['standing formal changes request', pr => { pr.reviews.push({ author: { login: 'chalbert' },
-        state: 'CHANGES_REQUESTED', commit: { oid: oldHead }, submittedAt: '2026-10-09T09:00:00Z' }); }],
-      ['unreadable formal reviews', pr => { delete pr.reviews; }],
-      ['malformed formal reviews', pr => { pr.reviews = {}; }],
-      ['superseding verdict', pr => { pr.comments.push({ author: { login: 'chalbert' }, body: 'Changes requested: fix the remaining bug.' }); }],
-      ['later body-derived hold', pr => { pr.comments.push({ author: { login: 'web-everything' },
-        body: '<!-- drain-skip-reason --> manifest baseline mismatch — post-review tamper suspected' }); }],
-      ['missing acceptance label', pr => { pr.labels = []; }],
-      ['changes label', pr => { pr.labels.push({ name: 'review:changes' }); }],
-      ['human label', pr => { pr.labels.push({ name: 'review:human' }); }],
-      ['pending label', pr => { pr.labels.push({ name: 'review:pending' }); }],
-      ['unreadable labels', pr => { delete pr.labels; }],
-      ['malformed labels', pr => { pr.labels.push({}); }],
-    ])('refuses %s without posting and names the review fallback', (_name, change) => {
-      const io = fixture();
-      const initial = JSON.stringify(io.pushed);
-      change(io.pushed);
-      if (phase === 'during proof') io.gh.mockReturnValueOnce(initial);
-      expect(() => runConflictFixMark(args, io)).toThrow('rearm-review.mjs --round=conflict');
-      expect(io.gh.mock.calls.some(([argv]) => argv[1] === 'comment')).toBe(false);
-      expect(io.gh.mock.calls[0][0]).toContain('headRefOid,baseRefOid,baseRefName,comments,labels,reviews');
-      if (phase === 'before proof') expect(io.git).not.toHaveBeenCalled();
-      else expect(io.gh).toHaveBeenCalledTimes(2);
-    });
-  });
-  it.each([
-    ['semantic change', patch.replace('+new', '+changed')],
-    ['unreadable patch', ''],
-    ['oversized patch', patch + 'x'.repeat(MAX_REBASE_DIFF_BYTES)],
-  ])('refuses %s without posting a keep-review marker and names the review fallback', (_name, after) => {
-    const io = fixture(after);
-    expect(() => runConflictFixMark(args, io)).toThrow('rearm-review.mjs --round=conflict');
-    expect(io.gh.mock.calls.some(([argv]) => argv[1] === 'comment')).toBe(false);
-  });
-  it('refuses missing original pins and unreadable pushed-head evidence without posting', () => {
-    for (const bad of [args.filter(a => !a.startsWith('--old-base=')), args]) {
-      const io = fixture();
-      if (bad === args) io.gh.mockImplementation(() => { throw new Error('unreadable'); });
-      expect(() => runConflictFixMark(bad, io)).toThrow('rearm-review.mjs --round=conflict');
-      expect(io.gh.mock.calls.some(([argv]) => argv[1] === 'comment')).toBe(false);
-    }
-  });
-  it('exits non-zero with no evidence and directs the operator to rearm review', () => {
-    const result = spawnSync(process.execPath, ['scripts/conveyor/conflict-fix-mark.mjs',
-      '6911', '--mode=conflict-rebase'], { encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024 });
-    expect(result.status).toBe(1);
-    expect(result.stderr).toContain('rearm-review.mjs --round=conflict');
-    expect(result.stdout).not.toContain('"commented":true');
-  });
-  it('refuses legacy actor receipts that bypass the enforced conflict-rebase mode', () => {
-    const io = fixture();
-    expect(() => runConflictFixMark(['6911', `--actor=accepted-conflict-rebase:${oldHead}@${newBase}`], io))
-      .toThrow('--mode=conflict-rebase');
-    expect(io.gh).not.toHaveBeenCalled();
-  });
-  it('proves the live pushed head, posts its receipt, and deduplicates only that head', () => {
-    const io = fixture(patch.replace('111..222', '333..444'));
-    expect(runConflictFixMark(args, io)).toMatchObject({ ok: true, head: newHead });
-    expect(io.git).toHaveBeenCalledWith(['merge-base', newHead, newBase]);
-    const posts = io.gh.mock.calls.filter(([argv]) => argv[1] === 'comment');
-    expect(posts).toHaveLength(1);
-    const body = posts[0][0][posts[0][0].indexOf('--body') + 1];
-    expect(body).toContain(`accepted-conflict-rebase:${newHead}@${newBase}`);
-    expect(body).not.toContain(`accepted-conflict-rebase:${oldHead}@`);
-    const plan = headRefOid => planAcceptedConflictRebase({ pr: {
-      headRefOid, baseRefName: 'main', mergeable: 'CONFLICTING', labels: ['review:accepted'],
-      comments: [{ body, author: { login: 'web-everything' } }],
-    }, mainSha: newBase, cap: 3, ceiling: 9 });
-    expect(plan(newHead)).toMatchObject({ kind: 'refuse', why: expect.stringContaining('already completed for this head') });
-    expect(plan(oldHead).kind).toBe('fix');
-  });
-
-  it('accepts a genuine rebase using reachable commits without reflogs, and refuses a detached old history', () => {
-    const cwd = mkdtempSync(join(tmpdir(), 'conflict-mark-history-'));
-    const git = (argv, input) => execFileSync('git', argv, { cwd, input, encoding: 'utf8', timeout: 10000,
-      env: { ...process.env, GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.test',
-        GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 'test@example.test' } }).trimEnd();
+    ['retired conflict-rebase mode', ['--mode=conflict-rebase']],
+    ['accepted-conflict-rebase actor receipt', [`--actor=accepted-conflict-rebase:${'a'.repeat(40)}@${'b'.repeat(40)}`]],
+    ['duplicate mode cannot hide a retired invocation', ['--mode=conflict-rebase', '--mode=stacked-rebase']],
+    ['duplicate actor cannot hide a retired receipt', ['--actor=accepted-conflict-rebase:old-receipt', '--actor=fixer']],
+  ])('rejects %s with nonzero exit, a rearm-review fallback and no comment', (_name, args) => {
+    const dir = mkdtempSync(join(tmpdir(), 'conflict-mark-retired-cli-'));
     try {
-      git(['init', '--bare', '--quiet']);
-      const tree = text => {
-        const blob = git(['hash-object', '-w', '--stdin'], text);
-        return git(['mktree'], `100644 blob ${blob}\tfile.txt\n`);
-      };
-      const commit = (t, parent, message) => git(['commit-tree', t, ...(parent ? ['-p', parent] : [])], message);
-      const baseTree = tree('before\nold\nafter\n');
-      const changedTree = tree('before\nnew\nafter\n');
-      const base = commit(baseTree, null, 'base');
-      const reviewed = commit(changedTree, base, 'reviewed');
-      const target = commit(baseTree, base, 'advanced target');
-      const rebased = commit(changedTree, target, 'rebased');
-      const pushed = { headRefOid: rebased, baseRefOid: target, baseRefName: 'main', labels: ['review:accepted'], reviews: [], comments: [
-        { author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${reviewed} -->` },
-      ] };
-      const gh = vi.fn(argv => argv[1] === 'view' ? JSON.stringify(pushed) : '');
-      const flags = sha => ['6911', '--mode=conflict-rebase', `--old-head=${sha}`, `--old-base=${base}`];
-      expect(runConflictFixMark(flags(reviewed), { gh, git: argv => git(argv) + '\n' })).toMatchObject({ ok: true, head: rebased });
-      gh.mockClear();
-      const unrelated = commit(changedTree, null, 'unrelated reviewed history');
-      pushed.comments[0].body = `<!-- reviewed-sha: ${unrelated} -->`;
-      expect(() => runConflictFixMark(flags(unrelated), { gh, git: argv => git(argv) + '\n' })).toThrow('rearm-review.mjs --round=conflict');
-      expect(gh.mock.calls.some(([argv]) => argv[1] === 'comment')).toBe(false);
-    } finally { rmSync(cwd, { recursive: true, force: true }); }
-  });
-  it('refuses a reviewed head changed during proof without posting', () => {
-    const io = fixture();
-    io.gh.mockReturnValueOnce(JSON.stringify(io.pushed))
-      .mockReturnValueOnce(JSON.stringify({ ...io.pushed, comments: [] }));
-    expect(() => runConflictFixMark(args, io)).toThrow('rearm-review.mjs --round=conflict');
-    expect(io.gh.mock.calls.some(([argv]) => argv[1] === 'comment')).toBe(false);
-  });
-  it('refuses a head changed during proof without posting', () => {
-    const io = fixture();
-    io.gh.mockReturnValueOnce(JSON.stringify(io.pushed))
-      .mockReturnValueOnce(JSON.stringify({ ...io.pushed, headRefOid: oldHead }));
-    expect(() => runConflictFixMark(args, io)).toThrow('rearm-review.mjs --round=conflict');
-    expect(io.gh).toHaveBeenCalledTimes(2);
+      const log = join(dir, 'gh-calls');
+      // Any attempted write reaches this recording fake, never the real GitHub CLI.
+      writeFileSync(join(dir, 'gh'), '#!/usr/bin/env node\n'
+        + "require('node:fs').appendFileSync(process.env.FAKE_GH_LOG, JSON.stringify(process.argv.slice(2)) + '\\n');\n",
+      { mode: 0o755 });
+      const result = spawnSync(process.execPath, [script, '6911', '--repo=o/n', ...args], {
+        env: { ...process.env, PATH: `${dir}${process.platform === 'win32' ? ';' : ':'}${process.env.PATH}`, FAKE_GH_LOG: log },
+        encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('run rearm-review.mjs --round=conflict');
+      expect(result.stdout).not.toContain('"commented":true');
+      expect(existsSync(log)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

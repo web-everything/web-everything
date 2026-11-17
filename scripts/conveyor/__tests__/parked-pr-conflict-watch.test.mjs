@@ -2532,9 +2532,9 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
   describe('#xngv3vn — the queued-conflict grace is skipped entirely for a REAL (non-manifest) conflict', () => {
     it('a REAL conflict (computeConflictDisposition → "real") is bounced IMMEDIATELY, even with age 0 / just labelled', () => {
       const provider = fakeProvider(); const routed = [];
-      const listPrs = () => [{ number: 2596, mergeable: 'CONFLICTING', labels: L('review:accepted', 'ready-to-merge', CONFLICT_LABEL) }];
+      const listPrs = () => [{ number: 2596, baseRefName: 'main', mergeable: 'CONFLICTING', labels: L('review:accepted', 'ready-to-merge', CONFLICT_LABEL) }];
       const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
-        repo: 'o/n', listPrs, provider,
+        repo: 'o/n', listPrs, provider, readFixClaim: () => null,
         postFinding: (o) => routed.push(o.pr.number), postStandDown: () => routed.push('sd'),
         computeConflictDisposition: () => 'real',
         labelAgeMs: () => { throw new Error('must not be called — a real conflict never waits on age'); },

@@ -366,27 +366,18 @@ node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo=
 > changes only what a *successful* resolution hands back with, never the escalation path.
 
 > **ACCEPTED-CONFLICT-REBASE MODE — dispatched with `mode: conflict-rebase`.** This accepted or
-> ready-to-merge PR conflicts with the default branch. Keep the fix claim for the entire repair. Pin
-> the original head and its old target, and the current default-branch target SHA before rebasing.
-> Rebase onto that pinned current target, resolve the conflict, and run the affected gates. Record
-> the conflicting and resolved hunks. Before pushing, run:
+> ready-to-merge PR conflicts with main. Keep the fix claim for the entire repair. Rebase onto
+> current `origin/main`, resolve, run the gate green, and push. Record the conflicting and resolved
+> hunks. ALWAYS hand back through `rearm-review.mjs --round=conflict` to `review:pending`:
 >
 > ```bash
-> node "{{WE_ROOT}}/scripts/conveyor/rebase-triviality.mjs" <oldHead> <newHead> <oldTarget> <newTarget>
+> node "{{WE_ROOT}}/scripts/conveyor/rearm-review.mjs" {{PR_NUM}} --repo={{REPO}} --round=conflict --only-if=accepted --actor=accepted-conflict-rebase:<newHead>@<newTarget> --main-ref=main
 > ```
 >
-> Only exit 0 (`trivial: true`) permits preserving every `review:*` label. The proof compares this
-> PR's own per-file patch against each head's merge-base, normalising hunk coordinates. In that case
-> push and use `conflict-fix-mark.mjs {{PR_NUM}} --repo={{REPO}} --mode=conflict-rebase
-> --old-head=<oldHead> --old-base=<oldTarget> --base-ref=<defaultBranch>`. The hand-back
-> itself proves triviality against the live pushed head and base, refuses unknown evidence, and
-> generates a receipt bound to that new head (never pass the old-head dispatch receipt).
-> If the patches differ, or evidence is missing, binary, oversized or unreadable, independent review
-> is owed: push, then run `rearm-review.mjs {{PR_NUM}} --repo={{REPO}} --round=conflict --only-if=accepted
-> --actor=accepted-conflict-rebase:<newHead>@<newTarget> --main-ref=<defaultBranch>` to return to
-> `review:pending`. For a ready-to-merge PR with no review verdict, use `--only-if=missing
-> --expect-head=<newHead>` instead of `--only-if=accepted`. Never preserve acceptance on a semantic change. Use exactly one hand-back marker,
-> then `completion-cli.mjs report` and `fix-procedure.mjs fix-end` as above. If the live head or base
+> For a ready-to-merge PR with no review verdict, use `--only-if=missing --expect-head=<newHead>`
+> instead of `--only-if=accepted`. Bind the receipt to the pushed head and the target actually
+> resolved against. Never touch review labels otherwise. Use exactly one hand-back marker, then
+> `completion-cli.mjs report` and `fix-procedure.mjs fix-end` as above. If the live head or base
 > changed since dispatch, re-read and re-plan before editing; never apply an old receipt to new evidence.
 > An unsafe resolution uses the existing conflict stand-down escalation.
 

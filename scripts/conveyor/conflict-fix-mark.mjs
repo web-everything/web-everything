@@ -30,15 +30,9 @@
  */
 import { resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { latestAcceptRecord } from '../lib/accept-carry-forward.mjs';
-import { REVIEW_LABELS } from '../lib/review-labels.mjs';
-import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
-import { proveRebaseTriviality } from './rebase-triviality.mjs';
-import { conflictRebaseReceipt } from './accepted-conflict-rebase.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
 import { resolveLocalRefSha, conflictFixTargetTrailer } from './rearm-review.mjs';
-import { enrichPrsWithCompleteComments, readCompletePrComments } from './pr-comments-complete.mjs';
 
 export { CONFLICT_FIX_COMMENT_MARKER };
 
@@ -72,11 +66,8 @@ export function buildConflictFixMarkComment({ actor = 'conveyor fix agent', base
 
 // ── IO SHELL (runs only as a CLI — the pure exports above stay side-effect-free on import) ────────────────────────
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname);
-export function runConflictFixMark(argv, { gh = (args) => execFileSyncThrottled('gh', args, {
-  encoding: 'utf8', timeout: resolveChildTimeoutMs(), maxBuffer: 1024 * 1024, killSignal: 'SIGKILL',
-}), git = args => execFileSync('git', args, {
-  encoding: 'utf8', timeout: resolveChildTimeoutMs(), maxBuffer: 8 * 1024 * 1024,
-}) } = {}) {
+if (IS_CLI) {
+  const argv = process.argv.slice(2);
   const flags = {};
   const positionals = [];
   for (const a of argv) {
@@ -87,106 +78,35 @@ export function runConflictFixMark(argv, { gh = (args) => execFileSyncThrottled(
     } else positionals.push(a);
   }
   const fail = (m) => {
-    throw new Error(m);
+    process.stderr.write(`✗ ${m}\n`);
+    process.exit(1);
   };
   const pr = Number(positionals[0]);
   if (!Number.isInteger(pr) || pr <= 0) {
-    fail('usage: conflict-fix-mark.mjs <pr> [--repo=<owner/name>] [--actor=<name>] [--base-ref=<name>] [--base-sha=<sha>] [--mode=conflict-rebase --old-head=<sha> --old-base=<sha>]  (pr must be a positive integer)');
+    fail('usage: conflict-fix-mark.mjs <pr> [--repo=<owner/name>] [--actor=<name>] [--base-ref=<name>] [--base-sha=<sha>]  (pr must be a positive integer)');
+  }
+  // In-flight fixers may still carry the retired keep-review interface. Refuse before
+  // any IO; inspect every argument so a later duplicate cannot hide a retired flag.
+  if (argv.some(a => a === '--mode' || a.startsWith('--mode=')
+      || (a.startsWith('--actor=') && a.includes('accepted-conflict-rebase:')))) {
+    fail('accepted conflict-rebase keep-review hand-back is retired; run rearm-review.mjs --round=conflict for independent review');
   }
   const baseRefName = typeof flags['base-ref'] === 'string' ? flags['base-ref'] : null;
   // #2787-live-incident — prefer an explicit `--base-sha=`; else self-derive it locally off `origin/<base-ref>`
   // (this CLI runs inside the fix agent's own lane, which just rebased against exactly this ref) rather than
   // leave the round's target trailer off whenever the caller doesn't pass one explicitly.
   const baseSha = typeof flags['base-sha'] === 'string' ? flags['base-sha'] : (baseRefName ? resolveLocalRefSha(baseRefName) : null);
-  let body;
-  let head = null;
-  if (flags.mode === 'conflict-rebase') {
-    const fallback = 'run rearm-review.mjs --round=conflict for independent review';
-    if (![flags['old-head'], flags['old-base']].every(sha => typeof sha === 'string' && /^[0-9a-f]{40}$/i.test(sha))) {
-      fail(`keep-review refused: pinned --old-head and --old-base required — ${fallback}`);
-    }
-    const readPr = () => {
-      const snapshot = JSON.parse(gh(['pr', 'view', String(pr),
-        ...(typeof flags.repo === 'string' ? [`--repo=${flags.repo}`] : []),
-        '--json', 'headRefOid,baseRefOid,baseRefName,comments,labels,reviews']));
-      if (!Array.isArray(snapshot.comments)) throw new Error('comments unreadable');
-      return enrichPrsWithCompleteComments([{ ...snapshot, number: pr }], {
-        repo: typeof flags.repo === 'string' ? flags.repo : null, annotate: pr => pr,
-        readComments: (number, options) => readCompletePrComments(number, { ...options, gh: args => JSON.parse(gh(args)) }),
-        onError: (_pr, error) => { throw error; },
-      })[0];
-    };
-    const cleanAcceptance = pr => {
-      const record = latestAcceptRecord(pr.comments, Array.isArray(pr.reviews) ? pr.reviews : null);
-      const labels = Array.isArray(pr.labels)
-        ? pr.labels.map(label => typeof label === 'string' ? label : label?.name) : [];
-      if (!record || record.reviewsUnreadable || record.laterVerdict || record.laterBodyDerivedHold
-          || labels.some(label => typeof label !== 'string' || !label)
-          || !labels.includes(REVIEW_LABELS.accepted)
-          || [REVIEW_LABELS.changes, REVIEW_LABELS.human, REVIEW_LABELS.pending].some(label => labels.includes(label))) {
-        throw new Error('review is no longer a clean acceptance');
-      }
-      return record;
-    };
-    try {
-      const pushed = readPr();
-      const reviewedHead = cleanAcceptance(pushed).sha;
-      const oldHead = flags['old-head'];
-      if (!reviewedHead || oldHead !== reviewedHead || oldHead === pushed.headRefOid) {
-        throw new Error('original head must be the independently recorded reviewed head');
-      }
-      // A rebase replaces commits, so oldHead need not be an ancestor of HEAD.
-      // Its reviewed patch must start at the same reachable commit in both histories;
-      // a caller-selected target must not narrow that patch to a convenient suffix.
-      const mergeBase = (a, b) => {
-        const sha = git(['merge-base', a, b]).trim();
-        if (!/^[0-9a-f]{40}$/i.test(sha)) throw new Error('history unavailable');
-        return sha;
-      };
-      const originalBase = mergeBase(oldHead, pushed.headRefOid);
-      if (originalBase !== mergeBase(oldHead, pushed.baseRefOid)
-          || originalBase !== mergeBase(oldHead, flags['old-base'])) {
-        throw new Error('original patch is not bound to the pushed history');
-      }
-      const proof = proveRebaseTriviality([flags['old-head'], pushed.headRefOid,
-        flags['old-base'], pushed.baseRefOid], git);
-      const receipt = conflictRebaseReceipt(pushed.headRefOid, pushed.baseRefOid);
-      if (!proof.trivial || !receipt || !pushed.baseRefName
-          || (baseRefName && baseRefName !== pushed.baseRefName)
-          || (flags['base-sha'] && flags['base-sha'] !== pushed.baseRefOid)) {
-        throw new Error('rebase is not provably trivial');
-      }
-      const current = readPr();
-      if (cleanAcceptance(current).sha !== reviewedHead) throw new Error('review changed during proof');
-      if (current.headRefOid !== pushed.headRefOid || current.baseRefOid !== pushed.baseRefOid
-          || current.baseRefName !== pushed.baseRefName) throw new Error('head or base changed during proof');
-      head = pushed.headRefOid;
-      body = [CONFLICT_FIX_COMMENT_MARKER, '', receipt,
-        `Proved identical PR changes at pushed head ${head}; review labels preserved.`,
-      ].join('\n') + conflictFixTargetTrailer(pushed.baseRefName, pushed.baseRefOid);
-    } catch {
-      fail(`keep-review refused: triviality evidence missing, changed or unreadable — ${fallback}`);
-    }
-  } else {
-    if (flags.mode) fail('unknown conflict-fix mode');
-    if (String(flags.actor ?? '').includes('accepted-conflict-rebase:')) {
-      fail('accepted conflict receipts require --mode=conflict-rebase --old-head=<sha> --old-base=<sha>; otherwise run rearm-review.mjs --round=conflict');
-    }
-    body = buildConflictFixMarkComment({
-      actor: typeof flags.actor === 'string' ? flags.actor : undefined, baseRefName, baseSha,
-    });
-  }
+  const body = buildConflictFixMarkComment({
+    actor: typeof flags.actor === 'string' ? flags.actor : undefined,
+    baseRefName,
+    baseSha,
+  });
   const args = ['pr', 'comment', String(pr), '--body', body];
   if (typeof flags.repo === 'string') args.push(`--repo=${flags.repo}`); // the fix agent runs in its WE lane clone; a missing --repo derives from cwd.
   try {
-    gh(args);
+    execFileSync('gh', args, { /* #74c write-only call: stdout is never read, so it is not captured (nothing to overflow or truncate) */ stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
   } catch (e) {
     fail(`could not post conflict-fix comment on PR #${pr}: ${String(e.message || e).split('\n')[0]}`);
   }
-  return { ok: true, pr, commented: true, ...(head ? { head } : {}) };
-}
-
-if (IS_CLI) {
-  try { process.stdout.write(JSON.stringify(runConflictFixMark(process.argv.slice(2))) + '\n'); }
-  catch (e) { process.stderr.write(`✗ ${e.message}\n`); process.exitCode = 1; }
+  process.stdout.write(JSON.stringify({ ok: true, pr, commented: true }) + '\n');
 }

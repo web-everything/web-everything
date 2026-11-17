@@ -1,8 +1,8 @@
 /**
- * @file accepted-conflict-rebase.mjs — pure admission and net-change proof for accepted conflicts.
- * Completed repairs reuse the trusted conflict-fix marker and target counter. The actor receipt
- * records its original head and target; deduplication is per head. Live dispatches use the shared fix claim.
- * Missing evidence refuses admission; failed/oversized diff evidence owes independent review.
+ * @file accepted-conflict-rebase.mjs — pure admission for accepted conflicts.
+ * Completed repairs reuse the trusted rearm-review conflict marker and target counter. The actor receipt
+ * records the repaired head and target; deduplication is per head. Live dispatches use the shared fix claim.
+ * Missing evidence refuses admission; every repair owes independent review.
  */
 import { countStaleConflictFixRounds, CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
@@ -10,7 +10,6 @@ import { isStatutePath, isDeclarativeLeashPath } from '../lib/gate-config.mjs';
 import { REVIEW_LABELS } from '../lib/review-labels.mjs';
 
 const SHA = /^[0-9a-f]{40}$/i;
-export const MAX_REBASE_DIFF_BYTES = 8 * 1024 * 1024;
 
 /** Whole-PR file evidence required before the watcher may hand ownership to reconcile.
  * Statute/leash paths and incomplete GraphQL file lists retain watcher ownership. */
@@ -37,7 +36,7 @@ export function isAcceptedConflictRebase(pr, defaultBranch = 'main') {
     && labels.some(l => [REVIEW_LABELS.accepted, 'ready-to-merge', 'status:ready-to-merge'].includes(l));
 }
 
-/** Safe actor value for either existing hand-back CLI; no new marker or state store. */
+/** Safe actor value for rearm-review --round=conflict; no new marker or state store. */
 export function conflictRebaseReceipt(head, target) {
   return SHA.test(head ?? '') && SHA.test(target ?? '')
     ? `accepted-conflict-rebase:${head.toLowerCase()}@${target.toLowerCase()}` : null;
@@ -55,57 +54,14 @@ export function planAcceptedConflictRebase({ pr, defaultBranch = 'main', mainSha
   const why = `accepted conflict against ${defaultBranch}; conflict-fix rounds ${attempts}/${cap}, total ${total}/${ceiling}`;
   if (attempts >= cap || total >= ceiling) return { kind: 'cap-exhausted', capKind: 'conflict-rebase', attempts, cap,
     why: `${why} — a person must take over` };
-  if (pr.comments.some(c => isTrustedMarkerAuthor(c) && typeof c?.body === 'string'
-      && c.body.trimStart().startsWith(CONFLICT_FIX_COMMENT_MARKER)
-      && c.body.split(/[\s;]+/).some(token => new RegExp(`^accepted-conflict-rebase:${pr.headRefOid.toLowerCase()}@[0-9a-f]{40}$`, 'i').test(token)))) return { kind: 'refuse', why: 'accepted conflict-rebase already completed for this head — refresh merge evidence or ask a person to inspect' };
+  if (pr.comments.some(c => {
+    if (!isTrustedMarkerAuthor(c) || typeof c?.body !== 'string'
+        || c.body.trimStart().split('\n')[0] !== CONFLICT_FIX_COMMENT_MARKER) return false;
+    // Parse the actor in the real rearm-review producer's prose, including its semicolon.
+    // A receipt quoted elsewhere in a trusted comment is not a completed repair.
+    const actor = /^A mechanical conflict-resolution round \(no other edits\) was applied by (accepted-conflict-rebase:[0-9a-f]{40}@[0-9a-f]{40}); the PR is re-armed `review:pending` \(an independent re-review is owed\)\.$/im.exec(c.body);
+    return actor?.[1].split(':')[1].split('@')[0].toLowerCase() === pr.headRefOid.toLowerCase();
+  })) return { kind: 'refuse', why: 'accepted conflict-rebase already completed for this head — refresh merge evidence or ask a person to inspect' };
   return { kind: 'fix', isConflict: true, mode: 'conflict-rebase', attempts, cap,
     conflictRebase: { oldHead: pr.headRefOid, mainSha, defaultBranch, receipt }, why };
-}
-
-/** Compare per-file contextual hunks, ignoring object IDs and line numbers only.
- * Context-free hunks cannot establish correspondence and require independent review. */
-export function classifyRebaseTriviality(before, after) {
-  const normalize = patch => {
-    if (typeof patch !== 'string' || !patch.startsWith('diff --git ')
-        || patch.length > MAX_REBASE_DIFF_BYTES || /GIT binary patch|Binary files .* differ/.test(patch)) return null;
-    if (!patch.endsWith('\n')) return null;
-    const out = [];
-    let removed = 0, added = 0, files = 0, evidence = false, contextual = false;
-    const complete = () => removed === 0 && added === 0;
-    let inHunk = false, changed = false;
-    const hunkComplete = () => complete() && (!inHunk || (contextual && changed));
-    for (const line of patch.slice(0, -1).split('\n')) {
-      if (line.startsWith('diff --git ')) {
-        if (!hunkComplete() || (files && !evidence)) return null;
-        files++; evidence = false; out.push(line);
-      } else if (line.startsWith('index ')) {
-        const index = /^index [0-9a-f]+\.\.[0-9a-f]+( [0-7]{6})?$/.exec(line);
-        if (!index) return null;
-        out.push('index' + (index[1] ?? ''));
-      } else if (line.startsWith('@@ ')) {
-        if (!hunkComplete()) return null;
-        const hunk = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@.*$/.exec(line);
-        if (!hunk) return null;
-        removed = Number(hunk[1] ?? 1); added = Number(hunk[2] ?? 1);
-        inHunk = true; contextual = false; changed = false;
-        evidence = true; out.push(`@@ -${removed} +${added} @@`);
-      } else if (removed || added) {
-        if (line.startsWith('-')) { removed--; changed = true; }
-        else if (line.startsWith('+')) { added--; changed = true; }
-        else if (line.startsWith(' ')) { removed--; added--; contextual = true; }
-        else return null;
-        if (removed < 0 || added < 0) return null;
-        out.push(line);
-      } else if (/^(?:old mode|new mode|new file mode|deleted file mode) [0-7]{6}$/.test(line)) {
-        evidence = true; out.push(line);
-      } else if (/^(?:--- |\+\+\+ )/.test(line) || line === '\\ No newline at end of file') {
-        out.push(line);
-      } else return null;
-    }
-    return hunkComplete() && files && evidence ? out.join('\n') : null;
-  };
-  const a = normalize(before), b = normalize(after);
-  const trivial = a !== null && b !== null && a === b;
-  return { trivial, handback: trivial ? 'conflict-fix-mark' : 'rearm-review',
-    why: trivial ? 'PR changes identical' : 'changed or incomplete diff evidence — independent review required' };
 }

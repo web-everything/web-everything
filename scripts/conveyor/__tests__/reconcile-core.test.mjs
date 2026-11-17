@@ -1,3 +1,4 @@
+import { buildConflictRearmComment } from '../rearm-review.mjs';
 /**
  * @file scripts/conveyor/__tests__/reconcile-core.test.mjs
  * @description Pins the resident reconcile pass (WE #3296) — the dispatch and, mostly, its FOUR REFUSALS.
@@ -4734,7 +4735,7 @@ describe('accepted main-base conflict-rebase hook', () => {
   it('suppresses a completed trusted head even when main advances', () => {
     const head = 'a'.repeat(40);
     const result = run({ headRefOid: head, comments: [{ author: AUTOMATION,
-      body: `${CONFLICT_FIX_COMMENT_MARKER}\naccepted-conflict-rebase:${head}@${'c'.repeat(40)}` }] });
+      body: buildConflictRearmComment({ actor: `accepted-conflict-rebase:${head}@${'c'.repeat(40)}`, decision: { keepsHuman: false }, mainRef: 'main', mainSha: 'c'.repeat(40) }) }] });
     expect(result.dispatch).toEqual([]);
     expect(result.refusals[0].why).toContain('already completed for this head');
   });
