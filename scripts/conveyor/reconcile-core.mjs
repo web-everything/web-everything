@@ -162,6 +162,7 @@ import { sessionSlugFor } from '../operations/dispatch-lane.mjs';
 // and an advisory-fix round on a `needs-human` PR carrying `advisory:changes`. Both are true leaves — no fs, no
 // clock, no process, no network — so importing them keeps this file PURE and leaf-light exactly as its own
 // header requires.
+import { isAcceptedConflictRebase, planAcceptedConflictRebase, hasReconcileConflictRebaseFiles } from './accepted-conflict-rebase.mjs';
 import { countStaleConflictFixRounds, CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
 import {
   countCompletedAdvisoryEpisodes, ADVISORY_FIX_COMMENT_MARKER,
@@ -1509,7 +1510,7 @@ function earlyStartShadowFields(pr, requiredChecks) {
  * `kind: 'review'` branches (a past-cap grant, the advisory-fix cap's stale-advisory review, the addressed-advisory
  * review) call this next to {@link refuseReferralHold}, so none of them reviews what the main path would refuse.
  */
-function refuseUnreviewable({ pr, requiredChecks, refuse, withPhase, extra = {} }) {
+function refuseUnreviewable({ pr, requiredChecks, refuse, withPhase, extra = {}, allowHumanClearedHead = false }) {
   if (pr?.isDraft) {
     refuse('draft', { ...withPhase, ...extra, ...earlyStartShadowFields(pr, requiredChecks), why: 'PR is still a draft — no independent review is dispatched until it is promoted to ready for review' });
     return true;
@@ -1519,7 +1520,7 @@ function refuseUnreviewable({ pr, requiredChecks, refuse, withPhase, extra = {} 
       why: `scope-bloat: ${pr.scopeBloat.why} — a fixer rebases it first, no review reads this diff` });
     return true;
   }
-  return refuseHumanClearedHead({ pr, refuse, withPhase, extra });
+  return !allowHumanClearedHead && refuseHumanClearedHead({ pr, refuse, withPhase, extra });
 }
 
 /**
@@ -3875,7 +3876,20 @@ export function planReconcile({
     // straight through, unchanged, to the existing `OWED_ELSEWHERE.conflicted` refusal below, exactly as it did
     // before this branch existed. It also never fires for any OTHER phase — a stacked PR that is `bounced`,
     // `needs-human`, etc. is handled entirely by that phase's own existing branch, unaffected by this one.
-    if (phase === 'conflicted') {
+    if (phase === 'conflicted' || isAcceptedConflictRebase(pr, defaultBranch)) {
+      // Only whole-PR paths are available here. Leave any statute/leash file (and
+      // incomplete file evidence) to the watcher's more precise conflict classification.
+      const acceptedRebase = hasReconcileConflictRebaseFiles(pr) ? planAcceptedConflictRebase({ pr, defaultBranch, mainSha,
+        cap: conflictFixCapHere, ceiling: CONFLICT_FIX_ABSOLUTE_CEILING }) : null;
+      if (acceptedRebase) {
+        if (refuseReferralHold({ pr, refuse, withPhase })) continue;
+        // Human clearance blocks another review, but cannot block repairing the accepted branch.
+        if (refuseUnreviewable({ pr, requiredChecks, refuse, withPhase, allowHumanClearedHead: true })) continue;
+        if (acceptedRebase.kind === 'cap-exhausted') refuseCapExhausted({ ...withPhase, ...acceptedRebase });
+        else if (acceptedRebase.kind === 'refuse') refuse('owed-elsewhere', { ...withPhase, why: acceptedRebase.why });
+        else dispatch.push({ ...base, ...withPhase, ...acceptedRebase });
+        continue;
+      }
       const baseRefName = pr?.baseRefName ?? null;
       const isStackedBase = Boolean(baseRefName) && baseRefName !== defaultBranch;
       if (isStackedBase) {

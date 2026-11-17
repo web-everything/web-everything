@@ -365,6 +365,29 @@ node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo=
 > applies unchanged (`stand-down.mjs {{PR_NUM}} --repo={{REPO}} --reason=conflict --detail=...`) — this mode
 > changes only what a *successful* resolution hands back with, never the escalation path.
 
+> **ACCEPTED-CONFLICT-REBASE MODE — dispatched with `mode: conflict-rebase`.** This accepted or
+> ready-to-merge PR conflicts with the default branch. Keep the fix claim for the entire repair. Pin
+> the original head and its old target, and the current default-branch target SHA before rebasing.
+> Rebase onto that pinned current target, resolve the conflict, and run the affected gates. Record
+> the conflicting and resolved hunks. Before pushing, run:
+>
+> ```bash
+> node "{{WE_ROOT}}/scripts/conveyor/rebase-triviality.mjs" <oldHead> <newHead> <oldTarget> <newTarget>
+> ```
+>
+> Only exit 0 (`trivial: true`) permits preserving every `review:*` label. The proof compares this
+> PR's own per-file patch against each head's merge-base, normalising hunk coordinates. In that case
+> push and use `conflict-fix-mark.mjs` with `--base-ref=<defaultBranch>` and
+> `--actor=accepted-conflict-rebase:<oldHead>@<newTarget>` (the dispatch receipt).
+> If the patches differ, or evidence is missing, binary, oversized or unreadable, independent review
+> is owed: push, then run `rearm-review.mjs {{PR_NUM}} --repo={{REPO}} --round=conflict --only-if=accepted
+> --actor=accepted-conflict-rebase:<oldHead>@<newTarget> --main-ref=<defaultBranch>` to return to
+> `review:pending`. For a ready-to-merge PR with no review verdict, use `--only-if=missing
+> --expect-head=<newHead>` instead of `--only-if=accepted`. Never preserve acceptance on a semantic change. Use exactly one hand-back marker,
+> then `completion-cli.mjs report` and `fix-procedure.mjs fix-end` as above. If the live head or base
+> changed since dispatch, re-read and re-plan before editing; never apply an old receipt to new evidence.
+> An unsafe resolution uses the existing conflict stand-down escalation.
+
 > **STALE-BASE MODE — dispatched with `mode: stale-base-rebase`.** The PR base is main but a required job
 > is missing because the base predates it. Rebase (or merge) onto current `origin/main` (usually conflict-free),
 > make no other edit, run the gate green, and push. **Touch no `review:*` label.** Hand back exactly like
