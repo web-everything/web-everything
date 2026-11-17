@@ -651,6 +651,28 @@ export async function runReviewLoopOnce({
     cwd: parsed.control.cwd || null, model: parsed.control.model || null, provider: parsed.control.provider || null,
   });
 
+  // Both entry points must preserve the saved CI hold, even when timing settings or clearance change.
+  const resumeCiHeldRecord = (parked, ciHeldRecordRetryMax) => {
+    const refuse = reason => ({ refusal: { code: 2, run: parked, stopped: 'refused',
+      lines: [`error: run ${parked.id} ${reason}`] } });
+    const evidence = reviewRunEvidence(parked)?.ciHeldRecordRetry;
+    if (!(ciHeldRecordRetryMax > 0 && Number.isFinite(evidence?.attempts)
+      && evidence.attempts <= ciHeldRecordRetryMax)) {
+      return refuse('CI-held record retry attempts spent or disabled; inspect run store and CI before retrying.');
+    }
+    const attempts = Math.max(0, Number(parked.recordEffectResumeAttempts) || 0);
+    if (attempts >= RESUME_MAX_ATTEMPTS) {
+      return refuse('record effect resume attempts spent; inspect run store and body-file refusal before retrying.');
+    }
+    // The record step bypasses confirm's live referral check. Refuse before touching the saved run.
+    const hold = acceptHold(parked, { filed: true });
+    if (hold) return refuse(`unattended accept held: ${hold}; resume after restoring clearance.`);
+    const label = sinks[REVIEW_EFFECTS.LABEL];
+    sinks = { ...sinks, [REVIEW_EFFECTS.LABEL]: Object.assign(
+      (payload, ctx) => label(payload, { ...ctx, requireCiGate: true }), label) };
+    return { run: { ...parked, resumedAt: now(), recordEffectResumeAttempts: attempts + 1 } };
+  };
+
   let run;
   if (parsed.control.resume) {
     run = store.read(parsed.control.resume);
@@ -658,6 +680,13 @@ export async function runReviewLoopOnce({
     if (run.op !== declaration.name) {
       return { code: 2, lines: [`error: run ${run.id} is a \`${run.op}\` run, not \`${declaration.name}\``], run: null, stopped: 'refused' };
     }
+  }
+  if (parsed.control.resume && reviewRunEvidence(run)?.ciHeldRecordRetry) {
+    const { ciHeldRecordRetryMax } = redTeamOnSkipSettings({ log: advisoryLog }).value;
+    const prepared = resumeCiHeldRecord(run, ciHeldRecordRetryMax);
+    if (prepared.refusal) return prepared.refusal;
+    run = prepared.run;
+    store.write(run);
   }
   if (!parsed.control.resume || reviewRunEvidence(run)?.referralStageRefused) {
     // Card xq1xbsl — A RULING ON AN UNCHANGED HEAD RESUMES THE PAUSED REVIEW; IT DOES NOT START A NEW PANEL. A fresh
@@ -671,7 +700,6 @@ export async function runReviewLoopOnce({
     }
     // Any doubt (an unreadable record, a run that cannot be rewound) falls back to a fresh review, never aborts the round.
     let rewound = null;
-    let requireCiGate = false;
     let persistSpent = null;
     try {
       const parked = resumedId ? store.read(resumedId) : null;
@@ -717,22 +745,19 @@ export async function runReviewLoopOnce({
       if (suspendedEffect && effectAttempts >= RESUME_MAX_ATTEMPTS) {
         return { code: 2, run: parked, stopped: 'refused', lines: [`error: run ${parked.id} suspended referral resume attempts spent; inspect run store and ruling.`] };
       }
-      if (retryableRecordEffect && recordAttempts >= RESUME_MAX_ATTEMPTS) {
+      if (retryableRecordEffect && !ciHeldRecordRetry && recordAttempts >= RESUME_MAX_ATTEMPTS) {
         return { code: 2, run: parked, stopped: 'refused', lines: [`error: run ${parked.id} record effect resume attempts spent; inspect run store and body-file refusal before retrying.`] };
       }
       if (parkedEvidence?.persistenceFailed && (persistRetryBudgetSpent(parkedEvidence) || attempts >= RESUME_MAX_ATTEMPTS)) {
         persistSpent = parked.id;
       } else if (parked && parked.op === declaration.name && (resumeAdvise ? adviseAttempts : attempts) < RESUME_MAX_ATTEMPTS && rosterMatches
         && (parked.pending?.kind === 'confirm' || unfinishedResume || parkedEvidence?.referralStageRefused || suspendedEffect || retryableRecordEffect)) {
-        // CI-held accepts resume at record, bypassing confirm's live referral check. Revalidate before
-        // touching the saved run; a lost clearance needs a ruling, never a replacement panel.
-        const hold = ciHeldRecordRetry ? acceptHold(parked, { filed: true }) : null;
-        if (hold) return { code: 2, run: parked, stopped: 'refused',
-          lines: [`error: run ${parked.id} unattended accept held: ${hold}; resume after restoring clearance.`] };
+        const prepared = ciHeldRecordRetry ? resumeCiHeldRecord(parked, ciHeldRecordRetryMax) : null;
+        if (prepared?.refusal) return prepared.refusal;
         // Continue an interrupted advisory step in place: its effect history skips applied writes and refuses
         // unknown non-idempotent outcomes. Rewinding it would discard both protections. Persistence attempts do
         // not consume this later step's retry budget.
-        rewound = retryableRecordEffect ? { ...parked, resumedAt: now(), recordEffectResumeAttempts: recordAttempts + 1 }
+        rewound = prepared ? prepared.run : retryableRecordEffect ? { ...parked, resumedAt: now(), recordEffectResumeAttempts: recordAttempts + 1 }
           : suspendedEffect ? { ...parked, resumedAt: now(), referralEffectResumeAttempts: effectAttempts + 1 } : resumeAdvise ? { ...parked, resumedAt: now() }
           : rewindRunToStep(parked, { registry, step: RESUME_STEP, at: now() });
         // The rewind drops the parked verdict and the referral step, and the record is saved before the resumed pass
@@ -751,7 +776,6 @@ export async function runReviewLoopOnce({
             mandatoryReferrals: parked.findings?.mandatoryReferrals ?? null,
             adviseFinishedAt: parked.stepTimings?.find((t) => t.step === 'advise')?.finishedAt ?? null, attempts: 1,
             ...(persistRetries ? { persistRetries } : {}) } };
-        requireCiGate = ciHeldRecordRetry;
       }
     } catch { rewound = null; }
     if (persistSpent) {
@@ -762,12 +786,6 @@ export async function runReviewLoopOnce({
     if (rewound) {
       run = rewound;
       store.write(run);
-      if (requireCiGate) {
-        // A saved strict CI hold survives timing-setting changes. Scope the override to this resume's label sink.
-        const label = sinks[REVIEW_EFFECTS.LABEL];
-        sinks = { ...sinks, [REVIEW_EFFECTS.LABEL]: Object.assign(
-          (payload, ctx) => label(payload, { ...ctx, requireCiGate: true }), label) };
-      }
     } else {
       run = startRun({
         op: declaration.name,

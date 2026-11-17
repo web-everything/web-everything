@@ -4378,3 +4378,8 @@ a resume counter project zero; projections missing that evidence cannot prove el
 Test the last eligible resume, exhaustion, and an exceeded budget against both the planner
 and the driver; exhaustion must preserve the `review-unfinished` escalation. Explicit-resume
 test argv must omit input flags (`--pr`, `--repo`), or parsing refuses before the replay guard.
+
+Automatic and explicit CI-held record resumes share one preparation guard: check both
+retry budgets, re-read live acceptance clearance with `filed: true`, and force the label
+sink’s strict CI gate even after timing settings change. Exercise both entry points with
+revoked clearance and pending-to-green CI; refusal must leave the saved run untouched.

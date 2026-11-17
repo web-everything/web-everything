@@ -1922,8 +1922,9 @@ describe('CI-held record driver resume', () => {
     return { args, store, saved, judge, seen, publishGate, runNode, find, timingEnv };
   }
 
-  it.each(['card', 'not-real'].flatMap(result => [false, true].map(cleared => [result, cleared])))(
-    'prevention-outstanding CI-held resume rechecks live %s clearance (still holds=%s)', async (result, cleared) => {
+  it.each(['automatic', 'explicit'].flatMap(mode => ['card', 'not-real'].flatMap(result =>
+    [false, true].map(cleared => [mode, result, cleared]))))(
+    '%s prevention-outstanding CI-held resume rechecks live %s clearance (still holds=%s)', async (mode, result, cleared) => {
       const repo = BASE_ARGV[1].slice(7);
       const original = { file: NET_PATHS[0], line: 7, summary: 'launch guard missing', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
       const seat = 'judge', key = referralFindingKey(seat, original);
@@ -1953,6 +1954,7 @@ describe('CI-held record driver resume', () => {
       const judges = f.judge.mock.calls.length, writes = f.seen.length, checks = f.publishGate.mock.calls.length;
       readAcceptancePr.mockClear();
       const out = await runReviewLoopOnce({ ...f.args, findResumableRun: f.find,
+        ...(mode === 'explicit' ? { argv: [`--resume=${f.saved.id}`, '--json'] } : {}),
         mintRunId: () => { throw Error('fresh panel'); } });
       expect(readAcceptancePr).toHaveBeenCalled();
       expect(out.run.id).toBe(f.saved.id);
@@ -1975,8 +1977,9 @@ describe('CI-held record driver resume', () => {
       }
     });
 
-  it('keeps a CI-held label swap held after timing settings change, then applies on green without a fresh panel', async () => {
+  it.each(['automatic', 'explicit'])('%s resume keeps a CI-held label swap held after timing settings change, then applies on green without a fresh panel', async mode => {
     const f = await fixture();
+    if (mode === 'explicit') f.args.argv = [`--resume=${f.saved.id}`, '--json'];
     Object.assign(f.timingEnv, { WE_REVIEW_START_EARLY: 'off', WE_REVIEW_START_AFTER: 'ci-green', WE_REVIEW_CANCEL_ON_CI_RED: 'false' });
     // The default lookup resolves the environment setting when no driver override is supplied.
     expect(f.find({ repo: BASE_ARGV[1].slice(7), pr: 1234 })).toBe(f.saved.id);
@@ -2027,15 +2030,35 @@ describe('CI-held record driver resume', () => {
     expect(f.store.read(saved.id).recordEffectResumeAttempts).toBeUndefined();
   });
 
-  it('refuses at the independent record-attempt guard without starting a fresh panel', async () => {
+  it.each(['automatic', 'explicit'])('%s resume refuses at the independent record-attempt guard without starting a fresh panel', async mode => {
     const f = await fixture();
     f.store.write({ ...f.saved, recordEffectResumeAttempts: RESUME_MAX_ATTEMPTS });
+    if (mode === 'explicit') f.args.argv = [`--resume=${f.saved.id}`, '--json'];
     const judges = f.judge.mock.calls.length;
     const out = await runReviewLoopOnce({ ...f.args, findResumableRun: () => f.saved.id, mintRunId: () => { throw Error('fresh panel'); } });
     expect(out.stopped).toBe('refused');
     expect(out.lines.join(' ')).toContain('record effect resume attempts spent');
+    expect(f.runNode).not.toHaveBeenCalled();
+    expect(f.store.read(f.saved.id)).toEqual({ ...f.saved, recordEffectResumeAttempts: RESUME_MAX_ATTEMPTS });
     expect(f.judge).toHaveBeenCalledTimes(judges);
   });
+
+  it.each([['over bound', 3, 4], ['zero disables retries', 0, 1]])(
+    'explicit CI-held resume refuses when %s without applying the label', async (_name, max, attempts) => {
+      const f = await fixture(max);
+      const saved = f.store.read(f.saved.id);
+      saved.effects.find(e => e.type === REVIEW_EFFECTS.LABEL).unknownAttempts = attempts;
+      f.store.write(saved);
+      const checks = f.publishGate.mock.calls.length, judges = f.judge.mock.calls.length;
+      const out = await runReviewLoopOnce({ ...f.args, argv: [`--resume=${saved.id}`, '--json'],
+        mintRunId: () => { throw Error('fresh panel'); } });
+      expect(out).toMatchObject({ code: 2, stopped: 'refused', run: saved });
+      expect(out.lines.join(' ')).toContain('CI-held record retry attempts spent or disabled');
+      expect(f.store.read(saved.id)).toEqual(saved);
+      expect(f.publishGate).toHaveBeenCalledTimes(checks);
+      expect(f.judge).toHaveBeenCalledTimes(judges);
+      expect(f.runNode).not.toHaveBeenCalled();
+    });
 
   it.each([RESUME_MAX_ATTEMPTS - 1, RESUME_MAX_ATTEMPTS, RESUME_MAX_ATTEMPTS + 1])(
     'driver and planner agree on the independent record resume budget (%s)', async resumeAttempts => {
