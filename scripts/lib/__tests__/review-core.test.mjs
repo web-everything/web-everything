@@ -1,3 +1,4 @@
+import { NO_PROMPT_COMMAND_RULES } from '../no-prompt-command-rules.mjs';
 /**
  * @file review-core.test.mjs — proof of the #2325 shared review-verdict core: the canonical `Finding` shape
  *   normalization, the `{findings, verdict}` derivation (humanRequired always wins; outstanding findings vs
@@ -604,7 +605,7 @@ describe('review.currentLevel interim mandates', () => {
     for (const [lens, hash] of Object.entries(originalHashes)) {
       const mandate = buildPanelMandate({ lens });
       expect(mandate).not.toContain(INTERNAL_DELIVERY_STANZA);
-      expect(createHash('sha256').update(mandate).digest('hex')).toBe(hash);
+      expect(createHash('sha256').update(mandate.slice(NO_PROMPT_COMMAND_RULES.length + 2)).digest('hex')).toBe(hash);
       expect(expectationForLens(lens)).toBe(LENS_EXPECTATIONS[lens]);
     }
   });
@@ -783,7 +784,7 @@ describe('buildPanelMandate (#2310)', () => {
 
     it('adds the mutation probe and tests-first guarantee mapping when `aim` is omitted', () => {
       expect(buildPanelMandate({ lens: MANDATE_LENSES.CORRECTNESS }))
-        .toBe(`${withCurrentPanel(FIXTURE).replace('Work from the diff text alone',
+        .toBe(`${NO_PROMPT_COMMAND_RULES}\n\n${withCurrentPanel(FIXTURE).replace('Work from the diff text alone',
           "each stated guarantee in the card's Acceptance has a named test; list any guarantee without one as a finding Work from the diff text alone")} ${MUTATION_PROBE_RULE} ${INTERNAL_DELIVERY_STANZA}`);
     });
 

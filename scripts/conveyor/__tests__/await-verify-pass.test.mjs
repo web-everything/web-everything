@@ -1,3 +1,4 @@
+import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
 import { describe, it, expect, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync, lstatSync, existsSync, utimesSync, readdirSync } from 'node:fs';
@@ -90,7 +91,7 @@ it('findAwaitSession binds by session id, else the newest row with the who name'
 it('resume prompts never begin with "-" and the green one forbids a second push', () => {
   for (const kind of ['green', 'push-rejected', 'red', 'load-flake', 'escalate', 'infra', 'void', 'other']) {
     const p = buildAwaitVerifyResumePrompt({ kind, record: rec(), marker: marker('red', { failureDetails: { tests: [{ file: 'a.test.mjs', name: 'b' }] } }) });
-    expect(p.startsWith('[harness verify verdict')).toBe(true);
+    expect(p.startsWith(`${NO_PROMPT_COMMAND_RULES}\n\n[harness verify verdict`)).toBe(true);
     expect(p).toContain(SHA);
   }
   expect(buildAwaitVerifyResumePrompt({ kind: 'green', record: rec() })).toMatch(/Do not push lane\/item-68b again/);
@@ -410,7 +411,7 @@ describe('replay: fix-4115 through the harness-owned wait', () => {
     const resumes = [];
     let current = -1;
     let waits = 0;
-    h.io.resume = (a) => { resumes.push(a.prompt.split('\n')[2] ?? ''); return { resumed: true }; };
+    h.io.resume = (a) => { resumes.push(a.prompt.slice(NO_PROMPT_COMMAND_RULES.length + 2).split('\n')[2] ?? ''); return { resumed: true }; };
     for (let t = at('19:55:00'); t <= at('21:05:00'); t += 120_000) {
       // The fixer side: at each real request time it commits, requests and marks, then ends its turn.
       const next = requests[current + 1];
