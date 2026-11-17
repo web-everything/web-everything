@@ -23,7 +23,8 @@ export function planGateRefresh({ checkRuns, head, restampedAtMs } = {}) {
 /**
  * Best effort after a durable restamp; failure never undoes the acceptance.
  * No attempt markers: later restamps consult live checks and can retry naturally.
- * Two bounded reads, then at most three attempts for each of three label calls,
+ * Three bounded reads, then at most three attempts for each label call (including
+ * a pre-removal if the label is already present),
  * plus one final removal attempt after the gate has already been triggered.
  * restampedAtMs is captured before posting, conservatively excluding racing runs.
  */
@@ -71,11 +72,17 @@ export function toggleMergeGateRefresh({ repo, pr, gh = execFileSyncThrottled, s
       }
     }
   };
+  const live = JSON.parse(gh('gh', ['pr', 'view', String(pr), '--repo', repo, '--json', 'labels'], options));
+  if (!Array.isArray(live?.labels) || live.labels.some(label => typeof label?.name !== 'string' || !label.name)) {
+    throw new Error('incomplete PR label evidence');
+  }
+  const removeArgs = ['pr', 'edit', String(pr), '--repo', repo, '--remove-label', LABEL];
+  // A successful add only triggers the gate when the label was absent.
+  if (live.labels.some(label => label.name === LABEL)) labelCall(removeArgs);
   labelCall(['label', 'create', LABEL, '--repo', repo, '--color', 'ededed',
     '--description', 'Refresh merge-gate after acceptance restamp'], true);
   labelCall(['pr', 'edit', String(pr), '--repo', repo, '--add-label', LABEL]);
   // The add has dispatched the gate. Cleanup failure must not re-arm its once-per-head claim.
-  const removeArgs = ['pr', 'edit', String(pr), '--repo', repo, '--remove-label', LABEL];
   try { labelCall(removeArgs); }
   catch {
     try { gh('gh', removeArgs, options); }

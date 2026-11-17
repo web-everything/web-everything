@@ -10,8 +10,9 @@ const restampedAtMs = Date.parse('2026-11-15T15:58:24Z');
 const gate = (extra = {}) => ({ id: 10, name: 'merge-gate', head_sha: head,
   status: 'completed', conclusion: 'failure', started_at: '2026-11-15T15:58:03Z', ...extra });
 const plan = checkRuns => planGateRefresh({ checkRuns, head, restampedAtMs });
-function fixture(checkRuns = [gate()], liveHead = head, total = checkRuns.length) {
+function fixture(checkRuns = [gate()], liveHead = head, total = checkRuns.length, labels = []) {
   return vi.fn((_file, args) => {
+    if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ labels });
     if (args[0] !== 'api') return '';
     if (args[1].includes('/check-runs')) return JSON.stringify({ total_count: total, check_runs: checkRuns });
     return JSON.stringify({ head: { sha: liveHead } });
@@ -56,7 +57,7 @@ describe('merge-gate refresh after restamp', () => {
     expect(run(gh)).toEqual({ ok: true, refreshed: true });
     expect(gh.mock.calls.at(-2)[1]).toContain('--add-label');
     expect(gh.mock.calls.at(-1)[1]).toContain('--remove-label');
-    expect(gh).toHaveBeenCalledTimes(5);
+    expect(gh).toHaveBeenCalledTimes(6);
   });
   it('creates the neutral label then adds and removes it after checking the live head', () => {
     const gh = fixture();
@@ -64,19 +65,21 @@ describe('merge-gate refresh after restamp', () => {
     expect(gh.mock.calls.map(([, args]) => args)).toEqual([
       ['api', `repos/o/r/commits/${head}/check-runs?per_page=100&filter=all&check_name=merge-gate`],
       ['api', 'repos/o/r/pulls/7'],
+      ['pr', 'view', '7', '--repo', 'o/r', '--json', 'labels'],
       ['label', 'create', 'gate:refresh', '--repo', 'o/r', '--color', 'ededed', '--description', 'Refresh merge-gate after acceptance restamp'],
       ['pr', 'edit', '7', '--repo', 'o/r', '--add-label', 'gate:refresh'],
       ['pr', 'edit', '7', '--repo', 'o/r', '--remove-label', 'gate:refresh'],
     ]);
   });
-  it('bounds both API reads to 2 MiB and a 30-second timeout', () => {
+  it('bounds all three reads to 2 MiB and a 30-second timeout', () => {
     const gh = fixture();
     expect(run(gh)).toEqual({ ok: true, refreshed: true });
-    const reads = gh.mock.calls.filter(([, args]) => args[0] === 'api');
-    expect(reads).toHaveLength(2);
+    const reads = gh.mock.calls.filter(([, args]) => args[0] === 'api' || args[1] === 'view');
+    expect(reads).toHaveLength(3);
     expect(reads.map(([, args]) => args[1])).toEqual([
       `repos/o/r/commits/${head}/check-runs?per_page=100&filter=all&check_name=merge-gate`,
       'repos/o/r/pulls/7',
+      'view',
     ]);
     for (const [, , options] of reads) {
       expect(options).toMatchObject({ maxBuffer: 2 * 1024 * 1024, timeout: 30_000 });
@@ -124,7 +127,7 @@ describe('merge-gate refresh after restamp', () => {
     expect(sleep.mock.calls).toEqual([[1000], [2000]]);
     expect(stderr.mock.calls.flat().join('')).toContain('daemon token denied');
   });
-  it.each([true, false])('add-ok/remove-fails stays successful with a note; final removal succeeds: %s', finalSucceeds => {
+  it.each([true, false])('label absent → add ok → remove fails stays successful with a note; final removal succeeds: %s', finalSucceeds => {
     const base = fixture(), sleep = vi.fn();
     let removes = 0;
     const gh = vi.fn((file, args, opts) => {
@@ -135,9 +138,62 @@ describe('merge-gate refresh after restamp', () => {
     expect(out).toMatchObject({ ok: true, refreshed: true, note: expect.stringContaining('merge-gate triggered') });
     expect(out.note).toContain(finalSucceeds ? 'cleanup succeeded' : 'ask an operator to remove gate:refresh');
     expect(gh.mock.calls.filter(([, args]) => args.includes('--add-label'))).toHaveLength(1);
+    expect(gh.mock.calls.filter(([, args]) => args[1] === 'view' || args[1] === 'edit').map(([, args]) =>
+      args[1] === 'view' ? 'read labels' : args.at(-2))).toEqual([
+      'read labels', '--add-label', ...Array(4).fill('--remove-label'),
+    ]);
     expect(removes).toBe(4);
     expect(sleep.mock.calls).toEqual([[1000], [2000]]);
   });
+  it('label already present and pre-remove fails reports failure without adding', () => {
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const base = fixture([gate()], head, 1, [{ name: 'gate:refresh' }]);
+    const sleep = vi.fn();
+    const gh = vi.fn((file, args, opts) => {
+      if (args.includes('--remove-label')) throw new Error('pre-remove denied');
+      return base(file, args, opts);
+    });
+    expect(run(gh, { sleep })).toMatchObject({ ok: false, error: expect.stringContaining('pre-remove denied') });
+    expect(gh.mock.calls.filter(([, args]) => args.includes('--remove-label'))).toHaveLength(3);
+    expect(gh.mock.calls.some(([, args]) => args.includes('--add-label'))).toBe(false);
+    expect(sleep.mock.calls).toEqual([[1000], [2000]]);
+  });
+  it('label present and pre-remove ok makes the add trigger a real transition', () => {
+    let present = true;
+    const base = fixture([gate()], head, 1, [{ name: 'gate:refresh' }]);
+    const transitions = [];
+    const gh = vi.fn((file, args, opts) => {
+      if (args.includes('--remove-label')) { transitions.push('remove'); present = false; }
+      if (args.includes('--add-label')) {
+        expect(present).toBe(false);
+        transitions.push('add');
+        present = true;
+      }
+      return base(file, args, opts);
+    });
+    expect(run(gh)).toEqual({ ok: true, refreshed: true });
+    expect(transitions).toEqual(['remove', 'add', 'remove']);
+    expect(present).toBe(false);
+  });
+  it.each(['unreadable', 'invalid JSON', 'missing labels', 'malformed labels', 'oversized'])(
+    'fails closed on %s PR label evidence before any label mutation', kind => {
+      vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      const base = fixture();
+      const gh = vi.fn((file, args, opts) => {
+        if (args[0] === 'pr' && args[1] === 'view') {
+          if (kind === 'unreadable') throw new Error('label read denied');
+          if (kind === 'invalid JSON') return '{';
+          if (kind === 'missing labels') return '{}';
+          if (kind === 'malformed labels') return JSON.stringify({ labels: [{}] });
+          return execFileSync(process.execPath, ['-e',
+            "process.stdout.write('{\"labels\":[]}' + ' '.repeat(2 * 1024 * 1024))"], opts);
+        }
+        return base(file, args, opts);
+      });
+      expect(run(gh)).toMatchObject({ ok: false, error: expect.stringContaining('operator to toggle gate:refresh') });
+      expect(gh.mock.calls).toHaveLength(3);
+      expect(gh.mock.calls.some(([, args]) => args[0] === 'label' || args[1] === 'edit')).toBe(false);
+    });
   it('recovers a transient add failure before removing the label', () => {
     const base = fixture();
     let adds = 0;
