@@ -66,6 +66,19 @@ export function isPendingConflictRebase(pr, defaultBranch = 'main') {
       || String(pr?.mergeable ?? '').toUpperCase() === 'CONFLICTING');
 }
 
+/** Fresh launch evidence: strict fields, pinned head, no holds, and current admission state. */
+export function isLaunchableConflictRebase(live, planned) {
+  const labels = Array.isArray(live?.labels) ? live.labels.map(l => typeof l === 'string' ? l : l?.name) : null;
+  return Boolean(labels && labels.every(l => typeof l === 'string' && l.length > 0)
+    && !labels.some(isConflictRebaseHoldLabel)
+    && SHA.test(planned?.headRefOid ?? '') && live?.headRefOid === planned.headRefOid
+    && live.headRefOid === planned.conflictRebase?.oldHead
+    && typeof planned.conflictRebase?.defaultBranch === 'string' && planned.conflictRebase.defaultBranch.length > 0
+    && live.state === 'OPEN' && live.isDraft === false
+    && (isAcceptedConflictRebase(live, planned.conflictRebase.defaultBranch)
+      || isPendingConflictRebase(live, planned.conflictRebase.defaultBranch)));
+}
+
 /** Plan after reconcile's stand-down/liveness/hold guards, using its effective conflict budgets. */
 export function planAcceptedConflictRebase({ pr, defaultBranch = 'main', mainSha, cap, ceiling }) {
   if (!isAcceptedConflictRebase(pr, defaultBranch)) return null;

@@ -71,6 +71,7 @@ import { FENCED_DATA_RULE, fenceUntrusted } from '../lib/mandate-fence.mjs';
  * infra-blocked recovery / the lease-reaper / the session-reaper / the hiccup sink — best-effort, never gating
  * the tick.
  */
+import { isLaunchableConflictRebase } from './accepted-conflict-rebase.mjs';
 import { appendBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { repeatedFindingPlan, resolveFixSafety } from './repeated-finding-reset.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
@@ -904,6 +905,7 @@ export function freeLaneNumbers({ exec = execFileSync, root = REPO_ROOT, lanePoo
  */
 export function tryResumeFix(planned, {
   demote = demoteConflictRebase,
+  readLive = readConflictRebaseLive,
   readCompletion,
   repo = 'we',
   root = REPO_ROOT,
@@ -989,14 +991,13 @@ export function tryResumeFix(planned, {
   return resumeBgSession(planned, {
     candidate,
     prepareResume: () => {
-      requireConflictRebaseDemotion(planned, { repo, root }, demote);
       // The agent reloads its own cwd, not the trigger's scratch directory. Legacy builders and
       // fixers need both repair helpers before this early-return path can resume them.
       const permissions = grantConflictHelper(candidateCwd);
       if (permissions?.ok !== true) throw new Error(`repair-helper permissions unwritten (${permissions?.reason ?? 'no result'})`);
     },
     prompt: withPlannedContext(buildResumePrompt({ pr: planned.pr, itemNum: planned.itemNum, cwd: candidateCwd }), planned),
-    repo, spawnAgent, listAgentsAll, stop, wait, claimOwner, acquireClaim, releaseClaim, claimRoot, sessionCwdFor, ensureSessionCwd,
+    repo, root, demote, readLive, spawnAgent, listAgentsAll, stop, wait, claimOwner, acquireClaim, releaseClaim, claimRoot, sessionCwdFor, ensureSessionCwd,
   });
 }
 
@@ -1008,6 +1009,7 @@ export function tryResumeFix(planned, {
  * candidate is this PR's own session; this function only performs the attempt.
  */
 export function resumeBgSession(planned, {
+  root = REPO_ROOT, demote = demoteConflictRebase, readLive = readConflictRebaseLive,
   candidate, prompt, repo = 'we', spawnAgent = defaultSpawnAgent, listAgentsAll = () => defaultListAgents({ all: true }),
   stop = stopSession, wait = defaultConfirmWait, claimOwner = fixDispatchClaimOwner(), acquireClaim = acquireFixDispatchClaim,
   releaseClaim = releaseFixDispatchClaim, claimRoot, sessionCwdFor = (id) => dispatchSessionCwd(id, { root: REPO_ROOT }),
@@ -1052,6 +1054,7 @@ export function resumeBgSession(planned, {
   // lane, by the time a resume is attempted) — this only affects where THIS one-shot trigger process starts.
   const resumeCwd = ensureSessionCwd(sessionCwdFor(candidate));
   let stdout = '';
+  try { assertLaunchable(planned, { repo, root, demote, readLive }); } catch (e) { releaseOurClaim(); throw e; }
   try { stdout = String(spawnAgent(resumeArgv, { cwd: resumeCwd }) ?? ''); } catch { stdout = ''; }
   const printedId = parseBackgroundedId(stdout);
 
@@ -1281,6 +1284,47 @@ export function demoteConflictRebase(planned, { repo = 'we', root = REPO_ROOT, e
   return result;
 }
 
+/** Uncached, bounded live read at the launch boundary; shared GitHub throttle applies. */
+function readConflictRebaseLive(pr, repo) {
+  return JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(pr), '--repo', ghRepoSlug(repo),
+    '--json', 'headRefOid,labels,state,isDraft,baseRefName,mergeStateStatus,mergeable'], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(),
+    killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
+  }));
+}
+
+/** The sole conflict-rebase launch gate. Proof is local to this call, never reusable by a retry. */
+export function assertLaunchable(planned, {
+  repo = 'we', root = REPO_ROOT, demote = demoteConflictRebase, readLive = readConflictRebaseLive,
+} = {}) {
+  if (planned.mode !== 'conflict-rebase') return;
+  const approvals = ['review:accepted', 'ready-to-merge', 'status:ready-to-merge'];
+  const names = live => live.labels.map(l => typeof l === 'string' ? l : l.name);
+  try {
+    const live = readLive(planned.pr, repo);
+    if (!isLaunchableConflictRebase(live, planned)) {
+      throw new Error('live head, labels, or conflict admission state changed or is incomplete');
+    }
+    const labels = names(live);
+    if (labels.some(l => approvals.includes(l))) {
+      requireConflictRebaseDemotion({ ...planned, labels }, { repo, root }, demote);
+    }
+    // Even an already-demoted episode needs a second fresh read: pending is not a cached proof.
+    const verified = readLive(planned.pr, repo);
+    if (!isLaunchableConflictRebase(verified, planned)
+        || !names(verified).includes('review:pending')
+        || names(verified).some(l => approvals.includes(l))) {
+      throw new Error('fresh live verification requires unchanged head, review:pending, no approvals or holds, and conflict admission');
+    }
+  } catch (cause) {
+    const error = cause?.kind === 'conflict-rebase-demotion-failed' ? cause
+      : Object.assign(new Error(`conflict-rebase launch refused: ${describeDispatchFailure(cause)}; refresh PR evidence before retrying`),
+        { kind: 'conflict-rebase-launch-refused' });
+    console.error(error.message);
+    throw error;
+  }
+}
+
 /** A CLI refusal or incomplete proof must never reach any fixer launch path. */
 function requireConflictRebaseDemotion(planned, options, demote) {
   if (planned.mode !== 'conflict-rebase') return;
@@ -1486,6 +1530,7 @@ export function writePrivateBorrowedPrompt(slug, text, base = tmpdir()) {
  */
 export function dispatchFix(planned, {
   demote = demoteConflictRebase,
+  readLive = readConflictRebaseLive,
   repo = 'we',
   root = REPO_ROOT,
   // Fixer context pack (`fix.contextPack`, `fix.localTests`) — the template arrives with the finding verbatim, the code
@@ -1605,7 +1650,6 @@ export function dispatchFix(planned, {
   let takeoverMarked = false; // card xx0055i — the takeover marker is up; a failure that proves no agent started must void it.
   let launchAttempted = false; // card xx0055i — a launch call (borrowed / wrapped / bg) has been issued: a failure may be indeterminate.
   try {
-    requireConflictRebaseDemotion(planned, { repo, root }, demote);
     const sessionSlug = sessionSlugFor(planned.itemNum, 'fix', planned.pr, '', repo);
     // #3960 — the repo-aware quintet, computed once from `repo`'s own profile (never re-derived here). The
     // token computation itself is repo-generic, so slice 5's capability gate (moved up to
@@ -1665,6 +1709,7 @@ export function dispatchFix(planned, {
       const promptFile = writeBorrowedPrompt(sessionSlug, withPlannedContext(prompt, planned));
       let handle;
       try {
+        assertLaunchable(planned, { repo, root, demote, readLive });
         launchAttempted = true;
         handle = spawnBorrowed({
           pr: planned.pr, num: planned.itemNum, sessionSlug, cwd: root,
@@ -1729,6 +1774,7 @@ export function dispatchFix(planned, {
       // 117 S3b — same argv, run as `claude -p` to completion by the detached wrapper. The handle is the wrapper's pid
       // (`pid:<n>`), stamped on the claim so the claim's liveness is that process (`isClaimRunnerDead`); the wrapper's
       // v2 record stands in for the `claude agents` row (`listWrappedWorkerAgents`). Claim kept, as for `--bg`.
+      assertLaunchable(planned, { repo, root, demote, readLive });
       launchAttempted = true;
       const launched = launchWrapped({
         role: 'fix', session: sessionSlug, bgArgv: argv, cwd: sessionCwd, env: workerSpawnEnv(), pr: planned.pr, item: planned.itemNum,
@@ -1745,6 +1791,7 @@ export function dispatchFix(planned, {
     // #3331 — READ THE REAL ID BACK OFF STDOUT, exactly as the resume branch above already does. `claude --bg`
     // discards `--session-id` and assigns its own, so the minted uuid addresses nothing; `agentId` is what
     // `claude agents`/`logs`/`stop` take. `sessionId` stays on the result for callers that already read it.
+    assertLaunchable(planned, { repo, root, demote, readLive });
     launchAttempted = true;
     const stdout = String(spawnAgent(argv, { cwd: sessionCwd }) ?? '');
     // #x0jphk5 — the claim is DELIBERATELY NOT released here on success: see this function's own docblock for
@@ -1890,6 +1937,7 @@ export function runReconcileFixDispatch({
   tryResumeRound = isUnderTestEnv() ? null : tryResumeRoundFix,
   dispatch = dispatchFix,
   demote = demoteConflictRebase,
+  readLive = readConflictRebaseLive,
   reconcile = runReconcilePass,
   readPrs,
   // R123 writes require caller permission, even when dispatch itself is stubbed (live smoke).
@@ -2272,21 +2320,13 @@ export function runReconcileFixDispatch({
     // gets, now extended to cover this earlier call site too.
     const executorDecision = !borrowed && fixExecutorRoute ? fixExecutorRoute({ ...entry, repo: repoKey, round: roundOf(entry) }) : null;
     let resumeAttempt = null;
-    let demotionResult;
-    const demoteOnce = (planned, options) => {
-      if (!demotionResult) {
-        // Retain verified proof for a cold start after an unsuccessful resume, without posting twice.
-        demotionResult = requireConflictRebaseDemotion(planned, options, demote);
-      }
-      return demotionResult;
-    };
     // A resume continues an existing Claude session and claim; a borrowed fix always starts fresh so its claim records the slot.
     if (entry.isConflict && !borrowed && executorDecision?.executor !== 'codex' && !entry.restack) {
       let attempt;
       try {
-        attempt = fixStep('resume', () => tryResume(entry, { root, repo: repoKey, demote: demoteOnce }), entry.pr);
+        attempt = fixStep('resume', () => tryResume(entry, { root, repo: repoKey, demote, readLive }), entry.pr);
       } catch (e) {
-        refusals.push({ pr: entry.pr, kind: e?.kind === 'conflict-rebase-demotion-failed' ? e.kind : 'dispatch-failed', why: describeDispatchFailure(e) });
+        refusals.push({ pr: entry.pr, kind: ['conflict-rebase-demotion-failed', 'conflict-rebase-launch-refused'].includes(e?.kind) ? e.kind : 'dispatch-failed', why: describeDispatchFailure(e) });
         continue;
       }
       if (attempt.resumed) {
@@ -2323,7 +2363,7 @@ export function runReconcileFixDispatch({
     }
     const lane = lanes.shift();
     try {
-      const result = fixStep('dispatch', () => dispatch({ ...entry, lane }, { root, repo: repoKey, demote: demoteOnce, extraArgs: agentArgsFromEnv(), resumeAttempt, ...(executorDecision ? { executorDecision } : {}), ...(borrowed ? { borrowed } : {}) }), entry.pr);
+      const result = fixStep('dispatch', () => dispatch({ ...entry, lane }, { root, repo: repoKey, demote, readLive, extraArgs: agentArgsFromEnv(), resumeAttempt, ...(executorDecision ? { executorDecision } : {}), ...(borrowed ? { borrowed } : {}) }), entry.pr);
       if (result?.held) {
         // #x0jphk5 — a `(repo, pr, headRefOid)` claim already held elsewhere: nothing was spawned, so the lane
         // this iteration popped went unused — return it to the pool for the NEXT entry, exactly as a
@@ -2347,7 +2387,7 @@ export function runReconcileFixDispatch({
       }
       if (entry.overlapExempt && !entry.restack) markRebaseExemptUsed(entry, exemptRebaseHeads); // card xd1tvd0 — one per head
     } catch (e) {
-      refusals.push({ pr: entry.pr, kind: e?.kind === 'conflict-rebase-demotion-failed' ? e.kind : 'dispatch-failed', why: describeDispatchFailure(e) });
+      refusals.push({ pr: entry.pr, kind: ['conflict-rebase-demotion-failed', 'conflict-rebase-launch-refused'].includes(e?.kind) ? e.kind : 'dispatch-failed', why: describeDispatchFailure(e) });
     }
   }
 
