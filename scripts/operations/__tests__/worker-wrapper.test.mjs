@@ -1,3 +1,5 @@
+import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
+const COMMAND_RULES_SUFFIX = `\n\n${NO_PROMPT_COMMAND_RULES}\n`;
 /**
  * @file worker-wrapper.test.mjs — item 117 slice S3a: the unified detached worker wrapper (D7 FINAL).
  * These run the wrapper against REAL child processes (node -e), so pid, stdin and timeout are proven, not mocked.
@@ -804,7 +806,7 @@ it('resumeArgvFrom preserves flags, replaces the identity and prompt, and leaves
   const argv = withStructuredOutput(['-p', '--session-id', 'original', '--permission-mode', 'auto', '--model', 'sonnet', '--settings', '{}', 'old']);
   const copy = [...argv];
   const out = resumeArgvFrom(argv, { sessionId: 'same', prompt: 'next' });
-  expect(out).toEqual(['-p', '--resume', 'same', ...argv.slice(3, -1), `next${STRUCTURED_OUTPUT_SUFFIX}`]);
+  expect(out).toEqual(['-p', '--resume', 'same', ...argv.slice(3, -1), (`next${STRUCTURED_OUTPUT_SUFFIX}` + COMMAND_RULES_SUFFIX)]);
   expect(argv).toEqual(copy);
   expect(out[out.indexOf('--json-schema') + 1]).toContain('"maxLength":280');
 });

@@ -1,3 +1,4 @@
+import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 import { appendBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { applyTestsFirstPolicy } from '../lib/tests-first-policy.mjs';
 import { readPreparePolicy } from '../conveyor/prepare-policy-settings.mjs';
@@ -2606,7 +2607,7 @@ export function buildAgentArgv({
   // fresh dispatch already gave a `--settings` PATH override to (see the non-resume branch below), and the
   // shim that override points at re-reads the shared token cache fresh on every `gh` call regardless of how
   // long the session has been running — so nothing is lost by never re-asserting it on resume.
-  if (resumeSessionId) return ['--bg', '--resume', String(resumeSessionId), prompt];
+  if (resumeSessionId) return ['--bg', '--resume', String(resumeSessionId), renderNoPromptCommandRules(prompt)];
   if (!table && payload?.launchKind) {
     const policy = readRoutingPolicy();
     const configured = resolveOperationRoute({ operation: payload.launchKind, available: ['claude'], gateClosed: policy.criticalWorkGate.kinds.includes(payload.launchKind), policy });
@@ -2669,7 +2670,7 @@ export function buildAgentArgv({
     ...args,
     ...(!table ? [...effortArgs, ...modelArgs] : []),
     ...advisorArgv(advisor),
-    withAdvisorBrief(prompt, advisor),
+    renderNoPromptCommandRules(withAdvisorBrief(prompt, advisor)),
   ];
 }
 

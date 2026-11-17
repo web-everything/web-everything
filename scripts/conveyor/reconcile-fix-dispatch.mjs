@@ -1,3 +1,4 @@
+import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 import { safeAdoptYield } from '../lib/daemon-rebuild/adopt-yield.mjs';
 import { admitMqFailureRoute } from './mq-failure-intake.mjs';
 import { refreshMqFailureHeadSync, mqFailureRefreshIo } from '../lib/mq-failure-refresh.mjs';
@@ -225,7 +226,7 @@ export function fixBriefPath(root = REPO_ROOT) {
 
 /** The fix brief `dispatchFix` sends by default: the template, its context pack, then the build requirements once. */
 export function readFixBriefTemplate(root = REPO_ROOT, pack = (template) => template) {
-  return appendBuildRequirements(pack(readFileSync(fixBriefPath(root), 'utf8')), { policy: resolveBuildPolicy({ log: line => console.error(line) }) });
+  return renderNoPromptCommandRules(appendBuildRequirements(pack(readFileSync(fixBriefPath(root), 'utf8')), { policy: resolveBuildPolicy({ log: line => console.error(line) }) }));
 }
 
 /** we:scripts/conveyor/reconcile-fix-dispatch.mjs#RESUME_CONFIRM_MAX_ATTEMPTS — hardening (2) from the
@@ -783,7 +784,7 @@ export function findResumeCandidate({ body, agentsAll, readCompletion, onDecline
  */
 export function buildResumePrompt({ pr, itemNum, cwd = null }) {
   const itemRef = itemNum ? `item #${itemNum}` : 'no backlog item';
-  return [
+  return renderNoPromptCommandRules([
     `New work on PR #${pr} (${itemRef}), which you previously worked: it has drifted into a real merge `
       + 'conflict against `main` since your last commit here — GitHub reports `mergeable: CONFLICTING`.',
     '',
@@ -795,7 +796,7 @@ export function buildResumePrompt({ pr, itemNum, cwd = null }) {
       '(your own and whatever landed on `main` since), run the gate green, and push. If you cannot safely ' +
       "resolve it, follow `skills-src/conveyor/fix-agent-brief.md`'s own conflict-escalation step: run " +
       `\`node scripts/conveyor/stand-down.mjs ${pr} --reason=conflict\`, then report and stop — do not guess.`,
-  ].join('\n');
+  ].join('\n'));
 }
 
 /** we:scripts/conveyor/reconcile-fix-dispatch.mjs#freeLaneNumbers — the SAME `lane-pool.mjs list --acquirable

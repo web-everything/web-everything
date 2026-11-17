@@ -1,3 +1,7 @@
+// Generated no-prompt rules: source scripts/lib/no-prompt-command-rules.mjs; pinned by the whole-tree test.
+const NO_PROMPT_COMMAND_RULES = "## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.\n- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`.\n- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.";
+function renderNoPromptCommandRules(brief) { return brief.includes(NO_PROMPT_COMMAND_RULES) ? brief : brief + '\n\n' + NO_PROMPT_COMMAND_RULES + '\n'; }
+
 export const meta = {
   name: 'batch-parallel-execute',
   description: 'Execute a /workflow (parallel) batch on the #2183 PR-fan-out model: a light probe detects the constellation repos each item spans → provision a lane pool per affected repo (+ create the ready-to-merge label once) → work each item as its OWN agent in its coupled lane CLONE (claim-in-lane, work, resolve, write the lane manifest to a SCRATCH file, push lane/<n> per repo), then OPEN A READY-TO-MERGE PR per pushed ref (pr-land --label-on-green embeds the manifest in the WE PR body — xnsk54v — and waits for required checks, labels only when green — #2199). The producer makes ZERO commits to main, never integrates inline, and never launches or waits on the drain — it completes when every item is an open ready-to-merge PR. A separate, optional drain lands them later in blockedBy order. Per-item progress. Returns a ledger.',
@@ -272,7 +276,7 @@ log(`Probing ${items.length} packed item(s) for the constellation repos they spa
 let probedCount = 0;
 const probedRaw = await parallel(items.map((it) => () =>
   agent(
-    [
+    renderNoPromptCommandRules([
       RETURN_HYGIENE,
       RELAY_GUARD,
       NO_FULL_SUITE_NO_SUBAGENT_GUARD,
@@ -289,7 +293,7 @@ const probedRaw = await parallel(items.map((it) => () =>
       `(subtle cross-cutting design, dense algorithmic/protocol reasoning, or a large multi-file refactor where a`,
       `cheaper model would plausibly ship a wrong-but-plausible edit) → that lane escalates to Opus. Rare; when in`,
       `doubt, false. Return ONLY the structured object { num, extraRepos, complex }.`,
-    ].join(' '),
+    ].join(' ')),
     { label: `probe:${it.num}`, phase: 'Probe', schema: PROBE_SCHEMA, effort: 'low' },
   ).then((p) => {
     probedCount++;
@@ -330,7 +334,7 @@ const provisionPlan = INTEGRATION_ORDER
 let lanePools = {}; // repo -> [absolute lane dir, …] (index-aligned to lanePlan[repo])
 
 const setup = await agent(
-  [
+  renderNoPromptCommandRules([
     RETURN_HYGIENE,
     RELAY_GUARD,
     NO_FULL_SUITE_NO_SUBAGENT_GUARD,
@@ -355,7 +359,7 @@ const setup = await agent(
     `whose value is the ORDERED array of that repo's absolute ACQUIRABLE lane-clone dirs, EXACTLY as`,
     `\`list --json --acquirable\` printed them (foreign-leased lanes are already filtered out; do NOT re-add them).`,
     `Return ONLY the object.`,
-  ].join(' '),
+  ].join(' ')),
   {
     label: 'setup:provision+label', phase: 'Provision',
     schema: {
@@ -611,7 +615,7 @@ function laneItemPrompt(it, laneDirs) {
     `resolveCommit (git rev-parse HEAD in the WE clone after the manifest commit), changedFiles (REPO-QUALIFIED`,
     `"<repo>:<path>"), gate (green/red). Return ONLY the structured object.`,
   );
-  return lines.join('\n');
+  return renderNoPromptCommandRules(lines.join('\n'));
 }
 
 const laneSchedule = buildLaneSchedule(workItems);
@@ -641,7 +645,7 @@ const results = await parallel(workItems.map((it) => () => {
   const laneDirs = Object.fromEntries(Object.entries(assign.perRepo).map(([r, p]) => [r, p.dir]));
   const releaseAll = () => { for (const p of Object.values(assign.perRepo)) p.release(); };
   return Promise.all(Object.values(assign.perRepo).map((p) => p.waitFor))
-    .then(() => agent(laneItemPrompt(it, laneDirs), { label: `lane:${disp}`, phase: 'Lanes', schema: ITEM_RESULT_SCHEMA, model: laneModelFor(it) }))
+    .then(() => agent(renderNoPromptCommandRules(laneItemPrompt(it, laneDirs)), { label: `lane:${disp}`, phase: 'Lanes', schema: ITEM_RESULT_SCHEMA, model: laneModelFor(it) }))
     .then((r) => {
       itemsDone++;
       releaseAll();
@@ -717,7 +721,7 @@ if (toReconcile.length) {
   const implPaths = Object.fromEntries(Object.entries(REPOS).filter(([k]) => k !== 'we').map(([k, v]) => [k, v.path]));
   log(`#2216 label reconcile: ${toReconcile.length} PR(s) came up labelled:false (check-timeout) — labelling the now-green ones, carrying the rest for /resume…`);
   const res = await agent(
-    [
+    renderNoPromptCommandRules([
       RETURN_HYGIENE, RELAY_GUARD, NO_FULL_SUITE_NO_SUBAGENT_GUARD, ``,
       `#2478/#2216 LABEL RECONCILE. Some /workflow lanes OPENED a PR but could NOT apply the \`${READY_LABEL}\``,
       `label: their \`pr-land --label-on-green\` wait outlasted the required checks (check-timeout), so the PR is`,
@@ -741,7 +745,7 @@ if (toReconcile.length) {
       `   \`carried\` (reason "check-red" | "still-pending"). It rides forward for /resume; never a silent drop.`,
       ``,
       `Return { labelled: [pr nums you labelled], carried: [{ pr, reason }] }.`,
-    ].join('\n'),
+    ].join('\n')),
     {
       label: 'finalize:label-reconcile', phase: 'Finalize',
       schema: {
@@ -778,7 +782,7 @@ if (toReconcile.length) {
 const queued = [];
 if (toQueue.length) {
   const res = await agent(
-    [
+    renderNoPromptCommandRules([
       RETURN_HYGIENE, RELAY_GUARD, NO_FULL_SUITE_NO_SUBAGENT_GUARD, ``,
       `In the PRIMARY WE checkout (${PRIMARY_ROOT}) on branch main, record a LOCAL ready-to-merge signal for the`,
       `items that opened a PR this run — WITHOUT committing or pushing anything (main must stay clean, #2183).`,
@@ -788,7 +792,7 @@ if (toQueue.length) {
       `ready-to-merge PRs (it reads each item's manifest off its pushed lane ref) and stops the next readiness`,
       `pack from re-offering them. Do NOT merge, do NOT integrate, do NOT delete any lane/* ref. Return`,
       `{ queued: [nums written], notes }.`,
-    ].join(' '),
+    ].join(' ')),
     {
       label: 'finalize:local-queue-signal', phase: 'Finalize',
       schema: { type: 'object', required: ['queued'], additionalProperties: true, properties: { queued: { type: 'array', items: { type: 'string' } }, notes: { type: 'string' } } },

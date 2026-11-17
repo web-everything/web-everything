@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 /**
  * @file scripts/operations/worker-wrapper.mjs
  * @description THE UNIFIED WORKER WRAPPER (item 117, slice S3a; decision D7 FINAL, operator 2026-10-08).
@@ -124,7 +125,7 @@ export function resumeArgvFrom(argv, { sessionId, prompt }) {
   const index = out.indexOf('--session-id');
   if (index < 0) throw new TypeError('operations: resumeArgvFrom needs --session-id');
   out.splice(index, 2, '--resume', sessionId);
-  return [...out, `${prompt}${STRUCTURED_OUTPUT_SUFFIX}`];
+  return [...out, renderNoPromptCommandRules(`${prompt}${STRUCTURED_OUTPUT_SUFFIX}`)];
 }
 
 export function resumeRequestPath(specDir, session) {

@@ -274,3 +274,12 @@ land the `preparedDate` via the lane→PR; `resolve` is the *decision* turn's jo
 Prepare is the upstream feeder for `/next decision`: it pays the research cost once, ahead of time, so
 the decision turn is a fast ratification. Run `/prepare` to manufacture ready-to-ratify decisions, then
 `/next decision` to ratify them.
+
+<!-- Generated from scripts/lib/no-prompt-command-rules.mjs; whole-tree test pins this copy. -->
+## No-prompt command rules
+
+- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.
+- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.
+- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.
+- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`.
+- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.

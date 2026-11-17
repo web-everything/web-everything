@@ -1,3 +1,4 @@
+import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 /**
  * we:scripts/conveyor/fix-resume.mjs — round N>1 of a fix: resume the previous round's fixer session, and move to a
  * stronger model from round 3 (card xrbu1bp, items 2 and 3 after card xx0055i).
@@ -181,7 +182,7 @@ export function buildRoundResumePrompt({ pr, itemNum = null, round, cap = null, 
         + 'in place of `--base=...` (the two cannot be combined), then `cd` into it.'
       : `Your old lane-${lane?.lane} was released when your last turn ended and has been reused since. The PR head is exactly `
         + `the \`${sha}\` you left, so nothing is lost: acquire a fresh lane exactly as step 1 of your brief says (\`--base=\` the PR ref).`;
-  return [
+  return renderNoPromptCommandRules([
     `# New review round — PR #${pr} (${item}), round ${round}${cap ? ` of ${cap}` : ''}`,
     '',
     'You fixed the previous round of this PR in this session. The reviewer sent it back again after your push. You are',
@@ -195,7 +196,7 @@ export function buildRoundResumePrompt({ pr, itemNum = null, round, cap = null, 
     'then steps 2 to 9 (step 1 is the lane above). Answer every finding below, especially any marked as raised again.',
     '',
     history || '(no round history could be read for this PR — read the newest review comments on the PR first)',
-  ].join('\n');
+  ].join('\n'));
 }
 
 // ── IO ─────────────────────────────────────────────────────────────────────────────────────────────────────────

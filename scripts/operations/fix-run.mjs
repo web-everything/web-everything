@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 import { buildStandDownComment } from '../conveyor/stand-down.mjs';
 import { repeatedFindingPlan, applyScopeReset, resolveFixSafety } from '../conveyor/repeated-finding-reset.mjs';
 /**
@@ -1060,11 +1061,11 @@ export async function runFixCli(argv = [], {
       try {
         spawned = await provider.spawn({
           taskKind: launch.taskKind, usageTaskKind: launch.repairKind === 'ci-heal' ? 'ci-heal' : launch.taskKind, repo: launch.repo, pr, caller: 'fix-run.mjs',
-          sessionId: undefined, prompt: mergePrompt + (launch.repairKind === 'ci-heal'
+          sessionId: undefined, prompt: renderNoPromptCommandRules(mergePrompt + (launch.repairKind === 'ci-heal'
             ? SANDBOX_PREAMBLE.replace(/The reviewer's finding[\s\S]*?authoritative ask\.\n/, 'The failing checks and tests are in the CI FAILURE CONTEXT section below.\n')
             : SANDBOX_PREAMBLE) + (openSendBacks.length
             ? `## Required fix-evidence citations\nCopy these keys into .fix-evidence.md and replace each <file:line> with a changed, tracked file and its line at HEAD.\n${FENCED_DATA_RULE}\n${fenceUntrusted('material', renderRequiredCitations(openSendBacks))}\n\n`
-            : '') + prContext + brief, lane: laneNum, sessionSlug, item: launch.item ?? '', attemptTag: '',
+            : '') + prContext + brief), lane: laneNum, sessionSlug, item: launch.item ?? '', attemptTag: '',
           ...(launch.model ? { model: launch.model } : {}), ...(launch.effort ? { effort: launch.effort } : {}),
         }, { resolveLane: () => lanePath, ...(launch.provider === 'codex' ? {
           spawnAgent: async (...args) => {

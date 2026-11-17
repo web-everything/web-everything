@@ -73,3 +73,12 @@ looked at.
   part — integrate and review the whole at full scale before calling any of it done.
 - **Stalled convergence is a finding.** If alternating-lens rounds won't go two-clean-in-a-row, stop honestly:
   the state model may be wrong (back to phase 1) or the ceiling is the model — say so, don't ship the churn.
+
+<!-- Generated from scripts/lib/no-prompt-command-rules.mjs; whole-tree test pins this copy. -->
+## No-prompt command rules
+
+- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.
+- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.
+- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.
+- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`.
+- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.

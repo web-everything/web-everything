@@ -1,3 +1,4 @@
+import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 /**
  * Card 130 (S3) - the coroner's LLM sample.
  *
@@ -246,7 +247,7 @@ export function appendRankingRow(file, row, { io = fs } = {}) {
 export async function makeSummariser(knobs, { runId } = {}) {
   const { judgeSpawn } = await import('../lib/judge-spawn.mjs');
   return async (rec) => {
-    const r = await judgeSpawn({ mandate: MANDATE, input: sessionInput(rec), shape: SAMPLE_SHAPE, model: knobs.model, effort: knobs.effort, budget: knobs.budgetUsd, runId: runId ?? 'coroner-sample', lens: String(rec.session) });
+    const r = await judgeSpawn({ mandate: renderNoPromptCommandRules(MANDATE), input: sessionInput(rec), shape: SAMPLE_SHAPE, model: knobs.model, effort: knobs.effort, budget: knobs.budgetUsd, runId: runId ?? 'coroner-sample', lens: String(rec.session) });
     return { value: r.value, costUsd: r.costUsd };
   };
 }

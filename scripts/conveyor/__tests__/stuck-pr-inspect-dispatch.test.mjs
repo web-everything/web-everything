@@ -1,3 +1,4 @@
+import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
 /**
  * @file scripts/conveyor/__tests__/stuck-pr-inspect-dispatch.test.mjs
  * @description Pins the diagnosis-only inspection dispatch (epic #3383): brief-fill refusals, the `inspect-*`
@@ -47,7 +48,7 @@ describe('fillInspectBrief', () => {
 
   it('substitutes every declared placeholder', () => {
     const { prompt, unknownTokens } = fillInspectBrief(template, values);
-    expect(prompt).toBe('PR 2505 in web-everything/web-everything as inspect-2505 — stage conflict, 390m over 45m.');
+    expect(prompt).toBe(`PR 2505 in web-everything/web-everything as inspect-2505 — stage conflict, 390m over 45m.\n\n${NO_PROMPT_COMMAND_RULES}\n`);
     expect(unknownTokens).toEqual([]);
   });
 
@@ -110,11 +111,13 @@ describe('inspectDispatchDisallowedToolsArgs', () => {
       'git restore .', 'git rm -r x', 'git worktree add ../x', 'git -C . reset --hard', 'git -c core.x=y clean -fdx',
     ]) expect(blocked(cmd), cmd).toBe(true);
   });
-  it('WIRING: the brief never tells the agent to run a git command (it is denied git wholesale)', () => {
+  it('WIRING: the brief adds no git commands beyond the exact shared safety rules (git is denied wholesale)', () => {
     const brief = readFileSync(
       join(dirname(fileURLToPath(import.meta.url)), '../../../skills-src/conveyor/stuck-pr-inspect-brief.md'), 'utf8',
     );
-    expect([...brief.matchAll(/`(git [^`]+)`/g)].map((m) => m[1])).toEqual([]);
+    expect(brief.split(NO_PROMPT_COMMAND_RULES)).toHaveLength(2);
+    expect([...brief.matchAll(/`(git [^`]+)`/g)].map((m) => m[1]))
+      .toEqual([...NO_PROMPT_COMMAND_RULES.matchAll(/`(git [^`]+)`/g)].map((m) => m[1]));
   });
   it('the brief tells the agent to redact secrets before quoting any log/process output in its public comment', () => {
     const brief = readFileSync(

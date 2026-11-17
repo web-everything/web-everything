@@ -1,3 +1,4 @@
+import { renderNoPromptCommandRules } from './no-prompt-command-rules.mjs';
 /** Bounded, advisory red-team of a sensitive worker brief before implementation. */
 import { openSync, fstatSync, readSync, closeSync, constants } from 'node:fs';
 import { isGuardPath } from './round-judge.mjs';
@@ -81,7 +82,7 @@ const SHAPE = {
 
 async function defaultRun({ files, prep, acceptance, policy, log }) {
   const result = await judgeSpawn({
-    mandate: `Find adversarial attack classes against the supplied prep and acceptance. Each class must have a concrete test. Return only {classes:[{attack,test}]}, at most ${policy.maxClasses} classes. You have no tools.\n${FENCED_DATA_RULE}`,
+    mandate: renderNoPromptCommandRules(`Find adversarial attack classes against the supplied prep and acceptance. Each class must have a concrete test. Return only {classes:[{attack,test}]}, at most ${policy.maxClasses} classes. You have no tools.\n${FENCED_DATA_RULE}`),
     input: fenceUntrusted('material', JSON.stringify({ files, prep, acceptance })),
     shape: SHAPE, allowedTools: null, runId: 'brief-red-team', timeoutMs: policy.timeoutMs,
     retries: 0, log,

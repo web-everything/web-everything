@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 /**
  * @file scripts/conveyor/stuck-pr-inspect-dispatch.mjs
  * @description DISPATCH ONE DIAGNOSIS-ONLY INSPECTION AGENT for one stuck PR (epic #3383's stuck-PR watch).
@@ -112,7 +113,7 @@ export function fillInspectBrief(template, values = {}) {
       + `Spell it exactly as one of ${INSPECT_BRIEF_PLACEHOLDERS.map((n) => `{{${n}}}`).join(', ')}.`,
     );
   }
-  return { prompt, unknownTokens: [...unknown].sort() };
+  return { prompt: renderNoPromptCommandRules(prompt), unknownTokens: [...unknown].sort() };
 }
 
 /** `inspect-<pr>` for WE, `inspect-<tag>-<pr>` for a sibling repo — `we:scripts/conveyor/session-slug.mjs`'s
