@@ -4422,6 +4422,20 @@ an unpublished local head, an exact-head pass, and another head's fingerprinted 
 the resolved local SHA without fetching the unpublished lane ref. A failed diff or main fetch still
 refuses. Include valid JSON negative records with invalid timestamps or contradictory findings next
 to an older pass, plus carried and waived paths; malformed records require repair before re-auditing.
+## Bounded red-team probe fairness
+
+`red-team-dispatch-queue.test.mjs` pins the two-probe limit per repository and
+least-recently-probed turns persisted as optional `lastProbeTurn` entry fields.
+Keep historical entries without the field loadable, reject malformed turns, and
+exercise five still-blocked entries across three ticks with a reload between ticks.
+Probe selection must preserve runnable FIFO admission and distinguish waiting for
+a probe turn from disabled probes and runnable capacity holds.
+Newly blocked entries (including runnable entries with an old turn) must join the
+tail using the same overflow rebase as probe admission. Keep a probe's current turn
+when it stays blocked. Replay two new planner skips per tick alongside four blocked
+heads across restarts, and bound repeat probes by `ceil(blockedCount / 2)` ticks;
+new arrivals must never overtake heads already waiting in the rotation.
+
 Operator prototype-load waiver tests live in `scripts/operations/__tests__/ruled-weakened-store.test.mjs`.
 Use an injected HOME and filesystem: the append-only ops store lives under
 `~/workspace/.operations/coordination/ruled-weakened.jsonl`. Tool, platform, then ops entries
