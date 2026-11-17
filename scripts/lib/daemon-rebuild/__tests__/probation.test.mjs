@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { acquireLockDir, lockDirFor, makeLockEntry, readLockEntry, releaseLockDir } from '../../../readiness/file-locks.mjs';
@@ -1001,7 +1001,8 @@ describe('S2a adoption identity and synchronous liveness', () => {
       const f = fixture();
       // Use this checkout only for read-only HEAD resolution. State is isolated
       // under f.env; no fixture Git writes or hand-written tick JSON are needed.
-      const root = fileURLToPath(new URL('../../../../', import.meta.url));
+      // Resolve on disk: Vite rewrites new URL(..., import.meta.url) as an asset URL.
+      const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../../..');
       const resolved = spawnSync('git', ['rev-parse', 'HEAD'], {
         cwd: root, env: f.env, encoding: 'utf8', timeout: 5000, maxBuffer: 4096,
       });
