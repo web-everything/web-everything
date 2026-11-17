@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import { resolve, dirname, relative } from 'node:path';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { resolve, dirname, relative, join } from 'node:path';
+import { tmpdir } from 'node:os';
 import yaml from 'js-yaml';
 
 const HEAD = 'a'.repeat(40);
@@ -93,13 +94,53 @@ describe('review-gate workflow contract', () => {
       expect(paths.some(path => file === path || file.startsWith(path + '/')), file).toBe(true);
     }
   });
-  it('no-jq-fast-path-no-npm-ci-and-setup-node-without-cache', () => {
-    const executable = steps.map(step => step.run ?? '').join('\n');
-    expect(executable).not.toMatch(/\bjq\b|\bnpm\s+ci\b/);
+  it('supports-the-legacy-trusted-main-script-before-the-new-script-lands', () => {
+    const compatibility = steps.find(step => step.name === 'Prepare legacy gate dependencies');
+    expect(compatibility).toBeDefined();
+    const root = mkdtempSync(join(tmpdir(), 'review-gate-transition-'));
+    try {
+      mkdirSync(join(root, 'scripts'));
+      mkdirSync(join(root, 'bin'));
+      for (const command of ['git', 'npm']) {
+        const file = join(root, 'bin', command);
+        writeFileSync(file, `#!/bin/sh\nprintf '%s\\n' '${command}' \"$@\" >> \"$TRACE\"\nexit \"\${${command.toUpperCase()}_STATUS:-0}\"\n`);
+        chmodSync(file, 0o755);
+      }
+      const entry = join(root, 'scripts/check-review-gate.mjs');
+      const trace = join(root, 'trace');
+      function prepare(source, status = {}) {
+        writeFileSync(entry, source);
+        writeFileSync(trace, '');
+        const child = spawnSync('bash', ['-e', '-c', compatibility.run], { cwd: root,
+          env: { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}`, TRACE: trace, ...status }, encoding: 'utf8' });
+        expect(child.error).toBeUndefined();
+        return { status: child.status, calls: readFileSync(trace, 'utf8').trim().split('\n').filter(Boolean) };
+      }
+      // Main still has these static imports until this PR merges. Test each independently.
+      for (const dependency of ['proc-read', 'review-escalation']) {
+        const legacy = `import { value } from './lib/${dependency}.mjs';\n`;
+        expect(prepare(legacy)).toEqual({ status: 0,
+          calls: ['git', 'sparse-checkout', 'disable', 'npm', 'ci', '--ignore-scripts'] });
+        expect(prepare(legacy, { GIT_STATUS: '9' })).toEqual({ status: 9,
+          calls: ['git', 'sparse-checkout', 'disable'] });
+        expect(prepare(legacy, { NPM_STATUS: '8' }).status).toBe(8);
+      }
+      expect(prepare(readFileSync('scripts/check-review-gate.mjs', 'utf8'))).toEqual({ status: 0, calls: [] });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+  it('no-jq-fast-path-no-npm-ci-outside-legacy-setup-and-setup-node-without-cache', () => {
+    const compatibility = steps.find(step => step.name === 'Prepare legacy gate dependencies');
+    const executable = steps.filter(step => step !== compatibility).map(step => step.run ?? '').join('\n');
+    expect(steps.map(step => step.run ?? '').join('\n')).not.toMatch(/\bjq\b/);
+    expect(executable).not.toMatch(/\bnpm\s+ci\b/);
     expect(steps.some(step => step.id === 'fast' || /steps\.fast\./.test(String(step.if)))).toBe(false);
     const setup = steps.filter(step => step.uses?.startsWith('actions/setup-node@'));
     expect(setup).toHaveLength(1); expect(setup[0].with).not.toHaveProperty('cache');
     expect(steps.findIndex(step => step.uses?.startsWith('actions/checkout@'))).toBeLessThan(steps.indexOf(setup[0]));
     expect(steps.indexOf(setup[0])).toBeLessThan(steps.findIndex(step => step.name === 'review-gate verdict'));
+    expect(steps.indexOf(setup[0])).toBeLessThan(steps.indexOf(compatibility));
+    expect(steps.indexOf(compatibility)).toBeLessThan(steps.findIndex(step => step.name === 'review-gate verdict'));
   });
 });

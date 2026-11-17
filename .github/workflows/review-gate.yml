@@ -68,6 +68,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      # Until this PR lands, main's gate still statically imports proc-read and
+      # review-escalation, including their transitive modules and npm packages.
+      # Restore its original dependency setup only for that trusted legacy code.
+      # The new gate keeps the sparse checkout and needs no npm install.
+      - name: Prepare legacy gate dependencies
+        run: |-
+          if [ -f scripts/check-review-gate.mjs ] && grep -Eq "^import .*from ['\"]\./lib/(proc-read|review-escalation)\.mjs['\"]" scripts/check-review-gate.mjs; then
+            git sparse-checkout disable
+            npm ci --ignore-scripts
+          fi
       - name: review-gate verdict
         env:
           REPO: ${{ github.repository }}
