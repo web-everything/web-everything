@@ -4438,10 +4438,18 @@ Keep `review-red-team-on-skip-r100-proof.test.mjs` alongside the non-empty accep
 proof, other-head proof, and unreadable-proof regressions in
 `review-red-team-on-skip-audit-round3.test.mjs`.
 
-Escalation notification state is separate from dispatch history. Delivery failures
-remain pending for a later tick, with at most three attempts per repository/PR/head
-in a daemon history. Only successful delivery marks the escalation done. The final
-failed attempt emits one best-effort `escalation-notify-failed` daemon event and an
-operator-inspection diagnostic; it never resumes dispatch or retries indefinitely.
-Cover throwing and error-result sinks, rejection, in-flight promises, successful
-deduplication, and the exhausted retry bound.
+Escalation notification state is separate from dispatch history. While the escalation
+is open, delivery failures retry indefinitely: the interval starts at one minute,
+doubles after each failure, and caps at thirty minutes. Only successful delivery
+marks the escalation done. The first failure emits a best-effort
+`escalation-notify-failed` daemon event and an operator-inspection diagnostic;
+subsequent failure events are at most hourly. Cover throwing and error-result sinks,
+rejection, in-flight promises, successful deduplication, and recovery after many failures.
+Use an injected clock to prove each retry boundary, the interval cap, and event spacing
+in `review-red-team-on-skip-audit-round4.test.mjs`.
+
+An older-head red-team result may settle an equal net diff only when the shared
+carryAcrossRebase setting resolves to on. With carry disabled, use the full-review
+decision, including its label and formal-review holds. Exact-head settlement does
+not depend on this setting. Keep both setting values and the held fallback paths
+covered in the round-four regression suite.

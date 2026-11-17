@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from 'vitest';
-import { ESCALATION_NOTIFY_MAX_ATTEMPTS, planRedTeamOnSkip, runRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
+import { planRedTeamOnSkip, runRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
 import { redTeamOwedFor } from '../review-red-team-policy.mjs';
 
 const repo = 'example/project', pr = 42, head = 'a'.repeat(40), otherHead = 'b'.repeat(40);
@@ -86,28 +86,34 @@ describe('round 3: escalation notification delivery', () => {
     f.options.escalate.mockImplementationOnce(() => { throw Error('sink unavailable'); });
     expect(f.tick().rows[0]).toMatchObject({ escalate: true, settleError: 'sink unavailable' });
     expect(f.options.escalate).toHaveBeenCalledOnce();
+    f.options.now = () => 2_060_000;
     f.tick();
     expect(f.options.escalate).toHaveBeenCalledTimes(2);
     f.tick();
     expect(f.options.escalate).toHaveBeenCalledTimes(2);
-    expect(f.options.emit).not.toHaveBeenCalled();
+    expect(f.options.emit).toHaveBeenCalledOnce();
     expect(f.options.lastDispatch.size).toBe(0);
   });
 
-  it.each(['throw', 'error result'])('emits escalation-notify-failed once at the retry bound and stops (%s)', kind => {
+  it.each(['throw', 'error result'])('emits escalation-notify-failed on first failure and keeps retrying with backoff (%s)', kind => {
     const f = escalationFixture();
     f.options.escalate.mockImplementation(() => {
       if (kind === 'throw') throw Error('sink unavailable');
       return { outcome: 'error', reason: 'sink unavailable' };
     });
-    f.tick(); f.tick(); f.tick();
-    expect(ESCALATION_NOTIFY_MAX_ATTEMPTS).toBe(3);
-    expect(f.options.escalate).toHaveBeenCalledTimes(ESCALATION_NOTIFY_MAX_ATTEMPTS);
+    let clock = 0;
+    f.options.now = () => clock;
+    f.tick();
     expect(f.options.emit).toHaveBeenCalledOnce();
     expect(f.options.emit).toHaveBeenCalledWith({ kind: 'escalation-notify-failed', repo, pr, daemon: 'review',
-      detail: { head, reason: 'review-unfinished', attempts: ESCALATION_NOTIFY_MAX_ATTEMPTS, error: 'sink unavailable' } });
+      detail: { head, reason: 'review-unfinished', attempts: 1, error: 'sink unavailable' } });
+    for (const delay of [60_000, 120_000, 240_000, 480_000]) {
+      clock += delay;
+      f.tick();
+    }
+    expect(f.options.escalate).toHaveBeenCalledTimes(5);
     f.tick(); f.tick();
-    expect(f.options.escalate).toHaveBeenCalledTimes(ESCALATION_NOTIFY_MAX_ATTEMPTS);
+    expect(f.options.escalate).toHaveBeenCalledTimes(5);
     expect(f.options.emit).toHaveBeenCalledOnce();
     expect(f.options.log).toHaveBeenCalledWith(expect.stringContaining('operator must inspect'));
     expect(f.options.lastDispatch.size).toBe(0);
@@ -131,8 +137,9 @@ describe('round 3: escalation notification delivery', () => {
     f.options.escalate.mockReturnValueOnce(delivery);
     f.tick();
     await new Promise(done => setImmediate(done));
+    f.options.now = () => 2_060_000;
     f.tick(); f.tick();
     expect(f.options.escalate).toHaveBeenCalledTimes(2);
-    expect(f.options.emit).not.toHaveBeenCalled();
+    expect(f.options.emit).toHaveBeenCalledOnce();
   });
 });

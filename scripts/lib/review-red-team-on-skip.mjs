@@ -16,7 +16,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pidExistence, readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir, withRedTeamStatusClaim,
   readCarriedCheckUnpublished, createCarriedCheckPublisher } from './drain-red-team-evidence.mjs';
-import { findCarriableVerdict } from './rebase-verdict-carry.mjs';
+import { findCarriableVerdict, resolveCarryAcrossRebase } from './rebase-verdict-carry.mjs';
 import { latestRedTeamResultPosition, redTeamForHead, redTeamMarker, parseRedTeamComment, redTeamResultCommentForHead, redTeamHoldDecision, isPublishableRedTeamResult, redTeamResultId } from './red-team-gate.mjs';
 import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
 import { foreignStaleOwnerDead, localPidLive } from './red-team-foreign-host-stale.mjs';
@@ -728,6 +728,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (needsReview) {
         const fallback = fullReviewDecision('unprovable head move needs a full review');
         if (fallback.action !== 'review') return fallback;
+        if (resolveCarryAcrossRebase({ env }).value !== 'on') return fallback;
         const carriable = findCarriableVerdict({ comments: rawPr.comments, headSha: head, pr });
         if (carriable && storedHead === carriable.sha
           && isPublishableRedTeamResult(redTeamForHead(rawPr.comments, pr, carriable.sha))) {
@@ -862,7 +863,9 @@ function progressFingerprint(raw, check) {
 /** Cooldown key of a carried-check republish, separate from a round dispatch's key on the same head. */
 const carriedCheckRetryKey = (repo, pr, head) => `${repo}#${pr}@${head}#carried-check`;
 export const CARRIED_CHECK_ESCALATION = 'carried red-team check not confirmed after retry; operator must inspect the head\'s check history';
-export const ESCALATION_NOTIFY_MAX_ATTEMPTS = 3;
+const ESCALATION_NOTIFY_BASE_DELAY_MS = 60_000;
+const ESCALATION_NOTIFY_MAX_DELAY_MS = 30 * 60_000;
+const ESCALATION_NOTIFY_EVENT_INTERVAL_MS = 60 * 60_000;
 const safeLine = value => String(value).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ').slice(0, 600);
 
 /** Complete review evidence: at most ten requests and one MiB, never a truncated success. */
@@ -1052,15 +1055,20 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       const { escalated, notifications } = skipGuardState(history);
       if (escalated.has(key)) return;
       const notification = notifications.get(key) ?? { attempts: 0, pending: false };
-      if (notification.pending || notification.attempts >= ESCALATION_NOTIFY_MAX_ATTEMPTS) return;
+      if (notification.pending || now() < (notification.nextAttemptAt ?? -Infinity)) return;
       notifications.set(key, notification);
       notification.attempts++;
       notification.pending = true;
       const failed = error => {
         notification.pending = false;
         row.settleError = safeErrorText(error);
-        if (notification.attempts === ESCALATION_NOTIFY_MAX_ATTEMPTS) {
-          note(`review-daemon: ${repo}#${row.prNumber} escalation notification failed after ${notification.attempts} attempts; operator must inspect`);
+        const failedAt = now();
+        notification.retryDelayMs = Math.min(ESCALATION_NOTIFY_MAX_DELAY_MS,
+          notification.retryDelayMs == null ? ESCALATION_NOTIFY_BASE_DELAY_MS : notification.retryDelayMs * 2);
+        notification.nextAttemptAt = failedAt + notification.retryDelayMs;
+        if (notification.lastFailureEventAt == null || failedAt - notification.lastFailureEventAt >= ESCALATION_NOTIFY_EVENT_INTERVAL_MS) {
+          notification.lastFailureEventAt = failedAt;
+          note(`review-daemon: ${repo}#${row.prNumber} escalation notification failed after ${notification.attempts} attempts; retry scheduled; operator must inspect`);
           try {
             Promise.resolve(emit({ kind: 'escalation-notify-failed', repo, pr: row.prNumber, daemon: 'review',
               detail: { head: row.head, reason: row.why, attempts: notification.attempts, error: row.settleError } })).catch(() => {});
