@@ -39,12 +39,18 @@
 import { createHash } from 'node:crypto';
 import { exactCitedPath, findingChangeState, normalizeFinding, earnsRound, isFindingOutstanding,
   requiresMandatoryReferral, MANDATORY_LENSES } from './jury-core.mjs';
-import { FINDING_STATUS_VALUES } from './verdict-ledger.mjs';
+import { FINDING_STATUS_VALUES, FINDING_DISPOSITION_VALUES, FINDING_SOURCE_RED_TEAM } from './verdict-ledger.mjs';
 
 /** The statuses, by name (R5). The ledger schema owns the closed set. */
 export const FINDING_STATUSES = Object.freeze({
   RAISED: FINDING_STATUS_VALUES[0], TOLERATED: FINDING_STATUS_VALUES[1], FIXED: FINDING_STATUS_VALUES[2], CARDED: FINDING_STATUS_VALUES[3],
 });
+
+/** Ledger evidence of a review: dispositions and unknown finding statuses establish no reviewed head. PURE. */
+export function isReviewRunRow(row) {
+  return row?.type === 'review-run'
+    || (row?.type === 'finding' && Object.values(FINDING_STATUSES).includes(row.status));
+}
 
 /** R6's two answers. */
 export const ROUND_DECISIONS = Object.freeze({ BLOCK: 'block', CARD: 'card' });
@@ -148,6 +154,8 @@ export function lastReviewedHead(reviewRuns, head) {
   const current = String(head ?? '').toLowerCase();
   const rows = Array.isArray(reviewRuns) ? reviewRuns : [];
   for (let i = rows.length - 1; i >= 0; i--) {
+    // Untyped entries are the legacy preselected {headSha} input; typed ledger rows must prove a review.
+    if (rows[i]?.type !== undefined && !isReviewRunRow(rows[i])) continue;
     const h = typeof rows[i]?.headSha === 'string' ? rows[i].headSha.toLowerCase() : '';
     if (h && h !== current) return h;
   }
@@ -163,6 +171,7 @@ export function lastReviewedHead(reviewRuns, head) {
 export function reviewRoundOf(reviewRuns, head) {
   const current = String(head ?? '').toLowerCase();
   const seen = new Set((Array.isArray(reviewRuns) ? reviewRuns : [])
+    .filter((r) => r?.type === undefined || isReviewRunRow(r))
     .map((r) => (typeof r?.headSha === 'string' ? r.headSha.toLowerCase() : '')).filter((h) => h && h !== current));
   return seen.size + 1;
 }
@@ -228,10 +237,31 @@ export function foldFindingStatuses(rows, { pr, head = '' } = {}) {
   const current = String(head ?? '').toLowerCase();
   for (const r of Array.isArray(rows) ? rows : []) {
     if (r?.type !== 'finding' || Number(r.pr) !== Number(pr)) continue;
-    if (!FINDING_STATUS_VALUES.includes(r.status) || typeof r.findingId !== 'string') continue;
+    if (!isReviewRunRow(r) || typeof r.findingId !== 'string') continue;
     if (current && String(r.headSha ?? '').toLowerCase() === current) continue;
     out.set(r.findingId, { status: r.status, headSha: r.headSha, round: r.round, path: r.path, symbol: r.symbol, defectClass: r.defectClass,
       lines: Array.isArray(r.lines) ? r.lines.filter((n) => Number.isInteger(n) && n > 0) : [] });
+  }
+  return out;
+}
+
+/**
+ * R883 slice 1 — the latest disposition (`open` / `not-real`) per stable finding id for one PR, EXCLUDING rows on
+ * `head`. Only exact red-team provenance is accepted, including for raw persisted rows. Read-only for now:
+ * nothing in the round rules consults it yet. PURE.
+ * @param {Array<object>} rows - ledger events in append order.
+ * @param {{pr: number, head?: string}} o
+ * @returns {Map<string, {status: string, headSha: string, round: number, source: string}>}
+ */
+export function foldFindingDispositions(rows, { pr, head = '' } = {}) {
+  const out = new Map();
+  const current = String(head ?? '').toLowerCase();
+  for (const r of Array.isArray(rows) ? rows : []) {
+    if (r?.type !== 'finding' || Number(r.pr) !== Number(pr)) continue;
+    if (!FINDING_DISPOSITION_VALUES.includes(r.status) || typeof r.findingId !== 'string') continue;
+    if (r.source !== FINDING_SOURCE_RED_TEAM) continue;
+    if (current && String(r.headSha ?? '').toLowerCase() === current) continue;
+    out.set(r.findingId, { status: r.status, headSha: r.headSha, round: r.round, source: r.source });
   }
   return out;
 }
