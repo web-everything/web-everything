@@ -4411,3 +4411,29 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+
+## Ready-candidate adoption during overlay churn
+
+`daemon-rebuild-ready.test.mjs` exercises adoption with real Git ancestry: newly registered
+refs and descendant advances remain pending after adoption, and the next adopt-only tick
+must return `needs-build` with a different plan. `ready-candidate-adopted-partial` is an
+open-kind rebuild alert emitted after successful adoption only when pending refs exist.
+A removed ref is safe only when a still-wanted overlay in the candidate contains its tip;
+containment in the candidate alone cannot authorize a retraction. Preserve the independent
+live-applied omission, build-provenance, smoke, forced-record and canonical-audit gates.
+Run this file and `daemon-rebuild-events.test.mjs` through heavy admission. This adoption
+rule does not reset overlay main-sync parking or add retries for parked overlays.
+
+
+## Sanctioned removal of a live overlay
+
+Before ready-candidate adoption, re-read the overlay registry after planning and its list
+edits; an unreadable registry blocks adoption with `overlay-state-corrupt`. Deduplicate
+live merge and adopted records by `(ref, sha)`, preserving different tips of the same ref.
+An omitted live tip requires either carried/graduated content or authenticated operator
+retirement of that exact tip while its ref is absent from the current registry. The real
+`prototype-load --remove` producer records authenticated `auto-retired` evidence; a plain
+`removed` record carries no such authority. Keep producer, current-registry, duplicate and
+negative-evidence cases in `operator-retirement.test.mjs`, and run it with the ready and
+event suites through heavy admission when changing this path.

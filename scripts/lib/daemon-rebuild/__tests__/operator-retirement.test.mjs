@@ -15,6 +15,7 @@ import { addOverlay, appendOverlayEvent, overlayFilePath, readOverlays, removeOv
 import { removeRegistration, retireRegistration } from '../../../daemon-overlay.mjs';
 import { createPrototypeLoader } from '../../../operations/prototype-load-io.mjs';
 import { OPERATOR_LOGINS } from '../../marker-authorship.mjs';
+import { REBUILD_IDENTITY_ENV } from '../shared.mjs';
 
 const ref = 'lane/overlay-fix';
 const sha = 'a'.repeat(40);
@@ -43,6 +44,7 @@ describe('operator retirement of a live overlay', () => {
         tree: 'candidate-tree', adopt: { finalSha: 'candidate', applied: [] } },
       plan: { finalSha: 'newer-plan' }, prevHead: 'live', treeOf: () => 'plan-tree',
       stillWanted: () => true, verifyBuilt: () => true,
+      registered: (r) => readOverlays(root, { env }).some((o) => o.ref === r),
       nowMs: Date.parse('2026-11-15T10:01:00Z'), maxAgeMs: 3_600_000,
       liveApplied: [{ ref, sha }],
       retiredByOperator: (a) => adoption.overlayRetiredByOperator?.({ ...a, events,
@@ -131,7 +133,8 @@ describe('operator retirement of a live overlay', () => {
 
   it.each([
     'operator-retired', 'hand-removed', 're-registered', 'removed-by-plan',
-    'unreadable-events', 'retirement-recorded-during-plan',
+    'unreadable-events', 'retirement-recorded-during-plan', 'duplicate-live-records', 'distinct-live-tips',
+    'operator-removed-during-plan', 'registry-corrupted-during-plan',
   ])(
     'prepareRebuild wires live registration and event evidence for %s', async (removal) => {
       // The real prepare phase reads both registry snapshots and the on-disk audit trail.
@@ -151,7 +154,7 @@ describe('operator retirement of a live overlay', () => {
         appendOverlayEvent(root, removed, { env });
         plan.decisions.push({ ref, action: 'remove', reason: 'pr-closed' });
       } else if (removal === 'hand-removed' || removal === 'retirement-recorded-during-plan') removeOverlay(root, ref, { env });
-      else {
+      else if (!['operator-removed-during-plan', 'registry-corrupted-during-plan'].includes(removal)) {
         expect(await loader()({ daemon: 'control', remove: ref, actor, reason: 'withdraw live fix' }))
           .toMatchObject({ ok: true, removed: [ref] });
         if (removal === 're-registered') addOverlay(root, { ref }, { env });
@@ -165,6 +168,11 @@ describe('operator retirement of a live overlay', () => {
       vi.spyOn(edgeFetch, 'fetchMainAndOverlays').mockReturnValue({ ok: true, goneRefs: [] });
       vi.spyOn(planner, 'planRebuild').mockImplementation(async () => {
         if (removal === 'retirement-recorded-during-plan') appendOverlayEvent(root, removed, { env });
+        if (removal === 'operator-removed-during-plan') {
+          expect(await loader()({ daemon: 'control', remove: ref, actor, reason: 'withdraw live fix' }))
+            .toMatchObject({ ok: true, removed: [ref] });
+        }
+        if (removal === 'registry-corrupted-during-plan') writeFileSync(overlayFilePath(root, env), '{unreadable');
         return plan;
       });
       vi.spyOn(adoption, 'readyBuildVerified').mockReturnValue(true);
@@ -179,22 +187,37 @@ describe('operator retirement of a live overlay', () => {
           const rev = args.at(-1);
           if (rev === 'HEAD') return ok(liveHead);
           if (rev === 'origin/main^{commit}') return ok(mainSha);
+          if (rev === `refs/remotes/origin/${ref}^{commit}`) return ok(sha);
           if (rev === `${plan.finalSha}^{tree}`) return ok('plan-tree');
+        }
+        if (args[0] === 'log' && ['duplicate-live-records', 'distinct-live-tips'].includes(removal)) {
+          const merge = (tip) => `${mainSha} ${tip}\t${REBUILD_IDENTITY_ENV.GIT_COMMITTER_EMAIL}\tdaemon-rebuild: merge overlay ${ref} onto main\n`;
+          return ok(merge(sha) + merge(removal === 'distinct-live-tips' ? 'f'.repeat(40) : sha));
         }
         if (args[0] === 'ls-files' || args[0] === 'log') return ok();
         if (['merge-base', 'merge-tree', 'config'].includes(args[0])) return { status: 1, stdout: '', stderr: '' };
         throw new Error(`unexpected Git: ${args.join(' ')}`);
       };
-      await prepareRebuild({ root, env, run, now: () => Date.parse('2026-11-15T10:01:00Z'),
+      const prepared = await prepareRebuild({ root, env, run, now: () => Date.parse('2026-11-15T10:01:00Z'),
         mainOnly: false, adoptOnly: true, prBaseChain: () => [] });
+      if (removal === 'registry-corrupted-during-plan') {
+        expect(prepared).toMatchObject({ terminal: true, result: { moved: false, reason: 'overlay-state-corrupt' } });
+        expect(matching).not.toHaveBeenCalled();
+        expect(finalize).not.toHaveBeenCalled();
+        return;
+      }
       expect(matching).toHaveBeenCalledOnce();
-      expect(matching.mock.calls[0][0].liveApplied).toEqual([{ ref, sha }]);
-      expect(retirement).toHaveBeenCalledOnce();
-      // A same-tick drop clears registeredRefs but must retain overlaysBefore's veto.
-      expect(retirement.mock.calls[0][0].registered(ref))
-        .toBe(removal === 're-registered' || removal === 'removed-by-plan');
+      expect(matching.mock.calls[0][0].liveApplied).toEqual([
+        { ref, sha }, ...(removal === 'distinct-live-tips' ? [{ ref, sha: 'f'.repeat(40) }] : []),
+      ]);
+      expect(matching.mock.calls[0][0].registered(ref)).toBe(removal === 're-registered');
+      if (removal === 're-registered') expect(retirement).not.toHaveBeenCalled();
+      else {
+        expect(retirement).toHaveBeenCalledTimes(removal === 'distinct-live-tips' ? 2 : 1);
+        expect(retirement.mock.calls[0][0].registered(ref)).toBe(false);
+      }
       const result = matching.mock.results[0].value;
-      if (removal === 'operator-retired' || removal === 'retirement-recorded-during-plan') {
+      if (['operator-retired', 'retirement-recorded-during-plan', 'duplicate-live-records', 'operator-removed-during-plan'].includes(removal)) {
         expect(result).toMatchObject({ adopt: { finalSha: candidate }, retired: [ref] });
         expect(finalize).toHaveBeenCalledOnce();
       } else {
