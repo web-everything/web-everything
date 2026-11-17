@@ -7,7 +7,7 @@ import { makeGit, verifyRev, FULL_SHA_RE, OVERLAY_EDGE_RESOLVE_ENV } from './sha
 import { findUnsafeLocalState, knownInputsOf } from './local-state.mjs';
 import { overlayFilePath, readOverlayState } from '../daemon-overlays.mjs';
 import { readRebuildState } from './state.mjs';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join, isAbsolute, resolve as resolvePath, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -15,21 +15,8 @@ import { fetchMainAndOverlays, defaultPrState } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
 import { makeAuditedTipGate } from './audited-tip.mjs';
 import { isSafeBranchName } from '../daemon-self-sync.mjs';
-import { fileURLToPath } from 'node:url';
 import { acquireSmokeSlot } from '../daemon-smoke-slots.mjs';
-import { cascadePolicy } from '../policy-cascade.mjs';
 import { resolveOverlayConflict } from './overlay-strategies.mjs';
-
-const SETTINGS = resolvePath(dirname(fileURLToPath(import.meta.url)), '..', 'daemon-rebuild-settings.json');
-export function dryRunHoldsSmokeSlot({ env = process.env, log = console } = {}) {
-  let tool;
-  try { tool = JSON.parse(readFileSync(SETTINGS, 'utf8')).dryRunHoldsSmokeSlot; } catch { /* default holds */ }
-  const raw = env.WE_DAEMON_DRY_RUN_HOLDS_SMOKE_SLOT;
-  return cascadePolicy('dryRunHoldsSmokeSlot', tool, {
-    env, log: line => log.info?.(line), standard: true, valid: value => typeof value === 'boolean',
-    envValues: { '': raw === '0' ? false : raw === '1' ? true : undefined },
-  }).value !== false;
-}
 
 // ── dryRunRebuild — STRICTLY read-only on `root` ────────────────────────────────────────────────────────────
 
@@ -53,9 +40,7 @@ export async function dryRunRebuild({
   root, env = process.env, prState, originUrl, run = gitRun, extraOverlays = [],
   log = console, now = Date.now, sleep, acquireSlot = acquireSmokeSlot,
 } = {}) {
-  const holdsSlot = dryRunHoldsSmokeSlot({ env, log });
-  const slot = holdsSlot
-    ? await acquireSlot({ env, log, now, sleep, reuseHeldByProcess: true }) : null;
+  const slot = await acquireSlot({ env, log, now, sleep });
   try {
     const rootGit = makeGit({ run, cwd: root, env, extraEnv: { GIT_OPTIONAL_LOCKS: '0' } });
 
@@ -81,7 +66,7 @@ export async function dryRunRebuild({
     let plan = { ok: false, reason: 'no-origin-url' };
     let untrackedCollision = [];
     try {
-      if (holdsSlot && slot?.acquired !== true) plan = { ok: false, reason: 'smoke-queue-timeout' };
+      if (slot?.acquired !== true) plan = { ok: false, reason: 'smoke-queue-timeout' };
       else if (url && head) {
         const objectDbStarted = now();
         let objectDbLogged = false;
@@ -164,7 +149,7 @@ export async function dryRunRebuild({
       stillRejected, untrackedCollision,
     };
   } finally {
-    await slot?.release();
+    await slot.release();
   }
 }
 

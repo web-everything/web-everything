@@ -3,7 +3,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { dryRunRebuild, dryRunHoldsSmokeSlot } from '../preview.mjs';
+import { dryRunRebuild } from '../preview.mjs';
 import { planRebuild } from '../plan.mjs';
 import { fetchMainAndOverlays } from '../edge-fetch.mjs';
 import { acquireSmokeSlot } from '../../daemon-smoke-slots.mjs';
@@ -50,7 +50,7 @@ it.each([false, true])('holds the slot across root inspection, object DB, and ov
   const result = dryRunRebuild({ ...options, acquireSlot });
   if (throws) await expect(result).rejects.toThrow('merge failed');
   else expect((await result).plan.ok).toBe(true);
-  expect(acquireSlot).toHaveBeenCalledWith(expect.objectContaining({ reuseHeldByProcess: true }));
+  expect(acquireSlot).toHaveBeenCalledTimes(1);
   expect(release).toHaveBeenCalledTimes(1);
   expect(held).toBe(false);
 });
@@ -71,21 +71,6 @@ it('releases the slot when initial root inspection throws', async () => {
     acquireSlot: async () => ({ acquired: true, release }),
   })).rejects.toThrow('read failed');
   expect(release).toHaveBeenCalledTimes(1);
-});
-
-it('the default dry-run acquisition borrows an already held same-process slot without deadlock', async () => {
-  const env = { WE_DAEMON_SMOKE_STATE_DIR: root, WE_DAEMON_SMOKE_MAX_CONCURRENT: '1' };
-  const holders = () => JSON.parse(readFileSync(join(root, 'smoke-slots.json'), 'utf8')).holders;
-  const outer = await acquireSmokeSlot({ env, log });
-  try {
-    planRebuild.mockImplementation(async () => {
-      expect(holders()).toHaveLength(1);
-      return { ok: true, finalSha: root };
-    });
-    expect((await dryRunRebuild({ ...options, env, sleep: async () => { throw new Error('double acquisition'); } })).plan.ok).toBe(true);
-    expect(holders()).toHaveLength(1);
-  } finally { await outer.release(); }
-  expect(holders()).toEqual([]);
 });
 
 it('logs object-db elapsed time and releases capacity when object setup throws', async () => {
@@ -122,12 +107,9 @@ it('logs overlay timing even when the merge throws', async () => {
   expect(log.info).toHaveBeenCalledWith('daemon-rebuild: dry-run step=overlay-merge ms=0');
 });
 
-it('defaults to holding a slot, rejects invalid overrides, and supports explicit rollback', async () => {
-  expect(dryRunHoldsSmokeSlot({ env: {}, log })).toBe(true);
-  expect(dryRunHoldsSmokeSlot({ env: { WE_DAEMON_DRY_RUN_HOLDS_SMOKE_SLOT: 'invalid' }, log })).toBe(true);
-  expect(dryRunHoldsSmokeSlot({ env: { WE_DAEMON_DRY_RUN_HOLDS_SMOKE_SLOT: '1' }, log })).toBe(true);
-  const acquireSlot = vi.fn();
-  await dryRunRebuild({ ...options, env: { WE_DAEMON_DRY_RUN_HOLDS_SMOKE_SLOT: '0' }, acquireSlot });
-  expect(acquireSlot).not.toHaveBeenCalled();
-  expect(planRebuild).toHaveBeenCalled();
+it('fails closed without planning when the slot is not acquired', async () => {
+  const acquireSlot = vi.fn(async () => ({ acquired: false, release: vi.fn() }));
+  const result = await dryRunRebuild({ ...options, acquireSlot });
+  expect(result.plan).toEqual({ ok: false, reason: 'smoke-queue-timeout' });
+  expect(planRebuild).not.toHaveBeenCalled();
 });

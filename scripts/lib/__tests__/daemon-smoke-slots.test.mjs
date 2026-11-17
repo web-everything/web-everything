@@ -47,26 +47,6 @@ async function wake() {
 }
 
 describe('daemon smoke slots', () => {
-  it('nested preview reuses a same-process slot and retains capacity until its last release', async () => {
-    const env = { WE_DAEMON_SMOKE_MAX_CONCURRENT: '1' };
-    const outer = await acquire(11, { env });
-    const preview = await acquire(11, { env, reuseHeldByProcess: true });
-    expect(state().holders).toHaveLength(1);
-    expect(state().waiters).toEqual([]);
-    await outer.release();
-    expect(state().holders).toHaveLength(1);
-    let time = 0;
-    const blocked = await acquire(12, { env: { ...env, WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: '1000' },
-      now: () => time, sleep: async ms => { time += ms; } });
-    expect(blocked.acquired).toBe(false);
-    await preview.release();
-    await preview.release();
-    expect(state().holders).toEqual([]);
-    const next = await acquire(12, { env });
-    expect(next.acquired).toBe(true);
-    await next.release();
-  });
-
   it.each(['unreadable', 'unparseable'])('fails closed to cap 1 when bundled settings are %s', async failure => {
     const read = fs.readFileSync.getMockImplementation();
     fs.readFileSync.mockImplementation((path, ...args) => {
@@ -820,5 +800,16 @@ describe('daemon smoke slots', () => {
     expect((await d).acquired).toBe(false);
     await slotB.release(); await c.release();
     expect(state().holders).toEqual([]);
+  });
+
+  it('gives concurrent same-process acquires their own tickets and fails closed on corrupt state', async () => {
+    const a = await acquire(process.pid);
+    const b = await acquire(process.pid);
+    expect(state().holders).toHaveLength(2);
+    await a.release();
+    expect(state().holders).toHaveLength(1);
+    await b.release();
+    writeFileSync(join(stateDir, 'smoke-slots.json'), '{not json');
+    await expect(acquire(process.pid)).rejects.toThrow();
   });
 });
