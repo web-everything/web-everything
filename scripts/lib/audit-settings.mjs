@@ -165,6 +165,8 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   'scripts/readiness/prepare-hold-state.mjs',
   // Receipt archiving reserves its temp with `wx` and publishes with a no-clobber hard link.
   'scripts/readiness/forge-receipts-archive.mjs',
+  // Forge deploy reserves record temps with `wx` and serializes writers on a flock deploy lock.
+  'scripts/readiness/forge-deploy.mjs',
   // Found by the hold scan (ci-queue-watch.mjs#withHistoryLock and its finalizer among them).
   'scripts/broadcast-inject.mjs', 'scripts/ci/refresh-timings.mjs', 'scripts/conveyor/ci-queue-watch.mjs',
   'scripts/conveyor/ci-red-recovery-watch.mjs', 'scripts/conveyor/health-watch-job.mjs', 'scripts/conveyor/infra-blocked.mjs',
