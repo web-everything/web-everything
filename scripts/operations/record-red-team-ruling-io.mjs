@@ -296,7 +296,7 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
       const { comments } = recheck(p);
       if (p.cardRef) {
         // Persist the reason before release: either failed POST leaves the break held and retryable.
-        if (!/^we:backlog\/[A-Za-z0-9][A-Za-z0-9._-]*\.md(?:@pr[1-9]\d{0,8})?$/.test(p.cardRef)) throw new Error(`--card resolved to an unsafe reference ${JSON.stringify(p.cardRef)}; nothing written`);
+        if (!CARD_REF_RE.test(p.cardRef)) throw new Error(`--card resolved to an unsafe reference ${JSON.stringify(p.cardRef)}; nothing written`);
         const record = operatorRecord(p, OPERATOR_CARD_OUTCOME, `- ${p.indices.length} finding(s) carded by the operator to \`${p.cardRef}\` ${indexList(p)}.`);
         post(p.repo, p.pr, reasonBody(p, `Carded to the existing card \`${p.cardRef}\`; no new card is filed.`), p.actor);
         // The reason POST may outlive the card. Validate the exact planned reference at the release boundary.
