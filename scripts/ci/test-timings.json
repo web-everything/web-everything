@@ -1734,6 +1734,7 @@
   "scripts/conveyor/soak/breaks/smoke-dryrun-resumes-real-session.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/agy-juror-shared-checkout-reset.soak.test.mjs": 1.85,
   "scripts/conveyor/soak/breaks/already-done-burst-unattributed.soak.test.mjs": 0.49,
+  "scripts/conveyor/soak/breaks/daemon-load-overlay-stale-tracking-ref.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/already-done-recheck-burst-no-cooldown.soak.test.mjs": 1.68,
   "scripts/conveyor/soak/breaks/send-back-fixer-reclaimed-before-verify.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/already-landed-pr-gets-fixer.soak.test.mjs": 65.56,
