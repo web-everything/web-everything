@@ -206,6 +206,11 @@ describe('fail closed', () => {
       ['/usr/bin/node', '-e', `require("${COPY}")`],
       ['/usr/bin/node', `--import=${COPY}`],
       ['node', 'ops/sync-guard-clone.mjs'], // relative, no WorkingDirectory
+      ['/usr/bin/node', `--import=${HOME}/ops/guard.mjs`, COPY],
+      ['/usr/bin/node', COPY, `--import=${HOME}/ops/guard.mjs`],
+      ['/usr/bin/node', '-e', `require('${HOME}/ops/guard.cjs')`, COPY],
+      ['/usr/bin/node', 'ops/guard.mjs', COPY],
+      ['/usr/bin/env', '-S', `node --import=${HOME}/ops/guard.mjs "${COPY}"`],
     ];
     const harness = () => {
       let d = deps({ fn: { hashCopy: () => 'old' } });
@@ -244,6 +249,16 @@ describe('fail closed', () => {
         h.set(next);
         h.tick(); h.tick();
         expect(h.ep()).toBeUndefined();
+      }
+    });
+
+    it('WorkingDirectory does not turn an embedded script option into a verified path', () => {
+      const h = harness();
+      h.tick(); h.tick();
+      h.set(job(['node', `--import=${HOME}/ops/guard.mjs`, COPY], { WorkingDirectory: HOME }));
+      for (let i = 0; i < 3; i++) {
+        expect(h.tick().transitions.some((t) => t.type === 'closed')).toBe(false);
+        expect(h.ep()).toMatchObject({ status: 'open', cleanStreak: 0 });
       }
     });
 

@@ -126,11 +126,13 @@ export function scanLaunchdOpsCopyDrift(d) {
       continue;
     }
     // Program and ProgramArguments often name the same script: check each distinct path once per job.
-    const args = [...new Set(raw.filter((a) => typeof a === 'string').map((a) => (!a.startsWith('/') && wd && SCRIPT_RE.test(a) ? posix.join(wd, a) : a)))];
-    let resolvedScript = false;
+    const args = [...new Set(raw.filter((a) => typeof a === 'string').map((a) => (!a.startsWith('/') && !a.startsWith('-') && wd && SCRIPT_RE.test(a) ? posix.join(wd, a) : a)))];
+    let unresolvedScript = false;
     for (const arg of args) {
-      if (!arg.startsWith('/') || !SCRIPT_RE.test(arg)) continue;
-      resolvedScript = true;
+      if (!arg.startsWith('/') || !SCRIPT_RE.test(arg)) {
+        if (SCRIPT_TEXT_RE.test(arg)) unresolvedScript = true;
+        continue;
+      }
       try {
         if (d.inGitCheckout(arg)) continue;
         const all = d.repoFilesByBasename(basename(arg));
@@ -156,9 +158,9 @@ export function scanLaunchdOpsCopyDrift(d) {
       }
     }
     // The command names a script (`node -e require("…/x.mjs")`, `--import=…/x.mjs`, a relative path
-    // without WorkingDirectory) yet no script path could be resolved: the scan cannot classify it.
+    // without WorkingDirectory) that could not be resolved: another verified path cannot classify it.
     // evaluate() holds an already-open episode open for it and ignores it otherwise.
-    if (!resolvedScript && args.some((a) => SCRIPT_TEXT_RE.test(a))) {
+    if (unresolvedScript) {
       findings.push({ severity: 'low', label, unclassified: true, note: 'job command not classified; drift not checked' });
     }
   }

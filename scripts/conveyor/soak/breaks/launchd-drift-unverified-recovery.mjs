@@ -15,7 +15,7 @@ export default {
     const { default: smell, scanLaunchdOpsCopyDrift } = await import(pathToFileURL(join(sourceRoot, SCANNER)).href);
     const { emptyHealthState, episodeKey, runHealthTick } = await import(pathToFileURL(join(sourceRoot, 'scripts/conveyor/health-watch-core.mjs')).href);
     const violations = [];
-    for (const scenario of ['shell', 'env-split-shell', 'env-split-escape', 'wrapped-env-split', 'partial-recovery']) {
+    for (const scenario of ['shell', 'env-split-shell', 'env-split-escape', 'wrapped-env-split', 'env-split-mixed-scripts', 'partial-recovery']) {
       let phase = 'drift';
       const copy = '/home/fixture/ops/sync-guard-clone.mjs';
       const deps = {
@@ -26,11 +26,12 @@ export default {
           return { Label: 'com.we.guard', ProgramArguments: phase === 'shell' ? ['/bin/sh', '-c', `node ${copy}`]
             : phase === 'env-split-shell' ? ['/usr/bin/env', '-S', `sh -c "node ${copy}"`]
             : phase === 'env-split-escape' ? ['/usr/bin/env', '-S', String.raw`sh\_-c\_'node "$SCRIPT"'`]
+            : phase === 'env-split-mixed-scripts' ? ['/usr/bin/env', '-S', `node --import=/home/fixture/ops/guard.mjs "${copy}"`]
             : phase === 'wrapped-env-split' ? ['/usr/bin/nohup', '/usr/bin/env', '-S', 'sh -c \'node "$SCRIPT"\''] : ['node', copy] };
         },
         inGitCheckout: () => false,
         repoFilesByBasename: () => ['scripts/sync-guard-clone.mjs'],
-        hashCopy: () => phase === 'partial-recovery' ? 'new' : 'old',
+        hashCopy: () => ['partial-recovery', 'env-split-mixed-scripts'].includes(phase) ? 'new' : 'old',
         hashMain: () => 'new', copyMtimeMs: () => 0, mainCommitMs: () => 86_400_000,
       };
       const descriptor = { ...smell, evaluate: (p, ctx) => smell.evaluate(p, { ...ctx, scan: () => scanLaunchdOpsCopyDrift(deps) }) };
