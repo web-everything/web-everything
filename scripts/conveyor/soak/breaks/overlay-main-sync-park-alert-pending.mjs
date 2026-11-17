@@ -3,17 +3,18 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
 import { addOverlay, overlayFilePath } from '../../../lib/daemon-overlays.mjs';
 import { alertsFilePath } from '../../../lib/daemon-rebuild/state.mjs';
 import { replay } from '../../../operations/needs-you-feed.mjs';
 import * as sync from '../../../lib/daemon-rebuild/overlay-main-sync.mjs';
-// Older replay trees predate the marked-inventory protocol.
-const { runOverlayMainSync, kickOverlayMainSync, VITEST_INVENTORY_MARK = '' } = sync;
 
 const SOURCE = 'scripts/lib/daemon-rebuild/overlay-main-sync.mjs';
 const FILE = 'worker.test.mjs';
 
-async function scenario(retryPath) {
+export async function scenario(retryPath, implementation = sync) {
+  // Older replay trees predate the marked-inventory protocol.
+  const { runOverlayMainSync, kickOverlayMainSync, VITEST_INVENTORY_MARK = '' } = implementation;
   const dir = mkdtempSync(join(tmpdir(), 'soak-main-sync-park-alert-pending-'));
   const root = join(dir, 'daemon'), origin = join(dir, 'origin.git'), ref = 'lane/park-alert-pending';
   const blocker = join(dir, 'feed-unavailable');
@@ -81,6 +82,12 @@ async function scenario(retryPath) {
       if (alerts().length !== 1) violations.push('pending publication did not retain exactly one local diagnostic');
     };
     checkPending();
+    // A persisted park without its streak timestamp must still deliver exactly once.
+    const malformed = state();
+    delete malformed.firstFailureAt[ref];
+    const stateFile = `${overlayFilePath(root, env)}.main-sync.state`;
+    for (const file of [stateFile, stateFile.replace(/\.state$/, '.json')])
+      writeFileSync(file, JSON.stringify(malformed));
     const eventCount = events.length;
     const retry = async () => {
       const result = retryPath === 'scheduler'
@@ -116,7 +123,18 @@ export default {
   title: 'parked overlay retains a failed feed publication and delivers exactly one NEEDS-YOU on recovery',
   card: 'overlay main-sync park alert pending delivery fix',
   fixedBy: { sha: 'fffd2a5ac424b29465d9b956874c9453affa8efc', where: 'main', paths: [SOURCE] },
-  fixPresent(root) { return readFileSync(join(root, SOURCE), 'utf8').includes('const published = needsYou('); },
+  fixPresent(root) {
+    // The harness requires a synchronous detector. Probe the requested tree's
+    // implementation in a bounded child instead of inspecting its source text.
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      const { scenario } = await import(process.argv[1]);
+      const implementation = await import(process.argv[2]);
+      const violations = [...await scenario('scheduler', implementation), ...await scenario('worker', implementation)];
+      process.exitCode = violations.length ? 1 : 0;
+    `, import.meta.url, pathToFileURL(join(root, SOURCE)).href],
+    { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 });
+    return !result.error && result.status === 0;
+  },
   async run() {
     return { violations: [...await scenario('scheduler'), ...await scenario('worker')] };
   },

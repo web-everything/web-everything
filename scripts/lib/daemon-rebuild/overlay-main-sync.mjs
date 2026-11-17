@@ -184,6 +184,9 @@ function validateSyncState(data) {
     || (data.failureCount[ref] === PARK_AFTER_FAILURES && !Object.hasOwn(data.parkedTip, ref)))) {
     throw new Error('incomplete parking state; operator repair required');
   }
+  // Older/malformed parks can lack the streak timestamp. Retain the retry stop
+  // and any delivery acknowledgement, but restore eligibility for an unsent alert.
+  for (const ref of Object.keys(data.parkedTip)) data.firstFailureAt[ref] ??= Date.now();
   return data;
 }
 function writeSyncState(file, data, io) {
@@ -307,6 +310,8 @@ function failureAlert(root, env, ref, error, io = fs, immediate = false) {
   }
 }
 // Only validated tip/registration evidence may retain a terminal parking stop.
+// GUARD NOTES (R991):
+// "Parking suppresses retries until the tip changes" - ACCEPTED as intended per R991.
 function parked(file, synced, ref, tip, registration, io = fs) {
   if (!Object.hasOwn(synced.failureCount, ref)) return false;
   if (synced.failureTip[ref] === tip && synced.failureRegistration[ref] === registrationKey(registration)) {

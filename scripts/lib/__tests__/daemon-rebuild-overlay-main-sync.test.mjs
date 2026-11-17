@@ -812,6 +812,47 @@ describe('overlay main sync', () => {
     expect(json(sidecarsOf(f.env.WE_NEEDS_YOU_FEED).state).openKeys).toHaveLength(1);
   }, 90_000);
 
+  it.each(['scheduler', 'worker'])('parked %s repairs a missing firstFailureAt, alerts once and preserves acknowledgement on later repairs', async path => {
+    const f = fixture(), outcomes = [], spawnFn = spawner();
+    f.deps.appendDaemonEvent = event => outcomes.push(event);
+    f.deps.testRunner = vi.fn(async () => ({ status: 1, stderr: 'persistent failure' }));
+    await expect(job(f)).rejects.toThrow(/persistent failure/);
+    const state = json(sidecar(f));
+    state.failureCount[ref] = 3;
+    state.parkedTip[ref] = f.oldSha;
+    state.failureReason[ref] = 'parked after 3 failures; last step tests: persistent failure';
+    const saveWithoutTimestamp = data => {
+      delete data.firstFailureAt[ref];
+      for (const file of [sidecar(f), sidecar(f).replace(/\.state$/, '.json')])
+        fs.writeFileSync(file, JSON.stringify(data));
+    };
+    saveWithoutTimestamp(state);
+    expect(alerts(f)).toHaveLength(0);
+    const before = outcomes.length;
+    const retry = async () => {
+      if (path === 'scheduler') expect(tick(f, { spawnFn, deps: f.deps })).toMatchObject({ started: [], skipped: [ref] });
+      else expect(await job(f)).toEqual({ skipped: true, reason: 'parked' });
+    };
+    await retry();
+    const repaired = json(sidecar(f));
+    expect(repaired.firstFailureAt[ref]).toEqual(expect.any(Number));
+    expect(repaired.failureAlertedAt[ref]).toEqual(expect.any(Number));
+    expect(alerts(f)).toHaveLength(1);
+    expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toHaveLength(1);
+    saveWithoutTimestamp(repaired);
+    await retry();
+    await retry();
+    expect(json(sidecar(f)).failureAlertedAt[ref]).toBe(repaired.failureAlertedAt[ref]);
+    expect(json(sidecar(f)).firstFailureAt[ref]).toEqual(expect.any(Number));
+    expect(json(sidecar(f)).parkedTip[ref]).toBe(f.oldSha);
+    expect(alerts(f)).toHaveLength(1);
+    expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toHaveLength(1);
+    expect(outcomes).toHaveLength(before);
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(1);
+    expect(f.pushes).toEqual([]);
+    expect(spawnFn).not.toHaveBeenCalled();
+  }, 90_000);
+
   it.each(['tip', 'registration'])('%s change un-parks, clears old cooldowns and resets the failure count', async change => {
     const f = fixture();
     f.deps.testRunner = vi.fn(async () => ({ status: 1, stderr: 'persistent failure' }));
