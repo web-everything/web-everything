@@ -116,10 +116,10 @@ it('reports worker repository unknown for an unscoped worker with no assignee', 
   expect(facts.owner).toBe('unknown');
 });
 
-it.each(['red-team:clear', 'red-team:blocked'])('reports red-team label lacks live result evidence (%s)', label => {
+it.each(['red-team:clear', 'red-team:blocked'])('reports red-team pending on the new head for a label without live evidence (%s)', label => {
   const facts = read({ gh: () => JSON.stringify([pr({ labels: [{ name: label }] })]) });
-  expect(facts.evidenceErrors).toEqual(['red-team label lacks live result evidence']);
-  expect(facts.redTeam).toEqual({ state: 'unknown', latestResultId: null, latestOutcome: null });
+  expect(facts.evidenceErrors).toEqual([]);
+  expect(facts.redTeam).toEqual({ state: 'pending', latestResultId: null, latestOutcome: null });
 });
 
 it('reports round-limit label disagrees with round evidence below the cap', () => {
@@ -296,10 +296,14 @@ it.each([126, 127])('each comment page consumes the 128-call budget (%i full pag
 
 it('shares the call budget across PRs and withholds unread comments after exhaustion', () => {
   const listing = Array.from({ length: 129 }, (_, i) => pr({ number: i + 1 }));
-  const gh = vi.fn(args => args[0] === 'pr' ? JSON.stringify(listing) : '');
+  const gh = vi.fn(args => {
+    if (args[0] === 'pr') return JSON.stringify(listing);
+    expect(args[1]).not.toBe('graphql');
+    return '';
+  });
   const { readComments: _comments, ...defaults } = options({ gh });
   const facts = createJudgeSweepFactsReader(defaults)({ repo }).prs;
-  expect(gh).toHaveBeenCalledTimes(128);
+  expect(gh).toHaveBeenCalledTimes(128); // list + 127 complete short threads
   expect(facts[126].openReferrals).toEqual([]);
   expect(facts.slice(127).map(p => p.openReferrals)).toEqual([null, null]);
   expect(facts[128].evidenceErrors).toContain('comment evidence unreadable or budget exhausted');
@@ -727,4 +731,121 @@ it('R746 never publishes or writes alert claims in tests without an injected pub
   const row = read({ exec, alertClaimsDir: 'invalid-unwritable-claim-location',
     findSuspendedRuns: () => [{ id: 'review-pr-unruled', ageMs: 7200000, findings: [{ key: 'k', summary: 'guard' }] }] });
   expect(row.evidenceErrors).toEqual([]); expect(exec).not.toHaveBeenCalled();
+});
+
+
+it.each(['red-team:blocked', 'red-team:clear'])('treats %s with an older-head result as pending without evidence errors', label => {
+  const facts = read({
+    gh: () => JSON.stringify([pr({ labels: [{ name: label }] })]),
+    readComments: () => [comment(renderRedTeamComment({ pr: 1, rev: 'c'.repeat(40),
+      provider: 'codex', model: 'fixture', findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' }))],
+  });
+  expect(facts.redTeam).toEqual({ state: 'pending', latestResultId: null, latestOutcome: null });
+  expect(facts.evidenceErrors).toEqual([]);
+});
+
+it.each(['red-team:blocked', 'red-team:clear'])('preserves live result classification with %s', label => {
+  const readComments = () => [comment(renderRedTeamComment({ pr: 1, rev: head,
+    provider: 'codex', model: 'fixture', findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' }))];
+  const baseline = read({ readComments });
+  const facts = read({ gh: () => JSON.stringify([pr({ labels: [{ name: label }] })]), readComments });
+  expect(facts.redTeam).toEqual(baseline.redTeam);
+  expect(facts.redTeam.state).toBe('clear');
+  expect(facts.evidenceErrors).toEqual([]);
+});
+
+it.each(['red-team:blocked', 'red-team:clear'])('keeps unreadable comments fail closed with %s', label => {
+  const readComments = vi.fn(() => { throw Error('offline'); });
+  const facts = read({ gh: () => JSON.stringify([pr({ labels: [{ name: label }] })]), readComments });
+  expect(readComments).toHaveBeenCalledTimes(2);
+  expect(facts.redTeam.state).toBe('unknown');
+  expect(facts.evidenceErrors).toEqual(['comment evidence unreadable or budget exhausted']);
+});
+
+const commentNode = (body = 'ordinary') => ({ body, createdAt: at, author: { login: 'web-everything' },
+  id: 'IC_fixture', url: 'https://example.test/comment' });
+const escapeTsv = value => value.replace(/\\/g, '\\\\').replace(/\t/g, '\\t').replace(/\n/g, '\\n').replace(/\r/g, '\\r');
+const commentTsv = c => [c.body, c.createdAt, c.author.login, c.id, c.url].map(escapeTsv).join('\t');
+
+it('reads all 18 threads through REST and preserves the downstream comment shape and TSV escaping', () => {
+  const listing = Array.from({ length: 18 }, (_, i) => pr({ number: i + 1 }));
+  const body = renderRedTeamComment({ pr: 1, rev: head, provider: 'codex', model: 'fixture',
+    findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' }) + '\n\tbackslash: \\ literal \\n\r';
+  const gh = vi.fn(args => {
+    if (args[0] === 'pr') {
+      expect(args.at(-1).split(',')).not.toContain('comments');
+      return JSON.stringify(listing);
+    }
+    expect(args[1]).not.toBe('graphql');
+    expect(args).toContain('page=1');
+    const number = Number(args.find(a => a.startsWith('repos/')).split('/')[4]);
+    return commentTsv(commentNode(number === 1 ? body : 'ordinary'));
+  });
+  const facts = createJudgeSweepFactsReader(options({ gh, readComments: undefined }))({ repo });
+  expect(gh).toHaveBeenCalledTimes(19);
+  const baseline = createJudgeSweepFactsReader(options({
+    gh: () => JSON.stringify(listing),
+    readComments: ({ number }) => [commentNode(number === 1 ? body : 'ordinary')],
+  }))({ repo });
+  expect(facts).toEqual(baseline);
+  expect(facts.prs[0].redTeam.state).toBe('clear');
+  expect(facts.prs.every(p => p.evidenceErrors.length === 0)).toBe(true);
+});
+
+it.each(['transport failure', 'malformed comment'])('retries REST %s exactly once per PR and fails closed', reason => {
+  const gh = vi.fn(args => {
+    if (args[0] === 'pr') return JSON.stringify([pr(), pr({ number: 2 })]);
+    if (reason === 'transport failure') throw Error('offline');
+    return 'missing author and timestamp';
+  });
+  const facts = createJudgeSweepFactsReader(options({ gh, readComments: undefined }))({ repo });
+  expect(gh).toHaveBeenCalledTimes(5);
+  expect(gh.mock.calls.slice(1).map(([args]) => args.find(a => a.startsWith('repos/'))))
+    .toEqual([1, 1, 2, 2].map(n => `repos/${repo}/issues/${n}/comments`));
+  expect(facts.prs.every(p => p.openReferrals === null
+    && p.evidenceErrors.includes('comment evidence unreadable or budget exhausted'))).toBe(true);
+});
+
+it('restarts REST paging once after a later-page failure and retains later-page evidence', () => {
+  let failed = false;
+  const body = renderRedTeamComment({ pr: 1, rev: head, provider: 'codex', model: 'fixture',
+    findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' });
+  const gh = vi.fn(args => {
+    if (args[0] === 'pr') return JSON.stringify([pr(), pr({ number: 2 })]);
+    if (args.includes(`repos/${repo}/issues/2/comments`)) return '';
+    if (args.includes('page=1')) return Array.from({ length: 100 }, () => commentTsv(commentNode())).join('\n');
+    if (!failed) { failed = true; throw Error('transient'); }
+    return commentTsv(commentNode(body));
+  });
+  const facts = createJudgeSweepFactsReader(options({ gh, readComments: undefined }))({ repo });
+  expect(gh).toHaveBeenCalledTimes(6);
+  expect(gh.mock.calls.slice(1).map(([args]) => args.at(-1))).toEqual(['page=1', 'page=2', 'page=1', 'page=2', 'page=1']);
+  expect(facts.prs[0].redTeam.state).toBe('clear');
+  expect(facts.prs.every(p => p.evidenceErrors.length === 0)).toBe(true);
+});
+
+it('saves shape children for identical file sets within a sweep while validating each PR and refreshing next sweep', () => {
+  const listing = [humanPr(), humanPr({ number: 2, headRefOid: 'c'.repeat(40) }),
+    humanPr({ number: 3, changedFiles: 2 }),
+    humanPr({ number: 4, files: [{ path: 'AGENTS.md' }] })];
+  const shape = vi.fn(files => ({ humanRequired: files.includes('AGENTS.md') }));
+  const reader = createJudgeSweepFactsReader(options({ gh: () => JSON.stringify(listing), shape,
+    cache: { get: () => undefined, set: vi.fn() } }));
+  const facts = reader({ repo }).prs;
+  expect(shape).toHaveBeenCalledTimes(2);
+  expect(facts.map(p => p.humanRequired)).toEqual([false, false, null, true]);
+  expect(facts[2].evidenceErrors).toContain('shape unavailable; inspect full diff before delegating');
+  reader({ repo });
+  expect(shape).toHaveBeenCalledTimes(4);
+});
+
+it('does not reuse malformed shape results for another PR with identical files', () => {
+  const shape = vi.fn().mockReturnValueOnce({}).mockReturnValueOnce({ humanRequired: true });
+  const facts = createJudgeSweepFactsReader(options({ shape,
+    gh: () => JSON.stringify([humanPr(), humanPr({ number: 2 })]),
+  }))({ repo }).prs;
+  expect(shape).toHaveBeenCalledTimes(2);
+  expect(facts[0].humanRequired).toBeNull();
+  expect(facts[0].evidenceErrors).toContain('shape unavailable; inspect full diff before delegating');
+  expect(facts[1].humanRequired).toBe(true);
 });

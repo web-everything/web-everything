@@ -68,6 +68,22 @@ describe('deterministic first-match judge classification', () => {
     expect(needsJudgment(facts(patch))).toEqual({ reason,
       needsJudgment: !['fixer running', 'in CI', 'waiting on review', 'fix-loop active (<60 min)'].includes(reason) });
   });
+  it.each([
+    ['at cap', 'at-cap', ['b', 'c', 'd', 'e'], []],
+    ['above cap', 'at-cap', ['b', 'c', 'd', 'e', 'f'], []],
+    ['repeated finding', 'finding-back-unfixed-more-than-once', [],
+      [advisory({ head: OLD, findings: [finding], minutes: 20 }), advisory({ findings: [finding] })]],
+  ])('still requires judgment for %s with pending red-team evidence and a stale red-team:clear label',
+    (_name, reason, reviewedHeads, comments) => {
+      const row = fixture({
+        gh: () => JSON.stringify([pr({ labels: [{ name: 'red-team:clear' }] })]),
+        readLedgerRows: () => reviewedHeads.map(h => ({ repo: REPO, pr: 1, type: 'review-run',
+          headSha: h.repeat(40), at: at(20) })),
+        readComments: () => comments,
+      }).read().prs[0];
+      expect(row.redTeam.state).toBe('pending');
+      expect(needsJudgment(row)).toEqual({ needsJudgment: true, reason });
+    });
   it('does not confuse nonconsecutive findings or missing red-team evidence with a clean approval', () => {
     expect(needsJudgment(facts({ verdictHistory: [{ findings: [{ key: 'k' }] }, { findings: [] }, { findings: [{ key: 'k' }] }] })).needsJudgment).toBe(false);
     expect(needsJudgment(facts({ labels: ['review:human'], latestVerdict: { accepted: true } })).needsJudgment).toBe(false);
@@ -589,17 +605,17 @@ describe('injected reader and shared evidence readers', () => {
     { trigger: 'fixer running', pending: false, ci: false, fixer: true },
     { trigger: 'all shortcuts', pending: true, ci: true, fixer: true },
   ].map(trigger => ({ label, ...trigger }))))(
-    'refuses a blocked red-team label without a trusted live result ($label; $trigger)',
+    'treats a stale red-team label as pending on the new head ($label; $trigger)',
     ({ label, pending, ci, fixer }) => {
       const gh = vi.fn(() => JSON.stringify([pr({
         labels: [label, ...(pending ? ['review:pending'] : [])].map(name => ({ name })),
         statusCheckRollup: ci ? [{ name: 'test', status: 'IN_PROGRESS' }] : [],
       })]));
       const f = fixture({ gh, readJobs: () => fixer ? [{ repo: REPO, pr: 1, kind: 'fix-run' }] : [] });
-      // Operator rule: unreadable evidence always needs judgment, including during fixer/CI activity.
       expect(buildJudgeSweepBundle(f.read()).prs[0]).toMatchObject(
-        { needsJudgment: true, reason: 'evidence-unavailable: inspect PR evidence and rerun',
-          evidenceErrors: ['red-team label lacks live result evidence'] });
+        { needsJudgment: false,
+          nextOwner: 'red-team', nextStep: 'red-team pending on the new head',
+          redTeam: { state: 'pending' }, evidenceErrors: [] });
       expect(f.readComments).toHaveBeenCalledTimes(1);
       expect(gh).toHaveBeenCalledTimes(1);
     });
@@ -608,10 +624,9 @@ describe('injected reader and shared evidence readers', () => {
       expect(() => fixture({ gh: () => JSON.stringify(listing) }).read()).toThrow(/inspect PR evidence.*operator query/);
     }
   });
-  it('shares a hard 128-call budget across comment pages and PRs', () => {
+  it('shares a hard 128-call budget across REST comment pages', () => {
     const tsv = Array.from({ length: 100 }, () => `ordinary\t${at(1)}\tchalbert\tcomment-id\thttps://example.test/comment`).join('\n');
-    const gh = vi.fn(args => args[0] === 'pr' ? JSON.stringify([pr({ statusCheckRollup: [{ name: 'test', status: 'IN_PROGRESS' }] }),
-      pr({ number: 2, labels: [{ name: 'review:pending' }] })]) : tsv);
+    const gh = vi.fn(args => args[0] === 'pr' ? JSON.stringify([pr({ statusCheckRollup: [{ name: 'test', status: 'IN_PROGRESS' }] })]) : tsv);
     const f = fixture({ gh, readComments: undefined });
     const row = buildJudgeSweepBundle(f.read());
     expect(gh).toHaveBeenCalledTimes(128);

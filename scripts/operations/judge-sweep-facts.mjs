@@ -9,6 +9,9 @@ export const JUDGE_SWEEP_REPO = CONSTELLATION_REPOS[DEFAULT_REPO_KEY].slug;
 export const STALL_DEFAULTS = Object.freeze({ fixerInfraLoop: 3, needsHumanAgedHours: 6,
   draftWithdrawnAgedHours: 4, waitingFixerMinutes: 45, unownedMinutes: 45 });
 
+const redTeamPendingOnNewHead = pr => pr.redTeam?.state === 'pending' && !pr.redTeam.latestResultId
+  && pr.labels?.some(l => ['red-team:blocked', 'red-team:clear'].includes(l));
+
 /** First match wins, including when a worker is running on a PR already near its cap. */
 function existingJudgment(pr, thresholds = STALL_DEFAULTS) {
   const limits = { ...STALL_DEFAULTS, ...thresholds };
@@ -66,6 +69,7 @@ export function deriveNextOwner(pr, thresholds = STALL_DEFAULTS) {
   if (judgment.needsJudgment && judgment.reason !== 'waiting-fixer-not-dispatched') {
     return result('judge', 'Inspect PR evidence and rule on the outstanding judgment.');
   }
+  if (redTeamPendingOnNewHead(pr)) return result('red-team', 'red-team pending on the new head');
   if (pr.fixerRunning) return result('fixer', 'Complete the active repair and publish its result.');
   if (labels.includes('ready-to-merge')) return result('drain', 'Merge after required gates pass.');
   if (labels.some(l => ['review:accepted', 'review:human', 'status:needs-you'].includes(l))) {

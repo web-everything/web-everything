@@ -243,6 +243,9 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
         if (chunk.split('\n').filter(Boolean).length < 100) return chunks.join('\n');
       }
     };
+    // Within this observation only, identical validated files and policy need one shape child.
+    // At most LIST_LIMIT - 1 entries; head/base cache identities still remain independent.
+    const shapes = new Map();
     const prs = listing.map(p => {
       if (!Number.isSafeInteger(p?.number) || p.number <= 0 || !/^[a-f0-9]{40}$/i.test(p.headRefOid ?? '')
         || !Array.isArray(p.labels) || p.labels.some(l => typeof l?.name !== 'string')
@@ -291,8 +294,9 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
       // Mandatory referrals can appear only in comments, even while a fixer or CI runs.
       const redTeamJudgmentLabel = labels.some(l => RED_TEAM_JUDGMENT_LABELS.has(l));
       try {
+        const prCommentsExec = commentsExec;
         const readCommentEvidence = () => {
-          const comments = readComments({ number: p.number, repo, exec: commentsExec });
+          const comments = readComments({ number: p.number, repo, exec: prCommentsExec });
           if (!Array.isArray(comments) || comments.some(c => typeof c?.body !== 'string' || !c.author?.login || !Number.isFinite(Date.parse(c.createdAt)))) throw failure('comments incomplete');
           return comments;
         };
@@ -313,7 +317,7 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
         const blocked = ruling || disposition.held.length || disposition.sendBack.length;
         result.redTeam = { state: blocked ? 'blocked' : labels.includes('red-team:pending') ? 'pending' : state.result ? 'clear' : 'unknown',
           latestResultId: state.resultId, latestOutcome: state.sendBackOutcome ?? [...state.outcomes].at(-1) ?? null };
-        if (!state.result && redTeamJudgmentLabel) evidenceErrors.push('red-team label lacks live result evidence');
+        if (!state.result && redTeamJudgmentLabel) result.redTeam.state = 'pending';
         const grants = gateRoundGrants(comments, p.number, repo, standingRuling);
         result.cap = gateRoundCap({ cap: baseCap, grants, roundAt: (at, g) => readReviewRoundAsOf({ repo, pr: p.number, at,
           head: Number.isInteger(state.headReviewIndex) && state.headReviewIndex < g.index ? headSha : null, readLedgerRows: () => mine }) });
@@ -400,9 +404,15 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
             if (!Array.isArray(p.files) || p.files.length !== p.changedFiles || !p.files.length
               || p.files.some(f => typeof f?.path !== 'string' || !f.path)
               || new Set(p.files.map(f => f.path)).size !== p.files.length) throw failure('net file list incomplete; inspect full diff');
-            const shaped = shape(p.files.map(f => f.path), humanSurfaces);
-            if (typeof shaped?.humanRequired !== 'boolean') throw failure('shape unreadable');
-            human = shaped.humanRequired;
+            const files = p.files.map(f => f.path);
+            const shapeKey = JSON.stringify([policyHash, files]);
+            human = shapes.get(shapeKey);
+            if (typeof human !== 'boolean') {
+              const shaped = shape(files, humanSurfaces);
+              if (typeof shaped?.humanRequired !== 'boolean') throw failure('shape unreadable');
+              human = shaped.humanRequired;
+              shapes.set(shapeKey, human);
+            }
             cache.set(key, human);
           }
           result.humanRequired = human;
