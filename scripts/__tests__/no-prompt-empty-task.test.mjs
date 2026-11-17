@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { NO_PROMPT_COMMAND_RULES, renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
+import { NO_PROMPT_COMMAND_RULES, NO_PROMPT_COMMAND_RULES_BODY, NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT, renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 import { composeOperatorTaskBrief } from '../operations/operator-task-brief.mjs';
 import { applyContextPack, briefWithContextPack } from '../conveyor/fix-context-pack.mjs';
 import { readFixBriefTemplate } from '../conveyor/reconcile-fix-dispatch.mjs';
@@ -27,7 +27,9 @@ mkdirSync(dirname(quietRules), { recursive: true });
 writeFileSync(quietRules, 'Quiet hours: pause work.');
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
-const EMPTY = ['', ' \t\r\n', NO_PROMPT_COMMAND_RULES, `\n${NO_PROMPT_COMMAND_RULES}\n`];
+const EMPTY = ['', ' \t\r\n', NO_PROMPT_COMMAND_RULES, `\n${NO_PROMPT_COMMAND_RULES}\n`,
+  `${NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT}\n${NO_PROMPT_COMMAND_RULES}`,
+  `${NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT}\n${NO_PROMPT_COMMAND_RULES_BODY}`];
 const settings = { contextPack: true, contextMaxBytes: 10000, contextLines: 20, localTests: 'proof-only' };
 
 describe('task content is checked before generic instructions can mask it', () => {
@@ -152,8 +154,8 @@ describe('task content is checked before generic instructions can mask it', () =
   ])('%s sandbox renderer refuses empty input before adding its literal rules', path => {
     const repo = join(dirname(fileURLToPath(import.meta.url)), '../..');
     const source = readFileSync(join(repo, path), 'utf8');
-    const helper = source.match(/function renderNoPromptCommandRules\(brief\) \{[\s\S]*?\n\}/)[0];
-    const render = new Function('NO_PROMPT_COMMAND_RULES', `${helper}; return renderNoPromptCommandRules;`)(NO_PROMPT_COMMAND_RULES);
+    const runtime = source.match(/\/\/ BEGIN generated no-prompt runtime[^\n]*\n([\s\S]*?)\n\/\/ END generated no-prompt runtime/)[1];
+    const render = new Function(`${runtime}; return renderNoPromptCommandRules;`)();
     for (const task of EMPTY) expect(() => render(task)).toThrow(/empty task content/);
     expect(render('Concrete task')).toBe(`Concrete task\n\n${NO_PROMPT_COMMAND_RULES}\n`);
   });
@@ -162,16 +164,20 @@ describe('task content is checked before generic instructions can mask it', () =
     const repo = join(dirname(fileURLToPath(import.meta.url)), '../..');
     const script = `import ast, json, sys
 tree = ast.parse(sys.stdin.read())
-nodes = [n for n in tree.body if (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'NO_PROMPT_COMMAND_RULES' for t in n.targets)) or (isinstance(n, ast.FunctionDef) and n.name == 'render_no_prompt_command_rules')]
+nodes = [n for n in tree.body if (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id.startswith('NO_PROMPT_COMMAND_RULES') for t in n.targets)) or (isinstance(n, ast.FunctionDef) and n.name == 'render_no_prompt_command_rules')]
 exec(compile(ast.Module(body=nodes, type_ignores=[]), '<renderer>', 'exec'))
-for task in ['', ' \\t\\r\\n', NO_PROMPT_COMMAND_RULES, '\\n' + NO_PROMPT_COMMAND_RULES + '\\n']:
+for task in ['', ' \\t\\r\\n', NO_PROMPT_COMMAND_RULES, '\\n' + NO_PROMPT_COMMAND_RULES + '\\n', NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT + '\\n' + NO_PROMPT_COMMAND_RULES]:
     try:
         render_no_prompt_command_rules(task)
     except ValueError as error:
         assert 'empty task content' in str(error)
     else:
         raise AssertionError('accepted empty task')
-assert render_no_prompt_command_rules('Concrete task') == 'Concrete task\\n\\n' + NO_PROMPT_COMMAND_RULES
+assert render_no_prompt_command_rules('Concrete task') == NO_PROMPT_COMMAND_RULES + '\\n\\nConcrete task'
+quoted = '<approach>\\n' + NO_PROMPT_COMMAND_RULES + '\\n</approach>'
+rendered = render_no_prompt_command_rules(quoted)
+assert rendered == NO_PROMPT_COMMAND_RULES + '\\n\\n' + quoted
+assert render_no_prompt_command_rules(rendered) == rendered
 print('PASS')`;
     const result = spawnSync('python3', ['-c', script], { input: readFileSync(join(repo, 'scripts/operator/converge.py'), 'utf8'),
       encoding: 'utf8', timeout: 10000, maxBuffer: 65536 });

@@ -4,7 +4,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import {
-  NO_PROMPT_COMMAND_RULES, renderNoPromptCommandRules,
+  NO_PROMPT_COMMAND_RULES, renderNoPromptCommandRules, renderNoPromptCommandRulesRuntime, noPromptRulePlacement,
   LAUNCH_BRIEF_SOURCES, LAUNCH_BRIEF_EXCLUSIONS,
 } from '../lib/no-prompt-command-rules.mjs';
 import { renderWorkerBrief } from '../worker-brief.mjs';
@@ -138,7 +138,10 @@ describe('no-prompt command rules', () => {
     for (const path of LAUNCH_BRIEF_SOURCES) {
       const text = files.get(path);
       expect(typeof text, path).toBe('string');
-      if (path.endsWith('.md')) expectBlock(text);
+      if (path.endsWith('.md')) {
+        expectBlock(text);
+        expect(noPromptRulePlacement(text).blocks, path).toHaveLength(1);
+      }
       else if (path.endsWith('.py')) {
         expect(JSON.parse(text.match(/^NO_PROMPT_COMMAND_RULES = (.+)$/m)[1]), path).toBe(NO_PROMPT_COMMAND_RULES);
         expect(text).toContain('prompt = render_no_prompt_command_rules(prompt)');
@@ -147,6 +150,7 @@ describe('no-prompt command rules', () => {
         // The workflow sandbox cannot import modules. Pin its generated literal, then its agent boundary.
         const literal = text.match(/^const NO_PROMPT_COMMAND_RULES = (.+);$/m);
         expect(JSON.parse(literal[1]), path).toBe(NO_PROMPT_COMMAND_RULES);
+        expect(text, path).toContain(renderNoPromptCommandRulesRuntime());
         const source = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
         function visit(node) {
           if (ts.isCallExpression(node) && node.expression.getText(source) === 'agent') {

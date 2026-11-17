@@ -1,10 +1,107 @@
-// Generated no-prompt rules: source scripts/lib/no-prompt-command-rules.mjs; pinned by the whole-tree test.
-const NO_PROMPT_COMMAND_RULES = "## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.\n- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`.\n- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.";
-function renderNoPromptCommandRules(brief) {
-  if (typeof brief !== 'string') throw new TypeError('no-prompt rules require a string brief');
-  if (!brief.replaceAll(NO_PROMPT_COMMAND_RULES, '').trim()) throw new Error('empty task content');
-  return brief.includes(NO_PROMPT_COMMAND_RULES) ? brief : brief + '\n\n' + NO_PROMPT_COMMAND_RULES + '\n';
+// BEGIN generated no-prompt runtime: scripts/lib/no-prompt-command-rules.mjs
+const NO_PROMPT_COMMAND_RULES = "<!-- no-prompt-command-rules:begin -->\n## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.\n- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`.\n- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.\n<!-- no-prompt-command-rules:end -->";
+const NO_PROMPT_COMMAND_RULES_BODY = "## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.\n- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`.\n- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.";
+const NO_PROMPT_COMMAND_RULES_SENTINEL = "<!-- no-prompt-command-rules:begin -->";
+const NO_PROMPT_COMMAND_RULES_END = "<!-- no-prompt-command-rules:end -->";
+const NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT = "<!-- Generated from scripts/lib/no-prompt-command-rules.mjs; whole-tree test pins this copy. -->";
+function noPromptRulePlacement(brief) {
+  const blocks = [];
+  const tags = [];
+  let markdown = null, inline = 0, comment = false, malformed = false, offset = 0;
+  while (offset < brief.length) {
+    const newline = brief.indexOf('\n', offset);
+    const end = newline < 0 ? brief.length : newline;
+    const line = brief.slice(offset, end).replace(/\r$/, '');
+    if (!markdown && !inline && !comment && !tags.length && !malformed
+      && line === NO_PROMPT_COMMAND_RULES_SENTINEL
+      && brief.startsWith(NO_PROMPT_COMMAND_RULES, offset)) {
+      const blockEnd = offset + NO_PROMPT_COMMAND_RULES.length;
+      if (blockEnd === brief.length || brief[blockEnd] === '\n' || brief.slice(blockEnd, blockEnd + 2) === '\r\n') {
+        blocks.push({ start: offset, end: blockEnd });
+        offset = blockEnd;
+        if (brief[offset] === '\r') offset++;
+        if (brief[offset] === '\n') offset++;
+        continue;
+      }
+    }
+    const fence = !inline && !comment && line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (markdown) {
+      if (fence && fence[1][0] === markdown.char && fence[1].length >= markdown.length && !fence[2].trim()) markdown = null;
+    } else if (fence) {
+      markdown = { char: fence[1][0], length: fence[1].length };
+    } else {
+      let at = 0;
+      while (at < line.length) {
+        if (comment) {
+          const close = line.indexOf('-->', at);
+          const nested = line.indexOf('<!--', at);
+          if (nested >= 0 && (close < 0 || nested < close)) malformed = true;
+          if (close < 0) break;
+          comment = false;
+          at = close + 3;
+          continue;
+        }
+        if (line[at] === '`') {
+          let next = at + 1;
+          while (line[next] === '`') next++;
+          const length = next - at;
+          // An unmatched backtick is literal Markdown, not an open code span.
+          const remaining = brief.slice(offset + next).replaceAll(NO_PROMPT_COMMAND_RULES, '');
+          const closes = remaining.match(/`+/g)?.some(run => run.length === length);
+          if (!inline && closes) inline = length;
+          else if (inline === length) inline = 0;
+          at = next;
+          continue;
+        }
+        if (inline) { at++; continue; }
+        if (line.startsWith('<!--', at)) { comment = true; at += 4; continue; }
+        const tag = line[at] === '<' && line.slice(at).match(/^<\s*(\/?)\s*([A-Za-z][\w:-]*)(?:\s[^<>]*?)?\s*(\/?)>/);
+        if (tag) {
+          const name = tag[2].toLowerCase();
+          // Runtime placeholders such as <branch> are prose, not labelled data fences.
+          const dataTag = /^(task|concerns|approach|findings|goal|material)$/.test(name)
+            || brief.slice(offset + at + tag[0].length).includes(`</${name}>`);
+          if (!dataTag && !tags.includes(name)) { at += tag[0].length; continue; }
+          if (tag[1]) {
+            if (tags.at(-1) === name) tags.pop();
+            else malformed = true;
+          } else if (!tag[3]) tags.push(name);
+          at += tag[0].length;
+          continue;
+        }
+        at++;
+      }
+    }
+    offset = newline < 0 ? brief.length : end + 1;
+  }
+  return { blocks, closed: !markdown && !inline && !comment && !tags.length && !malformed };
 }
+function stripTrustedNoPromptCommandRules(brief) {
+  const { blocks } = noPromptRulePlacement(brief);
+  let result = brief;
+  for (const { start, end } of blocks.reverse()) result = result.slice(0, start) + result.slice(end);
+  return result;
+}
+function assertBriefTaskContent(brief) {
+  if (typeof brief !== 'string') throw new TypeError('no-prompt rules require a string brief');
+  const task = brief.replaceAll(NO_PROMPT_COMMAND_RULES, '')
+    .replaceAll(NO_PROMPT_COMMAND_RULES_BODY, '')
+    .replaceAll(NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT, '')
+    .replaceAll(NO_PROMPT_COMMAND_RULES_SENTINEL, '')
+    .replaceAll(NO_PROMPT_COMMAND_RULES_END, '');
+  if (!task.trim()) {
+    throw new Error('empty task content — refusing a brief containing only whitespace or command rules');
+  }
+  return brief;
+}
+function renderNoPromptCommandRules(brief) {
+  assertBriefTaskContent(brief);
+  const placement = noPromptRulePlacement(brief);
+  if (placement.blocks.length) return brief;
+  return placement.closed ? `${brief}\n\n${NO_PROMPT_COMMAND_RULES}\n` : `${NO_PROMPT_COMMAND_RULES}\n\n${brief}`;
+}
+// END generated no-prompt runtime
+
 
 /**
  * subject-jury.workflow.js — the SUBJECT-AGNOSTIC jury harness (#2658, S6 / F1 front door of epic #2649).

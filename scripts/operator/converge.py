@@ -47,14 +47,24 @@ import re
 import subprocess
 
 # Generated from scripts/lib/no-prompt-command-rules.mjs; pinned by the whole-tree test.
-NO_PROMPT_COMMAND_RULES = "## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.\n- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`.\n- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`."
+NO_PROMPT_COMMAND_RULES = "<!-- no-prompt-command-rules:begin -->\n## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.\n- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`.\n- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.\n<!-- no-prompt-command-rules:end -->"
+NO_PROMPT_COMMAND_RULES_BODY = "## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.\n- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`.\n- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`."
+NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT = "<!-- Generated from scripts/lib/no-prompt-command-rules.mjs; whole-tree test pins this copy. -->"
+NO_PROMPT_COMMAND_RULES_SENTINEL = "<!-- no-prompt-command-rules:begin -->"
+NO_PROMPT_COMMAND_RULES_END = "<!-- no-prompt-command-rules:end -->"
 
 def render_no_prompt_command_rules(brief):
     if not isinstance(brief, str):
         raise TypeError('no-prompt rules require a string brief')
-    if not brief.replace(NO_PROMPT_COMMAND_RULES, '').strip():
+    task = brief
+    for marker in [NO_PROMPT_COMMAND_RULES, NO_PROMPT_COMMAND_RULES_BODY, NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT, NO_PROMPT_COMMAND_RULES_SENTINEL, NO_PROMPT_COMMAND_RULES_END]:
+        task = task.replace(marker, '')
+    if not task.strip():
         raise ValueError('empty task content')
-    return brief if NO_PROMPT_COMMAND_RULES in brief else brief + "\n\n" + NO_PROMPT_COMMAND_RULES
+    # A complete prefix starts in instruction position; quoted copies elsewhere never suppress it.
+    if brief.startswith(NO_PROMPT_COMMAND_RULES + "\n\n"):
+        return brief
+    return NO_PROMPT_COMMAND_RULES + "\n\n" + brief
 
 import sys
 import threading
