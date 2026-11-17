@@ -43,15 +43,15 @@ const SCOPE_SETTINGS_FILE = new URL('../settings/audit-scope.json', import.meta.
 const MAX_INVARIANTS_BYTES = 64 * 1024;
 const validScopeMode = value => value === 'open' || value === 'invariants';
 
-/** Resolve only the trusted running checkout's scope setting; unusable settings select open review. */
+/** Resolve the trusted tool setting over platform policy; absent/invalid layers fall through to standard open. */
 export function resolveAuditScope({ env = process.env, readFile = readFileSync, platform, log } = {}) {
-  let mode = 'open';
+  let tool;
   try {
     const configured = JSON.parse(readFile(SCOPE_SETTINGS_FILE, 'utf8'))?.mode;
-    if (validScopeMode(configured)) mode = configured;
-  } catch { /* unreadable settings keep open review */ }
+    if (validScopeMode(configured)) tool = { mode: configured };
+  } catch { /* unreadable tool settings leave platform and standard policy in effect */ }
   const override = env.WE_AUDIT_SCOPE_MODE;
-  const { value } = cascadePolicy('auditScope', { mode }, {
+  const { value } = cascadePolicy('auditScope', tool, {
     standard: { mode: 'open' }, platform, env, log,
     envValues: override === undefined ? {} : { mode: validScopeMode(override) ? override : 'open' },
     valid: { mode: validScopeMode },

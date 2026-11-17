@@ -1,4 +1,4 @@
 {
-  "$comment": "R968 audit scope from the TRUSTED running checkout, never the candidate diff. mode: open | invariants. Default and invalid/unreadable fallback: open. Policy cascade: standard, platform auditScope, this tool file, WE_AUDIT_SCOPE_MODE. Invariants mode requires a usable --invariants-file; otherwise warn and use open review. Provenance uses the shared policy-cascade logging convention.",
+  "$comment": "R968 audit scope from the TRUSTED running checkout, never the candidate diff. mode: open | invariants. Standard default: open. Missing, invalid or unreadable tool mode leaves platform auditScope in effect, then standard open if platform is silent. Policy cascade: standard, platform auditScope, this tool file, WE_AUDIT_SCOPE_MODE. Invariants mode requires a usable --invariants-file; otherwise warn and use open review. Provenance uses the shared policy-cascade logging convention.",
   "mode": "open"
 }

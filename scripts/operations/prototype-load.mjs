@@ -4,6 +4,7 @@
  * and removed registrations before replacement admission. Keep comparisons explicit and swaps ordered.
  */
 import { op } from './registry.mjs';
+import { createHash } from 'node:crypto';
 import { compute, effect } from './step-kinds.mjs';
 import { QUESTION_HASH, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes } from './codex-audit.mjs';
 import { carriesAcross } from '../lib/net-diff-fingerprint.mjs';
@@ -128,8 +129,13 @@ export function readyRecordSpeaksFor(records, input, liveFp = null) {
 /** Canonical audit for this head. Each non-empty base (base!==head) is judged by findAudit (latest wins within a
  * base, file order breaks ties, contradictory findings rejected). Fail closed: ANY base whose latest verdict is
  * WEAKENED blocks, and a pass only counts when covers(base) proves the base is already in main (the audit spans the
- * whole change, not just its last commit). */
+ * whole change, not just its last commit). Scoped passes additionally require auditOptions.invariantsText from
+ * this item's card INVARIANTS block, unchanged (including whitespace). No item binding means open audits only. */
 export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp = null, auditOptions = {}) {
+  const invariants = auditOptions.invariantsText;
+  const requiredInvariantsHash = typeof invariants === 'string' && invariants.trim()
+    && Buffer.byteLength(invariants, 'utf8') <= 64 * 1024
+    ? createHash('sha256').update(invariants).digest('hex') : null;
   // R503: an audit of an older head also speaks for this head when its stored net-diff fingerprint equals the live one.
   // No stored or live fingerprint, or any difference, means no carry (a real code change always re-audits).
   // Eligibility is per RECORD: each carried record must itself hold the matching fingerprint, so one carried record
@@ -208,6 +214,8 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   const passes = own.length ? own : carried.filter((d) => carriesAcross(d.record.fingerprint, liveFp));
   let pass = null;
   for (const { base, record } of passes) {
+    // Bind at admission for both own and fingerprint-carried evidence. Unbound scoped negatives still fail closed.
+    if (record.scope === 'invariants' && (!requiredInvariantsHash || record.invariantsHash !== requiredInvariantsHash)) continue;
     // A current-question record for this head+base (usable or not) blocks a PRIOR-question pass, even when carry
     // eligibility dropped it (no or differing fingerprint): judge against ALL records, fail closed.
     if (record.questionHash !== QUESTION_HASH

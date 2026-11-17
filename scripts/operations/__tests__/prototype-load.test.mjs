@@ -4,6 +4,7 @@
  * replacement, and adoption refusal with injected doubles, plus real Git adoption probes.
  */
 import { describe, it, expect, vi } from 'vitest';
+import { createHash } from 'node:crypto';
 import nodeFs, { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
@@ -396,6 +397,36 @@ describe('codex-audit runner registration', () => {
 });
 
 describe('canonicalAuditEvidence', () => {
+  const invariantsText = '- Keep the admission guard.\n';
+  const invariantsHash = createHash('sha256').update(invariantsText).digest('hex');
+  const scopedAudit = (overrides = {}) => auditRecord({ scope: 'invariants', invariantsHash, ...overrides });
+
+  it.each([SHA, MERGE])('accepts a scoped audit bound to the exact item invariants on head %s', head => {
+    const fingerprint = 'f'.repeat(64);
+    const record = scopedAudit({ head, fingerprint });
+    expect(prototypeLoad.canonicalAuditEvidence([record], SHA, () => true, fingerprint, { invariantsText }))
+      .toEqual({ ok: true, record });
+  });
+
+  it.each([undefined, '', '0'.repeat(64), [invariantsHash]])('rejects a scoped audit with missing or different hash %j', hash => {
+    const fingerprint = 'f'.repeat(64);
+    for (const head of [SHA, MERGE]) {
+      expect(prototypeLoad.canonicalAuditEvidence([scopedAudit({ head, fingerprint, invariantsHash: hash })], SHA,
+        () => true, fingerprint, { invariantsText })).toEqual({ ok: false, reason: 'no-record' });
+    }
+  });
+
+  it.each([undefined, null, [invariantsText], '', ' \n', invariantsText.trimEnd(), invariantsText.replace('\n', '\r\n')])('refuses scoped evidence when the item invariants are absent or differ: %j', required => {
+    expect(prototypeLoad.canonicalAuditEvidence([scopedAudit()], SHA, () => true, null, { invariantsText: required }))
+      .toEqual({ ok: false, reason: 'no-record' });
+  });
+
+  it('the production loader refuses scoped evidence when it has no item invariants binding', async () => {
+    const f = auditedFixture('refuse', { audits: auditLines([scopedAudit()]), auditBaseInMain: TREE });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { reason: 'no-record' } });
+    expect([...f.registrations]).toEqual([]);
+  });
+
   it('exports a pure selector returning the matching NOT WEAKENED record', () => {
     const record = Object.freeze(auditRecord());
     const records = Object.freeze([record]);
@@ -2227,7 +2258,9 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
   // eligibility (a missing or differing fingerprint) dropped that current record from the eligible set.
   describe('prior-question pass vs an ineligible current-question record', () => {
     const PRIOR = 'c'.repeat(64);
-    const opts = { priorQuestionHashes: [{ hash: PRIOR, acceptUntil: '2026-10-30T00:00:00Z' }], now: Date.parse('2026-10-21T00:00:00Z') };
+    const invariantsText = '- Preserve the guard.\n';
+    const invariantsHash = createHash('sha256').update(invariantsText).digest('hex');
+    const opts = { invariantsText, priorQuestionHashes: [{ hash: PRIOR, acceptUntil: '2026-10-30T00:00:00Z' }], now: Date.parse('2026-10-21T00:00:00Z') };
     const prior = () => old({ questionHash: PRIOR });
     const carry = (...records) => prototypeLoad.canonicalAuditEvidence(records, SHA, () => true, FP, opts);
     it('the carried prior pass alone is a pass (the setting is live in this path)', () => {
@@ -2236,9 +2269,12 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
     it.each([SHA, 'd'.repeat(40)])('a scoped pass on head %s cannot hide its accepted prior open WEAKENED from the canonical gate', head => {
       const weak = old({ head, questionHash: PRIOR, verdict: 'WEAKENED', findings: ['x.mjs:1 guard removed'] });
       for (const questionHash of [QUESTION_HASH, PRIOR]) {
-        const scoped = old({ head, questionHash, at: '2026-10-21T12:00:00Z', scope: 'invariants', invariantsHash: 'e'.repeat(64), followUps: [] });
-        expect(carry(weak, scoped)).toEqual({ ok: false, reason: 'weakened' });
-        expect(carry(scoped, weak)).toEqual({ ok: false, reason: 'weakened' });
+        for (const at of ['2026-10-19T12:00:00Z', weak.at, '2026-10-21T12:00:00Z']) {
+          const scoped = old({ head, questionHash, at, scope: 'invariants', invariantsHash, followUps: [] });
+          expect(carry(scoped)).toEqual({ ok: true, record: scoped });
+          expect(carry(weak, scoped)).toEqual({ ok: false, reason: 'weakened' });
+          expect(carry(scoped, weak)).toEqual({ ok: false, reason: 'weakened' });
+        }
       }
     });
     it.each([
@@ -3203,4 +3239,12 @@ it.skipIf(!shippedRuledSettings.ruledWeakened.some((e) => e.ruling === 'R803'))(
     audits: auditLines([auditRecord({ head: entry.sha, verdict: 'WEAKENED', findings: entry.findings })]), auditBaseInMain: TREE,
     settings: { ...shippedRuledSettings, daemons: settings.daemons, readyRecordPath: '~/ready', recordPath: '~/records', auditRecordPath: '~/canonical-audits.jsonl', workspaceRoot: '~/workspace' } });
   expect(await f.run({ branch: entry.ref })).toMatchObject({ ok: true, registered: true, canonicalAudit: { ok: true }, gate: { ruledWeakened: { ruling: 'R803' } } });
+});
+
+it('refuses oversized item invariants even when a scoped record has their exact hash', () => {
+  const invariantsText = 'é'.repeat(32769);
+  const invariantsHash = createHash('sha256').update(invariantsText).digest('hex');
+  const record = auditRecord({ scope: 'invariants', invariantsHash });
+  expect(prototypeLoad.canonicalAuditEvidence([record], SHA, () => true, null, { invariantsText }))
+    .toEqual({ ok: false, reason: 'no-record' });
 });

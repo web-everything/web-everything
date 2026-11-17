@@ -8,6 +8,7 @@ import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { describe, it, expect, vi } from 'vitest';
 import { CANONICAL_QUESTION, QUESTION_HASH, main, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes, resolveAuditScope, MAX_PRIOR_WINDOW_MS } from '../codex-audit.mjs';
 import { createAuditDeps } from '../codex-audit-io.mjs';
+import { resetCascadeLogForTest } from '../../lib/policy-cascade.mjs';
 
 // Lets one test swap the text codex-audit.mjs reads for its settings file; every other read passes through.
 const settingsOverride = vi.hoisted(() => ({ text: null }));
@@ -45,6 +46,65 @@ describe('R968 invariant-scoped audit', () => {
     f.deps.readInvariantsFile = vi.fn(() => invariant);
     return f;
   };
+
+  it('ships a parseable audit-scope setting with mode open', () => {
+    const setting = JSON.parse(realFs.readFileSync(new NodeURL('../../settings/audit-scope.json', import.meta.url), 'utf8'));
+    expect(setting.mode).toBe('open');
+  });
+
+  it('hashes the exact invariants file text, preserving whitespace and line endings', async () => {
+    const dir = realFs.mkdtempSync(join(tmpdir(), 'audit-exact-invariants-'));
+    try {
+      const path = join(dir, 'invariants.md');
+      const digests = [];
+      for (const text of [invariant, `${invariant}\n`, ` ${invariant}\n`, `${invariant}\r\n`, `${invariant}\n- Préserver é.\n`]) {
+        realFs.writeFileSync(path, text);
+        const f = scoped('NOT WEAKENED');
+        delete f.deps.readInvariantsFile;
+        expect(await main([...ARGS, `--invariants-file=${path}`], f.deps)).toBe(0);
+        expect(f.records[0].invariantsHash).toBe(createHash('sha256').update(text).digest('hex'));
+        digests.push(f.records[0].invariantsHash);
+      }
+      expect(new Set(digests).size).toBe(digests.length);
+    } finally { realFs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each(['symlink', 'directory', 'FIFO'])('the real reader refuses a %s with one warning and no hang', kind => {
+    const dir = realFs.mkdtempSync(join(tmpdir(), 'audit-special-invariants-'));
+    try {
+      const path = join(dir, 'invariants');
+      if (kind === 'directory') realFs.mkdirSync(path);
+      else if (kind === 'symlink') {
+        const target = join(dir, 'target');
+        realFs.writeFileSync(target, invariant);
+        realFs.symlinkSync(target, path);
+      } else {
+        expect(realSpawnSync('mkfifo', [path], { encoding: 'utf8', timeout: 2000 }).status).toBe(0);
+      }
+      // Isolate the synchronous reader so a blocking FIFO regression is killed by a real timeout.
+      const probe = realSpawnSync(process.execPath, ['--input-type=module', '-e', `
+        import { main } from ${JSON.stringify(new NodeURL('../codex-audit.mjs', import.meta.url).href)};
+        const errors = [], records = [];
+        let prompt;
+        const code = await main(${JSON.stringify([...ARGS, `--invariants-file=${path}`])}, {
+          resolveAuditScope: () => 'invariants', resolveSha: ref => ref === 'origin/main' ? '${BASE}' : '${HEAD}',
+          runCodex: async text => { prompt = text; return 'NOT WEAKENED'; },
+          appendRecord: record => records.push(record), now: () => '${AT}',
+          stderr: text => errors.push(text), stdout: () => {},
+        });
+        console.log(JSON.stringify({ code, prompt, errors, records }));
+      `], { encoding: 'utf8', timeout: 5000 });
+      expect(probe.error).toBeUndefined();
+      expect(probe.status).toBe(0);
+      const result = JSON.parse(probe.stdout);
+      expect(result.code).toBe(0);
+      expect(result.prompt).toBe(openPrompt);
+      expect(result.errors).toEqual(['Audit invariants file is unreadable, empty, or exceeds 64 KiB; using open review.\n']);
+      expect(result.records).toHaveLength(1);
+      expect(result.records[0]).not.toHaveProperty('scope');
+      expect(result.records[0]).not.toHaveProperty('invariantsHash');
+    } finally { realFs.rmSync(dir, { recursive: true, force: true }); }
+  });
 
   it.each([false, true])('pins open prompt, serialized record and output byte for byte (json=%s)', async json => {
     const f = fixture('WEAKENED\nx.mjs:1 bypass\nFOLLOW-UP: card');
@@ -190,10 +250,21 @@ describe('R968 invariant-scoped audit', () => {
   });
 
   it.each(['{}', '{"mode":"invalid"}', '{"mode":null}', '{"mode":42}', 'invalid JSON', null])('defaults invalid/unreadable settings to open: %j', text => {
-    expect(resolveAuditScope({ env: {}, platform: { mode: 'invariants' }, readFile: () => {
+    expect(resolveAuditScope({ env: {}, platform: {}, readFile: () => {
       if (text === null) throw new Error('unreadable');
       return text;
     } })).toBe('open');
+  });
+
+  it.each(['{}', '{"mode":"invalid"}', '{"mode":null}', 'invalid JSON', null])('honours platform mode when the tool file is silent: %j', text => {
+    resetCascadeLogForTest();
+    const log = vi.fn();
+    expect(resolveAuditScope({ env: { WE_POLICY_CASCADE_LOG: '1' }, log,
+      platform: { mode: 'invariants' }, readFile: () => {
+        if (text === null) throw new Error('unreadable');
+        return text;
+      } })).toBe('invariants');
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('mode="invariants" (platform)'));
   });
 
   it('resolves trusted tool settings and environment through the shared cascade with provenance', () => {
@@ -599,7 +670,7 @@ describe('prior question hashes (AU1 PR-B)', () => {
   });
   it.each([QUESTION_HASH, PRIOR])('a scoped pass under %s cannot supersede an accepted prior open WEAKENED', questionHash => {
     const weak = rec('WEAKENED', { findings: ['x.mjs:1 gap'] });
-    for (const at of [AT, '2026-11-03T12:00:00.000Z']) {
+    for (const at of ['2026-10-31T12:00:00.000Z', AT, '2026-11-03T12:00:00.000Z']) {
       const pass = rec('NOT WEAKENED', { questionHash, at, scope: 'invariants', invariantsHash: 'e'.repeat(64), followUps: [] });
       expect(find([weak, pass], open)).toBe(weak);
       expect(find([pass, weak], open)).toBe(weak);
