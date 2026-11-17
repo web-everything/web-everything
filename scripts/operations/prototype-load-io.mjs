@@ -22,7 +22,7 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readOverlayState, cloneKey } from '../lib/daemon-overlays.mjs';
 import { clearPendingAdoption, recordPendingAdoption, OVERLAY_ADOPTION_MAX_PENDING, OVERLAY_ADOPTION_TTL_MS } from '../lib/overlay-adoption.mjs';
 import { isGraphSourceFile, isVitestTestFile } from '../lib/related-test-selection.mjs';
-import { safeRef, safeRegistrationRef, validSha, jsonLines, testCheckEvidence, testWorkflowBound, TEST_CHECK_APP_ID, readyEvidence, readyRecordSpeaksFor, mergeRuledWeakened, canonicalAuditEvidence, changedPaths, comparePaths, nextMergeRef, refusal, resolveDaemonKey } from './prototype-load.mjs';
+import { safeRef, safeRegistrationRef, validSha, jsonLines, testCheckEvidence, testWorkflowBound, TEST_CHECK_APP_ID, readyEvidence, readyRecordSpeaksFor, mergeRuledWeakened, canonicalAuditEvidence, itemNumberFromBranch, invariantsSection, changedPaths, comparePaths, nextMergeRef, refusal, resolveDaemonKey } from './prototype-load.mjs';
 import { DISPATCH_PATH_DEFAULTS, matchDispatchPaths, runRealDispatchSmoke } from '../lib/daemon-load-overlay.mjs';
 import { netDiffFingerprint, carriesAcross } from '../lib/net-diff-fingerprint.mjs';
 import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository } from './prototype-retire.mjs';
@@ -310,6 +310,17 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       }
       if (!mainFetchOk) throw new Error('origin/main fetch unavailable; retry when main can be read');
     };
+    // INVARIANTS section of the single backlog card for the item a `lane/<item>-<slug>` branch names, from this trusted
+    // checkout. Any failure or ambiguity (non-WE repo, no item, zero or several cards, no section) returns null.
+    const branchInvariants = (branch) => {
+      try {
+        const item = itemNumberFromBranch(branch);
+        if (!item || gitRepo !== repo || typeof fs.readdirSync !== 'function') return null;
+        const dir = join(repo, 'backlog');
+        const cards = fs.readdirSync(dir).filter((name) => typeof name === 'string' && name.startsWith(`${item}-`) && name.endsWith('.md'));
+        return cards.length === 1 ? invariantsSection(read(join(dir, cards[0]))) : null;
+      } catch { return null; }
+    };
     const liveFingerprint = (evidence) => {
       if (liveFpMemo !== undefined) return liveFpMemo;
       // The record must name another head (audit) or sha (ready record): a headless record can never carry (main #6353).
@@ -508,8 +519,11 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         return ancestor(base, 'origin/main');
       } catch { return false; } };
       const liveFp = liveFingerprint(auditRecords);
+      // Scoped passes bind to the INVARIANTS block of the card for the item this branch names, read from THIS trusted
+      // checkout (never the candidate). No binding (other repo, no item, no unique card, no block) leaves it unset.
+      const invariantsText = branchInvariants(input.branch);
       out.canonicalAudit = { mode: 'refuse', ...canonicalAuditEvidence(auditRecords, input.sha, covers, liveFp,
-        { ruledWeakened: out.gate }) };
+        { ruledWeakened: out.gate, ...(invariantsText ? { invariantsText } : {}) }) };
       if (!out.canonicalAudit.ok) return stop('no-canonical-audit', {
         fallback: `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load. WEAKENED requires a matching ruledWeakened entry and fix-ready disclosure.` });
       if (out.gate?.ruledWeakened) console.warn(`WARNING: RULED-WEAKENED EXCEPTION ${out.gate.ruledWeakened.ruling}: loading ${input.branch}@${input.sha} despite audit WEAKENED (source layer: ${out.gate.ruledWeakened.layer || 'tool'}). Disclosed findings: ${out.gate.ruledWeakened.findings.join(' | ')}`);

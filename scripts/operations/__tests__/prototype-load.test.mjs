@@ -53,8 +53,11 @@ function fixture(options = {}) {
   const env = { HOME: '/home/test', USER: 'tester', PATH: '/bin', GH_TOKEN: 'secret', NODE_OPTIONS: 'unsafe', WE_ALLOW_NO_PR: '1', ...options.env };
   const ready = { ref: BASE.branch, sha: candidateSha, tests: 'green', audit: 'NOT WEAKENED' };
   const fs = {
+    // Trusted main-checkout cards for the INVARIANTS binding: { '<num>-<slug>.md': text }.
+    ...(options.cards ? { readdirSync: (p) => { if (!String(p).endsWith('/backlog')) throw Object.assign(new Error('missing'), { code: 'ENOENT' }); return Object.keys(options.cards); } } : {}),
     readFileSync(p) {
       reads.push(p);
+      if (options.cards && /\/backlog\/[^/]+\.md$/.test(p) && Object.hasOwn(options.cards, p.split('/').at(-1))) return options.cards[p.split('/').at(-1)];
       if (p === '/home/test/platform-preferences.json') return JSON.stringify({ prototypeLoad: options.platformSettings });
       if (options.readError && p === '/home/test/ready') throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
       if (p.endsWith('/test-clone-key.json')) return options.registryRaw ?? (options.list ? JSON.stringify({ overlays: [...registrations.values()] }) : '');
@@ -425,6 +428,78 @@ describe('canonicalAuditEvidence', () => {
     const f = auditedFixture('refuse', { audits: auditLines([scopedAudit()]), auditBaseInMain: TREE });
     expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { reason: 'no-record' } });
     expect([...f.registrations]).toEqual([]);
+  });
+
+  describe('production loader binds scoped evidence to the branch item card INVARIANTS block', () => {
+    const section = '- Keep the admission guard.\n- Never widen scope.\n';
+    const card = (body = section, heading = '## INVARIANTS') => `---\nstatus: open\n---\n\n# Demo\n\n${heading}\n${body}\n## Acceptance\n\n- [A1] x\n`;
+    const hashOf = (text) => createHash('sha256').update(text).digest('hex');
+    const run = (records, cards, branch = 'lane/1234-demo') => auditedFixture('refuse', { audits: auditLines(records), auditBaseInMain: TREE, cards })
+      .run({ branch, dryRun: true });
+
+    it('admits a scoped pass whose hash matches the card section byte for byte', async () => {
+      const scoped = scopedAudit({ invariantsHash: hashOf(section) });
+      expect(await run([scoped], { '1234-demo.md': card() })).toMatchObject({ ok: true, canonicalAudit: { ok: true } });
+      // An attempt-tagged branch binds to the same item.
+      expect(await run([scoped], { '1234-demo.md': card() }, 'lane/1234b-demo')).toMatchObject({ ok: true, canonicalAudit: { ok: true } });
+    });
+
+    it('refuses when the card text differs by one byte from the audited invariants', async () => {
+      const scoped = scopedAudit({ invariantsHash: hashOf(section) });
+      for (const changed of [section.replace('Keep', 'keep'), section.trimEnd(), section.replaceAll('\n', '\r\n'), `${section}\n`]) {
+        expect(await run([scoped], { '1234-demo.md': card(changed) })).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { reason: 'no-record' } });
+      }
+    });
+
+    it.each([
+      ['no matching card', { '9999-other.md': card() }, 'lane/1234-demo'],
+      ['two cards for the item', { '1234-a.md': card(), '1234-b.md': card() }, 'lane/1234-demo'],
+      ['no INVARIANTS section', { '1234-demo.md': '# Demo\n\n## Acceptance\n\n- x\n' }, 'lane/1234-demo'],
+      ['an empty INVARIANTS section', { '1234-demo.md': card('\n') }, 'lane/1234-demo'],
+      ['two INVARIANTS sections', { '1234-demo.md': `${card()}\n## Invariants\n- other\n` }, 'lane/1234-demo'],
+      ['an oversized section', { '1234-demo.md': card('x'.repeat(64 * 1024 + 1) + '\n') }, 'lane/1234-demo'],
+      ['a branch with no item number', { '1234-demo.md': card() }, 'lane/r968-demo'],
+    ])('leaves a scoped pass fail-closed with %s', async (_name, cards, branch) => {
+      expect(await run([scopedAudit({ invariantsHash: hashOf(section) })], cards, branch))
+        .toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { reason: 'no-record' } });
+    });
+
+    it('still admits an open pass when the item has no INVARIANTS binding', async () => {
+      expect(await run([auditRecord()], { '9999-other.md': card() })).toMatchObject({ ok: true, canonicalAudit: { ok: true } });
+    });
+  });
+
+  describe('a scoped record never hides the open re-audit that supersedes a carried WEAKENED', () => {
+    const FP = 'f'.repeat(64), BASE_A = 'a'.repeat(40), OLD = 'b'.repeat(40), HEAD = 'c'.repeat(40);
+    const at = (h) => `2026-10-20T${h}:00:00Z`;
+    const weakened = auditRecord({ base: BASE_A, head: OLD, at: at('10'), verdict: 'WEAKENED', findings: ['x.mjs:1 guard removed'], fingerprint: FP });
+    const open = auditRecord({ base: BASE_A, head: HEAD, at: at('11'), fingerprint: FP });
+    const scoped = scopedAudit({ base: BASE_A, head: HEAD, at: at('12'), fingerprint: FP, followUps: [] });
+    const evaluate = (records, auditOptions) => prototypeLoad.canonicalAuditEvidence(records, HEAD, () => true, FP, auditOptions);
+
+    it('baseline: the 11:00 open NOT WEAKENED re-audit supersedes the carried 10:00 WEAKENED', () => {
+      expect(evaluate([weakened, open], {})).toEqual({ ok: true, record: open });
+    });
+    it('the 12:00 scoped pass with matching invariants keeps the admission (never flips to weakened)', () => {
+      expect(evaluate([weakened, open, scoped], { invariantsText })).toEqual({ ok: true, record: scoped });
+    });
+    it('the 12:00 scoped pass without bound invariants falls back to the 11:00 open pass', () => {
+      expect(evaluate([weakened, open, scoped], {})).toEqual({ ok: true, record: open });
+      expect(evaluate([weakened, open, scoped], { invariantsText: 'other\n' })).toEqual({ ok: true, record: open });
+    });
+    it('a scoped pass alone still cannot supersede the carried WEAKENED', () => {
+      expect(evaluate([weakened, scoped], { invariantsText })).toEqual({ ok: false, reason: 'weakened' });
+    });
+    it('an unusable open record (bad time, foreign question) is not a supersede or fallback', () => {
+      for (const bad of [{ at: 'not-a-time' }, { questionHash: 'e'.repeat(64) }, { verdict: 'MAYBE' }]) {
+        expect(evaluate([weakened, { ...open, ...bad }, scoped], { invariantsText })).toEqual({ ok: false, reason: 'weakened' });
+        expect(evaluate([{ ...open, ...bad }, scoped], {})).toEqual({ ok: false, reason: 'no-record' });
+      }
+    });
+    it('an open WEAKENED on the live head beats a scoped pass', () => {
+      expect(evaluate([open, { ...open, at: at('11'), verdict: 'WEAKENED', findings: ['y.mjs:2 broke'] }, scoped], { invariantsText }))
+        .toEqual({ ok: false, reason: 'weakened' });
+    });
   });
 
   it('exports a pure selector returning the matching NOT WEAKENED record', () => {

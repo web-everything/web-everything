@@ -126,6 +126,34 @@ export function readyRecordSpeaksFor(records, input, liveFp = null) {
     && (!validSha(r.sha) || lowerSha(r.sha) === live || carriesAcross(r.fingerprint, liveFp)
       || (liveUnknown && carriesAcross(r.fingerprint, r.fingerprint))));
 }
+const MAX_INVARIANTS_BYTES = 64 * 1024;
+/** Backlog item number a lane branch is bound to: `lane/<item><attemptTag>-<slug>` (e.g. `lane/2502b-x` is item 2502).
+ * Branches with no leading item number (`lane/r968-x`) bind to nothing. */
+export function itemNumberFromBranch(branch) {
+  const m = /^lane\/(\d+)[a-z]?-/.exec(typeof branch === 'string' ? branch : '');
+  return m ? m[1] : null;
+}
+/** The INVARIANTS section of a backlog card: the raw bytes (no trim, no newline normalization) under the single
+ * `Invariants` heading (any level, any case) up to the next heading or the end. Headings inside fenced code do not
+ * count. Absent, duplicated, whitespace-only or over-64 KiB sections return null so scoped passes stay fail-closed.
+ * This is the text a worker writes verbatim to the `--invariants-file` it passes to codex-audit. */
+export function invariantsSection(cardText) {
+  if (typeof cardText !== 'string') return null;
+  let fence = null, start = -1, end = -1, count = 0, offset = 0;
+  for (const line of cardText.split(/(?<=\n)/)) {
+    const bare = line.replace(/\r?\n$/, '');
+    const fenceMark = /^ {0,3}(`{3,}|~{3,})/.exec(bare)?.[1];
+    if (fenceMark && (!fence || (fenceMark[0] === fence[0] && fenceMark.length >= fence.length))) fence = fence ? null : fenceMark;
+    else if (!fence && /^ {0,3}#{1,6}[ \t]/.test(bare)) {
+      if (start >= 0 && end < 0) end = offset;
+      if (/^ {0,3}#{1,6}[ \t]+invariants[ \t]*#*[ \t]*$/i.test(bare)) { count++; if (count === 1) start = offset + line.length; }
+    }
+    offset += line.length;
+  }
+  if (count !== 1) return null;
+  const body = cardText.slice(start, end < 0 ? cardText.length : end);
+  return body.trim() && Buffer.byteLength(body, 'utf8') <= MAX_INVARIANTS_BYTES ? body : null;
+}
 /** Canonical audit for this head. Each non-empty base (base!==head) is judged by findAudit (latest wins within a
  * base, file order breaks ties, contradictory findings rejected). Fail closed: ANY base whose latest verdict is
  * WEAKENED blocks, and a pass only counts when covers(base) proves the base is already in main (the audit spans the
@@ -204,18 +232,36 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   const hiddenWeak = priorOnly.filter((r) => r?.verdict === 'WEAKENED' && typeof r.head === 'string' && carriedHeads.has(r.head) && r.base !== r.head
     && !carried.some((d) => d.record.head === r.head && d.base === r.base)
     && findAudit(priorOnly, { ...auditOptions, head: r.head, base: r.base, questionHash: QUESTION_HASH, priorQuestionHashes, now }) === r).map((record) => ({ base: record.base, record }));
+  // The latest USABLE open-mode (scope !== 'invariants') record for a head+base, judged by findAudit's own acceptance
+  // rules over the FULL list. A scoped record never supersedes it, and an unusable one (bad time, foreign or expired
+  // question, unknown verdict, conflicting findings) never counts. When any current-question record exists for the
+  // pair, only current-question open records may decide (a prior-question open record never fills in for a scoped one).
+  const latestOpen = (head, base) => {
+    const sawCurrent = list.some((r) => r?.head === head && r.base === base && r.questionHash === QUESTION_HASH);
+    return findAudit(list.filter((r) => r?.scope !== 'invariants' && (!sawCurrent || r?.questionHash === QUESTION_HASH)),
+      { head, base, questionHash: QUESTION_HASH, ...auditOptions, priorQuestionHashes, now });
+  };
   const carriedWeak = [...carried, ...hiddenWeak].filter((d) => d.record.verdict === 'WEAKENED' && !ruled(d.record));
   if (carriedWeak.length) {
-    // R973: a scoped (invariants) pass is never a re-audit that supersedes a carried open-mode WEAKENED.
-    const ownAt = Math.max(-Infinity, ...own.filter((d) => covered(d.base) && d.record.scope !== 'invariants').map((d) => Date.parse(text(d.record.at))));
+    // R973: a scoped (invariants) pass is never a re-audit that supersedes a carried open-mode WEAKENED. The re-audit is
+    // the latest covered OPEN record of the live head, taken from the full list: a later scoped pass leaves it standing.
+    const liveBases = [...new Set(list.filter((r) => r?.head === sha && r.base !== sha).map((r) => r.base))];
+    const ownAt = Math.max(-Infinity, ...liveBases.filter((base) => covered(base)).map((base) => latestOpen(sha, base))
+      .filter(Boolean).map((record) => Date.parse(text(record.at))));
     if (carriedWeak.some((d) => !(Date.parse(text(d.record.at)) < ownAt))) return { ok: false, reason: 'weakened' };
   }
   // A pass counts only when covers(base) proves its base is in main; a carried pass must itself hold the fingerprint.
   const passes = own.length ? own : carried.filter((d) => carriesAcross(d.record.fingerprint, liveFp));
   let pass = null;
-  for (const { base, record } of passes) {
+  for (let { base, record } of passes) {
     // Bind at admission for both own and fingerprint-carried evidence. Unbound scoped negatives still fail closed.
-    if (record.scope === 'invariants' && (!requiredInvariantsHash || record.invariantsHash !== requiredInvariantsHash)) continue;
+    if (record.scope === 'invariants' && (!requiredInvariantsHash || record.invariantsHash !== requiredInvariantsHash)) {
+      // An unbound scoped pass is not evidence, but it must not hide an OPEN NOT WEAKENED pass of the same head and base
+      // (open passes still admit). A carried fallback must itself hold the live fingerprint, like any carried pass.
+      const open = latestOpen(record.head, base);
+      if (!open || open.verdict !== 'NOT WEAKENED' || (open.head !== sha && !carriesAcross(open.fingerprint, liveFp))) continue;
+      record = open;
+    }
     // A current-question record for this head+base (usable or not) blocks a PRIOR-question pass, even when carry
     // eligibility dropped it (no or differing fingerprint): judge against ALL records, fail closed.
     if (record.questionHash !== QUESTION_HASH
