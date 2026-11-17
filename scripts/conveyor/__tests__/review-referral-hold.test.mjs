@@ -65,6 +65,49 @@ describe('retryable record effects', () => {
     effects: [{ type: 'review.write-up', status: 'applied' },
       { type: 'review.label-swap', status: 'pending', error: '--body-file=gone is unreadable (ENOENT)', unknownAttempts: 0 },
       { type: 'verdict-ledger.append', status: 'declared' }, { type: 'review.notice', status: 'declared' }] });
+  const ciSaved = () => {
+    const r = saved();
+    r.effects[1] = { type: 'review.label-swap', status: 'failed',
+      error: 'review held: CI still pending on reviewed head', unknownAttempts: 1 };
+    return r;
+  };
+  it.each([false, true])('projects CI-held retry separately, incomplete=%s', incomplete => {
+    const r = ciSaved();
+    if (incomplete) r.stepTimings = r.stepTimings.filter(t => t.step !== 'advise');
+    const row = reviewRunEvidence(r);
+    expect(row.ciHeldRecordRetry).toEqual({ attempts: 1 });
+    expect(row.retryableRecordEffect).toBeUndefined();
+    expect(findResumableParkedRun(pr(), [row], { repo, ciHeldRecordRetryMax: 1 })).toEqual({ id: r.id, head });
+    expect(findResumableParkedRun(pr(), [row], { repo })).toBeNull();
+    expect(findResumableParkedRun(pr(), [row], { repo, ciHeldRecordRetryMax: 0 })).toBeNull();
+    expect(findResumableParkedRun(pr(), [{ ...row, ciHeldRecordRetry: { attempts: 4 } }],
+      { repo, ciHeldRecordRetryMax: 3 })).toBeNull();
+    expect(findResumableParkedRun(pr({ headRefOid: 'b'.repeat(40) }), [row], { repo, ciHeldRecordRetryMax: 3 })).toBeNull();
+    expect(findResumableParkedRun(pr({ comments: [comment('fresh review', row.startedAt + 1, 'chalbert')] }),
+      [row], { repo, ciHeldRecordRetryMax: 3 })).toBeNull();
+  });
+  it('uses the largest outstanding CI-held attempt count', () => {
+    const r = ciSaved(); r.effects.push({ ...r.effects[1], unknownAttempts: 4 });
+    expect(reviewRunEvidence(r).ciHeldRecordRetry).toEqual({ attempts: 4 });
+  });
+  it.each([
+    ['non-CI failure', r => { r.effects[1].error = 'network timeout'; }],
+    ['pending effect', r => { r.effects[1].status = 'pending'; }],
+    ['missing attempts', r => { delete r.effects[1].unknownAttempts; }],
+    ['string attempts', r => { r.effects[1].unknownAttempts = '1'; }],
+    ['infinite attempts', r => { r.effects[1].unknownAttempts = Infinity; }],
+    ['NaN attempts', r => { r.effects[1].unknownAttempts = NaN; }],
+    ['mixed failure', r => { r.effects.push({ type: 'review.notice', status: 'failed' }); }],
+    ['resume', r => { r.resumeOf = {}; }],
+    ['other step', r => { r.pending.step = 'advise'; }],
+    ['empty effects', r => { r.effects = []; }],
+    ['unreadable effect', r => { r.effects.push(null); }],
+  ])('does not prove CI-held retry for %s', (_, mutate) => {
+    const r = ciSaved(); mutate(r);
+    const row = reviewRunEvidence(r);
+    expect(row?.ciHeldRecordRetry).toBeUndefined();
+    expect(findResumableParkedRun(pr(), row ? [row] : [], { repo, ciHeldRecordRetryMax: 3 })).toBeNull();
+  });
   it.each([0])('resumes only the pending body-file refusal with unknownAttempts=%s, without a ruling', unknownAttempts => {
     const r = saved(); r.effects[1].unknownAttempts = unknownAttempts;
     const row = reviewRunEvidence(r);

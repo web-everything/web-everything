@@ -373,16 +373,19 @@ export function cardOnlySkipSettlementCandidate(evidence, head) {
 export function resolveReviewRedTeamOnSkip({ env = process.env, log, readFile = readFileSync,
   toolPath = join(dirname(fileURLToPath(import.meta.url)), '../settings/review-red-team-on-skip.json') } = {}) {
   let tool;
-  try { const data = JSON.parse(readFile(toolPath, 'utf8')); tool = { enabled: data.enabled, retryCooldownMin: data.retryCooldownMin, staleRedispatchDailyCap: data.staleRedispatchDailyCap }; } catch { /* lower layers */ }
+  try { const data = JSON.parse(readFile(toolPath, 'utf8')); tool = { enabled: data.enabled, retryCooldownMin: data.retryCooldownMin, staleRedispatchDailyCap: data.staleRedispatchDailyCap, ciHeldRecordRetryMax: data.ciHeldRecordRetryMax }; } catch { /* lower layers */ }
   const raw = env.WE_REVIEW_RED_TEAM_ON_SKIP;
   const cooldown = env.WE_REVIEW_RED_TEAM_ON_SKIP_RETRY_COOLDOWN_MIN;
+  const ciHeldMax = env.WE_REVIEW_RED_TEAM_ON_SKIP_CI_HELD_RECORD_RETRY_MAX;
   const dailyCap = env.WE_REVIEW_RED_TEAM_ON_SKIP_STALE_REDISPATCH_DAILY_CAP;
   return cascadePolicy('reviewRedTeamOnSkip', tool, {
-    env, log, standard: { enabled: true, retryCooldownMin: 30, staleRedispatchDailyCap: 3 },
-    envValues: { enabled: raw === '0' ? false : raw === '1' ? true : raw || undefined,
+    env, log, standard: { enabled: true, retryCooldownMin: 30, staleRedispatchDailyCap: 3, ciHeldRecordRetryMax: 3 },
+    envValues: { ciHeldRecordRetryMax: typeof ciHeldMax === 'string' && /^\d+$/.test(ciHeldMax) ? Number(ciHeldMax) : ciHeldMax || undefined,
+      enabled: raw === '0' ? false : raw === '1' ? true : raw || undefined,
       retryCooldownMin: typeof cooldown === 'string' && /^\d+$/.test(cooldown) ? Number(cooldown) : cooldown || undefined,
       staleRedispatchDailyCap: typeof dailyCap === 'string' && /^\d+$/.test(dailyCap) ? Number(dailyCap) : dailyCap || undefined },
-    valid: { enabled: v => typeof v === 'boolean', retryCooldownMin: v => Number.isSafeInteger(v) && v >= 0,
+    valid: { ciHeldRecordRetryMax: v => Number.isSafeInteger(v) && v >= 0 && v <= 10,
+      enabled: v => typeof v === 'boolean', retryCooldownMin: v => Number.isSafeInteger(v) && v >= 0,
       staleRedispatchDailyCap: v => Number.isSafeInteger(v) && v >= 1 },
   });
 }
@@ -537,9 +540,14 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           // never answered by "resume it": it falls through to the guarded paths below (PR #6784). An unreadable thread
           // cannot rule that out, so it never resumes either.
           const resumable = Array.isArray(rawPr?.comments)
-            ? findResumableParkedRun({ number: pr, headRefOid: head, comments: rawPr.comments }, runs, { repo }) : null;
-          if (resumable && runs.some(r => r.id === resumable.id && r.retryableRecordEffect === true)) {
+            ? findResumableParkedRun({ number: pr, headRefOid: head, comments: rawPr.comments }, runs, { repo, ciHeldRecordRetryMax: setting.ciHeldRecordRetryMax }) : null;
+          const matching = resumable && runs.find(r => r.id === resumable.id);
+          if (matching?.retryableRecordEffect === true) {
             return dispatchDecision({ action: 'review', why: 'unfinished review has only a retryable pre-write effect; resume it' });
+          }
+          if (setting.ciHeldRecordRetryMax > 0 && Number.isFinite(matching?.ciHeldRecordRetry?.attempts)
+            && matching.ciHeldRecordRetry.attempts <= setting.ciHeldRecordRetryMax) {
+            return dispatchDecision({ action: 'review', why: 'unfinished review is held only on pending CI at record; resume it (bounded)' });
           }
         } catch { /* Unreadable evidence keeps the human hold. */ }
         let neverReviewed = false;
