@@ -1,6 +1,22 @@
 # Testing — Three-Tier Strategy
 
+## Review PR fetch isolation (R37)
+
+Review PR transport runs in a fresh temporary bare repository with empty global/system
+config, never in the agent-writable lane. The lane contributes only alternate objects and
+one negotiation ref; a bounded binary pack/index-pack handoff imports the pinned commit.
+`review-job-fetch-security.test.mjs` replants hostile local/worktree/includeIf config after
+the scrub to prove isolation, and checks failed handoffs and moved heads leave the commit absent.
+
 > Authors: APPEND new sections at the END of this file, never right after the title (`.gitattributes` union-merges it, but appending avoids overlapping insertions).
+
+## Review PR transport isolation (R37)
+
+`review-job-fetch-security.test.mjs` replants URL rewrites and transport settings after the lane
+scrub: the network fetch must run in a fresh bare repository with empty global/system config.
+Only object data crosses back through a bounded thin-pack handoff. Keep both review entry points,
+worktree/includeIf config, unborn HEAD, and refused pack/index-pack cases covered; a moved PR head
+must be refused before importing objects. Do not replace this boundary with more config reject rules.
 
 ## Human-only enqueue approval license (R212)
 

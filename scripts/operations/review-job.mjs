@@ -309,8 +309,8 @@ export function execReadRaw(file, args, options = {}) {
   return execFileSyncThrottled(file, args, { ...options, maxBuffer: options.maxBuffer ?? READ_MAX_BUFFER });
 }
 
-/** Fetch only the explicit PR transport under scrubbed, isolated lane Git configuration. */
-function fetchPinnedPrHead({ lanePath, repo, pr, env, exec, readConfig, log, repoIds }) {
+/** Fetch outside the lane's config boundary, then hand only verified objects to the lane. */
+function fetchPinnedPrHead({ lanePath, repo, pr, head, headChangedError, env, exec, readConfig, spawnPack, log, repoIds }) {
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo ?? '')) throw Error('invalid review repository; inspect repo argument before retrying');
   const options = { cwd: lanePath, env, timeout: 180_000, maxBuffer: 1024 * 1024 };
   const configDir = mkdtempSync(join(tmpdir(), 'review-git-config-'));
@@ -356,10 +356,43 @@ function fetchPinnedPrHead({ lanePath, repo, pr, env, exec, readConfig, log, rep
         if (originId !== expectedId) throw Error(identityError);
       } catch { throw Error(identityError); }
     }
-    // Never resolve a remote name: retained origin.uploadpack/vcs can execute lane-owned commands.
-    exec('git', ['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true', 'fetch', '--no-recurse-submodules', '--no-auto-gc', '--no-auto-maintenance', '--upload-pack=git-upload-pack',
-      '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`], gitOptions);
-    const fetched = exec('git', ['rev-parse', 'FETCH_HEAD^{commit}'], gitOptions).trim();
+    const iso = join(configDir, 'iso.git');
+    exec('git', ['init', '--bare', '--quiet', iso], { ...gitOptions, cwd: configDir });
+    const isoOptions = { ...gitOptions, cwd: iso };
+    const objects = resolve(lanePath, exec('git', ['rev-parse', '--git-path', 'objects'], gitOptions).trim());
+    // Git alternates are line-delimited paths. Quote the path using Git's C-style quoting.
+    mkdirSync(join(iso, 'objects', 'info'), { recursive: true });
+    writeFileSync(join(iso, 'objects', 'info', 'alternates'), `${JSON.stringify(objects)}\n`);
+    let laneHead;
+    try { laneHead = exec('git', ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}'], gitOptions).trim(); }
+    catch (error) { if (error.status !== 1 || error.signal) throw error; }
+    if (laneHead !== undefined) {
+      if (!/^[a-f0-9]{40}$/i.test(laneHead)) throw Error('pinned review commit unavailable');
+      exec('git', ['update-ref', 'refs/haves/lane', laneHead], isoOptions);
+    }
+    const pins = ['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'gc.auto=0',
+      '-c', 'maintenance.auto=false', '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true',
+      '-c', 'core.sshCommand=ssh', '-c', 'ssh.variant=ssh'];
+    // No network command sees the lane as cwd or git-dir. Its config cannot redirect this URL.
+    exec('git', [...pins, 'fetch', '--no-recurse-submodules', '--no-auto-gc', '--no-auto-maintenance', '--upload-pack=git-upload-pack',
+      '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`], isoOptions);
+    const fetched = exec('git', ['rev-parse', 'FETCH_HEAD^{commit}'], isoOptions).trim();
+    if (!/^[a-f0-9]{40}$/i.test(fetched)) throw Error('pinned review commit unavailable');
+    if (fetched !== head) throw Error(headChangedError);
+    const packOptions = { ...isoOptions, encoding: null, maxBuffer: 1024 ** 3 };
+    const checkedSpawn = (args, options) => {
+      const result = spawnPack('git', args, options);
+      if (result.error || result.signal || result.status !== 0 || !Buffer.isBuffer(result.stdout)) {
+        throw Error('pinned review commit unavailable; object handoff failed; inspect lane and retry shared setup', { cause: result.error });
+      }
+      return result.stdout;
+    };
+    const pack = checkedSpawn([...pins, 'pack-objects', '--revs', '--thin', '--stdout'], {
+      ...packOptions, input: `${fetched}\n${laneHead ? `^${laneHead}\n` : ''}`,
+    });
+    checkedSpawn([...pins, 'index-pack', '--stdin', '--fix-thin', '--strict'], {
+      ...packOptions, cwd: lanePath, input: pack,
+    });
     const resolved = exec('git', ['rev-parse', '--verify', `${fetched}^{commit}`], gitOptions).trim();
     if (resolved !== fetched) throw Error('pinned review commit unavailable');
     return fetched;
@@ -367,7 +400,7 @@ function fetchPinnedPrHead({ lanePath, repo, pr, env, exec, readConfig, log, rep
 }
 
 /** The real effects, each one command. `root` is the checkout the arc runs from (the daemon's clone). */
-export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync, exec = execReadRaw, readConfig = spawnSync, readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readEvidence = readDrainRedTeamEvidence,
+export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync, exec = execReadRaw, readConfig = spawnSync, spawnPack = spawnSync, readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readEvidence = readDrainRedTeamEvidence,
   readSeatRecords = () => createRedTeamIo({ root, env }).readRecords({ strict: true }),
   readWitness = key => readRecoveryWitness({ ...key, env, readScorecards: readSeatRecords }), recoveryProbe = defaultRecoveryProbe(),
   queueBaseline = () => resolveLiveQueueBaseline({ checkoutRoot: root, env }),
@@ -499,7 +532,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     root,
     fetchRedTeamHead: ({ lanePath, repo, pr, head }) => {
       if (!/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('missing pinned red-team head');
-      const fetched = fetchPinnedPrHead({ lanePath, repo, pr, env, exec, readConfig, log, repoIds });
+      const fetched = fetchPinnedPrHead({ lanePath, repo, pr, head, headChangedError: 'red-team head changed during fetch', env, exec, readConfig, spawnPack, log, repoIds });
       if (fetched !== head) throw Error('red-team head changed during fetch');
       return { head };
     },
@@ -508,7 +541,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       const options = { cwd: lanePath, env, timeout: 180_000, maxBuffer: 1024 * 1024 };
       const { headRefOid: head } = JSON.parse(exec('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], options));
       if (!/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('review head missing; inspect PR evidence before retrying');
-      const fetched = fetchPinnedPrHead({ lanePath, repo, pr, env, exec, readConfig, log, repoIds });
+      const fetched = fetchPinnedPrHead({ lanePath, repo, pr, head, headChangedError: 'review head changed during fetch; retry shared setup on the live head', env, exec, readConfig, spawnPack, log, repoIds });
       if (fetched !== head) throw Error('review head changed during fetch; retry shared setup on the live head');
       return { head };
     },

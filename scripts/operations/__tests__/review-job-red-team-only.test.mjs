@@ -85,14 +85,14 @@ describe('lane Git hardening', () => {
       if (args[0] === 'remote') return `git@github.com:${repo}.git`;
       return args.includes('fetch') ? '' : `${head}\n`;
     };
-    const io = createReviewJobIo({ env, exec, readConfig: (file, args, options) => {
+    const io = createReviewJobIo({ env, exec, spawnPack: (file, args, options) => { calls.push({ file, args, options }); return { status: 0, stdout: Buffer.alloc(0) }; }, readConfig: (file, args, options) => {
       calls.push({ file, args, options });
       expect(options.timeout).toBe(30_000);
       return { status: 1, stdout: '', stderr: '' };
     } });
     expect(io[method]({ lanePath: '/lanes/lane-7', repo, pr, head })).toEqual({ head });
     const gitCalls = calls.filter(call => call.file === 'git');
-    expect(gitCalls).toHaveLength(6);
+    expect(gitCalls).toHaveLength(12);
     for (const { args, options } of gitCalls) {
       // Read Git's effective configuration, not just our helper's object shape.
       // This executes no fetch, callback, or repository write.
@@ -109,7 +109,7 @@ describe('lane Git hardening', () => {
       expect(options.env.GIT_EXTERNAL_DIFF).toBeUndefined();
       expect(options.env.GIT_NO_LAZY_FETCH).toBe('1');
       expect(options.env.REVIEW_FIXTURE_TOKEN).toBe('preserved');
-      expect(options).toMatchObject({ cwd: '/lanes/lane-7', timeout: args.includes('--name-only') ? 30_000 : 180_000, maxBuffer: 1024 * 1024 });
+      expect(options).toMatchObject({ cwd: args.includes('pack-objects') || args.includes('fetch') || args[0] === 'update-ref' || args[1] === 'FETCH_HEAD^{commit}' ? expect.stringMatching(/iso\.git$/) : args[0] === 'init' ? expect.stringMatching(/review-git-config-/) : '/lanes/lane-7', timeout: args.includes('--name-only') ? 30_000 : 180_000, maxBuffer: args.includes('pack-objects') || args.includes('index-pack') ? 1024 ** 3 : 1024 * 1024 });
     }
     expect(env).toEqual(original);
   });
@@ -356,7 +356,7 @@ describe('red-team-only review job', () => {
       const exec = vi.fn((file, args, options) => {
         calls.push([file, args]);
         expect(options).toMatchObject({ timeout: 180_000, maxBuffer: 1024 * 1024 });
-        expect(options.cwd).toBe('/lanes/lane-7');
+        expect(options.cwd).toEqual(args.includes('fetch') || args[0] === 'update-ref' || args[1] === 'FETCH_HEAD^{commit}' ? expect.stringMatching(/iso\.git$/) : args[0] === 'init' ? expect.stringMatching(/review-git-config-/) : '/lanes/lane-7');
         if (args[0] === 'config') return '';
         if (args[0] === 'remote') return `git@github.com:${repo}.git`;
         if (args.includes('fetch')) {
@@ -364,22 +364,29 @@ describe('red-team-only review job', () => {
           return '';
         }
         if (args[1] === 'FETCH_HEAD^{commit}') return kind === 'moved-head' ? 'b'.repeat(40) : `${head}\n`;
-        if (kind === 'missing-commit') throw Error('unknown commit');
-        return kind === 'wrong-commit' ? 'b'.repeat(40) : `${head}\n`;
+        if (args[1] === '--verify' && args[2] !== '--quiet') {
+          if (kind === 'missing-commit') throw Error('unknown commit');
+          if (kind === 'wrong-commit') return 'b'.repeat(40);
+        }
+        return `${head}\n`;
       });
-      const io = fakeIo({ fetchRedTeamHead: createReviewJobIo({ env: {}, exec, readConfig: (file, args) => {
+      const io = fakeIo({ fetchRedTeamHead: createReviewJobIo({ env: {}, exec, spawnPack: () => ({ status: 0, stdout: Buffer.alloc(0) }), readConfig: (file, args) => {
         calls.push([file, args]);
         return { status: 1, stdout: '', stderr: '' };
       } }).fetchRedTeamHead });
       const out = runReviewJob({ repo, pr, redTeamOnly: true }, io);
-      expect(calls.slice(0, 4)).toEqual([
+      expect(calls.slice(0, 8)).toEqual([
         ['git', ['config', '--includes', '--name-only', '--get-regexp', '^(fetch|transfer|receive)\\.fsck\\.|^fsck\\.']],
         ['git', ['config', '--show-scope', '--list', '--includes', '-z']],
         ['git', ['remote', 'get-url', 'origin']],
-        ['git', ['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true', 'fetch', '--no-recurse-submodules', '--no-auto-gc', '--no-auto-maintenance', '--upload-pack=git-upload-pack', '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`]],
+        ['git', ['init', '--bare', '--quiet', expect.stringMatching(/iso\.git$/)]],
+        ['git', ['rev-parse', '--git-path', 'objects']],
+        ['git', ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}']],
+        ['git', ['update-ref', 'refs/haves/lane', head]],
+        ['git', ['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true', '-c', 'core.sshCommand=ssh', '-c', 'ssh.variant=ssh', 'fetch', '--no-recurse-submodules', '--no-auto-gc', '--no-auto-maintenance', '--upload-pack=git-upload-pack', '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`]],
       ]);
       if (kind === 'ok') {
-        expect(calls.slice(4)).toEqual([
+        expect(calls.slice(8)).toEqual([
           ['git', ['rev-parse', 'FETCH_HEAD^{commit}']],
           ['git', ['rev-parse', '--verify', `${head}^{commit}`]],
         ]);
@@ -1122,7 +1129,7 @@ describe('red-team-only review job', () => {
       const calls = [];
       const exec = vi.fn((file, argv, options) => {
         calls.push([file, argv]);
-        expect(options.cwd).toBe('/lanes/lane-7');
+        expect(options.cwd).toEqual(argv.includes('fetch') || argv[0] === 'update-ref' || argv[1] === 'FETCH_HEAD^{commit}' ? expect.stringMatching(/iso\.git$/) : argv[0] === 'init' ? expect.stringMatching(/review-git-config-/) : '/lanes/lane-7');
         expect(options.timeout).toBeGreaterThan(0);
         expect(options.maxBuffer).toBe(1024 * 1024);
         if (kind === 'oversized-output') throw Object.assign(Error('output exceeded maxBuffer'), { code: 'ENOBUFS' });
@@ -1133,10 +1140,11 @@ describe('red-team-only review job', () => {
           if (kind === 'fetch-error') throw Error('not our ref');
           return '';
         }
+        if (argv[0] === 'init' || argv[0] === 'update-ref') return '';
         if (argv[0] === 'rev-parse') return kind === 'moved-head' ? 'b'.repeat(40) : head;
         throw Error('unexpected command');
       });
-      const prepareLane = createReviewJobIo({ env: {}, exec, readConfig: (file, args) => {
+      const prepareLane = createReviewJobIo({ env: {}, exec, spawnPack: () => ({ status: 0, stdout: Buffer.alloc(0) }), readConfig: (file, args) => {
         calls.push([file, args]);
         return { status: 1, stdout: '', stderr: '' };
       } }).prepareLane;
@@ -1151,7 +1159,11 @@ describe('red-team-only review job', () => {
           ['git', ['config', '--includes', '--name-only', '--get-regexp', '^(fetch|transfer|receive)\\.fsck\\.|^fsck\\.']],
           ['git', ['config', '--show-scope', '--list', '--includes', '-z']],
           ['git', ['remote', 'get-url', 'origin']],
-          ['git', ['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true', 'fetch', '--no-recurse-submodules', '--no-auto-gc', '--no-auto-maintenance', '--upload-pack=git-upload-pack', '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`]],
+          ['git', ['init', '--bare', '--quiet', expect.stringMatching(/iso\.git$/)]],
+          ['git', ['rev-parse', '--git-path', 'objects']],
+          ['git', ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}']],
+          ['git', ['update-ref', 'refs/haves/lane', head]],
+          ['git', ['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true', '-c', 'core.sshCommand=ssh', '-c', 'ssh.variant=ssh', 'fetch', '--no-recurse-submodules', '--no-auto-gc', '--no-auto-maintenance', '--upload-pack=git-upload-pack', '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`]],
           ['git', ['rev-parse', 'FETCH_HEAD^{commit}']],
           ['git', ['rev-parse', '--verify', `${head}^{commit}`]], ['red-team'],
         ]);

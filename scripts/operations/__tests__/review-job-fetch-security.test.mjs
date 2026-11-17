@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -44,12 +44,16 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s fetch command isolation',
       expect(isolated.GIT_CONFIG_NOSYSTEM).toBe('1');
       expect(readFileSync(isolated.GIT_CONFIG_GLOBAL, 'utf8')).toBe('');
       if (args.includes('fetch')) {
-        expect(args).toEqual(['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true', 'fetch', '--no-recurse-submodules', '--no-auto-gc', '--no-auto-maintenance', '--upload-pack=git-upload-pack',
+        expect(options.cwd).not.toBe(lane);
+        expect(options.cwd).toMatch(/iso\.git$/);
+        expect(args).not.toContain(lane);
+        expect(options.env.GIT_DIR).toBeUndefined();
+        expect(args).toEqual(['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true', '-c', 'core.sshCommand=ssh', '-c', 'ssh.variant=ssh', 'fetch', '--no-recurse-submodules', '--no-auto-gc', '--no-auto-maintenance', '--upload-pack=git-upload-pack',
           '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`]);
         fetchedUrls.push(args[args.length - 2]);
       }
       // Serve the genuine SSH URL locally. A surviving rewrite would select the marker helper instead.
-      const actual = args.includes('fetch') ? ['-c', 'ssh.variant=ssh', '-c', `core.sshCommand=${ssh}`, ...args] : args;
+      const actual = args.includes('fetch') ? [...args.slice(0, args.indexOf('fetch')), '-c', `core.sshCommand=${ssh}`, ...args.slice(args.indexOf('fetch'))] : args;
       return execFileSync(file, actual, { ...options, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
     };
     const inherited = { ...env, GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: key, GIT_CONFIG_VALUE_0: 'git@github.com:' };
@@ -107,7 +111,7 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s fetch command isolation',
     };
     expect(createReviewJobIo({ env, exec, log: () => {} }).prepareLane({ repo, pr, lanePath: lane })).toEqual({ head });
     expect(existsSync(marker)).toBe(false);
-    expect(git(lane, ['rev-parse', 'FETCH_HEAD^{commit}']).trim()).toBe(head);
+    expect(git(lane, ['rev-parse', '--verify', `${head}^{commit}`]).trim()).toBe(head);
   });
 
   it.each(['uploadpack', 'vcs', 'both'])(
@@ -151,8 +155,12 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s fetch command isolation',
         expect(readFileSync(isolated.GIT_CONFIG_GLOBAL, 'utf8')).toBe('');
         let actual = args;
         if (args.includes('fetch')) {
+        expect(options.cwd).not.toBe(lane);
+        expect(options.cwd).toMatch(/iso\.git$/);
+        expect(args).not.toContain(lane);
+        expect(options.env.GIT_DIR).toBeUndefined();
           const url = args[args.length - 2];fetchedUrls.push(url);
-          expect(args).toEqual(['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true', 'fetch', '--no-recurse-submodules', '--no-auto-gc', '--no-auto-maintenance', '--upload-pack=git-upload-pack',
+          expect(args).toEqual(['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true', '-c', 'core.sshCommand=ssh', '-c', 'ssh.variant=ssh', 'fetch', '--no-recurse-submodules', '--no-auto-gc', '--no-auto-maintenance', '--upload-pack=git-upload-pack',
             '--no-tags', url, `refs/pull/${pr}/head`]);
           expect(url).toBe(`git@github.com:${repo}.git`);
           // Rewrite only the explicit transport URL to a local source, without networking.
@@ -168,6 +176,128 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s fetch command isolation',
       expect(config).not.toContain('alias.review-unsafe');
       if (setting !== 'vcs') expect(config).toContain(`remote.origin.uploadpack=${helper}`);
       if (setting !== 'uploadpack') expect(config).toContain('remote.origin.vcs=review-marker');
+    });
+});
+
+// Replant hostile configuration AFTER the retained scrub/identity check. Isolation must
+// remain the security boundary even for keys the scrubber has never heard of.
+describe.each(['prepareLane', 'fetchRedTeamHead'])('%s isolated object handoff', method => {
+  function fixture({ poison = 'local', failure } = {}) {
+    const root = mkdtempSync(join(process.env.TMPDIR, 'review-object-handoff-')); roots.push(root);
+    const lane = join(root, 'lane'), source = join(root, 'source'), marker = join(root, 'contacted');
+    mkdirSync(lane); mkdirSync(source);
+    writeFileSync(join(root, 'ssh'), '#!/bin/sh\nexec git-upload-pack "$REVIEW_TEST_SOURCE"\n', { mode: 0o755 });
+    const helper = join(root, 'git-remote-review-marker');
+    writeFileSync(helper, '#!/bin/sh\nprintf contacted > "$REVIEW_HELPER_MARKER"\nexit 1\n', { mode: 0o755 });
+    const env = { ...process.env, PATH: `${root}:${process.env.PATH}`, REVIEW_TEST_SOURCE: source,
+      REVIEW_HELPER_MARKER: marker, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
+    const git = (cwd, args) => execFileSync('git', args, { cwd, env: laneGitHardeningEnv(env),
+      encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
+    const commit = cwd => git(cwd, ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+      'commit', '--quiet', '--allow-empty', '-m', 'fixture']);
+    git(source, ['init', '--quiet']); commit(source);
+    const laneHead = git(source, ['rev-parse', 'HEAD']).trim();
+    if (poison !== 'unborn') {
+      git(lane, ['init', '--quiet']);
+      // Seed only objects and HEAD, without a fixture network operation in the lane.
+      const seedPack = spawnSync('git', ['pack-objects', '--all', '--stdout'], { cwd: source, env, timeout: 10_000 });
+      expect(seedPack.status).toBe(0);
+      expect(spawnSync('git', ['index-pack', '--stdin'], { cwd: lane, env, input: seedPack.stdout, timeout: 10_000 }).status).toBe(0);
+      git(lane, ['update-ref', 'HEAD', laneHead]);
+    } else git(lane, ['init', '--quiet']);
+    writeFileSync(join(source, 'payload'), 'genuine fixture object\n'); git(source, ['add', 'payload']); commit(source);
+    const head = git(source, ['rev-parse', 'HEAD']).trim();
+    git(source, ['update-ref', `refs/pull/${pr}/head`, head]);
+    git(lane, ['remote', 'add', 'origin', `git@github.com:${repo}.git`]);
+    let iso, networkCalls = 0, packCalls = 0, indexCalls = 0;
+    const exec = (file, args, options) => {
+      if (file === 'gh') return JSON.stringify({ headRefOid: failure === 'moved-head' ? laneHead : head });
+      const output = gitExec(file, args, options);
+      if (args[0] === 'init') {
+        iso = args.at(-1);
+        const included = join(root, 'included');
+        let target = ['--local'];
+        if (poison === 'worktree') {
+          git(lane, ['config', '--local', 'extensions.worktreeConfig', 'true']); target = ['--worktree'];
+        } else if (poison === 'includeIf') {
+          git(lane, ['config', '--local', `includeIf.gitdir:${realpathSync(lane)}/.path`, included]); target = ['--file', included];
+        }
+        git(lane, ['config', ...target, 'url.review-marker::poison.insteadOf', 'git@github.com:']);
+        git(lane, ['config', ...target, 'url.review-marker::push.pushInsteadOf', 'git@github.com:']);
+        git(lane, ['config', ...target, 'core.sshCommand', helper]);
+        git(lane, ['config', ...target, 'ssh.variant', 'plink']);
+        git(lane, ['config', ...target, 'protocol.ssh.allow', 'never']);
+        git(lane, ['config', ...target, 'alias.review-unsafe', `!${helper}`]);
+        // Positive control for every scope: these rewrites really select the hostile helper.
+        expect(() => git(lane, ['-c', 'protocol.review-marker.allow=always', 'ls-remote', `git@github.com:${repo}.git`])).toThrow();
+        expect(existsSync(marker)).toBe(true); rmSync(marker);
+      }
+      return output;
+    };
+    function gitExec(file, args, options) {
+      if (args.includes('fetch')) {
+        networkCalls++;
+        expect(options.cwd).toBe(iso);
+        expect(options.cwd).not.toBe(lane);
+        expect(args).not.toContain(lane);
+        expect(options.env.GIT_DIR).toBeUndefined();
+        expect(git(iso, ['config', '--local', '--get-regexp', '^core.bare$']).trim()).toBe('core.bare true');
+        expect(readFileSync(join(iso, 'objects', 'info', 'alternates'), 'utf8')).toBe(`${JSON.stringify(join(lane, '.git', 'objects'))}\n`);
+        if (poison !== 'unborn') expect(git(iso, ['rev-parse', 'refs/haves/lane']).trim()).toBe(laneHead);
+      }
+      return execFileSync(file, args, { ...options, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    }
+    const spawnPack = (file, args, options) => {
+      expect(options).toMatchObject({ encoding: null, timeout: 180_000, maxBuffer: 1024 ** 3 });
+      expect(options.env.GIT_CONFIG_NOSYSTEM).toBe('1');
+      expect(readFileSync(options.env.GIT_CONFIG_GLOBAL, 'utf8')).toBe('');
+      const packing = args.includes('pack-objects');
+      if (packing) {
+        packCalls++;
+        expect(options.cwd).toBe(iso);
+        expect(options.input).toBe(`${head}\n${poison === 'unborn' ? '' : `^${laneHead}\n`}`);
+      } else {
+        indexCalls++;
+        expect(options.cwd).toBe(lane);
+        expect(Buffer.isBuffer(options.input)).toBe(true);
+        expect(args.slice(-4)).toEqual(['index-pack', '--stdin', '--fix-thin', '--strict']);
+      }
+      if (packing && failure?.startsWith('pack-')) {
+        return { status: failure === 'pack-exit' ? 1 : ['pack-signal', 'pack-missing-buffer'].includes(failure) ? 0 : null,
+          signal: failure === 'pack-signal' ? 'SIGTERM' : null,
+          error: ['pack-timeout', 'pack-oversized'].includes(failure) ? Object.assign(Error(failure), {
+            code: failure === 'pack-timeout' ? 'ETIMEDOUT' : 'ENOBUFS' }) : undefined,
+          stdout: failure === 'pack-missing-buffer' ? '' : Buffer.alloc(0) };
+      }
+      if (!packing && ['index-failure', 'index-signal'].includes(failure)) return { status: failure === 'index-failure' ? 1 : 0,
+        signal: failure === 'index-signal' ? 'SIGTERM' : null, stdout: Buffer.alloc(0) };
+      return spawnSync(file, args, !packing && failure === 'index-corrupt'
+        ? { ...options, input: Buffer.from('invalid pack') } : options);
+    };
+    const run = () => createReviewJobIo({ env, exec, spawnPack, log: () => {} })[method]({ repo, pr, lanePath: lane,
+      head: failure === 'moved-head' ? laneHead : head });
+    return { run, git, lane, head, marker, counts: () => ({ networkCalls, packCalls, indexCalls }), iso: () => iso };
+  }
+
+  it.each(['local', 'worktree', 'includeIf', 'unborn'])('ignores replanted %s config and imports the genuine commit', poison => {
+    const f = fixture({ poison });
+    expect(f.run()).toEqual({ head: f.head });
+    expect(f.git(f.lane, ['rev-parse', '--verify', `${f.head}^{commit}`]).trim()).toBe(f.head);
+    expect(f.git(f.lane, ['show', `${f.head}:payload`])).toBe('genuine fixture object\n');
+    expect(existsSync(f.marker)).toBe(false);
+    expect(existsSync(f.iso())).toBe(false);
+    expect(f.counts()).toEqual({ networkCalls: 1, packCalls: 1, indexCalls: 1 });
+  });
+
+  it.each(['pack-exit', 'pack-signal', 'pack-timeout', 'pack-oversized', 'pack-null-status', 'pack-missing-buffer', 'index-failure', 'index-signal', 'index-corrupt', 'moved-head'])(
+    'refuses %s without importing the fetched commit', failure => {
+      const f = fixture({ failure });
+      expect(f.run).toThrow(failure === 'moved-head' ? /head changed during fetch/ : /object handoff failed; inspect lane and retry/);
+      expect(() => f.git(f.lane, ['cat-file', '-e', `${f.head}^{commit}`])).toThrow();
+      expect(existsSync(f.marker)).toBe(false);
+      expect(existsSync(f.iso())).toBe(false);
+      expect(f.counts()).toEqual({ networkCalls: 1, packCalls: failure === 'moved-head' ? 0 : 1,
+        indexCalls: failure.startsWith('index-') ? 1 : 0 });
     });
 });
 
@@ -249,7 +379,7 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s fsck config validation', 
       if (args[0] === 'remote') return `git@github.com:${repo}.git`;
       return args.includes('fetch') ? '' : head;
     };
-    const run = () => createReviewJobIo({ env: {}, exec, readConfig, log: () => {} })[method]({ repo, pr, lanePath: 'fixture-lane', head });
+    const run = () => createReviewJobIo({ env: {}, exec, readConfig, spawnPack: () => ({ status: 0, stdout: Buffer.alloc(0) }), log: () => {} })[method]({ repo, pr, lanePath: 'fixture-lane', head });
     if (clean) expect(run()).toEqual({ head });
     else expect(run).toThrow(scrubError);
     expect(calls.some(args => args.includes('fetch'))).toBe(clean);
@@ -283,9 +413,10 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s fsck config validation', 
         git(['config', '--local', `includeIf.gitdir:${realpathSync(lane)}/.path`, included]);
       }
       // Only transport and PR lookup are fixtures; both default config readers execute real Git.
-      writeFileSync(join(bin, 'git'), '#!/bin/sh\nfor arg do\n  if [ "$arg" = fetch ]; then\n    printf fetched > "$REVIEW_FETCH_MARKER"\n    exit 0\n  fi\ndone\nexec "$REVIEW_REAL_GIT" "$@"\n', { mode: 0o755 });
+      writeFileSync(join(bin, 'git'), '#!/bin/sh\nfor arg do\n  if [ "$arg" = fetch ]; then\n    printf fetched > "$REVIEW_FETCH_MARKER"\n    printf "%s\\n" "$REVIEW_PINNED" > FETCH_HEAD\n    exit 0\n  fi\ndone\nexec "$REVIEW_REAL_GIT" "$@"\n', { mode: 0o755 });
       writeFileSync(join(bin, 'gh'), `#!/bin/sh\nprintf '%s' '{"headRefOid":"${pinned}"}'\n`, { mode: 0o755 });
       env.PATH = `${bin}:${process.env.PATH}`;
+      env.REVIEW_PINNED = pinned;
       const run = () => createReviewJobIo({ env, log: () => {} })[method]({ repo, pr, lanePath: lane, head: pinned });
       if (scope === 'clean') expect(run()).toEqual({ head: pinned });
       else expect(run).toThrow(scrubError);
@@ -318,6 +449,7 @@ describe('red-team fetch refusals', () => {
           if (failure === 'missing-commit') throw Error('unknown commit');
           return failure === 'moved-head' ? 'b'.repeat(40) : head;
         }
+        if (args[0] === 'rev-parse' && args[2] === '--quiet') return head;
         return failure === 'wrong-commit' ? 'b'.repeat(40) : args.at(-1).replace('^{commit}', '');
       };
       const errors = {
@@ -326,7 +458,7 @@ describe('red-team fetch refusals', () => {
         'fetch-failure': /fetch refused/, 'moved-head': /red-team head changed during fetch/,
         'missing-commit': /unknown commit/, 'wrong-commit': /pinned review commit unavailable/,
       };
-      expect(() => createReviewJobIo({ env: {}, exec, readConfig: () => ({ status: 1, stdout: '', stderr: '' }), log: () => {} }).fetchRedTeamHead({
+      expect(() => createReviewJobIo({ env: {}, exec, spawnPack: () => ({ status: 0, stdout: Buffer.alloc(0) }), readConfig: () => ({ status: 1, stdout: '', stderr: '' }), log: () => {} }).fetchRedTeamHead({
         lanePath: 'fixture-lane', repo: failure === 'invalid-repo' ? 'invalid' : repo, pr,
         head: failure === 'invalid-head' ? 'invalid' : head,
       })).toThrow(errors[failure]);
@@ -348,7 +480,7 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s canonical repository iden
       calls.push([file, args]);
       if (file === 'gh' && args[0] === 'pr') return JSON.stringify({ headRefOid: head });
       if (args[0] === 'config') { isolated = options.env; configs.push(isolated.GIT_CONFIG_GLOBAL); return ''; }
-      expect(options.cwd).toBe('fixture-lane');
+      expect(options.cwd).toEqual(args.includes('fetch') || args[0] === 'update-ref' || args[1] === 'FETCH_HEAD^{commit}' ? expect.stringMatching(/iso\.git$/) : args[0] === 'init' ? expect.stringMatching(/review-git-config-/) : 'fixture-lane');
       expect(options.env).toBe(isolated);
       expect(options).toMatchObject({ timeout: 180_000, maxBuffer: 1024 * 1024 });
       expect(isolated.GIT_CONFIG_NOSYSTEM).toBe('1');
@@ -362,11 +494,11 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s canonical repository iden
         return lookup(args[1]);
       }
       if (args[0] === 'remote') return origin;
-      if (args.includes('fetch')) return '';
+      if (args.includes('fetch') || args[0] === 'init' || args[0] === 'update-ref') return '';
       if (args[0] === 'rev-parse') return head;
       throw Error('unexpected command');
     };
-    const io = createReviewJobIo({ readConfig: () => ({ status: 1, stdout: '', stderr: '' }), env: { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'unsafe', GIT_CONFIG_VALUE_0: 'unsafe' }, exec, log: () => {} });
+    const io = createReviewJobIo({ spawnPack: () => ({ status: 0, stdout: Buffer.alloc(0) }), readConfig: () => ({ status: 1, stdout: '', stderr: '' }), env: { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'unsafe', GIT_CONFIG_VALUE_0: 'unsafe' }, exec, log: () => {} });
     const run = (repo = canonical, entry = method) => io[entry]({ repo, pr, lanePath: 'fixture-lane', head });
     return { run, calls, apiCalls, configs };
   }
