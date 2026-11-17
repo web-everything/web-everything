@@ -133,6 +133,7 @@ export const REPO_SCAN_TESTS = Object.freeze([
  * @type {Readonly<Record<string, string>>}
  */
 export const DEFERRED_SCAN_TESTS = Object.freeze({
+  'scripts/conveyor/soak/breaks/gh-log-escape-sequences-block-ci-heal.soak.test.mjs': 'false positive: its readdirSync calls only list scripts/ to symlink a throwaway pre-fix tree under mkdtemp for the break replay; it asserts a planner outcome, never a repo rule; the soak lane runs it',
   'scripts/lib/__tests__/gh-ci-log.test.mjs': 'whole-tree structural check that every job-log reader under scripts/ and skills-src/ uses the shared gh-ci-log helper or is on its explicit deferred allowlist; it imports gh-ci-log.mjs so `vitest related` selects it when the helper changes, and CI runs it for any new bypass elsewhere',
   'scripts/conveyor/__tests__/reconcile-pass-read-only.test.mjs': 'false positive: recursively snapshots only its mkdtemp cache fixture to assert zero writes, never the live repo; imports reconcile-pass.mjs, so vitest related already selects it when reconciliation changes',
   'scripts/readiness/__tests__/forge-cache-prune-running-record.test.mjs': 'false positive: its `snapshotBinding` readdir walk enumerates only the mkdtemp fixture tree it builds, never the live repo; a hermetic prune-record test, not a repo rule scanner',
