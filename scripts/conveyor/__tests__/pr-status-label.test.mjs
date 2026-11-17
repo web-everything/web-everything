@@ -48,6 +48,11 @@ describe('derivePrStatusLabel', () => {
   it('a current-head changes advisory blocks a stale accepted label', () => {
     expect(derive({ pr: pr(['review:accepted'], [{ author: BOT, createdAt: at(8), body: `**Verdict:** changes\n**Advisory outcome:** changes\nNet basis: \`${'0'.repeat(40)}..${HEAD}\`` }]) })).toBe('sent-back-review');
   });
+  it('an untrusted accept after a trusted changes advisory does not unblock ready-to-merge', () => {
+    const body = (o) => `**Verdict:** ${o}\n**Advisory outcome:** ${o}\nNet basis: \`${'0'.repeat(40)}..${HEAD}\``;
+    const comments = [{ author: BOT, createdAt: at(8), body: body('changes') }, { author: { login: 'stranger' }, createdAt: at(9), body: body('accept') }];
+    expect(derive({ pr: pr(['review:accepted'], comments) })).toBe('sent-back-review');
+  });
   it('a live fixer on an unjudged takeover is takeover-running; once judged, plain fixing', () => {
     expect(derive({ pr: pr(['review:changes'], [marker(7)]), reviewStatus: { role: 'fix', state: 'fixing' } })).toBe('takeover-running');
     expect(derive({ pr: pr(['review:changes'], [marker(7), advisory(8)]), reviewStatus: { role: 'fix', state: 'fixing' } })).toBe('fixing');

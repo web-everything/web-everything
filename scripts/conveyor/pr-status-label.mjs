@@ -5,7 +5,7 @@
  */
 import { PR_STATUS_SETTING_DEFAULTS } from './pr-status-settings.mjs';
 import { rulingNeeded } from '../lib/ruling-ledger.mjs';
-import { latestAdvisory, advisoryCoversHead, ADVISORY_OUTCOMES } from '../lib/advisory-labels.mjs';
+import { latestAdvisory, advisoryCoversHead, trustedAdvisoryComments, ADVISORY_OUTCOMES } from '../lib/advisory-labels.mjs';
 import { takeoverEpisodes, takeoverProgress } from './takeover-budget.mjs';
 // The queue's stand-down CLI lazily reaches the tagger; load the queue dynamically too.
 // Its import-time dependencies have no path back here (including its ruling-ledger load).
@@ -124,7 +124,7 @@ export function derivePrStatusLabel({ pr = {}, labels, reviewStatus = null, rows
     ? redChecks.filter(name => name !== 'review-gate') : redChecks;
   const l = names(labels ?? pr?.labels);
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
-  const headAdvisory = latestAdvisory(comments);
+  const headAdvisory = latestAdvisory(trustedAdvisoryComments(comments));
   const reviewBlock = deriveReviewBlockStatus(l)
     ?? (headAdvisory?.outcome === ADVISORY_OUTCOMES.CHANGES
       && advisoryCoversHead(headAdvisory, String(pr?.headRefOid ?? '').toLowerCase()) ? 'sent-back-review' : null);
