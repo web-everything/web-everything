@@ -1,4 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { readTimeoutEvidence, enrichPrsWithTimeoutEvidence } from '../reconcile-pass.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
 import { withPlannedContext, planFixesFromReconcile } from '../reconcile-fix-dispatch.mjs';
@@ -12,7 +15,7 @@ const pr = (review = false) => ({ number: 42, state: 'OPEN', headRefName: 'lane/
   mergeStateStatus: 'CLEAN', aheadByOnMain: 0, labels: review ? [{ name: 'review:changes' }] : [],
   comments: review ? [{ body: '🔁 human review — changes requested\n\nFix the failing test.' }] : [],
   statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', detailsUrl: `https://github.com/${repo}/actions/runs/10/job/20` }] });
-function fixture(error) {
+function fixture(error, escapeLog = null) {
   const data = {
     [`${prefix}/pulls/42`]: { state: 'open', head: { sha: head }, base: { sha: 'b'.repeat(40) }, changed_files: 1 },
     [`${prefix}/pulls/42/files?per_page=100&page=1`]: [{ filename: 'unit.test.mjs' }],
@@ -24,13 +27,43 @@ function fixture(error) {
   };
   return vi.fn((_command, args) => {
     const path = args.at(-1);
-    if (path.endsWith('/logs')) { expect(args).toContain('--allow-escape-sequences'); throw error; }
+    if (path.endsWith('/logs')) {
+      if (escapeLog !== null && args.includes('--allow-escape-sequences')) return escapeLog;
+      expect(args).toEqual(['api', path]);
+      throw error;
+    }
     if (!Object.hasOwn(data, path)) throw new Error(`Unexpected endpoint: ${path}`);
     return JSON.stringify(data[path]);
   });
 }
 const plan = prs => planReconcile({ prs, requiredChecks: ['test'], agents: [] });
 describe('unreadable CI logs keep bounded repair available', () => {
+  it.each(['plain', 'facts-disabled', 'facts-enabled', 'facts-raw-api'])(
+    'escape-coded logs are unreadable and never eligible or read with the allow flag (%s)', mode => {
+      // A passing step's timeout and an unrelated deploy failure must not authorize a rerun.
+      const log = '\x1b[31mFAIL passing.test.mjs > timeout fixture\x1b[0m\nError: Test timed out in 5000ms.\n'
+        + 'Test Files  1 failed (1)\nTests  1 failed (1)\nDeploy failed: permission denied\n';
+      const exec = fixture(new Error('API response contains terminal escape sequences'), log);
+      const cacheDir = mkdtempSync(join(tmpdir(), 'timeout-classifier-'));
+      try {
+        let reader;
+        if (mode !== 'plain') {
+          reader = makeFixEvidenceReader({ repo, pr: 42, head, exec, cacheDir,
+            env: { WE_FIX_FACTS: mode === 'facts-disabled' ? '0' : '1' },
+            rest: path => ({ json: JSON.parse(exec('gh', ['api', path])) }) });
+          if (mode === 'facts-raw-api') reader = { api: reader.api };
+        }
+        const sleep = vi.fn();
+        expect(readTimeoutEvidence(pr(), { repo, exec, reader, sleep, facts: () => ({ stale: false }) }))
+          .toEqual({ eligible: false, reason: 'log-unreadable' });
+        const logCalls = exec.mock.calls.filter(([, args]) => args.at(-1).endsWith('/logs'));
+        expect(logCalls).toHaveLength(1);
+        expect(logCalls[0][1]).toEqual(['api', `${prefix}/actions/jobs/20/logs`]);
+        expect(sleep).not.toHaveBeenCalled();
+      } finally {
+        rmSync(cacheDir, { recursive: true, force: true });
+      }
+    });
   it.each([false, true])('collects log-unreadable with the plain or shared facts reader (facts=%s)', facts => {
     const exec = fixture(new Error('HTTP 404'));
     const reader = facts ? makeFixEvidenceReader({ repo, exec, env: { WE_FIX_FACTS: '0' } }) : undefined;

@@ -1,4 +1,3 @@
-import { ciJobLogApiArgs } from '../lib/gh-ci-log.mjs';
 import { greenLedgerDir, hasGreenLedger } from '../lib/lane-verify.mjs';
 import { unread } from './dispatch-eligibility.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
@@ -2096,7 +2095,7 @@ function readTimeoutEvidenceOnce(pr, { repo, exec = execFileSyncThrottled, ts, r
   const plainApi = (path, raw = false) => {
     const remaining = deadline - Date.now();
     if (remaining <= 0) throw new Error('evidence-read-deadline');
-    const value = exec('gh', raw ? ciJobLogApiArgs(path) : ['api', path], { encoding: 'utf8', timeout: remaining, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
+    const value = exec('gh', ['api', path], { encoding: 'utf8', timeout: remaining, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
     return raw ? String(value) : JSON.parse(value);
   };
   const api = reader?.api ?? plainApi;

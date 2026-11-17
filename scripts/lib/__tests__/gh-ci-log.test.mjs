@@ -82,7 +82,7 @@ function bypasses(source, name) {
 // Follow-up: finding-producing log readers on gh 2.104.
 // These readers retain origin/main's transport until their log matching is addressed.
 // Pin each existing bypass count so the allowlist grants no additional direct reads.
-// reconcile-pass is mixed: only its main-fixed signature reader is deferred.
+// reconcile-pass also contains the timeout classifier transport pinned separately below.
 const deferredFindingReaders = new Map([
   ['scripts/conveyor/ci-auth-diagnosis.mjs', 1],
   ['scripts/conveyor/credential-inventory.mjs', 1],
@@ -100,7 +100,22 @@ const deferredFindingReaders = new Map([
   ['scripts/review-hold-probe.mjs', 1],
 ]);
 
+// Follow-up: timeout classifier on unfiltered logs: treat as unknown and retry, never eligible.
+// Generic path arguments are invisible to the endpoint scanner; pin these deferred transports explicitly.
+const deferredTimeoutReaders = new Map([
+  ['scripts/conveyor/reconcile-pass.mjs', 'plainApi'],
+  ['scripts/lib/fix-facts.mjs', 'plain'],
+]);
+
 describe('CI log reader structural guard', () => {
+  it('keeps deferred timeout classifier log reads on plain API transport without the allow flag', () => {
+    for (const [name, reader] of deferredTimeoutReaders) {
+      const source = readFileSync(resolve(name), 'utf8');
+      expect(source, name).toContain(`const ${reader} = (path, raw`);
+      expect(source, name).toContain("const value = exec('gh', ['api', path],");
+      expect(source, name).not.toMatch(/ciJobLogApiArgs|readCiJobLog|--allow-escape-sequences/);
+    }
+  });
   it('rejects direct API arrays, endpoint aliases, run-view arrays and shell readers', () => {
     for (const source of ["exec('gh', ['api', `repos/${repo}/actions/jobs/${id}/logs`])",
       "const endpoint = `repos/${repo}/actions/jobs/${id}/logs`; exec('gh', ['api', endpoint])",
@@ -112,7 +127,7 @@ describe('CI log reader structural guard', () => {
     expect(bypasses('throw new Error(exec("gh api repos/o/r/actions/jobs/42/logs"))', 'fixture.mjs'))
       .toEqual(['shell job-log command']);
   });
-  it('requires the helper outside the explicit deferred finding-producing readers in scripts and skills-src', () => {
+  it('requires the helper outside the explicit deferred readers in scripts and skills-src', () => {
     const root = resolve('.');
     const violations = [];
     const walk = directory => {
@@ -126,8 +141,10 @@ describe('CI log reader structural guard', () => {
         if (source.includes('\0')) continue;
         const issues = bypasses(source, name);
         if (name === 'scripts/conveyor/reconcile-pass.mjs') {
-          // Do not let this mixed file's fixer/ci-heal readers inherit the deferral.
+          // Pin the signature reader; the generic-path timeout reader is pinned separately above.
           expect(issues).toEqual(["['api', `repos/${repo}/actions/jobs/${jobId}/logs`]"]);
+        } else if (deferredTimeoutReaders.has(name)) {
+          expect(issues, name).toEqual([]);
         } else if (deferredFindingReaders.has(name)) {
           expect({ name, bypasses: issues.length }).toEqual({ name, bypasses: deferredFindingReaders.get(name) });
         } else {

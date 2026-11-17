@@ -1,4 +1,3 @@
-import { ciJobLogApiArgs } from './gh-ci-log.mjs';
 /**
  * @file scripts/lib/fix-facts.mjs
  * @description perf item C1d — the FIX DISPATCHER's cheaper PR reads. The fix-dispatch daemon's timeout-evidence
@@ -78,7 +77,7 @@ export function makeFixEvidenceReader({ repo, pr, head, exec = execFileSyncThrot
   const enabled = fixFactsEnabled(env);
   const remaining = () => { const left = deadline - Date.now(); if (left <= 0) throw new Error('evidence-read-deadline'); return left; };
   const plain = (path, raw) => {
-    const value = exec('gh', raw ? ciJobLogApiArgs(path) : ['api', path], { encoding: 'utf8', timeout: remaining(), maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
+    const value = exec('gh', ['api', path], { encoding: 'utf8', timeout: remaining(), maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
     stats.live += 1;
     return raw ? String(value) : JSON.parse(value);
   };
