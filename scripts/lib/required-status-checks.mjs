@@ -224,12 +224,13 @@ function readRulesPaged(restGet, path, o) {
  * @param {{repo?: string, branch?: string, gh?: Function, restGet?: Function}} o
  * @returns {{checks: string[], classic: string[]}}
  */
-export function readRequiredStatusChecksDetailed({ repo, branch = 'main', gh, restGet = ghRestGetJson } = {}) {
+export function readRequiredStatusChecksDetailed({ repo, branch = 'main', gh, restGet = ghRestGetJson, readOnly = false } = {}) {
   const base = `repos/${repo || '{owner}/{repo}'}`;
   const useRest = !gh && !resolvePersonalRouteEnabled();
   const text = gh ?? readRequiredChecksGh;
   // `{owner}/{repo}` placeholders resolve from the cwd's remote, so the ETag cache key must carry the cwd.
-  const restOpts = { op: 'required-checks', context: repo ? '' : process.cwd() };
+  const restOpts = { op: 'required-checks', context: repo ? '' : process.cwd(),
+    ...(readOnly ? { env: { ...process.env, WE_GH_ETAG_CACHE: '0' } } : {}) };
   let rulesChecks = [];
   let rulesError;
   let rulesFailed = false; // a flag, not `rulesError`'s truthiness: a `throw undefined` is still a failed read
@@ -315,6 +316,7 @@ function withPartialChecks(error, partialChecks) {
  * @param {string} o.repo - `owner/name` slug (branch protection is repo-scoped).
  * @param {string} [o.branch] - defaults to `'main'`.
  * @param {string} [o.cachePath] - defaults to {@link defaultCachePath}.
+ * @param {boolean} [o.readOnly=false] - retain cache reads and fallback policy, but skip shared cache/lock and ETag writes.
  * @param {number} [o.now] - epoch ms; defaults to `Date.now()`.
  * @param {number} [o.ttlMs] - how long a cached read is trusted before a fresh live fetch is attempted again;
  *   defaults to the `requiredChecksCache.ttlMinutes` setting (15 minutes). A stale-but-only-option cache is still preferred over the hardcoded fallback (see
@@ -325,6 +327,7 @@ function withPartialChecks(error, partialChecks) {
  */
 export function getRequiredStatusChecks({
   repo,
+  readOnly = false,
   branch = 'main',
   cachePath = defaultCachePath(),
   now = Date.now(),
@@ -349,7 +352,7 @@ export function getRequiredStatusChecks({
 
   const save = (checks, source, classic) => {
     let winner = null;
-    if (repo) {
+    if (repo && !readOnly) {
       try {
         mkdirSync(dirname(cachePath), { recursive: true });
         // Many daemons share this file: re-read inside the lock and merge, so two repos' writes never clobber each
@@ -392,7 +395,7 @@ export function getRequiredStatusChecks({
   const withPartial = checks => (checks.length ? [...new Set([...checks, ...partial])] : checks);
   try {
     // A reader returns the union array, or `{checks, classic}` when it also knows the classic-protection subset.
-    const read = readChecks({ repo, branch });
+    const read = readChecks({ repo, branch, ...(readOnly ? { readOnly: true } : {}) });
     const checks = Array.isArray(read) ? read : read?.checks;
     if (Array.isArray(checks) && checks.length) {
       return save(checks, 'live', Array.isArray(read) ? undefined : read.classic);

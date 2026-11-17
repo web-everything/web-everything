@@ -292,6 +292,16 @@ describe('clone maintenance gc-failed cause (B13)', () => {
     expect(await maybeMaintainClone(f.o)).toMatchObject({ skipped: true, reason: 'prune-expire-unreadable' });
     expect(f.run.mock.calls.some(([a]) => a.includes('gc'))).toBe(false);
   });
+  it('runs card salvage under the clone lock before the rate limit and reports counts; a salvage throw never blocks gc', async () => {
+    const f = fixture();
+    const salvageCards = vi.fn(async () => ({ moved: 2, kept: 1, failed: 0 }));
+    expect(await maybeMaintainClone({ ...f.o, salvageCards })).toMatchObject({ cardSalvage: { moved: 2, kept: 1, failed: 0 } });
+    expect(salvageCards).toHaveBeenCalledWith(expect.objectContaining({ root: f.root }));
+    const g = fixture();
+    const r = await maybeMaintainClone({ ...g.o, salvageCards: async () => { throw new Error('boom'); } });
+    expect(r.skipped).not.toBe(true);
+    expect(g.run.mock.calls.some(([a]) => a.includes('gc'))).toBe(true);
+  });
   it('never runs gc while Git is busy in the clone (or the evidence is unreadable)', async () => {
     for (const isBusy of [() => true, () => { throw new Error('unreadable process table'); }]) {
       const f = fixture();
