@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
@@ -13,6 +13,9 @@ import {
   parseGateArgs, runGate, isEntrypoint, makeFileOwnerReader, POLL_MS,
 } from '../daemon-host-gate.mjs';
 
+const HOST_A = '11111111-1111-4111-8111-111111111111';
+const HOST_B = '22222222-2222-4222-8222-222222222222';
+
 function fakeChild() {
   const child = new EventEmitter();
   child.kills = [];
@@ -20,7 +23,7 @@ function fakeChild() {
   return child;
 }
 
-function harness({ owners, self = 'studio' }) {
+function harness({ owners, self = HOST_A }) {
   const logs = [];
   const sleeps = [];
   const spawns = [];
@@ -31,12 +34,12 @@ function harness({ owners, self = 'studio' }) {
     thisHost: self,
     log: (line) => logs.push(line),
     sleep: async (ms) => { sleeps.push(ms); },
-    readRemote: async () => {
+    source: { readOwner: async () => {
       const value = owners[Math.min(i, owners.length - 1)];
       i += 1;
       if (value instanceof Error) throw value;
       return value;
-    },
+    } },
     spawn: (cmd, args, opts) => {
       const child = fakeChild();
       child.pid = 1000 + children.length;
@@ -65,7 +68,7 @@ describe('parseGateArgs', () => {
 
 describe('runGate', () => {
   it('owner=self execs the command with argv passthrough and inherited stdio', async () => {
-    const h = harness({ owners: [{ status: 'ok', owner: 'studio' }] });
+    const h = harness({ owners: [{ host: HOST_A, version: 'file' }] });
     const run = runGate({ cmd: '/bin/sh', args: ['-c', 'x y'] }, h.deps);
     await new Promise((r) => setTimeout(r, 5));
     expect(h.spawns).toHaveLength(1);
@@ -78,7 +81,7 @@ describe('runGate', () => {
   });
 
   it('owner=other stays in standby: never spawns across many polls, polls no faster than 60 s', async () => {
-    const h = harness({ owners: [{ status: 'ok', owner: 'macbook' }] });
+    const h = harness({ owners: [{ host: HOST_B, version: 'file' }] });
     h.deps.maxPolls = 20;
     const code = await runGate({ cmd: 'x', args: [] }, h.deps);
     expect(h.spawns).toHaveLength(0);
@@ -86,37 +89,69 @@ describe('runGate', () => {
     expect(h.sleeps.length).toBeGreaterThan(5);
     expect(h.sleeps.every((ms) => ms >= 60_000)).toBe(true);
     expect(POLL_MS).toBeGreaterThanOrEqual(60_000);
-    expect(h.logs[0]).toBe('host-gate: standby owner=macbook self=studio');
+    expect(h.logs[0]).toBe(`host-gate: standby owner=other self=${HOST_A}`);
   });
 
   it('owner unset stays in standby', async () => {
-    const h = harness({ owners: [{ status: 'unset' }] });
+    const h = harness({ owners: [{ host: '', version: 'unset' }] });
     h.deps.maxPolls = 5;
     await runGate({ cmd: 'x', args: [] }, h.deps);
     expect(h.spawns).toHaveLength(0);
-    expect(h.logs[0]).toContain('standby owner=unset self=studio');
+    expect(h.logs[0]).toContain(`standby owner=unset self=${HOST_A}`);
   });
 
   it('read error, thrown read and garbage results stay in standby (fail closed)', async () => {
     const h = harness({ owners: [
-      { status: 'error', error: 'rate limited' }, new Error('boom'), null, { status: 'ok', owner: 'bad host!' }, {},
+      new Error('rate limited'), new Error('boom'), null, { host: 'bad host!', version: 'file' }, {},
     ] });
     h.deps.maxPolls = 5;
     await runGate({ cmd: 'x', args: [] }, h.deps);
     expect(h.spawns).toHaveLength(0);
-    expect(h.logs[0]).toContain('standby owner=unreadable self=studio');
+    expect(h.logs[0]).toContain(`standby owner=unreadable self=${HOST_A}`);
   });
 
-  it('empty self host never execs', async () => {
-    const h = harness({ owners: [{ status: 'ok', owner: 'studio' }], self: '' });
+  it('fails closed when getThisHost returns an empty identity', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'host-gate-no-id-'));
+    try {
+      const self = getThisHost({ home: dir, create: false });
+      expect(self).toBe('');
+      const h = harness({ owners: [{ host: HOST_A, version: 'file' }], self });
+      h.deps.maxPolls = 3;
+      expect(await runGate({ cmd: 'x', args: [] }, h.deps)).toBe(75);
+      expect(h.spawns).toHaveLength(0);
+      expect(h.polls()).toBe(0);
+      expect(h.logs).toEqual(Array(3).fill('host-gate: standby owner=unreadable self='));
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('fails closed when the source throws on every fresh read', async () => {
+    const h = harness({ owners: [new Error('unavailable')] });
     h.deps.maxPolls = 3;
-    await runGate({ cmd: 'x', args: [] }, h.deps);
+    expect(await runGate({ cmd: 'x', args: [] }, h.deps)).toBe(75);
     expect(h.spawns).toHaveLength(0);
+    expect(h.polls()).toBe(3);
+    expect(h.logs.every((line) => line.includes('owner=unreadable'))).toBe(true);
+  });
+
+  it('fails closed when the source times out', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness({ owners: [] });
+      let reads = 0;
+      h.deps.source.readOwner = () => { reads += 1; return new Promise(() => {}); };
+      h.deps.maxPolls = 1;
+      const run = runGate({ cmd: 'x', args: [] }, h.deps);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(await run).toBe(75);
+      expect(reads).toBe(1);
+      expect(h.spawns).toHaveLength(0);
+      expect(h.logs[0]).toContain('owner=unreadable');
+    } finally { vi.useRealTimers(); }
   });
 
   it('flips to self then execs', async () => {
     const h = harness({ owners: [
-      { status: 'ok', owner: 'macbook' }, { status: 'ok', owner: 'macbook' }, { status: 'ok', owner: 'studio' },
+      { host: HOST_B, version: 'file' }, { host: HOST_B, version: 'file' }, { host: HOST_A, version: 'file' },
     ] });
     const run = runGate({ cmd: 'd', args: ['--flag'] }, h.deps);
     await new Promise((r) => setTimeout(r, 5));
@@ -128,7 +163,7 @@ describe('runGate', () => {
   });
 
   it('forwards the exit code', async () => {
-    const h = harness({ owners: [{ status: 'ok', owner: 'studio' }] });
+    const h = harness({ owners: [{ host: HOST_A, version: 'file' }] });
     const run = runGate({ cmd: 'd', args: [] }, h.deps);
     await new Promise((r) => setTimeout(r, 5));
     h.children[0].emit('exit', 7, null);
@@ -136,7 +171,7 @@ describe('runGate', () => {
   });
 
   it('maps a child killed by signal to 128+n', async () => {
-    const h = harness({ owners: [{ status: 'ok', owner: 'studio' }] });
+    const h = harness({ owners: [{ host: HOST_A, version: 'file' }] });
     const run = runGate({ cmd: 'd', args: [] }, h.deps);
     await new Promise((r) => setTimeout(r, 5));
     h.children[0].emit('exit', null, 'SIGTERM');
@@ -144,7 +179,7 @@ describe('runGate', () => {
   });
 
   it('forwards SIGTERM/SIGINT/SIGHUP to the child and removes listeners afterwards', async () => {
-    const h = harness({ owners: [{ status: 'ok', owner: 'studio' }] });
+    const h = harness({ owners: [{ host: HOST_A, version: 'file' }] });
     const run = runGate({ cmd: 'd', args: [] }, h.deps);
     await new Promise((r) => setTimeout(r, 5));
     h.procSignals.emit('SIGTERM');
@@ -160,7 +195,7 @@ describe('runGate', () => {
   });
 
   it('spawn failure exits 127 without looping', async () => {
-    const h = harness({ owners: [{ status: 'ok', owner: 'studio' }] });
+    const h = harness({ owners: [{ host: HOST_A, version: 'file' }] });
     h.deps.spawn = () => {
       const c = fakeChild();
       setImmediate(() => c.emit('error', new Error('ENOENT')));
@@ -172,11 +207,11 @@ describe('runGate', () => {
 
 describe('wrapper shutdown', () => {
   const tick = () => new Promise((resolve) => setImmediate(resolve));
-  it.each(['studio', 'macbook'])('does not spawn or sleep after shutdown during an owner read (%s)', async (owner) => {
+  it.each([HOST_A, HOST_B])('does not spawn or sleep after shutdown during an owner read (%s)', async (owner) => {
     const h = harness({ owners: [] });
-    h.deps.readRemote = async () => {
+    h.deps.source.readOwner = async () => {
       h.procSignals.emit('SIGTERM');
-      return { status: 'ok', owner };
+      return { host: owner, version: 'file' };
     };
     expect(await runGate({ cmd: 'd', args: [] }, h.deps)).toBe(143);
     expect(h.spawns).toHaveLength(0);
@@ -185,7 +220,7 @@ describe('wrapper shutdown', () => {
   });
 
   it('interrupts standby sleep on shutdown and removes signal listeners', async () => {
-    const h = harness({ owners: [{ status: 'unset' }] });
+    const h = harness({ owners: [{ host: '', version: 'unset' }] });
     h.deps.sleep = (ms, { signal }) => new Promise((resolve, reject) => {
       signal.addEventListener('abort', () => reject(signal.reason), { once: true });
     });
@@ -199,7 +234,7 @@ describe('wrapper shutdown', () => {
   });
 
   async function running() {
-    const h = harness({ owners: [{ status: 'ok', owner: 'studio' }] });
+    const h = harness({ owners: [{ host: HOST_A, version: 'file' }] });
     const waits = [];
     h.deps.killGraceMs = 123;
     h.deps.sleep = (ms, { signal }) => new Promise((resolve, reject) => {
@@ -272,7 +307,7 @@ describe('wrapper shutdown', () => {
   });
 
   it('accepts an already absent process group on leader exit', async () => {
-    const h = harness({ owners: [{ status: 'ok', owner: 'studio' }] });
+    const h = harness({ owners: [{ host: HOST_A, version: 'file' }] });
     h.deps.killGroup = () => { throw Object.assign(new Error('gone'), { code: 'ESRCH' }); };
     const run = runGate({ cmd: 'd', args: [] }, h.deps);
     await tick();
@@ -282,7 +317,7 @@ describe('wrapper shutdown', () => {
   });
 
   it('does not report completion when process-group cleanup is denied', async () => {
-    const h = harness({ owners: [{ status: 'ok', owner: 'studio' }] });
+    const h = harness({ owners: [{ host: HOST_A, version: 'file' }] });
     const signal = h.deps.killGroup;
     let deny = true;
     h.deps.killGroup = (...args) => {
@@ -314,9 +349,9 @@ describe('runGate while the daemon runs', () => {
     '%s during revocation returns the child exit code without a second spawn or standby sleep',
     async (signal, code) => {
       const { h, ticks } = watched([
-        { status: 'ok', owner: 'studio' },
-        { status: 'ok', owner: 'macbook' },
-        { status: 'ok', owner: 'studio' },
+        { host: HOST_A, version: 'file' },
+        { host: HOST_B, version: 'file' },
+        { host: HOST_A, version: 'file' },
       ]);
       h.deps.sleep = (ms) => {
         h.sleeps.push(ms);
@@ -345,8 +380,8 @@ describe('runGate while the daemon runs', () => {
     },
   );
 
-  it('stops the daemon and returns to standby when the owner moves to another host', async () => {
-    const { h, ticks } = watched([{ status: 'ok', owner: 'studio' }, { status: 'ok', owner: 'macbook' }]);
+  it.each([['other', HOST_B], ['unset', '']])('stops the daemon and returns to standby when owner=%s', async (description, host) => {
+    const { h, ticks } = watched([{ host: HOST_A, version: 'file' }, { host, version: host ? 'file' : 'unset' }]);
     h.deps.maxPolls = 2;
     const run = runGate({ cmd: 'd', args: [] }, h.deps);
     await tick();
@@ -356,12 +391,14 @@ describe('runGate while the daemon runs', () => {
     expect(h.children[0].kills).toContain('SIGTERM');
     h.children[0].emit('exit', null, 'SIGTERM');
     expect(await run).toBe(75);
-    expect(h.logs.some((l) => l.includes('stopping daemon'))).toBe(true);
+    expect(h.logs).toContain(`host-gate: owner=${description} self=${HOST_A}; stopping daemon, back to standby`);
+    expect(h.logs.at(-1)).toBe(`host-gate: standby owner=${description} self=${HOST_A}`);
+    expect(h.polls()).toBe(3);
     expect(h.spawns).toHaveLength(1);
   });
   it('tolerates unreadable reads for under 600 s of wall clock, stops at 600 s', async () => {
-    const bad = { status: 'error', error: 'rate limited' };
-    const { h, ticks } = watched([{ status: 'ok', owner: 'studio' }, bad]);
+    const bad = new Error('rate limited');
+    const { h, ticks } = watched([{ host: HOST_A, version: 'file' }, bad]);
     let t = 1_000_000;
     h.deps.now = () => t;
     h.deps.maxPolls = 2;
@@ -374,8 +411,30 @@ describe('runGate while the daemon runs', () => {
     h.children[0].emit('exit', null, 'SIGTERM');
     await run;
   });
+  it('re-reads while active and resets the unreadable deadline after a good read', async () => {
+    const { h, ticks } = watched([
+      { host: HOST_A, version: 'file' }, new Error('unavailable'),
+      { host: HOST_A, version: 'file' }, new Error('unavailable'),
+    ]);
+    let time = 0;
+    h.deps.now = () => time;
+    h.deps.maxPolls = 1;
+    const run = runGate({ cmd: 'd', args: [] }, h.deps);
+    await tick();
+    time = 599_000; ticks[0](); await tick();
+    expect(h.children[0].kills).toEqual([]);
+    ticks[1](); await tick();
+    time = 1_198_000; ticks[2](); await tick();
+    expect(h.children[0].kills).toEqual([]);
+    time = 1_199_000; ticks[3](); await tick();
+    expect(h.polls()).toBe(5);
+    expect(h.children[0].kills).toContain('SIGTERM');
+    h.children[0].emit('exit', null, 'SIGTERM');
+    expect(await run).toBe(75);
+  });
+
   it('SIGKILLs a daemon that ignores SIGTERM', async () => {
-    const { h, ticks } = watched([{ status: 'ok', owner: 'studio' }, { status: 'unset' }]);
+    const { h, ticks } = watched([{ host: HOST_A, version: 'file' }, { host: '', version: 'unset' }]);
     h.deps.maxPolls = 2;
     const run = runGate({ cmd: 'd', args: [] }, h.deps);
     await tick();
@@ -391,10 +450,20 @@ describe('makeFileOwnerReader (test-only override)', () => {
   const reader = (content, fail) => makeFileOwnerReader('/x/owner', {
     readFile: () => { if (fail) throw new Error('ENOENT'); return content; },
   });
-  it('reads a host', async () => { expect(await reader('studio\n')()).toEqual({ status: 'ok', owner: 'studio' }); });
-  it('empty is unset', async () => { expect(await reader('  \n')()).toEqual({ status: 'unset' }); });
-  it('unreadable is error', async () => { expect((await reader('', true)()).status).toBe('error'); });
-  it('invalid host is error', async () => { expect((await reader('a b;rm')()).status).toBe('error'); });
+  it('reads a UUID', async () => {
+    expect(await reader(HOST_A + '\n').readOwner()).toEqual({ host: HOST_A, version: 'file' });
+  });
+  it('empty is unset', async () => {
+    expect(await reader('').readOwner()).toEqual({ host: '', version: 'unset' });
+  });
+  it('unreadable throws', async () => { await expect(reader('', true).readOwner()).rejects.toThrow('ENOENT'); });
+  it.each(['a b;rm', 'host-a', '  \n', HOST_A + '\n\n'])('invalid owner throws (%s)', async (value) => {
+    await expect(reader(value).readOwner()).rejects.toThrow('invalid owner ID');
+  });
+  it('accepts an explicitly allowed migration alias', async () => {
+    const source = makeFileOwnerReader('/x/owner', { readFile: () => 'host-a', legacyOwnerValues: ['host-a'] });
+    expect(await source.readOwner()).toEqual({ host: 'host-a', version: 'file' });
+  });
 });
 
 describe('isEntrypoint', () => {
@@ -414,8 +483,8 @@ describe('owner-file override CLI boundary', () => {
     try {
       const owner = join(dir, 'owner');
       const marker = join(dir, 'executed');
-      writeFileSync(owner, getThisHost());
-      const env = { ...process.env, WE_DAEMON_HOST_OWNER_FILE: owner };
+      writeFileSync(owner, getThisHost({ home: dir }));
+      const env = { ...process.env, HOME: dir, WE_DAEMON_HOST_OWNER_FILE: owner };
       delete env.WE_DAEMON_HOST_GATE_TEST_ONLY;
       if (flag !== undefined) env.WE_DAEMON_HOST_GATE_TEST_ONLY = flag;
       const result = spawnSync(process.execPath, [script, '--', process.execPath, '-e',
@@ -432,9 +501,9 @@ describe('owner-file override CLI boundary', () => {
     const dir = mkdtempSync(join(tmpdir(), 'host-gate-cli-'));
     try {
       const owner = join(dir, 'owner');
-      writeFileSync(owner, getThisHost());
+      writeFileSync(owner, getThisHost({ home: dir }));
       const result = spawnSync(process.execPath, [script, '--', process.execPath, '-e', 'process.exit(7)'], {
-        env: { ...process.env, WE_DAEMON_HOST_OWNER_FILE: owner, WE_DAEMON_HOST_GATE_TEST_ONLY: '1' },
+        env: { ...process.env, HOME: dir, WE_DAEMON_HOST_OWNER_FILE: owner, WE_DAEMON_HOST_GATE_TEST_ONLY: '1' },
         encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024,
       });
       expect(result.error).toBeUndefined();
@@ -453,6 +522,14 @@ describe('owner-file override CLI boundary', () => {
 });
 
 describe('real daemon process group', () => {
+  function descendantAlive(pid) {
+    const identity = pidIdentity(pid);
+    if (identity.alive !== null) return identity.alive;
+    // Sandboxed macOS may deny ps. A kernel probe still supplies positive
+    // existence/death evidence; errors other than ESRCH remain unknown.
+    try { process.kill(pid, 0); return true; }
+    catch (error) { return error.code === 'ESRCH' ? false : null; }
+  }
   const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   async function waitFor(predicate) {
     const deadline = Date.now() + 3000;
@@ -468,7 +545,7 @@ describe('real daemon process group', () => {
       let child;
       let descendant;
       let releaseWatch;
-      let owner = 'studio';
+      let owner = HOST_A;
       let run;
       try {
         // The leader does not forward signals. The grandchild advertises readiness
@@ -487,21 +564,21 @@ describe('real daemon process group', () => {
           ? { cmd: '/bin/sh', args: ['-c', '"$1" -e "$2" "$3" & wait', 'host-gate-test', process.execPath, worker, ready] }
           : { cmd: process.execPath, args: ['-e', leader, worker, ready] };
         run = runGate(parsed, {
-          thisHost: 'studio', readRemote: async () => ({ status: 'ok', owner }),
+          thisHost: HOST_A, source: { readOwner: async () => ({ host: owner, version: 'file' }) },
           processSignals: procSignals, log: () => {}, maxPolls: 1, killGraceMs: 30,
           watchSleep: () => new Promise((resolve) => { releaseWatch = resolve; }),
           spawn: (...args) => { child = spawn(...args); return child; },
         });
         await waitFor(() => existsSync(ready));
         descendant = Number(readFileSync(ready, 'utf8'));
-        expect(pidIdentity(descendant).alive).toBe(true);
-        if (['revoke', 'shell-revoke', 'resistant-leader'].includes(reason)) { owner = 'macbook'; releaseWatch(); }
+        expect(descendantAlive(descendant)).toBe(true);
+        if (['revoke', 'shell-revoke', 'resistant-leader'].includes(reason)) { owner = HOST_B; releaseWatch(); }
         else if (reason === 'leader-exit') child.kill('SIGTERM');
         else procSignals.emit(reason);
         await Promise.race([run, delay(3000).then(() => { throw new Error('gate did not settle'); })]);
         // A killed orphan can remain a zombie until Linux's subreaper reaps it.
         // Require positive death evidence; an unreadable probe is not success.
-        await waitFor(() => pidIdentity(descendant).alive === false);
+        await waitFor(() => descendantAlive(descendant) === false);
         expect(procSignals.eventNames()).toEqual([]);
       } finally {
         if (child?.pid) {

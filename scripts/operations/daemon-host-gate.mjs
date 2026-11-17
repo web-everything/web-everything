@@ -11,19 +11,19 @@
  *
  * Test-only override: WE_DAEMON_HOST_OWNER_FILE=<file> (plus WE_DAEMON_HOST_GATE_TEST_ONLY=1,
  * else the wrapper refuses to start) reads the owner from a
- * local file instead of the shared daemon-host-owner branch (the real cache
- * is never written by this wrapper).
+ * local file instead of the shared daemon-host-owner branch.
  */
 import { spawn as nodeSpawn } from 'node:child_process';
 import { readFileSync, realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as timerSleep } from 'node:timers/promises';
-import { getThisHost, resolveHostRole, readOwnerRemote } from '../lib/daemon-host-guard.mjs';
+import { getThisHost, resolveHostRole } from '../lib/daemon-host-guard.mjs';
 
 export const POLL_MS = 60_000;
 const SIGNALS = ['SIGTERM', 'SIGINT', 'SIGHUP'];
 const SIGNUM = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15, SIGKILL: 9, SIGQUIT: 3 };
-const validHost = (v) => typeof v === 'string' && v.length <= 253 && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(v);
+const validHost = (v) => typeof v === 'string' && v.length === 36
+  && /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(v);
 
 export function parseGateArgs(argv) {
   const at = argv.indexOf('--');
@@ -32,23 +32,27 @@ export function parseGateArgs(argv) {
   return cmd ? { cmd, args } : null;
 }
 
-/** Test-only owner source: a local file holding the owner host name. */
-export function makeFileOwnerReader(path, { readFile = (p) => readFileSync(p, 'utf8') } = {}) {
-  return async () => {
-    try {
-      const owner = String(readFile(path)).trim();
-      if (!owner) return { status: 'unset' };
-      if (!validHost(owner)) return { status: 'error', error: 'invalid owner host' };
-      return { status: 'ok', owner };
-    } catch (error) {
-      return { status: 'error', error: String(error?.message ?? error) };
-    }
+/** Test-only owner source: a local file holding the owner UUID or a migration alias. */
+export function makeFileOwnerReader(path, {
+  readFile = (p) => readFileSync(p, 'utf8'), legacyOwnerValues = [],
+} = {}) {
+  return {
+    async readOwner() {
+      const host = String(readFile(path)).replace(/\r?\n$/, '');
+      if (host === '') return { host: '', version: 'unset' };
+      const legacy = typeof host === 'string' && host.length <= 253
+        && /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?![\s\S])/.test(host)
+        && Array.isArray(legacyOwnerValues) && legacyOwnerValues.includes(host);
+      if (!validHost(host) && !legacy) throw new Error('invalid owner ID');
+      return { host, version: 'file' };
+    },
   };
 }
 
-const describeOwner = (r) => {
-  if (r?.status === 'unset') return 'unset';
-  if (r?.status === 'ok' && validHost(r.owner)) return r.owner;
+const describeOwner = (reason) => {
+  if (reason === 'owner-unset') return 'unset';
+  if (reason === 'owner-is-other-host') return 'other';
+  if (reason === 'fresh-owner-is-this-host') return 'self';
   return 'unreadable';
 };
 
@@ -104,23 +108,14 @@ function startChild({ cmd, args }, { spawn, killGroup, processSignals, sleep, ki
 
 export const UNREADABLE_LIMIT_MS = 600_000;
 
-async function pollRole(thisHost, readRemote) {
-  let last = null;
-  let role = { role: 'standby' };
-  try {
-    role = await resolveHostRole({
-      thisHost, atStart: true,
-      readCache: () => { throw new Error('gate never trusts the cache'); },
-      writeCache: () => {},
-      readRemote: async () => { last = await readRemote(); return last; },
-    });
-  } catch { role = { role: 'standby' }; }
-  return { active: role?.role === 'active' && validHost(thisHost), last };
+async function pollRole(thisHost, source) {
+  const result = await resolveHostRole({ thisHost, source });
+  return { active: result.role === 'active', owner: describeOwner(result.reason) };
 }
 
 /** Watch a running child; returns its exit code, or null when the owner revoked it. */
 async function watchChild(child, ctx) {
-  const { thisHost, readRemote, watchSleep, sleep, killGraceMs, log, now: clock } = ctx;
+  const { thisHost, source, watchSleep, sleep, killGraceMs, log, now: clock } = ctx;
   let lastGoodAt = clock();
   let revoked = false;
   while (!revoked) {
@@ -129,9 +124,9 @@ async function watchChild(child, ctx) {
       watchSleep(POLL_MS).then(() => null),
     ]);
     if (winner) return winner.code;
-    const now = await pollRole(thisHost, readRemote);
+    const now = await pollRole(thisHost, source);
     if (now.active) { lastGoodAt = clock(); continue; }
-    const owner = describeOwner(now.last);
+    const owner = now.owner;
     if (owner === 'unreadable' && clock() - lastGoodAt < UNREADABLE_LIMIT_MS) continue;
     revoked = true;
     log(`host-gate: owner=${owner} self=${thisHost}; stopping daemon, back to standby`);
@@ -155,7 +150,7 @@ export async function runGate(parsed, deps = {}) {
     log = (line) => console.log(line),
     sleep = (ms, { signal } = {}) => timerSleep(ms, undefined, { signal }),
     watchSleep = sleep,
-    readRemote = readOwnerRemote,
+    source,
     spawn = nodeSpawn,
     killGroup = (pid, signal) => process.kill(-pid, signal),
     processSignals = process,
@@ -176,19 +171,19 @@ export async function runGate(parsed, deps = {}) {
   try {
     for (let poll = 0; poll < maxPolls; poll += 1) {
       if (shutdownCode !== null) return shutdownCode;
-      const { active, last } = await pollRole(thisHost, readRemote);
+      const { active, owner } = await pollRole(thisHost, source);
       if (shutdownCode !== null) return shutdownCode;
       if (!active) {
-        log(`host-gate: standby owner=${describeOwner(last)} self=${thisHost}`);
+        log(`host-gate: standby owner=${owner} self=${thisHost}`);
         if (shutdownCode !== null) return shutdownCode;
         try { await sleep(POLL_MS, { signal: shutdown.signal }); }
         catch (error) { if (shutdownCode === null) throw error; }
         continue;
       }
-      log(`host-gate: active owner=${describeOwner(last)} self=${thisHost}`);
+      log(`host-gate: active owner=${owner} self=${thisHost}`);
       if (shutdownCode !== null) return shutdownCode;
       const child = startChild(parsed, { spawn, killGroup, processSignals, sleep, killGraceMs });
-      const code = await watchChild(child, { thisHost, readRemote, watchSleep, sleep, killGraceMs, log, now });
+      const code = await watchChild(child, { thisHost, source, watchSleep, sleep, killGraceMs, log, now });
       // Revocation discards the exit code, but must not discard wrapper shutdown.
       if (shutdownCode !== null) return await child.done;
       if (code !== null) return code;
@@ -210,7 +205,7 @@ async function main() {
     console.error('host-gate: WE_DAEMON_HOST_OWNER_FILE needs WE_DAEMON_HOST_GATE_TEST_ONLY=1; refusing to start');
     process.exit(2);
   }
-  const deps = file ? { readRemote: makeFileOwnerReader(file) } : {};
+  const deps = file ? { source: makeFileOwnerReader(file) } : {};
   process.exit(await runGate(parsed, deps));
 }
 
