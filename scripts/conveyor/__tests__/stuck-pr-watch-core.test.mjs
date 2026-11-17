@@ -138,19 +138,19 @@ describe('stuckThresholdMinutes', () => {
 
   describe.each(['stuckPrWatch', 'stuckPrWatch.thresholdMinutes'])('%s parent validation', path => {
     it.each([[], 'invalid', 0, null, false, undefined, new Date()])(
-      'non-object parent %j logs a named diagnostic and retains positive defaults', value => {
+      'non-plain-object parent %j throws a TypeError naming the parent without logging a fallback', value => {
         const log = vi.fn();
         const invalid = path === 'stuckPrWatch' ? { stuckPrWatch: value } : { stuckPrWatch: { thresholdMinutes: value } };
-        expect(stuckThresholdMinutes({}, { readSettings: () => invalid, log })).toEqual(defaults);
-        expect(log).toHaveBeenCalledTimes(1);
-    expect(log).toHaveBeenCalledWith(`[stuck-pr-watch:invalid-threshold] ${path} must be a plain object; using built-in threshold defaults`);
+        expect(() => stuckThresholdMinutes({}, { readSettings: () => invalid, log }))
+          .toThrow(new TypeError(`${path} must be a plain object`));
+        expect(log).not.toHaveBeenCalled();
       },
     );
   });
 
-  it('a throwing settings reader falls back with a named diagnostic', () => {
+  it.each([new Error('unreadable'), new TypeError('reader failure')])('a throwing settings reader (%s) falls back with a named diagnostic', error => {
     const log = vi.fn();
-    expect(stuckThresholdMinutes({}, { readSettings: () => { throw new Error('unreadable'); }, log })).toEqual(defaults);
+    expect(stuckThresholdMinutes({}, { readSettings: () => { throw error; }, log })).toEqual(defaults);
     expect(log).toHaveBeenCalledWith('[stuck-pr-watch:settings-read-failed] using built-in threshold defaults');
   });
 
