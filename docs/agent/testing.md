@@ -4410,6 +4410,20 @@ non-replayable; CI-held provenance does not establish that a write was never app
 The named failed-cache-replacement regression seeds a clear, observes a live freeze while replacement fails, then forces a transient read before TTL expiry. Failed writes remove old evidence and block reuse in-process even when removal fails; only a successful cache write restores eligibility.
 
 `freeze-last-good.test.mjs` exercises transient-read retries and persistent successful reads with an injected clock, sleep and temporary cache path. Reused evidence must keep its original fetch timestamp: rewriting it during reuse would let an outage extend a cached clear indefinitely. Expired, future-dated, corrupt or missing evidence holds the line. Permanent errors never reuse the cache. `freeze-unreadable-hold` retains the `red-main-hold` skip kind and `redMainHold` flag so pass-level admission and PR-comment suppression still apply. Run these tests through heavy admission.
+## Bounded red-team probe fairness
+
+`red-team-dispatch-queue.test.mjs` pins the two-probe limit per repository and
+least-recently-probed turns persisted as optional `lastProbeTurn` entry fields.
+Keep historical entries without the field loadable, reject malformed turns, and
+exercise five still-blocked entries across three ticks with a reload between ticks.
+Probe selection must preserve runnable FIFO admission and distinguish waiting for
+a probe turn from disabled probes and runnable capacity holds.
+Newly blocked entries (including runnable entries with an old turn) must join the
+tail using the same overflow rebase as probe admission. Keep a probe's current turn
+when it stays blocked. Replay two new planner skips per tick alongside four blocked
+heads across restarts, and bound repeat probes by `ceil(blockedCount / 2)` ticks;
+new arrivals must never overtake heads already waiting in the rotation.
+
 Operator prototype-load waiver tests live in `scripts/operations/__tests__/ruled-weakened-store.test.mjs`.
 Use an injected HOME and filesystem: the append-only ops store lives under
 `~/workspace/.operations/coordination/ruled-weakened.jsonl`. Tool, platform, then ops entries
