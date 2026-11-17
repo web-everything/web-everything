@@ -251,6 +251,7 @@ export function foldFindingDispositions(rows, { pr, head = '' } = {}) {
   for (const r of Array.isArray(rows) ? rows : []) {
     if (r?.type !== 'finding' || Number(r.pr) !== Number(pr)) continue;
     if (!FINDING_DISPOSITION_VALUES.includes(r.status) || typeof r.findingId !== 'string') continue;
+    if (r.status === 'not-real' && (typeof r.source !== 'string' || !r.source.trim())) continue;
     if (current && String(r.headSha ?? '').toLowerCase() === current) continue;
     out.set(r.findingId, { status: r.status, headSha: r.headSha, round: r.round, source: typeof r.source === 'string' ? r.source : '' });
   }

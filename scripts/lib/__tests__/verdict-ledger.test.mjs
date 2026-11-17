@@ -30,6 +30,7 @@ import {
   FINDING_STATUS_VALUES, FINDING_SOURCE_RED_TEAM,
 } from '../verdict-ledger.mjs';
 import { foldFindingStatuses, foldFindingDispositions, findingIdentity, bindingRoundDecision, reviewScope } from '../review-round-rules.mjs';
+import { netInterdiff } from '../net-interdiff.mjs';
 import { registerLedgerStore } from '../verdict-ledger-store.mjs';
 import { createHash } from 'node:crypto';
 import { REVIEW_LABELS, normalizeContributionFingerprint, decideReviewGate } from '../review-escalation.mjs';
@@ -1937,14 +1938,68 @@ describe('R883 finding dispositions', () => {
     expect(foldFindingStatuses(extra, { pr: 7, head: 'h' })).toEqual(foldFindingStatuses(plain, { pr: 7, head: 'h' }));
   });
 
-  it('pin: the binding round decision is identical with or without the new rows', () => {
-    const scope = reviewScope({ priorHead: 'p', head: 'h', delta: { files: { 'src/a.mjs': [500] } } });
+  it.each(['raised', 'tolerated', 'fixed', 'carded'])('pin: the binding round decision for %s is identical with or without dispositions', (status) => {
+    const scope = reviewScope({ priorHead: 'p', head: 'h', delta: { priorHead: 'p', head: 'h', files: { 'src/a.mjs': [500] } } });
+    expect(scope.kind).toBe('delta');
     const finding = { file: 'src/a.mjs', line: 10, summary: 'x', severity: 'major' };
     const identity = { findingId: 'fi-one', path: 'src/a.mjs', symbol: 'check', defectClass: 'fail-open' };
-    const rows = [row({ status: 'tolerated' })];
+    const rows = [row({ status })];
     const withNew = [...rows, row({ status: 'open', source: 'red-team', headSha: 'q' }), row({ status: 'not-real', source: 'red-team', headSha: 'r' })];
     const decide = (rs) => bindingRoundDecision({ finding, identity, prior: foldFindingStatuses(rs, { pr: 7, head: 'h' }).get('fi-one'), scope });
     expect(decide(withNew)).toEqual(decide(rows));
+    expect(decide(rows).decision).toBe(status === 'raised' ? 'block' : 'card');
+  });
+
+  it('marks a finding not-real with its source while retaining the original finding and ledger history', () => {
+    const raised = buildLedgerEvent({ ...base, source: 'review-pr', ...fin({ status: 'raised' }) });
+    const disposition = buildLedgerEvent({ ...base, ...fin({ status: 'not-real', headSha: 'b'.repeat(40) }) });
+    const history = [raised, disposition].map(ev => serializeLedgerEvent(ev).line).join('\n');
+    const rows = parseLedgerEvents(history);
+    const snapshot = structuredClone(rows);
+    expect(foldFindingDispositions(rows, { pr: 7 }).get(raised.findingId)).toEqual({
+      status: 'not-real', source: 'red-team', headSha: disposition.headSha, round: 1,
+    });
+    expect(foldFindingStatuses(rows, { pr: 7 }).get(raised.findingId).status).toBe('raised');
+    expect(rows).toEqual(snapshot);
+    expect(rows).toEqual([raised, disposition]);
+  });
+
+  it.each([undefined, null, '', '   ', 42])('ignores a not-real disposition without a recorded source: %j', (source) => {
+    const open = row({ status: 'open', source: 'red-team' });
+    const invalid = row({ status: 'not-real', source });
+    expect(foldFindingDispositions([open, invalid], { pr: 7 })).toEqual(foldFindingDispositions([open], { pr: 7 }));
+    expect(foldFindingDispositions([invalid], { pr: 7 }).size).toBe(0);
+    expect(() => buildLedgerEvent({ ...base, source, ...fin({ status: 'not-real' }) })).toThrow();
+  });
+
+  it.each(['deleted', 'dismissed', 'NOT-REAL', null])('ignores unknown disposition %j without overwriting trusted evidence', (status) => {
+    const rows = [row(), row({ status: 'not-real', source: 'red-team' })];
+    const unknown = row({ status, source: 'red-team' });
+    expect(foldFindingDispositions([...rows, unknown], { pr: 7 })).toEqual(foldFindingDispositions(rows, { pr: 7 }));
+    expect(foldFindingDispositions([unknown], { pr: 7 }).size).toBe(0);
+    expect(foldFindingStatuses([...rows, unknown], { pr: 7 })).toEqual(foldFindingStatuses(rows, { pr: 7 }));
+  });
+
+  it.each([false, true])('slice 2 net interdiff retains its subset and unreadable fallback with dispositions (unreadable=%s)', (unreadable) => {
+    const rawFiles = { 'main-only.mjs': [20], 'src/a.mjs': [10] };
+    const exec = (_cmd, args) => {
+      if (unreadable) throw new Error('unreadable git evidence');
+      if (args[0] === 'merge-base') return 'cccc';
+      const path = args.at(-1);
+      if (args.includes('ls-tree')) return `${path}\0`;
+      if (args.includes('diff')) return path === 'src/a.mjs' && args.includes('bbbb') ? 'mode change\n' : '';
+      throw new Error('unexpected git call');
+    };
+    const net = netInterdiff({ exec, priorHead: 'aaaa', head: 'bbbb', base: 'main', rawFiles });
+    expect(net).toEqual(unreadable ? null : { files: { 'src/a.mjs': [10] }, dropped: ['main-only.mjs'] });
+    const scope = reviewScope({ priorHead: 'aaaa', head: 'bbbb', delta: { priorHead: 'aaaa', head: 'bbbb', files: net?.files ?? rawFiles } });
+    expect(scope.kind).toBe('delta');
+    const finding = { file: 'src/a.mjs', line: 10, summary: 'x', severity: 'major' };
+    const identity = { findingId: 'fi-one', path: 'src/a.mjs', symbol: 'check', defectClass: 'fail-open' };
+    const rows = [row({ status: 'tolerated' })];
+    const decide = rs => bindingRoundDecision({ finding, identity, prior: foldFindingStatuses(rs, { pr: 7, head: 'bbbb' }).get('fi-one'), scope });
+    expect(decide([...rows, row({ status: 'not-real', source: 'red-team' })])).toEqual(decide(rows));
+    expect(decide(rows).decision).toBe('block');
   });
 
   it('foldFindingDispositions: latest open / not-real per id for the PR, ignoring other statuses, PRs and the current head', () => {
