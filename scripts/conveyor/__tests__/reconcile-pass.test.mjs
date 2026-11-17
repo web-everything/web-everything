@@ -4,6 +4,16 @@ import { vi, it, expect, describe } from 'vitest';
 vi.mock('node:child_process', async (importOriginal) => ({
   ...await importOriginal(), execFileSync: vi.fn(),
 }));
+vi.mock('../../lib/pid-alive.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  const { execFileSync } = await import('node:child_process');
+  return {
+    ...actual,
+    // pid-alive can already be loaded by the test setup, before the subprocess mock.
+    // Keep its real parser and the default probe wiring; inject only the ps reader.
+    pidIdentity: (pid, opts) => actual.pidIdentity(pid, { exec: execFileSync, ...opts }),
+  };
+});
 vi.mock('../../lib/gh-throttle.mjs', async (importOriginal) => {
   const { execFileSync } = await import('node:child_process');
   return {
