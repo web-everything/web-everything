@@ -43,8 +43,8 @@ synchronous previous-tick liveness checks, and caller-owned restart. All mutatio
 checks run after acquiring the mutex; HEAD changes retain the clone write lock.
 The continuation side-file and timer watcher are removed.
 
-- [S2b outcome checks](x2bs2ap-probation-outcome-checks.md) requires adoption checks after asynchronous work.
-- [S2c external watcher](x2cs2ap-probation-external-watcher.md) owns r1 (crash before the boot hook) and r2 (a tick that never returns). The next boot still enforces S2a's deadline.
+- [S2b outcome checks](8558-probation-outcome-checks.md) requires adoption checks after asynchronous work.
+- [S2c external watcher](8559-probation-external-watcher.md) owns r1 (crash before the boot hook) and r2 (a tick that never returns). The next boot still enforces S2a's deadline.
 
 ## Non-goals
 

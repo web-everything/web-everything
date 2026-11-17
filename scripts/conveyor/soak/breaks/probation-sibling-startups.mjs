@@ -45,7 +45,7 @@ function response(child) {
 export default {
   id: 'probation-sibling-startups',
   title: 'four healthy sibling startups do not trigger probation rollback',
-  card: 'x1b8hlo / PR #6882 send-back item 1',
+  card: '5726 / PR #6882 send-back item 1',
   fixedBy: { sha: 'HEAD', where: 'lane/blue-green-s2-probation-r928', paths: ['scripts/lib/daemon-rebuild/probation.mjs'] },
   fixPresent(root) {
     return readFileSync(join(root, 'scripts/lib/daemon-rebuild/probation.mjs'), 'utf8').includes('concurrentBoots');
