@@ -3530,11 +3530,9 @@ export function planReconcile({
             + ` repair this required-check failure any further; a person must take it over. Last failure: ${lastFailureReason}${reported}`,
         });
       } else {
-        const unreadableReviewFix = bouncedRealRed && pr.timeoutRetry?.reason === 'log-unreadable';
         dispatch.push({
-          ...base, ...withPhase, ...refund, ...healFacts, ...owedMainRuleFact, kind: unreadableReviewFix ? 'fix' : 'ci-heal',
-          attempts: unreadableReviewFix ? roundAttempts() : ciHealAttempts,
-          ...(unreadableReviewFix ? { findings: countFindings(pr?.comments) } : {}),
+          ...base, ...withPhase, ...refund, ...healFacts, ...owedMainRuleFact, kind: 'ci-heal',
+          attempts: ciHealAttempts,
           ...(timeoutRetryFallback ? { timeoutRetryFallback: pr.timeoutRetry.reason } : {}),
           ...(partialFailureInventory ? { partialFailureInventory: true } : {}),
           ...(fixTiming.joinCiAndReview && readiness.reviewFindings ? { reviewFixAttempts: roundAttempts() } : {}),

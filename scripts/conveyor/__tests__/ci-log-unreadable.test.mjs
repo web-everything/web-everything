@@ -3,6 +3,7 @@ import { readTimeoutEvidence, enrichPrsWithTimeoutEvidence } from '../reconcile-
 import { planReconcile } from '../reconcile-core.mjs';
 import { withPlannedContext, planFixesFromReconcile } from '../reconcile-fix-dispatch.mjs';
 import { makeFixEvidenceReader } from '../../lib/fix-facts.mjs';
+import { REVIEW_PR_CHANNEL } from '../../lib/review-escalation.mjs';
 
 const repo = 'web-everything/web-everything', head = 'a'.repeat(40);
 const prefix = `repos/${repo}`;
@@ -42,10 +43,26 @@ describe('unreadable CI logs keep bounded repair available', () => {
     expect(plan(prs).dispatch).toContainEqual(expect.objectContaining({ kind: 'ci-heal', ciLogEvidenceReason: 'log-unreadable' }));
     expect(plan(prs).dispatch.some(row => row.kind === 'ci-timeout-rerun')).toBe(false);
   });
-  it('review:changes own-failure dispatches a fixer carrying log-unreadable into its brief', () => {
-    const input = { ...pr(true), timeoutRetry: { eligible: false, reason: 'log-unreadable' } };
+  it.each([false, true])('log-unreadable retains the readable-failure ci-heal path (bounced=%s)', bounced => {
+    const input = pr(bounced);
+    const readable = plan([{ ...input, timeoutRetry: { eligible: false, reason: 'no-timeout-signature' } }]);
+    const unreadable = plan([{ ...input, timeoutRetry: { eligible: false, reason: 'log-unreadable' } }]);
+    for (const result of [readable, unreadable]) {
+      expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', attempts: 0 })]);
+    }
+    expect(unreadable.dispatch[0]).toMatchObject({ ciLogEvidenceReason: 'log-unreadable', timeoutRetryFallback: 'log-unreadable' });
+  });
+  it('review:changes own-failure keeps the existing joined fixer carrying log-unreadable into its brief', () => {
+    // A trusted current-head verdict already joins CI and review repair, independently of log readability.
+    const finding = { author: { login: 'web-everything' }, body:
+      `🔁 review — changes requested\n\nRecorded by juror via ${REVIEW_PR_CHANNEL}.\n\nFix the failing test.\n\n---\n\nNet basis: \`0000..${head}\` — 1 net changed file(s) vs current main\n\n_Recorded through ${REVIEW_PR_CHANNEL}._` };
+    const input = { ...pr(true), comments: [finding], timeoutRetry: { eligible: false, reason: 'log-unreadable' } };
+    expect(plan([{ ...input, timeoutRetry: { eligible: false, reason: 'no-timeout-signature' } }]).dispatch)
+      .toEqual([expect.objectContaining({ kind: 'fix', joinedInputs: { head, ciFailures: [expect.objectContaining({ name: 'test' })], reviewFindings: [finding.body] } })]);
     const result = plan([input]);
     expect(result.dispatch).toContainEqual(expect.objectContaining({ kind: 'fix', ciLogEvidenceReason: 'log-unreadable' }));
+    expect(result.dispatch).toHaveLength(1);
+    expect(result.dispatch[0].joinedInputs.reviewFindings).toEqual([finding.body]);
     const entry = result.dispatch.find(row => row.kind === 'fix');
     const launch = planFixesFromReconcile([{ ...entry, files: ['unit.test.mjs'] }], () => null, () => []).planned[0];
     expect(launch).toMatchObject({ ciLogEvidenceReason: 'log-unreadable' });
