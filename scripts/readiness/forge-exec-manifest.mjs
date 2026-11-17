@@ -350,7 +350,7 @@ function hasJwkSecretText(text) {
       const stack=[],tokens=new RegExp(candidate.comments?JWK_TOKEN:JWK_DATA_TOKEN);
       tokens.lastIndex=Math.max(0,anchor);
       let cursor=tokens.lastIndex,closedScope=false;
-      for(const match of candidate.text.matchAll(tokens)) {
+      for(let match;(match=tokens.exec(candidate.text));) {
         const [token]=match;
         budget-=match.index+token.length-cursor;
         if(budget<0)return true;
@@ -379,6 +379,18 @@ function hasJwkSecretText(text) {
           continue;
         }
         const quoted=token[0]==='"'||token[0]==="'"||token[0]==='`';
+        // An unrelated opening quote can consume a serialized object's opening quote as its
+        // own closer. Read that delimiter again when an object or another escape layer follows.
+        // Normal string decoding below keeps the recovered object in its own scope and budget.
+        if(quoted&&token.length>1&&token.at(-1)===token[0]) {
+          let next=cursor;
+          while(candidate.text[next]==='\\') {
+            while(candidate.text[next]==='\\')next++;
+            if(candidate.text[next]!==token[0])break;
+            next++;
+          }
+          if(candidate.text[next]==='{')tokens.lastIndex=cursor-1;
+        }
         // Outside an object, only a complete serialized JWK can contribute a finding. Its private
         // value alone needs 22 characters; decoding shorter strings cannot supply one. Avoid a
         // decoded-string allocation per escaped property name in object-free adversarial text.
@@ -386,7 +398,17 @@ function hasJwkSecretText(text) {
         // Decode within whole string tokens so escaped quotes/braces cannot alter the enclosing scope.
         const value=quoted?decodeEscapes(token.slice(1,-1)):token;
         // A serialized object is its own scope: never combine its members with the enclosing object.
-        if(quoted&&value.includes('{')&&mayHaveJwkText(value))pending.push({text:value,comments:true});
+        if(quoted&&value.includes('{')&&mayHaveJwkText(value)) {
+          pending.push({text:value,comments:true});
+          // A complete serialized JSON container is covered by its decoded view. Retrying its
+          // escaped braces as raw objects only duplicates work and can exhaust recovery's budget.
+          try {
+            const parsed=JSON.parse(value);
+            if(parsed&&typeof parsed==='object')
+              for(let brace=candidate.text.indexOf('{',match.index);brace>=0&&brace<cursor;
+                brace=candidate.text.indexOf('{',brace+1))seen.add(brace);
+          } catch { /* Malformed prose and JS objects still need raw-brace recovery. */ }
+        }
         const frame=stack.at(-1);
         if(frame?.computed) {
           if(!quoted||frame.literal!==undefined)frame.invalid=true;

@@ -217,15 +217,29 @@ describe('forge-key-structure: JWK recovery after unrelated quotes',()=>{
         expect(manifestEntry(path,bytes,false,tracked)).toMatchObject({tracked});
     }
   });
-  it('retains escaped type names through nested serialization and recovery',()=>{
+  it.each([0,1,2,3])('retains escaped type names through serialization depth %i and recovery',depth=>{
     let text=JSON.stringify(staticJwk).replace('"kty"','"\\u006b\\u0074\\u0079"');
-    for(let depth=0;depth<4;depth++,text=JSON.stringify(text))
-      for(const encode of [encodings.raw,encodings.base64,encodings.utf16le]) {
+    for(let layer=0;layer<depth;layer++)text=JSON.stringify(text);
+    for(const encode of Object.values(encodings)) {
+      const bytes=encode(Buffer.from('"unfinished '+text));
+      expect(credentialBufferFinding(bytes)).toBe(FINDING);
+      expect(credentialContentFinding(path,bytes)).toBe(FINDING);
+      expect(()=>manifestEntry(path,bytes,false,true)).toThrow(expect.objectContaining({code:'excluded-source-file'}));
+    }
+  });
+  it.each([0,1,2,3])('keeps unrelated members separate through serialization depth %i and recovery',depth=>{
+    for(const object of [[{kty:'OKP'},{d:staticJwk.d}],
+      {kty:'OKP',description:JSON.stringify({d:staticJwk.d})},
+      {kty:'OKP',kid:staticJwk.d}]) {
+      let text=JSON.stringify(object).replace('"kty"','"\\u006b\\u0074\\u0079"');
+      for(let layer=0;layer<depth;layer++)text=JSON.stringify(text);
+      for(const encode of Object.values(encodings)) {
         const bytes=encode(Buffer.from('"unfinished '+text));
-        expect(credentialBufferFinding(bytes)).toBe(FINDING);
-        expect(credentialContentFinding(path,bytes)).toBe(FINDING);
-        expect(()=>manifestEntry(path,bytes,false,true)).toThrow(expect.objectContaining({code:'excluded-source-file'}));
+        expect(credentialBufferFinding(bytes)).toBeNull();
+        expect(credentialContentFinding(path,bytes)).toBe(encode===encodings.utf16le?'unsupported-text-encoding':null);
+        expect(manifestEntry(path,bytes,false,true)).toMatchObject({tracked:true});
       }
+    }
   });
 });
 
