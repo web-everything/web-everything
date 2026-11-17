@@ -52,7 +52,7 @@ const describeOwner = (r) => {
   return 'unreadable';
 };
 
-function startChild({ cmd, args }, { spawn, processSignals, sleep, killGraceMs }) {
+function startChild({ cmd, args }, { spawn, killGroup, processSignals, sleep, killGraceMs }) {
   let child;
   let finish;
   let ended = false;
@@ -60,7 +60,11 @@ function startChild({ cmd, args }, { spawn, processSignals, sleep, killGraceMs }
   const grace = new AbortController();
   const done = new Promise((resolve) => { finish = resolve; });
   const stop = (sig) => {
-    if (!ended) { try { child?.kill(sig); } catch { /* child already gone */ } }
+    if (!ended && child?.pid) {
+      try { killGroup(child.pid, sig); } catch (error) {
+        if (error?.code !== 'ESRCH') throw error;
+      }
+    }
   };
   const handlers = SIGNALS.map((sig) => {
     const fn = () => {
@@ -80,6 +84,9 @@ function startChild({ cmd, args }, { spawn, processSignals, sleep, killGraceMs }
   processSignals.on('exit', onExit);
   const end = (code) => {
     if (ended) return;
+    // The leader can exit before workers (including on a natural exit). Do not
+    // cancel escalation and release the gate while its process group can run.
+    stop('SIGKILL');
     ended = true;
     grace.abort();
     for (const [sig, fn] of handlers) processSignals.removeListener(sig, fn);
@@ -87,7 +94,7 @@ function startChild({ cmd, args }, { spawn, processSignals, sleep, killGraceMs }
     finish(code);
   };
   try {
-    child = spawn(cmd, args, { stdio: 'inherit' });
+    child = spawn(cmd, args, { stdio: 'inherit', detached: true });
     // A failed spawn has no exit event; errors on a live child must not release it.
     child.on('error', () => { if (!child.pid) end(127); });
     child.on('exit', (code, signal) => end(signal ? 128 + (SIGNUM[signal] ?? 15) : (code ?? 1)));
@@ -138,8 +145,9 @@ async function watchChild(child, ctx) {
 /**
  * Resolves to the daemon's exit code, or 75 after maxPolls standby polls (tests only).
  * While the child runs the owner is re-read every poll: a definitive other/unset owner,
- * or 600 s (wall clock) without a good read, stops the child (SIGTERM,
- * then SIGKILL after killGraceMs) and returns the gate to standby.
+ * or 600 s (wall clock) without a good read, stops the daemon process group
+ * (SIGTERM, then SIGKILL after killGraceMs) and returns the gate to standby.
+ * A leader exit also kills any remaining group members before releasing the gate.
  */
 export async function runGate(parsed, deps = {}) {
   const {
@@ -149,6 +157,7 @@ export async function runGate(parsed, deps = {}) {
     watchSleep = sleep,
     readRemote = readOwnerRemote,
     spawn = nodeSpawn,
+    killGroup = (pid, signal) => process.kill(-pid, signal),
     processSignals = process,
     maxPolls = Infinity,
     killGraceMs = 30_000,
@@ -178,7 +187,7 @@ export async function runGate(parsed, deps = {}) {
       }
       log(`host-gate: active owner=${describeOwner(last)} self=${thisHost}`);
       if (shutdownCode !== null) return shutdownCode;
-      const child = startChild(parsed, { spawn, processSignals, sleep, killGraceMs });
+      const child = startChild(parsed, { spawn, killGroup, processSignals, sleep, killGraceMs });
       const code = await watchChild(child, { thisHost, readRemote, watchSleep, sleep, killGraceMs, log, now });
       // Revocation discards the exit code, but must not discard wrapper shutdown.
       if (shutdownCode !== null) return await child.done;

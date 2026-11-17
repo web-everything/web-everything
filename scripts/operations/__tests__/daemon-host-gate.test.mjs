@@ -1,6 +1,13 @@
 // @vitest-environment node
 import { describe, it, expect } from 'vitest';
 import { EventEmitter } from 'node:events';
+import { spawn, spawnSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { getThisHost } from '../../lib/daemon-host-guard.mjs';
+import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 import {
   parseGateArgs, runGate, isEntrypoint, makeFileOwnerReader, POLL_MS,
 } from '../daemon-host-gate.mjs';
@@ -31,10 +38,12 @@ function harness({ owners, self = 'studio' }) {
     },
     spawn: (cmd, args, opts) => {
       const child = fakeChild();
+      child.pid = 1000 + children.length;
       spawns.push({ cmd, args, opts });
       children.push(child);
       return child;
     },
+    killGroup: (pid, signal) => children.find((child) => child.pid === pid).kill(signal),
     processSignals: procSignals,
     watchSleep: () => new Promise(() => {}),
     maxPolls: 50,
@@ -62,6 +71,7 @@ describe('runGate', () => {
     expect(h.spawns[0].cmd).toBe('/bin/sh');
     expect(h.spawns[0].args).toEqual(['-c', 'x y']);
     expect(h.spawns[0].opts.stdio).toBe('inherit');
+    expect(h.spawns[0].opts.detached).toBe(true);
     h.children[0].emit('exit', 0, null);
     expect(await run).toBe(0);
   });
@@ -222,16 +232,16 @@ describe('wrapper shutdown', () => {
     expect(await run).toBe(137);
   });
 
-  it('cancels the grace timer without SIGKILL when the child exits during grace', async () => {
+  it('kills remaining group members and cancels the grace timer when the leader exits during grace', async () => {
     const { h, waits, run } = await running();
     h.procSignals.emit('SIGINT');
     expect(waits[0].signal.aborted).toBe(false);
     h.children[0].emit('exit', null, 'SIGINT');
     expect(await run).toBe(130);
     expect(waits[0].signal.aborted).toBe(true);
-    expect(h.children[0].kills).toEqual(['SIGINT']);
+    expect(h.children[0].kills).toEqual(['SIGINT', 'SIGKILL']);
     h.procSignals.emit('exit', 130);
-    expect(h.children[0].kills).toEqual(['SIGINT']);
+    expect(h.children[0].kills).toEqual(['SIGINT', 'SIGKILL']);
   });
 
   it('synchronously SIGKILLs a live child on wrapper exit and still awaits child exit', async () => {
@@ -258,6 +268,35 @@ describe('wrapper shutdown', () => {
     expect(h.children[0].kills).toEqual(['SIGTERM', 'SIGKILL']);
     h.children[0].emit('exit', null, 'SIGKILL');
     expect(await run).toBe(137);
+  });
+
+  it('accepts an already absent process group on leader exit', async () => {
+    const h = harness({ owners: [{ status: 'ok', owner: 'studio' }] });
+    h.deps.killGroup = () => { throw Object.assign(new Error('gone'), { code: 'ESRCH' }); };
+    const run = runGate({ cmd: 'd', args: [] }, h.deps);
+    await tick();
+    h.children[0].emit('exit', 0, null);
+    expect(await run).toBe(0);
+    expect(h.procSignals.eventNames()).toEqual([]);
+  });
+
+  it('does not report completion when process-group cleanup is denied', async () => {
+    const h = harness({ owners: [{ status: 'ok', owner: 'studio' }] });
+    const signal = h.deps.killGroup;
+    let deny = true;
+    h.deps.killGroup = (...args) => {
+      if (deny) throw Object.assign(new Error('not permitted'), { code: 'EPERM' });
+      signal(...args);
+    };
+    let settled = false;
+    const run = runGate({ cmd: 'd', args: [] }, h.deps).then((code) => { settled = true; return code; });
+    await tick();
+    expect(() => h.children[0].emit('exit', 0, null)).toThrow('not permitted');
+    await tick();
+    expect(settled).toBe(false);
+    deny = false;
+    h.children[0].emit('exit', 0, null);
+    expect(await run).toBe(0);
   });
 });
 
@@ -365,4 +404,115 @@ describe('isEntrypoint', () => {
     expect(isEntrypoint('file:///x/g.mjs', '/y/h.mjs', () => '/y/h.mjs')).toBe(false);
     expect(isEntrypoint('file:///x/g.mjs', undefined)).toBe(false);
   });
+});
+
+describe('owner-file override CLI boundary', () => {
+  const script = fileURLToPath(new URL('../daemon-host-gate.mjs', import.meta.url));
+  it.each([undefined, '', '0', 'true'])('refuses WE_DAEMON_HOST_OWNER_FILE without TEST_ONLY=1 (%s)', (flag) => {
+    const dir = mkdtempSync(join(tmpdir(), 'host-gate-cli-'));
+    try {
+      const owner = join(dir, 'owner');
+      const marker = join(dir, 'executed');
+      writeFileSync(owner, getThisHost());
+      const env = { ...process.env, WE_DAEMON_HOST_OWNER_FILE: owner };
+      delete env.WE_DAEMON_HOST_GATE_TEST_ONLY;
+      if (flag !== undefined) env.WE_DAEMON_HOST_GATE_TEST_ONLY = flag;
+      const result = spawnSync(process.execPath, [script, '--', process.execPath, '-e',
+        'require("node:fs").writeFileSync(process.argv[1], "ran")', marker],
+      { env, encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024 });
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(2);
+      expect(result.stderr).toContain('refusing to start');
+      expect(existsSync(marker)).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('allows the explicit test-only override and propagates the command exit code', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'host-gate-cli-'));
+    try {
+      const owner = join(dir, 'owner');
+      writeFileSync(owner, getThisHost());
+      const result = spawnSync(process.execPath, [script, '--', process.execPath, '-e', 'process.exit(7)'], {
+        env: { ...process.env, WE_DAEMON_HOST_OWNER_FILE: owner, WE_DAEMON_HOST_GATE_TEST_ONLY: '1' },
+        encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024,
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(7);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('exits 2 with usage when the command is missing', () => {
+    const result = spawnSync(process.execPath, [script, '--'], {
+      encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain('usage: daemon-host-gate.mjs');
+  });
+});
+
+describe('real daemon process group', () => {
+  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  async function waitFor(predicate) {
+    const deadline = Date.now() + 3000;
+    while (!predicate() && Date.now() < deadline) await delay(10);
+    expect(predicate()).toBe(true);
+  }
+  const running = (pid) => {
+    try { process.kill(pid, 0); return true; }
+    catch (error) { if (error.code === 'ESRCH') return false; throw error; }
+  };
+
+  it.each(['revoke', 'SIGTERM', 'SIGINT', 'SIGHUP', 'exit', 'leader-exit', 'shell-revoke', 'resistant-leader'])(
+    '%s leaves no live descendant, including a worker that ignores SIGTERM', async (reason) => {
+      const dir = mkdtempSync(join(tmpdir(), 'host-gate-group-'));
+      const ready = join(dir, 'ready');
+      const procSignals = new EventEmitter();
+      let child;
+      let descendant;
+      let releaseWatch;
+      let owner = 'studio';
+      let run;
+      try {
+        // The leader does not forward signals. The grandchild advertises readiness
+        // only after installing its SIGTERM handler.
+        const worker = keepAliveScript({
+          anchorPid: process.pid, maxLifetimeMs: 15000,
+          prelude: 'process.on("SIGTERM", () => {});',
+          postlude: 'require("node:fs").writeFileSync(process.argv[1], String(process.pid));',
+        });
+        const leader = keepAliveScript({
+          anchorPid: process.pid, maxLifetimeMs: 15000,
+          prelude: (reason === 'resistant-leader' ? 'process.on("SIGTERM", () => {});' : '')
+            + 'require("node:child_process").spawn(process.execPath, ["-e", process.argv[1], process.argv[2]], {stdio:"inherit"});',
+        });
+        const parsed = reason === 'shell-revoke'
+          ? { cmd: '/bin/sh', args: ['-c', '"$1" -e "$2" "$3" & wait', 'host-gate-test', process.execPath, worker, ready] }
+          : { cmd: process.execPath, args: ['-e', leader, worker, ready] };
+        run = runGate(parsed, {
+          thisHost: 'studio', readRemote: async () => ({ status: 'ok', owner }),
+          processSignals: procSignals, log: () => {}, maxPolls: 1, killGraceMs: 30,
+          watchSleep: () => new Promise((resolve) => { releaseWatch = resolve; }),
+          spawn: (...args) => { child = spawn(...args); return child; },
+        });
+        await waitFor(() => existsSync(ready));
+        descendant = Number(readFileSync(ready, 'utf8'));
+        expect(running(descendant)).toBe(true);
+        if (['revoke', 'shell-revoke', 'resistant-leader'].includes(reason)) { owner = 'macbook'; releaseWatch(); }
+        else if (reason === 'leader-exit') child.kill('SIGTERM');
+        else procSignals.emit(reason);
+        await Promise.race([run, delay(3000).then(() => { throw new Error('gate did not settle'); })]);
+        await waitFor(() => !running(descendant));
+        expect(procSignals.eventNames()).toEqual([]);
+      } finally {
+        if (child?.pid) {
+          try { process.kill(-child.pid, 'SIGKILL'); } catch { /* group absent before fix */ }
+          try { process.kill(child.pid, 'SIGKILL'); } catch { /* already exited */ }
+        }
+        if (!descendant && existsSync(ready)) descendant = Number(readFileSync(ready, 'utf8'));
+        if (descendant) { try { process.kill(descendant, 'SIGKILL'); } catch { /* already exited */ } }
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }, 10000,
+  );
 });
