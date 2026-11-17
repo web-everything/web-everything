@@ -436,6 +436,24 @@ describe('R972 tier-three patterns', () => {
   it.each(['::ffff:8.8.8.8', '[::ffff:c000:201]', '[::ffff:999.1.1.1]'])('rejects public or invalid mapped IPs: %s', text => {
     expect(scanText(text).filter(hit => hit.pattern === 'private-network-ip')).toEqual([]);
   });
+  // PR 7008 red team: ordinary punctuation and colon-joined syntax around a private address.
+  // Addresses are assembled at runtime so this source adds no literal private address.
+  const v4 = (...octets) => octets.join('.');
+  const ula = (...groups) => groups.join(':');
+  it.each([
+    `Host address: ${v4(10, 23, 45, 67)}.`, `ssh -L 8080:${v4(10, 23, 45, 67)}:80 public-jump`,
+    `addr:${v4(192, 168, 1, 2)}`, `(${v4(10, 2, 3, 4)}),`, `${v4(10, 2, 3, 4)};`, `see ${v4(172, 16, 0, 2)}!`,
+    `::ffff:${v4(10, 2, 3, 4)}.`, `::ffff:${v4(10, 2, 3, 4)}:80`, `${ula('', '', 'ffff', 'a00', '1')}.`,
+    `ULA ${ula('fd12', '', '1')}.`, `ULA ${ula('fd12', '', '1')}:`, `addr:${ula('fd12', '', '1')}`,
+  ])('detects private IPs beside ordinary punctuation: %s', text => {
+    expect(scanText(text).some(hit => hit.pattern === 'private-network-ip')).toBe(true);
+  });
+  it.each([
+    v4(10, 2, 3, 4, 5), v4(1, 10, 2, 3, 4), `${v4(10, 2, 3, 4)}a`, `${v4(8, 8, 8, 8)}.`,
+    `8080:${v4(8, 8, 8, 8)}:80`, ula('2001', 'fd12', '', '1'), ula('2001', 'db8', '', 'fe80', '1'),
+  ])('keeps dotted-number and public-address boundaries: %s', text => {
+    expect(scanText(text).filter(hit => hit.pattern === 'private-network-ip')).toEqual([]);
+  });
   it.each(['&#47;home&#47;alice&#47;', '&sol;home&sol;alice&sol;', '/home/ali&#99;e/',
     '<b>/home/alice</b>', '/ho\u200bme/ali\u2060ce/', '／ｈｏｍｅ／ａｌｉｃｅ／'])('scans normalised HTML, zero-width and compatibility text: %s', text => {
     expect(scanText(text)).toContainEqual({ pattern: 'home-path', line: 1, match: '/home/alice' });

@@ -100,12 +100,16 @@ export const PATTERNS = Object.freeze([
   { id: 'operator-username', source: null, flags: 'gi' },
   { id: 'private-service-url', source: String.raw`\b([a-z0-9][a-z0-9.-]*)\.workers\.dev\b`, flags: 'gi' },
   { id: 'network-name', source: String.raw`\b[a-z0-9][a-z0-9.-]*\.(?:ts\.net|tailscale)\b|\btailscale(?:[- ]host(?:name)?)?\s*[:=]\s*["']?([a-z0-9][a-z0-9.-]*)`, flags: 'gi' },
-  { id: 'private-network-ip', source: String.raw`(?<![\w:])(?:::ffff:|(?:0{1,4}:){5}ffff:)(?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-f]{1,4}:[0-9a-f]{1,4})(?![\w.:])|(?<![\w.:])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])|(?<![\w:])(?:f[cd][0-9a-f]{2}|fe[89ab][0-9a-f]):[0-9a-f:]+(?:%[\w.-]+)?`, flags: 'gi' },
+  // PR 7008: boundaries reject only a longer dotted number (digit.N) or a preceding IPv6 group (hex:),
+  // so sentence punctuation and colon-joined syntax (ssh -L port:host:port, key:value) still match.
+  { id: 'private-network-ip', source: String.raw`(?<!\w|[0-9a-f:]:)(?:::ffff:|(?:0{1,4}:){5}ffff:)(?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-f]{1,4}:[0-9a-f]{1,4})(?![\w:]|\.\d)|(?<!\w|\d\.)(?:\d{1,3}\.){3}\d{1,3}(?!\w|\.\d)|(?<!\w|[0-9a-f:]:)(?:f[cd][0-9a-f]{2}|fe[89ab][0-9a-f]):[0-9a-f:]+(?:%[\w.-]+)?`, flags: 'gi' },
   { id: 'account-id', source: String.raw`\b(?:[a-z][a-z0-9]*_)*(?:github[ _-]*)?(?:app|installation)[ _-]*id\b["'\x60]*\s*(?:[:=]|\bis\b)?\s*["'\x60]*(\d+)\b|/app/installations/(\d+)\b|\b(?:[a-z][a-z0-9]*_)*installations["']?\s*[:=]\s*(?:Object\.freeze\(\s*)?\{[^{}]*\}`, flags: 'gi' },
 ]);
 
 function isPrivateIp(value) {
-  const address = value.split('%')[0];
+  let address = value.split('%')[0];
+  // A single trailing colon after an IPv6 address is sentence punctuation, never part of a valid address.
+  if (!isIP(address) && /[^:]:$/.test(address)) address = address.slice(0, -1);
   if (isIP(address) === 6) {
     const mapped = address.match(/^(?:::ffff:|(?:0{1,4}:){5}ffff:)(.+)$/i);
     if (mapped) {

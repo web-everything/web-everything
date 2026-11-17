@@ -74,6 +74,38 @@ import { buildReverseImportGraph, selectRelatedTests } from './related-test-sele
 
 const defaultFileConfig = loadVerifySettingsFile();
 
+/**
+ * PR 7008 — decode one line of Git path output. With the default `core.quotePath`, Git wraps a path holding a
+ * non-ASCII byte, `"`, `\` or a control byte in quotes, with `\NNN` octal per UTF-8 byte and C escapes. Git always
+ * quotes a path containing `"`, so a line that starts and ends with `"` is never a literal filename. Octal escapes
+ * are bytes and are reassembled before one UTF-8 decode. An unquoted line passes through untouched.
+ */
+export function unquoteGitPath(line) {
+  if (typeof line !== 'string' || line.length < 2 || line[0] !== '"' || line[line.length - 1] !== '"') return line;
+  const body = line.slice(1, -1);
+  const simple = { n: 0x0a, t: 0x09, r: 0x0d, f: 0x0c, b: 0x08, v: 0x0b, a: 0x07, '\\': 0x5c, '"': 0x22 };
+  const bytes = [];
+  for (let i = 0; i < body.length; i += 1) {
+    if (body[i] !== '\\') {
+      // Whole code point, so a literal astral character (core.quotePath=false) is not split into surrogates.
+      const ch = String.fromCodePoint(body.codePointAt(i));
+      bytes.push(...Buffer.from(ch, 'utf8'));
+      i += ch.length - 1;
+      continue;
+    }
+    const octal = body.slice(i + 1, i + 4);
+    if (/^[0-3][0-7]{2}$/.test(octal)) { bytes.push(parseInt(octal, 8)); i += 3; continue; }
+    if (Object.hasOwn(simple, body[i + 1] ?? '')) { bytes.push(simple[body[i + 1]]); i += 1; continue; }
+    bytes.push(0x5c);
+  }
+  return Buffer.from(bytes).toString('utf8');
+}
+
+/** Split Git `--name-only` / `ls-files` output into real path names (decoded, empty lines dropped). */
+function gitPathLines(out, { trim = false } = {}) {
+  return String(out).split('\n').map((s) => (trim ? s.trim() : s)).filter(Boolean).map(unquoteGitPath);
+}
+
 /** The pathspecs `testsNaming` greps — every vitest test-file suffix (PR #2680 review: one list, pinned by a test). */
 export const VITEST_TEST_PATHSPECS = Object.freeze(['*.test.ts', '*.test.tsx', '*.test.js', '*.test.jsx', '*.test.mjs', '*.test.cjs', '*.test.mts', '*.test.cts']);
 
@@ -289,7 +321,7 @@ export function localDiffIsCardOnly({ base = 'origin/main', runGit }) {
   try {
     const mergeBase = pinnedMergeBase({ base, runGit });
     if (!mergeBase) return false;
-    const lines = (out) => String(out).split('\n').map((s) => s.trim()).filter(Boolean);
+    const lines = (out) => gitPathLines(out, { trim: true });
     const tracked = lines(runGit(['diff', '--name-only', '--no-renames', mergeBase]));
     const untracked = lines(runGit(['ls-files', '--others', '--exclude-standard'])).filter((f) => !isAllowlistedLitterPath(f));
     return isCardOnlyDiff([...new Set([...tracked, ...untracked])]);
@@ -519,7 +551,7 @@ function relatedSelection({ targets, runGit, readRepoFile, settings }) {
   try {
     let reverse = graphCache.get(readRepoFile);
     if (!reverse) {
-      const files = String(runGit(['ls-files', '--cached', '--others', '--exclude-standard'])).split('\n').map((f) => f.trim()).filter(Boolean);
+      const files = gitPathLines(runGit(['ls-files', '--cached', '--others', '--exclude-standard']), { trim: true });
       reverse = buildReverseImportGraph({ files, readFile: readRepoFile });
       graphCache.set(readRepoFile, reverse);
     }
@@ -545,7 +577,8 @@ export function localChangedSet({ base = 'origin/main', runGit }) {
   const mergeBase = pinnedMergeBase({ base, runGit });
   if (!mergeBase) return null;
   // R984: whitespace is part of a Git path; never trim changed-file names.
-  const lines = (out) => String(out).split('\n').filter(Boolean);
+  // PR 7008: decode Git's C-quoted form so callers (the privacy producer's lstat/read) get the real filename.
+  const lines = (out) => gitPathLines(out);
   try {
     const tracked = lines(runGit(['diff', '--name-only', mergeBase]));
     const deletedFiles = lines(runGit(['diff', '--name-only', '--diff-filter=D', mergeBase]));
@@ -686,7 +719,7 @@ export function laneRelevantChangeSince({ recordSha, headSha, base = 'origin/mai
   if (!recordSha || !headSha) return null;
   if (recordSha === headSha) return [];
   if (!HEX_SHA_RE.test(recordSha) || !HEX_SHA_RE.test(headSha)) return null;
-  const lines = (out) => Array.from(new Set(String(out).split('\n').map((s) => s.trim()).filter(Boolean))).sort();
+  const lines = (out) => Array.from(new Set(gitPathLines(out, { trim: true }))).sort();
   const relevantAgainstBase = (sha) => {
     // Pinned explicitly to `sha`, NEVER the literal `HEAD` {@link pinnedMergeBase} uses — a caller may verify a
     // `headSha` that is not (or is no longer) this checkout's actual current HEAD (e.g. an explicit `--sha=`).
