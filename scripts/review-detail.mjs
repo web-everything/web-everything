@@ -27,6 +27,7 @@ import { deriveReviewDisposition, careLevelFromReasons } from './lib/review-core
 import { deriveResolutionBasis, renderResolutionBasisBanner } from './lib/review-render.mjs';
 import { extractManifestFromBody } from './readiness/lane-manifest.mjs';
 import { ADVISORY_NOTE_MARKER } from './conveyor/advisory-round-count.mjs';
+import { isTrustedMarkerAuthor } from './lib/marker-authorship.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
 
 /** The drain's advisory AI-review comment marker (the body the drain posts on an agent-review park). */
@@ -125,11 +126,13 @@ export function assembleReviewDetail({ view } = {}) {
   const lastMatchingComment = (pred) => {
     for (let i = comments.length - 1; i >= 0; i--) {
       const b = bodyOf(comments[i]);
-      if (pred(b)) return comments[i];
+      if (pred(b, comments[i])) return comments[i];
     }
     return null;
   };
-  const advisoryMatch = lastMatchingComment((b) => b.includes(ADVISORY_MARKER) || isCurrentAdvisoryNote(b));
+  // Both advisory formats feed the review judge: a later forged comment must neither hide nor replace one.
+  const advisoryMatch = lastMatchingComment((b, c) => isTrustedMarkerAuthor(c)
+    && (b.includes(ADVISORY_MARKER) || isCurrentAdvisoryNote(b)));
   const humanMatch = lastMatchingComment((b) => HUMAN_MARKERS.some((m) => b.trimStart().startsWith(m)));
   const advisoryComment = advisoryMatch ? bodyOf(advisoryMatch) : null;
   const humanComment = humanMatch ? bodyOf(humanMatch) : null;
