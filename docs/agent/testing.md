@@ -301,6 +301,10 @@ exercise diagnostic propagation through a real-git rebuild fixture. Run these su
 
 ## Overlay main-sync parking recovery
 
+When adding parking reasons, update the reason inventory in
+`daemon-rebuild-events.test.mjs` and prove overlay diagnostics stay on their own
+event channel without emitting a `rebuild-failed` event.
+
 In `daemon-rebuild-overlay-main-sync.test.mjs`, reject the changed-tip unpark rename,
 then separately reject the failure-record rename: persisted tip, count and parked tip
 must remain a complete old streak or become a complete new streak. Probe subsequent

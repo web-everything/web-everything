@@ -241,8 +241,11 @@ describe('rebuildClone coordination events', () => {
     },
   );
 
-  it('leaves the overlay main-sync conflict diagnostic to its own event channel', async () => {
-    const reason = 'merge conflicts remain after the ref tip moved: worker.mjs';
+  it.each([
+    'merge conflicts remain after the ref tip moved: worker.mjs',
+    'parked',
+    'parked after 3 failures; last step tests: tests: selected tests did not pass or execute',
+  ])('leaves the overlay main-sync diagnostic "%s" to its own event channel', async reason => {
     terminal({ moved: false, reason });
     expect(await rebuildClone(options)).toEqual({ moved: false, reason, alerts: [] });
     expect(options.emitEvent).not.toHaveBeenCalled();
@@ -266,6 +269,7 @@ describe('rebuildClone coordination events', () => {
       'needs-build', 'no-change', 'no-local-main', 'no-lockfile', 'no-result', 'non-store-changes',
       'none', 'none of ', 'not-on-main', 'not-state-files', 'operation-in-progress', 'origin/main ',
       'other-base', 'overlay-no-longer-wanted', 'overlay-set-aside', 'pinned-conflict-skipped',
+      'parked', 'parked after ', // overlay-main-sync parking skip and diagnostic (own event channel)
       'pinned-contained-in-applied', 'pinned-overlay-conflict-skipped', 'pr-closed', 'pr-merged',
       'ready-adopted', 'ready-pending', 'ready-recorded', 'rebuild-in-progress', 'rebuild-job-running',
       'rebuild-job-spaced', 'rebuild-job-started', 'recovered-adopted', 'ref-gone', 'ref-unresolved',
