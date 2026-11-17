@@ -4,6 +4,9 @@ import { spawnSync } from 'node:child_process';
 import { resolve, dirname, relative } from 'node:path';
 import { decidePublish, createGhPublishIo } from '../review-hold-io.mjs';
 import * as exports from '../review-hold-io.mjs';
+import { liveLabelNames } from '../review-labels.mjs';
+import * as ciGate from '../review-ci-gate-io.mjs';
+import { probe } from '../../review-hold-probe.mjs';
 
 const HEAD = 'a'.repeat(40);
 const PREFIX = 'review-gate-verdict/v1 ';
@@ -53,6 +56,37 @@ function clear(w) {
 }
 
 describe('decidePublish v2', () => {
+  it('liveLabelNames-preserves-spelling-and-keeps-bad-rows-invalid', async () => {
+    const names = ['review:pending', ' Review:pending ', 'revi\u200bew:pending', 'ｒｅｖｉｅｗ:pending', 'line\r\nend'];
+    expect(liveLabelNames(names.map(name => ({ name })))).toEqual(names);
+    expect(liveLabelNames(['bug', { name: 'review:pending' }])).toEqual(['bug', 'review:pending']);
+    expect(liveLabelNames([])).toEqual([]);
+    for (const bad of [undefined, null, {}, 'review:pending', { labels: [] }]) expect(liveLabelNames(bad)).toBeNull();
+    expect(liveLabelNames([{ color: 'x' }, { name: 7 }, null])).toEqual([null, null, null]);
+    const w = world(); w.input.liveLabels = liveLabelNames([{ name: 'review:pending' }, { color: 'x' }]);
+    await expect(w.decide()).resolves.toEqual({ publish: false, reason: 'invalid-input' });
+    expect(w.io.getPull).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['objects', [{ name: 'review:pending', color: 'ededed' }], true],
+    ['strings', ['review:pending'], true],
+    ['mixed', ['review:pending', { name: 'review:pending' }], true],
+    ['malformed row', [{ name: 'review:pending' }, null], false],
+    ['unreadable array', null, false],
+  ])('probe-normalizes-labels-before-real-decision: %s', async (_name, labels, publish) => {
+    const w = world();
+    const transport = vi.spyOn(exports, 'createGhPublishIo').mockReturnValue(w.io);
+    const oldGate = vi.spyOn(ciGate, 'readReviewCiGate').mockReturnValue({ allowed: false, reason: 'held' });
+    try {
+      const result = await probe({ repo: 'o/n', pr: 7, read: {
+        ghJson: args => args[0] === 'pr' ? { headRefOid: HEAD, labels } : [{ check_runs: [] }],
+        gh: () => { throw new Error('unexpected log read'); }, freeze: () => ({ frozen: false }),
+      } });
+      expect(result.publish).toEqual({ publish, reason: publish ? 'verified-hold' : 'invalid-input' });
+      expect(result.labels).toEqual(liveLabelNames(labels));
+      if (!publish) expect(w.io.getPull).not.toHaveBeenCalled();
+    } finally { transport.mockRestore(); oldGate.mockRestore(); }
+  });
   it('world', async () => { await yes(world()); });
   it('io-null-sweep', async () => {
     for (const method of Object.keys(world().io)) for (const value of [null, undefined, {}, [], '', new Error('offline')]) {

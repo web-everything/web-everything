@@ -36,3 +36,10 @@ export const REVIEW_LABELS = {
 
 /** Canonical, frozen set of labels that hold merging. */
 export const REVIEW_HOLD_LABELS = Object.freeze([REVIEW_LABELS.pending, REVIEW_LABELS.changes, REVIEW_LABELS.human, REVIEW_LABELS.heldMechanical]);
+
+/** Project provider rows to names without dropping unreadable evidence. Invalid reads or rows
+ * remain invalid for decidePublish; label spelling is preserved exactly. */
+export function liveLabelNames(labels) {
+  if (!Array.isArray(labels)) return null;
+  return labels.map(label => typeof label === 'string' ? label : typeof label?.name === 'string' ? label.name : null);
+}

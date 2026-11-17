@@ -10,6 +10,7 @@ import { readReviewCiGate } from './lib/review-ci-gate-io.mjs';
 import { readSharedFreeze } from './lib/red-main-freeze-shared.mjs';
 import { decidePublish, createGhPublishIo } from './lib/review-hold-io.mjs';
 import { deriveReviewHold } from './lib/review-hold-model.mjs';
+import { liveLabelNames } from './lib/review-labels.mjs';
 
 const OPTS = { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] };
 const gh = (args) => readGh(args, OPTS);
@@ -31,6 +32,7 @@ const latest = (runs, name) => runs.filter((r) => r.name === name).sort((a, b) =
 export async function probe({ repo, pr, read = { gh, ghJson, freeze: readSharedFreeze } } = {}) {
   const view = read.ghJson(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid,labels']);
   const headSha = view.headRefOid;
+  const liveLabels = liveLabelNames(view.labels);
   const pages = read.ghJson(['api', '--paginate', '--slurp', `repos/${repo}/commits/${headSha}/check-runs?per_page=100&filter=all`]);
   const runs = pages.flatMap((p) => {
     if (!Array.isArray(p?.check_runs)) throw new Error('unreadable check runs');
@@ -46,13 +48,13 @@ export async function probe({ repo, pr, read = { gh, ghJson, freeze: readSharedF
   const derived = deriveReviewHold({ headSha, prNumber: Number(pr), labels: view.labels, mergeGate, freeze });
   const io = createGhPublishIo({ repo, pr: Number(pr), head: headSha });
   const publish = await decidePublish({ repo, pr: Number(pr), head: headSha,
-    liveLabels: view.labels.map(l => l.name ?? l) }, io);
+    liveLabels }, io);
   let old;
   try {
     const ci = readReviewCiGate({ repo, pr });
     old = { allowed: ci.allowed, reason: ci.reason, affected: (ci.affected ?? []).map((r) => ({ name: r.name, reason: r.reason })) };
   } catch (error) { old = { error: String(error?.message ?? error) }; }
-  return { repo, pr: Number(pr), headSha, labels: view.labels.map((l) => l.name ?? l),
+  return { repo, pr: Number(pr), headSha, labels: liveLabels,
     new: { publishable: derived.publishable, candidacy: derived.candidacy, reason: derived.reason,
       holds: derived.holds, key: derived.key },
     publish, old };
