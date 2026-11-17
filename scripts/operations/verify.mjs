@@ -24,10 +24,9 @@
  * which taught the reader to retry rather than look. So `unrun` is a first-class outcome here, it is NEVER
  * folded into `fail`, and it never satisfies a gate.
  *
- * BOTH STEPS ARE `compute` AND THE DECLARATION HAS NO SINK. Verifying is a READ: it runs the repo's checks and
- * reports. Nothing it does may write, so `./http-adapter.mjs` derives a `GET`-only surface with no run record,
- * the same path `suggest-next` and `gate-health` already take. The subprocess work lives in
- * `./verify-io.mjs` and is injected, so every branch below is testable with no npm, no vitest and no clock.
+ * BOTH STEPS ARE `compute` AND THE DECLARATION HAS NO SINK. The subprocess work, including the home's marker
+ * writes in run/request modes, lives in `./verify-io.mjs` and is injected, so every branch below is testable
+ * with no npm, no vitest and no clock. Compute steps alone do not make the injected IO read-only.
  *
  * WHAT IT DELIBERATELY DOES NOT DO: decide whether the work is *good*. That is `review-pr`, which judges. This
  * only answers whether the repo's own machine-checkable gates are green, which is the precondition for asking
@@ -42,10 +41,12 @@ import { compute } from './step-kinds.mjs';
 export const VERIFY_OP = 'verify';
 
 /**
- * `run` executes the suites through the single home; `check` reads the marker it recorded and runs nothing —
- * the home's own read-only subcommand, which is what a board polls. A closed set, refused before a run exists.
+ * `run` executes the suites through the single home; `check` reads the marker it recorded and runs nothing.
+ * `request` stamps a running marker and returns immediately; the verify daemon runs the gate. An accepted
+ * request is `unrun` (requested, pending), never green: only a subsequent `check` can read the result.
+ * A closed set, refused before a run exists.
  */
-export const VERIFY_MODES = Object.freeze(['run', 'check']);
+export const VERIFY_MODES = Object.freeze(['run', 'check', 'request']);
 
 /** The three outcomes ONE check can have. `unrun` is not a flavour of `fail` — see the header. */
 export const CHECK_OUTCOMES = Object.freeze(['pass', 'fail', 'unrun']);

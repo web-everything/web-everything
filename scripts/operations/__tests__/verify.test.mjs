@@ -20,6 +20,20 @@ const check = (over = {}) => ({ name: 'verify-lane', outcome: 'pass', summary: '
 const finding = (checks) => shapeRunFinding({ cwd: '/lane', suite: 'run', checks });
 
 describe('the declaration', () => {
+  it('declares run, check and request modes and forwards request to the runner', () => {
+    expect(VERIFY_MODES).toEqual(['run', 'check', 'request']);
+    const seen = [];
+    const decl = verifyOperation({ runChecks: (args) => {
+      seen.push(args);
+      return { checks: [check({ outcome: 'unrun', reason: 'requested, pending' })] };
+    } });
+    const result = decl.steps.find((s) => s.name === 'run').step.fn({
+      input: { checkout: '/lane-3', mode: 'request', gate: 'npm run locus:gate' },
+    });
+    expect(seen).toEqual([{ cwd: '/lane-3', mode: 'request', gate: 'npm run locus:gate' }]);
+    expect(assessChecks(result)).toMatchObject({ ok: false, passed: 0, failed: 0, unrun: 1 });
+  });
+
   it('derives its own command line from the declaration — no argv code', () => {
     const decl = verifyOperation({ runChecks: () => ({ checks: [check()] }) });
     expect(decl.name).toBe(VERIFY_OP);
@@ -127,6 +141,15 @@ describe('assessChecks — the verdict', () => {
  * HEAD-keyed marker `pr-land` gates on. It could therefore have reported `ok` on a lane `pr-land` refused.
  */
 describe('verifyArgv — it shells the home, and the home is this repo\'s', () => {
+  it('uses the request subcommand, forwarding the gate as one argument without running it', () => {
+    expect(verifyArgv({ checkout: '/lane-3', mode: 'request', gate: 'npm run locus:gate && npm run check:standards' }))
+      .toEqual([VERIFY_LANE_CLI, 'request', '--repo=/lane-3', '--json', '--gate=npm run locus:gate && npm run check:standards']);
+    for (const gate of ['', '   ', undefined]) {
+      expect(verifyArgv({ checkout: '/lane-3', mode: 'request', gate }))
+        .toEqual([VERIFY_LANE_CLI, 'request', '--repo=/lane-3', '--json']);
+    }
+  });
+
   it('runs the suites through verify-lane.mjs, pointed at the named checkout', () => {
     expect(verifyArgv({ checkout: '/lane-3', mode: 'run' }))
       .toEqual([VERIFY_LANE_CLI, '--repo=/lane-3', '--json']);
@@ -234,6 +257,47 @@ describe('classifyVerifyResult — the home\'s vocabulary mapped onto three outc
 });
 
 describe('createChecksRunner', () => {
+  it('makes one request spawn and keeps acceptance pending until a check reads green', () => {
+    const calls = [];
+    const run = createChecksRunner({ spawn: (cmd, argv) => {
+      calls.push({ cmd, argv });
+      return { status: 0, stdout: JSON.stringify({ sha: 'abc', status: argv.includes('request') ? 'requested' : 'green' }) };
+    } });
+    const requested = run({ cwd: '/lane-3', mode: 'request', gate: 'npm run locus:gate' });
+    expect(calls).toEqual([{ cmd: process.execPath, argv: [VERIFY_LANE_CLI, 'request', '--repo=/lane-3', '--json', '--gate=npm run locus:gate'] }]);
+    expect(requested.checks[0]).toMatchObject({ outcome: 'unrun', reason: 'requested, pending' });
+    expect(assessChecks(shapeRunFinding(requested))).toMatchObject({ ok: false, passed: 0, failed: 0, unrun: 1 });
+    expect(assessChecks(shapeRunFinding(run({ cwd: '/lane-3', mode: 'check' })))).toMatchObject({ ok: true, passed: 1 });
+  });
+
+  it.each(['cached', 'green', 'red'])('never reports a request response as a result, even %s', (status) => {
+    const run = createChecksRunner({ spawn: () => ({ status: 0, stdout: JSON.stringify({ sha: 'abc', status }) }) });
+    expect(assessChecks(shapeRunFinding(run({ cwd: '/lane-3', mode: 'request' }))))
+      .toMatchObject({ ok: false, passed: 0, failed: 0, unrun: 1 });
+  });
+
+  it.each([1, 2, 3])('keeps a refused request (exit %s, no daemon) unrun and preserves the recovery detail', (status) => {
+    const run = createChecksRunner({ spawn: () => ({ status, stdout: JSON.stringify({
+      status: 'no-server', reason: 'verify-daemon-not-alive', detail: 'No verify daemon is alive; start the verify daemon, then re-run request.',
+    }) }) });
+    const result = run({ cwd: '/lane-3', mode: 'request' });
+    expect(result.checks[0]).toMatchObject({ outcome: 'unrun', reason: expect.stringContaining('start the verify daemon') });
+    expect(assessChecks(shapeRunFinding(result))).toMatchObject({ ok: false, passed: 0, failed: 0, unrun: 1 });
+  });
+
+  it.each([
+    { status: 1, stdout: '{"status":"green"}' },
+    { status: 2, stdout: '{"status":"red"}' },
+    { status: 0, stdout: 'not JSON' },
+    { status: 0, stdout: '{}' },
+    { status: null, signal: 'SIGKILL', stdout: '{"status":"requested"}' },
+    { error: new Error('ENOENT') },
+  ])('fails closed for incomplete or unsuccessful request evidence: %j', (response) => {
+    const run = createChecksRunner({ spawn: () => response });
+    expect(assessChecks(shapeRunFinding(run({ cwd: '/lane-3', mode: 'request' }))))
+      .toMatchObject({ ok: false, passed: 0, failed: 0, unrun: 1 });
+  });
+
   it('makes exactly one call to the home and shapes its answer', () => {
     const calls = [];
     const spawn = (cmd, argv) => { calls.push(argv); return { status: 0, stdout: JSON.stringify({ sha: 'abc', status: 'green' }) }; };

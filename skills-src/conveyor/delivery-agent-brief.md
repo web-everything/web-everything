@@ -261,7 +261,7 @@ ever typing `&`. This is not just guidance: a `PreToolUse(Bash)` guard (`we:scri
 turn's window) runs the gate for you:
 
 ```bash
-node scripts/verify-lane.mjs request              # returns almost instantly — nothing has run yet — @operation-home-ok: #xab3jh7 — request has no operation-level equivalent yet; folding it in is #xab3jh7
+node scripts/operations/run.mjs verify --checkout="$LANE" --mode=request # returns almost instantly — nothing has run yet
 node scripts/conveyor/await-verify.mjs mark --who={{SESSION_SLUG}} --item={{ITEM_NUM}} --ref=lane/{{ITEM_NUM}}{{ATTEMPT_TAG}}-<slug> --kind=delivery --attempt=1
 ```
 
@@ -435,7 +435,7 @@ git commit -F <msgfile> <explicit-paths>
 # TURN (`awaiting verify for <sha>`). The harness resumes this session with the verdict: a `green` means run the `open-pr`
 # below; a `red` is repaired and re-marked (the third is a hard stop, see *Escalations*). A moved HEAD (something else
 # committed) means `request` and `mark` again for the new HEAD. Never loop on `check`, never sleep-poll.
-node scripts/verify-lane.mjs request              # targets HEAD as of the commit you just made — @operation-home-ok: #xab3jh7 — request has no operation-level equivalent yet; folding it in is #xab3jh7
+node scripts/operations/run.mjs verify --checkout="$LANE" --mode=request # targets HEAD as of the commit you just made
 node scripts/conveyor/await-verify.mjs mark --who={{SESSION_SLUG}} --item={{ITEM_NUM}} --ref=lane/{{ITEM_NUM}}{{ATTEMPT_TAG}}-<slug> --kind=delivery --attempt=1
 
 # … END YOUR TURN HERE. After the harness's green resume message, and only then, publish: …

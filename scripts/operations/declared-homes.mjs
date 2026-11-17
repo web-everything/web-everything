@@ -48,8 +48,8 @@
 /**
  * Operation name → the raw invocations it declares over, as `"<locus:path> [subcommand]"`.
  *
- * A subcommand is present exactly when the home HAS subcommands. `verify-lane.mjs` has none, so naming the
- * file names the whole invocation; `backlog.mjs` has a dozen and only `claim` is declared over, so a
+ * A file-only entry covers the whole home: `verify` declares over `verify-lane.mjs`'s run, check and request
+ * modes. `backlog.mjs` has a dozen subcommands and only `claim` is declared over, so a
  * file-granular entry there would condemn every other `backlog.mjs` line in every skill.
  */
 export const DECLARED_HOMES = Object.freeze({

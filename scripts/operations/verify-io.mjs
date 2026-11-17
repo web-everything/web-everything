@@ -30,7 +30,8 @@
  * to retry rather than look.
  *
  * `mode: 'check'` is the home's own read-only subcommand: read the marker, run nothing. It is what a board
- * polls; `run` is what a delivery agent calls once.
+ * polls; `request` returns immediately after asking the verify daemon to run the gate. Acceptance is not
+ * a result, so request mode always reports `unrun` until a later `check` reads green.
  */
 import { boundFailureDetails } from '../lib/verify-failures.mjs';
 import { spawnSync } from 'node:child_process';
@@ -68,14 +69,15 @@ export function verifySpawnTimeoutMs(env = process.env) {
  *  the same discipline `we:scripts/collect-review-requests.mjs` applies to its git argv. */
 export function verifyArgv({ checkout, mode, gate = '' }) {
   const base = [VERIFY_LANE_CLI];
-  // `check` is the home's READ-ONLY subcommand and must come before the flags, as a positional.
-  if (mode === 'check') base.push('check');
+  // Both subcommands precede the flags. `request` must never fall through to a foreground gate run.
+  if (mode === 'check' || mode === 'request') base.push(mode);
   base.push(`--repo=${checkout}`, '--json');
-  // #xvj8sj0 — forward the caller's suite command. TWO CONDITIONS, and both matter:
+  // #xvj8sj0 — forward the caller's suite command under these conditions:
   //
   //   • ONLY WHEN NON-EMPTY. Passing `--gate=` with an empty value is not "use the default": the home reads
   //     `flags.gate` as a string and would run the empty command, so an unset gate must OMIT the flag and let
   //     the home apply its own default. Never restate that default here (#2644).
+  //   • FORWARD IN `request` MODE too: the marker records the gate the daemon will run.
   //   • NEVER IN `check` MODE. `check` runs no suites at all — it reads the marker HEAD already carries and
   //     prints its verdict. A gate there would be an argument the home ignores, which reads to the next author
   //     as though the mode honoured it.
@@ -94,7 +96,7 @@ export function verifyArgv({ checkout, mode, gate = '' }) {
  * commit. Everything else — including a green marker for a different sha — is `unrun`, because a verdict about
  * another commit is not a verdict about this one.
  */
-export function classifyVerifyResult({ status, signal, stdout = '', stderr = '', error } = {}) {
+export function classifyVerifyResult({ status, signal, stdout = '', stderr = '', error } = {}, mode = 'run') {
   const tail = `${stdout}${stderr}`.trim().split('\n').slice(-3).join(' / ').slice(0, 300);
   if (error) return { outcome: 'unrun', reason: `runner error: ${error.message}` };
   if (signal) return { outcome: 'unrun', reason: `killed by ${signal} — the suites did not finish, so this is NOT a failure they observed` };
@@ -109,11 +111,21 @@ export function classifyVerifyResult({ status, signal, stdout = '', stderr = '',
         + `so this is NOT a pass. Last output: ${tail || '<empty>'}`,
     };
   }
-  // Exit 3 is a usage/git error and writes NO marker. It is emphatically not a red gate.
-  if (status === VERIFY_LANE_EXITS.USAGE) {
+  // Exit 3 is a usage/git error and writes NO marker. Request refusals keep their recovery detail below.
+  if (status === VERIFY_LANE_EXITS.USAGE && mode !== 'request') {
     return { outcome: 'unrun', reason: `usage/git error (exit 3): ${parsed.reason || parsed.detail || tail || 'no detail'}`, sha: parsed.sha };
   }
   const markerStatus = String(parsed.status ?? '');
+  if (mode === 'request') {
+    // Even a cached or card-only green response is an acknowledgement here. Require a check for a result.
+    return {
+      outcome: 'unrun',
+      reason: status === 0 && ['requested', 'cached', 'green'].includes(markerStatus)
+        ? 'requested, pending'
+        : `request not accepted (exit ${status ?? '?'}, status ${JSON.stringify(markerStatus || 'unknown')}): ${parsed.detail || parsed.reason || tail || 'no detail'}`,
+      sha: parsed.sha,
+    };
+  }
   if (markerStatus === 'green') return { outcome: 'pass', summary: `verified green for ${String(parsed.sha ?? '').slice(0, 8)}`, sha: parsed.sha };
   if (markerStatus === 'red') {
     return { outcome: 'fail', ...(parsed.failureDetails ? { failureDetails: boundFailureDetails(parsed.failureDetails) } : {}), errors: Number.isFinite(Number(parsed.exitCode)) ? Number(parsed.exitCode) : null, summary: `suites failed for ${String(parsed.sha ?? '').slice(0, 8)}`, sha: parsed.sha };
@@ -141,7 +153,7 @@ export function createChecksRunner({ spawn = spawnSync, env = process.env } = {}
     } catch (e) {
       r = { error: e };
     }
-    const classified = classifyVerifyResult(r ?? {});
+    const classified = classifyVerifyResult(r ?? {}, mode);
     return {
       cwd,
       suite: mode,
