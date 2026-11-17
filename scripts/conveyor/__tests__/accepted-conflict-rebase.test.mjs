@@ -106,19 +106,19 @@ describe('conflict-rebase pre-repair demotion', () => {
       const remaining = labels.filter(l => !presentRemoveLabels(decision.removeLabels, labels).includes(l));
       expect(remaining).toEqual([]);
     });
-  it('brief requires successful pinned demotion first and marker/report/fix-end at hand-back', () => {
+  it('brief states dispatcher demotion and preserves marker/report/fix-end hand-back', () => {
     const brief = readFileSync('skills-src/conveyor/fix-agent-brief.md', 'utf8')
       .split('> **ACCEPTED-CONFLICT-REBASE MODE')[1].split('> **STALE-BASE MODE')[0];
-    expect(brief).toContain('before any rebase, edit or push');
-    expect(brief).toContain('--round=conflict-start --only-if=accepted --expect-head=<oldHead>');
-    expect(brief).toContain('refusal, crash or unreadable result means STOP');
-    expect(brief.indexOf('--round=conflict-start')).toBeLessThan(brief.indexOf('Then rebase'));
+    expect(brief).toContain('already demoted this PR to `review:pending`');
+    expect(brief).toContain('must not re-add review labels');
+    expect(brief).not.toContain('--round=conflict-start');
     expect(brief.indexOf('conflict-fix-mark.mjs')).toBeLessThan(brief.indexOf('completion-cli.mjs'));
     expect(brief.indexOf('completion-cli.mjs')).toBeLessThan(brief.indexOf('fix-procedure.mjs'));
     expect(brief).not.toContain('--round=conflict ');
     const prompt = withPlannedContext('brief', { mode: 'conflict-rebase' });
-    expect(prompt).toContain('FIRST run rearm-review.mjs --round=conflict-start');
-    expect(prompt).toContain('stop on failure');
+    expect(prompt).toContain('already demoted this PR to review:pending');
+    expect(prompt).toContain('must not re-add review labels');
+    expect(prompt).not.toContain('--round=conflict-start');
   });
   it('admission receipt survives crashes and target movement without spending either round budget', () => {
     const comments = [{ author: { login: AUTOMATION_LOGINS[0] },

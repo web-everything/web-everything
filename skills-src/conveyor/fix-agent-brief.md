@@ -367,18 +367,9 @@ node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo=
 
 > **ACCEPTED-CONFLICT-REBASE MODE — dispatched with `mode: conflict-rebase`.** This accepted or
 > ready-to-merge PR conflicts with main. Keep the fix claim for the entire repair.
-> **FIRST, before any rebase, edit or push, remove approval through the sanctioned label path:**
->
-> ```bash
-> node "{{WE_ROOT}}/scripts/conveyor/rearm-review.mjs" {{PR_NUM}} --repo={{REPO}} --round=conflict-start --only-if=accepted --expect-head=<oldHead> --actor=accepted-conflict-rebase:<oldHead>@<dispatchTarget>
-> ```
->
-> For a ready-to-merge PR with no review verdict, use `--only-if=missing` instead of
-> `--only-if=accepted`, keeping the head pin. This uses `review-set-label.mjs`'s shared rearm
-> path to apply `review:pending` and remove `review:accepted`, `ready-to-merge` and
-> `status:ready-to-merge`. Require a successful completion result proving that demotion;
-> a refusal, crash or unreadable result means STOP and report, never proceed to repair.
-> The admission receipt does not count as a completed repair round.
+> The dispatcher has already demoted this PR to `review:pending`, removed approval and
+> merge clearance labels, and posted the admission receipt pinned to the dispatched head.
+> The repair must not re-add review labels. The receipt does not count as a completed repair round.
 >
 > Then rebase onto current `origin/main`, resolve, run the gate green, and push. Record the
 > conflicting and resolved hunks. At hand-back post exactly one marker-only completion:
