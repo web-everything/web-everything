@@ -101,7 +101,9 @@ const refuse = (reason) => ({ ok: false, reason });
 
 // A provisional id is a whole token only when no identifier character, Unicode included, touches either side (so `fooxf74q20`,
 // `my_x1b8hlo` and `x1b8hlobar` never count). A hyphen or slash may touch: ids sit in `backlog/xhash-slug.md` paths.
-const CODE_TOKEN_RE = /(?<![\p{L}\p{N}_$])(x[0-9a-z]{6})(?![\p{L}\p{N}_$])/gu;
+// ID_Continue includes combining marks and connector punctuation; ECMAScript also permits $ and ZWNJ/ZWJ.
+// Keep the broader letter/number exclusions too, including Unicode numbers outside ID_Continue.
+const CODE_TOKEN_RE = /(?<![\p{ID_Continue}\p{L}\p{N}$\u200C\u200D])(x[0-9a-z]{6})(?![\p{ID_Continue}\p{L}\p{N}$\u200C\u200D])/gu;
 
 /**
  * PURE (R953): a line is a pure id swap when it differs from its old line ONLY by whole-token xHASH→NNNN

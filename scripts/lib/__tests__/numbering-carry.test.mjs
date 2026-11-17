@@ -144,6 +144,33 @@ describe('checkNumberingCommit', () => {
     it.each(['é', '中', '𐐀', '١', '𝟙'])('refuses a subject-proven swap touching a Unicode letter or number on the right: %s', (character) => {
       refused(checkNumberingCommit(withCode(`xf74q20${character}\n`, `6053${character}\n`)), /id rewrite/);
     });
+    it.each([
+      ['combining acute', '\u0301'], ['spacing mark', '\u0903'],
+      ['connector punctuation', '\u203F'], ['Other_ID_Continue', '\u00B7'],
+      ['ZWNJ', '\u200C'], ['ZWJ', '\u200D'],
+      ['variation selector', '\uFE0F'], ['supplementary combining mark', '\u{1D165}'],
+    ])('refuses embedded swaps touching %s on either side for subject and main aliases', (_name, character) => {
+      for (const [hash, number] of [['xf74q20', '6053'], ['x1b8hlo', '5726']]) {
+        refused(checkNumberingCommit(withCode(`a${character}${hash}\n`, `a${character}${number}\n`)), /id rewrite/);
+        refused(checkNumberingCommit(withCode(`${hash}${character}\n`, `${number}${character}\n`)), /id rewrite/);
+        expect(checkNumberingCommit(withCode(`xf74q20 ${hash}${character}\n`, `6053 ${hash}${character}\n`)).ok).toBe(true);
+      }
+    });
+    it('refuses the combining-mark identifier swap that turns valid JavaScript into a syntax error', () => {
+      const before = 'const xf74q20\u0301 = 1;';
+      const after = 'const 6053\u0301 = 1;';
+      expect(() => new Function(before)).not.toThrow();
+      expect(() => new Function(after)).toThrow(SyntaxError);
+      refused(checkNumberingCommit({
+        subject: 'drain: JIT-number xf74q20→#6053 at land (#2288)',
+        parents: ['parent'],
+        changes: [
+          { status: 'D', path: 'backlog/xf74q20-card.md', before: 'card' },
+          { status: 'A', path: 'backlog/6053-card.md', after: 'card' },
+          { status: 'M', path: 'scripts/app.mjs', before, after },
+        ],
+      }), /id rewrite/);
+    });
     it.each(['scripts/guard.mjs', '.github/workflows/run.yml', 'scripts/lib/numbering-carry.mjs', 'CODEOWNERS'])(
       'knowingly carries the behaviour-changing typeof counterexample under R953: %s', (path) => {
         const o = withCode('if (typeof xf74q20 === "undefined") throw Error("blocked");\n',
@@ -379,6 +406,11 @@ describe('proveNumberingOnlyMove read-only regressions', () => {
   it.each([
     ['éxf74q20', 'é6053'],
     ['xf74q20é', '6053é'],
+    ['a\u0301xf74q20', 'a\u03016053'],
+    ['xf74q20\u0301', '6053\u0301'],
+    ['xf74q20\u200C', '6053\u200C'],
+    ['xf74q20\u200D', '6053\u200D'],
+    ['xf74q20\u203F', '6053\u203F'],
   ])('refuses a subject-proven swap embedded in Unicode through the IO shell: %s', (before, after) => {
     const changes = codeChanges('xf74q20', '6053');
     Object.assign(changes.at(-1), { before: `card: '${before}';\n`, after: `card: '${after}';\n` });
