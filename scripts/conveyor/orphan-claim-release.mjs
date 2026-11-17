@@ -195,7 +195,8 @@ export function classifyOrphan(card, sig = {}) {
     if (!Array.isArray(v)) return { act: false, reason: `signal-unavailable:${name}` };
   }
   if (!sessions.length) return { act: false, reason: 'signal-unavailable:sessions' };
-  if ((sig.storeSnapshot ?? sessions.aggregate) && !sessionStoreEvidenceOk({ storeKey: card.storeKey, sessionId: card.sessionId, session: card.scaffoldedBy }, sig.storeSnapshot ?? sessions.aggregate)) {
+  const storeSnapshot = sig.storeSnapshot ?? sessions.aggregate;
+  if (storeSnapshot && !sessionStoreEvidenceOk({ storeKey: card.storeKey, sessionId: card.sessionId, session: card.scaffoldedBy }, storeSnapshot)) {
     return { act: false, reason: 'session-store-unknown' };
   }
   const age = cardAgeMs(card, nowMs);
@@ -203,7 +204,8 @@ export function classifyOrphan(card, sig = {}) {
   if (age <= minAgeMs) return { act: false, reason: 'too-young' };
   if (leases.some((l) => leaseNamesItem(l, tokens))) return { act: false, reason: 'live-lease' };
   if (openPrs.some((pr) => openPrNamesItem(pr, card, tokens))) return { act: false, reason: 'open-pr' };
-  if (sessions.some((row) => sessionNamesItem(row, card, tokens))) return { act: false, reason: 'live-session' };
+  if (sessions.some((row) => sessionNamesItem(row, card, tokens))
+    || storeSnapshot?.rows.some((row) => sessionNamesItem(row, card, tokens))) return { act: false, reason: 'live-session' };
   if (mergedPrs.some((pr) => prDeliveredItem(pr, { id: card.id, bornAs: card.bornAs }).matched)) return { act: false, reason: 'merged-delivery' };
   if (mergedWindowFloor && (!card.dateOpened || card.dateOpened < mergedWindowFloor)) return { act: false, reason: 'merged-window-uncovered' };
   const verb = card.scaffoldedBy && !card.dateStarted ? 'settle' : 'release';

@@ -82,10 +82,14 @@ describe('defaultReadFullTimeline — the inspection agent\'s GET-only replaceme
 });
 
 describe('defaultCountLiveInspections', () => {
-  it('counts only inspect-* sessions, degrading to 0 on a read failure', () => {
+  it('counts only inspect-* sessions in complete listings', () => {
     const listAgents = () => [{ name: 'inspect-1' }, { name: 'inspect-pa-2' }, { name: 'review-9' }, { name: 'fix-3' }];
     expect(defaultCountLiveInspections({ listAgents })).toBe(2);
-    expect(defaultCountLiveInspections({ listAgents: () => { throw new Error('nope'); } })).toBe(0);
+    expect(defaultCountLiveInspections({ listAgents: () => ({ status: 'ok', rows: listAgents() }) })).toBe(2);
+    expect(defaultCountLiveInspections({ listAgents: () => [] })).toBe(0);
+  });
+  it('exhausts dispatch capacity when the inspection listing cannot be read', () => {
+    expect(defaultCountLiveInspections({ listAgents: () => { throw new Error('nope'); } })).toBe(Infinity);
   });
 });
 

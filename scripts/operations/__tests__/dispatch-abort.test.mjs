@@ -5,7 +5,7 @@
  * WHAT THIS FILE COVERS:
  *   - `stopSession` shells `claude stop <id>`, never `kill` — the exact primitive whose absence let a stopped
  *     agent come back under a new pid and double-dispatch onto a lane. An already-gone handle (`claude stop`'s
- *     own `No job matching …` exit) is reported, not thrown; any OTHER failure still throws, and the exec
+ *     own `No job matching …` exit) is reported only after a fresh listing confirms absence; any OTHER failure still throws, and the exec
  *     options (including the timeout) are asserted in full, not just `encoding` (PR #1211 review F5's lesson).
  *   - `trustCheckout` grants trust through the SAME `withTrustedDirs` primitive the bootstrap step uses, is a
  *     no-op when already trusted, and never touches an unreadable config.
@@ -85,8 +85,9 @@ describe('stopSession', () => {
     expect(() => stopSession({ exec: vi.fn() })).toThrow(/needs a handle/);
   });
 
-  it('treats an already-gone handle as benign, not an error', () => {
-    const exec = vi.fn(() => {
+  it('treats an already-gone handle as benign after confirming absence', () => {
+    const exec = vi.fn((_cmd, argv) => {
+      if (argv[0] === 'agents') return '[]';
       const e = new Error("Command failed: claude stop aaaaaaaa");
       e.stderr = "No job matching 'aaaaaaaa'. Run 'claude agents' to list running sessions.\n";
       throw e;
@@ -103,7 +104,8 @@ describe('stopSession', () => {
   it('recognizes an already-gone handle even when other text precedes it on stderr', () => {
     // Matched against the FULL stderr, not just its first line — a prior cut only checked the first line,
     // which would misclassify this as a hard failure.
-    const exec = vi.fn(() => {
+    const exec = vi.fn((_cmd, argv) => {
+      if (argv[0] === 'agents') return '[]';
       const e = new Error('Command failed');
       e.stderr = `warning: some unrelated CLI banner\nNo job matching '${HANDLE}'. Run 'claude agents' to list running sessions.\n`;
       throw e;
@@ -184,7 +186,8 @@ describe('abortDispatch', () => {
 
   it('still calls `claude stop` even when the handle was already gone — cheap, and closes the fail-open gap', async () => {
     const { store } = await parkOneDispatch();
-    const exec = vi.fn(() => {
+    const exec = vi.fn((_cmd, argv) => {
+      if (argv[0] === 'agents') return '[]';
       const e = new Error('Command failed');
       e.stderr = `No job matching '${HANDLE}'. Run 'claude agents' to list running sessions.\n`;
       throw e;
@@ -193,7 +196,7 @@ describe('abortDispatch', () => {
 
     const line = abortDispatch({ runId: RUN_ID, key: KEY, store, listAgents, exec });
 
-    expect(exec).toHaveBeenCalledTimes(1); // attempted, not skipped — no pre-check decided it wasn't worth trying
+    expect(exec.mock.calls.map(([, argv]) => argv)).toEqual([['stop', HANDLE], ['agents', '--json', '--all']]);
     expect(line).toMatch(/was already gone — nothing to stop/);
     expect(line).toMatch(/closed out as `failed`/);
   });

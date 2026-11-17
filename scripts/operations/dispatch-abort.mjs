@@ -79,7 +79,7 @@ export function stopSession({ handle, exec = execFileSync, env = process.env, st
   list = listSessions } = {}) {
   const id = normalizeHandle(handle);
   if (!id) throw new Error('dispatch-abort: stopSession needs a handle to stop');
-  // OFF + sole store + the actual inherited env preserves the historical direct-stop trace. A rollback store on disk or
+  // OFF + sole store + the actual inherited env preserves the successful direct-stop trace. A rollback store on disk or
   // an invalid map leaves this path; neither can silently masquerade as single-profile discovery.
   const discovery = planStores({ env, map, home, exists, realpath });
   if (discovery.problems.length) throw new Error('dispatch-abort: session ownership unknown; repair account map and retry (claim retained)');
@@ -111,17 +111,16 @@ export function stopSession({ handle, exec = execFileSync, env = process.env, st
     // whole of its stderr today, but nothing guarantees it stays that way, and matching only the first line
     // would misclassify an already-gone handle as a hard failure the moment anything gets prepended to it.
     if (/No job matching/i.test(full)) {
-      if (!single) {
-        const store = { key: plan.storeKey, status: 'ok' };
-        let read;
-        try {
-          read = readStore(store, { output: String(exec('claude', ['agents', '--json', '--all'], {
-            ...STOP_EXEC_OPTS, env: childEnv, maxBuffer: 8 * 1024 * 1024,
-          })) });
-        } catch (error) { read = readStore(store, { error }); }
-        if (afterStopMiss(id, plan.storeKey, read).action !== 'gone') {
-          throw new Error('dispatch-abort: stop missed but owning store did not confirm absence; repair store and retry (claim retained)');
-        }
+      // A stop miss is not absence evidence, even on the no-pre-listing single-store path.
+      const store = single ? discovery.stores[0] : { key: plan.storeKey, status: 'ok' };
+      let read;
+      try {
+        read = readStore(store, { output: String(exec('claude', ['agents', '--json', '--all'], {
+          ...STOP_EXEC_OPTS, env: childEnv, maxBuffer: 8 * 1024 * 1024,
+        })) });
+      } catch (error) { read = readStore(store, { error }); }
+      if (afterStopMiss(id, store.key, read).action !== 'gone') {
+        throw new Error('dispatch-abort: stop missed but owning store did not confirm absence; repair store and retry (claim retained)');
       }
       return { stopped: true, alreadyGone: true, output: firstLine };
     }

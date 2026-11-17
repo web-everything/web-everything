@@ -132,23 +132,29 @@ export function defaultReadFullTimeline({ number, repo, exec = execFileSyncThrot
 
 /**
  * How many `inspect-*` sessions (any repo tag) are LIVE right now, for the global concurrency cap. A read
- * failure degrades to `0` — the SAME fail-soft direction `we:scripts/conveyor/reconcile-pass.mjs` takes for its
- * own agents read failing (the cap is a courtesy against pool pressure, not a safety gate; under-counting live
- * sessions can only over-dispatch by a small, self-correcting margin next tick, never under-report a genuinely
- * stuck PR as fine).
+ * failure or incomplete aggregate returns `Infinity`, exhausting dispatch capacity this tick. Positive partial
+ * rows are only a lower bound: unreadable stores may contain enough inspections to fill the cap.
  * @param {{listAgents?:Function}} [o]
  * @returns {number}
  */
 export function defaultCountLiveInspections({ listAgents = () => defaultListAgents({}) } = {}) {
+  const unknown = () => {
+    writeLineSync(2, '⚠ stuck-pr-watch: inspection count unknown — dispatch deferred; repair session stores and retry next tick');
+    return Infinity;
+  };
   let agents;
   try {
     agents = listAgents();
-  } catch (error) {
-    agents = error?.rows ?? [];
+  } catch {
+    return unknown();
   }
-  if (agents?.rows) agents = agents.rows;
-  agents = [...new Map((Array.isArray(agents) ? agents : []).map(row => [JSON.stringify([row.storeKey, row.sessionId ?? row.id ?? row.name]), row])).values()];
-  return (Array.isArray(agents) ? agents : []).filter((a) => parseSessionSlug(a?.name)?.kind === 'inspect').length;
+  if (!Array.isArray(agents)) {
+    if (agents?.status !== 'ok') return unknown();
+    agents = agents.rows;
+  }
+  if (!Array.isArray(agents) || (agents.aggregate && agents.aggregate.status !== 'ok')) return unknown();
+  agents = [...new Map(agents.map(row => [JSON.stringify([row.storeKey, row.sessionId ?? row.id ?? row.name]), row])).values()];
+  return agents.filter((a) => parseSessionSlug(a?.name)?.kind === 'inspect').length;
 }
 
 /**

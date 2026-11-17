@@ -936,8 +936,9 @@ export function stampLiveness(inFlight, { listAgents, isPidAlive = defaultIsPidA
     runs: rows.map((r) => {
       if (!r.handle) return { ...r, live: null };
       if (detachedHandlePid(r.handle) !== null) return { ...r, live: isDispatchHandleLive(r.handle, [], { isPidAlive }) };
-      const owner = resolveOwner(normalizeHandle(r.handle), { status: 'ok', rows: sessions.filter(s => typeof (s?.sessionId ?? s?.id) === 'string').map(s => ({ ...s, sessionId: s.sessionId ?? s.id })), problems: [] });
-      return { ...r, live: owner.kind === 'found' ? true : owner.kind === 'ambiguous' || partial ? null : false };
+      const owner = resolveOwner(normalizeHandle(r.handle), { status: 'ok', rows: sessions.filter(s => typeof (s?.sessionId ?? s?.id) === 'string').map(s => ({ ...s, sessionId: normalizeHandle(s.sessionId ?? s.id) })), problems: [] });
+      // Ambiguity prevents choosing a stop target, but still proves a matching session exists.
+      return { ...r, live: owner.kind === 'found' || owner.kind === 'ambiguous' ? true : partial ? null : false };
     }),
     unreadable,
     livenessSource: partial ? 'partial' : 'claude-agents',

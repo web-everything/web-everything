@@ -10,10 +10,10 @@ import { stopSession, STOP_EXEC_OPTS } from '../dispatch-abort.mjs';
 import { assertHandleNotLive } from '../wake.mjs';
 import { SessionsUnknown } from '../../lib/claude-sessions.mjs';
 import { cachedClaudeAgents } from '../../lib/claude-agents-cache.mjs';
-import { defaultCountLiveInspections } from '../../conveyor/stuck-pr-watch.mjs';
+import { defaultCountLiveInspections, watchStuckPrs } from '../../conveyor/stuck-pr-watch.mjs';
 import { runSessionReaperPass } from '../../conveyor/session-reaper.mjs';
 import { sessionStoreEvidenceOk, classifyReap } from '../../conveyor/lease-reaper.mjs';
-import { classifyOrphan } from '../../conveyor/orphan-claim-release.mjs';
+import { classifyOrphan, planOrphanRelease } from '../../conveyor/orphan-claim-release.mjs';
 import { lookupAwaitSession } from '../../conveyor/await-verify-pass.mjs';
 import { runFixerStuckReclaimPass } from '../../conveyor/fixer-stuck-reclaim.mjs';
 
@@ -35,7 +35,7 @@ const reader = snapshot => () => {
 describe.each(Object.entries(snapshots))('S2b %s evidence', (kind, snapshot) => {
   it('stampLiveness retains positive partial evidence and never infers partial absence', () => {
     const result = stampLiveness({ runs: [{ handle: UUID }, { handle: 'missing' }] }, { listAgents: reader(snapshot) });
-    expect(result.runs.map(r => r.live)).toEqual([kind === 'ambiguous' ? null : true, kind === 'unknown' ? null : false]);
+    expect(result.runs.map(r => r.live)).toEqual([true, kind === 'unknown' ? null : false]);
     expect(result.livenessSource).toBe(kind === 'unknown' ? 'partial' : 'claude-agents');
   });
   it('wake close-out refuses live, unknown and ambiguous ownership', () => {
@@ -54,8 +54,8 @@ describe.each(Object.entries(snapshots))('S2b %s evidence', (kind, snapshot) => 
       expect(exec).not.toHaveBeenCalled();
     }
   });
-  it('inspection courtesy counts positive rows once per store and UUID', () => {
-    expect(defaultCountLiveInspections({ listAgents: reader(snapshot) })).toBe(kind === 'ambiguous' ? 2 : 1);
+  it('inspection cap counts complete rows and fails closed on unknown stores', () => {
+    expect(defaultCountLiveInspections({ listAgents: reader(snapshot) })).toBe(kind === 'unknown' ? Infinity : kind === 'ambiguous' ? 2 : 1);
   });
   it('session reaper deduplicates within stores and passes store identity into every stop', () => {
     const stop = vi.fn(() => ({ stopped: true }));
@@ -239,4 +239,64 @@ it('partial liveness keeps the dispatch on its clock backstop beyond the absence
   const result = stampLiveness({ runs: [{ handle: 'missing', startedAt: '2026-11-16T10:00:00Z', expectedBy: '2026-11-16T12:00:00Z' }] }, { listAgents: reader(snapshots.unknown) });
   expect(result.livenessSource).toBe('partial');
   expect(dispatchStillHolds(result.runs[0], '2026-11-16T11:00:00Z')).toBe(true);
+});
+
+it.each(['ok', 'unknown'])('ambiguous working ownership holds beyond the clock backstop: %s listing', status => {
+  const snapshot = { status, rows: [row, duplicate].map(r => ({ ...r, state: 'working' })), problems: [] };
+  const result = stampLiveness({ runs: [{
+    handle: UUID, startedAt: '2026-11-15T10:00:00Z', expectedBy: '2026-11-15T12:00:00Z',
+  }] }, { listAgents: reader(snapshot) });
+  expect(dispatchStillHolds(result.runs[0], '2026-11-16T12:00:00Z')).toBe(true);
+  expect(result.runs[0].live).toBe(true);
+});
+
+it.each(['recorded', 'global'])('a working owner in the %s store listing vetoes orphan release', source => {
+  const owner = { ...row, name: 'conveyor-999', state: 'working' };
+  const unrelated = { ...row, sessionId: '22222222-2222-4222-8222-222222222222', name: 'unrelated' };
+  const storeSnapshotFor = vi.fn(() => ({ status: 'ok', rows: [source === 'recorded' ? owner : unrelated], problems: [] }));
+  const sessions = Object.defineProperty([source === 'global' ? owner : unrelated], 'storeSnapshotFor', { value: storeSnapshotFor });
+  const result = planOrphanRelease([{
+    id: '999', stem: '999-test', status: 'active', kind: 'story', storeKey: row.storeKey,
+    sessionId: UUID, scaffoldedBy: owner.name, dateStarted: '2020-01-01',
+  }], { nowMs: Date.parse('2026-11-16'), leases: [], openPrs: [], mergedPrs: [], sessions });
+  expect(storeSnapshotFor).toHaveBeenCalledWith(row.storeKey);
+  expect(result).toEqual({ release: [], skip: [{ id: '999', reason: 'live-session' }] });
+});
+
+it.each(['absent', 'present', 'unknown', 'unreadable'])('an inherited single-store stop miss requires fresh confirmation: %s', state => {
+  const list = vi.fn(); // The genuine single-store path needs no pre-stop listing.
+  const exec = vi.fn((_cmd, argv) => {
+    if (argv[0] === 'stop') throw Object.assign(new Error('No job matching'), { stderr: 'No job matching' });
+    if (state === 'unreadable') throw new Error('store unreadable');
+    return state === 'unknown' ? '{}' : JSON.stringify(state === 'absent' ? [] : [row]);
+  });
+  const stop = () => stopSession({ handle: UUID, env: process.env, map, ...fsPorts, exec, list });
+  if (state === 'absent') expect(stop().alreadyGone).toBe(true);
+  else expect(stop).toThrow(/did not confirm absence/);
+  expect(list).not.toHaveBeenCalled();
+  expect(exec.mock.calls.map(([, argv]) => argv)).toEqual([['stop', UUID], ['agents', '--json', '--all']]);
+  expect(exec.mock.calls[1][2].env).toBe(process.env);
+});
+
+it.each(['partial-error', 'unknown-aggregate', 'unreadable', 'invalid'])('incomplete inspection evidence prevents dispatch this tick: %s', kind => {
+  const listAgents = () => {
+    if (kind === 'partial-error') throw new SessionsUnknown({ ...snapshots.unknown, rows: [] });
+    if (kind === 'unknown-aggregate') return { ...snapshots.unknown, rows: [] };
+    if (kind === 'unreadable') throw new Error('unreadable store');
+    return {};
+  };
+  const dispatch = vi.fn(() => ({ sessionSlug: 'inspect-42', agentId: 'job-inspect' })), postComment = vi.fn();
+  const result = watchStuckPrs({
+    repo: 'web-everything/web-everything', now: Date.parse('2026-11-16T12:00:00Z'), maxConcurrent: 2,
+    listPrs: () => [{ number: 42, headRefName: 'lane/42-x', headRefOid: 'deadbeef',
+      labels: [{ name: 'review:changes' }], mergeable: 'MERGEABLE', isDraft: false, comments: [] }],
+    listTimelineEvents: () => [{ createdAt: '2026-11-16T10:00:00Z', event: 'commented' }],
+    readAgents: () => [], enrich: a => a,
+    countLiveInspections: () => defaultCountLiveInspections({ listAgents }),
+    dispatch, provider: { postComment },
+  });
+  expect(result.dispatchedCount).toBe(0);
+  expect(result.results).toEqual([expect.objectContaining({ num: 42, deferredReason: 'concurrency-cap' })]);
+  expect(dispatch).not.toHaveBeenCalled();
+  expect(postComment).not.toHaveBeenCalled();
 });

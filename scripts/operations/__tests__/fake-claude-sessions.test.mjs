@@ -46,7 +46,8 @@ afterEach(() => { if (fake) fake.cleanup(); fake = null; });
 /** The env every case spawns through: the fake's own `PATH` prefix (so `claude` resolves to the shim) plus
  *  the host's, with any per-case override spread last. */
 function envFor(instance, extra = {}) {
-  return { ...process.env, ...instance.env, ...extra };
+  // The store model requires an existing inherited store; keep it inside this fixture's private home.
+  return { ...process.env, ...instance.env, CLAUDE_CONFIG_DIR: instance.env.FAKE_CLAUDE_HOME, ...extra };
 }
 
 function bg(num, name, extra = {}) {
@@ -99,7 +100,7 @@ describe('createFakeClaude — spawn/list/stop through the real production seams
     const [row] = defaultListAgents({ env: envFor(fake) });
 
     const env = envFor(fake);
-    const res = stopSession({ handle: row.id, exec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, env }) });
+    const res = stopSession({ handle: row.id, env, exec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, env }) });
     expect(res).toEqual({ stopped: true, alreadyGone: false, output: expect.stringContaining('stopped') });
 
     expect(defaultListAgents({ env })).toHaveLength(0);
@@ -125,7 +126,7 @@ describe('createFakeClaude — spawn/list/stop through the real production seams
     defaultSpawnAgent(bg(42, 'review-542'), { env: envFor(fake) });
     const env = envFor(fake);
     const [first] = defaultListAgents({ env });
-    stopSession({ handle: first.id, exec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, env }) });
+    stopSession({ handle: first.id, env, exec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, env }) });
 
     const active = defaultListAgents({ env });
     expect(active).toHaveLength(1);
@@ -183,16 +184,15 @@ describe('createFakeClaude — spawn/list/stop through the real production seams
       expect(defaultListAgents({ env: envFor(fake) })).toEqual([]);
     });
 
-    it('stop-fails: `stop` always reports "No job matching", mapped by stopSession to alreadyGone (not a throw), and the session is left untouched', () => {
+    it('stop-fails: a fresh listing vetoes alreadyGone when the session is left untouched', () => {
       fake = createFakeClaude();
       defaultSpawnAgent(bg(13, 'review-513'), { env: envFor(fake) });
       const env = envFor(fake);
       const [row] = defaultListAgents({ env });
       fake.fault('stop-fails');
 
-      const res = stopSession({ handle: row.id, exec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, env }) });
-      expect(res.stopped).toBe(true);
-      expect(res.alreadyGone).toBe(true);
+      expect(() => stopSession({ handle: row.id, env, exec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, env }) }))
+        .toThrow(/did not confirm absence/);
       expect(defaultListAgents({ env })).toHaveLength(1); // never actually stopped
       expect(() => process.kill(row.pid, 0)).not.toThrow();
     });
