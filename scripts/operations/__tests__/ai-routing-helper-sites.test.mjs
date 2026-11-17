@@ -241,3 +241,13 @@ describe('helper routing refusals survive real cascade fallback', () => {
     expect(spawn).toHaveBeenCalledOnce();
   });
 });
+
+describe('raw empty-object helper settings refuse', () => {
+  for (const key of ['provider', 'model', 'effort']) {
+    it(`refuses an empty-object ${key} instead of falling back`, async () => {
+      const { resolveHelperRouting } = await import('../minimal-context-provider.mjs');
+      const env = { WE_AI_ROUTING: JSON.stringify({ helper: { coordinator: { [key]: {} } } }) };
+      expect(() => resolveHelperRouting({ model: 'sonnet', effort: 'medium' }, { env, log: false })).toThrow(/must be a string/);
+    });
+  }
+});

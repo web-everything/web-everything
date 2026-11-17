@@ -33,6 +33,7 @@
  */
 import { execFileSync } from 'node:child_process';
 import { resolveAiRouting, aiRoutingInputs } from '../lib/ai-routing.mjs';
+import { readSettings } from '../lib/settings-files.mjs';
 import { claudeSpawnAlias, resolvePolicyModel, resolvePolicyEffort } from '../lib/dispatch-routing-policy.mjs';
 import { mkdirSync, writeFileSync } from 'node:fs';
 
@@ -174,9 +175,29 @@ export const RESTRICTED_PROVIDER_TOOLS = 'Bash,Edit,Write,Read,Glob,Grep';
  * Keep inherited bytes (including omitted flags). Unsupported providers refuse rather than
  * silently launching a different model. Account selection is deliberately outside this role.
  */
+/** The cascade silently drops empty/non-scalar objects before validating, so check the raw env and tool settings here. */
+function assertHelperRawSettings(env, tool) {
+  const bad = [];
+  const scan = (source, raw) => {
+    let value = raw;
+    if (typeof raw === 'string') { try { value = JSON.parse(raw); } catch { return; } }
+    const coordinator = value?.helper?.coordinator;
+    if (!coordinator || typeof coordinator !== 'object') return;
+    for (const key of ['provider', 'model', 'effort']) {
+      const v = coordinator[key];
+      if (v !== undefined && typeof v !== 'string') bad.push(`${source}.helper.coordinator.${key}: must be a string, got ${v === null ? 'null' : Array.isArray(v) ? 'array' : typeof v}`);
+    }
+  };
+  scan('env', env?.WE_AI_ROUTING);
+  let toolSetting; try { toolSetting = readSettings().aiRouting; } catch { /* unreadable settings are the cascade's concern */ }
+  scan('tool', toolSetting);
+  if (bad.length) throw new TypeError(`aiRouting.helper: invalid routing settings: ${bad.join('; ')}`);
+}
+
 export function resolveHelperRouting(current, { env = process.env, resolved, log = console.error } = {}) {
   if (current.model !== undefined) resolvePolicyModel('claude', current.model);
   const lines = [];
+  assertHelperRawSettings(env, undefined);
   resolved ??= resolveAiRouting({ env, log: line => lines.push(line) });
   const report = line => { if (log !== false) { try { log(line); } catch { /* diagnostic only */ } } };
   for (const line of lines) report(line);
