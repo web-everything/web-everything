@@ -1660,22 +1660,30 @@ export function countLiveReviewRounds(lines, { isScriptFile = null, isOptionPath
   return count;
 }
 
+const REVIEW_CONCURRENCY_PATH = join(dirname(fileURLToPath(import.meta.url)), '../../scripts/settings/review-concurrency.json');
+
 /** EMERGENCY 2026-10-20 — the host-wide cap on live review rounds, from the tool layer
  *  (`scripts/settings/review-concurrency.json`, source logged by the cascade). Counts live `review-job.mjs` /
  *  `review-loop-cli.mjs` processes (a round is one job, or one bare loop). An unreadable `ps` fails closed (no new
  *  review this tick). Revert condition: see the settings file's comment. */
 export function liveReviewRoundBudget({ env = process.env, listCommands = () => execFileSync('ps', ['-Aww', '-o', 'pid=,ppid=,command='], { encoding: 'utf8', timeout: 10_000, maxBuffer: 32 * 1024 * 1024 }),
-  toolPath = join(dirname(fileURLToPath(import.meta.url)), '../../scripts/settings/review-concurrency.json') } = {}) {
+  toolPath = REVIEW_CONCURRENCY_PATH, readFile = readFileSync } = {}) {
+  const validMax = v => Number.isSafeInteger(v) && v >= 1 && v <= 16;
+  // Invalid overrides fall back to the committed cap; unreadable/invalid defaults hold all new rounds.
+  let defaultMax = 0;
+  try {
+    const configured = JSON.parse(readFile(REVIEW_CONCURRENCY_PATH, 'utf8')).maxLiveReviewRounds;
+    if (validMax(configured)) defaultMax = configured;
+  } catch { /* fail closed with zero slots */ }
   let tool;
-  try { tool = JSON.parse(readFileSync(toolPath, 'utf8')); } catch { tool = undefined; }
+  try { tool = JSON.parse(readFile(toolPath, 'utf8')); } catch { tool = undefined; }
   const raw = env?.WE_REVIEW_MAX_LIVE_ROUNDS;
   const r = cascadePolicy('reviewConcurrency', tool && { maxLiveReviewRounds: tool.maxLiveReviewRounds }, {
-    env, standard: { maxLiveReviewRounds: null },
+    env, standard: { maxLiveReviewRounds: defaultMax },
     envValues: { maxLiveReviewRounds: typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : undefined },
-    valid: { maxLiveReviewRounds: (v) => v === null || (Number.isSafeInteger(v) && v >= 1 && v <= 16) },
+    valid: { maxLiveReviewRounds: validMax },
   });
   const max = r.value.maxLiveReviewRounds;
-  if (max == null) return null;
   const src = r.sources?.maxLiveReviewRounds ?? 'standard';
   let lines;
   try { lines = String(listCommands()).split('\n'); } catch (e) { return { left: 0, reason: `live review rounds unknown (${String(e?.message ?? e).split('\n')[0]}); maxLiveReviewRounds=${max} (${src})` }; }

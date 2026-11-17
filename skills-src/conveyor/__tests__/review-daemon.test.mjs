@@ -1135,23 +1135,37 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     expect(budget.reason).toBe(`live review rounds ${live} of maxLiveReviewRounds=8 (tool)`);
   });
 
-  it.each(['tool', 'env'])('accepts 16 and rejects 17 and 0 from the %s layer', async layer => {
+  it('holds all new rounds when the committed default is unreadable and no valid override exists', async () => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const budget = liveReviewRoundBudget({ env: {}, listCommands: () => '',
+      readFile: () => { throw new Error('settings unreadable'); } });
+    expect(budget).toMatchObject({ max: 0, live: 0, left: 0 });
+    expect(budget.reason).toBe('live review rounds 0 of maxLiveReviewRounds=0 (standard)');
+  });
+
+  it.each(['{', '{}', ...[17, 0, 1.5, null].map(maxLiveReviewRounds => JSON.stringify({ maxLiveReviewRounds }))])(
+    'holds all new rounds when the committed default is invalid (%s) and no valid override exists', async contents => {
+      const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+      const budget = liveReviewRoundBudget({ env: {}, listCommands: () => '', readFile: () => contents });
+      expect(budget).toMatchObject({ max: 0, live: 0, left: 0 });
+      expect(budget.reason).toBe('live review rounds 0 of maxLiveReviewRounds=0 (standard)');
+    });
+
+  it.each(['tool', 'env'])('accepts 16 and falls back to a finite default for 17, 0 and non-integers from the %s layer', async layer => {
     const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
     const dir = mkdtempSync(join(tmpdir(), 'review-cap-bounds-'));
     const toolPath = join(dir, 'review-concurrency.json');
     try {
-      for (const max of [16, 17, 0]) {
+      for (const max of [16, 17, 0, 1.5, null]) {
         writeFileSync(toolPath, JSON.stringify({ maxLiveReviewRounds: layer === 'tool' ? max : 8 }));
         const budget = liveReviewRoundBudget({ toolPath, listCommands: () => '',
           env: layer === 'env' ? { WE_REVIEW_MAX_LIVE_ROUNDS: String(max) } : {} });
         if (max === 16) {
           expect(budget).toMatchObject({ max: 16, live: 0, left: 16 });
           expect(budget.reason).toContain(`maxLiveReviewRounds=16 (${layer})`);
-        } else if (layer === 'tool') {
-          expect(budget).toBeNull(); // Invalid tool evidence cannot override the existing standard default.
         } else {
           expect(budget).toMatchObject({ max: 8, live: 0, left: 8 });
-          expect(budget.reason).toContain('maxLiveReviewRounds=8 (tool)');
+          expect(budget.reason).toContain(`maxLiveReviewRounds=8 (${layer === 'tool' ? 'standard' : 'tool'})`);
         }
       }
     } finally { rmSync(dir, { recursive: true, force: true }); }
