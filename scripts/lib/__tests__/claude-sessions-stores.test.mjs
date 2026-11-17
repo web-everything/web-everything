@@ -162,3 +162,16 @@ it('ownerOf ignores a caller all:false', () => {
   const exec = vi.fn((_c, a) => JSON.stringify(a.includes('--all') ? [{ sessionId: A }] : []));
   expect(ownerOf(A, { ...base(oneMap), exec, env: {}, all: false }).kind).toBe('found');
 });
+
+
+it.each(['name', 'id'])('SessionsUnknown carries conflicting %s identities and confirmed rows', field => {
+  const first = { sessionId: A, name: 'conveyor-77', id: 'job-77' };
+  const second = { ...first, [field]: field === 'name' ? 'conveyor-78' : 'job-78' };
+  const exec = () => JSON.stringify([first, second, { sessionId: B, name: 'conveyor-99' }]);
+  let error;
+  try { defaultListAgents({ ...base(oneMap), exec, env: { WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' } }); } catch (caught) { error = caught; }
+  expect(error).toBeInstanceOf(SessionsUnknown);
+  expect(error.rows).toEqual([{ sessionId: B, name: 'conveyor-99', storeKey: '/home/u/.claude' }]);
+  expect(error.conflicted).toEqual([first, second].map(row => ({ ...row, storeKey: '/home/u/.claude' })));
+  expect(error.aggregate.incomplete).toBe(false);
+});

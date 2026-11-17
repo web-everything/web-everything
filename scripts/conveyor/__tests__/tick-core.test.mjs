@@ -2552,7 +2552,8 @@ describe('partial session discovery preserves the durable build floor', () => {
     const evidence = aggregate([read([row]), { store: { key: '/stores/b' }, status: 'unreadable' }], { planProblems: [] });
     expect(evidence.status).toBe('unknown');
     const liveAgentSessions = readLiveAgentSessions(() => { throw new SessionsUnknown(evidence); });
-    expect(liveAgentSessions).toEqual([row]);
+    expect(liveAgentSessions.rows).toEqual([row]);
+    expect(liveAgentSessions.status).toBe('unknown');
     const out = planTick({
       state: { queue: [{ num: 77, buildQueued: true }], lanes: [], prs: [] },
       plan: { launch: [{ num: 77, lane: 4 }] }, freeLanes: [4], bookkeeping: {}, liveAgentSessions,
@@ -2567,8 +2568,9 @@ describe('partial session discovery preserves the durable build floor', () => {
     expect(evidence.status).toBe('unknown');
     expect(evidence.problems).toEqual([expect.stringContaining('conflicting-duplicate-session')]);
     const rows = readLiveAgentSessions(() => { throw new SessionsUnknown(evidence); });
-    expect(rows).toEqual([{ ...row, sessionId: 'bbbbbbbb-1111-2222-3333-444444444444', name: 'conveyor-99' }]);
-    expect(durableBuildNums(rows)).toEqual(['99']);
+    expect(rows.rows).toEqual([{ ...row, sessionId: 'bbbbbbbb-1111-2222-3333-444444444444', name: 'conveyor-99' }]);
+    expect(durableBuildNums(rows.rows)).toEqual(['99']);
+    expect(rows.conflicted).toEqual(expect.arrayContaining([row, { ...row, name: 'conveyor-78' }]));
   });
   it('returns complete rows unchanged and propagates unrelated failures', () => {
     const rows = [row];
@@ -2576,4 +2578,59 @@ describe('partial session discovery preserves the durable build floor', () => {
     const failure = new Error('read failed');
     expect(() => readLiveAgentSessions(() => { throw failure; })).toThrow(failure);
   });
+});
+
+
+describe('session discovery dispatch guard matrix', () => {
+  const row = { sessionId: 'aaaaaaaa-1111-2222-3333-444444444444', storeKey: '/stores/a', name: 'conveyor-77' };
+  const read = (sessions, key = '/stores/a') => ({ store: { key }, status: 'ok', sessions });
+  const cases = [
+    { name: 'ok empty single-store keeps current dispatch', reads: [read([])], spawn: [77, 78], held: [], guards: [] },
+    { name: 'ok positive row survives restart', reads: [read([row])], spawn: [78], held: [[77, 'num']], guards: ['77'] },
+    { name: 'unknown unreadable store keeps positives and skips unidentified new builds', reads: [read([row]), { store: { key: '/stores/b' }, status: 'unreadable' }], spawn: [], held: [[77, 'num'], [78, 'sessions-unknown']], guards: ['77'] },
+    { name: 'unknown without candidates skips all new builds', reads: [{ store: { key: '/stores/a' }, status: 'unreadable' }], spawn: [], held: [[77, 'sessions-unknown'], [78, 'sessions-unknown']], guards: [] },
+    { name: 'ambiguous identity across stores retains both possible jobs', reads: [read([row]), read([{ ...row, storeKey: '/stores/b', name: 'conveyor-78' }], '/stores/b')], spawn: [], held: [[77, 'num'], [78, 'num']], guards: ['77', '78'] },
+    { name: 'conflicting conveyor-77 probe holds all duplicate names even after a third row', reads: [read([row, { ...row, name: 'conveyor-78', pidAlive: false }, { ...row, name: 'conveyor-79' }])], spawn: [], held: [[77, 'num'], [78, 'num']], guards: ['77', '78', '79'] },
+    { name: 'conflicting unrelated names still allow a proven new build', reads: [read([row, { ...row, name: 'conveyor-79' }])], spawn: [78], held: [[77, 'num']], guards: ['77', '79'] },
+  ];
+  it.each(cases)('$name', ({ reads, spawn, held, guards }) => {
+    const agg = aggregate(reads, { planProblems: [] });
+    const liveAgentSessions = readLiveAgentSessions(() => {
+      if (agg.status !== 'ok') throw new SessionsUnknown(agg);
+      return agg.rows;
+    });
+    const out = planTick({
+      state: { queue: [77, 78].map(num => ({ num, buildQueued: true })), lanes: [], prs: [] },
+      plan: { launch: [{ num: 77, lane: 4 }, { num: 78, lane: 5 }] }, freeLanes: [4, 5], bookkeeping: {}, liveAgentSessions,
+    });
+    expect(out.decisions.spawnBuilds).toEqual(spawn.map(num => ({ num, lane: num === 77 ? 4 : 5 })));
+    expect(out.decisions.suppressedBuilds).toEqual(held.map(([num, by]) => ({ num, lane: num === 77 ? 4 : 5, by })));
+    expect(out.nextState.buildGuards.filter(g => g.lane === null).map(g => g.num).sort()).toEqual(guards);
+    if (held.some(([, by]) => by === 'sessions-unknown')) {
+      expect(out.decisions.notes).toEqual(expect.arrayContaining([expect.objectContaining({ kind: 'sessions-unknown', text: expect.stringContaining('retry') })]));
+    }
+  });
+  it('unreadable discovery cannot expire a persisted guard at its TTL', () => {
+    const guard = { num: 77, lane: 4, spawnedTick: 0 };
+    const liveAgentSessions = readLiveAgentSessions(() => { throw new SessionsUnknown({ status: 'unknown', rows: [], problems: ['store unreadable'] }); });
+    const out = planTick({ state: { queue: [{ num: 77, buildQueued: true }], lanes: [], prs: [] },
+      plan: { launch: [{ num: 77, lane: 4 }] }, freeLanes: [4], bookkeeping: { tick: 100, buildGuards: [guard] }, liveAgentSessions });
+    expect(out.decisions.spawnBuilds).toEqual([]);
+    expect(out.decisions.suppressedBuilds).toEqual([{ num: 77, lane: 4, by: 'num' }]);
+    expect(out.nextState.buildGuards).toContainEqual(guard);
+    expect(out.decisions.notes.some(n => n.kind === 'build-ttl')).toBe(false);
+  });
+});
+
+
+it('session uncertainty clears on a healthy next tick without inventing new dispatch guards', () => {
+  const args = { state: { queue: [{ num: 77, buildQueued: true }], lanes: [], prs: [] },
+    plan: { launch: [{ num: 77, lane: 4 }] }, freeLanes: [4] };
+  const unknown = { status: 'unknown', rows: [], problems: ['account map unavailable'], incomplete: true };
+  const held = planTick({ ...args, liveAgentSessions: readLiveAgentSessions(() => { throw new SessionsUnknown(unknown); }) });
+  expect(held.decisions.spawnBuilds).toEqual([]);
+  expect(held.nextState.buildGuards).toEqual([]);
+  const healthy = planTick({ ...args, bookkeeping: held.nextState, liveAgentSessions: readLiveAgentSessions(() => []) });
+  expect(healthy.decisions.spawnBuilds).toEqual([{ num: 77, lane: 4 }]);
+  expect(healthy.decisions.suppressedBuilds).toEqual([]);
 });

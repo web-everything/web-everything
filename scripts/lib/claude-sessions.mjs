@@ -6,12 +6,13 @@ import { loadAccountMap } from './claude-account.mjs';
 import { cachedClaudeAgents } from './claude-agents-cache.mjs';
 import { aggregate, planStores, readStore, resolveOwner } from './claude-stores.mjs';
 
-/** Thrown by defaultListAgents when discovery is incomplete; `rows` carries the positive evidence. */
+/** Thrown by defaultListAgents when discovery is incomplete; `rows` carries positive evidence; `conflicted` carries possibly-live identities. */
 export class SessionsUnknown extends Error {
   constructor(agg) {
     super(`claude sessions unknown: ${agg.problems.join('; ')}`);
     this.name = 'SessionsUnknown';
     this.rows = agg.rows;
+    this.conflicted = agg.conflicted ?? [];
     this.problems = agg.problems;
     this.aggregate = agg;
   }

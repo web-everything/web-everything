@@ -73,22 +73,28 @@ export function aggregate(reads, { mapAvailable = true, planProblems } = {}) {
   if (!Array.isArray(planProblems)) throw new TypeError('aggregate: planProblems (from planStores) is required');
   const rows = new Map();
   const problems = [...planProblems];
-  const conflicts = new Set();
+  const conflicts = new Map();
+  let incomplete = problems.length > 0 || !mapAvailable;
   if (!mapAvailable) problems.push('account map unavailable; repair configuration and retry');
   for (const read of reads) {
     if (read.status === 'absent') continue;
-    if (read.status !== 'ok') { problems.push(`${read.store.key}: ${read.status}; repair store and retry`); continue; }
+    if (read.status !== 'ok') { incomplete = true; problems.push(`${read.store.key}: ${read.status}; repair store and retry`); continue; }
     for (const row of read.sessions) {
       const key = JSON.stringify([read.store.key, row.sessionId]);
-      if (conflicts.has(key)) continue;
+      if (conflicts.has(key)) {
+        const candidates = conflicts.get(key);
+        if (!candidates.some(candidate => isDeepStrictEqual(candidate, row))) candidates.push(row);
+        continue;
+      }
       if (rows.has(key) && !isDeepStrictEqual(rows.get(key), row)) {
-        conflicts.add(key);
+        conflicts.set(key, [rows.get(key), row]);
         rows.delete(key);
         problems.push(`${read.store.key}: conflicting-duplicate-session ${row.sessionId}; repair store and retry`);
       } else rows.set(key, row);
     }
   }
-  return { status: problems.length ? 'unknown' : 'ok', rows: [...rows.values()], problems };
+  return { status: problems.length ? 'unknown' : 'ok', rows: [...rows.values()], problems,
+    ...(problems.length ? { conflicted: [...conflicts.values()].flat(), incomplete } : {}) };
 }
 
 function normalizedHandle(handle) {

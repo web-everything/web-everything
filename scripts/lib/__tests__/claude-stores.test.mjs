@@ -324,7 +324,8 @@ describe('read, aggregate and ownership guarantees', () => {
       for (const reads of [[readStore(store(A), { output: ordered })],
         ordered.map(row => readStore(store(A), { output: [row] }))]) {
         const agg = aggregate([...reads, ...reads]);
-        expect(agg).toMatchObject({ status: 'unknown', rows: [] });
+        expect(agg).toMatchObject({ status: 'unknown', rows: [], incomplete: false });
+        expect(agg.conflicted).toEqual(ordered.map(row => ({ ...row, storeKey: A })));
         expect(agg.problems).toEqual([expect.stringContaining('conflicting-duplicate-session')]);
         for (const handle of [UUID, 'job-first', 'job-second', 'missing']) {
           expect(resolveOwner(handle, agg).kind).toBe('unknown');

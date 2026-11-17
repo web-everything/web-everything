@@ -50,6 +50,25 @@ it('does not cache non-array or invalid JSON', () => {
     expect(readdirSync(o.dir)).toEqual([]);
   }
 });
+it.each([
+  ['legacy primitives', [1, 'two', null, false], 1],
+  ['mixed valid rows', [1, { sessionId: 'aaaaaaaa-1111-2222-3333-444444444444' }], 1],
+  ['invalid object row', [{}], 2],
+  ['mixed invalid rows', [1, {}], 2],
+  ['invalid session UUID', [{ sessionId: 'invalid' }], 2],
+  ['conflicting duplicates', [
+    { sessionId: 'aaaaaaaa-1111-2222-3333-444444444444', name: 'first' },
+    { sessionId: 'aaaaaaaa-1111-2222-3333-444444444444', name: 'second' },
+  ], 2],
+])('cache validation: %s', (_name, payload, calls) => {
+  const o = setup();
+  const stdout = JSON.stringify(payload);
+  o.fetch.mockReturnValue(stdout);
+  expect(cachedClaudeAgents(o)).toBe(stdout);
+  expect(cachedClaudeAgents(o)).toBe(stdout);
+  expect(o.fetch).toHaveBeenCalledTimes(calls);
+  expect(readdirSync(o.dir)).toHaveLength(calls === 1 ? 1 : 0);
+});
 it('separates all sessions and leaves no temporary files after atomic writes', () => {
   const o = setup();
   cachedClaudeAgents(o);

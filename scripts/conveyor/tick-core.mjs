@@ -517,11 +517,11 @@ export function durableBuildNums(sessions) {
   return out;
 }
 
-/** Keep confirmed rows when another store is unknown; never reinterpret an incomplete read as absence. */
+/** Preserve unknown evidence and possible identities; complete listings keep the legacy array fast path. */
 export function readLiveAgentSessions(listAgents) {
   try { return listAgents({}); }
   catch (error) {
-    if (error instanceof SessionsUnknown) return error.rows;
+    if (error instanceof SessionsUnknown) return error.aggregate;
     throw error;
   }
 }
@@ -1177,7 +1177,7 @@ export function buildStatusLine({ queue = [], lanes = [], prs = [], health = {},
  *   signals?: { returnedBuildNums?:Array<*> },  // async events the shell folds in (Agent returns)
  *   prRearmCounts?: object,              // DURABLE per-PR re-arm-comment counts { [pr]: n } — the restart-surviving retry-cap floor (#2643); the IO shell derives it via `countRearmComments`
  *   admission?: { cap?:number, waiting?:Array<{owner:string, lane?:*, num?:*, requestedAt?:string}> },  // #3461 — the heavy-command admission-queue `status` read; each `waiting` entry surfaces as a `waiting-for-capacity` note
- *   liveAgentSessions?: Array<{name?:string}>|Array<string>,  // #3403 — the restart-surviving BUILD-guard floor: `claude agents --json` rows (or plain names), fed through {@link durableBuildNums}
+ *   liveAgentSessions?: Array<{name?:string}>|Array<string>|{status:'unknown', rows:object[], conflicted?:object[], incomplete?:boolean},  // #3403 — the restart-surviving BUILD-guard floor: `claude agents --json` rows (or plain names), fed through {@link durableBuildNums}
  *   config?: { buildTtlTicks?:number, prepareTtlTicks?:number, fixTtlTicks?:number, fixRetryCap?:number, idleWindowMs?:number, maxConcurrentLanes?:number },
  *   now?: number|null, lastOperatorTurn?: number|null,
  *   dispatchPaused?: boolean,          // #3609 — the manual/emergency dispatch-pause lever's current state
@@ -1350,9 +1350,14 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   ];
 
   // 1. RETIRE stale guards FIRST — a launch is then filtered against only still-live guards.
-  const build = retireBuildGuards(bookkeeping.buildGuards, {
-    lanes, queue, tick, now, ttlTicks: cfg.buildTtlTicks, returnedBuildNums: signals.returnedBuildNums,
-  });
+  const sessionsUnknown = !Array.isArray(liveAgentSessions) && liveAgentSessions?.status === 'unknown';
+  // Legacy/injected unknown evidence without completeness metadata also fails closed.
+  const sessionsIncomplete = sessionsUnknown && liveAgentSessions.incomplete !== false;
+  const build = sessionsIncomplete
+    ? { live: Array.isArray(bookkeeping.buildGuards) ? bookkeeping.buildGuards : [], retired: [] }
+    : retireBuildGuards(bookkeeping.buildGuards, {
+      lanes, queue, tick, now, ttlTicks: cfg.buildTtlTicks, returnedBuildNums: signals.returnedBuildNums,
+    });
   const prepareHeld = new Set((bookkeeping.prepareHeldNums ?? []).map(normNum));
   // builder-starved — a guard of a kind this caller never launches is a phantom (nothing runs behind it): drop it,
   // so bookkeeping carried over from older code self-heals on the first tick.
@@ -1409,7 +1414,11 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
       .filter((g) => g && g.lane == null && g.num != null)
       .map((g) => [normNum(g.num), { spawnedTick: g.spawnedTick, spawnedAt: g.spawnedAt }]),
   );
-  const durableOnly = durableBuildNums(liveAgentSessions)
+  const confirmedSessions = sessionsUnknown ? liveAgentSessions.rows : liveAgentSessions;
+  // Conflicts are only possible identities, never authoritative pid-death evidence. Keep every name.
+  const possibleSessions = sessionsUnknown
+    ? (liveAgentSessions.conflicted ?? []).map(row => ({ name: row.name })) : [];
+  const durableOnly = [...new Set([...durableBuildNums(confirmedSessions), ...durableBuildNums(possibleSessions)])]
     .filter((num) => !build.live.some((g) => normNum(g.num) === num));
   const durableBuildGuards = durableOnly.map((num) => ({
     num,
@@ -1423,6 +1432,10 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
 
   // 2. FILTER plan.launch through the live build guard (num OR lane), then record a guard per new build.
   const guardFiltered = filterLaunches(plan.launch, buildLive);
+  if (sessionsIncomplete) {
+    guardFiltered.suppressed.push(...guardFiltered.spawn.map(l => ({ num: l.num, lane: l.lane, by: 'sessions-unknown' })));
+    guardFiltered.spawn = [];
+  }
   // #xupukxa — DEFENSE IN DEPTH: dispatch-plan.mjs already caps `plan.launch` against the concurrency ceiling
   // using its OWN, separately-read active-lease count; re-cap here against `lanes.length` (THIS tick's own
   // active-lane read) so a stale plan or a lease-count race between the two subprocess reads can never let
@@ -1676,6 +1689,7 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   // available-lane withholding above: an operator watching the status line otherwise sees a ready build
   // silently vanish rather than being told why.
   for (const s of launched.suppressed) {
+    if (s.by === 'sessions-unknown') notes.push({ kind: 'sessions-unknown', num: s.num, text: `⏸ #${s.num} — session discovery incomplete; repair unreadable stores/configuration and retry next tick` });
     if (s.by === 'capacity-cap') notes.push({ kind: 'capacity-cap', num: s.num, text: `⏸ #${s.num} — capacity-cap (concurrent-lane cap ${cfg.maxConcurrentLanes} reached)` });
     if (s.by === 'load-cap') notes.push({ kind: 'load-cap', num: s.num, text: `⏸ #${s.num} — load-cap (${loadCapReading(loadAdmission)})` });
     if (s.by === 'queue-cap') notes.push({ kind: 'queue-cap', num: s.num, text: `⏸ #${s.num} — queue-cap (${queueCapReading(s, queueBudget)})` });
@@ -2134,9 +2148,8 @@ async function main(argv) {
   if (lanePoolError) process.stderr.write(`⚠ free-lane read failed (${lanePoolError}) — 0 free lanes this tick\n`);
 
   // #3403 — DURABLE build-guard floor: the live `claude agents --json` listing, fed to `durableBuildNums` inside
-  // `planTick`. Incomplete discovery retains confirmed rows from readable stores. A total failure leaves
-  // the floor unset (`[]`); the in-session guard + its TTL still cover the common case, exactly as an unset
-  // `prRearmCounts` floor leaves the in-session `fixAttempts` tally as the sole guard.
+  // `planTick`. Unknown discovery retains positives and conflicts; unidentified gaps hold new builds.
+  // Total read failure must also hold existing guards and defer new builds until a complete read.
   let liveAgentSessions = [];
   try {
     const { defaultListAgents } = await import('../operations/dispatch-lane-io.mjs');
@@ -2155,7 +2168,10 @@ async function main(argv) {
         s && typeof s === 'object' ? { ...s, pidAlive: resolvePidAlive(s, { psOutput, isPidAlive: defaultIsPidAlive }) } : s
       ));
     }
-  } catch { /* leave the floor unset — the in-session TTL still guards */ }
+  } catch {
+    liveAgentSessions = { status: 'unknown', rows: Array.isArray(liveAgentSessions) ? liveAgentSessions : liveAgentSessions.rows,
+      conflicted: liveAgentSessions.conflicted ?? [], incomplete: true };
+  }
 
   // DURABLE retry-cap floor (#2643): for each OPEN `review:changes` PR, read its re-arm comments off the PR and
   // count them (`countRearmComments`). This is the restart-surviving source of truth for "how many times this PR

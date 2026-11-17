@@ -4368,3 +4368,17 @@ Lease overlap intentionally retains an ancestor fallback for disjoint file/glob
 pairs. Delivery classification refines `scopeEntriesOverlap` with the same module's
 `globsMayIntersect` automaton; otherwise `scripts/**/merge-queue-*` captures
 every scripts file. Keep both helpers shared; do not write another glob matcher.
+
+
+### Session discovery uncertainty and build guards
+
+The `claude-stores` aggregate keeps confirmed `rows` separate from `conflicted` candidates.
+Unknown evidence with `incomplete: false` accounts for all stores but contains conflicting
+identities; every candidate name still holds its build guard, even if a conflicting row
+claims `pidAlive: false`. Unknown evidence with `incomplete: true` (or missing completeness
+metadata) can hide unidentified sessions: retain persisted build guards and defer new builds
+for that tick. The operator note directs repair and retry; a healthy next tick restores
+normal dispatch. Keep this evidence through `SessionsUnknown` and the tick IO boundary.
+The table in `scripts/conveyor/__tests__/tick-core.test.mjs` covers ok, unreadable, ambiguous,
+and conflicting discovery, including the restarted `conveyor-77` case. Run it with the
+`claude-stores` and `claude-sessions-stores` test files through heavy admission.
