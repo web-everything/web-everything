@@ -4419,8 +4419,9 @@ The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true
 refs and descendant advances remain pending after adoption, and the next adopt-only tick
 must return `needs-build` with a different plan. `ready-candidate-adopted-partial` is an
 open-kind rebuild alert emitted after successful adoption only when pending refs exist.
-A removed ref is safe only when a still-wanted overlay in the candidate contains its tip;
-containment in the candidate alone cannot authorize a retraction. Preserve the independent
+A candidate containing a removed ref is refused as `overlay-no-longer-wanted`, even when
+another overlay contains its tip; `pr-merged`/`in-main` removals retain their existing wanted
+handling. Each wanted tip must equal or descend from the candidate's tip. Preserve the independent
 live-applied omission, build-provenance, smoke, forced-record and canonical-audit gates.
 Run this file and `daemon-rebuild-events.test.mjs` through heavy admission. This adoption
 rule does not reset overlay main-sync parking or add retries for parked overlays.

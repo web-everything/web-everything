@@ -23,8 +23,8 @@ import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
  *   - `candidate`: the same sha (`exact`); a different sha whose TREE is identical — overlay-list churn that does
  *     not change a single file (`same-tree`, adopts the current plan's commit); or an older build the plan has
  *     since moved past (`superseded`, adopts the verified build — still newer than HEAD; the newer plan is smoked
- *     on a later tick), but only while each carried tip is still wanted, or a still-wanted successor in the
- *     candidate contains it. Newly wanted overlays and descendant tips are rebuilt on the next tick.
+ *     on a later tick), but only while each carried tip is still wanted. A removed ref is refused even when
+ *     another overlay contains its tip. Newly wanted overlays and descendant tips are rebuilt on the next tick.
  *   - `fallback-main-moved`: a passed fallback whose failing inputs moved ONLY because main advanced — every
  *     suspect that is still registered is still at the sha that failed (`overlayTip`) — is adopted anyway and
  *     still drops the suspects, exactly as its own finalize would have.
@@ -102,12 +102,9 @@ export function matchReadyCandidate({
       ? { adopt: null, reason: 'fallback-inputs-moved' }
       : { adopt: ready.adopt, dropRefs, failed: ready.failed || '', match: 'fallback-main-moved' };
   }
-  // A replacement must itself still be wanted at its recorded tip. Merely containing a removed tip in the
-  // candidate is insufficient: every candidate necessarily contains its own overlays, including retractions.
-  const wanted = applied.filter((a) => a.sha && stillWanted(a.ref, a.sha));
-  const carriesOnlyWanted = applied.every((a) => wanted.includes(a) || (
-    a.sha && !registered(a.ref) && wanted.some((successor) => successor.ref !== a.ref && carries(a.sha, successor.sha))
-  ));
+  // Each recorded tip must itself remain wanted. Successor ancestry cannot authorize a removed ref:
+  // the successor's current descendant may have retracted content present in this candidate.
+  const carriesOnlyWanted = applied.every((a) => a.sha && stillWanted(a.ref, a.sha));
   if (plan.finalSha === ready.adopt.finalSha) {
     if (!carriesOnlyWanted) return { adopt: null, reason: 'overlay-no-longer-wanted' };
     const revokedExact = revokedAudit(ready.adopt);

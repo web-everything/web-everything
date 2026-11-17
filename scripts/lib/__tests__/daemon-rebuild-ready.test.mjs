@@ -449,7 +449,7 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
     expect(existsSync(join(cloneDir, 'old.txt'))).toBe(false);
   });
 
-  it('adopts a candidate containing a removed ref and its still-wanted successor, retaining live content', async () => {
+  it('discards a candidate containing a removed ref even when its successor contains that tip', async () => {
     const { originDir, cloneDir, env } = makeFixture();
     env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
     env.WE_DAEMON_OVERLAY_STACK_MODE = 'independent';
@@ -464,12 +464,18 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
     expect(ready.adopt.applied.map((a) => a.ref)).toEqual(['lane/m1', 'lane/m3']);
     endTick();
     removeOverlay(cloneDir, 'lane/m1', { env });
+    pushBranch(originDir, 'lane/m3', (dir) => rmSync(join(dir, 'first.txt')), { base: 'origin/lane/m3' });
     advanceMain(originDir, (dir) => writeFile(dir, 'main.txt', 'main\n'));
     const smoke = vi.fn(async () => PASS);
     const result = await rebuildClone({ root: cloneDir, env, runSmoke: smoke, lockOpts: LOCK_OPTS });
-    expect(result).toMatchObject({ adopted: true, reason: 'ready-adopted', head: ready.adopt.finalSha });
+    expect(result.adopted).toBe(true);
+    expect(result.reason).not.toBe('ready-adopted');
+    expect(result.alerts).toContainEqual(expect.objectContaining({
+      kind: 'ready-candidate-discarded', detail: expect.objectContaining({ reason: 'overlay-no-longer-wanted', target: ready.adopt.finalSha }),
+    }));
     expect(git(cloneDir, ['merge-base', '--is-ancestor', original, 'HEAD']).status).toBe(0);
-    expect(smoke).not.toHaveBeenCalled();
+    expect(smoke).toHaveBeenCalledTimes(1);
+    expect(existsSync(join(cloneDir, 'first.txt'))).toBe(false);
     expect(result.alerts.some((a) => a.kind === 'ready-candidate-adopted-partial')).toBe(false);
   });
 
@@ -741,7 +747,7 @@ describe('matchReadyCandidate — pure', () => {
     expect(matchReadyCandidate(args()).match).toBe('superseded');
     expect(matchReadyCandidate(args({ stillWanted: () => false })).reason).toBe('overlay-no-longer-wanted');
   });
-  it.each(['unwanted successor', 'registered retraction', 'unknown ancestry'])(
+  it.each(['wanted successor containing the removed tip', 'unwanted successor', 'registered retraction', 'unknown ancestry'])(
     'refuses a replacement with %s even if the candidate contains the old tip', (evidence) => {
       const ready = { ...base, adopt: { ...base.adopt, applied: [
         { ref: 'lane/a', sha: 'a1' }, { ref: 'lane/successor', sha: 's1' },
