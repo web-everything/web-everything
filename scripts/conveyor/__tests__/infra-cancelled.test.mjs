@@ -10,6 +10,16 @@ import { enrichPrsWithTimeoutEvidence, readTimeoutEvidence, defaultReadMainRuns 
 
 const cancelledJob = { name: 'daemon-soak', status: 'completed', conclusion: 'cancelled', runner_name: '', steps: [] };
 const realFail = { name: 'test-shard (1)', status: 'completed', conclusion: 'failure', runner_name: 'GitHub Actions 1', steps: [{}] };
+const incompleteCancellationSteps = [
+  ['missing', undefined], ['null', null], ['not an array', {}], ['empty', []],
+  ['null entry', [null, { conclusion: 'cancelled' }]],
+  ['primitive entry', ['success', { conclusion: 'cancelled' }]],
+  ['array entry', [[], { conclusion: 'cancelled' }]],
+  ['unknown entry', [{}, { conclusion: 'cancelled' }]],
+  ['started step without conclusion', [{ started_at: '2026-11-17T10:01:00Z' }, { conclusion: 'cancelled' }]],
+  ['started step with null conclusion', [{ started_at: '2026-11-17T10:01:00Z', conclusion: null }, { conclusion: 'cancelled' }]],
+  ['no cancelled step', [{ conclusion: 'success' }]],
+];
 
 describe('hung job (ran to its own timeout) is NOT an infra cancellation', () => {
   const ran = (mins, extra = {}) => ({ name: 'soak-shard (1)', status: 'completed', conclusion: 'cancelled', runner_name: 'GitHub Actions 7',
@@ -40,10 +50,11 @@ describe('hung job (ran to its own timeout) is NOT an infra cancellation', () =>
     expect(hasCleanCancellationSteps({ steps: [{ conclusion: 'cancelled' }, { conclusion: 'cancelled' }] })).toBe(false);
     expect(hasCleanCancellationSteps({ steps: [{ conclusion: 'cancelled' }, { conclusion: 'skipped', started_at: '2026-11-17T10:01:00Z' }] })).toBe(false);
   });
-  it('fails closed on unknown step evidence, retaining runner and duration requirements without a steps array', () => {
-    expect(hasCleanCancellationSteps({ steps: [{}] })).toBe(false);
-    expect(hasCleanCancellationSteps({ steps: [null] })).toBe(false);
-    expect(hasCleanCancellationSteps(ran(15, { steps: undefined }))).toBe(true);
+  it.each(incompleteCancellationSteps)('fails closed on %s steps for a hung job', (_label, steps) => {
+    expect(hasCleanCancellationSteps(ran(15, { steps }))).toBe(false);
+    expect(isInfraCancelledJob(ran(15, { steps }))).toBe(false);
+  });
+  it('retains runner and duration requirements without a steps array', () => {
     expect(isHungJob(ran(15, { steps: undefined }))).toBe(true);
     expect(isHungJob(ran(15, { steps: undefined, runner_name: '' }))).toBe(false);
     expect(isHungJob(ran(15, { steps: undefined, completed_at: null }))).toBe(false);
@@ -257,6 +268,7 @@ describe('infra-cancelled evidence + planning', () => {
         const job = JSON.parse(base(cmd, args));
         return JSON.stringify({ ...job, ...(timeoutKind === 'step-timeout' ? infraStepJob() : {
           name: 'integration', runner_name: 'runner', started_at: '2026-11-17T10:00:00Z', completed_at: '2026-11-17T10:10:00Z',
+          steps: [{ conclusion: 'cancelled' }],
         }) });
       }
       return base(cmd, args);
@@ -274,6 +286,24 @@ describe('infra-cancelled evidence + planning', () => {
       if (path.endsWith('/actions/jobs/1')) return JSON.stringify({ ...JSON.parse(base(cmd, args)),
         name, runner_name: 'runner', started_at: '2026-11-17T10:00:00Z', completed_at: '2026-11-17T10:15:00Z',
         steps: [{ name: 'Run assertions', conclusion: 'failure' }, { name: 'Cleanup', conclusion: 'cancelled' }],
+      });
+      if (path.endsWith('/actions/jobs/1/logs')) {
+        logs.push(path);
+        return 'FAIL scripts/x.test.mjs > assertion failure\n';
+      }
+      return base(cmd, args);
+    } });
+    expect(logs).toEqual([`repos/${repo}/actions/jobs/1/logs`]);
+    expect(e).toEqual({ eligible: false, reason: 'mixed-infra-cancelled-and-real-failure' });
+  });
+
+  it.each(incompleteCancellationSteps)('a hung job with %s steps reads logs and stays real, not retry-timeout', (_label, steps) => {
+    const base = mkExec();
+    const logs = [];
+    const e = readTimeoutEvidence(pr, { repo, exec: (cmd, args) => {
+      const path = args[1];
+      if (path.endsWith('/actions/jobs/1')) return JSON.stringify({ ...JSON.parse(base(cmd, args)),
+        name: 'integration', runner_name: 'runner', started_at: '2026-11-17T10:00:00Z', completed_at: '2026-11-17T10:15:00Z', steps,
       });
       if (path.endsWith('/actions/jobs/1/logs')) {
         logs.push(path);

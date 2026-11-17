@@ -42,9 +42,11 @@ export function isHungJob(job, { hungMinutes = resolveHungJobMinutes() } = {}) {
 
 /** A cancellation may cut only the last started step; earlier failures and unknown evidence stay real. */
 export function hasCleanCancellationSteps(job) {
-  if (!Array.isArray(job?.steps)) return true;
+  if (!Array.isArray(job?.steps) || !job.steps.length
+      || !Array.from(job.steps).every((step) => step && typeof step === 'object' && !Array.isArray(step))) return false;
   const lastStarted = job.steps.findLastIndex((step) => step?.started_at || step?.conclusion !== 'skipped');
-  return job.steps.every((step, index) => ['success', 'skipped', 'neutral'].includes(step?.conclusion)
+  return job.steps[lastStarted]?.conclusion === 'cancelled'
+    && job.steps.every((step, index) => ['success', 'skipped', 'neutral'].includes(step?.conclusion)
     || (step?.conclusion === 'cancelled' && index === lastStarted));
 }
 
@@ -79,10 +81,12 @@ export function isInfraCancelledJob(job, opts) {
   // A job that ran to its own timeout is a hang (a real failure with a log), not infra: it goes to ci-heal.
   if (isHungJob(job, opts)) return false;
   const conclusion = String(job.conclusion ?? '').toLowerCase();
+  const noRunner = !job.runner_name && !job.runner_id;
+  // An explicitly empty job that never got a runner remains an infrastructure cancellation.
+  if (conclusion === 'cancelled' && noRunner && Array.isArray(job.steps) && job.steps.length === 0) return true;
   if (conclusion === 'cancelled' && !hasCleanCancellationSteps(job)) return false;
   if (INFRA_CONCLUSIONS.includes(conclusion)) return true;
   if (['success', 'skipped', 'neutral'].includes(conclusion)) return false;
-  const noRunner = !job.runner_name && !job.runner_id;
   return noRunner && Array.isArray(job.steps) && job.steps.length === 0;
 }
 
