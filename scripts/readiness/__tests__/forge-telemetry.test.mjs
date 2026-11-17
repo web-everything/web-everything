@@ -1,6 +1,6 @@
 // @vitest-environment node
 import {describe, it, expect} from 'vitest';
-import {parseTelemetry, stableActiveRunIds} from '../forge-exec-run.mjs';
+import {parseTelemetry, formatTelemetry, stableActiveRunIds} from '../forge-exec-run.mjs';
 
 const A = 'r-' + 'a'.repeat(32), B = 'r-' + 'b'.repeat(32);
 const base = {sampledAtET: '2026-11-03T15:00:00.000-05:00', cores: 4, loadPerCore: 0.5, memFreePct: 50, recent: []};
@@ -60,5 +60,30 @@ describe('R518 stable active-run listing (audit: one listing can miss a prepared
     const r = await stableActiveRunIds(async () => [A + '.running', ...(n++ % 2 ? [B + '.running'] : [])], 4);
     expect(r.stable).toBe(false);
     expect(r.count).toBe(2);
+  });
+});
+
+const deploy = {forgeSetSha:'a'.repeat(40),setDigest:'b'.repeat(64),hostTier:1};
+describe('S0 deploy telemetry schema', () => {
+  it.each([undefined,{draining:false},{draining:true},deploy,{...deploy,draining:true},
+    {...deploy,forgeSetSha:null,setDigest:null},{...deploy,forgeSetSha:'A'.repeat(40),setDigest:'B'.repeat(64)},
+    {...deploy,hostTier:Number.MAX_SAFE_INTEGER}])('accepts old and new deploy blocks: %j', block => {
+    const value = {...base,activeRuns:0,...(block === undefined ? {} : {deploy:block})};
+    expect(parseTelemetry(JSON.stringify(value))).toEqual(value);
+  });
+  it.each([null,[],{},true,{draining:1},{...deploy,draining:null},{...deploy,extra:1},
+    {forgeSetSha:deploy.forgeSetSha}, {...deploy,forgeSetSha:42},{...deploy,forgeSetSha:'a'.repeat(39)},
+    {...deploy,forgeSetSha:'g'.repeat(40)},{...deploy,setDigest:false},{...deploy,setDigest:'b'.repeat(63)},
+    {...deploy,setDigest:'g'.repeat(64)},{...deploy,hostTier:0},{...deploy,hostTier:-1},
+    {...deploy,hostTier:1.5},{...deploy,hostTier:'1'},{...deploy,hostTier:Number.MAX_SAFE_INTEGER+1}])
+  ('rejects malformed or unknown deploy fields: %j', block => {
+    expect(() => parseTelemetry(JSON.stringify({...base,activeRuns:0,deploy:block}))).toThrow('Invalid telemetry schema');
+  });
+  it('prints exactly one short deploy line only for a non-null SHA', () => {
+    const value = {...base,activeRuns:0};
+    const legacy = formatTelemetry(value);
+    expect(formatTelemetry({...value,deploy:{draining:true}})).toBe(legacy);
+    expect(formatTelemetry({...value,deploy:{...deploy,forgeSetSha:null}})).toBe(legacy);
+    expect(formatTelemetry({...value,deploy})).toBe(legacy+'\ndeploy '+deploy.forgeSetSha);
   });
 });

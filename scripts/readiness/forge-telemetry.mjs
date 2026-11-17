@@ -23,7 +23,7 @@ export async function readForgeTelemetry({host='forge',exec=execFile}={}) {
     // The command/argv stays legacy-compatible. Old runners ignore the stdin envelope.
     if (child?.stdin) {
       child.stdin.on('error',()=>{}); // an old runner may close stdin before reading it
-      child.stdin.end(JSON.stringify({capabilities:{limits:1}}));
+      child.stdin.end(JSON.stringify({capabilities:{limits:1,deploy:1}}));
     }
   });
   return parseTelemetry(output);

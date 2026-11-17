@@ -221,7 +221,8 @@ try:
             if nested:
                 return "(await (async () => {\n" + code + "\nreturn {" + ",".join(dict.fromkeys(names)) + "};\n})())"
             return "#!/usr/bin/env node\n" + code
-        for filename in ["forge-exec-run.mjs", "forge-warm-base.mjs", "forge-exec-limits.mjs", "forge-cache-prune.mjs", "forge-exec-sweep.mjs"]:
+        installed = ["forge-exec-run.mjs", "forge-warm-base.mjs", "forge-exec-limits.mjs", "forge-cache-prune.mjs", "forge-exec-sweep.mjs"]
+        for filename in installed:
             name = ".forge-exec-run-" + secrets.token_hex(16)
             fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700, dir_fd=dest)
             try:
@@ -234,6 +235,67 @@ try:
             finally:
                 os.close(fd)
             os.rename(name, filename, src_dir_fd=dest, dst_dir_fd=dest)
+        # S0: record the source graph and actual installed bytes, without automation.
+        import hashlib, subprocess
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        set_sha = None
+        try:
+            checkout = os.path.abspath(os.path.join(source_dir, "../.."))
+            result = subprocess.run(["git", "-C", checkout, "log", "-1", "--format=%H", "HEAD", "--"] +
+                                    ["scripts/readiness/" + name for name in sorted(allowed)],
+                                    check=True, capture_output=True, text=True, timeout=10)
+            candidate = result.stdout.strip()
+            if not re.fullmatch(r"[a-f0-9]{40}", candidate):
+                raise ValueError("invalid set sha")
+            set_sha = candidate
+        except (OSError, subprocess.SubprocessError, ValueError):
+            print("forge-setup: installed set git SHA unavailable; recording null", file=sys.stderr)
+        digest = hashlib.sha256()
+        for filename in sorted(installed):
+            fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dest)
+            with os.fdopen(fd, "rb") as stream:
+                file_hash = hashlib.sha256(stream.read()).hexdigest()
+            digest.update((filename + "\0" + file_hash + "\n").encode())
+        state = {"schema": 1, "forgeSetSha": set_sha, "setDigest": digest.hexdigest(), "hostTier": 1,
+                 "installedAtET": datetime.now(ZoneInfo("America/New_York")).isoformat(timespec="milliseconds")}
+        state_parent = os.open("/var/lib", flags)
+        try:
+            st = os.fstat(state_parent)
+            if st.st_uid != 0 or st.st_mode & 0o022:
+                raise RuntimeError("untrusted /var/lib")
+            try:
+                os.mkdir("forge-deploy", 0o755, dir_fd=state_parent)
+            except FileExistsError:
+                pass
+            state_dir = os.open("forge-deploy", flags, dir_fd=state_parent)
+            try:
+                st = os.fstat(state_dir)
+                if st.st_uid != 0 or st.st_mode & 0o022:
+                    raise RuntimeError("untrusted forge-deploy directory")
+                os.fchown(state_dir, 0, 0)
+                os.fchmod(state_dir, 0o755)
+                pending = ".state-" + secrets.token_hex(16)
+                try:
+                    fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=state_dir)
+                    with os.fdopen(fd, "w") as stream:
+                        json.dump(state, stream)
+                        stream.write("\n")
+                        stream.flush()
+                        os.fchown(stream.fileno(), 0, 0)
+                        os.fchmod(stream.fileno(), 0o644)
+                        os.fsync(stream.fileno())
+                    os.rename(pending, "state.json", src_dir_fd=state_dir, dst_dir_fd=state_dir)
+                    os.fsync(state_dir)
+                finally:
+                    try:
+                        os.unlink(pending, dir_fd=state_dir)
+                    except FileNotFoundError:
+                        pass
+            finally:
+                os.close(state_dir)
+        finally:
+            os.close(state_parent)
     finally:
         os.close(dest)
 finally:
