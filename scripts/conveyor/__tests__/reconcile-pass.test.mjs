@@ -1464,7 +1464,7 @@ describe('main-fixed signature facts reader', () => {
         emitterFiles: ['scripts/check-standards.mjs'], fixCommits: ['aaaaaaa', 'e5c22481e'] }],
       fixCommits: ['aaaaaaa', 'e5c22481e'], bugIntroducedAt: '2026-10-04T23:00:00Z', fixedAt: '2026-10-05T01:44:46Z',
     });
-    expect(exec).toHaveBeenCalledWith('gh', ['api', '--allow-escape-sequences', 'repos/web-everything/web-everything/actions/jobs/42/logs'],
+    expect(exec).toHaveBeenCalledWith('gh', ['api', 'repos/web-everything/web-everything/actions/jobs/42/logs'],
       expect.objectContaining({ maxBuffer: 64 * 1024 * 1024, timeout: expect.any(Number) }));
     expect(exec).toHaveBeenCalledWith('git', ['-C', '/checkout', 'grep', '-l', '-F', '-e',
       'cites a card by its hash-named FILE PATH', 'origin/main', '--', '.',

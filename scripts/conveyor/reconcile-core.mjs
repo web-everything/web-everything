@@ -3531,8 +3531,7 @@ export function planReconcile({
         });
       } else {
         dispatch.push({
-          ...base, ...withPhase, ...refund, ...healFacts, ...owedMainRuleFact, kind: 'ci-heal',
-          attempts: ciHealAttempts,
+          ...base, ...withPhase, ...refund, ...healFacts, ...owedMainRuleFact, kind: 'ci-heal', attempts: ciHealAttempts,
           ...(timeoutRetryFallback ? { timeoutRetryFallback: pr.timeoutRetry.reason } : {}),
           ...(partialFailureInventory ? { partialFailureInventory: true } : {}),
           ...(fixTiming.joinCiAndReview && readiness.reviewFindings ? { reviewFixAttempts: roundAttempts() } : {}),

@@ -890,7 +890,7 @@ export function defaultReadMainFixedSignatureFacts({
     root ??= resolveLanePoolRepoPath(repo) ?? REPO_ROOT;
     const options = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
       maxBuffer: 64 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' };
-    const log = exec('gh', ciJobLogApiArgs(`repos/${repo}/actions/jobs/${jobId}/logs`), options);
+    const log = exec('gh', ['api', `repos/${repo}/actions/jobs/${jobId}/logs`], options);
     const messages = extractCiErrorSignatures(log);
     if (!messages.length) return { signatures: [] };
     const git = (args) => exec('git', ['-C', root, ...args], options).trim();

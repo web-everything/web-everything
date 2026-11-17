@@ -633,7 +633,7 @@ export function buildOwnerBrief({ state, failing = {}, weRoot, repoSlug, setting
     '',
     'Steps:',
     `1. Take a lane: \`node "${weRoot}/scripts/lane-pool.mjs" acquire --purpose=main-fix-${sha9} --adopt\`. Work only in the lane path it prints.`,
-    `2. Find the cause in the merged range ${range} (\`git log --oneline ${lastGreenSha ? range : sha9}\`) and the failing job logs (use \`readCiJobLog\` from \`scripts/lib/gh-ci-log.mjs\` with repo + jobId from run ${Number.isInteger(runId) ? runId : 0}, job metadata including steps, and failedOnly: true).`,
+    `2. Find the cause in the merged range ${range} (\`git log --oneline ${lastGreenSha ? range : sha9}\`) and the failing job logs (use \`readCiJobLog\` from \`scripts/lib/gh-ci-log.mjs\` with repo + jobId from run ${Number.isInteger(runId) ? runId : 0}; the whole job log includes passing steps, filtered: false).`,
     '3. Main can have SEVERAL red causes on one commit (2026-10-08: a soak scenario AND a ledger-id test). You own them all, in ONE PR: fix every failing job listed above. If an open PR already fixes one cause, build ON its branch (`git merge origin/<its branch>` into yours) so your PR carries every fix, and name it in your PR body. Two PRs that each fix one cause DEADLOCK: each one\'s CI fails on the other\'s cause.',
     '4. Write or keep a failing test, then fix the ROOT CAUSE. Never delete, skip or loosen a test or a merge-gate guard to get green.',
     ...(policy.pushBeforeGate ? [

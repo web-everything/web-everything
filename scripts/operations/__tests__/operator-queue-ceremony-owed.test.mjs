@@ -92,8 +92,8 @@ describe('operator queue ceremony output', () => {
     const output = run();
     expect(output).toContain('NEEDS YOU (review:human + advisory:accepted, all gates pass; or a clear-human owed at the live head):');
     expect(output).toContain(`${REPO}#5193  Update CI — ${evaluate().reason}\n    clear-human: node scripts/review-set-label.mjs 5193 --repo=${REPO} --to=clear-human --actor=<your login> --reason='<your words>'`);
-    expect(execFileSync.mock.calls.map(([cmd, args]) => [cmd, args[0] === 'api' ? args : args.slice(0, 2)])).toEqual([
-      ['gh', ['pr', 'list']], ['gh', ['api', `repos/${REPO}/actions/jobs/456`]], ['gh', ['api', '--allow-escape-sequences', `repos/${REPO}/actions/jobs/456/logs`]],
+    expect(execFileSync.mock.calls.map(([cmd, args]) => [cmd, args.slice(0, 2)])).toEqual([
+      ['gh', ['pr', 'list']], ['gh', ['api', `repos/${REPO}/actions/jobs/456`]], ['gh', ['api', `repos/${REPO}/actions/jobs/456/logs`]],
     ]);
   });
   it('adds the ceremony fields to JSON ready without adding a NOT READY row', () => {

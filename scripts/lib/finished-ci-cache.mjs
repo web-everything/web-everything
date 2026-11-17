@@ -61,15 +61,13 @@ export function finishedCiAuthScope(env = process.env) {
 }
 export function classifyFinishedCiRead(args) {
   if (!Array.isArray(args) || args[0] !== 'api' || typeof args[1] !== 'string') return null;
-  const originalArgs = args;
-  if (args[1] === '--allow-escape-sequences') args = [args[0], ...args.slice(2)];
   const m = /^\/?repos\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/(?:actions\/jobs\/(\d+)\/logs|actions\/runs\/(\d+)\/jobs(?:\?[^\s]*)?|commits\/([a-fA-F0-9]{40})\/check-runs(?:\?[^\s]*)?)$/.exec(args[1]);
   if (!m) return null;
   const kind = m[2] ? 'job-log' : m[3] ? 'run-jobs' : 'check-runs';
   const jq = kind === 'run-jobs' ? '.jobs' : kind === 'check-runs' ? '.check_runs' : null;
   if (args.length !== 2 && !(jq && ((args.length === 4 && args[2] === '--jq' && args[3] === jq)
     || (args.length === 3 && args[2] === `--jq=${jq}`)))) return null;
-  return { kind, repo: m[1], id: m[2] || m[3] || m[4], key: JSON.stringify(originalArgs) };
+  return { kind, repo: m[1], id: m[2] || m[3] || m[4], key: JSON.stringify(args) };
 }
 export function finishedCiStorable(cls, stdoutText, { runCompleted = false } = {}) {
   try {

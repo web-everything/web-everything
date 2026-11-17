@@ -1,4 +1,3 @@
-import { ciJobLogApiArgs } from './gh-ci-log.mjs';
 /** Refresh drain-numbered cards when main gains their CI rule, and root scratch-only conflicts.
  * Log verdicts and successful refreshes are durable, head-scoped facts; read failures never become facts.
  */
@@ -127,7 +126,7 @@ export function readOwedMainRule(pr, { slug, exec = execFileSyncThrottled, cache
     const cached = readState(cache).verdicts?.[key];
     if (cached) return cached;
     const options = { encoding: 'utf8', stdio: 'pipe', timeout: 60_000, maxBuffer: 64 * 1024 * 1024 };
-    const logText = String(exec('gh', ciJobLogApiArgs(`repos/${slug}/actions/jobs/${job}/logs`), options));
+    const logText = String(exec('gh', ['api', `repos/${slug}/actions/jobs/${job}/logs`], options));
     const parsed = parseHandPickedOnlyFailure(logText);
     // Project each commit to its subject in jq: a commit BODY must never masquerade as a drain commit.
     const commits = parsed.only ? String(exec('gh', ['api', `repos/${slug}/pulls/${pr.number}/commits`, '--paginate', '--jq', '.[] | {subject: (.commit.message | split("\\n")[0]), author: .commit.author} | @json'], options)).split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line)) : [];

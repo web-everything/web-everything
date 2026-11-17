@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import { ciJobLogApiArgs } from './lib/gh-ci-log.mjs';
 /**
  * @file scripts/review-hold-probe.mjs
  * @description READ-ONLY probe (review-hold-model S1): prints `deriveReviewHold` next to today's
@@ -39,7 +38,7 @@ export function probe({ repo, pr, read = { gh, ghJson, freeze: readSharedFreeze 
   const mgRun = latest(runs, 'merge-gate');
   const rgRun = latest(runs, 'review-gate');
   const jobOf = (run) => (run ? read.ghJson(['api', `repos/${repo}/actions/jobs/${run.id}`]) : null);
-  const logOf = (run) => (run ? String(read.gh(ciJobLogApiArgs(`repos/${repo}/actions/jobs/${run.id}/logs`))) : '');
+  const logOf = (run) => (run ? String(read.gh(['api', `repos/${repo}/actions/jobs/${run.id}/logs`])) : '');
   const mergeGate = mgRun ? { state: mgRun.status === 'completed' ? 'completed' : 'pending', conclusion: mgRun.conclusion,
     ...ids(mgRun), jobHeadSha: mgRun.head_sha, latest: true, completedAt: mgRun.completed_at,
     logText: gateState(mgRun) === 'failure' ? logOf(mgRun) : '' } : null;

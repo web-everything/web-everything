@@ -23,7 +23,7 @@ function host(t = '2026-10-14T06:26:00Z', overrides = {}) {
       return JSON.stringify((overrides.groupRuns ?? episode.mergeGroupRuns).filter((r) => Date.parse(r.createdAt) <= Date.parse(t))
         .map((r) => Date.parse(r.updatedAt) > Date.parse(t) ? { ...r, status: 'in_progress', conclusion: null } : r));
     }
-    const path = args[0] === 'api' && args[1] === '--allow-escape-sequences' ? args[2] : args[1];
+    const path = args[1];
     const jobs = /\/runs\/(\d+)\/jobs/.exec(path);
     if (jobs) {
       if (overrides.jobsError && Number(jobs[1]) !== 38517676708) throw new Error('unreadable jobs');

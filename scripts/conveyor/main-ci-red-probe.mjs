@@ -1,4 +1,3 @@
-import { ciJobLogApiArgs } from '../lib/gh-ci-log.mjs';
 /**
  * @file scripts/conveyor/main-ci-red-probe.mjs
  * @description Read-only main CI evidence, shared by the operator queue and main-red owner.
@@ -33,7 +32,7 @@ function ghJson(exec, argv) {
 
 /** Read raw Actions log text, refusing a deferred GitHub read. */
 export function readJobLog(jobId, { exec = execFileSyncThrottled, repoSlug = DEFAULT_REPO_SLUG } = {}) {
-  const out = exec('gh', ciJobLogApiArgs(`repos/${repoSlug}/actions/jobs/${jobId}/logs`), {
+  const out = exec('gh', ['api', `repos/${repoSlug}/actions/jobs/${jobId}/logs`], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024,
     timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
   });

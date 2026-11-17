@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import { ciJobLogApiArgs } from '../lib/gh-ci-log.mjs';
 /**
  * @file scripts/conveyor/ci-red-recovery-watch.mjs
  * @description we:backlog/x5uqim1-*.md (parent #4075, epic #3383) — THE ACTUAL RECOVERY ACTION.
@@ -455,7 +454,7 @@ export function defaultReadMainFailureSignature({ repo, detailsUrl, failingCheck
     if (!Array.isArray(jobs)) throw new Error('unreadable jobs');
     const found = new Set();
     for (const job of jobs.filter(j => ['failure', 'timed_out'].includes(j.conclusion)).slice(0, 6)) {
-      for (const signature of extractInfraSignatures(exec('gh', ciJobLogApiArgs(`repos/${repoSlug(repo)}/actions/jobs/${job.id}/logs`), options))) found.add(signature);
+      for (const signature of extractInfraSignatures(exec('gh', ['api', `repos/${repoSlug(repo)}/actions/jobs/${job.id}/logs`], options))) found.add(signature);
     }
     return [...found];
   };

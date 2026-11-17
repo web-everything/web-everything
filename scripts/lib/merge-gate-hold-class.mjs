@@ -1,4 +1,3 @@
-import { ciJobLogApiArgs } from './gh-ci-log.mjs';
 /**
  * Candidacy HOLDs are review work, not CI repair work. Only head-bound job evidence may
  * excuse a failed merge-gate for a non-candidate; every unreadable fact stays red.
@@ -158,7 +157,7 @@ export function readMergeGateVerdict({ repo, jobId, prNumber, runGh = runGhSync,
       const options = { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024,
         stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'merge-gate-verdict', repo } };
       const job = JSON.parse(runGh(['api', path], options));
-      const log = String(runGh(ciJobLogApiArgs(`${path}/logs`), options));
+      const log = String(runGh(['api', `${path}/logs`], options));
       cache.set(key, { job, log });
     }
     const { job, log } = cache.get(key);

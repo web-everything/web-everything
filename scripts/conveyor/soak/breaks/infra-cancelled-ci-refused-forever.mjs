@@ -26,7 +26,7 @@ export default {
       if (/\/status$/.test(path)) return json({ total_count: 0 });
       if (/actions\/jobs\/1$/.test(path)) return json({ id: 1, run_id: 100, head_sha: head, run_attempt: 1, name: 'test', status: 'completed', conclusion: 'cancelled', runner_name: '', steps: [] });
       if (/actions\/runs\/100$/.test(path)) return json({ id: 100, head_sha: head, run_attempt: 1, path: '.github/workflows/ci.yml', repository: { full_name: repo } });
-      if (/\/logs$/.test(path)) throw new Error('Job log read failed\ngh: HTTP 404');
+      if (/\/logs$/.test(path)) throw new Error('Command failed: gh api .../logs\ngh: HTTP 404');
       throw new Error(`unexpected ${path}`);
     };
     const pr = { number: 5, state: 'OPEN', headRefOid: head, headRefName: 'lane/x', isDraft: false, labels: [{ name: 'review:pending' }], comments: [],

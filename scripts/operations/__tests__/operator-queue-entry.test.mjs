@@ -23,7 +23,6 @@ const stage = (root) => {
   mkdirSync(join(root, 'lib'), { recursive: true });
   copyFileSync(SOURCE, join(root, 'operations', 'operator-queue.mjs'));
   copyFileSync(LEAF, join(root, 'lib', 'advisory-labels.mjs'));
-  copyFileSync(join(dirname(LEAF), 'gh-ci-log.mjs'), join(root, 'lib', 'gh-ci-log.mjs'));
   copyFileSync(join(dirname(LEAF), 'constellation-repos.mjs'), join(root, 'lib', 'constellation-repos.mjs'));
   mkdirSync(join(root, 'conveyor'));
   copyFileSync(join(dirname(LEAF), '../conveyor/unsupported-repo.mjs'), join(root, 'conveyor/unsupported-repo.mjs'));

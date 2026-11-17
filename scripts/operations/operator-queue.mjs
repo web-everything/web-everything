@@ -1,4 +1,3 @@
-import { ciJobLogApiArgs } from '../lib/gh-ci-log.mjs';
 import { execFileSyncThrottled as execFileSync } from '../lib/gh-throttle.mjs';
 /**
  * @file Read-only operator queue: the SOLE authority on which human-gated PRs are worth the operator's time.
@@ -311,7 +310,7 @@ export function readMergeGateVerdict({ repo, check, number, exec = execFileSync 
     const options = { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024 };
     const job = JSON.parse(exec('gh', ['api', endpoint], options));
     if (typeof job?.head_sha !== 'string' || !job.head_sha) return { error: 'job has no head_sha' };
-    const log = exec('gh', ciJobLogApiArgs(`${endpoint}/logs`), options);
+    const log = exec('gh', ['api', `${endpoint}/logs`], options);
     const parsed = parsePrResultTable(log, number);
     return parsed.error ? parsed : { headSha: job.head_sha, ...parsed };
   } catch (error) {
