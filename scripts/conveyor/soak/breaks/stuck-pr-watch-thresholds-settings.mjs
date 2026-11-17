@@ -1,20 +1,25 @@
 /** S5: moving stage thresholds into settings preserves every shipped default and stall boundary. */
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DEFAULT_STUCK_THRESHOLD_MINUTES, stuckThresholdMinutes, evaluateStuckPr } from '../../stuck-pr-watch-core.mjs';
-import { readSettings } from '../../../lib/settings-files.mjs';
+import { readDeclaredSettings } from '../../../lib/settings-files.mjs';
 
 const ROOT = fileURLToPath(new URL('../../../../', import.meta.url));
 const SETTINGS = 'scripts/settings/stuck-pr-watch.json';
+const CORE = 'scripts/conveyor/stuck-pr-watch-core.mjs';
 
 export default {
   id: 'stuck-pr-watch-thresholds-settings',
   title: 'settings preserve the four stuck PR defaults and stage stall boundaries',
   card: 'S5 (settings-ization, defaults unchanged)',
   fixedBy: { sha: 'working-tree', where: 'S5', paths: [SETTINGS, 'scripts/conveyor/stuck-pr-watch-core.mjs'] },
-  fixPresent: root => existsSync(join(root, SETTINGS)),
+  // A deleted settings file is a regression of the installed reader, not an absent fix.
+  fixPresent(root) {
+    try { return readFileSync(join(root, CORE), 'utf8').includes('readDeclaredSettings'); }
+    catch { return false; }
+  },
   async run({ root = ROOT, log } = {}) {
     const violations = [], observations = [];
     try {
@@ -23,8 +28,11 @@ export default {
       assert.ok(Object.isFrozen(DEFAULT_STUCK_THRESHOLD_MINUTES));
       assert.deepEqual(JSON.parse(readFileSync(join(root, SETTINGS), 'utf8')).stuckPrWatch.thresholdMinutes, literal);
       const shipped = stuckThresholdMinutes({}, {
-        readSettings: () => readSettings({ dir: join(root, 'scripts/settings'), legacyPath: null }),
+        readSettings: () => readDeclaredSettings({ dir: join(root, 'scripts/settings'), legacyPath: null }),
       });
+      assert.equal(stuckThresholdMinutes({}, {
+        readSettings: () => ({ stuckPrWatch: { thresholdMinutes: { review: 99 } } }),
+      }).review, 99, 'core consumes configured thresholds');
       const missing = stuckThresholdMinutes({}, { readSettings: () => ({}) });
       assert.deepEqual(shipped, literal);
       assert.deepEqual(missing, literal);
