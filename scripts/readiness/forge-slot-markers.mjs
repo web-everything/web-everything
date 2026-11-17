@@ -187,8 +187,9 @@ function ownerGone(root, index, file, liveness, selfPid) {
  * DEATH_SAMPLE_MARGIN_MS after the owner was first seen dead (the stamp persists in a sidecar, so a later client completes
  * what an earlier one began), and Forge's readable telemetry shows ITS run finished or absent. A run still listed without
  * a result keeps the marker; an absent run is unknown whenever Forge reports active runs. A marker whose run id
- * was never recorded (the client died before prepare returned) is kept while Forge reports any active runs or any
- * run started inside its own possible window ([at - skew, first-seen-dead + skew]) is still unfinished.
+ * was never recorded (the client died before prepare returned) needs either zero active runs, or a sample past the
+ * run ceiling plus skew with a receipt placing EVERY active run outside its possible ownership window
+ * ([at - skew, first-seen-dead + skew]). An unfinished receipt inside that window still keeps the marker.
  * Unreadable or malformed telemetry reaps nothing. A bare legacy text marker has no host or run binding: retain it
  * until an operator confirms remote cleanup and removes it. Local owner death alone cannot settle remote work.
  */
@@ -326,7 +327,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
               }
             } else {
               const at = entry.at ?? entry.mtimeMs;
-              if (!evidence.complete && (!boundedOrphan(evidence, sampledAt, diedBy) || maybeSurvivingDescendants(telemetry, at, diedBy))) continue;
+              if (!evidence.complete && (!boundedOrphan(telemetry, evidence, sampledAt, at, diedBy) || maybeSurvivingDescendants(telemetry, at, diedBy))) continue;
               if (maybeOwnsInflight(telemetry, at, diedBy)) continue;
             }
             // Claim whatever is at the marker name with one atomic rename, THEN prove it is the file we judged. A replacement
@@ -349,12 +350,18 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
 
 // A run-less marker's owner died before it learned its run id. On a busy Forge the active-run count is never zero for long,
 // so count-only proof leaked the marker for good (a dozen of them walled off the cap while Forge sat idle). Any run that
-// owner could have started began before it died, and no admitted run outlives the admission run ceiling, so once the
-// sample is a full ceiling (plus skew) past the first-seen-dead stamp, the active runs cannot be it. Needs Forge's
-// authoritative activeRunIds (byIds); `maybeOwnsInflight` still guards any unfinished receipt inside the window.
+// owner could have started began before it died, but a 97/254 supervisor failure can leave descendants past the run
+// ceiling. Its receipt may already have fallen out of `recent`, even before this reaper first observes the marker.
+// Past the ceiling plus skew, release only if receipts place EVERY authoritative active run outside the ownership
+// window. Missing receipts fail closed; no remembered failure state or sidecar is needed across reaper restarts.
 export const ORPHAN_RUN_BOUND_MS = 120 * 60_000; // = heavy-admission DEFAULT_ADMISSION_CEILING_MS
-function boundedOrphan(evidence, sampledAt, diedBy) {
-  return evidence.byIds === true && sampledAt - diedBy > ORPHAN_RUN_BOUND_MS + CLOCK_SKEW_MS;
+function boundedOrphan(telemetry, evidence, sampledAt, at, diedBy) {
+  if (evidence.byIds !== true || sampledAt - diedBy <= ORPHAN_RUN_BOUND_MS + CLOCK_SKEW_MS) return false;
+  const starts = new Map(telemetry.recent.map(item => [item.runId, Date.parse(item.startedAtET)]));
+  return telemetry.activeRunIds.every(run => {
+    const started = starts.get(run);
+    return Number.isFinite(started) && (started < at - CLOCK_SKEW_MS || started > diedBy + CLOCK_SKEW_MS);
+  });
 }
 
 // A run-less marker's run could only have started between dispatch and owner death; Forge timestamps can skew either way.

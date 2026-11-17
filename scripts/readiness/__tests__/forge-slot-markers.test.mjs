@@ -554,6 +554,7 @@ describe('stale remote slot markers (perf10)', () => {
 // Forge (activeRuns > 0) never proved a run-less marker idle, so only a zero-active sample could release it.
 describe('bounded orphan release of run-less markers', () => {
   const BOUND = 120 * 60_000, SKEW = 60_000;
+  const unrelated = going(RUN_B, NOW + SKEW + 1);
   const withIds = (sampledMs, ids, recent = []) => async () => ({sampledAtET: iso(sampledMs), activeRuns: ids.length, activeRunIds: ids, recent});
   const make = () => {
     const root = setup({0: {pid: 111}});
@@ -561,12 +562,12 @@ describe('bounded orphan release of run-less markers', () => {
   };
   it('releases a dead-owner run-less marker on a busy Forge once any run it could own is older than the run ceiling', async () => {
     const {root, reaper} = make();
-    expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1_000, [RUN_B]))).toEqual(['slot-0.unconfirmed']);
+    expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1_000, [RUN_B], [unrelated]))).toEqual(['slot-0.unconfirmed']);
     expect(names(root)).toEqual([]);
   });
   it('keeps it when the sample is not yet past the run ceiling plus skew after the owner was first seen dead', async () => {
     const {root, reaper} = make();
-    expect(await reaper.step(withIds(NOW + BOUND + SKEW - 1_000, [RUN_B]))).toEqual([]);
+    expect(await reaper.step(withIds(NOW + BOUND + SKEW - 1_000, [RUN_B], [unrelated]))).toEqual([]);
     expect(names(root)).toEqual(['0']);
   });
   it('keeps it when Forge does not list its active run ids (count-only telemetry)', async () => {
@@ -581,19 +582,37 @@ describe('bounded orphan release of run-less markers', () => {
   });
   it.each([97, 254])('keeps it when a code-%s receipt (surviving descendants possible) started inside its window', async code => {
     const {root, reaper} = make();
-    expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1_000, [RUN_B], [done(RUN_A, code)].map(r => ({...r, startedAtET: iso(NOW - 1_000)}))))).toEqual([]);
+    const failure = {...done(RUN_A, code), startedAtET: iso(NOW - 1_000)};
+    expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1_000, [RUN_B], [unrelated, failure]))).toEqual([]);
     expect(names(root)).toEqual(['0']);
   });
+  it.each([97, 254].flatMap(code => ['same reaper', 'restarted reaper', 'first observed after eviction'].map(observation => ({code, observation}))))(
+    'retains an active slot after its supervisor-failure receipt is evicted: %j', async ({code, observation}) => {
+      const {root, reaper} = make();
+      const failure = {...done(RUN_A, code), startedAtET: iso(NOW - 1_000)};
+      if (observation !== 'first observed after eviction') {
+        expect(await reaper.step(withIds(NOW + 120_000, [RUN_A], [failure]))).toEqual([]);
+      }
+      const current = observation === 'restarted reaper'
+        ? createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])}) : reaper;
+      const newer = Array.from({length: 50}, (_, i) => ({
+        ...done('r-' + i.toString(16).padStart(32, '0')), startedAtET: iso(NOW + SKEW + 1 + i),
+      }));
+      expect(await current.step(withIds(NOW + BOUND + SKEW + 1, [RUN_A], newer))).toEqual([]);
+      expect([...blockedSlots(root, 1)]).toEqual([0]);
+      // An authoritative idle sample can still settle the run-less marker.
+      expect(await current.step(withIds(NOW + BOUND + SKEW + 2, [], newer))).toEqual(['slot-0.unconfirmed']);
+    });
   it('never applies to a live owner', async () => {
     const root = setup({0: {pid: 111}});
     const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([])});
-    expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1_000, [RUN_B]))).toEqual([]);
+    expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1_000, [RUN_B], [unrelated]))).toEqual([]);
     expect(names(root)).toEqual(['0']);
   });
   it.each([-1, 0, 1])('requires the sample strictly past the ceiling plus skew (offset %s ms)', async offset => {
     const {root, reaper} = make();
     const released = offset > 0;
-    expect(await reaper.step(withIds(NOW + BOUND + SKEW + offset, [RUN_B]))).toEqual(released ? ['slot-0.unconfirmed'] : []);
+    expect(await reaper.step(withIds(NOW + BOUND + SKEW + offset, [RUN_B], [unrelated]))).toEqual(released ? ['slot-0.unconfirmed'] : []);
     expect(names(root)).toEqual(released ? [] : ['0']);
   });
   it.each([null, [], [RUN_B, RUN_B], ['invalid']])('keeps the marker with invalid authoritative active ids: %j', async activeRunIds => {
@@ -605,10 +624,33 @@ describe('bounded orphan release of run-less markers', () => {
     'guards the inclusive receipt window even when the receipt is absent from active ids: %j', async ({code, startedMs}) => {
       const {root, reaper} = make();
       const keep = startedMs >= NOW - 660_000 && startedMs <= NOW + SKEW;
-      const recent = [{runId: RUN_A, code, startedAtET: iso(startedMs)}];
+      const recent = [unrelated, {runId: RUN_A, code, startedAtET: iso(startedMs)}];
       expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1, [RUN_B], recent))).toEqual(keep ? [] : ['slot-0.unconfirmed']);
       expect(names(root)).toEqual(keep ? ['0'] : []);
     });
+  it.each([{recent: []}, {recent: [unrelated]}])('keeps it when receipts cannot place every active run outside its window: %j', async ({recent}) => {
+    const {root, reaper} = make();
+    expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1, [RUN_A, RUN_B], recent))).toEqual([]);
+    expect([...blockedSlots(root, 1)]).toEqual([0]);
+  });
+  it.each([null, 0, 97, 254].flatMap(code => [NOW - 660_001, NOW - 660_000, NOW + SKEW, NOW + SKEW + 1].map(startedMs => ({code, startedMs}))))(
+    'requires each active run to be strictly outside the ownership window regardless of receipt code: %j', async ({code, startedMs}) => {
+      const {root, reaper} = make();
+      const keep = startedMs >= NOW - 660_000 && startedMs <= NOW + SKEW;
+      const recent = [unrelated, {runId: RUN_A, code, startedAtET: iso(startedMs)}];
+      expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1, [RUN_A, RUN_B], recent))).toEqual(keep ? [] : ['slot-0.unconfirmed']);
+      expect(names(root)).toEqual(keep ? ['0'] : []);
+    });
+  it('retains and signals a stuck slot when active runs exceed the 50-receipt window', async () => {
+    const root = setup({0: {pid: 111}}), signals = [];
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111]),
+      stuckMinSlots: 1, signal: event => signals.push(event)});
+    const ids = Array.from({length: 51}, (_, i) => 'r-' + i.toString(16).padStart(32, '0'));
+    const recent = ids.slice(0, 50).map(run => going(run, NOW + SKEW + 1));
+    expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1, ids, recent))).toEqual([]);
+    expect([...blockedSlots(root, 1)]).toEqual([0]);
+    expect(signals.some(event => event.kind === 'stuck-slots')).toBe(true);
+  });
   it.each(['inline', 'sidecar'])('does not apply the bound to a marker with a %s run id', async binding => {
     const root = setup({0: {pid: 111, run: binding === 'inline' ? RUN_A : undefined}});
     if (binding === 'sidecar') recordMarkerRun(join(root, 'slot-0.unconfirmed'), {owner: 'o', run: RUN_A});
