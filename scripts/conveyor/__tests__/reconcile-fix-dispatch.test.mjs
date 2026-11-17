@@ -9,8 +9,9 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
+import * as ghThrottle from '../../lib/gh-throttle.mjs';
 import {
-  withStaleBase, withPlannedContext, dispatchFix, fetchCardScopeAtRef, fetchPrDiffPaths, isDiffTooLargeError, PermanentScopeReadError, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
+  createFixPassPrReader, fetchPrFilesPaginated, replayFixLaunch, withStaleBase, withPlannedContext, dispatchFix, fetchCardScopeAtRef, fetchPrDiffPaths, isDiffTooLargeError, PermanentScopeReadError, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
   findResumeCandidate, buildResumePrompt, tryResumeFix, tryResumeRoundFix, filterFixesByInFlightScope, dropTerminalFixClaims, routeFixExecutor,
 } from '../reconcile-fix-dispatch.mjs';
 import { CONFLICT_LABEL } from '../parked-pr-conflict-watch.mjs';
@@ -788,15 +789,20 @@ describe('tryResumeRoundFix — migrate legacy repair-helper permissions before 
       expect(bash.hooks[0].command).toContain('node "$launcher" scripts/guard-bash.mjs;');
       return { resumed: true, result: { sessionId } };
     });
-    // Use this checkout's committed hooks, independent of the sibling primary's branch.
+    // Seed the committed pinned-launcher shape without depending on host .claude/settings.json.
+    const repoRoot = join(scratch, 'repo');
+    const repoSettingsPath = join(repoRoot, '.claude', 'settings.json');
+    mkdirSync(join(repoRoot, '.claude'), { recursive: true });
+    writeFileSync(repoSettingsPath, JSON.stringify({ hooks: { PreToolUse: [{
+      matcher: 'Bash',
+      hooks: [{ type: 'command', command: "sh -c 'launcher=\"$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/guard-bash.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'" }],
+    }] } }));
+    const readHooks = vi.fn(readFileSync);
     // Keep the real default isolateSession and permission refresh at the resume boundary.
     const isolation = await import('../../lib/dispatch-bg-isolation.mjs');
     const realIsolate = isolation.isolateDispatchSession;
-    const { fileURLToPath } = await import('node:url');
-    const { dirname, resolve } = await import('node:path');
-    const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
     const isolate = vi.spyOn(isolation, 'isolateDispatchSession').mockImplementation((cwd) => realIsolate(cwd, {
-      ensureHooks: (options) => isolation.ensureDispatchGuardHooks({ ...options, repoRoot }),
+      ensureHooks: (options) => isolation.ensureDispatchGuardHooks({ ...options, repoRoot, readFile: readHooks }),
     }));
     const planned = { pr: 5931, itemNum: null, attempts: 1, headRefOid: head, baseRefName: 'main', scope: ['we:x'] };
     const options = {
@@ -820,6 +826,7 @@ describe('tryResumeRoundFix — migrate legacy repair-helper permissions before 
       expect(tryResumeRoundFix(planned, options).resumed).toBe(true);
       expect(tryResumeRoundFix(planned, options).resumed).toBe(true);
       expect(resume).toHaveBeenCalledTimes(2);
+      expect(readHooks).toHaveBeenCalledWith(repoSettingsPath, 'utf8');
       const shim = await import('../../lib/gh-app-shim.mjs');
       const grant = vi.spyOn(shim, 'ensureSettingsFilePermissions');
       try {
@@ -2371,5 +2378,99 @@ describe('runReconcileFixDispatch — adoption safe point', () => {
     expect(dispatch.mock.calls.map(([entry]) => [entry.pr, entry.lane])).toEqual([[1764, 2]]);
     expect(claim.mock.calls).toEqual([[{ pr: 1764, lane: 2 }]]);
     expect(result.refusals).toEqual([]); // deferred is resumable work, not a refusal
+  });
+});
+
+
+describe('fix pass PR metadata snapshot', () => {
+  it('pins the null-repo dispatch default to canonical WE with one view per PR per pass', () => {
+    const exec = vi.spyOn(ghThrottle, 'execFileSyncThrottled').mockImplementation((_cmd, argv) => {
+      if (argv[0] === 'pr' && argv[1] === 'diff') throw new Error('HTTP 406: diff too large');
+      if (argv[0] === 'pr' && argv[1] === 'view') return JSON.stringify({
+        number: 7, baseRefName: 'main', headRefOid: 'head', labels: [],
+      });
+      if (argv[0] === 'api') return JSON.stringify(['a.mjs']);
+      throw new Error(`unexpected command: ${argv.join(' ')}`);
+    });
+    try {
+      for (let pass = 1; pass <= 2; pass++) {
+        const result = runReconcileFixDispatch({
+          root: '/repo', repo: null, checkStaleness: FRESH,
+          reconcile: () => ({ dispatch: [
+            { kind: 'fix', prNumber: 7, headRefName: 'manual-branch' },
+            { kind: 'fix', prNumber: 7, headRefName: 'manual-branch' },
+          ], refusals: [], notes: [] }),
+          loadItems: () => [], pickFreeLanes: () => [],
+          listBuildClaims: () => [], listFixClaims: () => [],
+          priorityShadow: null, stepLog: () => {},
+        });
+        expect(result.refusals).toEqual([
+          expect.objectContaining({ pr: 7, kind: 'scope-overlap' }),
+          expect.objectContaining({ pr: 7, kind: 'no-lane' }),
+        ]);
+        const views = exec.mock.calls.filter(([, argv]) => argv[0] === 'pr' && argv[1] === 'view');
+        expect(views).toHaveLength(pass);
+        expect(views.at(-1)[1].slice(0, 5)).toEqual([
+          'pr', 'view', '7', '--repo', 'web-everything/web-everything',
+        ]);
+      }
+    } finally { exec.mockRestore(); }
+  });
+
+  it('normalizes internal repo keys before executing and shares their canonical cache entry', () => {
+    const exec = vi.fn(() => JSON.stringify({ number: 7, body: 'description' }));
+    const readPrView = createFixPassPrReader({ exec, repo: 'we' });
+    expect(readPrView(7)).toEqual({ number: 7, body: 'description' });
+    expect(readPrView(7, 'web-everything/web-everything')).toEqual({ number: 7, body: 'description' });
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec.mock.calls[0][1].slice(0, 5)).toEqual(['pr', 'view', '7', '--repo', 'web-everything/web-everything']);
+    readPrView(8, 'we');
+    expect(exec).toHaveBeenCalledTimes(2);
+    expect(exec.mock.calls[1][1].slice(0, 5)).toEqual(['pr', 'view', '8', '--repo', 'web-everything/web-everything']);
+  });
+
+  it('shares exactly one union pr view across fallback, restack snapshot and replay, refreshing next pass', () => {
+    let head = 'first';
+    const exec = vi.fn((_cmd, argv) => {
+      if (argv[0] === 'pr' && argv[1] === 'view') return JSON.stringify({
+        number: Number(argv[2]), headRefName: 'lane/item', headRefOid: head, baseRefName: 'main',
+        labels: [], state: 'OPEN', files: [{ path: 'a.mjs' }], body: 'description', isCrossRepository: false,
+      });
+      if (argv[0] === 'api') return JSON.stringify(['a.mjs']);
+      throw new Error(`unexpected command: ${argv.join(' ')}`);
+    });
+    for (const expectedHead of ['first', 'second']) {
+      head = expectedHead;
+      const before = exec.mock.calls.filter(([, args]) => args[1] === 'view').length;
+      const readPrView = createFixPassPrReader({ exec, repo: 'web-everything/web-everything' });
+      expect(fetchPrFilesPaginated(7, { exec, readPrView })).toEqual(['a.mjs']);
+      expect(readPrView(7)).toMatchObject({ headRefOid: expectedHead, body: 'description', isCrossRepository: false });
+      const replay = replayFixLaunch({ pr: 7, round: 1, readPrView, exec,
+        fixSettings: { strongerModelFromRound: 0 }, resumeRound: () => ({ decision: { resume: false, reason: 'test' } }),
+      });
+      expect(replay).toMatchObject({ head: expectedHead, base: 'main', state: 'OPEN' });
+      // Before: three separate pr view sites for fallback, restack and replay.
+      expect(exec.mock.calls.filter(([, args]) => args[1] === 'view').length - before).toBe(1);
+      readPrView(8);
+      readPrView(7, 'another/repo');
+      expect(exec.mock.calls.filter(([, args]) => args[1] === 'view').length - before).toBe(3);
+    }
+    expect(exec.mock.calls[0][1].at(-1).split(',').sort()).toEqual([
+      'number', 'headRefName', 'headRefOid', 'baseRefName', 'labels', 'state', 'files', 'body', 'isCrossRepository',
+    ].sort());
+  });
+
+  it('keeps a failed view to one call while preserving paginated fallback and retrying next pass', () => {
+    const exec = vi.fn((_cmd, argv) => {
+      if (argv[1] === 'view') throw new Error('unreadable PR');
+      if (argv.includes('--paginate')) return 'fallback.mjs\n';
+      throw new Error('unexpected command');
+    });
+    const readPrView = createFixPassPrReader({ exec });
+    expect(fetchPrFilesPaginated(7, { exec, readPrView })).toEqual(['fallback.mjs']);
+    expect(() => readPrView(7)).toThrow('unreadable PR');
+    expect(exec.mock.calls.filter(([, args]) => args[1] === 'view')).toHaveLength(1);
+    expect(() => createFixPassPrReader({ exec })(7)).toThrow('unreadable PR');
+    expect(exec.mock.calls.filter(([, args]) => args[1] === 'view')).toHaveLength(2);
   });
 });

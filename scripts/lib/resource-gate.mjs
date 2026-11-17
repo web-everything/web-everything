@@ -377,6 +377,18 @@ export function createResourceFixThrottle({
   };
   return {
     capDecision: () => capDecision,
+    recheckHost(kind = 'fix') {
+      const fl = floorCheck(kind);
+      if (!fl.admit) return fl.refusal;
+      try {
+        const g = gateFor(kind);
+        return g.admit ? { admit: true } : g;
+      } catch (e) {
+        const why = `host gate threw (${String(e?.message ?? e).slice(0, 120)}); ${kind} refused, no claim taken`;
+        try { log(`resource-gate fix-throttle: ${why}\n`); } catch { /* best effort */ }
+        return { admit: false, kind: 'host-load', signal: 'gate-error', why };
+      }
+    },
     tryAdmit(kind = 'fix', { sendBack = false } = {}) {
       if (live === null) { try { live = countLiveFixSessions(listClaims(), { alive }); } catch { live = 0; } }
       // R553/R559 hard floor, before any cap arithmetic. The memory reading is re-read on EVERY admission (never the

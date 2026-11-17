@@ -8,7 +8,8 @@
 # - /srv/forge-receipts ops:ops 0700, /srv/forge-cache root:ops 0770,
 #   /srv/forge-base ops:ops 0700 and its anonymous public bare repo.git;
 # - /usr/local/libexec root:root 0755 and bundled root:root 0755 wrappers
-#   forge-exec-run.mjs, forge-warm-base.mjs, forge-exec-limits.mjs and forge-cache-prune.mjs;
+#   forge-exec-run.mjs, forge-warm-base.mjs, forge-exec-limits.mjs, forge-cache-prune.mjs
+#   and forge-exec-sweep.mjs;
 # - /etc/forge-exec/limits.json root:root 0644 (created only if absent),
 #   persistent parent/slot systemd slices with live resource ceilings;
 # - /etc/sudoers.d/forge-exec root:root 0440 with these exact forms:
@@ -16,9 +17,13 @@
 #   ops ALL=(root) NOPASSWD: /usr/local/libexec/forge-exec-run.mjs
 #   ops ALL=(root) NOPASSWD: /usr/local/libexec/forge-exec-run.mjs *
 # - root-owned forge-warm-base systemd service/timer (service runs as ops,
-#   timer every 30s) and /etc/cron.daily/forge-exec-prune root:root 0755;
+#   timer every 30s); the legacy forge-exec-prune cron job is removed;
 # - forge-cache-prune.service/timer: root oneshot cache retention, 2min after
-#   boot then every 15min, idle IO/low CPU priority; cron retains exec/receipt pruning;
+#   boot then every 15min, idle IO/low CPU priority;
+# - forge-exec-sweep.service/timer: root oneshot run/presync/receipt retention,
+#   5min after boot then every 30min, idle IO/low CPU priority;
+#   also reclaims reservations older than 7 days under the writer lease, only
+#   with writerGuard evidence and proof the worker UID has no processes;
 # - R497 egress: slot users forge-exec-1..N get no outbound network except loopback and
 #   TCP 443 to registry.npmjs.org (cold npm ci runs as the slot user). Rules come from
 #   /usr/local/libexec/forge-egress.sh (nft table inet forge_exec_egress), refreshed every
@@ -184,7 +189,7 @@ try:
         # installed imports resolve to node builtins, including on Node 22.1.
         import re, json
         source_dir = os.path.dirname(sys.argv[1])
-        allowed = {"forge-exec-run.mjs", "forge-exec-siblings.mjs", "forge-exec-manifest.mjs", "forge-exec-bases.mjs", "forge-warm-base.mjs", "forge-exec-limits.mjs", "forge-cache-prune.mjs"}
+        allowed = {"forge-exec-run.mjs", "forge-exec-siblings.mjs", "forge-exec-manifest.mjs", "forge-exec-bases.mjs", "forge-warm-base.mjs", "forge-exec-limits.mjs", "forge-cache-prune.mjs", "forge-exec-sweep.mjs"}
         def bundle(filename, nested=False):
             if filename not in allowed:
                 raise RuntimeError("unexpected wrapper dependency")
@@ -216,7 +221,8 @@ try:
             if nested:
                 return "(await (async () => {\n" + code + "\nreturn {" + ",".join(dict.fromkeys(names)) + "};\n})())"
             return "#!/usr/bin/env node\n" + code
-        for filename in ["forge-exec-run.mjs", "forge-warm-base.mjs", "forge-exec-limits.mjs", "forge-cache-prune.mjs"]:
+        installed = ["forge-exec-run.mjs", "forge-warm-base.mjs", "forge-exec-limits.mjs", "forge-cache-prune.mjs", "forge-exec-sweep.mjs"]
+        for filename in installed:
             name = ".forge-exec-run-" + secrets.token_hex(16)
             fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700, dir_fd=dest)
             try:
@@ -229,6 +235,67 @@ try:
             finally:
                 os.close(fd)
             os.rename(name, filename, src_dir_fd=dest, dst_dir_fd=dest)
+        # S0: record the source graph and actual installed bytes, without automation.
+        import hashlib, subprocess
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        set_sha = None
+        try:
+            checkout = os.path.abspath(os.path.join(source_dir, "../.."))
+            result = subprocess.run(["git", "-C", checkout, "log", "-1", "--format=%H", "HEAD", "--"] +
+                                    ["scripts/readiness/" + name for name in sorted(allowed)],
+                                    check=True, capture_output=True, text=True, timeout=10)
+            candidate = result.stdout.strip()
+            if not re.fullmatch(r"[a-f0-9]{40}", candidate):
+                raise ValueError("invalid set sha")
+            set_sha = candidate
+        except (OSError, subprocess.SubprocessError, ValueError):
+            print("forge-setup: installed set git SHA unavailable; recording null", file=sys.stderr)
+        digest = hashlib.sha256()
+        for filename in sorted(installed):
+            fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dest)
+            with os.fdopen(fd, "rb") as stream:
+                file_hash = hashlib.sha256(stream.read()).hexdigest()
+            digest.update((filename + "\0" + file_hash + "\n").encode())
+        state = {"schema": 1, "forgeSetSha": set_sha, "setDigest": digest.hexdigest(), "hostTier": 1,
+                 "installedAtET": datetime.now(ZoneInfo("America/New_York")).isoformat(timespec="milliseconds")}
+        state_parent = os.open("/var/lib", flags)
+        try:
+            st = os.fstat(state_parent)
+            if st.st_uid != 0 or st.st_mode & 0o022:
+                raise RuntimeError("untrusted /var/lib")
+            try:
+                os.mkdir("forge-deploy", 0o755, dir_fd=state_parent)
+            except FileExistsError:
+                pass
+            state_dir = os.open("forge-deploy", flags, dir_fd=state_parent)
+            try:
+                st = os.fstat(state_dir)
+                if st.st_uid != 0 or st.st_mode & 0o022:
+                    raise RuntimeError("untrusted forge-deploy directory")
+                os.fchown(state_dir, 0, 0)
+                os.fchmod(state_dir, 0o755)
+                pending = ".state-" + secrets.token_hex(16)
+                try:
+                    fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=state_dir)
+                    with os.fdopen(fd, "w") as stream:
+                        json.dump(state, stream)
+                        stream.write("\n")
+                        stream.flush()
+                        os.fchown(stream.fileno(), 0, 0)
+                        os.fchmod(stream.fileno(), 0o644)
+                        os.fsync(stream.fileno())
+                    os.rename(pending, "state.json", src_dir_fd=state_dir, dst_dir_fd=state_dir)
+                    os.fsync(state_dir)
+                finally:
+                    try:
+                        os.unlink(pending, dir_fd=state_dir)
+                    except FileNotFoundError:
+                        pass
+            finally:
+                os.close(state_dir)
+        finally:
+            os.close(state_parent)
     finally:
         os.close(dest)
 finally:
@@ -335,6 +402,32 @@ WantedBy=timers.target
 CACHE_TIMER
 systemctl daemon-reload
 systemctl enable --now forge-cache-prune.timer
+rm -f /etc/cron.daily/forge-exec-prune
+cat > /etc/systemd/system/forge-exec-sweep.service <<'SWEEP_SERVICE'
+[Unit]
+Description=Prune expired Forge runs, presync keys and receipts
+After=local-fs.target
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/env node /usr/local/libexec/forge-exec-sweep.mjs --apply
+Nice=19
+IOSchedulingClass=idle
+SWEEP_SERVICE
+cat > /etc/systemd/system/forge-exec-sweep.timer <<'SWEEP_TIMER'
+[Unit]
+Description=Check Forge execution retention every 30 minutes
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+AccuracySec=1min
+Persistent=false
+Unit=forge-exec-sweep.service
+[Install]
+WantedBy=timers.target
+SWEEP_TIMER
+systemctl daemon-reload
+systemctl enable --now forge-exec-sweep.timer
 # R497: no egress for slot users. Root-owned script, installed via temp + atomic rename.
 if ! command -v nft >/dev/null 2>&1; then
   apt-get install -y nftables
@@ -384,111 +477,4 @@ systemctl daemon-reload
 systemctl enable forge-exec-egress.service
 systemctl start forge-exec-egress.service
 systemctl enable --now forge-exec-egress.timer
-cat > /etc/cron.daily/forge-exec-prune <<'PRUNE'
-#!/bin/bash
-set -euo pipefail
-# Active reservations protect their slot and identifiable run evidence.
-# Unrelated expired state is pruned when reservation evidence identifies what
-# to protect; incomplete evidence preserves expired receipts. Reclaim only after
-# excluding reservation writers and launches, then proving its UID has no live
-# processes. Historical reservations require operator cleanup after stopping the UID.
-python3 - <<'PRUNE_PY'
-import os, re, stat, shutil, time, json, pwd, sys, fcntl
-root, receipts = '/srv/forge-exec', '/srv/forge-receipts'
-now = time.time()
-active, runs = set(), set()
-unknown_receipts = False
-def metadata(path):
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_size > 4*1024*1024: return {}
-        with os.fdopen(os.dup(fd)) as stream: value = json.load(stream)
-        return value if isinstance(value, dict) else {}
-    finally: os.close(fd)
-def uid_processes(uid):
-    present = False
-    for pid in os.listdir('/proc'):
-        if not pid.isdigit(): continue
-        try:
-            if os.stat('/proc/' + pid).st_uid != uid: continue
-            present = True
-            with open('/proc/' + pid + '/stat') as stream:
-                if stream.read().rsplit(')', 1)[1].split()[0] != 'Z': return True, True
-        except FileNotFoundError: continue
-        except (OSError, ValueError, IndexError): return True, True
-    return False, present
-# Take exclusive leases before observing reservations and keep them throughout
-# pruning. A blocked slot stays protected even if its writer has not published
-# reservation.json yet. Runner SH leases allow different slots to run in parallel.
-writer_fds, blocked = [], set()
-names = {'worker-active'} | {'worker-active-' + name[5:] for name in os.listdir(root) if re.fullmatch(r'slot-[1-9][0-9]*', name)}
-names |= {name for name in os.listdir(receipts) if re.fullmatch(r'worker-active(?:-[1-9][0-9]*)?', name)}
-for name in sorted(names):
-    fd = os.open(os.path.join(receipts, '.' + name + '.writer'), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
-    st = os.fstat(fd)
-    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_mode & 0o077 or st.st_uid not in {0, os.stat(receipts).st_uid}:
-        raise RuntimeError('unsafe worker writer guard; use local fallback and inspect slot setup')
-    # Cron runs as root, while controllers may run as ops. Normalize only a
-    # validated root-owned inode, including guards left by an older prune.
-    # Keep mode 0600 and the same inode: replacing it would split flock users.
-    owner = os.stat(receipts)
-    if st.st_uid == 0 and owner.st_uid != 0:
-        os.fchown(fd, owner.st_uid, owner.st_gid)
-    try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        blocked.add(name)
-        active.add(name)
-        os.close(fd)
-    else: writer_fds.append(fd)
-for name in sorted(names):
-    path = os.path.join(receipts, name)
-    try: st = os.lstat(path)
-    except FileNotFoundError:
-        if name in blocked: unknown_receipts = True
-        continue
-    if not stat.S_ISDIR(st.st_mode): raise RuntimeError('unsafe reservation')
-    try: record = metadata(os.path.join(path, 'reservation.json'))
-    except (OSError, ValueError): record = {}
-    # Missing protocol evidence may belong to an older, uncooperative wrapper.
-    # Only the operator can exclude its future launches.
-    if name not in blocked and record.get('writerGuard') == 1 and now - st.st_mtime > 604800:
-        user = 'forge-exec' + name[len('worker-active'):]
-        try: running, present = uid_processes(pwd.getpwnam(user).pw_uid)
-        except (KeyError, OSError): running, present = True, True
-        if not running:
-            print('forge-exec-prune: abandoned reservation ' + name + '; UID has no live processes', file=sys.stderr)
-            if not present: shutil.rmtree(path)
-            continue
-    active.add(name)
-    run = record.get('run')
-    if not isinstance(run, str) or not re.fullmatch(r'(r-|warm-)[a-f0-9]{32}', run):
-        unknown_receipts = True
-        continue
-    runs.add(run)
-
-def prune(parent, age, pattern, files=False, protected=()):
-    st = os.lstat(parent)
-    if not stat.S_ISDIR(st.st_mode): raise RuntimeError('unsafe prune root')
-    for name in os.listdir(parent):
-        if not re.fullmatch(pattern, name) or name in protected: continue
-        if re.fullmatch(r'\.worker-active(?:-[1-9][0-9]*)?\.writer', name): continue
-        if files and name.split('.', 1)[0] in runs: continue
-        path = os.path.join(parent, name)
-        st = os.lstat(path)
-        if now - st.st_mtime <= age: continue
-        if files and stat.S_ISREG(st.st_mode): os.unlink(path)
-        elif not files and stat.S_ISDIR(st.st_mode): shutil.rmtree(path)
-if 'worker-active' not in active:
-    prune(root, 86400, r'r-.*')
-for slot in os.listdir(root):
-    if re.fullmatch(r'slot-[1-9][0-9]*', slot) and 'worker-active-' + slot[5:] not in active:
-        prune(os.path.join(root, slot), 86400, r'(r-|warm-)[a-f0-9]{32}')
-if unknown_receipts:
-    print('forge-exec-prune: incomplete reservation evidence; preserving expired receipts until operator repair or confirmed UID shutdown', file=sys.stderr)
-else: prune(receipts, 86400, r'.*', files=True)
-PRUNE_PY
-PRUNE
-chown root:root /etc/cron.daily/forge-exec-prune
-chmod 755 /etc/cron.daily/forge-exec-prune
 printf 'forge-setup: ok\n'

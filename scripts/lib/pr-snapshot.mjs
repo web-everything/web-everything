@@ -190,8 +190,11 @@ function normalizeFields(fields) {
 /** Fetch complete light pages and hydrate stale heavy fields. Failed reads throw PrListUnreadableError. */
 export function fetchSnapshot({ repo, prevCount, prev = null, exec = execFileSyncThrottled, nowMs = Date.now(),
   deferrable = false, env = process.env, paging = resolvePrListPaging({ env }) }) {
+  // The refresher may be a new process: carry bounded lookup progress and immutable check-app identities
+  // in the snapshot already protected by readSharedOpenPrs' lock and atomic publication.
+  const checkAppState = { ...(prev?.repo === repo ? prev.checkAppState : {}) };
   const light = listOpenPrsLightPaged({ repo, exec, pageSize: paging.pageSize, pageRetries: paging.pageRetries,
-    maxRows: MAX_LIMIT, execOpts: { throttle: { op: 'pr list (snapshot page)', deferrable } } });
+    maxRows: MAX_LIMIT, checkAppState, execOpts: { throttle: { op: 'pr list (snapshot page)', deferrable } } });
   if (light.deferred) return light.deferred;
   assertInventoryComplete({ repo, rows: light.rows, totalCount: light.totalCount, truncated: light.truncated });
   const cache = {};
@@ -205,7 +208,7 @@ export function fetchSnapshot({ repo, prevCount, prev = null, exec = execFileSyn
   const heavyMeta = Object.fromEntries(Object.entries(heavy.cache).map(([n, { updatedAt, headRefOid, fetchedAtMs }]) =>
     [n, { updatedAt, headRefOid, fetchedAtMs }]));
   return { v: PR_SNAPSHOT_VERSION, repo, fetchedAtMs: nowMs, fields: [...SNAPSHOT_FIELDS], limit: MAX_LIMIT,
-    count: heavy.rows.length, truncated: light.truncated, prs: heavy.rows, heavyMeta,
+    count: heavy.rows.length, truncated: light.truncated, prs: heavy.rows, heavyMeta, checkAppState,
     paging: { pageSize: paging.pageSize, source: paging.source?.pageSize ?? 'standard', pages: light.pages,
       bytes: light.bytes, ms: light.ms, hydrated: heavy.fetched, reused: heavy.reused } };
 }

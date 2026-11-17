@@ -1,7 +1,7 @@
 /**
  * R951 — forge-disk-prune. Forge's root disk reached 100% because forge-cache-prune refused every run for 4 days
  * (469 refusals, "Invalid reserved lock evidence") and nothing alerted. This smell reads the Forge telemetry the Mac
- * already receives (`<dirname(lockRoot)>/remote/health.json`, written by forge-remote-health): `telemetry.diskUsedPct` (root
+ * already receives (`<dirname(lockRoot)>/remote/health-g2.json`, written by forge-remote-health): `telemetry.diskUsedPct` (root
  * disk used %) and `telemetry.prune.{consecutiveRefused,lastRefusal}`. It raises a needs-you finding at >= 80% used
  * or >= 3 consecutive prune refusals. Sticky (R952): an open needs-you stays needs-you while telemetry is missing. Invalid values (negative, non-numeric, >100%) count as missing. A missing file is a note too (never closes an open episode without a healthy reading); only under test is it not applicable. One subject for breach and note so an open needs-you episode never closes on missing evidence. FAILS CLOSED: missing/unreadable fields raise a low-severity "unobservable"
  * note, never silence. It makes no ssh call of its own: one local file open per tick, reading at most
@@ -10,6 +10,7 @@
 import fs from 'node:fs';
 import { dirname, join } from 'node:path';
 import { admissionLockRoot } from '../../readiness/heavy-admission.mjs';
+import { remoteHealthFile } from '../../readiness/forge-remote-health.mjs';
 
 export const DISK_USED_PCT_MAX = 80;
 export const PRUNE_REFUSED_MAX = 3;
@@ -17,7 +18,7 @@ export const TELEMETRY_MAX_AGE_MS = 15 * 60 * 1000; // older samples are not evi
 export const HEALTH_FILE_MAX_BYTES = 64 * 1024;
 
 export function defaultReadForgeHealth({ io = fs } = {}) {
-  const fd = io.openSync(join(dirname(admissionLockRoot(process.cwd())), 'remote', 'health.json'), 'r');
+  const fd = io.openSync(remoteHealthFile(join(dirname(admissionLockRoot(process.cwd())), 'remote')), 'r');
   try {
     const buffer = Buffer.alloc(HEALTH_FILE_MAX_BYTES + 1);
     let size = 0;
@@ -26,7 +27,7 @@ export function defaultReadForgeHealth({ io = fs } = {}) {
       if (bytes === 0) break;
       size += bytes;
     }
-    if (size > HEALTH_FILE_MAX_BYTES) throw new Error(`health.json exceeds ${HEALTH_FILE_MAX_BYTES} byte limit`);
+    if (size > HEALTH_FILE_MAX_BYTES) throw new Error(`health-g2.json exceeds ${HEALTH_FILE_MAX_BYTES} byte limit`);
     return JSON.parse(buffer.toString('utf8', 0, size));
   } finally { io.closeSync(fd); }
 }
