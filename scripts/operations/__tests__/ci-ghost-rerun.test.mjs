@@ -49,7 +49,7 @@ function fixture() {
       posted = true;
       return null;
     }
-    if (/\/pulls\/\d+$/.test(path)) { posted = false; return { state: f.pullState, head: { sha: f.head } }; }
+    if (/\/pulls\/\d+$/.test(path)) return { state: f.pullState, head: { sha: f.head } };
     if (path.includes('/check-runs?')) return { total_count: f.total, check_runs: f.checks ?? [
       { id: 70, url: checkUrl, details_url: `https://github.com/${repo}/actions/runs/9/job/7`,
         status: 'in_progress', app: { slug: 'github-actions' } },
@@ -64,7 +64,8 @@ function fixture() {
       conclusion: f.conclusion === undefined ? 'cancelled' : f.conclusion };
     throw new Error(`Unexpected fake route: ${path}`);
   });
-  f.state = { read: () => f.rows, append: row => f.rows.push(structuredClone(row)), withLock: fn => fn() };
+  f.state = { read: () => f.rows, append: row => f.rows.push(structuredClone(row)),
+    withLock: fn => { posted = false; return fn(); } };
   f.deps = { gh: f.gh, state: f.state, clock: () => f.now, settings,
     readSharedRerunStates: vi.fn(() => []), sharedStateDir: dir,
     sleep: async ms => { f.trace.push('wait'); f.now += ms; } };
@@ -105,6 +106,94 @@ describe('default GitHub execution', () => {
 });
 
 describe('ghost recovery', () => {
+  it.each(['redirected-budget', ''])(
+    'refuses an inherited shared budget override %j without an injected directory', async value => {
+      const f = fixture(); delete f.deps.sharedStateDir;
+      vi.stubEnv('WE_GH_THROTTLE_LOCK_ROOT', value);
+      try {
+        expect(await f.run()).toMatchObject({ reason: 'shared-state-env-override', exitCode: 2 });
+        expect(f.gh).not.toHaveBeenCalled();
+        expect(f.deps.readSharedRerunStates).not.toHaveBeenCalled();
+        expect(f.rows).toEqual([expect.objectContaining({ outcome: 'shared-state-env-override', counted: false })]);
+      } finally { vi.unstubAllEnvs(); }
+    });
+
+  it('allows an explicitly injected shared directory despite the inherited override', async () => {
+    const f = fixture(); vi.stubEnv('WE_GH_THROTTLE_LOCK_ROOT', 'redirected-budget');
+    try {
+      expect(await f.run()).toMatchObject({ reason: 'rerun', exitCode: 0 });
+      expect(f.shared().requests[0].status).toBe('confirmed');
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  describe.each([
+    ['before cancel', 2, []], ['before rerun', 3, ['cancel']],
+  ])('%s workflow preflight', (_phase, pullRead, posts) => {
+    it.each([
+      ['changed attempt', { run_attempt: 3 }], ['missing attempt', { run_attempt: undefined }],
+      ['invalid attempt type', { run_attempt: '2' }],
+      ['changed status', { status: 'queued' }], ['missing status', { status: undefined }],
+      ['changed head', { head_sha: 'b'.repeat(40) }], ['missing head', { head_sha: undefined }],
+      ['changed identity', { id: 10 }], ['missing response', null], ['unreadable response', 'throw'],
+    ])('rejects %s and releases the reservation', async (_name, changed) => {
+      const f = fixture(); const gh = f.gh; let pulls = 0;
+      f.deps.gh = async args => {
+        const result = await gh(args);
+        if (args[1].endsWith('/pulls/42')) pulls++;
+        if (pulls === pullRead && args[1].endsWith('/runs/9')) {
+          if (changed === 'throw') throw new Error('unreadable');
+          return changed === null ? null : { ...result, ...changed };
+        }
+        return result;
+      };
+      expect(await f.run()).toMatchObject({ reason: 'run-changed', exitCode: 4 });
+      expect(f.posts).toEqual(posts);
+      expect(f.shared().requests[0]).toMatchObject({ status: 'rejected', released: true });
+    });
+
+    it('rejects a status from the other phase and releases the reservation', async () => {
+      const f = fixture(); const gh = f.gh; let pulls = 0;
+      f.deps.gh = async args => {
+        const result = await gh(args);
+        if (args[1].endsWith('/pulls/42')) pulls++;
+        if (pulls === pullRead && args[1].endsWith('/runs/9')) {
+          result.status = pullRead === 2 ? 'completed' : 'in_progress';
+        }
+        return result;
+      };
+      expect(await f.run()).toMatchObject({ reason: 'run-changed', exitCode: 4 });
+      expect(f.posts).toEqual(posts);
+      expect(f.shared().requests[0]).toMatchObject({ status: 'rejected', released: true });
+    });
+  });
+
+  it.each([
+    ['completed job', { status: 'completed' }], ['missing status', { status: undefined }],
+    ['active step', { steps: [{ status: 'in_progress' }] }], ['missing steps', { steps: undefined }],
+    ['empty steps', { steps: [] }],
+    ['failed step', { steps: [{ ...ghost().steps[0], conclusion: 'failure' }] }],
+    ['young steps', { steps: [{ ...ghost().steps[0], completed_at: new Date(NOW).toISOString() }] }],
+    ['threshold boundary', { steps: [{ ...ghost().steps[0], completed_at: new Date(NOW - 15 * 60_000).toISOString() }] }],
+    ['missing completion time', { steps: [{ status: 'completed', conclusion: 'success' }] }],
+    ['changed attempt', { run_attempt: 3 }], ['changed run', { run_id: 10 }],
+    ['changed job', { id: 8 }], ['changed check', { check_run_url: 'other-check' }],
+    ['missing response', null], ['unreadable response', 'throw'],
+  ])('rejects %s in the pre-cancel ghost re-read and releases the reservation', async (_name, changed) => {
+    const f = fixture(); const gh = f.gh; let reads = 0;
+    f.deps.gh = async args => {
+      const result = await gh(args);
+      if (args[1].endsWith('/jobs/7') && ++reads === 2) {
+        if (changed === 'throw') throw new Error('unreadable');
+        return changed === null ? null : { ...result, ...changed };
+      }
+      return result;
+    };
+    expect(await f.run()).toMatchObject({ reason: 'run-changed', exitCode: 4 });
+    expect(reads).toBe(2);
+    expect(f.posts).toEqual([]);
+    expect(f.shared().requests[0]).toMatchObject({ status: 'rejected', released: true });
+  });
+
   it.each(['closed', 'CLOSED', 'MERGED', undefined, null, 'unknown'])(
     'refuses PR state %s before inspection or reservation', async pullState => {
       const f = fixture(); f.pullState = pullState;
@@ -146,13 +235,16 @@ describe('ghost recovery', () => {
     expect(f.shared().requests[0]).toMatchObject({ status: 'rejected', released: true });
   });
 
-  it('reads the live PR immediately before both cancel and rerun POSTs', async () => {
+  it('reads the live PR, run and ghost before cancel and the PR and completed run before rerun', async () => {
     const f = fixture();
     expect(await f.run()).toMatchObject({ reason: 'rerun', exitCode: 0 });
     const calls = f.gh.mock.calls.map(([args]) => args);
     for (const endpoint of ['cancel', 'rerun']) {
       const index = calls.findIndex(args => args[1].endsWith(`/${endpoint}`));
-      expect(calls[index - 1]).toEqual(['api', 'repos/web-everything/web-everything/pulls/42', '--method', 'GET']);
+      const paths = endpoint === 'cancel' ? ['pulls/42', 'actions/runs/9', 'actions/jobs/7']
+        : ['pulls/42', 'actions/runs/9'];
+      expect(calls.slice(index - paths.length, index)).toEqual(paths.map(path =>
+        ['api', `repos/web-everything/web-everything/${path}`, '--method', 'GET']));
     }
   });
 

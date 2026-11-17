@@ -125,7 +125,7 @@ export function defaultGh(args) {
 export async function runCiGhostRerun(options, {
   gh = defaultGh, clock = Date.now, sleep = sleepDefault,
   state = createStateStore(), settings = readCiGhostRerunSettings(),
-  readSharedRerunStates = readTimeoutStates, sharedStateDir = timeoutStateDir(),
+  readSharedRerunStates = readTimeoutStates, sharedStateDir,
 } = {}) {
   const { actor, channel, pr, repo = 'web-everything/web-everything', dryRun = false } = options;
   const audit = { ts: new Date(clock()).toISOString(), actor: actor ?? null, channel: channel ?? null,
@@ -137,6 +137,10 @@ export async function runCiGhostRerun(options, {
   };
   const api = (endpoint, method = 'GET') => gh(['api', `repos/${repo}/${endpoint}`, '--method', method]);
   try {
+    if (sharedStateDir === undefined && Object.hasOwn(process.env, 'WE_GH_THROTTLE_LOCK_ROOT')) {
+      return finish(failure('shared-state-env-override'));
+    }
+    if (sharedStateDir === undefined) sharedStateDir = timeoutStateDir();
     if (options.invalid || !oneLine(actor) || !/^[a-z\d](?:[a-z\d-]*)(?:\[bot\])?$/i.test(actor)
       || !oneLine(channel)) return finish(failure('invalid-attribution'));
     if (!positiveId(pr) || !/^[a-z\d_.-]+\/[a-z\d_.-]+$/i.test(repo)) return finish(failure('invalid-target'));
@@ -247,6 +251,27 @@ export async function runCiGhostRerun(options, {
           if (current?.head?.sha !== audit.head) return failure('head-moved', 4);
           return null;
         };
+        const checkRun = async status => {
+          try {
+            const current = await api(runPath);
+            if (current?.id !== job.run_id || current.head_sha !== audit.head
+              || current.run_attempt !== run.run_attempt || current.status !== status
+              || (status === 'completed' && !['cancelled', 'success'].includes(current.conclusion))) {
+              return failure('run-changed', 4);
+            }
+            if (status === 'in_progress') {
+              for (const inspected of decision.jobs.filter(candidate => candidate.run_id === job.run_id)) {
+                const currentJob = await api(`actions/jobs/${inspected.id}`);
+                if (currentJob?.id !== inspected.id || currentJob.run_id !== inspected.run_id
+                  || currentJob.run_attempt !== run.run_attempt || currentJob.check_run_url !== inspected.check_run_url
+                  || detectGhostJobs({ jobs: [currentJob], now: clock(), thresholdMin: settings.thresholdMin }).exitCode) {
+                  return failure('run-changed', 4);
+                }
+              }
+            }
+            return null;
+          } catch { return failure('run-changed', 4); }
+        };
         // Durable reservation precedes all POSTs, including ambiguous failures and process death.
         await state.append({ ...audit, ts: new Date(clock()).toISOString(), outcome: 'attempt', counted: true });
         const waitCompleted = async () => {
@@ -266,6 +291,8 @@ export async function runCiGhostRerun(options, {
         };
         const beforeCancel = await checkPull();
         if (beforeCancel) return beforeCancel;
+        const cancelRun = await checkRun('in_progress');
+        if (cancelRun) return cancelRun;
         try { await api(`${runPath}/cancel`, 'POST'); } catch { /* force-cancel remains available */ }
         let completed = await waitCompleted();
         if (typeof completed !== 'boolean') return completed;
@@ -279,6 +306,8 @@ export async function runCiGhostRerun(options, {
         if (!completed) return failure('cancel-unconfirmed', 4);
         const beforeRerun = await checkPull();
         if (beforeRerun) return beforeRerun;
+        const rerunRun = await checkRun('completed');
+        if (rerunRun) return rerunRun;
         rerunSent = true;
         await api(`${runPath}/rerun`, 'POST');
         timeoutTransaction(path, initial, shared => {
@@ -321,6 +350,7 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
   console.log(options.json ? JSON.stringify(result) :
     `${result.reason}; before=${JSON.stringify(result.before)}; newRunAttempt=${result.newRunAttempt ?? 'none'}`);
   if (result.reason === 'invalid-settings') console.error('Correct or remove invalid ciGhostRerun overrides before retrying: thresholdMin >= 5, maxPerWindow integer 1..3, maxPerHead integer 1..2, windowHours 1..24, cancelWaitSec 5..300.');
+  else if (result.reason === 'shared-state-env-override') console.error('Unset WE_GH_THROTTLE_LOCK_ROOT before retrying so recovery uses the shared budget location.');
   else if (result.reason === 'shared-rerun-budget') console.error('Inspect the shared ci-timeout-reruns state and workflow; resolve pending/unreadable evidence or recover manually.');
   else if (result.reason === 'rate-capped') console.error('Inspect the ledger and workflow; a lifetime per-head cap requires a new head or manual recovery. Window expiry only clears the rolling cap.');
   else if (result.exitCode) console.error('Inspect workflow evidence in GitHub; retry after the cap/window or state lock clears. Inspect state before removing a stale lock.');
