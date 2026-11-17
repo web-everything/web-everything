@@ -13,7 +13,7 @@ import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { STAND_DOWN_LABEL } from './stand-down.mjs';
 import { bindAgents, assessLiveness } from './reconcile-core.mjs';
 import { planSendBacks, pendingOnly, headKey, validHead, renderFindingsBody } from './review-sendback.mjs';
-import { blockRuledReferralsFor } from './review-referral-hold.mjs';
+import { blockRuledReferralsFor, GH_LIST_COMMENT_CAP } from './review-referral-hold.mjs';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
 export function resolveSendBackPolicy({ env = process.env, log = () => {}, tool } = {}) {
@@ -32,7 +32,17 @@ export function runSendBackTick({ repo, plan, prs, agents, log = () => {},
   enabled = resolveSendBackPolicy({ log }),
   ledgerPath = join(daemonConveyorStateRoot(), 'review-sendback.json'),
   readLive = (repo, pr) => createGhProvider().readPrState(repo, pr),
-  readReferrals = (live, repo) => blockRuledReferralsFor(live, { repo }),
+  // A capped comment page could omit a later withdrawal or pending referral: take the full thread first, and
+  // refuse (throw, retried next tick) when it cannot be read.
+  readReferrals = (live, repo) => {
+    let l = live;
+    if (Array.isArray(l.comments) && l.comments.length >= GH_LIST_COMMENT_CAP) {
+      const full = createGhProvider().readComments(repo, l.number);
+      if (!Array.isArray(full)) throw new Error('full comment thread unreadable; not sending back');
+      l = { ...l, comments: full };
+    }
+    return blockRuledReferralsFor(l, { repo });
+  },
   execute = execFileSync, publish = publishAttention,
   readLedger = () => {
     try { return JSON.parse(readFileSync(ledgerPath, 'utf8')); }

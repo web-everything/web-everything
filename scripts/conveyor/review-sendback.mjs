@@ -41,6 +41,7 @@ export function renderFindingsBody(referrals = []) {
   if (!groups.length) throw new Error('no blocking findings; operator attention required');
   return 'Blocking referrals ruled block on this head:\n\n' + groups.map(g => {
     const f = g.finding;
-    return `- ${f.file ? `\`${clean(f.file)}${f.line ? `:${f.line}` : ''}\` — ` : ''}${clean(f.summary)} (seats: ${[...g.seats].sort().join(', ')})`;
+    const at = [...g.locations].sort().map(l => `\`${clean(l)}\``).join(', ') || (f.file ? `\`${clean(f.file)}\`` : '');
+    return `- ${at ? `${at} — ` : ''}${clean(f.summary)} (seats: ${[...g.seats].sort().join(', ')})`;
   }).join('\n');
 }

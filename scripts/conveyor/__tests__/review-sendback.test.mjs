@@ -37,6 +37,11 @@ describe('review send-back', () => {
     const body = renderFindingsBody([ref('a', 'Reject x < 0', 'a.js'), ref('b', 'Reject x > 0', 'a.js'), ref('c', 'Reject x < 0', 'b.js')]);
     expect(body.match(/^- /gm)).toHaveLength(3);
   });
+  it('renders every location of an identical finding', () => {
+    const body = renderFindingsBody([ref('a', 'Same', 'a.js', 4), ref('b', 'Same', 'a.js', 9)]);
+    expect(body).toContain('a.js:4');
+    expect(body).toContain('a.js:9');
+  });
   it('does not send when live referral state no longer owes a block', () => {
     const { o, tick } = fixture({ readReferrals: vi.fn(() => []) }); tick();
     expect(o.execute).not.toHaveBeenCalled();
