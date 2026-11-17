@@ -1,5 +1,4 @@
 /** Unchecked drafts need typed skips; stale acceptance must not hide current-head review blockers. */
-import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -13,13 +12,9 @@ export default {
   title: 'unchecked drafts lose typed skip reasons and stale acceptance masks current-head review blockers',
   card: 'soak-declaration: draft promotion and status derivation',
   fixedBy: { sha: 'HEAD', where: 'lane/soak-declaration', paths: PATHS },
-  fixPresent(root) {
-    try {
-      const [rule, loop, status] = PATHS.map(path => readFileSync(join(root, path), 'utf8'));
-      return rule.includes("reason: 'awaiting-ci-trigger'") && rule.includes("reason: 'ci-blocked-by-conflict'")
-        && loop.includes('fresh.reason') && status.includes('!reviewBlock') && status.includes('headOnly.outcome');
-    } catch { return false; }
-  },
+  // The fix ships in the same change as this break, so it is always present: the harness never flips this break
+  // to `it.fails`. Behaviour is asserted by `run` + `judge`, never by source substrings.
+  fixPresent() { return true; },
   async run({ sourceRoot = ROOT, log } = {}) {
     const { isDraftOwedPromotion } = await import(pathToFileURL(join(sourceRoot, PATHS[0])).href);
     const { runDraftPromotionStep } = await import(pathToFileURL(join(sourceRoot, PATHS[1])).href);
