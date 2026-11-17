@@ -88,6 +88,8 @@ const REVIEW_AUTH_IMPORTS = Object.freeze([
   // record-referral-ruling.mjs builds the ruling card's locus prefix through this module (PR #6754).
   'scripts/lib/locus-prefix-text.mjs',
   // The -io and -cli halves' imports: the seat provider and review settings they decide with, and the operation engine.
+  // record-verdict-io now resolves the review coordinator through aiRouting before reconstructing the review seats.
+  'scripts/lib/ai-routing.mjs',
   'scripts/lib/review-seat-provider.mjs', 'scripts/lib/review-settings.mjs', 'scripts/lib/pr-state/referrals.mjs',
   'scripts/lib/pr-state/snapshot.mjs', 'scripts/lib/gh-app-shim.mjs', 'scripts/apply-review-request.mjs',
   'scripts/operations/review-pr.mjs', 'scripts/operations/review-pr-io.mjs', 'scripts/operations/engine.mjs',
@@ -245,7 +247,7 @@ export const LOCK_USERS = Object.freeze([
   'scripts/lib/daemon-rebuild/overlay-main-sync.mjs', 'scripts/lib/daemon-rebuild/rebuild-job.mjs',
   'scripts/lib/drain-queue-safety.mjs', 'scripts/lib/drain-red-team-evidence.mjs', 'scripts/lib/fix-slot-borrow.mjs',
   'scripts/lib/gh-throttle-holders.mjs', 'scripts/lib/gh-throttle.mjs', 'scripts/lib/host-load.mjs',
-  'scripts/lib/merge-queue-adaptive-batching.mjs', 'scripts/lib/pr-limit.mjs', 'scripts/lib/pr-snapshot.mjs',
+  'scripts/lib/merge-queue-adaptive-batching.mjs', 'scripts/lib/pr-limit.mjs', 'scripts/lib/pr-list-paged.mjs', 'scripts/lib/pr-snapshot.mjs',
   // Gate refresh takes withFileLock; enqueue reserves the pending-refresh reader lock.
   'scripts/lib/merge-gate-refresh.mjs', 'scripts/lib/merge-queue-enqueue.mjs',
   'scripts/lib/red-team-carry-machine.mjs', 'scripts/lib/red-team-withheld-publish.mjs',

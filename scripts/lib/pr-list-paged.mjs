@@ -17,6 +17,12 @@ import { readDeclaredSettings } from './settings-files.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { GH_TRANSIENT_SERVER_PATTERNS, GH_JSON_PARSE_FAILURE_PATTERNS } from './gh-throttle.mjs';
 import { isGhDeferred } from './gh-deferred.mjs';
+import { createHash } from 'node:crypto';
+import { mkdirSync, readFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { withFileLock, writeJsonAtomic } from './atomic-json-file.mjs';
+import { prSnapshotDir } from './pr-snapshot-store.mjs';
+import { isUnderTest } from './under-test.mjs';
 
 export const HEAVY_FIELDS = Object.freeze(['comments', 'body', 'files']);
 export const PAGED_LIGHT_FIELDS = Object.freeze(['number', 'title', 'url', 'isDraft', 'createdAt', 'updatedAt', 'headRefName',
@@ -72,14 +78,148 @@ export function buildOpenPrPageQuery({ repo, pageSize, after = null }) {
   if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100) throw new TypeError('pageSize must be an integer from 1 to 100');
   const [owner, name] = repo.split('/');
   const cursor = after === null ? '' : `,after:${JSON.stringify(after)}`;
-  return `query{repository(owner:"${owner}",name:"${name}"){pullRequests(states:OPEN,first:${pageSize}${cursor},orderBy:{field:CREATED_AT,direction:DESC}){totalCount pageInfo{hasNextPage endCursor} nodes{number title url isDraft createdAt updatedAt headRefName headRefOid baseRefName isCrossRepository mergeable mergeStateStatus reviewDecision labels(first:100){nodes{id name description color}} commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename ...on CheckRun{name status conclusion startedAt completedAt detailsUrl checkSuite{workflowRun{workflow{name}}}} ...on StatusContext{context state targetUrl createdAt}}}}}}}}}}}`;
+  return `query{repository(owner:"${owner}",name:"${name}"){pullRequests(states:OPEN,first:${pageSize}${cursor},orderBy:{field:CREATED_AT,direction:DESC}){totalCount pageInfo{hasNextPage endCursor} nodes{number title url isDraft createdAt updatedAt headRefName headRefOid baseRefName isCrossRepository mergeable mergeStateStatus reviewDecision labels(first:100){nodes{id name description color}} commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename ...on CheckRun{name status conclusion startedAt completedAt detailsUrl databaseId checkSuite{app{slug databaseId} workflowRun{workflow{name}}}} ...on StatusContext{context state targetUrl createdAt}}}}}}}}}}}`;
 }
 
 const ZERO = '0001-01-01T00:00:00Z';
 const mapCtx = c => c.__typename === 'CheckRun'
   ? { __typename: 'CheckRun', completedAt: c.completedAt ?? ZERO, conclusion: c.conclusion ?? '', detailsUrl: c.detailsUrl,
-    name: c.name, startedAt: c.startedAt ?? ZERO, status: c.status, workflowName: c.checkSuite?.workflowRun?.workflow?.name ?? '' }
+    name: c.name, startedAt: c.startedAt ?? ZERO, status: c.status, workflowName: c.checkSuite?.workflowRun?.workflow?.name ?? '',
+    appSlug: c.checkSuite?.app?.slug ?? '', appId: c.checkSuite?.app?.databaseId ?? null, ...(Number.isInteger(c.databaseId) ? { checkRunId: c.databaseId } : {}) }
   : { __typename: 'StatusContext', context: c.context, startedAt: c.createdAt, state: c.state, targetUrl: c.targetUrl ?? '' };
+
+/** GraphQL hides `checkSuite.app` for some app-posted checks (live #6873: red-team, app null). For each LIVE,
+ *  workflow-less CheckRun with no app, read the posting app over REST so the planner can bind provenance to it.
+ *  A failed read leaves the app empty: the planner then fails closed. Bounded per list; costs nothing otherwise.
+ *  Rotate attempts across refreshes, including failures, so a pending prefix cannot starve later checks.
+ *  A check-run's posting app is immutable: retain successful provenance by repo/check ID only while that
+ *  check is still live and workflow-less. Snapshot callers persist this state under their existing lock. */
+const APP_LOOKUP_CAP = 20;
+const APP_LOOKUP_REPO_CAP = 128;
+const appLookupStates = new Map();
+export function resolveCheckApps({ repo, rows, exec, execOpts = {}, checkAppState }) {
+  const state = checkAppState ?? appLookupStates.get(repo) ?? {};
+  const previous = state.repo === repo ? state : {};
+  const candidates = new Map();
+  for (const row of rows) {
+    for (const c of row.statusCheckRollup ?? []) {
+      if (c?.__typename !== 'CheckRun' || String(c.status).toUpperCase() === 'COMPLETED' || c.workflowName || c.appId !== null || !Number.isInteger(c.checkRunId)) continue;
+      if (!candidates.has(c.checkRunId)) candidates.set(c.checkRunId, []);
+      candidates.get(c.checkRunId).push(c);
+    }
+  }
+  const apps = {};
+  const apply = (id, app) => {
+    apps[id] = app;
+    for (const c of candidates.get(id)) Object.assign(c, app);
+  };
+  const pending = [];
+  for (const id of candidates.keys()) {
+    const app = previous.apps?.[id];
+    if (Number.isInteger(app?.appId) && typeof app.appSlug === 'string') apply(id, { appId: app.appId, appSlug: app.appSlug });
+    else pending.push(id);
+  }
+  pending.sort((a, b) => a - b);
+  // Use a numeric successor so completion/removal of the last attempted check cannot reset progress.
+  const start = Math.max(0, pending.findIndex(id => id > previous.cursor));
+  let cursor = previous.cursor ?? null;
+  for (let i = 0; i < Math.min(APP_LOOKUP_CAP, pending.length); i++) {
+    const id = pending[(start + i) % pending.length];
+    // Advance even on an unreadable answer: unknown checks hold, but cannot monopolize the budget.
+    cursor = id;
+    try {
+      const app = JSON.parse(String(exec('gh', ['api', `repos/${repo}/check-runs/${id}`], execOptions(execOpts))))?.app;
+      if (Number.isInteger(app?.id)) apply(id, { appId: app.id, appSlug: typeof app.slug === 'string' ? app.slug : '' });
+    } catch { /* unreadable: leave the app empty (fail closed) */ }
+  }
+  // Prune disappeared/completed checks; explicit state also carries progress across fresh Node processes.
+  Object.assign(state, { repo, cursor: candidates.size ? cursor : null, apps });
+  if (!checkAppState) {
+    appLookupStates.delete(repo);
+    appLookupStates.set(repo, state);
+    if (appLookupStates.size > APP_LOOKUP_REPO_CAP) appLookupStates.delete(appLookupStates.keys().next().value);
+  }
+  return rows;
+}
+
+/** `gh pr list --json statusCheckRollup` (the runner's tick snapshot, `open-pr-fetch.mjs`) carries neither a check-run id
+ *  nor its app. For each row with a LIVE, workflow-less CheckRun and no app, read the head commit's check runs over REST
+ *  and bind appId/appSlug by check name — but only when every same-named run on that commit agrees on one app. Any
+ *  failure, missing run, disagreement, a partial page (`total_count` above the runs returned) or no still-live same-name
+ *  run leaves the app empty: the planner then fails closed. `filter=all` shows superseded same-name runs of other apps
+ *  to the agreement test. Bounded per list; reserve the next batch with a persisted SHA cursor before the REST reads,
+ *  so clock phase, failed reads and fresh processes cannot repeatedly select only the same pending prefix.
+ *  `repo` null → the cwd repo (gh placeholders). */
+const COMMIT_LOOKUP_CAP = 30;
+const SHA_RE = /^[0-9a-f]{40}$/;
+const commitLookupCursors = new Map();
+
+function nextCommitLookups(shas, { repo, execOpts, env }) {
+  if (shas.length <= COMMIT_LOOKUP_CAP) return shas;
+  const identity = repo || env.GH_REPO;
+  const key = identity ? `repo:${identity.toLowerCase()}` : `cwd:${resolve(execOpts.cwd || process.cwd())}`;
+  const select = cursor => {
+    // A successor survives removal of the last attempted head and changes to input order/size.
+    const start = SHA_RE.test(cursor) ? Math.max(0, shas.findIndex(sha => sha > cursor)) : 0;
+    return Array.from({ length: COMMIT_LOOKUP_CAP }, (_, i) => shas[(start + i) % shas.length]);
+  };
+  // Hermetic tests/fake gh must never touch the host store. An explicit fixture directory exercises persistence.
+  if ((isUnderTest(env) || env.FAKE_GH_FIXTURE) && !env.WE_PR_SNAPSHOT_DIR) {
+    const batch = select(commitLookupCursors.get(key));
+    commitLookupCursors.delete(key);
+    commitLookupCursors.set(key, batch.at(-1));
+    if (commitLookupCursors.size > APP_LOOKUP_REPO_CAP) commitLookupCursors.delete(commitLookupCursors.keys().next().value);
+    return batch;
+  }
+  try {
+    const dir = join(prSnapshotDir(env), 'commit-app-cursors');
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, `${createHash('sha256').update(key).digest('hex')}.json`);
+    return withFileLock(`${path}.lock`, () => {
+      let cursor;
+      try { cursor = JSON.parse(readFileSync(path, 'utf8'))?.cursor; }
+      catch (error) { if (error.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error; }
+      const batch = select(cursor);
+      // Publish under the lock, BEFORE network IO; failures/crashes cannot monopolize a batch.
+      // Only scheduling state is stored here. App provenance is always fetched afresh.
+      writeJsonAtomic(path, { cursor: batch.at(-1) });
+      return batch;
+    }, { timeoutMs: 1000 });
+  } catch {
+    console.error('check-app lookup progress unavailable; restore writable PR snapshot storage; skipping commit lookups');
+    return []; // no unsynchronized prefix fallback; unknown apps remain closed
+  }
+}
+
+export function resolveCheckAppsByCommit({ repo, rows, exec, execOpts = {}, env = execOpts.env ?? process.env }) {
+  const wanted = new Map(); // headRefOid -> checks needing an app
+  for (const row of rows) {
+    if (typeof row?.headRefOid !== 'string' || !SHA_RE.test(row.headRefOid)) continue;
+    for (const c of row.statusCheckRollup ?? []) {
+      if (c?.__typename !== 'CheckRun' || String(c.status).toUpperCase() === 'COMPLETED' || c.workflowName || c.appId || c.appSlug) continue;
+      if (!wanted.has(row.headRefOid)) wanted.set(row.headRefOid, []);
+      wanted.get(row.headRefOid).push(c);
+    }
+  }
+  const shas = [...wanted.keys()].sort();
+  const base = repo ? `repos/${repo}` : 'repos/{owner}/{repo}';
+  for (const sha of nextCommitLookups(shas, { repo, execOpts, env })) {
+    try {
+      const body = JSON.parse(String(exec('gh', ['api', `${base}/commits/${sha}/check-runs?per_page=100&filter=all`], execOptions(execOpts))));
+      const runs = body?.check_runs;
+      // A partial page could hide a same-named run of another app: bind nothing from it.
+      if (!Array.isArray(runs) || !Number.isInteger(body.total_count) || body.total_count > runs.length) continue;
+      for (const c of wanted.get(sha)) {
+        const same = runs.filter(r => r?.name === c.name);
+        const ids = new Set(same.map(r => r?.app?.id));
+        const stillLive = same.some(r => String(r?.status).toLowerCase() !== 'completed');
+        if (same.length === 0 || !stillLive || ids.size !== 1 || !Number.isInteger(same[0].app?.id)) continue;
+        Object.assign(c, { appId: same[0].app.id, appSlug: typeof same[0].app.slug === 'string' ? same[0].app.slug : '' });
+      }
+    } catch { /* unreadable: leave the app empty (fail closed) */ }
+  }
+  return rows;
+}
 
 /** PURE: exactly gh pr list --json's labels and flattened statusCheckRollup shape. */
 export function mapGraphqlPr(n) {
@@ -133,7 +273,7 @@ function readPage({ repo, exec, query, page, pageRetries, execOpts }) {
 }
 
 /** SYNC: complete pages only; failure or deferral never returns previously read rows. */
-export function listOpenPrsLightPaged({ repo, exec, pageSize, pageRetries = 1, maxRows = 500, execOpts = {} }) {
+export function listOpenPrsLightPaged({ repo, exec, pageSize, pageRetries = 1, maxRows = 500, execOpts = {}, checkAppState }) {
   const started = Date.now();
   const rows = [];
   let pages = 0, bytes = 0, after = null, hasNextPage = false, totalCount;
@@ -147,6 +287,7 @@ export function listOpenPrsLightPaged({ repo, exec, pageSize, pageRetries = 1, m
     ({ hasNextPage, totalCount } = result);
     after = result.endCursor;
   } while (hasNextPage && rows.length < maxRows);
+  resolveCheckApps({ repo, rows, exec, execOpts, checkAppState });
   return { rows, pages, bytes, ms: Date.now() - started, truncated: hasNextPage && rows.length >= maxRows, totalCount };
 }
 

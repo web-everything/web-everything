@@ -1,6 +1,6 @@
 {
   "break": 5,
-  "title": "invalid B cannot block a positive A stop",
+  "title": "an unreadable store B keeps the owner unknown and refuses the stop",
   "input": {
     "home": "/home/test",
     "env": {
@@ -40,9 +40,8 @@
     "handle": "abcdef01-1234-4567-89ab-123456789abc"
   },
   "expect": {
-    "kind": "found",
-    "store": "/home/test/.claude",
-    "action": "stop",
-    "argId": "job-a"
+    "kind": "unknown",
+    "action": "refuse",
+    "reason": "unknown"
   }
 }
