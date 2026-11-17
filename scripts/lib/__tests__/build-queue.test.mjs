@@ -514,6 +514,51 @@ describe('build.priority operator list', () => {
 });
 
 
+it('runtime reads one second apart share the CLI cache key and hit the cache until semantics change', () => {
+  const root = mkdtempSync(join(tmpdir(), 'build-priority-runtime-cache-'));
+  const dir = join(root, 'backlog');
+  const cacheFile = buildQueueCacheFile(dir);
+  try {
+    mkdirSync(dir);
+    card(dir, '9101-first.md', { kind: 'story', size: 2, status: 'open', dateOpened: '2026-01-01', tags: [] });
+    const queueFile = join(root, 'queue.json');
+    writeFileSync(queueFile, '[]');
+    const runtimePath = join(root, 'runtime.json');
+    const clockPath = join(root, 'clock.mjs');
+    writeFileSync(clockPath, 'Date.now = () => Number(process.env.WE_TEST_RUNTIME_CACHE_NOW);');
+    const record = { ids: ['9101'], mode: 'only', setBy: 'operator', at: new Date(NOW).toISOString(), ttlHours: 1 };
+    writeFileSync(runtimePath, JSON.stringify(record));
+    const env = { ...process.env, CONVEYOR_QUEUE_FILE: queueFile, WE_BUILD_QUEUE_CACHE: '1',
+      WE_BUILD_PRIORITY_RUNTIME_FILE: runtimePath, WE_POLICY_CASCADE_LOG: '0' };
+    delete env.WE_BUILD_PRIORITY;
+    const run = at => JSON.parse(execFileSync(process.execPath,
+      ['--import', clockPath, BACKLOG_CLI, 'build-queue', '--json', `--backlog-dir=${dir}`],
+      { env: { ...env, WE_TEST_RUNTIME_CACHE_NOW: String(at) }, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024 }));
+    const cache = () => JSON.parse(readFileSync(cacheFile, 'utf8'));
+    const first = run(NOW);
+    const firstCache = cache();
+    const second = run(NOW + 1000);
+    expect(cache().key).toBe(firstCache.key);
+    expect(cache().at).toBe(NOW); // A recompute would publish NOW + 1000.
+    expect(second).toEqual(first);
+    expect(first.buildPriority.runtime.ageMs).toBe(0);
+
+    // TTL status, mode, list contents and fail-closed holds all invalidate the cache.
+    expect(run(NOW + 3600001).buildPriority.runtime.expired).toBe(true);
+    expect(cache().key).not.toBe(firstCache.key);
+    let previousKey = cache().key;
+    for (const update of [{ ...record, mode: 'lift' }, { ...record, ids: [] }, null]) {
+      writeFileSync(runtimePath, JSON.stringify(update));
+      run(NOW + 3600002);
+      expect(cache().key).not.toBe(previousKey);
+      previousKey = cache().key;
+    }
+  } finally {
+    rmSync(cacheFile, { force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 it('build-queue --next carries operator metadata and invalidates cached order when the list changes', () => {
   const root = mkdtempSync(join(tmpdir(), 'build-priority-cli-'));
   try {

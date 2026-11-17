@@ -6,9 +6,67 @@ const args = { needsPrepare: [{ num: '#099' }, { num: 100 }], availableLanes: [5
 afterEach(() => vi.restoreAllMocks());
 
 describe('prepare refusal skip', () => {
+  it('preserves recent refusals across successive ticks and drops expired or invalid entries', () => {
+    const input = { state: {}, plan: { held: [{ num: '#099', reason: 'needs-prepare' }] }, freeLanes: [5], now };
+    const prepareRefusals = Object.freeze({
+      99: Object.freeze([now - 1, now - 2, now - PREPARE_REFUSAL_WINDOW_MS - 1, now + 1, 'bad']),
+      100: Object.freeze([now - PREPARE_REFUSAL_WINDOW_MS - 1]),
+      101: null,
+      102: Object.freeze([now - PREPARE_REFUSAL_WINDOW_MS]),
+    });
+    const first = planTick({ ...input, bookkeeping: { prepareRefusals } });
+    expect(first.decisions.spawnPrepareItems).toEqual([]);
+    const second = planTick({ ...input, now: now + 1000, bookkeeping: first.nextState });
+    expect(second.decisions.spawnPrepareItems).toEqual([]);
+    expect(first.nextState.prepareRefusals).toEqual({ 99: [now - 1, now - 2], 102: [now - PREPARE_REFUSAL_WINDOW_MS] });
+    expect(second.nextState.prepareRefusals).toEqual({ 99: [now - 1, now - 2] });
+    const expired = planTick({ ...input, now: now + PREPARE_REFUSAL_WINDOW_MS, bookkeeping: second.nextState });
+    expect(expired.nextState.prepareRefusals).toEqual({});
+    expect(expired.decisions.spawnPrepareItems).toEqual([{ num: '#099', lane: 5 }]);
+  });
+
+  it.each(['needs-prepare', 'prepare-stale', 'no-size'])('refused %s cards do not occupy a one-card prepare window', reason => {
+    const result = planTick({
+      state: { queue: [{ num: '#099', buildPriority: 0 }, { num: 100 }] },
+      plan: { held: [{ num: '#099', reason }, { num: 100, reason: 'needs-prepare' }] },
+      freeLanes: [5], now,
+      config: { prepareAheadWindow: 1, prepareAutoSize: true },
+      bookkeeping: { prepareRefusals: { 99: [now - 1, now - 2] } },
+    });
+    expect(result.decisions.spawnPrepareItems).toEqual([{ num: 100, lane: 5 }]);
+    expect(result.decisions.notes.filter(note => note.kind === 'prepare-refusal-skip'))
+      .toEqual([{ kind: 'prepare-refusal-skip', num: '#099', text: expect.any(String) }]);
+    expect(result.decisions.notes.some(note => note.kind === 'prepare-ahead-window' && note.num === '#099')).toBe(false);
+  });
+
   it('exports the two-refusal, 24-hour bounds', () => {
     expect(PREPARE_REFUSAL_LIMIT).toBe(2);
     expect(PREPARE_REFUSAL_WINDOW_MS).toBe(86400000);
+  });
+
+  it.each(['guard', 'open PR'])('keeps in-flight %s cards in the prepare window without refusal notes', kind => {
+    const guard = { num: 99, kind: 'prepare-item', lane: 4, spawnedTick: 1, sawPr: false, claimed: true };
+    const result = planTick({
+      state: { queue: [{ num: 99 }, { num: 100 }], prs: kind === 'open PR' ? [{ num: 99, pr: 7000, state: 'OPEN' }] : [] },
+      plan: { held: [{ num: 99, reason: 'needs-prepare' }, { num: 100, reason: 'needs-prepare' }] },
+      freeLanes: [5], now, config: { prepareAheadWindow: 1 },
+      bookkeeping: { tick: 1, prepareRefusals: { 99: [now - 1, now - 2] }, prepareGuards: kind === 'guard' ? [guard] : [] },
+    });
+    expect(result.decisions.spawnPrepareItems).toEqual([]);
+    expect(result.decisions.notes.some(note => note.kind === 'prepare-refusal-skip')).toBe(false);
+    if (kind === 'guard') expect(result.nextState.prepareGuards).toEqual([guard]);
+  });
+
+  it('a retired guard no longer exempts a refused card from the window filter', () => {
+    const result = planTick({
+      state: { queue: [{ num: 99 }, { num: 100 }] },
+      plan: { held: [{ num: 99, reason: 'needs-prepare' }, { num: 100, reason: 'needs-prepare' }] },
+      freeLanes: [5], now, config: { prepareAheadWindow: 1, prepareItemTtlTicks: 1 },
+      bookkeeping: { tick: 2, prepareRefusals: { 99: [now - 1, now - 2] },
+        prepareGuards: [{ num: 99, kind: 'prepare-item', lane: 4, spawnedTick: 0, sawPr: false, claimed: true }] },
+    });
+    expect(result.decisions.retireGuards.prepare).toContainEqual(expect.objectContaining({ num: 99, reason: 'ttl' }));
+    expect(result.decisions.spawnPrepareItems).toEqual([{ num: 100, lane: 5 }]);
   });
 
   it('two recent refusals skip the normalized item without consuming a lane or slot', () => {

@@ -1150,8 +1150,12 @@ function buildQueue() {
   const mtimeOf = (p) => { try { return statSync(p).mtimeMs; } catch { return 'none'; } };
   const baseKey = cacheEnabled ? buildQueueCacheKey({ backlogDir: DIR, configPath: BUILD_QUEUE_CONFIG_PATH,
     next: argv.includes('--next') }) : null;
+  // Runtime age and its log line change on every read; only policy semantics invalidate cached output.
+  const priorityKey = { ids: buildPriority.ids, mode: buildPriority.mode, only: buildPriority.only,
+    held: buildPriority.held, source: buildPriority.source,
+    runtime: { hash: buildPriority.runtime?.hash, expired: buildPriority.runtime?.expired } };
   const key = baseKey === null ? null
-    : JSON.stringify([baseKey, buildPriority, queueSrc.path, mtimeOf(queueSrc.path), mtimeOf(DELIVERY_PRIORITY_SETTINGS_PATH), mtimeOf(PLATFORM_PREFERENCES_PATH),
+    : JSON.stringify([baseKey, priorityKey, queueSrc.path, mtimeOf(queueSrc.path), mtimeOf(DELIVERY_PRIORITY_SETTINGS_PATH), mtimeOf(PLATFORM_PREFERENCES_PATH),
       process.env.WE_PLATFORM_PREFERENCES_FILE,
       mtimeOf(join(SETTINGS_DIR, 'build-queue-priority.json')), process.env.WE_BUILD_QUEUE_PRIORITY_MODE,
       // The tool layer is the MERGE of dispatch-settings.json + every scripts/settings/*.json, so a later-sorting file can
