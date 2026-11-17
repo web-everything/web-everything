@@ -678,20 +678,23 @@ export const PROVIDER_QUOTA_FALLBACK = Object.freeze({ codex: 'antigravity' });
  * such caller, whether or not it ever seats a graceful judge request; the dynamic import here pays it only
  * when a request actually opts in (today, only `review-pr`'s `judgeAdvisory` seat).
  *
- * Never throws: an unreadable store, a failed import, or any other scan error reads as "no records", which
- * `quotaHold` itself already treats as usable — the same fail-open posture `review-extra-seats.mjs` takes on
- * its own read (`runExtraSeats`'s `catch` around `io.readRecords()`).
+ * Never throws: an unreadable/malformed store holds the provider closed; an absent store has no holds.
+ * A failed optional review-module import or other scan error still returns null, independently of store IO.
  * @param {string} providerName
  * @param {number} when - epoch ms.
  * @returns {Promise<string|null>} the hold reason, or null when usable.
  */
 export async function defaultProviderQuotaHold(providerName, when) {
   try {
-    const [{ quotaHold }, { readStore }] = await Promise.all([
-      import('./review-extra-seats.mjs'),
-      import('../conveyor/run-scorecard-store.mjs'),
-    ]);
-    return quotaHold(readStore().records, providerName, when);
+    const { readStore } = await import('../conveyor/run-scorecard-store.mjs');
+    let records;
+    try {
+      records = readStore({ strict: true }).records;
+    } catch {
+      return 'scorecard store unreadable';
+    }
+    const { quotaHold } = await import('./review-extra-seats.mjs');
+    return quotaHold(records, providerName, when);
   } catch {
     return null;
   }

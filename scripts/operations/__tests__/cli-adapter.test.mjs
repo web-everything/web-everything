@@ -6,6 +6,17 @@ import { notApplied } from '../effect-executor.mjs';
 import { createRegistry, op } from '../registry.mjs';
 import { createMemoryRunStore, isRunRecordTerminal } from '../run-store.mjs';
 import { effect } from '../step-kinds.mjs';
+import { defaultProviderQuotaHold } from '../cli-adapter.mjs';
+import { REVIEW_SEAT_DISPATCH_KIND } from '../../lib/provider-routing.mjs';
+
+const scorecardIO = vi.hoisted(() => ({ read: undefined }));
+vi.mock('../../conveyor/run-scorecard-store.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    readStore: (options) => actual.readStore({ ...options, read: scorecardIO.read }),
+  };
+});
 
 function fixture(prefix = []) {
   const registry = createRegistry();
@@ -112,5 +123,52 @@ describe('driveRun permanent guard refusal', () => {
     expect(context.store.read(context.run.id)).toEqual(result.run);
     expect(guard).toHaveBeenCalledTimes(1);
     expect(note).not.toHaveBeenCalled();
+  });
+});
+
+describe('defaultProviderQuotaHold strict store admission', () => {
+  const now = Date.parse('2026-09-30T20:00:00Z');
+  const row = {
+    dispatchKind: REVIEW_SEAT_DISPATCH_KIND, provider: 'codex', status: 'quota-exhausted',
+    scoredAt: '2026-09-30T19:59:00Z', quotaResetsAt: '2026-09-30T21:00:00Z',
+  };
+  const exhausted = 'quota exhausted on its last seat call (2026-09-30T19:59:00Z); sitting out until 2026-09-30T21:00:00.000Z';
+
+  it.each([
+    ['ok', { version: 1, records: [] }, null],
+    ['ENOENT', null, null],
+    ['malformed JSON', '{', 'scorecard store unreadable'],
+    ['invalid store shape', { records: null }, 'scorecard store unreadable'],
+    ['EACCES', null, 'scorecard store unreadable'],
+    ['quota exhausted', { records: [row] }, exhausted],
+    ['quota gauge full', { records: [{ ...row, status: 'ok', quotaUsedPercent: 99 }] },
+      'quota gauge at 99% on its last seat call; sitting out until 2026-09-30T21:00:00.000Z'],
+    ['expired quota', { records: [{ ...row, quotaResetsAt: '2026-09-30T19:59:59Z' }] }, null],
+    ['later clean row', { records: [row, { ...row, status: 'ok', scoredAt: '2026-09-30T20:00:00Z' }] }, null],
+  ])('%s preserves holds or refuses unreadable evidence', async (state, store, expected) => {
+    scorecardIO.read = vi.fn(() => {
+      if (state === 'ENOENT' || state === 'EACCES') throw Object.assign(new Error(state), { code: state });
+      return typeof store === 'string' ? store : JSON.stringify(store);
+    });
+    try {
+      expect(await defaultProviderQuotaHold('codex', now)).toBe(expected);
+      expect(scorecardIO.read).toHaveBeenCalledTimes(1);
+    } finally {
+      scorecardIO.read = undefined;
+    }
+  });
+
+  it.each([
+    ['readable', '{"records":[]}', null],
+    ['unreadable', '{', 'scorecard store unreadable'],
+  ])('keeps a failed optional import separate from a %s store', async (_state, text, expected) => {
+    scorecardIO.read = () => text;
+    vi.doMock('../review-extra-seats.mjs', () => { throw new Error('optional import unavailable'); });
+    try {
+      expect(await defaultProviderQuotaHold('codex', now)).toBe(expected);
+    } finally {
+      vi.doUnmock('../review-extra-seats.mjs');
+      scorecardIO.read = undefined;
+    }
   });
 });
