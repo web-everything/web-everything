@@ -1,15 +1,15 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { createReviewJobIo, dispatchReviewJob, runReviewJobCli } from '../review-job.mjs';
-import { readReviewJobRetry, writeReviewJobRetry } from '../review-job-retry.mjs';
+import { createReviewJobIo, dispatchReviewJob, runReviewJobCli, writeJobRecord } from '../review-job.mjs';
+import { readReviewJobRetry, writeReviewJobRetry, rearmReviewJobRetry, settleReviewJobRetry } from '../review-job-retry.mjs';
 import { tryReadCompletion } from '../completion-store.mjs';
 import { writeReviewJobDone, writeReviewJobStarted } from '../review-job-envelope.mjs';
 import { laneGitHardeningEnv } from '../../lib/lane-git-hardening.mjs';
 
 const head = 'a'.repeat(40), repo = 'plateauapp/plateau-app', pr = 229;
 const roots = [];
-afterEach(() => { vi.unstubAllEnvs(); for (const dir of roots.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); for (const dir of roots.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 function fixture(overrides = {}) {
   const dir = mkdtempSync(join(process.env.TMPDIR, 'review-retry-')); roots.push(dir);
   let completion = null, now = Date.now(), pid = 4000, currentHead = head;
@@ -85,7 +85,7 @@ describe('job-mode retry parking', () => {
     expect(() => runReviewJobCli(['rearm', `--pr=${pr}`, `--repo=${repo}`, `--expected-head=${head}`],
       { dir: f.options.dir, io: { checkoutExists: () => true, liveHead: () => 'b'.repeat(40) } })).toThrow(/head changed/);
     runReviewJobCli(['rearm', `--pr=${pr}`, `--repo=${repo}`, `--expected-head=${head}`],
-      { dir: f.options.dir, io: { checkoutExists: () => true, liveHead: () => head } });
+      { dir: f.options.dir, isAlive: () => false, io: { checkoutExists: () => true, liveHead: () => head } });
     expect(f.dispatch().jobPid).toBeGreaterThan(0);
     f.finish('blocked-on-infra'); f.move(); expect(f.dispatch().jobPid).toBeGreaterThan(0);
     expect(readReviewJobRetry('review-pa-229', f.options.dir).attempts).toBe(1);
@@ -191,5 +191,92 @@ describe('retry evidence and synthetic completion ownership', () => {
     expect(f.options.isAlive).toHaveBeenCalledWith(4001); expect(f.options.isAlive).toHaveBeenCalledWith(5000);
     expect(f.options.retryTerminal).toHaveBeenCalledOnce();
     expect(JSON.parse(readFileSync(path, 'utf8'))).toMatchObject({ status: 'done', outcome: 'blocked-on-infra' });
+  });
+});
+
+describe('pending ownership across re-arm and production PID probes', () => {
+  const slug = 'review-pa-229';
+  const retryPath = f => join(f.options.dir, '.retry', `${slug}.json`);
+  const rearm = f => runReviewJobCli(['rearm', `--pr=${pr}`, `--repo=${repo}`, `--expected-head=${head}`],
+    { dir: f.options.dir, io: { checkoutExists: () => true, liveHead: () => head } });
+  function pending(claim = 'missing') {
+    const f = fixture(); f.dispatch();
+    const path = join(f.options.dir, `${slug}.json`);
+    if (claim === 'missing') rmSync(path); else if (claim === 'corrupt') writeFileSync(path, '{broken');
+    return f;
+  }
+  function rawProbe(outcome) {
+    const original = process.kill.bind(process);
+    return vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+      if (pid !== 4001 || signal !== 0) return original(pid, signal);
+      if (outcome === 'live') return true;
+      throw Object.assign(Error('raw signal-zero probe'), { code: outcome === 'unknown' ? undefined : outcome });
+    });
+  }
+  it.each(['EPERM', 'EACCES', 'EIO', 'unknown'])('default dispatch settlement retains pending on raw %s instead of synthesizing death', code => {
+    const f = pending(), bytes = readFileSync(retryPath(f));
+    rawProbe(code); f.options.isAlive = undefined;
+    expect(f.dispatch().skipped).toMatch(/pending PID live or unknown/);
+    expect(f.options.retryTerminal).not.toHaveBeenCalled(); expect(f.options.spawnJob).toHaveBeenCalledTimes(1);
+    expect(readFileSync(retryPath(f)).equals(bytes)).toBe(true);
+  });
+  it.each(['before CI', 'during CI'])('default dispatch retains a claim with raw EACCES observed %s', timing => {
+    const f = fixture(); rawProbe('EACCES'); f.options.isAlive = undefined;
+    const claim = () => writeJobRecord({ slug, repo, pr, pid: 4001 }, f.options.dir);
+    if (timing === 'before CI') claim();
+    else f.options.ciGate = () => { claim(); return { allowed: true, headSha: head }; };
+    expect(f.dispatch().skipped).toBe('live-job');
+    expect(f.options.spawnJob).not.toHaveBeenCalled(); expect(f.options.retryTerminal).not.toHaveBeenCalled();
+    expect(existsSync(retryPath(f))).toBe(false);
+  });
+  it.each(['missing', 'corrupt'].flatMap(claim => ['live', 'EPERM', 'EACCES', 'unknown'].map(probe => ({ claim, probe }))))(
+    're-arm refuses a $probe pending PID despite a $claim claim, keeping dispatch blocked', ({ claim, probe }) => {
+      const f = pending(claim), bytes = readFileSync(retryPath(f));
+      rawProbe(probe);
+      expect(() => rearm(f)).toThrow(/cannot re-arm: pending PID live or unknown/);
+      f.options.isAlive = undefined;
+      expect(f.dispatch().skipped).toMatch(/pending PID live or unknown/);
+      expect(f.options.spawnJob).toHaveBeenCalledTimes(1); expect(f.options.retryTerminal).not.toHaveBeenCalled();
+      expect(readFileSync(retryPath(f)).equals(bytes)).toBe(true);
+    });
+  it('standalone settlement and re-arm defaults also refuse raw EACCES', () => {
+    const f = pending(), bytes = readFileSync(retryPath(f)); rawProbe('EACCES');
+    expect(settleReviewJobRetry({ slug, repo, head, dir: f.options.dir, completion: null, cap: 3,
+      terminal: f.options.retryTerminal }).skipped).toMatch(/pending PID live or unknown/);
+    expect(() => rearmReviewJobRetry({ slug, repo, head, dir: f.options.dir })).toThrow(/pending PID live or unknown/);
+    expect(f.options.retryTerminal).not.toHaveBeenCalled(); expect(readFileSync(retryPath(f)).equals(bytes)).toBe(true);
+  });
+  it.each(['missing', 'corrupt'])('re-arm releases pending only after raw ESRCH with a %s claim', claim => {
+    const f = pending(claim); rawProbe('ESRCH');
+    expect(rearm(f)).toMatchObject({ attempts: 0, parked: false });
+    expect(readReviewJobRetry(slug, f.options.dir).pending).toBeUndefined();
+    expect(f.dispatch().jobPid).toBe(4002);
+  });
+  it('default settlement synthesizes the terminal record only after raw ESRCH', () => {
+    const f = pending(); rawProbe('ESRCH'); f.options.isAlive = undefined;
+    expect(f.dispatch().jobPid).toBe(4002);
+    expect(f.options.retryTerminal).toHaveBeenCalledOnce();
+  });
+  it('re-arm retains a readable claim when its signal-zero probe is unknown', () => {
+    const f = pending('intact'), bytes = readFileSync(retryPath(f)); rawProbe('EACCES');
+    expect(() => rearm(f)).toThrow(/cannot re-arm: claim PID live or unknown/);
+    expect(readFileSync(retryPath(f)).equals(bytes)).toBe(true);
+  });
+  it.each(['corrupt', 'invalid-pending', 'wrong-repo'])('re-arm refuses %s retry state instead of erasing hidden pending ownership', kind => {
+    const f = pending(), state = readReviewJobRetry(slug, f.options.dir);
+    if (kind === 'invalid-pending') delete state.pending.baseline;
+    if (kind === 'wrong-repo') state.repo = 'web-everything/web-everything';
+    const bytes = kind === 'corrupt' ? '{"pending":{"pid":4001},' : JSON.stringify(state);
+    writeFileSync(retryPath(f), bytes);
+    expect(() => rearm(f)).toThrow(kind === 'wrong-repo' ? /repository mismatch/ : /retry evidence unreadable/);
+    expect(readFileSync(retryPath(f), 'utf8')).toBe(bytes); expect(f.options.spawnJob).toHaveBeenCalledTimes(1);
+  });
+  it.each([undefined, 2 ** 31])('re-arm refuses a missing/oversized pending PID (%s) before a liveness probe', pid => {
+    const f = pending(), state = readReviewJobRetry(slug, f.options.dir);
+    state.pending.pid = pid; writeReviewJobRetry(state, f.options.dir);
+    const bytes = readFileSync(retryPath(f)), isAlive = vi.fn(() => false);
+    expect(() => runReviewJobCli(['rearm', `--pr=${pr}`, `--repo=${repo}`, `--expected-head=${head}`],
+      { dir: f.options.dir, isAlive, io: { checkoutExists: () => true, liveHead: () => head } })).toThrow(/pending PID live or unknown/);
+    expect(isAlive).not.toHaveBeenCalled(); expect(readFileSync(retryPath(f)).equals(bytes)).toBe(true);
   });
 });

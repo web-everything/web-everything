@@ -2,7 +2,7 @@
 import { proveCardOnlyHeadMove } from '../lib/card-only-head-move.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus, redTeamStatusDir, readRecoveryWitness, restoreRecoveryWriter, createCarriedCheckPublisher, markCarriedCheckUnpublished } from '../lib/drain-red-team-evidence.mjs';
-import { pidNamespace } from '../lib/pid-alive.mjs';
+import { pidNamespace, probePidAlive } from '../lib/pid-alive.mjs';
 import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { reviewUsesRequiredChecks } from '../lib/review-timing.mjs';
@@ -1398,7 +1398,7 @@ export function dispatchReviewJob({
   spawnJob = defaultSpawnJob,
   readCompletion = tryReadCompletion,
   resolveSettingsEnv = () => resolveGhShimSettingsEnv(undefined),
-  isAlive = pidAlive,
+  isAlive = probePidAlive,
   checkoutExists = existsSync, home = homedir(), expectedHead, io = createReviewJobIo({ root, env }),
   publishNeedsYou = item => publishAttention(item), retryTerminal = writeReviewJobDone,
 } = {}) {
@@ -1415,7 +1415,7 @@ export function dispatchReviewJob({
   const base = { mode: 'job', pr: planned.pr, repo: planned.repo, repoKey: planned.repoKey, sessionSlug: slug, agentId: null, logPath };
 
   const existing = readJobRecord(slug, dir);
-  if (existing && Number.isInteger(existing.pid) && isAlive(existing.pid)) {
+  if (existing && Number.isInteger(existing.pid) && isAlive(existing.pid) !== false) {
     return { ...base, jobPid: existing.pid, skipped: 'live-job' };
   }
   if (laneCooloffActive(readCompletion(slug), now)) {
@@ -1433,7 +1433,7 @@ export function dispatchReviewJob({
   return withCompletionLock(`dispatch-${slug}`, () => {
     // Recheck under the same lock as budget reservation and spawn (two daemon processes may overlap).
     const live = readJobRecord(slug, dir);
-    if (live && Number.isInteger(live.pid) && isAlive(live.pid)) return { ...base, jobPid: live.pid, skipped: 'live-job' };
+    if (live && Number.isInteger(live.pid) && isAlive(live.pid) !== false) return { ...base, jobPid: live.pid, skipped: 'live-job' };
     const completion = readCompletion(slug);
     let retry = null;
     if (!redTeamOnly) {
@@ -1600,7 +1600,7 @@ export function carryStackAccept({ pr, repo, root = REPO_ROOT, env = process.env
 
 /** CLI boundary; injected job and rating effects keep recovery guard tests hermetic. */
 export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runReviewJob, rate = rateAndRecordReviewJob, onError = () => {},
-  io = null, dir = reviewJobsDir() } = {}) {
+  io = null, dir = reviewJobsDir(), isAlive = probePidAlive } = {}) {
   const [sub, ...rest] = argv;
   const flag = (name) => {
     const hit = rest.find((a) => a.startsWith(`--${name}=`));
@@ -1612,9 +1612,7 @@ export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runRevi
     const refusal = expectedHeadRefusal(flag('expected-head') ?? null, planned, jobIo);
     if (refusal) throw Error(refusal.reason);
     return withCompletionLock(`dispatch-${planned.sessionSlug}`, () => {
-      const existing = readJobRecord(planned.sessionSlug, dir);
-      if (existing && pidAlive(existing.pid)) throw Error('cannot re-arm a live review job');
-      return rearmReviewJobRetry({ slug: planned.sessionSlug, repo: planned.repo, head: flag('expected-head'), dir });
+      return rearmReviewJobRetry({ slug: planned.sessionSlug, repo: planned.repo, head: flag('expected-head'), dir, isAlive });
     }, { dir: join(dir, '.retry') });
   }
   if (sub !== 'run') {

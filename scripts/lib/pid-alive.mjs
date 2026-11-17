@@ -24,6 +24,13 @@ export function pidAlive(pid, kill = (p, s) => process.kill(p, s)) {
   try { kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; }
 }
 
+/** Cleanup authority: false ONLY on ESRCH; invalid PIDs and every other probe error are unknown. */
+export function probePidAlive(pid, kill = (p, s) => process.kill(p, s)) {
+  if (!Number.isSafeInteger(pid) || pid <= 0 || pid > 2 ** 31 - 1) return null;
+  try { kill(pid, 0); return true; }
+  catch (error) { return error?.code === 'ESRCH' ? false : null; }
+}
+
 /** One bounded, locale-stable snapshot; unreadable or malformed output is unknown. */
 function readPidIdentity(pid, exec) {
   if (!Number.isInteger(pid) || pid <= 0) return { alive: null, reason: 'invalid-pid' };

@@ -2,12 +2,16 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { writeJobRecord, jobRecordPath } from './review-job-store.mjs';
+import { writeJobRecord, jobRecordPath, readJobRecord } from './review-job-store.mjs';
 import { writeReviewJobDone } from './review-job-envelope.mjs';
-import { pidAlive } from '../lib/pid-alive.mjs';
+import { probePidAlive } from '../lib/pid-alive.mjs';
 
 const CLEAN = new Set(['auto-cleared', 'bounced', 'parked', 'carried']);
 export const completionFingerprint = rec => createHash('sha256').update(JSON.stringify(rec ?? null)).digest('hex');
+function provenDead(pid, isAlive) {
+  if (!Number.isSafeInteger(pid) || pid <= 0 || pid > 2 ** 31 - 1) return false;
+  try { return isAlive(pid) === false; } catch { return false; }
+}
 
 export function readReviewJobRetry(slug, dir) {
   try {
@@ -19,34 +23,37 @@ export function readReviewJobRetry(slug, dir) {
     return state;
   } catch (error) {
     if (error.code === 'ENOENT') return null;
-    throw Error('review retry evidence unreadable; inspect or explicitly re-arm before dispatch', { cause: error });
+    throw Error('review retry evidence unreadable; inspect and repair ownership evidence before dispatch or re-arm', { cause: error });
   }
 }
 export const writeReviewJobRetry = (state, dir) => writeJobRecord(state, join(dir, '.retry'));
 
-export function rearmReviewJobRetry({ slug, repo, head, dir }) {
+export function rearmReviewJobRetry({ slug, repo, head, dir, isAlive = probePidAlive }) {
   if (!/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('re-arm requires a readable pinned head');
+  // A missing/corrupt claim does not release the independently persisted pending writer.
+  const state = readReviewJobRetry(slug, dir), claim = readJobRecord(slug, dir);
+  if (state && state.repo !== repo) throw Error('review retry repository mismatch');
+  if (claim && !provenDead(claim.pid, isAlive))
+    throw Error('cannot re-arm: claim PID live or unknown; inspect ownership evidence first');
+  if (state?.pending && !provenDead(state.pending.pid, isAlive))
+    throw Error('cannot re-arm: pending PID live or unknown; inspect ownership evidence first');
   return writeReviewJobRetry({ slug, repo, head: head.toLowerCase(), attempts: 0, parked: false, notified: false }, dir);
 }
 
 /** Claims can be missing or unreadable: prove pending-writer death independently before settling. */
-export function settleReviewJobRetry({ slug, repo, head, dir, completion, cap, terminal = writeReviewJobDone, isAlive = pidAlive }) {
+export function settleReviewJobRetry({ slug, repo, head, dir, completion, cap, terminal = writeReviewJobDone, isAlive = probePidAlive }) {
   let state = readReviewJobRetry(slug, dir);
   const knownHead = state?.head;
   if (state?.repo !== undefined && state.repo !== repo) throw Error('review retry repository mismatch');
   if (state?.pending) {
     const retain = reason => ({ ...state, skipped: `review-job-pending: ${reason}; inspect claim/completion before re-arming` });
-    const dead = pid => {
-      if (!Number.isSafeInteger(pid) || pid <= 0 || pid > 2 ** 31 - 1) return false;
-      try { return isAlive(pid) === false; } catch { return false; }
-    };
-    if (!dead(state.pending.pid)) return retain('pending PID live or unknown');
+    if (!provenDead(state.pending.pid, isAlive)) return retain('pending PID live or unknown');
     const ownDone = completion?.status === 'done'
       && completionFingerprint(completion) !== state.pending.baseline
       && Date.parse(completion.updatedAt) >= state.pending.at
       && (completion.pid == null || completion.pid === state.pending.pid);
     if (!ownDone) {
-      if (completion !== null && completion?.pid !== state.pending.pid && !dead(completion?.pid))
+      if (completion !== null && completion?.pid !== state.pending.pid && !provenDead(completion?.pid, isAlive))
         return retain('completion PID live or unknown');
       terminal({ session: slug, pr: state.pending.pr, repo, pid: state.pending.pid,
         classified: { outcome: 'blocked-on-infra', label: 'review-job process exited without a done record' } });

@@ -4424,8 +4424,12 @@ completion. A PID-less completion requires our claim. Withheld writes log an ins
 fallback; the dispatcher's missing-done recovery still owns subsequent settlement. Dispatch uses
 `tryReadCompletion` without swallowing corrupt/unreadable evidence into absence. Recovery retains
 pending state unless its PID is proven dead, and never synthesizes over a live or unknown foreign
-completion writer. Missing/oversized pending PIDs require inspection and explicit re-arm; a missing
-or corrupt job claim alone is never evidence that a process died. Crash fixtures
+completion writer. Settlement and re-arm use `probePidAlive`: only signal-zero `ESRCH` proves
+death; `EPERM`, `EACCES` and all other errors are unknown. Re-arm checks both the job claim and
+retry pending PID under the dispatch lock; a missing/corrupt claim cannot erase a live or unknown
+pending writer. Unreadable retry state and missing/oversized pending PIDs require ownership
+evidence to be inspected and repaired before re-arm, not a blind budget reset. Producer tests
+inject raw signal-zero errors into the default settlement and re-arm paths. Crash fixtures
 must seed the dispatcher's own-PID claim; the foreign-live-PID import regression seeds the parent
 process's started record before handler installation and compares its bytes after the child exits.
 The lifecycle receipt for red-team-only jobs is separate so it cannot replace a panel verdict.
