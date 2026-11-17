@@ -834,6 +834,36 @@ describe('standards input parity', () => {
     expect(await runRemote(f)).toMatchObject({mode:'cancelled',terminated:true,reason:'incomplete-standards-inputs',detail:line});
   });
 
+  it.each(['stdout','stderr','both'])('falls back for a dynamic section skip despite static local agreement on %s', async stream => {
+    const f=scopedStandardsFixture('scripts/backlog/frontmatter.mjs'),original=f.exec;
+    const sourceRoot=fileURLToPath(new URL('../../../',import.meta.url));
+    for(const path of importClosure(join(sourceRoot,'scripts/lib/validate-rules-anchors.cjs')).keys()) {
+      const target=join(cwd,relative(sourceRoot,path));
+      mkdirSync(dirname(target),{recursive:true});
+      cpSync(path,target);
+    }
+    const gate=createSectionGate({scoped:true,touched:['scripts/backlog/frontmatter.mjs'],root:cwd});
+    expect(gate.shouldRun('9a-rules')).toBe(false);
+    const line='\x1b[36m  local\x1b[0m \x1b[2mskipped (scoped: no input touched): 9a-rules\x1b[0m';
+    f.exec=vi.fn(async call=>{
+      const result=await original(call);
+      if(isRun(call))return {...result,stdout:stream==='stderr'?'':line,stderr:stream==='stdout'?'':line};
+      return result;
+    });
+    expect(await runRemote(f)).toEqual({mode:'cancelled',terminated:true,code:1,reason:'incomplete-standards-inputs',detail:line});
+  });
+
+  it('keeps a plain (uncoloured) real scoped skip line remote when the local gate agrees', async () => {
+    const f=scopedStandardsFixture(),original=f.exec;
+    const line=`  local ${SKIP_REASON}: 14, 19\n`;
+    f.exec=vi.fn(async call=>{
+      const result=await original(call);
+      if(isRun(call)){call.onOutput(line,'stdout');return {...result,stdout:line};}
+      return result;
+    });
+    expect(await runRemote(f)).toMatchObject({mode:'remote',code:0});
+  });
+
   it('falls back for an unknown scoped skip section', async () => {
     const f=scopedStandardsFixture(),original=f.exec;
     const line=`local ${SKIP_REASON}: 14, unknown-section`;

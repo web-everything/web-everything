@@ -8,7 +8,7 @@ import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { makeGitOverlay } from '../hermetic-git-overlay.mjs';
 import {
-  createSectionGate, globToRegExp, matchesAny, SECTION_INPUTS, ALWAYS_TRIGGERS, SKIP_REASON,
+  createSectionGate, globToRegExp, matchesAny, SECTION_INPUTS, DYNAMIC_SECTIONS, ALWAYS_TRIGGERS, SKIP_REASON,
 } from '../standards-sections.mjs';
 import { importClosure } from '../standards-cache.mjs';
 
@@ -88,6 +88,13 @@ describe('createSectionGate', () => {
 });
 
 describe('check-standards.mjs wiring', () => {
+  it('dynamic gate calls exactly match DYNAMIC_SECTIONS, preventing static-only skip exemptions', () => {
+    const src = readFileSync(CHECK, 'utf8');
+    const dynamic = new Set([...src.matchAll(/sectionGate\.shouldRun\(\s*['"]([^'"]+)['"]\s*,\s*\{\s*dynamicInputs\b/g)]
+      .map((m) => m[1]));
+    expect([...dynamic].sort()).toEqual([...DYNAMIC_SECTIONS].sort());
+  });
+
   it('every gated section id is declared, and every declared id is gated', () => {
     const src = readFileSync(CHECK, 'utf8');
     const used = new Set([...src.matchAll(/sectionGate\.shouldRun\('([^']+)'/g)].map((m) => m[1]));
