@@ -20,18 +20,18 @@ const mailbox = vi.hoisted(() => {
 });
 vi.mock('node:fs', async importOriginal => {
   const actual = await importOriginal();
-  return {
-    ...actual,
-    ...Object.fromEntries([
-      'mkdirSync', 'readFileSync', 'writeFileSync', 'renameSync', 'watchFile', 'unwatchFile', 'watch',
-    ].map(name => [name, (path, ...args) => {
-      if (mailbox.route && (String(path) === mailbox.route.dir || String(path).startsWith(`${mailbox.route.dir}/`))) {
-        mailbox.route.operations.add(name);
-        return mailbox.route.fs[name](path, ...args);
-      }
-      return actual.default[name](path, ...args);
-    }])),
-  };
+  const routed = Object.fromEntries([
+    'mkdirSync', 'readFileSync', 'writeFileSync', 'renameSync', 'watchFile', 'unwatchFile', 'watch',
+  ].map(name => [name, (path, ...args) => {
+    if (mailbox.route && (String(path) === mailbox.route.dir || String(path).startsWith(`${mailbox.route.dir}/`))) {
+      mailbox.route.operations.add(name);
+      return mailbox.route.fs[name](path, ...args);
+    }
+    return actual.default[name](path, ...args);
+  }]));
+  // Vite's web transform can access named builtin imports through the default export.
+  // Both forms must share the router, including when handoff modules capture fs methods.
+  return { ...actual, ...routed, default: { ...actual.default, ...routed } };
 });
 
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, chmodSync, watch, unwatchFile } from 'node:fs';
