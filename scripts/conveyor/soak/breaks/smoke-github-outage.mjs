@@ -65,7 +65,7 @@ export async function replayBudgetExhaustedOutage(root) {
       return '';
     } });
   return runLiveSmokeWithRetry({ root, runChild, clock: () => t,
-    env: { WE_SMOKE_LOAD_SCALE: '0', WE_SMOKE_BUSY_LOAD_RATIO: '1e9', WE_SMOKE_GH_ENV_PROBE: '1', WE_RESOURCE_SHADOW: 'off' },
+    env: { WE_SMOKE_LOAD_SCALE: '0', WE_SMOKE_BUSY_LOAD_RATIO: '1e9', WE_SMOKE_GH_ENV_PROBE: '1', WE_RESOURCE_SHADOW: 'off', WE_SMOKE_SKIP_RECONCILE_DRY_RUN: '0', WE_SMOKE_DISPATCH_PASSES: '3' },
     refreshAuth: async ({ env }) => ({ env, refresh: null }),
     retries: 1, backoffMs: 10, sleep: async (ms) => { t += ms; }, log: { error() {} } });
 }

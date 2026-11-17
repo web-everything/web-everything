@@ -19,7 +19,7 @@ import {
   rebuildClone, readRebuildState, readReadyCandidate,
 } from '../daemon-rebuild.mjs';
 import {
-  resolveRebuildAsJob, rebuildCloneAsJob, rebuildChildArgs, parseRebuildChildOutput, REBUILD_JOB_KIND, RESULT_SUFFIX,
+  resolveRebuildAsJob, loadRebuildAsJobSettings, rebuildCloneAsJob, rebuildChildArgs, parseRebuildChildOutput, REBUILD_JOB_KIND, RESULT_SUFFIX,
 } from '../daemon-rebuild/rebuild-job.mjs';
 import { readRebuildStarvation, writeRebuildStarvation } from '../daemon-rebuild/lease.mjs';
 import * as rebuildLease from '../daemon-rebuild/lease.mjs';
@@ -228,6 +228,23 @@ describe('rebuildCloneAsJob — the tick side', () => {
     });
     expect(r.reason).toBe('rebuild-job-spaced');
     expect(store.list().records).toHaveLength(1);
+  });
+  it('spaces a new build even after one that recorded a ready candidate (15 min folding)', async () => {
+    const { store, reattach } = setup();
+    const rec = enqueueJob({ store, kindDef: REBUILD_JOB_KIND, codeSha: 'd'.repeat(40), input: { root: '/tmp/x' } });
+    store.update(rec.id, (r) => markSucceeded(r, { at: new Date().toISOString() }));
+    writeFileSync(join(store.dir, `${rec.id}${RESULT_SUFFIX}`), JSON.stringify({ reason: 'ready-recorded', readyRecorded: true, target: 'f00' }));
+    const adopt = vi.fn(async () => ({ moved: false, reason: 'needs-build', plan: { finalSha: 'abc' } }));
+    const r = await rebuildCloneAsJob({
+      root: '/tmp/x', adopt, store, reattach, codeSha: 'd'.repeat(40), log: quietLog, evict: () => ({ evicted: [] }),
+      settings: { entries: [], minIntervalMs: 900_000 },
+    });
+    expect(r.reason).toBe('rebuild-job-spaced');
+    expect(store.list().records).toHaveLength(1);
+  });
+
+  it('ships a 15 minute build interval', () => {
+    expect(loadRebuildAsJobSettings(undefined, { env: {} }).minIntervalMs).toBe(900_000);
   });
 });
 
