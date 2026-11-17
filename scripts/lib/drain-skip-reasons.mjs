@@ -87,7 +87,7 @@ export function buildSkipReasons({ verdicts = [], merged = [], failedMerges = []
   for (const v of verdicts) {
     if (v.decision !== 'merge') continue;
     const held = heldAtEnqueue.get(keyOf(v));
-    if (held) { put(v, String(held.kind || 'batching-deferred'), held.reason || 'admission deferred', 'enqueueOutcomes'); continue; }
+    if (held) { put(v, String(held.kind || 'enqueue-refused-unclassified'), held.reason || 'admission deferred', 'enqueueOutcomes'); continue; }
     const partner = v.item == null ? null : verdicts.find((o) => o !== v && o.item != null && String(o.item) === String(v.item)
       && keyOf(o) !== keyOf(v) && !landed.has(keyOf(o)));
     if (partner) {

@@ -69,6 +69,16 @@ describe('drain skip reasons (card 122 slice 1)', () => {
     expect(classifySkipReason('something new')).toBe('unrecognized-reason');
     expect(buildSkipReasons({ verdicts: [{ num: 9, decision: 'skip', reason: 'x', escalated: 'yes' }] })[0].kind).toBe('escalated');
   });
+  it('keeps an explicit batching-deferred kind from the enqueue outcome', () => {
+    const rows = buildSkipReasons({ verdicts: [{ num: 301, decision: 'merge' }],
+      enqueueOutcomes: [{ num: 301, repo: null, outcome: 'not-enqueued', kind: 'batching-deferred', reason: 'batching' }] });
+    expect(rows[0]).toMatchObject({ num: 301, kind: 'batching-deferred', source: 'enqueueOutcomes' });
+  });
+  it('a kindless not-enqueued outcome fails closed, never batching-deferred', () => {
+    const rows = buildSkipReasons({ verdicts: [{ num: 302, decision: 'merge' }],
+      enqueueOutcomes: [{ num: 302, repo: null, outcome: 'not-enqueued', reason: 'x' }] });
+    expect(rows[0]).toMatchObject({ num: 302, kind: 'enqueue-refused-unclassified', source: 'enqueueOutcomes' });
+  });
   it('the drain wires it into the result and the summary line', () => {
     const src = readFileSync(resolve(process.cwd(), 'scripts/merge-ai-prs.mjs'), 'utf8');
     expect(src).toMatch(/heldCoupleMembers, skipReasons,/);
