@@ -299,6 +299,22 @@ secret-shaped, so only the design can keep them out of every sink.
 Cover retry recovery, exhausted retries, non-signal refusal and concurrency with injected children;
 exercise diagnostic propagation through a real-git rebuild fixture. Run these suites through heavy admission.
 
+## Overlay main-sync parking recovery
+
+In `daemon-rebuild-overlay-main-sync.test.mjs`, reject the changed-tip unpark rename,
+then separately reject the failure-record rename: persisted tip, count and parked tip
+must remain a complete old streak or become a complete new streak. Probe subsequent
+recovery through the scheduler before the worker to catch suppressed admission and
+unreadable mixed state. Retry stops and failure evidence commit in one transaction;
+a failed unpark must not consume the old retry budget. Parking silences test runs
+and failed events; both scheduler and worker must still retry an unsent needs-you
+immediately. Exercise local diagnostic and feed publication failures separately, then
+restore storage and observe successful publication. Reject both primary and legacy
+mirror renames at unpark and park, including an already-alerted prior streak and an
+unavailable feed: a committed park must retain its unsent alert. Also reject alert
+acknowledgement and fallback-marker renames after publication; retries must preserve
+the published notification. Run this suite through heavy admission.
+
 ## Red-team re-check evidence
 
 Recovery distinguishes a policy-clear from a completed seat and a failed execution. A trusted
