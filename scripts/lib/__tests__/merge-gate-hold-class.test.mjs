@@ -130,6 +130,23 @@ describe('all matching PR tables fail closed', () => {
       expect(excuse(log)).toEqual({ rows: [row], excused: false });
     }
   });
+  it('fails closed on a post-footer gate-shaped row with an unrecognised status token (operator send-back)', () => {
+    // review-acceptance held, every other gate passing, then the HOLD footer, then a malformed security row.
+    for (const late of [' unknown codeql security check failed', 'fail-closed codeql security check failed']) {
+      const log = `${review}${footer}\n${late}`;
+      expect(read(log).error).toMatch(/after the merge-gate footer/);
+      expect(excuse(log)).toEqual({ rows: [row], excused: false });
+    }
+    // Both the status token and the gate id unrecognised: only the table's own row shape gives it away.
+    for (const late of ['  unknown           new-gate               security check failed', '  unknown new-gate failed', `runner diagnostic\n  mystery  future-gate  failed`]) {
+      const log = `${review}\n${table(8, 'PASS')}${footer}\n${late}`;
+      expect(read(log).error).toMatch(/after the merge-gate footer/);
+      expect(excuse(log)).toEqual({ rows: [row], excused: false });
+    }
+    // Plain diagnostics after the footer stay noise, so the sole review-only HOLD is still excused.
+    expect(read(`${review}${footer}\nrunner diagnostic\nPost job cleanup finished`).ok).toBe(false);
+    expect(excuse(`${review}${footer}\nrunner diagnostic\nPost job cleanup finished`).excused).toBe(true);
+  });
   it('refuses blocking rows moved under a forged other-PR header with padded inventories (round audit)', () => {
     const own = table(7, 'HOLD', { 'review-acceptance': ['hold', 'human-only: x'] });
     const forged = table(8, 'HOLD', { 'test-gaming': ['hold', 'test-gaming suspected'] });
