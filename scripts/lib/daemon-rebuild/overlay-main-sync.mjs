@@ -251,7 +251,7 @@ function needsYou(root, env, ref, error, io = fs, requireFeed = false) {
   const file = alertsFilePath(root, env);
   io.mkdirSync(dirname(file), { recursive: true });
   io.appendFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), kind: 'overlay-main-sync-needs-you', detail })}\n`);
-  if (requireFeed && !published) throw new Error('needs-you feed publication failed');
+  return !requireFeed || published;
 }
 function failureAlert(root, env, ref, error, io = fs, immediate = false, requireFeed = false) {
   const at = Date.now();
@@ -271,7 +271,9 @@ function failureAlert(root, env, ref, error, io = fs, immediate = false, require
       // streak rather than restarting the two-hour clock during fallback.
       pendingStreak = { firstFailureAt: { [ref]: state.firstFailureAt[ref] },
         failureReason: { [ref]: state.failureReason[ref] } };
-      needsYou(root, env, ref, state.failureReason[ref] ?? 'Overlay main sync failed; original error reason unavailable', io, requireFeed);
+      // Publication failure is pending delivery, not a state-storage failure:
+      // persist the streak without acknowledging it or replaying the local alert in fallback.
+      if (!needsYou(root, env, ref, state.failureReason[ref] ?? 'Overlay main sync failed; original error reason unavailable', io, requireFeed)) return;
       state.failureAlertedAt[ref] = at;
       state.errorAt ??= {};
       state.errorAt[ref] = at;

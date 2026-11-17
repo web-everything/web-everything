@@ -906,8 +906,8 @@ describe('overlay main sync', () => {
     expect(spawnFn).not.toHaveBeenCalled();
   }, 90_000);
 
-  it('parked passes retry a failed feed publication even when the local diagnostic succeeded', async () => {
-    const f = fixture();
+  it.each(['scheduler', 'worker'])('parked %s retries a failed feed publication even when the local diagnostic succeeded', async path => {
+    const f = fixture(), spawnFn = spawner();
     f.deps.testRunner = vi.fn(async () => ({ status: 1, stderr: 'persistent failure' }));
     const blocker = join(f.base, 'feed-unavailable');
     fs.writeFileSync(blocker, 'blocked');
@@ -915,13 +915,24 @@ describe('overlay main sync', () => {
     for (let i = 0; i < 3; i++) await expect(job(f)).rejects.toThrow(/persistent failure/);
     expect(json(sidecar(f)).parkedTip[ref]).toBe(f.oldSha);
     expect(json(sidecar(f)).failureAlertedAt[ref]).toBeUndefined();
+    expect(alerts(f)).toHaveLength(1);
+    const retry = async () => {
+      if (path === 'scheduler') expect(tick(f, { spawnFn }).skipped).toEqual([ref]);
+      else expect(await job(f)).toEqual({ skipped: true, reason: 'parked' });
+    };
+    await retry();
+    expect(json(sidecar(f)).failureAlertedAt[ref]).toBeUndefined();
+    expect(fs.existsSync(f.env.WE_NEEDS_YOU_FEED)).toBe(false);
     fs.unlinkSync(blocker);
-    expect(await job(f)).toEqual({ skipped: true, reason: 'parked' });
+    await retry();
     expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toContainEqual(expect.objectContaining({
       kind: 'overlay-main-sync-needs-you', ref, reason: expect.stringContaining('parked after 3 failures'),
     }));
     expect(json(sidecar(f)).failureAlertedAt[ref]).toEqual(expect.any(Number));
+    await retry();
+    expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toHaveLength(1);
     expect(f.deps.testRunner).toHaveBeenCalledTimes(3);
+    expect(spawnFn).not.toHaveBeenCalled();
   }, 90_000);
 
   it.each([
@@ -982,11 +993,16 @@ describe('overlay main sync', () => {
     const f = fixture(), spawnFn = spawner();
     f.deps.testRunner = vi.fn(async () => ({ status: 1, stderr: 'persistent failure' }));
     const rejected = [];
+    const acknowledgement = rename === 'state' ? sidecar(f) : sidecar(f).replace(/\.state$/, '.json');
+    const markerDir = `${alertsFilePath(f.root, f.env)}.main-sync`;
     f.deps.io.renameSync = (source, target) => {
+      // Lease fences rename directories too; only inspect the acknowledgement JSON files.
+      const fallbackMarker = dirname(target) === markerDir && target.endsWith('.json');
+      if (target !== acknowledgement && !fallbackMarker) return fs.renameSync(source, target);
       const next = json(source);
-      if ((target === (rename === 'state' ? sidecar(f) : sidecar(f).replace(/\.state$/, '.json'))
+      if ((target === acknowledgement
         && next.parkedTip?.[ref] && next.failureAlertedAt?.[ref])
-        || target.startsWith(`${alertsFilePath(f.root, f.env)}.main-sync/`)) {
+        || fallbackMarker) {
         rejected.push(target);
         throw new Error('alert acknowledgement unavailable');
       }
@@ -996,7 +1012,7 @@ describe('overlay main sync', () => {
     expect(rejected).toContain(rename === 'state' ? sidecar(f) : sidecar(f).replace(/\.state$/, '.json'));
     expect(rejected.some(file => file.startsWith(`${alertsFilePath(f.root, f.env)}.main-sync/`))).toBe(true);
     expect(json(sidecar(f)).parkedTip[ref]).toBe(f.oldSha);
-    expect(json(sidecar(f)).failureAlertedAt[ref]).toBe(rename === 'state' ? undefined : expect.any(Number));
+    expect(json(sidecar(f)).failureAlertedAt[ref]).toEqual(rename === 'state' ? undefined : expect.any(Number));
     expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toHaveLength(1);
     f.deps.io.renameSync = fs.renameSync;
     if (path === 'scheduler') expect(tick(f, { spawnFn }).skipped).toEqual([ref]);
