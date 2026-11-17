@@ -13,7 +13,8 @@ const HEAD = 'ABCDEF0123456789ABCDEF0123456789ABCDEF01';
 const ACTOR = { 'system:fix-stood-down': 'system', 'system:ledger-write-miss': 'system', 'system:stale-hold': 'system', 'red-team-sent-back-cleared': 'nobody',
   'awaiting-review': 'reviewer', 'human-review-pending-advisory': 'reviewer', 'red-team-pending': 'red-team', 'drain-skip:red-team-pending': 'red-team',
   fixing: 'fixer', 'sent-back-red-team': 'fixer', draft: 'fixer', 'ci-failed': 'fixer', 'awaiting-ci': 'ci', 'ready-to-merge': 'drain',
-  'in-merge-queue': 'drain', 'drain-skip:queue-file-overlap': 'drain', 'drain-skip:overlap-yield': 'drain', 'drain-skip:ready-not-reached': 'drain' };
+  'in-merge-queue': 'drain', 'drain-skip:queue-file-overlap': 'drain', 'drain-skip:overlap-yield': 'drain', 'drain-skip:ready-not-reached': 'drain',
+  'drain-skip:batching-deferred': 'drain' };
 const row = (waitingOn, o = {}) => ({ repo: REPO, number: 77, waitingOn, actor: ACTOR[waitingOn] ?? 'operator', stalled: true, liveJob: null,
   why: 'x', evidence: ['e1', 'e2', 'e3', 'e4'], next: { summary: 's', command: `next-for ${waitingOn}` }, ...o });
 const finding = (cls, file = 'scripts/foo.mjs') => ({ file, line: 3, summary: `${cls}: the claim must be released before the push`, cls, priorAppearances: 0 });
@@ -67,6 +68,7 @@ const FIXED = {
   'ci-failed': ['system', 'tooling-card'], 'awaiting-ci': ['system', 'tooling-card'], 'ready-to-merge': ['system', 'tooling-card'],
   'in-merge-queue': ['system', 'tooling-card'], 'drain-skip:queue-file-overlap': ['system', 'tooling-card'],
   'drain-skip:ready-not-reached': ['system', 'tooling-card'], 'drain-skip:overlap-yield': ['system', 'tooling-card'],
+  'drain-skip:batching-deferred': ['system', 'tooling-card'],
   'drain-skip:escalated': ['operator', 'unclassified'], 'drain-skip:unknown': ['operator', 'unclassified'],
   'ruling-needed:dispute': ['operator', 'ruling-needed:dispute'], 'needs-decision:note': ['operator', 'needs-decision:note'],
   'draft-withdrawn': ['operator', 'draft-withdrawn'], 'needs-you': ['operator', 'needs-you'], 'human-review': ['operator', 'human-review'],
@@ -108,6 +110,15 @@ describe('every state x every verdict', () => {
 });
 
 describe('known drain waits explain what releases them', () => {
+  it('drain batching is deferred to a later pass without escalation', () => {
+    const result = at('drain-skip:batching-deferred', { row: { actor: 'drain' } });
+    expect(result.lane).toBe('system');
+    expect(result.action).toBe('tooling-card');
+    expect(result.smell).toBe('pr-stage-stall');
+    expect(result.reason).not.toContain('unknown waiting state');
+    expect(result.reason).toMatch(/batching.*deferred/i);
+    expect(result.action).not.toBe('escalate');
+  });
   it('same-head merge-queue failure is held until the head changes', () => {
     const result = at('drain-skip:mq-same-head-failed', { row: { actor: 'drain' } });
     expect(result.reason).not.toContain('unknown waiting state');
