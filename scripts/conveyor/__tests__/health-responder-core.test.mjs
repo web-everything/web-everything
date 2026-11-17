@@ -78,6 +78,16 @@ describe('health responder closed decision table', () => {
     i.subjectFacts = {};
     expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false, actionFamily: null });
   });
+  it.each([true, false])('keeps launchd copy drift observation-only (subject facts: %s)', (withFacts) => {
+    const i = input();
+    const e = i.episodes[0], facts = i.subjectFacts[e.key];
+    e.smell = 'launchd-ops-copy-drift'; e.subject = 'com.we.guard'; e.key = `${e.smell}::${e.subject}`;
+    e.recommendation = 'Refresh the ops copy and restart the launchd job';
+    facts.episodeKey = e.key;
+    i.subjectFacts = withFacts ? { [e.key]: facts } : {};
+    i.config.smells = { [e.smell]: true };
+    expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false, actionFamily: null });
+  });
   it('keeps Forge disk/prune alerts observation-only with or without a permitted action plan', () => {
     const i = input();
     const e = i.episodes[0], facts = i.subjectFacts[e.key];

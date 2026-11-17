@@ -310,7 +310,7 @@ export const OPERATIONS = Object.freeze({
     // normally instead of this builder aborting resolveOperation with the root usage.
     let savedRun = null;
     if (resumeId) { try { savedRun = createFileRunStore().read(resumeId); } catch { savedRun = null; } }
-    const seatSettings = loadReviewSeatSettings();
+    const seatSettings = loadReviewSeatSettings({ aiRouting: aiRoutingInputs('review', resolveAiRouting()).coordinator });
     const live = { codexAdvisory: codexAdvisoryFromEnv(), correctnessAdvisory: correctnessAdvisoryFromEnv(),
       antigravityReview: antigravityReviewFromEnv() };
     // A saved run keeps the roster it started with at every cursor position (`reviewSeatOptionsForRun`).
