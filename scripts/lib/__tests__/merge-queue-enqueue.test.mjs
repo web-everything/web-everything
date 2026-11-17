@@ -294,7 +294,8 @@ describe('startup-failure stale merge-gate refresh', () => {
     expect(refreshStalePr).toHaveBeenCalledTimes(2);
     expect(calls.filter(args => args.includes('POST'))).toHaveLength(0);
   });
-  it.each(['timeout', 'unreadable', 'removal', 'denied'])('%s holds only uncertain claims and re-reads pending next pass', async kind => {
+  it.each(['timeout', 'unreadable', 'removal', 'denied', 'graphql-denied'])('%s holds only uncertain claims and re-reads pending next pass', async kind => {
+    const denied = kind === 'denied' || kind === 'graphql-denied';
     const state = {}, calls = [];
     let added = false, secondPass = false;
     const refreshStalePr = vi.fn(options => refreshRealStalePr({ ...options, prNumber: 5006,
@@ -302,6 +303,9 @@ describe('startup-failure stale merge-gate refresh', () => {
       execGh: args => {
         calls.push(args);
         if (args.includes('--add-label')) {
+          if (!secondPass && kind === 'graphql-denied') throw Object.assign(new Error('Command failed: gh pr edit'), {
+            status: 1, stderr: Buffer.from('GraphQL: Resource not accessible by integration (addLabelsToLabelable)\n'),
+          });
           added = true;
           if (!secondPass && kind === 'denied') throw new Error('HTTP 403: denied');
           if (!secondPass && kind === 'timeout') throw new Error('add timed out');
@@ -317,15 +321,15 @@ describe('startup-failure stale merge-gate refresh', () => {
       record: vi.fn((_path, key, entry) => { state[key] = entry; }) });
     try {
       const first = await handleStaleMergeGate(o);
-      expect(first.reason).toContain(kind === 'denied' ? 'refresh FAILED' : 'gate-refresh-pending');
+      expect(first.reason).toContain(denied ? 'refresh FAILED' : 'gate-refresh-pending');
       expect(o.record).not.toHaveBeenCalled();
       expect(state).toEqual({});
-      expect(readdirSync(dirname(o.statePath)).filter(name => name.includes('-claim-head-'))).toHaveLength(kind === 'denied' ? 0 : 1);
+      expect(readdirSync(dirname(o.statePath)).filter(name => name.includes('-claim-head-'))).toHaveLength(denied ? 0 : 1);
       expect(calls.filter(args => args.includes('--add-label'))).toHaveLength(1);
       secondPass = true;
       expect((await handleStaleMergeGate(o)).reason).toContain('refresh gate-refresh');
       expect(o.record).toHaveBeenCalledTimes(1);
-      expect(calls.filter(args => args.includes('--add-label'))).toHaveLength(kind === 'denied' ? 2 : 1);
+      expect(calls.filter(args => args.includes('--add-label'))).toHaveLength(denied ? 2 : 1);
       expect(refreshStalePr).toHaveBeenCalledTimes(2);
     } finally { rmSync(dirname(o.statePath), { recursive: true, force: true }); }
   });

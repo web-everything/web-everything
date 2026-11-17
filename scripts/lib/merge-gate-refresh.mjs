@@ -154,9 +154,13 @@ export function toggleMergeGateRefresh({ repo, pr, gh = execFileSyncThrottled, s
   try { gh('gh', ['pr', 'edit', String(pr), '--repo', repo, '--add-label', LABEL], options); }
   catch (error) {
     if (clearedExisting) return pendingResult(`label add failed after removal: ${errorText(error)}`, true);
-    const status = Number(/\bHTTP(?:\/[^ ]+)?\s+(\d{3})\b/i.exec(errorText(error))?.[1] ?? error?.status);
-    if ([401, 403, 404, 410, 422].includes(status)) {
-      return { ok: false, state: 'denied', error: errorText(error) };
+    const message = errorText(error);
+    const status = Number(/\bHTTP(?:\/[^ ]+)?\s+(\d{3})\b/i.exec(message)?.[1] ?? error?.status);
+    // gh reports GraphQL permission rejections with exit status 1, without HTTP status.
+    // Match the denied mutation explicitly; other GraphQL errors remain uncertain.
+    const graphqlDenied = /\bGraphQL:\s+Resource not accessible by (?:integration|personal access token)\s+\(addLabelsToLabelable\)/i.test(message);
+    if ([401, 403, 404, 410, 422].includes(status) || graphqlDenied) {
+      return { ok: false, state: 'denied', error: message };
     }
     // The write may have reached GitHub. Read once, without retrying the add.
   }

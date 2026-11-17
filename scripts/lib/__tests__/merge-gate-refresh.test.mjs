@@ -89,6 +89,52 @@ describe('merge-gate refresh after restamp', () => {
       .toMatchObject({ ok: confirmed, state: confirmed ? 'confirmed' : 'pending-unknown' });
     expect(gh).toHaveBeenCalledTimes(1);
   });
+  it.each(['integration', 'personal access token'])('releases a GraphQL %s denial so a later restamp can retry', actor => {
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const base = fixture();
+    let denied = true;
+    const gh = vi.fn((file, args, opts) => {
+      if (denied && args.includes('--add-label')) throw Object.assign(new Error('Command failed: gh pr edit'), {
+        status: 1,
+        stderr: Buffer.from(`GraphQL: Resource not accessible by ${actor} (addLabelsToLabelable)\n`),
+      });
+      return base(file, args, opts);
+    });
+    expect(run(gh)).toMatchObject({ ok: false, state: 'denied' });
+    expect(gh.mock.calls.filter(([, args]) => args.includes('--add-label'))).toHaveLength(1);
+    denied = false;
+    expect(run(gh)).toEqual({ ok: true, refreshed: true });
+    expect(run(gh)).toEqual({ ok: true, refreshed: false });
+    expect(gh.mock.calls.filter(([, args]) => args.includes('--add-label'))).toHaveLength(2);
+  });
+  it.each([
+    'GraphQL: Something went wrong while executing your query (addLabelsToLabelable)',
+    'GraphQL: API rate limit exceeded',
+    'GraphQL: Resource not accessible by integration (repository)',
+    'add timed out',
+  ])('retains unknown outcomes without another add: %s', message => {
+    const gh = vi.fn((_bin, args) => {
+      if (args.includes('--add-label')) throw Object.assign(new Error(message), { status: 1 });
+      return args[1] === 'view' ? '{"labels":[]}' : '';
+    });
+    const pending = toggleMergeGateRefresh({ repo: 'o/r', pr: 7, gh });
+    expect(pending).toMatchObject({ ok: false, state: 'pending-unknown', confirmed: false });
+    expect(toggleMergeGateRefresh({ repo: 'o/r', pr: 7, gh, pending })).toMatchObject({ state: 'pending-unknown' });
+    expect(gh.mock.calls.filter(([, args]) => args.includes('--add-label'))).toHaveLength(1);
+  });
+  it('retains a confirmed removal when the subsequent GraphQL add is denied', () => {
+    let present = true;
+    const gh = vi.fn((_bin, args) => {
+      if (args[1] === 'view') return JSON.stringify({ labels: present ? [{ name: 'gate:refresh' }] : [] });
+      if (args.includes('--remove-label')) present = false;
+      if (args.includes('--add-label')) throw new Error('GraphQL: Resource not accessible by integration (addLabelsToLabelable)');
+      return '';
+    });
+    const pending = toggleMergeGateRefresh({ repo: 'o/r', pr: 7, gh });
+    expect(pending).toMatchObject({ ok: false, state: 'pending-unknown', confirmed: true });
+    expect(toggleMergeGateRefresh({ repo: 'o/r', pr: 7, gh, pending })).toEqual({ ok: true, state: 'confirmed' });
+    expect(gh.mock.calls.filter(([, args]) => args.includes('--add-label'))).toHaveLength(1);
+  });
   it.each([408, 409, 429])('confirms an applied add despite HTTP %i and never adds again', status => {
     let present = false;
     const gh = vi.fn((_bin, args) => {
