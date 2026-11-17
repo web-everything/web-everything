@@ -11,8 +11,8 @@
  *   drain last followed up, so the drain's existing post-land path runs for them.
  */
 import { execFileSync } from 'node:child_process';
-import { closeSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PLATFORM_PREFERENCES_PATH } from './merge-delivery-policy.mjs';
@@ -23,6 +23,8 @@ import { latestFailingMergeGate, readMergeGateVerdict } from './merge-gate-hold-
 import { readSharedFreeze } from './red-main-freeze-shared.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
+import { reserve, releaseLockDirIf } from '../readiness/file-locks.mjs';
+import { writeJsonAtomic } from './atomic-json-file.mjs';
 
 export const REQUIRED_WORKFLOWS_UNSATISFIED = 'required-workflows-unsatisfied';
 
@@ -553,9 +555,36 @@ async function refreshStartupFailure({ c, headSha, classification, setting, stat
     if (!pending) return { handled: false, reason: 'merge-gate startup_failure refresh already claimed for this head' };
   }
   const readLock = `${claim}-reread`;
+  const readLockRoot = `${readLock}-locks`;
+  const readOwner = `gate-refresh-${randomUUID()}`;
   if (pending) {
-    try { writeClaim(readLock); }
-    catch { return { handled: false, reason: 'merge-gate refresh already claimed for label re-read' }; }
+    try {
+      const now = Date.now();
+      // Older releases wrote an empty file here with no owner. Honor it for a
+      // bounded migration window; abandoned legacy files must not stall forever.
+      try { if (now - statSync(readLock).mtimeMs < 10 * 60_000) return { handled: false, reason: 'merge-gate refresh already claimed for label re-read' }; }
+      catch (error) { if (error?.code !== 'ENOENT') throw error; }
+      const liveness = entry => {
+        if (!entry?.pid) return 'unknown';
+        try { process.kill(entry.pid, 0); return 'alive'; }
+        catch (error) { return error?.code === 'ESRCH' ? 'dead' : 'alive'; }
+      };
+      if (!reserve(readLockRoot, claim, readOwner, now, new Date(now).toISOString(), process.pid,
+        liveness, entry => liveness(entry) === 'alive' ? Infinity : 10).ok) {
+        return { handled: false, reason: 'merge-gate refresh already claimed for label re-read' };
+      }
+      // Another reader may have finished between our first read and the lock.
+      const saved = JSON.parse(readFileSync(claim, 'utf8'));
+      if (saved?.state !== 'pending-unknown') {
+        releaseLockDirIf(readLockRoot, claim, { owner: readOwner });
+        return { handled: false, reason: 'merge-gate startup_failure refresh already claimed for this head' };
+      }
+      pending = saved;
+    }
+    catch {
+      releaseLockDirIf(readLockRoot, claim, { owner: readOwner });
+      return { handled: false, reason: 'merge-gate refresh already claimed for label re-read' };
+    }
   }
   let dispatched = false, failed = false, uncertain = Boolean(pending), produced = null;
   const refreshStalePr = async options => {
@@ -565,7 +594,7 @@ async function refreshStartupFailure({ c, headSha, classification, setting, stat
       if (out?.state === 'pending-unknown') {
         uncertain = true;
         // Persist uncertainty in the existing claim, never in the success ledger.
-        writeFileSync(claim, JSON.stringify({ state: out.state, confirmed: out.confirmed === true }));
+        writeJsonAtomic(claim, { state: out.state, confirmed: out.confirmed === true });
       } else if (!out?.ok) { failed = !pending; }
       else { produced = out.newCommit; if (pending) writeFileSync(claim, ''); }
       return out;
@@ -576,7 +605,10 @@ async function refreshStartupFailure({ c, headSha, classification, setting, stat
     result = await handleQueueRefresh({ ...handleArgs, refreshStalePr });
   } catch (e) { failed = !uncertain; throw e; }
   // Only definite failures release the head; uncertain label dispatches keep it without a success record.
-  finally { if (pending) { try { unlinkSync(readLock); } catch { /* already gone */ } } if (!dispatched || failed) { try { unlinkSync(claim); } catch { /* already gone */ } } }
+  finally {
+    if (pending) releaseLockDirIf(readLockRoot, claim, { owner: readOwner });
+    if (!uncertain && (!dispatched || failed)) { try { unlinkSync(claim); } catch { /* already gone */ } }
+  }
   // The produced head is a different head: claim it durably so a lost ledger write cannot re-arm it. If even that fails, block the whole PR.
   if (dispatched && !failed && produced && produced !== headSha) {
     try { writeClaim(claimFor('head', produced)); }

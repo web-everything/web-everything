@@ -1,8 +1,9 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import { planGateRefresh, refreshMergeGateAfterRestamp, toggleMergeGateRefresh } from '../merge-gate-refresh.mjs';
 
 const head = 'a'.repeat(40);
@@ -23,9 +24,102 @@ function fixture(checkRuns = [gate()], liveHead = head, total = checkRuns.length
 }
 const run = (gh, extra = {}) => refreshMergeGateAfterRestamp({ repo: 'o/r', pr: 7, head, gh,
   restampedAtMs, sleep: vi.fn(), ...extra });
+let stateDir;
+beforeEach(() => {
+  stateDir = fs.mkdtempSync(join(tmpdir(), 'restamp-refresh-'));
+  vi.stubEnv('WE_COORDINATION_ROOT', stateDir);
+});
+afterEach(() => { fs.rmSync(stateDir, { recursive: true, force: true }); vi.unstubAllEnvs(); });
 afterEach(() => vi.restoreAllMocks());
 
 describe('merge-gate refresh after restamp', () => {
+  it.each(['denied', 'timeout', 'read-back', 'removal'])('reports returned %s failures with the retained-restamp operator hint', kind => {
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const base = fixture();
+    let added = false;
+    const gh = vi.fn((file, args, opts) => {
+      if (args.includes('--add-label')) {
+        added = true;
+        if (kind === 'denied') throw new Error('HTTP 403: add denied');
+        if (kind === 'timeout') throw new Error('add timed out');
+      }
+      if (added && args[1] === 'view' && kind === 'read-back') throw new Error('read-back offline');
+      if (args.includes('--remove-label') && kind === 'removal') throw new Error('removal offline');
+      return base(file, args, opts);
+    });
+    const result = run(gh);
+    expect(result).toMatchObject({ ok: false, error: expect.stringContaining('acceptance restamp retained') });
+    expect(result.error).toContain('ask an operator');
+    expect(stderr.mock.calls.flat().join('')).toContain(result.error);
+    if (kind === 'removal') expect(gh.mock.calls.filter(([, args]) => args.includes('--remove-label'))).toHaveLength(1);
+  });
+  it('restamp reconciles an uncertain refresh without another add', () => {
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const base = fixture();
+    let firstPass = true;
+    const gh = vi.fn((file, args, opts) => {
+      if (args.includes('--add-label')) {
+        base(file, args, opts); // GitHub applied the timed-out write.
+        throw new Error('add timed out');
+      }
+      if (firstPass && args[1] === 'view' && gh.mock.calls.some(([, a]) => a.includes('--add-label'))) throw new Error('offline');
+      return base(file, args, opts);
+    });
+    expect(run(gh)).toMatchObject({ ok: false, state: 'pending-unknown' });
+    const attemptPath = join(stateDir, 'restamp-gate-refresh', fs.readdirSync(join(stateDir, 'restamp-gate-refresh'))[0]);
+    expect(JSON.parse(fs.readFileSync(attemptPath, 'utf8'))).toMatchObject({ state: 'pending-unknown', confirmed: false });
+    firstPass = false;
+    expect(run(gh)).toMatchObject({ ok: true, refreshed: true });
+    expect(gh.mock.calls.filter(([, args]) => args.includes('--add-label'))).toHaveLength(1);
+    expect(run(gh)).toMatchObject({ ok: true, refreshed: false });
+  });
+  it.each([401, 403, 404, 410, 422, 408, 409, 429])('classifies HTTP %i without repeating an ambiguous write', status => {
+    const gh = vi.fn((_bin, args) => {
+      if (args.includes('--add-label')) throw new Error(`HTTP ${status}: response`);
+      return args[1] === 'view' ? '{"labels":[]}' : '';
+    });
+    expect(toggleMergeGateRefresh({ repo: 'o/r', pr: 7, gh })).toMatchObject({
+      ok: false, state: [408, 409, 429].includes(status) ? 'pending-unknown' : 'denied',
+    });
+    expect(gh.mock.calls.filter(([, args]) => args.includes('--add-label'))).toHaveLength(1);
+  });
+  it.each([false, true])('reconciles persisted confirmed=%s when the label is absent', confirmed => {
+    const gh = vi.fn(() => '{"labels":[]}');
+    expect(toggleMergeGateRefresh({ repo: 'o/r', pr: 7, gh, pending: { confirmed } }))
+      .toMatchObject({ ok: confirmed, state: confirmed ? 'confirmed' : 'pending-unknown' });
+    expect(gh).toHaveBeenCalledTimes(1);
+  });
+  it.each([408, 409, 429])('confirms an applied add despite HTTP %i and never adds again', status => {
+    let present = false;
+    const gh = vi.fn((_bin, args) => {
+      if (args.includes('--add-label')) { present = true; throw new Error(`HTTP ${status}: ambiguous response`); }
+      if (args[1] === 'view') return JSON.stringify({ labels: present ? [{ name: 'gate:refresh' }] : [] });
+      if (args.includes('--remove-label')) present = false;
+      return '';
+    });
+    expect(toggleMergeGateRefresh({ repo: 'o/r', pr: 7, gh })).toMatchObject({ ok: true, state: 'confirmed' });
+    expect(gh.mock.calls.filter(([, args]) => args.includes('--add-label'))).toHaveLength(1);
+    expect(present).toBe(false);
+  });
+  it.each(['null', '{}', 'bad JSON', 'oversized'])('refuses corrupt or oversized persisted attempt %s before any label mutation', contents => {
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const gh = fixture();
+    expect(run(gh)).toMatchObject({ ok: true });
+    const dir = join(stateDir, 'restamp-gate-refresh');
+    const path = join(dir, fs.readdirSync(dir).find(name => !name.endsWith('.lock')));
+    fs.writeFileSync(path, contents === 'oversized' ? ' '.repeat(4097) : contents);
+    gh.mockClear();
+    expect(run(gh)).toMatchObject({ ok: false, error: expect.stringContaining('ask an operator') });
+    expect(gh.mock.calls.some(([, args]) => args[0] === 'label' || args[1] === 'edit')).toBe(false);
+  });
+  it('permits a newer failed gate after a confirmed stale gate without losing the old bound', () => {
+    expect(run(fixture())).toEqual({ ok: true, refreshed: true });
+    const gh = fixture([gate({ id: 11 })]);
+    expect(run(gh)).toEqual({ ok: true, refreshed: true });
+    expect(run(gh)).toEqual({ ok: true, refreshed: false });
+    expect(run(fixture())).toEqual({ ok: true, refreshed: false }); // Older API evidence cannot re-arm it.
+    expect(gh.mock.calls.filter(([, args]) => args.includes('--add-label'))).toHaveLength(1);
+  });
   it('plans refresh for the newest failed gate before the restamp', () => {
     expect(plan([gate({ id: 9 }), gate(), gate({ id: 11, name: 'tests' })])).toEqual({ checkRunId: 10 });
   });
@@ -132,7 +226,7 @@ describe('merge-gate refresh after restamp', () => {
     expect(sleep.mock.calls).toEqual([[1000], [2000]]);
     expect(stderr.mock.calls.flat().join('')).toContain('daemon token denied');
   });
-  it('label already present and pre-remove fails reports failure without adding', () => {
+  it('label already present and uncertain pre-remove is held without retrying the removal or adding', () => {
     vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     const base = fixture([gate()], head, 1, [{ name: 'gate:refresh' }]);
     const sleep = vi.fn();
@@ -140,10 +234,10 @@ describe('merge-gate refresh after restamp', () => {
       if (args.includes('--remove-label')) throw new Error('pre-remove denied');
       return base(file, args, opts);
     });
-    expect(run(gh, { sleep })).toMatchObject({ ok: false, error: expect.stringContaining('pre-remove denied') });
-    expect(gh.mock.calls.filter(([, args]) => args.includes('--remove-label'))).toHaveLength(3);
+    expect(run(gh, { sleep })).toMatchObject({ ok: false, state: 'pending-unknown', error: expect.stringContaining('pre-remove denied') });
+    expect(gh.mock.calls.filter(([, args]) => args.includes('--remove-label'))).toHaveLength(1);
     expect(gh.mock.calls.some(([, args]) => args.includes('--add-label'))).toBe(false);
-    expect(sleep.mock.calls).toEqual([[1000], [2000]]);
+    expect(sleep).not.toHaveBeenCalled();
   });
   it('label present and pre-remove ok makes the add trigger a real transition', () => {
     let present = true;
@@ -230,21 +324,19 @@ describe('merge-gate refresh after restamp', () => {
     expect(run(gh)).toMatchObject({ ok: false, error: expect.stringContaining('retry restamp') });
     expect(gh.mock.calls.every(([, args]) => args[0] === 'api')).toBe(true);
   });
-  it('writes no state file or attempt marker and retries naturally on the next call', () => {
+  it('releases a definite denial so another restamp can retry, with no rerun request', () => {
     vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    const write = vi.spyOn(fs, 'writeFileSync');
     const base = fixture();
     let failing = true;
     const gh = vi.fn((file, args, opts) => {
-      if (failing && args.includes('--add-label')) throw new Error('offline');
+      if (failing && args.includes('--add-label')) throw new Error('HTTP 403: denied');
       return base(file, args, opts);
     });
     expect(run(gh).ok).toBe(false);
     failing = false;
     expect(run(gh)).toMatchObject({ ok: true, refreshed: true });
-    expect(write).not.toHaveBeenCalled();
-    const source = fs.readFileSync('scripts/lib/merge-gate-refresh.mjs', 'utf8');
-    expect(source).not.toMatch(/node:fs|writeFile|mkdir|run', 'rerun/);
+    expect(gh.mock.calls.filter(([, args]) => args.includes('--add-label'))).toHaveLength(2);
+    expect(gh.mock.calls.some(([, args]) => args.includes('POST') || args.includes('rerun'))).toBe(false);
   });
   it('wires only successful restamps after all writes and includes the helper result in JSON', () => {
     const source = fs.readFileSync('scripts/review-set-label.mjs', 'utf8');
