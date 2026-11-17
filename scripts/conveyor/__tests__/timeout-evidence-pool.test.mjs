@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, mkdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { URL as NodeURL } from 'node:url';
@@ -226,7 +226,7 @@ syncBuiltinESMExports();
     const prs = Array.from({ length: 5 }, (_, i) => ({ ...pr, number: pr.number + i }));
     const launch = vi.fn((file, args, opts) => spawn(file, args, opts));
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
-    let pooled, workerRows, forwardedBeforeCleanup;
+    let pooled, workerRows, workerStderrSizes, forwardedBeforeCleanup;
     try {
       const poolRunner = (rows, opts) => {
         pooled = runTimeoutEvidencePool(rows, { ...opts, launch, deadlineMs: 20_000,
@@ -236,6 +236,7 @@ syncBuiltinESMExports();
           remove: (folder, options) => {
             workerRows = [0, 1].filter(index => existsSync(join(folder, `${index}.result.json`)))
               .map(index => JSON.parse(readFileSync(join(folder, `${index}.result.json`), 'utf8')));
+            workerStderrSizes = [0, 1].map(index => statSync(join(folder, `${index}.stderr`)).size);
             forwardedBeforeCleanup = log.mock.calls.filter(([prefix]) => prefix === 'timeout-evidence worker stderr:').length;
             rmSync(folder, options);
           },
@@ -247,8 +248,8 @@ syncBuiltinESMExports();
       expect(workerRows.length).toBeGreaterThan(0);
       expect(workerRows.every(row => row.workerError && row.reason === 'throttle-degraded')).toBe(true);
       expect(existsSync(join(dir, 'worker-gh-calls'))).toBe(false);
-      // Degraded workers' stderr (the throttle warning) is forwarded to the planner log before cleanup, never hidden.
-      expect(forwardedBeforeCleanup).toBe(workerRows.length);
+      // Probe refusal can be silent; forward exactly the workers that actually emitted stderr.
+      expect(forwardedBeforeCleanup).toBe(workerStderrSizes.filter(size => size > 0).length);
       expect(Array.from(pooled)).toEqual(Array(5).fill(undefined));
       expect(results.map(row => row.timeoutRetry)).toEqual(prs.map(() => expected));
       const calls = readFileSync(join(dir, 'throttle', 'calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
@@ -271,6 +272,8 @@ syncBuiltinESMExports();
         },
         remove: (path, options) => {
           expect(existsSync(path)).toBe(true);
+          expect(statSync(join(path, '0.stderr')).size).toBe('omitted'.length + tail.length);
+          expect(statSync(join(path, '1.stderr')).size).toBe(0);
           expect(log.mock.calls).toEqual([['timeout-evidence worker stderr:', tail]]);
           rmSync(path, options);
         },
@@ -428,10 +431,12 @@ describe('worker throttle caller identity', () => {
   it('gives every worker the planner caller so the per-caller throttle allowance is shared', () => {
     const seen = [];
     const launch = vi.fn((file, args, opts) => { seen.push(opts.env.GH_CALLER); return {}; });
-    runTimeoutEvidencePool([{ number: 1 }, { number: 2 }], { launch, concurrency: 2, deadlineMs: 200, env: { GH_CALLER: 'planner-under-test' } });
+    runTimeoutEvidencePool([{ number: 1 }, { number: 2 }], { launch, probe: () => true, concurrency: 2, deadlineMs: 200,
+      env: { WE_GH_THROTTLE_CAP: '4', GH_CALLER: 'planner-under-test' } });
     expect(seen).toEqual(['planner-under-test', 'planner-under-test']);
     seen.length = 0;
-    runTimeoutEvidencePool([{ number: 1 }], { launch, concurrency: 2, deadlineMs: 200, env: Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== 'GH_CALLER')) });
+    runTimeoutEvidencePool([{ number: 1 }], { launch, probe: () => true, concurrency: 2, deadlineMs: 200,
+      env: { WE_GH_THROTTLE_CAP: '4' } });
     expect(seen).toHaveLength(1);
     expect(seen[0]).not.toMatch(/\.input\.json$/);
     expect(seen[0]).not.toBe('unknown');

@@ -4434,6 +4434,8 @@ failed release after acquisition select serial evidence reads; a busy slot or ti
 healthy and preserves worker admission. Worker probe failure exits before calling gh.
 Worker fixtures use a scratch `WE_GH_THROTTLE_LOCK_ROOT` and explicit throttle cap so
 host traffic and inherited capacity settings cannot change whether workers launch.
+Probe refusal may emit no stderr: assert forwarding against worker stderr file sizes
+captured before cleanup, with an explicit empty-file case that forwards nothing.
 The pool is capped
 by the live throttle cap. Result/stderr degradation cancels all active groups with the
 same verified cleanup before serial fallback, and workers exit inside fail-open warnings
