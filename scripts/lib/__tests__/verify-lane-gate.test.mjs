@@ -19,6 +19,7 @@ import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { alwaysRunPlan, alwaysRunInventory, verifyStandardsPolicy, STANDARDS_AUTO_PREFIXES, standardsRelevantPath, decideStandardsHalf, verifyPhaseAdmissionEnabled, verifyFastTargets, phaseAdmissionKind, verifyRelatedMode, buildPhaseOutcome, firstStandardsErrorId, verifyTestTimeoutFactor, scaledTimeoutFlags, buildVerifyPhases, formatVerifyPhases, explicitGateRefusal, resolveDefaultGate, matchRequestedDefaultGate, canScopeCheckStandards, composeGate, describeGate, laneRelevantChangeSince, computeWorkingTreeHash, stableTreeHash, FULL_GATE, MAX_RELATED_TARGETS, CARD_ONLY_SKIP_GATE, localDiffIsCardOnly } from '../verify-lane-gate.mjs';
 import { phaseAdmissionPlan, localPhaseReason } from '../verify-remote-routing.mjs';
+import { localChangedSet } from '../verify-lane-gate.mjs';
 
 /** A synthetic git runner for the xpnhz4o working-tree changed set: `merge-base` resolves to a fixed sha;
  *  `diff --name-only <sha>` returns the (working-tree) changed files; `--diff-filter=D` the deleted ones;
@@ -45,6 +46,14 @@ function fakeGit(changedFiles, { deleted = [], untracked = [], grepHits = {} } =
 
 /** Factor 1 = vitest's own timeouts, i.e. the exact pre-WE_VERIFY_TEST_TIMEOUT_FACTOR command. */
 const TODAY = Object.freeze({ WE_VERIFY_TEST_TIMEOUT_FACTOR: '1' });
+
+it('R984 preserves whitespace in tracked, deleted and untracked changed-file names', () => {
+  const result = localChangedSet({ runGit: fakeGit(['notes.md ', ' leading.md'],
+    { deleted: ['deleted.md '], untracked: [' new.md '] }) });
+  expect(result.changedFiles).toEqual([' leading.md', ' new.md ', 'notes.md ']);
+  expect(result.deletedFiles).toEqual(['deleted.md ']);
+  expect(result.untrackedFiles).toEqual([' new.md ']);
+});
 
 describe('#4540 — untracked lane scratch selection', () => {
   it('filters scratch before both related targets and reference discovery, preserving standards inputs', () => {

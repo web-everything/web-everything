@@ -203,7 +203,7 @@ function laneNumFromOverlapReason(reason) {
 }
 
 /** Human-readable load reading for a #4076/#4343 `load-cap` note's `text` — e.g. `"cpu idle 12% (<15%)"`,
- *  `"mem pressure 2 (>=2)"`, or `"load1 60.00/12 cores (5.00 > backstop 4)"`. `../readiness/heavy-admission.mjs
+ *  `"mem pressure 2 (>=2)"`, or `"load1 60.00/host core count (5.00 > backstop 4)"`. `../readiness/heavy-admission.mjs
  *  #loadAdmissionDecision` already names the exact condition that held in its own `reason` field — this simply
  *  surfaces it rather than re-deriving the same decision a second time. Falls back to a bare threshold mention
  *  when the IO shell's `loadAdmission` carries no `reason` at all (e.g. a bypass reason, or a caller that only

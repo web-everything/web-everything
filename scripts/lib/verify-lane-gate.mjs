@@ -544,7 +544,8 @@ function relatedSelection({ targets, runGit, readRepoFile, settings }) {
 export function localChangedSet({ base = 'origin/main', runGit }) {
   const mergeBase = pinnedMergeBase({ base, runGit });
   if (!mergeBase) return null;
-  const lines = (out) => String(out).split('\n').map((s) => s.trim()).filter(Boolean);
+  // R984: whitespace is part of a Git path; never trim changed-file names.
+  const lines = (out) => String(out).split('\n').filter(Boolean);
   try {
     const tracked = lines(runGit(['diff', '--name-only', mergeBase]));
     const deletedFiles = lines(runGit(['diff', '--name-only', '--diff-filter=D', mergeBase]));
