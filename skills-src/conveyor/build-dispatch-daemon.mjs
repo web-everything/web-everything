@@ -49,6 +49,7 @@ import { childFailure } from '../../scripts/lib/child-failure.mjs';
 import { execFileSync, execFile } from 'node:child_process';
 import { execFileSyncThrottled } from '../../scripts/lib/gh-throttle.mjs';
 import { readCiJobLog } from '../../scripts/lib/gh-ci-log.mjs';
+import { stripVTControlCharacters } from 'node:util';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, writeFileSync, rmSync, readFileSync, readdirSync, mkdirSync, appendFileSync, renameSync, statSync } from 'node:fs';
 import os, { tmpdir, hostname, homedir } from 'node:os';
@@ -2562,7 +2563,7 @@ function firstFailedStepError(job, log) {
   }));
   if (intervals.some(({ start, end }) => !Number.isFinite(start) || !Number.isFinite(end) || start > end)) return '';
   let failedStep = false;
-  for (const line of log.split('\n')) {
+  for (const line of stripVTControlCharacters(log).split('\n')) {
     const timestamp = /^\uFEFF?(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d))(?=\s|$)/.exec(line);
     if (timestamp) {
       const at = Date.parse(timestamp[1]);

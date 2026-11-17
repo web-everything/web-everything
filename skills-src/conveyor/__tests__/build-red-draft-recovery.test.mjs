@@ -179,6 +179,13 @@ describe('abandoned builder draft recovery', () => {
   const noDetail = 'No error detail published by the check.';
   it.each([
     { evidence: 'attributable failed step', metadata: { steps }, expectedError: '##[error]AssertionError: Done-when 2' },
+    { evidence: 'ANSI-coloured timestamps and FAIL row', metadata: { steps }, expectedError: 'FAIL actual.test.mjs > broken',
+      log: '\x1b[32m2026-09-30T01:00:01Z passing step\x1b[0m\nFAIL fixture.test.mjs > expected\n'
+        + '\x1b[31m2026-09-30T01:00:11Z failed step\x1b[0m\n\x1b[31mFAIL\x1b[0m actual.test.mjs > broken' },
+    { evidence: 'ANSI passing-step timestamp ends failed-step ownership',
+      metadata: { steps: [...steps, { conclusion: 'success', started_at: '2026-09-30T01:00:20Z', completed_at: '2026-09-30T01:00:29Z' }] },
+      expectedError: noDetail,
+      log: '2026-09-30T01:00:11Z failed step\n\x1b[32m2026-09-30T01:00:21Z passing step\x1b[0m\nError: Passing-step error context' },
     { evidence: 'missing step metadata', metadata: {}, expectedError: noDetail },
     { evidence: 'published check detail', metadata: {}, summary: 'AssertionError: failed check summary', expectedError: 'AssertionError: failed check summary' },
     { evidence: 'malformed step metadata', metadata: { steps: [null, steps[1]] }, expectedError: noDetail },
@@ -187,7 +194,7 @@ describe('abandoned builder draft recovery', () => {
     { evidence: 'invalid failed-step time', metadata: { steps: [steps[0], { ...steps[1], started_at: 'invalid' }] }, expectedError: noDetail },
     { evidence: 'reversed failed-step times', metadata: { steps: [steps[0], { ...steps[1], completed_at: steps[1].started_at, started_at: steps[1].completed_at }] }, expectedError: noDetail },
     { evidence: 'overlapping passing step', metadata: { steps: [{ ...steps[0], completed_at: steps[1].completed_at }, steps[1]] }, expectedError: noDetail },
-  ])('keeps earlier passing-step errors out of dispatch and comments with $evidence', async ({ metadata, summary, expectedError }) => {
+  ])('keeps earlier passing-step errors out of dispatch and comments with $evidence', async ({ metadata, summary, expectedError, log }) => {
     const dir = mkdtempSync(join(tmpdir(), 'builder-draft-'));
     const row = { type: 'conveyor.dispatch-delivery-agent', handle: 'pid:99999', lastSeenLiveAt: candidate.authorLastSeenLiveAt,
       payload: { launchKind: 'build', num: '4502' }, result: { pr: 3033 }, status: 'applied' };
@@ -210,8 +217,8 @@ describe('abandoned builder draft recovery', () => {
           { id: 2, name: 'test-shard (2)', conclusion: 'failure', output: { summary }, details_url: 'https://github.com/web-everything/web-everything/actions/runs/123/job/456' },
         ] };
       }),
-      paged: vi.fn(() => []), gh: vi.fn(() => '2026-09-30T01:00:01Z ##[error]Passing-step error context\n'
-        + '2026-09-30T01:00:11Z failed step\n##[error]AssertionError: Done-when 2\nsummary'),
+      paged: vi.fn(() => []), gh: vi.fn(() => log ?? ('2026-09-30T01:00:01Z ##[error]Passing-step error context\n'
+        + '2026-09-30T01:00:11Z failed step\n##[error]AssertionError: Done-when 2\nsummary')),
       freeLanes: () => [8], reserve: () => ({ ok: true }), release: vi.fn(),
       dispatch: vi.fn(async () => ({ agentId: 'pid:321' })),
     };

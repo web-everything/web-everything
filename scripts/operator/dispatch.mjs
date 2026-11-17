@@ -233,6 +233,7 @@ For the failing check, read its real log — not a guess:
 
 \`\`\`
 Read the failing job id from the checks output using readCiJobLog({ repo, jobId }) from scripts/lib/gh-ci-log.mjs. It returns the whole job log, including passing steps (filtered: false).
+Strip ANSI escapes before matching any log lines. For filtered: false or missing provenance, report failing tests as "unknown (unfiltered log)" and use only a bounded raw tail as context. Never promote its FAIL/error rows to an authoritative failure list; passing steps can print failure fixtures. Only filtered: true evidence attributable to failed steps may supply failing-test rows.
 \`\`\`
 
 ## Fix ONLY what the log says is wrong
