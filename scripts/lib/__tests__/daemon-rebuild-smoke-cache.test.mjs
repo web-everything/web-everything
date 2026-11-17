@@ -80,6 +80,7 @@ const FAIL = { verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, nam
 
 beforeEach(() => { tempDirs.length = 0; });
 afterEach(() => {
+  vi.unstubAllEnvs();
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
   tempDirs.length = 0;
 });
@@ -88,7 +89,7 @@ const rebuild = (f, runSmoke, extra = {}) => rebuildClone({
   root: f.cloneDir, env: f.env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS, ...extra,
 });
 const head = (f) => gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim();
-const identity = (f, sha) => smokePassIdentity((args) => git(f.cloneDir, args), sha, 'clone');
+const identity = (f, sha) => smokePassIdentity((args) => git(f.cloneDir, args), sha, 'clone', f.env);
 
 // Move main to a distinct commit with identical content, and restore the clone's original base.
 function repeatTree(f, base) {
@@ -295,19 +296,28 @@ describe('durable smoke pass cache', () => {
     expect(proofs[0].key).toBe(identity(f, head(f)).key);
   });
 
-  it('a reduced-depth proof never satisfies a full-depth request', async () => {
+  it.each([
+    ['light', '0', '1', '3', '0'],
+    ['full', '3', '0', '0', '1'],
+  ])('a %s proof never satisfies a different caller depth when process.env matches the proof', async (_, passes, skip, callerPasses, callerSkip) => {
+    vi.stubEnv('WE_SMOKE_DISPATCH_PASSES', passes);
+    vi.stubEnv('WE_SMOKE_SKIP_RECONCILE_DRY_RUN', skip);
     const f = makeFixture();
     const target = advanceMain(f.originDir, (dir) => writeFile(dir, 'a.txt', 'a'));
     gitOk(f.cloneDir, ['fetch', '-q', 'origin']);
-    vi.stubEnv('WE_SMOKE_DISPATCH_PASSES', '0'); vi.stubEnv('WE_SMOKE_SKIP_RECONCILE_DRY_RUN', '1');
-    const light = identity(f, target);
-    writeRebuildState(f.cloneDir, { smokePassed: [{ tree: light.tree, key: light.key, passedAt: new Date().toISOString() }] }, f.env);
-    vi.stubEnv('WE_SMOKE_DISPATCH_PASSES', '3'); vi.stubEnv('WE_SMOKE_SKIP_RECONCILE_DRY_RUN', '0');
-    expect(identity(f, target).key).not.toBe(light.key);
+    const proof = identity(f, target);
+    writeRebuildState(f.cloneDir, { smokePassed: [{ tree: proof.tree, key: proof.key, passedAt: new Date().toISOString() }] }, f.env);
+    f.env.WE_SMOKE_DISPATCH_PASSES = callerPasses;
+    f.env.WE_SMOKE_SKIP_RECONCILE_DRY_RUN = callerSkip;
+    const requested = identity(f, target);
+    expect(requested.key).not.toBe(proof.key);
     const smoke = vi.fn(async () => PASS);
     await rebuild(f, smoke);
     expect(smoke).toHaveBeenCalledTimes(1);
-    vi.unstubAllEnvs();
+    expect(smoke.mock.calls[0][0]).toMatchObject({ reuseCode: false, env: {
+      WE_SMOKE_DISPATCH_PASSES: callerPasses, WE_SMOKE_SKIP_RECONCILE_DRY_RUN: callerSkip,
+    } });
+    expect(readRebuildState(f.cloneDir, f.env).smokePassed[0].key).toBe(requested.key);
   });
 
   it.each(['lockHash', 'nodeVersion', 'harnessHash', 'cloneKind'])('does not reuse a proof with a different %s', async (field) => {

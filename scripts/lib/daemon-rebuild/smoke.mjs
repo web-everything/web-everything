@@ -81,7 +81,7 @@ export function completeSmokePass(result) {
 }
 
 /** Read the candidate's content identity and the RUNNING harness; failures cannot prove a tree. */
-export function smokePassIdentity(git, sha, cloneKind = 'daemon') {
+export function smokePassIdentity(git, sha, cloneKind = 'daemon', env = process.env) {
   try {
     const tree = verifyRev(git, `${sha}^{tree}`);
     if (!tree) return null;
@@ -93,7 +93,7 @@ export function smokePassIdentity(git, sha, cloneKind = 'daemon') {
     }
     const lockHash = lock.status === 0 ? sha256(lock.stdout ?? '') : '';
     const harnessHash = sha256(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../daemon-live-smoke.mjs')));
-    return { tree, key: smokePassKey({ tree, lockHash, nodeVersion: process.version, harnessHash, cloneKind, depth: smokeDepthTag() }) };
+    return { tree, key: smokePassKey({ tree, lockHash, nodeVersion: process.version, harnessHash, cloneKind, depth: smokeDepthTag(env) }) };
   } catch {
     return null;
   }
@@ -471,7 +471,7 @@ export async function smokeAndAdopt({
     // cannot distinguish a healthy fallback from a harness that has since broken on every tree.
     const freshComparison = label != null;
     if (freshComparison) changedFiles = null;
-    const identity = smokePassIdentity(git, sha, cloneKind);
+    const identity = smokePassIdentity(git, sha, cloneKind, smokeEnv);
     const passes = readRebuildState(root, stEnv).smokePassed;
     const proven = !freshComparison && reuse.reuseEnabled && identity && Array.isArray(passes) && passes.find(entry => {
       const age = now() - Date.parse(entry?.passedAt);
