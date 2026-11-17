@@ -159,9 +159,9 @@ describe('defaultProviderQuotaHold strict store admission', () => {
   });
 
   it.each([
-    ['readable', '{"records":[]}', null],
+    ['readable', '{"records":[]}', 'provider quota check unavailable'],
     ['unreadable', '{', 'scorecard store unreadable'],
-  ])('keeps a failed optional import separate from a %s store', async (_state, text, expected) => {
+  ])('holds closed on a failed quota-module import with a %s store', async (_state, text, expected) => {
     scorecardIO.read = () => text;
     vi.doMock('../review-extra-seats.mjs', () => { throw new Error('optional import unavailable'); });
     try {
