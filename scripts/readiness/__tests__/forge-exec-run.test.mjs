@@ -458,14 +458,14 @@ process.stdout.write('x'.repeat(4*1024*1024+1));
   it.each([
     ['last 20 stderr lines', Array.from({length:30},(_,i)=>`install line ${i+1}`).join('\n')+'\n',
       Array.from({length:20},(_,i)=>`install line ${i+11}`).join('\n')],
-    ['UTF-8 byte cap keeps newest output', '😀'.repeat(600)+'END\n', '😀'.repeat(511)+'END'],
+    ['UTF-8 byte cap keeps newest output', '😀'.repeat(600)+'END\n', '😀'.repeat(127)+'END'],
     ['control characters removed without redaction', 'old\n\x00\x07\t\x1bsecret=value\x7f\x85\r\n', 'npm ci failed: old\nsecret=value'],
   ])('publishes install exit 97 failureTail: %s', async (_name,stderr,expected) => {
     await writeFile(join(root,'bin','npm'),`#!${process.execPath}\nprocess.stderr.write(${JSON.stringify(stderr)}); process.exitCode=1;\n`,{mode:0o755});
     expect((await runner.run(request)).code).toBe(97);
     const recent=(await runner.telemetry()).recent[0];
     expect(recent).toMatchObject({code:97,failureTail:expected});
-    expect(Buffer.byteLength(recent.failureTail)).toBeLessThanOrEqual(2048);
+    expect(Buffer.byteLength(recent.failureTail)).toBeLessThanOrEqual(512);
     const receipt=await runner.finish(request);
     expect(receipt).toMatchObject({phase:'install',code:97});
     expect(receipt).not.toHaveProperty('failureTail');

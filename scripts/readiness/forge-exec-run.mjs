@@ -238,7 +238,8 @@ async function readDeployState(path) {
   } catch { return null; }
   finally { try { await file?.close(); } catch { /* evidence unavailable */ } }
 }
-const FAILURE_TAIL_BYTES = 2048;
+// 50 retained entries must stay inside parseTelemetry's 64 KiB budget.
+const FAILURE_TAIL_BYTES = 512;
 function failureTail(stderr) {
   const lines=String(stderr).replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g,'').replace(/\n$/,'').split('\n').slice(-20).join('\n');
   const bytes=Buffer.from(lines);
