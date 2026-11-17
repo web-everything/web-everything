@@ -5,7 +5,7 @@
  * per host per minute; failed reads are also throttled per host in memory.
  * Startup explicitly requires a new read. Failed reads never extend the
  * ten-minute fallback. Non-me evidence blocks fallback before persistence; cache
- * mutations are serialized per guard/host. Failed writes retain that denial until
+ * mutations are serialized per cache-reader/host, even across guard states. Failed writes retain that denial until
  * a newer successful write, with best-effort removal. NOT yet wired into daemons.
  */
 import { readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync } from 'node:fs';
@@ -95,7 +95,7 @@ export async function readOwnerRemote({ ghApi: api = runGhApi } = {}) {
       throw new Error('owner contents unreadable');
     }
     const encoded = file.body.content.replace(/\s/g, '');
-    if (encoded.length > MAX_BUFFER || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
+    if (encoded.length > MAX_BUFFER || encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) {
       throw new Error('invalid owner encoding; inspect host on daemon-host-owner');
     }
     const bytes = Buffer.from(encoded, 'base64');
@@ -152,10 +152,36 @@ export async function resolveHostRole({ thisHost, now = Date.now(), atStart = fa
   }
   state.hosts ??= new Map();
   if (!state.hosts.has(thisHost)) state.hosts.set(thisHost, {});
-  const hostState = state.hosts.get(thisHost);
+  const guardState = state.hosts.get(thisHost);
+  const readerState = stateForReader(read);
+  readerState.authorities ??= new Map();
+  const boundAuthority = readerState.authorities.get(thisHost);
+  if (guardState.authority && boundAuthority && guardState.authority !== boundAuthority) {
+    // Reinitialize the guard with a stable reader rather than splitting a live queue.
+    return { ...standby('cache-context-conflict'), source: 'remote-failed' };
+  }
+  // Independent guards using the same cache IO share ordering and revocation.
+  // Keep that authority when a guard temporarily uses a snapshot reader, too.
+  const hostState = guardState.authority ??= boundAuthority ?? {};
+  readerState.authorities.set(thisHost, hostState);
+  const joinRead = () => {
+    const flight = guardState.inFlight;
+    if (!flight) return null;
+    if (!atStart && hostState.cacheInvalidated) {
+      return Promise.resolve({ ...standby('cache-invalidated'), source: 'remote-failed' });
+    }
+    // Startup bypasses cached reads, including a read already awaiting persistence.
+    if (atStart && !flight.reading) return null;
+    return flight.promise.then((decision) => atStart && decision.source === 'remote-failed'
+      ? { ...standby('start-requires-fresh-read'), source: 'remote-failed' } : decision);
+  };
+  let joined = joinRead();
+  if (joined) return joined;
   const readOrder = hostState.readOrder = (hostState.readOrder ?? 0) + 1;
   const cacheEvidence = hostState.latestEvidence;
   try { cache = await read(); } catch { /* Unreadable cache grants no ownership. */ }
+  joined = joinRead();
+  if (joined) return joined;
   const usableRead = cache?.host === thisHost && within(cache.writtenAt, now, CACHE_MAX_AGE_MS)
     && within(cache.readAt, now, FRESH_READ_MS)
     && ((cache.status === 'ok' && validHost(cache.owner)) || (cache.status === 'unset' && cache.owner === ''));
@@ -168,41 +194,68 @@ export async function resolveHostRole({ thisHost, now = Date.now(), atStart = fa
     return { ...(throttled && decision.reason === 'owner-unreadable'
       ? standby('remote-throttled') : decision), source: 'remote-failed' };
   };
-  if (!atStart && within(hostState.failedReadAt, now, FRESH_READ_MS)) return fallback(true);
-  let remote;
-  try { remote = await readRemote(); } catch { /* Use bounded fallback below. */ }
-  if ((remote?.status === 'ok' && validHost(remote.owner)) || remote?.status === 'unset') {
-    delete hostState.failedReadAt;
-    const owner = remote.status === 'ok' ? remote.owner : '';
-    // Evidence older than one this process already saw must not overwrite the cache.
-    const stale = hostState.latestReadAt > now
-      || (hostState.latestReadAt === now && hostState.latestReadOrder > readOrder);
-    if (stale) return { ...standby('superseded-owner-read'), source: 'remote' };
-    hostState.latestReadAt = now;
-    hostState.latestReadOrder = readOrder;
-    const evidence = {};
-    hostState.latestEvidence = evidence;
-    // Revoke immediately: another reader can run while write/invalidation awaits IO.
-    if (owner !== thisHost) hostState.cacheInvalidated = true;
-    // Serialize removal as well as replacement, so late old writes cannot recreate
-    // a deleted cache or overwrite a persisted handoff. Skip superseded queued work.
-    const pending = (hostState.cacheWrite ?? Promise.resolve()).then(async () => {
-      if (hostState.latestEvidence !== evidence) return;
-      try {
-        await write({ host: thisHost, status: remote.status, owner, readAt: now, writtenAt: now });
-        if (hostState.latestEvidence === evidence) delete hostState.cacheInvalidated;
-      } catch {
-        if (owner !== thisHost) {
-          try { await invalidateCache(); } catch { /* Memory denial survives failed removal. */ }
+  if (!atStart && within(guardState.failedReadAt, now, FRESH_READ_MS)) return fallback(true);
+  // Publish before starting IO so concurrent callers share the entire decision.
+  const flight = { reading: true };
+  flight.promise = Promise.resolve().then(resolveRemote).finally(() => {
+    if (guardState.inFlight === flight) delete guardState.inFlight;
+  });
+  guardState.inFlight = flight;
+  return flight.promise;
+
+  async function resolveRemote() {
+    let remote;
+    try { remote = await readRemote(); } catch { /* Use bounded fallback below. */ }
+    finally {
+      // Persistence may wait for disk IO. A subsequent startup read can confirm
+      // a handoff during that wait; joined callers still receive this decision.
+      flight.reading = false;
+    }
+    // Another guard (or process) may have confirmed a handoff during remote IO.
+    // readAt is the remote read's start time, never its completion time.
+    const refreshCache = async () => {
+      try { cache = await read(); } catch { cache = null; }
+    };
+    await refreshCache();
+    const newerCache = (owner) => Number.isFinite(cache?.readAt)
+      && (cache.readAt > now || (cache.readAt === now && owner === thisHost
+        && ((cache.status === 'ok' && validHost(cache.owner) && cache.owner !== thisHost)
+          || (cache.status === 'unset' && cache.owner === ''))));
+    if ((remote?.status === 'ok' && validHost(remote.owner)) || remote?.status === 'unset') {
+      delete guardState.failedReadAt;
+      const owner = remote.status === 'ok' ? remote.owner : '';
+      const stale = newerCache(owner) || hostState.latestReadAt > now
+        || (hostState.latestReadAt === now && hostState.latestReadOrder > readOrder);
+      if (stale) return { ...standby('superseded-owner-read'), source: 'remote' };
+      hostState.latestReadAt = now;
+      hostState.latestReadOrder = readOrder;
+      const evidence = {};
+      hostState.latestEvidence = evidence;
+      // Revoke immediately: another reader can run while persistence awaits IO.
+      if (owner !== thisHost) hostState.cacheInvalidated = true;
+      // All states using this cache reader serialize replacement and removal.
+      const pending = (hostState.cacheWrite ?? Promise.resolve()).then(async () => {
+        if (hostState.latestEvidence !== evidence) return;
+        await refreshCache();
+        if (hostState.latestEvidence !== evidence || newerCache(owner)) return;
+        try {
+          await write({ host: thisHost, status: remote.status, owner, readAt: now, writtenAt: now });
+          if (hostState.latestEvidence === evidence) delete hostState.cacheInvalidated;
+        } catch {
+          if (owner !== thisHost) {
+            try { await invalidateCache(); } catch { /* Memory denial survives failed removal. */ }
+          }
         }
+      });
+      hostState.cacheWrite = pending;
+      await pending;
+      if (hostState.cacheWrite === pending) delete hostState.cacheWrite;
+      if (hostState.latestEvidence !== evidence || newerCache(owner)) {
+        return { ...standby('superseded-owner-read'), source: 'remote' };
       }
-    });
-    hostState.cacheWrite = pending;
-    await pending;
-    if (hostState.cacheWrite === pending) delete hostState.cacheWrite;
-    if (hostState.latestEvidence !== evidence) return { ...standby('superseded-owner-read'), source: 'remote' };
-    return { ...decide({ owner, ownerReadAt: now }), source: 'remote' };
+      return { ...decide({ owner, ownerReadAt: now }), source: 'remote' };
+    }
+    guardState.failedReadAt = now;
+    return fallback();
   }
-  hostState.failedReadAt = now;
-  return fallback();
 }

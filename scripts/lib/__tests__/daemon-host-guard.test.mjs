@@ -7,6 +7,7 @@ import {
   FRESH_READ_MS, CACHE_MAX_AGE_MS, CLOCK_SKEW_MS, OWNER_REF, OWNER_FILE,
   defaultCachePath, getThisHost, decideHostRole, readOwnerRemote, resolveHostRole,
   readCacheFile, writeCacheFile, invalidateCacheFile, runGhApi,
+  createGuardState,
 } from '../daemon-host-guard.mjs';
 
 const NOW = 1_800_000_000_000;
@@ -147,6 +148,97 @@ function resolver(extra = {}) {
 }
 
 describe('resolveHostRole injected IO', () => {
+  it('switching to an already-bound reader fails closed instead of splitting a live writer queue', async () => {
+    let stored = null;
+    const reader = () => stored;
+    const switchingState = {};
+    await resolveHostRole({ thisHost: ME, now: NOW, state: switchingState, readCache: () => null,
+      readRemote: offline, writeCache: () => { throw new Error('no write'); } });
+    const writing = deferred();
+    const started = deferred();
+    const options = { thisHost: ME, now: NOW, atStart: true, readCache: reader };
+    const old = resolveHostRole({ ...options, state: {}, readRemote: () => ({ status: 'ok', owner: ME }),
+      writeCache: async (value) => { started.resolve(); await writing.promise; stored = value; } });
+    await started.promise;
+    let effects = 0;
+    expect(await resolveHostRole({ ...options, state: switchingState, now: NOW + 1,
+      readRemote: () => { effects += 1; return { status: 'ok', owner: OTHER }; },
+      writeCache: () => { effects += 1; } })).toEqual({
+      role: 'standby', reason: 'cache-context-conflict', source: 'remote-failed',
+    });
+    expect(effects).toBe(0);
+    // A newly initialized guard joins the canonical queue and can perform handoff.
+    const handoff = resolveHostRole({ ...options, state: {}, now: NOW + 2,
+      readRemote: () => ({ status: 'ok', owner: OTHER }), writeCache: (value) => { stored = value; } });
+    await new Promise(setImmediate);
+    writing.resolve();
+    await Promise.all([old, handoff]);
+    expect(stored.owner).toBe(OTHER);
+  });
+
+  it.each(['explicit', 'default'])('three simultaneous calls share one remote read and identical decisions (%s state)', async (mode) => {
+    const reading = deferred();
+    const fixture = resolver({ ...(mode === 'explicit' ? { state: createGuardState() } : {}), readRemote: () => {
+      reads += 1;
+      return reading.promise;
+    } });
+    let reads = 0;
+    const decisions = Promise.all(Array.from({ length: 3 }, () => resolveHostRole(fixture.options)));
+    reading.resolve({ status: 'ok', owner: ME });
+    const results = await decisions;
+    expect(reads).toBe(1);
+    expect(results).toEqual(Array(3).fill({
+      role: 'active', reason: 'fresh-owner-is-this-host', source: 'remote',
+    }));
+    expect(fixture.writes).toHaveLength(1);
+  });
+
+  it.each([
+    { status: 'ok', owner: OTHER, separateReader: false }, { status: 'unset', separateReader: false },
+    { status: 'ok', owner: OTHER, separateReader: true }, { status: 'unset', separateReader: true },
+    { status: 'ok', owner: OTHER, separateReader: true, delta: 0 },
+    { status: 'unset', separateReader: true, delta: 0 },
+  ])(
+    'separate states cannot overwrite a $status handoff (independent IO: $separateReader, delta: $delta)', async (handoff) => {
+      let stored = null;
+      const reading = deferred();
+      const started = deferred();
+      const writes = [];
+      const options = { thisHost: ME, now: NOW, atStart: true,
+        readCache: () => stored, writeCache: (value) => { writes.push(value); stored = value; } };
+      const old = resolveHostRole({ ...options, state: {}, readRemote: () => {
+        started.resolve(); return reading.promise;
+      } });
+      await started.promise;
+      await resolveHostRole({ ...options, state: {}, now: NOW + (handoff.delta ?? 1),
+        readCache: handoff.separateReader ? () => stored : options.readCache, readRemote: () => handoff });
+      reading.resolve({ status: 'ok', owner: ME });
+      expect(await old).toMatchObject({ role: 'standby', reason: 'superseded-owner-read' });
+      expect(writes).toHaveLength(1);
+      expect(stored.owner).toBe(handoff.owner ?? '');
+      expect(await resolveHostRole({ ...options, state: {}, atStart: false,
+        now: NOW + FRESH_READ_MS + 2, readRemote: offline })).toMatchObject({ role: 'standby' });
+    },
+  );
+
+  it.each([{ status: 'ok', owner: OTHER }, { status: 'unset' }])(
+    'separate states retain $status handoff revocation when persistence and removal fail', async (handoff) => {
+      const reading = deferred();
+      const started = deferred();
+      const f = failedWriteFixture(handoff);
+      const old = resolveHostRole({ ...f.options, state: {}, writeCache: f.store,
+        readRemote: () => { started.resolve(); return reading.promise; } });
+      await started.promise;
+      await resolveHostRole(f.options);
+      reading.resolve({ status: 'ok', owner: ME });
+      expect(await old).toMatchObject({ role: 'standby', reason: 'superseded-owner-read' });
+      expect(f.invalidations()).toBe(1);
+      expect(await resolveHostRole({ ...f.options, state: {}, atStart: false,
+        now: NOW + FRESH_READ_MS + 1, readRemote: offline }))
+        .toMatchObject({ role: 'standby', reason: 'cache-invalidated' });
+    },
+  );
+
   it('rate limit: second call within 60s does not call readRemote', async () => {
     const fixture = resolver();
     expect(await resolveHostRole(fixture.options)).toEqual({
@@ -222,6 +314,20 @@ describe('resolveHostRole injected IO', () => {
     expect(fixture.writes).toEqual([]);
   });
 
+  it('invalid inputs cannot perform IO or write cache', async () => {
+    let calls = 0;
+    const io = () => { calls += 1; throw new Error('must not run'); };
+    for (const input of [{}, { thisHost: '' }, { thisHost: ME, now: NaN }]) {
+      expect(await resolveHostRole({ ...input, readCache: io, writeCache: io,
+        invalidateCache: io, readRemote: io })).toEqual({
+        role: 'standby', reason: 'invalid-input', source: 'remote-failed',
+      });
+    }
+    expect(calls).toBe(0);
+    expect(await resolveHostRole()).toMatchObject({ reason: 'invalid-input' });
+    expect(createGuardState().hosts).toEqual(new Map());
+  });
+
   it('writeCache throw ignored without changing the decision', async () => {
     const fixture = resolver({ writeCache: () => { throw new Error('read-only cache'); } });
     expect(await resolveHostRole(fixture.options)).toEqual({
@@ -246,6 +352,24 @@ function remoteFixture(responses) {
 }
 
 describe('readOwnerRemote', () => {
+  it.each([
+    ['noncanonical padding bits', 'Zh=='],
+    ['invalid host', Buffer.from('bad/host').toString('base64')],
+    ['host over 253 characters', Buffer.from('a'.repeat(254)).toString('base64')],
+    ['over 1 MiB', 'A'.repeat(1024 * 1024 + 4)],
+  ])('rejects %s contents', async (_name, content) => {
+    const fixture = remoteFixture([{ ok: true, status: 200 },
+      { ok: true, status: 200, body: { content } }]);
+    expect(await readOwnerRemote(fixture)).toMatchObject({ status: 'error' });
+  });
+
+  it('accepts exactly 1 MiB of canonical encoded whitespace as unset', async () => {
+    const content = Buffer.alloc(3 * 1024 * 1024 / 4, 32).toString('base64');
+    expect(content.length).toBe(1024 * 1024);
+    expect(await readOwnerRemote(remoteFixture([{ ok: true, status: 200 },
+      { ok: true, status: 200, body: { content } }]))).toEqual({ status: 'unset' });
+  });
+
   it('404 ref is unset and does not request contents', async () => {
     const fixture = remoteFixture([{ ok: false, status: 404 }]);
     expect(await readOwnerRemote(fixture)).toEqual({ status: 'unset' });
@@ -376,8 +500,9 @@ describe('overlapping cache persistence after handoff', () => {
     },
   );
 
-  it.each([[false, 0], [true, 0], [false, 1], [true, 1]])(
-    'late old me write cannot undo handoff (fails: %s, clock delta: %s)', async (fails, delta) => {
+  it.each([[false, 0, false], [true, 0, false], [false, 1, false], [true, 1, false],
+    [false, 0, true], [true, 0, true], [false, 1, true], [true, 1, true]])(
+    'late old me write cannot undo handoff (fails: %s, clock delta: %s, separate states: %s)', async (fails, delta, separate) => {
       let stored = cache();
       const writing = deferred();
       const started = deferred();
@@ -386,16 +511,16 @@ describe('overlapping cache persistence after handoff', () => {
       const old = resolveHostRole({ ...options, readRemote: () => ({ status: 'ok', owner: ME }),
         writeCache: async (value) => { started.resolve(); await writing.promise; stored = value; } });
       await started.promise;
-      const handoff = resolveHostRole({ ...options, now: NOW + delta,
+      const handoff = resolveHostRole({ ...options, ...(separate ? { state: {} } : {}), now: NOW + delta,
         readRemote: () => ({ status: 'ok', owner: OTHER }), writeCache: (value) => {
           if (fails) throw new Error('disk full');
           stored = value;
         } });
       // Let the newer read reach persistence while the older write is still pending.
-      await Promise.resolve();
-      await Promise.resolve();
+      await new Promise(setImmediate);
       writing.resolve();
-      await Promise.all([old, handoff]);
+      const [oldDecision] = await Promise.all([old, handoff]);
+      expect(oldDecision).toMatchObject({ role: 'standby', reason: 'superseded-owner-read' });
       expect(stored?.owner).not.toBe(ME);
       expect(await resolveHostRole({ ...options, atStart: false,
         now: NOW + FRESH_READ_MS + 2, readRemote: offline }))
@@ -410,12 +535,12 @@ describe('overlapping cache persistence after handoff', () => {
     const old = resolveHostRole({ ...f.options,
       readRemote: () => { started.resolve(); return reading.promise; } });
     await started.promise;
-    await resolveHostRole(f.options);
+    await resolveHostRole({ ...f.options, state: {}, writeCache: f.store });
     reading.resolve({ status: 'ok', owner: ME });
     expect(await old).toMatchObject({ role: 'standby', reason: 'superseded-owner-read' });
     expect(await resolveHostRole({ ...f.options, atStart: false,
       now: NOW + FRESH_READ_MS + 1, readRemote: offline }))
-      .toMatchObject({ role: 'standby', reason: 'cache-invalidated' });
+      .toMatchObject({ role: 'standby', reason: 'cache-owner-is-other-host' });
   });
 
   it.each(['cache', 'remote'])('discards an old me snapshot after a handoff during a delayed %s read', async (phase) => {
@@ -423,9 +548,13 @@ describe('overlapping cache persistence after handoff', () => {
     const started = deferred();
     const f = failedWriteFixture({ status: 'ok', owner: OTHER });
     const snapshot = cache({ readAt: phase === 'cache' ? NOW : NOW - 120000 });
+    let firstRead = true;
     const old = resolveHostRole({ ...f.options, atStart: false,
       readCache: () => {
-        if (phase === 'remote') return snapshot;
+        if (phase === 'remote') {
+          if (!firstRead) return f.stored();
+          firstRead = false; return snapshot;
+        }
         started.resolve(); return waiting.promise;
       },
       readRemote: () => {
@@ -433,9 +562,11 @@ describe('overlapping cache persistence after handoff', () => {
         started.resolve(); return waiting.promise;
       } });
     await started.promise;
-    await resolveHostRole({ ...f.options, now: NOW + 1, writeCache: f.store });
+    await resolveHostRole({ ...f.options, ...(phase === 'remote' ? { state: {} } : {}),
+      now: NOW + 1, writeCache: f.store });
     waiting.resolve(phase === 'cache' ? snapshot : offline());
-    expect(await old).toMatchObject({ role: 'standby', reason: 'superseded-cache-read' });
+    expect(await old).toMatchObject({ role: 'standby',
+      reason: phase === 'cache' ? 'superseded-cache-read' : 'cache-owner-is-other-host' });
   });
 
   it('delayed removal cannot delete a newer recovery write and other hosts do not wait for it', async () => {
@@ -672,7 +803,7 @@ describe('cache file IO and gh transport', () => {
       calls.push(args); return '{"owner":"daemon-a"}';
     } })).toEqual({ ok: true, status: 200, body: { owner: ME } });
     expect(calls).toEqual([['gh', ['api', REF_PATH], expect.objectContaining({
-      encoding: 'utf8', timeout: expect.any(Number), maxBuffer: expect.any(Number),
+      encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024,
     })]]);
     expect(runGhApi(REF_PATH, { execFile: () => 'not JSON' })).toMatchObject({ ok: false, status: null });
   });

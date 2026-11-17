@@ -293,6 +293,38 @@ describe('preflight CLI IO hooks', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
+  it('actual preflight role transport never calls filesystem mutation APIs, including on rejection', () => {
+    const moduleUrl = new URL('../daemon-preflight.mjs', import.meta.url).href;
+    const script = `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      const effects = [];
+      for (const name of ['writeFileSync', 'appendFileSync', 'mkdirSync', 'unlinkSync', 'renameSync']) {
+        fs[name] = () => { effects.push(name); throw new Error('unexpected mutation'); };
+      }
+      syncBuiltinESMExports();
+      const { cliIO } = await import(${JSON.stringify(moduleUrl)});
+      const results = [];
+      for (const response of [{ status: 'ok', owner: 'daemon-a' }, { status: 'unset' },
+        { status: 'error' }, null]) {
+        const io = cliIO({}, { readOwnerRemote: async () => {
+          if (response === null) throw new Error('offline');
+          return response;
+        } });
+        results.push(await io.resolveRole({ thisHost: 'daemon-a', now: ${NOW} }));
+      }
+      console.log(JSON.stringify({ effects, results }));
+    `;
+    const report = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', script], {
+      encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024,
+    }));
+    expect(report.effects).toEqual([]);
+    expect(report.results.map(({ role }) => role)).toEqual(['active', 'standby', 'standby', 'standby']);
+    expect(report.results.slice(2)).toEqual(Array(2).fill({
+      role: 'standby', reason: 'owner-unreadable', source: 'remote-failed',
+    }));
+  });
+
   it('cliIO.sshForge uses BatchMode and a ConnectTimeout argv', () => {
     const calls = [];
     const result = { status: 0 };
