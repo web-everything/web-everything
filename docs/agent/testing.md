@@ -2141,6 +2141,43 @@ separate from transient infrastructure failures and their retry streak.
 
 ### Forge client telemetry and remote admission
 
+Admission reaper fixtures pass through the real telemetry parser: use `easternTimestamp()` for
+timestamps and include receipt `stageMs: {install, run}`. Reaper-only fixtures do not prove that
+health admission accepts the same sample. Release logs keep their original five-key JSON and
+byte order for markers without new provenance or exit evidence; PID accompanies new evidence,
+and unknown optional values are omitted rather than logged as null or `no-exit-record`.
+
+R1017 (under R1012): for a host-bound marker with a provably dead local owner, preserve the
+marker grace and death-sample margin. With a persisted 32-hex nonce and fresh integer receipt
+(including 97/254) still listed active, finish on the owner's behalf before claiming/removing
+the marker. Bound SSH and output; failed or timed-out finishes retain capacity, log once and
+retry no faster than 30 seconds per run. Legacy nonce-less markers keep their existing rules.
+For 97/254, finishing on behalf requires a persisted numbered worker slot (`forge-exec-N`, N >= 1), since only that finish path proves descendant cleanup; missing, legacy or malformed slots keep the marker held.
+A run-less dead-owner marker keeps the existing zero-active and 120-minute-plus-skew orphan
+rules. R1017 also permits release when the marker is at least `RUNLESS_DEAD_GRACE_MS = 15 * 60_000`
+old and a fresh sample is at least that grace after first-seen-dead. Require `activeRunIds` and
+a parseable start in `recent` for EVERY active id, strictly outside the inclusive ownership
+window `[marker.at - CLOCK_SKEW_MS, diedBy + CLOCK_SKEW_MS]`. Any in-window null-code or 97/254
+receipt retains the marker.
+
+The accepted residual risk is a request the dead client already dispatched that Forge starts
+MORE than 15 minutes after owner death. Observed start lag is about one minute; client SSH
+calls are short and bounded by `ConnectTimeout`. The dead client never issues `run`, so only
+a prepared run can exist. The grace is an operator ruling, not an enforced remote start
+deadline. If this residual occurs, the consequence is one extra concurrent Forge run until it
+finishes (Forge enforces its own cap). No run is killed and no result is lost: the owner is dead
+and cannot collect one. Pin that accepted behaviour explicitly: release at 15 minutes even if
+a delayed request starts later and remains active at 28 minutes.
+
+Missing IDs, receipts or parseable starts still fail closed; stuck-slot signals and
+operator-confirmed cleanup remain the fallback while capacity is retained.
+Keep regressions for the exact seven-active-run live shape released at >=15 minutes, 14-minute retention, unknown evidence,
+finish retries and legacy state. Markers carry optional caller/session/parent PID/command-word,
+lane and PR tags; `.exit` records synchronous best-effort exit or signal evidence. Release logs
+and stuck-slot detail carry these tags plus the exit record, or `no-exit-record` for a client
+that had no chance to log. Remove `.exit` with its marker; operator-confirmed cleanup remains
+the fallback when evidence stays incomplete.
+
 For selected `npx vitest run` phases, verify-lane's remote admission plan rewrites plain
 arguments to `npm run test:unit -- ...`; spawn that planned command without a local slot
 or `WE_HEAVY_ADMISSION_HELD`, so the nested wrapper owns remote execution and local fallback.
