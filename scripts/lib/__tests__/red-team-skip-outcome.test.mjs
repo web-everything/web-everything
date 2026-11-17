@@ -405,7 +405,7 @@ describe('stored-review not-owed rule (R730)', () => {
 });
 
 describe('empty net diff policy settlement', () => {
-  it('publishes the terminal policy-clear reason exactly once', () => {
+  it('publishes the terminal policy-clear reason exactly once using a config-independent emptiness probe', () => {
     const f = fixture();
     f.io.readStatus = () => ({ head, loopPayload: { findings: { read: { netBasis: { base: 'c'.repeat(40), rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true } } } });
     f.io.gitExec = vi.fn(() => '');
@@ -416,6 +416,9 @@ describe('empty net diff policy settlement', () => {
     expect(f.settle(skip).outcome).toBe('already');
     expect(f.io.postComment).toHaveBeenCalledTimes(1);
     expect(f.io.gitExec.mock.calls[0][1]).toContain(`${'c'.repeat(40)}..${head}`);
+    expect(f.io.gitExec.mock.calls[0][1]).toEqual(expect.arrayContaining([
+      '--ignore-submodules=none', '--no-ext-diff', '--no-textconv', '--no-renames',
+    ]));
   });
 });
 

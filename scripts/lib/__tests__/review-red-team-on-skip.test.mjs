@@ -3119,8 +3119,12 @@ describe('finished skipped empty net diff recovery', () => {
       comments: [{ body: `✅ review — accepted\n<!-- reviewed-sha: ${head} -->`, author: { login: 'web-everything' } }] }],
       gitExec: vi.fn(() => ''), readEvidence: () => evidence, readStatus: () => status };
   };
-  it('heals a legacy finished skipped object to terminal policy-clear', () => {
-    expect(decide(options())).toMatchObject({ action: 'clear', policy: 'empty-net-diff', why: 'red team skipped: empty net diff' });
+  it('heals a legacy finished skipped object using a config-independent emptiness probe', () => {
+    const o = options();
+    expect(decide(o)).toMatchObject({ action: 'clear', policy: 'empty-net-diff', why: 'red team skipped: empty net diff' });
+    expect(o.gitExec).toHaveBeenCalledWith('git', expect.arrayContaining([
+      '--ignore-submodules=none', '--no-ext-diff', '--no-textconv', '--no-renames',
+    ]), expect.anything());
   });
   it.each([
     ['unscored', o => { delete o.readStatus().loopPayload.findings.read.netBasis.scored; }],

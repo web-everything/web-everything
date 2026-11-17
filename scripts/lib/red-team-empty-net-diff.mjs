@@ -25,7 +25,7 @@ export function emptyNetDiffSkip(status, head = status?.head) {
 export function verifyEmptyNetDiff(read, head, { exec = execFileSync, cwd } = {}) {
   if (!provenEmptyNetDiff(read, head) || typeof read.netBasis.base !== 'string' || !read.netBasis.base) return false;
   try {
-    return exec('git', ['diff', '--no-ext-diff', '--no-textconv', '--name-only', '-z',
+    return exec('git', ['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--ignore-submodules=none', '--name-only', '-z',
       '--end-of-options', `${read.netBasis.base}..${head}`, '--'],
     { cwd, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024 }) === '';
   } catch { return false; }
