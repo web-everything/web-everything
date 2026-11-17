@@ -766,7 +766,8 @@ describe('forge-setup.sh installs the cache-retention timer and service (replaci
     const timerHeredoc = setup.indexOf("CACHE_TIMER\nsystemctl daemon-reload\nsystemctl enable --now forge-cache-prune.timer\n");
     expect(timerHeredoc).toBeGreaterThan(setup.indexOf("<<'CACHE_SERVICE'"));
     expect(setup).toContain('"forge-warm-base.mjs", "forge-exec-limits.mjs", "forge-cache-prune.mjs", "forge-exec-sweep.mjs"}');
-    expect(setup).toContain('for filename in ["forge-exec-run.mjs", "forge-warm-base.mjs", "forge-exec-limits.mjs", "forge-cache-prune.mjs", "forge-exec-sweep.mjs"]:');
+    expect(setup).toContain('installed = ["forge-exec-run.mjs", "forge-warm-base.mjs", "forge-exec-limits.mjs", "forge-cache-prune.mjs", "forge-exec-sweep.mjs"]');
+    expect(setup).toContain('for filename in installed:');
   });
 
   it('the daily cron job is gone: the exec sweeper timer replaces it and no cron heredoc owns cache retention', () => {
