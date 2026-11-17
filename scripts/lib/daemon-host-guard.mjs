@@ -1,74 +1,90 @@
 /**
- * Owner source: file `host` on branch daemon-host-owner. The GitHub App cannot
- * read repo variables (403). Cache: ~/.claude/daemon-host-guard/cache.json,
- * outside every rsync root. Successful reads are reused for one remote read
- * per host per minute; failed reads are also throttled per host in memory.
- * Startup explicitly requires a new read. Failed reads never extend the
- * ten-minute fallback. Non-me evidence blocks fallback before persistence; cache
- * mutations are serialized per cache reader/host across guard states. Failed writes retain that denial until
- * a newer successful write. Failed handoffs retain ordered denial on disk; if
- * denial cannot be saved, the cache lock stays fenced. NOT yet wired into daemons.
+ * Ownership is granted only by a fresh source read on each invocation.
+ * Local identity is a persistent random token; no ownership evidence is stored.
+ * NOT yet wired into daemons.
  */
-import { readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync, existsSync, rmdirSync, linkSync, truncateSync } from 'node:fs';
+import { closeSync, constants, fstatSync, linkSync, mkdirSync, openSync, readSync, unlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 import { homedir, hostname } from 'node:os';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 
 export const FRESH_READ_MS = 60_000;
-export const CACHE_MAX_AGE_MS = 600_000;
-export const CLOCK_SKEW_MS = 5_000;
+export const OWNER_READ_TIMEOUT_MS = 15_000;
 export const OWNER_REF = 'daemon-host-owner';
 export const OWNER_FILE = 'host';
+// Deprecated: accept these local aliases only until the owner branch contains IDs.
+export const LEGACY_OWNER_VALUES = Object.freeze(['studio', 'macbook']);
 const MAX_BUFFER = 1024 * 1024;
-const validHost = (value) => typeof value === 'string'
-  && value.length <= 253 && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value);
-const within = (stamp, now, age) => Number.isFinite(stamp)
-  && stamp <= now + CLOCK_SKEW_MS && now - stamp <= age;
+const validId = (value) => typeof value === 'string'
+  && /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}(?![\s\S])/.test(value);
+const validOwner = (value) => validId(value) || LEGACY_OWNER_VALUES.includes(value);
+const validVersion = (value) => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/.test(value);
 const standby = (reason) => ({ role: 'standby', reason });
+const stripFileNewline = (value) => value.replace(/\r?\n(?![\s\S])/, '');
 
-export function defaultCachePath(home = homedir()) {
-  return join(home, '.claude', 'daemon-host-guard', 'cache.json');
+export function defaultHostIdPath(home = homedir()) {
+  return join(home, '.claude', 'host-id');
 }
 
-export function getThisHost({ exec = (file, args) => execFileSync(file, args, {
-  encoding: 'utf8', timeout: 15_000, maxBuffer: MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'],
-}), hostname: fallback = hostname } = {}) {
+function readHostId(path) {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
-    const host = String(exec('scutil', ['--get', 'HostName'])).trim();
-    if (validHost(host)) return host;
-  } catch { /* Other platforms use the OS hostname. */ }
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || (stat.mode & 0o777) !== 0o600 || stat.size > 38) return '';
+    const bytes = Buffer.alloc(39);
+    const count = readSync(fd, bytes, 0, bytes.length, 0);
+    const id = stripFileNewline(bytes.subarray(0, count).toString('utf8'));
+    return validId(id) ? id : '';
+  } finally { closeSync(fd); }
+}
+
+/** Publish a complete ID once; concurrent creators read the winner, never replace it. */
+export function getThisHost({ home = homedir(), create = true } = {}) {
+  const path = defaultHostIdPath(home);
+  try { return readHostId(path); }
+  catch (error) { if (error.code !== 'ENOENT' || !create) return ''; }
+  let temporary;
   try {
-    const host = String(fallback()).trim();
-    return validHost(host) ? host : '';
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    temporary = path + '.' + randomUUID() + '.tmp';
+    writeFileSync(temporary, randomUUID() + '\n', { flag: 'wx', mode: 0o600 });
+    try { linkSync(temporary, path); }
+    catch (error) { if (error.code !== 'EEXIST') throw error; }
+    return readHostId(path);
+  } catch { return ''; }
+  finally {
+    if (temporary) {
+      try { unlinkSync(temporary); } catch { /* An orphan cannot grant ownership. */ }
+    }
+  }
+}
+
+export function getLegacyHost({ exec = execFileSync, hostname: fallback = hostname } = {}) {
+  try {
+    const value = String(exec('scutil', ['--get', 'HostName'], {
+      encoding: 'utf8', timeout: 15_000, maxBuffer: MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'],
+    })).trim();
+    if (value) return LEGACY_OWNER_VALUES.includes(value) ? value : '';
+  } catch { /* Migration can use the OS alias when the configured alias is absent. */ }
+  try {
+    const value = String(fallback()).trim();
+    return LEGACY_OWNER_VALUES.includes(value) ? value : '';
   } catch { return ''; }
 }
 
-/** Pure decision. Expired or malformed evidence leaves this host on standby. */
-export function decideHostRole({ thisHost, owner, ownerReadAt, now, cache, atStart = false } = {}) {
-  if (!validHost(thisHost) || !Number.isFinite(now)) return standby('invalid-input');
-  if ((owner === '' || validHost(owner)) && within(ownerReadAt, now, FRESH_READ_MS)) {
-    if (owner === '') return standby('owner-unset');
-    return owner === thisHost
-      ? { role: 'active', reason: 'fresh-owner-is-this-host' }
-      : standby('owner-is-other-host');
+/** Pure decision: absent, stale, future or malformed evidence is always standby. */
+export function decideHostRole({ thisHost, legacyHost = '', owner, ownerReadAt, now } = {}) {
+  if (!validId(thisHost) || !Number.isFinite(now)) return standby('invalid-input');
+  if (!Number.isFinite(ownerReadAt) || ownerReadAt > now || now - ownerReadAt > FRESH_READ_MS) {
+    return standby('owner-unreadable');
   }
-  if (atStart) return standby('start-requires-fresh-read');
-  if (cache != null) {
-    if (cache.host !== thisHost) return standby('cache-foreign-host');
-    if (Number.isFinite(cache.writtenAt) && cache.writtenAt > now + CLOCK_SKEW_MS) return standby('clock-skew');
-    if (!within(cache.writtenAt, now, CACHE_MAX_AGE_MS)) return standby('cache-stale');
-    if (!within(cache.readAt, now, CACHE_MAX_AGE_MS)) return standby(Number.isFinite(cache.readAt) ? 'cache-stale' : 'owner-unreadable');
-    if (!['ok', 'unset'].includes(cache.status)) return standby('owner-unreadable');
-    if (cache.owner === '') return standby('owner-unset');
-    if (!validHost(cache.owner) || cache.status === 'unset') return standby('owner-unreadable');
-    return cache.owner === thisHost
-      ? { role: 'active', reason: 'cache-owner-is-this-host' }
-      : standby('cache-owner-is-other-host');
-  }
-  return standby(Number.isFinite(ownerReadAt) && ownerReadAt > now + CLOCK_SKEW_MS
-    ? 'clock-skew' : 'owner-unreadable');
+  if (owner === '') return standby('owner-unset');
+  if (!validOwner(owner)) return standby('owner-unreadable');
+  return owner === thisHost || (LEGACY_OWNER_VALUES.includes(owner) && owner === legacyHost)
+    ? { role: 'active', reason: 'fresh-owner-is-this-host' }
+    : standby('owner-is-other-host');
 }
 
 export function runGhApi(path, { execFile = execFileSync } = {}) {
@@ -84,308 +100,59 @@ export function runGhApi(path, { execFile = execFileSync } = {}) {
   }
 }
 
-/** A missing ref is unset; missing/malformed contents or any other failure is unreadable. */
-export async function readOwnerRemote({ ghApi: api = runGhApi } = {}) {
-  try {
-    const base = `repos/${CONSTELLATION_REPOS.we.slug}`;
-    const ref = await api(`${base}/git/ref/heads/${OWNER_REF}`);
-    if (ref?.ok === false && ref.status === 404) return { status: 'unset' };
-    if (ref?.ok !== true || ref.status !== 200) throw new Error('owner ref unreadable');
-    const file = await api(`${base}/contents/${OWNER_FILE}?ref=${OWNER_REF}`);
-    if (file?.ok !== true || file.status !== 200 || typeof file.body?.content !== 'string') {
-      throw new Error('owner contents unreadable');
-    }
-    const encoded = file.body.content.replace(/\s/g, '');
-    if (encoded.length > MAX_BUFFER || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
-      throw new Error('invalid owner encoding; inspect host on daemon-host-owner');
-    }
-    const bytes = Buffer.from(encoded, 'base64');
-    if (bytes.toString('base64') !== encoded) throw new Error('noncanonical owner encoding');
-    const owner = bytes.toString('utf8').trim();
-    if (!owner) return { status: 'unset' };
-    if (!validHost(owner)) throw new Error('invalid owner host; inspect host on daemon-host-owner');
-    return { status: 'ok', owner };
-  } catch (error) {
-    return { status: 'error', error: String(error?.message ?? error) };
-  }
-}
-
-export function readCacheFile(path = defaultCachePath()) {
-  if (existsSync(`${path}.lock`) || cacheFenceBlocked(path)) throw new Error('cache locked; inspect abandoned writer before removing lock');
-  const value = JSON.parse(readFileSync(path, 'utf8'));
-  if (existsSync(`${path}.lock`) || cacheFenceBlocked(path)) throw new Error('cache writer changed during read');
-  return value;
-}
-
-// Provision once, before any holder can publish. Contenders can revoke this
-// permission by truncating an existing inode, without allocating a marker.
-// Nothing automatically restores it, including a holder's release path.
-export function cacheFenceBlocked(path = defaultCachePath()) {
-  try { return readFileSync(`${path}.lock.fence`, 'utf8') !== 'ready\n'; }
-  catch (error) { return error.code !== 'ENOENT'; }
-}
-
-function prepareCacheFence(path) {
-  const fence = `${path}.lock.fence`;
-  if (existsSync(fence)) return;
-  const temporary = `${fence}.${process.pid}.${randomUUID()}.tmp`;
-  try {
-    writeFileSync(temporary, 'ready\n', { mode: 0o600, flag: 'wx' });
-    // Publish complete initial state atomically, never overwrite a revocation.
-    try { linkSync(temporary, fence); } catch (error) {
-      if (error.code !== 'EEXIST') throw error;
-    }
-  } finally { removeCacheFile(temporary); }
-}
-
-// Never reclaim a lock by age: a suspended holder could resume and publish old
-// ownership. On timeout fence the holder; a nonempty lock survives its cleanup
-// and makes all fallback reads fail closed until the operator inspects it.
-function withCacheLock(path, mutate, { retainOnError = false } = {}) {
-  const lock = `${path}.lock`;
-  const fence = `${lock}.fence`;
-  if (cacheFenceBlocked(path)) return 'fence-unenforceable';
-  try { prepareCacheFence(path); } catch (error) {
-    if (cacheFenceBlocked(path)) return 'fence-unenforceable';
-    throw error;
-  }
-  const deadline = performance.now() + 1000;
-  const sleeper = new Int32Array(new SharedArrayBuffer(4));
-  for (;;) {
-    if (cacheFenceBlocked(path)) return 'fence-unenforceable';
-    try { mkdirSync(lock, { mode: 0o700 }); break; }
-    catch (error) {
-      if (error.code !== 'EEXIST') throw error;
-      if (performance.now() >= deadline) {
-        try { writeFileSync(join(lock, 'blocked'), '', { flag: 'wx', mode: 0o600 }); }
-        catch (error) {
-          if (error.code !== 'EEXIST') {
-            // The preallocated permission survives even a holder already in
-            // cleanup. Truncation needs no new inode or data blocks.
-            try { truncateSync(fence, 0); } catch { /* Resolver must also poison/invalidate. */ }
-            return 'fence-unenforceable';
-          }
-        }
-        return false;
+/** Ownership source: readOwner() returns {host, version}; failures reject. */
+export function createGithubOwnershipSource({ ghApi: api = runGhApi } = {}) {
+  return {
+    async readOwner() {
+      const base = `repos/${CONSTELLATION_REPOS.we.slug}`;
+      const ref = await api(`${base}/git/ref/heads/${OWNER_REF}`);
+      if (ref?.ok === false && ref.status === 404) return { host: '', version: null };
+      const version = ref?.body?.object?.sha;
+      if (ref?.ok !== true || ref.status !== 200 || !validVersion(version)) throw new Error('owner ref unreadable');
+      const file = await api(`${base}/contents/${OWNER_FILE}?ref=${version}`);
+      if (file?.ok !== true || file.status !== 200 || file.body?.encoding !== 'base64'
+        || typeof file.body.content !== 'string' || file.body.content.length > MAX_BUFFER) {
+        throw new Error('owner contents unreadable');
       }
-      Atomics.wait(sleeper, 0, 0, 5);
-    }
-  }
-  if (cacheFenceBlocked(path)) return 'fence-unenforceable';
-  let result;
-  let failure;
-  try { result = mutate(); }
-  catch (error) { failure = error; }
-  finally {
-    // Keep the directory itself as a fence even when disk-full prevents writing
-    // a marker. Releasing it would allow delayed writers to restore ownership.
-    if ((!failure || !retainOnError) && !cacheFenceBlocked(path)) {
-      try { rmdirSync(lock); }
-      catch (error) {
-        if (error.code === 'ENOTEMPTY' || error.code === 'EEXIST') result = false;
-        else failure = error;
+      const encoded = file.body.content.replace(/\r?\n/g, '');
+      if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?(?![\s\S])/.test(encoded)) {
+        throw new Error('invalid owner encoding');
       }
-    }
-  }
-  // A publication error cannot bypass a denial that arrived while it ran.
-  if (cacheFenceBlocked(path)) return 'fence-unenforceable';
-  if (result === false) return false;
-  if (failure) throw failure;
-  return result;
-}
-
-/** Atomic replacement; failed writes leave no temporary evidence behind. */
-export function writeCacheFile(value, path = defaultCachePath()) {
-  mkdirSync(dirname(path), { recursive: true });
-  return withCacheLock(path, () => {
-    let stored;
-    try { stored = JSON.parse(readFileSync(path, 'utf8')); } catch { /* Repair absent/corrupt evidence. */ }
-    if (supersedes(stored, value)) return false;
-    replaceCacheFile(value, path);
-  }, { retainOnError: value.owner !== value.host });
-}
-
-export function invalidateCacheFile(path = defaultCachePath(), failedRead) {
-  if (!failedRead && !existsSync(path) && !existsSync(`${path}.lock`)) return;
-  if (failedRead) mkdirSync(dirname(path), { recursive: true });
-  return withCacheLock(path, () => {
-    if (failedRead) {
-      let stored;
-      try { stored = JSON.parse(readFileSync(path, 'utf8')); } catch { /* Replace unreadable evidence. */ }
-      if (preserveAfterFailure(stored, failedRead)) return false;
-      // Absence cannot fence a delayed read. Preserve the handoff's read order
-      // across independent guards/restarts, including when no cache existed.
-      replaceCacheFile(failedRead, path);
-      return;
-    }
-    removeCacheFile(path);
-  }, { retainOnError: Boolean(failedRead) });
-}
-
-function replaceCacheFile(value, path) {
-  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  try {
-    writeFileSync(temporary, `${JSON.stringify(value)}\n`, { mode: 0o600, flag: 'wx' });
-    renameSync(temporary, path);
-  } finally { removeCacheFile(temporary); }
-}
-
-function removeCacheFile(path) {
-  try { unlinkSync(path); } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-  }
-}
-
-// readAt is the remote read's START time, never its completion time. On ties a
-// persisted handoff wins over ownership, including records from older guards.
-function validCacheRecord(stored, host) {
-  return stored?.host === host && Number.isFinite(stored.readAt)
-    && ((stored.status === 'ok' && validHost(stored.owner))
-      || (stored.status === 'unset' && stored.owner === ''));
-}
-
-function supersedes(stored, next) {
-  return validCacheRecord(stored, next.host)
-    && (stored.readAt > next.readAt || (stored.readAt === next.readAt
-      && stored.owner !== next.host && next.owner === next.host));
-}
-
-function preserveAfterFailure(stored, failedRead) {
-  return supersedes(stored, failedRead)
-    || (validCacheRecord(stored, failedRead.host) && stored.owner !== failedRead.host
-      && stored.readAt === failedRead.readAt);
-}
-
-/** Share one state across a guard's calls; hosts never share poison or throttle. */
-export function createGuardState() {
-  return { hosts: new Map() };
-}
-// Each cache reader identifies a guard's IO context unless state is supplied.
-const readerStates = new WeakMap();
-const readerWrites = new WeakMap();
-function stateForReader(read) {
-  if (!readerStates.has(read)) readerStates.set(read, createGuardState());
-  return readerStates.get(read);
-}
-
-export async function resolveHostRole({ thisHost, now = Date.now(), atStart = false,
-  readCache: read = readCacheFile, writeCache: write = writeCacheFile,
-  invalidateCache = (value) => invalidateCacheFile(defaultCachePath(), value),
-  readRemote = readOwnerRemote, state = stateForReader(read) } = {}) {
-  const decide = (extra) => decideHostRole({ thisHost, now, atStart, cache, ...extra });
-  let cache = null;
-  if (!validHost(thisHost) || !Number.isFinite(now)) {
-    return { ...standby('invalid-input'), source: 'remote-failed' };
-  }
-  state.hosts ??= new Map();
-  if (!state.hosts.has(thisHost)) state.hosts.set(thisHost, {});
-  const hostState = state.hosts.get(thisHost);
-  const readOrder = hostState.readOrder = (hostState.readOrder ?? 0) + 1;
-  const cacheEvidence = hostState.latestEvidence;
-  try { cache = await read(); } catch { /* Unreadable cache grants no ownership. */ }
-  if (hostState.inFlight) {
-    const decision = await hostState.inFlight.promise;
-    // A startup caller must never inherit another caller's offline cache grant.
-    return atStart && decision.source === 'remote-failed'
-      ? { ...standby('start-requires-fresh-read'), source: 'remote-failed' } : decision;
-  }
-  const usableRead = cache?.host === thisHost && within(cache.writtenAt, now, CACHE_MAX_AGE_MS)
-    && within(cache.readAt, now, FRESH_READ_MS)
-    && ((cache.status === 'ok' && validHost(cache.owner)) || (cache.status === 'unset' && cache.owner === ''));
-  if (!atStart && !hostState.cacheInvalidated && cacheEvidence === hostState.latestEvidence && usableRead) {
-    return { ...decide({ owner: cache.owner, ownerReadAt: cache.readAt }), source: 'cache-fresh-read' };
-  }
-  const fallback = (throttled = false) => {
-    const decision = hostState.cacheInvalidated ? standby('cache-invalidated')
-      : cacheEvidence !== hostState.latestEvidence ? standby('superseded-cache-read') : decide({});
-    return { ...(throttled && decision.reason === 'owner-unreadable'
-      ? standby('remote-throttled') : decision), source: 'remote-failed' };
+      const bytes = Buffer.from(encoded, 'base64');
+      if (bytes.toString('base64') !== encoded) throw new Error('noncanonical owner encoding');
+      const host = stripFileNewline(bytes.toString('utf8'));
+      if (host !== '' && !validOwner(host)) throw new Error('invalid owner ID');
+      return { host, version };
+    },
   };
-  if (!atStart && within(hostState.failedReadAt, now, FRESH_READ_MS)) return fallback(true);
-  const flight = {};
-  hostState.inFlight = flight;
-  // Defer execution until the shared promise is installed, even for sync IO.
-  flight.promise = Promise.resolve().then(resolveRemote).finally(() => {
-    if (hostState.inFlight === flight) delete hostState.inFlight;
-  });
-  return flight.promise;
+}
 
-  async function resolveRemote() {
-    let remote;
-    try { remote = await readRemote(); } catch { /* Use bounded fallback below. */ }
-    if ((remote?.status === 'ok' && validHost(remote.owner)) || remote?.status === 'unset') {
-      delete hostState.failedReadAt;
-      const owner = remote.status === 'ok' ? remote.owner : '';
-      // Evidence older than one this process already saw must not overwrite the cache.
-      const stale = hostState.latestReadAt > now
-        || (hostState.latestReadAt === now && hostState.latestReadOrder > readOrder);
-      if (stale) return { ...standby('superseded-owner-read'), source: 'remote' };
-      hostState.latestReadAt = now;
-      hostState.latestReadOrder = readOrder;
-      const evidence = {};
-      hostState.latestEvidence = evidence;
-      // Revoke immediately: another reader can run while write/invalidation awaits IO.
-      if (owner !== thisHost) hostState.cacheInvalidated = true;
-      // Serialize removal and replacement across states sharing this cache reader.
-      const value = { host: thisHost, status: remote.status, owner, readAt: now, writtenAt: now };
-      let superseded = false;
-      let fenceUnenforceable = false;
-      const writes = readerWrites.get(read) ?? new Map();
-      readerWrites.set(read, writes);
-      const pending = (writes.get(thisHost) ?? Promise.resolve()).then(async () => {
-        if (hostState.latestEvidence !== evidence) return;
-        let stored;
-        try { stored = await read(); } catch { /* A fresh remote read can repair a missing cache. */ }
-        if (supersedes(stored, value)) {
-          superseded = true;
-          hostState.cacheInvalidated = true;
-          return;
-        }
-        try {
-          const outcome = await write(value);
-          if (outcome === 'fence-unenforceable') {
-            fenceUnenforceable = true;
-            hostState.cacheInvalidated = true;
-            // Even a read naming this host cannot grant ownership after denial.
-            const denial = { ...value, status: 'unset', owner: '' };
-            try { await invalidateCache(denial); } catch { /* Memory poison survives unavailable persistence. */ }
-            return;
-          }
-          if (outcome === false) {
-            superseded = true;
-            hostState.cacheInvalidated = true;
-            return;
-          }
-          if (hostState.latestEvidence === evidence) delete hostState.cacheInvalidated;
-        } catch {
-          if (owner !== thisHost) {
-            let stored;
-            try { stored = await read(); } catch { /* The conditional remover also checks under its lock. */ }
-            if (!preserveAfterFailure(stored, value)) {
-              try {
-                if (await invalidateCache(value) === 'fence-unenforceable') fenceUnenforceable = true;
-              } catch { /* Memory denial survives failed removal. */ }
-            }
-          }
-        }
-      });
-      writes.set(thisHost, pending);
-      await pending;
-      if (writes.get(thisHost) === pending) writes.delete(thisHost);
-      if (writes.size === 0) readerWrites.delete(read);
-      if (fenceUnenforceable) return { ...standby('fence-unenforceable'), source: 'remote' };
-      if (superseded || hostState.latestEvidence !== evidence) return { ...standby('superseded-owner-read'), source: 'remote' };
-      return { ...decide({ owner, ownerReadAt: now }), source: 'remote' };
+/** A new bounded read for every call, with no remembered authorization. */
+export async function resolveHostRole({ thisHost = getThisHost(), legacyHost,
+  ownershipSource = createGithubOwnershipSource(), clock = Date.now,
+  timeoutMs = OWNER_READ_TIMEOUT_MS } = {}) {
+  let timer;
+  try {
+    if (!validId(thisHost) || !Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > OWNER_READ_TIMEOUT_MS) {
+      return { ...standby('invalid-input'), source: 'remote-failed' };
     }
-    hostState.failedReadAt = now;
-    // Another guard may have confirmed a handoff while this read was offline.
-    let latestCache;
-    try { latestCache = await read(); cache = latestCache; }
-    catch { cache = null; /* A locked/unreadable cache cannot preserve an old ownership snapshot. */ }
-    if (supersedes(latestCache, { host: thisHost, owner: thisHost, readAt: now })) {
-      hostState.cacheInvalidated = true;
-      return { ...standby('superseded-cache-read'), source: 'remote-failed' };
+    const ownerReadAt = clock();
+    const started = performance.now();
+    const record = await Promise.race([
+      Promise.resolve().then(() => ownershipSource.readOwner()),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('owner timeout')), timeoutMs); }),
+    ]);
+    if (performance.now() - started >= timeoutMs) throw new Error('owner timeout');
+    if (!record || Object.keys(record).some((key) => !['host', 'version'].includes(key))
+      || !(record.host === '' || validOwner(record.host))
+      || !(validVersion(record.version) || (record.host === '' && record.version === null))) {
+      throw new Error('invalid owner response');
     }
-    return fallback();
-  }
+    const decision = decideHostRole({ thisHost,
+      legacyHost: legacyHost ?? (LEGACY_OWNER_VALUES.includes(record.host) ? getLegacyHost() : ''),
+      owner: record.host, ownerReadAt, now: clock() });
+    return { ...decision, source: decision.reason === 'owner-unreadable' ? 'remote-failed' : 'remote' };
+  } catch {
+    return { ...standby('owner-unreadable'), source: 'remote-failed' };
+  } finally { clearTimeout(timer); }
 }

@@ -207,11 +207,7 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   'scripts/conveyor/soak/breaks/infra-lock-waiter-busy-spins.mjs', 'scripts/lib/review-head-index.mjs',
   'scripts/operations/fix-ready-record.mjs',
   // The ETag eviction stamp writer uses an exclusive `wx` create.
-  'scripts/lib/gh-rest-read.mjs',
-  // PR #6945: the host-handoff cache-write-race soak break names the retained `cache.json.lock` directory (a lock file name).
-  'scripts/conveyor/soak/breaks/host-handoff-cache-write-race.mjs',
-  // Preflight inspects the retained ownership lock; lock readers are protected by the same hold-scan rule.
-  'scripts/operations/daemon-preflight.mjs']);
+  'scripts/lib/gh-rest-read.mjs']);
 /** The imported names that take, renew or give up a hold (`withFileLock`, `withAddGuardLock`, `acquireFixDispatchClaim`,
  *  `tryLease`, …). */
 export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|reserve|try)\w*(?:Claim|Lease|Lock|Hold|Slot|Mutex|Reservation)\w*)$/;
