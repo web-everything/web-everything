@@ -579,7 +579,8 @@ describe('wrapped verification waits', () => {
     const head = 'a'.repeat(40);
     h.s.mode = 'conflict-rebase';
     h.s.launchGuard = launchGuardFor({ mode: h.s.mode, pr: 7, headRefOid: head,
-      conflictRebase: { oldHead: head, defaultBranch: 'main' } }, { repo: 'o/r' });
+      conflictRebase: { oldHead: head, defaultBranch: 'main', mainSha: 'f'.repeat(40),
+        receipt: `accepted-conflict-rebase:${head}@${'f'.repeat(40)}` } }, { repo: 'o/r' });
     let live = { headRefOid: head, labels: ['review:pending'], state: 'OPEN', isDraft: false,
       baseRefName: 'main', mergeable: 'CONFLICTING' };
     h.io.launchGate = vi.fn(request => assertFixerLaunch(request, { readLive: () => live }));

@@ -13,7 +13,8 @@ afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: tru
 const sid = '12345678-1234-4234-8234-123456789abc';
 const head = 'a'.repeat(40);
 const descriptor = { mode: 'conflict-rebase', launchGuard: launchGuardFor({ mode: 'conflict-rebase',
-  pr: 7, headRefOid: head, conflictRebase: { oldHead: head, defaultBranch: 'main' } }, { repo: 'o/r' }) };
+  pr: 7, headRefOid: head, conflictRebase: { oldHead: head, defaultBranch: 'main', mainSha: 'f'.repeat(40),
+        receipt: `accepted-conflict-rebase:${head}@${'f'.repeat(40)}` } }, { repo: 'o/r' }) };
 const live = () => ({ headRefOid: head, state: 'OPEN', isDraft: false, baseRefName: 'main',
   mergeable: 'CONFLICTING', labels: ['review:pending'] });
 

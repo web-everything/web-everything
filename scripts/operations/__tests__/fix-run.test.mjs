@@ -14,7 +14,8 @@ import { resolveFixBorrowSettings } from '../../lib/dispatch-throttle.mjs';
 import { defaultSpawnCodexAgent } from '../codex-delivery-provider.mjs';
 import { assertFixerLaunch, launchGuardFor } from '../../conveyor/conflict-rebase-launch-gate.mjs';
 import { conflictRebaseReceipt, planAcceptedConflictRebase } from '../../conveyor/accepted-conflict-rebase.mjs';
-import { buildConflictRearmComment } from '../../conveyor/rearm-review.mjs';
+import { runRearmReviewCli } from '../../conveyor/rearm-review.mjs';
+import { countStaleConflictFixRounds } from '../../conveyor/conflict-fix-round-count.mjs';
 import { AUTOMATION_LOGINS } from '../../lib/marker-authorship.mjs';
 import { fixDetachedProvider, fixLauncherAvailable, FIX_RUN_SCRIPT, FIX_RUN_EXECUTORS, FIX_RUN_CONFINEMENT } from '../dispatch-providers/fix.mjs';
 import { resolveDeliveryAgentProvider } from '../deliver-item-wrapper.mjs';
@@ -124,7 +125,8 @@ describe('runFixCli', () => {
     const live = { headRefOid: head, labels: ['review:pending'], state: 'OPEN', isDraft: false,
       baseRefName: 'main', mergeable: 'CONFLICTING' };
     const guard = launchGuardFor({ mode: 'conflict-rebase', pr: 7, headRefOid: head,
-      conflictRebase: { oldHead: head, defaultBranch: 'main' } }, { repo: 'o/r' });
+      conflictRebase: { oldHead: head, defaultBranch: 'main', mainSha: 'f'.repeat(40),
+        receipt: `accepted-conflict-rebase:${head}@${'f'.repeat(40)}` } }, { repo: 'o/r' });
     const spawnFn = vi.fn();
     const providerSpawn = vi.fn(async (request, io) => {
       expect(request).toMatchObject({ mode: 'conflict-rebase', launchGuard: guard });
@@ -150,7 +152,8 @@ describe('runFixCli', () => {
     let live = { headRefOid: head, labels: ['review:pending'], state: 'OPEN', isDraft: false,
       baseRefName: 'main', mergeable: 'CONFLICTING' };
     const guard = launchGuardFor({ mode: 'conflict-rebase', pr: 7, headRefOid: head,
-      conflictRebase: { oldHead: head, defaultBranch: 'main' } }, { repo: 'o/r' });
+      conflictRebase: { oldHead: head, defaultBranch: 'main', mainSha: 'f'.repeat(40),
+        receipt: `accepted-conflict-rebase:${head}@${'f'.repeat(40)}` } }, { repo: 'o/r' });
     if (change === 'missing mode') delete guard.mode;
     if (change === 'missing pin') delete guard.pinnedHead;
     const readComments = m.io.readComments;
@@ -174,7 +177,8 @@ describe('runFixCli', () => {
       const live = { headRefOid: head, labels: ['review:pending'], state: 'OPEN', isDraft: false,
         baseRefName: 'main', mergeable: 'CONFLICTING' };
       const guard = launchGuardFor({ mode: 'conflict-rebase', pr: 7, headRefOid: head,
-        conflictRebase: { oldHead: head, defaultBranch: 'main' } }, { repo: 'o/r' });
+        conflictRebase: { oldHead: head, defaultBranch: 'main', mainSha: 'f'.repeat(40),
+        receipt: `accepted-conflict-rebase:${head}@${'f'.repeat(40)}` } }, { repo: 'o/r' });
       if (change === 'invalid descriptor') delete guard.pinnedHead;
       // Evidence changes during async provider preparation, after the original PR read.
       const resolveProvider = async () => {
@@ -203,7 +207,8 @@ describe('runFixCli', () => {
     const live = { headRefOid: head, labels: ['review:pending'], state: 'OPEN', isDraft: false,
       baseRefName: 'main', mergeable: 'CONFLICTING' };
     const guard = launchGuardFor({ mode: 'conflict-rebase', pr: 7, headRefOid: head,
-      conflictRebase: { oldHead: head, defaultBranch: 'main' } }, { repo: 'o/r' });
+      conflictRebase: { oldHead: head, defaultBranch: 'main', mainSha: 'f'.repeat(40),
+        receipt: `accepted-conflict-rebase:${head}@${'f'.repeat(40)}` } }, { repo: 'o/r' });
     let merging = false;
     const result = await runFixCli([...argv, '--merge-onto=main', '--mode=conflict-rebase',
       `--launch-guard=${JSON.stringify(guard)}`], { ...m.io,
@@ -232,20 +237,62 @@ describe('runFixCli', () => {
           baseRefName: 'main', mergeable: 'CONFLICTING' };
         expect((await runFixCli([...argv, '--mode=conflict-rebase', `--launch-guard=${JSON.stringify(guard)}`], {
           ...m.io, launchGateOptions: { readLive: () => live },
+          run: (cmd, args, opts) => {
+            const result = m.run(cmd, args, opts);
+            if (!args.some(a => a.endsWith('rearm-review.mjs'))) return result;
+            const exit = vi.spyOn(process, 'exit').mockImplementation(code => { throw new Error(`exit:${code}`); });
+            const output = [];
+            try {
+              expect(() => runRearmReviewCli({ argv: args.slice(1), resolveMainSha: () => target,
+                labelCliOptions: { provider: {
+                  readPrState: () => ({ ...live, headRefOid: after, comments: [] }),
+                  readLabels: () => live.labels,
+                  setLabels: (_repo, _pr, swap) => {
+                    expect(swap.add).toBe('review:pending');
+                    expect(live.labels).toEqual(['review:pending']);
+                  },
+                  postComment: (_repo, _pr, body) => comments.push({ author: { login: AUTOMATION_LOGINS[0] }, body }),
+                }, emit: line => output.push(JSON.parse(line)) },
+              })).toThrow('exit:0');
+              expect(output).toEqual([expect.objectContaining({ ok: true, round: 'conflict' })]);
+            } finally { exit.mockRestore(); }
+            return JSON.stringify(output[0]);
+          },
         })).code).toBe(0);
         const rearm = m.calls.find(c => c.some(a => a.endsWith('rearm-review.mjs')));
         expect(rearm).toEqual(['node', '/we/scripts/conveyor/rearm-review.mjs', '7', '--repo=o/r',
           '--round=conflict', `--actor=${receipt}`, '--main-ref=main']);
-        comments.push({ author: { login: AUTOMATION_LOGINS[0] }, body: buildConflictRearmComment({
-          actor: rearm.find(a => a.startsWith('--actor=')).slice('--actor='.length),
-          decision: { keepsHuman: false }, mainRef: 'main', mainSha: target,
-        }) });
+        expect(comments).toHaveLength(i);
+        expect(comments.at(-1).body).toContain(receipt);
+        expect(countStaleConflictFixRounds(comments, { currentRef: 'main',
+          currentSha: movedTarget ? 'e'.repeat(40) : target })).toEqual({ stale: movedTarget ? 0 : i, total: i });
         const plan = planAcceptedConflictRebase({ pr: { ...live, headRefOid: after, labels: ['review:accepted'], comments },
           mainSha: movedTarget ? 'e'.repeat(40) : target, cap, ceiling });
         expect(plan.kind).toBe(i < 3 ? 'fix' : 'cap-exhausted');
         if (i === 3) expect(plan.why).toContain('a person must take over');
       }
     });
+  it('conflict completion refusal remains an error under the nothing-to-rearm noop policy', async () => {
+    vi.stubEnv('WE_FIX_REARM_NOTHING_TO_REARM', 'noop');
+    const head = 'a'.repeat(40), target = 'f'.repeat(40), m = mk([head, 'b'.repeat(40)]);
+    const guard = launchGuardFor({ mode: 'conflict-rebase', pr: 7, headRefOid: head,
+      conflictRebase: { oldHead: head, defaultBranch: 'main', mainSha: target,
+        receipt: conflictRebaseReceipt(head, target) } }, { repo: 'o/r' });
+    const write = vi.fn();
+    const result = await runFixCli([...argv, '--mode=conflict-rebase', `--launch-guard=${JSON.stringify(guard)}`], {
+      ...m.io, write, launchGateOptions: { readLive: () => ({ headRefOid: head, labels: ['review:pending'],
+        state: 'OPEN', isDraft: false, baseRefName: 'main', mergeable: 'CONFLICTING' }) },
+      run: (cmd, args, opts) => {
+        if (args.some(a => a.endsWith('rearm-review.mjs'))) throw Object.assign(new Error('Command failed'), {
+          stderr: 'neither review:changes nor review:accepted is live — nothing to re-arm',
+        });
+        return m.run(cmd, args, opts);
+      },
+    });
+    expect(result.code).toBe(1);
+    expect(m.pendingRearm.clear).not.toHaveBeenCalled();
+    expect(write.mock.calls.flat().join('')).not.toContain('re-arm skipped');
+  });
   it.each([false, true])('pushAfterCi=%s waits with injected time and folds failures before the agent', async enabled => {
     const m = mk(['a'.repeat(40), 'b'.repeat(40)]);
     let now = 1000;

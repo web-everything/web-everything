@@ -824,6 +824,7 @@ export async function runFixCli(argv = [], {
           ...(launch.mode === 'conflict-rebase' ? ['--round=conflict', `--actor=${launch.launchGuard.conflictRebase.receipt}`,
             `--main-ref=${launch.launchGuard.conflictRebase.defaultBranch}`] : [])], { cwd: weRoot });
       } catch (e) {
+        if (launch.mode === 'conflict-rebase') throw e;
         const policy = resolveRearmRefusalPolicy();
         if (policy.mode === 'noop' && isNothingToRearmRefusal(e)) {
           write(`fix-run: PR #${pr} re-arm skipped — nothing to re-arm (review label not changes/accepted); policy fixRearmNothingToRearm=noop (source ${policy.source})\n`);

@@ -4456,7 +4456,12 @@ Borrowed `fix-run.mjs` repairs also check fresh admission after provider resolut
 merge/commit preparation, retaining the execution check afterward. Its conflict completion re-arms with
 `--round=conflict` and the dispatched receipt actor so both conflict budgets count completed repairs.
 `fix-run.test.mjs` covers pre-merge holds, moved heads, incomplete evidence, the post-merge recheck,
-and completed repairs exhausting each budget.
+and completed repairs exhausting each budget by running the production conflict re-arm CLI with injected
+label/comment IO on an already-pending PR. Count the emitted comment, never a fabricated completion.
+Conflict completion refusals remain errors even under the ordinary nothing-to-rearm noop policy.
+Every conflict launch requires a 40-hex target `mainSha` and its exact lowercase head/target receipt,
+including already-pending PRs; test missing, malformed and mismatched evidence before live reads.
+Holds and absent review labels must refuse completion visibly without posting a marker.
 The live PR read uses `throttle.noMemo: true` to retain throttling while bypassing the smoke memo.
 `conflict-rebase-launch-boundaries.test.mjs` enumerates execution sites; wrapper, borrowed-launch
 and memo regressions change evidence across the preparation/resume boundary with injected IO.

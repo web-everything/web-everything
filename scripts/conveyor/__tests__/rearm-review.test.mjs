@@ -1,3 +1,4 @@
+import { CONFLICT_FIX_COMMENT_MARKER } from '../conflict-fix-round-count.mjs';
 /**
  * @file scripts/conveyor/__tests__/rearm-review.test.mjs
  * @description Pins the PURE re-arm decision for the conveyor fix agent (WE #2630). `decideRearm` swaps a
@@ -738,6 +739,47 @@ describe('conflict-start independently verifies demotion before permitting repai
       })).toThrow('exit:0');
       expect(readLabels).not.toHaveBeenCalled();
       expect(output[0]).toMatchObject({ ok: true, labels: ['review:pending'], round });
+    } finally { exit.mockRestore(); }
+  });
+});
+
+
+describe('conflict completion on an already-pending PR', () => {
+  it.each([
+    ['pending', ['review:pending'], true],
+    ['no review label', ['unrelated'], false],
+    ...['review:human', 'review:held-mechanical', 'review:changes', 'status:held',
+      'held', 'status:hold', 'hold', 'review:pending-with-bounce'].map(label =>
+      [label, ['review:pending', label], false]),
+    ['unreadable labels', undefined, false],
+    ['malformed labels', ['review:pending', {}], false],
+    ['hold arriving before completion marker', ['review:pending'], false, true],
+  ])('%s records completion only with usable unheld labels', (_name, labels, ok, lateHold = false) => {
+    const head = 'a'.repeat(40), target = 'b'.repeat(40);
+    const receipt = `accepted-conflict-rebase:${head}@${target}`;
+    const postComment = vi.fn(), setLabels = vi.fn(), output = [];
+    let reads = 0;
+    const exit = vi.spyOn(process, 'exit').mockImplementation(code => { throw new Error(`exit:${code}`); });
+    try {
+      expect(() => runRearmReviewCli({
+        argv: ['7', '--repo=o/r', '--round=conflict', `--actor=${receipt}`],
+        resolveMainSha: () => target,
+        labelCliOptions: { provider: {
+          readPrState: () => ({ state: 'OPEN', headRefOid: head, comments: [],
+            labels: lateHold && ++reads > 1 ? ['review:pending', 'review:human'] : labels }),
+          readLabels: () => labels, setLabels, postComment,
+        }, emit: line => output.push(JSON.parse(line)) },
+      })).toThrow(`exit:${ok ? 0 : 1}`);
+      if (ok) {
+        expect(postComment).toHaveBeenCalledOnce();
+        expect(postComment.mock.calls[0][2]).toContain(receipt);
+        expect(postComment.mock.calls[0][2]).toContain(CONFLICT_FIX_COMMENT_MARKER);
+        expect(output).toEqual([expect.objectContaining({ ok: true, round: 'conflict', labels: ['review:pending'] })]);
+      } else {
+        expect(postComment).not.toHaveBeenCalled();
+        expect(setLabels).not.toHaveBeenCalled();
+        expect(output).toEqual([expect.objectContaining({ error: expect.stringContaining('STOP repair') })]);
+      }
     } finally { exit.mockRestore(); }
   });
 });

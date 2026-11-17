@@ -2,7 +2,7 @@ import { auditLaunchBoundaries } from './launch-boundary-audit.mjs';
 import { readdirSync, readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
-import { assertFixerLaunch, launchGuardFor, FIXER_LAUNCH_MODES } from '../../conveyor/conflict-rebase-launch-gate.mjs';
+import { assertFixerLaunch, assertLaunchDescriptor, assertLaunchable, launchGuardFor, FIXER_LAUNCH_MODES } from '../../conveyor/conflict-rebase-launch-gate.mjs';
 import { defaultSpawnAgent, spawnAgentToCompletion, defaultClaudeProvider } from '../dispatch-lane-io.mjs';
 import { defaultSpawnCodexAgent } from '../codex-delivery-provider.mjs';
 import { DELIVERY_AGENT_PROVIDERS } from '../deliver-item-wrapper.mjs';
@@ -13,13 +13,31 @@ import { execGuardedFixer } from '../fixer-process.mjs';
 
 const head = 'a'.repeat(40);
 const planned = { mode: 'conflict-rebase', pr: 7, headRefOid: head,
-  conflictRebase: { oldHead: head, defaultBranch: 'main' } };
+  conflictRebase: { oldHead: head, defaultBranch: 'main', mainSha: 'f'.repeat(40),
+        receipt: `accepted-conflict-rebase:${head}@${'f'.repeat(40)}` } };
 const guard = launchGuardFor(planned, { repo: 'o/r' });
 const live = () => ({ headRefOid: head, state: 'OPEN', isDraft: false, baseRefName: 'main',
   mergeable: 'CONFLICTING', labels: ['review:pending'] });
 const refused = expect.objectContaining({ kind: 'conflict-rebase-launch-refused' });
 
 describe('lowest fixer execution authority', () => {
+  it.each([
+    ['missing mainSha', { mainSha: undefined }],
+    ['malformed mainSha', { mainSha: 'unknown' }],
+    ['missing receipt', { receipt: undefined }],
+    ['mismatched receipt', { receipt: `accepted-conflict-rebase:${head}@${'b'.repeat(40)}` }],
+    ['uppercase receipt', { receipt: guard.conflictRebase.receipt.toUpperCase() }],
+  ])('refuses %s on an already-pending PR at every gate', (_name, changed) => {
+    const conflictRebase = { ...guard.conflictRebase, ...changed };
+    const descriptor = { mode: planned.mode, launchGuard: { ...guard, conflictRebase } };
+    const readLive = vi.fn(live), demote = vi.fn();
+    expect(() => assertLaunchDescriptor(descriptor)).toThrow(refused);
+    expect(() => assertFixerLaunch(descriptor, { readLive, demote })).toThrow(refused);
+    expect(() => assertLaunchable({ ...planned, conflictRebase }, { readLive, demote })).toThrow(refused);
+    expect(readLive).not.toHaveBeenCalled();
+    expect(demote).not.toHaveBeenCalled();
+  });
+
   it('trust-grant retry re-gates and refuses a hold arriving after the first attempt', () => {
     let state = live();
     const exec = vi.fn(() => { throw Object.assign(new Error('trust'), { stderr: 'Workspace not trusted' }); });

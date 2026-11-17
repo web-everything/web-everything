@@ -49,8 +49,18 @@ export function assertLaunchDescriptor(descriptor) {
       || !/^[1-9][0-9]*$/.test(String(launchGuard.pr ?? '')) || !launchGuard.repo
       || !launchGuard.conflictRebase
       || (pr != null && String(pr) !== String(launchGuard.pr))) refuse();
+  assertConflictReceipt(launchGuard.pinnedHead, launchGuard.conflictRebase);
   try { if (repo != null && ghRepoSlug(repo) !== ghRepoSlug(launchGuard.repo)) refuse(); }
   catch { refuse(); }
+}
+
+/** Every conflict launch, including a pending PR, needs the original target and receipt. */
+function assertConflictReceipt(head, evidence) {
+  if (!/^[0-9a-f]{40}$/i.test(head ?? '')
+      || !/^[0-9a-f]{40}$/i.test(evidence?.mainSha ?? '')
+      || evidence?.receipt !== `accepted-conflict-rebase:${head.toLowerCase()}@${evidence.mainSha.toLowerCase()}`) {
+    refuseFixerLaunch('missing or mismatched target mainSha and head receipt; refresh PR evidence before retrying');
+  }
 }
 
 /** At execution, every launch declares its purpose; conflict repairs also re-read live evidence. */
@@ -96,6 +106,7 @@ export function assertLaunchable(planned, {
   repo = 'we', root = REPO_ROOT, demote = demoteConflictRebase, readLive = readConflictRebaseLive,
 } = {}) {
   if (planned.mode !== 'conflict-rebase') return;
+  assertConflictReceipt(planned.headRefOid, planned.conflictRebase);
   const approvals = ['review:accepted', 'ready-to-merge', 'status:ready-to-merge'];
   const names = live => live.labels.map(l => typeof l === 'string' ? l : l.name);
   try {

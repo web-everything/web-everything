@@ -348,12 +348,12 @@ function readConflictStartLabels(repo, pr) {
 /** Run the rearm entrypoint with injectable label IO for strict conflict-start verification. */
 export function runRearmReviewCli({ argv = process.argv.slice(2), readLabels = readConflictStartLabels,
   labelCliOptions = {}, resolveMainSha = resolveLocalRefSha } = {}) {
+  // Conflict completion also accepts review:pending after conflict-start demotion.
   // #xkmu3gv — `--round=conflict` selects the MECHANICAL conflict-resolution comment/marker
   // (`CONFLICT_FIX_COMMENT_MARKER`, its own smaller `we:scripts/conveyor/reconcile-core.mjs#CONFLICT_FIX_ROUND_CAP`,
-  // #xkmu3gv) instead of the ordinary rearm marker. THE LABEL SWAP ITSELF IS IDENTICAL EITHER WAY — the SAME
-  // `review:changes → review:pending` (never `review:accepted`, never removes `review:human`) the shared pure
-  // `decideSetLabel({ to: 'rearm' })` decides; only which durable floor this completed round counts against, and
-  // the comment text explaining why, differs. See `conflict-fix-round-count.mjs`'s own header for why a
+  // #xkmu3gv) instead of the ordinary rearm marker. The shared pure re-arm decider still requests
+  // review:pending; conflict rounds additionally refuse holds and permit an already-pending completion.
+  // The comment identifies which durable floor counts this completed round. See `conflict-fix-round-count.mjs`'s own header for why a
   // mechanical conflict-resolution round needs its own cap rather than sharing `countRearmComments`'s.
   const roundArg = (argv.find((a) => a.startsWith('--round=')) || '').slice('--round='.length);
   const isConflictRound = roundArg === 'conflict';
@@ -401,26 +401,39 @@ export function runRearmReviewCli({ argv = process.argv.slice(2), readLabels = r
       process.exit(1);
     }
   }
-  // Guard each fresh state read, including the reads immediately before demotion.
+  // Guard each fresh state read, including the reads immediately before a completion marker or demotion.
   // The shared CLI otherwise tolerates holds on ordinary completed fix rounds.
-  const provider = isConflictStart ? (labelCliOptions.provider ?? createGhProvider()) : null;
+  const strictConflictLabels = isConflictStart || isConflictRound;
+  const provider = strictConflictLabels ? (labelCliOptions.provider ?? createGhProvider()) : null;
+  const readConflictState = (...args) => {
+    const state = provider.readPrState(...args);
+    if (!Array.isArray(state?.labels) || !state.labels.every(l =>
+      typeof (typeof l === 'string' ? l : l?.name) === 'string'
+      && (typeof l === 'string' ? l : l.name).length > 0)
+      || state.labels.some(l => isConflictRebaseHoldLabel(typeof l === 'string' ? l : l.name))) {
+      throw new Error(`${isConflictStart ? 'conflict-start' : 'conflict'} labels unreadable or held; STOP repair and refresh PR labels before retrying`);
+    }
+    if (isConflictRound && !state.labels.some(l =>
+      ['review:pending', 'review:accepted'].includes(typeof l === 'string' ? l : l.name))) {
+      throw new Error('conflict completion has nothing to re-arm; STOP repair and refresh PR labels before retrying');
+    }
+    return state;
+  };
   runReviewLabelCli({
     ...labelCliOptions,
-    ...(isConflictStart ? { provider: {
+    ...(strictConflictLabels ? { provider: {
       ...provider,
-      readPrState: (...args) => {
-        const state = provider.readPrState(...args);
-        if (!Array.isArray(state?.labels) || !state.labels.every(l =>
-          typeof (typeof l === 'string' ? l : l?.name) === 'string'
-          && (typeof l === 'string' ? l : l.name).length > 0)
-          || state.labels.some(l => isConflictRebaseHoldLabel(typeof l === 'string' ? l : l.name))) {
-          throw new Error('conflict-start labels unreadable or held; STOP repair and refresh PR labels before retrying');
-        }
-        return state;
-      },
+      readPrState: readConflictState,
+      ...(isConflictRound ? { postComment: (...args) => {
+        // The unpinned shared path writes the marker before swapping labels.
+        // Check again here so a newly arrived hold never receives a completion marker.
+        readConflictState(args[0], args[1]);
+        return provider.postComment(...args);
+      } } : {}),
     } } : {}),
     argv,
     fixedTo: 'rearm',
+    allowPendingConflictRearm: isConflictRound,
     defaultActor: 'conveyor fix agent',
     repoOptional: true, // the fix agent runs inside its WE lane clone, so a missing --repo derives from cwd.
     usage: 'usage: rearm-review.mjs <pr> [--repo=<owner/name>] [--actor=<name>] [--round=conflict|conflict-start] [--main-ref=<name>] [--only-if=accepted|missing] [--expect-head=<sha>]  (pr must be a positive integer)',

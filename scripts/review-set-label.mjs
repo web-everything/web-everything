@@ -409,7 +409,7 @@ export { decideParkToHuman, findContradictoryReviewVerdicts, decideContradictory
  *   its CLI also binds OPEN state and the pushed head before writing and verifies the result afterward.
  * @returns {{allowed:boolean, addLabel:string, removeLabels:string[], keepsHuman:boolean, reason:string}}
  */
-export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false, redTeamRulingHold = false, acceptanceStillCoversHead = false, humanClearedHead = false, operatorRestamp = false } = {}) {
+export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false, redTeamRulingHold = false, acceptanceStillCoversHead = false, humanClearedHead = false, operatorRestamp = false, allowPendingConflictRearm = false } = {}) {
   // we:scripts/review-set-label.mjs#decideSetLabel — only the targets in the closed set are valid.
   if (!REVIEW_LABEL_TARGETS.includes(to)) {
     throw new Error(
@@ -537,7 +537,10 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
           + '(#4333); nothing was changed',
       };
     }
-    if (!missing && !wasChanges && !wasAccepted) {
+    // Conflict-start already demoted this PR; completion must still leave its durable marker.
+    const pendingConflict = allowPendingConflictRearm && requireLive === null
+      && hasReviewLabel(currentLabels, REVIEW_LABELS.pending);
+    if (!missing && !wasChanges && !wasAccepted && !pendingConflict) {
       return {
         allowed: false,
         addLabel: '',
@@ -570,7 +573,7 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
       // `redteam:accepted` the PR still carries from before the fix.
       removeLabels: [REVIEW_LABELS.changes, REVIEW_LABELS.accepted, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL, 'status:ready-to-merge', ...RED_TEAM_STATUS_LABELS],
       keepsHuman: isHuman,
-      rearmFrom: missing ? 'missing' : wasChanges ? REVIEW_LABELS.changes : REVIEW_LABELS.accepted,
+      rearmFrom: pendingConflict ? REVIEW_LABELS.pending : missing ? 'missing' : wasChanges ? REVIEW_LABELS.changes : REVIEW_LABELS.accepted,
       reason: missing ? 'missing review family restored to review:pending; independent review owed' : isHuman
         ? 're-armed — review:human KEPT as the sole hold (gate-self stays human-ceremony-only); review:pending '
           + 'NOT added — the human hold already says an independent review is owed (#x01u7az)'
@@ -1138,6 +1141,7 @@ export function runReviewLabelCli({
   successResult,
   refusalResult,
   allowClearHuman = false,
+  allowPendingConflictRearm = false,
   readHumanOnlyHold = defaultReadHumanOnlyHold,
   // The findings write-up, so this function can REFUSE an empty bounce (see the `--to=changes` guard below).
   // The rendered comment still gets its body from the caller's `buildComment` closure — this is the same text,
@@ -1580,6 +1584,7 @@ export function runReviewLabelCli({
     findingCount: bounceEvidence.findingCount,
     reason: clearReason || bounceEvidence.reason,
     requireLive: onlyIf,
+    allowPendingConflictRearm,
     humanOnlyHold,
     redTeamRulingHold,
     acceptanceStillCoversHead: parseReviewedSha(prComments.filter(isTrustedMarkerAuthor)) === headSha,
