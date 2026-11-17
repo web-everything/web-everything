@@ -1,7 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { dirname, resolve, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createPrLandRunner } from '../open-pr-io.mjs';
 import { classifySubmit } from '../open-pr.mjs';
 import { admitCanonicalAudit } from '../../pr-land.mjs';
@@ -17,6 +19,103 @@ function runner(canonicalAudit) {
   const run = createPrLandRunner({ canonicalAudit, prePrReview: review, spawn, env: {}, prepGate: () => ({ ok: true }), readPrepBody: () => '' });
   return { run, spawn, review };
 }
+
+// Keep both producers' default checker. Replace only filesystem/process effects in a child,
+// never the checker or evaluator; no real Git, credentials, network, or .git writes.
+function defaultProducer({ direct = false, dry = false, records = [] } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'default-audit-gate-'));
+  const trace = join(dir, 'effects.jsonl');
+  const preload = join(dir, 'effects.mjs');
+  const audit = join(dir, 'audit.jsonl');
+  const prefs = join(dir, 'prefs.json');
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+  writeFileSync(audit, records.map(r => JSON.stringify(r)).join('\n'));
+  writeFileSync(prefs, '{}');
+  writeFileSync(preload, `
+    import fs from 'node:fs';
+    import cp from 'node:child_process';
+    import { syncBuiltinESMExports } from 'node:module';
+    const read = fs.readFileSync;
+    fs.readFileSync = (path, ...args) => String(path) === ${JSON.stringify(join(dir, 'scripts/settings/prototype-load.json'))}
+      ? JSON.stringify({ auditRecordPath: ${JSON.stringify(audit)} }) : read(path, ...args);
+    cp.execFileSync = (cmd, args) => {
+      fs.appendFileSync(${JSON.stringify(trace)}, JSON.stringify([cmd, args]) + '\\n');
+      if (cmd !== 'git') throw new Error('unexpected process: ' + cmd);
+      const a = args[0] === '-C' ? args.slice(2) : args;
+      if (a[0] === 'rev-parse') return ${JSON.stringify(sha)};
+      if (a[0] === 'fetch' && a.join(' ') === 'fetch origin main') return '';
+      if (a[0] === 'fetch') throw new Error("couldn't find remote ref");
+      if (a[0] === 'merge-base') return a.includes('--is-ancestor') ? '' : ${JSON.stringify(base)};
+      if (a[0] === 'diff') return a.includes('--name-only') ? 'docs/guide.md\\n'
+        : a.includes('--name-status') ? 'M\\tdocs/guide.md\\n'
+        : 'diff --git a/docs/guide.md b/docs/guide.md\\n+documentation only\\n';
+      throw new Error('unexpected git: ' + a.join(' '));
+    };
+    syncBuiltinESMExports();
+  `);
+  const argv = [`--repo=${dir}`, '--ref=lane/audit', `--sha=${sha}`, '--title=docs: update guide', '--body=Documentation update', '--json', ...(dry ? ['--dry-run'] : [])];
+  let entry = join(root, 'scripts/pr-land.mjs');
+  if (!direct) {
+    entry = join(dir, 'open.mjs');
+    writeFileSync(entry, `
+      import { createPrLandRunner } from ${JSON.stringify(pathToFileURL(join(root, 'scripts/operations/open-pr-io.mjs')).href)};
+      import { appendFileSync } from 'node:fs';
+      const run = createPrLandRunner({ cwd: ${JSON.stringify(dir)}, env: process.env,
+        prePrReview: () => ({ action: 'pass' }), prepGate: () => ({ ok: true }),
+        spawn: (_cmd, args) => {
+          appendFileSync(${JSON.stringify(trace)}, JSON.stringify(['publication', args]) + '\\n');
+          return { status: 0, stdout: '{"pr":7}' };
+        } });
+      console.log(JSON.stringify(run({ argv: ${JSON.stringify(argv)} })));
+    `);
+  }
+  try {
+    let status = 0, stdout;
+    try {
+      stdout = execFileSync(process.execPath, ['--import', preload, entry, ...argv], {
+        cwd: dir, env: { ...process.env, WE_PLATFORM_PREFERENCES_FILE: prefs, WE_POLICY_CASCADE_LOG: '0' },
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 1024 * 1024,
+      });
+    } catch (error) {
+      status = error.status; stdout = String(error.stdout || '');
+      if (!stdout.trim()) throw new Error(`producer exited ${status}: ${String(error.stderr || error.message)}`);
+    }
+    return { status, result: JSON.parse(stdout.trim()), effects: readFileSync(trace, 'utf8').trim().split('\n').map(line => JSON.parse(line)) };
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+describe('default canonical checker integration', () => {
+  it.each([false, true])('default open-pr checker refuses missing evidence for docs-only changes, dry=%s', dry => {
+    const { result, effects } = defaultProducer({ dry });
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'canonical-audit-missing' });
+    expect(result.detail).toContain(`codex-audit --base=origin/main --head=${sha}`);
+    expect(effects.some(([cmd, args]) => cmd === 'publication' || args.includes('push'))).toBe(false);
+  });
+  it.each([false, true])('direct pr-land default checker refuses missing evidence before publication for docs-only changes, dry=%s', dry => {
+    const { status, result, effects } = defaultProducer({ direct: true, dry });
+    expect(status).toBe(3);
+    expect(result).toMatchObject({ merged: false, reason: 'canonical-audit-missing' });
+    expect(result.detail).toContain(`codex-audit --base=origin/main --head=${sha}`);
+    expect(effects.some(([cmd, args]) => cmd !== 'git' || args.includes('push'))).toBe(false);
+  });
+  it('default open-pr admits an audited unpublished local head and delegates publication', () => {
+    const record = { head: sha, base, questionHash: QUESTION_HASH, at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED', findings: [] };
+    const { result, effects } = defaultProducer({ records: [record, { ...record, head: 'c'.repeat(40), fingerprint: 'd'.repeat(64) }] });
+    expect(result.outcome).toBe('opened');
+    expect(effects.filter(([cmd]) => cmd === 'publication')).toHaveLength(1);
+    expect(effects.find(([cmd]) => cmd === 'publication')[1]).toContain(`--sha=${sha}`);
+    expect(effects.some(([, args]) => args.includes('fetch') && args.some(arg => arg.includes('refs/heads/lane/audit')))).toBe(false);
+  });
+  it('direct pr-land default checker admits an audited unpublished local head in dry-run', () => {
+    const record = { head: sha, base, questionHash: QUESTION_HASH, at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED', findings: [] };
+    const { status, result, effects } = defaultProducer({ direct: true, dry: true,
+      records: [record, { ...record, head: 'c'.repeat(40), fingerprint: 'd'.repeat(64) }] });
+    expect(status).toBe(0);
+    expect(result.reason).toBe('dry-run');
+    expect(effects.some(([, args]) => args.includes('fetch') && args.some(arg => arg.includes('refs/heads/lane/audit')))).toBe(false);
+    expect(effects.some(([, args]) => args.includes('push'))).toBe(false);
+  });
+});
 describe('open-pr canonical gate', () => {
   it.each([false, true])('refuses without spawning including dry run=%s', dry => {
     const check = vi.fn(() => ({ ok: false, reason: 'canonical-audit-missing', message }));

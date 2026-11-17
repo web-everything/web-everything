@@ -59,10 +59,23 @@ describe('canonical audit before opening a PR', () => {
     const fp = 'd'.repeat(64);
     const records = [{ ...green, fingerprint: fp }, { ...weak, head: other, fingerprint: fp, at: '2026-11-17T01:00:00Z' }];
     const result = fixture({ records, liveFingerprint: false,
-      execOverride: (args, resolved) => { if (args.includes('fetch') && args.some(a => String(a).includes(ref))) throw new Error('fetch failed'); return resolved; } }).result;
+      execOverride: (args, resolved) => { if (args.includes('diff')) throw new Error('diff failed'); return resolved; } }).result;
     expect(result).toMatchObject({ ok: false, reason: 'canonical-audit-missing', record: null });
     expect(result.message).toMatch(/cannot verify newer WEAKENED audits/);
     expect(result.message).toMatch(/codex-audit --base=origin\/main --head=/);
+  });
+  it('allows an audited local head before first branch publication', () => {
+    const { result, calls } = fixture({
+      records: [green, { ...green, head: other, fingerprint: 'd'.repeat(64) }], liveFingerprint: false,
+      execOverride: (args, resolved) => {
+        if (args.includes('fetch') && args.some(a => String(a).includes(ref))) throw new Error("couldn't find remote ref");
+        if (args.includes('diff')) return 'diff --git a/docs/test.md b/docs/test.md\n+local documentation\n';
+        return resolved;
+      },
+    });
+    expect(result).toMatchObject({ ok: true, sha, record: green });
+    expect(calls.some(([, args]) => args.includes('fetch') && args.some(a => String(a).includes(ref)))).toBe(false);
+    expect(calls.some(([, args]) => args.includes('diff') && args.at(-1) === sha)).toBe(true);
   });
   it('a newer WEAKENED on another head with the same fingerprint hides an older pass', () => {
     const fp = 'd'.repeat(64);
@@ -88,8 +101,30 @@ describe('canonical audit before opening a PR', () => {
     expect(fixture({ auditText: `\r\n  \r\n${JSON.stringify(green)}\r\n\t\n` }).result)
       .toMatchObject({ ok: true, record: green });
   });
-  it('docs-only changes still refuse without canonical evidence (no diff exemption)', () => {
-    expect(fixture({ records: [], tool: { docsOnly: true } }).result.reason).toBe('canonical-audit-missing');
+  it.each([
+    ['invalid timestamp', { at: 'not-a-date' }],
+    ['missing timestamp', { at: undefined }],
+    ['contradictory findings', { findings: ['NOT WEAKENED'] }],
+    ['hidden contradictory findings', { findings: ['\u001b[31mＮＯＴ ＷＥＡＫＥＮＥＤ\u001b[0m'] }],
+    ['malformed findings', { findings: 'missing guard' }],
+  ])('refuses %s negative evidence alongside an older pass', (_name, malformed) => {
+    const { result } = fixture({ records: [green, { ...weak, at: '2026-11-17T01:00:00Z', ...malformed }] });
+    expect(result).toMatchObject({ ok: false, reason: 'canonical-audit-missing', record: null });
+    expect(result.message).toContain('malformed');
+    expect(result.message).toContain(`codex-audit --base=origin/main --head=${sha}`);
+  });
+  it.each(['before', 'after', 'carried', 'waived'])('malformed evidence refuses in the %s path', path => {
+    const malformed = { ...weak, at: 'invalid', ...(path === 'carried' ? { head: other, fingerprint: 'd'.repeat(64) } : {}) };
+    const records = path === 'before' ? [malformed, green] : [green, malformed];
+    expect(fixture({ records, tool: path === 'waived' ? { ruledWeakened: [waiver] } : {}, liveFingerprint: () => 'd'.repeat(64) }).result)
+      .toMatchObject({ ok: false, reason: 'canonical-audit-missing', record: null });
+  });
+  it.each([
+    null, [], { ...weak, head: 'short' }, { ...weak, base: null },
+    { ...weak, questionHash: QUESTION_HASH + '\n' }, { ...weak, fingerprint: 'not-a-fingerprint' },
+    { ...weak, findings: [null] }, { ...weak, verdict: 'unknown' },
+  ])('refuses malformed JSON record %j rather than falling back to a pass', record => {
+    expect(fixture({ records: [green, record] }).result).toMatchObject({ ok: false, reason: 'canonical-audit-missing', record: null });
   });
   it('the latest canonical WEAKENED supersedes an older green audit', () => {
     expect(fixture({ records: [green, { ...weak, at: '2026-11-17T01:00:00Z' }] }).result.reason).toBe('canonical-audit-weakened');

@@ -5,6 +5,22 @@ import { join } from 'node:path';
 import { canonicalAuditEvidence, mergeRuledWeakened, validSha } from './prototype-load.mjs';
 import { readPlatformPreferences, resolveCascade } from '../lib/policy-cascade.mjs';
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
+import { findAudit, QUESTION_HASH } from './codex-audit.mjs';
+
+// The shared evaluator skips unusable records. At admission, corrupt evidence must
+// refuse before that skip can expose an older pass (including a carried pass).
+function wellFormedAudit(record) {
+  if (!record || typeof record !== 'object' || Array.isArray(record)
+    || !validSha(record.head) || !validSha(record.base)
+    || typeof record.questionHash !== 'string' || !/^[a-f0-9]{64}(?![\s\S])/i.test(record.questionHash)
+    || typeof record.at !== 'string' || !Number.isFinite(Date.parse(record.at))
+    || (record.fingerprint != null && (typeof record.fingerprint !== 'string' || !/^[a-f0-9]{64}(?![\s\S])/i.test(record.fingerprint)))
+    || !Array.isArray(record.findings) || !record.findings.every(f => typeof f === 'string')) return false;
+  // Validate verdict/contradiction syntax with the canonical parser, even for a
+  // historical question. The original hash still determines evidence eligibility.
+  const candidate = { ...record, head: record.head.toLowerCase(), base: record.base.toLowerCase(), questionHash: QUESTION_HASH };
+  return findAudit([candidate], { head: candidate.head, base: candidate.base, questionHash: QUESTION_HASH, priorQuestionHashes: [] }) === candidate;
+}
 
 export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env = process.env,
   readFile = readFileSync, exec = execFileSync, fetchMain: fetchMainOpt, ancestor: ancestorOpt,
@@ -33,6 +49,9 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     } catch {
       return refuse('canonical-audit-missing', 'the audit record file has an unreadable/truncated line');
     }
+    if (!records.every(wellFormedAudit)) {
+      return refuse('canonical-audit-missing', 'the audit record file has a malformed record; inspect and repair the audit record file');
+    }
   } catch {
     return refuse('canonical-audit-missing', `no canonical codex-audit record for ${fullSha} (audit evidence or settings unreadable)`);
   }
@@ -51,7 +70,8 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     if (!evidence.some(r => r?.fingerprint && (r.head || r.sha) && !same(r.sha) && !same(r.head))) return null;
     try {
       fetchMain();
-      git('fetch', 'origin', `+refs/heads/${ref}:refs/remotes/origin/${ref}`);
+      // fullSha was resolved locally above. A new lane ref need not exist on
+      // origin until pr-land publishes it after admission.
       const fp = netDiffFingerprint(repo, 'origin/main', fullSha, { exec });
       if (!fp) throw new Error('empty fingerprint');
       return fp;
