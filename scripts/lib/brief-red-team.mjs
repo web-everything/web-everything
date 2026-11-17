@@ -81,9 +81,17 @@ const SHAPE = {
   } } },
 };
 
-export async function defaultRun({ files, prep, acceptance, policy, log, env = process.env, resolved, spawn = judgeSpawn }) {
+function resolveBriefRouting({ env = process.env, resolved, log }) {
   const current = { model: resolveClaudeHelperRoute({ env, log: false }).model, effort: DEFAULT_EFFORT };
   const route = resolveHelperRouting(current, { env, resolved, log });
+  return { current, route };
+}
+
+export async function defaultRun(args) {
+  return runJudge(args, resolveBriefRouting(args));
+}
+
+async function runJudge({ files, prep, acceptance, policy, log, spawn = judgeSpawn }, { current, route }) {
   const result = await spawn({
     mandate: `Find adversarial attack classes against the supplied prep and acceptance. Each class must have a concrete test. Return only {classes:[{attack,test}]}, at most ${policy.maxClasses} classes. You have no tools.\n${FENCED_DATA_RULE}`,
     input: fenceUntrusted('material', JSON.stringify({ files, prep, acceptance })),
@@ -98,15 +106,20 @@ export async function defaultRun({ files, prep, acceptance, policy, log, env = p
 
 export async function redTeamBrief({ files = [], prep = '', acceptance = '', policy,
   run = defaultRun, log = () => {}, env = process.env, resolved } = {}) {
+  policy = { ...DEFAULTS, ...select(policy ?? readBriefRedTeamPolicy()) };
+  const skipped = reason => ({ status: 'skipped', reason, classes: [] });
+  if (!isBriefRedTeamTouchSet(files)) return skipped('outside red-team touch-set');
+  if (!policy.enabled) return skipped('disabled');
+  if (![prep, acceptance].some(text => typeof text === 'string' && text.trim())) return skipped('no prep or acceptance text');
+  // Routing is a launch requirement, outside the advisory judge failure boundary.
+  const routing = resolveBriefRouting({ env, resolved, log });
   let timer;
   try {
-    policy = { ...DEFAULTS, ...select(policy ?? readBriefRedTeamPolicy()) };
-    const skipped = reason => ({ status: 'skipped', reason, classes: [] });
-    if (!isBriefRedTeamTouchSet(files)) return skipped('outside red-team touch-set');
-    if (!policy.enabled) return skipped('disabled');
-    if (![prep, acceptance].some(text => typeof text === 'string' && text.trim())) return skipped('no prep or acceptance text');
     const result = await Promise.race([
-      Promise.resolve().then(() => run({ files, prep, acceptance, policy, log, env, resolved })),
+      Promise.resolve().then(() => {
+        const args = { files, prep, acceptance, policy, log, env, resolved };
+        return run === defaultRun ? runJudge(args, routing) : run(args);
+      }),
       new Promise((_, reject) => {
         timer = setTimeout(() => reject(new Error('timed out')), policy.timeoutMs);
       }),

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { resolveAiRouting } from '../../lib/ai-routing.mjs';
-import { defaultRun } from '../../lib/brief-red-team.mjs';
+import { defaultRun, redTeamBrief } from '../../lib/brief-red-team.mjs';
 import { opusCommand } from '../scheduled-sweep.mjs';
 import { buildRestrictedProviderArgv } from '../minimal-context-provider.mjs';
 import { makeSummariser, DEFAULTS, MANDATE, SAMPLE_SHAPE, sessionInput } from '../coroner-sample.mjs';
@@ -75,7 +75,7 @@ for (const [name, run] of sites) describe(`${name} helper safety`, () => {
     if (name !== 'sweep') expect(effortOf(output)).toBe('high');
   });
   it('refuses an unusable model before any real spawn', async () => {
-    await expect(run(injected({ provider: 'claude', model: 'unknown-model' }))).rejects.toThrow(/unknown model/);
+    await expect(run(resolve({ provider: 'claude', model: 'unknown-model' }))).rejects.toThrow(/aiRouting.helper/);
   });
   it('refuses a valid model on an unsupported provider instead of falling back', async () => {
     await expect(run(resolve({ provider: 'codex', model: 'gpt-6-astra' }))).rejects.toThrow(/requires Claude/);
@@ -132,5 +132,56 @@ it('reads helper routing from injected environment through the real resolver', (
 it('refuses unknown inherited model pins and invalid effort without spawning', async () => {
   expect(() => buildRestrictedProviderArgv({ ...providerArgs, model: 'unknown', env, resolved: inherit })).toThrow(/unknown model/);
   await expect(coroner(inherit, { ...DEFAULTS, model: 'unknown' })).rejects.toThrow(/unknown model/);
-  await expect(brief(injected({ effort: 'unknown' }))).rejects.toThrow(/unknown effort/);
+  await expect(brief(resolve({ effort: 'unknown' }))).rejects.toThrow(/aiRouting.helper/);
+});
+
+describe('helper routing refusals survive real cascade fallback', () => {
+  it.each([
+    ['model', { provider: 'claude', model: 'unknown-model' }],
+    ['effort', { effort: 'unknown' }],
+    ['provider', { provider: 'unknown', model: 'sonnet' }],
+    ['combination', { provider: 'claude', model: 'gpt-6-astra' }],
+  ])('refuses an invalid %s from environment before returning provider argv', (_, coordinator) => {
+    const routedEnv = { ...env, WE_AI_ROUTING: JSON.stringify({ helper: { coordinator } }) };
+    expect(() => buildRestrictedProviderArgv({ ...providerArgs, env: routedEnv, log: false }))
+      .toThrow(/aiRouting.helper/);
+  });
+
+  it.each([
+    ['unsupported provider', { provider: 'codex', model: 'gpt-6-astra' }],
+    ['unknown model', { provider: 'claude', model: 'unknown-model' }],
+    ['invalid effort', { effort: 'unknown' }],
+  ])('refuses a resumed launch with %s', (_, coordinator) => {
+    expect(() => buildRestrictedProviderArgv({ ...providerArgs, resumeSessionId: 'resume',
+      env, resolved: resolve(coordinator), log: false })).toThrow(/aiRouting.helper/);
+  });
+
+  it('preserves inherited resume bytes through the environment resolver', () => {
+    expect(buildRestrictedProviderArgv({ ...providerArgs, resumeSessionId: 'resume',
+      env: { ...env, WE_AI_ROUTING: JSON.stringify({ helper: { coordinator: {
+        provider: 'inherit', model: 'inherit', effort: 'inherit',
+      } } }) }, log: false })).toEqual([
+      '--restricted', '--tools', 'Bash,Edit,Write,Read,Glob,Grep', '--strict-mcp-config',
+      '--disable-slash-commands', '--settings', 'hooks.json', '--resume', 'resume', 'prompt',
+    ]);
+  });
+
+  it.each([
+    ['unsupported provider', { provider: 'codex', model: 'gpt-6-astra' }],
+    ['unknown model', { provider: 'claude', model: 'unknown-model' }],
+  ])('propagates %s through redTeamBrief rather than returning zero classes', async (_, coordinator) => {
+    const run = vi.fn(async args => defaultRun({ ...args, spawn }));
+    const spawn = vi.fn(async () => ({ value: { classes: [] } }));
+    await expect(redTeamBrief({ ...briefArgs, resolved: resolve(coordinator), run }))
+      .rejects.toThrow(/aiRouting.helper/);
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it('keeps ordinary judge failures fail-open through the default runner and real resolver', async () => {
+    const spawn = vi.fn(async () => { throw new Error('judge unavailable'); });
+    const result = await redTeamBrief({ ...briefArgs, resolved: resolve(),
+      run: args => defaultRun({ ...args, spawn }) });
+    expect(result).toEqual({ status: 'failed', reason: 'judge unavailable', classes: [] });
+    expect(spawn).toHaveBeenCalledOnce();
+  });
 });

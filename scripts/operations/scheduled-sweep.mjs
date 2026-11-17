@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import { resolveHelperRouting } from './minimal-context-provider.mjs';
 /**
  * @file scripts/operations/scheduled-sweep.mjs
  * @description Card 106 — durable schedules. The PR movement sweep, the coroner sweep and the Opus sweep as
@@ -26,6 +25,7 @@ import { resolveHelperRouting } from './minimal-context-provider.mjs';
  *
  *   Usage: node scripts/operations/scheduled-sweep.mjs run <pr-movement|coroner|opus> [--dry-run] [--json] [--ignore-quiet]
  */
+import { resolveHelperRouting } from './minimal-context-provider.mjs';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';

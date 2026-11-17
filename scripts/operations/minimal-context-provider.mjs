@@ -178,10 +178,15 @@ export function resolveHelperRouting(current, { env = process.env, resolved, log
   resolvePolicyModel('claude', current.model);
   const lines = [];
   resolved ??= resolveAiRouting({ env, log: line => lines.push(line) });
-  const { coordinator } = aiRoutingInputs('helper', resolved);
-  if (!coordinator) return current;
   const report = line => { if (log !== false) { try { log(line); } catch { /* diagnostic only */ } } };
   for (const line of lines) report(line);
+  // The cascade retains lower-layer values on invalid input. Helpers must refuse
+  // that fallback, including when the retained coordinator is entirely inherited.
+  const invalid = (resolved.invalid ?? []).filter(detail =>
+    /^(?:platform|tool|env)(?:\.helper(?=[.=:])|[=:])/.test(detail));
+  if (invalid.length) throw new TypeError(`aiRouting.helper: invalid routing settings: ${invalid.join('; ')}`);
+  const { coordinator } = aiRoutingInputs('helper', resolved);
+  if (!coordinator) return current;
   report(`policy-cascade · aiRouting.helper: ${JSON.stringify(coordinator)} (${JSON.stringify(
     Object.fromEntries(Object.entries(resolved.sources ?? {}).filter(([key]) => key.startsWith('helper.coordinator.'))))})`);
   if (coordinator.provider !== undefined && coordinator.provider !== 'claude') {
@@ -217,8 +222,8 @@ export function buildRestrictedProviderArgv({
   sessionId, prompt, resumeSessionId = null, settingsFile, tools = RESTRICTED_PROVIDER_TOOLS, addDirs = [], model = 'sonnet', effort = 'medium',
   env = process.env, resolved, log,
 }) {
-  // A resumed session keeps its existing model and effort; no routing flags are emitted.
-  if (!resumeSessionId) ({ model, effort } = resolveHelperRouting({ model, effort }, { env, resolved, log }));
+  // Validate resumes too, while retaining their existing model and effort flags.
+  ({ model, effort } = resolveHelperRouting({ model, effort }, { env, resolved, log }));
   const RESTRICTED_FLAGS = [
     '--restricted', '--tools', tools, '--strict-mcp-config',
     '--disable-slash-commands', '--settings', settingsFile,
