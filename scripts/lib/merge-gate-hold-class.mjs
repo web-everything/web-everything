@@ -74,6 +74,9 @@ export function parsePrResultTable(log, prNumber) {
       seen.add(row[2]);
       tableResults.push({ status: row[1], id: row[2], reason: row[3] });
     }
+    // Real tables list the whole gate inventory; a partial table is missing evidence (e.g. CodeQL) and stays held.
+    const missing = GATE_IDS.filter(id => !seen.has(id));
+    if (missing.length) return { error: `incomplete verdict table, missing gates: ${missing.join(', ')}` };
     if (!tableResults.length || (tableHeader[2] === 'HOLD') !== tableResults.some(blocking)) return { error: 'verdict header disagrees with rows' };
     results.push(...tableResults);
     if (tableHeader[2] === 'HOLD') ok = false;
@@ -91,12 +94,14 @@ export function parsePrResultTable(log, prNumber) {
       return { error: 'missing, ambiguous or job-level merge-gate failure' };
     }
   }
-  // A manual freeze takes precedence over main-CI red in combineRedMain. Its
-  // table row alone therefore cannot prove main CI passed. Bind the diagnostic
-  // to this invocation, never an older table's completed verdict.
+  // A manual freeze takes precedence over main-CI red in combineRedMain, so the table row alone cannot prove main
+  // CI passed. Green needs exactly one green diagnostic for THIS invocation (between the previous summary and the
+  // first table) and NO other main-CI line anywhere in the log (any later or other red line wins).
   const priorSummary = lines.slice(0, start).findLastIndex(line => /^merge-gate: (?:PASS|HOLD)\b/.test(line));
-  const mainCi = lines.slice(priorSummary + 1, start).filter(line => /^main CI\b/.test(line));
-  const mainCiGreen = mainCi.length === 1 && /^main CI \(.+\): green$/.test(mainCi[0]);
+  const own = lines.slice(priorSummary + 1, start).filter(line => /^main CI\b/.test(line));
+  const everyMainCi = lines.filter(line => /^main CI\b/.test(line));
+  const green = line => /^main CI \(.+\): green$/.test(line);
+  const mainCiGreen = own.length === 1 && green(own[0]) && everyMainCi.every(green);
   return { num: Number(header[1]), ok, results, mainCiGreen };
 }
 

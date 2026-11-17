@@ -4,11 +4,30 @@ import { formatPrResult } from '../merge-gate-ci.mjs';
 import { runDraftPromotionStep } from '../../conveyor/draft-promotion-loop.mjs';
 import { readReviewCiGate, readReviewHeadAndLabels } from '../review-ci-gate-io.mjs';
 import { describe, it, expect, vi } from 'vitest';
-import { parsePrResultTable, classifyMergeGateHold, excuseMergeGateRows, resolveMergeGateHoldSetting, readMergeGateVerdict } from '../merge-gate-hold-class.mjs';
+import { parsePrResultTable as rawParse, classifyMergeGateHold, excuseMergeGateRows, resolveMergeGateHoldSetting, readMergeGateVerdict } from '../merge-gate-hold-class.mjs';
 import { runReconcilePass } from '../../conveyor/reconcile-pass.mjs';
 import { defaultReadHeadCheckState } from '../../operations/promote-draft-pr-dispatch.mjs';
 
-const log4965 = `2026-10-12T09:49:30.3934630Z #4965: HOLD
+import { GATE_IDS } from '../merge-gate-inventory.mjs';
+
+// Real merge-gate tables list the whole gate inventory; abridged fixtures are completed with passing rows so they
+// stay readable. Raw (incomplete) tables are exercised through rawParse and must be refused.
+const complete = log => {
+  const out = [];
+  let seen = null;
+  const flush = () => { if (seen) for (const id of GATE_IDS) if (!seen.has(id)) out.push(`  pass              ${id.padEnd(22)} fixture`); seen = null; };
+  for (const line of String(log).split('\n')) {
+    const bare = line.replace(/^\d{4}-\d\d-\d\dT\S+\s/, '');
+    if (/^#\d+:|^merge-gate:/.test(bare)) flush();
+    if (/^#\d+: (PASS|HOLD)\s*$/.test(bare)) seen = new Set();
+    else if (seen) { const m = /^  (\S+)\s+(\S+)/.exec(bare); if (m) seen.add(m[2]); }
+    out.push(line);
+  }
+  flush();
+  return out.join('\n');
+};
+const parsePrResultTable = (log, n) => rawParse(complete(log), n);
+const log4965Raw = `2026-10-12T09:49:30.3934630Z #4965: HOLD
 2026-10-12T09:49:30.3936795Z   hold              candidate-label        no "ready-to-merge" label — the drain never considers it
 2026-10-12T09:49:30.3938131Z   hold              producer-certified     not AI-generated, no ready-to-merge label, not human-cleared
 2026-10-12T09:49:30.3939344Z   pass              default-base           base main vs main
@@ -25,7 +44,8 @@ const log5008 = `main CI (ci.yml@main): green
   hold              red-main-freeze        main is RED (freeze: manual freeze: merge-queue switch: ruleset apply (operator go 2026-10-12))
   pass              ledger                 labels: labels clear (ledger not consulted)
 merge-gate: HOLD — held`;
-const candidacy = log4965.split('\n').filter(l => !l.includes('test-gaming')).join('\n');
+const log4965 = complete(log4965Raw);
+const candidacy = complete(log4965Raw.split('\n').filter(l => !l.includes('test-gaming')).join('\n'));
 const sha = 'a'.repeat(40);
 const row = { name: 'merge-gate', id: 123, status: 'COMPLETED', conclusion: 'FAILURE' };
 const green = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' };
@@ -42,16 +62,21 @@ describe('strict job table parser', () => {
   });
 });
 describe('all matching PR tables fail closed', () => {
-  const security = '#7: HOLD\n  hold codeql CodeQL failed';
-  const review = '#7: HOLD\n  hold review-acceptance human-only: x';
+  // Full-inventory tables like the real job log: every gate listed, `over` overrides [status, reason] per gate.
+  const table = (num, head, over = {}) => [`#${num}: ${head}`, ...GATE_IDS.map(id => {
+    const [status, reason] = over[id] ?? ['pass', 'ok'];
+    return `  ${status.padEnd(17)} ${id.padEnd(22)} ${reason}`;
+  })].join('\n');
+  const security = table(7, 'HOLD', { codeql: ['hold', 'CodeQL failed'] });
+  const review = table(7, 'HOLD', { 'review-acceptance': ['hold', 'human-only: x'] });
   const footer = '\nmerge-gate: HOLD — held';
-  const read = log => ({ ...parsePrResultTable(log, 7), head_sha: sha });
+  const read = log => ({ ...rawParse(log, 7), head_sha: sha });
   const excuse = log => excuseMergeGateRows([row], opts({ prNumber: 7, readVerdict: () => read(log) }));
-  it.each([[security, review], [review, security]])('keeps CodeQL visible and red with tables %j then %j', (first, second) => {
+  it.each([[security, review], [review, security]])('keeps CodeQL visible and red whichever table comes first', (first, second) => {
     const log = `${first}\n${second}${footer}`;
     const parsed = read(log);
     expect(parsed).toMatchObject({ ok: false, results: expect.arrayContaining([{ status: 'hold', id: 'codeql', reason: 'CodeQL failed' }]) });
-    expect(parsed.results).toHaveLength(2);
+    expect(parsed.results).toHaveLength(2 * GATE_IDS.length);
     expect(classify(parsed.results).excused).toBe(false);
     expect(excuse(log)).toEqual({ rows: [row], excused: false });
   });
@@ -60,25 +85,36 @@ describe('all matching PR tables fail closed', () => {
     expect(read(log).error).toBeTruthy();
     expect(excuse(log)).toEqual({ rows: [row], excused: false });
   });
+  it('refuses a review-only table that lacks the full gate inventory (round 3)', () => {
+    const partial = '#7: HOLD\n  hold               review-acceptance      human-only: x';
+    expect(read(`${partial}${footer}`).error).toMatch(/incomplete verdict table.*codeql/);
+    expect(excuse(`${partial}${footer}`)).toEqual({ rows: [row], excused: false });
+    // one complete table does not rescue a second partial one
+    expect(read(`${review}\n${partial}${footer}`).error).toMatch(/incomplete verdict table/);
+    // every gate except codeql: the missing evidence alone keeps it held
+    const noCodeql = review.split('\n').filter(l => !l.includes(' codeql ')).join('\n');
+    expect(read(`${noCodeql}${footer}`).error).toMatch(/missing gates: codeql/);
+  });
   it('ignores other PR rows while retaining all matching rows without deduplication', () => {
     const log = `${review}\n#8: HOLD\n  malformed other PR row\n${review}${footer}`;
-    expect(read(log)).toMatchObject({ ok: false, results: [
-      { status: 'hold', id: 'review-acceptance', reason: 'human-only: x' },
-      { status: 'hold', id: 'review-acceptance', reason: 'human-only: x' },
-    ] });
+    expect(read(log)).toMatchObject({ ok: false });
+    expect(read(log).results).toHaveLength(2 * GATE_IDS.length);
     expect(excuse(log).excused).toBe(true);
-    expect(read(`${log}\n#8: HOLD\n  hold codeql failed${footer}`).error).toBeTruthy();
+    expect(read(`${log}\n${table(7, 'HOLD', { codeql: ['hold', 'failed'] })}`).error).toBeTruthy();
   });
-  it('still excuses a single review-only table', () => {
+  it('still excuses a single complete review-only table', () => {
     expect(excuse(`${review}${footer}`)).toMatchObject({ excused: true, rows: [{ conclusion: 'SUCCESS' }] });
   });
-  it('accepts only all-PASS tables as ok and binds main CI to the first matching header', () => {
-    const pass = '#7: PASS\n  pass codeql clear';
-    expect(read(`main CI (ci.yml@main): green\n${pass}\nmain CI (ci.yml@main): red\n${pass}`)).toHaveProperty('error');
-    expect(read(`main CI (ci.yml@main): green\n${pass}\n${pass}`)).toMatchObject({ ok: true, mainCiGreen: true, results: [
-      { status: 'pass', id: 'codeql', reason: 'clear' }, { status: 'pass', id: 'codeql', reason: 'clear' },
-    ] });
-    expect(read(`main CI (ci.yml@main): green\n${review}\n${review}${footer}`)).toMatchObject({ ok: false, mainCiGreen: true });
+  it('accepts only all-PASS tables as ok; any red main-CI line anywhere clears mainCiGreen (round 3)', () => {
+    const pass = table(7, 'PASS');
+    const green = 'main CI (ci.yml@main): green', red = 'main CI (ci.yml@main): RED since bbbbbbbbb';
+    expect(read(`${green}\n${pass}\n${red}\n${pass}`)).toHaveProperty('error');
+    expect(read(`${green}\n${pass}\n${pass}`)).toMatchObject({ ok: true, mainCiGreen: true });
+    expect(read(`${green}\n${review}\n${review}${footer}`)).toMatchObject({ ok: false, mainCiGreen: true });
+    // a red line after another PR's table, before or after ours, or after the footer
+    for (const log of [`${green}\n${review}\n#8: HOLD\n${red}${footer}`, `${green}\n${review}${footer}\n${red}`, `${red}\n${green}\n${review}${footer}`]) {
+      expect(read(log).mainCiGreen).toBe(false);
+    }
   });
   it('rejects a footer that sits between tables (truncated later invocation)', () => {
     const log = `${review}${footer}\nmain CI (ci.yml@main): green\n${review}`;
@@ -472,7 +508,7 @@ describe('PR-event candidacy deferral', () => {
     expect(out).toMatchObject({ num: 5011, ok: true, blocking: [], clearanceCarry: input.clearanceCarry });
     expect(out.results.slice(0, 5)).toEqual(input.blocking.map(r => ({ ...r, status: 'skipped-by-policy', reason: `candidacy hold deferred to the merge_group run (mergeGate.prEventCandidacyHoldsPass=on): ${r.reason}` })));
     expect(input).toEqual(before);
-    expect(parsePrResultTable(formatPrResult(out), 5011)).toMatchObject({ ok: true, results: out.results });
+    expect(parsePrResultTable(formatPrResult(out), 5011)).toMatchObject({ ok: true, results: expect.arrayContaining(out.results) });
   });
   it.each(['merge_group', 'workflow_dispatch', undefined, null, 'PULL_REQUEST', 'pull_request_target'])('leaves event %s unchanged', mergeEvent => {
     const input = pending();
