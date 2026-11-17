@@ -12,7 +12,18 @@ import { resolveOverlayConflict } from './overlay-strategies.mjs';
 import { releaseBuildLease } from './lease.mjs';
 import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
 import { revokedAppliedTips, tipInMain as gitTipInMain } from './audited-tip.mjs';
+import { resolveSmokeDepth } from '../daemon-live-smoke.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
+
+/** Missing depth is legacy full evidence; malformed tags prove nothing. */
+export function smokeDepthAtLeast(recorded, env = process.env) {
+  if (recorded === undefined) return true;
+  const match = typeof recorded === 'string' && /^dispatchPasses=(0|3);skipReconcile=(true|false)$/.exec(recorded);
+  if (!match) return false;
+  const requested = resolveSmokeDepth(env);
+  return Number(match[1]) >= requested.dispatchPasses
+    && (match[2] === 'false' || requested.skipReconcileDryRun);
+}
 
 /**
  * PURE: may the ready candidate `ready` be adopted now, instead of smoking `plan`? Returns
@@ -47,9 +58,10 @@ export function matchReadyCandidate({
   registered = stillWanted, allowFallback = true, rejected = null, nowMs, maxAgeMs,
   liveApplied, carries = () => false, leftForMain = () => false,
   removedForMain = () => false, retiredByOperator = () => false, contentInBuild = () => false, forcedWatch = () => 'missing', auditedTip = null,
-  tipInMain = () => false,
+  tipInMain = () => false, env = process.env,
 }) {
   if (!ready) return { adopt: null, reason: 'none' };
+  if (!smokeDepthAtLeast(ready.smokeDepth, env)) return { adopt: null, reason: 'insufficient-smoke-depth' };
   // The live plan could not persist its audit pin. No ready/fallback path may replace that history with a build
   // lacking the pin (even a same-tree candidate or a record claiming pinnedFrom for a different sha).
   if (plan.reason === 'pinned-overlay-hold-marker-failed') return { adopt: null, reason: plan.reason };
@@ -376,6 +388,7 @@ export async function finalizeRebuild({
     } catch { /* best-effort audit trail only */ }
   };
   const state = readRebuildState(root, stEnv);
+  const smokeDepth = Object.hasOwn(plan, 'smokeDepth') ? plan.smokeDepth : state.adopted?.smokeDepth;
   const writeState = () => writeRebuildState(root, state, stEnv);
   // Every exit from this (locked) phase ends the build, so every exit releases its lease and persists that.
   releaseBuildLease(state, lease);
@@ -399,7 +412,7 @@ export async function finalizeRebuild({
   if (headNow === plan.finalSha) {
     if (!state.adopted || state.adopted.inputsKey !== plan.inputsKey || state.held) {
       state.adopted = {
-        head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, at: nowIso(),
+        head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, smokeDepth, at: nowIso(),
       };
       state.rejected = null;
       state.held = null;
@@ -451,7 +464,7 @@ export async function finalizeRebuild({
   // the pre-fix code, which reset BEFORE smoking (PR #2731 review; see prepareRebuild's Step 0).
   state.inProgress = {
     pid: process.pid, host: hostname(), prevHead, target: plan.finalSha, startedAt: nowIso(),
-    inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, verified: true,
+    inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, smokeDepth, verified: true,
   };
   writeState();
   try {
@@ -470,7 +483,7 @@ export async function finalizeRebuild({
       });
     }
     state.adopted = {
-      head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, at: nowIso(),
+      head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, smokeDepth, at: nowIso(),
     };
     state.rejected = null;
     state.held = null;

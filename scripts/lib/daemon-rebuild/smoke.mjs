@@ -12,7 +12,7 @@ import { readRebuildState, writeRebuildState, alertsFilePath, writeReadyCandidat
 import { releaseBuildLease } from './lease.mjs';
 import { forceRequestFor, readForceAdopt, recordForcedAdoption, abortForcedAdoption, clearForceAdopt } from '../daemon-force-adopt.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
-import { finalizeRebuild, staleAlertDetail, dropSuspectOverlays } from './adopt.mjs';
+import { finalizeRebuild, staleAlertDetail, dropSuspectOverlays, smokeDepthAtLeast } from './adopt.mjs';
 import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { mkdirSync, appendFileSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -448,7 +448,7 @@ export async function smokeAndAdopt({
   // one) — lets the smoke skip a tree-code check whose code none of them touch (see daemon-live-smoke.mjs
   // SMOKE_CHECKS). Unknown (not the adopted head, a failed diff) ⇒ null ⇒ full smoke.
   const changedSince = (sha) => {
-    if (!adoptedHead || adoptedHead !== prevHead) return null;
+    if (!adoptedHead || adoptedHead !== prevHead || !smokeDepthAtLeast(adoptedState.smokeDepth, smokeEnv)) return null;
     // A build adopted while a lane-pool probe was SKIPPED for a busy pool (`skipped: busy pool`) was never
     // live-verified on those checks, so "unchanged since the last live-verified build" does not hold for it:
     // the next smoke runs every check (null = full smoke), or a chain of busy skips would launder the pool code.
@@ -608,6 +608,7 @@ export async function smokeAndAdopt({
     }
     writeReadyCandidate(root, {
       ...readyMeta,
+      smokeDepth: smokeDepthTag(smokeEnv),
       prevHead,
       tree: verifyRev(git, `${p.finalSha}^{tree}`),
       adopt: {
@@ -635,7 +636,7 @@ export async function smokeAndAdopt({
       };
     }
     const fin = await withWriteLock(root, () => finalizeRebuild({
-      root, env, log, run, stateOpts, now, plan: p, prevHead, lease, onAdopted,
+      root, env, log, run, stateOpts, now, plan: { ...p, smokeDepth: smokeDepthTag(smokeEnv) }, prevHead, lease, onAdopted,
       auditedTip: makeAuditedTipGate(env), // unaudited-tip: evidence revoked during the smoke must not be adopted
     }), finalizeLockOpts);
     if (!fin.ok) {

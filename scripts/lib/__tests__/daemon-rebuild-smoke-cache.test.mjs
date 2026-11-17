@@ -100,6 +100,43 @@ function repeatTree(f, base) {
 }
 
 describe('durable smoke pass cache', () => {
+
+  const fullDepth = { WE_SMOKE_DISPATCH_PASSES: '3', WE_SMOKE_SKIP_RECONCILE_DRY_RUN: '0' };
+  const lightDepth = { WE_SMOKE_DISPATCH_PASSES: '0', WE_SMOKE_SKIP_RECONCILE_DRY_RUN: '1' };
+
+  it('records ready depth and re-smokes a light ready candidate for a full request', async () => {
+    const f = makeFixture();
+    Object.assign(f.env, lightDepth);
+    advanceMain(f.originDir, dir => writeFile(dir, 'a.txt', 'a'));
+    expect((await rebuild(f, async () => PASS, { readyOnly: true })).readyRecorded).toBe(true);
+    expect(JSON.parse(readFileSync(readyCandidatePath(f.cloneDir, f.env), 'utf8')).smokeDepth)
+      .toBe(smokeDepthTag(f.env));
+    Object.assign(f.env, fullDepth);
+    const smoke = vi.fn(async () => PASS);
+    expect((await rebuild(f, smoke)).adopted).toBe(true);
+    expect(smoke).toHaveBeenCalledTimes(1);
+    expect(smoke.mock.calls[0][0].changedFiles).toBeNull();
+  });
+
+  it.each(['light', 'legacy'])('%s adopted depth controls incremental code-check trust', async (depth) => {
+    const f = makeFixture();
+    Object.assign(f.env, depth === 'light' ? lightDepth : fullDepth);
+    advanceMain(f.originDir, dir => writeFile(dir, 'a.txt', 'a'));
+    await rebuild(f, async () => PASS);
+    const state = readRebuildState(f.cloneDir, f.env);
+    if (depth === 'light') expect(state.adopted.smokeDepth).toBe(smokeDepthTag(f.env));
+    else {
+      delete state.adopted.smokeDepth;
+      writeRebuildState(f.cloneDir, state, f.env);
+    }
+    Object.assign(f.env, fullDepth);
+    advanceMain(f.originDir, dir => writeFile(dir, 'b.txt', 'b'));
+    const smoke = vi.fn(async () => PASS);
+    await rebuild(f, smoke);
+    expect(smoke).toHaveBeenCalledTimes(1);
+    expect(smoke.mock.calls[0][0].changedFiles).toEqual(depth === 'light' ? null : ['b.txt']);
+  });
+
   it.each([false, true])('keeps healthy overlays when a cached fallback shares the broken harness (already running: %s)', async (alreadyRunning) => {
     const f = makeFixture();
     const base = head(f);

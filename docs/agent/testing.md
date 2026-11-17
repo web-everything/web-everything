@@ -915,6 +915,9 @@ per-lens design models still override the helper default.
 
 Rebuilds retain up to five complete passing smoke proofs in the existing per-clone rebuild state.
 Keys bind clone kind, Git tree, lockfile, Node version and the running smoke harness hash.
+Ready candidates and adopted heads retain the smoke depth tag. A lighter or unknown tag cannot
+satisfy a deeper request or justify unchanged-code skips; legacy records without a tag count as full.
+A rejected ready depth falls through to a fresh smoke at the requesting environment’s depth.
 `rebuildSmoke.reuseEnabled` (true) and `rebuildSmoke.reuseHours` (12) resolve through the
 standard → platform → `scripts/settings/rebuild-smoke.json` → env cascade; env overrides are
 `WE_REBUILD_SMOKE_REUSE_ENABLED=0|1` and `WE_REBUILD_SMOKE_REUSE_HOURS`. Log each leaf's source.

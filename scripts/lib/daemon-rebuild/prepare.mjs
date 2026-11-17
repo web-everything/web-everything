@@ -195,7 +195,7 @@ export async function prepareRebuild({
         const promote = headNow === ip.target && ip.target !== ip.prevHead;
         if (promote) {
           state.adopted = {
-            head: ip.target, inputsKey: ip.inputsKey ?? null, mainSha: ip.mainSha ?? null, applied: ip.applied ?? [], at: nowIso(),
+            head: ip.target, smokeDepth: ip.smokeDepth, inputsKey: ip.inputsKey ?? null, mainSha: ip.mainSha ?? null, applied: ip.applied ?? [], at: nowIso(),
           };
           state.rejected = null;
           state.held = null;
@@ -518,7 +518,7 @@ export async function prepareRebuild({
   if (plan.upToDate) {
     if (!state.adopted || state.adopted.inputsKey !== plan.inputsKey || state.held) {
       state.adopted = {
-        head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, at: nowIso(),
+        head: plan.finalSha, smokeDepth: state.adopted?.smokeDepth, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, at: nowIso(),
       };
       state.held = null; // x5wbsbc — current again: no longer held on a last-good build
       writeState();
@@ -552,6 +552,7 @@ export async function prepareRebuild({
         return overlayEvents;
       };
       const m = matchReadyCandidate({
+        env,
         ready,
         plan,
         prevHead,
@@ -629,7 +630,7 @@ export async function prepareRebuild({
           run,
           stateOpts,
           now,
-          plan: m.adopt,
+          plan: { ...m.adopt, smokeDepth: ready.smokeDepth },
           prevHead,
           lease: { token: ready.token ?? null },
           onAdopted: m.dropRefs.length

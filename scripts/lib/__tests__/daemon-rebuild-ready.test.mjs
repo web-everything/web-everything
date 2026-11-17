@@ -629,6 +629,28 @@ describe('matchReadyCandidate — pure', () => {
     adopt: { ...base.adopt, applied: [] },
   };
 
+  it.each([
+    ['light', 'dispatchPasses=0;skipReconcile=true', false],
+    ['dispatch-only reduction', 'dispatchPasses=0;skipReconcile=false', false],
+    ['reconcile-only reduction', 'dispatchPasses=3;skipReconcile=true', false],
+    ['unknown', 'unknown', false],
+    ['null', null, false],
+    ['legacy', undefined, true],
+  ])('%s ready depth against a full request', (_, smokeDepth, allowed) => {
+    const result = matchReadyCandidate(args({
+      ready: { ...base, smokeDepth }, plan: { finalSha: base.adopt.finalSha },
+      env: { WE_SMOKE_DISPATCH_PASSES: '3', WE_SMOKE_SKIP_RECONCILE_DRY_RUN: '0' },
+    }));
+    expect(result).toMatchObject(allowed ? { match: 'exact' } : { adopt: null, reason: 'insufficient-smoke-depth' });
+  });
+
+  it('accepts a light ready proof at the same depth and a legacy proof at light depth', () => {
+    const env = { WE_SMOKE_DISPATCH_PASSES: '0', WE_SMOKE_SKIP_RECONCILE_DRY_RUN: '1' };
+    for (const smokeDepth of ['dispatchPasses=0;skipReconcile=true', undefined]) {
+      expect(matchReadyCandidate(args({ ready: { ...base, smokeDepth }, env })).match).toBe('superseded');
+    }
+  });
+
   it('never adopts an unverified superseded build — even an overlay-free one (`applied: []`)', () => {
     const ready = { ...base, adopt: { ...base.adopt, finalSha: 'EVIL', mainSha: 'EVIL', applied: [] } };
     expect(matchReadyCandidate(args({ ready, verifyBuilt: () => false })).reason).toBe('unverified-build');
