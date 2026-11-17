@@ -1,5 +1,6 @@
 import { configDefaults, defineConfig } from 'vitest/config';
 import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
 import { hermeticGitEnv, maxTestWorkers, weAlias } from './vitest.shared';
 import { TRUST_CHAIN_TIER_FILES } from './scripts/lib/trust-chain-tier.mjs';
 import { cacheEnabled as testCacheEnabled } from './scripts/lib/test-result-cache.mjs';
@@ -51,7 +52,9 @@ export default defineConfig({
     // The simulator goldens were captured in Toronto local time. Node only applies runtime
     // TZ changes in a process, so isolate this suite in a fork instead of a worker thread.
     // Vitest matches absolute test paths; resolve from this config so the glob also works in hidden lane roots.
-    poolMatchGlobs: [[fileURLToPath(new URL('./packages/longshore/sim-engine/__tests__/**/*.test.mjs', import.meta.url)), 'forks']],
+    // Keep new URL(..., import.meta.url) out of this expression: Vite treats it as a browser asset URL
+    // when another test imports the config, and fileURLToPath then rejects the rewritten HTTP URL.
+    poolMatchGlobs: [[resolve(dirname(fileURLToPath(import.meta.url)), 'packages/longshore/sim-engine/__tests__/**/*.test.mjs'), 'forks']],
     poolOptions: {
       forks: {
         maxForks: maxTestWorkers,
