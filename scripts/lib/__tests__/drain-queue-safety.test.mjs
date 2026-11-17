@@ -925,8 +925,7 @@ describe('merge-queue same-head failure admission', () => {
         ] };
     }
 
-    it.each(['Set up job', 'Checkout', 'Run actions/checkout', 'actions/checkout@v4',
-      'Fetch sources', 'Setup Node.js', 'Install toolchain'])(
+    it.each(['Set up job', 'Checkout', 'Run actions/checkout', 'actions/checkout@v4'])(
       'accepts step proof for %s before tests, without reading logs', name => fixture(f => {
         setupJob(f, name);
         expect(f.guard().hold).toBe(false);
@@ -934,7 +933,7 @@ describe('merge-queue same-head failure admission', () => {
         expect(f.exec.mock.calls.some(([, args]) => args.includes(`repos/${repo}/actions/jobs/9021/logs`))).toBe(false);
       }));
 
-    it.each(['Run tests', 'Run build', 'Test checkout', 'Install test fixtures', 'Unknown command',
+    it.each(['Install dependencies', 'Fetch sources', 'Setup Node.js', 'Install toolchain', 'Run tests', 'Run build', 'Test checkout', 'Install test fixtures', 'Unknown command',
       'Run actions/setup-tests', 'Checkout\n'])(
       'refuses step proof when %s fails', name => fixture(f => {
         setupJob(f, name);

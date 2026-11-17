@@ -101,9 +101,8 @@ function validMqInfraSignatures(value) {
 // Positive setup evidence only: display names of arbitrary commands are not proof.
 function mqSetupStep(name) {
   return typeof name === 'string' && (/^Set up job(?![\s\S])/i.test(name)
-    || /^(?:Run )?actions\/(?:checkout|setup-(?:node|python|go|java|dotnet|ruby))(?:@[a-z0-9._/-]+)?(?![\s\S])/i.test(name)
-    || /^(?:Checkout|Check out)(?: (?:repository|code))?(?![\s\S])/i.test(name)
-    || /^(?:Fetch|Setup|Set up|Install)[ -](?:dependencies|toolchain|Node(?:\.js)?|pnpm|npm|Bun|Rust|Go|Python|Git|repository|sources|code)(?![\s\S])/i.test(name));
+    || /^(?:Run )?actions\/checkout(?:@[a-z0-9._/-]+)?(?![\s\S])/i.test(name)
+    || /^(?:Checkout|Check out)(?: (?:repository|code))?(?![\s\S])/i.test(name));
 }
 
 function mqSetupFailure(job) {
