@@ -5,7 +5,7 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync, readdirSync } from 'node:fs';
 import { parse } from 'acorn';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { laneIndicesIn, poolsWithLanes } from '../lib/lane-pool-scan.mjs';
 
 // Only string telemetry is exercised. These lexical helpers stay inside the VM;
@@ -81,18 +81,36 @@ function probeTelemetry(source) {
 /**
  * @param {{poolRoot?: string|null, readFile?: Function, readdir?: Function, git?: Function, now?: number, mainTipTimeMs?: number|null}} [options]
  * `git(args, {cwd, timeout, maxBuffer})` returns stdout or throws; readFile follows readFileSync.
- * @returns {Array<{pool:string, lane:number, head:string|null, behind:number|null, behindSinceMs:number|null, headLagMs:number|null, forgeExecHasPrune:boolean|null}>}
+ * @returns {Array<{pool:string, unreadable:true, path:string}|{pool:string, lane:number, head:string|null, behind:number|null, behindSinceMs:number|null, headLagMs:number|null, forgeExecHasPrune:boolean|null}>}
  */
 export function probeLaneCheckouts({ poolRoot, readFile = readFileSync, readdir = readdirSync, git = (args, options) => execFileSync('git', args, options), now = Date.now(), mainTipTimeMs = null } = {}) {
   if (poolRoot == null) return [];
   // The shared scanner deliberately swallows IO errors. Verify the root first,
   // and refuse an empty scan so health-watch records probe failure, not a clean tick.
-  readdir(poolRoot);
-  const pools = poolsWithLanes(poolRoot, { readdir });
+  const entries = readdir(poolRoot);
+  const unreadable = new Set();
+  const readPool = (pool) => {
+    try { return readdir(join(poolRoot, pool)); }
+    catch (error) {
+      // Root-level sentinel files are not pools; other failures are unknown evidence.
+      if (error.code !== 'ENOTDIR') unreadable.add(pool);
+      return [];
+    }
+  };
+  for (const pool of entries) readPool(pool);
+  const pools = poolsWithLanes(poolRoot, {
+    readdir: path => path === poolRoot ? readdir(path) : readPool(basename(path)),
+  });
+  // Check again: the shared scan can swallow a pool becoming unreadable mid-scan.
+  const namesByPool = new Map([...new Set([...entries, ...pools])].map(pool => [pool, readPool(pool)]));
   if (!pools.length) throw new Error('Lane checkout probe found no pools');
   const out = [];
-  for (const pool of pools) {
-    for (const lane of laneIndicesIn(join(poolRoot, pool), { readdir })) {
+  for (const pool of new Set([...pools, ...unreadable])) {
+    if (unreadable.has(pool)) {
+      out.push({ pool, unreadable: true, path: join(poolRoot, pool) });
+      continue;
+    }
+    for (const lane of laneIndicesIn(join(poolRoot, pool), { readdir: () => namesByPool.get(pool) })) {
       const cwd = join(poolRoot, pool, `lane-${lane}`);
       const row = { pool, lane, head: null, behind: null, behindSinceMs: null, headLagMs: null, forgeExecHasPrune: null };
       try {

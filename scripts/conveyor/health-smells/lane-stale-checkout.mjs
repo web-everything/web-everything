@@ -20,6 +20,13 @@ export default {
   recommendationHint: 'Refresh stale pool lanes through lane-pool refresh/reclaim.',
   evaluate({ laneCheckouts }, { now }) {
     return (laneCheckouts || []).map((c) => {
+      if (c.unreadable === true) return {
+        subject: `lane-checkout:${c.pool}/unreadable`,
+        breach: true,
+        measure: { unreadable: true, path: c.path },
+        summary: `pool unreadable: ${c.path}`,
+        recommendation: `Restore read access to pool ${c.pool} so lane checkout freshness can be verified.`,
+      };
       const age = Number.isFinite(c.behindSinceMs) ? now - c.behindSinceMs : 0;
       const staleForge = c.forgeExecHasPrune === false;
       const staleLag = Number.isFinite(c.behind) && c.behind > this.maxBehindCommits && age > this.maxBehindMs;

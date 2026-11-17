@@ -4,7 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import smell from '../lane-stale-checkout.mjs';
@@ -61,6 +61,16 @@ describe('lane-stale-checkout', () => {
     const result = evaluate(lane({ head: null }));
     expect(result.breach).toBe(true);
     expect(result.summary).toContain('lane checkout unreadable');
+  });
+
+  it('fails closed with a distinct subject and exact summary for an unreadable pool', () => {
+    const path = join('lanes', 'web-everything');
+    expect(evaluate({ pool: 'web-everything', unreadable: true, path })).toMatchObject({
+      subject: 'lane-checkout:web-everything/unreadable',
+      breach: true,
+      summary: `pool unreadable: ${path}`,
+      measure: { unreadable: true, path },
+    });
   });
 
   it.each([smell.maxBehindMs, 0, -1000])('does not alert for head lag within the threshold: %s', (headLagMs) => {
@@ -153,6 +163,32 @@ describe('probeLaneCheckouts', () => {
     expect(git.mock.calls.every(([, options]) => options.timeout === 2000 && options.maxBuffer === 65536)).toBe(true);
     expect(git.mock.calls.some(([args]) => args[0] === 'fetch')).toBe(false);
     expect(git).toHaveBeenCalledWith(['rev-list', '--count', 'HEAD..origin/main'], expect.objectContaining({ cwd: join(root, 'pool', 'lane-1') }));
+  });
+
+  it.each(['always', 'before scan', 'during scan', 'after scan'])('surfaces a pool unreadable %s while another pool reads fine', (failure) => {
+    addLane(root, 2, freshSource);
+    const path = join(root, 'unreadable-pool');
+    mkdirSync(join(path, 'lane-1'), { recursive: true });
+    let reads = 0;
+    const readdir = (dir) => {
+      if (dir === path) {
+        reads++;
+        if (failure === 'always' || (failure === 'before scan' && reads === 1)
+          || (failure === 'during scan' && reads === 2)
+          || (failure === 'after scan' && reads === 3)) {
+          throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+        }
+      }
+      return readdirSync(dir);
+    };
+    const rows = probeLaneCheckouts({ poolRoot: root, readdir, git: gitFixture(), now, mainTipTimeMs: now });
+    expect(rows).toHaveLength(2);
+    expect(rows).toContainEqual({ pool: 'unreadable-pool', unreadable: true, path });
+    expect(rows).toContainEqual(expect.objectContaining({ pool: 'pool', lane: 2, head: '222222222' }));
+    expect(smell.evaluate({ laneCheckouts: rows }, { now })).toEqual([
+      expect.objectContaining({ subject: 'lane-checkout:pool/lane-2', breach: false }),
+      expect.objectContaining({ subject: 'lane-checkout:unreadable-pool/unreadable', breach: true, summary: `pool unreadable: ${path}` }),
+    ]);
   });
 
   it('preserves commit lag when the fork point is unreadable', () => {
