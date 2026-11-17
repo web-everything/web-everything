@@ -1738,9 +1738,10 @@ export function runReconcilePass({
   if (repoKey === null) throw new Error(`reconcile-pass: --repo ${repo} is not a constellation repo`);
   const step = (name, fn) => {
     const startedAt = stepNow();
-    try { return fn(); } finally {
-      try { stepLog(`reconcile-pass: planner-step name=${name} repo=${repoKey} ms=${stepNow() - startedAt} startedAt=${new Date(startedAt).toISOString()}`); } catch { /* best-effort */ }
-    }
+    // Preserve the original failure output for the smoke classifier when a read throws.
+    const result = fn();
+    try { stepLog(`reconcile-pass: planner-step name=${name} repo=${repoKey} ms=${stepNow() - startedAt} startedAt=${new Date(startedAt).toISOString()}`); } catch { /* best-effort */ }
+    return result;
   };
   const timedStep = (name, fn) => (...args) => step(name, () => fn(...args));
   enrichStandDownAutoProceed = timedStep('enrich-stand-down-auto-proceed', enrichStandDownAutoProceed);
@@ -1898,8 +1899,12 @@ if (IS_CLI) {
     else flags[a.slice(2, eq)] = a.slice(eq + 1);
   }
   let result;
+  // A later read can fail after successful steps. Keep their diagnostics out of a
+  // failed child's first line: live-smoke classifies the original failure summary.
+  const stepLines = [];
   try {
     result = runReconcilePass({
+      stepLog: line => stepLines.push(line),
       repo: typeof flags.repo === 'string' ? flags.repo : null,
       ...(typeof flags['prs-file'] === 'string' ? { readPrs: () => readPrsFromFile(flags['prs-file']) } : {}),
       ...(typeof flags['agents-file'] === 'string' ? { readAgents: () => readPrsFromFile(flags['agents-file']) } : {}),
@@ -1908,6 +1913,7 @@ if (IS_CLI) {
     process.stderr.write(`✗ reconcile pass could not read state: ${String((e && e.message) || e).split('\n')[0]}\n`);
     process.exit(1);
   }
+  for (const line of stepLines) console.error(line);
   if (flags.json) process.stdout.write(JSON.stringify(result) + '\n');
   else process.stdout.write(formatReport(result) + '\n');
 }

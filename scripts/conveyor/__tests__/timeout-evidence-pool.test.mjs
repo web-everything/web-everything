@@ -7,6 +7,7 @@ import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 import { probeTimeoutEvidenceThrottle, runTimeoutEvidencePool } from '../timeout-evidence-pool.mjs';
 import { enrichPrsWithTimeoutEvidence, readTimeoutEvidence } from '../reconcile-pass.mjs';
+import { acquireGhSlotSync, releaseGhSlotSync } from '../../lib/gh-throttle.mjs';
 
 const repo = 'fixture/repo';
 const pr = { number: 7100, headRefOid: 'a'.repeat(40), statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE',
@@ -39,6 +40,7 @@ if (process.env.HANG_WORKER) {
 }
 `, { mode: 0o755 });
   const env = { ...process.env, PATH: bin + ':' + process.env.PATH, WE_FIX_FACTS: '0',
+    WE_GH_THROTTLE_CAP: '4',
     WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'throttle'), WE_GH_THROTTLE_COST_HEADERS: '0' };
   for (const [key, value] of Object.entries(env)) if (process.env[key] !== value) vi.stubEnv(key, value);
   return env;
@@ -99,6 +101,36 @@ it('probe round trip releases its real slot', () => scratch(dir => {
   const env = realFixture(dir);
   expect(probeTimeoutEvidenceThrottle(env)).toBe(true);
   expect(probeTimeoutEvidenceThrottle({ ...env, WE_GH_THROTTLE_CAP: '1' })).toBe(true);
+}));
+
+it('a busy throttle is healthy and still launches pool workers', () => scratch(dir => {
+  const env = { ...realFixture(dir), WE_GH_THROTTLE_CAP: '2' };
+  const lockRoot = env.WE_GH_THROTTLE_LOCK_ROOT;
+  mkdirSync(lockRoot, { recursive: true });
+  const owners = ['busy-fixture-1', 'busy-fixture-2'];
+  const launch = vi.fn(() => ({ on() {} }));
+  try {
+    for (const owner of owners) expect(acquireGhSlotSync({ lockRoot, cap: 2, owner, timeoutMs: 0 }).ok).toBe(true);
+    expect(probeTimeoutEvidenceThrottle(env)).toBe(true);
+    runTimeoutEvidencePool([pr, pr], { env, concurrency: 2, launch });
+    expect(launch).toHaveBeenCalledTimes(2);
+  } finally {
+    for (const owner of owners) releaseGhSlotSync({ lockRoot, cap: 2, owner });
+  }
+}));
+
+it.each(['acquire throws', 'acquire error', 'release throws', 'release fails'])('probe rejects machinery failure: %s', mode => scratch(dir => {
+  const acquire = () => {
+    if (mode === 'acquire throws') throw Error('fixture acquire');
+    return mode === 'acquire error' ? { ok: false, error: 'fixture error' } : { ok: true };
+  };
+  const release = () => {
+    if (mode === 'release throws') throw Error('fixture release');
+    return { released: false };
+  };
+  const probe = () => probeTimeoutEvidenceThrottle(realFixture(dir), { acquire, release });
+  if (mode.endsWith('throws')) expect(probe).toThrow(/fixture/);
+  else expect(probe()).toBe(false);
 }));
 
 it.each(['result', 'stderr'])('degraded %s stops launches and kills active groups before returning serial slots', source => {

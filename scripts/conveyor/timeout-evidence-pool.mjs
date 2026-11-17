@@ -10,18 +10,20 @@ import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { ghThrottleLockRoot, resolveGhCap, acquireGhSlotSync, releaseGhSlotSync, deriveGhCaller } from '../lib/gh-throttle.mjs';
 import { randomUUID } from 'node:crypto';
 
-// Unlike runGhSync, this round trip must never fail open. Busy slots also select serial.
-export function probeTimeoutEvidenceThrottle(env = process.env) {
+// Unlike runGhSync, machinery errors must never fail open. Busy slots are healthy.
+export function probeTimeoutEvidenceThrottle(env = process.env, { acquire = acquireGhSlotSync, release = releaseGhSlotSync } = {}) {
   const lockRoot = ghThrottleLockRoot(undefined, env), cap = resolveGhCap(env);
   const owner = `timeout-evidence-probe-${process.pid}-${randomUUID()}`;
   mkdirSync(lockRoot, { recursive: true });
   let acquired, released;
   try {
-    acquired = acquireGhSlotSync({ lockRoot, cap, owner, timeoutMs: 0 }).ok === true;
+    const result = acquire({ lockRoot, cap, owner, timeoutMs: 0 });
+    acquired = result.ok === true;
+    if (result.error) return false;
   } finally {
-    released = releaseGhSlotSync({ lockRoot, cap, owner }).released === true;
+    if (acquired) released = release({ lockRoot, cap, owner }).released === true;
   }
-  return acquired && released;
+  return !acquired || released;
 }
 
 const MAX_RESULT_BYTES = 16 * 1024 * 1024;

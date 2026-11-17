@@ -4429,9 +4429,23 @@ Run these tests with `reconcile-pass.test.mjs` through heavy-admission on a host
 permitting process-group signals and process inspection.
 
 The timeout-evidence pool fails closed before spawning: planner and worker probes mkdir
-the throttle root and acquire/release a real sync slot. A failed or busy probe selects
-serial evidence reads; worker probe failure exits before calling gh. The pool is capped
+the throttle root and attempt to acquire/release a real sync slot. Machinery errors or
+failed release after acquisition select serial evidence reads; a busy slot or timeout is
+healthy and preserves worker admission. Worker probe failure exits before calling gh.
+Worker fixtures use a scratch `WE_GH_THROTTLE_LOCK_ROOT` and explicit throttle cap so
+host traffic and inherited capacity settings cannot change whether workers launch.
+The pool is capped
 by the live throttle cap. Result/stderr degradation cancels all active groups with the
 same verified cleanup before serial fallback, and workers exit inside fail-open warnings
 before the throttle can continue ungated. Named pool regressions cover zero-launch
 planner refusal, zero-gh worker refusal, both degradation signals and cap bounds.
+
+
+### Reconcile CLI timing diagnostics
+
+Buffer planner-step timing lines at the reconcile CLI boundary and publish them only
+after the whole pass succeeds. Suppressing only the throwing step is insufficient:
+a successful earlier step can displace the failure summary used by live-smoke
+classification. The CLI timing regression covers a failed read after a successful
+step and successful JSON output; the GitHub-outage soak must hold as
+`smoke-env-unavailable` without writing a smoke rejection.

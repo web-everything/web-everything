@@ -1859,6 +1859,50 @@ describe('defaultReadAgents — the production default wires the reconcile-only 
   });
 });
 
+it.each([true, false])('CLI preserves failure output and publishes planner timings only on success (fail=%s)', async fail => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join, resolve } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'reconcile-cli-timings-'));
+  const prsPath = join(dir, 'prs.json');
+  const agentsPath = join(dir, 'agents.json');
+  writeFileSync(prsPath, '[]');
+  writeFileSync(agentsPath, '[]');
+  const savedArgv = process.argv;
+  const stopped = new Error('CLI exited');
+  const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+  const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+  const logs = vi.spyOn(console, 'error').mockImplementation(() => {});
+  const exit = vi.spyOn(process, 'exit').mockImplementation(() => { throw stopped; });
+  try {
+    vi.resetModules();
+    if (fail) {
+      const { getRequiredStatusChecks } = await import('../../lib/required-status-checks.mjs');
+      getRequiredStatusChecks.mockImplementationOnce(() => { throw new Error('HTTP 502: Bad Gateway'); });
+    }
+    process.argv = [process.execPath, resolve('scripts/conveyor/reconcile-pass.mjs'), '--json',
+      `--prs-file=${prsPath}`, `--agents-file=${agentsPath}`];
+    const cli = import('../reconcile-pass.mjs');
+    if (fail) {
+      await expect(cli).rejects.toBe(stopped);
+      expect(exit).toHaveBeenCalledWith(1);
+      expect(stderr.mock.calls.map(([line]) => line).join('')).toBe('✗ reconcile pass could not read state: HTTP 502: Bad Gateway\n');
+      expect(logs.mock.calls.flat().join('\n')).not.toContain('planner-step');
+      expect(stdout).not.toHaveBeenCalled();
+    } else {
+      await cli;
+      expect(logs.mock.calls.flat().join('\n')).toContain('planner-step name=read-prs ');
+      expect(logs.mock.calls.flat().join('\n')).toContain('planner-step name=plan ');
+      expect(JSON.parse(stdout.mock.calls.map(([line]) => line).join('')).prs).toBe(0);
+      expect(exit).not.toHaveBeenCalled();
+    }
+  } finally {
+    process.argv = savedArgv;
+    exit.mockRestore(); logs.mockRestore(); stdout.mockRestore(); stderr.mockRestore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 60_000);
+
 it('logs one timing line per planner step (name, repo, ms, startedAt) so a slow step is visible', async () => {
   const { runReconcilePass } = await import('../reconcile-pass.mjs');
   let time = 1000;
@@ -1993,6 +2037,9 @@ it('serially falls back through the throttle when the pool fails or returns a mi
   execFileSync.mockReset();
 });
 it('runs the file-based synchronous pool with real child processes and cleans its temp directory', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const lockRoot = mkdtempSync(evidenceJoin(tmpdir(), 'timeout-pool-throttle-'));
   const { spawn, execFileSync: realExec } = await vi.importActual('node:child_process');
   const groupAlive = pid => realExec('ps', ['-axo', 'pgid=,stat='], { encoding: 'utf8' }).split('\n').some(line => {
     const [group, state] = line.trim().split(/\s+/);
@@ -2008,7 +2055,11 @@ it('runs the file-based synchronous pool with real child processes and cleans it
       renameSync(output + '.tmp', output); ${keepAliveScript({ maxLifetimeMs: 10_000 })}`;
     return spawn(process.execPath, ['--input-type=module', '-e', script, ...args.slice(-2)], opts);
   };
-  expect(runTimeoutEvidencePool([{ number: 1 }, { number: 2 }, { number: 3 }], { launch, groupAlive, concurrency: 2, deadlineMs: 3000 }))
-    .toEqual([{ eligible: true, number: 1 }, { eligible: true, number: 2 }, { eligible: true, number: 3 }]);
-  expect(evidenceExists(folder)).toBe(false);
+  try {
+    expect(runTimeoutEvidencePool([{ number: 1 }, { number: 2 }, { number: 3 }], {
+      launch, groupAlive, concurrency: 2, deadlineMs: 3000,
+      env: { ...process.env, WE_GH_THROTTLE_LOCK_ROOT: lockRoot, WE_GH_THROTTLE_CAP: '4' },
+    })).toEqual([{ eligible: true, number: 1 }, { eligible: true, number: 2 }, { eligible: true, number: 3 }]);
+    expect(evidenceExists(folder)).toBe(false);
+  } finally { rmSync(lockRoot, { recursive: true, force: true }); }
 });
