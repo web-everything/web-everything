@@ -12,6 +12,7 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { GATE_IDS } from '../../lib/merge-gate-inventory.mjs';
 import {
   buildCiHealEscalationComment, parseCiHealEscalations, latestCiHealEscalationForHead,
   escalationStaleAgainstBase, enrichPrsWithEscalationBaseFacts, defaultReadBaseHead,
@@ -748,7 +749,9 @@ for (const method of ['execFileSync', 'spawnSync', 'execSync', 'exec', 'execFile
       }
       if (args[1][0] === 'api' && args[1][1] === 'repos/web-everything/web-everything/actions/jobs/123/logs')
         return ${JSON.stringify('#6042: HOLD\n  hold review-acceptance review pending\n'
-          + (evidence === 'job-failure' ? '  fail-closed codeql security check failed\n' : '')
+          // The parser requires the whole gate inventory per table, as the real job log prints.
+          + GATE_IDS.filter(id => id !== 'review-acceptance').map(id => id === 'codeql' && evidence === 'job-failure'
+            ? '  fail-closed codeql security check failed\n' : `  pass ${id} ok\n`).join('')
           + (evidence === 'truncated' ? '' : 'merge-gate: HOLD — held\n'))};
     }
     throw new Error('unexpected child process in CLI preflight test');
