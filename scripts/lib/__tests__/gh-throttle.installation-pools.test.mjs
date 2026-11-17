@@ -274,6 +274,23 @@ process.send('ready');
     expect(readLockEntry(pool('101').lockRoot, slotPath(0)).owner).toBe('first');
     expect(existsSync(join(root, 'calls.jsonl'))).toBe(false);
   });
+  // The caller bound counts every slot of every pool, so a stale holder above a lowered cap in the
+  // caller's OWN pool must be reaped too, or it blocks admission it can never clear (R1012 sibling).
+  it.each(['101', null])('reaps a stale caller holder above a lowered cap in its own pool %s', bucket => {
+    const clock = Date.now();
+    const extra = { policy: { ...policy, perCallerMax: 1 }, now: () => clock, cap: 3 };
+    expect(acquire(bucket, 'a', extra).ok).toBe(true);
+    expect(acquire(bucket, 'b', extra).ok).toBe(true);
+    expect(acquire(bucket, 'first', { ...extra, meta: ghHolderMeta({ caller: 'same', args }) }).ok).toBe(true);
+    releaseGhSlotSync({ ...pool(bucket), cap: 3, owner: 'a' });
+    releaseGhSlotSync({ ...pool(bucket), cap: 3, owner: 'b' });
+    expect(readLockEntry(pool(bucket).lockRoot, slotPath(2)).owner).toBe('first');
+    const later = { ...extra, cap: 2, meta: ghHolderMeta({ caller: 'same', args }) };
+    expect(acquire(bucket, 'second', { ...later, now: () => clock + 105000 }).ok).toBe(false);
+    expect(acquire(bucket, 'second', { ...later, now: () => clock + 106000 }).ok).toBe(true);
+    expect(readLockEntry(pool(bucket).lockRoot, slotPath(2))).toBeNull();
+    expect(rows('calls.jsonl')).toContainEqual(expect.objectContaining({ outcome: 'slot_reaped', bucket: bucket ?? 'shared', caller: 'same' }));
+  });
   it('reports bucket holders and reaps an aged bucket slot into the shared call log', () => {
     const clock = Date.now();
     expect(acquire(null, 'shared').ok).toBe(true);

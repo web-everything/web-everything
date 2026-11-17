@@ -214,10 +214,11 @@ export function acquireGhHolderSlot({ lockRoot, cap, owner, pid, pollMs, timeout
     const nowMs = now();
     const entries = Array.from({ length: cap }, (_, slot) => readLockEntry(lockRoot, slotPath(slot)));
     let holders = entries.flatMap((e, slot) => e ? [holder(slot, e, nowMs)] : []);
-    // Snapshot other pools before trying admission, just as for the own-pool entries.
+    // Snapshot every slot the caller bound counts (all pools, including own-pool slots at or above
+    // a lowered cap) before trying admission, so each counted stale holder is also reapable.
     const others = policy.perCallerMax > 0 ? readGhSlotHolders({ lockRoot: callerLockRoot, cap, nowMs })
       .map(h => ({ root: h.bucket ? join(callerLockRoot, 'installations', h.bucket) : callerLockRoot, ...h }))
-      .filter(h => h.root !== lockRoot)
+      .filter(h => h.root !== lockRoot || h.slot >= cap)
       .map(h => ({ ...h, entry: readLockEntry(h.root, slotPath(h.slot)) })) : [];
     const reap = (root, slot, snapshot, bucket) => {
       if (policy.maxHoldSeconds <= 0 || !snapshot || !overAge(holder(slot, snapshot, nowMs))) return;
@@ -230,7 +231,7 @@ export function acquireGhHolderSlot({ lockRoot, cap, owner, pid, pollMs, timeout
     let r = capped() ? { ok: false } : trySlot({ lockRoot, cap, owner, pid, nowMs, nowIso: new Date(nowMs).toISOString(), meta: { ...slotMeta, acquiredAt: new Date(nowMs).toISOString() } });
     if (!r.ok && (capped() || holders.length >= cap) && policy.maxHoldSeconds > 0) {
       for (const h of holders) reap(lockRoot, h.slot, entries[h.slot]);
-      for (const h of others) reap(h.root, h.slot, h.entry, h.bucket ?? 'shared');
+      for (const h of others) reap(h.root, h.slot, h.entry, h.root === lockRoot ? undefined : h.bucket ?? 'shared');
       holders = readGhSlotHolders({ lockRoot, cap, nowMs, includeInstallations: false });
       if (!capped()) r = trySlot({ lockRoot, cap, owner, pid, nowMs, nowIso: new Date(nowMs).toISOString(), meta: { ...slotMeta, acquiredAt: new Date(nowMs).toISOString() } });
     }
