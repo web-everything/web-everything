@@ -63,7 +63,8 @@ export function reviewRunEvidence(run) {
       retryableRecordEffect = !run.resumeOf && outstanding.length > 0 && outstanding.every(e => e?.type === 'review.label-swap'
         && e.status === 'pending' && e.unknownAttempts === 0 && isBodyFileRefusal(e.error));
       if (outstanding.length > 0 && outstanding.every(e => e?.type === 'review.label-swap'
-        && e.status === 'failed' && typeof e.error === 'string' && /CI still pending on reviewed head/.test(e.error))) {
+        && e.status === 'failed' && (run.ciHeldRecord === true
+          || typeof e.error === 'string' && /CI still pending on reviewed head/.test(e.error)))) {
         const resumeAttempts = Object.hasOwn(run, 'recordEffectResumeAttempts') ? run.recordEffectResumeAttempts : 0;
         ciHeldRecordRetry = { attempts: outstanding.every(e => ciHeldRecordRetryCountersValid({
           attempts: e.unknownAttempts, resumeAttempts,

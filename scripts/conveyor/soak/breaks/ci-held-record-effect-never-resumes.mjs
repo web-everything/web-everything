@@ -87,6 +87,35 @@ export default {
           check(out.run?.effects.find(e => e.type === REVIEW_EFFECTS.LABEL)?.status === 'failed', `${kind}: pending CI must keep holding`);
         } else check(judges > before.judges, `${kind}: fresh panel fallback must remain reachable`);
         cases.push({ kind, runId: out.run?.id });
+        if (kind === 'driver-first') {
+          // A second pre-write failure must not erase the first CI hold's retry policy.
+          let clearanceReads = 0;
+          const retryArgs = { ...args, argv: [`--resume=${saved.id}`, '--json'],
+            acceptPolicy: { value: { unattendedAcceptRequiresCleanReferrals: true } },
+            readAcceptancePr: () => { clearanceReads++; return {
+              headRefOid: head, body: '<!-- authored-by-actor: author -->', comments: [],
+            }; },
+          };
+          sinks[REVIEW_EFFECTS.LABEL] = async () => {
+            throw notApplied('review-set-label.mjs could not be started, nothing was written: EAGAIN');
+          };
+          await runReviewLoopOnce(retryArgs);
+          const interrupted = reviewRunEvidence(store.read(saved.id));
+          check(interrupted?.ciHeldRecordRetry?.attempts === 3,
+            'pre-write retry: EAGAIN must retain CI-held evidence and its spent attempts');
+          check(findResumableParkedRun({ number: pr, headRefOid: head, comments: [] }, [interrupted],
+            { repo, ciHeldRecordRetryMax: 3 })?.id === saved.id, 'pre-write retry: discovery must retain the held run');
+          clearanceReads = 0;
+          let strictGate = false;
+          sinks[REVIEW_EFFECTS.LABEL] = async (_payload, ctx) => {
+            strictGate = ctx.requireCiGate === true;
+            throw notApplied('review held: CI still pending on reviewed head');
+          };
+          const retry = await runReviewLoopOnce(retryArgs);
+          check(strictGate && clearanceReads > 0, 'pre-write retry: both CI and acceptance guards must survive');
+          check(retry.stopped === 'effect-halted', 'pre-write retry: pending CI must keep the run held');
+          cases.push({ kind: 'driver-prewrite-failure-preserves-ci-hold', runId: retry.run?.id });
+        }
       }
 
       for (const kind of ['first', 'at-bound', 'over-bound', 'off', 'operator-wake', 'other-head', 'non-CI', 'cooldown', 'body-file']) {

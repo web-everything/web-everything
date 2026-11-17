@@ -693,7 +693,8 @@ export async function runReviewLoopOnce({
     const label = sinks[REVIEW_EFFECTS.LABEL];
     sinks = { ...sinks, [REVIEW_EFFECTS.LABEL]: Object.assign(
       (payload, ctx) => label(payload, { ...ctx, requireCiGate: true }), label) };
-    return { run: { ...parked, resumedAt: now(), recordEffectResumeAttempts: attempts + 1 } };
+    // Persist the provenance before driving: a later pre-write failure replaces the effect's CI error.
+    return { run: { ...parked, resumedAt: now(), ciHeldRecord: true, recordEffectResumeAttempts: attempts + 1 } };
   };
 
   let run;

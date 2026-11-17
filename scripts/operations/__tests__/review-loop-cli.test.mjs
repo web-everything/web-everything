@@ -27,7 +27,7 @@ import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, onTestFinished } from 'vitest';
 
 import { createRegistry } from '../registry.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
@@ -1898,8 +1898,10 @@ describe('CI-held record driver resume', () => {
     const publishGate = vi.fn(() => ({ allowed: false, headSha: HEAD_A, reason: 'required-checks-not-successful' }));
     const runNode = vi.fn(() => { throw Error('CI pending must prevent publication'); });
     const timingEnv = { WE_REVIEW_START_EARLY: 'on', WE_REVIEW_START_EARLY_PUBLISH_WAIT_MS: '1', WE_REVIEW_START_EARLY_POLL_MS: '1' };
+    const root = mkdtempSync(join(tmpdir(), 'ci-held-resume-'));
+    onTestFinished(() => rmSync(root, { recursive: true, force: true }));
     const label = createReviewPrSinks({
-      root: mkdtempSync(join(tmpdir(), 'ci-held-resume-')), runStore: store, env: timingEnv,
+      root, runStore: store, env: timingEnv,
       labelProvider: { readPrState: () => ({ comments: [] }) }, postRedTeamCheckRun: async () => ({ ok: true }), out: () => {},
       publishGate, readPublishHead: () => HEAD_A, now: () => time, sleep: async ms => { time += ms; }, runNode,
     })[REVIEW_EFFECTS.LABEL];
@@ -2008,6 +2010,52 @@ describe('CI-held record driver resume', () => {
     for (const [args] of f.publishGate.mock.calls) expect(args.policy)
       .toMatchObject({ startEarly: 'off', startAfter: 'ci-green', startBeforeCi: false });
   });
+
+  it.each(['automatic', 'explicit'].flatMap(mode =>
+    ['pending', 'revoked', 'green', 'exhausted', 'unknown'].map(next => [mode, next])))(
+    '%s CI-held retry preserves guards after EAGAIN (%s)', async (mode, next) => {
+      let cleared = true;
+      const readAcceptancePr = vi.fn(() => ({ headRefOid: HEAD_A,
+        body: cleared ? '<!-- authored-by-actor: author -->' : '', comments: [] }));
+      const f = await fixture(3, { acceptPolicy: { value: { unattendedAcceptRequiresCleanReferrals: true } },
+        readAcceptancePr });
+      f.publishGate.mockReturnValue({ allowed: true, headSha: HEAD_A, reason: 'required-checks-successful' });
+      f.runNode.mockImplementation(() => { throw Object.assign(Error('spawn EAGAIN'), { code: 'EAGAIN' }); });
+      const args = { ...f.args, findResumableRun: f.find,
+        ...(mode === 'explicit' ? { argv: [`--resume=${f.saved.id}`, '--json'] } : {}),
+        mintRunId: () => { throw Error('fresh panel'); } };
+      const failed = await runReviewLoopOnce(args);
+      expect(failed.stopped).toBe('effect-halted');
+      expect(failed.run.effects.find(e => e.type === REVIEW_EFFECTS.LABEL)).toMatchObject({ status: 'failed',
+        error: 'review-set-label.mjs could not be started, nothing was written: EAGAIN' });
+      Object.assign(f.timingEnv, { WE_REVIEW_START_EARLY: 'off', WE_REVIEW_START_AFTER: 'ci-green', WE_REVIEW_CANCEL_ON_CI_RED: 'false' });
+      f.runNode.mockClear();
+      f.runNode.mockReturnValue('{"ok":true}');
+      f.publishGate.mockClear();
+      readAcceptancePr.mockClear();
+      if (next === 'pending') f.publishGate.mockReturnValue({ allowed: false, headSha: HEAD_A, reason: 'required-checks-not-successful' });
+      if (next === 'revoked') cleared = false;
+      if (next === 'exhausted' || next === 'unknown') {
+        const saved = f.store.read(f.saved.id);
+        if (next === 'exhausted') saved.recordEffectResumeAttempts = RESUME_MAX_ATTEMPTS;
+        else saved.effects.find(e => e.type === REVIEW_EFFECTS.LABEL).status = 'pending';
+        f.store.write(saved);
+        // Bypass discovery to exercise the driver's/executor's own refusal.
+        args.findResumableRun = () => f.saved.id;
+        args.argv = [`--resume=${f.saved.id}`, '--json'];
+      }
+      const out = next === 'unknown' ? await runReviewLoopCliOnce(args) : await runReviewLoopOnce(args);
+      if (next === 'green') {
+        expect(out.stopped).toBe('complete');
+        expect(f.runNode).toHaveBeenCalledOnce();
+      } else {
+        expect(out.stopped).toBe(next === 'pending' ? 'effect-halted' : 'refused');
+        expect(f.runNode).not.toHaveBeenCalled();
+      }
+      if (['pending', 'revoked', 'green'].includes(next)) expect(readAcceptancePr).toHaveBeenCalled();
+      if (['pending', 'green'].includes(next)) expect(f.publishGate).toHaveBeenCalled();
+      else expect(f.publishGate).not.toHaveBeenCalled();
+    });
 
   it.each([['at bound', 3, 3, true], ['over bound', 3, 4, false], ['zero disables retries', 0, 1, false]])(
     '%s uses the setting and preserves the fresh path when ineligible', async (_name, max, attempts, resumes) => {

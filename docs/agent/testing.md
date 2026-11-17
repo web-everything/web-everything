@@ -4389,3 +4389,10 @@ Automatic and explicit CI-held record resumes share one preparation guard: check
 retry budgets, re-read live acceptance clearance with `filed: true`, and force the label
 sink’s strict CI gate even after timing settings change. Exercise both entry points with
 revoked clearance and pending-to-green CI; refusal must leave the saved run untouched.
+
+Persist `ciHeldRecord` before retrying the label effect: a subsequent pre-write refusal
+(for example spawn EAGAIN) replaces its latest error. The saved provenance must keep
+automatic discovery and explicit resume behind both guards and both retry budgets.
+Exercise pending CI after timing settings change, revoked clearance, green completion,
+and budget exhaustion after that intervening failure. Unknown pending outcomes remain
+non-replayable; CI-held provenance does not establish that a write was never applied.
