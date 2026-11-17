@@ -251,7 +251,7 @@ describe('renderWorkerBrief', () => {
     expect(brief.indexOf('related-tests gate')).toBeGreaterThan(-1);
     expect(brief.indexOf('related-tests gate')).toBeLessThan(brief.indexOf('Codex audit'));
     expect(brief.split('related-tests gate')).toHaveLength(2);
-    expect(brief).toContain('The related-tests gate (`--gate=related` through verify-lane) must be green on the exact commit BEFORE the audit runs, because any later code change invalidates the audit record and its waiver binding.');
+    expect(brief).toContain('The related-tests gate (the verify-lane default diff-driven related-test selection, with no explicit `--gate` override) must be green on the exact commit BEFORE the audit runs, because any later code change invalidates the audit record and its waiver binding.');
   });
 
   it('omits the WE related-tests gate requirement from the plateau-app brief', () => {
