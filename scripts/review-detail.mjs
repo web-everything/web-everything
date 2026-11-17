@@ -37,7 +37,12 @@ const ADVISORY_HEADING = 'Advisory review (informational only)';
 /** A current note opens with the producer's marker AND carries the heading, so quoted, fenced or inline mentions never match. */
 const isCurrentAdvisoryNote = (b) => b.trimStart().startsWith(ADVISORY_NOTE_MARKER) && ADVISORY_HEADING_RE.test(b);
 /** The heading only counts as a line-start markdown heading, so a quoted (`> `) or inline mention never matches. */
-const ADVISORY_HEADING_RE = new RegExp(`^#{1,6}[ \\t]+(?:\\S+[ \\t]+)?${ADVISORY_HEADING.replace(/[().]/g, '\\$&')}`, 'm');
+const ADVISORY_HEADING_RE = buildAdvisoryHeadingPattern(ADVISORY_HEADING);
+
+/** Build a markdown heading matcher with the heading text treated literally. */
+export function buildAdvisoryHeadingPattern(heading) {
+  return new RegExp(`^#{1,6}[ \\t]+(?:\\S+[ \\t]+)?${heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'm');
+}
 /** A prior human-verdict comment starts with one of these (accept ✅ / bounce-back 🔁). */
 const HUMAN_MARKERS = ['✅ human review', '🔁 human review'];
 

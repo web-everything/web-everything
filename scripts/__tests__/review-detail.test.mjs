@@ -4,7 +4,7 @@
  *   assembler and unit-tested here against fixtures, no network.
  */
 import { describe, it, expect } from 'vitest';
-import { assembleReviewDetail, parseEscalationReason } from '../review-detail.mjs';
+import { assembleReviewDetail, buildAdvisoryHeadingPattern, parseEscalationReason } from '../review-detail.mjs';
 import { buildEscalationReasonBlock } from '../lib/review-escalation.mjs';
 import { careLevelFromReasons } from '../lib/review-core.mjs';
 import { ADVISORY_NOTE_MARKER } from '../conveyor/advisory-round-count.mjs';
@@ -115,6 +115,16 @@ describe('assembleReviewDetail — a review:human parked PR', () => {
     expect(d.title).toBe('scripts: something touching the gate policy');
     expect(d.url).toBe('https://github.com/chalbert/webeverything/pull/2470');
   });
+});
+
+describe('buildAdvisoryHeadingPattern — literal regex metacharacters', () => {
+  it.each(['\\', '^', '$', '.', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|'])(
+    'matches %s literally without accepting a substituted character', (metacharacter) => {
+      const pattern = buildAdvisoryHeadingPattern(`Advisory review ${metacharacter} informational only`);
+      expect(pattern.test(`## ⚠️ Advisory review ${metacharacter} informational only — repo#1`)).toBe(true);
+      expect(pattern.test('## ⚠️ Advisory review X informational only — repo#1')).toBe(false);
+    },
+  );
 });
 
 describe('assembleReviewDetail — current advisory notes (#3659)', () => {
