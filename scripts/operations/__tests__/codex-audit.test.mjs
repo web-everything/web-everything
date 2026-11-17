@@ -207,6 +207,26 @@ describe('R968 invariant-scoped audit', () => {
   });
 });
 
+describe('R973 scoped record never supersedes an open WEAKENED', () => {
+  const rec = (at, verdict, extra = {}) => ({ at, base: BASE, head: HEAD, questionHash: QUESTION_HASH, verdict, findings: [], ...extra });
+  const scoped = { scope: 'invariants', invariantsHash: 'c'.repeat(64), followUps: [] };
+  const opts = { head: HEAD, base: BASE, questionHash: QUESTION_HASH, priorQuestionHashes: [], now: Date.parse('2026-11-02T00:00:00Z') };
+  it('keeps the open WEAKENED record when a later scoped NOT WEAKENED exists', () => {
+    const open = rec('2026-11-01T10:00:00.000Z', 'WEAKENED', { findings: ['a.mjs:1 fail-open'] });
+    const got = findAudit([open, rec('2026-11-01T11:00:00.000Z', 'NOT WEAKENED', scoped)], opts);
+    expect(got).toBe(open);
+  });
+  it('a later open NOT WEAKENED still replaces an earlier open WEAKENED', () => {
+    const fixed = rec('2026-11-01T12:00:00.000Z', 'NOT WEAKENED');
+    const scopedLater = rec('2026-11-01T13:00:00.000Z', 'NOT WEAKENED', scoped);
+    expect(findAudit([rec('2026-11-01T10:00:00.000Z', 'WEAKENED'), fixed, scopedLater], opts)).toBe(scopedLater);
+  });
+  it('a scoped record alone is used as before', () => {
+    const only = rec('2026-11-01T11:00:00.000Z', 'NOT WEAKENED', scoped);
+    expect(findAudit([only], opts)).toBe(only);
+  });
+});
+
 describe('canonical audit', () => {
   it('pins the question text and its sha256 hash', () => {
     expect(CANONICAL_QUESTION).toBe('You are a read-only auditor. Judge the WHOLE diff `git diff <base>...<head>`, including pre-existing behaviour the diff now relies on, not only the changed lines. Does the change WEAKEN anything: a guard, gate, test, assertion or fail-closed path; a loosened check or threshold; removed validation; a new bypass, override or silent fallback; a test that no longer fails when the behaviour breaks? Pre-existing limitations the diff relies on count. Answer with the FIRST line exactly `NOT WEAKENED` or `WEAKENED`, then findings, one per line, each with file:line and why. Do not edit files.');
