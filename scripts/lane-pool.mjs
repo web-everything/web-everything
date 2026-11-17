@@ -2689,6 +2689,10 @@ async function cmdAcquire(repo) {
     // the SAME static list again on a later poll tick, which would just re-try the identical dead ends until
     // `--wait-ms` ran out instead of ever reaching the scan.
     let freeListExhausted = !freeList;
+    // Growth/recovery already identify the lanes they made available. After the default deadline,
+    // try those candidates through the ordinary atomic claim + fresh preservation checks below,
+    // without starting another full-pool scan. Explicit-wait callers retain their scan policy.
+    let retryCandidateDirs = null;
     // The `--no-reset` guard's live remote heads: ONE lazy ls-remote per acquire call (only if a candidate is ahead),
     // shared by every candidate. A failed probe is an empty set, so an ahead lane then fails closed.
     let noResetRemoteShasValue = null;
@@ -2701,9 +2705,12 @@ async function cmdAcquire(repo) {
       // time) — and a caller could itself inherit whichever other caller's smaller budget started the
       // in-flight scan it joined. `--wait-ms` still bounds only how long THIS acquire call may keep polling
       // for a lane to free up (the loop below), never the scan itself.
-      let candidateDirs;
+      const retryingCandidates = retryCandidateDirs !== null;
+      const retryRemoteShasBox = { value: null };
+      let candidateDirs = retryCandidateDirs;
+      retryCandidateDirs = null;
       let usingFreeList = false;
-      if (!freeListExhausted) {
+      if (candidateDirs === null && !freeListExhausted) {
         const freeCands = freeLaneCandidates(freeList, { exclude: excluded, nowMs: Date.now(), maxAgeMs: freeListMaxAgeMs() });
         if (freeCands.length) {
           candidateDirs = freeCands.map((n) => laneDir(repo, n));
@@ -2712,7 +2719,7 @@ async function cmdAcquire(repo) {
           freeListExhausted = true; // this tick's list has nothing left to offer — fall through to the scan below
         }
       }
-      if (!usingFreeList) {
+      if (candidateDirs === null) {
         try {
           // #4122 — once the free list is missing/stale/exhausted, this is EXACTLY today's pre-#4122 candidate
           // source, unchanged: the shared, single-flight, cached full-pool scan (#xn432dz/#3383). An earlier
@@ -2759,6 +2766,12 @@ async function cmdAcquire(repo) {
         .filter((n) => !excluded.has(n) && !holdRefused.has(n) && n !== selfLane && !isHistoryQuarantined(repo, n))
         .sort((a, b) => a - b);
       for (const pick of pickable) {
+        if (retryingCandidates) {
+          // A grown/recovered lane can gain work or a foreign lease before this retry. Apply the
+          // scan's normal eligibility rule even with --force, which never widens auto-pick eligibility.
+          const candidateNow = Date.now();
+          if (!isLaneAcquirable(laneAcquirableInfo(repo, pick, retryRemoteShasBox, candidateNow, ttlMs), candidateNow, ttlMs)) continue;
+        }
         const claimed = tryClaimLane(laneDir(repo, pick), session, Date.now(), ttlMs);
         if (!claimed) {
           excluded.add(pick); // a concurrent acquire won this one — try the next candidate
@@ -2840,7 +2853,8 @@ async function cmdAcquire(repo) {
         // reachable origin.
         const remoteProbeFailed = !liveRemoteShasProbe(repo).ok;
         const added = growPoolOnEmpty(repo, lanes, remoteProbeFailed);
-        if (added > 0) {
+        if (added.length > 0) {
+          if (flags['wait-ms'] === undefined) retryCandidateDirs = added.map(n => laneDir(repo, n));
           excluded.clear();
           continue;
         }
@@ -2852,8 +2866,9 @@ async function cmdAcquire(repo) {
           const result = await recoverRepoPool(repo, names.valid);
           if (result.reclaimed.length) {
             invalidateListCache(repo);
+            if (flags['wait-ms'] === undefined) retryCandidateDirs = result.reclaimed.map(n => laneDir(repo, n));
             excluded.clear();
-            continue; // one fresh scan even past deadline; recoveredOnce bounds this retry
+            continue; // one retry of recovered candidates; recoveredOnce bounds it
           }
           const verdictByLane = await collectVerdicts({ lanePoolDir: repo.poolDir });
           const diagnosis = diagnosePool({ ...result, verdictByLane, rejected: names.rejected });
@@ -4790,7 +4805,7 @@ function acquireGrowthMaxNew() {
  * never more than `acquireGrowthMaxNew()` in this one call) and appends their numbers to `lanes` IN PLACE so
  * the caller's very next `chooseFreeLane` pass sees them. Canonical lane names count toward the cap;
  * new lanes fill numbering gaps first. Stray and out-of-range entries are ignored and reported.
- * Returns the number of lanes actually added (0 ⇒ the caller's existing "no free lane" failure stands).
+ * Returns the numbers of lanes actually added ([] ⇒ the caller's existing "no free lane" failure stands).
  */
 function growPoolOnEmpty(repo, lanes, remoteProbeFailed) {
   if (remoteProbeFailed) {
@@ -4799,7 +4814,7 @@ function growPoolOnEmpty(repo, lanes, remoteProbeFailed) {
         `refusing to grow it (deliberate fail-SAFE STOP, never fail-safe GROW, mirrors #4025). Investigate ` +
         `connectivity/timeouts, then retry \`acquire\` once the probe can actually answer.`,
     );
-    return 0;
+    return [];
   }
   const hardMax = acquireHardMaxFor(repo);
   const { valid, rejected } = classifyLaneNames(existsSync(repo.poolDir) ? readdirSync(repo.poolDir) : [], hardMax);
@@ -4810,14 +4825,14 @@ function growPoolOnEmpty(repo, lanes, remoteProbeFailed) {
       `  ⚠ pool "${repo.name}" is already at its hard cap (${state.count} lanes ≥ ${hardMax}; override with ` +
         `--hard-max=N or LANE_POOL_HARD_MAX) — acquire cannot grow it further; release a lane or raise the cap.`,
     );
-    return 0;
+    return [];
   }
   const maxNew = acquireGrowthMaxNew();
   const numbers = nextLaneNumbers(valid, hardMax, maxNew);
   const toAdd = numbers.length;
   if (toAdd <= 0) {
     log(`  ⚠ acquire's per-call growth cap is 0 (--growth-max-new=0 or LANE_POOL_ACQUIRE_GROWTH_MAX_NEW=0) — not growing.`);
-    return 0;
+    return [];
   }
   log(
     `  no free lane in pool "${repo.name}" (${lanes.length} all held/dirty) — growing by up to ${toAdd} new ` +
@@ -4841,7 +4856,7 @@ function growPoolOnEmpty(repo, lanes, remoteProbeFailed) {
     invalidateListCache(repo); // #xn432dz — the pool's composition just changed
     log(`  grew pool "${repo.name}" by ${added} lane(s) (through lane-${numbers[added - 1]})`);
   }
-  return added;
+  return numbers.slice(0, added);
 }
 
 /**
