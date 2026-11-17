@@ -31,6 +31,7 @@
 import { resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { latestAcceptRecord } from '../lib/accept-carry-forward.mjs';
+import { REVIEW_LABELS } from '../lib/review-labels.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { proveRebaseTriviality } from './rebase-triviality.mjs';
 import { conflictRebaseReceipt } from './accepted-conflict-rebase.mjs';
@@ -105,10 +106,22 @@ export function runConflictFixMark(argv, { gh = (args) => execFileSyncThrottled(
     }
     const readPr = () => JSON.parse(gh(['pr', 'view', String(pr),
       ...(typeof flags.repo === 'string' ? [`--repo=${flags.repo}`] : []),
-      '--json', 'headRefOid,baseRefOid,baseRefName,comments']));
+      '--json', 'headRefOid,baseRefOid,baseRefName,comments,labels']));
+    const cleanAcceptance = pr => {
+      const record = latestAcceptRecord(pr.comments);
+      const labels = Array.isArray(pr.labels)
+        ? pr.labels.map(label => typeof label === 'string' ? label : label?.name) : [];
+      if (!record || record.laterVerdict || record.laterBodyDerivedHold
+          || labels.some(label => typeof label !== 'string' || !label)
+          || !labels.includes(REVIEW_LABELS.accepted)
+          || [REVIEW_LABELS.changes, REVIEW_LABELS.human, REVIEW_LABELS.pending].some(label => labels.includes(label))) {
+        throw new Error('review is no longer a clean acceptance');
+      }
+      return record;
+    };
     try {
       const pushed = readPr();
-      const reviewedHead = latestAcceptRecord(pushed.comments)?.sha;
+      const reviewedHead = cleanAcceptance(pushed).sha;
       const oldHead = flags['old-head'];
       if (!reviewedHead || oldHead !== reviewedHead || oldHead === pushed.headRefOid) {
         throw new Error('original head must be the independently recorded reviewed head');
@@ -135,7 +148,7 @@ export function runConflictFixMark(argv, { gh = (args) => execFileSyncThrottled(
         throw new Error('rebase is not provably trivial');
       }
       const current = readPr();
-      if (latestAcceptRecord(current.comments)?.sha !== reviewedHead) throw new Error('review changed during proof');
+      if (cleanAcceptance(current).sha !== reviewedHead) throw new Error('review changed during proof');
       if (current.headRefOid !== pushed.headRefOid || current.baseRefOid !== pushed.baseRefOid
           || current.baseRefName !== pushed.baseRefName) throw new Error('head or base changed during proof');
       head = pushed.headRefOid;
