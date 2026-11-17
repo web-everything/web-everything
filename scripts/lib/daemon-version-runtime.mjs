@@ -23,6 +23,7 @@ import {
 import { buildVersion } from './daemon-version.mjs';
 import { switchCurrent } from './daemon-version-switch.mjs';
 import { gitRun } from './main-staleness.mjs';
+import { smokeDepthAtLeast } from './daemon-rebuild/adopt.mjs';
 
 const ID = /^[0-9A-Za-z][0-9A-Za-z._-]*$/;
 const RETRYABLE_SMOKE = new Set(['transient', 'auth-broken', 'env-timeout']);
@@ -56,7 +57,7 @@ export function isInsideVersions(ctx, root) {
   return !!ctx && resolve(root).startsWith(join(ctx.dir, 'versions') + sep);
 }
 
-/** `current` as { id, dir, sha }, or null (no pointer yet / unreadable). Reads the link text, never follows it. */
+/** `current` as { id, dir, sha, smokeDepth }, or null (no pointer yet / unreadable). Reads the link text, never follows it. */
 export function currentVersion(ctx, { fs = filesystem } = {}) {
   try {
     const target = fs.readlinkSync(join(ctx.dir, 'current'));
@@ -65,7 +66,7 @@ export function currentVersion(ctx, { fs = filesystem } = {}) {
     if (!ID.test(id)) return null;
     const dir = join(ctx.dir, 'versions', id);
     const record = JSON.parse(fs.readFileSync(join(dir, '.version.json'), 'utf8'));
-    return record?.id === id && typeof record.sha === 'string' ? { id, dir, sha: record.sha } : null;
+    return record?.id === id && typeof record.sha === 'string' ? { id, dir, sha: record.sha, smokeDepth: record.smokeDepth } : null;
   } catch { return null; }
 }
 
@@ -120,7 +121,7 @@ function answer(ctx, ids, result, fs) {
  * `current` to it with a compare-and-swap. Returns the same shape rebuildClone does
  * ({ moved, adopted, head, reason }) so the daemon wrapper treats both alike. No lock is taken here.
  */
-export async function versionedRebuild({ ctx, log = console, deps = {} }) {
+export async function versionedRebuild({ ctx, log = console, env = process.env, deps = {} }) {
   const fs = deps.fs ?? filesystem;
   const run = deps.run ?? gitRun;
   const build = deps.buildVersion ?? buildVersion;
@@ -145,7 +146,7 @@ export async function versionedRebuild({ ctx, log = console, deps = {} }) {
     if (rev.status !== 0 || !/^[0-9a-f]{40,64}$/.test(sha)) return finish({ moved: false, reason: 'rev-parse-failed' });
 
     const cur = currentVersion(ctx, { fs });
-    if (cur?.sha === sha) return finish({ moved: false, reason: 'up-to-date', head: sha });
+    if (cur?.sha === sha && smokeDepthAtLeast(cur.smokeDepth, env)) return finish({ moved: false, reason: 'up-to-date', head: sha });
     // A rollback holds the rejected sha until main moves: never rebuild it into a loop.
     const state = readJson(fs, join(ctx.dir, 'state.json'));
     if (state?.hold) {
@@ -164,7 +165,7 @@ export async function versionedRebuild({ ctx, log = console, deps = {} }) {
       return finish({ moved: false, reason: 'smoke-backoff', head: sha, retryAt: retry.retryAt });
     }
 
-    const built = await build({ clone: ctx.clone, home: ctx.home, sha, settings: ctx.settings, repo: hasRepo ? repoDir : undefined, deps: deps.buildDeps });
+    const built = await build({ clone: ctx.clone, home: ctx.home, sha, settings: ctx.settings, repo: hasRepo ? repoDir : undefined, deps: { ...deps.buildDeps, env } });
     if (built.status === 'disabled') return finish({ moved: false, reason: 'disabled' });
     const id = built.id;
     const record = readJson(fs, join(ctx.dir, 'versions', id, '.version.json'));

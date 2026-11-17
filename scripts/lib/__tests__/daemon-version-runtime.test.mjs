@@ -50,6 +50,42 @@ describe('card 89 S5 — versioned in-tick path', () => {
   afterEach(() => rmSync(fixture, { recursive: true, force: true }));
   const rebuild = () => rt.versionedRebuild({ ctx, log, deps: { buildDeps } });
 
+  it.each(['light', 'malformed'])('re-smokes the current SHA when %s evidence cannot prove the requested depth', async depth => {
+    const env = { ...process.env, WE_SMOKE_DISPATCH_PASSES: '0', WE_SMOKE_SKIP_RECONCILE_DRY_RUN: '1' };
+    const attempt = () => rt.versionedRebuild({ ctx, log, env, deps: { buildDeps } });
+    const first = await attempt();
+    expect(first.adopted).toBe(true);
+    expect(rt.currentVersion(ctx).smokeDepth).toBe('dispatchPasses=0;skipReconcile=true');
+    if (depth === 'malformed') {
+      const path = join(rt.currentVersion(ctx).dir, '.version.json');
+      const record = JSON.parse(readFileSync(path, 'utf8'));
+      record.smokeDepth = 'invalid';
+      writeFileSync(path, JSON.stringify(record));
+    }
+    env.WE_SMOKE_DISPATCH_PASSES = '3';
+    env.WE_SMOKE_SKIP_RECONCILE_DRY_RUN = '0';
+    const second = await attempt();
+    expect(second).toMatchObject({ moved: true, adopted: true, head: first.head });
+    expect(second.versionId).not.toBe(first.versionId);
+    expect(buildDeps.runSmoke).toHaveBeenCalledTimes(2);
+    expect(buildDeps.runSmoke.mock.calls[1][0].env).toMatchObject({ WE_SMOKE_DISPATCH_PASSES: '3', WE_SMOKE_SKIP_RECONCILE_DRY_RUN: '0' });
+    expect(rt.currentVersion(ctx).smokeDepth).toBeUndefined();
+  });
+
+  it.each(['light', 'full', 'legacy'])('keeps the same-SHA shortcut for sufficient %s evidence', async depth => {
+    const env = { ...process.env, WE_SMOKE_DISPATCH_PASSES: depth === 'light' ? '0' : '3', WE_SMOKE_SKIP_RECONCILE_DRY_RUN: depth === 'light' ? '1' : '0' };
+    const attempt = () => rt.versionedRebuild({ ctx, log, env, deps: { buildDeps } });
+    const first = await attempt();
+    if (depth === 'legacy') {
+      const path = join(rt.currentVersion(ctx).dir, '.version.json');
+      const record = JSON.parse(readFileSync(path, 'utf8'));
+      delete record.smokeDepth;
+      writeFileSync(path, JSON.stringify(record));
+    }
+    expect(await attempt()).toMatchObject({ moved: false, reason: 'up-to-date', head: first.head });
+    expect(buildDeps.runSmoke).toHaveBeenCalledTimes(1);
+  });
+
   it('is dormant: an unlisted clone resolves no versioned context', () => {
     expect(rt.resolveVersionedContext({ root: clone, settings: { enabled: {} } })).toBeNull();
     expect(rt.resolveVersionedContext({ root: clone, settings: { enabled: { daemon: false } } })).toBeNull();
