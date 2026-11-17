@@ -156,8 +156,9 @@ describe('helper routing refusals survive real cascade fallback', () => {
       env, resolved: resolve(coordinator), log: false })).toThrow(/aiRouting.helper/);
   });
 
-  it('preserves inherited resume bytes through the environment resolver', () => {
+  it.each([{}, { currentModel: 'opus', currentEffort: 'max' }])('preserves inherited resume bytes with persisted settings %j through the environment resolver', (persisted) => {
     expect(buildRestrictedProviderArgv({ ...providerArgs, resumeSessionId: 'resume',
+      ...persisted,
       env: { ...env, WE_AI_ROUTING: JSON.stringify({ helper: { coordinator: {
         provider: 'inherit', model: 'inherit', effort: 'inherit',
       } } }) }, log: false })).toEqual([
@@ -172,11 +173,53 @@ describe('helper routing refusals survive real cascade fallback', () => {
     [{ effort: 'max' }, ['--effort', 'max']],
   ])('carries validated resume overrides %j through the real environment resolver', (coordinator, flags) => {
     expect(buildRestrictedProviderArgv({ ...providerArgs, resumeSessionId: 'resume',
+      currentModel: 'sonnet', currentEffort: 'medium',
       env: { ...env, WE_AI_ROUTING: JSON.stringify({ helper: { coordinator } }) }, log: false }))
       .toEqual([
         '--restricted', '--tools', 'Bash,Edit,Write,Read,Glob,Grep', '--strict-mcp-config',
         '--disable-slash-commands', '--settings', 'hooks.json', ...flags, '--resume', 'resume', 'prompt',
       ]);
+  });
+
+  it('omits resume overrides with unknown persisted floors and logs each reason', () => {
+    const log = vi.fn();
+    const argv = buildRestrictedProviderArgv({ ...providerArgs, resumeSessionId: 'resume',
+      model: 'haiku', effort: 'low', env, resolved: resolve({ provider: 'claude', model: 'opus', effort: 'max' }), log });
+    expect(argv).toEqual(buildRestrictedProviderArgv({ ...providerArgs, resumeSessionId: 'resume',
+      env, resolved: inherit, log: false }));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('current model has no proven floor'));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('effort has no proven floor'));
+  });
+
+  it('raises resume settings over persisted floors even when overrides equal fresh defaults', () => {
+    const argv = buildRestrictedProviderArgv({ ...providerArgs, resumeSessionId: 'resume',
+      currentModel: 'haiku', currentEffort: 'low', env,
+      resolved: resolve({ provider: 'claude', model: 'sonnet', effort: 'medium' }), log: false });
+    expect(argv.slice(-7)).toEqual(['--model', 'sonnet', '--effort', 'medium', '--resume', 'resume', 'prompt']);
+  });
+
+  it.each([
+    [{ currentModel: 'haiku' }, ['--model', 'sonnet']],
+    [{ currentEffort: 'low' }, ['--effort', 'high']],
+    [{ currentModel: 'sonnet', currentEffort: 'high' }, []],
+  ])('checks resume floors independently for %j', (persisted, flags) => {
+    const argv = buildRestrictedProviderArgv({ ...providerArgs, resumeSessionId: 'resume', ...persisted,
+      env, resolved: resolve({ provider: 'claude', model: 'sonnet', effort: 'high' }), log: false });
+    expect(argv).toEqual([
+      '--restricted', '--tools', 'Bash,Edit,Write,Read,Glob,Grep', '--strict-mcp-config',
+      '--disable-slash-commands', '--settings', 'hooks.json', ...flags, '--resume', 'resume', 'prompt',
+    ]);
+  });
+
+  it('omits sonnet/high overrides that would lower a persisted opus/max session and logs why', () => {
+    const log = vi.fn();
+    const argv = buildRestrictedProviderArgv({ ...providerArgs, resumeSessionId: 'resume',
+      currentModel: 'opus', currentEffort: 'max', env,
+      resolved: resolve({ provider: 'claude', model: 'sonnet', effort: 'high' }), log });
+    expect(argv).not.toContain('--model');
+    expect(argv).not.toContain('--effort');
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('model sonnet below current opus'));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('effort high below current max'));
   });
 
   it.each([

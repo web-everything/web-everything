@@ -175,7 +175,7 @@ export const RESTRICTED_PROVIDER_TOOLS = 'Bash,Edit,Write,Read,Glob,Grep';
  * silently launching a different model. Account selection is deliberately outside this role.
  */
 export function resolveHelperRouting(current, { env = process.env, resolved, log = console.error } = {}) {
-  resolvePolicyModel('claude', current.model);
+  if (current.model !== undefined) resolvePolicyModel('claude', current.model);
   const lines = [];
   resolved ??= resolveAiRouting({ env, log: line => lines.push(line) });
   const report = line => { if (log !== false) { try { log(line); } catch { /* diagnostic only */ } } };
@@ -197,8 +197,9 @@ export function resolveHelperRouting(current, { env = process.env, resolved, log
   const tiers = ['haiku', 'sonnet', 'opus'];
   const tier = model => tiers.indexOf(claudeSpawnAlias(resolvePolicyModel('claude', model)));
   if (coordinator.model !== undefined) {
-    const proposed = tier(coordinator.model), floor = tier(current.model);
-    if (proposed < floor) report(`aiRouting.helper: model ${coordinator.model} below current ${current.model}; ignoring lowering override`);
+    const proposed = tier(coordinator.model);
+    if (current.model === undefined) report('aiRouting.helper: current model has no proven floor; ignoring model override');
+    else if (proposed < tier(current.model)) report(`aiRouting.helper: model ${coordinator.model} below current ${current.model}; ignoring lowering override`);
     else next.model = claudeSpawnAlias(resolvePolicyModel('claude', coordinator.model));
   }
   if (coordinator.effort !== undefined) {
@@ -214,17 +215,21 @@ export function resolveHelperRouting(current, { env = process.env, resolved, log
     }
   }
   // Validate the final model even when only effort/provider was overridden.
-  tier(next.model);
+  if (next.model !== undefined) tier(next.model);
   return next;
 }
 
 export function buildRestrictedProviderArgv({
   sessionId, prompt, resumeSessionId = null, settingsFile, tools = RESTRICTED_PROVIDER_TOOLS, addDirs = [], model = 'sonnet', effort = 'medium',
-  env = process.env, resolved, log,
+  currentModel, currentEffort, env = process.env, resolved, log,
 }) {
-  // Inherited resumes omit pins; changed routes must override the persisted session settings.
-  const current = { model, effort };
-  ({ model, effort } = resolveHelperRouting({ model, effort }, { env, resolved, log }));
+  // Resume floors must be the session's persisted settings, explicitly supplied by the caller.
+  // Missing floors leave that dimension with the session; fresh-launch defaults prove nothing.
+  // Inherited resumes omit pins even when persisted settings are supplied.
+  const current = resumeSessionId
+    ? { model: currentModel ?? undefined, effort: currentEffort ?? undefined }
+    : { model, effort };
+  ({ model, effort } = resolveHelperRouting(current, { env, resolved, log }));
   const resumeRoutingFlags = [
     ...(model !== current.model ? ['--model', claudeSpawnAlias(model)] : []),
     ...(effort !== current.effort ? ['--effort', effort] : []),
