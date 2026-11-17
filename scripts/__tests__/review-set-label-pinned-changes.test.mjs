@@ -8,9 +8,9 @@ afterEach(() => vi.restoreAllMocks());
 function run({ changedAt = Infinity, change = { headRefOid: 'b'.repeat(40) }, pin = head } = {}) {
   let reads = 0;
   const state = { state: 'OPEN', headRefOid: head, headRefName: 'lane/test', baseRefName: 'release',
-    labels: ['review:pending'], comments: [], body: '' };
+    labels: ['review:pending'], comments: globalThis.__cap ? Array.from({ length: 100 }, () => ({ body: 'c' })) : [], body: '' };
   const provider = { name: 'stub', readPrState: vi.fn(() => (++reads >= changedAt ? { ...state, ...change } : state)),
-    setLabels: vi.fn(), postComment: vi.fn(), readComments: () => [] };
+    setLabels: vi.fn(), postComment: vi.fn(), readComments: () => (globalThis.__cap ? null : []) };
   const output = [];
   vi.spyOn(process, 'exit').mockImplementation(code => { throw Object.assign(new Error('exit'), { exitCode: code }); });
   let exit = 0;
@@ -33,6 +33,12 @@ describe('guarded changes through sanctioned CLI', () => {
     let r; try { r = run(); } finally { delete globalThis.__noBlock; }
     expect(r.exit).toBe(1);
     expect(r.provider.postComment).not.toHaveBeenCalled(); expect(r.provider.setLabels).not.toHaveBeenCalled();
+  });
+  it('reads the full thread on a capped page and refuses when it is unreadable', () => {
+    globalThis.__cap = true;
+    let r; try { r = run(); } finally { delete globalThis.__cap; }
+    expect(r.exit).toBe(1);
+    expect(r.provider.setLabels).not.toHaveBeenCalled();
   });
   it('refuses a malformed pin before reading or writing', () => {
     const r = run({ pin: 'bad' }); expect(r.exit).toBe(2);
