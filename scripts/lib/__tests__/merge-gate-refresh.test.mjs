@@ -111,7 +111,7 @@ describe('merge-gate refresh after restamp', () => {
     expect(run(gh)).toEqual({ ok: true, refreshed: true });
     expect(gh.mock.calls.at(-1)[1]).toContain('--remove-label');
   });
-  it.each(['create', '--add-label', '--remove-label'])('retries %s three times with backoff and reports failure without throwing', phase => {
+  it.each(['create', '--add-label'])('retries %s three times with backoff and reports failure without throwing', phase => {
     const base = fixture();
     const sleep = vi.fn();
     const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
@@ -123,6 +123,20 @@ describe('merge-gate refresh after restamp', () => {
     expect(gh.mock.calls.filter(([, args]) => args.includes(phase))).toHaveLength(3);
     expect(sleep.mock.calls).toEqual([[1000], [2000]]);
     expect(stderr.mock.calls.flat().join('')).toContain('daemon token denied');
+  });
+  it.each([true, false])('add-ok/remove-fails stays successful with a note; final removal succeeds: %s', finalSucceeds => {
+    const base = fixture(), sleep = vi.fn();
+    let removes = 0;
+    const gh = vi.fn((file, args, opts) => {
+      if (args.includes('--remove-label') && (++removes < 4 || !finalSucceeds)) throw new Error('cleanup denied');
+      return base(file, args, opts);
+    });
+    const out = run(gh, { sleep });
+    expect(out).toMatchObject({ ok: true, refreshed: true, note: expect.stringContaining('merge-gate triggered') });
+    expect(out.note).toContain(finalSucceeds ? 'cleanup succeeded' : 'ask an operator to remove gate:refresh');
+    expect(gh.mock.calls.filter(([, args]) => args.includes('--add-label'))).toHaveLength(1);
+    expect(removes).toBe(4);
+    expect(sleep.mock.calls).toEqual([[1000], [2000]]);
   });
   it('recovers a transient add failure before removing the label', () => {
     const base = fixture();

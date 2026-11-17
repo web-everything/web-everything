@@ -150,10 +150,10 @@ async function handleQueueRefresh({ c, key, headSha, setting, statePath = requir
     const reason = `merge-queue: ${wording} → refresh FAILED: ${out.error}`;
     return { handled: true, reason, line: `  ↻ ${label}: refresh PR ${tag}${c.num} (${decision.reason}) → refresh FAILED: ${out.error}` };
   }
-  let note = '';
+  let note = out.note ? `; ${out.note}` : '';
   // Record before restamping: a successful refresh must not loop even if acceptance IO fails.
   try { record(statePath, key, { fromHead: headSha, newHead: out.newCommit, action: out.action, at: now() }); }
-  catch (e) { note = `; refresh state record failed: ${errText(e)}`; }
+  catch (e) { note += `; refresh state record failed: ${errText(e)}`; }
   if (out.action === 'rebased' && needsAcceptanceRestamp(c, { action: 'rebased' })) {
     let rs;
     try { rs = await restampAcceptance({ pr: c.num, repo: c.repo, newHead: out.newCommit, cwd }); }

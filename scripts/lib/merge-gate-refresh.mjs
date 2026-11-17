@@ -23,7 +23,8 @@ export function planGateRefresh({ checkRuns, head, restampedAtMs } = {}) {
 /**
  * Best effort after a durable restamp; failure never undoes the acceptance.
  * No attempt markers: later restamps consult live checks and can retry naturally.
- * Two bounded reads, then at most three attempts for each of three label calls.
+ * Two bounded reads, then at most three attempts for each of three label calls,
+ * plus one final removal attempt after the gate has already been triggered.
  * restampedAtMs is captured before posting, conservatively excluding racing runs.
  */
 export function refreshMergeGateAfterRestamp({ repo, pr, head, gh = execFileSyncThrottled,
@@ -46,8 +47,8 @@ export function refreshMergeGateAfterRestamp({ repo, pr, head, gh = execFileSync
     const live = JSON.parse(gh('gh', ['api', `repos/${repo}/pulls/${pr}`], options));
     if (live?.head?.sha !== head) throw new Error('live PR head differs from restamped head');
 
-    toggleMergeGateRefresh({ repo, pr, gh, sleep });
-    return { ok: true, refreshed: true };
+    const result = toggleMergeGateRefresh({ repo, pr, gh, sleep });
+    return { ok: true, refreshed: true, ...(result.note ? { note: result.note } : {}) };
   } catch (error) {
     const message = `${errorText(error)}; acceptance restamp retained — retry restamp or ask an operator to toggle ${LABEL}`;
     process.stderr.write(`merge-gate refresh FAILED for ${repo}#${pr}: ${message}\n`);
@@ -73,5 +74,15 @@ export function toggleMergeGateRefresh({ repo, pr, gh = execFileSyncThrottled, s
   labelCall(['label', 'create', LABEL, '--repo', repo, '--color', 'ededed',
     '--description', 'Refresh merge-gate after acceptance restamp'], true);
   labelCall(['pr', 'edit', String(pr), '--repo', repo, '--add-label', LABEL]);
-  labelCall(['pr', 'edit', String(pr), '--repo', repo, '--remove-label', LABEL]);
+  // The add has dispatched the gate. Cleanup failure must not re-arm its once-per-head claim.
+  const removeArgs = ['pr', 'edit', String(pr), '--repo', repo, '--remove-label', LABEL];
+  try { labelCall(removeArgs); }
+  catch {
+    try { gh('gh', removeArgs, options); }
+    catch (error) {
+      return { ok: true, note: `merge-gate triggered; ${LABEL} removal failed: ${errorText(error)}; ask an operator to remove ${LABEL}` };
+    }
+    return { ok: true, note: `merge-gate triggered; ${LABEL} cleanup succeeded on the final removal attempt` };
+  }
+  return { ok: true };
 }

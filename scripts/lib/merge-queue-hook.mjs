@@ -353,8 +353,8 @@ export function recordRefreshed(path, key, headSha, { max = 500, pass = null, no
 /**
  * Refresh a stale PR. Rebuild onto main through `refreshOntoMain` (the sanctioned path the CI-red recovery uses).
  * When the branch is already on the main tip (`current`, nothing to rebuild — only the pass is too old), re-run
- * the required check's workflow run instead (throttled REST). Startup failures or a cannot-be-retried
- * 403 use the shared gate:refresh trigger, with live head verification, to produce a fresh gate.
+ * the required check's workflow run instead (throttled REST). Identified merge-gate startup failures
+ * use the shared gate:refresh trigger, with live head verification, to produce a fresh gate.
  * @returns {Promise<{ok: boolean, action: string, newCommit?: string|null, error?: string}>}
  */
 export async function refreshStalePr({ laneRef, root, repo = null, prNumber = null, runId = null, runConclusion = null, expectedHead = null, readTip, refresh, rerun, execGh }) {
@@ -385,8 +385,8 @@ export async function refreshStalePr({ laneRef, root, repo = null, prNumber = nu
         || !/^[0-9a-f]{40}$/.test(expectedHead || '')) throw new Error('no verified repo, PR and head for gate refresh');
       const live = JSON.parse(call(['api', `repos/${repo}/pulls/${prNumber}`]));
       if (live?.head?.sha !== expectedHead) throw new Error('live PR head differs from judged head');
-      toggleMergeGateRefresh({ repo, pr: prNumber, gh: (_bin, args) => call(args) });
-      return { ok: true, action: 'gate-refresh', newCommit: null };
+      const result = toggleMergeGateRefresh({ repo, pr: prNumber, gh: (_bin, args) => call(args) });
+      return { ok: true, action: 'gate-refresh', newCommit: null, ...(result.note ? { note: result.note } : {}) };
     } catch (e) {
       return { ok: false, action: 'gate-refresh-failed', error: `${firstLine(e)}; ask an operator to toggle gate:refresh` };
     }
@@ -399,8 +399,6 @@ export async function refreshStalePr({ laneRef, root, repo = null, prNumber = nu
     call(['api', '-X', 'POST', `repos/${repo}/actions/runs/${runId}/rerun`]);
     return { ok: true, action: 'rerun', newCommit: null };
   } catch (e) {
-    const detail = `${e?.message ?? ''} ${e?.stderr ?? ''}`;
-    if (/403/.test(detail) && /cannot be retried/i.test(detail)) return triggerGate();
     return { ok: false, action: 'rerun-failed', error: firstLine(e) };
   }
 }

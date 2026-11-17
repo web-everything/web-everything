@@ -151,12 +151,11 @@ describe('startup-failure stale merge-gate refresh', () => {
     expect(bad).toHaveBeenCalledTimes(1);
     expect(good).toHaveBeenCalledTimes(1);
   });
-  it.each(['startup_failure', '403 refusal'])('does not spend catch-up budget on failed %s recovery; a later trigger succeeds once', async kind => {
+  it('does not spend catch-up budget on failed startup_failure recovery; a later trigger succeeds once', async () => {
     const state = {}, calls = [];
     let refused = true;
     const refreshStalePr = vi.fn(options => refreshRealStalePr({ ...options, prNumber: 5006,
       readTip: () => HEAD, refresh: () => ({ ok: true, action: 'current' }),
-      runConclusion: kind === 'startup_failure' ? 'startup_failure' : null,
       execGh: args => {
         calls.push(args);
         if (refused || args.includes('POST')) throw new Error('HTTP 403: This workflow run cannot be retried');
@@ -174,7 +173,33 @@ describe('startup-failure stale merge-gate refresh', () => {
     expect(state['o/r#5006']).toMatchObject({ fromHead: HEAD, newHead: null, action: 'gate-refresh' });
     await handleStaleMergeGate(o);
     expect(refreshStalePr).toHaveBeenCalledTimes(2);
-    expect(calls.filter(args => args.includes('POST'))).toHaveLength(kind === 'startup_failure' ? 0 : 2);
+    expect(calls.filter(args => args.includes('POST'))).toHaveLength(0);
+  });
+  it('records add-ok/remove-fails as success and retains the head claim even if the ledger is lost', async () => {
+    const state = {}, calls = [];
+    const refreshStalePr = vi.fn(options => refreshRealStalePr({ ...options, prNumber: 5006,
+      readTip: () => HEAD, refresh: () => ({ ok: true, action: 'current' }),
+      execGh: args => {
+        calls.push(args);
+        if (args.includes('--remove-label')) throw new Error('cleanup denied');
+        return JSON.stringify({ head: { sha: HEAD } });
+      } }));
+    const o = options({ refreshStalePr, readState: () => state,
+      record: vi.fn((_path, key, entry) => { state[key] = entry; }) });
+    try {
+      const result = await handleStaleMergeGate(o);
+      expect(result.reason).toContain('refresh gate-refresh');
+      expect(result.reason).toContain('ask an operator to remove gate:refresh');
+      expect(o.record).toHaveBeenCalledTimes(1);
+      expect(state['o/r#5006']).toMatchObject({ fromHead: HEAD, newHead: null, action: 'gate-refresh' });
+      expect(calls.filter(args => args.includes('--add-label'))).toHaveLength(1);
+      expect(calls.filter(args => args.includes('--remove-label'))).toHaveLength(4);
+      expect(await handleStaleMergeGate(o)).toMatchObject({ reason: expect.stringContaining('a person should look') });
+      delete state['o/r#5006'];
+      expect(await handleStaleMergeGate(o)).toMatchObject({ handled: false, reason: expect.stringContaining('already claimed') });
+      expect(refreshStalePr).toHaveBeenCalledTimes(1);
+      expect(o.record).toHaveBeenCalledTimes(1);
+    } finally { rmSync(dirname(o.statePath), { recursive: true, force: true }); }
   });
   it('refuses when the required-check set is unknown (gate not allowed)', async () => {
     const o = options({ requiredChecks: undefined });
