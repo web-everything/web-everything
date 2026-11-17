@@ -8,11 +8,12 @@ const NO_PROMPT_COMMAND_RULES_SENTINEL = '<!-- no-prompt-command-rules:begin -->
 const NO_PROMPT_COMMAND_RULES_END = '<!-- no-prompt-command-rules:end -->';
 const NO_PROMPT_COMMAND_RULES_BODY = `## No-prompt command rules
 
-- Plain single commands only: no \`$(...)\`, no shell variables or arrays, no loops, no trailing \`&\`.
-- Edit files with the Edit/Write tools, never \`sed -i\`, \`perl -i\`, or redirect writes.
-- Never \`rm -rf\` / \`rm -r\`: write scratch to a NEW uniquely named dir instead of deleting.
-- Never run destructive history or working-tree resets, forced pushes, or cleans.
-- Stop background jobs with the job tool (TaskStop), never \`pkill\`/\`killall\`.`;
+- No \`for\`/\`while\` loops in one command; split them into separate commands.
+- No trailing \`&\` (use the tool's background option).
+- No \`sed -i\` / \`perl -i\` (use the Edit tool).
+- \`rm -rf\` only on plain scratch names in the current lane; never \`rm -r\` on anything else.
+- Never \`pkill\`, \`killall\` or \`kill -9\` (use TaskStop or \`kill <pid>\`).
+- Never \`git reset --hard\`, \`git push --force\` or \`git clean\`.`;
 export const NO_PROMPT_COMMAND_RULES = `${NO_PROMPT_COMMAND_RULES_SENTINEL}\n${NO_PROMPT_COMMAND_RULES_BODY}\n${NO_PROMPT_COMMAND_RULES_END}`;
 
 /** Validate the task itself before the builder adds any instructions. */

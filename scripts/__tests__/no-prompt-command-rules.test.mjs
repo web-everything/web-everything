@@ -15,6 +15,20 @@ function expectBlock(text) {
 }
 
 describe('no-prompt command rules scope', () => {
+  it('pins the exact approval-hook-compatible rules', () => {
+    expect(NO_PROMPT_COMMAND_RULES).toBe([
+      '<!-- no-prompt-command-rules:begin -->',
+      '## No-prompt command rules',
+      '',
+      '- No `for`/`while` loops in one command; split them into separate commands.',
+      "- No trailing `&` (use the tool's background option).",
+      '- No `sed -i` / `perl -i` (use the Edit tool).',
+      '- `rm -rf` only on plain scratch names in the current lane; never `rm -r` on anything else.',
+      '- Never `pkill`, `killall` or `kill -9` (use TaskStop or `kill <pid>`).',
+      '- Never `git reset --hard`, `git push --force` or `git clean`.',
+      '<!-- no-prompt-command-rules:end -->',
+    ].join('\n'));
+  });
   it('opts in only the four session kinds observed prompting the operator', () => {
     expect(NO_PROMPT_SESSION_KINDS).toEqual(['fix', 'ci-heal', 'review-job', 'red-team']);
     for (const kind of NO_PROMPT_SESSION_KINDS) expectBlock(renderNoPromptCommandRules('Task', kind));
