@@ -621,7 +621,21 @@ describe('renderGhShimScript — sets WE_GH_THROTTLE_CALLER on the throttle CLI 
     const shimPath = join(dir, 'gh');
     writeFileSync(shimPath, renderGhShimScript({ realGhPath: realGh, cachePath: join(dir, 'cache.json'), ghThrottleCliPath: relayCli }));
     chmodSync(shimPath, 0o755);
-    const env = { ...process.env, ...NOT_A_DAEMON, GH_TOKEN: undefined, GH_CALLER: undefined, CLAUDE_CODE_SESSION_ID: undefined };
+    // Supply the process-table input deterministically: restricted hosts can deny /bin/ps.
+    // The generated shim still performs the probe, parses its result and passes the caller to the relay.
+    const preload = join(dir, 'parent-command.cjs');
+    writeFileSync(preload, `const cp = require('node:child_process');
+const original = cp.spawnSync;
+cp.spawnSync = function(file, args, ...rest) {
+  if (file === '/bin/ps' && args?.[0] === '-o' && args[1] === 'command=' && args[2] === '-p' && args[3] === String(process.ppid)) {
+    return { status: 0, stdout: process.env.WE_TEST_PARENT_COMMAND + '\\n', stderr: '' };
+  }
+  return original.call(this, file, args, ...rest);
+};\n`);
+    const env = { ...process.env, ...NOT_A_DAEMON, GH_TOKEN: undefined, GH_CALLER: undefined, CLAUDE_CODE_SESSION_ID: undefined,
+      NODE_OPTIONS: [process.env.NODE_OPTIONS, '--require=' + JSON.stringify(preload)].filter(Boolean).join(' '),
+      WE_TEST_PARENT_COMMAND: '/bin/sh -c fixture',
+    };
     return { dir, shimPath, env };
   }
   const callerOf = (r) => JSON.parse(r.stdout).caller;
@@ -640,7 +654,7 @@ describe('renderGhShimScript — sets WE_GH_THROTTLE_CALLER on the throttle CLI 
     const { dir, shimPath, env } = setup();
     try {
       const script = join(dir, 'ci-heal-mark.mjs');
-      writeFileSync(script, `import { spawnSync } from 'node:child_process';\nconst r = spawnSync(${JSON.stringify(shimPath)}, ['pr', 'comment', '1'], { encoding: 'utf8' });\nprocess.stdout.write(r.stdout);\n`);
+      writeFileSync(script, `import { spawnSync } from 'node:child_process';\nconst r = spawnSync(${JSON.stringify(shimPath)}, ['pr', 'comment', '1'], { encoding: 'utf8', env: { ...process.env, WE_TEST_PARENT_COMMAND: [process.execPath, process.argv[1]].join(' ') } });\nprocess.stdout.write(r.stdout);\n`);
       const r = spawnSync(process.execPath, [script], { encoding: 'utf8', env: { ...env, CLAUDE_CODE_SESSION_ID: 'must-not-win' } });
       expect(callerOf(r)).toBe('ci-heal-mark.mjs');
     } finally { rmSync(dir, { recursive: true, force: true }); }
