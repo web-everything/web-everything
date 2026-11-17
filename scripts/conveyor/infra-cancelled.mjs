@@ -40,8 +40,16 @@ export function isHungJob(job, { hungMinutes = resolveHungJobMinutes() } = {}) {
   return Number.isFinite(start) && Number.isFinite(end) && end - start >= hungMinutes * 60_000;
 }
 
-// Only network infrastructure steps qualify; durations alone never excuse a build or test failure.
-const INFRA_STEP_NAME = /^(?:(?:run\s+)?actions\/(?:checkout|(?:download|upload)-artifact|cache(?:\/restore| restore))(?:@|\s|$)|checkout\b|check out\b|fetch |(?:download|upload)[\s-]+artifacts?\b)/i;
+/** A cancellation may cut only the last started step; earlier failures and unknown evidence stay real. */
+export function hasCleanCancellationSteps(job) {
+  if (!Array.isArray(job?.steps)) return true;
+  const lastStarted = job.steps.findLastIndex((step) => step?.started_at || step?.conclusion !== 'skipped');
+  return job.steps.every((step, index) => ['success', 'skipped', 'neutral'].includes(step?.conclusion)
+    || (step?.conclusion === 'cancelled' && index === lastStarted));
+}
+
+// Whole infrastructure names only: compound build/test steps carry real failure evidence.
+const INFRA_STEP_NAME = /^(?:checkout|check out (?!.* and ).+|(?:run )?actions\/(?:checkout|(?:download|upload)-artifact|cache\/restore)@\S+|fetch (?!.*(?: and |\b(?:run|test|assert)\b)).+|(?:download|upload)[ -]+artifacts?|restore cache|actions\/cache restore)$/i;
 
 /** A terminal infrastructure step timed out before any later step ran. Missing evidence stays real. */
 export function isInfraStepTimeoutJob(job) {
@@ -71,6 +79,7 @@ export function isInfraCancelledJob(job, opts) {
   // A job that ran to its own timeout is a hang (a real failure with a log), not infra: it goes to ci-heal.
   if (isHungJob(job, opts)) return false;
   const conclusion = String(job.conclusion ?? '').toLowerCase();
+  if (conclusion === 'cancelled' && !hasCleanCancellationSteps(job)) return false;
   if (INFRA_CONCLUSIONS.includes(conclusion)) return true;
   if (['success', 'skipped', 'neutral'].includes(conclusion)) return false;
   const noRunner = !job.runner_name && !job.runner_id;

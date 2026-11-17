@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import {
   isInfraCancelledJob, isInfraStepTimeoutJob, isAggregateGateFailure, classifyInfraCancelled, isInfraCancelledOnlyRun, resolveInfraCancelledMode,
-  authoritativeCheckRuns, isHungJob, DEFAULT_INFRA_CANCELLED_MODE, DEFAULT_INFRA_CANCELLED_MAX_RERUNS,
+  authoritativeCheckRuns, isHungJob, hasCleanCancellationSteps, DEFAULT_INFRA_CANCELLED_MODE, DEFAULT_INFRA_CANCELLED_MAX_RERUNS,
 } from '../infra-cancelled.mjs';
 import { computeMainRedWindows, currentMainGreen } from '../main-red-recovery.mjs';
 import { enrichPrsWithTimeoutEvidence, readTimeoutEvidence, defaultReadMainRuns } from '../reconcile-pass.mjs';
@@ -26,6 +26,28 @@ describe('hung job (ran to its own timeout) is NOT an infra cancellation', () =>
     expect(isInfraCancelledJob(ran(15), { hungMinutes: 0 })).toBe(true);
     expect(isInfraCancelledJob(ran(15), { hungMinutes: 30 })).toBe(true);
   });
+  it.each(['failure', 'timed_out'])('an earlier %s before cancellation stays real', conclusion => {
+    const job = ran(15, { steps: [{ name: 'Assertions', conclusion }, { name: 'Cleanup', conclusion: 'cancelled' }] });
+    expect(hasCleanCancellationSteps(job)).toBe(false);
+    expect(isInfraCancelledJob(job)).toBe(false);
+    expect(isInfraCancelledOnlyRun([job])).toBe(false);
+  });
+  it('allows passing steps and only the last started step to be cancelled', () => {
+    expect(hasCleanCancellationSteps({ steps: [
+      { conclusion: 'success' }, { conclusion: 'neutral' }, { conclusion: 'cancelled' }, { conclusion: 'skipped' },
+    ] })).toBe(true);
+    expect(hasCleanCancellationSteps({ steps: [{ conclusion: 'cancelled' }, { conclusion: 'success' }] })).toBe(false);
+    expect(hasCleanCancellationSteps({ steps: [{ conclusion: 'cancelled' }, { conclusion: 'cancelled' }] })).toBe(false);
+    expect(hasCleanCancellationSteps({ steps: [{ conclusion: 'cancelled' }, { conclusion: 'skipped', started_at: '2026-11-17T10:01:00Z' }] })).toBe(false);
+  });
+  it('fails closed on unknown step evidence, retaining runner and duration requirements without a steps array', () => {
+    expect(hasCleanCancellationSteps({ steps: [{}] })).toBe(false);
+    expect(hasCleanCancellationSteps({ steps: [null] })).toBe(false);
+    expect(hasCleanCancellationSteps(ran(15, { steps: undefined }))).toBe(true);
+    expect(isHungJob(ran(15, { steps: undefined }))).toBe(true);
+    expect(isHungJob(ran(15, { steps: undefined, runner_name: '' }))).toBe(false);
+    expect(isHungJob(ran(15, { steps: undefined, completed_at: null }))).toBe(false);
+  });
 });
 
 const infraStepJob = (name = 'Fetch main history (blobless)', duration = 180_000) => ({
@@ -39,12 +61,16 @@ const infraStepJob = (name = 'Fetch main history (blobless)', duration = 180_000
 describe('infrastructure step timeout', () => {
   it.each(['Checkout', 'Run actions/checkout@v4', 'Check out repository', 'Fetch main history (blobless)',
     'Download artifact', 'Upload artifacts', 'actions/download-artifact@v4', 'actions/upload-artifact@v4',
-    'Run actions/cache/restore@v4', 'actions/cache restore'])('recognizes a three-minute %s failure for PR retry only', name => {
+    'Restore cache', 'Run actions/cache/restore@v4', 'actions/cache restore'])('recognizes a three-minute %s failure for PR retry only', name => {
     expect(isInfraStepTimeoutJob(infraStepJob(name))).toBe(true);
     expect(isInfraCancelledJob(infraStepJob(name))).toBe(false);
   });
   it.each(['Install + build FUI tools', 'Install dependencies', 'Setup Node', 'Set up Node', 'Build tools',
-    'Cache dependencies', 'Run actions/setup-node@v4', 'actions/cache@v4', 'Fetch'])('%s five-minute failure stays real', name => {
+    'Cache dependencies', 'Run actions/setup-node@v4', 'actions/cache@v4', 'Fetch',
+    'Checkout and run assertions', 'Checkout repository', 'Check out repository and build',
+    'Fetch history and build', 'Fetch history run checks', 'Fetch test results', 'Fetch assert output',
+    'Download artifact and run assertions', 'Upload artifact and test', 'Restore cache and build',
+    'Run actions/checkout@v4 and run assertions'])('%s five-minute failure stays real', name => {
     const job = infraStepJob(name, 5 * 60_000);
     expect(isInfraStepTimeoutJob(job)).toBe(false);
     expect(isInfraCancelledJob(job)).toBe(false);
@@ -240,6 +266,39 @@ describe('infra-cancelled evidence + planning', () => {
     expect(out.timeoutRetry).toMatchObject({ eligible: true, infraCancelled: true, timeoutKind, cap: 1 });
   });
 
+  it.each(['integration', 'test-shard (1)', 'soak-shard (1)'])('an earlier assertion failure then cancelled step in hung %s reads logs and stays real', name => {
+    const base = mkExec();
+    const logs = [];
+    const e = readTimeoutEvidence(pr, { repo, exec: (cmd, args) => {
+      const path = args[1];
+      if (path.endsWith('/actions/jobs/1')) return JSON.stringify({ ...JSON.parse(base(cmd, args)),
+        name, runner_name: 'runner', started_at: '2026-11-17T10:00:00Z', completed_at: '2026-11-17T10:15:00Z',
+        steps: [{ name: 'Run assertions', conclusion: 'failure' }, { name: 'Cleanup', conclusion: 'cancelled' }],
+      });
+      if (path.endsWith('/actions/jobs/1/logs')) {
+        logs.push(path);
+        return 'FAIL scripts/x.test.mjs > assertion failure\n';
+      }
+      return base(cmd, args);
+    } });
+    expect(logs).toEqual([`repos/${repo}/actions/jobs/1/logs`]);
+    expect(e).toEqual({ eligible: false, reason: 'mixed-infra-cancelled-and-real-failure' });
+  });
+
+  it('a hung job with passing earlier steps and a cancelled final step retries without logs', () => {
+    const base = mkExec();
+    const e = readTimeoutEvidence(pr, { repo, exec: (cmd, args) => {
+      const path = args[1];
+      if (path.endsWith('/logs')) throw new Error('log read forbidden');
+      if (path.endsWith('/actions/jobs/1')) return JSON.stringify({ ...JSON.parse(base(cmd, args)),
+        name: 'integration', runner_name: 'runner', started_at: '2026-11-17T10:00:00Z', completed_at: '2026-11-17T10:15:00Z',
+        steps: [{ conclusion: 'success' }, { conclusion: 'cancelled' }, { conclusion: 'skipped' }],
+      });
+      return base(cmd, args);
+    } });
+    expect(e).toMatchObject({ eligible: true, infraCancelled: true, timeoutKind: 'job-timeout' });
+  });
+
   // `test` is a real runner job here (cancelled `daemon-soak` sits beside it, so `test` is NOT dropped as a derived
   // aggregate of a failed test-shard). Whether it counts as the aggregate gate is decided by its failed step.
   const withTestJob = (steps) => {
@@ -253,8 +312,8 @@ describe('infra-cancelled evidence + planning', () => {
   };
   const step = (name, conclusion) => ({ name, status: 'completed', conclusion });
 
-  it('reconcile evidence keeps a five-minute Install + build FUI tools failure real', () => {
-    const e = readTimeoutEvidence(pr, { repo, exec: withTestJob(infraStepJob('Install + build FUI tools', 5 * 60_000).steps) });
+  it.each(['Install + build FUI tools', 'Checkout and run assertions'])('reconcile evidence keeps a five-minute %s failure real', name => {
+    const e = readTimeoutEvidence(pr, { repo, exec: withTestJob(infraStepJob(name, 5 * 60_000).steps) });
     expect(e).toEqual({ eligible: false, reason: 'mixed-infra-cancelled-and-real-failure' });
   });
 

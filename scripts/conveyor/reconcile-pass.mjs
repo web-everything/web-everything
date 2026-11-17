@@ -66,7 +66,7 @@ import { checksArgv, parseJsonLines, GH_TIMEOUT_MS } from '../operations/pr-stat
 import { isGhDeferred } from '../lib/gh-deferred.mjs';
 import { readTimeoutBudget } from './timeout-retry-state.mjs';
 import { EVIDENCE_READ_BACKOFF_MS, isEvidenceReadTimeout, syncSleep } from './evidence-read-retry.mjs';
-import { isInfraCancelledOnlyRun, isInfraCancelledJob, isHungJob, isInfraStepTimeoutJob, isAggregateGateFailure, classifyInfraCancelled, resolveInfraCancelledMode, DEFAULT_INFRA_CANCELLED_MAX_RERUNS, authoritativeCheckRuns } from './infra-cancelled.mjs';
+import { isInfraCancelledOnlyRun, isInfraCancelledJob, isHungJob, hasCleanCancellationSteps, isInfraStepTimeoutJob, isAggregateGateFailure, classifyInfraCancelled, resolveInfraCancelledMode, DEFAULT_INFRA_CANCELLED_MAX_RERUNS, authoritativeCheckRuns } from './infra-cancelled.mjs';
 import { createHash } from 'node:crypto';
 import { posix } from 'node:path';
 import { createRequire } from 'node:module';
@@ -2143,8 +2143,9 @@ function readTimeoutEvidenceOnce(pr, { repo, exec = execFileSyncThrottled, ts, r
           || run.repository.full_name !== repo || job.run_attempt !== run.run_attempt) throw new Error('wrong-run-head-attempt');
       // Outage fix: a cancelled / startup_failure / no-runner job has NO log, so the read below 404'd and the PR
       // was refused forever. Classify first; never read a log that cannot exist.
-      const cancelledShard = /^(?:test|soak)-shard(?:\s|$)/.test(job.name ?? '') && String(job.conclusion).toLowerCase() === 'cancelled';
-      const timeoutKind = isHungJob(job) ? 'job-timeout' : isInfraStepTimeoutJob(job) ? 'step-timeout' : undefined;
+      const cleanCancellation = hasCleanCancellationSteps(job);
+      const cancelledShard = cleanCancellation && /^(?:test|soak)-shard(?:\s|$)/.test(job.name ?? '') && String(job.conclusion).toLowerCase() === 'cancelled';
+      const timeoutKind = isHungJob(job) && cleanCancellation ? 'job-timeout' : isInfraStepTimeoutJob(job) ? 'step-timeout' : undefined;
       const infra = cancelledShard || isInfraCancelledJob(job) || timeoutKind;
       return { repo, head, run: run.id, job: job.id, name: job.name, attempt: job.run_attempt, workflow: run.path,
         aggregateGate: isAggregateGateFailure(job), status: job.status, conclusion: job.conclusion, logJob: job.id, logAttempt: job.run_attempt,
