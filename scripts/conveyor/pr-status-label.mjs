@@ -101,6 +101,16 @@ export function takeoverUnjudged(comments) {
   return !takeoverProgress(comments, latest).judged;
 }
 
+/** PURE: negative review evidence blocks readiness even alongside stale acceptance/status labels.
+ * Labels are conservative evidence on the observed head; missing comments never clear a blocker.
+ */
+export function deriveReviewBlockStatus(labels) {
+  const l = names(labels);
+  if (l.includes('red-team:blocked')) return 'sent-back-red-team';
+  if (l.includes('review:changes')) return 'sent-back-review';
+  return null;
+}
+
 /**
  * PURE: the ONE `status:*` state for a PR, or null when none applies.
  * @param {{pr?:object, labels?:Array, reviewStatus?:{role?:string,state?:string}|null, rows?:Array<object>, defaultBranch?:string, humanAt?:number, requiredChecks?:string[]|null, settings?:object}} o
@@ -113,6 +123,7 @@ export function derivePrStatusLabel({ pr = {}, labels, reviewStatus = null, rows
   const ciChecks = settings.reviewGateSignal === 'review' && Array.isArray(redChecks)
     ? redChecks.filter(name => name !== 'review-gate') : redChecks;
   const l = names(labels ?? pr?.labels);
+  const reviewBlock = deriveReviewBlockStatus(l);
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
   const rs = reviewStatus?.state ?? null;
   const list = Array.isArray(rows) ? rows : [];
@@ -121,10 +132,10 @@ export function derivePrStatusLabel({ pr = {}, labels, reviewStatus = null, rows
   const liveFix = (reviewStatus?.role === 'fix' || reviewStatus?.role === 'ci-heal') && rs !== 'needs-human';
   if (requiredCiRed(subject, l, ciChecks, settings)) return liveFix ? 'fixing' : 'ci-red';
   if (subject.mergeable === 'CONFLICTING' || subject.mergeStateStatus === 'DIRTY') return liveFix ? 'fixing' : 'conflict';
-  if (l.includes('review:accepted') && !l.includes('ready-to-merge')
+  if (!reviewBlock && l.includes('review:accepted') && !l.includes('ready-to-merge')
     && reviewStatus?.role === 'review' && ['reviewing', 'review-stalled'].includes(rs)
     && settings.acceptedRedTeamStatus === 'red-team') return 'red-team';
-  if (l.includes('review:accepted')) return 'ready-to-merge';
+  if (!reviewBlock && l.includes('review:accepted')) return 'ready-to-merge';
   if (liveFix) return takeoverUnjudged(comments) && reviewStatus.role === 'fix' ? 'takeover-running' : 'fixing';
   const escalated = list.some((r) => (r.kind === 'cap-exhausted' && ESCALATED.has(r.takeover))
     || r.kind === 'ruling-dispute' || r.takeoverNotConverging === true);
@@ -140,6 +151,7 @@ export function derivePrStatusLabel({ pr = {}, labels, reviewStatus = null, rows
   if ((!stands.length || unresolved) && list.some((r) => r.kind === 'stood-down')) return 'stood-down';
   if (redTeamQueueReason(subject)) return 'sent-back-red-team';
   if (list.some((r) => r.mode === 'takeover' || r.takeoverReview?.ok || r.kind === 'cap-exhausted' || r.kind === 'takeover-awaiting-review')) return 'at-round-limit';
+  if (reviewBlock) return reviewBlock;
   if (rs === 'awaiting-base' || l.includes('review-status:awaiting-base')
     || list.some((r) => r.kind === 'stacked-awaiting-base' || (r.kind === 'gate-hold' && /base/.test(String(r.hold ?? ''))))) return 'waiting-on-base';
   if (rs === 'awaiting-ci' || list.some((r) => r.kind === 'owed-ci-rerun')) return 'awaiting-ci';
