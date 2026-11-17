@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { classifyPr, nextActor } from './assistant-babysit-rules.mjs';
 
 const DEFAULT_REPOS = ['web-everything/web-everything', 'plateauapp/plateau-app'];
-export const DEFAULT_CLAIM_TTL_MIN = 20;
+export const DEFAULT_CLAIM_TTL_MIN = 10; // matches the dispatch claim store default lease
 const PR_LIST_LIMIT = 500;
 const stamp = (value, field = 'timestamp evidence') => {
   const ms = typeof value === 'number' ? value : typeof value === 'string' ? Date.parse(value) : NaN;
@@ -49,6 +49,7 @@ function loadClaims(io, coordDir) {
       if (!repo) throw new Error('Missing or invalid meta.repo');
       if (!pr) throw new Error('Missing or invalid meta.pr');
       if (typeof meta.kind !== 'string' || !meta.kind.trim()) throw new Error('Missing or invalid meta.kind');
+      if (typeof lock.owner !== 'string' || !lock.owner.trim()) throw new Error('Missing or invalid owner');
       const ttlMinutes = meta.ttlMinutes ?? DEFAULT_CLAIM_TTL_MIN;
       if (!Number.isFinite(ttlMinutes) || ttlMinutes <= 0) throw new Error('Invalid ttlMinutes');
       const claimedAtMs = stamp(meta.claimedAt, 'claimedAt');

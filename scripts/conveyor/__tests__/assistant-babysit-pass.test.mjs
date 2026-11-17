@@ -6,7 +6,7 @@ import { runTick, DEFAULT_CLAIM_TTL_MIN } from '../assistant-babysit-pass.mjs';
 const nowMs = Date.parse('2026-01-01T12:00:00Z');
 const old = '2026-01-01T10:00:00Z';
 const missing = () => Object.assign(new Error('missing fixture'), { code: 'ENOENT' });
-const makeClaim = (meta = {}, fields = {}) => ({ heartbeatAt: new Date(nowMs).toISOString(),
+const makeClaim = (meta = {}, fields = {}) => ({ owner: 'fixer:test', heartbeatAt: new Date(nowMs).toISOString(),
   meta: { repo: 'we', pr: 1, kind: 'fix', claimedAt: '2026-01-01T11:55:00Z', ttlMinutes: 10, ...meta }, ...fields });
 function fixture() {
   const files = new Map();
@@ -24,7 +24,7 @@ function fixture() {
       if (index !== undefined) {
         const claim = world.claims[Number(index)];
         if (claim instanceof Error) throw claim;
-        return typeof claim === 'string' ? claim : JSON.stringify(claim);
+        return typeof claim === 'string' ? claim : JSON.stringify(claim && !('owner' in claim) ? { owner: 'fixer:test', ...claim } : claim);
       }
       throw missing();
     },
@@ -176,16 +176,16 @@ describe('report-only tick', () => {
 
   it.each([
     ['missing', undefined], ['null', null],
-  ])('defaults %s claim TTL to 20 minutes without aborting other PR reports', (_, ttlMinutes) => {
+  ])('defaults %s claim TTL to 10 minutes without aborting other PR reports', (_, ttlMinutes) => {
     const w = fixture();
-    expect(DEFAULT_CLAIM_TTL_MIN).toBe(20);
+    expect(DEFAULT_CLAIM_TTL_MIN).toBe(10);
     w.prs.push({ ...w.prs[0], number: 2 });
-    w.claims = [{ heartbeatAt: new Date(nowMs - 20 * 60000).toISOString(), meta: {
+    w.claims = [{ heartbeatAt: new Date(nowMs - 5 * 60000).toISOString(), meta: {
       repo: 'we', pr: 1, kind: 'fix', claimedAt: '2026-01-01T11:30:00Z', headSha: 'abc', ttlMinutes,
     } }];
     expect(w.tick().reports.map((r) => [r.pr, r.rule])).toEqual([[2, 'no-worker']]);
     expect(w.log().at(-1)).toMatchObject({ type: 'tick', open: 2, reports: 1, badClaims: 0 });
-    expect(w.tick({ nowMs: nowMs + 1 }).reports.map((r) => [r.pr, r.rule])).toEqual([[1, 'no-worker'], [2, 'no-worker']]);
+    expect(w.tick({ nowMs: nowMs + 6 * 60000 }).reports.map((r) => [r.pr, r.rule])).toEqual([[1, 'no-worker'], [2, 'no-worker']]);
   });
 
   it.each([10, 30])('preserves a valid claim TTL of %i minutes', (ttlMinutes) => {
@@ -206,7 +206,8 @@ describe('report-only tick', () => {
     ['object ttl', makeClaim({ ttlMinutes: {} }), 'Invalid ttlMinutes', true],
     ['infinite ttl', JSON.stringify(makeClaim()).replace('"ttlMinutes":10', '"ttlMinutes":1e400'), 'Invalid ttlMinutes', true],
     ['NaN ttl JSON', JSON.stringify(makeClaim()).replace('"ttlMinutes":10', '"ttlMinutes":NaN'), 'Invalid claim JSON', false],
-    ['missing metadata', {}, 'Missing or invalid meta.repo', false],
+    ['missing owner', makeClaim({}, { owner: undefined }), 'Missing or invalid owner', true],
+    ['missing metadata', {},'Missing or invalid meta.repo', false],
     ['missing repo', makeClaim({ repo: undefined }), 'Missing or invalid meta.repo', false],
     ['invalid repo', makeClaim({ repo: 123 }), 'Missing or invalid meta.repo', false],
     ['missing PR', makeClaim({ pr: undefined }), 'Missing or invalid meta.pr', false],
