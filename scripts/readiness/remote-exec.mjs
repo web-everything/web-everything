@@ -13,7 +13,7 @@ import {BASE_RETENTION} from './forge-exec-bases.mjs';
 import {resolveTransport,runnerSupportsBundle,planBundle,mainFreshness,bundleEvidence,makeBundleDirectory,removeBundleDirectory} from './remote-git-bundle.mjs';
 import {routeNeedsGit,selectionUnproven} from './needs-git-route.mjs';
 import {writeJsonAtomic} from '../lib/atomic-json-file.mjs';
-import {SKIP_REASON, SECTION_INPUTS} from '../lib/standards-sections.mjs';
+import {SKIP_REASON, SECTION_INPUTS, createSectionGate} from '../lib/standards-sections.mjs';
 
 const ROOT = '/srv/forge-exec';
 const LIMIT = 4 * 1024 * 1024;
@@ -1378,15 +1378,28 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
   const cancel = { signal: cancelSignal ?? new AbortController().signal };
   const nonce = randomBytes(16).toString('hex');
   const tails = {stdout:'',stderr:''};
+  const standardsFilesArg = argv.find(arg => arg.startsWith('--files='));
+  const standardsFiles = standardsFilesArg
+    ? standardsFilesArg.split('=').slice(1).join('=').split(/[\s,]+/).map(file => file.trim()).filter(Boolean)
+    : [];
   let incompleteStandards;
   const inspectStandardsLine = line => {
-    // standards-sections.mjs deliberately omits gates with no touched inputs.
-    // Exempt only its exact marker; unknown skips still require local evidence.
-    // The whole line must be the producer's exact summary naming only known section ids.
+    // A whole-line summary is only a candidate: explicit argv scope and the
+    // local gate must independently agree. Remote backlog links only widen scope,
+    // so a local would-run always contradicts a remote skip.
     const plain = line.replace(/\x1b\[[0-9;]*m/g, '').trim();
     const prefix = `local ${SKIP_REASON}: `;
-    const benign = plain.startsWith(prefix) && plain.slice(prefix.length).split(', ').every(id => Object.hasOwn(SECTION_INPUTS, id));
-    const evidence = benign ? '' : line;
+    let benign = false;
+    if (plain.startsWith(prefix) && argv.includes('--local') && standardsFiles.length) {
+      try {
+        // bindGit above verifies cwd is the repository root.
+        const gate = createSectionGate({scoped:true, touched:standardsFiles, root:cwd});
+        benign = plain.slice(prefix.length).split(', ').every(id =>
+          Object.hasOwn(SECTION_INPUTS, id) && gate.shouldRun(id) === false);
+      } catch { /* incomplete local evidence requires fallback */ }
+    }
+    // ANSI suffixes such as "2m" must not mask the word boundary before "skipped".
+    const evidence = benign ? '' : plain;
     if (/\bskipp(?:ing|ed)\b|\bno-scope\b|\bENOENT\b|no changed tier lines; nothing to attribute/i.test(evidence))
       incompleteStandards ??= line;
   };
