@@ -1,3 +1,5 @@
+import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
+const COMMAND_RULES_PREFIX = `${NO_PROMPT_COMMAND_RULES}\n\n`;
 import { applyTestsFirstPolicy } from '../../lib/tests-first-policy.mjs';
 /**
  * @file dispatch-lane.test.mjs — the effect that STARTS rather than completes (#3037, under epic #3029).
@@ -1307,7 +1309,7 @@ describe('what the sink actually runs', () => {
     // real dispatch argv. Passing it bought nothing and encoded a false premise the rest of the file read as
     // fact; the handle now comes from the id the CLI prints (`parseBackgroundedId`).
     const argv = buildAgentArgv({ sessionId: 'sess-c3', payload });
-    expect(argv).toEqual(['--bg', '-n', 'conveyor-3037', '--settings', JSON.stringify({ env: { WE_CONVEYOR_WORKER: '1' } }), '--effort', 'high', '--model', 'sonnet', '# build #3037']);
+    expect(argv).toEqual(['--bg', '-n', 'conveyor-3037', '--settings', JSON.stringify({ env: { WE_CONVEYOR_WORKER: '1' } }), '--effort', 'high', '--model', 'sonnet', (COMMAND_RULES_PREFIX + ('# build #3037'))]);
     expect(argv).not.toContain('--session-id');
     expect(argv).not.toContain('sess-c3');
   });
@@ -1319,7 +1321,7 @@ describe('what the sink actually runs', () => {
       '--bg', '-n', 'conveyor-3037',
       '--settings', JSON.stringify({ env: { WE_CONVEYOR_WORKER: '1' } }),
       '--append-system-prompt-file', '/path/to/identity.md',
-      '--effort', 'high', '--model', 'sonnet', '# build #3037',
+      '--effort', 'high', '--model', 'sonnet', (COMMAND_RULES_PREFIX + ('# build #3037')),
     ]);
   });
 
@@ -1332,7 +1334,7 @@ describe('what the sink actually runs', () => {
       '--bg', '-n', 'conveyor-3037',
       '--settings', JSON.stringify({ env: { PATH: '/shim:/usr/bin', WE_CONVEYOR_WORKER: '1' } }),
       '--append-system-prompt-file', '/path/to/identity.md',
-      '--effort', 'high', '--model', 'sonnet', '# build #3037',
+      '--effort', 'high', '--model', 'sonnet', (COMMAND_RULES_PREFIX + ('# build #3037')),
     ]);
   });
 
@@ -1343,7 +1345,7 @@ describe('what the sink actually runs', () => {
     expect(argv).toEqual([
       '--bg', '-n', 'conveyor-3037',
       '--settings', JSON.stringify({ env: { PATH: '/shim:/usr/bin', WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' } }),
-      '--effort', 'high', '--model', 'sonnet', '# build #3037',
+      '--effort', 'high', '--model', 'sonnet', (COMMAND_RULES_PREFIX + ('# build #3037')),
     ]);
   });
 
@@ -1370,7 +1372,7 @@ describe('what the sink actually runs', () => {
   });
 
   it('xgqz204 — a resume stays a BARE `--bg --resume` (the resumed process already carries the marker)', () => {
-    expect(buildAgentArgv({ payload, resumeSessionId: 'abc' })).toEqual(['--bg', '--resume', 'abc', '# build #3037']);
+    expect(buildAgentArgv({ payload, resumeSessionId: 'abc' })).toEqual(['--bg', '--resume', 'abc', (COMMAND_RULES_PREFIX + ('# build #3037'))]);
   });
 
   it('#xu2krte — resumeSessionId emits a BARE `--bg --resume <id> <prompt>`, no -n/systemPromptFile/extraArgs', () => {
@@ -1381,7 +1383,7 @@ describe('what the sink actually runs', () => {
       sessionId: 'sess-unused', payload, resumeSessionId: 'cand-1111-2222-3333-444444444444',
       systemPromptFile: '/path/to/identity.md', extraArgs: ['--model', 'sonnet'],
     });
-    expect(argv).toEqual(['--bg', '--resume', 'cand-1111-2222-3333-444444444444', payload.prompt]);
+    expect(argv).toEqual(['--bg', '--resume', 'cand-1111-2222-3333-444444444444', (COMMAND_RULES_PREFIX + (payload.prompt))]);
   });
 
   it('#x8mpubm — settingsEnv is NEVER emitted on the resume branch either, same reasoning as extraArgs above', () => {
@@ -1389,7 +1391,7 @@ describe('what the sink actually runs', () => {
       sessionId: 'sess-unused', payload, resumeSessionId: 'cand-1111-2222-3333-444444444444',
       settingsEnv: { PATH: '/shim:/usr/bin' },
     });
-    expect(argv).toEqual(['--bg', '--resume', 'cand-1111-2222-3333-444444444444', payload.prompt]);
+    expect(argv).toEqual(['--bg', '--resume', 'cand-1111-2222-3333-444444444444', (COMMAND_RULES_PREFIX + (payload.prompt))]);
   });
 
   it('#x9fbg1x — worktreeSettings is NEVER emitted on the resume branch either — a still-running resumed '
@@ -1398,7 +1400,7 @@ describe('what the sink actually runs', () => {
       sessionId: 'sess-unused', payload, resumeSessionId: 'cand-1111-2222-3333-444444444444',
       worktreeSettings: { bgIsolation: 'none' },
     });
-    expect(argv).toEqual(['--bg', '--resume', 'cand-1111-2222-3333-444444444444', payload.prompt]);
+    expect(argv).toEqual(['--bg', '--resume', 'cand-1111-2222-3333-444444444444', (COMMAND_RULES_PREFIX + (payload.prompt))]);
   });
 
   it('#xu2krte — resumeSessionId still refuses an empty/dash-leading prompt, same as a fresh dispatch', () => {
@@ -1413,7 +1415,7 @@ describe('what the sink actually runs', () => {
 
   it('forwards the operator\'s extra flags ahead of the prompt', () => {
     const argv = buildAgentArgv({ sessionId: 'sess-c3', payload, extraArgs: ['--model', 'sonnet'] });
-    expect(argv[argv.length - 1]).toBe(payload.prompt);
+    expect(argv[argv.length - 1]).toBe((COMMAND_RULES_PREFIX + (payload.prompt)));
     expect(argv.slice(-3, -1)).toEqual(['--model', 'sonnet']);
   });
 
@@ -2626,7 +2628,7 @@ describe('#3165: the planner\'s prepare lists reach the spawner', () => {
    *  the KIND'S OWN required set (not `fillBrief`'s build-shaped default), so a name only one kind's brief
    *  carries — `DELIVERY_BASE` since #3637 — is never demanded of a kind that has no such token. */
   function expectedPrompt(kind, values) {
-    return fillBrief(applyTestsFirstPolicy(readFileSync(briefPath(REPO_ROOT, kind), 'utf8')) + (['build', 'fix', 'ci-heal'].includes(kind) ? '\n\n' + renderBuildRequirements() : ''), values, BRIEF_REQUIRED_BY_KIND[kind]).prompt;
+    return COMMAND_RULES_PREFIX + COMMAND_RULES_PREFIX + fillBrief(applyTestsFirstPolicy(readFileSync(briefPath(REPO_ROOT, kind), 'utf8')) + (['build', 'fix', 'ci-heal'].includes(kind) ? '\n\n' + renderBuildRequirements() : ''), values, BRIEF_REQUIRED_BY_KIND[kind]).prompt;
   }
 
   // ── criterion 1 ──────────────────────────────────────────────────────────────────────────────────────────
@@ -2952,7 +2954,7 @@ describe('#3332: the planner\'s fix and CI-heal lists reach the spawner', () => 
   /** The brief a kind SHOULD produce, filled from the file on disk — byte-exact, so it cannot drift. `fix`/
    *  `ci-heal` need `REPO_AWARE_VALUE_PATTERNS` (#3960: `GATE_COMMAND`/`ATTRIBUTION` legitimately carry a space). */
   function expectedPrompt(kind, values) {
-    return fillBrief(
+    return COMMAND_RULES_PREFIX + COMMAND_RULES_PREFIX + fillBrief(
       applyTestsFirstPolicy(readFileSync(briefPath(REPO_ROOT, kind), 'utf8')) + '\n\n' + renderBuildRequirements(), values, BRIEF_REQUIRED_BY_KIND[kind],
       undefined, kind === 'fix' || kind === 'ci-heal' ? REPO_AWARE_VALUE_PATTERNS : undefined,
     ).prompt;
@@ -3979,6 +3981,6 @@ describe('grouped dispatch payload and prepare brief', () => {
     expect(grouped.prompt).toContain('GROUPED PREPARE');
     expect(grouped.prompt).toContain('cards #3038, #3039 in addition to #3037');
     expect(grouped.prompt).toContain("'Not prepared'");
-    expect(shapeDispatchRead(raw, { num: '3037' }).prompt).toBe('Prepare 3037. ');
+    expect(shapeDispatchRead(raw, { num: '3037' }).prompt).toBe((COMMAND_RULES_PREFIX + ('Prepare 3037. ')));
   });
 });

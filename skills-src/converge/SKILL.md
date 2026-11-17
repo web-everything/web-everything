@@ -181,3 +181,14 @@ you report, either.
 `/converge` applies no label, posts no comment, opens no PR, and merges nothing. It does not commit or push —
 the editor is explicitly told not to. Landing a PR is [`/drain`](../drain/SKILL.md); the human verdict on a
 parked PR is [`/review`](../review/SKILL.md); a judge-only opinion with no fixes is [`/jury`](../jury/SKILL.md).
+
+<!-- Generated from scripts/lib/no-prompt-command-rules.mjs; whole-tree test pins this copy. -->
+<!-- no-prompt-command-rules:begin -->
+## No-prompt command rules
+
+- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.
+- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.
+- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting.
+- Never run destructive history or working-tree resets, forced pushes, or cleans.
+- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`.
+<!-- no-prompt-command-rules:end -->

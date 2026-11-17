@@ -1,3 +1,5 @@
+import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
+const COMMAND_RULES_PREFIX = `${NO_PROMPT_COMMAND_RULES}\n\n`;
 /**
  * fix.pushBeforeGate (operator go 2026-10-10): the harness pushes a fixer's marked commit BEFORE the local verify
  * verdict, while the fix claim stays held until green. The claim-side refusals are pinned at the end against the
@@ -529,7 +531,7 @@ describe('push-before-gate: the early push', () => {
   });
   it('no-new-commit prompt directs the fixer to post durable evidence and finish', () => {
     const prompt = buildAwaitVerifyResumePrompt({ kind: 'no-new-commit', record: rec() });
-    expect(prompt).toMatch(/^\[harness verify verdict/);
+    expect(prompt.startsWith(`${COMMAND_RULES_PREFIX}[harness verify verdict`)).toBe(true);
     for (const text of ['already had this exact sha when the harness tried to push it (upToDate)', 'Do NOT re-mark',
       'standalone heading `## Fix evidence`', `Head: ${SHA}`, '<!-- addresses-operator-send-back: <id> -->',
       'per open operator send-back you addressed', 'file:line citations', 'hand-back', 'completion report', 'fix-end']) {

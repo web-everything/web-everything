@@ -37,3 +37,14 @@ diff. The runner restores that member's pre-run bytes and reports it in the lead
 <!-- tests-first:requireExecutableAcceptance -->
 Require at least one [A<n>] Executable line per stated guarantee in Acceptance, each naming a command or test that fails before the build and passes after. Replace the scaffold TODO before stamping preparedDate. Include changed defaults, callers, and fail-closed paths among the guarantees.
 <!-- /tests-first -->
+
+<!-- Generated from scripts/lib/no-prompt-command-rules.mjs; whole-tree test pins this copy. -->
+<!-- no-prompt-command-rules:begin -->
+## No-prompt command rules
+
+- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.
+- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.
+- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting.
+- Never run destructive history or working-tree resets, forced pushes, or cleans.
+- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`.
+<!-- no-prompt-command-rules:end -->

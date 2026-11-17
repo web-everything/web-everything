@@ -964,3 +964,14 @@ Per #deterministic-core-thin-judgment (#2607) and its child #conveyor-orchestrat
   judgment-layer bridge spawns the matching agent (or, for an epic or a prepared decision, surfaces it — no
   agent). Starting/supervising the runner is itself part of this plane. The one judgment that stays human
   throughout: **ratifying** a presented decision (never autonomous).
+
+<!-- Generated from scripts/lib/no-prompt-command-rules.mjs; whole-tree test pins this copy. -->
+<!-- no-prompt-command-rules:begin -->
+## No-prompt command rules
+
+- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.
+- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.
+- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting.
+- Never run destructive history or working-tree resets, forced pushes, or cleans.
+- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`.
+<!-- no-prompt-command-rules:end -->

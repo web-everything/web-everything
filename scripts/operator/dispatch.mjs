@@ -1,3 +1,4 @@
+import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 /**
  * dispatch.mjs — the load-bearing primitives from `we:scripts/operator/converge.py`, ported to Node (#3383).
  *
@@ -112,7 +113,7 @@ export function unleaseLane({ lane, slug, repo = REPO, exec = spawnSync }) {
  * what was proven live, not something this port gets to improve on rewrite).
  */
 export function buildFixPrompt({ pr, branch, lanePath }) {
-  return `You are a FIX agent for pull request #${pr} in \`web-everything/web-everything\`. You did not review it; your
+  return renderNoPromptCommandRules(`You are a FIX agent for pull request #${pr} in \`web-everything/web-everything\`. You did not review it; your
 job is to address the review that bounced it, and nothing else.
 
 ## Your lane
@@ -204,12 +205,12 @@ better than one with none.
 - \`git push origin HEAD:${branch}\`
 
 Report: which findings you addressed, which you did not and why, and the commit sha.
-`;
+`);
 }
 
 /** CI_HEAL agent prompt — `converge.py`'s `CI_HEAL` template, ported verbatim. */
 export function buildCiHealPrompt({ pr, branch, lanePath }) {
-  return `You are healing a REAL CI FAILURE on pull request #${pr} in \`web-everything/web-everything\`. Its review
+  return renderNoPromptCommandRules(`You are healing a REAL CI FAILURE on pull request #${pr} in \`web-everything/web-everything\`. Its review
 already ACCEPTED this diff's content — do not re-review it, do not second-guess the accepted changes. Your
 job is narrow: make the failing CI check pass, and nothing else.
 
@@ -259,12 +260,12 @@ git push origin HEAD:${branch}
 \`\`\`
 
 Report the failing check's name, what was actually wrong, and the commit sha.
-`;
+`);
 }
 
 /** REVIEW agent prompt — `converge.py`'s `REVIEW` template, ported verbatim. */
 export function buildReviewPrompt({ pr, drvPath, jurorPath }) {
-  return `You are an INDEPENDENT reviewer for pull request #${pr} in \`web-everything/web-everything\`. You did not
+  return renderNoPromptCommandRules(`You are an INDEPENDENT reviewer for pull request #${pr} in \`web-everything/web-everything\`. You did not
 write it and you did not fix it — those were other sessions.
 
 Run the declared operation, not a procedure of your own. Read \`skills-src/review/SKILL.md\`, then:
@@ -361,7 +362,7 @@ round's blocking findings are addressed and what remains is prose, ACCEPT and li
 5. A CONFIRMED finding owes a prevention; say whether one is filed.
 
 Report the verdict and the run id.
-`;
+`);
 }
 
 /**

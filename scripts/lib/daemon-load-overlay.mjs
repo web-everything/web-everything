@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { renderNoPromptCommandRules } from './no-prompt-command-rules.mjs';
 /**
  * @file scripts/lib/daemon-load-overlay.mjs
  * @description #4044 Module E — the operator's own manual "load this early" CLI for a daemon clone. `--ref` now
@@ -456,14 +457,14 @@ const LAUNCH_HARNESS_FILE = join(dirname(fileURLToPath(import.meta.url)), 'dispa
 /** The smoke worker's task: three commands, the first of the kind the incident's workers were refused. */
 export function dispatchSmokePrompt({ tree, store, marker, nonce, slug, kind, pr }) {
   const q = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
-  return [
+  return renderNoPromptCommandRules([
     'Dispatch smoke for a daemon overlay load. This is not PR work: do not acquire a lane, do not edit or create any file yourself, open nothing.',
     'Run these three Bash commands exactly as written, one at a time, and report the first output line of each:',
     '1. gh api rate_limit --jq .resources.core.limit',
     `2. node -e "require('fs').writeFileSync(process.argv[1], process.argv[2])" ${q(marker)} ${q(nonce)}`,
     `3. OPERATION_COMPLETIONS_DIR=${q(store)} node ${q(join(tree, 'scripts', 'operations', 'completion-cli.mjs'))} report --session=${slug} --kind=${kind} --pr=${pr} --status=done --outcome=not-applicable`,
     'Then finish with outcome not-applicable.',
-  ].join('\n');
+  ].join('\n'));
 }
 
 /**

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 /**
  * @file scripts/conveyor/health-investigate-dispatch.mjs
  * @description #4078 (health daemon slice 2, ruling #4065 clause 2) — the IO SHELL that dispatches ONE
@@ -206,7 +207,7 @@ export async function dispatchInvestigation(target, {
   }, BRIEF_REQUIRED_BY_KIND[HEALTH_INVESTIGATE_KIND], []);
   const routing = route();
   const out = await sinks[DISPATCH_EFFECT]({
-    launchKind: HEALTH_INVESTIGATE_KIND, prompt, sessionSlug: session, lane: null, scope: [], routing,
+    launchKind: HEALTH_INVESTIGATE_KIND, prompt: renderNoPromptCommandRules(prompt), sessionSlug: session, lane: null, scope: [], routing,
     expectedWithinMinutes: Math.ceil(cfg.investigateWallClockMs / 60_000),
   });
   return { handle: out?.handle ?? null, session, unknownTokens, routing };
