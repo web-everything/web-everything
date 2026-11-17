@@ -1,7 +1,8 @@
 /** Optional resolver inputs. Launch composition and final policy checks belong to each resolver. */
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { cascadePolicy, resolveCascade, logCascadeSources, readPlatformPreferences } from './policy-cascade.mjs';
-import { readSettings, readDeclaredSettings } from './settings-files.mjs';
+import { readSettings, mergeSettingsLayers, SETTINGS_DIR, LEGACY_SETTINGS_PATH } from './settings-files.mjs';
 import { resolvePolicyModel, resolvePolicyEffort, resolveOperationRoute, operationEffort, defaultPolicyModel,
   DEFAULT_ROUTING_POLICY, validateRoutingPolicy } from './dispatch-routing-policy.mjs';
 import { resolveCodexTaskRoute } from './codex-task-route.mjs';
@@ -264,6 +265,37 @@ function launchPolicyEntries({ operation, taskType, policy, size, designQuestion
   return [initial, entry, effective].filter(Boolean);
 }
 
+// Read and validate one snapshot of every contributor before the shared settings merger sees it.
+// settingsFiles uses the declared reader's dir/legacyPath seams for hermetic file fixtures.
+function readLaunchToolSettings(settingsFiles = {}, valid, refuse) {
+  const { dir = SETTINGS_DIR, legacyPath = LEGACY_SETTINGS_PATH } = settingsFiles;
+  const layers = [];
+  const load = (source, path, optional = false) => {
+    let raw;
+    try { raw = readFileSync(path, 'utf8'); }
+    catch (error) {
+      if (optional && error.code === 'ENOENT') return;
+      refuse('settings-read', `${source}: ${error.message}`);
+    }
+    let data;
+    try { data = JSON.parse(raw); }
+    catch (error) { refuse('settings-read', `${source}: ${error.message}`); }
+    if (!object(data)) refuse('settings-read', `${source}: expected a settings object`);
+    if (Object.hasOwn(data, 'aiRouting')) {
+      scanLaunchLayer(data.aiRouting, 'tool', valid, (code, detail) => refuse(code, `${source}: ${detail}`));
+    }
+    layers.push({ source, data });
+  };
+  if (legacyPath) load('dispatch-settings.json', legacyPath, !Object.hasOwn(settingsFiles, 'legacyPath'));
+  let names;
+  try { names = readdirSync(dir).filter(name => name.endsWith('.json')).sort(); }
+  catch (error) { refuse('settings-read', `settings directory: ${error.message}`); }
+  for (const name of names) load(`settings/${name}`, join(dir, name));
+  const merged = mergeSettingsLayers(layers);
+  if (merged.duplicates.length) refuse('settings-read', 'declared settings are ambiguous');
+  return merged.settings.aiRouting;
+}
+
 function checkLaunchFloor(base, route, rule, refuse) {
   const beforeEffort = AI_ROUTING_EFFORT_RANKS[base.effort];
   const afterEffort = AI_ROUTING_EFFORT_RANKS[route.effort];
@@ -318,9 +350,7 @@ export function resolveLaunchSpec(role, siteKey, ctx) {
     }
     let tool = ctx.tool;
     if (!Object.hasOwn(ctx, 'tool')) {
-      const loaded = readDeclaredSettings();
-      if (loaded.errors.length || loaded.duplicates.length) refuse('settings-read', 'declared settings are unreadable or ambiguous');
-      tool = loaded.settings.aiRouting;
+      tool = readLaunchToolSettings(ctx.settingsFiles, valid, refuse);
     }
     let envBlock;
     if (ctx.env.WE_AI_ROUTING !== undefined) {
@@ -366,12 +396,21 @@ export function resolveLaunchSpec(role, siteKey, ctx) {
     }
     const route = resolveOperationRoute({ ...options, policy: effectivePolicy, aiRouting: overlay });
     if (!route) refuse('route', 'no concrete launch route');
+    const countingRequired = route.mode === 'shadow' || baseline.mode === 'shadow'
+      || entries.some(entry => entry.mode === 'shadow');
+    const countingPrimary = route.provider === 'claude' && route.mode !== 'shadow';
+    const countingFallback = route.fallback.some(candidate => candidate.provider === 'claude'
+      && (!options.available || options.available.includes('claude')));
+    if (site.kind === 'review' && countingRequired && !countingPrimary && !countingFallback) {
+      refuse('counting-reviewer', 'shadow review requires an available counting Claude reviewer');
+    }
     // Policy effort vocabulary alone does not check model-specific Codex capabilities.
     for (const candidate of [route, ...route.fallback]) checkCombination(candidate);
     const changed = ['provider', 'model', 'effort'].some(field => route[field] !== baseline[field]);
     const readsRepo = site.readsRepo || ctx.readsRepo === true;
-    if (changed && ((readsRepo || ['red-team-recheck', 'ci-heal', 'helper'].includes(role)) && route.provider !== 'claude')) {
-      refuse('provider', 'this seat can only change to native Claude');
+    const claudeOnly = ['red-team-recheck', 'ci-heal', 'helper'].includes(role);
+    if ((claudeOnly || (changed && readsRepo)) && route.provider !== 'claude') {
+      refuse('provider', 'this seat requires native Claude');
     }
     checkLaunchFloor(baseline, route, AI_ROUTING_FLOORS[role], refuse);
     return freeze({ provider: route.provider, model: route.model, effort: route.effort, env: structuredClone(ctx.env),

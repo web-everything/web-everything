@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { join } from 'node:path';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { AiRoutingRefusal, AI_ROUTING_ROLES, AI_ROUTING_MODEL_RANKS, AI_ROUTING_EFFORT_RANKS,
   resolveLaunchSpec } from '../ai-routing.mjs';
 import { DEFAULT_ROUTING_POLICY, resolveOperationRoute, resolvePolicyModel, operationEffort } from '../dispatch-routing-policy.mjs';
@@ -30,6 +32,19 @@ const refusal = (run, code) => {
   expect(error).toMatchObject({ name: 'AiRoutingRefusal', role: expect.any(String), siteKey: expect.any(String),
     detail: expect.any(String), ...(code ? { code } : {}) });
   expect(error.message).toContain('operator');
+  return error;
+};
+
+const withToolFiles = (legacy, files, run) => {
+  const root = mkdtempSync(join(tmpdir(), 'ai-routing-sources-'));
+  try {
+    const dir = join(root, 'settings');
+    mkdirSync(dir);
+    const legacyPath = legacy === undefined ? null : join(root, 'legacy.json');
+    if (legacyPath) writeFileSync(legacyPath, JSON.stringify(legacy));
+    files.forEach((data, index) => writeFileSync(join(dir, `${index}.json`), JSON.stringify(data)));
+    return run({ dir, legacyPath });
+  } finally { rmSync(root, { recursive: true, force: true }); }
 };
 
 describe('resolveLaunchSpec registry and parity', () => {
@@ -233,6 +248,61 @@ describe('final policy validation and immutable launch contract', () => {
 });
 
 describe('launch policy audit regressions', () => {
+  it.each(['mandatory:correctness', 'mandatory:security'])('refuses %s shadow review when Claude quota removes its counting fallback', taskType => {
+    const ctx = context('review', { policy: DEFAULT_ROUTING_POLICY, taskType, availability: { claude: 'quota held' } });
+    expect(resolveOperationRoute({ ...ctx, operation: 'review-seat' })).toMatchObject({ mode: 'shadow', fallback: [] });
+    refusal(() => resolveLaunchSpec('review', 'review', ctx), 'counting-reviewer');
+    const spec = launch('review', { ...ctx, availability: {} });
+    expect(spec).toMatchObject({ mode: 'shadow', fallback: [expect.objectContaining({ provider: 'claude' })] });
+  });
+
+  it('refuses shadow review when its counting fallback is outside the launch provider roster', () => {
+    refusal(() => launch('review', { policy: DEFAULT_ROUTING_POLICY, available: ['agy-claude'] }), 'counting-reviewer');
+  });
+
+  it.each(['red-team-recheck', 'ci-heal', 'helper'])('%s refuses an unchanged non-Claude baseline', role => {
+    const ctx = context(role, { policy: policyFor(role, 'codex', 'sol', 'high') });
+    expect(resolveOperationRoute({ ...ctx, operation: operationFor(role) })).toMatchObject({ provider: 'codex' });
+    refusal(() => resolveLaunchSpec(role, role, ctx), 'provider');
+    expect(launch(role).provider).toBe('claude');
+  });
+
+  const invalidContributors = [null, {}, [], { helper: null }, { helper: {} },
+    { helper: { coordinator: {} } }, { helper: { coordinator: { effort: 42 } } }, { unknown: true }];
+  for (const source of ['legacy', 'file']) {
+    it.each(invalidContributors.map(value => [JSON.stringify(value), value]))(`${source} raw contributor %s refuses before a later valid helper can mask it`, (_label, bad) => {
+      const valid = { aiRouting: setting('helper', { effort: 'high' }) };
+      withToolFiles(source === 'legacy' ? { aiRouting: bad } : undefined,
+        source === 'legacy' ? [valid] : [{ aiRouting: bad }, valid], settingsFiles => {
+          const ctx = context('helper', { settingsFiles });
+          delete ctx.tool;
+          const error = refusal(() => resolveLaunchSpec('helper', 'helper', ctx), 'invalid-setting');
+          expect(error.detail).toContain(source === 'legacy' ? 'dispatch-settings.json' : 'settings/0.json');
+        });
+    });
+  }
+
+  it('merges valid tool contributors only after scanning their individual raw blocks', () => {
+    withToolFiles({ aiRouting: setting('helper', { effort: 'high' }) },
+      [{ aiRouting: setting('helper', { provider: 'claude', model: 'sonnet' }) }], settingsFiles => {
+        const ctx = context('helper', { settingsFiles });
+        delete ctx.tool;
+        expect(resolveLaunchSpec('helper', 'helper', ctx)).toMatchObject({ provider: 'claude', model: 'claude-sonnet-5-5', effort: 'high' });
+      });
+  });
+
+  it('refuses a raw platform file before valid tool and environment layers can mask it', () => {
+    withToolFiles(undefined, [{ aiRouting: { helper: null } }], ({ dir }) => {
+      const good = setting('helper', { effort: 'high' });
+      const ctx = context('helper', { tool: good, env: {
+        WE_PLATFORM_PREFERENCES_FILE: join(dir, '0.json'), WE_AI_ROUTING: JSON.stringify(good),
+      } });
+      delete ctx.platform;
+      const error = refusal(() => resolveLaunchSpec('helper', 'helper', ctx), 'settings-read');
+      expect(error.detail).toContain('platform.helper');
+    });
+  });
+
   it('carries validated shadow mode and the counting Claude fallback into launch and floor evidence', () => {
     const ctx = context('review', { policy: DEFAULT_ROUTING_POLICY });
     const expected = resolveOperationRoute({ ...ctx, operation: 'review-seat' });
