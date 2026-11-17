@@ -2,7 +2,7 @@ import { afterAll, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
+import { NO_PROMPT_SESSION_KINDS, renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 import { applyContextPack, briefWithContextPack } from '../conveyor/fix-context-pack.mjs';
 import { readFixBriefTemplate } from '../conveyor/reconcile-fix-dispatch.mjs';
 import { readCiHealBriefTemplate } from '../operations/ci-heal-pr-dispatch.mjs';
@@ -16,8 +16,8 @@ const EMPTY = ['', ' ', '\t', '\n', '\r', '\r\n', ' \t\r\n'];
 const settings = { contextPack: true, contextMaxBytes: 10000, contextLines: 20, localTests: 'proof-only' };
 
 describe('task content is checked before generic instructions can mask it', () => {
-  it.each(EMPTY)('shared renderer refuses empty or whitespace-only task %j', task => {
-    expect(() => renderNoPromptCommandRules(task, 'fix')).toThrow(/empty task content/);
+  it.each(NO_PROMPT_SESSION_KINDS.flatMap(kind => EMPTY.map(task => [kind, task])))('shared %s renderer refuses empty or whitespace-only task %j', (kind, task) => {
+    expect(() => renderNoPromptCommandRules(task, kind)).toThrow(/empty task content/);
   });
 
   it.each(EMPTY)('applyContextPack refuses %j before tests instructions or evidence', task => {

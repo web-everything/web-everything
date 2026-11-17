@@ -603,6 +603,15 @@ export function attemptTagFor(priorAttempts) {
   return String.fromCharCode(97 + Math.min(Math.trunc(n), 25));
 }
 
+/** Validate raw task text before policy or operator instructions can mask an empty template. */
+export function assertBriefTemplateContent(template) {
+  const text = String(template ?? '');
+  if (!text.trim()) {
+    throw new Error('dispatch-lane: the delivery-agent brief template is empty — refusing to dispatch an agent with no instructions');
+  }
+  return text;
+}
+
 /**
  * FILL an agent brief. PURE.
  *
@@ -670,10 +679,7 @@ export function fillBrief(
   optionalNames = OPTIONAL_BRIEF_PLACEHOLDERS,
   valuePatterns = {},
 ) {
-  const text = String(template ?? '');
-  if (!text.trim()) {
-    throw new Error('dispatch-lane: the delivery-agent brief template is empty — refusing to dispatch an agent with no instructions');
-  }
+  const text = assertBriefTemplateContent(template);
   for (const name of requiredNames) {
     const value = values[name];
     const blank = value === undefined || value === null || String(value).trim() === '';

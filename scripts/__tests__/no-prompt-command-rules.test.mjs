@@ -5,7 +5,7 @@ import { NO_PROMPT_COMMAND_RULES } from '../lib/no-prompt-command-rules.mjs';
 import { readCiHealBriefTemplate } from '../operations/ci-heal-pr-dispatch.mjs';
 import { readFixBriefTemplate } from '../conveyor/reconcile-fix-dispatch.mjs';
 import { buildMandate, buildPlanCritiqueMandate } from '../lib/review-core.mjs';
-import { buildRedTeamTask } from '../operations/review-extra-seats.mjs';
+import { buildRedTeamTask, buildRecheckRequest } from '../operations/review-extra-seats.mjs';
 import { NO_PROMPT_SESSION_KINDS, renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -41,6 +41,11 @@ describe('no-prompt command rules scope', () => {
     for (const read of [readFixBriefTemplate, readCiHealBriefTemplate]) {
       expectBlock(renderNoPromptCommandRules(read(ROOT, template => `Packed context\n${template}`), read === readFixBriefTemplate ? 'fix' : 'ci-heal'));
     }
+  });
+  it.each(['', ' ', '\r\n', ' \t\r\n'])('review and red-team builders retain their owned task instructions with blank optional data %j', data => {
+    expectBlock(buildMandate({ goal: data }));
+    expectBlock(buildRedTeamTask({ repo: 'fixture/repo', pr: 7, title: data, inline: { body: data, diffText: data } }));
+    expectBlock(buildRecheckRequest({ repo: 'fixture/repo', pr: 7, title: data, diffText: data, findings: [] }).mandate);
   });
   it('injects into review-job and red-team prompts', () => {
     expectBlock(buildMandate());
