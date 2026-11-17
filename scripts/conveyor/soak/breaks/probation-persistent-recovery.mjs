@@ -1,12 +1,12 @@
 /** PR #6882: persistent recovery refusals skip ticks without a restart loop. */
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { withSelfSync } from '../../../lib/daemon-self-sync.mjs';
 import { applyPendingRollback, checkProbationAtTick } from '../../../lib/daemon-rebuild/probation.mjs';
 import { acquireRead, inspectCloneLock } from '../../../lib/daemon-clone-lock.mjs';
 import { cloneKeyOf } from '../../../lib/daemon-last-good.mjs';
-import { alertsFilePath, writeRebuildState } from '../../../lib/daemon-rebuild/state.mjs';
+import { alertsFilePath, readRebuildState, writeRebuildState } from '../../../lib/daemon-rebuild/state.mjs';
 
 export default {
   id: 'probation-persistent-recovery',
@@ -38,8 +38,28 @@ export default {
       write(marker, record);
       write(proven, { head: good, inputsKey: 'good', mainSha: good, applied: [], provenAt: new Date(at - 1000).toISOString() });
       writeRebuildState(root, { adopted: { head: failed }, forceUnverifiedTrees: [good] }, env);
-      const run = args => ({ status: 0, stdout: args.at(-1) === `${good}^{tree}` ? good : head });
-      let head = failed, ticks = 0, restarts = 0;
+      let head = failed, ticks = 0, restarts = 0, resets = 0;
+      // Model a clean checkout and its HEAD transitions without writing .git.
+      // A catch-all success would invent MERGE_HEAD and dirty status output,
+      // preventing the real finalizer from ever reaching the recovery reset.
+      const run = args => {
+        if (args[0] === 'rev-parse') {
+          const rev = args.at(-1);
+          if (rev === 'HEAD') return { status: 0, stdout: head };
+          if (rev === `${good}^{tree}`) return { status: 0, stdout: good };
+          if (rev === 'MERGE_HEAD') return { status: 1, stdout: '' };
+        }
+        if (args[0] === 'reset' && args[1] === '--hard' && args[2] === good && args.length === 3) {
+          if (readRebuildState(root, env).rejected?.inputsKey !== record.rejectInputsKey) {
+            violations.push('reset preceded durable failed-input rejection');
+          }
+          resets++;
+          head = good;
+          return { status: 0, stdout: '' };
+        }
+        if (['ls-files', 'status', 'cat-file', 'rev-list'].includes(args[0])) return { status: 0, stdout: '' };
+        throw new Error(`Unexpected Git operation: ${args.join(' ')}`);
+      };
       for (const boot of ['stale', 'fresh', 'failed-head']) {
         if (boot === 'failed-head') {
           head = failed;
@@ -66,6 +86,7 @@ export default {
         }
       }
       if (ticks !== 0 || restarts !== 1) violations.push(`persistent failure: ticks=${ticks}, restarts=${restarts}`);
+      if (resets !== 0) violations.push('refused recovery reset the checkout');
       log?.(`three boots, two polls each: ticks=${ticks}, restarts=${restarts}`);
 
       // First adoption has no provenGood; repeated tick checks must stay bounded.
@@ -75,7 +96,7 @@ export default {
         adoptedAt: new Date(at).toISOString(), bootedAt: new Date(at).toISOString(), bootPid: process.pid,
         probationMs: 1000, baseline: {}, boots: 1, version: 1 });
       let events = 0;
-      for (let poll = 0; poll < 4; poll++) await checkProbationAtTick({ root, env, run: () => ({ status: 0, stdout: failed }),
+      for (let poll = 0; poll < 4; poll++) await checkProbationAtTick({ root, env, run,
         bootSha: failed, bootAt: at, now: () => at + 1001, log: { error() {} }, emit(event) {
           if (event.kind === 'probation-needs-you') events++;
         } });
@@ -97,6 +118,12 @@ export default {
       const result = await applyPendingRollback({ root, env, run, bootHead: good, now: () => at,
         lockWaitMs: 0, log: { error() {} }, emit() {} });
       if (!result.ok || inspectCloneLock(root, lease).readers.length) violations.push(`dead local reader blocked recovery: ${result.reason}`);
+      if (resets !== 1 || head !== good || result.head !== good) violations.push('dead-reader recovery did not reset exactly once to proven good');
+      if (existsSync(marker) || existsSync(probation)) violations.push('successful recovery retained pending evidence');
+      const recovered = readRebuildState(root, env);
+      if (recovered.adopted?.head !== good || recovered.rejected?.inputsKey !== record.rejectInputsKey) {
+        violations.push('successful recovery lost adopted head or failed-input rejection');
+      }
       log?.(`dead local reader: recovery=${result.ok === true}`);
     } catch (error) { violations.push(error.message); }
     finally { rmSync(base, { recursive: true, force: true }); }
