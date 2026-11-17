@@ -71,7 +71,7 @@ export async function dryRunRebuild({
         const objectDbStarted = now();
         let objectDbLogged = false;
         const logObjectDb = () => {
-          if (!objectDbLogged) log.info?.(`daemon-rebuild: dry-run step=object-db ms=${Math.max(0, now() - objectDbStarted)}`);
+          if (!objectDbLogged) log.error?.(`daemon-rebuild: dry-run step=object-db ms=${Math.max(0, now() - objectDbStarted)}`);
           objectDbLogged = true;
         };
         try {
@@ -112,7 +112,7 @@ export async function dryRunRebuild({
                   edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
                 });
               } finally {
-                log.info?.(`daemon-rebuild: dry-run step=overlay-merge ms=${Math.max(0, now() - overlayStarted)}`);
+                log.error?.(`daemon-rebuild: dry-run step=overlay-merge ms=${Math.max(0, now() - overlayStarted)}`);
               }
 
               // Same untracked-collision check `doRebuild` runs before its real `reset --hard` (see

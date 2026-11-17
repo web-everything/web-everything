@@ -1,0 +1,117 @@
+/** Run the real CLI and preview source with hermetic ESM dependencies; no git, network or disk writes. */
+import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const PROBE = `
+import { readFileSync } from 'node:fs';
+import { SourceTextModule, SyntheticModule, createContext } from 'node:vm';
+import * as path from 'node:path';
+import * as url from 'node:url';
+const { cli, preview, cliUrl, json } = JSON.parse(readFileSync(0, 'utf8'));
+let finish;
+const done = new Promise(resolve => { finish = resolve; });
+const cliProcess = {
+  argv: [process.execPath, url.fileURLToPath(cliUrl), '--clone=/fixture/clone', '--dry-run', ...(json ? ['--json'] : [])],
+  env: {},
+  stdout: { write(s) { process.stdout.write(s); finish(); } },
+  stderr: { write(s) { process.stderr.write(s); finish(); } },
+};
+const context = createContext({ console, process: cliProcess });
+const sha = 'a'.repeat(40);
+let acquired = false;
+let released = false;
+let fetched = false;
+let planned = false;
+const held = () => { if (!acquired || released) throw new Error('preview ran without its smoke slot'); };
+const git = args => { held(); return { status: 0, stdout: args[0] === 'symbolic-ref' ? 'main' : sha }; };
+const mocks = {
+  '../main-staleness.mjs': { gitRun: git },
+  './shared.mjs': { makeGit: () => git, verifyRev: () => { held(); return sha; }, FULL_SHA_RE: /^[a-f0-9]{40}$/, OVERLAY_EDGE_RESOLVE_ENV: 'EDGE' },
+  './local-state.mjs': { findUnsafeLocalState: () => ({ safe: true, untracked: [] }), knownInputsOf: () => ({}) },
+  '../daemon-overlays.mjs': { overlayFilePath: () => '/fixture/overlays.json', readOverlayState: () => ({ overlays: [], corrupt: false }) },
+  './state.mjs': { readRebuildState: () => ({}) },
+  'node:fs': { mkdtempSync: () => '/fixture/scratch', mkdirSync() {}, writeFileSync() {}, rmSync() {} },
+  'node:path': path,
+  'node:os': { tmpdir: () => '/fixture' },
+  'node:child_process': { spawnSync: () => { held(); return { status: 0 }; } },
+  './edge-fetch.mjs': { fetchMainAndOverlays: () => { held(); fetched = true; }, defaultPrState() {} },
+  './plan.mjs': { planRebuild: async () => { held(); planned = true; return { ok: true, finalSha: sha }; } },
+  './audited-tip.mjs': { makeAuditedTipGate() {} },
+  '../daemon-self-sync.mjs': { isSafeBranchName: () => true },
+  '../daemon-smoke-slots.mjs': { acquireSmokeSlot: async () => { acquired = true; return { acquired: true, release() { released = true; } }; } },
+  './overlay-strategies.mjs': { resolveOverlayConflict() {} },
+};
+const synthetic = values => new SyntheticModule(Object.keys(values), function() {
+  for (const [key, value] of Object.entries(values)) this.setExport(key, value);
+}, { context });
+const previewModule = new SourceTextModule(preview, { context });
+await previewModule.link(specifier => {
+  if (!Object.hasOwn(mocks, specifier)) throw new Error('unmocked preview dependency: ' + specifier);
+  return synthetic(mocks[specifier]);
+});
+await previewModule.evaluate();
+const facade = synthetic({ dryRunRebuild: previewModule.namespace.dryRunRebuild, rebuildClone() { throw new Error('unexpected real rebuild'); } });
+const cliModule = new SourceTextModule(cli, { context, initializeImportMeta(meta) { meta.url = cliUrl; } });
+await cliModule.link(specifier => {
+  if (specifier === './daemon-rebuild/index.mjs') return facade;
+  if (specifier === './daemon-clone-lock.mjs') return synthetic({ writeRebuildRequest() { throw new Error('unexpected write'); } });
+  if (specifier === 'node:path') return synthetic(path);
+  if (specifier === 'node:url') return synthetic(url);
+  throw new Error('unmocked CLI dependency: ' + specifier);
+});
+await cliModule.evaluate();
+await done;
+if (cliProcess.exitCode || !fetched || !planned || !released) throw new Error('CLI preview did not finish successfully');
+`;
+
+export function probeDryRunCli({ json = true } = {}) {
+  const cliUrl = new URL('../../../lib/daemon-rebuild.mjs', import.meta.url);
+  return spawnSync(process.execPath, ['--no-warnings', '--experimental-vm-modules', '--input-type=module', '-e', PROBE], {
+    input: JSON.stringify({
+      cli: readFileSync(cliUrl, 'utf8'),
+      preview: readFileSync(new URL('../../../lib/daemon-rebuild/preview.mjs', import.meta.url), 'utf8'),
+      cliUrl: cliUrl.href, json,
+    }),
+    encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024,
+  });
+}
+
+export default {
+  id: 'rebuild-dry-run-json-timing',
+  title: 'dry-run CLI emits one JSON document on stdout and phase timings on stderr',
+  card: 'x1b8hlo',
+  fixedBy: { sha: 'pending', where: 'lane/r1-rebuild-herd', paths: ['scripts/lib/daemon-rebuild/preview.mjs'] },
+  fixPresent(root) {
+    const source = readFileSync(join(root, 'scripts/lib/daemon-rebuild/preview.mjs'), 'utf8');
+    return source.includes('log.error?.(`daemon-rebuild: dry-run step=object-db ms=')
+      && source.includes('log.error?.(`daemon-rebuild: dry-run step=overlay-merge ms=');
+  },
+  async run() {
+    const violations = [];
+    for (const json of [true, false]) {
+      const result = probeDryRunCli({ json });
+      if (result.error || result.status !== 0) {
+        violations.push(`CLI failed: ${result.error?.message ?? result.stderr}`);
+        continue;
+      }
+      if (json) {
+        try {
+          const value = JSON.parse(result.stdout);
+          if (value.dryRun !== true || value.plan?.ok !== true || value.wouldDo !== 'nothing') {
+            violations.push('JSON result did not describe the successful preview');
+          }
+        } catch (error) { violations.push('JSON.parse(stdout) failed: ' + error.message); }
+      } else if (!/^daemon-rebuild --dry-run: [^\n]+\n$/.test(result.stdout)) {
+        violations.push('text stdout contained diagnostics or lacked its summary');
+      }
+      for (const step of ['object-db', 'overlay-merge']) {
+        if (!new RegExp('daemon-rebuild: dry-run step=' + step + ' ms=\\d+').test(result.stderr)) {
+          violations.push('missing stderr timing: ' + step);
+        }
+      }
+    }
+    return { violations };
+  },
+  judge: report => report.violations,
+};

@@ -7,6 +7,7 @@ import { dryRunRebuild } from '../preview.mjs';
 import { planRebuild } from '../plan.mjs';
 import { fetchMainAndOverlays } from '../edge-fetch.mjs';
 import { acquireSmokeSlot } from '../../daemon-smoke-slots.mjs';
+import cliTimingBreak from '../../../conveyor/soak/breaks/rebuild-dry-run-json-timing.mjs';
 
 vi.mock('../plan.mjs', () => ({ planRebuild: vi.fn() }));
 vi.mock('../edge-fetch.mjs', () => ({ fetchMainAndOverlays: vi.fn(), defaultPrState: vi.fn() }));
@@ -157,7 +158,7 @@ it('logs object-db elapsed time and releases capacity when object setup throws',
   await expect(dryRunRebuild({ ...options, now: () => 10,
     acquireSlot: async () => ({ acquired: true, release }),
   })).rejects.toThrow('object DB failed');
-  expect(log.info).toHaveBeenCalledWith('daemon-rebuild: dry-run step=object-db ms=0');
+  expect(log.error).toHaveBeenCalledWith('daemon-rebuild: dry-run step=object-db ms=0');
   expect(planRebuild).not.toHaveBeenCalled();
   expect(release).toHaveBeenCalledTimes(1);
 });
@@ -169,8 +170,8 @@ it('emits separate object-db and overlay-merge elapsed milliseconds with the inj
   await dryRunRebuild({ ...options, now: () => time,
     acquireSlot: async () => ({ acquired: true, release() {} }),
   });
-  expect(log.info).toHaveBeenCalledWith('daemon-rebuild: dry-run step=object-db ms=37');
-  expect(log.info).toHaveBeenCalledWith('daemon-rebuild: dry-run step=overlay-merge ms=59');
+  expect(log.error).toHaveBeenCalledWith('daemon-rebuild: dry-run step=object-db ms=37');
+  expect(log.error).toHaveBeenCalledWith('daemon-rebuild: dry-run step=overlay-merge ms=59');
 });
 
 it('logs overlay timing even when the merge throws', async () => {
@@ -178,12 +179,40 @@ it('logs overlay timing even when the merge throws', async () => {
   await expect(dryRunRebuild({ ...options, now: () => 10,
     acquireSlot: async () => ({ acquired: true, release() {} }),
   })).rejects.toThrow('merge failed');
-  expect(log.info).toHaveBeenCalledWith('daemon-rebuild: dry-run step=overlay-merge ms=0');
+  expect(log.error).toHaveBeenCalledWith('daemon-rebuild: dry-run step=overlay-merge ms=0');
 });
+
+it.each(['none', 'object-db', 'overlay-merge'])(
+  'default logger sends timing diagnostics only to stderr (failure=%s)', async failure => {
+    const stdout = vi.spyOn(console, 'info').mockImplementation(() => {});
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      if (failure === 'object-db') fetchMainAndOverlays.mockImplementation(() => { throw new Error('setup failed'); });
+      if (failure === 'overlay-merge') planRebuild.mockRejectedValue(new Error('merge failed'));
+      const result = dryRunRebuild({ ...options, log: undefined,
+        acquireSlot: async () => ({ acquired: true, release() {} }),
+      });
+      if (failure === 'none') expect((await result).plan.ok).toBe(true);
+      else await expect(result).rejects.toThrow(failure === 'object-db' ? 'setup failed' : 'merge failed');
+      expect(stdout).not.toHaveBeenCalled();
+      expect(stderr).toHaveBeenCalledWith(expect.stringMatching(/^daemon-rebuild: dry-run step=object-db ms=\d+$/));
+      if (failure !== 'object-db') {
+        expect(stderr).toHaveBeenCalledWith(expect.stringMatching(/^daemon-rebuild: dry-run step=overlay-merge ms=\d+$/));
+      }
+    } finally {
+      stdout.mockRestore();
+      stderr.mockRestore();
+    }
+  },
+);
 
 it('fails closed without planning when the slot is not acquired', async () => {
   const acquireSlot = vi.fn(async () => ({ acquired: false, release: vi.fn() }));
   const result = await dryRunRebuild({ ...options, acquireSlot });
   expect(result.plan).toEqual({ ok: false, reason: 'smoke-queue-timeout' });
   expect(planRebuild).not.toHaveBeenCalled();
+});
+
+it('CLI default logger preserves JSON and text stdout while emitting timings on stderr', async () => {
+  expect(cliTimingBreak.judge(await cliTimingBreak.run())).toEqual([]);
 });
