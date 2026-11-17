@@ -199,7 +199,7 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
    Do not release either resource or end the turn until verification is confirmed terminal;
    if observation cannot recover, escalate for supervised termination before cleanup. Open a PR only after green;
    never end the turn while a task is running.
-   6a. **Codex audit.** After verify is green and before open-pr, commit, then run the repo's Codex audit on the net diff:
+${repo !== 'plateau-app' ? '   The related-tests gate (`--gate=related` through verify-lane) must be green on the exact commit BEFORE the audit runs, because any later code change invalidates the audit record and its waiver binding.\n' : ''}   6a. **Codex audit.** After verify is green and before open-pr, commit, then run the repo's Codex audit on the net diff:
    \`node ${shellQuoteWord(CODEX_AUDIT_CLI)} --base=origin/main --head=<40-hex sha of your lane HEAD>\`, run with the lane as the working directory.
    Open the PR only on the verdict NOT WEAKENED. On WEAKENED: fix the findings, re-test, and re-audit, at most 2 repair rounds.
    If it is still WEAKENED after those 2 rounds, stop: do NOT open a PR; report the remaining findings. Include the verdict in your report.

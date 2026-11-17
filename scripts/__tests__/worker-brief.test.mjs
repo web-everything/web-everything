@@ -246,6 +246,18 @@ describe('renderWorkerBrief', () => {
     expect(brief.slice(brief.indexOf('6. **One PR.**'), brief.indexOf('7. **Pre-push'))).toContain('verify ONCE at the end');
   });
 
+  it('requires the related-tests gate exactly once before the WE Codex audit', () => {
+    const brief = renderWorkerBrief({ ...params, repo: 'we' });
+    expect(brief.indexOf('related-tests gate')).toBeGreaterThan(-1);
+    expect(brief.indexOf('related-tests gate')).toBeLessThan(brief.indexOf('Codex audit'));
+    expect(brief.split('related-tests gate')).toHaveLength(2);
+    expect(brief).toContain('The related-tests gate (`--gate=related` through verify-lane) must be green on the exact commit BEFORE the audit runs, because any later code change invalidates the audit record and its waiver binding.');
+  });
+
+  it('omits the WE related-tests gate requirement from the plateau-app brief', () => {
+    expect(renderWorkerBrief({ ...params, repo: 'plateau-app' })).not.toContain('related-tests gate');
+  });
+
   it('puts a Codex audit requiring NOT WEAKENED between verify and open-pr (6a)', () => {
     const brief = renderWorkerBrief(params);
     const step = brief.slice(brief.indexOf('6. **One PR.**'), brief.indexOf('7. **Pre-push'));
