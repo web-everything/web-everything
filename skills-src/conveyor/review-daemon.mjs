@@ -933,7 +933,7 @@ export function sharedHostBudget(hostAdmission) {
     if (!verdict) {
       try { verdict = hostAdmission() ?? { admitted: false, reason: 'host admission returned nothing' }; }
       catch (e) { verdict = { admitted: false, reason: `host admission unknown: ${String(e?.message ?? e).split('\n')[0]}` }; }
-      left = verdict.admitted ? (Number.isFinite(verdict.maxPerTick) && verdict.maxPerTick >= 1 ? verdict.maxPerTick : Infinity) : 0;
+      left = verdict.admitted ? (Number.isFinite(verdict.maxPerTick) && verdict.maxPerTick >= 0 ? verdict.maxPerTick : Infinity) : 0;
     }
     return { ...verdict, startBudget: verdict.maxPerTick, maxPerTick: left, take: (n) => { left = Math.max(0, left - n); } };
   };

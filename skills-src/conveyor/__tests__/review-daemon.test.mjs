@@ -992,6 +992,12 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     expect(check).toHaveBeenCalledTimes(1);
   });
 
+  it.each([[0, 0], [0.5, 0.5], [2, 2], [Infinity, Infinity], [-Infinity, Infinity], [NaN, Infinity], [-1, Infinity], [undefined, Infinity]])('shared host budget normalizes maxPerTick=%s to %s', async (maxPerTick, expected) => {
+    const { sharedHostBudget } = await import('../review-daemon.mjs');
+    const hostAdmission = sharedHostBudget(() => ({ admitted: true, maxPerTick }));
+    expect(hostAdmission().maxPerTick).toBe(expected);
+  });
+
   it('host admission (verify-admission): runReviewTickAllRepos wraps one check into a host-wide budget across every repo', () => {
     const check = vi.fn(() => ({ admitted: true, reason: 'ok', maxPerTick: 2 }));
     const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
@@ -1500,6 +1506,24 @@ describe('review dispatch waiting history', () => {
     ]);
     expect(out.deferredForHost).toBe(1);
     expect(out.deferredForLanes).toBe(0);
+  });
+
+  it('holds an admitted zero shared budget across repos with the start-budget message', async () => {
+    const { sharedHostBudget } = await import('../review-daemon.mjs');
+    const check = vi.fn(() => ({ admitted: true, maxPerTick: 0, reason: 'host ok' }));
+    const hostAdmission = sharedHostBudget(check);
+    const dispatch = vi.fn();
+    for (const repo of ['waiting/repo', 'other/repo']) {
+      const out = tick(state(), [1], { repo, hostAdmission, dispatch });
+      expect(out.pendingNotDispatched[0].reasons).toEqual([
+        'review owed, held by the per-tick review start budget (0 of 0 used this tick; host admitted: host ok)',
+      ]);
+      expect(out.deferredForHost).toBe(1);
+      expect(out.failed).toEqual([]);
+    }
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(hostAdmission()).toMatchObject({ maxPerTick: 0, startBudget: 0 });
+    expect(check).toHaveBeenCalledTimes(1);
   });
 
   it('records a dead same-head job as no-verdict once, retries immediately, and retains its owed age', () => {
