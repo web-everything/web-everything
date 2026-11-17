@@ -1005,11 +1005,12 @@ const ttlMsFromFlags = () => ttlMinutesFromFlags() * 60_000;
 // long enough not to hammer the filesystem on a genuinely-exhausted pool for the whole wait window.
 const ACQUIRE_POLL_MS = 1000;
 const ACQUIRE_DEFAULT_WAIT_MS = 8000;
-// Only nonnegative safe whole milliseconds are accepted; malformed or oversized settings use 8000ms.
+// Only nonnegative safe whole milliseconds are accepted; invalid settings use 8000ms.
+// Valid settings above one minute clamp to 60000ms.
 const acquireDefaultWaitRaw = process.env.LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS;
 const acquireDefaultWaitMs = /^\d+$/.test(acquireDefaultWaitRaw ?? '')
   && Number.isSafeInteger(Number(acquireDefaultWaitRaw))
-  ? Number(acquireDefaultWaitRaw)
+  ? Math.min(60_000, Number(acquireDefaultWaitRaw))
   : ACQUIRE_DEFAULT_WAIT_MS;
 // A lane holds a LIVE lease when a marker exists and hasn't outlived its TTL (owner presumed alive).
 function liveLease(dir, nowMs, ttlMs) {
@@ -2644,6 +2645,7 @@ async function cmdAcquire(repo) {
     // (never fail-safe-GROW) rationale below — an unanswered lock is no more evidence of a starved pool than an
     // unfinished scan is.
     let sawLockContention = false;
+    let sawScanStartDeadline = false;
     // #3407 — a candidate excluded because it FAILED TO PROVISION (below) is a different fact from "the scan
     // found nothing" or "every lane is genuinely held/dirty": growth-on-empty exists for the latter two, never
     // as a rescue for the former (that would silently widen this fix's own scope into the SEPARATE
@@ -2720,7 +2722,9 @@ async function cmdAcquire(repo) {
           // `nowMs + waitMs` — `nowMs` only for an explicit zero wait, preserving instant-fail).
           // It only bounds how long THIS call may sit out a DIFFERENT caller's in-flight scan/lock — never the
           // scan's own `scanTimeoutMs` budget when this call is the one actually running it.
-          candidateDirs = acquirableListCached(repo, { limit: null, scanTimeoutMs: listScanTimeoutMs(), cacheTtlMs: listCacheTtlMs(), callerDeadlineMs: deadline, acceptPartial: true });
+          // Omitted-flag acquires may use cached answers after expiry, but must not start another scan.
+          // This never shortens a scan already running, and explicit --wait-ms retains its existing policy.
+          candidateDirs = acquirableListCached(repo, { limit: null, scanTimeoutMs: listScanTimeoutMs(), cacheTtlMs: listCacheTtlMs(), callerDeadlineMs: deadline, scanStartDeadlineMs: flags['wait-ms'] === undefined ? deadline : null, acceptPartial: true });
           sawScanTimeout = false;
           sawLockContention = lastListWasLockPartial; // a running scan's partial answer is NOT proof of capacity (audit)
         } catch (e) {
@@ -2730,7 +2734,10 @@ async function cmdAcquire(repo) {
           // nothing free" below, so a slow tick self-heals on the next one. `sawScanTimeout`/`sawLockContention`
           // (above) are what let the eventual message/growth-refusal tell these apart from a completed scan
           // that genuinely found nothing.
-          if (e && e.lockContention) {
+          if (e && e.scanStartDeadline) {
+            candidateDirs = [];
+            sawScanStartDeadline = true;
+          } else if (e && e.lockContention) {
             candidateDirs = [];
             sawLockContention = true;
           } else if (e && e.scanTimeout) {
@@ -2819,7 +2826,7 @@ async function cmdAcquire(repo) {
       // either), and a fresh, dedicated, ONE-TIME live remote-reachability probe taken only here (never on the
       // hot scan path above) — a network/remote outage must never be misread as "genuinely starved, so clone
       // more".
-      if (!grownOnce && !sawScanTimeout && !sawLockContention && !sawProvisionFailure) {
+      if (!grownOnce && !sawScanTimeout && !sawLockContention && !sawScanStartDeadline && !sawProvisionFailure) {
         grownOnce = true;
         // Probe the exact URL growth will clone from (`provisionLane` → `repo.originUrl`, resolved against the
         // same process cwd the clone uses) — never from inside an existing lane: a vanished/corrupted `lanes[0]`
@@ -2832,7 +2839,7 @@ async function cmdAcquire(repo) {
           continue;
         }
       }
-      if (!recoveredOnce && recoveryEnabled() && !sawScanTimeout && !sawLockContention && !sawProvisionFailure) {
+      if (!recoveredOnce && recoveryEnabled() && !sawScanTimeout && !sawLockContention && !sawScanStartDeadline && !sawProvisionFailure) {
         recoveredOnce = true;
         try {
           const names = classifyLaneNames(readdirSync(repo.poolDir), acquireHardMaxFor(repo));
@@ -2855,10 +2862,12 @@ async function cmdAcquire(repo) {
       emitAcquirePollCount(); // #xj4tewd — before fail() exits the process, so a debug-mode caller still sees it
       // Exit 75 (EX_TEMPFAIL) = at least one parked lane-hold refusal was seen and NO other failure kind (non-hold provision failure, scan timeout) was; the rest of the pool was simply busy. Scan-lock contention alone stays exit 1 so a wedged lock still fails the smoke:
       // environmental, never a code defect. Callers (the rebuild smoke) key on this exit code, never on message text.
-      const environmentalOnly = !sawNonHoldProvisionFailure && !sawScanTimeout && !sawLockContention
+      const environmentalOnly = !sawNonHoldProvisionFailure && !sawScanTimeout && !sawLockContention && !sawScanStartDeadline
         && holdRefused.size > 0 && lanes.every((n) => n === selfLane || holdRefused.has(n)); // a busy/leased lane is a real "no lane free", never environmental
       fail(
-        sawScanTimeout
+        sawScanStartDeadline
+          ? `no lane within ${waitMs}ms in pool "${repo.name}" — default acquire deadline elapsed before a new acquirability scan could start; capacity is unknown — retry, or set --wait-ms explicitly`
+          : sawScanTimeout
           ? `no free lane in pool "${repo.name}" — the acquirability scan itself did not finish within the ` +
               `wait window (raise --scan-timeout-ms / LANE_POOL_LIST_SCAN_TIMEOUT_MS, or investigate a hung ` +
               `git — #xn432dz); this is NOT necessarily because all ${lanes.length} lane(s) are held/dirty`
@@ -4502,16 +4511,24 @@ function acquirableListCached(repo, opts) {
 // True when the last cached-list call returned a RUNNING scan's partial hand-off: capacity is still unknown, so the
 // caller must keep treating the scan as unfinished (never grow/recover on it).
 let lastListWasLockPartial = false;
-function acquirableListCachedRaw(repo, { limit, scanTimeoutMs, cacheTtlMs, callerDeadlineMs = null, partialOnOverrun = false, acceptPartial = false }) {
+function acquirableListCachedRaw(repo, { limit, scanTimeoutMs, cacheTtlMs, callerDeadlineMs = null, scanStartDeadlineMs = null, partialOnOverrun = false, acceptPartial = false }) {
   lastListWasLockPartial = false;
   const slice = (paths) => (limit !== null ? paths.slice(0, limit) : paths);
   const hit = readListCache(repo, Date.now(), cacheTtlMs, callerDeadlineMs);
   if (hit) return slice(hit);
   // xkv3p37 — cached-mode scans reuse per-lane clean verdicts (off when caching itself is off: TTL 0).
   const scanOpts = { scanTimeoutMs, reuseClean: cacheTtlMs > 0, partialOnOverrun };
+  const checkScanStartDeadline = () => {
+    if (scanStartDeadlineMs !== null && Date.now() >= scanStartDeadlineMs) {
+      throw Object.assign(new Error('default acquire deadline elapsed before scan startup'), { scanStartDeadline: true });
+    }
+  };
   // A --limit caller never scans on the cache's behalf (its answer is truncated); it takes a hit if there is
   // one, else runs its own short early-stopping scan uncached.
-  if (limit !== null) return scanAcquirable(repo, { ...scanOpts, limit });
+  if (limit !== null) {
+    checkScanStartDeadline();
+    return scanAcquirable(repo, { ...scanOpts, limit });
+  }
   const waitDeadline = Date.now() + (scanTimeoutMs > 0 ? scanTimeoutMs : DEFAULT_LIST_SCAN_TIMEOUT_MS) + LIST_LOCK_ORPHAN_GRACE_MS;
   for (;;) {
     let mine = tryTakeListLock(repo);
@@ -4526,6 +4543,7 @@ function acquirableListCachedRaw(repo, { limit, scanTimeoutMs, cacheTtlMs, calle
         // Re-check under the lock: the previous holder may have just written a fresh result.
         const again = readListCache(repo, Date.now(), cacheTtlMs, callerDeadlineMs);
         if (again) return again;
+        checkScanStartDeadline();
         scanned = true;
         // Publish each proven-free lane as the scan finds it so waiting `acquire` callers can claim one now.
         const myOwner = readLockOwner(repo);
@@ -4560,6 +4578,7 @@ function acquirableListCachedRaw(repo, { limit, scanTimeoutMs, cacheTtlMs, calle
     if (fresh) return fresh;
     if (Date.now() > waitDeadline) {
       // Should be unreachable (the lock goes stale first), but never hang: scan ourselves, uncached.
+      checkScanStartDeadline();
       log(`  list --acquirable: gave up waiting for the scan lock after ${scanTimeoutMs}ms+grace — scanning uncached (#xn432dz)`);
       return scanAcquirable(repo, { ...scanOpts, limit: null });
     }

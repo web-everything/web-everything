@@ -1,15 +1,82 @@
 /** CLI proofs for the bounded default acquire wait, using a private, fully held pool. */
-import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import { sharedRepos, withGhStub } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { runInNewContext } from 'node:vm';
 
 const SCRIPT = resolve(process.cwd(), 'scripts/lane-pool.mjs');
 // Mirrors the fixed `ACQUIRE_POLL_MS` in `we:scripts/lane-pool.mjs` — the test's own timing budgets are
 // expressed relative to it so a change to the poll spacing there doesn't silently make this flaky.
 const POLL_MS = 1000;
+const source = readFileSync(SCRIPT, 'utf8');
+const waitSetting = source.slice(source.indexOf('const ACQUIRE_DEFAULT_WAIT_MS ='), source.indexOf('// A lane holds a LIVE lease'));
+const rawStart = source.indexOf('function acquirableListCachedRaw(');
+const cachedList = source.slice(rawStart, source.indexOf('\n}', rawStart) + 2);
+
+// Execute the production policy with a controlled clock/IO: oversized settings need no minute-long sleep,
+// and deadline races can be pinned to the exact moment the scan would start.
+describe('default acquire scan startup policy', () => {
+  it.each(['60001', '9007199254740991'])(
+    'clamps oversized safe environment override %s to 60000ms', (value) => {
+      expect(runInNewContext(`${waitSetting}\nacquireDefaultWaitMs`, {
+        process: { env: { LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS: value } },
+      })).toBe(60_000);
+    },
+  );
+
+  function probe({ now = 100, deadline = 100, lockAt = now, hit = null, limit = null } = {}) {
+    const scan = vi.fn(() => { now = 1000; return ['/lane']; });
+    const release = vi.fn();
+    const run = () => runInNewContext(`${cachedList}\nacquirableListCachedRaw({}, opts)`, {
+      opts: { limit, scanTimeoutMs: 120_000, cacheTtlMs: 5000, scanStartDeadlineMs: deadline },
+      Date: { now: () => now },
+      lastListWasLockPartial: false, lastScanPartial: false,
+      readListCache: () => hit,
+      tryTakeListLock: () => { now = lockAt; return true; },
+      scanAcquirable: scan, releaseListLock: release,
+      readLockOwner: () => null, writeListCache: vi.fn(),
+      LIST_LOCK_ORPHAN_GRACE_MS: 1000,
+      process: { env: {} },
+    });
+    return { run, scan, release };
+  }
+
+  it.each([null, 1])('refuses a new scan at the default deadline (limit %s)', (limit) => {
+    const p = probe({ limit });
+    expect(p.run).toThrow(expect.objectContaining({ scanStartDeadline: true }));
+    expect(p.scan).not.toHaveBeenCalled();
+    if (limit === null) expect(p.release).toHaveBeenCalledOnce();
+  });
+
+  it('rechecks expiry after acquiring the scan lock and releases it without scanning', () => {
+    const p = probe({ now: 99, lockAt: 101 });
+    expect(p.run).toThrow(expect.objectContaining({ scanStartDeadline: true }));
+    expect(p.scan).not.toHaveBeenCalled();
+    expect(p.release).toHaveBeenCalledOnce();
+  });
+
+  it('lets a scan started before expiry finish with its full 120s budget', () => {
+    const p = probe({ now: 99 });
+    expect(p.run()).toEqual(['/lane']);
+    expect(p.scan).toHaveBeenCalledWith({}, expect.objectContaining({ scanTimeoutMs: 120_000 }));
+    expect(p.release).toHaveBeenCalledOnce();
+  });
+
+  it('still accepts cached evidence after the deadline', () => {
+    const p = probe({ hit: ['/cached'] });
+    expect(p.run()).toEqual(['/cached']);
+    expect(p.scan).not.toHaveBeenCalled();
+  });
+
+  it('preserves explicit-wait callers without a scan-start deadline', () => {
+    const p = probe({ deadline: null });
+    expect(p.run()).toEqual(['/lane']);
+    expect(p.scan).toHaveBeenCalledOnce();
+  });
+});
 
 function git(args, cwd) {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
@@ -102,6 +169,16 @@ function expectDefaultWait(result) {
 
 describe('lane-pool acquire default bounded wait', () => {
   beforeEach(fullyHeldPool);
+
+  it('an expired omitted-flag default refuses scan startup with an unknown-capacity diagnosis', () => {
+    const result = runPool(['acquire', ...poolArgs(), '--session=picker', '--hard-max=1', '--no-free-list', '--cache-ttl-ms=0'], {
+      LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS: '0',
+    });
+    expect(result.code).toBe(1);
+    expect(result.err).toContain('default acquire deadline elapsed before a new acquirability scan could start; capacity is unknown');
+    expect(result.err).not.toContain('__SCAN_LOCK_HELD_MS__');
+    expect(pollCount(result)).toBe(0);
+  });
 
   it('omitting --wait-ms polls for the 8000ms default on a fully held pool', () => {
     expectDefaultWait(exhaustedAcquire());
