@@ -51,11 +51,21 @@ describe('stale remote slot markers (perf10)', () => {
     const events = [];
     const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111]),
       stuckMinSlots: 1, signal: event => events.push(event)});
-    const telemetry = {...await tel(1, undefined, [done(RUN_A, code)])(), activeRunIds: [RUN_A]};
+    const telemetry = {...await tel(1, NOW, [done(RUN_A, code)])(), activeRunIds: [RUN_A]};
     expect(runVerdict(telemetry, RUN_A)).toBe('inflight');
     expect(await reaper.step(async () => telemetry)).toEqual([]);
     expect([...blockedSlots(root, 1)]).toEqual([0]);
     expect(events.filter(event => event.kind === 'stuck-slots')).toHaveLength(stuck ? 1 : 0);
+  });
+  it.each([-300_000, 300_000])('an old receipt with no result code and a stale or future sample (offset %i ms) does NOT hide a stuck marker', async offset => {
+    const root = setup({0: {pid: 111, run: RUN_A, ageMs: 11 * 60_000}});
+    const events = [];
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111]),
+      stuckMinSlots: 1, signal: event => events.push(event)});
+    const telemetry = {...await tel(1, NOW + offset, [done(RUN_A, null)])(), activeRunIds: [RUN_A]};
+    expect(await reaper.step(async () => telemetry)).toEqual([]);
+    expect([...blockedSlots(root, 1)]).toEqual([0]);
+    expect(events.filter(event => event.kind === 'stuck-slots')).toHaveLength(1);
   });
   it.each(['missing', 'dead', 'alive'])('retains a legacy marker with a %s lock holder while remote work may survive', async holder => {
     const root = setup({0: {}});

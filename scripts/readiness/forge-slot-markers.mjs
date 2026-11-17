@@ -12,6 +12,7 @@ import {probePidLiveness} from './pid-liveness.mjs';
 export const MARKER_GRACE_MS = 120_000;
 // Equals the admission ceiling: older inflight orphans must still raise the stuck signal.
 const INFLIGHT_STUCK_EXEMPT_MS = 120 * 60_000;
+const INFLIGHT_SAMPLE_MAX_AGE_MS = 120_000;
 // The Forge sample must be taken this long AFTER the owner was first seen dead: it covers Forge-vs-Mac clock skew and
 // a receipt created between Forge's receipt listing and its timestamp, so a sample can never predate a surviving run.
 export const DEATH_SAMPLE_MARGIN_MS = 90_000;
@@ -305,7 +306,9 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
           for (const entry of dead) {
             verdicts.set(entry.name, entry.run ? runVerdict(telemetry, entry.run) : 'run-less');
             const receipt = telemetry.recent.find(item => item?.runId === entry.run);
-            if (verdicts.get(entry.name) === 'inflight' && receipt && receipt.code == null
+            // Only a FRESH sample showing the run in flight may exempt a marker; stale or future-dated telemetry never does.
+            if (now - sampledAt <= INFLIGHT_SAMPLE_MAX_AGE_MS && sampledAt - now <= 60_000
+              && verdicts.get(entry.name) === 'inflight' && receipt && receipt.code == null
               && now - entry.mtimeMs < INFLIGHT_STUCK_EXEMPT_MS) healthyInflight.add(entry.name);
             const diedBy = firstDead.get(entry.key);
             if (now - entry.mtimeMs < graceMs || sampledAt < diedBy + DEATH_SAMPLE_MARGIN_MS) { resetIdle(entry); continue; }
