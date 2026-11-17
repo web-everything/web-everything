@@ -10,6 +10,14 @@ export const payloads = Object.freeze(['forge-exec-run.mjs', 'forge-warm-base.mj
   'forge-exec-limits.mjs', 'forge-cache-prune.mjs', 'forge-exec-sweep.mjs']);
 export const ID = /^[a-f0-9]{64}$/;
 const SHA = /^[a-f0-9]{40}$/;
+function easternTimestamp(ms = Date.now()) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', {timeZone: 'America/New_York',
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+    second: '2-digit', hourCycle: 'h23', timeZoneName: 'longOffset'}).formatToParts(new Date(ms)).map(p => [p.type, p.value]));
+  return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}.${String(new Date(ms).getUTCMilliseconds()).padStart(3, '0')}${parts.timeZoneName.replace('GMT', '')}`;
+}
+const validET = value => typeof value === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}-0[45]:00$/.test(value)
+  && Number.isFinite(Date.parse(value)) && easternTimestamp(Date.parse(value)) === value;
 const fail = reason => { throw new Error(`${reason}; inspect the remote runner and run recover`); };
 const validId = value => { if (typeof value !== 'string' || !ID.test(value)) fail('id must match ^[a-f0-9]{64}$'); return value; };
 const stat = (fs, name) => {
@@ -72,7 +80,7 @@ export async function flockLock(name, action, {fs = nativeFs, uid = 0, spawnImpl
   let child;
   try {
     if (!trusted(fs.fstatSync(fd), uid)) fail('untrusted lock file');
-    child = spawnImpl('flock', ['-n', '-x', '3', process.execPath, '-e',
+    child = spawnImpl('sh', ['-c', 'flock -n -x 3 || exit 1; exec "$@"', 'forge-deploy-lock', process.execPath, '-e',
       "process.stdout.write('locked\\n'); process.stdin.resume(); process.stdin.on('end',()=>process.exit(0));"],
     {stdio: ['pipe', 'pipe', 'ignore', fd]});
     const exited = new Promise(resolve => child.once('close', resolve));
@@ -124,13 +132,18 @@ export async function deploy({command, root, source, id, sha: legacyId, shaMeta 
   };
   const record = () => {
     const value = readOptional('deploy.json');
-    if (present('deploy.json') && (!value || Object.keys(value).join() !== 'previous' || !(value.previous === null || (typeof value.previous === 'string' && ID.test(value.previous))))) fail('invalid deploy record');
+    if (present('deploy.json') && (!value || !['previous', 'previous,provenance'].includes(Object.keys(value).sort().join()) ||
+      ('provenance' in value && value.provenance !== 'unknown') ||
+      !(value.previous === null || (typeof value.previous === 'string' && ID.test(value.previous))))) fail('invalid deploy record');
     return value;
   };
   const cache = () => {
     const value = readOptional('state.json');
     if (present('state.json') && (!value || !(value.setDigest === null || (typeof value.setDigest === 'string' && ID.test(value.setDigest))) ||
-      !(value.forgeSetSha === 'unknown' || (typeof value.forgeSetSha === 'string' && SHA.test(value.forgeSetSha))))) fail('invalid state cache');
+      !(value.forgeSetSha === null || (typeof value.forgeSetSha === 'string' && SHA.test(value.forgeSetSha))) ||
+      (value.schema !== undefined && value.schema !== 1) ||
+      (value.hostTier !== undefined && !(Number.isSafeInteger(value.hostTier) && value.hostTier > 0)) ||
+      (value.installedAtET !== undefined && !validET(value.installedAtET)))) fail('invalid state cache');
     return value;
   };
   const artifacts = () => fs.readdirSync(root).filter(name => /^\.(stage|publish|current|record)-/.test(name));
@@ -172,11 +185,16 @@ export async function deploy({command, root, source, id, sha: legacyId, shaMeta 
       } else { if (st.uid !== uid) fail('untrusted staged artifact'); fs.unlinkSync(name); }
     };
     const finish = (active, previous, saved, manifest) => {
-      const provenance = manifest?.sha ?? (unknown ? 'unknown' : saved?.forgeSetSha);
-      if (active && !(provenance === 'unknown' || (typeof provenance === 'string' && SHA.test(provenance)))) fail('missing provenance: provide --sha-meta or explicit --unknown');
+      // A null-sha manifest cannot borrow provenance from another content set.
+      // Recovery has no authority to declare an interrupted switch unknown.
+      if (active && !manifest.sha && command === 'recover' && saved?.setDigest !== active) fail('missing matching provenance cache');
+      const provenance = manifest?.sha ?? (command === 'recover' ? saved?.forgeSetSha : null);
       syncDir(root);
-      if (active) atomic('state.json', {...saved, setDigest: active, forgeSetSha: provenance});
-      atomic('deploy.json', {previous});
+      if (active) atomic('state.json', {schema: 1, forgeSetSha: provenance, setDigest: active,
+        hostTier: saved?.hostTier ?? 1,
+        installedAtET: command === 'recover' && saved?.setDigest === active && saved.forgeSetSha === provenance && saved.installedAtET
+          ? saved.installedAtET : easternTimestamp()});
+      atomic('deploy.json', {previous, ...(active && provenance === null ? {provenance: 'unknown'} : {})});
     };
     if (command === 'recover') {
       try {
@@ -208,6 +226,7 @@ export async function deploy({command, root, source, id, sha: legacyId, shaMeta 
     }
     const old = inspect();
     if (command === 'install') {
+      if (shaMeta === null && !unknown) fail('missing provenance: provide --sha-meta or explicit --unknown');
       source = trustDirectory(source, {fs, uid});
       const files = Object.fromEntries(payloads.map(name => [name, safeRead(fs, path.join(source, name), uid)]));
       if (contentDigest(files) !== id) fail('source digest mismatch');
@@ -233,7 +252,7 @@ export async function deploy({command, root, source, id, sha: legacyId, shaMeta 
     if (command === 'rollback') { if (!old.previous) fail('no previous version'); id = old.previous; }
     const manifest = readVersion(root, id, {fs, uid});
     const saved = cache();
-    if (!manifest.sha && !saved?.forgeSetSha && !unknown) fail('missing provenance: provide --sha-meta or explicit --unknown');
+    if (!manifest.sha && !unknown) fail('missing provenance: provide --sha-meta or explicit --unknown');
     if (id === old.current) return old;
     const txn = at(`.publish-${randomUUID()}`), link = at(`.current-${randomUUID()}`);
     let committed = false;

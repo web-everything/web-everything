@@ -1,5 +1,5 @@
 // @vitest-environment node
-import {afterEach, describe, expect, it} from 'vitest';
+import {afterEach, describe, expect, it, vi} from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import {tmpdir} from 'node:os';
@@ -9,7 +9,7 @@ import {createHash} from 'node:crypto';
 import {deploy, contentDigest, flockLock, ID, main, payloads, readVersion, trusted, trustDirectory} from '../forge-deploy.mjs';
 
 const sandboxes = [];
-afterEach(() => { for (const dir of sandboxes.splice(0)) fs.rmSync(dir, {recursive: true, force: true}); });
+afterEach(() => { vi.useRealTimers(); for (const dir of sandboxes.splice(0)) fs.rmSync(dir, {recursive: true, force: true}); });
 const sha = 'a'.repeat(40), otherSha = 'b'.repeat(40);
 const unlocked = async (_name, action) => action();
 const mutations = new Set(['writeFileSync', 'fsyncSync', 'renameSync', 'symlinkSync', 'unlinkSync', 'rmdirSync', 'mkdirSync']);
@@ -67,7 +67,7 @@ function fixture() {
 async function seeded() {
   const f = fixture();
   f.a = f.bundle('one'); await f.run('install', {id: f.a, shaMeta: sha}); await f.run('switch', {id: f.a});
-  f.b = f.bundle('two'); await f.run('install', {id: f.b});
+  f.b = f.bundle('two'); await f.run('install', {id: f.b, shaMeta: sha});
   return f;
 }
 function agreement(f) {
@@ -91,13 +91,13 @@ describe('publication crash points', () => {
           return f;
         };
         const baseline = await prepare(), counter = faults(baseline.io);
-        await baseline.run(command, {id: baseline.target, fs: counter.io});
+        await baseline.run(command, {id: baseline.target, shaMeta: sha, fs: counter.io});
         const bound = counter.count();
         expect(bound).toBeGreaterThan(0);
         for (let k = 1; k <= bound; k++) {
           const f = await prepare(), injected = faults(f.io, k, mode);
           const before = f.read('state.json').forgeSetSha;
-          await expect(f.run(command, {id: f.target, fs: injected.io})).rejects.toThrow();
+          await expect(f.run(command, {id: f.target, shaMeta: sha, fs: injected.io})).rejects.toThrow();
           expect(injected.fired(), `fault ${k}/${bound}`).toBe(true);
           // A crash at the current rename must keep the newly committed pointer.
           const committed = fs.readlinkSync(path.join(f.root, 'current'));
@@ -181,14 +181,111 @@ it('recovery is idempotent and restores stale cache without weakening provenance
 });
 
 it('keeps sha separate from digest, accepts verified replacement sha, and requires explicit unknown', async () => {
-  const f = fixture(), a = f.bundle('one'); await f.run('install', {id: a});
+  const f = fixture(), a = f.bundle('one'); await f.run('install', {id: a, unknown: true});
   await expect(f.run('switch', {id: a})).rejects.toThrow('missing provenance');
   await f.run('switch', {id: a, unknown: true});
-  expect(f.read('state.json').forgeSetSha).toBe('unknown');
+  expect(f.read('state.json').forgeSetSha).toBeNull();
+  expect(f.read('deploy.json').provenance).toBe('unknown');
   const b = f.bundle('two'); await f.run('install', {id: b, shaMeta: otherSha}); await f.run('switch', {id: b});
   expect(f.read('state.json').forgeSetSha).toBe(otherSha);
-  await f.run('rollback'); expect(f.read('state.json').forgeSetSha).toBe(otherSha);
+  await expect(f.run('rollback')).rejects.toThrow('missing provenance');
+  expect(f.read('state.json').forgeSetSha).toBe(otherSha);
+  await f.run('rollback', {unknown: true}); expect(f.read('state.json').forgeSetSha).toBeNull();
   await expect(f.run('install', {id: b, shaMeta: b})).rejects.toThrow('40 lowercase hex');
+});
+
+it('refuses null-sha install and switch without explicit unknown, regardless of the prior verified sha', async () => {
+  const f = await seeded(), id = f.bundle('unknown');
+  const probe = faults(f.io);
+  await expect(f.run('install', {id, fs: probe.io})).rejects.toThrow('missing provenance');
+  expect(fs.existsSync(path.join(f.root, 'versions', id))).toBe(false);
+  await f.run('install', {id, unknown: true});
+  await expect(f.run('switch', {id, fs: probe.io})).rejects.toThrow('missing provenance');
+  expect(probe.count()).toBe(0);
+  expect(f.read('state.json').forgeSetSha).toBe(sha);
+  expect(fs.readlinkSync(path.join(f.root, 'current'))).toBe(`versions/${f.a}`);
+  await f.run('switch', {id, unknown: true});
+  expect(f.read('state.json').forgeSetSha).toBeNull();
+  await expect(f.run('switch', {id})).rejects.toThrow('missing provenance');
+  await f.run('recover');
+  expect(f.read('state.json').forgeSetSha).toBeNull();
+});
+
+it.each(['missing', 'different'])('quarantines null-sha recovery with %s digest evidence even with --unknown', async kind => {
+  const f = await seeded(), id = f.bundle('unknown');
+  await f.run('install', {id, unknown: true});
+  // Model a crash after current commits, before state.json is published.
+  fs.unlinkSync(path.join(f.root, 'current'));
+  fs.symlinkSync(`versions/${id}`, path.join(f.root, 'current'));
+  if (kind === 'missing') fs.unlinkSync(path.join(f.root, 'state.json'));
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await expect(f.run('recover', {unknown: true})).rejects.toThrow('matching provenance');
+    expect(fs.existsSync(path.join(f.root, 'quarantine'))).toBe(true);
+    expect(fs.readlinkSync(path.join(f.root, 'current'))).toBe(`versions/${id}`);
+    if (kind === 'different') expect(f.read('state.json').forgeSetSha).toBe(sha);
+  }
+});
+
+it('preserves a saved verified sha for a null manifest only when its digest matches', async () => {
+  const f = fixture(), id = f.bundle('unknown');
+  await f.run('install', {id, unknown: true}); await f.run('switch', {id, unknown: true});
+  const saved = {...f.read('state.json'), forgeSetSha: sha};
+  fs.writeFileSync(path.join(f.root, 'state.json'), JSON.stringify(saved));
+  await f.run('switch', {id, unknown: true});
+  expect(f.read('state.json')).toEqual(saved);
+  await f.run('recover', {unknown: true});
+  expect(f.read('state.json')).toEqual(saved);
+  expect(f.read('deploy.json')).toEqual({previous: null});
+});
+
+it('writes the exact S0 state shape with ET milliseconds, preserves tier, and keeps matching recovery timestamps', async () => {
+  vi.useFakeTimers({toFake: ['Date']});
+  vi.setSystemTime(new Date('2026-01-15T17:00:00.123Z'));
+  const f = await seeded();
+  expect(f.read('state.json')).toEqual({schema: 1, forgeSetSha: sha, setDigest: f.a,
+    hostTier: 1, installedAtET: '2026-01-15T12:00:00.123-05:00'});
+  const saved = {...f.read('state.json'), hostTier: 3};
+  fs.writeFileSync(path.join(f.root, 'state.json'), JSON.stringify(saved));
+  vi.setSystemTime(new Date('2026-07-15T17:00:00.456Z'));
+  await f.run('recover'); expect(f.read('state.json')).toEqual(saved);
+  await f.run('switch', {id: f.b, unknown: true});
+  expect(f.read('state.json')).toEqual({...saved, setDigest: f.b, installedAtET: '2026-07-15T13:00:00.456-04:00'});
+  vi.setSystemTime(new Date('2026-07-16T17:00:00.789Z'));
+  await f.run('rollback');
+  expect(f.read('state.json')).toEqual({...saved, installedAtET: '2026-07-16T13:00:00.789-04:00'});
+});
+
+it('verified manifest sha wins over --unknown on both switch and recover', async () => {
+  const f = await seeded();
+  await f.run('switch', {id: f.b, unknown: true});
+  await f.run('recover', {unknown: true});
+  expect(f.read('state.json').forgeSetSha).toBe(sha);
+  expect(f.read('deploy.json').provenance).toBeUndefined();
+});
+
+it('migrates the previous minimal cache to S0 without losing its verified sha', async () => {
+  const f = await seeded();
+  fs.writeFileSync(path.join(f.root, 'state.json'), JSON.stringify({setDigest: f.a, forgeSetSha: sha}));
+  await f.run('recover');
+  expect(f.read('state.json')).toMatchObject({schema: 1, forgeSetSha: sha, setDigest: f.a, hostTier: 1});
+  expect(f.read('state.json').installedAtET).toMatch(/\.\d{3}-0[45]:00$/);
+  const saved = f.read('state.json');
+  await f.run('recover'); expect(f.read('state.json')).toEqual(saved);
+});
+
+it.each([
+  {schema: 2}, {hostTier: 0}, {hostTier: 1.5}, {forgeSetSha: 'unknown'},
+  {installedAtET: '2026-07-15T12:00:00.000-05:00'}, {installedAtET: 'unreadable'},
+])('refuses malformed S0 evidence and quarantines recovery: %j', async invalid => {
+  const f = await seeded();
+  const saved = {...f.read('state.json'), ...invalid};
+  fs.writeFileSync(path.join(f.root, 'state.json'), JSON.stringify(saved));
+  const probe = faults(f.io);
+  await expect(f.run('switch', {id: f.b, fs: probe.io})).rejects.toThrow('invalid state cache');
+  expect(probe.count()).toBe(0);
+  await expect(f.run('recover')).rejects.toThrow('invalid state cache');
+  expect(f.read('state.json')).toEqual(saved);
+  expect(fs.existsSync(path.join(f.root, 'quarantine'))).toBe(true);
 });
 
 it('uses the same trust predicate for every ancestor and file with injected uid', async () => {
@@ -218,7 +315,7 @@ it('uses the same trust predicate for every ancestor and file with injected uid'
 it('fails closed on oversized input and leaves an operator-visible inspection fallback', async () => {
   const f = fixture(), id = f.bundle('one');
   fs.truncateSync(path.join(f.source, payloads[0]), 8 * 1024 * 1024 + 1);
-  await expect(f.run('install', {id})).rejects.toThrow('inspect the remote runner');
+  await expect(f.run('install', {id, shaMeta: sha})).rejects.toThrow('inspect the remote runner');
   expect(fs.existsSync(path.join(f.root, 'versions', id))).toBe(false);
 });
 
@@ -294,7 +391,8 @@ it('preflight validates supplied source owner, size, symlinks and digest without
 it('flock holds one owner-checked file descriptor through the action and releases it afterward', async () => {
   const f = fixture(); let held = false, released = false;
   const spawnImpl = (command, argv, options) => {
-    expect(command).toBe('flock'); expect(argv.slice(0, 3)).toEqual(['-n', '-x', '3']);
+    expect(command).toBe('sh');
+    expect(argv.slice(0, 5)).toEqual(['-c', 'flock -n -x 3 || exit 1; exec "$@"', 'forge-deploy-lock', process.execPath, '-e']);
     expect(trusted(f.io.fstatSync(options.stdio[3]), f.uid)).toBe(true);
     const child = new EventEmitter(); child.stdout = new PassThrough(); child.stdin = new PassThrough();
     child.exitCode = null; child.kill = () => { throw new Error('unexpected kill'); };
