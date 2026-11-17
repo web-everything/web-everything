@@ -52,7 +52,7 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s fetch command isolation',
         expect(options.cwd).toMatch(/iso\.git$/);
         expect(args).not.toContain(lane);
         expect(options.env.GIT_DIR).toBeUndefined();
-        expect(args).toEqual(['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true', '-c', 'core.sshCommand=ssh', '-c', 'ssh.variant=ssh', 'fetch', '--no-recurse-submodules', '--no-auto-gc', '--no-auto-maintenance', '--upload-pack=git-upload-pack',
+        expect(args).toEqual(['-c', 'protocol.allow=never', '-c', 'protocol.ssh.allow=always', '-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true', '-c', 'core.sshCommand=ssh', '-c', 'ssh.variant=ssh', 'fetch', '--no-recurse-submodules', '--no-auto-gc', '--no-auto-maintenance', '--upload-pack=git-upload-pack',
           '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`]);
         fetchedUrls.push(args[args.length - 2]);
       }
@@ -164,7 +164,7 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s fetch command isolation',
         expect(args).not.toContain(lane);
         expect(options.env.GIT_DIR).toBeUndefined();
           const url = args[args.length - 2];fetchedUrls.push(url);
-          expect(args).toEqual(['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true', '-c', 'core.sshCommand=ssh', '-c', 'ssh.variant=ssh', 'fetch', '--no-recurse-submodules', '--no-auto-gc', '--no-auto-maintenance', '--upload-pack=git-upload-pack',
+          expect(args).toEqual(['-c', 'protocol.allow=never', '-c', 'protocol.ssh.allow=always', '-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true', '-c', 'core.sshCommand=ssh', '-c', 'ssh.variant=ssh', 'fetch', '--no-recurse-submodules', '--no-auto-gc', '--no-auto-maintenance', '--upload-pack=git-upload-pack',
             '--no-tags', url, `refs/pull/${pr}/head`]);
           expect(url).toBe(`git@github.com:${repo}.git`);
           // Rewrite only the explicit transport URL to a local source, without networking.
@@ -213,6 +213,13 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s isolated object handoff',
     const head = git(source, ['rev-parse', 'HEAD']).trim();
     git(source, ['update-ref', `refs/pull/${pr}/head`, head]);
     git(lane, ['remote', 'add', 'origin', `git@github.com:${repo}.git`]);
+    if (poison.startsWith('remote-')) {
+      git(lane, ['update-ref', 'refs/heads/main', laneHead]);
+      git(lane, ['update-ref', `refs/pull/${pr}/head`, laneHead]);
+      git(lane, ['update-ref', 'refs/tags/keep', laneHead]);
+      // Detach so the checked-out-branch guard cannot mask the remap control.
+      git(lane, ['update-ref', '--no-deref', 'HEAD', laneHead]);
+    }
     const templatePoison = poison.startsWith('template-');
     const template = join(root, 'template'), poisonUrl = 'git://template-poison.invalid/';
     if (templatePoison) {
@@ -255,6 +262,28 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s isolated object handoff',
           expect(config).not.toContain(helper);
           return output;
         }
+        if (poison.startsWith('remote-')) {
+          const url = `git@github.com:${repo}.git`;
+          const ref = poison === 'remote-main' ? 'refs/heads/main' : `refs/pull/${pr}/head`;
+          git(lane, ['config', `remote.${url}.url`, poison === 'remote-url' ? 'review-marker::attacker' : url]);
+          git(lane, ['config', `remote.${url}.fetch`, poison === 'remote-main'
+            ? `+refs/pull/${pr}/head:refs/heads/main` : '+refs/*:refs/*']);
+          const control = join(root, 'remote-control.git');
+          git(root, ['clone', '--bare', '--quiet', lane, control]);
+          git(control, ['config', `remote.${url}.url`, poison === 'remote-url' ? 'review-marker::attacker' : url]);
+          git(control, ['config', `remote.${url}.fetch`, poison === 'remote-main'
+            ? `+refs/pull/${pr}/head:refs/heads/main` : '+refs/*:refs/*']);
+          // The old plain in-lane fetch resolves the explicit URL as a remote name.
+          if (poison === 'remote-url') {
+            expect(() => git(control, ['fetch', url, `refs/pull/${pr}/head`])).toThrow();
+            expect(readFileSync(marker, 'utf8')).toContain('attacker'); rmSync(marker);
+          } else {
+            git(control, ['fetch', url, `refs/pull/${pr}/head`]);
+            expect(git(control, ['rev-parse', ref]).trim()).toBe(head);
+            expect(head).not.toBe(laneHead);
+          }
+          return output;
+        }
         const included = join(root, 'included');
         let target = ['--local'];
         if (poison === 'worktree') {
@@ -291,6 +320,7 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s isolated object handoff',
       expect(options).toMatchObject({ encoding: null, timeout: 180_000, maxBuffer: 1024 ** 3 });
       expect(options.env.GIT_CONFIG_NOSYSTEM).toBe('1');
       expect(readFileSync(options.env.GIT_CONFIG_GLOBAL, 'utf8')).toBe('');
+      expect(args.slice(0, 6)).toEqual(['-c', 'protocol.allow=never', '-c', 'protocol.ssh.allow=always', '-c', 'protocol.ext.allow=never']);
       const packing = args.includes('pack-objects');
       if (packing) {
         packCalls++;
@@ -328,6 +358,19 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s isolated object handoff',
     expect(existsSync(f.iso())).toBe(false);
     expect(f.counts()).toEqual({ networkCalls: 1, packCalls: 1, indexCalls: 1 });
   });
+
+  it.each(['remote-url', 'remote-main', 'remote-wildcard'])(
+    'isolates same-named %s remote: control contacts attacker or remaps refs, job preserves lane refs', poison => {
+      const f = fixture({ poison });
+      const before = f.git(f.lane, ['for-each-ref', '--format=%(refname) %(objectname)']);
+      // The fixture replants the hostile remote after the scrub, before the isolated fetch.
+      expect(f.run()).toEqual({ head: f.head });
+      expect(f.git(f.lane, ['rev-parse', '--verify', `${f.head}^{commit}`]).trim()).toBe(f.head);
+      expect(f.git(f.lane, ['show', `${f.head}:payload`])).toBe('genuine fixture object\n');
+      expect(existsSync(f.marker)).toBe(false);
+      expect(f.git(f.lane, ['for-each-ref', '--format=%(refname) %(objectname)'])).toBe(before);
+      expect(f.counts()).toEqual({ networkCalls: 1, packCalls: 1, indexCalls: 1 });
+    });
 
   it.each(['pack-exit', 'pack-signal', 'pack-timeout', 'pack-oversized', 'pack-null-status', 'pack-missing-buffer', 'index-failure', 'index-signal', 'index-corrupt', 'moved-head'])(
     'refuses %s without importing the fetched commit', failure => {

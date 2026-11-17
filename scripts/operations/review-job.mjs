@@ -372,7 +372,7 @@ function fetchPinnedPrHead({ lanePath, repo, pr, head, headChangedError, env, ex
       if (!/^[a-f0-9]{40}$/i.test(laneHead)) throw Error('pinned review commit unavailable');
       exec('git', ['update-ref', 'refs/haves/lane', laneHead], isoOptions);
     }
-    const pins = ['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'gc.auto=0',
+    const pins = ['-c', 'protocol.allow=never', '-c', 'protocol.ssh.allow=always', '-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'gc.auto=0',
       '-c', 'maintenance.auto=false', '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true',
       '-c', 'core.sshCommand=ssh', '-c', 'ssh.variant=ssh'];
     // No network command sees the lane as cwd or git-dir. Its config cannot redirect this URL.
