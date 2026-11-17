@@ -47,7 +47,7 @@ export async function runUpdateBranch(input, io) {
         const status = await io.update(repo, pr, result.beforeHead);
         if (status !== 202) throw new Error(`update not accepted (HTTP ${status ?? 'unknown'}); inspect the PR before retrying`);
         accepted = true;
-        Object.assign(result, { ok: true, status: 'accepted-pending', afterHead: null, behindAfter: null,
+        Object.assign(result, { ok: false, status: 'unconfirmed', afterHead: null, behindAfter: null,
           detail: 'Accepted; if no new head is observed after two reads, inspect the PR before retrying.' });
         for (let attempt = 0; attempt < 2; attempt++) {
           await io.sleep(250);
@@ -65,7 +65,7 @@ export async function runUpdateBranch(input, io) {
       }
     }
   } catch (error) {
-    Object.assign(result, { ok: accepted, status: accepted ? 'accepted-pending' : 'failed',
+    Object.assign(result, { ok: false, status: accepted ? 'unconfirmed' : 'failed',
       detail: `${String(error.message ?? error).slice(0, 500)}; inspect the PR before retrying` });
     if (!accepted) result.refused = true;
   }

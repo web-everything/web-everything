@@ -92,7 +92,7 @@ describe('update-branch', () => {
 
   it('stops after two unchanged reads with an explicit inspect-before-retry fallback', async () => {
     const f = fixture([pull, { behind_by: 1 }, accepted, pull, pull]);
-    expect(await f.run()).toMatchObject({ ok: true, status: 'accepted-pending', afterHead: null, behindAfter: null, detail: expect.stringMatching(/inspect the PR before retrying/) });
+    expect(await f.run()).toMatchObject({ ok: false, status: 'unconfirmed', afterHead: null, behindAfter: null, detail: expect.stringMatching(/inspect the PR before retrying/) });
     expect(f.gh).toHaveBeenCalledTimes(5);
     expect(f.sleep).toHaveBeenCalledTimes(2);
     expect(writes(f)).toHaveLength(1);
@@ -100,7 +100,7 @@ describe('update-branch', () => {
 
   it('reports an accepted update when observation fails, without retrying the write', async () => {
     const f = fixture([pull, { behind_by: 1 }, accepted, new Error('read failed')]);
-    expect(await f.run()).toMatchObject({ ok: true, status: 'accepted-pending', afterHead: null, behindAfter: null });
+    expect(await f.run()).toMatchObject({ ok: false, status: 'unconfirmed', afterHead: null, behindAfter: null });
     expect(writes(f)).toHaveLength(1);
   });
 
