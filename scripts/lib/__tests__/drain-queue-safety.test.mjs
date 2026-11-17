@@ -941,6 +941,19 @@ describe('merge-queue same-head failure admission', () => {
       f.expectHeld();
     }));
 
+    it('refuses a recovered transport error followed by a permanent error', () => fixture(f => {
+      setupJob(f);
+      f.jobLog = "fatal: Could not resolve host: github.com\nfatal: unable to access 'u': The requested URL returned error: 403\n";
+      f.expectHeld();
+    }));
+
+    it('refuses a setup-named step when check output carries test-failure wording', () => fixture(f => {
+      setupJob(f);
+      f.checks[0].output = { title: 'AssertionError', summary: 'tests failed', text: '' };
+      f.jobLog = 'fatal: Could not resolve host: github.com\n';
+      f.expectHeld();
+    }));
+
     it('refuses a setup-named step with a permanent 403 and no transport failure', () => fixture(f => {
       setupJob(f);
       f.jobLog = "fatal: unable to access 'https://github.com/x/y/': The requested URL returned error: 403\n";

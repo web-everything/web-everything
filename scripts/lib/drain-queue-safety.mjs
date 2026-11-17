@@ -945,8 +945,14 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
           // A failing setup/checkout step is corroborating evidence only: the log must also show a
           // transport failure and no test-failure wording, because step display names are editable.
           // Fail closed when the scan window dropped earlier output: the veto must see the whole log.
-          const setupInfra = setupProof && text.length <= MQ_INFRA_SCAN_BYTES && MQ_SETUP_TRANSPORT.test(tail)
-            && !MQ_SETUP_TEST_FAILURE.test(text);
+          // Every error-like line must itself be a transport failure (a later permanent error vetoes a
+          // recovered one), and neither the log nor the check output may carry test-failure wording.
+          const errorLines = text.split('\n').filter(line => /\b(?:error|fatal|fail(?:ed|ure)?)\b/i.test(line)
+            && !/Process completed with exit code \d+/.test(line));
+          const setupInfra = setupProof && text.length <= MQ_INFRA_SCAN_BYTES && errorLines.length > 0
+            && errorLines.every(line => MQ_SETUP_TRANSPORT.test(line))
+            && ![text, check.output?.title, check.output?.summary, check.output?.text]
+              .some(value => typeof value === 'string' && MQ_SETUP_TEST_FAILURE.test(value));
           const matched = setupInfra || tail.split('\n').some(line => {
             if (line.length > MQ_INFRA_LINE_CHARS) truncatedLine = true;
             const boundedLine = line.slice(-MQ_INFRA_LINE_CHARS);
