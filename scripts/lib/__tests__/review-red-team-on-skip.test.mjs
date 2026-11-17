@@ -3107,3 +3107,40 @@ it('a recovered result check settles the next pass without a recovery seat', () 
   expect(o.publishCheck).toHaveBeenCalledTimes(1);
   expect(o.dispatch).not.toHaveBeenCalled();
 });
+
+describe('finished skipped empty net diff recovery', () => {
+  const options = () => {
+    const loopPayload = payload();
+    Object.assign(loopPayload.findings.read, { netBasis: { rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true });
+    const status = { head, status: 'finished', loopPayload, result: { status: 'skipped' } };
+    const evidence = { status, loopPayload, recorded: false, seatRecorded: false, completedRecorded: false,
+      failedSeatCount: 0, inFlight: false, queued: false };
+    return { rawPrs: [{ number: pr, headRefOid: head, labels: ['review:accepted', 'ready-to-merge', 'red-team:pending'], reviews: [],
+      comments: [{ body: `✅ review — accepted\n<!-- reviewed-sha: ${head} -->`, author: { login: 'web-everything' } }] }],
+      readEvidence: () => evidence, readStatus: () => status };
+  };
+  it('heals a legacy finished skipped object to terminal policy-clear', () => {
+    expect(decide(options())).toMatchObject({ action: 'clear', policy: 'empty-net-diff', why: 'red team skipped: empty net diff' });
+  });
+  it.each([
+    ['unscored', o => { delete o.readStatus().loopPayload.findings.read.netBasis.scored; }],
+    ['unscored text', o => { o.readStatus().loopPayload.findings.read.diffScored = false; }],
+    ['missing paths', o => { delete o.readStatus().loopPayload.findings.read.netChangedFiles; }],
+    ['nonempty paths', o => { o.readStatus().loopPayload.findings.read.netChangedFiles = ['scripts/example.mjs']; }],
+    ['wrong head', o => { o.readStatus().head = 'b'.repeat(40); }],
+    ['unknown policy', o => { o.readStatus().result.policy = 'other'; }],
+    ['missing acceptance', o => { o.rawPrs[0].comments = []; }],
+    ['review hold', o => { o.rawPrs[0].labels.push('review:changes'); }],
+    ['seat exists', o => { o.readEvidence().seatRecorded = true; }],
+  ])('does not clear %s', (_, mutate) => {
+    const o = options(); mutate(o);
+    expect(decide(o).action).not.toBe('clear');
+  });
+  it('re-arms an owed non-policy finished skip once, then holds on the spent retry', () => {
+    const o = options();
+    Object.assign(o.readStatus().loopPayload.findings.read, { diffText: '+code', netChangedFiles: ['scripts/example.mjs'] });
+    expect(decide(o)).toMatchObject({ action: 'dispatch', mode: 'fresh' });
+    o.readStatus().retryCount = 1;
+    expect(decide(o)).toMatchObject({ action: 'skip', why: 'red-team retry already spent; inspect stored evidence' });
+  });
+});

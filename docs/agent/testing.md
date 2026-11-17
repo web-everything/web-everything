@@ -2555,6 +2555,11 @@ queue listings; include same-head holds, abbreviated legacy Head markers and mis
 
 ## Drain enqueue confirmation
 
+Queue-state fixtures must use the same candidate repository identity when writing and asserting keys:
+an omitted `repo` uses `cwd#<pr>`, while an explicit `repo` uses `<repo>#<pr>`.
+Empty-net-diff policy clearance requires a readable scorecard store proving no prior completed row
+needs recovery; test unreadable stores with both `resumeOnly` modes and preserve the hold for inspection.
+
 Post-accept admission imports the review scheduler’s `redTeamOwedFor` and `redTeamEnabled` over
 the exact repo/PR/head review payload; acceptance labels alone never establish an owed pass.
 An owed pass waits for the trusted red-team result marker for the exact PR and live head. Replay both GraphQL `author.login` and REST `user.login` bot comments, plus untrusted

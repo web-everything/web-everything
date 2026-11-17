@@ -1835,3 +1835,15 @@ describe('recovery while a quiet review awaits human confirm', () => {
     expect(planRedTeamRecovery(result)).toMatchObject({ mode: 'skip', why: 'review-unfinished' });
   });
 });
+
+describe('legacy empty net diff historical evidence', () => {
+  it('retains a finished skipped status only with exact-head empty net proof', () => {
+    const head = 'a'.repeat(40);
+    const old = { status: { head, status: 'finished', result: { status: 'skipped' },
+      loopPayload: { findings: { read: { netBasis: { rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true } } } },
+      recorded: false, inFlight: false, queued: false };
+    expect(historicalCardOnlySkipCandidate(old)).toBe(true);
+    delete old.status.loopPayload.findings.read.netChangedFiles;
+    expect(historicalCardOnlySkipCandidate(old)).toBe(false);
+  });
+});

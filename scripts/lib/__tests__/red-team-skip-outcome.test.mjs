@@ -403,3 +403,32 @@ describe('stored-review not-owed rule (R730)', () => {
     });
   });
 });
+
+describe('empty net diff policy settlement', () => {
+  it('publishes the terminal policy-clear reason exactly once', () => {
+    const f = fixture();
+    f.io.readStatus = () => ({ head, loopPayload: { findings: { read: { netBasis: { rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true } } } });
+    const skip = { status: 'skipped', policy: 'empty-net-diff', reason: 'red team skipped: empty net diff' };
+    expect(classifyRedTeamSkip(skip).kind).toBe('policy');
+    expect(f.settle(skip).outcome).toBe('policy-clear');
+    expect(f.comments[0].body).toContain('Red team not required on this head: not-owed: empty net diff');
+    expect(f.settle(skip).outcome).toBe('already');
+    expect(f.io.postComment).toHaveBeenCalledTimes(1);
+  });
+});
+
+it.each(['absent', 'unreadable', 'wrong head', 'unscored text', 'nonempty'])('empty net diff settlement refuses %s stored proof', kind => {
+  const f = fixture();
+  const read = { netBasis: { rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true };
+  f.io.readStatus = () => {
+    if (kind === 'unreadable') throw Error('unreadable');
+    if (kind === 'absent') return null;
+    if (kind === 'unscored text') read.diffScored = false;
+    if (kind === 'nonempty') read.diffText = '+code';
+    return { head: kind === 'wrong head' ? 'b'.repeat(40) : head, loopPayload: { findings: { read } } };
+  };
+  const result = f.settle({ status: 'skipped', policy: 'empty-net-diff' });
+  expect(result.outcome).not.toBe('policy-clear');
+  expect(f.io.postComment).not.toHaveBeenCalled();
+  expect(f.io.publishNeedsYou).toHaveBeenCalled();
+});

@@ -12,9 +12,10 @@ import { newRunRecord, writeRun } from '../run-store.mjs';
 import { redTeamOwedOnHead } from '../../lib/review-red-team-policy.mjs';
 import { planRedTeamStatusLabels } from '../../lib/red-team-status-labels.mjs';
 import { redTeamMarker } from '../../lib/red-team-gate.mjs';
-import { speculateRedTeam, runRedTeam } from '../review-extra-seats.mjs';
+import { createRedTeamIo, speculateRedTeam, runRedTeam } from '../review-extra-seats.mjs';
 
 const repo = 'web-everything/web-everything', pr = 5872, head = 'a'.repeat(40);
+const emptySkip = { status: 'skipped', policy: 'empty-net-diff', reason: 'red team skipped: empty net diff' };
 const skipped = { status: 'skipped', policy: 'card-only', reason: 'red team skipped: card-only' };
 const payload = () => ({ runId: 'review-pr-skip', stopped: 'complete',
   verdict: { verdict: 'accept', loop: { outcome: 'converged' }, findings: [], admittedFindings: [] },
@@ -43,6 +44,7 @@ function fixture(redTeam = skipped) {
 
 describe('review-job red-team skip settlement', () => {
   it.each([
+    [emptySkip, emptySkip],
     [{ status: 'skipped', policy: 'card-only' }, { status: 'skipped', policy: 'card-only' }],
     [{ status: 'skipped', reason: 'quota exhausted' }, { status: 'skipped' }],
     [{ status: 'skipped', policy: 'other' }, { status: 'skipped' }],
@@ -74,14 +76,17 @@ describe('review-job red-team skip settlement', () => {
     try {
       runReviewJob({ repo, pr }, f.io);
       const stored = readRedTeamStatus(key);
-      expect(stored.result).toEqual(cardOnly ? { status: 'skipped', policy: 'card-only' } : { status: 'skipped' });
+      expect(stored.result).toEqual(cardOnly ? skipped : { status: 'skipped' });
       expect(normalizeRedTeamResult(stored.result)).toEqual({ priorResult: 'skipped', priorComment: undefined });
       expect(redTeamSkipNeedsSettlement(stored)).toBe(cardOnly);
       expect(readEvidence()).toMatchObject({ loopPayload: f.loopPayload, scheduled: false, recorded: false, inFlight: false, skipCardOnly: true });
       writeRun({ ...newRunRecord({ id: 'review-pr-skip', op: 'review-pr', input: { repo, pr } }), ...f.loopPayload }, env.WE_SHARED_RUNS_DIR);
       if (!cardOnly) {
-        expect(() => production.redTeamStatus({ repo, pr, loopPayload: f.loopPayload, status: 'queued', redTeamMode: 'fresh' })).toThrow('prior pass cannot restart');
-        expect(readRedTeamStatus(key)).toEqual(stored); return;
+        const admission = production.redTeamStatus({ repo, pr, loopPayload: f.loopPayload, status: 'queued', redTeamMode: 'fresh' });
+        expect(admission.redTeamAdmission.retrySpent).toBe(true);
+        expect(readRedTeamStatus(key).retryCount).toBe(1);
+        expect(() => production.redTeamStatus({ repo, pr, loopPayload: f.loopPayload, status: 'queued', redTeamMode: 'fresh' })).toThrow();
+        return;
       }
       const admission = production.redTeamStatus({ repo, pr, loopPayload: f.loopPayload, status: 'queued', redTeamMode: 'fresh' });
       expect(admission.redTeamAdmission.prior).toEqual(cardOnly ? null : {
@@ -800,5 +805,85 @@ describe('readRedTeamOnlyPayload fails closed on a held carry fallback', () => {
   ])('throws a hold for a %s ok:false witness', (_n, witness) => {
     const io = createReviewJobIo({ env: {}, readWitness: () => witness, readSeatRecords: () => [] });
     expect(() => io.readRedTeamOnlyPayload({ pr: 1, repo: 'o/r', head: 'h' })).toThrow(/hold and inspect run evidence/);
+  });
+});
+
+describe('empty net diff producer proof', () => {
+  const read = () => ({ netBasis: { rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true });
+  it('skips a proven empty net diff before provider work with policy and reason', async () => {
+    expect(await speculateRedTeam({ repo, pr, read: read(), env: {} }, { now: () => 1000, readRecords: () => [], log: vi.fn() })).toEqual(emptySkip);
+  });
+  it('refuses empty net diff clearance when the production scorecard reader encounters a directory', async () => {
+    const storePath = mkdtempSync(join(tmpdir(), 'red-team-scorecard-directory-'));
+    try {
+      const production = createRedTeamIo({ env: {}, storePath });
+      expect(production.readRecords()).toEqual([]);
+      const io = { now: () => 1000, readRecords: production.readRecords, log: vi.fn(),
+        cliAvailable: vi.fn(), reserveCalls: vi.fn(), runSeat: vi.fn(), append: vi.fn(), postComment: vi.fn() };
+      const result = await speculateRedTeam({ repo, pr, read: read(), env: {} }, io);
+      expect(result).toEqual({ status: 'skipped', reason: 'scorecard store unreadable — inspect stored evidence before retrying; no call launched' });
+      expect(result).not.toHaveProperty('policy');
+      for (const effect of ['cliAvailable', 'reserveCalls', 'runSeat', 'append', 'postComment']) {
+        expect(io[effect]).not.toHaveBeenCalled();
+      }
+    } finally {
+      rmSync(storePath, { recursive: true, force: true });
+    }
+  });
+  it.each([
+    ['unscored text', r => { r.diffScored = false; }],
+    ['missing text score', r => { delete r.diffScored; }],
+    ['missing score', r => { delete r.netBasis.scored; }],
+    ['missing head', r => { delete r.netBasis.rev; }],
+    ['missing paths', r => { delete r.netChangedFiles; }],
+    ['nonempty paths', r => { r.netChangedFiles = ['scripts/example.mjs']; }],
+    ['unreadable diff', r => { delete r.diffText; }],
+  ])('never grants a policy for %s', async (_, mutate) => {
+    const r = read(); mutate(r);
+    expect(await speculateRedTeam({ repo, pr, read: r, env: {} }, {})).toEqual({ status: 'skipped', reason: 'the review printed no diff' });
+  });
+
+  it('empty net diff preserves resume-only refusal when the scorecard store is unreadable', async () => {
+    const read = { netBasis: { rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true };
+    expect(await speculateRedTeam({ repo, pr, read, env: {}, resumeOnly: true }, {
+      now: () => 1000, readRecords: () => { throw Error('unreadable'); }, log: vi.fn(),
+    })).toEqual({ status: 'skipped', reason: 'resume-only: scorecard store unreadable — no call launched' });
+  });
+  it('empty net diff preserves resume-only refusal when the readable scorecard store has no prior row', async () => {
+    const io = {
+      now: () => 1000, readRecords: () => [], log: vi.fn(),
+      cliAvailable: vi.fn(), reserveCalls: vi.fn(), runSeat: vi.fn(),
+      append: vi.fn(), postComment: vi.fn(),
+    };
+    expect(await speculateRedTeam({ repo, pr, read: read(), env: {}, resumeOnly: true }, io))
+      .toEqual({ status: 'skipped', reason: 'resume-only: no clean prior red-team row — no call launched' });
+    for (const effect of ['cliAvailable', 'reserveCalls', 'runSeat', 'append', 'postComment']) {
+      expect(io[effect]).not.toHaveBeenCalled();
+    }
+  });
+  it.each([
+    ['default', {}],
+    ['resumable', { resumeOnly: false, resume: true }],
+    ['speculative', { resumeOnly: false, resume: false }],
+  ])('refuses empty net diff policy clearance with an unreadable scorecard store (%s)', async (_, mode) => {
+    const io = {
+      now: () => 1000, readRecords: () => { throw Error('unreadable'); }, log: vi.fn(),
+      cliAvailable: vi.fn(), reserveCalls: vi.fn(), runSeat: vi.fn(),
+      append: vi.fn(), postComment: vi.fn(),
+    };
+    expect(await speculateRedTeam({ repo, pr, read: read(), env: {}, ...mode }, io))
+      .toEqual({ status: 'skipped', reason: 'scorecard store unreadable — inspect stored evidence before retrying; no call launched' });
+    for (const effect of ['cliAvailable', 'reserveCalls', 'runSeat', 'append', 'postComment']) {
+      expect(io[effect]).not.toHaveBeenCalled();
+    }
+  });
+  it.each([true, false])('empty net diff preserves completed prior row (resume=%s)', async resume => {
+    const read = { netBasis: { rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true };
+    const row = { dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head, status: 'ok' };
+    const result = await speculateRedTeam({ repo, pr, read, env: {}, resume }, {
+      now: () => 1000, readRecords: () => [row], log: vi.fn(),
+      listComments: () => [{ body: redTeamMarker(pr, head), author: { login: 'web-everything' } }],
+    });
+    expect(result.status).toBe(resume ? 'already-ran' : 'prior-row');
   });
 });
