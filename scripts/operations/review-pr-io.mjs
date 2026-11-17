@@ -71,7 +71,7 @@ import { ledgerFindingKey, REFERRAL_RETIRED_CHANNEL } from '../lib/pr-state/refe
 const MANDATORY_LEDGER_SYNC_PASSES = 3;
 // Card 5469 — the scoped re-review shadow: the declared setting and the pure round rules.
 import { isValidRoundBudget, resolveReviewSettings, resolveReviewSettingSource, SCOPED_REREVIEW_MODES, ROUND_BUDGET_OFF } from '../lib/review-settings.mjs';
-import { acceptanceIds, enclosingSymbol, foldFindingStatuses, lastReviewedHead, reviewRoundOf, reviewScope, shadowRound,
+import { acceptanceIds, enclosingSymbol, foldFindingStatuses, isReviewRunRow, lastReviewedHead, reviewRoundOf, reviewScope, shadowRound,
   FINDING_STATUSES } from '../lib/review-round-rules.mjs';
 import { createFileRunStore, sharedRunsDir } from './run-store.mjs';
 import { notApplied } from './effect-executor.mjs';
@@ -517,7 +517,7 @@ export function readReviewRound({ repo, pr, head, readLedgerRows = defaultReadLe
   if (typeof head !== 'string' || !/^[0-9a-f]{40}$/i.test(head)) return null;
   try {
     const rows = (readLedgerRows(repo) ?? []).filter((r) => Number(r?.pr) === Number(pr)
-      && (r.type === EVENT_TYPES.REVIEW_RUN || r.type === EVENT_TYPES.FINDING));
+      && isReviewRunRow(r));
     return reviewRoundOf(rows, head);
   } catch { return null; }
 }
@@ -537,7 +537,7 @@ export function readReviewRoundAsOf({ repo, pr, at, head = null, readLedgerRows 
   if (!Number.isFinite(t)) return null;
   try {
     const heads = new Set((readLedgerRows(repo) ?? []).filter((r) => Number(r?.pr) === Number(pr)
-      && (r.type === EVENT_TYPES.REVIEW_RUN || r.type === EVENT_TYPES.FINDING) && Date.parse(r.at) <= t
+      && isReviewRunRow(r) && Date.parse(r.at) <= t
       && typeof r.headSha === 'string' && r.headSha).map((r) => r.headSha.toLowerCase()));
     if (typeof head === 'string' && /^[0-9a-f]{40}$/i.test(head)) heads.add(head.toLowerCase());
     return heads.size > 0 ? heads.size : null;
@@ -591,9 +591,9 @@ export function recordScopedRereviewShadow({ payload, exec, readLedgerRows, appe
     let rows = [];
     let ledger = 'ok';
     try { rows = (readLedgerRows(repo) ?? []).filter((r) => Number(r?.pr) === Number(pr)); } catch { rows = []; ledger = 'unreadable'; }
-    // Reviewed heads, in append order: a completed run's review-run row, and the shadow's own finding rows (written at
-    // review time, so a round parked for a ruling is counted too).
-    const reviewRuns = rows.filter((r) => r.type === EVENT_TYPES.REVIEW_RUN || r.type === EVENT_TYPES.FINDING);
+    // Reviewed heads, in append order: review-run rows and the shadow's review-status finding rows.
+    // Red-team dispositions never establish a reviewed head or consume a round.
+    const reviewRuns = rows.filter(isReviewRunRow);
     const fromLedger = ledger === 'ok' ? lastReviewedHead(reviewRuns, head) : null;
     // The ledger names the last reviewed head (edge 6). A PR whose earlier rounds predate the review-run rows falls
     // back to the trusted `Net basis:` marker the latest-fix read already used; anything else is a full review.

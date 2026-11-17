@@ -1913,6 +1913,19 @@ describe('R883 finding dispositions', () => {
     expect(parseLedgerEvents(`${line}\n`)).toEqual([ev]);
   });
 
+  it.each(['open', 'not-real'].flatMap(status =>
+    [undefined, null, '', '   ', 42, 'review-pr', 'other-writer', 'RED-TEAM', ' red-team ', 'red-team\n']
+      .map(source => [status, source])))('rejects %s from an untrusted source %j in the schema and fold', (status, source) => {
+    const trusted = buildLedgerEvent({ ...base, ...fin({ status: 'open' }) });
+    const invalid = { ...trusted, status, source };
+    expect(validateLedgerEvent(invalid).valid).toBe(false);
+    expect(serializeLedgerEvent(invalid).ok).toBe(false);
+    expect(parseLedgerEvents(`${JSON.stringify(invalid)}\n`)).toEqual([]);
+    expect(() => buildLedgerEvent({ ...base, ...fin({ status }), source })).toThrow();
+    expect(foldFindingDispositions([trusted, invalid], { pr: 7 })).toEqual(foldFindingDispositions([trusted], { pr: 7 }));
+    expect(foldFindingDispositions([invalid], { pr: 7 }).size).toBe(0);
+  });
+
   it('still parses an old row (no new fields) and still rejects an unknown status', () => {
     const old = buildLedgerEvent({ ...base, source: 'review-pr', ...fin({ status: 'raised' }) });
     expect(parseLedgerEvents(`${serializeLedgerEvent(old).line}\n`)).toEqual([old]);
