@@ -7,6 +7,7 @@ import { describe, it, expect } from 'vitest';
 import { assembleReviewDetail, parseEscalationReason } from '../review-detail.mjs';
 import { buildEscalationReasonBlock } from '../lib/review-escalation.mjs';
 import { careLevelFromReasons } from '../lib/review-core.mjs';
+import { ADVISORY_NOTE_MARKER } from '../conveyor/advisory-round-count.mjs';
 import { embedManifestInBody, parseManifest } from '../readiness/lane-manifest.mjs';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -110,6 +111,66 @@ describe('assembleReviewDetail — a review:human parked PR', () => {
     expect(d.repo).toBe('chalbert/webeverything');
     expect(d.title).toBe('scripts: something touching the gate policy');
     expect(d.url).toBe('https://github.com/chalbert/webeverything/pull/2470');
+  });
+});
+
+describe('assembleReviewDetail — current advisory notes (#3659)', () => {
+  const createdAt = '2026-08-01T13:00:00Z';
+  const body = [
+    ADVISORY_NOTE_MARKER,
+    'This PR carries `review:human`. The independent',
+    'AI review below ran automatically, before the required human review ceremony — it has neither accepted nor',
+    'bounced this PR. No `review:*` label was changed and no decision was recorded.',
+    '',
+    '## ⚠️ Advisory review (informational only) — chalbert/webeverything#2470',
+    '',
+    '**Verdict:** human review required',
+  ].join('\n');
+
+  it('captures a current advisory note body and timestamp after a legacy advisory', () => {
+    const d = assembleReviewDetail({ view: {
+      ...parkedHumanView,
+      comments: [...parkedHumanView.comments, { body, createdAt }],
+    } });
+    expect(d.advisoryComment).toBe(body);
+    expect(d.advisoryCommentAt).toBe(createdAt);
+  });
+
+  it('keeps selecting the latest human verdict and ignores embedded human markers', () => {
+    const human = { body: '  ✅ human review — accepted', createdAt: '2026-08-01T14:00:00Z' };
+    const d = assembleReviewDetail({ view: {
+      ...parkedHumanView,
+      comments: [...parkedHumanView.comments, human, { body: `${body}\n\nQuoted: 🔁 human review`, createdAt }],
+    } });
+    expect(d.humanComment).toBe(human.body);
+    expect(d.humanCommentAt).toBe(human.createdAt);
+  });
+
+  it('ignores a quoted or inline mention of the heading from a later comment', () => {
+    const quoted = { body: `> ## ⚠️ Advisory review (informational only) — x#1\n\nI disagree`, createdAt: '2026-08-02T00:00:00Z' };
+    const fenced = { body: '```\n## ⚠️ Advisory review (informational only) — x#1\n```', createdAt: '2026-08-04T00:00:00Z' };
+    const inline = { body: 'see the Advisory review (informational only) above', createdAt: '2026-08-03T00:00:00Z' };
+    const d = assembleReviewDetail({ view: { comments: [{ body, createdAt }, quoted, inline, fenced] } });
+    expect(d.advisoryComment).toBe(body);
+    expect(d.advisoryCommentAt).toBe(createdAt);
+  });
+
+  it('matches the real renderAdvisoryNote output so the duplicated heading cannot drift', async () => {
+    const { renderAdvisoryNote } = await import('../operations/review-pr.mjs');
+    const note = renderAdvisoryNote({
+      read: {
+        repo: 'chalbert/webeverything', pr: 2470, disposition: 'converge', degraded: false,
+        netBasis: { base: '0'.repeat(40), rev: '1'.repeat(40) }, netChangedFiles: ['scripts/review-detail.mjs'],
+      },
+      verdict: { verdict: 'changes', lensVerdicts: {}, findings: [] },
+    });
+    expect(note).toContain(ADVISORY_NOTE_MARKER);
+    expect(note).not.toContain('🤖 advisory AI review');
+    const d = assembleReviewDetail({ view: { comments: [{ body: note, createdAt }] } });
+    expect(d.advisoryComment).toBe(note);
+    expect(d.advisoryCommentAt).toBe(createdAt);
+    expect(d.humanComment).toBeNull();
+    expect(d.humanCommentAt).toBeNull();
   });
 });
 

@@ -26,10 +26,17 @@ import { ESCALATION_REASON_MARKER, REVIEW_LABELS, hasReviewLabel } from './lib/r
 import { deriveReviewDisposition, careLevelFromReasons } from './lib/review-core.mjs';
 import { deriveResolutionBasis, renderResolutionBasisBanner } from './lib/review-render.mjs';
 import { extractManifestFromBody } from './readiness/lane-manifest.mjs';
+import { ADVISORY_NOTE_MARKER } from './conveyor/advisory-round-count.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
 
 /** The drain's advisory AI-review comment marker (the body the drain posts on an agent-review park). */
 const ADVISORY_MARKER = '🤖 advisory AI review';
+/** Duplicated from review-pr.mjs renderAdvisoryNote; pinned against that producer in the tests. */
+const ADVISORY_HEADING = 'Advisory review (informational only)';
+/** A current note opens with the producer's marker AND carries the heading, so quoted, fenced or inline mentions never match. */
+const isCurrentAdvisoryNote = (b) => b.trimStart().startsWith(ADVISORY_NOTE_MARKER) && ADVISORY_HEADING_RE.test(b);
+/** The heading only counts as a line-start markdown heading, so a quoted (`> `) or inline mention never matches. */
+const ADVISORY_HEADING_RE = new RegExp(`^#{1,6}[ \\t]+(?:\\S+[ \\t]+)?${ADVISORY_HEADING.replace(/[().]/g, '\\$&')}`, 'm');
 /** A prior human-verdict comment starts with one of these (accept ✅ / bounce-back 🔁). */
 const HUMAN_MARKERS = ['✅ human review', '🔁 human review'];
 
@@ -122,7 +129,7 @@ export function assembleReviewDetail({ view } = {}) {
     }
     return null;
   };
-  const advisoryMatch = lastMatchingComment((b) => b.includes(ADVISORY_MARKER));
+  const advisoryMatch = lastMatchingComment((b) => b.includes(ADVISORY_MARKER) || isCurrentAdvisoryNote(b));
   const humanMatch = lastMatchingComment((b) => HUMAN_MARKERS.some((m) => b.trimStart().startsWith(m)));
   const advisoryComment = advisoryMatch ? bodyOf(advisoryMatch) : null;
   const humanComment = humanMatch ? bodyOf(humanMatch) : null;
