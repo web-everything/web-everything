@@ -1,9 +1,14 @@
 /** Optional resolver inputs. Launch composition and final policy checks belong to each resolver. */
-import { cascadePolicy, resolveCascade, logCascadeSources } from './policy-cascade.mjs';
-import { readSettings } from './settings-files.mjs';
-import { resolvePolicyModel, resolvePolicyEffort } from './dispatch-routing-policy.mjs';
+import { readFileSync } from 'node:fs';
+import { cascadePolicy, resolveCascade, logCascadeSources, readPlatformPreferences } from './policy-cascade.mjs';
+import { readSettings, readDeclaredSettings } from './settings-files.mjs';
+import { resolvePolicyModel, resolvePolicyEffort, resolveOperationRoute, operationEffort, defaultPolicyModel,
+  DEFAULT_ROUTING_POLICY, validateRoutingPolicy } from './dispatch-routing-policy.mjs';
+import { resolveCodexTaskRoute } from './codex-task-route.mjs';
+import { workerTierFor, selectReviewSeatProvider, decideCriticalWorkGate } from './provider-routing.mjs';
+import { criticalWorkVerdict } from './critical-work.mjs';
 import { CODEX_MODEL_CATALOGUE, CODEX_EFFORT_MAP, codexModelSupportsEffort } from './codex-model-routing.mjs';
-import { FIX_EXECUTOR_RUNGS } from './fix-executor-chain.mjs';
+import { FIX_EXECUTOR_RUNGS, resolveFixExecutorChain, pickChainRung } from './fix-executor-chain.mjs';
 import { loadAccountMap } from './claude-account.mjs';
 
 export const AI_ROUTING_ROLES = Object.freeze(['review', 'red-team', 'red-team-recheck', 'fix', 'build', 'prepare', 'ci-heal', 'worker', 'judge', 'helper']);
@@ -151,4 +156,203 @@ export function aiRoutingInputs(role, resolved) {
     coordinator: Object.keys(coordinator).length ? structuredClone(coordinator) : undefined,
     executors: setting.executors === 'inherit' ? undefined : structuredClone(setting.executors),
   };
+}
+
+/** A refusal is actionable evidence: fix/remove the named setting, or escalate to the operator. */
+export class AiRoutingRefusal extends Error {
+  constructor(code, role, siteKey, detail) {
+    super(`ai-routing refusal (${code}) ${role}@${siteKey}: ${detail}; correct the input or ask the operator`);
+    this.name = 'AiRoutingRefusal';
+    Object.assign(this, { code, role, siteKey, detail });
+  }
+}
+
+// Codex families intentionally have no relative ordering (F4). Cross-family changes refuse.
+export const AI_ROUTING_MODEL_RANKS = freeze({
+  claude: { 'claude-haiku-5-5': 1, 'claude-sonnet-5-5': 2, 'claude-opus-5-5': 3 },
+  codex: Object.fromEntries(Object.keys(CODEX_MODEL_CATALOGUE).map(model => [model, 1])),
+  'agy-claude': { 'claude-sonnet-5-5': 2, 'claude-sonnet-5-5-low': 2,
+    'claude-sonnet-5-5-medium': 2, 'claude-sonnet-5-5-high': 2,
+    'claude-opus-5-5-low': 3, 'claude-opus-5-5-medium': 3, 'claude-opus-5-5-high': 3 },
+});
+export const AI_ROUTING_EFFORT_RANKS = freeze({ low: 0, medium: 1, high: 2, xhigh: 3, max: 4, ultra: 5 });
+export const AI_ROUTING_FLOORS = freeze({
+  review: 'raise-only', 'red-team': 'provider-only', 'red-team-recheck': 'claude-only',
+  judge: 'raise-only-same-model', 'ci-heal': 'raise-only-claude-only', helper: 'raise-only-claude-only',
+  fix: 'none', build: 'none', prepare: 'none', worker: 'none',
+});
+
+// PR0 sites are deliberately just the role names. Adding a real call site is a separate migration.
+const launchSites = freeze({
+  review: { role: 'review', operation: 'review-seat', kind: 'review', readsRepo: false },
+  'red-team': { role: 'red-team', operation: 'review-seat', taskType: 'red-team', kind: 'review', readsRepo: false },
+  'red-team-recheck': { role: 'red-team-recheck', operation: 'review-recheck', kind: 'review', readsRepo: true },
+  judge: { role: 'judge', operation: 'judge', kind: 'review', readsRepo: false },
+  helper: { role: 'helper', operation: 'precedent-draft', kind: 'worker', readsRepo: true },
+  'ci-heal': { role: 'ci-heal', operation: 'ci-heal', kind: 'ci-heal', readsRepo: true },
+  fix: { role: 'fix', operation: 'fix', kind: 'fix', readsRepo: true },
+  build: { role: 'build', operation: 'build', kind: 'build', readsRepo: true },
+  prepare: { role: 'prepare', operation: 'prepare-item', kind: 'prepare', readsRepo: true },
+  worker: { role: 'worker', operation: 'worker', kind: 'worker', readsRepo: true },
+});
+
+function scanLaunchLayer(block, path, valid, refuse) {
+  if (!object(block) || !Object.keys(block).length) refuse('invalid-setting', `${path}: expected a nonempty object`);
+  for (const [key, value] of Object.entries(block)) {
+    const leaf = path.includes('.') ? `${path.slice(path.indexOf('.') + 1)}.${key}` : key;
+    if (object(value)) {
+      // Only declared object nodes may be traversed; this also rejects prototype keys.
+      const node = leaf === 'executorProfiles' || AI_ROUTING_ROLES.includes(leaf)
+        || AI_ROUTING_ROLES.some(role => leaf === `${role}.coordinator`)
+        || Object.keys(FIX_EXECUTOR_RUNGS).some(id => leaf === `executorProfiles.${id}`);
+      if (!node) refuse('invalid-setting', `${path}.${key}: unknown object`);
+      scanLaunchLayer(value, `${path}.${key}`, valid, refuse);
+    } else if (value === null || Array.isArray(value) || !valid[leaf](value)) {
+      refuse('invalid-setting', `${path}.${key}: invalid value`);
+    }
+  }
+}
+
+function launchBaseline(site, ctx, policy, options) {
+  let route = resolveOperationRoute(options);
+  if (!route && site.role === 'fix') {
+    const chain = resolveFixExecutorChain({ env: ctx.env, platform: ctx.chainPlatform ?? {}, repo: ctx.repo ?? {} });
+    const picked = pickChainRung({ ...ctx, chain: chain.value,
+      critical: options.gateClosed, criticalClaudeFromRung: chain.criticalClaudeFromRung });
+    route = { provider: picked.executor, ...picked.policyRoute };
+  }
+  if (!route && ['review', 'red-team'].includes(site.role) && !ctx.mandatoryLens) {
+    const picked = selectReviewSeatProvider({ ...ctx, lens: options.taskType ?? site.role });
+    if (!picked.provider) throw new TypeError('no available review seat provider');
+    route = { provider: picked.provider };
+  }
+  route ??= { provider: 'claude' };
+  if (route.provider === 'codex') {
+    const codex = resolveCodexTaskRoute({ ...ctx, kind: site.kind, env: ctx.env,
+      tool: ctx.codexTool ?? {}, platform: ctx.codexPlatform ?? {}, log: false,
+      ...(route.model ? { standard: { model: route.model, effort: route.effort } } : {}) });
+    route = { ...route, model: codex.model, effort: codex.effort };
+  } else {
+    const tier = workerTierFor({ ...ctx, kind: site.kind }).tier;
+    route = { ...route, model: resolvePolicyModel(route.provider,
+      ctx.model ?? route.model ?? (route.provider === 'claude' ? tier : defaultPolicyModel(route.provider)), policy),
+    effort: resolvePolicyEffort(route.provider, ctx.effort ?? route.effort
+      ?? operationEffort(site.operation, route.provider, options.taskType, policy)) };
+  }
+  return route;
+}
+
+function checkLaunchFloor(base, route, rule, refuse) {
+  const beforeEffort = AI_ROUTING_EFFORT_RANKS[base.effort];
+  const afterEffort = AI_ROUTING_EFFORT_RANKS[route.effort];
+  if (beforeEffort === undefined || afterEffort === undefined || afterEffort < beforeEffort) {
+    refuse('floor', 'effort is below the baseline or unranked');
+  }
+  if (rule === 'provider-only') {
+    // Red-team may select another provider's native model; within one provider the pair is fixed.
+    if (base.provider === route.provider && (base.model !== route.model || base.effort !== route.effort)) {
+      refuse('floor', 'red-team permits provider changes only');
+    }
+    return;
+  }
+  if (rule === 'raise-only-same-model' && base.model !== route.model) refuse('floor', 'judge model is fixed');
+  if (base.provider === 'codex' || route.provider === 'codex') {
+    if (base.provider !== route.provider || base.model !== route.model) refuse('floor', 'Codex model ordering is unknown; keep the same model');
+  } else if (base.model !== route.model || base.provider !== route.provider) {
+    const before = AI_ROUTING_MODEL_RANKS[base.provider]?.[base.model];
+    const after = AI_ROUTING_MODEL_RANKS[route.provider]?.[route.model];
+    if (before === undefined || after === undefined || after < before) refuse('floor', 'model is below the baseline or unranked');
+  }
+}
+
+/**
+ * Resolve a launch without consulting ambient environment. ctx.env is the full launch environment.
+ * ctx.platform / ctx.tool are raw aiRouting blocks; omit them to read the declared files.
+ * Route evidence (policy, operatorKeys, availability, vetoes, pins, care, scope) is supplied in ctx.
+ * budget is launch-owned and copied unchanged; settings cannot supply it. No consumer opts in in PR0.
+ */
+export function resolveLaunchSpec(role, siteKey, ctx) {
+  const refuse = (code, detail) => { throw new AiRoutingRefusal(code, role, siteKey, detail); };
+  try {
+    if (!object(ctx) || !Object.hasOwn(ctx, 'env') || !object(ctx.env)) refuse('environment', 'ctx.env is required');
+    const site = Object.hasOwn(launchSites, siteKey) && launchSites[siteKey];
+    if (!site || site.role !== role) refuse('site', 'unknown site or role mismatch');
+    const valid = aiRoutingValidators({ accountMap: ctx.accountMap ?? { accounts: {} } });
+    let platform = ctx.platform;
+    if (!Object.hasOwn(ctx, 'platform')) {
+      if (ctx.env.WE_PLATFORM_PREFERENCES_FILE) {
+        // An explicitly selected file is required evidence, including when it does not exist.
+        try { readFileSync(ctx.env.WE_PLATFORM_PREFERENCES_FILE, 'utf8'); }
+        catch (error) { refuse('settings-read', error.message); }
+      }
+      const loaded = readPlatformPreferences({ env: ctx.env, warn: () => {}, readFile: (path, encoding) => {
+        const raw = readFileSync(path, encoding);
+        const parsed = JSON.parse(raw);
+        if (object(parsed) && Object.hasOwn(parsed, 'aiRouting')) scanLaunchLayer(parsed.aiRouting, 'platform', valid, refuse);
+        return raw;
+      } });
+      if (loaded.errors.length) refuse('settings-read', loaded.errors.join('; '));
+      platform = loaded.prefs.aiRouting;
+    }
+    let tool = ctx.tool;
+    if (!Object.hasOwn(ctx, 'tool')) {
+      const loaded = readDeclaredSettings();
+      if (loaded.errors.length || loaded.duplicates.length) refuse('settings-read', 'declared settings are unreadable or ambiguous');
+      tool = loaded.settings.aiRouting;
+    }
+    let envBlock;
+    if (ctx.env.WE_AI_ROUTING !== undefined) {
+      if (typeof ctx.env.WE_AI_ROUTING !== 'string') refuse('invalid-setting', 'WE_AI_ROUTING must be JSON text');
+      envBlock = JSON.parse(ctx.env.WE_AI_ROUTING);
+    }
+    for (const [layer, block] of [['platform', platform], ['tool', tool], ['env', envBlock]]) {
+      if (block === undefined) continue;
+      if (AI_ROUTING_FLOORS[role] === 'none' && object(block) && block[role]) {
+        const changes = value => object(value) ? Object.values(value).some(changes) : value !== 'inherit';
+        if (changes(block[role])) refuse('writer', 'writer settings cannot change this launch');
+      }
+      scanLaunchLayer(block, layer, valid, refuse);
+    }
+    const resolved = resolveAiRouting({ platform: platform ?? {}, tool: tool ?? {}, env: ctx.env,
+      log: ctx.log ?? false, accountMap: ctx.accountMap ?? { accounts: {} } });
+    if (resolved.invalid.length) refuse('invalid-setting', resolved.invalid.join('; '));
+    const inputs = aiRoutingInputs(role, resolved);
+    if (inputs.executors) refuse('unsupported-overlay', 'executor changes have no PR0 launch consumer');
+    if (resolved.value[role].coordinator.account !== 'inherit') refuse('unsupported-overlay', 'account changes have no PR0 launch consumer');
+    const policy = validateRoutingPolicy(ctx.policy ?? DEFAULT_ROUTING_POLICY);
+    const gate = decideCriticalWorkGate(policy.criticalWorkGate, site.kind, ctx.taskType ?? site.taskType,
+      { criticalWork: criticalWorkVerdict(ctx), criticalMisses: ctx.criticalMisses });
+    const options = { ...ctx, operation: site.operation, taskType: ctx.taskType ?? site.taskType, policy,
+      gateClosed: ctx.gateClosed === true || gate?.open === false,
+      vetoes: [...(ctx.vetoes ?? []), ...(gate?.vetoes ?? [])] };
+    const baseline = launchBaseline(site, ctx, policy, options);
+    const locked = ctx.mandatoryLens || ctx.care || ctx.pinned || ctx.resume || ctx.model !== undefined || ctx.effort !== undefined;
+    const overlay = locked ? undefined : inputs.coordinator;
+    // Concretize inherited routes with their actual legacy selection, then run the SAME validator.
+    // Keep policy fallback/mode and operator keys so overlays cannot bypass operator decisions.
+    const key = options.taskType ? `${site.operation}:${options.taskType}` : site.operation;
+    const effectivePolicy = { ...policy, operations: { ...policy.operations,
+      [key]: { provider: baseline.provider, model: baseline.model, effort: baseline.effort,
+        fallback: baseline.fallback ?? [], ...(baseline.mode ? { mode: baseline.mode } : {}) } } };
+    // Preserve provider controls from the original entry when concretizing inheritance.
+    for (const entry of [policy.operations[site.operation], policy.operations[key]]) {
+      if (entry?.disabledProviders) effectivePolicy.operations[key].disabledProviders =
+        [...new Set([...(effectivePolicy.operations[key].disabledProviders ?? []), ...entry.disabledProviders])];
+    }
+    const route = resolveOperationRoute({ ...options, policy: effectivePolicy, aiRouting: overlay });
+    if (!route) refuse('route', 'no concrete launch route');
+    const changed = ['provider', 'model', 'effort'].some(field => route[field] !== baseline[field]);
+    const readsRepo = site.readsRepo || ctx.readsRepo === true;
+    if (changed && ((readsRepo || ['red-team-recheck', 'ci-heal', 'helper'].includes(role)) && route.provider !== 'claude')) {
+      refuse('provider', 'this seat can only change to native Claude');
+    }
+    checkLaunchFloor(baseline, route, AI_ROUTING_FLOORS[role], refuse);
+    return freeze({ provider: route.provider, model: route.model, effort: route.effort, env: structuredClone(ctx.env),
+      readsRepo, budget: structuredClone(ctx.budget ?? null),
+      floor: { rule: AI_ROUTING_FLOORS[role], provider: baseline.provider, model: baseline.model, effort: baseline.effort },
+      sources: { baseline: siteKey, settings: resolved.sources }, overlay: overlay ? structuredClone(overlay) : null });
+  } catch (error) {
+    if (error instanceof AiRoutingRefusal) throw error;
+    refuse('resolver', error instanceof Error ? error.message : String(error));
+  }
 }
