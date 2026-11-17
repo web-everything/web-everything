@@ -459,7 +459,7 @@ describe('canonicalAuditEvidence', () => {
 
   describe('production loader binds scoped evidence to the branch item card INVARIANTS block', () => {
     const section = '- Keep the admission guard.\n- Never widen scope.\n';
-    const card = (body = section, heading = '## INVARIANTS') => `---\nstatus: open\n---\n\n# Demo\n\n${heading}\n${body}\n## Acceptance\n\n- [A1] x\n`;
+    const card = (body = section, heading = '## INVARIANTS') => `---\nstatus: open\n---\n\n# Demo\n\n${heading}\n${body}`; // section last: its bytes are exactly `body`
     const hashOf = (text) => createHash('sha256').update(text).digest('hex');
     const run = (records, cards, branch = 'lane/1234-demo') => auditedFixture('refuse', { audits: auditLines(records), auditBaseInMain: TREE, cards })
       .run({ branch, dryRun: true });
