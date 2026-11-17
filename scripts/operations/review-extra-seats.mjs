@@ -1240,7 +1240,8 @@ function aiSeatRoute(role, current, { env, io, available, operation, taskType, p
   // Retain matching policy defaults, otherwise use the seat's provider defaults.
   const defaults = [configured, ...(configured?.fallback ?? [])].find(route => route?.provider === provider);
   const model = defaults?.model ?? (role === 'red-team-recheck' ? RECHECK_MODEL : RED_TEAM_MODELS[provider].model);
-  const effort = defaults?.effort ?? resolveOperationEffort(operation, provider, taskType, effectivePolicy);
+  // Operation effort may be a scalar belonging to a different provider (e.g. Codex xhigh).
+  const effort = defaults?.effort ?? (role === 'red-team-recheck' ? RECHECK_EFFORT : RED_TEAM_MODELS[provider].effort);
   // A policy disable must reject the overlay even when it also made the provider
   // unavailable via a zero cap. Do not let a fallback mask that rejection.
   const route = validateAiSeatRoute({ operation, taskType, available: [provider], policy: effectivePolicy,

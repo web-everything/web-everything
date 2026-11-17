@@ -101,10 +101,10 @@ test('red-team overlays only provider and ignores executors', async () => {
 });
 
 for (const fallback of [[], [{ provider: 'agy-gemini', model: 'flash', effort: 'high' }]]) {
-  test(`red-team provider overlay works without a matching repository fallback (${fallback.length} fallbacks)`, async () => {
+  test.each(['high', 'xhigh'])(`red-team provider overlay works without a matching repository fallback (%s, ${fallback.length} fallbacks)`, async effort => {
     const policy = structuredClone(DEFAULT_ROUTING_POLICY);
     policy.operations['review-seat:red-team'] = {
-      provider: 'codex', model: 'astra', effort: 'high', fallback,
+      provider: 'codex', model: 'astra', effort, fallback,
     };
     const readRoutingPolicy = createRoutingPolicyReader({ env: {},
       read: () => JSON.stringify(policy),
@@ -116,6 +116,7 @@ for (const fallback of [[], [{ provider: 'agy-gemini', model: 'flash', effort: '
     assert.deepEqual(readRoutingPolicy.operatorKeys(), []);
     assert.equal(baseline.result.status, 'speculated');
     assert.equal(baseline.calls[0].provider, 'codex');
+    assert.equal(baseline.calls[0].effort, effort);
     const actual = await seat(() => resolved, { readRoutingPolicy });
     assert.equal(actual.result.status, 'speculated', actual.result.reason);
     assert.deepEqual(actual.reservations, ['agy-claude']);
@@ -207,9 +208,9 @@ for (const unavailable of ['policy cap', 'explicit cap', 'CLI', 'quota']) {
   }
 }
 
-test('Claude recheck overlay uses seat defaults without a matching repository fallback', async () => {
+test.each(['high', 'xhigh'])('Claude recheck overlay uses seat defaults without a matching repository fallback (%s)', async effort => {
   const policy = structuredClone(DEFAULT_ROUTING_POLICY);
-  policy.operations['review-recheck'] = { provider: 'codex', model: 'astra', effort: 'high', fallback: [] };
+  policy.operations['review-recheck'] = { provider: 'codex', model: 'astra', effort, fallback: [] };
   const baseline = resolveOperationRoute({ operation: 'review-recheck', policy });
   // The initial recheck read uses the module's global policy reader; inject its resolved snapshot.
   const resolved = vi.spyOn(routingPolicyIo, 'resolveOperationRoute').mockReturnValueOnce(baseline);
