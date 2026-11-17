@@ -24,6 +24,11 @@ describe('runCliToFile', () => {
     expect(out.endsWith('TAIL-MARKER')).toBe(true);
   }, 60000);
 
+  it('fails with a typed error naming the limit when output exceeds it', () => {
+    const script = `const l = 'y'.repeat(1023) + '\\n'; for (let i = 0; i < 270 * 1024; i++) process.stdout.write(l);`;
+    expect(() => runCliToFile('node', ['-e', script])).toThrow(/MAX_OUTPUT_BYTES/);
+  }, 60000);
+
   it('throws a typed error on non-zero exit', () => {
     expect(() => runCliToFile('node', ['-e', 'process.exit(3)'])).toThrow(CliBatchError);
     try {

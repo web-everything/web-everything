@@ -12,6 +12,9 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
+/** Generous explicit ceiling on the child's stdout (read back into memory); exceeding it is a typed error. */
+const MAX_OUTPUT_BYTES = 256 * 1024 * 1024;
+
 /** Typed failure so callers/CI can tell a child failure from a parse failure. */
 class CliBatchError extends Error {
   constructor(message, details) {
@@ -50,6 +53,13 @@ function runCliToFile(cmd, args, opts = {}) {
     }
     fs.closeSync(outFd);
     outFd = undefined;
+    const size = fs.statSync(outPath).size;
+    if (size > MAX_OUTPUT_BYTES) {
+      throw new CliBatchError(
+        `[cli-batch] ${cmd} wrote ${size} bytes of stdout, over the ${MAX_OUTPUT_BYTES}-byte limit (MAX_OUTPUT_BYTES)`,
+        { size, limit: MAX_OUTPUT_BYTES },
+      );
+    }
     return fs.readFileSync(outPath, 'utf8');
   } finally {
     if (inFd !== undefined) fs.closeSync(inFd);
@@ -58,4 +68,4 @@ function runCliToFile(cmd, args, opts = {}) {
   }
 }
 
-module.exports = { runCliToFile, CliBatchError };
+module.exports = { runCliToFile, CliBatchError, MAX_OUTPUT_BYTES };
