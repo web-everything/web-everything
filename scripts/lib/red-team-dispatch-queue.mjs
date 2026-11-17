@@ -1,3 +1,4 @@
+import { redTeamRecoveryRefusals, isRedTeamRecoveryRefusal } from './red-team-request.mjs';
 import { failClosedCapacity } from './operator-override-reader.mjs';
 import { readOperatorPolicy } from './policy-cascade.mjs';
 import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
@@ -300,9 +301,10 @@ const readableCapacity = capacity => !!capacity && typeof capacity.lanes === 'nu
 
 export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCapacity, run, log = () => {},
   floor, readCpuIdlePct, readSkipCardOnly = () => readRedTeamProbes().value.skipCardOnly, readNetFiles = args => isUnderTest() ? { ok: false } : readBacklogOnlyNetFiles(args), ...rest }) {
+  plan = { ...plan, refusals: redTeamRecoveryRefusals({ repo, refusals: plan?.refusals, rawPrs }) };
   const candidates = [], cardOnlyCandidates = [];
   for (const row of plan?.refusals ?? []) {
-    if (row.kind !== 'already-reviewed-head') continue;
+    if (!isRedTeamRecoveryRefusal(row)) continue;
     const head = row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid;
     if (!isRealHead(head)) continue;
     const number = Number(row.prNumber), key = `${repo}#${number}@${head}`;
@@ -358,10 +360,10 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
     const refusals = [...kept.filter(row => !bypassed.has(Number(row.prNumber))), ...kept.filter(row => bypassed.has(Number(row.prNumber)))];
     // Replace admitted candidate slots in FIFO order while preserving unrelated rows and metadata.
     const queuedRows = admitted.flatMap(entry => refusals.filter(row =>
-      row.kind === 'already-reviewed-head' && Number(row.prNumber) === entry.pr));
+      isRedTeamRecoveryRefusal(row) && Number(row.prNumber) === entry.pr));
     let index = 0;
     const options = { repo, plan: { ...plan, refusals: refusals.map(row =>
-      row.kind === 'already-reviewed-head' && allowed.has(Number(row.prNumber)) ? queuedRows[index++] : row) },
+      isRedTeamRecoveryRefusal(row) && allowed.has(Number(row.prNumber)) ? queuedRows[index++] : row) },
     rawPrs: held.size ? rawPrs?.filter(pr => !held.has(Number(pr.number))) : rawPrs, capacity, log, ...rest };
     const finish = result => {
       queue.settle(repo, result);

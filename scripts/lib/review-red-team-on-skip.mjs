@@ -1,4 +1,5 @@
 /** Recover an owed red-team result on an already-reviewed head through the existing review job. */
+import { redTeamRecoveryRefusals, isRedTeamRecoveryRefusal, RED_TEAM_REQUEST_KIND } from './red-team-request.mjs';
 import { execFileSync } from 'node:child_process';
 import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
 import { readFileSync, statSync } from 'node:fs';
@@ -481,11 +482,12 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
   readSeal = isUnderTest() || isUnderTest(env) ? null : readSealedStatus,
   setting, lastDispatch, readCheckFact, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions,
   headNeverReviewed = headNeverReviewedFromRuns, readReviewRuns = defaultReadReviewRuns, readCarriedCheck = () => false }) {
-  return refusals.filter(r => r?.kind === 'already-reviewed-head').map(refusal => {
+  return redTeamRecoveryRefusals({ repo, refusals, rawPrs }).filter(isRedTeamRecoveryRefusal).map(refusal => {
     const pr = Number(refusal.prNumber);
     const rawPr = (rawPrs ?? []).find(p => Number(p?.number) === pr);
     const head = rawPr?.headRefOid ?? null;
     const row = { prNumber: pr, head, action: 'skip' };
+    const requestedRecovery = refusal.kind === RED_TEAM_REQUEST_KIND;
     const skip = why => ({ ...row, why });
     // #6606: a verdict carry settles the head with a result but no round, so nothing else republishes its check. While
     // its outbox marker says the check is unconfirmed, a result on head is not settled: republish from live evidence,
@@ -591,6 +593,25 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (evidence?.carryConflict) return skip('later review supersedes the carry');
       const unfinishedCarry = evidence?.carry && evidence.carry.step !== 'done';
       if (redTeamForHead(rawPr.comments, pr, head) && !unfinishedCarry) return resultOnHead();
+      const human = Array.isArray(rawPr.labels) && rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:human');
+      if (refusal.kind === RED_TEAM_REQUEST_KIND && human
+        && evidence?.loopPayload?.findings?.read?.netBasis?.rev !== head) {
+        // An old advisory cannot authorize a red-team-only run at a new SHA. Ask for the ordinary
+        // advisory loop first, whose confirm invariant retains review:human and whose finish runs red team.
+        // This is the same head-bound CI waiver as the existing human-handoff advisory path; the
+        // dispatcher re-reads CI and refuses unknown/malformed evidence. No acceptance is synthesized.
+        if (evidence?.inFlight !== false || evidence.queued || evidence.recorded !== false
+          || evidence.seatRecorded !== false || evidence.completedRecorded === true
+          || readStatus({ repo, pr, head }) != null) return skip('live-head review or red-team state is not absent');
+        if (rawPr.scopeBloat || rawPr.referralHold) return skip('scope or referral hold prevents advisory recovery');
+        if (rawPr.labels.some(label => {
+          const name = typeof label === 'string' ? label : label?.name;
+          return name.startsWith('review:') && !['review:human', 'review:pending'].includes(name);
+        })) return skip('additional review hold prevents advisory recovery');
+        if (!Array.isArray(rawPr.reviews)) return skip('PR reviews unreadable; inspect formal reviews before advisory recovery');
+        return dispatchDecision({ action: 'review', advisoryHead: head,
+          why: 'human hold at an unreviewed head needs an advisory review before red team' });
+      }
       const accepted = Array.isArray(rawPr.labels) && rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:accepted');
       if (evidence?.inFlight || evidence?.queued) return skip('red-team pass in flight');
       const reviews = Array.isArray(rawPr.reviews) ? rawPr.reviews : null;
@@ -665,7 +686,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       };
       // A missing live-head review requires the full loop; stale reads cannot authorize a red-team-only pass.
       const storedHead = evidence?.loopPayload?.findings?.read?.netBasis?.rev;
-      const needsReview = !movedCardOnly && !pendingCardOnly && !unfinishedCarry && accepted
+      const needsReview = !movedCardOnly && !pendingCardOnly && !unfinishedCarry && (accepted || refusal.kind === RED_TEAM_REQUEST_KIND)
         && (evidence?.loopPayload == null || (isRealHead(storedHead) && storedHead !== head))
         && evidence?.inFlight === false && !evidence.queued
         && evidence.recorded === false && evidence.seatRecorded === false
@@ -673,6 +694,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         && (evidence.status == null || (isRealHead(evidence.status.head) && evidence.status.head !== head))
         && readStatus({ repo, pr, head }) == null;
       const fullReviewDecision = (why, { referralsRuled = false } = {}) => {
+        if (requestedRecovery && (rawPr.scopeBloat || rawPr.referralHold)) return skip('scope or referral hold prevents requested review');
         // R640: pending is a merge hold, and does not prevent the full review.
         // Once every refused referral is ruled, the daemon's own "referrals need a ruling" pause notice (trusted author
         // only) is settled, and the parked run's retained review:pending is the resume's own label. Every other hold stands.
@@ -680,7 +702,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           ? rawPr.comments.filter(comment => !isSettledReferralPauseNotice(comment, { persistRecovered: true })) : rawPr.comments;
         const guardAcceptance = referralsRuled ? (accepted ? latestAcceptRecord(guardComments, reviews) : null) : acceptance;
         const context = { labels: rawPr.labels, acceptance: guardAcceptance, comments: guardComments, reviews,
-          settlesPending: true, settlesReviewPending: referralsRuled };
+          settlesPending: true, settlesReviewPending: referralsRuled || requestedRecovery };
         const refusal = publishableClearGuard(context);
         if (refusal) return guardedSkip(refusal);
         // Formal holds apply even without an acceptance comment. No timestamp
@@ -917,7 +939,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
   try {
     const at = now();
     const resolved = setting ?? resolveReviewRedTeamOnSkip({ env, log: note }).value;
-    const refusals = plan?.refusals ?? [];
+    const refusals = redTeamRecoveryRefusals({ repo, refusals: plan?.refusals, rawPrs });
     // Reconcile rows omit formal reviews. Read recovery candidates, including unaccepted not-owed heads,
     // once per PR, without mutating the daemon's shared snapshot. Failed/oversized
     // reads stay unknown: the planner requires operator inspection before clearing.
@@ -928,13 +950,14 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     const planningPrs = (rawPrs ?? []).map(rawPr => {
       const pr = Number(rawPr?.number), head = rawPr?.headRefOid;
       if (!resolved.enabled || Array.isArray(rawPr?.reviews) || !isRealHead(head)
-        || !refusals.some(r => r?.kind === 'already-reviewed-head' && Number(r.prNumber) === pr
+        || !refusals.some(r => isRedTeamRecoveryRefusal(r) && Number(r.prNumber) === pr
           && (r.headSha == null || r.headSha === head))
         || !Array.isArray(rawPr.comments) || redTeamForHead(rawPr.comments, pr, head)
         || !Array.isArray(rawPr.labels) || !rawPr.labels.some(label =>
           // review:pending is the parked run's own retained label: a ruled referral-blocked review resumes through
           // fullReviewDecision, which needs the formal reviews even when no accept or red-team label is present.
-          ['review:accepted', 'red-team:pending', 'review:pending'].includes(typeof label === 'string' ? label : label?.name))) return rawPr;
+          ['review:accepted', 'red-team:pending', 'review:pending', 'review:human'].includes(typeof label === 'string' ? label : label?.name))
+          && !refusals.some(row => row.kind === RED_TEAM_REQUEST_KIND && Number(row.prNumber) === pr)) return rawPr;
       if (reviewsByPr.has(pr)) return { ...rawPr, reviews: reviewsByPr.get(pr) };
       let reviews;
       try {
@@ -986,7 +1009,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
         throw Error('evidence changed before settlement');
       }
       const rawPr = { ...live, number: row.prNumber, comments, reviews };
-      const refusal = refusals.find(r => r.kind === 'already-reviewed-head' && Number(r.prNumber) === row.prNumber);
+      const refusal = refusals.find(r => isRedTeamRecoveryRefusal(r) && Number(r.prNumber) === row.prNumber);
       const [fresh] = planRedTeamOnSkip({ ...planningOptions, refusals: refusal ? [refusal] : [],
         rawPrs: [rawPr], now: now() });
       if (fresh?.why === 'review-unfinished' && fresh.escalate) {
@@ -1146,6 +1169,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
             if (row.staleRecovery && !abandon({ repo, pr: row.prNumber, head: row.head }).ok) throw new PreStartDispatchRefusalError('stale abandonment refused');
             const result = dispatch({ pr: row.prNumber, repo,
               ...(row.action === 'dispatch' ? { redTeamOnly: true, redTeamMode: row.mode } : {}),
+              ...(row.advisoryHead ? { expectedHead: row.head, advisoryCiWaiver: { head: row.advisoryHead, reason: 'human-handoff' } } : {}),
               ...(preferLane != null ? { preferLane } : {}) });
             if (result?.skipped || !Number.isInteger(result?.jobPid)) {
               const refundable = result?.skipped !== 'live-job'

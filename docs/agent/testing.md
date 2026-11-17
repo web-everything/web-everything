@@ -4425,3 +4425,24 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+
+## Human-held head moves and explicit red-team requests
+
+Red-team queue nomination must not depend on the primary review refusal kind. The open-PR
+snapshot can nominate a ready `review:human` head missing its result even when reconciliation
+reports `review-ci` or `ci-heal-escalated`. A stale/missing stored review requires a fresh advisory
+loop before red-team-only recovery; never re-key an old accepting payload to a content-changed head.
+The advisory uses the existing head-bound human-handoff CI waiver, preserves the human hold,
+and shares the queue, retry cooldown, lane allowance and live-review budget. Unreadable absence
+of stored work, scope/referral holds and incomplete reviews keep dispatch closed.
+
+`node scripts/operations/run.mjs red-team-enqueue --pr=<N> --reason=<text>` (optional
+`--repo=owner/repo`) records a head-bound request through the registered operation engine.
+The daemon consumes trusted requests through that same nomination path. It does not bypass
+stored-review eligibility or clear review labels. Closed/draft PRs, unreadable evidence, oversized
+reasons and an existing result at the live head refuse; shorten an oversized reason or inspect
+unreadable evidence before retrying. Requests for older heads do not nominate the new head.
+The scoped regressions are `red-team-enqueue.test.mjs`, `review-red-team-on-skip.test.mjs`
+and `red-team-dispatch-queue.test.mjs`; operation registration also updates the declaring-module
+map in `http-adapter.test.mjs`.

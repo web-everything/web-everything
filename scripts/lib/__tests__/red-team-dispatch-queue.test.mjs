@@ -1477,3 +1477,29 @@ it.each([
     expect(log.mock.calls.flat().join(' ')).toMatch(/operator-db-(unreadable|invalid)/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+
+describe('human-held heads use the existing bounded queue', () => {
+  const humanInputs = (prs, count) => inputs(prs, {
+    plan: { refusals: prs.map(prNumber => ({ kind: 'review-ci', prNumber, headSha: head(prNumber) })) },
+    rawPrs: prs.map(number => ({ number, headRefOid: head(number), state: 'OPEN', isDraft: false,
+      labels: ['review:human'], comments: [] })), capacity: capacity(count),
+  });
+  it('nominates human-held heads despite review-ci and respects FIFO capacity', () => {
+    const f = fixture(), run = vi.fn(() => refused(7, 'no review capacity left'));
+    runWithRedTeamQueue({ ...humanInputs([7, 8, 9], 1), queue: f.queue, run });
+    expect(numbers(f.queue.entries())).toEqual([7, 8, 9]);
+    expect(run.mock.calls[0][0].plan.refusals.filter(row => row.kind === 'red-team-requested').map(row => row.prNumber)).toEqual([7]);
+    expect(run.mock.calls[0][0].rawPrs.map(row => row.number)).toEqual([7]);
+  });
+  it('moves a human-held new head to the tail instead of reusing old head evidence', () => {
+    const f = fixture();
+    f.queue.sync(repo, candidates([7, 8]));
+    const o = humanInputs([7, 8], 1);
+    o.rawPrs[0].headRefOid = 'f'.repeat(40);
+    o.plan.refusals[0].headSha = 'f'.repeat(40);
+    runWithRedTeamQueue({ ...o, queue: f.queue, run: () => refused(8, 'no review capacity left') });
+    expect(numbers(f.queue.entries())).toEqual([8, 7]);
+    expect(f.queue.entries()[1].head).toBe('f'.repeat(40));
+  });
+});

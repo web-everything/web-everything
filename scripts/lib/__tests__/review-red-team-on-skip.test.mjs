@@ -3176,3 +3176,64 @@ it('a recovered result check settles the next pass without a recovery seat', () 
   expect(o.publishCheck).toHaveBeenCalledTimes(1);
   expect(o.dispatch).not.toHaveBeenCalled();
 });
+
+
+describe('human hold red-team recovery independent of reconcile refusal kind', () => {
+  const humanPr = () => ({ number: pr, isDraft: false, state: 'OPEN', headRefOid: head,
+    labels: ['review:human', 'advisory:accepted'], comments: [], reviews: [] });
+  const absent = () => ({ loopPayload: null, inFlight: false, recorded: false,
+    seatRecorded: false, completedRecorded: false });
+  const options = (kind, over = {}) => runFixture({ rawPrs: [humanPr()],
+    plan: { refusals: [{ kind, prNumber: pr, headSha: head }] }, readEvidence: absent, ...over });
+  it.each(['review-ci', 'ci-heal-escalated', 'owed-ci-heal'])(
+    'requests the fresh advisory and its red team for a moved human head refused as %s', kind => {
+      const o = options(kind);
+      const out = runRedTeamOnSkip(o);
+      expect(out.rows).toEqual([expect.objectContaining({ action: 'review', head, advisoryHead: head })]);
+      expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, expectedHead: head,
+        advisoryCiWaiver: { head, reason: 'human-handoff' } });
+      expect(o.rawPrs[0].labels).toEqual(['review:human', 'advisory:accepted']);
+      expect(o.syncLabels).not.toHaveBeenCalled();
+    });
+  it('recovers red-team-only when the human advisory already owes a live-head pass', () => {
+    const o = options('review-ci', { readEvidence: () => ({ ...absent(), loopPayload: payload() }) });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'dispatch', mode: 'fresh' });
+    expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' });
+    expect(o.syncLabels).not.toHaveBeenCalled();
+  });
+  it('does not carry an old accepting read onto a content-changed human head', () => {
+    const old = { ...payload(), findings: { read: { netBasis: { rev: 'b'.repeat(40) } } } };
+    const o = options('ci-heal-escalated', { readEvidence: () => ({ ...absent(), loopPayload: old }), proveMove: () => ({ ok: true }) });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review' });
+    expect(old.findings.read.netBasis.rev).toBe('b'.repeat(40));
+    expect(o.syncLabels).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['unreadable reviews', { rawPrs: [{ ...humanPr(), reviews: null }], readReviews: () => null }],
+    ['unknown red-team absence', { readEvidence: () => ({ loopPayload: null }) }],
+    ['existing live-head status', { readStatus: () => ({ status: 'finished', head }) }],
+    ['scope bloat', { rawPrs: [{ ...humanPr(), scopeBloat: { stale: true } }] }],
+    ['referral hold', { rawPrs: [{ ...humanPr(), referralHold: { kind: 'same-head' } }] }],
+    ['unfinished review', { readEvidence: () => ({ ok: false, reason: 'review-unfinished' }), headNeverReviewed: () => false }],
+    ['in-flight red team', { readEvidence: () => ({ ...absent(), inFlight: true }) }],
+    ['exhausted capacity', { capacity: { lanes: 0, budget: { left: 0 } } }],
+  ])('preserves the human hold without dispatch for %s', (_, over) => {
+    const o = options('review-ci', over);
+    runRedTeamOnSkip(o);
+    expect(o.dispatch).not.toHaveBeenCalled();
+    expect(o.syncLabels).not.toHaveBeenCalled();
+  });
+  it('does not re-review a live-head human advisory that did not accept', () => {
+    const o = options('review-ci', { readEvidence: () => ({ ...absent(),
+      loopPayload: { ...payload(), verdict: { verdict: 'changes' } } }) });
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it('reads formal reviews once for the newly nominated human candidate', () => {
+    const o = options('review-ci', { rawPrs: [{ ...humanPr(), reviews: undefined }], readReviews: vi.fn(() => []) });
+    runRedTeamOnSkip(o);
+    expect(o.readReviews).toHaveBeenCalledOnce();
+    expect(o.readReviews).toHaveBeenCalledWith({ repo, pr });
+    expect(o.dispatch).toHaveBeenCalledOnce();
+  });
+});
