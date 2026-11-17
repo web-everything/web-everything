@@ -185,7 +185,7 @@ describe('withSelfSync — DEFAULT path: rebuild-driven (#4044 Module E)', () =>
     const onRestart = vi.fn(), rebuild = vi.fn(async () => ({ moved: false, reason: 'up-to-date' }));
     const checkProbation = vi.fn(() => ({ action: 'none' }));
     const w = withSelfSync({ tickOnce: () => 'ticked' }, {
-      root: '/x', env: {}, onRestart, log, applyPendingRollback, rebuild, checkProbation,
+      root: '/x', env: {}, now: () => 1000, onRestart, log, applyPendingRollback, rebuild, checkProbation,
       readHead: () => 'boot', acquireRead: () => { events.push('read'); return { ok: true }; },
       releaseRead: vi.fn(), readState: emptyState,
     });
@@ -205,6 +205,80 @@ describe('withSelfSync — DEFAULT path: rebuild-driven (#4044 Module E)', () =>
     expect(applyPendingRollback).toHaveBeenCalledTimes(1);
     expect(applyPendingRollback).toHaveBeenCalledWith(expect.objectContaining({ root: '/x', env: {}, log }));
     if (['refused', 'throws', 'rejects'].includes(kind)) expect(log.error).toHaveBeenCalledWith(expect.stringContaining('rollback'));
+  });
+
+  it.each(['rollback-lock-timeout', 'probation-lock-held', 'head-unresolved'])
+  ('boot rollback retries transient refusal with capped backoff: %s', async reason => {
+    let at = 0;
+    const applyPendingRollback = vi.fn(async () => ({ ok: false, reason }));
+    const tick = vi.fn(), acquireRead = vi.fn(), onRestart = vi.fn();
+    const w = withSelfSync({ tickOnce: tick }, {
+      root: '/x', env: {}, now: () => at, versions: null, background: false,
+      log: { error() {} }, readHead: () => 'boot', readState: emptyState,
+      applyPendingRollback, acquireRead, releaseRead() {}, onRestart,
+    });
+    let attempts = 0;
+    for (const delay of [1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000]) {
+      await expect(w.tickOnce()).resolves.toMatchObject({ skipped: true, reason });
+      expect(applyPendingRollback).toHaveBeenCalledTimes(++attempts);
+      at += delay - 1;
+      await expect(w.tickOnce()).resolves.toMatchObject({ skipped: true, reason });
+      expect(applyPendingRollback).toHaveBeenCalledTimes(attempts);
+      at++;
+    }
+    applyPendingRollback.mockResolvedValueOnce({ ok: true, head: 'restored' });
+    await w.tickOnce();
+    await w.tickOnce();
+    expect(applyPendingRollback).toHaveBeenCalledTimes(attempts + 1);
+    expect(onRestart).toHaveBeenCalledTimes(1);
+    expect(tick).not.toHaveBeenCalled();
+    expect(acquireRead).not.toHaveBeenCalled();
+  });
+
+  it('boot rollback backoff shares one in-flight attempt across concurrent polls', async () => {
+    let at = 0, finish;
+    const applyPendingRollback = vi.fn(() => new Promise(resolve => { finish = resolve; }));
+    const tick = vi.fn(), acquireRead = vi.fn();
+    const w = withSelfSync({ tickOnce: tick }, {
+      root: '/x', env: {}, now: () => at, versions: null, background: false,
+      log: { error() {} }, readHead: () => 'boot', readState: emptyState,
+      applyPendingRollback, acquireRead, releaseRead() {},
+    });
+    const first = w.tickOnce();
+    at = 100_000;
+    const concurrent = w.tickOnce();
+    expect(applyPendingRollback).toHaveBeenCalledTimes(1);
+    finish({ ok: false, reason: 'rollback-lock-timeout' });
+    await Promise.all([first, concurrent]);
+    await w.tickOnce();
+    expect(applyPendingRollback).toHaveBeenCalledTimes(1);
+    at += 1000;
+    const retry = w.tickOnce(), shared = w.tickOnce();
+    expect(applyPendingRollback).toHaveBeenCalledTimes(2);
+    finish({ ok: false, reason: 'proven-good-unverified' });
+    await Promise.all([retry, shared]);
+    at += 1_000_000;
+    await w.tickOnce();
+    expect(applyPendingRollback).toHaveBeenCalledTimes(2);
+    expect(tick).not.toHaveBeenCalled();
+    expect(acquireRead).not.toHaveBeenCalled();
+  });
+
+  it.each(['rollback-failed', 'rollback-request-unreadable', 'rebuild-state-unreadable', 'proven-good-unverified', 'unknown-refusal'])
+  ('boot rollback retains persistent refusals across the retry horizon: %s', async reason => {
+    let at = 0;
+    const applyPendingRollback = vi.fn(async () => ({ ok: false, reason }));
+    const tick = vi.fn(), acquireRead = vi.fn(), checkProbation = vi.fn(), onRestart = vi.fn();
+    const w = withSelfSync({ tickOnce: tick }, {
+      root: '/x', env: {}, now: () => at, versions: null, background: false,
+      log: { error() {} }, readHead: () => 'boot', readState: emptyState,
+      applyPendingRollback, acquireRead, releaseRead() {}, checkProbation, onRestart,
+    });
+    await expect(w.tickOnce()).resolves.toMatchObject({ skipped: true, reason });
+    at += 1_000_000;
+    await expect(w.tickOnce()).resolves.toMatchObject({ skipped: true, reason });
+    expect(applyPendingRollback).toHaveBeenCalledTimes(1);
+    for (const effect of [tick, acquireRead, checkProbation, onRestart]) expect(effect).not.toHaveBeenCalled();
   });
 
   it.each([false, true])('boot rollback bypasses restart debounce before rebuilding or ticking (swap spacing: %s)', async swapSpaced => {

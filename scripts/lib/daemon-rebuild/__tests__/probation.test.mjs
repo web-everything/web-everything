@@ -18,6 +18,7 @@ import { finalizeRebuild } from '../adopt.mjs';
 import { makeTickProgressStore } from '../../daemon-background-build.mjs';
 import { withSelfSync } from '../../daemon-self-sync.mjs';
 import siblingStartupBreak from '../../../conveyor/soak/breaks/probation-sibling-startups.mjs';
+import bootRetryBreak from '../../../conveyor/soak/breaks/probation-boot-rollback-retry.mjs';
 
 // No remote, fetch, push, hooks, or user Git configuration. commit-tree creates
 // local fixture objects; the real rollback must move HEAD and the tracked bytes.
@@ -56,6 +57,11 @@ function realRepo(f) {
 
 
 describe('real repository rollback and CLI contracts', () => {
+
+  it('released reader permits boot rollback on a later tick after timeout', async () => {
+    const report = await bootRetryBreak.run();
+    expect(bootRetryBreak.judge(report)).toEqual([]);
+  });
 
   it('failure requests rollback without touching HEAD or taking a clone lock; boot apply resets under the normal lock', async () => {
     const f = fixture();

@@ -962,6 +962,8 @@ export function withSelfSync(effects, {
   const bootSha = readHead(syncOpts());
   const bootAt = now();
   let bootRollback;
+  let bootRollbackRetryAt = Infinity;
+  let bootRollbackRetryMs = 1000;
   let probationRestart;
   const restartProbation = detail => (probationRestart ??= Promise.resolve().then(() => onRestart({ ...detail, reason: 'probation-rollback' })));
   const cloneLockOpts = () => (env && env.WE_DAEMON_CLONE_LOCK_ROOT ? { lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT } : {});
@@ -1135,10 +1137,25 @@ export function withSelfSync(effects, {
     // dropping them would silently reset a payload-threading caller's state every tick. The daemons that
     // built this helper pass a zero-arg tickOnce, so `...args` is empty for them and nothing changes.
     tickOnce: async (...args) => {
+      if (probationRestart) return probationRestart;
+      // Share an in-flight recovery across polls. Only known pre-reset refusals
+      // may expire the cached result; persistent/unknown failures stay closed.
+      if (bootRollback && now() >= bootRollbackRetryAt) {
+        bootRollback = undefined;
+        bootRollbackRetryAt = Infinity;
+      }
       const rollback = await (bootRollback ??= (async () => {
         try {
           const result = await applyPendingRollback({ root, env, log, now, bootHead: bootSha, bootSha, bootAt });
           if (result?.ok === false) log.error?.(`daemon-self-sync: boot rollback deferred (${result.reason})`);
+          if (result?.ok !== true && result?.restartRequired !== true
+            && ['rollback-lock-timeout', 'probation-lock-held', 'head-unresolved'].includes(result?.reason)) {
+            // Backoff starts on completion, so a slow attempt cannot cause an
+            // immediate retry. Every attempt re-enters the real boot hook and
+            // revalidates current HEAD, adoption identity and marker under lock.
+            bootRollbackRetryAt = now() + bootRollbackRetryMs;
+            bootRollbackRetryMs = Math.min(2 * bootRollbackRetryMs, 60_000);
+          }
           return result;
         } catch (error) {
           log.error?.(`daemon-self-sync: boot rollback failed: ${error?.message || error}`);
@@ -1155,7 +1172,6 @@ export function withSelfSync(effects, {
       }
       if (probationRestart) return probationRestart;
       if (rollback?.reason === 'probation-lock-held') {
-        bootRollback = undefined; // retry registration before admitting a tick
         return skippedTick('probation-lock-held');
       }
       // A refused recovery must not turn its pending marker into another restart.

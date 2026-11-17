@@ -4,6 +4,7 @@
  * `probation-boot-rollback-restart.mjs` registers the urgent boot rollback restart case the same way.
  * `probation-rollback-marker-validation.mjs` registers the writer/boot-reader contract case the same way.
  * `probation-persistent-recovery.mjs` registers persistent boot refusals and dead-reader recovery the same way.
+ * `probation-boot-rollback-retry.mjs` registers recovery after reader release through the same discovery.
  * `probation-sibling-startups.mjs` registers healthy concurrent boot accounting the same way.
  * `probation-caller-ownership.mjs` registers one-shot rebuild boot isolation the same way.
  * `probation-startup-failure.mjs` registers later-boot deadline recovery through the same discovery.
