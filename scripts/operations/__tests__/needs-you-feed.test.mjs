@@ -521,11 +521,37 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head }, gateComments()), log: () => {} });
     expectUndecided(kept);
   });
-  it('an automatic card-queued record does not settle a confirmed degraded break', async () => {
-    const [res, ...rest] = gateComments({ broken: true, impact: 'degraded', outcome: GATE_OUTCOMES.CARD_QUEUED });
-    const card = { ...rest[0], body: rest[0].body + '\n**Red-team gate**\n- 1 finding(s) filed as a follow-up card (#1).' };
-    const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] }, [res, card]), log: () => {} });
-    expect(kept.find(i => i.pr === 5768).kind).toBe('confirmed-break-owed-send-back');
+  it.each(['broken', 'degraded'])('an automatic card-queued ruling settles a confirmed %s break without a needs-you alert while held', async impact => {
+    const [res, record] = gateComments({ broken: true, impact, outcome: GATE_OUTCOMES.CARD_QUEUED });
+    const card = { ...record, body: record.body + '\n- 1 finding(s) filed as a follow-up card (#1).' };
+    const { kept, held } = await gateReadyItems([items()[0]], report, {
+      gh: gate({ headRefOid: head, labels: [{ name: 'red-team:blocked' }] }, [res, card]), log: () => {}, fixClaimLive: () => false,
+    });
+    expect(kept).toEqual([]);
+    expect(held).toHaveLength(1);
+    expect(held[0].reasons).toContain('the red team blocked the live head');
+  });
+  it.each(['no card', 'marker only', 'older head', 'other finding', 'untrusted author'])('an uncarded confirmed break still needs-you with %s', async shape => {
+    const [res, record] = gateComments({ broken: true, outcome: GATE_OUTCOMES.CARD_QUEUED });
+    const card = { ...record, body: record.body + '\n- 1 finding(s) filed as a follow-up card (#1).' };
+    if (shape === 'marker only') card.body = record.body;
+    if (shape === 'older head') card.body = card.body.replace(head, '2'.repeat(40));
+    if (shape === 'other finding') card.body = card.body.replace('(#1)', '(#2)');
+    if (shape === 'untrusted author') card.user = { login: 'mallory' };
+    const { kept } = await gateReadyItems([items()[0]], report, {
+      gh: gate({ headRefOid: head, labels: [{ name: 'red-team:blocked' }] }, [res, ...(shape === 'no card' ? [] : [card])]),
+      log: () => {}, fixClaimLive: () => false,
+    });
+    expect(kept).toHaveLength(1);
+    expect(kept[0].kind).toBe('confirmed-break-owed-send-back');
+  });
+  it('a card-queued record without a live result remains red-team-undecided', async () => {
+    const [, record] = gateComments({ broken: true, outcome: GATE_OUTCOMES.CARD_QUEUED });
+    const card = { ...record, body: record.body + '\n- 1 finding(s) filed as a follow-up card (#1).' };
+    const { kept } = await gateReadyItems([items()[0]], report, {
+      gh: gate({ headRefOid: head, labels: [] }, [card]), log: () => {}, fixClaimLive: () => false,
+    });
+    expectUndecided(kept);
   });
   it.each([
     ['missing closing space', body => body.replace(/ -->/, '-->')],

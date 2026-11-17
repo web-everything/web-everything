@@ -262,10 +262,11 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
       // The shared disposition (red-team-gate) decides what still holds on the live head; no private marker parser.
       // Read even with no result in the thread: the sealed stored evidence can hold a head the thread shows nothing for (PR #6622).
       const disposition = readRedTeamDisposition({ comments: view.comments, pr: item.pr, head: view.headRefOid, repo: item.repo, setting: ALERT_BREAK_POLICY });
-      // Only an operator's own card / not-real / clear ruling settles a confirmed break: the gate's automatic card record
-      // is written before the card job succeeds, so it is no proof (nor is a policy that leaves degraded to a card).
+      // A validated operator release or automatic gate card ruling settles that finding on the live head;
+      // policy alone is no disposition. The shared reader validates and scopes the recorded ruling.
       const open = new Set([...(disposition?.sendBack ?? []), ...(disposition?.held ?? [])].map(f => f.index));
-      const settled = f => !open.has(f.index) && (disposition?.rulings.get(f.index) ?? []).some(r => r.source === 'operator' && r.kind !== 'block');
+      const settled = f => !open.has(f.index) && (disposition?.rulings.get(f.index) ?? []).some(r =>
+        (r.source === 'operator' && r.kind !== 'block') || (r.source === 'automatic' && r.kind === 'card'));
       // Index 0 is the shared hold on stored evidence the thread does not show in full: no operator ruling settles it.
       // An index-0 hold that is only "publication pending" (stored evidence not sealed yet) is no break: never approve, never alarm.
       const publicationPending = (disposition?.held ?? []).some(f => f.index === 0 && f.unsealed === true);
