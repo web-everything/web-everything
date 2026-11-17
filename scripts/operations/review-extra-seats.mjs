@@ -62,6 +62,8 @@ import { providerQuotaHold, QUOTA_COOLOFF_MS, CODEX_QUOTA_FULL_PERCENT } from '.
  */
 
 import { resolveOperationEffort, resolveOperationRoute, readRoutingPolicy } from '../lib/dispatch-routing-policy-io.mjs';
+import { resolveAiRouting, aiRoutingInputs } from '../lib/ai-routing.mjs';
+import { resolveOperationRoute as validateAiSeatRoute } from '../lib/dispatch-routing-policy.mjs';
 import { rosterForKey } from '../lib/dispatch-routing-providers.mjs';
 import { agyRunEvidence, pickAgyEvidence } from '../lib/antigravity-run-evidence.mjs';
 import { spawn, spawnSync } from 'node:child_process';
@@ -1189,6 +1191,29 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
 // The `red-team-replay` CLI never writes the store at all.
 
 export const RED_TEAM_SEAT = Object.freeze({ seat: 'red-team', lens: 'red-team', key: 'red-team' });
+
+// These are single seats: executor settings have no bearing on their route.
+function aiSeatRoute(role, current, { env, io, available, operation, taskType, policy, operatorKeys }) {
+  try {
+    const resolved = (io.readAiRouting ?? resolveAiRouting)({ env, log: false });
+    const { coordinator } = aiRoutingInputs(role, resolved);
+    if (!coordinator?.provider) return current;
+    if (!available.includes(coordinator.provider)) {
+      io.log(`aiRouting.${role}: ${coordinator.provider} unavailable; inheriting today's route`);
+      return current;
+    }
+    // Reapply roster, counting-seat, disabled-provider and operator-override rules.
+    const reader = io.readRoutingPolicy ?? readRoutingPolicy;
+    const route = validateAiSeatRoute({ operation, taskType, available, policy: policy ?? reader(),
+      aiRouting: coordinator, operatorKeys: operatorKeys ?? reader.operatorKeys?.() ?? [] });
+    const sources = Object.fromEntries(Object.entries(resolved.sources ?? {}).filter(([path]) => path.startsWith(`${role}.coordinator.`)));
+    io.log(`policy-cascade · aiRouting.${role}: ${route?.provider}/${route?.model}/${route?.effort} (${JSON.stringify(sources)})`);
+    return route ?? current;
+  } catch (error) {
+    io.log(`aiRouting.${role}: invalid routing (${error.message}); inheriting today's route`);
+    return current;
+  }
+}
 export const RED_TEAM_RUBRIC = 'review-red-team.1';
 export const RED_TEAM_MISS_DISPATCH_KIND = 'red-team-miss';
 /** The red team digs deeper than an advisory lens, so it runs at the higher effort each provider offers. */
@@ -1811,6 +1836,9 @@ export async function speculateRedTeam({
       try { configuredRoute = resolveOperationRoute({ operation: 'review-seat', taskType: RED_TEAM_SEAT.key, available, policy: routingPolicy }); }
       catch (error) { lastReason = error.message; break; }
       const pick = configuredRoute ? { provider: configuredRoute.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: RED_TEAM_SEAT.key, available, scorecards: records });
+      const overlaid = aiSeatRoute('red-team', configuredRoute, { env, io, available,
+        operation: 'review-seat', taskType: RED_TEAM_SEAT.key, policy: routingPolicy });
+      if (overlaid !== configuredRoute) { configuredRoute = overlaid; pick.provider = overlaid.provider; }
       if (!pick.provider) { lastReason = pick.reasoning; break; }
       let reservation;
       try {
@@ -2068,6 +2096,7 @@ export function renderRedTeamSummary(r) {
 
 /** The red team's effects: the added seats' io, plus the Claude re-check, the head message and the PR comment. */
 export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath, spawnRecheck = null, recordStatus = recordRedTeamStatus, sealResult = null,
+  readAiRouting = resolveAiRouting,
   readCompleteComments = ({ pr, repo }) => readCompletePrComments(pr, { repo,
     exec: (file, args, options) => execRead(file, args, { ...options, cwd: root, env }) }), ...rest } = {}) {
   const base = createExtraSeatsIo({ env, root, storePath, ...rest });
@@ -2090,6 +2119,7 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
   }));
   return {
     ...base,
+    readAiRouting,
     readRecords: ({ strict = false } = {}) => strict
       ? readStore({ path: storePath ?? resolveScorecardStorePath(env), strict: true }).records : base.readRecords(),
     readRedTeamStatus: input => readRedTeamStatus({ ...input, env }),
@@ -2109,7 +2139,9 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
     },
     runRecheck: async ({ pr, lanePath, rev, readsRepo = true, mandate, input, shape }) => {
       const { judgeSpawn } = await import('../lib/judge-spawn.mjs');
-      const configured = resolveOperationRoute({ operation: 'review-recheck', available: ['claude', 'codex', 'antigravity'] });
+      let configured = resolveOperationRoute({ operation: 'review-recheck', available: ['claude', 'codex', 'antigravity'] });
+      configured = aiSeatRoute('red-team-recheck', configured, { env, io: { readAiRouting, log: base.log, readRoutingPolicy: rest.readRoutingPolicy },
+        available: ['claude', 'codex', 'antigravity'], operation: 'review-recheck' });
       // Repo tools require Claude's enforceable allow-list. Other providers cannot honor it.
       if (readsRepo && configured && configured.provider !== 'claude') throw new Error('repo re-check requires the Claude read-only tool allow-list');
       const spawnJudge = spawnRecheck ?? (configured ? (await import('./cli-adapter.mjs')).resolveJudgeProvider(configured.provider) : judgeSpawn);
