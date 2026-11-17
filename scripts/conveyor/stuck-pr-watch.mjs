@@ -132,22 +132,22 @@ export function defaultReadFullTimeline({ number, repo, exec = execFileSyncThrot
 
 /**
  * How many `inspect-*` sessions (any repo tag) are LIVE right now, for the global concurrency cap. A read
- * failure degrades to `0` — the SAME fail-soft direction `we:scripts/conveyor/reconcile-pass.mjs` takes for its
- * own agents read failing (the cap is a courtesy against pool pressure, not a safety gate; under-counting live
- * sessions can only over-dispatch by a small, self-correcting margin next tick, never under-report a genuinely
- * stuck PR as fine).
+ * failure refuses counting: unseen inspections never create free capacity. The sweep
+ * defers dispatch until discovery can be repaired and retried.
  * @param {{listAgents?:Function}} [o]
  * @returns {number}
  */
 export function defaultCountLiveInspections({ listAgents = () => defaultListAgents({}) } = {}) {
-  let agents;
-  try {
-    agents = listAgents();
-  } catch (error) {
-    agents = error?.name === 'SessionsUnknown' ? error.rows : [];
+  const rows = listAgents(); // SessionsUnknown must propagate to the concurrency gate.
+  if (!Array.isArray(rows) || rows.incomplete?.length) throw new Error('inspection discovery unknown');
+  const agents = [...new Map(rows.map(a => [JSON.stringify([a.storeKey, a.sessionId ?? a.id ?? a.name]), a])).values()];
+  const identities = new Set();
+  for (const agent of agents) {
+    if (!agent.sessionId) continue;
+    if (identities.has(agent.sessionId)) throw new Error('inspection ownership ambiguous');
+    identities.add(agent.sessionId);
   }
-  agents = [...new Map((Array.isArray(agents) ? agents : []).map(a => [JSON.stringify([a.storeKey, a.sessionId ?? a.id ?? a.name]), a])).values()];
-  return agents.filter((a) => parseSessionSlug(a?.name)?.kind === 'inspect').length;
+  return agents.filter(a => parseSessionSlug(a?.name)?.kind === 'inspect').length;
 }
 
 /**
@@ -210,7 +210,16 @@ export function watchStuckPrs({
     });
   }
 
-  const liveInspectCount = countLiveInspections({});
+  let liveInspectCount;
+  try {
+    liveInspectCount = countLiveInspections({});
+    if (!Number.isFinite(liveInspectCount) || liveInspectCount < 0) throw new Error('inspection count unknown');
+  } catch (error) {
+    const reason = String(error?.message ?? error).split('\n')[0];
+    writeLineSync(2, `⚠ stuck-pr-watch: inspection capacity unknown; repair discovery and retry: ${reason}`);
+    for (const c of candidates) results.push({ num: c.num, stage: c.stage, verdict: 'stuck', deferredReason: 'inspection-capacity-unknown' });
+    return { checked: Array.isArray(prs) ? prs.length : 0, stuck: candidates.length, dispatchedCount: 0, results };
+  }
   const { toDispatch, deferred } = planStuckDispatches({ candidates, liveInspectCount, maxConcurrent: cap });
 
   for (const c of deferred) {
