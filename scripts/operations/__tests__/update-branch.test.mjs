@@ -9,7 +9,7 @@ import { join } from 'node:path';
 
 const repo = 'web-everything/web-everything';
 const head = 'a'.repeat(40), base = 'b'.repeat(40), newHead = 'c'.repeat(40);
-const pull = { state: 'open', head: { sha: head }, base: { sha: base }, mergeable: true, mergeable_state: 'behind' };
+const pull = { state: 'open', head: { sha: head }, base: { sha: base, ref: 'main' }, mergeable: true, mergeable_state: 'behind' };
 const next = { ...pull, head: { sha: newHead } };
 const input = { pr: 42, reason: 'fix already on main' };
 const accepted = 'HTTP/2.0 202 Accepted\r\n\r\n{"message":"Updating pull request branch."}';
@@ -42,7 +42,7 @@ describe('update-branch', () => {
     const f = fixture([pull, { behind_by: 0 }]);
     expect(await f.run()).toMatchObject({ ok: true, status: 'already-up-to-date', beforeHead: head, afterHead: head, behindBefore: 0, behindAfter: 0 });
     expect(writes(f)).toHaveLength(0);
-    expect(f.gh.mock.calls[1][0]).toEqual(['api', `repos/${repo}/compare/${base}...${head}`]);
+    expect(f.gh.mock.calls[1][0]).toEqual(['api', `repos/${repo}/compare/main...${head}`]);
   });
 
   it.each([{ mergeable: false }, { mergeable_state: 'dirty' }])('refuses conflicts and reports candidate PR files (%j)', async flag => {

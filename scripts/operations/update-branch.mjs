@@ -32,8 +32,8 @@ export async function runUpdateBranch(input, io) {
     if (pull?.state !== 'open') {
       Object.assign(result, { refused: true, status: 'not-open' });
     } else {
-      if (!result.beforeHead || !pull?.base?.sha) throw new Error('missing PR head/base; inspect the PR manually');
-      result.behindBefore = behind(await io.compare(repo, pull.base.sha, result.beforeHead));
+      if (!result.beforeHead || !pull?.base?.ref) throw new Error('missing PR head/base; inspect the PR manually');
+      result.behindBefore = behind(await io.compare(repo, pull.base.ref, result.beforeHead));
       result.behindAfter = result.behindBefore;
       if (result.behindBefore === 0) Object.assign(result, { ok: true, status: 'already-up-to-date' });
       else if (pull.mergeable === false || pull.mergeable_state === 'dirty') {
@@ -54,8 +54,8 @@ export async function runUpdateBranch(input, io) {
           const next = await io.readPr(repo, pr);
           if (next?.head?.sha && next.head.sha !== result.beforeHead) {
             result.afterHead = next.head.sha;
-            if (!next.base?.sha) throw new Error('missing updated base SHA');
-            result.behindAfter = behind(await io.compare(repo, next.base.sha, next.head.sha));
+            if (!next.base?.ref) throw new Error('missing updated base ref');
+            result.behindAfter = behind(await io.compare(repo, next.base.ref, next.head.sha));
             if (result.behindAfter === 0) { result.ok = true; result.status = 'updated'; delete result.detail; }
             else Object.assign(result, { ok: false, refused: true, status: 'partially-updated',
               detail: 'New head observed but still behind the base; inspect the PR before retrying.' });
