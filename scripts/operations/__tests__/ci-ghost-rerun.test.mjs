@@ -28,7 +28,7 @@ afterEach(() => {
 const NOW = Date.parse('2026-11-16T12:00:00Z');
 const HEAD = 'a'.repeat(40);
 const settings = { thresholdMin: 15, maxPerWindow: 1, maxPerHead: 1, windowHours: 2, cancelWaitSec: 10 };
-const options = { pr: 42, actor: 'operator', channel: 'manual recovery' };
+const options = { repo: 'web-everything/web-everything', pr: 42, actor: 'operator', channel: 'manual recovery' };
 const ghost = () => ({ id: 7, run_id: 9, run_attempt: 2, status: 'in_progress', steps: [
   { status: 'completed', conclusion: 'success', completed_at: '2026-11-16T11:30:00Z' },
   { status: 'completed', conclusion: 'success', completed_at: '2026-11-16T11:40:00Z' },

@@ -127,7 +127,7 @@ export async function runCiGhostRerun(options, {
   state = createStateStore(), settings = readCiGhostRerunSettings(),
   readSharedRerunStates = readTimeoutStates, sharedStateDir,
 } = {}) {
-  const { actor, channel, pr, repo = 'web-everything/web-everything', dryRun = false } = options;
+  const { actor, channel, pr, repo, dryRun = false } = options;
   const audit = { ts: new Date(clock()).toISOString(), actor: actor ?? null, channel: channel ?? null,
     repo, pr: pr ?? null, head: null, runId: null, jobId: null };
   let before = null;
