@@ -4,8 +4,9 @@
  * outside every rsync root. Successful reads are reused for one remote read
  * per host per minute; failed reads are also throttled per host in memory.
  * Startup explicitly requires a new read. Failed reads never extend the
- * ten-minute fallback. A failed write of non-me evidence poisons fallback until
- * a successful write, with best-effort cache removal. NOT yet wired into daemons.
+ * ten-minute fallback. Non-me evidence blocks fallback before persistence; cache
+ * mutations are serialized per guard/host. Failed writes retain that denial until
+ * a newer successful write, with best-effort removal. NOT yet wired into daemons.
  */
 import { readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -152,15 +153,18 @@ export async function resolveHostRole({ thisHost, now = Date.now(), atStart = fa
   state.hosts ??= new Map();
   if (!state.hosts.has(thisHost)) state.hosts.set(thisHost, {});
   const hostState = state.hosts.get(thisHost);
+  const readOrder = hostState.readOrder = (hostState.readOrder ?? 0) + 1;
+  const cacheEvidence = hostState.latestEvidence;
   try { cache = await read(); } catch { /* Unreadable cache grants no ownership. */ }
   const usableRead = cache?.host === thisHost && within(cache.writtenAt, now, CACHE_MAX_AGE_MS)
     && within(cache.readAt, now, FRESH_READ_MS)
     && ((cache.status === 'ok' && validHost(cache.owner)) || (cache.status === 'unset' && cache.owner === ''));
-  if (!atStart && !hostState.cacheInvalidated && usableRead) {
+  if (!atStart && !hostState.cacheInvalidated && cacheEvidence === hostState.latestEvidence && usableRead) {
     return { ...decide({ owner: cache.owner, ownerReadAt: cache.readAt }), source: 'cache-fresh-read' };
   }
   const fallback = (throttled = false) => {
-    const decision = hostState.cacheInvalidated ? standby('cache-invalidated') : decide({});
+    const decision = hostState.cacheInvalidated ? standby('cache-invalidated')
+      : cacheEvidence !== hostState.latestEvidence ? standby('superseded-cache-read') : decide({});
     return { ...(throttled && decision.reason === 'owner-unreadable'
       ? standby('remote-throttled') : decision), source: 'remote-failed' };
   };
@@ -171,24 +175,32 @@ export async function resolveHostRole({ thisHost, now = Date.now(), atStart = fa
     delete hostState.failedReadAt;
     const owner = remote.status === 'ok' ? remote.owner : '';
     // Evidence older than one this process already saw must not overwrite the cache.
-    const stale = hostState.latestReadAt > now;
-    if (!stale) hostState.latestReadAt = now;
-    try {
-      if (stale) return { ...decide({ owner, ownerReadAt: now }), source: 'remote' };
-      await write({ host: thisHost, status: remote.status, owner, readAt: now, writtenAt: now });
-      // An older overlapping read must not clear poison set by newer non-me evidence.
-      if (!(hostState.poisonedAt > now)) {
-        delete hostState.cacheInvalidated;
-        delete hostState.poisonedAt;
+    const stale = hostState.latestReadAt > now
+      || (hostState.latestReadAt === now && hostState.latestReadOrder > readOrder);
+    if (stale) return { ...standby('superseded-owner-read'), source: 'remote' };
+    hostState.latestReadAt = now;
+    hostState.latestReadOrder = readOrder;
+    const evidence = {};
+    hostState.latestEvidence = evidence;
+    // Revoke immediately: another reader can run while write/invalidation awaits IO.
+    if (owner !== thisHost) hostState.cacheInvalidated = true;
+    // Serialize removal as well as replacement, so late old writes cannot recreate
+    // a deleted cache or overwrite a persisted handoff. Skip superseded queued work.
+    const pending = (hostState.cacheWrite ?? Promise.resolve()).then(async () => {
+      if (hostState.latestEvidence !== evidence) return;
+      try {
+        await write({ host: thisHost, status: remote.status, owner, readAt: now, writtenAt: now });
+        if (hostState.latestEvidence === evidence) delete hostState.cacheInvalidated;
+      } catch {
+        if (owner !== thisHost) {
+          try { await invalidateCache(); } catch { /* Memory denial survives failed removal. */ }
+        }
       }
-    } catch {
-      // Fresh evidence still decides this call. Old me evidence must not survive it.
-      if (owner !== thisHost) {
-        hostState.cacheInvalidated = true;
-        hostState.poisonedAt = Math.max(hostState.poisonedAt ?? now, now);
-        try { await invalidateCache(); } catch { /* Memory poison survives failed removal. */ }
-      }
-    }
+    });
+    hostState.cacheWrite = pending;
+    await pending;
+    if (hostState.cacheWrite === pending) delete hostState.cacheWrite;
+    if (hostState.latestEvidence !== evidence) return { ...standby('superseded-owner-read'), source: 'remote' };
     return { ...decide({ owner, ownerReadAt: now }), source: 'remote' };
   }
   hostState.failedReadAt = now;

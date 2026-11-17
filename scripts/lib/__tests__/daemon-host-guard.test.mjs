@@ -349,6 +349,115 @@ function failedWriteFixture(remote) {
 }
 const offline = () => ({ status: 'error', error: 'offline' });
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+describe('overlapping cache persistence after handoff', () => {
+  it.each([{ status: 'ok', owner: OTHER }, { status: 'unset' }])(
+    'blocks old cache while a $status handoff write is pending and after it fails', async (remote) => {
+      const writing = deferred();
+      const started = deferred();
+      const f = failedWriteFixture(remote);
+      const handoff = resolveHostRole({ ...f.options,
+        writeCache: () => { started.resolve(); return writing.promise; } });
+      await started.promise;
+      const during = await resolveHostRole({ ...f.options, atStart: false,
+        now: NOW + 1, readRemote: offline });
+      writing.reject(new Error('disk full'));
+      await handoff;
+      expect(during).toMatchObject({ role: 'standby', reason: 'cache-invalidated' });
+      expect(await resolveHostRole({ ...f.options, atStart: false,
+        now: NOW + FRESH_READ_MS + 2, readRemote: offline }))
+        .toMatchObject({ role: 'standby', reason: 'cache-invalidated' });
+    },
+  );
+
+  it.each([[false, 0], [true, 0], [false, 1], [true, 1]])(
+    'late old me write cannot undo handoff (fails: %s, clock delta: %s)', async (fails, delta) => {
+      let stored = cache();
+      const writing = deferred();
+      const started = deferred();
+      const options = { thisHost: ME, now: NOW, atStart: true, state: {},
+        readCache: () => stored, invalidateCache: () => { stored = null; } };
+      const old = resolveHostRole({ ...options, readRemote: () => ({ status: 'ok', owner: ME }),
+        writeCache: async (value) => { started.resolve(); await writing.promise; stored = value; } });
+      await started.promise;
+      const handoff = resolveHostRole({ ...options, now: NOW + delta,
+        readRemote: () => ({ status: 'ok', owner: OTHER }), writeCache: (value) => {
+          if (fails) throw new Error('disk full');
+          stored = value;
+        } });
+      // Let the newer read reach persistence while the older write is still pending.
+      await Promise.resolve();
+      await Promise.resolve();
+      writing.resolve();
+      await Promise.all([old, handoff]);
+      expect(stored?.owner).not.toBe(ME);
+      expect(await resolveHostRole({ ...options, atStart: false,
+        now: NOW + FRESH_READ_MS + 2, readRemote: offline }))
+        .toMatchObject({ role: 'standby' });
+    },
+  );
+
+  it('an older remote response at the same timestamp cannot supersede a confirmed handoff', async () => {
+    const reading = deferred();
+    const started = deferred();
+    const f = failedWriteFixture({ status: 'ok', owner: OTHER });
+    const old = resolveHostRole({ ...f.options,
+      readRemote: () => { started.resolve(); return reading.promise; } });
+    await started.promise;
+    await resolveHostRole(f.options);
+    reading.resolve({ status: 'ok', owner: ME });
+    expect(await old).toMatchObject({ role: 'standby', reason: 'superseded-owner-read' });
+    expect(await resolveHostRole({ ...f.options, atStart: false,
+      now: NOW + FRESH_READ_MS + 1, readRemote: offline }))
+      .toMatchObject({ role: 'standby', reason: 'cache-invalidated' });
+  });
+
+  it.each(['cache', 'remote'])('discards an old me snapshot after a handoff during a delayed %s read', async (phase) => {
+    const waiting = deferred();
+    const started = deferred();
+    const f = failedWriteFixture({ status: 'ok', owner: OTHER });
+    const snapshot = cache({ readAt: phase === 'cache' ? NOW : NOW - 120000 });
+    const old = resolveHostRole({ ...f.options, atStart: false,
+      readCache: () => {
+        if (phase === 'remote') return snapshot;
+        started.resolve(); return waiting.promise;
+      },
+      readRemote: () => {
+        if (phase === 'cache') return offline();
+        started.resolve(); return waiting.promise;
+      } });
+    await started.promise;
+    await resolveHostRole({ ...f.options, now: NOW + 1, writeCache: f.store });
+    waiting.resolve(phase === 'cache' ? snapshot : offline());
+    expect(await old).toMatchObject({ role: 'standby', reason: 'superseded-cache-read' });
+  });
+
+  it('delayed removal cannot delete a newer recovery write and other hosts do not wait for it', async () => {
+    const removing = deferred();
+    const started = deferred();
+    const f = failedWriteFixture({ status: 'ok', owner: OTHER });
+    const handoff = resolveHostRole({ ...f.options, invalidateCache: async () => {
+      started.resolve(); await removing.promise; f.store(null);
+    } });
+    await started.promise;
+    const recovery = resolveHostRole({ ...f.options, now: NOW + 1,
+      readRemote: () => ({ status: 'ok', owner: ME }), writeCache: f.store });
+    const other = await resolveHostRole({ ...f.options, thisHost: OTHER, now: NOW + 2,
+      readRemote: () => ({ status: 'ok', owner: OTHER }), writeCache: () => {} });
+    removing.resolve();
+    await handoff;
+    expect(await recovery).toMatchObject({ role: 'active', source: 'remote' });
+    expect(other).toMatchObject({ role: 'active', source: 'remote' });
+    expect(f.stored()?.owner).toBe(ME);
+  });
+});
+
 describe('cache invalidation after non-me evidence', () => {
   it('failed cache write after fresh other-host read cannot reactivate this host on a later failed read', async () => {
     const f = failedWriteFixture({ status: 'ok', owner: OTHER });
