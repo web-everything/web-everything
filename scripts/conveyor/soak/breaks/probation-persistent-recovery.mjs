@@ -1,4 +1,4 @@
-/** PR #6882: persistent recovery refusals must leave a fresh daemon able to tick. */
+/** PR #6882: persistent recovery refusals skip ticks without a restart loop. */
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -38,9 +38,15 @@ export default {
       write(marker, record);
       write(proven, { head: good, inputsKey: 'good', mainSha: good, applied: [], provenAt: new Date(at - 1000).toISOString() });
       writeRebuildState(root, { adopted: { head: failed }, forceUnverifiedTrees: [good] }, env);
-      const run = () => ({ status: 0, stdout: good });
+      const run = args => ({ status: 0, stdout: args.at(-1) === `${good}^{tree}` ? good : head });
       let head = failed, ticks = 0, restarts = 0;
-      for (const boot of ['stale', 'fresh']) {
+      for (const boot of ['stale', 'fresh', 'failed-head']) {
+        if (boot === 'failed-head') {
+          head = failed;
+          write(probation, { adoptionId: record.adoptionId, sha: failed, prevHead: good, inputsKey: 'failed', mainSha: good, applied: [],
+            adoptedAt: new Date(at - 1001).toISOString(), bootedAt: new Date(at - 1001).toISOString(), bootPid: process.pid,
+            probationMs: 1000, baseline: {}, boots: 1, version: 1 });
+        }
         const wrapped = withSelfSync({ tickOnce() { ticks++; return 'ticked'; } }, {
           root, env, now: () => at, readHead: () => head, versions: null, background: false,
           log: { error() {} }, readState: () => ({ adopted: null }),
@@ -51,12 +57,16 @@ export default {
           applyPendingRollback: opts => applyPendingRollback({ ...opts, run, emit() {} }),
           onRestart() { restarts++; return 'restarted'; },
         });
-        head = good;
-        const result = await wrapped.tickOnce();
-        if (result !== (boot === 'stale' ? 'restarted' : 'ticked')) violations.push(`${boot} boot returned ${result}`);
+        if (boot !== 'failed-head') head = good;
+        for (let poll = 0; poll < 2; poll++) {
+          const result = await wrapped.tickOnce();
+          const expected = boot === 'stale' ? result === 'restarted'
+            : result?.skipped === true && result.reason === 'proven-good-unverified';
+          if (!expected) violations.push(`${boot} boot poll ${poll} returned ${JSON.stringify(result)}`);
+        }
       }
-      if (ticks !== 1 || restarts !== 1) violations.push(`persistent failure: ticks=${ticks}, restarts=${restarts}`);
-      log?.(`two boots: ticks=${ticks}, restarts=${restarts}`);
+      if (ticks !== 0 || restarts !== 1) violations.push(`persistent failure: ticks=${ticks}, restarts=${restarts}`);
+      log?.(`three boots, two polls each: ticks=${ticks}, restarts=${restarts}`);
 
       // First adoption has no provenGood; repeated tick checks must stay bounded.
       rmSync(proven);

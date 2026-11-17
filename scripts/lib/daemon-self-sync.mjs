@@ -1153,6 +1153,8 @@ export function withSelfSync(effects, {
         bootRollback = undefined; // retry registration before admitting a tick
         return skippedTick('probation-lock-held');
       }
+      // A refused recovery must not turn its pending marker into another restart.
+      if (rollback?.ok === false) return skippedTick(rollback.reason);
       const probation = readProbation(root, env);
       const proofSha = probation && probation.sha !== bootSha
         && restartGate(probation.sha).reason === 'no-imported-change' ? probation.sha : bootSha;

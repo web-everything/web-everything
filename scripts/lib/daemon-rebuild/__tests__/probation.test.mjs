@@ -422,6 +422,29 @@ describe('boot rollback send-back regressions (injected Git)', () => {
     return { wrapped, tick, onRestart, acquire, rebuild };
   }
 
+  it.each(['rollback-lock-timeout', 'proven-good-unverified'])(
+    'rollback deferred with HEAD at failed SHA never restarts, including a second tick: %s', async reason => {
+      const f = fixture(); pending(f);
+      const marker = readFileSync(f.markerFile, 'utf8');
+      if (reason === 'rollback-lock-timeout') withWriteLock.mockResolvedValueOnce({ ok: false, heldBy: 'busy' });
+      else json(f.provenFile, { ...f.good, head: OTHER });
+      const readHead = vi.fn(() => FAILED);
+      const c = wrapper(f, () => ({ status: 0, stdout: FAILED }), readHead);
+
+      const ticks = [await c.wrapped.tickOnce(), await c.wrapped.tickOnce()];
+      expect(c.onRestart).not.toHaveBeenCalled();
+      expect(ticks).toEqual([
+        expect.objectContaining({ skipped: true, reason }),
+        expect.objectContaining({ skipped: true, reason }),
+      ]);
+      expect(readHead()).toBe(FAILED);
+      expect(readFileSync(f.markerFile, 'utf8')).toBe(marker);
+      expect(c.tick).not.toHaveBeenCalled();
+      expect(c.acquire).not.toHaveBeenCalled();
+      expect(c.rebuild).not.toHaveBeenCalled();
+    },
+  );
+
   it('concurrent boot callers both restart after the first removes the rollback marker', async () => {
     const f = fixture(); pending(f);
     // Both processes load failed code before a sibling restores disk.
@@ -490,9 +513,11 @@ describe('boot rollback send-back regressions (injected Git)', () => {
     expect(c.acquire).not.toHaveBeenCalled();
     expect(existsSync(f.markerFile)).toBe(true);
     const fresh = wrapper(f, () => ({ status: 0, stdout: head }), () => head);
-    expect(await fresh.wrapped.tickOnce()).toBe('failed-build-ticked');
+    expect(await fresh.wrapped.tickOnce()).toMatchObject({ skipped: true, reason: 'proven-good-unverified' });
     expect(fresh.onRestart).not.toHaveBeenCalled();
-    expect(fresh.tick).toHaveBeenCalledTimes(1);
+    expect(fresh.tick).not.toHaveBeenCalled();
+    expect(fresh.acquire).not.toHaveBeenCalled();
+    expect(fresh.rebuild).not.toHaveBeenCalled();
   });
 
   it.each(['unverified', 'unreadable', 'completion-state', 'write-throw', 'cleanup-throw', 'lock-timeout', 'lock-throw', 'replaced', 'consumed', 'unresolved', 'head-throw'])
