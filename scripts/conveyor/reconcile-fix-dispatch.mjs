@@ -1,3 +1,4 @@
+import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 import { safeAdoptYield } from '../lib/daemon-rebuild/adopt-yield.mjs';
 import { admitMqFailureRoute } from './mq-failure-intake.mjs';
 import { refreshMqFailureHeadSync, mqFailureRefreshIo } from '../lib/mq-failure-refresh.mjs';
@@ -225,7 +226,9 @@ export function fixBriefPath(root = REPO_ROOT) {
 
 /** The fix brief `dispatchFix` sends by default: the template, its context pack, then the build requirements once. */
 export function readFixBriefTemplate(root = REPO_ROOT, pack = (template) => template) {
-  return appendBuildRequirements(pack(readFileSync(fixBriefPath(root), 'utf8')), { policy: resolveBuildPolicy({ log: line => console.error(line) }) });
+  const template = assertBriefTaskContent(readFileSync(fixBriefPath(root), 'utf8'));
+  const packed = assertBriefTaskContent(pack(template));
+  return appendBuildRequirements(packed, { policy: resolveBuildPolicy({ log: line => console.error(line) }) });
 }
 
 /** we:scripts/conveyor/reconcile-fix-dispatch.mjs#RESUME_CONFIRM_MAX_ATTEMPTS — hardening (2) from the
@@ -991,7 +994,7 @@ export function tryResumeFix(planned, {
       const permissions = grantConflictHelper(candidateCwd);
       if (permissions?.ok !== true) throw new Error(`repair-helper permissions unwritten (${permissions?.reason ?? 'no result'})`);
     },
-    prompt: withPlannedContext(buildResumePrompt({ pr: planned.pr, itemNum: planned.itemNum, cwd: candidateCwd }), planned),
+    prompt: renderNoPromptCommandRules(withPlannedContext(buildResumePrompt({ pr: planned.pr, itemNum: planned.itemNum, cwd: candidateCwd }), planned), 'fix'),
     repo, spawnAgent, listAgentsAll, stop, wait, claimOwner, acquireClaim, releaseClaim, claimRoot, sessionCwdFor, ensureSessionCwd,
   });
 }
@@ -1666,7 +1669,7 @@ export function dispatchFix(planned, {
       advisor,
       // fix procedure — a re-armed concurrent-author pause hands the next fixer the saved alt branch to start from.
       ...(ladderTable ? { table: ladderTable } : {}),
-      payload: { prompt: withPlannedContext(prompt, planned), sessionSlug, launchKind: 'fix' },
+      payload: { prompt: renderNoPromptCommandRules(withPlannedContext(prompt, planned), 'fix'), sessionSlug, launchKind: 'fix' },
       // #3606 — see this function's own docblock: without this the fix agent reads a correctly-filled brief as an
       // unfilled template and self-aborts (3/3 live).
       systemPromptFile: DISPATCHED_AGENT_SYSTEM_PROMPT_FILE,

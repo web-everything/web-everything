@@ -1,3 +1,6 @@
+Use literal values copied from command output for angle-bracket placeholders below; never assign shell variables.
+Capture the acquired lane path, live base branch and fetched base SHA before using them; stop if any is empty.
+Stop the command sequence on failure; resolve a failed merge before its ancestry check.
 # Conveyor fix-agent brief (template) — repair a `review:changes` bounce IN ITS OWN LANE, then hand back for re-review (#2630)
 
 > **This is a TEMPLATE, not a runnable skill.** The `/conveyor` skill (#2613) instantiates it when a
@@ -82,8 +85,7 @@ node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} 
 One author repairs a PR at a time. Take the PR's durable fix claim before touching anything:
 
 ```bash
-node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-begin {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} \
-  --why="conveyor fix: address review on PR #{{PR_NUM}}"
+node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-begin {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --why="conveyor fix: address review on PR #{{PR_NUM}}"
 ```
 
 **Default: the PR stays READY, never draft.** This normal repair loop (an ordinary review-findings fix) labels
@@ -113,15 +115,14 @@ The work is intact on the `{{LANE_REF}}` ref (the pushed PR head). Acquire a fre
 (not to `origin/main`), so your clone opens at the exact HEAD the reviewer saw:
 
 > **You started in a scratch directory, not a checkout** — and it holds nothing of `scripts/`, which is why
-> `{{WE_ROOT}}` qualifies every tool call in this brief (see step "cd `$LANE` just left WE's own checkout"
+> `{{WE_ROOT}}` qualifies every tool call in this brief (see step "cd `<lane-path>` just left WE's own checkout"
 > below). Never write a file there by a relative path, and never write ANYTHING into `{{WE_ROOT}}` itself (the
 > checkout that dispatched you): either one left dirty by a stray write is how a dispatcher's own clone gets
 > stuck refusing every future dispatch as stale (#4174).
 
 ```bash
-export LANE_SESSION={{SESSION_SLUG}}
-LANE=$(node "{{WE_ROOT}}/scripts/lane-pool.mjs" acquire --repo={{LANE_REPO}} --lane={{LANE}} --purpose=conveyor-fix \
-  --session={{SESSION_SLUG}} --scope='{{SCOPE}}' --base={{LANE_REF}}) && cd "$LANE"
+node "{{WE_ROOT}}/scripts/lane-pool.mjs" acquire --repo={{LANE_REPO}} --lane={{LANE}} --purpose=conveyor-fix --session={{SESSION_SLUG}} --scope='{{SCOPE}}' --base={{LANE_REF}}
+cd "<lane-path>"
 ```
 
 - `--base={{LANE_REF}}` lands the clone on the pushed lane tip (via `checkout -B main <ref>`), so you **reuse
@@ -132,7 +133,7 @@ LANE=$(node "{{WE_ROOT}}/scripts/lane-pool.mjs" acquire --repo={{LANE_REPO}} --l
   node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=not-applicable
   node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
   ```
-- **`cd "$LANE"` just left WE's own checkout.** `{{LANE_REF}}` can belong to any constellation repo, so from
+- **`cd "<lane-path>"` just left WE's own checkout.** `{{LANE_REF}}` can belong to any constellation repo, so from
   here on your cwd may hold no `scripts/` directory at all — every remaining tool call in this brief is
   qualified with `{{WE_ROOT}}` for exactly that reason. Never drop the `{{WE_ROOT}}/` qualifier for a bare
   relative path.
@@ -157,7 +158,7 @@ same line again. Never re-argue a `not-real` ruling, and never work around a `bl
 
 **Reproduce it before you touch any code.** Run or write a test that FAILS for the exact reason the reviewer
 named, and show it red. If an earlier commit already fixed the finding, run
-`node "{{WE_ROOT}}/scripts/operations/run.mjs" revert-red-check --checkout="$LANE" --base=<the commit before that fix>`
+`node "{{WE_ROOT}}/scripts/operations/run.mjs" revert-red-check --checkout="<lane-path>" --base=<the commit before that fix>`
 and cite its output as the red proof. Never disable, comment out, or `if (false && …)` a guard, check, or test to
 produce a red run; a temporary revert is only done by `revert-red-check` (the auto-mode classifier denies hand
 removal as `[Security Weaken]` and then refuses the rest of the session, PR #5242).
@@ -173,16 +174,14 @@ judgment you cannot safely make, do **NOT** guess. **Record the stand-down on th
 `review:changes` (do **not** re-arm) and RETURN `#{{ITEM_NUM}} → fix escalated (finding needs human judgment)`:
 
 For a referral-finding question, write a JSON array of the exact `{runId, key}` subjects from the
-review's mandatory-referrals record to a temporary file and set `FINDING_REFS_FILE` to its path.
+review's mandatory-referrals record to a temporary file with the Write tool. Copy its JSON literally into `<finding-refs-json>` below.
 Include every finding you need ruled on, preserving the record's values; do not derive keys from
 locations or prose. The flag below binds the question so a later operator ruling can resolve it.
 For a question unrelated to referral findings, omit `--finding-refs` and require an explicit operator
 answer. Legacy stand-downs without these subjects also require an explicit answer.
 
 ```bash
-node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=needs-judgment \
-  --finding-refs="$(cat -- "$FINDING_REFS_FILE")" \
-  --detail="<one line — what you could not decide>"
+node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=needs-judgment --finding-refs='<finding-refs-json>' --detail="<one line — what you could not decide>"
 node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=escalated-needs-judgment
 node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
 ```
@@ -230,7 +229,7 @@ not one (its own text says so, twice), so nothing here ever touches `review:huma
 
 ### 3. Apply the fix — repair ONLY the reviewer's finding
 
-Make the smallest change that addresses the finding, in `$LANE`, on the lane's **current branch** (its local
+Make the smallest change that addresses the finding, in `<lane-path>`, on the lane's **current branch** (its local
 `main` — do **NOT** `git checkout -b`; the single-branch hook blocks branch creation even in a lane clone).
 Keep scope tight: the repair's files should stay within `{{SCOPE}}`. Do not fold in unrelated work, and do not
 weaken or delete a test to sidestep the finding.
@@ -283,12 +282,11 @@ first. A failed merge needs resolution (or `git merge --abort` before the stand-
 complete the merge and rerun the ancestry check against the saved `BASE_SHA` before the gate.
 
 ```bash
-BASE_REF=$(gh pr view {{PR_NUM}} --repo {{REPO}} --json baseRefName --jq .baseRefName)
-test -n "$BASE_REF" || exit 1
-git fetch origin "$BASE_REF" || exit 1
-BASE_SHA=$(git rev-parse FETCH_HEAD) || exit 1
-git merge --no-edit "$BASE_SHA" || exit 1
-git merge-base --is-ancestor "$BASE_SHA" HEAD || exit 1
+gh pr view {{PR_NUM}} --repo {{REPO}} --json baseRefName --jq .baseRefName
+git fetch origin "<base-branch>"
+git rev-parse FETCH_HEAD
+git merge --no-edit "<base-sha>"
+git merge-base --is-ancestor "<base-sha>" HEAD
 ```
 
 To take one side of a conflicted file, or union both, use ONLY
@@ -309,8 +307,7 @@ base is something else; the same reproduce/resolve/escalate discipline applies e
 different ref.)
 
 ```bash
-node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=conflict \
-  --detail="<one line — what made the overlap unsafe to resolve automatically>"
+node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=conflict --detail="<one line — what made the overlap unsafe to resolve automatically>"
 node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=escalated-conflict
 node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
 ```
@@ -356,8 +353,8 @@ Then report `#{{ITEM_NUM}} → fix escalated (conflict with main)`.
 > conflict-fix round uses (they are the identical kind of work, just against a different ref):
 >
 > ```bash
-> node "{{WE_ROOT}}/scripts/conveyor/conflict-fix-mark.mjs" {{PR_NUM}} --repo={{REPO}} --base-ref=<the baseRefName you resolved against> && \
->   node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=re-armed
+> node "{{WE_ROOT}}/scripts/conveyor/conflict-fix-mark.mjs" {{PR_NUM}} --repo={{REPO}} --base-ref=<the baseRefName you resolved against>
+> node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=re-armed
 node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
 > ```
 >
@@ -429,8 +426,8 @@ and records the sweep for this session; paste the line into the evidence comment
 changed files no row names (the list is in the record). In `warn` mode it never blocks; it tells you what is missing:
 
 ```bash
-BASE_REF=$(gh pr view {{PR_NUM}} --repo {{REPO}} --json baseRefName --jq .baseRefName)
-node "{{WE_ROOT}}/scripts/conveyor/class-sweep-check.mjs" --evidence-file=<evidence-file> --kind=fix --repo={{REPO}} --pr={{PR_NUM}} --session={{SESSION_SLUG}} --checkout="$LANE" --base="origin/$BASE_REF"
+gh pr view {{PR_NUM}} --repo {{REPO}} --json baseRefName --jq .baseRefName
+node "{{WE_ROOT}}/scripts/conveyor/class-sweep-check.mjs" --evidence-file=<evidence-file> --kind=fix --repo={{REPO}} --pr={{PR_NUM}} --session={{SESSION_SLUG}} --checkout="<lane-path>" --base="origin/<base-branch>"
 ```
 
 ### 4. Run the gate GREEN (the item's own locus gate)
@@ -526,8 +523,7 @@ The same holds for the blocked-on-infra and load-flake exits: they release the c
 unverified head is never handed back for review or landed.)
 
 ```bash
-node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=gate-red \
-  --detail="<one line — which check stayed red>"
+node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=gate-red --detail="<one line — which check stayed red>"
 node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=gate-red
 node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
 ```
@@ -569,13 +565,13 @@ pinned-count bump) may skip the subagent — but never skip re-reading the revie
 (or while its verify runs), ask the risk check on your lane:
 
 ```bash
-node "{{WE_ROOT}}/scripts/operations/run.mjs" pre-pr-check --checkout="$LANE"
+node "{{WE_ROOT}}/scripts/operations/run.mjs" pre-pr-check --checkout="<lane-path>"
 ```
 
 `pre-pr-check: not gated` — nothing more to do. `pre-pr-check: gated` — it prints the exact commands: run the
 `/converge` flow (`node "{{WE_ROOT}}/scripts/converge-cli.mjs" init …`, drive `step` to `land`, commit the fixes) and stamp
-`node "{{WE_ROOT}}/scripts/converge-cli.mjs" receipt --lane="$LANE" --state="$LANE/.converge-state.json"`, as the delivery brief's step 6 does
-([delivery-agent-brief.md](delivery-agent-brief.md)). `$LANE` is your lane clone's absolute root (`pwd` at its top level).
+`node "{{WE_ROOT}}/scripts/converge-cli.mjs" receipt --lane="<lane-path>" --state="<lane-path>/.converge-state.json"`, as the delivery brief's step 6 does
+([delivery-agent-brief.md](delivery-agent-brief.md)). `<lane-path>` is your lane clone's absolute root (`pwd` at its top level).
 
 ### 6. Commit (before step 4's request) — the harness re-pushes it to the SAME lane ref
 
@@ -585,21 +581,19 @@ under push-before-gate, else on a green verdict for exactly this commit — to `
 `gh pr create`, never `pr-land` — the PR already exists):
 
 ```bash
-printf '%s\n' "{{ATTRIBUTION}}: fix — <specific correction> (PR {{PR_NUM}})" "" \
-  "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>" > <msgfile>
+# Use Write to create a new message file containing "{{ATTRIBUTION}}: fix — <specific correction> (PR {{PR_NUM}})", a blank line,
+# and "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>".
 git commit -F <msgfile> <explicit-paths>
 ```
 
 **If the harness reports the push was rejected because the branch moved** (someone else pushed while you worked — rare now that
 the fix claim refuses other pushes, but a push from outside the guarded paths can still land), do not force and
-do not merge two designs. Save your repair on a side branch, record a **pause** (not a stand-down — it is not
+do not merge two designs. Read the remote head with `git ls-remote origin refs/heads/{{LANE_REF}}` and the repair head with `git rev-parse HEAD`; copy their SHAs literally below. Save your repair on a side branch, record a **pause** (not a stand-down — it is not
 terminal and needs no person), release the claim, and return:
 
 ```bash
 git push origin HEAD:refs/heads/{{LANE_REF}}-fix-{{PR_NUM}}-alt
-node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=concurrent-author \
-  --head="$(git ls-remote origin refs/heads/{{LANE_REF}} | cut -f1)" --alt={{LANE_REF}}-fix-{{PR_NUM}}-alt \
-  --alt-sha="$(git rev-parse HEAD)" --detail="<one line — what the other author changed>"
+node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=concurrent-author --head=<remote-head-sha> --alt={{LANE_REF}}-fix-{{PR_NUM}}-alt --alt-sha=<repair-head-sha> --detail="<one line — what the other author changed>"
 node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=not-applicable
 node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
 ```
@@ -611,7 +605,7 @@ Write the commit message to a file and `commit -F` it — a heredoc runs backtic
 subshell (`bad substitution`); a message file has no such footgun. Pushing to `lane/*` is allowed by the
 single-branch guard; pushing to `main` is not.
 
-Write the evidence file OUTSIDE the lane (e.g. `"$TMPDIR/fix-evidence-{{PR_NUM}}.md"`) and never commit a `.fix-*` scratch file (`.fix-evidence*.md` is gitignored and check:standards refuses it in a diff).
+Write the evidence file OUTSIDE the lane (e.g. `"<task-scratch-dir>/fix-evidence-{{PR_NUM}}.md"`) and never commit a `.fix-*` scratch file (`.fix-evidence*.md` is gitignored and check:standards refuses it in a diff).
 
 **Post the before/after proof as a PR comment before re-arming.** A reviewer must be able to SEE that the fix
 works, not just infer it from a green gate: post a comment carrying the trimmed red output (step 2) followed by
@@ -670,8 +664,8 @@ There is no `review:changes` to swap here, so there is **no label to touch at al
 advisory-fix marker instead:
 
 ```bash
-node "{{WE_ROOT}}/scripts/conveyor/advisory-fix-mark.mjs" {{PR_NUM}} --repo={{REPO}} && \
-  node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=re-armed
+node "{{WE_ROOT}}/scripts/conveyor/advisory-fix-mark.mjs" {{PR_NUM}} --repo={{REPO}}
+node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=re-armed
   node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
 ```
 
@@ -688,12 +682,7 @@ improvement idea) from the repair — a write-time-gated scrub that rejects raw 
 absolute/repo paths, or PII, so keep every field a short generalized lesson:
 
 ```bash
-node "{{WE_ROOT}}/scripts/conveyor/learnings-drop.mjs" \
-  --kind=<friction|missing-convention|doc-gap|skill-gap|improvement> \
-  --summary="<one sentence — the lesson>" \
-  --area="<coarse label, e.g. review-changes repair / re-arm>" \
-  --suggestion="<short recommendation>" \
-  --session={{SESSION_SLUG}}
+node "{{WE_ROOT}}/scripts/conveyor/learnings-drop.mjs" --kind=<friction|missing-convention|doc-gap|skill-gap|improvement> --summary="<one sentence — the lesson>" --area="<coarse label, e.g. review-changes repair / re-arm>" --suggestion="<short recommendation>" --session={{SESSION_SLUG}}
 ```
 
 Skip only if you genuinely hit no generalizable friction.
@@ -778,7 +767,7 @@ re-push, re-arm-never-clear shape is identical — which is the point (#2630).
   `we:scripts/lib/daemon-*`, `we:scripts/lane-pool*`, `we:scripts/review-set-label.mjs` or
   `we:scripts/operations/*dispatch*` — add the live case as a scenario in `we:scripts/conveyor/soak/breaks/`
   (one module + its `.soak.test.mjs` wrapper, registered in `we:scripts/conveyor/soak/breaks/index.mjs`), and
-  post the proof with your before/after evidence: `node "$LANE/scripts/conveyor/soak/red-green.mjs" --break=<id>`
+  post the proof with your before/after evidence: `node "<lane-path>/scripts/conveyor/soak/red-green.mjs" --break=<id>`
   (the copy in YOUR WE lane — it tests the tree it lives in) must print RED on the tree before your fix and GREEN
   with it. A unit test alone is not enough: seven live daemon
   breaks on 2026-09-25 were all green in unit tests. **This is now MECHANICALLY enforced**, not just written

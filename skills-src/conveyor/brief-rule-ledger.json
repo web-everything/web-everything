@@ -283,26 +283,6 @@
           "brief": "skills-src/conveyor/dispatched-agent-system-prompt.md",
           "key": "9d5a70c587",
           "text": "- **Your own background output.** Never `sleep`-poll a `tasks/<id>.output` file or a `subagents/*.jsonl`"
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-brief.md",
-          "key": "839ed13a18",
-          "text": "`run_in_background`, and never `sleep`-poll its `tasks/<id>.output` file (`we:scripts/guard-bash.mjs` denies that"
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-brief.md",
-          "key": "a274bd9a20",
-          "text": "The same holds after you re-push (step 6): do not wait on CI or the merge — report and exit."
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
-          "key": "839ed13a18",
-          "text": "`run_in_background`, and never `sleep`-poll its `tasks/<id>.output` file (`we:scripts/guard-bash.mjs` denies that"
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
-          "key": "622de49190",
-          "text": "After the re-push, do NOT wait for the new CI run to go green (no `gh pr checks --watch`, no `sleep` loop on"
         }
       ]
     },
@@ -345,26 +325,6 @@
           "brief": "skills-src/conveyor/dispatched-agent-system-prompt.md",
           "key": "89fdccba83",
           "text": "this session's `--settings`, but do not rely on it: always pass the timeout explicitly. If a"
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-brief.md",
-          "key": "2e5b70f9e0",
-          "text": "**Run it in the FOREGROUND with an explicit Bash `timeout: 600000`** (the 10-minute max) — never"
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-brief.md",
-          "key": "839ed13a18",
-          "text": "`run_in_background`, and never `sleep`-poll its `tasks/<id>.output` file (`we:scripts/guard-bash.mjs` denies that"
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
-          "key": "2e5b70f9e0",
-          "text": "**Run it in the FOREGROUND with an explicit Bash `timeout: 600000`** (the 10-minute max) — never"
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
-          "key": "839ed13a18",
-          "text": "`run_in_background`, and never `sleep`-poll its `tasks/<id>.output` file (`we:scripts/guard-bash.mjs` denies that"
         }
       ]
     },
@@ -390,16 +350,6 @@
           "brief": "skills-src/conveyor/delivery-agent-brief.md",
           "key": "23068c75af",
           "text": "head is `node heavy-admission.mjs run`, never the raw `npx vitest …` head `dispatchedAgentVerificationReason`"
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-brief.md",
-          "key": "eb61153e5d",
-          "text": "changed. **Never run the full suite yourself** (`npm run test:unit`, `npm test`, a bare `vitest run`): it takes"
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
-          "key": "eb61153e5d",
-          "text": "changed. **Never run the full suite yourself** (`npm run test:unit`, `npm test`, a bare `vitest run`): it takes"
         }
       ]
     },
@@ -420,11 +370,6 @@
           "brief": "skills-src/conveyor/fix-agent-brief.md",
           "key": "22c8cbd4b0",
           "text": "Commit only the repair's files (explicit paths, never `git add -A`; one commit) on the lane's current branch,"
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
-          "key": "63af1ba9a9",
-          "text": "Commit only the heal's files (explicit paths, never `git add -A`; one commit) on the lane's current branch. Because"
         },
         {
           "brief": "skills-src/conveyor/prepare-decision-agent-brief.md",
@@ -539,11 +484,6 @@
         },
         {
           "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
-          "key": "a3df5b39ed",
-          "text": "then **EXIT WITHOUT MERGING** — and **NEVER touch the review label** (`review:human` / `review:pending` /"
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
           "key": "e97abc298b",
           "text": "### 9. EXIT — do not merge, do not touch the review label, do not release"
         },
@@ -551,11 +491,6 @@
           "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
           "key": "b568f24739",
           "text": "**Stop here.** Do NOT run `gh pr merge`. Do NOT run a drain. Do NOT `release` the lane. Do NOT change ANY review"
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
-          "key": "05788444fd",
-          "text": "- **Never merge; never touch the review label** — you stop at a re-pushed, CI-repaired PR. `review:human` /"
         },
         {
           "brief": "skills-src/conveyor/investigation-agent-brief.md",
@@ -746,16 +681,6 @@
           "brief": "skills-src/conveyor/delivery-agent-brief.md",
           "key": "792c3bb3b5",
           "text": "- **Never hand-roll `gh pr create` + `gh pr edit --add-label`** — route through `pr-land` so the #2307"
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-brief.md",
-          "key": "faf5ba1ec2",
-          "text": "then push HEAD to `{{LANE_REF}}` — this **updates the existing PR**, it does not open a new one (never"
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-brief.md",
-          "key": "e134a9acef",
-          "text": "`gh pr create`, never `pr-land` — the PR already exists; you are pushing a new head to it):"
         },
         {
           "brief": "skills-src/conveyor/fix-agent-brief.md",
@@ -1118,11 +1043,6 @@
         },
         {
           "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
-          "key": "d252d93987",
-          "text": "# Conveyor CI-heal fix-agent brief (template) — rebase + repair a green-at-open PR gone RED / BEHIND, NEVER touch the review gate (#2666)"
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
           "key": "d2b37a443a",
           "text": "> failing check, re-push — **repairing ONLY CI, never the review label**. This is the CI-axis sibling of"
         },
@@ -1130,11 +1050,6 @@
           "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
           "key": "fade5f121c",
           "text": "> **must not go near it**."
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
-          "key": "a3df5b39ed",
-          "text": "then **EXIT WITHOUT MERGING** — and **NEVER touch the review label** (`review:human` / `review:pending` /"
         },
         {
           "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
@@ -1155,21 +1070,6 @@
           "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
           "key": "e97abc298b",
           "text": "### 9. EXIT — do not merge, do not touch the review label, do not release"
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
-          "key": "d5259ebe9f",
-          "text": "locus gate green, re-push HEAD to the same `lane/*` ref, post the CI-heal comment — and **never touch the review"
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
-          "key": "864890fab1",
-          "text": "repair-only-CI, re-push, never-touch-the-review shape is identical."
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
-          "key": "05788444fd",
-          "text": "- **Never merge; never touch the review label** — you stop at a re-pushed, CI-repaired PR. `review:human` /"
         }
       ]
     },
@@ -1516,11 +1416,6 @@
         },
         {
           "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
-          "key": "9234010107",
-          "text": "over: reconstitute on `{{LANE_REF}}` (don't rebuild), rebase onto `main`, repair only the failing check, get the"
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
           "key": "07d2c42ee8",
           "text": "- **Repair only the CI break** — do not fold unrelated work in; do not weaken or delete a test to go green; if the"
         },
@@ -1575,11 +1470,6 @@
           "brief": "skills-src/conveyor/fix-agent-brief.md",
           "key": "415f1c2448",
           "text": "test if the finding touches a call path, not only a unit test of the isolated piece; and never claim the repair"
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-brief.md",
-          "key": "786c11bf61",
-          "text": "Re-run the SAME test from step 2 — it must now be green — and, where the finding had a real-surface probe,"
         },
         {
           "brief": "skills-src/conveyor/fix-agent-brief.md",
@@ -1669,19 +1559,9 @@
           "text": "the fix claim refuses other pushes, but a push from outside the guarded paths can still land), do not force and"
         },
         {
-          "brief": "skills-src/conveyor/fix-agent-brief.md",
-          "key": "fbad9fc969",
-          "text": "do not merge two designs. Save your repair on a side branch, record a **pause** (not a stand-down — it is not"
-        },
-        {
           "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
           "key": "2f7eb8e4e5",
           "text": "(never for the review-gate-only case above — that is ALWAYS `not-a-ci-break`, never this). Report and stop:"
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
-          "key": "4c044d14bd",
-          "text": "diff itself is genuinely wrong (not a CI/rebase break), escalate — don't paper over it."
         },
         {
           "brief": "skills-src/conveyor/investigation-agent-brief.md",
@@ -1722,11 +1602,6 @@
         },
         {
           "brief": "skills-src/conveyor/fix-agent-brief.md",
-          "key": "615f11ce1d",
-          "text": "> judgment call, and you must NOT stand down** (#xkmu3gv incident, CONFIRMED LIVE on `web-everything/web-everything"
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-brief.md",
           "key": "e902f39241",
           "text": "> make — it is never the right exit for \"there was nothing left to do here\". Tell the two apart by re-reading"
         },
@@ -1739,11 +1614,6 @@
           "brief": "skills-src/conveyor/fix-agent-brief.md",
           "key": "a450524ec8",
           "text": "FRICTION, not a judgment call — do NOT stand down.** The reviewer's finding still says exactly what to do; only"
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-brief.md",
-          "key": "6c0fb75dc6",
-          "text": "never `stand-down.mjs`, which is terminal and reserved for a genuine judgment call (see step 2):"
         },
         {
           "brief": "skills-src/conveyor/fix-agent-brief.md",
@@ -1801,18 +1671,8 @@
         },
         {
           "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
-          "key": "26175570d3",
-          "text": "(`git rebase --abort` FIRST, so you never leave a half-rebased tree behind. `--head` is ALWAYS `$EXAMINED_HEAD`"
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
           "key": "18c6d096d5",
           "text": "— the PR's PUBLISHED head, captured ONCE at step 0 before diagnosis began — never `git rev-parse HEAD` (after a"
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
-          "key": "6b6db497c0",
-          "text": "clean rebase that you have not pushed, the local `HEAD` is a commit GitHub never saw, the marker would never"
         },
         {
           "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
@@ -2506,11 +2366,6 @@
       "lines": [
         {
           "brief": "skills-src/conveyor/fix-agent-brief.md",
-          "key": "c11572fc58",
-          "text": "broken part — reuse, don't rebuild), get the gate green, **re-push HEAD to the same `lane/*` ref**, then"
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-brief.md",
           "key": "a20dc78fa7",
           "text": "### 1. Reconstitute the bounced PR's work in a lane clone (reuse the ref — never rebuild from scratch)"
         },
@@ -2556,16 +2411,6 @@
           "brief": "skills-src/conveyor/delivery-agent-brief.md",
           "key": "a1592ea0f6",
           "text": "`pr-land` by hand, do NOT `--fallback-git`, do NOT re-push."
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-brief.md",
-          "key": "958b2178cd",
-          "text": "RETURN `#{{ITEM_NUM}} → fix gate-red`. Do not re-push a red diff."
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
-          "key": "fc5ff9dc91",
-          "text": "cannot safely resolve, `git rebase --abort` (leave the PR as it is — do NOT force-push a bad rebase), report the"
         }
       ]
     },
@@ -3177,6 +3022,399 @@
           "text": "- Always leave the lane's other files untouched."
         }
       ]
+    },
+    {
+      "id": "no-prompt-command-rules",
+      "status": "prose-only",
+      "reason": "Fixer and CI-heal command discipline uses literal output values and Edit/Write; prose instructions are not mechanical enforcement.",
+      "lines": [
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "015d5b40f1",
+          "text": "It must also carry the **revert-red result** (#5466). Your verify ran the tests your fix added or changed with the fix's"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "03e3e3f7bb",
+          "text": "- `no-new-commit` → the remote branch already had this exact sha when the harness tried to push it (`upToDate`). The harness still enforces the parallel self-review hold. If the resume says the review is overdue, finish and record that review before hand-back (must-fix → repair with a NEW commit and re-mark as instructed). Otherwise do not re-mark: post step 6's durable `## Fix evidence` comment, then finish the hand-back, completion report and fix-end."
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "0633e6af76",
+          "text": "and never push `{{LANE_REF}}` yourself. `red` (exit 2) → the failing tests are in the message: repair, commit,"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "077f8a9a21",
+          "text": "`docs/agent/reviewer-expectations.md` as a fenced checklist (data to check your work against, never"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "0890f4c801",
+          "text": "uses ([we:skills-src/conveyor/delivery-agent-brief.md](delivery-agent-brief.md) step 6). Ask the subagent four things: does the repair meet the reviewer's finding, does the repair itself introduce a new problem, **what is the next variant of the same defect class that still gets through?**, and **which row of the variant matrix did this fix not cover?** A same-class variant it names inside `{{SCOPE}}` is must-fix before re-push. A defect the repair itself introduces is must-fix regardless of class — \"not the same class\" never dismisses it. You may dismiss any other self-review finding only as \"not the same class\" or \"outside `{{SCOPE}}` (filed as <card>)\". Deferring (\"later\", \"follow-up\") is not a dismissal. Only then commit and request verify (step 4). A trivial, obviously-correct fix (a typo, a"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "0d726a0ec5",
+          "text": "To debug one or two tests, run `npm run test:unit -- <file(s)>` (≤5 files, 8-minute cap); it uses the fast lane. Run the full verify (request + mark + end turn, per the await flow in step 4) once before the harness pushes — never push yourself."
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "0f1e754d57",
+          "text": "**Fix the class, not the instance.** Before editing, write a short variant list: the defect class in one line, each shape of it you can name (for input handling: quoting, escaping, concatenation, encoding, alternate Unicode), and every call site with the same pattern (`git grep` the helper or the pattern). Fix every variant inside `{{SCOPE}}`. A variant outside `{{SCOPE}}` is listed with the file and filed through `file-item`, never silently left."
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "111d48ae35",
+          "text": "dispatches nothing. Pushing while you hold the claim is allowed; **releasing it on red is never allowed** (no"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "12498ee888",
+          "text": "changed files no row names (the list is in the record). In `warn` mode it never blocks; it tells you what is missing:"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "19feb9ff3c",
+          "text": "It never expands a default local selection into the full suite. **Never run the full suite yourself**"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "2b9fac2f0c",
+          "text": "right now, never pre-emptively.**"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "3ae50ec1ee",
+          "text": "> `fix-procedure.mjs fix-end`. Never run `rearm-review.mjs`."
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "3bbf96b880",
+          "text": "`sleep`, never a backgrounded Bash/Monitor wait (the one exception: step 5's parallel self-review Agent call), never read output files in a loop (#x36vidg), never `reset` or re-`request`"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "4c2c445d7b",
+          "text": "the fixed site. Every changed file must be named by one of the finding's rows: the four paths above, or extra rows"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "4caa2733ea",
+          "text": "the harness pushes your marked commit to `{{LANE_REF}}` within seconds (normal push, never force), so CI starts while"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "54112d7882",
+          "text": "Use literal values copied from command output for angle-bracket placeholders below; never assign shell variables."
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "565ddf6805",
+          "text": "After the harness pushes, do not wait on CI or the merge — finish the hand-back, report and exit."
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "569fe15a9d",
+          "text": "(step 2). The comment must also carry a `Variants considered:` block: the list from step 3, each marked fixed, or out of scope + card, followed by the variant matrix from step 3 with every touched row marked `fixed at <sites>` or `n/a: <why>`."
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "5c2f555a3a",
+          "text": "and cite its output as the red proof. Never disable, comment out, or `if (false && …)` a guard, check, or test to"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "7af6353dd8",
+          "text": "same line again. Never re-argue a `not-real` ruling, and never work around a `block` ruling."
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "7b17ca9361",
+          "text": "your commit may already be on the PR, **never amend, rebase or force-push a marked commit**: repair with a NEW"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "82a47043d9",
+          "text": "Then **end your turn**: reply with one line (`awaiting verify for <sha>`) and stop. Never `check --wait`, never"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "88fc4355cd",
+          "text": "re-arm), and RETURN `#{{ITEM_NUM}} → fix gate-red`. Never hand a red head back for review. (With push-before-gate"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "8a79a200e2",
+          "text": "Run `rearm-review.mjs` as its OWN Bash call: the command must START with `node \"{{WE_ROOT}}/…\"`, never behind `cd`,"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "9118d2136d",
+          "text": "under push-before-gate, else on a green verdict for exactly this commit — to `{{LANE_REF}}` — this **updates the existing PR**, it does not open a new one (never"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "9deac2bb9f",
+          "text": "Re-run the SAME test from step 2 before you request verify — it must now be green — and, where the finding had a real-surface probe,"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "a64e011a84",
+          "text": "quoted path is denied). Do not run `verify-lane.mjs run` here; `request` stamps a marker the verify runner"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "ae3648ff10",
+          "text": "the green resume while the review is open, and `fix-end` refuses a hand-back release until it returned** — never"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "b141a06136",
+          "text": "The harness acts on the same verdict `verify-lane.mjs check` prints — the **`check` output**, never the `request`"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "b4b5d4764b",
+          "text": "> judgment call, and you must NOT stand down** (#xkmu3gv incident, CONFIRMED LIVE on `web-everything/web-everything"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "bea8f5d2b2",
+          "text": "NEVER use `git checkout --ours/--theirs`, `git checkout -- <file>`, `git restore`, or `git reset` on a file:"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "c2777c78a9",
+          "text": "never cherry-pick a range of main commits or reconstruct upstream merges. Save local repairs in a commit"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "ca1231e361",
+          "text": "flags: never `--passWithNoTests`, `--config`, `--reporter`, `-t`…) / `npm run test:unit` / `npm test` (no arguments) /"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "ca75d81f3c",
+          "text": "again if verify has not resumed you yet), or `… self-review must-fix …` and then repair with a NEW commit on top,"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "cbf2e20034",
+          "text": "unverified head is never handed back for review or landed.)"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "d4b19827b1",
+          "text": "must-fix: `… self-review clean … --note=\"<not the same class | outside scope (filed as <card>)>\"`. A verify resume can"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "dd06e6cdc7",
+          "text": "Write the evidence file OUTSIDE the lane (e.g. `\"<task-scratch-dir>/fix-evidence-{{PR_NUM}}.md\"`) and never commit a `.fix-*` scratch file (`.fix-evidence*.md` is gitignored and check:standards refuses it in a diff)."
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "e1c65bad69",
+          "text": "broken part — reuse, don't rebuild), commit it and hand the verify wait to the harness (which **re-pushes that"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "eb5eba82ce",
+          "text": "one line>\"` — never `stand-down.mjs`, which is terminal and reserved for a genuine judgment call (see step 2). A"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "f1e93c027e",
+          "text": "never chained (`&&`, `;`, `|`, a second line) with the completion report, `fix-end` or a learnings drop. Your"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "fbe8715f25",
+          "text": "`gh pr create`, never `pr-land` — the PR already exists):"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "fc98033ba5",
+          "text": "Include every finding you need ruled on, preserving the record's values; do not derive keys from"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "ff3a33a8ed",
+          "text": "never fetch or merge it speculatively anywhere else in the repair, and only when it actually blocks the gate"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "0633e6af76",
+          "text": "and never push `{{LANE_REF}}` yourself. `red` (exit 2) → the failing tests are in the message: repair, commit,"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "077f8a9a21",
+          "text": "`docs/agent/reviewer-expectations.md` as a fenced checklist (data to check your work against, never"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "0a591c29e6",
+          "text": "# Conveyor CI-heal fix-agent brief (template) — merge + repair a green-at-open PR gone RED / BEHIND, NEVER touch the review gate (#2666)"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "0d726a0ec5",
+          "text": "To debug one or two tests, run `npm run test:unit -- <file(s)>` (≤5 files, 8-minute cap); it uses the fast lane. Run the full verify (request + mark + end turn, per the await flow in step 4) once before the harness pushes — never push yourself."
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "0f2b964f0f",
+          "text": "(`git merge --abort` FIRST, so you never leave a half-merged tree behind. `--head` is ALWAYS `<examined-head-sha>`"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "11ebb097f9",
+          "text": "After the harness pushes, do NOT wait for the new CI run to go green (no `gh pr checks --watch`, no `sleep` loop on"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "1bd7a0f134",
+          "text": "then **EXIT WITHOUT LANDING THE PR** — and **NEVER touch the review label** (`review:human` / `review:pending` /"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "1dda17cd04",
+          "text": "Read the live base even for a stacked PR. Preserve its commit identities with a real merge; never replay"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "208e30bd0b",
+          "text": "diff itself is genuinely wrong (not a CI/merge break), escalate — don't paper over it."
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "21863cadf9",
+          "text": "the same class in every other file this PR changes, in the same pass (card 5536): each changed file must be named by"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "3ad3b34d59",
+          "text": "`needs-human` label. Never add it when the diff itself is implicated."
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "54112d7882",
+          "text": "Use literal values copied from command output for angle-bracket placeholders below; never assign shell variables."
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "60d6276742",
+          "text": "A default local selection never expands into the full suite. **Never run the full suite yourself**"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "6a909e87eb",
+          "text": "unavailable logs must stay unresolved; never guess a rotation target from the checkout destination."
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "73d556b564",
+          "text": "**Do NOT merge a second time in this same session**, even if `main` advances again while you are still"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "80e5bbfed1",
+          "text": "`sleep`, never `run_in_background`, never read output files in a loop (#x36vidg), never `reset` or re-`request`"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "82a47043d9",
+          "text": "Then **end your turn**: reply with one line (`awaiting verify for <sha>`) and stop. Never `check --wait`, never"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "82c3e8277e",
+          "text": "- **Never land the PR; use the completion marker for review handoff** — you stop at a re-pushed, CI-repaired PR. `review:human` /"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "8319015f57",
+          "text": "moved; reconcile with the current PR head, commit, and request + mark again. Never force-push over that refusal."
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "91a73e0236",
+          "text": "over: reconstitute on `{{LANE_REF}}` (don't rebuild), merge the live PR base into the lane, repair only the failing check, get the"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "942b5eeff3",
+          "text": "never use `needs-human` for inherited red."
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "9d6d0cffb4",
+          "text": "clean merge that you have not pushed, the local `HEAD` is a commit GitHub never saw, the marker would never"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "a64e011a84",
+          "text": "quoted path is denied). Do not run `verify-lane.mjs run` here; `request` stamps a marker the verify runner"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "b141a06136",
+          "text": "The harness acts on the same verdict `verify-lane.mjs check` prints — the **`check` output**, never the `request`"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "b5fe5f7240",
+          "text": "diagnosing/repairing (step 3) or before you re-push (step 6) — a clean step-2 merge leaves no working-tree"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "b9c4e98801",
+          "text": "Commit only the heal's files (explicit paths, never `git add -A`; one commit) on the lane's current branch, BEFORE"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "bea8f5d2b2",
+          "text": "NEVER use `git checkout --ours/--theirs`, `git checkout -- <file>`, `git restore`, or `git reset` on a file:"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "ca1231e361",
+          "text": "flags: never `--passWithNoTests`, `--config`, `--reporter`, `-t`…) / `npm run test:unit` / `npm test` (no arguments) /"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "d6d5e3a2dc",
+          "text": "The displayed repository-scoped rotation command prompts the operator for a replacement; the healer never executes it."
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "dad2f201a6",
+          "text": "cannot safely resolve, `git merge --abort` (leave the PR as it is — do NOT force-push a bad merge), report the"
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "dd06e6cdc7",
+          "text": "Write the evidence file OUTSIDE the lane (e.g. `\"<task-scratch-dir>/fix-evidence-{{PR_NUM}}.md\"`) and never commit a `.fix-*` scratch file (`.fix-evidence*.md` is gitignored and check:standards refuses it in a diff)."
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "e52c9ecfa4",
+          "text": "This is a product permission wall, not a judgment call: do not stand down or retry the denied command."
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
+          "key": "fadf7804f6",
+          "text": "In `warn` mode it never blocks. A merge-only heal with no code change skips it."
+        },
+        {
+          "brief": "skills-src/conveyor/fix-agent-brief.md",
+          "key": "2ce8eaa056",
+          "text": "do not merge two designs. Read the remote head with `git ls-remote origin refs/heads/{{LANE_REF}}` and the repair head with `git rev-parse HEAD`; copy their SHAs literally below. Save your repair on a side branch, record a **pause** (not a stand-down — it is not"
+        }
+      ],
+      "proposed": "guard-bash: enforce single-command and Edit/Write discipline for fix and ci-heal sessions."
     }
   ]
 }

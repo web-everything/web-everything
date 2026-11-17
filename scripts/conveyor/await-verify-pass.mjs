@@ -1,3 +1,4 @@
+import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 /**
  * The fix daemon's verify-verdict pass — we:backlog/5137-harness-owns-the-verify-wait-not-the-model.md slices 2+3.
  *
@@ -230,7 +231,11 @@ function buildNoPushResumePrompt({ kind, record, marker, detail, head, next }) {
  * The message the resumed session receives. Pure. Every variant names the sha, the attempt, and the exact next
  * step in the session's own brief, and repeats the one invariant: the session never pushes `{{LANE_REF}}` itself.
  */
-export function buildAwaitVerifyResumePrompt({ kind, record, marker = null, detail = '' }) {
+export function buildAwaitVerifyResumePrompt(options) {
+  return renderNoPromptCommandRules(buildAwaitVerifyTask(options), options.record.kind);
+}
+
+function buildAwaitVerifyTask({ kind, record, marker = null, detail = '' }) {
   const subject = isNoPushRecord(record) ? `item #${record.item} (${record.repo})` : `PR #${record.pr} (${record.repo})`;
   const head = `[harness verify verdict — #5137] ${subject}, sha ${record.sha}, attempt ${record.attempt ?? 1}.`;
   const next = `Re-mark with --attempt=${(record.attempt ?? 1) + 1} after committing and re-requesting, then end your turn again.`;
@@ -273,7 +278,7 @@ export function buildAwaitVerifyResumePrompt({ kind, record, marker = null, deta
     case 'red':
       return `${head}\n\nVerify is RED for this sha. Failing tests:\n${failureLines(marker)}\n\nRepair the failure in your lane (same scope rules), commit, run \`verify-lane.mjs request\`, then ${next.charAt(0).toLowerCase()}${next.slice(1)} If the red is only timeouts that pass alone under host load, take the brief's load-flake exit instead.${earlyRed}`;
     case 'load-flake-redispatch':
-      return `${head}\n\nVerify is RED only on timeouts the gate already re-ran alone (load-flake):\n${failureLines(marker)}\n\nTake your ${brief(record)}'s load-flake exit. No reverify worker can push a saved fix in this repo. Record the re-dispatch hold (\`--head\` is the PR's own head, never your repair sha — a mismatched head ends the hold at once): \`node "${ROOT}/scripts/conveyor/stand-down.mjs" ${record.pr} --repo=${record.repo} --who=${record.who} --reason=load-flake --head=${earlyRed ? record.sha : `"$(git rev-parse origin/${record.ref})"`} --detail="verify red only on host-load timeouts the gate re-ran alone"\`, then \`node "${ROOT}/scripts/operations/completion-cli.mjs" report --repo=${record.repo} --pr=${record.pr} --session=${record.who} --kind=${record.kind} --status=done --outcome=blocked-on-load-flake\` and \`node "${ROOT}/scripts/conveyor/fix-procedure.mjs" fix-end ${record.pr} --repo=${record.repo} --who=${record.who}\`. The quiet-host pass ends the hold so the fix loop re-dispatches a fixer against the same review findings.`;
+      return `${head}\n\nVerify is RED only on timeouts the gate already re-ran alone (load-flake):\n${failureLines(marker)}\n\nTake your ${brief(record)}'s load-flake exit. No reverify worker can push a saved fix in this repo. ${earlyRed ? '' : `First run \`git rev-parse origin/${record.ref}\` and copy its output literally into <remote-head-sha>. `} Record the re-dispatch hold (\`--head\` is the PR's own head, never your repair sha — a mismatched head ends the hold at once): \`node "${ROOT}/scripts/conveyor/stand-down.mjs" ${record.pr} --repo=${record.repo} --who=${record.who} --reason=load-flake --head=${earlyRed ? record.sha : '<remote-head-sha>'} --detail="verify red only on host-load timeouts the gate re-ran alone"\`, then \`node "${ROOT}/scripts/operations/completion-cli.mjs" report --repo=${record.repo} --pr=${record.pr} --session=${record.who} --kind=${record.kind} --status=done --outcome=blocked-on-load-flake\` and \`node "${ROOT}/scripts/conveyor/fix-procedure.mjs" fix-end ${record.pr} --repo=${record.repo} --who=${record.who}\`. The quiet-host pass ends the hold so the fix loop re-dispatches a fixer against the same review findings.`;
     case 'load-flake':
       return `${head}\n\nVerify is RED only on timeouts the gate already re-ran alone (load-flake):\n${failureLines(marker)}\n\nTake your ${brief(record)}'s load-flake exit with --alt-sha=${record.sha} (push this sha to the alt branch named there, never to ${record.ref}), then report blocked-on-load-flake and fix-end. The quiet-host reverify pass retries it.${earlyRed ? ` This sha is ALREADY the PR head (push-before-gate): pass --head=${record.sha} (never a local \`git rev-parse origin/...\`, which is stale after the harness push).` : ''}`;
     case 'escalate':

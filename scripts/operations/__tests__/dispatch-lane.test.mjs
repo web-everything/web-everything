@@ -1,3 +1,4 @@
+import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
 import { applyTestsFirstPolicy } from '../../lib/tests-first-policy.mjs';
 /**
  * @file dispatch-lane.test.mjs — the effect that STARTS rather than completes (#3037, under epic #3029).
@@ -2952,7 +2953,7 @@ describe('#3332: the planner\'s fix and CI-heal lists reach the spawner', () => 
   /** The brief a kind SHOULD produce, filled from the file on disk — byte-exact, so it cannot drift. `fix`/
    *  `ci-heal` need `REPO_AWARE_VALUE_PATTERNS` (#3960: `GATE_COMMAND`/`ATTRIBUTION` legitimately carry a space). */
   function expectedPrompt(kind, values) {
-    return fillBrief(
+    return `${NO_PROMPT_COMMAND_RULES}\n\n` + fillBrief(
       applyTestsFirstPolicy(readFileSync(briefPath(REPO_ROOT, kind), 'utf8')) + '\n\n' + renderBuildRequirements(), values, BRIEF_REQUIRED_BY_KIND[kind],
       undefined, kind === 'fix' || kind === 'ci-heal' ? REPO_AWARE_VALUE_PATTERNS : undefined,
     ).prompt;
@@ -3156,7 +3157,7 @@ describe('#3960: the fix/ci-heal briefs fill repo-aware, and reproduce WE\'s pre
     const tokens = briefTokensForRepo('we', { itemNum: '2608', checkoutExists: () => true, readPackageJson: () => WE_PACKAGE_JSON });
     const { prompt } = fillBrief(FIX_BRIEF, { ...BASE_FIX_VALUES, ...tokens }, BRIEF_REQUIRED_BY_KIND.fix, undefined, REPO_AWARE_VALUE_PATTERNS);
     // The exact literal `fix-agent-brief.md` hardcoded before #3960 (`"WE #{{ITEM_NUM}}: address …"`).
-    expect(prompt).toContain('printf \'%s\\n\' "WE #2608: fix — <specific correction> (PR 701)"');
+    expect(prompt).toContain('"WE #2608: fix — <specific correction> (PR 701)"');
     // xpnhz4o — the gate is the diff-selected verify-lane run, never the bare full suite.
     expect(prompt).toContain(`node ${tokens.WE_ROOT}/scripts/verify-lane.mjs request --repo=.`); // #4369 — request/check, never the guard-denied `run`
     expect(prompt).toContain(`node ${tokens.WE_ROOT}/scripts/conveyor/await-verify.mjs mark --repo=web-everything/web-everything --pr=701 --who=fix-701 --ref=lane/2608-x --kind=fix --attempt=1`); // #5137
@@ -3171,7 +3172,7 @@ describe('#3960: the fix/ci-heal briefs fill repo-aware, and reproduce WE\'s pre
   it('for WE, the ci-heal brief\'s {{ATTRIBUTION}} reproduces the pre-#3960 hardcoded literal exactly', () => {
     const tokens = briefTokensForRepo('we', { itemNum: '2638', checkoutExists: () => true, readPackageJson: () => WE_PACKAGE_JSON });
     const { prompt } = fillBrief(CI_HEAL_BRIEF, { ...BASE_CI_HEAL_VALUES, ...tokens }, BRIEF_REQUIRED_BY_KIND['ci-heal'], undefined, REPO_AWARE_VALUE_PATTERNS);
-    expect(prompt).toContain('printf \'%s\\n\' "WE #2638: ci-heal — <failing check and repair> (PR 743)"');
+    expect(prompt).toContain('"WE #2638: ci-heal — <failing check and repair> (PR 743)"');
     expect(prompt).toContain(`node ${tokens.WE_ROOT}/scripts/verify-lane.mjs request --repo=.`); // #4369 — request/check, never the guard-denied `run`
     expect(prompt).toContain(`node ${tokens.WE_ROOT}/scripts/conveyor/await-verify.mjs mark --repo=web-everything/web-everything --pr=743 --who=ci-heal-743 --ref=lane/2638-x --kind=ci-heal --attempt=1`); // #5137
     expect(prompt).not.toContain(`verify-lane.mjs run --repo=.          #`);
@@ -3196,7 +3197,7 @@ describe('#3960: the fix/ci-heal briefs fill repo-aware, and reproduce WE\'s pre
     // The gate runs against the plateau lane (`--repo=.`), with WE's own verify-lane choosing plateau's scripts.
     expect(prompt).toContain(`node ${tokens.WE_ROOT}/scripts/verify-lane.mjs request --repo=.`);
     expect(prompt).toContain(`node ${tokens.WE_ROOT}/scripts/conveyor/await-verify.mjs mark --repo=plateauapp/plateau-app --pr=701 --who=fix-701 --ref=lane/2608-x --kind=fix --attempt=1`); // #5137
-    expect(prompt).toContain('printf \'%s\\n\' "PLATEAU #2608: fix — <specific correction> (PR 701)"');
+    expect(prompt).toContain('"PLATEAU #2608: fix — <specific correction> (PR 701)"');
   });
 });
 
@@ -3212,7 +3213,7 @@ describe('#4269: the ci-heal brief captures the examined head ONCE and never re-
   const LIVE_HEAD_READ = 'gh pr view {{PR_NUM}} --repo {{REPO}} --json headRefOid --jq .headRefOid';
 
   it('captures EXAMINED_HEAD from exactly one live `gh pr view` read, at step 0', () => {
-    const captureLines = CI_HEAL_BRIEF_RAW.split('\n').filter((l) => /^EXAMINED_HEAD=/.test(l.trim()));
+    const captureLines = CI_HEAL_BRIEF_RAW.split('\n').filter((l) => /^gh pr view .*--json headRefOid --jq \.headRefOid$/.test(l.trim()));
     expect(captureLines).toHaveLength(1);
     expect(captureLines[0]).toContain(LIVE_HEAD_READ);
   });
@@ -3220,7 +3221,7 @@ describe('#4269: the ci-heal brief captures the examined head ONCE and never re-
   it('every escalation exit\'s --head= uses ONLY the captured $EXAMINED_HEAD — never a fresh live re-read', () => {
     const headArgs = [...CI_HEAL_BRIEF_RAW.matchAll(/--head="([^"]*)"/g)].map((m) => m[1]);
     expect(headArgs.length).toBeGreaterThanOrEqual(4); // lane-ref-gone, conflict, needs-human, waiting-on-system-fix
-    for (const arg of headArgs) expect(arg).toBe('$EXAMINED_HEAD');
+    for (const arg of headArgs) expect(arg).toBe('<examined-head-sha>');
     // The live read pattern must appear EXACTLY once in the whole brief — the step-0 capture — never again as a
     // `--head=` argument at any escalation exit.
     const liveReadOccurrences = CI_HEAL_BRIEF_RAW.split(LIVE_HEAD_READ).length - 1;
@@ -3228,9 +3229,9 @@ describe('#4269: the ci-heal brief captures the examined head ONCE and never re-
   });
 
   it('the capture happens BEFORE every escalation exit that uses it (step 0, ahead of lane acquire and diagnosis)', () => {
-    const captureIndex = CI_HEAL_BRIEF_RAW.indexOf('EXAMINED_HEAD="$(gh pr view');
+    const captureIndex = CI_HEAL_BRIEF_RAW.indexOf(LIVE_HEAD_READ);
     expect(captureIndex).toBeGreaterThan(-1);
-    const headUseIndices = [...CI_HEAL_BRIEF_RAW.matchAll(/--head="\$EXAMINED_HEAD"/g)].map((m) => m.index);
+    const headUseIndices = [...CI_HEAL_BRIEF_RAW.matchAll(/--head="<examined-head-sha>"/g)].map((m) => m.index);
     expect(headUseIndices.length).toBeGreaterThanOrEqual(4);
     for (const idx of headUseIndices) expect(idx).toBeGreaterThan(captureIndex);
   });
@@ -3245,9 +3246,9 @@ describe('#4269: the ci-heal brief captures the examined head ONCE and never re-
       { ITEM_NUM: '2638', PR_NUM: 743, LANE_REF: 'lane/2638-x', LANE: 6, SESSION_SLUG: 'ci-heal-743', SCOPE: 'we:scripts/operations/', REASON: 'red-ci', ...tokens },
       BRIEF_REQUIRED_BY_KIND['ci-heal'], undefined, REPO_AWARE_VALUE_PATTERNS,
     );
-    expect(prompt).toContain('EXAMINED_HEAD="$(gh pr view 743 --repo web-everything/web-everything --json headRefOid --jq .headRefOid)"');
+    expect(prompt).toContain('gh pr view 743 --repo web-everything/web-everything --json headRefOid --jq .headRefOid');
     // lane-ref-gone, conflict, not-a-ci-break, inherited-from-base, needs-human, waiting-on-system-fix
-    expect(prompt.match(/--head="\$EXAMINED_HEAD"/g)).toHaveLength(6);
+    expect(prompt.match(/--head="<examined-head-sha>"/g)).toHaveLength(6);
   });
 });
 

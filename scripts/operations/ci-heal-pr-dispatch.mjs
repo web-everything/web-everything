@@ -1,3 +1,4 @@
+import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 /**
  * @file ci-heal-pr-dispatch.mjs
  * Dispatch ONE ci-heal for a PR that carries `ci:failed`, from `reconcile-core.mjs`'s own durable `kind:'ci-heal'`
@@ -203,7 +204,9 @@ export function routeAvailableCiHeal(p, { readHolds = readAgyHold, readScores = 
 
 /** The ci-heal brief `dispatchCiHeal` sends by default: the template, its context pack, then the build requirements once. */
 export function readCiHealBriefTemplate(root = REPO_ROOT, pack = (template) => template) {
-  return appendBuildRequirements(pack(readFileSync(briefPath(root, 'ci-heal'), 'utf8')), { policy: resolveBuildPolicy({ log: line => console.error(line) }) });
+  const template = assertBriefTaskContent(readFileSync(briefPath(root, 'ci-heal'), 'utf8'));
+  const packed = assertBriefTaskContent(pack(template));
+  return appendBuildRequirements(packed, { policy: resolveBuildPolicy({ log: line => console.error(line) }) });
 }
 
 /**
@@ -309,7 +312,7 @@ export async function dispatchCiHeal(planned, {
     if (route?.outcome === 'refused') { releaseOurClaim(); return { held: true, reason: route.refusal }; }
     const briefOnly = reason === 'codeql' || !!planned.owedMainRule;
     const out = await sinks[DISPATCH_EFFECT]({
-      launchKind: 'ci-heal', prompt: withOwedMainRuleSection(withCodeQLSection(withAltBranchHint(prompt, planned.altBranch), planned, repo), planned), sessionSlug, num: planned.itemNum ?? undefined, lane: planned.lane, scope: planned.scope,
+      launchKind: 'ci-heal', prompt: renderNoPromptCommandRules(withOwedMainRuleSection(withCodeQLSection(withAltBranchHint(prompt, planned.altBranch), planned, repo), planned), 'ci-heal'), sessionSlug, num: planned.itemNum ?? undefined, lane: planned.lane, scope: planned.scope,
       headRefOid: planned.headRefOid, claimOwner, claimRoot,
       // x8cnbii: a CodeQL heal needs the brief's alert, which the probation worker prompt does not carry; so does
       // a heal that must keep drain-assigned card numbers (PR #5082).

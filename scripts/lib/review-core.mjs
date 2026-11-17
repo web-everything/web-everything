@@ -1,3 +1,4 @@
+import { renderNoPromptCommandRules } from './no-prompt-command-rules.mjs';
 import { readTestsFirstPolicy, GUARANTEE_TEST_RULE } from './tests-first-policy.mjs';
 import { cascadePolicy, logCascadeSources, platformPreference } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
@@ -318,7 +319,7 @@ export function buildMandate({ contextIsolation = 'diff-only', mandate = DEFAULT
   // isolation line, the `file` finding anchor, and the #2336 no-checkout body. The output is byte-identical to the
   // prior inline form. #2336: a review subagent runs inside the drain's shared primary checkout, so it must NEVER
   // `git checkout` the PR branch there (that moves the shared HEAD and violates the never-branch-a-shared-checkout guard).
-  return buildSubjectMandate({
+  return renderNoPromptCommandRules(buildSubjectMandate({
     subjectNoun: 'diff',
     mandate,
     defaultMandate: DEFAULT_MANDATE,
@@ -340,7 +341,7 @@ export function buildMandate({ contextIsolation = 'diff-only', mandate = DEFAULT
       PROSE_IMPRECISION_RULE,
       GUARANTEE_NEEDS_A_TEST_RULE,
     ],
-  });
+  }), 'review-job');
 }
 
 /**

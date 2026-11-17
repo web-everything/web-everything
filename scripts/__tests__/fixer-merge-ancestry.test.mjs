@@ -51,12 +51,18 @@ describe('fixer catch-up preserves ancestry and comparison scope', () => {
         const f = fixture(baseRef);
         const body = readFileSync(join(ROOT, 'skills-src/conveyor', brief), 'utf8');
         const recipe = [...body.matchAll(/```bash\n([\s\S]*?)```/g)]
-          .map((m) => m[1]).find((code) => code.startsWith('BASE_REF='));
+          .map((m) => m[1]).find((code) => code.startsWith('gh pr view') && code.includes('git merge --no-edit'));
         expect(recipe).toBeTruthy();
-        // Only the read-only GitHub base lookup is replaced; fetch/merge/check are real git.
-        execFileSync('bash', ['-c', `gh() { echo '${baseRef}'; }\n${recipe}`], {
-          cwd: f.root, stdio: 'pipe', env: { ...process.env, GIT_MERGE_AUTOEDIT: 'no' },
-        });
+        // Read outputs separately and copy literal values, as the brief requires; execute every Git command.
+        let fetchedSha;
+        for (const command of recipe.trim().split('\n')) {
+          if (command.startsWith('gh pr view')) continue; // fixture's live PR base lookup
+          const filled = command.replaceAll('<base-branch>', baseRef).replaceAll('<base-sha>', fetchedSha ?? '');
+          const output = execFileSync('bash', ['-c', filled], {
+            cwd: f.root, encoding: 'utf8', env: { ...process.env, GIT_MERGE_AUTOEDIT: 'no' },
+          });
+          if (command === 'git rev-parse FETCH_HEAD') fetchedSha = output.trim();
+        }
         expect(f.git('show', '-s', '--format=%P', 'HEAD').split(' ')).toEqual([f.own, f.base]);
         expect(f.git('diff', `${f.base}...HEAD`)).toBe(f.git('diff', f.base, 'HEAD'));
         expect(f.git('diff', '--name-only', `${f.base}...HEAD`)).toBe('repair.txt');

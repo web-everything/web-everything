@@ -1,3 +1,4 @@
+import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 /**
  * @file scripts/operations/dispatch-lane.mjs
  * @description THE `dispatch-lane` DECLARATION — the effect that STARTS rather than completes (#3037, epic #3029).
@@ -1325,7 +1326,7 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes, groupMember
     // From the reader's card-record decision (planOperatorPostBuild), never a search of the filled prompt, which
     // card-influenced text can reach. A build only: no other kind composes post-build steps.
     operatorPostBuild: launchKind === 'build' && raw.operatorPostBuild === true,
-    prompt: brief.prompt,
+    prompt: renderNoPromptCommandRules(brief.prompt, launchKind),
     // REPORTED, never fatal — see `fillBrief`. Two of these are the brief's own prose today.
     briefUnknownTokens: brief.unknownTokens,
     // THE PR THIS DISPATCH REPAIRS, and (CI-heal only) WHY — riding the `read` finding so the effect payload

@@ -170,12 +170,12 @@ describe('fix-agent-ci-brief.md — every escalation marker targets the head thi
   });
   it('every escalation call stamps the CAPTURED $EXAMINED_HEAD — never a fresh, live gh pr view re-read at escalation time (#4269)', () => {
     for (const call of markerCalls) {
-      expect(call).toMatch(/--head="\$EXAMINED_HEAD"/);
+      expect(call).toMatch(/--head="<examined-head-sha>"/);
       expect(call).not.toMatch(/--head="\$\(gh pr view/);
     }
   });
   it('$EXAMINED_HEAD is itself captured off the PR\'s own headRefOid, exactly once, before any escalation call', () => {
-    const captureIndex = BRIEF.indexOf('EXAMINED_HEAD="$(gh pr view {{PR_NUM}} --repo {{REPO}} --json headRefOid --jq .headRefOid)"');
+    const captureIndex = BRIEF.indexOf('gh pr view {{PR_NUM}} --repo {{REPO}} --json headRefOid --jq .headRefOid');
     expect(captureIndex).toBeGreaterThan(-1);
     const firstMarkerCallIndex = BRIEF.indexOf(markerCalls[0]);
     expect(captureIndex).toBeLessThan(firstMarkerCallIndex);
@@ -269,9 +269,9 @@ describe('#4545 real CLI composition and owed-body preservation', () => {
   });
   it('brief passes diagnosed run and attempt alongside captured head on the needs-human auth exit', () => {
     const brief = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../../skills-src/conveyor/fix-agent-ci-brief.md'), 'utf8');
-    expect(brief).toContain('CI_AUTH_ARGS=(--run="$AUTH_RUN" --attempt="$AUTH_ATTEMPT")');
-    expect(brief).toContain('--head="$EXAMINED_HEAD" --outcome=needs-human "${CI_AUTH_ARGS[@]}"');
-    expect(brief.indexOf('CI_AUTH_ARGS=()')).toBeLessThan(brief.indexOf('CI_AUTH_ARGS=(--run='));
+    expect(brief).toContain('--run=<auth-run-id> --attempt=<auth-attempt-number>');
+    expect(brief).toContain('--head="<examined-head-sha>" --outcome=needs-human <authentication-flags-if-applicable>');
+    expect(brief.indexOf('--run=<auth-run-id> --attempt=<auth-attempt-number>')).toBeLessThan(brief.indexOf('--outcome=needs-human <authentication-flags-if-applicable>'));
     expect(brief).toContain('the healer never executes it');
   });
 });
