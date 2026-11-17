@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { isAlreadyQueuedError, ENQUEUE_MUTATION, mergeActionFor, buildEnqueueArgs, enqueuePr, planQueueFollowUps, rulesetSuggestion, workflowEditHold, normalizeGatePath, readPinnedChangedFiles } from '../merge-queue-enqueue.mjs';
 import { classifyStartupFailureGate, handleStaleMergeGate, staleMergeGateRefreshStatePath, handleRequiredWorkflowsRefusal, isRequiredWorkflowsUnsatisfiedError, REQUIRED_WORKFLOWS_UNSATISFIED } from '../merge-queue-enqueue.mjs';
+import { refreshStalePr as refreshRealStalePr } from '../merge-queue-hook.mjs';
 import { execFileSyncThrottled } from '../gh-throttle.mjs';
 
 vi.mock('../gh-throttle.mjs', async importOriginal => ({
@@ -74,7 +75,7 @@ describe('startup-failure stale merge-gate refresh', () => {
     expect(o.readGateRuns).toHaveBeenCalledTimes(1);
     expect(o.readGateRuns).toHaveBeenCalledWith({ repo: 'o/r', headSha: HEAD });
     expect(o.refreshStalePr).toHaveBeenCalledTimes(1);
-    expect(o.refreshStalePr).toHaveBeenCalledWith({ laneRef: 'lane/test', root: '/clone', repo: 'o/r', runId: 123, expectedHead: HEAD });
+    expect(o.refreshStalePr).toHaveBeenCalledWith({ laneRef: 'lane/test', root: '/clone', repo: 'o/r', runId: 123, runConclusion: 'startup_failure', expectedHead: HEAD });
     expect(o.record).toHaveBeenCalledWith(o.statePath, 'o/r#5006', expect.objectContaining({ fromHead: HEAD, newHead: HEAD }));
     expect(await handleStaleMergeGate(o)).toMatchObject({ handled: true, reason: expect.stringContaining('a person should look') });
     expect(o.refreshStalePr).toHaveBeenCalledTimes(1);
@@ -149,6 +150,31 @@ describe('startup-failure stale merge-gate refresh', () => {
     expect(await handleStaleMergeGate(options({ statePath, refreshStalePr: good }))).toMatchObject({ handled: true });
     expect(bad).toHaveBeenCalledTimes(1);
     expect(good).toHaveBeenCalledTimes(1);
+  });
+  it.each(['startup_failure', '403 refusal'])('does not spend catch-up budget on failed %s recovery; a later trigger succeeds once', async kind => {
+    const state = {}, calls = [];
+    let refused = true;
+    const refreshStalePr = vi.fn(options => refreshRealStalePr({ ...options, prNumber: 5006,
+      readTip: () => HEAD, refresh: () => ({ ok: true, action: 'current' }),
+      runConclusion: kind === 'startup_failure' ? 'startup_failure' : null,
+      execGh: args => {
+        calls.push(args);
+        if (refused || args.includes('POST')) throw new Error('HTTP 403: This workflow run cannot be retried');
+        return JSON.stringify({ head: { sha: HEAD } });
+      } }));
+    const o = options({ refreshStalePr, readState: () => state,
+      record: vi.fn((_path, key, entry) => { state[key] = entry; }) });
+    expect(await handleStaleMergeGate(o)).toMatchObject({ reason: expect.stringContaining('refresh FAILED') });
+    expect(o.record).not.toHaveBeenCalled();
+    expect(state).toEqual({});
+    expect(readdirSync(dirname(o.statePath)).some(name => name.includes('-claim-'))).toBe(false);
+    refused = false;
+    expect(await handleStaleMergeGate(o)).toMatchObject({ reason: expect.stringContaining('refresh gate-refresh') });
+    expect(o.record).toHaveBeenCalledTimes(1);
+    expect(state['o/r#5006']).toMatchObject({ fromHead: HEAD, newHead: null, action: 'gate-refresh' });
+    await handleStaleMergeGate(o);
+    expect(refreshStalePr).toHaveBeenCalledTimes(2);
+    expect(calls.filter(args => args.includes('POST'))).toHaveLength(kind === 'startup_failure' ? 0 : 2);
   });
   it('refuses when the required-check set is unknown (gate not allowed)', async () => {
     const o = options({ requiredChecks: undefined });

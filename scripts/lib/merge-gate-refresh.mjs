@@ -46,26 +46,32 @@ export function refreshMergeGateAfterRestamp({ repo, pr, head, gh = execFileSync
     const live = JSON.parse(gh('gh', ['api', `repos/${repo}/pulls/${pr}`], options));
     if (live?.head?.sha !== head) throw new Error('live PR head differs from restamped head');
 
-    const labelCall = (args, alreadyExistsOk = false) => {
-      for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-          gh('gh', args, options);
-          return;
-        } catch (error) {
-          if (alreadyExistsOk && /already exists/i.test(errorText(error))) return;
-          if (attempt === 2) throw error;
-          sleep(1000 * (attempt + 1));
-        }
-      }
-    };
-    labelCall(['label', 'create', LABEL, '--repo', repo, '--color', 'ededed',
-      '--description', 'Refresh merge-gate after acceptance restamp'], true);
-    labelCall(['pr', 'edit', String(pr), '--repo', repo, '--add-label', LABEL]);
-    labelCall(['pr', 'edit', String(pr), '--repo', repo, '--remove-label', LABEL]);
+    toggleMergeGateRefresh({ repo, pr, gh, sleep });
     return { ok: true, refreshed: true };
   } catch (error) {
     const message = `${errorText(error)}; acceptance restamp retained — retry restamp or ask an operator to toggle ${LABEL}`;
     process.stderr.write(`merge-gate refresh FAILED for ${repo}#${pr}: ${message}\n`);
     return { ok: false, error: message };
   }
+}
+
+/** Shared bounded trigger; callers must verify the PR head before toggling. */
+export function toggleMergeGateRefresh({ repo, pr, gh = execFileSyncThrottled, sleep = sleepSync }) {
+  const options = { encoding: 'utf8', stdio: 'pipe', timeout: 30_000, maxBuffer: 2 * 1024 * 1024 };
+  const labelCall = (args, alreadyExistsOk = false) => {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        gh('gh', args, options);
+        return;
+      } catch (error) {
+        if (alreadyExistsOk && /already exists/i.test(errorText(error))) return;
+        if (attempt === 2) throw error;
+        sleep(1000 * (attempt + 1));
+      }
+    }
+  };
+  labelCall(['label', 'create', LABEL, '--repo', repo, '--color', 'ededed',
+    '--description', 'Refresh merge-gate after acceptance restamp'], true);
+  labelCall(['pr', 'edit', String(pr), '--repo', repo, '--add-label', LABEL]);
+  labelCall(['pr', 'edit', String(pr), '--repo', repo, '--remove-label', LABEL]);
 }

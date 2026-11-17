@@ -135,7 +135,7 @@ export async function handleRequiredWorkflowsRefusal(options) {
 
 async function handleQueueRefresh({ c, key, headSha, setting, statePath = requiredWorkflowsRefreshStatePath(), cloneDir, cwd, tag = '#',
   readState = readRequiredWorkflowsRefreshState, record = recordRequiredWorkflowsRefresh,
-  decide = decideRequiredWorkflowsRefresh, runId = null, label = 'required-workflows', wording = 'required workflows unsatisfied', dryRun = false,
+  decide = decideRequiredWorkflowsRefresh, runId = null, runConclusion = null, label = 'required-workflows', wording = 'required workflows unsatisfied', dryRun = false,
   refreshStalePr, needsAcceptanceRestamp, restampAcceptance, warn = () => {}, now = () => new Date().toISOString() }) {
   if (dryRun) return { handled: false };
   const decision = decide({ key, headSha, setting, state: readState(statePath) });
@@ -144,7 +144,7 @@ async function handleQueueRefresh({ c, key, headSha, setting, statePath = requir
   let out;
   try {
     out = !cloneDir ? { ok: false, error: `no ${c.repo} clone provisioned` }
-      : await refreshStalePr({ laneRef: c.headRef, root: cloneDir, repo: c.repo, runId, expectedHead: headSha });
+      : await refreshStalePr({ laneRef: c.headRef, root: cloneDir, repo: c.repo, runId, ...(runConclusion ? { runConclusion } : {}), expectedHead: headSha });
   } catch (e) { out = { ok: false, error: errText(e) }; }
   if (!out.ok) {
     const reason = `merge-queue: ${wording} → refresh FAILED: ${out.error}`;
@@ -534,7 +534,7 @@ async function refreshStartupFailure({ c, headSha, classification, setting, stat
   // Reserve atomically BEFORE dispatching (wx): concurrent passes cannot both push, and a failed ledger write cannot re-arm the head.
   const key = `${c.repo}#${c.num}`;
   const handleArgs = { ...refreshOptions, warn, c, key, headSha, setting, statePath, decide: decideStaleMergeGateRefresh,
-    runId: classification.runId, label: 'stale merge-gate', wording: `merge-gate workflow startup_failure (run ${classification.runId})` };
+    runId: classification.runId, runConclusion: 'startup_failure', label: 'stale merge-gate', wording: `merge-gate workflow startup_failure (run ${classification.runId})` };
   // A ledger skip (already refreshed once) needs no claim and keeps its own wording.
   if (decideStaleMergeGateRefresh({ key, headSha, setting, state: (refreshOptions.readState ?? readRequiredWorkflowsRefreshState)(statePath) }).action !== 'refresh') return handleQueueRefresh(handleArgs);
   const claimFor = (kind, sha) => join(dirname(statePath), `drain-stale-merge-gate-claim-${kind}-${createHash('sha256').update(`${key}\n${sha ?? ''}`).digest('hex').slice(0, 24)}`);
@@ -554,6 +554,7 @@ async function refreshStartupFailure({ c, headSha, classification, setting, stat
   try {
     result = await handleQueueRefresh({ ...handleArgs, refreshStalePr });
   } catch (e) { failed = true; throw e; }
+  // An infra refusal (including a failed label fallback) consumes neither the claim nor the catch-up ledger.
   finally { if (!dispatched || failed) { try { unlinkSync(claim); } catch { /* already gone */ } } }
   // The produced head is a different head: claim it durably so a lost ledger write cannot re-arm it. If even that fails, block the whole PR.
   if (dispatched && !failed && produced && produced !== headSha) {
