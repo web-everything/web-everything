@@ -7561,7 +7561,7 @@ async function runCli() {
       if (!AS_JSON) process.stderr.write(`  merge-queue: refreshOnUnsatisfiedWorkflows=${requiredWorkflowsRefresh.value} (${requiredWorkflowsRefresh.source})${requiredWorkflowsRefresh.invalid.length ? ` · ignored invalid: ${requiredWorkflowsRefresh.invalid.join('; ')}` : ''}\n`);
       for (const { c, headSha, detail } of requiredWorkflowsRefusals) {
         const cloneDir = isLocalRepo(c.repo) ? process.cwd() : siblingCloneDir(c.repo);
-        const recovery = await handleRequiredWorkflowsRefusal({ c, key: `${c.repo || localSlug || 'cwd'}#${c.num}`, headSha,
+        const recovery = await handleRequiredWorkflowsRefusal({ c: { ...c, repo: c.repo || localSlug }, key: `${c.repo || localSlug || 'cwd'}#${c.num}`, headSha,
           setting: requiredWorkflowsRefresh, cloneDir, cwd: isLocalRepo(c.repo) ? undefined : cloneDir, tag: repoTag(c.repo),
           refreshStalePr: options => refreshApprovedHead(c, options), needsAcceptanceRestamp, restampAcceptance, warn: (line) => { if (!AS_JSON) process.stderr.write(`${line}\n`); } });
         if (recovery.handled) {

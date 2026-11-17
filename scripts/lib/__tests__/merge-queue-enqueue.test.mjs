@@ -3,7 +3,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { closeSync, openSync, readdirSync, readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { isAlreadyQueuedError, ENQUEUE_MUTATION, mergeActionFor, buildEnqueueArgs, enqueuePr, planQueueFollowUps, rulesetSuggestion, workflowEditHold, normalizeGatePath, readPinnedChangedFiles } from '../merge-queue-enqueue.mjs';
 import { classifyStartupFailureGate, handleStaleMergeGate, staleMergeGateRefreshStatePath, handleRequiredWorkflowsRefusal, isRequiredWorkflowsUnsatisfiedError, REQUIRED_WORKFLOWS_UNSATISFIED } from '../merge-queue-enqueue.mjs';
 import { execFileSyncThrottled } from '../gh-throttle.mjs';
@@ -664,6 +664,36 @@ describe('the "merge-gate is expected" enqueue refusal routes to the VERIFIED st
     expect(isRequiredWorkflowsUnsatisfiedError(MESSAGE)).toBe(false);
     const result = enqueuePr({ repo: 'o/r', num: 7, headSha: HEAD, cwd: CWD, exec: execFor({ files: [['a.txt', '']], mutation: JSON.stringify({ errors: [{ message: MESSAGE }] }) }) });
     expect(result).toMatchObject({ ok: false, reason: REQUIRED_WORKFLOWS_UNSATISFIED, gateExpected: true });
+  });
+  it('the drain normalizes --this-repo before expected-gate recovery, as it does for stale-gate recovery', () => {
+    const source = readFileSync(new URL('../../merge-ai-prs.mjs', import.meta.url), 'utf8');
+    for (const handler of ['handleRequiredWorkflowsRefusal', 'handleStaleMergeGate']) {
+      expect(source.includes(`${handler}({ c: { ...c, repo: c.repo || localSlug }`), handler).toBe(true);
+    }
+  });
+  it.each([null, 'o/r', 'other/repo'])('uses the canonical repository for run reads, refreshes and claims (candidate repo %s)', async repo => {
+    const localSlug = 'o/r';
+    const candidate = { num: 6940, repo, headRef: 'lane/test', mergeGateExpected: true };
+    const slug = repo || localSlug;
+    const o = options({ c: { ...candidate, repo: slug }, readGateRuns: undefined });
+    const transport = vi.mocked(execFileSyncThrottled);
+    transport.mockReturnValueOnce(JSON.stringify({ total_count: 1, workflow_runs: [startupRun()] }));
+    try {
+      expect(await handleRequiredWorkflowsRefusal(o)).toMatchObject({ handled: true });
+      expect(transport).toHaveBeenLastCalledWith('gh', ['api',
+        `repos/${slug}/actions/runs?head_sha=${HEAD}&event=pull_request_target&per_page=100`], expect.any(Object));
+      expect(o.refreshStalePr).toHaveBeenCalledWith(expect.objectContaining({ repo: slug, runId: 123 }));
+      expect(o.record).toHaveBeenCalledWith(o.staleStatePath, `${slug}#6940`, expect.objectContaining({ fromHead: HEAD }));
+      // An explicit slug on the next pass must share the local alias's atomic claim.
+      const retry = { ...o, c: { ...candidate, repo: slug }, readGateRuns: vi.fn(() => [startupRun()]), refreshStalePr: vi.fn() };
+      expect(await handleRequiredWorkflowsRefusal(retry)).toMatchObject({ handled: false, reason: expect.stringContaining('already claimed') });
+      expect(retry.refreshStalePr).not.toHaveBeenCalled();
+      expect(candidate.repo).toBe(repo);
+    } finally {
+      transport.mockReset();
+      transport.mockImplementation(() => { throw new Error('unexpected GitHub IO'); });
+      rmSync(dirname(o.staleStatePath), { recursive: true, force: true });
+    }
   });
   it('refreshes once when the newest Merge gate run ended startup_failure, with run evidence and a durable claim', async () => {
     const o = options();
