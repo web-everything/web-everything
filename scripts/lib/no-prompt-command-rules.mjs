@@ -13,6 +13,37 @@ export const NO_PROMPT_COMMAND_RULES_BODY = `## No-prompt command rules
 - Stop background jobs with the job tool (TaskStop), never \`pkill\`/\`killall\`.`;
 export const NO_PROMPT_COMMAND_RULES = `${NO_PROMPT_COMMAND_RULES_SENTINEL}\n${NO_PROMPT_COMMAND_RULES_BODY}\n${NO_PROMPT_COMMAND_RULES_END}`;
 
+/** Shared with the launch-brief syntax audit: preserve its existing executor signature. */
+export const CLAUDE_LAUNCH_EXECUTOR_PATTERN = /(?:spawn|exec|run)/i;
+export const CLAUDE_SCRIPT_LAUNCH_PATTERNS = Object.freeze({
+  py: /["']claude["']/g,
+  sh: /\bclaude\s+(?:-p|--print|--bg)\b/g,
+});
+
+/** Indirect launch boundaries whose argv is rendered by the named caller. Counts fail closed on growth. */
+export const LAUNCH_RENDERER_ALLOWLIST = Object.freeze({
+  'scripts/operator/converge.py': {
+    count: 1,
+    reason: 'The run_agent subprocess boundary renders its prompt with render_no_prompt_command_rules; the generated Python helper is pinned separately.',
+  },
+  'scripts/operations/dispatch-lane-io.mjs': {
+    count: 6,
+    reason: 'Three argv-only transport calls consume buildAgentArgv headers; the other signatures are an injected provider, an executor report, and an agents listing.',
+  },
+  'scripts/operations/explore-io.mjs': {
+    count: 2,
+    reason: 'The argv-only spawner consumes composeInvestigationPrompt headers; the second call only lists existing agents.',
+  },
+  'scripts/operator/dispatch.mjs': {
+    count: 1,
+    reason: 'The shared spawn helper receives the FIX, CI_HEAL or REVIEW prompt rendered by its caller.',
+  },
+  'scripts/probes/worker-result-probe.mjs': {
+    count: 2,
+    reason: 'The background probe forwards caller argv containing rendered PROMPT/PROMPT2; its other call stops that probe.',
+  },
+});
+
 /** Validate the task itself before the builder adds any instructions. */
 export function assertBriefTaskContent(task) {
   if (typeof task !== 'string') throw new TypeError('no-prompt rules require a string brief');

@@ -7,6 +7,7 @@ import ts from 'typescript';
 import {
   NO_PROMPT_COMMAND_RULES, renderNoPromptCommandRules, renderNoPromptCommandRulesRuntime,
   LAUNCH_BRIEF_SOURCES, LAUNCH_BRIEF_EXCLUSIONS,
+  CLAUDE_LAUNCH_EXECUTOR_PATTERN, CLAUDE_SCRIPT_LAUNCH_PATTERNS, LAUNCH_RENDERER_ALLOWLIST,
 } from '../lib/no-prompt-command-rules.mjs';
 import { renderWorkerBrief } from '../worker-brief.mjs';
 import { readCiHealBriefTemplate } from '../operations/ci-heal-pr-dispatch.mjs';
@@ -18,6 +19,80 @@ import { auditLedger, listBriefs } from '../conveyor/brief-rule-ledger.mjs';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 // Test fixtures and soak fault scenarios model launches; they are not production brief sources.
 const FIXTURE = /(?:^|\/)(?:__tests__|__fixtures__|fixtures|soak)(?:\/|$)|\.(?:test|spec)\./;
+
+function isLaunch(node, source) {
+  return ts.isCallExpression(node) && (node.expression.getText(source) === 'agent'
+    || (CLAUDE_LAUNCH_EXECUTOR_PATTERN.test(node.expression.getText(source))
+      && /^['"]claude['"]$/.test(node.arguments[0]?.getText(source) ?? '')));
+}
+
+// Resolve local symbols, rather than letting any renderer elsewhere in a registered file cover a launch.
+function uncoveredLaunches(path, text, allowance = LAUNCH_RENDERER_ALLOWLIST[path]) {
+  const scriptPattern = CLAUDE_SCRIPT_LAUNCH_PATTERNS[path.split('.').at(-1)];
+  if (scriptPattern) {
+    const missing = [...text.matchAll(scriptPattern)].map(match => text.slice(0, match.index).split('\n').length);
+    if (!allowance) return missing;
+    expect(allowance.reason.trim().length, path).toBeGreaterThan(20);
+    expect(missing.length, `${path}: stale or exceeded launch allowance`).toBe(allowance.count);
+    return [];
+  }
+  const source = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  const launches = [];
+  function collect(node) {
+    if (isLaunch(node, source)) launches.push(node);
+    ts.forEachChild(node, collect);
+  }
+  collect(source);
+  if (!launches.length) {
+    if (allowance) throw new Error(`${path}: stale launch allowance`);
+    return [];
+  }
+  const options = { allowJs: true, noLib: true, noResolve: true, types: [] };
+  const host = ts.createCompilerHost(options);
+  host.getSourceFile = name => name === path ? source : undefined;
+  host.fileExists = name => name === path;
+  host.directoryExists = () => false;
+  host.readFile = () => undefined;
+  const checker = ts.createProgram([path], options, host).getTypeChecker();
+  function rendered(node, seen = new Set()) {
+    if (!node || seen.has(node)) return false;
+    seen.add(node);
+    if (ts.isCallExpression(node) && node.expression.getText(source) === 'renderNoPromptCommandRules') return true;
+    if (ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) || ts.isArrowFunction(node)) {
+      if (!node.body) return false;
+      if (!ts.isBlock(node.body)) return rendered(node.body, seen);
+      const returns = [];
+      function collectReturns(child) {
+        if (ts.isFunctionLike(child)) return;
+        if (ts.isReturnStatement(child)) returns.push(child.expression);
+        else ts.forEachChild(child, collectReturns);
+      }
+      ts.forEachChild(node.body, collectReturns);
+      return returns.length > 0 && returns.every(value => rendered(value, new Set(seen)));
+    }
+    if (ts.isIdentifier(node)) {
+      for (const declaration of checker.getSymbolAtLocation(node)?.declarations ?? []) {
+        if (ts.isVariableDeclaration(declaration) && rendered(declaration.initializer, seen)) return true;
+        if (ts.isFunctionDeclaration(declaration) && rendered(declaration, seen)) return true;
+      }
+    }
+    let found = false;
+    ts.forEachChild(node, child => { if (rendered(child, seen)) found = true; });
+    return found;
+  }
+  const missing = [];
+  for (const node of launches) {
+    if (!node.arguments.some(arg => rendered(arg))) {
+      missing.push(source.getLineAndCharacterOfPosition(node.getStart()).line + 1);
+    }
+  }
+  if (allowance) {
+    expect(allowance.reason.trim().length, path).toBeGreaterThan(20);
+    expect(missing.length, `${path}: stale or exceeded launch allowance`).toBe(allowance.count);
+    return [];
+  }
+  return missing;
+}
 
 function tree(dir, io = { readdirSync, readFileSync }) {
   return io.readdirSync(join(ROOT, dir), { withFileTypes: true }).flatMap(entry => {
@@ -33,8 +108,9 @@ function tree(dir, io = { readdirSync, readFileSync }) {
 function isBriefSource(path, text) {
   if (typeof text !== 'string') throw new TypeError(`Unreadable brief source: ${path}`);
   if (path.endsWith('.md')) return /(?:SKILL|brief[^/]*|prompt[^/]*)\.md$|\.prompt\.md$/.test(path);
-  if (path.endsWith('.sh')) return /\bclaude\s+(?:-p|--print|--bg)\b/.test(text);
-  if (path.endsWith('.py')) return /["']claude["']|def \w*(?:prompt|brief|mandate)\w*\(/i.test(text);
+  if (path.endsWith('.sh')) return [...text.matchAll(CLAUDE_SCRIPT_LAUNCH_PATTERNS.sh)].length > 0;
+  if (path.endsWith('.py')) return [...text.matchAll(CLAUDE_SCRIPT_LAUNCH_PATTERNS.py)].length > 0
+    || /def \w*(?:prompt|brief|mandate)\w*\(/i.test(text);
   const source = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
   let found = false;
   function visit(node) {
@@ -46,9 +122,7 @@ function isBriefSource(path, text) {
     if (ts.isVariableDeclaration(node) && node.initializer
       && (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer))
       && /(?:Brief|Prompt|Mandate)/.test(node.name.getText(source))) found = true;
-    if (ts.isCallExpression(node) && (node.expression.getText(source) === 'agent'
-      || (/(?:spawn|exec|run)/i.test(node.expression.getText(source))
-        && /^['"]claude['"]$/.test(node.arguments[0]?.getText(source) ?? '')))) found = true;
+    if (isLaunch(node, source)) found = true;
     ts.forEachChild(node, visit);
   }
   visit(source);
@@ -117,6 +191,30 @@ describe('no-prompt command rules', () => {
   it('fails closed on unreadable source evidence and tree reads', () => {
     expect(() => unregistered([['scripts/new-launch.mjs', null]])).toThrow('Unreadable brief source');
     expect(() => tree('scripts', { readdirSync() { throw new Error('read denied'); } })).toThrow('read denied');
+  });
+
+  it('refuses a second unwrapped launch in an already registered file', () => {
+    const text = "spawn('claude', ['-p', renderNoPromptCommandRules(task)]);\nspawn('claude', ['-p', task]);";
+    expect(uncoveredLaunches('scripts/operations/maintenance-io.mjs', text)).toEqual([2]);
+  });
+
+  it('refuses a builder that discards its renderer result before launching', () => {
+    const text = "function brief() { renderNoPromptCommandRules(task); return task; }\nspawn('claude', ['-p', brief()]);";
+    expect(uncoveredLaunches('scripts/operations/maintenance-io.mjs', text)).toEqual([2]);
+  });
+
+  it('refuses an additional Python launch beyond its reasoned transport allowance', () => {
+    expect(() => uncoveredLaunches('scripts/operator/converge.py',
+      'subprocess.run(["claude", "-p", prompt])\nsubprocess.run(["claude", "-p", raw])'))
+      .toThrow('stale or exceeded launch allowance');
+  });
+
+  it('checks every launch call site, including launches added to registered builders', () => {
+    const failures = [...tree('scripts'), ...tree('skills-src')]
+      .filter(([path]) => /\.(?:mjs|cjs|js|ts|py|sh)$/.test(path))
+      .flatMap(([path, text]) => LAUNCH_BRIEF_EXCLUSIONS[path] ? []
+        : uncoveredLaunches(path, text).map(line => `${path}:${line}`));
+    expect(failures).toEqual([]);
   });
 
   it('audits the whole scripts/ and skills-src/ trees with explicit exclusions', () => {

