@@ -783,6 +783,7 @@ describe('setup and pruning contract', () => {
     const installer=setup.match(/<<'WRAPPER'\n([\s\S]*?)\nWRAPPER/)[1];
     const local=join(root,'usr-local');
     await mkdir(local,{mode:0o755});
+    await mkdir(join(local,'var-lib'),{mode:0o755});
     // Run the shipped installer; only the privileged host directory and ownership
     // operations are substituted. Copying, mode changes and atomic rename are real.
     const harness=String.raw`import os, sys
@@ -791,7 +792,7 @@ from unittest.mock import patch
 installer, source, local = sys.argv[1:]
 real_open, real_fstat = os.open, os.fstat
 def local_open(path, *args, **kwargs):
-    return real_open(local if path == '/usr/local' else path, *args, **kwargs)
+    return real_open(local if path == '/usr/local' else os.path.join(local, 'var-lib') if path == '/var/lib' else path, *args, **kwargs)
 def root_stat(fd):
     st = real_fstat(fd)
     return SimpleNamespace(st_uid=0, st_mode=st.st_mode)
@@ -799,8 +800,8 @@ with patch.object(os, 'open', side_effect=local_open), \
      patch.object(os, 'fstat', side_effect=root_stat), patch.object(os, 'fchown') as chown:
     sys.argv = ['installer', source]
     exec(installer)
-    assert chown.call_count == 5
-    assert chown.call_args.args[1:] == (0, 0)
+    assert chown.call_count == 7
+    assert all(c.args[1:] == (0, 0) for c in chown.call_args_list)
 `;
     const installed=spawnSync('python3',['-I','-c',harness,installer,
       new URL('../forge-exec-run.mjs',import.meta.url).pathname,local],{

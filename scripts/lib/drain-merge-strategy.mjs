@@ -682,6 +682,8 @@ export function createDrainMergeStrategy({
         }
         // A shortcut refusal delegates to the full cascade in this pass. Do not install
         // retry backoff here: it would hide the refusal from that cascade's recovery catch.
+        // The "merge-gate is expected" refusal carries its class on the candidate so the cascade's recovery can route it to the verified path.
+        if (r.gateExpected === true) c.mergeGateExpected = true;
         if (preparedAdmission) throw Object.assign(new Error(`github-merge-queue prepared enqueue FAILED (${r.error})`), {
           githubMessage: r.error,
           ...(r.reason === REQUIRED_WORKFLOWS_UNSATISFIED ? { code: REQUIRED_WORKFLOWS_UNSATISFIED, headSha } : {}),
