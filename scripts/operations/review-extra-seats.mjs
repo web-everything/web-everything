@@ -1215,7 +1215,8 @@ function aiSeatRoute(role, current, { env, io, available, operation, taskType, p
     io.log(`aiRouting.${role}: ${coordinator.provider} cannot enforce Claude's tool, budget and environment restrictions; inheriting today's route`);
     return current;
   }
-  if (!available.includes(coordinator.provider)) {
+  const roster = rosterForKey(taskType ? `${operation}:${taskType}` : operation);
+  if (roster && !roster.includes(coordinator.provider)) {
     io.log(`aiRouting.${role}: ${coordinator.provider} unavailable; inheriting today's route`);
     return current;
   }
@@ -1240,8 +1241,14 @@ function aiSeatRoute(role, current, { env, io, available, operation, taskType, p
   const defaults = [configured, ...(configured?.fallback ?? [])].find(route => route?.provider === provider);
   const model = defaults?.model ?? (role === 'red-team-recheck' ? RECHECK_MODEL : RED_TEAM_MODELS[provider].model);
   const effort = defaults?.effort ?? resolveOperationEffort(operation, provider, taskType, effectivePolicy);
-  const route = validateAiSeatRoute({ operation, taskType, available, policy: effectivePolicy,
+  // A policy disable must reject the overlay even when it also made the provider
+  // unavailable via a zero cap. Do not let a fallback mask that rejection.
+  const route = validateAiSeatRoute({ operation, taskType, available: [provider], policy: effectivePolicy,
     aiRouting: { provider, model, effort }, operatorKeys: effectiveOperatorKeys });
+  if (!available.includes(provider)) {
+    io.log(`aiRouting.${role}: ${provider} unavailable; inheriting today's route`);
+    return current;
+  }
   const sources = Object.fromEntries(Object.entries(resolved.sources ?? {}).filter(([path]) => path.startsWith(`${role}.coordinator.`)));
   io.log(`policy-cascade · aiRouting.${role}: ${route?.provider}/${route?.model}/${route?.effort} (${JSON.stringify(sources)})`);
   // Validation expands model aliases; keep the launch boundary's existing defaults.

@@ -182,18 +182,30 @@ test('red-team Codex overlay uses provider defaults outside the repository route
   assert.equal(calls[0].effort, 'high');
 });
 
-test('red-team overlay outside the repository route chain cannot enable a disabled provider', async () => {
-  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
-  policy.operations['review-seat:red-team'] = {
-    provider: 'codex', model: 'astra', effort: 'high', fallback: [], disabledProviders: ['agy-claude'],
-  };
-  const { result, calls, reservations } = await seat(() => setting('red-team', { provider: 'agy-claude', model: 'sonnet' }),
-    { readRoutingPolicy: () => policy });
-  assert.equal(result.status, 'skipped');
-  assert.match(result.reason, /no available route/);
-  assert.deepEqual(calls, []);
-  assert.deepEqual(reservations, []);
-});
+for (const unavailable of ['policy cap', 'explicit cap', 'CLI', 'quota']) {
+  for (const fallback of [[], [{ provider: 'codex', model: 'astra', effort: 'high' }]]) {
+    test(`red-team overlay outside the repository route chain cannot enable a disabled provider (${unavailable}, ${fallback.length} fallbacks)`, async () => {
+      const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+      policy.operations['review-seat:red-team'] = {
+        provider: 'codex', model: 'astra', effort: 'high', fallback, disabledProviders: ['agy-claude'],
+      };
+      const resolved = setting('red-team', { provider: 'agy-claude', model: 'sonnet' });
+      assert.deepEqual(resolved.invalid, []);
+      const overrides = { readRoutingPolicy: () => policy,
+        ...(unavailable === 'CLI' ? { cliAvailable: provider => provider !== 'agy-claude' }
+          : unavailable === 'quota' ? { readRecords: () => [{ dispatchKind: 'review-seat', provider: 'agy-claude',
+            scoredAt: new Date(NOW).toISOString(), callStatus: 'quota', quotaUsedPercent: 100,
+            quotaResetsAt: new Date(NOW + 3600000).toISOString() }] } : {}),
+      };
+      const { result, calls, reservations } = await seat(() => resolved, overrides,
+        unavailable === 'explicit cap' ? { WE_REVIEW_SEAT_CAP_AGY_CLAUDE: '0' } : {});
+      assert.equal(result.status, 'skipped');
+      assert.match(result.reason, /no available route/);
+      assert.deepEqual(calls, []);
+      assert.deepEqual(reservations, []);
+    });
+  }
+}
 
 test('Claude recheck overlay uses seat defaults without a matching repository fallback', async () => {
   const policy = structuredClone(DEFAULT_ROUTING_POLICY);
