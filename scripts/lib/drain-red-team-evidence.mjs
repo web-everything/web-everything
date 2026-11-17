@@ -1,4 +1,4 @@
-import { emptyNetDiffSkip, provenEmptyNetDiff, EMPTY_NET_DIFF_SKIP } from './red-team-empty-net-diff.mjs';
+import { emptyNetDiffSkip, provenEmptyNetDiffPayload, EMPTY_NET_DIFF_SKIP } from './red-team-empty-net-diff.mjs';
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
 import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher } from './red-team-check-run.mjs';
 import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
@@ -969,7 +969,7 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     if (carry) {
       // The journal survives a crash before the compatibility status exists. Never invent an accept.
       // Project the carry's own policy: an empty-net-diff carry never claims the card-only setting.
-      const empty = provenEmptyNetDiff(carry.loopPayload?.findings?.read, head);
+      const empty = provenEmptyNetDiffPayload(carry.loopPayload, head);
       const skipCardOnly = empty ? status?.skipCardOnly === true : true;
       const projected = { repo, pr, head, loopPayload: carry.loopPayload, status: 'finished',
         result: empty ? { ...EMPTY_NET_DIFF_SKIP } : { status: 'skipped', policy: 'card-only' }, skipCardOnly };

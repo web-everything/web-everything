@@ -17,6 +17,7 @@ import { createRedTeamIo, speculateRedTeam, runRedTeam } from '../review-extra-s
 import { execFileSync } from 'node:child_process';
 import { readRedTeamCarry } from '../../lib/red-team-carry-machine.mjs';
 import { createRedTeamCarryIo } from '../../lib/red-team-carry-io.mjs';
+import { emptyNetDiffSkip, provenEmptyNetDiffPayload } from '../../lib/red-team-empty-net-diff.mjs';
 
 const repo = 'web-everything/web-everything', pr = 5872, head = 'a'.repeat(40);
 const emptySkip = { status: 'skipped', policy: 'empty-net-diff', reason: 'red team skipped: empty net diff' };
@@ -1082,5 +1083,25 @@ describe('empty net diff terminal publication through the production carry path'
     // A proven empty read passes the policy gate and reaches the live guards (which then refuse a missing head).
     expect(carry.eligible({ repo, pr, head, loopPayload: { findings: { read: proven } } })).toBe(false);
     expect(readLive).toHaveBeenCalledOnce();
+  });
+
+  it('a head-move carry rebinding an empty source read never proves the new head empty', () => {
+    const from = 'b'.repeat(40);
+    const read = { netBasis: { rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true };
+    expect(provenEmptyNetDiffPayload({ findings: { read } }, head)).toBe(true);
+    expect(provenEmptyNetDiffPayload({ carriedFrom: head, findings: { read } }, head)).toBe(true);
+    expect(provenEmptyNetDiffPayload({ carriedFrom: from, findings: { read } }, head)).toBe(false);
+    const rebound = { repo, pr, head, loopPayload: { carriedFrom: from, verdict: null, findings: { read } } };
+    expect(emptyNetDiffSkip({ repo, pr, head, status: 'finished', result: { ...emptySkip }, loopPayload: rebound.loopPayload }, head)).toBe(false);
+    // Policy off: the rebound read cannot buy the empty-diff exemption past the policy gate.
+    const readLive = vi.fn(() => null), writeStatus = vi.fn(), postResult = vi.fn();
+    const carry = createRedTeamCarryIo({ env: { WE_RED_TEAM_SKIP_CARD_ONLY: '0' }, readLive, readComments: () => [], writeStatus, postResult });
+    expect(carry.eligible(rebound)).toBe(false);
+    expect(readLive).not.toHaveBeenCalled();
+    // Any effect for a moved carry keeps card-only provenance and text.
+    carry.recordIntent(rebound);
+    expect(writeStatus.mock.calls[0][0].result).toEqual({ status: 'skipped', policy: 'card-only' });
+    carry.postResult(rebound);
+    expect(postResult.mock.calls[0][0].body).toContain('card-only diff (policy redTeam.skipCardOnly)');
   });
 });

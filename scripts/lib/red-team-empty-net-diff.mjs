@@ -8,6 +8,15 @@ export function provenEmptyNetDiff(read, head = read?.netBasis?.rev) {
     && typeof read.diffText === 'string' && read.diffText === '';
 }
 
+/**
+ * A payload's read proves an empty diff for `head` only when it was taken on that head. A head-move carry rebinds
+ * its source read's rev onto the new head but keeps the source's diff fields, so it never proves the new head empty.
+ */
+export function provenEmptyNetDiffPayload(loopPayload, head) {
+  const from = loopPayload?.carriedFrom;
+  return (from == null || from === head) && provenEmptyNetDiff(loopPayload?.findings?.read, head);
+}
+
 export const EMPTY_NET_DIFF_SKIP = Object.freeze({ status: 'skipped', policy: 'empty-net-diff',
   reason: 'red team skipped: empty net diff' });
 
@@ -18,7 +27,7 @@ export function emptyNetDiffSkip(status, head = status?.head) {
     && (typeof result === 'string' ? result : result?.status) === 'skipped'
     && (!result?.policy || result.policy === 'empty-net-diff')
     && !result?.deferredByGuard && !result?.deferredByCap
-    && provenEmptyNetDiff(status.loopPayload?.findings?.read, head);
+    && provenEmptyNetDiffPayload(status.loopPayload, head);
 }
 
 /** Re-read the stored range, never a live head ref. Unknown or oversized output retains the hold. */

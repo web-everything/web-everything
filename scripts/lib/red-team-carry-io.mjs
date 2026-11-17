@@ -1,4 +1,4 @@
-import { provenEmptyNetDiff, EMPTY_NET_DIFF_SKIP } from './red-team-empty-net-diff.mjs';
+import { provenEmptyNetDiffPayload, EMPTY_NET_DIFF_SKIP } from './red-team-empty-net-diff.mjs';
 /** Live guards and observable effects for the not-owed carry machine. */
 import { createHash } from 'node:crypto';
 import { readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus } from './drain-red-team-evidence.mjs';
@@ -27,7 +27,7 @@ export function createRedTeamCarryIo({ env = process.env, readEvidence = readDra
   return {
     env, checkpoint, witness: () => witness,
     eligible(state) {
-      if (!provenEmptyNetDiff(state.loopPayload?.findings?.read, state.head) && skipPolicy() !== true) return false;
+      if (!provenEmptyNetDiffPayload(state.loopPayload, state.head) && skipPolicy() !== true) return false;
       live = readLive(key(state));
       comments = readComments(key(state));
       if (live?.headRefOid !== state.head || !Array.isArray(live.labels) || !Array.isArray(comments)) return false;
@@ -58,12 +58,12 @@ export function createRedTeamCarryIo({ env = process.env, readEvidence = readDra
     intentRecorded(state) {
       const status = readStatus(key(state));
       return status?.status === 'finished' && status.result?.status === 'skipped'
-        && status.result.policy === (provenEmptyNetDiff(state.loopPayload?.findings?.read, state.head) ? 'empty-net-diff' : 'card-only') && status.loopPayload?.verdict === null
+        && status.result.policy === (provenEmptyNetDiffPayload(state.loopPayload, state.head) ? 'empty-net-diff' : 'card-only') && status.loopPayload?.verdict === null
         && JSON.stringify(status.loopPayload) === JSON.stringify(state.loopPayload);
     },
     recordIntent(state) {
       writeStatus({ ...key(state), loopPayload: state.loopPayload, status: 'finished',
-        result: provenEmptyNetDiff(state.loopPayload?.findings?.read, state.head) ? { ...EMPTY_NET_DIFF_SKIP } : { status: 'skipped', policy: 'card-only' } }, { env });
+        result: provenEmptyNetDiffPayload(state.loopPayload, state.head) ? { ...EMPTY_NET_DIFF_SKIP } : { status: 'skipped', policy: 'card-only' } }, { env });
     },
     labelApplied(state) {
       const current = readLive(key(state));
@@ -79,6 +79,6 @@ export function createRedTeamCarryIo({ env = process.env, readEvidence = readDra
       if (!Array.isArray(thread)) throw Error('carry comments unreadable');
       return Boolean(redTeamForHead(thread, state.pr, state.head));
     },
-    postResult: state => postResult({ ...key(state), body: `${redTeamMarker(state.pr, state.head)}\n\nRed team not required on this head: ${provenEmptyNetDiff(state.loopPayload?.findings?.read, state.head) ? 'not-owed: empty net diff' : 'card-only diff (policy redTeam.skipCardOnly)'}` }),
+    postResult: state => postResult({ ...key(state), body: `${redTeamMarker(state.pr, state.head)}\n\nRed team not required on this head: ${provenEmptyNetDiffPayload(state.loopPayload, state.head) ? 'not-owed: empty net diff' : 'card-only diff (policy redTeam.skipCardOnly)'}` }),
   };
 }

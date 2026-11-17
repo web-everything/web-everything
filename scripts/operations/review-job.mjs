@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { provenEmptyNetDiff, EMPTY_NET_DIFF_SKIP } from '../lib/red-team-empty-net-diff.mjs';
+import { provenEmptyNetDiffPayload, EMPTY_NET_DIFF_SKIP } from '../lib/red-team-empty-net-diff.mjs';
 import { proveCardOnlyHeadMove } from '../lib/card-only-head-move.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus, redTeamStatusDir, readRecoveryWitness, restoreRecoveryWriter, createCarriedCheckPublisher, markCarriedCheckUnpublished } from '../lib/drain-red-team-evidence.mjs';
@@ -1291,13 +1291,15 @@ function runReviewArc({
         // potentially slow proof/fetch, before admission writes or settlement.
         let skipCardOnly = false;
         try { skipCardOnly = io.redTeamSkipCardOnlySetting?.() === true; } catch { /* fail closed */ }
-        if (!skipCardOnly && !provenEmptyNetDiff(loopPayload?.findings?.read, head)) {
+        // A head-move carry's rebound read is the source's diff, so it never proves this head empty.
+        const emptyNetDiff = provenEmptyNetDiffPayload(loopPayload, head);
+        if (!skipCardOnly && !emptyNetDiff) {
           classified = { outcome: 'red-team-not-owed', reason: 'live card-only skip policy is disabled or unreadable' };
           return result({ ...classified, lanePath });
         }
         // Carry publication owns its journal, compatibility status, label and comment while
         // this job still holds the lane/claim. It never enters queued model admission.
-        const redTeam = provenEmptyNetDiff(loopPayload?.findings?.read, head) ? { ...EMPTY_NET_DIFF_SKIP }
+        const redTeam = emptyNetDiff ? { ...EMPTY_NET_DIFF_SKIP }
           : { status: 'skipped', policy: 'card-only', reason: 'red team skipped: card-only' };
         const settled = io.settleRedTeamSkip({ repo: planned.repo, pr: planned.pr, head, readHead: head,
           redTeam, carry: { loopPayload, lanePath } });

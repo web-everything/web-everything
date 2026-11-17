@@ -1,4 +1,4 @@
-import { emptyNetDiffSkip, provenEmptyNetDiff, verifyEmptyNetDiff, EMPTY_NET_DIFF_SKIP } from './red-team-empty-net-diff.mjs';
+import { emptyNetDiffSkip, provenEmptyNetDiffPayload, verifyEmptyNetDiff, EMPTY_NET_DIFF_SKIP } from './red-team-empty-net-diff.mjs';
 /** Recover an owed red-team result on an already-reviewed head through the existing review job. */
 import { execFileSync } from 'node:child_process';
 import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
@@ -366,7 +366,7 @@ export function cardOnlyHeadMoveCandidate(evidence, head) {
 export function cardOnlySkipSettlementCandidate(evidence, head) {
   const read = evidence?.loopPayload?.findings?.read;
   return !evidence?.carryConflict && isRealHead(head) && read?.netBasis?.rev === head
-    && (redTeamCardOnly(read) || provenEmptyNetDiff(read, head)) && redTeamSkipNeedsSettlement(evidence?.status)
+    && (redTeamCardOnly(read) || provenEmptyNetDiffPayload(evidence.loopPayload, head)) && redTeamSkipNeedsSettlement(evidence?.status)
     && evidence.status.head === head
     && evidence.recorded === false && evidence.seatRecorded === false
     && !evidence.inFlight && !evidence.queued;
@@ -696,7 +696,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           { referralsRuled: true });
       }
       if (emptyNetDiffSkip(status, head) && emptyNetDiffSkip(evidence.status, head)
-        && provenEmptyNetDiff(evidence.loopPayload?.findings?.read, head)
+        && provenEmptyNetDiffPayload(evidence.loopPayload, head)
         && evidence.recorded === false && evidence.seatRecorded === false
         && evidence.inFlight === false && !evidence.queued && !evidence.carryConflict
         && acceptedReview && acceptance?.sha === head) {
