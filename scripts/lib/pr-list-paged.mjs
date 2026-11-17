@@ -139,14 +139,18 @@ export function resolveCheckApps({ repo, rows, exec, execOpts = {}, checkAppStat
 /** `gh pr list --json statusCheckRollup` (the runner's tick snapshot, `open-pr-fetch.mjs`) carries neither a check-run id
  *  nor its app. For each row with a LIVE, workflow-less CheckRun and no app, read the head commit's check runs over REST
  *  and bind appId/appSlug by check name — but only when every same-named run on that commit agrees on one app. Any
- *  failure, missing run or disagreement leaves the app empty: the planner then fails closed. Bounded per list; commits
- *  rotate across refreshes so a pending prefix cannot starve later ones. `repo` null → the cwd repo (gh placeholders). */
+ *  failure, missing run, disagreement, a partial page (`total_count` above the runs returned) or no still-live same-name
+ *  run leaves the app empty: the planner then fails closed. `filter=all` shows superseded same-name runs of other apps
+ *  to the agreement test. Bounded per list; the window of commits read advances with the clock (every refresh is a fresh
+ *  process, so no in-memory cursor could rotate), so a prefix of pending commits cannot starve later ones.
+ *  `repo` null → the cwd repo (gh placeholders). */
 const COMMIT_LOOKUP_CAP = 30;
-const commitLookupCursors = new Map();
-export function resolveCheckAppsByCommit({ repo, rows, exec, execOpts = {} }) {
+const COMMIT_LOOKUP_WINDOW_MS = 30_000;
+const SHA_RE = /^[0-9a-f]{40}$/;
+export function resolveCheckAppsByCommit({ repo, rows, exec, execOpts = {}, now = Date.now() }) {
   const wanted = new Map(); // headRefOid -> checks needing an app
   for (const row of rows) {
-    if (typeof row?.headRefOid !== 'string' || !row.headRefOid) continue;
+    if (typeof row?.headRefOid !== 'string' || !SHA_RE.test(row.headRefOid)) continue;
     for (const c of row.statusCheckRollup ?? []) {
       if (c?.__typename !== 'CheckRun' || String(c.status).toUpperCase() === 'COMPLETED' || c.workflowName || c.appId || c.appSlug) continue;
       if (!wanted.has(row.headRefOid)) wanted.set(row.headRefOid, []);
@@ -154,24 +158,25 @@ export function resolveCheckAppsByCommit({ repo, rows, exec, execOpts = {} }) {
     }
   }
   const shas = [...wanted.keys()].sort();
-  const key = repo ?? '';
-  const start = Math.max(0, shas.findIndex(s => s > (commitLookupCursors.get(key) ?? '')));
+  // Advance by one full window per tick-length of wall clock: consecutive refreshes cover disjoint commits until all are seen.
+  const start = shas.length ? (Math.floor(now / COMMIT_LOOKUP_WINDOW_MS) * COMMIT_LOOKUP_CAP) % shas.length : 0;
   const base = repo ? `repos/${repo}` : 'repos/{owner}/{repo}';
   for (let i = 0; i < Math.min(COMMIT_LOOKUP_CAP, shas.length); i++) {
     const sha = shas[(start + i) % shas.length];
-    commitLookupCursors.set(key, sha); // advance even on failure: an unreadable commit must not monopolize the budget
     try {
-      const runs = JSON.parse(String(exec('gh', ['api', `${base}/commits/${sha}/check-runs?per_page=100`], execOptions(execOpts))))?.check_runs;
-      if (!Array.isArray(runs)) continue;
+      const body = JSON.parse(String(exec('gh', ['api', `${base}/commits/${sha}/check-runs?per_page=100&filter=all`], execOptions(execOpts))));
+      const runs = body?.check_runs;
+      // A partial page could hide a same-named run of another app: bind nothing from it.
+      if (!Array.isArray(runs) || !Number.isInteger(body.total_count) || body.total_count > runs.length) continue;
       for (const c of wanted.get(sha)) {
         const same = runs.filter(r => r?.name === c.name);
         const ids = new Set(same.map(r => r?.app?.id));
-        if (same.length === 0 || ids.size !== 1 || !Number.isInteger(same[0].app?.id)) continue;
+        const stillLive = same.some(r => String(r?.status).toLowerCase() !== 'completed');
+        if (same.length === 0 || !stillLive || ids.size !== 1 || !Number.isInteger(same[0].app?.id)) continue;
         Object.assign(c, { appId: same[0].app.id, appSlug: typeof same[0].app.slug === 'string' ? same[0].app.slug : '' });
       }
     } catch { /* unreadable: leave the app empty (fail closed) */ }
   }
-  if (commitLookupCursors.size > APP_LOOKUP_REPO_CAP) commitLookupCursors.delete(commitLookupCursors.keys().next().value);
   return rows;
 }
 

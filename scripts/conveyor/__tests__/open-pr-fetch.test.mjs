@@ -7,6 +7,7 @@ import {
   fetchOpenPrsRest, restPullToBuildDispatchShape, BUILD_DISPATCH_PR_FIELDS,
 } from '../open-pr-fetch.mjs';
 import { runGhSync } from '../../lib/gh-throttle.mjs';
+import { resolveCheckAppsByCommit } from '../../lib/pr-list-paged.mjs';
 import { normalizeOpenPrs } from '../build-dispatch-policy.mjs';
 import { defaultListOpenPrs } from '../duplicate-pr-watch.mjs';
 import { defaultListParkedPrs as listConflicts } from '../parked-pr-conflict-watch.mjs';
@@ -71,25 +72,29 @@ describe('shared open-PR discovery', () => {
     const redTeam = { __typename: 'CheckRun', name: 'red-team', workflowName: '', status: 'IN_PROGRESS', conclusion: '' };
     const done = { __typename: 'CheckRun', name: 'test', workflowName: 'CI', status: 'COMPLETED', conclusion: 'FAILURE' };
     const row = (rollup, sha = SHA, number = 1) => ({ number, headRefOid: sha, statusCheckRollup: rollup.map((c) => ({ ...c })) });
-    const run = (rows, apiRuns, { repo = 'o/r' } = {}) => {
+    const mkExec = (rows, apiRuns, calls, total) => (args) => {
+      if (args[0] !== 'api') return JSON.stringify(rows);
+      calls.push(args[1]);
+      if (apiRuns instanceof Error) throw apiRuns;
+      const runs = apiRuns.map((r) => ({ status: 'in_progress', ...r }));
+      return JSON.stringify({ total_count: total ?? runs.length, check_runs: runs });
+    };
+    const run = (rows, apiRuns, { repo = 'o/r', total } = {}) => {
       const calls = [];
-      const exec = (args) => {
-        if (args[0] === 'api') { calls.push(args[1]); if (apiRuns instanceof Error) throw apiRuns; return JSON.stringify({ check_runs: apiRuns }); }
-        return JSON.stringify(rows);
-      };
-      return { out: defaultFetchOpenPrs({ repo, exec, readComments: () => [] }), calls };
+      return { out: defaultFetchOpenPrs({ repo, exec: mkExec(rows, apiRuns, calls, total), readComments: () => [] }), calls };
     };
     const live = (out, i = 0) => out[i].statusCheckRollup.find((c) => c.name === 'red-team');
+    const configured = { id: 9, name: 'red-team', app: { id: 5037855, slug: 'web-everything' } };
 
     it('binds the posting app of a live workflow-less check from the head commit check runs', () => {
-      const { out, calls } = run([row([done, redTeam])], [{ id: 9, name: 'red-team', app: { id: 5037855, slug: 'web-everything' } }]);
+      const { out, calls } = run([row([done, redTeam])], [configured]);
       expect(live(out)).toMatchObject({ appId: 5037855, appSlug: 'web-everything' });
-      expect(calls).toEqual([`repos/o/r/commits/${SHA}/check-runs?per_page=100`]);
+      expect(calls).toEqual([`repos/o/r/commits/${SHA}/check-runs?per_page=100&filter=all`]);
     });
 
     it('uses gh placeholders when no repo is given', () => {
       const { calls } = run([row([redTeam])], [], { repo: null });
-      expect(calls).toEqual([`repos/{owner}/{repo}/commits/${SHA}/check-runs?per_page=100`]);
+      expect(calls).toEqual([`repos/{owner}/{repo}/commits/${SHA}/check-runs?per_page=100&filter=all`]);
     });
 
     it('makes no extra read when every check is completed, workflow-backed or already has an app', () => {
@@ -97,22 +102,32 @@ describe('shared open-PR discovery', () => {
       expect(calls).toEqual([]);
     });
 
-    it.each([
-      ['an unreadable read', new Error('boom')],
-      ['no matching run', [{ id: 1, name: 'other', app: { id: 5 } }]],
-      ['a run without an app', [{ id: 1, name: 'red-team', app: null }]],
-      ['same-name runs from two apps', [{ id: 1, name: 'red-team', app: { id: 5, slug: 'a' } }, { id: 2, name: 'red-team', app: { id: 6, slug: 'b' } }]],
-    ])('fails closed (no app) on %s', (_label, apiRuns) => {
-      expect(live(run([row([redTeam])], apiRuns).out)).not.toHaveProperty('appId');
+    it('never puts a non-SHA headRefOid in the API path', () => {
+      const { calls } = run([row([redTeam], '../../x?y=1')], [configured]);
+      expect(calls).toEqual([]);
     });
 
-    it('bounds commit reads per list and rotates so later commits are reached', () => {
-      const rows = Array.from({ length: 40 }, (_, i) => row([redTeam], String(i).padStart(2, '0').padEnd(40, 'b'), i + 1));
-      const first = run(rows, [], { repo: 'o/rot' }).calls;
-      const second = run(rows, [], { repo: 'o/rot' }).calls;
-      expect(first).toHaveLength(30);
-      expect(second).toHaveLength(30);
-      expect(new Set([...first, ...second]).size).toBe(40);
+    it.each([
+      ['an unreadable read', new Error('boom'), undefined],
+      ['no matching run', [{ id: 1, name: 'other', app: { id: 5 } }], undefined],
+      ['a run without an app', [{ id: 1, name: 'red-team', app: null }], undefined],
+      ['same-name runs from two apps', [{ id: 1, name: 'red-team', app: { id: 5, slug: 'a' } }, { id: 2, name: 'red-team', app: { id: 6, slug: 'b' } }], undefined],
+      ['a partial page (total_count above the runs returned)', [configured], 101],
+      ['same-name runs that are all completed', [{ ...configured, status: 'completed' }], undefined],
+    ])('fails closed (no app) on %s', (_label, apiRuns, total) => {
+      expect(live(run([row([redTeam])], apiRuns, { total }).out)).not.toHaveProperty('appId');
+    });
+
+    it('bounds commit reads per list and the window advances with the clock across fresh processes', () => {
+      const rows = Array.from({ length: 70 }, (_, i) => row([redTeam], String(i).padStart(2, '0').padEnd(40, 'b'), i + 1));
+      const seen = new Set();
+      for (const now of [0, 30_000, 60_000]) {
+        const calls = [];
+        resolveCheckAppsByCommit({ repo: 'o/rot', rows: structuredClone(rows), exec: (_c, args) => mkExec(rows, [], calls)(args), now });
+        expect(calls).toHaveLength(30);
+        calls.forEach((c) => seen.add(c));
+      }
+      expect(seen.size).toBe(70);
     });
   });
 

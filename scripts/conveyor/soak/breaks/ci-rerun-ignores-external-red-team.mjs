@@ -57,7 +57,7 @@ export async function scenario(sourceRoot) {
     const { defaultFetchOpenPrs } = await import(pathToFileURL(join(root, 'scripts/conveyor/open-pr-fetch.mjs')).href);
     const { appSlug: _s, appId: _i, ...bare } = redTeam;
     const exec = args => JSON.stringify(args[0] === 'api'
-      ? { check_runs: [{ name: 'red-team', app: { id: 5037855, slug: 'web-everything' } }] }
+      ? { total_count: 1, check_runs: [{ name: 'red-team', status: 'in_progress', app: { id: 5037855, slug: 'web-everything' } }] }
       : [{ number: 6873, headRefOid: head, statusCheckRollup: [failed, bare] }]);
     const snapshot = defaultFetchOpenPrs({ repo, exec, readComments: () => [] });
     const snapshotReruns = reran(plan(snapshot[0].statusCheckRollup));

@@ -120,7 +120,7 @@ describe('direct (snapshot-disabled) list path: retried and truncation-safe', ()
     const sha = 'c'.repeat(40);
     const live = { __typename: 'CheckRun', name: 'red-team', workflowName: '', status: 'IN_PROGRESS', conclusion: '' };
     execFileSync.mockReset().mockImplementation((_f, args) => args[0] === 'api'
-      ? JSON.stringify({ check_runs: [{ name: 'red-team', app: { id: 5037855, slug: 'web-everything' } }] })
+      ? JSON.stringify({ total_count: 1, check_runs: [{ name: 'red-team', status: 'in_progress', app: { id: 5037855, slug: 'web-everything' } }] })
       : JSON.stringify([{ ...row(1), headRefOid: sha, statusCheckRollup: [live] }]));
     const [pr] = defaultReadPrs({ repo: 'o/r', exec: execFileSyncThrottled, readCommits: () => [], readShared: () => null,
       retryOpts: { sleep: () => {}, persist: false, onEvent: () => {} } });
