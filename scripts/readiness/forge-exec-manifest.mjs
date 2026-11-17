@@ -219,6 +219,7 @@ const SIGNATURES=[
   '4022004018b250601020d3ec8468a270600103','4032004018b250601020d3ec8468a270600103',
   // SEC1 ECPrivateKey requires version 1 (RFC 5915); optional parameters/publicKey follow
   // the private OCTET STRING and are deliberately absent from these 32/48/66-byte signatures.
+  // Other scalar sizes and length forms are recognized by hasSec1PrivateKey below.
   '0240101020','0340101020','2440101020',
   // OpenSSH key-v1 magic (with NUL) precedes optional cipher/KDF fields. PuTTY's header
   // prefix ends before its format version, so neither signature pins optional fields.
@@ -324,7 +325,31 @@ function hasRsaPrivateKey(bytes) {
   }
   return false;
 }
-const hasSignature=bytes=>SIGNATURES.some(signature=>bytes.includes(signature))||hasPkcs8PrivateKey(bytes)||hasRsaPrivateKey(bytes);
+// SEC1 ECPrivateKey: version 1 followed by a nonempty private OCTET STRING. Scalar
+// length depends on the curve, not a fixed size inventory. Parameters/publicKey are
+// optional and follow the scalar. Only three bounded headers and the version byte
+// are read per candidate; skip scalar and optional-field bodies without copying them.
+function hasSec1PrivateKey(bytes) {
+  const first=bytes.indexOf(0x30);
+  if(first<0)return false;
+  for(let start=first;start<bytes.length;start++) {
+    if(bytes[start]!==0x30)continue;
+    const length=bytes[start+1];
+    // Version plus an OCTET STRING with at least one scalar byte need six bytes.
+    if(length<6)continue;
+    const headerLength=length<128?2:2+(length&0x7f);
+    if(bytes[start+headerLength]!==2)continue;
+    const sequence=derElement(bytes,start,bytes.length);
+    if(!sequence)continue;
+    const version=derElement(bytes,sequence.start,sequence.end);
+    if(!version||version.tag!==2||version.length!==1||bytes[version.start]!==1)continue;
+    const scalar=derElement(bytes,version.end,sequence.end);
+    if(scalar?.tag===4&&scalar.length>0)return true;
+  }
+  return false;
+}
+const hasSignature=bytes=>SIGNATURES.some(signature=>bytes.includes(signature))
+  ||hasPkcs8PrivateKey(bytes)||hasRsaPrivateKey(bytes)||hasSec1PrivateKey(bytes);
 // Require an exact private member and a known kty in the SAME object, in either order. Keep duplicate
 // members visible, including in JS-style objects; JSON.parse would discard earlier duplicate members.
 function hasJwkSecret(bytes) {
@@ -472,8 +497,9 @@ function squeezed(text) {
 }
 function* decodedBuffers(text) {
   const [b64,b64url,hex]=squeezed(text);
-  if(b64.length>=16)yield* decodeAligned(b64,'base64',4);
-  if(b64url!==undefined&&b64url!==b64&&b64url.length>=16)yield* decodeAligned(b64url,'base64url',4);
+  // The smallest SEC1 shape is eight bytes: eleven unpadded base64 characters.
+  if(b64.length>=11)yield* decodeAligned(b64,'base64',4);
+  if(b64url!==undefined&&b64url!==b64&&b64url.length>=11)yield* decodeAligned(b64url,'base64url',4);
   if(hex.length>=16)for(let skip=0;skip<2;skip++)yield Buffer.from(hex.slice(skip),'hex');
   // Escaped hex and Unicode runs contain digits but no decimal token boundary.
   // Reject those with a native search before the per-character decimal parser.
@@ -506,7 +532,7 @@ function scanText(text) {
   if(hasJwkSecretText(text))return true;
   const stripped=stripComments(text);
   if(stripped!==text&&hasJwkSecretText(stripped))return true;
-  // The shortest decoded view needs eight decimal bytes (the hex/base64 views need sixteen
+  // The shortest decoded view needs eight decimal bytes (sixteen hex or eleven base64
   // alphabet characters). Sparse punctuation cannot produce one: use native searches before
   // allocating and filtering several full-sized views. JWK parsing above is independent.
   const encodedChar=/[A-Za-z0-9+/_-]/g;

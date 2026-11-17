@@ -164,6 +164,63 @@ describe('forge-key-structure: PKCS#8 version and optional-field variants',()=>{
   });
 });
 
+describe('forge-key-structure: SEC1 scalar lengths and optional fields',()=>{
+  const path=Buffer.from('docs/material.bin');
+  const encodings={raw:bytes=>bytes,...Object.fromEntries(Object.entries(views)
+    .map(([name,encode])=>[name,bytes=>Buffer.from(encode(bytes))]))};
+  const assertBlocked=content=>{
+    expect(credentialBufferFinding(content)).toBe(FINDING);
+    expect(credentialContentFinding(path,content)).toBe(FINDING);
+    for(const tracked of [false,true])
+      expect(()=>manifestEntry(path,content,false,tracked)).toThrow(expect.objectContaining({
+        code:'excluded-source-file',message:expect.stringContaining(FINDING),
+      }));
+  };
+  for(const namedCurve of ['prime192v1','secp224r1','brainpoolP320r1']) {
+    const bytes=priv('ec',{namedCurve},{type:'sec1'});
+    it(`${namedCurve} SEC1 key imports, signs and verifies`,()=>{
+      const key=createPrivateKey({key:bytes,format:'der',type:'sec1'});
+      const message=Buffer.from('scalar length regression');
+      expect(verify('sha256',message,createPublicKey(key),sign('sha256',message,key))).toBe(true);
+    });
+    for(const [encoding,encode] of Object.entries(encodings))
+      it(`blocks usable ${namedCurve} SEC1 as ${encoding} on both scanners and manifestEntry`,()=>{
+        assertBlocked(encode(bytes));
+      });
+  }
+  // Assemble containers at runtime to avoid embedding a key signature in this source.
+  const element=(tag,body,long=false)=>Buffer.from([tag,...(body.length>255
+    ?[0x82,body.length>>8,body.length&255]:long||body.length>=128?[0x81,body.length]:[body.length]),...body]);
+  const container=(length,{version=1,tag=4,tail=[],long=false}={})=>element(48,[
+    ...element(2,[version],long),...element(tag,Array(length).fill(7),long),...tail,
+  ],long);
+  for(const length of [1,21,24,28,40,72,128,256])
+    it(`recognizes ${length}-byte SEC1 scalars with optional fields and DER length forms`,()=>{
+      for(const long of [false,true])
+        for(const tail of [[],[0xa0,2,5,0],[0xa1,3,3,1,0],[0xa0,2,5,0,0xa1,3,3,1,0]])
+          for(const encode of [encodings.raw,encodings.base64,encodings.hex,encodings.decimal])
+            assertBlocked(encode(container(length,{long,tail})));
+    });
+  it('requires a complete SEC1 sequence, version one and a nonempty scalar OCTET STRING',()=>{
+    const valid=container(24);
+    for(const bytes of [container(24,{version:0}),container(24,{version:2}),container(24,{tag:3}),
+      container(0),valid.subarray(2),valid.subarray(0,-1),Buffer.from([48,3,2,1,1]),
+      Buffer.from([48,0x80,...valid.subarray(2),0,0]),
+      Buffer.from([48,0x84,0xff,0xff,0xff,0xff,...valid.subarray(2)]),
+      Buffer.from([48,3,...valid.subarray(2)])])
+      for(const encode of [encodings.raw,encodings.base64,encodings.hex,encodings.decimal]) {
+        const content=encode(bytes);
+        expect(credentialBufferFinding(content)).toBeNull();
+        expect(credentialContentFinding(path,content)).not.toBe(FINDING);
+        expect(manifestEntry(path,content,false,true)).toMatchObject({tracked:true});
+      }
+  });
+  it('finds SEC1 after dense sequence prefixes and malformed candidates',()=>{
+    assertBlocked(Buffer.concat([Buffer.alloc(64*1024,0x30),
+      Buffer.from([48,0x84,0xff,0xff,0xff,0xff]),container(24)]));
+  });
+});
+
 describe('forge-key-structure: JWK recovery after unrelated quotes',()=>{
   const path=Buffer.from('docs/notes.md');
   const encodings={raw:bytes=>bytes,...Object.fromEntries(Object.entries(views)
