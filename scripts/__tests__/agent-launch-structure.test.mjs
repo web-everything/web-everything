@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { relative, resolve } from 'node:path';
 import { AGENT_LAUNCH_ALLOWLIST, findAgentLaunches, readAgentLaunchTree } from '../lib/agent-launch-structure.mjs';
 
+// Lint, not a boundary: catches literal launches only (R1019). Aliasing, bind and mutation are out of scope;
+// real enforcement is the runtime launch assertion follow-up card.
 const root = resolve(import.meta.dirname, '../..');
 // Migration baseline includes legacy unresolved commands exposed by fail-closed detection.
 // Each exemption must shrink as launch sites migrate; unknown commands receive no blanket exemption.
