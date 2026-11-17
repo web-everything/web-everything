@@ -5,8 +5,9 @@ import { settleRedTeamSkip } from '../../lib/red-team-skip-outcome.mjs';
 import { publishAttention, replay } from '../needs-you-feed.mjs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { runReviewJob, createReviewJobIo } from '../review-job.mjs';
-import { readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir } from '../../lib/drain-red-team-evidence.mjs';
+import { runReviewJob, createReviewJobIo, redTeamRunnerArgs } from '../review-job.mjs';
+import { decodeRecoveryAdmission, readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir } from '../../lib/drain-red-team-evidence.mjs';
+import { failedRedTeamRetry } from '../../lib/red-team-run-result.mjs';
 import { normalizeRedTeamResult, planRedTeamOnSkip, redTeamSkipNeedsSettlement, planRedTeamRecovery, abandonStaleRedTeamRun, recoveryProbe } from '../../lib/review-red-team-on-skip.mjs';
 import { newRunRecord, writeRun } from '../run-store.mjs';
 import { redTeamOwedOnHead } from '../../lib/review-red-team-policy.mjs';
@@ -92,6 +93,80 @@ describe('review-job red-team skip settlement', () => {
       expect(admission.redTeamAdmission.prior).toEqual(cardOnly ? null : {
         repo, pr, head, status: 'finished', result: { status: 'skipped' },
       });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(['accept', 'advisory', 'missing-read', 'mismatched-rev', 'missing-verdict', 'degraded-advisory'])
+  ('serialized non-policy skip recovery launches one seat only with intact pinned evidence (%s)', async variant => {
+    const root = mkdtempSync(join(tmpdir(), 'skip-runner-admission-'));
+    const env = { WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_STATUS_LABELS: '0',
+      WE_REVIEW_RED_TEAM: '1', WE_REVIEW_EXTRA_SEATS: '1', WE_RED_TEAM_SKIP_CARD_ONLY: '0' };
+    const key = { repo, pr, head, env }, loopPayload = payload();
+    Object.assign(loopPayload.findings.read, {
+      netChangedFiles: ['scripts/example.mjs'],
+      diffText: 'diff --git a/scripts/example.mjs b/scripts/example.mjs\n+export const value = 1;\n',
+    });
+    if (variant === 'advisory' || variant === 'degraded-advisory') Object.assign(loopPayload.verdict, {
+      verdict: 'needs-human', humanRequired: true,
+      lensVerdicts: { correctness: 'accept', security: 'accept' },
+    });
+    const readEvidence = () => readDrainRedTeamEvidence({ ...key, list: () => [], readScorecards: () => [] });
+    const production = createReviewJobIo({ env, readEvidence, readSeatRecords: () => [] });
+    const io = {
+      now: () => 1_000, log: vi.fn(), readRecords: vi.fn(() => []), readRecoveryComments: () => [],
+      readRedTeamStatus: () => readRedTeamStatus(key),
+      cliAvailable: vi.fn(provider => provider === 'codex'),
+      reserveCalls: vi.fn(() => ({ used: 0, callIds: ['skip-retry-seat'] })),
+      makeScratch: () => root, removeScratch: vi.fn(), writeFile: vi.fn(), readHeadMessage: () => '',
+      runSeat: vi.fn(async () => ({ report: { lastMessage: JSON.stringify({
+        lenses: { 'red-team': { verdict: 'accept', findings: [] } },
+      }) } })),
+      runRecheck: vi.fn(),
+    };
+    try {
+      writeRun({ ...newRunRecord({ id: loopPayload.runId, op: 'review-pr', input: { repo, pr } }), ...loopPayload }, env.WE_SHARED_RUNS_DIR);
+      production.redTeamStatus({ repo, pr, loopPayload, status: 'finished', result: { status: 'skipped' } });
+      const { redTeamAdmission } = production.redTeamStatus({ repo, pr, loopPayload, status: 'queued', redTeamMode: 'fresh' });
+      expect(redTeamAdmission.retrySpent).toBe(true);
+      expect(readRedTeamStatus(key).retryCount).toBe(1);
+      // Mirror the production runner's file/argv boundary, then its CLI decoder.
+      const admissionFile = join(root, 'admission.json');
+      writeFileSync(admissionFile, JSON.stringify(redTeamAdmission));
+      const args = redTeamRunnerArgs({ repo, pr, lanePath: root, loopFile: join(root, 'loop.json'),
+        redTeamMode: 'fresh', redTeamAdmission: admissionFile });
+      const file = args.find(arg => arg.startsWith('--red-team-admission=')).slice('--red-team-admission='.length);
+      const decoded = decodeRecoveryAdmission(readFileSync(file, 'utf8'));
+      // Corrupt only the prior; the current review still owes a pass on this head.
+      if (variant === 'missing-read') delete decoded.prior.loopPayload?.findings?.read;
+      if (variant === 'mismatched-rev' && decoded.prior.loopPayload) decoded.prior.loopPayload.findings.read.netBasis.rev = 'b'.repeat(40);
+      if (variant === 'missing-verdict') delete decoded.prior.loopPayload?.verdict;
+      if (variant === 'degraded-advisory' && decoded.prior.loopPayload) decoded.prior.loopPayload.findings.read.degraded = true;
+      const eligible = variant === 'accept' || variant === 'advisory';
+      expect(failedRedTeamRetry(decoded.prior, { failedSeatCount: 0, completedRecorded: false })).toBe(eligible);
+      const input = { repo, pr, lanePath: root, loopPayload, env, post: false, record: false,
+        redTeamMode: 'fresh', redTeamAdmission: decoded };
+      const result = await runRedTeam(input, io);
+      if (!eligible) {
+        expect(result).toMatchObject({ status: 'not-owed', deferredByGuard: true,
+          reason: expect.stringContaining('red-team retry already spent') });
+        expect(io.cliAvailable).not.toHaveBeenCalled();
+        expect(io.reserveCalls).not.toHaveBeenCalled();
+        expect(io.runSeat).not.toHaveBeenCalled();
+        return;
+      }
+      expect(decoded.prior.loopPayload).toEqual({ verdict: loopPayload.verdict, findings: { read: loopPayload.findings.read } });
+      expect(result.status).toBe('ran');
+      expect(io.runSeat).toHaveBeenCalledOnce();
+      expect(io.reserveCalls).toHaveBeenCalledOnce();
+      // Even without seat rows, losing the retry's result cannot replenish its budget.
+      production.redTeamStatus({ repo, pr, loopPayload, status: 'finished', result: { status: 'skipped' } });
+      expect(readRedTeamStatus(key).retryCount).toBe(1);
+      expect(() => production.redTeamStatus({ repo, pr, loopPayload, status: 'queued', redTeamMode: 'fresh' })).toThrow();
+      expect(await runRedTeam({ ...input, redTeamAdmission: undefined }, io)).toMatchObject({
+        status: 'not-owed', deferredByGuard: true, reason: expect.stringContaining('red-team retry already spent'),
+      });
+      expect(io.runSeat).toHaveBeenCalledOnce();
+      expect(io.reserveCalls).toHaveBeenCalledOnce();
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 

@@ -438,6 +438,10 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
         ...(input.retryCount === 1 ? { retrySpent: true } : {}),
         prior: admissionPrior == null ? null : { repo: admissionPrior.repo, pr: admissionPrior.pr, head: admissionPrior.head,
           status: admissionPrior.status, result: admissionPrior.result,
+          // The runner rechecks failedRedTeamRetry after decoding this admission file.
+          // Preserve its prior read and owed verdict, including advisory-accept evidence.
+          ...(admissionPrior.loopPayload ? { loopPayload: { verdict: admissionPrior.loopPayload.verdict,
+            findings: { read: admissionPrior.loopPayload.findings?.read } } } : {}),
           ...(admissionPrior.retryCount !== undefined ? { retryCount: admissionPrior.retryCount } : {}) } } } : {}) };
     },
     root,

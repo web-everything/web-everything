@@ -2559,6 +2559,10 @@ Queue-state fixtures must use the same candidate repository identity when writin
 an omitted `repo` uses `cwd#<pr>`, while an explicit `repo` uses `<repo>#<pr>`.
 Empty-net-diff policy clearance requires a readable scorecard store proving no prior completed row
 needs recovery; test unreadable stores with both `resumeOnly` modes and preserve the hold for inspection.
+Non-policy skip recovery tests must round-trip the prior verdict and read through the admission file
+and runner guard, asserting one seat and a spent retry even when no seat rows survive. Missing reads,
+mismatched pinned heads and incomplete advisory acceptance must refuse before provider work.
+Keep the pinned-SHA read and the clear-time empty-net-diff recheck intact when changing retry admission.
 
 Post-accept admission imports the review scheduler’s `redTeamOwedFor` and `redTeamEnabled` over
 the exact repo/PR/head review payload; acceptance labels alone never establish an owed pass.
