@@ -11,7 +11,7 @@ import { addOverlay, readOverlayState, overlayFilePath, appendOverlayEvent, remo
 import { alertsFilePath } from '../daemon-rebuild/state.mjs';
 import { readOverlayConflictWakes } from '../overlay-conflict-wake.mjs';
 import { pruneStaleOverlayRecords } from '../daemon-clone-registry.mjs';
-import { replay, sidecarsOf } from '../../operations/needs-you-feed.mjs';
+import { publishAttention, replay, sidecarsOf } from '../../operations/needs-you-feed.mjs';
 import { probeOverlayMainSync } from '../../conveyor/health-watch.mjs';
 import { allowedCommand } from '../../readiness/forge-exec-run.mjs';
 import { runHeavyTests } from '../daemon-rebuild/auto-rebase.mjs';
@@ -756,6 +756,64 @@ describe('overlay main sync', () => {
     expect(fs.existsSync(marker(f))).toBe(false); unchanged(f);
   });
 
+  it('non-parked preparation failures schedule exactly three retries at 10, 20 and 30 minutes then remember main', async () => {
+    const f = fixture(), clock = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
+    const git = f.deps.git, spawnFn = spawner();
+    // A scratch clone failure precedes validated tip evidence, so it cannot park.
+    f.deps.git = vi.fn((args, opts) => args[0] === 'clone'
+      ? { status: 1, stdout: '', stderr: 'temporary clone failure' } : git(args, opts));
+    for (const [index, delay] of [10, 20, 30].entries()) {
+      await expect(job(f)).rejects.toThrow(/temporary clone failure/);
+      const retry = json(sidecar(f));
+      expect(retry.attemptedMain[ref]).toBeUndefined();
+      expect(retry.parkedTip[ref]).toBeUndefined();
+      expect(retry.failureCount[ref]).toBeUndefined();
+      expect(retry.retryMain[ref]).toBe(f.mainSha);
+      expect(retry.retryTries[ref]).toBe(index + 1);
+      expect(retry.retryAfter[ref]).toBe(Date.now() + delay * 60_000);
+      expect(tick(f, { spawnFn }).started).toEqual([]);
+      clock.mockReturnValue(retry.retryAfter[ref] - 1);
+      expect(tick(f, { spawnFn }).started).toEqual([]);
+      clock.mockReturnValue(retry.retryAfter[ref]);
+      expect(tick(f, { spawnFn }).started).toEqual([ref]);
+      fs.unlinkSync(marker(f));
+    }
+    await expect(job(f)).rejects.toThrow(/temporary clone failure/);
+    attempted(f);
+    expect(f.deps.git.mock.calls.filter(([args]) => args[0] === 'clone')).toHaveLength(4);
+    expect(f.deps.testRunner).not.toHaveBeenCalled();
+    expect(spawnFn).toHaveBeenCalledTimes(3);
+    expect(tick(f, { spawnFn }).started).toEqual([]);
+    expect(alerts(f)).toHaveLength(0);
+    clock.mockReturnValue(Date.now() + 60 * 60_000 + 1);
+    expect(tick(f, { spawnFn }).started).toEqual([]);
+    expect(alerts(f)).toHaveLength(1);
+    expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toHaveLength(1);
+    expect(json(sidecarsOf(f.env.WE_NEEDS_YOU_FEED).state).openKeys).toHaveLength(1);
+  }, 90_000);
+
+  it('an earlier open failure alert for the same ref cannot swallow the tip-specific park alert', async () => {
+    const f = fixture(), spawnFn = spawner();
+    publishAttention({ repo: 'web-everything', pr: 123, head: ref, ref,
+      kind: 'overlay-main-sync-needs-you', reason: 'earlier failure' }, { path: f.env.WE_NEEDS_YOU_FEED });
+    f.deps.testRunner = vi.fn(async () => ({ status: 1, stderr: 'persistent failure' }));
+    for (let i = 0; i < 3; i++) await expect(job(f)).rejects.toThrow(/persistent failure/);
+    const acknowledgedAt = json(sidecar(f)).failureAlertedAt[ref];
+    expect(acknowledgedAt).toEqual(expect.any(Number));
+    for (let i = 0; i < 2; i++) {
+      expect(tick(f, { spawnFn }).skipped).toEqual([ref]);
+      expect(await job(f)).toEqual({ skipped: true, reason: 'parked' });
+    }
+    const feed = replay({ path: f.env.WE_NEEDS_YOU_FEED });
+    expect(feed).toHaveLength(2);
+    expect(feed.filter(event => event.kind === 'overlay-main-sync-parked')).toEqual([
+      expect.objectContaining({ ref, head: `${ref}@${f.oldSha}`, reason: expect.stringContaining('parked after 3 failures') }),
+    ]);
+    expect(json(sidecar(f)).failureAlertedAt[ref]).toBe(acknowledgedAt);
+    expect(spawnFn).not.toHaveBeenCalled();
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(3);
+  }, 90_000);
+
   it('preserves the ten- and twenty-minute retry cooldowns before the third failure parks', async () => {
     const f = fixture(), clock = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000), spawnFn = spawner();
     f.deps.testRunner = vi.fn(async () => ({ status: 1, stderr: 'temporary failure' }));
@@ -929,12 +987,17 @@ describe('overlay main sync', () => {
       return append(path, ...args);
     });
     f.deps.io.appendFileSync = (...args) => fs.appendFileSync(...args);
+    // Keep both destinations unavailable so the park alert remains unsent.
+    const blocker = join(f.base, 'feed-unavailable');
+    fs.writeFileSync(blocker, 'blocked');
+    f.env.WE_NEEDS_YOU_FEED = join(blocker, 'feed.jsonl');
     for (let i = 0; i < 3; i++) await expect(job(f)).rejects.toThrow(/persistent failure/);
     expect(json(sidecar(f)).parkedTip[ref]).toBe(f.oldSha);
     expect(json(sidecar(f)).failureAlertedAt[ref]).toBeUndefined();
     expect(alerts(f)).toEqual([]);
     const before = outcomes.length;
     publication.mockRestore();
+    fs.unlinkSync(blocker);
     for (let i = 0; i < 2; i++) {
       if (retryPath === 'scheduler') expect(tick(f, { spawnFn, deps: f.deps })).toMatchObject({ started: [], skipped: [ref] });
       else expect(await job(f)).toEqual({ skipped: true, reason: 'parked' });
@@ -943,6 +1006,35 @@ describe('overlay main sync', () => {
     expect(alerts(f)[0].detail.reason).toMatch(/parked after 3 failures/);
     expect(json(sidecar(f)).failureAlertedAt[ref]).toEqual(expect.any(Number));
     expect(outcomes).toHaveLength(before);
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(3);
+    expect(spawnFn).not.toHaveBeenCalled();
+  }, 90_000);
+
+  it.each(['mkdirSync', 'appendFileSync'])('park alert reaches the feed when local %s persistently fails', async method => {
+    const f = fixture(), spawnFn = spawner();
+    f.deps.testRunner = vi.fn(async () => ({ status: 1, stderr: 'persistent failure' }));
+    const file = alertsFilePath(f.root, f.env);
+    const target = method === 'mkdirSync' ? dirname(file) : file;
+    const original = fs[method];
+    const failedWrite = vi.fn(() => { throw new Error('local alert unavailable'); });
+    vi.spyOn(fs, method).mockImplementation((path, ...args) => path === target
+      ? failedWrite() : original(path, ...args));
+    f.deps.io[method] = (...args) => fs[method](...args);
+    for (let i = 0; i < 3; i++) await expect(job(f)).rejects.toThrow(/persistent failure/);
+    expect(failedWrite).toHaveBeenCalled();
+    expect(alerts(f)).toEqual([]);
+    expect(json(sidecar(f)).parkedTip[ref]).toBe(f.oldSha);
+    const acknowledgedAt = json(sidecar(f)).failureAlertedAt[ref];
+    expect(acknowledgedAt).toEqual(expect.any(Number));
+    const expected = [expect.objectContaining({
+      kind: 'overlay-main-sync-parked', ref, head: `${ref}@${f.oldSha}`,
+      reason: expect.stringContaining('parked after 3 failures'),
+    })];
+    expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toEqual(expected);
+    expect(tick(f, { spawnFn }).skipped).toEqual([ref]);
+    expect(await job(f)).toEqual({ skipped: true, reason: 'parked' });
+    expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toEqual(expected);
+    expect(json(sidecar(f)).failureAlertedAt[ref]).toBe(acknowledgedAt);
     expect(f.deps.testRunner).toHaveBeenCalledTimes(3);
     expect(spawnFn).not.toHaveBeenCalled();
   }, 90_000);
@@ -967,7 +1059,7 @@ describe('overlay main sync', () => {
     fs.unlinkSync(blocker);
     await retry();
     expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toContainEqual(expect.objectContaining({
-      kind: 'overlay-main-sync-needs-you', ref, reason: expect.stringContaining('parked after 3 failures'),
+      kind: 'overlay-main-sync-parked', ref, head: `${ref}@${f.oldSha}`, reason: expect.stringContaining('parked after 3 failures'),
     }));
     expect(json(sidecar(f)).failureAlertedAt[ref]).toEqual(expect.any(Number));
     await retry();
@@ -1022,7 +1114,7 @@ describe('overlay main sync', () => {
     if (path === 'scheduler') expect(tick(f, { spawnFn }).skipped).toEqual([ref]);
     else expect(await job(f)).toEqual({ skipped: true, reason: 'parked' });
     expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toContainEqual(expect.objectContaining({
-      kind: 'overlay-main-sync-needs-you', reason: expect.stringContaining('parked after 3 failures'),
+      kind: 'overlay-main-sync-parked', head: `${ref}@${f.oldSha}`, reason: expect.stringContaining('parked after 3 failures'),
     }));
     expect(json(sidecar(f)).failureAlertedAt[ref]).toEqual(expect.any(Number));
     expect(f.deps.testRunner).toHaveBeenCalledTimes(rename === 'state' ? 4 : 3);
@@ -1059,8 +1151,17 @@ describe('overlay main sync', () => {
     f.deps.io.renameSync = fs.renameSync;
     if (path === 'scheduler') expect(tick(f, { spawnFn }).skipped).toEqual([ref]);
     else expect(await job(f)).toEqual({ skipped: true, reason: 'parked' });
-    expect(json(sidecar(f)).failureAlertedAt[ref]).toEqual(expect.any(Number));
+    // An open feed key suppresses the retry; it must not acknowledge delivery.
+    expect(json(sidecar(f)).failureAlertedAt[ref]).toEqual(rename === 'state' ? undefined : expect.any(Number));
     expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toHaveLength(1);
+    const originalFeed = f.env.WE_NEEDS_YOU_FEED;
+    // Once the destination accepts the specific alert, acknowledgement can recover.
+    f.env.WE_NEEDS_YOU_FEED = join(f.base, 'recovered-feed', 'needs-you.jsonl');
+    if (path === 'scheduler') expect(tick(f, { spawnFn }).skipped).toEqual([ref]);
+    else expect(await job(f)).toEqual({ skipped: true, reason: 'parked' });
+    expect(json(sidecar(f)).failureAlertedAt[ref]).toEqual(expect.any(Number));
+    expect(replay({ path: originalFeed })).toHaveLength(1);
+    expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toHaveLength(rename === 'state' ? 1 : 0);
     expect(f.deps.testRunner).toHaveBeenCalledTimes(3);
     expect(spawnFn).not.toHaveBeenCalled();
   }, 90_000);

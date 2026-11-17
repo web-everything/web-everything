@@ -243,18 +243,29 @@ function publishNeedsYou(root, env, ref, kind, reason, extra = {}) {
   try {
     const old = readOverlayState(root, { env }).overlays.find(o => o.ref === ref);
     // Feed keys use a numeric PR; zero is the established host/non-PR convention.
-    publishAttention({ repo: 'web-everything', pr: old?.pr ?? 0, head: ref, ref, kind,
+    const result = publishAttention({ repo: 'web-everything', pr: old?.pr ?? 0, head: ref, ref, kind,
       title: `Overlay top ${ref}`, reason, ...extra }, { path: feedPath({ env }) });
-    return true;
+    // Only park alerts require a new feed line for this specific tip. Ordinary
+    // failures retain acknowledgement when an already-open alert is deduplicated.
+    return kind !== 'overlay-main-sync-parked' || result.lines.length > 0;
   } catch { return false; /* The caller may retry without interrupting sync or local diagnostics. */ }
 }
-function needsYou(root, env, ref, error, io = fs, localAlerted = false) {
+function needsYou(root, env, ref, error, io = fs, localAlerted = false, parkedTip) {
   const detail = { ref, reason: String(error?.message ?? error).replace(/[\x00-\x1f\x7f]/g, '').slice(0, 1000) };
-  const published = publishNeedsYou(root, env, ref, 'overlay-main-sync-needs-you', detail.reason);
+  // Feed delivery must remain independent of local diagnostic availability.
+  const published = parkedTip
+    ? publishNeedsYou(root, env, ref, 'overlay-main-sync-parked', detail.reason, { head: `${ref}@${parkedTip}` })
+    : publishNeedsYou(root, env, ref, 'overlay-main-sync-needs-you', detail.reason);
   const file = alertsFilePath(root, env);
   if (!localAlerted) {
-    io.mkdirSync(dirname(file), { recursive: true });
-    io.appendFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), kind: 'overlay-main-sync-needs-you', detail })}\n`);
+    try {
+      io.mkdirSync(dirname(file), { recursive: true });
+      io.appendFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), kind: 'overlay-main-sync-needs-you', detail })}\n`);
+    } catch (error) {
+      // A delivered park alert can be acknowledged even if its local copy failed.
+      // Retain ordinary-failure fallback and retry undelivered park alerts.
+      if (!parkedTip || !published) throw error;
+    }
   }
   return published;
 }
@@ -277,11 +288,11 @@ function failureAlert(root, env, ref, error, io = fs, immediate = false) {
       // streak rather than restarting the two-hour clock during fallback.
       pendingStreak = { firstFailureAt: { [ref]: state.firstFailureAt[ref] },
         failureReason: { [ref]: state.failureReason[ref] },
-        failureLocalAlertedAt: state.failureLocalAlertedAt };
+        failureLocalAlertedAt: state.failureLocalAlertedAt, parkedTip: state.parkedTip };
       // Publication failure is pending delivery, not a state-storage failure:
       // persist the streak without acknowledging it or replaying the local alert in fallback.
       const published = needsYou(root, env, ref, state.failureReason[ref] ?? 'Overlay main sync failed; original error reason unavailable',
-        io, Object.hasOwn(state.failureLocalAlertedAt, ref));
+        io, Object.hasOwn(state.failureLocalAlertedAt, ref), state.parkedTip?.[ref]);
       if (!published) {
         state.failureLocalAlertedAt[ref] ??= at;
         return;

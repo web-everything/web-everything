@@ -102,7 +102,8 @@ export async function scenario(retryPath, implementation = sync) {
     unlinkSync(blocker);
     await retry();
     const delivered = replay({ path: env.WE_NEEDS_YOU_FEED });
-    if (delivered.length !== 1 || delivered[0]?.kind !== 'overlay-main-sync-needs-you'
+    if (delivered.length !== 1 || delivered[0]?.kind !== 'overlay-main-sync-parked'
+      || delivered[0]?.head !== `${ref}@${tip}`
       || delivered[0]?.ref !== ref || delivered[0]?.pr !== 123
       || !delivered[0]?.reason.includes('parked after 3 failures')) violations.push('recovered feed did not receive exactly one NEEDS-YOU for the parked overlay');
     const acknowledgedAt = state().failureAlertedAt[ref];
