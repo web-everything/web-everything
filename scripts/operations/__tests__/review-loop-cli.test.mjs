@@ -36,7 +36,7 @@ import { fileItemOperation } from '../file-item.mjs';
 import { REVIEW_EFFECTS, reviewPrOperation } from '../review-pr.mjs';
 import { buildPreventionFilingInput, buildRoundCardsFilingInput, roundCardsFindingsFingerprint, postAcceptAdvisoryShadowReport } from '../../lib/review-loop-policy.mjs';
 import {
-  runReviewLoopCliOnce, defaultFindResumableRun, RESUME_MAX_ATTEMPTS, applyUnattendedActorDefault, buildFileItemArgv, fileItemForPrevention, fileItemForPreventionViaLandingJob,
+  runReviewLoopCliOnce, createReviewPassPrReader, defaultFindResumableRun, RESUME_MAX_ATTEMPTS, applyUnattendedActorDefault, buildFileItemArgv, fileItemForPrevention, fileItemForPreventionViaLandingJob,
   findFiledPreventionCard, findFiledRoundCardsCard, findRetainedRoundCardsReceipt, QUEUED_RECEIPT_TTL_MS, retainedRoundCardsReceipt,
   runReviewLoopOnce as driveReviewLoopOnceRaw, UNATTENDED_REVIEW_ACTOR,
 } from '../review-loop-cli.mjs';
@@ -2122,5 +2122,145 @@ describe('CI-held record driver resume', () => {
     expect(out.lines.join(' ')).toContain('UNKNOWN');
     expect(f.publishGate).toHaveBeenCalledTimes(checks);
     expect(f.runNode).not.toHaveBeenCalled();
+  });
+});
+
+describe('review pass PR metadata snapshot', () => {
+  it('caches resume reads per repo/PR and uses exactly one fresh pr view per acceptance read', () => {
+    let head = HEAD_A;
+    const exec = vi.fn(() => JSON.stringify({ headRefOid: head, body: 'body', createdAt: 'date' }));
+    const readComments = vi.fn(() => [{ body: `thread-${readComments.mock.calls.length}` }]);
+    const input = { repo: 'owner/repo', pr: 7 };
+    for (const expectedHead of [HEAD_A, HEAD_B]) {
+      head = expectedHead;
+      const readPr = createReviewPassPrReader({ exec, readComments });
+      const views = () => exec.mock.calls.filter(([, args]) => args[0] === 'pr' && args[1] === 'view').length;
+      const before = views();
+      expect(defaultFindResumableRun(input, { readPr, readRuns: () => [] })).toBeNull();
+      expect(readPr(input)).toMatchObject({ headRefOid: expectedHead });
+      expect(readPr(input, { refreshHead: true })).toMatchObject({ headRefOid: expectedHead, body: 'body', createdAt: 'date' });
+      expect(readPr(input, { refreshHead: true }).comments).toEqual([{ body: `thread-${readComments.mock.calls.length}` }]);
+      // Acceptance needs fresh author stamps as well as the head; only resume reads share the cache.
+      expect(views() - before).toBe(3);
+      readPr({ ...input, repo: 'another/repo' });
+      readPr({ ...input, pr: 8 });
+      expect(views() - before).toBe(5);
+    }
+    expect(readComments).toHaveBeenCalledTimes(12);
+    expect(exec.mock.calls.filter(([, args]) => args[0] === 'api')).toHaveLength(0);
+    expect(exec.mock.calls[0][1]).toContain('headRefOid,body,createdAt');
+  });
+
+  it('acceptance sees an author-stamp body edit made after the resume read', () => {
+    let body = 'original author stamp';
+    const exec = vi.fn(() => JSON.stringify({ headRefOid: HEAD_A, body, createdAt: 'date' }));
+    const readPr = createReviewPassPrReader({ exec, readComments: () => [] });
+    const input = { repo: 'owner/repo', pr: 7 };
+    expect(readPr(input).body).toBe(body);
+    body = 'changed author stamp';
+    expect(readPr(input, { refreshHead: true })).toMatchObject({ headRefOid: HEAD_A, body });
+    expect(readPr(input).body).toBe(body);
+    expect(exec).toHaveBeenCalledTimes(2);
+    expect(exec.mock.calls.every(([, args]) => args.at(-1) === 'headRefOid,body,createdAt')).toBe(true);
+  });
+
+  it('retains an unreadable metadata failure for the pass and retries on the next pass', () => {
+    const exec = vi.fn(() => { throw new Error('unreadable PR'); });
+    const readComments = vi.fn();
+    const input = { repo: 'owner/repo', pr: 7 };
+    const readPr = createReviewPassPrReader({ exec, readComments });
+    expect(defaultFindResumableRun(input, { readPr, readRuns: () => [] })).toBeNull();
+    expect(() => readPr(input)).toThrow('unreadable PR');
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(readComments).not.toHaveBeenCalled();
+    expect(() => createReviewPassPrReader({ exec, readComments })(input)).toThrow('unreadable PR');
+    expect(exec).toHaveBeenCalledTimes(2);
+  });
+});
+
+
+describe('acceptance refreshes the resume snapshot head', () => {
+  it.each(['pushed head', 'unreadable head', 'missing head'])(
+    'refuses acceptance after resume lookup when the remote has a %s', async scenario => {
+      let afterResume = false;
+      const exec = vi.fn((_cmd, args) => {
+        expect(args).toEqual(['pr', 'view', '1234', '--repo', 'web-everything/web-everything', '--json', 'headRefOid,body,createdAt']);
+        if (afterResume && scenario === 'unreadable head') throw new Error('head read failed');
+        const headRefOid = !afterResume ? HEAD_A : scenario === 'missing head' ? null : HEAD_B;
+        return JSON.stringify({ headRefOid, body: '', createdAt: '' });
+      });
+      const readComments = vi.fn(() => []);
+      const readResumePr = createReviewPassPrReader({ exec, readComments });
+      const { declaration, registry } = registryFor({ rev: HEAD_A });
+      const seen = [];
+      const fileItem = vi.fn();
+      const out = await driveReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+        store: createMemoryRunStore(), sinks: recordingSinks(seen), readResumePr,
+        findResumableRun: input => {
+          expect(defaultFindResumableRun(input, { readPr: readResumePr, readRuns: () => [] })).toBeNull();
+          afterResume = true; // The fresh acceptance view must observe evidence after the resume read.
+          return null;
+        },
+        makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: () => `snapshot-${scenario.replaceAll(' ', '-')}`, fileItem,
+      });
+      expect(out.stopped).toBe('confirm');
+      expect(out.run.findings.confirm).toBeUndefined();
+      expect(seen.some(effect => effect.type === REVIEW_EFFECTS.LABEL)).toBe(false);
+      expect(fileItem).not.toHaveBeenCalled();
+      expect(out.lines.join('\n')).toContain(scenario === 'pushed head'
+        ? 'live head does not match the reviewed head' : 'live referrals unavailable');
+      // One resume view, then fresh views for auto-confirm and the parked-outcome refusal.
+      expect(exec.mock.calls.filter(([, args]) => args[0] === 'pr' && args[1] === 'view')).toHaveLength(3);
+      expect(exec.mock.calls.filter(([, args]) => args[0] === 'api')).toHaveLength(0);
+      expect(readComments.mock.calls.length).toBeGreaterThan(1);
+    },
+  );
+
+  it.each(['unchanged', 'changed'])('uses the fresh %s author body to authorize referral clearance', async scenario => {
+    const original = { file: NET_PATHS[0], line: 7, summary: 'launch guard missing', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+    const seat = 'judge';
+    const key = referralFindingKey(seat, original);
+    const reviewer = mandatoryReferralReviewer('snapshot-body-referral');
+    const authorBody = '<!-- authored-by-actor: author -->';
+    const record = { version: 1, repo: 'web-everything/web-everything', pr: 1234, head: HEAD_A,
+      runId: 'snapshot-body-referral', reviewer, authorBody, attempted: true,
+      referrals: [{ key, seat, original, finding: normalizeFinding(original) }],
+      rulings: [{ id: 'clearance', key, reviewerId: reviewer.id, lens: 'correctness', result: 'not-real',
+        rationale: 'Verified against the pinned diff', evidence: ['diff:launch-guard'] }],
+    };
+    let body = authorBody;
+    const exec = vi.fn((_cmd, args) => {
+      expect(args).toEqual(['pr', 'view', '1234', '--repo', record.repo, '--json', 'headRefOid,body,createdAt']);
+      return JSON.stringify({ headRefOid: HEAD_A, body, createdAt: '' });
+    });
+    const readComments = vi.fn(() => [{ body: renderReferralRecord(record), author: { login: 'web-everything' } }]);
+    const readResumePr = createReviewPassPrReader({ exec, readComments });
+    const { declaration, registry } = registryFor({ rev: HEAD_A });
+    const seen = [];
+    const fileItem = vi.fn();
+    const out = await driveReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+      store: createMemoryRunStore(), sinks: recordingSinks(seen), readResumePr,
+      findResumableRun: input => {
+        expect(defaultFindResumableRun(input, { readPr: readResumePr, readRuns: () => [] })).toBeNull();
+        if (scenario === 'changed') body = `<!-- authored-by-actor: ${reviewer.id} -->`;
+        return null;
+      },
+      makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: () => `snapshot-body-${scenario}`, fileItem,
+    });
+    if (scenario === 'changed') {
+      expect(out.stopped).toBe('confirm');
+      expect(out.run.findings.confirm).toBeUndefined();
+      expect(seen.some(effect => effect.type === REVIEW_EFFECTS.LABEL)).toBe(false);
+      expect(out.lines.join('\n')).toContain('mandatory referrals remain open on the live head');
+    } else {
+      expect(out.stopped).toBe('complete');
+      expect(out.run.findings.confirm).toBe('accept');
+      expect(seen.some(effect => effect.type === REVIEW_EFFECTS.LABEL)).toBe(true);
+    }
+    expect(fileItem).not.toHaveBeenCalled();
+    // A refusal rechecks acceptance when rendering the parked outcome; a successful accept does not.
+    const reads = scenario === 'changed' ? 3 : 2;
+    expect(exec).toHaveBeenCalledTimes(reads);
+    expect(readComments).toHaveBeenCalledTimes(reads);
   });
 });
