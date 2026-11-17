@@ -5,6 +5,7 @@ import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, wr
 import { tmpdir } from 'node:os';
 import { spawn, execFileSync } from 'node:child_process';
 import { once } from 'node:events';
+import { liveHolderContention, markerCreationFailure } from '../../conveyor/soak/breaks/host-handoff-cache-write-race.mjs';
 import {
   FRESH_READ_MS, CACHE_MAX_AGE_MS, CLOCK_SKEW_MS, OWNER_REF, OWNER_FILE,
   defaultCachePath, getThisHost, decideHostRole, readOwnerRemote, resolveHostRole,
@@ -754,6 +755,36 @@ describe('failed-read throttling', () => {
 });
 
 describe('cache file IO and gh transport', () => {
+  it.each(['ENOSPC', 'EACCES'])('live holder cannot erase denial after marker creation throws %s', async (code) => {
+    expect((await liveHolderContention(code)).violations).toEqual([]);
+  }, 15000);
+
+  it.each(['ENOSPC', 'EACCES'])('revocation survives a holder already releasing its empty lock (%s)', async (code) => {
+    expect((await liveHolderContention(code, { phase: 'cleanup' })).violations).toEqual([]);
+  }, 15000);
+
+  it.each(['publish', 'cleanup'])('holder %s errors cannot bypass concurrent revocation', async (phase) => {
+    expect((await liveHolderContention('ENOSPC', { phase, holderFails: true })).violations).toEqual([]);
+  }, 15000);
+
+  it.each(['ENOSPC', 'EACCES'])('failed handoff invalidation also reports marker denial (%s)', async (code) => {
+    expect((await liveHolderContention(code, { invalidate: true })).violations).toEqual([]);
+  }, 15000);
+
+  it.each(['ENOSPC', 'EACCES'])('retained lock denies fresh activation when marker creation throws', (code) => {
+    expect(markerCreationFailure(code)).toEqual({
+      decision: { role: 'standby', reason: 'fence-unenforceable', source: 'remote' },
+      failures: 1, reads: 1, lockExists: true, markerExists: false,
+    });
+  });
+
+  it.each(['ENOSPC', 'EACCES'])('optional cache persistence failure still allows fresh activation (%s)', (code) => {
+    expect(markerCreationFailure(code, { retainedLock: false })).toEqual({
+      decision: { role: 'active', reason: 'fresh-owner-is-this-host', source: 'remote' },
+      failures: 1, reads: 1, lockExists: false, markerExists: false,
+    });
+  });
+
   it.each([
     ['other', OTHER, 0], ['other', OTHER, 1], ['unset', '', 0], ['unset', '', 1],
   ])('failed %s handoff retains evidence against a delayed response (owner %s, delta %s)', async (_kind, owner, delta) => {
@@ -898,7 +929,7 @@ describe('cache file IO and gh transport', () => {
       expect((await oldExit)[0]).toBe(0);
       expect((await newerExit)[0]).toBe(0);
       expect(readCacheFile(path).owner).toBe(OTHER);
-      expect(readdirSync(root).sort()).toEqual(['cache.json', 'release']);
+      expect(readdirSync(root).sort()).toEqual(['cache.json', 'cache.json.lock.fence', 'release']);
     } finally {
       old.kill(); newer?.kill();
       rmSync(root, { recursive: true, force: true });
@@ -927,7 +958,7 @@ describe('cache file IO and gh transport', () => {
       writeCacheFile(handoff, path);
       expect(writeCacheFile(cache({ readAt: NOW, writtenAt: NOW }), path)).toBe(false);
       expect(readCacheFile(path)).toEqual(handoff);
-      expect(readdirSync(root)).toEqual(['cache.json']);
+      expect(readdirSync(root).sort()).toEqual(['cache.json', 'cache.json.lock.fence']);
       writeCacheFile(cache({ readAt: NOW + delta + 1, writtenAt: NOW + delta + 1 }), path);
       expect(readCacheFile(path).owner).toBe(ME);
     } finally { rmSync(root, { recursive: true, force: true }); }
@@ -944,7 +975,7 @@ describe('cache file IO and gh transport', () => {
       writeCacheFile(cache({ owner: OTHER }), path);
       expect(readCacheFile(path)).toEqual(cache({ owner: OTHER }));
       expect(statSync(path).mode & 0o777).toBe(0o600);
-      expect(readdirSync(join(path, '..'))).toEqual(['cache.json']);
+      expect(readdirSync(join(path, '..')).sort()).toEqual(['cache.json', 'cache.json.lock.fence']);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -957,7 +988,7 @@ describe('cache file IO and gh transport', () => {
       expect(() => writeCacheFile(cache(), path)).toThrow();
       expect(statSync(path).isDirectory()).toBe(true);
       expect(readFileSync(join(path, 'sentinel'), 'utf8')).toBe('unchanged');
-      expect(readdirSync(root)).toEqual(['cache.json']);
+      expect(readdirSync(root).sort()).toEqual(['cache.json', 'cache.json.lock.fence']);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 

@@ -13,33 +13,76 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-/** A live holder resumes after the contender's one-second deadline. */
-export async function liveHolderContention() {
+/** Inject filesystem errors in a child so builtin patches cannot leak to other tests. */
+export function markerCreationFailure(code, { retainedLock = true } = {}) {
   const root = process.env.SOAK_TREE_ROOT || fileURLToPath(new URL('../../../../', import.meta.url));
   const moduleUrl = pathToFileURL(join(root, 'scripts/lib/daemon-host-guard.mjs')).href;
-  const { readCacheFile, resolveHostRole, writeCacheFile } = await import(moduleUrl);
+  const dir = mkdtempSync(join(tmpdir(), 'host-marker-failure-'));
+  const path = join(dir, 'cache.json');
+  try {
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      const path = ${JSON.stringify(path)};
+      const retainedLock = ${JSON.stringify(retainedLock)};
+      if (retainedLock) fs.mkdirSync(path + '.lock');
+      const write = fs.writeFileSync;
+      let failures = 0;
+      fs.writeFileSync = (target, ...args) => {
+        if (target === path + '.lock/blocked' || (!retainedLock && target.endsWith('.tmp')
+          && !target.startsWith(path + '.lock.fence.'))) {
+          failures += 1;
+          throw Object.assign(new Error('injected filesystem failure'), { code: ${JSON.stringify(code)} });
+        }
+        return write(target, ...args);
+      };
+      syncBuiltinESMExports();
+      const { resolveHostRole, readCacheFile, writeCacheFile, invalidateCacheFile } = await import(${JSON.stringify(moduleUrl)});
+      let reads = 0;
+      const decision = await resolveHostRole({ thisHost: 'a', now: 1800000000000, atStart: true, state: {},
+        readCache: () => readCacheFile(path), writeCache: (value) => writeCacheFile(value, path),
+        invalidateCache: (value) => invalidateCacheFile(path, value),
+        readRemote: () => { reads += 1; return { status: 'ok', owner: 'a' }; } });
+      process.stdout.write(JSON.stringify({ decision, failures, reads,
+        lockExists: fs.existsSync(path + '.lock'), markerExists: fs.existsSync(path + '.lock/blocked') }));
+    `], { timeout: 5000, maxBuffer: 1024 * 1024, encoding: 'utf8' });
+    if (child.status !== 0) throw new Error(`fault injection failed: ${child.error ?? child.stderr}`);
+    return JSON.parse(child.stdout);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+/** A live holder resumes after the contender's one-second deadline. */
+export async function liveHolderContention(markerError, { phase = 'publish', holderFails = false, invalidate = false } = {}) {
+  const root = process.env.SOAK_TREE_ROOT || fileURLToPath(new URL('../../../../', import.meta.url));
+  const moduleUrl = pathToFileURL(join(root, 'scripts/lib/daemon-host-guard.mjs')).href;
+  const { readCacheFile, resolveHostRole, writeCacheFile, invalidateCacheFile } = await import(moduleUrl);
   const { cliIO } = await import(pathToFileURL(join(root, 'scripts/operations/daemon-preflight.mjs')).href);
   const home = mkdtempSync(join(tmpdir(), 'host-live-holder-'));
   const path = join(home, '.claude', 'daemon-host-guard', 'cache.json');
   const release = join(home, 'release');
   const now = 1_800_000_000_000;
-  const record = { host: 'a', owner: 'a', status: 'ok', readAt: now, writtenAt: now };
   const violations = [];
   const holder = spawn(process.execPath, ['--input-type=module', '-e', `
     import fs from 'node:fs'; import { syncBuiltinESMExports } from 'node:module';
-    const rename = fs.renameSync;
-    fs.renameSync = (...args) => {
+    const operation = ${JSON.stringify(phase === 'cleanup' ? 'rmdirSync' : 'renameSync')};
+    const original = fs[operation];
+    fs[operation] = (...args) => {
       process.send('paused'); const deadline = Date.now() + 8000;
       while (!fs.existsSync(${JSON.stringify(release)})) {
         if (Date.now() > deadline) throw new Error('release timeout');
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
       }
-      return rename(...args);
+      if (${holderFails}) throw Object.assign(new Error('holder failure after revocation'), { code: 'EACCES' });
+      return original(...args);
     };
     syncBuiltinESMExports();
-    const { writeCacheFile } = await import(${JSON.stringify(moduleUrl)});
-    const result = writeCacheFile(${JSON.stringify(record)}, ${JSON.stringify(path)});
-    process.exitCode = result === false ? 0 : 2;
+    const { resolveHostRole, readCacheFile, writeCacheFile, invalidateCacheFile } = await import(${JSON.stringify(moduleUrl)});
+    const path = ${JSON.stringify(path)};
+    const decision = await resolveHostRole({ thisHost: 'a', now: ${now}, atStart: true, state: {},
+      readCache: () => readCacheFile(path), writeCache: (value) => writeCacheFile(value, path),
+      invalidateCache: (value) => invalidateCacheFile(path, value),
+      readRemote: () => ({ status: 'ok', owner: 'a' }) });
+    process.exitCode = decision.role === 'standby' ? 0 : 2;
   `], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
   const exited = once(holder, 'exit');
   try {
@@ -47,23 +90,59 @@ export async function liveHolderContention() {
     // Wait for the contender to actually fence the holder, rather than relying
     // on scheduler timing or releasing before the one-second deadline.
     const contender = spawnSync(process.execPath, ['--input-type=module', '-e', `
-      import { writeCacheFile } from ${JSON.stringify(moduleUrl)};
-      const result = writeCacheFile(${JSON.stringify({ ...record, owner: 'b', readAt: now + 1 })}, ${JSON.stringify(path)});
-      process.exitCode = result === false ? 0 : 2;
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      const path = ${JSON.stringify(path)};
+      const markerError = ${JSON.stringify(markerError ?? null)};
+      let failures = 0;
+      const write = fs.writeFileSync;
+      fs.writeFileSync = (target, ...args) => {
+        if (markerError && target === path + '.lock/blocked') {
+          failures += 1;
+          throw Object.assign(new Error('injected marker failure'), { code: markerError });
+        }
+        return write(target, ...args);
+      };
+      syncBuiltinESMExports();
+      const { resolveHostRole, readCacheFile, writeCacheFile, invalidateCacheFile } = await import(${JSON.stringify(moduleUrl)});
+      const state = {};
+      const decision = await resolveHostRole({ thisHost: 'a', now: ${now + 1}, atStart: true, state,
+        readCache: () => readCacheFile(path), writeCache: (value) => {
+          if (${invalidate}) throw new Error('handoff persistence failed');
+          return writeCacheFile(value, path);
+        },
+        invalidateCache: (value) => invalidateCacheFile(path, value),
+        readRemote: () => ({ status: 'ok', owner: 'b' }) });
+      process.stdout.write(JSON.stringify({ decision, failures, poisoned: state.hosts.get('a').cacheInvalidated }));
     `], { timeout: 5000, maxBuffer: 1024 * 1024, encoding: 'utf8' });
-    if (contender.status !== 0 || !existsSync(join(`${path}.lock`, 'blocked'))) {
+    if (contender.status !== 0) throw new Error(`contender failed: ${contender.error ?? contender.stderr}`);
+    const result = JSON.parse(contender.stdout);
+    if (markerError && (result.failures < 1 || result.decision.reason !== 'fence-unenforceable' || !result.poisoned)) {
+      violations.push(`marker ${markerError} denial was not observable and poisoned: ${contender.stdout}`);
+    }
+    if (!markerError && !existsSync(join(`${path}.lock`, 'blocked'))) {
       violations.push('live holder was not fenced after bounded contention');
     }
     writeFileSync(release, '');
     const [code] = await exited;
-    if (code !== 0 || JSON.parse(readFileSync(path, 'utf8')).owner !== 'a') {
-      violations.push('live holder did not complete its rename and report the retained fence');
+    if (code !== 0 || (!holderFails && JSON.parse(readFileSync(path, 'utf8')).owner !== 'a')) {
+      violations.push('live holder did not report denial after completing or failing publication');
+    }
+    if (phase === 'cleanup' && !holderFails && existsSync(`${path}.lock`)) {
+      violations.push('cleanup race did not remove the ordinary lock');
     }
     let denied = false;
     try { readCacheFile(path); } catch { denied = true; }
     if (!denied) violations.push('resumed live holder left usable stale cache evidence');
+    const independent = await resolveHostRole({ thisHost: 'a', now: now + 60_002, state: {},
+      readCache: () => readCacheFile(path), writeCache: (value) => writeCacheFile(value, path),
+      readRemote: () => ({ status: 'error' }) });
+    if (independent.role !== 'standby') {
+      violations.push(`independent guard reactivated after marker ${markerError ?? 'success'}: ${JSON.stringify(independent)}`);
+    }
     const decision = await resolveHostRole({ thisHost: 'a', now: now + 2, atStart: true, state: {},
       readCache: () => readCacheFile(path), writeCache: (value) => writeCacheFile(value, path),
+      invalidateCache: (value) => invalidateCacheFile(path, value),
       readRemote: () => ({ status: 'ok', owner: 'a' }) });
     if (decision.role !== 'standby') violations.push('retained lock allowed ownership before operator recovery');
     const diagnostic = cliIO({ HOME: home }).cacheLock?.();
@@ -90,7 +169,7 @@ export default {
     const script = `import b from ${JSON.stringify(pathToFileURL(fileURLToPath(import.meta.url)).href)};
       const report = await b.run(); process.exitCode = b.judge(report).length ? 1 : 0;`;
     return spawnSync(process.execPath, ['--input-type=module', '-e', script], {
-      env: { ...process.env, SOAK_TREE_ROOT: root }, encoding: 'utf8', timeout: 10_000,
+      env: { ...process.env, SOAK_TREE_ROOT: root }, encoding: 'utf8', timeout: 20_000,
       maxBuffer: 1024 * 1024,
     }).status === 0;
   },
@@ -240,6 +319,16 @@ export default {
         }
       } finally { old.kill(); newer?.kill(); }
       violations.push(...(await liveHolderContention()).violations);
+      for (const code of ['ENOSPC', 'EACCES']) {
+        for (const options of [{}, { phase: 'cleanup' }, { holderFails: true }, { phase: 'cleanup', holderFails: true }, { invalidate: true }]) {
+          violations.push(...(await liveHolderContention(code, options)).violations);
+        }
+        const result = markerCreationFailure(code);
+        if (result.failures !== 1 || result.reads !== 1 || result.decision.role !== 'standby'
+          || !result.lockExists || result.markerExists) {
+          violations.push(`retained lock allowed fresh activation when marker creation throws ${code}`);
+        }
+      }
       return { violations };
     } finally { rmSync(dir, { recursive: true, force: true }); }
   },
