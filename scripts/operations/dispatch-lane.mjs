@@ -795,6 +795,9 @@ export function dispatchStillHolds(entry, at, {
 
   // THE AGENT IS ALIVE. No clock, at any age. This is the branch the round-2 fix did not have.
   if (entry?.live === true) return true;
+  // A partial store read cannot prove ownership gone, regardless of the dispatch's age.
+  // Repair discovery and obtain a complete absence read before releasing this hold.
+  if (entry?.live == null && entry?.livenessSource === 'partial') return true;
 
   // THE AGENT IS GONE from a listing that WAS read. Nothing can collide with a session that does not exist, so
   // the hold ends as soon as the record is too old for "absent" to mean "not listed yet".
@@ -831,7 +834,7 @@ export function dispatchStillHolds(entry, at, {
  * cannot degrade the same way, so it must be named rather than collapsing into `unknown` (which would make the
  * guard look weaker than it is) or `claude-agents` (which would claim a listing that was never read).
  */
-export const LIVENESS_SOURCES = Object.freeze(['claude-agents', 'unreadable', 'not-needed', 'wrapper-pid']);
+export const LIVENESS_SOURCES = Object.freeze(['claude-agents', 'partial', 'unreadable', 'not-needed', 'wrapper-pid']);
 
 /** A launch/suppression row from the tick core, or null. Shape-checked, never trusted blind. */
 function shapeRow(row, what) {

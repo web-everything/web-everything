@@ -74,16 +74,27 @@ describe('dispatch liveness table', () => {
     expect(result.runs[0].live).toBe(name === 'unknown' ? null : name === 'absent' ? false : true);
     if (name === 'unknown') expect(result.livenessSource).toBe('partial');
   });
-  it('partial preserves positive evidence and falls back to the clock for other handles', () => {
+  it('partial preserves positive evidence and holds unseen handles beyond the deadline until complete absence', () => {
     const now = '2026-11-17T12:00:00Z';
     const result = stampLiveness({ runs: [
-      { handle: sid }, { handle: 'bbbbbbbb', expectedBy: '2026-11-17T12:30:00Z' },
+      { handle: sid }, { handle: 'bbbbbbbb', startedAt: '2026-11-17T11:00:00Z', expectedBy: '2026-11-17T12:30:00Z' },
     ] }, { listAgents: listing(agg([row], 'unknown')) });
     expect(result.runs.map(r => r.live)).toEqual([true, null]);
     expect(result.livenessSource).toBe('partial');
     expect(dispatchStillHolds(result.runs[1], now)).toBe(true);
-    expect(dispatchStillHolds(result.runs[1], '2026-11-19T12:00:00Z')).toBe(false);
+    expect(result.runs[1].livenessSource).toBe('partial');
+    expect(dispatchStillHolds(result.runs[1], '2026-11-19T12:00:00Z')).toBe(true);
+    const absent = stampLiveness({ runs: result.runs }, { listAgents: () => [] });
+    expect(absent.runs[1].live).toBe(false);
+    expect(absent.runs[1].livenessSource).toBe('claude-agents');
+    expect(dispatchStillHolds(absent.runs[1], '2026-11-19T12:00:00Z')).toBe(false);
   });
+  it.each(['unreadable', 'unknown', 'claude-agents'])('%s null liveness retains its clock fallback', source => {
+    const entry = { live: null, livenessSource: source, expectedBy: '2026-11-17T12:30:00Z' };
+    expect(dispatchStillHolds(entry, '2026-11-17T12:00:00Z')).toBe(true);
+    expect(dispatchStillHolds(entry, '2026-11-19T12:00:00Z')).toBe(false);
+  });
+
 });
 
 describe('inspection counting table', () => {
