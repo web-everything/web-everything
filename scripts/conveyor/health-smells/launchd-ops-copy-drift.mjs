@@ -24,6 +24,7 @@ const WRAPPER_RE = /^(?:env|nice|nohup|caffeinate|arch|exec|time|timeout|sudo|co
 const NOISE_RE = /(^|\/)(__tests__|fixtures?|archive[ds]?|node_modules)\//;
 const DAY = 86_400_000;
 const sha = (buf) => createHash('sha256').update(buf).digest('hex');
+const ENV_SPLIT_RE = /^(?:--split-string(?:=|$)|-[^-=]*S)/;
 
 // Split a shell-ish command line into words (whitespace, single/double quotes, backslash).
 // Returns null for unbalanced quotes or a trailing escape: the caller must treat that as unverifiable.
@@ -65,8 +66,12 @@ function expandEnvSplitStrings(argv) {
         const rest = a.slice(a.indexOf('S') + 1);
         text = rest === '' ? argv[++i] : rest;
       } else { out.push(a); continue; }
-      const words = typeof text === 'string' ? splitWords(text) : null;
-      if (!words) return null;
+      // env's escapes (e.g. \_), variable expansion and comment syntax are not shell
+      // quoting. Keep unsupported syntax unverified instead of comparing a guessed path.
+      if (typeof text !== 'string' || /[\\$#]|[^\S\t\n\r\v\f ]/.test(text)) return null;
+      const words = splitWords(text);
+      // Nested split options require another env parse; an empty split supplies no command.
+      if (!words?.[0] || words.some((word) => ENV_SPLIT_RE.test(word))) return null;
       out.push(...words);
       continue;
     }
@@ -102,7 +107,9 @@ export function scanLaunchdOpsCopyDrift(d) {
     const executable = typeof program === 'string' ? basename(program) : '';
     // `env -S <string>` splits one argument into a command line; inspect the real tokens, and
     // fail closed (unverified) when the string cannot be split with certainty.
-    const expanded = executable === 'env' ? expandEnvSplitStrings(plistArgv) : plistArgv;
+    const wrappedEnv = WRAPPER_RE.test(executable) && plistArgv.some((a, i) =>
+      i > 0 && typeof a === 'string' && basename(a) === 'env');
+    const expanded = executable === 'env' || wrappedEnv ? expandEnvSplitStrings(plistArgv) : plistArgv;
     if (!expanded) {
       findings.push({ severity: 'low', label, note: 'shell command cannot be verified; drift not checked' });
       continue;

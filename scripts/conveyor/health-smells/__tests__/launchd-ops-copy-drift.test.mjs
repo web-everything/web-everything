@@ -171,6 +171,36 @@ describe('fail closed', () => {
     }
   });
 
+  it.each([
+    ['/usr/bin/env', '-S', String.raw`sh\_-c\_'node "$SCRIPT"'`],
+    ['/usr/bin/env', '-S', '${SHELL} -c \'node "$SCRIPT"\''],
+    ['/usr/bin/env', '-S', '-S "sh -c \'node $SCRIPT\'"'],
+    ['/usr/bin/env', '-S', '-S "sh -c true"'],
+    ['/usr/bin/env', '-S', 'sh\u00a0-c true'],
+    ['/usr/bin/env', '-S', '# cannot determine command'],
+    ['/usr/bin/nohup', '/usr/bin/env', '-S', 'sh -c \'node "$SCRIPT"\''],
+    ['/usr/bin/env', '-S', ''],
+    ['/usr/bin/env', '-S', '""'],
+    ['/usr/bin/env', '-S'],
+  ])('uncertain env split commands retain persisted episodes: %j', (...argv) => {
+    let d = deps({ fn: { hashCopy: () => 'old' } });
+    const descriptor = { ...smell, evaluate: (p, ctx) => smell.evaluate(p, { ...ctx, scan: () => scanLaunchdOpsCopyDrift(d) }) };
+    let state = emptyHealthState();
+    let now = 0;
+    const tick = () => { const r = runHealthTick(state, {}, [descriptor], ++now * 1000); state = r.state; return r; };
+    tick(); tick();
+    state = JSON.parse(JSON.stringify(state));
+    d = deps({ plists: { 'com.we.guard.plist': { Label: 'com.we.guard', ProgramArguments: argv } } });
+    expect(scanLaunchdOpsCopyDrift(d)).toMatchObject([{ label: 'com.we.guard', severity: 'low' }]);
+    for (let i = 0; i < 3; i++) {
+      expect(tick().transitions.some((t) => t.type === 'closed')).toBe(false);
+      expect(state.episodes[episodeKey(smell.id, 'com.we.guard')]).toMatchObject({ status: 'open', cleanStreak: 0 });
+    }
+    d = deps();
+    tick(); tick();
+    expect(state.episodes[episodeKey(smell.id, 'com.we.guard')]).toBeUndefined();
+  });
+
   describe('unclassifiable script jobs hold open episodes open, never open new ones', () => {
     const argvs = [
       ['/usr/bin/node', '-e', `require("${COPY}")`],
@@ -227,6 +257,11 @@ describe('fail closed', () => {
     const d = deps({ plists: { 'com.we.guard.plist': { Label: 'com.we.guard', Program: COPY, ProgramArguments: [COPY] } }, fn: { hashCopy: () => 'old' } });
     expect(scanLaunchdOpsCopyDrift(d)).toHaveLength(1);
     expect(smell.evaluate({}, { scan: () => [...scanLaunchdOpsCopyDrift(d), ...scanLaunchdOpsCopyDrift(d)] })).toHaveLength(1);
+    const descriptor = { ...smell, evaluate: (p, ctx) => smell.evaluate(p, { ...ctx, scan: () => scanLaunchdOpsCopyDrift(d) }) };
+    const key = episodeKey(smell.id, 'com.we.guard');
+    const first = runHealthTick(emptyHealthState(), {}, [descriptor], 1000);
+    expect(first.state.episodes[key]).toMatchObject({ status: 'pending' });
+    expect(runHealthTick(first.state, {}, [descriptor], 2000).state.episodes[key]).toMatchObject({ status: 'open' });
   });
 
   it('two drifted scripts in one job evaluate as one observation for the label', () => {
