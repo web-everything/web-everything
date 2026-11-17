@@ -171,6 +171,58 @@ describe('fail closed', () => {
     }
   });
 
+  describe('unclassifiable script jobs hold open episodes open, never open new ones', () => {
+    const argvs = [
+      ['/usr/bin/node', '-e', `require("${COPY}")`],
+      ['/usr/bin/node', `--import=${COPY}`],
+      ['node', 'ops/sync-guard-clone.mjs'], // relative, no WorkingDirectory
+    ];
+    const harness = () => {
+      let d = deps({ fn: { hashCopy: () => 'old' } });
+      const descriptor = { ...smell, evaluate: (p, ctx) => smell.evaluate(p, { ...ctx, scan: () => scanLaunchdOpsCopyDrift(d) }) };
+      let state = emptyHealthState();
+      let now = 0;
+      const tick = () => { const r = runHealthTick(state, {}, [descriptor], ++now * 1000); state = r.state; return r; };
+      return { tick, set: (next) => { d = next; }, ep: () => state.episodes[episodeKey(smell.id, 'com.we.guard')] };
+    };
+    const job = (ProgramArguments, extra = {}) => deps({ plists: { 'com.we.guard.plist': { Label: 'com.we.guard', ProgramArguments, ...extra } } });
+
+    it.each(argvs)('open episode stays open through production ticks: %j', (...argv) => {
+      const h = harness();
+      h.tick(); h.tick();
+      h.set(job(argv));
+      for (let i = 0; i < 3; i++) {
+        expect(h.tick().transitions.some((t) => t.type === 'closed')).toBe(false);
+        expect(h.ep()).toMatchObject({ status: 'open', cleanStreak: 0 });
+      }
+      expect(scanLaunchdOpsCopyDrift(job(argv))).toMatchObject([{ label: 'com.we.guard', severity: 'low', unclassified: true }]);
+    });
+
+    it.each(argvs)('with no open episode nothing is opened: %j', (...argv) => {
+      const h = harness();
+      h.set(job(argv));
+      for (let i = 0; i < 4; i++) h.tick();
+      expect(h.ep()).toBeUndefined();
+    });
+
+    it('repointing the job into a git checkout or a resolvable script lets the episode recover', () => {
+      for (const next of [deps({ fn: { inGitCheckout: () => true } }), deps({ plists: { 'com.we.guard.plist': { Label: 'com.we.guard', ProgramArguments: ['node', 'ops/sync-guard-clone.mjs'], WorkingDirectory: '/home/fixture' } } })]) {
+        const h = harness();
+        h.tick(); h.tick();
+        h.set(job(argvs[0]));
+        h.tick();
+        h.set(next);
+        h.tick(); h.tick();
+        expect(h.ep()).toBeUndefined();
+      }
+    });
+
+    it('plain binaries and non-script commands are not unclassified', () => {
+      expect(scanLaunchdOpsCopyDrift(job(['/usr/bin/ssh', '-N', 'host']))).toEqual([]);
+      expect(scanLaunchdOpsCopyDrift(job(['/usr/bin/python3', '/home/fixture/ops/x.py']))).toEqual([]);
+    });
+  });
+
   it('Program + ProgramArguments naming the same drifted script count once per tick', () => {
     const d = deps({ plists: { 'com.we.guard.plist': { Label: 'com.we.guard', Program: COPY, ProgramArguments: [COPY] } }, fn: { hashCopy: () => 'old' } });
     expect(scanLaunchdOpsCopyDrift(d)).toHaveLength(1);

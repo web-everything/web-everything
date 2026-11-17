@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 
 const LABEL_RE = /^com\.(we|plateau)\./;
 const SCRIPT_RE = /\.(mjs|js|cjs|sh)$/;
+const SCRIPT_TEXT_RE = /[\w@%+=:,.-]+\.(?:mjs|js|cjs|sh)\b/;
 const SHELL_RE = /^(?:sh|bash|dash|ash|zsh|ksh|fish|csh|tcsh)$/;
 // Launchers that run the next command: a shell after one of them is still a shell command line.
 const WRAPPER_RE = /^(?:env|nice|nohup|caffeinate|arch|exec|time|timeout|sudo|command|xcrun|stdbuf|setsid)$/;
@@ -119,8 +120,10 @@ export function scanLaunchdOpsCopyDrift(d) {
     }
     // Program and ProgramArguments often name the same script: check each distinct path once per job.
     const args = [...new Set(raw.filter((a) => typeof a === 'string').map((a) => (!a.startsWith('/') && wd && SCRIPT_RE.test(a) ? posix.join(wd, a) : a)))];
+    let resolvedScript = false;
     for (const arg of args) {
       if (!arg.startsWith('/') || !SCRIPT_RE.test(arg)) continue;
+      resolvedScript = true;
       try {
         if (d.inGitCheckout(arg)) continue;
         const all = d.repoFilesByBasename(basename(arg));
@@ -144,6 +147,12 @@ export function scanLaunchdOpsCopyDrift(d) {
       } catch {
         findings.push({ severity: 'low', label, copyPath: tilde(arg), note: 'could not compare copy with origin/main; drift not checked' });
       }
+    }
+    // The command names a script (`node -e require("…/x.mjs")`, `--import=…/x.mjs`, a relative path
+    // without WorkingDirectory) yet no script path could be resolved: the scan cannot classify it.
+    // evaluate() holds an already-open episode open for it and ignores it otherwise.
+    if (!resolvedScript && args.some((a) => SCRIPT_TEXT_RE.test(a))) {
+      findings.push({ severity: 'low', label, unclassified: true, note: 'job command not classified; drift not checked' });
     }
   }
   // Include clean-label evidence on incomplete results, preserving the array/CLI contract.
@@ -184,7 +193,10 @@ export default {
   id: 'launchd-ops-copy-drift', scope: 'host', cadence: 'every-tick', probes: [],
   openAfter: 2, closeAfter: 2, severity: 'medium', action: 'investigate',
   evaluate(_probes, ctx = {}) {
-    const findings = [...(ctx.scan ?? (() => scanLaunchdOpsCopyDrift(realDeps())))()];
+    const open = new Set(Object.values(ctx.episodes ?? {}).filter((ep) => ep.smell === 'launchd-ops-copy-drift').map((ep) => ep.subject));
+    // An unclassified job only holds an existing episode open; it never opens a new one.
+    const findings = [...(ctx.scan ?? (() => scanLaunchdOpsCopyDrift(realDeps())))()]
+      .filter((f) => !f.unclassified || open.has(f.label));
     if (findings.some((f) => f.coverageIncomplete)) {
       // Missing subjects normally count as clean. Carry persisted identities through incomplete scans,
       // including after watcher restarts. A readable, verified job can recover independently.
