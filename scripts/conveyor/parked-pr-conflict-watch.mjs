@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readLiveFixClaim } from './fix-procedure.mjs';
+import { readLiveFixClaimStrict } from './fix-procedure.mjs';
 import { isAcceptedConflictRebase, hasReconcileConflictRebaseFiles } from './accepted-conflict-rebase.mjs';
 import { buildConflictFindingBody, defaultPostConflictFinding } from '../lib/conflict-finding.mjs';
 export { buildConflictFindingBody, defaultPostConflictFinding };
@@ -1386,7 +1386,7 @@ export function watchParkedPrConflicts({
   listAgents = defaultListAgents,
   // Inject for hermetic callers; the live reader validates constellation repos and reads the claim store.
   // An unreadable claim must retain the hold below, never be treated as an absent claim.
-  readFixClaim = readLiveFixClaim,
+  readFixClaim = readLiveFixClaimStrict,
   now = Date.now(),
   queueScope = {},
   // Card xkugvzd — the declared setting (`conflict-reassert-settings.json`, env `WE_CONFLICT_REASSERT_REVIEW_HUMAN`).

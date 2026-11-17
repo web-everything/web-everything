@@ -243,16 +243,36 @@ const heartbeatFileFor = (owner) => `hb.${createHash('sha256').update(String(own
  *  has refreshed through {@link heartbeatOwn}, `heartbeatAt` is the later of the entry's and that file's. */
 export function readLockEntry(lockRoot, path) { return readEntryInDir(lockDirFor(lockRoot, path)); }
 
-function readEntryInDir(dir) {
+/** Strict readers distinguish a free resource from incomplete/unreadable claim evidence. */
+export function readLockEntryStrict(lockRoot, path) {
+  return readEntryInDir(lockDirFor(lockRoot, path), true);
+}
+
+function readEntryInDir(dir, strict = false) {
   const file = join(dir, 'lock.json');
-  if (!existsSync(file)) return null;
   let entry;
-  try { entry = parseLockEntry(readFileSync(file, 'utf8')); } catch { return null; }
-  if (!entry) return null;
+  try { entry = parseLockEntry(readFileSync(file, 'utf8')); } catch (e) {
+    if (!strict) return null;
+    if (e.code === 'ENOENT') {
+      // An existing lock dir without its entry may be a writer mid-acquisition.
+      try { statSync(dir); } catch (dirError) {
+        if (dirError.code === 'ENOENT') return null;
+        throw dirError;
+      }
+    }
+    throw e;
+  }
+  if (!entry || !Number.isFinite(Date.parse(entry.heartbeatAt))) {
+    if (strict) throw new Error('claim entry corrupt — retry next sweep');
+    return entry;
+  }
   try {
     const beat = readFileSync(join(dir, heartbeatFileFor(entry.owner)), 'utf8').trim();
+    if (strict && !Number.isFinite(Date.parse(beat))) throw new Error('claim heartbeat corrupt');
     if (Date.parse(beat) > Date.parse(entry.heartbeatAt)) entry.heartbeatAt = beat;
-  } catch { /* never refreshed through heartbeatOwn */ }
+  } catch (e) {
+    if (strict && e.code !== 'ENOENT') throw e;
+  }
   return entry;
 }
 

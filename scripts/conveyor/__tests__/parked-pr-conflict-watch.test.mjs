@@ -4,9 +4,11 @@
  * mirroring `we:scripts/conveyor/__tests__/review-status-tag.test.mjs`'s own shape.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { readFileSync, mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { lockDirFor } from '../../readiness/file-locks.mjs';
+import { fixDispatchResource, fixDispatchClaimRoot } from '../fix-claim-store.mjs';
 
 import {
   CONFLICT_LABEL,
@@ -2291,7 +2293,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
   it('a known main base now defers its accepted head to reconcile instead of bouncing after grace', () => {
     const routed = [];
     const listPrs = () => [{ number: 2514, mergeable: 'CONFLICTING', baseRefName: 'main', labels: L('review:accepted', CONFLICT_LABEL), files: [{ path: 'scripts/x.mjs' }] }];
-    const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down', readFixClaim: () => null,
       repo: 'o/n', listPrs, provider: fakeProvider(), postFinding: o => routed.push(o.pr.number), postStandDown: () => {},
       labelAgeMs: () => QUEUED_CONFLICT_GRACE_MS + 1000, listPrFiles: () => [{ path: 'scripts/x.mjs' }],
     });
@@ -3681,6 +3683,32 @@ describe('accepted conflict-rebase watch deferral', () => {
     expect(postFinding).not.toHaveBeenCalled();
     expect(postStandDown).not.toHaveBeenCalled();
   });
+  it.each(['corrupt', 'unreadable', 'incomplete', 'invalid heartbeat', 'absent', 'expired'])(
+    'uses the production claim reader for %s on-disk evidence', state => {
+      const root = mkdtempSync(join(tmpdir(), 'watch-claim-'));
+      const previous = process.env.WE_COORDINATION_ROOT;
+      process.env.WE_COORDINATION_ROOT = root;
+      try {
+        const dir = lockDirFor(fixDispatchClaimRoot(), fixDispatchResource({ repo: 'we', pr: 6911, kind: 'fixing' }));
+        if (state !== 'absent') mkdirSync(dir, { recursive: true });
+        if (state === 'corrupt') writeFileSync(join(dir, 'lock.json'), '{broken');
+        if (state === 'unreadable') mkdirSync(join(dir, 'lock.json')); // EISDIR, including privileged test runners
+        if (state === 'invalid heartbeat' || state === 'expired') writeFileSync(join(dir, 'lock.json'), JSON.stringify({
+          owner: 'fixer', heartbeatAt: state === 'expired' ? '2000-01-01T00:00:00Z' : 'invalid',
+        }));
+        const { result, postFinding, postStandDown } = acceptedWatch({ files: [{ path: 'scripts/example.mjs' }] }, {
+          repo: 'we', readFixClaim: undefined, // exercise the watcher's default production reader
+        });
+        expect(result[0].routedTo).toContain(['absent', 'expired'].includes(state)
+          ? 'deferred-to-reconcile' : 'held (fix claim unreadable — retry next sweep)');
+        expect(postFinding).not.toHaveBeenCalled();
+        expect(postStandDown).not.toHaveBeenCalled();
+      } finally {
+        if (previous === undefined) delete process.env.WE_COORDINATION_ROOT;
+        else process.env.WE_COORDINATION_ROOT = previous;
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
   it.each(['claim', 'files'])('fails closed when accepted routing %s evidence is unreadable', evidence => {
     const { result, postFinding, postStandDown } = acceptedWatch({ files: null }, {
       readFixClaim: () => { if (evidence === 'claim') throw new Error('unreadable'); return null; },

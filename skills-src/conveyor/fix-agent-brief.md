@@ -377,11 +377,13 @@ node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo=
 >
 > Only exit 0 (`trivial: true`) permits preserving every `review:*` label. The proof compares this
 > PR's own per-file patch against each head's merge-base, normalising hunk coordinates. In that case
-> push and use `conflict-fix-mark.mjs` with `--base-ref=<defaultBranch>` and
-> `--actor=accepted-conflict-rebase:<oldHead>@<newTarget>` (the dispatch receipt).
+> push and use `conflict-fix-mark.mjs {{PR_NUM}} --repo={{REPO}} --mode=conflict-rebase
+> --old-head=<oldHead> --old-base=<oldTarget> --base-ref=<defaultBranch>`. The hand-back
+> itself proves triviality against the live pushed head and base, refuses unknown evidence, and
+> generates a receipt bound to that new head (never pass the old-head dispatch receipt).
 > If the patches differ, or evidence is missing, binary, oversized or unreadable, independent review
 > is owed: push, then run `rearm-review.mjs {{PR_NUM}} --repo={{REPO}} --round=conflict --only-if=accepted
-> --actor=accepted-conflict-rebase:<oldHead>@<newTarget> --main-ref=<defaultBranch>` to return to
+> --actor=accepted-conflict-rebase:<newHead>@<newTarget> --main-ref=<defaultBranch>` to return to
 > `review:pending`. For a ready-to-merge PR with no review verdict, use `--only-if=missing
 > --expect-head=<newHead>` instead of `--only-if=accepted`. Never preserve acceptance on a semantic change. Use exactly one hand-back marker,
 > then `completion-cli.mjs report` and `fix-procedure.mjs fix-end` as above. If the live head or base

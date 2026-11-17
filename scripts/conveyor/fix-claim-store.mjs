@@ -10,7 +10,7 @@
 import { join } from 'node:path';
 import { readdirSync, readFileSync } from 'node:fs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
-import { readLockEntry, parseLockEntry, isLeaseExpired } from '../readiness/file-locks.mjs';
+import { readLockEntry, readLockEntryStrict, parseLockEntry, isLeaseExpired } from '../readiness/file-locks.mjs';
 import { mintSessionSlug } from './session-slug.mjs';
 
 /** How long an unreleased claim survives before a DIFFERENT owner may reclaim it (dead-holder floor). Chosen
@@ -54,6 +54,11 @@ export function readFixDispatchClaim({
 } = {}) {
   const resource = fixDispatchResource({ repo, pr, kind });
   return readLockEntry(lockRoot, resource);
+}
+
+/** Fail closed on corrupt/unreadable entries; only an absent lock directory is free. */
+export function readFixDispatchClaimStrict({ repo, pr, kind = 'fix', lockRoot = fixDispatchClaimRoot() } = {}) {
+  return readLockEntryStrict(lockRoot, fixDispatchResource({ repo, pr, kind }));
 }
 
 /** we:scripts/conveyor/fix-claim-store.mjs#fixDispatchSessionName — the SAME session name a real dispatch
