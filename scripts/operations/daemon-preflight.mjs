@@ -1,10 +1,10 @@
 /** Read-only host inspection; NOT yet wired into daemons. */
-import { accessSync, constants, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { accessSync, constants, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { dirname, delimiter, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { decideHostRole, getThisHost, readOwnerRemote } from '../lib/daemon-host-guard.mjs';
+import { decideHostRole, defaultCachePath as hostCachePath, getThisHost, readOwnerRemote } from '../lib/daemon-host-guard.mjs';
 import { DAEMON_CLONE_SEED, classifyOverlayRecord } from '../lib/daemon-clone-registry.mjs';
 import { defaultCachePath } from '../lib/github-app-auth-env.mjs';
 
@@ -28,6 +28,7 @@ export async function runPreflight({ thisHost, io, env = process.env, now = Date
       && result.source !== 'remote-failed' && !['invalid-input', 'owner-unreadable', 'start-requires-fresh-read', 'clock-skew'].includes(result.reason),
     detail: `role=${result?.role} reason=${result?.reason}` };
   });
+  await check('cache-lock', () => io.cacheLock());
   for (const tool of ['node', 'claude', 'gh', 'codex']) {
     await check(`tool:${tool}`, async () => ({ ok: await io.which(tool) === true, detail: tool }));
   }
@@ -99,14 +100,25 @@ function discoverCloneDirs(workspace, { env }) {
   }))];
 }
 
-export function cliIO(env = process.env, {
-  readOwnerRemote: readRemote = readOwnerRemote,
-  execFileSync: exec = execFileSync,
-  spawnSync: spawn = spawnSync,
-  daemonCloneRoots: cloneRoots = discoverCloneDirs,
-} = {}) {
+export function cliIO(env = process.env, options = {}) {
+  for (const key of Object.keys(options)) {
+    if (!['readOwnerRemote', 'execFileSync', 'spawnSync', 'daemonCloneRoots'].includes(key)) {
+      throw new TypeError(`unknown cliIO option: ${key}`);
+    }
+  }
+  const { readOwnerRemote: readRemote = readOwnerRemote, execFileSync: exec = execFileSync,
+    spawnSync: spawn = spawnSync, daemonCloneRoots: cloneRoots = discoverCloneDirs } = options;
   const checkout = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
   return {
+    cacheLock: () => {
+      const lock = `${hostCachePath(env.HOME || homedir())}.lock`;
+      try { lstatSync(lock); }
+      catch (error) {
+        if (error.code === 'ENOENT') return { ok: true, detail: 'no retained lock' };
+        throw error;
+      }
+      return { ok: false, detail: `${lock}: ownership fenced; stop all guard writers and inspect the holder, cache permissions and disk capacity; remove the lock only after repairing cache evidence, then restart with a fresh owner read` };
+    },
     resolveRole: async ({ thisHost, now }) => {
       let remote;
       try { remote = await readRemote(); } catch { /* Unreadable startup evidence fails closed. */ }

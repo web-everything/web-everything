@@ -3,7 +3,7 @@ import { describe, it, expect } from 'vitest';
 import { join } from 'node:path';
 import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { once } from 'node:events';
 import {
   FRESH_READ_MS, CACHE_MAX_AGE_MS, CLOCK_SKEW_MS, OWNER_REF, OWNER_FILE,
@@ -392,6 +392,21 @@ describe('readOwnerRemote', () => {
 });
 
 describe('getThisHost', () => {
+  it('default scutil exec is bounded to 15s and 1 MiB', () => {
+    // A native child exercises the default wrapper, rather than replacing it via exec.
+    const output = execFileSync(process.execPath, ['--input-type=module', '-e', `
+      import cp from 'node:child_process';
+      import { syncBuiltinESMExports } from 'node:module';
+      const calls = [];
+      cp.execFileSync = (...args) => { calls.push(args); return 'daemon-a'; };
+      syncBuiltinESMExports();
+      const { getThisHost } = await import(${JSON.stringify(new URL('../daemon-host-guard.mjs', import.meta.url).href)});
+      console.log(JSON.stringify({ host: getThisHost(), calls }));
+    `], { encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024 });
+    expect(JSON.parse(output)).toEqual({ host: ME, calls: [['scutil', ['--get', 'HostName'],
+      expect.objectContaining({ timeout: 15000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] })]] });
+  });
+
   it('uses trimmed scutil HostName before hostname fallback', () => {
     const calls = [];
     expect(getThisHost({
@@ -412,6 +427,22 @@ describe('getThisHost', () => {
 });
 
 describe('cache evidence with readAt (audit round 1)', () => {
+  it.each([undefined, null, '', 'error', 'failed', 'unset'])(
+    'cache with missing or unsuccessful status cannot activate: %j', (status) => {
+      const stored = cache({ status });
+      if (status === undefined) delete stored.status;
+      expect(decide({ cache: stored })).toEqual({ role: 'standby', reason: 'owner-unreadable' });
+    },
+  );
+
+  it.each(['host', 'owner', 'status', 'readAt', 'writtenAt'])(
+    'cache missing required field %s cannot activate with all other evidence valid', (field) => {
+      const stored = cache();
+      delete stored[field];
+      expect(decide({ cache: stored }).role).toBe('standby');
+    },
+  );
+
   it('rejects a cache whose readAt is older than ten minutes even if writtenAt is recent', () => {
     const now = 10_000_000;
     const out = decideHostRole({ thisHost: 'studio', owner: null, now,

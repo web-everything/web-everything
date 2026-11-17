@@ -29,7 +29,7 @@ PR #6945 repairs residual (1) with ordered handoff evidence and failed-read thro
 1. **Untrusted text** — Validate host names and canonical base64 owner contents; execute commands with argv and strip control characters from preflight output. No receive endpoint: CSRF/origin checks are n/a.
 2. **Truncated reads** — Bound child output to 1 MiB and execution to 15 seconds; failed commands, malformed JSON and incomplete cache evidence cannot establish ownership. Inspect the owner branch/cache and retry after repairing unreadable evidence.
 3. **Shared state files** — Replace cache atomically using a unique mode-0600 temporary file; remove temporary files on failure. After a failed non-me write, retain timestamped denial instead of deleting ordering evidence. If denial persistence fails under the cache lock, retain that lock as a fence until an operator repairs the cache. Keep in-memory poison as well. Older denial must advance to the failed handoff's timestamp; only a strictly newer ownership read can replace it.
-4. **Fail closed** — Startup requires fresh remote evidence; poisoned fallback is standby `cache-invalidated`. Unknown reads grant no ownership without valid bounded cache evidence. Preflight uses no cache IO and reports unreadable ownership as a failed check.
+4. **Fail closed** — Startup requires fresh remote evidence; poisoned fallback is standby `cache-invalidated`. Unknown reads grant no ownership without valid bounded cache evidence. Preflight resolves ownership without cache IO, inspects only lock metadata, and reports unreadable ownership as a failed check.
 5. **Identity scoping** — Scope cache evidence, poison and failed-read throttles to the host. Injected guard state keeps independent guard instances isolated; foreign cache evidence cannot activate this host.
 6. **State over time** — Throttle failed reads for 60 seconds per host, bypassed at startup; successful reads clear the failure timestamp. Successful cache writes alone clear poison. Neither throttle nor failed reads refresh the ten-minute cache lifetime.
 7. **Who wrote it** — Cache must name this host and contain successful status and valid read/write timestamps; mode 0600 limits access. Local cache is trusted host-local evidence, not a remotely supplied authorship marker. Preflight obtains remote evidence directly.
@@ -37,6 +37,17 @@ PR #6945 repairs residual (1) with ordered handoff evidence and failed-read thro
 ## Risks
 
 Poison and failed-read throttles live in process memory. Startup must still require a fresh remote read; callers must share guard state across later checks. A retained cache lock deliberately blocks ownership and fallback across processes: inspect the writer and repair cache permissions or disk capacity before removing the fence. Missing/unreadable overlay directories, unreadable files and malformed records fail preflight explicitly; valid stale records and sidecars are excluded intentionally.
+
+Contention lasting over one second also retains the lock, even when the live holder later completes its rename successfully. Its write returns false, and subsequent fresh owner reads remain standby until operator recovery. A killed holder or power loss can leave the same state. Preflight reports `FAIL cache-lock` with the lock path and recovery guidance. Stop **all** guard writers (including suspended holders), inspect the holder and repair disk/permission failures, discard stale ownership cache evidence, remove the retained lock, then restart with a fresh remote ownership read. Never remove a lock while a holder can resume. Automatic stale-lock reclamation remains out of scope.
+
+## Review prevention record (PR #6945, 2026-11-17)
+
+- Inert cache spies: reject unknown `cliIO` injection keys. The no-cache test uses a child with real HOME isolation and native filesystem hooks, with the cache-using resolver as a positive control.
+- Live-holder contention: extend the registered `host-handoff-cache-write-race` soak with a holder paused until a separate contender fences it. Assert resumed rename, rejected write, denied fallback/fresh activation, and the preflight operator diagnostic.
+- Child bounds: independently pin the default scutil wrapper, both git probes and SSH to 15,000 ms and 1 MiB, alongside the existing GitHub transport assertion. Broader prevention is filed as #x8q4n2s.
+- Required cache evidence: parameterize missing/unsuccessful status with valid timestamps and remove each required field independently.
+- Unreadable ownership: pass returned and thrown remote errors through production `cliIO.resolveRole` into `main`; require `FAIL role`, exit 1 and continued unrelated checks. This also covers the duplicate codex-correctness card suggestion from the same review.
+- Successful reads with failed persistence: deferred advisory work filed as #x9m6r3t; do not change throttle semantics in this repair.
 
 ## Test plan
 
