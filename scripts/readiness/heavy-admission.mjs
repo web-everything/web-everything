@@ -144,7 +144,7 @@
  *     fresh resource snapshot permits it. Status and release scan every slot that scaling may hand out.
  */
 import '../lib/tools-root-guard.mjs';
-import { constants, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync, renameSync } from 'node:fs';
+import { constants, existsSync, mkdirSync, mkdtempSync, rmdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync, renameSync } from 'node:fs';
 import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
 import { execSync, execFile, spawn } from 'node:child_process';
 import { hostname, homedir, userInfo, loadavg, cpus, constants as osConstants } from 'node:os';
@@ -1140,8 +1140,12 @@ function recordRemoteFallback({lockRoot, reason, detail = null, cwd, argv, env, 
   try {
     const file = join(lockRoot, 'remote-fallbacks.jsonl');
     const bounded = value => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, '?').slice(0, 4096);
+    const sandbox = Object.fromEntries(['CODEX_SANDBOX', 'CODEX_SANDBOX_NETWORK_DISABLED', 'SANDBOX_RUNTIME']
+      .filter(key => (env ?? process.env)[key] != null)
+      .map(key => [key, bounded((env ?? process.env)[key]).slice(0, 256)]));
     const row = {ts:new Date(clock()).toISOString(), reason:bounded(reason),
-      detail:detail == null ? null : bounded(detail), lane:basename(cwd),
+      detail:detail == null ? null : bounded(detail), lane:bounded(basename(cwd)),
+      pid:process.pid, ppid:process.ppid, sandbox:Object.keys(sandbox).length ? sandbox : null,
       kind:classifyAdmissionCommandKind(argv.map(shellQuoteWord).join(' '), env)};
     mkdirSync(lockRoot, {recursive:true});
     const tail = existsSync(file) ? readTailBytes(file, 512 * 1024) : '';
@@ -1195,15 +1199,27 @@ export async function runWithRemoteDecision({
   log(`heavy-admission: ${decision.remote ? 'remote' : 'local'} (${decision.reason})\n`);
   if (decision.needsGit) recordRemoteFallback({lockRoot, reason: 'needs-git', cwd, argv, env, clock});
   if (!decision.remote) return { handled: false };
-  // Local heartbeat workers can be terminated during import. Keep Forge's top-level awaits out of
-  // that import graph: terminating an evaluating async module can crash Node with SIGTRAP.
-  const { checkRemoteHealth, recordRemoteResult, peekRemoteTelemetry } = await import('./forge-remote-health.mjs');
   const remoteRoot = join(dirname(lockRoot), 'remote');
   const localFallback = (reason, detail = null) => {
     recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock});
     log(`heavy-admission: remote unavailable (${oneLine(reason)}) - falling back to local admission\n`);
     return { handled: false };
   };
+  // Caller confinement is local evidence, not a Forge health failure. Exercise writes before
+  // importing health code so a denied caller cannot mutate the host-shared health state.
+  try {
+    mkdirSync(remoteRoot, {recursive:true});
+    const probe = mkdtempSync(join(remoteRoot, '.write-probe-'));
+    rmdirSync(probe);
+  } catch (error) {
+    if (['EPERM', 'EACCES', 'EROFS'].includes(error?.code)) {
+      return localFallback('confined-local', `${error.code} ${oneLine(basename(remoteRoot))}`);
+    }
+    // A race or other failure still belongs to the normal remote-health path.
+  }
+  // Local heartbeat workers can be terminated during import. Keep Forge's top-level awaits out of
+  // that import graph: terminating an evaluating async module can crash Node with SIGTRAP.
+  const { checkRemoteHealth, recordRemoteResult, peekRemoteTelemetry } = await import('./forge-remote-health.mjs');
   const health = () => checkRemoteHealth({root:remoteRoot,settings:policy.settings.remote,clock,readTelemetry,host});
   const healthy = await health();
   if (!healthy.ok) return localFallback(healthy.reason, healthy.detail);

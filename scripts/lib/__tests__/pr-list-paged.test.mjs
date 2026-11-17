@@ -2,11 +2,12 @@
  * @file scripts/lib/__tests__/pr-list-paged.test.mjs
  * @description Hermetic paging, gh-shape mapping, heavy-field freshness and policy cascade probes.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  buildOpenPrPageQuery, mapGraphqlPr, parseOpenPrPage, isTransientGhFailure, heavyIsFresh,
+  buildOpenPrPageQuery, mapGraphqlPr, parseOpenPrPage, isTransientGhFailure, heavyIsFresh, resolveCheckAppsByCommit,
   listOpenPrsLightPaged, listOpenPrsPagedHydrated, assertInventoryComplete, listOpenPrsPagedHydratedComplete, parseListOutput, hydrateHeavyFields, resolvePrListPaging, PrListUnreadableError,
   HEAVY_FIELDS, PAGED_LIGHT_FIELDS, PR_LIST_PAGING_DEFAULTS, PR_LIST_PAGE_SIZE_ENV,
 } from '../pr-list-paged.mjs';
@@ -27,6 +28,134 @@ const cached = (r, extra = {}) => ({ updatedAt: r.updatedAt, headRefOid: r.headR
   fetchedAtMs: 9500, ...heavy, ...extra });
 const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
   timeout: 60_000, killSignal: 'SIGKILL' };
+const externalNodes = ids => ids.map(id => node(id, {
+  commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: [{
+    __typename: 'CheckRun', name: 'red-team', status: 'IN_PROGRESS', databaseId: id,
+    checkSuite: { app: null, workflowRun: null },
+  }] } } } }] },
+}));
+
+describe('commit app lookup progress', () => {
+  let dir, env;
+  const sha = i => i.toString(16).padStart(40, '0');
+  const pendingRows = ids => ids.map(i => ({ headRefOid: sha(i), statusCheckRollup: [{
+    __typename: 'CheckRun', name: 'red-team', status: 'IN_PROGRESS',
+  }] }));
+  const response = JSON.stringify({ total_count: 1, check_runs: [{
+    name: 'red-team', status: 'in_progress', app: { id: 42, slug: 'red-team' },
+  }] });
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'commit-app-cursor-'));
+    env = { ...process.env, WE_PR_SNAPSHOT_DIR: dir };
+  });
+  afterEach(() => { vi.restoreAllMocks(); rmSync(dir, { recursive: true, force: true }); });
+
+  it('covers every pending head at the runner two-minute refresh interval', () => {
+    const shas = Array.from({ length: 40 }, (_, i) => (i + 1).toString(16).padStart(40, '0'));
+    const queried = new Set();
+    const clock = vi.spyOn(Date, 'now');
+    for (const now of [0, 120000, 240000, 360000, 480000]) {
+      clock.mockReturnValue(now);
+      const rows = shas.map(headRefOid => ({ headRefOid, statusCheckRollup: [{
+        __typename: 'CheckRun', name: 'red-team', status: 'IN_PROGRESS',
+      }] }));
+      const exec = vi.fn((_cmd, args) => {
+        queried.add(args[1].match(/commits\/([0-9a-f]{40})\//)[1]);
+        return JSON.stringify({ total_count: 1, check_runs: [{
+          name: 'red-team', status: 'in_progress', app: { id: 42, slug: 'red-team' },
+        }] });
+      });
+      resolveCheckAppsByCommit({ repo: 'progress/two-minute', rows, exec, env });
+      expect(exec.mock.calls.length).toBeLessThanOrEqual(30);
+    }
+    expect(queried.size).toBe(40);
+  });
+
+  it.each([31, 60, 70])('advances with a frozen clock and failed reads for %i heads', count => {
+    vi.spyOn(Date, 'now').mockReturnValue(0);
+    const queried = new Set();
+    const ids = Array.from({ length: count }, (_, i) => i + 1);
+    for (let refresh = 0; refresh < Math.ceil(count / 30); refresh++) {
+      const rows = pendingRows(ids);
+      const exec = vi.fn((_cmd, args) => {
+        queried.add(args[1].match(/commits\/([0-9a-f]{40})\//)[1]);
+        if (refresh % 2 === 0) throw new Error('unavailable');
+        return '{malformed';
+      });
+      resolveCheckAppsByCommit({ repo: 'progress/failures', rows, exec, env });
+      expect(exec).toHaveBeenCalledTimes(30);
+      expect(rows.every(r => !r.statusCheckRollup[0].appId)).toBe(true);
+    }
+    expect(queried.size).toBe(count);
+  });
+
+  it('continues beyond a removed cursor head despite reordered rows and duplicate heads', () => {
+    const ids = Array.from({ length: 70 }, (_, i) => i + 1);
+    resolveCheckAppsByCommit({ repo: 'progress/churn', rows: pendingRows(ids), exec: () => response, env });
+    const rows = pendingRows([...ids.filter(i => i !== 30).reverse(), 31]);
+    const calls = [];
+    resolveCheckAppsByCommit({ repo: 'progress/churn', rows, env, exec: (_cmd, args) => {
+      calls.push(args[1].match(/commits\/([0-9a-f]{40})\//)[1]);
+      return response;
+    } });
+    expect(calls).toEqual(ids.slice(30, 60).map(sha));
+    expect(rows.filter(r => r.headRefOid === sha(31)).every(r => r.statusCheckRollup[0].appId === 42)).toBe(true);
+  });
+
+  it('keeps repository and cwd progress independent', () => {
+    const ids = Array.from({ length: 40 }, (_, i) => i + 1);
+    const localEnv = { ...env, GH_REPO: '' };
+    for (const scope of [{ repo: 'progress/a' }, { repo: 'progress/b' },
+      { repo: null, execOpts: { cwd: join(dir, 'a') } }, { repo: null, execOpts: { cwd: join(dir, 'b') } }]) {
+      const rows = pendingRows(ids);
+      resolveCheckAppsByCommit({ ...scope, rows, exec: () => response, env: localEnv });
+      expect(rows.filter(r => r.statusCheckRollup[0].appId).map(r => r.headRefOid)).toEqual(ids.slice(0, 30).map(sha));
+    }
+  });
+
+  it('publishes and unlocks the reservation before an interleaved reader starts REST IO', () => {
+    const ids = Array.from({ length: 60 }, (_, i) => i + 1);
+    const outer = pendingRows(ids);
+    const inner = pendingRows(ids);
+    let interleaved = false;
+    resolveCheckAppsByCommit({ repo: 'progress/interleaved', rows: outer, env, exec: () => {
+      if (!interleaved) {
+        interleaved = true;
+        resolveCheckAppsByCommit({ repo: 'progress/interleaved', rows: inner, env, exec: () => response });
+      }
+      return response;
+    } });
+    const hydrated = rows => rows.filter(r => r.statusCheckRollup[0].appId).map(r => r.headRefOid);
+    expect(hydrated(outer)).toEqual(ids.slice(0, 30).map(sha));
+    expect(hydrated(inner)).toEqual(ids.slice(30).map(sha));
+  });
+
+  it('recovers a corrupt cursor and then advances on the following refresh', () => {
+    const ids = Array.from({ length: 40 }, (_, i) => i + 1);
+    const fetch = () => {
+      const rows = pendingRows(ids);
+      resolveCheckAppsByCommit({ repo: 'progress/corrupt', rows, exec: () => response, env });
+      return rows.filter(r => r.statusCheckRollup[0].appId).map(r => r.headRefOid);
+    };
+    fetch();
+    const cursorDir = join(dir, 'commit-app-cursors');
+    writeFileSync(join(cursorDir, readdirSync(cursorDir)[0]), '{broken');
+    expect(fetch()).toEqual(ids.slice(0, 30).map(sha));
+    expect(fetch()).toContain(sha(40));
+  });
+
+  it('leaves unknown apps closed and reports unavailable cursor storage', () => {
+    const blocked = join(dir, 'not-a-directory');
+    writeFileSync(blocked, 'occupied');
+    const rows = pendingRows(Array.from({ length: 40 }, (_, i) => i + 1));
+    const exec = vi.fn(() => response);
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    resolveCheckAppsByCommit({ repo: 'progress/blocked', rows, exec, env: { ...env, WE_PR_SNAPSHOT_DIR: blocked } });
+    expect(exec).not.toHaveBeenCalled();
+    expect(rows.every(r => !r.statusCheckRollup[0].appId)).toBe(true);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('restore writable PR snapshot storage'));
+  });
+});
 
 describe('query and gh row shape', () => {
   it('builds first and subsequent pages, quotes cursors and rejects invalid repos', () => {
@@ -49,7 +178,7 @@ describe('query and gh row shape', () => {
       commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: [check, status] } } } }] } });
     expect(mapGraphqlPr(n)).toEqual({ ...node(1), reviewDecision: '', labels: n.labels.nodes, statusCheckRollup: [
       { __typename: 'CheckRun', completedAt: '0001-01-01T00:00:00Z', conclusion: '', detailsUrl: check.detailsUrl,
-        name: 'test', startedAt: '0001-01-01T00:00:00Z', status: 'IN_PROGRESS', workflowName: '' },
+        name: 'test', startedAt: '0001-01-01T00:00:00Z', status: 'IN_PROGRESS', workflowName: '', appSlug: '', appId: null },
       { __typename: 'StatusContext', context: 'ci', startedAt: 'today', state: 'PENDING', targetUrl: '' },
     ] });
     expect(Object.keys(row(1))).toEqual(PAGED_LIGHT_FIELDS);
@@ -95,6 +224,169 @@ describe('light paging', () => {
       expect(options).toEqual({ ...opts, env: expect.objectContaining({ GH_REPO: repo }) });
     }
     expect(exec.mock.calls[1][1][3]).toContain('after:"a"');
+  });
+  it('resolves the posting app over REST for a live workflow-less check, because GraphQL hides checkSuite.app (live #6873)', () => {
+    const check = id => ({ __typename: 'CheckRun', name: 'red-team', status: 'IN_PROGRESS', conclusion: null, startedAt: 's', completedAt: null,
+      detailsUrl: 'https://example.invalid/x', databaseId: id, checkSuite: { app: null, workflowRun: null } });
+    const n = node(1, { commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: [check(777)] } } } }] } });
+    const exec = vi.fn().mockReturnValueOnce(page([n])).mockReturnValueOnce(JSON.stringify({ app: { id: 5037855, slug: 'web-everything' } }));
+    const row = listOpenPrsLightPaged({ repo, exec, pageSize: 20 }).rows[0].statusCheckRollup[0];
+    expect(row).toMatchObject({ name: 'red-team', appId: 5037855, appSlug: 'web-everything' });
+    expect(exec.mock.calls[1][1]).toEqual(['api', `repos/${repo}/check-runs/777`]);
+    // an unreadable REST answer leaves the app empty (the planner then fails closed)
+    const bad = vi.fn().mockReturnValueOnce(page([n])).mockImplementationOnce(() => { throw new Error('boom'); });
+    expect(listOpenPrsLightPaged({ repo, exec: bad, pageSize: 20, checkAppState: {} }).rows[0].statusCheckRollup[0]).toMatchObject({ appId: null, appSlug: '' });
+    // a completed or workflow-bearing check costs no extra call
+    const done = vi.fn().mockReturnValueOnce(page([node(1, { commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: [{ ...check(1), status: 'COMPLETED' }] } } } }] } })]));
+    listOpenPrsLightPaged({ repo, exec: done, pageSize: 20 });
+    expect(done).toHaveBeenCalledTimes(1);
+  });
+  it('reaches the 21st pending external check on a fresh snapshot without exceeding 20 REST lookups', () => {
+    const ids = Array.from({ length: 21 }, (_, i) => 777 + i);
+    let lookedUp = [];
+    const exec = vi.fn((_file, args) => {
+      if (args[1] === 'graphql') {
+        return args[3].includes('after:') ? page(externalNodes(ids.slice(20)), false, null, 21)
+          : page(externalNodes(ids.slice(0, 20)), true, 'next', 21);
+      }
+      lookedUp.push(Number(args[1].split('/').at(-1)));
+      return JSON.stringify({ app: { id: 5037855, slug: 'web-everything' } });
+    });
+    const read = () => listOpenPrsLightPaged({ repo: 'starvation/success', exec, pageSize: 20 });
+    const first = read();
+    expect(lookedUp).toEqual(ids.slice(0, 20));
+    expect(first.rows.at(-1).statusCheckRollup[0].appId).toBeNull();
+    lookedUp = [];
+    const second = read();
+    expect(lookedUp).toHaveLength(1);
+    expect(lookedUp[0]).toBe(797);
+    expect(second.rows.at(-1).statusCheckRollup[0]).toMatchObject({ appId: 5037855, appSlug: 'web-everything' });
+  });
+  it('rotates past failed and malformed app reads while unknown checks stay closed', () => {
+    const ids = Array.from({ length: 41 }, (_, i) => 1000 + i);
+    const attempted = new Set();
+    let calls = 0;
+    const exec = vi.fn((_file, args) => {
+      if (args[1] === 'graphql') return page(externalNodes(ids), false, null, 41);
+      calls++;
+      const id = Number(args[1].split('/').at(-1));
+      attempted.add(id);
+      if (id % 2) throw new Error('unreadable');
+      return '{"app":null}';
+    });
+    for (let refresh = 0; refresh < 3; refresh++) {
+      calls = 0;
+      const result = listOpenPrsLightPaged({ repo: 'starvation/failure', exec, pageSize: 100 });
+      expect(calls).toBe(20);
+      expect(result.rows.every(r => r.statusCheckRollup[0].appId === null)).toBe(true);
+    }
+    expect([...attempted].sort((a, b) => a - b)).toEqual(ids);
+  });
+  it('keeps lookup progress per repository and handles changed or empty candidate lists', () => {
+    let ids = Array.from({ length: 21 }, (_, i) => 2000 + i);
+    let lookedUp = [];
+    const exec = vi.fn((_file, args) => {
+      if (args[1] === 'graphql') return page(externalNodes(ids), false, null, ids.length);
+      lookedUp.push(Number(args[1].split('/').at(-1)));
+      return '{"app":{"id":42,"slug":"other-app"}}';
+    });
+    const read = repo => listOpenPrsLightPaged({ repo, exec, pageSize: 100 });
+    read('starvation/one');
+    lookedUp = [];
+    read('starvation/two');
+    expect(lookedUp[0]).toBe(2000);
+    // A new check at the front does not reset progress past the previous last attempt.
+    ids.unshift(1999);
+    lookedUp = [];
+    read('starvation/one');
+    expect(lookedUp[0]).toBe(2020);
+    expect(lookedUp).toEqual([2020, 1999]);
+    // The cursor can disappear, and no candidates is also a valid snapshot.
+    ids = [3000];
+    lookedUp = [];
+    read('starvation/one');
+    expect(lookedUp).toEqual([3000]);
+    ids = [];
+    lookedUp = [];
+    expect(read('starvation/one').rows).toEqual([]);
+    expect(lookedUp).toEqual([]);
+  });
+  it('deduplicates shared-head check IDs and supplies provenance to every PR copy', () => {
+    const nodes = [...externalNodes(Array(21).fill(4000)), ...externalNodes([4001])]
+      .map((n, i) => ({ ...n, number: i + 1 }));
+    let calls = 0;
+    const exec = vi.fn((_file, args) => {
+      if (args[1] === 'graphql') return page(nodes, false, null, nodes.length);
+      calls++;
+      return '{"app":{"id":42,"slug":"poster"}}';
+    });
+    const result = listOpenPrsLightPaged({ repo: 'starvation/duplicates', exec, pageSize: 100 });
+    expect(calls).toBe(2);
+    expect(result.rows.every(r => r.statusCheckRollup[0].appId === 42)).toBe(true);
+  });
+  it('accumulates provenance when one PR has more than 20 pending external checks', () => {
+    const ids = Array.from({ length: 41 }, (_, i) => 5000 + i);
+    const checks = externalNodes(ids).flatMap(n => n.commits.nodes[0].commit.statusCheckRollup.contexts.nodes);
+    const n = node(1, { commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: checks } } } }] } });
+    let calls = 0;
+    const exec = vi.fn((_file, args) => {
+      if (args[1] === 'graphql') return page([n], false, null, 1);
+      calls++;
+      return '{"app":{"id":5037855,"slug":"web-everything"}}';
+    });
+    for (const [expectedCalls, resolved] of [[20, 20], [20, 40], [1, 41]]) {
+      calls = 0;
+      const { rows } = listOpenPrsLightPaged({ repo: 'starvation/many-checks', exec, pageSize: 100 });
+      expect(calls).toBe(expectedCalls);
+      expect(rows[0].statusCheckRollup.filter(c => c.appId === 5037855)).toHaveLength(resolved);
+    }
+  });
+  it('evicts old repository lookup state with fresh reads as the fallback', () => {
+    let calls = 0;
+    const exec = vi.fn((_file, args) => {
+      if (args[1] === 'graphql') return page(externalNodes([6000]), false, null, 1);
+      calls++;
+      return '{"app":{"id":42,"slug":"poster"}}';
+    });
+    for (let i = 0; i <= 128; i++) listOpenPrsLightPaged({ repo: `eviction/repo-${i}`, exec, pageSize: 100 });
+    calls = 0;
+    const { rows } = listOpenPrsLightPaged({ repo: 'eviction/repo-0', exec, pageSize: 100 });
+    expect(calls).toBe(1);
+    expect(rows[0].statusCheckRollup[0].appId).toBe(42);
+  });
+  it('binds persisted app provenance to the repository and current check ID', () => {
+    const state = { repo: 'provenance/old', cursor: 7000, apps: { 7000: { appId: 42, appSlug: 'old-app' } } };
+    let ids = [7000];
+    const exec = vi.fn((_file, args) => {
+      if (args[1] === 'graphql') return page(externalNodes(ids), false, null, ids.length);
+      throw new Error('unreadable');
+    });
+    const read = () => listOpenPrsLightPaged({ repo: 'provenance/new', exec, pageSize: 100, checkAppState: state });
+    expect(read().rows[0].statusCheckRollup[0].appId).toBeNull();
+    expect(state.apps).toEqual({});
+    state.apps[7000] = { appId: 42, appSlug: 'old-app' };
+    ids = [7001];
+    expect(read().rows[0].statusCheckRollup[0].appId).toBeNull();
+    expect(state.apps).toEqual({});
+  });
+  it('continues past a removed cursor after serializing failed lookup progress', () => {
+    const ids = Array.from({ length: 41 }, (_, i) => 8000 + i);
+    let state = {};
+    let lookedUp = [];
+    const exec = vi.fn((_file, args) => {
+      if (args[1] === 'graphql') return page(externalNodes(ids), false, null, ids.length);
+      lookedUp.push(Number(args[1].split('/').at(-1)));
+      throw new Error('unreadable');
+    });
+    const read = () => listOpenPrsLightPaged({ repo: 'starvation/removed-cursor', exec, pageSize: 100, checkAppState: state });
+    read();
+    expect(lookedUp).toEqual(ids.slice(0, 20));
+    state = JSON.parse(JSON.stringify(state));
+    ids.splice(19, 1);
+    lookedUp = [];
+    read();
+    expect(lookedUp).toEqual(Array.from({ length: 20 }, (_, i) => 8020 + i));
+    expect(state.apps).toEqual({});
   });
   it('retries a transient second page once and never publishes a failed partial list', () => {
     const cause = failure(`${timeout}\nextra detail`);

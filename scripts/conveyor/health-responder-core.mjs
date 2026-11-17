@@ -58,6 +58,7 @@ export const OBSERVATION_ONLY = Object.freeze({
   "lane-destructive-unpushed": "Possible loss needs recovery judgment; preserve reflogs and do not clean anything.",
   "lane-pool-growth": "Dirty/unleased is not proof of abandoned work; no trim/reset/provision.",
   "lane-worker-without-lease": "A live worker needs ownership investigation, never release or fabricated adoption.",
+  "launchd-ops-copy-drift": "The job owner must inspect script drift; never refresh ops copies, rewrite plists or restart launchd jobs from the responder.",
   "ledger-readiness-regressed": "Report the readiness regression and inspect replay evidence; never promote the ledger, change review authority or relax readiness thresholds from the responder.",
   "live-process-stale-transcript": "Silence does not prove death; owning job watchdog/reaper alone handles the worker.",
   "machine-overload": "Inhibit new responder jobs; no process kill, cap increase or automatic global pause overwrite.",

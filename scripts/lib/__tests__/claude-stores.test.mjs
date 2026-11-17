@@ -61,10 +61,8 @@ function checkBreak(fixture) {
       break;
     case 5:
       expect(agg.status).toBe('unknown');
-      // Superseded by the resolveOwner hardening: the fixture still names store A as the match, but an
-      // unreadable store may hold a duplicate, so the owner is unknown and the stop is refused.
-      expect(resolveOwner(input.handle, agg)).toMatchObject({ kind: 'unknown', problems: agg.problems });
-      expect(stopPlan(input.handle, agg)).toEqual({ action: 'refuse', reason: 'unknown' });
+      expect(resolveOwner(input.handle, agg)).toMatchObject({ kind: wanted.kind, problems: agg.problems });
+      expect(stopPlan(input.handle, agg)).toEqual({ action: wanted.action, reason: wanted.reason });
       break;
     case 6:
       for (const map of input.badMaps) {

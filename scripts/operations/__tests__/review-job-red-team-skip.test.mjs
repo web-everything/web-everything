@@ -591,6 +591,20 @@ describe('review-job red-team skip settlement', () => {
   });
 
   it.each([
+    [{ status: 'error', reason: 'gh: HTTP 502' }, ' (gh: HTTP 502)'],
+    [{ status: 'error', reason: 'a\n  b\tc' }, ' (a b c)'],
+    [{ status: 'error', reason: 'x'.repeat(300) }, ` (${'x'.repeat(200)})`],
+    [{ status: 'error', reason: '' }, ''],
+    [{ status: 'error' }, ''],
+  ])('unpublished skip reason carries the comment reason when present: %j', (comment, suffix) => {
+    const f = fixture({ status: 'ran', comment });
+    runReviewJob({ repo, pr }, f.io);
+    expect(f.io.settleRedTeamSkip).toHaveBeenCalledWith(expect.objectContaining({
+      redTeam: { status: 'unpublished', reason: `red team ran but its result comment is error${suffix}` },
+    }));
+  });
+
+  it.each([
     { status: 'resumed', comment: { status: { toString: null } } },
     { status: 'ran', findings: {} },
     { status: 'ran', findings: [null] },
