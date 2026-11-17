@@ -42,8 +42,9 @@ import { readReviewRunEvidence } from './conveyor/review-referral-hold.mjs';
  * actually does it. Before this, #2882 closed the raw label edit without opening a replacement, so the single
  * act the `review:human` tier exists to enable had no sanctioned way to perform it and the operator was pushed
  * to an unrecorded `gh` call — losing the `reviewed-sha` stamp and the attributed comment. `clear-human` is the
- * ONLY target that removes `review:human`, and `accepted` stays unconditionally refused on a `review:human` PR
- * — see `decideSetLabel` for why this is a target rather than a flag.
+ * acceptance target that removes `review:human`, and `accepted` stays unconditionally refused on a `review:human` PR
+ * — see `decideSetLabel` for why this is a target rather than a flag. `rereview` instead removes
+ * the hold without accepting: it records the live head and requests fresh review with `review:pending`.
  *
  * WHAT THIS TARGET DOES NOT DO, stated up front so nobody re-derives it: it does NOT verify that a human ran
  * it. #2895 RULED that the unforgeable actor signal is DEFERRED — no local construct survives an agent with
@@ -349,7 +350,7 @@ export function reassertHumanClearance({ provider, repo, pr, headSha, warn = s =
  * costs a failed run and a lost record, and on an ALREADY-accepted PR — the one case that still swaps first — it
  * costs exactly the old partial state. Add a member here and the projection covers it automatically.
  */
-export const REVIEW_LABEL_TARGETS = Object.freeze(['accepted', 'changes', 'rearm', 'clear-human', 'restamp']);
+export const REVIEW_LABEL_TARGETS = Object.freeze(['accepted', 'changes', 'rearm', 'clear-human', 'rereview', 'restamp']);
 
 /**
  * we:scripts/review-set-label.mjs — THE #3334 REASONLESS-BOUNCE RULE, re-exported from its leaf module so this
@@ -376,7 +377,7 @@ export { decideParkToHuman, findContradictoryReviewVerdicts, decideContradictory
 
 /**
  * we:scripts/review-set-label.mjs#decideSetLabel — the PURE verdict-label decision. Given the target `to` and
- * the PR's OBSERVED labels, return the label swap. FOUR targets (the closed set is `REVIEW_LABEL_TARGETS`), each
+ * the PR's OBSERVED labels, return the label swap. Targets (the closed set is `REVIEW_LABEL_TARGETS`), each
  * with its invariant enforced HERE (unbypassable): the reviewer verdicts `accepted` / `changes`, the conveyor
  * fix-agent `rearm` (#2644, was `decideRearm`), and the #2895 gate-self `clear-human`. Every return carries
  * `keepsHuman` — whether the swap leaves `review:human` in place.
@@ -390,15 +391,17 @@ export { decideParkToHuman, findContradictoryReviewVerdicts, decideContradictory
  *   • `rearm` — the #2630 invariant: ONLY a live `review:changes` is re-armable (idempotent — a second call
  *     refuses cleanly); the swap is ALWAYS `review:changes → review:pending`, NEVER `review:accepted`, and
  *     NEVER removes `review:human`. The strongest thing an auto-fix can do is re-arm the review, never clear it.
- *   • `clear-human` — the #2895 gate-self clearance: the ONLY target that removes `review:human` (and the only
+ *   • `clear-human` — the #2895 gate-self clearance: the acceptance target that removes `review:human` (and the only
  *     one refused when the PR does NOT carry it). Nothing here checks WHO is asking — see below.
+ *   • `rereview` — requires `review:human`, drops the human hold and stale verdict/readiness labels,
+ *     adds only `review:pending`. Requires an attributed reason and records the live head without approving it.
  *   • `restamp` — the #x5e2ldj re-stamp: moves NO label at all. It exists because the drain's own
  *     content-preserving rebase moves the head, which makes the acceptance markers stale, which re-parks the
  *     very PR the drain was about to land — clear, rebase, re-park, forever. `review-escalation.mjs` names this
  *     fix in its POSITION section: the drain KNOWS it produced the rebase, so it can re-stamp rather than have
  *     a gate re-derive. REFUSED unless a live `review:accepted` is already on the PR: a re-stamp may only carry
  *     an acceptance ACROSS a head move, never manufacture one.
- * @param {{to:('accepted'|'changes'|'rearm'|'clear-human'), currentLabels?:Array, findingCount?:number|null,
+ * @param {{to:('accepted'|'changes'|'rearm'|'clear-human'|'rereview'|'restamp'), currentLabels?:Array, findingCount?:number|null,
  *   reason?:string, humanOnlyHold?:boolean, redTeamRulingHold?:boolean, requireLive?:(null|'accepted'|'missing')}} o - `currentLabels` is the observed label array (string or `{name}` shape, per
  *   `hasReviewLabel`). `findingCount` and `reason` are the #3334 decision inputs: how many findings the juror
  *   raised (tri-state — `null` is UNKNOWN and never refuses) and the reason the caller stated, if any. They are
@@ -422,8 +425,8 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
   // proven carry exactly like `review:human`, but it is the ONE hold `restamp` may lift (see that branch).
   const isHeldMechanical = hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical);
 
-  // we:scripts/review-set-label.mjs#decideSetLabel — clear-human (#2895): the ONE target that removes
-  // `review:human`, and the only sanctioned way to clear a gate-self PR. It exists because #2882 closed the raw
+  // we:scripts/review-set-label.mjs#decideSetLabel — clear-human (#2895): the acceptance target that removes
+  // `review:human`. The rereview target below releases the hold without approval. It exists because #2882 closed the raw
   // label edit (rightly) without opening a replacement, leaving the single act the `review:human` tier exists to
   // enable with no way to perform it — the operator was pushed to an unrecorded `gh` call outside the flow,
   // which is exactly the attribution loss the single home was built to prevent.
@@ -442,6 +445,17 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
   // rule in `we:skills-src/review/SKILL.md`. The `allowClearHuman` opt-in is a much smaller thing than either —
   // it binds importers only, and today it binds none (see its doc on `runReviewLabelCli`). None of the three is
   // a barrier.
+  if (to === 'rereview') {
+    const refuse = reason => ({ allowed: false, addLabel: '', removeLabels: [], keepsHuman: isHuman, reason });
+    if (!isHuman) return refuse('rereview requires review:human — use rearm for a PR without the human hold');
+    if (humanClearedHead) return refuse('head carries a human clearance — a rereview never undoes it');
+    return { allowed: true, addLabel: REVIEW_LABELS.pending, keepsHuman: false,
+      removeLabels: [REVIEW_LABELS.human, REVIEW_LABELS.accepted, REVIEW_LABELS.changes,
+        REVIEW_LABELS.awaitingAdvisory, ...Object.values(ADVISORY_LABELS), RULING_NEEDED_LABEL,
+        'redteam:accepted', READY_TO_MERGE_LABEL, ...RED_TEAM_STATUS_LABELS],
+      reason: 'human hold returned to pending review at the live head without approval' };
+  }
+
   if (to === 'clear-human') {
     // The operator may also clear the drain's mechanical park by hand (it is a hold a human resolves when no carry can).
     if (!isHuman && !isHeldMechanical && !humanOnlyHold && !redTeamRulingHold) {
@@ -516,7 +530,7 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
   if (to === 'rearm') {
     if (humanClearedHead) return { allowed: false, addLabel: '', removeLabels: [], keepsHuman: isHuman, reason: 'head carries a human clearance — a rearm never undoes it' };
     const missing = requireLive === 'missing';
-    if (missing && (!Array.isArray(currentLabels) || !currentLabels.every(l => typeof (typeof l === 'string' ? l : l?.name) === 'string' && (typeof l === 'string' ? l : l.name).length > 0)
+    if (missing && (!Array.isArray(currentLabels) || !currentLabels.every(l => typeof (typeof l === 'string' ? l : l?.name) === 'string' && (typeof l === 'string' ? l : l.name).length > 0 && (typeof l === 'string' ? l : l.name).length > 0)
       || currentLabels.some(l => (typeof l === 'string' ? l : l.name).startsWith('review:')))) {
       return { allowed: false, addLabel: '', removeLabels: [], keepsHuman: isHuman, reason: 'missing-only re-arm requires a valid empty review family' };
     }
@@ -1234,8 +1248,11 @@ export function runReviewLabelCli({
   }
   const pinnedRearm = to === 'rearm' && expectHeadFlag !== undefined;
   const pinnedPlainRearm = pinnedRearm && onlyIf !== 'missing';
-  if (expectHeadFlag !== undefined && !guardedRestamp && !pinnedAccept && !pinnedRearm && onlyIf !== 'missing') fail('--expect-head requires guarded restamp, re-arm or a pinned accept');
+  if (expectHeadFlag !== undefined && !guardedRestamp && !pinnedAccept && !pinnedRearm && to !== 'rereview' && onlyIf !== 'missing') fail('--expect-head requires guarded restamp, re-arm or a pinned accept');
   if (onlyIf === 'missing' && (!/^[0-9a-f]{40}$/.test(expectedHead || '') || newHeadArg)) fail('missing re-arm requires --expect-head=<full 40-hex SHA>');
+  if (to === 'rereview' && expectHeadFlag !== undefined && !/^[0-9a-f]{40}$/.test(expectedHead || '')) fail('rereview requires --expect-head=<full 40-hex SHA>');
+  if (to === 'rereview' && newHeadArg) fail('--new-head is not valid with rereview');
+  if (to === 'rereview' && (!actorArg.trim() || !clearReason)) fail('--to=rereview requires explicit --actor and --reason for the durable record');
   if (pinnedRearm && !/^[0-9a-f]{40}$/.test(expectedHead || '')) fail('re-arm requires --expect-head=<full 40-hex SHA>');
   if (onlyIf !== null && to !== 'rearm') {
     fail('--only-if is only valid with the rearm target');
@@ -1319,9 +1336,9 @@ export function runReviewLabelCli({
     );
   }
   const targets = allowClearHuman ? "'accepted', 'changes', or 'clear-human'" : "'accepted' or 'changes'";
-  const targetOk = to === 'accepted' || to === 'changes' || to === 'clear-human' || to === 'restamp';
+  const targetOk = to === 'rereview' || to === 'accepted' || to === 'changes' || to === 'clear-human' || to === 'restamp';
   if (!fixedTo && !targetOk) {
-    fail(`invalid --to — expected ${targets}`);
+    fail(`invalid --to — expected ${targets}, or 'rereview'`);
   }
   // #2974 — `rearm` is DELIBERATELY still absent from this list. Before this item, a reviewer clearing a
   // bounced-but-now-fixed PR had no sanctioned path: `--to=accepted` left the stale `review:changes` behind
@@ -1411,9 +1428,11 @@ export function runReviewLabelCli({
     } }))}\n`);
     process.exit(1);
   };
-  if (to === 'rearm' && !prCommentsReadable) refuseRearm('comments unreadable — cannot prove no human clearance');
+  if (['rearm', 'rereview'].includes(to) && !prCommentsReadable) refuseRearm('comments unreadable — cannot prove no human clearance');
   if (to === 'rearm' && !/^[0-9a-f]{7,40}$/i.test(headSha.trim())) refuseRearm('head unreadable — cannot prove no human clearance');
 
+  if (to === 'rereview' && !/^[0-9a-f]{40}$/i.test(headSha)) fail('rereview requires a readable live head', 1);
+  if (to === 'rereview' && expectHeadFlag !== undefined && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
   if ((guardedRestamp || pinnedAccept || pinnedRearm || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
   if (expectNoReadiness && hasReviewLabel(currentLabels, READY_TO_MERGE_LABEL)) {
     fail('missing review handoff refused: producer readiness appeared after the caller observation', 1);
@@ -1532,11 +1551,11 @@ export function runReviewLabelCli({
     if (page.length < PR_COMMENTS_PAGE_SIZE) return page;
     let comments;
     try { comments = provider.readComments(repo, pr); } catch (e) {
-      if (to === 'rearm') return refuse('comments unreadable — cannot prove no human clearance');
+      if (['rearm', 'rereview'].includes(to)) return refuse('comments unreadable — cannot prove no human clearance');
       return fail(ghErr(e, 'complete comment thread unreadable'), 1);
     }
-    if (to === 'rearm' && !Array.isArray(comments)) refuse('comments unreadable — cannot prove no human clearance');
-    if (to === 'rearm') {
+    if (['rearm', 'rereview'].includes(to) && !Array.isArray(comments)) refuse('comments unreadable — cannot prove no human clearance');
+    if (['rearm', 'rereview'].includes(to)) {
       const ids = c => [c?.node_id, c?.id, c?.url, c?.html_url].filter(v => v !== undefined && v !== null && v !== '');
       const normalizeLogin = login => typeof login === 'string' ? login.toLowerCase().replace(/\[bot\]$/, '') : login;
       const covered = comments.length >= page.length && page.every(c => comments.some(full => {
@@ -1556,7 +1575,7 @@ export function runReviewLabelCli({
     }
     return comments;
   };
-  const rearmThread = to === 'rearm' ? fullThread() : null;
+  const rearmThread = ['rearm', 'rereview'].includes(to) ? fullThread() : null;
   // Capture before either write; a send-back during the swap or comment must not
   // become the verdict this older re-arm claims to have handled.
   const rearmVerdict = to === 'rearm' ? latestChangesVerdict(rearmThread) : null;
@@ -1583,7 +1602,7 @@ export function runReviewLabelCli({
     humanOnlyHold,
     redTeamRulingHold,
     acceptanceStillCoversHead: parseReviewedSha(prComments.filter(isTrustedMarkerAuthor)) === headSha,
-    humanClearedHead: to === 'rearm' && headEverHumanCleared(rearmThread, headSha.trim()),
+    humanClearedHead: ['rearm', 'rereview'].includes(to) && headEverHumanCleared(rearmThread, headSha.trim()),
     operatorRestamp: to === 'restamp' && actorArg.trim().toLowerCase() === 'operator',
   });
   if (resumePinnedRearm) {
@@ -1598,6 +1617,62 @@ export function runReviewLabelCli({
   if (!decision.allowed && !restampAcrossHold) {
     emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision }))}\n`);
     process.exit(1);
+  }
+
+  if (to === 'rereview') {
+    // Record first even on a stale accepted label: failure must retain the human hold.
+    const observe = () => {
+      const fresh = provider.readPrState(repo, pr);
+      if (fresh.state !== 'OPEN' || fresh.headRefOid !== headSha) throw new Error('rereview state or live head changed; human hold retained');
+      if (!Array.isArray(fresh.comments) || !Array.isArray(fresh.labels)
+        || !fresh.labels.every(l => typeof (typeof l === 'string' ? l : l?.name) === 'string' && (typeof l === 'string' ? l : l.name).length > 0)) {
+        throw new Error('rereview labels or comments unreadable; retry after evidence is readable');
+      }
+      const next = decideSetLabel({ to, currentLabels: fresh.labels,
+        humanClearedHead: headEverHumanCleared(fullThread(fresh.comments, headSha), headSha) });
+      if (!next.allowed) throw new Error(next.reason);
+      return fresh;
+    };
+    try {
+      const fresh = observe();
+      const record = buildVerdictComment({ to, actor, reason: clearReason, headSha, fromLabels: fresh.labels });
+      if (record.length > GH_COMMENT_MAX) throw new Error('rereview record exceeds comment limit — trim --actor/--reason; nothing was changed');
+      provider.postComment(repo, pr, record);
+      const latest = observe();
+      provider.setLabels(repo, pr, { add: decision.addLabel, remove: presentRemoveLabels(decision.removeLabels, latest.labels) });
+      let labels;
+      let racedClearance = false;
+      try {
+        const after = provider.readPrState(repo, pr);
+        if (after.state !== 'OPEN' || after.headRefOid !== headSha) {
+          throw new Error('rereview state or live head changed during label write');
+        }
+        if (!Array.isArray(after.comments)) throw new Error('rereview comments unreadable after label write');
+        racedClearance = headEverHumanCleared(after.comments, headSha);
+        const comments = fullThread(after.comments, headSha, reason => { throw new Error(reason); });
+        racedClearance ||= headEverHumanCleared(comments, headSha);
+        if (racedClearance) {
+          throw new Error('human clearance arrived during rereview label write');
+        }
+        labels = provider.readLabels(repo, pr);
+        if (!hasReviewLabel(labels, REVIEW_LABELS.pending) || decision.removeLabels.some(l => hasReviewLabel(labels, l))) {
+          throw new Error('rereview label write not verified');
+        }
+      } catch (e) {
+        try {
+          provider.setLabels(repo, pr, racedClearance
+            ? { add: REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.pending, REVIEW_LABELS.human, REVIEW_LABELS.awaitingAdvisory] }
+            : { add: REVIEW_LABELS.human, remove: [REVIEW_LABELS.pending] });
+        } catch (restoreError) {
+          if (racedClearance) throw new Error(`${e.message}; clearance restoration failed: ${restoreError.message}; restore review:accepted and remove review:pending manually`);
+          throw new Error(`${e.message}; human hold restoration failed: ${restoreError.message}; restore review:human and remove review:pending manually`);
+        }
+        if (racedClearance) throw new Error(`${e.message}; human clearance restored; rereview refused`);
+        throw new Error(`${e.message}; human hold restored; inspect the PR and retry`);
+      }
+      emit(`${JSON.stringify(successResult({ pr: Number(pr), to, decision, labels }))}\n`);
+    } catch (e) { fail(ghErr(e, 'rereview failed'), 1); }
+    return;
   }
 
   // #x169fqe — capture the DIFF this verdict is being formed against, so the accept records WHAT was reviewed
@@ -2374,7 +2449,7 @@ export function runReviewLabelCli({
     try {
       const after = provider.readPrState(repo, pr);
       if (after.state !== 'OPEN' || after.headRefOid !== expectedHead || !Array.isArray(after.labels)
-        || !after.labels.every(l => typeof (typeof l === 'string' ? l : l?.name) === 'string' && (typeof l === 'string' ? l : l.name).length > 0)) throw new Error('invalid post-write state');
+        || !after.labels.every(l => typeof (typeof l === 'string' ? l : l?.name) === 'string' && (typeof l === 'string' ? l : l.name).length > 0 && (typeof l === 'string' ? l : l.name).length > 0)) throw new Error('invalid post-write state');
       newLabels = after.labels.map(l => typeof l === 'string' ? l : l.name);
       if (!newLabels.includes(REVIEW_LABELS.pending) || newLabels.some(l => l.startsWith('review:') && l !== REVIEW_LABELS.pending)
         || decision.removeLabels.some(l => newLabels.includes(l))) throw new Error('label transition was not observed');
@@ -2448,8 +2523,16 @@ export function runReviewLabelCli({
  */
 export function buildVerdictComment({
   to, actor, headSha = '', body = '', reason = '', reviewedDiff = '', clearerId = '', independence = null,
-  channel = '', humanClearance = null,
+  channel = '', humanClearance = null, fromLabels = [],
 } = {}) {
+  if (to === 'rereview') {
+    // JSON leaves Unicode separators and C1 controls raw. Escape them too so caller text
+    // cannot create parser-visible lines; neutralize markers before adding our own marker.
+    const data = neutralizeCommentMarkers(JSON.stringify({ actor, reason, headSha,
+      fromLabels: (Array.isArray(fromLabels) ? fromLabels : []).map(l => typeof l === 'string' ? l : l.name) })
+      .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, c => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`));
+    return `🔄 review — re-review requested without approval\n\n${data}\n\n<!-- review-rereview-v1 -->`;
+  }
   // #2895 — `clear-human` stamps the marker for the same reason `accepted` does: it IS an acceptance (it adds
   // review:accepted), so the drain must be able to refuse it later if the head advances past the cleared tree.
   // #x169fqe — the reviewed DIFF is stamped alongside the reviewed SHA, so a later content-preserving rebase
@@ -2801,7 +2884,7 @@ if (IS_CLI) {
     // Handed over so the harness can refuse an empty `--to=changes` alongside its other pre-flight checks
     // (#xd6moh1). The rendered body still comes from the `buildComment` closure below — same text, one read.
     verdictBody,
-    usage: 'usage: review-set-label.mjs <pr> --repo=<owner/name> --to=accepted|changes|clear-human [--actor=<name>] [--channel=<surface>] [--body-file=<path>]  (pr must be a positive integer; changes REQUIRES --body-file=<the findings>; clear-human additionally requires --actor and --reason=<stated reason>)',
+    usage: 'usage: review-set-label.mjs <pr> --repo=<owner/name> --to=accepted|changes|clear-human|rereview [--actor=<name>] [--channel=<surface>] [--body-file=<path>]  (pr must be a positive integer; changes REQUIRES --body-file=<the findings>; clear-human and rereview additionally require --actor and --reason=<stated reason>)',
     buildComment: ({ to, actor, headSha, reason, reviewedDiff, clearerId, independence, humanClearance }) => buildVerdictComment({
       to, actor, headSha, reason, reviewedDiff, clearerId, independence, body: verdictBody, channel: verdictChannel,
       humanClearance,

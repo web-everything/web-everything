@@ -92,7 +92,7 @@ describe('what this applier REFUSES', () => {
   });
 
   it('refuses a verdict target it does not know', () => {
-    for (const to of ['rearm', 'merged', 'ACCEPTED', '', null, undefined]) {
+    for (const to of ['rearm', 'rereview', 'merged', 'ACCEPTED', '', null, undefined]) {
       expect(validateRequest({ ...OK, to }).ok).toBe(false);
     }
     expect(APPLIABLE_TARGETS).toEqual(['accepted', 'changes', 'clear-human']);

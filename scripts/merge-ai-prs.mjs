@@ -3599,6 +3599,7 @@ export const REVIEW_RECORD_HEADLINES = {
 export function reviewRecordKind(body) {
   const text = typeof body === 'string' ? body : '';
   if (!text) return null;
+  if (text.startsWith('🔄 review — re-review requested without approval\n') && text.endsWith('<!-- review-rereview-v1 -->')) return 'rereview';
   for (const [kind, headline] of Object.entries(REVIEW_RECORD_HEADLINES)) if (text.includes(headline)) return kind;
   return null;
 }

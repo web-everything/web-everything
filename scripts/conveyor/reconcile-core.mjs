@@ -1444,6 +1444,29 @@ export function acceptLabelDropped({ labels, comments, headSha, now, graceMs = A
   return Number.isFinite(at) && now - at >= graceMs;
 }
 
+/** A trusted, structured CURRENT-head rereview request may supersede an earlier accept.
+ * Missing/malformed records or timestamps retain the ordinary same-head suppression. */
+function currentHeadRereviewRequested({ labels, comments, headSha }) {
+  if (!labels?.includes(REVIEW_LABELS.pending) || labels.includes(REVIEW_LABELS.accepted)
+    || labels.includes(REVIEW_LABELS.human) || !/^[0-9a-f]{40}$/.test(headSha)) return false;
+  // Keep this predicate closed on clearance independently of the caller's human-clearance gate.
+  if (headEverHumanCleared(comments, headSha)) return false;
+  const acceptedAt = Date.parse(findAcceptVerdictComment(comments, headSha)?.createdAt);
+  if (!Number.isFinite(acceptedAt)) return false;
+  return (Array.isArray(comments) ? comments : []).some(c => {
+    if (!isTrustedMarkerAuthor(c) || typeof c?.body !== 'string') return false;
+    const lines = c.body.split('\n');
+    if (lines.length !== 5 || lines[0] !== '🔄 review — re-review requested without approval'
+      || lines[1] !== '' || lines[3] !== '' || lines[4] !== '<!-- review-rereview-v1 -->') return false;
+    try {
+      const record = JSON.parse(lines[2]);
+      return record?.headSha === headSha && typeof record.actor === 'string' && !!record.actor.trim()
+        && typeof record.reason === 'string' && !!record.reason.trim() && Array.isArray(record.fromLabels)
+        && Date.parse(c.createdAt) > acceptedAt;
+    } catch { return false; }
+  });
+}
+
 /**
  * xuxcsw6 — the human-parked referral hold gates EVERY review emission, not only {@link dispatchReviewRow}.
  * The two advisory-fix branches push `kind: 'review'` directly; a parked review posts no fresh advisory note,
@@ -1694,7 +1717,9 @@ function dispatchReviewRow({
   const relabelOwed = !!(headSha && reviewedSha && reviewedSha === headSha)
     && acceptLabelDropped({ labels: withPhase?.labels, comments: pr?.comments, headSha, now });
   if (relabelOwed) extra = { ...extra, relabelOwed: true };
-  if (headSha && reviewedSha && reviewedSha === headSha && !relabelOwed) {
+  // An explicit request releases the recent-accept suppression only; every other gate still applies.
+  const rereviewRequested = currentHeadRereviewRequested({ labels: withPhase?.labels, comments: pr?.comments, headSha });
+  if (headSha && reviewedSha && reviewedSha === headSha && !relabelOwed && !rereviewRequested) {
     // #xconv1 (web-everything/web-everything#2766/#2767 unblock, epic #3383/#4075) — a `needs-human` PR in this
     // EXACT shape (accepted, then escalated — never a fresh push, or `reviewedSha` would no longer equal
     // `headSha`) is NOT the #2588 risk this refusal exists for: `review-pr.mjs`'s own `confirm` step

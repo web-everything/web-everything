@@ -193,7 +193,7 @@ describe('decideSetLabel — totality over REVIEW_LABEL_TARGETS × starting labe
   for (const to of REVIEW_LABEL_TARGETS) {
     for (const names of startingSets) {
       const label = `to='${to}' starting=[${names.join(',')}]`;
-      it(`${label} — never leaves review:accepted and review:changes together, and never drops human unless clear-human`, () => {
+      it(`${label} — never leaves review:accepted and review:changes together, and never drops human unless clear-human or rereview`, () => {
         const currentLabels = names.map((name) => ({ name }));
         const d = decideSetLabel({ to, currentLabels });
         // #2832 supersedes this assertion's original form. #2974 wrote it as "a non-review label is NEVER named
@@ -202,7 +202,7 @@ describe('decideSetLabel — totality over REVIEW_LABEL_TARGETS × starting labe
         // go-ahead on one PR is the contradiction that merged WE #956 and plateau-app #134. So the rule is now
         // conditional on the target, and asserting it in BOTH directions is strictly stronger than the blanket
         // form it replaces — it pins which targets strip and which must not.
-        const HOLD_PRODUCING = new Set(['changes', 'rearm']);   // the targets whose addLabel IS a review hold
+        const HOLD_PRODUCING = new Set(['changes', 'rearm', 'rereview']);   // the targets whose addLabel IS a review hold
         if (!d.allowed) {
           // A refusal changes nothing — the resulting set IS the starting set, and it names NO removals at all
           // (not even the go-ahead: a refused hold must never strip anything).
@@ -219,11 +219,11 @@ describe('decideSetLabel — totality over REVIEW_LABEL_TARGETS × starting labe
         }
         const removals = presentRemoveLabels(d.removeLabels, currentLabels);
         const after = new Set([...names.filter((n) => !removals.includes(n)), d.addLabel]);
-        // (1) review:human survives every allowed swap except clear-human.
-        if (names.includes(REVIEW_LABELS.human) && to !== 'clear-human') {
+        // (1) review:human survives every allowed swap except clear-human or rereview.
+        if (names.includes(REVIEW_LABELS.human) && !['clear-human', 'rereview'].includes(to)) {
           expect(after.has(REVIEW_LABELS.human)).toBe(true);
         }
-        if (to === 'clear-human') {
+        if (['clear-human', 'rereview'].includes(to)) {
           expect(after.has(REVIEW_LABELS.human)).toBe(false);
         }
         // (2) THE #2974 INVARIANT: accepted and changes never coexist in the resulting set.
