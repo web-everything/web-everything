@@ -4421,7 +4421,11 @@ review graph. Uncatchable termination is recovered as a failed done record at th
 The crash backstop re-reads ownership at exit: it requires our claim or our completion PID,
 refuses foreign claims and unreadable evidence, and never replaces a live or unknown foreign PID's
 completion. A PID-less completion requires our claim. Withheld writes log an inspection/re-arm
-fallback; the dispatcher's missing-done recovery still owns subsequent settlement. Crash fixtures
+fallback; the dispatcher's missing-done recovery still owns subsequent settlement. Dispatch uses
+`tryReadCompletion` without swallowing corrupt/unreadable evidence into absence. Recovery retains
+pending state unless its PID is proven dead, and never synthesizes over a live or unknown foreign
+completion writer. Missing/oversized pending PIDs require inspection and explicit re-arm; a missing
+or corrupt job claim alone is never evidence that a process died. Crash fixtures
 must seed the dispatcher's own-PID claim; the foreign-live-PID import regression seeds the parent
 process's started record before handler installation and compares its bytes after the child exits.
 The lifecycle receipt for red-team-only jobs is separate so it cannot replace a panel verdict.

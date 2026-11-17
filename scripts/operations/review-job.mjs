@@ -1396,7 +1396,7 @@ export function dispatchReviewJob({
   pr, repo, preferLane = null, root = REPO_ROOT, env = process.env, now = Date.now(), checkStaleness,
   dir = reviewJobsDir(env, root),
   spawnJob = defaultSpawnJob,
-  readCompletion = (slug) => { try { return tryReadCompletion(slug); } catch { return null; } },
+  readCompletion = tryReadCompletion,
   resolveSettingsEnv = () => resolveGhShimSettingsEnv(undefined),
   isAlive = pidAlive,
   checkoutExists = existsSync, home = homedir(), expectedHead, io = createReviewJobIo({ root, env }),
@@ -1439,7 +1439,8 @@ export function dispatchReviewJob({
     if (!redTeamOnly) {
       const head = ci?.headSha;
       if (!isRealHead(head)) return { ...base, jobPid: null, skipped: 'review-job-head-unreadable' };
-      retry = settleReviewJobRetry({ slug, repo: planned.repo, head, dir, completion, cap: policy.jobFailureCap, terminal: retryTerminal });
+      retry = settleReviewJobRetry({ slug, repo: planned.repo, head, dir, completion, cap: policy.jobFailureCap, terminal: retryTerminal, isAlive });
+      if (retry.skipped) return { ...base, jobPid: null, skipped: retry.skipped };
       if (retry.parked) {
         if (!retry.notified) {
           publishNeedsYou({ repo: planned.repo, pr: planned.pr, head: retry.head, kind: 'review-job-exhausted',

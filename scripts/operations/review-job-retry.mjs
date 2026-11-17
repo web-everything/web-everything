@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { writeJobRecord, jobRecordPath } from './review-job-store.mjs';
 import { writeReviewJobDone } from './review-job-envelope.mjs';
+import { pidAlive } from '../lib/pid-alive.mjs';
 
 const CLEAN = new Set(['auto-cleared', 'bounced', 'parked', 'carried']);
 export const completionFingerprint = rec => createHash('sha256').update(JSON.stringify(rec ?? null)).digest('hex');
@@ -28,19 +29,28 @@ export function rearmReviewJobRetry({ slug, repo, head, dir }) {
   return writeReviewJobRetry({ slug, repo, head: head.toLowerCase(), attempts: 0, parked: false, notified: false }, dir);
 }
 
-/** Called under the dispatch lock, after proving no live job owns this PR. Missing done counts as failure. */
-export function settleReviewJobRetry({ slug, repo, head, dir, completion, cap, terminal = writeReviewJobDone }) {
+/** Claims can be missing or unreadable: prove pending-writer death independently before settling. */
+export function settleReviewJobRetry({ slug, repo, head, dir, completion, cap, terminal = writeReviewJobDone, isAlive = pidAlive }) {
   let state = readReviewJobRetry(slug, dir);
   const knownHead = state?.head;
   if (state?.repo !== undefined && state.repo !== repo) throw Error('review retry repository mismatch');
   if (state?.pending) {
+    const retain = reason => ({ ...state, skipped: `review-job-pending: ${reason}; inspect claim/completion before re-arming` });
+    const dead = pid => {
+      if (!Number.isSafeInteger(pid) || pid <= 0 || pid > 2 ** 31 - 1) return false;
+      try { return isAlive(pid) === false; } catch { return false; }
+    };
+    if (!dead(state.pending.pid)) return retain('pending PID live or unknown');
     const ownDone = completion?.status === 'done'
       && completionFingerprint(completion) !== state.pending.baseline
       && Date.parse(completion.updatedAt) >= state.pending.at
       && (completion.pid == null || completion.pid === state.pending.pid);
-    if (!ownDone) terminal({ session: slug, pr: state.pending.pr, repo,
-      ...(state.pending.pid ? { pid: state.pending.pid } : {}),
-      classified: { outcome: 'blocked-on-infra', label: 'review-job process exited without a done record' } });
+    if (!ownDone) {
+      if (completion !== null && completion?.pid !== state.pending.pid && !dead(completion?.pid))
+        return retain('completion PID live or unknown');
+      terminal({ session: slug, pr: state.pending.pr, repo, pid: state.pending.pid,
+        classified: { outcome: 'blocked-on-infra', label: 'review-job process exited without a done record' } });
+    }
     if (!state.parked && ownDone && CLEAN.has(completion.outcome)) state.attempts = 0;
     delete state.pending;
   }
