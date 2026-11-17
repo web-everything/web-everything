@@ -349,6 +349,10 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       readComments,
       readStatus,
       postComment,
+      // The empty-diff proof is re-read in the prepared review checkout, with hardened lane Git; no
+      // checkout leaves cwd unset, and missing objects fail the proof closed (operator hold).
+      cwd: input.carry?.lanePath ?? input.lanePath,
+      gitExec: (file, args, options) => exec(file, args, { ...options, env: laneGitHardeningEnv(env) }),
       ...(input.carry ? { carry: createRedTeamCarryIo({ env, readStatus, writeStatus, readEvidence,
         readLive: ({ repo, pr }) => provider.readPrState(repo, pr), readComments,
         lanePath: input.carry.lanePath,
@@ -983,7 +987,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
         const readHead = isRealHead(rev) ? rev : null;
         const head = readHead ?? seatsBox.laneHead;
         const settled = io.settleRedTeamSkip({ redTeam: settlementOutcome, repo: out.repo, pr: out.pr,
-          head, readHead, runId: out.runId });
+          head, readHead, runId: out.runId, lanePath: seatsBox.input?.lanePath });
         out.redTeam = { ...out.redTeam, ...settled };
       } catch (error) {
         try { io.log(`review-job ${out.sessionSlug}: red-team skip settlement failed (${tail(error?.message ?? error, 300)})`); }
