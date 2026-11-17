@@ -11,8 +11,7 @@ import { defaultReadRequiredStatusChecks } from '../lib/required-status-checks.m
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { latestUnresolvedStandDown } from '../conveyor/stand-down-answer-core.mjs';
 import { standDownReason } from '../conveyor/stand-down.mjs';
-import { listFixDispatchClaims, fixDispatchSessionName } from '../conveyor/fix-claim-store.mjs';
-import { isClaimSessionLive } from '../conveyor/fix-dispatch-claim.mjs';
+import { listFixDispatchClaims, fixDispatchSessionName, claimedFixerLiveness, claimPidAlive } from '../conveyor/fix-claim-store.mjs';
 import { listBuildDispatchHolds } from '../conveyor/build-dispatch-claim.mjs';
 import { listBuildBackoffs } from '../conveyor/build-dispatch-failures.mjs';
 import { countGrantedRoundExtensions } from '../conveyor/round-extension-mark.mjs';
@@ -40,6 +39,7 @@ export function createWhyReader({
   readAgents = () => JSON.parse(run('claude', ['agents', '--json', '--all'], { encoding: 'utf8', timeout: 30000, maxBuffer: 32 * 1024 * 1024 })),
   listPrs = (repo, { state = 'open' } = {}) => JSON.parse(run('gh', ['pr', 'list', '--repo', repo, '--state', state, '--limit', '10000', '--json', 'number,title,headRefName,labels,state'], { encoding: 'utf8', timeout: 60000, maxBuffer: 32 * 1024 * 1024 })),
   now = Date.now,
+  isAlive = claimPidAlive,
 } = {}) {
   return ({ pr = 0, item = '', repo }) => {
     const subject = { kind: pr ? 'pr' : 'item', id: pr || item.trim() }, gaps = [];
@@ -86,11 +86,9 @@ export function createWhyReader({
       }
     }
     const claims = safe('fix claims', () => readClaims(), []).filter(c => [key, repo].includes(c.meta?.repo) && c.meta?.pr === pr && ['fix', 'ci-heal'].includes(c.meta.kind));
-    let agents = null;
-    if (claims.length) agents = safe('claim sessions', () => { const result = readAgents(); const rows = result.agents ?? result; if (!Array.isArray(rows)) throw new Error('expected agents array'); return rows; }, null);
     facts.claims = claims.map(c => {
       const session = c.meta.who ?? fixDispatchSessionName({ repo: key, pr, kind: c.meta.kind });
-      return { ...c, session, kind: c.meta.kind, live: agents ? isClaimSessionLive({ repo: key, pr, kind: c.meta.kind, agentsAll: agents, name: session }) : null };
+      return { ...c, session, kind: c.meta.kind, ...claimedFixerLiveness(c, { nowMs: now(), isAlive }) };
     });
     const itemId = pr ? cardForPr(allPrs.find(p => p.number === pr)) : subject.id;
     const matches = r => String(r.num ?? r.meta?.num) === String(itemId) && (!r.meta?.repo || [key, repo].includes(r.meta.repo));

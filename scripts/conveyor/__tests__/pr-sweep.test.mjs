@@ -598,9 +598,9 @@ describe('R502 wait state replaces the implied daemon owner', () => {
   };
   it('resolveWaitState: live claim beats refusal beats parked; nothing known stays null', async () => {
     const { resolveWaitState } = await import('../pr-sweep-core.mjs');
-    const refusal = { kind: 'refusal', at: new Date(now - 10 * 60000).toISOString(), reason: 'review-referrals-pending', name: 'fix-dispatch-daemon' };
+    const refusal = { kind: 'refusal', head: open.headRefOid, at: new Date(now - 10 * 60000).toISOString(), reason: 'review-referrals-pending', name: 'fix-dispatch-daemon' };
     const ctx = { now };
-    expect(resolveWaitState(open, { fixClaim: { who: 'fix-12' }, daemons: [refusal] }, ctx)).toMatchObject({ kind: 'live-claim' });
+    expect(resolveWaitState(open, { fixClaim: { who: 'fix-12', pid: 1, pidAlive: true, heartbeatAt: new Date(now).toISOString() }, daemons: [refusal] }, ctx)).toMatchObject({ kind: 'live-claim' });
     expect(resolveWaitState(open, { daemons: [refusal] }, ctx)).toMatchObject({ kind: 'refused', detail: expect.stringContaining('review-referrals-pending') });
     expect(resolveWaitState({ ...open, labels: ['review:human'] }, {}, ctx)).toMatchObject({ kind: 'parked' });
     // freshness: a months-old refusal, or no clock, is not a wait state
@@ -634,7 +634,7 @@ describe('R502 wait state replaces the implied daemon owner', () => {
   });
   it('the sweep decisions carry the wait state from owner signals', async () => {
     const out = await runPrSweep({ now, config: {}, settings: { value: settings, sources: {} }, readPrevious: () => null, readPrs: () => [open],
-      readQueue: () => ({ ready: [], rulingNeeded: [] }), readSignals: () => ({ [`${ghRepoSlug(open.repo)}#12`]: { fixClaim: { who: 'fix-12' }, daemons: [], sessions: [] } }),
+      readQueue: () => ({ ready: [], rulingNeeded: [] }), readSignals: () => ({ [`${ghRepoSlug(open.repo)}#12`]: { fixClaim: { who: 'fix-12', pid: 1, pidAlive: true, heartbeatAt: new Date(now).toISOString() }, daemons: [], sessions: [] } }),
       notify: () => ({ ok: false }), persist: () => {}, append: () => {}, flush: () => {}, stallSweep: () => ({ mode: 'off' }) });
     expect(out.decisions[0].waitState).toMatchObject({ kind: 'live-claim' });
     expect(out.decisions[0].violation).not.toBe('owner-stale');
@@ -644,7 +644,7 @@ describe('R502 wait state replaces the implied daemon owner', () => {
 it('R502: collectOwnerSignals attaches the live fixer claim as evidence and tolerates a failing claim read', async () => {
   const base = { prs: [pr], dir: tmpdir(), env: {}, errors: [], readAgents: () => [], cloneRoots: () => [], listLogs: () => [], readHealth: () => ({}) };
   const withClaim = await collectOwnerSignals({ ...base, readClaim: () => ({ meta: { who: 'fix-12', claimedAt: 'x' } }) });
-  expect(withClaim[`${pr.repo}#12`].fixClaim).toEqual({ who: 'fix-12', claimedAt: 'x' });
+  expect(withClaim[`${pr.repo}#12`].fixClaim).toMatchObject({ live: null, pidAlive: null, meta: { who: 'fix-12', claimedAt: 'x' } });
   const errors = [];
   const broken = await collectOwnerSignals({ ...base, errors, readClaim: () => { throw new Error('EACCES'); } });
   expect(broken[`${pr.repo}#12`].fixClaim).toBeUndefined();

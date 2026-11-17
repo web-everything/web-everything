@@ -12,6 +12,27 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { readLockEntry, parseLockEntry, isLeaseExpired } from '../readiness/file-locks.mjs';
 import { mintSessionSlug } from './session-slug.mjs';
+/** Only a missing process proves death; an unreadable probe remains unknown. */
+export function claimPidAlive(pid, kill = (p, signal) => process.kill(p, signal)) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  try { kill(pid, 0); return true; }
+  catch (error) { return error?.code === 'ESRCH' ? false : error?.code === 'EPERM' ? true : null; }
+}
+
+/** Read current process and lease evidence; a persisted `live` value is never evidence. */
+export function claimedFixerLiveness(entry, { nowMs = Date.now(), isAlive = claimPidAlive } = {}) {
+  if (!entry) return { live: false, pidAlive: false };
+  const pid = entry.meta?.runnerPid ?? entry.pid;
+  let alive = null;
+  if (Number.isSafeInteger(pid) && pid > 0) {
+    try { const observed = isAlive(pid); alive = typeof observed === 'boolean' ? observed : null; } catch { /* unknown probe */ }
+  }
+  const at = Date.parse(entry.heartbeatAt ?? '');
+  const ttl = Number(entry.meta?.ttlMinutes ?? DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES);
+  const fresh = Number.isFinite(at) && Number.isFinite(nowMs) && at <= nowMs + 60_000
+    && ttl > 0 && nowMs - at <= ttl * 60_000;
+  return { live: alive === null ? null : alive === true && fresh, pidAlive: alive };
+}
 
 /** How long an unreleased claim survives before a DIFFERENT owner may reclaim it (dead-holder floor). Chosen
  *  well above the measured 26+s `claude agents --json --all` listing lag ({@link ../operations/dispatch-lane-io.mjs})

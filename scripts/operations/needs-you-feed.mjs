@@ -9,9 +9,11 @@ import { dirname, join, resolve, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { handoffHome } from './handoff-home.mjs';
 import { humanReviewHold } from './pr-sweep-core.mjs';
-import { liveResultGateState, parseRedTeamComment, RED_TEAM_COMMENT_MARKER, readRedTeamDisposition } from '../lib/red-team-gate.mjs';
-import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { currentHeadHumanReviewGates } from '../lib/human-review-gates.mjs';
+import { openBasePr } from '../lib/open-pr-base.mjs';
+import { liveResultGateState, readRedTeamDisposition } from '../lib/red-team-gate.mjs';
 import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
+import { claimedFixerLiveness } from '../conveyor/fix-claim-store.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { isLaneLocus, workspaceRootOf } from '../guard-lane.mjs';
 import { daemonCloneRoots, isDaemonCloneRealpath } from '../lib/daemon-clone-registry.mjs';
@@ -97,37 +99,6 @@ export function itemsFromReport(report) {
 // For the approval alert every confirmed break (degraded as well as broken) counts, whatever the send-back policy;
 // a break the gate already released (recorded card/advisory/ruling) no longer holds.
 const ALERT_BREAK_POLICY = Object.freeze({ broken: 'send-back', degraded: 'send-back', unconfirmed: 'advisory' });
-// The parser silently drops a finding line it cannot read; the comment's own headline counts them. Any result
-// comment for the live head whose headline disagrees with what parsed is not a clean pass (fail closed).
-function headlineAgrees(comments, pr, head) {
-  const live = String(head ?? '').toLowerCase();
-  return (Array.isArray(comments) ? comments : []).every(c => {
-    if (!isTrustedMarkerAuthor(c)) return true; // untrusted text is data, never a veto
-    const whole = typeof c === 'string' ? c : c?.body;
-    const lines = typeof whole === 'string' ? whole.replace(/\r\n/g, '\n').split('\n') : [];
-    // Every embedded result counts, carried wrappers included (liveResultGateState reads those too).
-    return lines.every((line, at) => {
-      if (!line.trimStart().toLowerCase().startsWith(RED_TEAM_COMMENT_MARKER)) return true; // same leniency as the shared parser
-      const body = lines.slice(at).join('\n').trimStart(), parsed = parseRedTeamComment(body);
-      if (!parsed) {
-        // Repair only the delimiter to ask the shared parser which PR/head this marker names.
-        // Malformed live or unscopable evidence still vetoes approval; unrelated history does not.
-        const scope = parseRedTeamComment(`${line.split('-->', 1)[0].trimEnd()} -->`);
-        return scope !== null && (scope.pr !== Number(pr) || scope.rev !== live);
-      }
-      return parsed.pr !== Number(pr) || parsed.rev !== live || resultAgrees(body, parsed);
-    });
-  });
-}
-function resultAgrees(body, parsed) {
-  {
-    const clean = /^### Post-accept red team — no break found$/m.test(body);
-    const counted = /^### Post-accept red team — (\d+) possible break\(s\), (\d+) confirmed/m.exec(body);
-    if (clean) return parsed.findings.length === 0;
-    return !!counted && Number(counted[1]) === parsed.findings.length
-      && Number(counted[2]) === parsed.findings.filter(f => f.confirmed).length;
-  }
-}
 // Items whose verdict came from a live read of the PR (the only evidence that may retire a confirmed-break alert).
 const LIVE_VERIFIED = new WeakSet();
 const verified = item => { LIVE_VERIFIED.add(item); return item; };
@@ -221,7 +192,7 @@ export function monitorCommand(path = feedPath()) {
   path = checkedFeedPath(path);
   return `tail -n 0 -F '${path.replace(/'/g, "'\\''")}' | grep --line-buffered NEEDS-YOU`;
 }
-async function readLivePr(item, { gh, cwd }, fields = 'labels,headRefOid') {
+async function readLivePr(item, { gh, cwd }, fields = 'labels,headRefOid,statusCheckRollup,baseRefName,headRefName') {
   const opts = { cwd, encoding: 'utf8', timeout: 60000, killSignal: 'SIGKILL', maxBuffer: 256 * 1024 * 1024 };
   const view = JSON.parse(String(await gh('gh', ['pr', 'view', String(item.pr), '--repo', item.repo, '--json', fields], opts)));
   const pages = JSON.parse(String(await gh('gh', ['api', '--paginate', '--slurp', `repos/${item.repo}/issues/${item.pr}/comments?per_page=100`], opts)));
@@ -236,7 +207,7 @@ async function readLivePr(item, { gh, cwd }, fields = 'labels,headRefOid') {
  * that came from the queue's `ready` section are judged. Returns `{kept, held}`.
  */
 export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(), log = console.error, deadlineMs = 120000, concurrency = 4,
-  fixClaimLive = (repo, pr) => { try { return readLiveFixClaim({ repo, pr }) !== null; } catch { return null; } } } = {}) {
+  fixClaimLive = (repo, pr) => { try { return claimedFixerLiveness(readLiveFixClaim({ repo, pr }), { nowMs: now }).live; } catch { return null; } } } = {}) {
   // "your review" and "needs your merge" rows both ask the operator to approve: both pass the same live red-team gate.
   const ready = new Set([...(report.ready ?? []), ...(report.needsYourMerge ?? [])].map((r) => `${r.repo}#${r.number ?? r.pr}`));
   const deadline = Date.now() + deadlineMs;
@@ -256,6 +227,16 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
       if (!Array.isArray(view.labels)) throw new Error('the live PR read has no labels');
       // Publish the head actually checked, not a stale report head or a later lookup.
       checked = { ...item, head: view.headRefOid };
+      if (view.baseRefName && view.baseRefName !== 'main') {
+        const bases = JSON.parse(String(await gh('gh', ['pr', 'list', '--repo', item.repo, '--state', 'open',
+          '--head', view.baseRefName, '--limit', '100', '--json', 'number,state,headRefName'],
+        { cwd, encoding: 'utf8', timeout: 60000, maxBuffer: 1024 * 1024 })));
+        if (!Array.isArray(bases) || bases.length >= 100 || bases.some(p => !Number.isSafeInteger(p?.number)
+          || p.number <= 0 || typeof p.headRefName !== 'string' || p.state !== 'OPEN')) throw new Error('open base PR evidence incomplete');
+        const base = openBasePr({ ...view, repo: item.repo }, bases.map(p => ({ ...p, repo: item.repo })));
+        if (base) { held.push({ item, reasons: [`waiting on open base PR #${base.number}`] }); return; }
+      }
+      const gates = currentHeadHumanReviewGates({ ...view, number: item.pr, repo: item.repo });
       const reasons = humanReviewHold({ ...view, labels: view.labels ?? [] }, now,
         { fixClaimLive: fixClaimLive(item.repo, item.pr) });
       const state = liveResultGateState(view.comments, item.pr, view.headRefOid, item.repo);
@@ -276,7 +257,7 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
         out[index] = verified({ ...stripAction(checked), kind: 'confirmed-break-owed-send-back',
           reason: 'a confirmed red-team break is owed a send-back on the live head' });
       } else if (publicationPending) out[index] = undecided(checked);
-      else if (state.result !== null && !state.result.findings.some(f => f.recheckOutcome === 'unverifiable') && headlineAgrees(view.comments, item.pr, view.headRefOid)) out[index] = verified(checked);
+      else if (gates.eligible && state.result !== null) out[index] = verified(checked);
       else out[index] = undecided(checked);
     } catch (error) { log(`needs-you-feed ${item.repo}#${item.pr} live gate unreadable, keeping: ${error.message}`); out[index] = undecided(checked); }
   };

@@ -1,3 +1,4 @@
+import { withHumanReviewEvidence } from '../../lib/__tests__/helpers/human-review-evidence.mjs';
 /** @file pr-stall-classify.test.mjs
  * @description The stall sweep's pure classifier: every waiting state x every judge verdict, fail-closed paths, guard
  *   paths, the round ceiling, and the never-automatic actions.
@@ -6,16 +7,17 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { classifyStall, CLASSIFY_DEFAULTS, demoteNeverAutomatic, JUDGED_STATES, NEVER_AUTOMATIC, POLICY_ACTOR } from '../pr-stall-classify.mjs';
+import { SKIP_KINDS } from '../../lib/drain-skip-reasons.mjs';
 import { MAX_TOTAL_ROUND_EXTENSIONS } from '../round-extension-mark.mjs';
 import { planStallActions } from '../pr-stall-sweep.mjs';
 
 const REPO = 'web-everything/web-everything';
 const HEAD = 'ABCDEF0123456789ABCDEF0123456789ABCDEF01';
 const ACTOR = { 'system:fix-stood-down': 'system', 'system:ledger-write-miss': 'system', 'system:stale-hold': 'system', 'red-team-sent-back-cleared': 'nobody',
-  'awaiting-review': 'reviewer', 'human-review-pending-advisory': 'reviewer', 'red-team-pending': 'red-team', 'drain-skip:red-team-pending': 'red-team',
+  'awaiting-review': 'reviewer', 'human-review-pending-advisory': 'reviewer', 'human-review-pending-gates': 'reviewer', 'red-team-pending': 'red-team', 'drain-skip:red-team-pending': 'drain',
   fixing: 'fixer', 'sent-back-red-team': 'fixer', draft: 'fixer', 'ci-failed': 'fixer', 'awaiting-ci': 'ci', 'ready-to-merge': 'drain',
   'in-merge-queue': 'drain', 'drain-skip:queue-file-overlap': 'drain', 'drain-skip:overlap-yield': 'drain', 'drain-skip:ready-not-reached': 'drain' };
-const row = (waitingOn, o = {}) => ({ repo: REPO, number: 77, waitingOn, actor: ACTOR[waitingOn] ?? 'operator', stalled: true, liveJob: null,
+const row = (waitingOn, o = {}) => ({ repo: REPO, number: 77, waitingOn, actor: waitingOn.startsWith('drain-skip:') ? 'drain' : ACTOR[waitingOn] ?? 'operator', ageMinutes: 121, stalled: true, liveJob: null,
   why: 'x', evidence: ['e1', 'e2', 'e3', 'e4'], next: { summary: 's', command: `next-for ${waitingOn}` }, ...o });
 const finding = (cls, file = 'scripts/foo.mjs') => ({ file, line: 3, summary: `${cls}: the claim must be released before the push`, cls, priorAppearances: 0 });
 const TRIGGER = { 'ruling-needed:referral-hold': 'referral-hold', 'ruling-needed:red-team-round-cap': 'red-team-cap', 'at-round-limit': 'review-cap' };
@@ -62,16 +64,17 @@ const FIXED = {
   'red-team-sent-back-cleared': ['system', 'rerun-red-team-gate'],
   'awaiting-review': ['system', 'ask-review-daemon'],
   'human-review-pending-advisory': ['system', 'ask-review-daemon'],
+  'human-review-pending-gates': ['system', 'ask-review-daemon'],
   'red-team-pending': ['system', 'ask-review-daemon'],
-  'drain-skip:red-team-pending': ['system', 'ask-review-daemon'],
+  'drain-skip:red-team-pending': ['system', 'tooling-card'],
   fixing: ['system', 'tooling-card'], 'sent-back-red-team': ['system', 'tooling-card'], draft: ['system', 'tooling-card'],
   'ci-failed': ['system', 'tooling-card'], 'awaiting-ci': ['system', 'tooling-card'], 'ready-to-merge': ['system', 'tooling-card'],
   'in-merge-queue': ['system', 'tooling-card'], 'drain-skip:queue-file-overlap': ['system', 'tooling-card'],
   'drain-skip:ready-not-reached': ['system', 'tooling-card'], 'drain-skip:overlap-yield': ['system', 'tooling-card'],
-  'drain-skip:escalated': ['operator', 'unclassified'], 'drain-skip:unknown': ['operator', 'unclassified'],
+  'drain-skip:escalated': ['system', 'tooling-card'], 'drain-skip:unknown': ['operator', 'unclassified'],
   'ruling-needed:dispute': ['operator', 'ruling-needed:dispute'], 'needs-decision:note': ['operator', 'needs-decision:note'],
   'draft-withdrawn': ['operator', 'draft-withdrawn'], 'needs-you': ['operator', 'needs-you'], 'human-review': ['operator', 'human-review'],
-  'drain-skip:not-certified': ['operator', 'drain-skip:not-certified'], unclassified: ['operator', 'unclassified'],
+  'drain-skip:not-certified': ['system', 'tooling-card'], unclassified: ['operator', 'unclassified'],
   'some-future-state': ['operator', 'unclassified'],
 };
 // Judged states: [lane, action] per verdict, in VERDICT_NAMES order.
@@ -102,9 +105,11 @@ describe('every state x every verdict', () => {
     const src = readFileSync(join(process.cwd(), 'scripts/operations/pr-sweep-core.mjs'), 'utf8');
     const emitted = [...src.matchAll(/done\(([^,]+),/g)].flatMap(([, arg]) => [...arg.replace(/has\('[^']*'\)/g, '').matchAll(/'([^']+)'/g)].map((m) => m[1]));
     expect(emitted.length).toBeGreaterThan(15);
-    for (const s of emitted) expect(Object.keys(FIXED).includes(s) || Object.keys(JUDGED).includes(s), s).toBe(true);
-    const drainKinds = /DRAIN_SKIP_ACTOR = Object\.freeze\(\{([\s\S]*?)\}\)/.exec(src)[1].match(/'([a-z-]+)':/g).map((k) => `drain-skip:${k.slice(1, -2)}`);
-    for (const s of drainKinds) expect(Object.keys(FIXED), s).toContain(s);
+    for (const s of emitted) expect(Object.keys(FIXED).includes(s) || Object.keys(JUDGED).includes(s) || s === 'waiting-on-base', s).toBe(true);
+    for (const kind of SKIP_KINDS) {
+      const result = at(`drain-skip:${kind}`);
+      expect(result?.reason ?? '').not.toContain('unknown waiting state');
+    }
   });
 });
 
@@ -511,7 +516,7 @@ describe('stand-down detection (live #5768 shape)', async () => {
     expect(row).toMatchObject({ waitingOn: 'fixing', stalled: true, liveJob: null });
   });
   it('the owed human review keeps its operator priority over a stand-down', () => {
-    expect(sweep(pr({ labels: [{ name: 'review:human' }, { name: 'advisory:accepted' }] })).waitingOn).toBe('human-review');
+    expect(sweep(withHumanReviewEvidence(pr({ labels: [{ name: 'review:human' }, { name: 'advisory:accepted' }], statusCheckRollup: [{ name: 'unit', conclusion: 'SUCCESS' }] }))).waitingOn).toBe('human-review');
   });
   it('a repair state outranks the human-review exemption', () => {
     expect(sweep(pr({ labels: [{ name: 'review:human' }, { name: 'advisory:accepted' }, { name: 'review:changes' }] })).waitingOn).toBe('system:fix-stood-down');
@@ -597,7 +602,7 @@ describe('pending red-team watchdog evidence', () => {
         reason: expect.stringMatching(/fail-closed: classifier error.*maxRedTeamRestartsPerHead/) });
   });
   it.each(states)('%s retains the daemon fallback when evidence is omitted', state => {
-    expect(at(state)).toMatchObject({ lane: 'system', action: 'ask-review-daemon' });
+    expect(at(state)).toMatchObject({ lane: 'system', action: state.startsWith('drain-skip:') ? 'tooling-card' : 'ask-review-daemon' });
   });
   it.each(states)('%s never acts while a live job is attached', state => {
     for (const status of [null, { status: 'finished', result: { status: 'ran' } }]) {

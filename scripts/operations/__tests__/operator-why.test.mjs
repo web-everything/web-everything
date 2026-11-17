@@ -115,8 +115,8 @@ it('reads daemon paths from plists, binds both claim kinds, and catches individu
     listFiles: () => ['pass-daemon.recovery.log'], listPlists: () => ['com.we.fix'],
     readPlist: () => ({ ProgramArguments: ['node', '/scripts/reconcile-fix-dispatch-daemon.mjs'], StandardOutPath: '/declared/fix.log' }),
     tail: path => { if (path === '/declared/fix.log') return { text: 'date #5017 skipped: held' }; throw new Error('tail offline'); },
-    readClaims: () => ['fix', 'ci-heal'].map(kind => ({ meta: { repo: 'we', pr: 5017, kind, who: kind === 'fix' ? 'worker' : 'gone' } })),
-    readAgents: () => [{ name: 'worker', state: 'working' }], readBuildHolds: () => [], readBackoffs: () => [],
+    readClaims: () => ['fix', 'ci-heal'].map(kind => ({ pid: kind === 'fix' ? 42 : 43, heartbeatAt: new Date(0).toISOString(), meta: { repo: 'we', pr: 5017, kind, who: kind === 'fix' ? 'worker' : 'gone' } })),
+    isAlive: pid => pid === 42, readAgents: () => [], readBuildHolds: () => [], readBackoffs: () => [],
     readPrepareFailures: () => { throw new Error('ledger corrupt'); }, now: () => 0,
   });
   const facts = read({ pr: 5017, repo: base.repo });

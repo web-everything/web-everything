@@ -1,5 +1,6 @@
 /** @file Operator readiness gates (label gate, label/comment cross-check, transient mergeability) and the read-only CLI report over inline gh fixtures. */
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { withHumanReviewEvidence } from '../lib/__tests__/helpers/human-review-evidence.mjs';
 import { execFileSync } from 'node:child_process';
 
 vi.mock('node:child_process', () => {
@@ -21,7 +22,7 @@ afterEach(() => vi.restoreAllMocks());
 
 /** A path that never exists, so `main` never reads the real `.conveyor/unsupported-repo.json` sidecar. */
 const NO_UNSUPPORTED = '/nonexistent-operator-queue-test/unsupported-repo.json';
-const HEAD = 'fd37ce270aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+const HEAD = 'fd37ce270aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const BASE = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 /** A LEGACY advisory comment (no `**Advisory outcome:**` line) — the verdict line is all a reader had. */
 const advisory = (head = HEAD, verdict = 'approve', createdAt = '2026-09-18T12:00:00Z') => ({
@@ -35,7 +36,7 @@ const HUMAN = { name: 'review:human' };
 const ACCEPTED = { name: 'advisory:accepted' };
 const CHANGES = { name: 'advisory:changes' };
 const PENDING = { name: 'review:pending' };
-const fixture = (overrides = {}) => ({
+const fixture = (overrides = {}) => withHumanReviewEvidence({
   number: 42, title: 'Ready for review', labels: [HUMAN, ACCEPTED],
   headRefOid: HEAD, mergeable: 'MERGEABLE', comments: [advisory()],
   statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
@@ -80,8 +81,8 @@ describe('evaluatePr', () => {
   it.each([
     { comments: [advisory(HEAD.slice(0, 9))] },
     { headRefOid: HEAD.slice(0, 9) },
-  ])('accepts a matching SHA prefix in either direction', (overrides) => {
-    expect(evaluatePr(fixture(overrides)).ready).toBe(true);
+  ])('accepts an advisory prefix only with a fully pinned current head', (overrides) => {
+    expect(evaluatePr(fixture(overrides)).ready).toBe(!overrides.headRefOid);
   });
 
   it('ignores review-gate failure and accepts skipped and neutral checks', () => {
@@ -233,7 +234,7 @@ describe('main', () => {
       });
       expect(execFileSync).toHaveBeenLastCalledWith('gh', [
         'pr', 'list', '--repo', 'owner/good', '--state', 'open', '--limit', '200', '--json',
-        'number,title,labels,headRefOid,mergeable,statusCheckRollup,isDraft,body,createdAt,comments',
+        'number,title,labels,headRefOid,headRefName,baseRefName,mergeable,statusCheckRollup,isDraft,body,createdAt,comments',
       ], expect.objectContaining({ encoding: 'utf8' }));
       expect(execFileSync.mock.calls.filter(([, args]) =>
         args[args.indexOf('--repo') + 1] === 'owner/broken').length).toBeGreaterThan(1);

@@ -6,6 +6,7 @@ import { stripVTControlCharacters } from 'node:util';
 import { cascadePolicy, formatCascadeSourcesLine, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { redactCommandLine } from '../operations/command-redact.mjs';
 import { scrubText } from './health-watch-core.mjs';
+import { resolveWaitState } from './pr-sweep-core.mjs';
 
 export const DETECTOR_DEFAULTS = { enabled: true, sameLabelMinutes: 60, repeatedReasonCount: 5,
   blockingLabels: ['red-team:pending', 'review:pending', 'status:fixing'] };
@@ -91,7 +92,7 @@ function failureKey(pr) {
 }
 
 /** PURE: retain only current PR/head/label clocks, and emit at most one item per PR/head. */
-export function detectStalls({ prs, daemons = {}, seen = {}, now = Date.now(), settings = DETECTOR_DEFAULTS }) {
+export function detectStalls({ prs, daemons = {}, signals = {}, openPrs = prs, seen = {}, now = Date.now(), settings = DETECTOR_DEFAULTS }) {
   const items = new Map(), nextSeen = {}, errors = [], failedPrKeys = [];
   if (!Array.isArray(prs)) return { items: [], nextSeen, errors: ['PR listing is not an array'] };
   for (const pr of prs) {
@@ -104,6 +105,13 @@ export function detectStalls({ prs, daemons = {}, seen = {}, now = Date.now(), s
       const savedClocks = [...new Set(blocking)].map(label => seen[`${key}@${head}|${label}`]).filter(v => v !== undefined);
       if (savedClocks.some(v => !Number.isFinite(v))) throw new Error('invalid first-seen clock');
       const observedSince = Math.min(now, ...savedClocks);
+      const wait = resolveWaitState(pr, signals[key], { now, openPrs });
+      if (wait?.kind === 'live-claim' || (wait?.kind === 'open-base' && !labels.includes('status:needs-you'))
+        || (wait?.owner === 'drain' && now - observedSince <= wait.deadlineMinutes * 60_000)) {
+        // Preserve the original age so a queue hold cannot renew its deadline every tick.
+        for (const label of new Set(blocking)) nextSeen[`${key}@${head}|${label}`] = observedSince;
+        continue;
+      }
       const eligible = []; let progress = -Infinity;
       for (const entry of entries) {
         // Health refusals carry epoch milliseconds; log entries carry ISO dates (T or space separator).
@@ -177,8 +185,9 @@ export async function runDetector({ prs, readSignals, seen = {}, now = Date.now(
     catch (e) { errors.push(prError(pr, e)); const key = failureKey(pr); if (key) failedPrKeys.push(key); }
   }
   const daemons = {};
+  let signals;
   try {
-    const signals = await readSignals({ prs: filtered });
+    signals = await readSignals({ prs: filtered, now });
     if (!object(signals)) throw new Error('owner signals are not an object');
     for (const pr of filtered) {
       const { key } = identity(pr, resolved.value.blockingLabels);
@@ -189,6 +198,6 @@ export async function runDetector({ prs, readSignals, seen = {}, now = Date.now(
     errors.push(`signals: ${message(e)}`);
     return { enabled, items: [], nextSeen: seen, errors };
   }
-  const out = detectStalls({ prs: filtered, daemons, seen, now, settings: resolved.value });
+  const out = detectStalls({ prs: filtered, openPrs: prs, daemons, signals, seen, now, settings: resolved.value });
   return { ...out, enabled, errors: [...errors, ...out.errors], failedPrKeys: [...failedPrKeys, ...out.failedPrKeys] };
 }

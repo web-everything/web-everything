@@ -5,6 +5,8 @@
 import { findFixerSession } from './health-smells/pr-no-owner.mjs';
 import { parseSessionSlug } from './session-slug.mjs';
 import { repoKeyForSlug, ghRepoSlug } from '../lib/constellation-repos.mjs';
+import { claimedFixerLiveness } from './fix-claim-store.mjs';
+import { openBasePr } from '../lib/open-pr-base.mjs';
 export const prKey = (pr) => `${ghRepoSlug(pr.repo)}#${pr.number}`;
 // Epoch numbers may arrive as numeric strings; everything else is an ISO date.
 const ms = (v) => typeof v === 'number' ? v : /^\d+$/.test(String(v ?? '')) ? Number(v) : Date.parse(v);
@@ -46,6 +48,8 @@ export function resolveOwner(pr, signals = {}) {
   const { now, stuckAfterMinutes = 90, sessionActiveWithinMinutes = 30, operator, smell, daemons = [], sessions = [], unreadSessions = [] } = signals;
   const base = { owner: null, state: 'none', why: 'No owner signal', ownerLastSeenAt: null };
   if (operator) return { ...base, owner: 'operator', state: 'waiting-operator', why: 'NEEDS YOU / RULING NEEDED' };
+  if (!smell && signals.fixClaim && claimedFixerLiveness(signals.fixClaim, { nowMs: now, isAlive: () => signals.fixClaim.pidAlive }).live === true)
+    return { ...base, owner: `fixer:${signals.fixClaim.meta?.who ?? signals.fixClaim.who ?? 'dispatched'}`, state: 'active', why: 'Live fixer process and fresh heartbeat', ownerLastSeenAt: new Date(now).toISOString() };
   const bound = sessions.filter((a) => {
     const slug = parseSessionSlug(a.name);
     return slug ? slug.repo === repoKeyForSlug(pr.repo) && Number(slug.id) === Number(pr.number)
@@ -74,19 +78,34 @@ export function resolveOwner(pr, signals = {}) {
 export const INFORMATIONAL_REFUSAL_KINDS = Object.freeze(new Set(['nothing-owed', 'draft']));
 const refusalKind = (reason) => /(?:reconcile-refused|\brefused)\s+([a-z][a-z0-9-]*)/.exec(String(reason ?? ''))?.[1] ?? null;
 /** R502 item 5 - the REAL reason a PR is waiting, so the sweep stops reporting the implied daemon as a stale owner.
- *  Precedence: a live fixer claim, then the daemon's latest refusal (when no later progress and, if it names a head,
- *  the current head), then a parked PR (draft or `review:human`). Null when nothing is known: the old report stands. PURE. */
-export function resolveWaitState(pr, { fixClaim = null, daemons = [] } = {}, { now = null, maxAgeMinutes = 360 } = {}) {
-  if (fixClaim?.who) return { kind: 'live-claim', detail: String(fixClaim.who) };
+ *  Precedence: a process-probed claim, an open base, then a fresh refusal explicitly bound to the current head.
+ *  Queued and parked PRs have their own waits. Null when nothing is known: ordinary stall detection remains. PURE. */
+export function resolveWaitState(pr, { fixClaim = null, daemons = [] } = {}, { now = null, maxAgeMinutes = 360, openPrs = [] } = {}) {
+  const labels = labelNames(pr) ?? [];
+  if (fixClaim) {
+    const claim = claimedFixerLiveness(fixClaim, { nowMs: now, isAlive: () => fixClaim.pidAlive });
+    if (claim.live === true) return { kind: 'live-claim', detail: String(fixClaim.meta?.who ?? fixClaim.who ?? 'dispatched') };
+    if (claim.pidAlive === true) return { kind: 'fixer-heartbeat-stale', detail: 'fixer process alive; heartbeat not fresh' };
+    if (claim.pidAlive === false) return { kind: 'dead-fixer', detail: 'claimed fixer process is dead' };
+  }
+  const base = openBasePr(pr, openPrs);
+  if (base && !labels.some(l => ['status:needs-you', 'status:at-round-limit'].includes(l))) return { kind: 'open-base', detail: `waiting on base PR #${base.number}`, base: base.number };
   // A refusal is current evidence only when fresh: without a clock, or older than maxAgeMinutes, it is not a wait state.
   const dated = (Array.isArray(daemons) ? daemons : []).filter((d) => Number.isFinite(ms(d?.at)));
   const progressAt = Math.max(-Infinity, ...dated.filter((d) => d.kind === 'progress').map((d) => ms(d.at)));
-  const refusal = dated.filter((d) => d.kind === 'refusal' && Number.isFinite(now) && ms(d.at) <= now + 60000 && now - ms(d.at) <= maxAgeMinutes * 60000 && ms(d.at) > progressAt && (d.head == null || d.head === pr.headRefOid))
+  const refusal = dated.filter((d) => d.kind === 'refusal' && Number.isFinite(now) && ms(d.at) <= now + 60000 && now - ms(d.at) <= maxAgeMinutes * 60000 && ms(d.at) > progressAt && typeof (d.head ?? d.headRefOid) === 'string' && (d.head ?? d.headRefOid).toLowerCase() === String(pr.headRefOid).toLowerCase())
     .sort((a, b) => ms(b.at) - ms(a.at))[0];
   // The daemon's latest word being a purely informational no-op (nothing owed, draft) is not a wait owner: those PRs
   // are queued or parked, not blocked. An unparseable reason is NOT informational (fail closed).
-  if (refusal && !INFORMATIONAL_REFUSAL_KINDS.has(refusalKind(refusal.reason))) return { kind: 'refused', detail: String(refusal.reason ?? '').slice(0, 160), by: refusal.name ?? null, at: new Date(ms(refusal.at)).toISOString() };
-  const labels = labelNames(pr) ?? [];
+  const kind = refusalKind(refusal?.reason);
+  const repair = labels.some(l => ['review:changes', 'status:fixing', 'red-team:pending', 'review:pending', 'status:needs-you', 'status:at-round-limit'].includes(l));
+  const queued = pr.isInMergeQueue === true ? 'merge-queue'
+    : /batching-deferred/.test(refusal?.reason ?? '') ? 'batching'
+      : ['no-lane', 'cap-exhausted'].includes(kind) ? 'capacity'
+        : !repair && (labels.includes('review:accepted') || labels.includes('ready-to-merge')) ? 'accepted-waiting-on-merge' : null;
+  if (refusal && !INFORMATIONAL_REFUSAL_KINDS.has(kind) && !['no-lane', 'cap-exhausted'].includes(kind)
+    && !/batching-deferred/.test(refusal.reason)) return { kind: 'refused', detail: String(refusal.reason ?? '').slice(0, 160), by: refusal.name ?? null, at: new Date(ms(refusal.at)).toISOString() };
+  if (queued) return { kind: queued, detail: `waiting: ${queued}`, owner: 'drain', deadlineMinutes: 120 };
   if (pr.isDraft === true || labels.includes('review:human')) return { kind: 'parked', detail: pr.isDraft === true ? 'draft' : 'review:human' };
   return null;
 }
@@ -114,7 +133,7 @@ export function evaluateInvariant(pr, owner = {}, { now, since = now, settings =
   if (blockedBy.length) nextAction = blockedBy.map(n => `blocked-by #${n}`).join(', ');
   const emptyDiff = pr.changedFiles === 0;
   if (emptyDiff) nextAction = 'close into card';
-  const budget = !emptyDiff && blockedBy.length ? 'wait-on' : nextAction;
+  const budget = !emptyDiff && (blockedBy.length || waitState?.owner === 'drain') ? 'wait-on' : nextAction;
   const configured = settings.deadlineMinutes;
   // The settings cascade accepts a global scalar as well as per-action budgets.
   const minutes = (Number.isFinite(configured) && configured > 0 ? configured : configured?.[budget]) ?? DEADLINE_MINUTES[budget] ?? 45;
@@ -122,12 +141,14 @@ export function evaluateInvariant(pr, owner = {}, { now, since = now, settings =
   const lastSignal = ms(owner.ownerLastSeenAt);
   const stale = owner.state === 'unknown' || owner.state === 'stuck'
     || (Number.isFinite(lastSignal) ? now - lastSignal > (settings.idleMinutes ?? 45) * 60000 : !['active', 'waiting-operator'].includes(owner.state) && now - stateSince(pr, since, now) > (settings.idleMinutes ?? 45) * 60000);
-  const violation = emptyDiff ? 'empty-diff' : blockedBy.length ? 'waiting-on-blocked'
+  const moving = (waitState?.kind === 'live-claim' && !owner.smell && owner.state !== 'unknown') || waitState?.kind === 'open-base';
+  const waiting = waitState?.owner === 'drain' && now <= Date.parse(deadline);
+  const violation = emptyDiff ? 'empty-diff' : moving || waiting ? null : blockedBy.length ? 'waiting-on-blocked'
     : unreadable ? 'owner-stale' : !labels.length ? 'no-labels'
     : now > Date.parse(deadline) ? 'deadline-passed' : stale ? (waitState?.kind && !['unknown'].includes(owner.state) && !owner.smell ? `waiting-${waitState.kind}` : 'owner-stale') : null;
   const implied = nextAction === 'fix' || nextAction === 'rebase' ? 'daemon:fix-dispatch-daemon' : nextAction.startsWith('await-') ? 'daemon:review-daemon' : 'operator';
   // A stale owner with a known wait state reports THAT, never the stale or implied daemon (R502 item 5).
-  const reported = stale && waitState?.kind && owner.state !== 'unknown' && !owner.smell ? `wait:${waitState.kind}` : owner.owner ?? implied;
+  const reported = waitState?.owner === 'drain' ? 'drain' : stale && waitState?.kind && owner.state !== 'unknown' && !owner.smell ? `wait:${waitState.kind}` : owner.owner ?? implied;
   return { owner: reported, nextAction, deadline, violation, ...(waitState?.kind ? { waitState } : {}) };
 }
 export function planSweep({ idle, owners, prevState = {}, needsYou, now, settings, ownerReadsOk = true, prsReadOk = true }) {

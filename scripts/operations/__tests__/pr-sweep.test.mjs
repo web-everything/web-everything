@@ -3,6 +3,7 @@
  * round cap), #5784 (ruling dispute), #5787 (draft-withdrawn), #5771 (red-team result missing, drain skip),
  * #5759 (red-team break sent back, then review:human cleared).
  */
+import { withHumanReviewEvidence } from '../../lib/__tests__/helpers/human-review-evidence.mjs';
 import { readFileSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -335,7 +336,7 @@ describe('red-team request held (#5771)', () => {
   const pr = mkPr({ number: 5771, labels: L('ready-to-merge', 'review:accepted'), updatedAt: '2026-10-21T05:27:40Z' });
   const skips = [{ num: 5771, repo: REPO, kind: 'red-team-pending', reason: 'post-accept red team has no recorded result on the live head' }];
   it('no red-team result and no job for hours is STALLED on the red team', () => {
-    expect(row(sweep([pr], { drainSkips: skips }), 5771)).toMatchObject({ waitingOn: 'red-team-pending', actor: 'red-team', stalled: true });
+    expect(row(sweep([pr], { drainSkips: skips }), 5771)).toMatchObject({ waitingOn: 'drain-skip:red-team-pending', actor: 'drain', stalled: true });
   });
   it('a live review-job for the PR clears the stall', () => {
     expect(row(sweep([pr], { drainSkips: skips, liveJobs: [{ kind: 'review-job', pr: 5771, repo: REPO }] }), 5771)).toMatchObject({ stalled: false, liveJob: 'review-job' });
@@ -421,9 +422,9 @@ describe('thresholds, drain, ci', () => {
     const g = mkPr({ number: 3, labels: L('ready-to-merge'), statusCheckRollup: [{ name: 'review-gate', conclusion: 'FAILURE' }] });
     expect(row(sweep([g]), 3).waitingOn).toBe('ready-to-merge');
   });
-  it('not-certified drain skip is the operator\'s', () => {
+  it('not-certified drain skip is drain-owned until its deadline', () => {
     const p = mkPr({ number: 4, labels: L('ready-to-merge') });
-    expect(row(sweep([p], { drainSkips: [{ num: 4, repo: REPO, kind: 'not-certified', reason: 'x' }] }), 4)).toMatchObject({ actor: 'operator', stalled: true });
+    expect(row(sweep([p], { drainSkips: [{ num: 4, repo: REPO, kind: 'not-certified', reason: 'x' }] }), 4)).toMatchObject({ actor: 'drain', stalled: false });
   });
   it.each(['not-certified', 'red-team-pending'])('a %s drain skip requires the same repo and PR', (kind) => {
     const p = mkPr({ number: 4, labels: L('ready-to-merge') });
@@ -434,7 +435,7 @@ describe('thresholds, drain, ci', () => {
       expect(sweep([p], { drainSkips: [{ ...skip, kind, reason: 'x' }] }).prs[0]).toEqual(baseline);
     }
     expect(sweep([p], { drainSkips: [{ num: 4, repo: REPO, kind, reason: 'x' }] }).prs[0])
-      .toMatchObject({ waitingOn: kind === 'red-team-pending' ? kind : `drain-skip:${kind}` });
+      .toMatchObject({ waitingOn: `drain-skip:${kind}` });
   });
   it('an unreadable PR list is an error, never an empty sweep', () => {
     expect(() => assessPrSweep({ now: NOW })).toThrow(/unreadable/);
@@ -442,8 +443,8 @@ describe('thresholds, drain, ci', () => {
   it('orders STALLED first, oldest first', () => {
     const r = sweep([
       mkPr({ number: 6, labels: L('ready-to-merge'), updatedAt: '2026-10-21T11:12:00Z' }),
-      mkPr({ number: 9, labels: L('review:human', 'advisory:accepted'), updatedAt: '2026-10-21T11:10:00Z' }),
-      mkPr({ number: 8, labels: L('review:human', 'advisory:accepted'), updatedAt: '2026-10-21T10:00:00Z' }),
+      withHumanReviewEvidence(mkPr({ number: 9, statusCheckRollup: [{ name: 'unit', conclusion: 'SUCCESS' }], labels: L('review:human', 'advisory:accepted'), updatedAt: '2026-10-21T11:10:00Z' })),
+      withHumanReviewEvidence(mkPr({ number: 8, statusCheckRollup: [{ name: 'unit', conclusion: 'SUCCESS' }], labels: L('review:human', 'advisory:accepted'), updatedAt: '2026-10-21T10:00:00Z' })),
       mkPr({ number: 7, labels: L('review:pending'), updatedAt: '2026-10-21T08:00:00Z' }),
     ], { liveJobs: [{ kind: 'review-job', pr: 7, repo: REPO }] });
     expect(r.prs.map((x) => [x.number, x.stalled])).toEqual([[8, true], [9, true], [7, false], [6, false]]);

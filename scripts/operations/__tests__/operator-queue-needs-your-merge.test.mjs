@@ -1,3 +1,4 @@
+import { withHumanReviewEvidence } from '../../lib/__tests__/helpers/human-review-evidence.mjs';
 /**
  * @file operator-queue-needs-your-merge.test.mjs — card 334: an approved PR that touches a workflow or action file
  *   passes every gate but the person-only enqueue, so NEEDS YOU shows it with the one `land-human-only` command
@@ -45,7 +46,7 @@ describe('needs your merge — evaluation', () => {
     expect(needsYourMergePrecheck(pr({ statusCheckRollup: [green('test'), { context: 'legacy', state: 'SUCCESS' }] }))).toEqual([]);
   });
   it('also accepts successful StatusContext checks in the human-review and ceremony paths', () => {
-    const candidate = pr({ statusCheckRollup: [green('test'), { context: 'legacy', state: 'SUCCESS' }] });
+    const candidate = withHumanReviewEvidence(pr({ statusCheckRollup: [green('test'), { context: 'legacy', state: 'SUCCESS' }] }));
     expect(evaluatePr(candidate).reasons.some((reason) => reason.startsWith('CI '))).toBe(false);
     candidate.statusCheckRollup.push({ name: 'merge-gate', status: 'COMPLETED', conclusion: 'FAILURE' });
     expect(evaluateCeremonyOwed(candidate).needsMergeGateVerdict).toBe(true);

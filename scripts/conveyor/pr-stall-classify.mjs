@@ -16,6 +16,7 @@ import { MAX_TOTAL_ROUND_EXTENSIONS } from './round-extension-mark.mjs';
 import { nextActions } from '../operations/pr-sweep-core.mjs';
 import { CARD_REF_RE } from '../lib/referral-card-readable.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
+import { DRAIN_SKIP_DEADLINES } from '../lib/drain-skip-reasons.mjs';
 
 /** Actions no automatic lane may ever take, whatever a verdict says. */
 export const NEVER_AUTOMATIC = Object.freeze(['not-real', 'clear-human', 'accept', 'supersede']);
@@ -76,7 +77,7 @@ function strictClone(x, depth = 0) {
   if (isArr && (out.length !== x.length || Object.keys(out).length !== x.length)) throw new Error('unreadable input: sparse array');
   return out;
 }
-const KNOWN_STATES = () => new Set([...Object.keys(EXPECTED_ACTOR), ...Object.keys(JUDGED_STATES), ...Object.keys(OPERATOR_STATES)]);
+const KNOWN_STATES = () => new Set([...Object.keys(EXPECTED_ACTOR), ...Object.keys(JUDGED_STATES), ...Object.keys(OPERATOR_STATES), ...Object.keys(DRAIN_SKIP_DEADLINES).map(k => `drain-skip:${k}`)]);
 /** Defaults under the caller's values, every leaf validated; anything unknown or invalid throws (fails closed). */
 export function classifySettings(raw = {}) {
   const top = strictClone(raw); // read once; a getter, hidden key or `__proto__` key is refused
@@ -105,11 +106,12 @@ const TOOLING_SMELL = Object.freeze({
   'drain-skip:queue-file-overlap': 'pr-stage-stall', 'drain-skip:overlap-yield': 'pr-stage-stall', 'drain-skip:ready-not-reached': 'pr-stage-stall',
 });
 /** Waits on the review daemon: ask it again, once per head. The sweep never spawns a review job itself. */
-const REVIEW_WAITS = new Set(['awaiting-review', 'human-review-pending-advisory', 'red-team-pending', 'drain-skip:red-team-pending']);
+const REVIEW_WAITS = new Set(['awaiting-review', 'human-review-pending-advisory', 'human-review-pending-gates', 'red-team-pending', 'drain-skip:red-team-pending']);
 /** The actor `deriveWaitingOn` sets for each state an automatic lane may act on. */
 const EXPECTED_ACTOR = Object.freeze({
   'system:ledger-write-miss': 'system', 'system:stale-hold': 'system', 'system:fix-stood-down': 'system', 'red-team-sent-back-cleared': 'nobody',
-  'awaiting-review': 'reviewer', 'human-review-pending-advisory': 'reviewer', 'red-team-pending': 'red-team', 'drain-skip:red-team-pending': 'red-team',
+  'waiting-on-base': 'drain', 'human-review-pending-gates': 'reviewer',
+  'awaiting-review': 'reviewer', 'human-review-pending-advisory': 'reviewer', 'red-team-pending': 'red-team', 'drain-skip:red-team-pending': 'drain',
   fixing: 'fixer', 'sent-back-red-team': 'fixer', draft: 'fixer', 'ci-failed': 'fixer', 'awaiting-ci': 'ci', 'ready-to-merge': 'drain',
   'in-merge-queue': 'drain', 'drain-skip:queue-file-overlap': 'drain', 'drain-skip:overlap-yield': 'drain', 'drain-skip:ready-not-reached': 'drain',
   'drain-skip:mq-same-head-failed': 'drain', 'drain-skip:card-grouped': 'drain',
@@ -205,8 +207,19 @@ function classifyUnsafe(o = {}) {
   if (/\(evidence unreadable/.test(row.why)) return operator('unreadable-evidence', 'the referral thread could not be read; a person must look');
 
   // An automatic or judged state needs the EXACT actor pr-sweep-core gives it; any other is a contradiction a person reads.
-  const want = EXPECTED_ACTOR[state] ?? (JUDGED_STATES[state] ? 'operator' : null);
+  const skipKind = state.startsWith('drain-skip:') ? state.slice('drain-skip:'.length) : null;
+  const drainWait = Object.hasOwn(DRAIN_SKIP_DEADLINES, skipKind ?? '');
+  const want = drainWait ? 'drain' : EXPECTED_ACTOR[state] ?? (JUDGED_STATES[state] ? 'operator' : null);
   if (want && row.actor !== want) return operator('unclassified', `fail-closed: actor ${JSON.stringify(row.actor)} does not fit ${state}`);
+
+  if (state === 'waiting-on-base') return null;
+  if (drainWait && state !== 'drain-skip:unknown-mergeability' && !(state === 'drain-skip:red-team-pending' && redTeam !== undefined)) {
+    if (!Number.isFinite(row.ageMinutes) || row.ageMinutes < 0) return operator('unclassified', 'fail-closed: unreadable drain wait age');
+    if (row.liveJob || row.ageMinutes <= DRAIN_SKIP_DEADLINES[skipKind]) return null;
+    const detail = skipKind === 'mq-same-head-failed' ? 'the same-head merge-queue attempt failed; held until the head changes'
+      : skipKind === 'card-grouped' ? 'the PR is grouped into an open card group; waiting for that group to land' : row.why;
+    return out('system', 'tooling-card', `${detail}; drain wait deadline passed with no live job`, { smell: 'pr-stage-stall' });
+  }
 
   if (state === 'drain-skip:unknown-mergeability') {
     // Reuse the sweep's age; a fresh wall-clock read would give this pure classifier a different clock.

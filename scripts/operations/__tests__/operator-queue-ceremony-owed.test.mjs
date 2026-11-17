@@ -1,3 +1,4 @@
+import { withHumanReviewEvidence } from '../../lib/__tests__/helpers/human-review-evidence.mjs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('node:child_process', async (original) => ({ ...await original(), execFileSync: vi.fn() }));
 vi.mock('../../lib/gh-throttle.mjs', async (original) => ({
@@ -15,7 +16,7 @@ const REPO = 'web-everything/web-everything';
 const HOLD = `human-only: the diff at ${HEAD.slice(0, 9)} touches .github/workflows/ci.yml — only a clear-human ceremony at this exact head can accept it`;
 const check = { name: 'merge-gate', status: 'COMPLETED', conclusion: 'FAILURE',
   detailsUrl: `https://github.com/${REPO}/actions/runs/123/job/456` };
-const pr = () => ({ number: 5193, title: 'Update CI', headRefOid: HEAD, mergeable: 'MERGEABLE', isDraft: false,
+const pr = () => withHumanReviewEvidence({ number: 5193, title: 'Update CI', headRefOid: HEAD, mergeable: 'MERGEABLE', isDraft: false,
   labels: ['ready-to-merge', 'review:accepted'].map((name) => ({ name })), comments: [],
   statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }, check,
     { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' }],
@@ -38,7 +39,7 @@ describe('clear-human ceremony owed at the live head', () => {
     for (const text of ['review-acceptance', 'human-only', HEAD.slice(0, 9), 'review:accepted is stale (from an older head)']) {
       expect(result.reason).toContain(text);
     }
-    expect(evaluate({ ...pr(), labels: [] }).reason).not.toContain('is stale');
+    expect(evaluate({ ...pr(), labels: [{ name: 'red-team:clear' }] }).reason).not.toContain('is stale');
     expect(evaluate(pr(), { ...verdict(), headSha: HEAD.toUpperCase() }).owed).toBe(true);
   });
   it.each(['other head', 'unreadable', 'missing results', 'extra hold', 'no human-only text'])('fails closed: %s', (kind) => {

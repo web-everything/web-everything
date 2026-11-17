@@ -1,3 +1,4 @@
+import { withHumanReviewEvidence } from '../../lib/__tests__/helpers/human-review-evidence.mjs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 
@@ -242,13 +243,13 @@ describe('operator queue read safety', () => {
       { body: '🔁 review — changes requested', author: { login: 'chalbert' }, createdAt: '2026-10-11T09:01:00Z' },
       ...Array.from({ length: 98 }, () => ({ body: 'discussion', author: { login: 'web-everything' } })),
     ];
-    const listed = { ...pr(4631, comments), headRefOid: '572049b31',
+    const listed = withHumanReviewEvidence({ ...pr(4631, comments), headRefOid: '572049b31' + 'a'.repeat(31),
       labels: [{ name: 'review:human' }, { name: 'advisory:accepted' }],
       statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
-    };
+    });
     expect(queue.evaluatePr(listed)).toMatchObject({ ready: false, reasons: expect.arrayContaining(['changes requested']) });
     const fullComments = [
-      ...comments, advisory('572049b31', 'accept', '2026-10-11T10:00:00Z'),
+      ...listed.comments, advisory('572049b31', 'accept', '2026-10-11T10:00:00Z'),
     ];
     execFileSync.mockReturnValueOnce(JSON.stringify([listed])).mockReturnValueOnce(commentTsv(fullComments))
       .mockReturnValueOnce(commentCount(fullComments));

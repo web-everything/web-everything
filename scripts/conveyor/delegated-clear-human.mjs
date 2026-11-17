@@ -21,13 +21,11 @@ import { readDeclaredSettings } from '../lib/settings-files.mjs';
 import { ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { appendDaemonEvent } from '../lib/daemon-events.mjs';
 import { hasReviewLabel, REVIEW_LABELS, scoreEscalation } from '../lib/review-escalation.mjs';
+import { currentHeadHumanReviewGates, redTeamClearAtCurrentHead } from '../lib/human-review-gates.mjs';
 
 export const R11_REASON = 'Standing delegation R11 (operator chalbert, Claude Code chat 2026-10-21 21:50 ET): "Ok, I allow you to approve any of those until this is changed"';
 export const MODES = Object.freeze(['off', 'shadow', 'on']);
 const ACTOR = 'chalbert';
-const OK_CONCLUSIONS = new Set(['SUCCESS', 'NEUTRAL', 'SKIPPED']);
-/** The review hold itself: the one failing check this pass is allowed to look past. */
-const REVIEW_HOLD_CHECK = /^(merge-gate|review-gate)$/i;
 
 /** standard (shadow) < platform < repo < env; invalid layers are ignored and reported. */
 export function resolveDelegatedClearHumanMode({ env = {}, platform = {}, repo = {} } = {}) {
@@ -44,37 +42,21 @@ export function resolveDelegatedClearHumanMode({ env = {}, platform = {}, repo =
 
 const names = (labels) => (labels || []).map((l) => (typeof l === 'string' ? l : l?.name));
 
-function checksPass(rollup) {
-  if (!Array.isArray(rollup) || rollup.length === 0) return { ok: false, why: 'no check rollup' };
-  for (const c of rollup) {
-    const name = c?.name || c?.context || '';
-    if (REVIEW_HOLD_CHECK.test(name)) continue;
-    const verdict = String(c?.conclusion || c?.state || '').toUpperCase();
-    if (!OK_CONCLUSIONS.has(verdict) && verdict !== 'SUCCESS') return { ok: false, why: `check ${name || '?'} is ${verdict || 'pending'}` };
-  }
-  return { ok: true };
-}
-
 /** Pure given its injected readers. Returns `{eligible, failed, evidence}`; any throw or unknown input is a refusal. */
 export function evaluateEligibility(pr, { scoreNet, redTeamClearAtHead } = {}) {
-  const failed = [];
+  const gates = currentHeadHumanReviewGates(pr, { redTeamClearAtHead });
+  const failed = [...gates.failed];
   const labels = pr?.labels || [];
   const head = typeof pr?.headRefOid === 'string' && /^[0-9a-f]{40}$/i.test(pr.headRefOid) ? pr.headRefOid : null;
-  if (!head) failed.push('head not pinned');
   if (!hasReviewLabel(labels, REVIEW_LABELS.human)) failed.push('not review:human');
   const accepted = hasReviewLabel(labels, REVIEW_LABELS.accepted) ? REVIEW_LABELS.accepted
     : names(labels).includes('advisory:accepted') ? 'advisory:accepted' : null;
   if (!accepted) failed.push('no review:accepted / advisory:accepted');
-  const checks = checksPass(pr?.statusCheckRollup);
-  if (!checks.ok) failed.push(checks.why);
   let shape = null;
   if (head) {
     try { shape = scoreNet(pr); } catch { shape = null; }
     if (!shape || shape.scored !== true) failed.push('net diff unscored');
     else if (shape.humanRequired !== false) failed.push('net diff still humanRequired');
-    let rt = false;
-    try { rt = names(labels).includes('red-team:clear') && !!redTeamClearAtHead(pr, head); } catch { rt = false; }
-    if (!rt) failed.push('red-team:clear not proven on the current head');
   }
   return { eligible: failed.length === 0, failed,
     evidence: { head, accepted, redTeam: 'clear', shape: { humanRequired: false, files: shape?.files ?? null }, checks: 'pass apart from the review hold' } };
@@ -147,14 +129,7 @@ export async function liveReaders({ cwd = process.cwd(), repo = ghRepoSlug('we')
 }
 
 export async function liveRedTeam({ repo }) {
-  const { readDrainRedTeamEvidence } = await import('../lib/drain-red-team-evidence.mjs');
-  const { planRedTeamStatusLabels } = await import('../lib/red-team-status-labels.mjs');
-  return (pr, head) => {
-    const evidence = readDrainRedTeamEvidence({ repo, pr: pr.number, head });
-    const plan = planRedTeamStatusLabels({ labels: pr.labels, comments: pr.comments, repo, pr: pr.number, head, evidence });
-    const has = names(pr.labels).includes('red-team:clear');
-    return plan.add === 'red-team:clear' || (has && !plan.remove.includes('red-team:clear') && !plan.add);
-  };
+  return (pr, head) => redTeamClearAtCurrentHead({ ...pr, repo }, head);
 }
 
 async function main(argv) {

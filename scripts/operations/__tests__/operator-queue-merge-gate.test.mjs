@@ -1,3 +1,4 @@
+import { withHumanReviewEvidence } from '../../lib/__tests__/helpers/human-review-evidence.mjs';
 import { describe, expect, it, vi } from 'vitest';
 import { evaluatePr, readMergeGateVerdict } from '../operator-queue.mjs';
 import { formatPrResult, parsePrResultTable } from '../../lib/merge-gate-verdict.mjs';
@@ -36,7 +37,7 @@ const LOG = `2026-10-12T09:49:30.3867808Z merge-gate: workflow self-check — ok
 2026-10-12T09:49:30.3959878Z merge-gate: HOLD — held`;
 const check = { name: 'merge-gate', status: 'COMPLETED', conclusion: 'FAILURE',
   detailsUrl: 'https://github.com/web-everything/web-everything/actions/runs/38232286310/job/114754411476' };
-const pr = () => ({
+const pr = () => withHumanReviewEvidence({
   number: 4965, headRefOid: HEAD, mergeable: 'MERGEABLE',
   labels: ['review:human', 'advisory:accepted', 'review-round:3'].map((name) => ({ name })),
   statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }, check,

@@ -17,7 +17,8 @@ import { handoffHome } from '../operations/handoff-home.mjs';
 import { notifyDesktopChecked } from './branch-sync.mjs';
 import { flushDigest } from '../lib/quiet-hours-io.mjs';
 import { classifyIdlePrs, resolveOwner, planSweep, prKey, isRunningSession, evaluateInvariant, resolveWaitState, stateFingerprint, stateSince, DEADLINE_MINUTES } from './pr-sweep-core.mjs';
-import { readLiveFixClaim } from './fix-procedure.mjs';
+import { listFixDispatchClaims, claimedFixerLiveness, claimPidAlive } from './fix-claim-store.mjs';
+import { openBasePr } from '../lib/open-pr-base.mjs';
 import { buildBlockedMap, sortUnblockersFirst } from './pr-blocked-by.mjs';
 import { createOpenPrCommentReader } from './pr-comments-complete.mjs';
 import { sanitizeForFeed } from '../operations/needs-you-feed.mjs';
@@ -87,14 +88,14 @@ export async function readSweepAgents({ env, listWrapped, readRows } = {}) {
     .map((w) => ({ reason: `wrapped session ${w.name} missing from the agent listing`, session: w.name }))];
   return gaps.length ? Object.defineProperty(rows, 'incomplete', { value: gaps }) : rows;
 }
-export async function collectOwnerSignals({ prs, dir, env, errors, errorSources = [], sourceRoot = ROOT,
+export async function collectOwnerSignals({ prs, dir, env, errors, errorSources = [], sourceRoot = ROOT, now = Date.now(),
   readAgents = () => readSweepAgents({ env }), readActivity = async (agent) => {
     const { readTranscriptTailActivity } = await import('./hung-session.mjs');
     return readTranscriptTailActivity(agent, { tailLines: 15, maxBytes: 400_000, fieldMax: 200 })?.lastActivityMs ?? null;
   }, readHealth = () => JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')),
   cloneRoots = () => daemonCloneRoots(workspaceOf(sourceRoot)), listLogs = readdirSync, readTail = readLogTail,
-  // R502 item 5: the live fixer claim is a wait state of its own; a failed read just means no claim evidence.
-  readClaim = (pr) => readLiveFixClaim({ repo: repoKeyForSlug(pr.repo), pr: Number(pr.number) }),
+  readClaim = null, readClaims = listFixDispatchClaims,
+  isAlive = claimPidAlive,
 }) {
   let sessions = []; let health = {}; const logs = []; let unreadSessions = [];
   const recordError = (source, text) => { errorSources.push({ index: errors.length, source }); errors.push(text); };
@@ -129,6 +130,9 @@ export async function collectOwnerSignals({ prs, dir, env, errors, errorSources 
       logs.push({ name: basename(name, '.log'), text, repo: /plateau/.test(d) ? 'plateau-app' : 'we' });
     }
   }
+  // Read and probe the dispatch inventory once, including workers not yet visible in the agent listing.
+  const claims = readClaim ? [] : (await guarded('fix claims', readClaims, [], 'claims'))
+    .map(c => ({ ...c, ...claimedFixerLiveness(c, { nowMs: now, isAlive }) }));
   return Object.fromEntries(prs.map((pr) => {
     const daemons = [];
     for (const log of logs) for (const line of log.text.split('\n')) {
@@ -144,8 +148,15 @@ export async function collectOwnerSignals({ prs, dir, env, errors, errorSources 
     const episode = Object.values(health.episodes ?? {}).find((e) => ['open', 'flapping'].includes(e.status)
       && ['fixer-stuck', 'fix-claim-held-no-progress', 'ruling-needed-waiting'].includes(e.smell) && mentions(`${e.subject} ${JSON.stringify(e.measure)}`, pr));
     let claim = null;
-    try { claim = readClaim(pr); } catch (e) { claim = null; recordError('claims', `claim ${prKey(pr)}: ${e.message}`); }
-    const fixClaim = claim?.meta?.who ? { who: claim.meta.who, claimedAt: claim.meta.claimedAt ?? null } : null;
+    try {
+      if (readClaim) { const entry = readClaim(pr); claim = entry ? { ...entry, ...claimedFixerLiveness(entry, { nowMs: now, isAlive }) } : null; }
+      else {
+        const mine = claims.filter(c => repoKeyForSlug(c.meta?.repo) === repoKeyForSlug(pr.repo)
+          && Number(c.meta?.pr) === Number(pr.number) && ['fix', 'fixing', 'ci-heal'].includes(c.meta?.kind));
+        claim = mine.find(c => c.live === true) ?? mine.find(c => c.pidAlive === true) ?? mine[0] ?? null;
+      }
+    } catch (e) { recordError('claims', `claim ${prKey(pr)}: ${e.message}`); }
+    const fixClaim = claim;
     return [prKey(pr), { sessions, daemons, smell: episode?.smell, unreadSessions, ...(fixClaim ? { fixClaim } : {}) }];
   }));
 }
@@ -178,7 +189,10 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
   const before = errors.length;
   const signals = await safe('owner signals', () => readSignals({ prs, now, dir, env, errors, sourceRoot }), {});
   const ownerReadsOk = errors.length === before && queueOk;
-  const owners = Object.fromEntries(prs.map((p) => [prKey(p), resolveOwner(p, { ...value, now, ...(signals ?? {})[prKey(p)], operator: needsYou?.some((n) => prKey(n) === prKey(p)) })]));
+  const owners = Object.fromEntries(prs.map((p) => [prKey(p), openBasePr(p, prs) && !needsYou?.some(n => prKey(n) === prKey(p))
+    && !(p.labels ?? []).some(l => ['status:needs-you', 'status:at-round-limit'].includes(typeof l === 'string' ? l : l?.name))
+    ? { owner: 'drain', state: 'waiting-base', why: 'waiting on an open base PR', ownerLastSeenAt: null }
+    : resolveOwner(p, { ...value, now, ...(signals ?? {})[prKey(p)], operator: needsYou?.some((n) => prKey(n) === prKey(p)) })]));
   const clocks = prsReadOk ? {} : { ...previous?.invariantClocks };
   const dependencies = new Map();
   for (const repo of value.repos) {
@@ -190,7 +204,11 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
     const key = prKey(p), fingerprint = stateFingerprint(p), old = previous?.invariantClocks?.[key];
     const since = stateSince(p, old?.fingerprint === fingerprint ? old.since : now, now);
     clocks[key] = { fingerprint, since };
-    return { ...p, ...dependencies.get(key), ...evaluateInvariant(p, owners[key], { now, since, settings: value, waitState: resolveWaitState(p, (signals ?? {})[key], { now, maxAgeMinutes: value.waitStateMaxAgeMinutes }), ...dependencies.get(key) }) };
+    const waitState = resolveWaitState(p, (signals ?? {})[key], { now, maxAgeMinutes: value.waitStateMaxAgeMinutes, openPrs: prs });
+    const decision = evaluateInvariant(p, owners[key], { now, since, settings: value, waitState, ...dependencies.get(key) });
+    if (decision.violation === null && waitState?.owner === 'drain' && owners[key].state !== 'waiting-operator')
+      owners[key] = { owner: 'drain', state: 'waiting-drain', why: waitState.detail, ownerLastSeenAt: null };
+    return { ...p, ...dependencies.get(key), ...decision };
   }));
   const annotate = item => {
     const decision = decisions.find(p => p.repo === item.repo && p.number === item.pr);

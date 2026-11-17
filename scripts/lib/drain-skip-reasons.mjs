@@ -16,7 +16,15 @@ export const SKIP_KINDS = Object.freeze([
   // Former "other" bucket, now named: every skip says which rule held it.
   'not-certified', 'off-base', 'codeql-failed', 'empty-body', 'stale-read', 'escalated',
   'partner-pending', 'ready-not-reached', 'red-main-hold', 'unrecognized-reason', 'card-grouped',
+  'batching-deferred', 'mq-same-head-failed', 'branch-preparation', 'merge-lock-held', 'card-group-hold',
+  'red-team-pending', 'enqueue-backoff', 'live-state-unreadable', 'sent-back',
+  'conflict', 'unconfirmed', 'enqueue-error', 'queue-file-overlap',
+  'bornas-collision', 'bornas-unreadable',
 ]);
+
+/** Drain-owned budgets never use the timestamp of a repeated skip to renew the wait. */
+export const DRAIN_SKIP_DEADLINES = Object.freeze(Object.fromEntries(SKIP_KINDS.map(kind =>
+  [kind, kind === 'unknown-mergeability' ? 15 : 120])));
 
 /** Map a drain reason string to a stable kind. Order matters: the most specific signal wins. */
 export function classifySkipReason(reason) {

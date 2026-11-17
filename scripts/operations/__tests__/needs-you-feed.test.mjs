@@ -342,7 +342,11 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
   const repo = 'o/r';
   const head = '18088fcad0000000000000000000000000000000';
   const report = { ready: [{ repo, number: 5768, title: 't' }], needsYourMerge: [{ repo, number: 9, title: 'm' }] };
-  const gate = (view, comments) => async (_f, args) => (args[0] === 'api' ? JSON.stringify([comments]) : JSON.stringify(view));
+  // Legacy gate fixtures now supply explicit CI and label evidence; result proof still comes from each case.
+  const gate = (view, comments) => async (_f, args) => (args[0] === 'api' ? JSON.stringify([comments]) : JSON.stringify({
+    statusCheckRollup: [{ name: 'unit', status: 'COMPLETED', conclusion: 'SUCCESS' }], ...view,
+    ...(Array.isArray(view.labels) ? { labels: [...view.labels, { name: 'red-team:clear' }] } : {}),
+  }));
   const items = () => itemsFromReport(report);
   const bare = ({ command, pick, ...rest }) => rest; // reclassified items drop the approve/merge instruction
   const gateComments = ({ pr = 5768, rev = head, outcome = GATE_OUTCOMES.NOTHING_TO_SEND, broken = false, impact = 'broken', count = 1 } = {}) => {
@@ -650,7 +654,7 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
   it('the real fix-claim lease overrides the comment heuristic (expired lease = not claimed; live lease = claimed)', async () => {
     const created_at = new Date(Date.now() - 600000).toISOString();
     const body = '🔒 conveyor fix-begin — fix claim held';
-    const gh = async (_f, args) => (args[0] === 'api' ? JSON.stringify([[{ user: { login: 'plateau-worker[bot]' }, body, created_at }, ...gateComments()]]) : JSON.stringify({ headRefOid: head, labels: [] }));
+    const gh = gate({ headRefOid: head, labels: [] }, [{ user: { login: 'plateau-worker[bot]' }, body, created_at }, ...gateComments()]);
     const live = await gateReadyItems(items(), report, { gh, log: () => {}, fixClaimLive: () => true });
     expect(live.held[0].reasons).toEqual(['a fix claim is open']);
     const expired = await gateReadyItems(items(), report, { gh, log: () => {}, fixClaimLive: () => false });

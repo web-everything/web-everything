@@ -35,6 +35,9 @@ import { standDownComments, isStandDownSuperseded, standDownReason, standDownTra
 import { isAdvisoryMechanismStandDownSuperseded } from '../conveyor/advisory-fix-mark.mjs';
 import { isOperatorAnswerStandDownSuperseded } from '../conveyor/stand-down-answer-core.mjs';
 import { CONFIRMED_BREAKS_DEFAULTS, gateOutcomesForHead, parseRedTeamGateMarker, redTeamRulingNeeded, GATE_OUTCOMES } from '../lib/red-team-gate.mjs';
+import { DRAIN_SKIP_DEADLINES } from '../lib/drain-skip-reasons.mjs';
+import { openBasePr } from '../lib/open-pr-base.mjs';
+import { currentHeadHumanReviewGates } from '../lib/human-review-gates.mjs';
 
 export { PR_SWEEP_OP, STALLED_AFTER_MINUTES_DEFAULT };
 /** A fix claim comment with no later release counts as a live fixer for this long. */
@@ -216,11 +219,6 @@ export function nextActions(pr) {
   };
 }
 
-const DRAIN_SKIP_ACTOR = Object.freeze({
-  'red-team-pending': 'red-team', 'not-certified': 'operator', 'queue-file-overlap': 'drain', 'overlap-yield': 'drain',
-  'ready-not-reached': 'drain',
-});
-
 // `review-gate` is the review's own mirror, not CI (operator-queue drops it too).
 const realChecks = (pr) => (Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : [])
   .filter((c) => (c?.name ?? c?.context) !== 'review-gate');
@@ -292,6 +290,10 @@ export function deriveWaitingOn(pr, ctx) {
 
   if (has('status:needs-you')) return done('needs-you', 'operator', labelAt('status:needs-you'), 'the PR carries status:needs-you', actions.humanReview, ['label status:needs-you']);
 
+  const base = openBasePr(pr, ctx.openPrs);
+  if (base) return { ...done('waiting-on-base', 'drain', moved('ready-to-merge', 'review:accepted'),
+    `waiting on open base PR #${base.number}`, null, ['open base branch']), base: base.number };
+
   const outcomes = head ? gateOutcomesForHead(pr.comments, pr.number, head) : new Set();
   const sentBack = outcomes.has(GATE_OUTCOMES.SENT_BACK);
   const fixing = has('review:changes') || has('status:fixing') || has('review-status:fixing') || has('status:sent-back-red-team');
@@ -301,7 +303,8 @@ export function deriveWaitingOn(pr, ctx) {
   // and it comes before the send-back-cleared check (re-running the gate cannot revive a fixer that stood down).
   // The owed human review keeps its operator priority, but only when that IS the state it would get (no draft, repair,
   // CI or red-team wait would be chosen first below).
-  const humanOwed = has('review:human') && has('advisory:accepted') && !pr.isDraft && !fixing && !has('ci:failed') && !failingChecks(pr)
+  const humanGates = has('review:human') && has('advisory:accepted') ? currentHeadHumanReviewGates(pr) : null;
+  const humanOwed = humanGates?.eligible && !pr.isDraft && !fixing && !has('ci:failed') && !failingChecks(pr)
     && !has('status:awaiting-ci') && !has('checking') && !runningChecks(pr) && !has('red-team:pending')
     && !drainSkips.some((x) => x.num === pr.number && (!x.repo || x.repo === pr.repo) && x.kind === 'red-team-pending')
     && !(sentBack && !claim); // a cleared send-back would be chosen first
@@ -331,10 +334,13 @@ export function deriveWaitingOn(pr, ctx) {
   }
 
   const skip = drainSkips.find((s) => s.num === pr.number && s.repo && s.repo === pr.repo);
-  if (has('red-team:pending') || skip?.kind === 'red-team-pending') {
+  if (has('red-team:pending')) {
     return done('red-team-pending', 'red-team', moved('red-team:pending', 'ready-to-merge', 'review:accepted'), `post-accept red team has no result on this head${skip ? ` (drain: ${skip.reason})` : ''}`,
       actions.rerunReview, [has('red-team:pending') ? 'label red-team:pending' : null, skip ? 'drain skip red-team-pending' : null].filter(Boolean));
   }
+  if (humanGates && !humanGates.eligible)
+    return done('human-review-pending-gates', 'reviewer', moved('advisory:accepted', 'review:human'),
+      humanGates.failed.join('; '), actions.rerunReview, ['human review gates']);
   if (has('review:human') && has('advisory:accepted')) return done('human-review', 'operator', labelAt('advisory:accepted', 'review:human'),
     'advisory review accepted; the human review is owed', actions.humanReview, ['labels review:human + advisory:accepted']);
   if (has('review:human')) return done('human-review-pending-advisory', 'reviewer', moved('review:human'), 'review:human with no accepted advisory yet', actions.rerunReview, ['label review:human']);
@@ -345,9 +351,8 @@ export function deriveWaitingOn(pr, ctx) {
   const enqueued = sorted(pr.comments).filter((e) => trusted(e) && ENQUEUE_RE.test(bodyOf(e.c)) && bodyOf(e.c).includes(head ?? '\0')).pop();
   if (has('ready-to-merge') || has('review:accepted')) {
     if (skip) {
-      const actor = DRAIN_SKIP_ACTOR[skip.kind] ?? 'drain';
-      return done(`drain-skip:${skip.kind}`, actor, moved('ready-to-merge', 'review:accepted'), `the drain skipped it: ${skip.reason}`,
-        actor === 'red-team' ? actions.rerunReview : actions.why, ['merge-ai-prs skip-reasons']);
+      return { ...done(`drain-skip:${skip.kind}`, 'drain', moved('ready-to-merge', 'review:accepted'), `the drain skipped it: ${skip.reason}`,
+        actions.why, ['merge-ai-prs skip-reasons']), deadlineMinutes: DRAIN_SKIP_DEADLINES[skip.kind] };
     }
     if (enqueued) return done('in-merge-queue', 'drain', enqueued.at, 'enqueued on the merge queue', null, ['we-drain-enqueue-clearance']);
     return done('ready-to-merge', 'drain', moved('ready-to-merge', 'review:accepted'), 'ready; the drain has not merged it yet', null, ['label ready-to-merge']);
@@ -408,7 +413,7 @@ export function assessPrSweep(read) {
   const thresholdMinutes = Number.isFinite(read.stalledAfterMinutes) && read.stalledAfterMinutes > 0
     ? read.stalledAfterMinutes : STALLED_AFTER_MINUTES_DEFAULT;
   const rows = read.prs.map((pr) => {
-    const d = deriveWaitingOn(pr, { now, drainSkips: read.drainSkips ?? [], liveJobs: read.liveJobs ?? [], holdOptions: read.holdOptions, standDownLapse: read.standDownLapse });
+    const d = deriveWaitingOn(pr, { now, openPrs: read.prs, drainSkips: read.drainSkips ?? [], liveJobs: read.liveJobs ?? [], holdOptions: read.holdOptions, standDownLapse: read.standDownLapse });
     const jobs = jobsFor(pr, read.liveJobs, now);
     // A terminal stand-down already excludes every later claim and live job; an older fix claim is not liveness. A
     // claim COMMENT with no process is liveness only inside the threshold: an orphaned claim is not a fixer at work.
@@ -421,12 +426,13 @@ export function assessPrSweep(read) {
     if (d.actor === 'operator') stalledReason = 'waiting on the operator';
     else if (d.actor === 'nobody') stalledReason = 'nobody owns the next move';
     else if (d.terminal && !live) stalledReason = 'terminal: nothing will move it on this head';
-    else if (!live && ageMinutes !== null && ageMinutes > thresholdMinutes) {
-      stalledReason = `waiting on ${d.actor} for ${ageMinutes} min (> ${thresholdMinutes}) with no live job`;
+    else if (!d.base && !live && ageMinutes !== null && ageMinutes > (d.deadlineMinutes ?? thresholdMinutes)) {
+      stalledReason = `waiting on ${d.actor} for ${ageMinutes} min (> ${d.deadlineMinutes ?? thresholdMinutes}) with no live job`;
     }
     return {
       repo: pr.repo, number: pr.number, title: pr.title ?? '', url: pr.url ?? `https://github.com/${pr.repo}/pull/${pr.number}`,
       waitingOn: d.state, actor: d.actor,
+      ...(d.deadlineMinutes ? { deadline: new Date((d.since ?? now) + d.deadlineMinutes * 60_000).toISOString() } : {}),
       since: d.since === null ? null : new Date(d.since).toISOString(), approxSince: d.approxSince, ageMinutes,
       liveJob: live ? (real[0]?.kind ?? 'checks') : null, why: d.why, evidence: d.evidence,
       stalled: stalledReason !== null, stalledReason,

@@ -18,7 +18,7 @@ import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 export const DEFAULT_REPOS = Object.freeze([CONSTELLATION_REPOS.we.slug, CONSTELLATION_REPOS['plateau-app'].slug]);
 export const DRAIN_LOG = join(homedir(), 'workspace', 'plateau-app', '.drain-daemon', 'daemon.log');
 export const STALLED_AFTER_ENV = 'WE_PR_SWEEP_STALLED_AFTER_MINUTES';
-const LIST_FIELDS = 'number,state,title,url,isDraft,headRefOid,updatedAt,labels,statusCheckRollup,body,createdAt';
+const LIST_FIELDS = 'number,state,title,url,isDraft,headRefOid,headRefName,baseRefName,updatedAt,labels,statusCheckRollup,body,createdAt';
 /** Plain `gh` through execFileSync, deliberately NOT the throttled wrapper: that one creates lock dirs and appends call
  *  logs, and this operation must write nothing. */
 const ghSync = (_file, args, opts) => execFileSync('gh', args, { maxBuffer: 256 * 1024 * 1024, ...opts });

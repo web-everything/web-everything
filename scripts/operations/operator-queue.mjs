@@ -42,6 +42,8 @@ import {
 } from '../lib/advisory-labels.mjs';
 
 import { CONSTELLATION_REPOS, repoKeyForSlug } from '../lib/constellation-repos.mjs';
+import { currentHeadHumanReviewGates } from '../lib/human-review-gates.mjs';
+import { openBasePr } from '../lib/open-pr-base.mjs';
 import { readUnsupported } from '../conveyor/unsupported-repo.mjs';
 // Imports the LIGHTWEIGHT marker module directly, never `stuck-pr-watch-core.mjs` itself — that file pulls in
 // `reconcile-core.mjs`'s much heavier transitive graph (`rearm-review.mjs` → `review-set-label.mjs` →
@@ -170,8 +172,13 @@ export const MERGEABLE_POLL_DELAY_MS = 1000;
  * @returns {{ready: boolean, reasons: string[], transient: boolean}} `transient` is true when the ONLY thing
  *   between this PR and `ready` is GitHub's still-computing mergeability — `ready` is then false and `reasons` empty.
  */
-export function evaluatePr(pr, { redTeamSetting = CONFIRMED_BREAKS_DEFAULTS, mergeGateVerdict } = {}) {
+export function evaluatePr(pr, { redTeamSetting = CONFIRMED_BREAKS_DEFAULTS, mergeGateVerdict, openPrs = [] } = {}) {
   const reasons = operatorSendBackHoldReasons(pr);
+  // Preserve the queue's detailed CI/changes explanations for the same failed gates.
+  reasons.push(...currentHeadHumanReviewGates(pr).failed.filter(reason => !reason.startsWith('check ')
+    && reason !== 'ci:failed label' && reason !== 'approval held by review:changes'));
+  const base = openBasePr(pr, openPrs);
+  if (base) reasons.push(`waiting on open base PR #${base.number}`);
   if (!hasLabel(pr, 'review:human')) reasons.push('no review:human label');
 
   const advisory = latestAdvisory(pr.comments);
@@ -265,8 +272,11 @@ export function evaluatePr(pr, { redTeamSetting = CONFIRMED_BREAKS_DEFAULTS, mer
 }
 
 /** A non-review:human PR owes clear-human only when the live job proves a human-only acceptance hold. Pure. */
-export function evaluateCeremonyOwed(pr, { redTeamSetting = CONFIRMED_BREAKS_DEFAULTS, mergeGateVerdict } = {}) {
+export function evaluateCeremonyOwed(pr, { redTeamSetting = CONFIRMED_BREAKS_DEFAULTS, mergeGateVerdict, openPrs = [] } = {}) {
   const reasons = operatorSendBackHoldReasons(pr);
+  reasons.push(...currentHeadHumanReviewGates(pr).failed);
+  const base = openBasePr(pr, openPrs);
+  if (base) reasons.push(`waiting on open base PR #${base.number}`);
   if (pr.isDraft) reasons.push('draft PR');
   for (const label of ['review:human', 'review:changes', 'review:pending', 'status:sent-back-red-team', 'ci:failed', 'merge-status:conflicting']) {
     if (hasLabel(pr, label)) reasons.push(`${label} label`);
@@ -662,7 +672,7 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
   };
   for (const repo of repoSlugs) {
     try {
-      const fields = 'number,title,labels,headRefOid,mergeable,statusCheckRollup,isDraft,body,createdAt';
+      const fields = 'number,title,labels,headRefOid,headRefName,baseRefName,mergeable,statusCheckRollup,isDraft,body,createdAt';
       const listing = ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '200', '--json'];
       const completePr = (pr) => {
         try {
@@ -695,11 +705,11 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
       const redTeamSetting = readConfirmedBreaks().value;
       for (const listed of prs.filter((candidate) => hasLabel(candidate, 'review:human'))) {
         let pr = listed;
-        let result = evaluatePr(pr, { redTeamSetting });
+        let result = evaluatePr(pr, { redTeamSetting, openPrs: prs });
         let mergeGateVerdict;
         if (result.needsMergeGateVerdict) {
           mergeGateVerdict = readMergeGateVerdict({ repo, check: result.mergeGateCheck, number: pr.number });
-          result = evaluatePr(pr, { redTeamSetting, mergeGateVerdict });
+          result = evaluatePr(pr, { redTeamSetting, mergeGateVerdict, openPrs: prs });
         }
         // Only a PR that would otherwise be ready is worth re-polling — one with a real failure is not-ready
         // whatever GitHub says about mergeability.
@@ -707,7 +717,7 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
           pr = { ...pr, mergeable: pollMergeable({
             repo, number: pr.number, sleep, attempts: pollAttempts, delayMs: pollDelayMs,
           }) };
-          result = evaluatePr(pr, { redTeamSetting, mergeGateVerdict });
+          result = evaluatePr(pr, { redTeamSetting, mergeGateVerdict, openPrs: prs });
         }
         const row = { repo, number: pr.number, title: pr.title };
         if (result.ready) {
@@ -722,10 +732,10 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
           report.notReady.push({ repo, number: pr.number, title: pr.title, reasons: sendBackReasons });
           continue;
         }
-        let result = evaluateCeremonyOwed(pr, { redTeamSetting });
+        let result = evaluateCeremonyOwed(pr, { redTeamSetting, openPrs: prs });
         if (result.needsMergeGateVerdict) {
           const mergeGateVerdict = readMergeGateVerdict({ repo, check: result.mergeGateCheck, number: pr.number });
-          result = evaluateCeremonyOwed(pr, { redTeamSetting, mergeGateVerdict });
+          result = evaluateCeremonyOwed(pr, { redTeamSetting, mergeGateVerdict, openPrs: prs });
         }
         if (result.owed) {
           report.ready.push({ repo, number: pr.number, title: pr.title, ceremonyOwed: true,
@@ -737,7 +747,7 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
       // The committed contract tests live in scripts/operations/__tests__/operator-queue-needs-your-merge.test.mjs
       // (the R170 describe block plus the queue-state cases above it).
       for (const pr of prs) {
-        if (readyNumbersThisRepo.has(pr.number)) continue;
+        if (readyNumbersThisRepo.has(pr.number) || openBasePr(pr, prs)) continue;
         // PRs outside the merge lane retain their existing triage sections.
         if (!hasLabel(pr, 'review:accepted') && !hasLabel(pr, 'ready-to-merge')) continue;
         const pending = (reason) => (report.needsYourMergePending ??= []).push({

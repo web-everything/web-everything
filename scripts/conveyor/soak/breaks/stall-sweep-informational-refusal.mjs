@@ -21,15 +21,15 @@ export default {
     const at = new Date(now - 10 * 60000).toISOString();
     const pr = { number: 6531, headRefOid: 'abc', labels: ['review:accepted'], isDraft: false };
     const line = (kind, tail) => `reconcile-fix-dispatch-daemon: reconcile-refused ${kind} ${REPO} PR #6531 — ${tail}`;
-    const wait = (reason) => resolveWaitState(pr, { daemons: [{ kind: 'refusal', at, name: 'fix-dispatch-daemon', reason }] }, { now });
+    const wait = (reason) => resolveWaitState(pr, { daemons: [{ kind: 'refusal', head: pr.headRefOid, at, name: 'fix-dispatch-daemon', reason }] }, { now });
     const informational = wait(line('nothing-owed', 'phase `queued` — reviewed and queued, or already landed; this pass has nothing to dispatch'));
-    const real = wait(line('no-lane', 'no free lane'));
+    const real = wait(line('dispatch-failed', 'worker could not start'));
     const report = { informational, real }; log?.(JSON.stringify(report)); return report;
   },
   judge(report) {
     const v = [];
     if (report.informational?.kind === 'refused') v.push('[informational-refusal-is-wait-owner] nothing-owed phase `queued` read as a refused wait owner');
-    if (report.real?.kind !== 'refused') v.push('[real-refusal-hidden] a no-lane refusal no longer counts as a wait owner');
+    if (report.real?.kind !== 'refused') v.push('[real-refusal-hidden] a current-head dispatch failure no longer counts as a wait owner');
     return v;
   },
 };

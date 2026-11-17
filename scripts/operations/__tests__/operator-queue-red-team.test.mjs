@@ -23,10 +23,10 @@ const pr = (comments, head = HEAD, labels = [{ name: 'review:human' }, { name: '
 });
 
 describe('operator-queue: red-team placement', () => {
-  it('baseline: the PR is ready without a red-team comment (fixture sanity)', () => {
+  it('fails closed without a current-head red-team result or CI evidence', () => {
     const r = evaluatePr(pr([advisory(HEAD)], HEAD, [{ name: 'review:human' }, { name: 'advisory:accepted' }]));
-    // The advisory fixture must satisfy the real parser, or every assertion below is vacuous.
-    expect(r.reasons).toEqual([]);
+    expect(r.ready).toBe(false);
+    expect(r.reasons).toEqual(['red-team:clear not proven on the current head', 'no check rollup']);
   });
   it('a confirmed broken break the gate sent back, still under review:changes → NOT READY with the reason', () => {
     const r = evaluatePr(pr([advisory(HEAD), redTeam(HEAD), sentBack]));
@@ -37,9 +37,9 @@ describe('operator-queue: red-team placement', () => {
   it('no gate record → released: the gate never acted, so the operator is not held behind an actor that did not run', () => {
     expect(evaluatePr(pr([advisory(HEAD), redTeam(HEAD)])).reasons).not.toContainEqual(expect.stringMatching(/^red team:/));
   });
-  it('the operator returned the PR to review:human on the same head (review:changes gone) → released', () => {
+  it('removing review:changes alone cannot prove red-team clearance on the same head', () => {
     const labels = [{ name: 'review:human' }, { name: 'advisory:accepted' }];
-    expect(evaluatePr(pr([advisory(HEAD), redTeam(HEAD), sentBack], HEAD, labels)).reasons).toEqual([]);
+    expect(evaluatePr(pr([advisory(HEAD), redTeam(HEAD), sentBack], HEAD, labels)).reasons).toEqual(['red-team:clear not proven on the current head', 'no check rollup']);
   });
   it('a degraded one does not hold it (it is carded)', () => {
     expect(evaluatePr(pr([advisory(HEAD), redTeam(HEAD, 'degraded'), sentBack])).reasons).not.toContainEqual(expect.stringMatching(/^red team:/));

@@ -1,3 +1,4 @@
+import { withHumanReviewEvidence } from '../../lib/__tests__/helpers/human-review-evidence.mjs';
 /**
  * @file #4722 — every open `review:human` PR lands in EXACTLY ONE of the operator queue's triage sections (NEEDS YOU,
  * PENDING, NOT READY), over a fixture set that covers every advisory/review label mix — including the live #4722
@@ -59,7 +60,7 @@ function fixtureSet() {
 /** Run `main --json` over one listing; every follow-up `gh pr view` mergeability poll answers UNKNOWN. */
 function run(prs) {
   const log = vi.spyOn(console, 'log').mockImplementation(() => {});
-  execFileSync.mockReset().mockReturnValueOnce(JSON.stringify(prs)).mockReturnValue(JSON.stringify({ mergeable: 'UNKNOWN' }));
+  execFileSync.mockReset().mockReturnValueOnce(JSON.stringify(prs.map(withHumanReviewEvidence))).mockReturnValue(JSON.stringify({ mergeable: 'UNKNOWN' }));
   main(['--repo=o/n', '--json'], { sleep: vi.fn(), pollAttempts: 1, unsupportedPath: NO_UNSUPPORTED });
   return JSON.parse(log.mock.calls[0][0]);
 }
