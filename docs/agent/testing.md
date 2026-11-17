@@ -4418,7 +4418,8 @@ pins. The empty file is removed on success or failure. Lane setup reuses `scrubR
 before fetching. Retained `origin.uploadpack` and
 `origin.vcs` must never select a command: fetch only the validated repository's explicit SSH URL,
 with the lane-pool transport pins (`protocol.ext.allow=never` and
-`--upload-pack=git-upload-pack`). `review-job-fetch-security.test.mjs` uses real local repositories
+`--upload-pack=git-upload-pack`), plus `submodule.recurse=false` and `--no-recurse-submodules`:
+populated submodules retain their own unscrubbed remote helpers. `review-job-fetch-security.test.mjs` uses real local repositories
 and marker-writing helpers, proves the hostile fixtures execute through a remote-name fetch,
 then exercises the production SSH URL without networking and verifies the marker stays absent.
 Any scrub read/removal failure refuses fetching and records an infrastructure failure requiring

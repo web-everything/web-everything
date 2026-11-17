@@ -471,8 +471,8 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
         const origin = exec('git', ['remote', 'get-url', 'origin'], gitOptions).trim();
         const originRepo = /^(?:git@github\.com:|ssh:\/\/git@github\.com\/|https:\/\/github\.com\/)([^/]+\/[^/]+?)(?:\.git)?\/?$/i.exec(origin)?.[1];
         if (originRepo?.toLowerCase() !== repo.toLowerCase()) throw Error('review lane origin repository mismatch or unreadable; inspect lane before retrying');
-        // Never resolve a remote name: retained origin.uploadpack/vcs can execute lane-owned commands.
-        exec('git', ['-c', 'protocol.ext.allow=never', 'fetch', '--upload-pack=git-upload-pack',
+        // Never resolve a remote name or recurse: retained origin helpers and unscrubbed submodules can execute commands.
+        exec('git', ['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', 'fetch', '--no-recurse-submodules', '--upload-pack=git-upload-pack',
           '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`], gitOptions);
         const fetched = exec('git', ['rev-parse', 'FETCH_HEAD^{commit}'], gitOptions).trim();
         if (fetched !== head) throw Error('review head changed during fetch; retry shared setup on the live head');

@@ -1131,7 +1131,7 @@ describe('red-team-only review job', () => {
           ['gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid']],
           ['git', ['config', '--show-scope', '--list', '--includes', '-z']],
           ['git', ['remote', 'get-url', 'origin']],
-          ['git', ['-c', 'protocol.ext.allow=never', 'fetch', '--upload-pack=git-upload-pack', '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`]],
+          ['git', ['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', 'fetch', '--no-recurse-submodules', '--upload-pack=git-upload-pack', '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`]],
           ['git', ['rev-parse', 'FETCH_HEAD^{commit}']], ['red-team'],
         ]);
         expect(out.redTeam.status).toBe('ran');
