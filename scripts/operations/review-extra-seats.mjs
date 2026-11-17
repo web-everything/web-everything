@@ -1195,41 +1195,42 @@ export const RED_TEAM_SEAT = Object.freeze({ seat: 'red-team', lens: 'red-team',
 // These are single seats: executor settings have no bearing on their route.
 let loggedIgnoredAiSeatOptions = false;
 function aiSeatRoute(role, current, { env, io, available, operation, taskType, policy, operatorKeys }) {
+  let resolved, coordinator;
   try {
-    const resolved = (io.readAiRouting ?? resolveAiRouting)({ env, log: false });
-    const { coordinator } = aiRoutingInputs(role, resolved);
-    if ((coordinator?.model !== undefined || coordinator?.effort !== undefined) && !loggedIgnoredAiSeatOptions) {
-      loggedIgnoredAiSeatOptions = true;
-      io.log('aiRouting red-team/red-team-recheck: overlay model/effort ignored; only coordinator.provider is honoured');
-    }
-    if (!coordinator?.provider) return current;
-    if (role === 'red-team-recheck' && coordinator.provider !== 'claude') {
-      io.log(`aiRouting.${role}: ${coordinator.provider} cannot enforce Claude's tool, budget and environment restrictions; inheriting today's route`);
-      return current;
-    }
-    if (!available.includes(coordinator.provider)) {
-      io.log(`aiRouting.${role}: ${coordinator.provider} unavailable; inheriting today's route`);
-      return current;
-    }
-    // Reapply roster, counting-seat, disabled-provider and operator-override rules.
-    const reader = io.readRoutingPolicy ?? readRoutingPolicy;
-    const effectivePolicy = policy ?? reader();
-    const provider = coordinator.provider;
-    const defaults = current?.provider === provider ? current : resolveOperationRoute({
-      operation, taskType, available: [provider], policy: effectivePolicy,
-    });
-    const model = defaults?.model ?? (role === 'red-team-recheck' ? RECHECK_MODEL : RED_TEAM_MODELS[provider].model);
-    const effort = defaults?.effort ?? resolveOperationEffort(operation, provider, taskType, effectivePolicy);
-    const route = validateAiSeatRoute({ operation, taskType, available, policy: effectivePolicy,
-      aiRouting: { provider, model, effort }, operatorKeys: operatorKeys ?? reader.operatorKeys?.() ?? [] });
-    const sources = Object.fromEntries(Object.entries(resolved.sources ?? {}).filter(([path]) => path.startsWith(`${role}.coordinator.`)));
-    io.log(`policy-cascade · aiRouting.${role}: ${route?.provider}/${route?.model}/${route?.effort} (${JSON.stringify(sources)})`);
-    // Validation expands model aliases; keep the launch boundary's existing defaults.
-    return route?.provider === provider ? { ...route, model, effort } : route ?? current;
+    resolved = (io.readAiRouting ?? resolveAiRouting)({ env, log: false });
+    ({ coordinator } = aiRoutingInputs(role, resolved));
   } catch (error) {
     io.log(`aiRouting.${role}: invalid routing (${error.message}); inheriting today's route`);
     return current;
   }
+  if ((coordinator?.model !== undefined || coordinator?.effort !== undefined) && !loggedIgnoredAiSeatOptions) {
+    loggedIgnoredAiSeatOptions = true;
+    io.log('aiRouting red-team/red-team-recheck: overlay model/effort ignored; only coordinator.provider is honoured');
+  }
+  if (!coordinator?.provider) return current;
+  if (role === 'red-team-recheck' && coordinator.provider !== 'claude') {
+    io.log(`aiRouting.${role}: ${coordinator.provider} cannot enforce Claude's tool, budget and environment restrictions; inheriting today's route`);
+    return current;
+  }
+  if (!available.includes(coordinator.provider)) {
+    io.log(`aiRouting.${role}: ${coordinator.provider} unavailable; inheriting today's route`);
+    return current;
+  }
+  // Reapply roster, counting-seat, disabled-provider and operator-override rules.
+  const reader = io.readRoutingPolicy ?? readRoutingPolicy;
+  const effectivePolicy = policy ?? reader();
+  const provider = coordinator.provider;
+  const defaults = current?.provider === provider ? current : resolveOperationRoute({
+    operation, taskType, available: [provider], policy: effectivePolicy,
+  });
+  const model = defaults?.model ?? (role === 'red-team-recheck' ? RECHECK_MODEL : RED_TEAM_MODELS[provider].model);
+  const effort = defaults?.effort ?? resolveOperationEffort(operation, provider, taskType, effectivePolicy);
+  const route = validateAiSeatRoute({ operation, taskType, available, policy: effectivePolicy,
+    aiRouting: { provider, model, effort }, operatorKeys: operatorKeys ?? reader.operatorKeys?.() ?? [] });
+  const sources = Object.fromEntries(Object.entries(resolved.sources ?? {}).filter(([path]) => path.startsWith(`${role}.coordinator.`)));
+  io.log(`policy-cascade · aiRouting.${role}: ${route?.provider}/${route?.model}/${route?.effort} (${JSON.stringify(sources)})`);
+  // Validation expands model aliases; keep the launch boundary's existing defaults.
+  return route?.provider === provider ? { ...route, model, effort } : route ?? current;
 }
 export const RED_TEAM_RUBRIC = 'review-red-team.1';
 export const RED_TEAM_MISS_DISPATCH_KIND = 'red-team-miss';
@@ -1853,8 +1854,11 @@ export async function speculateRedTeam({
       try { configuredRoute = resolveOperationRoute({ operation: 'review-seat', taskType: RED_TEAM_SEAT.key, available, policy: routingPolicy }); }
       catch (error) { lastReason = error.message; break; }
       const pick = configuredRoute ? { provider: configuredRoute.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: RED_TEAM_SEAT.key, available, scorecards: records });
-      const overlaid = aiSeatRoute('red-team', configuredRoute, { env, io, available,
-        operation: 'review-seat', taskType: RED_TEAM_SEAT.key, policy: routingPolicy });
+      let overlaid;
+      try {
+        overlaid = aiSeatRoute('red-team', configuredRoute, { env, io, available,
+          operation: 'review-seat', taskType: RED_TEAM_SEAT.key, policy: routingPolicy });
+      } catch (error) { lastReason = error.message; break; }
       if (overlaid !== configuredRoute) { configuredRoute = overlaid; pick.provider = overlaid.provider; }
       if (!pick.provider) { lastReason = pick.reasoning; break; }
       let reservation;

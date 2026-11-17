@@ -191,7 +191,7 @@ test('red-team roster rejects native Claude so counting Claude review seats rema
 
 for (const resolver of [() => { throw new Error('unreadable'); }, () => ({}),
   () => setting('red-team', { provider: 'codex', model: 'not-a-model' })]) {
-  test('invalid or throwing resolution inherits at both sites', async () => {
+  test('unreadable or invalid aiRouting settings inherit at both sites', async () => {
     const baseline = await seat();
     const actual = await seat(resolver);
     assert.deepEqual(actual.calls, baseline.calls);
@@ -233,8 +233,23 @@ test('overlay validation preserves the mandatory counting-Claude-seat rule', asy
   policy.operations['review-seat:mandatory:correctness'] = {
     provider: 'agy-claude', model: 'sonnet', mode: 'shadow', fallback: [],
   };
-  const { calls, logs } = await seat(() => setting('red-team', { provider: 'codex', model: 'gpt-6-astra' }),
+  const { result, calls, reservations } = await seat(() => setting('red-team', { provider: 'codex', model: 'gpt-6-astra' }),
     { readRoutingPolicy: () => policy });
-  assert.deepEqual(calls, (await seat()).calls);
-  assert.ok(logs.some(line => line.includes('claude route in fallback to count')));
+  assert.equal(result.status, 'skipped');
+  assert.match(result.reason, /claude route in fallback to count/);
+  assert.deepEqual(calls, []);
+  assert.deepEqual(reservations, []);
+});
+
+test('recheck overlay validation refuses an incomplete counting-Claude-seat policy before spawning', async () => {
+  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+  policy.operations['review-seat:mandatory:correctness'] = {
+    provider: 'agy-claude', model: 'sonnet', mode: 'shadow', fallback: [],
+  };
+  let spawned = false;
+  await assert.rejects(recheck(providerOnly('red-team-recheck', 'claude'), false, {
+    readRoutingPolicy: () => policy,
+    spawnRecheck: async () => { spawned = true; },
+  }), /claude route in fallback to count/);
+  assert.equal(spawned, false);
 });
