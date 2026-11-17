@@ -190,6 +190,43 @@ describe('pass audit and admission', () => {
     expect(result.held.some(r => /operator/.test(r.reason))).toBe(true);
     expect(h.events.some(e => e.reason.includes('evidence-unavailable'))).toBe(true);
   });
+  it('reports single-line evidence failure details under the unchanged notification key and fails closed', async () => {
+    const message = 'lock held by pid 42\nsecond line';
+    const h = harness(undefined, { readHistory: () => { throw Error(message); } });
+    const result = await h.run();
+    expect(result.held).toEqual([{ reason: `${message}; operator inspection required` }]);
+    expect(h.events[0].evidence).toEqual(['Watchdog evidence unavailable: lock held by pid 42 second line; inspect held result']);
+    expect(h.events[0].reason).toContain('lock held by pid 42');
+    expect(h.events[0].reason).not.toMatch(/[\r\n]/);
+    expect(Object.keys(h.state)).toEqual(['evidence-unavailable']);
+    expect(h.io.checkAdmission).not.toHaveBeenCalled(); expect(h.io.execute).not.toHaveBeenCalled();
+    expect(result.actions).toEqual([]);
+  });
+  it('bounds the evidence failure message to 200 characters after collapsing whitespace', async () => {
+    const message = 'x'.repeat(500);
+    const h = harness([], { readSystemEvidence: () => { throw Error(message); } });
+    const result = await h.run();
+    expect(h.events[0].evidence).toEqual([`Watchdog evidence unavailable: ${'x'.repeat(200)}; inspect held result`]);
+    expect(result.held).toEqual([{ reason: `${message}; operator inspection required` }]);
+    expect(h.io.execute).not.toHaveBeenCalled();
+  });
+  it.each(['lock held by pid 42\n\t  second line', undefined, null])('returns held and notifies safely for non-Error throw %s', async thrown => {
+    const h = harness(undefined, { readHistory: () => { throw thrown; } });
+    const result = await h.run();
+    expect(h.events[0].evidence).toEqual([`Watchdog evidence unavailable: ${String(thrown).replace(/\s+/g, ' ')}; inspect held result`]);
+    expect(Object.keys(h.state)).toEqual(['evidence-unavailable']);
+    expect(result.held).toEqual([{ reason: 'undefined; operator inspection required' }]);
+    expect(h.io.checkAdmission).not.toHaveBeenCalled(); expect(h.io.execute).not.toHaveBeenCalled();
+    expect(result.actions).toEqual([]);
+  });
+  it('retains the NEEDS-YOU fallback when the evidence failure notification fails', async () => {
+    const h = harness(undefined, { readHistory: () => { throw Error('audit unavailable'); },
+      emit: () => { throw Error('feed offline'); } });
+    const result = await h.run();
+    expect(result.held).toEqual([{ reason: 'audit unavailable; operator inspection required' },
+      { reason: 'NEEDS-YOU unavailable: feed offline' }]);
+    expect(h.io.checkAdmission).not.toHaveBeenCalled(); expect(h.io.execute).not.toHaveBeenCalled();
+  });
   it('a refused dispatch retains intent, omits did and escalates without retry', async () => {
     const h = harness(undefined, { execute: vi.fn(() => ({ ok: false, reason: 'held by admission' })) });
     await h.run(); await h.run(); expect(h.io.execute).toHaveBeenCalledTimes(1);

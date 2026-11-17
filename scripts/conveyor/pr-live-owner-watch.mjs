@@ -222,9 +222,11 @@ export async function runLiveOwnerWatchPass({ now = Date.now(), env = process.en
       for (const smell of detectSmells(evidence, now, config)) if (await notify(smell.key, smell.reason)) result.smells.push(smell);
     } else result.held.push({ reason: 'system evidence deferred by tick budget; inspect on next pass' });
   } catch (e) {
+    const message = String(e?.message ?? String(e)).replace(/\s+/g, ' ').slice(0, 200);
+    e ??= {}; // Keep the existing held reason safe for nullish throws.
     result.held.push({ reason: `${e.message}; operator inspection required` });
     // An unavailable audit/lock never authorizes a dispatch. Feed failure is itself returned, not swallowed.
-    try { await notify('evidence-unavailable', 'Watchdog evidence unavailable; inspect held result'); }
+    try { await notify('evidence-unavailable', `Watchdog evidence unavailable: ${message}; inspect held result`); }
     catch (feedError) { result.held.push({ reason: `NEEDS-YOU unavailable: ${feedError.message}` }); }
   } finally { if (release) await release(); }
   return result;
