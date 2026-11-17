@@ -1,4 +1,5 @@
 import { createGhProvider } from './review-label-provider.mjs';
+import { candidateQueueClass } from './merge-queue.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 /**
  * @file scripts/lib/drain-merge-strategy.mjs
@@ -605,7 +606,7 @@ export function createDrainMergeStrategy({
       }
       let batchingGroupId;
       try {
-        const g = adaptiveBatching().gate(c.num);
+        const g = adaptiveBatching().gate(c.num, { priorityClass: candidateQueueClass(c) });
         batchingGroupId = g.groupId;
         if (!g.admit) {
           say(`  merge-queue batching: defer #${c.num} (${g.reason})`);

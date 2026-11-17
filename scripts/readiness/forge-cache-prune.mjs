@@ -5,6 +5,7 @@ import {constants} from 'node:fs';
 import {join, resolve} from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {execFile, spawn} from 'node:child_process';
+import {randomBytes} from 'node:crypto';
 import {promisify} from 'node:util';
 
 const HOUR = 3_600_000;
@@ -13,6 +14,63 @@ const WORKER = /^worker-active(?:-[1-9][0-9]*)?(?![\s\S])/;
 const RUN = /^(?:r-|warm-)[a-f0-9]{32}(?![\s\S])/;
 const LIMIT = 4 * 1024 * 1024;
 const repair = 'preserving cache; inspect evidence and repair it before retrying';
+export const PRUNE_STATUS_FILE = 'cache-prune-status.json';
+export const validPruneStatus = value => value && !Array.isArray(value)
+  && Object.keys(value).sort().join(',') === 'consecutiveRefused,lastRefusal'
+  && Number.isSafeInteger(value.consecutiveRefused) && value.consecutiveRefused >= 0
+  && typeof value.lastRefusal === 'string' && value.lastRefusal.length <= 200
+  && !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value.lastRefusal);
+
+/** Unknown or unsafe evidence is never a zero-refusal result. */
+export async function readPruneStatus(receipts) {
+  const owner = await directory(receipts);
+  const handle = await fs.open(join(receipts, PRUNE_STATUS_FILE),
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const st = await handle.stat();
+    if (!st.isFile() || st.nlink !== 1 || ![0, owner.uid].includes(st.uid)
+      || (st.mode & 0o022) || st.size > 4096) throw new Error('Unsafe prune status');
+    const buffer = Buffer.alloc(4097);
+    let size = 0;
+    while (size < buffer.length) {
+      const {bytesRead} = await handle.read(buffer, size, buffer.length - size, null);
+      if (!bytesRead) break;
+      size += bytesRead;
+    }
+    if (size > 4096) throw new Error('Oversized prune status');
+    const status = JSON.parse(buffer.toString('utf8', 0, size));
+    if (!validPruneStatus(status)) throw new Error('Invalid prune status');
+    return status;
+  } finally { await handle.close(); }
+}
+
+/** Serialize completion results independently of the pruning lock (busy runs count too). */
+export async function recordPruneResult(receipts, refusal) {
+  let release;
+  for (let attempt = 0; !release; attempt++) {
+    try { release = await acquireLock(receipts, '.forge-cache-prune-status.pid'); }
+    catch (error) {
+      const contention = ['EEXIST', 'ENOENT'].includes(error.code)
+        || /^(Cache pruner is already running|Unreadable prune pid;|Prune lock changed;)/.test(error.message);
+      if (!contention || attempt >= 99) throw error;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  }
+  const pending = join(receipts, PRUNE_STATUS_FILE + '-' + randomBytes(8).toString('hex'));
+  try {
+    const previous = await readPruneStatus(receipts).catch(error => {
+      if (error.code !== 'ENOENT') throw error;
+      return {consecutiveRefused: 0, lastRefusal: ''};
+    });
+    const value = {consecutiveRefused: refusal === null ? 0 : Math.min(Number.MAX_SAFE_INTEGER, previous.consecutiveRefused + 1),
+      lastRefusal: refusal === null ? previous.lastRefusal : String(refusal).slice(0, 200).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ')};
+    await fs.writeFile(pending, JSON.stringify(value), {flag: 'wx', mode: 0o600});
+    // The service runs as root; telemetry runs as ops, the receipts directory's owner.
+    const owner = await directory(receipts);
+    await fs.chown(pending, owner.uid, owner.gid);
+    await fs.rename(pending, join(receipts, PRUNE_STATUS_FILE));
+  } finally { await fs.rm(pending, {force: true}); await release(); }
+}
 
 export function resolveSettings(env = process.env) {
   const sources = {};
@@ -436,9 +494,9 @@ export async function executePrune(plan, {root, apply = false, receipts, spawnPr
   }
 }
 
-async function acquireLock(root) {
+async function acquireLock(root, name = '.forge-cache-prune.pid') {
   await directory(root);
-  const path = join(root, '.forge-cache-prune.pid');
+  const path = join(root, name);
   for (let attempt = 0; attempt < 2; attempt++) {
     let handle;
     try { handle = await fs.open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600); }
@@ -473,7 +531,7 @@ async function acquireLock(root) {
 export async function main(argv = process.argv.slice(2)) {
   let root = '/srv/forge-cache', receipts = '/srv/forge-receipts', apply = false;
   const json = argv.includes('--json');
-  let release;
+  let release, parsed = false, refusal = null;
   try {
     for (const arg of argv) {
       if (arg.startsWith('--root=')) root = resolve(arg.slice(7));
@@ -481,6 +539,7 @@ export async function main(argv = process.argv.slice(2)) {
       else if (arg === '--apply') apply = true;
       else if (arg !== '--json') throw new Error(`Unknown argument: ${arg}`);
     }
+    parsed = true;
     const settings = resolveSettings();
     // Always emit effective bounds and provenance, even if the subsequent scan refuses.
     process[json ? 'stderr' : 'stdout'].write(`${JSON.stringify({settings, root, receipts, apply})}\n`);
@@ -503,11 +562,21 @@ export async function main(argv = process.argv.slice(2)) {
     process.stdout.write(`${JSON.stringify({settings, root, receipts, apply, disk, ...plan, execution}, null, json ? 0 : 2)}\n`);
     return 0;
   } catch (error) {
+    refusal = error.message;
     process.stderr.write(`${JSON.stringify({refused: error.message})}\n`);
     return 1;
-  } finally { if (release) await release(); }
+  } finally {
+    try {
+      // A diagnostic dry-run must not clear (or increment) the service's refusal streak.
+      if (parsed && apply) await recordPruneResult(receipts, refusal);
+    } catch (error) {
+      process.stderr.write(`${JSON.stringify({refused: `Cannot record prune status: ${error.message}`})}\n`);
+      return 1;
+    } finally { if (release) await release(); }
+  }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  process.exitCode = await main();
+if(process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  // Keep the runner/client static import graph synchronously loadable by Node.
+  main().then(code => { process.exitCode = code; });
 }

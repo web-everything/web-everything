@@ -46,8 +46,8 @@ on:
     branches: [main, 'lane/**']  # lane/**: a GitHub-stacked PR runs its own required checks while its base is open (stack.reviewWhileBaseOpen)
   # GitHub merge queue (merge-delivery strategy `github-merge-queue`): the required checks `test`, `smoke` and
   # `daemon-soak` re-run on each merge-group commit (main + the entries ahead + this PR). Check names unchanged so
-  # the ruleset requires the same names. A merge_group is never card-only-light (ci-card-only.mjs: not a
-  # pull_request) and always runs the full soak (daemon-soak-scope: not a pull_request ⇒ run=true).
+  # the ruleset requires the same names. A merge_group can be light for a validated cards-only diff,
+  # and always runs the full soak (daemon-soak-scope: not a pull_request ⇒ run=true).
   merge_group:
   workflow_dispatch:
 
@@ -64,8 +64,8 @@ jobs:
   # CARD-ONLY LIGHT PATH (actions-queue-relief, 2026-10-03). A PR that changes only `backlog/**` runs the
   # independent `standards` job's `check:standards` (the backlog/card guards) but NOT the unit shards, coverage merge,
   # integration suite, docs build or Playwright lane. Detection is `scripts/ci-card-only.mjs` (tested):
-  # light ONLY for a `pull_request` whose every changed path is under `backlog/`; a push to main, a manual
-  # dispatch, an empty diff, or any other path is the full suite. Fail closed: if this job fails, `light` is
+  # PRs permit cards/docs; merge_group permits only cards against its validated ancestor base.
+  # A push to main, manual dispatch, empty or unreadable diff runs the full suite. Fail closed: if this job fails, `light` is
   # empty (not 'true'), and `test` / `smoke` below fail on `needs.changes.result != 'success'`.
   #
   # REQUIRED CHECKS STILL REPORT FROM REAL RUNNING JOBS: `test` and `smoke` keep running as jobs (they do
@@ -91,9 +91,13 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           FRESH_MAIN_SHA=""
+          if [ "$EVENT_NAME" = "merge_group" ]; then
+            BASE_SHA="$MG_BASE_SHA"
+          fi
           if [ "$BASE_REF" = "main" ]; then
             if sh scripts/ci/fetch-main-history.sh; then
               FRESH_MAIN_SHA=$(git rev-parse --verify --end-of-options 'refs/remotes/origin/main^{commit}') || FRESH_MAIN_SHA=""

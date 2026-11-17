@@ -3,7 +3,7 @@ import {afterEach, describe, expect, it, vi} from 'vitest';
 import {mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, symlinkSync, existsSync, lstatSync} from 'node:fs';
 import {join} from 'node:path';
 import {easternTimestamp} from '../forge-exec-run.mjs';
-import {checkRemoteHealth} from '../forge-remote-health.mjs';
+import {checkRemoteHealth,recordRemoteResult} from '../forge-remote-health.mjs';
 
 const roots=[];
 const scratch=()=>{const root=mkdtempSync(join(process.env.TMPDIR,'forge-health-quar-'));roots.push(root);return root;};
@@ -70,5 +70,54 @@ describe('malformed Forge health state',()=>{
     const root=scratch();writeFileSync(join(root,'health.json'),'{}');
     await check(root,sample());
     expect(log.mock.calls.join('\n')).toMatch(/quarantined malformed state/);
+  });
+});
+
+describe('forge-unreachable backoff is short, lifted by a good probe, and carries detail',()=>{
+  const down=()=>{const e=new Error('forge-unreachable');e.transport=true;e.detail='ssh exit 255: Connection closed by 148.251.135.244 port 22';return e;};
+  it('backs off only briefly after an unreachable read and reports the probe error',async()=>{
+    const root=scratch();
+    const r=await checkRemoteHealth({root,settings,clock:()=>now,readTelemetry:async()=>{throw down();},ping:async()=>false});
+    expect(r.ok).toBe(false);expect(r.reason).toBe('forge-unreachable');
+    expect(r.detail).toContain('Connection closed');
+    expect(JSON.parse(readFileSync(join(root,'health.json'),'utf8')).backoffUntil-now).toBeLessThanOrEqual(15000);
+  });
+  it('keeps the backoff while the host still fails the probe',async()=>{
+    const root=scratch();
+    await checkRemoteHealth({root,settings,clock:()=>now,readTelemetry:async()=>{throw down();},ping:async()=>false});
+    const r=await checkRemoteHealth({root,settings,clock:()=>now+1000,readTelemetry:async()=>sample({sampledAtET:easternTimestamp(now+1000)}),ping:async()=>false});
+    expect(r.reason).toBe('backoff-forge-unreachable');
+  });
+  it('lifts the backoff when the next probe succeeds',async()=>{
+    const root=scratch();
+    await checkRemoteHealth({root,settings,clock:()=>now,readTelemetry:async()=>{throw down();},ping:async()=>false});
+    const t=now+1000;
+    const r=await checkRemoteHealth({root,settings,clock:()=>t,readTelemetry:async()=>sample({sampledAtET:easternTimestamp(t)}),ping:async()=>true});
+    expect(r).toEqual({ok:true});
+  });
+  it('does not lift a load backoff on a good ping',async()=>{
+    const root=scratch();
+    await check(root,sample({loadPerCore:5}));
+    const r=await checkRemoteHealth({root,settings,clock:()=>now+1000,readTelemetry:async()=>sample(),ping:async()=>true});
+    expect(r.reason).toBe('backoff-maxLoadPerCore');
+  });
+});
+
+describe('repeated forge-unreachable failures keep backing off',()=>{
+  it('grows 15s,30s,60s,120s and caps at the full backoff',async()=>{
+    const root=scratch();let t=now;const waits=[];
+    const down=async()=>{const e=new Error('forge-unreachable');e.transport=true;throw e;};
+    for(let i=0;i<6;i++){
+      await checkRemoteHealth({root,settings,clock:()=>t,readTelemetry:down,ping:async()=>false});
+      const until=JSON.parse(readFileSync(join(root,'health.json'),'utf8')).backoffUntil;waits.push(until-t);t=until;
+    }
+    expect(waits).toEqual([15000,30000,60000,120000,120000,120000]);
+  });
+  it('an unreachable run result never relabels or shortens an active load backoff',async()=>{
+    const root=scratch();
+    await check(root,sample({loadPerCore:5}));
+    for(let i=0;i<3;i++)await recordRemoteResult({root,settings:{...settings,backoffFailures:3},clock:()=>now+1000,result:{mode:'not-started',terminated:true,reason:'forge-unreachable'}});
+    const r=await checkRemoteHealth({root,settings,clock:()=>now+2000,readTelemetry:async()=>sample(),ping:async()=>true});
+    expect(r.reason).toBe('backoff-maxLoadPerCore');
   });
 });
