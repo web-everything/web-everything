@@ -24,8 +24,10 @@ export default {
     const { isDraftOwedPromotion } = await import(pathToFileURL(join(sourceRoot, PATHS[0])).href);
     const { runDraftPromotionStep } = await import(pathToFileURL(join(sourceRoot, PATHS[1])).href);
     const { derivePrStatusLabel } = await import(pathToFileURL(join(sourceRoot, PATHS[2])).href);
+    const { CONSTELLATION_REPOS } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/constellation-repos.mjs')).href);
+    const repos = [Object.values(CONSTELLATION_REPOS)[0].slug];
     const violations = [];
-    const check = (ok, name) => {
+    const check =(ok, name) => {
       if (!ok) violations.push(name);
       log?.(`${name}: ${ok ? 'pass' : 'FAIL'}`);
     };
@@ -43,7 +45,7 @@ export default {
       let writes = 0;
       let views = 0;
       const result = runDraftPromotionStep({
-        repos: ['web-everything/web-everything'], listDrafts: () => [draft], absentNotApplicable: [],
+        repos, listDrafts: () => [draft], absentNotApplicable: [],
         readHeadCheckState: () => checks,
         // The list is clean: conflict evidence must come from the fresh view.
         readPrView: () => { views++; return { ...draft, ...fields }; },
@@ -58,7 +60,7 @@ export default {
       'green draft remains eligible');
     let writes = 0;
     const unreadable = runDraftPromotionStep({
-      repos: ['web-everything/web-everything'], listDrafts: () => [draft], absentNotApplicable: [],
+      repos, listDrafts: () => [draft], absentNotApplicable: [],
       readHeadCheckState: () => checks,
       readPrView: () => { throw new Error('unreadable PR view'); }, ready: () => { writes++; },
     });
