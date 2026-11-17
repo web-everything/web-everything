@@ -199,7 +199,7 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
    Do not release either resource or end the turn until verification is confirmed terminal;
    if observation cannot recover, escalate for supervised termination before cleanup. Open a PR only after green;
    never end the turn while a task is running.
-   6a. **Codex audit.** After verify is green and before open-pr, commit, then run the repo's Codex audit on the net diff:
+${repo !== 'plateau-app' ? '   The related-tests gate (the verify-lane default diff-driven related-test selection, with no explicit `--gate` override) must be green on the exact commit BEFORE the audit runs, because any later code change invalidates the audit record and its waiver binding.\n' : ''}   6a. **Codex audit.** After verify is green and before open-pr, commit, then run the repo's Codex audit on the net diff:
    \`node ${shellQuoteWord(CODEX_AUDIT_CLI)} --base=origin/main --head=<40-hex sha of your lane HEAD>\`, run with the lane as the working directory.
    Open the PR only on the verdict NOT WEAKENED. On WEAKENED: fix the findings, re-test, and re-audit, at most 2 repair rounds.
    If it is still WEAKENED after those 2 rounds, stop: do NOT open a PR; report the remaining findings. Include the verdict in your report.
@@ -217,6 +217,10 @@ ${renderProofStep(proof)}
 minutes, and only after checking the condition is reachable. Never loop on anything outside your control (another
 daemon's tick, a rebuild, CI, a merge, review, load dropping): report it as PENDING with the exact command that
 checks it, and end. If you need the condition to happen, cause it through the sanctioned mechanism instead of waiting.
+**CI wait (the one allowed exception).** When your task needs a PR's CI result (load-after-CI), run the declared op as ONE
+harness-tracked background call: \`node scripts/operations/run.mjs await-checks --pr=<N> --repo=<owner/name> --check=test --timeoutMin=60\`.
+It polls once a minute through the shared gh throttle, returns one verdict line (pass, fail, head-moved, timeout or
+check-not-found, with head sha and run url) and exits. Never use raw \`gh pr checks --watch\` (refused).
 
 **Processes.** Never \`pkill\`, \`killall\`, or any pattern kill. Stop only a process you started, by PID, and say
 what evidence shows it is yours. Never stop the operator's dev server.

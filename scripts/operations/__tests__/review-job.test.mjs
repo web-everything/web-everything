@@ -134,10 +134,12 @@ describe('job records — liveness by pid, without a transcript', () => {
     expect(assessLiveness(bindAgents(pr, [{ ...row, pidAlive: false }], 'we'))).toBeNull();
   });
 
-  it('listAgentsWithReviewJobs merges the listing with the job rows, and a job-read failure costs nothing', () => {
+  it('listAgentsWithReviewJobs merges job rows and marks a failed job read incomplete', () => {
     const merged = listAgentsWithReviewJobs({ listAgents: () => [{ name: 'fix-3' }], listJobs: () => [{ name: 'review-4' }], listWrapped: () => [] });
     expect(merged.map((a) => a.name)).toEqual(['fix-3', 'review-4']);
-    expect(listAgentsWithReviewJobs({ listAgents: () => [{ name: 'x' }], listJobs: () => { throw new Error('io'); }, listWrapped: () => [] })).toEqual([{ name: 'x' }]);
+    const partial = listAgentsWithReviewJobs({ listAgents: () => [{ name: 'x' }], listJobs: () => { throw new Error('io'); }, listWrapped: () => [] });
+    expect(partial).toEqual([{ name: 'x' }]);
+    expect(partial.incomplete).toEqual(['review-jobs-unreadable']);
   });
   // PR #4462 review: a wrapped fixer is a live-session population readers decide on by absence, so a failed listing of it
   // aborts the read (like a failed `claude agents`) instead of showing "no fixer".

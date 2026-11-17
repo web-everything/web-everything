@@ -52,7 +52,8 @@ import { execFileSync } from 'node:child_process';
 import { resolveChildTimeoutMs } from '../../scripts/lib/bounded-child.mjs';
 import { decideParkToHuman } from '../../scripts/lib/review-escalation.mjs';
 import { hostname } from 'node:os';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import {
   RUNNER_LOCK_ROOT, makeOwner,
@@ -75,7 +76,7 @@ import { createResourceFixThrottle } from '../../scripts/lib/resource-gate.mjs';
 import { createDispatchSinks } from '../../scripts/operations/dispatch-lane-io.mjs';
 import { repoProfile } from '../../scripts/lib/repo-profile.mjs';
 import { resolveFixSettings, resolveFixDispatchSettings } from '../../scripts/conveyor/fix-takeover.mjs';
-import { unlinkSync, readFileSync } from 'node:fs';
+import { unlinkSync, readFileSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
 import { resolveCascade } from '../../scripts/lib/policy-cascade.mjs';
 import { stopSession } from '../../scripts/operations/dispatch-abort.mjs';
 import { runOrphanFixRoundPass } from '../../scripts/conveyor/orphan-fix-round.mjs';
@@ -1018,9 +1019,45 @@ export function resolveFixPassBudgets({ env = process.env,
     { value: resolved.value[key], source: resolved.sources[key] }]));
 }
 
-// One cursor per bounded repo phase; callers can inject isolated daemon state.
-const fixPassRotation = {};
-const fixPassPrCursors = {};
+const FIX_PASS_CURSORS_PATH = resolve(DAEMON_REPO_ROOT, '.conveyor/fix-pass-cursors.json');
+
+/** Missing or malformed state starts a fresh rotation; test imports never read live cursors. */
+export function loadFixPassCursors({ path, readFile = readFileSync } = {}) {
+  const empty = { rotation: {}, prCursors: {} };
+  if (process.env.VITEST && path == null) return empty;
+  try {
+    const state = JSON.parse(readFile(path ?? FIX_PASS_CURSORS_PATH, 'utf8'));
+    const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+    if (state?.version !== 1 || !record(state.rotation) || !record(state.prCursors)
+      || !Object.values(state.rotation).every(value => typeof value === 'string')
+      || !Object.values(state.prCursors).every(cursors => record(cursors)
+        && Object.values(cursors).every(value => (Number.isSafeInteger(value) && value > 0)
+          || (typeof value === 'string' && value.length > 0)))) return empty;
+    return { rotation: state.rotation, prCursors: state.prCursors };
+  } catch { return empty; }
+}
+
+function writeFixPassCursors(path, content) {
+  mkdirSync(dirname(path), { recursive: true });
+  const temp = `${path}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temp, content, { flag: 'wx' });
+    renameSync(temp, path);
+  } finally {
+    try { unlinkSync(temp); } catch { /* Renamed or never created. */ }
+  }
+}
+
+/** Cursor persistence is best effort; injected writes receive the final path and JSON. */
+export async function saveFixPassCursors({ path, rotation, prCursors, write = writeFixPassCursors } = {}) {
+  if (process.env.VITEST && path == null) return;
+  try {
+    await write(path ?? FIX_PASS_CURSORS_PATH, JSON.stringify({ version: 1, rotation, prCursors }) + '\n');
+  } catch { /* A persistence failure must not stop dispatch. */ }
+}
+
+// Load once for the daemon defaults; injected state stays independent.
+const { rotation: fixPassRotation, prCursors: fixPassPrCursors } = loadFixPassCursors();
 
 /**
  * we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs#runTickAllRepos — #xngv3vn (epic #3383/#4075): the
@@ -1097,10 +1134,14 @@ export async function runTickAllRepos({
   passBudgets = resolveFixPassBudgets(),
   budgetRotation = fixPassRotation,
   prCursors = fixPassPrCursors,
+  // Optional path/write IO for hermetic persistence probes; state ownership stays with the defaults.
+  cursorPersistence = {},
   adoptYieldProbe,
   // Off under a test run unless injected (the real pass reads GitHub).
   orphanGuardTick = process.env.VITEST ? null : runOrphanFixRoundPass,
 } = {}) {
+  const persistCursors = budgetRotation === fixPassRotation && prCursors === fixPassPrCursors;
+  const cursorsBefore = persistCursors ? JSON.stringify([budgetRotation, prCursors]) : null;
   let yieldedForAdoption = false;
   let completedRepo = false;
   const shouldYield = () => (yieldedForAdoption ||= safeAdoptYield(adoptYieldProbe));
@@ -1469,6 +1510,9 @@ export async function runTickAllRepos({
         statusTags.push({ pr: d.pr, repo: d.repo, changed: false, error: String((e && e.message) || e).split('\n')[0] });
       }
     }
+  }
+  if (persistCursors && JSON.stringify([budgetRotation, prCursors]) !== cursorsBefore) {
+    await saveFixPassCursors({ ...cursorPersistence, rotation: budgetRotation, prCursors });
   }
   return {
     repos: repos.map(repo => fix.repos.find(entry => entry.repo === repo)

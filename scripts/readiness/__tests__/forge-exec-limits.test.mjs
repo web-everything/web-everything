@@ -72,7 +72,8 @@ describe('Forge slice limits',()=>{
   it('includes the limits module in the installed bundle allowlist and wrapper list',async()=>{
     const setup=await readFile(new URL('../forge-setup.sh',import.meta.url),'utf8');
     expect(setup).toMatch(/allowed = \{[^\n]*"forge-exec-limits.mjs"/);
-    expect(setup).toMatch(/for filename in \[[^\n]*"forge-exec-limits.mjs"/);
+    expect(setup).toMatch(/installed = \[[^\n]*"forge-exec-limits.mjs"/);
+    expect(setup).toContain('for filename in installed:');
     expect(setup).toContain('/usr/local/libexec/forge-exec-limits.mjs apply');
   });
 });

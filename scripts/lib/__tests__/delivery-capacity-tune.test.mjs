@@ -281,6 +281,6 @@ describe('shadow is inert', () => {
   it('a throwing tune never fails the readout', () => {
     const out = finishDeliveryCapacity({ run: { verdict }, code: 0, lines: ['raw'] }, { tune: vi.fn(() => { throw new Error('boom'); }) });
     expect(out.code).toBe(0);
-    expect(out.lines).toHaveLength(1);
+    expect(out.lines).toHaveLength(2);
   });
 });

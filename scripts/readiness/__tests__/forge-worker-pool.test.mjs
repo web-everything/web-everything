@@ -9,6 +9,7 @@ import * as bases from '../forge-exec-bases.mjs';
 import {buildManifest, verifyReceipt} from '../remote-exec.mjs';
 import {scanMaterializedGuards} from './fixtures/forge-git-guards.mjs';
 import {cachedPublicGitExec} from './fixtures/forge-public-git.mjs';
+import {runSweepFixture, idleWorkerEvidence} from './fixtures/forge-sweep.mjs';
 
 // Simulate only filesystem ownership; retain real directory modes/inodes and
 // run every production identity/ownership check on the supplied evidence.
@@ -140,16 +141,12 @@ describe('per-user worker reservations',()=>{
     expect((await fs.readdir(join(root,'receipts'))).filter(name=>name.startsWith('worker-active'))).toEqual([]);
   });
   async function pruneWithoutUidProcesses(before='',after='') {
-    const setup=await fs.readFile(new URL('../forge-setup.sh',import.meta.url),'utf8');
-    const body=setup.match(/<<'PRUNE_PY'\n([\s\S]*?)\nPRUNE_PY/)[1];
-    const proc=join(root,'proc');await fs.mkdir(proc,{recursive:true});
-    const local=body.replaceAll('/srv/forge-exec',join(root,'runs')).replaceAll('/srv/forge-receipts',join(root,'receipts'))
-      .replaceAll('/srv/forge-cache',join(root,'cache')).replaceAll('/proc',proc);
-    return spawnSync('python3',['-I','-c',`import pwd, types, os\npwd.getpwnam=lambda _:types.SimpleNamespace(pw_uid=os.getuid())\n${before}\n${local}\n${after}`],
-      {encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
+    await fs.mkdir(join(root,'proc'),{recursive:true});
+    return runSweepFixture(root,{before,after,pythonBefore:idleWorkerEvidence(root)});
   }
   it.each(['new','persisted'])('root pruning hands %s private writer inodes to the operator before slot acquisition',async mode=>{
     await runner.telemetry();
+    await fs.mkdir(join(root,'runs','r-'+'f'.repeat(32))); // legacy namespace also needs its guard
     const names=['worker-active','worker-active-1','worker-active-2'],inodes=[];
     if(mode==='persisted')for(const name of names){
       const path=join(root,'receipts','.'+name+'.writer');await fs.writeFile(path,'',{mode:0o600});
@@ -158,30 +155,27 @@ describe('per-user worker reservations',()=>{
     // Model root guards and a distinct operator even when this test runs as
     // root. Real opens, modes, inodes and flock remain intact; missing fchown
     // fails the ownership proof on both privileged and unprivileged hosts.
-    const before=String.raw`original_open, original_fstat, original_stat = os.open, os.fstat, os.stat
-operator = (os.getuid() or 1000, os.getgid() or 1000)
-owners = {}
-def operator_stat(path, *args, **kwargs):
-    st = original_stat(path, *args, **kwargs)
-    values = list(st)
-    if path == ${JSON.stringify(join(root,'receipts'))}: values[4:6] = operator
-    return os.stat_result(values)
-def root_open(path, *args, **kwargs):
-    fd = original_open(path, *args, **kwargs)
-    if str(path).endswith('.writer'): owners.setdefault(original_fstat(fd).st_ino, (0, 0))
-    return fd
-def root_stat(fd):
-    st = original_fstat(fd)
-    values = list(st)
-    values[4:6] = owners.get(st.st_ino, (st.st_uid, st.st_gid))
-    return os.stat_result(values)
-def transfer(fd, uid, gid):
-    st = original_fstat(fd)
-    assert owners[st.st_ino] == (0, 0)
-    owners[st.st_ino] = (uid, gid)
-os.open, os.fstat, os.stat, os.fchown = root_open, root_stat, operator_stat, transfer
-`;
-    const after=`assert len(owners) == 3\nassert all(owner == operator for owner in owners.values()), owners`;
+    const before=`
+const originalOpen=fs.open, originalLstat=fs.lstat;
+const operator={uid:process.getuid()||1000,gid:process.getgid()||1000};
+const owners=new Map();
+fs.lstat=async (path,...args)=>{
+  const st=await originalLstat(path,...args);
+  return path===${JSON.stringify(join(root,'receipts'))}?Object.assign(st,operator):st;
+};
+fs.open=async (...args)=>{
+  const handle=await originalOpen(...args);
+  if(!String(args[0]).endsWith('.writer'))return handle;
+  const originalStat=handle.stat.bind(handle), st=await originalStat();
+  if(!owners.has(st.ino))owners.set(st.ino,{uid:0,gid:0});
+  handle.stat=async ()=>Object.assign(await originalStat(),owners.get(st.ino));
+  handle.chown=async (uid,gid)=>{
+    assert.deepEqual(owners.get(st.ino),{uid:0,gid:0});
+    owners.set(st.ino,{uid,gid});
+  };
+  return handle;
+};`;
+    const after=`assert.equal(owners.size,3);for(const owner of owners.values())assert.deepEqual(owner,operator);`;
     const result=await pruneWithoutUidProcesses(before,after);expect(result.status,result.stderr).toBe(0);
     for(const [i,name] of names.entries()){
       const st=await fs.stat(join(root,'receipts','.'+name+'.writer'));
@@ -194,6 +188,7 @@ os.open, os.fstat, os.stat, os.fchown = root_open, root_stat, operator_stat, tra
   it.skipIf(process.platform!=='linux'||process.getuid()!==0)('root pruning permits real operator acquisition of every slot',async()=>{
     const uid=65534,gid=65534;
     await runner.telemetry();
+    await fs.mkdir(join(root,'runs','r-'+'f'.repeat(32)));
     for(const path of [root,join(root,'runs'),join(root,'receipts'),join(root,'cache')])await fs.chown(path,uid,gid);
     for(const k of [1,2])await fs.chown(join(root,'runs',`slot-${k}`),uid,2000+k);
     const result=await pruneWithoutUidProcesses();expect(result.status,result.stderr).toBe(0);
@@ -219,22 +214,25 @@ for(const k of [1,2]){
   });
   it.each(['foreign owner','non-private mode','symlink'])('prune refuses %s before transferring writer ownership',async fault=>{
     await runner.telemetry();
-    const path=join(root,'receipts/.worker-active.writer');
+    const path=join(root,'receipts/.worker-active-1.writer');
     if(fault==='symlink'){
       const target=join(root,'foreign-writer');await fs.writeFile(target,'untouched',{mode:0o600});await fs.symlink(target,path);
     }else await fs.writeFile(path,'',{mode:fault==='non-private mode'?0o644:0o600});
-    const before=String.raw`def forbidden_transfer(*args): raise AssertionError('untrusted inode was chowned')
-os.fchown = forbidden_transfer
-`+(fault==='foreign owner'?String.raw`original_fstat = os.fstat
-def foreign_stat(fd):
-    values = list(original_fstat(fd))
-    values[4] = 1048576
-    return os.stat_result(values)
-os.fstat = foreign_stat
-`:'');
+    const before=`
+const originalOpen=fs.open;
+fs.open=async (...args)=>{
+  const handle=await originalOpen(...args);
+  handle.chown=async ()=>{throw new Error('untrusted inode was chowned');};
+  ${fault==='foreign owner'?`const originalStat=handle.stat.bind(handle);
+  handle.stat=async ()=>Object.assign(await originalStat(),{uid:1048576});`:''}
+  return handle;
+};`;
     const result=await pruneWithoutUidProcesses(before);
-    expect(result.status).not.toBe(0);expect(result.stderr).not.toContain('untrusted inode was chowned');
-    expect(result.stderr).toContain(fault==='symlink'?'Too many levels':'unsafe worker writer guard');
+    expect(result.status).toBe(1);
+    expect(result.summary.refusals).toEqual(expect.arrayContaining([expect.objectContaining({consumer:'slots'})]));
+    const errors=result.summary.refusals.map(r=>r.error).join('\n');
+    expect(errors).not.toContain('untrusted inode was chowned');
+    expect(errors).toContain(fault==='symlink'?'ELOOP':'unsafe writer guard');
     if(fault==='symlink')expect(await fs.readFile(join(root,'foreign-writer'),'utf8')).toBe('untouched');
   });
   it('excludes reclamation while an old reservation holder is paused before worker launch',async()=>{
@@ -254,12 +252,18 @@ os.fstat = foreign_stat
       for(const path of [lock(a),container,receipt])await fs.utimes(path,expired,expired);
       const writer=join(root,'receipts/.worker-active-1.writer'),inode=(await fs.stat(writer)).ino;
       await fs.utimes(writer,expired,expired);
-      const unrelated=join(root,'receipts/unrelated.telemetry');await fs.writeFile(unrelated,'old');await fs.utimes(unrelated,expired,expired);
+      // Retained telemetry is read by the runner after the paused launch resumes.
+      // Use the producer schema rather than relying on the sweep to delete it.
+      const unrelatedRun='r-'+'f'.repeat(32),unrelated=join(root,'receipts',unrelatedRun+'.telemetry');
+      const unrelatedBytes=JSON.stringify({runId:unrelatedRun,startedAtET:'2026-01-01T00:00:00.000-05:00',stageMs:{install:0,run:0},code:0});
+      await fs.writeFile(unrelated,unrelatedBytes);await fs.utimes(unrelated,expired,expired);
       const result=await pruneWithoutUidProcesses();
-      expect(result.status,result.stderr).toBe(0);expect(result.stderr).not.toContain('abandoned reservation');
+      expect(result.status,result.stderr).toBe(0);
+      expect(result.summary.skips.some(s=>s.reason.includes('reclaimed abandoned'))).toBe(false);
       for(const path of [lock(a),container,receipt])expect(await fs.stat(path)).toBeDefined();
       expect((await fs.stat(writer)).ino).toBe(inode);
-      await expect(fs.stat(unrelated)).rejects.toMatchObject({code:'ENOENT'});
+      expect(await fs.readFile(unrelated,'utf8')).toBe(unrelatedBytes);
+      expect(result.summary.counts.receiptFiles).toBe(0);
       const other=createRunner({testRoot:root,testPath:'/usr/bin:/bin',testWorkerExec:vi.fn()});
       await expect(other.prepare({nonce})).rejects.toMatchObject({code:'forge-busy'});
       expect(launches).toEqual([]);
@@ -279,7 +283,7 @@ os.fstat = foreign_stat
     // Retain prepared evidence to require the reservation identity recheck,
     // rather than relying on receipt pruning to reject the stale controller.
     const result=await pruneWithoutUidProcesses();expect(result.status,result.stderr).toBe(0);
-    expect(result.stderr).toContain('abandoned reservation worker-active-1');
+    expect(result.summary.skips).toEqual(expect.arrayContaining([expect.objectContaining({reason:expect.stringContaining('reclaimed abandoned worker-active-1')})]));
     const b=await runner.prepare({nonce});expect(b.worker.uid).toBe(a.worker.uid);
     await expect(runner.run(request)).rejects.toThrow('Reservation mismatch');
     expect(calls).not.toHaveBeenCalled();
