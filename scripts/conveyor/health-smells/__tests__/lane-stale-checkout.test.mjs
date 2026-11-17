@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import smell from '../lane-stale-checkout.mjs';
 import { probeLaneCheckouts } from '../../lane-checkout-probe.mjs';
+import { stepEpisodes } from '../../health-watch-core.mjs';
 
 const now = 1_800_000_000_000;
 const freshSource = `export function parseTelemetry(text) {
@@ -45,7 +46,7 @@ describe('lane-stale-checkout', () => {
 
   it.each([
     { behind: 200, behindSinceMs: now - smell.maxBehindMs - 1 },
-    { behind: 201, behindSinceMs: now - smell.maxBehindMs },
+    { behind: 201, behindSinceMs: now - smell.maxBehindMs, headLagMs: smell.maxBehindMs },
     { behind: 1, behindSinceMs: now - 2 * smell.maxBehindMs },
   ])('does not alert for just-behind or insufficiently aged evidence: %o', (lag) => {
     expect(evaluate(lane(lag)).breach).toBe(false);
@@ -78,8 +79,39 @@ describe('lane-stale-checkout', () => {
     expect(result.measure.headLagMs).toBe(smell.maxBehindMs + 1);
   });
 
-  it('retains the existing incomplete commit-lag behavior', () => {
-    expect(evaluate(lane({ behind: 1000, behindSinceMs: null })).breach).toBe(false);
+  it.each([
+    { behindSinceMs: null, headLagMs: null },
+    { behindSinceMs: null, headLagMs: 0 },
+    { behindSinceMs: now, headLagMs: null },
+  ])('fails closed for excessive commit lag with unknown age or head lag: %o', (lag) => {
+    const result = evaluate(lane({ behind: 1000, ...lag }));
+    expect(result.breach).toBe(true);
+    expect(result.summary).toContain('lag unverifiable');
+    expect(result.recommendation).toContain('lane-pool refresh/reclaim');
+  });
+
+  it('keeps missing lane episodes open until explicit non-breach observations close them', () => {
+    const step = (state, rows, tick) => stepEpisodes(state, [{ smell, results: smell.evaluate({ laneCheckouts: rows }, { now: tick }) }], tick);
+    const stale = lane({ behind: 1000 });
+    let { state } = step({}, [stale], now);
+    const opened = step(state, [stale], now + 1);
+    expect(opened.transitions.map(t => t.type)).toEqual(['opened']);
+    state = opened.state;
+    const key = Object.keys(state.episodes)[0];
+    for (let i = 0; i < smell.closeAfter; i++) {
+      const missing = step(state, [], now + 2 + i);
+      expect(missing.transitions).toEqual([]);
+      expect(missing.state.episodes[key]).toMatchObject({ status: 'open', cleanStreak: 0 });
+      state = missing.state;
+    }
+    const fresh = step(state, [lane()], now + 10);
+    expect(fresh.state.episodes[key]).toMatchObject({ status: 'open', cleanStreak: 1 });
+    const closed = step(fresh.state, [lane()], now + 11);
+    expect(closed.transitions.map(t => t.type)).toEqual(['closed']);
+    expect(closed.state.episodes[key]).toBeUndefined();
+  });
+
+  it('returns no observations when lane evidence is missing', () => {
     expect(smell.evaluate({}, { now })).toEqual([]);
   });
 });
@@ -203,7 +235,8 @@ describe('probeLaneCheckouts', () => {
     };
     const [row] = probeLaneCheckouts({ poolRoot: root, git, now });
     expect(row).toMatchObject({ behind: 201, behindSinceMs: null, headLagMs: null, forgeExecHasPrune: true });
-    expect(evaluate(row).breach).toBe(false);
+    expect(evaluate(row).breach).toBe(true);
+    expect(evaluate(row).summary).toContain('lag unverifiable');
     expect(evaluate(row).recommendation).toContain('lane-pool refresh/reclaim');
   });
 
