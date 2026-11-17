@@ -1,4 +1,4 @@
-import { ciJobLogApiArgs } from '../lib/gh-ci-log.mjs';
+import { readCiJobLog } from '../lib/gh-ci-log.mjs';
 /**
  * @file scripts/conveyor/fix-context-pack.mjs
  * @description The CONTEXT PACK every fix / ci-heal brief carries (operator go 2026-10-10; study
@@ -430,7 +430,10 @@ export function readCiPackInputs({ repoSlug, pr, exec }) {
   const job = failing.map((c) => /\/actions\/runs\/\d+\/job\/(\d+)/.exec(c.link)?.[1]).find(Boolean);
   if (job) {
     try {
-      const log = String(exec('gh', ciJobLogApiArgs(`repos/${repoSlug}/actions/jobs/${job}/logs`), GH_OPTS));
+      const metadata = JSON.parse(String(exec('gh', ['api', `repos/${repoSlug}/actions/jobs/${job}`], GH_OPTS)));
+      const result = readCiJobLog({ repo: repoSlug, jobId: job, job: metadata, failedOnly: true, exec, opts: GH_OPTS });
+      if (!result.ok) throw new Error(result.reason);
+      const log = result.text;
       logTail = log.split('\n').slice(-400).map((l) => l.replace(/^[^\t]*\t[^\t]*\t(?:\uFEFF?\d{4}-\d\d-\d\dT[\d:.]+Z\s?)?/, '')).join('\n');
     } catch { logTail = ''; }
   }

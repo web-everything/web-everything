@@ -232,7 +232,7 @@ gh pr checks ${pr} --repo web-everything/web-everything
 For the failing check, read its real log — not a guess:
 
 \`\`\`
-Read the failing job id from the checks output using readCiJobLog({ repo, jobId }) from scripts/lib/gh-ci-log.mjs.
+Read the failing job id from the checks output using readCiJobLog({ repo, jobId, job, failedOnly: true }) from scripts/lib/gh-ci-log.mjs; supply job metadata including steps.
 \`\`\`
 
 ## Fix ONLY what the log says is wrong

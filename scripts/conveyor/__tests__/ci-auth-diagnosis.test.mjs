@@ -18,7 +18,8 @@ function fixture() {
   return { ...input, workflowCommit: { sha: revision, parents: [{ sha: headSha }, { sha: 'c'.repeat(40) }] }, run: { id: input.runId, run_attempt: 1, repository: { full_name: repo }, head_sha: revision,
     event: 'pull_request', pull_requests: [{ head: { sha: headSha }, base: { repo: { full_name: repo } } }], path: '.github/workflows/ci.yml' },
   jobs: [{ id: 42, run_id: input.runId, run_attempt: 1, head_sha: revision, name: 'build', conclusion: 'failure',
-    steps: [{ number: 2, name: 'Checkout FUI (sibling)', conclusion: 'failure' }] }], workflow,
+    steps: [{ number: 2, name: 'Checkout FUI (sibling)', conclusion: 'failure',
+      started_at: '2026-09-29T21:19:59Z', completed_at: '2026-09-29T21:20:01Z' }] }], workflow,
   logs: { 42: 'build\tCheckout FUI (sibling)\t2026-09-29T21:20:00Z ##[error]Bad credentials' },
   secrets: [{ name: 'FUI_READ_TOKEN', updatedAt: '2026-09-30T00:00:00Z' }], observedAt: '2026-10-01T00:00:00Z' };
 }
@@ -77,7 +78,8 @@ describe('deterministic attribution', () => {
     noRotation(e);
   });
   it('allows multiple failed steps when only one has authentication evidence', () => {
-    const e = fixture(); e.jobs[0].steps.push({ number: 3, name: 'cleanup', conclusion: 'failure' });
+    const e = fixture(); e.jobs[0].steps.push({ number: 3, name: 'cleanup', conclusion: 'failure',
+      started_at: '2026-09-29T21:20:02Z', completed_at: '2026-09-29T21:20:03Z' });
     e.logs[42] += '\nbuild\tcleanup\t##[error]Disk full';
     expect(rendered(e)).toContain('gh secret set FUI_READ_TOKEN');
     e.logs[42] += '\nbuild\tcleanup\t##[error]Bad credentials';
@@ -131,6 +133,49 @@ function reader(e, calls, failAt) {
 }
 
 describe('read-only collection bounds and failure isolation', () => {
+  it.each([false, true])('preserves historical step-prefixed attribution with valid step intervals (failed auth=%s)', auth => {
+    const e = fixture();
+    Object.assign(e.jobs[0].steps[0], { started_at: '2026-09-29T21:20:10Z', completed_at: '2026-09-29T21:20:19Z' });
+    e.jobs[0].steps.push({ number: 1, name: 'Set up job', conclusion: 'success',
+      started_at: '2026-09-29T21:20:00Z', completed_at: '2026-09-29T21:20:09Z' });
+    e.logs[42] = 'build\tSet up job\t2026-09-29T21:20:01Z passing diagnostic: Bad credentials\n'
+      + `build\tCheckout FUI (sibling)\t2026-09-29T21:20:11Z ${auth ? 'Bad credentials' : 'Disk full'}`;
+    const result = collectCiAuthDiagnosis(input, { read: reader(e, []) });
+    expect(result.status).toBe(auth ? 'resolved' : 'unresolved');
+    if (auth) expect(result.secret).toBe('FUI_READ_TOKEN');
+    else expect(result.detail).toBe('No authentication failure identified in failed-step logs.');
+  });
+  it.each([false, true])('attributes auth only to failed steps, including untimestamped continuations (failed auth=%s)', auth => {
+    const e = fixture();
+    Object.assign(e.jobs[0].steps[0], { started_at: '2026-09-29T21:20:10Z', completed_at: '2026-09-29T21:20:19Z' });
+    e.jobs[0].steps.push({ number: 1, name: 'Set up job', conclusion: 'success',
+      started_at: '2026-09-29T21:20:00Z', completed_at: '2026-09-29T21:20:09Z' });
+    e.logs[42] = `2026-09-29T21:20:01Z passing diagnostic: Bad credentials\nBad credentials continuation\n`
+      + `2026-09-29T21:20:11Z failed step\n${auth ? 'Bad credentials' : 'Disk full'}`;
+    const result = collectCiAuthDiagnosis(input, { read: reader(e, []) });
+    expect(result.status).toBe(auth ? 'resolved' : 'unresolved');
+    if (auth) expect(result.secret).toBe('FUI_READ_TOKEN');
+    else expect(result.detail).toBe('No authentication failure identified in failed-step logs.');
+  });
+  it.each(['missing', 'invalid', 'reversed', 'mixed'])('treats unfiltered Bad credentials logs as unknown (%s intervals)', kind => {
+    const e = fixture();
+    const step = e.jobs[0].steps[0];
+    if (kind === 'missing') delete step.completed_at;
+    if (kind === 'invalid') step.started_at = 'invalid';
+    if (kind === 'reversed') step.started_at = '2026-09-29T21:20:02Z';
+    if (kind === 'mixed') e.jobs[0].steps.push({ number: 3, name: 'cleanup', conclusion: 'failure' });
+    // Even historical step labels must not turn the whole-log fallback into an auth diagnosis.
+    for (const prefixed of [true, false]) {
+      e.logs[42] = `${prefixed ? 'build\tCheckout FUI (sibling)\t' : ''}2026-09-29T21:20:00Z Bad credentials`;
+      for (const result of [diagnoseCiAuth(e), collectCiAuthDiagnosis(input, { read: reader(e, []) })]) {
+        expect(result.status).toBe('unresolved');
+        expect(result.detail).toContain('attribution is unknown');
+        expect(result).not.toHaveProperty('secret');
+        expect(result).not.toHaveProperty('failures');
+        expect(renderCiAuthDiagnosis(result)).not.toContain('gh secret set');
+      }
+    }
+  });
   it('attributes raw ANSI job API logs to the unique failed step interval', () => {
     const e = fixture();
     Object.assign(e.jobs[0].steps[0], { started_at: '2026-09-29T21:19:59Z', completed_at: '2026-09-29T21:20:01Z' });
@@ -142,6 +187,7 @@ describe('read-only collection bounds and failure isolation', () => {
   it('refuses ambiguous or missing raw-log step attribution', () => {
     const e = fixture();
     e.logs[42] = '2026-09-29T21:20:00Z ##[error]Bad credentials';
+    delete e.jobs[0].steps[0].completed_at;
     expect(collectCiAuthDiagnosis(input, { read: reader(e, []) }).status).toBe('unresolved');
     Object.assign(e.jobs[0].steps[0], { started_at: '2026-09-29T21:19:59Z', completed_at: '2026-09-29T21:20:01Z' });
     e.jobs[0].steps.push({ ...e.jobs[0].steps[0], number: 3, name: 'other', conclusion: 'success' });
@@ -252,6 +298,15 @@ describe('PR head versus executed merge workflow', () => {
     expect(d.secret).toBe('FUI_READ_TOKEN');
     expect(calls).toContainEqual(['api', `repos/${repo}/git/commits/${revision}`]);
     expect(calls).toContainEqual(['api', `repos/${repo}/contents/.github/workflows/ci.yml?ref=${revision}`]);
+  });
+  it('retains successful raw checkout logs to verify the merge before selecting failed-step auth evidence', () => {
+    const e = mergeFixture();
+    Object.assign(e.jobs[0].steps[0], { started_at: '2026-09-29T21:20:00Z', completed_at: '2026-09-29T21:20:09Z' });
+    Object.assign(e.jobs[0].steps[1], { started_at: '2026-09-29T21:20:10Z', completed_at: '2026-09-29T21:20:19Z' });
+    e.logs[42] = `2026-09-29T21:20:01Z [command]/usr/bin/git log -1 --format='%H'\n`
+      + `2026-09-29T21:20:02Z ${revision}\n2026-09-29T21:20:11Z failed checkout\nBad credentials`;
+    expect(collectCiAuthDiagnosis(input, { read: mergeReader(e, []) }))
+      .toMatchObject({ status: 'resolved', revision, secret: 'FUI_READ_TOKEN' });
   });
   it('unverifiable merge parents, overridden checkout refs and missing merge logs never guess', () => {
     const e = mergeFixture();

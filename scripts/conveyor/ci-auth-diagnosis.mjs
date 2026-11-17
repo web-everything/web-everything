@@ -1,4 +1,4 @@
-import { ciJobLogApiArgs } from '../lib/gh-ci-log.mjs';
+import { ciJobLogApiArgs, failedStepsLog } from '../lib/gh-ci-log.mjs';
 /** Read-only, attempt-scoped CI credential evidence; never reads credential values. */
 import yaml from 'js-yaml';
 import { runGhSync } from '../lib/gh-throttle.mjs';
@@ -41,16 +41,28 @@ function jobNames(id, definition) {
 
 // Preserve historical run-view evidence; raw job API lines need unique step time attribution.
 function stepLogLines(log, job, step) {
+  let belongs = false;
   return String(log ?? '').split('\n').flatMap(line => {
     const parts = line.split('\t');
-    if (parts[0] === job.name && parts[1] === step.name) return [parts.slice(2).join('\t')];
+    if (parts[0] === job.name && parts.length >= 3) {
+      belongs = parts[1] === step.name;
+      return belongs ? [parts.slice(2).join('\t')] : [];
+    }
     const match = /^(\d{4}-\d\d-\d\dT[\d:.]+Z)\s+(.*)$/.exec(line);
-    if (!match || job.steps.some(s => s.conclusion !== 'skipped'
+    if (!match) return belongs ? [line] : [];
+    belongs = false;
+    // Historical prefixes above already identify the step; apply time filtering only to raw lines.
+    if (step.conclusion === 'failure') {
+      const selected = failedStepsLog(job, line);
+      if (!selected.filtered || !selected.text) return [];
+    }
+    if (job.steps.some(s => s.conclusion !== 'skipped'
       && (!timestamp(s.started_at) || !timestamp(s.completed_at)))) return [];
     const at = Date.parse(match[1]);
     const owners = job.steps.filter(s => timestamp(s.started_at) && timestamp(s.completed_at)
       && at >= Date.parse(s.started_at) && at <= Date.parse(s.completed_at));
-    return owners.length === 1 && owners[0] === step ? [match[2]] : [];
+    belongs = owners.length === 1 && owners[0] === step;
+    return belongs ? [match[2]] : [];
   });
 }
 
@@ -75,6 +87,7 @@ export function diagnoseCiAuth(evidence = {}) {
     const candidates = [];
     for (const job of failed) {
       if (!Array.isArray(job.steps) || typeof logs?.[job.id] !== 'string') return unresolved('Failed-step logs are unavailable.');
+      if (!failedStepsLog(job, logs[job.id]).filtered) return unresolved('Failed-step log attribution is unknown: usable failed-step intervals are unavailable.');
       for (const step of job.steps.filter((s) => s.conclusion === 'failure')) {
         if (job.steps.filter((s) => s.name === step.name).length !== 1) return unresolved('Repeated step labels within a job make log attribution ambiguous.');
         const lines = stepLogLines(logs[job.id], job, step);

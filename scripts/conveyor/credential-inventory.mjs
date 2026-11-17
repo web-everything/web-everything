@@ -1,4 +1,4 @@
-import { ciJobLogApiArgs } from '../lib/gh-ci-log.mjs';
+import { ciJobLogApiArgs, failedStepsLog } from '../lib/gh-ci-log.mjs';
 /** Read-only credential metadata and failed Actions signature collection (#4378). */
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
@@ -93,7 +93,9 @@ export function collectCredentialInventory({ repos = DEFAULT_REPOS, now = Date.n
                     logBytes += Buffer.byteLength(log) + (logBytes ? 1 : 0);
                     if (logBytes > maxBytes) fail('output-limit');
                     if (!log.trim()) fail('unavailable');
-                    return log;
+                    const selected = failedStepsLog(job, log);
+                    if (!selected.filtered) fail('incomplete');
+                    return selected.text;
                   }).join('\n');
                   if (!logs.trim()) fail('unavailable');
                   result.ciFindings.push({ repo, runId: row.id, attempt: row.run_attempt, workflow: row.name, observedAt: new Date(now).toISOString(), badCredentials: /bad credentials/i.test(logs) });

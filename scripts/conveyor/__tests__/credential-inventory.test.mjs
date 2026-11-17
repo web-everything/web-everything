@@ -3,19 +3,49 @@ import { collectCredentialInventory as collect, normalizeInventory, DEFAULT_REPO
 const now = Date.parse('2026-10-01T12:00:00Z');
 const run = (overrides = {}) => ({ id: 42, run_attempt: 1, name: 'CI', status: 'completed', conclusion: 'failure', updated_at: new Date(now - 1000).toISOString(), ...overrides });
 const secret = (name = 'FUI_READ_TOKEN') => ({ name, updated_at: '2026-01-01T00:00:00Z', value: 'SECRET_CANARY' });
-function runner({ secrets = [secret()], runs = [run()], logs = 'step Bad credentials SECRET_CANARY', error } = {}) {
+const failedStep = () => ({ conclusion: 'failure', started_at: '2026-10-01T11:00:10Z', completed_at: '2026-10-01T11:00:19Z' });
+function runner({ secrets = [secret()], runs = [run()], jobs = [{ id: 420, conclusion: 'failure', steps: [failedStep()] }], logs = '2026-10-01T11:00:11Z step Bad credentials SECRET_CANARY', error } = {}) {
   const calls = [];
   const exec = (cmd, args, options) => {
     calls.push(args);
     expect(cmd).toBe('gh'); expect(options.timeout).toBeGreaterThan(0); expect(options.maxBuffer).toBeGreaterThan(0);
     if (args[1] === '--allow-escape-sequences') { if (error) throw error; return logs; }
-    if (args[3]?.includes('/jobs?')) return JSON.stringify({ total_count: 1, jobs: [{ id: 420, conclusion: 'failure' }] });
+    if (args[3]?.includes('/jobs?')) return JSON.stringify({ total_count: jobs.length, jobs });
     expect(args.slice(0, 3)).toEqual(['api', '--method', 'GET']);
     return JSON.stringify(args[3].includes('/secrets?') ? { secrets, total_count: secrets.length } : { workflow_runs: runs, total_count: runs.length });
   };
   return { exec, calls };
 }
 describe('credential metadata collector', () => {
+  it.each([false, true])('only Bad credentials in a failed step produces an auth finding (failed auth=%s)', badCredentials => {
+    const jobs = [{ id: 420, conclusion: 'failure', steps: [
+      { conclusion: 'success', started_at: '2026-10-01T11:00:00Z', completed_at: '2026-10-01T11:00:09Z' },
+      { conclusion: 'failure', started_at: '2026-10-01T11:00:10Z', completed_at: '2026-10-01T11:00:19Z' },
+      { conclusion: 'success', started_at: '2026-10-01T11:00:20Z', completed_at: '2026-10-01T11:00:29Z' },
+    ] }];
+    const logs = `2026-10-01T11:00:01Z passing diagnostic: Bad credentials\nBad credentials continuation\n`
+      + `2026-10-01T11:00:11Z failed step\n${badCredentials ? 'Bad credentials' : 'Disk full'}\n`
+      + '2026-10-01T11:00:21Z cleanup: Bad credentials';
+    const result = collect({ now, repos: ['a/b'], exec: runner({ jobs, logs }).exec });
+    expect(result.repositories[0].ci).toEqual({ complete: true, errors: [] });
+    expect(result.ciFindings).toEqual([expect.objectContaining({ runId: 42, attempt: 1, badCredentials })]);
+  });
+  it.each([
+    undefined, [], [{ conclusion: 'failure' }],
+    [{ ...failedStep(), completed_at: 'invalid' }],
+    [{ ...failedStep(), started_at: '2026-10-01T11:00:20Z' }],
+    [failedStep(), { conclusion: 'failure' }],
+  ])('treats an unfiltered Bad credentials log as unknown, never an auth finding (steps=%j)', steps => {
+    const result = collect({ now, repos: ['a/b'], exec: runner({ jobs: [{ id: 420, conclusion: 'failure', steps }] }).exec });
+    expect(result.ciFindings).toEqual([]);
+    expect(result.repositories[0].ci).toEqual({ complete: false, errors: ['incomplete'] });
+  });
+  it('keeps a run unknown when any failed job has an unfiltered auth log', () => {
+    const jobs = [{ id: 420, conclusion: 'failure', steps: [failedStep()] }, { id: 421, conclusion: 'failure' }];
+    const result = collect({ now, repos: ['a/b'], exec: runner({ jobs }).exec });
+    expect(result.ciFindings).toEqual([]);
+    expect(result.repositories[0].ci).toEqual({ complete: false, errors: ['incomplete'] });
+  });
   it('refuses incomplete attempt jobs and combined logs beyond the existing output bound', () => {
     const base = runner();
     const exec = (_cmd, args, options) => {
@@ -25,7 +55,7 @@ describe('credential metadata collector', () => {
     expect(collect({ now, repos: ['a/b'], exec }).repositories[0].ci).toEqual({ complete: false, errors: ['incomplete'] });
     const large = runner();
     const bounded = (_cmd, args, options) => {
-      if (args[3]?.includes('/jobs?')) return JSON.stringify({ total_count: 2, jobs: [420, 421].map(id => ({ id, conclusion: 'failure' })) });
+      if (args[3]?.includes('/jobs?')) return JSON.stringify({ total_count: 2, jobs: [420, 421].map(id => ({ id, conclusion: 'failure', steps: [failedStep()] })) });
       if (args[1] === '--allow-escape-sequences') return 'x'.repeat(600);
       return large.exec(_cmd, args, options);
     };
@@ -33,10 +63,21 @@ describe('credential metadata collector', () => {
     expect(result.repositories[0].ci).toEqual({ complete: false, errors: ['output-limit'] });
     expect(result.ciFindings).toEqual([]);
   });
+  it('bounds combined raw job bytes before failed-step filtering discards passing output', () => {
+    const jobs = [420, 421].map(id => ({ id, conclusion: 'failure', steps: [
+      { conclusion: 'success', started_at: '2026-10-01T11:00:00Z', completed_at: '2026-10-01T11:00:09Z' },
+      { conclusion: 'failure', started_at: '2026-10-01T11:00:10Z', completed_at: '2026-10-01T11:00:19Z' },
+    ] }));
+    const logs = `2026-10-01T11:00:01Z ${'x'.repeat(500)}\n2026-10-01T11:00:11Z Disk full`;
+    const result = collect({ now, repos: ['a/b'], maxBytes: 1000, exec: runner({ jobs, logs }).exec });
+    expect(result.repositories[0].ci).toEqual({ complete: false, errors: ['output-limit'] });
+    expect(result.ciFindings).toEqual([]);
+  });
   it('collects all repositories, projects allowlists and never retains logs or extra API fields', () => {
     const { exec, calls } = runner(); const result = collect({ now, exec });
     expect(result.repositories).toHaveLength(3); expect(result.secrets).toHaveLength(3);
     expect(result.secrets.map((r) => r.repo)).toEqual([...DEFAULT_REPOS].sort());
+    expect(result.ciFindings).toHaveLength(3);
     expect(result.ciFindings.every((r) => r.badCredentials)).toBe(true);
     expect(JSON.stringify(result)).not.toContain('SECRET_CANARY');
     expect(calls.filter((a) => a[1] === '--allow-escape-sequences')[0]).toEqual(['api', '--allow-escape-sequences', 'repos/frontier-ui/frontierui/actions/jobs/420/logs']);
@@ -55,7 +96,9 @@ describe('credential metadata collector', () => {
     expect(complete.secrets).toHaveLength(101); expect(complete.repositories[0].secrets.complete).toBe(true);
   });
   it.each(['401', 'test failed'])('does not classify %s as authentication failure', (logs) => {
-    expect(collect({ now, exec: runner({ logs }).exec }).ciFindings.every((r) => !r.badCredentials)).toBe(true);
+    const result = collect({ now, repos: ['a/b'], exec: runner({ logs: `2026-10-01T11:00:11Z ${logs}` }).exec });
+    expect(result.repositories[0].ci).toEqual({ complete: true, errors: [] });
+    expect(result.ciFindings).toEqual([expect.objectContaining({ badCredentials: false })]);
   });
   it('filters successful and old runs, includes the exact lookback edge, and limits scan coverage', () => {
     const runs = [run({ id: 1, conclusion: 'success' }), run({ id: 2, updated_at: new Date(now - 86400001).toISOString() }), run({ id: 3, updated_at: new Date(now - 86400000).toISOString() }), run({ id: 4 })];
