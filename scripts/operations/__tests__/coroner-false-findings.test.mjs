@@ -23,6 +23,13 @@ describe('false-finding cause fixtures', () => {
     const r = ruling(); r.rulings[0].cause = 'other'; r.rulings[0].lens = 'judgeSecurity';
     expect(extract([comment(r)])[0]).toMatchObject({ cause: 'other', causeBasis: 'recorded', lens: 'judgeSecurity' });
   });
+  it('does not count confirmed-real (live-reproduced / fix-now) rulings as false findings', () => {
+    expect(extract([comment(ruling({ reason: 'Class: live-reproduced -> fix-now' }))])).toEqual([]);
+    expect(extract([comment(ruling({ reason: 'Class: coverage-or-style -> fix-now' }))])).toEqual([]);
+    expect(extract([comment(ruling())])).toHaveLength(1);
+    expect(extract([comment(ruling({ reason: 'Class: live-reproduced was incorrect; false alarm' }))])).toHaveLength(1);
+    expect(extract([comment(ruling({ reason: 'False alarm: reviewer claimed Class: live-reproduced, but it does not reproduce' }))])).toHaveLength(1);
+  });
   it('recognizes policy re-blocks without counting the block as a new false finding', () => {
     const r = ruling(); const block = ruling({ actor: 'auto-policy', at: '2026-10-13T00:00:00Z' }); block.rulings[0].result = 'block';
     expect(extract([comment(r), comment(block)])).toMatchObject([{ cause: 'auto-policy-over-not-real' }]);

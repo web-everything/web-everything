@@ -41,6 +41,8 @@ export function falseFindingsForPr({ repo, pr, prType = 'unknown', comments, win
   const out = [];
   for (const r of rulings) {
     if (r.repo !== repo || r.pr !== pr || r.result !== 'not-real' || !inWindow(r.at, window)) continue;
+    // Confirmed-real rulings (class live-reproduced / action fix-now) are not false findings; dropped, not counted separately.
+    if (/^\s*Class:\s*[\w-]+\s*->\s*fix-now\b/i.test(String(r.reason ?? ''))) continue;
     const [lens, file, line, claim] = keyParts(r.key);
     const same = key => { const p = keyParts(key); return p[0] === lens && p[1] === file && p[3] === claim; };
     const reviewerNotReal = records.flatMap(rec => (rec.rulings ?? []).filter(o => o.result === 'not-real' && same(o.key)).map(() => rec.at));
