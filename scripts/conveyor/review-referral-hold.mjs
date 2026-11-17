@@ -58,9 +58,9 @@ export function reviewRunEvidence(run) {
   let retryableRecordEffect = false;
   let ciHeldRecordRetry;
   try {
-    if (!run.resumeOf && run.pending?.kind === 'effect' && run.pending.step === 'record' && Array.isArray(run.effects)) {
+    if (run.pending?.kind === 'effect' && run.pending.step === 'record' && Array.isArray(run.effects)) {
       const outstanding = run.effects.filter(e => !['applied', 'declared'].includes(e?.status));
-      retryableRecordEffect = outstanding.length > 0 && outstanding.every(e => e?.type === 'review.label-swap'
+      retryableRecordEffect = !run.resumeOf && outstanding.length > 0 && outstanding.every(e => e?.type === 'review.label-swap'
         && e.status === 'pending' && e.unknownAttempts === 0 && isBodyFileRefusal(e.error));
       if (outstanding.length > 0 && outstanding.every(e => e?.type === 'review.label-swap'
         && e.status === 'failed' && typeof e.error === 'string' && /CI still pending on reviewed head/.test(e.error))) {

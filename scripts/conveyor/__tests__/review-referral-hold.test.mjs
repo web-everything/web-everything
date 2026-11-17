@@ -94,6 +94,23 @@ describe('retryable record effects', () => {
       expect(findResumableParkedRun(pr(), [row], { repo, ciHeldRecordRetryMax: 3 }))
         .toEqual(resumeAttempts < RESUME_MAX_ATTEMPTS ? { id: r.id, head } : null);
     });
+  it.each([false, true])('selects saved CI-held record retries within both budgets, completed referral resume=%s', resumed => {
+    for (const attempts of [1, 3, 4]) {
+      for (const resumeAttempts of [0, RESUME_MAX_ATTEMPTS - 1, RESUME_MAX_ATTEMPTS]) {
+        const r = { ...ciSaved(), recordEffectResumeAttempts: resumeAttempts };
+        if (resumed) r.resumeOf = { verdict: run().findings.referralVerdict,
+          mandatoryReferrals: run().findings.mandatoryReferrals, attempts: 1 };
+        r.effects[1].unknownAttempts = attempts;
+        const row = reviewRunEvidence(JSON.parse(JSON.stringify(r)));
+        expect(row.ciHeld).toBe(true);
+        expect(row.ciHeldRecordRetry).toEqual({ attempts, resumeAttempts });
+        expect(row.retryableRecordEffect).toBeUndefined();
+        expect(findResumableParkedRun(pr(), [row], { repo, ciHeldRecordRetryMax: 3 }))
+          .toEqual(attempts <= 3 && resumeAttempts < RESUME_MAX_ATTEMPTS ? { id: r.id, head } : null);
+        expect(findResumableParkedRun(pr(), [row], { repo, ciHeldRecordRetryMax: 0 })).toBeNull();
+      }
+    }
+  });
   it.each([undefined, -1, '1', NaN, Infinity, 1.5])(
     'refuses incomplete or invalid projected resume attempts (%s)', resumeAttempts => {
       const row = reviewRunEvidence(ciSaved());
@@ -124,7 +141,6 @@ describe('retryable record effects', () => {
     ['non-CI failure', r => { r.effects[1].error = 'network timeout'; }],
     ['pending effect', r => { r.effects[1].status = 'pending'; }],
     ['mixed failure', r => { r.effects.push({ type: 'review.notice', status: 'failed' }); }],
-    ['resume', r => { r.resumeOf = {}; }],
     ['other step', r => { r.pending.step = 'advise'; }],
     ['empty effects', r => { r.effects = []; }],
     ['unreadable effect', r => { r.effects.push(null); }],

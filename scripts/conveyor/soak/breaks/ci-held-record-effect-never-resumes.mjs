@@ -33,9 +33,11 @@ export default {
       const { createMemoryRunStore } = await load('scripts/operations/run-store.mjs');
       const { judgeOutcome } = await load('scripts/operations/cli-adapter.mjs');
       const { notApplied } = await load('scripts/operations/effect-executor.mjs');
-      for (const [kind, max, attempts, resumes] of [
+      for (const [kind, max, attempts, resumes, completedResume = false] of [
         ['driver-first', 3, 1, true], ['driver-at-bound', 3, 3, true],
         ['driver-over-bound', 3, 4, false], ['driver-off', 0, 1, false],
+        ['driver-referral-resume-first', 3, 1, true, true], ['driver-referral-resume-at-bound', 3, 3, true, true],
+        ['driver-referral-resume-over-bound', 3, 4, false, true], ['driver-referral-resume-off', 0, 1, false, true],
       ]) {
         const declaration = reviewPrOperation({ readPr: () => ({
           state: 'OPEN', createdAt: '', body: '<!-- authored-by-actor: author -->',
@@ -64,7 +66,10 @@ export default {
         check(saved?.pending?.step === 'record', `${kind}: fixture must reach record`);
         const label = saved.effects.find(e => e.type === REVIEW_EFFECTS.LABEL);
         check(label?.status === 'failed', `${kind}: fixture must save a failed effect`);
-        label.unknownAttempts = attempts; store.write(saved);
+        label.unknownAttempts = attempts;
+        if (completedResume) saved.resumeOf = { verdict: saved.findings.referralVerdict,
+          mandatoryReferrals: saved.findings.mandatoryReferrals, attempts: 1 };
+        store.write(saved);
         const before = { judges, writes, labels };
         const out = await runReviewLoopOnce({ ...args, mintRunId: () => 'fresh-panel',
           findResumableRun: input => defaultFindResumableRun(input, {
@@ -76,7 +81,8 @@ export default {
         if (resumes) {
           check(judges === before.judges && writes === before.writes, `${kind}: panel and applied writes must not replay`);
           check(labels === before.labels + 1, `${kind}: failed label swap must retry`);
-          check(out.run?.recordEffectResumeAttempts === 1 && Boolean(out.run?.resumedAt) && !out.run?.resumeOf,
+          check(out.run?.recordEffectResumeAttempts === 1 && Boolean(out.run?.resumedAt)
+            && Boolean(out.run?.resumeOf) === completedResume,
             `${kind}: resume must spend the record budget in place`);
           check(out.run?.effects.find(e => e.type === REVIEW_EFFECTS.LABEL)?.status === 'failed', `${kind}: pending CI must keep holding`);
         } else check(judges > before.judges, `${kind}: fresh panel fallback must remain reachable`);
