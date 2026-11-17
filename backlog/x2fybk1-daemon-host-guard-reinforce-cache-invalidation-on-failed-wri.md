@@ -25,11 +25,14 @@ the daemon on standby. Cached ownership, throttles, locks and fences are removed
 - Generate a random UUID once in `~/.claude/host-id`, mode 600. Publish without
   overwriting another process's ID. Malformed or inaccessible identity fails closed.
 - Deprecated aliases come only from the local, uncommitted environment variable
-  `WE_DAEMON_LEGACY_OWNER_VALUES` (exact comma-separated lowercase names, at most
-  1024 characters total; each name at most 253 letters, digits, dots or hyphens,
-  starting and ending with a letter or digit; UUIDs are excluded). Unset or malformed
-  configuration disables migration. A fresh legacy owner must match a configured
-  alias and the locally established name; otherwise it cannot activate this host.
+  `WE_DAEMON_LEGACY_OWNER_VALUES` (comma-separated `alias=uuid` bindings, at most
+  1024 characters total; each alias at most 253 lowercase letters, digits, dots or
+  hyphens, starting and ending with a letter or digit, never a UUID; each UUID a
+  valid host ID; no duplicate aliases). Unset or malformed configuration disables
+  migration. An alias only names a host and never replaces the UUID check: a fresh
+  legacy owner activates this host only when the alias is bound to this host's UUID
+  and equals the name `scutil --get HostName` reports. If `scutil` fails the guard
+  stays standby; the OS hostname is never used as a fallback.
 - Preflight reads existing identity without provisioning it, uses the same resolver,
   reports unreadable ownership as a failed check, and continues unrelated checks.
 - Clone discovery errors remain explicit failures; valid stale overlays and sidecars

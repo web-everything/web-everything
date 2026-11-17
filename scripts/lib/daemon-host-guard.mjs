@@ -5,7 +5,7 @@
 import { closeSync, constants, fstatSync, linkSync, mkdirSync, openSync, readSync, unlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
-import { homedir, hostname } from 'node:os';
+import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
@@ -18,17 +18,29 @@ const validId = (value) => typeof value === 'string' && value.length === 36
   && /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value);
 const validAlias = (value) => typeof value === 'string' && value.length <= 253
   && /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?![\s\S])/.test(value) && !validId(value);
-const legacyOwner = (value, aliases) => validAlias(value) && Array.isArray(aliases) && aliases.includes(value);
-const validOwner = (value, aliases) => validId(value) || legacyOwner(value, aliases);
+const isBindings = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+const legacyOwner = (value, bindings) => validAlias(value) && isBindings(bindings)
+  && Object.hasOwn(bindings, value) && validId(bindings[value]);
+const validOwner = (value, bindings) => validId(value) || legacyOwner(value, bindings);
 const standby = (reason) => ({ role: 'standby', reason });
 const lineValue = (value) => value.replace(/\r?\n$/, '');
+const NO_BINDINGS = Object.freeze(Object.create(null));
 
-/** Deprecated migration aliases: exact comma-separated names in local env only. */
+/**
+ * Deprecated migration aliases from local env only: comma-separated `alias=uuid`.
+ * An alias only NAMES a host; it is bound to that host's UUID and never replaces
+ * the UUID check. Any invalid or duplicate entry disables migration entirely.
+ */
 export function getLegacyOwnerValues(env = process.env) {
   const raw = env.WE_DAEMON_LEGACY_OWNER_VALUES;
-  if (typeof raw !== 'string' || raw.length > 1024) return Object.freeze([]);
-  const aliases = raw.split(',');
-  return Object.freeze(aliases.every(validAlias) ? aliases : []);
+  if (typeof raw !== 'string' || raw.length > 1024) return NO_BINDINGS;
+  const bindings = Object.create(null);
+  for (const entry of raw.split(',')) {
+    const parts = entry.split('=');
+    if (parts.length !== 2 || !validAlias(parts[0]) || !validId(parts[1]) || parts[0] in bindings) return NO_BINDINGS;
+    bindings[parts[0]] = parts[1];
+  }
+  return Object.freeze(bindings);
 }
 
 export function defaultHostIdPath(home = homedir()) {
@@ -66,31 +78,29 @@ export function getThisHost({ home = homedir(), create = true } = {}) {
   } catch { return ''; }
 }
 
-/** Local names are consulted only for the deprecated migration aliases. */
-export function getLegacyHost({ exec = execFileSync, hostname: fallback = hostname,
-  legacyOwnerValues = getLegacyOwnerValues() } = {}) {
-  if (!Array.isArray(legacyOwnerValues) || legacyOwnerValues.length === 0) return '';
+/** Local name consulted only for deprecated aliases; any failure fails closed (no OS-hostname fallback). */
+export function getLegacyHost({ exec = execFileSync, legacyOwnerValues = getLegacyOwnerValues() } = {}) {
+  if (!isBindings(legacyOwnerValues) || Object.keys(legacyOwnerValues).length === 0) return '';
   let name;
   try {
     name = String(exec('scutil', ['--get', 'HostName'], {
       encoding: 'utf8', timeout: READ_TIMEOUT_MS, maxBuffer: MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'],
     })).trim();
-  } catch { /* The OS name remains a migration-only fallback. */ }
-  if (!name) {
-    try { name = String(fallback()).trim(); } catch { return ''; }
-  }
+  } catch { return ''; }
   return legacyOwner(name, legacyOwnerValues) ? name : '';
 }
 
 /** Pure decision over fresh evidence; timestamps in the future fail closed. */
-export function decideHostRole({ thisHost, owner, ownerReadAt, now, legacyHost = '', legacyOwnerValues = [] } = {}) {
+export function decideHostRole({ thisHost, owner, ownerReadAt, now, legacyHost = '', legacyOwnerValues = NO_BINDINGS } = {}) {
   if (!validId(thisHost) || !Number.isFinite(now)) return standby('invalid-input');
   if (!Number.isFinite(ownerReadAt) || ownerReadAt > now || now - ownerReadAt > FRESH_READ_MS) {
     return standby('owner-unreadable');
   }
   if (owner === '') return standby('owner-unset');
   if (!validOwner(owner, legacyOwnerValues)) return standby('owner-unreadable');
-  return owner === thisHost || (legacyOwner(owner, legacyOwnerValues) && owner === legacyHost)
+  // An alias is only a name: it activates this host solely when bound to this host's UUID.
+  return owner === thisHost || (legacyOwner(owner, legacyOwnerValues) && owner === legacyHost
+    && legacyOwnerValues[owner] === thisHost)
     ? { role: 'active', reason: 'fresh-owner-is-this-host' }
     : standby('owner-is-other-host');
 }

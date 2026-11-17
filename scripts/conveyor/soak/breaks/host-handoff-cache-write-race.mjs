@@ -40,15 +40,17 @@ export default {
         });
       }
       if (reads !== 10) violations.push('a call reused earlier ownership');
-      for (const [configured, expected] of [[undefined, 'standby'], ['legacy-alpha\n', 'standby'],
-        ['legacy-beta', 'standby'], ['legacy-alpha', 'active']]) {
+      for (const [configured, expected] of [[undefined, 'standby'], ['legacy-alpha=' + first + '\n', 'standby'],
+        ['legacy-beta=' + first, 'standby'], ['legacy-alpha=' + second, 'standby'], ['legacy-alpha', 'standby'],
+        ['legacy-alpha=' + first, 'active']]) {
         const env = { HOME: join(home, 'first'), WE_DAEMON_LEGACY_OWNER_VALUES: configured };
         const migration = cliIO(env, { legacyHost: 'legacy-alpha', execFileSync: (_file, args) => JSON.stringify(
           args[1].includes('/git/ref/') ? { object: { type: 'commit', sha: 'a'.repeat(40) } }
             : { type: 'file', encoding: 'base64', content: Buffer.from('legacy-alpha\n').toString('base64') },
         ) });
         const decision = await migration.resolveRole();
-        if (decision.role !== expected || (expected === 'standby' && decision.reason !== 'owner-unreadable')) {
+        const standbyReason = configured === 'legacy-alpha=' + second ? 'owner-is-other-host' : 'owner-unreadable';
+        if (decision.role !== expected || (expected === 'standby' && decision.reason !== standbyReason)) {
           violations.push('legacy migration ignored local alias configuration');
         }
       }
