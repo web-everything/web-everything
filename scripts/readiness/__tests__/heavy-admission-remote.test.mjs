@@ -762,6 +762,94 @@ describe('runWithRemoteDecision', () => {
     },
   );
 
+  describe('fresh telemetry confirms termination without a verified receipt', () => {
+    const run = 'r-' + 'a'.repeat(32);
+    const otherRun = 'r-' + 'b'.repeat(32);
+    it('does not reuse a prior attempt run ID when a busy retry fails before reporting its own ID', async () => {
+      const f = fixture({remote: {busyWaitMs: 2000, busyBackoffMs: 1000}});
+      f.sleep = async () => {};
+      f.remoteExec.mockImplementationOnce(async ({onRun}) => {
+        onRun(run);
+        return {mode: 'not-started', terminated: true, reason: 'forge-busy'};
+      }).mockRejectedValueOnce(new Error('retry lost'));
+      f.readTelemetry = vi.fn(healthyRead);
+      expect(await runWithRemoteDecision(f)).toEqual({handled: true, exitCode: 124});
+      expect(f.remoteExec).toHaveBeenCalledTimes(2);
+      expect(f.readTelemetry).toHaveBeenCalledTimes(1);
+      expect(existsSync(join(f.lockRoot, '..', 'remote', 'slot-0.unconfirmed'))).toBe(true);
+      expect(f.log.mock.calls.map(([line]) => line).join('')).toContain('retry lost');
+    });
+    const cases = [
+      ['finished', false], ['inflight', true], ['supervisor 97', true], ['supervisor 254', true],
+      ['unreadable', true], ['missing', true], ['stale', true], ['predates failure', true],
+      ['future', true], ['absent', true], ['malformed', true], ['stalled', true], ['no run id', true],
+    ];
+    it.each(['timeout', 'unconfirmed', 'throw', 'synchronous throw'].flatMap(outcome =>
+      cases.map(([evidence, refuses]) => ({outcome, evidence, refuses}))))(
+      '$outcome with $evidence telemetry retains quarantine=$refuses', async ({outcome, evidence, refuses}) => {
+        vi.useFakeTimers();
+        try {
+          const f = fixture();
+          const initialAt = Date.now();
+          let dispatched = false;
+          f.readTelemetry = vi.fn(async () => {
+            if (!dispatched) return healthyRead();
+            if (evidence === 'unreadable') throw new Error('telemetry unreadable');
+            if (evidence === 'missing') return null;
+            if (evidence === 'stalled') return new Promise(() => {});
+            // The probe samples after the client gives up, even when fake timers share a millisecond.
+            vi.setSystemTime(Date.now() + 1);
+            const sampledAt = evidence === 'stale' ? Date.now() - 30_001
+              : evidence === 'predates failure' ? initialAt : evidence === 'future' ? Date.now() + 60_001 : Date.now();
+            return {sampledAtET: new Date(sampledAt).toISOString(), activeRuns: 2, activeRunIds: [run, otherRun],
+              recent: [
+                {runId: otherRun, startedAtET: new Date(initialAt).toISOString(), code: null},
+                ...(evidence === 'absent' ? [] : [{runId: run, startedAtET: new Date(initialAt).toISOString(),
+                  code: evidence === 'inflight' ? null : evidence === 'supervisor 97' ? 97 : evidence === 'supervisor 254' ? 254 : 0}]),
+              ], ...(evidence === 'malformed' ? {activeRuns: 3} : {})};
+          });
+          f.remoteExec.mockImplementation(({onRun}) => {
+            dispatched = true;
+            if (evidence !== 'no run id') onRun(run);
+            if (outcome === 'timeout') return new Promise(() => {});
+            if (outcome === 'throw') return Promise.reject(new Error('transport lost'));
+            if (outcome === 'synchronous throw') throw new Error('transport lost');
+            return Promise.resolve({mode: 'unconfirmed', reason: 'receipt unavailable'});
+          });
+          const remoteRoot = join(f.lockRoot, '..', 'remote');
+          const marker = join(remoteRoot, 'slot-0.unconfirmed');
+          const local = vi.fn(() => {
+            expect(existsSync(marker)).toBe(false);
+            expect(existsSync(marker + '.run')).toBe(false);
+            expect(heldSlots({lockRoot: remoteRoot, cap: 8})).toHaveLength(0);
+          });
+          const pending = runWithRemoteDecision({...f, timeoutMs: 20}).then(result => {
+            if (!result.handled) local();
+            return result;
+          });
+          await vi.advanceTimersByTimeAsync(2025);
+          expect(await pending).toEqual(refuses ? {handled: true, exitCode: 124} : {handled: false});
+          expect(f.remoteExec).toHaveBeenCalledTimes(1);
+          expect(f.readTelemetry).toHaveBeenCalledTimes(evidence === 'no run id' ? 1 : 2);
+          expect(existsSync(marker)).toBe(refuses);
+          expect(local).toHaveBeenCalledTimes(refuses ? 0 : 1);
+          const logs = f.log.mock.calls.map(([line]) => line).join('');
+          if (refuses) expect(logs).toContain('termination unconfirmed; refusing local rerun (exit 124)');
+          else {
+            expect(logs).toContain('termination confirmed without a verified receipt');
+            expect(logs).toContain('falling back to local admission');
+            expect(logs).not.toContain('exit 124');
+            const reason = outcome === 'timeout' ? 'remote-timeout' : outcome === 'unconfirmed' ? 'receipt unavailable' : 'transport lost';
+            expect(JSON.parse(readFileSync(join(f.lockRoot, 'remote-fallbacks.jsonl'), 'utf8'))).toMatchObject({reason});
+            const health = JSON.parse(readFileSync(join(remoteRoot, 'health-g2.json'), 'utf8'));
+            expect(health).toMatchObject({failures: 0, backoffUntil: 0});
+          }
+          expect(vi.getTimerCount()).toBe(0);
+        } finally { vi.useRealTimers(); }
+      },
+    );
+  });
+
   it.each([
     ['default ceiling without env', undefined, ['npm', 'run', 'build'], DEFAULT_ADMISSION_CEILING_MS],
     ['ceiling from env', { WE_HEAVY_ADMISSION_CEILING_MS: '1234' }, ['npm', 'run', 'build'], 1234],

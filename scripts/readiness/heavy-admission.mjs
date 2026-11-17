@@ -175,7 +175,7 @@ import {
 import { routeNeedsGit } from './needs-git-route.mjs';
 import { capabilityBundleVerdict, capabilityRecord } from './remote-git-bundle.mjs'; // R501: test files that spawn git cannot run on Forge's .git-less snapshot
 import { recordRemoteRun } from '../lib/forge-share.mjs'; // R501: the one durable remote-success row forgeShare reads
-import { createMarkerReaper, markerContent, recordMarkerRun, blockedSlots, heldTombstone } from './forge-slot-markers.mjs';
+import { createMarkerReaper, markerContent, recordMarkerRun, blockedSlots, heldTombstone, runVerdict } from './forge-slot-markers.mjs';
 import { classifyWaiterPriority, waiterPriorityClass, validRepairPatterns, DEFAULT_REPAIR_PATTERNS, ADMISSION_PRIORITY_MODES } from './heavy-repair-priority.mjs'; // red-main repair class — kept out of the projection (which the read-only `heavy-queue` op imports) because it needs `node:vm`
 export * from './heavy-queue-projection.mjs';
 export * from './heavy-repair-priority.mjs';
@@ -1158,8 +1158,8 @@ function recordRemoteFallback({lockRoot, reason, detail = null, cwd, argv, env, 
  * Only { mode: 'remote', code: <integer 0..254> } exits with that code. Local admission requires
  * { mode: 'not-started', terminated: true } or { mode: 'cancelled', terminated: true }.
  * After timeout-abort, allow up to one second for cancelled+terminated acknowledgement.
- * Everything else (including legacy fallback, throws, malformed results and unacknowledged
- * timeouts) refuses local reruns with exit 124. */
+ * Otherwise a fresh settled per-run telemetry result can confirm termination for a local rerun;
+ * missing or incomplete evidence still refuses local reruns with exit 124. */
 const CLIENT_SIGNAL_NUMBERS = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 };
 /** x40a9dk: how long a killed client waits for its remote cancel to be confirmed (default 90s; the protected finish took 14s live). */
 function resolveSignalCancelWaitMs(env) {
@@ -1337,6 +1337,7 @@ export async function runWithRemoteDecision({
   let primaryCreated = false;
   let outstanding = false;
   let terminated = false;
+  let executionRun = null;
   const executor = remoteExec ?? createRemoteExec({ policy, cwd, env, lockRoot, log, runOverride: remoteClientOverride });
   remoteExec = options => executor({...options,slotUnits:units,onRun:run => {
     options.onRun(run);
@@ -1357,6 +1358,26 @@ export async function runWithRemoteDecision({
   let signalHandlers = [];
   // A kill that lands while a result is being recorded is honoured: exit with the signal code, keeping `terminated` as is.
   const killedExit = () => signalled ? { handled: true, exitCode: 128 + CLIENT_SIGNAL_NUMBERS[signalled], signal: signalled } : null;
+  const confirmFinished = async () => {
+    if (!executionRun || signalled) return false;
+    const gaveUpAt = clock();
+    let probeTimer;
+    try {
+      // Bypass the health cache: only a sample taken after this failure can settle this execution.
+      const telemetry = await Promise.race([
+        Promise.resolve().then(async () => (readTelemetry ?? (await import('./forge-telemetry.mjs')).readForgeTelemetry)({host})),
+        new Promise(resolve => { probeTimer = setTimeout(() => resolve(null), 1000); }),
+        signalPromise,
+      ]);
+      const sampledAt = Date.parse(telemetry?.sampledAtET), age = clock() - sampledAt;
+      if (signalled || !(sampledAt > gaveUpAt && age >= -60_000 && age <= 30_000)
+        || runVerdict(telemetry, executionRun) !== 'finished') return false;
+      terminated = true;
+      log(`heavy-admission: remote run ${executionRun} finished per fresh telemetry; termination confirmed without a verified receipt, rerunning through local admission\n`);
+      return true;
+    } catch { return false; }
+    finally { clearTimeout(probeTimer); }
+  };
   const timedOut = Symbol('remote-timeout');
   try {
     // Waiting for a remote slot can outlive the cached sample. Recheck before dispatch.
@@ -1391,9 +1412,14 @@ export async function runWithRemoteDecision({
         controller.abort();
       }, timeoutMs);
     });
-    const dispatch = () => Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, cancelSignal: cancelController.signal, transport: policy.settings.remote.transport, bundleMainMaxAgeMs: policy.settings.remote.bundle.mainMaxAgeMin * 60_000,
+    const dispatch = () => {
+      executionRun = null;
+      return Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, cancelSignal: cancelController.signal, transport: policy.settings.remote.transport, bundleMainMaxAgeMs: policy.settings.remote.bundle.mainMaxAgeMin * 60_000,
       onWarning: (reason, detail) => recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock}),
-      onCapabilities: capabilities => writeRunnerCapabilities({ root: remoteRoot, host, capabilities, clock }), onRun: run => recordMarkerRun(executionMarker, {owner, run}) }));
+      onCapabilities: capabilities => writeRunnerCapabilities({ root: remoteRoot, host, capabilities, clock }), onRun: run => {
+        if (recordMarkerRun(executionMarker, {owner, run})) executionRun = run;
+      } }));
+    };
     let remote = dispatch();
     let result = await Promise.race([remote, timeout, signalPromise]);
     // forge-busy-wait: an explicit, confirmed non-start (never 'unconfirmed') waits and retries Forge within a total
@@ -1453,26 +1479,34 @@ export async function runWithRemoteDecision({
       // A client kill during the timeout grace period still cancels and exits with the signal code.
       if (typeof termination?.clientSignal === 'string') return await cancelOnClientSignal(termination.clientSignal);
       if (termination?.mode !== 'cancelled' || termination.terminated !== true) {
-        await record({mode:'unconfirmed'});
-        return killedExit() ?? refuseLocal('remote-timeout');
+        if (!await confirmFinished()) {
+          await record({mode:'unconfirmed'});
+          return killedExit() ?? refuseLocal('remote-timeout');
+        }
       }
       reason = 'remote-timeout';
       terminated = true;
-      await record(termination);
+      await record({mode:'cancelled',terminated:true,reason:'remote-timeout'});
       if (killedExit()) return killedExit();
     } else {
       terminated = (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254)
         || ((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true);
-      await record(result); // record() itself skips a busy Forge result when the busy wait is enabled
+      const confirmedByTelemetry = !terminated && await confirmFinished();
+      await record(confirmedByTelemetry ? {mode:'cancelled',terminated:true,reason:result?.reason} : result); // record() itself skips a busy Forge result when the busy wait is enabled
       if (killedExit()) return killedExit();
       if (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254) return { handled: true, exitCode: result.code, remoteResult: result };
-      // Only explicit non-start or cancellation with confirmed termination is safe. Throws and malformed
-      // replies may come from an executor whose remote child is still alive.
-      if (!((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true)) return killedExit() ?? refuseLocal(result?.reason ?? 'unconfirmed remote result');
+      // Explicit acknowledgement or a fresh settled per-run result must confirm termination. Throws and
+      // malformed replies alone may come from an executor whose remote child is still alive.
+      if (!terminated) return killedExit() ?? refuseLocal(result?.reason ?? 'unconfirmed remote result');
       reason = result?.reason ?? 'unconfirmed remote result';
       detail = result?.detail;
     }
-  } catch (error) { await record({mode:'unconfirmed'}); return killedExit() ?? refuseLocal(error?.message ?? error); }
+  } catch (error) {
+    reason = error?.message ?? String(error);
+    if (!await confirmFinished()) { await record({mode:'unconfirmed'}); return killedExit() ?? refuseLocal(reason); }
+    await record({mode:'cancelled',terminated:true,reason});
+    if (killedExit()) return killedExit();
+  }
   finally {
     clearTimeout(timer); clearInterval(heartbeat);
     for (const [name, h] of signalHandlers) process.removeListener(name, h);
