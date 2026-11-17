@@ -440,7 +440,7 @@ function* decodedBuffers(text,recent) {
   }
   if(length>=8)yield bytes.subarray(0,length);
 }
-function scanText(text,recent) {
+function scanText(text,recent,onDecoded) {
   // Every supported text representation needs ASCII letters, digits or encoding punctuation.
   // UTF-16 views of ordinary ASCII bytes often contain none; avoid allocating empty filtered views.
   if(text.length<8||!/[A-Za-z0-9+/_-]/.test(text))return false;
@@ -453,7 +453,10 @@ function scanText(text,recent) {
   const encodedChar=/[A-Za-z0-9+/_-]/g;
   for(let count=0;count<8;count++)if(!encodedChar.test(text))return false;
   for(const variant of stripped===text?[text]:[text,stripped])
-    for(const bytes of decodedBuffers(variant,recent))if(hasKey(bytes))return true;
+    for(const bytes of decodedBuffers(variant,recent)) {
+      onDecoded?.(bytes);
+      if(hasKey(bytes))return true;
+    }
   return false;
 }
 function textViews(content) {
@@ -470,26 +473,26 @@ function textViews(content) {
   return texts;
 }
 // content: Buffer. True when a structured key hides in the raw bytes or in any decoded text view.
-function privateKeyStructureFinding(content,{escapes=false,recent=new Map()}={}) {
+function privateKeyStructureFinding(content,{escapes=false,recent=new Map(),onDecoded}={}) {
   if(!Buffer.isBuffer(content))return null;
   // JWKs are checked by scanText in the lossless Latin-1 and UTF-8 views below.
   if(hasSignature(content))return KEY_STRUCTURE_FINDING;
   for(const text of textViews(content)) {
-    if(scanText(text,recent))return KEY_STRUCTURE_FINDING;
+    if(scanText(text,recent,onDecoded))return KEY_STRUCTURE_FINDING;
     // Ordinary manifest paths use only this detector, so retain escape-decoded views without
     // consulting legacy text/JSON policy. Recursive calls leave escape expansion disabled.
     if(escapes&&text.includes('\\'))
       for(const view of new Set([decodeEscapes(text,recent),withoutBackslashes(text,recent)]))
-        if(view!==text&&decodedStructureFinding(view,recent))return KEY_STRUCTURE_FINDING;
+        if(view!==text&&decodedStructureFinding(view,recent,onDecoded))return KEY_STRUCTURE_FINDING;
   }
   return null;
 }
 // Escaped byte strings use code units 0..255 (including DER bytes above 127).
 // UTF-8 alone changes those bytes. Keep both interpretations as additional inputs;
 // recursive scans do not expand escapes again, so work stays bounded per view.
-function decodedStructureFinding(text,recent=new Map()) {
-  return privateKeyStructureFinding(Buffer.from(text,'latin1'),{recent})
-    ??(/[^\x00-\x7f]/.test(text)?privateKeyStructureFinding(Buffer.from(text,'utf8'),{recent}):null);
+function decodedStructureFinding(text,recent=new Map(),onDecoded) {
+  return privateKeyStructureFinding(Buffer.from(text,'latin1'),{recent,onDecoded})
+    ??(/[^\x00-\x7f]/.test(text)?privateKeyStructureFinding(Buffer.from(text,'utf8'),{recent,onDecoded}):null);
 }
 // Scan each supported byte view, including BOM-less UTF-16 in either byte order.
 function legacyBufferFinding(content) {
@@ -782,21 +785,20 @@ export function warnCredential(onWarning,path,finding) {
 // Every path, not only credential-named ones: a structured key or a PEM private-key block with a body.
 // Linear scans only; binary bytes get the structured-signature check, the PEM text check is a bounded regex.
 // The label may end in ` BLOCK` (ASCII-armoured PGP). Armour allows `Name: value` header lines before the base64 body.
-const pemPrivateBlock=new RegExp('-----'+'BEGIN [A-Z0-9 ]*PRIVATE'+' KEY(?: BLOCK)?-----\\s*(?:(?:[A-Za-z][A-Za-z-]*: [^\\r\\n]*\\r?\\n)*\\s*(?:[A-Za-z0-9+/=]{8,}\\s*){3,}|Proc-Type:|DEK-Info:)');
-// A PEM wrapped in base64 (a Kubernetes Secret value) or hex spells the header only after decoding.
-// A decoded view is never longer than its text, so a text view over the scan limit is skipped.
-function encodedPemFinding(views) {
-  for(const text of views) {
-    if(text.length>LIMIT)continue;
-    // Fresh dedupe state: the structure scan already consumed these views and would yield nothing again.
-    for(const decoded of decodedBuffers(text,new Map()))
-      if(pemPrivateBlock.test(decoded.toString('latin1')))return true;
-  }
-  return false;
-}
+// Three eight-character groups can share one run or span two/three runs. Spell those
+// cases separately: nested repetitions (and adjacent whitespace stars) backtrack on near misses.
+const pemBody='(?:[A-Za-z0-9+/=]{24}|[A-Za-z0-9+/=]{16,}\\s+[A-Za-z0-9+/=]{8}|[A-Za-z0-9+/=]{8,}\\s+[A-Za-z0-9+/=]{16}|[A-Za-z0-9+/=]{8,}\\s+[A-Za-z0-9+/=]{8,}\\s+[A-Za-z0-9+/=]{8})';
+const pemPrivateBlock=new RegExp('-----'+'BEGIN [A-Z0-9 ]*PRIVATE'+' KEY(?: BLOCK)?-----\\s*(?:Proc-Type:|DEK-Info:|(?:[A-Za-z][A-Za-z-]*: [^\\r\\n]*\\r?\\n\\s*)*'+pemBody+')');
 export function ordinaryPathKeyFinding(content) {
   if(!Buffer.isBuffer(content))return null;
-  const recent=new Map(),structured=privateKeyStructureFinding(content,{escapes:true,recent});
+  // Inspect the buffers already decoded for structure, including escape-decoded wrappers.
+  // Bound the additional PEM text allocation by decoded bytes, not the larger encoded input.
+  // Structure scanning retains its existing coverage even beyond the PEM text limit.
+  let encodedPem=false;
+  const onDecoded=bytes=>{
+    if(!encodedPem&&bytes.length<=LIMIT&&pemPrivateBlock.test(bytes.toString('latin1')))encodedPem=true;
+  };
+  const recent=new Map(),structured=privateKeyStructureFinding(content,{escapes:true,recent,onDecoded});
   if(structured)return structured;
   const views=textViews(content);
   if([...views].some(text=>pemPrivateBlock.test(text)))return 'private-key';
@@ -807,7 +809,7 @@ export function ordinaryPathKeyFinding(content) {
       if(view!==text&&pemPrivateBlock.test(view))return KEY_STRUCTURE_FINDING;
   }
   // Last, so an escaped spelling keeps its escape finding rather than the encoded-view one.
-  return encodedPemFinding(views)?'private-key':null;
+  return encodedPem?'private-key':null;
 }
 export function manifestEntry(path,content,executable,tracked,onWarning) {
   pathParts(path);

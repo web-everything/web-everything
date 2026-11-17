@@ -1,7 +1,8 @@
 // @vitest-environment node
 import {generateKeyPairSync} from 'node:crypto';
+import {execFileSync} from 'node:child_process';
 import {describe,expect,it,vi} from 'vitest';
-import {credentialBufferFinding,credentialContentFinding,ordinaryPathKeyFinding} from '../forge-exec-manifest.mjs';
+import {credentialBufferFinding,credentialContentFinding,ordinaryPathKeyFinding,manifestEntry} from '../forge-exec-manifest.mjs';
 
 const key=generateKeyPairSync('ed25519').privateKey.export({format:'der',type:'pkcs8'});
 const scanners={
@@ -11,6 +12,39 @@ const scanners={
 };
 
 describe('Forge encoded-view reuse',()=>{
+  it('bounds an armoured PGP header followed by a long blank body',()=>{
+    const script=`import {ordinaryPathKeyFinding} from ${JSON.stringify(new URL('../forge-exec-manifest.mjs',import.meta.url).href)};
+      const text='-----'+'BEGIN PGP PRIVATE'+' KEY BLOCK-----'+'\\n'.repeat(262144)+'!';
+      if(ordinaryPathKeyFinding(Buffer.from(text))!==null)process.exit(1);`;
+    expect(()=>execFileSync(process.execPath,['--input-type=module','-e',script],{timeout:2000,stdio:'pipe'})).not.toThrow();
+  });
+
+  it.each(['base64','hex'])('refuses %s PEM whose encoded text exceeds the limit but decoded bytes fit',encoding=>{
+    const pem='-----'+'BEGIN PRIVATE'+' KEY-----\n'+'A'.repeat(64)+'\n';
+    const raw=Buffer.from('!'.repeat(3*1024*1024)+pem);
+    const bytes=Buffer.from(raw.toString(encoding));
+    expect(bytes.length).toBeGreaterThan(4*1024*1024);
+    expect(ordinaryPathKeyFinding(bytes)).toBe('private-key');
+    expect(()=>manifestEntry(Buffer.from('docs/material.md'),bytes,false,true))
+      .toThrow(expect.objectContaining({code:'excluded-source-file'}));
+  });
+
+  it.each(['base64','hex'])('refuses an escape-spelled %s PGP wrapper without decoding a stream twice',encoding=>{
+    const pgp='-----'+'BEGIN PGP PRIVATE'+' KEY BLOCK-----\nVersion: test\n\n'+'B'.repeat(64)+'\n';
+    const encoded=Buffer.from(pgp).toString(encoding);
+    const bytes=Buffer.from([...encoded].map(c=>'\\u'+c.charCodeAt(0).toString(16).padStart(4,'0')).join(''));
+    expect(ordinaryPathKeyFinding(bytes)).toBe('private-key');
+    for(const tracked of [false,true])
+      expect(()=>manifestEntry(Buffer.from('docs/material.md'),bytes,false,tracked))
+        .toThrow(expect.objectContaining({code:'excluded-source-file'}));
+  });
+
+  it('skips the additional PEM text scan when decoded bytes exceed the limit',()=>{
+    const pem='-----'+'BEGIN PRIVATE'+' KEY-----\n'+'A'.repeat(64)+'\n';
+    const raw=Buffer.from('!'.repeat(4*1024*1024+16)+pem);
+    expect(ordinaryPathKeyFinding(Buffer.from(raw.toString('base64')))).toBeNull();
+  });
+
   for(const [name,scan] of Object.entries(scanners)) {
     it(`${name} preserves alphabet filtering, hex prefixes and every alignment in a shared pass`,()=>{
       const text='G0x1X0X2y0xx300X40x0X5z6789abcdefABCDEF+/_-éΩ𝄞';
