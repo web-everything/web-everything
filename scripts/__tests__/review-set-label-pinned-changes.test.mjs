@@ -5,7 +5,7 @@ import { runReviewLabelCli } from '../review-set-label.mjs';
 import { appendVerdict } from '../lib/verdict-ledger.mjs';
 const head = 'a'.repeat(40);
 afterEach(() => vi.restoreAllMocks());
-function run({ changedAt = Infinity, change = { headRefOid: 'b'.repeat(40) }, pin = head } = {}) {
+function run({ extra = [], changedAt = Infinity, change = { headRefOid: 'b'.repeat(40) }, pin = head } = {}) {
   let reads = 0;
   const state = { state: 'OPEN', headRefOid: head, headRefName: 'lane/test', baseRefName: 'release',
     labels: ['review:pending'], comments: globalThis.__cap ? Array.from({ length: 100 }, () => ({ body: 'c' })) : [], body: '' };
@@ -15,7 +15,7 @@ function run({ changedAt = Infinity, change = { headRefOid: 'b'.repeat(40) }, pi
   vi.spyOn(process, 'exit').mockImplementation(code => { throw Object.assign(new Error('exit'), { exitCode: code }); });
   let exit = 0;
   try {
-    runReviewLabelCli({ argv: ['7', '--repo=o/n', '--to=changes', `--expect-head=${pin}`],
+    runReviewLabelCli({ argv: ['7', '--repo=o/n', '--to=changes', `--expect-head=${pin}`, ...extra],
       defaultActor: 'daemon', usage: 'test', verdictBody: 'Fix the blocked case', provider,
       buildComment: () => 'Fix the blocked case', successResult: () => ({ ok: true }),
       refusalResult: ({ decision }) => ({ error: decision.reason }), signalFix: () => {}, emit: s => output.push(s) });
@@ -39,6 +39,10 @@ describe('guarded changes through sanctioned CLI', () => {
     let r; try { r = run(); } finally { delete globalThis.__cap; }
     expect(r.exit).toBe(1);
     expect(r.provider.setLabels).not.toHaveBeenCalled();
+  });
+  it('refuses when the blocking set differs from the digest the findings were written for', () => {
+    const r = run({ extra: ['--expect-referrals=' + '0'.repeat(64)] }); expect(r.exit).toBe(1);
+    expect(r.provider.postComment).not.toHaveBeenCalled(); expect(r.provider.setLabels).not.toHaveBeenCalled();
   });
   it('refuses a malformed pin before reading or writing', () => {
     const r = run({ pin: 'bad' }); expect(r.exit).toBe(2);

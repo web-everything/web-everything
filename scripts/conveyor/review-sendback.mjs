@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 /** Pure planning and findings rendering for the review daemon's mechanical send-back. */
 const labels = pr => Array.isArray(pr?.labels) ? pr.labels.map(l => typeof l === 'string' ? l : l?.name) : [];
 export const pendingOnly = pr => labels(pr).includes('review:pending')
@@ -45,3 +46,6 @@ export function renderFindingsBody(referrals = []) {
     return `- ${at ? `${at} — ` : ''}${clean(f.summary)} (seats: ${[...g.seats].sort().join(', ')})`;
   }).join('\n');
 }
+
+/** Stable digest of the blocking referral set a body was rendered from; the writer re-derives and compares it. */
+export const referralDigest = (refs = []) => createHash('sha256').update(JSON.stringify([...refs].map(r => String(r?.key ?? '')).sort())).digest('hex');

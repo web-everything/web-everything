@@ -12,7 +12,7 @@ import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { STAND_DOWN_LABEL } from './stand-down.mjs';
 import { bindAgents, assessLiveness } from './reconcile-core.mjs';
-import { planSendBacks, pendingOnly, headKey, validHead, renderFindingsBody } from './review-sendback.mjs';
+import { planSendBacks, pendingOnly, headKey, validHead, renderFindingsBody, referralDigest } from './review-sendback.mjs';
 import { blockRuledReferralsFor, GH_LIST_COMMENT_CAP } from './review-referral-hold.mjs';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -89,7 +89,7 @@ export function runSendBackTick({ repo, plan, prs, agents, log = () => {},
             const fresh = readReferrals({ ...live, number: pr.number }, repo);
             if (!fresh.length) { log(`review-sendback: #${pr.number} referral state changed since planning; not sent`); continue; }
             writeFileSync(body, renderFindingsBody(fresh), 'utf8');
-            execute(process.execPath, ['scripts/review-set-label.mjs', String(row.prNumber), '--to=changes', `--repo=${repo}`, `--body-file=${body}`, `--expect-head=${row.headSha}`],
+            execute(process.execPath, ['scripts/review-set-label.mjs', String(row.prNumber), '--to=changes', `--repo=${repo}`, `--body-file=${body}`, `--expect-head=${row.headSha}`, `--expect-referrals=${referralDigest(fresh)}`],
               { cwd: ROOT, encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 120_000 });
             ledger.sent[row.key] = true;
             saveLedger(ledger);

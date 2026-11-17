@@ -57,7 +57,7 @@ describe('review send-back', () => {
     const { o, tick } = fixture();
     o.execute.mockImplementation((node, argv, opts) => {
       expect(node).toBe(process.execPath);
-      expect(argv).toEqual(['scripts/review-set-label.mjs', '7', '--to=changes', `--repo=${repo}`, expect.stringMatching(/^--body-file=/), `--expect-head=${head}`]);
+      expect(argv).toEqual(['scripts/review-set-label.mjs', '7', '--to=changes', `--repo=${repo}`, expect.stringMatching(/^--body-file=/), `--expect-head=${head}`, expect.stringMatching(/^--expect-referrals=[0-9a-f]{64}$/)]);
       expect(readFileSync(argv[4].slice(12), 'utf8')).toContain('Broken case!');
       expect(opts.maxBuffer).toBe(1024 * 1024);
     }); tick(); expect(o.execute).toHaveBeenCalledTimes(1); expect(o.log).not.toHaveBeenCalled();

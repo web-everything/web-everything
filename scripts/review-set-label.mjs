@@ -4,6 +4,7 @@ import { standingRulingScope } from './conveyor/standing-ruling-io.mjs';
 import { signalFixDispatch } from './lib/fix-handoff.mjs';
 import { mandatoryReferralState, readReferralRecords, referralRecordState } from './lib/jury-core.mjs';
 import { referralSeatDisabled } from './operations/review-seat-policy.mjs';
+import { referralDigest } from './conveyor/review-sendback.mjs';
 import { readReviewRunEvidence, blockRuledReferralsFor, GH_LIST_COMMENT_CAP } from './conveyor/review-referral-hold.mjs';
 /**
  * review-set-label.mjs — swap a PR's review label, INVARIANT-2 guarded (#2470, increment 2 of 2). Also the
@@ -1232,6 +1233,7 @@ export function runReviewLabelCli({
   if (onlyIf !== null && !['accepted', 'missing'].includes(onlyIf)) {
     fail("invalid --only-if — expected 'accepted' or 'missing'");
   }
+  const expectReferrals = (argv.find((a) => a.startsWith('--expect-referrals=')) || '').slice('--expect-referrals='.length);
   const pinnedChanges = to === 'changes' && expectHeadFlag !== undefined;
   if (pinnedChanges && (!/^[0-9a-f]{40}$/.test(expectedHead || '') || newHeadArg)) fail('changes requires --expect-head=<full 40-hex SHA>');
   const pinnedRearm = to === 'rearm' && expectHeadFlag !== undefined;
@@ -2015,8 +2017,9 @@ export function runReviewLabelCli({
       if (!Array.isArray(full)) throw new Error('pinned changes: full comment thread unreadable; nothing further written');
       evidence = { ...fresh, comments: full };
     }
-    if (!blockRuledReferralsFor({ ...evidence, number: Number(pr) }, { repo }).length) {
-      throw new Error('pinned changes: referral state no longer owes a block; nothing further written');
+    const owed = blockRuledReferralsFor({ ...evidence, number: Number(pr) }, { repo });
+    if (!owed.length || (expectReferrals && referralDigest(owed) !== expectReferrals)) {
+      throw new Error('pinned changes: blocking referral set differs from the one the findings were written for; nothing further written');
     }
   };
   const assertPinnedRearmHead = (fresh) => {
