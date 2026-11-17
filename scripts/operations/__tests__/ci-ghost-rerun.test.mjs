@@ -11,8 +11,10 @@ import { readCiGhostRerunSettings } from '../../lib/ci-ghost-rerun-settings.mjs'
 import { readDeclaredSettings, SETTINGS_DIR } from '../../lib/settings-files.mjs';
 import { readPlatformPreferences } from '../../lib/policy-cascade.mjs';
 import { execFileSyncThrottled } from '../../lib/gh-throttle.mjs';
+import { readTimeoutBudget } from '../../conveyor/timeout-retry-state.mjs';
 
 vi.mock('../../lib/gh-throttle.mjs', () => ({ execFileSyncThrottled: vi.fn() }));
+vi.mock('../../conveyor/timeout-retry-state.mjs', () => ({ readTimeoutBudget: vi.fn() }));
 
 const NOW = Date.parse('2026-11-16T12:00:00Z');
 const HEAD = 'a'.repeat(40);
@@ -54,6 +56,7 @@ function fixture() {
   });
   f.state = { read: () => f.rows, append: row => f.rows.push(structuredClone(row)), withLock: fn => fn() };
   f.deps = { gh: f.gh, state: f.state, clock: () => f.now, settings,
+    readSharedRerunBudget: vi.fn(() => ({ confirmed: 0, rejected: 0, pending: false })),
     sleep: async ms => { f.trace.push('wait'); f.now += ms; } };
   f.run = (overrides = {}) => runCiGhostRerun({ ...options, ...overrides }, f.deps);
   return f;
@@ -131,14 +134,66 @@ describe('ghost recovery', () => {
       expect(f.rows.some(row => row.counted)).toBe(false);
     });
 
-  it('allows a completed sibling when every active job is validated', async () => {
+  it.each(['success', 'skipped', 'neutral'])('allows a %s completed sibling when every active job is validated', async conclusion => {
     const f = fixture();
     f.listedJobs = [{ id: 7, run_id: 9, run_attempt: 2, status: 'in_progress',
       check_run_url: 'https://api.github.com/repos/web-everything/web-everything/check-runs/70' },
-    { id: 8, run_id: 9, run_attempt: 2, status: 'completed' }];
+    { id: 8, run_id: 9, run_attempt: 2, status: 'completed', conclusion }];
     f.jobsTotal = 2;
     expect(await f.run()).toMatchObject({ exitCode: 0, reason: 'rerun' });
     expect(f.posts).toEqual(['cancel', 'rerun']);
+  });
+
+  it.each(['failure', 'cancelled', 'timed_out', 'action_required', null, undefined, 'unknown', 'stale'])(
+    'refuses a completed sibling with conclusion %s without replacing failures', async conclusion => {
+      const f = fixture();
+      f.listedJobs = [{ ...f.job, check_run_url: 'https://api.github.com/repos/web-everything/web-everything/check-runs/70' },
+        { id: 8, run_id: 9, run_attempt: 2, status: 'completed', conclusion }];
+      f.jobsTotal = 2;
+      expect(await f.run()).toMatchObject({ exitCode: 2, reason: 'sibling-failed' });
+      expect(f.posts).toEqual([]);
+      expect(f.rows).toEqual([expect.objectContaining({ outcome: 'sibling-failed', counted: false })]);
+    });
+
+  it.each([
+    ['confirmed allowance exhausted', { confirmed: 1, rejected: 0, pending: false }],
+    ['rejected allowance exhausted', { confirmed: 0, rejected: 1, pending: false }],
+    ['pending reservation', { confirmed: 0, rejected: 0, pending: true }],
+    ['unreadable state', { pending: true, reason: 'timeout-state-unreadable:corrupt' }],
+    ['unknown budget', undefined],
+    ['incomplete budget', { confirmed: 0 }],
+    ['invalid count', { confirmed: -1, rejected: 0, pending: false }],
+    ['oversized count', { confirmed: Number.MAX_SAFE_INTEGER + 1, rejected: 0, pending: false }],
+    ['invalid rejected count', { confirmed: 0, rejected: null, pending: false }],
+    ['read error despite zero counts', { confirmed: 0, rejected: 0, pending: false, reason: 'unreadable' }],
+  ])('refuses shared rerun budget: %s; requires operator inspection before manual recovery', async (_name, budget) => {
+    const f = fixture(); f.deps.readSharedRerunBudget.mockReturnValue(budget);
+    expect(await f.run()).toMatchObject({ exitCode: 3, reason: 'shared-rerun-budget' });
+    expect(f.deps.readSharedRerunBudget).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', pr: 42, head: HEAD });
+    expect(f.posts).toEqual([]);
+    expect(f.rows).toEqual([expect.objectContaining({ outcome: 'shared-rerun-budget', counted: false })]);
+  });
+
+  it('refuses a throwing shared budget reader before any POST or local reservation', async () => {
+    const f = fixture(); f.deps.readSharedRerunBudget.mockRejectedValue(new Error('unreadable'));
+    expect(await f.run()).toMatchObject({ exitCode: 3, reason: 'shared-rerun-budget' });
+    expect(f.posts).toEqual([]);
+    expect(f.rows.some(row => row.counted)).toBe(false);
+  });
+
+  it('uses the existing shared budget reader by default with the exact target identity', async () => {
+    const f = fixture(); delete f.deps.readSharedRerunBudget;
+    readTimeoutBudget.mockReturnValueOnce({ confirmed: 0, rejected: 0, pending: false });
+    expect(await f.run({ repo: 'other/repo', pr: 43 })).toMatchObject({ reason: 'rerun', exitCode: 0 });
+    expect(readTimeoutBudget).toHaveBeenCalledTimes(1);
+    expect(readTimeoutBudget).toHaveBeenCalledWith({ repo: 'other/repo', pr: 43, head: HEAD });
+    expect(f.rows.filter(row => row.counted)).toHaveLength(1);
+  });
+
+  it('checks the shared budget even for a dry run', async () => {
+    const f = fixture(); f.deps.readSharedRerunBudget.mockReturnValue({ confirmed: 1, rejected: 0, pending: false });
+    expect(await f.run({ dryRun: true })).toMatchObject({ reason: 'shared-rerun-budget', exitCode: 3 });
+    expect(f.posts).toEqual([]);
   });
 
   it('refuses a job detail that no longer links to the selected check', async () => {
