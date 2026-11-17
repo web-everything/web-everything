@@ -819,8 +819,18 @@ export function createDefaultJudge({
     }
     // An explicit pin (request-level provider, factory provider/providerName, or factory model) outranks the policy default.
     const pinned = request?.providerName !== undefined || factoryProviderName !== undefined || provider !== undefined || model !== undefined;
-    const configured = pinned ? null : resolveOperationRoute({ operation: operation === 'judge' ? 'judge' : `judge:${operation}`, taskType: request?.mandate?.lens ?? request?.lens, available: JUDGE_PROVIDER_NAMES,
-      aiRouting: request?.model !== undefined || request?.effort !== undefined ? undefined : resolveJudgeRoutingInput() });
+    const routeOptions = { operation: operation === 'judge' ? 'judge' : `judge:${operation}`, taskType: request?.mandate?.lens ?? request?.lens, available: JUDGE_PROVIDER_NAMES };
+    let configured = pinned ? null : resolveOperationRoute(routeOptions);
+    if (!pinned && !request?.mandatoryLens && request?.care == null && request?.model === undefined && request?.effort === undefined) {
+      const aiRouting = resolveJudgeRoutingInput();
+      if (aiRouting) {
+        const routed = resolveOperationRoute({ ...routeOptions, aiRouting });
+        const rank = effort => Object.keys(CODEX_EFFORT_MAP).indexOf(effort);
+        // Match the Codex judge guard: settings may only raise effort on today's provider/model.
+        if (configured && routed && routed.provider === configured.provider && routed.model === configured.model
+          && rank(configured.effort) >= 0 && rank(routed.effort) >= rank(configured.effort)) configured = routed;
+      }
+    }
     const effectiveProviderName = configured?.provider ?? request?.providerName ?? providerName;
     // #xqa9ttq (PR #2115 review, CONFIRMED) - `allowedTools: []` is the explicit "no tools" signal
     // `assertNoCodexToolAllowlist` documents as tool-free. `assertSafeJudgeRequest` is shared with claude and
