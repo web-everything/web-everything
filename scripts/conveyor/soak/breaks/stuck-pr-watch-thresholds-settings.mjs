@@ -28,7 +28,15 @@ export default {
       assert.ok(Object.isFrozen(DEFAULT_STUCK_THRESHOLD_MINUTES));
       const fileThresholds = JSON.parse(readFileSync(join(root, SETTINGS), 'utf8')).stuckPrWatch.thresholdMinutes;
       assert.deepEqual(fileThresholds, literal);
-      // Exercise the production reader with no WE_STUCK_PR_* environment overrides.
+      // The default reader has module-relative paths and no directory override. Equal
+      // shipped/default values alone cannot prove wiring, so pin its import and default.
+      const coreSource = readFileSync(join(root, CORE), 'utf8');
+      assert.match(coreSource, /^import\s*\{\s*readDeclaredSettings\s*\}\s*from\s*['"]\.\.\/lib\/settings-files\.mjs['"];$/m,
+        'production reader imports the shared readDeclaredSettings');
+      assert.equal(stuckThresholdMinutes.length, 0, 'production resolver retains default parameters');
+      assert.match(coreSource, /^export function stuckThresholdMinutes\(env = process\.env, \{ readSettings: read = readDeclaredSettings,/m,
+        'production resolver defaults to readDeclaredSettings without an injected reader');
+      // Exercise the production defaults with no WE_STUCK_PR_* environment overrides.
       const production = stuckThresholdMinutes({});
       assert.deepEqual(production, literal, 'production reader preserves all four literal defaults');
       assert.deepEqual(production, fileThresholds, 'production reader matches the declared file thresholds');
