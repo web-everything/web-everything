@@ -8,7 +8,7 @@
 import { readGh } from './lib/proc-read.mjs';
 import { readReviewCiGate } from './lib/review-ci-gate-io.mjs';
 import { readSharedFreeze } from './lib/red-main-freeze-shared.mjs';
-import { decidePublish, createGhPublishIo } from './lib/review-hold-io.mjs';
+import { decidePublish, createGhPublishIo, liveLabelNames } from './lib/review-hold-io.mjs';
 import { deriveReviewHold } from './lib/review-hold-model.mjs';
 
 const OPTS = { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] };
@@ -46,7 +46,7 @@ export async function probe({ repo, pr, read = { gh, ghJson, freeze: readSharedF
   const derived = deriveReviewHold({ headSha, prNumber: Number(pr), labels: view.labels, mergeGate, freeze });
   const io = createGhPublishIo({ repo, pr: Number(pr), head: headSha });
   const publish = await decidePublish({ repo, pr: Number(pr), head: headSha,
-    liveLabels: view.labels.map(l => l.name ?? l) }, io);
+    liveLabels: liveLabelNames(view.labels) }, io);
   let old;
   try {
     const ci = readReviewCiGate({ repo, pr });

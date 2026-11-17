@@ -140,7 +140,18 @@ describe('decidePublish v2', () => {
   it('rerun-of-old-run-has-highest-ids', async () => { const w = world(); addRun(w, { id: 999, run_number: 7, run_attempt: 4, created_at: '2026-11-16T00:00:00Z', updated_at: '2099-01-01T00:00:00Z' }); await yes(w); expect(w.io.listAttemptJobs).toHaveBeenCalledWith(31, 1); });
   it('run_number-tie', async () => { const w = world(); addRun(w, { run_number: 8 }); await no(w); });
   it('created_at-inverted', async () => { const w = world(); addRun(w, { created_at: '2026-11-16T00:00:00Z' }); await no(w); });
-  it('module-exports-exactly-two', () => { expect(Object.keys(exports).sort()).toEqual(['createGhPublishIo', 'decidePublish']); });
+  // liveLabelNames is the third export: callers holding provider label rows need the same name projection.
+  it('module-exports-exactly-three', () => { expect(Object.keys(exports).sort()).toEqual(['createGhPublishIo', 'decidePublish', 'liveLabelNames']); });
+  it('liveLabelNames-projects-names-and-keeps-bad-rows-invalid', async () => {
+    expect(exports.liveLabelNames([{ name: 'review:pending', color: 'x' }, 'bug'])).toEqual(['review:pending', 'bug']);
+    expect(exports.liveLabelNames([])).toEqual([]);
+    for (const bad of [undefined, null, {}, 'review:pending', { labels: [] }]) expect(exports.liveLabelNames(bad)).toBeNull();
+    expect(exports.liveLabelNames([{ color: 'x' }, { name: 7 }, null])).toEqual([null, null, null]);
+    // A projected bad row fails closed in decidePublish, before any GitHub read.
+    const w = world(); w.input.liveLabels = exports.liveLabelNames([{ name: 'review:pending' }, { color: 'x' }]);
+    await expect(w.decide()).resolves.toEqual({ publish: false, reason: 'invalid-input' });
+    expect(w.io.getPull).not.toHaveBeenCalled();
+  });
   it('result-frozen-two-keys', async () => { const result = await world().decide(); expect(Object.isFrozen(result)).toBe(true); expect(Object.keys(result).sort()).toEqual(['publish', 'reason']); });
   it('extra-input-keys-change-nothing', async () => { const w = world(); Object.assign(w.input, { evidence: { verified: true }, seal: true, reviewGate: { state: 'success' } }); await yes(w); });
   it('binding-sweep', async () => {

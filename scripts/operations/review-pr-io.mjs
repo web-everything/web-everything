@@ -1,4 +1,4 @@
-import { decidePublish, createGhPublishIo } from '../lib/review-hold-io.mjs';
+import { decidePublish, createGhPublishIo, liveLabelNames } from '../lib/review-hold-io.mjs';
 import { redTeamCheckRunIsEvidence, redTeamCheckRunPayload, postRedTeamCheckRun as defaultPostRedTeamCheckRun } from '../lib/red-team-check-run.mjs';
 import { redTeamForHead } from '../lib/red-team-gate.mjs';
 import { basisLineOf, isReviewVerdictComment, reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
@@ -1174,7 +1174,8 @@ export function createReviewPrSinks({
           try {
             // Review records use a net diff against current main, not the PR files API's merge base.
             // Let decidePublish read that complete API list when the caller supplies no list.
-            const liveLabels = await readLabels(payload.repo, payload.pr);
+            // The provider returns GitHub label objects; decidePublish compares label names.
+            const liveLabels = liveLabelNames(await readLabels(payload.repo, payload.pr));
             decision = await decideReviewGate({ repo: payload.repo, pr: payload.pr, head: payload.reviewedHead,
               liveLabels, changedFiles: payload.changedFiles });
           } catch { /* A failed read or decision retains the hold. */ }

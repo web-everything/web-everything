@@ -12,6 +12,14 @@ const PREFIX = 'review-gate-verdict/v1 ';
 // CI-mode import closure. The optional manual --pr reader is not loaded in CI.
 const GATE_PATHS = ['scripts/check-review-gate.mjs', 'scripts/lib/review-labels.mjs', 'scripts/lib/write-all-sync.mjs'];
 
+/** Label names for `liveLabels` from a label read. Strings pass through and GitHub `{name}` rows map to the
+ *  name. Any other row, or a non-array read, stays invalid so decidePublish holds with `invalid-input`.
+ *  Unlike advisory-labels' `labelNames`, it never drops a bad row: dropping would hide unreadable evidence. */
+export function liveLabelNames(labels) {
+  if (!Array.isArray(labels)) return null;
+  return labels.map(l => (typeof l === 'string' ? l : typeof l?.name === 'string' ? l.name : null));
+}
+
 /** Omitted changedFiles uses the complete PR files API list; an explicit list must match it. */
 export async function decidePublish(input, io) {
   try {
