@@ -107,7 +107,8 @@
  * REMOTE ROUTING CONTRACT — remote stays disabled by default (heavyAdmission.remote.enabled=false).
  * Only { mode: 'remote', code: <integer 0..254> } exits with that code. Local admission may follow only
  * { mode: 'not-started', terminated: true } or { mode: 'cancelled', terminated: true }. After a timeout,
- * only the cancelled+terminated acknowledgement permits local admission. Everything else, including
+ * confirmed cancellation or fresh finished telemetry permits local admission. R989 also accepts a late
+ * remote result within the cancel wait only when its run matches this dispatch's recorded run ID. Everything else, including
  * legacy { mode: 'fallback' }, throws, malformed results and unacknowledged timeouts, exits 124.
  *
  * THE LOAD-ADMISSION GATE (#4076, revised #4343) — a SECOND, DIFFERENT admission axis this module now also
@@ -1157,7 +1158,8 @@ function recordRemoteFallback({lockRoot, reason, detail = null, cwd, argv, env, 
 /** Attempt remote execution before taking a local slot; remote is disabled by default.
  * Only { mode: 'remote', code: <integer 0..254> } exits with that code. Local admission requires
  * { mode: 'not-started', terminated: true } or { mode: 'cancelled', terminated: true }.
- * After timeout-abort, wait within a bounded cancel window for confirmed termination.
+ * After timeout-abort, wait within a bounded cancel window for confirmed termination or (R989) a
+ * verified remote result whose string run ID matches this dispatch's non-null recorded run ID.
  * Otherwise a fresh settled per-run telemetry result can confirm termination for a local rerun;
  * missing or incomplete evidence still refuses local reruns with exit 124. */
 const CLIENT_SIGNAL_NUMBERS = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 };
@@ -1491,6 +1493,9 @@ export async function runWithRemoteDecision({
       const deadline = new Promise(resolve => { timer = setTimeout(() => resolve(null), waitMs); });
       const confirmed = remote.catch(() => null).then(answer => {
         if (answer?.mode === 'cancelled' && answer.terminated === true) return answer;
+        // R989: remote-exec already verifies the head-bound receipt; bind a late result to THIS dispatch too.
+        if (answer?.mode === 'remote' && Number.isInteger(answer.code) && answer.code >= 0 && answer.code <= 254
+          && executionRun !== null && typeof answer.run === 'string' && answer.run === executionRun) return answer;
         return new Promise(() => {}); // an ambiguous answer cannot stop the fresh telemetry probes
       });
       const probe = (async () => {
@@ -1508,6 +1513,12 @@ export async function runWithRemoteDecision({
       if (!termination) {
         await record({mode:'unconfirmed'});
         return killedExit() ?? refuseLocal('remote-timeout');
+      }
+      if (termination.mode === 'remote') {
+        terminated = true;
+        await record(termination);
+        if (killedExit()) return killedExit();
+        return { handled: true, exitCode: termination.code, remoteResult: termination };
       }
       reason = 'remote-timeout';
       terminated = true;

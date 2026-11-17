@@ -2241,7 +2241,12 @@ Regressions live in `forge-slot-markers-per-run.test.mjs` and `heavy-admission-r
 
 After a run timeout, allow 30 seconds for cancellation (`WE_HEAVY_TIMEOUT_CANCEL_WAIT_MS`,
 validated as a nonnegative integer and capped at 90 seconds), probing fresh per-run telemetry
-about every two seconds while also waiting for the executor. Only confirmed cancellation
+about every two seconds while also waiting for the executor. R989 accepts a late receipt-verified
+`mode: 'remote'` answer with an integer code 0–254 only inside this cancel wait and only when
+its string `run` strictly matches the non-null execution run recorded by `onRun` for this dispatch;
+return its exit code (including failures), record it, and release the slot and both marker files.
+Missing/mismatched run IDs, invalid codes, executor rejection and other ambiguous answers must
+not stop telemetry probes. A client signal still wins. Only confirmed cancellation
 or fresh `finished` telemetry permits local fallback; deadline expiry
 keeps exit 124 and both marker files. Dead-owner markers with an `inflight` verdict remain
 quarantined; unknown evidence and failed releases still count as `stuck-slots`.

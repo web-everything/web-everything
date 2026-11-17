@@ -692,7 +692,7 @@ describe('runWithRemoteDecision', () => {
 
   it.each([
     ['cancelled', 5000], ['cancelled', 18000],
-    ['telemetry', 5000], ['telemetry', 18000], ['remote-telemetry', 5000], ['inflight', 30000],
+    ['telemetry', 5000], ['telemetry', 18000], ['remote', 5000], ['remote', 18000], ['remote-telemetry', 5000], ['inflight', 30000],
   ])('files timeout waits for %s after %i ms without releasing a live run', async (completion, delay) => {
     vi.useFakeTimers();
     try {
@@ -711,7 +711,7 @@ describe('runWithRemoteDecision', () => {
         dispatched = true;
         onRun(run);
         if (completion === 'cancelled' || completion.startsWith('remote')) signal.addEventListener('abort', () => {
-          setTimeout(() => resolve(completion.startsWith('remote') ? {mode: 'remote', code: 0}
+          setTimeout(() => resolve(completion.startsWith('remote') ? {mode: 'remote', code: 0, run}
             : {mode: 'cancelled', terminated: true}), delay);
         }, {once: true});
       }));
@@ -725,12 +725,14 @@ describe('runWithRemoteDecision', () => {
       expect(heldSlots({lockRoot: remoteRoot, cap: 8})).toHaveLength(1);
       await vi.advanceTimersByTimeAsync(28_000);
       const kept = completion === 'inflight';
-      expect(await pending).toEqual(kept ? {handled: true, exitCode: 124} : {handled: false});
+      expect(await pending).toEqual(kept ? {handled: true, exitCode: 124}
+        : completion.startsWith('remote') ? {handled: true, exitCode: 0, remoteResult: {mode: 'remote', code: 0, run}}
+          : {handled: false});
       expect(existsSync(marker)).toBe(kept);
       expect(existsSync(marker + '.run')).toBe(kept);
       expect(heldSlots({lockRoot: remoteRoot, cap: 8})).toHaveLength(kept ? 1 : 0);
       expect(f.readTelemetry.mock.calls.length).toBeGreaterThan(2);
-      if (!kept) expect(JSON.parse(readFileSync(join(f.lockRoot, 'remote-fallbacks.jsonl'), 'utf8')))
+      if (!kept && !completion.startsWith('remote')) expect(JSON.parse(readFileSync(join(f.lockRoot, 'remote-fallbacks.jsonl'), 'utf8')))
         .toMatchObject({reason: 'remote-timeout'});
       expect(vi.getTimerCount()).toBe(0);
     } finally { vi.useRealTimers(); }
@@ -815,7 +817,67 @@ describe('runWithRemoteDecision', () => {
     } finally { vi.useRealTimers(); }
   });
 
-  it.each(['never resolves', 'missing acknowledgement', 'false acknowledgement', 'not-started acknowledgement', 'legacy fallback', 'rejection', 'late success'])(
+  it.each([0, 1, 254])('returns a late verified remote result with code %i for this dispatch after timeout', async code => {
+    vi.useFakeTimers();
+    try {
+      const f = fixture();
+      const run = 'r-' + 'a'.repeat(32);
+      const answer = {mode: 'remote', code, run};
+      f.remoteExec.mockImplementation(({onRun, signal}) => new Promise(resolve => {
+        onRun(run);
+        signal.addEventListener('abort', () => setTimeout(() => resolve(answer), 100), {once: true});
+      }));
+      const pending = runWithRemoteDecision({...f, timeoutMs: 20});
+      await vi.advanceTimersByTimeAsync(20);
+      const remoteRoot = join(f.lockRoot, '..', 'remote'), marker = join(remoteRoot, 'slot-0.unconfirmed');
+      expect(existsSync(marker)).toBe(true);
+      expect(existsSync(marker + '.run')).toBe(true);
+      expect(heldSlots({lockRoot: remoteRoot, cap: 8})).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(await pending).toEqual({handled: true, exitCode: code, remoteResult: answer});
+      expect(existsSync(marker)).toBe(false);
+      expect(existsSync(marker + '.run')).toBe(false);
+      expect(heldSlots({lockRoot: remoteRoot, cap: 8})).toHaveLength(0);
+      expect(existsSync(join(f.lockRoot, 'remote-fallbacks.jsonl'))).toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each([
+    ['mismatched run', {code: 0, run: 'r-' + 'b'.repeat(32)}, true],
+    ['missing run', {code: 0}, true],
+    ['non-string run', {code: 0, run: 1}, true],
+    ['unrecorded run', {code: 0, run: 'r-' + 'a'.repeat(32)}, false],
+    ['negative code', {code: -1, run: 'r-' + 'a'.repeat(32)}, true],
+    ['out-of-range code', {code: 255, run: 'r-' + 'a'.repeat(32)}, true],
+    ['fractional code', {code: 0.5, run: 'r-' + 'a'.repeat(32)}, true],
+  ])('discards a late remote result with %s and continues telemetry until the deadline', async (_label, fields, recorded) => {
+    vi.useFakeTimers();
+    try {
+      const f = fixture();
+      f.readTelemetry = vi.fn(healthyRead);
+      f.remoteExec.mockImplementation(({onRun, signal}) => new Promise(resolve => {
+        if (recorded) onRun('r-' + 'a'.repeat(32));
+        signal.addEventListener('abort', () => setTimeout(() => resolve({mode: 'remote', ...fields}), 100), {once: true});
+      }));
+      let settled = false;
+      const pending = runWithRemoteDecision({...f, timeoutMs: 20}).then(result => { settled = true; return result; });
+      await vi.advanceTimersByTimeAsync(120);
+      const probes = f.readTelemetry.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(4000);
+      expect(settled).toBe(false);
+      if (recorded) expect(f.readTelemetry.mock.calls.length).toBeGreaterThan(probes);
+      await vi.advanceTimersByTimeAsync(25_900);
+      expect(await pending).toEqual({handled: true, exitCode: 124});
+      const remoteRoot = join(f.lockRoot, '..', 'remote'), marker = join(remoteRoot, 'slot-0.unconfirmed');
+      expect(existsSync(marker)).toBe(true);
+      expect(existsSync(marker + '.run')).toBe(recorded);
+      expect(heldSlots({lockRoot: remoteRoot, cap: 8})).toHaveLength(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(['never resolves', 'missing acknowledgement', 'false acknowledgement', 'not-started acknowledgement', 'legacy fallback', 'rejection'])(
     'refuses a local rerun after timeout when remote termination is uncertain: %s', async (outcome) => {
       vi.useFakeTimers();
       try {
@@ -829,7 +891,6 @@ describe('runWithRemoteDecision', () => {
             if (outcome === 'not-started acknowledgement') resolve({ mode: 'not-started', terminated: true });
             if (outcome === 'legacy fallback') resolve({ mode: 'fallback', terminated: true });
             if (outcome === 'rejection') reject(new Error('transport closed'));
-            if (outcome === 'late success') resolve({ mode: 'remote', code: 0 });
           }, { once: true });
         }));
         const local = vi.fn();
