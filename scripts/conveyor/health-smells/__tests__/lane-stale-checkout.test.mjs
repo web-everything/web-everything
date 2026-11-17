@@ -19,7 +19,7 @@ const freshSource = `export function parseTelemetry(text) {
 }
 `;
 const staleSource = 'export function parseTelemetry(text) { return JSON.parse(text); }';
-const lane = (overrides = {}) => ({ pool: 'web-everything', lane: 1, head: 'abcdef123', behind: 0, behindSinceMs: null, forgeExecHasPrune: true, ...overrides });
+const lane = (overrides = {}) => ({ pool: 'web-everything', lane: 1, head: 'abcdef123', behind: 0, behindSinceMs: null, headLagMs: null, forgeExecHasPrune: true, ...overrides });
 const evaluate = (row, model = smell) => model.evaluate({ laneCheckouts: [row] }, { now })[0];
 
 describe('lane-stale-checkout', () => {
@@ -55,8 +55,30 @@ describe('lane-stale-checkout', () => {
     expect(evaluate(lane({ behind: 3, behindSinceMs: now - 1001 }), { ...smell, maxBehindCommits: 2, maxBehindMs: 1000 }).breach).toBe(true);
   });
 
-  it('does not infer a breach from null or incomplete evidence', () => {
-    expect(evaluate(lane({ head: null, behind: null, behindSinceMs: null, forgeExecHasPrune: null })).breach).toBe(false);
+  it('fails closed when the Forge parser cannot be verified', () => {
+    const result = evaluate(lane({ forgeExecHasPrune: null }));
+    expect(result.breach).toBe(true);
+    expect(result.summary).toContain('cannot verify forge telemetry parser');
+  });
+
+  it('fails closed when the lane HEAD is unreadable', () => {
+    const result = evaluate(lane({ head: null }));
+    expect(result.breach).toBe(true);
+    expect(result.summary).toContain('lane checkout unreadable');
+  });
+
+  it.each([smell.maxBehindMs, 0, -1000, null])('does not alert for head lag within the threshold: %s', (headLagMs) => {
+    expect(evaluate(lane({ headLagMs })).breach).toBe(false);
+  });
+
+  it('alerts for HEAD over 24 hours behind the real main tip even with zero local lag', () => {
+    const result = evaluate(lane({ headLagMs: smell.maxBehindMs + 1 }));
+    expect(result.breach).toBe(true);
+    expect(result.summary).toContain('lane HEAD trails main tip');
+    expect(result.measure.headLagMs).toBe(smell.maxBehindMs + 1);
+  });
+
+  it('retains the existing incomplete commit-lag behavior', () => {
     expect(evaluate(lane({ behind: 1000, behindSinceMs: null })).breach).toBe(false);
     expect(smell.evaluate({}, { now })).toEqual([]);
   });
@@ -89,8 +111,8 @@ describe('probeLaneCheckouts', () => {
     const readFile = vi.fn(readFileSync);
     const rows = probeLaneCheckouts({ poolRoot: root, readFile, git, now });
     expect(rows).toEqual([
-      { pool: 'pool', lane: 1, head: '111111111', behind: 201, behindSinceMs: now - 2 * smell.maxBehindMs, forgeExecHasPrune: false },
-      { pool: 'pool', lane: 2, head: '222222222', behind: 0, behindSinceMs: null, forgeExecHasPrune: true },
+      { pool: 'pool', lane: 1, head: '111111111', behind: 201, behindSinceMs: now - 2 * smell.maxBehindMs, headLagMs: null, forgeExecHasPrune: false },
+      { pool: 'pool', lane: 2, head: '222222222', behind: 0, behindSinceMs: null, headLagMs: null, forgeExecHasPrune: true },
     ]);
     expect(smell.evaluate({ laneCheckouts: rows }, { now }).map((r) => r.breach)).toEqual([true, false]);
     expect(readFile).toHaveBeenCalledTimes(2);
@@ -99,28 +121,78 @@ describe('probeLaneCheckouts', () => {
     expect(git).toHaveBeenCalledWith(['rev-list', '--count', 'HEAD..origin/main'], expect.objectContaining({ cwd: join(root, 'pool', 'lane-1') }));
   });
 
-  it('keeps the Forge flag when HEAD diverges and skips only lag reads', () => {
-    addLane(root, 1, staleSource);
-    const git = vi.fn((args) => {
-      if (args[0] === 'rev-parse') return 'abcdef123456';
-      throw new Error('not an ancestor');
+  it('measures lag for divergent HEADs without requiring ancestry', () => {
+    addLane(root, 1, freshSource);
+    const fixture = gitFixture();
+    const git = vi.fn((args, options) => {
+      if (args[0] === 'merge-base') throw new Error('not an ancestor');
+      return fixture(args, options);
     });
     const [row] = probeLaneCheckouts({ poolRoot: root, git, now });
-    expect(row).toMatchObject({ head: 'abcdef123', behind: null, behindSinceMs: null, forgeExecHasPrune: false });
+    expect(row).toMatchObject({ head: '111111111', behind: 201, behindSinceMs: now - 2 * smell.maxBehindMs, forgeExecHasPrune: true });
     expect(evaluate(row).breach).toBe(true);
-    expect(git).toHaveBeenCalledTimes(2);
+    expect(git.mock.calls.some(([args]) => args[0] === 'merge-base')).toBe(false);
+    expect(git).toHaveBeenCalledWith(['log', '--reverse', '--format=%ct', 'HEAD..origin/main'], expect.any(Object));
   });
 
-  it('leaves unreadable files and failed Git unknown without throwing', () => {
-    addLane(root, 1, null);
+  it('breaches on a missing Forge file even when HEAD is readable', () => {
+    addLane(root, 2, null);
+    const [row] = probeLaneCheckouts({ poolRoot: root, git: gitFixture(), now });
+    expect(row.forgeExecHasPrune).toBe(null);
+    expect(evaluate(row).breach).toBe(true);
+    expect(evaluate(row).summary).toContain('cannot verify forge telemetry parser');
+  });
+
+  it('breaches when reading the Forge file fails', () => {
+    addLane(root, 2, freshSource);
+    const [row] = probeLaneCheckouts({ poolRoot: root, git: gitFixture(), now,
+      readFile: () => { throw new Error('EACCES'); } });
+    expect(row.forgeExecHasPrune).toBe(null);
+    expect(evaluate(row).breach).toBe(true);
+    expect(evaluate(row).summary).toContain('cannot verify forge telemetry parser');
+  });
+
+  it('breaches on unreadable HEAD even when the Forge parser is current', () => {
+    addLane(root, 1, freshSource);
     const [row] = probeLaneCheckouts({ poolRoot: root, git: () => { throw new Error('timeout'); }, now });
-    expect(row).toMatchObject({ head: null, behind: null, behindSinceMs: null, forgeExecHasPrune: null });
-    expect(evaluate(row).breach).toBe(false);
+    expect(row).toMatchObject({ head: null, behind: null, behindSinceMs: null, forgeExecHasPrune: true });
+    expect(evaluate(row).breach).toBe(true);
+    expect(evaluate(row).summary).toContain('lane checkout unreadable');
+  });
+
+  it('uses the host main-tip time when the lane origin/main is stale', () => {
+    addLane(root, 2, freshSource);
+    const fixture = gitFixture();
+    const git = vi.fn((args, options) => args[0] === 'log' && args[1] === '-1'
+      ? String((now - 2 * smell.maxBehindMs) / 1000) : fixture(args, options));
+    const [row] = probeLaneCheckouts({ poolRoot: root, git, now, mainTipTimeMs: now });
+    expect(row).toMatchObject({ behind: 0, behindSinceMs: null, headLagMs: 2 * smell.maxBehindMs });
+    expect(evaluate(row).breach).toBe(true);
+    expect(git).toHaveBeenCalledWith(['log', '-1', '--format=%ct', 'HEAD'], expect.any(Object));
+  });
+
+  it('preserves unknown head lag when the host main-tip time is unavailable', () => {
+    addLane(root, 2, freshSource);
+    const [row] = probeLaneCheckouts({ poolRoot: root, git: gitFixture(), now, mainTipTimeMs: null });
+    expect(row.headLagMs).toBe(null);
   });
 
   it('does not mistake unrelated prune/disk fields outside parseTelemetry for support', () => {
     addLane(root, 1, `${staleSource}\n${freshSource.replace('parseTelemetry', 'otherParser')}`);
     expect(probeLaneCheckouts({ poolRoot: root, git: gitFixture(), now })[0].forgeExecHasPrune).toBe(false);
+  });
+
+  it.each([
+    `export function parseTelemetry(text) { /* ${freshSource} */ return JSON.parse(text); }`,
+    `// ${freshSource.replaceAll('\n', '\n// ')}\n${staleSource}`,
+    `export function parseTelemetry(text) { const mention = ${JSON.stringify(freshSource)}; return JSON.parse(text); }`,
+    `${staleSource}\n${freshSource.slice(freshSource.indexOf('{') + 1, freshSource.lastIndexOf('}'))}`,
+    `const mention = ${JSON.stringify(freshSource)};\n${staleSource}`,
+  ])('breaches when parser support appears only in comments, strings or outside its body: %s', (source) => {
+    addLane(root, 2, source);
+    const [row] = probeLaneCheckouts({ poolRoot: root, git: gitFixture(), now });
+    expect(row.forgeExecHasPrune).toBe(false);
+    expect(evaluate(row).breach).toBe(true);
   });
 
   it('keeps oversized Git output unknown and allows an operator refresh recommendation', () => {
@@ -130,7 +202,7 @@ describe('probeLaneCheckouts', () => {
       return gitFixture()(args, options);
     };
     const [row] = probeLaneCheckouts({ poolRoot: root, git, now });
-    expect(row).toMatchObject({ behind: 201, behindSinceMs: null, forgeExecHasPrune: true });
+    expect(row).toMatchObject({ behind: 201, behindSinceMs: null, headLagMs: null, forgeExecHasPrune: true });
     expect(evaluate(row).breach).toBe(false);
     expect(evaluate(row).recommendation).toContain('lane-pool refresh/reclaim');
   });

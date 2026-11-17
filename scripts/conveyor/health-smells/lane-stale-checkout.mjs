@@ -22,12 +22,15 @@ export default {
       const staleForge = c.forgeExecHasPrune === false;
       const staleLag = Number.isFinite(c.behind) && c.behind > this.maxBehindCommits && age > this.maxBehindMs;
       const reasons = [];
+      if (c.forgeExecHasPrune == null) reasons.push('cannot verify forge telemetry parser');
+      if (!c.head) reasons.push('lane checkout unreadable');
+      if (Number.isFinite(c.headLagMs) && c.headLagMs > this.maxBehindMs) reasons.push(`lane HEAD trails main tip by ${fmtAge(c.headLagMs)}`);
       if (staleForge) reasons.push('Forge parseTelemetry lacks prune/diskUsedPct handling');
       if (staleLag) reasons.push(`${c.behind} commits behind origin/main, oldest unapplied ${fmtAge(age)} old`);
       return {
         subject: `lane-checkout:${c.pool}/lane-${c.lane}`,
-        breach: staleForge || staleLag,
-        measure: { head: c.head, behind: c.behind, behindMin: Math.round(age / MINUTE), forgeExecHasPrune: c.forgeExecHasPrune },
+        breach: reasons.length > 0,
+        measure: { head: c.head, headLagMs: c.headLagMs, behind: c.behind, behindMin: Math.round(age / MINUTE), forgeExecHasPrune: c.forgeExecHasPrune },
         summary: `pool lane ${c.pool}/lane-${c.lane}: ${reasons.join('; ') || 'no known stale-checkout evidence'}.`,
         recommendation: `Refresh ${c.pool}/lane-${c.lane} through the product lane-pool refresh/reclaim path, never by hand.`,
       };
