@@ -88,7 +88,7 @@ describe('lane Git hardening', () => {
     const io = createReviewJobIo({ env, exec });
     expect(io[method]({ lanePath: '/lanes/lane-7', repo, pr, head })).toEqual({ head });
     const gitCalls = calls.filter(call => call.file === 'git');
-    expect(gitCalls).toHaveLength(method === 'prepareLane' ? 4 : 3);
+    expect(gitCalls).toHaveLength(5);
     for (const { args, options } of gitCalls) {
       // Read Git's effective configuration, not just our helper's object shape.
       // This executes no fetch, callback, or repository write.
@@ -98,12 +98,10 @@ describe('lane Git hardening', () => {
       expect(config('core.alternateRefsCommand')).toBe('true');
       expect(config('core.fsmonitor')).toBe('false');
       expect(config('core.hooksPath')).toBe('/dev/null');
-      if (method === 'prepareLane') {
-        expect(() => config('review.fixture')).toThrow();
-        expect(options.env.GIT_CONFIG_NOSYSTEM).toBe('1');
-        expect(options.env.GIT_CONFIG_SYSTEM).toBe(options.env.GIT_CONFIG_GLOBAL);
-        expect(options.env).toBe(gitCalls[0].options.env);
-      } else expect(config('review.fixture')).toBe('preserved');
+      expect(() => config('review.fixture')).toThrow();
+      expect(options.env.GIT_CONFIG_NOSYSTEM).toBe('1');
+      expect(options.env.GIT_CONFIG_SYSTEM).toBe(options.env.GIT_CONFIG_GLOBAL);
+      expect(options.env).toBe(gitCalls[0].options.env);
       expect(options.env.GIT_EXTERNAL_DIFF).toBeUndefined();
       expect(options.env.GIT_NO_LAZY_FETCH).toBe('1');
       expect(options.env.REVIEW_FIXTURE_TOKEN).toBe('preserved');
@@ -316,6 +314,7 @@ describe('red-team-only review job', () => {
       commit('reviewed ops head');
       const pinned = git(['-C', origin, 'rev-parse', 'HEAD']);
       git(['-C', origin, 'update-ref', `refs/pull/${pr}/head`, pinned]);
+      git(['-C', lanePath, 'remote', 'set-url', 'origin', `git@github.com:${repo}.git`]);
       expect(() => git(['-C', lanePath, 'cat-file', '-e', `${pinned}^{commit}`])).toThrow();
       expect(() => seats.makeScratch({ lanePath, rev: pinned })).toThrow(/not our ref/);
 
@@ -326,7 +325,10 @@ describe('red-team-only review job', () => {
         // Isolate the recovery boundary with H absent even if shared setup changes.
         prepareLane: () => ({ head: pinned }),
         readRedTeamOnlyPayload: () => ({ head: pinned, loopPayload }),
-        fetchRedTeamHead: createReviewJobIo().fetchRedTeamHead,
+        fetchRedTeamHead: createReviewJobIo({ exec: (file, args, options) => execFileSync(file,
+          args.includes('fetch') ? ['-c', 'protocol.file.allow=always', '-c',
+            `url.${origin}.insteadOf=git@github.com:${repo}.git`, ...args] : args,
+          { ...options, encoding: 'utf8' }) }).fetchRedTeamHead,
         redTeamStatus: input => events.push(input.status),
         runRedTeam: vi.fn(input => {
           scratch = seats.makeScratch({ lanePath: input.lanePath, rev: input.loopPayload.findings.read.netBasis.rev });
@@ -350,22 +352,28 @@ describe('red-team-only review job', () => {
       const exec = vi.fn((file, args, options) => {
         calls.push([file, args]);
         expect(options).toMatchObject({ timeout: 180_000, maxBuffer: 1024 * 1024 });
-        expect(args.slice(0, 2)).toEqual(['-C', '/lanes/lane-7']);
-        if (args[2] === 'fetch') {
+        expect(options.cwd).toBe('/lanes/lane-7');
+        if (args[0] === 'config') return '';
+        if (args[0] === 'remote') return `git@github.com:${repo}.git`;
+        if (args.includes('fetch')) {
           if (kind === 'fetch-error') throw Error('fetch failed');
           return '';
         }
-        if (args[4] === 'FETCH_HEAD^{commit}') return kind === 'moved-head' ? 'b'.repeat(40) : `${head}\n`;
+        if (args[1] === 'FETCH_HEAD^{commit}') return kind === 'moved-head' ? 'b'.repeat(40) : `${head}\n`;
         if (kind === 'missing-commit') throw Error('unknown commit');
         return kind === 'wrong-commit' ? 'b'.repeat(40) : `${head}\n`;
       });
       const io = fakeIo({ fetchRedTeamHead: createReviewJobIo({ env: {}, exec }).fetchRedTeamHead });
       const out = runReviewJob({ repo, pr, redTeamOnly: true }, io);
-      expect(calls[0]).toEqual(['git', ['-C', '/lanes/lane-7', 'fetch', '--quiet', '--no-tags', 'origin', `pull/${pr}/head`]]);
+      expect(calls.slice(0, 3)).toEqual([
+        ['git', ['config', '--show-scope', '--list', '--includes', '-z']],
+        ['git', ['remote', 'get-url', 'origin']],
+        ['git', ['-c', 'protocol.ext.allow=never', 'fetch', '--upload-pack=git-upload-pack', '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`]],
+      ]);
       if (kind === 'ok') {
-        expect(calls.slice(1)).toEqual([
-          ['git', ['-C', '/lanes/lane-7', 'rev-parse', '--verify', 'FETCH_HEAD^{commit}']],
-          ['git', ['-C', '/lanes/lane-7', 'rev-parse', '--verify', `${head}^{commit}`]],
+        expect(calls.slice(3)).toEqual([
+          ['git', ['rev-parse', 'FETCH_HEAD^{commit}']],
+          ['git', ['rev-parse', '--verify', `${head}^{commit}`]],
         ]);
         expect(out.redTeam.status).toBe('ran');
       } else {
@@ -1132,7 +1140,8 @@ describe('red-team-only review job', () => {
           ['git', ['config', '--show-scope', '--list', '--includes', '-z']],
           ['git', ['remote', 'get-url', 'origin']],
           ['git', ['-c', 'protocol.ext.allow=never', 'fetch', '--upload-pack=git-upload-pack', '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`]],
-          ['git', ['rev-parse', 'FETCH_HEAD^{commit}']], ['red-team'],
+          ['git', ['rev-parse', 'FETCH_HEAD^{commit}']],
+          ['git', ['rev-parse', '--verify', `${head}^{commit}`]], ['red-team'],
         ]);
         expect(out.redTeam.status).toBe('ran');
         expect(io.readRedTeamOnlyPayload).toHaveBeenCalledWith({ pr, repo, head });
