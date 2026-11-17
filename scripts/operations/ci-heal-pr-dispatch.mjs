@@ -59,6 +59,7 @@ import {
   agentArgsFromEnv, briefPath, createDispatchSinks, defaultLoadItems, findItem, REPO_ROOT,
 } from './dispatch-lane-io.mjs';
 import { resolveDispatchRoute as decideDispatchRoute, readRoutingPolicy, resolveOperationRoute } from '../lib/dispatch-routing-policy-io.mjs';
+import { aiRoutingInputs, resolveAiRouting } from '../lib/ai-routing.mjs';
 import { assertMainNotStale } from './review-dispatch.mjs';
 import { armSelfReexecOnFastForward } from '../lib/main-staleness.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
@@ -123,14 +124,24 @@ function postFixLoopParkComment({ repoSlug, pr, body }) {
 }
 /** Use the fixer's existing stronger rung, otherwise the routing policy's native Claude heal route. */
 export function resolveStrongerCiHealRoute({ loadLadder = loadFixerLadder, readPolicy = readRoutingPolicy,
-  resolveRoute = resolveOperationRoute } = {}) {
+  resolveRoute = resolveOperationRoute, resolveRouting = resolveAiRouting, log = message => console.error(message) } = {}) {
   let table;
   try { table = fixerTableFor(planRoundEscalation({ round: 3, fromRound: 3, fixerLadder: loadLadder() })); }
   catch { table = null; }
   if (table) return { policyRoute: { provider: 'claude', model: table.model, effort: table.effort, fallback: [] }, source: table.reason };
   const policy = readPolicy();
-  const route = resolveRoute({ operation: 'ci-heal', available: ['claude'],
-    gateClosed: policy.criticalWorkGate.kinds.includes('ci-heal'), policy });
+  const options = { operation: 'ci-heal', available: ['claude'],
+    gateClosed: policy.criticalWorkGate.kinds.includes('ci-heal'), policy };
+  let route;
+  let routed = false;
+  try {
+    const { coordinator } = aiRoutingInputs('ci-heal', resolveRouting({ log }));
+    if (coordinator !== undefined) {
+      route = resolveRoute({ ...options, aiRouting: coordinator, operatorKeys: readPolicy.operatorKeys?.() });
+      routed = true;
+    }
+  } catch (error) { log(`ci-heal aiRouting unavailable; using existing route: ${error.message}`); }
+  if (!routed) route = resolveRoute(options);
   if (route?.provider !== 'claude') throw new Error('CI-heal stronger-model route did not resolve to Claude');
   return { policyRoute: { provider: 'claude', model: route.model, effort: route.effort, fallback: [] }, source: 'routing-policy ci-heal default' };
 }
