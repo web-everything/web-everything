@@ -2,7 +2,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { writeJobRecord, jobRecordPath, readJobRecord } from './review-job-store.mjs';
+import { writeJobRecord, jobRecordPath } from './review-job-store.mjs';
 import { writeReviewJobDone } from './review-job-envelope.mjs';
 import { probePidAlive } from '../lib/pid-alive.mjs';
 
@@ -27,18 +27,6 @@ export function readReviewJobRetry(slug, dir) {
   }
 }
 export const writeReviewJobRetry = (state, dir) => writeJobRecord(state, join(dir, '.retry'));
-
-export function rearmReviewJobRetry({ slug, repo, head, dir, isAlive = probePidAlive }) {
-  if (!/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('re-arm requires a readable pinned head');
-  // A missing/corrupt claim does not release the independently persisted pending writer.
-  const state = readReviewJobRetry(slug, dir), claim = readJobRecord(slug, dir);
-  if (state && state.repo !== repo) throw Error('review retry repository mismatch');
-  if (claim && !provenDead(claim.pid, isAlive))
-    throw Error('cannot re-arm: claim PID live or unknown; inspect ownership evidence first');
-  if (state?.pending && !provenDead(state.pending.pid, isAlive))
-    throw Error('cannot re-arm: pending PID live or unknown; inspect ownership evidence first');
-  return writeReviewJobRetry({ slug, repo, head: head.toLowerCase(), attempts: 0, parked: false, notified: false }, dir);
-}
 
 /** Claims can be missing or unreadable: prove pending-writer death independently before settling. */
 export function settleReviewJobRetry({ slug, repo, head, dir, completion, cap, terminal = writeReviewJobDone, isAlive = probePidAlive }) {

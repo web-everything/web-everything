@@ -102,8 +102,8 @@ import { RED_TEAM_STATUS_LABEL_META } from '../lib/red-team-status-label-meta.mj
 import { publishAttention } from './needs-you-feed.mjs';
 
 import { randomUUID } from 'node:crypto';
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir, hostname } from 'node:os';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, hostname, tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -116,7 +116,7 @@ import { runReport } from './completion-cli.mjs';
 import { writeReviewJobDone, writeReviewJobStarted } from './review-job-envelope.mjs';
 import { workerWrapperEnabledFor } from './worker-wrapper-launch.mjs';
 import { tryReadCompletion, withCompletionLock } from './completion-store.mjs';
-import { completionFingerprint, rearmReviewJobRetry, settleReviewJobRetry, writeReviewJobRetry } from './review-job-retry.mjs';
+import { completionFingerprint, settleReviewJobRetry, writeReviewJobRetry } from './review-job-retry.mjs';
 import { rateAndRecordReviewJob } from '../conveyor/run-rating.mjs';
 import { recorderFor, setActiveRecorder } from './telemetry-store.mjs';
 import { ACTOR_ENV } from '../lib/review-independence.mjs';
@@ -455,24 +455,30 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       const options = { cwd: lanePath, env, timeout: 180_000, maxBuffer: 1024 * 1024 };
       const { headRefOid: head } = JSON.parse(exec('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], options));
       if (!/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('review head missing; inspect PR evidence before retrying');
-      // Acquisition scrubs unsafe config, but command-valued pins must also apply to every lane Git call.
-      const gitOptions = { ...options, env: laneGitHardeningEnv(env) };
-      const { kept } = scrubRiskyLaneConfig(lanePath, { log, run: (args, opts) => exec('git', args,
-        { ...gitOptions, ...opts, env: laneGitHardeningEnv(scrubGitRepoEnv(env)) }) });
-      // Only these exact origin keys are intentionally retained by the scrubber. Everything else
-      // reports a failed read/removal, including failures that leave transport URL rewrites active.
-      if (kept.some(key => !/^remote\.origin\.(?:url|pushurl|proxy|receivepack|uploadpack|vcs)$/i.test(key))) {
-        throw Error('review lane config scrub failed; inspect and repair lane configuration before retrying');
-      }
-      const origin = exec('git', ['remote', 'get-url', 'origin'], gitOptions).trim();
-      const originRepo = /^(?:git@github\.com:|ssh:\/\/git@github\.com\/|https:\/\/github\.com\/)([^/]+\/[^/]+?)(?:\.git)?\/?$/i.exec(origin)?.[1];
-      if (originRepo?.toLowerCase() !== repo.toLowerCase()) throw Error('review lane origin repository mismatch or unreadable; inspect lane before retrying');
-      // Never resolve a remote name: retained origin.uploadpack/vcs can execute lane-owned commands.
-      exec('git', ['-c', 'protocol.ext.allow=never', 'fetch', '--upload-pack=git-upload-pack',
-        '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`], gitOptions);
-      const fetched = exec('git', ['rev-parse', 'FETCH_HEAD^{commit}'], gitOptions).trim();
-      if (fetched !== head) throw Error('review head changed during fetch; retry shared setup on the live head');
-      return { head };
+      const configDir = mkdtempSync(join(tmpdir(), 'review-git-config-'));
+      try {
+        const emptyConfig = join(configDir, 'empty');
+        writeFileSync(emptyConfig, '', { mode: 0o600 });
+        // One environment for every lane Git call: no inherited config sources or indexed overrides.
+        const gitOptions = { ...options, env: laneGitHardeningEnv({ ...scrubGitRepoEnv(env),
+          GIT_CONFIG_GLOBAL: emptyConfig, GIT_CONFIG_SYSTEM: emptyConfig, GIT_CONFIG_NOSYSTEM: '1' }) };
+        const { kept } = scrubRiskyLaneConfig(lanePath, { log, run: (args, opts) => exec('git', args,
+          { ...gitOptions, ...opts }) });
+        // Only these exact origin keys are intentionally retained by the scrubber. Everything else
+        // reports a failed read/removal, including failures that leave transport URL rewrites active.
+        if (kept.some(key => !/^remote\.origin\.(?:url|pushurl|proxy|receivepack|uploadpack|vcs)$/i.test(key))) {
+          throw Error('review lane config scrub failed; inspect and repair lane configuration before retrying');
+        }
+        const origin = exec('git', ['remote', 'get-url', 'origin'], gitOptions).trim();
+        const originRepo = /^(?:git@github\.com:|ssh:\/\/git@github\.com\/|https:\/\/github\.com\/)([^/]+\/[^/]+?)(?:\.git)?\/?$/i.exec(origin)?.[1];
+        if (originRepo?.toLowerCase() !== repo.toLowerCase()) throw Error('review lane origin repository mismatch or unreadable; inspect lane before retrying');
+        // Never resolve a remote name: retained origin.uploadpack/vcs can execute lane-owned commands.
+        exec('git', ['-c', 'protocol.ext.allow=never', 'fetch', '--upload-pack=git-upload-pack',
+          '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`], gitOptions);
+        const fetched = exec('git', ['rev-parse', 'FETCH_HEAD^{commit}'], gitOptions).trim();
+        if (fetched !== head) throw Error('review head changed during fetch; retry shared setup on the live head');
+        return { head };
+      } finally { rmSync(configDir, { recursive: true, force: true }); }
     },
     readRedTeamOnlyPayload: ({ pr, repo, head }) => {
       const w = readWitness({ pr, repo, head });
@@ -1450,8 +1456,7 @@ export function dispatchReviewJob({
       if (retry.parked) {
         if (!retry.notified) {
           publishNeedsYou({ repo: planned.repo, pr: planned.pr, head: retry.head, kind: 'review-job-exhausted',
-            reason: `parked after ${retry.attempts} unclean review jobs; inspect infra, then push a new head or explicitly re-arm`,
-            command: `node scripts/operations/review-job.mjs rearm --pr=${planned.pr} --repo=${planned.repo} --expected-head=${retry.head}` });
+            reason: `parked after ${retry.attempts} unclean review jobs; inspect infra, then push a new head or re-arm through the existing review rearm path` });
           retry.notified = true;
           writeReviewJobRetry(retry, dir);
         }
@@ -1606,21 +1611,12 @@ export function carryStackAccept({ pr, repo, root = REPO_ROOT, env = process.env
 
 /** CLI boundary; injected job and rating effects keep recovery guard tests hermetic. */
 export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runReviewJob, rate = rateAndRecordReviewJob, onError = () => {},
-  io = null, dir = reviewJobsDir(), isAlive = probePidAlive } = {}) {
+} = {}) {
   const [sub, ...rest] = argv;
   const flag = (name) => {
     const hit = rest.find((a) => a.startsWith(`--${name}=`));
     return hit ? hit.slice(name.length + 3) : undefined;
   };
-  if (sub === 'rearm') {
-    const planned = planReviewDispatch({ pr: flag('pr'), repo: flag('repo'), ...(io?.checkoutExists ? { checkoutExists: io.checkoutExists } : {}) });
-    const jobIo = io ?? createReviewJobIo();
-    const refusal = expectedHeadRefusal(flag('expected-head') ?? null, planned, jobIo);
-    if (refusal) throw Error(refusal.reason);
-    return withCompletionLock(`dispatch-${planned.sessionSlug}`, () => {
-      return rearmReviewJobRetry({ slug: planned.sessionSlug, repo: planned.repo, head: flag('expected-head'), dir, isAlive });
-    }, { dir: join(dir, '.retry') });
-  }
   if (sub !== 'run') {
     writeLineSync(2, 'usage: review-job.mjs run --pr=<n> --repo=<owner/repo>');
     process.exitCode = 2;

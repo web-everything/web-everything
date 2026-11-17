@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { createReviewJobIo, dispatchReviewJob, runReviewJobCli, writeJobRecord } from '../review-job.mjs';
-import { readReviewJobRetry, writeReviewJobRetry, rearmReviewJobRetry, settleReviewJobRetry } from '../review-job-retry.mjs';
+import { createReviewJobIo, dispatchReviewJob, writeJobRecord } from '../review-job.mjs';
+import { readReviewJobRetry, writeReviewJobRetry, settleReviewJobRetry } from '../review-job-retry.mjs';
 import { tryReadCompletion } from '../completion-store.mjs';
 import { writeReviewJobDone, writeReviewJobStarted } from '../review-job-envelope.mjs';
 import { laneGitHardeningEnv, scrubGitRepoEnv } from '../../lib/lane-git-hardening.mjs';
@@ -55,17 +55,23 @@ describe('private review lane fetch', () => {
     expect(calls.filter(([, args]) => args.includes('fetch')).map(([, args]) => args)).toEqual([
       ['-c', 'protocol.ext.allow=never', 'fetch', '--upload-pack=git-upload-pack', '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`],
     ]);
-    for (const [, args, options] of calls) {
-      // The scrub must see the actual lane config; fetch retains the standard hardening semantics.
-      expect(options.env).toEqual(laneGitHardeningEnv(args[0] === 'config' ? scrubGitRepoEnv(env) : env));
+    const isolated = calls[0][2].env;
+    expect(isolated.GIT_CONFIG_GLOBAL).toBe(isolated.GIT_CONFIG_SYSTEM);
+    for (const [, , options] of calls) {
+      expect(options.env).toBe(isolated);
+      expect(options.env).toEqual(laneGitHardeningEnv({ ...scrubGitRepoEnv(env),
+        GIT_CONFIG_GLOBAL: isolated.GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM: isolated.GIT_CONFIG_GLOBAL, GIT_CONFIG_NOSYSTEM: '1' }));
     }
+    expect(existsSync(isolated.GIT_CONFIG_GLOBAL)).toBe(false);
   });
   it('surfaces SSH fetch failure without attempting HTTPS or reading FETCH_HEAD', () => {
     const f = lane({ originFails: true }); expect(f.prepare).toThrow('transport failed');
     expect(f.exec.mock.calls.filter(([, args]) => args.includes('fetch')).map(([, args]) => args))
       .toEqual([['-c', 'protocol.ext.allow=never', 'fetch', '--upload-pack=git-upload-pack', '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`]]);
     for (const [, , options] of f.exec.mock.calls.filter(([, args]) => args.includes('fetch'))) {
-      expect(options.env).toEqual(laneGitHardeningEnv({}));
+      expect(options.env).toEqual(laneGitHardeningEnv({ ...scrubGitRepoEnv({}),
+        GIT_CONFIG_GLOBAL: options.env.GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM: options.env.GIT_CONFIG_GLOBAL, GIT_CONFIG_NOSYSTEM: '1' }));
+      expect(existsSync(options.env.GIT_CONFIG_GLOBAL)).toBe(false);
     }
     expect(f.exec.mock.calls.some(([, args]) => args[0] === 'rev-parse')).toBe(false);
   });
@@ -99,7 +105,9 @@ describe('job-mode retry parking', () => {
     for (let n = 0; n < 8; n++) expect(f.dispatch().skipped).toBe('review-job-parked');
     expect(f.options.spawnJob).toHaveBeenCalledTimes(3);
     expect(f.options.publishNeedsYou).toHaveBeenCalledTimes(1);
-    expect(f.options.publishNeedsYou).toHaveBeenCalledWith(expect.objectContaining({ head, command: expect.stringContaining('--expected-head=') }));
+    expect(f.options.publishNeedsYou).toHaveBeenCalledWith(expect.objectContaining({ head,
+      reason: expect.stringContaining('re-arm through the existing review rearm path') }));
+    expect(f.options.publishNeedsYou.mock.calls[0][0]).not.toHaveProperty('command');
     if (outcome === 'no done') expect(f.options.retryTerminal).toHaveBeenCalledTimes(3);
   });
   it('migrates an exhausted historical infraStreak fail closed instead of starting job 22', () => {
@@ -108,16 +116,11 @@ describe('job-mode retry parking', () => {
     expect(f.options.spawnJob).not.toHaveBeenCalled();
     f.move(); expect(f.dispatch().jobPid).toBeGreaterThan(0);
   });
-  it('a new head or explicit pinned re-arm starts a fresh budget; raising the cap alone does not', () => {
+  it('a new head starts a fresh budget; raising the cap alone does not', () => {
     const f = fixture({ env: { WE_REVIEW_JOB_FAILURE_CAP: '1' } });
     f.dispatch(); f.finish('blocked-on-infra'); expect(f.dispatch().skipped).toBe('review-job-parked');
     f.options.env.WE_REVIEW_JOB_FAILURE_CAP = '10'; expect(f.dispatch().skipped).toBe('review-job-parked');
-    expect(() => runReviewJobCli(['rearm', `--pr=${pr}`, `--repo=${repo}`, `--expected-head=${head}`],
-      { dir: f.options.dir, io: { checkoutExists: () => true, liveHead: () => 'b'.repeat(40) } })).toThrow(/head changed/);
-    runReviewJobCli(['rearm', `--pr=${pr}`, `--repo=${repo}`, `--expected-head=${head}`],
-      { dir: f.options.dir, isAlive: () => false, io: { checkoutExists: () => true, liveHead: () => head } });
-    expect(f.dispatch().jobPid).toBeGreaterThan(0);
-    f.finish('blocked-on-infra'); f.move(); expect(f.dispatch().jobPid).toBeGreaterThan(0);
+    f.move(); expect(f.dispatch().jobPid).toBeGreaterThan(0);
     expect(readReviewJobRetry('review-pa-229', f.options.dir).attempts).toBe(1);
   });
   it('healthy web-everything reviews reset the failure budget and retain normal job dispatch', () => {
@@ -224,11 +227,9 @@ describe('retry evidence and synthetic completion ownership', () => {
   });
 });
 
-describe('pending ownership across re-arm and production PID probes', () => {
+describe('pending ownership and production PID probes', () => {
   const slug = 'review-pa-229';
   const retryPath = f => join(f.options.dir, '.retry', `${slug}.json`);
-  const rearm = f => runReviewJobCli(['rearm', `--pr=${pr}`, `--repo=${repo}`, `--expected-head=${head}`],
-    { dir: f.options.dir, io: { checkoutExists: () => true, liveHead: () => head } });
   function pending(claim = 'missing') {
     const f = fixture(); f.dispatch();
     const path = join(f.options.dir, `${slug}.json`);
@@ -259,54 +260,15 @@ describe('pending ownership across re-arm and production PID probes', () => {
     expect(f.options.spawnJob).not.toHaveBeenCalled(); expect(f.options.retryTerminal).not.toHaveBeenCalled();
     expect(existsSync(retryPath(f))).toBe(false);
   });
-  it.each(['missing', 'corrupt'].flatMap(claim => ['live', 'EPERM', 'EACCES', 'unknown'].map(probe => ({ claim, probe }))))(
-    're-arm refuses a $probe pending PID despite a $claim claim, keeping dispatch blocked', ({ claim, probe }) => {
-      const f = pending(claim), bytes = readFileSync(retryPath(f));
-      rawProbe(probe);
-      expect(() => rearm(f)).toThrow(/cannot re-arm: pending PID live or unknown/);
-      f.options.isAlive = undefined;
-      expect(f.dispatch().skipped).toMatch(/pending PID live or unknown/);
-      expect(f.options.spawnJob).toHaveBeenCalledTimes(1); expect(f.options.retryTerminal).not.toHaveBeenCalled();
-      expect(readFileSync(retryPath(f)).equals(bytes)).toBe(true);
-    });
-  it('standalone settlement and re-arm defaults also refuse raw EACCES', () => {
+  it('standalone settlement defaults also refuse raw EACCES', () => {
     const f = pending(), bytes = readFileSync(retryPath(f)); rawProbe('EACCES');
     expect(settleReviewJobRetry({ slug, repo, head, dir: f.options.dir, completion: null, cap: 3,
       terminal: f.options.retryTerminal }).skipped).toMatch(/pending PID live or unknown/);
-    expect(() => rearmReviewJobRetry({ slug, repo, head, dir: f.options.dir })).toThrow(/pending PID live or unknown/);
     expect(f.options.retryTerminal).not.toHaveBeenCalled(); expect(readFileSync(retryPath(f)).equals(bytes)).toBe(true);
-  });
-  it.each(['missing', 'corrupt'])('re-arm releases pending only after raw ESRCH with a %s claim', claim => {
-    const f = pending(claim); rawProbe('ESRCH');
-    expect(rearm(f)).toMatchObject({ attempts: 0, parked: false });
-    expect(readReviewJobRetry(slug, f.options.dir).pending).toBeUndefined();
-    expect(f.dispatch().jobPid).toBe(4002);
   });
   it('default settlement synthesizes the terminal record only after raw ESRCH', () => {
     const f = pending(); rawProbe('ESRCH'); f.options.isAlive = undefined;
     expect(f.dispatch().jobPid).toBe(4002);
     expect(f.options.retryTerminal).toHaveBeenCalledOnce();
-  });
-  it('re-arm retains a readable claim when its signal-zero probe is unknown', () => {
-    const f = pending('intact'), bytes = readFileSync(retryPath(f)); rawProbe('EACCES');
-    expect(() => rearm(f)).toThrow(/cannot re-arm: claim PID live or unknown/);
-    expect(readFileSync(retryPath(f)).equals(bytes)).toBe(true);
-  });
-  it.each(['corrupt', 'invalid-pending', 'wrong-repo'])('re-arm refuses %s retry state instead of erasing hidden pending ownership', kind => {
-    const f = pending(), state = readReviewJobRetry(slug, f.options.dir);
-    if (kind === 'invalid-pending') delete state.pending.baseline;
-    if (kind === 'wrong-repo') state.repo = 'web-everything/web-everything';
-    const bytes = kind === 'corrupt' ? '{"pending":{"pid":4001},' : JSON.stringify(state);
-    writeFileSync(retryPath(f), bytes);
-    expect(() => rearm(f)).toThrow(kind === 'wrong-repo' ? /repository mismatch/ : /retry evidence unreadable/);
-    expect(readFileSync(retryPath(f), 'utf8')).toBe(bytes); expect(f.options.spawnJob).toHaveBeenCalledTimes(1);
-  });
-  it.each([undefined, 2 ** 31])('re-arm refuses a missing/oversized pending PID (%s) before a liveness probe', pid => {
-    const f = pending(), state = readReviewJobRetry(slug, f.options.dir);
-    state.pending.pid = pid; writeReviewJobRetry(state, f.options.dir);
-    const bytes = readFileSync(retryPath(f)), isAlive = vi.fn(() => false);
-    expect(() => runReviewJobCli(['rearm', `--pr=${pr}`, `--repo=${repo}`, `--expected-head=${head}`],
-      { dir: f.options.dir, isAlive, io: { checkoutExists: () => true, liveHead: () => head } })).toThrow(/pending PID live or unknown/);
-    expect(isAlive).not.toHaveBeenCalled(); expect(readFileSync(retryPath(f)).equals(bytes)).toBe(true);
   });
 });

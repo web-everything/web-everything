@@ -98,8 +98,12 @@ describe('lane Git hardening', () => {
       expect(config('core.alternateRefsCommand')).toBe('true');
       expect(config('core.fsmonitor')).toBe('false');
       expect(config('core.hooksPath')).toBe('/dev/null');
-      if (args[0] === 'config') expect(options.env.GIT_CONFIG_VALUE_1).not.toBe('preserved');
-      else expect(config('review.fixture')).toBe('preserved');
+      if (method === 'prepareLane') {
+        expect(() => config('review.fixture')).toThrow();
+        expect(options.env.GIT_CONFIG_NOSYSTEM).toBe('1');
+        expect(options.env.GIT_CONFIG_SYSTEM).toBe(options.env.GIT_CONFIG_GLOBAL);
+        expect(options.env).toBe(gitCalls[0].options.env);
+      } else expect(config('review.fixture')).toBe('preserved');
       expect(options.env.GIT_EXTERNAL_DIFF).toBeUndefined();
       expect(options.env.GIT_NO_LAZY_FETCH).toBe('1');
       expect(options.env.REVIEW_FIXTURE_TOKEN).toBe('preserved');

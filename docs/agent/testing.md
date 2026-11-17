@@ -4412,9 +4412,9 @@ Session `infraStreak` cool-offs depend on bound agent rows, which dead-job pruni
 cannot bound detached jobs. `review.json`'s `timing.jobFailureCap` (default 3, range 1–100;
 `WE_REVIEW_JOB_FAILURE_CAP`) uses the timing policy cascade and source log. Reserve before spawn;
 missing, stale or unknown terminal evidence spends the attempt. Exhaustion parks the head and
-publishes one NEEDS-YOU event. Raising the cap does not unpark it. A new head or the printed
-head-pinned `review-job.mjs rearm` command resets admission. Historical unscoped exhausted streaks
-park conservatively on migration; inspect them before re-arming.
+publishes one NEEDS-YOU event directing operators to the existing review rearm path. Raising the
+cap does not unpark it; a new head starts a fresh budget. Historical unscoped exhausted streaks
+park conservatively on migration and require inspection.
 
 `review-job-runner.mjs` installs exit, exception, rejection and signal handlers before importing the
 review graph. Uncatchable termination is recovered as a failed done record at the next admission.
@@ -4424,19 +4424,21 @@ completion. A PID-less completion requires our claim. Withheld writes log an ins
 fallback; the dispatcher's missing-done recovery still owns subsequent settlement. Dispatch uses
 `tryReadCompletion` without swallowing corrupt/unreadable evidence into absence. Recovery retains
 pending state unless its PID is proven dead, and never synthesizes over a live or unknown foreign
-completion writer. Settlement and re-arm use `probePidAlive`: only signal-zero `ESRCH` proves
-death; `EPERM`, `EACCES` and all other errors are unknown. Re-arm checks both the job claim and
-retry pending PID under the dispatch lock; a missing/corrupt claim cannot erase a live or unknown
-pending writer. Unreadable retry state and missing/oversized pending PIDs require ownership
-evidence to be inspected and repaired before re-arm, not a blind budget reset. Producer tests
-inject raw signal-zero errors into the default settlement and re-arm paths. Crash fixtures
+completion writer. Settlement uses `probePidAlive`: only signal-zero `ESRCH` proves death;
+`EPERM`, `EACCES` and all other errors are unknown. Unreadable retry state and missing/oversized
+pending PIDs require ownership evidence to be inspected and repaired. Producer tests
+inject raw signal-zero errors into the default settlement path. Crash fixtures
 must seed the dispatcher's own-PID claim; the foreign-live-PID import regression seeds the parent
 process's started record before handler installation and compares its bytes after the child exits.
 The lifecycle receipt for red-team-only jobs is separate so it cannot replace a panel verdict.
 The operation retry/lifecycle suites and conveyor retry regression cover repeated ticks, pruning,
-missing records, early claim/import failure, explicit re-arm, and healthy WE review dispatch.
+missing records, early claim/import failure, and healthy WE review dispatch.
 
-Review lane setup reuses `scrubRiskyLaneConfig` before fetching. Retained `origin.uploadpack` and
+Review lane setup uses one hardened environment for the config scrub, origin validation and fetch.
+Global and system config point at the same temporary empty file, system config is disabled, and
+inherited indexed config and config-source overrides are removed before applying the hardening
+pins. The empty file is removed on success or failure. Lane setup reuses `scrubRiskyLaneConfig`
+before fetching. Retained `origin.uploadpack` and
 `origin.vcs` must never select a command: fetch only the validated repository's explicit SSH URL,
 with the lane-pool transport pins (`protocol.ext.allow=never` and
 `--upload-pack=git-upload-pack`). `review-job-fetch-security.test.mjs` uses real local repositories
@@ -4445,4 +4447,4 @@ then exercises the production SSH URL without networking and verifies the marker
 Any scrub read/removal failure refuses fetching and records an infrastructure failure requiring
 lane inspection/repair. Only the scrubber's intentionally retained exact origin keys are exempt.
 SSH transport failure surfaces directly; there is no HTTPS fallback. The retry and job suites
-cover unreadable/oversized config, surviving URL rewrites, no fallback, and terminal failure labels.
+cover unreadable/oversized config, inherited global and lane URL rewrites, no fallback, and terminal failure labels.
