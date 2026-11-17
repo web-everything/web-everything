@@ -2,8 +2,11 @@
  * @file scripts/lib/ci-ghost-rerun-settings.mjs
  * @description Ghost CI recovery settings through the shared policy cascade.
  */
-import { platformPreference, resolveCascade, logCascadeSources } from './policy-cascade.mjs';
-import { readSettings } from './settings-files.mjs';
+import { readPlatformPreferences, resolveCascade, logCascadeSources } from './policy-cascade.mjs';
+import { readDeclaredSettings } from './settings-files.mjs';
+
+const isPlainObject = value => value !== null && typeof value === 'object'
+  && [Object.prototype, null].includes(Object.getPrototypeOf(value));
 
 const bounds = {
   thresholdMin: value => Number.isFinite(value) && value >= 5,
@@ -17,8 +20,28 @@ export function isValidCiGhostRerunSettings(settings) {
     && Object.entries(bounds).every(([key, valid]) => valid(settings[key]));
 }
 
-export function readCiGhostRerunSettings({ env = process.env, platform, tool, log } = {}) {
+export function readCiGhostRerunSettings({ env = process.env, platform, tool, log,
+  readPlatform = readPlatformPreferences, readTool = readDeclaredSettings } = {}) {
   const standard = { thresholdMin: 15, maxPerWindow: 1, windowHours: 2, cancelWaitSec: 60 };
+  const invalid = [];
+  const load = (name, read, key) => {
+    try {
+      const result = read();
+      if (result.errors.length) invalid.push(`${name}.read`);
+      if (!isPlainObject(result[key])) { invalid.push(name); return undefined; }
+      return result[key];
+    } catch {
+      invalid.push(`${name}.read`);
+      return undefined;
+    }
+  };
+  const block = (name, layer) => {
+    if (layer == null) return undefined;
+    if (!isPlainObject(layer)) { invalid.push(name); return undefined; }
+    if (!Object.hasOwn(layer, 'ciGhostRerun')) return layer;
+    if (!isPlainObject(layer.ciGhostRerun)) { invalid.push(`${name}.ciGhostRerun`); return undefined; }
+    return layer.ciGhostRerun;
+  };
   const select = layer => Object.fromEntries(Object.keys(standard)
     .filter(key => layer?.[key] !== undefined).map(key => [key, layer[key]]));
   const envValues = Object.fromEntries(Object.keys(standard).map(key => {
@@ -26,14 +49,16 @@ export function readCiGhostRerunSettings({ env = process.env, platform, tool, lo
     return [key, env[name] === undefined ? undefined : Number(env[name])];
   }));
   const layers = {
-    platform: select(platform ?? platformPreference('ciGhostRerun', { env })),
-    tool: select(tool ?? readSettings()?.ciGhostRerun), env: envValues,
+    platform: select(block('platform', platform === undefined
+      ? load('platform', () => readPlatform({ env }), 'prefs') : platform)),
+    tool: select(block('tool', tool === undefined
+      ? load('tool', readTool, 'settings') : tool)), env: envValues,
   };
   // Preserve invalid overrides even when the shared cascade selects a valid lower layer.
   // Check whole values too: an object must not disappear into cascade leaf traversal.
-  const invalid = Object.entries(layers).flatMap(([layer, values]) => Object.entries(values)
+  invalid.push(...Object.entries(layers).flatMap(([layer, values]) => Object.entries(values)
     .filter(([key, value]) => value !== undefined && !bounds[key](value))
-    .map(([key]) => `${layer}.${key}`));
+    .map(([key]) => `${layer}.${key}`)));
   const resolved = resolveCascade({ standard, platform: layers.platform, tool: layers.tool,
     envValues, valid: bounds });
   logCascadeSources('ciGhostRerun', resolved, { env, ...(log ? { log } : {}) });

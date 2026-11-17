@@ -110,6 +110,7 @@ export async function runCiGhostRerun(options, {
         || checks.total_count !== checks.check_runs.length || checks.total_count > 100) return failure('checks-incomplete');
       const jobs = [];
       const jobsByRun = new Map();
+      const runsById = new Map();
       for (const check of checks.check_runs) {
         if (check?.app?.slug !== 'github-actions' || check.status !== 'in_progress') continue;
         if (!positiveId(check.id)) return failure('job-unreadable');
@@ -122,15 +123,20 @@ export async function runCiGhostRerun(options, {
         if (check.url !== checkUrl || details.origin !== 'https://github.com' || !positiveId(runId)
           || !details.pathname.startsWith(`/${repo}/actions/runs/`)) return failure('job-unreadable');
         if (!jobsByRun.has(runId)) {
-          const listed = await api(`actions/runs/${runId}/jobs?per_page=100&filter=latest`);
+          const run = await api(`actions/runs/${runId}`);
+          if (run?.id !== runId || !positiveId(run.run_attempt)) return failure('run-unreadable');
+          runsById.set(runId, run);
+          const listed = await api(`actions/runs/${runId}/attempts/${run.run_attempt}/jobs?per_page=100`);
           if (!Array.isArray(listed?.jobs) || !Number.isSafeInteger(listed.total_count)
             || listed.total_count !== listed.jobs.length || listed.total_count > 100) return failure('jobs-incomplete');
+          if (listed.jobs.some(job => job?.run_attempt !== run.run_attempt)) return failure('run-attempt-mismatch');
           jobsByRun.set(runId, listed.jobs);
         }
         const matches = jobsByRun.get(runId).filter(job => job?.check_run_url === checkUrl);
         if (matches.length !== 1 || !positiveId(matches[0].id) || matches[0].run_id !== runId) return failure('job-unreadable');
         const job = await api(`actions/jobs/${matches[0].id}`);
         if (job?.id !== matches[0].id || job.run_id !== runId || job.check_run_url !== checkUrl) return failure('job-unreadable');
+        if (job.run_attempt !== runsById.get(runId).run_attempt) return failure('run-attempt-mismatch');
         if (job.status !== 'in_progress') return failure('not-ghost');
         jobs.push(job);
       }
@@ -150,6 +156,7 @@ export async function runCiGhostRerun(options, {
       before = { status: run?.status ?? null, jobStatus: job.status, runAttempt: run?.run_attempt ?? null };
       if (run?.head_sha !== audit.head) return failure('head-sha-mismatch');
       if (run.id !== job.run_id || !positiveId(run.run_attempt) || run.status !== 'in_progress') return failure('run-unreadable');
+      if (job.run_attempt !== run.run_attempt) return failure('run-attempt-mismatch');
       const attempts = await state.read();
       const since = clock() - settings.windowHours * 3_600_000;
       if (attempts.filter(row => row.counted && row.repo === repo && row.pr === pr

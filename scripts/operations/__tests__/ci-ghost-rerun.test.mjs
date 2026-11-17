@@ -3,16 +3,19 @@
  * @description Hermetic ghost recovery, cancellation, audit, cap and settings guarantees.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createStateStore, detectGhostJobs, parseArgs, runCiGhostRerun } from '../ci-ghost-rerun.mjs';
 import { readCiGhostRerunSettings } from '../../lib/ci-ghost-rerun-settings.mjs';
+import { readDeclaredSettings } from '../../lib/settings-files.mjs';
+import { readPlatformPreferences } from '../../lib/policy-cascade.mjs';
 
 const NOW = Date.parse('2026-11-16T12:00:00Z');
 const HEAD = 'a'.repeat(40);
 const settings = { thresholdMin: 15, maxPerWindow: 1, windowHours: 2, cancelWaitSec: 10 };
 const options = { pr: 42, actor: 'operator', channel: 'manual recovery' };
-const ghost = () => ({ id: 7, run_id: 9, status: 'in_progress', steps: [
+const ghost = () => ({ id: 7, run_id: 9, run_attempt: 2, status: 'in_progress', steps: [
   { status: 'completed', completed_at: '2026-11-16T11:30:00Z' },
   { status: 'completed', completed_at: '2026-11-16T11:40:00Z' },
 ] });
@@ -37,9 +40,9 @@ function fixture() {
       { id: 70, url: checkUrl, details_url: `https://github.com/${repo}/actions/runs/9/job/7`,
         status: 'in_progress', app: { slug: 'github-actions' } },
     ] };
-    if (path.endsWith('/runs/9/jobs?per_page=100&filter=latest')) return {
+    if (path.endsWith('/runs/9/attempts/2/jobs?per_page=100')) return {
       total_count: f.jobsTotal ?? 1,
-      jobs: f.listedJobs ?? [{ id: 7, run_id: 9, status: 'in_progress', check_run_url: checkUrl }],
+      jobs: f.listedJobs ?? [{ id: 7, run_id: 9, run_attempt: 2, status: 'in_progress', check_run_url: checkUrl }],
     };
     if (path.endsWith('/jobs/7')) return { check_run_url: checkUrl, ...f.job };
     if (path.endsWith('/runs/9')) return { id: 9, head_sha: f.runHead, run_attempt: posted ? (f.pollAttempt ?? 2) : 2,
@@ -66,7 +69,7 @@ describe('ghost recovery', () => {
     const f = fixture();
     expect(await f.run()).toMatchObject({ exitCode: 0, reason: 'rerun', jobId: 7, runId: 9 });
     const endpoints = f.gh.mock.calls.map(([args]) => args[1]);
-    expect(endpoints).toContain('repos/web-everything/web-everything/actions/runs/9/jobs?per_page=100&filter=latest');
+    expect(endpoints).toContain('repos/web-everything/web-everything/actions/runs/9/attempts/2/jobs?per_page=100');
     expect(endpoints).toContain('repos/web-everything/web-everything/actions/jobs/7');
     expect(endpoints).not.toContain('repos/web-everything/web-everything/actions/jobs/70');
     expect(f.trace).toEqual(['cancel', 'wait', 'rerun']);
@@ -74,8 +77,8 @@ describe('ghost recovery', () => {
 
   it.each([
     ['missing relationship', []],
-    ['another check', [{ id: 7, run_id: 9, check_run_url: 'https://api.github.com/repos/web-everything/web-everything/check-runs/71' }]],
-    ['ambiguous relationship', [7, 8].map(id => ({ id, run_id: 9,
+    ['another check', [{ id: 7, run_id: 9, run_attempt: 2, check_run_url: 'https://api.github.com/repos/web-everything/web-everything/check-runs/71' }]],
+    ['ambiguous relationship', [7, 8].map(id => ({ id, run_id: 9, run_attempt: 2,
       check_run_url: 'https://api.github.com/repos/web-everything/web-everything/check-runs/70' }))],
   ])('refuses %s without posting', async (_name, listedJobs) => {
     const f = fixture(); f.listedJobs = listedJobs; f.jobsTotal = listedJobs.length;
@@ -86,9 +89,9 @@ describe('ghost recovery', () => {
   it.each(['queued', 'waiting', 'pending', 'in_progress', 'unknown', undefined])(
     'refuses an unvalidated %s sibling before any POST', async status => {
       const f = fixture();
-      f.listedJobs = [{ id: 7, run_id: 9, status: 'in_progress',
+      f.listedJobs = [{ id: 7, run_id: 9, run_attempt: 2, status: 'in_progress',
         check_run_url: 'https://api.github.com/repos/web-everything/web-everything/check-runs/70' },
-      { id: 8, run_id: 9, status }];
+      { id: 8, run_id: 9, run_attempt: 2, status }];
       f.jobsTotal = 2;
       expect(await f.run()).toMatchObject({ exitCode: 2, reason: 'sibling-active' });
       expect(f.posts).toEqual([]);
@@ -97,9 +100,9 @@ describe('ghost recovery', () => {
 
   it('allows a completed sibling when every active job is validated', async () => {
     const f = fixture();
-    f.listedJobs = [{ id: 7, run_id: 9, status: 'in_progress',
+    f.listedJobs = [{ id: 7, run_id: 9, run_attempt: 2, status: 'in_progress',
       check_run_url: 'https://api.github.com/repos/web-everything/web-everything/check-runs/70' },
-    { id: 8, run_id: 9, status: 'completed' }];
+    { id: 8, run_id: 9, run_attempt: 2, status: 'completed' }];
     f.jobsTotal = 2;
     expect(await f.run()).toMatchObject({ exitCode: 0, reason: 'rerun' });
     expect(f.posts).toEqual(['cancel', 'rerun']);
@@ -109,6 +112,37 @@ describe('ghost recovery', () => {
     const f = fixture(); f.job.check_run_url = null;
     expect(await f.run()).toMatchObject({ exitCode: 2, reason: 'job-unreadable' });
     expect(f.posts).toEqual([]);
+  });
+
+  it.each([1, 3, undefined, null, '2'])(
+    'refuses ghost job attempt %s that does not equal the current workflow attempt', async attempt => {
+      const f = fixture(); f.job.run_attempt = attempt;
+      expect(await f.run()).toMatchObject({ exitCode: 2, reason: 'run-attempt-mismatch' });
+      expect(f.posts).toEqual([]);
+      expect(f.rows).toEqual([expect.objectContaining({ outcome: 'run-attempt-mismatch', counted: false })]);
+    });
+
+  it.each([1, undefined])('refuses sibling evidence from attempt %s before any POST', async attempt => {
+    const f = fixture();
+    f.listedJobs = [{ ...f.job, check_run_url: 'https://api.github.com/repos/web-everything/web-everything/check-runs/70' },
+      { id: 8, run_id: 9, run_attempt: attempt, status: 'completed' }];
+    f.jobsTotal = 2;
+    expect(await f.run()).toMatchObject({ exitCode: 2, reason: 'run-attempt-mismatch' });
+    expect(f.posts).toEqual([]);
+    expect(f.rows.some(row => row.counted)).toBe(false);
+  });
+
+  it('refuses when the workflow attempt advances after the pinned job list read', async () => {
+    const f = fixture(); const gh = f.gh;
+    let reads = 0;
+    f.deps.gh = async args => {
+      const result = await gh(args);
+      if (args[1].endsWith('/runs/9') && ++reads === 2) result.run_attempt = 3;
+      return result;
+    };
+    expect(await f.run()).toMatchObject({ exitCode: 2, reason: 'run-attempt-mismatch' });
+    expect(f.posts).toEqual([]);
+    expect(f.rows.some(row => row.counted)).toBe(false);
   });
 
   it('refuses an oversized workflow job list for manual inspection', async () => {
@@ -329,6 +363,83 @@ describe('JSONL store with fake filesystem', () => {
 });
 
 describe('settings cascade', () => {
+  it.each(['platform', 'tool'])('refuses malformed %s layers and blocks without contacting GitHub', async layer => {
+    for (const value of [false, true, 'bad', 12, [], new Date(0)]) {
+      for (const malformed of [value, { ciGhostRerun: value }]) {
+        const f = fixture();
+        f.deps.settings = readCiGhostRerunSettings({ env: {}, platform: {}, tool: {}, [layer]: malformed });
+        expect(f.deps.settings.invalid).toContain(typeof malformed === 'object'
+          && malformed !== null && Object.hasOwn(malformed, 'ciGhostRerun') ? `${layer}.ciGhostRerun` : layer);
+        expect(await f.run()).toMatchObject({ exitCode: 2, reason: 'invalid-settings' });
+        expect(f.gh).not.toHaveBeenCalled();
+        expect(f.rows.at(-1)).toMatchObject({ outcome: 'invalid-settings', counted: false });
+      }
+    }
+  });
+
+  it.each(['platform', 'tool'])('refuses a null ciGhostRerun block in the %s layer', async layer => {
+    const f = fixture();
+    f.deps.settings = readCiGhostRerunSettings({ env: {}, platform: {}, tool: {}, [layer]: { ciGhostRerun: null } });
+    expect(f.deps.settings.invalid).toContain(`${layer}.ciGhostRerun`);
+    expect(await f.run()).toMatchObject({ exitCode: 2, reason: 'invalid-settings' });
+    expect(f.gh).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, null])('accepts absent layers %s', value => {
+    expect(readCiGhostRerunSettings({ env: {}, platform: value, tool: value,
+      readPlatform: () => ({ prefs: {}, errors: [] }), readTool: () => ({ settings: {}, errors: [] }) }))
+      .toEqual({ thresholdMin: 15, maxPerWindow: 1, windowHours: 2, cancelWaitSec: 60 });
+  });
+
+  it('accepts plain ciGhostRerun blocks and preserves their layer provenance', () => {
+    const log = vi.fn();
+    expect(readCiGhostRerunSettings({ env: { WE_POLICY_CASCADE_LOG: '1' }, log,
+      platform: { ciGhostRerun: { thresholdMin: 20 } }, tool: { ciGhostRerun: { windowHours: 3 } } }))
+      .toEqual({ thresholdMin: 20, maxPerWindow: 1, windowHours: 3, cancelWaitSec: 60 });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('thresholdMin=20 (platform)'));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('windowHours=3 (tool)'));
+  });
+
+  it.each(['parse', 'read', 'shape'])('refuses a platform settings file %s failure', async kind => {
+    const f = fixture();
+    f.deps.settings = readCiGhostRerunSettings({ env: {}, tool: {},
+      readPlatform: () => readPlatformPreferences({ env: { WE_PLATFORM_PREFERENCES_FILE: 'fixture.json' },
+        readFile: () => {
+          if (kind === 'read') throw Object.assign(new Error('denied'), { code: 'EACCES' });
+          return kind === 'parse' ? '{' : 'false';
+        } }),
+    });
+    expect(f.deps.settings.invalid).toContain('platform.read');
+    expect(await f.run()).toMatchObject({ exitCode: 2, reason: 'invalid-settings' });
+    expect(f.gh).not.toHaveBeenCalled();
+  });
+
+  it.each(['parse', 'read', 'shape'])('refuses a tool settings file %s failure', async kind => {
+    const dir = mkdtempSync(join(tmpdir(), 'ci-ghost-settings-'));
+    try {
+      const file = join(dir, 'fixture.json');
+      if (kind !== 'read') writeFileSync(file, kind === 'parse' ? '{' : '[]');
+      const f = fixture();
+      f.deps.settings = readCiGhostRerunSettings({ env: {}, platform: {},
+        readTool: () => readDeclaredSettings({ dir, legacyPath: kind === 'read' ? dir : file }),
+      });
+      expect(f.deps.settings.invalid).toContain('tool.read');
+      expect(await f.run()).toMatchObject({ exitCode: 2, reason: 'invalid-settings' });
+      expect(f.gh).not.toHaveBeenCalled();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each(['platform', 'tool'])('returns an invalid marker when the %s reader throws', async layer => {
+    const f = fixture();
+    f.deps.settings = readCiGhostRerunSettings({ env: {},
+      platform: layer === 'platform' ? undefined : {}, tool: layer === 'tool' ? undefined : {},
+      [layer === 'platform' ? 'readPlatform' : 'readTool']: () => { throw new Error('unreadable'); },
+    });
+    expect(f.deps.settings.invalid).toContain(`${layer}.read`);
+    expect(await f.run()).toMatchObject({ exitCode: 2, reason: 'invalid-settings' });
+    expect(f.gh).not.toHaveBeenCalled();
+  });
+
   it('resolves standard -> platform -> tool -> env independently and logs provenance', () => {
     const log = vi.fn();
     expect(readCiGhostRerunSettings({ platform: { thresholdMin: 20, windowHours: 3 },
