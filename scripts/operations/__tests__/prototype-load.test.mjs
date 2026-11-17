@@ -458,8 +458,9 @@ describe('canonicalAuditEvidence', () => {
   });
 
   describe('production loader binds scoped evidence to the branch item card INVARIANTS block', () => {
-    const section = '- Keep the admission guard.\n- Never widen scope.\n';
-    const card = (body = section, heading = '## INVARIANTS') => `---\nstatus: open\n---\n\n# Demo\n\n${heading}\n${body}\n## Acceptance\n\n- [A1] x\n`;
+    // The section is every line under the heading up to the next heading, so it keeps the blank separator line.
+    const section = '- Keep the admission guard.\n- Never widen scope.\n\n';
+    const card = (body = section, heading = '## INVARIANTS') => `---\nstatus: open\n---\n\n# Demo\n\n${heading}\n${body}## Acceptance\n\n- [A1] x\n`;
     const hashOf = (text) => createHash('sha256').update(text).digest('hex');
     const run = (records, cards, branch = 'lane/1234-demo') => auditedFixture('refuse', { audits: auditLines(records), auditBaseInMain: TREE, cards })
       .run({ branch, dryRun: true });
@@ -473,7 +474,7 @@ describe('canonicalAuditEvidence', () => {
 
     it('refuses when the card text differs by one byte from the audited invariants', async () => {
       const scoped = scopedAudit({ invariantsHash: hashOf(section) });
-      for (const changed of [section.replace('Keep', 'keep'), section.trimEnd(), section.replaceAll('\n', '\r\n'), `${section}\n`]) {
+      for (const changed of [section.replace('Keep', 'keep'), `${section.trimEnd()}\n`, section.replaceAll('\n', '\r\n'), `${section}\n`]) {
         expect(await run([scoped], { '1234-demo.md': card(changed) })).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { reason: 'no-record' } });
       }
     });
