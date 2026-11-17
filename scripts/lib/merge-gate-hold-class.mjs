@@ -70,8 +70,10 @@ export function parsePrResultTable(log, prNumber) {
       if (/^#\d+:|^merge-gate:/.test(line)) {
         // Rows after the footer are evidence the producer never printed for this table: fail closed.
         if (line.startsWith('merge-gate:')) {
-          for (let k = j + 1; k < lines.length && (!lines[k].trim() || lines[k].startsWith('  ')); k++) {
-            if (lines[k].trim()) return { error: 'verdict rows after the merge-gate footer' };
+          // Scan to the next PR header (or the end), through any interleaved diagnostics.
+          for (let k = j + 1; k < lines.length && !/^#\d+:/.test(lines[k]); k++) {
+            const late = /^\s*(\S+)\s+(\S+)\s/.exec(lines[k]);
+            if (late && statuses.has(late[1]) && gates.has(late[2])) return { error: 'verdict rows after the merge-gate footer' };
           }
         }
         break;
