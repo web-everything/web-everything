@@ -5307,3 +5307,7 @@ The terminal-record half of card #3751. we:scripts/verify-lane.mjs refused to ST
 ## Session update (2026-09-24, continued) — stranded-hash grace 180 s -> 1800 s: the drain's numbering lag is now 8-17 minutes, so gates went red after every hash-card merge
 
 The landing of the #3751 fix went red on a check, not on the change: `strandedHashesOnMain` in we:scripts/check-standards-rules.mjs errors on a hash-named card on origin/main once it is older than `STRANDED_HASH_GRACE_SECONDS`, sized at 180 s from a measured 7-73 s drain numbering lag. On 2026-09-24 the real lag across 8 lands was 469-1029 s, so every gate in the ~10 minutes after any hash-card merge was red on a hash the drain was about to number (live: xqzxroq, merged 11:35:46 EDT, still unnumbered at 11:46). The grace is now 1800 s, about 1.75x the slowest measured lag. Main has the same constant; the same change goes to main by PR.
+
+## Session update (2026-11-17) — knowledge-store session-start check and proposal-only sync (card 0l)
+
+Card 0l prototype: new scripts/operations/knowledge-store-check.mjs (session-start check: which memory store this session loads, whether it is the canonical one, exits 1 with start-in/link fixes) and knowledge-store-sync.mjs (proposal-only merge plan, --apply behind an explicit flag, never run). New files only, 7 scoped tests pass. Feeds card 0k. No PR; committed to lane/mechanical-dispatcher.
