@@ -92,7 +92,7 @@ function harness({ changedFiles = ['scripts/x.mjs'], strategy = null, dryRun = f
     writeFile: strategyExtra.writeFile ?? vi.fn(),
     dryRun, env, labelProvider, readRedTeamEvidence: strategyExtra.readRedTeamEvidence ?? (() => { if (evidence.readError) throw new Error('evidence unreadable'); return evidence; }), requestRedTeam, publishNeedsYou, redTeamDeadline, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
     cancelObsoleteRuns: () => {}, batching: { gate: () => ({ admit: true }), observe: () => ({}) },
-    postConflictFinding, ...(now ? { now } : {}), resolved: policyOf(strategy), log: { write: (l) => logs.push(l) }, readFile, writeState, ...(withLock ? { withLock } : {}),
+    postConflictFinding, ...(now ? { now } : {}), resolved: policyOf(strategy), log: { write: (l) => logs.push(l) }, readFile, writeState, ...(strategyExtra.statePath ? { statePath: strategyExtra.statePath, readFile: readFileSync, writeState: undefined } : {}), ...(withLock ? { withLock } : {}),
   });
   // `peer` = a second drain process writing the same state file (its own enqueue) at any moment, as `onView` does mid-collect.
   const peerEnqueue = (entry) => { const cur = stored ? JSON.parse(JSON.stringify(stored)) : { pending: [], followedUp: [] }; cur.pending.push(entry); stored = cur; };
@@ -2046,5 +2046,35 @@ describe('drain pre-stage queue admission', () => {
     if (variant === 'unreadable') expect(() => s.enqueue(c, HEAD, { prepared, comments: prepared.comments })).toThrow('evidence unreadable');
     else expect(s.enqueue(c, HEAD, { prepared, comments: prepared.comments })).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
     expect(calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+  });
+});
+
+describe('finished pending red-team stall notice', () => {
+  it('emits one durable notice per repo/pr/head, including after strategy restart', () => {
+    const notes = [];
+    const root = mkdtempSync(join(tmpdir(), 'stall-notices-'));
+    const statePath = join(root, 'queue.json');
+    let clock = 1000;
+    const make = () => harness({ strategy: 'github-merge-queue', now: () => clock, strategyExtra: { statePath },
+      labels: ['review:accepted', 'ready-to-merge', 'red-team:pending'],
+      publishNeedsYou: item => notes.push(item),
+      evidence: { scheduled: true, recorded: false, seatRecorded: false, failedSeatCount: 0, completedRecorded: false,
+        inFlight: false, queued: false, loopPayload: { verdict: { verdict: 'accept' } },
+        status: { head: HEAD, status: 'finished', retryCount: 1, result: { status: 'skipped' } } } });
+    try {
+      const h = make();
+      // Use the explicit repo identity whose durable key we inspect across restarts.
+      const candidate = { num: 5283, repo: LOCAL };
+      expect(h.s.enqueue(candidate, HEAD).enqueued).toBe(false);
+      const notices = readQueueState(statePath).redTeamStallNotices;
+      expect(notices[`${LOCAL}#5283`][HEAD]).toBe(clock);
+      // Exercise mutateState's separate write projection before restarting.
+      h.s.confirmQueueFollowUps([{ num: 999, repo: LOCAL }]);
+      expect(readQueueState(statePath).redTeamStallNotices).toEqual(notices);
+      clock = readQueueState(statePath).redTeamPending[`${LOCAL}#5283`].retryAt + 1;
+      const restarted = make();
+      expect(restarted.s.enqueue(candidate, HEAD).enqueued).toBe(false);
+      expect(notes).toEqual([expect.objectContaining({ repo: LOCAL, pr: 5283, head: HEAD, kind: 'red-team-finished-pending' })]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
