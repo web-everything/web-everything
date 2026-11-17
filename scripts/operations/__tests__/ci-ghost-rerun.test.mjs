@@ -3,6 +3,8 @@
  * @description Hermetic ghost recovery, cancellation, audit, cap and settings guarantees.
  */
 import { describe, it, expect, vi } from 'vitest';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { createStateStore, detectGhostJobs, parseArgs, runCiGhostRerun } from '../ci-ghost-rerun.mjs';
 import { readCiGhostRerunSettings } from '../../lib/ci-ghost-rerun-settings.mjs';
 
@@ -37,10 +39,10 @@ function fixture() {
     ] };
     if (path.endsWith('/runs/9/jobs?per_page=100&filter=latest')) return {
       total_count: f.jobsTotal ?? 1,
-      jobs: f.listedJobs ?? [{ id: 7, run_id: 9, check_run_url: checkUrl }],
+      jobs: f.listedJobs ?? [{ id: 7, run_id: 9, status: 'in_progress', check_run_url: checkUrl }],
     };
     if (path.endsWith('/jobs/7')) return { check_run_url: checkUrl, ...f.job };
-    if (path.endsWith('/runs/9')) return { id: 9, head_sha: f.runHead, run_attempt: 2,
+    if (path.endsWith('/runs/9')) return { id: 9, head_sha: f.runHead, run_attempt: posted ? (f.pollAttempt ?? 2) : 2,
       status: posted ? (f.statuses.length > 1 ? f.statuses.shift() : f.statuses[0]) : 'in_progress' };
     throw new Error(`Unexpected fake route: ${path}`);
   });
@@ -79,6 +81,28 @@ describe('ghost recovery', () => {
     const f = fixture(); f.listedJobs = listedJobs; f.jobsTotal = listedJobs.length;
     expect(await f.run()).toMatchObject({ exitCode: 2, reason: 'job-unreadable' });
     expect(f.posts).toEqual([]);
+  });
+
+  it.each(['queued', 'waiting', 'pending', 'in_progress', 'unknown', undefined])(
+    'refuses an unvalidated %s sibling before any POST', async status => {
+      const f = fixture();
+      f.listedJobs = [{ id: 7, run_id: 9, status: 'in_progress',
+        check_run_url: 'https://api.github.com/repos/web-everything/web-everything/check-runs/70' },
+      { id: 8, run_id: 9, status }];
+      f.jobsTotal = 2;
+      expect(await f.run()).toMatchObject({ exitCode: 2, reason: 'sibling-active' });
+      expect(f.posts).toEqual([]);
+      expect(f.rows.some(row => row.counted)).toBe(false);
+    });
+
+  it('allows a completed sibling when every active job is validated', async () => {
+    const f = fixture();
+    f.listedJobs = [{ id: 7, run_id: 9, status: 'in_progress',
+      check_run_url: 'https://api.github.com/repos/web-everything/web-everything/check-runs/70' },
+    { id: 8, run_id: 9, status: 'completed' }];
+    f.jobsTotal = 2;
+    expect(await f.run()).toMatchObject({ exitCode: 0, reason: 'rerun' });
+    expect(f.posts).toEqual(['cancel', 'rerun']);
   });
 
   it('refuses a job detail that no longer links to the selected check', async () => {
@@ -147,6 +171,24 @@ describe('ghost recovery', () => {
     };
     expect((await f.run()).reason).toBe('rerun');
     expect(f.posts).toEqual(['force-cancel', 'rerun']);
+  });
+
+  it.each(['in_progress', 'completed'])(
+    'aborts when polling sees a changed attempt with status %s', async status => {
+      const f = fixture(); f.pollAttempt = 3; f.statuses = [status];
+      expect(await f.run()).toMatchObject({ exitCode: 4, reason: 'run-attempt-changed' });
+      expect(f.posts).toEqual(['cancel']);
+      expect(f.rows.at(-1)).toMatchObject({ outcome: 'run-attempt-changed', counted: false });
+    });
+
+  it('aborts when the attempt changes during force-cancel polling', async () => {
+    const f = fixture(); f.statuses = ['in_progress']; const gh = f.gh;
+    f.deps.gh = async args => {
+      if (args[1].endsWith('/force-cancel')) { f.pollAttempt = 3; f.statuses = ['completed']; }
+      return gh(args);
+    };
+    expect(await f.run()).toMatchObject({ exitCode: 4, reason: 'run-attempt-changed' });
+    expect(f.posts).toEqual(['cancel', 'force-cancel']);
   });
 
   it('returns cancel-unconfirmed with no rerun after both bounded waits', async () => {
@@ -239,6 +281,25 @@ describe('JSONL store with fake filesystem', () => {
     return { state: createStateStore('fake-state', io), io, setText: value => { text = value; }, getText: () => text };
   }
 
+  it('ignores the removed environment state directory override for both ledger and lock', async () => {
+    const previous = process.env.WE_CI_GHOST_RERUN_STATE_DIR;
+    process.env.WE_CI_GHOST_RERUN_STATE_DIR = 'bypass-state';
+    try {
+      const io = { mkdirSync: vi.fn(), appendFileSync: vi.fn(), rmdirSync: vi.fn(),
+        statSync: vi.fn(() => ({ size: 0 })), readFileSync: vi.fn(() => '') };
+      const state = createStateStore(undefined, io);
+      await state.withLock(() => { state.read(); state.append({ outcome: 'test' }); });
+      const dir = join(homedir(), '.claude', 'ci-ghost-rerun');
+      expect(io.statSync).toHaveBeenCalledWith(join(dir, 'attempts.jsonl'));
+      expect(io.appendFileSync).toHaveBeenCalledWith(join(dir, 'attempts.jsonl'), expect.any(String), expect.any(Object));
+      expect(io.mkdirSync).toHaveBeenCalledWith(join(dir, 'operation.lock'), { mode: 0o700 });
+      expect(io.rmdirSync).toHaveBeenCalledWith(join(dir, 'operation.lock'));
+    } finally {
+      if (previous === undefined) delete process.env.WE_CI_GHOST_RERUN_STATE_DIR;
+      else process.env.WE_CI_GHOST_RERUN_STATE_DIR = previous;
+    }
+  });
+
   it('persists JSONL audit lines, reads them back and releases a failed operation lock', async () => {
     const f = store();
     const row = { ts: new Date(NOW).toISOString(), outcome: 'dry-run', counted: false };
@@ -277,10 +338,50 @@ describe('settings cascade', () => {
     expect(log).toHaveBeenCalledWith(expect.stringContaining('windowHours=3 (platform)'));
   });
 
-  it('rejects non-positive, non-finite and fractional cap values while preserving lower layers', () => {
+  it('exposes invalid overrides even when the cascade retains valid lower layers', () => {
     expect(readCiGhostRerunSettings({ platform: { thresholdMin: 20 }, tool: { thresholdMin: -1 }, env: {
       WE_CI_GHOST_RERUN_THRESHOLD_MIN: 'NaN', WE_CI_GHOST_RERUN_MAX_PER_WINDOW: '1.5',
       WE_CI_GHOST_RERUN_WINDOW_HOURS: '0', WE_CI_GHOST_RERUN_CANCEL_WAIT_SEC: 'Infinity',
-    } })).toEqual({ thresholdMin: 20, maxPerWindow: 1, windowHours: 2, cancelWaitSec: 60 });
+    } })).toEqual({ thresholdMin: 20, maxPerWindow: 1, windowHours: 2, cancelWaitSec: 60,
+      invalid: expect.arrayContaining(['tool.thresholdMin', 'env.thresholdMin', 'env.maxPerWindow',
+        'env.windowHours', 'env.cancelWaitSec']) });
   });
+});
+
+const invalidOverrides = [
+  ['thresholdMin', 4.99], ['thresholdMin', -1], ['thresholdMin', NaN], ['thresholdMin', Infinity],
+  ['maxPerWindow', 0], ['maxPerWindow', 4], ['maxPerWindow', 1.5],
+  ['windowHours', 0.99], ['windowHours', 24.01],
+  ['cancelWaitSec', 4.99], ['cancelWaitSec', 300.01],
+  ['thresholdMin', null], ['thresholdMin', {}], ['thresholdMin', 'bad'],
+];
+
+describe.each(['platform', 'tool', 'env', 'injected'])('%s invalid settings', layer => {
+  it.each(invalidOverrides)('refuses %s=%s without contacting GitHub', async (key, value) => {
+    const f = fixture();
+    if (layer === 'injected') f.deps.settings = { ...settings, [key]: value };
+    else {
+      const input = { platform: {}, tool: {}, env: {} };
+      if (layer === 'env') {
+        const name = `WE_CI_GHOST_RERUN_${key.replace(/[A-Z]/g, c => `_${c}`).toUpperCase()}`;
+        input.env[name] = String(value);
+      } else input[layer][key] = value;
+      f.deps.settings = readCiGhostRerunSettings(input);
+      expect(f.deps.settings.invalid).toContain(`${layer}.${key}`);
+    }
+    expect(await f.run()).toMatchObject({ exitCode: 2, reason: 'invalid-settings' });
+    expect(f.gh).not.toHaveBeenCalled();
+    expect(f.posts).toEqual([]);
+    expect(f.rows.at(-1).outcome).toBe('invalid-settings');
+  });
+});
+
+it.each([
+  { thresholdMin: 5, maxPerWindow: 1, windowHours: 1, cancelWaitSec: 5 },
+  { thresholdMin: 5, maxPerWindow: 3, windowHours: 24, cancelWaitSec: 300 },
+])('accepts inclusive settings bounds %j', async valid => {
+  const f = fixture();
+  f.deps.settings = readCiGhostRerunSettings({ platform: {}, tool: valid, env: {} });
+  expect(f.deps.settings).toEqual(valid);
+  expect(await f.run()).toMatchObject({ exitCode: 0, reason: 'rerun' });
 });

@@ -12,7 +12,7 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as sleepDefault } from 'node:timers/promises';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
-import { readCiGhostRerunSettings } from '../lib/ci-ghost-rerun-settings.mjs';
+import { isValidCiGhostRerunSettings, readCiGhostRerunSettings } from '../lib/ci-ghost-rerun-settings.mjs';
 
 const positiveId = value => Number.isSafeInteger(value) && value > 0;
 const oneLine = value => typeof value === 'string' && value.trim().length > 0
@@ -36,8 +36,7 @@ export function detectGhostJobs({ jobs, now, thresholdMin }) {
 }
 
 /** A single JSONL ledger holds audit and counted attempt reservations; the lock spans the effect. */
-export function createStateStore(dir = process.env.WE_CI_GHOST_RERUN_STATE_DIR
-  || join(homedir(), '.claude', 'ci-ghost-rerun'), io = {
+export function createStateStore(dir = join(homedir(), '.claude', 'ci-ghost-rerun'), io = {
   appendFileSync, mkdirSync, readFileSync, rmdirSync, statSync,
 }) {
   const ledger = join(dir, 'attempts.jsonl');
@@ -98,8 +97,7 @@ export async function runCiGhostRerun(options, {
     if (options.invalid || !oneLine(actor) || !/^[a-z\d](?:[a-z\d-]*)(?:\[bot\])?$/i.test(actor)
       || !oneLine(channel)) return finish(failure('invalid-attribution'));
     if (!positiveId(pr) || !/^[a-z\d_.-]+\/[a-z\d_.-]+$/i.test(repo)) return finish(failure('invalid-target'));
-    if (Object.values(settings).some(value => !Number.isFinite(value) || value <= 0)
-      || !Number.isInteger(settings.maxPerWindow) || settings.cancelWaitSec > 3600) {
+    if (!isValidCiGhostRerunSettings(settings)) {
       return finish(failure('invalid-settings'));
     }
     const result = await state.withLock(async () => {
@@ -138,6 +136,12 @@ export async function runCiGhostRerun(options, {
       }
       const decision = detectGhostJobs({ jobs, now: clock(), thresholdMin: settings.thresholdMin });
       if (decision.exitCode) return decision;
+      // Cancellation affects the entire workflow, including siblings absent from checks.
+      for (const [runId, listedJobs] of jobsByRun) {
+        const validated = new Set(decision.jobs.filter(job => job.run_id === runId).map(job => job.id));
+        if (listedJobs.some(job => !job || (job.status !== 'completed'
+          && !(job.status === 'in_progress' && validated.has(job.id))))) return failure('sibling-active');
+      }
       const job = decision.jobs[0];
       audit.jobId = job.id;
       audit.runId = job.run_id;
@@ -159,6 +163,7 @@ export async function runCiGhostRerun(options, {
         for (let tick = 0; tick <= ticks; tick++) {
           const current = await api(runPath);
           if (current?.id !== job.run_id || current.head_sha !== audit.head) throw new Error('run evidence changed');
+          if (current.run_attempt !== run.run_attempt) return failure('run-attempt-changed', 4);
           if (current.status === 'completed') return true;
           if (tick < ticks) await sleep(settings.cancelWaitSec * 1000 / ticks);
         }
@@ -166,11 +171,13 @@ export async function runCiGhostRerun(options, {
       };
       try { await api(`${runPath}/cancel`, 'POST'); } catch { /* force-cancel remains available */ }
       let completed = await waitCompleted();
+      if (typeof completed !== 'boolean') return completed;
       if (!completed) {
         try {
           await api(`${runPath}/force-cancel`, 'POST');
-          completed = await waitCompleted();
-        } catch { completed = false; }
+        } catch { /* still poll to confirm cancellation */ }
+        completed = await waitCompleted();
+        if (typeof completed !== 'boolean') return completed;
       }
       if (!completed) return failure('cancel-unconfirmed', 4);
       await api(`${runPath}/rerun`, 'POST');
@@ -202,6 +209,7 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
   const result = await runCiGhostRerun(options);
   console.log(options.json ? JSON.stringify(result) :
     `${result.reason}; before=${JSON.stringify(result.before)}; newRunAttempt=${result.newRunAttempt ?? 'none'}`);
-  if (result.exitCode) console.error('Inspect workflow evidence in GitHub; retry after the cap/window or state lock clears. Inspect state before removing a stale lock.');
+  if (result.reason === 'invalid-settings') console.error('Correct or remove invalid ciGhostRerun overrides before retrying: thresholdMin >= 5, maxPerWindow integer 1..3, windowHours 1..24, cancelWaitSec 5..300.');
+  else if (result.exitCode) console.error('Inspect workflow evidence in GitHub; retry after the cap/window or state lock clears. Inspect state before removing a stale lock.');
   process.exitCode = result.exitCode;
 }
