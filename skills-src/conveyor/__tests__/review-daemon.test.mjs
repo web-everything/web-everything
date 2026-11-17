@@ -1418,7 +1418,7 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     });
     expect(out.pendingNotDispatched).toHaveLength(1);
     const reasons = out.pendingNotDispatched.flatMap(p => p.reasons).join('\n');
-    expect(reasons).toMatch(/host start budget|host admission/);
+    expect(reasons).toContain('per-tick review start budget (2 of 2 used this tick; host admitted: not checked)');
     expect(reasons).not.toContain('held by the live-review cap');
     expect(liveReviewBudget.left).toBe(2);
     expect(out).toMatchObject({ deferredForHost: 1, deferredForCap: 0, deferredForCapReason: null });
@@ -1449,6 +1449,170 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     });
     expect(statusCandidates).toHaveBeenCalledTimes(1);
     expect(statusCandidates.mock.calls[0][0]).toHaveLength(4); // all 4 owed reviews, not just the 1 dispatched
+  });
+});
+
+describe('review dispatch waiting history', () => {
+  const state = () => ({ firstOwedAt: new Map(), lastDispatched: new Map() });
+  function tick(dispatchState, numbers, options = {}) {
+    return runReviewTick({ repo: 'waiting/repo', dispatchState,
+      reconcile: () => ({ dispatch: numbers.map(prNumber => ({ kind: 'review', prNumber, headRefOid: 'head', attempts: 0 })), refusals: [] }),
+      readPrs: () => numbers.map(number => ({ number, headRefOid: 'head', labels: ['review:pending'] })),
+      readAgents: () => [], dispatch: () => ({ agentId: 'review' }),
+      tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+      acquirableLanes: () => 10, now: () => 100, ...options });
+  }
+
+  it('serves continuously owed higher PRs before newly owed lower PRs, removes cleared ages, and isolates repos', () => {
+    const history = state();
+    tick(history, [7012, 7013], { acquirableLanes: () => 0 });
+    const dispatch = vi.fn(() => ({}));
+    tick(history, [6933, 7013, 7012], { now: () => 200, dispatch,
+      hostAdmission: () => ({ admitted: true, maxPerTick: 2 }) });
+    expect(dispatch.mock.calls.map(([o]) => o.pr)).toEqual([7012, 7013]);
+    tick(history, [7012], { repo: 'other/repo', now: () => 250, acquirableLanes: () => 0 });
+    tick(history, [6933, 7013], { now: () => 300, acquirableLanes: () => 0 });
+    expect(history.firstOwedAt.has('waiting/repo#7012')).toBe(false);
+    expect(history.firstOwedAt.get('other/repo#7012')).toBe(250);
+    tick(history, [7012, 6933, 7013], { now: () => 400, dispatch });
+    expect(dispatch.mock.calls.slice(2).map(([o]) => o.pr)).toEqual([7013, 6933, 7012]);
+  });
+
+  it('keeps rank and red-team slots ahead of age, and leaves inputs unchanged', async () => {
+    const { orderReviewsForDispatch } = await import('../review-daemon.mjs');
+    const reviews = [{ prNumber: 1 }, { prNumber: 2 }, { prNumber: 3, redTeamRequest: {} },
+      { prNumber: 4 }, { prNumber: 5, mainFix: true }, { prNumber: 6 }];
+    const owedSince = new Map([[1, 20], [2, 10], [4, 100], [5, 200], [6, 10]]);
+    const labelsByPr = new Map([[4, ['review:human']]]);
+    expect(orderReviewsForDispatch(reviews, { owedSince, labelsByPr }).map(r => r.prNumber)).toEqual([5, 4, 3, 2, 6, 1]);
+    expect(reviews.map(r => r.prNumber)).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(owedSince.get(2)).toBe(10);
+  });
+
+  it('explains exhausted shared starts with the original budget and admitted memory reason', async () => {
+    const { sharedHostBudget } = await import('../review-daemon.mjs');
+    const reason = 'host load 0.28, memory fine source=memory-pressure';
+    const hostAdmission = sharedHostBudget(() => ({ admitted: true, maxPerTick: 1, reason }));
+    tick(state(), [1], { hostAdmission });
+    const out = tick(state(), [2], { repo: 'other/repo', hostAdmission });
+    expect(out.pendingNotDispatched[0].reasons).toEqual([
+      `review owed, held by the per-tick review start budget (1 of 1 used this tick; host admitted: ${reason})`,
+    ]);
+    expect(out.deferredForHost).toBe(1);
+    expect(out.deferredForLanes).toBe(0);
+  });
+
+  it('records a dead same-head job as no-verdict once, retries immediately, and retains its owed age', () => {
+    const history = state();
+    const log = vi.fn();
+    tick(history, [7012], { dispatch: () => ({ mode: 'job', jobPid: 42 }) });
+    const dispatch = vi.fn(() => ({}));
+    const tagRound = vi.fn();
+    const out = tick(history, [6933, 7012], { now: () => 200, isPidAlive: () => false, log, dispatch, tagRound,
+      hostAdmission: () => ({ admitted: true, maxPerTick: 1 }) });
+    expect(out.endedNoVerdict).toEqual([{ prNumber: 7012, reason: 'review-job-ended-no-verdict', jobPid: 42 }]);
+    expect(log).toHaveBeenCalledWith('review-daemon: waiting/repo#7012 review-job-ended-no-verdict (job pid 42) - will retry');
+    expect(dispatch.mock.calls.map(([o]) => o.pr)).toEqual([7012]);
+    expect(tagRound).toHaveBeenCalledWith(expect.objectContaining({ pr: 7012, round: 1 }));
+    expect(history.firstOwedAt.get('waiting/repo#7012')).toBe(100);
+    expect(out.failed).toEqual([]);
+    const next = tick(history, [7012], { isPidAlive: () => false, acquirableLanes: () => 0, log });
+    expect(next.endedNoVerdict).toBeUndefined();
+    expect(log).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { head: 'head', alive: true }, { head: 'head', alive: null },
+    { head: 'changed', alive: false }, { head: null, alive: false },
+  ])('does not claim no-verdict without a dead same-head job: %j', ({ head, alive }) => {
+    const history = state();
+    history.lastDispatched.set('waiting/repo#7012', { pid: 42, head });
+    const log = vi.fn();
+    const out = tick(history, [7012], { isPidAlive: () => alive, log, acquirableLanes: () => 0 });
+    expect(out.endedNoVerdict).toBeUndefined();
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it('yields to peers from the second consecutive no-verdict, with one start per tick and no cooldown', () => {
+    const history = state(); // Older injected state has no counter map yet.
+    const dispatch = vi.fn(() => ({ mode: 'job', jobPid: 42 }));
+    const log = vi.fn();
+    const options = { dispatch, log, isPidAlive: () => false,
+      hostAdmission: () => ({ admitted: true, maxPerTick: 1 }) };
+    tick(history, [7012], options);
+    const first = tick(history, [7012, 7013], { ...options, now: () => 200 });
+    expect(first.endedNoVerdict).toHaveLength(1);
+    expect(history.firstOwedAt.get('waiting/repo#7012')).toBe(100);
+    const second = tick(history, [7012, 7013], { ...options, now: () => 300 });
+    expect(second.endedNoVerdict).toEqual([{ prNumber: 7012, reason: 'review-job-ended-no-verdict', jobPid: 42 }]);
+    expect(history.firstOwedAt.get('waiting/repo#7012')).toBe(300);
+    expect(history.noVerdictCounts.get('waiting/repo#7012')).toEqual({ head: 'head', count: 2 });
+    tick(history, [7012, 7013], { ...options, now: () => 400 });
+    tick(history, [7012, 7013], { ...options, now: () => 500 });
+    tick(history, [7012, 7013], { ...options, now: () => 600 });
+    expect(dispatch.mock.calls.map(([o]) => o.pr)).toEqual([7012, 7012, 7013, 7013, 7012, 7013]);
+    expect(log.mock.calls.filter(([line]) => line.includes('review-job-ended-no-verdict'))).toHaveLength(5);
+  });
+
+  it.each([true, false])('retains age and retry history through live-process refusals (known open PRs: %s)', (knownOpen) => {
+    const history = state();
+    tick(history, [7012], { dispatch: () => ({ jobPid: 42 }) });
+    tick(history, [7012], { now: () => 200, isPidAlive: () => false, dispatch: () => ({ jobPid: 43 }) });
+    tick(history, [], { now: () => 300,
+      readPrs: knownOpen ? () => [{ number: 7012, headRefOid: 'head', labels: [] }] : null,
+      reconcile: () => ({ dispatch: [], refusals: [{ prNumber: '7012', kind: 'live-process' }] }) });
+    expect(history.firstOwedAt.get('waiting/repo#7012')).toBe(100);
+    expect(history.lastDispatched.get('waiting/repo#7012')).toEqual({ pid: 43, head: 'head' });
+    expect(history.noVerdictCounts.get('waiting/repo#7012')).toEqual({ head: 'head', count: 1 });
+    const out = tick(history, [7012], { now: () => 400, isPidAlive: () => false });
+    expect(out.endedNoVerdict).toHaveLength(1);
+    expect(history.firstOwedAt.get('waiting/repo#7012')).toBe(400);
+  });
+
+  it.each(['not-owed', 'closed', 'head-changed', 'refused-head-changed'])('clears consecutive no-verdict history when %s', (reason) => {
+    const history = state();
+    const key = 'waiting/repo#7012';
+    tick(history, [7012], { dispatch: () => ({ jobPid: 42 }) });
+    tick(history, [7012], { isPidAlive: () => false });
+    history.noVerdictCounts.set('other/repo#7012', { head: 'head', count: 2 });
+    const changed = reason.includes('head-changed');
+    tick(history, reason === 'head-changed' ? [7012] : [], {
+      acquirableLanes: () => 0,
+      readPrs: () => reason === 'closed' ? [] : [{ number: 7012, headRefOid: changed ? 'new-head' : 'head', labels: [] }],
+      ...(reason === 'head-changed' ? { reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 7012, headRefOid: 'new-head' }], refusals: [] }) } : {}),
+      ...(reason === 'closed' || reason === 'refused-head-changed'
+        ? { reconcile: () => ({ dispatch: [], refusals: [{ prNumber: 7012, kind: 'live-process' }] }) } : {}),
+    });
+    expect(history.noVerdictCounts.has(key)).toBe(false);
+    expect(history.noVerdictCounts.get('other/repo#7012')).toEqual({ head: 'head', count: 2 });
+    if (!changed) expect(history.firstOwedAt.has(key)).toBe(false);
+    tick(history, [7012], { dispatch: () => ({ jobPid: 43 }) });
+    const age = history.firstOwedAt.get(key);
+    const out = tick(history, [7012], { now: () => 500, isPidAlive: () => false });
+    expect(out.endedNoVerdict).toHaveLength(1);
+    expect(history.noVerdictCounts.get(key)).toEqual({ head: 'head', count: 1 });
+    expect(history.firstOwedAt.get(key)).toBe(age);
+  });
+
+  it('deletes the ended job before logging and still retries and tags when the logger throws', () => {
+    const history = state();
+    const key = 'waiting/repo#7012';
+    tick(history, [7012], { dispatch: () => ({ jobPid: 42 }) });
+    const deletedBeforeLog = [];
+    const log = vi.fn(() => {
+      deletedBeforeLog.push(!history.lastDispatched.has(key));
+      throw new Error('logger unavailable');
+    });
+    const dispatch = vi.fn(() => ({}));
+    const tagRound = vi.fn();
+    const out = tick(history, [7012], { isPidAlive: () => false, log, dispatch, tagRound });
+    expect(deletedBeforeLog).toEqual([true]);
+    expect(out.endedNoVerdict).toHaveLength(1);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(tagRound).toHaveBeenCalledWith(expect.objectContaining({ pr: 7012, round: 1 }));
+    expect(history.lastDispatched.has(key)).toBe(false);
+    expect(tick(history, [7012], { isPidAlive: () => false, log }).endedNoVerdict).toBeUndefined();
+    expect(log).toHaveBeenCalledTimes(1);
   });
 });
 
