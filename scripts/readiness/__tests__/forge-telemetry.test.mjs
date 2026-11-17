@@ -1,11 +1,40 @@
 // @vitest-environment node
 import {describe, it, expect} from 'vitest';
 import {execFile} from 'node:child_process';
-import {readForgeTelemetry} from '../forge-telemetry.mjs';
+import {readForgeTelemetry, main} from '../forge-telemetry.mjs';
 import {parseTelemetry, formatTelemetry, stableActiveRunIds} from '../forge-exec-run.mjs';
 
 const A = 'r-' + 'a'.repeat(32), B = 'r-' + 'b'.repeat(32);
 const base = {sampledAtET: '2026-11-03T15:00:00.000-05:00', cores: 4, loadPerCore: 0.5, memFreePct: 50, recent: []};
+describe('Forge failureTail telemetry', () => {
+  const recent={runId:A,startedAtET:base.sampledAtET,stageMs:{install:1234,run:0},code:97};
+  const sample=fields=>({...base,activeRuns:0,recent:[{...recent,...fields}]});
+  it.each([{}, {prewarmed:false}, {failureTail:'npm ci failed'}, {failureTail:'é'.repeat(1024),prewarmed:true}])
+  ('accepts legacy entries and optional bounded tails: %j', fields => {
+    const value=sample(fields);
+    expect(parseTelemetry(JSON.stringify(value))).toEqual(value);
+  });
+  it.each([
+    ['oversize ASCII', {failureTail:'x'.repeat(2049)}],
+    ['oversize UTF-8', {failureTail:'é'.repeat(1025)}],
+    ['non-string', {failureTail:42}], ['null', {failureTail:null}],
+    ['unknown key', {failureTail:'failed',extra:true}],
+    ['success', {failureTail:'failed',code:0}], ['running', {failureTail:'failed',code:null}],
+  ])('rejects %s with invalid telemetry schema', (_name,fields) => {
+    expect(()=>parseTelemetry(JSON.stringify(sample(fields)))).toThrow('Invalid telemetry schema');
+  });
+  it('preserves failureTail through the SSH reader and JSON formatter; strips controls in terminal output', async () => {
+    const value=sample({failureTail:'npm ci failed\nreason\x00'});
+    const read=()=>readForgeTelemetry({exec:(_cmd,_args,_options,callback)=>callback(null,JSON.stringify(value),'')});
+    expect(await read()).toEqual(value);
+    let output='';
+    await main(['--json'],{read,write:text=>{output=text;}});
+    expect(JSON.parse(output)).toEqual(value);
+    await main([],{read,write:text=>{output=text;}});
+    expect(output).toContain('\nfailureTail:\nnpm ci failed\nreason\n');
+    expect(output).not.toContain('\x00');
+  });
+});
 describe('Forge disk/prune telemetry wire schema', () => {
   it.each([
     {diskUsedPct: 100},

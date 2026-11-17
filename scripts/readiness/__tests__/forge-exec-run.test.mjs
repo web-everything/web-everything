@@ -348,6 +348,7 @@ if (process.argv[2] !== 'ci') {
 }
 `,{mode:0o755});
     expect(await runner.run(request)).toMatchObject({code:0,stdout:'é😀',stderr:'é😀'});
+    expect((await runner.telemetry()).recent[0]).not.toHaveProperty('failureTail');
   });
   it('refuses an overlapping run and rechecks its input after the first worker substitutes its assertions', async () => {
     const other = createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin'});
@@ -453,6 +454,31 @@ process.stdout.write('x'.repeat(4*1024*1024+1));
     expect((await runner.run(request)).code).toBe(97);
     expect(await runner.finish(request)).toMatchObject({phase:'install',code:97});
     await expect(stat(join(work,'task-seen'))).rejects.toThrow();
+  });
+  it.each([
+    ['last 20 stderr lines', Array.from({length:30},(_,i)=>`install line ${i+1}`).join('\n')+'\n',
+      Array.from({length:20},(_,i)=>`install line ${i+11}`).join('\n')],
+    ['UTF-8 byte cap keeps newest output', '😀'.repeat(600)+'END\n', '😀'.repeat(511)+'END'],
+    ['control characters removed without redaction', 'old\n\x00\x07\t\x1bsecret=value\x7f\x85\r\n', 'npm ci failed: old\nsecret=value'],
+  ])('publishes install exit 97 failureTail: %s', async (_name,stderr,expected) => {
+    await writeFile(join(root,'bin','npm'),`#!${process.execPath}\nprocess.stderr.write(${JSON.stringify(stderr)}); process.exitCode=1;\n`,{mode:0o755});
+    expect((await runner.run(request)).code).toBe(97);
+    const recent=(await runner.telemetry()).recent[0];
+    expect(recent).toMatchObject({code:97,failureTail:expected});
+    expect(Buffer.byteLength(recent.failureTail)).toBeLessThanOrEqual(2048);
+    const receipt=await runner.finish(request);
+    expect(receipt).toMatchObject({phase:'install',code:97});
+    expect(receipt).not.toHaveProperty('failureTail');
+  });
+  it('publishes supervisor exit 254 failureTail', async () => {
+    let calls=0;
+    runner=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',testWorkerExec:async()=>{
+      if(++calls===2) throw new Error('supervisor diagnostic\x00');
+      return {code:0,stdout:'',stderr:''};
+    }});
+    expect((await runner.run(request)).code).toBe(254);
+    expect((await runner.telemetry()).recent[0]).toMatchObject({code:254,failureTail:'supervisor diagnostic'});
+    expect(await runner.finish(request)).toMatchObject({phase:'supervisor',code:254});
   });
   it('does not reuse labels, rejects invalid run names, and consumes prepared state once', async () => {
     const other = await runner.prepare({nonce:request.nonce,label:'abcdef-1'});
