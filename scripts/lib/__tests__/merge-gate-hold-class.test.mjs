@@ -117,6 +117,13 @@ describe('all matching PR tables fail closed', () => {
       expect(read(log).mainCiGreen).toBe(false);
     }
   });
+  it('rejects a late row with an unknown status word (red-team break)', () => {
+    for (const late of ['  unknown           codeql                 security check failed', ' unknown codeql failed', 'FAILED codeql']) {
+      const log = `${review}${footer}\n${late}`;
+      expect(read(log).error).toMatch(/after the merge-gate footer/);
+      expect(excuse(log)).toEqual({ rows: [row], excused: false });
+    }
+  });
   it('rejects late rows even when another PR header sits between the table and the footer', () => {
     const other = table(8, 'HOLD', { 'review-acceptance': ['hold', 'human-only: y'] });
     const late = '  hold              codeql                 security check failed';

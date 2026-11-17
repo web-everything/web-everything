@@ -74,7 +74,7 @@ export function parsePrResultTable(log, prNumber) {
           for (let k = j + 1; k < lines.length && !/^#\d+:/.test(lines[k]); k++) {
             // Truncated or malformed rows count too: a status word first, or a status plus a gate id anywhere.
             const words = lines[k].trim().split(/\s+/).filter(Boolean);
-            if (words.length && (statuses.has(words[0]) || (words.some(w => statuses.has(w)) && words.some(w => gates.has(w))))) {
+            if (words.length && (statuses.has(words[0]) || words.some(w => gates.has(w)))) {
               return { error: 'verdict rows after the merge-gate footer' };
             }
           }
@@ -111,7 +111,7 @@ export function parsePrResultTable(log, prNumber) {
     const footerAt = lines.findIndex((line, i) => i > start && /^merge-gate:/.test(line));
     for (const line of lines.slice(footerAt + 1)) {
       const words = line.trim().split(/\s+/).filter(Boolean);
-      if (words.length && (statuses.has(words[0]) || (words.some(w => statuses.has(w)) && words.some(w => gates.has(w))))) {
+      if (words.length && (statuses.has(words[0]) || words.some(w => gates.has(w)))) {
         return { error: 'verdict rows after the merge-gate footer' };
       }
     }
