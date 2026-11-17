@@ -1,17 +1,3 @@
-// BEGIN generated no-prompt runtime: scripts/lib/no-prompt-command-rules.mjs
-const NO_PROMPT_COMMAND_RULES = "<!-- no-prompt-command-rules:begin -->\n## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting.\n- Never run destructive history or working-tree resets, forced pushes, or cleans.\n- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`.\n<!-- no-prompt-command-rules:end -->";
-function assertBriefTaskContent(task) {
-  if (typeof task !== 'string') throw new TypeError('no-prompt rules require a string brief');
-  if (!task.trim()) throw new Error('empty task content — refusing an empty or whitespace-only task');
-  return task;
-}
-function renderNoPromptCommandRules(task) {
-  assertBriefTaskContent(task);
-  return `${NO_PROMPT_COMMAND_RULES}\n\n${task}`;
-}
-// END generated no-prompt runtime
-
-
 /**
  * review-parked-prs.mjs — encode the drain's PARKED-PR review loop as a Workflow-harness script (#2437,
  * slice of epic #2418), now running the REAL editor↔reviewer CONVERGENCE loop (#2639, the heaviest slice of
@@ -592,7 +578,7 @@ const EDITOR_SCHEMA = {
 function rigorPrompt(item, escalationReason) {
   const flag = repoPathFlag(item.repo);
   const where = flag ? `the checkout at ${REPOS[item.repo].path}` : 'this checkout (your cwd)';
-  return renderNoPromptCommandRules([
+  return [
     RETURN_HYGIENE,
     '',
     `Compute the advisory panel RIGOR for drain-parked PR #${item.pr} (repo id: ${item.repo}) from its escalation`,
@@ -605,13 +591,13 @@ function rigorPrompt(item, escalationReason) {
     '`rounds` is the SHARED panel dial. `editorEnabled` / `editorRounds` are the #2908 EDITOR knob — whether the',
     'editor may push at this band, and the round cap that buys. COPY all five values verbatim from the command\'s',
     'output; derive NOTHING yourself. Return ONLY the structured object.',
-  ].join('\n'));
+  ].join('\n');
 }
 
 /** The DISCOVER prompt — enumerate the review:pending parked PRs across the constellation repos, with labels. */
 function discoverPrompt() {
   const repoList = Object.keys(REPOS).map((id) => ({ id, slug: REPOS[id].slug, path: REPOS[id].path || '(this cwd)' }));
-  return renderNoPromptCommandRules([
+  return [
     RETURN_HYGIENE,
     '',
     'You are the DISCOVER step of the review-parked-prs workflow. Produce the list of PARKED pull requests to',
@@ -625,14 +611,14 @@ function discoverPrompt() {
     'Return { prs: [{ pr, repo, labels }] } — `repo` is the constellation id (we | frontierui | plateau-app),',
     '`labels` the PR\'s CURRENT label-name strings. Include EVERY review:pending PR you found (do NOT pre-filter',
     'review:human — the workflow filters it deterministically). Return ONLY the structured object.',
-  ].join('\n'));
+  ].join('\n');
 }
 
 /** The LABEL-FETCH prompt (explicit-args path) — re-fetch the CURRENT labels for caller-named PRs so the
  *  review:human guard NEVER trusts caller-supplied/absent labels (INVARIANT 2 holds on every path). */
 function labelFetchPrompt(prs) {
   const repoList = Object.keys(REPOS).map((id) => ({ id, slug: REPOS[id].slug, path: REPOS[id].path || '(this cwd)' }));
-  return renderNoPromptCommandRules([
+  return [
     RETURN_HYGIENE,
     '',
     'Fetch the CURRENT GitHub labels for these explicitly-named parked PRs so the workflow can enforce the',
@@ -647,7 +633,7 @@ function labelFetchPrompt(prs) {
     '',
     'Return { prs: [{ pr, repo, labels }] } with the CURRENT label names for each PR you could read. Return',
     'ONLY the structured object.',
-  ].join('\n'));
+  ].join('\n');
 }
 
 /** The single per-PR FETCH prompt — one read-only fetch of the diff + escalation reason all four lenses share.
@@ -659,7 +645,7 @@ function fetchPrompt(pr, repo, round = 1) {
   const roundNote = round > 1
     ? `This is round ${round} — an editor pushed a revision to this PR branch, so fetch its CURRENT (revised) diff. `
     : '';
-  return renderNoPromptCommandRules([
+  return [
     RETURN_HYGIENE,
     '',
     `Fetch the review bundle for drain-parked PR #${pr} (repo id: ${repo}) — a SINGLE read-only fetch that the`,
@@ -681,7 +667,7 @@ function fetchPrompt(pr, repo, round = 1) {
     'still describes the PR\'s current head. Do NOT invent or shorten it; if the field is absent, return "".',
     'If the entry has an `error` field (the PR could not be read), return { pr, diff: "", diffBasis: "three-dot", error: <that message> }.',
     'Do NOT `git checkout`/`switch` to the PR branch. Return ONLY { pr, diff, diffBasis, title, headSha, escalationReason, error? }.',
-  ].join('\n'));
+  ].join('\n');
 }
 
 /** ONE lens reviewer's prompt — judges the SHARED diff snapshot (no fetch); gets its mandate from the CLI. When
@@ -698,7 +684,7 @@ function lensPrompt(pr, repo, lens, diff, escalationReason, title, round = 1, ju
   const roundFraming = round > 1
     ? `This is negotiation round ${round}: an editor already revised this diff to address a prior round's findings. Judge the CURRENT diff below FRESH — do not assume the earlier findings were or were not fixed; report what the diff shows NOW.`
     : '';
-  return renderNoPromptCommandRules([
+  return [
     RETURN_HYGIENE,
     '',
     `You are the ${lens} reviewer on the review panel for drain-parked PR #${pr} (repo ${repo})${title ? ` — ${title}` : ''}.`,
@@ -737,7 +723,7 @@ function lensPrompt(pr, repo, lens, diff, escalationReason, title, round = 1, ju
     `finding include impactIfUnfixed (exactly one of: ${IMPACT_LEVEL_VALUES.join(', ')}) + rootCause + prevention +`,
     'preventionCaptured. Return an EMPTY findings array if the diff survives scrutiny (do not pad with nitpicks).',
     'Return ONLY the structured object.',
-  ].join('\n'));
+  ].join('\n');
 }
 
 /** The INVITE prompt (#2640) — shell the shared review core to turn a grounded juror invite into the jury-growth
@@ -754,7 +740,7 @@ function invitePrompt(item, careLevel, seatedLenses, jurorsPerLens, invite) {
     invitedLens: invite.lens,
     citedFinding: invite.citedFinding,
   };
-  return renderNoPromptCommandRules([
+  return [
     RETURN_HYGIENE,
     '',
     `A juror on the review panel for drain-parked PR #${item.pr} (repo id: ${item.repo}) invited the "${invite.lens}"`,
@@ -773,7 +759,7 @@ function invitePrompt(item, careLevel, seatedLenses, jurorsPerLens, invite) {
     '```json',
     JSON.stringify(payload, null, 2),
     '```',
-  ].join('\n'));
+  ].join('\n');
 }
 
 /** The REDUCE prompt — shell review-core-cli to derive per-lens verdicts, the panel verdict + disposition, the
@@ -784,7 +770,7 @@ function invitePrompt(item, careLevel, seatedLenses, jurorsPerLens, invite) {
  *  hand-rolled. The step also returns the FLATTENED outstanding findings so the editor round revises against them. */
 function reducePrompt(pr, repo, okLenses, failedLenses, escalationReason, humanRequired, round, roundCap) {
   const slug = slugFor(repo);
-  return renderNoPromptCommandRules([
+  return [
     RETURN_HYGIENE,
     '',
     `Reduce round ${round} of the review panel for parked PR #${pr} (repo ${repo}) to a verdict + disposition +`,
@@ -825,7 +811,7 @@ function reducePrompt(pr, repo, okLenses, failedLenses, escalationReason, humanR
     'Return { verdict: <step-4 panel verdict>, outcome: <step-4 outcome>, disposition: <step-4 disposition or',
     'null>, lensVerdicts: <the step-1 lensVerdicts map — every lens, with "unknown" for any that failed to run>,',
     'findings: <the step-2 flattened findings array>, commentBody: <step 5> }. Return ONLY the structured object.',
-  ].join('\n'));
+  ].join('\n');
 }
 
 /** The EDITOR prompt (#2311/#2639) — the negotiation round's revising half. Gets its mandate from the shared core
@@ -836,7 +822,7 @@ function reducePrompt(pr, repo, okLenses, failedLenses, escalationReason, humanR
 function editorPrompt(pr, repo, findings, round, roundCap) {
   const slug = slugFor(repo);
   const where = repoPathFlag(repo) ? `the checkout at ${REPOS[repo].path}` : 'this checkout (your cwd)';
-  return renderNoPromptCommandRules([
+  return [
     RETURN_HYGIENE,
     '',
     `You are the EDITOR in round ${round}/${roundCap} of the bounded editor↔reviewer negotiation over drain-parked`,
@@ -869,7 +855,7 @@ function editorPrompt(pr, repo, findings, round, roundCap) {
     'finding you fixed>], dismissed: [{ summary, reason }], error?: <set if you could not clone/revise/push> }.',
     'If you could not push (clone failed, no write access, an unrecoverable conflict), set pushed:false and error.',
     'Return ONLY the structured object.',
-  ].join('\n'));
+  ].join('\n');
 }
 
 /**
@@ -922,7 +908,7 @@ async function careRigorFor(item, escalationReason) {
   // Door 4 — the LOCAL, echo-independent half of the derivation, computed BEFORE the agent runs so nothing the
   // agent returns can influence it. `false` here means review-only no matter what comes back.
   const reasonsAllowEditor = editorAllowedByReasons(escalationReason);
-  const r = await agent(renderNoPromptCommandRules(rigorPrompt(item, escalationReason)), { label: `rigor:${prTag(item)}`, phase: 'Converge', schema: RIGOR_SCHEMA }).catch(() => null);
+  const r = await agent(rigorPrompt(item, escalationReason), { label: `rigor:${prTag(item)}`, phase: 'Converge', schema: RIGOR_SCHEMA }).catch(() => null);
   const jurorsPerLens = (r && Number.isFinite(Number(r.jurorsPerLens)) && Number(r.jurorsPerLens) >= 1) ? Math.floor(Number(r.jurorsPerLens)) : 1;
   // Door 2 — a band we do not recognize is UNRESOLVED (`null`), not `'low'`. `null` can never satisfy the gate.
   const echoedLevel = (r && typeof r.careLevel === 'string') ? r.careLevel.trim() : '';
@@ -988,7 +974,7 @@ async function runPanelRound(pr, repo, diff, escalationReason, title, round, act
   const invites = [];
   const lensResults = await parallel(activeLenses.map((lens) => () =>
     parallel(Array.from({ length: jurorsPerLens }, (_unused, juror) => () =>
-      agent(renderNoPromptCommandRules(lensPrompt(pr, repo, lens, diff, escalationReason, title, round, juror, jurorsPerLens, diffBasis)), { label: `panel:${repo}#${pr}:r${round}:${lens}${jurorsPerLens > 1 ? `#${juror + 1}` : ''}`, phase: 'Converge', schema: LENS_SCHEMA })
+      agent(lensPrompt(pr, repo, lens, diff, escalationReason, title, round, juror, jurorsPerLens, diffBasis), { label: `panel:${repo}#${pr}:r${round}:${lens}${jurorsPerLens > 1 ? `#${juror + 1}` : ''}`, phase: 'Converge', schema: LENS_SCHEMA })
         .then((r) => {
           // #2640 — collect a grounded invite (cite the finding, guardrail 1); the loop applies at most one per round.
           if (r && r.invite && typeof r.invite === 'object' && r.invite.lens && r.invite.citedFinding) {
@@ -1025,7 +1011,7 @@ async function runPanelRound(pr, repo, diff, escalationReason, title, round, act
  *  here from state the attacker does not control. Returns the normalized delta, or null if the agent could not run
  *  (the caller then falls through to a normal editor round). */
 async function applyJurorInvite(item, careLevel, seatedLenses, jurorsPerLens, invite) {
-  const r = await agent(renderNoPromptCommandRules(invitePrompt(item, careLevel, seatedLenses, jurorsPerLens, invite)), { label: `invite:${prTag(item)}`, phase: 'Converge', schema: INVITE_SCHEMA }).catch(() => null);
+  const r = await agent(invitePrompt(item, careLevel, seatedLenses, jurorsPerLens, invite), { label: `invite:${prTag(item)}`, phase: 'Converge', schema: INVITE_SCHEMA }).catch(() => null);
   if (!r) return null;
   // Re-derive the roster as a GROW-ONLY union from KNOWN loop inputs — never the echoed seatedLenses verbatim. The
   // current roster is always ⊆ the result, so no lens (least of all a mandatory one) can be dropped by the echo.
@@ -1080,7 +1066,7 @@ async function reducePanelRound(pr, repo, lensResults, escalationReason, fetchOk
   }
 
   const okLenses = lensResults.filter((r) => r.ok).map((r) => ({ lens: r.lens, findings: r.findings }));
-  const r = await agent(renderNoPromptCommandRules(reducePrompt(pr, repo, okLenses, failedLenses, escalationReason, degrade, round, roundCap)), { label: `reduce:${repo}#${pr}:r${round}`, phase: 'Converge', schema: VERDICT_SCHEMA }).catch(() => null);
+  const r = await agent(reducePrompt(pr, repo, okLenses, failedLenses, escalationReason, degrade, round, roundCap), { label: `reduce:${repo}#${pr}:r${round}`, phase: 'Converge', schema: VERDICT_SCHEMA }).catch(() => null);
 
   let verdict = (r && r.verdict) || (degrade ? 'needs-human' : 'unknown');
   let outcome = (r && r.outcome) || null;
@@ -1108,7 +1094,7 @@ async function reducePanelRound(pr, repo, lensResults, escalationReason, fetchOk
  *  the SAME PR branch. Returns whether it pushed + the fixed/dismissed audit trail. A failure to push (`pushed`
  *  false / an error) means the diff could not advance — the loop treats that as a deadlock (escalate). */
 async function editorRound(pr, repo, findings, round, roundCap) {
-  const r = await agent(renderNoPromptCommandRules(editorPrompt(pr, repo, findings, round, roundCap)), { label: `editor:${repo}#${pr}:r${round}`, phase: 'Converge', schema: EDITOR_SCHEMA }).catch(() => null);
+  const r = await agent(editorPrompt(pr, repo, findings, round, roundCap), { label: `editor:${repo}#${pr}:r${round}`, phase: 'Converge', schema: EDITOR_SCHEMA }).catch(() => null);
   const pushed = !!(r && r.pushed === true && !r.error);
   const fixed = (r && Array.isArray(r.fixed)) ? r.fixed : [];
   const dismissed = (r && Array.isArray(r.dismissed)) ? r.dismissed : [];
@@ -1141,7 +1127,7 @@ const RECORD_SCHEMA = {
  *  PR-finding text, so the agent WRITES it to a file and passes --file — never echoes it through the shell
  *  (the #2336/#2640 untrusted-text pattern). */
 function recordPrompt(subject, state) {
-  return renderNoPromptCommandRules([
+  return [
     RETURN_HYGIENE,
     '',
     `Persist the jury ledger for review subject "${subject}" to the durable append-only log. The state below is`,
@@ -1158,7 +1144,7 @@ function recordPrompt(subject, state) {
     '```json',
     JSON.stringify(state, null, 2),
     '```',
-  ].join('\n'));
+  ].join('\n');
 }
 
 /** #2641 — record ONE PR's jury ledger to the durable log (BEST-EFFORT observability; NEVER gates the workflow's
@@ -1167,7 +1153,7 @@ function recordPrompt(subject, state) {
  *  durable log its mirror. */
 async function recordJuryLedger(item, state) {
   const subject = prTag(item);
-  const r = await agent(renderNoPromptCommandRules(recordPrompt(subject, state)), { label: `record:${subject}`, phase: 'Converge', schema: RECORD_SCHEMA }).catch(() => null);
+  const r = await agent(recordPrompt(subject, state), { label: `record:${subject}`, phase: 'Converge', schema: RECORD_SCHEMA }).catch(() => null);
   if (r && Number.isFinite(r.appended)) {
     log(`  ${subject}: recorded ${r.appended} jury-ledger event(s) to the durable log${r.rejected && r.rejected.length ? ` (${r.rejected.length} rejected)` : ''}.`);
   } else {
@@ -1187,7 +1173,7 @@ async function convergePr(item) {
   const { pr, repo } = item;
 
   // ONE fetch + rigor dial up front (round 1's diff; re-fetched each subsequent round after an editor push).
-  let fetched = await agent(renderNoPromptCommandRules(fetchPrompt(pr, repo, 1)), { label: `fetch:${prTag(item)}:r1`, phase: 'Converge', schema: FETCH_SCHEMA }).catch(() => null);
+  let fetched = await agent(fetchPrompt(pr, repo, 1), { label: `fetch:${prTag(item)}:r1`, phase: 'Converge', schema: FETCH_SCHEMA }).catch(() => null);
   let diff = (fetched && typeof fetched.diff === 'string') ? fetched.diff : '';
   const title = (fetched && fetched.title) ? String(fetched.title) : '';
   const escalationReason = (fetched && Array.isArray(fetched.escalationReason)) ? fetched.escalationReason : [];
@@ -1302,7 +1288,7 @@ async function convergePr(item) {
           break;
         }
         // Re-fetch the CURRENT diff (no editor this pass — the grown jury re-judges the same code) and re-review.
-        fetched = await agent(renderNoPromptCommandRules(fetchPrompt(pr, repo, round)), { label: `fetch:${prTag(item)}:r${round}`, phase: 'Converge', schema: FETCH_SCHEMA }).catch(() => null);
+        fetched = await agent(fetchPrompt(pr, repo, round), { label: `fetch:${prTag(item)}:r${round}`, phase: 'Converge', schema: FETCH_SCHEMA }).catch(() => null);
         diff = (fetched && typeof fetched.diff === 'string') ? fetched.diff : diff;
         headSha = shaOf(fetched); // #2864 — the grown jury re-judges at whatever head this re-fetch read.
         diffBasis = basisOf(fetched);
@@ -1348,7 +1334,7 @@ async function convergePr(item) {
 
     round += 1;
     // Re-fetch the CURRENT (revised) diff for the next round's re-review.
-    fetched = await agent(renderNoPromptCommandRules(fetchPrompt(pr, repo, round)), { label: `fetch:${prTag(item)}:r${round}`, phase: 'Converge', schema: FETCH_SCHEMA }).catch(() => null);
+    fetched = await agent(fetchPrompt(pr, repo, round), { label: `fetch:${prTag(item)}:r${round}`, phase: 'Converge', schema: FETCH_SCHEMA }).catch(() => null);
     diff = (fetched && typeof fetched.diff === 'string') ? fetched.diff : diff;
     headSha = shaOf(fetched); // #2864 — the editor pushed, so the next round judges (and records) a NEW head.
     diffBasis = basisOf(fetched);
@@ -1402,11 +1388,11 @@ const provided = normalizeParkedInput(args);
 let parked;
 if (provided.length) {
   log(`Given ${provided.length} PR(s) explicitly: ${provided.map(prTag).join(', ')} — re-fetching their CURRENT labels to enforce the review:human guard (caller-supplied labels are never trusted).`);
-  const fetchedLabels = await agent(renderNoPromptCommandRules(labelFetchPrompt(provided)), { label: 'labels:explicit', phase: 'Discover', schema: DISCOVER_SCHEMA }).catch(() => null);
+  const fetchedLabels = await agent(labelFetchPrompt(provided), { label: 'labels:explicit', phase: 'Discover', schema: DISCOVER_SCHEMA }).catch(() => null);
   parked = normalizeParkedInput({ prs: (fetchedLabels && Array.isArray(fetchedLabels.prs)) ? fetchedLabels.prs : [] });
 } else {
   log('No PRs given — discovering the review:pending parked PRs across the constellation repos.');
-  const disc = await agent(renderNoPromptCommandRules(discoverPrompt()), { label: 'discover:parked', phase: 'Discover', schema: DISCOVER_SCHEMA }).catch(() => null);
+  const disc = await agent(discoverPrompt(), { label: 'discover:parked', phase: 'Discover', schema: DISCOVER_SCHEMA }).catch(() => null);
   parked = normalizeParkedInput({ prs: (disc && Array.isArray(disc.prs)) ? disc.prs : [] });
 }
 

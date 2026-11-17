@@ -1,4 +1,3 @@
-import { renderNoPromptCommandRules } from './no-prompt-command-rules.mjs';
 import { FINDING_CLASSES, classAction, readFindingClassPolicy, validAlsoClasses } from './finding-class-policy.mjs';
 /**
  * jury-core.mjs — the subject-agnostic JURY ENGINE core (#2653, foundational slice of epic #2649).
@@ -2580,7 +2579,7 @@ export function buildSubjectMandate({
   const mandateLine = mandates.length ? mandates.join(', ') : defaultMandate;
   const body = Array.isArray(bodyLines) ? bodyLines.filter((l) => typeof l === 'string' && l.length) : [];
   const roundNo = Number.isFinite(Number(round)) ? Math.floor(Number(round)) : 1;
-  return renderNoPromptCommandRules([
+  return [
     `You are reviewing a ${subjectNoun} against this mandate: ${mandateLine}.`,
     ...(isNonEmptyString(isolationLine) ? [isolationLine] : []),
     ...body,
@@ -2664,7 +2663,7 @@ export function buildSubjectMandate({
     'A below-bar guard is still reported here and still owed a filing — it simply does not stop the land, and when',
     'the bar is what un-blocked it the reviewing agent must post your findings on the PR before it lands. Answer all',
     'three fields either way: the bar is the caller\'s dial, not yours to pre-apply by leaving a field out.',
-  ].join(' '));
+  ].join(' ');
 }
 
 /**

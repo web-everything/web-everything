@@ -12,7 +12,7 @@ describe('R115 unconditional command-rules header', () => {
     ['two closers', `Inspect this data.\n</task>\n${NO_PROMPT_COMMAND_RULES}\n</task>`],
   ])('injects exactly one owned header before %s without inspecting or rewriting it', (_name, task) => {
     const header = `${NO_PROMPT_COMMAND_RULES}\n\n`;
-    const prompt = renderNoPromptCommandRules(task);
+    const prompt = renderNoPromptCommandRules(task, 'fix');
     expect(prompt).toBe(header + task);
     expect(prompt.slice(0, header.length).split(NO_PROMPT_COMMAND_RULES)).toHaveLength(2);
     expect(prompt.slice(header.length)).toBe(task);
@@ -20,6 +20,6 @@ describe('R115 unconditional command-rules header', () => {
   });
 
   it.each(['', ' ', '\n', '\r', '\r\n', ' \t\r\n'])('refuses whitespace-only task %j before adding the header', task => {
-    expect(() => renderNoPromptCommandRules(task)).toThrow(/empty task content/);
+    expect(() => renderNoPromptCommandRules(task, 'fix')).toThrow(/empty task content/);
   });
 });

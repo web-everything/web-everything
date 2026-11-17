@@ -1,4 +1,3 @@
-import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 /** Advisory only: a stale finding remains pending until the operator rules. */
 import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
@@ -102,7 +101,7 @@ export async function reverifyStaleReferrals({ repo, prNumber, head, pending = [
       if (!section || section.length > 100_000) throw new Error('cited file diff unavailable or oversized');
       const outcome = await codexJudgeSpawn({
         repo, pr: prNumber, lens: 'referral-reverify', timeoutMs: 120_000, shape,
-        mandate: renderNoPromptCommandRules(`Re-check exactly one finding at its cited file:line on the supplied current-head diff. Read only; do not edit, post, or rule. Return reproduces=false only with concrete file:line evidence explaining why the defect no longer reproduces. Unknown or incomplete evidence means reproduces=true. Do not investigate other findings.\n${FENCED_DATA_RULE}`),
+        mandate: `Re-check exactly one finding at its cited file:line on the supplied current-head diff. Read only; do not edit, post, or rule. Return reproduces=false only with concrete file:line evidence explaining why the defect no longer reproduces. Unknown or incomplete evidence means reproduces=true. Do not investigate other findings.\n${FENCED_DATA_RULE}`,
         input: [fenceUntrusted('findings', JSON.stringify(finding)),
           fenceUntrusted('material', JSON.stringify({ repo, prNumber, head }) + '\n' + section)].join('\n\n'),
       });

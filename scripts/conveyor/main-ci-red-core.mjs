@@ -1,4 +1,3 @@
-import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 /**
  * @file scripts/conveyor/main-ci-red-core.mjs
  * @description Card xu1nixv — "a red main gets an owner". The PURE rules (no fs, no clock, no gh, no spawn).
@@ -622,7 +621,7 @@ export function buildOwnerBrief({ state, failing = {}, weRoot, repoSlug, setting
     `failing jobs: ${(failing.jobs || []).join(', ') || 'unknown'}`,
     ...(failing.tests || []).slice(0, 8).map((t) => `failing test: ${t}`),
   ].join('\n');
-  return renderNoPromptCommandRules([
+  return [
     `# Fix red main (${repoSlug}) — owner for first red commit ${sha9}`,
     '',
     `Main's CI workflow has been red since commit ${sha9}. You are its ONE owner. Make main green with a ready PR.`,
@@ -651,7 +650,7 @@ export function buildOwnerBrief({ state, failing = {}, weRoot, repoSlug, setting
     `Policy: ${formatMainFixPushPolicyLine(policy).replace(/^main-fix-push-policy: /, '')}.`,
     '',
     `Report in at most 8 lines: the cause, the PR number, and the tests that now pass.`,
-  ].join('\n'));
+  ].join('\n');
 }
 
 /**
@@ -730,7 +729,7 @@ export function buildCombineBrief({ deadlock, weRoot, repoSlug, firstRedSha }) {
     `jobs each PR fails only because of the other's cause: ${deadlock.jobs.join(', ')}`,
     `first red commit: ${firstRedSha ?? 'unknown'}`,
   ].join('\n');
-  return renderNoPromptCommandRules([
+  return [
     `# Combine the red-main fix PRs into #${carrier} (${repoSlug})`,
     '',
     'Main is red with several causes, and each fix PR fails CI on a cause another fix PR fixes, so none can land. Make ONE PR carry every fix.',
@@ -748,7 +747,7 @@ export function buildCombineBrief({ deadlock, weRoot, repoSlug, firstRedSha }) {
     '5. Never delete, skip or loosen a test or a merge-gate guard. Release the lane.',
     '',
     'Report in at most 6 lines: what merged, the tests that pass, the carrier PR.',
-  ].join('\n'));
+  ].join('\n');
 }
 
 /**

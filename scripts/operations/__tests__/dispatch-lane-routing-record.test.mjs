@@ -1,5 +1,3 @@
-import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
-const COMMAND_RULES_PREFIX = `${NO_PROMPT_COMMAND_RULES}\n\n`;
 /**
  * @file dispatch-lane-routing-record.test.mjs — #3717/#3906: the provider is COMPUTED before the spawn (never
  *   guessed from a brief sentence), both halves of the decision (routed vs executed) land in the durable run
@@ -635,7 +633,7 @@ describe('(e) buildAgentArgv with a table, and resolveWorkerModel\'s own shape',
 
   it('a resume retains its model even when no fresh model resolves', () => {
     expect(buildAgentArgv({ payload, table: { model: null }, resumeSessionId: 'existing' }))
-      .toEqual(['--bg', '--resume', 'existing', (COMMAND_RULES_PREFIX + (payload.prompt))]);
+      .toEqual(['--bg', '--resume', 'existing', payload.prompt]);
   });
 
   it('normalizes repeated explicit choices to one model without changing the last choice', () => {
@@ -692,7 +690,7 @@ describe('(e) buildAgentArgv with a table, and resolveWorkerModel\'s own shape',
     expect(argv).toEqual([
       '--bg', '-n', 'conveyor-9001',
       '--settings', JSON.stringify({ env: { WE_CONVEYOR_WORKER: '1' } }),
-      '--effort', 'high', '--model', 'opus', `${COMMAND_RULES_PREFIX}# build #9001`,
+      '--effort', 'high', '--model', 'opus', '# build #9001',
     ]);
   });
 

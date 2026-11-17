@@ -1,4 +1,3 @@
-import { renderNoPromptCommandRules } from './no-prompt-command-rules.mjs';
 /**
  * decision-prose-adapter.mjs — the DECISION-PROSE subject adapter (#2657, S5 of epic #2649).
  *
@@ -121,7 +120,7 @@ export function decisionMethodsForLens(lens) {
  * @returns {string}
  */
 export function buildDecisionMandate({ approach = '', round = 1, roundCap = PLAN_ROUND_CAP } = {}) {
-  return renderNoPromptCommandRules(buildPlanCritiqueMandate({ approach, round, roundCap }));
+  return buildPlanCritiqueMandate({ approach, round, roundCap });
 }
 
 /**

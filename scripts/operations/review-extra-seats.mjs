@@ -1368,7 +1368,7 @@ export function buildRedTeamTask({ pr, repo, title, dir, diffFile, bodyFile, inl
     ? ['', 'Already raised by the reviewers (do NOT repeat these):', ...claudeFindings.slice(0, 20).map((f) => `- ${capText(f.summary, 300)}`)]
     : [];
   const example = { lenses: { [RED_TEAM_SEAT.key]: { verdict: 'accept', findings: [] } } };
-  return [
+  return renderNoPromptCommandRules([
     `You are the RED TEAM for pull request ${repo}#${pr}: ${JSON.stringify(String(title ?? ''))}.`,
     'Independent reviewers have ALREADY ACCEPTED this change. Your only job is to BREAK it: find a concrete failing input,',
     'a missed edge case, or a security hole in what this diff introduces or claims. Assume the reviewers were too trusting.',
@@ -1388,7 +1388,7 @@ export function buildRedTeamTask({ pr, repo, title, dir, diffFile, bodyFile, inl
     'where each findings entry is {"summary": string, "category": string, "file": (repo-relative path)|null, "line": integer|null, "impactIfUnfixed": string, "failure_scenario": string, "findingClass": string, "classBasis": string}',
     'Every finding must include all eight fields above; summary and impactIfUnfixed must be non-empty strings. category and failure_scenario must be strings, never null. Include only the requested seat keys under lenses.',
     'and verdict is "accept" (it holds) or "changes" (you broke it).',
-  ].filter((l) => l !== null && l !== undefined).join('\n');
+  ].filter((l) => l !== null && l !== undefined).join('\n'), 'red-team');
 }
 
 // Tool-bearing jurors read untrusted code without filesystem confinement. Never
@@ -1448,7 +1448,7 @@ export function buildRecheckRequest({ pr, repo, title, diffText, findings, reads
     capText(diffText, INLINE_DIFF_MAX),
     '=== END ===',
   ].join('\n');
-  return { mandate: renderNoPromptCommandRules(mandate), input, shape: RECHECK_SHAPE };
+  return { mandate: renderNoPromptCommandRules(mandate, 'red-team'), input, shape: RECHECK_SHAPE };
 }
 
 /** One policy for model-reported paths, including legacy rows at publication sinks.

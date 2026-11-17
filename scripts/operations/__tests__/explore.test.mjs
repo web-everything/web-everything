@@ -1,5 +1,3 @@
-import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
-const COMMAND_RULES_PREFIX = `${NO_PROMPT_COMMAND_RULES}\n\n`;
 /**
  * @file explore.test.mjs — the multi-agent committee investigation (#3150, under epic #3029).
  *
@@ -330,7 +328,7 @@ describe('#3150 clause 1 — a real committee run, end to end', () => {
     expect(prompt).toContain('/tmp/we-explore-test/run-explore-fixture/p1-sess1.md');
     expect(prompt).toContain(REPORT_END_MARKER);
     // The brief's SUBSTANCE is on the run record verbatim; only the destination line is added by the sink.
-    expect(prompt.startsWith(`${COMMAND_RULES_PREFIX}${COMMAND_RULES_PREFIX}You are panelist p1 of 3`)).toBe(true);
+    expect(prompt.startsWith('You are panelist p1 of 3')).toBe(true);
   });
 
   it('the synthesis judges the panel\'s REPORTS, tool-free, with the findings shape forced', async () => {

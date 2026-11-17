@@ -1,5 +1,3 @@
-import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
-const COMMAND_RULES_PREFIX = `${NO_PROMPT_COMMAND_RULES}\n\n`;
 /**
  * @file dispatch-lane-fixture-harness.test.mjs — the dispatcher fixture-root harness, ONE HOP FURTHER (#3446).
  *
@@ -300,7 +298,7 @@ describe('dispatch-lane fixture-root harness — REAL argv-building + guard logi
       expect(seen).not.toContain('--session-id');
       expect(result.handle).toBeTruthy();
       expect(seen[seen.indexOf('-n') + 1]).toBe(`conveyor-${NUM}`);
-      expect(seen[seen.length - 1]).toBe(COMMAND_RULES_PREFIX + read.prompt);
+      expect(seen[seen.length - 1]).toBe(read.prompt);
     } finally {
       kase.cleanup();
     }

@@ -1,4 +1,3 @@
-import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 /**
  * @file scripts/operations/explore.mjs
  * @description THE `explore` DECLARATION — the multi-agent committee investigation (#3150, under epic #3029).
@@ -305,7 +304,7 @@ export function buildPanelistBrief({ question, lens, panelist, panelSize } = {})
   if (!LENS_RE.test(String(lens ?? ''))) {
     throw new Error(`explore.plan: refusing to brief panelist ${panelist} with a malformed lens ${JSON.stringify(lens)}`);
   }
-  return renderNoPromptCommandRules([
+  return [
     `You are panelist ${panelist} of ${panelSize} on a blind investigation committee. Your lens is `
     + `\`${lens}\` — investigate the question below THROUGH THAT LENS and no other.`,
     'Work the question for real: read the code, run the commands, fetch the sources. Ground every claim in '
@@ -337,7 +336,7 @@ export function buildPanelistBrief({ question, lens, panelist, panelSize } = {})
     CODE_PATH_PREFIX_RULE,
     FENCED_DATA_RULE,
     fenceUntrusted('task', q),
-  ].join('\n\n'));
+  ].join('\n\n');
 }
 
 /**
@@ -354,7 +353,7 @@ export function buildPanelistBrief({ question, lens, panelist, panelSize } = {})
  * @returns {string}
  */
 export function buildSynthesisMandate({ question, lenses = [], filing = false } = {}) {
-  return renderNoPromptCommandRules([
+  return [
     `You are synthesizing a ${lenses.length}-panelist blind investigation committee. The panel ran these `
     + `lenses: ${lenses.join(', ')}. Each report below was written independently; no panelist saw another's.`,
     'Reduce them to ONE findings list. Merge findings the panel agrees on into a single entry and name who '
@@ -374,7 +373,7 @@ export function buildSynthesisMandate({ question, lenses = [], filing = false } 
     CODE_PATH_PREFIX_RULE,
     FENCED_DATA_RULE,
     fenceUntrusted('task', String(question ?? '')),
-  ].join('\n\n'));
+  ].join('\n\n');
 }
 
 /**

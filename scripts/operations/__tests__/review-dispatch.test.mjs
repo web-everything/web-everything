@@ -1,5 +1,3 @@
-import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
-const COMMAND_RULES_PREFIX = `${NO_PROMPT_COMMAND_RULES}\n\n`;
 import { readReviewCiGate } from '../../lib/review-ci-gate-io.mjs';
 /**
  * @file review-dispatch.test.mjs — `#3279`: dispatch an independent review to a fresh session.
@@ -154,9 +152,9 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
       '--append-system-prompt-file', REVIEW_DISPATCH_SYSTEM_PROMPT_FILE,
       '--effort', 'high', '--model', 'sonnet',
       ...DISALLOWED_TOOLS_ARGV,
-      (COMMAND_RULES_PREFIX + COMMAND_RULES_PREFIX + ('# brief for 1234 in web-everything/web-everything\n'
+      '# brief for 1234 in web-everything/web-everything\n'
       + 'acquire: node scripts/lane-pool.mjs acquire --session=review-1234\n'
-      + 'this brief documents {{LIKE_THIS}} as an example convention, not a real token')),
+      + 'this brief documents {{LIKE_THIS}} as an example convention, not a real token',
     ]);
 
     expect(result.sessionId).toBe('11111111-1111-4111-8111-111111111111');
@@ -266,9 +264,9 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
       '--effort', 'high', '--model', 'sonnet',
       ...DISALLOWED_TOOLS_ARGV,
       '--permission-mode', 'plan',
-      (COMMAND_RULES_PREFIX + COMMAND_RULES_PREFIX + ('# brief for 1234 in web-everything/web-everything\n'
+      '# brief for 1234 in web-everything/web-everything\n'
       + 'acquire: node scripts/lane-pool.mjs acquire --session=review-1234\n'
-      + 'this brief documents {{LIKE_THIS}} as an example convention, not a real token')),
+      + 'this brief documents {{LIKE_THIS}} as an example convention, not a real token',
     ]);
   });
 

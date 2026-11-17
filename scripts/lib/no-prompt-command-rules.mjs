@@ -1,6 +1,9 @@
 /** Shared command discipline for sessions running under the operator's Claude permissions.
- * Markdown briefs and sandbox workflows also carry generated copies of this block.
+ * Only the session kinds observed prompting the operator opt in; other sessions retain their own briefs.
  */
+/** Explicit scope: fixer, CI-heal, review-job and red-team sessions only. */
+export const NO_PROMPT_SESSION_KINDS = Object.freeze(['fix', 'ci-heal', 'review-job', 'red-team']);
+
 const NO_PROMPT_COMMAND_RULES_SENTINEL = '<!-- no-prompt-command-rules:begin -->';
 const NO_PROMPT_COMMAND_RULES_END = '<!-- no-prompt-command-rules:end -->';
 const NO_PROMPT_COMMAND_RULES_BODY = `## No-prompt command rules
@@ -20,7 +23,8 @@ export function assertBriefTaskContent(task) {
 }
 
 /** R115: the builder owns this fixed header; task text never controls its inclusion. */
-export function renderNoPromptCommandRules(task) {
+export function renderNoPromptCommandRules(task, sessionKind) {
+  if (!NO_PROMPT_SESSION_KINDS.includes(sessionKind)) return task;
   assertBriefTaskContent(task);
   return `${NO_PROMPT_COMMAND_RULES}\n\n${task}`;
 }

@@ -1,5 +1,3 @@
-import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
-const COMMAND_RULES_PREFIX = `${NO_PROMPT_COMMAND_RULES}\n\n`;
 import { reviewSeatOptionsForRun } from '../review-pr.mjs';
 import { ADVISORY_NOTE_MARKER, countAdvisoryComments } from '../../conveyor/advisory-round-count.mjs';
 import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
@@ -371,7 +369,7 @@ describe('the net basis', () => {
     const argv = buildJudgeArgv({ ...request, sessionId: deriveSessionId('t') });
     expect(argv).not.toContain('--bare');
     expect(argv).not.toContain('--dangerously-skip-permissions');
-    expect(argv.filter((a) => a === COMMAND_RULES_PREFIX + request.mandate)).toHaveLength(1); // one token: the whole mandate
+    expect(argv.filter((a) => a === request.mandate)).toHaveLength(1); // one token: the whole mandate
   });
 
   it('`shapeReadFinding` never lets `gh`\'s stat masquerade as the net list', () => {

@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import { renderNoPromptCommandRules } from '../../scripts/lib/no-prompt-command-rules.mjs';
 /**
  * panel-fanout.mjs — the panel shim the jury harness shells ONCE instead of fanning out N subagents (#3057,
  * under #3029).
@@ -176,7 +175,7 @@ export function jurorMandate({
   const methodLine = method
     ? `Your grounding method is "${method}" — ground your judgement in that evidence where you can; if the method is not callable in this run (e.g. a deferred visual-diff primitive), judge by inspection and SAY you could not run it.`
     : '';
-  return renderNoPromptCommandRules([
+  return [
     ...RETURN_HYGIENE,
     '',
     `You are the ${lens} juror on the jury reviewing a ${noun} for the "${subject}" subject.`,
@@ -196,7 +195,7 @@ export function jurorMandate({
     'worseThanBase, parallelizable. Omitting any of the three leaves the finding BLOCKING; they are the only way',
     'to route one to a carve-out. Return an EMPTY findings array if the subject survives your lens\'s scrutiny',
     '(do not pad with nitpicks).',
-  ].filter((l) => l !== '').join('\n'));
+  ].filter((l) => l !== '').join('\n');
 }
 
 /**

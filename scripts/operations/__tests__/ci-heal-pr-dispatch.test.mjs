@@ -236,7 +236,7 @@ describe('dispatchCiHeal (#3852)', () => {
   it('an item-less PR fills ITEM_NUM blank and reports itemNum null', async () => {
     const { calls, sinks } = recordingSink();
     const out = await dispatchCiHeal({ ...PLANNED, itemNum: null }, { readBrief: () => TEMPLATE, sinks });
-    expect(calls[0].prompt).toMatch(new RegExp(`^${NO_PROMPT_COMMAND_RULES.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n\\nheal # pr=743`));
+    expect(calls[0].prompt.startsWith(`${NO_PROMPT_COMMAND_RULES}\n\nheal # pr=743`)).toBe(true);
     expect(calls[0].num).toBeUndefined();
     expect(out.itemNum).toBeNull();
   });

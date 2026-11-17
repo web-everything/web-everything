@@ -1,5 +1,3 @@
-import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
-const COMMAND_RULES_PREFIX = `${NO_PROMPT_COMMAND_RULES}\n\n`;
 /**
  * @file scripts/conveyor/__tests__/fix-context-pack.test.mjs
  * @description The fixer context pack (fix.contextPack) and the proof-only tests rule (fix.localTests): the brief
@@ -107,15 +105,14 @@ describe('already-fixed red proof', () => {
 });
 
 describe('the brief with a context pack', () => {
-  it('both settings off = the shared header followed by the old brief, byte for byte', () => {
-    expect(applyContextPack(FIX_BRIEF, { settings: OFF, inputs: sampleInputs() })).toBe(COMMAND_RULES_PREFIX + FIX_BRIEF);
-    expect(applyContextPack(CI_BRIEF, { kind: 'ci-heal', settings: OFF, inputs: { checks: [{ name: 'test' }], files: FILES } })).toBe(COMMAND_RULES_PREFIX + CI_BRIEF);
+  it('both settings off = the old brief, byte for byte', () => {
+    expect(applyContextPack(FIX_BRIEF, { settings: OFF, inputs: sampleInputs() })).toBe(FIX_BRIEF);
+    expect(applyContextPack(CI_BRIEF, { kind: 'ci-heal', settings: OFF, inputs: { checks: [{ name: 'test' }], files: FILES } })).toBe(CI_BRIEF);
   });
 
   it('carries the finding verbatim, the code at the named line (±N), the changed files and the proof-only rule', () => {
     const out = applyContextPack(FIX_BRIEF, { settings: ON, inputs: sampleInputs() });
-    expect(out.startsWith(COMMAND_RULES_PREFIX)).toBe(true);
-    const pack = out.slice(COMMAND_RULES_PREFIX.length, out.indexOf('\n---\n'));
+    const pack = out.slice(0, out.indexOf('\n---\n'));
     expect(pack).toMatch(/^## Context pack — staged by the harness/);
     expect(pack).toContain('> 1. `scripts/conveyor/verify-gate-job.mjs:260` (judgeCorrectnessAdvisory) — A retry starts another gate');
     expect(pack).toContain('#### `scripts/conveyor/verify-gate-job.mjs:260` (±30 lines)');
@@ -134,11 +131,10 @@ describe('the brief with a context pack', () => {
       const out = applyContextPack(FIX_BRIEF, { settings: { ...ON, contextMaxBytes: maxBytes }, inputs: sampleInputs() });
       if (maxBytes === 1200) {
         // The mandatory proof rule exhausts this budget; preserve the full brief via the existing fallback.
-        expect(out).toBe(`${COMMAND_RULES_PREFIX}${localTestsSection('proof-only', 'fix')}\n\n${FIX_BRIEF}`);
+        expect(out).toBe(`${localTestsSection('proof-only', 'fix')}\n\n${FIX_BRIEF}`);
         continue;
       }
-      expect(out.startsWith(COMMAND_RULES_PREFIX)).toBe(true);
-      const pack = out.slice(COMMAND_RULES_PREFIX.length, out.indexOf('\n---\n'));
+      const pack = out.slice(0, out.indexOf('\n---\n'));
       expect(Buffer.byteLength(pack)).toBeLessThanOrEqual(maxBytes);
       expect(Buffer.byteLength(out)).toBeLessThan(Buffer.byteLength(FIX_BRIEF));
     }
@@ -169,8 +165,7 @@ describe('the brief with a context pack', () => {
     const inputs = { checks: [{ name: 'test', link: 'https://github.com/o/r/actions/runs/1/job/2' }], failedTests: extractFailedTests(log), logTail: log, files: FILES };
     expect(inputs.failedTests).toEqual(['FAIL  scripts/conveyor/__tests__/pr-stack.test.mjs > restack > keeps the base']);
     const out = applyContextPack(CI_BRIEF, { kind: 'ci-heal', settings: ON, inputs });
-    expect(out.startsWith(COMMAND_RULES_PREFIX)).toBe(true);
-    const pack = out.slice(COMMAND_RULES_PREFIX.length, out.indexOf('\n---\n'));
+    const pack = out.slice(0, out.indexOf('\n---\n'));
     expect(pack).toContain('- test — https://github.com/o/r/actions/runs/1/job/2');
     expect(pack).toContain('- FAIL  scripts/conveyor/__tests__/pr-stack.test.mjs > restack > keeps the base');
     expect(pack).toContain('AssertionError: expected 1 to be 2');
@@ -182,8 +177,8 @@ describe('the dispatch entry never fails a dispatch', () => {
   it('a reader that throws leaves the brief plus only the tests rule; a run under test with nothing injected is untouched', () => {
     const out = briefWithContextPack(FIX_BRIEF, { settings: ON, readInputs: () => { throw new Error('gh down'); } });
     expect(out.endsWith(FIX_BRIEF)).toBe(true);
-    expect(out.startsWith(`${COMMAND_RULES_PREFIX}${COMMAND_RULES_PREFIX}### Local tests — proof-only`)).toBe(true);
-    expect(briefWithContextPack(FIX_BRIEF, { repoSlug: 'o/r', pr: 1, exec: () => { throw new Error('no IO under test'); } })).toBe(COMMAND_RULES_PREFIX + FIX_BRIEF);
+    expect(out.startsWith('### Local tests — proof-only')).toBe(true);
+    expect(briefWithContextPack(FIX_BRIEF, { repoSlug: 'o/r', pr: 1, exec: () => { throw new Error('no IO under test'); } })).toBe(FIX_BRIEF);
   });
 
   it('reads the PR once (comments, files, head, labels) and each named file at the head', () => {

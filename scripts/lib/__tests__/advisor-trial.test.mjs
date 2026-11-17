@@ -1,5 +1,3 @@
-import { NO_PROMPT_COMMAND_RULES } from '../no-prompt-command-rules.mjs';
-const COMMAND_RULES_PREFIX = `${NO_PROMPT_COMMAND_RULES}\n\n`;
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -92,13 +90,13 @@ describe('advisor trial — flag building', () => {
     expect(withOff).toEqual(plain);
     const model = (argv) => argv[argv.indexOf('--model') + 1];
     expect(model(withOn)).toBe(model(plain));
-    expect(withOn.slice(-3)).toEqual(['--advisor', 'opus', `${COMMAND_RULES_PREFIX}fix PR #1\n\n${ADVISOR_BRIEF_LINE}\n`]);
+    expect(withOn.slice(-3)).toEqual(['--advisor', 'opus', `fix PR #1\n\n${ADVISOR_BRIEF_LINE}\n`]);
     expect(withOn.slice(0, -3)).toEqual(plain.slice(0, -1));
   });
 
   it('a resume stays a bare --bg --resume even when on', () => {
     expect(buildAgentArgv({ sessionId: 's', payload: { prompt: 'go' }, resumeSessionId: 'old', advisor: on }))
-      .toEqual(['--bg', '--resume', 'old', `${COMMAND_RULES_PREFIX}go`]);
+      .toEqual(['--bg', '--resume', 'old', 'go']);
   });
 });
 

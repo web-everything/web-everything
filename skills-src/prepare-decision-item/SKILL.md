@@ -274,14 +274,3 @@ land the `preparedDate` via the lane→PR; `resolve` is the *decision* turn's jo
 Prepare is the upstream feeder for `/next decision`: it pays the research cost once, ahead of time, so
 the decision turn is a fast ratification. Run `/prepare` to manufacture ready-to-ratify decisions, then
 `/next decision` to ratify them.
-
-<!-- Generated from scripts/lib/no-prompt-command-rules.mjs; whole-tree test pins this copy. -->
-<!-- no-prompt-command-rules:begin -->
-## No-prompt command rules
-
-- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.
-- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.
-- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting.
-- Never run destructive history or working-tree resets, forced pushes, or cleans.
-- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`.
-<!-- no-prompt-command-rules:end -->

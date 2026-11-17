@@ -215,7 +215,7 @@ describe('the harness really shells the shim — the fan-out cannot regress to s
 
   it('the Panel phase shells panel-fanout.mjs', () => {
     expect(body).toContain('node skills-src/jury/panel-fanout.mjs');
-    expect(body).toMatch(/agent\(\s*\n?\s*renderNoPromptCommandRules\(panelPrompt\(/);
+    expect(body).toMatch(/agent\(\s*\n?\s*panelPrompt\(/);
   });
 
   it('no per-seat `agent()` fan-out survives anywhere in the body', () => {
@@ -226,7 +226,7 @@ describe('the harness really shells the shim — the fan-out cannot regress to s
     // `parallel()` was the fan-out primitive; the body must no longer CALL it.
     expect(code).not.toMatch(/\bparallel\(/);
     // Exactly ONE `agent(` call remains in the Panel phase, and it is the shim relay.
-    expect(code).toMatch(/agent\(\s*\n?\s*renderNoPromptCommandRules\(panelPrompt\(/);
+    expect(code).toMatch(/agent\(\s*\n?\s*panelPrompt\(/);
   });
 
   it('the harness passes all three ceilings on the command line — none is left to default', () => {

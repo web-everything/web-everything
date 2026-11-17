@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { reviewUsesRequiredChecks } from '../lib/review-timing.mjs';
 import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.mjs';
@@ -423,7 +422,7 @@ export function fillReviewBrief(template, values = {}) {
       + `Spell it exactly as one of ${REVIEW_BRIEF_PLACEHOLDERS.map((n) => `{{${n}}}`).join(', ')}.`,
     );
   }
-  return { prompt: renderNoPromptCommandRules(prompt), unknownTokens: [...unknown].sort() };
+  return { prompt, unknownTokens: [...unknown].sort() };
 }
 
 // #3875 — `assertMainNotStale` (the #3439/#3474/#3637 dispatch-chokepoint staleness guard) and its

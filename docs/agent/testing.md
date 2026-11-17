@@ -1942,12 +1942,6 @@ the parked-PR path, bounded refusal, and the daemon's dispatch environment as we
 
 ### Prepare launch evidence and brief boundaries
 
-R115: Claude brief builders always prepend the shared approval-avoidance block from
-`scripts/lib/no-prompt-command-rules.mjs` in their owned header. Task text is opaque:
-never scan it for an existing block, parse its fences, or strip rules before checking emptiness.
-Validate the task with `trim()` before adding any generic instructions. Pin generated Markdown
-copies exactly once at build time. Launch-coverage lint is tracked for the agent-launch migration.
-
 Standalone Claude prepares use `skills-src/conveyor/prepare-item-agent-brief.md`; probation's
 runner reads `skills-src/conveyor/prepare-item-worker-brief.md`. Keep these separate: worker-only
 instructions delegate stamping and publishing to a runner that standalone sessions do not have.
@@ -4431,12 +4425,3 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
-## Claude launch brief command rules
-
-`scripts/lib/no-prompt-command-rules.mjs` owns the shared no-prompt command block.
-Prepend it with `renderNoPromptCommandRules` when authoring a Claude brief, including resume
-and review mandates. Validate task content before adding context or suffixes:
-`assertBriefTaskContent` refuses whitespace-only task inputs without inspecting their content.
-Markdown briefs and import-free workflow harnesses carry generated literal copies. When the block
-changes, refresh those copies and the imperative ledger. The no-prompt unit tests pin the owned
-header position and empty-task refusal. Launch-coverage lint is tracked for the agent-launch migration.

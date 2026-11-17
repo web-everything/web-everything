@@ -228,7 +228,7 @@ export function fixBriefPath(root = REPO_ROOT) {
 export function readFixBriefTemplate(root = REPO_ROOT, pack = (template) => template) {
   const template = assertBriefTaskContent(readFileSync(fixBriefPath(root), 'utf8'));
   const packed = assertBriefTaskContent(pack(template));
-  return renderNoPromptCommandRules(appendBuildRequirements(packed, { policy: resolveBuildPolicy({ log: line => console.error(line) }) }));
+  return appendBuildRequirements(packed, { policy: resolveBuildPolicy({ log: line => console.error(line) }) });
 }
 
 /** we:scripts/conveyor/reconcile-fix-dispatch.mjs#RESUME_CONFIRM_MAX_ATTEMPTS — hardening (2) from the
@@ -786,7 +786,7 @@ export function findResumeCandidate({ body, agentsAll, readCompletion, onDecline
  */
 export function buildResumePrompt({ pr, itemNum, cwd = null }) {
   const itemRef = itemNum ? `item #${itemNum}` : 'no backlog item';
-  return renderNoPromptCommandRules([
+  return [
     `New work on PR #${pr} (${itemRef}), which you previously worked: it has drifted into a real merge `
       + 'conflict against `main` since your last commit here — GitHub reports `mergeable: CONFLICTING`.',
     '',
@@ -798,7 +798,7 @@ export function buildResumePrompt({ pr, itemNum, cwd = null }) {
       '(your own and whatever landed on `main` since), run the gate green, and push. If you cannot safely ' +
       "resolve it, follow `skills-src/conveyor/fix-agent-brief.md`'s own conflict-escalation step: run " +
       `\`node scripts/conveyor/stand-down.mjs ${pr} --reason=conflict\`, then report and stop — do not guess.`,
-  ].join('\n'));
+  ].join('\n');
 }
 
 /** we:scripts/conveyor/reconcile-fix-dispatch.mjs#freeLaneNumbers — the SAME `lane-pool.mjs list --acquirable
@@ -994,7 +994,7 @@ export function tryResumeFix(planned, {
       const permissions = grantConflictHelper(candidateCwd);
       if (permissions?.ok !== true) throw new Error(`repair-helper permissions unwritten (${permissions?.reason ?? 'no result'})`);
     },
-    prompt: withPlannedContext(buildResumePrompt({ pr: planned.pr, itemNum: planned.itemNum, cwd: candidateCwd }), planned),
+    prompt: renderNoPromptCommandRules(withPlannedContext(buildResumePrompt({ pr: planned.pr, itemNum: planned.itemNum, cwd: candidateCwd }), planned), 'fix'),
     repo, spawnAgent, listAgentsAll, stop, wait, claimOwner, acquireClaim, releaseClaim, claimRoot, sessionCwdFor, ensureSessionCwd,
   });
 }
@@ -1669,7 +1669,7 @@ export function dispatchFix(planned, {
       advisor,
       // fix procedure — a re-armed concurrent-author pause hands the next fixer the saved alt branch to start from.
       ...(ladderTable ? { table: ladderTable } : {}),
-      payload: { prompt: withPlannedContext(prompt, planned), sessionSlug, launchKind: 'fix' },
+      payload: { prompt: renderNoPromptCommandRules(withPlannedContext(prompt, planned), 'fix'), sessionSlug, launchKind: 'fix' },
       // #3606 — see this function's own docblock: without this the fix agent reads a correctly-filled brief as an
       // unfilled template and self-aborts (3/3 live).
       systemPromptFile: DISPATCHED_AGENT_SYSTEM_PROMPT_FILE,

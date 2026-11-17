@@ -34,14 +34,3 @@ harness's sensitive-file heuristic can deny a rewrite there and nobody is watchi
 above). You have no lane clone to write into (you are diagnosis-only), so keep any working notes in your own
 context rather than on disk; the only durable artifact you produce is the one PR comment and the completion
 record the brief tells you to write.
-
-<!-- Generated from scripts/lib/no-prompt-command-rules.mjs; whole-tree test pins this copy. -->
-<!-- no-prompt-command-rules:begin -->
-## No-prompt command rules
-
-- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.
-- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.
-- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting.
-- Never run destructive history or working-tree resets, forced pushes, or cleans.
-- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`.
-<!-- no-prompt-command-rules:end -->

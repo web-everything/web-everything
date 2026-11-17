@@ -1,4 +1,3 @@
-import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 /**
  * @file scripts/operations/maintenance-io.mjs
  * @description Card 105 — the REAL io for `maintenance.mjs`. Bound only from `run.mjs`.
@@ -27,7 +26,7 @@ export function loadMaintenancePolicy({ path = POLICY_PATH } = {}) {
 
 export function runTestSession({ exec = execFileSync, policy = loadMaintenancePolicy() } = {}) {
   try {
-    const out = String(exec('claude', ['-p', renderNoPromptCommandRules(policy.prompt), '--model', policy.model], {
+    const out = String(exec('claude', ['-p', policy.prompt, '--model', policy.model], {
       encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: policy.timeoutSeconds * 1000, killSignal: 'SIGKILL', env: markWorkerEnv(process.env),
     }));
     return out.includes(policy.expect) ? { ok: true, detail: out.trim().slice(0, 200) } : { ok: false, detail: `unexpected reply: ${out.trim().slice(0, 200)}` };

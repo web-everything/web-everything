@@ -1,3 +1,8 @@
+Capture the examined head SHA once before diagnosis and reuse that exact literal at every escalation.
+
+Use literal values copied from command output for angle-bracket placeholders below; never assign shell variables.
+Capture the acquired lane path, live base branch and fetched base SHA before using them; stop if any is empty.
+Stop the command sequence on failure; resolve a failed merge before its ancestry check.
 # Conveyor CI-heal fix-agent brief (template) — merge + repair a green-at-open PR gone RED / BEHIND, NEVER touch the review gate (#2666)
 
 > **This is a TEMPLATE, not a runnable skill.** The `/conveyor` skill (#2613) instantiates it when a
@@ -89,8 +94,8 @@ own step 0/step-per-exit shape already prevents for a `review:changes` repair:
 # live at escalation time (after diagnosis, possibly minutes later) can return a head a CONCURRENT push swapped
 # in mid-session — a revision this session never actually examined — and permanently stamp the escalation
 # marker against it, silently suppressing healing on a head nobody ever diagnosed.
-EXAMINED_HEAD="$(gh pr view {{PR_NUM}} --repo {{REPO}} --json headRefOid --jq .headRefOid)"
-CI_AUTH_ARGS=() # populated only for a diagnosed CI authentication failure
+gh pr view {{PR_NUM}} --repo {{REPO}} --json headRefOid --jq .headRefOid
+
 
 node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --kind=ci-heal --pr={{PR_NUM}} --item={{ITEM_NUM}} --status=started
 ```
@@ -100,8 +105,7 @@ node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} 
 One author changes a PR's branch at a time — a CI-heal included. Take the PR's fix claim before anything else:
 
 ```bash
-node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-begin {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} \
-  --why="conveyor ci-heal: {{REASON}}"
+node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-begin {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --why="conveyor ci-heal: {{REASON}}"
 ```
 
 **A ci-heal is a normal repair loop, so this stays READY by default — never draft.** It labels the PR
@@ -124,9 +128,8 @@ your clone opens at the exact HEAD that was pushed:
 > write is how a dispatcher's own clone gets stuck refusing every future dispatch as stale (#4174).
 
 ```bash
-export LANE_SESSION={{SESSION_SLUG}}
-LANE=$(node "{{WE_ROOT}}/scripts/lane-pool.mjs" acquire --repo={{LANE_REPO}} --lane={{LANE}} --purpose=conveyor-ci-heal \
-  --session={{SESSION_SLUG}} --scope='{{SCOPE}}' --base={{LANE_REF}}) && cd "$LANE"
+node "{{WE_ROOT}}/scripts/lane-pool.mjs" acquire --repo={{LANE_REPO}} --lane={{LANE}} --purpose=conveyor-ci-heal --session={{SESSION_SLUG}} --scope='{{SCOPE}}' --base={{LANE_REF}}
+cd "<lane-path>"
 ```
 
 - `--base={{LANE_REF}}` lands the clone on the pushed lane tip, so you **reuse the built work** — you are healing a
@@ -141,11 +144,9 @@ LANE=$(node "{{WE_ROOT}}/scripts/lane-pool.mjs" acquire --repo={{LANE_REPO}} --l
   guidance) so the conveyor stops re-dispatching a heal that will only fail identically again, until a human
   intervenes or a new push resolves it:
   ```bash
-  node "{{WE_ROOT}}/scripts/conveyor/ci-heal-escalation-mark.mjs" {{PR_NUM}} --repo={{REPO}} \
-    --head="$EXAMINED_HEAD" \
-    --outcome=needs-human --reason="lane ref gone — {{LANE_REF}} no longer resolves"
+  node "{{WE_ROOT}}/scripts/conveyor/ci-heal-escalation-mark.mjs" {{PR_NUM}} --repo={{REPO}} --head="<examined-head-sha>" --outcome=needs-human --reason="lane ref gone — {{LANE_REF}} no longer resolves"
   ```
-- **`cd "$LANE"` just left WE's own checkout.** `{{LANE_REF}}` can belong to any constellation repo, so from
+- **`cd "<lane-path>"` just left WE's own checkout.** `{{LANE_REF}}` can belong to any constellation repo, so from
   here on your cwd may hold no `scripts/` directory at all — every remaining tool call in this brief is
   qualified with `{{WE_ROOT}}` for exactly that reason. Never drop the `{{WE_ROOT}}/` qualifier for a bare
   relative path.
@@ -170,12 +171,11 @@ and rerun the ancestry check against the saved `BASE_SHA` before proceeding. Thi
 three-dot diffs agree against that fetched base; a later base advance requires a fresh comparison.
 
 ```bash
-BASE_REF=$(gh pr view {{PR_NUM}} --repo {{REPO}} --json baseRefName --jq .baseRefName)
-test -n "$BASE_REF" || exit 1
-git fetch origin "$BASE_REF" || exit 1
-BASE_SHA=$(git rev-parse FETCH_HEAD) || exit 1
-git merge --no-edit "$BASE_SHA" || exit 1
-git merge-base --is-ancestor "$BASE_SHA" HEAD || exit 1
+gh pr view {{PR_NUM}} --repo {{REPO}} --json baseRefName --jq .baseRefName
+git fetch origin "<base-branch>"
+git rev-parse FETCH_HEAD
+git merge --no-edit "<base-sha>"
+git merge-base --is-ancestor "<base-sha>" HEAD
 ```
 
 To take one side of a conflicted file, or union both, use ONLY
@@ -195,11 +195,10 @@ alone often fixes a BEHIND `test` failure.
 git merge --abort
 node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=escalated-conflict
 node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
-node "{{WE_ROOT}}/scripts/conveyor/ci-heal-escalation-mark.mjs" {{PR_NUM}} --repo={{REPO}} \
-  --head="$EXAMINED_HEAD" --outcome=needs-human --reason="conflict with main during merge"
+node "{{WE_ROOT}}/scripts/conveyor/ci-heal-escalation-mark.mjs" {{PR_NUM}} --repo={{REPO}} --head="<examined-head-sha>" --outcome=needs-human --reason="conflict with main during merge"
 ```
 
-(`git merge --abort` FIRST, so you never leave a half-merged tree behind. `--head` is ALWAYS `$EXAMINED_HEAD`
+(`git merge --abort` FIRST, so you never leave a half-merged tree behind. `--head` is ALWAYS `<examined-head-sha>`
 — the PR's PUBLISHED head, captured ONCE at step 0 before diagnosis began — never `git rev-parse HEAD` (after a
 clean merge that you have not pushed, the local `HEAD` is a commit GitHub never saw, the marker would never
 match `pr.headRefOid`, and the next tick would dispatch the same heal again) and never a FRESH `gh pr view` read
@@ -217,13 +216,13 @@ gh run view <run-id> --log-failed --repo {{REPO}} # the failing step's log (opti
 ```
 
 - For **CI authentication failures** (for example Bad credentials at Checkout FUI), capture the diagnosed
-  `AUTH_RUN` and `AUTH_ATTEMPT` from that run's metadata, keeping the original `$EXAMINED_HEAD`.
+  `AUTH_RUN` and `AUTH_ATTEMPT` from that run's metadata, keeping the original `<examined-head-sha>`.
   When operator credential replacement is required, prepare read-only enrichment for the existing
   **needs-human** exit below:
   ```bash
-  CI_AUTH_ARGS=(--run="$AUTH_RUN" --attempt="$AUTH_ATTEMPT")
+  Use literal `--run=<auth-run-id> --attempt=<auth-attempt-number>` flags on the needs-human command only for a diagnosed authentication failure.
   ```
-  That exit passes this array to the marker alongside the captured head. The marker identifies the failed
+  That exit passes those literal flags to the marker alongside the captured head. The marker identifies the failed
   step's reference and consuming repository; a 401 does not establish expiry. Unresolved ownership or
   unavailable logs must stay unresolved; never guess a rotation target from the checkout destination.
   The displayed repository-scoped rotation command prompts the operator for a replacement; the healer never executes it.
@@ -231,7 +230,7 @@ gh run view <run-id> --log-failed --repo {{REPO}} # the failing step's log (opti
 - If a clean merge already fixes it (the failure was purely BEHIND against the new main), no code change is
   needed — proceed to the gate.
 - If a real break remains (a flake, or a genuine interaction with what landed on `main`), repair **only** that, in
-  `$LANE`, on the lane's **current branch** (its local `main` — do **NOT** `git checkout -b`; the single-branch
+  `<lane-path>`, on the lane's **current branch** (its local `main` — do **NOT** `git checkout -b`; the single-branch
   hook blocks branch creation even in a lane clone). Keep scope within `{{SCOPE}}`. **Do NOT weaken or delete a
   test to go green**, and do NOT fold in unrelated work.
 - **Before escalating, check for a metadata-only fix.** Some required-check-adjacent gates read the PR's own
@@ -241,15 +240,17 @@ gh run view <run-id> --log-failed --repo {{REPO}} # the failing step's log (opti
   genuinely applies (the change really IS soak-safe — never invent a reason that is not true), add it and
   continue instead of escalating (the skip rule right after the fence says whether step 4 is needed):
   ```bash
-  gh pr view {{PR_NUM}} --repo {{REPO}} --json body --jq .body > <bodyfile>
-  printf '\n\nsoak-waiver: <the genuine reason>\n' >> <bodyfile>
+  gh pr view {{PR_NUM}} --repo {{REPO}} --json body --jq .body
+  # Copy the output with Write to a new body file and append the genuine soak-waiver reason with Edit.
   node "{{WE_ROOT}}/scripts/pr-body-edit.mjs" --pr={{PR_NUM}} --repo={{REPO}} --body-file=<bodyfile>
   ```
   (never a raw `gh pr edit --body` — it drops the PR's own authorship stamp; see that script's own header.)
-  **Metadata-only skip (#34).** When this predicate exits 0 (HEAD is still the examined commit — no commit and no
+  **Metadata-only skip (#34).** When HEAD equals the captured examined head, the diff exits 0, and status prints nothing (HEAD is still the examined commit — no commit and no
   merge, not even a same-tree merge — and the working tree has no edit, staged, unstaged or untracked):
   ```bash
-  [ "$(git rev-parse HEAD)" = "$EXAMINED_HEAD" ] && git diff --quiet "$EXAMINED_HEAD" && [ -z "$(git status --porcelain)" ]
+  git rev-parse HEAD
+  git diff --quiet <examined-head-sha>
+  git status --porcelain
   ```
   skip steps 4-6 entirely: no `verify-lane.mjs request`. Re-run the
   failed check on the same commit (`gh run rerun <failed-run-id> --failed`), then go straight to step 7 with
@@ -262,15 +263,14 @@ gh run view <run-id> --log-failed --repo {{REPO}} # the failing step's log (opti
   - **`not-a-ci-break` — check this FIRST, before reaching for `needs-human`:** every check `gh pr checks`
     actually lists as a REQUIRED status check (`test`/`smoke`/`daemon-soak`/`soak-replay-gate` — confirm live via
     `gh api repos/{{REPO}}/branches/main/protection --jq .required_status_checks.contexts`, never assume the
-    list from memory) is green on `$EXAMINED_HEAD`, and the ONLY red is a review-gate-shaped check
+    list from memory) is green on `<examined-head-sha>`, and the ONLY red is a review-gate-shaped check
     (`review-gate` itself, or one that only ever reflects the `review:pending`/`review:human`/`review:changes`
     label) — by design, not a defect. This PR did nothing wrong and there is no "system fix" to wait on either:
     it is owed its ORDINARY REVIEW, right now, not another ci-heal attempt:
     ```bash
     node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=escalated-needs-human
     node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
-    node "{{WE_ROOT}}/scripts/conveyor/ci-heal-escalation-mark.mjs" {{PR_NUM}} --repo={{REPO}} \
-      --head="$EXAMINED_HEAD" --outcome=not-a-ci-break --reason="not a CI break — every required check is green; only <name the gate check> is red, held by the review label"
+    node "{{WE_ROOT}}/scripts/conveyor/ci-heal-escalation-mark.mjs" {{PR_NUM}} --repo={{REPO}} --head="<examined-head-sha>" --outcome=not-a-ci-break --reason="not a CI break — every required check is green; only <name the gate check> is red, held by the review label"
     ```
     Then report `#{{ITEM_NUM}} → ci-heal stood down (not a CI break — owed a review, not a heal)`. This is a
     STRUCTURED signal, not prose: `reconcile-core.mjs`'s escalation refusal reads this exact outcome as "dispatch
@@ -278,13 +278,11 @@ gh run view <run-id> --log-failed --repo {{REPO}} # the failing step's log (opti
     review dispatch.
   - **`inherited-from-base`** — this PR is STACKED (its base is not main) and the red belongs to the BASE PR:
     it reproduces on the base head itself, or the failing test/code belongs to the base PR and this diff does
-    not touch it. Use the freshly fetched `$BASE_SHA` from step 2; local `origin/<base branch>` may be stale.
+    not touch it. Use the freshly fetched `<base-sha>` from step 2; local `origin/<base branch>` may be stale.
     ```bash
     node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=escalated-needs-human
     node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
-    node "{{WE_ROOT}}/scripts/conveyor/ci-heal-escalation-mark.mjs" {{PR_NUM}} --repo={{REPO}} \
-      --head="$EXAMINED_HEAD" --outcome=inherited-from-base --base-pr=<base PR number> \
-      --base-head="$BASE_SHA" --reason="<name the failing test and the base PR code it contradicts>"
+    node "{{WE_ROOT}}/scripts/conveyor/ci-heal-escalation-mark.mjs" {{PR_NUM}} --repo={{REPO}} --head="<examined-head-sha>" --outcome=inherited-from-base --base-pr=<base PR number> --base-head="<base-sha>" --reason="<name the failing test and the base PR code it contradicts>"
     ```
     This routes a note to the base PR and re-arms this PR's ci-heal automatically when the base head moves;
     never use `needs-human` for inherited red.
@@ -293,10 +291,9 @@ gh run view <run-id> --log-failed --repo {{REPO}} # the failing step's log (opti
     ```bash
     node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=escalated-needs-human
     node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
-    node "{{WE_ROOT}}/scripts/conveyor/ci-heal-escalation-mark.mjs" {{PR_NUM}} --repo={{REPO}} \
-      --head="$EXAMINED_HEAD" --outcome=needs-human "${CI_AUTH_ARGS[@]}" --reason="<name the actual finding>"
+    node "{{WE_ROOT}}/scripts/conveyor/ci-heal-escalation-mark.mjs" {{PR_NUM}} --repo={{REPO}} --head="<examined-head-sha>" --outcome=needs-human <authentication-flags-if-applicable> --reason="<name the actual finding>"
     ```
-    On a stacked PR, pass `--base-head="$BASE_SHA"` so the escalation re-arms when the base moves.
+    On a stacked PR, pass `--base-head="<base-sha>"` so the escalation re-arms when the base moves.
     When the red is `main`'s own defect (it reproduces on a merge with main and the PR's diff is not implicated),
     add `--cause=main-defect` to that command. The conveyor then refreshes the PR onto main ONCE after main's
     required check is green on a newer main (knob `WE_MAIN_DEFECT_REBASES_PER_SHA`), and the new head clears the
@@ -311,9 +308,7 @@ gh run view <run-id> --log-failed --repo {{REPO}} # the failing step's log (opti
     ```bash
     node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=escalated-needs-human
     node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
-    node "{{WE_ROOT}}/scripts/conveyor/ci-heal-escalation-mark.mjs" {{PR_NUM}} --repo={{REPO}} \
-      --head="$EXAMINED_HEAD" --outcome=waiting-on-system-fix --system-fix=<n> \
-      --reason="<name the tooling bug and the PR fixing it>"
+    node "{{WE_ROOT}}/scripts/conveyor/ci-heal-escalation-mark.mjs" {{PR_NUM}} --repo={{REPO}} --head="<examined-head-sha>" --outcome=waiting-on-system-fix --system-fix=<n> --reason="<name the tooling bug and the PR fixing it>"
     ```
     Then report `#{{ITEM_NUM}} → ci-heal waiting on system fix #<n> (PR #{{PR_NUM}} did nothing wrong)`.
 
@@ -429,8 +424,8 @@ a file as one fenced `class-sweep` JSON block (the format is in
 [fix-agent-brief.md](fix-agent-brief.md) step 3) and record it from your lane:
 
 ```bash
-BASE_REF=$(gh pr view {{PR_NUM}} --repo {{REPO}} --json baseRefName --jq .baseRefName)
-node "{{WE_ROOT}}/scripts/conveyor/class-sweep-check.mjs" --evidence-file=<sweep-file> --kind=ci-heal --repo={{REPO}} --pr={{PR_NUM}} --session={{SESSION_SLUG}} --checkout="$LANE" --base="origin/$BASE_REF"
+gh pr view {{PR_NUM}} --repo {{REPO}} --json baseRefName --jq .baseRefName
+node "{{WE_ROOT}}/scripts/conveyor/class-sweep-check.mjs" --evidence-file=<sweep-file> --kind=ci-heal --repo={{REPO}} --pr={{PR_NUM}} --session={{SESSION_SLUG}} --checkout="<lane-path>" --base="origin/<base-branch>"
 ```
 
 In `warn` mode it never blocks. A merge-only heal with no code change skips it.
@@ -439,17 +434,17 @@ In `warn` mode it never blocks. A merge-only heal with no code change skips it.
 (or while its verify runs), ask the risk check on your lane:
 
 ```bash
-node "{{WE_ROOT}}/scripts/operations/run.mjs" pre-pr-check --checkout="$LANE"
+node "{{WE_ROOT}}/scripts/operations/run.mjs" pre-pr-check --checkout="<lane-path>"
 ```
 
 `pre-pr-check: not gated` — nothing more to do. `pre-pr-check: gated` — it prints the exact commands: run the
 `/converge` flow (`node "{{WE_ROOT}}/scripts/converge-cli.mjs" init …`, drive `step` to `land`, commit the fixes) and stamp
-`node "{{WE_ROOT}}/scripts/converge-cli.mjs" receipt --lane="$LANE" --state="$LANE/.converge-state.json"`, as the delivery brief's step 6 does
-([delivery-agent-brief.md](delivery-agent-brief.md)). `$LANE` is your lane clone's absolute root (`pwd` at its top level).
+`node "{{WE_ROOT}}/scripts/converge-cli.mjs" receipt --lane="<lane-path>" --state="<lane-path>/.converge-state.json"`, as the delivery brief's step 6 does
+([delivery-agent-brief.md](delivery-agent-brief.md)). `<lane-path>` is your lane clone's absolute root (`pwd` at its top level).
 
 ### 6. Commit (before step 4's request) — the harness re-pushes it to the SAME lane ref
 
-Write the evidence file OUTSIDE the lane (e.g. `"$TMPDIR/fix-evidence-{{PR_NUM}}.md"`) and never commit a `.fix-*` scratch file (`.fix-evidence*.md` is gitignored and check:standards refuses it in a diff).
+Write the evidence file OUTSIDE the lane (e.g. `"<task-scratch-dir>/fix-evidence-{{PR_NUM}}.md"`) and never commit a `.fix-*` scratch file (`.fix-evidence*.md` is gitignored and check:standards refuses it in a diff).
 
 Commit only the heal's files (explicit paths, never `git add -A`; one commit) on the lane's current branch, BEFORE
 step 4's `request`. Do **not** push `{{LANE_REF}}` yourself: on a green verdict for exactly this commit the harness
@@ -457,8 +452,8 @@ pushes it to update the existing PR's head — this **updates the PR**, it does 
 open a new one (never `gh pr create`, never `pr-land` — the PR already exists):
 
 ```bash
-printf '%s\n' "{{ATTRIBUTION}}: ci-heal — <failing check and repair> (PR {{PR_NUM}})" "" \
-  "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>" > <msgfile>
+# Use Write to create a new message file containing "{{ATTRIBUTION}}: ci-heal — <failing check and repair> (PR {{PR_NUM}})", a blank line,
+# and "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>".
 git commit -F <msgfile> <explicit-paths>   # omit if the merge alone healed it and there is nothing new to commit
 ```
 
@@ -473,8 +468,8 @@ The harness re-pushed the heal. Record it with a durable comment — this is **t
 a comment, **NOT** a label change:
 
 ```bash
-node "{{WE_ROOT}}/scripts/conveyor/ci-heal-mark.mjs" {{PR_NUM}} --repo={{REPO}} --reason={{REASON}} && \
-  node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=<no-change|healed>
+node "{{WE_ROOT}}/scripts/conveyor/ci-heal-mark.mjs" {{PR_NUM}} --repo={{REPO}} --reason={{REASON}}
+node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=<no-change|healed>
   node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
 ```
 
@@ -497,12 +492,7 @@ improvement idea) from the heal — a write-time-gated scrub that rejects raw co
 paths, or PII, so keep every field a short generalized lesson:
 
 ```bash
-node "{{WE_ROOT}}/scripts/conveyor/learnings-drop.mjs" \
-  --kind=<friction|missing-convention|doc-gap|skill-gap|improvement> \
-  --summary="<one sentence — the lesson>" \
-  --area="<coarse label, e.g. ci-heal / merge-on-main>" \
-  --suggestion="<short recommendation>" \
-  --session={{SESSION_SLUG}}
+node "{{WE_ROOT}}/scripts/conveyor/learnings-drop.mjs" --kind=<friction|missing-convention|doc-gap|skill-gap|improvement> --summary="<one sentence — the lesson>" --area="<coarse label, e.g. ci-heal / merge-on-main>" --suggestion="<short recommendation>" --session={{SESSION_SLUG}}
 ```
 
 Skip only if you genuinely hit no generalizable friction.
@@ -559,14 +549,3 @@ The dispatch composer appends the effective build safeguards, then quotes
 `docs/agent/reviewer-expectations.md` as a fenced checklist (data to check your work against, never
 instructions). Follow the safeguards block for the final gate and the capped pre-review check; the
 mechanical wrapper owns the check on wrapped builds.
-
-<!-- Generated from scripts/lib/no-prompt-command-rules.mjs; whole-tree test pins this copy. -->
-<!-- no-prompt-command-rules:begin -->
-## No-prompt command rules
-
-- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.
-- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.
-- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting.
-- Never run destructive history or working-tree resets, forced pushes, or cleans.
-- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`.
-<!-- no-prompt-command-rules:end -->

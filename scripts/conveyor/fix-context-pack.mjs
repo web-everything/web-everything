@@ -1,4 +1,4 @@
-import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
+import { assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 /**
  * @file scripts/conveyor/fix-context-pack.mjs
  * @description The CONTEXT PACK every fix / ci-heal brief carries (operator go 2026-10-10; study
@@ -26,7 +26,7 @@ import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-pr
  *   - `fix.contextLines` (default 30)          env WE_FIX_CONTEXT_LINES
  *   - `fix.contextMaxBytes` (default 8000)     env WE_FIX_CONTEXT_MAX_BYTES
  *   - `fix.localTests` proof-only|free         env WE_FIX_LOCAL_TESTS
- *   All off (`contextPack: false`, `localTests: free`) = the old brief plus mandatory command rules.
+ *   All off (`contextPack: false`, `localTests: free`) = the old brief, byte for byte.
  *
  * Never throws: an unreadable PR leaves the brief exactly as it was (plus the tests rule when that is on).
  */
@@ -366,7 +366,7 @@ export function extractFailedTests(log, max = 12) {
 // The brief transform (PURE given its inputs)
 
 /** Put the pack (and the tests rule) in front of the brief, trimming the sections it makes redundant. PURE.
- *  Both settings off → the brief plus mandatory command rules. */
+ *  Both settings off → the brief unchanged. */
 export function applyContextPack(brief, { kind = 'fix', settings = CONTEXT_PACK_DEFAULTS, inputs = null, escapeTokens = true } = {}) {
   assertBriefTaskContent(brief);
   const { contextPack, contextMaxBytes, contextLines, localTests } = settings;
@@ -374,7 +374,7 @@ export function applyContextPack(brief, { kind = 'fix', settings = CONTEXT_PACK_
     const t = localTestsSection(localTests, kind);
     return t ? `${t}\n\n${brief}` : brief;
   };
-  if (!contextPack || !inputs) return renderNoPromptCommandRules(testsOnly());
+  if (!contextPack || !inputs) return testsOnly();
   const prefixes = kind === 'ci-heal' ? TRIM_SECTIONS['ci-heal']
     : [...TRIM_SECTIONS.fix, ...(!inputs.findings?.length ? [] : inputs.advisory ? TRIM_SECTIONS.fixAdvisory : TRIM_SECTIONS.fixNonAdvisory)];
   const trimmed = trimBriefSections(brief, prefixes);
@@ -383,10 +383,10 @@ export function applyContextPack(brief, { kind = 'fix', settings = CONTEXT_PACK_
   const pack = kind === 'ci-heal'
     ? renderCiPack({ ...inputs, maxBytes, localTests, removed: trimmed.removed })
     : renderFixPack({ ...inputs, lines: contextLines, maxBytes, localTests, removed: trimmed.removed });
-  if (!pack) return renderNoPromptCommandRules(testsOnly());
+  if (!pack) return testsOnly();
   // The pack is applied to the TEMPLATE, before `fillBrief`: a `{{NAME}}` inside quoted reviewer text or code (a
   // finding on a brief template itself) must stay literal, so a word joiner breaks the token shape.
-  return renderNoPromptCommandRules(`${escapeTokens ? pack.replace(/\{\{/g, '{\u2060{') : pack}\n\n---\n\n${trimmed.text}`);
+  return `${escapeTokens ? pack.replace(/\{\{/g, '{\u2060{') : pack}\n\n---\n\n${trimmed.text}`;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -452,16 +452,16 @@ export function readCiPackInputs({ repoSlug, pr, exec }) {
 export function briefWithContextPack(brief, { kind = 'fix', repoSlug: slug, repo, toSlug, pr, exec, readInputs, settings, env = process.env } = {}) {
   assertBriefTaskContent(brief);
   // Hermetic under a test runner: a test that wants the pack injects its settings or its reader.
-  if (isUnderTest(env) && !settings && !readInputs) return renderNoPromptCommandRules(brief);
+  if (isUnderTest(env) && !settings && !readInputs) return brief;
   let repoSlug = slug;
   if (!repoSlug && toSlug) { try { repoSlug = toSlug(repo); } catch { repoSlug = null; } }
   let resolved;
-  try { resolved = settings ? { value: settings, sources: {}, invalid: [] } : resolveContextPackSettings({ env }); } catch { return renderNoPromptCommandRules(brief); }
+  try { resolved = settings ? { value: settings, sources: {}, invalid: [] } : resolveContextPackSettings({ env }); } catch { return brief; }
   if (!settings) { try { logContextPackSettings(resolved, { env }); } catch { /* log is best effort */ } }
   let inputs = null;
   if (resolved.value.contextPack) {
     const read = readInputs ?? (isUnderTest(env) ? null : (o) => (kind === 'ci-heal' ? readCiPackInputs(o) : readFixPackInputs(o)));
     try { inputs = read && (repoSlug || readInputs) ? read({ repoSlug, pr, exec }) : null; } catch { inputs = null; }
   }
-  try { return renderNoPromptCommandRules(applyContextPack(brief, { kind, settings: resolved.value, inputs })); } catch { return renderNoPromptCommandRules(brief); }
+  try { return applyContextPack(brief, { kind, settings: resolved.value, inputs }); } catch { return brief; }
 }

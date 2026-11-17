@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 /**
  * @file scripts/operations/worker-wrapper.mjs
  * @description THE UNIFIED WORKER WRAPPER (item 117, slice S3a; decision D7 FINAL, operator 2026-10-08).
@@ -121,12 +120,11 @@ export const STRUCTURED_OUTPUT_SUFFIX = [
 
 /** 117 S3b regression 2026-10-08: resume the same print-mode session with all launch flags intact. */
 export function resumeArgvFrom(argv, { sessionId, prompt }) {
-  assertBriefTaskContent(prompt);
   const out = argv.slice(0, -1);
   const index = out.indexOf('--session-id');
   if (index < 0) throw new TypeError('operations: resumeArgvFrom needs --session-id');
   out.splice(index, 2, '--resume', sessionId);
-  return [...out, renderNoPromptCommandRules(`${prompt}${STRUCTURED_OUTPUT_SUFFIX}`)];
+  return [...out, `${prompt}${STRUCTURED_OUTPUT_SUFFIX}`];
 }
 
 export function resumeRequestPath(specDir, session) {

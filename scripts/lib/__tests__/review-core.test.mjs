@@ -1,4 +1,4 @@
-import { NO_PROMPT_COMMAND_RULES, renderNoPromptCommandRules } from '../no-prompt-command-rules.mjs';
+import { NO_PROMPT_COMMAND_RULES } from '../no-prompt-command-rules.mjs';
 /**
  * @file review-core.test.mjs — proof of the #2325 shared review-verdict core: the canonical `Finding` shape
  *   normalization, the `{findings, verdict}` derivation (humanRequired always wins; outstanding findings vs
@@ -599,13 +599,13 @@ describe('review.currentLevel interim mandates', () => {
   it('public-preview omits the stanza and preserves both original mandates byte for byte', () => {
     vi.stubEnv('WE_REVIEW_CURRENT_LEVEL', 'public-preview');
     const originalHashes = {
-      security: 'fba362c0c66fe7c401aa61eedf6aba32ae40a4319f93864adaf9253f2694f0ea',
-      correctness: '4edc7cc552e327ffd1e37c4d3811074220e5304db6f2a57b31d4b4e418ece8bd',
+      security: '0ac63f1577617fa0370090c396d257fbb24e25e86b1d862369cdacd2a5729a9a',
+      correctness: '402e28a43189148deb9b1d7ae76f960e7cc30b6c0a97d3e169a908b0a25765d8',
     };
     for (const [lens, hash] of Object.entries(originalHashes)) {
       const mandate = buildPanelMandate({ lens });
       expect(mandate).not.toContain(INTERNAL_DELIVERY_STANZA);
-      expect(createHash('sha256').update(mandate).digest('hex')).toBe(hash);
+      expect(createHash('sha256').update(mandate.slice(NO_PROMPT_COMMAND_RULES.length + 2)).digest('hex')).toBe(hash);
       expect(expectationForLens(lens)).toBe(LENS_EXPECTATIONS[lens]);
     }
   });
@@ -757,7 +757,7 @@ describe('buildPanelMandate (#2310)', () => {
   // before #3094 (`correctness` lens, no goal, no round, no net set, no aim), stored with NO trailing newline so
   // the comparison is the raw string and nothing has to be trimmed away.
   //
-  // The PERMITTED deltas are the shared command rules and the ruled mutation probe, and the assertion says so in the only way that cannot
+  // The one PERMITTED delta is the ruled mutation probe, and the assertion says so in the only way that cannot
   // drift: `fixture + ' ' + MUTATION_PROBE_RULE`, exactly. If `aim` ever contributes a byte when absent, or any
   // other clause is added to the no-aim path, this reddens and names what changed.
   describe('#3094 — the no-`aim` mandate is byte-identical to the pre-#3094 fixture, plus the ruled probe', () => {
@@ -784,7 +784,7 @@ describe('buildPanelMandate (#2310)', () => {
 
     it('adds the mutation probe and tests-first guarantee mapping when `aim` is omitted', () => {
       expect(buildPanelMandate({ lens: MANDATE_LENSES.CORRECTNESS }))
-        .toBe(`${NO_PROMPT_COMMAND_RULES}\n\n${NO_PROMPT_COMMAND_RULES}\n\n${withCurrentPanel(FIXTURE).replace('Work from the diff text alone',
+        .toBe(`${NO_PROMPT_COMMAND_RULES}\n\n${withCurrentPanel(FIXTURE).replace('Work from the diff text alone',
           "each stated guarantee in the card's Acceptance has a named test; list any guarantee without one as a finding Work from the diff text alone")} ${MUTATION_PROBE_RULE} ${INTERNAL_DELIVERY_STANZA}`);
     });
 
@@ -2483,9 +2483,8 @@ describe('review-parked-prs.mjs — the editor is gated on the care band (source
     expect(src).toMatch(/const editorEnabled = reasonsAllowEditor && EDITOR_ENABLED_CARE_LEVELS\.includes\(careLevel\) && r != null && r\.editorEnabled === true;/);
     // F1: the local half is computed BEFORE the agent runs, so nothing the agent returns can influence it.
     const localIdx = src.indexOf('const reasonsAllowEditor = editorAllowedByReasons(escalationReason);');
-    const agentIdx = src.indexOf('const r = await agent(renderNoPromptCommandRules(rigorPrompt(');
+    const agentIdx = src.indexOf('const r = await agent(rigorPrompt(');
     expect(localIdx).toBeGreaterThan(-1);
-    expect(agentIdx).toBeGreaterThan(-1);
     expect(localIdx).toBeLessThan(agentIdx);
   });
 
@@ -2759,8 +2758,8 @@ it('the sandbox parked-review repo table uses the shared owner-qualified slugs',
   const table = src.match(/const REPOS = (\{[\s\S]*?\n\});/)[1];
   const repos = new Function(`return (${table});`)();
   const discover = src.match(/function discoverPrompt\(\) \{[\s\S]*?\n\}/)[0];
-  const prompt = new Function('renderNoPromptCommandRules', `const REPOS = ${table}; const RETURN_HYGIENE = ''; const REVIEW_PENDING = 'review:pending';
-    ${discover}; return discoverPrompt();`)(renderNoPromptCommandRules);
+  const prompt = new Function(`const REPOS = ${table}; const RETURN_HYGIENE = ''; const REVIEW_PENDING = 'review:pending';
+    ${discover}; return discoverPrompt();`)();
   for (const { slug } of Object.values(CONSTELLATION_REPOS)) {
     expect(prompt).toContain(`gh pr list --repo ${slug} --label review:pending`);
   }

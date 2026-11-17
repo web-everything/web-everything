@@ -196,7 +196,7 @@ export function buildRoundResumePrompt({ pr, itemNum = null, round, cap = null, 
     'then steps 2 to 9 (step 1 is the lane above). Answer every finding below, especially any marked as raised again.',
     '',
     history || '(no round history could be read for this PR — read the newest review comments on the PR first)',
-  ].join('\n'));
+  ].join('\n'), 'fix');
 }
 
 // ── IO ─────────────────────────────────────────────────────────────────────────────────────────────────────────

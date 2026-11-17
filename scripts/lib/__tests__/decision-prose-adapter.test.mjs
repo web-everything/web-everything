@@ -1,5 +1,3 @@
-import { NO_PROMPT_COMMAND_RULES } from '../no-prompt-command-rules.mjs';
-const COMMAND_RULES_PREFIX = `${NO_PROMPT_COMMAND_RULES}\n\n`;
 /**
  * @file decision-prose-adapter.test.mjs — proof of the #2657 decision-prose subject adapter (S5 of epic #2649):
  *   the root-cause / completeness lens-set, the `plan-critique` grounding method, that the adapter is THIN over
@@ -71,7 +69,7 @@ describe('THIN over the plan-handshake (#2657)', () => {
   it('buildDecisionMandate IS buildPlanCritiqueMandate over the approach (no second copy of the prose)', () => {
     const approach = 'cache the parsed config at module load';
     expect(buildDecisionMandate({ approach, round: 1 }))
-      .toBe(COMMAND_RULES_PREFIX + buildPlanCritiqueMandate({ approach, round: 1, roundCap: PLAN_ROUND_CAP }));
+      .toBe(buildPlanCritiqueMandate({ approach, round: 1, roundCap: PLAN_ROUND_CAP }));
   });
 
   it('re-exports the plan-handshake proposer + outcome derivation through this module', () => {
@@ -107,7 +105,7 @@ describe('DECISION_PROSE_ADAPTER — conforms to the F2 contract + drives the se
     expect(DECISION_PROSE_ADAPTER.resolveMethods('root-cause')).toEqual(['plan-critique']);
     const approach = 'add a guard clause';
     expect(DECISION_PROSE_ADAPTER.buildMandate({ approach }))
-      .toBe(COMMAND_RULES_PREFIX + buildPlanCritiqueMandate({ approach, round: 1, roundCap: PLAN_ROUND_CAP }));
+      .toBe(buildPlanCritiqueMandate({ approach, round: 1, roundCap: PLAN_ROUND_CAP }));
   });
 
   it('resolveAdapterRoster builds a decision roster whose seats carry the decision lenses + plan-critique', () => {

@@ -223,14 +223,3 @@ came from** — archiving would silently discard exactly the observations you de
 - **Nothing routes to memory on the pool's word alone.** The pool is an unverified report; agent memory is a
   standing instruction. A `verified` grounding verdict plus the red-team is the seam between the two — and a
   recurrence count is never a substitute for either.
-
-<!-- Generated from scripts/lib/no-prompt-command-rules.mjs; whole-tree test pins this copy. -->
-<!-- no-prompt-command-rules:begin -->
-## No-prompt command rules
-
-- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.
-- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.
-- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting.
-- Never run destructive history or working-tree resets, forced pushes, or cleans.
-- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`.
-<!-- no-prompt-command-rules:end -->

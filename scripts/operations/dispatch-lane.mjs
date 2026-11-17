@@ -717,7 +717,7 @@ export function fillBrief(
       + `as one of ${BRIEF_PLACEHOLDERS.map((n) => `{{${n}}}`).join(', ')}.`,
     );
   }
-  return { prompt: renderNoPromptCommandRules(prompt), unknownTokens: [...unknown].sort() };
+  return { prompt, unknownTokens: [...unknown].sort() };
 }
 
 /**
@@ -1326,7 +1326,7 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes, groupMember
     // From the reader's card-record decision (planOperatorPostBuild), never a search of the filled prompt, which
     // card-influenced text can reach. A build only: no other kind composes post-build steps.
     operatorPostBuild: launchKind === 'build' && raw.operatorPostBuild === true,
-    prompt: brief.prompt,
+    prompt: renderNoPromptCommandRules(brief.prompt, launchKind),
     // REPORTED, never fatal — see `fillBrief`. Two of these are the brief's own prose today.
     briefUnknownTokens: brief.unknownTokens,
     // THE PR THIS DISPATCH REPAIRS, and (CI-heal only) WHY — riding the `read` finding so the effect payload

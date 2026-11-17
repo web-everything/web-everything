@@ -110,14 +110,3 @@ node scripts/operations/completion-cli.mjs report --status=done --session={{SESS
 Return a one-line result: `#{{PR}} stuck-inspection → <one-line cause>`. **Do not** change any label, push any
 commit, open any PR, merge anything, or wait for a reply — nobody is watching this session turn by turn (see
 the system prompt). Your job ends with the comment and the completion record.
-
-<!-- Generated from scripts/lib/no-prompt-command-rules.mjs; whole-tree test pins this copy. -->
-<!-- no-prompt-command-rules:begin -->
-## No-prompt command rules
-
-- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.
-- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.
-- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting.
-- Never run destructive history or working-tree resets, forced pushes, or cleans.
-- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`.
-<!-- no-prompt-command-rules:end -->
