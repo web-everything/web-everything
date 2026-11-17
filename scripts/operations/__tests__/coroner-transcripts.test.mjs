@@ -77,10 +77,11 @@ describe('claude transcript friction (card 130 S1)', () => {
     ['{"client_secret": "s3cr3tvalue99"}', 's3cr3tvalue99'],
     ['postgres://admin:p4ssw0rd@db.internal:5432/app', 'p4ssw0rd'],
     ['https://user:hunter2hunter2@example.com/x', 'hunter2hunter2'],
-    // Assemble the original PEM at runtime; its test source must pass the Forge key scan.
-    [['-----BEG\x49N RSA PRIVATE\x20KEY-----',
-      '0qZ3kXa7AEQACKAABIwoEIIM'.split('').reverse().join(''),
-      'abcdEFGH1234+/==', '-----\x45ND RSA PRIVATE\x20KEY-----'].join('\n'),
+    // Keep fake key bytes visible so manifest admission excludes this fixture.
+    [`-----BEGIN RSA PRIVATE KEY-----
+MIIEowIBAAKCAQEA7aXk3Zq0
+abcdEFGH1234+/==
+-----END RSA PRIVATE KEY-----`,
       '0qZ3kXa7AEQACKAABIwoEIIM'.split('').reverse().join('')],
     ['key AI\x7aaSyA-1234567890abcdefghijklmnopqrstu used', 'AIzaSyA-1234567890'],
     ['npm_' + 'a1B2c3D4e5'.repeat(4), 'a1B2c3D4e5a1B2c3D4e5'],

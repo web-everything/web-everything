@@ -2293,6 +2293,22 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     expect(callsOf(exec).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
   });
 
+  it('dispatches an unrelated selected test while excluding a tracked key-bearing fixture',async()=>{
+    const name='redaction-fixture.test.mjs';
+    const body=generateKeyPairSync('ed25519').privateKey.export({type:'pkcs8',format:'pem'});
+    writeFileSync(join(cwd,name),body);
+    writeFileSync(join(cwd,'a.test.mjs'),'export const fixture = 1;');
+    const paths=['a.test.mjs',name,'package-lock.json'].map(value=>Buffer.from(value));
+    const exec=acceptingTransport(paths,Buffer.concat(paths.map(path=>indexRecord(path.toString(),readFileSync(join(cwd,path.toString()))))));
+    expect(await runRemote({argv,cwd,runId,exec})).toMatchObject({mode:'remote',code:0});
+    const sent=JSON.parse(callsOf(exec).find(isRun).input);
+    expect(Buffer.from(sent.manifest.excluded,'base64').toString()).toBe(name+'\0');
+    expect(Buffer.from(sent.manifest.paths,'base64').toString()).not.toContain(name);
+    const transfers=callsOf(exec).filter(call=>call.file==='rsync');
+    expect(transfers.length).toBeGreaterThan(0);
+    for(const call of transfers)expect(call.input.toString()).not.toContain(name);
+  });
+
   it.each(['id_custom.md', 'id_backup/safe.js'])
   ('requires public evidence for credential-name-only source %s', async name => {
     mkdirSync(join(cwd, name, '..'), {recursive:true});
@@ -3270,7 +3286,7 @@ describe('safeFallbackDetail', () => {
 
 describe('delta manifest reuse cannot bypass the all-paths key scan', () => {
   for (const keyBearing of [false,true]) it(keyBearing
-    ? 'refuses base-admitted ordinary paths sharing a private-key blob instead of reusing them'
+    ? 'excludes base-admitted ordinary paths sharing a private-key blob instead of reusing them'
     : 'reuses clean base-admitted ordinary paths without reading their worktree bytes', async () => {
     const dir = realpathSync(mkdtempSync(join(process.env.TMPDIR, 'delta-key-')));
     try {
@@ -3301,7 +3317,12 @@ describe('delta manifest reuse cannot bypass the all-paths key scan', () => {
       const readFile=vi.fn(path=>filesystem.readFile(path));
       const build=()=>remoteManifestAPI.buildDeltaManifest({cwd:dir,exec,base,fs:{...filesystem,readFile}});
       if(keyBearing) {
-        await expect(build()).rejects.toMatchObject({code:'excluded-source-file'});
+        const delta=await build();
+        expect(delta.manifestMode).toBe('git-delta');
+        expect(delta.entries).toEqual([]);
+        expect(delta.excluded.map(path=>path.toString())).toEqual(names);
+        expect(delta.deletions.map(path=>path.toString())).toEqual(names);
+        expect(delta.deltaPaths).toEqual([]);
         expect(readFile).toHaveBeenCalled();
       } else {
         const delta=await build();

@@ -229,9 +229,16 @@ export async function warmTick({root='/srv/forge-base',exec=run,clock=Date.now,f
         if(oid!==entry.oid)throw new Error('Public blob changed');
         // R321: a name-flagged public file with secret-like content stays out of the base.
         if(policy.credentialSource&&credentialContentFinding(entry.path,content)){excluded.push(entry.path);continue;}
+        // Run the leaf guard before writing any bytes to the export tree.
+        let admitted;
+        try {admitted=manifestEntry(entry.path,content,entry.executable,true);}
+        catch(error) {
+          if(policy.credentialSource||error.code!=='excluded-source-file')throw error;
+          excluded.push(entry.path);continue;
+        }
         let dest=Buffer.from(tree);const parts=pathParts(entry.path);
         for(const [i,part] of parts.entries()){dest=bytePath(dest,part);if(i<parts.length-1)await fs.mkdir(dest,{recursive:true,mode:0o755});else await fs.writeFile(dest,content,{flag:'wx',mode:entry.executable?0o755:0o644});}
-        entries.push(manifestEntry(entry.path,content,entry.executable,true));
+        entries.push(admitted);
       }
       const manifest=manifestWire({entries,excluded}),manifestDigest=digestManifest(manifest);
       if(Buffer.byteLength(JSON.stringify(manifest))>LIMIT-16384)throw new Error('Warm manifest bound exceeded: use full shipping');

@@ -388,7 +388,7 @@ const manifestRefusal=(code,path)=>Object.assign(new Error(`${code}: use local f
   code,detail:(Buffer.isBuffer(path)?path.toString('utf8'):String(path)).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g,'?')||'.',
 });
 // Walk independently of Git's inventory. Never follow a directory link.
-async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedLinks,ignoredPaths,exec,head,rootInfo,scoped}) {
+async function crossCheckManifest({cwd,fs,entries,keyExcluded,identities,indexBlobs,trackedLinks,ignoredPaths,exec,head,rootInfo,scoped}) {
   const shipped=new Map(entries.map(entry=>[entry.path.toString('hex'),entry]));
   const walked=new Map();
   let count=0,bytes=0;
@@ -412,9 +412,9 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedL
       }
       if(st.isDirectory())await walk(absolute,path);
       else if(st.isFile()) {
-        // (a) Discovery excludes entry points, not imports. Every test-shaped
-        // leaf must ship, even when Git ignores it or Vitest does not list it.
-        if(isTestFile(path)&&!shipped.has(key))throw manifestRefusal('unshipped-test-file',path);
+        // Only a tracked leaf freshly excluded by the key scanner may be absent.
+        // Ignored, uninventoried and policy-excluded tests still refuse the build.
+        if(isTestFile(path)&&!shipped.has(key)&&!keyExcluded.has(key))throw manifestRefusal('unshipped-test-file',path);
         // Ignored leaves may become tests or excluded paths through directory
         // aliases. Follow projections transitively, sharing the walk's limits.
         if(!shipped.has(key)&&ignoredPaths.has(key)&&!classifyManifestPath(path).excluded) {
@@ -700,7 +700,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   validateTestNames(files);
   const rootInfo = await fs.lstat(Buffer.from(cwd));
   if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) throw new Error('Invalid inventory root');
-  const entries = [], excluded = [], identities = new Map();
+  const entries = [], excluded = [], identities = new Map(), keyExcluded = new Set();
   // Deletion evidence is loaded once; each caller reports its own path.
   let deletedLoad;
   const deletedWorktreePaths=()=>deletedLoad ??= (async()=>{
@@ -775,7 +775,14 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     // aborting unrelated work. The public worktree identity check above still
     // refuses private edits; manifestEntry remains a fail-closed leaf guard.
     if(credentialSource&&credentialContentFinding(path,content))return {excluded:path};
-    return {entry:manifestEntry(path,content,!!(st.mode & 0o111),indexBlobs.has(path.toString('base64')),onWarning)};
+    // Tracking never permits shipping private bytes. Record the content exclusion
+    // instead of aborting an unrelated build when a tracked fixture contains a key.
+    // Untracked material still reaches manifestEntry's fail-closed refusal.
+    try {return {entry:manifestEntry(path,content,executable,tracked,onWarning)};}
+    catch(error) {
+      if(!tracked||credentialSource||error.code!=='excluded-source-file')throw error;
+      keyExcluded.add(path.toString('hex'));return {excluded:path};
+    }
   });
   for (const leaf of leaves) {
     if (leaf?.entry) entries.push(leaf.entry);
@@ -858,7 +865,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       throw error;
     }
   }
-  try {await timed(beginSub,'cross-check',()=>crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedLinks,
+  try {await timed(beginSub,'cross-check',()=>crossCheckManifest({cwd,fs,entries,keyExcluded,identities,indexBlobs,trackedLinks,
     ignoredPaths:new Set(ignoredPaths.map(path=>path.toString('hex'))),exec,head,rootInfo,scoped:trackedOnly&&!!listFiles}));}
   catch(error) {throw error.code?.startsWith('manifest-')||['unshipped-test-file','unshipped-symlink'].includes(error.code)
     ? error : manifestRefusal('manifest-worktree-mismatch',error.detail??(error.path?relative(cwd,Buffer.isBuffer(error.path)?error.path.toString('utf8'):error.path):'.'));}
@@ -1436,6 +1443,18 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
       manifest ??= await buildManifest({cwd,exec,listFiles,fs,head:logicalHead,env,beginSub,onWarning:reportWarning});
       log(`manifest: ${delta ? `git-delta (${delta.changedCount} changed of ${delta.baseCount})` : `full-scan (${manifestReason})`}\n`);
       manifestDone({...(!delta?{manifestReason}:{}),substages:[...substages.values].map(([stage,ms])=>({stage,ms:Math.round(ms)}))});
+      // Exclusion must not turn a requested test run green by omitting its tests.
+      // Vitest run filters are substrings; related/full-suite discovery needs all tests.
+      if(argv[2]!=='check:standards') {
+        const filters=[];
+        for(let i=argv[0]==='npm'?4:3;i<argv.length;i++) {
+          if(argv[i]==='-t'||argv[i]==='--config'){i++;continue;}
+          if(!argv[i].startsWith('-'))filters.push(argv[i]);
+        }
+        const missing=manifest.excluded.find(path=>isTestFile(path)
+          &&(argv[2]==='related'||!filters.length||filters.some(filter=>path.toString('utf8').includes(filter))));
+        if(missing)return fallback('unshipped-test-file',missing.toString('utf8'));
+      }
       // Scanners may skip nonexistent paths. Require the entire requested scope
       // in the final snapshot, including warm-base leaves, before remote admission.
       if (Object.hasOwn(executionEnv, 'VERIFY_SCAN_FILES')) {

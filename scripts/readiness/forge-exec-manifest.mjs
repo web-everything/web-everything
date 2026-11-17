@@ -844,7 +844,10 @@ export function decodeManifest(manifest) {
     ||!manifest.tracked.every(v=>typeof v==='boolean'))throw new Error('Invalid base manifest entries');
   validateTestNames(paths);
   const keys=new Set(paths.map(p=>p.toString('hex')));
-  if(excluded.some(p=>keys.has(p.toString('hex'))||isTestFile(p)))throw new Error('Invalid base exclusions');
+  // Ordinary tracked tests may be content-excluded by the all-paths key scan.
+  // Path-policy exclusions remain ineligible tests; overlap is always invalid.
+  validateTestNames([...paths,...excluded]);
+  if(excluded.some(p=>keys.has(p.toString('hex'))||isTestFile(p)&&classifyManifestPath(p).excluded))throw new Error('Invalid base exclusions');
   return {entries:paths.map((path,i)=>({path,sha256:manifest.hashes[i],executable:manifest.executable[i],tracked:manifest.tracked[i]})),excluded};
 }
 // Decode Git's byte-safe tree protocol. Only policy-excluded paths may have

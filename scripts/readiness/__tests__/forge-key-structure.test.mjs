@@ -6,10 +6,10 @@ import * as filesystem from 'node:fs/promises';
 import {dirname,join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {describe,expect,it,vi} from 'vitest';
-import {credentialBufferFinding,credentialContentFinding,credentialTextFinding,manifestEntry,ordinaryPathKeyFinding,secretText} from '../forge-exec-manifest.mjs';
-import {buildManifest,main,runRemote} from '../remote-exec.mjs';
+import {credentialBufferFinding,credentialContentFinding,credentialTextFinding,decodeManifest,digestManifest,manifestEntry,manifestWire,ordinaryPathKeyFinding,secretText} from '../forge-exec-manifest.mjs';
+import {buildManifest,defaultExec,main,runRemote} from '../remote-exec.mjs';
 import {scanBundleRange} from '../remote-git-bundle.mjs';
-import {easternTimestamp} from '../forge-exec-run.mjs';
+import {easternTimestamp,verifyManifest} from '../forge-exec-run.mjs';
 import {warmTick} from '../forge-warm-base.mjs';
 // Load the CLI's lazy dependency during collection, before fallback test timeouts start.
 import '../heavy-admission.mjs';
@@ -532,9 +532,15 @@ describe('forge-key-structure: non-allowlistable blocking and local routing',()=
           expect(()=>manifestEntry(Buffer.from(name),content,false,tracked)).toThrow(expect.objectContaining({code:'excluded-source-file'}));
       });
     for(const [label,content] of [ordinaryMaterial[1],...escapedRsaMaterial,...ordinaryMaterial.filter(([name])=>name==='RSA 1536'||name==='computed double quotes'||name==='backtick values')])
-      it(`ordinary ${label} selects local fallback with tracked=${tracked} before transport`,async()=>{
+      it(`ordinary ${label} ${tracked?'is excluded from the manifest':'selects local fallback before transport'}`,async()=>{
         const f=dispatchFixture(content,{name:'docs/material.mjs',tracked});
         try {
+          if(tracked) {
+            const manifest=await buildManifest(f.options);
+            expect(manifest.excluded.map(path=>path.toString())).toEqual([f.name]);
+            expect(manifest.entries.some(entry=>entry.path.toString()===f.name)).toBe(false);
+            return;
+          }
           await expect(buildManifest(f.options)).rejects.toMatchObject({code:'excluded-source-file'});
           expect(await runRemote(f.options)).toMatchObject({mode:'not-started',reason:'excluded-source-file'});
           const local=vi.fn(async()=>7);
@@ -644,14 +650,16 @@ describe('forge-key-structure: never weaker than main',()=>{
   });
 });
 
-describe('forge-key-structure: shipped sources are scan-clean',()=>{
-  it.each(ordinaryFixtureFiles)('ships ordinary fixture source %s without excluding it',async name=>{
+describe('forge-key-structure: fixture paths never waive content scanning',()=>{
+  it.each(ordinaryFixtureFiles)('ships or excludes ordinary fixture source %s according to its bytes',async name=>{
     const content=readFileSync(name),f=dispatchFixture(content,{name});
     try {
-      expect(manifestEntry(Buffer.from(name),content,false,true)).toMatchObject({tracked:true});
+      const excluded=keyBearingFixtureNames.includes(name);
+      if(excluded)expect(()=>manifestEntry(Buffer.from(name),content,false,true)).toThrow(expect.objectContaining({code:'excluded-source-file'}));
+      else expect(manifestEntry(Buffer.from(name),content,false,true)).toMatchObject({tracked:true});
       const manifest=await buildManifest(f.options);
-      expect(manifest.entries.map(entry=>entry.path.toString())).toContain(name);
-      expect(manifest.excluded.map(path=>path.toString())).not.toContain(name);
+      expect(manifest.entries.some(entry=>entry.path.toString()===name)).toBe(!excluded);
+      expect(manifest.excluded.some(path=>path.toString()===name)).toBe(excluded);
     } finally {rmSync(f.root,{recursive:true,force:true});}
   });
   it.each(ordinaryFixtureFiles)('still blocks real key material at fixture path %s',async name=>{
@@ -660,7 +668,9 @@ describe('forge-key-structure: shipped sources are scan-clean',()=>{
       try {
         for(const tracked of [false,true])
           expect(()=>manifestEntry(Buffer.from(name),content,false,tracked)).toThrow(expect.objectContaining({code:'excluded-source-file'}));
-        await expect(buildManifest(f.options)).rejects.toMatchObject({code:'excluded-source-file'});
+        const manifest=await buildManifest(f.options);
+        expect(manifest.entries.some(entry=>entry.path.toString()===name)).toBe(false);
+        expect(manifest.excluded.map(path=>path.toString())).toEqual([name]);
       } finally {rmSync(f.root,{recursive:true,force:true});}
     }
   });
@@ -815,6 +825,63 @@ const redactionFixtureNames=['scripts/conveyor/__tests__/ci-heal-mark.test.mjs',
   'scripts/conveyor/__tests__/supersede-rule.test.mjs',
   'scripts/operations/__tests__/coroner-transcripts.test.mjs',
   'scripts/readiness/__tests__/remote-git-bundle.test.mjs'];
+const keyBearingFixtureNames=redactionFixtureNames.filter(name=>/\/(?:ci-heal-mark|coroner-transcripts)\.test\.mjs$/.test(name));
+
+describe('operator send-back IC_kwDORBt1-c8AAAABnW58dw: tracked fixture exclusion',()=>{
+  it.each([
+    ['npm','run','test:unit','--','fixture.test.mjs'],
+    ['npm','run','test:unit'],
+    ['npx','vitest','related','src/index.mjs','--run'],
+  ])('runs locally when the excluded fixture belongs to requested scope %j',async(...argv)=>{
+    const f=dispatchFixture(ed,{name:'fixture.test.mjs'});
+    try {
+      expect(await runRemote({...f.options,argv})).toMatchObject({mode:'not-started',reason:'unshipped-test-file'});
+      expect(f.options.exec.mock.calls.some(([call])=>call.file==='rsync'
+        ||call.file==='ssh'&&/ (?:prepare|run)$/.test(call.args.at(-1)))).toBe(false);
+    } finally {rmSync(f.root,{recursive:true,force:true});}
+  });
+  it('excludes a new tracked key-bearing test without throwing or shipping its bytes',async()=>{
+    const f=dispatchFixture(ed,{name:'new-fixture.test.mjs'});
+    try {
+      const manifest=await buildManifest(f.options);
+      expect(manifest.excluded.map(path=>path.toString())).toEqual([f.name]);
+      expect(manifest.entries.map(entry=>entry.path.toString())).toEqual(['package-lock.json']);
+      const wire=manifestWire(manifest);
+      expect(decodeManifest(wire).excluded).toEqual(manifest.excluded);
+      // Materialize only admitted bytes, then exercise the installed verifier.
+      const stage=join(f.root,'stage');mkdirSync(stage);
+      writeFileSync(join(stage,'package-lock.json'),'{}');
+      await verifyManifest(stage,wire,digestManifest(wire));
+      writeFileSync(join(stage,f.name),ed);
+      await expect(verifyManifest(stage,wire,digestManifest(wire))).rejects.toThrow();
+    } finally {rmSync(f.root,{recursive:true,force:true});}
+  });
+  it('builds the real repository manifest with tracked fixtures excluded',async()=>{
+    const cwd=realpathSync(new URL('../../..',import.meta.url));
+    const files=execFileSync('git',['ls-files','-z'],{cwd,maxBuffer:1<<26}).toString().split('\0').filter(Boolean);
+    const deleted=new Set(execFileSync('git',['ls-files','--deleted','-z'],{cwd,maxBuffer:1<<26}).toString().split('\0').filter(Boolean));
+    // The public baseline is this checkout's HEAD, not a mutable remote ref.
+    // All inventories, objects, links and worktree bytes still come from the real repo.
+    const exec=call=>defaultExec({...call,args:call.args.map(arg=>arg==='origin/main'?'HEAD':arg)});
+    const manifest=await buildManifest({cwd,exec,listFiles:async()=>files.filter(file=>!deleted.has(file))});
+    const excluded=new Set(manifest.excluded.map(path=>path.toString()));
+    const shipped=new Set(manifest.entries.map(entry=>entry.path.toString()));
+    for(const file of keyBearingFixtureNames) {
+      expect(excluded.has(file),file).toBe(true);
+      expect(shipped.has(file),file).toBe(false);
+    }
+    for(const file of files) {
+      if(deleted.has(file)) {
+        expect(shipped.has(file)||excluded.has(file),file).toBe(false);
+        continue;
+      }
+      // Tracked directory links are projected into regular manifest leaves.
+      if(lstatSync(join(cwd,file)).isSymbolicLink()) {
+        expect([...shipped].some(path=>path.startsWith(file+'/')),file).toBe(true);
+      } else expect(Number(shipped.has(file))+Number(excluded.has(file)),file).toBe(1);
+    }
+  },180000);
+});
 
 describe('forge-key-structure: perf and tracked files',()=>{
   it('bounds both buffer and content scans of 3 MiB adversarial and escape-heavy blobs to one second',()=>{
@@ -837,38 +904,37 @@ describe('forge-key-structure: perf and tracked files',()=>{
         expect(performance.now()-start,`${name} adversarial blob ${index}`).toBeLessThan(1000);
       }
   },30000);
-  it('requires zero private-key refusals over the repository tracked files',()=>{
+  it('pins the key-bearing fixtures in the repository tracked files',()=>{
     const files=new Set(execFileSync('git',['ls-files','-z'],{maxBuffer:1<<26}).toString().split('\0').filter(Boolean));
+    const deleted=new Set(execFileSync('git',['ls-files','--deleted','-z'],{maxBuffer:1<<26}).toString().split('\0').filter(Boolean));
     const hits=[];
     for(const file of files) {
+      if(deleted.has(file))continue;
       if(!lstatSync(file).isFile())continue;
       if(ordinaryPathKeyFinding(readFileSync(file)))hits.push(file);
     }
-    // Short fake bodies and unrelated decimal literals are not complete RSA private structures.
-    // Keep the inventory clean without path exemptions: real keys remain blocked at these paths.
-    expect(hits.sort()).toEqual([]);
+    expect(hits.sort()).toEqual([...keyBearingFixtureNames].sort());
   },120000);
-  it('builds a manifest containing the repository redaction and key-scanner fixtures',async()=>{
+  it('builds a manifest excluding only the key-bearing repository redaction fixtures',async()=>{
     const files=Object.fromEntries(redactionFixtureNames.map((name,i)=>[`fixture-${i}.test.mjs`,readFileSync(name)]));
     const f=dispatchFixture(Buffer.from('export const fixture = 1;'),{extraFiles:files});
     try {
       const manifest=await buildManifest(f.options);
-      expect(manifest.entries.map(entry=>entry.path.toString())).toEqual(expect.arrayContaining(Object.keys(files)));
-      expect(manifest.excluded).toEqual([]);
+      const excluded=redactionFixtureNames.flatMap((name,i)=>keyBearingFixtureNames.includes(name)?[`fixture-${i}.test.mjs`]:[]);
+      expect(manifest.excluded.map(path=>path.toString())).toEqual(excluded);
+      for(const name of Object.keys(files))expect(manifest.entries.some(entry=>entry.path.toString()===name)).toBe(!excluded.includes(name));
     } finally {rmSync(f.root,{recursive:true,force:true});}
   });
 });
 
 describe('forge-key-structure: warm-base export',()=>{
-  for(const shape of ['scan-clean repository fixtures','DER','base64','PEM'])
-    it(shape==='scan-clean repository fixtures'
-      ? 'publishes a ready warm base containing the repository redaction fixtures'
-      : `refuses a tracked ordinary file containing a ${shape} key without publishing a warm base`,async()=>{
+  for(const shape of ['repository fixtures','DER','base64','PEM'])
+    it(`publishes a ready warm base with key-bearing ${shape} excluded`,async()=>{
       const root=realpathSync(mkdtempSync(join(process.env.TMPDIR??tmpdir(),'forge-key-warm-')));
-      const sha='a'.repeat(40),clean=shape==='scan-clean repository fixtures';
+      const sha='a'.repeat(40),fixtures=shape==='repository fixtures';
       const material=shape==='DER'?ed:shape==='base64'?Buffer.from(ed.toString('base64'))
         :Buffer.from(['-----'+'BEGIN PRIVATE '+'KEY-----',ed.toString('base64'),'-----'+'END PRIVATE '+'KEY-----'].join('\n'));
-      const files={'package-lock.json':Buffer.from('{}'),...(clean
+      const files={'package-lock.json':Buffer.from('{}'),...(fixtures
         ? Object.fromEntries(redactionFixtureNames.map((name,i)=>[`fixture-${i}.test.mjs`,readFileSync(name)]))
         : {'material.bin':material})};
       const inventory=Object.entries(files).map(([name,bytes])=>{
@@ -890,16 +956,16 @@ describe('forge-key-structure: warm-base export',()=>{
       try {
         const tick=()=>warmTick({root,exec,install,clock:()=>Date.parse('2026-11-15T00:01:00Z'),
           runs:join(root,'runs'),receipts:join(root,'receipts'),log:vi.fn()});
-        if(clean) {
-          await expect(tick()).resolves.toMatchObject({sha});
-          expect(install).toHaveBeenCalledOnce();
-          expect(JSON.parse(readFileSync(join(root,sha,'READY'),'utf8'))).toMatchObject({sha});
-          for(const [name,bytes] of Object.entries(files))expect(readFileSync(join(root,sha,'tree',name))).toEqual(bytes);
-        } else {
-          await expect(tick()).rejects.toMatchObject({code:'excluded-source-file'});
-          expect(install).not.toHaveBeenCalled();
-          await expect(filesystem.lstat(join(root,sha))).rejects.toMatchObject({code:'ENOENT'});
-          await expect(filesystem.lstat(join(root,sha+'.tmp'))).rejects.toMatchObject({code:'ENOENT'});
+        await expect(tick()).resolves.toMatchObject({sha});
+        expect(install).toHaveBeenCalledOnce();
+        expect(JSON.parse(readFileSync(join(root,sha,'READY'),'utf8'))).toMatchObject({sha});
+        const manifest=decodeManifest(JSON.parse(readFileSync(join(root,sha,'manifest.json'),'utf8')));
+        const excluded=Object.entries(files).filter(([,bytes])=>ordinaryPathKeyFinding(bytes)).map(([name])=>name).sort();
+        expect(excluded.length).toBeGreaterThan(0);
+        expect(manifest.excluded.map(path=>path.toString())).toEqual(excluded);
+        for(const [name,bytes] of Object.entries(files)) {
+          if(excluded.includes(name))await expect(filesystem.lstat(join(root,sha,'tree',name))).rejects.toMatchObject({code:'ENOENT'});
+          else expect(readFileSync(join(root,sha,'tree',name))).toEqual(bytes);
         }
       } finally {rmSync(root,{recursive:true,force:true});}
     });

@@ -561,10 +561,10 @@ describe('PR #3577 review: failure detail is neutralised before it reaches a pub
     ['JSON-quoted key', '{"token": "abc123def456"}', 'abc123def456'],
     ['JSON password', '"password":"hunter2"', 'hunter2'],
     ['JWT', 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r', 'dBjftJeZ4CVP'],
-    // Preserve the runtime PEM while keeping this shippable test source free of key material.
-    ['PEM body', ['-----BEG'+'IN RSA PRIVATE'+' KEY-----',
-      'oM2HxMzoCHPLVfL1US1uAEQACKAABIwoEIIM'.split('').reverse().join(''),
-      '-----END RSA PRIVATE'+' KEY-----'].join('\n'),
+    // Fake PEM material exercises redaction and must be excluded from Forge snapshots.
+    ['PEM body', `-----BEGIN RSA PRIVATE KEY-----
+MIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo
+-----END RSA PRIVATE KEY-----`,
       'CKAABIwoEIIM'.split('').reverse().join('')],
     ['gitlab / npm token', 'glpat-abcdefghij0123456789 npm_abcdefghijklmnopqrst0123', 'abcdefghij0123456789'],
     ['quoted value with spaces', 'GH_TOKEN="abc def ghi"', 'def ghi'],

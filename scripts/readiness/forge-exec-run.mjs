@@ -10,7 +10,7 @@ import {join, relative} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {cpus, loadavg, freemem, totalmem} from 'node:os';
 import {BASE_RETENTION, baseGuard, readyBases, readBase, copyLeaves, baseFile, createBasePin, claimPrewarm, materializeWorktree, mirrorReadOnlyForSlots, validBundleEvidence, readMainFetchStamp} from './forge-exec-bases.mjs';
-import {decodeManifest} from './forge-exec-manifest.mjs';
+import {classifyManifestPath,decodeManifest} from './forge-exec-manifest.mjs';
 import {readPruneStatus, validPruneStatus} from './forge-cache-prune.mjs';
 const LIMIT = 4 * 1024 * 1024;
 const FORGE_RUN_WALL_MS = 1_740_000;
@@ -345,7 +345,9 @@ export async function verifyManifest(root, manifest, manifestDigest, {fs = files
   if (sibling && [...paths,...excluded].some(path => !siblingPrefixes.some(prefix => path.subarray(0,prefix.length).equals(prefix))))
     throw new Error('Unsupported sibling manifest path');
   const expected = new Map(paths.map((path, i) => [path.toString('hex'), {path, sha256:manifest.hashes[i], executable:manifest.executable[i],tracked:manifest.tracked[i]}]));
-  for (const path of excluded) if (expected.has(path.toString('hex')) || isTestFile(path) || /\.(test|spec)\./.test(pathParts(path).at(-1).toString('latin1')))
+  validateTestNames([...paths,...excluded]);
+  for (const path of excluded) if (expected.has(path.toString('hex')) || classifyManifestPath(path).excluded
+    && (isTestFile(path) || /\.(test|spec)\./.test(pathParts(path).at(-1).toString('latin1'))))
     throw new Error('Manifest excluded test or overlapping path');
   const parents = new Set();
   for (const path of paths) for (let i = 0; i < path.length; i++) if (path[i] === 47) parents.add(path.subarray(0, i).toString('hex'));
