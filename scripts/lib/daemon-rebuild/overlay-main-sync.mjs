@@ -265,12 +265,13 @@ function needsYou(root, env, ref, error, io = fs, localAlerted = false, parkedTi
       io.mkdirSync(dirname(file), { recursive: true });
       io.appendFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), kind: 'overlay-main-sync-needs-you', detail })}\n`);
     } catch (error) {
-      // A delivered park alert can be acknowledged even if its local copy failed.
-      // Retain ordinary-failure fallback and retry undelivered park alerts.
-      if (!parkedTip || !published) throw error;
+      // Park acknowledgement requires both destinations; feed retries deduplicate.
+      // Ordinary failures retain the independent diagnostic fallback.
+      if (!parkedTip) throw error;
+      return { published: false, localAlerted: false };
     }
   }
-  return published;
+  return { published, localAlerted: true };
 }
 function failureAlert(root, env, ref, error, io = fs, immediate = false) {
   const at = Date.now();
@@ -294,10 +295,10 @@ function failureAlert(root, env, ref, error, io = fs, immediate = false) {
         failureLocalAlertedAt: state.failureLocalAlertedAt, parkedTip: state.parkedTip };
       // Publication failure is pending delivery, not a state-storage failure:
       // persist the streak without acknowledging it or replaying the local alert in fallback.
-      const published = needsYou(root, env, ref, state.failureReason[ref] ?? 'Overlay main sync failed; original error reason unavailable',
+      const delivery = needsYou(root, env, ref, state.failureReason[ref] ?? 'Overlay main sync failed; original error reason unavailable',
         io, Object.hasOwn(state.failureLocalAlertedAt, ref), state.parkedTip?.[ref]);
-      if (!published) {
-        state.failureLocalAlertedAt[ref] ??= at;
+      if (!delivery.published) {
+        if (delivery.localAlerted) state.failureLocalAlertedAt[ref] ??= at;
         return;
       }
       delete state.failureLocalAlertedAt[ref];
@@ -331,10 +332,13 @@ function parked(file, synced, ref, tip, registration, io = fs) {
   if (synced.failureTip[ref] === tip && synced.failureRegistration[ref] === registrationKey(registration)) {
     return synced.parkedTip[ref] === tip;
   }
+  const wasParked = Object.hasOwn(synced.parkedTip, ref);
   const reset = state => {
     for (const key of [...failureKeys, 'firstFailureAt', 'failureAlertedAt', 'failureLocalAlertedAt', 'failureReason', 'errorAt']) delete state[key][ref];
-    clearRetry(state, ref);
-    delete state.attemptedMain[ref]; delete state.pushRetryMain[ref]; delete state.pushRetryAfter[ref];
+    if (wasParked) {
+      clearRetry(state, ref);
+      delete state.attemptedMain[ref]; delete state.pushRetryMain[ref]; delete state.pushRetryAfter[ref];
+    }
   };
   updateSyncState(file, reset, io);
   reset(synced);

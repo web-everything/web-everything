@@ -944,6 +944,35 @@ describe('overlay main sync', () => {
     expect(spawnFn).not.toHaveBeenCalled();
   }, 90_000);
 
+  it.each(['tip', 'registration'])('unparked %s change preserves the same-main cooldown and retry budget after one failure', async change => {
+    const f = fixture(), clock = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000), spawnFn = spawner();
+    f.deps.testRunner = vi.fn(async () => ({ status: 1, stderr: 'temporary failure' }));
+    await expect(job(f)).rejects.toThrow(/temporary failure/);
+    const before = json(sidecar(f));
+    expect(before.failureCount[ref]).toBe(1);
+    expect(before.parkedTip[ref]).toBeUndefined();
+    if (change === 'tip') {
+      ok(f.root, ['checkout', '-q', ref]);
+      write(f.root, 'author.txt', 'author pushed'); ok(f.root, ['add', '.']); ok(f.root, ['commit', '-qm', 'author push']);
+      ok(f.root, ['push', '-q', 'origin', ref]); ok(f.root, ['checkout', '-q', 'main']);
+    } else {
+      const file = overlayFilePath(f.root, f.env), registered = json(file);
+      registered.overlays[0].addedAt = 're-registered'; fs.writeFileSync(file, JSON.stringify(registered));
+    }
+    expect(tick(f, { spawnFn })).toMatchObject({ started: [], skipped: [ref] });
+    const after = json(sidecar(f));
+    for (const key of ['retryMain', 'retryTries', 'retryAfter']) expect(after[key][ref]).toBe(before[key][ref]);
+    expect(after.failureCount[ref]).toBeUndefined();
+    expect(spawnFn).not.toHaveBeenCalled();
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(1);
+    clock.mockReturnValue(before.retryAfter[ref]);
+    expect(tick(f, { spawnFn }).started).toEqual([ref]);
+    fs.unlinkSync(marker(f));
+    await expect(job(f)).rejects.toThrow(/temporary failure/);
+    expect(json(sidecar(f)).retryTries[ref]).toBe(2);
+    expect(json(sidecar(f)).retryAfter[ref]).toBe(Date.now() + 20 * 60_000);
+  }, 90_000);
+
   it.each(['tip', 'registration'])('%s change un-parks, clears old cooldowns and resets the failure count', async change => {
     const f = fixture();
     f.deps.testRunner = vi.fn(async () => ({ status: 1, stderr: 'persistent failure' }));
@@ -1043,22 +1072,22 @@ describe('overlay main sync', () => {
     expect(spawnFn).not.toHaveBeenCalled();
   }, 90_000);
 
-  it.each(['mkdirSync', 'appendFileSync'])('park alert reaches the feed when local %s persistently fails', async method => {
+  it.each(['mkdirSync', 'appendFileSync'])('park alert retries local %s on the same feed and acknowledges only after recovery', async method => {
     const f = fixture(), spawnFn = spawner();
     f.deps.testRunner = vi.fn(async () => ({ status: 1, stderr: 'persistent failure' }));
     const file = alertsFilePath(f.root, f.env);
     const target = method === 'mkdirSync' ? dirname(file) : file;
     const original = fs[method];
     const failedWrite = vi.fn(() => { throw new Error('local alert unavailable'); });
-    vi.spyOn(fs, method).mockImplementation((path, ...args) => path === target
+    const localWrite = vi.spyOn(fs, method).mockImplementation((path, ...args) => path === target
       ? failedWrite() : original(path, ...args));
     f.deps.io[method] = (...args) => fs[method](...args);
     for (let i = 0; i < 3; i++) await expect(job(f)).rejects.toThrow(/persistent failure/);
     expect(failedWrite).toHaveBeenCalled();
     expect(alerts(f)).toEqual([]);
     expect(json(sidecar(f)).parkedTip[ref]).toBe(f.oldSha);
-    const acknowledgedAt = json(sidecar(f)).failureAlertedAt[ref];
-    expect(acknowledgedAt).toEqual(expect.any(Number));
+    expect(json(sidecar(f)).failureAlertedAt[ref]).toBeUndefined();
+    expect(json(sidecar(f)).failureLocalAlertedAt[ref]).toBeUndefined();
     const expected = [expect.objectContaining({
       kind: 'overlay-main-sync-parked', ref, head: parkHead(ref, f.oldSha),
       reason: expect.stringContaining('parked after 3 failures'),
@@ -1067,7 +1096,18 @@ describe('overlay main sync', () => {
     expect(tick(f, { spawnFn }).skipped).toEqual([ref]);
     expect(await job(f)).toEqual({ skipped: true, reason: 'parked' });
     expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toEqual(expected);
+    expect(json(sidecar(f)).failureAlertedAt[ref]).toBeUndefined();
+    expect(alerts(f)).toEqual([]);
+    localWrite.mockRestore();
+    expect(await job(f)).toEqual({ skipped: true, reason: 'parked' });
+    const acknowledgedAt = json(sidecar(f)).failureAlertedAt[ref];
+    expect(acknowledgedAt).toEqual(expect.any(Number));
+    expect(alerts(f)).toHaveLength(1);
+    expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toEqual(expected);
+    expect(fs.readFileSync(f.env.WE_NEEDS_YOU_FEED, 'utf8').trim().split('\n')).toHaveLength(1);
+    expect(await job(f)).toEqual({ skipped: true, reason: 'parked' });
     expect(json(sidecar(f)).failureAlertedAt[ref]).toBe(acknowledgedAt);
+    expect(alerts(f)).toHaveLength(1);
     expect(f.deps.testRunner).toHaveBeenCalledTimes(3);
     expect(spawnFn).not.toHaveBeenCalled();
   }, 90_000);
