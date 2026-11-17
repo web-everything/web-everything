@@ -1,10 +1,10 @@
 /** Read-only host inspection; NOT yet wired into daemons. */
-import { accessSync, constants, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { accessSync, constants, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { dirname, delimiter, join, resolve } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import { cacheFenceBlocked, decideHostRole, defaultCachePath as hostCachePath, getThisHost, readOwnerRemote } from '../lib/daemon-host-guard.mjs';
+import { fileURLToPath } from 'node:url';
+import { createGitHubOwnershipSource, getLegacyOwnerValues, getThisHost, resolveHostRole, runGhApi } from '../lib/daemon-host-guard.mjs';
 import { DAEMON_CLONE_SEED, classifyOverlayRecord } from '../lib/daemon-clone-registry.mjs';
 import { defaultCachePath } from '../lib/github-app-auth-env.mjs';
 
@@ -25,10 +25,9 @@ export async function runPreflight({ thisHost, io, env = process.env, now = Date
   await check('role', async () => {
     const result = await io.resolveRole({ thisHost, now });
     return { ok: ['active', 'standby'].includes(result?.role) && typeof result?.reason === 'string'
-      && result.source !== 'remote-failed' && !['invalid-input', 'owner-unreadable', 'start-requires-fresh-read', 'clock-skew'].includes(result.reason),
+      && result.source !== 'remote-failed' && !['invalid-input', 'owner-unreadable'].includes(result.reason),
     detail: `role=${result?.role} reason=${result?.reason}` };
   });
-  await check('cache-lock', () => io.cacheLock());
   for (const tool of ['node', 'claude', 'gh', 'codex']) {
     await check(`tool:${tool}`, async () => ({ ok: await io.which(tool) === true, detail: tool }));
   }
@@ -102,38 +101,20 @@ function discoverCloneDirs(workspace, { env }) {
 
 export function cliIO(env = process.env, options = {}) {
   for (const key of Object.keys(options)) {
-    if (!['readOwnerRemote', 'execFileSync', 'spawnSync', 'daemonCloneRoots'].includes(key)) {
+    if (!['source', 'legacyHost', 'execFileSync', 'spawnSync', 'daemonCloneRoots'].includes(key)) {
       throw new TypeError(`unknown cliIO option: ${key}`);
     }
   }
-  const { readOwnerRemote: readRemote = readOwnerRemote, execFileSync: exec = execFileSync,
+  const { source, legacyHost, execFileSync: exec = execFileSync,
     spawnSync: spawn = spawnSync, daemonCloneRoots: cloneRoots = discoverCloneDirs } = options;
   const checkout = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+  const legacyOwnerValues = getLegacyOwnerValues(env);
   return {
-    cacheLock: () => {
-      const path = hostCachePath(env.HOME || homedir());
-      for (const lock of [`${path}.lock`, `${path}.lock.fence`]) {
-        if (lock.endsWith('.fence') && !cacheFenceBlocked(path)) continue;
-        try { lstatSync(lock); }
-        catch (error) {
-          if (error.code === 'ENOENT') continue;
-          throw error;
-        }
-        return { ok: false, detail: `${lock}: ownership fenced; stop all guard writers and inspect the holder, cache permissions and disk capacity; remove the lock only after repairing cache evidence, then restart with a fresh owner read` };
-      }
-      return { ok: true, detail: 'no retained lock' };
-    },
-    resolveRole: async ({ thisHost, now }) => {
-      let remote;
-      try { remote = await readRemote(); } catch { /* Unreadable startup evidence fails closed. */ }
-      const readable = (remote?.status === 'ok' && typeof remote.owner === 'string' && remote.owner !== '')
-        || remote?.status === 'unset';
-      if (!readable) return { ...decideHostRole({ thisHost, now }), source: 'remote-failed' };
-      return { ...decideHostRole({ thisHost, now, atStart: true,
-        owner: remote.status === 'ok' ? remote.owner : remote.status === 'unset' ? '' : null,
-        ownerReadAt: remote.status === 'error' ? undefined : now }),
-      source: remote.status === 'error' ? 'remote-failed' : 'remote' };
-    },
+    resolveRole: ({ thisHost = getThisHost({ home: env.HOME || homedir(), create: false }) } = {}) =>
+      resolveHostRole({ thisHost, legacyHost, legacyOwnerValues, source: source ?? createGitHubOwnershipSource({
+        legacyOwnerValues,
+        ghApi: (path) => runGhApi(path, { execFile: (file, args, options) => exec(file, args, { ...options, env }) }),
+      }) }),
     which: (tool) => (env.PATH ?? '').split(delimiter).filter(Boolean).some((dir) => {
       try {
         const path = join(dir, tool);
@@ -163,13 +144,21 @@ export function cliIO(env = process.env, options = {}) {
   };
 }
 
-export async function main({ thisHost = getThisHost(), env = process.env,
+export async function main({ thisHost, env = process.env,
   io = cliIO(env), log = console.log, now = Date.now() } = {}) {
   const result = await runPreflight({ thisHost, env, io, now });
   log(formatPreflight(result));
   return result.ok ? 0 : 1;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+function isEntryPoint() {
+  if (!process.argv[1]) return false;
+  try {
+    // Normalize both paths, including checkout views and --preserve-symlinks-main.
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch { return false; } // An importer may supply a nonexistent argv path.
+}
+
+if (isEntryPoint()) {
   process.exitCode = await main();
 }
