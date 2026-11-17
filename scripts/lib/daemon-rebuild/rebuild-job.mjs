@@ -23,6 +23,7 @@
  */
 import { spawn as spawnChild, execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import { hostname } from 'node:os';
 import {
   existsSync, mkdirSync, readFileSync, rmSync, writeFileSync,
@@ -68,20 +69,41 @@ export const REBUILD_JOB_KINDS = kindRegistry([REBUILD_JOB_KIND]);
 
 /** The `rebuildAsJob` block of daemon-rebuild-settings.json (missing / unreadable = off), as the tool layer over the
  *  team's platform preference `rebuildAsJob` (shared policy cascade, we:scripts/lib/policy-cascade.mjs). */
-export function loadRebuildAsJobSettings(path = SETTINGS_PATH, { env = process.env } = {}) {
+export function loadRebuildAsJobSettings(path = SETTINGS_PATH, { env = process.env, log = console.error } = {}) {
   try {
     let tool;
     try { tool = JSON.parse(readFileSync(path, 'utf8'))?.rebuildAsJob; } catch { tool = undefined; }
-    const raw = cascadePolicy('rebuildAsJob', tool, { env,
-      standard: { entries: [], minIntervalMs: DEFAULT_REBUILD_JOB_MIN_INTERVAL_MS } }).layered;
-    if (!raw || typeof raw !== 'object') return { entries: [], minIntervalMs: DEFAULT_REBUILD_JOB_MIN_INTERVAL_MS };
+    const resolved = cascadePolicy('rebuildAsJob', tool, { env, log,
+      valid: { minIntervalJitterPct: Number.isFinite },
+      standard: { entries: [], minIntervalMs: DEFAULT_REBUILD_JOB_MIN_INTERVAL_MS, minIntervalJitterPct: 20 } });
+    const raw = resolved.value;
+    if (!raw || typeof raw !== 'object') return { entries: [], minIntervalMs: DEFAULT_REBUILD_JOB_MIN_INTERVAL_MS, minIntervalJitterPct: 20 };
+    const jitterPct = clampJitterPct(raw.minIntervalJitterPct);
+    if (jitterPct !== raw.minIntervalJitterPct) {
+      log(`daemon-rebuild-job: minIntervalJitterPct=${jitterPct} (${resolved.sources.minIntervalJitterPct ?? 'standard'}; clamped to 0-100)`);
+    }
     return {
       entries: Array.isArray(raw.entries) ? raw.entries.filter((e) => typeof e === 'string' && e) : [],
+      minIntervalJitterPct: jitterPct,
       minIntervalMs: Number.isFinite(raw.minIntervalMs) && raw.minIntervalMs >= 0 ? raw.minIntervalMs : DEFAULT_REBUILD_JOB_MIN_INTERVAL_MS,
     };
   } catch {
-    return { entries: [], minIntervalMs: DEFAULT_REBUILD_JOB_MIN_INTERVAL_MS };
+    return { entries: [], minIntervalMs: DEFAULT_REBUILD_JOB_MIN_INTERVAL_MS, minIntervalJitterPct: 20 };
   }
+}
+
+function clampJitterPct(value) {
+  return Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 20;
+}
+
+/** Stable across restarts and checkout paths; an injected RNG must also stay within the spacing floor. */
+export function rebuildJobInterval({ minIntervalMs, minIntervalJitterPct }, entries = [], rng) {
+  const pct = clampJitterPct(minIntervalJitterPct);
+  if (pct === 0) return minIntervalMs;
+  const name = entries.map(e => basename(e)).sort().join('\0');
+  const fraction = rng ? rng() : createHash('sha256').update(name).digest().readUInt32BE(0) / 0xffffffff;
+  const bounded = Number.isFinite(fraction) ? Math.max(0, Math.min(1, fraction)) : 1;
+  return minIntervalMs * (1 + bounded * pct / 100);
 }
 
 /**
@@ -149,12 +171,12 @@ function clockFor(dir) {
  * `job` (the in-flight or just-started job) and `finishedJobs` (outcomes consumed this tick).
  * @param {{root: string, env?: object, log?: object, mainOnly?: boolean, entries?: string[],
  *   adopt: (o?: object) => Promise<object>, store?: object, reattach?: Function, clock?: object, now?: () => number,
- *   codeSha?: string, snapshot?: object, settings?: object, evict?: Function}} o
+ *   codeSha?: string, snapshot?: object, settings?: object, evict?: Function, rng?: () => number}} o
  */
 export async function rebuildCloneAsJob({
   root, env = process.env, log = console, mainOnly = false, entries = [], adopt,
   store = createJobStore(rebuildJobsDir(root, env)), reattach = reattachTick, clock, now = () => Date.now(),
-  codeSha, snapshot, settings = loadRebuildAsJobSettings(), evict = evictSnapshots,
+  codeSha, snapshot, settings = loadRebuildAsJobSettings(undefined, { env }), evict = evictSnapshots, rng,
 }) {
   const say = (m) => log.error?.(`daemon-rebuild-job: ${m}`);
   mkdirSync(store.dir, { recursive: true });
@@ -225,10 +247,11 @@ export async function rebuildCloneAsJob({
     .sort((a, b) => Date.parse(b.job.finishedAt || 0) - Date.parse(a.job.finishedAt || 0))[0];
   const lastRes = last ? readResult(store.dir, last.id) : null;
   const sinceMs = last ? now() - Date.parse(last.job.finishedAt || 0) : Infinity;
-  if (last && !lastRes?.readyRecorded && sinceMs < settings.minIntervalMs) {
+  const intervalMs = rebuildJobInterval(settings, entries, rng);
+  if (last && !lastRes?.readyRecorded && sinceMs < intervalMs) {
     housekeeping();
     return {
-      moved: false, reason: 'rebuild-job-spaced', retryInMs: settings.minIntervalMs - sinceMs, plan: r.plan, finishedJobs, alerts: r.alerts ?? [],
+      moved: false, reason: 'rebuild-job-spaced', retryInMs: intervalMs - sinceMs, plan: r.plan, finishedJobs, alerts: r.alerts ?? [],
     };
   }
   let queued;

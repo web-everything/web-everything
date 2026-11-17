@@ -4449,3 +4449,9 @@ a successful earlier step can displace the failure summary used by live-smoke
 classification. The CLI timing regression covers a failed read after a successful
 step and successful JSON output; the GitHub-outage soak must hold as
 `smoke-env-unavailable` without writing a smoke rejection.
+Operator prototype-load waiver tests live in `scripts/operations/__tests__/ruled-weakened-store.test.mjs`.
+Use an injected HOME and filesystem: the append-only ops store lives under
+`~/workspace/.operations/coordination/ruled-weakened.jsonl`. Tool, platform, then ops entries
+share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
+The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
+`--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.

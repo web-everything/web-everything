@@ -801,4 +801,15 @@ describe('daemon smoke slots', () => {
     await slotB.release(); await c.release();
     expect(state().holders).toEqual([]);
   });
+
+  it('gives concurrent same-process acquires their own tickets and fails closed on corrupt state', async () => {
+    const a = await acquire(process.pid);
+    const b = await acquire(process.pid);
+    expect(state().holders).toHaveLength(2);
+    await a.release();
+    expect(state().holders).toHaveLength(1);
+    await b.release();
+    writeFileSync(join(stateDir, 'smoke-slots.json'), '{not json');
+    await expect(acquire(process.pid)).rejects.toThrow();
+  });
 });
