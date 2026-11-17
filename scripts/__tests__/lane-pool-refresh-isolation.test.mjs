@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { sharedRepos, withGhStub } from './fixtures/shared-git-fixture.mjs';
@@ -50,6 +50,55 @@ afterEach(() => {
 });
 
 describe('lane-pool refresh isolation (3725 defect 2)', () => {
+  it.each([
+    ['without force', []],
+    ['with force', ['--force']],
+  ])('rejects bare --lane %s before resetting or unmapping any lane', (_name, extra) => {
+    commit('next\n');
+    for (const n of [1, 2, 3]) {
+      writeFileSync(join(lane(n), 'file.txt'), `dirty work ${n}\n`);
+      writeFileSync(join(lane(n), 'untracked.txt'), `untracked work ${n}\n`);
+    }
+    const registry = join(referenceDir, '.claude', 'lane-ports.json');
+    mkdirSync(join(referenceDir, '.claude'), { recursive: true });
+    const mapping = JSON.stringify({
+      101: { repo: 'refresh-test', lane: 1 },
+      102: { repo: 'refresh-test', lane: 2 },
+      103: { repo: 'refresh-test', lane: 3 },
+    });
+    writeFileSync(registry, mapping);
+    const before = [1, 2, 3].map((n) => git(['status', '--porcelain'], lane(n)));
+
+    const r = runPool(['refresh', '--lane', ...extra]);
+    expect.soft(r.code, r.err).not.toBe(0);
+    expect.soft(r.err).toContain('--lane requires a lane number');
+    for (const n of [1, 2, 3]) {
+      expect.soft(head(n)).toBe(oldHead);
+      expect.soft(readFileSync(join(lane(n), 'file.txt'), 'utf8')).toBe(`dirty work ${n}\n`);
+      expect.soft(git(['status', '--porcelain'], lane(n))).toBe(before[n - 1]);
+    }
+    expect(readFileSync(registry, 'utf8')).toBe(mapping);
+  });
+
+  it('rejects malformed lane numbers before refreshing any lane', () => {
+    commit('next\n');
+    for (const value of ['', '0', '01', '-1', '+1', '1.0', '1e0', '0x1', ' 1', '1 ', '1\n', '１', '1\u200b', '9007199254740993', '9'.repeat(400)]) {
+      const r = runPool(['refresh', `--lane=${value}`, '--force']);
+      expect(r.code, JSON.stringify(value)).not.toBe(0);
+      expect(r.err, JSON.stringify(value)).toContain('--lane requires a lane number');
+      for (const n of [1, 2, 3]) expect(head(n)).toBe(oldHead);
+    }
+  });
+
+  it('rejects bare --lane in every other lane consumer before command-specific actions', () => {
+    for (const command of ['acquire', 'release', 'status', 'path', 'remove', 'reclaim', 'keep', 'adopt', 'map', 'unmap']) {
+      const r = runPool([command, '--lane', '--force']);
+      expect(r.code, command).not.toBe(0);
+      expect(r.err, command).toContain('--lane requires a lane number');
+      for (const n of [1, 2, 3]) expect(head(n)).toBe(oldHead);
+    }
+  });
+
   it('--lane=N refreshes exactly the selected lane', () => {
     const next = commit('next\n');
     const r = runPool(['refresh', '--lane=2']);

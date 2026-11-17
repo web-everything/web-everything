@@ -5815,4 +5815,14 @@ if (unknownFlags.length) {
   );
 }
 
+// Validate before repo resolution or dispatch so every flags.lane consumer is protected.
+// A bare --lane is true, and Number(true) would silently select lane 1 even with --force.
+// Use an absolute end assertion: `$` alone also accepts a trailing newline.
+if (flags.lane !== undefined && (
+  typeof flags.lane !== 'string' || !/^[1-9]\d*(?![\s\S])/.test(flags.lane) ||
+  !Number.isSafeInteger(Number(flags.lane))
+)) {
+  fail('--lane requires a lane number');
+}
+
 await COMMANDS[cmd](resolveRepo());
