@@ -893,7 +893,9 @@ const collapseWhitespace = value => String(value ?? '').replace(/\s+/g, ' ').tri
 // decimal inputs and malformed columns (x.mjs:1.2 or x.mjs:1:2x); never erase their numeric prefix.
 // Only line and optional column are locations; a third numeric segment must preserve the whole token.
 const PATH_COLON_LOCATION = /((?:[\w.@~+-]+\/)*[\w@~+-][\w.@~+-]*\.[a-z0-9]{1,8})(:\d+(?::\d+)?)(?=$|[\s'"`)\]}]|[.,;](?:\s|$))/gi;
-const URI_SCHEME_PREFIX = /^[^a-z0-9]*[a-z][a-z0-9+.-]*:/i;
+// A scheme can sit anywhere in the token, not only at its start: `fetch(data:...`, `f(a,mailto:`, `url=urn:`,
+// `x||file:` are expressions around a URL. Any scheme-shaped `name:` earlier in the token keeps the whole location.
+const URI_SCHEME_PREFIX = /(?:^|[^a-z0-9+.-])[a-z][a-z0-9+.-]*:/i;
 const LINE_WORD_LOCATION =/\b(line|L) +\d+(?=$|[ )]|[.,;:](?: |$))/gi;
 // Do not guess where code/quotes end (including unmatched, escaped or Unicode quotes).
 // Conservatively retain word-style locations throughout such a summary; explicit path:line handling is separate.

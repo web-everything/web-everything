@@ -924,6 +924,14 @@ describe('summary canonicalization strips only whitespace and line-location toke
       expect(held(d)).toEqual([1]);
       expect(d.dispositions.get(1).state).not.toBe('released carded');
     });
+    it('(d) keeps the payload number when the slashless URL sits inside an expression', () => {
+      for (const prefix of ['fetch(data:text/plain,', 'f(a,mailto:', 'url=urn:', '(file:', '[data:text/plain,',
+        '{u:file:', 'x||data:text/plain,', "load('data:text/plain,", 'a=`mailto:']) {
+        const at = n => `Rejects ${prefix}src/input.txt:${n} payload`;
+        expect(summaryCanonical(at(10), urlFile)).toBe(at(10));
+        expect(summaryCanonical(at(10), urlFile)).not.toBe(summaryCanonical(at(20), urlFile));
+      }
+    });
     it('(c) control: a plain src/input.txt:N location still canonicalizes equal', () => {
       const plain = n => `Rejects src/input.txt:${n} payload`;
       expect(summaryCanonical(plain(10), urlFile)).toBe(summaryCanonical(plain(20), urlFile));
