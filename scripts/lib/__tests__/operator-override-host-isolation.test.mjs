@@ -34,11 +34,15 @@ describe('host operator-override store isolation under vitest', () => {
     expect(readOperatorOverrides({ log: () => {} })).toEqual({ readable: true, values: {} });
   });
   it('a store at the default lookup path is the sandbox one: it is read, so only this file can populate it', () => {
-    const sandboxFile = seed(userInfo().homedir);
+    // Fail closed BEFORE any write or delete: if the setup override is not in effect (a config with no setupFiles,
+    // a test mocking node:os), userInfo().homedir is the REAL account home and this test must not touch it.
+    const home = userInfo().homedir;
+    expect(home.startsWith(join(tmpdir(), 'we-test-home-'))).toBe(true);
+    const sandboxFile = seed(home);
     try {
       expect(sandboxFile).toBe(operatorOverridesPath());
       expect(readOperatorOverrides({ log: () => {} })).toEqual({ readable: true, values });
-    } finally { rmSync(userInfo().homedir, { recursive: true, force: true }); }
+    } finally { rmSync(sandboxFile, { force: true }); }
     expect(readOperatorOverrides({ log: () => {} })).toEqual({ readable: true, values: {} });
   });
 });
