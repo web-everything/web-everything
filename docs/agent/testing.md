@@ -4404,3 +4404,12 @@ automatic discovery and explicit resume behind both guards and both retry budget
 Exercise pending CI after timing settings change, revoked clearance, green completion,
 and budget exhaustion after that intervening failure. Unknown pending outcomes remain
 non-replayable; CI-held provenance does not establish that a write was never applied.
+
+## Bounded red-team probe fairness
+
+`red-team-dispatch-queue.test.mjs` pins the two-probe limit per repository and
+least-recently-probed turns persisted as optional `lastProbeTurn` entry fields.
+Keep historical entries without the field loadable, reject malformed turns, and
+exercise five still-blocked entries across three ticks with a reload between ticks.
+Probe selection must preserve runnable FIFO admission and distinguish waiting for
+a probe turn from disabled probes and runnable capacity holds.

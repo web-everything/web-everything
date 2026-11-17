@@ -1026,7 +1026,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       expect(numbers(f.queue.admit(repo, 2))).toEqual([1, 2, 3]);
       expect(numbers(f.queue.admit(repo, 0))).toEqual([1]); // a probe uses no slot, so it still runs at zero admission
     });
-    it('probes every blocked head and rotates heads that stay blocked to the tail after maxAttempts', async () => {
+    it('caps probes at two and rotates heads that stay blocked to the tail after maxAttempts', async () => {
       const f = fixture();
       await f.queue.sync(repo, candidates([1, 2, 3, 4]));
       for (const pr of [1, 2, 3]) {
@@ -1035,14 +1035,14 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
           dispatched: [], notStarted: [1, 2, 3].map(n => ({ prNumber: n, reason: 'review-unfinished' })) });
         break;
       }
-      expect(numbers(f.queue.admit(repo, 1))).toEqual([1, 2, 3, 4]); // all probes plus 1 runnable slot
+      expect(numbers(f.queue.admit(repo, 1))).toEqual([1, 2, 4]); // at most 2 probes plus 1 runnable slot
       for (let tick = 0; tick < 3; tick++) {
         const ids = numbers(f.queue.admit(repo, 1));
         const why = n => (n === 4 ? 'no review capacity left' : 'review-unfinished');
         await f.queue.settle(repo, { rows: ids.map(n => ({ prNumber: n, action: 'skip', why: why(n) })),
           dispatched: [], notStarted: ids.map(n => ({ prNumber: n, reason: why(n) })) });
       }
-      expect(numbers(f.queue.entries())).toEqual([4, 1, 2, 3]); // all blocked heads rotated behind #4
+      expect(numbers(f.queue.entries())).toEqual([4, 3, 1, 2]); // blocked heads rotate after maxAttempts, independently of probe turns
       expect(numbers(f.queue.entries())).toContain(3);
     });
     const persistedBlocked = (f, reason, runnable = []) => {
@@ -1052,31 +1052,89 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       }))));
       return f.open();
     };
-    it.each(['review-unfinished', 'planner-skip'])('probes and settles all five persisted %s entries with free capacity, without holds', reason => {
+    it.each(['review-unfinished', 'planner-skip'])('probes all five persisted %s entries within three ticks, capped at two even across restarts', reason => {
+      const f = fixture();
+      let queue = persistedBlocked(f, reason);
+      const turns = [[1, 2], [3, 4], [1, 5]]; // selected entries retain queue order in runner input
+      const seen = new Set();
+      for (const expected of turns) {
+        f.logs.length = 0;
+        runWithRedTeamQueue({ queue, ...inputs([1, 2, 3, 4, 5], { capacity: capacity(4) }), log: f.log,
+          run: options => {
+            const ids = options.plan.refusals.map(row => row.prNumber);
+            expect(ids).toEqual(expected);
+            expect(options.rawPrs.map(row => row.number)).toEqual(expected);
+            ids.forEach(pr => seen.add(pr));
+            return { rows: ids.map(prNumber => ({ prNumber, action: 'skip', why: reason })),
+              notStarted: ids.map(prNumber => ({ prNumber, reason })) };
+          } });
+        expect(f.logs.filter(line => line.startsWith(`${prefix}probe `))).toHaveLength(2);
+        expect(f.logs.filter(line => line.includes('capacity') && line.startsWith(`${prefix}hold `))).toEqual([]);
+        expect(f.logs.filter(line => line.includes('waiting for a probe turn'))).toHaveLength(6);
+        expect(queue.entries()).toHaveLength(5);
+        const before = queue.entries();
+        queue = f.open();
+        expect(queue.entries()).toEqual(before);
+      }
+      expect([...seen]).toEqual([1, 2, 3, 4, 5]);
+    });
+    it.each(['review-unfinished', 'planner-skip'])('settles all five persisted %s entries over capped ticks', reason => {
       const f = fixture();
       const queue = persistedBlocked(f, reason);
-      runWithRedTeamQueue({ queue, ...inputs([1, 2, 3, 4, 5], { capacity: capacity(4) }), log: f.log,
-        run: options => {
-          expect(options.plan.refusals.map(row => row.prNumber)).toEqual([1, 2, 3, 4, 5]);
-          return { rows: [1, 2, 3, 4, 5].map(prNumber => ({ prNumber, action: 'clear' })) };
-        } });
+      const remaining = [[1, 2, 3, 4, 5], [3, 4, 5], [5]];
+      const turns = [[1, 2], [3, 4], [5]];
+      for (let tick = 0; tick < turns.length; tick++) {
+        runWithRedTeamQueue({ queue, ...inputs(remaining[tick], { capacity: capacity(4) }), log: f.log,
+          run: options => {
+            expect(options.plan.refusals.map(row => row.prNumber)).toEqual(turns[tick]);
+            return { rows: turns[tick].map(prNumber => ({ prNumber, action: 'clear' })) };
+          } });
+      }
       expect(f.logs.filter(line => line.startsWith(`${prefix}probe `))).toHaveLength(5);
-      expect(f.logs.filter(line => line.startsWith(`${prefix}hold `))).toEqual([]);
+      expect(f.logs.filter(line => line.startsWith(`${prefix}hold `) && !line.includes('waiting for a probe turn'))).toEqual([]);
       expect(queue.entries()).toEqual([]);
+      expect(f.open().entries()).toEqual([]);
     });
-    it('five probes use no runnable slots and only excess runnable entries log capacity holds', () => {
+    it('two probes use no runnable slots and only excess runnable entries log capacity holds', () => {
       const f = fixture();
       const queue = persistedBlocked(f, 'planner-skip', [6, 7]);
       runWithRedTeamQueue({ queue, ...inputs([1, 2, 3, 4, 5, 6, 7], { capacity: capacity(1) }), log: f.log,
         run: options => {
-          expect(options.plan.refusals.map(row => row.prNumber)).toEqual([1, 2, 3, 4, 5, 6]);
+          expect(options.plan.refusals.map(row => row.prNumber)).toEqual([1, 2, 6]);
           return { rows: [], dispatched: [], notStarted: [] };
         } });
-      expect(f.logs.filter(line => line.startsWith(`${prefix}probe `))).toHaveLength(5);
+      expect(f.logs.filter(line => line.startsWith(`${prefix}probe `))).toHaveLength(2);
       expect(f.logs.filter(line => line.startsWith(`${prefix}admit `))).toEqual([`${prefix}admit ${repo}#6: capacity 1`]);
       expect(f.logs.filter(line => line.startsWith(`${prefix}hold `))).toEqual([
-        `${prefix}hold ${repo}#7: capacity 1`, `${prefix}hold ${repo}#7: capacity; waiting for a later tick`,
+        ...[3, 4, 5].map(pr => `${prefix}hold ${repo}#${pr}: waiting for a probe turn`),
+        `${prefix}hold ${repo}#7: capacity 1`,
+        ...[3, 4, 5].map(pr => `${prefix}hold ${repo}#${pr}: waiting for a probe turn; waiting for a later tick`),
+        `${prefix}hold ${repo}#7: capacity; waiting for a later tick`,
       ]);
+    });
+    it('the two-probe cap applies independently to each repository', () => {
+      const f = fixture();
+      const queue = persistedBlocked(f, 'planner-skip');
+      const original = queue.entries();
+      f.files.set(f.file, JSON.stringify([...original, ...original.map(entry => ({
+        ...entry, repo: otherRepo, key: `${otherRepo}#${entry.pr}`,
+      }))]));
+      const reopened = f.open();
+      expect(numbers(reopened.admit(repo, 0))).toEqual([1, 2]);
+      expect(numbers(reopened.admit(otherRepo, 0))).toEqual([1, 2]);
+      expect(numbers(reopened.admit(repo, 0))).toEqual([3, 4]);
+    });
+    it('rebases persisted probe turns before overflow while preserving fair order', () => {
+      const f = fixture();
+      const queue = persistedBlocked(f, 'planner-skip');
+      f.files.set(f.file, JSON.stringify(queue.entries().map((entry, index) => ({
+        ...entry, lastProbeTurn: Number.MAX_SAFE_INTEGER - 4 + index,
+      }))));
+      const reopened = f.open();
+      expect(numbers(reopened.admit(repo, 0))).toEqual([1, 2]);
+      expect(f.open().entries()).toEqual(reopened.entries());
+      expect(numbers(reopened.admit(repo, 0))).toEqual([3, 4]);
+      expect(numbers(reopened.admit(repo, 0))).toEqual([1, 5]);
     });
     it('disabled probes fail closed for five blocked entries and never log capacity holds', () => {
       const f = fixture();
@@ -1114,6 +1172,13 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       f.files.set(f.file, JSON.stringify(candidates([1, 2, 3]).map(c => ({ key: `${repo}#${c.pr}`, repo, pr: c.pr, head: c.head,
         enqueuedAt: 1, attempts: 0, blocked: 'unrecognized-reason' }))));
       expect(f.open().entries()).toEqual([]);
+    });
+    it.each([-1, 1.5, '1', null])('invalid persisted probe turn %j is corrupt and loads empty', lastProbeTurn => {
+      const f = fixture();
+      f.files.set(f.file, JSON.stringify([{ key: `${repo}#1`, repo, pr: 1, head: head(1),
+        enqueuedAt: 1, attempts: 0, blocked: 'planner-skip', lastProbeTurn }]));
+      expect(f.open().entries()).toEqual([]);
+      expect(f.logs.some(line => line.includes('invalid persisted entries'))).toBe(true);
     });
     const planned = async (f, capacityValue) => {
       let seen, cap;
