@@ -5,13 +5,49 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createReviewJobIo } from '../review-job.mjs';
 import { laneGitHardeningEnv } from '../../lib/lane-git-hardening.mjs';
+import { proveCardOnlyHeadMove } from '../../lib/card-only-head-move.mjs';
 
 const roots = [], repo = 'plateauapp/plateau-app', pr = 229;
 function expectGitEnv(options, args, env) {
+  expect(options.env.GIT_NO_REPLACE_OBJECTS).toBe('1');
   const { GIT_TEMPLATE_DIR: _template, ...templateFree } = env;
   expect(options.env).toEqual(args[0] === 'init' || args.includes('index-pack') || /iso\.git$/.test(options.cwd) ? templateFree : env);
 }
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+
+it('refuses a card-only head-move proof when a lane replacement ref hides a code change', () => {
+  const lane = mkdtempSync(join(process.env.TMPDIR, 'review-replace-proof-')); roots.push(lane);
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null',
+    GIT_CONFIG_NOSYSTEM: '1' };
+  delete env.GIT_NO_REPLACE_OBJECTS;
+  const exec = (file, args, options) => execFileSync(file, args, { ...options,
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  const git = args => exec('git', args, { cwd: lane, env, timeout: 10_000, maxBuffer: 1024 * 1024 });
+  const commit = message => git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+    '-c', 'commit.gpgsign=false', 'commit', '--quiet', '-am', message]);
+  git(['init', '--quiet']);
+  writeFileSync(join(lane, 'code.js'), 'export const trusted = true;\n');
+  git(['add', 'code.js']); commit('base');
+  const fromSha = git(['rev-parse', 'HEAD']).trim();
+  writeFileSync(join(lane, 'code.js'), 'export const trusted = false;\n');
+  commit('code change');
+  const toSha = git(['rev-parse', 'HEAD']).trim();
+  git(['reset', '--hard', fromSha]);
+  mkdirSync(join(lane, 'backlog'));
+  writeFileSync(join(lane, 'backlog', '123-card.md'), 'Card update\n');
+  git(['add', 'backlog/123-card.md']); commit('benign card');
+  const benign = git(['rev-parse', 'HEAD']).trim();
+  git(['replace', toSha, benign]);
+
+  // Control: plain Git sees the substituted tree and wrongly authorises the skip.
+  expect(git(['show', `${toSha}:code.js`])).toBe('export const trusted = true;\n');
+  expect(proveCardOnlyHeadMove({ fromSha, toSha, cwd: lane,
+    exec: (file, args, options) => exec(file, args, { ...options, env }) }))
+    .toMatchObject({ ok: true, kind: 'card-only' });
+
+  const io = createReviewJobIo({ env, exec, log: () => {} });
+  expect(io.proveCardOnlyHeadMove({ fromSha, toSha, lanePath: lane })).toEqual({ ok: false });
+});
 
 describe.each(['prepareLane', 'fetchRedTeamHead'])('%s fetch command isolation', method => {
   it.each(['global', 'local', 'both'])('isolates inherited config and removes %s URL rewrites before fetching', scope => {
@@ -318,6 +354,7 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s isolated object handoff',
     }
     const spawnPack = (file, args, options) => {
       expect(options).toMatchObject({ encoding: null, timeout: 180_000, maxBuffer: 1024 ** 3 });
+      expect(options.env.GIT_NO_REPLACE_OBJECTS).toBe('1');
       expect(options.env.GIT_CONFIG_NOSYSTEM).toBe('1');
       expect(readFileSync(options.env.GIT_CONFIG_GLOBAL, 'utf8')).toBe('');
       expect(args.slice(0, 6)).toEqual(['-c', 'protocol.allow=never', '-c', 'protocol.ssh.allow=always', '-c', 'protocol.ext.allow=never']);
