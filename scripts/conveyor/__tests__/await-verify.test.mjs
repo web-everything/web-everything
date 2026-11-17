@@ -9,6 +9,7 @@ import {
   resolveAwaitVerifyTtlMs, resolveAwaitVerifyPath, readAwaitVerifyRecord, classifyAwaitVerify,
   makeAwaitingVerifyResolver, writeAwaitVerifyRecord, clearAwaitVerifyRecord,
   AWAIT_VERIFY_STORE_ENV, listStoredAwaitVerify, readStoredAwaitVerify, writeStoredAwaitVerify,
+  isHarnessRecord,
 } from '../await-verify.mjs';
 import { DEFAULT_ADMISSION_CEILING_MS } from '../../readiness/heavy-admission.mjs';
 
@@ -148,6 +149,41 @@ describe('#5137 slices 2+3 — the shared store a dispatched session is found by
     encoding: 'utf8', stdio: 'pipe', env: { ...process.env, CLAUDE_CODE_SESSION_ID: 'S-live', [AWAIT_VERIFY_STORE_ENV]: store },
   });
   const MARK = ['mark', '--repo=web-everything/web-everything', '--pr=4115', '--who=fix-4115', '--ref=lane/item-68b', '--kind=fix'];
+
+  describe.each(['delivery', 'prepare'])('%s item validation', (kind) => {
+    it.each(['G4', 'S3', '8561', 'a._-9', 'a'.repeat(32)])('accepts %j and preserves its stored type and session key', (item) => {
+      gitRepo();
+      const store = join(cwd, '.store');
+      writeFileSync(join(cwd, 'wip.txt'), 'uncommitted\n');
+      const marked = JSON.parse(run(['mark', '--who=build-item', `--item=${item}`, '--ref=lane/item', `--kind=${kind}`], store));
+      const expectedItem = item === '8561' ? 8561 : item;
+      expect(marked.item).toBe(expectedItem);
+      expect(marked.pr).toBeUndefined();
+      expect(marked.kind).toBe(kind);
+      expect(readAwaitVerifyRecord(cwd)).toEqual(marked);
+      expect(readStoredAwaitVerify('S-live', { dir: store })).toEqual(marked);
+      expect(listStoredAwaitVerify({ dir: store }).map(entry => entry.key)).toEqual(['S-live']);
+      expect(isHarnessRecord(marked)).toBe(true);
+      expect(classify({ record: marked, session: { sessionId: 'S-live' }, nowMs: Date.parse(marked.requestedAt) }).reason).toBe('awaiting-verify');
+    });
+
+    it.each(['', ' ', '4x', 'a/b', '..', 'a'.repeat(33), 'G4\n', '0', '-1', '1.5'])('rejects %j with exit 2 and no record', (item) => {
+      gitRepo();
+      const store = join(cwd, '.store');
+      let failure;
+      try { run(['mark', '--who=build-item', `--item=${item}`, '--ref=lane/item', `--kind=${kind}`], store); }
+      catch (error) { failure = error; }
+      expect(failure?.status).toBe(2);
+      expect(String(failure?.stderr).trim()).toBe('malformed: --kind=delivery|prepare needs --item=<NNN|queue-id>');
+      expect(readAwaitVerifyRecord(cwd)).toBeNull();
+      expect(existsSync(store)).toBe(false);
+      const invalid = { ...record, pr: undefined, item, kind, lane: cwd, ref: 'lane/item' };
+      expect(isHarnessRecord(invalid)).toBe(false);
+      expect(classify({ record: invalid }).reason).toBe('malformed');
+      expect(writeStoredAwaitVerify(invalid, { dir: store })).toEqual({ ok: false, reason: 'malformed' });
+      expect(existsSync(store)).toBe(false);
+    });
+  });
 
   it('card 4: a delivery or prepare mark names its ITEM (no PR), may be dirty, and is stored', () => {
     gitRepo();
