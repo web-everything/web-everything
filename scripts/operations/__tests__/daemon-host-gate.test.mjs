@@ -143,6 +143,9 @@ describe('runGate', () => {
     h.children[0].emit('exit', 0, null);
     await run;
     expect(h.procSignals.listenerCount('SIGTERM')).toBe(0);
+    expect(h.procSignals.listenerCount('SIGINT')).toBe(0);
+    expect(h.procSignals.listenerCount('SIGHUP')).toBe(0);
+    expect(h.procSignals.listenerCount('exit')).toBe(0);
   });
 
   it('spawn failure exits 127 without looping', async () => {
@@ -156,6 +159,108 @@ describe('runGate', () => {
   });
 });
 
+describe('wrapper shutdown', () => {
+  const tick = () => new Promise((resolve) => setImmediate(resolve));
+  it.each(['studio', 'macbook'])('does not spawn or sleep after shutdown during an owner read (%s)', async (owner) => {
+    const h = harness({ owners: [] });
+    h.deps.readRemote = async () => {
+      h.procSignals.emit('SIGTERM');
+      return { status: 'ok', owner };
+    };
+    expect(await runGate({ cmd: 'd', args: [] }, h.deps)).toBe(143);
+    expect(h.spawns).toHaveLength(0);
+    expect(h.sleeps).toHaveLength(0);
+    expect(h.procSignals.eventNames()).toEqual([]);
+  });
+
+  it('interrupts standby sleep on shutdown and removes signal listeners', async () => {
+    const h = harness({ owners: [{ status: 'unset' }] });
+    h.deps.sleep = (ms, { signal }) => new Promise((resolve, reject) => {
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    });
+    const run = runGate({ cmd: 'd', args: [] }, h.deps);
+    await tick();
+    h.procSignals.emit('SIGINT');
+    expect(await run).toBe(130);
+    expect(h.spawns).toHaveLength(0);
+    expect(h.polls()).toBe(1);
+    expect(h.procSignals.eventNames()).toEqual([]);
+  });
+
+  async function running() {
+    const h = harness({ owners: [{ status: 'ok', owner: 'studio' }] });
+    const waits = [];
+    h.deps.killGraceMs = 123;
+    h.deps.sleep = (ms, { signal }) => new Promise((resolve, reject) => {
+      waits.push({ ms, signal, resolve });
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    });
+    let settled = false;
+    const run = runGate({ cmd: 'd', args: [] }, h.deps).then((code) => {
+      settled = true;
+      return code;
+    });
+    await tick();
+    return { h, waits, run, settled: () => settled };
+  }
+
+  it('SIGKILLs a child ignoring SIGTERM after one grace wait and awaits its exit', async () => {
+    const { h, waits, run, settled } = await running();
+    h.procSignals.emit('SIGTERM');
+    expect(h.children[0].kills).toEqual(['SIGTERM']);
+    expect(waits).toHaveLength(1);
+    expect(waits[0].ms).toBe(123);
+    h.procSignals.emit('SIGTERM');
+    h.procSignals.emit('SIGHUP');
+    expect(waits).toHaveLength(1);
+    expect(settled()).toBe(false);
+    waits[0].resolve();
+    await tick();
+    expect(h.children[0].kills).toEqual(['SIGTERM', 'SIGTERM', 'SIGHUP', 'SIGKILL']);
+    expect(settled()).toBe(false);
+    h.children[0].emit('exit', null, 'SIGKILL');
+    expect(await run).toBe(137);
+  });
+
+  it('cancels the grace timer without SIGKILL when the child exits during grace', async () => {
+    const { h, waits, run } = await running();
+    h.procSignals.emit('SIGINT');
+    expect(waits[0].signal.aborted).toBe(false);
+    h.children[0].emit('exit', null, 'SIGINT');
+    expect(await run).toBe(130);
+    expect(waits[0].signal.aborted).toBe(true);
+    expect(h.children[0].kills).toEqual(['SIGINT']);
+    h.procSignals.emit('exit', 130);
+    expect(h.children[0].kills).toEqual(['SIGINT']);
+  });
+
+  it('synchronously SIGKILLs a live child on wrapper exit and still awaits child exit', async () => {
+    const { h, waits, run, settled } = await running();
+    h.procSignals.emit('exit', 1);
+    expect(h.children[0].kills).toEqual(['SIGKILL']);
+    expect(waits).toHaveLength(0);
+    expect(settled()).toBe(false);
+    h.children[0].emit('exit', null, 'SIGKILL');
+    expect(await run).toBe(137);
+    expect(h.procSignals.listenerCount('exit')).toBe(0);
+  });
+
+  it('does not resolve on an error from a live child before its exit', async () => {
+    const { h, waits, run, settled } = await running();
+    h.children[0].pid = 1234;
+    h.procSignals.emit('SIGTERM');
+    h.children[0].emit('error', new Error('signal failed'));
+    await tick();
+    expect(settled()).toBe(false);
+    expect(waits[0].signal.aborted).toBe(false);
+    waits[0].resolve();
+    await tick();
+    expect(h.children[0].kills).toEqual(['SIGTERM', 'SIGKILL']);
+    h.children[0].emit('exit', null, 'SIGKILL');
+    expect(await run).toBe(137);
+  });
+});
+
 describe('runGate while the daemon runs', () => {
   const tick = () => new Promise((r) => setTimeout(r, 5));
   function watched(owners) {
@@ -165,6 +270,41 @@ describe('runGate while the daemon runs', () => {
     h.deps.killGraceMs = 10;
     return { h, ticks };
   }
+  it.each([['SIGTERM', 143], ['SIGINT', 130], ['SIGHUP', 129]])(
+    '%s during revocation returns the child exit code without a second spawn or standby sleep',
+    async (signal, code) => {
+      const { h, ticks } = watched([
+        { status: 'ok', owner: 'studio' },
+        { status: 'ok', owner: 'macbook' },
+        { status: 'ok', owner: 'studio' },
+      ]);
+      h.deps.sleep = (ms) => {
+        h.sleeps.push(ms);
+        return new Promise(() => {});
+      };
+      const spawn = h.deps.spawn;
+      h.deps.spawn = (...args) => {
+        const child = spawn(...args);
+        // Let a faulty respawn finish so the regression fails without timing out.
+        if (h.spawns.length > 1) setImmediate(() => child.emit('exit', 0, null));
+        return child;
+      };
+      const run = runGate({ cmd: 'd', args: [] }, h.deps);
+      await tick();
+      ticks[0]();
+      await tick();
+      expect(h.children[0].kills).toEqual(['SIGTERM']);
+      h.procSignals.emit(signal);
+      expect(h.children[0].kills).toEqual(['SIGTERM', signal]);
+      h.children[0].emit('exit', null, signal);
+      expect(await run).toBe(code);
+      expect(h.spawns).toHaveLength(1);
+      expect(h.polls()).toBe(2);
+      expect(h.sleeps).toEqual([h.deps.killGraceMs, h.deps.killGraceMs]);
+      expect(h.procSignals.eventNames()).toEqual([]);
+    },
+  );
+
   it('stops the daemon and returns to standby when the owner moves to another host', async () => {
     const { h, ticks } = watched([{ status: 'ok', owner: 'studio' }, { status: 'ok', owner: 'macbook' }]);
     h.deps.maxPolls = 2;

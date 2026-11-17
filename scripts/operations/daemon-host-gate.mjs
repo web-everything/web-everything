@@ -17,6 +17,7 @@
 import { spawn as nodeSpawn } from 'node:child_process';
 import { readFileSync, realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
+import { setTimeout as timerSleep } from 'node:timers/promises';
 import { getThisHost, resolveHostRole, readOwnerRemote } from '../lib/daemon-host-guard.mjs';
 
 export const POLL_MS = 60_000;
@@ -51,25 +52,47 @@ const describeOwner = (r) => {
   return 'unreadable';
 };
 
-function startChild({ cmd, args }, { spawn, processSignals }) {
+function startChild({ cmd, args }, { spawn, processSignals, sleep, killGraceMs }) {
   let child;
   let finish;
+  let ended = false;
+  let stopping = false;
+  const grace = new AbortController();
   const done = new Promise((resolve) => { finish = resolve; });
+  const stop = (sig) => {
+    if (!ended) { try { child?.kill(sig); } catch { /* child already gone */ } }
+  };
   const handlers = SIGNALS.map((sig) => {
-    const fn = () => { try { child?.kill(sig); } catch { /* child already gone */ } };
+    const fn = () => {
+      const first = !stopping;
+      stopping = true;
+      stop(sig);
+      if (first && !ended) {
+        void sleep(killGraceMs, { signal: grace.signal }).then(() => {
+          stop('SIGKILL'); // done still waits for the child's exit event.
+        }, (error) => { if (error?.name !== 'AbortError') stop('SIGKILL'); });
+      }
+    };
     processSignals.on(sig, fn);
     return [sig, fn];
   });
+  const onExit = () => stop('SIGKILL');
+  processSignals.on('exit', onExit);
   const end = (code) => {
+    if (ended) return;
+    ended = true;
+    grace.abort();
     for (const [sig, fn] of handlers) processSignals.removeListener(sig, fn);
+    processSignals.removeListener('exit', onExit);
     finish(code);
   };
   try {
     child = spawn(cmd, args, { stdio: 'inherit' });
-    child.on('error', () => end(127));
+    // A failed spawn has no exit event; errors on a live child must not release it.
+    child.on('error', () => { if (!child.pid) end(127); });
     child.on('exit', (code, signal) => end(signal ? 128 + (SIGNUM[signal] ?? 15) : (code ?? 1)));
   } catch { end(127); }
-  return { done, stop: (sig) => { try { child?.kill(sig); } catch { /* gone */ } } };
+  return { done, stop };
 }
 
 export const UNREADABLE_LIMIT_MS = 600_000;
@@ -122,7 +145,7 @@ export async function runGate(parsed, deps = {}) {
   const {
     thisHost = getThisHost(),
     log = (line) => console.log(line),
-    sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+    sleep = (ms, { signal } = {}) => timerSleep(ms, undefined, { signal }),
     watchSleep = sleep,
     readRemote = readOwnerRemote,
     spawn = nodeSpawn,
@@ -131,19 +154,40 @@ export async function runGate(parsed, deps = {}) {
     killGraceMs = 30_000,
     now = Date.now,
   } = deps;
-  for (let poll = 0; poll < maxPolls; poll += 1) {
-    const { active, last } = await pollRole(thisHost, readRemote);
-    if (!active) {
-      log(`host-gate: standby owner=${describeOwner(last)} self=${thisHost}`);
-      await sleep(POLL_MS);
-      continue;
+  let shutdownCode = null;
+  const shutdown = new AbortController();
+  const handlers = SIGNALS.map((sig) => {
+    const fn = () => {
+      shutdownCode ??= 128 + SIGNUM[sig];
+      shutdown.abort();
+    };
+    processSignals.on(sig, fn);
+    return [sig, fn];
+  });
+  try {
+    for (let poll = 0; poll < maxPolls; poll += 1) {
+      if (shutdownCode !== null) return shutdownCode;
+      const { active, last } = await pollRole(thisHost, readRemote);
+      if (shutdownCode !== null) return shutdownCode;
+      if (!active) {
+        log(`host-gate: standby owner=${describeOwner(last)} self=${thisHost}`);
+        if (shutdownCode !== null) return shutdownCode;
+        try { await sleep(POLL_MS, { signal: shutdown.signal }); }
+        catch (error) { if (shutdownCode === null) throw error; }
+        continue;
+      }
+      log(`host-gate: active owner=${describeOwner(last)} self=${thisHost}`);
+      if (shutdownCode !== null) return shutdownCode;
+      const child = startChild(parsed, { spawn, processSignals, sleep, killGraceMs });
+      const code = await watchChild(child, { thisHost, readRemote, watchSleep, sleep, killGraceMs, log, now });
+      // Revocation discards the exit code, but must not discard wrapper shutdown.
+      if (shutdownCode !== null) return await child.done;
+      if (code !== null) return code;
     }
-    log(`host-gate: active owner=${describeOwner(last)} self=${thisHost}`);
-    const child = startChild(parsed, { spawn, processSignals });
-    const code = await watchChild(child, { thisHost, readRemote, watchSleep, sleep, killGraceMs, log, now });
-    if (code !== null) return code;
+    return shutdownCode ?? 75;
+  } finally {
+    for (const [sig, fn] of handlers) processSignals.removeListener(sig, fn);
   }
-  return 75;
 }
 
 async function main() {
