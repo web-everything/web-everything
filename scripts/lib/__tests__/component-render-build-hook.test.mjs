@@ -25,6 +25,9 @@ import {
   tierRank,
   TIER_ORDER,
   EXPECTED_PRODUCER,
+  COMPONENT_BATCH_SIZE,
+  COMPONENT_BATCH_INPUT_BYTES,
+  planComponentBatches,
   PINNED_CLI_RELATIVE,
   resolveFuiRoot,
 } from '../component-render-build-hook.cjs';
@@ -538,6 +541,51 @@ describe('spliceComponentsBatch — bounded subprocess batches across the build 
     for (let i = 0; i < 1025; i++) {
       expect(written.get(`/site/${i}/index.html`)).toBe(`<article>Card ${i} $&</article>`);
     }
+  });
+
+  // PR #6911 smoke: fewer than 512 specs can still exceed the CLI buffer when each card embeds a large
+  // backlog page body (largest measured spec 2,097,024 B). Batches must be bounded by bytes, not only count.
+  it('splits fewer than 512 specs by input bytes so no batch exceeds the byte budget', () => {
+    const body = 'x'.repeat(6 * 1024 * 1024);
+    const pages = Array.from({ length: 3 }, (_, i) => ({
+      outputPath: `/big/${i}/index.html`,
+      content: `<we-card data-we-spec='${JSON.stringify({ component: 'card', config: { title: `Big ${i}`, body } })}'>f</we-card>`,
+    }));
+    const sizes = [];
+    const byteBoundRunner = (_cmd, _args, opts) => {
+      const bytes = Buffer.byteLength(opts.input);
+      if (bytes > COMPONENT_BATCH_INPUT_BYTES) throw Object.assign(new Error('output buffer exceeded'), { code: 'ENOBUFS' });
+      const entries = JSON.parse(opts.input);
+      sizes.push(entries.length);
+      return JSON.stringify({ producer: EXPECTED_PRODUCER,
+        results: entries.map(e => ({ key: e.key, html: `<article>${e.config.title}</article>` })) });
+    };
+    const { writeFile, written } = makeWriter();
+    expect(spliceComponentsBatch(pages, stubRoot, byteBoundRunner, writeFile)).toEqual({ pages: 3, components: 3 });
+    expect(sizes).toEqual([2, 1]);
+    expect(written.get('/big/2/index.html')).toBe('<article>Big 2</article>');
+  });
+
+  it('isolates an oversized spec in its own batch and names it when that batch still fails', () => {
+    const huge = { key: 'we-c-1', component: 'card', config: { body: 'y'.repeat(COMPONENT_BATCH_INPUT_BYTES) } };
+    const specs = [{ key: 'we-c-0', component: 'badge', config: {} }, huge, { key: 'we-c-2', component: 'badge', config: {} }];
+    expect(planComponentBatches(specs).map(b => b.map(s => s.key))).toEqual([['we-c-0'], ['we-c-1'], ['we-c-2']]);
+    const calls = [];
+    const overflowRunner = (_cmd, _args, opts) => {
+      const entries = JSON.parse(opts.input);
+      calls.push(entries.map(e => e.key));
+      if (entries.some(e => e.key === 'we-c-1')) throw Object.assign(new Error('spawnSync node ENOBUFS'), { code: 'ENOBUFS' });
+      return JSON.stringify({ producer: EXPECTED_PRODUCER, results: entries.map(e => ({ key: e.key, html: '<span></span>' })) });
+    };
+    expect(() => renderComponents(specs, stubRoot, overflowRunner))
+      .toThrow(/batch of spec "we-c-1" \(\d{8,} input bytes\) failed: spawnSync node ENOBUFS/);
+    expect(calls).toEqual([['we-c-0'], ['we-c-1']]);
+  });
+
+  it('plans batches by count when specs are small', () => {
+    const specs = Array.from({ length: COMPONENT_BATCH_SIZE + 1 }, (_, i) => ({ key: `k${i}`, component: 'badge', config: {} }));
+    expect(planComponentBatches(specs).map(b => b.length)).toEqual([COMPONENT_BATCH_SIZE, 1]);
+    expect(planComponentBatches([])).toEqual([]);
   });
 
   it.each(['buffer', 'producer'])('a later batch %s failure aborts before any SSR page is rewritten', (failure) => {

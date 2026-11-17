@@ -66,10 +66,37 @@ function resolveFuiRoot(repoRoot) {
  *  Kept in sync with `frontierui/blocks/renderers/component-render/buildHarness.ts:BUILD_HARNESS_PRODUCER`. */
 const EXPECTED_PRODUCER = 'frontierui/component-render-build-harness/1';
 
-// Whole-site output grows with the backlog and can exceed the CLI's 64 MiB buffer. Keep the same
-// per-process output limit and amortize startup over bounded batches instead of the entire site.
-// An oversized individual batch still fails the build; reduce its content or batch size to recover.
+// Whole-site output grows with the backlog: each backlog page body is embedded in its card spec. Measured
+// 2026-11-17 (PR #6911): main rendered 15,760 specs in one call to 67,107,759 B of output, 1,105 B under
+// the 64 MiB buffer; one more card overflowed it (ENOBUFS). Keep the same per-process output limit and
+// amortize startup over batches bounded by BOTH spec count and input bytes. The output measured about
+// 1.02x the input, so a 16 MiB input budget leaves ample room under 64 MiB. A single spec larger than the
+// budget runs alone; if even that overflows, the build fails with an error naming its key and size.
 const COMPONENT_BATCH_SIZE = 512;
+const COMPONENT_BATCH_INPUT_BYTES = 16 * 1024 * 1024;
+const CLI_MAX_BUFFER = 64 * 1024 * 1024;
+
+/**
+ * Split specs into ordered batches of at most `maxCount` specs and at most `maxBytes` of JSON input
+ * (counted as `JSON.stringify(batch)` bytes). A spec that alone exceeds `maxBytes` gets a batch of its own.
+ */
+function planComponentBatches(specs, maxCount = COMPONENT_BATCH_SIZE, maxBytes = COMPONENT_BATCH_INPUT_BYTES) {
+  const batches = [];
+  let current = [];
+  let bytes = 2; // the enclosing `[]`
+  for (const spec of specs) {
+    const size = Buffer.byteLength(JSON.stringify(spec)) + 1; // + the separating comma
+    if (current.length > 0 && (current.length >= maxCount || bytes + size > maxBytes)) {
+      batches.push(current);
+      current = [];
+      bytes = 2;
+    }
+    current.push(spec);
+    bytes += size;
+  }
+  if (current.length > 0) batches.push(current);
+  return batches;
+}
 
 /**
  * Shell out to the pinned FUI build-CLI: keyed-batch JSON on stdin, keyed-batch envelope on stdout.
@@ -86,7 +113,7 @@ function runBuildBatch(entries, repoRoot, runner = execFileSync) {
     );
   }
   const input = JSON.stringify(entries);
-  const out = runner('node', [cliPath], { input, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  const out = runner('node', [cliPath], { input, encoding: 'utf8', maxBuffer: CLI_MAX_BUFFER });
   let batch;
   try {
     batch = JSON.parse(out);
@@ -103,15 +130,25 @@ function runBuildBatch(entries, repoRoot, runner = execFileSync) {
 }
 
 /**
- * Render component specs to a `{ key -> html }` map in batches of at most 512 specs. Each spec is
- * `{ key, component: 'card'|'badge'|'tag', config }`. A per-entry error is surfaced to the build log and
- * that key is omitted from the map (keyed-batch isolation — one bad spec never poisons the others).
+ * Render component specs to a `{ key -> html }` map in batches planned by `planComponentBatches` (at most
+ * 512 specs and 16 MiB of input each). Each spec is `{ key, component: 'card'|'badge'|'tag', config }`. A
+ * per-entry error is surfaced to the build log and that key is omitted from the map (keyed-batch isolation
+ * — one bad spec never poisons the others). A failed batch fails the build with its keys and input size.
  */
 function renderComponents(specs, repoRoot, runner = execFileSync) {
   if (!Array.isArray(specs) || specs.length === 0) return new Map();
   const byKey = new Map();
-  for (let offset = 0; offset < specs.length; offset += COMPONENT_BATCH_SIZE) {
-    const batch = runBuildBatch(specs.slice(offset, offset + COMPONENT_BATCH_SIZE), repoRoot, runner);
+  for (const entries of planComponentBatches(specs)) {
+    let batch;
+    try {
+      batch = runBuildBatch(entries, repoRoot, runner);
+    } catch (e) {
+      const bytes = Buffer.byteLength(JSON.stringify(entries));
+      const keys = entries.length === 1
+        ? `spec "${entries[0].key}"`
+        : `${entries.length} specs "${entries[0].key}".."${entries[entries.length - 1].key}"`;
+      throw new Error(`[component-render build] batch of ${keys} (${bytes} input bytes) failed: ${e && e.message}`, { cause: e });
+    }
     for (const res of batch.results) {
       if (!res || res.error || !res.html) {
         if (res && res.error) {
@@ -733,6 +770,9 @@ module.exports = {
   PINNED_CLI_RELATIVE,
   resolveFuiRoot,
   EXPECTED_PRODUCER,
+  COMPONENT_BATCH_SIZE,
+  COMPONENT_BATCH_INPUT_BYTES,
+  planComponentBatches,
   runBuildBatch,
   renderComponents,
   renderIntentGrid,
