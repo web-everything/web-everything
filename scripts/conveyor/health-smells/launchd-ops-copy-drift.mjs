@@ -18,6 +18,8 @@ import { fileURLToPath } from 'node:url';
 const LABEL_RE = /^com\.(we|plateau)\./;
 const SCRIPT_RE = /\.(mjs|js|cjs|sh)$/;
 const SHELL_RE = /^(?:sh|bash|dash|ash|zsh|ksh|fish|csh|tcsh)$/;
+// Launchers that run the next command: a shell after one of them is still a shell command line.
+const WRAPPER_RE = /^(?:env|nice|nohup|caffeinate|arch|exec|time|timeout|sudo|command|xcrun|stdbuf|setsid)$/;
 const NOISE_RE = /(^|\/)(__tests__|fixtures?|archive[ds]?|node_modules)\//;
 const DAY = 86_400_000;
 const sha = (buf) => createHash('sha256').update(buf).digest('hex');
@@ -106,7 +108,7 @@ export function scanLaunchdOpsCopyDrift(d) {
     }
     const argv = expanded;
     const raw = [plist?.Program, ...argv];
-    const shellArgsStart = SHELL_RE.test(executable) ? 1 : executable === 'env'
+    const shellArgsStart = SHELL_RE.test(executable) ? 1 : WRAPPER_RE.test(executable)
       ? argv.findIndex((a, i) => i > 0 && typeof a === 'string' && SHELL_RE.test(basename(a))) + 1 : 0;
     // Shell text can contain quoting, substitutions, pipelines or relative paths. Do not
     // execute it or guess which script it runs: retain this job as explicitly unverified.

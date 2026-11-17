@@ -141,6 +141,16 @@ describe('fail closed', () => {
     expect(scanLaunchdOpsCopyDrift(d)).toMatchObject([{ label: 'com.we.guard', severity: 'low', note: expect.stringContaining('cannot be verified') }]);
   });
 
+  it.each([
+    ['/usr/bin/caffeinate', '-i', 'sh', '-c', `node ${COPY}`],
+    ['/usr/bin/nohup', 'bash', '-lc', `node ${COPY}`],
+    ['/usr/bin/arch', '-arm64', '/bin/zsh', '-c', `node ${COPY}`],
+    ['/usr/bin/env', '--', 'sh', '-c', `node ${COPY}`],
+  ])('wrapper launchers in front of a shell command stay unverified: %j', (...argv) => {
+    const d = deps({ plists: { 'com.we.guard.plist': { Label: 'com.we.guard', ProgramArguments: argv } } });
+    expect(scanLaunchdOpsCopyDrift(d)).toMatchObject([{ label: 'com.we.guard', severity: 'low', note: expect.stringContaining('cannot be verified') }]);
+  });
+
   it('env -S that runs a plain script stays verifiable and flags drift', () => {
     const d = deps({ plists: { 'com.we.guard.plist': { Label: 'com.we.guard', ProgramArguments: ['/usr/bin/env', '-S', `node ${COPY}`] } }, fn: { hashCopy: () => 'old' } });
     expect(scanLaunchdOpsCopyDrift(d)).toMatchObject([{ label: 'com.we.guard', severity: 'medium', staleDays: 3 }]);
