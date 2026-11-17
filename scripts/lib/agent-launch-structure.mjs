@@ -4,8 +4,8 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve, relative } from 'node:path';
 
 const primitives = /^(?:spawn(?:Sync|Fn|Process|ToCompletion(?:Fn)?)?|exec(?:File(?:Sync)?(?:Throttled)?|Sync|Fn)?|fork|run(?:Fn|Default)?|listing)$/;
-const agent = /(?:^|[\s/;'"`|&()])(?:claude|codex)(?=$|[\s;'"`|&()])/;
-const shell = /(?:^|\/)(?:ba|z|da|k)?sh$|^(?:cmd|powershell)$/;
+const agent = /(?:^|[\s/\\;'"`|&()])(?:claude|codex)(?=$|[\s;'"`|&()])/;
+const wrapper = /(?:^|[/\\])(?:(?:ba|z|da|k)?sh|cmd|powershell|env|nohup|command|exec|xargs|sudo|time|nice|setsid|stdbuf|arch|caffeinate|node)$/;
 export const AGENT_LAUNCH_ALLOWLIST = Object.freeze(['scripts/lib/agent-launch.mjs']);
 
 /** Scan source strings, resolving lexical aliases, constants, defaults and imported bindings with the TS parser. */
@@ -41,7 +41,11 @@ export function findAgentLaunches(sources) {
       owner = owner.parent.parent;
     }
     if (!owner.initializer || keys.some(k => k == null) || (literal && (!ts.isVariableDeclaration(owner) || !(owner.parent.flags & ts.NodeFlags.Const)))) return null;
-    return keys.reduce((source, key) => ts.factory.createElementAccessExpression(source, ts.factory.createStringLiteral(key)), owner.initializer);
+    // Only inline object literals prove a destructured value; shared objects may mutate.
+    return keys.reduce((source, key) => literal
+      ? source && ts.isObjectLiteralExpression(source) && !source.properties.some(ts.isSpreadAssignment)
+        ? source.properties.find(p => p.name?.text === key)?.initializer : null
+      : ts.factory.createElementAccessExpression(source, ts.factory.createStringLiteral(key)), owner.initializer);
   }
   function values(node, seen = new Set()) {
     if (!node || seen.has(node)) return [null];
@@ -62,8 +66,7 @@ export function findAgentLaunches(sources) {
     if (ts.isTemplateExpression(node)) return node.templateSpans.reduce((out, s) => out.flatMap(prefix => values(s.expression, seen)
       .map(v => prefix == null || v == null ? null : prefix + v + s.literal.text)), [node.head.text]);
     if (ts.isArrayLiteralExpression(node)) return node.elements.flatMap(e => values(ts.isSpreadElement(e) ? e.expression : e, seen));
-    if (ts.isPropertyAccessExpression(node)) return property(node.expression, node.name.text, seen);
-    if (ts.isElementAccessExpression(node)) return values(node.argumentExpression, seen).flatMap(p => property(node.expression, p, seen));
+    if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) return [null];
     if (ts.isCallExpression(node)) {
       const d = ts.isIdentifier(node.expression) ? declaration(node.expression) : null;
       // Calls to a local argv/command builder (and Object.freeze) retain its literal command evidence.
@@ -82,39 +85,6 @@ export function findAgentLaunches(sources) {
     ts.forEachChild(body, visit);
     return out;
   }
-  function property(node, name, seen) {
-    if (!node || seen.has(node)) return [null];
-    seen = new Set(seen).add(node);
-    if (ts.isIdentifier(node)) return property(declaration(node), name, seen);
-    if (ts.isVariableDeclaration(node)) return node.parent.flags & ts.NodeFlags.Const ? property(node.initializer, name, seen) : [null];
-    if (ts.isParameter(node)) return [null];
-    if (ts.isBindingElement(node)) return property(bindingExpression(node, true), name, seen);
-    if (ts.isParenthesizedExpression(node) || ts.isAwaitExpression(node) || ts.isAsExpression(node)) return property(node.expression, name, seen);
-    if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
-      // Resolve nested object projections before reading the final property.
-      const key = ts.isPropertyAccessExpression(node) ? node.name.text : values(node.argumentExpression, seen)[0];
-      let source = node.expression;
-      if (ts.isIdentifier(source)) source = declaration(source)?.initializer;
-      if (source && ts.isObjectLiteralExpression(source)) {
-        const member = source.properties.find(p => p.name?.text === key);
-        return property(member?.initializer, name, seen);
-      }
-      return [null];
-    }
-    if (ts.isCallExpression(node)) {
-      if (node.expression.getText() === 'Object.freeze') return property(node.arguments[0], name, seen);
-      const d = ts.isIdentifier(node.expression) ? declaration(node.expression) : null;
-      if (d?.body) return returns(d.body).flatMap(r => property(r, name, seen));
-    }
-    if (ts.isObjectLiteralExpression(node)) {
-      const found = node.properties.flatMap(p => ts.isSpreadAssignment(p) ? property(p.expression, name, seen)
-        : (p.name?.text === name || name === '*') ? values(p.initializer ?? p.name, seen) : []);
-      return found.length ? found : [null];
-    }
-    if (ts.isImportSpecifier(node)) return property(imported(node), name, seen);
-    if (ts.isArrayLiteralExpression(node) && /^\d+$/.test(name)) return values(node.elements[Number(name)], seen);
-    return [null];
-  }
   function isPrimitive(node, seen = new Set()) {
     if (!node || seen.has(node)) return false;
     seen.add(node);
@@ -124,7 +94,7 @@ export function findAgentLaunches(sources) {
       if (receiver && (ts.isRegularExpressionLiteral(receiver) || (ts.isNewExpression(receiver) && receiver.expression.getText() === 'RegExp'))) return false;
       return primitives.test(node.name.text);
     }
-    if (ts.isElementAccessExpression(node)) return values(node.argumentExpression).some(v => primitives.test(v));
+    if (ts.isElementAccessExpression(node)) return values(node.argumentExpression).some(v => v == null || primitives.test(v));
     if (ts.isIdentifier(node)) {
       if (primitives.test(node.text)) return true;
       const d = declaration(node);
@@ -144,9 +114,12 @@ export function findAgentLaunches(sources) {
       if (ts.isCallExpression(n) && isPrimitive(n.expression)) {
         const command = values(n.arguments[0]);
         const unresolved = !command.length || command.includes(null);
-        const shellCommand = command.some(c => shell.test(c)) && values(n.arguments[1]).some(c => c == null || agent.test(c));
-        if (unresolved || command.some(c => agent.test(c)) || shellCommand) findings.push({ file: name,
+        const dynamicMember = ts.isElementAccessExpression(n.expression) && values(n.expression.argumentExpression).includes(null);
+        const wrapped = (dynamicMember || command.some(c => wrapper.test(c))) && values(n.arguments[1]).some(c => c == null || agent.test(c));
+        if (unresolved || command.some(c => agent.test(c)) || wrapped) findings.push({ file: name,
           line: file.getLineAndCharacterOfPosition(n.getStart()).line + 1, kind: n.expression.getText(file),
+          classification: unresolved ? 'unresolved' : 'resolved',
+          fingerprint: JSON.stringify([command, values(n.arguments[1]), ...n.arguments.slice(0, 2).map(a => a.getText(file))]),
           reason: unresolved ? 'unresolved command; cannot establish launch boundary' : 'agent execution outside agent-launch.mjs' });
       }
       ts.forEachChild(n, visit);

@@ -112,6 +112,16 @@ describe('transparent execution', () => {
 describe('resume validation across execution forms', () => {
   const launches = [
     ['claude', ['-r', SID]],
+    ['codex', ['--sandbox', 'workspace-write', 'exec', 'resume', SID]],
+    ['codex', ['--profile=fixture', 'exec', '--json', '-s', 'workspace-write', 'resume', SID]],
+    ['codex', `--sandbox workspace-write exec --json resume '${SID}'`],
+    [`codex --profile fixture exec resume ${SID}`],
+    ['sh', ['-c', `codex --profile fixture exec --json resume ${SID}`]],
+    ['claude', ['--verbose', '--session-id', SID, '-p', 'hello']],
+    ['claude', ['-p', 'hello', `--session-id=${SID}`]],
+    ['claude', ['-p', 'hello', '--resume', SID]],
+    ['claude', ['-p', 'hello', '-r', SID]],
+    [`claude --verbose --session-id '${SID}' -p hello`],
     ['claude', `--resume ${SID}`],
     ['claude', `-r '${SID}'`],
     ['codex', `exec resume "${SID}"`],
@@ -142,6 +152,8 @@ describe('resume validation across execution forms', () => {
   });
   it.each([
     ['claude', ['--resume', SID, '-r', 'other-id']],
+    ['claude', ['--resume', SID, '--session-id', 'other-id']],
+    ['codex', ['--profile', 'fixture', 'exec', 'resume', 'other-id']],
     [`claude --resume ${SID}; codex exec resume other-id`],
     ['sh', ['-c', `claude -r ${SID} | codex exec resume other-id`]],
   ])('checks every resume id rather than just the first (%j)', (...args) => {
@@ -154,6 +166,12 @@ describe('resume validation across execution forms', () => {
     expect(agentResumeId(['-r', SID])).toBe(SID);
     expect(agentResumeId(`exec resume '${SID}'`)).toBe(SID);
     expect(agentResumeId('--print hello')).toBeNull();
+  });
+  it.each([['--resume'], ['-r'], ['--session-id'], ['--session-id='], ['--profile', 'fixture', 'exec', 'resume']])
+  ('refuses missing native resume ids before execution (%j)', (...argv) => {
+    const primitive = vi.fn(), log = vi.fn();
+    expect(() => launchAgent({ mode: 'claude-resume', resumeId: null, log }, primitive, 'claude', argv)).toThrow('native resume id');
+    expect(primitive).not.toHaveBeenCalled();
   });
 });
 

@@ -40,9 +40,11 @@ export function agentResumeId(argv = []) {
 }
 
 function resumeIds(argv) {
+  let hasExec = false;
   return argv.flatMap((word, i) => {
-    if (word === '--resume' || word === '-r' || (argv[0] === 'exec' && word === 'resume')) return argv[i + 1] == null ? [] : [argv[i + 1]];
-    return typeof word === 'string' && /^(?:--resume=|-r=?).+/.test(word) ? [word.replace(/^(?:--resume=|-r=?)/, '')] : [];
+    if (word === 'exec') hasExec = true;
+    if (word === '--resume' || word === '-r' || word === '--session-id' || (word === 'resume' && hasExec)) return [argv[i + 1] ?? ''];
+    return typeof word === 'string' && /^(?:--resume=|--session-id=|-r=?)/.test(word) ? [word.replace(/^(?:--resume=|--session-id=|-r=?)/, '')] : [];
   });
 }
 
