@@ -445,12 +445,17 @@ describe('R972 tier-three patterns', () => {
     `addr:${v4(192, 168, 1, 2)}`, `(${v4(10, 2, 3, 4)}),`, `${v4(10, 2, 3, 4)};`, `see ${v4(172, 16, 0, 2)}!`,
     `::ffff:${v4(10, 2, 3, 4)}.`, `::ffff:${v4(10, 2, 3, 4)}:80`, `${ula('', '', 'ffff', 'a00', '1')}.`,
     `ULA ${ula('fd12', '', '1')}.`, `ULA ${ula('fd12', '', '1')}:`, `addr:${ula('fd12', '', '1')}`,
+    `ssh -L localhost:8080:${v4(10, 0, 0, 1)}:80`, `source:${ula('fd00', '', '1')}`, `ipv6:${ula('fd00', '', '1')}`,
+    `iface:${ula('fe80', '', '1')}`, `source:${ula('', '', 'ffff', 'a00', '1')}`,
+    `backup_${v4(10, 0, 0, 1)}.tar.gz`, `${v4(10, 0, 0, 1)}_backup`, `addr_${ula('fd00', '', '1')}`,
   ])('detects private IPs beside ordinary punctuation: %s', text => {
     expect(scanText(text).some(hit => hit.pattern === 'private-network-ip')).toBe(true);
   });
   it.each([
     v4(10, 2, 3, 4, 5), v4(1, 10, 2, 3, 4), `${v4(10, 2, 3, 4)}a`, `${v4(8, 8, 8, 8)}.`,
     `8080:${v4(8, 8, 8, 8)}:80`, ula('2001', 'fd12', '', '1'), ula('2001', 'db8', '', 'fe80', '1'),
+    ula('2001', 'fd12', '1'), `cafe:${ula('fd00', '', '1')}`, ula('2001', '', 'fd00', '1'),
+    `${ula('2001', 'db8', '')}:${v4(10, 0, 0, 1)}`, `${ula('64', 'ff9b', '')}:${v4(192, 168, 0, 1)}`,
   ])('keeps dotted-number and public-address boundaries: %s', text => {
     expect(scanText(text).filter(hit => hit.pattern === 'private-network-ip')).toEqual([]);
   });
