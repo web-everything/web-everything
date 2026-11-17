@@ -82,6 +82,7 @@ import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
 import { runReconcilePass, defaultReadPrs, defaultReadAgents, isConflictingPr } from '../../scripts/conveyor/reconcile-pass.mjs';
 import { promoteDraftsThenReplan, promoteDraftsGuarded, rearmStaleAcceptanceGuarded, rearmStaleAcceptsThenReplan } from '../../scripts/conveyor/review-tick-promote.mjs'; // card xemxk3h
+import { runSendBackTick } from '../../scripts/conveyor/review-sendback-io.mjs';
 import { notifyReferralHold } from '../../scripts/conveyor/review-referral-hold.mjs';
 // card x29vm8a — a scope-bloated PR (stale base) is refreshed onto main through the SAME mechanical path the ci-red
 // recovery watch uses, once per head, before any review reads its diff.
@@ -434,6 +435,7 @@ export function runReviewTick({
   // existing caller unchanged; the real daemon wires `rearmStaleAcceptanceGuarded`. `noteRearms` reports the rows.
   rearmStaleAccepts = null,
   noteRearms = null,
+  sendBack = null,
   onPlan = null,
   // One-line failure causes (status sweep / status tag). The real daemon wires `log.error`; tests inject a spy.
   log = () => {},
@@ -569,6 +571,8 @@ export function runReviewTick({
     replanError = replanError ?? out.replanError ?? null;
     if (out.rearms.length) { try { noteRearms?.({ repo, rearms: out.rearms, replanError: out.replanError }); } catch { /* report only */ } }
   }
+  try { sendBack?.({ repo, plan, prs: rawPrs, agents: rawAgents, log }); }
+  catch (e) { log(`review-sendback hook failed: ${String(e?.message ?? e).replace(/[\p{Cc}\p{Cf}]/gu, ' ').slice(0, 500)}`); }
   try { onPlan?.({ repo, plan, rawPrs }); } catch { /* observation never breaks a tick */ }
   // Captured at plan completion, never at log-read time. Only a plan that survived (re)planning is evidence.
   const operatorHolds = replanError ? null : { observedAt: now(), holds: operatorHoldsFromPlan(plan) };
@@ -1712,7 +1716,7 @@ export function buildCliDaemonEffects({
   // store is stale or partial; label READS try the store, label WRITES and the drain/merge path never do.
   // The real review-pass effects ({@link cliReviewTickOpts}); injectable so a test can drive this default `runReview`.
   reviewTickOpts = cliReviewTickOpts,
-  runReview = (opts) => runReviewTickAllRepos({ tick, ...reviewTickOpts({ log, factCache }), ...opts }),
+  runReview = (opts) => runReviewTickAllRepos({ tick, sendBack: runSendBackTick, ...reviewTickOpts({ log, factCache }), ...opts }),
   // #xconv1 — the SAME shared-reads optimization `runReview` above opts into, wired the same way for its own
   // separate, additive async stage (see `runConvertAdvisoryTick`'s own doc for why this is not folded into
   // `runReview`/`runReviewTick`).

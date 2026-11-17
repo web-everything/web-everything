@@ -2815,3 +2815,16 @@ it.each(['idle', 'low', 'denied', 'floor throws', 'sample throws', 'infinite'])(
       expect(readCpuIdlePct).not.toHaveBeenCalled();
     }
   });
+
+
+describe('runReviewTick mechanical send-back hook', () => {
+  it('forwards final plan and shared evidence; hook failure never aborts the tick', () => {
+    const plan = { dispatch: [], refusals: [], notes: [] }, prs = [], agents = [];
+    const sendBack = vi.fn(() => { throw new Error('failed send'); }), log = vi.fn();
+    const result = runReviewTick({ reconcile: () => plan, readPrs: () => prs, readAgents: () => agents,
+      sendBack, log, holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [] });
+    expect(sendBack).toHaveBeenCalledWith(expect.objectContaining({ plan, prs, agents }));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('hook failed'));
+    expect(result.reconcileError).toBeNull();
+  });
+});

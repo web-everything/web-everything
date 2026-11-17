@@ -4,7 +4,8 @@ import { standingRulingScope } from './conveyor/standing-ruling-io.mjs';
 import { signalFixDispatch } from './lib/fix-handoff.mjs';
 import { mandatoryReferralState, readReferralRecords, referralRecordState } from './lib/jury-core.mjs';
 import { referralSeatDisabled } from './operations/review-seat-policy.mjs';
-import { readReviewRunEvidence } from './conveyor/review-referral-hold.mjs';
+import { referralDigest } from './conveyor/review-sendback.mjs';
+import { readReviewRunEvidence, blockRuledReferralsFor, GH_LIST_COMMENT_CAP } from './conveyor/review-referral-hold.mjs';
 /**
  * review-set-label.mjs — swap a PR's review label, INVARIANT-2 guarded (#2470, increment 2 of 2). Also the
  * SINGLE HOME of the shared review-label CLI harness (#2644): a PURE `decideSetLabel` decides the swap for a
@@ -1232,9 +1233,12 @@ export function runReviewLabelCli({
   if (onlyIf !== null && !['accepted', 'missing'].includes(onlyIf)) {
     fail("invalid --only-if — expected 'accepted' or 'missing'");
   }
+  const expectReferrals = (argv.find((a) => a.startsWith('--expect-referrals=')) || '').slice('--expect-referrals='.length);
+  const pinnedChanges = to === 'changes' && expectHeadFlag !== undefined;
+  if (pinnedChanges && (!/^[0-9a-f]{40}$/.test(expectedHead || '') || newHeadArg)) fail('changes requires --expect-head=<full 40-hex SHA>');
   const pinnedRearm = to === 'rearm' && expectHeadFlag !== undefined;
   const pinnedPlainRearm = pinnedRearm && onlyIf !== 'missing';
-  if (expectHeadFlag !== undefined && !guardedRestamp && !pinnedAccept && !pinnedRearm && onlyIf !== 'missing') fail('--expect-head requires guarded restamp, re-arm or a pinned accept');
+  if (expectHeadFlag !== undefined && !guardedRestamp && !pinnedAccept && !pinnedChanges && !pinnedRearm && onlyIf !== 'missing') fail('--expect-head requires guarded restamp, re-arm or a pinned accept');
   if (onlyIf === 'missing' && (!/^[0-9a-f]{40}$/.test(expectedHead || '') || newHeadArg)) fail('missing re-arm requires --expect-head=<full 40-hex SHA>');
   if (pinnedRearm && !/^[0-9a-f]{40}$/.test(expectedHead || '')) fail('re-arm requires --expect-head=<full 40-hex SHA>');
   if (onlyIf !== null && to !== 'rearm') {
@@ -1414,7 +1418,7 @@ export function runReviewLabelCli({
   if (to === 'rearm' && !prCommentsReadable) refuseRearm('comments unreadable — cannot prove no human clearance');
   if (to === 'rearm' && !/^[0-9a-f]{7,40}$/i.test(headSha.trim())) refuseRearm('head unreadable — cannot prove no human clearance');
 
-  if ((guardedRestamp || pinnedAccept || pinnedRearm || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
+  if ((guardedRestamp || pinnedAccept || pinnedChanges || pinnedRearm || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
   if (expectNoReadiness && hasReviewLabel(currentLabels, READY_TO_MERGE_LABEL)) {
     fail('missing review handoff refused: producer readiness appeared after the caller observation', 1);
   }
@@ -1997,6 +2001,27 @@ export function runReviewLabelCli({
 
   // Check the pin before each write. At the label write, reuse the clearance check's
   // fresh state so a push during that read cannot bypass the pin.
+  const assertPinnedChanges = () => {
+    if (!pinnedChanges) return;
+    const fresh = provider.readPrState(repo, pr);
+    const names = fresh.labels?.map(l => typeof l === 'string' ? l : l.name);
+    if (fresh.headRefOid !== expectedHead || String(fresh.state).toUpperCase() !== 'OPEN'
+      || !names?.includes(REVIEW_LABELS.pending)
+      || [REVIEW_LABELS.human, REVIEW_LABELS.changes].some(l => names.includes(l))) {
+      throw new Error('pinned changes head or pending labels changed; nothing further written');
+    }
+    // A withdrawn ruling or a newly pending referral since the caller read it must not authorize the bounce.
+    let evidence = fresh;
+    if (Array.isArray(fresh.comments) && fresh.comments.length >= GH_LIST_COMMENT_CAP) {
+      const full = provider.readComments(repo, pr); // a capped page can hide a later withdrawal or pending referral
+      if (!Array.isArray(full)) throw new Error('pinned changes: full comment thread unreadable; nothing further written');
+      evidence = { ...fresh, comments: full };
+    }
+    const owed = blockRuledReferralsFor({ ...evidence, number: Number(pr) }, { repo });
+    if (!owed.length || (expectReferrals && referralDigest(owed) !== expectReferrals)) {
+      throw new Error('pinned changes: blocking referral set differs from the one the findings were written for; nothing further written');
+    }
+  };
   const assertPinnedRearmHead = (fresh) => {
     if (pinnedRearm && onlyIf !== 'missing' && (fresh ?? provider.readPrState(repo, pr)).headRefOid !== expectedHead) {
       throw new Error('live head differs from --expect-head');
@@ -2036,6 +2061,7 @@ export function runReviewLabelCli({
   };
   recheckMissingRearm();
 
+  try { assertPinnedChanges(); } catch (e) { fail(ghErr(e, 'pinned changes refused'), 1); }
   const ledgerVerdict = verdictForLabelTarget(to);
   let clearingLedgerMiss = false;
   let clearingLedgerError;
@@ -2107,6 +2133,7 @@ export function runReviewLabelCli({
   let preSwapLabels;
   const applySwap = () => {
     try {
+      assertPinnedChanges();
       if (['accepted', 'restamp', 'clear-human'].includes(to)) {
         const fresh = provider.readPrState(repo, pr);
         if (fresh.headRefOid !== headSha && !(to === 'restamp' && newHeadArg && !mandatoryReferralState(fresh.comments).records.length)) throw new Error('head changed before acceptance; hold retained');
@@ -2159,7 +2186,7 @@ export function runReviewLabelCli({
         if (rearmVerdictKey(verdict) !== rearmVerdictKey(rearmVerdict)) fail('latest changes verdict changed before marker write — retry the pinned re-arm', 1);
         if (coveringRearm(freshComments, verdict)) return;
       } else {
-        try { assertPinnedRearmHead(); } catch (e) { fail(ghErr(e, 'gh pr comment failed'), 1); }
+        try { assertPinnedChanges(); assertPinnedRearmHead(); } catch (e) { fail(ghErr(e, 'gh pr comment failed'), 1); }
       }
       try {
         restampedAt = Date.now();
