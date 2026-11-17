@@ -1138,31 +1138,6 @@ describe('rebuildClone', () => {
     expect(readRebuildState(cloneDir, env).adopted.inputsKey).toBe('ik-crash-1');
   });
 
-  it.each(['dispatchPasses=0;skipReconcile=true', 'invalid'])('persists interrupted adoption at %s depth but plans a full smoke before reporting success', async (smokeDepth) => {
-    const { cloneDir, env } = makeFixture();
-    env.WE_SMOKE_DISPATCH_PASSES = '3';
-    env.WE_SMOKE_SKIP_RECONCILE_DRY_RUN = '0';
-    const { target } = crashAfterReset(cloneDir, env);
-    const state = readRebuildState(cloneDir, env);
-    state.inProgress.smokeDepth = smokeDepth;
-    writeFileSync(rebuildStatePath(cloneDir, env), JSON.stringify(state));
-    const runSmoke = passSmoke();
-    const args = { root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS };
-
-    const result = await rebuildClone({ ...args, adoptOnly: true });
-    expect(result).toMatchObject({ reason: 'needs-build', plan: { upToDate: true } });
-    expect(result.adopted).toBeFalsy();
-    expect(runSmoke).not.toHaveBeenCalled();
-    const recovered = readRebuildState(cloneDir, env);
-    expect(recovered.inProgress).toBeNull();
-    expect(recovered.adopted).toMatchObject({ head: target, smokeDepth, inputsKey: 'ik-crash-1' });
-    expect(interruptedAlerts(result)).toHaveLength(1);
-
-    expect((await rebuildClone(args)).adopted).toBe(true);
-    expect(runSmoke).toHaveBeenCalledTimes(1);
-    expect(readRebuildState(cloneDir, env).adopted.smokeDepth).toBeUndefined();
-  });
-
   // PR #2731 review: a record written by the PRE-fix code (reset BEFORE smoke) carries no `verified` marker, and
   // the pre-fix recovery could leave `state.unverified` behind. Either one at HEAD means a build that was NEVER
   // smoked is on disk — it must be rolled back and re-smoked off-lock, never promoted straight to adopted.

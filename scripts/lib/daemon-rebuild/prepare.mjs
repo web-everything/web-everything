@@ -12,7 +12,7 @@ import {
   READY_MAX_AGE_ENV, DEFAULT_READY_MAX_AGE_MS, claimBuildLease, buildLeaseIsLive,
 } from './lease.mjs';
 import {
-  staleAlertDetail, matchReadyCandidate, readyBuildVerified, finalizeRebuild, dropSuspectOverlays, smokeDepthAtLeast,
+  staleAlertDetail, matchReadyCandidate, readyBuildVerified, finalizeRebuild, dropSuspectOverlays,
   overlayGraduated, overlayRetiredByOperator, reportDiscardedCandidate,
 } from './adopt.mjs';
 import { hostname } from 'node:os';
@@ -195,21 +195,21 @@ export async function prepareRebuild({
         const promote = headNow === ip.target && ip.target !== ip.prevHead;
         if (promote) {
           state.adopted = {
-            head: ip.target, smokeDepth: ip.smokeDepth, inputsKey: ip.inputsKey ?? null, mainSha: ip.mainSha ?? null, applied: ip.applied ?? [], at: nowIso(),
+            head: ip.target, inputsKey: ip.inputsKey ?? null, mainSha: ip.mainSha ?? null, applied: ip.applied ?? [], at: nowIso(),
           };
           state.rejected = null;
           state.held = null;
           writeState();
           alert('rebuild-interrupted-recovered', { target: ip.target, headNow, promoted: true });
           await finishVerifiedSwaps();
-          // Recovery preserves the passed depth; a deeper request still needs a fresh plan and smoke.
-          if (smokeDepthAtLeast(ip.smokeDepth, env)) return terminal({
+          // Short-circuit here (unlike the non-promoted branch below, which falls through to a fresh plan this
+          // same tick): this build is now FULLY adopted, so there is nothing else for this tick to decide.
+          return terminal({
             moved: false, adopted: true, reason: 'recovered-adopted', head: ip.target,
           });
-        } else {
-          writeState();
-          alert('rebuild-interrupted-recovered', { target: ip.target, headNow, promoted: false });
         }
+        writeState();
+        alert('rebuild-interrupted-recovered', { target: ip.target, headNow, promoted: false });
       } else {
         alert('rebuild-interrupted-unrecoverable', { inProgress: state.inProgress, headNow });
         return terminal({ moved: false, reason: 'rebuild-interrupted-unrecoverable' });
@@ -515,10 +515,10 @@ export async function prepareRebuild({
   }
 
   // ── Step 4: up-to-date / still-rejected short-circuits ──────────────────────────────────────────────
-  if (plan.upToDate && smokeDepthAtLeast(state.adopted?.smokeDepth, env)) {
+  if (plan.upToDate) {
     if (!state.adopted || state.adopted.inputsKey !== plan.inputsKey || state.held) {
       state.adopted = {
-        head: plan.finalSha, smokeDepth: state.adopted?.smokeDepth, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, at: nowIso(),
+        head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, at: nowIso(),
       };
       state.held = null; // x5wbsbc — current again: no longer held on a last-good build
       writeState();
@@ -552,7 +552,6 @@ export async function prepareRebuild({
         return overlayEvents;
       };
       const m = matchReadyCandidate({
-        env,
         ready,
         plan,
         prevHead,
@@ -630,7 +629,7 @@ export async function prepareRebuild({
           run,
           stateOpts,
           now,
-          plan: { ...m.adopt, smokeDepth: ready.smokeDepth },
+          plan: m.adopt,
           prevHead,
           lease: { token: ready.token ?? null },
           onAdopted: m.dropRefs.length
@@ -693,7 +692,7 @@ export async function prepareRebuild({
 
   // daemonRebuild.skipUnrelated — the move changes nothing this daemon runs (see skip-unrelated.mjs): adopt the
   // target without the candidate build + live smoke. Only from a clone that is itself on its smoke-verified
-  // build (adopted === HEAD, not held) at the requested smoke depth, so insufficient evidence is never carried forward unsmoked.
+  // build (adopted === HEAD, not held), so an unverified tree is never carried forward unsmoked.
   // A sibling daemon's LIVE build lease also blocks it: it is mid-smoke on a candidate, and moving the clone
   // under it would leave its finalize running against a prevHead that no longer matches HEAD.
   // A build adopted while a lane-pool probe was SKIPPED for a busy pool (`busySkippedTrees`) was never fully
@@ -702,7 +701,6 @@ export async function prepareRebuild({
   const headTree = busyTrees.length ? verifyRev(git, `${prevHead}^{tree}`) : null;
   const busyUnverified = busyTrees.length > 0 && (!headTree || busyTrees.includes(headTree));
   if (typeof skipCheck === 'function' && state.adopted?.head === prevHead && !state.held && !state.quarantine
-    && smokeDepthAtLeast(state.adopted.smokeDepth, env)
     && !busyUnverified && !buildLeaseIsLive(state.building, { env: stEnv, nowMs: nowMs() })) {
     // --no-renames: a renamed file must list BOTH endpoints, or a renamed-away imported module hides from the closure.
     // -z: NUL-separated, so a non-ASCII path is not C-quoted into a string that never matches a closure member.

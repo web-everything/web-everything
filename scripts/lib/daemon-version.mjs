@@ -15,8 +15,6 @@ import { isVersionedClone, validateDaemonVersionsSettings } from './daemon-versi
 import { linkVersionState, carryUntrackedSidecars } from './daemon-version-state.mjs';
 import { ensureNodeModulesStore, linkNodeModules } from './daemon-job-snapshots.mjs';
 import { candidateSmokeEnv } from './daemon-rebuild/candidate.mjs';
-import { smokeDepthAtLeast } from './daemon-rebuild/adopt.mjs';
-import { smokeDepthTag } from './daemon-rebuild/smoke.mjs';
 import { makeGit } from './daemon-rebuild/shared.mjs';
 import { runLiveSmokeWithRetry } from './daemon-live-smoke.mjs';
 
@@ -52,8 +50,7 @@ export async function buildVersion({ clone, home, sha = 'HEAD', settings, force 
       try { record = JSON.parse(fs.readFileSync(join(versionsRoot, entry.name, '.version.json'), 'utf8')); }
       catch (error) { if (error.code === 'ENOENT' || error instanceof SyntaxError) continue; throw error; }
       if (record.sha === fullSha && record.id === entry.name
-        && ['built', 'smoke-failed'].includes(record.status)
-        && smokeDepthAtLeast(record.smokeDepth, env)) {
+        && ['built', 'smoke-failed'].includes(record.status)) {
         return { status: 'reused', id: entry.name, dir: join(versionsRoot, entry.name) };
       }
     }
@@ -113,7 +110,7 @@ export async function buildVersion({ clone, home, sha = 'HEAD', settings, force 
     });
     if (!smoke || typeof smoke.verdict !== 'string') throw new Error('Smoke returned no verdict');
     const status = smoke.verdict === 'pass' ? 'built' : 'smoke-failed';
-    const record = { id, sha: fullSha, builtAt, lockKey: store.key, smoke, smokeDepth: smokeDepthTag(env), status };
+    const record = { id, sha: fullSha, builtAt, lockKey: store.key, smoke, status };
     fs.writeFileSync(join(temp, '.version.json.tmp'), `${JSON.stringify(record, null, 2)}\n`, { flag: 'wx' });
     fs.renameSync(join(temp, '.version.json.tmp'), join(temp, '.version.json'));
     fs.renameSync(temp, dir);

@@ -69,16 +69,14 @@ describe('daemon smoke slots', () => {
     vi.spyOn(adoptions, 'checkPendingAdoptions').mockResolvedValue(undefined);
     const result = { moved: false, reason: 'smoke-failed' };
     const versions = { clone: stateDir };
-    const env = { WE_DAEMON_SMOKE_STATE_DIR: stateDir, WE_SMOKE_DISPATCH_PASSES: '0', WE_SMOKE_SKIP_RECONCILE_DRY_RUN: '1' };
-    const versioned = vi.spyOn(versionRuntime, 'versionedRebuild').mockImplementation(async ({ ctx, env: forwardedEnv }) => {
+    const versioned = vi.spyOn(versionRuntime, 'versionedRebuild').mockImplementation(async ({ ctx }) => {
       expect(ctx).toBe(versions);
-      expect(forwardedEnv).toBe(env);
       expect(state().holders.map(e => e.pid)).toEqual([process.pid]);
       if (throws) throw new Error('versioned smoke failure');
       return result;
     });
     const rebuilding = rebuildClone({ root: stateDir, versions, asJob: false, readyOnly: true,
-      env, log, emitEvent: vi.fn() });
+      env: { WE_DAEMON_SMOKE_STATE_DIR: stateDir }, log, emitEvent: vi.fn() });
     if (throws) await expect(rebuilding).rejects.toThrow('versioned smoke failure');
     else expect(await rebuilding).toBe(result);
     expect(versioned).toHaveBeenCalledTimes(1);

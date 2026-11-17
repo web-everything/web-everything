@@ -12,7 +12,7 @@ import { readRebuildState, writeRebuildState, alertsFilePath, writeReadyCandidat
 import { releaseBuildLease } from './lease.mjs';
 import { forceRequestFor, readForceAdopt, recordForcedAdoption, abortForcedAdoption, clearForceAdopt } from '../daemon-force-adopt.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
-import { finalizeRebuild, staleAlertDetail, dropSuspectOverlays, smokeDepthAtLeast } from './adopt.mjs';
+import { finalizeRebuild, staleAlertDetail, dropSuspectOverlays } from './adopt.mjs';
 import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { mkdirSync, appendFileSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -24,7 +24,7 @@ import { hostname } from 'node:os';
 import { pinnedStatus, planRebuild } from './plan.mjs';
 import { makeAuditedTipGate } from './audited-tip.mjs';
 import { runBounded } from '../bounded-child.mjs';
-import { SMOKE_CHECKS, resolveSmokeDepth } from '../daemon-live-smoke.mjs';
+import { SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
 import { readDeclaredSettings } from '../settings-files.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
 
@@ -39,19 +39,9 @@ function rejectionDetail(row) {
   };
 }
 
-/** Tag of the current smoke depth: undefined for the full smoke, else which parts the smoke skips. */
-export function smokeDepthTag(env = process.env) {
-  const d = resolveSmokeDepth(env);
-  return d.dispatchPasses === 0 || d.skipReconcileDryRun
-    ? `dispatchPasses=${d.dispatchPasses};skipReconcile=${d.skipReconcileDryRun}` : undefined;
-}
-
 /** Identity of a proven tree and the dependencies of its full smoke. */
-export function smokePassKey({ tree, lockHash, nodeVersion, harnessHash, cloneKind = 'daemon', depth }) {
-  // `depth` is set only for a reduced smoke, so a full-depth key (and every proof recorded before the light
-  // default) is unchanged and a reduced proof can never satisfy a full request.
-  return sha256(JSON.stringify(depth ? { tree, lockHash, nodeVersion, harnessHash, cloneKind, depth }
-    : { tree, lockHash, nodeVersion, harnessHash, cloneKind }));
+export function smokePassKey({ tree, lockHash, nodeVersion, harnessHash, cloneKind = 'daemon' }) {
+  return sha256(JSON.stringify({ tree, lockHash, nodeVersion, harnessHash, cloneKind }));
 }
 
 /** Reuse policy and per-leaf provenance through the shared settings cascade. */
@@ -81,7 +71,7 @@ export function completeSmokePass(result) {
 }
 
 /** Read the candidate's content identity and the RUNNING harness; failures cannot prove a tree. */
-export function smokePassIdentity(git, sha, cloneKind = 'daemon', env = process.env) {
+export function smokePassIdentity(git, sha, cloneKind = 'daemon') {
   try {
     const tree = verifyRev(git, `${sha}^{tree}`);
     if (!tree) return null;
@@ -93,7 +83,7 @@ export function smokePassIdentity(git, sha, cloneKind = 'daemon', env = process.
     }
     const lockHash = lock.status === 0 ? sha256(lock.stdout ?? '') : '';
     const harnessHash = sha256(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../daemon-live-smoke.mjs')));
-    return { tree, key: smokePassKey({ tree, lockHash, nodeVersion: process.version, harnessHash, cloneKind, depth: smokeDepthTag(env) }) };
+    return { tree, key: smokePassKey({ tree, lockHash, nodeVersion: process.version, harnessHash, cloneKind }) };
   } catch {
     return null;
   }
@@ -448,7 +438,7 @@ export async function smokeAndAdopt({
   // one) — lets the smoke skip a tree-code check whose code none of them touch (see daemon-live-smoke.mjs
   // SMOKE_CHECKS). Unknown (not the adopted head, a failed diff) ⇒ null ⇒ full smoke.
   const changedSince = (sha) => {
-    if (!adoptedHead || adoptedHead !== prevHead || !smokeDepthAtLeast(adoptedState.smokeDepth, smokeEnv)) return null;
+    if (!adoptedHead || adoptedHead !== prevHead) return null;
     // A build adopted while a lane-pool probe was SKIPPED for a busy pool (`skipped: busy pool`) was never
     // live-verified on those checks, so "unchanged since the last live-verified build" does not hold for it:
     // the next smoke runs every check (null = full smoke), or a chain of busy skips would launder the pool code.
@@ -471,7 +461,7 @@ export async function smokeAndAdopt({
     // cannot distinguish a healthy fallback from a harness that has since broken on every tree.
     const freshComparison = label != null;
     if (freshComparison) changedFiles = null;
-    const identity = smokePassIdentity(git, sha, cloneKind, smokeEnv);
+    const identity = smokePassIdentity(git, sha, cloneKind);
     const passes = readRebuildState(root, stEnv).smokePassed;
     const proven = !freshComparison && reuse.reuseEnabled && identity && Array.isArray(passes) && passes.find(entry => {
       const age = now() - Date.parse(entry?.passedAt);
@@ -608,7 +598,6 @@ export async function smokeAndAdopt({
     }
     writeReadyCandidate(root, {
       ...readyMeta,
-      smokeDepth: smokeDepthTag(smokeEnv),
       prevHead,
       tree: verifyRev(git, `${p.finalSha}^{tree}`),
       adopt: {
@@ -636,7 +625,7 @@ export async function smokeAndAdopt({
       };
     }
     const fin = await withWriteLock(root, () => finalizeRebuild({
-      root, env, log, run, stateOpts, now, plan: { ...p, smokeDepth: smokeDepthTag(smokeEnv) }, prevHead, lease, onAdopted,
+      root, env, log, run, stateOpts, now, plan: p, prevHead, lease, onAdopted,
       auditedTip: makeAuditedTipGate(env), // unaudited-tip: evidence revoked during the smoke must not be adopted
     }), finalizeLockOpts);
     if (!fin.ok) {

@@ -303,26 +303,6 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     return { originDir, cloneDir, env, lastGood, target, arm };
   };
 
-  it.each(['light', 'legacy'])('rollback preserves last-good %s smoke evidence instead of the current full depth', async depth => {
-    const { cloneDir, env, lastGood, target, arm } = setup();
-    env.WE_SMOKE_DISPATCH_PASSES = '3';
-    env.WE_SMOKE_SKIP_RECONCILE_DRY_RUN = '0';
-    const smokeDepth = depth === 'light' ? 'dispatchPasses=0;skipReconcile=true' : undefined;
-    const path = rebuildStatePath(cloneDir, env);
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, JSON.stringify({ adopted: { head: lastGood, smokeDepth } }));
-    arm();
-    await tick(cloneDir, env, { runSmoke: failing(), forceWatchProbe: healthy });
-    expect(headOf(cloneDir)).toBe(target);
-    expect(readForceWatch(cloneDir, env).lastGood.smokeDepth).toBe(smokeDepth);
-    expect(readRebuildState(cloneDir, env).adopted.smokeDepth).toBeUndefined();
-
-    await tick(cloneDir, env, { runSmoke: passing(), forceWatchProbe: unhealthy });
-    expect(headOf(cloneDir)).toBe(lastGood);
-    expect(readForceWatch(cloneDir, env)).toBeNull();
-    expect(readRebuildState(cloneDir, env).adopted.smokeDepth).toBe(smokeDepth);
-  });
-
   it('a request for the held candidate reaches a fresh smoke through a sticky rejection and is consumed; a request for another build does not lift it', async () => {
     const { cloneDir, env, lastGood, target, arm } = setup();
     // The candidate fails and the last-good control passes: a plain candidate rejection, not a broken harness.

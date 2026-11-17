@@ -143,7 +143,7 @@ async function forceWatch(options, emitEvent, startedAtMs) {
           clearReadyCandidate(root, stEnv);
           const done = await finalizeRebuild({
             root, env, log, run, stateOpts, now, prevHead: head, lease: { token: 'force-adopt-rollback' },
-            plan: { ok: true, finalSha: lastGood.head, inputsKey: lastGood.inputsKey, mainSha: lastGood.mainSha, applied: lastGood.applied || [], smokeDepth: lastGood.smokeDepth },
+            plan: { ok: true, finalSha: lastGood.head, inputsKey: lastGood.inputsKey, mainSha: lastGood.mainSha, applied: lastGood.applied || [] },
           });
           return { ok: done?.adopted === true };
         }, { now });
@@ -199,7 +199,7 @@ async function rebuildCloneInternal({
     const slot = await acquireSmokeSlot({ env: { ...env, ...(stateOpts?.env || {}) }, log, now, sleep });
     try {
       if (!slot.acquired) return { moved: false, reason: 'smoke-queue-timeout' };
-      return await versionedRebuild({ ctx: vctx, log, env });
+      return await versionedRebuild({ ctx: vctx, log });
     } finally {
       await slot.release();
     }

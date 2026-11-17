@@ -10,9 +10,7 @@ import { rebuildClone, readRebuildState, readyCandidatePath } from '../daemon-re
 import { SMOKE_CHECKS, runLiveSmoke } from '../daemon-live-smoke.mjs';
 import { addOverlay, readOverlays } from '../daemon-overlays.mjs';
 import { writeRebuildState } from '../daemon-rebuild/state.mjs';
-import { smokePassKey, smokeDepthTag, smokePassIdentity, smokePassTtlMs, resolveSmokeReuse } from '../daemon-rebuild/smoke.mjs';
-import { rebuildCloneAsJob } from '../daemon-rebuild/rebuild-job.mjs';
-import { createJobStore } from '../daemon-jobs-runtime.mjs';
+import { smokePassKey, smokePassIdentity, smokePassTtlMs, resolveSmokeReuse } from '../daemon-rebuild/smoke.mjs';
 
 vi.mock('../resource-admission.mjs', () => ({ shadowAdmission: vi.fn(), admit: vi.fn() }));
 
@@ -82,7 +80,6 @@ const FAIL = { verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, nam
 
 beforeEach(() => { tempDirs.length = 0; });
 afterEach(() => {
-  vi.unstubAllEnvs();
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
   tempDirs.length = 0;
 });
@@ -91,7 +88,7 @@ const rebuild = (f, runSmoke, extra = {}) => rebuildClone({
   root: f.cloneDir, env: f.env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS, ...extra,
 });
 const head = (f) => gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim();
-const identity = (f, sha) => smokePassIdentity((args) => git(f.cloneDir, args), sha, 'clone', f.env);
+const identity = (f, sha) => smokePassIdentity((args) => git(f.cloneDir, args), sha, 'clone');
 
 // Move main to a distinct commit with identical content, and restore the clone's original base.
 function repeatTree(f, base) {
@@ -102,93 +99,6 @@ function repeatTree(f, base) {
 }
 
 describe('durable smoke pass cache', () => {
-
-  const fullDepth = { WE_SMOKE_DISPATCH_PASSES: '3', WE_SMOKE_SKIP_RECONCILE_DRY_RUN: '0' };
-  const lightDepth = { WE_SMOKE_DISPATCH_PASSES: '0', WE_SMOKE_SKIP_RECONCILE_DRY_RUN: '1' };
-
-  it.each(['light', 'malformed'])('re-smokes an unchanged head with %s adopted depth for a full request', async (depth) => {
-    const f = makeFixture();
-    Object.assign(f.env, lightDepth);
-    advanceMain(f.originDir, dir => writeFile(dir, 'a.txt', 'a'));
-    await rebuild(f, async () => PASS);
-    const before = head(f);
-    if (depth === 'malformed') {
-      const state = readRebuildState(f.cloneDir, f.env);
-      state.adopted.smokeDepth = 'invalid';
-      writeRebuildState(f.cloneDir, state, f.env);
-    }
-    Object.assign(f.env, fullDepth);
-    const smoke = vi.fn(async () => PASS);
-    expect(await rebuild(f, smoke, { adoptOnly: true })).toMatchObject({ reason: 'needs-build', plan: { upToDate: true } });
-    expect(smoke).not.toHaveBeenCalled();
-    expect(readRebuildState(f.cloneDir, f.env).building ?? null).toBeNull();
-    const store = createJobStore(mktemp('we-rebuild-depth-jobs-'));
-    const job = await rebuildCloneAsJob({
-      root: f.cloneDir, env: f.env, store, codeSha: before,
-      adopt: () => rebuild(f, smoke, { adoptOnly: true }),
-      reattach: async () => ({ slept: false, actions: [] }), evict: () => ({ evicted: [] }),
-    });
-    expect(job.reason).toBe('rebuild-job-started');
-    expect(store.list().records).toHaveLength(1);
-    expect(smoke).not.toHaveBeenCalled();
-    await rebuild(f, smoke);
-    expect(smoke).toHaveBeenCalledTimes(1);
-    expect(smoke.mock.calls[0][0].changedFiles).toBeNull();
-    expect(head(f)).toBe(before);
-    expect(readRebuildState(f.cloneDir, f.env).adopted.smokeDepth).toBeUndefined();
-    expect((await rebuild(f, smoke)).reason).toBe('up-to-date');
-    expect(smoke).toHaveBeenCalledTimes(1);
-  });
-
-  it.each(['light', 'legacy'])('keeps the unchanged-head shortcut for sufficient %s depth', async (depth) => {
-    const f = makeFixture();
-    Object.assign(f.env, lightDepth);
-    advanceMain(f.originDir, dir => writeFile(dir, 'a.txt', 'a'));
-    await rebuild(f, async () => PASS);
-    if (depth === 'legacy') {
-      const state = readRebuildState(f.cloneDir, f.env);
-      delete state.adopted.smokeDepth;
-      writeRebuildState(f.cloneDir, state, f.env);
-      Object.assign(f.env, fullDepth);
-    }
-    const smoke = vi.fn(async () => PASS);
-    expect((await rebuild(f, smoke)).reason).toBe('up-to-date');
-    expect(smoke).not.toHaveBeenCalled();
-  });
-
-  it('records ready depth and re-smokes a light ready candidate for a full request', async () => {
-    const f = makeFixture();
-    Object.assign(f.env, lightDepth);
-    advanceMain(f.originDir, dir => writeFile(dir, 'a.txt', 'a'));
-    expect((await rebuild(f, async () => PASS, { readyOnly: true })).readyRecorded).toBe(true);
-    expect(JSON.parse(readFileSync(readyCandidatePath(f.cloneDir, f.env), 'utf8')).smokeDepth)
-      .toBe(smokeDepthTag(f.env));
-    Object.assign(f.env, fullDepth);
-    const smoke = vi.fn(async () => PASS);
-    expect((await rebuild(f, smoke)).adopted).toBe(true);
-    expect(smoke).toHaveBeenCalledTimes(1);
-    expect(smoke.mock.calls[0][0].changedFiles).toBeNull();
-  });
-
-  it.each(['light', 'legacy'])('%s adopted depth controls incremental code-check trust', async (depth) => {
-    const f = makeFixture();
-    Object.assign(f.env, depth === 'light' ? lightDepth : fullDepth);
-    advanceMain(f.originDir, dir => writeFile(dir, 'a.txt', 'a'));
-    await rebuild(f, async () => PASS);
-    const state = readRebuildState(f.cloneDir, f.env);
-    if (depth === 'light') expect(state.adopted.smokeDepth).toBe(smokeDepthTag(f.env));
-    else {
-      delete state.adopted.smokeDepth;
-      writeRebuildState(f.cloneDir, state, f.env);
-    }
-    Object.assign(f.env, fullDepth);
-    advanceMain(f.originDir, dir => writeFile(dir, 'b.txt', 'b'));
-    const smoke = vi.fn(async () => PASS);
-    await rebuild(f, smoke);
-    expect(smoke).toHaveBeenCalledTimes(1);
-    expect(smoke.mock.calls[0][0].changedFiles).toEqual(depth === 'light' ? null : ['b.txt']);
-  });
-
   it.each([false, true])('keeps healthy overlays when a cached fallback shares the broken harness (already running: %s)', async (alreadyRunning) => {
     const f = makeFixture();
     const base = head(f);
@@ -385,36 +295,12 @@ describe('durable smoke pass cache', () => {
     expect(proofs[0].key).toBe(identity(f, head(f)).key);
   });
 
-  it.each([
-    ['light', '0', '1', '3', '0'],
-    ['full', '3', '0', '0', '1'],
-  ])('a %s proof never satisfies a different caller depth when process.env matches the proof', async (_, passes, skip, callerPasses, callerSkip) => {
-    vi.stubEnv('WE_SMOKE_DISPATCH_PASSES', passes);
-    vi.stubEnv('WE_SMOKE_SKIP_RECONCILE_DRY_RUN', skip);
-    const f = makeFixture();
-    const target = advanceMain(f.originDir, (dir) => writeFile(dir, 'a.txt', 'a'));
-    gitOk(f.cloneDir, ['fetch', '-q', 'origin']);
-    const proof = identity(f, target);
-    writeRebuildState(f.cloneDir, { smokePassed: [{ tree: proof.tree, key: proof.key, passedAt: new Date().toISOString() }] }, f.env);
-    f.env.WE_SMOKE_DISPATCH_PASSES = callerPasses;
-    f.env.WE_SMOKE_SKIP_RECONCILE_DRY_RUN = callerSkip;
-    const requested = identity(f, target);
-    expect(requested.key).not.toBe(proof.key);
-    const smoke = vi.fn(async () => PASS);
-    await rebuild(f, smoke);
-    expect(smoke).toHaveBeenCalledTimes(1);
-    expect(smoke.mock.calls[0][0]).toMatchObject({ reuseCode: false, env: {
-      WE_SMOKE_DISPATCH_PASSES: callerPasses, WE_SMOKE_SKIP_RECONCILE_DRY_RUN: callerSkip,
-    } });
-    expect(readRebuildState(f.cloneDir, f.env).smokePassed[0].key).toBe(requested.key);
-  });
-
   it.each(['lockHash', 'nodeVersion', 'harnessHash', 'cloneKind'])('does not reuse a proof with a different %s', async (field) => {
     const f = makeFixture();
     const target = advanceMain(f.originDir, (dir) => writeFile(dir, 'a.txt', 'a'));
     gitOk(f.cloneDir, ['fetch', '-q', 'origin']);
     const tree = identity(f, target).tree;
-    const parts = { tree, cloneKind: 'clone', depth: smokeDepthTag(), lockHash: '', nodeVersion: process.version,
+    const parts = { tree, cloneKind: 'clone', lockHash: '', nodeVersion: process.version,
       harnessHash: createHash('sha256').update(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../daemon-live-smoke.mjs'))).digest('hex') };
     expect(smokePassKey(parts)).toBe(identity(f, target).key);
     writeRebuildState(f.cloneDir, { smokePassed: [{ tree, key: smokePassKey({ ...parts, [field]: 'different' }), passedAt: new Date().toISOString() }] }, f.env);
