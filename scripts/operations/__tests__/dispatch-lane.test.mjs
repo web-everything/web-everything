@@ -1,3 +1,5 @@
+import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
+const COMMAND_RULES_SUFFIX = `\n\n${NO_PROMPT_COMMAND_RULES}\n`;
 import { applyTestsFirstPolicy } from '../../lib/tests-first-policy.mjs';
 /**
  * @file dispatch-lane.test.mjs — the effect that STARTS rather than completes (#3037, under epic #3029).
@@ -1307,7 +1309,7 @@ describe('what the sink actually runs', () => {
     // real dispatch argv. Passing it bought nothing and encoded a false premise the rest of the file read as
     // fact; the handle now comes from the id the CLI prints (`parseBackgroundedId`).
     const argv = buildAgentArgv({ sessionId: 'sess-c3', payload });
-    expect(argv).toEqual(['--bg', '-n', 'conveyor-3037', '--settings', JSON.stringify({ env: { WE_CONVEYOR_WORKER: '1' } }), '--effort', 'high', '--model', 'sonnet', '# build #3037']);
+    expect(argv).toEqual(['--bg', '-n', 'conveyor-3037', '--settings', JSON.stringify({ env: { WE_CONVEYOR_WORKER: '1' } }), '--effort', 'high', '--model', 'sonnet', ('# build #3037' + COMMAND_RULES_SUFFIX)]);
     expect(argv).not.toContain('--session-id');
     expect(argv).not.toContain('sess-c3');
   });
@@ -1319,7 +1321,7 @@ describe('what the sink actually runs', () => {
       '--bg', '-n', 'conveyor-3037',
       '--settings', JSON.stringify({ env: { WE_CONVEYOR_WORKER: '1' } }),
       '--append-system-prompt-file', '/path/to/identity.md',
-      '--effort', 'high', '--model', 'sonnet', '# build #3037',
+      '--effort', 'high', '--model', 'sonnet', ('# build #3037' + COMMAND_RULES_SUFFIX),
     ]);
   });
 
@@ -1332,7 +1334,7 @@ describe('what the sink actually runs', () => {
       '--bg', '-n', 'conveyor-3037',
       '--settings', JSON.stringify({ env: { PATH: '/shim:/usr/bin', WE_CONVEYOR_WORKER: '1' } }),
       '--append-system-prompt-file', '/path/to/identity.md',
-      '--effort', 'high', '--model', 'sonnet', '# build #3037',
+      '--effort', 'high', '--model', 'sonnet', ('# build #3037' + COMMAND_RULES_SUFFIX),
     ]);
   });
 
@@ -1343,7 +1345,7 @@ describe('what the sink actually runs', () => {
     expect(argv).toEqual([
       '--bg', '-n', 'conveyor-3037',
       '--settings', JSON.stringify({ env: { PATH: '/shim:/usr/bin', WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' } }),
-      '--effort', 'high', '--model', 'sonnet', '# build #3037',
+      '--effort', 'high', '--model', 'sonnet', ('# build #3037' + COMMAND_RULES_SUFFIX),
     ]);
   });
 
@@ -1370,7 +1372,7 @@ describe('what the sink actually runs', () => {
   });
 
   it('xgqz204 — a resume stays a BARE `--bg --resume` (the resumed process already carries the marker)', () => {
-    expect(buildAgentArgv({ payload, resumeSessionId: 'abc' })).toEqual(['--bg', '--resume', 'abc', '# build #3037']);
+    expect(buildAgentArgv({ payload, resumeSessionId: 'abc' })).toEqual(['--bg', '--resume', 'abc', ('# build #3037' + COMMAND_RULES_SUFFIX)]);
   });
 
   it('#xu2krte — resumeSessionId emits a BARE `--bg --resume <id> <prompt>`, no -n/systemPromptFile/extraArgs', () => {
@@ -1381,7 +1383,7 @@ describe('what the sink actually runs', () => {
       sessionId: 'sess-unused', payload, resumeSessionId: 'cand-1111-2222-3333-444444444444',
       systemPromptFile: '/path/to/identity.md', extraArgs: ['--model', 'sonnet'],
     });
-    expect(argv).toEqual(['--bg', '--resume', 'cand-1111-2222-3333-444444444444', payload.prompt]);
+    expect(argv).toEqual(['--bg', '--resume', 'cand-1111-2222-3333-444444444444', (payload.prompt + COMMAND_RULES_SUFFIX)]);
   });
 
   it('#x8mpubm — settingsEnv is NEVER emitted on the resume branch either, same reasoning as extraArgs above', () => {
@@ -1389,7 +1391,7 @@ describe('what the sink actually runs', () => {
       sessionId: 'sess-unused', payload, resumeSessionId: 'cand-1111-2222-3333-444444444444',
       settingsEnv: { PATH: '/shim:/usr/bin' },
     });
-    expect(argv).toEqual(['--bg', '--resume', 'cand-1111-2222-3333-444444444444', payload.prompt]);
+    expect(argv).toEqual(['--bg', '--resume', 'cand-1111-2222-3333-444444444444', (payload.prompt + COMMAND_RULES_SUFFIX)]);
   });
 
   it('#x9fbg1x — worktreeSettings is NEVER emitted on the resume branch either — a still-running resumed '
@@ -1398,7 +1400,7 @@ describe('what the sink actually runs', () => {
       sessionId: 'sess-unused', payload, resumeSessionId: 'cand-1111-2222-3333-444444444444',
       worktreeSettings: { bgIsolation: 'none' },
     });
-    expect(argv).toEqual(['--bg', '--resume', 'cand-1111-2222-3333-444444444444', payload.prompt]);
+    expect(argv).toEqual(['--bg', '--resume', 'cand-1111-2222-3333-444444444444', (payload.prompt + COMMAND_RULES_SUFFIX)]);
   });
 
   it('#xu2krte — resumeSessionId still refuses an empty/dash-leading prompt, same as a fresh dispatch', () => {
@@ -1413,7 +1415,7 @@ describe('what the sink actually runs', () => {
 
   it('forwards the operator\'s extra flags ahead of the prompt', () => {
     const argv = buildAgentArgv({ sessionId: 'sess-c3', payload, extraArgs: ['--model', 'sonnet'] });
-    expect(argv[argv.length - 1]).toBe(payload.prompt);
+    expect(argv[argv.length - 1]).toBe((payload.prompt + COMMAND_RULES_SUFFIX));
     expect(argv.slice(-3, -1)).toEqual(['--model', 'sonnet']);
   });
 
@@ -3979,6 +3981,6 @@ describe('grouped dispatch payload and prepare brief', () => {
     expect(grouped.prompt).toContain('GROUPED PREPARE');
     expect(grouped.prompt).toContain('cards #3038, #3039 in addition to #3037');
     expect(grouped.prompt).toContain("'Not prepared'");
-    expect(shapeDispatchRead(raw, { num: '3037' }).prompt).toBe('Prepare 3037. ');
+    expect(shapeDispatchRead(raw, { num: '3037' }).prompt).toBe(('Prepare 3037. ' + COMMAND_RULES_SUFFIX));
   });
 });

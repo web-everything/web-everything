@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 /**
  * worker-result-probe.mjs — slice S0 of item 117 (worker JSON output contract).
  *
@@ -35,8 +36,8 @@ export const PROBE_SCHEMA = Object.freeze({
   properties: { outcome: { type: 'string', enum: ['done', 'blocked'] }, note: { type: 'string' } },
 });
 const SCHEMA_JSON = JSON.stringify(PROBE_SCHEMA);
-const PROMPT = 'Reply with outcome done and note hello. Use no tools.';
-const PROMPT2 = 'Now reply with outcome blocked and note again. Use no tools.';
+const PROMPT = renderNoPromptCommandRules('Reply with outcome done and note hello. Use no tools.');
+const PROMPT2 = renderNoPromptCommandRules('Now reply with outcome blocked and note again. Use no tools.');
 
 /** Pure: does a parsed value match the probe schema's shape? */
 export function matchesProbeShape(v) {

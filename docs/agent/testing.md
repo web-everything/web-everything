@@ -4411,3 +4411,15 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+## Claude launch brief command rules
+
+`scripts/lib/no-prompt-command-rules.mjs` owns the shared no-prompt command block and the
+launch-source registry. Append it with `renderNoPromptCommandRules` when authoring a Claude
+brief, including resume and review mandates. Validate task content before adding context or suffixes:
+`assertBriefTaskContent` refuses blank and rules-only inputs. Markdown briefs and import-free workflow harnesses
+carry generated literal copies; `scripts/__tests__/no-prompt-command-rules.test.mjs` pins them
+against the shared text. When the block changes, refresh those copies and the imperative ledger.
+The whole-tree audit scans `scripts/` and `skills-src/` for launch/prompt signatures and refuses
+unknown sources. Register each new source or document its specific non-launch/provider-only
+reason in `LAUNCH_BRIEF_EXCLUSIONS`; test fixtures and soak fault scenarios are excluded by directory.
+The audit checks instruction presence, not agent compliance with the instructions.

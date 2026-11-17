@@ -19,6 +19,7 @@ import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
 import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 
+import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
 import { DISPATCH_EFFECT } from '../dispatch-lane.mjs';
 import { briefPath, REPO_ROOT } from '../dispatch-lane-io.mjs';
 import { dispatchCiHeal, runReconcileCiHealDispatch, resetCiHealFlushDeadlineState, orderCiHealEntriesOldestFirst, readSessionLog, resolveStrongerCiHealRoute, routeAvailableCiHeal, dispatchTimeoutRetry, flushTimeoutFollowups, timeoutGithubEffects, readTimeoutHold, TIMEOUT_PENDING_MAX_AGE_MS } from '../ci-heal-pr-dispatch.mjs';
@@ -166,7 +167,7 @@ describe('dispatchCiHeal (#3852)', () => {
     expect(calls).toHaveLength(1);
     const slug = calls[0].sessionSlug;
     expect(calls[0].prompt).toBe(
-      `heal #2638 pr=743 ref=lane/2638-some-slug lane=9 slug=${slug} scope=we:scripts/a.mjs,we:scripts/b.mjs why=red-ci`,
+      `heal #2638 pr=743 ref=lane/2638-some-slug lane=9 slug=${slug} scope=we:scripts/a.mjs,we:scripts/b.mjs why=red-ci\n\n${NO_PROMPT_COMMAND_RULES}\n`,
     );
   });
 
@@ -203,7 +204,7 @@ describe('dispatchCiHeal (#3852)', () => {
     const { calls, sinks } = recordingSink();
     await dispatchCiHeal({ ...PLANNED, reason: 'behind' }, { readBrief: () => TEMPLATE, sinks });
     expect(calls[0].reason).toBe('behind');
-    expect(calls[0].prompt).toMatch(/why=behind$/);
+    expect(calls[0].prompt).toBe(`heal #2638 pr=743 ref=lane/2638-some-slug lane=9 slug=${calls[0].sessionSlug} scope=we:scripts/a.mjs,we:scripts/b.mjs why=behind\n\n${NO_PROMPT_COMMAND_RULES}\n`);
   });
 
   it('a second call for the same PR comes back held, and dispatches nothing new', async () => {
@@ -279,7 +280,7 @@ describe('dispatchCiHeal (#3852)', () => {
   it('#x0mn6x0 — an empty scope (no item, nothing derivable from the diff either) fills SCOPE blank instead of throwing', async () => {
     const { calls, sinks } = recordingSink();
     const out = await dispatchCiHeal({ ...PLANNED, scope: [] }, { readBrief: () => TEMPLATE, sinks });
-    expect(calls[0].prompt).toBe(`heal #2638 pr=743 ref=lane/2638-some-slug lane=9 slug=${calls[0].sessionSlug} scope= why=red-ci`);
+    expect(calls[0].prompt).toBe(`heal #2638 pr=743 ref=lane/2638-some-slug lane=9 slug=${calls[0].sessionSlug} scope= why=red-ci\n\n${NO_PROMPT_COMMAND_RULES}\n`);
     expect(calls[0].scope).toEqual([]);
     expect(out.agentId).toBe('agent-1');
   });

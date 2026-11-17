@@ -1,3 +1,4 @@
+import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 /**
  * @file scripts/operations/review-prep.mjs
  * @description THE `review-prep` DECLARATION — mechanizing the independent-review-of-preparation pattern
@@ -308,7 +309,7 @@ export function buildPrepMandate({ item, title = '', cardBody = '', scopeFiles =
     '`scripts/lib/build-queue.mjs`) — the same convention this card\'s own body already follows.',
   );
   parts.push(MUTATION_PROBE_RULE);
-  return parts.join(' ');
+  return renderNoPromptCommandRules(parts.join(' '));
 }
 
 /** Validate + normalize one juror-reported risk entry against the closed #3103 set. An unknown `risk` name is
