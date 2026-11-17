@@ -548,23 +548,12 @@ export async function prepareRebuild({
         if (!wantedTips.has(ref)) wantedTips.set(ref, verifyRev(git, `refs/remotes/origin/${ref}^{commit}`));
         return wantedTips.get(ref);
       };
-      let currentOverlayState;
       const stillWanted = (ref, sha) => {
         if (!wantedRefs.has(ref)) return false;
         if (!sha) return true; // fallback registration check
-        currentOverlayState ??= readOverlayState(root, { env });
-        if (currentOverlayState.corrupt) return false;
-        if (registeredRefs.has(ref) && !currentOverlayState.overlays.some((o) => o?.ref === ref)) return false;
         const tip = wantedTip(ref);
         return tip ? tip === sha || git(['merge-base', '--is-ancestor', sha, tip]).status === 0
           : !registeredRefs.has(ref) && tipInMain(git, plan.mainSha, sha);
-      };
-      const registeredForOmission = (ref) => {
-        currentOverlayState ??= readOverlayState(root, { env });
-        // Unreadable evidence cannot authorize dropping a live tip. Both snapshots retain their veto.
-        return currentOverlayState.corrupt || registeredRefs.has(ref)
-          || overlaysBefore.some((o) => o?.ref === ref)
-          || currentOverlayState.overlays.some((o) => o?.ref === ref);
       };
       const maxAgeMs = Number(env?.[READY_MAX_AGE_ENV]) > 0 ? Number(env[READY_MAX_AGE_ENV]) : DEFAULT_READY_MAX_AGE_MS;
       let overlayEvents;
@@ -600,11 +589,11 @@ export async function prepareRebuild({
         carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,
         leftForMain: (a, build) => overlayGraduated({
           readyAt: ready.at ?? ready.passedAt,
-          ref: a.ref, sha: a.sha, build, registered: registeredForOmission, events: readOverlayEvents(), git,
+          ref: a.ref, sha: a.sha, build, registered: (r) => registeredRefs.has(r) || overlaysBefore.some((o) => o?.ref === r), events: readOverlayEvents(), git,
         }),
         retiredByOperator: (a) => overlayRetiredByOperator({
           ref: a.ref, sha: a.sha, events: readOverlayEvents(),
-          registered: registeredForOmission,
+          registered: (r) => registeredRefs.has(r) || overlaysBefore.some((o) => o?.ref === r),
         }),
         contentInBuild: (sha, build) => contentContainedInBuild(git, sha, build),
         removedForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),

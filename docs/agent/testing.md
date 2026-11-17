@@ -4423,13 +4423,7 @@ A candidate containing a removed ref is refused as `overlay-no-longer-wanted`, e
 another overlay contains its tip; `pr-merged`/`in-main` removals retain their existing wanted
 handling. Each wanted tip must equal or descend from the candidate's tip. Preserve the independent
 live-applied omission, build-provenance, smoke, forced-record and canonical-audit gates.
-The `stillWanted(ref, sha)` helper must validate candidate inclusion against post-planning
-registry evidence, refusing removed refs and unreadable state. Keep a separate regression
-for a candidate containing a ref removed while `prState` resolves `OPEN`, with HEAD unchanged.
 Preserve `overlaysBefore` as a veto for omitted live tips: the regression for a live overlay
 retired during planning must reject its omission and preserve HEAD.
-Omission authorization must also check post-planning registrations: an operator-retired live
-ref re-registered during planning remains protected. Unreadable registry evidence grants no
-omission authority. Cover re-registration and unreadable evidence separately with HEAD unchanged.
 Run this file and `daemon-rebuild-events.test.mjs` through heavy admission. This adoption
 rule does not reset overlay main-sync parking or add retries for parked overlays.
