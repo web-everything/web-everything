@@ -21,8 +21,8 @@ const claimed = (over = {}) => ({
   scaffoldedBy: null, dateStarted: '2026-09-10', dateScaffolded: null, dateOpened: '2026-09-01', ...over,
 });
 
-/** All four sources available and empty — nobody is on anything. */
-const quiet = (over = {}) => ({ nowMs: NOW, leases: [], openPrs: [], mergedPrs: [], sessions: [], ...over });
+/** Positive session evidence, with nobody on this card. */
+const quiet = (over = {}) => ({ nowMs: NOW, leases: [], openPrs: [], mergedPrs: [], sessions: [{ name: 'unrelated', state: 'working' }], ...over });
 
 describe('classifyOrphan — Done-when 1', () => {
   it('releases an active card with no lease, no open PR, no live session, older than 48 h', () => {
@@ -96,6 +96,15 @@ describe('classifyOrphan — Done-when 1', () => {
 });
 
 describe('classifyOrphan — guards', () => {
+  it.each(['empty', 'unknown', 'ok'])('requires a nonempty, ok aggregate before releasing: %s', kind => {
+    const rows = kind === 'empty' ? [] : [{ name: 'unrelated', state: 'working', storeKey: '/profile/a' }];
+    const aggregate = { status: kind === 'unknown' ? 'unknown' : 'ok', rows, problems: [] };
+    const sessions = Object.defineProperty(rows, 'aggregate', { value: aggregate });
+    const result = planOrphanRelease([claimed()], quiet({ sessions }));
+    expect(result.release).toHaveLength(kind === 'ok' ? 1 : 0);
+    if (kind !== 'ok') expect(result.skip).toHaveLength(1);
+  });
+
   it('fails closed when ANY signal source is unavailable', () => {
     for (const k of ['leases', 'openPrs', 'mergedPrs', 'sessions']) {
       const v = classifyOrphan(claimed(), quiet({ [k]: null }));

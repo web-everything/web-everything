@@ -194,6 +194,7 @@ export function classifyOrphan(card, sig = {}) {
   for (const [name, v] of [['leases', leases], ['open-prs', openPrs], ['merged-prs', mergedPrs], ['sessions', sessions]]) {
     if (!Array.isArray(v)) return { act: false, reason: `signal-unavailable:${name}` };
   }
+  if (!sessions.length) return { act: false, reason: 'signal-unavailable:sessions' };
   if ((sig.storeSnapshot ?? sessions.aggregate) && !sessionStoreEvidenceOk({ storeKey: card.storeKey, sessionId: card.sessionId, session: card.scaffoldedBy }, sig.storeSnapshot ?? sessions.aggregate)) {
     return { act: false, reason: 'session-store-unknown' };
   }
@@ -305,6 +306,10 @@ function ghPrs(state, limit, fields) {
 function listSessions() {
   try {
     const snapshot = readSessionStores({ all: true, fresh: true });
+    if (snapshot.status !== 'ok' || !snapshot.rows.length) {
+      log('  ⚠ session listing unknown or empty — inspect/repair stores and retry; every card skipped');
+      return null;
+    }
     const reads = new Map();
     Object.defineProperty(snapshot.rows, 'storeSnapshotFor', { value: key => {
       if (!reads.has(key)) {

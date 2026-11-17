@@ -116,6 +116,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readField } from '../backlog/frontmatter.mjs';
 import { stopSession } from '../operations/dispatch-abort.mjs';
 import { defaultListAgents, normalizeHandle, prListTimeoutMs, dispatchScratchRoot, revokeDispatchTrust } from '../operations/dispatch-lane-io.mjs';
+import { CREDENTIAL_ENV_VARS } from '../lib/claude-account.mjs';
 // #ghost-sessions-inflate-cap — the SAME shared two-signal pid-liveness probe `lease-reaper.mjs`/`tick-core.mjs`
 // already trust; see `makePidDeadResolver`'s own docblock for why this reaper cites it rather than re-deriving
 // a fourth copy of `process.kill(pid, 0)`.
@@ -1629,14 +1630,14 @@ export function makeCostRolledUpResolver() {
  * distinction, mirrored here rather than re-imported since this file's scope for `#4089` does not touch
  * `dispatch-abort.mjs`). An already-gone handle is benign (`claude rm` reports the same "No job matching" shape
  * `claude stop` does), matching every other best-effort stop/rm call in this file.
- * @param {{handle:string, exec?:Function}} o
+ * @param {{handle:string, exec?:Function, env?:object}} o
  * @returns {{removed:true, alreadyGone:boolean, output:string}}
  */
-export function rmSessionRecord({ handle, exec = execFileSync } = {}) {
+export function rmSessionRecord({ handle, exec = execFileSync, env } = {}) {
   const id = normalizeHandle(handle);
   if (!id) throw new Error('session-reaper: rmSessionRecord needs a handle');
   try {
-    const output = String(exec('claude', ['rm', id], { encoding: 'utf8', timeout: 30_000 }));
+    const output = String(exec('claude', ['rm', id], { encoding: 'utf8', timeout: 30_000, ...(env ? { env } : {}) }));
     return { removed: true, alreadyGone: false, output };
   } catch (e) {
     const full = String(e?.stderr ?? e?.message ?? e);
@@ -1696,14 +1697,17 @@ export function runRetentionSweepPass({
   const slugs = new Set([...listCompletionSessions(completionDir), ...listDeliveryReportSessions(deliveryDir)]);
 
   let sessionsByName = null;
-  const findSession = (name) => {
+  const findSessions = (name) => {
     if (sessionsByName === null) {
       sessionsByName = new Map();
       try {
-        for (const s of listAgents() ?? []) if (s && s.name) sessionsByName.set(s.name, s);
+        for (const s of listAgents() ?? []) if (s && s.name) {
+          if (!sessionsByName.has(s.name)) sessionsByName.set(s.name, new Map());
+          sessionsByName.get(s.name).set(JSON.stringify([s.storeKey, s.sessionId ?? s.id, s.id]), s);
+        }
       } catch { /* best-effort — a stale/unreadable listing just means no `claude rm` this pass */ }
     }
-    return sessionsByName.get(name) ?? null;
+    return sessionsByName.get(name)?.values() ?? [];
   };
 
   let deleted = 0;
@@ -1742,9 +1746,11 @@ export function runRetentionSweepPass({
 
     try { deleteCompletionFn(slug, completionDir); } catch { /* best-effort, mirrors the rest of this file */ }
     try { deleteDeliveryReportFn(slug, deliveryDir); } catch { /* best-effort */ }
-    const stillListed = findSession(slug);
-    if (stillListed?.id) {
-      try { rm({ handle: stillListed.id, exec: execFileSync }); } catch (e) {
+    for (const stillListed of findSessions(slug)) {
+      if (!stillListed.id) continue;
+      const env = { ...process.env, ...(stillListed.storeKey ? { CLAUDE_CONFIG_DIR: stillListed.storeKey } : {}) };
+      if (stillListed.storeKey) for (const name of CREDENTIAL_ENV_VARS) delete env[name];
+      try { rm({ handle: stillListed.id, exec: execFileSync, env }); } catch (e) {
         logFn(`  ⚠ ${slug}: \`claude rm\` failed: ${String(e?.message || e).split('\n')[0]}`);
       }
     }
@@ -1899,7 +1905,13 @@ export function runDispatchScratchSweepPass({
   }
 
   let sessions;
-  try { sessions = listAgents() ?? []; } catch { sessions = []; } // an unreadable listing degrades to "no match for anyone" — Path A never fires, only Path B (ceiling) can act, and only once confirmed no live row claims the folder
+  try {
+    sessions = listAgents();
+    if (!Array.isArray(sessions)) throw new Error('invalid session listing');
+  } catch {
+    logFn('  ⚠ dispatch-scratch sweep skipped: session listing unknown — repair stores and retry');
+    return { scanned: names.length, deleted: 0, kept: names.length, trustRevoked: 0, wouldDelete: dryRun ? [] : undefined };
+  }
   const byId = new Map();
   const liveCwds = new Set();
   for (const s of sessions) {

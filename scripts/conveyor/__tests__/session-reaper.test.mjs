@@ -55,6 +55,7 @@ import {
   resolveRetentionGraceMs,
   resolveRetentionCeilingMs,
   runRetentionSweepPass,
+  rmSessionRecord,
   RETENTION_GRACE_MS_DEFAULT,
   RETENTION_CEILING_MS_DEFAULT,
   writeChatSpawnLink,
@@ -75,6 +76,7 @@ import {
   DISPATCH_SCRATCH_CEILING_MS_DEFAULT,
 } from '../session-reaper.mjs';
 import { OUTCOME_UNREADABLE } from '../hung-session.mjs';
+import { SessionsUnknown } from '../../lib/claude-sessions.mjs';
 import { newCompletionRecord, applyCompletionUpdate, writeCompletion } from '../../operations/completion-store.mjs';
 import { newDeliveryReport, writeDeliveryReport } from '../../operations/delivery-report-store.mjs';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
@@ -2056,6 +2058,23 @@ describe('runRetentionSweepPass — the IO shell', () => {
     expect(result.kept).toBe(1);
   });
 
+  it('removes same-name retention rows in each owning store, preserving profile tags and colliding handles', () => {
+    writeCompletion(newCompletionRecord({ session: 'review-100', kind: 'review', pr: '100' }), completionsDir);
+    const exec = vi.fn(() => 'removed');
+    const rows = [
+      bg({ name: 'review-100', id: 'same-id', storeKey: '/profile/a' }),
+      bg({ name: 'review-100', id: 'same-id', storeKey: '/profile/b' }),
+      bg({ name: 'review-101', id: 'same-id', storeKey: '/profile/inherited' }),
+    ];
+    const result = runRetentionSweepPass(baseOpts({
+      listAgents: () => rows,
+      rm: options => rmSessionRecord({ ...options, exec }),
+    }));
+    expect(result.deleted).toBe(1);
+    expect(exec.mock.calls.map(([, argv, options]) => [argv, options.env.CLAUDE_CONFIG_DIR]))
+      .toEqual([[['rm', 'same-id'], '/profile/a'], [['rm', 'same-id'], '/profile/b']]);
+  });
+
   it('dry-run reports what would be deleted without touching disk', () => {
     writeCompletion(newCompletionRecord({ session: 'conveyor-4091', kind: 'review', pr: '1' }), completionsDir);
     const result = runRetentionSweepPass(baseOpts({ dryRun: true }));
@@ -2342,8 +2361,8 @@ describe('runDispatchScratchSweepPass — the IO shell', () => {
     expect(result).toMatchObject({ scanned: 0, deleted: 0, kept: 0 });
   });
 
-  it('an unreadable `listAgents` degrades to no matches, never throws — path A cannot fire without a listing', () => {
-    const dir = makeOldFolder('sess-unreadable-1', 60_000); // young — grace alone would keep it anyway
+  it('an unreadable listing skips scratch cleanup even beyond the ceiling', () => {
+    const dir = makeOldFolder('sess-unreadable-1', 8 * DAY);
     const result = runDispatchScratchSweepPass({
       dispatchRoot,
       listAgents: () => { throw new Error('claude agents boom'); },
@@ -2353,6 +2372,25 @@ describe('runDispatchScratchSweepPass — the IO shell', () => {
     });
     expect(result.deleted).toBe(0);
     expect(existsSync(dir)).toBe(true);
+  });
+
+  it.each([true, false])('unknown stores with healthy working rows skip all scratch cleanup (dryRun=%s)', dryRun => {
+    const dir = makeOldFolder('sess-working-1', 8 * DAY);
+    const orphanDir = makeOldFolder('sess-unregistered-1', 8 * DAY);
+    const rows = [bg({ sessionId: 'sess-working-1', state: 'working', cwd: dir, storeKey: '/profile/a' })];
+    const rmDirFn = vi.fn(), revokeTrust = vi.fn(), log = vi.fn();
+    const result = runDispatchScratchSweepPass({
+      dispatchRoot, dryRun, graceMs: DAY, ceilingMs: 7 * DAY,
+      listAgents: () => { throw new SessionsUnknown({ status: 'unknown', rows, problems: ['/profile/b: unreadable'] }); },
+      rmDirFn, revokeTrust, log,
+    });
+    expect(result).toMatchObject({ scanned: 2, kept: 2, deleted: 0, trustRevoked: 0 });
+    expect(result.wouldDelete).toEqual(dryRun ? [] : undefined);
+    expect(rmDirFn).not.toHaveBeenCalled();
+    expect(revokeTrust).not.toHaveBeenCalled();
+    expect(existsSync(dir)).toBe(true);
+    expect(existsSync(orphanDir)).toBe(true);
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/skipped.*repair stores and retry/));
   });
 });
 

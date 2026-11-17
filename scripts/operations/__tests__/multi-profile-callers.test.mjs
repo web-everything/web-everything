@@ -76,7 +76,7 @@ describe.each(Object.entries(snapshots))('S2b %s evidence', (kind, snapshot) => 
     }).reap).toBe(kind === 'ok');
   });
   it('orphan release refuses incomplete or ambiguous ownership even with no live row', () => {
-    const sessions = Object.defineProperty([], 'aggregate', { value: snapshot });
+    const sessions = Object.defineProperty([...snapshot.rows], 'aggregate', { value: snapshot });
     const decision = classifyOrphan({ id: '999', status: 'active', kind: 'story', sessionId: UUID, dateStarted: '2020-01-01' }, {
       nowMs: Date.now(), leases: [], openPrs: [], mergedPrs: [], sessions,
     });
@@ -130,7 +130,7 @@ it('a launch credential refusal is notApplied before any process can start', () 
 
 it('OFF single-store stop matches the recorded main trace exactly, without listing', () => {
   const exec = vi.fn(() => 'stopped'), list = vi.fn();
-  stopSession({ handle: 'job-a', exec, list, env: { HOME: '/home/test' }, map, ...fsPorts });
+  stopSession({ handle: 'job-a', exec, list, env: process.env, map, ...fsPorts });
   expect(exec.mock.calls).toEqual([['claude', ['stop', 'job-a'], STOP_EXEC_OPTS]]);
   expect(list).not.toHaveBeenCalled();
 });
@@ -158,6 +158,30 @@ it('an enabled routing map uses owner resolution even when its store aliases the
     map: { accounts: { b: { configDir: key } }, daemons: { 'com.we.build': 'b' }, routing: { accountB: true } } });
   expect(list).toHaveBeenCalledOnce();
   expect(exec.mock.calls[0][1]).toEqual(['stop', row.id]);
+});
+
+it.each(['stopped', 'absent', 'present', 'unknown'])('a supplied sole-store env resolves ownership and confirms a stop miss: %s', state => {
+  const key = '/profile/selected';
+  const selectedRow = { ...row, storeKey: key };
+  const env = { HOME: '/home/test', CLAUDE_CONFIG_DIR: key, ANTHROPIC_API_KEY: 'inherited-secret' };
+  const list = vi.fn(() => ({ status: 'ok', rows: [selectedRow], problems: [] }));
+  const exec = vi.fn((_cmd, argv) => {
+    if (argv[0] === 'stop') {
+      if (state === 'stopped') return 'stopped';
+      throw Object.assign(new Error('No job matching'), { stderr: 'No job matching' });
+    }
+    return state === 'unknown' ? '{}' : JSON.stringify(state === 'absent' ? [] : [selectedRow]);
+  });
+  const stop = () => stopSession({ handle: UUID, env, map, ...fsPorts, exec, list });
+  if (state === 'present' || state === 'unknown') expect(stop).toThrow(/did not confirm absence/);
+  else expect(stop().alreadyGone).toBe(state === 'absent');
+  expect(list).toHaveBeenCalledWith(expect.objectContaining({ env }));
+  expect(exec.mock.calls[0][1]).toEqual(['stop', row.id]);
+  for (const call of exec.mock.calls) {
+    expect(call[2].env.CLAUDE_CONFIG_DIR).toBe(key);
+    expect(call[2].env.ANTHROPIC_API_KEY).toBeUndefined();
+  }
+  if (state !== 'stopped') expect(exec.mock.calls[1][1]).toEqual(['agents', '--json', '--all']);
 });
 
 it.each(['absent', 'present', 'unknown'])('stop miss freshly re-lists only its owning store: %s', state => {

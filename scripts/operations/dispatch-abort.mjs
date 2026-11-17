@@ -79,11 +79,11 @@ export function stopSession({ handle, exec = execFileSync, env = process.env, st
   list = listSessions } = {}) {
   const id = normalizeHandle(handle);
   if (!id) throw new Error('dispatch-abort: stopSession needs a handle to stop');
-  // OFF + sole inherited store preserves the historical direct-stop trace. A rollback store on disk or
+  // OFF + sole store + the actual inherited env preserves the historical direct-stop trace. A rollback store on disk or
   // an invalid map leaves this path; neither can silently masquerade as single-profile discovery.
   const discovery = planStores({ env, map, home, exists, realpath });
   if (discovery.problems.length) throw new Error('dispatch-abort: session ownership unknown; repair account map and retry (claim retained)');
-  const single = map.routing?.accountB !== true && (!storeKey || discovery.stores[0]?.key === storeKey) && discovery.stores.length === 1
+  const single = env === process.env && map.routing?.accountB !== true && (!storeKey || discovery.stores[0]?.key === storeKey) && discovery.stores.length === 1
     && discovery.stores[0].inherited && discovery.stores[0].status === 'ok';
   let plan;
   let childEnv = env;
