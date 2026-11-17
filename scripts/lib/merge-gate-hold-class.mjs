@@ -51,43 +51,50 @@ export function deferCandidacyHoldsOnPrEvent(prResult, { mergeEvent, setting } =
   return { ...prResult, ok: remaining.length === 0, results, blocking: remaining };
 }
 
-/** Read the LAST table for this PR; malformed newer evidence never falls back to an older table. */
+/** Read every table for this PR; any malformed table invalidates the evidence. */
 export function parsePrResultTable(log, prNumber) {
   const lines = String(log ?? '').split(/\r?\n/).map(l => l.replace(/^\d{4}-\d\d-\d\dT\S+\s/, ''));
   let start = -1, header;
+  const results = [];
+  let ok = true;
   for (let i = 0; i < lines.length; i++) {
-    const m = /^#(\d+): (\S+)\s*$/.exec(lines[i]);
-    if (m && (prNumber === undefined || Number(m[1]) === Number(prNumber))) { start = i; header = m; }
+    const m = /^#(\d+):/.exec(lines[i]);
+    if (!m || (prNumber !== undefined && Number(m[1]) !== Number(prNumber))) continue;
+    const tableHeader = /^#(\d+): (PASS|HOLD)\s*$/.exec(lines[i]);
+    if (!tableHeader) return { error: 'unknown verdict or malformed PR verdict header' };
+    if (start < 0) { start = i; header = tableHeader; }
+    const tableResults = [], seen = new Set();
+    for (let j = i + 1; j < lines.length; j++) {
+      const line = lines[j];
+      if (/^#\d+:|^merge-gate:/.test(line)) break;
+      if (!line.trim()) continue;
+      const row = /^  (\S+)\s+(\S+)\s+(.+)$/.exec(line);
+      if (!row || !statuses.has(row[1]) || !gates.has(row[2]) || seen.has(row[2])) return { error: 'invalid status, gate, duplicate or malformed verdict row' };
+      seen.add(row[2]);
+      tableResults.push({ status: row[1], id: row[2], reason: row[3] });
+    }
+    if (!tableResults.length || (tableHeader[2] === 'HOLD') !== tableResults.some(blocking)) return { error: 'verdict header disagrees with rows' };
+    results.push(...tableResults);
+    if (tableHeader[2] === 'HOLD') ok = false;
   }
   if (start < 0) return { error: 'missing PR verdict header' };
-  if (!['PASS', 'HOLD'].includes(header[2])) return { error: 'unknown verdict' };
-  const results = [], seen = new Set();
-  for (const line of lines.slice(start + 1)) {
-    if (/^#\d+:|^merge-gate:/.test(line)) break;
-    if (!line.trim()) continue;
-    const m = /^  (\S+)\s+(\S+)\s+(.+)$/.exec(line);
-    if (!m || !statuses.has(m[1]) || !gates.has(m[2]) || seen.has(m[2])) return { error: 'invalid status, gate, duplicate or malformed verdict row' };
-    seen.add(m[2]);
-    results.push({ status: m[1], id: m[2], reason: m[3] });
-  }
   // A PR table does not include workflow self-check or other job-level failures.
   // Inspect the entire remaining log (including other PR tables), and authorize
   // excusal only with the known table-only HOLD footer. Missing, duplicate and
   // unknown summaries are insufficient evidence, including truncated logs.
-  if (header[2] === 'HOLD') {
+  if (!ok) {
     const summaries = lines.slice(start + 1).filter(line => /^merge-gate:/.test(line));
     if (summaries.length !== 1 || summaries[0] !== 'merge-gate: HOLD — held') {
       return { error: 'missing, ambiguous or job-level merge-gate failure' };
     }
   }
-  if (!results.length || (header[2] === 'HOLD') !== results.some(blocking)) return { error: 'verdict header disagrees with rows' };
   // A manual freeze takes precedence over main-CI red in combineRedMain. Its
   // table row alone therefore cannot prove main CI passed. Bind the diagnostic
   // to this invocation, never an older table's completed verdict.
   const priorSummary = lines.slice(0, start).findLastIndex(line => /^merge-gate: (?:PASS|HOLD)\b/.test(line));
   const mainCi = lines.slice(priorSummary + 1, start).filter(line => /^main CI\b/.test(line));
   const mainCiGreen = mainCi.length === 1 && /^main CI \(.+\): green$/.test(mainCi[0]);
-  return { num: Number(header[1]), ok: header[2] === 'PASS', results, mainCiGreen };
+  return { num: Number(header[1]), ok, results, mainCiGreen };
 }
 
 /** Pure classification; a candidate must have an actually passing merge-gate. */

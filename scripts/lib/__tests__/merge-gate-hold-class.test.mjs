@@ -36,14 +36,61 @@ const opts = (extra = {}) => ({ prNumber: 4965, headSha: sha, labels: ['review:p
 describe('strict job table parser', () => {
   it('parses the real #4965 excerpt', () => expect(parsePrResultTable(log4965, 4965)).toMatchObject({ num: 4965, ok: false, results: expect.arrayContaining([{ status: 'hold', id: 'ledger', reason: 'labels: labels hold' }]) }));
   it.each([log4965.replace('candidate-label', 'unknown-gate'), log4965.replace('hold              candidate', 'mystery           candidate'), log4965.replace('producer-certified', 'candidate-label'), log4965.replace('#4965: HOLD', '#4965: PASS')])('rejects malformed or contradictory evidence', log => expect(parsePrResultTable(log, 4965).error).toBeTruthy());
-  it('last matching header wins, even if malformed', () => {
-    expect(parsePrResultTable(`${log4965}\n#4965: PASS\n  pass ledger clear`, 4965)).toMatchObject({ ok: true, results: [{ status: 'pass', id: 'ledger', reason: 'clear' }] });
+  it('retains earlier holds and rejects incomplete later tables', () => {
+    expect(parsePrResultTable(`${log4965}\n#4965: PASS\n  pass ledger clear`, 4965)).toMatchObject({ ok: false, results: [...verdict(log4965).results, { status: 'pass', id: 'ledger', reason: 'clear' }] });
     expect(parsePrResultTable(`${candidacy}\n#4965: HOLD`, 4965).error).toBeTruthy();
+  });
+});
+describe('all matching PR tables fail closed', () => {
+  const security = '#7: HOLD\n  hold codeql CodeQL failed';
+  const review = '#7: HOLD\n  hold review-acceptance human-only: x';
+  const footer = '\nmerge-gate: HOLD — held';
+  const read = log => ({ ...parsePrResultTable(log, 7), head_sha: sha });
+  const excuse = log => excuseMergeGateRows([row], opts({ prNumber: 7, readVerdict: () => read(log) }));
+  it.each([[security, review], [review, security]])('keeps CodeQL visible and red with tables %j then %j', (first, second) => {
+    const log = `${first}\n${second}${footer}`;
+    const parsed = read(log);
+    expect(parsed).toMatchObject({ ok: false, results: expect.arrayContaining([{ status: 'hold', id: 'codeql', reason: 'CodeQL failed' }]) });
+    expect(parsed.results).toHaveLength(2);
+    expect(classify(parsed.results).excused).toBe(false);
+    expect(excuse(log)).toEqual({ rows: [row], excused: false });
+  });
+  it.each(['#7: HOLD\n  bad row', '#7: MAYBE\n  hold review-acceptance x', '#7: HOLD extra\n  hold review-acceptance x', '#7: HOLD', '#7: PASS\n  hold review-acceptance x', `${review}\n  hold review-acceptance duplicate`])('rejects a malformed second table: %s', second => {
+    const log = `${review}\n${second}${footer}`;
+    expect(read(log).error).toBeTruthy();
+    expect(excuse(log)).toEqual({ rows: [row], excused: false });
+  });
+  it('ignores other PR rows while retaining all matching rows without deduplication', () => {
+    const log = `${review}\n#8: HOLD\n  malformed other PR row\n${review}${footer}`;
+    expect(read(log)).toMatchObject({ ok: false, results: [
+      { status: 'hold', id: 'review-acceptance', reason: 'human-only: x' },
+      { status: 'hold', id: 'review-acceptance', reason: 'human-only: x' },
+    ] });
+    expect(excuse(log).excused).toBe(true);
+    expect(read(`${log}\n#8: HOLD\n  hold codeql failed${footer}`).error).toBeTruthy();
+  });
+  it('still excuses a single review-only table', () => {
+    expect(excuse(`${review}${footer}`)).toMatchObject({ excused: true, rows: [{ conclusion: 'SUCCESS' }] });
+  });
+  it('accepts only all-PASS tables as ok and binds main CI to the first matching header', () => {
+    const pass = '#7: PASS\n  pass codeql clear';
+    expect(read(`main CI (ci.yml@main): green\n${pass}\nmain CI (ci.yml@main): red\n${pass}`)).toHaveProperty('error');
+    expect(read(`main CI (ci.yml@main): green\n${pass}\n${pass}`)).toMatchObject({ ok: true, mainCiGreen: true, results: [
+      { status: 'pass', id: 'codeql', reason: 'clear' }, { status: 'pass', id: 'codeql', reason: 'clear' },
+    ] });
+    expect(read(`${review}${footer}\nmain CI (ci.yml@main): green\n${review}`)).toMatchObject({ ok: false, mainCiGreen: false });
   });
 });
 describe('hold classification', () => {
   it('excuses candidacy only', () => expect(classify(verdict().results)).toMatchObject({ excused: true, kind: 'candidacy' }));
   it('keeps test-gaming real', () => expect(classify(verdict(log4965).results)).toMatchObject({ excused: false, kind: 'real' }));
+  it.each(['codeql', 'test-gaming'])('never excuses a failing %s alongside review holds and a passing duplicate', id => {
+    expect(classify([
+      { id, status: 'hold', reason: 'security failed' },
+      { id: 'review-acceptance', status: 'hold', reason: 'human-only: x' },
+      { id, status: 'pass', reason: 'clear' },
+    ])).toMatchObject({ excused: false, kind: 'real', others: [{ id, status: 'hold', reason: 'security failed' }] });
+  });
   it.each(['codeql', 'default-base', 'manifest-baseline', 'non-empty-body', 'duplicate-id-on-main', 'couple-whole', 'blocked-by'])('keeps %s real', id => expect(classify([{ id, status: 'hold', reason: 'blocked' }]).excused).toBe(false));
   it('never excuses fail-closed or a current candidate', () => {
     expect(classify([{ id: 'candidate-label', status: 'fail-closed' }]).excused).toBe(false);
