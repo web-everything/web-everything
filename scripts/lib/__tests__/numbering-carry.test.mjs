@@ -138,6 +138,12 @@ describe('checkNumberingCommit', () => {
         refused(checkNumberingCommit(withCode(`${character}xf74q20\n`, `${character}6053\n`)), /id rewrite/);
         refused(checkNumberingCommit(withCode(`xf74q20${character}\n`, `6053${character}\n`)), /id rewrite/);
       });
+    it.each(['é', '中', '𐐀', '١', '𝟙'])('refuses a subject-proven swap touching a Unicode letter or number on the left: %s', (character) => {
+      refused(checkNumberingCommit(withCode(`${character}xf74q20\n`, `${character}6053\n`)), /id rewrite/);
+    });
+    it.each(['é', '中', '𐐀', '١', '𝟙'])('refuses a subject-proven swap touching a Unicode letter or number on the right: %s', (character) => {
+      refused(checkNumberingCommit(withCode(`xf74q20${character}\n`, `6053${character}\n`)), /id rewrite/);
+    });
     it.each(['scripts/guard.mjs', '.github/workflows/run.yml', 'scripts/lib/numbering-carry.mjs', 'CODEOWNERS'])(
       'knowingly carries the behaviour-changing typeof counterexample under R953: %s', (path) => {
         const o = withCode('if (typeof xf74q20 === "undefined") throw Error("blocked");\n',
@@ -360,6 +366,26 @@ describe('proveNumberingOnlyMove read-only regressions', () => {
     refused(result, /id rewrite/);
     expect(result.retryable).toBe(grepStatus === 128 ? true : undefined);
     expect(r.calls.some((a) => a[0] === 'grep')).toBe(true);
+  });
+  it('fails closed with retryable true for a subject-proven code swap after git grep status 128', () => {
+    const changes = codeChanges('xf74q20', '6053');
+    expect(proofReader({ changes, grepStatus: 1 }).prove().ok).toBe(true);
+    const r = proofReader({ changes, grepStatus: 128 });
+    const result = r.prove();
+    refused(result, /id rewrite/);
+    expect(result.retryable).toBe(true);
+    expect(r.calls.some((a) => a[0] === 'grep')).toBe(true);
+  });
+  it.each([
+    ['éxf74q20', 'é6053'],
+    ['xf74q20é', '6053é'],
+  ])('refuses a subject-proven swap embedded in Unicode through the IO shell: %s', (before, after) => {
+    const changes = codeChanges('xf74q20', '6053');
+    Object.assign(changes.at(-1), { before: `card: '${before}';\n`, after: `card: '${after}';\n` });
+    refused(proofReader({ changes }).prove(), /id rewrite/);
+  });
+  it('carries an ASCII-clean subject-proven swap through the IO shell', () => {
+    expect(proofReader({ changes: codeChanges('xf74q20', '6053') }).prove().ok).toBe(true);
   });
   it('subject pairs win over conflicting main aliases in the code path', () => {
     const mainAliases = 'origin/main:backlog/9999-alias.md:bornAs: xf74q20\n';

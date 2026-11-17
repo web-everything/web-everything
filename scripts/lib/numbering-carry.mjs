@@ -99,9 +99,9 @@ export function isLedgerRewrite(before, after, map) {
 
 const refuse = (reason) => ({ ok: false, reason });
 
-// A provisional id is a whole token only when no identifier character touches either side (so `fooxf74q20`,
+// A provisional id is a whole token only when no identifier character, Unicode included, touches either side (so `fooxf74q20`,
 // `my_x1b8hlo` and `x1b8hlobar` never count). A hyphen or slash may touch: ids sit in `backlog/xhash-slug.md` paths.
-const CODE_TOKEN_RE = /(?<![A-Za-z0-9_$])(x[0-9a-z]{6})(?![A-Za-z0-9_$])/g;
+const CODE_TOKEN_RE = /(?<![\p{L}\p{N}_$])(x[0-9a-z]{6})(?![\p{L}\p{N}_$])/gu;
 
 /**
  * PURE (R953): a line is a pure id swap when it differs from its old line ONLY by whole-token xHASH→NNNN
