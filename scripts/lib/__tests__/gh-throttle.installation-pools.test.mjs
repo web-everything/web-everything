@@ -249,6 +249,18 @@ process.send('ready');
     expect(acquire('202', 'third', extra).ok).toBe(true);
     expect(acquire('101', 'different').ok).toBe(true);
   });
+  it.each([
+    ['101', '202'],
+    ['101', null],
+    [null, '101'],
+  ])('ignores a stale holder from pool %s when admitting pool %s, but still counts a fresh holder', (source, target) => {
+    const clock = Date.now();
+    const extra = { policy: { ...policy, perCallerMax: 1 }, meta: ghHolderMeta({ caller: 'same', args }), now: () => clock };
+    expect(acquire(source, 'first', extra).ok).toBe(true);
+    expect(acquire(target, 'second', { ...extra, now: () => clock + 105000 }).ok).toBe(false);
+    expect(acquire(target, 'second', { ...extra, now: () => clock + 105001 }).ok).toBe(true);
+    expect(readGhSlotHolders({ lockRoot: root, cap: 1, nowMs: clock + 105001 })).toHaveLength(2);
+  });
   it('reports bucket holders and reaps an aged bucket slot into the shared call log', () => {
     const clock = Date.now();
     expect(acquire(null, 'shared').ok).toBe(true);
