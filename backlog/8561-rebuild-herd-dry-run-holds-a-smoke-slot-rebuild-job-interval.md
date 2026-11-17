@@ -55,4 +55,4 @@ Preview cases live in `we:scripts/lib/daemon-rebuild/__tests__/preview.test.mjs`
 
 - Card gate for unfinished acceptance/non-goal/edge-case placeholders: already tracked by [#5360](5360-prevention-add-a-check-standards-rule-that-fails-a-card-movi.md).
 - Guarantee-to-named-test/assertion gate: already tracked by [#6484](6484-prevention-file-a-card-validation-gate-requiring-guarantee-t.md). This card now provides the mappings above, including the two-attempt recovery assertion and separate-ticket ownership assertions.
-- Documented environment-switch source validation and real-default seam review coverage: filed in [#x7s9k2m](x7s9k2m-validate-documented-switches-and-default-seam-test-coverage.md). Future rollback switches must include a named test exercising the explicit override value; admission currently has no bypass switch.
+- Documented environment-switch source validation and real-default seam review coverage: filed in [#8570](8570-validate-documented-switches-and-default-seam-test-coverage.md). Future rollback switches must include a named test exercising the explicit override value; admission currently has no bypass switch.

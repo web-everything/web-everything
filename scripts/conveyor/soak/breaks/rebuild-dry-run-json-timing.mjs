@@ -106,7 +106,7 @@ export function probeDryRunCli({ json = true } = {}) {
 export default {
   id: 'rebuild-dry-run-json-timing',
   title: 'dry-run CLI emits one JSON document on stdout and phase timings on stderr',
-  card: 'x1b8hlo',
+  card: '5726',
   fixedBy: { sha: 'pending', where: 'lane/r1-rebuild-herd', paths: ['scripts/lib/daemon-rebuild/preview.mjs'] },
   fixPresent(root) {
     const source = readFileSync(join(root, 'scripts/lib/daemon-rebuild/preview.mjs'), 'utf8');
