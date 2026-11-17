@@ -1,4 +1,4 @@
-import { emptyNetDiffSkip, provenEmptyNetDiff, EMPTY_NET_DIFF_SKIP } from './red-team-empty-net-diff.mjs';
+import { emptyNetDiffSkip, provenEmptyNetDiff, verifyEmptyNetDiff, EMPTY_NET_DIFF_SKIP } from './red-team-empty-net-diff.mjs';
 /** Recover an owed red-team result on an already-reviewed head through the existing review job. */
 import { execFileSync } from 'node:child_process';
 import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
@@ -478,7 +478,7 @@ export function storedSealRefusal({ repo, pr, head, env, readSeal, readStatus, s
  */
 export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, readStatus, now, env = process.env,
   readSeal = isUnderTest() || isUnderTest(env) ? null : readSealedStatus,
-  setting, lastDispatch, readCheckFact, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions,
+  gitExec = execFileSync, cwd, setting, lastDispatch, readCheckFact, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions,
   headNeverReviewed = headNeverReviewedFromRuns, readReviewRuns = defaultReadReviewRuns, readCarriedCheck = () => false }) {
   return refusals.filter(r => r?.kind === 'already-reviewed-head').map(refusal => {
     const pr = Number(refusal.prNumber);
@@ -703,6 +703,8 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance,
           comments: rawPr.comments, reviews, settlesPending: true });
         if (refusal) return guardedSkip(refusal);
+        if (!verifyEmptyNetDiff(evidence.loopPayload?.findings?.read, head, { exec: gitExec, cwd }))
+          return skip('empty net diff not proven for this head; inspect stored evidence');
         return { ...row, action: 'clear', policy: EMPTY_NET_DIFF_SKIP.policy, why: EMPTY_NET_DIFF_SKIP.reason };
       }
       if (!movedCardOnly && !pendingCardOnly && (!owed || accepted || finishedNotOwed)) {
@@ -947,7 +949,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       return { ...rawPr, reviews };
     });
     const planningOptions = { repo, refusals, rawPrs: planningPrs,
-      readEvidence, readStatus, readReviewRuns, readCheckFact, readSeal, env,
+      readEvidence, readStatus, readReviewRuns, readCheckFact, readSeal, env, gitExec: exec, cwd,
       now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, readWitness, headNeverReviewed, readCarriedCheck,
       recoveryOptions: { now: at, probe: recoveryProbe(), deadlineMs: staleRunDeadlineMs(env), env } };
     rows.push(...planRedTeamOnSkip(planningOptions));
@@ -1110,7 +1112,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
             let publishFailure = null;
             const result = settle({ redTeam: row.policy === EMPTY_NET_DIFF_SKIP.policy ? { ...EMPTY_NET_DIFF_SKIP } : { status: 'not-owed' }, repo, pr: row.prNumber,
               head: row.head, readHead: row.head, accepted: true, storedReviewPolicyClear: true, comments: rawPr.comments, reason: row.why,
-              io: { env, log: note, readStatus,
+              io: { env, log: note, readStatus, gitExec: exec, cwd,
                 // settleRedTeamSkip reaches this only once it decided policy-clear and the head shows no result.
                 postComment: ({ repo, pr, body }) => {
                   // settleRedTeamSkip bounds its reason to 80 chars for the needs-you feed, which would cut a yield's

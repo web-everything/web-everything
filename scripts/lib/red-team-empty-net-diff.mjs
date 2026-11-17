@@ -1,3 +1,5 @@
+import { execFileSync } from 'node:child_process';
+
 /** Positive, head-bound proof only: missing diff evidence never grants an exemption. */
 export function provenEmptyNetDiff(read, head = read?.netBasis?.rev) {
   return typeof head === 'string' && /^[a-f0-9]{40}$/i.test(head)
@@ -17,4 +19,14 @@ export function emptyNetDiffSkip(status, head = status?.head) {
     && (!result?.policy || result.policy === 'empty-net-diff')
     && !result?.deferredByGuard && !result?.deferredByCap
     && provenEmptyNetDiff(status.loopPayload?.findings?.read, head);
+}
+
+/** Re-read the stored range, never a live head ref. Unknown or oversized output retains the hold. */
+export function verifyEmptyNetDiff(read, head, { exec = execFileSync, cwd } = {}) {
+  if (!provenEmptyNetDiff(read, head) || typeof read.netBasis.base !== 'string' || !read.netBasis.base) return false;
+  try {
+    return exec('git', ['diff', '--no-ext-diff', '--no-textconv', '--name-only', '-z',
+      '--end-of-options', `${read.netBasis.base}..${head}`, '--'],
+    { cwd, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024 }) === '';
+  } catch { return false; }
 }
