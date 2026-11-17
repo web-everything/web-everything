@@ -15,7 +15,7 @@ import {
 import { reserve, readLockEntry } from '../../readiness/file-locks.mjs';
 import { acquireFixDispatchClaim, releaseFixDispatchClaim, readFixDispatchClaim, listFixDispatchClaims } from '../fix-dispatch-claim.mjs';
 import { resolveFixerSlotSettings } from '../fixer-slot-rules.mjs';
-import { AWAIT_VERIFY_LIMITS, formatAwaitVerifyLines, runAwaitVerifyPass } from '../await-verify-pass.mjs';
+import { AWAIT_VERIFY_LIMITS, formatAwaitVerifyLines, runAwaitVerifyPass, defaultAwaitVerifyIo } from '../await-verify-pass.mjs';
 
 const SHA = '65a382e81413952ab11e5448e36f01bb7ce4c332';
 const TREE = 'f'.repeat(64);
@@ -97,7 +97,7 @@ describe('runSlotAwareAwaitPass — the real pass, R3-gated', () => {
     pendingResume: { kind: 'red', detail: 'previous-head CI failures' }, ...over,
   });
   const runSlots = (h, over = {}) => runSlotAwareAwaitPass({
-    io: h.io, runPass: runAwaitVerifyPass, allowResume: true, settings: ON,
+    io: h.io, runPass: h.runPass ?? runAwaitVerifyPass, allowResume: true, settings: ON,
     claims: [], nowMs: NOW, ttlMs: TTL, cap: 2, log: vi.fn(), ...over,
   });
 
@@ -105,9 +105,16 @@ describe('runSlotAwareAwaitPass — the real pass, R3-gated', () => {
     const waiting = () => repair(1, reason === 'delivered-previous-ci'
       ? { pendingResume: { kind: 'red', delivered: true } }
       : { resumeFailures: AWAIT_VERIFY_LIMITS.maxResumeFailures });
-    const setup = () => {
+    const setup = (pending = false) => {
       const record = waiting();
+      if (!pending) delete record.previousCi;
       const h = harness([record], {});
+      // Clean historical waits exercise the slot policy with the exact phase-A verdict.
+      // Pending inventory below uses the real pass to pin its producer rows.
+      if (!pending) h.runPass = async () => ({ rows: [{ key: 'sid-1', action: 'wait',
+        ...(reason === 'delivered-previous-ci'
+          ? { reason: 'previous-head CI repair must be verified and re-marked' }
+          : { result: 'resume-exhausted; operator recovery required' }) }] });
       h.io.fixTimingPolicy = () => ({ pushAfterCi: true });
       h.io.sessionLive = vi.fn(() => false);
       h.io.newerVerdictSince = vi.fn(() => true);
@@ -118,6 +125,49 @@ describe('runSlotAwareAwaitPass — the real pass, R3-gated', () => {
       });
       return { h, record };
     };
+
+    it('retains pending previous-head CI failures from the real pass despite a dead session and newer verdict', async () => {
+      const { h, record } = setup(true);
+      const out = await runSlots(h);
+      expect(out.cleared).toEqual([]);
+      expect(out.excluded).toEqual([{ key: 'sid-1', reason }]);
+      expect(h.store.get('sid-1')).toEqual(record);
+      expect(h.io.clearStoredRecordIf).not.toHaveBeenCalled();
+      expect(h.io.newerVerdictSince).not.toHaveBeenCalled();
+      expect(h.calls.resume).toEqual([]);
+    });
+
+    it.each([
+      ['gh error', '2026-10-08T19:29:00Z', null],
+      ['bad wait date', 'invalid', '2026-10-08T19:31:00Z'],
+      ['bad event date', '2026-10-08T19:29:00Z', 'invalid'],
+      ['mixed valid and bad event dates', '2026-10-08T19:29:00Z', 'invalid\n2026-10-08T19:31:00Z'],
+      ['empty history', '2026-10-08T19:29:00Z', ''],
+    ])('keeps the wait when the production label reader sees %s', async (_name, since, history) => {
+      const { h, record } = setup();
+      record.requestedAt = since;
+      const reader = await defaultAwaitVerifyIo({ env: {}, dispatchIo: {}, stopSessionFn: vi.fn(),
+        pushRefusalFn: vi.fn(), readClaimFn: vi.fn(), exec: vi.fn(() => {
+          if (history === null) throw new Error('gh failed');
+          return history;
+        }) });
+      h.io.newerVerdictSince = reader.newerVerdictSince;
+      const out = await runSlots(h);
+      expect(out.cleared).toEqual([]);
+      expect(out.excluded).toEqual([{ key: 'sid-1', reason }]);
+      expect(h.store.get('sid-1')).toEqual(record);
+      expect(h.io.clearStoredRecordIf).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['2026-10-08T19:28:00Z', false],
+      ['2026-10-08T19:29:00Z', false],
+      ['2026-10-08T19:28:00Z\n2026-10-08T19:31:00Z', true],
+    ])('production label reader requires a strictly newer valid event: %s', async (history, expected) => {
+      const reader = await defaultAwaitVerifyIo({ env: {}, dispatchIo: {}, stopSessionFn: vi.fn(),
+        pushRefusalFn: vi.fn(), readClaimFn: vi.fn(), exec: vi.fn(() => history) });
+      expect(reader.newerVerdictSince('web-everything/web-everything', 1, '2026-10-08T19:29:00Z')).toBe(expected);
+    });
 
     it('retires a dead session with a newer verdict without excluding, counting or resuming it', async () => {
       const { h, record } = setup();

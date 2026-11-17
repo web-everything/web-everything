@@ -1135,7 +1135,8 @@ export async function defaultAwaitVerifyIo({
         const out = String(exec('gh', ['api', `repos/${repo}/issues/${pr}/events`, '--paginate', '--jq',
           '.[] | select(.event == "labeled" and .label.name == "review:changes") | .created_at'],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env, timeout: 60_000, maxBuffer: 1024 * 1024 }));
-        return out.trim().split('\n').some(at => Date.parse(at) > sinceMs);
+        const dates = out.trim().split('\n').map(at => Date.parse(at));
+        return dates.every(Number.isFinite) && dates.some(at => at > sinceMs);
       } catch { return false; }
     },
     sessionLive: (record) => {

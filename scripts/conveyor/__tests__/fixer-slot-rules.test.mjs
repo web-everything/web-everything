@@ -5,7 +5,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   resolveFixerSlotSettings, FIXER_SLOT_SETTINGS_BUILT_IN, fixSlotState, fixSlotCount, slotCountedItems, admitResumes,
-  awaitPassRunner, releaseOnCompletion, shouldRetireUnwakeable,
+  awaitPassRunner, releaseOnCompletion, shouldRetireUnwakeable, classifyStaleOwed, STALE_HEAD_GRACE_MS,
 } from '../fixer-slot-rules.mjs';
 
 const MIN = 60_000;
@@ -132,5 +132,39 @@ describe('shouldRetireUnwakeable', () => {
   });
   it.each([null, undefined, 'resume-paused', 'stale'])('refuses other reasons: %s', reason => {
     expect(shouldRetireUnwakeable({ reason, sessionLive: false, newerVerdict: true })).toBe(false);
+  });
+});
+
+
+describe('classifyStaleOwed — retirement does not change stale rules', () => {
+  const base = { v: 1, sessionId: 'sid', who: 'fix-1', repo: 'web-everything/web-everything', pr: 1,
+    kind: 'fix', sha: 'a'.repeat(40), lane: '/lanes/lane-1', ref: 'lane/fix', attempt: 1,
+    requestedAt: new Date(T - 2 * STALE_HEAD_GRACE_MS).toISOString(), pendingResume: { kind: 'green' } };
+  const newer = { key: 'new', record: { ...base, sha: 'b'.repeat(40), requestedAt: new Date(T).toISOString() } };
+  it.each([
+    ['closed PR', { open: false }, null, true],
+    ['moved open head after grace', { open: true, headSha: 'b'.repeat(40) }, null, true],
+    ['same head', { open: true, headSha: base.sha }, null, false],
+    ['unreadable head', { open: true, headSha: 'bad' }, null, false],
+    ['unknown PR', null, null, false],
+    ['newer same-lineage different SHA', null, newer, true],
+    ['same SHA', null, { ...newer, record: { ...newer.record, sha: base.sha } }, false],
+    ['equal timestamp', null, { ...newer, record: { ...newer.record, requestedAt: base.requestedAt } }, false],
+    ['other session', null, { ...newer, record: { ...newer.record, sessionId: 'other' } }, false],
+  ])('%s preserves pending repair inventory and otherwise keeps its existing decision', (_name, facts, next, retires) => {
+    for (const pending of [false, true]) {
+      const old = { key: 'old', record: { ...base, ...(pending
+        ? { previousCi: { ready: { ciFailures: [{ name: 'unit', conclusion: 'failure' }] } } } : {}) } };
+      expect(classifyStaleOwed({ owed: [old], records: next ? [old, next] : [old],
+        prFacts: new Map([['old', facts]]), nowMs: T })).toEqual(retires && !pending ? ['old'] : []);
+    }
+  });
+  it.each(['red', 'escalate', 'push-refused'])('keeps never-pushed %s waits despite a moved head', kind => {
+    const old = { key: 'old', record: { ...base, pendingResume: { kind } } };
+    expect(classifyStaleOwed({ owed: [old], prFacts: new Map([['old', { open: true, headSha: 'b'.repeat(40) }]]), nowMs: T })).toEqual([]);
+  });
+  it('keeps a green wait inside the head-read grace window', () => {
+    const old = { key: 'old', record: { ...base, pendingResume: { kind: 'green', at: new Date(T).toISOString() } } };
+    expect(classifyStaleOwed({ owed: [old], prFacts: new Map([['old', { open: true, headSha: 'b'.repeat(40) }]]), nowMs: T })).toEqual([]);
   });
 });

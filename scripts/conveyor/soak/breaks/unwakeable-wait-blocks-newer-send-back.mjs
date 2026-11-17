@@ -1,4 +1,4 @@
-/** A stale unwakeable wait (its session is gone) must be retired once a newer review:changes send-back exists. */
+/** A stale unwakeable wait (its session is gone) must be retired once a newer review:changes send-back exists, unless previous-head CI failures remain pending. */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
@@ -19,13 +19,14 @@ export default {
   },
   async run({ log } = {}) {
     const violations = [];
-    for (const [reason, over] of [
+    for (const pending of [false, true]) for (const [reason, over] of [
       ['delivered-previous-ci', { pendingResume: { kind: 'red', delivered: true } }],
       ['resume-exhausted', { pendingResume: { kind: 'red', detail: 'previous-head CI failures' } }],
     ]) {
       const record = { v: 1, sessionId: 'fix-6595', who: 'fix-6595', repo: CONSTELLATION_REPOS.we.slug, pr: 6595,
         kind: 'fix', sha: '7'.repeat(40), lane: '/lanes/lane-9', ref: 'lane/stale-fix', attempt: 1,
-        requestedAt: REQUESTED, ...over };
+        requestedAt: REQUESTED, ...over,
+        ...(pending ? { previousCi: { ready: { ciFailures: [{ name: 'unit', conclusion: 'failure' }] } } } : {}) };
       const store = new Map([[record.sessionId, record]]);
       const row = { key: record.sessionId, pr: record.pr, who: record.who, action: 'wait',
         ...(reason === 'delivered-previous-ci'
@@ -41,7 +42,12 @@ export default {
       const out = await runSlotAwareAwaitPass({ io, runPass: async () => ({ rows: [row] }), allowResume: true,
         settings: { parkedReleasesSlot: true }, claims: [], nowMs: NOW, ttlMs: 150 * 60_000, cap: 2, log: () => {} });
       log?.(`${reason}: waiter=${store.has(record.sessionId)}, excluded=${out.excluded?.length ?? '?'}`);
-      if (store.has(record.sessionId) || !out.cleared?.includes(record.sessionId)) {
+      if (pending) {
+        if (store.get(record.sessionId) !== record || out.cleared?.length
+          || !out.excluded?.some(e => e.key === record.sessionId && e.reason === reason)) {
+          violations.push(`${reason}: pending previous-head CI failures were not retained and excluded for operator recovery`);
+        }
+      } else if (store.has(record.sessionId) || !out.cleared?.includes(record.sessionId)) {
         violations.push(`${reason}: stale unwakeable wait was not retired despite a dead session and a newer send-back`);
       }
     }

@@ -29,7 +29,7 @@ import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { resolveFixDispatchMaxConcurrent, isPidAlive } from '../lib/dispatch-throttle.mjs';
 import { reserve, releaseLockDirIf, readLockEntry } from '../readiness/file-locks.mjs';
-import { listStoredAwaitVerify, resolveAwaitVerifyTtlMs } from './await-verify.mjs';
+import { listStoredAwaitVerify, resolveAwaitVerifyTtlMs, previousCiFailurePending } from './await-verify.mjs';
 import { listFixDispatchClaims, fixDispatchSessionName, fixDispatchResource, fixDispatchClaimRoot } from './fix-claim-store.mjs';
 import { releaseFixDispatchClaim } from './fix-dispatch-claim.mjs';
 import { tryReadCompletion } from '../operations/completion-store.mjs';
@@ -141,6 +141,8 @@ export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings
   const retired = new Set();
   for (const [key, reason] of unwakeable) {
     const record = allOwed.find(e => e.key === key).record;
+    // Exclusion frees admission, but pending repair inventory still needs operator recovery.
+    if (previousCiFailurePending(record)) continue;
     try {
       const sessionLive = await io.sessionLive?.(record);
       const newerVerdict = await io.newerVerdictSince?.(record.repo, record.pr, record.requestedAt);
