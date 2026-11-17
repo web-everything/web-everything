@@ -321,6 +321,17 @@ describe('renderWorkerBrief', () => {
     }
   });
 
+  it('publishes the lane HEAD to the same ref before opening the PR', () => {
+    const policy = resolveBuildPolicy({ env: {}, tool: {}, platform: {} });
+    const brief = renderWorkerBrief({ ...params, policy });
+    const push = 'git push origin HEAD:refs/heads/lane/fix-widget';
+    expect(brief).toContain(push);
+    expect(brief.indexOf(push)).toBeLessThan(brief.indexOf('operations/run.mjs open-pr'));
+    const pushSlug = brief.match(/git push origin HEAD:refs\/heads\/(lane\/[^`\s]+)/)?.[1];
+    const prSlug = brief.match(/operations\/run\.mjs open-pr --ref=(lane\/[^`\s]+)/)?.[1];
+    expect(prSlug).toBe(pushSlug);
+  });
+
   it('requires the trust-boundary section in the PR body and stops if the card lacks it', () => {
     expect(renderWorkerBrief(params)).toContain("**Trust boundary.** A build of a trust-boundary item must carry the card's `Trust boundary and threat model` section into the PR body; if the card lacks one, stop and report.");
   });
