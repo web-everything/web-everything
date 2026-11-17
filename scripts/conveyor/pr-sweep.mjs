@@ -16,7 +16,7 @@ import { healthDir } from './health-watch-section.mjs';
 import { handoffHome } from '../operations/handoff-home.mjs';
 import { notifyDesktopChecked } from './branch-sync.mjs';
 import { flushDigest } from '../lib/quiet-hours-io.mjs';
-import { classifyIdlePrs, resolveOwner, planSweep, prKey, isRunningSession, evaluateInvariant, resolveWaitState, stateFingerprint, stateSince, DEADLINE_MINUTES } from './pr-sweep-core.mjs';
+import { classifyIdlePrs, resolveOwner, planSweep, prKey, isRunningSession, claimedSessionFinished, evaluateInvariant, resolveWaitState, stateFingerprint, stateSince, DEADLINE_MINUTES } from './pr-sweep-core.mjs';
 import { readFixDispatchClaim, claimedFixerLiveness } from './fix-claim-store.mjs';
 import { buildBlockedMap, sortUnblockersFirst } from './pr-blocked-by.mjs';
 import { createOpenPrCommentReader } from './pr-comments-complete.mjs';
@@ -148,7 +148,7 @@ export async function collectOwnerSignals({ prs, dir, env, errors, errorSources 
     try {
       const read = readClaim(pr), claims = Array.isArray(read) ? read : [read];
       const observed = claims.filter(Boolean).map(c => {
-        const hung = sessions.some(a => a.hung === true && (a.pid === c.meta?.runnerPid || a.name === c.meta?.who));
+        const hung = claimedSessionFinished(c, sessions);
         const proof = claimedFixerLiveness(c, { nowMs: now, headSha: pr.headRefOid, identity, hung });
         return { ...c, ...proof, runnerEvidence: proof.runnerEvidence };
       });
@@ -227,13 +227,14 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
       readSignals: async ({ prs }) => {
         const readErrors = [], errorSources = [];
         const signals = await readSignals({ prs, now, dir, env, errors: readErrors, errorSources, sourceRoot });
-        // Agent activity is used by the owner sweep, but the detector only needs
-        // log/refusal evidence. Unknown-source errors still fail closed.
+        // Unreadable agents cannot grant claim suppression. Keep detecting from
+        // readable log/refusal evidence; unknown-source errors still fail closed.
         const agentsOnly = new Set(errorSources.filter(e => e.source === 'agents').map(e => e.index));
         detectorErrors.push(...readErrors.filter((_, index) => !agentsOnly.has(index)));
         errors.push(...readErrors.filter((_, index) => agentsOnly.has(index)).map(e => `owner signals: ${e}`));
         if (readErrors.some((_, index) => !agentsOnly.has(index))) throw new Error('owner signals incomplete');
-        return signals;
+        return agentsOnly.size ? Object.fromEntries(Object.entries(signals).map(([key, signal]) =>
+          [key, { ...signal, fixClaim: null }])) : signals;
       } });
     out.items = sortUnblockersFirst(out.items.map(annotate));
     detectorErrors.push(...out.errors);

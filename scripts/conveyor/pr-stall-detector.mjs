@@ -6,7 +6,7 @@ import { stripVTControlCharacters } from 'node:util';
 import { cascadePolicy, formatCascadeSourcesLine, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { redactCommandLine } from '../operations/command-redact.mjs';
 import { scrubText } from './health-watch-core.mjs';
-import { resolveWaitState, stallSuppressionSince, suppressionExpired, operatorHeld } from './pr-sweep-core.mjs';
+import { resolveOwner, resolveWaitState, stallSuppressionSince, suppressionExpired, operatorHeld } from './pr-sweep-core.mjs';
 
 export const DETECTOR_DEFAULTS = { enabled: true, sameLabelMinutes: 60, repeatedReasonCount: 5,
   blockingLabels: ['red-team:pending', 'review:pending', 'status:fixing'] };
@@ -105,7 +105,8 @@ export function detectStalls({ prs, daemons = {}, signals = {}, seen = {}, now =
       const savedClocks = [...new Set(blocking)].map(label => seen[`${key}@${head}|${label}`]).filter(v => v !== undefined);
       if (savedClocks.some(v => !Number.isFinite(v))) throw new Error('invalid first-seen clock');
       const observedSince = Math.min(now, ...savedClocks);
-      const liveFixer = resolveWaitState(pr, signals[key], { now })?.kind === 'live-claim';
+      const liveFixer = resolveOwner(pr, { ...signals[key], now }).state !== 'unknown'
+        && resolveWaitState(pr, signals[key], { now })?.kind === 'live-claim';
       const eligible = []; let progress = -Infinity;
       for (const entry of entries) {
         // Health refusals carry epoch milliseconds; log entries carry ISO dates (T or space separator).

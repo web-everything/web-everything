@@ -33,6 +33,11 @@ export function classifyIdlePrs({ prs, now, idleMinutes }) {
 // be one; an absent or unknown value never grants ownership.
 const RUNNING = new Set(['working', 'running', 'busy']);
 const DONE_FLAGS = ['hung', 'idleFinished', 'authExpired', 'selfReportedDone'];
+/** A bound session's terminal guards override otherwise live claim evidence. */
+export function claimedSessionFinished(claim, sessions = []) {
+  return sessions.some(a => DONE_FLAGS.some(f => a[f] === true)
+    && (a.pid === claim?.meta?.runnerPid || a.name === claim?.meta?.who));
+}
 /** Running state and a live pid; the IO shell reads activity only for these rows. */
 export function isRunningSession(a) {
   const vals = [a?.state, a?.status].filter((v) => v !== undefined && v !== null && v !== '').map((v) => String(v).toLowerCase());
@@ -93,7 +98,7 @@ const refusalKind = (reason) => /(?:reconcile-refused|\brefused)\s+([a-z][a-z0-9
  *  Precedence: a live fixer claim, then the daemon's latest refusal (when no later progress and, if it names a head,
  *  the current head), then a parked PR (draft or `review:human`). Null when nothing is known: the old report stands. PURE. */
 export function resolveWaitState(pr, { fixClaim = null, daemons = [], sessions = [] } = {}, { now = null, maxAgeMinutes = 360, identity } = {}) {
-  const hung = sessions.some(a => a.hung === true && (a.pid === fixClaim?.meta?.runnerPid || a.name === fixClaim?.meta?.who));
+  const hung = claimedSessionFinished(fixClaim, sessions);
   // Only this tick's IO observation can satisfy the pure derivation; saved `live`/`pidAlive` fields cannot.
   identity ??= (pid, expected) => {
     const e = fixClaim?.runnerEvidence;

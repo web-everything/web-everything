@@ -3978,7 +3978,10 @@ the lock and surface the audit-log error for operator inspection. Keep these clo
 parent holder and dead-holder recovery.
 
 Keep the bounded fixer replay in `scripts/conveyor/__tests__/pr-sweep.test.mjs`:
-claim ownership requires a current runner identity, matching head, fresh heartbeat and no hung flag.
+claim ownership requires a current runner identity, matching head, fresh heartbeat and no bound
+session guard (`hung`, `idleFinished`, `authExpired`, `selfReportedDone`). Unknown bound session
+evidence cannot suppress detector findings; an agent-listing failure disables claim suppression
+while readable log/refusal evidence still produces operator alerts.
 The IO reader replaces persisted liveness with a timestamped identity observation; old observations
 cannot establish ownership on a later tick. Repair/live-claim suppression expires at
 `STALL_SUPPRESSION_MAX_MINUTES` from head/label movement (or the persisted first observation

@@ -81,6 +81,31 @@ describe('#6873 bounded fixer replay', () => {
     }
   });
 
+  it.each(['hung', 'idleFinished', 'authExpired', 'selfReportedDone'])(
+    'a bound session with %s cannot make a claim live or suppress the detector', async flag => {
+      for (const binding of [{ pid: 42 }, { name: 'fix-6873' }]) {
+        const signals = (await collect(claimFor(p), now, {
+          readAgents: () => [{ ...binding, [flag]: true }],
+        }))[key];
+        expect(signals.fixClaim.live).toBe(false);
+        // Exercise the pure path with fresh identity proof too, independently of IO's rejection.
+        const fresh = { ...signals, fixClaim: claimFor(p) };
+        expect(resolveWaitState(p, fresh, { now })).toBeNull();
+        expect(detected(fresh).items).toMatchObject([{ lane: 'operator', pr: 6873 }]);
+      }
+    });
+
+  it.each([
+    ['unreadable listing record', { unreadSessions: ['fix-6873'] }],
+    ['unreadable activity', { sessions: [{ name: 'fix-6873', state: 'running', pid: 42,
+      pidAlive: true, startedAt: now - 40 * minute, activityUnknown: true }] }],
+  ])('an owner unknown from %s cannot suppress a stall with a live claim', (_name, unread) => {
+    const signals = { fixClaim: claimFor(p), ...unread };
+    expect(resolveOwner(p, { ...signals, now }).state).toBe('unknown');
+    expect(detected(signals).items).toMatchObject([{ lane: 'operator', pr: 6873 }]);
+    expect(Object.values(detected(signals).nextSeen)).toEqual([now - 50 * minute]);
+  });
+
   it('selects a current live claim over a stale saved live flag from another claim kind', async () => {
     const dead = { ...claimFor(p), live: true, meta: { ...claimFor(p).meta, runnerPid: 99, kind: 'fixing' } };
     const signals = (await collect([dead, claimFor(p)]))[key];

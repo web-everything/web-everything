@@ -563,6 +563,41 @@ describe('runPrSweep detector integration', () => {
       items: [expect.objectContaining({ action: 'stalled-detector' })] });
   });
 
+  it.each(['readable', 'reject', 'unscoped gap'])(
+    '%s agent evidence only permits live-claim suppression when readable', async evidence => {
+      const since = NOW - 50 * MINUTE;
+      const options = sweepOptions({
+        readPrs: () => [pr({ headCommittedAt: new Date(since).toISOString(),
+          updatedAt: new Date(NOW - 120 * MINUTE).toISOString() })],
+        readPrevious: () => ({ stallDetector: { [key()]: since } }),
+        readSignals: async args => {
+          const signals = await collectOwnerSignals({ ...args,
+            readAgents: () => {
+              if (evidence === 'reject') throw new Error('agents offline');
+              return evidence === 'unscoped gap'
+                ? Object.defineProperty([], 'incomplete', { value: [{ reason: 'agents offline' }] }) : [];
+            },
+            readHealth: () => ({}), cloneRoots: () => [],
+            readClaim: () => ({ heartbeatAt: new Date(NOW).toISOString(), meta: { who: 'fix-5759',
+              headSha: HEAD, runnerPid: 42, runnerStart: 'runner-start', runnerArgv: 'fix-worker' } }),
+            identity: () => ({ alive: true }),
+          });
+          expect(signals[PR_KEY].fixClaim.live).toBe(true);
+          return { [PR_KEY]: { ...signals[PR_KEY], daemons: skips(6) } };
+        },
+      });
+      const report = await runPrSweep(options);
+      expect(report.errors.filter(error => !error.includes('agents offline'))).toEqual([]);
+      expect(report.stallDetector.stalled).toBe(evidence === 'readable' ? 0 : 1);
+      expect(report.nextState.stallDetector).toEqual({ [key()]: since });
+      const digest = options.stallDigest.mock.calls[0][0];
+      expect(digest.incomplete).toBe(false);
+      if (evidence !== 'readable') {
+        expect(report.errors.join(' ')).toContain('agents offline');
+        expect(digest.items).toMatchObject([{ lane: 'operator', action: 'stalled-detector' }]);
+      }
+    });
+
   it.each(['health', 'roots', 'logs', 'tail'])('a failed %s signal read still preserves clocks and marks the digest incomplete', async source => {
     const fail = () => { throw new Error('unreadable'); };
     const options = sweepOptions({ readSignals: args => collectOwnerSignals({ ...args,
