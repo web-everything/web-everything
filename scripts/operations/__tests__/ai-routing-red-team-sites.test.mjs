@@ -100,6 +100,116 @@ test('red-team overlays only provider and ignores executors', async () => {
   assert.equal(calls[0].effort, configured?.effort ?? resolveOperationEffort('review-seat', 'agy-claude', 'red-team'));
 });
 
+for (const fallback of [[], [{ provider: 'agy-gemini', model: 'flash', effort: 'high' }]]) {
+  test(`red-team provider overlay works without a matching repository fallback (${fallback.length} fallbacks)`, async () => {
+    const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+    policy.operations['review-seat:red-team'] = {
+      provider: 'codex', model: 'astra', effort: 'high', fallback,
+    };
+    const readRoutingPolicy = createRoutingPolicyReader({ env: {},
+      read: () => JSON.stringify(policy),
+      preferences: () => ({ errors: [], prefs: {} }), emit: () => {},
+    });
+    const resolved = setting('red-team', { provider: 'agy-claude', model: 'sonnet' });
+    assert.deepEqual(resolved.invalid, []);
+    const baseline = await seat(empty, { readRoutingPolicy });
+    assert.deepEqual(readRoutingPolicy.operatorKeys(), []);
+    assert.equal(baseline.result.status, 'speculated');
+    assert.equal(baseline.calls[0].provider, 'codex');
+    const actual = await seat(() => resolved, { readRoutingPolicy });
+    assert.equal(actual.result.status, 'speculated', actual.result.reason);
+    assert.deepEqual(actual.reservations, ['agy-claude']);
+    assert.equal(actual.calls[0].provider, 'agy-claude');
+    assert.equal(actual.calls[0].model, RED_TEAM_MODELS['agy-claude'].model);
+    assert.equal(actual.calls[0].effort, 'high');
+  });
+}
+
+test('red-team overlay retains a matching fallback’s configured model and effort', async () => {
+  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+  policy.operations['review-seat:red-team'] = {
+    provider: 'codex', model: 'astra', effort: 'high',
+    fallback: [{ provider: 'agy-claude', model: 'opus-5-5', effort: 'high' }],
+  };
+  const { result, calls } = await seat(() => setting('red-team', { provider: 'agy-claude', model: 'sonnet' }),
+    { readRoutingPolicy: () => policy });
+  assert.equal(result.status, 'speculated', result.reason);
+  assert.equal(calls[0].provider, 'agy-claude');
+  assert.equal(calls[0].model, policy.aliases['agy-claude']['opus-5-5']);
+  assert.equal(calls[0].effort, 'high');
+});
+
+for (const unavailable of ['CLI', 'quota', 'cap']) {
+  test(`red-team overlay supplies a route when the default provider is unavailable (${unavailable})`, async () => {
+    const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+    policy.operations['review-seat:red-team'] = { provider: 'codex', model: 'astra', effort: 'high', fallback: [] };
+    const overrides = { readRoutingPolicy: () => policy,
+      ...(unavailable === 'CLI' ? { cliAvailable: provider => provider !== 'codex' }
+        : unavailable === 'quota' ? { readRecords: () => [{ dispatchKind: 'review-seat', provider: 'codex',
+          scoredAt: new Date(NOW).toISOString(), callStatus: 'quota', quotaUsedPercent: 100,
+          quotaResetsAt: new Date(NOW + 3600000).toISOString() }] } : {}),
+    };
+    const env = unavailable === 'cap' ? { WE_REVIEW_SEAT_CAP_CODEX: '0' } : {};
+    // Missing, invalid and unavailable overlays must retain the exhausted policy's refusal.
+    for (const resolver of [empty, () => setting('red-team', { provider: 'bogus', model: 'sonnet' }),
+      () => setting('red-team', { provider: 'codex', model: 'astra' })]) {
+      const baseline = await seat(resolver, overrides, env);
+      assert.equal(baseline.result.status, 'skipped');
+      assert.match(baseline.result.reason, /no available route/);
+      assert.deepEqual(baseline.reservations, []);
+      assert.deepEqual(baseline.calls, []);
+    }
+    const actual = await seat(() => setting('red-team', { provider: 'agy-claude', model: 'sonnet' }), overrides, env);
+    assert.equal(actual.result.status, 'speculated', actual.result.reason);
+    assert.deepEqual(actual.reservations, ['agy-claude']);
+    assert.equal(actual.calls[0].provider, 'agy-claude');
+    assert.equal(actual.calls[0].model, RED_TEAM_MODELS['agy-claude'].model);
+    assert.equal(actual.calls[0].effort, 'high');
+  });
+}
+
+test('red-team Codex overlay uses provider defaults outside the repository route chain', async () => {
+  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+  policy.operations['review-seat:red-team'] = {
+    provider: 'agy-claude', model: 'sonnet', effort: 'high', fallback: [],
+  };
+  const { result, calls, reservations } = await seat(() => setting('red-team', { provider: 'codex', model: 'sol' }),
+    { readRoutingPolicy: () => policy });
+  assert.equal(result.status, 'speculated', result.reason);
+  assert.deepEqual(reservations, ['codex']);
+  assert.equal(calls[0].provider, 'codex');
+  assert.equal(calls[0].model, RED_TEAM_MODELS.codex.model);
+  assert.equal(calls[0].effort, 'high');
+});
+
+test('red-team overlay outside the repository route chain cannot enable a disabled provider', async () => {
+  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+  policy.operations['review-seat:red-team'] = {
+    provider: 'codex', model: 'astra', effort: 'high', fallback: [], disabledProviders: ['agy-claude'],
+  };
+  const { result, calls, reservations } = await seat(() => setting('red-team', { provider: 'agy-claude', model: 'sonnet' }),
+    { readRoutingPolicy: () => policy });
+  assert.equal(result.status, 'skipped');
+  assert.match(result.reason, /no available route/);
+  assert.deepEqual(calls, []);
+  assert.deepEqual(reservations, []);
+});
+
+test('Claude recheck overlay uses seat defaults without a matching repository fallback', async () => {
+  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+  policy.operations['review-recheck'] = { provider: 'codex', model: 'astra', effort: 'high', fallback: [] };
+  const baseline = resolveOperationRoute({ operation: 'review-recheck', policy });
+  // The initial recheck read uses the module's global policy reader; inject its resolved snapshot.
+  const resolved = vi.spyOn(routingPolicyIo, 'resolveOperationRoute').mockReturnValueOnce(baseline);
+  try {
+    const call = await recheck(() => setting('red-team-recheck', { provider: 'claude', model: 'sonnet' }),
+      false, { readRoutingPolicy: () => policy });
+    assert.equal(call.model, RECHECK_MODEL);
+    assert.equal(call.effort, 'high');
+    assert.equal(call.budget, 1);
+  } finally { resolved.mockRestore(); }
+});
+
 for (const key of ['review-seat', 'review-seat:red-team']) {
   for (const fallback of [[], [{ provider: 'agy-claude', model: 'sonnet' }]]) {
     test(`red-team conflicting overlay preserves operator pin ${key} with ${fallback.length} fallbacks`, async () => {

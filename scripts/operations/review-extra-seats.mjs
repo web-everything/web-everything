@@ -1225,16 +1225,19 @@ function aiSeatRoute(role, current, { env, io, available, operation, taskType, p
   const effectiveOperatorKeys = operatorKeys ?? reader.operatorKeys?.() ?? [];
   const lookupKeys = [`${operation}:${taskType}`, operation, String(operation).split(':')[0], '*'];
   if (lookupKeys.some(key => effectiveOperatorKeys.includes(key))) {
-    // Resolve the operator's chain before restricting defaults to the overlay's provider.
+    // Resolve the operator's chain before deriving defaults for the overlay's provider.
     const route = validateAiSeatRoute({ operation, taskType, available, policy: effectivePolicy,
       aiRouting: {}, operatorKeys: effectiveOperatorKeys });
     io.log(`policy-cascade · aiRouting.${role}: operator routing override takes precedence; inheriting ${route?.provider}/${route?.model}/${route?.effort}`);
     return route ?? current;
   }
   const provider = coordinator.provider;
-  const defaults = current?.provider === provider ? current : resolveOperationRoute({
-    operation, taskType, available: [provider], policy: effectivePolicy,
+  const configured = current?.provider === provider ? current : resolveOperationRoute({
+    operation, taskType, policy: effectivePolicy,
   });
+  // The overlay may select a provider absent from the repository's route chain.
+  // Retain matching policy defaults, otherwise use the seat's provider defaults.
+  const defaults = [configured, ...(configured?.fallback ?? [])].find(route => route?.provider === provider);
   const model = defaults?.model ?? (role === 'red-team-recheck' ? RECHECK_MODEL : RED_TEAM_MODELS[provider].model);
   const effort = defaults?.effort ?? resolveOperationEffort(operation, provider, taskType, effectivePolicy);
   const route = validateAiSeatRoute({ operation, taskType, available, policy: effectivePolicy,
@@ -1863,15 +1866,17 @@ export async function speculateRedTeam({
     let lastReason = null;
     let configuredRoute = null;
     for (let attempt = 0; attempt <= providers.length && available.length && !callId; attempt += 1) {
+      let routeError = null;
       try { configuredRoute = resolveOperationRoute({ operation: 'review-seat', taskType: RED_TEAM_SEAT.key, available, policy: routingPolicy }); }
-      catch (error) { lastReason = error.message; break; }
-      const pick = configuredRoute ? { provider: configuredRoute.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: RED_TEAM_SEAT.key, available, scorecards: records });
-      let overlaid;
+      catch (error) { configuredRoute = null; routeError = error; }
       try {
-        overlaid = aiSeatRoute('red-team', configuredRoute, { env, io, available,
+        configuredRoute = aiSeatRoute('red-team', configuredRoute, { env, io, available,
           operation: 'review-seat', taskType: RED_TEAM_SEAT.key, policy: routingPolicy });
+        // A valid overlay can supply a route even when the default chain is exhausted.
+        // Without one, preserve the policy failure rather than selecting outside its chain.
+        if (routeError && !configuredRoute) throw routeError;
       } catch (error) { lastReason = error.message; break; }
-      if (overlaid !== configuredRoute) { configuredRoute = overlaid; pick.provider = overlaid.provider; }
+      const pick = configuredRoute ? { provider: configuredRoute.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: RED_TEAM_SEAT.key, available, scorecards: records });
       if (!pick.provider) { lastReason = pick.reasoning; break; }
       let reservation;
       try {
