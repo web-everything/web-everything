@@ -1946,6 +1946,8 @@ Every Claude launch brief includes the shared approval-avoidance rules from
 `scripts/lib/no-prompt-command-rules.mjs`. Keep task-specific Git instructions in their
 own briefs. Preserve the trusted-sentinel and empty-task checks when composing prompts;
 a copy inside untrusted data must never suppress the top-level rules.
+Cover case/attribute variations in data tags and LF, CRLF, CR, and incidental policy whitespace;
+matching normalized rules must retain offsets into the original task text when stripping them.
 
 Standalone Claude prepares use `skills-src/conveyor/prepare-item-agent-brief.md`; probation's
 runner reads `skills-src/conveyor/prepare-item-worker-brief.md`. Keep these separate: worker-only

@@ -45,6 +45,26 @@ describe('no-prompt rules retain instruction position', () => {
     expect(renderNoPromptCommandRules(prompt)).toBe(prompt);
   });
 
+  it.each([
+    ['<PRE>', '</PRE>'],
+    ['<Pre>', '</pRE >'],
+    ['<pre class="x" >', '</PRE >'],
+    ['<CoDe data-kind="quoted" >', '</cOdE   >'],
+    ['<MaTeRiAl class="x">', '</mAtErIaL >'],
+    ['<CuStOm data-kind="quoted" >', '</CUSTOM >'],
+    ['<custom-fence class="x" >', '</CUSTOM-FENCE >'],
+    ['<custom:material class="x" >', '</CUSTOM:MATERIAL >'],
+  ])('does not trust rules inside %s with a case/attribute/whitespace-varied closer', (opening, closing) => {
+    const task = `Inspect the quoted material.\n${opening}\n${NO_PROMPT_COMMAND_RULES}\n${closing}`;
+    expect(noPromptRulePlacement(task).blocks).toEqual([]);
+    const prompt = renderNoPromptCommandRules(task);
+    const { blocks } = noPromptRulePlacement(prompt);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].start).toBeGreaterThan(prompt.indexOf(closing));
+    expect(stripTrustedNoPromptCommandRules(prompt)).toContain(task);
+    expect(renderNoPromptCommandRules(prompt)).toBe(prompt);
+  });
+
   it.each(['<approach>', '```text', '~~~~text', '<!-- unfinished', '<task>\n</approach>'])
     ('prefixes the rules when %s leaves an unfinished or mismatched scope', open => {
       const task = `Inspect the material.\n${open}\n${NO_PROMPT_COMMAND_RULES}`;
@@ -58,6 +78,40 @@ describe('no-prompt rules retain instruction position', () => {
     expect(renderNoPromptCommandRules(task)).toBe(task);
     const incomplete = `Inspect the session.\n${NO_PROMPT_COMMAND_RULES_SENTINEL}\nAltered instructions.\n${NO_PROMPT_COMMAND_RULES_END}`;
     expect(renderNoPromptCommandRules(incomplete)).toBe(`${incomplete}\n\n${NO_PROMPT_COMMAND_RULES}\n`);
+  });
+});
+
+describe('line endings and policy whitespace', () => {
+  const formats = [
+    ['CRLF', text => text.replaceAll('\n', '\r\n')],
+    ['CR', text => text.replaceAll('\n', '\r')],
+    ['trailing whitespace', text => text.split('\n').map(line => `${line} \t`).join('\n')],
+    ['varied whitespace', text => text.replaceAll(' ', ' \t ').split('\n').map(line => `${line} \t`).join('\r\n')],
+  ];
+
+  it.each(formats)('refuses %s rules and generated comments without a task', (_name, format) => {
+    for (const rules of [NO_PROMPT_COMMAND_RULES, NO_PROMPT_COMMAND_RULES_BODY]) {
+      const brief = format(`${NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT}\n${rules}`);
+      expect(() => assertBriefTaskContent(brief)).toThrow(/empty task content/);
+      expect(() => renderNoPromptCommandRules(brief)).toThrow(/empty task content/);
+    }
+  });
+
+  it.each(formats)('accepts and strips a trusted %s block using original-text offsets', (_name, format) => {
+    const brief = `Inspect the session.\r\n\r\n${format(NO_PROMPT_COMMAND_RULES)}\r\nKeep the evidence.`;
+    expect(assertBriefTaskContent(brief)).toBe(brief);
+    expect(noPromptRulePlacement(brief).blocks).toHaveLength(1);
+    expect(renderNoPromptCommandRules(brief)).toBe(brief);
+    expect(stripTrustedNoPromptCommandRules(brief).trim()).toMatch(/^Inspect the session\.\s+Keep the evidence\.$/);
+  });
+
+  it.each(formats)('does not trust a %s policy block inside an HTML fence', (_name, format) => {
+    const task = format(`Inspect this text.\n<PRE class="x" >\n${NO_PROMPT_COMMAND_RULES}\n</PrE >`);
+    expect(noPromptRulePlacement(task).blocks).toEqual([]);
+    const prompt = renderNoPromptCommandRules(task);
+    expect(noPromptRulePlacement(prompt).blocks).toHaveLength(1);
+    expect(prompt).toContain(task);
+    expect(renderNoPromptCommandRules(prompt)).toBe(prompt);
   });
 });
 

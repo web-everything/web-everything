@@ -29,7 +29,10 @@ afterAll(() => rmSync(root, { recursive: true, force: true }));
 
 const EMPTY = ['', ' \t\r\n', NO_PROMPT_COMMAND_RULES, `\n${NO_PROMPT_COMMAND_RULES}\n`,
   `${NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT}\n${NO_PROMPT_COMMAND_RULES}`,
-  `${NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT}\n${NO_PROMPT_COMMAND_RULES_BODY}`];
+  `${NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT}\n${NO_PROMPT_COMMAND_RULES_BODY}`,
+  `${NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT}\n${NO_PROMPT_COMMAND_RULES}`.replaceAll('\n', '\r\n'),
+  `${NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT}\n${NO_PROMPT_COMMAND_RULES}`.replaceAll('\n', '\r'),
+  `${NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT}\n${NO_PROMPT_COMMAND_RULES}`.split('\n').map(line => `${line} \t`).join('\r\n')];
 const settings = { contextPack: true, contextMaxBytes: 10000, contextLines: 20, localTests: 'proof-only' };
 
 describe('task content is checked before generic instructions can mask it', () => {
