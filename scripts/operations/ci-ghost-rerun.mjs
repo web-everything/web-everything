@@ -8,21 +8,22 @@
  * Shared allowance: timeout-retry-state.mjs#readTimeoutStates reads ci-timeout-reruns
  * under ghThrottleLockRoot(), keyed by repo/PR/head (including legacy state files).
  * Confirmed plus unreleased rejected requests spend the once-per-head allowance;
- * pending or unreadable evidence refuses. That module exposes no record/consume API:
- * this integration checks the conveyor budget read-only before recovery; ci-heal's
- * per-head allowance applies after. Our attempts.jsonl also enforces a lifetime
- * per-head cap independently of the rolling window; window expiry never resets it.
+ * pending or unreadable evidence refuses. Shared reservations are written under the
+ * conveyor's per-head lock before any POST and confirmed only after an accepted rerun.
+ * Our attempts.jsonl also enforces a lifetime per-head cap independently of the
+ * rolling window; window expiry never resets it.
  * On shared-budget refusal, an operator must inspect the shared state and workflow
  * before resolving pending/unreadable evidence or recovering the run manually.
  */
-import { appendFileSync, mkdirSync, readFileSync, rmdirSync, statSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as sleepDefault } from 'node:timers/promises';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { isValidCiGhostRerunSettings, readCiGhostRerunSettings } from '../lib/ci-ghost-rerun-settings.mjs';
-import { readTimeoutStates } from '../conveyor/timeout-retry-state.mjs';
+import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
+import { timeoutStateDir, timeoutKey, readTimeoutStates } from '../conveyor/timeout-retry-state.mjs';
 
 const positiveId = value => Number.isSafeInteger(value) && value > 0;
 const oneLine = value => typeof value === 'string' && value.trim().length > 0
@@ -63,7 +64,8 @@ export function createStateStore(dir = join(homedir(), '.claude', 'ci-ghost-reru
         const row = JSON.parse(line);
         if (!row || !Number.isFinite(Date.parse(row.ts)) || typeof row.outcome !== 'string'
           || !Object.hasOwn(row, 'counted') || typeof row.counted !== 'boolean'
-          || (row.counted && (!row.repo || !positiveId(row.pr) || !row.head))) {
+          || (row.counted && (typeof row.repo !== 'string' || !row.repo.trim() || !positiveId(row.pr)
+            || typeof row.head !== 'string' || row.head.length !== 40 || !/^[a-f\d]{40}$/i.test(row.head)))) {
           throw new Error('state unreadable; inspect ledger before retry');
         }
         return row;
@@ -80,6 +82,30 @@ export function createStateStore(dir = join(homedir(), '.claude', 'ci-ghost-reru
       try { return await fn(); } finally { io.rmdirSync(lock); }
     },
   };
+}
+
+// Same transaction and lock as ci-heal-pr-dispatch: both writers serialize per head.
+function timeoutTransaction(path, initial, fn) {
+  return withFileLock(`${path}.lock`, () => {
+    const state = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : initial();
+    if (state.version !== 1 || !Array.isArray(state.requests)) throw new Error('corrupt-timeout-state');
+    const result = fn(state);
+    writeJsonAtomic(path, state);
+    return result;
+  });
+}
+
+function validateSharedState(state, evidence) {
+  if (!state || typeof state !== 'object' || Array.isArray(state) || state.version !== 1
+    || !state.evidence || !Object.entries(evidence).every(([key, value]) => state.evidence[key] === value)
+    || !Array.isArray(state.requests)) throw new Error('corrupt-timeout-state');
+  for (const request of state.requests) {
+    if (!request || typeof request !== 'object' || Array.isArray(request)
+      || !['confirmed', 'pending', 'rejected'].includes(request.status)
+      || (Object.hasOwn(request, 'released') && typeof request.released !== 'boolean')) {
+      throw new Error('corrupt-timeout-request');
+    }
+  }
 }
 
 /** Injectable runner takes argv, never shell text. POSTs intentionally have no JSON response. */
@@ -99,7 +125,7 @@ export function defaultGh(args) {
 export async function runCiGhostRerun(options, {
   gh = defaultGh, clock = Date.now, sleep = sleepDefault,
   state = createStateStore(), settings = readCiGhostRerunSettings(),
-  readSharedRerunStates = readTimeoutStates,
+  readSharedRerunStates = readTimeoutStates, sharedStateDir = timeoutStateDir(),
 } = {}) {
   const { actor, channel, pr, repo = 'web-everything/web-everything', dryRun = false } = options;
   const audit = { ts: new Date(clock()).toISOString(), actor: actor ?? null, channel: channel ?? null,
@@ -176,59 +202,83 @@ export async function runCiGhostRerun(options, {
       if (run?.head_sha !== audit.head) return failure('head-sha-mismatch');
       if (run.id !== job.run_id || !positiveId(run.run_attempt) || run.status !== 'in_progress') return failure('run-unreadable');
       if (job.run_attempt !== run.run_attempt) return failure('run-attempt-mismatch');
-      const attempts = await state.read();
+      let attempts;
+      try { attempts = await state.read(); }
+      catch { return failure('state-unreadable', 4); }
       const since = clock() - settings.windowHours * 3_600_000;
       const perHead = attempts.filter(row => row.counted && row.repo === repo && row.pr === pr && row.head === audit.head);
       if (perHead.length >= settings.maxPerHead
         || perHead.filter(row => Date.parse(row.ts) > since).length >= settings.maxPerWindow) return failure('rate-capped', 3);
-      // Match the conveyor's once-per-head recovery allowance, counting rejected
-      // requests too. Unknown fields must never be interpreted as unused budget.
+      const evidence = { repo, pr, head: audit.head };
+      const path = join(sharedStateDir, `${timeoutKey(evidence)}.json`);
+      const initial = () => {
+        const legacy = readSharedRerunStates(evidence, sharedStateDir);
+        if (!Array.isArray(legacy)) throw new Error('corrupt-timeout-state');
+        legacy.forEach(entry => validateSharedState(entry, evidence));
+        return { version: 1, evidence, card: legacy.find(entry => entry.card)?.card,
+          requests: legacy.flatMap(entry => entry.requests).map((request, id) => ({ ...request, id })) };
+      };
+      let reservation;
       try {
-        const evidence = { repo, pr, head: audit.head };
-        const shared = await readSharedRerunStates(evidence);
-        if (!Array.isArray(shared)) return failure('shared-rerun-budget', 3);
-        for (const entry of shared) {
-          if (!entry || typeof entry !== 'object' || Array.isArray(entry) || entry.version !== 1
-            || !entry.evidence || !Object.entries(evidence).every(([key, value]) => entry.evidence[key] === value)
-            || !Array.isArray(entry.requests)) return failure('shared-rerun-budget', 3);
-          for (const request of entry.requests) {
-            if (!request || typeof request !== 'object' || Array.isArray(request)
-              || !['confirmed', 'pending', 'rejected'].includes(request.status)
-              || (Object.hasOwn(request, 'released') && typeof request.released !== 'boolean')) {
-              return failure('shared-rerun-budget', 3);
-            }
-            if (request.status !== 'rejected' || request.released !== true) return failure('shared-rerun-budget', 3);
+        mkdirSync(sharedStateDir, { recursive: true });
+        const allowed = timeoutTransaction(path, initial, shared => {
+          validateSharedState(shared, evidence);
+          if (shared.requests.some(request => request.status !== 'rejected' || request.released !== true)) return false;
+          if (!dryRun) {
+            reservation = { id: shared.requests.length, signature: 'ci-ghost-rerun',
+              target: { run: job.run_id, job: job.id, attempt: run.run_attempt }, status: 'pending',
+              reservedAt: new Date(clock()).toISOString(), outcome: 'reserved; API outcome unknown' };
+            shared.requests.push(reservation);
           }
-        }
+          return true;
+        });
+        if (!allowed) return failure('shared-rerun-budget', 3);
       } catch { return failure('shared-rerun-budget', 3); }
       if (dryRun) return { exitCode: 0, reason: 'dry-run' };
-      // Durable reservation precedes all POSTs, including ambiguous failures and process death.
-      await state.append({ ...audit, ts: new Date(clock()).toISOString(), outcome: 'attempt', counted: true });
-      const waitCompleted = async () => {
-        // At most 13 reads per phase, regardless of injected clock behavior.
-        const ticks = Math.min(12, Math.ceil(settings.cancelWaitSec / 5));
-        for (let tick = 0; tick <= ticks; tick++) {
-          const current = await api(runPath);
-          if (current?.id !== job.run_id || current.head_sha !== audit.head) throw new Error('run evidence changed');
-          if (current.run_attempt !== run.run_attempt) return failure('run-attempt-changed', 4);
-          if (current.status === 'completed') return true;
-          if (tick < ticks) await sleep(settings.cancelWaitSec * 1000 / ticks);
-        }
-        return false;
-      };
-      try { await api(`${runPath}/cancel`, 'POST'); } catch { /* force-cancel remains available */ }
-      let completed = await waitCompleted();
-      if (typeof completed !== 'boolean') return completed;
-      if (!completed) {
-        try {
-          await api(`${runPath}/force-cancel`, 'POST');
-        } catch { /* still poll to confirm cancellation */ }
-        completed = await waitCompleted();
+      let rerunSent = false;
+      try {
+        // Durable reservation precedes all POSTs, including ambiguous failures and process death.
+        await state.append({ ...audit, ts: new Date(clock()).toISOString(), outcome: 'attempt', counted: true });
+        const waitCompleted = async () => {
+          // At most 13 reads per phase, regardless of injected clock behavior.
+          const ticks = Math.min(12, Math.ceil(settings.cancelWaitSec / 5));
+          for (let tick = 0; tick <= ticks; tick++) {
+            const current = await api(runPath);
+            if (current?.id !== job.run_id || current.head_sha !== audit.head) throw new Error('run evidence changed');
+            if (current.run_attempt !== run.run_attempt) return failure('run-attempt-changed', 4);
+            if (current.status === 'completed') {
+              return ['cancelled', 'success'].includes(current.conclusion)
+                ? true : failure('run-failed-on-cancel', 4);
+            }
+            if (tick < ticks) await sleep(settings.cancelWaitSec * 1000 / ticks);
+          }
+          return false;
+        };
+        try { await api(`${runPath}/cancel`, 'POST'); } catch { /* force-cancel remains available */ }
+        let completed = await waitCompleted();
         if (typeof completed !== 'boolean') return completed;
+        if (!completed) {
+          try {
+            await api(`${runPath}/force-cancel`, 'POST');
+          } catch { /* still poll to confirm cancellation */ }
+          completed = await waitCompleted();
+          if (typeof completed !== 'boolean') return completed;
+        }
+        if (!completed) return failure('cancel-unconfirmed', 4);
+        rerunSent = true;
+        await api(`${runPath}/rerun`, 'POST');
+        timeoutTransaction(path, initial, shared => {
+          const request = shared.requests[reservation.id];
+          request.status = 'confirmed';
+          request.outcome = 'API accepted; retry result not yet observed';
+        });
+        return { exitCode: 0, reason: 'rerun', newRunAttempt: run.run_attempt + 1 };
+      } finally {
+        if (!rerunSent) timeoutTransaction(path, initial, shared => {
+          const request = shared.requests[reservation.id];
+          if (request.status === 'pending') { request.status = 'rejected'; request.released = true; }
+        });
       }
-      if (!completed) return failure('cancel-unconfirmed', 4);
-      await api(`${runPath}/rerun`, 'POST');
-      return { exitCode: 0, reason: 'rerun', newRunAttempt: run.run_attempt + 1 };
     });
     return finish(result);
   } catch {

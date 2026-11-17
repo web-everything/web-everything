@@ -2,19 +2,26 @@
  * @file scripts/operations/__tests__/ci-ghost-rerun.test.mjs
  * @description Hermetic ghost recovery, cancellation, audit, cap and settings guarantees.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import { homedir, tmpdir } from 'node:os';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createStateStore, defaultGh, detectGhostJobs, parseArgs, runCiGhostRerun } from '../ci-ghost-rerun.mjs';
 import { readCiGhostRerunSettings } from '../../lib/ci-ghost-rerun-settings.mjs';
 import { readDeclaredSettings, SETTINGS_DIR } from '../../lib/settings-files.mjs';
 import { readPlatformPreferences } from '../../lib/policy-cascade.mjs';
 import { execFileSyncThrottled } from '../../lib/gh-throttle.mjs';
-import { readTimeoutStates } from '../../conveyor/timeout-retry-state.mjs';
+import { readTimeoutBudget, timeoutKey, readTimeoutStates } from '../../conveyor/timeout-retry-state.mjs';
 
 vi.mock('../../lib/gh-throttle.mjs', () => ({ execFileSyncThrottled: vi.fn() }));
-vi.mock('../../conveyor/timeout-retry-state.mjs', () => ({ readTimeoutStates: vi.fn() }));
+vi.mock('../../conveyor/timeout-retry-state.mjs', async importOriginal => ({
+  ...await importOriginal(), readTimeoutStates: vi.fn(),
+}));
+
+const temporaryDirs = [];
+afterEach(() => {
+  temporaryDirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true }));
+});
 
 const NOW = Date.parse('2026-11-16T12:00:00Z');
 const HEAD = 'a'.repeat(40);
@@ -26,7 +33,9 @@ const ghost = () => ({ id: 7, run_id: 9, run_attempt: 2, status: 'in_progress', 
 ] });
 
 function fixture() {
-  const f = { head: HEAD, job: ghost(), rows: [], posts: [], trace: [],
+  const dir = mkdtempSync(join(tmpdir(), 'ci-ghost-shared-'));
+  temporaryDirs.push(dir);
+  const f = { dir, head: HEAD, job: ghost(), rows: [], posts: [], trace: [],
     statuses: ['in_progress', 'completed'], now: NOW, runHead: HEAD, total: 1 };
   let posted = false;
   f.gh = vi.fn(async args => {
@@ -51,13 +60,16 @@ function fixture() {
     };
     if (path.endsWith('/jobs/7')) return { check_run_url: checkUrl, ...f.job };
     if (path.endsWith('/runs/9')) return { id: 9, head_sha: f.runHead, run_attempt: posted ? (f.pollAttempt ?? 2) : 2,
-      status: posted ? (f.statuses.length > 1 ? f.statuses.shift() : f.statuses[0]) : 'in_progress' };
+      status: posted ? (f.statuses.length > 1 ? f.statuses.shift() : f.statuses[0]) : 'in_progress',
+      conclusion: f.conclusion === undefined ? 'cancelled' : f.conclusion };
     throw new Error(`Unexpected fake route: ${path}`);
   });
   f.state = { read: () => f.rows, append: row => f.rows.push(structuredClone(row)), withLock: fn => fn() };
   f.deps = { gh: f.gh, state: f.state, clock: () => f.now, settings,
-    readSharedRerunStates: vi.fn(() => []),
+    readSharedRerunStates: vi.fn(() => []), sharedStateDir: dir,
     sleep: async ms => { f.trace.push('wait'); f.now += ms; } };
+  f.sharedPath = join(dir, `${timeoutKey({ repo: 'web-everything/web-everything', pr: 42, head: HEAD })}.json`);
+  f.shared = () => JSON.parse(readFileSync(f.sharedPath, 'utf8'));
   f.run = (overrides = {}) => runCiGhostRerun({ ...options, ...overrides }, f.deps);
   return f;
 }
@@ -184,7 +196,7 @@ describe('ghost recovery', () => {
     f.deps.readSharedRerunStates.mockReturnValue([{ version: 1,
       evidence: { repo: 'web-everything/web-everything', pr: 42, head: HEAD }, requests }]);
     expect(await f.run()).toMatchObject({ exitCode: 3, reason: 'shared-rerun-budget' });
-    expect(f.deps.readSharedRerunStates).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', pr: 42, head: HEAD });
+    expect(f.deps.readSharedRerunStates).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', pr: 42, head: HEAD }, f.dir);
     expect(f.posts).toEqual([]);
     expect(f.rows).toEqual([expect.objectContaining({ outcome: 'shared-rerun-budget', counted: false })]);
   });
@@ -200,7 +212,7 @@ describe('ghost recovery', () => {
   });
 
   it('refuses a throwing shared state reader before any POST or local reservation', async () => {
-    const f = fixture(); f.deps.readSharedRerunStates.mockRejectedValue(new Error('unreadable'));
+    const f = fixture(); f.deps.readSharedRerunStates.mockImplementation(() => { throw new Error('unreadable'); });
     expect(await f.run()).toMatchObject({ exitCode: 3, reason: 'shared-rerun-budget' });
     expect(f.posts).toEqual([]);
     expect(f.rows.some(row => row.counted)).toBe(false);
@@ -211,7 +223,7 @@ describe('ghost recovery', () => {
     readTimeoutStates.mockReturnValueOnce([]);
     expect(await f.run({ repo: 'other/repo', pr: 43 })).toMatchObject({ reason: 'rerun', exitCode: 0 });
     expect(readTimeoutStates).toHaveBeenCalledTimes(1);
-    expect(readTimeoutStates).toHaveBeenCalledWith({ repo: 'other/repo', pr: 43, head: HEAD });
+    expect(readTimeoutStates).toHaveBeenCalledWith({ repo: 'other/repo', pr: 43, head: HEAD }, f.dir);
     expect(f.rows.filter(row => row.counted)).toHaveLength(1);
   });
 
@@ -227,6 +239,91 @@ describe('ghost recovery', () => {
     const f = fixture(); f.deps.readSharedRerunStates.mockReturnValue([{}]);
     expect(await f.run({ dryRun: true })).toMatchObject({ reason: 'shared-rerun-budget', exitCode: 3 });
     expect(f.posts).toEqual([]);
+  });
+
+  it('reserves shared budget before any POST, confirms it, and blocks an independent local ledger', async () => {
+    const f = fixture(); const gh = f.gh;
+    f.deps.gh = async args => {
+      if (args[3] === 'POST') expect(f.shared().requests).toEqual([expect.objectContaining({
+        id: 0, signature: 'ci-ghost-rerun', target: { run: 9, job: 7, attempt: 2 },
+        status: 'pending', reservedAt: new Date(NOW).toISOString(), outcome: 'reserved; API outcome unknown',
+      })]);
+      return gh(args);
+    };
+    expect(await f.run()).toMatchObject({ reason: 'rerun', exitCode: 0 });
+    expect(readTimeoutBudget({ dir: f.dir, repo: 'web-everything/web-everything', pr: 42, head: HEAD }))
+      .toMatchObject({ confirmed: 1, pending: false });
+    f.rows.length = 0;
+    expect(await f.run()).toMatchObject({ reason: 'shared-rerun-budget', exitCode: 3 });
+    expect(f.posts).toEqual(['cancel', 'rerun']);
+  });
+
+  it('imports legacy requests with reassigned IDs and retains the legacy followup card', async () => {
+    const f = fixture();
+    f.deps.readSharedRerunStates = (await vi.importActual('../../conveyor/timeout-retry-state.mjs')).readTimeoutStates;
+    writeFileSync(join(f.dir, 'legacy-signature.json'), JSON.stringify({ version: 1,
+      evidence: { repo: 'web-everything/web-everything', pr: 42, head: HEAD }, card: { filed: true },
+      requests: [{ id: 8, status: 'rejected', released: true }] }));
+    expect(await f.run()).toMatchObject({ reason: 'rerun', exitCode: 0 });
+    expect(f.shared()).toMatchObject({ card: { filed: true }, requests: [
+      { id: 0, status: 'rejected', released: true }, { id: 1, status: 'confirmed' },
+    ] });
+  });
+
+  it('rechecks canonical budget under the lock rather than trusting an empty legacy read', async () => {
+    const f = fixture();
+    writeFileSync(f.sharedPath, JSON.stringify({ version: 1,
+      evidence: { repo: 'web-everything/web-everything', pr: 42, head: HEAD }, requests: [{ status: 'pending' }] }));
+    expect(await f.run()).toMatchObject({ reason: 'shared-rerun-budget', exitCode: 3 });
+    expect(f.posts).toEqual([]);
+  });
+
+  it('refuses corrupt canonical shared state before POSTs', async () => {
+    const f = fixture(); writeFileSync(f.sharedPath, '{');
+    expect(await f.run()).toMatchObject({ reason: 'shared-rerun-budget', exitCode: 3 });
+    expect(f.posts).toEqual([]);
+  });
+
+  it.each(['failure', 'timed_out', 'action_required', 'neutral', null, 'unknown'])(
+    'refuses completion with conclusion %s after cancellation and releases shared reservation', async conclusion => {
+      const f = fixture(); f.conclusion = conclusion;
+      expect(await f.run()).toMatchObject({ reason: 'run-failed-on-cancel', exitCode: 4 });
+      expect(f.posts).toEqual(['cancel']);
+      expect(f.shared().requests).toEqual([expect.objectContaining({ status: 'rejected', released: true })]);
+    });
+
+  it.each(['success', 'cancelled'])('reruns after cancellation completes with %s', async conclusion => {
+    const f = fixture(); f.conclusion = conclusion;
+    expect(await f.run()).toMatchObject({ reason: 'rerun', exitCode: 0 });
+    expect(f.shared().requests[0].status).toBe('confirmed');
+  });
+
+  it('releases shared budget when cancellation cannot be confirmed', async () => {
+    const f = fixture(); f.statuses = ['in_progress'];
+    expect(await f.run()).toMatchObject({ reason: 'cancel-unconfirmed', exitCode: 4 });
+    expect(f.posts).toEqual(['cancel', 'force-cancel']);
+    expect(f.shared().requests[0]).toMatchObject({ status: 'rejected', released: true });
+  });
+
+  it('releases shared budget when local reservation fails before any POST', async () => {
+    const f = fixture(); f.state.append = () => { throw new Error('disk full'); };
+    expect(await f.run()).toMatchObject({ reason: 'audit-unwritable', exitCode: 4 });
+    expect(f.posts).toEqual([]);
+    expect(f.shared().requests[0]).toMatchObject({ status: 'rejected', released: true });
+  });
+
+  it('leaves ambiguous rerun POST pending and refuses a caller with an independent local ledger', async () => {
+    const f = fixture(); const gh = f.gh;
+    f.deps.gh = async args => {
+      if (args[1].endsWith('/rerun')) throw new Error('connection lost');
+      return gh(args);
+    };
+    expect(await f.run()).toMatchObject({ reason: 'evidence-or-state-unreadable', exitCode: 4 });
+    expect(f.shared().requests[0]).toMatchObject({ status: 'pending' });
+    expect(f.shared().requests[0]).not.toHaveProperty('released');
+    f.rows.length = 0;
+    expect(await f.run()).toMatchObject({ reason: 'shared-rerun-budget', exitCode: 3 });
+    expect(f.posts).toEqual(['cancel']);
   });
 
   it('refuses a job detail that no longer links to the selected check', async () => {
@@ -330,15 +427,14 @@ describe('ghost recovery', () => {
     expect(f.posts).toEqual([]);
   });
 
-  it('retains the window cap with maxPerHead=2 and refuses a third lifetime attempt', async () => {
+  it('retains the window cap with maxPerHead=2 and refuses a second shared attempt after expiry', async () => {
     const f = fixture(); f.deps.settings = { ...settings, maxPerHead: 2 };
     expect((await f.run()).reason).toBe('rerun');
     expect((await f.run()).reason).toBe('rate-capped');
     f.now += 3 * 3_600_000;
-    expect((await f.run()).reason).toBe('rerun');
-    f.now += 3 * 3_600_000;
-    expect((await f.run()).reason).toBe('rate-capped');
-    expect(f.rows.filter(row => row.counted)).toHaveLength(2);
+    expect((await f.run()).reason).toBe('shared-rerun-budget');
+    expect(f.rows.filter(row => row.counted)).toHaveLength(1);
+    expect(f.posts).toEqual(['cancel', 'rerun']);
   });
 
   it('force-cancels after a bounded wait, and confirms completion before rerun', async () => {
@@ -424,7 +520,7 @@ describe('ghost recovery', () => {
 
   it('refuses unreadable state and writes a refusal audit without posting', async () => {
     const f = fixture(); f.state.read = () => { throw new Error('broken JSONL'); };
-    expect((await f.run()).reason).toBe('evidence-or-state-unreadable');
+    expect((await f.run()).reason).toBe('state-unreadable');
     expect(f.posts).toEqual([]);
     expect(f.rows.at(-1).counted).toBe(false);
   });
@@ -505,6 +601,19 @@ describe('JSONL store with fake filesystem', () => {
   it.each(['not json', '{}', '{"ts":"bad","outcome":"attempt","counted":true}'])('fails closed on corrupt persisted evidence %s', text => {
     const f = store(); f.setText(text);
     expect(() => f.state.read()).toThrow();
+  });
+
+  it.each([
+    { head: { sha: HEAD } }, { head: 'bad' }, { head: HEAD + '\n' }, { head: 123 },
+    { repo: {} }, { repo: '' }, { repo: ' ' }, { pr: 0 }, { pr: '42' }, { pr: 1.5 },
+  ])('throws for malformed counted ledger identity %j and refuses the entire operation', async identity => {
+    const persisted = store();
+    persisted.setText(JSON.stringify({ ts: new Date(NOW).toISOString(), outcome: 'attempt', counted: true,
+      repo: 'web-everything/web-everything', pr: 42, head: HEAD, ...identity }) + '\n');
+    expect(() => persisted.state.read()).toThrow('state unreadable');
+    const f = fixture(); f.deps.state = persisted.state;
+    expect(await f.run()).toMatchObject({ reason: 'state-unreadable', exitCode: 4 });
+    expect(f.posts).toEqual([]);
   });
 
   it('refuses oversized state with explicit archive-before-retry fallback', () => {
