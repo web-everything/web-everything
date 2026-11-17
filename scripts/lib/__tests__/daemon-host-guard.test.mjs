@@ -522,6 +522,9 @@ describe('overlapping cache persistence after handoff', () => {
     const started = deferred();
     const f = failedWriteFixture({ status: 'ok', owner: OTHER });
     const snapshot = cache({ readAt: phase === 'cache' ? NOW : NOW - 120000 });
+    // The remote phase needs stale evidence to reach readRemote; subsequent cache
+    // reads must still see the handoff persisted through f.store.
+    f.store(snapshot);
     const old = resolveHostRole({ ...f.options, atStart: false,
       ...(phase === 'remote' ? { state: {} } : {}),
       readCache: () => {
