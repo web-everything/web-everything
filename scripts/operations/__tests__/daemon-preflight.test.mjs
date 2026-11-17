@@ -5,13 +5,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
+import { getThisHost, LEGACY_OWNER_VALUES } from '../../lib/daemon-host-guard.mjs';
 import { runPreflight, formatPreflight, clean, cliIO, main } from '../daemon-preflight.mjs';
 
+const ME = '11111111-1111-4111-8111-111111111111';
+const OTHER = '22222222-2222-4222-8222-222222222222';
+const VERSION = 'a'.repeat(40);
 const NOW = 1_800_000_000_000;
 const ENV = Object.freeze({ DAEMON_KEY: 'fixture/key', SECOND_KEY: 'fixture/second-key' });
 const SHA = 'a'.repeat(40);
 const NAMES = [
-  'role', 'cache-lock', 'tool:node', 'tool:claude', 'tool:gh', 'tool:codex',
+  'role', 'tool:node', 'tool:claude', 'tool:gh', 'tool:codex',
   'keyfile:DAEMON_KEY', 'keyfile:SECOND_KEY',
   'clone-head:fixture/clone-a', 'clone-head:fixture/clone-b',
   'platform-preferences', 'ssh:forge',
@@ -21,7 +25,6 @@ function fixture(overrides = {}) {
   const calls = [];
   const members = {
     resolveRole: () => ({ role: 'active', reason: 'fresh-owner-is-this-host', source: 'remote' }),
-    cacheLock: () => ({ ok: true, detail: 'no retained lock' }),
     which: () => true,
     keyFiles: (env) => [
       { name: 'DAEMON_KEY', path: env.DAEMON_KEY },
@@ -43,7 +46,7 @@ function fixture(overrides = {}) {
   return { io, calls };
 }
 
-const run = (io) => runPreflight({ thisHost: 'daemon-a', io, env: ENV, now: NOW });
+const run = (io) => runPreflight({ thisHost: ME, io, env: ENV, now: NOW });
 
 describe('daemon preflight read-only checks', () => {
   it('every preflight check passes in the specified order through injected IO', async () => {
@@ -99,7 +102,6 @@ describe('daemon preflight read-only checks', () => {
 
   it.each([
     ['resolveRole', 'role'],
-    ['cacheLock', 'cache-lock'],
     ['which', 'tool:node', 'node'], ['which', 'tool:claude', 'claude'],
     ['which', 'tool:gh', 'gh'], ['which', 'tool:codex', 'codex'],
     ['statFile', 'keyfile:DAEMON_KEY', ENV.DAEMON_KEY],
@@ -129,7 +131,7 @@ describe('daemon preflight read-only checks', () => {
     const result = await run(io);
     expect(result.ok).toBe(true);
     expect(result.checks.map(({ name }) => name)).toEqual([
-      'role', 'cache-lock', 'tool:node', 'tool:claude', 'tool:gh', 'tool:codex', 'platform-preferences', 'ssh:forge',
+      'role', 'tool:node', 'tool:claude', 'tool:gh', 'tool:codex', 'platform-preferences', 'ssh:forge',
     ]);
   });
 
@@ -137,7 +139,7 @@ describe('daemon preflight read-only checks', () => {
     const { io, calls } = fixture();
     await run(io);
     expect([...new Set(calls.map(({ name }) => name))].sort()).toEqual([
-      'cacheLock', 'cloneDirs', 'keyFiles', 'parsePreferences', 'readHead', 'resolveRole', 'sshForge', 'statFile', 'which',
+      'cloneDirs', 'keyFiles', 'parsePreferences', 'readHead', 'resolveRole', 'sshForge', 'statFile', 'which',
     ]);
     expect(calls.some(({ name }) => /write|mkdir|append|unlink|rename|readFile/i.test(name))).toBe(false);
   });
@@ -234,7 +236,7 @@ describe('preflight CLI IO hooks', () => {
         const adapter = cliIO(env);
         const { io, calls } = fixture({ cloneDirs: adapter.cloneDirs, readHead: () => SHA });
         const lines = [];
-        expect(await main({ thisHost: 'daemon-a', env, now: NOW, io, log: (line) => lines.push(line) })).toBe(1);
+        expect(await main({ thisHost: ME, env, now: NOW, io, log: (line) => lines.push(line) })).toBe(1);
         expect(lines[0]).toMatch(/FAIL clone-dirs /);
         expect(lines[0]).toContain(overlays);
         expect(lines[0]).toContain('ok   ssh:forge status=0');
@@ -295,100 +297,74 @@ describe('preflight CLI IO hooks', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it('cliIO.resolveRole uses atStart and maps a remote error to source remote-failed', async () => {
+  it('cliIO.resolveRole reads every time and maps source errors to remote-failed', async () => {
     const root = mkdtempSync(join(tmpdir(), 'preflight-role-'));
     try {
       const env = { HOME: root, PATH: '', XDG_CACHE_HOME: root };
       let remote;
       let reads = 0;
       const io = cliIO(env, {
-        readOwnerRemote: () => { reads += 1; return remote; },
+        source: { readOwner: () => { reads += 1; return remote; } },
         spawnSync: () => { throw new Error('unexpected spawn'); },
         execFileSync: () => { throw new Error('unexpected exec'); },
         daemonCloneRoots: () => [],
       });
       const cases = [
-        [{ status: 'ok', owner: 'daemon-a' }, 'active', 'fresh-owner-is-this-host', 'remote'],
-        [{ status: 'ok', owner: 'daemon-b' }, 'standby', 'owner-is-other-host', 'remote'],
-        [{ status: 'unset' }, 'standby', 'owner-unset', 'remote'],
+        [{ host: ME, version: VERSION }, 'active', 'fresh-owner-is-this-host', 'remote'],
+        [{ host: OTHER, version: VERSION }, 'standby', 'owner-is-other-host', 'remote'],
+        [{ host: '', version: VERSION }, 'standby', 'owner-unset', 'remote'],
         [{ status: 'error', error: 'offline' }, 'standby', 'owner-unreadable', 'remote-failed'],
       ];
       for (const [response, role, reason, source] of cases) {
         remote = response;
         // Repeated calls at the same timestamp must still obtain startup evidence.
-        expect(await io.resolveRole({ thisHost: 'daemon-a', now: NOW })).toEqual({ role, reason, source });
+        expect(await io.resolveRole({ thisHost: ME, now: NOW })).toEqual({ role, reason, source });
       }
       expect(reads).toBe(cases.length);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it('cliIO.resolveRole performs no default cache IO, with a cache-using positive control', () => {
-    const root = mkdtempSync(join(tmpdir(), 'preflight-no-cache-'));
+  it.each(['missing', 'present'])('main reads %s identity without provisioning or changing files', async (state) => {
+    const root = mkdtempSync(join(tmpdir(), 'preflight-identity-'));
     try {
-      const output = execFileSync(process.execPath, ['--input-type=module', '-e', `
-        import fs from 'node:fs';
-        import { syncBuiltinESMExports } from 'node:module';
-        import { homedir } from 'node:os';
-        import { cliIO } from ${JSON.stringify(new URL('../daemon-preflight.mjs', import.meta.url).href)};
-        import { defaultCachePath, resolveHostRole } from ${JSON.stringify(new URL('../../lib/daemon-host-guard.mjs', import.meta.url).href)};
-        const effects = [];
-        const prefix = defaultCachePath().slice(0, -'cache.json'.length);
-        for (const name of ['readFileSync', 'writeFileSync', 'mkdirSync', 'renameSync', 'unlinkSync', 'existsSync', 'rmdirSync']) {
-          const original = fs[name];
-          fs[name] = (...args) => {
-            if (String(args[0]).startsWith(prefix)) effects.push(name);
-            return original(...args);
-          };
-        }
-        syncBuiltinESMExports();
-        const responses = [{ status: 'ok', owner: 'daemon-a' }, { status: 'unset' }, { status: 'error' }];
-        for (const remote of responses) {
-          await cliIO(process.env, { readOwnerRemote: () => remote }).resolveRole({ thisHost: 'daemon-a', now: ${NOW} });
-        }
-        const actual = effects.splice(0);
-        // Substituting the cache-using resolver must trip these same real IO hooks.
-        await resolveHostRole({ thisHost: 'daemon-a', now: ${NOW}, atStart: true,
-          readRemote: () => responses[0] });
-        console.log(JSON.stringify({ home: homedir(), actual, control: effects }));
-      `], { env: { ...process.env, HOME: root }, encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024 });
-      const result = JSON.parse(output);
-      expect(result.home).toBe(root);
-      expect(result.actual).toEqual([]);
-      expect(result.control).toContain('readFileSync');
-      expect(result.control).toContain('writeFileSync');
+      const id = state === 'present' ? getThisHost({ home: root }) : ME;
+      const adapter = cliIO({ HOME: root }, { source: { readOwner: () => ({ host: id, version: VERSION }) } });
+      const before = readdirSync(root);
+      const { io } = fixture({ resolveRole: adapter.resolveRole });
+      const lines = [];
+      expect(await main({ env: { HOME: root }, io, log: (line) => lines.push(line) })).toBe(state === 'present' ? 0 : 1);
+      expect(lines[0]).toContain(state === 'present' ? 'role=active' : 'role=standby reason=invalid-input');
+      expect(readdirSync(root)).toEqual(before);
+      if (state === 'present') {
+        expect(readdirSync(join(root, '.claude'))).toEqual(['host-id']);
+        expect(readFileSync(join(root, '.claude', 'host-id'), 'utf8')).toBe(id + '\n');
+      }
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it.each(['absent', 'retained', 'unreadable', 'ready', 'revoked'])('cache-lock check reports %s state through main without changing it', async (state) => {
-    const root = mkdtempSync(join(tmpdir(), 'preflight-lock-'));
-    const guard = join(root, '.claude', 'daemon-host-guard');
-    const lock = join(guard, 'cache.json.lock');
-    try {
-      mkdirSync(join(root, '.claude'));
-      if (state === 'unreadable') writeFileSync(guard, 'not a directory');
-      else if (state === 'retained') mkdirSync(lock, { recursive: true });
-      else if (state === 'ready' || state === 'revoked') {
-        mkdirSync(guard);
-        writeFileSync(`${lock}.fence`, state === 'ready' ? 'ready\n' : '');
-      }
-      const allowed = state === 'absent' || state === 'ready';
-      const adapter = cliIO({ HOME: root });
-      const { io } = fixture({ cacheLock: () => adapter.cacheLock() });
-      const lines = [];
-      expect(await main({ thisHost: 'daemon-a', env: ENV, io, now: NOW, log: (line) => lines.push(line) }))
-        .toBe(allowed ? 0 : 1);
-      expect(lines[0]).toContain(`${allowed ? 'ok  ' : 'FAIL'} cache-lock `);
-      expect(lines[0]).toContain('ok   ssh:forge status=0');
-      if (state === 'retained') {
-        expect(lines[0]).toContain(lock);
-        expect(lines[0]).toMatch(/stop.*writers.*inspect/i);
-        expect(readdirSync(lock)).toEqual([]);
-      }
-      if (state === 'ready' || state === 'revoked') {
-        expect(readFileSync(`${lock}.fence`, 'utf8')).toBe(state === 'ready' ? 'ready\n' : '');
-        if (state === 'revoked') expect(lines[0]).toContain(`${lock}.fence`);
-      }
-    } finally { rmSync(root, { recursive: true, force: true }); }
+  it('preflight supports migration aliases through the same resolver', async () => {
+    for (const alias of LEGACY_OWNER_VALUES) {
+      const io = cliIO({}, { source: { readOwner: () => ({ host: alias, version: VERSION }) }, legacyHost: alias });
+      expect((await io.resolveRole({ thisHost: ME })).role).toBe('active');
+    }
+  });
+
+  it('default source wires bounded GitHub reads and pinned contents into preflight', async () => {
+    const calls = [];
+    const adapter = cliIO(ENV, { execFileSync: (...args) => {
+      calls.push(args);
+      return JSON.stringify(calls.length === 1 ? { object: { type: 'commit', sha: VERSION } }
+        : { type: 'file', encoding: 'base64', content: Buffer.from(ME + '\n').toString('base64') });
+    } });
+    const { io } = fixture({ resolveRole: adapter.resolveRole });
+    expect((await run(io)).checks[0]).toEqual({ name: 'role', ok: true, detail: 'role=active reason=fresh-owner-is-this-host' });
+    expect(calls).toHaveLength(2);
+    expect(calls[1][1][1]).toContain('/contents/host?ref=' + VERSION);
+    for (const [command, args, options] of calls) {
+      expect(command).toBe('gh');
+      expect(args[0]).toBe('api');
+      expect(options).toMatchObject({ env: ENV, timeout: 15000, maxBuffer: 1024 * 1024 });
+    }
   });
 
   it('cliIO.which finds executables on PATH and rejects directories and non-executables', () => {
@@ -426,13 +402,13 @@ describe('preflight CLI IO hooks', () => {
 
 describe('preflight main', () => {
   it.each(['returned', 'thrown'])('main fails unreadable ownership (%s error) and continues remaining checks', async (kind) => {
-    const adapter = cliIO({}, { readOwnerRemote: () => {
+    const adapter = cliIO({}, { source: { readOwner: () => {
       if (kind === 'thrown') throw new Error('offline');
       return { status: 'error', error: 'offline' };
-    } });
+    } } });
     const { io, calls } = fixture({ resolveRole: adapter.resolveRole });
     const lines = [];
-    expect(await main({ thisHost: 'daemon-a', env: ENV, now: NOW, io, log: (line) => lines.push(line) })).toBe(1);
+    expect(await main({ thisHost: ME, env: ENV, now: NOW, io, log: (line) => lines.push(line) })).toBe(1);
     expect(lines[0]).toContain('FAIL role role=standby reason=owner-unreadable');
     expect(lines[0].split('\n').filter((line) => line.startsWith('FAIL'))).toHaveLength(1);
     expect(lines[0]).toContain('ok   tool:node node');
@@ -444,7 +420,7 @@ describe('preflight main', () => {
     for (const passes of [false, true]) {
       const { io } = fixture({ which: (tool) => passes || tool !== 'gh' });
       const lines = [];
-      const exitCode = await main({ thisHost: 'daemon-a', env: ENV, now: NOW, io, log: (line) => lines.push(line) });
+      const exitCode = await main({ thisHost: ME, env: ENV, now: NOW, io, log: (line) => lines.push(line) });
       expect(exitCode).toBe(passes ? 0 : 1);
       expect(lines).toHaveLength(1);
       expect(lines[0]).toBe(formatPreflight(await run(io)));
