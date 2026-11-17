@@ -14,6 +14,8 @@ import { rebuildLeaseStaleMs } from './daemon-rebuild/lease.mjs';
 
 // Retain only failed releases; a later acquire by this process retries them under the state lock.
 const failedTickets = new Set();
+// Opt-in nested previews retain a process-local holder until every borrower finishes.
+const activeSlots = new Map();
 
 const positive = value => Number.isSafeInteger(value) && value > 0;
 // The queue-wait ceiling never collapses to 0: a short rebuild lease must still allow a capacity check.
@@ -88,11 +90,13 @@ function readState(path) {
  * Corrupt/unreadable state fails closed. Dead lock owners are reclaimed immediately; missing owners
  * get a 60s grace period. A crash cannot expose a partially written state file. Queue expiry fails closed.
  * Optional onWait is awaited outside the slot lock on every occupied queue poll.
+ * reuseHeldByProcess opts a nested preview into retaining an existing in-process holder (same state dir/PID).
+ * Other callers keep independent FIFO tickets; retained capacity ends only after every reference releases.
  */
 export async function acquireSmokeSlot({
   env = process.env, log = console,
   stateDir = env.WE_DAEMON_SMOKE_STATE_DIR || join(homedir(), '.claude', 'daemon-self-sync-state'),
-  pid = process.pid, isAlive = processAlive, now = Date.now, sleep = setTimeout, onWait,
+  pid = process.pid, isAlive = processAlive, now = Date.now, sleep = setTimeout, onWait, reuseHeldByProcess = false,
 } = {}) {
   if (!positive(pid)) throw new Error('daemon-live-smoke: invalid slot pid');
   const cap = setting(env, log, 'smokeMaxConcurrent', 'WE_DAEMON_SMOKE_MAX_CONCURRENT', 2);
@@ -104,6 +108,19 @@ export async function acquireSmokeSlot({
   mkdirSync(stateDir, { recursive: true });
   const path = resolve(stateDir, 'smoke-slots.json');
   const lock = join(stateDir, 'smoke-slots.lock');
+  const holderKey = `${path}:${pid}`;
+  const retain = (holder) => {
+    holder.refs++;
+    let done = false;
+    return { acquired: true, release: async () => {
+      if (!done) { done = true; holder.refs--; }
+      if (holder.refs === 0) {
+        if (activeSlots.get(holderKey) === holder) activeSlots.delete(holderKey);
+        await holder.release();
+      }
+    } };
+  };
+  if (reuseHeldByProcess && activeSlots.has(holderKey)) return retain(activeSlots.get(holderKey));
   async function transaction(update, until = Infinity) {
     const started = now();
     const token = `owner-${randomUUID()}`;
@@ -253,7 +270,11 @@ export async function acquireSmokeSlot({
         return index;
       }, deadline);
       ticket = claimed;
-      if (ahead === null) return { acquired: true, release };
+      if (ahead === null) {
+        const holder = { refs: 0, release };
+        activeSlots.set(holderKey, holder);
+        return retain(holder);
+      }
       if (ahead !== lastAhead) log.error?.(`daemon-live-smoke: smoke-queued (${ahead} ahead)`);
       lastAhead = ahead;
       await onWait?.();

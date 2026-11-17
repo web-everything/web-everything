@@ -7,7 +7,7 @@ import { makeGit, verifyRev, FULL_SHA_RE, OVERLAY_EDGE_RESOLVE_ENV } from './sha
 import { findUnsafeLocalState, knownInputsOf } from './local-state.mjs';
 import { overlayFilePath, readOverlayState } from '../daemon-overlays.mjs';
 import { readRebuildState } from './state.mjs';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { join, isAbsolute, resolve as resolvePath, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -15,7 +15,21 @@ import { fetchMainAndOverlays, defaultPrState } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
 import { makeAuditedTipGate } from './audited-tip.mjs';
 import { isSafeBranchName } from '../daemon-self-sync.mjs';
+import { fileURLToPath } from 'node:url';
+import { acquireSmokeSlot } from '../daemon-smoke-slots.mjs';
+import { cascadePolicy } from '../policy-cascade.mjs';
 import { resolveOverlayConflict } from './overlay-strategies.mjs';
+
+const SETTINGS = resolvePath(dirname(fileURLToPath(import.meta.url)), '..', 'daemon-rebuild-settings.json');
+export function dryRunHoldsSmokeSlot({ env = process.env, log = console } = {}) {
+  let tool;
+  try { tool = JSON.parse(readFileSync(SETTINGS, 'utf8')).dryRunHoldsSmokeSlot; } catch { /* default holds */ }
+  const raw = env.WE_DAEMON_DRY_RUN_HOLDS_SMOKE_SLOT;
+  return cascadePolicy('dryRunHoldsSmokeSlot', tool, {
+    env, log: line => log.info?.(line), standard: true, valid: value => typeof value === 'boolean',
+    envValues: { '': raw === '0' ? false : raw === '1' ? true : undefined },
+  }).value !== false;
+}
 
 // ── dryRunRebuild — STRICTLY read-only on `root` ────────────────────────────────────────────────────────────
 
@@ -29,105 +43,129 @@ import { resolveOverlayConflict } from './overlay-strategies.mjs';
  * written to the overlay state file, only fed into this one `planRebuild` call, so a preview of "what if I
  * registered this ref too" (`daemon-load-overlay.mjs --dry-run`) never mutates anything on disk.
  * @param {{root:string, env?:NodeJS.ProcessEnv, prState?:(pr:number)=>(Promise<string|null>|string|null),
- *   originUrl?:string, run?:typeof gitRun, extraOverlays?:Array<{ref:string, pr?:number|null}>}} o
+ *   originUrl?:string, run?:typeof gitRun, extraOverlays?:Array<{ref:string, pr?:number|null}>,
+ *   log?:object, now?:()=>number, sleep?:Function, acquireSlot?:typeof acquireSmokeSlot}} o
  * @returns {Promise<{dryRun:true, head:string|null, onMain:boolean|null, unsafe:object, plan:object,
  *   wouldDo:'nothing'|'nothing (still-rejected)'|'rebuild-and-smoke'|'hold (established-overlay-conflict)'|'refuse', overlayFile:string,
  *   overlays:Array<object>, overlayStateCorrupt:boolean, state:object, stillRejected:boolean}>}
  */
 export async function dryRunRebuild({
   root, env = process.env, prState, originUrl, run = gitRun, extraOverlays = [],
+  log = console, now = Date.now, sleep, acquireSlot = acquireSmokeSlot,
 } = {}) {
-  const rootGit = makeGit({ run, cwd: root, env, extraEnv: { GIT_OPTIONAL_LOCKS: '0' } });
-
-  const head = verifyRev(rootGit, 'HEAD');
-  const headRef = rootGit(['symbolic-ref', '--short', 'HEAD']);
-  const onMain = headRef.status === 0 ? String(headRef.stdout ?? '').trim() === 'main' : null;
-  const state = readRebuildState(root, env);
-  // Match prepareRebuild: adopted inputs remain safe after their remote tips are rewritten or deleted.
-  const unsafe = findUnsafeLocalState({ git: rootGit, knownInputs: knownInputsOf(state) });
-
-  const overlayFile = overlayFilePath(root, env);
-  const overlayState = readOverlayState(root, { env });
-  const overlayStateCorrupt = overlayState.corrupt;
-  const overlays = overlayState.overlays.concat(extraOverlays);
-
-  let url = originUrl;
-  if (!url) {
-    const urlRes = rootGit(['remote', 'get-url', 'origin']);
-    url = urlRes.status === 0 ? String(urlRes.stdout ?? '').trim() : null;
-  }
-
-  let scratchDir = null;
-  let plan = { ok: false, reason: 'no-origin-url' };
-  let untrackedCollision = [];
+  const holdsSlot = dryRunHoldsSmokeSlot({ env, log });
+  const slot = holdsSlot
+    ? await acquireSlot({ env, log, now, sleep, reuseHeldByProcess: true }) : null;
   try {
-    if (url && head) {
-      scratchDir = mkdtempSync(join(tmpdir(), 'we-daemon-rebuild-dryrun-'));
-      const init = spawnSync('git', ['init', '--bare', '-q', scratchDir], {
-        encoding: 'utf8', timeout: 60_000, killSignal: 'SIGKILL',
-      });
-      if (init.status !== 0) {
-        plan = { ok: false, reason: 'scratch-init-failed' };
-      } else {
-        const gitCommonRes = rootGit(['rev-parse', '--git-common-dir']);
-        const gitCommonRaw = gitCommonRes.status === 0 ? String(gitCommonRes.stdout ?? '').trim() : null;
-        const gitCommonDir = gitCommonRaw
-          ? (isAbsolute(gitCommonRaw) ? gitCommonRaw : resolvePath(root, gitCommonRaw))
-          : null;
-        if (!gitCommonDir) {
-          plan = { ok: false, reason: 'git-common-dir-failed' };
-        } else {
-          const alternatesFile = join(scratchDir, 'objects', 'info', 'alternates');
-          mkdirSync(dirname(alternatesFile), { recursive: true });
-          writeFileSync(alternatesFile, `${join(gitCommonDir, 'objects')}\n`, 'utf8');
+    const rootGit = makeGit({ run, cwd: root, env, extraEnv: { GIT_OPTIONAL_LOCKS: '0' } });
 
-          const scratchGit = makeGit({ run, cwd: scratchDir, env });
-          scratchGit(['remote', 'add', 'origin', url]);
-          fetchMainAndOverlays({ git: scratchGit, overlays, edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0' });
+    const head = verifyRev(rootGit, 'HEAD');
+    const headRef = rootGit(['symbolic-ref', '--short', 'HEAD']);
+    const onMain = headRef.status === 0 ? String(headRef.stdout ?? '').trim() === 'main' : null;
+    const state = readRebuildState(root, env);
+    // Match prepareRebuild: adopted inputs remain safe after their remote tips are rewritten or deleted.
+    const unsafe = findUnsafeLocalState({ git: rootGit, knownInputs: knownInputsOf(state) });
 
-          plan = await planRebuild({
-            auditedTip: makeAuditedTipGate(env),
-            git: scratchGit,
-            headSha: head,
-            mainRef: 'origin/main',
-            overlays,
-            prState: prState || ((pr) => defaultPrState({ pr, root })),
-            mainOnly: false,
-            edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
-          });
+    const overlayFile = overlayFilePath(root, env);
+    const overlayState = readOverlayState(root, { env });
+    const overlayStateCorrupt = overlayState.corrupt;
+    const overlays = overlayState.overlays.concat(extraOverlays);
 
-          // Same untracked-collision check `doRebuild` runs before its real `reset --hard` (see
-          // findUnsafeLocalState's header) — computed here against the scratch repo, which shares `root`'s
-          // objects via the alternates file above, so `cat-file -e <finalSha>:<path>` needs no extra fetch.
-          if (plan.ok && unsafe.untracked.length > 0) {
-            untrackedCollision = unsafe.untracked.filter(
-              (p) => scratchGit(['cat-file', '-e', `${plan.finalSha}:${p}`]).status === 0,
-            );
-          }
-        }
-      }
+    let url = originUrl;
+    if (!url) {
+      const urlRes = rootGit(['remote', 'get-url', 'origin']);
+      url = urlRes.status === 0 ? String(urlRes.stdout ?? '').trim() : null;
     }
+
+    let scratchDir = null;
+    let plan = { ok: false, reason: 'no-origin-url' };
+    let untrackedCollision = [];
+    try {
+      if (holdsSlot && slot?.acquired !== true) plan = { ok: false, reason: 'smoke-queue-timeout' };
+      else if (url && head) {
+        const objectDbStarted = now();
+        let objectDbLogged = false;
+        const logObjectDb = () => {
+          if (!objectDbLogged) log.info?.(`daemon-rebuild: dry-run step=object-db ms=${Math.max(0, now() - objectDbStarted)}`);
+          objectDbLogged = true;
+        };
+        try {
+          scratchDir = mkdtempSync(join(tmpdir(), 'we-daemon-rebuild-dryrun-'));
+          const init = spawnSync('git', ['init', '--bare', '-q', scratchDir], {
+            encoding: 'utf8', timeout: 60_000, killSignal: 'SIGKILL',
+          });
+          if (init.status !== 0) {
+            plan = { ok: false, reason: 'scratch-init-failed' };
+          } else {
+            const gitCommonRes = rootGit(['rev-parse', '--git-common-dir']);
+            const gitCommonRaw = gitCommonRes.status === 0 ? String(gitCommonRes.stdout ?? '').trim() : null;
+            const gitCommonDir = gitCommonRaw
+              ? (isAbsolute(gitCommonRaw) ? gitCommonRaw : resolvePath(root, gitCommonRaw))
+              : null;
+            if (!gitCommonDir) {
+              plan = { ok: false, reason: 'git-common-dir-failed' };
+            } else {
+              const alternatesFile = join(scratchDir, 'objects', 'info', 'alternates');
+              mkdirSync(dirname(alternatesFile), { recursive: true });
+              writeFileSync(alternatesFile, `${join(gitCommonDir, 'objects')}\n`, 'utf8');
+
+              const scratchGit = makeGit({ run, cwd: scratchDir, env });
+              scratchGit(['remote', 'add', 'origin', url]);
+              fetchMainAndOverlays({ git: scratchGit, overlays, edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0' });
+
+              logObjectDb();
+              const overlayStarted = now();
+              try {
+                plan = await planRebuild({
+                  auditedTip: makeAuditedTipGate(env),
+                  git: scratchGit,
+                  headSha: head,
+                  mainRef: 'origin/main',
+                  overlays,
+                  prState: prState || ((pr) => defaultPrState({ pr, root })),
+                  mainOnly: false,
+                  edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
+                });
+              } finally {
+                log.info?.(`daemon-rebuild: dry-run step=overlay-merge ms=${Math.max(0, now() - overlayStarted)}`);
+              }
+
+              // Same untracked-collision check `doRebuild` runs before its real `reset --hard` (see
+              // findUnsafeLocalState's header) — computed here against the scratch repo, which shares `root`'s
+              // objects via the alternates file above, so `cat-file -e <finalSha>:<path>` needs no extra fetch.
+              if (plan.ok && unsafe.untracked.length > 0) {
+                untrackedCollision = unsafe.untracked.filter(
+                  (p) => scratchGit(['cat-file', '-e', `${plan.finalSha}:${p}`]).status === 0,
+                );
+              }
+            }
+          }
+        } finally { logObjectDb(); }
+      }
+    } finally {
+      if (scratchDir) rmSync(scratchDir, { recursive: true, force: true });
+    }
+
+    const retryDue = Number.isFinite(Date.parse(state.rejected?.retryAt || '')) && now() >= Date.parse(state.rejected.retryAt);
+    const stillRejected = !!(plan.ok && state.rejected?.inputsKey === plan.inputsKey && !retryDue);
+
+    let wouldDo = 'refuse';
+    if (unsafe.safe && onMain === true && plan.ok) {
+      if (untrackedCollision.length > 0 || overlayStateCorrupt) wouldDo = 'refuse'; // mirrors doRebuild's refusals
+      // x9diisp — mirrors prepareRebuild: a plan that would lose overlays the running build carries is HELD, not built.
+      else if (plan.establishedLost?.length > 0) wouldDo = 'hold (established-overlay-conflict)';
+      else if (plan.finalSha === head) wouldDo = 'nothing';
+      else if (stillRejected) wouldDo = 'nothing (still-rejected)';
+      else wouldDo = 'rebuild-and-smoke';
+    }
+
+    return {
+      dryRun: true, head, onMain, unsafe, plan, wouldDo, overlayFile, overlays, overlayStateCorrupt, state,
+      stillRejected, untrackedCollision,
+    };
   } finally {
-    if (scratchDir) rmSync(scratchDir, { recursive: true, force: true });
+    await slot?.release();
   }
-
-  const retryDue = Number.isFinite(Date.parse(state.rejected?.retryAt || '')) && Date.now() >= Date.parse(state.rejected.retryAt);
-  const stillRejected = !!(plan.ok && state.rejected?.inputsKey === plan.inputsKey && !retryDue);
-
-  let wouldDo = 'refuse';
-  if (unsafe.safe && onMain === true && plan.ok) {
-    if (untrackedCollision.length > 0 || overlayStateCorrupt) wouldDo = 'refuse'; // mirrors doRebuild's refusals
-    // x9diisp — mirrors prepareRebuild: a plan that would lose overlays the running build carries is HELD, not built.
-    else if (plan.establishedLost?.length > 0) wouldDo = 'hold (established-overlay-conflict)';
-    else if (plan.finalSha === head) wouldDo = 'nothing';
-    else if (stillRejected) wouldDo = 'nothing (still-rejected)';
-    else wouldDo = 'rebuild-and-smoke';
-  }
-
-  return {
-    dryRun: true, head, onMain, unsafe, plan, wouldDo, overlayFile, overlays, overlayStateCorrupt, state,
-    stillRejected, untrackedCollision,
-  };
 }
 
 // ── overlay-conflict guard (`scripts/daemon-overlay.mjs add`, epic #3383/#4075) ─────────────────────────────

@@ -47,6 +47,26 @@ async function wake() {
 }
 
 describe('daemon smoke slots', () => {
+  it('nested preview reuses a same-process slot and retains capacity until its last release', async () => {
+    const env = { WE_DAEMON_SMOKE_MAX_CONCURRENT: '1' };
+    const outer = await acquire(11, { env });
+    const preview = await acquire(11, { env, reuseHeldByProcess: true });
+    expect(state().holders).toHaveLength(1);
+    expect(state().waiters).toEqual([]);
+    await outer.release();
+    expect(state().holders).toHaveLength(1);
+    let time = 0;
+    const blocked = await acquire(12, { env: { ...env, WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: '1000' },
+      now: () => time, sleep: async ms => { time += ms; } });
+    expect(blocked.acquired).toBe(false);
+    await preview.release();
+    await preview.release();
+    expect(state().holders).toEqual([]);
+    const next = await acquire(12, { env });
+    expect(next.acquired).toBe(true);
+    await next.release();
+  });
+
   it.each(['unreadable', 'unparseable'])('fails closed to cap 1 when bundled settings are %s', async failure => {
     const read = fs.readFileSync.getMockImplementation();
     fs.readFileSync.mockImplementation((path, ...args) => {
