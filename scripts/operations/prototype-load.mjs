@@ -200,7 +200,8 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
     && findAudit(priorOnly, { ...auditOptions, head: r.head, base: r.base, questionHash: QUESTION_HASH, priorQuestionHashes, now }) === r).map((record) => ({ base: record.base, record }));
   const carriedWeak = [...carried, ...hiddenWeak].filter((d) => d.record.verdict === 'WEAKENED' && !ruled(d.record));
   if (carriedWeak.length) {
-    const ownAt = Math.max(-Infinity, ...own.filter((d) => covered(d.base)).map((d) => Date.parse(text(d.record.at))));
+    // R973: a scoped (invariants) pass is never a re-audit that supersedes a carried open-mode WEAKENED.
+    const ownAt = Math.max(-Infinity, ...own.filter((d) => covered(d.base) && d.record.scope !== 'invariants').map((d) => Date.parse(text(d.record.at))));
     if (carriedWeak.some((d) => !(Date.parse(text(d.record.at)) < ownAt))) return { ok: false, reason: 'weakened' };
   }
   // A pass counts only when covers(base) proves its base is in main; a carried pass must itself hold the fingerprint.

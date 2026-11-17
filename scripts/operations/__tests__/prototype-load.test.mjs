@@ -2437,6 +2437,10 @@ describe('carried evidence precedence (R503 red team)', () => {
     // and the superseded scenario plus a fresh live-head audit also loads
     expect(prototypeLoad.canonicalAuditEvidence([audit({ verdict: 'WEAKENED', at: at(1) }), audit({ at: at(2) }), fresh], SHA, () => true, FP)).toEqual({ ok: true, record: fresh });
   });
+  it('R973: a newer SCOPED pass on the rebased head never supersedes a carried open-mode WEAKENED', () => {
+    const scoped = auditRecord({ at: at(3), scope: 'invariants', invariantsHash: 'c'.repeat(64), followUps: [] });
+    expect(prototypeLoad.canonicalAuditEvidence([audit({ verdict: 'WEAKENED', at: at(1) }), scoped], SHA, () => true, FP)).toEqual({ ok: false, reason: 'weakened' });
+  });
   it('a carried WEAKENED newer than the live head\'s own verdict still blocks', () => {
     expect(prototypeLoad.canonicalAuditEvidence([auditRecord({ at: at(1) }), audit({ verdict: 'WEAKENED', at: at(3) })], SHA, () => true, FP)).toEqual({ ok: false, reason: 'weakened' });
   });
