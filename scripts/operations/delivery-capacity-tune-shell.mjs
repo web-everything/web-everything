@@ -1,16 +1,70 @@
 /** S2 shadow auto-tune IO shell. Bound ONLY in run.mjs: the read-only declaring module must reach no effects (#3036). */
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { resolveDeliveryCapacity } from '../lib/delivery-capacity.mjs';
-import { shadowTune } from '../lib/delivery-capacity-tune.mjs';
+import { execFileSync } from 'node:child_process';
+import { shadowTune, buildResourceRows } from '../lib/delivery-capacity-tune.mjs';
+import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
+import { createAgentActivityReader } from './agent-activity-io.mjs';
+import { collectHeavyQueue } from './heavy-queue-io.mjs';
+import { assessHeavyQueue } from './heavy-queue.mjs';
+import { admissionLockRoot } from '../readiness/heavy-admission.mjs';
 import { resolveCoordinationRoot } from './coordination-root.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { ghRepoSlug, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
+
+const TAIL_BYTES = 2 * 1024 * 1024;
+const tailLines = (io, file) => {
+  const size = io.statSync(file).size;
+  const fd = io.openSync(file, 'r');
+  try {
+    const len = Math.min(size, TAIL_BYTES), buf = Buffer.alloc(len);
+    io.readSync(fd, buf, 0, len, size - len);
+    const lines = buf.toString('utf8').split('\n');
+    return size > len ? lines.slice(1) : lines; // drop the cut first line
+  } finally { io.closeSync(fd); }
+};
+
+/** One read per source per tick (never per PR); each failure marks only its own source unreadable. */
+export function readResourceSources({ coordinationRoot = resolveCoordinationRoot, io = fs, run = execFileSync,
+  readAgents = createAgentActivityReader, heavyQueue = () => assessHeavyQueue(collectHeavyQueue()) } = {}) {
+  const attempt = fn => { try { return { ok: true, ...fn() }; } catch { return { ok: false }; } };
+  const leases = attempt(() => {
+    const status = JSON.parse(run(process.execPath, [fileURLToPath(new URL('../lane-pool.mjs', import.meta.url)), 'status', '--json', '--leased-only'],
+      { encoding: 'utf8', timeout: 60000, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
+    if (!Array.isArray(status?.lanes)) throw new Error('lane status unreadable');
+    return { leases: status.lanes.filter(l => l?.lease).map(l => l.lease), laneCount: status.lanes.length };
+  });
+  return {
+    leases,
+    // The activity reader swallows lease-read errors, so hand it the strict lease read: no silent zero.
+    agents: attempt(() => {
+      if (!leases.ok) throw new Error('leases unreadable');
+      return { rows: readAgents({ readLeases: () => leases.leases })({}).rows };
+    }),
+    heavy: attempt(() => {
+      const dir = admissionLockRoot(process.cwd(), process.env);
+      const records = tailLines(io, path.join(dir, 'durations.jsonl')).flatMap(line => {
+        if (!line.trim()) return [];
+        try { return [JSON.parse(line)]; } catch { throw new Error('malformed duration record'); }
+      });
+      return { records, waitMin: heavyQueue().projectedWaitMinutesForNewJob };
+    }),
+    rebases: attempt(() => ({ events: tailLines(io, path.join(coordinationRoot(), '..', 'logs', 'pr-merge-watch.log')).flatMap(line => {
+      const m = /^(\d{4}-\d\d-\d\dT[\d:.]+Z)\b.*\brebas\w*.*#(\d+)/i.exec(line);
+      return m ? [{ tsMs: Date.parse(m[1]), number: Number(m[2]) }] : [];
+    }) })),
+  };
+}
+
+const readOpenPrsDefault = () => readSharedOpenPrs({ repo: ghRepoSlug(DEFAULT_REPO_KEY), fields: 'number,headRefName' });
 
 /** Bounded IO shell; injected readers make journal and GitHub failures hermetic. */
 export function createDeliveryCapacityTune({
   resolvePolicy = resolveDeliveryCapacity, coordinationRoot = resolveCoordinationRoot,
   io = fs, exec = execFileSyncThrottled, now = Date.now,
+  readOpenPrs = readOpenPrsDefault, readSources = readResourceSources,
 } = {}) {
   return readout => {
     try {
@@ -85,7 +139,13 @@ export function createDeliveryCapacityTune({
           || !result.pageInfo.endCursor || result.pageInfo.endCursor === cursor) return null;
         cursor = result.pageInfo.endCursor;
       }
-      const tuned = shadowTune({ readout, policy, merged, rows, nowMs });
+      // Unreadable PR list or source leaves resources null: the tune then holds (fail closed).
+      let resources = null;
+      try {
+        const openPrs = readOpenPrs();
+        if (Array.isArray(openPrs)) resources = buildResourceRows({ openPrs, nowMs, sources: readSources({ coordinationRoot, io }) }).resources;
+      } catch { resources = null; }
+      const tuned = shadowTune({ readout, policy, merged, rows, nowMs, resources });
       if (!tuned) return null;
       io.mkdirSync(path.dirname(file), { recursive: true });
       io.appendFileSync(file, `${JSON.stringify(tuned.row)}\n`, 'utf8');

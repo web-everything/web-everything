@@ -3,16 +3,21 @@ bornAs: xu8wvf7
 kind: story
 size: 5
 parent: "5452"
-status: open
+status: resolved
 blockedBy: ["4283", "5453"]
 scope: ["we:scripts/conveyor/decider-daemon.mjs", "we:scripts/conveyor/decide.mjs", "we:scripts/conveyor/reconcile-core.mjs", "we:scripts/lib/dispatch-throttle.mjs"]
 dateOpened: "2026-10-08"
+dateStarted: "2026-11-15"
+dateResolved: "2026-11-16"
 tags: []
 ---
 
 # Decider process in shadow: projection, one pure decide per dirty PR across all roles, admission and slots
 
 Rulings E1 and E2, step 2 (E6). One decider process reads the projection, runs one pure decide per dirty PR for every role at once (planReconcile in we:scripts/conveyor/reconcile-core.mjs), runs admission over caps and free slots, and appends action-requested events. No network inside a decision. Ships in shadow: it journals what it would request beside the live sweeps.
+
+Runtime writers are tracked by card #8354 (bornAs `xsj9xu7`, landed with #6889).
+The obsolete `xsj9xu7` duplicate was removed in PR #6891; keep that removal when updating this shadow decider.
 
 ## Acceptance
 

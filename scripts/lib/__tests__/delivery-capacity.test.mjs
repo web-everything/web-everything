@@ -16,7 +16,9 @@ const DEFAULTS = {
     'status:escalated', 'blocked', 'advisory:ruling-needed'],
   autoTune: { mode: 'shadow', everyMin: 60, windowH: 6, minMerges: 10, ttmTargetH: 6,
     backoffFactor: 1.5, roundsTarget: 2.0, increase: 2, decrease: 0.8,
-    minUnits: 12, maxUnits: 48, raiseOnlyIfBinding: true },
+    minUnits: 12, maxUnits: 48, raiseOnlyIfBinding: true,
+    heavyWaitMaxMin: 10, lanesFreeMin: 3, activeHighRatio: 0.6, activeLowRatio: 0.3,
+    sessionUnits: 1, minutesPerUnit: 30, laneUnits: 0.5, rebaseUnits: 0.25 },
   heldWeight: 0, heldCap: 4, heldStaleH: 72, idleMinPct: 15, memMinGb: 4, maxStartsPerCheck: 8,
 };
 const OPEN_HOST = Object.freeze({ idlePct: 22, memGb: 6 });

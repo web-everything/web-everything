@@ -62,7 +62,7 @@
 # <rules>" to the step summary, and exits 0; it changes only the exit code, never a verdict, and never masks a run
 # with no verdict. Shadow until the shared red-main freeze source lands (#4715 flips the repo setting to enforce).
 # The ruleset step (making `merge-gate` required) needs enforce.
-# TRIGGERS: head changes (opened/synchronize/reopened, merge_group) plus the labels the gates read (ready-to-merge,
+# TRIGGERS: head changes (opened/synchronize/reopened, merge_group) plus the labels the gates read (ready-to-merge, gate:refresh — a neutral label the drain toggles after an acceptance restamp so the gate re-reads the thread,
 # review:*). Any other label event is skipped under a DIFFERENT job name (a skipped job counts as passing for a
 # required check, so it must never post as `merge-gate`) and in its own concurrency group (it never cancels a real
 # run). Body edits do not re-run the PR leg; the merge_group run re-evaluates everything before GitHub merges.
@@ -93,13 +93,13 @@ permissions:
   actions: read # readMainCiFact (scripts/merge-gate-check.mjs) lists main's CI runs with `gh run list`
 
 concurrency:
-  group: merge-gate-${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && !startsWith(github.event.label.name, 'review:') && !startsWith(github.event.label.name, 'red-team:') && format('unwatched-{0}', github.run_id) || github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id }}
+  group: merge-gate-${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && github.event.label.name != 'gate:refresh' && !startsWith(github.event.label.name, 'review:') && !startsWith(github.event.label.name, 'red-team:') && format('unwatched-{0}', github.run_id) || github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id }}
   cancel-in-progress: true
 
 jobs:
   merge-gate:
-    name: ${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && !startsWith(github.event.label.name, 'review:') && !startsWith(github.event.label.name, 'red-team:') && 'merge-gate (unwatched label, skipped)' || 'merge-gate' }}
-    if: ${{ !((github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && !startsWith(github.event.label.name, 'review:') && !startsWith(github.event.label.name, 'red-team:')) }}
+    name: ${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && github.event.label.name != 'gate:refresh' && !startsWith(github.event.label.name, 'review:') && !startsWith(github.event.label.name, 'red-team:') && 'merge-gate (unwatched label, skipped)' || 'merge-gate' }}
+    if: ${{ !((github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && github.event.label.name != 'gate:refresh' && !startsWith(github.event.label.name, 'review:') && !startsWith(github.event.label.name, 'red-team:')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

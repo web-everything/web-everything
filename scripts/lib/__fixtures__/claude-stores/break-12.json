@@ -1,0 +1,58 @@
+{
+  "break": 12,
+  "title": "stop miss requires a conclusive owner-store relist",
+  "input": {
+    "home": "/home/test",
+    "env": {
+      "XPC_SERVICE_NAME": "com.we.worker"
+    },
+    "map": {
+      "accounts": {
+        "a": {
+          "configDir": "/home/test/.claude"
+        },
+        "b": {
+          "configDir": "/home/test/claude-b"
+        }
+      },
+      "daemons": {
+        "com.we.worker": "b"
+      },
+      "routing": {
+        "accountB": true
+      }
+    },
+    "existing": [
+      "/home/test/.claude",
+      "/home/test/claude-b"
+    ],
+    "listings": {
+      "/home/test/.claude": [
+        {
+          "sessionId": "abcdef01-1234-4567-89ab-123456789abc",
+          "id": "job-a"
+        }
+      ],
+      "/home/test/claude-b": [
+        {
+          "sessionId": "abcdef02-1234-4567-89ab-123456789abc",
+          "id": "job-b"
+        }
+      ]
+    },
+    "handle": "abcdef01-1234-4567-89ab-123456789abc"
+  },
+  "expect": {
+    "listed": {
+      "action": "refuse",
+      "reason": "still-listed"
+    },
+    "gone": {
+      "action": "gone"
+    },
+    "unreadable": {
+      "action": "refuse",
+      "reason": "unknown"
+    }
+  }
+}

@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { readPlatformPreferences, resolveCascade, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
 import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
 import { retireRegistration } from '../daemon-overlay.mjs';
+import { assertHumanOperator, resolveOperatorIdentity } from '../lib/operator-identity.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readOverlayState, cloneKey } from '../lib/daemon-overlays.mjs';
 import { clearPendingAdoption, recordPendingAdoption, OVERLAY_ADOPTION_MAX_PENDING, OVERLAY_ADOPTION_TTL_MS } from '../lib/overlay-adoption.mjs';
@@ -220,7 +221,8 @@ export function defaultDeps() {
     retirePlanner: defaultRetirePlanner };
 }
 export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, combinedTest, cloneKey: keyForClone = cloneKey,
-  retirePlanner = defaultRetirePlanner, fingerprint = null, testCheck = null, dispatchSmoke = null, realDispatchSmoke = runRealDispatchSmoke, removeRegistration = null }) {
+  retirePlanner = defaultRetirePlanner, fingerprint = null, testCheck = null, dispatchSmoke = null, realDispatchSmoke = runRealDispatchSmoke, removeRegistration = null,
+  resolveOperatorIdentity: operatorIdentity = resolveOperatorIdentity }) {
   const expand = (p) => p.startsWith('~/') ? join(env.HOME, p.slice(2)) : p;
   const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return ''; throw e; } };
   const tool = settings || JSON.parse(read(join(repo, 'scripts/settings/prototype-load.json')));
@@ -418,6 +420,14 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         if (!safeRegistrationRef(input.remove) || !input.reason?.trim() || input.branch || input.replace || input.retire)
           return stop('bad-input', { detail: '--remove requires --reason and no add/replace/retire' });
         stage = 'remove-refused';
+        let actor;
+        if (input.actor) {
+          try { actor = assertHumanOperator(await operatorIdentity({ env }), input.actor); }
+          catch (error) {
+            return stop('operator-identity-refused', { detail: String(error.message || error),
+              fallback: 'Authenticate as a human operator on OPERATOR_LOGINS and retry --remove with the matching --actor.' });
+          }
+        }
         const listed = listRows();
         if (!listed.ok) return stop('remove-refused', { detail: 'unreadable-registry' });
         if (listed.rows.some((r) => r.stackBases !== undefined && (!Array.isArray(r.stackBases) || !r.stackBases.every(safeRegistrationRef))))
@@ -452,7 +462,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
             },
             tip: (ref) => requireGit('ls-remote', 'origin', `refs/heads/${ref}`).split(/\s+/)[0],
           } }));
-        const data = await removeOne({ root: out.clone, ref: input.remove, expectedTip: tip, expectedEntry: targets[0], by: env.USER || 'prototype-load' });
+        const data = await removeOne({ root: out.clone, ref: input.remove, expectedTip: tip, expectedEntry: targets[0], by: env.USER || 'prototype-load',
+          ...(actor ? { actor } : {}) });
         if (data?.retired !== true) return stop('remove-refused', {
           detail: data?.refused || 'removal-unproved', fallback: 'Retain the entry; resolve changed entry/tip or stacked dependents, then retry --remove.' });
         out.removed = [input.remove]; out.ok = true; return out;

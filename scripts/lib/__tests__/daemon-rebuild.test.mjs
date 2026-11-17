@@ -201,7 +201,7 @@ describe('overlay conflict resolution', () => {
     const main = gitOk(f.cloneDir, ['rev-parse', 'origin/main']).trim();
 
     expect(resolveOverlayConflict({ git: runGit, cur: a, ovSha: b, ref: 'lane/b' }))
-      .toMatchObject({ ok: false, tried: ['replay'] });
+      .toMatchObject({ ok: false, tried: ['replay', 'advisory-merge'] });
 
     const result = await planRebuild({
       git: runGit, headSha: main, mainRef: 'origin/main', overlays: [{ ref: 'lane/a', pr: 1 }, { ref: 'lane/b', pr: 2 }],
@@ -237,7 +237,7 @@ describe('overlay conflict resolution', () => {
     expect(result.decisions[1]).toMatchObject({ action: 'drop', reason: 'conflict', files: ['README.md'] });
     expect(result.alerts).toContainEqual({
       kind: 'overlay-conflict-unresolved',
-      detail: { ref: 'lane/b', pr: 2, sha: f.b, files: ['README.md'], tried: ['edge-ref', 'replay'] },
+      detail: { ref: 'lane/b', pr: 2, sha: f.b, files: ['README.md'], tried: ['edge-ref', 'replay', 'advisory-merge'] },
     });
   });
 
@@ -262,7 +262,7 @@ describe('overlay conflict resolution', () => {
       expect(gitOk(f.cloneDir, ['ls-tree', '-r', '--name-only', result.finalSha])).not.toContain('reviewed.txt');
       expect(result.alerts).toContainEqual({
         kind: 'overlay-conflict-unresolved',
-        detail: { ref: 'lane/b', pr: 2, sha: f.b, files: ['README.md'], tried: ['replay'] },
+        detail: { ref: 'lane/b', pr: 2, sha: f.b, files: ['README.md'], tried: ['replay', 'advisory-merge'] },
       });
     });
 
@@ -466,9 +466,9 @@ describe('overlay conflict resolution', () => {
     const approvedEdgeSha = f.a; // a recorded resolution, so the edge path is actually attempted
     expect(resolveOverlayConflict({ git: brokenEdge, cur, ovSha: f.b, ref: 'lane/b', approvedEdgeSha })).toMatchObject({ ok: true, via: 'replay' });
     const brokenCommit = (args, opts) => args[0] === 'commit-tree' ? { status: 128 } : brokenEdge(args, opts);
-    expect(resolveOverlayConflict({ git: brokenCommit, cur, ovSha: f.b, ref: 'lane/b', approvedEdgeSha })).toEqual({ ok: false, files: ['README.md'], tried: ['replay'] });
+    expect(resolveOverlayConflict({ git: brokenCommit, cur, ovSha: f.b, ref: 'lane/b', approvedEdgeSha })).toEqual({ ok: false, files: ['README.md'], tried: ['replay', 'advisory-merge'] });
     expect(resolveOverlayConflict({ git: () => { throw new Error('git failed'); }, cur, ovSha: f.b, ref: 'lane/b', approvedEdgeSha }))
-      .toEqual({ ok: false, files: [], tried: ['replay'] });
+      .toEqual({ ok: false, files: [], tried: ['replay', 'advisory-merge'] });
   });
 
   it('fetches edges once, removes stale edges and wakes then clears the conflicting PR', async () => {

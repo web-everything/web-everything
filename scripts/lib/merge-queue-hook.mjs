@@ -30,7 +30,7 @@
 import { readFileSync, mkdirSync } from 'node:fs';
 import { readGit } from './proc-read.mjs';
 import { dirname, join } from 'node:path';
-import { planQueue, validateQueueSettings, MERGE_QUEUE_DEFAULTS } from './merge-queue.mjs';
+import { planQueue, validateQueueSettings, MERGE_QUEUE_DEFAULTS, candidateQueueClass } from './merge-queue.mjs';
 import { MERGE_FRESHNESS_DEFAULTS } from './merge-freshness.mjs';
 import { readMainRedPriority } from './main-red-priority.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
@@ -111,16 +111,18 @@ export function hookEnabled(settings) {
  */
 export function prioritizeMainFix(ordered, { mainFix = null, queueSettings = MERGE_QUEUE_DEFAULTS, isCoupleHalf = () => false, repoKeyOf = (c) => c.repo ?? 'we' } = {}) {
   const q = { ...MERGE_QUEUE_DEFAULTS, ...queueSettings };
-  if (!q.enabled || !mainFix || !Array.isArray(ordered)) return ordered;
+  if (!q.enabled || !Array.isArray(ordered)) return ordered;
   // The published record is `{repo: 'we', pr, prs: [every fix PR of the red window]}` (main-ci-red-core.mjs#planPriority):
   // `repo` is the constellation KEY, not a slug, and every PR in `prs` is a fix. `repoKeyOf` maps a candidate to its key
   // (the drain passes its own mapper; a null-repo candidate is the local WE clone).
-  const fixPrs = new Set([mainFix.pr, ...(Array.isArray(mainFix.prs) ? mainFix.prs : [])].map(Number));
-  const fixRepo = mainFix.repo ?? 'we';
-  const classOf = (c) => (fixPrs.has(Number(c.num)) && repoKeyOf(c) === fixRepo && !isCoupleHalf(c) ? 'main-fix' : q.defaultClass);
+  const fixPrs = new Set([mainFix?.pr, ...(Array.isArray(mainFix?.prs) ? mainFix.prs : [])].map(Number));
+  const fixRepo = mainFix?.repo ?? 'we';
+  const classOf = (c) => (fixPrs.has(Number(c.num)) && repoKeyOf(c) === fixRepo && !isCoupleHalf(c) ? 'main-fix'
+    : isCoupleHalf(c) ? q.defaultClass : candidateQueueClass(c));
   const fallback = q.classOrder.indexOf(q.defaultClass);
   const rank = (c) => { const i = q.classOrder.indexOf(classOf(c)); return i === -1 ? fallback : i; };
-  return ordered.map((c, i) => ({ c, i })).sort((a, b) => (rank(a.c) - rank(b.c)) || (a.i - b.i)).map((x) => x.c);
+  const sorted = ordered.map((c, i) => ({ c, i })).sort((a, b) => (rank(a.c) - rank(b.c)) || (a.i - b.i)).map((x) => x.c);
+  return sorted.every((c, i) => c === ordered[i]) ? ordered : sorted;
 }
 
 /** The published main-fix PR record (we:scripts/lib/main-red-priority.mjs), or null. `MERGE_QUEUE_MAIN_FIX_FILE_ENV`
@@ -353,7 +355,7 @@ export function recordRefreshed(path, key, headSha, { max = 500, pass = null, no
  * the required check's workflow run instead (`gh run rerun`, throttled), so a new pass is produced.
  * @returns {Promise<{ok: boolean, action: string, newCommit?: string|null, error?: string}>}
  */
-export async function refreshStalePr({ laneRef, root, repo = null, prNumber = null, runId = null, expectedHead = null, readTip, refresh, rerun }) {
+export async function refreshStalePr({ laneRef, root, repo = null, prNumber = null, runId = null, expectedHead = null, readTip, refresh, rerun, execGh }) {
   if (!laneRef) return { ok: false, action: 'error', error: 'no head ref' };
   // The same-repo guard needs the PR number; without one a fork PR could be rebased, so refuse (fail closed).
   if (!Number.isSafeInteger(prNumber)) return { ok: false, action: 'unverified-pr', error: 'no verifiable PR number for the same-repo check' };
@@ -371,12 +373,18 @@ export async function refreshStalePr({ laneRef, root, repo = null, prNumber = nu
   if (r.action !== 'current') return { ok: true, action: r.action, newCommit: r.newCommit ?? null };
   if (!runId) return { ok: false, action: 'current-no-run', error: 'branch already on main and the required run id is unknown' };
   try {
-    if (rerun) rerun(runId);
-    else {
+    if (rerun) { rerun(runId); return { ok: true, action: 'rerun', newCommit: null }; }
+    // Required-workflow runs can live in another repo, so `gh run rerun/view` (which resolves the workflow by id) 404s.
+    // Address the run through the PR repo's REST endpoint instead; if GitHub refuses the rerun (a startup_failure run may not be
+    // re-runnable) the error surfaces; never mutate the branch here (an approved head must be preserved, and a branch already on
+    // the main tip has nothing to update).
+    if (!repo) return { ok: false, action: 'rerun-failed', error: 'no repo to address the run rerun' };
+    let call = execGh;
+    if (!call) {
       const { execFileSyncThrottled } = await import('./gh-throttle.mjs');
-      execFileSyncThrottled('gh', ['run', 'rerun', String(runId), ...(repo ? ['--repo', repo] : [])],
-        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      call = args => execFileSyncThrottled('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 });
     }
+    call(['api', '-X', 'POST', `repos/${repo}/actions/runs/${runId}/rerun`]);
     return { ok: true, action: 'rerun', newCommit: null };
   } catch (e) { return { ok: false, action: 'rerun-failed', error: firstLine(e) }; }
 }

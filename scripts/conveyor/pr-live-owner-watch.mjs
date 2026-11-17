@@ -18,6 +18,13 @@ const age = (v, now) => Number.isFinite(millis(v)) && millis(v) <= now ? (now - 
 const labelsOf = pr => (pr.labels ?? []).map(l => typeof l === 'string' ? l : l.name);
 const operator = pr => labelsOf(pr).some(l => ['review:human', 'needs-you', 'operator-approval'].includes(l));
 const keyOf = pr => `${pr.repo}#${pr.number ?? pr.pr}`;
+/** Even reading .message or converting a thrown value can throw. Preserve message-only held text. */
+function safeErrorText(value, { messageOnly = false } = {}) {
+  try {
+    const message = value?.message;
+    return String(messageOnly ? message : message ?? value);
+  } catch { return '[unstringifiable thrown value]'; }
+}
 /** Decisions dedup over this window; the IO reads at least this far back from the decision log. */
 export const DECISION_WINDOW_MS = HOUR;
 /** Longest notify dedup window; the IO prunes smell state older than this. */
@@ -212,7 +219,7 @@ export async function runLiveOwnerWatchPass({ now = Date.now(), env = process.en
         const did = { ...record, phase: 'did' };
         await io.appendDecision(did); result.actions.push(did);
       } catch (e) {
-        result.held.push({ pr: pr.number, reason: String(e.message) });
+        result.held.push({ pr: pr.number, reason: safeErrorText(e, { messageOnly: true }) });
         await notify(`action-failed:${keyOf(pr)}`, 'Action refused or completion unknown; inspect intent before retry', pr);
         break;
       }
@@ -222,10 +229,11 @@ export async function runLiveOwnerWatchPass({ now = Date.now(), env = process.en
       for (const smell of detectSmells(evidence, now, config)) if (await notify(smell.key, smell.reason)) result.smells.push(smell);
     } else result.held.push({ reason: 'system evidence deferred by tick budget; inspect on next pass' });
   } catch (e) {
-    result.held.push({ reason: `${e.message}; operator inspection required` });
+    const message = safeErrorText(e).replace(/\s+/g, ' ').slice(0, 200);
+    result.held.push({ reason: `${safeErrorText(e, { messageOnly: true })}; operator inspection required` });
     // An unavailable audit/lock never authorizes a dispatch. Feed failure is itself returned, not swallowed.
-    try { await notify('evidence-unavailable', 'Watchdog evidence unavailable; inspect held result'); }
-    catch (feedError) { result.held.push({ reason: `NEEDS-YOU unavailable: ${feedError.message}` }); }
+    try { await notify('evidence-unavailable', `Watchdog evidence unavailable: ${message}; inspect held result`); }
+    catch (feedError) { result.held.push({ reason: `NEEDS-YOU unavailable: ${safeErrorText(feedError, { messageOnly: true })}` }); }
   } finally { if (release) await release(); }
   return result;
 }
@@ -251,7 +259,7 @@ export async function probeLiveOwnerWatch({ dir, now = Date.now(), config = {}, 
   try {
     const result = await runPass({ now, config: cfg, timeoutMs: Math.min(remainingMs, cfg.tickBudgetMs) });
     const value = { at: new Date(now).toISOString(), result }; writeCache(value); return { ...value, cached: false };
-  } catch (e) { return { error: e.message, cached: false }; }
+  } catch (e) { return { error: safeErrorText(e, { messageOnly: true }), cached: false }; }
 }
 /**
  * Child env for the bounded pass. Forward only the tick budget the parent's kill timeout enforces: policy
@@ -276,5 +284,5 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   runLiveOwnerWatchPass({ now: Number(process.env.WE_LIVE_OWNER_WATCH_NOW) || Date.now(),
     ...(process.argv.includes('--dry-run') ? { mode: 'shadow' } : {}) }).then(result => {
     console.log(process.argv.includes('--json') ? JSON.stringify(result) : `${result.considered} PRs; ${result.actions.length} action records; ${result.held.length} held\n${result.selfAudit?.summary ?? 'self-audit unavailable'}`);
-  }).catch(e => { console.error(String(e.message).replace(/[\p{Cc}\p{Cf}]/gu, ' ')); process.exitCode = 1; });
+  }).catch(e => { console.error(safeErrorText(e, { messageOnly: true }).replace(/[\p{Cc}\p{Cf}]/gu, ' ')); process.exitCode = 1; });
 }

@@ -40,3 +40,7 @@ One line per class: either the handling, or `n/a: <why>`.
 the clone-gc probe overlay was blocked by this conflict
 
 no card covers merge-driver or regeneration of the advisory timings file for overlay merges
+
+## Added 2026-11-15 (cards batch 20)
+
+2026-11-15 17:04 ET MED: apply the same test-timings advisory auto-resolve to the behind-main-conflict path in we:scripts/operations/prototype-load-io.mjs (the #6905 auto-resolve covers only the first path).

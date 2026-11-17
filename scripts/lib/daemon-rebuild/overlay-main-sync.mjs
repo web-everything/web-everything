@@ -18,6 +18,7 @@ import { REBUILD_IDENTITY_ENV } from './shared.mjs';
 import { tryLease } from '../../operations/coordination-lock.mjs';
 import { resolveFastMaxFiles } from '../../readiness/heavy-queue-projection.mjs';
 import { buildHeavyTestInvocation, runHeavyTests, heavyTestReport } from './auto-rebase.mjs';
+import { resolveAdvisoryInWorktree } from './advisory-merge.mjs';
 
 const SELF = fileURLToPath(import.meta.url), SETTINGS = join(dirname(SELF), '../daemon-rebuild-settings.json');
 const validMode = mode => ['off', 'shadow', 'on'].includes(mode);
@@ -741,7 +742,12 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
       if (!error.transientGit) throw error;
       mergeError = error; merge = { error };
     }
-    const conflicts = paths(git(['diff', '--name-only', '-z', '--diff-filter=U'], scratch));
+    let conflicts = paths(git(['diff', '--name-only', '-z', '--diff-filter=U'], scratch));
+    if (conflicts.length && resolveAdvisoryInWorktree({ git: args => git(args, scratch), cwd: scratch })) {
+      mergeError = undefined;
+      merge = { status: 0, stdout: '', stderr: '' };
+      conflicts = paths(git(['diff', '--name-only', '-z', '--diff-filter=U'], scratch));
+    }
     if (conflicts.length) {
       mergeConflict = true;
       conflictInfo = { files: conflicts, tip: from,

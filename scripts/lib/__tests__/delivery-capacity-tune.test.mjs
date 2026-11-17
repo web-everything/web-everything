@@ -8,6 +8,7 @@ import { renderOutcome } from '../../operations/cli-adapter.mjs';
 const H = 3600000;
 const NOW = Date.UTC(2026, 10, 15, 12, 0, 0);
 const policy = structuredClone(DELIVERY_CAPACITY_DEFAULTS);
+const resources = { heavyWaitMin: 0, lanesFree: 5, prs: [] };
 const healthy = { merges: 20, medianTtmH: 4, meanRounds: 1.8, idlePct: 30, memGb: 8, capBinding: true };
 const step = (over = {}, extra = {}) => aimdStep({ cap: 30, signals: { ...healthy, ...over }, policy, last: null, nowMs: NOW, ...extra });
 
@@ -16,6 +17,8 @@ describe('autoTune settings defaults', () => {
     expect(DELIVERY_CAPACITY_DEFAULTS.autoTune).toEqual({
       mode: 'shadow', everyMin: 60, windowH: 6, minMerges: 10, ttmTargetH: 6, backoffFactor: 1.5,
       roundsTarget: 2.0, increase: 2, decrease: 0.8, minUnits: 12, maxUnits: 48, raiseOnlyIfBinding: true,
+      heavyWaitMaxMin: 10, lanesFreeMin: 3, activeHighRatio: 0.6, activeLowRatio: 0.3,
+      sessionUnits: 1, minutesPerUnit: 30, laneUnits: 0.5, rebaseUnits: 0.25,
     });
   });
 });
@@ -93,26 +96,26 @@ describe('shadowTune and render', () => {
   const merged = Array.from({ length: 12 }, (_, i) => ({ number: i, createdAt: new Date(NOW - 5 * H).toISOString(),
     mergedAt: new Date(NOW - H).toISOString(), events: [] }));
   it('renders the would-set line and builds one jsonl row', () => {
-    const out = shadowTune({ readout: { ...readout, used: 31, cap: 30, verdict: 'deliver' }, policy, merged, rows: [], nowMs: NOW });
+    const out = shadowTune({ resources, readout: { ...readout, used: 31, cap: 30, verdict: 'deliver' }, policy, merged, rows: [], nowMs: NOW });
     expect(out.line).toMatch(/^auto-tune \(shadow\): would set unitCap 30→32 because /);
     expect(out.row).toMatchObject({ schema: 'deliveryCapacity.tune.v1', mode: 'shadow', from: 30, to: 32, action: 'raise', tsMs: NOW });
     expect(renderTuneLine(out.row)).toBe(out.line);
   });
   it('chains from the last row cap and treats a prior binding row inside the window as binding', () => {
     const rows = [{ tsMs: NOW - 2 * H, changed: true, to: 34, binding: true, bindingNow: true }];
-    const out = shadowTune({ readout, policy, merged, rows, nowMs: NOW });
+    const out = shadowTune({ resources, readout, policy, merged, rows, nowMs: NOW });
     expect(out.row.from).toBe(34);
     expect(out.row.binding).toBe(true);
   });
   it('is off when mode is off', () => {
     const off = { ...policy, autoTune: { ...policy.autoTune, mode: 'off' } };
-    expect(shadowTune({ readout, policy: off, merged, rows: [], nowMs: NOW })).toBeNull();
+    expect(shadowTune({ resources, readout, policy: off, merged, rows: [], nowMs: NOW })).toBeNull();
   });
   it('repeated cooldown hold rows cannot shorten the last adjustment cooldown', () => {
     const bindingReadout = { ...readout, verdict: 'deliver' };
     const rows = [];
     const check = minutes => {
-      const out = shadowTune({ readout: bindingReadout, policy, merged, rows, nowMs: NOW + minutes * 60000 });
+      const out = shadowTune({ resources, readout: bindingReadout, policy, merged, rows, nowMs: NOW + minutes * 60000 });
       rows.push(out.row);
       return out.row;
     };
@@ -123,7 +126,8 @@ describe('shadowTune and render', () => {
     expect(check(60)).toMatchObject({ action: 'raise', from: 32, to: 34, changed: true });
   });
   it('IO shell preserves adjustment cooldown after more than 200 journaled holds', () => {
-    let journal = '', nowMs = NOW;
+    let journal = JSON.stringify({ schema: 'deliveryCapacity.tune.v1', action: 'raise',
+      from: 30, to: 32, changed: true, tsMs: NOW - 30 * 60000 }) + '\n', nowMs = NOW;
     const io = {
       statSync: () => ({ size: journal.length }),
       readFileSync: () => journal,
@@ -143,15 +147,15 @@ describe('shadowTune and render', () => {
       expect(JSON.parse(journal.trim().split('\n').at(-1))).toEqual(out.row);
       return out.row;
     };
-    expect(check()).toMatchObject({ action: 'raise', from: 30, to: 32, changed: true });
+    expect(check()).toMatchObject({ action: 'hold', from: 32, to: 32, changed: false, reason: 'cooldown' });
     for (let second = 1; second <= 205; second++) {
       nowMs = NOW + second * 1000;
       expect(check()).toMatchObject({ action: 'hold', from: 32, to: 32, changed: false, reason: 'cooldown' });
     }
     nowMs = NOW + 60 * 60000;
-    expect(check()).toMatchObject({ action: 'raise', from: 32, to: 34, changed: true });
+    expect(check()).toMatchObject({ action: 'hold', from: 32, to: 32, changed: false, reason: 'resource evidence unreadable' });
     nowMs += 1000;
-    expect(check()).toMatchObject({ action: 'hold', from: 34, to: 34, changed: false, reason: 'cooldown' });
+    expect(check()).toMatchObject({ action: 'hold', from: 32, to: 32, changed: false, reason: 'resource evidence unreadable' });
     expect(io.appendFileSync).toHaveBeenCalledTimes(208);
   });
 });
@@ -162,19 +166,21 @@ describe('audit regressions', () => {
   it('a carried binding does not renew itself: no raise 10h after the last real binding', () => {
     const base = assessCapacity({ prs: [], host: { idlePct: 30, memGb: 8 }, policy: { ...policy, mode: 'units' } });
     const rows = [];
-    let out = shadowTune({ readout: { ...base, verdict: 'deliver' }, policy, merged, rows, nowMs: NOW });
+    let out = shadowTune({ resources, readout: { ...base, verdict: 'deliver' }, policy, merged, rows, nowMs: NOW });
     rows.push(out.row);
     for (let h = 1; h <= 10; h++) {
-      out = shadowTune({ readout: base, policy, merged, rows, nowMs: NOW + h * H });
+      out = shadowTune({ resources, readout: base, policy, merged, rows, nowMs: NOW + h * H });
       rows.push(out.row);
     }
+    expect(rows[0]).toMatchObject({ action: 'raise', to: 32 });
     expect(out.row.binding).toBe(false);
     expect(out.row.changed).toBe(false);
+    expect(out.row.reason).toBe('cap was not binding');
   });
   it('overload (gate closed on low idle) recommends lowering instead of holding on unreadable host', () => {
     const readout = assessCapacity({ prs: [], host: { idlePct: 3, memGb: 8 }, policy: { ...policy, mode: 'units' } });
     expect(readout.why[0]).toMatch(/^gate closed \(idle 3% mem 8GB\)$/);
-    const out = shadowTune({ readout, policy, merged, rows: [], nowMs: NOW });
+    const out = shadowTune({ resources, readout, policy, merged, rows: [], nowMs: NOW });
     expect(out.row).toMatchObject({ action: 'lower', from: 30, to: 24 });
   });
 });
@@ -210,9 +216,9 @@ describe('audit regressions 3', () => {
 describe('audit regressions 4', () => {
   it('count-mode saturation is not unit-cap binding', () => {
     const base = assessCapacity({ prs: [], host: { idlePct: 30, memGb: 8 }, policy });
-    const out = shadowTune({ readout: { ...base, mode: 'count', used: 18, cap: 18, verdict: 'deliver' }, policy,
+    const out = shadowTune({ resources, readout: { ...base, mode: 'count', used: 18, cap: 18, verdict: 'deliver' }, policy,
       merged: Array.from({ length: 12 }, (_, i) => ({ number: i, createdAt: new Date(NOW - 5 * H).toISOString(), mergedAt: new Date(NOW - H).toISOString(), events: [] })), rows: [], nowMs: NOW });
-    expect(out.row).toMatchObject({ binding: false, changed: false });
+    expect(out.row).toMatchObject({ binding: false, changed: false, reason: 'cap was not binding' });
   });
   it('a contradictory journal row fails closed', () => {
     const row = { schema: 'deliveryCapacity.tune.v1', action: 'raise', from: 30, to: 32, changed: false, tsMs: NOW - 1000 };
@@ -238,9 +244,9 @@ describe('shadow is inert', () => {
     expect(verdict).toEqual(before);
   });
   it.each([
-    ['shadow', 12, 'complete', 'raise'],
+    ['shadow', 12, 'complete', 'hold'],
     ['shadow', 0, 'complete', 'hold'],
-    ['on', 12, 'error', 'raise'],
+    ['on', 12, 'error', 'hold'],
   ])('preserves the adapter JSON envelope after a successful %s journal append (%i merges, %s)', (mode, merges, stopped, action) => {
     const run = { id: 'capacity-run', op: 'delivery-capacity', verdict: { ...verdict, used: verdict.cap, verdict: 'deliver' },
       effects: [], pending: null, findings: [{ key: 'capacity-evidence' }], telemetry: [], outcome: 'observed' };

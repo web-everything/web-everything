@@ -34,6 +34,63 @@ export function aimdStep(input) {
   } catch { return hold('tuning evidence unreadable'); }
 }
 
+/** Resource-only suggestion; missing evidence never permits an adjustment. */
+export function resourceStep(input) {
+  let from = null;
+  const hold = reason => ({ action: 'hold', from, to: from, changed: false, reason });
+  try {
+    const { cap, signals: s, policy, last, nowMs } = input;
+    from = finite(cap) ? cap : null;
+    const p = policy.autoTune;
+    if (last?.changed && nowMs - last.tsMs < p.everyMin * 60000) return hold('cooldown');
+    if (['hold', 'pin'].includes(s?.override?.kind)) return hold('manual override active');
+    if (s?.fallbackReason || s?.discoveryIncomplete === true) return hold('PR discovery incomplete');
+    if (finite(cap) && cap < p.minUnits) return hold('configured cap below minUnits; not tuned');
+    if (![s?.idlePct, s?.memGb, s?.heavyWaitMin, s?.lanesFree].every(finite)
+      || !Array.isArray(s?.prs)
+      || ('openCount' in s && !(finite(s.openCount) && s.prs.length >= s.openCount))
+      || !s.prs.every(pr => pr && ['number', 'liveSessions', 'ciMin', 'heavyMin', 'rebases']
+        .every(key => finite(pr[key]) && pr[key] >= 0) && typeof pr.laneHeld === 'boolean')) {
+      // Fail closed in the safe direction: a readable low host reading still lowers; nothing here can raise.
+      const low = [];
+      if (finite(s?.idlePct) && finite(policy.idleMinPct) && s.idlePct < policy.idleMinPct) low.push('low idle');
+      if (finite(s?.memGb) && finite(policy.memMinGb) && s.memGb < policy.memMinGb) low.push('low memory');
+      if (low.length && [cap, p.decrease, p.minUnits, p.maxUnits].every(finite) && p.minUnits <= p.maxUnits) {
+        const to = Math.max(p.minUnits, Math.min(p.maxUnits, Math.round(cap * p.decrease * 10) / 10));
+        if (to < cap) return { action: 'lower', from, to, changed: true, reason: `${low.join(', ')} (resource evidence unreadable)` };
+      }
+      return hold('resource evidence unreadable');
+    }
+    if (![cap, nowMs, p.everyMin, p.increase, p.decrease, p.minUnits, p.maxUnits,
+      p.heavyWaitMaxMin, p.lanesFreeMin, p.activeHighRatio, p.activeLowRatio,
+      p.sessionUnits, p.minutesPerUnit, p.laneUnits, p.rebaseUnits,
+      policy.idleMinPct, policy.memMinGb].every(finite)
+      || p.minUnits > p.maxUnits || p.minutesPerUnit <= 0
+      || p.activeLowRatio >= p.activeHighRatio) return hold('resource evidence unreadable');
+    const activeUnits = s.prs.reduce((total, pr) => total + pr.liveSessions * p.sessionUnits
+      + (pr.ciMin + pr.heavyMin) / p.minutesPerUnit
+      + (pr.laneHeld ? p.laneUnits : 0) + pr.rebases * p.rebaseUnits, 0);
+    if (!finite(activeUnits)) return hold('resource evidence unreadable');
+    const reasons = [];
+    if (s.idlePct < policy.idleMinPct) reasons.push('low idle');
+    if (s.memGb < policy.memMinGb) reasons.push('low memory');
+    if (s.heavyWaitMin > p.heavyWaitMaxMin) reasons.push('heavy wait');
+    if (s.lanesFree < p.lanesFreeMin) reasons.push('few free lanes');
+    if (activeUnits >= cap * p.activeHighRatio) reasons.push('high active units');
+    const lower = reasons.length > 0;
+    if (!lower && cap <= p.maxUnits) {
+      if (activeUnits > cap * p.activeLowRatio) return hold('active units above raise threshold');
+      if (!s.capBinding && p.raiseOnlyIfBinding !== false) return hold('cap was not binding');
+    }
+    const proposed = lower ? Math.round(cap * p.decrease * 10) / 10 : cap + p.increase;
+    const to = Math.max(p.minUnits, Math.min(p.maxUnits, proposed));
+    if (to === cap) return hold('at bound');
+    return { action: to < cap ? 'lower' : 'raise', from, to, changed: true,
+      reason: lower ? reasons.join(', ') : cap > p.maxUnits ? 'above maxUnits'
+        : 'healthy resources and binding policy satisfied' };
+  } catch { return hold('resource evidence unreadable'); }
+}
+
 export function summarizeMerged(prs, options) {
   try {
     const { holdLabels, nowMs, windowH } = options;
@@ -89,10 +146,14 @@ export function shadowTune(input) {
       || history.some(r => r?.bindingNow === true && finite(r.tsMs) && r.tsMs >= nowMs - p.windowH * H && r.tsMs <= nowMs);
     const host = typeof readout?.why?.[0] === 'string'
       ? /^gate (?:open|closed) \(idle (\d+(?:\.\d+)?)% mem (\d+(?:\.\d+)?)GB\)$/.exec(readout.why[0]) : null;
-    const signals = { ...summarizeMerged(merged, { holdLabels: policy.holdLabels, nowMs, windowH: p.windowH }),
-      idlePct: host ? Number(host[1]) : null, memGb: host ? Number(host[2]) : null, capBinding: binding };
+    const signals = { heavyWaitMin: input.resources?.heavyWaitMin ?? null, lanesFree: input.resources?.lanesFree ?? null,
+      prs: input.resources?.prs ?? null, openCount: finite(readout?.openCount) ? readout.openCount : null, idlePct: host ? Number(host[1]) : null,
+      memGb: host ? Number(host[2]) : null, capBinding: binding,
+      override: readout?.override ?? null, fallbackReason: readout?.fallbackReason ?? null,
+      discoveryIncomplete: readout?.discoveryIncomplete === true };
+    const info = summarizeMerged(merged, { holdLabels: policy.holdLabels, nowMs, windowH: p.windowH });
     const row = { schema: 'deliveryCapacity.tune.v1', ts: new Date(nowMs).toISOString(), tsMs: nowMs,
-      mode: p.mode, ...aimdStep({ cap, signals, policy, last: lastChange, nowMs }), binding, bindingNow, signals };
+      mode: p.mode, ...resourceStep({ cap, signals, policy, last: lastChange, nowMs }), binding, bindingNow, signals, info };
     return { row, line: renderTuneLine(row) };
   } catch { return null; }
 }
@@ -101,4 +162,52 @@ export function renderTuneLine(row) {
   try {
     return `auto-tune (${row.mode}): would ${row.changed ? `set unitCap ${row.from}→${row.to}` : `hold unitCap ${row.from}`} because ${row.reason}`;
   } catch { return 'auto-tune (shadow): would hold unitCap null because tuning evidence unreadable'; }
+}
+
+/** True when `blob` names the PR: its `#N`/`pr-N` number, or its branch slug as a whole token (never a substring of a longer word). */
+function namesPr(blob, pr) {
+  const text = String(blob ?? '').toLowerCase();
+  if (!text) return false;
+  const slug = String(pr.headRefName ?? '').toLowerCase().replace(/^lane\//, '');
+  const bounded = token => new RegExp(`(^|[^a-z0-9])${token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}($|[^a-z0-9])`).test(text);
+  return (slug.length >= 4 && bounded(slug)) || bounded(`#${pr.number}`) || bounded(`pr-${pr.number}`);
+}
+
+/**
+ * One row per open PR (explicit zeros included) from host-local sources, read once per tick by the caller.
+ * Each source is `{ ok, ... }`; a source that is not `ok` is reported in `unreadable` and yields no rows
+ * (an unreadable source must never count as zero). Pure: the shell does all IO.
+ */
+export function buildResourceRows({ openPrs, nowMs, sources }) {
+  try {
+    const { agents, heavy, leases, rebases } = sources ?? {};
+    const unreadable = Object.entries({ agents, heavy, leases, rebases })
+      .filter(([, s]) => s?.ok !== true).map(([name]) => name);
+    if (unreadable.length) return { resources: null, unreadable };
+    if (!Array.isArray(openPrs) || !finite(nowMs) || !Array.isArray(agents.rows) || !Array.isArray(heavy.records)
+      || !Array.isArray(leases.leases) || !finite(leases.laneCount) || !Array.isArray(rebases.events)
+      || !finite(heavy.waitMin) || heavy.waitMin < 0
+      || !heavy.records.every(rec => rec && finite(Date.parse(rec.at)) && finite(rec.ms) && rec.ms >= 0)
+      || !rebases.events.every(e => e && finite(e.tsMs) && Number.isInteger(e.number))
+      || !openPrs.every(pr => Number.isInteger(pr?.number) && typeof pr.headRefName === 'string')) {
+      return { resources: null, unreadable: ['shape'] };
+    }
+    const since = nowMs - H;
+    const prs = openPrs.map(pr => {
+      let ciMin = 0, heavyMin = 0;
+      for (const rec of heavy.records) {
+        const at = Date.parse(rec?.at);
+        if (at < since || at > nowMs) continue;
+        if (!namesPr(`${rec.session ?? ''} ${rec.command ?? ''}`, pr)) continue;
+        if (rec.dispatchKind === 'ci-heal') ciMin += rec.ms / 60000; else heavyMin += rec.ms / 60000;
+      }
+      return { number: pr.number,
+        liveSessions: agents.rows.filter(row => namesPr(
+          `${row?.name ?? ''} ${row?.codexSlug ?? ''} ${row?.id ?? ''} ${row?.cwd ?? ''} ${row?.lease?.purpose ?? ''}`, pr)).length,
+        ciMin, heavyMin,
+        laneHeld: leases.leases.some(lease => namesPr(`${lease?.purpose ?? ''} ${lease?.session ?? ''}`, pr)),
+        rebases: rebases.events.filter(e => e.number === pr.number && e.tsMs >= since && e.tsMs <= nowMs).length };
+    });
+    return { resources: { heavyWaitMin: heavy.waitMin, lanesFree: Math.max(0, leases.laneCount - leases.leases.length), prs } };
+  } catch { return { resources: null, unreadable: ['shape'] }; }
 }

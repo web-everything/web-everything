@@ -2805,3 +2805,22 @@ describe('2026-10-10 recovery caps and stacked missing runs', async () => {
   });
 
 });
+
+describe('ci-red-recovery-watch — fixture credential hygiene', () => {
+  it.each([
+    'scripts/__tests__/close-session-sweep.test.mjs',
+    'scripts/conveyor/__tests__/ci-red-recovery-watch.test.mjs',
+    'scripts/conveyor/__tests__/fix-round-history.test.mjs',
+    'scripts/conveyor/__tests__/health-watch-core.test.mjs',
+    'scripts/conveyor/__tests__/pr-stall-detector.test.mjs',
+    'scripts/lib/__tests__/gh-throttle.waitlog.test.mjs',
+  ])('%s passes the same scans the Forge bundle and manifest paths run on it', async (rel) => {
+    const { readFileSync } = await import('node:fs');
+    const m = await import('../../readiness/forge-exec-manifest.mjs');
+    // Read source bytes directly; Vite rewrites dynamic import.meta URLs as asset globs.
+    const content = readFileSync(join(REPO_ROOT, rel));
+    expect(m.credentialBufferFinding(content)).toBeNull();
+    expect(m.credentialContentFinding(Buffer.from(rel), content)).toBeNull();
+    expect(() => m.manifestEntry(Buffer.from(rel), content, false, true)).not.toThrow();
+  });
+});

@@ -87,6 +87,7 @@ import { CONSTELLATION_REPOS, capableRepos } from '../lib/constellation-repos.mj
 import { laneJournalPath, readLaneJournalTail, reconcileLaneJournalEntry } from '../lib/lane-history.mjs';
 import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
 import { laneIndicesIn, poolsWithLanes } from '../lib/lane-pool-scan.mjs';
+import { probeLaneCheckouts } from './lane-checkout-probe.mjs';
 import { readVerifyMarker } from '../lib/lane-verify.mjs';
 // #4317 — the same "which paths are DAEMON clones" registry `guard-lane.mjs`/`guard-bash.mjs` already use, so
 // this probe's notion of "a daemon clone" can never drift from the guards'.
@@ -1232,6 +1233,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   probes.laneVerifyMarkers = attempt('laneVerifyMarkers', () => probeLaneVerifyMarkers({
     poolRoot: flags['lane-pool-root'] || (fixtureTick ? null : defaultPoolRoot(REPO_ROOT)),
   }));
+  probes.laneCheckouts = attempt('laneCheckouts', () => probeLaneCheckouts({ poolRoot: flags['lane-pool-root'] || (fixtureTick ? null : defaultPoolRoot(REPO_ROOT)), repoRoot: REPO_ROOT }));
   // #4200-ish — cheap, fs-only, every tick: catches a shim baked with a lane-clone path BEFORE that lane resets.
   probes.ghShimLanes = attempt('ghShimLanes', () => probeGhShimLanes());
   // #4317 — cheap, every tick: an aged untracked backlog card sitting inside a daemon clone (the exact class of

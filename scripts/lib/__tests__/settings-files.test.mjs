@@ -5,7 +5,7 @@
  *   we:scripts/settings/<feature>.json), and that the merged read resolves the same values.
  */
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readdirSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readdirSync, readFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative, sep } from 'node:path';
 import {
@@ -104,6 +104,60 @@ describe('readDeclaredSettings — IO', () => {
     const r = readDeclaredSettings({ dir: '/nonexistent-settings-dir', legacyPath: '/nonexistent.json' });
     expect(r.settings).toEqual({});
     expect(r.errors).toEqual([]);
+  });
+
+  it('reports ENOTDIR using only the directory error message and preserves the legacy layer', () => {
+    const d = mkdtempSync(join(tmpdir(), 'settings-files-'));
+    try {
+      const dir = join(d, 'settings');
+      const legacyPath = join(d, 'legacy.json');
+      const settings = { fixDispatch: { borrowBuildSlots: 'on' } };
+      writeFileSync(dir, 'not a directory');
+      writeFileSync(legacyPath, JSON.stringify(settings));
+      let directoryError;
+      try { readdirSync(dir); } catch (e) { directoryError = e; }
+      expect(directoryError?.code).toBe('ENOTDIR');
+      let r;
+      expect(() => { r = readDeclaredSettings({ dir, legacyPath }); }).not.toThrow();
+      expect(r).toEqual({
+        ...mergeSettingsLayers([{ source: 'dispatch-settings.json', data: settings }]),
+        sources: ['dispatch-settings.json'],
+        errors: [{ source: 'settings/', error: directoryError.message }],
+      });
+      expect(readSettings({ dir, legacyPath })).toEqual(settings);
+    } finally { rmSync(d, { recursive: true, force: true }); }
+  });
+
+  it('a missing directory stays silent and preserves the legacy settings', () => {
+    const d = mkdtempSync(join(tmpdir(), 'settings-files-'));
+    try {
+      const dir = join(d, 'missing-settings');
+      const legacyPath = join(d, 'legacy.json');
+      writeFileSync(legacyPath, JSON.stringify({ cap: 3 }));
+      const r = readDeclaredSettings({ dir, legacyPath });
+      expect(r.settings).toEqual({ cap: 3 });
+      expect(r.errors).toEqual([]);
+      expect(readSettings({ dir, legacyPath })).toEqual({ cap: 3 });
+    } finally { rmSync(d, { recursive: true, force: true }); }
+  });
+
+  it.skipIf(process.getuid?.() === 0)('an unreadable directory reports exactly one error without throwing', () => {
+    const d = mkdtempSync(join(tmpdir(), 'settings-files-'));
+    const dir = join(d, 'settings');
+    mkdirSync(dir);
+    try {
+      const legacyPath = join(d, 'legacy.json');
+      writeFileSync(legacyPath, JSON.stringify({ cap: 3 }));
+      chmodSync(dir, 0o000);
+      let r;
+      expect(() => { r = readDeclaredSettings({ dir, legacyPath }); }).not.toThrow();
+      expect(r.settings).toEqual({ cap: 3 });
+      expect(r.errors).toEqual([{ source: 'settings/', error: expect.stringMatching(/^EACCES:/) }]);
+      expect(readSettings({ dir, legacyPath })).toEqual({ cap: 3 });
+    } finally {
+      chmodSync(dir, 0o700);
+      rmSync(d, { recursive: true, force: true });
+    }
   });
 });
 

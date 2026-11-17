@@ -105,3 +105,4 @@ Agent Meta · Memory · Model Routing cluster — open a leaf with `node scripts
 - [Only ask review when ready](only-ask-review-when-ready.md) — never list a PR as "your review" until not draft, checks green, advisory review + red team done on the current head
 - 152. [New work gets placed, not started](152-new-work-gets-placed-not-started.md) — triage operator points into priorities + propose a slot; only blockers start now
 - [Morning message reports decisions](morning-message-reports-decisions.md) — under full delegation decide owed asks first and report them as "decided: item → call"; no "needs you" list (R937/R939, 2026-11-15)
+- [Full delegation covers workflow clearances](full-delegation-covers-workflow-clearances.md) — operator R952 "You have still full authority": the orchestrator clears workflow-file PRs itself when advisory accepted + red-team clear + required CI green; only rule-14 hard lines go to the operator

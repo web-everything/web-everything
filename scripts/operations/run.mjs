@@ -24,7 +24,7 @@
  */
 
 import { OPERATOR_OVERRIDE_OPS, OPERATOR_OVERRIDE_EFFECT, operatorOverrideOperation } from './operator-override.mjs';
-import { readOperatorOverrides, writeOperatorOverride, clearOperatorOverride } from '../lib/operator-override-store.mjs';
+import { lastOverrideReason, readOperatorOverrides, writeOperatorOverride, clearOperatorOverride } from '../lib/operator-override-store.mjs';
 import { aiRoutingOperation, AI_ROUTING_OP, finishAiRouting } from './ai-routing.mjs';
 import { resolveAiRouting, aiRoutingInputs, AI_ROUTING_ROLES } from '../lib/ai-routing.mjs';
 import { routingOverrideOperation, ROUTING_OVERRIDE_OP } from './routing-override.mjs';
@@ -35,7 +35,7 @@ import { readLatestDecisions } from '../conveyor/health-responder-state.mjs';
 import { healthRespondOperation, HEALTH_RESPOND_OP } from './health-respond.mjs';
 import { resolve, join, dirname } from 'node:path';
 import { readFileSync } from 'node:fs';
-import { loadavg } from 'node:os';
+import { loadavg, userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 import { operatorSessionBootstrapOperation, finishBootstrap } from './operator-session-bootstrap.mjs';
@@ -94,6 +94,7 @@ import { readSnapshot, loadResourcePolicy, resourcePaths, appendResourceLog } fr
 import { workerCapacityOperation, finishWorkerCapacity, WORKER_CAPACITY_OP } from './worker-capacity.mjs';
 import { resolveWorkerCapacitySettings } from '../lib/worker-capacity.mjs';
 import { deliveryCapacityOperation, finishDeliveryCapacity, DELIVERY_CAPACITY_OP } from './delivery-capacity.mjs';
+import { DELIVERY_CAPACITY_OVERRIDE_OPS, DELIVERY_CAPACITY_OVERRIDE_EFFECT, deliveryCapacityOverrideOperation } from './delivery-capacity-override.mjs';
 import { createDeliveryCapacityTune } from './delivery-capacity-tune-shell.mjs';
 import { resolveDeliveryCapacity, assessCapacity } from '../lib/delivery-capacity.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
@@ -246,6 +247,17 @@ export const CLI_ONLY_OPERATIONS = Object.freeze({
       [OPERATOR_OVERRIDE_EFFECT]: ({ clear, ...input }) => (clear ? clearOperatorOverride : writeOperatorOverride)(input),
     },
   })])),
+  ...Object.fromEntries(DELIVERY_CAPACITY_OVERRIDE_OPS.map(name => [name, () => ({
+    declaration: deliveryCapacityOverrideOperation(name),
+    sinks: {
+      [DELIVERY_CAPACITY_OVERRIDE_EFFECT]: ({ writes, clears, reason }) => {
+        const actor = userInfo().username;
+        for (const { key, value } of writes) writeOperatorOverride({ key, value, reason, actor });
+        for (const key of clears) clearOperatorOverride({ key, reason, actor });
+        return { writes, clears };
+      },
+    },
+  })])),
 });
 
 export const OPERATIONS = Object.freeze({
@@ -298,7 +310,7 @@ export const OPERATIONS = Object.freeze({
     // normally instead of this builder aborting resolveOperation with the root usage.
     let savedRun = null;
     if (resumeId) { try { savedRun = createFileRunStore().read(resumeId); } catch { savedRun = null; } }
-    const seatSettings = loadReviewSeatSettings();
+    const seatSettings = loadReviewSeatSettings({ aiRouting: aiRoutingInputs('review', resolveAiRouting()).coordinator });
     const live = { codexAdvisory: codexAdvisoryFromEnv(), correctnessAdvisory: correctnessAdvisoryFromEnv(),
       antigravityReview: antigravityReviewFromEnv() };
     // A saved run keeps the roster it started with at every cursor position (`reviewSeatOptionsForRun`).
@@ -548,8 +560,14 @@ export const OPERATIONS = Object.freeze({
         host = { idlePct: Number(idle[1]), memGb: (Number(free[1]) + Number(inactive[1])) * Number(pageSize[1]) / 2 ** 30 };
         if (!Number.isFinite(host.idlePct) || !Number.isFinite(host.memGb)) throw new Error('invalid host evidence');
       } catch { failures.push('host CPU/memory collection failed; inspect top/vm_stat'); }
-      return assessCapacity({ prs, host, policy, incomplete,
+      let overrides = { readable: false, values: {} };
+      try {
+        overrides = { ...readOperatorOverrides(), holdReason: lastOverrideReason('deliveryCapacity.holdUntil') };
+      } catch { /* unreadable stays fail-closed */ }
+      const result = assessCapacity({ prs, host, policy, incomplete, overrides,
         ...(failures.length ? { fallbackReason: `${failures.join('; ')}; count-mode fallback` } : {}) });
+      // Reads never write: an expired override is ignored and shown in the readout until the next hold, pin or clear.
+      return result;
     } }),
     sinks: {},
     finish: (args) => finishDeliveryCapacity(args, { tune: createDeliveryCapacityTune() }),
@@ -892,6 +910,7 @@ const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLTo
 if (IS_CLI) {
   const [name, ...rest] = process.argv.slice(2);
   if (name === 'worker-pause') { const { main: pause } = await import('./worker-pause.mjs'); const pauseCode = pause(rest); process.exit(pauseCode); } // R480: tiny flag CLI, not a run-record operation
+  if (name === 'await-checks') { const { main } = await import('./await-checks.mjs'); const code = main(rest); process.exit(code); } // worker CI wait (guard-bash refuses raw --watch)
   if (name === 'await') { const { main } = await import('./await.mjs'); const code = main(rest); process.exit(code); }
   if (!name || name === '--help' || name === '-h') {
     writeAllSync(1, `${rootUsage()}\n`);

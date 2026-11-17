@@ -607,6 +607,9 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     'routing-override': 'routing-override.mjs',
     'operator-override-set': 'operator-override.mjs',
     'operator-override-clear': 'operator-override.mjs',
+    'delivery-capacity-hold': 'delivery-capacity-override.mjs',
+    'delivery-capacity-pin': 'delivery-capacity-override.mjs',
+    'delivery-capacity-clear': 'delivery-capacity-override.mjs',
     'operator-override-show': 'operator-override.mjs',
   });
 

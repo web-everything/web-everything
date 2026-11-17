@@ -11,6 +11,10 @@
  *     event log. A GitHub redelivery (same `X-GitHub-Delivery` id) is stored once.
  *   • GET /events?cursor=N — bearer-authed with the SEPARATE `PR_EVENTS_READ_TOKEN` binding (the webhook secret
  *     never leaves GitHub↔Worker). Returns every event with `seq > cursor`, oldest first, plus the new cursor.
+ *   • POST /runtime-events — internal writers use the EXISTING `PR_EVENTS_BOOTSTRAP_TOKEN` binding. Strictly
+ *     validated runtime records share the feed sequence, with idempotency by repo/PR/head/action/cause/type.
+ *     Optional notes are bounded opaque data; runtime writes do not refresh webhook health or PR projections.
+ *     Runtime retention is separate: 5000 rows / 30 days by default; pruning signals a gap for a full resync.
  *   • GET /health — `{ ok }` only; no data, no auth.
  *
  * CURSOR SEMANTICS (the contract `we:scripts/lib/pr-events.mjs` relies on)
@@ -19,8 +23,8 @@
  *   • `cursor` absent → `{ cursor: head, events: [], reset: true }`: a fresh reader starts at "now" (its own
  *     first full tick covers history — nothing is replayed).
  *   • `cursor > head` → the log was recreated under the reader; same answer as absent (`reset: true`).
- *   • `cursor < oldest - 1` → events the reader never saw were pruned: `gap: true` and the reader must treat
- *     that as "something happened" (run a full tick). Retention is bounded by count AND age.
+ *   • `cursor < highestPrunedSeq` (or the legacy oldest-row boundary) → unseen events were pruned:
+ *     `gap: true`, requiring a full tick. Each class has independent count AND age retention bounds.
  *   • `more: true` → a page limit cut the answer short; the reader asks again from the returned cursor.
  *
  * Fail-closed: a missing secret/token binding answers 503, never "accept unsigned" / "serve unauthenticated".
@@ -59,6 +63,11 @@ export function classifyPrComment(body) {
 
 export const DEFAULT_MAX_EVENTS = 5000;
 export const DEFAULT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+export const DEFAULT_MAX_RUNTIME_EVENTS = 5000;
+/** Idempotency-key tombstones outlive event rows (60 days, 20000 keys, oldest evicted first). */
+export const DEFAULT_RUNTIME_KEY_RETENTION_MS = 60 * 24 * 3600 * 1000;
+export const DEFAULT_MAX_RUNTIME_KEYS = 20_000;
+export const DEFAULT_RUNTIME_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 export const DEFAULT_PAGE_LIMIT = 200;
 export const MAX_PAGE_LIMIT = 500;
 
@@ -147,6 +156,7 @@ export function checkProjectionKey(event) {
 
 /** Fold only received evidence. Field clocks protect concurrent bootstrap imports. */
 export function foldObservation(storage, observed) {
+  if (observed.class === 'runtime') return;
   // GitHub spells a repo one way, an operator may type another: the projection identifies a repo case-insensitively.
   const event = { ...observed, repo: String(observed.repo).toLowerCase() };
   const { repo, seq, sha, type } = event;
@@ -240,15 +250,36 @@ export function validateBootstrap(input) {
   return { repo: input.repo.toLowerCase(), importId: input.importId, baseCursor: input.baseCursor, status: input.status, prs };
 }
 
+/** Strict runtime schema; reject unknown fields before storage or sequence allocation. */
+export function validateRuntimeEvent(raw) {
+  const object = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+  const slug = (v) => typeof v === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(v);
+  const keys = new Set(['class', 'type', 'repo', 'number', 'head', 'action', 'cause', 'writer', 'note']);
+  if (!object(raw) || Object.keys(raw).some((k) => !keys.has(k)) || raw.class !== 'runtime' ||
+      !['action-requested', 'worker-started', 'worker-finished'].includes(raw.type) ||
+      typeof raw.repo !== 'string' || !/^[A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*$/.test(raw.repo) ||
+      !Number.isSafeInteger(raw.number) || raw.number <= 0 ||
+      typeof raw.head !== 'string' || !/^[a-fA-F0-9]{40}$/.test(raw.head) || !slug(raw.action) ||
+      !Number.isSafeInteger(raw.cause) || !object(raw.writer) || !slug(raw.writer.role) ||
+      Object.keys(raw.writer).some((k) => !['role', 'clone'].includes(k)) ||
+      ('clone' in raw.writer && !slug(raw.writer.clone)) ||
+      ('note' in raw && (typeof raw.note !== 'string' || raw.note.length > 500))) throw new Error('invalid runtime event');
+  return { ...raw, writer: { ...raw.writer } };
+}
+
 /**
- * The event log over a tiny storage interface — ONE implementation of the cursor rules, shared by the Durable
- * Object (SQLite storage, `worker.mjs`) and the in-memory store the tests and local harness use.
- *
- * storage: { getMeta(k), setMeta(k, v), hasDelivery(id), insert(seq, id, at, json), range(afterSeq, limit),
- *            minSeq(), prune(throughSeq, olderThanMs), transaction(fn),
- *            getProjection(bucket, key), putProjection(bucket, key, value), listProjection(bucket) }
+ * Shared log over memory / Durable Object SQLite storage.
+ * storage: { getMeta(k), setMeta(k,v), hasDelivery(id), insert(seq,id,at,json,keep), range(after,limit),
+ *   minSeq(), prune(maxEvents,olderThanMs,maxRuntimeEvents,runtimeOlderThanMs), transaction(fn),
+ *   getProjection(bucket,key), putProjection(bucket,key,value), listProjection(bucket) }
+ * prune returns the highest deleted seq (0 if none); callers persist it atomically with the append.
  */
-export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retentionMs = DEFAULT_RETENTION_MS } = {}) {
+export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retentionMs = DEFAULT_RETENTION_MS,
+  maxRuntimeEvents = DEFAULT_MAX_RUNTIME_EVENTS, runtimeRetentionMs = DEFAULT_RUNTIME_RETENTION_MS,
+  runtimeKeyRetentionMs = DEFAULT_RUNTIME_KEY_RETENTION_MS, maxRuntimeKeys = DEFAULT_MAX_RUNTIME_KEYS } = {}) {
+  if (!Number.isSafeInteger(maxRuntimeEvents) || maxRuntimeEvents < 0 ||
+      !Number.isFinite(runtimeRetentionMs) || runtimeRetentionMs < 0 ||
+      !Number.isFinite(runtimeKeyRetentionMs) || runtimeKeyRetentionMs < 0 || !Number.isSafeInteger(maxRuntimeKeys) || maxRuntimeKeys < 1) throw new Error('invalid runtime retention bounds');
   const head = () => Number(storage.getMeta('head') || 0);
   storage.transaction(() => {
     if (!storage.getMeta('projectionVersion')) {
@@ -259,22 +290,48 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
       storage.setMeta('projectionVersion', '1');
     }
   });
-  const log = {
-    /** Append one compact record. Returns `{ seq, duplicate }`. */
-    append(record, now = Date.now()) { return storage.transaction(() => {
-      storage.setMeta('lastDeliveryAt', String(now));
+  const pruneInTransaction = (now) => {
+    const pruned = storage.prune(maxEvents, now - retentionMs, maxRuntimeEvents, now - runtimeRetentionMs);
+    storage.setMeta('highestPrunedSeq', String(Math.max(Number(storage.getMeta('highestPrunedSeq') || 0), pruned || 0)));
+  };
+  // Caller owns the transaction, including any idempotency evidence written alongside the row.
+  const appendInTransaction = (record, now, keep = false) => {
+      if (!keep) storage.setMeta('lastDeliveryAt', String(now));
       if (record.id && storage.hasDelivery(record.id)) return { seq: null, duplicate: true };
       const seq = head() + 1;
       const stored = { ...record, seq };
-      storage.insert(seq, record.id || null, now, JSON.stringify(stored));
+      storage.insert(seq, record.id || null, now, JSON.stringify(stored), keep);
       storage.setMeta('head', String(seq));
-      storage.setMeta('lastEventAt', String(now));
+      if (!keep) storage.setMeta('lastEventAt', String(now));
       // Per-repo clock: only this repo's own events ever move it (R417).
-      if (typeof record.repo === 'string' && record.repo) storage.putProjection('repoEvents', record.repo.toLowerCase(), { repo: record.repo.toLowerCase(), lastEventAt: now });
+      if (!keep && typeof record.repo === 'string' && record.repo) storage.putProjection('repoEvents', record.repo.toLowerCase(), { repo: record.repo.toLowerCase(), lastEventAt: now });
       foldObservation(storage, stored);
-      storage.prune(seq - maxEvents, now - retentionMs);
+      pruneInTransaction(now);
       return { seq, duplicate: false };
-    }); },
+    };
+  const log = {
+    /** Append one compact GitHub fact. Returns `{ seq, duplicate }`. */
+    append(record, now = Date.now()) { return storage.transaction(() => appendInTransaction(record, now)); },
+    appendRuntime(raw, now = Date.now()) {
+      const event = validateRuntimeEvent(raw);
+      const id = `rt:${JSON.stringify([event.repo.toLowerCase(), event.number, event.head.toLowerCase(), event.action, event.cause, event.type])}`;
+      // Idempotency evidence outlives the event row: one compact map of key -> time (no bodies), so a replay after
+      // runtime retention pruned the row is still a duplicate. Bounded by age and by count (oldest first); both
+      // rewrite the single document, so no storage delete method is needed. A duplicate never touches feed-health clocks.
+      return storage.transaction(() => {
+        const keys = storage.getProjection('runtimeKeys', 'all')?.keys || {};
+        if (keys[id] != null && keys[id] >= now - runtimeKeyRetentionMs) return { seq: null, duplicate: true };
+        // Expiry must work on replay-only traffic, including rows left by an idle log.
+        // A row still within its own retention window remains duplicate evidence.
+        if (storage.hasDelivery(id)) pruneInTransaction(now);
+        const res = appendInTransaction({ ...event, id }, now, true);
+        if (res.duplicate) return res;
+        const live = Object.entries({ ...keys, [id]: now }).filter(([, at]) => at >= now - runtimeKeyRetentionMs)
+          .sort((x, y) => x[1] - y[1]).slice(-Math.max(1, maxRuntimeKeys));
+        storage.putProjection('runtimeKeys', 'all', { keys: Object.fromEntries(live) });
+        return res;
+      });
+    },
     bootstrap(raw, now = Date.now()) { return storage.transaction(() => {
       const input = validateBootstrap(raw);
       const importKey = JSON.stringify([input.repo, input.importId]);
@@ -318,7 +375,7 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
         return { cursor: h, events: [], reset: true, gap: false, more: false, ...meta };
       }
       const oldest = storage.minSeq();
-      const gap = oldest != null && cursor < oldest - 1;
+      const gap = cursor < Number(storage.getMeta('highestPrunedSeq') || 0) || (oldest != null && cursor < oldest - 1);
       const rows = storage.range(cursor, lim).map((j) => JSON.parse(j));
       const next = rows.length ? rows[rows.length - 1].seq : (gap ? h : cursor);
       return { cursor: next, events: rows, reset: false, gap, more: next < h, ...meta };
@@ -342,7 +399,8 @@ function repoFreshness(storage, head, now) {
   for (const repo of [...new Set([...boots.keys(), ...lastEvent.keys()])].sort()) {
     const b = boots.get(repo);
     const bootstrapAt = b ? clamp(b.at) : null;
-    const gap = b ? head > b.baseCursor && (oldest == null || b.baseCursor < oldest - 1) : true;
+    const gap = b ? b.baseCursor < Number(storage.getMeta('highestPrunedSeq') || 0) ||
+      (head > b.baseCursor && (oldest == null || b.baseCursor < oldest - 1)) : true;
     const lastEventAt = clamp(lastEvent.get(repo));
     const badEvent = lastEvent.has(repo) && lastEventAt == null; // an unreadable/future event time voids coverage
     // Open rows the Worker holds that the latest COMPLETE listing left out (rows a later event touched are newer, not omitted).
@@ -373,10 +431,23 @@ export function createMemoryStorage() {
     getMeta: (k) => (meta.has(k) ? meta.get(k) : null),
     setMeta: (k, v) => { meta.set(k, v); },
     hasDelivery: (id) => rows.some((r) => r.id === id),
-    insert: (seq, id, at, json) => { rows.push({ seq, id, at, json }); },
+    insert: (seq, id, at, json, keep = false) => { rows.push({ seq, id, at, json, keep }); },
     range: (after, limit) => rows.filter((r) => r.seq > after).slice(0, limit).map((r) => r.json),
     minSeq: () => (rows.length ? rows[0].seq : null),
-    prune: (throughSeq, olderThanMs) => { rows = rows.filter((r) => r.seq > throughSeq && r.at >= olderThanMs); },
+    prune: (maxEvents, olderThanMs, maxRuntimeEvents, runtimeOlderThanMs) => {
+      // Count each class's rows, not shared sequence positions: runtime traffic cannot evict young facts.
+      const facts = rows.filter((r) => !r.keep);
+      const throughSeq = facts.length > maxEvents ? facts[facts.length - maxEvents - 1].seq : 0;
+      const runtime = rows.filter((r) => r.keep);
+      const runtimeThrough = runtime.length > maxRuntimeEvents ? runtime[runtime.length - maxRuntimeEvents - 1].seq : 0;
+      let highest = 0;
+      rows = rows.filter((r) => {
+        const retain = r.keep ? r.seq > runtimeThrough && r.at >= runtimeOlderThanMs : r.seq > throughSeq && r.at >= olderThanMs;
+        if (!retain) highest = Math.max(highest, r.seq);
+        return retain;
+      });
+      return highest;
+    },
     _rows: () => rows,
   };
 }
@@ -410,6 +481,16 @@ export async function handleRequest(request, env, { getLog, now = () => Date.now
     }
     const res = await log.append(record, t);
     return json(202, { stored: !res.duplicate, seq: res.seq, duplicate: res.duplicate });
+  }
+
+  if (url.pathname === '/runtime-events') {
+    if (request.method !== 'POST') return json(405, { error: 'method not allowed' });
+    if (!env.PR_EVENTS_BOOTSTRAP_TOKEN) return json(503, { error: 'bootstrap token not configured' });
+    if (!timingSafeEqual(request.headers.get('authorization') || '', `Bearer ${env.PR_EVENTS_BOOTSTRAP_TOKEN}`)) return json(401, { error: 'unauthorized' });
+    let input;
+    try { input = validateRuntimeEvent(await request.json()); } catch { return json(400, { error: 'invalid runtime event' }); }
+    const result = await (await getLog()).appendRuntime(input, now());
+    return json(202, { stored: !result.duplicate, ...result });
   }
 
   if (url.pathname === '/prs/bootstrap') {
