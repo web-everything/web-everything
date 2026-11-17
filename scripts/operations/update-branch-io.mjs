@@ -12,7 +12,8 @@ export function createUpdateBranchSinks({ env = process.env, gh = runGhSync, sle
 } = {}) {
   const call = async (args) => String(await gh(['api', ...args], {
     encoding: 'utf8', timeout: 30_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
-    throttle: { maxAttempts: 1 },
+    // Fresh reads only: a memoized PR/compare would replay the pre-write head.
+    throttle: { maxAttempts: 1, env: { ...env, WE_GH_READ_MEMO_DIR: '' } },
   }));
   const prefix = repo => `repos/${ghRepoSlug(repo)}`;
   const read = async path => JSON.parse(await call([path]));

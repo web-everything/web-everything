@@ -75,7 +75,7 @@ describe('update-branch', () => {
     expect(f.sleep).toHaveBeenCalledTimes(1);
     expect(f.append).toHaveBeenCalledTimes(1);
     expect(f.append.mock.calls[0][0].detail).toEqual(result);
-    for (const [, options] of f.gh.mock.calls) expect(options).toMatchObject({ timeout: 30_000, maxBuffer: 4 * 1024 * 1024, throttle: { maxAttempts: 1 } });
+    for (const [, options] of f.gh.mock.calls) expect(options).toMatchObject({ timeout: 30_000, maxBuffer: 4 * 1024 * 1024, throttle: { maxAttempts: 1, env: { WE_GH_READ_MEMO_DIR: '' } } });
   });
 
   it('does not report updated when the new head is still behind', async () => {
