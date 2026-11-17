@@ -95,37 +95,38 @@ export const STUCK_THRESHOLD_ENV = Object.freeze({
 
 /**
  * Resolve env > scripts/settings/stuck-pr-watch.json > built-in default, per-stage.
- * Malformed files or parents fall back with a named diagnostic; missing settings retain the built-in defaults.
- * Throws on invalid per-stage settings or env overrides — a bad knob should fail loud, not silently disable a stage.
+ * Malformed files or reader failures fall back with a named diagnostic; missing settings retain the built-in defaults.
+ * Throws on invalid parents, per-stage settings or env overrides — a bad knob should fail loud, not silently disable a stage.
  * @param {NodeJS.ProcessEnv} [env]
  * @param {{readSettings?:Function, log?:Function}} [options] - lazy settings reader and warning sink.
  * @returns {Record<string, number>}
  */
 export function stuckThresholdMinutes(env = process.env, { readSettings: read = readDeclaredSettings, log = console.warn } = {}) {
   let configured;
+  let settings;
   try {
     const result = read();
-    const settings = result && Object.hasOwn(result, 'settings') ? result.settings : result;
+    settings = result && Object.hasOwn(result, 'settings') ? result.settings : result;
     for (const { source, error } of result?.errors ?? []) {
       if (source === 'settings/stuck-pr-watch.json') {
         log(`[stuck-pr-watch:settings-file-invalid] ${source}: ${error}`);
       }
     }
-    const isPlainObject = value => value !== null && typeof value === 'object'
-      && [Object.prototype, null].includes(Object.getPrototypeOf(value));
-    if (settings && Object.hasOwn(settings, 'stuckPrWatch')) {
-      if (!isPlainObject(settings.stuckPrWatch)) {
-        log('[stuck-pr-watch:invalid-threshold] stuckPrWatch must be a plain object; using built-in threshold defaults');
-      } else if (Object.hasOwn(settings.stuckPrWatch, 'thresholdMinutes')) {
-        if (!isPlainObject(settings.stuckPrWatch.thresholdMinutes)) {
-          log('[stuck-pr-watch:invalid-threshold] stuckPrWatch.thresholdMinutes must be a plain object; using built-in threshold defaults');
-        } else {
-          configured = settings.stuckPrWatch.thresholdMinutes;
-        }
-      }
-    }
   } catch {
     log('[stuck-pr-watch:settings-read-failed] using built-in threshold defaults');
+  }
+  const isPlainObject = value => value !== null && typeof value === 'object'
+    && [Object.prototype, null].includes(Object.getPrototypeOf(value));
+  if (settings && Object.hasOwn(settings, 'stuckPrWatch')) {
+    if (!isPlainObject(settings.stuckPrWatch)) {
+      throw new TypeError('stuckPrWatch must be a plain object');
+    }
+    if (Object.hasOwn(settings.stuckPrWatch, 'thresholdMinutes')) {
+      if (!isPlainObject(settings.stuckPrWatch.thresholdMinutes)) {
+        throw new TypeError('stuckPrWatch.thresholdMinutes must be a plain object');
+      }
+      configured = settings.stuckPrWatch.thresholdMinutes;
+    }
   }
   const out = {};
   for (const stage of Object.values(STUCK_STAGES)) {
