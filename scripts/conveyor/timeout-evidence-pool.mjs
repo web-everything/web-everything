@@ -4,7 +4,7 @@ import { readFileSync, readSync, writeFileSync, statSync, mkdtempSync, rmSync, o
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawn, execFileSync } from 'node:child_process';
-import { URL as NodeURL } from 'node:url';
+import { URL as NodeURL, fileURLToPath } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
 import { readSettings } from '../lib/settings-files.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
@@ -45,42 +45,8 @@ function workerGroupAlive(pid) {
   return String(execFileSync('ps', ['-axo', 'pgid=,stat='], { encoding: 'utf8', timeout: 1000, maxBuffer: 4 * 1024 * 1024 }))
     .split('\n').some(line => { const [group, state] = line.trim().split(/\s+/); return Number(group) === pid && state && !state.startsWith('Z'); });
 }
-const WORKER = `
-import { readFileSync, writeFileSync, renameSync } from 'node:fs';
-import { probeTimeoutEvidenceThrottle } from ${JSON.stringify(new NodeURL('./timeout-evidence-pool.mjs', import.meta.url).href)};
-import { readTimeoutEvidence } from ${JSON.stringify(new NodeURL('./reconcile-pass.mjs', import.meta.url).href)};
-const [input, output] = process.argv.slice(1);
-let degraded = false;
-const stderrWrite = process.stderr.write.bind(process.stderr);
-process.stderr.write = (chunk, ...args) => {
-  if (/gh-throttle:.*(?:fail-open|running this call ungated)/.test(String(chunk))) {
-    degraded = true;
-    stderrWrite(chunk, ...args);
-    reportFailure(); // Stop inside the warning, before the throttle can run ungated.
-  }
-  return stderrWrite(chunk, ...args);
-};
-const failure = () => ({ workerError: true, ...(degraded ? { reason: 'throttle-degraded' } : {}) });
-function reportFailure() {
-  try {
-    writeFileSync(output + '.tmp', JSON.stringify(failure()));
-    renameSync(output + '.tmp', output);
-  } catch {}
-  process.exit(1);
-}
-try {
-  if (probeTimeoutEvidenceThrottle() !== true) { degraded = true; reportFailure(); }
-} catch { degraded = true; reportFailure(); }
-try {
-  const { pr, repo, task } = JSON.parse(readFileSync(input, 'utf8'));
-  const value = task
-    ? await (await import(task.module))[task.exportName](pr, task.options)
-    : readTimeoutEvidence(pr, { repo });
-  writeFileSync(output + '.tmp', JSON.stringify(degraded ? failure() : { value }));
-  renameSync(output + '.tmp', output);
-  process.exit(0);
-} catch { reportFailure(); }
-`;
+// Spawned by path: rebuild's collectRunClosure tracks it; each child loads fresh disk code.
+const WORKER = fileURLToPath(new NodeURL('./timeout-evidence-worker.mjs', import.meta.url));
 
 // Runs inside the wrapper's detached group, independently of the blocking planner.
 const WATCHDOG = `
@@ -106,7 +72,7 @@ planner=$PPID
 trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP
 trap 'code=$?; printf "%s" "$code" > "$7.done"; exec /bin/sleep 180' 0
 "$1" --input-type=module -e "$3" "$planner" "$$" "$5" "$4" "$7" &
-"$1" --input-type=module -e "$2" "$6" "$7"
+"$1" "$2" "$6" "$7"
 `;
 
 /** No pipes: the parent blocks without servicing Node's stream/event loop. Undefined slots fall back serially. */

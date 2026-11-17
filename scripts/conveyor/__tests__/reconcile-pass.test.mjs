@@ -1995,7 +1995,7 @@ describe('timeout evidence bounded readers', () => {
     });
     const launch = (_node, args, opts) => {
       expect(opts.stdio.slice(1).every(Number.isInteger)).toBe(true);
-      expect(args[4]).toContain('readTimeoutEvidence');
+      expect(args[4]).toMatch(/[/\\]timeout-evidence-worker\.mjs$/);
       expect(opts.detached).toBe(true);
       const output = args.at(-1); folder = evidenceJoin(output, '..');
       const child = { pid: pid++, on: () => {} };

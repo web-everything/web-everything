@@ -2,8 +2,9 @@ import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, mkdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { URL as NodeURL, pathToFileURL } from 'node:url';
+import { URL as NodeURL, pathToFileURL, fileURLToPath } from 'node:url';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
+import { collectRunClosure, decideSkipRebuild } from '../../lib/daemon-rebuild/skip-unrelated.mjs';
 import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 import { probeTimeoutEvidenceThrottle, runTimeoutEvidencePool, pooledReadMap, evidenceMemoKey, memoEvidence, withTickEvidence, currentTickEvidence } from '../timeout-evidence-pool.mjs';
 import { enrichPrsWithTimeoutEvidence, readTimeoutEvidence } from '../reconcile-pass.mjs';
@@ -187,17 +188,17 @@ fs.mkdirSync = function (path, ...args) {
 };
 syncBuiltinESMExports();
 `);
-    let workerSource;
-    const launch = vi.fn((_file, args) => { workerSource = args[4]; return { on() {} }; });
+    let workerPath;
+    const launch = vi.fn((_file, args) => { workerPath = args[4]; return { on() {} }; });
     runTimeoutEvidencePool([pr], { repo, env, launch });
     expect(launch).toHaveBeenCalledOnce();
     const input = join(dir, 'input.json'), output = join(dir, 'result.json');
     writeFileSync(input, JSON.stringify({ pr, repo }));
     // Run the shipped worker to completion without planner cancellation masking a bypass.
-    const runWorker = source => spawnSync(process.execPath, ['--require', preload, '--input-type=module', '-e', source, input, output], {
+    const runWorker = path => spawnSync(process.execPath, ['--require', preload, path, input, output], {
       env: { ...env, GH_CALL_RECORD: calls }, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
     });
-    const child = runWorker(workerSource);
+    const child = runWorker(workerPath);
     expect(child.error).toBeUndefined();
     expect(child.signal).toBeNull();
     expect(child.status).toBe(1);
@@ -208,10 +209,14 @@ syncBuiltinESMExports();
     expect(existsSync(calls)).toBe(false);
 
     // Prove the zero-call assertion detects removing this exact interception branch.
+    const workerSource = readFileSync(workerPath, 'utf8');
     const mutant = workerSource.replace('reportFailure(); // Stop inside the warning', '// Stop inside the warning');
     expect(mutant).not.toBe(workerSource);
     rmSync(reached);
-    const mutation = runWorker(mutant);
+    const mutantPath = join(dir, 'mutant-worker.mjs');
+    writeFileSync(mutantPath, mutant.replace(/from '(\.\/[^']+)'/g, (_, spec) =>
+      'from ' + JSON.stringify(new NodeURL(spec, pathToFileURL(workerPath)).href)));
+    const mutation = runWorker(mutantPath);
     expect(mutation.error).toBeUndefined();
     expect(mutation.signal).toBeNull();
     expect(mutation.stderr).toContain('(fail-open)');
@@ -583,7 +588,7 @@ it('the shared production worker invokes the configured reader and transports it
       env: { ...process.env, WE_GH_THROTTLE_CAP: '4', WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'throttle') },
       launch: (_file, args, options) => {
         // Run the actual JS worker using Node only; process-group lifecycle is injected separately.
-        const worker = spawnSync(process.execPath, ['--input-type=module', '-e', args[4], args.at(-2), args.at(-1)], {
+        const worker = spawnSync(process.execPath, [args[4], args.at(-2), args.at(-1)], {
           env: options.env, encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024,
         });
         expect(worker.status, worker.stderr).toBe(0);
@@ -608,4 +613,21 @@ it('tick memo scope crosses awaits and nested planner calls, stays isolated and 
     expect(currentTickEvidence()).toBe(first);
   });
   expect(currentTickEvidence()).toBeUndefined();
+});
+
+
+it('rebuild tracking discovers the spawned worker and fails closed for its dynamic task closure', () => {
+  const root = fileURLToPath(new NodeURL('../../../', import.meta.url));
+  const worker = 'scripts/conveyor/timeout-evidence-worker.mjs';
+  const closure = collectRunClosure({ root, entries: ['scripts/conveyor/timeout-evidence-pool.mjs'],
+    byName: () => [], stopWhenIncomplete: true,
+    exists: path => {
+      if (!path.startsWith(root)) return false;
+      try { return statSync(path).isFile(); } catch { return false; }
+    },
+  });
+  expect(closure.files).toContain(worker);
+  expect(closure.complete).toBe(false);
+  expect(decideSkipRebuild({ changedFiles: [worker], closure }).skip).toBe(false);
+  expect(decideSkipRebuild({ changedFiles: ['scripts/unknown-reader.mjs'], closure }).skip).toBe(false);
 });
