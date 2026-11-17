@@ -125,9 +125,6 @@ export const NON_BLOCKING_CONCLUSIONS = Object.freeze(['skipped', 'neutral']);
  */
 export const CI_TRUTH_EXCLUDED_CHECKS = Object.freeze(['review-gate', 'soak-replay-gate']);
 
-/** Routing/merge policy checks cannot be repaired by a CI-heal, even when required. */
-export const GATE_CLASS_CHECKS = Object.freeze(['merge-gate', 'review-gate']);
-
 /**
  * Conclusions that mean the check ran and did not succeed.
  *

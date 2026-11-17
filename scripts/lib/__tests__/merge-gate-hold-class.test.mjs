@@ -477,3 +477,42 @@ describe('review-hold annotation (card 273, #5157)', () => {
     }
   });
 });
+
+
+describe('main CI freeze review annotation', () => {
+  const log = `#4965: HOLD
+  hold red-main-freeze main is RED (freeze: main CI red since abc123: test failed)
+merge-gate: HOLD — held`;
+  it.each(['', '  hold test-gaming suspected\n'])(
+    'annotates main CI freeze with review holds %s while leaving merge-gate red', extra => {
+      const readVerdict = () => verdict(log.replace('merge-gate:', `${extra}merge-gate:`));
+      expect(excuseMergeGateRows([row], opts({ readVerdict }))).toMatchObject({ excused: false, reviewHold: true,
+        rows: [{ conclusion: 'FAILURE', mergeGateReviewHold: { holds: extra ? ['red-main-freeze', 'test-gaming'] : ['red-main-freeze'] } }] });
+    });
+  it('dispatches the pending review and no ci-heal with advisory handoff disabled', () => {
+    const result = plan({ readVerdict: () => verdict(log), loadPrOwnership: () => ({ advisoryReviewOnHumanHandoff: { value: 'off', source: 'test' } }) });
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'review' })]);
+    expect(result.refusals.some(r => r.kind === 'review-ci')).toBe(false);
+  });
+  it('still owes ci-heal when test fails alongside the annotated freeze', () => {
+    expect(plan({ readVerdict: () => verdict(log), testRed: true }).dispatch)
+      .toEqual([expect.objectContaining({ kind: 'ci-heal' })]);
+  });
+  it.each([
+    log.replace('hold red-main-freeze', 'fail-closed red-main-freeze'),
+    log.replace('merge-gate:', '  hold codeql alert\nmerge-gate:'),
+    log.replace('main CI red since abc123: test failed', 'manual freeze: operator'),
+    log.replace('merge-gate: HOLD — held', 'merge-gate: HOLD — workflow self-check failed'),
+    log.replace('merge-gate: HOLD — held', ''),
+  ])('keeps fail-closed, other holds and incomplete/job-level failures unannotated and healable: %s', badLog => {
+    const readVerdict = () => verdict(badLog);
+    expect(excuseMergeGateRows([row], opts({ readVerdict }))).toEqual({ rows: [row], excused: false });
+    expect(plan({ readVerdict }).dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal' })]);
+  });
+  it.each([{ error: 'unreadable' }, { ...verdict(log), head_sha: 'b'.repeat(40) }])(
+    'keeps unreadable or wrong-head freeze evidence unannotated and healable', evidence => {
+      const readVerdict = () => evidence;
+      expect(excuseMergeGateRows([row], opts({ readVerdict }))).toEqual({ rows: [row], excused: false });
+      expect(plan({ readVerdict }).dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal' })]);
+    });
+});

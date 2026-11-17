@@ -3539,53 +3539,6 @@ describe('draft-first PRs — reconcile-core.mjs (operator-approved 2026-09-27)'
   });
 });
 
-describe('gate-class failures never owe CI healing', () => {
-  const check = (name, conclusion = 'success') => ({ name, status: 'completed', conclusion });
-  const plan = (rows, over = {}) => planReconcile({ requiredChecks: ['test', 'merge-gate', 'review-gate'],
-    prs: [pr1563({ labels: lbl('review:pending'), comments: [], statusCheckRollup: rows, ...over })],
-    agents: [], now: NOW });
-
-  it.each(['merge-gate', 'review-gate'])('dispatches a normal review for unannotated %s-only red with tests green', gate => {
-    const result = plan([check('test'), check('merge-gate'), check('review-gate')]
-      .map(row => row.name === gate ? check(gate, 'failure') : row));
-    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'review', prNumber: 1563 })]);
-    expect(result.dispatch.some(row => row.kind === 'ci-heal')).toBe(false);
-  });
-
-  it.each([false, true])('heals only test when merge-gate is also red: %s', gateRed => {
-    const result = plan([check('test', 'failure'), check('merge-gate', gateRed ? 'failure' : 'success'), check('review-gate')]);
-    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', failingRequiredChecks: ['test'] })]);
-    expect(result.dispatch[0].why).toContain('a required check is failing (test)');
-  });
-
-  it.each([
-    ['missing test', [check('merge-gate', 'failure'), check('review-gate')]],
-    ['pending test', [{ name: 'test', status: 'in_progress' }, check('merge-gate', 'failure'), check('review-gate')]],
-  ])('does not authorize a review with %s', (_, rows) => {
-    const result = plan(rows);
-    expect(result.dispatch).toEqual([]);
-    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci' }));
-  });
-
-  it('does not authorize a review without a head SHA', () => {
-    const result = plan([check('test'), check('merge-gate', 'failure'), check('review-gate')], { headRefOid: null });
-    expect(result.dispatch).toEqual([]);
-    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci' }));
-  });
-
-  it('keeps an unannotated gate-only red draft unpromoted without healing it', () => {
-    const result = plan([check('test'), check('merge-gate', 'failure'), check('review-gate')], { isDraft: true });
-    expect(result.dispatch).toEqual([]);
-    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'nothing-owed', why: 'only gate-class checks are failing; no CI repair is owed' }));
-  });
-
-  it('does not dispatch a review or heal for accepted/ready gate-only red', () => {
-    const result = plan([check('test'), check('merge-gate', 'failure'), check('review-gate')],
-      { labels: lbl('review:accepted', 'ready') });
-    expect(result.dispatch).toEqual([]);
-  });
-});
-
 describe('review-hold-only required reds do not deadlock draft promotion or review', () => {
   const requiredChecks = ['test', 'merge-gate', 'review-gate'];
   const check = (name, conclusion = 'success', extra = {}) => ({ name, status: 'completed', conclusion, ...extra });
@@ -3611,6 +3564,7 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
   });
 
   it.each([
+    ['unannotated red merge-gate', () => [check('test'), check('merge-gate', 'failure'), check('review-gate', 'failure')]],
     ['another required red check', () => heldRollup().map(row => row.name === 'test' ? check('test', 'failure') : row)],
   ])('does not promote a draft with %s; CI healing still owns the failure', (_, rollup) => {
     const result = plan({ statusCheckRollup: rollup() });
@@ -3630,11 +3584,12 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
     ['annotated merge-gate and review-gate red', heldRollup],
   ])('hands a non-draft with %s to the review daemon instead of the review-ci config-conflict refusal', (_, rollup) => {
     const result = plan({ isDraft: false, statusCheckRollup: rollup() });
-    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'review' })]);
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'review', prNumber: 1563 })]);
     expect(result.refusals.filter(row => row.kind === 'review-ci' || row.reviewRefusal?.kind === 'review-ci')).toEqual([]);
   });
 
   it.each([
+    ['unannotated red merge-gate', () => [check('test'), check('merge-gate', 'failure'), check('review-gate', 'failure')]],
     ['another required red check', () => heldRollup().map(row => row.name === 'test' ? check('test', 'failure') : row)],
   ])('reviewChecksAllow still refuses a non-draft with %s even after not-a-ci-break escalation', (_, rollup) => {
     const result = plan({ isDraft: false, statusCheckRollup: rollup(), comments: [{ author: AUTOMATION,
@@ -3904,11 +3859,11 @@ it.each([[], [finding()]])('x6n7c2p required checks before review — fail close
     expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci' }));
   }
 });
-it('required review-gate alone dispatches review without repeatedly healing review completion', () => {
+it('required review-gate conflict refuses without repeatedly healing review completion', () => {
   const plan = planReconcile({ requiredChecks: ['review-gate'], agents: [], now: NOW,
     prs: [pr1563({ labels: lbl('review:pending'), statusCheckRollup: [{ name: 'review-gate', status: 'completed', conclusion: 'failure' }] })] });
-  expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'review' })]);
-  expect(plan.refusals).toEqual([]);
+  expect(plan.dispatch).toEqual([]);
+  expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'review-ci', ci: expect.objectContaining({ reason: 'required-review-gate-conflict' }) })]);
 });
 describe('required review-gate conflict is scoped to the review it gates', () => {
   const failed = name => ({ name, status: 'completed', conclusion: 'failure' });

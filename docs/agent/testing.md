@@ -4426,9 +4426,12 @@ share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and gran
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
 
-## Gate-class CI repair regressions
 
-`merge-gate` and `review-gate` failures never owe CI healing, even when required and
-unannotated. Pin gate-only review-pending dispatch separately from annotated draft
-promotion; mixed real/gate failures must name only real checks in the heal. Keep
-missing/pending required evidence and missing-head review refusals covered.
+## Main CI freeze review routing
+
+`merge-gate-hold-class.test.mjs` pins the head-bound, table-only HOLD evidence for a main-CI
+`red-main-freeze`: annotate its hold ids without turning the check green or permitting a merge.
+The pending review uses the normal review guards even with advisory handoff disabled. Wrong-head,
+unreadable, job-level failures, fail-closed rows and other hold ids retain CI healing; a red `test`
+alongside an annotated freeze also retains its ci-heal. Keep review annotation separate from
+`HUMAN_REVIEW_HOLD_GATES`, which also controls merge verdicts.
