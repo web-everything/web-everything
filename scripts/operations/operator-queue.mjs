@@ -815,16 +815,18 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
         const comments = [...annotateLapsedStandDowns(pr, { onLapse: () => {} }).comments]
           .sort((a, b) => (Date.parse(a.createdAt) || 0) - (Date.parse(b.createdAt) || 0));
         const unresolved = standDownAnswers?.latestUnresolvedStandDown(comments);
+        const reason = unresolved ? standDownReason(unresolved.body) ?? '' : '';
+        const clause = STAND_DOWN_REASONS['needs-judgment'];
+        const question = reason === clause ? '' : reason.startsWith(`${clause}. `) ? reason.slice(clause.length + 2).trim() : reason.trim();
         if (standDownAnswers && !unresolved) {
           if (standDownAnswers.latestOperatorAnswer(comments)) {
             (report.standDownAnswered ??= []).push({ repo, number: pr.number, title: pr.title,
               answeredAt: standDownAnswers.latestOperatorAnswerAt(comments) });
           }
         } else if (unresolved && standDownQueueSection === 'needs-you'
-          && standDownTrailerReason(unresolved.body) === 'needs-judgment') {
-          const reason = standDownReason(unresolved.body) ?? '';
-          const clause = STAND_DOWN_REASONS['needs-judgment'];
-          const question = reason === clause ? '' : reason.startsWith(`${clause}. `) ? reason.slice(clause.length + 2) : reason;
+          && standDownTrailerReason(unresolved.body) === 'needs-judgment' && question) {
+          // Older stand-downs may carry only the generic reason. Keep those visible with
+          // that reason in STOOD DOWN rather than publishing an empty fixer question.
           const remaining = remainingStandDownFindings?.({ ...pr, comments }, { repo }) ?? [];
           (report.needsYouStandDowns ??= []).push({ repo, number: pr.number, title: pr.title,
             standDownAt: unresolved.createdAt, question, remaining });

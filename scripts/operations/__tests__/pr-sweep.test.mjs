@@ -33,6 +33,42 @@ const mkPr = (o) => ({ repo: REPO, number: 5485, title: 't', isDraft: false, hea
 const sweep = (prs, extra = {}) => assessPrSweep({ now: NOW, stalledAfterMinutes: 45, prs, liveJobs: [], drainSkips: [], ...extra });
 const row = (report, n) => report.prs.find((r) => r.number === n);
 
+describe('stacked base waits preserve actionable states and deadlines', async () => {
+  const { buildStandDownComment } = await import('../../conveyor/stand-down.mjs');
+  const base = mkPr({ number: 900, headRefName: 'lane/base', updatedAt: '2026-10-21T11:00:00Z' });
+  const child = mkPr({ number: 901, baseRefName: base.headRefName, labels: L('ready-to-merge'),
+    updatedAt: '2026-10-21T05:00:00Z' });
+  it.each([
+    ['failed CI label', { labels: L('ci:failed') }, 'ci-failed'],
+    ['failed CI rollup', { statusCheckRollup: [{ name: 'unit', conclusion: 'FAILURE' }] }, 'ci-failed'],
+    ['repair owed', { labels: L('review:changes') }, 'fixing'],
+    ['send-back', { labels: L('status:sent-back-red-team') }, 'sent-back-red-team'],
+    ['terminal stand-down', { labels: L('review:changes'), comments: [c('web-everything', '2026-10-21T10:00:00Z',
+      buildStandDownComment({ reason: 'gate-red', detail: 'verify red' }))] }, 'system:fix-stood-down'],
+  ])('an open base never hides %s', (_name, patch, waitingOn) => {
+    expect(row(sweep([base, { ...child, ...patch }]), child.number))
+      .toMatchObject({ waitingOn, stalled: true });
+  });
+  it('dates the deadline from the base rather than the old child', () => {
+    expect(row(sweep([base, child]), child.number)).toMatchObject({ waitingOn: 'waiting-on-base', stalled: false,
+      since: '2026-10-21T11:00:00.000Z', deadline: '2026-10-21T13:00:00.000Z' });
+  });
+  it.each(['CLOSED', 'MERGED'])('a %s base restores normal handling', state => {
+    expect(row(sweep([{ ...base, state }, child]), child.number))
+      .toMatchObject({ waitingOn: 'ready-to-merge', stalled: true });
+  });
+  it('an expired base hold restores normal handling despite fresh bookkeeping timestamps', () => {
+    const held = { ...base, labels: L('status:needs-you'), labelEvents: [{ label: 'status:needs-you', at: '2026-10-21T09:00:00Z' }] };
+    expect(row(sweep([held, child], { now: Date.parse('2026-10-21T11:00:00Z') }), child.number))
+      .toMatchObject({ waitingOn: 'waiting-on-base', stalled: false });
+    expect(row(sweep([held, child]), child.number)).toMatchObject({ waitingOn: 'ready-to-merge', stalled: true });
+  });
+  it('an unreadable base age cannot excuse a stall', () => {
+    expect(row(sweep([{ ...base, updatedAt: 'unreadable' }, child]), child.number))
+      .toMatchObject({ waitingOn: 'ready-to-merge', stalled: true });
+  });
+});
+
 describe('repair process identity at a terminal stand-down', async () => {
   const { buildStandDownComment } = await import('../../conveyor/stand-down.mjs');
   const stoppedAt = Date.parse('2026-10-21T11:00:00Z');

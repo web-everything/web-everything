@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { planNotifications, runOperatorNotify, itemKey } from '../operator-notify.mjs';
 import { readState, writeState } from '../operator-notify-io.mjs';
 import { evaluatePr } from '../operator-queue.mjs';
+import { withHumanReviewEvidence } from '../../lib/__tests__/helpers/human-review-evidence.mjs';
 
 const row = { repo: 'web-everything/web-everything', number: 2108, title: 'Review this PR' };
 const now = '2026-09-20T12:00:00Z';
@@ -79,10 +80,11 @@ describe('notification state', () => {
 });
 
 it('only NEEDS YOU notifies, using the authority’s real evaluator', async () => {
-  const head = 'fd37ce270aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const head = 'fd37ce270aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
   // Same current-format advisory fixture as scripts/__tests__/operator-queue.test.mjs.
   const advisory = (outcome) => ({ body: `**Verdict:** 🚦 human review required\n**Advisory outcome:** \`${outcome}\` — x.\nNet basis: \`${'a'.repeat(40)}..${head}\``, createdAt: now });
-  const pr = (number, overrides = {}) => ({ number, title: row.title, labels: [{ name: 'review:human' }, { name: 'advisory:accepted' }], comments: [advisory('accept')], headRefOid: head, mergeable: 'MERGEABLE', statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }], ...overrides });
+  // READY requires a full head, scoped run evidence and a separate red-team pass, not just advisory acceptance.
+  const pr = (number, overrides = {}) => withHumanReviewEvidence({ repo: row.repo, number, title: row.title, labels: [{ name: 'review:human' }, { name: 'advisory:accepted' }], comments: [advisory('accept')], headRefOid: head, mergeable: 'MERGEABLE', statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }], ...overrides });
   // Mirrors main's review:human filter and evaluatePr bucketing. UNKNOWN remains
   // UNKNOWN after fixture polling; no real gh or sleeps are needed here.
   const bucket = (prs) => {

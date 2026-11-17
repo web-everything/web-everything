@@ -26,6 +26,8 @@ const stage = (root) => {
   for (const file of ['human-review-gates.mjs', 'open-pr-base.mjs']) {
     copyFileSync(join(dirname(LEAF), file), join(root, 'lib', file));
   }
+  // The shared readiness predicate also vetoes unknown review-run evidence; retain that reader's import graph.
+  symlinkSync(join(dirname(LEAF), 'drain-red-team-evidence.mjs'), join(root, 'lib', 'drain-red-team-evidence.mjs'));
   copyFileSync(join(dirname(LEAF), 'constellation-repos.mjs'), join(root, 'lib', 'constellation-repos.mjs'));
   mkdirSync(join(root, 'conveyor'));
   copyFileSync(join(dirname(LEAF), '../conveyor/unsupported-repo.mjs'), join(root, 'conveyor/unsupported-repo.mjs'));

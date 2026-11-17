@@ -104,7 +104,8 @@ const LOCK_STALE_MS_DEFAULT = 30_000;
 
 /** Same-host pid-liveness probe for a lock's recorded holder (PR #2735 red-team finding 2) — mirrors
  *  `we:scripts/readiness/drain-lock.mjs#probeNumberingHolderLiveness`'s own `process.kill(pid, 0)` convention:
- *  `'dead'` ONLY on a proven `ESRCH` (no such process on this host); `'alive'`/`'unknown'` otherwise. A
+ *  `'dead'` ONLY on a proven `ESRCH` (no such process on this host); `'alive'`/`'unknown'` otherwise.
+ *  EPERM also proves existence: permission to signal the holder is not required to honor its lock. A
  *  stale-BY-AGE lock whose recorded holder is still genuinely running (a slow critical section, never a crash)
  *  must not be stolen just because it outlived `staleMs`. No pid recorded at all (an older/foreign lock shape,
  *  or unreadable content) answers `'unknown'` — falls back to the age-only heuristic this repo shipped before
@@ -119,7 +120,7 @@ function probeLockHolderLiveness(lockPath, readFileSyncFn) {
   if (!Number.isInteger(pid) || pid <= 0) return 'unknown';
   if (pid === process.pid) return 'alive'; // can't be our own dead holder
   try { process.kill(pid, 0); return 'alive'; }
-  catch (e) { return e && e.code === 'ESRCH' ? 'dead' : 'unknown'; }
+  catch (e) { return e?.code === 'EPERM' ? 'alive' : e?.code === 'ESRCH' ? 'dead' : 'unknown'; }
 }
 
 /**

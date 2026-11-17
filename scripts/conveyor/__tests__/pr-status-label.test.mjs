@@ -22,6 +22,7 @@ import { tagReviewStatus as tagReviewStatusIo, LEGACY_REVIEW_STATUS_DEFAULT } fr
 import { evaluatePr } from '../../operations/operator-queue.mjs';
 import { STAND_DOWN_MARKER } from '../stand-down.mjs';
 import { takeoverMarkerBody } from '../fix-takeover.mjs';
+import { withHumanReviewEvidence } from '../../lib/__tests__/helpers/human-review-evidence.mjs';
 
 import { resolvePrStatusSettings, loadPrStatusSettings, prStatusSettingValues, PR_STATUS_SETTING_DEFAULTS } from '../pr-status-settings.mjs';
 
@@ -211,7 +212,8 @@ describe('truthful stage regressions', () => {
     expect(planPrStatusLabel({ state, currentLabels: subject.labels })).toEqual({ add: 'status:answered-waiting-fixer', remove: ['status:needs-you'] });
   });
   it('matches the queue, including mergeability and CI gates on daemon snapshots', () => {
-    const subject = pr(['review:human', 'advisory:accepted'], [verdict()], { mergeStateStatus: 'CLEAN', statusCheckRollup: [check('test')] });
+    // Advisory acceptance alone is insufficient: pin the repo and independent red-team evidence.
+    const subject = withHumanReviewEvidence(pr(['review:human', 'advisory:accepted'], [verdict()], { repo: 'owner/repo', mergeStateStatus: 'CLEAN', statusCheckRollup: [check('test')] }));
     expect(evaluatePr({ ...subject, mergeable: 'MERGEABLE' }).ready).toBe(true);
     expect(operatorQueueNeedsYou(subject)).toBe(true);
     expect(derive({ pr: subject })).toBe('needs-you');

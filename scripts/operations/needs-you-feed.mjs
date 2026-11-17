@@ -227,15 +227,6 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
       if (!Array.isArray(view.labels)) throw new Error('the live PR read has no labels');
       // Publish the head actually checked, not a stale report head or a later lookup.
       checked = { ...item, head: view.headRefOid };
-      if (view.baseRefName && view.baseRefName !== 'main') {
-        const bases = JSON.parse(String(await gh('gh', ['pr', 'list', '--repo', item.repo, '--state', 'open',
-          '--head', view.baseRefName, '--limit', '100', '--json', 'number,state,headRefName'],
-        { cwd, encoding: 'utf8', timeout: 60000, maxBuffer: 1024 * 1024 })));
-        if (!Array.isArray(bases) || bases.length >= 100 || bases.some(p => !Number.isSafeInteger(p?.number)
-          || p.number <= 0 || typeof p.headRefName !== 'string' || p.state !== 'OPEN')) throw new Error('open base PR evidence incomplete');
-        const base = openBasePr({ ...view, repo: item.repo }, bases.map(p => ({ ...p, repo: item.repo })));
-        if (base) { held.push({ item, reasons: [`waiting on open base PR #${base.number}`] }); return; }
-      }
       const gates = currentHeadHumanReviewGates({ ...view, number: item.pr, repo: item.repo });
       const reasons = humanReviewHold({ ...view, labels: view.labels ?? [] }, now,
         { fixClaimLive: fixClaimLive(item.repo, item.pr) });
@@ -251,6 +242,15 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
       // An index-0 hold that is only "publication pending" (stored evidence not sealed yet) is no break: never approve, never alarm.
       const publicationPending = (disposition?.held ?? []).some(f => f.index === 0 && f.unsealed === true);
       const owed = (state.result?.findings ?? []).some(f => f.confirmed && !settled(f)) || (open.has(0) && !publicationPending);
+      if (!owed && view.baseRefName && view.baseRefName !== 'main') {
+        const bases = JSON.parse(String(await gh('gh', ['pr', 'list', '--repo', item.repo, '--state', 'open',
+          '--head', view.baseRefName, '--limit', '100', '--json', 'number,state,headRefName'],
+        { cwd, encoding: 'utf8', timeout: 60000, maxBuffer: 1024 * 1024 })));
+        if (!Array.isArray(bases) || bases.length >= 100 || bases.some(p => !Number.isSafeInteger(p?.number)
+          || p.number <= 0 || typeof p.headRefName !== 'string' || p.state !== 'OPEN')) throw new Error('open base PR evidence incomplete');
+        const base = openBasePr({ ...view, repo: item.repo }, bases.map(p => ({ ...p, repo: item.repo })));
+        if (base) { held.push({ item, reasons: [`waiting on open base PR #${base.number}`] }); return; }
+      }
       // A confirmed break is classified before the hold: a hold (blocked, sent back) must not hide the alert.
       if (reasons.length && !owed) { held.push({ item, reasons }); return; }
       if (owed) {

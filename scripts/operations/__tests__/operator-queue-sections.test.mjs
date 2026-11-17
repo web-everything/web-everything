@@ -9,9 +9,11 @@ import { withHumanReviewEvidence } from '../../lib/__tests__/helpers/human-revie
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 
-vi.mock('node:child_process', () => {
+vi.mock('node:child_process', async (importOriginal) => {
+  // Run-evidence imports also use async subprocess APIs; retain their guarded exports.
+  const original = await importOriginal();
   const execFileSync = vi.fn();
-  return { execFileSync, default: { execFileSync } };
+  return { ...original, execFileSync, default: { ...original.default, execFileSync } };
 });
 if (process.versions.bun) await import('../../lib/gh-throttle.mjs?real');
 const mockModule = vi.mock;

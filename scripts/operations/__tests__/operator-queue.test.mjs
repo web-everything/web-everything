@@ -391,6 +391,19 @@ describe('staged copies missing an optional reader', () => {
   });
 });
 
+it('keeps needs-judgment without a fixer question in STOOD DOWN with its reason', () => {
+  vi.stubEnv('WE_REVIEW_STAND_DOWN_QUEUE_SECTION', 'needs-you');
+  const held = { ...standDown, body: buildStandDownComment({ reason: 'needs-judgment' }) };
+  execFileSync.mockReturnValue(JSON.stringify([pr(7, [held])]));
+  run(['--json']);
+  const report = JSON.parse(stdout());
+  expect(report.needsYouStandDowns ?? []).toEqual([]);
+  expect(report.stoodDown).toEqual([{ repo: 'o/n', number: 7, title: 'PR 7',
+    standDownAt: held.createdAt,
+    reason: "the reviewer's finding needs a judgment the fix agent could not safely make, so it did NOT guess",
+    alsoReviewHuman: false }]);
+});
+
 it('routes needs-judgment to NEEDS YOU with the fixer question', () => {
   vi.stubEnv('WE_REVIEW_STAND_DOWN_QUEUE_SECTION', 'needs-you');
   const held = { ...standDown, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Please rule not-real on this finding.' }) };

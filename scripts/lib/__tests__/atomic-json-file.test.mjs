@@ -4,7 +4,7 @@
  *   directory only (never the operator's own files) — proves the write actually lands, the rename is genuinely
  *   atomic (no leftover `.tmp` survives success), and a validation failure never touches the real target path.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, unlinkSync, utimesSync,
   writeFileSync,
@@ -148,6 +148,30 @@ describe('withFileLock', () => {
     writeFileSync(lockPath, '999999999'); // fresh — mtime is "now"
     expect(() => withFileLock(lockPath, () => 'should never run', { staleMs: 60_000, timeoutMs: 100, pollMs: 10 }))
       .toThrow(/timed out/);
+  });
+
+  it.each(['before takeover', 'after takeover'])('EPERM preserves an aged holder %s', (stage) => {
+    const lockPath = join(dir, 'permission.lock');
+    const holder = 999999999;
+    writeFileSync(lockPath, `${holder}\n`);
+    const past = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, past, past);
+    const fn = vi.fn();
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
+      throw Object.assign(new Error('signal permission denied'), { code: 'EPERM' });
+    });
+    // The post-move probe must also honor a holder that became live after the first read.
+    if (stage === 'after takeover') kill.mockImplementationOnce(() => {
+      throw Object.assign(new Error('no such process'), { code: 'ESRCH' });
+    });
+    try {
+      expect(() => withFileLock(lockPath, fn, { staleMs: 1_000, timeoutMs: 0 })).toThrow(/timed out/);
+      expect(kill).toHaveBeenCalledWith(holder, 0);
+      expect(kill).toHaveBeenCalledTimes(stage === 'after takeover' ? 2 : 1);
+      expect(fn).not.toHaveBeenCalled();
+      expect(readFileSync(lockPath, 'utf8')).toBe(`${holder}\n`);
+      expect(readdirSync(dir)).toEqual(['permission.lock']);
+    } finally { kill.mockRestore(); }
   });
 
   // PR #2735 (A3 red-team of #2726/#4188) finding 2, MOST SERIOUS of the lock family: a takeover that decides

@@ -604,6 +604,24 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     const { kept } = await gateReadyItems(itemsFromReport(r), r, { gh: gate({ headRefOid: head, labels: [] }, gateComments({ pr: 9 })), log: () => {} });
     expect(kept[0]).toEqual({ ...itemsFromReport(r)[0], head });
   });
+  it.each(['open', 'unreadable', 'oversized'])('a confirmed break still alerts before an %s base lookup', async baseState => {
+    const r = { ready: [{ repo, number: 5768, command: 'approve' }] };
+    const live = gate({ headRefOid: head, baseRefName: 'lane/base', labels: [] }, gateComments({ broken: true }).slice(0, 1));
+    const gh = vi.fn(async (cmd, args) => {
+      if (args[1] === 'list') {
+        if (baseState === 'unreadable') throw Error('base unavailable');
+        return JSON.stringify(Array.from({ length: baseState === 'oversized' ? 100 : 1 }, (_, index) =>
+          ({ number: index + 1, state: 'OPEN', headRefName: 'lane/base' })));
+      }
+      return live(cmd, args);
+    });
+    const { kept, held } = await gateReadyItems(itemsFromReport(r), r, { gh, log: () => {}, fixClaimLive: () => false });
+    expect(held).toEqual([]);
+    expect(kept).toHaveLength(1);
+    expect(kept[0]).toMatchObject({ kind: 'confirmed-break-owed-send-back', head });
+    expect(kept[0]).not.toHaveProperty('command');
+    expect(gh.mock.calls.some(([, args]) => args[1] === 'list')).toBe(false);
+  });
   it('a confirmed break is classified before the human-review hold: red-team:blocked does not hide the alert', async () => {
     const r = { needsYourMerge: [{ repo, number: 6239, title: 'm' }], ready: [] };
     const { kept, held } = await gateReadyItems(itemsFromReport(r), r, { gh: gate({ headRefOid: head, labels: [{ name: 'red-team:blocked' }] },

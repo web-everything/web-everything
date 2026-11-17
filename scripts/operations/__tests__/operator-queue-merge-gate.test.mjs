@@ -38,7 +38,8 @@ const LOG = `2026-10-12T09:49:30.3867808Z merge-gate: workflow self-check — ok
 const check = { name: 'merge-gate', status: 'COMPLETED', conclusion: 'FAILURE',
   detailsUrl: 'https://github.com/web-everything/web-everything/actions/runs/38232286310/job/114754411476' };
 const pr = () => withHumanReviewEvidence({
-  number: 4965, headRefOid: HEAD, mergeable: 'MERGEABLE',
+  // A clean comment alone cannot scope the required run-evidence read.
+  repo: 'owner/repo', number: 4965, headRefOid: HEAD, mergeable: 'MERGEABLE',
   labels: ['review:human', 'advisory:accepted', 'review-round:3'].map((name) => ({ name })),
   statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }, check,
     { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' }],

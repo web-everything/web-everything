@@ -213,6 +213,7 @@ function classifyUnsafe(o = {}) {
   if (want && row.actor !== want) return operator('unclassified', `fail-closed: actor ${JSON.stringify(row.actor)} does not fit ${state}`);
 
   if (state === 'waiting-on-base') return null;
+  if (state === 'drain-skip:not-certified') return operator(state, OPERATOR_STATES[state]);
   if (drainWait && state !== 'drain-skip:unknown-mergeability' && !(state === 'drain-skip:red-team-pending' && redTeam !== undefined)) {
     if (!Number.isFinite(row.ageMinutes) || row.ageMinutes < 0) return operator('unclassified', 'fail-closed: unreadable drain wait age');
     if (row.liveJob || row.ageMinutes <= DRAIN_SKIP_DEADLINES[skipKind]) return null;

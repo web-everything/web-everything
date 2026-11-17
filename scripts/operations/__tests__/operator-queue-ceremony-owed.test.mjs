@@ -16,7 +16,7 @@ const REPO = 'web-everything/web-everything';
 const HOLD = `human-only: the diff at ${HEAD.slice(0, 9)} touches .github/workflows/ci.yml — only a clear-human ceremony at this exact head can accept it`;
 const check = { name: 'merge-gate', status: 'COMPLETED', conclusion: 'FAILURE',
   detailsUrl: `https://github.com/${REPO}/actions/runs/123/job/456` };
-const pr = () => withHumanReviewEvidence({ number: 5193, title: 'Update CI', headRefOid: HEAD, mergeable: 'MERGEABLE', isDraft: false,
+const pr = () => withHumanReviewEvidence({ repo: REPO, number: 5193, title: 'Update CI', headRefOid: HEAD, mergeable: 'MERGEABLE', isDraft: false,
   labels: ['ready-to-merge', 'review:accepted'].map((name) => ({ name })), comments: [],
   statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }, check,
     { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' }],

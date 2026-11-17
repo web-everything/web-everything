@@ -31,7 +31,7 @@ const result = (number, head = HEAD, findings = []) => bot(renderRedTeamComment(
 const MAIN_GREEN = mainRedState([{ databaseId: 3196001, workflowName: 'CI', event: 'push',
   status: 'completed', conclusion: 'success', headSha: 'a'.repeat(40),
   createdAt: '2026-10-26T22:50:00Z', updatedAt: '2026-10-26T22:54:00Z' }]);
-const pr = (over = {}) => ({ number: 5298, title: 'fix red main: CI caps', headRefOid: HEAD, mergeable: 'MERGEABLE', isDraft: false,
+const pr = (over = {}) => ({ repo: REPO, number: 5298, title: 'fix red main: CI caps', headRefOid: HEAD, mergeable: 'MERGEABLE', isDraft: false,
   labels: ['ready-to-merge', 'review:accepted'].map((name) => ({ name })), comments: [result(over.number ?? 5298, over.headRefOid ?? HEAD)],
   statusCheckRollup: [green('test'), green('merge-gate'), { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' }], ...over });
 const WF = [{ filename: '.github/workflows/ci.yml' }, { filename: 'scripts/x.mjs' }];

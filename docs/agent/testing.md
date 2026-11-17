@@ -4411,3 +4411,26 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+## PR sweep invariant regressions
+
+Stacked child waits run after repair, CI and terminal stand-down handling. Their 120-minute
+budget uses the base state timestamp; closed, merged, unreadable-age or expired bases restore
+ordinary child handling. Confirmed red-team send-backs are classified before any base lookup.
+`drain-skip:not-certified` retains its operator action when stall detection emits it, including
+after the generic drain deadline. The shared current-head approval predicate must also read
+drain run evidence: unknown, incomplete or throwing reads veto both delegated approval and
+other readiness callers despite an older clean comment. The delegated evidence regressions
+exercise both shadow and live modes and assert no event or clearance. Staged CLI fixtures
+need the drain evidence reader import graph alongside `human-review-gates.mjs`.
+Queue readiness fixtures must include the repository and a full 40-character head alongside
+independent current-head red-team proof. The run reader scopes carry journals by that identity;
+omitting it is unknown evidence, not a clean pass. Preserve the remaining child-process exports
+when mocking synchronous queue reads, since the reader's dependencies also import async APIs.
+
+Stand-downs carrying only the generic needs-judgment reason remain visible in STOOD DOWN;
+the NEEDS YOU question route requires a non-empty fixer question. Keep both queue suites
+passing when changing that routing. The atomic-file lock treats `kill(pid, 0)` returning
+EPERM as proof of a live holder, including the post-rename takeover probe. The named EPERM
+cases in `atomic-json-file.test.mjs` exercise both probes without requiring signal permission
+to a real parent process; `pr-stall-live-safety.test.mjs` also verifies the live-parent lock.

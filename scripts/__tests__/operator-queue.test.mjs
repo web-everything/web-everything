@@ -2,10 +2,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { withHumanReviewEvidence } from '../lib/__tests__/helpers/human-review-evidence.mjs';
 import { execFileSync } from 'node:child_process';
+import * as drainEvidence from '../lib/drain-red-team-evidence.mjs';
 
-vi.mock('node:child_process', () => {
+vi.mock('node:child_process', async (importOriginal) => {
+  // Run-evidence imports also use async subprocess APIs; retain their guarded exports.
+  const original = await importOriginal();
   const execFileSync = vi.fn();
-  return { execFileSync, default: { execFileSync } };
+  return { ...original, execFileSync, default: { ...original.default, execFileSync } };
 });
 // Register after Bun has loaded the real copy; Vitest still supplies importOriginal.
 if (process.versions.bun) await import('../lib/gh-throttle.mjs?real');
@@ -37,13 +40,24 @@ const ACCEPTED = { name: 'advisory:accepted' };
 const CHANGES = { name: 'advisory:changes' };
 const PENDING = { name: 'review:pending' };
 const fixture = (overrides = {}) => withHumanReviewEvidence({
-  number: 42, title: 'Ready for review', labels: [HUMAN, ACCEPTED],
+  // Readiness now scopes run evidence by repository as well as PR/head.
+  repo: 'owner/repo', number: 42, title: 'Ready for review', labels: [HUMAN, ACCEPTED],
   headRefOid: HEAD, mergeable: 'MERGEABLE', comments: [advisory()],
   statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
   ...overrides,
 });
 
 describe('evaluatePr', () => {
+  it.each([
+    ['unknown run', () => ({ ok: false, reason: 'review-unfinished' })],
+    ['incomplete read', () => ({})],
+    ['throwing read', () => { throw Error('run unreadable'); }],
+  ])('%s vetoes READY despite a clean current-head comment', (_name, read) => {
+    vi.spyOn(drainEvidence, 'readDrainRedTeamEvidence').mockImplementation(read);
+    expect(evaluatePr(fixture())).toEqual({ ready: false,
+      reasons: ['red-team:clear not proven on the current head'], transient: false });
+  });
+
   it('passes a fully ready PR without mutating it', () => {
     const pr = fixture();
     const before = structuredClone(pr);

@@ -290,10 +290,6 @@ export function deriveWaitingOn(pr, ctx) {
 
   if (has('status:needs-you')) return done('needs-you', 'operator', labelAt('status:needs-you'), 'the PR carries status:needs-you', actions.humanReview, ['label status:needs-you']);
 
-  const base = openBasePr(pr, ctx.openPrs);
-  if (base) return { ...done('waiting-on-base', 'drain', moved('ready-to-merge', 'review:accepted'),
-    `waiting on open base PR #${base.number}`, null, ['open base branch']), base: base.number };
-
   const outcomes = head ? gateOutcomesForHead(pr.comments, pr.number, head) : new Set();
   const sentBack = outcomes.has(GATE_OUTCOMES.SENT_BACK);
   const fixing = has('review:changes') || has('status:fixing') || has('review-status:fixing') || has('status:sent-back-red-team');
@@ -337,6 +333,17 @@ export function deriveWaitingOn(pr, ctx) {
   if (has('red-team:pending')) {
     return done('red-team-pending', 'red-team', moved('red-team:pending', 'ready-to-merge', 'review:accepted'), `post-accept red team has no result on this head${skip ? ` (drain: ${skip.reason})` : ''}`,
       actions.rerunReview, [has('red-team:pending') ? 'label red-team:pending' : null, skip ? 'drain skip red-team-pending' : null].filter(Boolean));
+  }
+  // Only an otherwise idle child waits on its base. Date the bounded wait from the base's state,
+  // so an old child can wait for a fresh base, but repeated child updates cannot renew a stuck base.
+  const base = openBasePr(pr, ctx.openPrs);
+  if (base) {
+    const baseState = deriveWaitingOn(base, { ...ctx, openPrs: [] });
+    const deadlineMinutes = DRAIN_SKIP_DEADLINES['off-base'];
+    if (baseState.since !== null && now - baseState.since <= deadlineMinutes * 60_000)
+      return { ...done('waiting-on-base', 'drain', baseState.since,
+        `waiting on open base PR #${base.number}`, null, ['open base branch']), base: base.number,
+      approxSince: baseState.approxSince, deadlineMinutes };
   }
   if (humanGates && !humanGates.eligible)
     return done('human-review-pending-gates', 'reviewer', moved('advisory:accepted', 'review:human'),
@@ -426,7 +433,7 @@ export function assessPrSweep(read) {
     if (d.actor === 'operator') stalledReason = 'waiting on the operator';
     else if (d.actor === 'nobody') stalledReason = 'nobody owns the next move';
     else if (d.terminal && !live) stalledReason = 'terminal: nothing will move it on this head';
-    else if (!d.base && !live && ageMinutes !== null && ageMinutes > (d.deadlineMinutes ?? thresholdMinutes)) {
+    else if (!live && ageMinutes !== null && ageMinutes > (d.deadlineMinutes ?? thresholdMinutes)) {
       stalledReason = `waiting on ${d.actor} for ${ageMinutes} min (> ${d.deadlineMinutes ?? thresholdMinutes}) with no live job`;
     }
     return {

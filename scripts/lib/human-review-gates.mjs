@@ -1,8 +1,14 @@
 /** Shared current-head evidence required before asking for or delegating human approval. */
 import { parseRedTeamComment, RED_TEAM_COMMENT_MARKER, readRedTeamDisposition } from './red-team-gate.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { readDrainRedTeamEvidence } from './drain-red-team-evidence.mjs';
 
 export function redTeamClearAtCurrentHead(pr, head) {
+  // A published clean comment cannot answer unreadable or unknown newer review runs.
+  try {
+    const evidence = readDrainRedTeamEvidence({ repo: pr.repo, pr: pr.number, head });
+    if (!evidence || evidence.ok === false || !['inFlight', 'scheduled', 'recorded'].every(k => typeof evidence[k] === 'boolean')) return false;
+  } catch { return false; }
   const d = readRedTeamDisposition({ comments: pr.comments, pr: pr.number, head, repo: pr.repo });
   return headlineAgrees(pr.comments, pr.number, head) && !!d.result && d.sendBack.length === 0 && d.held.length === 0
     && !d.result.findings.some(f => f.recheckOutcome === 'unverifiable');

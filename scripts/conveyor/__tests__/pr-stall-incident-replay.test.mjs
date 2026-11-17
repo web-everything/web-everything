@@ -160,7 +160,8 @@ describe('every emitted drain skip is a known bounded drain wait', () => {
     expect(classifyStall({ row: fresh, head })).toBeNull();
     const old = assessPrSweep({ prs: [{ ...p, updatedAt: iso(DRAIN_SKIP_DEADLINES[kind] + 1) }], now, drainSkips: skips }).prs[0];
     expect(old.stalled).toBe(true);
-    expect(classifyStall({ row: old, head })).toMatchObject({ lane: 'system', action: 'tooling-card' });
+    expect(classifyStall({ row: old, head })).toMatchObject(kind === 'not-certified'
+      ? { lane: 'operator', action: 'drain-skip:not-certified' } : { lane: 'system', action: 'tooling-card' });
   });
   it('unknown skip evidence fails closed with an operator-visible explanation', () => {
     const row = assessPrSweep({ prs: [pr(6940, { labels: ['review:accepted'], updatedAt: iso(500) })], now,

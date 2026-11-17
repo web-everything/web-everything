@@ -74,7 +74,7 @@ const FIXED = {
   'drain-skip:escalated': ['system', 'tooling-card'], 'drain-skip:unknown': ['operator', 'unclassified'],
   'ruling-needed:dispute': ['operator', 'ruling-needed:dispute'], 'needs-decision:note': ['operator', 'needs-decision:note'],
   'draft-withdrawn': ['operator', 'draft-withdrawn'], 'needs-you': ['operator', 'needs-you'], 'human-review': ['operator', 'human-review'],
-  'drain-skip:not-certified': ['system', 'tooling-card'], unclassified: ['operator', 'unclassified'],
+  'drain-skip:not-certified': ['operator', 'drain-skip:not-certified'], unclassified: ['operator', 'unclassified'],
   'some-future-state': ['operator', 'unclassified'],
 };
 // Judged states: [lane, action] per verdict, in VERDICT_NAMES order.
@@ -114,6 +114,13 @@ describe('every state x every verdict', () => {
 });
 
 describe('known drain waits explain what releases them', () => {
+  it.each([0, 120, 121, 10000])('not-certified stays operator-only at age %s, even with a live job', ageMinutes => {
+    for (const liveJob of [null, 'drain']) {
+      expect(at('drain-skip:not-certified', { row: { ageMinutes, liveJob } }))
+        .toMatchObject({ lane: 'operator', action: 'drain-skip:not-certified',
+          reason: 'the drain will not merge it uncertified', command: 'next-for drain-skip:not-certified' });
+    }
+  });
   it('same-head merge-queue failure is held until the head changes', () => {
     const result = at('drain-skip:mq-same-head-failed', { row: { actor: 'drain' } });
     expect(result.reason).not.toContain('unknown waiting state');
