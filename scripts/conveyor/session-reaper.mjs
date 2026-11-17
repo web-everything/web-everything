@@ -108,7 +108,7 @@ import { parseSessionSlug } from './session-slug.mjs';
 import { rateAndRecordSession } from './run-rating.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -117,6 +117,7 @@ import { readField } from '../backlog/frontmatter.mjs';
 import { stopSession } from '../operations/dispatch-abort.mjs';
 import { defaultListAgents, normalizeHandle, prListTimeoutMs, dispatchScratchRoot, revokeDispatchTrust } from '../operations/dispatch-lane-io.mjs';
 import { CREDENTIAL_ENV_VARS } from '../lib/claude-account.mjs';
+import { storeKey as canonicalStoreKey } from '../lib/claude-stores.mjs';
 // #ghost-sessions-inflate-cap — the SAME shared two-signal pid-liveness probe `lease-reaper.mjs`/`tick-core.mjs`
 // already trust; see `makePidDeadResolver`'s own docblock for why this reaper cites it rather than re-deriving
 // a fourth copy of `process.kill(pid, 0)`.
@@ -152,6 +153,17 @@ import { startedAtMs } from './reconcile-core.mjs';
 // reads it at all.
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+
+// hung-session's transcript readers retain their inherited-store boundary. Multi-store rows with no known
+// owner, or an owner outside that store, must never reach those readers or acquire a hung verdict from them.
+function isInheritedTranscriptStore(session) {
+  if (typeof session?.storeKey !== 'string' || !session.storeKey) return false;
+  try {
+    return session.storeKey === canonicalStoreKey(process.env.CLAUDE_CONFIG_DIR, {
+      home: process.env.HOME || homedir(), realpath: realpathSync,
+    });
+  } catch { return false; }
+}
 
 /** This file's own checkout root, resolved by SCRIPT LOCATION (never `process.cwd()`) — same convention
  *  `dispatch-lane-io.mjs#REPO_ROOT` / `completion-store.mjs#COMPLETIONS_ROOT` already use, and load-bearing
@@ -496,6 +508,7 @@ export function resolveLastActivityMs(session, {
   summarizeEntryFn = summarizeEntry,
   statFn = statSync,
 } = {}) {
+  if (!isInheritedTranscriptStore(session)) return null;
   const tail = readTranscriptTailActivity(session, {
     tailLines: BLOCKED_ON_INFRA_TAIL_LINES,
     maxBytes: BLOCKED_ON_INFRA_MAX_BYTES,
@@ -961,6 +974,7 @@ export function makeCompletionResolver({ dir } = {}) {
  */
 export function makeHungResolver({ thresholdMs = resolveHungThresholdMs(), now = Date.now } = {}) {
   return function hungFor(session) {
+    if (!isInheritedTranscriptStore(session)) return null;
     try {
       return readHungInfo(session, now(), thresholdMs);
     } catch {
@@ -980,6 +994,7 @@ export function makeHungResolver({ thresholdMs = resolveHungThresholdMs(), now =
  */
 export function makeAuthExpiredResolver() {
   return function authExpiredFor(session) {
+    if (!isInheritedTranscriptStore(session)) return null;
     try {
       return readClaudeAuthExpiredInfo(session);
     } catch {
@@ -1003,6 +1018,7 @@ export function makeAuthExpiredResolver() {
  */
 export function makeIdleFinishedResolver({ thresholdMs = resolveIdleFinishedThresholdMs(), now = Date.now } = {}) {
   return function idleFinishedFor(session) {
+    if (!isInheritedTranscriptStore(session)) return null;
     try {
       return readIdleFinishedInfo(session, now(), thresholdMs);
     } catch {
@@ -1914,9 +1930,17 @@ export function runDispatchScratchSweepPass({
   }
   const byId = new Map();
   const liveCwds = new Set();
+  const isTerminal = row => TERMINAL_REAP_STATES.has(row?.state) || ALREADY_STOPPED_STATES.has(row?.state);
   for (const s of sessions) {
-    if (s && s.sessionId != null) byId.set(String(s.sessionId), s);
-    const terminal = TERMINAL_REAP_STATES.has(s?.state) || ALREADY_STOPPED_STATES.has(s?.state);
+    if (s && s.sessionId != null) {
+      const id = String(s.sessionId);
+      if (!byId.has(id)) byId.set(id, new Map());
+      // Nested maps index (UUID, store key), preserving each store's owner. Even duplicate rows within one
+      // store cannot let a terminal observation overwrite a live/unknown owner.
+      const owners = byId.get(id);
+      if (!owners.has(s.storeKey) || isTerminal(owners.get(s.storeKey))) owners.set(s.storeKey, s);
+    }
+    const terminal = isTerminal(s);
     if (!terminal && s?.cwd) liveCwds.add(String(s.cwd));
   }
 
@@ -1929,8 +1953,10 @@ export function runDispatchScratchSweepPass({
     const dir = join(dispatchRoot, name);
     let ageMs = null;
     try { ageMs = now - statFn(dir).mtimeMs; } catch { /* stays null — `unknown-age` keeps it, never a guess */ }
+    const owners = [...(byId.get(name)?.values() ?? [])];
+    const sessionRow = owners.find(row => !isTerminal(row)) ?? owners[0] ?? null;
     const verdict = classifyDispatchScratchEntry(
-      { ageMs, sessionRow: byId.get(name) ?? null, liveCwdInUse: liveCwds.has(dir) },
+      { ageMs, sessionRow, liveCwdInUse: liveCwds.has(dir) },
       { graceMs, ceilingMs },
     );
     if (!verdict.reap) { kept++; continue; }

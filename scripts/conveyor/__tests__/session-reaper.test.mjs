@@ -77,14 +77,16 @@ import {
 } from '../session-reaper.mjs';
 import { OUTCOME_UNREADABLE } from '../hung-session.mjs';
 import { SessionsUnknown } from '../../lib/claude-sessions.mjs';
+import { storeKey as canonicalStoreKey } from '../../lib/claude-stores.mjs';
 import { newCompletionRecord, applyCompletionUpdate, writeCompletion } from '../../operations/completion-store.mjs';
 import { newDeliveryReport, writeDeliveryReport } from '../../operations/delivery-report-store.mjs';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 
-const bg = (over = {}) => ({ id: 'abc12345', cwd: '/repo', kind: 'background', startedAt: 1, sessionId: 'abc12345-0000-0000-0000-000000000000', name: 'conveyor-1', ...over });
+const inheritedStoreKey = () => canonicalStoreKey(process.env.CLAUDE_CONFIG_DIR, { home: process.env.HOME || homedir(), realpath: realpathSync });
+const bg = (over = {}) => ({ id: 'abc12345', cwd: '/repo', kind: 'background', startedAt: 1, sessionId: 'abc12345-0000-0000-0000-000000000000', name: 'conveyor-1', storeKey: inheritedStoreKey(), ...over });
 const interactive = (over = {}) => ({ pid: 111, cwd: '/repo', kind: 'interactive', startedAt: 1, sessionId: 'def67890-0000-0000-0000-000000000000', name: 'my terminal', ...over });
 
 describe('classifySessionReap — the per-row verdict', () => {
@@ -433,10 +435,11 @@ describe('stopSessionWithRetry — recovers a transient `claude stop` failure in
     expect(sleeps).toEqual(STOP_RETRY_BACKOFF_MS); // backed off before every retry, never after the last attempt
   });
 
-  it('never retries an `alreadyGone` answer — that is not a failure, resolved on the first call', () => {
-    let calls = 0;
-    const exec = () => {
-      calls++;
+  it('never retries an `alreadyGone` answer after the owning store confirms absence', () => {
+    const calls = [];
+    const exec = (_cmd, args) => {
+      calls.push(args);
+      if (args[0] === 'agents') return '[]';
       const e = new Error('boom');
       e.stderr = "No job matching 'abcd1234'. Run 'claude agents' to list running sessions.";
       throw e;
@@ -444,7 +447,7 @@ describe('stopSessionWithRetry — recovers a transient `claude stop` failure in
     let slept = 0;
     const res = stopSessionWithRetry({ handle: 'abcd1234', exec, sleep: () => { slept++; } });
     expect(res).toEqual({ stopped: true, alreadyGone: true, output: expect.stringContaining('No job matching') });
-    expect(calls).toBe(1);
+    expect(calls).toEqual([['stop', 'abcd1234'], ['agents', '--json', '--all']]);
     expect(slept).toBe(0);
   });
 });
@@ -1227,19 +1230,19 @@ describe('resolveLastActivityMs — Guard 1(c)\'s own IO (#4306)', () => {
 
   it('returns null when the session carries no cwd/sessionId — never a guess', () => {
     expect(resolveLastActivityMs(null)).toBeNull();
-    expect(resolveLastActivityMs({ cwd: '/c' })).toBeNull();
-    expect(resolveLastActivityMs({ sessionId: 's1' })).toBeNull();
+    expect(resolveLastActivityMs({ storeKey: inheritedStoreKey(), cwd: '/c' })).toBeNull();
+    expect(resolveLastActivityMs({ storeKey: inheritedStoreKey(), sessionId: 's1' })).toBeNull();
   });
 
   it('returns null when no transcript can be resolved', () => {
-    const result = resolveLastActivityMs({ cwd: '/c', sessionId: 's1' }, {
+    const result = resolveLastActivityMs({ storeKey: inheritedStoreKey(), cwd: '/c', sessionId: 's1' }, {
       resolveTranscript: () => { throw new Error('not found'); },
     });
     expect(result).toBeNull();
   });
 
   it('returns null when the transcript tail cannot be read', () => {
-    const result = resolveLastActivityMs({ cwd: '/c', sessionId: 's1' }, {
+    const result = resolveLastActivityMs({ storeKey: inheritedStoreKey(), cwd: '/c', sessionId: 's1' }, {
       resolveTranscript: () => '/fake/path.jsonl',
       tailLinesFn: () => { throw new Error('unreadable'); },
     });
@@ -1252,7 +1255,7 @@ describe('resolveLastActivityMs — Guard 1(c)\'s own IO (#4306)', () => {
       textEntry('2026-09-27T20:44:34.000Z'), // the newest
       textEntry('2026-09-27T20:10:00.000Z'),
     ]).split('\n').filter(Boolean);
-    const result = resolveLastActivityMs({ cwd: '/c', sessionId: 's1' }, {
+    const result = resolveLastActivityMs({ storeKey: inheritedStoreKey(), cwd: '/c', sessionId: 's1' }, {
       resolveTranscript: () => '/fake/path.jsonl',
       tailLinesFn: () => ({ lines }),
       summarizeEntryFn: (raw) => { const o = JSON.parse(raw); return { kind: o.type, ts: o.timestamp, blocks: [] }; },
@@ -1261,7 +1264,7 @@ describe('resolveLastActivityMs — Guard 1(c)\'s own IO (#4306)', () => {
   });
 
   it('falls back to the transcript file\'s own mtime when no line carries a parseable `ts`', () => {
-    const result = resolveLastActivityMs({ cwd: '/c', sessionId: 's1' }, {
+    const result = resolveLastActivityMs({ storeKey: inheritedStoreKey(), cwd: '/c', sessionId: 's1' }, {
       resolveTranscript: () => '/fake/path.jsonl',
       tailLinesFn: () => ({ lines: ['not json'] }),
       summarizeEntryFn: () => { throw new Error('unparseable'); },
@@ -1271,7 +1274,7 @@ describe('resolveLastActivityMs — Guard 1(c)\'s own IO (#4306)', () => {
   });
 
   it('returns null when the mtime fallback itself is unreadable', () => {
-    const result = resolveLastActivityMs({ cwd: '/c', sessionId: 's1' }, {
+    const result = resolveLastActivityMs({ storeKey: inheritedStoreKey(), cwd: '/c', sessionId: 's1' }, {
       resolveTranscript: () => '/fake/path.jsonl',
       tailLinesFn: () => ({ lines: ['not json'] }),
       summarizeEntryFn: () => { throw new Error('unparseable'); },
@@ -1281,7 +1284,7 @@ describe('resolveLastActivityMs — Guard 1(c)\'s own IO (#4306)', () => {
   });
 
   it('one unparseable line never aborts the scan — the other lines still resolve a timestamp', () => {
-    const result = resolveLastActivityMs({ cwd: '/c', sessionId: 's1' }, {
+    const result = resolveLastActivityMs({ storeKey: inheritedStoreKey(), cwd: '/c', sessionId: 's1' }, {
       resolveTranscript: () => '/fake/path.jsonl',
       tailLinesFn: () => ({ lines: ['not json', JSON.stringify({ type: 'assistant', timestamp: '2026-09-27T20:44:34.000Z' })] }),
       summarizeEntryFn: (raw) => { if (raw === 'not json') throw new Error('bad'); const o = JSON.parse(raw); return { kind: o.type, ts: o.timestamp, blocks: [] }; },
@@ -1293,7 +1296,7 @@ describe('resolveLastActivityMs — Guard 1(c)\'s own IO (#4306)', () => {
     // Unlike readHungInfo/readIdleFinishedInfo (hung-session.test.mjs), resolveLastActivityMs never derives a
     // pending-tool-call verdict from `entries`, so it has no reason to refuse a partial read. It stays exactly
     // as tolerant as it was before #4312's extraction, whichever position the bad line sits at.
-    const result = resolveLastActivityMs({ cwd: '/c', sessionId: 's1' }, {
+    const result = resolveLastActivityMs({ storeKey: inheritedStoreKey(), cwd: '/c', sessionId: 's1' }, {
       resolveTranscript: () => '/fake/path.jsonl',
       // The GOOD line is FIRST (older); the BAD line is LAST (the tail's own newest).
       tailLinesFn: () => ({ lines: [JSON.stringify({ type: 'assistant', timestamp: '2026-09-27T20:44:34.000Z' }), 'not json'] }),
@@ -1478,7 +1481,7 @@ describe('runSessionReaperPass — the backstop-completion write (xbv32pg follow
       };
       const result = freshRunSessionReaperPass({
         listAgents: () => [{
-          id: 'a1', sessionId, cwd, kind: 'background', state: 'done', name: 'fix-2821',
+          id: 'a1', sessionId, cwd, kind: 'background', state: 'done', name: 'fix-2821', storeKey: inheritedStoreKey(),
         }],
         groundTruthFor: () => null,
         completionFor: () => null,
@@ -1523,7 +1526,7 @@ describe('runSessionReaperPass — the backstop-completion write (xbv32pg follow
           startedAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
         };
         const result = freshRunSessionReaperPass({
-          listAgents: () => [{ id: 'a1', sessionId, cwd, kind: 'background', state: 'done', name: 'fix-2821' }],
+          listAgents: () => [{ id: 'a1', sessionId, cwd, kind: 'background', state: 'done', name: 'fix-2821', storeKey: inheritedStoreKey() }],
           groundTruthFor: () => null,
           completionFor: () => null,
           stop: ({ handle }) => ({ stopped: true, alreadyGone: false, output: `stopped ${handle}` }),
@@ -2349,6 +2352,24 @@ describe('runDispatchScratchSweepPass — the IO shell', () => {
     });
     expect(result.deleted).toBe(0);
     expect(result.kept).toBe(1);
+    expect(existsSync(dir)).toBe(true);
+  });
+
+  it.each([true, false])('a working UUID in any store protects scratch despite a terminal foreign row (dryRun=%s)', dryRun => {
+    const dir = makeOldFolder('shared-uuid', 30 * DAY);
+    const rmDirFn = vi.fn(), revokeTrust = vi.fn();
+    const result = runDispatchScratchSweepPass({
+      dispatchRoot, dryRun, graceMs: DAY, ceilingMs: 7 * DAY,
+      listAgents: () => [
+        bg({ sessionId: 'shared-uuid', storeKey: '/profile/a', state: 'working', cwd: '/different-cwd' }),
+        bg({ sessionId: 'shared-uuid', storeKey: '/profile/b', state: 'done', cwd: dir }),
+      ],
+      rmDirFn, revokeTrust, log: () => {},
+    });
+    expect(result).toMatchObject({ scanned: 1, deleted: 0, kept: 1, trustRevoked: 0 });
+    expect(result.wouldDelete).toEqual(dryRun ? [] : undefined);
+    expect(rmDirFn).not.toHaveBeenCalled();
+    expect(revokeTrust).not.toHaveBeenCalled();
     expect(existsSync(dir)).toBe(true);
   });
 

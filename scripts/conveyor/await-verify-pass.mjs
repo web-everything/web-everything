@@ -290,7 +290,8 @@ export function buildAwaitVerifyResumePrompt({ kind, record, marker = null, deta
 /**
  * Find the session row a record speaks for. A record that names a session id binds to THAT session only — a
  * replacement fixer reusing the same `who` name must never receive the old session's verdict. Only a record with
- * no session id falls back to the newest row with its `who` name. Pure.
+ * no session id falls back to the newest row with its `who` name in the recorded store. Legacy records without
+ * a store key must have matches in at most one store. Pure.
  */
 export function findAwaitSession(record, rows) {
   const list = Array.isArray(rows) ? rows : [];
@@ -299,7 +300,11 @@ export function findAwaitSession(record, rows) {
     if (matches.length > 1) throw new Error('session ownership ambiguous; repair stores and retry');
     return matches[0] ?? null;
   }
-  return list.filter((r) => r?.name === record.who).sort((a, b) => (b?.startedAt ?? 0) - (a?.startedAt ?? 0))[0] ?? null;
+  const matches = list.filter(r => r?.name === record.who && (!record.storeKey || r.storeKey === record.storeKey));
+  if (!record.storeKey && new Set(matches.map(r => r.storeKey)).size > 1) {
+    throw new Error('session ownership ambiguous; repair stores and retry');
+  }
+  return matches.sort((a, b) => (b?.startedAt ?? 0) - (a?.startedAt ?? 0))[0] ?? null;
 }
 
 /**
@@ -1345,7 +1350,15 @@ export async function defaultAwaitVerifyIo({
       const printedId = io.parseBackgroundedId(stdout);
       let outcome = { resumed: false };
       for (let attempt = 1; attempt <= 3; attempt += 1) {
-        outcome = io.resumeSucceeded({ printedId, requestedSessionId: session.sessionId, agentsAfter: io.defaultListAgents({ all: true, env: liveEnv }) });
+        const listed = io.defaultListAgents({ all: true, env: liveEnv });
+        const agentsAfter = (Array.isArray(listed) ? listed : []).filter(row => !session.storeKey || row?.storeKey === session.storeKey);
+        // The UUID and printed job id can each collide across stores. An unkeyed legacy wait cannot choose
+        // between those owners; leave it unconfirmed for the existing retry/escalation path.
+        const normalize = value => String(value ?? '').trim().toLowerCase();
+        const matches = agentsAfter.filter(row => normalize(row?.sessionId) === normalize(session.sessionId)
+          || (printedId && normalize(row?.id) === normalize(printedId)));
+        const ambiguous = !session.storeKey && new Set(matches.map(row => row.storeKey)).size > 1;
+        outcome = ambiguous ? { resumed: false } : io.resumeSucceeded({ printedId, requestedSessionId: session.sessionId, agentsAfter });
         if (outcome.resumed || attempt === 3) break;
         sleep(2_000);
       }
