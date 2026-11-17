@@ -1,3 +1,4 @@
+import { NO_PROMPT_SESSION_KINDS } from '../lib/no-prompt-command-rules.mjs';
 import { appendBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { applyTestsFirstPolicy } from '../lib/tests-first-policy.mjs';
 import { readPreparePolicy } from '../conveyor/prepare-policy-settings.mjs';
@@ -120,7 +121,7 @@ import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { inFlight, notApplied } from './effect-executor.mjs';
 import { createFileRunStore } from './run-store.mjs';
 import { workerTierFor, probationWorkerForRoute } from '../lib/provider-routing.mjs';
-import { parseGroupMembers, dispatchStillHolds, DEFAULT_EXPECTED_WITHIN_MINUTES, DISPATCH_EFFECT, DISPATCH_LISTING_GRACE_MINUTES, LAUNCH_KINDS } from './dispatch-lane.mjs';
+import { assertBriefTemplateContent, parseGroupMembers, dispatchStillHolds, DEFAULT_EXPECTED_WITHIN_MINUTES, DISPATCH_EFFECT, DISPATCH_LISTING_GRACE_MINUTES, LAUNCH_KINDS } from './dispatch-lane.mjs';
 // #3383 — the spawned session is a WORKER; a hook-driven tick-once must never run in it (see session-role.mjs).
 import { markWorkerEnv, workerMarkerSettingsEnv } from './session-role.mjs';
 // #3902 — the blocking-spawn primitive `spawnAgentToCompletion` (below) is built on, for the same reason
@@ -576,6 +577,8 @@ export function readTick({
   if (groupItems.length && [{ steps: operatorSteps }, ...groupItems.map(member => ({ steps: planOperatorPostBuild(member ?? {}, operatorOptions) }))].some(({ steps }) => steps.length)) {
     throw new Error('dispatch-lane: an operator task with post-build steps cannot run in a grouped build');
   }
+  const rawBrief = String(readText(briefPath(root, launchKind)));
+  if (NO_PROMPT_SESSION_KINDS.includes(launchKind)) assertBriefTemplateContent(rawBrief);
   return {
     resolvedNum: key,
     admission: tick.decisions?.admission ? {
@@ -596,8 +599,8 @@ export function readTick({
     item,
     groupItems,
     briefTemplate: composeOperatorTaskBrief(['build', 'fix', 'ci-heal'].includes(launchKind)
-      ? appendBuildRequirements(applyTestsFirstPolicy(String(readText(briefPath(root, launchKind)))), { policy: resolveBuildPolicy({ log: line => console.error(line) }) })
-      : applyTestsFirstPolicy(String(readText(briefPath(root, launchKind)))), item ?? {}, { ...operatorOptions, steps: operatorSteps }),
+      ? appendBuildRequirements(applyTestsFirstPolicy(rawBrief), { policy: resolveBuildPolicy({ log: line => console.error(line) }) })
+      : applyTestsFirstPolicy(rawBrief), item ?? {}, { ...operatorOptions, steps: operatorSteps }),
     // Derived from the card record, never from prompt text: shapeDispatchRead reads this, not the filled prompt.
     operatorPostBuild: operatorSteps.length > 0,
     nextState,
