@@ -1377,11 +1377,27 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
   const cancel = { signal: cancelSignal ?? new AbortController().signal };
   const nonce = randomBytes(16).toString('hex');
   const tails = {stdout:'',stderr:''};
-  let incompleteStandards = false;
+  let incompleteStandards;
+  const inspectStandardsLine = line => {
+    // standards-sections.mjs deliberately omits gates with no touched inputs.
+    // Exempt only its exact marker; unknown skips still require local evidence.
+    const evidence = line.replace(/\bskipped \(scoped: no input touched\)/g, '');
+    if (/\bskipp(?:ing|ed)\b|\bno-scope\b|\bENOENT\b|no changed tier lines; nothing to attribute/i.test(evidence))
+      incompleteStandards ??= line;
+  };
   const observeStandards = (chunk, stream = 'stdout') => {
     const text = tails[stream] + String(chunk);
-    if (/\bskipp(?:ing|ed)\b|\bno-scope\b|\bENOENT\b|no changed tier lines; nothing to attribute/i.test(text)) incompleteStandards = true;
-    tails[stream] = text.slice(-128);
+    const lines = text.split('\n');
+    tails[stream] = lines.pop();
+    for (const line of lines) {
+      if (line.length > 4096) incompleteStandards ??= `standards output line exceeds 4096 characters: ${line.slice(0, 4000)}`;
+      else inspectStandardsLine(line);
+    }
+    // An unbounded/unknown line is incomplete evidence, never a remote green.
+    if (tails[stream].length > 4096) {
+      incompleteStandards ??= `standards output line exceeds 4096 characters: ${tails[stream].slice(0, 4000)}`;
+      tails[stream] = '';
+    }
   };
   const ssh = (command, request, inherit = false) => exec({file:'ssh',
     args:[host, `sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs ${command}`],
@@ -1623,10 +1639,15 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
       }
       if(!result || !verifyReceipt(text,expected,result.code)) return {mode:'unconfirmed',reason:'ambiguous-result'};
       if (argv[2] === 'check:standards') {
+        for (const stream of ['stdout', 'stderr']) {
+          inspectStandardsLine(tails[stream]);
+          tails[stream] = '';
+        }
         observeStandards(result.stdout ?? '', 'stdout');
         observeStandards(result.stderr ?? '', 'stderr');
+        for (const stream of ['stdout', 'stderr']) inspectStandardsLine(tails[stream]);
         // Only a matching protected receipt proves it is safe to rerun locally.
-        if (incompleteStandards) return {mode:'cancelled',terminated:true,code:1,reason:'incomplete-standards-inputs'};
+        if (incompleteStandards !== undefined) return {mode:'cancelled',terminated:true,code:1,reason:'incomplete-standards-inputs',detail:incompleteStandards};
       }
       // A verified receipt proves it ran remotely. Without a usable report on a green run, rerun locally;
       // a red run keeps its verdict (verify-lane treats a missing report as unavailable, never green).
