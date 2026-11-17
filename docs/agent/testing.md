@@ -4433,8 +4433,11 @@ Red-team queue nomination must not depend on the primary review refusal kind. Th
 snapshot can nominate a ready `review:human` head missing its result even when reconciliation
 reports `review-ci` or `ci-heal-escalated`. A stale/missing stored review requires a fresh advisory
 loop before red-team-only recovery; never re-key an old accepting payload to a content-changed head.
-The advisory uses the existing head-bound human-handoff CI waiver, preserves the human hold,
-and shares the queue, retry cooldown, lane allowance and live-review budget. Unreadable absence
+The advisory uses the existing head-bound human-handoff CI waiver only when
+`prOwnership.advisoryReviewOnHumanHandoff` resolves to `on`; unreadable settings keep CI blocking.
+Formal review holds and other review-hold labels still block advisory recovery.
+The advisory preserves the human hold and shares the queue, retry cooldown, lane allowance
+and live-review budget. Unreadable absence
 of stored work, scope/referral holds and incomplete reviews keep dispatch closed.
 
 `node scripts/operations/run.mjs red-team-enqueue --pr=<N> --reason=<text>` (optional

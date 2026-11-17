@@ -26,6 +26,7 @@ import { createPolicyClearPublisher, readRedTeamGateSource, readRedTeamRecoveryF
   POLICY_CLEAR_HOLD_OWED } from './red-team-check-run.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
+import { loadPrOwnershipSettings } from '../conveyor/pr-ownership-settings.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun, completedRedTeamSeat } from './red-team-run-result.mjs';
 
 import { redTeamRequired, VERDICTS } from './jury-core.mjs';
@@ -594,6 +595,17 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       const unfinishedCarry = evidence?.carry && evidence.carry.step !== 'done';
       if (redTeamForHead(rawPr.comments, pr, head) && !unfinishedCarry) return resultOnHead();
       const human = Array.isArray(rawPr.labels) && rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:human');
+      if (refusal.kind === RED_TEAM_REQUEST_KIND && human) {
+        const reviews = Array.isArray(rawPr.reviews) ? rawPr.reviews : null;
+        // The advisory retains review:human; every other hold uses the full-review guards.
+        const refusal = publishableClearGuard({
+          labels: rawPr.labels.filter(label => (typeof label === 'string' ? label : label?.name) !== 'review:human'),
+          acceptance: null, comments: rawPr.comments, reviews, settlesPending: true, settlesReviewPending: true,
+        });
+        if (refusal) return guardedSkip(refusal);
+        if (reviews === null) return skip('PR reviews unreadable; inspect formal reviews before full review');
+        if (laterReviewHold(reviews)) return skip('formal review hold prevents full review; inspect formal reviews');
+      }
       if (refusal.kind === RED_TEAM_REQUEST_KIND && human
         && evidence?.loopPayload?.findings?.read?.netBasis?.rev !== head) {
         // An old advisory cannot authorize a red-team-only run at a new SHA. Ask for the ordinary
@@ -608,7 +620,6 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           const name = typeof label === 'string' ? label : label?.name;
           return name.startsWith('review:') && !['review:human', 'review:pending'].includes(name);
         })) return skip('additional review hold prevents advisory recovery');
-        if (!Array.isArray(rawPr.reviews)) return skip('PR reviews unreadable; inspect formal reviews before advisory recovery');
         return dispatchDecision({ action: 'review', advisoryHead: head,
           why: 'human hold at an unreviewed head needs an advisory review before red team' });
       }
@@ -863,7 +874,7 @@ export const carriedCheckPublisher = ({ repo, env = process.env, run = runGhSync
  * host start on success or an unknown outcome. Both are optional for standalone callers.
  */
 export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log = () => {}, dryRun = false,
-  env = process.env, setting,
+  env = process.env, setting, loadPrOwnership = loadPrOwnershipSettings,
   readEvidence = readDrainRedTeamEvidence, readStatus = readRedTeamStatus,
   readCarry = key => readRedTeamCarry({ ...key, env }),
   readReviewRuns = isUnderTest() || isUnderTest(env) ? () => [] : readReviewRunEvidence,
@@ -1167,9 +1178,22 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           if (reserved) budget.left--;
           try {
             if (row.staleRecovery && !abandon({ repo, pr: row.prNumber, head: row.head }).ok) throw new PreStartDispatchRefusalError('stale abandonment refused');
+            let advisoryCiWaiver;
+            if (row.advisoryHead) {
+              try {
+                const resolved = loadPrOwnership({ env })?.advisoryReviewOnHumanHandoff;
+                note(`pr-ownership: prOwnership.advisoryReviewOnHumanHandoff=${resolved?.value ?? 'off'} (source: ${resolved?.source ?? 'unreadable'})`);
+                if (resolved?.value === 'on' && resolved.source !== 'unreadable') {
+                  advisoryCiWaiver = { head: row.advisoryHead, reason: 'human-handoff' };
+                }
+              } catch {
+                note('pr-ownership: prOwnership.advisoryReviewOnHumanHandoff=off (source: unreadable); CI waiver withheld');
+              }
+            }
             const result = dispatch({ pr: row.prNumber, repo,
               ...(row.action === 'dispatch' ? { redTeamOnly: true, redTeamMode: row.mode } : {}),
-              ...(row.advisoryHead ? { expectedHead: row.head, advisoryCiWaiver: { head: row.advisoryHead, reason: 'human-handoff' } } : {}),
+              ...(row.advisoryHead ? { expectedHead: row.head } : {}),
+              ...(advisoryCiWaiver ? { advisoryCiWaiver } : {}),
               ...(preferLane != null ? { preferLane } : {}) });
             if (result?.skipped || !Number.isInteger(result?.jobPid)) {
               const refundable = result?.skipped !== 'live-job'

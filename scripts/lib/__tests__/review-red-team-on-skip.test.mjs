@@ -13,6 +13,8 @@ import { cardOnlyHeadMoveCandidate, normalizeRedTeamResult, planRedTeamRecovery,
 import { assertMainNotStale, PreStartDispatchRefusalError } from '../main-staleness.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { resetCascadeLogForTest } from '../policy-cascade.mjs';
+import { resolvePrOwnershipSettings } from '../../conveyor/pr-ownership-settings.mjs';
+import { dispatchReview } from '../../operations/review-dispatch.mjs';
 import { readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus, redTeamStatusDir,
   readCarriedCheckUnpublished, publishCarriedCheckDurably, markCarriedCheckUnpublished } from '../drain-red-team-evidence.mjs';
 import { publishRedTeamCheckFromLive, evaluateRedTeamCheckFact, clearLivePublicationHold,
@@ -3184,6 +3186,7 @@ describe('human hold red-team recovery independent of reconcile refusal kind', (
   const absent = () => ({ loopPayload: null, inFlight: false, recorded: false,
     seatRecorded: false, completedRecorded: false });
   const options = (kind, over = {}) => runFixture({ rawPrs: [humanPr()],
+    env: {}, loadPrOwnership: ({ env }) => resolvePrOwnershipSettings({ env }),
     plan: { refusals: [{ kind, prNumber: pr, headSha: head }] }, readEvidence: absent, ...over });
   it.each(['review-ci', 'ci-heal-escalated', 'owed-ci-heal'])(
     'requests the fresh advisory and its red team for a moved human head refused as %s', kind => {
@@ -3200,6 +3203,64 @@ describe('human hold red-team recovery independent of reconcile refusal kind', (
     expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'dispatch', mode: 'fresh' });
     expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' });
     expect(o.syncLabels).not.toHaveBeenCalled();
+  });
+  it.each([false, true])('CHANGES_REQUESTED blocks human recovery without dispatch (current advisory=%s)', current => {
+    const o = options('review-ci', {
+      rawPrs: [{ ...humanPr(), reviews: [{ state: 'CHANGES_REQUESTED', author: { login: 'reviewer' },
+        submittedAt: '2026-11-17T12:00:00Z' }] }],
+      readEvidence: () => ({ ...absent(), loopPayload: current ? payload() : null }),
+    });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip',
+      why: 'formal review hold prevents full review; inspect formal reviews' });
+    expect(o.dispatch).not.toHaveBeenCalled();
+    expect(o.syncLabels).not.toHaveBeenCalled();
+  });
+  it.each(['review-status:blocked', 'review:changes'])(
+    '%s blocks human advisory recovery through the shared label guard', label => {
+      const o = options('review-ci', { rawPrs: [{ ...humanPr(), labels: [...humanPr().labels, { name: label }] }] });
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip',
+        why: 'conflicting label prevents policy-clear', escalate: true });
+      expect(o.dispatch).not.toHaveBeenCalled();
+      expect(o.syncLabels).not.toHaveBeenCalled();
+    });
+  it('a later review hold comment blocks human advisory recovery', () => {
+    const o = options('review-ci', { rawPrs: [{ ...humanPr(), comments: [{ body: '🔁 human review — changes requested\n\nFix the guard.' }] }] });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip',
+      why: 'explicit review hold comment prevents full review; inspect the PR thread' });
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it('unreadable formal reviews block human advisory recovery', () => {
+    const o = options('review-ci', { rawPrs: [{ ...humanPr(), reviews: null }], readReviews: () => null });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip',
+      why: 'PR reviews unreadable; inspect formal reviews before full review' });
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it.each(['failure', 'pending'])(
+    'advisoryReviewOnHumanHandoff=off withholds the waiver and required CI %s blocks dispatch', state => {
+      const readBrief = vi.fn(() => { throw new Error('CI must block before reading the brief'); });
+      const o = options('review-ci', {
+        env: { WE_PR_OWNERSHIP_ADVISORY_ON_HANDOFF: 'off', WE_REVIEW_START_AFTER: 'ci-green' }, log: vi.fn(),
+        dispatch: vi.fn(args => dispatchReview({ ...args, root: tmpdir(),
+          env: { WE_REVIEW_START_AFTER: 'ci-green' }, checkStaleness: () => ({ fresh: true, behind: 0 }),
+          ciGate: () => ({ allowed: false, headSha: head, reason: 'required-checks-not-green',
+            affected: [{ name: 'test', reason: state }] }), readBrief })),
+      });
+      const out = runRedTeamOnSkip(o);
+      expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, expectedHead: head });
+      expect(o.dispatch.mock.results[0].value.skipped).toContain('review-ci: required-checks-not-green');
+      expect(readBrief).not.toHaveBeenCalled();
+      expect(out.dispatched).toEqual([]);
+      expect(o.capacity.budget.left).toBe(1);
+      expect(o.log).toHaveBeenCalledWith('pr-ownership: prOwnership.advisoryReviewOnHumanHandoff=off (source: env)');
+    });
+  it.each([
+    ['unreadable settings', () => { throw new Error('unreadable'); }],
+    ['missing setting', () => ({})],
+    ['unreadable source', () => ({ advisoryReviewOnHumanHandoff: { value: 'on', source: 'unreadable' } })],
+  ])('%s withholds the human-handoff CI waiver', (_, loadPrOwnership) => {
+    const o = options('review-ci', { loadPrOwnership });
+    runRedTeamOnSkip(o);
+    expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, expectedHead: head });
   });
   it('does not carry an old accepting read onto a content-changed human head', () => {
     const old = { ...payload(), findings: { read: { netBasis: { rev: 'b'.repeat(40) } } } };
