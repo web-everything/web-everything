@@ -1,3 +1,4 @@
+import { launchAgent } from '../lib/agent-launch.mjs';
 /** Operator decision 2026-10-13: manual intervention without a worker. All why IO is injectable here. */
 import { execFileSync } from 'node:child_process';
 import { readdirSync, readFileSync, existsSync } from 'node:fs';
@@ -37,7 +38,7 @@ export function createWhyReader({
   readBackoffs = () => { const path = join(coordinationRoot, 'build-dispatch-failures.json'); if (pathExists(path)) JSON.parse(readText(path)); return listBuildBackoffs({ path, now: now() }); },
   // readFailureState repairs corrupt ledgers by renaming them. Read its format without that mutation.
   readPrepareFailures = () => { const path = join(coordinationRoot, 'prepare-failures.json'); return pathExists(path) ? JSON.parse(readText(path)) : { failures: {} }; },
-  readAgents = () => JSON.parse(run('claude', ['agents', '--json', '--all'], { encoding: 'utf8', timeout: 30000, maxBuffer: 32 * 1024 * 1024 })),
+  readAgents = () => JSON.parse(launchAgent({ mode: 'claude-agents-list', resumeId: null }, run, 'claude', ['agents', '--json', '--all'], { encoding: 'utf8', timeout: 30000, maxBuffer: 32 * 1024 * 1024 })),
   listPrs = (repo, { state = 'open' } = {}) => JSON.parse(run('gh', ['pr', 'list', '--repo', repo, '--state', state, '--limit', '10000', '--json', 'number,title,headRefName,labels,state'], { encoding: 'utf8', timeout: 60000, maxBuffer: 32 * 1024 * 1024 })),
   now = Date.now,
 } = {}) {

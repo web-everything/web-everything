@@ -1335,7 +1335,7 @@ export async function defaultAwaitVerifyIo({
         if (!exited()) return { resumed: false, reason: 'stop-before-resume: process still alive' };
         sleep(1_000);
       }
-      const argv = io.buildAgentArgv({ payload: { prompt }, resumeSessionId: session.sessionId });
+      const argv = io.buildAgentArgv({ payload: { prompt }, resumeId: session.sessionId });
       let stdout = '';
       try { stdout = String(io.defaultSpawnAgent(argv, { cwd: session.cwd }) ?? ''); } catch (e) { return { resumed: false, reason: String(e?.message ?? e).split('\n')[0] }; }
       const printedId = io.parseBackgroundedId(stdout);

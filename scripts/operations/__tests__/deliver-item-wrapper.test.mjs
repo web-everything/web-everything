@@ -140,7 +140,7 @@ describe('buildRestrictedProviderArgv', () => {
   it('#4348 — addDirs adds one `--add-dir <dir>` pair each, on both branches, before -p/--resume', () => {
     const fresh = buildRestrictedProviderArgv({ sessionId: 'u', prompt: 'p', settingsFile: '/s.json', addDirs: ['/we/lane-7'] });
     expect(fresh.slice(-10)).toEqual(['--add-dir', '/we/lane-7', '--model', 'sonnet', '--effort', 'medium', '-p', '--session-id', 'u', 'p']);
-    const resume = buildRestrictedProviderArgv({ prompt: 'p', resumeSessionId: 'u', settingsFile: '/s.json', addDirs: ['/we/lane-7'] });
+    const resume = buildRestrictedProviderArgv({ prompt: 'p', resumeId: 'u', settingsFile: '/s.json', addDirs: ['/we/lane-7'] });
     expect(resume.slice(-5)).toEqual(['--add-dir', '/we/lane-7', '--resume', 'u', 'p']);
   });
 
@@ -176,7 +176,7 @@ describe('buildRestrictedProviderArgv', () => {
   it('resume: drops -p/--session-id, adds --resume <id>, retains the session model and keeps the restriction flags from a fresh '
     + 'spawn (--resume was verified, not assumed, to preserve both auth-without-a-key and hooks-firing)', () => {
     const argv = buildRestrictedProviderArgv({
-      sessionId: 'session-1', prompt: 'fix the gate failure', resumeSessionId: 'session-1',
+      sessionId: 'session-1', prompt: 'fix the gate failure', resumeId: 'session-1',
       settingsFile: '/repo/.operations/hooks.json',
     });
     expect(argv).toEqual([
@@ -340,13 +340,13 @@ describe('CODEX_PROVIDER.spawn (#3580 — the real second provider)', () => {
   it('records the thread id Codex minted, keyed by sessionSlug, on a FRESH spawn', async () => {
     const o = io();
     await DELIVERY_AGENT_PROVIDERS.codex.spawn(REQ, o);
-    expect(o.writeThreadId).toHaveBeenCalledWith('sess-9', '01a0-live-thread');
+    expect(o.writeThreadId).toHaveBeenCalledWith('01a0-live-thread');
   });
 
   it('resumes on the RECORDED Codex thread id — never on the Claude UUID the port hands it', async () => {
     const o = io({ readThreadId: vi.fn(() => 'recorded-tid') });
-    await DELIVERY_AGENT_PROVIDERS.codex.spawn({ ...REQ, resumeSessionId: 'claude-uuid' }, o);
-    expect(o.readThreadId).toHaveBeenCalledWith('sess-9');
+    await DELIVERY_AGENT_PROVIDERS.codex.spawn({ ...REQ, resumeId: 'recorded-tid' }, o);
+    expect(o.readThreadId).toHaveBeenCalledWith('recorded-tid');
     const argv = o.spawnAgent.mock.calls[0][0];
     expect(argv.slice(0, 3)).toEqual(['exec', 'resume', 'recorded-tid']);
     expect(argv).not.toContain('claude-uuid');
@@ -358,16 +358,25 @@ describe('CODEX_PROVIDER.spawn (#3580 — the real second provider)', () => {
   // to carry — the agent would be handed "your gate failed" with no memory of what it built.
   it('REFUSES to resume when no thread id was recorded, instead of silently starting a new session', async () => {
     const o = io({ readThreadId: vi.fn(() => null) });
-    await expect(DELIVERY_AGENT_PROVIDERS.codex.spawn({ ...REQ, resumeSessionId: 'claude-uuid' }, o))
+    await expect(DELIVERY_AGENT_PROVIDERS.codex.spawn({ ...REQ, resumeId: 'recorded-tid' }, o))
       .rejects.toThrow(/cannot resume session sess-9/);
     expect(o.spawnAgent).not.toHaveBeenCalled();
+  });
+
+  it('REFUSES a mismatched nonempty Codex receipt before spawnAgent', async () => {
+    const o = io({ readThreadId: vi.fn(() => 'different-thread-id') });
+    await expect(DELIVERY_AGENT_PROVIDERS.codex.spawn({ ...REQ, resumeId: 'recorded-tid' }, o))
+      .rejects.toThrow(/cannot resume session sess-9/);
+    expect(o.readThreadId).toHaveBeenCalledWith('recorded-tid');
+    expect(o.spawnAgent).not.toHaveBeenCalled();
+    expect(o.writeThreadId).not.toHaveBeenCalled();
   });
 
   it('captures the child\'s output on a spawn failure and rethrows untouched (same as the Claude provider)', async () => {
     const boom = new Error('spawnSync codex ETIMEDOUT');
     const o = io({ spawnAgent: vi.fn(() => { throw boom; }) });
     await expect(DELIVERY_AGENT_PROVIDERS.codex.spawn(REQ, o)).rejects.toThrow(boom);
-    expect(o.persistFailure).toHaveBeenCalledWith('sess-9', boom, { resumeSessionId: null });
+    expect(o.persistFailure).toHaveBeenCalledWith(REQ.sessionId, boom, { resumeId: null });
   });
 
   it('refuses a deny map that would cover the agent\'s own lane, before any spawn happens', async () => {
@@ -613,7 +622,7 @@ describe('CLAUDE_RESTRICTED_PROVIDER.spawn real cwd + env (#3627 bug 7)', () => 
     const io = fakeIo({ resolveReportsDir: vi.fn(() => '/real/repo/.operations/delivery-reports') });
     await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(
       {
-        sessionId: '66666666-6666-4666-8666-666666666666', resumeSessionId: '66666666-6666-4666-8666-666666666666',
+        sessionId: '66666666-6666-4666-8666-666666666666', resumeId: '66666666-6666-4666-8666-666666666666',
         prompt: 'fix the gate failure', lane: 3, sessionSlug: 'conveyor-3371', item: '3371', attemptTag: '',
       },
       io,
@@ -641,11 +650,11 @@ describe('CLAUDE_RESTRICTED_PROVIDER.spawn real cwd + env (#3627 bug 7)', () => 
 
     expect(persistFailure).toHaveBeenCalledTimes(1);
     const [sessionSlugArg, errorArg, optsArg] = persistFailure.mock.calls[0];
-    expect(sessionSlugArg).toBe('conveyor-3371');
+    expect(sessionSlugArg).toBe('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
     expect(errorArg).toBe(failure);
     expect(errorArg.stdout).toContain('partial agent output');
     expect(errorArg.stderr).toContain('some stderr line');
-    expect(optsArg.resumeSessionId).toBe(null);
+    expect(optsArg.resumeId).toBe(null);
   });
 
   it('still throws the original error after capturing it — the capture is observability, never a swallow', async () => {
@@ -656,19 +665,19 @@ describe('CLAUDE_RESTRICTED_PROVIDER.spawn real cwd + env (#3627 bug 7)', () => 
     )).rejects.toThrow('boom');
   });
 
-  it('a resume\'s captured failure is tagged with the resumeSessionId (so it never clobbers the fresh spawn\'s '
+  it('a resume\'s captured failure is tagged with the resumeId (so it never clobbers the fresh spawn\'s '
     + 'own capture, which uses the same sessionSlug)', async () => {
     const io = fakeIo({ spawnAgent: vi.fn(() => { throw new Error('resume boom'); }) });
     const persistFailure = vi.fn();
     await expect(DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(
       {
-        sessionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', resumeSessionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+        sessionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', resumeId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
         prompt: 'fix the gate failure', lane: 3, sessionSlug: 'conveyor-3371', item: '3371', attemptTag: '',
       },
       { ...io, persistFailure },
     )).rejects.toThrow('resume boom');
     const [, , optsArg] = persistFailure.mock.calls[0];
-    expect(optsArg.resumeSessionId).toBe('cccccccc-cccc-4ccc-8ccc-cccccccccccc');
+    expect(optsArg.resumeId).toBe('cccccccc-cccc-4ccc-8ccc-cccccccccccc');
   });
 
   // build-path-codex-isolation-locus — the SAME fix as `CODEX_PROVIDER.spawn lanePathOverride`, above, for
@@ -746,7 +755,7 @@ describe('cross-locus delivery reaches BOTH lanes (#4348)', () => {
     run: vi.fn(),
     persistFailure: vi.fn(),
     resolveReportsDir: vi.fn((lanePath) => `${lanePath}/.operations/delivery-reports`),
-    readThreadId: vi.fn(() => 'tid-4348'),
+    readThreadId: vi.fn((id) => id),
     writeThreadId: vi.fn(),
     recordCpu: vi.fn(),
     recordScorecard: vi.fn(),
@@ -797,7 +806,7 @@ describe('cross-locus delivery reaches BOTH lanes (#4348)', () => {
 
   it('CODEX_PROVIDER: the gate-failure RESUME keeps the WE-lane grant (`exec resume` takes no --add-dir)', async () => {
     const o = codexIo();
-    await DELIVERY_AGENT_PROVIDERS.codex.spawn({ ...REQ, lanePathOverride: P2, resumeSessionId: REQ.sessionId }, o);
+    await DELIVERY_AGENT_PROVIDERS.codex.spawn({ ...REQ, lanePathOverride: P2, resumeId: 'tid-4348' }, o);
     const [argv, opts] = o.spawnAgent.mock.calls[0];
     expect(argv.slice(0, 3)).toEqual(['exec', 'resume', 'tid-4348']);
     expect(permissionsOf(argv)).toContain(`"${L7}"="write"`);
@@ -805,7 +814,7 @@ describe('cross-locus delivery reaches BOTH lanes (#4348)', () => {
   });
 
   it('CODEX_PROVIDER: the ONLY writable grant added for the heavy queue is the admission lock folder (operator ruling 2026-10-07)', async () => {
-    for (const request of [{ ...REQ }, { ...REQ, lanePathOverride: P2 }, { ...REQ, lanePathOverride: P2, resumeSessionId: REQ.sessionId }]) {
+    for (const request of [{ ...REQ }, { ...REQ, lanePathOverride: P2 }, { ...REQ, lanePathOverride: P2, resumeId: 'tid-4348' }]) {
       const o = codexIo();
       await DELIVERY_AGENT_PROVIDERS.codex.spawn(request, o);
       const argv = o.spawnAgent.mock.calls[0][0];
@@ -834,7 +843,7 @@ describe('cross-locus delivery reaches BOTH lanes (#4348)', () => {
 
   it('CLAUDE_RESTRICTED_PROVIDER: the resume keeps the --add-dir grant', async () => {
     const o = claudeIo();
-    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ ...REQ, lanePathOverride: P2, resumeSessionId: REQ.sessionId }, o);
+    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ ...REQ, lanePathOverride: P2, resumeId: 'tid-4348' }, o);
     const argv = o.spawnAgent.mock.calls[0][0];
     expect(argv).toContain('--resume');
     expect(argv[argv.indexOf('--add-dir') + 1]).toBe(L7);
@@ -2874,7 +2883,7 @@ describe('runGateWithOneRetry (#3627 bug 2 — threads the injected run through 
     expect(provider.spawn).toHaveBeenCalledTimes(1); // the one resume-with-gate-failure call
   });
 
-  it('(#3627 bug 5) resumes with claudeSessionId — a real UUID — as BOTH sessionId and resumeSessionId, '
+  it('(#3627 bug 5) resumes with claudeSessionId — a real UUID — as BOTH sessionId and resumeId, '
     + 'never sessionSlug (the CLI validates --session-id/--resume as a UUID and rejects a human-readable slug)', async () => {
     const run = vi.fn((cmd, args) => {
       if (args[0] === 'scripts/lane-pool.mjs') {
@@ -2893,9 +2902,9 @@ describe('runGateWithOneRetry (#3627 bug 2 — threads the injected run through 
     expect(provider.spawn).toHaveBeenCalledTimes(1);
     const call = provider.spawn.mock.calls[0][0];
     expect(call.sessionId).toBe(claudeSessionId);
-    expect(call.resumeSessionId).toBe(claudeSessionId);
+    expect(call.resumeId).toBe(claudeSessionId);
     expect(call.sessionId).not.toBe('conveyor-3371');
-    expect(call.resumeSessionId).not.toBe('conveyor-3371');
+    expect(call.resumeId).not.toBe('conveyor-3371');
   });
 
   it('(#3627 bug 5) the SAME claudeSessionId a fresh spawn used is what the resume targets — a resume must '
@@ -2922,7 +2931,7 @@ describe('runGateWithOneRetry (#3627 bug 2 — threads the injected run through 
     const [freshCall, resumeCall] = freshProvider.spawn.mock.calls.map((c) => c[0]);
     expect(freshCall.sessionId).toBe(claudeSessionId);
     expect(resumeCall.sessionId).toBe(claudeSessionId);
-    expect(resumeCall.resumeSessionId).toBe(claudeSessionId);
+    expect(resumeCall.resumeId).toBe(claudeSessionId);
   });
 });
 
@@ -3602,7 +3611,7 @@ describe('deliverItem (#3627 bug 13 — the success-path result string names the
     expect(reviewBuild).toHaveBeenCalledTimes(3);
     expect(provider.spawn).toHaveBeenCalledTimes(3);
     for (const [call] of provider.spawn.mock.calls.slice(1)) {
-      expect(call.resumeSessionId).toBe('uuid-fixed');
+      expect(call.resumeId).toBe('uuid-fixed');
       expect(call.prompt.split('# Reviewer expectations')).toHaveLength(2);
     }
     expect(execFileSync.mock.calls.filter(([bin, args]) => bin === 'node' && args[1] === 'verify')).toHaveLength(3);
@@ -4683,7 +4692,7 @@ describe('117 S3a: CLAUDE_RESTRICTED_PROVIDER on the unified worker wrapper', ()
     const runWorkerFn = vi.fn(async () => ({ envelope: { v: 2 } }));
     const stale = { v: 1, session: 'conveyor-4001', status: 'done', outcome: 'done', updatedAt: '2020-01-01T00:00:00.000Z', filesTouched: ['a.mjs'] };
     vi.mocked(tryReadDeliveryReport).mockReturnValue(stale);
-    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ ...REQUEST, resumeSessionId: 'abc-resume' }, fakeIo({ workerWrapper: true, runWorkerFn }));
+    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ ...REQUEST, resumeId: 'abc-resume' }, fakeIo({ workerWrapper: true, runWorkerFn }));
     const [, io] = runWorkerFn.mock.calls[0];
     expect(io.legacyRead()).toBeNull();
     const fresh = { ...stale, updatedAt: new Date(Date.now() + 60_000).toISOString() };
@@ -4698,7 +4707,7 @@ describe('117 S3a: CLAUDE_RESTRICTED_PROVIDER on the unified worker wrapper', ()
 
   it('knob ON, resumed turn: --resume is kept and the schema is on it too (D7: resume with the schema)', async () => {
     const runWorkerFn = vi.fn(async () => ({ envelope: { v: 2 } }));
-    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ ...REQUEST, resumeSessionId: 'abc-resume' }, fakeIo({ workerWrapper: true, runWorkerFn }));
+    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ ...REQUEST, resumeId: 'abc-resume' }, fakeIo({ workerWrapper: true, runWorkerFn }));
     const [spec] = runWorkerFn.mock.calls[0];
     expect(spec.argv).toContain('--resume');
     expect(spec.argv).toContain('-p');
@@ -4743,14 +4752,14 @@ describe('117 S3a: CLAUDE_RESTRICTED_PROVIDER on the unified worker wrapper', ()
       const bad = fakeIo({ workerWrapper: true, recordCpu: vi.fn(), persistFailure: vi.fn(), spawnAgent: vi.fn(async () => { throw boom; }) });
       await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ ...REQUEST, sessionSlug: 'conveyor-4002' }, bad);
       expect(bad.recordCpu).toHaveBeenCalledWith(usage);
-      expect(bad.persistFailure).toHaveBeenCalledWith('conveyor-4002', boom, { resumeSessionId: null });
+      expect(bad.persistFailure).toHaveBeenCalledWith(REQUEST.sessionId, boom, { resumeId: null });
 
       // runWorker itself rejecting (a record it could not write) is also a failed turn: same telemetry + capture, then the error propagates
       const fault = Object.assign(new Error('lock timeout'), { resourceUsage: usage });
       const rej = fakeIo({ workerWrapper: true, recordCpu: vi.fn(), persistFailure: vi.fn(), runWorkerFn: vi.fn(async () => { throw fault; }) });
       await expect(DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(REQUEST, rej)).rejects.toBe(fault);
       expect(rej.recordCpu).toHaveBeenCalledWith(usage);
-      expect(rej.persistFailure).toHaveBeenCalledWith('conveyor-4001', fault, { resumeSessionId: null });
+      expect(rej.persistFailure).toHaveBeenCalledWith(REQUEST.sessionId, fault, { resumeId: null });
     } finally {
       if (prevOps === undefined) delete process.env.WE_OPERATIONS_DIR; else process.env.WE_OPERATIONS_DIR = prevOps;
       if (prev === undefined) delete process.env.OPERATION_COMPLETIONS_DIR; else process.env.OPERATION_COMPLETIONS_DIR = prev;

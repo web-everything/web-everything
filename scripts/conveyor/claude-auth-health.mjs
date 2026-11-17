@@ -1,3 +1,4 @@
+import { launchAgent } from '../lib/agent-launch.mjs';
 /**
  * @file scripts/conveyor/claude-auth-health.mjs
  * @description Card x5kagse (epic #4075/#3383) — the FOLLOW-UP to #2717 (`we:scripts/conveyor/hung-session.mjs
@@ -156,7 +157,7 @@ function run(cmd, args, { timeoutMs = 10_000 } = {}) {
  */
 export function probeClaudeLoggedIn({ exec = run } = {}) {
   try {
-    const out = exec('claude', ['auth', 'status', '--json']);
+    const out = launchAgent({ mode: 'claude-auth-status', resumeId: null }, exec, 'claude', ['auth', 'status', '--json']);
     return JSON.parse(out)?.loggedIn === true;
   } catch {
     return false;

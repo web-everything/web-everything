@@ -1,3 +1,4 @@
+import { launchAgent } from './agent-launch.mjs';
 /**
  * @file scripts/lib/lane-salvage.mjs
  * @description SNAPSHOT-THEN-RECLAIM for an abandoned pool lane.
@@ -128,7 +129,7 @@ export function liveAgentInLane(agents, dir, sessionIds = []) {
 /** `claude agents --json`, FAIL-CLOSED: `null` when it cannot be read (callers then refuse to salvage). */
 export function readAgentsStrict({ exec = execFileSync } = {}) {
   try {
-    const parsed = JSON.parse(cachedClaudeAgents({ fetch: () => exec('claude', ['agents', '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 30_000 }) }));
+    const parsed = JSON.parse(cachedClaudeAgents({ fetch: () => launchAgent({ mode: 'claude-agents-list', resumeId: null }, exec, 'claude', ['agents', '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 30_000 }) }));
     return Array.isArray(parsed) ? parsed : null;
   } catch { return null; }
 }

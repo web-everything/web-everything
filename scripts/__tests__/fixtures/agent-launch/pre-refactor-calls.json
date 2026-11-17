@@ -1,0 +1,296 @@
+[
+  {
+    "file": "scripts/codex-direct-task.mjs",
+    "line": 1079,
+    "mode": "codex-direct",
+    "old": "spawnFn(cli, argv, { cwd: dir, stdio: ['pipe', 'pipe', 'pipe'], detached: true,\n        env: review ? env : { ...env, PATH: codexShimPath(env), ...(tempRoot ? { TMPDIR: tempRoot, TMP: tempRoot, TEMP: tempRoot } : {}) } })"
+  },
+  {
+    "file": "scripts/conveyor/claude-auth-health.mjs",
+    "line": 159,
+    "mode": "claude-auth-status",
+    "old": "exec('claude', ['auth', 'status', '--json'])"
+  },
+  {
+    "file": "scripts/conveyor/driver-watchdog.mjs",
+    "line": 491,
+    "mode": "claude-agents-list",
+    "old": "exec('claude', ['agents', '--json'], {\n    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: 30_000, killSignal: 'SIGKILL',\n  })"
+  },
+  {
+    "file": "scripts/conveyor/health-watch.mjs",
+    "line": 819,
+    "mode": "claude-agents-list",
+    "old": "exec('claude', ['agents', '--json'], { cwd: homedir() })"
+  },
+  {
+    "file": "scripts/conveyor/liveness-sweep.mjs",
+    "line": 164,
+    "mode": "claude-agents-list",
+    "old": "exec('claude', ['agents', '--json'], { cwd: home, encoding: 'utf8', timeout: 60_000 })"
+  },
+  {
+    "file": "scripts/conveyor/orphan-claim-release.mjs",
+    "line": 302,
+    "mode": "claude-agents-list",
+    "old": "execFileSync('claude', ['agents', '--json', '--all'], {\n      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL',\n    })"
+  },
+  {
+    "file": "scripts/conveyor/pool-exhaustion.mjs",
+    "line": 92,
+    "mode": "claude-agents-list",
+    "old": "execFileSync('claude', ['agents', '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 30_000 })"
+  },
+  {
+    "file": "scripts/conveyor/reconcile-pass.mjs",
+    "line": 513,
+    "mode": "claude-agents-list",
+    "old": "exec('claude', ['agents', '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: 30_000, killSignal: 'SIGKILL' })"
+  },
+  {
+    "file": "scripts/conveyor/session-reaper.mjs",
+    "line": 1639,
+    "mode": "claude-rm",
+    "old": "exec('claude', ['rm', id], { encoding: 'utf8', timeout: 30_000 })"
+  },
+  {
+    "file": "scripts/conveyor/session-watchdog.mjs",
+    "line": 479,
+    "mode": "claude-agents-list",
+    "old": "exec('claude', ['agents', '--json'], { cwd: homedir(), encoding: 'utf8', timeout: 60_000 })"
+  },
+  {
+    "file": "scripts/lane-whois.mjs",
+    "line": 315,
+    "mode": "claude-agents-list",
+    "old": "exec('claude', ['agents', '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })"
+  },
+  {
+    "file": "scripts/lib/claude-sessions.mjs",
+    "line": 38,
+    "mode": "claude-agents-list",
+    "old": "exec('claude', ['agents', '--json', ...(all ? ['--all'] : [])], {\n          encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024,\n          timeout: listTimeoutMs(env), killSignal: 'SIGKILL', env: childEnv, ...(cwd ? { cwd } : {}) })"
+  },
+  {
+    "file": "scripts/lib/codex-judge-spawn.mjs",
+    "line": 758,
+    "mode": "codex-judge",
+    "old": "spawnFn(cli, argv, { cwd: spawnCwd, env: childEnv, stdio: ['pipe', 'pipe', 'pipe'] })"
+  },
+  {
+    "file": "scripts/lib/judge-spawn.mjs",
+    "line": 927,
+    "mode": "claude-judge",
+    "old": "spawnFn(cli, argv, { cwd: spawnCwd, env: markWorkerEnv(sanitizeSpawnEnv(env)), stdio: ['pipe', 'pipe', 'pipe'] })"
+  },
+  {
+    "file": "scripts/lib/lane-salvage.mjs",
+    "line": 131,
+    "mode": "claude-agents-list",
+    "old": "exec('claude', ['agents', '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 30_000 })"
+  },
+  {
+    "file": "scripts/lib/pr-state-io.mjs",
+    "line": 65,
+    "mode": "claude-agents-list",
+    "old": "exec('claude', ['agents', '--json'])"
+  },
+  {
+    "file": "scripts/lib/reap-dead-review-runs.mjs",
+    "line": 173,
+    "mode": "claude-agents-list",
+    "old": "listing('claude', ['agents', '--json'])"
+  },
+  {
+    "file": "scripts/lib/review-precedents-io.mjs",
+    "line": 186,
+    "mode": "claude-print",
+    "old": "spawn('claude', ['-p', '--model', alias, '--tools', '', '--output-format', 'text'], { input: prompt, encoding: 'utf8', timeout: 90000, env: markWorkerEnv(process.env) })"
+  },
+  {
+    "file": "scripts/measure-judge-spawn.mjs",
+    "line": 89,
+    "mode": "judge-measurement",
+    "old": "spawn(cli, argv, { cwd, env: process.env, stdio: ['pipe', 'pipe', 'pipe'] })"
+  },
+  {
+    "file": "scripts/measure-judge-spawn.mjs",
+    "line": 133,
+    "mode": "agent-version",
+    "old": "execFileSync(cli, ['--version'], quiet)"
+  },
+  {
+    "file": "scripts/operations/codex-delivery-provider.mjs",
+    "line": 456,
+    "mode": "codex-delivery",
+    "old": "spawnToCompletion(CODEX_CLI, argv, {\n    encoding: 'utf8',\n    stdio: ['ignore', 'pipe', 'pipe'],\n    maxBuffer: 64 * 1024 * 1024,\n    killSignal: 'SIGKILL',\n    ...opts,\n  }, io)"
+  },
+  {
+    "file": "scripts/operations/deliver-item-wrapper.mjs",
+    "line": 2169,
+    "mode": "claude-converge",
+    "old": "runFn('claude', argv, { cwd: lane, env: markWorkerEnv(sanitizeSpawnEnv({ ...process.env, WE_DISPATCH_KIND: dispatchKind })) })"
+  },
+  {
+    "file": "scripts/operations/dispatch-abort.mjs",
+    "line": 76,
+    "mode": "claude-stop",
+    "old": "exec('claude', ['stop', id], STOP_EXEC_OPTS)"
+  },
+  {
+    "file": "scripts/operations/dispatch-lane-io.mjs",
+    "line": 2071,
+    "mode": "claude-dispatch-bg",
+    "old": "exec('claude', argv, execOpts)"
+  },
+  {
+    "file": "scripts/operations/dispatch-lane-io.mjs",
+    "line": 2075,
+    "mode": "claude-dispatch-bg",
+    "old": "exec('claude', argv, execOpts)"
+  },
+  {
+    "file": "scripts/operations/dispatch-lane-io.mjs",
+    "line": 2105,
+    "mode": "claude-dispatch-to-completion",
+    "old": "spawnToCompletion('claude', argv, {\n    encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: SPAWN_TIMEOUT_MS, killSignal: 'SIGKILL', ...opts,\n    env: markWorkerEnv(sanitizeSpawnEnv(opts.env || process.env)),\n  }, io)"
+  },
+  {
+    "file": "scripts/operations/dispatch-lane-io.mjs",
+    "line": 3516,
+    "mode": "claude-agents-list",
+    "old": "exec('claude', ['agents', '--json', ...(all ? ['--all'] : [])], {\n    encoding: 'utf8',\n    stdio: ['ignore', 'pipe', 'pipe'],\n    maxBuffer: 8 * 1024 * 1024,\n    timeout: listTimeoutMs(env),\n    killSignal: 'SIGKILL',\n    // FORWARDED TO THE CHILD, not just read for the timeout. `defaultSpawnAgent` forwards its `env` (via\n    // `...opts`) and this did not, so the two halves of one chain resolved `claude` differently: a test that\n    // pointed `PATH` at a fake got a real spawn and a REAL listing back. The default is `process.env`, so\n    // every existing caller — all of which pass `{ exec }` alone — is byte-identical.\n    env,\n  })"
+  },
+  {
+    "file": "scripts/operations/explore-io.mjs",
+    "line": 525,
+    "mode": "claude-explore",
+    "old": "exec('claude', argv, {\n    encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: SPAWN_TIMEOUT_MS, killSignal: 'SIGKILL', ...opts,\n  })"
+  },
+  {
+    "file": "scripts/operations/explore-io.mjs",
+    "line": 555,
+    "mode": "claude-agents-list",
+    "old": "exec('claude', ['agents', '--json'], {\n    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024,\n    timeout: LIST_TIMEOUT_MS, killSignal: 'SIGKILL',\n  })"
+  },
+  {
+    "file": "scripts/operations/land-advance-io.mjs",
+    "line": 72,
+    "mode": "claude-agents-list",
+    "old": "run('claude', ['agents', '--json'])"
+  },
+  {
+    "file": "scripts/operations/maintenance-io.mjs",
+    "line": 29,
+    "mode": "claude-maintenance",
+    "old": "exec('claude', ['-p', policy.prompt, '--model', policy.model], {\n      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: policy.timeoutSeconds * 1000, killSignal: 'SIGKILL', env: markWorkerEnv(process.env),\n    })"
+  },
+  {
+    "file": "scripts/operations/operator-controls-io.mjs",
+    "line": 39,
+    "mode": "claude-agents-list",
+    "old": "execFileSync('claude', ['agents', '--json', '--all'], { encoding: 'utf8', timeout: 30000 })"
+  },
+  {
+    "file": "scripts/operations/operator-why-io.mjs",
+    "line": 40,
+    "mode": "claude-agents-list",
+    "old": "run('claude', ['agents', '--json', '--all'], { encoding: 'utf8', timeout: 30000, maxBuffer: 32 * 1024 * 1024 })"
+  },
+  {
+    "file": "scripts/operations/review-extra-seats.mjs",
+    "line": 1091,
+    "mode": "agent-version",
+    "old": "spawnSync(CLI_BIN[provider], ['--version'], { env, encoding: 'utf8', timeout: 20_000, stdio: ['ignore', 'pipe', 'pipe'] })"
+  },
+  {
+    "file": "scripts/operations/review-extra-seats.mjs",
+    "line": 2217,
+    "mode": "review-recheck",
+    "old": "spawn(cli, argv, { ...options, detached: true })"
+  },
+  {
+    "file": "scripts/operations/scheduled-sweep.mjs",
+    "line": 291,
+    "mode": "claude-scheduled-sweep",
+    "old": "spawnSync(cmd, args, { input: readFileSync(briefPath, 'utf8'), encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 30 * MIN, cwd: REPO_ROOT })"
+  },
+  {
+    "file": "scripts/operations/worker-wrapper.mjs",
+    "line": 306,
+    "mode": "worker-run",
+    "old": "spawnFn(cmd, argv, opts)"
+  },
+  {
+    "file": "scripts/operations/worker-wrapper.mjs",
+    "line": 383,
+    "mode": "worker-run",
+    "old": "spawnToCompletionFn(spec.command, argv, {\n        // EVERY launch path gets the same env hygiene (a static GH_TOKEN stripped, the worker marker set), not just the callers that\n        // happen to pass a sanitising spawn: the detached CLI and any future launcher inherit it here.\n        cwd: spec.cwd, env: markWorkerEnv(sanitizeSpawnEnv(spec.env ?? process.env)), timeout: Math.max(1, deadlineMs - clock()), killSignal: 'SIGKILL',\n        stdio: ['ignore', 'pipe', 'pipe'], // stdin closed: codex hangs on an open pipe (S0)\n      }, { spawnFn: spawnWithPid })"
+  },
+  {
+    "file": "scripts/operator/dispatch.mjs",
+    "line": 444,
+    "mode": "claude-operator",
+    "old": "spawnFn('claude', [\n      '-p', '--permission-mode', 'bypassPermissions',\n      `--disallowedTools=${disallowedTools.join(',')}`,\n      prompt,\n    ], {\n      cwd: lanePath, stdio: ['ignore', logFd, logFd], detached: true, env: markWorkerEnv(sanitizeSpawnEnv(process.env)),\n    })"
+  },
+  {
+    "file": "scripts/probes/worker-result-probe.mjs",
+    "line": 56,
+    "mode": "worker-result-probe",
+    "old": "spawnSync(cmd, args, { cwd, encoding: 'utf8', timeout: timeoutMs, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024 })"
+  },
+  {
+    "file": "scripts/probes/worker-result-probe.mjs",
+    "line": 66,
+    "mode": "worker-result-probe",
+    "old": "run('claude', [PROMPT, ...base, '--session-id', sid])"
+  },
+  {
+    "file": "scripts/probes/worker-result-probe.mjs",
+    "line": 71,
+    "mode": "worker-result-probe",
+    "old": "run('claude', [PROMPT2, ...base, '--resume', sid])"
+  },
+  {
+    "file": "scripts/probes/worker-result-probe.mjs",
+    "line": 73,
+    "mode": "worker-result-probe",
+    "old": "run('claude', [PROMPT, ...base.slice(0, -1), '0.00001', '--no-session-persistence'])"
+  },
+  {
+    "file": "scripts/probes/worker-result-probe.mjs",
+    "line": 99,
+    "mode": "worker-result-probe",
+    "old": "run('claude', ['--bg', ...args], { cwd, timeoutMs: 60000 })"
+  },
+  {
+    "file": "scripts/probes/worker-result-probe.mjs",
+    "line": 129,
+    "mode": "claude-stop",
+    "old": "run('claude', ['stop', id], { cwd, timeoutMs: 30000 })"
+  },
+  {
+    "file": "scripts/probes/worker-result-probe.mjs",
+    "line": 137,
+    "mode": "worker-result-probe",
+    "old": "run('codex', ['exec', ...common, '-o', out1, '-s', 'read-only', PROMPT], { cwd: dir })"
+  },
+  {
+    "file": "scripts/probes/worker-result-probe.mjs",
+    "line": 144,
+    "mode": "worker-result-probe",
+    "old": "run('codex', ['exec', '--json', '--skip-git-repo-check', '--output-schema', bad, '-o', out3, '-s', 'read-only', 'hi'], { cwd: dir })"
+  },
+  {
+    "file": "scripts/probes/worker-result-probe.mjs",
+    "line": 153,
+    "mode": "worker-result-probe",
+    "old": "run('codex', ['exec', 'resume', tid, ...common, '-o', out2, PROMPT2], { cwd: dir })"
+  },
+  {
+    "file": "scripts/operations/review-dispatch.mjs",
+    "line": 691,
+    "mode": "claude-review",
+    "old": "spawnAgent(argv, { cwd: sessionCwd })"
+  }
+]

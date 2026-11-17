@@ -1,3 +1,4 @@
+import { launchAgent } from '../lib/agent-launch.mjs';
 /** Read → plan → re-read → sanctioned mutation → verification → durable attribution. All IO injectable. */
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, chmodSync, appendFileSync } from 'node:fs';
@@ -36,7 +37,7 @@ export function createOperatorControlsReader({ root = CONTROL_ROOT, coord = reso
     return row.referralHold?.kind === 'same-head' ? row.referralHold : null;
   },
   readClaim = args => readFixDispatchClaim({ ...args, lockRoot: join(coord, 'fix-dispatch-claims') }),
-  readAgents = () => JSON.parse(execFileSync('claude', ['agents', '--json', '--all'], { encoding: 'utf8', timeout: 30000 })),
+  readAgents = () => JSON.parse(launchAgent({ mode: 'claude-agents-list', resumeId: null }, execFileSync, 'claude', ['agents', '--json', '--all'], { encoding: 'utf8', timeout: 30000 })),
   readCheck = (repo, head) => {
     const settings = loadMergeQueueSettings();
     const pages = JSON.parse(runGh(['api', `repos/${repo}/commits/${head}/check-runs?check_name=${encodeURIComponent(settings.requiredCheck ?? 'test')}&per_page=100`, '--paginate', '--slurp']));

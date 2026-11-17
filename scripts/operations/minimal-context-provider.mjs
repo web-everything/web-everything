@@ -155,7 +155,7 @@ export const RESTRICTED_PROVIDER_TOOLS = 'Bash,Edit,Write,Read,Glob,Grep';
 // ================================================================================================
 
 /**
- * PURE argv builder — the fresh-spawn/`-p --session-id` shape, or the `--resume` shape when `resumeSessionId`
+ * PURE argv builder — the fresh-spawn/`-p --session-id` shape, or the `--resume` shape when `resumeId`
  * is given. No `-p` in the resume branch — verified, not a bug: a real `--resume <uuid> "<prompt>"` run with
  * redirected (non-TTY) stdout and no `-p` completed as a clean headless turn (this CLI treats non-interactive
  * stdout as non-interactive on its own).
@@ -170,15 +170,15 @@ export const RESTRICTED_PROVIDER_TOOLS = 'Bash,Edit,Write,Read,Glob,Grep';
  * the agent cannot read it. Omitted → argv byte-identical to before.
  */
 export function buildRestrictedProviderArgv({
-  sessionId, prompt, resumeSessionId = null, settingsFile, tools = RESTRICTED_PROVIDER_TOOLS, addDirs = [], model = 'sonnet', effort = 'medium',
+  sessionId, prompt, resumeId = null, settingsFile, tools = RESTRICTED_PROVIDER_TOOLS, addDirs = [], model = 'sonnet', effort = 'medium',
 }) {
   const RESTRICTED_FLAGS = [
     '--restricted', '--tools', tools, '--strict-mcp-config',
     '--disable-slash-commands', '--settings', settingsFile,
     ...addDirs.flatMap((dir) => ['--add-dir', dir]),
   ];
-  return resumeSessionId
-    ? [...RESTRICTED_FLAGS, '--resume', String(resumeSessionId), prompt]
+  return resumeId
+    ? [...RESTRICTED_FLAGS, '--resume', String(resumeId), prompt]
     : [...RESTRICTED_FLAGS, '--model', claudeSpawnAlias(model), '--effort', effort, '-p', '--session-id', String(sessionId), prompt];
 }
 
@@ -228,19 +228,19 @@ export function createHooksSettingsWriter(fileName, settings) {
  *
  * @param {string} dirName - the `.operations/` subdirectory, e.g. `'delivery-spawn-failures'` /
  *   `'review-spawn-failures'`.
- * @param {string} sessionSlug
+ * @param {string} sessionId native session/thread id
  * @param {Error} error
- * @param {{resumeSessionId?: (string|null)}} [o]
+ * @param {{resumeId?: (string|null)}} [o]
  * @returns {string|null} the path written, or `null` on a capture failure.
  */
-export function persistSpawnFailure(dirName, sessionSlug, error, { resumeSessionId = null } = {}) {
+export function persistSpawnFailure(dirName, sessionId, error, { resumeId = null } = {}) {
   try {
     const dir = `${REPO_ROOT}.operations/${dirName}`;
     mkdirSync(dir, { recursive: true });
-    const path = `${dir}/${sessionSlug}${resumeSessionId ? '-resume' : ''}-${Date.now()}.json`;
+    const path = `${dir}/${sessionId}${resumeId ? '-resume' : ''}-${Date.now()}.json`;
     writeFileSync(path, `${JSON.stringify({
-      sessionSlug,
-      resumeSessionId,
+      sessionId,
+      resumed: resumeId != null,
       at: new Date().toISOString(),
       message: error && error.message ? String(error.message) : null,
       status: error && 'status' in error ? error.status : null,

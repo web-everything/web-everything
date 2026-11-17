@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { launchAgent } from '../lib/agent-launch.mjs';
 /**
  * @file scripts/conveyor/health-watch.mjs
  * @description #4077 (health daemon slice 1, ruling #4065) — the IO SHELL of the health watch. Runs the probes,
@@ -816,7 +817,7 @@ export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.
 }
 
 export function probeAgents({ exec = run } = {}) {
-  const arr = JSON.parse(cachedClaudeAgents({ fetch: () => exec('claude', ['agents', '--json'], { cwd: homedir() }) }));
+  const arr = JSON.parse(cachedClaudeAgents({ fetch: () => launchAgent({ mode: 'claude-agents-list', resumeId: null }, exec, 'claude', ['agents', '--json'], { cwd: homedir() }) }));
   // `cwd`/`sessionId` carried through (additive — no existing smell reads `probes.agents` at all yet) so the
   // claude-auth-expired sign below can resolve each background session's own transcript.
   // #xrv69j6 — `status`/`waitingFor` ALSO carried through (additive, same reasoning): a background session

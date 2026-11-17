@@ -1,3 +1,4 @@
+import { agentResumeId, launchAgentToCompletion } from '../lib/agent-launch.mjs';
 /**
  * @file scripts/operations/codex-delivery-provider.mjs
  * @description The REAL Codex implementation of `we:scripts/operations/deliver-item-wrapper.mjs`'s
@@ -109,14 +110,10 @@
  * without it, which makes "this key had no effect" and "this key does not exist" indistinguishable. With it, a
  * key that a future Codex release renames fails LOUD instead of silently dropping the sandbox.
  *
- * ── THE THREAD-ID MAPPING, AND WHY IT EXISTS ─────────────────────────────────────────────────────────────
- * Claude lets the CALLER mint the session id (`--session-id <uuid>`) and resume by it. Codex does not: `codex
- * exec` has no `--session-id`, mints its own thread id, and announces it in the `thread.started` event of the
- * `--json` stream. The port's `spawn({ resumeSessionId })` therefore arrives carrying the CLAUDE-side UUID,
- * which Codex would not recognise. Rather than widen the port for one provider, this file keeps its own
- * sidecar map: the fresh spawn parses `thread_id` out of its own stdout and records it under
- * `.operations/codex-delivery-threads/<sessionSlug>.json`, and a resume reads it back. The port's shape is
- * untouched, and `CLAUDE_RESTRICTED_PROVIDER` is unaffected.
+ * ── NATIVE THREAD ID ───────────────────────────────────────────────────────────────────────────────────
+ * Codex announces its id in thread.started. New receipts are keyed by that same id and carry only
+ * sessionId; the wrapper persists it in the delivery report and supplies it unchanged on resume.
+ * readCodexThreadId also reads old { sessionSlug, threadId } receipts for recovery of existing runs.
  *
  * PURE / IMPURE SPLIT, the same discipline `codex-judge-spawn.mjs` and `minimal-context-provider.mjs` keep:
  * `buildCodexDeliveryArgv`, `parseCodexThreadId` and `assertDenyPathsUsable` are PURE — no fs, no spawn, no
@@ -125,7 +122,6 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
-import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
 import {
   CODEX_EFFORT_MAP, CODEX_MODEL, assertCodexModel, resolveCodexEffort,
 } from '../lib/codex-model-routing.mjs';
@@ -178,7 +174,7 @@ export const CODEX_DELIVERY_EFFORT_LEVELS = Object.freeze(Object.keys(CODEX_EFFO
 export const CODEX_DELIVERY_EFFORT = resolveCodexEffort({ tier: 'sonnet' });
 
 /**
- * The `.operations/` sidecar holding the `sessionSlug → Codex thread id` map — the same sidecar family
+ * The `.operations/` sidecar holding receipts keyed by the native Codex thread id — the same sidecar family
  * `delivery-report-store.mjs` and `persistSpawnFailure` already write into, so a Codex delivery leaves its
  * durable crumbs in the one place an operator already looks.
  */
@@ -412,15 +408,15 @@ export function codexThreadIdPath(sessionSlug, repoRoot = REPO_ROOT) {
 }
 
 /**
- * Record the Codex thread id a fresh spawn minted, keyed by the wrapper's own `sessionSlug`. Best-effort:
+ * Record the native id a fresh spawn minted, under that same id. Best-effort:
  * a failure to write the crumb must not fail a delivery that has otherwise just succeeded — the only thing
  * lost is the ability to resume, which `readCodexThreadId`'s own caller reports clearly if it comes to that.
  */
-export function writeCodexThreadId(sessionSlug, threadId, repoRoot = REPO_ROOT) {
+export function writeCodexThreadId(sessionId, repoRoot = REPO_ROOT) {
   try {
-    const path = codexThreadIdPath(sessionSlug, repoRoot);
+    const path = codexThreadIdPath(sessionId, repoRoot);
     mkdirSync(`${repoRoot}.operations/${CODEX_THREAD_DIR_NAME}`, { recursive: true });
-    writeFileSync(path, `${JSON.stringify({ sessionSlug, threadId, at: new Date().toISOString() }, null, 2)}\n`);
+    writeFileSync(path, `${JSON.stringify({ sessionId, at: new Date().toISOString() }, null, 2)}\n`);
     return path;
   } catch { return null; }
 }
@@ -429,7 +425,9 @@ export function writeCodexThreadId(sessionSlug, threadId, repoRoot = REPO_ROOT) 
 export function readCodexThreadId(sessionSlug, repoRoot = REPO_ROOT) {
   try {
     const parsed = JSON.parse(readFileSync(codexThreadIdPath(sessionSlug, repoRoot), 'utf8'));
-    return typeof parsed?.threadId === 'string' && parsed.threadId ? parsed.threadId : null;
+    // Old on-disk receipts carried { sessionSlug, threadId }; new receipts carry only the native id.
+    const sessionId = parsed?.sessionId ?? parsed?.threadId;
+    return typeof sessionId === 'string' && sessionId ? sessionId : null;
   } catch { return null; }
 }
 
@@ -453,7 +451,7 @@ export function readCodexThreadId(sessionSlug, repoRoot = REPO_ROOT) {
  * reclaimed when the caller's `timeout` fires.
  */
 export function defaultSpawnCodexAgent(argv, opts = {}, io = {}) {
-  return spawnToCompletion(CODEX_CLI, argv, {
+  return launchAgentToCompletion({ mode: agentResumeId(argv) ? 'codex-exec-resume' : 'codex-delivery', resumeId: agentResumeId(argv) }, CODEX_CLI, argv, {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     maxBuffer: 64 * 1024 * 1024,

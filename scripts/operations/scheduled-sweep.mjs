@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { agentResumeId, launchAgent } from '../lib/agent-launch.mjs';
 /**
  * @file scripts/operations/scheduled-sweep.mjs
  * @description Card 106 — durable schedules. The PR movement sweep, the coroner sweep and the Opus sweep as
@@ -288,7 +289,7 @@ export function opusCommand() {
 function runOpus({ dryRun }) {
   const { cmd, args, briefPath } = opusCommand();
   if (dryRun) return { attention: [], sections: [{ title: 'Would run', lines: [`${cmd} ${args.join(' ')} < ${briefPath}`] }] };
-  const r = spawnSync(cmd, args, { input: readFileSync(briefPath, 'utf8'), encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 30 * MIN, cwd: REPO_ROOT });
+  const r = launchAgent({ mode: 'claude-scheduled-sweep', resumeId: agentResumeId(args) }, spawnSync, cmd, args, { input: readFileSync(briefPath, 'utf8'), encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 30 * MIN, cwd: REPO_ROOT });
   if (r.status !== 0) return { attention: [`opus sweep failed (exit ${r.status}): ${r.error?.message ?? String(r.stderr ?? '').split('\n')[0]}`], sections: [] };
   return { attention: [], sections: [{ title: 'Opus findings', lines: String(r.stdout).split('\n').filter(Boolean).slice(0, 80) }] };
 }

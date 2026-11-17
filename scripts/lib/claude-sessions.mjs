@@ -1,3 +1,4 @@
+import { launchAgent } from './agent-launch.mjs';
 /** Thin IO wrapper over the pure store model (claude-stores.mjs): discover stores, list each, aggregate. */
 import { execFileSync } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
@@ -35,7 +36,7 @@ export function listSessions({ all = false, fresh = false, env = process.env, ex
       const inherit = single && store.inherited;
       const childEnv = inherit ? env : { ...env, ...store.env };
       const out = cachedClaudeAgents({ all, env: childEnv, fresh, dir, storeKey: inherit ? undefined : store.key,
-        fetch: () => exec('claude', ['agents', '--json', ...(all ? ['--all'] : [])], {
+        fetch: () => launchAgent({ mode: 'claude-agents-list', resumeId: null }, exec, 'claude', ['agents', '--json', ...(all ? ['--all'] : [])], {
           encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024,
           timeout: listTimeoutMs(env), killSignal: 'SIGKILL', env: childEnv, ...(cwd ? { cwd } : {}) }) });
       return readStore(store, { output: String(out ?? '') } /* empty stdout is invalid, never an empty list */);

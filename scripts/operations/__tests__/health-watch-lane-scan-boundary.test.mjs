@@ -289,6 +289,12 @@ describe('health-watch destructive lane action call-site contract', () => {
           .map(arg => arg.getText(tree).replace(/\s+/g, ' ')).join(', ')})`);
       } else if (ts.isCallExpression(node) && uses(node.expression, helpers)) {
         const callee = node.expression.getText(tree);
+        // The launcher forwards the primitive/command/argv unchanged. Keep those
+        // arguments pinned as well as its imported helper identity and count.
+        if (origins(node.expression).has('../lib/agent-launch.mjs#launchAgent')) {
+          calls.push(`${callee}(${node.arguments.slice(0, 4)
+            .map(arg => arg.getText(tree).replace(/\s+/g, ' ')).join(', ')})`);
+        }
         if (qualifyHelpers) {
           for (const origin of origins(node.expression)) calls.push(`helper:${origin}:${callee}`);
         } else calls.push(`helper:${callee}`);
@@ -354,6 +360,7 @@ describe('health-watch destructive lane action call-site contract', () => {
   const allowedHelperInventory = {
     "scripts/conveyor/health-watch.mjs": [
       "helper:../backlog-stranded-sweep.mjs#readBacklogCards:readBacklogCards",
+      "helper:../lib/agent-launch.mjs#launchAgent:launchAgent",
       "helper:../lib/automation-home.mjs#workspaceOf:workspaceOf",
       "helper:../lib/claude-agents-cache.mjs#cachedClaudeAgents:cachedClaudeAgents",
       "helper:../lib/daemon-clone-branch-probe.mjs#probeDaemonCloneBranches:probeDaemonCloneBranches",
@@ -474,6 +481,7 @@ describe('health-watch destructive lane action call-site contract', () => {
   const allowedHelperCounts = {
     "scripts/conveyor/health-watch.mjs": {
       "helper:../backlog-stranded-sweep.mjs#readBacklogCards:readBacklogCards": 1,
+      "helper:../lib/agent-launch.mjs#launchAgent:launchAgent": 1,
       "helper:../lib/automation-home.mjs#workspaceOf:workspaceOf": 9,
       "helper:../lib/claude-agents-cache.mjs#cachedClaudeAgents:cachedClaudeAgents": 1,
       "helper:../lib/daemon-clone-branch-probe.mjs#probeDaemonCloneBranches:probeDaemonCloneBranches": 1,
@@ -645,6 +653,19 @@ describe('health-watch destructive lane action call-site contract', () => {
       const example = "launch = exec; launch('git', ['reset'])";
     `)).toEqual([]);
   });
+  it('pins forwarded launcher arguments through an imported alias', () => {
+    const source = `import { launchAgent as launch } from '../lib/agent-launch.mjs';
+      launch({ mode: 'claude-agents-list', resumeId: null }, exec, 'claude', ['agents', '--json']);`;
+    const reviewed = commands(source);
+    expect(reviewed).toEqual([
+      "launch({ mode: 'claude-agents-list', resumeId: null }, exec, 'claude', ['agents', '--json'])",
+      'helper:launch',
+    ]);
+    expect(commands(source.replace("['agents', '--json']", "['reset', '--hard']"))).not.toEqual(reviewed);
+    expect(helperCounts(`${source}\nlaunch();`)).toEqual({
+      'helper:../lib/agent-launch.mjs#launchAgent:launch': 2,
+    });
+  });
   it.each(scopedScanFiles(['scripts/conveyor/health-watch.mjs', 'scripts/operations/stale-state-io.mjs']))(
     'allowlists every command call site in %s; new destructive lane actions require a guard', file => {
     const source = readFileSync(new URL(`../../../${file}`, import.meta.url), 'utf8');
@@ -664,7 +685,7 @@ describe('health-watch destructive lane action call-site contract', () => {
       "exec('gh', ['pr', 'list', '--repo', slug, '--state', 'open', '--limit', '100', '--json', fields])",
       "exec('gh', ['pr', 'view', String(pr.number), '--repo', slug, '--json', 'state,labels,headRefOid,headRefName,baseRefName'])",
       "exec('gh', args)",
-      "exec('claude', ['agents', '--json'])",
+      "launchAgent({ mode: 'claude-agents-list', resumeId: null }, exec, 'claude', ['agents', '--json'])",
       "exec(process.execPath, [join(repoRoot, 'scripts/operations/run.mjs'), 'stale-state', '--json'])",
       "exec('gh', ['pr', 'list', '--repo', CONSTELLATION_REPOS.we.slug, '--state', 'merged', '--limit', String(limit), '--json', 'number,title,headRefName,body'])",
       "run(process.execPath, [join(REPO_ROOT, 'scripts/readiness/heavy-admission.mjs'), 'status', '--json'])",

@@ -1,3 +1,4 @@
+import { agentResumeId, launchAgent, launchAgentToCompletion } from '../lib/agent-launch.mjs';
 import { appendBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { applyTestsFirstPolicy } from '../lib/tests-first-policy.mjs';
 import { readPreparePolicy } from '../conveyor/prepare-policy-settings.mjs';
@@ -125,7 +126,6 @@ import { parseGroupMembers, dispatchStillHolds, DEFAULT_EXPECTED_WITHIN_MINUTES,
 import { markWorkerEnv, workerMarkerSettingsEnv } from './session-role.mjs';
 // #3902 — the blocking-spawn primitive `spawnAgentToCompletion` (below) is built on, for the same reason
 // `codex-delivery-provider.mjs#spawnCodexToCompletion` is (see that file's own header).
-import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
 // #3717/#3906 — the ROUTING DECISION's inputs are read HERE (io) and handed to the pure router as data: the
 // scorecards (the shared store, #4155), the checked-in size policy (#3843), the checked-in promotion record
 // (#3784) and the supervision-enforcement switch (OFF by default; turning it on is #4180). The decision itself
@@ -2068,11 +2068,11 @@ export function defaultSpawnAgent(argv, opts = {}, { exec = execFileSync, grantT
     env: markWorkerEnv(sanitizeSpawnEnv(opts.env || process.env)),
   };
   try {
-    return exec('claude', argv, execOpts);
+    return launchAgent({ mode: agentResumeId(argv) ? 'claude-resume' : 'claude-dispatch-bg', resumeId: agentResumeId(argv) }, exec, 'claude', argv, execOpts);
   } catch (e) {
     if (!opts.cwd || !isTrustRefusal(e)) throw e;
     try { grantTrust(opts.cwd); } catch { /* grantDispatchTrust itself never throws; belt-and-suspenders */ }
-    return exec('claude', argv, execOpts);
+    return launchAgent({ mode: agentResumeId(argv) ? 'claude-resume' : 'claude-dispatch-bg', resumeId: agentResumeId(argv) }, exec, 'claude', argv, execOpts);
   }
 }
 
@@ -2102,7 +2102,7 @@ export function workerSpawnEnv(env = process.env) {
  * @returns {Promise<{stdout: string, stderr: string, resourceUsage: object|null}>}
  */
 export function spawnAgentToCompletion(argv, opts = {}, io = {}) {
-  return spawnToCompletion('claude', argv, {
+  return launchAgentToCompletion({ mode: agentResumeId(argv) ? 'claude-resume' : 'claude-dispatch-to-completion', resumeId: agentResumeId(argv) }, 'claude', argv, {
     encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: SPAWN_TIMEOUT_MS, killSignal: 'SIGKILL', ...opts,
     env: markWorkerEnv(sanitizeSpawnEnv(opts.env || process.env)),
   }, io);
@@ -2158,7 +2158,7 @@ export const DISPATCHED_AGENT_SYSTEM_PROMPT_FILE = join(dirname(fileURLToPath(im
  * real CLI, and a wrong bet turns into a dispatch with a mangled prompt), the dash is REFUSED outright. Every
  * legitimate brief starts with markdown, so the refusal costs nothing and proves what the position could not.
  *
- * `resumeSessionId` (`#xu2krte`) — OPT-IN, and it changes the WHOLE argv shape, not just one flag. A live
+ * `resumeId` (`#xu2krte`) — OPT-IN, and it changes the WHOLE argv shape, not just one flag. A live
  * build-time probe (CLI 2.1.263, 2026-09-06; see
  * `docs/agent/platform-decisions.md#parked-pr-conflict-dispatched-not-scripted`) found `claude --bg --resume
  * <id>` genuinely continues the named session with NEW work injected — a real resume, not a re-attach to old
@@ -2167,8 +2167,8 @@ export const DISPATCHED_AGENT_SYSTEM_PROMPT_FILE = join(dirname(fileURLToPath(im
  * id instead (observed 3/3 tries, regardless of whether the original session was still live). So this branch
  * emits nothing else — no `-n`, no system-prompt file, no `extraArgs` — and the caller
  * (`we:scripts/conveyor/reconcile-fix-dispatch.mjs#dispatchFix`) is responsible for detecting a fork (the id the
- * CLI actually resumed under does not match `resumeSessionId`) via {@link parseBackgroundedId} /
- * {@link resumeSucceeded} and falling back to a fresh, full dispatch (this same function, `resumeSessionId`
+ * CLI actually resumed under does not match `resumeId`) via {@link parseBackgroundedId} /
+ * {@link resumeSucceeded} and falling back to a fresh, full dispatch (this same function, `resumeId`
  * omitted) when it does.
  */
 /**
@@ -2580,7 +2580,7 @@ export function ensureDispatchSessionCwd(dir, {
 }
 
 export function buildAgentArgv({
-  sessionId, payload, extraArgs = [], systemPromptFile = null, resumeSessionId = null, settingsEnv = null,
+  sessionId, payload, extraArgs = [], systemPromptFile = null, resumeId = null, settingsEnv = null,
   // #x9fbg1x — an OPT-IN `worktree` patch folded into the SAME `--settings` JSON `settingsEnv` already rides
   // in. `null` (every existing caller/test that never mentions it) keeps this function's argv byte-identical
   // to before this param existed — only `createDispatchSinks`' own resolver ever supplies a real value.
@@ -2606,7 +2606,7 @@ export function buildAgentArgv({
   // fresh dispatch already gave a `--settings` PATH override to (see the non-resume branch below), and the
   // shim that override points at re-reads the shared token cache fresh on every `gh` call regardless of how
   // long the session has been running — so nothing is lost by never re-asserting it on resume.
-  if (resumeSessionId) return ['--bg', '--resume', String(resumeSessionId), prompt];
+  if (resumeId) return ['--bg', '--resume', String(resumeId), prompt];
   if (!table && payload?.launchKind) {
     const policy = readRoutingPolicy();
     const configured = resolveOperationRoute({ operation: payload.launchKind, available: ['claude'], gateClosed: policy.criticalWorkGate.kinds.includes(payload.launchKind), policy });
@@ -2750,7 +2750,7 @@ export function parseBackgroundedId(stdout) {
 }
 
 /**
- * we:scripts/operations/dispatch-lane-io.mjs#resumeSucceeded — PURE: did a `buildAgentArgv({resumeSessionId})`
+ * we:scripts/operations/dispatch-lane-io.mjs#resumeSucceeded — PURE: did a `buildAgentArgv({resumeId})`
  * dispatch genuinely continue the requested session, or did the CLI fork a copy under a fresh id?
  *
  * DELIBERATELY NOT A STRING-PREFIX COMPARISON. `claude agents --json`'s own `id` field is not reliably a
@@ -3513,7 +3513,7 @@ export function defaultLaneRefForPr(pr, { exec = execFileSyncThrottled, env = pr
  *   unchanged; pass `all: true` ONLY from a caller whose job requires seeing completed sessions too.
  */
 export function defaultListAgents({ exec = execFileSync, env = process.env, all = false } = {}) {
-  const out = cachedClaudeAgents({ all, env, fetch: () => exec('claude', ['agents', '--json', ...(all ? ['--all'] : [])], {
+  const out = cachedClaudeAgents({ all, env, fetch: () => launchAgent({ mode: 'claude-agents-list', resumeId: null }, exec, 'claude', ['agents', '--json', ...(all ? ['--all'] : [])], {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     maxBuffer: 8 * 1024 * 1024,

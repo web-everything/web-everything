@@ -1,3 +1,4 @@
+import { launchAgent } from './agent-launch.mjs';
 /**
  * @file Bounded, read-only observations for /state. Runtime records can outlive a worker;
  * only `claude agents` busy/working is live evidence. Each failed probe remains visible.
@@ -62,7 +63,7 @@ function run(bin, args) {
 const array = v => Array.isArray(v) ? v : [];
 const iso = v => v == null ? null : soft(() => new Date(v).toISOString());
 function agents(exec) {
-  const raw = JSON.parse(exec('claude', ['agents', '--json']));
+  const raw = JSON.parse(launchAgent({ mode: 'claude-agents-list', resumeId: null }, exec, 'claude', ['agents', '--json']));
   if (!Array.isArray(raw) && !Array.isArray(raw?.agents)) throw new Error('unrecognized agents listing');
   return array(raw?.agents ?? raw).slice(0, 500);
 }

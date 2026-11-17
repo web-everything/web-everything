@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { agentResumeId, launchAgent } from '../lib/agent-launch.mjs';
 /**
  * @file scripts/operations/worker-wrapper.mjs
  * @description THE UNIFIED WORKER WRAPPER (item 117, slice S3a; decision D7 FINAL, operator 2026-10-08).
@@ -303,7 +304,7 @@ async function runWorkerOnce(spec, io, stop) {
   // The job record: written the moment the child has a pid (the spawn seam below), before it can finish.
   let graceTimer = null;
   const spawnWithPid = (cmd, argv, opts) => {
-    const child = spawnFn(cmd, argv, opts);
+    const child = launchAgent({ mode: spec.launcher === 'codex-exec' ? (agentResumeId(argv) ? 'codex-exec-resume' : 'codex-exec') : (agentResumeId(argv) ? 'claude-resume' : 'claude-wrapper-run'), resumeId: agentResumeId(argv) }, spawnFn, cmd, argv, opts);
     // Opt-in smoke evidence: persist the first byte time and stderr while the worker is still running.
     if (spec.diagnosticsDir) {
       let first = true;
@@ -380,7 +381,7 @@ async function runWorkerOnce(spec, io, stop) {
   let resourceUsage = null;
   const run = async (argv) => {
     try {
-      const launch = () => spawnToCompletionFn(spec.command, argv, {
+      const launch = () => launchAgent({ mode: spec.launcher === 'codex-exec' ? (agentResumeId(argv) ? 'codex-exec-resume' : 'codex-exec') : (agentResumeId(argv) ? 'claude-resume' : 'claude-wrapper-run'), resumeId: agentResumeId(argv) }, spawnToCompletionFn, spec.command, argv, {
         // EVERY launch path gets the same env hygiene (a static GH_TOKEN stripped, the worker marker set), not just the callers that
         // happen to pass a sanitising spawn: the detached CLI and any future launcher inherit it here.
         cwd: spec.cwd, env: markWorkerEnv(sanitizeSpawnEnv(spec.env ?? process.env)), timeout: Math.max(1, deadlineMs - clock()), killSignal: 'SIGKILL',
@@ -400,7 +401,10 @@ async function runWorkerOnce(spec, io, stop) {
   // Set while the LAST turn ended awaiting a verdict that never reached this wrapper (see `verifyUnfinishedResult`).
   let unfinishedVerify = null;
   if (spec.launcher === 'claude-p') {
-    const requestPath = resumeRequestPath(spec.specDir ?? join(dirname(dir), 'worker-wrapper-specs'), spec.session);
+    const requestDir = spec.specDir ?? join(dirname(dir), 'worker-wrapper-specs');
+    const requestPath = resumeRequestPath(requestDir, spec.sessionId ?? spec.session);
+    // Read existing slug-keyed requests; all new writers use the native session id.
+    const legacyRequestPath = resumeRequestPath(requestDir, spec.session);
     let resumes = 0;
     // Every `requestedAt` of the await record(s) a resume answered. The pass re-stamps a waiting record (`rerequest`) while we poll, so
     // the copy a failed clear leaves behind can carry a LATER stamp than the one the wait began with: collect every stamp seen in the wait.
@@ -425,8 +429,15 @@ async function runWorkerOnce(spec, io, stop) {
         awaiting = await awaitingVerify(spec.sessionId);
         if (awaiting?.record?.requestedAt) stamps.add(awaiting.record.requestedAt);
         try {
-          request = JSON.parse(readFile(requestPath));
-          rmSync(requestPath, { force: true });
+          let requestFile = requestPath;
+          let text;
+          try { text = readFile(requestFile); } catch (e) {
+            if (e?.code !== 'ENOENT' || legacyRequestPath === requestPath) throw e;
+            requestFile = legacyRequestPath;
+            text = readFile(requestFile);
+          }
+          request = JSON.parse(text);
+          rmSync(requestFile, { force: true });
           if (request?.v !== 1 || request.sessionId !== spec.sessionId || typeof request.prompt !== 'string') request = null;
         } catch (e) {
           if (e instanceof SyntaxError) rmSync(requestPath, { force: true });
@@ -565,15 +576,19 @@ export function preserveLegacyWords(envelope, legacy) {
 
 /**
  * Launch a spec through THIS file as a detached node process (`unref`ed; survives its parent). The spec is written
- * to `<specDir>/<session>.spec.json` first; the child reads it, runs {@link runWorker}, and exits. `wrapperPid` is the
+ * to `<specDir>/<sessionId or legacy session slug>.spec.json` first; the child reads it, runs {@link runWorker}, and exits. `wrapperPid` is the
  * wrapper process; the v2 record's `pid` is the WORKER child the wrapper then spawns (a different process).
  * @returns {{wrapperPid: number, specFile: string}}
  */
 export function launchDetached(spec, { specDir, spawnFn = spawn, nodePath = process.execPath, entry = fileURLToPath(import.meta.url) } = {}) {
   if (!specDir) throw new TypeError('operations: launchDetached needs specDir');
   if (!isValidSessionSlug(spec?.session)) throw new TypeError(`operations: launchDetached: invalid session slug ${JSON.stringify(spec?.session)}`);
+  if (spec.sessionId != null && (typeof spec.sessionId !== 'string' || spec.sessionId.length !== 36
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(spec.sessionId))) {
+    throw new TypeError('operations: launchDetached: sessionId must be a native UUID');
+  }
   mkdirSync(specDir, { recursive: true, mode: 0o700 });
-  const specFile = join(specDir, `${spec.session}.spec.json`);
+  const specFile = join(specDir, `${spec.sessionId ?? spec.session}.spec.json`);
   // The spec file never carries `env` (it can hold tokens): the detached child inherits the launcher's environment
   // instead, with a static GH_TOKEN stripped and the worker marker set (the worker it spawns is sanitised again in runWorker).
   // Owner-only permissions; the child deletes it once read.

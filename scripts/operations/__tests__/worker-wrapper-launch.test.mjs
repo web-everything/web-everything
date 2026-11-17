@@ -220,10 +220,10 @@ describe('wrapped await rows and resume requests', () => {
   it('writes an owner-only request atomically, with the same session identity', () => {
     const specDir = tmp();
     expect(requestWrappedResume({ session: row(), prompt: 'verified', specDir, now: T1 })).toEqual({ resumed: true });
-    const path = join(specDir, 'fix-7.resume.json');
+    const path = join(specDir, `${SESSION_ID}.resume.json`);
     expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ v: 1, sessionId: SESSION_ID, prompt: 'verified', at: T1() });
     expect(statSync(path).mode & 0o777).toBe(0o600);
-    expect(readdirSync(specDir)).toEqual(['fix-7.resume.json']);
+    expect(readdirSync(specDir)).toEqual([`${SESSION_ID}.resume.json`]);
   });
   it.each([{ kind: 'background' }, { status: 'busy' }, { state: 'stopped' }, { sessionId: 'not-uuid' }, { sessionId: '-'.repeat(36) }, { name: '../escape' }])('refuses %j without writing a file', (over) => {
     const specDir = tmp();

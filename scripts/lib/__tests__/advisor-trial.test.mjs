@@ -95,7 +95,7 @@ describe('advisor trial — flag building', () => {
   });
 
   it('a resume stays a bare --bg --resume even when on', () => {
-    expect(buildAgentArgv({ sessionId: 's', payload: { prompt: 'go' }, resumeSessionId: 'old', advisor: on }))
+    expect(buildAgentArgv({ sessionId: 's', payload: { prompt: 'go' }, resumeId: 'old', advisor: on }))
       .toEqual(['--bg', '--resume', 'old', 'go']);
   });
 });

@@ -1,3 +1,4 @@
+import { agentResumeId, launchAgent } from '../lib/agent-launch.mjs';
 /**
  * @file scripts/operations/explore-io.mjs
  * @description THE IO SHELL of the `explore` declaration (#3150, under epic #3029) — the SINK that starts one
@@ -522,7 +523,7 @@ export function createExploreSinks({
  * `defaultSpawnAgent`).
  */
 export function defaultSpawnAgent(argv, opts = {}, { exec = execFileSync } = {}) {
-  return exec('claude', argv, {
+  return launchAgent({ mode: 'claude-explore', resumeId: agentResumeId(argv) }, exec, 'claude', argv, {
     encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: SPAWN_TIMEOUT_MS, killSignal: 'SIGKILL', ...opts,
   });
 }
@@ -552,7 +553,7 @@ export function defaultClaudeProvider(request, { spawnAgent = (argv, opts) => de
 /** `claude agents --json` — ACTIVE sessions only. `--all` would list completed ones too, so a finished
  *  investigation would read as `running` forever: the one mistake that makes an observer worse than none. */
 export function defaultListAgents({ exec = execFileSync } = {}) {
-  const out = cachedClaudeAgents({ fetch: () => exec('claude', ['agents', '--json'], {
+  const out = cachedClaudeAgents({ fetch: () => launchAgent({ mode: 'claude-agents-list', resumeId: null }, exec, 'claude', ['agents', '--json'], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024,
     timeout: LIST_TIMEOUT_MS, killSignal: 'SIGKILL',
   }) });

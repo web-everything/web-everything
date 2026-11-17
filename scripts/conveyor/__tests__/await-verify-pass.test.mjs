@@ -936,7 +936,7 @@ it('resume stops the idle live process by its SHORT job id first, then resumes t
     pidAliveFn: () => false,
     stopSessionFn: ({ handle }) => { calls.push(['stop', handle]); return { stopped: true }; },
     dispatchIo: {
-      buildAgentArgv: ({ resumeSessionId }) => ['--bg', '--resume', resumeSessionId],
+      buildAgentArgv: ({ resumeId }) => ['--bg', '--resume', resumeId],
       parseBackgroundedId: () => sid,
       resumeSucceeded: () => ({ resumed: true }),
       defaultSpawnAgent: (argv, opts) => { calls.push(['spawn', argv.slice(0, 3), opts.cwd]); return 'backgrounded'; },
@@ -961,7 +961,7 @@ describe('resume port: stop-before-resume guards', () => {
         pidAliveFn,
         stopSessionFn: ({ handle }) => { calls.push(['stop', handle]); return stop({ handle }); },
         dispatchIo: {
-          buildAgentArgv: ({ resumeSessionId }) => ['--bg', '--resume', resumeSessionId],
+          buildAgentArgv: ({ resumeId }) => ['--bg', '--resume', resumeId],
           parseBackgroundedId: () => sid,
           resumeSucceeded: () => ({ resumed: true }),
           defaultSpawnAgent: () => { calls.push(['spawn']); return 'backgrounded'; },

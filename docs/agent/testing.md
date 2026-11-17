@@ -4404,3 +4404,16 @@ automatic discovery and explicit resume behind both guards and both retry budget
 Exercise pending CI after timing settings change, revoked clearance, green completion,
 and budget exhaustion after that intervening failure. Unknown pending outcomes remain
 non-replayable; CI-held provenance does not establish that a write was never applied.
+
+## Single agent execution boundary (R1003)
+
+All Claude/Codex execution in `scripts/` and `skills-src/`, including management and probe commands,
+passes through `scripts/lib/agent-launch.mjs`. Choose a closed registry mode and supply an explicit
+`resumeId` key (null for a fresh launch). Pass the existing injected primitive unchanged. Guards run
+synchronously before execution; refusals throw `AgentLaunchRefusedError` and log their reason.
+
+The parity fixtures in `scripts/__tests__/fixtures/agent-launch/pre-refactor-calls.json` pin the old
+call expressions. The parser-based structural test resolves aliases, constants and injected defaults;
+add a negative fixture when extending its detection. Only the launcher itself is allowlisted.
+Resume requests and Codex receipts use the native session/thread id as their filename key. Old
+slug-keyed requests and receipts remain readable; new records never write a second resume identity.

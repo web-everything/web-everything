@@ -1,3 +1,4 @@
+import { launchAgent } from '../lib/agent-launch.mjs';
 /**
  * Gather optional snapshots → core sweep() → print recovery plans. DRY-RUN by default.
  * --apply executes ENABLED rungs and writes the recovery ledger; only retry-self-update
@@ -161,7 +162,7 @@ export async function gatherSnapshot(options = {}, deps = {}) {
     else errors.push({ source: `prs:${repo}`, error: 'non-array PR result; repo skipped' });
   }
   await optional('agents', () => {
-    const agents = JSON.parse((deps.cachedClaudeAgents ?? cachedClaudeAgents)({ env, fetch: () => exec('claude', ['agents', '--json'], { cwd: home, encoding: 'utf8', timeout: 60_000 }) }));
+    const agents = JSON.parse((deps.cachedClaudeAgents ?? cachedClaudeAgents)({ env, fetch: () => launchAgent({ mode: 'claude-agents-list', resumeId: null }, exec, 'claude', ['agents', '--json'], { cwd: home, encoding: 'utf8', timeout: 60_000 }) }));
     snapshot.agents = agents.map(({ name, state }) => ({ name, state }));
   });
   const roots = await optional('clone-roots', () => (deps.daemonCloneRoots ?? daemonCloneRoots)(join(home, 'workspace'), { env })) ?? [];

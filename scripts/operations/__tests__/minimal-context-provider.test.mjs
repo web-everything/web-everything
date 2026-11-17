@@ -116,7 +116,7 @@ describe('buildRestrictedProviderArgv', () => {
 
   it('resume: --resume <id>, no -p/--session-id', () => {
     const argv = buildRestrictedProviderArgv({
-      sessionId: 'ignored', resumeSessionId: 'resume-1', prompt: 'fix it', settingsFile: '/repo/.operations/hooks.json',
+      sessionId: 'ignored', resumeId: 'resume-1', prompt: 'fix it', settingsFile: '/repo/.operations/hooks.json',
     });
     expect(argv).toContain('--resume');
     expect(argv).toContain('resume-1');
@@ -198,7 +198,7 @@ describe('persistSpawnFailure', () => {
     const [writtenPath, writtenContent] = writeFileSync.mock.calls[0];
     expect(writtenPath).toBe(path);
     const parsed = JSON.parse(writtenContent);
-    expect(parsed.sessionSlug).toBe('sess-1');
+    expect(parsed.sessionId).toBe('sess-1');
     expect(parsed.message).toBe('boom');
     expect(parsed.stdout).toBe('out');
     expect(parsed.stderr).toBe('err');
@@ -207,7 +207,7 @@ describe('persistSpawnFailure', () => {
   it('a resume tags the filename with -resume so it never clobbers the fresh spawn\'s own capture', () => {
     mkdirSync.mockReset();
     writeFileSync.mockReset();
-    const path = persistSpawnFailure('probe-spawn-failures', 'sess-2', new Error('boom'), { resumeSessionId: 'r' });
+    const path = persistSpawnFailure('probe-spawn-failures', 'sess-2', new Error('boom'), { resumeId: 'r' });
     expect(path).toMatch(/sess-2-resume-\d+\.json$/);
   });
 });

@@ -1,3 +1,4 @@
+import { launchAgent } from '../lib/agent-launch.mjs';
 /**
  * @file scripts/conveyor/pool-exhaustion.mjs
  * @description Say WHY the lane pool is exhausted, once per episode, instead of a dispatcher silently
@@ -89,7 +90,7 @@ function defaultReadStatus({ lanePoolRepo = null } = {}) {
 
 function defaultReadAgents() {
   try {
-    const parsed = JSON.parse(cachedClaudeAgents({ fetch: () => execFileSync('claude', ['agents', '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 30_000 }) }));
+    const parsed = JSON.parse(cachedClaudeAgents({ fetch: () => launchAgent({ mode: 'claude-agents-list', resumeId: null }, execFileSync, 'claude', ['agents', '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 30_000 }) }));
     return Array.isArray(parsed) ? parsed : null;
   } catch { return null; }
 }

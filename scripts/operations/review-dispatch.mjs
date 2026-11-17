@@ -124,6 +124,7 @@ import { resolveOperationEffort, resolveOperationRoute, readRoutingPolicy } from
 import { repoKeyForSlug, CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { repoProfile } from '../lib/repo-profile.mjs';
 import { execFileSync } from 'node:child_process';
+import { launchAgent } from '../lib/agent-launch.mjs';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { existsSync, readFileSync } from 'node:fs';
@@ -688,7 +689,7 @@ export function dispatchReview({
       unknownTokens, judgeProvider, wrapped: true,
     };
   }
-  const stdout = String(spawnAgent(argv, { cwd: sessionCwd }) ?? '');
+  const stdout = String(launchAgent({ mode: 'claude-review', resumeId: null }, spawnAgent, argv, { cwd: sessionCwd }) ?? '');
   const agentId = parseBackgroundedId(stdout);
   return {
     sessionId, agentId, sessionSlug: planned.sessionSlug, pr: planned.pr, repo: planned.repo, repoKey: planned.repoKey, prompt,

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { launchAgent } from '../lib/agent-launch.mjs';
 import { isTerminalStatus } from '../lib/backlog-status.cjs';
 /**
  * @file scripts/conveyor/session-reaper.mjs
@@ -1636,7 +1637,7 @@ export function rmSessionRecord({ handle, exec = execFileSync } = {}) {
   const id = normalizeHandle(handle);
   if (!id) throw new Error('session-reaper: rmSessionRecord needs a handle');
   try {
-    const output = String(exec('claude', ['rm', id], { encoding: 'utf8', timeout: 30_000 }));
+    const output = String(launchAgent({ mode: 'claude-rm', resumeId: null }, exec, 'claude', ['rm', id], { encoding: 'utf8', timeout: 30_000 }));
     return { removed: true, alreadyGone: false, output };
   } catch (e) {
     const full = String(e?.stderr ?? e?.message ?? e);

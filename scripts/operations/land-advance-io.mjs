@@ -1,3 +1,4 @@
+import { launchAgent } from '../lib/agent-launch.mjs';
 /**
  * @file land-advance-io.mjs
  * Evidence ports are synchronous so the declared operation can remain compute-only.
@@ -69,7 +70,7 @@ export function writeFollowUp(entry, { store = createFileRunStore(), mintId = ne
     status: 'in-flight', handle: effect.handle, expectedBy: effect.expectedBy, startedAt: entry.launchedAt, dispatch: effect.dispatch });
   store.write(run);
 }
-export function readLiveSessions({ run = runDefault, listAgents = () => cachedClaudeAgents({ fetch: () => run('claude', ['agents', '--json']) }),
+export function readLiveSessions({ run = runDefault, listAgents = () => cachedClaudeAgents({ fetch: () => launchAgent({ mode: 'claude-agents-list', resumeId: null }, run, 'claude', ['agents', '--json']) }),
   ps = () => scanPsOutput({ exec: (program, args) => run(program, args) }), isPidAlive = defaultIsPidAlive } = {}) {
   const raw = listAgents(), agents = Array.isArray(raw) ? raw : JSON.parse(raw);
   if (!Array.isArray(agents)) throw new Error('claude agents: expected array');

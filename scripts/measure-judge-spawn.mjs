@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { agentResumeId, launchAgent } from './lib/agent-launch.mjs';
 /**
  * measure-judge-spawn.mjs — argv in, loaded-context and wall clock out (#3028).
  *
@@ -86,7 +87,7 @@ function controlArgv({ model, effort, budget, sessionId }) {
 function runOnce(argv, { cwd, cli }) {
   return new Promise((resolve) => {
     const startedAt = Date.now();
-    const child = spawn(cli, argv, { cwd, env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = launchAgent({ mode: 'judge-measurement', resumeId: agentResumeId(argv) }, spawn, cli, argv, { cwd, env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });
     let out = '';
     let err = '';
     child.stdout.on('data', (d) => { out += d; });
@@ -130,7 +131,7 @@ export function conditions({ cwd, model, effort, budget, cli, repeat, treatmentO
     gitHead: safe(() => execFileSync('git', ['-C', cwd, 'rev-parse', 'HEAD'], quiet).trim()),
     gitBranch: safe(() => execFileSync('git', ['-C', cwd, 'rev-parse', '--abbrev-ref', 'HEAD'], quiet).trim()),
     cli,
-    cliVersion: safe(() => execFileSync(cli, ['--version'], quiet).trim()),
+    cliVersion: safe(() => launchAgent({ mode: 'agent-version', resumeId: null }, execFileSync, cli, ['--version'], quiet).trim()),
     model,
     effort,
     maxBudgetUsd: budget,

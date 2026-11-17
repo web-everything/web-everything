@@ -4,7 +4,7 @@
  */
 import { execFileSync, spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { keepAliveScript } from '../../lib/test-keepalive.mjs';
@@ -497,15 +497,28 @@ describe('claude argv: the schema rides on fresh and resumed turns', () => {
 });
 
 describe('detached launch', () => {
-  it('launchDetached spawns THIS file detached with the spec, and unrefs it', () => {
+  it.each([undefined, null, '12345678-1234-4234-8234-123456789abc'])('launchDetached spawns THIS file detached with the spec, and unrefs it (sessionId=%s)', (sessionId) => {
     const calls = [];
     const specDir = tmp();
-    const r = launchDetached(spec(), { specDir, spawnFn: (cmd, argv, opts) => { calls.push({ cmd, argv, opts }); return { pid: 4242, unref() { calls.push('unref'); } }; } });
+    const r = launchDetached(spec({ sessionId }), { specDir, spawnFn: (cmd, argv, opts) => { calls.push({ cmd, argv, opts }); return { pid: 4242, unref() { calls.push('unref'); } }; } });
     expect(r.wrapperPid).toBe(4242);
+    expect(r.specFile).toBe(join(specDir, `${sessionId ?? 'build-4001'}.spec.json`));
     expect(calls[0].opts).toMatchObject({ detached: true, stdio: 'ignore' });
     expect(calls[0].argv[1]).toBe(`--spec=${r.specFile}`);
     expect(calls).toContain('unref');
     expect(JSON.parse(readFileSync(r.specFile, 'utf8'))).toMatchObject({ session: 'build-4001', specDir });
+  });
+
+  it.each(['../victim', '../../victim', 'nested/victim', '..\\victim', '', 'not-a-uuid', '-'.repeat(36),
+    '12345678-1234-4234-8234-123456789abc\n', 123, {}])('launchDetached rejects traversal and invalid session IDs before any write (%j)', (sessionId) => {
+    const parent = tmp();
+    const specDir = join(parent, 'specs');
+    const spawnFn = vi.fn();
+    const s = spec({ sessionId }, parent);
+    expect(() => launchDetached(s, { specDir, spawnFn })).toThrow(/sessionId must be a native UUID/);
+    expect(readdirSync(parent)).toEqual([]);
+    expect(existsSync(specDir)).toBe(false);
+    expect(spawnFn).not.toHaveBeenCalled();
   });
 
   it('the CLI runs a spec file to completion, leaves the v2 record and deletes the spec (a real child process)', () => {

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { launchAgent } from '../lib/agent-launch.mjs';
 /**
  * @file scripts/operations/dispatch-abort.mjs
  * @description SAFELY STOP AND CLOSE OUT ONE DISPATCHED AGENT — the recurring by-hand sequence from #3383's
@@ -73,7 +74,7 @@ export function stopSession({ handle, exec = execFileSync } = {}) {
   const id = normalizeHandle(handle);
   if (!id) throw new Error('dispatch-abort: stopSession needs a handle to stop');
   try {
-    const output = String(exec('claude', ['stop', id], STOP_EXEC_OPTS));
+    const output = String(launchAgent({ mode: 'claude-stop', resumeId: null }, exec, 'claude', ['stop', id], STOP_EXEC_OPTS));
     return { stopped: true, alreadyGone: false, output };
   } catch (e) {
     const full = String(e?.stderr ?? e?.message ?? e);

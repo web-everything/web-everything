@@ -1,3 +1,4 @@
+import { agentResumeId, launchAgent } from './agent-launch.mjs';
 /**
  * codex-judge-spawn.mjs — the SECOND `JudgeProvider` implementation (#xqa9ttq, under #3369/#3370), Codex CLI
  * as a READ-ONLY-SHELL panelist (NOT tool-free — see below).
@@ -755,7 +756,7 @@ export async function codexJudgeSpawn({
     result = await withCodexUsage({ model, effort, taskKind: `review-${lens ?? 'general'}`, caller: 'codex-judge-spawn.mjs', repo, pr, card, changedFiles: false }, () => new Promise((resolve, reject) => {
       let child;
       try {
-        child = spawnFn(cli, argv, { cwd: spawnCwd, env: childEnv, stdio: ['pipe', 'pipe', 'pipe'] });
+        child = launchAgent({ mode: 'codex-judge', resumeId: agentResumeId(argv) }, spawnFn, cli, argv, { cwd: spawnCwd, env: childEnv, stdio: ['pipe', 'pipe', 'pipe'] });
       } catch (e) {
         reject(new Error(`codex-judge-spawn: could not start \`${cli}\`: ${e.message}`));
         return;

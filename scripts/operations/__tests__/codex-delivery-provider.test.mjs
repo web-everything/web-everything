@@ -405,16 +405,16 @@ describe('defaultSpawnCodexAgent — the blocking primitive', () => {
 
 describe('the sessionSlug → Codex thread id sidecar', () => {
   // Codex has no `--session-id`: it mints its own thread id and announces it in the stream. This sidecar is
-  // what lets the port's `spawn({ resumeSessionId })` contract stay UNCHANGED for both providers.
+  // what lets the port's `spawn({ resumeId })` contract stay UNCHANGED for both providers.
   it('round-trips a thread id through a real temp .operations/ sidecar', () => {
     const root = `${mkdtempSync(join(tmpdir(), 'we-codex-thread-'))}/`;
     try {
-      expect(readCodexThreadId('sess-1', root)).toBeNull();
-      const written = writeCodexThreadId('sess-1', 'tid-abc', root);
-      expect(written).toBe(codexThreadIdPath('sess-1', root));
+      expect(readCodexThreadId('tid-abc', root)).toBeNull();
+      const written = writeCodexThreadId('tid-abc', root);
+      expect(written).toBe(codexThreadIdPath('tid-abc', root));
       expect(existsSync(written)).toBe(true);
-      expect(readCodexThreadId('sess-1', root)).toBe('tid-abc');
-      expect(JSON.parse(readFileSync(written, 'utf8'))).toMatchObject({ sessionSlug: 'sess-1', threadId: 'tid-abc' });
+      expect(readCodexThreadId('tid-abc', root)).toBe('tid-abc');
+      expect(JSON.parse(readFileSync(written, 'utf8'))).toMatchObject({ sessionId: 'tid-abc' });
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -425,7 +425,7 @@ describe('the sessionSlug → Codex thread id sidecar', () => {
   // Best-effort by construction: losing the crumb costs the ability to resume (which the provider then reports
   // loudly), and must never fail a build that has otherwise just succeeded.
   it('never throws on an unwritable/unreadable sidecar — it degrades to null', () => {
-    expect(writeCodexThreadId('s', 'tid', '/nonexistent-root-\0/')).toBeNull();
+    expect(writeCodexThreadId('tid', '/nonexistent-root-\0/')).toBeNull();
     expect(readCodexThreadId('s', '/definitely/not/a/real/root/')).toBeNull();
   });
 });

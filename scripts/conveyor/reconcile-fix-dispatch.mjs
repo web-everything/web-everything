@@ -842,7 +842,7 @@ export function freeLaneNumbers({ exec = execFileSync, root = REPO_ROOT, lanePoo
  *
  * When the planned entry is a conflict-caused bounce (Fork 2/4's `merge-status:conflicting` label still present
  * at plan time) AND {@link findResumeCandidate} finds a still-listed original-builder session, this attempts
- * `buildAgentArgv({resumeSessionId})` — a bare `claude --bg --resume <id>` with no other flag, per that
+ * `buildAgentArgv({resumeId})` — a bare `claude --bg --resume <id>` with no other flag, per that
  * function's own docblock and the live build-time probe backing it
  * (`docs/agent/platform-decisions.md#parked-pr-conflict-dispatched-not-scripted`). The outcome is checked
  * against a FRESH `claude agents --json --all` read ({@link resumeSucceeded}): a genuine resume returns
@@ -1041,7 +1041,7 @@ export function resumeBgSession(planned, {
 
   const resumeArgv = buildAgentArgv({
     payload: { prompt },
-    resumeSessionId: candidate,
+    resumeId: candidate,
   });
   // #4174 — same "never `root` itself" cwd as the fresh-dispatch spawn below; see this function's own new
   // param comment. The resumed AGENT keeps running in whatever cwd its own session already occupies (its

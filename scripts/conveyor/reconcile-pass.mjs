@@ -1,3 +1,4 @@
+import { launchAgent } from '../lib/agent-launch.mjs';
 import { greenLedgerDir, hasGreenLedger } from '../lib/lane-verify.mjs';
 import { unread } from './dispatch-eligibility.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
@@ -510,7 +511,7 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
 /** UNCACHED `claude agents --json` status for one row's sessionId, or null when unreadable/absent (fail closed). */
 export function freshAgentStatus(row, exec = execFileSync) {
   try {
-    const rows = JSON.parse(String(exec('claude', ['agents', '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: 30_000, killSignal: 'SIGKILL' }) || '[]'));
+    const rows = JSON.parse(String(launchAgent({ mode: 'claude-agents-list', resumeId: null }, exec, 'claude', ['agents', '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: 30_000, killSignal: 'SIGKILL' }) || '[]'));
     const hit = Array.isArray(rows) ? rows.find((r) => r?.sessionId && r.sessionId === row?.sessionId) : null;
     return hit && typeof hit.status === 'string' ? hit.status : null;
   } catch { return null; }

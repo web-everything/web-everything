@@ -632,7 +632,7 @@ describe('(e) buildAgentArgv with a table, and resolveWorkerModel\'s own shape',
   });
 
   it('a resume retains its model even when no fresh model resolves', () => {
-    expect(buildAgentArgv({ payload, table: { model: null }, resumeSessionId: 'existing' }))
+    expect(buildAgentArgv({ payload, table: { model: null }, resumeId: 'existing' }))
       .toEqual(['--bg', '--resume', 'existing', payload.prompt]);
   });
 

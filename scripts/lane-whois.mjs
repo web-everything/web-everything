@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { launchAgent } from './lib/agent-launch.mjs';
 /**
  * @file scripts/lane-whois.mjs
  * @description LANE WHOIS (#3383, epic #3383). The operator's ask: "we need to be able to trace every lane
@@ -312,7 +313,7 @@ export function lanePreservedFileChecker(dir, branchRef, dirtyPaths, { maxFallba
 /** `claude agents --json` - the LIVE session listing (background agents, this host). Best-effort. */
 export function liveAgentSessions({ exec = execFileSync } = {}) {
   try {
-    const out = cachedClaudeAgents({ fetch: () => exec('claude', ['agents', '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) });
+    const out = cachedClaudeAgents({ fetch: () => launchAgent({ mode: 'claude-agents-list', resumeId: null }, exec, 'claude', ['agents', '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) });
     const parsed = JSON.parse(out);
     return Array.isArray(parsed) ? parsed : [];
   } catch {

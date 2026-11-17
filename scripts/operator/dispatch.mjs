@@ -1,3 +1,4 @@
+import { launchAgent } from '../lib/agent-launch.mjs';
 /**
  * dispatch.mjs — the load-bearing primitives from `we:scripts/operator/converge.py`, ported to Node (#3383).
  *
@@ -441,7 +442,7 @@ export async function runAgent({
   const logFd = openSync(logPath, 'w');
   let child;
   try {
-    child = spawnFn('claude', [
+    child = launchAgent({ mode: 'claude-operator', resumeId: null }, spawnFn, 'claude', [
       '-p', '--permission-mode', 'bypassPermissions',
       `--disallowedTools=${disallowedTools.join(',')}`,
       prompt,

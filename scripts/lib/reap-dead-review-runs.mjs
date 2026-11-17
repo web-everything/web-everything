@@ -1,3 +1,4 @@
+import { launchAgent } from './agent-launch.mjs';
 /** Mark provably dead review-pr cursors with R755 sidecars; never rewrite records. Dry-run by default. */
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { hostname } from 'node:os';
@@ -170,7 +171,7 @@ export function reapDeadReviewRuns({ env = process.env, dir = (env.OPERATION_RUN
       for (const { id } of remaining) if (leases.includes(id)) decisions.set(id, 'live-lease');
       const sessionCandidates = remaining.filter(c => !decisions.has(c.id));
       if (sessionCandidates.length) {
-        const sessions = textOf((probes.sessions ?? (() => listing('claude', ['agents', '--json'])))());
+        const sessions = textOf((probes.sessions ?? (() => launchAgent({ mode: 'claude-agents-list', resumeId: null }, listing, 'claude', ['agents', '--json'])))());
         for (const { id, record } of sessionCandidates) {
           const handles = record.effects.filter(e => e.status === 'in-flight').map(e => e.handle).filter(h => typeof h === 'string' && h);
           if (record.job?.handle) handles.push(record.job.handle);

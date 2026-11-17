@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { launchAgent } from './lib/agent-launch.mjs';
 /**
  * codex-direct-task.mjs — a PERSONAL, manually-invoked escape hatch: delegate one real coding task to Codex
  * CLI's agentic (tool-bearing) mode, for a Claude Code operator whose own usage is running low.
@@ -1076,7 +1077,7 @@ export async function runCodexDirectExec({
   return new Promise((resolvePromise, reject) => {
     let child;
     try {
-      child = spawnFn(cli, argv, { cwd: dir, stdio: ['pipe', 'pipe', 'pipe'], detached: true,
+      child = launchAgent({ mode: review ? 'codex-self-review' : resumeThreadId ? 'codex-exec-resume' : 'codex-exec', resumeId: resumeThreadId }, spawnFn, cli, argv, { cwd: dir, stdio: ['pipe', 'pipe', 'pipe'], detached: true,
         env: review ? env : { ...env, PATH: codexShimPath(env), ...(tempRoot ? { TMPDIR: tempRoot, TMP: tempRoot, TEMP: tempRoot } : {}) } });
     } catch (e) {
       reject(new Error(`codex-direct-task: could not start \`${cli}\`: ${e.message}`));

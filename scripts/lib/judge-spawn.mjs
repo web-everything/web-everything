@@ -1,3 +1,4 @@
+import { agentResumeId, launchAgent } from './agent-launch.mjs';
 /**
  * judge-spawn.mjs — the tool-free juror spawn behind one function (#3028, under #3029).
  *
@@ -924,7 +925,7 @@ export async function judgeSpawn({
     const { stdout, stderr, code, signal, timedOut } = await new Promise((resolve, reject) => {
       let child;
       try {
-        child = spawnFn(cli, argv, { cwd: spawnCwd, env: markWorkerEnv(sanitizeSpawnEnv(env)), stdio: ['pipe', 'pipe', 'pipe'] });
+        child = launchAgent({ mode: 'claude-judge', resumeId: agentResumeId(argv) }, spawnFn, cli, argv, { cwd: spawnCwd, env: markWorkerEnv(sanitizeSpawnEnv(env)), stdio: ['pipe', 'pipe', 'pipe'] });
       } catch (e) {
         reject(new Error(`judge-spawn: could not start \`${cli}\`: ${e.message}`));
         return;

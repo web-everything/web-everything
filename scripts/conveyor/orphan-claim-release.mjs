@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { launchAgent } from '../lib/agent-launch.mjs';
 /**
  * @file scripts/conveyor/orphan-claim-release.mjs
  * @description THE ORPHANED-CLAIM RELEASE PASS (WE #3913, epic #3383). Finds backlog cards stuck `status: active`
@@ -299,7 +300,7 @@ function ghPrs(state, limit, fields) {
 
 function listSessions() {
   try {
-    const rows = JSON.parse(cachedClaudeAgents({ all: true, fetch: () => execFileSync('claude', ['agents', '--json', '--all'], {
+    const rows = JSON.parse(cachedClaudeAgents({ all: true, fetch: () => launchAgent({ mode: 'claude-agents-list', resumeId: null }, execFileSync, 'claude', ['agents', '--json', '--all'], {
       encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL',
     }) }) || '[]');
     // An empty listing is indistinguishable from a bad read (lease-reaper's sessionStatesForReap reasoning).

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { agentResumeId, launchAgent } from '../lib/agent-launch.mjs';
 /**
  * @file scripts/operations/deliver-item-wrapper.mjs
  * @description The wrapper a MINIMAL delivery agent (`we:skills-src/conveyor/delivery-agent-brief-v2.md`) runs
@@ -125,7 +126,7 @@ import { sanitizeSpawnEnv } from '../lib/gh-app-shim.mjs';
 import { extractSubmitResult } from './open-pr.mjs';
 import { readBuildGroupingSettings } from '../conveyor/build-grouping.mjs';
 import { fillBrief, parseGroupMembers } from './dispatch-lane.mjs';
-import { tryReadDeliveryReport, resolveDeliveryReportsDir } from './delivery-report-store.mjs';
+import { tryReadDeliveryReport, writeDeliveryReport, resolveDeliveryReportsDir } from './delivery-report-store.mjs';
 import { tryReadCompletion } from './completion-store.mjs';
 import {
   STRUCTURED_OUTPUT_SUFFIX, runWorker, withStructuredOutput, workerWrapperEnabled,
@@ -422,7 +423,7 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
   let root;
   let terminalOutcome = 'wrapper-threw';
   try {
-    const claudeSessionId = newSessionId(); // the Claude CLI's own --session-id — see the docblock above.
+    let claudeSessionId = newSessionId(); // the Claude CLI's own --session-id — see the docblock above.
 
     // build-path-codex-isolation-locus — WHICH REPO this item's own `scope:` actually names, resolved ONCE, up
     // front, before anything is acquired. See `resolveDeliveryLocus`'s own docblock for the couple-repo refusal
@@ -526,6 +527,12 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
       report = await runAgentToCompletion({
         item, sessionSlug, lane, attemptTag, provider, claudeSessionId, lanePathOverride: implLanePath, resume, groupMembers,
       });
+      // Providers that mint their own thread id return it with the report; every resume reuses that id.
+      const recoveredSessionId = report?.sessionId ?? (resume && provider.vendor === 'codex' ? readCodexThreadId(sessionSlug) : null);
+      if (recoveredSessionId) {
+        claudeSessionId = recoveredSessionId;
+        if (resume && provider.vendor === 'codex') writeCodexThreadId(recoveredSessionId); // migrate an old slug-keyed receipt
+      }
       turn.ok({
         outcome: report && report.outcome ? String(report.outcome) : 'unreported',
         filesTouched: Array.isArray(report?.filesTouched) ? report.filesTouched.length : 0,
@@ -612,7 +619,7 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
         { cwd: gate.lanePath, env: laneGitHardeningEnv(), maxBuffer: SELF_REVIEW_MAX_DIFF_BYTES + 1 })),
       review: reviewBuild,
       fix: async prompt => {
-        const resumed = await provider.spawn({ sessionId: claudeSessionId, resumeSessionId: claudeSessionId,
+        const resumed = await provider.spawn({ sessionId: claudeSessionId, resumeId: claudeSessionId,
           prompt: appendBuildRequirements(prompt, { policy: buildPolicy, selfReview: false }),
           lane, sessionSlug, item, attemptTag, lanePathOverride: implLanePath });
         const updated = resumed?.envelope ? buildReportFromEnvelope(resumed, sessionSlug)
@@ -1009,7 +1016,7 @@ export function stageDeliveryReportCliIntoLane(lanePath, {
 /**
  * @typedef {object} DeliveryAgentProvider
  * @property {string} name
- * @property {(request: {sessionId: string, prompt: string, resumeSessionId?: string|null}) => void} spawn
+ * @property {(request: {sessionId: string, prompt: string, resumeId?: string|null}) => void} spawn
  *   BLOCKS until the agent's own turn ends (FIRM REQUIREMENT 4 — no polling, ever). No return value is
  *   needed: the delivery-report contract (`we:scripts/operations/delivery-report-cli.mjs`) is
  *   PROVIDER-AGNOSTIC BY DESIGN — whichever CLI a provider spawns, the AGENT shells the same report CLI
@@ -1218,11 +1225,11 @@ const CLAUDE_RESTRICTED_PROVIDER = {
   // `io` is injectable ONLY so a test can assert what this spawns without touching the real filesystem or a
   // real `claude` process — mirrors this file's existing `{ run: runFn = run }` pattern (e.g.
   // `runGateWithOneRetry`, `runConvergeEdit`). Real call sites (`runAgentToCompletion`,
-  // `resumeAgentWithGateFailure`) pass `{ sessionId, prompt, resumeSessionId?, lane, sessionSlug, item,
+  // `resumeAgentWithGateFailure`) pass `{ sessionId, prompt, resumeId?, lane, sessionSlug, item,
   // attemptTag }` — `lane`/`sessionSlug`/`item`/`attemptTag` added by bug 7's fix, below.
   async spawn(
     {
-      sessionId, prompt, resumeSessionId = null, lane, sessionSlug, item, attemptTag, model = 'sonnet', effort = 'medium',
+      sessionId, prompt, resumeId = null, lane, sessionSlug, item, attemptTag, model = 'sonnet', effort = 'medium',
       // build-path-codex-isolation-locus — see `runAgentToCompletion`'s own docblock for what sets this.
       lanePathOverride = null,
     } = {},
@@ -1259,7 +1266,7 @@ const CLAUDE_RESTRICTED_PROVIDER = {
     const weLanePath = resolveLane(lane, { run: runFn });
     const lanePath = lanePathOverride || weLanePath;
     const baseArgv = buildRestrictedProviderArgv({
-      sessionId, prompt: workerWrapper ? `${prompt}${STRUCTURED_OUTPUT_SUFFIX}` : prompt, resumeSessionId, settingsFile, model, effort,
+      sessionId, prompt: workerWrapper ? `${prompt}${STRUCTURED_OUTPUT_SUFFIX}` : prompt, resumeId, settingsFile, model, effort,
       addDirs: lanePathOverride ? [weLanePath] : [],
     });
     // 117 S3a — wrapped: `-p --output-format json --json-schema` on fresh AND resumed turns (the schema survives resume).
@@ -1304,7 +1311,7 @@ const CLAUDE_RESTRICTED_PROVIDER = {
       try {
         ran = await runWorkerFn({
           role: 'build', launcher: 'claude-p', session: sessionSlug, command: 'claude', argv, cwd: lanePath,
-          env: { ...process.env, ...deliveryEnv }, timeoutMs: DELIVERY_AGENT_SPAWN_TIMEOUT_MS, model, item, sessionId,
+          env: { ...process.env, ...deliveryEnv }, timeoutMs: DELIVERY_AGENT_SPAWN_TIMEOUT_MS, model, item, sessionId: resumeId ?? sessionId,
         }, {
           // keep the SAME env hygiene as the old path (GH_TOKEN stripped, worker marker) via the existing spawn primitive
           spawnToCompletionFn: (_cmd, a, opts, spawnIo) => spawnAgent(a, opts, spawnIo),
@@ -1312,20 +1319,20 @@ const CLAUDE_RESTRICTED_PROVIDER = {
           // this turn started counts, or a resume that ended with no result would read as the stale `done`.
           legacyRead: () => {
             const report = tryReadDeliveryReport(sessionSlug, reportsDir);
-            return resumeSessionId && !(Date.parse(report?.updatedAt) >= turnStartedAt) ? null : report;
+            return resumeId && !(Date.parse(report?.updatedAt) >= turnStartedAt) ? null : report;
           },
         });
       } catch (e) {
         // runWorker rejects only on a bad spec or a record it could not write: the old path still recorded the turn's CPU and
         // captured the failure on its way out, so do the same before rethrowing.
         recordCpu(e && e.resourceUsage);
-        persistFailure(sessionSlug, e, { resumeSessionId });
+        persistFailure(resumeId ?? sessionId, e, { resumeId });
         throw e;
       }
       // The same post-spawn side effects as the unwrapped path below (the wrapper returns before reaching them): the turn's CPU
       // telemetry on success and failure alike, and the capture of what a failed child said.
       recordCpu(ran?.resourceUsage);
-      if (ran?.failure) persistFailure(sessionSlug, ran.failure, { resumeSessionId });
+      if (ran?.failure) persistFailure(resumeId ?? sessionId, ran.failure, { resumeId });
       return ran;
     }
     try {
@@ -1353,7 +1360,7 @@ const CLAUDE_RESTRICTED_PROVIDER = {
       // header) is recorded too, so an agent turn that fails still reports its real CPU cost, not a fabricated
       // zero.
       recordCpu(e && e.resourceUsage);
-      persistFailure(sessionSlug, e, { resumeSessionId });
+      persistFailure(resumeId ?? sessionId, e, { resumeId });
       throw e;
     }
   },
@@ -1405,7 +1412,7 @@ const CODEX_PROVIDER = {
   // what this spawns without a real `codex` process or a real filesystem.
   async spawn(
     {
-      sessionId, prompt, resumeSessionId = null, lane, sessionSlug, item, attemptTag, model, effort, taskKind = 'build', usageTaskKind, size, epic, decision, care, mandatoryLens, repo, pr, caller = 'deliver-item-wrapper.mjs',
+      sessionId, prompt, resumeId = null, lane, sessionSlug, item, attemptTag, model, effort, taskKind = 'build', usageTaskKind, size, epic, decision, care, mandatoryLens, repo, pr, caller = 'deliver-item-wrapper.mjs',
       // build-path-codex-isolation-locus — see `runAgentToCompletion`'s own docblock for what sets this.
       lanePathOverride = null,
     } = {},
@@ -1458,13 +1465,11 @@ const CODEX_PROVIDER = {
     // map must cover neither lane.
     const deny = denyPaths ?? deliveryDenyPathsForLanes([lanePath, ...extraLanes]);
     for (const reachable of [lanePath, ...extraLanes]) assertDenyPathsUsable(deny, reachable);
-    // Codex mints its OWN thread id and has no `--session-id`, so `resumeSessionId` (a CLAUDE-side UUID the
-    // port hands every provider) is used as the SIGNAL that this is a resume, and the actual id is looked up
-    // in this provider's own sidecar map. A resume with no recorded thread id is a hard error, never a silent
+    // Both the receipt key and resumeId are Codex's native thread id. Refuse an absent or mismatched receipt. A resume with no recorded thread id is a hard error, never a silent
     // downgrade to a fresh session: the whole point of the gate-failure resume is that the agent still
     // remembers what it built, and a fresh turn would quietly lose that.
-    const resumeThreadId = resumeSessionId ? readThreadId(sessionSlug) : null;
-    if (resumeSessionId && !resumeThreadId) {
+    const resumeThreadId = resumeId ? readThreadId(resumeId) : null;
+    if (resumeId && (!resumeThreadId || resumeThreadId !== resumeId)) {
       throw new Error(
         `deliver-item-wrapper: CODEX_PROVIDER cannot resume session ${sessionSlug} — no Codex thread id was `
         + 'recorded for it (the fresh spawn never reached `thread.started`, or its sidecar was removed). '
@@ -1492,7 +1497,7 @@ const CODEX_PROVIDER = {
       recordCpu(spawned.resourceUsage);
     } catch (e) {
       recordCpu(e && e.resourceUsage);
-      persistFailure(sessionSlug, e, { resumeSessionId });
+      persistFailure(resumeId ?? sessionId, e, { resumeId });
       throw e;
     }
     // #3383 usage-ledger follow-up — best-effort, never throws; see that function's own header.
@@ -1509,11 +1514,10 @@ const CODEX_PROVIDER = {
     // ability to resume, which the guard above then reports loudly, and must never fail a build that worked.
     if (!resumeThreadId) {
       const threadId = parseCodexThreadId(stdout);
-      if (threadId) writeThreadId(sessionSlug, threadId);
+      if (threadId) writeThreadId(threadId);
     }
-    // `sessionId` is unused by this provider — Codex has no caller-minted session id (see above). Named in
-    // the destructure anyway so the port's request shape stays visible at both implementations.
-    void sessionId;
+    // Carry the native id back to the wrapper and its durable report for gate/self-review/recovery resumes.
+    return { sessionId: resumeThreadId ?? parseCodexThreadId(stdout) };
   },
 };
 
@@ -1570,7 +1574,7 @@ export function buildReportFromEnvelope(spawned, sessionSlug) {
     const why = envelope?.parse?.reason ?? envelope?.result?.outcome ?? 'no result';
     throw new Error(`deliver-item-wrapper: agent for ${sessionSlug} exited with no done report (crash or refused effect) — worker-result envelope: ${why}`);
   }
-  return report;
+  return spawned?.sessionId ? { ...report, sessionId: spawned.sessionId } : report;
 }
 
 /** The report for a finished v2 envelope, or `null` when it holds no usable result (not done, unparseable, aborted). */
@@ -1631,7 +1635,7 @@ export async function runAgentToCompletion(
   },
   {
     readBrief = () => appendBuildRequirements(readFileSync(`${REPO_ROOT}/skills-src/conveyor/delivery-agent-brief-v2.md`, 'utf8'), { selfReview: false }),
-    readReport = tryReadDeliveryReport,
+    readReport = tryReadDeliveryReport, writeReport = writeDeliveryReport,
     resolveLane = resolveLanePath,
     resolveReportsDir = resolveDeliveryReportsDir,
     run: runFn = run,
@@ -1691,6 +1695,11 @@ export async function runAgentToCompletion(
     // Nothing to poll for: the process is gone, so there is nothing further to wait on. This is itself a
     // result the wrapper acts on (treat as `blocked`, surface literally), never a reason to start waiting.
     throw new Error(`deliver-item-wrapper: agent for ${sessionSlug} exited with no done report (crash or refused effect)`);
+  }
+  if (spawned?.sessionId) {
+    const identified = { ...report, sessionId: spawned.sessionId };
+    writeReport(identified, reportsDir);
+    return identified;
   }
   return report;
 }
@@ -1828,7 +1837,7 @@ export async function runGateWithOneRetry(
  *  BLOCKS (same reasoning as `runAgentToCompletion`) until that new turn itself ends, so the caller
  *  (`runGateWithOneRetry`) can safely read the agent's fresh report the very next line with no loop of its
  *  own either. Goes THROUGH THE SAME PROVIDER PORT the initial spawn used (`provider.spawn` with
- *  `resumeSessionId` set) rather than a second, resume-specific Claude-CLI code path — a provider owns BOTH
+ *  `resumeId` set) rather than a second, resume-specific Claude-CLI code path — a provider owns BOTH
  *  its fresh-spawn and its resume shape, so `CODEX_PROVIDER` (once real) would supply both from one place. */
 async function resumeAgentWithGateFailure({
   sessionSlug, lane, item, attemptTag, failureOutput, gateOutcome = 'fail', provider = CLAUDE_RESTRICTED_PROVIDER,
@@ -1845,14 +1854,14 @@ async function resumeAgentWithGateFailure({
   // wrapper-owned way it already commits the original build (see `commitBuildTurn`'s own header for why —
   // this is the #3565 Codex sandbox finding applied as a structural fix, not a sandbox carve-out).
   const prompt = gateFailureResumePrompt({ failureOutput, gateOutcome });
-  // BUG-5 FIX: both `sessionId` and `resumeSessionId` are `claudeSessionId` — the real UUID minted once in
+  // BUG-5 FIX: both `sessionId` and `resumeId` are `claudeSessionId` — the real UUID minted once in
   // `deliverItem` and reused by the fresh spawn — never `sessionSlug`. `--resume <id>` must name the SAME CLI
   // session the fresh spawn created, and that id must itself be a UUID (CLI-enforced).
   // #3627 bug 7 — this prompt says `$LANE` above, same as the fresh brief, so this resume needs the SAME real
   // cwd/env treatment (`lane`/`sessionSlug`/`item`/`attemptTag` threaded through to the provider) or a resumed
   // agent hits the identical "no real $LANE to cd into" failure the fresh spawn did.
   return provider.spawn({
-    sessionId: claudeSessionId, prompt, resumeSessionId: claudeSessionId, lane, sessionSlug, item, attemptTag,
+    sessionId: claudeSessionId, prompt, resumeId: claudeSessionId, lane, sessionSlug, item, attemptTag,
     lanePathOverride,
   }); // AWAITS. Returned (not dropped): a wrapped provider hands back its v2 envelope for the resumed turn.
 }
@@ -2166,7 +2175,7 @@ export function runConvergeEdit(
   // note refused to write one for exactly that reason). The fix wrapper passes `repair`, a WRAPPER-AGENT kind
   // (`dispatch-lane.mjs#WRAPPER_AGENT_KINDS`) — the same half of the value space this default's own
   // `'delivery'` has always been in. The gap that note called an open follow-up is closed.
-  const out = runFn('claude', argv, { cwd: lane, env: markWorkerEnv(sanitizeSpawnEnv({ ...process.env, WE_DISPATCH_KIND: dispatchKind })) });
+  const out = launchAgent({ mode: 'claude-converge', resumeId: agentResumeId(argv) }, runFn, 'claude', argv, { cwd: lane, env: markWorkerEnv(sanitizeSpawnEnv({ ...process.env, WE_DISPATCH_KIND: dispatchKind })) });
   // Additive fields only — see this function's own docblock ("VISIBILITY fix") for why these two are always
   // `requestedProvider !== editorProvider` on a Codex-selected delivery, on purpose, not a bug.
   return { ...parseConvergeEditResult(out), requestedProvider: provider.name, editorProvider: CLAUDE_RESTRICTED_PROVIDER.name };

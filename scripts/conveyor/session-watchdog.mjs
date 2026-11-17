@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { launchAgent } from '../lib/agent-launch.mjs';
 /**
  * @file scripts/conveyor/session-watchdog.mjs
  * @description THE SESSION WATCHDOG (card xegykal, epic #3383). Operator ruling 2026-10-04 ~09:30 ET: "we need a
@@ -476,7 +477,7 @@ export function makeSnapshotHeadReader({ maxAgeMs = DEFAULT_SESSION_WATCHDOG.prH
 }
 
 export function defaultListAgentsJson(exec = execFileSync) {
-  return JSON.parse(String(cachedClaudeAgents({ fetch: () => exec('claude', ['agents', '--json'], { cwd: homedir(), encoding: 'utf8', timeout: 60_000 }) })));
+  return JSON.parse(String(cachedClaudeAgents({ fetch: () => launchAgent({ mode: 'claude-agents-list', resumeId: null }, exec, 'claude', ['agents', '--json'], { cwd: homedir(), encoding: 'utf8', timeout: 60_000 }) })));
 }
 
 function defaultProcesses(exec = execFileSync) {

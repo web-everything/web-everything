@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { agentResumeId, launchAgent } from '../lib/agent-launch.mjs';
 /**
  * worker-result-probe.mjs — slice S0 of item 117 (worker JSON output contract).
  *
@@ -53,7 +54,7 @@ export function tryParse(text) {
 function sleepMs(ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
 
 function run(cmd, args, { cwd, timeoutMs = 120000 } = {}) {
-  const r = spawnSync(cmd, args, { cwd, encoding: 'utf8', timeout: timeoutMs, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024 });
+  const r = launchAgent({ mode: 'worker-result-probe', resumeId: agentResumeId(args) }, spawnSync, cmd, args, { cwd, encoding: 'utf8', timeout: timeoutMs, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024 });
   if (r.error) return { ok: false, reason: r.error.code === 'ENOENT' ? `${cmd} not installed` : String(r.error.message), stdout: '', stderr: '', status: null };
   return { ok: true, status: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
 }
@@ -63,14 +64,14 @@ const skip = (launcher, reason) => ({ launcher, honored: null, resultLocation: n
 function probeClaudeP(dir) {
   const sid = randomUUID();
   const base = ['-p', '--model', 'haiku', '--json-schema', SCHEMA_JSON, '--output-format', 'json', '--max-budget-usd', '0.3'];
-  const r = run('claude', [PROMPT, ...base, '--session-id', sid]);
+  const r = launchAgent({ mode: 'worker-result-probe', resumeId: null }, run, 'claude', [PROMPT, ...base, '--session-id', sid]);
   if (!r.ok) return skip('claude -p', r.reason);
   const j = tryParse(r.stdout);
   if (!j) return skip('claude -p', `exit ${r.status}, stdout is not JSON (auth or CLI problem?): ${r.stderr.slice(0, 120).replace(/\s+/g, ' ')}`);
   const honored = !!j && j.subtype === 'success' && matchesProbeShape(j.structured_output);
-  const r2 = run('claude', [PROMPT2, ...base, '--resume', sid]);
+  const r2 = launchAgent({ mode: 'worker-result-probe', resumeId: sid }, run, 'claude', [PROMPT2, ...base, '--resume', sid]);
   const j2 = tryParse(r2.stdout);
-  const budget = run('claude', [PROMPT, ...base.slice(0, -1), '0.00001', '--no-session-persistence']);
+  const budget = launchAgent({ mode: 'worker-result-probe', resumeId: null }, run, 'claude', [PROMPT, ...base.slice(0, -1), '0.00001', '--no-session-persistence']);
   const jb = tryParse(budget.stdout);
   return {
     launcher: 'claude -p', honored, resultLocation: 'stdout JSON field `structured_output` (the `result` field is the same JSON as a string)',
@@ -96,7 +97,7 @@ function waitForStructured(id, ms = 90000) {
 function probeClaudeBg(cwd) {
   const spawned = [];
   const start = (args) => {
-    const r = run('claude', ['--bg', ...args], { cwd, timeoutMs: 60000 });
+    const r = launchAgent({ mode: 'worker-result-probe', resumeId: null }, run, 'claude', ['--bg', ...args], { cwd, timeoutMs: 60000 });
     if (!r.ok) return { err: r.reason };
     const m = /backgrounded\s*·\s*([0-9a-f]{8})/.exec(r.stdout + r.stderr);
     if (!m) return { err: `no session id in output: ${(r.stdout + r.stderr).slice(0, 160).replace(/\s+/g, ' ')}` };
@@ -126,7 +127,7 @@ function probeClaudeBg(cwd) {
     bg.failureShape = 'operator `claude stop <id>`: state.json state=stopped; structuredResult stays whatever was last set (null if none).';
     return [bg, resume];
   } finally {
-    for (const id of spawned) run('claude', ['stop', id], { cwd, timeoutMs: 30000 });
+    for (const id of spawned) launchAgent({ mode: 'claude-stop', resumeId: null }, run, 'claude', ['stop', id], { cwd, timeoutMs: 30000 });
   }
 }
 
@@ -134,14 +135,14 @@ function probeCodex(dir) {
   const schema = join(dir, 'codex-schema.json'); writeFileSync(schema, SCHEMA_JSON);
   const out1 = join(dir, 'c1.txt'); const out2 = join(dir, 'c2.txt'); const out3 = join(dir, 'c3.txt');
   const common = ['--json', '--skip-git-repo-check', '--output-schema', schema];
-  const r = run('codex', ['exec', ...common, '-o', out1, '-s', 'read-only', PROMPT], { cwd: dir });
+  const r = launchAgent({ mode: 'worker-result-probe', resumeId: null }, run, 'codex', ['exec', ...common, '-o', out1, '-s', 'read-only', PROMPT], { cwd: dir });
   if (!r.ok) return [skip('codex exec', r.reason), skip('codex exec resume', r.reason)];
   if (r.status !== 0 && !existsSync(out1)) return [skip('codex exec', `exit ${r.status}, no -o file (auth or CLI problem?): ${r.stdout.slice(-160).replace(/\s+/g, ' ')}`), skip('codex exec resume', 'first call failed')];
   const tid = /"thread_id":"([^"]+)"/.exec(r.stdout)?.[1];
   const v1 = existsSync(out1) ? tryParse(readFileSync(out1, 'utf8')) : null;
   const bad = join(dir, 'codex-bad.json');
   writeFileSync(bad, JSON.stringify({ ...PROBE_SCHEMA, required: ['outcome'] }));
-  const f = run('codex', ['exec', '--json', '--skip-git-repo-check', '--output-schema', bad, '-o', out3, '-s', 'read-only', 'hi'], { cwd: dir });
+  const f = launchAgent({ mode: 'worker-result-probe', resumeId: null }, run, 'codex', ['exec', '--json', '--skip-git-repo-check', '--output-schema', bad, '-o', out3, '-s', 'read-only', 'hi'], { cwd: dir });
   const exec = {
     launcher: 'codex exec', honored: matchesProbeShape(v1), resultLocation: 'the `-o <file>` (last agent message) and the `agent_message` item in the --json stream; the file is the JSON text',
     failureShape: { nonStrictSchema: `exit ${f.status}; ${/invalid_json_schema/.test(f.stdout) ? '400 invalid_json_schema in a `turn.failed` event' : 'see stdout'}; -o file written: ${existsSync(out3)}` },
@@ -150,7 +151,7 @@ function probeCodex(dir) {
   let resume;
   if (!tid) resume = skip('codex exec resume', 'no thread_id in --json stream');
   else {
-    const r2 = run('codex', ['exec', 'resume', tid, ...common, '-o', out2, PROMPT2], { cwd: dir });
+    const r2 = launchAgent({ mode: 'worker-result-probe', resumeId: tid }, run, 'codex', ['exec', 'resume', tid, ...common, '-o', out2, PROMPT2], { cwd: dir });
     const v2 = existsSync(out2) ? tryParse(readFileSync(out2, 'utf8')) : null;
     resume = { launcher: 'codex exec resume', honored: r2.ok && matchesProbeShape(v2), resultLocation: 'same: `-o <file>`', notes: '`resume` takes --output-schema and -o; the schema applies to the resumed turn.' };
   }

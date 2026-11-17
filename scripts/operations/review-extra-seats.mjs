@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { launchAgent, agentResumeId } from '../lib/agent-launch.mjs';
 import { FINDING_CLASSES, classAction, stricterClass, readFindingClassPolicy, validAlsoClasses } from '../lib/finding-class-policy.mjs';
 import { decodeRecoveryAdmission } from '../lib/drain-red-team-evidence.mjs';
 import { recordRedTeamStatus, readRedTeamStatus, redTeamStatusDir } from '../lib/drain-red-team-evidence.mjs';
@@ -1088,7 +1089,7 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
       }, { timeoutMs: lockTimeoutMs });
     },
     cliAvailable: (provider) => {
-      const r = spawnSync(CLI_BIN[provider], ['--version'], { env, encoding: 'utf8', timeout: 20_000, stdio: ['ignore', 'pipe', 'pipe'] });
+      const r = launchAgent({ mode: 'agent-version', resumeId: null }, spawnSync, CLI_BIN[provider], ['--version'], { env, encoding: 'utf8', timeout: 20_000, stdio: ['ignore', 'pipe', 'pipe'] });
       return r.status === 0;
     },
     // A SELF-CONTAINED copy of the one pinned commit: a fresh repo that FETCHES it from the lane, so its objects
@@ -2214,7 +2215,7 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
           // directly. A PID-targeted launcher signal does not reach its group.
           spawnFn: (cli, argv, options) => {
             if (stoppingSeats || terminatingSeats) throw new Error('review seats are stopping');
-            return trackSeat(spawn(cli, argv, { ...options, detached: true }), 'SIGKILL');
+            return trackSeat(launchAgent({ mode: 'review-recheck', resumeId: agentResumeId(argv) }, spawn, cli, argv, { ...options, detached: true }), 'SIGKILL');
           },
         });
         // Validate while the pinned checkout still exists; callers retain only safe relative paths.

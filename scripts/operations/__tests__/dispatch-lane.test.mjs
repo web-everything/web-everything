@@ -1370,15 +1370,15 @@ describe('what the sink actually runs', () => {
   });
 
   it('xgqz204 — a resume stays a BARE `--bg --resume` (the resumed process already carries the marker)', () => {
-    expect(buildAgentArgv({ payload, resumeSessionId: 'abc' })).toEqual(['--bg', '--resume', 'abc', '# build #3037']);
+    expect(buildAgentArgv({ payload, resumeId: 'abc' })).toEqual(['--bg', '--resume', 'abc', '# build #3037']);
   });
 
-  it('#xu2krte — resumeSessionId emits a BARE `--bg --resume <id> <prompt>`, no -n/systemPromptFile/extraArgs', () => {
+  it('#xu2krte — resumeId emits a BARE `--bg --resume <id> <prompt>`, no -n/systemPromptFile/extraArgs', () => {
     // The live build-time probe (docs/agent/platform-decisions.md#parked-pr-conflict-dispatched-not-scripted)
     // found any OTHER flag alongside `--resume` makes the CLI fork a copy instead of continuing the named
     // session — so this branch must emit nothing else, even when the caller supplies extras.
     const argv = buildAgentArgv({
-      sessionId: 'sess-unused', payload, resumeSessionId: 'cand-1111-2222-3333-444444444444',
+      sessionId: 'sess-unused', payload, resumeId: 'cand-1111-2222-3333-444444444444',
       systemPromptFile: '/path/to/identity.md', extraArgs: ['--model', 'sonnet'],
     });
     expect(argv).toEqual(['--bg', '--resume', 'cand-1111-2222-3333-444444444444', payload.prompt]);
@@ -1386,7 +1386,7 @@ describe('what the sink actually runs', () => {
 
   it('#x8mpubm — settingsEnv is NEVER emitted on the resume branch either, same reasoning as extraArgs above', () => {
     const argv = buildAgentArgv({
-      sessionId: 'sess-unused', payload, resumeSessionId: 'cand-1111-2222-3333-444444444444',
+      sessionId: 'sess-unused', payload, resumeId: 'cand-1111-2222-3333-444444444444',
       settingsEnv: { PATH: '/shim:/usr/bin' },
     });
     expect(argv).toEqual(['--bg', '--resume', 'cand-1111-2222-3333-444444444444', payload.prompt]);
@@ -1395,15 +1395,15 @@ describe('what the sink actually runs', () => {
   it('#x9fbg1x — worktreeSettings is NEVER emitted on the resume branch either — a still-running resumed '
     + 'session already carries whatever its first, fresh dispatch gave it', () => {
     const argv = buildAgentArgv({
-      sessionId: 'sess-unused', payload, resumeSessionId: 'cand-1111-2222-3333-444444444444',
+      sessionId: 'sess-unused', payload, resumeId: 'cand-1111-2222-3333-444444444444',
       worktreeSettings: { bgIsolation: 'none' },
     });
     expect(argv).toEqual(['--bg', '--resume', 'cand-1111-2222-3333-444444444444', payload.prompt]);
   });
 
-  it('#xu2krte — resumeSessionId still refuses an empty/dash-leading prompt, same as a fresh dispatch', () => {
-    expect(() => buildAgentArgv({ payload: { prompt: '  ' }, resumeSessionId: 'x' })).toThrow(/empty prompt/);
-    expect(() => buildAgentArgv({ payload: { prompt: '--hostile' }, resumeSessionId: 'x' })).toThrow(/begins with `-`/);
+  it('#xu2krte — resumeId still refuses an empty/dash-leading prompt, same as a fresh dispatch', () => {
+    expect(() => buildAgentArgv({ payload: { prompt: '  ' }, resumeId: 'x' })).toThrow(/empty prompt/);
+    expect(() => buildAgentArgv({ payload: { prompt: '--hostile' }, resumeId: 'x' })).toThrow(/begins with `-`/);
   });
 
   it('REFUSES a brief beginning with a dash — position alone does not stop a parser reading it as a flag', () => {

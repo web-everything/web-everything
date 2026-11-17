@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { launchAgent } from '../lib/agent-launch.mjs';
 import { pidIdentity } from '../lib/pid-alive.mjs';
 /**
  * @file scripts/conveyor/driver-watchdog.mjs
@@ -488,7 +489,7 @@ function saveJson(path, obj) {
  * a watchdog must not be able to reach. Shelling one command is a syscall, not duplicated judgment.
  */
 export function defaultListAgents({ exec = execFileSync } = {}) {
-  const out = cachedClaudeAgents({ fetch: () => exec('claude', ['agents', '--json'], {
+  const out = cachedClaudeAgents({ fetch: () => launchAgent({ mode: 'claude-agents-list', resumeId: null }, exec, 'claude', ['agents', '--json'], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: 30_000, killSignal: 'SIGKILL',
   }) });
   return JSON.parse(String(out || '[]'));
