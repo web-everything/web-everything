@@ -322,53 +322,75 @@ function hasJwkSecretText(text) {
   // An object needs a literal opening brace, or a quoted token that can decode to one.
   if(!text.includes('{')&&!text.includes('"')&&!text.includes("'")&&!text.includes('`'))return false;
   const pending=[{text,comments:true}];
+  let budget=8*text.length;
   while(pending.length) {
-    const stack=[],candidate=pending.pop();
-    for(const [token] of candidate.text.matchAll(candidate.comments?JWK_TOKEN:JWK_DATA_TOKEN)) {
-      if(token.startsWith('//')||token.startsWith('/*')) {
-        // Parse a comment body as data once. Reinterpreting nested comment markers could repeatedly
-        // scan almost the same suffix on inputs such as many slashes followed by an object.
-        if(token.includes('{')&&mayHaveJwkText(token))pending.push({text:token.slice(2,token.endsWith('*/')?-2:undefined),comments:false});
-        continue;
+    const candidate=pending.pop(),seen=new Set();
+    // A quote in unrelated prose can swallow an object's opening brace. Retry every brace
+    // hidden by the first tokenization, with a fresh scope, including inside malformed prose.
+    // Braces already parsed as objects need no retry. All recovery and decoded-string scans
+    // share a budget of eight original input lengths. Exhaustion conservatively blocks
+    // shipment through the same finding rather than admitting incompletely scanned content.
+    for(let anchor=-1;;) {
+      const stack=[],tokens=new RegExp(candidate.comments?JWK_TOKEN:JWK_DATA_TOKEN);
+      tokens.lastIndex=Math.max(0,anchor);
+      let cursor=tokens.lastIndex,closedScope=false;
+      for(const match of candidate.text.matchAll(tokens)) {
+        const [token]=match;
+        budget-=match.index+token.length-cursor;
+        if(budget<0)return true;
+        cursor=match.index+token.length;
+        if(token.startsWith('//')||token.startsWith('/*')) {
+          // Parse a comment body as data once. Reinterpreting nested comment markers could repeatedly
+          // scan almost the same suffix on inputs such as many slashes followed by an object.
+          if(token.includes('{')&&mayHaveJwkText(token))pending.push({text:token.slice(2,token.endsWith('*/')?-2:undefined),comments:false});
+          continue;
+        }
+        if(token==='{'||token==='[') {
+          if(token==='{')seen.add(match.index);
+          const parent=stack.at(-1);
+          if(parent?.computed)parent.invalid=true;
+          stack.push({object:token==='{',computed:token==='['&&parent?.object&&!parent.value,
+            type:false,secret:false});
+          continue;
+        }
+        if(token==='}'||token===']') {
+          const closed=stack.pop(),parent=stack.at(-1);
+          // Only a single quoted literal in a property-position bracket supplies an object member.
+          // Arrays used as values and nested objects keep their own scope.
+          if(token===']'&&closed?.computed&&parent?.object)
+            parent.member=closed.invalid?undefined:closed.literal;
+          if(anchor>=0&&!stack.length) {closedScope=true;break;}
+          continue;
+        }
+        const quoted=token[0]==='"'||token[0]==="'"||token[0]==='`';
+        // Outside an object, only a complete serialized JWK can contribute a finding. Its private
+        // value alone needs 22 characters; decoding shorter strings cannot supply one. Avoid a
+        // decoded-string allocation per escaped property name in object-free adversarial text.
+        if(!stack.length&&(!quoted||token.length<24))continue;
+        // Decode within whole string tokens so escaped quotes/braces cannot alter the enclosing scope.
+        const value=quoted?decodeEscapes(token.slice(1,-1)):token;
+        // A serialized object is its own scope: never combine its members with the enclosing object.
+        if(quoted&&value.includes('{')&&mayHaveJwkText(value))pending.push({text:value,comments:true});
+        const frame=stack.at(-1);
+        if(frame?.computed) {
+          if(!quoted||frame.literal!==undefined)frame.invalid=true;
+          else frame.literal=value;
+          continue;
+        }
+        if(!frame?.object)continue;
+        if(token===',') {frame.member=undefined;frame.value=false;continue;}
+        if(token===':') {frame.value=true;continue;}
+        if(!frame.value) {frame.member=value;continue;}
+        if(frame.member==='kty'&&JWK_TYPE.test(value))frame.type=true;
+        if(JWK_MEMBER.test(frame.member)&&quoted&&/^[A-Za-z0-9_-]{22,}/.test(value.replace(/\s/g,'')))frame.secret=true;
+        frame.member=undefined;frame.value=false;
+        if(frame.type&&frame.secret)return true;
       }
-      if(token==='{'||token==='[') {
-        const parent=stack.at(-1);
-        if(parent?.computed)parent.invalid=true;
-        stack.push({object:token==='{',computed:token==='['&&parent?.object&&!parent.value,
-          type:false,secret:false});
-        continue;
-      }
-      if(token==='}'||token===']') {
-        const closed=stack.pop(),parent=stack.at(-1);
-        // Only a single quoted literal in a property-position bracket supplies an object member.
-        // Arrays used as values and nested objects keep their own scope.
-        if(token===']'&&closed?.computed&&parent?.object)
-          parent.member=closed.invalid?undefined:closed.literal;
-        continue;
-      }
-      const quoted=token[0]==='"'||token[0]==="'"||token[0]==='`';
-      // Outside an object, only a complete serialized JWK can contribute a finding. Its private
-      // value alone needs 22 characters; decoding shorter strings cannot supply one. Avoid a
-      // decoded-string allocation per escaped property name in object-free adversarial text.
-      if(!stack.length&&(!quoted||token.length<24))continue;
-      // Decode within whole string tokens so escaped quotes/braces cannot alter the enclosing scope.
-      const value=quoted?decodeEscapes(token.slice(1,-1)):token;
-      // A serialized object is its own scope: never combine its members with the enclosing object.
-      if(quoted&&value.includes('{')&&mayHaveJwkText(value))pending.push({text:value,comments:true});
-      const frame=stack.at(-1);
-      if(frame?.computed) {
-        if(!quoted||frame.literal!==undefined)frame.invalid=true;
-        else frame.literal=value;
-        continue;
-      }
-      if(!frame?.object)continue;
-      if(token===',') {frame.member=undefined;frame.value=false;continue;}
-      if(token===':') {frame.value=true;continue;}
-      if(!frame.value) {frame.member=value;continue;}
-      if(frame.member==='kty'&&JWK_TYPE.test(value))frame.type=true;
-      if(JWK_MEMBER.test(frame.member)&&quoted&&/^[A-Za-z0-9_-]{22,}/.test(value.replace(/\s/g,'')))frame.secret=true;
-      frame.member=undefined;frame.value=false;
-      if(frame.type&&frame.secret)return true;
+      // A failed final regex search still traverses the suffix, even if it is only whitespace.
+      if(!closedScope)budget-=candidate.text.length-cursor;
+      if(budget<0)return true;
+      do {anchor=candidate.text.indexOf('{',anchor+1);} while(anchor>=0&&seen.has(anchor));
+      if(anchor<0)break;
     }
   }
   return false;

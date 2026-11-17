@@ -83,6 +83,9 @@ const staticJwkVariants=Object.fromEntries([
   ['computed names across line comments',key=>'[ // name\r\n'+JSON.stringify(key)+'\u2028]',JSON.stringify],
   ['escaped computed names',key=>'[ /* name */ "'+[...key].map(char=>'\\u'+char.charCodeAt(0).toString(16).padStart(4,'0')).join('')+'" ]',JSON.stringify],
 ].map(([name,keyText,valueText])=>[name,'{'+Object.entries(staticJwk).map(([key,value])=>keyText(key)+':'+valueText(value)).join(',\r\n')+'}']));
+// Overlapping malformed object/string/comment interpretations exhaust recovery's work budget.
+const jwkRecoveryNoise=size=>Buffer.from("`*:}`',/{/*`".repeat(Math.floor(size/12))+' kty '+'a'.repeat(22));
+const jwkRecoverySuffix=size=>Buffer.from('{\\"'.repeat(256)+'" kty '+'a'.repeat(22)+' '.repeat(size));
 // Inventory is separate from fixture registration: removing an advertised fixture/view must fail the gate.
 const supportedFormats=['pkcs8-ed25519','pkcs8-x25519','pkcs1-rsa','pkcs1-rsa-512','pkcs8-rsa',
   'sec1-ec','sec1-ec-p384','sec1-ec-p521','pkcs8-ec-p256','pkcs8-ec-p384','pkcs8-ec-p521',
@@ -157,6 +160,52 @@ describe('forge-key-structure: PKCS#8 version and optional-field variants',()=>{
         expect(credentialContentFinding(path,content)).not.toBe(FINDING);
         expect(manifestEntry(path,content,false,true)).toMatchObject({tracked:true});
       }
+    }
+  });
+});
+
+describe('forge-key-structure: JWK recovery after unrelated quotes',()=>{
+  const path=Buffer.from('docs/notes.md');
+  const encodings={raw:bytes=>bytes,...Object.fromEntries(Object.entries(views)
+    .map(([name,encode])=>[name,bytes=>Buffer.from(encode(bytes))])),
+    utf16le:bytes=>Buffer.from(bytes.toString(),'utf16le')};
+  const scanners={buffer:credentialBufferFinding,content:bytes=>credentialContentFinding(path,bytes),
+    manifest:bytes=>expect(()=>manifestEntry(path,bytes,false,true)).toThrow(expect.objectContaining({
+      code:'excluded-source-file',message:expect.stringContaining(FINDING),
+    }))};
+  for(const quote of ['"',"'",'`'])
+    for(const prefix of [quote,quote+'prose\r\n\u2028',quote.repeat(3),'{note:'+quote+'unfinished ',
+      '{note:'+quote+'{nested:'+quote+'unfinished '])
+      for(const [surface,scan] of Object.entries(scanners))
+        it(`${surface} blocks JWK objects after prefix ${JSON.stringify(prefix)}`,()=>{
+          for(const text of [JSON.stringify(staticJwk),...Object.values(staticJwkVariants),
+            JSON.stringify({description:'braces { in a string }',...staticJwk}),
+            JSON.stringify({...staticJwk,kty:undefined}).replace(/}$/,',"kty":"OKP"}')])
+            for(const encode of Object.values(encodings)) {
+              const result=scan(encode(Buffer.from(prefix+text)));
+              if(surface!=='manifest')expect(result).toBe(FINDING);
+            }
+        });
+  it('does not combine unrelated objects, comments or quoted fragments during recovery',()=>{
+    for(const prefix of ['"',"'",'`','{note:"unfinished '])
+      for(const text of [JSON.stringify([{kty:'OKP'},{d:staticJwk.d}]),
+        JSON.stringify({kty:'OKP',description:JSON.stringify({d:staticJwk.d})}),
+        `{kty:'OKP' /* d:'${staticJwk.d}' */}`,
+        JSON.stringify({kty:'OKP',kid:staticJwk.d})]) {
+        const bytes=Buffer.from(prefix+text);
+        expect(credentialBufferFinding(bytes)).toBeNull();
+        expect(credentialContentFinding(path,bytes)).toBeNull();
+        expect(manifestEntry(path,bytes,false,true)).toMatchObject({tracked:true});
+      }
+  });
+  it('fails closed when overlapping recovery candidates exhaust the scan budget',()=>{
+    for(const bytes of [jwkRecoveryNoise(64*1024),jwkRecoverySuffix(64*1024)]) {
+      expect(credentialBufferFinding(bytes)).toBe(FINDING);
+      expect(credentialContentFinding(path,bytes)).toBe(FINDING);
+      for(const tracked of [false,true])
+        expect(()=>manifestEntry(path,bytes,false,tracked)).toThrow(expect.objectContaining({
+          code:'excluded-source-file',message:expect.stringContaining(FINDING),
+        }));
     }
   });
 });
@@ -436,12 +485,16 @@ describe('forge-key-structure: RSA length and static JWK regressions',()=>{
   });
 });
 
-describe('forge-key-structure: known Layer A signature gaps outside the supported inventory',()=>{
-  it.each(['brainpoolP320r1','brainpoolP512r1'])('does not yet recognize PKCS#8 EC %s',curve=>{
+describe('forge-key-structure: PKCS#8 curves outside the fixed signature inventory',()=>{
+  it.each(['brainpoolP320r1','brainpoolP512r1'])('structurally recognizes PKCS#8 EC %s',curve=>{
     // These curves have different AlgorithmIdentifier lengths AND scalar sizes from P-256/P-384/P-521.
     const bytes=priv('ec',{namedCurve:curve},{type:'pkcs8'});
-    expect(credentialBufferFinding(bytes)).toBeNull();
-    expect(credentialBufferFinding(Buffer.from(bytes.toString('base64')))).toBeNull();
+    for(const content of [bytes,Buffer.from(bytes.toString('base64'))]) {
+      expect(credentialBufferFinding(content)).toBe(FINDING);
+      expect(credentialContentFinding(Buffer.from('docs/notes.md'),content)).toBe(FINDING);
+      expect(()=>manifestEntry(Buffer.from('docs/notes.md'),content,false,true))
+        .toThrow(expect.objectContaining({code:'excluded-source-file'}));
+    }
   });
 });
 
@@ -513,6 +566,8 @@ describe('forge-key-structure: non-allowlistable blocking and local routing',()=
     ['escaped base64',Buffer.from([...ed.toString('base64')].map(char=>'\\u'+char.charCodeAt(0).toString(16).padStart(4,'0')).join(''))],
     ...rsaVariants.map(({modulusLength,bytes})=>['RSA '+modulusLength,Buffer.from(bytes.toString('base64'))]),
     ...Object.entries(staticJwkVariants).map(([name,text])=>[name,Buffer.from('const value = '+text+';')]),
+    ['odd quote before JWK',Buffer.from('"'+JSON.stringify(staticJwk))],
+    ['JWK recovery budget exhausted',jwkRecoveryNoise(1024)],
     // Legacy content rules remain scoped to credential-named manifest paths. A legacy finding
     // beside a structured key must not mask the structure-only scan on an ordinary path.
     ...blocking.map(([finding,text])=>[finding+' beside structure',Buffer.from(text+'\n'+ed.toString('base64'))]),
@@ -538,7 +593,8 @@ describe('forge-key-structure: non-allowlistable blocking and local routing',()=
         for(const name of ['docs/notes.md','src/material.mjs','assets/material.bin'])
           expect(()=>manifestEntry(Buffer.from(name),content,false,tracked)).toThrow(expect.objectContaining({code:'excluded-source-file'}));
       });
-    for(const [label,content] of [ordinaryMaterial[1],...escapedRsaMaterial,...ordinaryMaterial.filter(([name])=>name==='RSA 1536'||name==='computed double quotes'||name==='backtick values')])
+    for(const [label,content] of [ordinaryMaterial[1],...escapedRsaMaterial,...ordinaryMaterial.filter(([name])=>
+      ['RSA 1536','computed double quotes','backtick values','odd quote before JWK','JWK recovery budget exhausted'].includes(name))])
       it(`ordinary ${label} selects local fallback with tracked=${tracked} before transport`,async()=>{
         const f=dispatchFixture(content,{name:'docs/material.mjs',tracked});
         try {
@@ -756,7 +812,7 @@ describe('forge-key-structure: perf and tracked files',()=>{
       Buffer.from('`'+'\\`'.repeat(size/2-4)+'{kty}\\'),
       Buffer.from('[`kty`]:`RSA`,'.repeat(Math.floor(size/13))),
       Buffer.alloc(size,Buffer.from([2,1,0,2,0x84,0xff,0xff,0xff,0xff])),
-      Buffer.alloc(size,0x30),Buffer.alloc(size,Buffer.from([0x30,3,2,1,0]))];
+      Buffer.alloc(size,0x30),Buffer.alloc(size,Buffer.from([0x30,3,2,1,0])),jwkRecoveryNoise(size),jwkRecoverySuffix(size)];
     for(const [name,scan] of [['buffer',credentialBufferFinding],
       ['content',bytes=>credentialContentFinding(Buffer.from('credentials.md'),bytes)]])
       for(const [index,blob] of blobs.entries()) {
