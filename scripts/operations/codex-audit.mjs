@@ -161,13 +161,15 @@ export async function main(argv, deps) {
     const followUps = scoped ? cleaned.filter(line => line.startsWith('FOLLOW-UP:')).map(line => line.slice('FOLLOW-UP:'.length).trim()) : [];
     const findings = scoped ? cleaned.filter(line => !line.startsWith('FOLLOW-UP:')) : cleaned;
     const scopeFields = scoped ? { followUps } : {};
+    // Scoped evidence is labelled and bound to the exact invariants text, so a scoped pass is never mistaken for an open one.
+    const scopeBinding = scoped ? { scope: 'invariants', invariantsHash: createHash('sha256').update(invariants).digest('hex') } : {};
     const result = { verdict, base, head, questionHash: QUESTION_HASH, findings, ...scopeFields };
     // R503: store the head's net-diff fingerprint so the audit carries across a rebase/merge-of-main; unreadable = omitted.
     let fingerprint = null;
     try { fingerprint = (await deps.fingerprint?.(base, head)) || null; } catch { fingerprint = null; }
     try {
       await deps.appendRecord({ at: deps.now(), base, head, baseRef: flags.base,
-        questionHash: QUESTION_HASH, verdict, findings, ...scopeFields, ...(fingerprint ? { fingerprint } : {}) });
+        questionHash: QUESTION_HASH, verdict, findings, ...scopeFields, ...scopeBinding, ...(fingerprint ? { fingerprint } : {}) });
     } catch {
       deps.stderr('Audit record write failed; repair the record path and retry.\n');
       return 3;

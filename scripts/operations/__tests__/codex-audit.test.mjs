@@ -67,7 +67,7 @@ describe('R968 invariant-scoped audit', () => {
     expect(prompt).toContain(invariant);
     expect(prompt).toContain('Answer WEAKENED only if the diff breaks a listed invariant');
     expect(prompt).toContain('FIRST line must still be exactly NOT WEAKENED or WEAKENED');
-    expect(f.records[0]).toMatchObject({ verdict: 'WEAKENED', findings: ['guard.mjs:1 accepts unknown evidence'], followUps: [] });
+    expect(f.records[0]).toMatchObject({ verdict: 'WEAKENED', findings: ['guard.mjs:1 accepts unknown evidence'], followUps: [], scope: 'invariants', invariantsHash: expect.stringMatching(/^[a-f0-9]{64}$/) });
     expect(f.output.join('')).toBe('WEAKENED\nguard.mjs:1 accepts unknown evidence\n');
   });
 
@@ -100,6 +100,7 @@ describe('R968 invariant-scoped audit', () => {
     expect(f.deps.runCodex).toHaveBeenCalledWith(openPrompt);
     expect(f.output).toEqual(['NOT WEAKENED\n']);
     expect(f.records[0]).not.toHaveProperty('followUps');
+    expect(f.records[0]).not.toHaveProperty('scope');
     expect(f.errors).toHaveLength(1);
     expect(f.errors[0]).toBe('Audit invariants mode requires an invariants file; using open review.\n');
     expect(f.deps.readInvariantsFile).not.toHaveBeenCalled();
