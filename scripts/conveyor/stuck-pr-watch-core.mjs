@@ -128,23 +128,23 @@ export function stuckThresholdMinutes(env = process.env, { readSettings: read = 
       configured = settings.stuckPrWatch.thresholdMinutes;
     }
   }
-  const out = {};
+  const out = { ...DEFAULT_STUCK_THRESHOLD_MINUTES };
   for (const stage of Object.values(STUCK_STAGES)) {
-    const raw = String(env?.[STUCK_THRESHOLD_ENV[stage]] ?? '').trim();
-    if (!raw) {
-      const value = configured?.[stage];
-      if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
-        out[stage] = value;
-      } else {
-        out[stage] = DEFAULT_STUCK_THRESHOLD_MINUTES[stage];
-        if (value !== undefined) {
-          throw new TypeError(`stuckPrWatch.thresholdMinutes.${stage} must be a positive finite number, got ${typeof value === 'number' ? value : JSON.stringify(value)}`);
-        }
+    if (configured && Object.hasOwn(configured, stage)) {
+      const value = configured[stage];
+      if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+        throw new TypeError(`stuckPrWatch.thresholdMinutes.${stage} must be a positive finite number, got ${typeof value === 'number' ? value : JSON.stringify(value)}`);
       }
-      continue;
+      out[stage] = value;
     }
+  }
+  for (const stage of Object.values(STUCK_STAGES)) {
+    const override = env?.[STUCK_THRESHOLD_ENV[stage]];
+    if (override === undefined) continue;
+    const raw = typeof override === 'string' ? override.trim() : override;
+    if (raw === '') continue;
     const n = Number(raw);
-    if (!Number.isFinite(n) || n <= 0) {
+    if (typeof raw !== 'string' || !/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(raw) || !Number.isFinite(n) || n <= 0) {
       throw new TypeError(`${STUCK_THRESHOLD_ENV[stage]} must be a positive number of minutes, got ${JSON.stringify(raw)}`);
     }
     out[stage] = n;

@@ -1,5 +1,5 @@
 {
-  "$comment": "Stuck PR stage thresholds in minutes. Precedence: stage env override > this file > built-in default. Invalid settings fall back to the built-in stage threshold with a diagnostic.",
+  "$comment": "Stuck PR stage thresholds in minutes. Precedence: stage env override > this file > built-in default. Invalid values throw a TypeError naming the setting, even when an env override is set.",
   "stuckPrWatch": {
     "thresholdMinutes": {
       "review": 45,

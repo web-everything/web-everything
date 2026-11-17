@@ -88,7 +88,7 @@ describe('stuckThresholdMinutes', () => {
     })).toEqual({ review: 9, fix: 13, approved: 14, conflict: 15 });
   });
 
-  it.each([0, -1, NaN, Infinity, -Infinity, '20', null, false, {}, []])(
+  it.each([0, -1, NaN, Infinity, -Infinity, '20', null, false, true, {}, [], undefined])(
     'invalid settings value %j throws a TypeError naming the stage and bad value', value => {
       const log = vi.fn();
       expect(() => stuckThresholdMinutes({}, { readSettings: settings({ review: value, fix: 17 }), log }))
@@ -97,13 +97,18 @@ describe('stuckThresholdMinutes', () => {
     },
   );
 
-  it.each(Object.values(STUCK_STAGES))('env override wins over a bad %s settings value without reading it', stage => {
-    const get = vi.fn(() => 'invalid');
-    const configured = Object.defineProperty({}, stage, { get });
-    expect(stuckThresholdMinutes({ [STUCK_THRESHOLD_ENV[stage]]: '9' }, {
-      readSettings: settings(configured),
-    })).toEqual({ ...defaults, [stage]: 9 });
-    expect(get).not.toHaveBeenCalled();
+  describe.each(Object.values(STUCK_STAGES))('%s settings validation with an env override', stage => {
+    it.each([0, -1, NaN, Infinity, -Infinity, '20', null, false, true, {}, [], undefined])(
+      'invalid file value %j still throws a TypeError naming the stage', value => {
+        expect(() => stuckThresholdMinutes({ [STUCK_THRESHOLD_ENV[stage]]: '9' }, {
+          readSettings: settings({ [stage]: value }),
+        })).toThrow(new TypeError(`stuckPrWatch.thresholdMinutes.${stage} must be a positive finite number, got ${typeof value === 'number' ? value : JSON.stringify(value)}`));
+      },
+    );
+  });
+
+  it('ignores unknown settings stage keys', () => {
+    expect(stuckThresholdMinutes({}, { readSettings: settings({ extra: null }) })).toEqual(defaults);
   });
 
   it('missing settings use defaults; malformed JSON logs its file error and uses defaults through the real reader', () => {
@@ -117,7 +122,7 @@ describe('stuckThresholdMinutes', () => {
       const error = read().errors[0].error;
       expect(stuckThresholdMinutes({}, { readSettings: read, log })).toEqual(defaults);
       expect(log).toHaveBeenCalledTimes(1);
-    expect(log).toHaveBeenCalledWith(`[stuck-pr-watch:settings-file-invalid] settings/stuck-pr-watch.json: ${error}`);
+      expect(log).toHaveBeenCalledWith(`[stuck-pr-watch:settings-file-invalid] settings/stuck-pr-watch.json: ${error}`);
       writeFileSync(join(dir, 'stuck-pr-watch.json'), JSON.stringify({ stuckPrWatch: { thresholdMinutes: { fix: 19 } } }));
       expect(stuckThresholdMinutes({}, { readSettings: read })).toEqual({ ...defaults, fix: 19 });
     } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -154,13 +159,25 @@ describe('stuckThresholdMinutes', () => {
     expect(log).toHaveBeenCalledWith('[stuck-pr-watch:settings-read-failed] using built-in threshold defaults');
   });
 
-  it.each(['0', '-5', 'soon', 'Infinity', '-Infinity', 'NaN'])(
+  it.each(['0', '-5', 'soon', 'Infinity', '-Infinity', 'NaN', '0x10', '1e999', '5abc', '1e2', false, true, null, [], {}, 5, NaN, Infinity])(
     'invalid env %s still throws the same TypeError even with valid settings', raw => {
       expect(() => stuckThresholdMinutes({ WE_STUCK_PR_FIX_THRESHOLD_MINUTES: raw }, {
         readSettings: settings({ fix: 20 }),
       })).toThrow(new TypeError(`WE_STUCK_PR_FIX_THRESHOLD_MINUTES must be a positive number of minutes, got ${JSON.stringify(raw)}`));
     },
   );
+
+  it.each(['', '   ', '\t\n'])('empty-after-trim env %j is unset', raw => {
+    expect(stuckThresholdMinutes({ WE_STUCK_PR_FIX_THRESHOLD_MINUTES: raw }, {
+      readSettings: settings({ fix: 20 }),
+    })).toEqual({ ...defaults, fix: 20 });
+  });
+
+  it.each([' 2.5 ', '.5', '5.'])('accepts trimmed positive decimal env %j', raw => {
+    expect(stuckThresholdMinutes({ WE_STUCK_PR_FIX_THRESHOLD_MINUTES: raw }, {
+      readSettings: settings({ fix: 20 }),
+    })).toEqual({ ...defaults, fix: Number(raw) });
+  });
 
   it('each stage is overridable by its own env var', () => {
     const env = {
