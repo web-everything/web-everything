@@ -70,25 +70,32 @@ const isPlaceholder = token => PLACEHOLDERS.has(token);
 // Generic execution accounts (container root, CI and image defaults) are not private identities, so
 // the local account adds no pattern; committed identity digests still apply under them.
 const GENERIC_ACCOUNTS = new Set(['root', 'admin', 'administrator', 'nobody', 'daemon', 'www-data', 'node',
-  'ubuntu', 'debian', 'ec2-user', 'vscode', 'codespace', 'gitpod', 'runner', 'jenkins', 'circleci',
-  'buildkite-agent', 'gitlab-runner', 'travis', 'docker', 'ci', 'build', 'builder', 'app', 'guest', 'default']);
-const isGenericAccount = name => GENERIC_ACCOUNTS.has(name.toLowerCase());
+  'ubuntu', 'debian', 'centos', 'fedora', 'alpine', 'ec2-user', 'azureuser', 'cloud-user', 'opc', 'bitnami',
+  'vscode', 'codespace', 'gitpod', 'coder', 'vagrant', 'pi', 'dev', 'jovyan', 'git', 'postgres',
+  'runner', 'runneradmin', 'vssadministrator', 'jenkins', 'circleci', 'buildkite-agent', 'gitlab-runner',
+  'travis', 'docker', 'ci', 'build', 'builder', 'app', 'guest', 'default']);
+// Case-folded like Windows account names; a bare numeric uid names no person.
+const isGenericAccount = name => isPlaceholder(name) || isPlaceholder(name.toLowerCase())
+  || GENERIC_ACCOUNTS.has(name.toLowerCase()) || /^\d+$/.test(name);
 // R972: Windows separators count too; a backslash that starts a JSON-escaped separator is left to the decoded view.
 const BACKSLASH = String.raw`\\(?!/|u00(?:2[fF]|5[cC]))`;
 const SEP = `(?:/|${BACKSLASH})+`;
-const HOME_TOKEN = String.raw`(<[^>]+>|\$\{[^}]+\}|[^/\\\s"'\x60<>()\[\]{},;:!?]+)`;
-// Windows folds case: after a drive, admin share, MSYS/WSL drive or a backslash, any-case "users" is a home.
-// A bare forward-slash "/users/" stays case-sensitive so web routes are not home paths.
+// A home token never starts with "%": %USERNAME% is a variable, and percent-encoded names are decoded in another view.
+const HOME_TOKEN = String.raw`(<[^>]+>|\$\{[^}]+\}|[^/\\\s"'\x60<>()\[\]{},;:!?%][^/\\\s"'\x60<>()\[\]{},;:!?]*)`;
+// Windows folds case: after a drive, admin share, WSL drive or a backslash, any-case "users" is a home.
+// A forward-slash "/users/" without a drive stays case-sensitive so web routes are not home paths.
 const USERS_ANY_CASE = '[Uu][Ss][Ee][Rr][Ss]';
-const WINDOWS_ROOT = String.raw`(?<=\b[A-Za-z]:|\b[A-Za-z]\$|(?<![\w.-])/[A-Za-z]|/mnt/[A-Za-z])`;
+const WINDOWS_ROOT = String.raw`(?<=\b[A-Za-z]:|\b[A-Za-z]\$|/mnt/[A-Za-z])`;
+// Each alternative starts at most once per separator run (lookbehind or single separator), keeping scans linear.
+const HOME_PATH_SOURCE = `(?<![/\\\\])${SEP}(?:Users|home|Documents and Settings)${SEP}${HOME_TOKEN}`
+  + `|${WINDOWS_ROOT}${SEP}${USERS_ANY_CASE}${SEP}${HOME_TOKEN}|${BACKSLASH}${USERS_ANY_CASE}${SEP}${HOME_TOKEN}`;
 const SERVICE_PLACEHOLDERS = new Set(['example.workers.dev', 'your-worker.workers.dev']);
 const NETWORK_PLACEHOLDERS = new Set(['example.ts.net']);
 export const PATTERNS = Object.freeze([
   { id: 'uninspectable-compressed', source: null, flags: '' },
   { id: 'machine-name', source: String.raw`\b(?:Mac ?Studio|Studio host|MacBook|Mac mini)`, flags: 'gi' },
   { id: 'host-spec', source: String.raw`\b\d+[- ]cores?\b[\s\S]{0,32}?\b\d+(?:\.\d+)?\s*Gi?B\b|\b\d+(?:\.\d+)?\s*Gi?B\b[\s\S]{0,32}?\b\d+[- ]cores?\b|\bM[1-9]\d*(?:\s+(?:Max|Pro|Ultra))?\b[\s\S]{0,24}?\b\d+(?:\.\d+)?\s*Gi?B\b|\b\d+(?:\.\d+)?\s*Gi?B\b[\s\S]{0,24}?\bM[1-9]\d*(?:\s+(?:Max|Pro|Ultra))?\b`, flags: 'gi' },
-  { id: 'home-path', source: `${SEP}(?:Users|home)${SEP}${HOME_TOKEN}|${WINDOWS_ROOT}${SEP}${USERS_ANY_CASE}${SEP}${HOME_TOKEN}`
-    + `|${BACKSLASH}${USERS_ANY_CASE}${SEP}${HOME_TOKEN}`, flags: 'g' },
+  { id: 'home-path', source: HOME_PATH_SOURCE, flags: 'g' },
   // Committed identity digests and optional local identity; never store the actual identity here.
   { id: 'operator-username', source: null, flags: 'gi' },
   { id: 'private-service-url', source: String.raw`\b([a-z0-9][a-z0-9.-]*)\.workers\.dev\b`, flags: 'gi' },
@@ -240,7 +247,7 @@ function scanPrivacyView(text, { path = '', allowlist = { entries: [], operatorU
   };
   for (const pattern of PATTERNS) {
     const source = pattern.id === 'operator-username'
-      ? (operatorUsername && !isPlaceholder(operatorUsername) && !isGenericAccount(operatorUsername)
+      ? (operatorUsername && !isGenericAccount(operatorUsername)
         ? String.raw`(?<![\w-])${operatorUsername.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\w-])` : null)
       : pattern.source;
     if (!source) continue;
@@ -258,9 +265,10 @@ function scanPrivacyView(text, { path = '', allowlist = { entries: [], operatorU
   // R972: portable identity detection on CI and other reviewers' machines. Hash both complete
   // home-directory tokens and identifiers split on non-alphanumerics; normalize case before hashing.
   const identities = new Set(allowlist.operatorUsernameSha256);
-  for (const source of [new RegExp(`${SEP}(?:${USERS_ANY_CASE}|home)${SEP}([^/\\\\\\s"'\`<>]+)`, 'g'), /[a-z0-9]+(?:[._-][a-z0-9]+)*/gi]) {
+  // The same home-path definition as the pattern above, so both scans agree on what a home token is.
+  for (const source of [new RegExp(HOME_PATH_SOURCE, 'g'), /[a-z0-9]+(?:[._-][a-z0-9]+)*/gi]) {
     for (const candidate of text.matchAll(source)) {
-      const token = candidate[1] ?? candidate[0];
+      const token = candidate[1] ?? candidate[2] ?? candidate[3] ?? candidate[0];
       const index = candidate.index + candidate[0].length - token.length;
       const parts = [...token.matchAll(/[a-z0-9]+/gi)];
       const forms = new Set([token, ...['', '.', '-', '_'].map(separator => parts.map(part => part[0]).join(separator))]);

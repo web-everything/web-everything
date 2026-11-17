@@ -393,13 +393,23 @@ describe('R972 Windows home paths', () => {
     for (const text of [win('\\\\', 'C:', 'Users', 'alice', 'project'), win('\\', 'c:', 'users', 'alice', 'project'),
       'C:/Users' + win('\\', '', 'alice', 'project'), win('\\', '', '', 'host', 'c$', 'Users', 'alice'),
       win('\\', '', '', 'host', 'c$', 'users', 'alice'), win('&bsol;', 'C:', 'Users', 'alice'),
-      win('/', '', 'c', 'users', 'alice'), win('/', '', 'mnt', 'c', 'users', 'alice'), win('\\', 'D:', 'USERS', 'alice')]) {
+      win('/', '', 'c', 'Users', 'alice'), win('/', '', 'mnt', 'c', 'users', 'alice'), win('\\', 'D:', 'USERS', 'alice'),
+      win('\\', 'C:', 'Documents and Settings', 'alice'), win('/', 'C:', 'Documents and Settings', 'alice')]) {
       expect(homePaths(text).some(match => match.endsWith('alice'))).toBe(true);
     }
   });
-  it('keeps a bare lowercase web route out of the home-path category', () => {
-    for (const text of [win('/', 'https:', '', 'api.github.com', 'users', 'octocat'), win('/', '', 'api', 'users', 'octocat')]) {
+  it('keeps lowercase web routes and Windows environment variables out of the home-path category', () => {
+    for (const text of [win('/', 'https:', '', 'api.github.com', 'users', 'octocat'), win('/', '', 'api', 'users', 'octocat'),
+      win('/', '', 'v', 'users', 'me'), win('\\', 'C:', 'Users', '%USERNAME%', 'AppData'), win('\\', 'C:', 'Users', '%username%')]) {
       expect(homePaths(text)).toEqual([]);
+    }
+  });
+  it('stays linear on long separator runs', () => {
+    for (const text of ['/'.repeat(40000), '\\'.repeat(20000), '// ' + '/'.repeat(20000), 'C:' + '\\'.repeat(20000),
+      '/Users' + '/'.repeat(20000)]) {
+      const started = performance.now();
+      scanText(text);
+      expect(performance.now() - started).toBeLessThan(1500);
     }
   });
   it('exempts complete template tokens behind Windows separators', () => {
@@ -480,7 +490,8 @@ describe('R972 tier-three patterns', () => {
     expect(scanText('example', { operatorUsername: 'example' })).toEqual([]);
   });
   // A generic execution account (container root, CI images) is not a private identity.
-  it.each(['root', 'Root', 'admin', 'administrator', 'node', 'ubuntu', 'vscode', 'codespace', 'jenkins', 'nobody'])(
+  it.each(['root', 'Root', 'admin', 'administrator', 'node', 'ubuntu', 'vscode', 'codespace', 'jenkins', 'nobody',
+    'User', 'runneradmin', 'VssAdministrator', 'azureuser', 'vagrant', 'pi', 'dev', 'jovyan', 'coder', 'git', '1000'])(
     'never turns the generic execution account %s into an operator-username pattern', account => {
       expect(scanText(`const ${account.toLowerCase()} = document.documentElement;`, { operatorUsername: account })).toEqual([]);
     });
