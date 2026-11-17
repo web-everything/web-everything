@@ -1,7 +1,7 @@
 /** Cap-only shared-reader subset: human card records, author/wrapper and head/result binding. */
 import { describe, expect, it } from 'vitest';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
-import { CONFIRMED_BREAKS_DEFAULTS, FINDING_FINGERPRINT_FIELDS, findingFingerprint, summaryCanonical, operatorRulingsOnLiveResult, resolveOperatorRulings, readOperatorRulings, gateRoundGrants, liveResultGateState, readRedTeamDisposition, redTeamGateMarker } from '../red-team-gate.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, FINDING_FINGERPRINT_FIELDS, findingFingerprint, summaryCanonical, operatorRulingsOnLiveResult, resolveOperatorRulings, readOperatorRulings, gateRoundGrants, liveResultGateState, parseRedTeamComment, readRedTeamDisposition, redTeamGateMarker } from '../red-team-gate.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
 import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
@@ -795,8 +795,9 @@ describe('summary canonicalization strips only whitespace and line-location toke
     ['third numeric segment', '10:20:30', '10:20:40'],
     ['line change before excess segments', '10:20:30', '11:20:30'],
     ['column change before excess segments', '10:20:30', '10:21:30'],
-    ['additional numeric segment', '10:20:30', '10:20:30:40'],
-    ['many numeric segments', `10:20:${'30:'.repeat(30)}40`, `10:20:${'30:'.repeat(30)}41`],
+    // Five-digit segments keep these malformed locations outside the renderer's IPv6 secret scrub.
+    ['additional numeric segment', '10:20:30', '10:20:30:40000'],
+    ['many numeric segments', `10:20:${'30000:'.repeat(30)}40`, `10:20:${'30000:'.repeat(30)}41`],
     ['long colon sequence', '10:20:1.2', '10:20:3.2'],
     ['malformed column', '1:2x', '3:2x'],
     ['trailing colon', '1:', '3:'],
@@ -809,7 +810,12 @@ describe('summary canonicalization strips only whitespace and line-location toke
     ['Unicode suffix', '1\uff0e2', '3\uff0e2'],
     ['invisible suffix', '1\u200b.2', '3\u200b.2'],
   ];
-  it.each(partialLocations)('preserves the whole path token with a %s', (_name, before, after) => {
+  it.each([
+    ...partialLocations,
+    // Keep the original IPv6-like tokens covered directly, before the publication seam scrubs them.
+    ['IPv6-like additional numeric segment', '10:20:30', '10:20:30:40'],
+    ['IPv6-like many numeric segments', `10:20:${'30:'.repeat(30)}40`, `10:20:${'30:'.repeat(30)}41`],
+  ])('preserves the whole path token with a %s', (_name, before, after) => {
     for (const path of ['scripts/x.mjs', 'x.mjs', '../scripts/x.mjs']) {
       for (const quote of ['', "'", '"', '`', '\u201d']) {
         const a = `Rejects ${quote}${path}:${before}${quote} input`;
@@ -830,6 +836,9 @@ describe('summary canonicalization strips only whitespace and line-location toke
       findings: [{ ...F(159, 'broken'), file: 'scripts/x.mjs', summary: `Rejects 'scripts/x.mjs:${token}' input` }] }), at);
     const source = fresh(H, before, result.created_at);
     const next = fresh(N, after, '2026-10-21T21:00:00Z');
+    // Prove this exercises the literal summaries, rather than identical scrubbed or clipped placeholders.
+    expect(parseRedTeamComment(source.body).findings[0].summary).toBe(`Rejects 'scripts/x.mjs:${before}' input`);
+    expect(parseRedTeamComment(next.body).findings[0].summary).toBe(`Rejects 'scripts/x.mjs:${after}' input`);
     const id = liveResultGateState([source], P, H).resultId;
     const comments = [source, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z', id), next];
     const d = readRedTeamDisposition({ comments, pr: P, head: N, setting: CONFIRMED_BREAKS_DEFAULTS,
