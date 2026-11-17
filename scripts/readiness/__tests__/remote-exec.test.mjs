@@ -3,8 +3,14 @@ import {gitArgs,bindingEvidence} from './fixtures/forge-bound-git.mjs';
 /** @file Contract and execution tests for the Forge remote runner. */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { constants, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, symlinkSync, statSync, readdirSync, renameSync, cpSync, chmodSync, utimesSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join, relative } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
+import { runInNewContext } from 'node:vm';
+import standardsSource from '../../check-standards.mjs?raw';
+import { SKIP_REASON, createSectionGate } from '../../lib/standards-sections.mjs';
+import { importClosure } from '../../lib/standards-cache.mjs';
 import { createHash } from 'node:crypto';
 import * as filesystem from 'node:fs/promises';
 import {
@@ -746,12 +752,14 @@ describe('standards input parity', () => {
       policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always'}}}),
       remoteExec:async () => {
         const result = await runRemote(f);
-        expect(result).toEqual({mode:'cancelled',terminated:true,code:1,reason:'incomplete-standards-inputs'});
+        expect(result).toEqual({mode:'cancelled',terminated:true,code:1,reason:'incomplete-standards-inputs',detail:outcome});
         expect(callsOf(f.exec).filter(isReceipt)).toHaveLength(1);
         return result;
       },
     })).toEqual({handled:false});
     expect(log).toHaveBeenCalledWith(expect.stringContaining('falling back to local admission'));
+    const rows = readFileSync(join(f.lockRoot,'remote-fallbacks.jsonl'),'utf8').trim().split('\n').map(line=>JSON.parse(line));
+    expect(rows).toContainEqual(expect.objectContaining({kind:'standards',reason:'incomplete-standards-inputs',detail:outcome}));
   });
 
   it.each(['skipping', 'no-scope', 'ENOENT'])('refuses captured standards %s on stderr after bounded streaming history', async outcome => {
@@ -760,12 +768,162 @@ describe('standards input parity', () => {
     f.exec = vi.fn(async call => {
       const result = await original(call);
       if (isRun(call)) {
-        call.onOutput?.('x'.repeat(4*1024*1024),'stdout');
+        call.onOutput?.('valid output\n'.repeat(320000),'stdout');
         return {...result,stderr:outcome};
       }
       return result;
     });
-    expect(await runRemote(f)).toEqual({mode:'cancelled',terminated:true,code:1,reason:'incomplete-standards-inputs'});
+    expect(await runRemote(f)).toEqual({mode:'cancelled',terminated:true,code:1,reason:'incomplete-standards-inputs',detail:outcome});
+  });
+
+  function scopedStandardsFixture(files = 'a.test.mjs') {
+    const f = fixture();
+    f.argv = ['npm','run','check:standards','--','--local',`--files=${files}`];
+    // Resolve the real section implementations in this fixture's repository root.
+    const sourceRoot = fileURLToPath(new URL('../../../', import.meta.url));
+    for (const entry of ['verdict-totality.mjs', 'jury-core.mjs', 'mandate-fence-scan.mjs']) {
+      for (const path of importClosure(join(sourceRoot, 'scripts/lib', entry)).keys()) {
+        const target = join(cwd, relative(sourceRoot, path));
+        mkdirSync(dirname(target), {recursive:true});
+        cpSync(path, target);
+      }
+    }
+    return f;
+  }
+
+  it.each(['stdout','stderr','both'])('keeps the locally verified real scoped skip marker remote on %s across chunk boundaries', async stream => {
+    const f=scopedStandardsFixture(),original=f.exec;
+    const gate=createSectionGate({scoped:true,touched:['a.test.mjs'],root:cwd});
+    expect(gate.shouldRun('14')).toBe(false);
+    expect(gate.shouldRun('19')).toBe(false);
+    const line='\x1b[36m  local\x1b[0m \x1b[2mskipped (scoped: no input touched): 14, 19\x1b[0m\n';
+    f.exec=vi.fn(async call=>{
+      const result=await original(call);
+      if(isRun(call)) {
+        for(const source of stream==='both'?['stdout','stderr']:[stream]) {
+          for(const char of line)call.onOutput(char,source);
+        }
+        return {...result,stdout:stream==='stderr'?'':line,stderr:stream==='stdout'?'':line};
+      }
+      return result;
+    });
+    expect(await runRemote(f)).toMatchObject({mode:'remote',code:0});
+    expect(callsOf(f.exec).filter(isReceipt)).toHaveLength(1);
+  });
+
+  it.each([
+    ['no scope', []],
+    ['local only', ['--local']],
+    ['files only', ['--files=a.test.mjs']],
+    ['separator-only files', ['--local','--files= ,  , ']],
+  ])('falls back for a scoped skip with %s argv', async (_name, args) => {
+    const f=fixture(),original=f.exec;
+    f.argv=['npm','run','check:standards',...(args.length ? ['--',...args] : [])];
+    const line='\x1b[36m  local\x1b[0m \x1b[2mskipped (scoped: no input touched): 14, 19\x1b[0m';
+    f.exec=vi.fn(async call=>({...await original(call),...(isRun(call)?{stdout:line}: {})}));
+    expect(await runRemote(f)).toMatchObject({mode:'cancelled',terminated:true,reason:'incomplete-standards-inputs',detail:line});
+  });
+
+  it.each(['scripts/readiness/remote-exec.mjs', 'a.test.mjs, scripts/readiness/remote-exec.mjs'])
+  ('falls back when argv files contradict the scoped skip: %s', async files => {
+    const f=scopedStandardsFixture(files),original=f.exec;
+    const gate=createSectionGate({scoped:true,touched:files.split(/[\s,]+/),root:cwd});
+    expect(gate.shouldRun('14')).toBe(true);
+    const line='\x1b[36m  local\x1b[0m \x1b[2mskipped (scoped: no input touched): 14, 19\x1b[0m';
+    f.exec=vi.fn(async call=>({...await original(call),...(isRun(call)?{stdout:line}: {})}));
+    expect(await runRemote(f)).toMatchObject({mode:'cancelled',terminated:true,reason:'incomplete-standards-inputs',detail:line});
+  });
+
+  it.each(['stdout','stderr','both'])('falls back for a dynamic section skip despite static local agreement on %s', async stream => {
+    const f=scopedStandardsFixture('scripts/backlog/frontmatter.mjs'),original=f.exec;
+    const sourceRoot=fileURLToPath(new URL('../../../',import.meta.url));
+    for(const path of importClosure(join(sourceRoot,'scripts/lib/validate-rules-anchors.cjs')).keys()) {
+      const target=join(cwd,relative(sourceRoot,path));
+      mkdirSync(dirname(target),{recursive:true});
+      cpSync(path,target);
+    }
+    const gate=createSectionGate({scoped:true,touched:['scripts/backlog/frontmatter.mjs'],root:cwd});
+    expect(gate.shouldRun('9a-rules')).toBe(false);
+    const line='\x1b[36m  local\x1b[0m \x1b[2mskipped (scoped: no input touched): 9a-rules\x1b[0m';
+    f.exec=vi.fn(async call=>{
+      const result=await original(call);
+      if(isRun(call))return {...result,stdout:stream==='stderr'?'':line,stderr:stream==='stdout'?'':line};
+      return result;
+    });
+    expect(await runRemote(f)).toEqual({mode:'cancelled',terminated:true,code:1,reason:'incomplete-standards-inputs',detail:line});
+  });
+
+  it('keeps a plain (uncoloured) real scoped skip line remote when the local gate agrees', async () => {
+    const f=scopedStandardsFixture(),original=f.exec;
+    const line=`  local ${SKIP_REASON}: 14, 19\n`;
+    f.exec=vi.fn(async call=>{
+      const result=await original(call);
+      if(isRun(call)){call.onOutput(line,'stdout');return {...result,stdout:line};}
+      return result;
+    });
+    expect(await runRemote(f)).toMatchObject({mode:'remote',code:0});
+  });
+
+  it('falls back for an unknown scoped skip section', async () => {
+    const f=scopedStandardsFixture(),original=f.exec;
+    const line=`local ${SKIP_REASON}: 14, unknown-section`;
+    f.exec=vi.fn(async call=>({...await original(call),...(isRun(call)?{stdout:line}: {})}));
+    expect(await runRemote(f)).toMatchObject({mode:'cancelled',terminated:true,reason:'incomplete-standards-inputs',detail:line});
+  });
+
+  it('falls back when local section inputs cannot be read', async () => {
+    const f=fixture(),original=f.exec;
+    f.argv=['npm','run','check:standards','--','--local','--files=a.test.mjs'];
+    const line=`local ${SKIP_REASON}: 14, 19`;
+    expect(createSectionGate({scoped:true,touched:['a.test.mjs'],root:cwd}).shouldRun('14')).toBe(true);
+    f.exec=vi.fn(async call=>({...await original(call),...(isRun(call)?{stdout:line}: {})}));
+    expect(await runRemote(f)).toMatchObject({mode:'cancelled',terminated:true,reason:'incomplete-standards-inputs',detail:line});
+  });
+
+  it.each(['stdout','stderr','both'])('falls back for the actual memory warning producer with a skipping checker on %s', async stream => {
+    const start=standardsSource.indexOf('// ── 9a″. Agent-memory index-tree shape');
+    const end=standardsSource.indexOf('// ── 9b. Module-resolution exports-lock',start);
+    expect(start).toBeGreaterThan(0);expect(end).toBeGreaterThan(start);
+    mkdirSync(join(cwd,'scripts'));
+    const skip='check:memory — no memory index at .claude/agent-memory/MEMORY.md (n/a); skipping.';
+    const stdout=stream==='stderr'?'Checking memory\n':skip+'\n';
+    const stderr=stream==='stdout'?'':skip+'\n';
+    writeFileSync(join(cwd,'scripts/check-memory.mjs'),
+      `process.stdout.write(${JSON.stringify(stdout)});process.stderr.write(${JSON.stringify(stderr)});`);
+    const warnings=[];
+    runInNewContext(standardsSource.slice(start,end),{ROOT:cwd,join,process,require:createRequire(import.meta.url),
+      warn:message=>warnings.push(message),err:message=>{throw new Error(message);},mark:()=>{}},{timeout:10000});
+    expect(warnings).toHaveLength(1);
+    const output=warnings.join('\n')+'\n';
+    const f=fixture(),original=f.exec;f.argv=['npm','run','check:standards'];
+    f.exec=vi.fn(async call=>{
+      const result=await original(call);
+      if(isRun(call))call.onOutput(output,'stdout');
+      return result;
+    });
+    expect(await runRemote(f)).toMatchObject({mode:'cancelled',terminated:true,reason:'incomplete-standards-inputs',
+      detail:output.trim().split('\n').find(line=>line.includes('skipping'))});
+  });
+
+  it.each(['ENOENT: missing input','no-scope','skipped: missing input','skipping unknown checker'])
+  ('does not let a benign scoped skip hide %s on the same line',async signal=>{
+    const f=scopedStandardsFixture(),original=f.exec;
+    const line=`local ${SKIP_REASON}: 14; ${signal}`;
+    f.exec=vi.fn(async call=>({...await original(call),...(isRun(call)?{stdout:line}: {})}));
+    expect(await runRemote(f)).toMatchObject({mode:'cancelled',terminated:true,reason:'incomplete-standards-inputs',detail:line});
+  });
+
+  it('reruns locally for an oversized standards line with bounded diagnostic detail',async()=>{
+    const f=fixture(),original=f.exec;f.argv=['npm','run','check:standards'];
+    f.exec=vi.fn(async call=>{
+      const result=await original(call);
+      if(isRun(call))call.onOutput('x'.repeat(4097),'stdout');
+      return result;
+    });
+    const result=await runRemote(f);
+    expect(result).toMatchObject({mode:'cancelled',terminated:true,reason:'incomplete-standards-inputs',
+      detail:expect.stringContaining('standards output line exceeds 4096 characters: ')});
+    expect(result.detail.length).toBeLessThanOrEqual(4096);
   });
 
   const ackReceipt = (_nonce, value) => JSON.stringify({v:1,nonce:value.nonce,run:value.run,cancelAck:true});
