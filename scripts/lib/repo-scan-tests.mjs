@@ -133,6 +133,7 @@ export const REPO_SCAN_TESTS = Object.freeze([
  * @type {Readonly<Record<string, string>>}
  */
 export const DEFERRED_SCAN_TESTS = Object.freeze({
+  'scripts/conveyor/__tests__/reconcile-pass-read-only.test.mjs': 'false positive: recursively snapshots only its mkdtemp cache fixture to assert zero writes, never the live repo; imports reconcile-pass.mjs, so vitest related already selects it when reconciliation changes',
   'scripts/readiness/__tests__/forge-cache-prune-running-record.test.mjs': 'false positive: its `snapshotBinding` readdir walk enumerates only the mkdtemp fixture tree it builds, never the live repo; a hermetic prune-record test, not a repo rule scanner',
   'scripts/__tests__/daemon-heavy-spawn-lint.test.mjs': 'repo scan: reads and TypeScript-parses every non-test .mjs under scripts/ (all subdirectories) plus skills-src/conveyor for unadmitted heavy child_process spawns; the lint helper is unit-tested hermetically and CI runs the full test',
   'scripts/readiness/__tests__/forge-r352-sample-secret-files.test.mjs': 'false positive: reads a fixed list of 14 named files plus a readdirSync of backlog/ only to locate four cards by number; not a repo-wide rule scanner',

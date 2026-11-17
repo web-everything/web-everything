@@ -3,9 +3,10 @@ bornAs: xyui2xf
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:scripts/conveyor/pending-launches.mjs", "we:scripts/conveyor/build-dispatch-failures.mjs", "we:skills-src/conveyor/__tests__/build-dispatch-non-blocking-launch.test.mjs", "we:scripts/conveyor/__tests__/pending-launches.test.mjs", "we:scripts/conveyor/__tests__/build-dispatch-failures.test.mjs"]
 dateOpened: "2026-10-17"
+dateResolved: "2026-11-16"
 tags: []
 ---
 

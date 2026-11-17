@@ -2,7 +2,7 @@
 bornAs: xo83x9i
 kind: epic
 parent: "3383"
-status: active
+status: open
 dateOpened: "2026-09-01"
 dateStarted: "2026-09-03"
 tags: []
