@@ -18,9 +18,6 @@ const MAX_CARD_ONLY_HEADS = 256;
 // Holds where the runner cannot start a review for this head at all (no job, no capacity spent). Such an entry is
 // still probed every tick, but it must not occupy one of the capacity-bound admissions.
 const NON_RUNNABLE_REASONS = new Set(['review-unfinished', 'planner-skip']);
-// At most this many probes ride along per repo per tick; attempts rotation (maxAttempts) moves a probe that stays
-// blocked to the tail, so every blocked entry is re-checked in turn.
-const MAX_PROBES = 2;
 const copy = entries => entries.map(entry => ({ ...entry }));
 const note = (log, message) => {
   try { log(`review-daemon: red-team queue ${message}`.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ')); }
@@ -163,12 +160,16 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
       const bound = typeof count === 'number' && !Number.isNaN(count) ? Math.max(0, Math.floor(count)) : 0;
       // Non-runnable heads ride along as probes (re-checked each tick, never starved) without using a slot.
       const mine = entries.filter(entry => entry.repo === repo);
-      // Zero admission (unreadable capacity, fail closed) admits no probe either.
-      const probes = new Set(mine.filter(entry => NON_RUNNABLE_REASONS.has(entry.blocked) && allowProbes && validCount).slice(0, MAX_PROBES).map(entry => entry.key));
+      // Disabled probes or an invalid count fail closed; a valid zero count still allows worker-free probes.
+      const probes = new Set(mine.filter(entry => NON_RUNNABLE_REASONS.has(entry.blocked) && allowProbes && validCount).map(entry => entry.key));
       const runnable = mine.filter(entry => !NON_RUNNABLE_REASONS.has(entry.blocked)).slice(0, bound);
       const keys = new Set(runnable.map(entry => entry.key));
       const admitted = mine.filter(entry => probes.has(entry.key) || keys.has(entry.key));
       for (const entry of mine) {
+        if (NON_RUNNABLE_REASONS.has(entry.blocked) && !probes.has(entry.key)) {
+          note(log, `hold ${entry.key}: probes disabled`);
+          continue;
+        }
         note(log, `${probes.has(entry.key) ? 'probe' : keys.has(entry.key) ? 'admit' : 'hold'} ${entry.key}: capacity ${bound}`);
       }
       return copy(admitted);
@@ -327,7 +328,8 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
     const admitted = queue.admit(repo, exhausted ? Infinity : bound, { allowProbes: readableCapacity(capacity) });
     const allowed = new Set(admitted.map(entry => entry.pr));
     const held = new Set(candidates.filter(candidate => !allowed.has(candidate.pr)).map(candidate => candidate.pr));
-    for (const pr of held) note(log, `hold ${repo}#${pr}: capacity; waiting for a later tick`);
+    const blocked = new Set(queue.entries().filter(entry => entry.repo === repo && NON_RUNNABLE_REASONS.has(entry.blocked)).map(entry => entry.pr));
+    for (const pr of held) note(log, `hold ${repo}#${pr}: ${blocked.has(pr) ? 'probes disabled' : 'capacity'}; waiting for a later tick`);
     // Bypassed card-only rows go last so queued code PRs claim the runner's capacity first.
     const kept = (plan?.refusals ?? []).filter(row => !held.has(Number(row.prNumber)));
     const refusals = [...kept.filter(row => !bypassed.has(Number(row.prNumber))), ...kept.filter(row => bypassed.has(Number(row.prNumber)))];

@@ -1026,7 +1026,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       expect(numbers(f.queue.admit(repo, 2))).toEqual([1, 2, 3]);
       expect(numbers(f.queue.admit(repo, 0))).toEqual([1]); // a probe uses no slot, so it still runs at zero admission
     });
-    it('bounds probes per tick and rotates a head that stays blocked to the tail after maxAttempts', async () => {
+    it('probes every blocked head and rotates heads that stay blocked to the tail after maxAttempts', async () => {
       const f = fixture();
       await f.queue.sync(repo, candidates([1, 2, 3, 4]));
       for (const pr of [1, 2, 3]) {
@@ -1035,15 +1035,62 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
           dispatched: [], notStarted: [1, 2, 3].map(n => ({ prNumber: n, reason: 'review-unfinished' })) });
         break;
       }
-      expect(numbers(f.queue.admit(repo, 1))).toEqual([1, 2, 4]); // 2 probes max, 1 runnable slot; #3 held
+      expect(numbers(f.queue.admit(repo, 1))).toEqual([1, 2, 3, 4]); // all probes plus 1 runnable slot
       for (let tick = 0; tick < 3; tick++) {
         const ids = numbers(f.queue.admit(repo, 1));
         const why = n => (n === 4 ? 'no review capacity left' : 'review-unfinished');
         await f.queue.settle(repo, { rows: ids.map(n => ({ prNumber: n, action: 'skip', why: why(n) })),
           dispatched: [], notStarted: ids.map(n => ({ prNumber: n, reason: why(n) })) });
       }
-      expect(numbers(f.queue.entries()).slice(-2)).toEqual([1, 2]); // rotated behind #3/#4
+      expect(numbers(f.queue.entries())).toEqual([4, 1, 2, 3]); // all blocked heads rotated behind #4
       expect(numbers(f.queue.entries())).toContain(3);
+    });
+    const persistedBlocked = (f, reason, runnable = []) => {
+      f.files.set(f.file, JSON.stringify(candidates([1, 2, 3, 4, 5, ...runnable]).map(c => ({
+        key: `${repo}#${c.pr}`, repo, pr: c.pr, head: c.head, enqueuedAt: 1, attempts: 0,
+        ...(c.pr <= 5 ? { blocked: reason } : {}),
+      }))));
+      return f.open();
+    };
+    it.each(['review-unfinished', 'planner-skip'])('probes and settles all five persisted %s entries with free capacity, without holds', reason => {
+      const f = fixture();
+      const queue = persistedBlocked(f, reason);
+      runWithRedTeamQueue({ queue, ...inputs([1, 2, 3, 4, 5], { capacity: capacity(4) }), log: f.log,
+        run: options => {
+          expect(options.plan.refusals.map(row => row.prNumber)).toEqual([1, 2, 3, 4, 5]);
+          return { rows: [1, 2, 3, 4, 5].map(prNumber => ({ prNumber, action: 'clear' })) };
+        } });
+      expect(f.logs.filter(line => line.startsWith(`${prefix}probe `))).toHaveLength(5);
+      expect(f.logs.filter(line => line.startsWith(`${prefix}hold `))).toEqual([]);
+      expect(queue.entries()).toEqual([]);
+    });
+    it('five probes use no runnable slots and only excess runnable entries log capacity holds', () => {
+      const f = fixture();
+      const queue = persistedBlocked(f, 'planner-skip', [6, 7]);
+      runWithRedTeamQueue({ queue, ...inputs([1, 2, 3, 4, 5, 6, 7], { capacity: capacity(1) }), log: f.log,
+        run: options => {
+          expect(options.plan.refusals.map(row => row.prNumber)).toEqual([1, 2, 3, 4, 5, 6]);
+          return { rows: [], dispatched: [], notStarted: [] };
+        } });
+      expect(f.logs.filter(line => line.startsWith(`${prefix}probe `))).toHaveLength(5);
+      expect(f.logs.filter(line => line.startsWith(`${prefix}admit `))).toEqual([`${prefix}admit ${repo}#6: capacity 1`]);
+      expect(f.logs.filter(line => line.startsWith(`${prefix}hold `))).toEqual([
+        `${prefix}hold ${repo}#7: capacity 1`, `${prefix}hold ${repo}#7: capacity; waiting for a later tick`,
+      ]);
+    });
+    it('disabled probes fail closed for five blocked entries and never log capacity holds', () => {
+      const f = fixture();
+      const queue = persistedBlocked(f, 'planner-skip');
+      expect(queue.admit(repo, 4, { allowProbes: false })).toEqual([]);
+      runWithRedTeamQueue({ queue, ...inputs([1, 2, 3, 4, 5], { capacity: undefined }), log: f.log,
+        run: options => {
+          expect(options.plan.refusals).toEqual([]);
+          return { rows: [], dispatched: [], notStarted: [] };
+        } });
+      expect(f.logs.filter(line => line.startsWith(`${prefix}probe `))).toEqual([]);
+      expect(f.logs.filter(line => line.includes('capacity'))).toEqual([]);
+      expect(f.logs.filter(line => line.includes('probes disabled'))).toHaveLength(15);
+      expect(queue.entries()).toHaveLength(5);
     });
     it('a dispatched blocked head leaves the queue', async () => {
       const f = fixture();
@@ -1109,7 +1156,12 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       const f = fixture();
       await f.queue.sync(repo, candidates([1, 2]));
       await block(f, 1);
-      for (const bad of [undefined, NaN, '1']) expect(f.queue.admit(repo, bad)).toEqual([]);
+      for (const bad of [undefined, NaN, '1']) {
+        f.logs.length = 0;
+        expect(f.queue.admit(repo, bad)).toEqual([]);
+        expect(f.logs).toContain(`${prefix}hold ${repo}#1: probes disabled`);
+        expect(f.logs.some(line => line.includes(`${repo}#1: capacity`))).toBe(false);
+      }
     });
     it('floors the caller capacity object in place so runner decrements reach it', async () => {
       const f = fixture();
