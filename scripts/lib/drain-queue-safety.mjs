@@ -98,7 +98,7 @@ function validMqInfraSignatures(value) {
   });
 }
 
-const MQ_SETUP_TRANSPORT = /could not resolve host|connection (?:reset|timed out|refused)|operation timed out|early EOF|RPC failed|unable to access '[^']+'|requested URL returned error: 5\d\d|remote end hung up|TLS connection was non-properly terminated/i;
+const MQ_SETUP_TRANSPORT = /could not resolve host|connection (?:reset|timed out|refused)|operation timed out|early EOF|RPC failed|requested URL returned error: 5\d\d|remote end hung up|TLS connection was non-properly terminated/i;
 const MQ_SETUP_TEST_FAILURE = /assert|expected|\bexpect\(|\btests?\b|✗|×|\bFAIL\b/i;
 
 // Positive setup evidence only: display names of arbitrary commands are not proof.
@@ -944,7 +944,9 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
           let truncatedLine = false;
           // A failing setup/checkout step is corroborating evidence only: the log must also show a
           // transport failure and no test-failure wording, because step display names are editable.
-          const setupInfra = setupProof && MQ_SETUP_TRANSPORT.test(tail) && !MQ_SETUP_TEST_FAILURE.test(tail);
+          // Fail closed when the scan window dropped earlier output: the veto must see the whole log.
+          const setupInfra = setupProof && text.length <= MQ_INFRA_SCAN_BYTES && MQ_SETUP_TRANSPORT.test(tail)
+            && !MQ_SETUP_TEST_FAILURE.test(text);
           const matched = setupInfra || tail.split('\n').some(line => {
             if (line.length > MQ_INFRA_LINE_CHARS) truncatedLine = true;
             const boundedLine = line.slice(-MQ_INFRA_LINE_CHARS);

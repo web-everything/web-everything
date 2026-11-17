@@ -941,6 +941,18 @@ describe('merge-queue same-head failure admission', () => {
       f.expectHeld();
     }));
 
+    it('refuses a setup-named step with a permanent 403 and no transport failure', () => fixture(f => {
+      setupJob(f);
+      f.jobLog = "fatal: unable to access 'https://github.com/x/y/': The requested URL returned error: 403\n";
+      f.expectHeld();
+    }));
+
+    it('refuses a setup-named step when an earlier assertion precedes the scan window', () => fixture(f => {
+      setupJob(f);
+      f.jobLog = 'AssertionError: expected 1 to be 2\n' + 'x'.repeat(70000) + '\nconnection reset by peer\n';
+      f.expectHeld();
+    }));
+
     it('refuses a setup-named step whose log has no transport failure', () => fixture(f => {
       setupJob(f);
       f.expectHeld();
