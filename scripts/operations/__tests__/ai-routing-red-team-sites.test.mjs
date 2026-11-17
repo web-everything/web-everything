@@ -144,18 +144,28 @@ for (const reason of ['held', 'capped', 'CLI unavailable', 'reservation denied']
       quotaResetsAt: new Date(NOW + 3600000).toISOString() }] }
       : reason === 'CLI unavailable' ? { cliAvailable: provider => provider !== 'agy-claude' }
         : reason === 'reservation denied' ? { reserveCalls: ({ provider }) => ({ used: 300, callIds: provider === 'agy-claude' ? [] : ['fallback'] }) } : {};
-    const { calls, logs } = await seat(() => setting('red-team', route), overrides,
+    const resolved = setting('red-team', route);
+    assert.deepEqual(resolved.invalid, []);
+    const { calls: baselineCalls } = await seat(empty, overrides,
       reason === 'capped' ? { WE_REVIEW_SEAT_CAP_AGY_CLAUDE: '0' } : {});
+    const { calls, logs } = await seat(() => resolved, overrides,
+      reason === 'capped' ? { WE_REVIEW_SEAT_CAP_AGY_CLAUDE: '0' } : {});
+    assert.deepEqual(calls, baselineCalls);
     assert.equal(calls[0].provider, 'codex');
     assert.ok(logs.some(line => line.includes('agy-claude unavailable')));
   });
 }
 
-test('recheck overlay outside available inherits today’s route', async () => {
-  const call = await recheck(() => setting('red-team-recheck', route));
+test('valid but unavailable recheck overlay logs and inherits today’s route', async () => {
+  const resolved = setting('red-team-recheck', route);
+  assert.deepEqual(resolved.invalid, []);
   const baseline = await recheck();
-  assert.equal(call.model, baseline.model);
-  assert.equal(call.effort, baseline.effort);
+  const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+  try {
+    const call = await recheck(() => resolved);
+    assert.deepEqual({ ...call, runId: baseline.runId, spawnFn: baseline.spawnFn }, baseline);
+    assert.ok(stderr.mock.calls.some(([line]) => line.includes('aiRouting.red-team-recheck: agy-claude cannot enforce')));
+  } finally { stderr.mockRestore(); }
 });
 
 for (const provider of ['codex', 'antigravity', 'agy-claude']) {
@@ -189,18 +199,43 @@ test('red-team roster rejects native Claude so counting Claude review seats rema
   assert.ok(logs.some(line => line.includes('claude unavailable')));
 });
 
-for (const resolver of [() => { throw new Error('unreadable'); }, () => ({}),
-  () => setting('red-team', { provider: 'codex', model: 'not-a-model' })]) {
-  test('unreadable or invalid aiRouting settings inherit at both sites', async () => {
-    const baseline = await seat();
-    const actual = await seat(resolver);
-    assert.deepEqual(actual.calls, baseline.calls);
-    const baselineRecheck = await recheck();
-    const actualRecheck = await recheck(resolver);
-    assert.equal(actualRecheck.model, baselineRecheck.model);
-    assert.equal(actualRecheck.effort, baselineRecheck.effort);
-  });
+for (const role of ['red-team', 'red-team-recheck']) {
+  for (const input of ['invalid', 'unreadable']) {
+    test(`${role} ${input} settings log and inherit today’s route`, async () => {
+      const resolver = ({ log }) => {
+        if (input === 'unreadable') throw new Error('unreadable settings');
+        assert.equal(typeof log, 'function');
+        return resolveAiRouting({ env: {}, platform: {}, log, accountMap: { accounts: {} },
+          tool: { [role]: { coordinator: { provider: role === 'red-team' ? 'codex' : 'claude', model: 'not-a-model' } } } });
+      };
+      const expected = input === 'invalid'
+        ? `aiRouting.${role}: ignored invalid settings: tool.${role}.coordinator.model`
+        : `aiRouting.${role}: invalid routing (unreadable settings); inheriting today's route`;
+      if (role === 'red-team') {
+        const baseline = await seat();
+        const actual = await seat(resolver);
+        assert.deepEqual(actual.calls, baseline.calls);
+        assert.ok(actual.logs.some(line => line.includes(expected)));
+      } else {
+        const baseline = await recheck();
+        const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+        try {
+          const call = await recheck(resolver);
+          assert.deepEqual({ ...call, runId: baseline.runId, spawnFn: baseline.spawnFn }, baseline);
+          assert.ok(stderr.mock.calls.some(([line]) => line.includes(expected)));
+        } finally { stderr.mockRestore(); }
+      }
+    });
+  }
 }
+
+test('incomplete aiRouting settings inherit at both sites', async () => {
+  const resolver = () => ({});
+  assert.deepEqual((await seat(resolver)).calls, (await seat()).calls);
+  const baseline = await recheck();
+  const call = await recheck(resolver);
+  assert.deepEqual({ ...call, runId: baseline.runId, spawnFn: baseline.spawnFn }, baseline);
+});
 
 test('executor-only settings do not alter either single seat', async () => {
   assert.deepEqual((await seat(() => setting('red-team', inherit, ['claude']))).calls, (await seat()).calls);

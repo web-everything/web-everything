@@ -1197,7 +1197,10 @@ let loggedIgnoredAiSeatOptions = false;
 function aiSeatRoute(role, current, { env, io, available, operation, taskType, policy, operatorKeys }) {
   let resolved, coordinator;
   try {
-    resolved = (io.readAiRouting ?? resolveAiRouting)({ env, log: false });
+    resolved = (io.readAiRouting ?? resolveAiRouting)({ env, log: io.log });
+    if (resolved.invalid?.length) {
+      io.log(`aiRouting.${role}: ignored invalid settings: ${resolved.invalid.join('; ')}`);
+    }
     ({ coordinator } = aiRoutingInputs(role, resolved));
   } catch (error) {
     io.log(`aiRouting.${role}: invalid routing (${error.message}); inheriting today's route`);
