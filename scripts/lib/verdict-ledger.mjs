@@ -541,7 +541,7 @@ export const EVENT_TYPES = Object.freeze({
   SEND_BACK: 'send-back',   // the PR goes back to its author
   AUTHOR: 'author',         // who opened the PR
   LABEL_INPUT: 'label-input', // a hand-applied label seen by the mirror
-  FINDING: 'finding',       // card 5469: one finding's stable identity + its status on a reviewed head (non-bearing)
+  FINDING: 'finding',       // stable finding identity + review status or red-team disposition (non-bearing)
 });
 
 /** Every event type, as an array. */
@@ -552,10 +552,16 @@ export const REVIEW_RUN_PHASES = Object.freeze(['started', 'completed']);
 export const APPROVAL_KINDS = Object.freeze(['clear-human', 'clear-operator', 'judge']);
 export const SEND_BACK_CAUSES = Object.freeze(['block-ruling', 'changes']);
 export const LABEL_INPUT_CHANGES = Object.freeze(['added', 'removed']);
-/** Card 5469 — a finding's status on one reviewed head: `raised` (it held the verdict), `tolerated` (reported, did
+/** Card 5469 — a finding's review status or red-team disposition: `raised` (it held the verdict), `tolerated` (reported, did
  *  not hold it), `fixed` (raised on an earlier head, not reported now, and the fix range changed code at it),
- *  `carded` (set aside as a card suggestion). Written only by the review role (`source: review-pr`). */
-export const FINDING_STATUS_VALUES = Object.freeze(['raised', 'tolerated', 'fixed', 'carded']);
+ *  `carded` (set aside as a card suggestion) are written by the review role (`source: review-pr`). R883 adds
+ *  `open` / `not-real` dispositions, which require `source: red-team` and do not establish a reviewed head. */
+export const FINDING_STATUS_VALUES = Object.freeze(['raised', 'tolerated', 'fixed', 'carded', 'open', 'not-real']);
+/** R883 slice 1 — dispositions, written with `source: red-team` (a red-team finding that is still `open`, or ruled
+ *  `not-real`). Appended AFTER the old statuses so their positions never move. Review status and reviewed-head
+ *  readers skip them; the separate disposition fold feeds no round decision yet. */
+export const FINDING_DISPOSITION_VALUES = Object.freeze(['open', 'not-real']);
+export const FINDING_SOURCE_RED_TEAM = 'red-team';
 /** Card 5469 — a stable finding id: `fi-` + 12 hex of sha256(repo, pr, path, symbol, defect class). Distinct from the
  *  #76a referral `f-` id, which also hashes the claim text and the first-seen head. */
 export const STABLE_FINDING_ID_PATTERN = /^fi-[0-9a-f]{12}$/;
@@ -703,6 +709,10 @@ export function validateLedgerEvent(raw) {
   if (!Number.isInteger(raw.pr) || raw.pr <= 0) errors.push(`bad \`pr\`: ${JSON.stringify(raw.pr)}`);
   if (typeof raw.at !== 'string' || !ISO_RE.test(raw.at)) errors.push(`bad \`at\`: ${JSON.stringify(raw.at)}`);
   if (!isStr(raw.source)) errors.push('bad `source`: a row must name its writer');
+  if (raw.type === EVENT_TYPES.FINDING && FINDING_DISPOSITION_VALUES.includes(raw.status)
+    && raw.source !== FINDING_SOURCE_RED_TEAM) {
+    errors.push('bad `source`: a finding disposition requires red-team');
+  }
   for (const [name, check] of spec) {
     if (!check(raw[name])) errors.push(`bad \`${name}\`: ${JSON.stringify(raw[name])}`);
   }
