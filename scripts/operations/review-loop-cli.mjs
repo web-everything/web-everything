@@ -75,6 +75,7 @@ import {
   buildRoundCardsFilingInput, isRoundCardsParked, roundCardsAcceptReason, roundCardsDecision, roundCardsFindingsFingerprint,
   roundCardsFindingsMarker, roundCardsHeadMarker, postAcceptAdvisoryDecision,
 } from '../lib/review-loop-policy.mjs';
+import { resolveReviewRedTeamOnSkip } from '../lib/review-red-team-on-skip.mjs';
 import { resolvePostAcceptAdvisorySettings } from '../lib/post-accept-advisory-settings.mjs';
 import { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops, recordPostAcceptAdvisoryRating } from './review-pr-io.mjs';
 import { unattendedAcceptableVerdict, unattendedAcceptHold, unattendedAcceptPolicy } from '../lib/unattended-review-accept.mjs';
@@ -402,11 +403,12 @@ export const RESUME_MAX_ATTEMPTS = 3;
  * unreadable PR or store answers `null`, which means "start a fresh review" exactly as before this existed.
  * @returns {string|null} the run id to resume.
  */
-export function defaultFindResumableRun({ repo, pr }, { readPr = defaultReadResumePr, readRuns = readReviewRunEvidence } = {}) {
+export function defaultFindResumableRun({ repo, pr, ciHeldRecordRetryMax }, { readPr = defaultReadResumePr, readRuns = readReviewRunEvidence, env = process.env } = {}) {
   try {
     const view = readPr({ repo, pr });
     if (!view?.headRefOid) return null;
-    return findResumableParkedRun({ ...view, number: Number(pr) }, readRuns(), { repo })?.id ?? null;
+    return findResumableParkedRun({ ...view, number: Number(pr) }, readRuns(), { repo,
+      ciHeldRecordRetryMax: ciHeldRecordRetryMax ?? resolveReviewRedTeamOnSkip({ env }).value.ciHeldRecordRetryMax })?.id ?? null;
   } catch { return null; }
 }
 
@@ -555,6 +557,7 @@ export async function runReviewLoopOnce({
   appendLearning = appendEntry, session = 'review-loop', fileItem = fileItemForPreventionViaLandingJob,
   findFiledPrevention = findFiledPreventionCard, findResumableRun = () => null, now = () => new Date().toISOString(),
   findFiledRoundCards = findFiledRoundCardsCard,
+  redTeamOnSkipSettings = resolveReviewRedTeamOnSkip,
   // `review.parallelSeats` — start every independent juror seat at once (`./parallel-judges.mjs`); `seatLanes` gives a
   // further tool-bearing seat a lane of its own. Both default to the sequential drive, so a caller that passes
   // neither is unchanged; the CLI block below passes the resolved setting and the real lane provider.
@@ -653,9 +656,10 @@ export async function runReviewLoopOnce({
     // panel judges the same head again, raises referrals the first one did not, and parks the PR for a ruling it
     // already had (live 2026-10-08, #4361/#4388). The parked run already holds the panel's verdict and findings, so it
     // goes back to the step that reads the rulings and carries on from there. New referrals come only from a new push.
+    const { ciHeldRecordRetryMax } = redTeamOnSkipSettings({ log: advisoryLog }).value;
     let resumedId = parsed.control.resume ?? null;
     if (!resumedId && parsed.input.repo && parsed.input.pr != null && process.env.WE_REVIEW_RESUME_PARKED !== '0') {
-      try { resumedId = findResumableRun({ repo: parsed.input.repo, pr: parsed.input.pr }); } catch { resumedId = null; }
+      try { resumedId = findResumableRun({ repo: parsed.input.repo, pr: parsed.input.pr, ciHeldRecordRetryMax }); } catch { resumedId = null; }
     }
     // Any doubt (an unreadable record, a run that cannot be rewound) falls back to a fresh review, never aborts the round.
     let rewound = null;
@@ -666,7 +670,10 @@ export async function runReviewLoopOnce({
       // "Unfinished" = the earlier resume never got through `advise` (the same test `reviewRunEvidence` applies).
       const unfinishedResume = Boolean(parked?.resumeOf) && !parked.stepTimings?.find((t) => t.step === 'advise')?.finishedAt;
       const suspendedEffect = !parked?.resumeOf && parked?.pending?.kind === 'effect' && parked.pending.step === RESUME_STEP;
-      const retryableRecordEffect = reviewRunEvidence(parked)?.retryableRecordEffect === true;
+      const recordEvidence = reviewRunEvidence(parked);
+      const ciHeldRecordRetry = ciHeldRecordRetryMax > 0 && Number.isFinite(recordEvidence?.ciHeldRecordRetry?.attempts)
+        && recordEvidence.ciHeldRecordRetry.attempts <= ciHeldRecordRetryMax;
+      const retryableRecordEffect = recordEvidence?.retryableRecordEffect === true || ciHeldRecordRetry;
       const recordAttempts = Math.max(0, Number(parked?.recordEffectResumeAttempts) || 0);
       const effectAttempts = Math.max(0, Number(parked?.referralEffectResumeAttempts) || 0);
       const attempts = suspendedEffect ? effectAttempts : unfinishedResume ? Number(parked.resumeOf.attempts) || 1 : 0;

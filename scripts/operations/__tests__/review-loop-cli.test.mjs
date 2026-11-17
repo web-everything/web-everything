@@ -36,11 +36,12 @@ import { fileItemOperation } from '../file-item.mjs';
 import { REVIEW_EFFECTS, reviewPrOperation } from '../review-pr.mjs';
 import { buildPreventionFilingInput, buildRoundCardsFilingInput, roundCardsFindingsFingerprint, postAcceptAdvisoryShadowReport } from '../../lib/review-loop-policy.mjs';
 import {
-  applyUnattendedActorDefault, buildFileItemArgv, fileItemForPrevention, fileItemForPreventionViaLandingJob,
+  defaultFindResumableRun, RESUME_MAX_ATTEMPTS, applyUnattendedActorDefault, buildFileItemArgv, fileItemForPrevention, fileItemForPreventionViaLandingJob,
   findFiledPreventionCard, findFiledRoundCardsCard, findRetainedRoundCardsReceipt, QUEUED_RECEIPT_TTL_MS, retainedRoundCardsReceipt,
   runReviewLoopOnce as driveReviewLoopOnceRaw, UNATTENDED_REVIEW_ACTOR,
 } from '../review-loop-cli.mjs';
 import { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops, recordPostAcceptAdvisoryRating, createReviewPrSinks } from '../review-pr-io.mjs';
+import { reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
 import { spawnPreventionLandingJob } from '../../lib/prevention-landing-job.mjs';
 
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey,
@@ -1879,5 +1880,103 @@ describe('post-accept advisory shadow wiring', () => {
     expect(out.stopped).toBe('complete');
     expect(out.run.findings.confirm).toBe('accept');
     expect(log).toHaveBeenCalledWith(expect.stringContaining('live review unaffected'));
+  });
+});
+
+
+describe('CI-held record driver resume', () => {
+  async function fixture(max = 3) {
+    const declaration = reviewPrOperation({ readPr: input => {
+      const view = stubReader({ rev: HEAD_A })(input);
+      return { ...view, body: '<!-- authored-by-actor: author -->' };
+    } });
+    const registry = createRegistry(); registry.register(declaration);
+    const store = createMemoryRunStore(), seen = [];
+    const judge = vi.fn(async () => judgeOutcome(CLEAN_ANSWER, {}));
+    let time = 0;
+    const publishGate = vi.fn(() => ({ allowed: false, headSha: HEAD_A, reason: 'required-checks-not-successful' }));
+    const runNode = vi.fn(() => { throw Error('CI pending must prevent publication'); });
+    const label = createReviewPrSinks({
+      env: { WE_REVIEW_START_EARLY: 'on', WE_REVIEW_START_EARLY_PUBLISH_WAIT_MS: '1', WE_REVIEW_START_EARLY_POLL_MS: '1' },
+      publishGate, readPublishHead: () => HEAD_A, now: () => time, sleep: async ms => { time += ms; }, runNode,
+    })[REVIEW_EFFECTS.LABEL];
+    const sinks = { ...recordingSinks(seen), [REVIEW_EFFECTS.LABEL]: label };
+    const env = { WE_REVIEW_RED_TEAM_ON_SKIP_CI_HELD_RECORD_RETRY_MAX: String(max) };
+    const find = input => defaultFindResumableRun(input, { env,
+      readPr: () => ({ headRefOid: HEAD_A, comments: [] }),
+      readRuns: () => [reviewRunEvidence(store.read('ci-held-original'))],
+    });
+    const args = { declaration, registry, store, sinks, argv: [...BASE_ARGV, '--json'], makeJudge: () => judge,
+      mintRunId: () => 'ci-held-original', redTeamOnSkipSettings: () => ({ value: { ciHeldRecordRetryMax: max } }),
+      readAcceptancePr: () => ({ headRefOid: HEAD_A, body: '<!-- authored-by-actor: author -->', comments: [] }),
+    };
+    await runReviewLoopOnce(args);
+    const saved = store.read('ci-held-original');
+    expect(saved.pending).toMatchObject({ kind: 'effect', step: 'record' });
+    expect(saved.effects.find(e => e.type === REVIEW_EFFECTS.LABEL)).toMatchObject({ status: 'failed', unknownAttempts: 1,
+      error: 'review held: CI still pending on reviewed head' });
+    return { args, store, saved, judge, seen, publishGate, runNode, find };
+  }
+
+  it('re-runs a failed notApplied label swap in place, rechecks pending CI, and never starts a fresh panel', async () => {
+    const f = await fixture();
+    // The default lookup resolves the environment setting when no driver override is supplied.
+    expect(f.find({ repo: BASE_ARGV[1].slice(7), pr: 1234 })).toBe(f.saved.id);
+    const judges = f.judge.mock.calls.length, writes = f.seen.length, checks = f.publishGate.mock.calls.length;
+    const out = await runReviewLoopOnce({ ...f.args, findResumableRun: f.find, mintRunId: () => { throw Error('fresh panel'); } });
+    expect(out.run.id).toBe(f.saved.id);
+    expect(out.run.cursor).toBe(f.saved.cursor);
+    expect(out.run.resumedAt).toBeTruthy();
+    expect(out.run.recordEffectResumeAttempts).toBe(1);
+    expect(out.run.resumeOf).toBeUndefined();
+    expect(out.run.effects.find(e => e.type === REVIEW_EFFECTS.LABEL)).toMatchObject({ status: 'failed', unknownAttempts: 2 });
+    expect(f.publishGate.mock.calls.length).toBeGreaterThan(checks);
+    expect(f.runNode).not.toHaveBeenCalled();
+    expect(f.judge).toHaveBeenCalledTimes(judges);
+    expect(f.seen).toHaveLength(writes);
+  });
+
+  it.each([['at bound', 3, 3, true], ['over bound', 3, 4, false], ['zero disables retries', 0, 1, false]])(
+    '%s uses the setting and preserves the fresh path when ineligible', async (_name, max, attempts, resumes) => {
+      const f = await fixture(max);
+      const saved = f.store.read(f.saved.id);
+      saved.effects.find(e => e.type === REVIEW_EFFECTS.LABEL).unknownAttempts = attempts;
+      f.store.write(saved);
+      const out = await runReviewLoopOnce({ ...f.args, findResumableRun: f.find, mintRunId: () => 'fresh-panel' });
+      expect(out.run.id).toBe(resumes ? saved.id : 'fresh-panel');
+      expect(out.run.recordEffectResumeAttempts).toBe(resumes ? 1 : undefined);
+    });
+
+  it.each([0, 3])('the driver itself rejects an ineligible CI retry even if lookup returns it (max=%i)', async max => {
+    const f = await fixture(max);
+    const saved = f.store.read(f.saved.id);
+    saved.effects.find(e => e.type === REVIEW_EFFECTS.LABEL).unknownAttempts = max + 1;
+    f.store.write(saved);
+    const out = await runReviewLoopOnce({ ...f.args, findResumableRun: () => saved.id, mintRunId: () => 'fresh-panel' });
+    expect(out.run.id).toBe('fresh-panel');
+    expect(f.store.read(saved.id).recordEffectResumeAttempts).toBeUndefined();
+  });
+
+  it('refuses at the independent record-attempt guard without starting a fresh panel', async () => {
+    const f = await fixture();
+    f.store.write({ ...f.saved, recordEffectResumeAttempts: RESUME_MAX_ATTEMPTS });
+    const judges = f.judge.mock.calls.length;
+    const out = await runReviewLoopOnce({ ...f.args, findResumableRun: f.find, mintRunId: () => { throw Error('fresh panel'); } });
+    expect(out.stopped).toBe('refused');
+    expect(out.lines.join(' ')).toContain('record effect resume attempts spent');
+    expect(f.judge).toHaveBeenCalledTimes(judges);
+  });
+
+  it('never replays an unknown pending label outcome on explicit resume', async () => {
+    const f = await fixture();
+    const saved = f.store.read(f.saved.id);
+    saved.effects.find(e => e.type === REVIEW_EFFECTS.LABEL).status = 'pending';
+    f.store.write(saved);
+    const checks = f.publishGate.mock.calls.length;
+    const out = await runReviewLoopOnce({ ...f.args, argv: [...f.args.argv, `--resume=${saved.id}`] });
+    expect(out.code).not.toBe(0);
+    expect(out.lines.join(' ')).toContain('UNKNOWN');
+    expect(f.publishGate).toHaveBeenCalledTimes(checks);
+    expect(f.runNode).not.toHaveBeenCalled();
   });
 });
