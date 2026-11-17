@@ -4425,3 +4425,21 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+
+### Mechanical review send-back
+
+The review daemon's optional `sendBack` hook uses `review-sendback.mjs` for pure planning and
+`review-sendback-io.mjs` for bounded execution. `review.sendBackBlockRuled` defaults true;
+`scripts/settings/review-sendback.json` is the tool override and
+`WE_REVIEW_SEND_BACK_BLOCK_RULED=0` disables sends. Stood-down attention remains active.
+The shared daemon conveyor state root holds `review-sendback.json`, with independent per-head
+send and attention receipts. An unreadable ledger refuses both actions and logs a manual-inspection
+fallback. A tick handles at most 16 eligible PRs. A persisted per-repository cursor resumes
+after the last attempted PR in number order, including failed reads and sends, so persistent
+failures cannot starve later PRs. Historical receipts-only ledgers acquire the cursor on first use.
+The oversized-batch regression must exercise multiple ticks with the first 16 actions failing.
+The sanctioned writer accepts `--to=changes --expect-head=<sha>` and rechecks the head and pending
+labels before durable writes. These checks cannot make GitHub's separate comment and label writes atomic.
+Run `review-sendback.test.mjs`, `review-set-label-pinned-changes.test.mjs`, and the daemon's
+`review-daemon.test.mjs` through heavy-admission when changing this path.
