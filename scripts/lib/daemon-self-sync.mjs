@@ -138,7 +138,7 @@ import {
 import { basename, dirname, join, resolve } from 'node:path';
 import fs, { mkdirSync, readFileSync, renameSync, writeFileSync, readdirSync, realpathSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { applyPendingRollback as applyPendingRollbackAtBoot, continueProbation } from './daemon-rebuild/probation.mjs';
+import { bootProbation, checkProbationAtTick, readProbation } from './daemon-rebuild/probation.mjs';
 import { repairCloneRefs } from './lane-repair.mjs';
 import {
   loadBackgroundBuildSettings, resolveBackgroundBuild, tickStarvedSmell, BACKGROUND_BUILD_ENV,
@@ -829,7 +829,8 @@ export function withSelfSync(effects, {
   readLatestRebuildJobResult: readLatestJobOpt,
   // x0m7a8x — the declared rebuild path (see resolveSelfSyncRebuildAsJob); undefined resolves it once, here.
   rebuildAsJob: rebuildAsJobOpt,
-  applyPendingRollback = applyPendingRollbackAtBoot,
+  applyPendingRollback = bootProbation,
+  checkProbation = checkProbationAtTick,
   maintainObjects, maintain, hasMaintenanceRebuildJob = () => cloneHasRebuildJob(root, env),
 }) {
   const tick = effects.tickOnce;
@@ -961,6 +962,8 @@ export function withSelfSync(effects, {
   const bootSha = readHead(syncOpts());
   const bootAt = now();
   let bootRollback;
+  let probationRestart;
+  const restartProbation = detail => (probationRestart ??= Promise.resolve().then(() => onRestart({ ...detail, reason: 'probation-rollback' })));
   const cloneLockOpts = () => (env && env.WE_DAEMON_CLONE_LOCK_ROOT ? { lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT } : {});
   // #4044 restart gate (see decideRestart). The closure is walked lazily, once, from the BOOT tree's files — the
   // code actually loaded in memory. (A file newly added to the closure only matters via an edit to an existing
@@ -995,7 +998,6 @@ export function withSelfSync(effects, {
     const d = decideRestart({ changedFiles, closure, uptimeMs: now() - bootAt, minIntervalMs: urgent ? 0 : minIntervalMs });
     // A supported no-restart adoption must prove continued liveness, rather than wait for a boot
     // this gate intentionally prevents. Deferred imported changes and unknown diffs still need a boot.
-    if (d.reason === 'no-imported-change') continueProbation({ root: diffRoot, env, sha: headNow, now });
     if (!d.restart && !loggedHeads.has(`${headNow}:${d.reason}`)) {
       loggedHeads.add(`${headNow}:${d.reason}`);
       log.error?.(d.reason === 'min-interval'
@@ -1135,7 +1137,7 @@ export function withSelfSync(effects, {
     tickOnce: async (...args) => {
       const rollback = await (bootRollback ??= (async () => {
         try {
-          const result = await applyPendingRollback({ root, env, log, now, bootHead: bootSha });
+          const result = await applyPendingRollback({ root, env, log, now, bootHead: bootSha, bootSha, bootAt });
           if (result?.ok === false) log.error?.(`daemon-self-sync: boot rollback deferred (${result.reason})`);
           return result;
         } catch (error) { log.error?.(`daemon-self-sync: boot rollback failed: ${error?.message || error}`); }
@@ -1144,7 +1146,20 @@ export function withSelfSync(effects, {
         // Recovery may have moved disk while this process kept the failed build's modules loaded.
         // Restart before any rebuild or tick, bypassing ordinary restart/swap spacing.
         log.error?.('daemon-self-sync: boot recovery requires restart — loading current code');
-        return onRestart(rollback);
+        return restartProbation(rollback);
+      }
+      if (probationRestart) return probationRestart;
+      if (rollback?.reason === 'probation-lock-held') {
+        bootRollback = undefined; // retry registration before admitting a tick
+        return skippedTick('probation-lock-held');
+      }
+      const probation = readProbation(root, env);
+      const proofSha = probation && probation.sha !== bootSha
+        && restartGate(probation.sha).reason === 'no-imported-change' ? probation.sha : bootSha;
+      const verdict = checkProbation({ root, env, log, now, bootSha: proofSha, bootAt, readHead: () => readHead(syncOpts()) });
+      if (verdict.action === 'fail') {
+        log.error?.('daemon-self-sync: probation-rollback — draining before restart');
+        return restartProbation(verdict);
       }
       const ownershipNowMs = now();
       tickOwnership = resolveCloneOwnership({ root, entries, env, nowMs: ownershipNowMs, ...cloneLockOpts() });

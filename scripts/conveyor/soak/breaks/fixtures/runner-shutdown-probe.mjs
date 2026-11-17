@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 
 const [root, dir, mode] = process.argv.slice(2);
 const runner = await import(pathToFileURL(join(root, 'skills-src/conveyor/runner.mjs')));
+const { withSelfSync } = await import(pathToFileURL(join(root, 'scripts/lib/daemon-self-sync.mjs')));
 const { runPassAsTimedJob, runPassDaemonLoop } = await import(pathToFileURL(join(root, 'skills-src/conveyor/pass-daemon.mjs')));
 const { createJobStore } = await import(pathToFileURL(join(root, 'scripts/lib/daemon-jobs-runtime.mjs')));
 const { CONSTELLATION_REPOS } = await import(pathToFileURL(join(root, 'scripts/lib/constellation-repos.mjs')));
@@ -19,6 +20,7 @@ let released = false;
 let overlapped = false;
 let signalSent = false;
 let ticksAtSignal;
+let restartReason;
 const ports = {
   root: dir, store, codeSha: 'fixture', snapshot: { materialize() {} },
   host: 'fixture-host', readStart: () => 'fixture-start',
@@ -86,12 +88,26 @@ const bindings = {
   makeCliEmit: () => () => {
     if (mode === 'emit-error' && ticks === 2) throw new Error('fixture emit failure');
   },
-  wireSelfSyncAndAppAuth: ({ tickOnce: tick, onRestart }) => async () => {
+  wireSelfSyncAndAppAuth: ({ tickOnce: tick, onRestart }) => {
+    if (mode === 'probation-restart') return withSelfSync({ tickOnce: tick }, {
+      root: dir, env: { WE_DAEMON_STATE_DIR: join(dir, 'state'), WE_DAEMON_CLONE_LOCK_ROOT: join(dir, 'locks') },
+      versions: null, background: false, readHead: () => 'boot', readState: () => ({}),
+      rebuild: async () => ({ moved: false }), acquireRead: () => ({ ok: true }), releaseRead() {},
+      applyPendingRollback: async () => ({ action: 'none' }), log: { error() {} },
+      checkProbation: () => ({ action: ticks ? 'fail' : 'none' }),
+      onRestart: info => {
+        restartReason = info.reason;
+        overlapped = store.list().records.some(r => r.job.status === 'running');
+        return onRestart(info);
+      },
+    }).tickOnce;
+    return async () => {
     if (mode === 'restart' && ticks === 1) {
       overlapped = store.list().records.some(r => r.job.status === 'running');
       return onRestart();
     }
     return tick();
+    };
   },
   releaseRunnerLeaseIfOwned: () => { released = true; },
   RUNNER_LOCK_ROOT: dir, REPO_ROOT: dir, SCRIPTS_DIR: join(dir, 'scripts'), TICK_CORE: '',
@@ -103,7 +119,7 @@ const bindings = {
 };
 const buildEffects = new Function(...Object.keys(bindings), `${factory}\nreturn buildEffects;`)(...Object.values(bindings));
 process.on('exit', () => writeFileSync(join(dir, 'report.json'), JSON.stringify({
-  ticks, ticksAtSignal, released, overlapped, launched, results, snapshotDirs, pids: [...children.keys()],
+  ticks, ticksAtSignal, released, overlapped, restartReason, launched, results, snapshotDirs, pids: [...children.keys()],
   jobs: store.list().records.map(r => ({ status: r.job.status, result: r.job.passResult })),
 })));
 try {

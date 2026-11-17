@@ -12,15 +12,15 @@ import { readProvenGood, writeProvenGood } from '../../../lib/daemon-rebuild/pro
 // replace the native child process's file import with an http: URL.
 const probationModuleUrl = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../../../lib/daemon-rebuild/probation.mjs')).href;
 const worker = `
-  import { armProbationWatch, readProbation, runProbationTick } from ${JSON.stringify(probationModuleUrl)};
+  import { bootProbation, readProbation, checkProbationAtTick } from ${JSON.stringify(probationModuleUrl)};
   const { root, env, at, head } = JSON.parse(process.env.PROBATION_SIBLING_FIXTURE);
   let rollbacks = 0, restarts = 0;
-  const options = { root, env, now: () => at + 10, processStartMs: at,
-    readHead: () => head, run: () => { throw new Error('Unexpected Git IO'); }, emit() {},
+  const options = { root, env, now: () => at + 10, bootAt: at, bootSha: head,
+    readHead: () => head, run: () => ({ status: 0, stdout: head }), emit() {},
     rollback: async () => { rollbacks++; return { ok: true }; } };
-  armProbationWatch({ ...options, intervalMs: 60000, onRolledBack() { restarts++; } });
+  await bootProbation(options);
   process.on('message', async () => {
-    const result = await runProbationTick(options);
+    const result = checkProbationAtTick(options);
     process.send({ result, rollbacks, restarts });
   });
   process.on('disconnect', () => process.exit(0));
@@ -60,9 +60,9 @@ export default {
       const key = cloneKeyOf(root), head = 'b'.repeat(40), good = 'a'.repeat(40), at = Date.now();
       const file = kind => join(env.WE_DAEMON_STATE_DIR, `${key}.${kind}.json`);
       const write = (path, record) => writeFileSync(path, JSON.stringify(record));
-      write(file('probation'), { sha: head, prevHead: good, inputsKey: 'healthy-B', mainSha: good, applied: [],
+      write(file('probation'), { adoptionId: '11111111-1111-4111-8111-111111111111', sha: head, prevHead: good, inputsKey: 'healthy-B', mainSha: good, applied: [],
         adoptedAt: new Date(at).toISOString(), probationMs: 1000, boots: 0, baseline: {}, version: 1 });
-      writeProvenGood(root, env, { head: good, inputsKey: 'proven-A', mainSha: good, applied: [], provenAt: new Date(at - 1).toISOString() });
+      write(file('proven-good'), { head: good, inputsKey: 'proven-A', mainSha: good, applied: [], provenAt: new Date(at - 1).toISOString() });
       writeRebuildState(root, { adopted: { head, inputsKey: 'healthy-B', mainSha: good, applied: [] } }, env);
       let last;
       for (let i = 0; i < 4; i++) {

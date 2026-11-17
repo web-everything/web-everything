@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { withSelfSync } from '../../../lib/daemon-self-sync.mjs';
-import { applyPendingRollback, runProbationTick } from '../../../lib/daemon-rebuild/probation.mjs';
+import { applyPendingRollback, checkProbationAtTick } from '../../../lib/daemon-rebuild/probation.mjs';
 import { acquireRead, inspectCloneLock } from '../../../lib/daemon-clone-lock.mjs';
 import { cloneKeyOf } from '../../../lib/daemon-last-good.mjs';
 import { alertsFilePath, writeRebuildState } from '../../../lib/daemon-rebuild/state.mjs';
@@ -32,7 +32,7 @@ export default {
       const marker = join(env.WE_DAEMON_STATE_DIR, `${key}.rollback-requested.json`);
       const proven = join(env.WE_DAEMON_STATE_DIR, `${key}.proven-good.json`);
       const probation = join(env.WE_DAEMON_STATE_DIR, `${key}.probation.json`);
-      const record = { from: failed, to: good, inputsKey: 'good', mainSha: good, applied: [],
+      const record = { adoptionId: '11111111-1111-4111-8111-111111111111', from: failed, to: good, inputsKey: 'good', mainSha: good, applied: [],
         rejectInputsKey: 'failed', reason: 'no-tick-progress', at: new Date(at).toISOString() };
       const write = (file, value) => writeFileSync(file, JSON.stringify(value));
       write(marker, record);
@@ -58,14 +58,15 @@ export default {
       if (ticks !== 1 || restarts !== 1) violations.push(`persistent failure: ticks=${ticks}, restarts=${restarts}`);
       log?.(`two boots: ticks=${ticks}, restarts=${restarts}`);
 
-      // First adoption has no provenGood; repeated watch ticks must stay bounded.
+      // First adoption has no provenGood; repeated tick checks must stay bounded.
       rmSync(proven);
-      write(probation, { sha: failed, prevHead: good, inputsKey: 'failed', mainSha: good, applied: [],
+      rmSync(marker);
+      write(probation, { adoptionId: record.adoptionId, sha: failed, prevHead: good, inputsKey: 'failed', mainSha: good, applied: [],
         adoptedAt: new Date(at).toISOString(), bootedAt: new Date(at).toISOString(), bootPid: process.pid,
         probationMs: 1000, baseline: {}, boots: 1, version: 1 });
       let events = 0;
-      for (let poll = 0; poll < 4; poll++) await runProbationTick({ root, env, run: () => ({ status: 0, stdout: failed }),
-        readHead: () => failed, now: () => at + 1001, log: { error() {} }, emit(event) {
+      for (let poll = 0; poll < 4; poll++) await checkProbationAtTick({ root, env, run: () => ({ status: 0, stdout: failed }),
+        bootSha: failed, bootAt: at, now: () => at + 1001, log: { error() {} }, emit(event) {
           if (event.kind === 'probation-needs-you') events++;
         } });
       const alerts = readFileSync(alertsFilePath(root, env), 'utf8').trim().split('\n')
@@ -80,6 +81,7 @@ export default {
       if (!gone) throw new Error('dead-PID fixture was not verifiably dead');
       write(proven, { head: good, inputsKey: 'good', mainSha: good, applied: [], provenAt: new Date(at - 1000).toISOString() });
       writeRebuildState(root, { adopted: { head: failed } }, env);
+      write(marker, record);
       const lease = { owner: `${hostname()}:${deadPid}`, pid: deadPid, nowMs: at, lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT };
       if (!acquireRead(root, lease).ok) throw new Error('reader fixture acquisition failed');
       const result = await applyPendingRollback({ root, env, run, bootHead: good, now: () => at,

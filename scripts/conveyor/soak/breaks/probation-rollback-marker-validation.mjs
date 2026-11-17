@@ -22,7 +22,7 @@ export default {
     try {
       const failed = 'b'.repeat(40), good = 'a'.repeat(40);
       const at = Date.parse('2026-11-15T12:00:00Z');
-      for (const [name, adopted] of [['absent', null], ['missing-key', {}], ['null-key', { inputsKey: null }]]) {
+      for (const [name, identity] of [['absent', undefined], ['malformed', '../other'], ['null-id', null]]) {
         const root = join(base, name);
         mkdirSync(root);
         const env = { WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_CLONE_LOCK_ROOT: join(root, 'locks') };
@@ -39,20 +39,23 @@ export default {
           || !openProbation({ ...opts, sha: failed, prevHead: good, inputsKey: 'failed', mainSha: good, applied: [] })) {
           throw new Error('Failed to persist fixture evidence');
         }
-        writeRebuildState(root, { adopted }, env);
+        writeRebuildState(root, { adopted: { head: failed } }, env);
+        const valid = readFileSync(probationFile, 'utf8');
+        writeFileSync(probationFile, JSON.stringify({ ...JSON.parse(valid), adoptionId: identity }));
         const before = readFileSync(probationFile, 'utf8');
         const result = await requestRollback(opts);
-        if (result.ok !== false || result.reason !== 'rollback-request-unreadable') violations.push(`${name}: accepted incomplete request`);
+        if (result.ok !== false || result.reason !== 'probation-unreadable') violations.push(`${name}: accepted incomplete request`);
         if (existsSync(markerFile)) violations.push(`${name}: wrote an unreadable boot marker`);
         if (!existsSync(probationFile) || readFileSync(probationFile, 'utf8') !== before) violations.push(`${name}: lost probation evidence`);
         const alerts = existsSync(alertsFilePath(root, env))
           ? readFileSync(alertsFilePath(root, env), 'utf8').trim().split('\n').map(JSON.parse) : [];
-        if (!alerts.some(alert => alert.kind === 'probation-needs-you' && alert.detail?.reason === 'rollback-request-unreadable')) {
+        if (!alerts.some(alert => alert.kind === 'probation-needs-you' && alert.detail?.reason === 'probation-unreadable')) {
           violations.push(`${name}: no operator alert`);
         }
         log?.(`${name}: refused=${result.ok === false}, marker=${existsSync(markerFile)}`);
         // An operator repairs the missing input evidence; a retried request must
         // produce a marker the real boot reader can consume without intervention.
+        writeFileSync(probationFile, valid);
         writeRebuildState(root, { adopted: { head: failed, inputsKey: 'failed' } }, env);
         if (!(await requestRollback(opts)).ok) violations.push(`${name}: repaired request refused`);
         head = good; // A sibling has already restored disk; no reset is needed.

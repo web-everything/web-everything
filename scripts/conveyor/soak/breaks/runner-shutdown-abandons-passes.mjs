@@ -55,7 +55,8 @@ export default {
       }
       if (survivors.length) violations.push('pass children survived runner exit beyond their deadlines');
       if (mode.startsWith('SIG') && report.ticks !== report.ticksAtSignal) violations.push('runner admitted more ticks during signal shutdown');
-      if (['max-ticks', 'error', 'restart'].includes(mode) && !report.overlapped) violations.push('outstanding pass blocked the next tick');
+      if (['max-ticks', 'error', 'restart', 'probation-restart'].includes(mode) && !report.overlapped) violations.push('outstanding pass blocked the next tick');
+      if (mode === 'probation-restart' && report.restartReason !== 'probation-rollback') violations.push('probation did not use caller restart');
       const result = { mode, violations, survivors, ...report };
       log?.(JSON.stringify(result));
       return result;

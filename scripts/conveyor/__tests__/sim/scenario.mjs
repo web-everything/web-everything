@@ -224,7 +224,7 @@ export async function runScenario(def, { timeoutMs = 60_000, budgetMs = Infinity
       child.on('exit', onExit);
       child.on('error', onErr);
       child.on('disconnect', onDisconnect);
-      // Hosts may exit between ticks (including probation's asynchronous restart).
+      // Hosts may exit at a tick boundary (including probation's caller-owned restart).
       // Their exit event has already passed, so reject before sending or waiting.
       if (!child.connected || child.exitCode !== null || child.signalCode !== null) {
         onErr(new Error('not connected or already exited'));

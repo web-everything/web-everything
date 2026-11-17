@@ -146,6 +146,28 @@ describe('withSelfSync — DEFAULT path: rebuild-driven (#4044 Module E)', () =>
   });
   const okLock = () => ({ ok: true });
 
+  it('probation failure exits only through onRestart before taking a tick lease', async () => {
+    const exit = vi.spyOn(process, 'exit').mockImplementation(() => { throw new Error('direct exit'); });
+    const onRestart = vi.fn(() => 'drained'), tick = vi.fn(), acquireRead = vi.fn(okLock), rebuild = vi.fn();
+    const checkProbation = vi.fn(() => ({ action: 'fail', reason: 'no-tick-progress' }));
+    try {
+      const wrapped = withSelfSync({ tickOnce: tick }, {
+        root: '/x', env: {}, versions: null, background: false, log: { error() {} },
+        readHead: () => 'boot', readState: emptyState, acquireRead, releaseRead() {}, rebuild,
+        applyPendingRollback: async () => ({ action: 'none' }), checkProbation, onRestart,
+      });
+      expect(await wrapped.tickOnce()).toBe('drained');
+      expect(await wrapped.tickOnce()).toBe('drained');
+      expect(onRestart).toHaveBeenCalledTimes(1);
+      expect(onRestart).toHaveBeenCalledWith(expect.objectContaining({ reason: 'probation-rollback' }));
+      expect(checkProbation).toHaveBeenCalledTimes(1);
+      expect(exit).not.toHaveBeenCalled();
+      expect(tick).not.toHaveBeenCalled();
+      expect(acquireRead).not.toHaveBeenCalled();
+      expect(rebuild).not.toHaveBeenCalled();
+    } finally { exit.mockRestore(); }
+  });
+
   it('superseded boot rollback restarts stale code before any tick', async () => {
     const report = await bootRollbackBreak.run({ phases: ['superseded-under-lock'] });
     expect(bootRollbackBreak.judge(report)).toEqual([]);
@@ -188,7 +210,8 @@ describe('withSelfSync — DEFAULT path: rebuild-driven (#4044 Module E)', () =>
     });
     await expect(w.tickOnce()).resolves.toBe('restarted');
     await expect(w.tickOnce()).resolves.toBe('restarted');
-    expect(onRestart).toHaveBeenCalledWith({ ok: true, head: 'restored' });
+    expect(onRestart).toHaveBeenCalledWith({ ok: true, head: 'restored', reason: 'probation-rollback' });
+    expect(onRestart).toHaveBeenCalledTimes(1);
     expect(applyPendingRollback).toHaveBeenCalledTimes(1);
     expect(rebuild).not.toHaveBeenCalled();
     expect(acquireRead).not.toHaveBeenCalled();
@@ -211,7 +234,7 @@ describe('withSelfSync — DEFAULT path: rebuild-driven (#4044 Module E)', () =>
     await expect(w.tickOnce()).rejects.toBe(failure);
     await expect(w.tickOnce()).rejects.toBe(failure);
     expect(applyPendingRollback).toHaveBeenCalledTimes(1);
-    expect(onRestart).toHaveBeenCalledTimes(2);
+    expect(onRestart).toHaveBeenCalledTimes(1);
     expect(rebuild).not.toHaveBeenCalled();
     expect(acquireRead).not.toHaveBeenCalled();
     expect(tick).not.toHaveBeenCalled();

@@ -3,6 +3,14 @@ import { expect, it, vi } from 'vitest';
 import b from '../../../scripts/conveyor/soak/breaks/runner-shutdown-abandons-passes.mjs';
 import { makeBackgroundMechanicalPasses } from '../runner.mjs';
 
+it('probation failure drains the runner and releases its lease through onRestart', async () => {
+  const report = await b.run({ mode: 'probation-restart', log: console.log });
+  expect(b.judge(report)).toEqual([]);
+  expect(report.restartReason).toBe('probation-rollback');
+  expect(report.released).toBe(true);
+  expect(report.jobs.every(job => job.result)).toBe(true);
+}, 15_000);
+
 it.each(['once', 'max-ticks', 'idle-stop', 'lease-lost', 'error', 'emit-error', 'heartbeat-error',
   'sleep-error', 'restart', 'SIGTERM', 'SIGINT', 'SIGTERM-twice', 'SIGINT-twice',
   'daemon-SIGTERM', 'daemon-SIGINT', 'daemon-sleep-error'])(

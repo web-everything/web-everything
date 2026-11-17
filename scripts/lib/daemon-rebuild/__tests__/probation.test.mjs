@@ -7,17 +7,293 @@ import { spawnSync } from 'node:child_process';
 import { acquireLockDir, lockDirFor, makeLockEntry, readLockEntry, releaseLockDir } from '../../../readiness/file-locks.mjs';
 import {
   PROBATION_MS_DEFAULT, PROBATION_MAX_BOOTS, probationMsOf,
-  readProvenGood, writeProvenGood, readProbation, openProbation, continueProbation,
-  evaluateProbation, registerOutcomeCheck, clearOutcomeChecks,
-  requestRollback, applyPendingRollback, runProbationTick, armProbationWatch,
+  readProvenGood, writeProvenGood, readProbation, openProbation,
+  evaluateProbation, withProbationLock, bootProbation, checkProbationAtTick,
+  requestRollback, applyPendingRollback,
 } from '../probation.mjs';
-import { acquireRead, releaseRead, inspectCloneLock, withWriteLock } from '../../daemon-clone-lock.mjs';
+import { acquireRead, acquireWrite, releaseRead, inspectCloneLock, withWriteLock } from '../../daemon-clone-lock.mjs';
 import { prepareRebuild } from '../prepare.mjs';
 import { planRebuild } from '../plan.mjs';
 import { finalizeRebuild } from '../adopt.mjs';
 import { makeTickProgressStore } from '../../daemon-background-build.mjs';
 import { withSelfSync } from '../../daemon-self-sync.mjs';
 import siblingStartupBreak from '../../../conveyor/soak/breaks/probation-sibling-startups.mjs';
+
+// No remote, fetch, push, hooks, or user Git configuration. commit-tree creates
+// local fixture objects; the real rollback must move HEAD and the tracked bytes.
+function realRepo(f) {
+  const run = vi.fn((args, opts = {}) => {
+    if (['fetch', 'push', 'pull', 'clone'].includes(args[0])) throw new Error('Network Git forbidden');
+    return spawnSync('git', ['-c', 'core.hooksPath=/dev/null', ...args], {
+      cwd: opts.cwd || f.root, env: {
+        ...f.env, GIT_AUTHOR_NAME: 'Probation test', GIT_AUTHOR_EMAIL: 'test@example.invalid',
+        GIT_COMMITTER_NAME: 'Probation test', GIT_COMMITTER_EMAIL: 'test@example.invalid',
+        GIT_AUTHOR_DATE: iso(ADOPTED_AT), GIT_COMMITTER_DATE: iso(ADOPTED_AT),
+      }, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024,
+    });
+  });
+  const git = args => {
+    const r = run(args);
+    if (r.status !== 0) throw new Error(`Fixture git ${args[0]} failed: ${r.stderr}`);
+    return r.stdout.trim();
+  };
+  git(['init', '-q', '-b', 'main']);
+  writeFileSync(join(f.root, 'build.txt'), 'proven build\n');
+  git(['add', 'build.txt']);
+  const good = git(['commit-tree', git(['write-tree']), '-m', 'proven fixture']);
+  git(['reset', '--hard', good]);
+  writeFileSync(join(f.root, 'build.txt'), 'failed build\n');
+  git(['add', 'build.txt']);
+  const failed = git(['commit-tree', git(['write-tree']), '-p', good, '-m', 'failed fixture']);
+  git(['reset', '--hard', failed]);
+  f.good.head = good;
+  f.good.mainSha = good;
+  Object.assign(f.probation, { sha: failed, prevHead: good, mainSha: good, applied: [] });
+  f.opts.bootSha = failed;
+  f.seed();
+  return { run, git, good, failed };
+}
+
+
+describe('real repository rollback and CLI contracts', () => {
+
+  it('failure requests rollback without touching HEAD or taking a clone lock; boot apply resets under the normal lock', async () => {
+    const f = fixture();
+    const repo = realRepo(f);
+    writeReadyCandidate(f.root, { prevHead: repo.failed, adopt: { finalSha: repo.failed } }, f.env);
+    const result = checkProbationAtTick({ ...f.opts, run: repo.run });
+    expect(result).toMatchObject({ action: 'fail', reason: 'no-tick-progress' });
+    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
+    expect(readFileSync(join(f.root, 'build.txt'), 'utf8')).toBe('failed build\n');
+    expect(withWriteLock).not.toHaveBeenCalled();
+    expect(JSON.parse(readFileSync(f.markerFile, 'utf8'))).toEqual({
+      adoptionId: f.probation.adoptionId, from: repo.failed, to: repo.good, inputsKey: f.good.inputsKey, mainSha: f.good.mainSha, applied: f.good.applied,
+      rejectInputsKey: 'failed-inputs', reason: 'no-tick-progress', at: iso(f.opts.now()),
+    });
+    expect(existsSync(f.probationFile)).toBe(true);
+    expect(f.opts.emit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'probation-rollback-requested' }), { env: expect.anything() });
+    repo.run.mockClear();
+    const resetLocks = [];
+    expect(await applyPendingRollback({ ...f.opts, run: (args, opts) => {
+      if (args[0] === 'reset') resetLocks.push(inspectCloneLock(f.root, { lockRoot: f.env.WE_DAEMON_CLONE_LOCK_ROOT, nowMs: f.opts.now() }));
+      return repo.run(args, opts);
+    } })).toMatchObject({ ok: true });
+    expect(resetLocks).toHaveLength(1);
+    expect(resetLocks[0].writerLive).toBe(true);
+    expect(withWriteLock).toHaveBeenCalledTimes(1);
+    expect(withWriteLock.mock.calls[0][2]).toEqual({ now: f.opts.now, waitMs: 60000, lockRoot: f.env.WE_DAEMON_CLONE_LOCK_ROOT,
+      owner: expect.stringContaining('-probation-rollback-'), leaseMinutes: Infinity, probe: expect.any(Function) });
+    expect(withWriteLock.mock.calls[0][2].probe({ owner: 'unknown:1' })).toBe('alive');
+    expect(repo.run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(true);
+    expect(existsSync(f.markerFile)).toBe(false);
+    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.good);
+    expect(readFileSync(join(f.root, 'build.txt'), 'utf8')).toBe('proven build\n');
+    expect(readRebuildState(f.root, f.env)).toMatchObject({
+      adopted: { head: repo.good, inputsKey: f.good.inputsKey },
+      rejected: { inputsKey: f.probation.inputsKey, reason: 'no-tick-progress', probation: true },
+    });
+    expect(readReadyCandidate(f.root, f.env)).toBeNull();
+    expect(existsSync(f.probationFile)).toBe(false);
+    expect(f.opts.emit.mock.calls.some(([event]) => event.kind === 'probation-rolled-back')).toBe(true);
+  });
+
+
+  it.each(['missing', 'invalid'])('rollback marker with %s failed SHA refuses recovery and alerts once', async kind => {
+    const f = fixture(); const repo = realRepo(f);
+    await requestRollback({ ...f.opts, run: repo.run });
+    const marker = JSON.parse(readFileSync(f.markerFile, 'utf8'));
+    if (kind === 'missing') delete marker.from;
+    else marker.from = 'not-a-sha';
+    json(f.markerFile, marker);
+    const before = readRebuildState(f.root, f.env);
+    withWriteLock.mockClear();
+    expect(await applyPendingRollback({ ...f.opts, run: repo.run }))
+      .toEqual({ ok: false, reason: 'rollback-request-unreadable' });
+    expect(await applyPendingRollback({ ...f.opts, run: repo.run }))
+      .toEqual({ ok: false, reason: 'rollback-request-unreadable' });
+    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
+    expect(readRebuildState(f.root, f.env)).toEqual(before);
+    expect(JSON.parse(readFileSync(f.markerFile, 'utf8'))).toEqual(marker);
+    expect(withWriteLock).not.toHaveBeenCalled();
+    expect(readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n')).toHaveLength(1);
+  });
+
+
+  it.each(['corrupt', 'incomplete', 'directory'])('unreadable %s rollback marker stays and alerts once', async kind => {
+    const f = fixture(); f.seed();
+    if (kind === 'directory') mkdirSync(f.markerFile);
+    else writeFileSync(f.markerFile, kind === 'corrupt' ? '{broken' : '{}');
+    expect(await applyPendingRollback(f.opts)).toMatchObject({ ok: false });
+    expect(await applyPendingRollback(f.opts)).toMatchObject({ ok: false });
+    expect(existsSync(f.markerFile)).toBe(true);
+    expect(readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n')).toHaveLength(1);
+    expect(withWriteLock).not.toHaveBeenCalled();
+  });
+
+
+  it('a live reader makes normal boot lock acquisition time out without reclaiming its slot', async () => {
+    const f = fixture(); const repo = realRepo(f);
+    await requestRollback({ ...f.opts, run: repo.run });
+    const lockOpts = { owner: 'busy-reader:1', lockRoot: f.env.WE_DAEMON_CLONE_LOCK_ROOT, nowMs: f.opts.now() };
+    expect(acquireRead(f.root, lockOpts).ok).toBe(true);
+    try {
+      expect(await applyPendingRollback({ ...f.opts, run: repo.run, lockWaitMs: 0 }))
+        .toEqual({ ok: false, reason: 'rollback-lock-timeout' });
+      expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
+      expect(existsSync(f.markerFile)).toBe(true);
+      expect(inspectCloneLock(f.root, { lockRoot: lockOpts.lockRoot }).readers).toHaveLength(1);
+    } finally { releaseRead(f.root, lockOpts); }
+  });
+
+
+  it.each(['listed', 'unresolved', 'malformed'])('boot rollback refuses a newly unverified %s target inside the lock', async kind => {
+    const f = fixture(); const repo = realRepo(f);
+    await requestRollback({ ...f.opts, run: repo.run });
+    const marker = readFileSync(f.markerFile, 'utf8');
+    const actual = await vi.importActual('../../daemon-clone-lock.mjs');
+    withWriteLock.mockImplementationOnce((root, fn, opts) => actual.withWriteLock(root, async () => {
+      writeRebuildState(f.root, { ...readRebuildState(f.root, f.env),
+        forceUnverifiedTrees: kind === 'malformed' ? {} : [repo.git(['rev-parse', `${repo.good}^{tree}`])],
+      }, f.env);
+      return fn();
+    }, opts));
+    const run = (args, opts) => kind === 'unresolved' && args.includes(`${repo.good}^{tree}`)
+      ? { status: 1 } : repo.run(args, opts);
+    repo.run.mockClear();
+    expect(await applyPendingRollback({ ...f.opts, run }))
+      .toEqual({ ok: false, reason: 'proven-good-unverified' });
+    expect(repo.run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
+    expect(readFileSync(join(f.root, 'build.txt'), 'utf8')).toBe('failed build\n');
+    expect(readFileSync(f.markerFile, 'utf8')).toBe(marker);
+    expect(readRebuildState(f.root, f.env).rejected).toBeNull();
+    expect(JSON.parse(readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim()))
+      .toMatchObject({ kind: 'probation-needs-you', detail: { reason: 'proven-good-unverified' } });
+    expect(f.opts.emit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'probation-needs-you',
+      detail: { reason: 'proven-good-unverified' } }), { env: expect.anything() });
+  });
+
+
+  it.each([true, undefined])('boot recovery preserves only probation rejection (probation=%s)', async probation => {
+    const f = fixture(); const repo = realRepo(f);
+    repo.git(['reset', '--hard', repo.good]);
+    const rejected = { inputsKey: 'failed-inputs', reason: 'no-tick-progress', at: iso(f.opts.now()),
+      ...(probation ? { probation } : {}) };
+    writeRebuildState(f.root, { ...readRebuildState(f.root, f.env), rejected,
+      inProgress: { target: repo.good, prevHead: repo.failed, verified: true,
+        inputsKey: 'good-inputs', mainSha: repo.good, applied: [], startedAt: iso(ADOPTED_AT - 3_600_000) },
+    }, f.env);
+    expect(await prepareRebuild({ ...f.opts, run: repo.run }))
+      .toMatchObject({ terminal: true, result: { reason: 'recovered-adopted', head: repo.good } });
+    expect(readRebuildState(f.root, f.env).rejected).toEqual(probation ? rejected : null);
+    expect(readRebuildState(f.root, f.env).inProgress).toBeNull();
+  });
+
+
+  it('crash after rollback reset persists rejection before reset and boot recovery keeps failed inputs rejected', async () => {
+    const f = fixture(); const repo = realRepo(f);
+    repo.git(['update-ref', 'refs/remotes/origin/main', repo.failed]);
+    const plan = await planRebuild({ git: args => repo.run(args), headSha: repo.good, mainRef: 'origin/main' });
+    expect(plan.ok).toBe(true);
+    writeRebuildState(f.root, { ...readRebuildState(f.root, f.env), adopted: {
+      head: repo.failed, inputsKey: plan.inputsKey, mainSha: repo.failed, applied: [],
+    } }, f.env);
+    json(f.probationFile, { ...f.probation, inputsKey: plan.inputsKey });
+    await requestRollback({ ...f.opts, run: repo.run, reason: 'no-tick-progress' });
+    // Exit the child immediately after the real reset, before finalize can save or clear the marker.
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import { applyPendingRollback } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../probation.mjs')).href)};
+      import { gitRun } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../../main-staleness.mjs')).href)};
+      await applyPendingRollback({ root: process.env.TEST_ROOT, env: process.env,
+        now: () => ${ADOPTED_AT + WINDOW + 1}, log: {},
+        run: (args, opts) => {
+          const result = gitRun(args, opts);
+          if (args[0] === 'reset' && result.status === 0) process.exit(73);
+          return result;
+        } });
+    `], { env: { ...f.env, TEST_ROOT: f.root }, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024 });
+    expect(child.status, child.stderr).toBe(73);
+    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.good);
+    expect(existsSync(f.markerFile)).toBe(true);
+    const rejection = { inputsKey: plan.inputsKey, reason: 'no-tick-progress', at: iso(f.opts.now()), probation: true };
+    expect(readRebuildState(f.root, f.env)).toMatchObject({
+      rejected: rejection, inProgress: { target: repo.good, prevHead: repo.failed, verified: true },
+    });
+    const prepare = () => prepareRebuild({ ...f.opts, env: { ...f.env, WE_DAEMON_REBUILD_SKIP_UNRELATED: '0' },
+      // All objects are local; emulate a successful fetch without any remote IO.
+      run: (args, opts) => args[0] === 'fetch' ? { status: 0, stdout: '' } : repo.run(args, opts),
+      prState: async () => null });
+    expect(await prepare()).toMatchObject({ terminal: true, result: { reason: 'recovered-adopted', head: repo.good } });
+    expect(readRebuildState(f.root, f.env)).toMatchObject({ rejected: rejection, inProgress: null });
+    expect(await prepare()).toMatchObject({ terminal: true, result: { reason: 'still-rejected', plan: { inputsKey: plan.inputsKey } } });
+    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.good);
+    expect(readRebuildState(f.root, f.env).rejected).toEqual(rejection);
+  });
+
+
+  it('no pending rollback does nothing', async () => {
+    const f = fixture();
+    expect(await applyPendingRollback(f.opts)).toEqual({ action: 'none' });
+    expect(withWriteLock).not.toHaveBeenCalled();
+  });
+
+
+  it('failed finalization keeps the rollback marker for next boot', async () => {
+    const f = fixture(); const repo = realRepo(f);
+    await requestRollback({ ...f.opts, run: repo.run });
+    const run = (args, opts) => args[0] === 'reset' ? { status: 1, stderr: 'reset refused' } : repo.run(args, opts);
+    expect(await applyPendingRollback({ ...f.opts, run })).toMatchObject({ ok: false });
+    expect(existsSync(f.markerFile)).toBe(true);
+    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
+  });
+
+
+  it('rejected inputsKey is not re-adopted: rollback persists the failed key without retryAt', async () => {
+    const f = fixture(); const repo = realRepo(f);
+    expect(await requestRollback({ ...f.opts, run: repo.run, expectSha: repo.failed })).toMatchObject({ ok: true });
+    expect(await applyPendingRollback({ ...f.opts, run: repo.run })).toMatchObject({ ok: true });
+    const rejected = readRebuildState(f.root, f.env).rejected;
+    expect(rejected).toMatchObject({ inputsKey: 'failed-inputs', probation: true, reason: 'probation-failed' });
+    expect(rejected).not.toHaveProperty('retryAt');
+    expect(Number.isFinite(Date.parse(rejected.at))).toBe(true);
+    expect(await checkProbationAtTick(f.opts)).toMatchObject({ action: 'none' });
+    expect(readRebuildState(f.root, f.env).rejected).toEqual(rejected);
+  });
+
+
+  it('CLI provenGood only requests rollback and leaves HEAD and adopted state untouched', () => {
+    const f = fixture(); const repo = realRepo(f);
+    const before = readRebuildState(f.root, f.env);
+    const cli = spawnSync(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), '../probation.mjs'),
+      'rollback', `--clone=${f.root}`, '--to=provenGood'], {
+      cwd: f.base, env: f.env, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024,
+    });
+    expect(cli.error).toBeUndefined();
+    expect(cli.status).toBe(0);
+    expect(JSON.parse(cli.stdout)).toEqual({ ok: true, requested: true });
+    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
+    expect(readRebuildState(f.root, f.env)).toEqual(before);
+    expect(JSON.parse(readFileSync(f.markerFile, 'utf8'))).toMatchObject({ to: repo.good, rejectInputsKey: 'failed-inputs' });
+    expect(existsSync(f.probationFile)).toBe(true);
+  });
+
+
+  it('CLI refuses unknown --to without changing HEAD or adopted state', () => {
+    const f = fixture(); const repo = realRepo(f);
+    const before = readRebuildState(f.root, f.env);
+    // Resolve on disk: Vite rewrites new URL(..., import.meta.url) as an asset URL.
+    const cli = spawnSync(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), '../probation.mjs'),
+      'rollback', `--clone=${f.root}`, '--to=unknown'], {
+      cwd: f.base, env: f.env, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024,
+    });
+    expect(cli.error).toBeUndefined();
+    expect(cli.status).toBe(1);
+    expect(`${cli.stdout}\n${cli.stderr}`).toMatch(/unknown|invalid|unsupported|provenGood/i);
+    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
+    expect(readRebuildState(f.root, f.env)).toEqual(before);
+  });
+
+});
 
 vi.mock('../../daemon-clone-lock.mjs', async importOriginal => {
   const actual = await importOriginal();
@@ -48,9 +324,16 @@ const OTHER = 'c'.repeat(40);
 const iso = ms => new Date(ms).toISOString();
 const dirs = [];
 
-beforeEach(() => { clearOutcomeChecks(); withWriteLock.mockClear(); });
+it('late openProbation for B after C finalize is a no-op', () => {
+  const f = fixture();
+  f.seed();
+  const before = readFileSync(f.probationFile, 'utf8');
+  expect(openProbation({ ...f.opts, ...f.probation, run: () => ({ status: 0, stdout: OTHER }) })).toBe(false);
+  expect(readFileSync(f.probationFile, 'utf8')).toBe(before);
+});
+
+beforeEach(() => { withWriteLock.mockClear(); });
 afterEach(() => {
-  clearOutcomeChecks();
   vi.clearAllTimers();
   vi.useRealTimers();
   vi.unstubAllEnvs();
@@ -88,18 +371,18 @@ function fixture() {
   const tickFile = join(env.WE_DAEMON_STATE_DIR, `${key}.ticks.worker.json`);
   const good = { head: GOOD, inputsKey: 'good-inputs', mainSha: GOOD, applied: [], provenAt: iso(ADOPTED_AT - 10_000) };
   const probation = {
-    sha: FAILED, inputsKey: 'failed-inputs', mainSha: GOOD,
+    adoptionId: '11111111-1111-4111-8111-111111111111', sha: FAILED, inputsKey: 'failed-inputs', mainSha: GOOD,
     applied: [{ ref: 'overlay/example', sha: FAILED }], prevHead: GOOD,
     adoptedAt: iso(ADOPTED_AT), bootedAt: iso(ADOPTED_AT), bootPid: process.pid, probationMs: WINDOW,
     baseline: { [basename(tickFile)]: iso(ADOPTED_AT - 100) }, boots: 0, version: 1,
   };
-  const run = vi.fn(() => { throw new Error('Unexpected Git IO in injected fixture'); });
+  const run = vi.fn(() => ({ status: 0, stdout: FAILED }));
   const rollback = vi.fn(async () => ({ ok: true }));
   const emit = vi.fn();
   const log = { error: vi.fn(), warn: vi.fn(), info: vi.fn(), log: vi.fn() };
   const opts = {
     root, env, stateOpts: { env }, log, run, rollback, emit,
-    now: () => ADOPTED_AT + WINDOW + 1, readHead: () => FAILED, processStartMs: ADOPTED_AT,
+    now: () => ADOPTED_AT + WINDOW + 1, bootSha: FAILED, bootAt: ADOPTED_AT,
   };
   return {
     base, root, env, good, probation, probationFile, provenFile, tickFile, opts,
@@ -116,151 +399,10 @@ function fixture() {
   };
 }
 
-// No remote, fetch, push, hooks, or user Git configuration. commit-tree creates
-// local fixture objects; the real rollback must move HEAD and the tracked bytes.
-function realRepo(f) {
-  const run = vi.fn((args, opts = {}) => {
-    if (['fetch', 'push', 'pull', 'clone'].includes(args[0])) throw new Error('Network Git forbidden');
-    return spawnSync('git', ['-c', 'core.hooksPath=/dev/null', ...args], {
-      cwd: opts.cwd || f.root, env: {
-        ...f.env, GIT_AUTHOR_NAME: 'Probation test', GIT_AUTHOR_EMAIL: 'test@example.invalid',
-        GIT_COMMITTER_NAME: 'Probation test', GIT_COMMITTER_EMAIL: 'test@example.invalid',
-        GIT_AUTHOR_DATE: iso(ADOPTED_AT), GIT_COMMITTER_DATE: iso(ADOPTED_AT),
-      }, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024,
-    });
-  });
-  const git = args => {
-    const r = run(args);
-    if (r.status !== 0) throw new Error(`Fixture git ${args[0]} failed: ${r.stderr}`);
-    return r.stdout.trim();
-  };
-  git(['init', '-q', '-b', 'main']);
-  writeFileSync(join(f.root, 'build.txt'), 'proven build\n');
-  git(['add', 'build.txt']);
-  const good = git(['commit-tree', git(['write-tree']), '-m', 'proven fixture']);
-  git(['reset', '--hard', good]);
-  writeFileSync(join(f.root, 'build.txt'), 'failed build\n');
-  git(['add', 'build.txt']);
-  const failed = git(['commit-tree', git(['write-tree']), '-p', good, '-m', 'failed fixture']);
-  git(['reset', '--hard', failed]);
-  f.good.head = good;
-  f.good.mainSha = good;
-  Object.assign(f.probation, { sha: failed, prevHead: good, mainSha: good, applied: [] });
-  f.seed();
-  return { run, git, good, failed };
-}
-
-describe('sibling boot accounting', () => {
-  it('four live sibling processes can promote the fourth process tick without rollback', async () => {
-    expect((await siblingStartupBreak.run()).violations).toEqual([]);
-  }, 30_000);
-
-  it('re-reads sibling overlap under registration lock after an initially empty boot snapshot', async () => {
-    vi.useFakeTimers();
-    const f = fixture(); f.seed();
-    const probeBoot = vi.fn(() => 'dead');
-    armProbationWatch({ ...f.opts, now: () => ADOPTED_AT + 10, probeBoot, readHead() {
-      // A delayed first startup read boots=0; siblings register before it gets the mutex.
-      json(f.probationFile, { ...f.probation, boots: 1, concurrentBoots: true, bootPid: 11002, bootHost: hostname() });
-      return FAILED;
-    }, onRolledBack: vi.fn() });
-    expect(readProbation(f.root, f.env)).toMatchObject({ boots: 1, concurrentBoots: true, bootPid: process.pid });
-    await vi.advanceTimersByTimeAsync(0);
-    expect(f.opts.rollback).not.toHaveBeenCalled();
-  });
-
-  it.each(['live', 'unknown', 'unreadable', 'dead'])('preserves a %s registration holder and retries after release', async kind => {
-    vi.useFakeTimers();
-    const f = fixture(); f.seed();
-    const lockRoot = join(f.env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(f.root)}.probation-registration`);
-    const lockKey = `${f.probation.sha}:${f.probation.adoptedAt}`;
-    const pid = kind === 'dead' ? 2147483647 : process.pid;
-    const owner = `${kind === 'unknown' ? 'remote.invalid' : hostname()}:${pid}-fixture`;
-    const entry = makeLockEntry(owner, lockKey, iso(ADOPTED_AT - 100_000), pid);
-    expect(acquireLockDir(lockRoot, lockKey, entry)).toBe(true);
-    if (kind === 'unreadable') unlinkSync(join(lockDirFor(lockRoot, lockKey), 'lock.json'));
-    armProbationWatch({ ...f.opts, now: () => ADOPTED_AT + 10, intervalMs: 10, onRolledBack: vi.fn() });
-    expect(readProbation(f.root, f.env).boots).toBe(0);
-    expect(existsSync(lockDirFor(lockRoot, lockKey))).toBe(true);
-    if (kind !== 'unreadable') expect(readLockEntry(lockRoot, lockKey)?.owner).toBe(owner);
-    json(f.probationFile, { ...f.probation, boots: 1, concurrentBoots: true });
-    releaseLockDir(lockRoot, lockKey);
-    await vi.advanceTimersByTimeAsync(10);
-    expect(readProbation(f.root, f.env)).toMatchObject({ boots: 1, bootPid: process.pid });
-    expect(readProbation(f.root, f.env).concurrentBoots).toBe(true);
-    expect(existsSync(lockDirFor(lockRoot, lockKey))).toBe(false);
-    expect(f.opts.rollback).not.toHaveBeenCalled();
-  });
-
-  it('abandoned registration retains deadline enforcement and does not lock a later adoption', async () => {
-    vi.useFakeTimers();
-    const f = fixture(); f.seed();
-    const lockRoot = join(f.env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(f.root)}.probation-registration`);
-    const lockKey = `${f.probation.sha}:${f.probation.adoptedAt}`;
-    const entry = makeLockEntry(`${hostname()}:2147483647`, lockKey, iso(ADOPTED_AT), 2147483647);
-    expect(acquireLockDir(lockRoot, lockKey, entry)).toBe(true);
-    armProbationWatch({ ...f.opts, now: () => ADOPTED_AT + 2 * WINDOW + 1, onRolledBack: vi.fn() });
-    await vi.advanceTimersByTimeAsync(0);
-    expect(f.opts.rollback).toHaveBeenCalledWith('no-tick-progress', {});
-    expect(readLockEntry(lockRoot, lockKey)).toEqual(entry);
-    json(f.probationFile, { ...f.probation, adoptedAt: iso(ADOPTED_AT + 1) });
-    armProbationWatch({ ...f.opts, processStartMs: ADOPTED_AT + 1, now: () => ADOPTED_AT + 10, onRolledBack: vi.fn() });
-    expect(readProbation(f.root, f.env)).toMatchObject({ boots: 1, bootPid: process.pid });
-    expect(readLockEntry(lockRoot, lockKey)).toEqual(entry);
-    await vi.advanceTimersByTimeAsync(0);
-  });
-
-  it.each([undefined, 'remote.invalid'])('treats missing or remote predecessor host %s as unknown', async bootHost => {
-    vi.useFakeTimers();
-    const f = fixture(); f.seed();
-    json(f.probationFile, { ...f.probation, boots: 3, bootPid: 2147483647, bootHost });
-    armProbationWatch({ ...f.opts, now: () => ADOPTED_AT + 10, onRolledBack: vi.fn() });
-    expect(readProbation(f.root, f.env)).toMatchObject({ boots: 1, concurrentBoots: true });
-    await vi.advanceTimersByTimeAsync(0);
-    expect(f.opts.rollback).not.toHaveBeenCalled();
-  });
-
-  it.each(['alive', 'unknown', 'throws'])('does not treat a %s predecessor as a crash, even after later exits', async status => {
-    vi.useFakeTimers();
-    const f = fixture(); f.seed();
-    json(f.probationFile, { ...f.probation, boots: 3, bootPid: 11001, bootHost: hostname() });
-    const probeBoot = vi.fn(() => {
-      if (status === 'throws') throw new Error('probe unavailable');
-      return status;
-    });
-    armProbationWatch({ ...f.opts, probeBoot, now: () => ADOPTED_AT + 10, onRolledBack: vi.fn() });
-    const registered = readProbation(f.root, f.env);
-    expect(registered).toMatchObject({ boots: 1, concurrentBoots: true, bootPid: process.pid });
-    json(f.tickFile, { pid: process.pid, head: FAILED, lastTickDoneAt: iso(ADOPTED_AT + 1) });
-    await vi.advanceTimersByTimeAsync(0);
-    expect(f.opts.rollback).not.toHaveBeenCalled();
-    expect(readProvenGood(f.root, f.env)?.head).toBe(FAILED);
-
-    // A departed most-recent sibling does not make earlier overlapping siblings crashes.
-    const g = fixture(); g.seed();
-    json(g.probationFile, { ...registered, bootPid: 11002 });
-    armProbationWatch({ ...g.opts, probeBoot: () => 'dead', now: () => ADOPTED_AT + 10, onRolledBack: vi.fn() });
-    expect(readProbation(g.root, g.env)).toMatchObject({ boots: 1, concurrentBoots: true });
-    expect(evaluateProbation({ probation: readProbation(g.root, g.env), head: FAILED, now: ADOPTED_AT + WINDOW + 1 }))
-      .toEqual({ action: 'fail', reason: 'no-tick-progress' });
-    await vi.advanceTimersByTimeAsync(0);
-  });
-
-  it('still detects four sequential boots with confirmed predecessor exits', async () => {
-    vi.useFakeTimers();
-    const f = fixture(); f.seed();
-    json(f.probationFile, { ...f.probation, boots: 3, bootPid: 2147483647, bootHost: hostname() });
-    armProbationWatch({ ...f.opts, now: () => ADOPTED_AT + 10, onRolledBack: vi.fn() });
-    expect(readProbation(f.root, f.env).boots).toBe(4);
-    await vi.advanceTimersByTimeAsync(0);
-    expect(f.opts.rollback).toHaveBeenCalledWith('crash-loop', {});
-  });
-});
-
 describe('boot rollback send-back regressions (injected Git)', () => {
   function pending(f) {
     f.seed();
-    json(f.markerFile, { from: FAILED, to: GOOD, ...f.good,
+    json(f.markerFile, { adoptionId: f.probation.adoptionId, from: FAILED, to: GOOD, ...f.good,
       rejectInputsKey: 'failed-inputs', reason: 'no-tick-progress', at: iso(ADOPTED_AT) });
   }
 
@@ -394,32 +536,6 @@ describe('boot rollback send-back regressions (injected Git)', () => {
     }
   });
 
-  it.each(['no-proven-good', 'proven-good-unverified', 'rollback-request-unreadable', 'rebuild-state-unreadable'])
-  ('persistent %s refusal emits one alert, event, and log across polls', async reason => {
-    const f = fixture(); pending(f);
-    if (reason === 'no-proven-good') unlinkSync(f.provenFile);
-    if (reason === 'proven-good-unverified') writeFileSync(rebuildStatePath(f.root, f.env), '{');
-    if (reason === 'rollback-request-unreadable') writeRebuildState(f.root, { adopted: null }, f.env);
-    if (reason === 'rebuild-state-unreadable') {
-      writeFileSync(rebuildStatePath(f.root, f.env), '{');
-      json(f.tickFile, { pid: process.pid, head: FAILED, lastTickDoneAt: iso(ADOPTED_AT + 1) });
-    }
-    const run = () => ({ status: 0, stdout: FAILED });
-    for (let poll = 0; poll < 4; poll++) {
-      await runProbationTick({ ...f.opts, rollback: undefined, run,
-        now: () => reason === 'rebuild-state-unreadable' ? ADOPTED_AT + 2 : f.opts.now() });
-    }
-    const alerts = readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(JSON.parse);
-    expect(alerts).toEqual([expect.objectContaining({ detail: { reason } })]);
-    expect(f.opts.emit.mock.calls.filter(([event]) => event.kind === 'probation-needs-you')).toHaveLength(1);
-    expect(f.opts.log.error).toHaveBeenCalledTimes(1);
-    // Dedupe is reason-specific; a different refusal on the same root still alerts.
-    if (reason !== 'no-proven-good') unlinkSync(f.provenFile);
-    await requestRollback({ ...f.opts, run });
-    const reasons = readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(line => JSON.parse(line).detail.reason);
-    expect(reasons).toEqual(reason === 'no-proven-good' ? [reason] : [reason, 'no-proven-good']);
-  });
-
   it('post-reset HEAD read failure retires failed code only once', async () => {
     const f = fixture(); pending(f);
     let head = FAILED, readable = true;
@@ -519,7 +635,7 @@ describe('boot rollback send-back regressions (injected Git)', () => {
       resumeFinalization();
       expect(await ticking).toBe('restarted');
       expect(c.onRestart).toHaveBeenCalledWith(expect.objectContaining({
-        reason: 'rollback-request-changed', head: GOOD, restartRequired: true,
+        reason: 'probation-rollback', head: GOOD, restartRequired: true,
       }));
       expect(c.tick).not.toHaveBeenCalled();
       expect(c.acquire).not.toHaveBeenCalled();
@@ -552,6 +668,17 @@ describe('boot rollback send-back regressions (injected Git)', () => {
     } finally { releaseRead(f.root, lockOpts); }
   });
 
+  it('boot recovery reclaims a dead rollback writer using the emitted owner shape', async () => {
+    const f = fixture(); pending(f);
+    const deadPid = 2147483647;
+    const opts = { owner: `${hostname()}:${deadPid}-probation-rollback-fixture`, pid: deadPid,
+      lockRoot: f.env.WE_DAEMON_CLONE_LOCK_ROOT, now: f.opts.now, waitMs: 0, leaseMinutes: Infinity };
+    expect((await acquireWrite(f.root, opts)).ok).toBe(true);
+    expect(await applyPendingRollback({ ...f.opts, bootHead: GOOD, lockWaitMs: 0,
+      run: () => ({ status: 0, stdout: GOOD }) })).toMatchObject({ ok: true });
+    expect(inspectCloneLock(f.root, opts).writer).toBeNull();
+  });
+
   it.each(['corrupt', 'directory', 'missing', 'array', 'null'])('unreadable rebuild state refuses promotion and rollback: %s', async kind => {
     const f = fixture(); pending(f);
     const file = rebuildStatePath(f.root, f.env);
@@ -564,14 +691,14 @@ describe('boot rollback send-back regressions (injected Git)', () => {
     expect(existsSync(f.markerFile)).toBe(true);
     rmSync(f.provenFile);
     json(f.tickFile, { pid: process.pid, head: FAILED, lastTickDoneAt: iso(ADOPTED_AT + 1) });
-    await runProbationTick({ ...f.opts, run, now: () => ADOPTED_AT + 2 });
+    await checkProbationAtTick({ ...f.opts, run, now: () => ADOPTED_AT + 2 });
     expect(readProvenGood(f.root, f.env)).toBeNull();
   });
 
   it('openProbation never seeds provenGood from an adoption still on probation', () => {
     const f = fixture(); f.seed(); rmSync(f.provenFile);
     const preAdopted = { head: FAILED, inputsKey: 'failed-inputs', mainSha: GOOD, applied: [] };
-    expect(openProbation({ ...f.opts, ...f.probation, sha: OTHER, prevHead: FAILED, preAdopted })).toBe(true);
+    expect(openProbation({ ...f.opts, ...f.probation, sha: OTHER, prevHead: FAILED, preAdopted, run: () => ({ status: 0, stdout: OTHER }) })).toBe(true);
     expect(readProvenGood(f.root, f.env)).toBeNull();
   });
 
@@ -583,7 +710,7 @@ describe('boot rollback send-back regressions (injected Git)', () => {
     expect(await requestRollback({ ...f.opts, run: () => ({ status: 0, stdout: FAILED }) }))
       .toEqual({ ok: false, reason: 'no-proven-good' });
     expect(existsSync(f.markerFile)).toBe(false);
-    json(f.markerFile, { from: FAILED, to: GOOD, ...f.good,
+    json(f.markerFile, { adoptionId: f.probation.adoptionId, from: FAILED, to: GOOD, ...f.good,
       rejectInputsKey: 'failed-inputs', reason: 'no-tick-progress', at: iso(ADOPTED_AT) });
     expect(await applyPendingRollback({ ...f.opts, run: () => ({ status: 0, stdout: FAILED }) }))
       .toEqual({ ok: false, reason: 'proven-good-unverified' });
@@ -603,946 +730,243 @@ describe('boot rollback send-back regressions (injected Git)', () => {
   });
 });
 
-describe('no-restart adoptions', () => {
-  it.each(['skipped-unrelated', 'adopted', 'sibling'])('%s adoption can prove continued ticking without a fresh boot', async reason => {
-    const f = fixture();
-    let at = ADOPTED_AT;
-    let head = GOOD;
-    const onRestart = vi.fn();
-    const wrapped = withSelfSync({ tickOnce: () => {
-      json(f.tickFile, { pid: process.pid, head, lastTickDoneAt: iso(++at) });
-      return 'ticked';
-    } }, {
-      root: f.root, env: f.env, now: () => at, log: f.opts.log, onRestart,
-      versions: null, background: false, applyPendingRollback: async () => ({ action: 'none' }),
-      readHead: () => head, readState: () => ({ adopted: null }),
-      acquireRead: () => ({ ok: true }), releaseRead: () => {},
-      importClosure: () => ({ files: new Set(['scripts/daemon.mjs']), complete: true, bareDeps: false, jsonNames: new Set() }),
-      diffFiles: () => ['docs/example.md'],
-      rebuild: async () => {
-        if (head !== FAILED) {
-          json(f.provenFile, f.good);
-          writeRebuildState(f.root, { adopted: { head: FAILED, inputsKey: 'failed-inputs', mainSha: GOOD, applied: [] } }, f.env);
-          openProbation({ ...f.opts, ...f.probation, now: () => at });
-          head = FAILED;
-        }
-        return { moved: reason !== 'sibling', adopted: true, head, reason };
-      },
+
+describe('S2a adoption identity and synchronous liveness', () => {
+  const OTHER_ID = '22222222-2222-4222-8222-222222222222';
+  const tick = f => json(f.tickFile, { pid: process.pid, head: FAILED, lastTickDoneAt: iso(ADOPTED_AT + 1) });
+  const snapshot = f => [f.probationFile, f.provenFile, f.markerFile, rebuildStatePath(f.root, f.env)]
+    .map(file => existsSync(file) ? readFileSync(file, 'utf8') : null);
+
+  it('stale rollback request cannot delete a newer adoption probation', () => {
+    const f = fixture(); f.seed();
+    const id = f.probation.adoptionId;
+    expect(openProbation({ ...f.opts, ...f.probation, sha: OTHER, run: () => ({ status: 0, stdout: OTHER }) })).toBe(true);
+    const before = snapshot(f);
+    expect(requestRollback({ ...f.opts, expectId: id, expectSha: FAILED })).toMatchObject({ reason: 'adoption-changed' });
+    expect(snapshot(f)).toEqual(before);
+  });
+
+  it.each(['open', 'request', 'tick-pass', 'tick-fail', 'tick-delete', 'boot', 'apply', 'proven-good', 'lock'])(
+    'probation mutation with a mismatched adoptionId changes no file: %s', async mutation => {
+      const f = fixture(); f.seed(); tick(f);
+      if (mutation === 'apply') requestRollback(f.opts);
+      const before = snapshot(f);
+      const options = { ...f.opts, expectId: OTHER_ID, bootAt: ADOPTED_AT + 1 };
+      if (mutation === 'open') openProbation({ ...options, ...f.probation, sha: OTHER, run: () => ({ status: 0, stdout: OTHER }) });
+      if (mutation === 'request') requestRollback(options);
+      if (mutation.startsWith('tick')) checkProbationAtTick({ ...options,
+        bootAt: ADOPTED_AT,
+        now: () => mutation === 'tick-fail' ? ADOPTED_AT + 3000 : ADOPTED_AT + 2,
+        run: () => ({ status: 0, stdout: mutation === 'tick-delete' ? OTHER : FAILED }) });
+      if (mutation === 'boot') await bootProbation(options);
+      if (mutation === 'apply') await applyPendingRollback(options);
+      if (mutation === 'proven-good') expect(writeProvenGood(f.root, f.env, { ...f.good, head: OTHER }, OTHER_ID)).toBe(false);
+      if (mutation === 'lock') withProbationLock(f.root, OTHER_ID, () => { throw new Error('must not enter'); }, { env: f.env });
+      expect(snapshot(f)).toEqual(before);
     });
-    expect(await wrapped.tickOnce()).toBe('ticked');
-    expect(onRestart).not.toHaveBeenCalled();
-    expect(await runProbationTick({ ...f.opts, now: () => ++at })).toEqual({ action: 'passed' });
-    expect(readProvenGood(f.root, f.env)?.head).toBe(FAILED);
-    expect(await runProbationTick({ ...f.opts, now: () => ADOPTED_AT + 2 * WINDOW + 1 })).toEqual({ action: 'none' });
-    expect(f.opts.rollback).not.toHaveBeenCalled();
-    expect(existsSync(f.markerFile)).toBe(false);
+
+  it('open stamps a fresh UUID; boot and marker preserve that adoption id', async () => {
+    const f = fixture(); f.seed(); unlinkSync(f.probationFile);
+    expect(openProbation({ ...f.opts, ...f.probation, now: () => ADOPTED_AT })).toBe(true);
+    const opened = readProbation(f.root, f.env);
+    expect(opened.adoptionId).toMatch(/^[a-f0-9-]{36}$/);
+    await bootProbation({ ...f.opts, now: () => ADOPTED_AT + 1 });
+    expect(readProbation(f.root, f.env)).toMatchObject({ adoptionId: opened.adoptionId, bootPid: process.pid, boots: 1 });
+    expect(requestRollback(f.opts).ok).toBe(true);
+    expect(JSON.parse(readFileSync(f.markerFile))).toMatchObject({ adoptionId: opened.adoptionId });
   });
 
-  it.each([{ changedFiles: null }, { changedFiles: ['scripts/daemon.mjs'] }])('unknown or deferred imported changes (%j) still require a fresh boot', async ({ changedFiles }) => {
-    const f = fixture();
-    openProbation({ ...f.opts, ...f.probation, now: () => ADOPTED_AT });
-    const wrapped = withSelfSync({ tickOnce: () => 'ticked' }, {
-      root: f.root, env: f.env, now: () => ADOPTED_AT, log: f.opts.log, onRestart: () => 'restarted',
-      versions: null, background: false, applyPendingRollback: async () => ({ action: 'none' }),
-      readHead: () => GOOD, readState: () => ({ adopted: null }),
-      acquireRead: () => ({ ok: true }), releaseRead: () => {},
-      importClosure: () => ({ files: new Set(['scripts/daemon.mjs']), complete: true, bareDeps: false, jsonNames: new Set() }),
-      diffFiles: () => changedFiles, minRestartIntervalMs: 600_000,
-      rebuild: async () => ({ moved: true, adopted: true, head: FAILED }),
+  it('duplicate opens do not renew the adoption deadline', () => {
+    const f = fixture(); f.seed();
+    const before = snapshot(f);
+    expect(openProbation({ ...f.opts, ...f.probation })).toBe(false);
+    expect(snapshot(f)).toEqual(before);
+  });
+
+  it('healthy previous tick promotes synchronously and deletes probation', () => {
+    const f = fixture(); f.seed(); tick(f);
+    expect(checkProbationAtTick({ ...f.opts, now: () => ADOPTED_AT + 2 })).toEqual({ action: 'pass' });
+    expect(readProvenGood(f.root, f.env)).toMatchObject({ head: FAILED, adoptionId: f.probation.adoptionId });
+    expect(readProbation(f.root, f.env)).toBeNull();
+  });
+
+  it.each(['pid', 'head', 'before-adoption', 'before-boot', 'future', 'unapproved-head'])(
+    'rejects invalid previous tick evidence: %s', kind => {
+      const f = fixture(); f.seed(); tick(f);
+      const evidence = JSON.parse(readFileSync(f.tickFile));
+      if (kind === 'pid') evidence.pid++;
+      if (kind === 'head') evidence.head = OTHER;
+      if (kind === 'before-adoption') evidence.lastTickDoneAt = iso(ADOPTED_AT);
+      if (kind === 'future') evidence.lastTickDoneAt = iso(ADOPTED_AT + 60_003);
+      json(f.tickFile, evidence);
+      expect(checkProbationAtTick({ ...f.opts, now: () => ADOPTED_AT + 2,
+        bootAt: kind === 'before-boot' ? ADOPTED_AT + 1 : ADOPTED_AT,
+        bootSha: kind === 'unapproved-head' ? GOOD : FAILED })).toEqual({ action: 'pending' });
+      expect(readProvenGood(f.root, f.env).head).toBe(GOOD);
     });
-    await wrapped.tickOnce();
-    expect(readProbation(f.root, f.env)).not.toHaveProperty('continuedPid');
-    expect(await runProbationTick({ ...f.opts, now: () => ADOPTED_AT + 2 * WINDOW + 1 }))
-      .toEqual({ action: 'rolled-back', reason: 'never-booted' });
+
+  it.each(['boot', 'adoption'])('late healthy evidence cannot override the %s deadline', kind => {
+    const f = fixture(); f.seed();
+    const now = ADOPTED_AT + (kind === 'adoption' ? 2 : 1) * WINDOW + 1;
+    json(f.tickFile, { pid: process.pid, head: FAILED, lastTickDoneAt: iso(now - 1) });
+    expect(checkProbationAtTick({ ...f.opts, now: () => now,
+      bootAt: kind === 'adoption' ? now - 2 : ADOPTED_AT })).toMatchObject({ action: 'fail' });
+    expect(existsSync(f.markerFile)).toBe(true);
+    expect(f.opts.run.mock.calls.every(([args]) => args[0] !== 'reset')).toBe(true);
+    expect(readProbation(f.root, f.env).adoptionId).toBe(f.probation.adoptionId);
   });
 
-  it('the adopting observer can run outcome checks after no-restart authorization', async () => {
-    vi.useFakeTimers();
-    const f = fixture();
-    openProbation({ ...f.opts, ...f.probation, now: () => ADOPTED_AT });
-    const check = vi.fn(() => ({ status: 'fail', reason: 'outcome-failed' }));
-    registerOutcomeCheck('continuation', check);
-    armProbationWatch({ ...f.opts, now: () => ADOPTED_AT + 10, observeOnly: true, onRolledBack: vi.fn() });
-    expect(continueProbation({ ...f.opts, sha: FAILED, now: () => ADOPTED_AT + 10 })).toBe(true);
-    await vi.advanceTimersByTimeAsync(0);
-    expect(check).toHaveBeenCalled();
-    expect(f.opts.rollback).toHaveBeenCalledWith('outcome-failed', {});
-    expect(readProbation(f.root, f.env)).not.toHaveProperty('bootPid');
+  it('superseded tick cleanup leaves proven good unchanged', () => {
+    const f = fixture(); f.seed();
+    expect(checkProbationAtTick({ ...f.opts, run: () => ({ status: 0, stdout: OTHER }) }))
+      .toEqual({ action: 'none', reason: 'superseded' });
+    expect(readProbation(f.root, f.env)).toBeNull();
+    expect(readProvenGood(f.root, f.env).head).toBe(GOOD);
   });
 
-  it('continuation retains the first authorization time and cannot renew either deadline', async () => {
-    const f = fixture();
-    openProbation({ ...f.opts, ...f.probation, now: () => ADOPTED_AT });
-    continueProbation({ ...f.opts, sha: FAILED, now: () => ADOPTED_AT + 10 });
-    continueProbation({ ...f.opts, sha: FAILED, now: () => ADOPTED_AT + WINDOW });
-    expect(readProbation(f.root, f.env).continuedAt).toBe(iso(ADOPTED_AT + 10));
-    expect(await runProbationTick({ ...f.opts, now: () => ADOPTED_AT + WINDOW + 11 }))
-      .toEqual({ action: 'rolled-back', reason: 'no-tick-progress' });
-    continueProbation({ ...f.opts, sha: FAILED, now: () => ADOPTED_AT + 2 * WINDOW });
-    expect(await runProbationTick({ ...f.opts, now: () => ADOPTED_AT + 2 * WINDOW + 1 }))
-      .toEqual({ action: 'rolled-back', reason: 'no-tick-progress' });
-  });
-
-  it.each(['pid', 'head', 'before-proof', 'future'])('continuation rejects a tick with invalid %s evidence', async kind => {
-    const f = fixture();
-    openProbation({ ...f.opts, ...f.probation, now: () => ADOPTED_AT });
-    continueProbation({ ...f.opts, sha: FAILED, now: () => ADOPTED_AT + 10 });
-    json(f.tickFile, { pid: kind === 'pid' ? process.pid + 1 : process.pid, head: kind === 'head' ? OTHER : FAILED,
-      lastTickDoneAt: iso(ADOPTED_AT + (kind === 'before-proof' ? 5 : kind === 'future' ? 60_021 : 11)) });
-    expect(await runProbationTick({ ...f.opts, now: () => ADOPTED_AT + 20 })).toEqual({ action: 'pending' });
-    expect(continueProbation({ ...f.opts, sha: OTHER })).toBe(false);
-  });
-
-  it('continuation cannot promote a force-unverified tree', async () => {
-    const f = fixture();
-    openProbation({ ...f.opts, ...f.probation, now: () => ADOPTED_AT });
-    continueProbation({ ...f.opts, sha: FAILED, now: () => ADOPTED_AT + 1 });
-    writeRebuildState(f.root, { forceUnverifiedTrees: [OTHER] }, f.env);
-    json(f.tickFile, { pid: process.pid, head: FAILED, lastTickDoneAt: iso(ADOPTED_AT + 2) });
-    const run = vi.fn(() => ({ status: 0, stdout: OTHER }));
-    expect(await runProbationTick({ ...f.opts, run, now: () => ADOPTED_AT + 3 })).toEqual({ action: 'passed-unverified' });
-    expect(readProvenGood(f.root, f.env)).toBeNull();
-  });
-
-  it('a continuation write cannot replace a concurrently opened adoption', () => {
-    const f = fixture();
-    openProbation({ ...f.opts, ...f.probation, now: () => ADOPTED_AT });
-    continueProbation({ ...f.opts, sha: FAILED, now: () => {
-      openProbation({ ...f.opts, ...f.probation, sha: OTHER, now: () => ADOPTED_AT + 50 });
-      return ADOPTED_AT + 10;
-    } });
-    expect(readProbation(f.root, f.env)).toMatchObject({ sha: OTHER, adoptedAt: iso(ADOPTED_AT + 50) });
-    expect(readProbation(f.root, f.env)).not.toHaveProperty('continuedPid');
-  });
-
-  it.each(['corrupt', 'stale', 'inline', 'unwritable'])('%s continuation proof cannot authorize the old process', async kind => {
-    const f = fixture();
-    openProbation({ ...f.opts, ...f.probation, now: () => ADOPTED_AT });
-    const proofFile = join(f.env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(f.root)}.probation-continuation.json`);
-    if (kind === 'corrupt') writeFileSync(proofFile, '{broken');
-    if (kind === 'stale') json(proofFile, { sha: FAILED, adoptedAt: iso(ADOPTED_AT - 1), continuedPid: process.pid, continuedAt: iso(ADOPTED_AT) });
-    if (kind === 'inline') json(f.probationFile, { ...readProbation(f.root, f.env), continuedPid: process.pid, continuedAt: iso(ADOPTED_AT) });
-    if (kind === 'unwritable') {
-      mkdirSync(proofFile);
-      expect(continueProbation({ ...f.opts, sha: FAILED, now: () => ADOPTED_AT + 1 })).toBe(false);
-    }
-    json(f.tickFile, { pid: process.pid, head: FAILED, lastTickDoneAt: iso(ADOPTED_AT + 1) });
-    expect(await runProbationTick({ ...f.opts, now: () => ADOPTED_AT + 2 })).toEqual({ action: 'pending' });
-    expect(await runProbationTick({ ...f.opts, now: () => ADOPTED_AT + 2 * WINDOW + 1 }))
-      .toEqual({ action: 'rolled-back', reason: 'never-booted' });
-  });
-});
-
-describe('probation and provenGood contracts', () => {
-  it.each([null, {}, { inputsKey: null }, { inputsKey: 7 }])(
-    'requestRollback refuses incomplete adopted inputs without writing a marker: %j', async adopted => {
+  it.each(['no-proven-good', 'proven-good-unverified', 'rebuild-state-unreadable', 'probation-unreadable'])(
+    'persistent %s refusal alerts exactly once and preserves evidence', reason => {
       const f = fixture(); f.seed();
-      writeRebuildState(f.root, { adopted }, f.env);
-      const before = readFileSync(f.probationFile, 'utf8');
-      expect(await requestRollback({ ...f.opts, run: () => ({ status: 0, stdout: FAILED }) }))
-        .toEqual({ ok: false, reason: 'rollback-request-unreadable' });
-      expect(existsSync(f.markerFile)).toBe(false);
-      expect(readFileSync(f.probationFile, 'utf8')).toBe(before);
+      if (reason === 'no-proven-good') unlinkSync(f.provenFile);
+      if (reason.includes('unverified') || reason === 'rebuild-state-unreadable') writeFileSync(rebuildStatePath(f.root, f.env), '{');
+      if (reason === 'probation-unreadable') writeFileSync(f.probationFile, '{');
+      if (reason === 'rebuild-state-unreadable') tick(f);
+      const before = snapshot(f);
+      for (let i = 0; i < 4; i++) checkProbationAtTick({ ...f.opts,
+        now: () => reason === 'rebuild-state-unreadable' ? ADOPTED_AT + 2 : ADOPTED_AT + 3000 });
       const alerts = readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(JSON.parse);
-      expect(alerts).toEqual([expect.objectContaining({ kind: 'probation-needs-you',
-        detail: { reason: 'rollback-request-unreadable' } })]);
-    },
-  );
+      expect(alerts).toEqual([expect.objectContaining({ detail: { reason } })]);
+      expect(f.opts.log.error).toHaveBeenCalledTimes(1);
+      expect(snapshot(f)).toEqual(before);
+    });
 
-  it('requestRollback validates caller fields before replacing existing recovery evidence', async () => {
-    const f = fixture(); f.seed();
-    writeFileSync(f.markerFile, 'existing recovery evidence');
-    expect(await requestRollback({ ...f.opts, reason: null, run: () => ({ status: 0, stdout: FAILED }) }))
-      .toEqual({ ok: false, reason: 'rollback-request-unreadable' });
-    expect(readFileSync(f.markerFile, 'utf8')).toBe('existing recovery evidence');
-    expect(existsSync(f.probationFile)).toBe(true);
+  it('unverified tree can pass liveness but cannot become proven good or a rollback target', () => {
+    const f = fixture(); f.seed(); tick(f);
+    writeRebuildState(f.root, { forceUnverifiedTrees: [FAILED] }, f.env);
+    expect(checkProbationAtTick({ ...f.opts, now: () => ADOPTED_AT + 2 })).toEqual({ action: 'pass' });
+    expect(readProvenGood(f.root, f.env).head).toBe(GOOD);
+    f.seed(); writeRebuildState(f.root, { forceUnverifiedTrees: [FAILED] }, f.env);
+    expect(requestRollback(f.opts)).toMatchObject({ reason: 'proven-good-unverified' });
   });
 
-  it('every required boot marker field survives the writer and is accepted by the reader', async () => {
+  it.each(['live', 'unknown', 'unreadable', 'dead'])('shared mutex handles a %s holder without expiry reclamation', kind => {
     const f = fixture(); f.seed();
+    const lockRoot = join(f.env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(f.root)}.probation-registration`);
+    const entry = makeLockEntry(kind === 'unknown' ? 'remote.invalid:123' : `${hostname()}:${kind === 'dead' ? 2147483647 : process.pid}-fixture-token`,
+      'probation', iso(0), kind === 'dead' ? 2147483647 : process.pid);
+    expect(acquireLockDir(lockRoot, 'probation', entry)).toBe(true);
+    if (kind === 'unreadable') writeFileSync(join(lockDirFor(lockRoot, 'probation'), 'lock.json'), '{');
+    const callback = vi.fn(() => true);
+    const result = withProbationLock(f.root, f.probation.adoptionId, callback, { env: f.env });
+    expect(callback).toHaveBeenCalledTimes(kind === 'dead' ? 1 : 0);
+    if (kind !== 'dead') {
+      expect(result).toMatchObject({ reason: 'probation-lock-held' });
+      expect(existsSync(lockDirFor(lockRoot, 'probation'))).toBe(true);
+    }
+  });
+
+  it('all writers stay out while asynchronous boot recovery holds the shared mutex', async () => {
+    const f = fixture(); f.seed(); requestRollback(f.opts);
+    let release, entered;
+    const waiting = new Promise(resolve => { entered = resolve; });
+    const finish = new Promise(resolve => { release = resolve; });
+    finalizeRebuild.mockImplementationOnce(async () => { entered(); await finish; return { adopted: false }; });
+    const recovery = applyPendingRollback(f.opts);
+    await waiting;
+    const before = snapshot(f);
+    expect(openProbation({ ...f.opts, ...f.probation, sha: OTHER, run: () => ({ status: 0, stdout: OTHER }) })).toBe(false);
+    expect(requestRollback(f.opts)).toMatchObject({ reason: 'probation-lock-held' });
+    expect(checkProbationAtTick(f.opts)).toMatchObject({ reason: 'probation-lock-held' });
+    expect(await bootProbation(f.opts)).toMatchObject({ reason: 'probation-lock-held' });
+    expect(writeProvenGood(f.root, f.env, f.good, f.probation.adoptionId)).toBe(false);
+    expect(snapshot(f)).toEqual(before);
+    release(); await recovery;
+  });
+
+  it.each(['alive', 'unknown', 'throws'])('sibling boot with %s predecessor is not a crash loop', async status => {
+    const f = fixture(); f.probation.boots = 3; f.probation.bootPid = 123; f.seed();
+    await bootProbation({ ...f.opts, now: () => ADOPTED_AT + 1,
+      probeBoot: () => { if (status === 'throws') throw new Error(); return status; } });
+    expect(readProbation(f.root, f.env)).toMatchObject({ boots: 1, concurrentBoots: true });
+    expect(existsSync(f.markerFile)).toBe(false);
+  });
+
+  it('confirmed sequential crash loop requests and applies rollback in the boot call', async () => {
+    const f = fixture(); f.probation.boots = PROBATION_MAX_BOOTS; f.probation.bootPid = 123; f.seed();
     let head = FAILED;
+    finalizeRebuild.mockImplementationOnce(async () => { head = GOOD; return { adopted: true }; });
+    expect(await bootProbation({ ...f.opts, now: () => ADOPTED_AT + 1,
+      run: () => ({ status: 0, stdout: head }), probeBoot: () => 'dead' })).toMatchObject({ ok: true, restartRequired: true });
+    expect(head).toBe(GOOD);
+    expect(readRebuildState(f.root, f.env).rejected).toMatchObject({ inputsKey: 'failed-inputs', reason: 'crash-loop' });
+  });
+
+  it('startup failure after adoption rolls back at a later boot', async () => {
+    const f = fixture(); f.seed();
+    let head = FAILED, at = ADOPTED_AT + 1;
     const run = () => ({ status: 0, stdout: head });
-    expect(await requestRollback({ ...f.opts, run })).toEqual({ ok: true, requested: true });
-    const marker = JSON.parse(readFileSync(f.markerFile, 'utf8'));
-    for (const field of ['from', 'to', 'inputsKey', 'mainSha', 'applied', 'rejectInputsKey', 'reason', 'at']) {
-      expect(marker[field], field).not.toBeUndefined();
-    }
-    head = GOOD; // A sibling completed the reset; exercise real boot validation and cleanup.
-    expect(await applyPendingRollback({ ...f.opts, run })).toMatchObject({ ok: true, head: GOOD });
-    expect(readRebuildState(f.root, f.env).rejected.inputsKey).toBe('failed-inputs');
-    expect(existsSync(f.markerFile)).toBe(false);
-  });
-
-  it('an unreadable probation file is kept and alerted once, never treated as none', async () => {
-    const f = fixture();
-    mkdirSync(dirname(f.probationFile), { recursive: true });
-    writeFileSync(f.probationFile, '{not json');
-    for (let poll = 0; poll < 4; poll++) {
-      expect(await runProbationTick(f.opts)).toEqual({ action: 'pending', reason: 'probation-unreadable' });
-      expect(readFileSync(f.probationFile, 'utf8')).toBe('{not json');
-    }
-    const alerts = readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(JSON.parse);
-    expect(alerts.filter(alert => alert.kind === 'probation-needs-you'
-      && alert.detail?.reason === 'probation-unreadable')).toHaveLength(1);
-  });
-
-  it('a never-settling outcome check cannot block the deadline rollback', async () => {
-    vi.useFakeTimers();
-    const f = fixture(); f.seed();
-    registerOutcomeCheck('hangs', () => new Promise(() => {}));
-    const p = runProbationTick(f.opts);
-    await vi.advanceTimersByTimeAsync(31_000);
-    expect((await p).action).toBe('rolled-back');
-    expect(f.opts.rollback).toHaveBeenCalledWith('no-tick-progress', expect.anything());
-  });
-
-  it('failure requests rollback without touching HEAD or taking a lock; boot apply resets under the normal lock', async () => {
-    const f = fixture();
-    const repo = realRepo(f);
-    writeReadyCandidate(f.root, { prevHead: repo.failed, adopt: { finalSha: repo.failed } }, f.env);
-    const rollback = vi.fn(reason => requestRollback({
-      ...f.opts, run: repo.run, expectSha: repo.failed, reason,
-    }));
-    const result = await runProbationTick({ ...f.opts, run: repo.run, readHead: () => repo.git(['rev-parse', 'HEAD']), rollback });
-    expect(result).toMatchObject({ action: 'rolled-back', reason: 'no-tick-progress' });
-    expect(rollback).toHaveBeenCalledTimes(1);
-    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
-    expect(readFileSync(join(f.root, 'build.txt'), 'utf8')).toBe('failed build\n');
-    expect(withWriteLock).not.toHaveBeenCalled();
-    expect(JSON.parse(readFileSync(f.markerFile, 'utf8'))).toEqual({
-      from: repo.failed, to: repo.good, inputsKey: f.good.inputsKey, mainSha: f.good.mainSha, applied: f.good.applied,
-      rejectInputsKey: 'failed-inputs', reason: 'no-tick-progress', at: iso(f.opts.now()),
+    const restart = vi.fn(), rebuild = vi.fn(async () => ({ moved: false }));
+    const make = () => withSelfSync({ tickOnce() { throw new Error('B startup failure'); } }, {
+      root: f.root, env: f.env, log: f.opts.log, now: () => at, versions: null, background: false,
+      readHead: () => head, readState: () => ({}), rebuild, onRestart: restart,
+      acquireRead: () => ({ ok: true }), releaseRead() {},
+      applyPendingRollback: opts => bootProbation({ ...opts, run, emit: f.opts.emit }),
+      checkProbation: opts => checkProbationAtTick({ ...opts, run, emit: f.opts.emit }),
     });
-    expect(existsSync(f.probationFile)).toBe(false);
-    expect(f.opts.emit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'probation-rollback-requested' }), { env: expect.anything() });
-    repo.run.mockClear();
-    const resetLocks = [];
-    expect(await applyPendingRollback({ ...f.opts, run: (args, opts) => {
-      if (args[0] === 'reset') resetLocks.push(inspectCloneLock(f.root, { lockRoot: f.env.WE_DAEMON_CLONE_LOCK_ROOT, nowMs: f.opts.now() }));
-      return repo.run(args, opts);
-    } })).toMatchObject({ ok: true });
-    expect(resetLocks).toHaveLength(1);
-    expect(resetLocks[0].writerLive).toBe(true);
-    expect(withWriteLock).toHaveBeenCalledTimes(1);
-    expect(withWriteLock.mock.calls[0][2]).toEqual({ now: f.opts.now, waitMs: 60000, lockRoot: f.env.WE_DAEMON_CLONE_LOCK_ROOT,
-      owner: expect.stringMatching(/^probation-rollback:/), leaseMinutes: Infinity, probe: expect.any(Function) });
-    expect(withWriteLock.mock.calls[0][2].probe({ owner: 'unknown:1' })).toBe('alive');
-    expect(repo.run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(true);
-    expect(existsSync(f.markerFile)).toBe(false);
-    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.good);
-    expect(readFileSync(join(f.root, 'build.txt'), 'utf8')).toBe('proven build\n');
-    expect(readRebuildState(f.root, f.env)).toMatchObject({
-      adopted: { head: repo.good, inputsKey: f.good.inputsKey },
-      rejected: { inputsKey: f.probation.inputsKey, reason: 'no-tick-progress', probation: true },
-    });
-    expect(readReadyCandidate(f.root, f.env)).toBeNull();
-    expect(existsSync(f.probationFile)).toBe(false);
-    expect(f.opts.emit.mock.calls.some(([event]) => event.kind === 'probation-rolled-back')).toBe(true);
-  });
-
-  it.each(['tick-in-progress', 'concurrent-mover'].flatMap(reason => ['failed', 'target'].map(head => ({ reason, head }))))
-  ('boot lock refusal $reason at $head keeps the marker, alerts, and never resets', async ({ reason, head }) => {
-    const f = fixture(); const repo = realRepo(f);
-    await requestRollback({ ...f.opts, run: repo.run });
-    const marker = readFileSync(f.markerFile, 'utf8');
-    if (head === 'target') repo.git(['reset', '--hard', repo.good]);
-    withWriteLock.mockResolvedValueOnce({ ok: false, reason, heldBy: 'busy-owner' });
-    expect(await applyPendingRollback({ ...f.opts, run: repo.run, lockWaitMs: 0 }))
-      .toEqual({ ok: false, reason: 'rollback-lock-timeout', ...(head === 'target' ? { restartRequired: true } : {}) });
-    expect(repo.git(['rev-parse', 'HEAD'])).toBe(head === 'target' ? repo.good : repo.failed);
-    expect(readFileSync(f.markerFile, 'utf8')).toBe(marker);
-    expect(readRebuildState(f.root, f.env).rejected).toBeNull();
-    expect(JSON.parse(readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim()))
-      .toMatchObject({ kind: 'probation-needs-you', detail: { reason: 'rollback-lock-timeout', heldBy: 'busy-owner' } });
-    expect(f.opts.emit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'probation-needs-you',
-      detail: { reason: 'rollback-lock-timeout', heldBy: 'busy-owner' } }), { env: expect.anything() });
-    expect(f.opts.log.error).toHaveBeenCalled();
-  });
-
-  it.each(['before boot', 'during lock acquisition'])('deferred rollback preserves a newer adoption and its state: %s', async phase => {
-    const f = fixture(); const repo = realRepo(f);
-    await requestRollback({ ...f.opts, run: repo.run, expectSha: repo.failed });
-    withWriteLock.mockResolvedValueOnce({ ok: false, reason: 'tick-in-progress', heldBy: 'busy-owner' });
-    expect(await applyPendingRollback({ ...f.opts, run: repo.run, lockWaitMs: 0 }))
-      .toEqual({ ok: false, reason: 'rollback-lock-timeout' });
-
-    writeFileSync(join(f.root, 'build.txt'), 'new healthy build\n');
-    repo.git(['add', 'build.txt']);
-    const newer = repo.git(['commit-tree', repo.git(['write-tree']), '-p', repo.failed, '-m', 'new healthy adoption']);
-    repo.git(['reset', '--hard', repo.failed]);
-    const state = { ...readRebuildState(f.root, f.env), adopted: {
-      head: newer, inputsKey: 'new-healthy-inputs', mainSha: repo.good, applied: [],
-    } };
-    const ready = { prevHead: newer, adopt: { finalSha: newer }, passedAt: iso(f.opts.now()) };
-    const probation = { ...f.probation, sha: newer, inputsKey: 'new-healthy-inputs' };
-    const adoptNewer = () => {
-      repo.git(['reset', '--hard', newer]);
-      writeRebuildState(f.root, state, f.env);
-      writeReadyCandidate(f.root, ready, f.env);
-      json(f.probationFile, probation);
-      repo.run.mockClear();
-    };
-    if (phase === 'before boot') adoptNewer();
-    else {
-      const actual = await vi.importActual('../../daemon-clone-lock.mjs');
-      withWriteLock.mockImplementationOnce((root, fn, opts) => actual.withWriteLock(root, async () => {
-        adoptNewer();
-        return fn();
-      }, opts));
-    }
-    f.opts.emit.mockClear();
-    const result = await applyPendingRollback({ ...f.opts, run: repo.run,
-      bootHead: phase === 'before boot' ? newer : repo.failed });
-    expect(result).toMatchObject({ action: 'superseded', head: newer });
-    expect(result.restartRequired === true).toBe(phase === 'during lock acquisition');
-    expect(repo.run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
-    expect(repo.git(['rev-parse', 'HEAD'])).toBe(newer);
-    expect(readFileSync(join(f.root, 'build.txt'), 'utf8')).toBe('new healthy build\n');
-    expect(readRebuildState(f.root, f.env)).toEqual(state);
-    expect(readReadyCandidate(f.root, f.env)).toEqual(ready);
-    expect(readProbation(f.root, f.env)).toEqual(probation);
-    expect(readProvenGood(f.root, f.env)).toEqual(f.good);
-    expect(existsSync(f.markerFile)).toBe(false);
-    expect(f.opts.emit).not.toHaveBeenCalled();
-  });
-
-  it('already-at-target recovery preserves concurrent adoption', async () => {
-    const f = fixture(); const repo = realRepo(f);
-    await requestRollback({ ...f.opts, run: repo.run, expectSha: repo.failed });
-    writeFileSync(join(f.root, 'build.txt'), 'new healthy build\n');
-    repo.git(['add', 'build.txt']);
-    const newer = repo.git(['commit-tree', repo.git(['write-tree']), '-p', repo.failed, '-m', 'concurrent healthy adoption']);
-    repo.git(['reset', '--hard', repo.good]);
-    const state = { ...readRebuildState(f.root, f.env), adopted: {
-      head: newer, inputsKey: 'new-healthy-inputs', mainSha: repo.good, applied: [],
-    } };
-    const ready = { prevHead: newer, adopt: { finalSha: newer } };
-    let adopted = false;
-    const adoptNewer = () => {
-      if (adopted) return;
-      adopted = true;
-      repo.git(['reset', '--hard', newer]);
-      writeRebuildState(f.root, state, f.env);
-      writeReadyCandidate(f.root, ready, f.env);
-      repo.run.mockClear();
-    };
-    const actual = await vi.importActual('../../daemon-clone-lock.mjs');
-    // A competing adoption wins before recovery's lock callback begins. The old
-    // unlocked shortcut instead sees the target, then loses state to this race.
-    withWriteLock.mockImplementationOnce((root, fn, opts) => actual.withWriteLock(root, async () => {
-      adoptNewer();
-      return fn();
-    }, opts));
-    const run = (args, opts) => {
-      const result = repo.run(args, opts);
-      if (args[0] === 'rev-parse' && args.at(-1) === 'HEAD') adoptNewer();
-      return result;
-    };
-    try {
-      const result = await applyPendingRollback({ ...f.opts, run });
-      expect(adopted).toBe(true);
-      expect(readRebuildState(f.root, f.env)).toEqual(state);
-      expect(readReadyCandidate(f.root, f.env)).toEqual(ready);
-      expect(repo.git(['rev-parse', 'HEAD'])).toBe(newer);
-      expect(readFileSync(join(f.root, 'build.txt'), 'utf8')).toBe('new healthy build\n');
-      expect(repo.run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
-      expect(result).toMatchObject({ action: 'superseded', head: newer });
-      expect(withWriteLock).toHaveBeenCalledTimes(1);
-      expect(existsSync(f.markerFile)).toBe(false);
-    } finally {
-      // The buggy shortcut never consumes the one-shot lock injection.
-      withWriteLock.mockReset();
-      withWriteLock.mockImplementation(actual.withWriteLock);
-    }
-  });
-
-  it.each(['missing', 'invalid'])('rollback marker with %s failed SHA refuses recovery and alerts once', async kind => {
-    const f = fixture(); const repo = realRepo(f);
-    await requestRollback({ ...f.opts, run: repo.run });
-    const marker = JSON.parse(readFileSync(f.markerFile, 'utf8'));
-    if (kind === 'missing') delete marker.from;
-    else marker.from = 'not-a-sha';
-    json(f.markerFile, marker);
-    const before = readRebuildState(f.root, f.env);
-    withWriteLock.mockClear();
-    expect(await applyPendingRollback({ ...f.opts, run: repo.run }))
-      .toEqual({ ok: false, reason: 'rollback-request-unreadable' });
-    expect(await applyPendingRollback({ ...f.opts, run: repo.run }))
-      .toEqual({ ok: false, reason: 'rollback-request-unreadable' });
-    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
-    expect(readRebuildState(f.root, f.env)).toEqual(before);
-    expect(JSON.parse(readFileSync(f.markerFile, 'utf8'))).toEqual(marker);
-    expect(withWriteLock).not.toHaveBeenCalled();
-    expect(readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n')).toHaveLength(1);
-  });
-
-  it.each(['corrupt', 'incomplete', 'directory'])('unreadable %s rollback marker stays and alerts once', async kind => {
-    const f = fixture(); f.seed();
-    if (kind === 'directory') mkdirSync(f.markerFile);
-    else writeFileSync(f.markerFile, kind === 'corrupt' ? '{broken' : '{}');
-    expect(await applyPendingRollback(f.opts)).toMatchObject({ ok: false });
-    expect(await applyPendingRollback(f.opts)).toMatchObject({ ok: false });
-    expect(existsSync(f.markerFile)).toBe(true);
-    expect(readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n')).toHaveLength(1);
-    expect(withWriteLock).not.toHaveBeenCalled();
-  });
-
-  it('a live reader makes normal boot lock acquisition time out without reclaiming its slot', async () => {
-    const f = fixture(); const repo = realRepo(f);
-    await requestRollback({ ...f.opts, run: repo.run });
-    const lockOpts = { owner: 'busy-reader:1', lockRoot: f.env.WE_DAEMON_CLONE_LOCK_ROOT, nowMs: f.opts.now() };
-    expect(acquireRead(f.root, lockOpts).ok).toBe(true);
-    try {
-      expect(await applyPendingRollback({ ...f.opts, run: repo.run, lockWaitMs: 0 }))
-        .toEqual({ ok: false, reason: 'rollback-lock-timeout' });
-      expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
-      expect(existsSync(f.markerFile)).toBe(true);
-      expect(inspectCloneLock(f.root, { lockRoot: lockOpts.lockRoot }).readers).toHaveLength(1);
-    } finally { releaseRead(f.root, lockOpts); }
-  });
-
-  it.each(['listed', 'unresolved', 'malformed'])('boot rollback refuses a newly unverified %s target inside the lock', async kind => {
-    const f = fixture(); const repo = realRepo(f);
-    await requestRollback({ ...f.opts, run: repo.run });
-    const marker = readFileSync(f.markerFile, 'utf8');
-    const actual = await vi.importActual('../../daemon-clone-lock.mjs');
-    withWriteLock.mockImplementationOnce((root, fn, opts) => actual.withWriteLock(root, async () => {
-      writeRebuildState(f.root, { ...readRebuildState(f.root, f.env),
-        forceUnverifiedTrees: kind === 'malformed' ? {} : [repo.git(['rev-parse', `${repo.good}^{tree}`])],
-      }, f.env);
-      return fn();
-    }, opts));
-    const run = (args, opts) => kind === 'unresolved' && args.includes(`${repo.good}^{tree}`)
-      ? { status: 1 } : repo.run(args, opts);
-    repo.run.mockClear();
-    expect(await applyPendingRollback({ ...f.opts, run }))
-      .toEqual({ ok: false, reason: 'proven-good-unverified' });
-    expect(repo.run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
-    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
-    expect(readFileSync(join(f.root, 'build.txt'), 'utf8')).toBe('failed build\n');
-    expect(readFileSync(f.markerFile, 'utf8')).toBe(marker);
-    expect(readRebuildState(f.root, f.env).rejected).toBeNull();
-    expect(JSON.parse(readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim()))
-      .toMatchObject({ kind: 'probation-needs-you', detail: { reason: 'proven-good-unverified' } });
-    expect(f.opts.emit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'probation-needs-you',
-      detail: { reason: 'proven-good-unverified' } }), { env: expect.anything() });
-  });
-
-  it.each([true, undefined])('boot recovery preserves only probation rejection (probation=%s)', async probation => {
-    const f = fixture(); const repo = realRepo(f);
-    repo.git(['reset', '--hard', repo.good]);
-    const rejected = { inputsKey: 'failed-inputs', reason: 'no-tick-progress', at: iso(f.opts.now()),
-      ...(probation ? { probation } : {}) };
-    writeRebuildState(f.root, { ...readRebuildState(f.root, f.env), rejected,
-      inProgress: { target: repo.good, prevHead: repo.failed, verified: true,
-        inputsKey: 'good-inputs', mainSha: repo.good, applied: [], startedAt: iso(ADOPTED_AT - 3_600_000) },
-    }, f.env);
-    expect(await prepareRebuild({ ...f.opts, run: repo.run }))
-      .toMatchObject({ terminal: true, result: { reason: 'recovered-adopted', head: repo.good } });
-    expect(readRebuildState(f.root, f.env).rejected).toEqual(probation ? rejected : null);
-    expect(readRebuildState(f.root, f.env).inProgress).toBeNull();
-  });
-
-  it('crash after rollback reset persists rejection before reset and boot recovery keeps failed inputs rejected', async () => {
-    const f = fixture(); const repo = realRepo(f);
-    repo.git(['update-ref', 'refs/remotes/origin/main', repo.failed]);
-    const plan = await planRebuild({ git: args => repo.run(args), headSha: repo.good, mainRef: 'origin/main' });
-    expect(plan.ok).toBe(true);
-    writeRebuildState(f.root, { ...readRebuildState(f.root, f.env), adopted: {
-      head: repo.failed, inputsKey: plan.inputsKey, mainSha: repo.failed, applied: [],
-    } }, f.env);
-    await requestRollback({ ...f.opts, run: repo.run, reason: 'no-tick-progress' });
-    // Exit the child immediately after the real reset, before finalize can save or clear the marker.
-    const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
-      import { applyPendingRollback } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../probation.mjs')).href)};
-      import { gitRun } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../../main-staleness.mjs')).href)};
-      await applyPendingRollback({ root: process.env.TEST_ROOT, env: process.env,
-        now: () => ${ADOPTED_AT + WINDOW + 1}, log: {},
-        run: (args, opts) => {
-          const result = gitRun(args, opts);
-          if (args[0] === 'reset' && result.status === 0) process.exit(73);
-          return result;
-        } });
-    `], { env: { ...f.env, TEST_ROOT: f.root }, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024 });
-    expect(child.status, child.stderr).toBe(73);
-    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.good);
-    expect(existsSync(f.markerFile)).toBe(true);
-    const rejection = { inputsKey: plan.inputsKey, reason: 'no-tick-progress', at: iso(f.opts.now()), probation: true };
-    expect(readRebuildState(f.root, f.env)).toMatchObject({
-      rejected: rejection, inProgress: { target: repo.good, prevHead: repo.failed, verified: true },
-    });
-    const prepare = () => prepareRebuild({ ...f.opts, env: { ...f.env, WE_DAEMON_REBUILD_SKIP_UNRELATED: '0' },
-      // All objects are local; emulate a successful fetch without any remote IO.
-      run: (args, opts) => args[0] === 'fetch' ? { status: 0, stdout: '' } : repo.run(args, opts),
-      prState: async () => null });
-    expect(await prepare()).toMatchObject({ terminal: true, result: { reason: 'recovered-adopted', head: repo.good } });
-    expect(readRebuildState(f.root, f.env)).toMatchObject({ rejected: rejection, inProgress: null });
-    expect(await prepare()).toMatchObject({ terminal: true, result: { reason: 'still-rejected', plan: { inputsKey: plan.inputsKey } } });
-    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.good);
-    expect(readRebuildState(f.root, f.env).rejected).toEqual(rejection);
-  });
-
-  it('no pending rollback does nothing', async () => {
-    const f = fixture();
-    expect(await applyPendingRollback(f.opts)).toEqual({ action: 'none' });
-    expect(withWriteLock).not.toHaveBeenCalled();
-  });
-
-  it('failed finalization keeps the rollback marker for next boot', async () => {
-    const f = fixture(); const repo = realRepo(f);
-    await requestRollback({ ...f.opts, run: repo.run });
-    const run = (args, opts) => args[0] === 'reset' ? { status: 1, stderr: 'reset refused' } : repo.run(args, opts);
-    expect(await applyPendingRollback({ ...f.opts, run })).toMatchObject({ ok: false });
-    expect(existsSync(f.markerFile)).toBe(true);
-    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
-  });
-
-  it('slow outcome check expires the window before evaluation instead of passing', async () => {
-    const f = fixture(); f.seed();
-    let at = ADOPTED_AT + 2;
-    json(f.tickFile, { pid: process.pid, head: FAILED, lastTickDoneAt: iso(ADOPTED_AT + 1) });
-    registerOutcomeCheck('slow', async () => { at = ADOPTED_AT + WINDOW + 1; return { status: 'ok' }; });
-    expect(await runProbationTick({ ...f.opts, now: () => at }))
-      .toEqual({ action: 'rolled-back', reason: 'no-tick-progress' });
-    expect(readProvenGood(f.root, f.env)).toEqual(f.good);
-  });
-
-  it.each([
-    ['crash-loop boots', { boots: 4 }, { action: 'rolled-back', reason: 'crash-loop' }],
-    ['replacement boot PID', { bootPid: process.pid + 1 }, { action: 'pending' }],
-  ])('a concurrent boot during outcome checks cannot promote stale probation evidence: %s', async (_name, bootUpdate, expected) => {
-    const f = fixture(); f.seed();
-    json(f.tickFile, { pid: process.pid, head: FAILED, lastTickDoneAt: iso(ADOPTED_AT + 1) });
-    let releaseCheck, checkStarted;
-    const started = new Promise(resolve => { checkStarted = resolve; });
-    const outcome = new Promise(resolve => { releaseCheck = resolve; });
-    registerOutcomeCheck('paused-boot-check', () => { checkStarted(); return outcome; });
-
-    const pending = runProbationTick({ ...f.opts, now: () => ADOPTED_AT + 2 });
-    await started;
-    json(f.probationFile, { ...readProbation(f.root, f.env), ...bootUpdate });
-    releaseCheck({ status: 'ok' });
-
-    expect(await pending).toEqual(expected);
-    expect(readProvenGood(f.root, f.env)).toEqual(f.good);
-    expect(f.opts.emit.mock.calls.some(([event]) => event.kind === 'probation-passed')).toBe(false);
-  });
-
-  it('healthy tick after adoptedAt writes provenGood from the probation record and removes probation', async () => {
-    const f = fixture(); f.seed();
-    json(f.tickFile, { lastTickDoneAt: iso(ADOPTED_AT + 1), pid: process.pid, head: f.probation.sha });
-    expect(await runProbationTick({ ...f.opts, now: () => ADOPTED_AT + 2 })).toMatchObject({ action: 'passed' });
-    expect(readProvenGood(f.root, f.env)).toMatchObject({
-      head: f.probation.sha, inputsKey: f.probation.inputsKey, mainSha: f.probation.mainSha,
-      applied: f.probation.applied, provenAt: iso(ADOPTED_AT + 2),
-    });
-    expect(existsSync(f.probationFile)).toBe(false);
-    expect(f.opts.rollback).not.toHaveBeenCalled();
-    expect(f.opts.emit.mock.calls.some(([event]) => event.kind === 'probation-passed')).toBe(true);
-  });
-
-  it('rejected inputsKey is not re-adopted: rollback persists the failed key without retryAt', async () => {
-    const f = fixture(); const repo = realRepo(f);
-    expect(await requestRollback({ ...f.opts, run: repo.run, expectSha: repo.failed })).toMatchObject({ ok: true });
-    expect(await applyPendingRollback({ ...f.opts, run: repo.run })).toMatchObject({ ok: true });
-    const rejected = readRebuildState(f.root, f.env).rejected;
-    expect(rejected).toMatchObject({ inputsKey: 'failed-inputs', probation: true, reason: 'probation-failed' });
-    expect(rejected).not.toHaveProperty('retryAt');
-    expect(Number.isFinite(Date.parse(rejected.at))).toBe(true);
-    expect(await runProbationTick(f.opts)).toMatchObject({ action: 'none' });
-    expect(readRebuildState(f.root, f.env).rejected).toEqual(rejected);
-  });
-
-  it('no provenGood refuses with no-proven-good, leaves HEAD untouched, and writes an operator alert', async () => {
-    const f = fixture(); const repo = realRepo(f);
-    rmSync(f.provenFile);
-    const result = await requestRollback({ ...f.opts, run: repo.run, expectSha: repo.failed });
-    expect(result).toMatchObject({ ok: false, reason: 'no-proven-good' });
-    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
-    expect(readFileSync(join(f.root, 'build.txt'), 'utf8')).toBe('failed build\n');
-    const alerts = readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(line => JSON.parse(line));
-    expect(alerts.some(alert => alert.kind === 'probation-needs-you')).toBe(true);
-  });
-
-  it('superseded HEAD drops probation without rollback or changing provenGood', async () => {
-    const f = fixture(); f.seed();
-    const before = readFileSync(f.provenFile, 'utf8');
-    expect(await runProbationTick({ ...f.opts, readHead: () => OTHER })).toMatchObject({ action: 'superseded' });
-    expect(f.opts.rollback).not.toHaveBeenCalled();
-    expect(existsSync(f.probationFile)).toBe(false);
-    expect(readFileSync(f.provenFile, 'utf8')).toBe(before);
-  });
-
-  it('crash-loop: boots greater than 3 fails even while ticks advance', async () => {
-    const f = fixture(); f.seed();
-    expect(PROBATION_MAX_BOOTS).toBe(3);
-    json(f.probationFile, { ...f.probation, boots: 4 });
-    json(f.tickFile, { lastTickDoneAt: iso(ADOPTED_AT + 1), pid: process.pid, head: f.probation.sha });
-    expect(await runProbationTick({ ...f.opts, now: () => ADOPTED_AT + 2 })).toMatchObject({ action: 'rolled-back', reason: 'crash-loop' });
-    expect(f.opts.rollback).toHaveBeenCalledTimes(1);
-  });
-
-  it('pending before the deadline preserves probation and provenGood', async () => {
-    const f = fixture(); f.seed();
-    expect(await runProbationTick({ ...f.opts, now: () => ADOPTED_AT + WINDOW - 1 })).toEqual({ action: 'pending' });
-    expect(readProbation(f.root, f.env)).toEqual(f.probation);
-    expect(readProvenGood(f.root, f.env)).toEqual(f.good);
-    expect(f.opts.rollback).not.toHaveBeenCalled();
-  });
-
-  it('a sibling PID cannot prove the booted worker is live', async () => {
-    const f = fixture(); f.seed();
-    const sibling = join(f.env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(f.root)}.ticks.sibling.json`);
-    json(f.probationFile, { ...f.probation, baseline: {
-      ...f.probation.baseline, [basename(sibling)]: iso(ADOPTED_AT - 100),
-    } });
-    json(sibling, { lastTickDoneAt: iso(ADOPTED_AT + 1), pid: process.pid + 1, head: FAILED });
-    expect(await runProbationTick(f.opts)).toMatchObject({ action: 'rolled-back', reason: 'no-tick-progress' });
-  });
-
-  it('empty baseline passes only when a tick of this clone advances past adoption', async () => {
-    const f = fixture(); f.seed();
-    json(f.probationFile, { ...f.probation, baseline: {} });
-    json(join(f.env.WE_DAEMON_STATE_DIR, 'foreign-clone.ticks.worker.json'), { lastTickDoneAt: iso(ADOPTED_AT + 1) });
-    expect(await runProbationTick({ ...f.opts, now: () => ADOPTED_AT + 2 })).toEqual({ action: 'pending' });
-    json(f.tickFile, { lastTickDoneAt: iso(ADOPTED_AT + 1), pid: process.pid, head: f.probation.sha });
-    expect(await runProbationTick({ ...f.opts, now: () => ADOPTED_AT + 2 })).toMatchObject({ action: 'passed' });
-  });
-
-  it('failed rollback is reported as rollback-failed rather than a successful recovery', async () => {
-    const f = fixture(); f.seed();
-    f.opts.rollback.mockResolvedValue({ ok: false, reason: 'no-proven-good' });
-    expect(await runProbationTick(f.opts)).toMatchObject({ action: 'rollback-failed' });
-    expect(readProvenGood(f.root, f.env)).toEqual(f.good);
-  });
-
-  it('outcome-check hook: registered fail triggers rollback even though ticks advance', async () => {
-    const f = fixture(); f.seed();
-    json(f.tickFile, { lastTickDoneAt: iso(ADOPTED_AT + 1), pid: process.pid, head: f.probation.sha });
-    const check = vi.fn(() => ({ status: 'fail', reason: 'outcome-red' }));
-    registerOutcomeCheck('test-outcome', check);
-    expect(await runProbationTick({ ...f.opts, now: () => ADOPTED_AT + 2 })).toMatchObject({ action: 'rolled-back', reason: 'outcome-red' });
-    expect(check).toHaveBeenCalledWith(expect.objectContaining({ root: f.root, env: f.env, probation: f.probation }));
-    expect(f.opts.rollback).toHaveBeenCalledTimes(1);
-  });
-
-  it('outcome-check hook: throwing check stays pending despite advancing ticks', async () => {
-    const f = fixture(); f.seed();
-    json(f.tickFile, { lastTickDoneAt: iso(ADOPTED_AT + 1), pid: process.pid, head: f.probation.sha });
-    registerOutcomeCheck('throws', () => { throw new Error('check unavailable'); });
-    expect(await runProbationTick({ ...f.opts, now: () => ADOPTED_AT + 2 })).toEqual({ action: 'pending' });
-    expect(f.opts.rollback).not.toHaveBeenCalled();
-    expect(readProvenGood(f.root, f.env)).toEqual(f.good);
-    expect(existsSync(f.probationFile)).toBe(true);
-  });
-
-  it.each([
-    ['absent and matching', false, GOOD],
-    ['absent and mismatching', false, OTHER],
-    ['existing and matching', true, GOOD],
-  ])('openProbation preserves provenGood and never promotes adoption metadata: %s', async (_label, existing, head) => {
-    const f = fixture();
-    if (existing) writeProvenGood(f.root, f.env, f.good);
-    const preAdopted = { head, inputsKey: 'pre-adopted-inputs', mainSha: GOOD, applied: [] };
-    await openProbation({ ...f.opts, ...f.probation, preAdopted, now: () => ADOPTED_AT });
-    expect(readProvenGood(f.root, f.env)).toEqual(existing ? f.good : null);
-    expect(readProbation(f.root, f.env)).toMatchObject({ sha: FAILED, inputsKey: 'failed-inputs', adoptedAt: iso(ADOPTED_AT) });
-  });
-
-  it('openProbation captures recent clone ticks, replaces old probation without proving it, and never seeds without preAdopted', async () => {
-    const f = fixture();
-    const oldTick = join(f.env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(f.root)}.ticks.old.json`);
-    json(f.tickFile, { lastTickDoneAt: iso(ADOPTED_AT - 100) });
-    json(oldTick, { lastTickDoneAt: iso(ADOPTED_AT - 2 * WINDOW - 1) });
-    json(join(f.env.WE_DAEMON_STATE_DIR, 'foreign.ticks.worker.json'), { lastTickDoneAt: iso(ADOPTED_AT - 100) });
-    json(f.probationFile, { ...f.probation, sha: OTHER, inputsKey: 'superseded-inputs' });
-    await openProbation({ ...f.opts, ...f.probation, now: () => ADOPTED_AT });
-    expect(readProvenGood(f.root, f.env)).toBeNull();
-    expect(readProbation(f.root, f.env)).toMatchObject({
-      sha: FAILED, inputsKey: 'failed-inputs', probationMs: WINDOW,
-      baseline: { [basename(f.tickFile)]: iso(ADOPTED_AT - 100) },
-    });
-    expect(Object.keys(readProbation(f.root, f.env).baseline)).toEqual([basename(f.tickFile)]);
-  });
-
-  it('request refuses superseded HEAD; apply already at target records rejection under the write lock', async () => {
-    const f = fixture(); const repo = realRepo(f);
-    const before = readRebuildState(f.root, f.env);
-    expect(await requestRollback({ ...f.opts, run: repo.run, expectSha: OTHER })).toMatchObject({ superseded: true, head: repo.failed });
-    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
-    expect(readRebuildState(f.root, f.env)).toEqual(before);
-    repo.git(['reset', '--hard', repo.good]);
-    expect(await requestRollback({ ...f.opts, run: repo.run, expectSha: repo.good })).toMatchObject({ ok: true, requested: true });
-    expect(await applyPendingRollback({ ...f.opts, run: repo.run })).toMatchObject({ ok: true });
-    expect(withWriteLock).toHaveBeenCalledTimes(1);
-    expect(readRebuildState(f.root, f.env).rejected.inputsKey).toBe('failed-inputs');
-    expect(existsSync(f.markerFile)).toBe(false);
-    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.good);
-  });
-
-  it.each(['outcome', 'rollback'])('probation watch does not overlap pending interval probes: %s', async kind => {
-    vi.useFakeTimers();
-    const f = fixture(); f.seed();
-    let finish;
-    const probe = vi.fn().mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
-    const onRolledBack = vi.fn();
-    const options = { ...f.opts, onRolledBack, intervalMs: 10 };
-    if (kind === 'outcome') {
-      options.now = () => ADOPTED_AT + 2;
-      registerOutcomeCheck('slow', probe.mockResolvedValue({ status: 'pending' }));
-    } else options.rollback = probe.mockResolvedValue({ ok: true });
-    armProbationWatch(options);
-    await vi.advanceTimersByTimeAsync(0);
-    expect(probe).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(50);
-    expect(probe).toHaveBeenCalledTimes(1);
-    expect(onRolledBack).not.toHaveBeenCalled();
-    finish(kind === 'outcome' ? { status: 'pending' } : { ok: false });
-    await vi.advanceTimersByTimeAsync(0);
-    await vi.advanceTimersByTimeAsync(10);
-    expect(probe).toHaveBeenCalledTimes(2);
-    if (kind === 'rollback') expect(onRolledBack).toHaveBeenCalledTimes(1);
-    else {
-      expect(onRolledBack).not.toHaveBeenCalled();
-      unlinkSync(f.probationFile);
-      await vi.advanceTimersByTimeAsync(10); // Let the pending watch retire.
-    }
-  });
-
-  it('armProbationWatch returns immediately without awaiting rollback and calls onRolledBack after failed probation', async () => {
-    vi.useFakeTimers();
-    const f = fixture(); f.seed();
-    let finish;
-    const rollback = vi.fn(() => new Promise(resolve => { finish = resolve; }));
-    const onRolledBack = vi.fn();
-    const options = { ...f.opts, rollback, onRolledBack, intervalMs: 10 };
-    const returned = armProbationWatch(options);
-    expect(returned?.then).toBeUndefined();
-    armProbationWatch(options); // same root must not create another boot/watch
-    await vi.advanceTimersByTimeAsync(0);
-    expect(readProbation(f.root, f.env).boots).toBe(1);
-    expect(rollback).toHaveBeenCalledTimes(1);
-    expect(onRolledBack).not.toHaveBeenCalled();
-    expect(rollback).toHaveBeenCalledWith('no-tick-progress', {});
-    finish({ ok: true });
-    await vi.advanceTimersByTimeAsync(0);
-    expect(onRolledBack).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(100);
-    expect(rollback).toHaveBeenCalledTimes(1);
-  });
-
-  it('armProbationWatch retries a transient rollback failure on the next tick and stops after success', async () => {
-    vi.useFakeTimers();
-    const f = fixture(); f.seed();
-    const rollback = vi.fn()
-      .mockResolvedValueOnce({ ok: false, reason: 'tick-in-progress' })
-      .mockResolvedValue({ ok: true });
-    const onRolledBack = vi.fn();
-    const options = { ...f.opts, rollback, onRolledBack, intervalMs: 10 };
-    armProbationWatch(options);
-    await vi.advanceTimersByTimeAsync(0);
-    expect(rollback).toHaveBeenCalledTimes(1);
-    expect(onRolledBack).not.toHaveBeenCalled();
-    expect(readProbation(f.root, f.env).boots).toBe(1);
-    armProbationWatch(options); // failure must retain the existing watch
-    await vi.advanceTimersByTimeAsync(9);
-    expect(rollback).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(1);
-    expect(rollback).toHaveBeenCalledTimes(2);
-    expect(rollback).toHaveBeenLastCalledWith('no-tick-progress', {});
-    expect(onRolledBack).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(100);
-    expect(rollback).toHaveBeenCalledTimes(2);
-    expect(onRolledBack).toHaveBeenCalledTimes(1);
-  });
-
-  it('armProbationWatch keeps monitoring replacement probation after an older outcome probe is superseded', async () => {
-    vi.useFakeTimers();
-    const f = fixture(); f.seed();
-    let releaseCheck;
-    let head = FAILED;
-    const check = vi.fn()
-      .mockImplementationOnce(() => new Promise(resolve => { releaseCheck = resolve; }))
-      .mockReturnValue({ status: 'ok' });
-    registerOutcomeCheck('paused-probe', check);
-    const onRolledBack = vi.fn();
-    const options = { ...f.opts, readHead: () => head,
-      now: () => ADOPTED_AT + 2 * WINDOW + 2, onRolledBack, intervalMs: 10 };
-    armProbationWatch(options);
-    await vi.advanceTimersByTimeAsync(0);
-    expect(check).toHaveBeenCalledTimes(1);
-
-    openProbation({ ...f.opts, ...f.probation, sha: OTHER, prevHead: FAILED,
-      inputsKey: 'replacement-inputs', now: () => ADOPTED_AT + 1 });
-    head = OTHER;
-    armProbationWatch(options);
-    releaseCheck({ status: 'fail', reason: 'stale-outcome' });
-    await vi.advanceTimersByTimeAsync(0);
-    expect(readProbation(f.root, f.env).sha).toBe(OTHER);
-    expect(f.opts.rollback).not.toHaveBeenCalled();
-    expect(onRolledBack).not.toHaveBeenCalled();
-
-    await vi.advanceTimersByTimeAsync(10);
-    expect(check).toHaveBeenCalledTimes(2);
-    expect(check).toHaveBeenLastCalledWith(expect.objectContaining({
-      probation: expect.objectContaining({ sha: OTHER, inputsKey: 'replacement-inputs' }),
-    }));
-    expect(f.opts.rollback).toHaveBeenCalledTimes(1);
-    expect(f.opts.rollback).toHaveBeenCalledWith('never-booted', {});
-    expect(onRolledBack).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(100);
-    expect(f.opts.rollback).toHaveBeenCalledTimes(1);
-  });
-
-  it.each([
-    ['missing pid', { head: FAILED }], ['missing head', { pid: process.pid }],
-    ['old SHA', { pid: process.pid, head: GOOD }],
-    ['sibling PID', { pid: process.pid + 1, head: FAILED }],
-    ['adopter PID', { pid: process.pid + 2, head: FAILED }],
-  ])('tick provenance refuses %s', async (_label, record) => {
-    const f = fixture(); f.seed();
-    json(f.probationFile, { ...f.probation, adopterPid: process.pid + 2 });
-    json(f.tickFile, { lastTickDoneAt: iso(ADOPTED_AT + 1), ...record });
-    expect(await runProbationTick({ ...f.opts, now: () => ADOPTED_AT + 2 })).toEqual({ action: 'pending' });
-    expect(readProvenGood(f.root, f.env)).toEqual(f.good);
-  });
-
-  it('one matching boot tick proves liveness despite a stale baseline entry', async () => {
-    const f = fixture(); f.seed();
-    json(f.probationFile, { ...f.probation, baseline: { ...f.probation.baseline, stale: iso(ADOPTED_AT - 1) } });
-    json(f.tickFile, { pid: process.pid, head: FAILED, lastTickDoneAt: iso(ADOPTED_AT + 1) });
-    expect(await runProbationTick({ ...f.opts, now: () => ADOPTED_AT + 2 })).toEqual({ action: 'passed' });
-  });
-
-  it('ticks over 60 seconds in the future never prove liveness', async () => {
-    const f = fixture(); f.seed();
-    json(f.tickFile, { pid: process.pid, head: FAILED, lastTickDoneAt: iso(ADOPTED_AT + 60_003) });
-    expect(await runProbationTick({ ...f.opts, now: () => ADOPTED_AT + 2 })).toEqual({ action: 'pending' });
-  });
-
-  it('legacy unbooted probation stays readable and gets a never-booted absolute cap', async () => {
-    const f = fixture(); f.seed();
-    const { bootPid, bootedAt, ...legacy } = f.probation;
-    json(f.probationFile, legacy);
-    expect(readProbation(f.root, f.env)).toEqual(legacy);
-    json(f.tickFile, { pid: process.pid, head: FAILED, lastTickDoneAt: iso(ADOPTED_AT + 1) });
-    expect(await runProbationTick(f.opts)).toEqual({ action: 'pending' });
-    expect(await runProbationTick({ ...f.opts, now: () => ADOPTED_AT + 2 * WINDOW + 1 }))
-      .toEqual({ action: 'rolled-back', reason: 'never-booted' });
-  });
-
-  it('boot deadline starts at bootedAt but cannot exceed twice the adoption window', () => {
-    const f = fixture();
-    const probation = { ...f.probation, bootedAt: iso(ADOPTED_AT + WINDOW) };
-    expect(evaluateProbation({ probation, head: FAILED, now: ADOPTED_AT + WINDOW + 1 })).toEqual({ action: 'pending' });
-    expect(evaluateProbation({ probation, head: FAILED, now: ADOPTED_AT + 2 * WINDOW + 1 }))
-      .toEqual({ action: 'fail', reason: 'no-tick-progress' });
-  });
-
-  it('observer fails booted probation beyond the adoption cap even with a recent boot and tick', async () => {
-    const f = fixture(); f.seed();
-    json(f.probationFile, { ...f.probation, bootedAt: iso(ADOPTED_AT + 2 * WINDOW) });
-    json(f.tickFile, { pid: process.pid, head: FAILED, lastTickDoneAt: iso(ADOPTED_AT + 2 * WINDOW + 1) });
-    expect(await runProbationTick({ ...f.opts, observeOnly: true, now: () => ADOPTED_AT + 2 * WINDOW }))
-      .toEqual({ action: 'pending' });
-    expect(f.opts.rollback).not.toHaveBeenCalled();
-    expect(await runProbationTick({ ...f.opts, observeOnly: true, now: () => ADOPTED_AT + 2 * WINDOW + 2 }))
-      .toEqual({ action: 'rolled-back', reason: 'no-tick-progress' });
-    expect(f.opts.rollback).toHaveBeenCalledWith('no-tick-progress', {});
-  });
-
-  it('watch records the boot PID and first boot time without replacing an existing time', async () => {
-    vi.useFakeTimers();
-    const f = fixture(); f.seed();
-    const { bootPid, bootedAt, ...legacy } = f.probation;
-    json(f.probationFile, legacy);
-    armProbationWatch({ ...f.opts, now: () => ADOPTED_AT + 10 });
-    expect(readProbation(f.root, f.env)).toMatchObject({ bootPid: process.pid, bootedAt: iso(ADOPTED_AT), boots: 1 });
-    const g = fixture(); g.seed();
-    json(g.probationFile, { ...g.probation, bootPid: process.pid + 1 });
-    armProbationWatch({ ...g.opts, now: () => ADOPTED_AT + 20 });
-    expect(readProbation(g.root, g.env)).toMatchObject({ bootedAt: iso(ADOPTED_AT), bootPid: process.pid });
-    await vi.advanceTimersByTimeAsync(0);
-  });
-
-  it.each(['old', 'wrong-head', 'unresolved', 'unreadable', 'unknown-start'])('watch refuses boot evidence from %s process and observes only', async kind => {
-    vi.useFakeTimers();
-    const f = fixture(); f.seed();
-    const { bootPid, bootedAt, ...legacy } = f.probation;
-    json(f.probationFile, legacy);
-    const check = vi.fn(() => ({ status: 'ok' })); registerOutcomeCheck('boot-proof', check);
-    const readHead = () => {
-      if (kind === 'unreadable') throw new Error('HEAD unavailable');
-      return kind === 'wrong-head' ? OTHER : kind === 'unresolved' ? null : FAILED;
-    };
-    armProbationWatch({ ...f.opts, processStartMs: kind === 'old' ? ADOPTED_AT - 1001 : kind === 'unknown-start' ? NaN : ADOPTED_AT,
-      readHead, now: () => ADOPTED_AT + 10, onRolledBack: vi.fn() });
-    expect(readProbation(f.root, f.env)).toEqual(legacy);
-    await vi.advanceTimersByTimeAsync(0);
-    expect(check).not.toHaveBeenCalled();
-  });
-
-  it.each([1, 1000])('watch refuses a process started %s ms before adoption with the default Git HEAD probe', earlyMs => {
-    vi.useFakeTimers();
-    const f = fixture(); const repo = realRepo(f);
-    const { bootPid, bootedAt, ...legacy } = f.probation;
-    json(f.probationFile, legacy);
-    armProbationWatch({ ...f.opts, run: repo.run, readHead: undefined, processStartMs: ADOPTED_AT - earlyMs });
-    expect(readProbation(f.root, f.env)).toEqual(legacy);
-  });
-
-  it('watch records a process start at or after adoption rather than watch-arm time', () => {
-    vi.useFakeTimers();
-    for (const start of [ADOPTED_AT + 5, ADOPTED_AT]) {
-      const f = fixture(); f.seed();
-      const { bootPid, bootedAt, ...legacy } = f.probation;
-      json(f.probationFile, legacy);
-      armProbationWatch({ ...f.opts, processStartMs: start, now: () => ADOPTED_AT + 20 });
-      expect(readProbation(f.root, f.env)).toMatchObject({
-        bootPid: process.pid, bootedAt: iso(start), boots: 1,
-      });
-    }
-  });
-
-  it('observer never boots, probes outcomes or proves ticks, and rolls back only after the never-booted cap', async () => {
-    vi.useFakeTimers();
-    const f = fixture(); f.seed();
-    const { bootPid, bootedAt, ...legacy } = f.probation;
-    json(f.probationFile, legacy);
-    json(f.tickFile, { pid: process.pid, head: FAILED, lastTickDoneAt: iso(ADOPTED_AT + 1) });
-    const check = vi.fn(() => ({ status: 'fail' })); registerOutcomeCheck('observer', check);
-    let at = ADOPTED_AT + WINDOW + 1;
-    armProbationWatch({ ...f.opts, observeOnly: true, now: () => at, intervalMs: 10, onRolledBack: vi.fn() });
-    await vi.advanceTimersByTimeAsync(0);
-    expect(readProbation(f.root, f.env)).toEqual(legacy);
-    expect(f.opts.rollback).not.toHaveBeenCalled(); expect(check).not.toHaveBeenCalled();
+    await expect(make().tickOnce()).rejects.toThrow('B startup failure');
     at = ADOPTED_AT + 2 * WINDOW + 1;
-    await vi.advanceTimersByTimeAsync(10);
-    expect(f.opts.rollback).toHaveBeenCalledWith('never-booted', {});
+    rebuild.mockClear();
+    finalizeRebuild.mockImplementationOnce(async () => {
+      expect(readRebuildState(f.root, f.env).rejected.inputsKey).toBe('failed-inputs');
+      head = GOOD; return { adopted: true };
+    });
+    await make().tickOnce();
+    expect(head).toBe(GOOD);
+    expect(restart).toHaveBeenCalledOnce();
+    expect(restart).toHaveBeenCalledWith(expect.objectContaining({ reason: 'probation-rollback' }));
+    expect(rebuild).not.toHaveBeenCalled();
   });
 
-  it.each(['listed', 'unresolved'])('unverified %s tree cannot pass, seed, or be a rollback target', async kind => {
-    const f = fixture(); const repo = realRepo(f);
-    const trees = [repo.git(['rev-parse', `${repo.failed}^{tree}`]), repo.git(['rev-parse', `${repo.good}^{tree}`])];
-    writeRebuildState(f.root, { ...readRebuildState(f.root, f.env), forceUnverifiedTrees: trees }, f.env);
-    const run = kind === 'unresolved' ? (args, opts) => args.some(a => a.endsWith('^{tree}')) ? { status: 1 } : repo.run(args, opts) : repo.run;
-    const rollback = await requestRollback({ ...f.opts, run });
-    expect(rollback).toEqual({ ok: false, reason: 'proven-good-unverified' });
-    expect(f.opts.emit).toHaveBeenCalledTimes(1);
-    expect(f.opts.emit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'probation-needs-you',
-      detail: { reason: 'proven-good-unverified' } }), { env: expect.anything() });
-    f.opts.emit.mockClear();
-    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
-    expect(readFileSync(alertsFilePath(f.root, f.env), 'utf8')).toContain('probation-needs-you');
-    rmSync(f.provenFile);
-    expect(openProbation({ ...f.opts, ...f.probation, run, preAdopted: f.good, now: () => ADOPTED_AT })).toBe(true);
-    expect(readProvenGood(f.root, f.env)).toBeNull();
-    json(f.probationFile, f.probation);
-    json(f.tickFile, { pid: process.pid, head: repo.failed, lastTickDoneAt: iso(ADOPTED_AT + 1) });
-    expect(await runProbationTick({ ...f.opts, run, readHead: () => repo.failed, now: () => ADOPTED_AT + 2 }))
-      .toEqual({ action: 'passed-unverified' });
-    expect(existsSync(f.probationFile)).toBe(false);
-    expect(readProvenGood(f.root, f.env)).toBeNull(); expect(f.opts.emit).not.toHaveBeenCalled();
+  it('four live sibling processes promote only their own previous tick without rollback', async () => {
+    expect((await siblingStartupBreak.run()).violations).toEqual([]);
+  });
+
+  it.each([null, ['scripts/worker.mjs']])('unknown or imported changes never authorize an old process tick: %j', async changedFiles => {
+    const f = fixture();
+    let head = GOOD;
+    const check = vi.fn(opts => checkProbationAtTick({ ...f.opts, ...opts, run: () => ({ status: 0, stdout: head }) }));
+    const wrapped = withSelfSync({ tickOnce: () => 'ticked' }, {
+      root: f.root, env: f.env, log: f.opts.log, versions: null, background: false,
+      now: () => ADOPTED_AT + 2, readHead: () => head, readState: () => ({}),
+      applyPendingRollback: async () => ({ action: 'none' }), checkProbation: check,
+      rebuild: async () => ({ moved: false }), acquireRead: () => ({ ok: true }), releaseRead() {},
+      onRestart: vi.fn(), diffFiles: () => changedFiles,
+      importClosure: () => ({ complete: true, files: new Set(['scripts/worker.mjs']), bareDeps: false, jsonNames: new Set() }),
+    });
+    f.seed(); head = FAILED;
+    json(f.tickFile, { pid: process.pid, head: FAILED, lastTickDoneAt: iso(ADOPTED_AT + 3) });
+    await wrapped.tickOnce();
+    expect(check).toHaveBeenCalledWith(expect.objectContaining({ bootSha: GOOD }));
+    expect(readProvenGood(f.root, f.env).head).toBe(GOOD);
+    expect(readProbation(f.root, f.env).adoptionId).toBe(f.probation.adoptionId);
+  });
+
+  it('unresolved HEAD never deletes probation or proves a tick', () => {
+    const f = fixture(); f.seed();
+    json(f.tickFile, { pid: process.pid, head: FAILED, lastTickDoneAt: iso(ADOPTED_AT + 1) });
+    expect(checkProbationAtTick({ ...f.opts, now: () => ADOPTED_AT + 2, run: () => ({ status: 1 }) }))
+      .toEqual({ action: 'pending' });
+    expect(readProbation(f.root, f.env).adoptionId).toBe(f.probation.adoptionId);
+    expect(readProvenGood(f.root, f.env).head).toBe(GOOD);
+  });
+
+  it.each(['missing', 'malformed', 'legacy'])('invalid %s adoption identity is unreadable', kind => {
+    const f = fixture(); f.seed();
+    const record = { ...f.probation };
+    if (kind === 'malformed') record.adoptionId = '../other';
+    else delete record.adoptionId;
+    json(f.probationFile, record);
+    expect(readProbation(f.root, f.env)).toBeNull();
   });
 
   it('tick writer records HEAD and PID, with null HEAD when Git cannot resolve it', () => {
@@ -1569,89 +993,8 @@ describe('probation and provenGood contracts', () => {
     }
   });
 
-  it('a late matching tick cannot override either boot or adoption expiry', () => {
-    const f = fixture();
-    for (const bootedAt of [iso(ADOPTED_AT), iso(ADOPTED_AT + 2 * WINDOW)]) {
-      expect(evaluateProbation({ probation: { ...f.probation, bootedAt }, head: FAILED,
-        now: ADOPTED_AT + 2 * WINDOW + 2,
-        tickNow: { worker: { pid: process.pid, head: FAILED, lastTickDoneAt: iso(ADOPTED_AT + 2 * WINDOW + 1) } },
-      })).toEqual({ action: 'fail', reason: 'no-tick-progress' });
-    }
-  });
-
-  it('an existing watch switches to observer mode when this process adopts a replacement', async () => {
-    vi.useFakeTimers();
-    const f = fixture(); f.seed();
-    let at = ADOPTED_AT + 10;
-    const options = { ...f.opts, now: () => at, intervalMs: 10, onRolledBack: vi.fn() };
-    armProbationWatch(options);
-    await vi.advanceTimersByTimeAsync(0);
-    openProbation({ ...f.opts, ...f.probation, now: () => ADOPTED_AT + 20 });
-    const check = vi.fn(() => ({ status: 'fail' })); registerOutcomeCheck('replacement-observer', check);
-    armProbationWatch({ ...options, observeOnly: true });
-    at = ADOPTED_AT + 30;
-    await vi.advanceTimersByTimeAsync(10);
-    expect(check).not.toHaveBeenCalled();
-    expect(readProbation(f.root, f.env)).not.toHaveProperty('bootPid');
-    expect(f.opts.rollback).not.toHaveBeenCalled();
-    at = ADOPTED_AT + 20 + 2 * WINDOW + 1;
-    await vi.advanceTimersByTimeAsync(10);
-    expect(f.opts.rollback).toHaveBeenCalledWith('never-booted', {});
-  });
-
-  it('CLI provenGood only requests rollback and leaves HEAD and adopted state untouched', () => {
-    const f = fixture(); const repo = realRepo(f);
-    const before = readRebuildState(f.root, f.env);
-    const cli = spawnSync(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), '../probation.mjs'),
-      'rollback', `--clone=${f.root}`, '--to=provenGood'], {
-      cwd: f.base, env: f.env, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024,
-    });
-    expect(cli.error).toBeUndefined();
-    expect(cli.status).toBe(0);
-    expect(JSON.parse(cli.stdout)).toEqual({ ok: true, requested: true });
-    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
-    expect(readRebuildState(f.root, f.env)).toEqual(before);
-    expect(JSON.parse(readFileSync(f.markerFile, 'utf8'))).toMatchObject({ to: repo.good, rejectInputsKey: 'failed-inputs' });
-    expect(existsSync(f.probationFile)).toBe(false);
-  });
-
-  it('CLI refuses unknown --to without changing HEAD or adopted state', () => {
-    const f = fixture(); const repo = realRepo(f);
-    const before = readRebuildState(f.root, f.env);
-    // Resolve on disk: Vite rewrites new URL(..., import.meta.url) as an asset URL.
-    const cli = spawnSync(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), '../probation.mjs'),
-      'rollback', `--clone=${f.root}`, '--to=unknown'], {
-      cwd: f.base, env: f.env, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024,
-    });
-    expect(cli.error).toBeUndefined();
-    expect(cli.status).toBe(1);
-    expect(`${cli.stdout}\n${cli.stderr}`).toMatch(/unknown|invalid|unsupported|provenGood/i);
-    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
-    expect(readRebuildState(f.root, f.env)).toEqual(before);
-  });
-
-  it.each(['missing', 'corrupt'])('reads fail closed to null for %s persisted probation and provenGood', kind => {
-    const f = fixture();
-    if (kind === 'corrupt') {
-      mkdirSync(f.env.WE_DAEMON_STATE_DIR, { recursive: true });
-      writeFileSync(f.probationFile, '{broken');
-      writeFileSync(f.provenFile, '{broken');
-    }
-    expect(readProbation(f.root, f.env)).toBeNull();
-    expect(readProvenGood(f.root, f.env)).toBeNull();
-  });
-
-  it('unreadable HEAD stays pending before deadline and fails after it rather than superseding', () => {
-    const f = fixture();
-    expect(evaluateProbation({ probation: f.probation, head: null, now: ADOPTED_AT + 1, tickNow: {} })).toMatchObject({ action: 'pending' });
-    expect(evaluateProbation({ probation: f.probation, head: null, now: ADOPTED_AT + WINDOW + 1, tickNow: {} })).toMatchObject({ action: 'fail' });
-  });
-
   it('probationMsOf accepts positive integers and defaults on invalid bounds', () => {
-    expect(PROBATION_MS_DEFAULT).toBe(900_000);
-    expect(probationMsOf({ WE_DAEMON_PROBATION_MS: '25' })).toBe(25);
-    for (const value of [undefined, '', '0', '-1', '1.5', 'NaN', 'Infinity']) {
-      expect(probationMsOf({ WE_DAEMON_PROBATION_MS: value })).toBe(PROBATION_MS_DEFAULT);
-    }
+    expect(probationMsOf({ WE_DAEMON_PROBATION_MS: '1000' })).toBe(1000);
+    for (const value of ['', '0', '-1', 'Infinity', '1.5', 'x']) expect(probationMsOf({ WE_DAEMON_PROBATION_MS: value })).toBe(PROBATION_MS_DEFAULT);
   });
 });

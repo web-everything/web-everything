@@ -8,7 +8,7 @@ import { writeRebuildState } from '../../../lib/daemon-rebuild/state.mjs';
 
 export default {
   id: 'probation-caller-ownership',
-  title: 'one-shot rebuilds preserve boot evidence until an opted-in daemon starts',
+  title: 'one-shot rebuilds preserve boot evidence until an boot hook starts',
   card: 'PR #6882 send-back items 1 and 2',
   fixedBy: { sha: 'HEAD', where: 'lane/blue-green-s2-probation-r928',
     paths: ['scripts/lib/daemon-rebuild/rebuild.mjs', 'scripts/lib/daemon-rebuild.mjs', 'scripts/lib/daemon-self-sync.mjs'] },
@@ -40,27 +40,21 @@ export default {
             throw new Error(`Unexpected Git operation: ${args[0]}`);
           } };
         writeRebuildState(root, {}, env);
-        if (!openProbation({ root, env, sha, prevHead, inputsKey: 'candidate', mainSha: sha, applied: [], now: () => at })) {
+        if (!openProbation({ root, env, sha, prevHead, inputsKey: 'candidate', mainSha: sha, applied: [], now: () => at, run: () => ({ status: 0, stdout: sha }) })) {
           throw new Error('Could not seed probation');
         }
         const before = readProbation(root, env);
         const result = await rebuildClone({ ...options, ...shape });
         if (result.reason !== 'not-on-main') violations.push(`${name}: unexpected rebuild result ${result.reason}`);
         const after = readProbation(root, env);
-        if (name === 'daemon') {
-          if (after?.boots !== 1 || after?.bootPid !== process.pid || after?.bootedAt !== new Date(at + 500).toISOString()) {
-            violations.push('opted-in daemon did not register its boot');
-          }
-        } else if (JSON.stringify(after) !== JSON.stringify(before)) {
-          violations.push(`${name} changed probation boot evidence: boots=${after?.boots}, bootPid=${after?.bootPid}`);
+        if (JSON.stringify(after) !== JSON.stringify(before)) {
+          violations.push(`${name} changed boot evidence outside the boot hook`);
         }
         log?.(`${name}: boots=${after?.boots}, bootPid=${after?.bootPid ?? 'absent'}`);
       }
     } catch (error) { violations.push(error.message); }
     finally {
       rmSync(base, { recursive: true, force: true });
-      // A real armed watch retires on the next interval after its fixture disappears.
-      await new Promise(resolve => setTimeout(resolve, 20));
     }
     return { violations };
   },
