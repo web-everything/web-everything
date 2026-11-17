@@ -90,11 +90,32 @@ function validMqInfraSignatures(value) {
     }
     if (literals < 11 || alphanumerics < 10) return false;
     try {
-      const re = new RegExp(source);
+      // Case folding applies to the generic probes, not the runtime signatures.
+      const re = new RegExp(source, 'i');
       // Generic failure wording is not an infra signature, whatever the grammar admits.
       return !['test failed', 'Error: assertion failed', 'tests failed', 'command failed'].some(probe => re.test(probe));
     } catch { return false; }
   });
+}
+
+// Positive setup evidence only: display names of arbitrary commands are not proof.
+function mqSetupStep(name) {
+  return typeof name === 'string' && (/^Set up job(?![\s\S])/i.test(name)
+    || /^(?:Run )?actions\/(?:checkout|setup-(?:node|python|go|java|dotnet|ruby))(?:@[a-z0-9._/-]+)?(?![\s\S])/i.test(name)
+    || /^(?:Checkout|Check out)(?: (?:repository|code))?(?![\s\S])/i.test(name)
+    || /^(?:Fetch|Setup|Set up|Install)[ -](?:dependencies|toolchain|Node(?:\.js)?|pnpm|npm|Bun|Rust|Go|Python|Git|repository|sources|code)(?![\s\S])/i.test(name));
+}
+
+function mqSetupFailure(job) {
+  const steps = job.steps;
+  if (!Array.isArray(steps) || !steps.length || steps.some((step, i) =>
+    typeof step?.name !== 'string' || !step.name.trim() || step.status !== 'completed'
+    || !Number.isSafeInteger(step.number) || step.number < 1
+    || i > 0 && step.number <= steps[i - 1].number)) return false;
+  const failed = steps.findIndex(step => step.conclusion === 'failure');
+  return failed >= 0 && mqSetupStep(steps[failed].name)
+    && steps.every((step, i) => i < failed ? step.conclusion === 'success' && mqSetupStep(step.name)
+      : i === failed ? step.conclusion === 'failure' : step.conclusion === 'skipped');
 }
 const mqFailureReasons = new Set(['failed_checks', 'ci_failure',
   'branch_protection_failure', 'invalid_merge_commit']);
@@ -882,7 +903,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
           || `${jobPath[1]}/${jobPath[2]}` !== repo) continue;
         const jobId = Number(jobPath[3]);
         if (!Number.isSafeInteger(jobId) || jobId <= 0) continue;
-        if (summaryStep) {
+        {
           try {
             if (budget <= 2) throw new Error('retry evidence budget exhausted');
             budget--;
@@ -891,6 +912,11 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
               stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 },
             }));
             if (job?.id === jobId && job.name === check.name && mqOid(job.head_sha) === oid
+              && job.status === 'completed' && job.conclusion === 'failure' && mqSetupFailure(job)) {
+              logVerdicts.set(check.id, true);
+              continue;
+            }
+            if (summaryStep && job?.id === jobId && job.name === check.name && mqOid(job.head_sha) === oid
               && job.status === 'completed' && job.conclusion === 'failure'
               && Array.isArray(job.steps) && job.steps.length > 0
               && job.steps.some(step => step?.name === summaryStep && step.conclusion === 'failure')

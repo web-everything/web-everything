@@ -19,6 +19,32 @@ import { decideDrainWorkflowEditHold } from '../drain-workflow-edit-hold.mjs';
 const head = '5300b9ec377a' + '0'.repeat(28);
 const prior = 'a'.repeat(40);
 
+describe('MQ infrastructure signature validation', () => {
+  it.each(['could not fetch \\S+ from promisor remote', 'tool outage',
+    'outage during \\S+\\. checkout', 'outage during \\s+checkout',
+    'outage during \\d+remote', 'outage during \\S+', 'a'.repeat(200)])(
+    'accepts specific bounded signature %j without falling back', source => {
+      const result = readDrainQueueSafety({ env: {}, tool: { mqInfraSignatures: [source] }, platform: {} });
+      expect(result.value.mqInfraSignatures).toEqual([source]);
+      expect(result.sources.mqInfraSignatures).toBe('tool');
+      expect(result.invalid).toEqual([]);
+    });
+
+  it.each(['test failed', 'TESTS FAILED', 'Command Failed', 'Error\\: ASSERTION FAILED',
+    'tests\\s+FAILED', 'a'.repeat(10), 'a'.repeat(9) + '  ', 'a'.repeat(201),
+    'outage during \\S+suffix', 'outage during \\d+7', 'outage during \\s+ checkout',
+    'outage \\S+ on \\d+ remote', 'outage (a+)+', '.*'])(
+    'rejects generic or unsafe signature %j and reports fallback', source => {
+      const log = vi.fn();
+      const result = readDrainQueueSafety({ env: {}, tool: { mqInfraSignatures: [source] },
+        platform: { mqInfraSignatures: ['platform outage'] }, log });
+      expect(result.value.mqInfraSignatures).toEqual(['platform outage']);
+      expect(result.sources.mqInfraSignatures).toBe('platform');
+      expect(result.invalid.join('\n')).toContain('mqInfraSignatures');
+      expect(log.mock.calls.flat().join('\n')).toContain('(platform)');
+    });
+});
+
 describe('shared same-head live reader', () => {
   it('strips both memo environments while preserving caller options and non-GitHub IO', () => {
     const exec = vi.fn(() => 'live');
@@ -854,6 +880,11 @@ describe('merge-queue same-head failure admission', () => {
           if (f.checkReads > 1) throw new Error('next check-runs page unavailable');
           return f.checkJson ?? JSON.stringify({ total_count: f.checkTotal ?? f.checks.length, check_runs: f.checks });
         }
+        if (endpoint === `repos/${repo}/actions/jobs/9021`) {
+          if (f.job instanceof Error) throw f.job;
+          return JSON.stringify(f.job);
+        }
+        if (endpoint === `repos/${repo}/actions/jobs/9021/logs`) return f.jobLog ?? 'Process completed with exit code 1.\n';
         if (endpoint?.includes('/actions/') || (args[0] === 'run' && args[1] === 'list')) {
           f.mainReads = (f.mainReads ?? 0) + 1;
           if (f.mainError) throw new Error('main runs unavailable');
@@ -882,6 +913,67 @@ describe('merge-queue same-head failure admission', () => {
       };
       test(f);
     }
+
+    function setupJob(f, name = 'Checkout') {
+      f.checks[0] = { ...f.checks[0], name: 'test-shard (1)', conclusion: 'failure',
+        details_url: `https://github.com/${repo}/actions/runs/201/job/9021` };
+      f.job = { id: 9021, name: f.checks[0].name, head_sha: removed().beforeCommit.oid,
+        status: 'completed', conclusion: 'failure', steps: [
+          { number: 1, name: 'Set up job', status: 'completed', conclusion: 'success' },
+          { number: 2, name, status: 'completed', conclusion: 'failure' },
+          { number: 3, name: 'Run tests', status: 'completed', conclusion: 'skipped' },
+        ] };
+    }
+
+    it.each(['Set up job', 'Checkout', 'Run actions/checkout', 'actions/checkout@v4',
+      'Fetch sources', 'Setup Node.js', 'Install toolchain'])(
+      'accepts step proof for %s before tests, without reading logs', name => fixture(f => {
+        setupJob(f, name);
+        expect(f.guard().hold).toBe(false);
+        expect(f.log.mock.calls[0][0]).toContain('infra retry 1/2');
+        expect(f.exec.mock.calls.some(([, args]) => args.includes(`repos/${repo}/actions/jobs/9021/logs`))).toBe(false);
+      }));
+
+    it.each(['Run tests', 'Run build', 'Test checkout', 'Install test fixtures', 'Unknown command',
+      'Run actions/setup-tests', 'Checkout\n'])(
+      'refuses step proof when %s fails', name => fixture(f => {
+        setupJob(f, name);
+        f.expectHeld();
+      }));
+
+    it.each([
+      ['missing steps', job => { delete job.steps; }],
+      ['empty steps', job => { job.steps = []; }],
+      ['unknown status', job => { delete job.steps[1].status; }],
+      ['unknown conclusion', job => { job.steps[2].conclusion = null; }],
+      ['unknown name', job => { delete job.steps[1].name; }],
+      ['missing number', job => { delete job.steps[1].number; }],
+      ['unordered steps', job => { job.steps[2].number = 1; }],
+      ['later test ran', job => { job.steps[2].conclusion = 'success'; }],
+      ['later test failed', job => { job.steps[2].conclusion = 'failure'; }],
+      ['earlier test ran', job => { job.steps[0].name = 'Run tests'; }],
+      ['wrong job', job => { job.id = 21; }],
+      ['wrong head', job => { job.head_sha = prior; }],
+      ['wrong name', job => { job.name = 'other'; }],
+      ['incomplete job', job => { job.status = 'in_progress'; }],
+    ])('fails closed on step evidence: %s', (_name, change) => fixture(f => {
+      setupJob(f);
+      change(f.job);
+      f.expectHeld();
+    }));
+
+    it('fails closed on unreadable job metadata', () => fixture(f => {
+      setupJob(f);
+      f.job = new Error('metadata unavailable');
+      f.expectHeld();
+    }));
+
+    it('retains signature proof when job metadata is unavailable', () => fixture(f => {
+      setupJob(f);
+      f.job = new Error('metadata unavailable');
+      f.jobLog = 'fatal: could not fetch abc123 from promisor remote\n';
+      expect(f.guard().hold).toBe(false);
+    }));
 
     it.each(['cancelled', 'timed_out', 'startup_failure'])('guard logs retry 1/2 for infrastructure check conclusion %s', conclusion => fixture(f => {
       f.checks[0].conclusion = conclusion;
