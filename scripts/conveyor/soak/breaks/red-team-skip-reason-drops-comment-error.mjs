@@ -13,6 +13,7 @@ export default {
   },
   async run({ sourceRoot } = {}) {
     const root = sourceRoot ?? resolve(fileURLToPath(import.meta.url), '../../../../..');
+    const { CONSTELLATION_REPOS } = await import(pathToFileURL(join(root, 'scripts/lib/constellation-repos.mjs')).href);
     const { runReviewJob } = await import(pathToFileURL(join(root, 'scripts/operations/review-job.mjs')).href);
     const head = 'a'.repeat(40), loopPayload = { runId: 'review-pr-soak', stopped: 'complete',
       verdict: { verdict: 'accept', loop: { outcome: 'converged' }, findings: [], admittedFindings: [] },
@@ -31,7 +32,7 @@ export default {
         settleRedTeamSkip: (input) => { seen = input.redTeam.reason; return { outcome: 'non-policy' }; },
         runRedTeamGate: () => ({ status: 'ok', outcome: 'advisory' }), redTeamStatus() {}, clearRedTeamQueued() {},
       };
-      runReviewJob({ repo: 'web-everything/web-everything', pr: 1 }, io);
+      runReviewJob({ repo: CONSTELLATION_REPOS.we.slug, pr: 1 }, io);
       return seen;
     };
     const violations = [];
