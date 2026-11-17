@@ -207,7 +207,7 @@ describe('final policy validation and immutable launch contract', () => {
     env.PATH = '/changed-after-resolution';
     expect(spec.env.PATH).toBe('/bin');
     expect(spec.budget).toEqual(budget);
-    expect(Object.keys(spec).sort()).toEqual(['provider', 'model', 'effort', 'env', 'readsRepo', 'budget', 'floor', 'sources', 'overlay'].sort());
+    expect(Object.keys(spec).sort()).toEqual(['provider', 'model', 'effort', 'env', 'readsRepo', 'budget', 'floor', 'sources', 'overlay', 'fallback'].sort());
     const frozen = value => {
       if (value && typeof value === 'object') { expect(Object.isFrozen(value)).toBe(true); Object.values(value).forEach(frozen); }
     };
@@ -229,5 +229,72 @@ describe('final policy validation and immutable launch contract', () => {
     finally { Object.defineProperty(process, 'env', original); }
     expect(error).toBeUndefined();
     expect(reads).toBe(0);
+  });
+});
+
+describe('launch policy audit regressions', () => {
+  it('carries validated shadow mode and the counting Claude fallback into launch and floor evidence', () => {
+    const ctx = context('review', { policy: DEFAULT_ROUTING_POLICY });
+    const expected = resolveOperationRoute({ ...ctx, operation: 'review-seat' });
+    expect(expected).toMatchObject({ mode: 'shadow', provider: 'agy-claude',
+      fallback: [expect.objectContaining({ provider: 'claude' })] });
+    const spec = resolveLaunchSpec('review', 'review', ctx);
+    expect(spec.mode).toBe(expected.mode);
+    expect(spec.fallback).toEqual(expected.fallback);
+    expect(spec.floor).toMatchObject({ mode: expected.mode, fallback: expected.fallback });
+    expect(Object.isFrozen(spec.fallback)).toBe(true);
+    expect(Object.isFrozen(spec.fallback[0])).toBe(true);
+    expect(Object.isFrozen(spec.floor.fallback[0])).toBe(true);
+  });
+
+  it('preserves taskTypes provider restrictions when concretizing an inherited operation', () => {
+    const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+    policy.operations.judge = { inherit: true };
+    policy.taskTypes['restricted-judge'] = { provider: 'claude', model: 'sonnet', effort: 'high',
+      disabledProviders: ['agy-claude'], fallback: [] };
+    const overlay = { provider: 'agy-claude', model: 'claude-sonnet-5-5', effort: 'high' };
+    const ctx = context('judge', { policy, taskType: 'restricted-judge', tool: setting('judge', overlay) });
+    expect(() => resolveOperationRoute({ ...ctx, operation: 'judge', aiRouting: overlay })).toThrow(/no available route/);
+    refusal(() => resolveLaunchSpec('judge', 'judge', ctx), 'resolver');
+    // Positive control: the same overlay is valid once the task restriction is removed.
+    const unrestricted = structuredClone(policy);
+    delete unrestricted.taskTypes['restricted-judge'].disabledProviders;
+    expect(launch('judge', { ...ctx, policy: unrestricted }).provider).toBe('agy-claude');
+  });
+
+  it.each(['env', 'codexTool', 'codexPlatform'])('keeps operator-selected Sol/high above weaker Codex %s defaults', layer => {
+    const policy = policyFor('judge', 'codex', 'sol', 'high');
+    const defaults = { review: { model: 'gpt-6-luna', effort: 'low' } };
+    const extra = layer === 'env' ? { env: { WE_CODEX_MODEL_BY_TASK: JSON.stringify(defaults) } } : { [layer]: defaults };
+    const ctx = context('judge', { policy, operatorKeys: ['judge'], ...extra });
+    const expected = resolveOperationRoute({ ...ctx, operation: 'judge' });
+    expect(expected).toMatchObject({ model: 'gpt-6.1-sol', effort: 'high' });
+    const spec = resolveLaunchSpec('judge', 'judge', ctx);
+    expect(pair(spec)).toEqual(pair(expected));
+    expect(spec.floor).toMatchObject(pair(expected));
+    // Even without an operator key, a settings overlay cannot turn those defaults into a lower floor.
+    refusal(() => launch('judge', { ...ctx, operatorKeys: [],
+      tool: setting('judge', { provider: 'codex', model: 'gpt-6-luna', effort: 'low' }) }), 'floor');
+  });
+
+  it('refuses final Luna/ultra effort overlays rejected by the Codex resolver', () => {
+    const ctx = context('judge', { policy: policyFor('judge', 'codex', 'gpt-6-luna', 'high') });
+    expect(() => resolveCodexTaskRoute({ kind: 'review', env: {}, platform: {}, tool: {}, log: false,
+      model: 'gpt-6-luna', effort: 'ultra' })).toThrow(/does not support effort ultra/);
+    refusal(() => launch('judge', { ...ctx, tool: setting('judge', { effort: 'ultra' }) }), 'resolver');
+    expect(launch('judge', { ...ctx, tool: setting('judge', { effort: 'max' }) }))
+      .toMatchObject({ model: 'gpt-6-luna', effort: 'max' });
+  });
+
+  it('refuses an omitted optional advisory seat instead of resurrecting it through Codex', () => {
+    const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+    policy.operations['review-seat:advisory:agy-correctness'].disabledProviders = ['agy-claude'];
+    const ctx = context('review', { policy, taskType: 'advisory:agy-correctness', available: ['codex', 'agy-claude'] });
+    expect(resolveOperationRoute({ ...ctx, operation: 'review-seat' })).toBeNull();
+    refusal(() => resolveLaunchSpec('review', 'review', ctx), 'omitted-seat');
+    refusal(() => launch('review', { ...ctx, tool: setting('review', { provider: 'codex', model: 'sol' }) }), 'omitted-seat');
+    const enabled = structuredClone(policy);
+    delete enabled.operations['review-seat:advisory:agy-correctness'].disabledProviders;
+    expect(launch('review', { ...ctx, policy: enabled }).provider).toBe('agy-claude');
   });
 });

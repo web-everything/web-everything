@@ -213,8 +213,11 @@ function scanLaunchLayer(block, path, valid, refuse) {
   }
 }
 
-function launchBaseline(site, ctx, policy, options) {
+function launchBaseline(site, ctx, policy, options, refuse) {
   let route = resolveOperationRoute(options);
+  if (!route && site.operation === 'review-seat' && options.taskType === 'advisory:agy-correctness') {
+    refuse('omitted-seat', 'the optional advisory seat has no active route');
+  }
   if (!route && site.role === 'fix') {
     const chain = resolveFixExecutorChain({ env: ctx.env, platform: ctx.chainPlatform ?? {}, repo: ctx.repo ?? {} });
     const picked = pickChainRung({ ...ctx, chain: chain.value,
@@ -230,7 +233,11 @@ function launchBaseline(site, ctx, policy, options) {
   if (route.provider === 'codex') {
     const codex = resolveCodexTaskRoute({ ...ctx, kind: site.kind, env: ctx.env,
       tool: ctx.codexTool ?? {}, platform: ctx.codexPlatform ?? {}, log: false,
-      ...(route.model ? { standard: { model: route.model, effort: route.effort } } : {}) });
+      vetoes: options.vetoes,
+      // The policy/chain has already selected these leaves. Task defaults, including env,
+      // must not replace them before they become floor evidence. Caller pins still win.
+      ...(route.model ? { model: ctx.model ?? route.model } : {}),
+      ...(route.effort ? { effort: ctx.effort ?? route.effort } : {}) });
     route = { ...route, model: codex.model, effort: codex.effort };
   } else {
     const tier = workerTierFor({ ...ctx, kind: site.kind }).tier;
@@ -240,6 +247,21 @@ function launchBaseline(site, ctx, policy, options) {
       ?? operationEffort(site.operation, route.provider, options.taskType, policy)) };
   }
   return route;
+}
+
+// Retain the entries consulted by resolveOperationRoute before concretizing inheritance.
+function launchPolicyEntries({ operation, taskType, policy, size, designQuestion, wellScoped }) {
+  const initial = policy.operations[`${operation}:${taskType}`] ?? policy.operations[operation]
+    ?? policy.operations[operation.split(':')[0]];
+  let entry = initial;
+  if (['prepare', 'prepare-item'].includes(operation) && policy.smallPrepare && Number.isFinite(size)
+    && size > 0 && size <= policy.smallPrepare.maxSize && designQuestion === false && wellScoped === true) {
+    entry = policy.smallPrepare.route;
+  } else if (['prepare', 'prepare-item'].includes(operation) && (size >= 5 || designQuestion === true)) {
+    entry = policy.operations['prepare-decision'];
+  }
+  const effective = !entry || entry.inherit ? policy.taskTypes[taskType] ?? entry ?? policy.operations['*'] : entry;
+  return [initial, entry, effective].filter(Boolean);
 }
 
 function checkLaunchFloor(base, route, rule, refuse) {
@@ -325,7 +347,7 @@ export function resolveLaunchSpec(role, siteKey, ctx) {
     const options = { ...ctx, operation: site.operation, taskType: ctx.taskType ?? site.taskType, policy,
       gateClosed: ctx.gateClosed === true || gate?.open === false,
       vetoes: [...(ctx.vetoes ?? []), ...(gate?.vetoes ?? [])] };
-    const baseline = launchBaseline(site, ctx, policy, options);
+    const baseline = launchBaseline(site, ctx, policy, options, refuse);
     const locked = ctx.mandatoryLens || ctx.care || ctx.pinned || ctx.resume || ctx.model !== undefined || ctx.effort !== undefined;
     const overlay = locked ? undefined : inputs.coordinator;
     // Concretize inherited routes with their actual legacy selection, then run the SAME validator.
@@ -334,13 +356,18 @@ export function resolveLaunchSpec(role, siteKey, ctx) {
     const effectivePolicy = { ...policy, operations: { ...policy.operations,
       [key]: { provider: baseline.provider, model: baseline.model, effort: baseline.effort,
         fallback: baseline.fallback ?? [], ...(baseline.mode ? { mode: baseline.mode } : {}) } } };
-    // Preserve provider controls from the original entry when concretizing inheritance.
-    for (const entry of [policy.operations[site.operation], policy.operations[key]]) {
+    // Include taskTypes and wildcard inheritance, not just operation-local controls.
+    const entries = launchPolicyEntries(options);
+    const selectedEntry = entries.at(-1);
+    if (selectedEntry?.enabledProviders) effectivePolicy.operations[key].enabledProviders = [...selectedEntry.enabledProviders];
+    for (const entry of entries) {
       if (entry?.disabledProviders) effectivePolicy.operations[key].disabledProviders =
         [...new Set([...(effectivePolicy.operations[key].disabledProviders ?? []), ...entry.disabledProviders])];
     }
     const route = resolveOperationRoute({ ...options, policy: effectivePolicy, aiRouting: overlay });
     if (!route) refuse('route', 'no concrete launch route');
+    // Policy effort vocabulary alone does not check model-specific Codex capabilities.
+    for (const candidate of [route, ...route.fallback]) checkCombination(candidate);
     const changed = ['provider', 'model', 'effort'].some(field => route[field] !== baseline[field]);
     const readsRepo = site.readsRepo || ctx.readsRepo === true;
     if (changed && ((readsRepo || ['red-team-recheck', 'ci-heal', 'helper'].includes(role)) && route.provider !== 'claude')) {
@@ -348,8 +375,10 @@ export function resolveLaunchSpec(role, siteKey, ctx) {
     }
     checkLaunchFloor(baseline, route, AI_ROUTING_FLOORS[role], refuse);
     return freeze({ provider: route.provider, model: route.model, effort: route.effort, env: structuredClone(ctx.env),
+      fallback: structuredClone(route.fallback), ...(route.mode ? { mode: route.mode } : {}),
       readsRepo, budget: structuredClone(ctx.budget ?? null),
-      floor: { rule: AI_ROUTING_FLOORS[role], provider: baseline.provider, model: baseline.model, effort: baseline.effort },
+      floor: { rule: AI_ROUTING_FLOORS[role], provider: baseline.provider, model: baseline.model, effort: baseline.effort,
+        fallback: structuredClone(baseline.fallback ?? []), ...(baseline.mode ? { mode: baseline.mode } : {}) },
       sources: { baseline: siteKey, settings: resolved.sources }, overlay: overlay ? structuredClone(overlay) : null });
   } catch (error) {
     if (error instanceof AiRoutingRefusal) throw error;
