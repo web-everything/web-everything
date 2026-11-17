@@ -38,14 +38,17 @@ export function demoteNeverAutomatic(item, operatorCommand) {
  *   - `maxRedTeamRestartsPerHead`: separate restart budget, 0..2; zero routes orphaned heads to the operator.
  *   - `maxFixListLines`: the longest fix list a policy block may carry (1..20: it can only lower the standard).
  *   - `staleHoldAutoResume`: a stale hold is the system's (true) or the operator's (false).
+ *   - `unknownMergeabilityDeadlineMs`: drain-owned mergeability wait, at most 15 minutes (a few drain passes).
  */
 export const CLASSIFY_DEFAULTS = Object.freeze({
+  unknownMergeabilityDeadlineMs: 15 * 60_000,
   maxRedTeamRestartsPerHead: 2, staleHoldAutoResume: false, grantCeiling: MAX_TOTAL_ROUND_EXTENSIONS, maxFixListLines: 20, stateLanes: Object.freeze({}),
   systemActions: Object.freeze({ 'await-ledger-outbox': true, 'resume-stale-hold': true, 'rerun-red-team-gate': true, 'ask-review-daemon': true, 'tooling-card': true, 'restart-red-team': true, 'publish-red-team-result': true }),
   policyActions: Object.freeze({ grant: true, card: true, block: true }),
 });
 /** Validators for each classifier setting leaf (shared with the sweep's cascade, so a bad value is refused there too). */
 export const CLASSIFY_VALID = Object.freeze({
+  unknownMergeabilityDeadlineMs: (v) => Number.isSafeInteger(v) && v > 0 && v <= CLASSIFY_DEFAULTS.unknownMergeabilityDeadlineMs,
   maxRedTeamRestartsPerHead: (v) => Number.isSafeInteger(v) && v >= 0 && v <= 2,
   staleHoldAutoResume: (v) => typeof v === 'boolean',
   grantCeiling: (v) => Number.isSafeInteger(v) && v >= 1 && v <= MAX_TOTAL_ROUND_EXTENSIONS,
@@ -110,6 +113,7 @@ const EXPECTED_ACTOR = Object.freeze({
   fixing: 'fixer', 'sent-back-red-team': 'fixer', draft: 'fixer', 'ci-failed': 'fixer', 'awaiting-ci': 'ci', 'ready-to-merge': 'drain',
   'in-merge-queue': 'drain', 'drain-skip:queue-file-overlap': 'drain', 'drain-skip:overlap-yield': 'drain', 'drain-skip:ready-not-reached': 'drain',
   'drain-skip:mq-same-head-failed': 'drain', 'drain-skip:card-grouped': 'drain',
+  'drain-skip:unknown-mergeability': 'drain',
 });
 /** Operator-owned states the judge does not cover: why a person is needed. */
 const OPERATOR_STATES = Object.freeze({
@@ -203,6 +207,14 @@ function classifyUnsafe(o = {}) {
   // An automatic or judged state needs the EXACT actor pr-sweep-core gives it; any other is a contradiction a person reads.
   const want = EXPECTED_ACTOR[state] ?? (JUDGED_STATES[state] ? 'operator' : null);
   if (want && row.actor !== want) return operator('unclassified', `fail-closed: actor ${JSON.stringify(row.actor)} does not fit ${state}`);
+
+  if (state === 'drain-skip:unknown-mergeability') {
+    // Reuse the sweep's age; a fresh wall-clock read would give this pure classifier a different clock.
+    if (!Number.isFinite(row.ageMinutes) || row.ageMinutes < 0) return operator('unclassified', 'fail-closed: unreadable mergeability wait age');
+    if (row.ageMinutes <= cfg.unknownMergeabilityDeadlineMs / 60_000) return null;
+    return out('system', 'tooling-card', 'the drain daemon owns the mergeability re-check, but GitHub mergeability is still unknown past the deadline',
+      { smell: 'pr-stage-stall', onceKey: `${key}:tooling-card` });
+  }
 
   if (state === 'system:ledger-write-miss') return out('system', 'await-ledger-outbox', 'the reviewer\'s referral save failed; the ledger outbox re-saves it');
   if (state === 'system:stale-hold') {
