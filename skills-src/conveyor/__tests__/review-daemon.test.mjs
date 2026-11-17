@@ -11,6 +11,19 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+// Keep host-wide operator settings out of hermetic daemon fixtures; exercise the real reader
+// against an explicitly injected missing store. Operator precedence has policy-cascade coverage.
+const operatorFixture = await vi.hoisted(async () => {
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const { randomUUID } = await import('node:crypto');
+  return { file: join(tmpdir(), `missing-review-operator-${randomUUID()}.json`) };
+});
+vi.mock('../../../scripts/lib/operator-override-reader.mjs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, readOperatorOverrides: options => actual.readOperatorOverrides({ ...options, file: operatorFixture.file }) };
+});
+
 // Mocked so `defaultReapSessions`'s own describe block below can assert exactly what it passes through
 // WITHOUT ever shelling a real `claude agents`/`claude stop`/`gh` call — this repo's own hard rule (never touch
 // a real process in a test; inject a fake). `session-reaper.mjs`'s OWN test suite
@@ -1120,6 +1133,56 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     const budget = liveReviewRoundBudget({ env: {}, listCommands: () => commands });
     expect(budget).toMatchObject({ live, max: 8, left });
     expect(budget.reason).toBe(`live review rounds ${live} of maxLiveReviewRounds=8 (tool)`);
+  });
+
+  it.each(['tool', 'env'])('accepts 16 and rejects 17 and 0 from the %s layer', async layer => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'review-cap-bounds-'));
+    const toolPath = join(dir, 'review-concurrency.json');
+    try {
+      for (const max of [16, 17, 0]) {
+        writeFileSync(toolPath, JSON.stringify({ maxLiveReviewRounds: layer === 'tool' ? max : 8 }));
+        const budget = liveReviewRoundBudget({ toolPath, listCommands: () => '',
+          env: layer === 'env' ? { WE_REVIEW_MAX_LIVE_ROUNDS: String(max) } : {} });
+        if (max === 16) {
+          expect(budget).toMatchObject({ max: 16, live: 0, left: 16 });
+          expect(budget.reason).toContain(`maxLiveReviewRounds=16 (${layer})`);
+        } else if (layer === 'tool') {
+          expect(budget).toBeNull(); // Invalid tool evidence cannot override the existing standard default.
+        } else {
+          expect(budget).toMatchObject({ max: 8, live: 0, left: 8 });
+          expect(budget.reason).toContain('maxLiveReviewRounds=8 (tool)');
+        }
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each([0, 1, 4, 5])('a live cap of 16 holds excess owed reviews with a lane reason when the pool has %i acquirable lanes', async laneCount => {
+    const { liveReviewRoundBudget, defaultAcquirableLaneNumbers } = await import('../review-daemon.mjs');
+    const lanes = Math.floor(laneCount / 2);
+    const pool = Array.from({ length: laneCount }, (_, i) => i + 1);
+    const budget = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '16' }, listCommands: () => '' });
+    const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
+    const poolExhaustion = { exhausted: vi.fn(), recovered: vi.fn() };
+    const prs = Array.from({ length: 16 }, (_, i) => ({ number: 100 + i, labels: ['review:pending'] }));
+    const out = runReviewTick({ reconcile: () => reviewsPlan(16), dispatch, liveReviewBudget: budget,
+      readPrs: () => prs, readAgents: () => [],
+      acquirableLanes: opts => defaultAcquirableLaneNumbers(opts, { readLanes: () => pool }),
+      hostAdmission: () => ({ admitted: true, maxPerTick: 8 }), poolExhaustion,
+      holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+    });
+    expect(dispatch).toHaveBeenCalledTimes(lanes);
+    expect(out.failed).toEqual([]);
+    expect(out.reviewsOwed).toBe(16);
+    expect(out.deferredForLanes).toBe(16 - lanes);
+    expect(out.deferredForCap).toBe(0);
+    expect(budget.left).toBe(16 - lanes);
+    expect(out.pendingNotDispatched).toHaveLength(16 - lanes);
+    for (const row of out.pendingNotDispatched) {
+      expect(row.reasons.join(' ')).toContain('no acquirable lane this tick');
+    }
+    if (lanes === 0) expect(poolExhaustion.exhausted).toHaveBeenCalledWith(expect.objectContaining({ deferred: 16 }));
+    else expect(poolExhaustion.recovered).toHaveBeenCalled();
   });
 
   it('EMERGENCY live-review cap: a shared budget bounds new reviews across repos; 0 left dispatches nothing', async () => {

@@ -1129,8 +1129,8 @@ export function hasStaleMainRefusal(tickResult) {
 }
 
 /**
- * #3383 bug 3 — the REAL `acquirableLanes` effect: how many lanes are acquirable RIGHT NOW in `repo`'s own
- * pool. Reuses `reconcile-fix-dispatch.mjs`'s own `freeLaneNumbers` — the SAME `lane-pool.mjs list
+ * #3383 bug 3 — the REAL `acquirableLanes` effect: how many review starts fit RIGHT NOW in `repo`'s own
+ * pool, allowing roughly two lanes per round. Reuses `reconcile-fix-dispatch.mjs`'s own `freeLaneNumbers` — the SAME `lane-pool.mjs list
  * --acquirable --json` read `tick-core.mjs`'s IO shell already uses — rather than re-deriving a second copy;
  * `repoProfile(repo).lanePoolRepo` is the exact same derivation `review-dispatch.mjs#planReviewDispatch`
  * already uses to pick which pool a given repo's own review session acquires from. Fail-soft, like
@@ -1144,9 +1144,12 @@ export function defaultAcquirableLaneCount({ repo }) {
   return defaultAcquirableLaneNumbers({ repo }).length;
 }
 
-/** Preserve the tick's fresh scan so sibling jobs acquire distinct lanes without scanning again. */
-export function defaultAcquirableLaneNumbers({ repo }) {
-  return freeLaneNumbers({ lanePoolRepo: repoProfile(repo).lanePoolRepo });
+/** Preserve distinct preferred lanes while leaving one companion lane per review round available.
+ * A round needs roughly two lanes; an unmatched lane cannot fit another round this tick.
+ * Returning no candidates uses the existing typed lane deferral / poolExhaustion path. */
+export function defaultAcquirableLaneNumbers({ repo }, { readLanes = freeLaneNumbers } = {}) {
+  const lanes = readLanes({ lanePoolRepo: repoProfile(repo).lanePoolRepo });
+  return lanes.slice(0, Math.floor(lanes.length / 2));
 }
 
 /** The lane-pool repo path for `repo` (the same derivation {@link defaultAcquirableLaneCount} uses). */
@@ -1669,7 +1672,7 @@ export function liveReviewRoundBudget({ env = process.env, listCommands = () => 
   const r = cascadePolicy('reviewConcurrency', tool && { maxLiveReviewRounds: tool.maxLiveReviewRounds }, {
     env, standard: { maxLiveReviewRounds: null },
     envValues: { maxLiveReviewRounds: typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : undefined },
-    valid: { maxLiveReviewRounds: (v) => v === null || (Number.isSafeInteger(v) && v >= 1) },
+    valid: { maxLiveReviewRounds: (v) => v === null || (Number.isSafeInteger(v) && v >= 1 && v <= 16) },
   });
   const max = r.value.maxLiveReviewRounds;
   if (max == null) return null;

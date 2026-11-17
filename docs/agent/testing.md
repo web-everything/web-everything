@@ -575,6 +575,11 @@ prior status/result); only a trusted result already on the head is terminal. Reg
 **a transient comments-unreadable guard refusal leaves status absent and fresh recovery eligible**
 and **a confirmed-dead queued/ran prior admits and reaches the shared resume path without a model call**.
 Recovery shares the tick's lane/live-review capacity and host admission (including recovery-only ticks).
+`reviewConcurrency.maxLiveReviewRounds` accepts 1..16 (configured default 8); the host per-tick
+start burst remains independently bounded at 1..8. The review daemon's production lane scan budgets
+two acquirable lanes per round. Excess owed reviews, including a pool with only one lane left, stay
+queued with the existing lane deferral / `poolExhaustion` reason. The focused live-cap-16 pool-fit
+cases in `review-daemon.test.mjs` cover empty, single-lane, even and odd pools without dispatch failures.
 Ordinary and recovery starts share the remaining host per-tick allowance; confirmed starts and
 unknown outcomes consume the cross-repo host budget, while confirmed non-starts do not.
 Recovery defaults to a 30-minute retry cooldown through
