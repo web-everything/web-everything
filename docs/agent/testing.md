@@ -2152,6 +2152,7 @@ marker grace and death-sample margin. With a persisted 32-hex nonce and fresh in
 (including 97/254) still listed active, finish on the owner's behalf before claiming/removing
 the marker. Bound SSH and output; failed or timed-out finishes retain capacity, log once and
 retry no faster than 30 seconds per run. Legacy nonce-less markers keep their existing rules.
+For 97/254, finishing on behalf requires a persisted numbered worker slot (`forge-exec-N`, N >= 1), since only that finish path proves descendant cleanup; missing, legacy or malformed slots keep the marker held.
 A run-less dead-owner marker keeps the existing zero-active and 120-minute-plus-skew orphan
 rules. R1017 also permits release when the marker is at least `RUNLESS_DEAD_GRACE_MS = 15 * 60_000`
 old and a fresh sample is at least that grace after first-seen-dead. Require `activeRunIds` and

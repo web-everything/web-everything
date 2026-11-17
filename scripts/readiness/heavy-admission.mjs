@@ -1350,7 +1350,7 @@ export async function runWithRemoteDecision({
   const executor = remoteExec ?? createRemoteExec({ policy, cwd, env, lockRoot, log, runOverride: remoteClientOverride });
   remoteExec = options => executor({...options,slotUnits:units,onRun:(run, metadata) => {
     try { options.onRun(run, metadata); } catch { /* advisory */ }
-    for (const file of extraMarkers) recordMarkerRun(file,{owner,run,nonce:metadata?.nonce});
+    for (const file of extraMarkers) recordMarkerRun(file,{owner,run,nonce:metadata?.nonce,slot:metadata?.slot});
   }});
   let exitWatcher;
   const refuseLocal = (reason) => {
@@ -1428,7 +1428,7 @@ export async function runWithRemoteDecision({
       return Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, cancelSignal: cancelController.signal, transport: policy.settings.remote.transport, bundleMainMaxAgeMs: policy.settings.remote.bundle.mainMaxAgeMin * 60_000,
       onWarning: (reason, detail) => recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock}),
       onCapabilities: capabilities => writeRunnerCapabilities({ root: remoteRoot, host, capabilities, clock }), onRun: (run, metadata) => {
-        if (recordMarkerRun(executionMarker, {owner, run, nonce:metadata?.nonce})) executionRun = run;
+        if (recordMarkerRun(executionMarker, {owner, run, nonce:metadata?.nonce, slot:metadata?.slot})) executionRun = run;
       } }));
     };
     let remote = dispatch();

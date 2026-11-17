@@ -47,12 +47,13 @@ describe('release log compatibility', () => {
 
 describe('R1017 finish settled active runs for dead owners', () => {
   const nonce = 'a'.repeat(32);
-  function fixture({code = 97, savedNonce = nonce, alive = false, host = 'forge', finishRun = vi.fn(async () => {})} = {}) {
+  const slot = 'forge-exec-2';
+  function fixture({code = 97, savedNonce = nonce, savedSlot = slot, alive = false, host = 'forge', finishRun = vi.fn(async () => {})} = {}) {
     const root = mkdtempSync(join(tmpdir(), 'slot-finish-')); roots.push(root);
     const file = join(root, 'slot-0.unconfirmed');
     writeFileSync(file, markerContent({owner: 'o', pid: 111, nowMs: NOW - 600_000, host, run: RUN_DEAD}));
     utimesSync(file, (NOW - 600_000) / 1000, (NOW - 600_000) / 1000);
-    expect(recordMarkerRun(file, {owner: 'o', run: RUN_DEAD, nonce: savedNonce})).toBe(true);
+    expect(recordMarkerRun(file, {owner: 'o', run: RUN_DEAD, nonce: savedNonce, slot: savedSlot})).toBe(true);
     const st = statSync(file);
     writeFileSync(file + '.dead', JSON.stringify({key: `slot-0.unconfirmed:${st.ino}:${st.mtimeMs}`, at: NOW - 120_000}));
     let now = NOW;
@@ -61,7 +62,7 @@ describe('R1017 finish settled active runs for dead owners', () => {
     const sample = (patch = {}) => async () => ({sampledAtET: iso(now), activeRuns: 1, activeRunIds: [RUN_DEAD], recent: [{...dead, code}], ...patch});
     return {root, file, log, reaper, sample, finishRun, setNow: value => { now = value; }};
   }
-  it.each([0, 97, 254, 255])('finishes listed active code %s once and removes marker and sidecars', async code => {
+  it.each([0, 1, 97, 254, 255])('finishes numbered-worker listed active code %s once and removes marker and sidecars', async code => {
     const f = fixture({code});
     writeFileSync(f.file + '.exit', JSON.stringify({owner: 'o', code: 143, signal: 'SIGTERM', at: NOW - 120_000}));
     writeFileSync(f.file + '.idle', '{}');
@@ -72,6 +73,27 @@ describe('R1017 finish settled active runs for dead owners', () => {
     expect(f.log.mock.calls.filter(([line]) => line.includes("(finished on owner's behalf)"))).toHaveLength(1);
     await f.reaper.step(f.sample());
     expect(f.finishRun).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    ['forge-exec', 97], ['forge-exec', 254], [undefined, 97], [undefined, 254],
+    ['forge-exec-01', 97], ['forge-exec-01', 254], ['forge-exec-2\n', 97], ['forge-exec-2\n', 254],
+  ])('holds active code %s/%s without a valid numbered slot and never finishes', async (savedSlot, code) => {
+    const f = fixture({code});
+    writeFileSync(f.file + '.run', JSON.stringify({owner: 'o', run: RUN_DEAD, nonce, ...(savedSlot !== undefined ? {slot: savedSlot} : {})}));
+    expect(runVerdict(await f.sample()(), RUN_DEAD)).toBe('inflight');
+    expect(await f.reaper.step(f.sample())).toEqual([]);
+    f.setNow(NOW + FINISH_RETRY_MS);
+    expect(await f.reaper.step(f.sample())).toEqual([]);
+    expect(f.finishRun).not.toHaveBeenCalled();
+    expect(existsSync(f.file)).toBe(true);
+  });
+  it.each([0, 1, 255])('still finishes active code %s on behalf without a recorded slot', async code => {
+    const f = fixture({code});
+    expect(recordMarkerRun(f.file, {owner: 'o', run: RUN_DEAD, nonce})).toBe(true);
+    expect(await f.reaper.step(f.sample())).toEqual(['slot-0.unconfirmed']);
+    expect(f.finishRun).toHaveBeenCalledTimes(1);
+    expect(f.finishRun).toHaveBeenCalledWith({run: RUN_DEAD, nonce});
+    expect(existsSync(f.file)).toBe(false);
   });
   it('keeps failed finishes, logs once and retries no more often than every 30 seconds per run', async () => {
     expect(FINISH_RETRY_MS).toBe(30_000);
@@ -159,7 +181,7 @@ describe('R1017 finish settled active runs for dead owners', () => {
     const f = fixture(), other = join(f.root, 'slot-1.unconfirmed');
     writeFileSync(other, readFileSync(f.file));
     utimesSync(other, (NOW - 600_000) / 1000, (NOW - 600_000) / 1000);
-    expect(recordMarkerRun(other, {owner: 'o', run: RUN_DEAD, nonce})).toBe(true);
+    expect(recordMarkerRun(other, {owner: 'o', run: RUN_DEAD, nonce, slot})).toBe(true);
     const st = statSync(other);
     writeFileSync(other + '.dead', JSON.stringify({key: `slot-1.unconfirmed:${st.ino}:${st.mtimeMs}`, at: NOW - 120_000}));
     expect(await f.reaper.step(f.sample())).toEqual(['slot-0.unconfirmed', 'slot-1.unconfirmed']);
@@ -178,11 +200,26 @@ describe('R1017 finish settled active runs for dead owners', () => {
     expect(await f.reaper.step(f.sample())).toEqual([]);
     expect(f.finishRun).not.toHaveBeenCalled();
   });
-  it('round-trips nonce in a private owner-bound sidecar', () => {
-    const f = fixture();
-    expect(JSON.parse(readFileSync(f.file + '.run', 'utf8'))).toEqual({owner: 'o', run: RUN_DEAD, nonce});
+  it.each(['forge-exec', slot])('round-trips nonce and slot %s in a private owner-bound sidecar', savedSlot => {
+    const f = fixture({savedSlot});
+    expect(JSON.parse(readFileSync(f.file + '.run', 'utf8'))).toEqual({owner: 'o', run: RUN_DEAD, nonce, slot: savedSlot});
     expect(statSync(f.file + '.run').mode & 0o777).toBe(0o600);
-    expect(recordMarkerRun(f.file, {owner: 'successor', run: RUN_DEAD, nonce})).toBe(false);
+    expect(recordMarkerRun(f.file, {owner: 'successor', run: RUN_DEAD, nonce, slot: savedSlot})).toBe(false);
+  });
+  it.each([null, '', 2, ['forge-exec-2'], {}, 'root', 'forge-exec-0', 'forge-exec-01', 'forge-exec--1', 'forge-exec-2x',
+    'forge-exec-2\n', 'forge-exec-2\r', 'forge-exec-2\r\n', 'forge-exec-2\u2028', 'forge-exec-2\u2029',
+  ].map(value => [value]))('rejects malformed slot writes and treats persisted slot %j as unreadable', async invalid => {
+    const f = fixture({code: 0});
+    const before = readFileSync(f.file + '.run', 'utf8');
+    expect(recordMarkerRun(f.file, {owner: 'o', run: RUN_DEAD, nonce, slot: invalid})).toBe(false);
+    expect(readFileSync(f.file + '.run', 'utf8')).toBe(before);
+    // With no inline run, accepting this malformed sidecar would finish code 0 on behalf.
+    writeFileSync(f.file, markerContent({owner: 'o', pid: 111, nowMs: NOW - 600_000, host: 'forge'}));
+    utimesSync(f.file, (NOW - 600_000) / 1000, (NOW - 600_000) / 1000);
+    writeFileSync(f.file + '.run', JSON.stringify({owner: 'o', run: RUN_DEAD, nonce, slot: invalid}));
+    expect(await f.reaper.step(f.sample())).toEqual([]);
+    expect(f.finishRun).not.toHaveBeenCalled();
+    expect(existsSync(f.file)).toBe(true);
   });
 });
 

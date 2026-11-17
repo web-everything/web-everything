@@ -105,11 +105,22 @@ function fixture({ probeCode = 0, copyCode = 0, prepareCode = 0, runCode = 0, re
 }
 // Simulate umask 077 without changing the test worker's process-wide umask.
 describe('R1017 advisory run identity', () => {
-  it('passes the prepare nonce with onRun before dispatch and finish', async () => {
+  it.each([undefined, 'forge-exec', 'forge-exec-2'])('passes the prepare nonce and raw slot %s with onRun before dispatch and finish', async slot => {
     const f = fixture();
+    const execute = f.exec;
+    f.exec = vi.fn(async call => {
+      const reply = await execute(call);
+      if (isPrepare(call)) {
+        const preparation = JSON.parse(reply.stdout);
+        if (slot !== undefined) preparation.slot = slot;
+        if (slot === 'forge-exec-2') preparation.capabilities.workers = [slot];
+        return {...reply, stdout: JSON.stringify(preparation)};
+      }
+      return reply;
+    });
     const onRun = vi.fn((run, metadata) => {
       const prepare = JSON.parse(callsOf(f.exec).find(isPrepare).input);
-      expect(metadata).toEqual({nonce: prepare.nonce});
+      expect(metadata).toEqual({nonce: prepare.nonce, slot});
       expect(metadata.nonce).toMatch(/^[a-f0-9]{32}$/);
       expect(run).toBe('r-' + prepare.nonce);
       expect(callsOf(f.exec).some(isRun)).toBe(false);
@@ -117,7 +128,28 @@ describe('R1017 advisory run identity', () => {
     });
     expect(await runRemote({...f, onRun})).toMatchObject({mode: 'remote', code: 0});
     expect(onRun).toHaveBeenCalledTimes(1);
+    expect(onRun.mock.calls[0]).toEqual(['r-' + JSON.parse(callsOf(f.exec).find(isPrepare).input).nonce,
+      {nonce: JSON.parse(callsOf(f.exec).find(isPrepare).input).nonce, slot}]);
     expect(JSON.parse(callsOf(f.exec).find(isCleanup).input).nonce).toBe(onRun.mock.calls[0][1].nonce);
+  });
+  it.each(['root', 'forge-exec-01', ['forge-exec-2'], {slot: 'forge-exec-2'}, 2, null].map(value => [value]))
+  ('keeps onRun before slot validation and passes only raw strings: %j', async slot => {
+    const f = fixture(), execute = f.exec;
+    f.exec = vi.fn(async call => {
+      const reply = await execute(call);
+      if (isPrepare(call)) {
+        const preparation = JSON.parse(reply.stdout);
+        return {...reply, stdout: JSON.stringify({...preparation, slot, capabilities: {...preparation.capabilities, workers: ['forge-exec-2']}})};
+      }
+      return reply;
+    });
+    const onRun = vi.fn();
+    const result = await runRemote({...f, onRun});
+    const {nonce} = JSON.parse(callsOf(f.exec).find(isPrepare).input);
+    expect(onRun).toHaveBeenCalledTimes(1);
+    expect(onRun).toHaveBeenCalledWith('r-' + nonce, {nonce, slot: typeof slot === 'string' ? slot : undefined});
+    expect(result).toMatchObject(slot === null ? {mode: 'remote', code: 0} : {mode: 'not-started', terminated: true, reason: 'copy-failed'});
+    if (slot !== null) expect(callsOf(f.exec).some(call => call.file === 'rsync' || isRun(call))).toBe(false);
   });
   it('keeps nonce persistence advisory when onRun throws', async () => {
     const f = fixture();

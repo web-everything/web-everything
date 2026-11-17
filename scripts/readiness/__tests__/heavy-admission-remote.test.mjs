@@ -82,17 +82,17 @@ describe('R1017 remote marker provenance and nonce plumbing', () => {
     writeFileSync(join(f.cwd, '.git', LEASE_FILENAME), JSON.stringify({lane: 14, session: 'lease-session', pr: 1017}));
     return {...f, remoteRoot: join(f.lockRoot, '..', 'remote')};
   }
-  it('persists nonce and trace tags for the primary and every extra unit marker, then removes sidecars', async () => {
+  it.each([undefined, 'forge-exec', 'forge-exec-2'])('persists nonce, slot %s and trace tags for the primary and every extra unit marker, then removes sidecars', async slot => {
     const f = multiUnitFixture(), nonce = 'a'.repeat(32), run = 'r-' + 'b'.repeat(32);
     let files;
     f.remoteExec = vi.fn(async options => {
-      options.onRun(run, {nonce});
+      options.onRun(run, {nonce, slot});
       files = readdirSync(f.remoteRoot).filter(name => name.endsWith('.unconfirmed'));
       expect(files).toHaveLength(2);
       for (const name of files) {
         const file = join(f.remoteRoot, name), marker = JSON.parse(readFileSync(file, 'utf8'));
         expect(marker).toMatchObject({pid: process.pid, caller: {kind: 'FULL', session: 'fixture-session', ppid: process.ppid, cmd: 'npm'}, lane: 14, pr: 1017});
-        expect(JSON.parse(readFileSync(file + '.run', 'utf8'))).toEqual({owner: marker.owner, run, nonce});
+        expect(JSON.parse(readFileSync(file + '.run', 'utf8'))).toEqual({owner: marker.owner, run, nonce, ...(slot !== undefined ? {slot} : {})});
         expect(statSync(file + '.run').mode & 0o777).toBe(0o600);
       }
       return {mode: 'remote', code: 0};
@@ -142,7 +142,7 @@ describe('R1017 remote marker provenance and nonce plumbing', () => {
     writeFileSync(file, JSON.stringify({v: 1, host: 'forge', owner: 'dead', pid: Number(child.stdout.toString()), at: now - 600_000}));
     utimesSync(file, (now - 600_000) / 1000, (now - 600_000) / 1000);
     const st = statSync(file);
-    writeFileSync(file + '.run', JSON.stringify({owner: 'dead', run, nonce}));
+    writeFileSync(file + '.run', JSON.stringify({owner: 'dead', run, nonce, slot: 'forge-exec-2'}));
     writeFileSync(file + '.dead', JSON.stringify({key: `slot-0.unconfirmed:${st.ino}:${st.mtimeMs}`, at: now - 120_000}));
     f.readTelemetry = async () => ({...await healthyRead(), sampledAtET: easternTimestamp(now), activeRuns: 1, activeRunIds: [run],
       recent: [{runId: run, code: f.sleep.mock.calls.length ? 97 : null, startedAtET: easternTimestamp(now - 500_000), stageMs: {install: 0, run: 0}}]});

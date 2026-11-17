@@ -31,6 +31,8 @@ const CLOCK_SKEW_MS = 60_000;
 const LEGACY_TEXT = 'remote termination unconfirmed';
 const RUN = /^r-[a-f0-9]{32}(?![\s\S])/;
 const NONCE = /^[a-f0-9]{32}(?![\s\S])/;
+const SLOT = /^forge-exec(?:-[1-9]\d*)?(?![\s\S])/;
+const NUMBERED_SLOT = /^forge-exec-[1-9]\d*(?![\s\S])/;
 const shortText = v => typeof v === 'string' && v.length > 0 && v.length <= 200 && !/[\x00-\x1f\x7f]/.test(v);
 const validCaller = v => v && typeof v === 'object' && !Array.isArray(v)
   && Object.keys(v).every(k => ['kind', 'session', 'ppid', 'cmd'].includes(k))
@@ -89,12 +91,13 @@ function sidecarExit(file, owner) {
  * Record the Forge run id beside this client's marker, in a sidecar bound to the marker's owner. The marker file itself is
  * never rewritten (a reaper may be judging its inode), and a stale sidecar of another owner is ignored.
  */
-export function recordMarkerRun(file, {owner, run, nonce}) {
-  if (typeof run !== 'string' || !RUN.test(run) || (nonce !== undefined && (typeof nonce !== 'string' || !NONCE.test(nonce)))) return false;
+export function recordMarkerRun(file, {owner, run, nonce, slot}) {
+  if (typeof run !== 'string' || !RUN.test(run) || (nonce !== undefined && (typeof nonce !== 'string' || !NONCE.test(nonce)))
+    || (slot !== undefined && (typeof slot !== 'string' || !SLOT.test(slot)))) return false;
   const tmp = `${file}.run-${randomBytes(6).toString('hex')}`;
   try {
     if (JSON.parse(readFileSync(file, 'utf8'))?.owner !== owner) return false;
-    writeFileSync(tmp, JSON.stringify({owner, run, ...(nonce !== undefined ? {nonce} : {})}) + '\n', {flag: 'wx', mode: 0o600});
+    writeFileSync(tmp, JSON.stringify({owner, run, ...(nonce !== undefined ? {nonce} : {}), ...(slot !== undefined ? {slot} : {})}) + '\n', {flag: 'wx', mode: 0o600});
     renameSync(tmp, `${file}.run`);
     return true;
   } catch { try { unlinkSync(tmp); } catch { /* none */ } return false; }
@@ -104,7 +107,8 @@ function sidecarRun(file, owner) {
   try {
     const saved = JSON.parse(readFileSync(`${file}.run`, 'utf8'));
     return saved?.owner === owner && typeof saved.run === 'string' && RUN.test(saved.run)
-      && (saved.nonce === undefined || typeof saved.nonce === 'string' && NONCE.test(saved.nonce)) ? saved : null;
+      && (saved.nonce === undefined || typeof saved.nonce === 'string' && NONCE.test(saved.nonce))
+      && (saved.slot === undefined || typeof saved.slot === 'string' && SLOT.test(saved.slot)) ? saved : null;
   } catch { return null; }
 }
 
@@ -208,6 +212,7 @@ function readMarker(file) {
       return {legacy: false, host: marker.host, owner: marker.owner, pid: marker.pid ?? null,
         caller: marker.caller, lane: marker.lane, pr: marker.pr, exit: sidecarExit(file, marker.owner),
         run: marker.run ?? saved?.run ?? null, nonce: saved && (!marker.run || marker.run === saved.run) ? saved.nonce : undefined,
+        slot: saved && (!marker.run || marker.run === saved.run) ? saved.slot : undefined,
         at: marker.at ?? null};
     }
   } catch { /* not JSON: legacy only if it is exactly the known bare text */ }
@@ -249,7 +254,8 @@ function ownerGone(root, index, file, liveness, selfPid) {
  * only when a dead-owner marker exists, so a loop with no dead markers costs one readdir.
  * Decided PER RUN; a matching settled receipt suffices even while Forge is busy, except ambiguous supervisor
  * failure codes (97/254), which require zero active runs as cleanup evidence. With an injected finisher and a
- * persisted nonce, a settled run still listed active is instead finished on the dead owner's behalf before release.
+ * persisted nonce, a settled run still listed active is instead finished on the dead owner's behalf before release;
+ * 97/254 additionally require a persisted numbered slot, whose finish path proves descendant cleanup.
  * A dead-owner,
  * host-bound marker is reaped when it is past the grace window, the telemetry sample was taken at least
  * DEATH_SAMPLE_MARGIN_MS after the owner was first seen dead (the stamp persists in a sidecar, so a later client completes
@@ -359,7 +365,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
         if (marker.host !== host || host === undefined) continue;
         if (!gone) { forget(file, key); continue; }
         stampFor(file, key);
-        dead.push({name, key, file, mtimeMs, ino, index, run: marker.run, nonce: marker.nonce, at: marker.at, owner: marker.owner, ...trace});
+        dead.push({name, key, file, mtimeMs, ino, index, run: marker.run, nonce: marker.nonce, slot: marker.slot, at: marker.at, owner: marker.owner, ...trace});
       }
       if (dead.length) {
         let telemetry = null;
@@ -381,7 +387,8 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
               verdict = runVerdict(telemetry, entry.run);
               const receipt = telemetry.recent.find(item => item?.runId === entry.run);
               if (finishRun && entry.nonce && telemetry.activeRunIds?.includes(entry.run)
-                && Number.isInteger(receipt?.code) && receipt.code >= 0 && receipt.code <= 255) {
+                && Number.isInteger(receipt?.code) && receipt.code >= 0 && receipt.code <= 255
+                && (receipt.code !== 97 && receipt.code !== 254 || typeof entry.slot === 'string' && NUMBERED_SLOT.test(entry.slot))) {
                 // Fresh evidence and another local death probe precede the only remote mutation.
                 if (decisionAt - sampledAt < -CLOCK_SKEW_MS || decisionAt - sampledAt > 30_000
                   || !ownerGone(root, entry.index, entry.file, liveness, selfPid)) continue;
