@@ -143,10 +143,11 @@ export function defaultCountLiveInspections({ listAgents = () => defaultListAgen
   let agents;
   try {
     agents = listAgents();
-  } catch {
-    return 0;
+  } catch (error) {
+    agents = error?.name === 'SessionsUnknown' ? error.rows : [];
   }
-  return (Array.isArray(agents) ? agents : []).filter((a) => parseSessionSlug(a?.name)?.kind === 'inspect').length;
+  agents = [...new Map((Array.isArray(agents) ? agents : []).map(a => [JSON.stringify([a.storeKey, a.sessionId ?? a.id ?? a.name]), a])).values()];
+  return agents.filter((a) => parseSessionSlug(a?.name)?.kind === 'inspect').length;
 }
 
 /**

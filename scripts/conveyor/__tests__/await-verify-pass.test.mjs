@@ -944,7 +944,7 @@ it('resume stops the idle live process by its SHORT job id first, then resumes t
     },
   });
   const r = io.resume({ session: { id: 'a287c608', sessionId: sid, kind: 'background', cwd: '/scratch', state: 'working', status: 'idle', pid: 4242 }, prompt: 'x' });
-  expect(calls[0]).toEqual(['stop', 'a287c608']); // never the full uuid: `claude stop <uuid>` is "No job matching"
+  expect(calls[0]).toEqual(['stop', sid]); // never the full uuid: `claude stop <uuid>` is "No job matching"
   expect(calls[1]).toEqual(['spawn', ['--bg', '--resume', sid], '/scratch']);
   expect(r).toMatchObject({ resumed: true });
 });
@@ -1038,11 +1038,11 @@ describe('resume port: stop-before-resume guards', () => {
     expect(r).toEqual({ resumed: false, reason: 'stop-before-resume: claude stop failed' });
     expect(spawned(h.calls)).toBe(false);
   });
-  it('falls back to the first 8 chars of the session uuid when the row carries no short id', async () => {
+  it('passes the full UUID to ownership resolution when the row carries no short id', async () => {
     const h = mk({ pidAliveFn: () => false });
     const { id: _omit, ...noShortId } = idle;
     (await h.ioPromise).resume({ session: noShortId, prompt: 'x' });
-    expect(h.calls.find((c) => c[0] === 'stop')).toEqual(['stop', 'a287c608']);
+    expect(h.calls.find((c) => c[0] === 'stop')).toEqual(['stop', idle.sessionId]);
   });
   it('does not kill a session that started a new turn after the pass saw it idle', async () => {
     const h = mk({ pidAliveFn: () => false, rows: [{ ...idle, status: 'busy' }] });

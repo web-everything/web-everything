@@ -1205,6 +1205,7 @@ export function reapPlan(candidates, { nowMs, ttlMs = DEFAULT_LEASE_TTL_MINUTES 
   for (const c of Array.isArray(candidates) ? candidates : []) {
     if (!c || !c.lease) continue; // no lease → nothing to reap
     const extra = typeof signalsFor === 'function' ? signalsFor(c) || {} : {};
+    if (extra.sessionsOk === false) { keep.push({ ...c, reason: 'sessions-unknown; repair stores and retry' }); continue; }
     const verdict = classifyReap(c.lease, {
       nowMs,
       ttlMs,
@@ -1397,13 +1398,21 @@ export function fetchPrStatesForRepo(repoKey, flags, { exec } = {}) {
  * to find, while a hand-briefed lease's owning interactive row is still right there) — only `states`/`pidAlive`
  * (whose #1921 concern is specifically about the background-only population) degrade on that shape.
  */
-export function fetchSessionSignals(flags, { exec = execFileSync } = {}) {
-  if (flags['no-check-sessions']) return { states: null, pidAlive: new Map(), agents: null };
+export function fetchSessionSignals(flags, { exec = execFileSync, listAgents = defaultListAgents, env = process.env } = {}) {
+  if (flags['no-check-sessions']) return { states: null, pidAlive: new Map(), agents: null, sessionChecksDisabled: true };
   let sessions;
   try {
-    sessions = defaultListAgents({ exec, all: true });
+    sessions = listAgents({ exec, env, all: true, fresh: true });
+    if (!Array.isArray(sessions)) throw new Error('invalid session list');
+    const identities = new Set();
+    const names = new Set();
+    for (const row of sessions) {
+      if (identities.has(row.sessionId) || (row.name && names.has(row.name))) throw new Error('ambiguous session owner');
+      identities.add(row.sessionId);
+      if (row.name) names.add(row.name);
+    }
   } catch (e) {
-    log(`  ⚠ \`claude agents --json --all\` failed — session-gone reap axis OFF this run (TTL-stale still applies): ${String(e?.message || e).split('\n')[0]}`);
+    log(`  ⚠ \`claude agents --json --all\` failed — reaping held this run; repair session discovery and retry: ${String(e?.message || e).split('\n')[0]}`);
     return { states: null, pidAlive: new Map(), agents: null };
   }
   const states = sessionStatesForReap(sessions);
@@ -1475,7 +1484,7 @@ function defaultPidCommand(pid) {
  * `ownerAlive` is computed BEFORE item resolution so it can veto the branch-derived PR-terminal fallback.
  * `isPidAlive` defaults to the driver's existence-and-identity probe; tests can inject both IO seams.
  */
-export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPidAlive, sessionAgents, wrapperPids, claimRunnerPids = new Map(), staleTerminalNames = new Set(), pidCommand = defaultPidCommand, nowMs, isPidAlive = defaultIsPidAlive }) {
+export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPidAlive, sessionAgents, sessionChecksDisabled = false, wrapperPids, claimRunnerPids = new Map(), staleTerminalNames = new Set(), pidCommand = defaultPidCommand, nowMs, isPidAlive = defaultIsPidAlive }) {
   return (c) => {
     // #x5wm9ot — an item-kind session (`conveyor-`/`prepare-`/`prepare-decision-`) checks `byItem` by its item
     // number; a PR_KIND session (`review-`/`fix-`/`ci-heal-`/`inspect-`) checks `byPr` by its OWN PR number —
@@ -1517,6 +1526,8 @@ export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPid
       } catch { /* Unreadable command evidence retains the fresh claim's veto. */ }
     }
     return {
+      // Explicit opt-out leaves the other reap axes enabled; failed discovery vetoes them.
+      sessionsOk: sessionChecksDisabled ? null : Array.isArray(sessionAgents),
       prState,
       sessionGone: sessionGoneForLease(c.lease, sessionStates, { nowMs, pidAlive: sessionPidAliveNow, wrapperAlive, ownerAlive, claimRunnerAlive, staleTerminalRows }),
       pidAlive: pidAliveForLease(c.lease),
@@ -1563,7 +1574,7 @@ function main(argv) {
   const ttlMs = ttlMinutes * 60_000;
   const nowMs = Date.now();
 
-  const { states: sessionStates, pidAlive: sessionPidAlive, agents: sessionAgents } = fetchSessionSignals(flags); // states null on zero background rows too; agents null only on a failed/no-array read (see fetchSessionSignals's own doc)
+  const { states: sessionStates, pidAlive: sessionPidAlive, agents: sessionAgents, sessionChecksDisabled = false } = fetchSessionSignals(flags); // states null on zero background rows too; agents null only on a failed/no-array read (see fetchSessionSignals's own doc)
   // #3903 — ONE read of the run store for every in-flight detached-wrapper pid. Best-effort: an unreadable
   // store or record leaves the map empty/partial, which only means the old (listing-only) behaviour applies.
   const wrapperPids = readWrapperPidsForPass({ env: process.env, log });
@@ -1602,7 +1613,7 @@ function main(argv) {
   const distinctRepoKeys = [...new Set(candidates.map((c) => c.repoKey).filter(Boolean))];
   const prStatesByRepo = new Map(distinctRepoKeys.map((repoKey) => [repoKey, fetchPrStatesForRepo(repoKey, flags)]));
 
-  const signalsFor = buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPidAlive, sessionAgents, wrapperPids, claimRunnerPids, staleTerminalNames, nowMs });
+  const signalsFor = buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPidAlive, sessionAgents, sessionChecksDisabled, wrapperPids, claimRunnerPids, staleTerminalNames, nowMs });
   const plan = reapPlan(candidates, { nowMs, ttlMs, signalsFor });
   const { reap, keep } = applyLaneHold(plan, { nowMs });
 

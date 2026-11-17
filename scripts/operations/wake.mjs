@@ -43,6 +43,7 @@ import { resolveOperation } from './run.mjs';
 import { createDispatchObservers, defaultListAgents, listedSessionIds, normalizeHandle } from './dispatch-lane-io.mjs';
 import { createExploreObservers, reclaimExploreScratch } from './explore-io.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
+import { resolveOwner } from '../lib/claude-stores.mjs';
 
 /**
  * Is this run parked on work someone else is doing? Cheap enough to run over every record in the store.
@@ -400,8 +401,15 @@ export function assertHandleNotLive(entry, { listAgents } = {}) {
     + 'dispatch un-parks the run, and the executor then retries it — which for a dispatch means starting a SECOND agent '
     + 'on the same lane, under the same session slug.';
   let sessions;
+  let evidence;
   try {
-    sessions = listAgents();
+    const result = listAgents();
+    // defaultListAgents returns an array only after complete discovery. Preserve an
+    // aggregate supplied by another reader instead of silently upgrading unknown.
+    evidence = Array.isArray(result)
+      ? { status: result.incomplete?.length ? 'unknown' : 'ok', rows: result, problems: [] }
+      : result;
+    sessions = evidence?.rows;
   } catch (e) {
     throw new Error(
       `wake --resolve: could not read \`claude agents --json\` to check whether ${handle} is still running `
@@ -428,7 +436,11 @@ export function assertHandleNotLive(entry, { listAgents } = {}) {
       + `agent MIGHT be alive. ${advice}`,
     );
   }
-  if (listed.has(handle)) {
+  const owner = resolveOwner(handle, evidence);
+  if (owner.kind === 'unknown' || owner.kind === 'ambiguous') {
+    throw new Error(`wake --resolve: session ownership ${owner.kind} for ${handle} — refusing close-out; repair store discovery and retry. ${advice}`);
+  }
+  if (owner.kind !== 'absent') {
     throw new Error(
       `wake --resolve: session ${handle} is STILL LISTED by \`claude agents\` — the agent is ALIVE. ${advice}`,
     );

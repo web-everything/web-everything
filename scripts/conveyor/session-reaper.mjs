@@ -143,6 +143,7 @@ import { tailLines, summarizeEntry } from '../../skills-src/inspect-agent-health
 // so "which generation started later" means the same thing in both files. No cycle: `reconcile-core.mjs` does
 // not import this file.
 import { startedAtMs } from './reconcile-core.mjs';
+import { SessionsUnknown } from '../lib/claude-sessions.mjs';
 // #4149 (epic #3383/#4075) — this file no longer reads `INFRA_RETRY_COOLOFF_MS` itself: `makeCompletionResolver`
 // now stops a `blocked-on-infra` session's process as soon as its record says `done`, regardless of the cool-off
 // (see that function's own doc). `reconcile-core.mjs#markSelfReportedDone`/`#assessLiveness` still enforce the
@@ -1632,11 +1633,11 @@ export function makeCostRolledUpResolver() {
  * @param {{handle:string, exec?:Function}} o
  * @returns {{removed:true, alreadyGone:boolean, output:string}}
  */
-export function rmSessionRecord({ handle, exec = execFileSync } = {}) {
+export function rmSessionRecord({ handle, exec = execFileSync, env = process.env } = {}) {
   const id = normalizeHandle(handle);
   if (!id) throw new Error('session-reaper: rmSessionRecord needs a handle');
   try {
-    const output = String(exec('claude', ['rm', id], { encoding: 'utf8', timeout: 30_000 }));
+    const output = String(exec('claude', ['rm', id], { encoding: 'utf8', timeout: 30_000, env }));
     return { removed: true, alreadyGone: false, output };
   } catch (e) {
     const full = String(e?.stderr ?? e?.message ?? e);
@@ -1683,7 +1684,7 @@ export function runRetentionSweepPass({
   ceilingMs = resolveRetentionCeilingMs(),
   now = Date.now(),
   dryRun = false,
-  listAgents = () => defaultListAgents({ exec: execFileSync, all: true }),
+  listAgents = () => defaultListAgents({ exec: execFileSync, all: true, fresh: true }),
   rm = rmSessionRecord,
   statFn = statSync,
   deleteCompletionFn = deleteCompletion,
@@ -1744,7 +1745,7 @@ export function runRetentionSweepPass({
     try { deleteDeliveryReportFn(slug, deliveryDir); } catch { /* best-effort */ }
     const stillListed = findSession(slug);
     if (stillListed?.id) {
-      try { rm({ handle: stillListed.id, exec: execFileSync }); } catch (e) {
+      try { rm({ handle: stillListed.id, exec: execFileSync, env: { ...process.env, ...(stillListed.storeKey ? { CLAUDE_CONFIG_DIR: stillListed.storeKey } : {}) } }); } catch (e) {
         logFn(`  ⚠ ${slug}: \`claude rm\` failed: ${String(e?.message || e).split('\n')[0]}`);
       }
     }
@@ -1870,7 +1871,7 @@ export function classifyDispatchScratchEntry({ ageMs, sessionRow, liveCwdInUse }
  */
 export function runDispatchScratchSweepPass({
   dispatchRoot = dispatchScratchRoot(),
-  listAgents = () => defaultListAgents({ exec: execFileSync, all: true }),
+  listAgents = () => defaultListAgents({ exec: execFileSync, all: true, fresh: true }),
   graceMs = resolveDispatchScratchGraceMs(),
   ceilingMs = resolveDispatchScratchCeilingMs(),
   now = Date.now(),
@@ -1899,7 +1900,7 @@ export function runDispatchScratchSweepPass({
   }
 
   let sessions;
-  try { sessions = listAgents() ?? []; } catch { sessions = []; } // an unreadable listing degrades to "no match for anyone" — Path A never fires, only Path B (ceiling) can act, and only once confirmed no live row claims the folder
+  try { sessions = listAgents() ?? []; } catch { return { deleted: 0, kept: names.length, wouldDelete: dryRun ? [] : undefined, unreadable: true }; } // an unreadable listing degrades to "no match for anyone" — Path A never fires, only Path B (ceiling) can act, and only once confirmed no live row claims the folder
   const byId = new Map();
   const liveCwds = new Set();
   for (const s of sessions) {
@@ -2055,11 +2056,11 @@ export const STOP_RETRY_BACKOFF_MS = [300, 900];
  * @param {{handle:string, exec?:Function, sleep?:(ms:number)=>void, attempts?:number, backoffMs?:number[]}} o
  * @returns {{stopped:true, alreadyGone:boolean, output:string}}
  */
-export function stopSessionWithRetry({ handle, exec = execFileSync, sleep = sleepSyncMs, attempts = STOP_RETRY_ATTEMPTS, backoffMs = STOP_RETRY_BACKOFF_MS } = {}) {
+export function stopSessionWithRetry({ handle, exec = execFileSync, listSessions, env = process.env, sleep = sleepSyncMs, attempts = STOP_RETRY_ATTEMPTS, backoffMs = STOP_RETRY_BACKOFF_MS } = {}) {
   let lastErr;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
-      return stopSession({ handle, exec });
+      return stopSession({ handle, exec, listSessions, env });
     } catch (e) {
       lastErr = e;
       if (attempt < attempts) sleep(backoffMs[attempt - 1] ?? backoffMs[backoffMs.length - 1]);
@@ -2165,7 +2166,7 @@ export function makeReapedLedger({
  * }}
  */
 export function runSessionReaperPass({
-  listAgents = () => defaultListAgents({ exec: execFileSync, all: true }),
+  listAgents = () => defaultListAgents({ exec: execFileSync, all: true, fresh: true }),
   groundTruthFor = makeGroundTruthResolver({ exec: execFileSync }),
   completionFor = makeCompletionResolver(),
   allowedCwd,
@@ -2248,6 +2249,8 @@ export function runSessionReaperPass({
     // (`we:scripts/operations/dispatch-lane-io.mjs`) for why the OTHER callers must not also flip this.
     sessions = listAgents();
   } catch (e) {
+    if (e instanceof SessionsUnknown && e.rows.length) sessions = e.rows;
+    else {
     // Best-effort like every other mechanical pass (Done-when #3): an unreadable listing means there is
     // nothing safe to act on this tick, not a hard failure — the next tick tries again.
     logFn(`  ⚠ \`claude agents --json\` unreadable — session-reaper skipping this tick: ${String(e?.message || e).split('\n')[0]}`);
@@ -2259,21 +2262,24 @@ export function runSessionReaperPass({
       wouldWriteBackstop: dryRun ? [] : undefined, wouldStop: dryRun ? [] : undefined,
       collected: dryRun ? undefined : [], kept: 0, unreadable: true,
     };
+    }
   }
   if (!Array.isArray(sessions)) sessions = [];
 
+  sessions = [...new Map(sessions.map(s => [JSON.stringify([s.storeKey, s.sessionId ?? s.id]), s])).values()];
   const plan = sessionReapPlan(sessions, { groundTruthFor, completionFor, allowedCwd, neverReapWorking, idleThresholdMs, now, hungFor, noOutcomeFor, chatSpawnGuardFor, authExpiredFor, idleFinishedFor, awaitingVerifyFor, pidDeadFor });
   const { keep } = plan;
   let reap = plan.reap;
   let previouslyReaped = 0;
+  const ledgerKey = s => s.storeKey ? JSON.stringify([s.storeKey, s.sessionId]) : normalizeHandle(s?.id);
   if (reapedLedger) {
     // A `done`/`failed` session never changes state after `claude stop` — the listing keeps it `done` forever —
     // so without a memory of what was already stopped, every tick re-stopped every finished session (1,228 of
     // the 1,501 "stopped" per tick, live 2026-09-26, ~0.7s each: a 2-minute tick took ~20). Terminal-state rows
     // only: a `working`/`blocked` row that is still listed after a stop is worth another try.
-    reapedLedger.retainOnly(sessions.map((s) => normalizeHandle(s?.id)).filter(Boolean));
+    reapedLedger.retainOnly(sessions.map(ledgerKey).filter(Boolean));
     reap = reap.filter(({ session }) => {
-      const id = normalizeHandle(session?.id);
+      const id = ledgerKey(session);
       const skip = Boolean(id) && TERMINAL_REAP_STATES.has(session?.state) && reapedLedger.has(id);
       if (skip) previouslyReaped++;
       return !skip;
@@ -2399,12 +2405,12 @@ export function runSessionReaperPass({
     try {
       // Retried — see {@link stopSessionWithRetry}'s own doc for why: a `claude stop` failure found live
       // 2026-09-04 was a transient CLI-internal hiccup, not a hard bug, and usually clears within a beat.
-      const res = stop({ handle, exec: execFileSync });
+      const res = stop({ handle: session.sessionId || handle, exec: execFileSync });
       if (res.alreadyGone) alreadyGone++;
       else stopped++;
       logFn(`  ${res.alreadyGone ? 'already gone' : 'stopped'} ${handle} (${reason}; ${session.name ?? 'unnamed'})`);
       done.push({ id: handle, sessionId: normalizeHandle(session.sessionId) || null, name: session.name ?? null, reason, alreadyGone: res.alreadyGone });
-      if (reapedLedger) reapedLedger.add(handle);
+      if (reapedLedger) reapedLedger.add(ledgerKey(session));
       // Rate this now-finished session — best-effort, and NEVER lets a rating failure look like a reap failure
       // (the reap above already succeeded; this is pure bookkeeping on top of it).
       if (typeof rateSession === 'function') {
@@ -2553,7 +2559,20 @@ export function runSessionReaperCli(argv, io = {}) {
 
   // The listing and the stop BIND the driver's executor and sleep explicitly: the pass calls `stop({ handle, exec:
   // execFileSync })`, so forwarding `stopSessionWithRetry` unchanged would bypass an injected executor.
-  const listAgents = () => defaultListAgents({ exec, all: true });
+  const listAgents = () => {
+    let readError;
+    try {
+      return defaultListAgents({ all: true, fresh: true, exec: (...args) => {
+        try { return exec(...args); }
+        catch (error) { readError = error; throw error; }
+      } });
+    } catch (error) {
+      // The store model records unreadable evidence without retaining CLI errors.
+      // Keep the original diagnostic visible while preserving its fail-closed verdict.
+      if (readError) log(`  ⚠ session listing failed: ${String(readError?.message ?? readError).split('\n')[0]}`);
+      throw error;
+    }
+  };
   const stop = ({ handle }) => stopSessionWithRetry({ handle, exec, sleep });
   const result = runSessionReaperPass({ listAgents, stop, log, groundTruthFor, completionFor, allowedCwd, neverReapWorking, idleThresholdMs, dryRun, hungFor, backstopCompletion, noOutcomeFor, chatSpawnGuardFor, authExpiredFor, idleFinishedFor, awaitingVerifyFor, pidDeadFor, rateSession });
   const retentionResult = runRetention ? runRetentionSweepPass({ dryRun }) : null;

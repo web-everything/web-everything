@@ -39,6 +39,8 @@
  * real filesystem, `claude agents --json`, `claude stop` and `~/.claude.json`.
  */
 
+import { listSessions as readSessions } from '../lib/claude-sessions.mjs';
+import { stopPlan, afterStopMiss, readStore } from '../lib/claude-stores.mjs';
 import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -69,20 +71,32 @@ export const STOP_EXEC_OPTS = Object.freeze({ encoding: 'utf8', timeout: 30_000 
  * @param {{handle: string, exec?: Function}} o
  * @returns {{stopped: true, alreadyGone: boolean, output: string}}
  */
-export function stopSession({ handle, exec = execFileSync } = {}) {
+export function stopSession({ handle, exec = execFileSync, env = process.env,
+  listSessions = readSessions } = {}) {
   const id = normalizeHandle(handle);
   if (!id) throw new Error('dispatch-abort: stopSession needs a handle to stop');
+  const plan = stopPlan(id, listSessions({ all: true, fresh: true, exec, env }));
+  if (plan.action === 'gone') return { stopped: true, alreadyGone: true, output: '' };
+  if (plan.action !== 'stop') throw new Error(`dispatch-abort: refusing stop: ${plan.reason}`);
+  const childEnv = { ...env, ...plan.env };
   try {
-    const output = String(exec('claude', ['stop', id], STOP_EXEC_OPTS));
+    const output = String(exec('claude', ['stop', plan.argId], { ...STOP_EXEC_OPTS, env: childEnv }));
     return { stopped: true, alreadyGone: false, output };
   } catch (e) {
     const full = String(e?.stderr ?? e?.message ?? e);
-    const firstLine = full.split('\n')[0];
-    // Matched against the FULL text, not just the first line — the CLI's real "already gone" message is the
-    // whole of its stderr today, but nothing guarantees it stays that way, and matching only the first line
-    // would misclassify an already-gone handle as a hard failure the moment anything gets prepended to it.
-    if (/No job matching/i.test(full)) return { stopped: true, alreadyGone: true, output: firstLine };
-    throw new Error(`dispatch-abort: \`claude stop ${id}\` failed: ${firstLine}`);
+    if (/No job matching/i.test(full)) {
+      const store = { key: plan.storeKey, status: 'ok' };
+      let read;
+      try {
+        read = readStore(store, { output: String(exec('claude', ['agents', '--json', '--all'], {
+          ...STOP_EXEC_OPTS, env: childEnv, maxBuffer: 8 * 1024 * 1024 })) });
+      } catch (error) { read = readStore(store, { error }); }
+      if (afterStopMiss(id, plan.storeKey, read).action === 'gone') {
+        return { stopped: true, alreadyGone: true, output: full.split('\n')[0] };
+      }
+      throw new Error('dispatch-abort: stop missed a matched session; owning store is unknown or session still listed');
+    }
+    throw new Error(`dispatch-abort: \`claude stop ${plan.argId}\` failed: ${full.split('\n')[0]}`);
   }
 }
 
@@ -137,7 +151,7 @@ export function trustCheckout({ dir, readConfig, writeConfig } = {}) {
  * @param {Function} [o.exec]
  * @returns {string} one operator-facing line, including a lane hint when the dispatch had one.
  */
-export function abortDispatch({ runId, key, status = 'failed', note = '', force = false, store, listAgents = defaultListAgents, exec = execFileSync } = {}) {
+export function abortDispatch({ runId, key, status = 'failed', note = '', force = false, store, listAgents = defaultListAgents, exec = execFileSync, listSessions = readSessions } = {}) {
   if (!runId || !key) throw new Error('dispatch-abort: needs both runId and key (wake.mjs --status prints them)');
   const run = store.read(runId);
   if (!run) throw new Error(`dispatch-abort: no run record for ${JSON.stringify(runId)}`);
@@ -147,7 +161,7 @@ export function abortDispatch({ runId, key, status = 'failed', note = '', force 
   const handle = normalizeHandle(entry.handle);
   let stopLine = 'no handle to stop';
   if (handle) {
-    const res = stopSession({ handle, exec });
+    const res = stopSession({ handle, exec, listSessions });
     stopLine = res.alreadyGone ? `${handle} was already gone — nothing to stop` : `stopped ${handle}`;
   }
 

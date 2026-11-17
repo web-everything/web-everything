@@ -1,3 +1,4 @@
+import { stopSession as stopOwnedSession } from '../../operations/dispatch-abort.mjs';
 /**
  * Card xccgzu5 — the fix daemon consumes the session watchdog's fixer-stuck events. Live 2026-10-08: ci-heal-4453 sat
  * idle for an hour on a verify for a commit it had already pushed, holding the fix claim and a reserved ci-heal slot,
@@ -112,12 +113,26 @@ describe('runFixerStuckReclaimPass', () => {
     const { opts, calls, acks } = io();
     const r = await runFixerStuckReclaimPass(opts);
     expect(r.rows[0].result).toBe('reclaimed');
-    expect(calls.stop).toHaveBeenCalledWith({ handle: '5536e97f' });
+    expect(calls.stop).toHaveBeenCalledWith({ handle: SID });
     expect(calls.endFix).toHaveBeenCalledWith(expect.objectContaining({ repo: 'we', pr: 4453, who: 'ci-heal-4453', sessionId: SID }));
     expect(calls.release).toHaveBeenCalledWith({ repo: 'we', pr: 4453, who: 'ci-heal-4453' });
     expect(calls.clear).toHaveBeenCalled();
     expect(acks).toEqual([expect.objectContaining({ key: EVENT.key, by: RECLAIM_ACK_BY, action: 'reclaimed' })]);
     expect(formatFixerStuckReclaimLines(r)[0]).toMatch(/PR #4453 ci-heal-4453 — reclaim → reclaimed/);
+  });
+
+  it.each(['ok', 'unknown', 'ambiguous'])('%s ownership: only a confirmed stop releases the claim', async kind => {
+    const row = { ...EVENT.session, storeKey: '/stores/b' };
+    const aggregate = { status: kind === 'unknown' ? 'unknown' : 'ok', problems: ['store unreadable'],
+      rows: kind === 'ambiguous' ? [row, { ...row, storeKey: '/stores/a' }] : [row] };
+    const exec = vi.fn(() => 'stopped');
+    const { opts, calls, acks } = io({ stopSession: o => stopOwnedSession({ ...o, exec, listSessions: () => aggregate }) });
+    const result = await runFixerStuckReclaimPass(opts);
+    expect(result.rows[0].result).toBe(kind === 'ok' ? 'reclaimed' : 'stop-failed');
+    if (kind !== 'ok') {
+      expect(exec).not.toHaveBeenCalled(); expect(calls.endFix).not.toHaveBeenCalled();
+      expect(calls.release).not.toHaveBeenCalled(); expect(calls.clear).not.toHaveBeenCalled(); expect(acks).toEqual([]);
+    } else expect(exec).toHaveBeenCalledWith('claude', ['stop', row.id], expect.objectContaining({ env: expect.objectContaining({ CLAUDE_CONFIG_DIR: '/stores/b' }) }));
   });
 
   it('kill switch WE_FIXER_STUCK_RECLAIM=0 reports only', async () => {
