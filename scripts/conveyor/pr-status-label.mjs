@@ -123,8 +123,11 @@ export function derivePrStatusLabel({ pr = {}, labels, reviewStatus = null, rows
   const ciChecks = settings.reviewGateSignal === 'review' && Array.isArray(redChecks)
     ? redChecks.filter(name => name !== 'review-gate') : redChecks;
   const l = names(labels ?? pr?.labels);
-  const reviewBlock = deriveReviewBlockStatus(l);
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
+  const headAdvisory = latestAdvisory(comments);
+  const reviewBlock = deriveReviewBlockStatus(l)
+    ?? (headAdvisory?.outcome === ADVISORY_OUTCOMES.CHANGES
+      && advisoryCoversHead(headAdvisory, String(pr?.headRefOid ?? '').toLowerCase()) ? 'sent-back-review' : null);
   const rs = reviewStatus?.state ?? null;
   const list = Array.isArray(rows) ? rows : [];
   const subject = { ...pr, labels: l.map((name) => ({ name })) };
