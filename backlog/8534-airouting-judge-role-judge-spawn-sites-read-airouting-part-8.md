@@ -2,8 +2,9 @@
 bornAs: x8ypu0j
 kind: story
 size: 3
-status: open
+status: resolved
 dateOpened: "2026-11-16"
+dateResolved: "2026-11-17"
 scope: ["we:scripts/operations/cli-adapter.mjs", "we:scripts/lib/judge-spawn.mjs", "we:scripts/lib/codex-judge-spawn.mjs", "we:scripts/lib/jury-core.mjs", "we:scripts/lib/judge-panel.mjs", "we:scripts/conveyor/referral-reverify.mjs"]
 tags: []
 ---
