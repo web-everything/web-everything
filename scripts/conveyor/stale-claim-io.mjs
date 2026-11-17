@@ -35,12 +35,15 @@ export function claimRepoSlug(claim, constellation = {}) {
   return constellation[repo]?.slug ?? repo;
 }
 
-/** Last commit time of the PR head, the closest cheap proxy for "last push". */
+/** Last push time of the PR: the later of the head commit date and the latest force-push event (a force push of an
+ *  old commit keeps its old commit date but is still a push). Either read failing means "unknown" (never releases). */
 export async function readLastPush(claim, { run = execFile, slugOf = claimRepoSlug } = {}) {
-  const { stdout } = await run('gh', ['pr', 'view', String(claim.meta.pr), '--repo', slugOf(claim), '--json', 'state,commits'], { timeout: 60_000 });
-  const pr = JSON.parse(stdout);
-  const last = (pr.commits ?? []).map(c => Date.parse(c.committedDate)).filter(Number.isFinite).sort((a, b) => b - a)[0];
-  return Number.isFinite(last) ? { atMs: last, open: pr.state === 'OPEN' } : null;
+  const slug = slugOf(claim), pr = String(claim.meta.pr);
+  const { stdout } = await run('gh', ['pr', 'view', pr, '--repo', slug, '--json', 'state,commits'], { timeout: 60_000 });
+  const view = JSON.parse(stdout);
+  const { stdout: eventsOut } = await run('gh', ['api', '--paginate', `repos/${slug}/issues/${pr}/events`, '--jq', '.[] | select(.event == "head_ref_force_pushed") | .created_at'], { timeout: 60_000 });
+  const times = [...(view.commits ?? []).map(c => Date.parse(c.committedDate)), ...String(eventsOut).split('\n').filter(Boolean).map(Date.parse)].filter(Number.isFinite);
+  return times.length ? { atMs: Math.max(...times), open: view.state === 'OPEN' } : null;
 }
 
 /** Run one operator control through the real CLI (same path as `run.mjs clear-claim` / `run.mjs rearm`). */
@@ -76,6 +79,13 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     platform: (() => { try { return cascade?.platformPreference?.('staleClaim', { env }); } catch { return undefined; } })(),
     env: flag('mode') ? { ...env, WE_STALE_CLAIM_MODE: flag('mode') } : env,
   });
+  if (settings.mode === 'act') {
+    const controls = await importMain('scripts/operations/operator-controls.mjs');
+    if (!events?.appendDaemonEvent || !controls?.CONTROL_OPS?.includes('clear-claim') || !controls.CONTROL_OPS.includes('rearm')) {
+      process.stderr.write('stale-claim: act mode needs the clear-claim and rearm controls and the daemon event writer in this checkout\n');
+      return 2;
+    }
+  }
   const slugOf = claim => claimRepoSlug(claim, constellation);
   const logPath = staleClaimsLogPath({ env });
   const nowMs = Date.now();

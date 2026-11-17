@@ -43,11 +43,21 @@ export function classifyOwner({ claim, agents, pidAlive = () => false, activityM
   if (!Array.isArray(agents)) return { state: 'unknown', agent: null, lastActivityMs: null };
   const meta = claim.meta ?? {};
   const name = meta.who ?? sessionNameFor(claim);
-  const agent = agents.find(a => a && ((meta.sessionId && a.sessionId === meta.sessionId) || (name && a.name === name))) ?? null;
-  if (!agent) {
+  // Every session that could be this claim's owner. An exact sessionId match is authoritative; otherwise every
+  // same-named session counts, and the MOST ACTIVE verdict wins, so a stale older row never hides a live newer one.
+  const exact = meta.sessionId ? agents.filter(a => a && a.sessionId === meta.sessionId) : [];
+  const candidates = exact.length ? exact : agents.filter(a => a && name && a.name === name);
+  if (!candidates.length) {
     // No listed session. A claim pid that is still alive is a live, unlisted owner: stay conservative.
     return { state: Number.isInteger(claim.pid) && pidAlive(claim.pid) ? 'active' : 'dead', agent: null, lastActivityMs: null };
   }
+  const verdicts = candidates.map(agent => classifyAgent({ agent, pidAlive, activityMs, nowMs, idleMinutes }));
+  return verdicts.sort((a, b) => OWNER_STATE_RANK.indexOf(a.state) - OWNER_STATE_RANK.indexOf(b.state))[0];
+}
+
+const OWNER_STATE_RANK = ['active', 'idle-recent', 'idle-unknown', 'idle-finished', 'dead', 'done'];
+
+function classifyAgent({ agent, pidAlive, activityMs, nowMs, idleMinutes }) {
   if (['done', 'stopped', 'failed'].includes(agent.state)) return { state: 'done', agent, lastActivityMs: null };
   if (Number.isInteger(agent.pid) && !pidAlive(agent.pid)) return { state: 'dead', agent, lastActivityMs: null };
   if (agent.status !== 'idle') return { state: 'active', agent, lastActivityMs: null };
@@ -97,6 +107,10 @@ export async function runStalePass({ claims = [], agents, settings, nowMs, deps 
     };
     if (decision.action === 'release' && settings.mode === 'act') {
       try {
+        // Write the audit row FIRST: a release that cannot be recorded does not happen.
+        await record({ ...row, outcome: 'releasing' });
+      } catch (error) { row.outcome = 'record-failed'; row.detail = String(error?.message ?? error); }
+      if (row.outcome === 'would-release') try {
         const result = await release(claim, { reason: decision.reason });
         if (!result?.released) { row.outcome = 'release-failed'; row.detail = result?.reason ?? 'refused'; }
         else {
@@ -104,13 +118,14 @@ export async function runStalePass({ claims = [], agents, settings, nowMs, deps 
           row.outcome = rearmed?.ok ? 'released' : 'released-rearm-failed';
           if (!rearmed?.ok) row.detail = rearmed?.reason ?? 'rearm refused';
           // Typed event for every real release, including one whose rearm was a no-op or failed.
-          await emit({ kind: STALE_CLAIM_EVENT, repo: meta.repo, pr: meta.pr, daemon: 'stale-claim',
+          const emitted = await emit({ kind: STALE_CLAIM_EVENT, repo: meta.repo, pr: meta.pr, daemon: 'stale-claim',
             detail: { pr: meta.pr, kind: meta.kind, owner: row.owner, ownerState: row.ownerState, reason: row.reason,
               claimAgeMin: row.claimAgeMin, pushAgeMin: row.pushAgeMin, idleAgeMin: row.idleAgeMin, rearmed: Boolean(rearmed?.ok) } });
+          if (emitted === false) row.eventError = 'event-not-recorded';
         }
       } catch (error) { row.outcome = 'release-failed'; row.detail = String(error?.message ?? error); }
     }
-    try { await record(row); } catch { /* recording never interrupts the pass */ }
+    try { await record(row); } catch (error) { row.recordError = String(error?.message ?? error); }
     rows.push(row);
   }
   return { mode: settings.mode, rows };

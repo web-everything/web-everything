@@ -4,6 +4,7 @@
  *   release decision; act mode calls the (mocked) release then rearm; report mode and an alive owner never release.
  */
 import { describe, it, expect, vi } from 'vitest';
+import { claimRepoSlug, readLastPush, runControl } from '../stale-claim-io.mjs';
 import { classifyOwner, decideStaleClaim, resolveStaleClaimSettings, runStalePass, STALE_CLAIM_EVENT } from '../stale-claim.mjs';
 
 const MIN = 60_000;
@@ -138,5 +139,46 @@ describe('runStalePass', () => {
     const { run } = mk('act', { release: vi.fn(async () => { throw new Error('boom'); }) });
     const { rows } = await run();
     expect(rows[0]).toMatchObject({ outcome: 'release-failed', detail: 'boom' });
+  });
+});
+
+describe('owner matching', () => {
+  it('a live same-named session beats an older terminal row', () => {
+    const agents = [agent({ state: 'done', sessionId: 'old' }), agent({ status: 'busy', sessionId: 'new' })];
+    expect(classifyOwner({ claim: claim(), agents, nowMs: NOW, idleMinutes: 30, pidAlive: () => true }).state).toBe('active');
+  });
+  it('an exact sessionId match is authoritative over a same-named row', () => {
+    const agents = [agent({ state: 'done', sessionId: 'mine' }), agent({ status: 'busy', sessionId: 'other' })];
+    const c = claim({ sessionId: 'mine' });
+    expect(classifyOwner({ claim: c, agents, nowMs: NOW, idleMinutes: 30, pidAlive: () => true }).state).toBe('done');
+  });
+});
+
+describe('act mode records before releasing', () => {
+  it('a record failure blocks the release', async () => {
+    const deps = { pidAlive: () => true, activityMs: () => null, lastPush: async () => ago(90), release: vi.fn(), rearm: vi.fn(), emit: vi.fn(),
+      record: vi.fn(async () => { throw new Error('disk full'); }) };
+    const { rows } = await runStalePass({ claims: [claim()], agents: [agent({ state: 'done' })], settings: settings('act'), nowMs: NOW, deps });
+    expect(rows[0]).toMatchObject({ outcome: 'record-failed', detail: 'disk full' });
+    expect(deps.release).not.toHaveBeenCalled();
+  });
+});
+
+describe('io adapters', () => {
+  it('runControl invokes the real run.mjs operator controls with the claim kind', async () => {
+    const run = vi.fn(async () => ({ stdout: '' }));
+    await runControl('clear-claim', claim({ kind: 'ci-heal' }), 'why', { run, root: '/r', slugOf: c => claimRepoSlug(c, { we: { slug: 'o/we' } }) });
+    expect(run).toHaveBeenCalledWith('node', expect.arrayContaining(['scripts/operations/run.mjs', 'clear-claim', '--repo=o/we', '--pr=6999', '--kind=ci-heal']), expect.objectContaining({ cwd: '/r' }));
+    const failing = vi.fn(async () => { throw Object.assign(new Error('x'), { stderr: 'refusing LIVE claim' }); });
+    expect(await runControl('rearm', claim(), 'why', { run: failing, root: '/r' })).toEqual({ ok: false, reason: 'refusing LIVE claim' });
+  });
+  it('readLastPush takes the later of the head commit and a force push', async () => {
+    const run = vi.fn()
+      .mockResolvedValueOnce({ stdout: JSON.stringify({ state: 'OPEN', commits: [{ committedDate: '2026-11-17T08:00:00Z' }] }) })
+      .mockResolvedValueOnce({ stdout: '2026-11-17T11:50:00Z\n' });
+    expect(await readLastPush(claim(), { run })).toEqual({ atMs: Date.parse('2026-11-17T11:50:00Z'), open: true });
+  });
+  it('readLastPush rejects when a read fails (unknown push never releases)', async () => {
+    await expect(readLastPush(claim(), { run: vi.fn().mockRejectedValue(new Error('gh down')) })).rejects.toThrow('gh down');
   });
 });
