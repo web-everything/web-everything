@@ -27,9 +27,9 @@ export default {
       const recovery = readFileSync(join(root, 'scripts/lib/review-red-team-on-skip.mjs'), 'utf8');
       const job = readFileSync(join(root, 'scripts/operations/review-job.mjs'), 'utf8');
       return settlement.includes('const storedClear = input.storedReviewPolicyClear === true')
-        && settlement.includes('const classified = storedClear ?')
+        && settlement.includes('let classified = storedClear ?')
         && recovery.includes('settle = settleRedTeamSkip')
-        && recovery.includes("const result = settle({ redTeam: { status: 'not-owed' }")
+        && recovery.includes("const result = settle({ redTeam: row.policy === EMPTY_NET_DIFF_SKIP.policy ? { ...EMPTY_NET_DIFF_SKIP } : { status: 'not-owed' }")
         && recovery.includes('storedReviewPolicyClear: true')
         && job.includes('const settled = io.settleRedTeamSkip(');
     } catch { return false; }
@@ -211,7 +211,9 @@ export default {
           && t.rows[0]?.why === 'red-team result already on head'), `${name}: later ticks did not retain the settled head`);
         check(dispatches === (skipped ? 1 : 0) && runnerCalls === (skipped ? 1 : 0), `${name}: repeated or unnecessary provider dispatch`);
         check(events.join(',') === (skipped ? 'queued,settle,finished' : 'settle'), `${name}: settlement must happen once before persisted completion`);
-        const expectedResult = skipped ? { status: 'skipped', policy: 'card-only' } : result;
+        // The recovery job preserves the producer's policy reason as well as its status and policy.
+        const expectedResult = skipped
+          ? { status: 'skipped', policy: 'card-only', reason: 'red team skipped: card-only' } : result;
         check(stored?.repo === repo && stored.pr === pr && stored.head === head && stored.status === 'finished'
           && JSON.stringify(stored.result) === JSON.stringify(expectedResult), `${name}: settled status was not persisted`);
         check(readFileSync(join(evidence.redTeamStatusDir(daemonEnv), `${encodeURIComponent(repo)}-${pr}-${head}.json`), 'utf8') === persisted,
