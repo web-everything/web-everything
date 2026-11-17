@@ -100,6 +100,7 @@ const TOOLING_SMELL = Object.freeze({
   'system:fix-stood-down': 'stood-down-prs', // terminal on the head (live #5768): the stand-down smell, or stateLanes -> operator
   // Only the drain skips that mean "the drain will get to it"; an unknown or escalated skip kind is a person's.
   'drain-skip:queue-file-overlap': 'pr-stage-stall', 'drain-skip:overlap-yield': 'pr-stage-stall', 'drain-skip:ready-not-reached': 'pr-stage-stall',
+  'drain-skip:batching-deferred': 'pr-stage-stall',
 });
 /** Waits on the review daemon: ask it again, once per head. The sweep never spawns a review job itself. */
 const REVIEW_WAITS = new Set(['awaiting-review', 'human-review-pending-advisory', 'red-team-pending', 'drain-skip:red-team-pending']);
@@ -109,6 +110,7 @@ const EXPECTED_ACTOR = Object.freeze({
   'awaiting-review': 'reviewer', 'human-review-pending-advisory': 'reviewer', 'red-team-pending': 'red-team', 'drain-skip:red-team-pending': 'red-team',
   fixing: 'fixer', 'sent-back-red-team': 'fixer', draft: 'fixer', 'ci-failed': 'fixer', 'awaiting-ci': 'ci', 'ready-to-merge': 'drain',
   'in-merge-queue': 'drain', 'drain-skip:queue-file-overlap': 'drain', 'drain-skip:overlap-yield': 'drain', 'drain-skip:ready-not-reached': 'drain',
+  'drain-skip:batching-deferred': 'drain',
   'drain-skip:mq-same-head-failed': 'drain', 'drain-skip:card-grouped': 'drain',
 });
 /** Operator-owned states the judge does not cover: why a person is needed. */
@@ -232,7 +234,9 @@ function classifyUnsafe(o = {}) {
   if (OPERATOR_STATES[state]) return operator(state, OPERATOR_STATES[state]);
   const smell = TOOLING_SMELL[state] ?? null;
   if (smell) {
-    return row.liveJob ? null : out('system', 'tooling-card', `${state === 'system:fix-stood-down' ? row.why : `waiting on ${row.actor} past the threshold with no live job`}; the tooling is stuck, not the PR`, { smell });
+    const reason = state === 'drain-skip:batching-deferred' ? 'drain is batching; deferred to a later pass'
+      : state === 'system:fix-stood-down' ? row.why : `waiting on ${row.actor} past the threshold with no live job`;
+    return row.liveJob ? null : out('system', 'tooling-card', `${reason}; the tooling is stuck, not the PR`, { smell });
   }
 
   const trigger = JUDGED_STATES[state];
