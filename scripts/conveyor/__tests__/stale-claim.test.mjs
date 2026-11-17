@@ -182,3 +182,24 @@ describe('io adapters', () => {
     await expect(readLastPush(claim(), { run: vi.fn().mockRejectedValue(new Error('gh down')) })).rejects.toThrow('gh down');
   });
 });
+
+describe('round 2 guards', () => {
+  it('act mode without a recorder is a hard error', async () => {
+    const deps = { release: vi.fn(), rearm: vi.fn(), emit: vi.fn() };
+    await expect(runStalePass({ claims: [claim()], agents: [agent({ state: 'done' })], settings: settings('act'), nowMs: NOW, deps })).rejects.toThrow('act mode requires');
+    expect(deps.release).not.toHaveBeenCalled();
+  });
+  it('a throwing rearm still logs the release event', async () => {
+    const deps = { pidAlive: () => true, activityMs: () => null, lastPush: async () => ago(90), release: vi.fn(async () => ({ released: true })),
+      rearm: vi.fn(async () => { throw new Error('rearm boom'); }), record: vi.fn(), emit: vi.fn() };
+    const { rows } = await runStalePass({ claims: [claim()], agents: [agent({ state: 'done' })], settings: settings('act'), nowMs: NOW, deps });
+    expect(rows[0]).toMatchObject({ outcome: 'released-rearm-failed', detail: 'rearm boom' });
+    expect(deps.emit).toHaveBeenCalledOnce();
+  });
+  it('an invalid force-push timestamp makes the push time unknown', async () => {
+    const run = vi.fn()
+      .mockResolvedValueOnce({ stdout: JSON.stringify({ state: 'OPEN', commits: [{ committedDate: '2026-11-17T08:00:00Z' }] }) })
+      .mockResolvedValueOnce({ stdout: 'not-a-date\n' });
+    await expect(readLastPush(claim(), { run })).rejects.toThrow('unparseable');
+  });
+});

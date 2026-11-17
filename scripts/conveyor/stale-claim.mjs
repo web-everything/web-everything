@@ -89,7 +89,9 @@ const minutes = ms => (ms === null || ms === undefined ? null : Math.floor(ms / 
  * @returns {Promise<{mode:string, rows:object[]}>}
  */
 export async function runStalePass({ claims = [], agents, settings, nowMs, deps = {} }) {
-  const { pidAlive, activityMs, sessionNameFor, lastPush = async () => null, release, rearm, record = () => {}, emit = () => {} } = deps;
+  const { pidAlive, activityMs, sessionNameFor, lastPush = async () => null, release, rearm, record, emit } = deps;
+  // Act mode must be able to audit, release, rearm and emit; a missing dep is a hard error, never a silent no-op.
+  if (settings.mode === 'act' && ![release, rearm, record, emit].every(fn => typeof fn === 'function')) throw new TypeError('act mode requires release, rearm, record and emit deps');
   const rows = [];
   for (const claim of claims) {
     const meta = claim.meta ?? {};
@@ -114,7 +116,8 @@ export async function runStalePass({ claims = [], agents, settings, nowMs, deps 
         const result = await release(claim, { reason: decision.reason });
         if (!result?.released) { row.outcome = 'release-failed'; row.detail = result?.reason ?? 'refused'; }
         else {
-          const rearmed = await rearm(claim, { reason: decision.reason });
+          let rearmed;
+          try { rearmed = await rearm(claim, { reason: decision.reason }); } catch (error) { rearmed = { ok: false, reason: String(error?.message ?? error) }; }
           row.outcome = rearmed?.ok ? 'released' : 'released-rearm-failed';
           if (!rearmed?.ok) row.detail = rearmed?.reason ?? 'rearm refused';
           // Typed event for every real release, including one whose rearm was a no-op or failed.
@@ -125,7 +128,7 @@ export async function runStalePass({ claims = [], agents, settings, nowMs, deps 
         }
       } catch (error) { row.outcome = 'release-failed'; row.detail = String(error?.message ?? error); }
     }
-    try { await record(row); } catch (error) { row.recordError = String(error?.message ?? error); }
+    try { await record?.(row); } catch (error) { row.recordError = String(error?.message ?? error); }
     rows.push(row);
   }
   return { mode: settings.mode, rows };

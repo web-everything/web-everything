@@ -42,7 +42,9 @@ export async function readLastPush(claim, { run = execFile, slugOf = claimRepoSl
   const { stdout } = await run('gh', ['pr', 'view', pr, '--repo', slug, '--json', 'state,commits'], { timeout: 60_000 });
   const view = JSON.parse(stdout);
   const { stdout: eventsOut } = await run('gh', ['api', '--paginate', `repos/${slug}/issues/${pr}/events`, '--jq', '.[] | select(.event == "head_ref_force_pushed") | .created_at'], { timeout: 60_000 });
-  const times = [...(view.commits ?? []).map(c => Date.parse(c.committedDate)), ...String(eventsOut).split('\n').filter(Boolean).map(Date.parse)].filter(Number.isFinite);
+  const times = [...(view.commits ?? []).map(c => Date.parse(c.committedDate)), ...String(eventsOut).split('\n').filter(Boolean).map(Date.parse)];
+  // An unparseable timestamp means the push time is unknown: refuse rather than fall back to an older date.
+  if (times.some(t => !Number.isFinite(t))) throw new Error('unparseable push timestamp');
   return times.length ? { atMs: Math.max(...times), open: view.state === 'OPEN' } : null;
 }
 
