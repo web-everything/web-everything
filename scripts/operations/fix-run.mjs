@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { execGuardedFixer } from './fixer-process.mjs';
+import { assertFixerLaunch, assertLaunchDescriptor } from '../conveyor/conflict-rebase-launch-gate.mjs';
 import { buildStandDownComment } from '../conveyor/stand-down.mjs';
 import { repeatedFindingPlan, applyScopeReset, resolveFixSafety } from '../conveyor/repeated-finding-reset.mjs';
 /**
@@ -819,7 +820,9 @@ export async function runFixCli(argv = [], {
     before = checkLane(prHeadSha).laneHead;
     const rearmReview = () => {
       try {
-        return run('node', [resolve(weRoot, 'scripts', 'conveyor', 'rearm-review.mjs'), pr, ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot });
+        return run('node', [resolve(weRoot, 'scripts', 'conveyor', 'rearm-review.mjs'), pr, ...(launch.repo ? [`--repo=${launch.repo}`] : []),
+          ...(launch.mode === 'conflict-rebase' ? ['--round=conflict', `--actor=${launch.launchGuard.conflictRebase.receipt}`,
+            `--main-ref=${launch.launchGuard.conflictRebase.defaultBranch}`] : [])], { cwd: weRoot });
       } catch (e) {
         const policy = resolveRearmRefusalPolicy();
         if (policy.mode === 'noop' && isNothingToRearmRefusal(e)) {
@@ -853,6 +856,10 @@ export async function runFixCli(argv = [], {
       return { code: 0, result };
     }
     const provider = await resolveProvider(launch.provider);
+    // Preparation can merge and commit before the provider runs. Admit it with fresh evidence too;
+    // execGuardedFixer still repeats admission after preparation, immediately before execution.
+    (launchGate ?? assertFixerLaunch)({ mode: launch.mode, launchGuard: launch.launchGuard, pr, repo: launch.repo }, launchGateOptions);
+    assertLaunchDescriptor(launch);
     const git = (...args) => run('git', [...HARDENED_GIT_ARGS, ...args], { cwd: lanePath, env: gitEnv });
     // Never let git open a lane path to stage it: `git add` and `commit -- paths` run with OUR read access, not the
     // sandbox's, and re-open each path after any check. Each path's bytes are read through laneStageEntry's one checked

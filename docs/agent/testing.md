@@ -4452,6 +4452,11 @@ through provider requests, borrowed-launch argv and worker specs/records. `fixer
 is the execution authority: every exec, including a trust retry or verification resume, runs
 `assertFixerLaunch` again. A dispatcher check is early feedback, never execution permission.
 Missing conflict launch evidence refuses before process creation; refresh PR evidence before retrying.
+Borrowed `fix-run.mjs` repairs also check fresh admission after provider resolution and before launcher
+merge/commit preparation, retaining the execution check afterward. Its conflict completion re-arms with
+`--round=conflict` and the dispatched receipt actor so both conflict budgets count completed repairs.
+`fix-run.test.mjs` covers pre-merge holds, moved heads, incomplete evidence, the post-merge recheck,
+and completed repairs exhausting each budget.
 The live PR read uses `throttle.noMemo: true` to retain throttling while bypassing the smoke memo.
 `conflict-rebase-launch-boundaries.test.mjs` enumerates execution sites; wrapper, borrowed-launch
 and memo regressions change evidence across the preparation/resume boundary with injected IO.

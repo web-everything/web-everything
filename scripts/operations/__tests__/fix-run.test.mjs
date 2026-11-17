@@ -13,6 +13,9 @@ import { buildFixEndComment } from '../../conveyor/fix-procedure.mjs';
 import { resolveFixBorrowSettings } from '../../lib/dispatch-throttle.mjs';
 import { defaultSpawnCodexAgent } from '../codex-delivery-provider.mjs';
 import { assertFixerLaunch, launchGuardFor } from '../../conveyor/conflict-rebase-launch-gate.mjs';
+import { conflictRebaseReceipt, planAcceptedConflictRebase } from '../../conveyor/accepted-conflict-rebase.mjs';
+import { buildConflictRearmComment } from '../../conveyor/rearm-review.mjs';
+import { AUTOMATION_LOGINS } from '../../lib/marker-authorship.mjs';
 import { fixDetachedProvider, fixLauncherAvailable, FIX_RUN_SCRIPT, FIX_RUN_EXECUTORS, FIX_RUN_CONFINEMENT } from '../dispatch-providers/fix.mjs';
 import { resolveDeliveryAgentProvider } from '../deliver-item-wrapper.mjs';
 import { childFailureReason, resolveAcquireWaitPolicy, parseFixRunArgv, readCiHealInputs, renderCiHealContext, renderPrContext, runFixCli, SANDBOX_PREAMBLE, HARDENED_GIT_ARGS, defaultPendingRearm, removePromptFile, riskyLaneConfig, changedPaths, escalationComment, readLaneFileSafe, laneStageEntry, unmergedPaths, MAX_CONFLICTED_PATHS, BLOB_MAX_BYTES, STAGE_MAX_BYTES } from '../fix-run.mjs';
@@ -138,7 +141,7 @@ describe('runFixCli', () => {
     });
     expect(result.code).toBe(1);
     expect(providerSpawn).toHaveBeenCalledOnce();
-    expect(launchGate).toHaveBeenCalledTimes(2);
+    expect(launchGate).toHaveBeenCalledTimes(3); // preparation, provider, actual Codex exec
     expect(spawnFn).not.toHaveBeenCalled();
   });
   it.each(['moved head', 'new hold', 'missing mode', 'missing pin', 'missing guard'])('borrowed launch refuses %s at the provider boundary after async preparation', async change => {
@@ -165,6 +168,84 @@ describe('runFixCli', () => {
     expect(launchGate).toHaveBeenCalledOnce();
     expect(m.spawn).not.toHaveBeenCalled();
   });
+  it.each(['moved head', 'held label', 'unreadable labels', 'invalid descriptor'])(
+    'refuses %s before any launcher merge or commit', async change => {
+      const head = 'a'.repeat(40), m = mk([head, 'b'.repeat(40)]);
+      const live = { headRefOid: head, labels: ['review:pending'], state: 'OPEN', isDraft: false,
+        baseRefName: 'main', mergeable: 'CONFLICTING' };
+      const guard = launchGuardFor({ mode: 'conflict-rebase', pr: 7, headRefOid: head,
+        conflictRebase: { oldHead: head, defaultBranch: 'main' } }, { repo: 'o/r' });
+      if (change === 'invalid descriptor') delete guard.pinnedHead;
+      // Evidence changes during async provider preparation, after the original PR read.
+      const resolveProvider = async () => {
+        if (change === 'moved head') live.headRefOid = 'c'.repeat(40);
+        if (change === 'held label') live.labels.push('review:held-mechanical');
+        if (change === 'unreadable labels') live.labels = null;
+        return { spawn: m.spawn };
+      };
+      const result = await runFixCli([...argv, '--merge-onto=main', '--mode=conflict-rebase',
+        `--launch-guard=${JSON.stringify(guard)}`], { ...m.io, resolveProvider,
+        ...(change === 'invalid descriptor' ? { launchGate: vi.fn() } : {}),
+        launchGateOptions: { readLive: () => live },
+        // Force a clean merge/commit if admission is accidentally deferred again.
+        fileExists: () => true,
+        run: (cmd, args, opts) => {
+          if (args.includes('--git-path')) return 'MERGE_HEAD';
+          return m.run(cmd, args, opts);
+        },
+      });
+      expect(result.code).toBe(1);
+      expect(m.calls.filter(c => c[0] === 'git' && (c.includes('merge') || c.includes('commit')))).toEqual([]);
+      expect(m.spawn).not.toHaveBeenCalled();
+    });
+  it('rechecks admission after a clean merge is committed and before the provider runs', async () => {
+    const head = 'a'.repeat(40), m = mk([head, 'b'.repeat(40)]);
+    const live = { headRefOid: head, labels: ['review:pending'], state: 'OPEN', isDraft: false,
+      baseRefName: 'main', mergeable: 'CONFLICTING' };
+    const guard = launchGuardFor({ mode: 'conflict-rebase', pr: 7, headRefOid: head,
+      conflictRebase: { oldHead: head, defaultBranch: 'main' } }, { repo: 'o/r' });
+    let merging = false;
+    const result = await runFixCli([...argv, '--merge-onto=main', '--mode=conflict-rebase',
+      `--launch-guard=${JSON.stringify(guard)}`], { ...m.io,
+      launchGateOptions: { readLive: () => live }, fileExists: () => true,
+      run: (cmd, args, opts) => {
+        if (args.includes('--git-path')) return merging ? 'MERGE_HEAD' : '';
+        if (args.includes('merge')) merging = true;
+        if (args.includes('commit')) { merging = false; live.labels.push('review:held-mechanical'); }
+        return m.run(cmd, args, opts);
+      },
+    });
+    expect(result.code).toBe(1);
+    expect(m.calls.filter(c => c.includes('commit'))).toHaveLength(1);
+    expect(m.spawn).not.toHaveBeenCalled();
+    expect(m.calls.some(c => c.includes('push'))).toBe(false);
+  });
+  it.each([['per-target', 3, 9, false], ['absolute', 9, 3, true]])(
+    'completed borrowed conflict repairs exhaust the %s cap', async (_name, cap, ceiling, movedTarget) => {
+      const target = 'f'.repeat(40), comments = [];
+      for (let i = 1; i <= 3; i++) {
+        const head = String(i).repeat(40), after = String(i + 1).repeat(40), m = mk([head, after]);
+        const receipt = conflictRebaseReceipt(head, target);
+        const guard = launchGuardFor({ mode: 'conflict-rebase', pr: 7, headRefOid: head,
+          conflictRebase: { oldHead: head, defaultBranch: 'main', mainSha: target, receipt } }, { repo: 'o/r' });
+        const live = { headRefOid: head, labels: ['review:pending'], state: 'OPEN', isDraft: false,
+          baseRefName: 'main', mergeable: 'CONFLICTING' };
+        expect((await runFixCli([...argv, '--mode=conflict-rebase', `--launch-guard=${JSON.stringify(guard)}`], {
+          ...m.io, launchGateOptions: { readLive: () => live },
+        })).code).toBe(0);
+        const rearm = m.calls.find(c => c.some(a => a.endsWith('rearm-review.mjs')));
+        expect(rearm).toEqual(['node', '/we/scripts/conveyor/rearm-review.mjs', '7', '--repo=o/r',
+          '--round=conflict', `--actor=${receipt}`, '--main-ref=main']);
+        comments.push({ author: { login: AUTOMATION_LOGINS[0] }, body: buildConflictRearmComment({
+          actor: rearm.find(a => a.startsWith('--actor=')).slice('--actor='.length),
+          decision: { keepsHuman: false }, mainRef: 'main', mainSha: target,
+        }) });
+        const plan = planAcceptedConflictRebase({ pr: { ...live, headRefOid: after, labels: ['review:accepted'], comments },
+          mainSha: movedTarget ? 'e'.repeat(40) : target, cap, ceiling });
+        expect(plan.kind).toBe(i < 3 ? 'fix' : 'cap-exhausted');
+        if (i === 3) expect(plan.why).toContain('a person must take over');
+      }
+    });
   it.each([false, true])('pushAfterCi=%s waits with injected time and folds failures before the agent', async enabled => {
     const m = mk(['a'.repeat(40), 'b'.repeat(40)]);
     let now = 1000;
