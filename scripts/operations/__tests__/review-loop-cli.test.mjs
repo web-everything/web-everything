@@ -1897,8 +1897,10 @@ describe('CI-held record driver resume', () => {
     let time = 0;
     const publishGate = vi.fn(() => ({ allowed: false, headSha: HEAD_A, reason: 'required-checks-not-successful' }));
     const runNode = vi.fn(() => { throw Error('CI pending must prevent publication'); });
+    const timingEnv = { WE_REVIEW_START_EARLY: 'on', WE_REVIEW_START_EARLY_PUBLISH_WAIT_MS: '1', WE_REVIEW_START_EARLY_POLL_MS: '1' };
     const label = createReviewPrSinks({
-      env: { WE_REVIEW_START_EARLY: 'on', WE_REVIEW_START_EARLY_PUBLISH_WAIT_MS: '1', WE_REVIEW_START_EARLY_POLL_MS: '1' },
+      root: mkdtempSync(join(tmpdir(), 'ci-held-resume-')), runStore: store, env: timingEnv,
+      labelProvider: { readPrState: () => ({ comments: [] }) }, postRedTeamCheckRun: async () => ({ ok: true }), out: () => {},
       publishGate, readPublishHead: () => HEAD_A, now: () => time, sleep: async ms => { time += ms; }, runNode,
     })[REVIEW_EFFECTS.LABEL];
     const sinks = { ...recordingSinks(seen), [REVIEW_EFFECTS.LABEL]: label };
@@ -1917,7 +1919,7 @@ describe('CI-held record driver resume', () => {
     expect(saved.pending).toMatchObject({ kind: 'effect', step: 'record' });
     expect(saved.effects.find(e => e.type === REVIEW_EFFECTS.LABEL)).toMatchObject({ status: 'failed', unknownAttempts: 1,
       error: 'review held: CI still pending on reviewed head' });
-    return { args, store, saved, judge, seen, publishGate, runNode, find };
+    return { args, store, saved, judge, seen, publishGate, runNode, find, timingEnv };
   }
 
   it.each(['card', 'not-real'].flatMap(result => [false, true].map(cleared => [result, cleared])))(
@@ -1973,8 +1975,9 @@ describe('CI-held record driver resume', () => {
       }
     });
 
-  it('re-runs a failed notApplied label swap in place, rechecks pending CI, and never starts a fresh panel', async () => {
+  it('keeps a CI-held label swap held after timing settings change, then applies on green without a fresh panel', async () => {
     const f = await fixture();
+    Object.assign(f.timingEnv, { WE_REVIEW_START_EARLY: 'off', WE_REVIEW_START_AFTER: 'ci-green', WE_REVIEW_CANCEL_ON_CI_RED: 'false' });
     // The default lookup resolves the environment setting when no driver override is supplied.
     expect(f.find({ repo: BASE_ARGV[1].slice(7), pr: 1234 })).toBe(f.saved.id);
     const judges = f.judge.mock.calls.length, writes = f.seen.length, checks = f.publishGate.mock.calls.length;
@@ -1989,6 +1992,18 @@ describe('CI-held record driver resume', () => {
     expect(f.runNode).not.toHaveBeenCalled();
     expect(f.judge).toHaveBeenCalledTimes(judges);
     expect(f.seen).toHaveLength(writes);
+    expect(out.stopped).toBe('effect-halted');
+    expect(out.run.effects.find(e => e.type === REVIEW_EFFECTS.LABEL).error).toBe('review held: CI still pending on reviewed head');
+    f.publishGate.mockReturnValue({ allowed: true, headSha: HEAD_A, reason: 'required-checks-successful' });
+    f.runNode.mockReturnValue('{"ok":true}');
+    const green = await runReviewLoopOnce({ ...f.args, findResumableRun: f.find, mintRunId: () => { throw Error('fresh panel'); } });
+    expect(green.run.id).toBe(f.saved.id);
+    expect(green.stopped).toBe('complete');
+    expect(green.run.effects.find(e => e.type === REVIEW_EFFECTS.LABEL).status).toBe('applied');
+    expect(f.runNode).toHaveBeenCalledOnce();
+    expect(f.judge).toHaveBeenCalledTimes(judges);
+    for (const [args] of f.publishGate.mock.calls) expect(args.policy)
+      .toMatchObject({ startEarly: 'off', startAfter: 'ci-green', startBeforeCi: false });
   });
 
   it.each([['at bound', 3, 3, true], ['over bound', 3, 4, false], ['zero disables retries', 0, 1, false]])(

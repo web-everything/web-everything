@@ -87,7 +87,7 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { DEFAULT_LENS, SECURITY_SEAT_STEP, seatSecurityForTouchSet, securitySeatFromRun } from './review-pr.mjs';
+import { DEFAULT_LENS, REVIEW_EFFECTS, SECURITY_SEAT_STEP, seatSecurityForTouchSet, securitySeatFromRun } from './review-pr.mjs';
 import { parallelSeatsEnabled, seatsByTouchSetEnabled, resolveCardOnlyReviewSettings } from '../lib/review-seat-settings.mjs';
 import { planReviewDispatch } from './review-dispatch.mjs';
 import { READ_SINK_ENV, withReadSink } from '../lib/review-speculative-red-team.mjs';
@@ -671,6 +671,7 @@ export async function runReviewLoopOnce({
     }
     // Any doubt (an unreadable record, a run that cannot be rewound) falls back to a fresh review, never aborts the round.
     let rewound = null;
+    let requireCiGate = false;
     let persistSpent = null;
     try {
       const parked = resumedId ? store.read(resumedId) : null;
@@ -750,6 +751,7 @@ export async function runReviewLoopOnce({
             mandatoryReferrals: parked.findings?.mandatoryReferrals ?? null,
             adviseFinishedAt: parked.stepTimings?.find((t) => t.step === 'advise')?.finishedAt ?? null, attempts: 1,
             ...(persistRetries ? { persistRetries } : {}) } };
+        requireCiGate = ciHeldRecordRetry;
       }
     } catch { rewound = null; }
     if (persistSpent) {
@@ -760,6 +762,12 @@ export async function runReviewLoopOnce({
     if (rewound) {
       run = rewound;
       store.write(run);
+      if (requireCiGate) {
+        // A saved strict CI hold survives timing-setting changes. Scope the override to this resume's label sink.
+        const label = sinks[REVIEW_EFFECTS.LABEL];
+        sinks = { ...sinks, [REVIEW_EFFECTS.LABEL]: Object.assign(
+          (payload, ctx) => label(payload, { ...ctx, requireCiGate: true }), label) };
+      }
     } else {
       run = startRun({
         op: declaration.name,
