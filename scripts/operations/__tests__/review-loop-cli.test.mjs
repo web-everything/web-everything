@@ -36,11 +36,12 @@ import { fileItemOperation } from '../file-item.mjs';
 import { REVIEW_EFFECTS, reviewPrOperation } from '../review-pr.mjs';
 import { buildPreventionFilingInput, buildRoundCardsFilingInput, roundCardsFindingsFingerprint, postAcceptAdvisoryShadowReport } from '../../lib/review-loop-policy.mjs';
 import {
-  defaultFindResumableRun, RESUME_MAX_ATTEMPTS, applyUnattendedActorDefault, buildFileItemArgv, fileItemForPrevention, fileItemForPreventionViaLandingJob,
+  runReviewLoopCliOnce, defaultFindResumableRun, RESUME_MAX_ATTEMPTS, applyUnattendedActorDefault, buildFileItemArgv, fileItemForPrevention, fileItemForPreventionViaLandingJob,
   findFiledPreventionCard, findFiledRoundCardsCard, findRetainedRoundCardsReceipt, QUEUED_RECEIPT_TTL_MS, retainedRoundCardsReceipt,
   runReviewLoopOnce as driveReviewLoopOnceRaw, UNATTENDED_REVIEW_ACTOR,
 } from '../review-loop-cli.mjs';
 import { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops, recordPostAcceptAdvisoryRating, createReviewPrSinks } from '../review-pr-io.mjs';
+import { planRedTeamOnSkip } from '../../lib/review-red-team-on-skip.mjs';
 import { reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
 import { spawnPreventionLandingJob } from '../../lib/prevention-landing-job.mjs';
 
@@ -1961,11 +1962,37 @@ describe('CI-held record driver resume', () => {
     const f = await fixture();
     f.store.write({ ...f.saved, recordEffectResumeAttempts: RESUME_MAX_ATTEMPTS });
     const judges = f.judge.mock.calls.length;
-    const out = await runReviewLoopOnce({ ...f.args, findResumableRun: f.find, mintRunId: () => { throw Error('fresh panel'); } });
+    const out = await runReviewLoopOnce({ ...f.args, findResumableRun: () => f.saved.id, mintRunId: () => { throw Error('fresh panel'); } });
     expect(out.stopped).toBe('refused');
     expect(out.lines.join(' ')).toContain('record effect resume attempts spent');
     expect(f.judge).toHaveBeenCalledTimes(judges);
   });
+
+  it.each([RESUME_MAX_ATTEMPTS - 1, RESUME_MAX_ATTEMPTS, RESUME_MAX_ATTEMPTS + 1])(
+    'driver and planner agree on the independent record resume budget (%s)', async resumeAttempts => {
+      const f = await fixture();
+      const saved = { ...f.saved, recordEffectResumeAttempts: resumeAttempts };
+      f.store.write(saved);
+      const { repo, pr } = saved.input;
+      const [plan] = planRedTeamOnSkip({ repo,
+        refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: HEAD_A }],
+        rawPrs: [{ number: pr, headRefOid: HEAD_A, comments: [], reviews: [] }],
+        readEvidence: () => ({ ok: false, reason: 'review-unfinished' }),
+        readReviewRuns: () => [reviewRunEvidence(saved)], headNeverReviewed: () => false,
+        setting: { enabled: true, retryCooldownMin: 30, ciHeldRecordRetryMax: 3 },
+        lastDispatch: new Map(), now: 2_000_000,
+      });
+      const eligible = resumeAttempts < RESUME_MAX_ATTEMPTS;
+      expect(f.find({ repo, pr })).toBe(eligible ? saved.id : null);
+      expect(plan.action).toBe(eligible ? 'review' : 'skip');
+      if (!eligible) expect(plan).toMatchObject({ why: 'review-unfinished', escalate: true });
+      // Bypass discovery to probe the driver's own guard against the same saved run.
+      const out = await runReviewLoopOnce({ ...f.args, findResumableRun: () => saved.id,
+        mintRunId: () => { throw Error('fresh panel'); } });
+      expect(out.stopped === 'refused').toBe(!eligible);
+      expect(out.run.recordEffectResumeAttempts).toBe(eligible ? resumeAttempts + 1 : resumeAttempts);
+      if (!eligible) expect(out.lines.join(' ')).toContain('record effect resume attempts spent');
+    });
 
   it('never replays an unknown pending label outcome on explicit resume', async () => {
     const f = await fixture();
@@ -1973,8 +2000,10 @@ describe('CI-held record driver resume', () => {
     saved.effects.find(e => e.type === REVIEW_EFFECTS.LABEL).status = 'pending';
     f.store.write(saved);
     const checks = f.publishGate.mock.calls.length;
-    const out = await runReviewLoopOnce({ ...f.args, argv: [...f.args.argv, `--resume=${saved.id}`] });
+    const out = await runReviewLoopCliOnce({ ...f.args, argv: [`--resume=${saved.id}`, '--json'] });
     expect(out.code).not.toBe(0);
+    expect(out.stopped).toBe('refused');
+    expect(out.run).toBeNull();
     expect(out.lines.join(' ')).toContain('UNKNOWN');
     expect(f.publishGate).toHaveBeenCalledTimes(checks);
     expect(f.runNode).not.toHaveBeenCalled();

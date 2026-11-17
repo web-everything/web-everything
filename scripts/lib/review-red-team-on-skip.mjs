@@ -38,7 +38,7 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { readSealedStatus, sealedFromStatus, sealedStatusPath } from './red-team-sealed-status.mjs';
 import { publishStoredRedTeamResult } from './red-team-withheld-publish.mjs';
 import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
-import { readReviewRunEvidence, refusedReferralsAreRuled, findResumableParkedRun } from '../conveyor/review-referral-hold.mjs';
+import { RESUME_MAX_ATTEMPTS, readReviewRunEvidence, refusedReferralsAreRuled, findResumableParkedRun } from '../conveyor/review-referral-hold.mjs';
 
 // The shared reader returns reviewRunEvidence projections, not raw run records.
 const defaultReadReviewRuns = () => isUnderTest() ? [] : readReviewRunEvidence();
@@ -546,7 +546,9 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
             return dispatchDecision({ action: 'review', why: 'unfinished review has only a retryable pre-write effect; resume it' });
           }
           if (setting.ciHeldRecordRetryMax > 0 && Number.isFinite(matching?.ciHeldRecordRetry?.attempts)
-            && matching.ciHeldRecordRetry.attempts <= setting.ciHeldRecordRetryMax) {
+            && matching.ciHeldRecordRetry.attempts <= setting.ciHeldRecordRetryMax
+            && Number.isSafeInteger(matching.ciHeldRecordRetry.resumeAttempts) && matching.ciHeldRecordRetry.resumeAttempts >= 0
+            && matching.ciHeldRecordRetry.resumeAttempts < RESUME_MAX_ATTEMPTS) {
             return dispatchDecision({ action: 'review', why: 'unfinished review is held only on pending CI at record; resume it (bounded)' });
           }
         } catch { /* Unreadable evidence keeps the human hold. */ }

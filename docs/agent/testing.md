@@ -4368,3 +4368,13 @@ Lease overlap intentionally retains an ancestor fallback for disjoint file/glob
 pairs. Delivery classification refines `scopeEntriesOverlap` with the same module's
 `globsMayIntersect` automaton; otherwise `scripts/**/merge-queue-*` captures
 every scripts file. Keep both helpers shared; do not write another glob matcher.
+
+### CI-held record resume budgets
+
+CI-held record retries have two independent bounds: the label effect’s `unknownAttempts`
+and the run’s `recordEffectResumeAttempts`. Project both through `reviewRunEvidence`
+and check the shared `RESUME_MAX_ATTEMPTS` before planning a resume. Old raw runs without
+a resume counter project zero; projections missing that evidence cannot prove eligibility.
+Test the last eligible resume, exhaustion, and an exceeded budget against both the planner
+and the driver; exhaustion must preserve the `review-unfinished` escalation. Explicit-resume
+test argv must omit input flags (`--pr`, `--repo`), or parsing refuses before the replay guard.

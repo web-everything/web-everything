@@ -14,7 +14,7 @@ import { countFindings, planReconcile } from '../reconcile-core.mjs';
 import {
   reviewRunEvidence, readReviewRunEvidence, decideReferralHold, enrichPrsWithReferralHolds,
   notifyReferralHold, REFERRAL_RETRY_MS, decideSameHeadHold, resolveSameHeadMaxReviews, PENDING_REASON_TOKENS,
-  GH_LIST_COMMENT_CAP, findResumableParkedRun,
+  GH_LIST_COMMENT_CAP, findResumableParkedRun, RESUME_MAX_ATTEMPTS,
   VERDICT_COOLDOWN_BASE_MS, VERDICT_COOLDOWN_CAP_MS, VERDICT_COOLDOWN_MAX_RELEASES,
   resolveNoVerdictRetry, NO_VERDICT_RETRY_STANDARD, raiseNoVerdictNeedsYou, NO_VERDICT_NEEDS_YOU_KIND, needsYouClaimRoot,
 } from '../review-referral-hold.mjs';
@@ -75,20 +75,34 @@ describe('retryable record effects', () => {
     const r = ciSaved();
     if (incomplete) r.stepTimings = r.stepTimings.filter(t => t.step !== 'advise');
     const row = reviewRunEvidence(r);
-    expect(row.ciHeldRecordRetry).toEqual({ attempts: 1 });
+    expect(row.ciHeldRecordRetry).toEqual({ attempts: 1, resumeAttempts: 0 });
     expect(row.retryableRecordEffect).toBeUndefined();
     expect(findResumableParkedRun(pr(), [row], { repo, ciHeldRecordRetryMax: 1 })).toEqual({ id: r.id, head });
     expect(findResumableParkedRun(pr(), [row], { repo })).toBeNull();
     expect(findResumableParkedRun(pr(), [row], { repo, ciHeldRecordRetryMax: 0 })).toBeNull();
-    expect(findResumableParkedRun(pr(), [{ ...row, ciHeldRecordRetry: { attempts: 4 } }],
+    expect(findResumableParkedRun(pr(), [{ ...row, ciHeldRecordRetry: { attempts: 4, resumeAttempts: 0 } }],
       { repo, ciHeldRecordRetryMax: 3 })).toBeNull();
     expect(findResumableParkedRun(pr({ headRefOid: 'b'.repeat(40) }), [row], { repo, ciHeldRecordRetryMax: 3 })).toBeNull();
     expect(findResumableParkedRun(pr({ comments: [comment('fresh review', row.startedAt + 1, 'chalbert')] }),
       [row], { repo, ciHeldRecordRetryMax: 3 })).toBeNull();
   });
+  it.each([RESUME_MAX_ATTEMPTS - 1, RESUME_MAX_ATTEMPTS, RESUME_MAX_ATTEMPTS + 1])(
+    'enforces the independent saved record resume budget (%s)', resumeAttempts => {
+      const r = { ...ciSaved(), recordEffectResumeAttempts: resumeAttempts };
+      const row = reviewRunEvidence(r);
+      expect(row.ciHeldRecordRetry).toEqual({ attempts: 1, resumeAttempts });
+      expect(findResumableParkedRun(pr(), [row], { repo, ciHeldRecordRetryMax: 3 }))
+        .toEqual(resumeAttempts < RESUME_MAX_ATTEMPTS ? { id: r.id, head } : null);
+    });
+  it.each([undefined, -1, '1', NaN, Infinity, 1.5])(
+    'refuses incomplete or invalid projected resume attempts (%s)', resumeAttempts => {
+      const row = reviewRunEvidence(ciSaved());
+      row.ciHeldRecordRetry.resumeAttempts = resumeAttempts;
+      expect(findResumableParkedRun(pr(), [row], { repo, ciHeldRecordRetryMax: 3 })).toBeNull();
+    });
   it('uses the largest outstanding CI-held attempt count', () => {
     const r = ciSaved(); r.effects.push({ ...r.effects[1], unknownAttempts: 4 });
-    expect(reviewRunEvidence(r).ciHeldRecordRetry).toEqual({ attempts: 4 });
+    expect(reviewRunEvidence(r).ciHeldRecordRetry).toEqual({ attempts: 4, resumeAttempts: 0 });
   });
   it.each([
     ['non-CI failure', r => { r.effects[1].error = 'network timeout'; }],

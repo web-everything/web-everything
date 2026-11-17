@@ -81,7 +81,7 @@ import { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops, recordPo
 import { unattendedAcceptableVerdict, unattendedAcceptHold, unattendedAcceptPolicy } from '../lib/unattended-review-accept.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { hasUncapturedPrevention } from '../lib/jury-core.mjs';
-import { findResumableParkedRun, refusedReferralsAreRuled, persistRetryBudgetSpent, readReviewRunEvidence, reviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
+import { RESUME_MAX_ATTEMPTS, findResumableParkedRun, refusedReferralsAreRuled, persistRetryBudgetSpent, readReviewRunEvidence, reviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
@@ -395,7 +395,7 @@ export function findRetainedRoundCardsReceipt({ store, repo, pr, head = null, fi
 
 export const RESUME_STEP = 'mandatoryReferrals';
 /** How many times one parked run is driven again after its resume failed part-way, before a fresh review is allowed. */
-export const RESUME_MAX_ATTEMPTS = 3;
+export { RESUME_MAX_ATTEMPTS } from '../conveyor/review-referral-hold.mjs';
 
 /**
  * Card xq1xbsl — THE PARKED RUN AN OPERATOR'S RULING RESUMES, if there is one. Reads the PR's live head and thread and
@@ -522,6 +522,14 @@ function defaultReadResumePr({ repo, pr }) {
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }));
   // The complete, paginated thread: a ruling is the newest comment, which a 100-comment page can miss.
   return { headRefOid, body, createdAt, comments: readCompletePrComments(pr, { repo }) };
+}
+
+/** Executable boundary: report replay refusals and other thrown errors with a nonzero CLI result. */
+export async function runReviewLoopCliOnce(options) {
+  try { return await runReviewLoopOnce(options); }
+  catch (error) {
+    return { code: 1, lines: [`error: ${String(error?.message ?? error)}`], run: null, stopped: 'refused' };
+  }
 }
 
 /**
@@ -1142,7 +1150,7 @@ if (IS_CLI) {
     REVIEW_LOOP_OP, { json: hasJsonFlag(argv), cwd: cwdFlagValue(argv), securitySeat: seating.securitySeat, cardOnlyLight: seating.cardOnlyLight, resumeId: argvFlag(argv, 'resume') },
   );
   const prFlag = Number(argvFlag(argv, 'pr'));
-  runReviewLoopOnce({
+  runReviewLoopCliOnce({
     declaration,
     registry,
     argv,
@@ -1157,10 +1165,6 @@ if (IS_CLI) {
     .then(({ code, lines }) => {
       writeAllSync(1, `${lines.join('\n')}\n`);
       process.exit(code);
-    })
-    .catch((e) => {
-      writeAllSync(1, `error: ${String(e?.message ?? e)}\n`);
-      process.exit(1);
     });
 }
 

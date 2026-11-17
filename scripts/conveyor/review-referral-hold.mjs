@@ -26,6 +26,9 @@ import { isQuotaError } from '../lib/provider-quota-hold.mjs';
 import { isBodyFileRefusal } from '../operations/review-pr-io.mjs';
 import { reverifyStaleReferrals } from './referral-reverify.mjs';
 
+/** Maximum drives of a saved run before its resume budget is exhausted. Shared with the driver. */
+export const RESUME_MAX_ATTEMPTS = 3;
+
 export const REFERRAL_HOLD_MARKER = 'review paused:';
 export const GH_LIST_COMMENT_CAP = 100;
 /** The one set of run-level reasons `mandatoryReferralState` derives afresh from the live thread and PR body. They name
@@ -57,7 +60,8 @@ export function reviewRunEvidence(run) {
       if (outstanding.length > 0 && outstanding.every(e => e?.type === 'review.label-swap'
         && e.status === 'failed' && typeof e.error === 'string' && /CI still pending on reviewed head/.test(e.error)
         && Number.isFinite(e.unknownAttempts))) {
-        ciHeldRecordRetry = { attempts: Math.max(...outstanding.map(e => e.unknownAttempts)) };
+        ciHeldRecordRetry = { attempts: Math.max(...outstanding.map(e => e.unknownAttempts)),
+          resumeAttempts: run.recordEffectResumeAttempts ?? 0 };
       }
     }
   } catch { /* Unreadable effects cannot prove a safe record retry. */ }
@@ -310,7 +314,9 @@ export function findResumableParkedRun(pr, runs, { repo, cardReadable, ciHeldRec
   const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number));
   const last = latestReviewAttempt(history);
   const ciHeldRetry = ciHeldRecordRetryMax > 0 && Number.isFinite(last?.ciHeldRecordRetry?.attempts)
-    && last.ciHeldRecordRetry.attempts <= ciHeldRecordRetryMax;
+    && last.ciHeldRecordRetry.attempts <= ciHeldRecordRetryMax
+    && Number.isSafeInteger(last.ciHeldRecordRetry.resumeAttempts) && last.ciHeldRecordRetry.resumeAttempts >= 0
+    && last.ciHeldRecordRetry.resumeAttempts < RESUME_MAX_ATTEMPTS;
   if ((!last?.parked && !last?.resumeAdvise && !last?.suspendedReferralEffect && !last?.retryableRecordEffect && !ciHeldRetry) || last.head !== pr.headRefOid) return null;
   // A saved record retry only replays its label swap, but an operator comment after the run began (e.g. "run a fresh
   // review") asks for a fresh look on this head, so it is never answered by resuming the stale verdict (PR #6784).

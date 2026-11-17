@@ -18,7 +18,7 @@ import { readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus, redTe
 import { publishRedTeamCheckFromLive, evaluateRedTeamCheckFact, clearLivePublicationHold,
   readRedTeamPublicationHoldFact, withRedTeamCheckLock } from '../red-team-check-run.mjs';
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
-import { refusedReferralsAreRuled, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
+import { RESUME_MAX_ATTEMPTS, refusedReferralsAreRuled, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
@@ -67,6 +67,9 @@ describe('unfinished CI-held record retry', () => {
   it.each([
     ['off at zero', () => options(saved(), 0)],
     ['exceeds bound', () => options(saved(4))],
+    ['resume budget exhausted', () => options({ ...saved(), ciHeldRecordRetry: { attempts: 1, resumeAttempts: RESUME_MAX_ATTEMPTS } })],
+    ['resume budget exceeded', () => options({ ...saved(), ciHeldRecordRetry: { attempts: 1, resumeAttempts: RESUME_MAX_ATTEMPTS + 1 } })],
+    ['old projection missing resume evidence', () => options({ ...saved(), ciHeldRecordRetry: { attempts: 1 } })],
     ['non-CI failure', () => options(saved(1, 'network timeout'))],
     ['operator wake', () => ({ ...options(), rawPrs: [{ number: pr, headRefOid: head, reviews: [],
       comments: [{ body: 'fresh review', createdAt: new Date(2).toISOString(), author: { login: 'chalbert' } }] }] })],
