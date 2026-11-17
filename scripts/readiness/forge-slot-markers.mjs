@@ -324,7 +324,11 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
                 const first = idleStamp(entry.file, entry.key, sampledAt);
                 if (sampledAt - first < idleConfirmMs) continue;
               }
-            } else if (!(evidence.complete || (boundedOrphan(evidence, sampledAt, diedBy) && !maybeSurvivingDescendants(telemetry, entry.at ?? entry.mtimeMs, diedBy))) || maybeOwnsInflight(telemetry, entry.at ?? entry.mtimeMs, diedBy)) continue;
+            } else {
+              const at = entry.at ?? entry.mtimeMs;
+              if (!evidence.complete && (!boundedOrphan(evidence, sampledAt, diedBy) || maybeSurvivingDescendants(telemetry, at, diedBy))) continue;
+              if (maybeOwnsInflight(telemetry, at, diedBy)) continue;
+            }
             // Claim whatever is at the marker name with one atomic rename, THEN prove it is the file we judged. A replacement
             // swapped in meanwhile is put straight back (or kept as a held tombstone that still blocks its slot), so no
             // dispatch marker is ever lost, whatever the timing and without any lease or lock.
@@ -350,7 +354,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
 // authoritative activeRunIds (byIds); `maybeOwnsInflight` still guards any unfinished receipt inside the window.
 export const ORPHAN_RUN_BOUND_MS = 120 * 60_000; // = heavy-admission DEFAULT_ADMISSION_CEILING_MS
 function boundedOrphan(evidence, sampledAt, diedBy) {
-  return evidence.byIds === true && sampledAt - diedBy >= ORPHAN_RUN_BOUND_MS + CLOCK_SKEW_MS;
+  return evidence.byIds === true && sampledAt - diedBy > ORPHAN_RUN_BOUND_MS + CLOCK_SKEW_MS;
 }
 
 // A run-less marker's run could only have started between dispatch and owner death; Forge timestamps can skew either way.

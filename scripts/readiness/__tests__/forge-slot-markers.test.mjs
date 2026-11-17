@@ -590,4 +590,30 @@ describe('bounded orphan release of run-less markers', () => {
     expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1_000, [RUN_B]))).toEqual([]);
     expect(names(root)).toEqual(['0']);
   });
+  it.each([-1, 0, 1])('requires the sample strictly past the ceiling plus skew (offset %s ms)', async offset => {
+    const {root, reaper} = make();
+    const released = offset > 0;
+    expect(await reaper.step(withIds(NOW + BOUND + SKEW + offset, [RUN_B]))).toEqual(released ? ['slot-0.unconfirmed'] : []);
+    expect(names(root)).toEqual(released ? [] : ['0']);
+  });
+  it.each([null, [], [RUN_B, RUN_B], ['invalid']])('keeps the marker with invalid authoritative active ids: %j', async activeRunIds => {
+    const {root, reaper} = make();
+    expect(await reaper.step(async () => ({sampledAtET: iso(NOW + BOUND + SKEW + 1), activeRuns: 1, activeRunIds, recent: []}))).toEqual([]);
+    expect(names(root)).toEqual(['0']);
+  });
+  it.each([null, 97, 254].flatMap(code => [NOW - 660_001, NOW - 660_000, NOW + SKEW, NOW + SKEW + 1].map(startedMs => ({code, startedMs}))))(
+    'guards the inclusive receipt window even when the receipt is absent from active ids: %j', async ({code, startedMs}) => {
+      const {root, reaper} = make();
+      const keep = startedMs >= NOW - 660_000 && startedMs <= NOW + SKEW;
+      const recent = [{runId: RUN_A, code, startedAtET: iso(startedMs)}];
+      expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1, [RUN_B], recent))).toEqual(keep ? [] : ['slot-0.unconfirmed']);
+      expect(names(root)).toEqual(keep ? ['0'] : []);
+    });
+  it.each(['inline', 'sidecar'])('does not apply the bound to a marker with a %s run id', async binding => {
+    const root = setup({0: {pid: 111, run: binding === 'inline' ? RUN_A : undefined}});
+    if (binding === 'sidecar') recordMarkerRun(join(root, 'slot-0.unconfirmed'), {owner: 'o', run: RUN_A});
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
+    expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1, [RUN_A, RUN_B]))).toEqual([]);
+    expect(names(root)).toEqual(['0']);
+  });
 });
