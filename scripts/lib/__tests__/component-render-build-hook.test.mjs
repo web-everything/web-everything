@@ -507,6 +507,51 @@ describe('spliceComponents — one subprocess per page, splice each placeholder 
   });
 });
 
+describe('spliceComponentsBatch — output-buffer overflow (ENOBUFS) on a huge site (red main @ f5aa5b111)', () => {
+  // A runner that, like the real spawnSync, throws ENOBUFS when one call's stdout would exceed its budget.
+  function limitedRunner(maxSpecsPerCall, log) {
+    return (_c, _a, opts) => {
+      const entries = JSON.parse(opts.input);
+      log.push(entries.length);
+      if (entries.length > maxSpecsPerCall) {
+        const err = new Error('spawnSync node ENOBUFS');
+        err.code = 'ENOBUFS';
+        throw err;
+      }
+      return genericRunner(_c, _a, opts);
+    };
+  }
+
+  it('splits the batch and retries when one subprocess overflows its output buffer; every placeholder still splices', () => {
+    const calls = [];
+    const written = new Map();
+    const results = Array.from({ length: 10 }, (_, i) => ({
+      outputPath: `/site/p${i}/index.html`,
+      content: `<we-card data-we-spec='{"component":"card","config":{"title":"T${i}"}}'>fb</we-card>`,
+    }));
+    const stat = spliceComponentsBatch(results, stubRoot, limitedRunner(3, calls), (p, c) => written.set(p, c));
+    expect(stat).toEqual({ pages: 10, components: 10 });
+    for (let i = 0; i < 10; i++) expect(written.get(`/site/p${i}/index.html`)).toContain(`data-title="T${i}"`);
+    expect(calls[0]).toBe(10); // first try is still ONE whole-site subprocess
+    expect(Math.max(...calls.slice(1))).toBeLessThanOrEqual(5); // then halves
+  });
+
+  it('a single spec that overflows on its own is still a hard error (no infinite split)', () => {
+    const calls = [];
+    const results = [{ outputPath: '/site/x/index.html',
+      content: `<we-card data-we-spec='{"component":"card","config":{"title":"X"}}'>f</we-card>` }];
+    expect(() => spliceComponentsBatch(results, stubRoot, limitedRunner(0, calls), () => {})).toThrow(/ENOBUFS/);
+    expect(calls).toEqual([1]);
+  });
+
+  it('non-ENOBUFS runner failures are NOT swallowed by the split-retry', () => {
+    const boom = () => { throw new Error('cli exploded'); };
+    const results = [{ outputPath: '/site/x/index.html',
+      content: `<we-card data-we-spec='{"component":"card","config":{"title":"X"}}'>f</we-card>` }];
+    expect(() => spliceComponentsBatch(results, stubRoot, boom, () => {})).toThrow(/cli exploded/);
+  });
+});
+
 describe('spliceComponentsBatch — one subprocess for the WHOLE build (#2185)', () => {
   // Capture what the (injected) writeFile would persist, keyed by outputPath.
   function makeWriter() {
