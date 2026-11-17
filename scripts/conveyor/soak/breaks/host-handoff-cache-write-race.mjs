@@ -1,14 +1,16 @@
 /** PR #6945: ownership must stay revoked across pending and overlapping cache writes. */
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 
 function deferred() {
   let resolve;
-  const promise = new Promise((yes) => { resolve = yes; });
-  return { promise, resolve };
+  let reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
 }
 
 export default {
@@ -36,34 +38,137 @@ export default {
     const offline = () => ({ status: 'error' });
     const violations = [];
     try {
+      // Empty-cache callers, including startup, must await one ownership read.
+      let reads = 0;
+      const reading = deferred();
+      const concurrentOptions = { thisHost: 'a', now, state: {}, readCache: () => readCacheFile(path),
+        writeCache: (value) => writeCacheFile(value, path),
+        readRemote: () => { reads += 1; return reading.promise; } };
+      const concurrent = Promise.all(Array.from({ length: 3 }, () => resolveHostRole(concurrentOptions)));
+      await Promise.resolve();
+      reading.resolve({ status: 'ok', owner: 'a' });
+      const decisions = await concurrent;
+      if (reads !== 1 || decisions.some((decision) => JSON.stringify(decision) !== JSON.stringify(decisions[0]))) {
+        violations.push(`concurrent calls: ${reads} reads, decisions=${JSON.stringify(decisions)}`);
+      }
+
+      // Separate guard states can read the same host-local file. The older
+      // response must neither replace a confirmed handoff nor enable offline use.
+      for (const handoff of [{ status: 'ok', owner: 'b' }, { status: 'unset' }]) {
+        invalidateCacheFile(path);
+        const reading = deferred();
+        const started = deferred();
+        const options = { thisHost: 'a', now, atStart: true,
+          writeCache: (value) => writeCacheFile(value, path) };
+        const old = resolveHostRole({ ...options, state: {}, readCache: () => readCacheFile(path),
+          readRemote: () => { started.resolve(); return reading.promise; } });
+        await started.promise;
+        await resolveHostRole({ ...options, state: {}, now: now + 1, readCache: () => readCacheFile(path),
+          readRemote: () => handoff });
+        reading.resolve({ status: 'ok', owner: 'a' });
+        const late = await old;
+        const offlineDecision = await resolveHostRole({ ...options, state: {}, atStart: false,
+          now: now + FRESH_READ_MS + 2, readCache: () => readCacheFile(path), readRemote: offline });
+        if (late.role !== 'standby' || offlineDecision.role !== 'standby' || readCacheFile(path).owner === 'a') {
+          violations.push(`separate states resurrected ownership after ${handoff.status} handoff`);
+        }
+      }
       for (const fails of [false, true]) {
+        invalidateCacheFile(path);
         writeCacheFile({ host: 'a', owner: 'a', status: 'ok', readAt: now, writtenAt: now }, path);
         const writing = deferred();
         const started = deferred();
         const options = { thisHost: 'a', now, atStart: true, state: {},
-          readCache: () => readCacheFile(path), invalidateCache: () => invalidateCacheFile(path) };
+          readCache: () => readCacheFile(path), invalidateCache: (value) => invalidateCacheFile(path, value) };
         const old = resolveHostRole({ ...options, readRemote: () => ({ status: 'ok', owner: 'a' }),
-          writeCache: async (value) => { started.resolve(); await writing.promise; writeCacheFile(value, path); } });
+          writeCache: async (value) => { started.resolve(); await writing.promise; return writeCacheFile(value, path); } });
         await started.promise;
-        const handoff = resolveHostRole({ ...options, now: now + 1,
+        const handoffState = {};
+        const handoff = resolveHostRole({ ...options, state: handoffState, now: now + 1,
           readRemote: () => ({ status: 'ok', owner: 'b' }), writeCache: (value) => {
             if (fails) throw new Error('disk full');
-            writeCacheFile(value, path);
+            return writeCacheFile(value, path);
           } });
         await Promise.resolve();
         await Promise.resolve();
-        const during = await resolveHostRole({ ...options, now: now + 2, atStart: false, readRemote: offline });
+        const during = resolveHostRole({ ...options, state: handoffState, now: now + 2,
+          atStart: false, readRemote: offline });
         writing.resolve();
         await Promise.all([old, handoff]);
-        const after = await resolveHostRole({ ...options, now: now + FRESH_READ_MS + 3,
+        const after = await resolveHostRole({ ...options, state: handoffState, now: now + FRESH_READ_MS + 3,
           atStart: false, readRemote: offline });
         // A new guard must also stay closed when removal or replacement succeeded.
         const restarted = await resolveHostRole({ ...options, state: {}, now: now + FRESH_READ_MS + 3,
           atStart: false, readRemote: offline });
-        for (const [phase, decision] of [['pending', during], ['offline', after], ['restart', restarted]]) {
+        for (const [phase, decision] of [['pending', await during], ['offline', after], ['restart', restarted]]) {
           if (decision.role !== 'standby') violations.push(`${phase}: ownership resurrected (write fails=${fails})`);
         }
       }
+      invalidateCacheFile(path);
+      const oldestRead = deferred();
+      const readStarted = deferred();
+      const failedWrite = deferred();
+      const writeStarted = deferred();
+      const sharedFile = { thisHost: 'a', now, atStart: true,
+        writeCache: (value) => writeCacheFile(value, path),
+        invalidateCache: (value) => invalidateCacheFile(path, value) };
+      const oldest = resolveHostRole({ ...sharedFile, state: {}, readCache: () => readCacheFile(path),
+        readRemote: () => { readStarted.resolve(); return oldestRead.promise; } });
+      await readStarted.promise;
+      const failed = resolveHostRole({ ...sharedFile, state: {}, now: now + 1,
+        readCache: () => readCacheFile(path), readRemote: () => ({ status: 'ok', owner: 'b' }),
+        writeCache: () => { writeStarted.resolve(); return failedWrite.promise; } });
+      await writeStarted.promise;
+      await resolveHostRole({ ...sharedFile, state: {}, now: now + 2,
+        readCache: () => readCacheFile(path), readRemote: () => ({ status: 'ok', owner: 'b' }) });
+      failedWrite.reject(new Error('late disk failure'));
+      await failed;
+      oldestRead.resolve({ status: 'ok', owner: 'a' });
+      const lateDecision = await oldest;
+      const afterFailure = await resolveHostRole({ ...sharedFile, state: {}, atStart: false,
+        now: now + FRESH_READ_MS + 3, readCache: () => readCacheFile(path), readRemote: offline });
+      if (lateDecision.role !== 'standby' || afterFailure.role !== 'standby') {
+        violations.push('failed handoff invalidation erased newer evidence and resurrected ownership');
+      }
+      // Reproduce a real process pausing after its cache comparison. A second
+      // process must finish its newer handoff after that holder, never before it.
+      invalidateCacheFile(path);
+      const release = join(dir, 'release');
+      const moduleUrl = pathToFileURL(join(root, 'scripts/lib/daemon-host-guard.mjs')).href;
+      const record = { host: 'a', owner: 'a', status: 'ok', readAt: now, writtenAt: now };
+      const old = spawn(process.execPath, ['--input-type=module', '-e', `
+        import fs from 'node:fs'; import { syncBuiltinESMExports } from 'node:module';
+        const rename = fs.renameSync;
+        fs.renameSync = (...args) => {
+          process.send('paused'); const deadline = Date.now() + 5000;
+          while (!fs.existsSync(${JSON.stringify(release)})) {
+            if (Date.now() > deadline) throw new Error('release timeout');
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+          }
+          return rename(...args);
+        };
+        syncBuiltinESMExports();
+        const { writeCacheFile } = await import(${JSON.stringify(moduleUrl)});
+        writeCacheFile(${JSON.stringify(record)}, ${JSON.stringify(path)});
+      `], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+      const oldExit = once(old, 'exit');
+      let newer;
+      try {
+        await once(old, 'message');
+        newer = spawn(process.execPath, ['--input-type=module', '-e', `
+          import { writeCacheFile } from ${JSON.stringify(moduleUrl)};
+          process.send('writing');
+          writeCacheFile(${JSON.stringify({ ...record, owner: 'b', readAt: now + 1, writtenAt: now + 1 })}, ${JSON.stringify(path)});
+        `], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+        const newerExit = once(newer, 'exit');
+        await once(newer, 'message');
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        writeFileSync(release, '');
+        const codes = await Promise.all([oldExit, newerExit]);
+        if (codes.some(([code]) => code !== 0) || readCacheFile(path).owner !== 'b') {
+          violations.push('independent process overwrote a newer handoff after resuming');
+        }
+      } finally { old.kill(); newer?.kill(); }
       return { violations };
     } finally { rmSync(dir, { recursive: true, force: true }); }
   },
