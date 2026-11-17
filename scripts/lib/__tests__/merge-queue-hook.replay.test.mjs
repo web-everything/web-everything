@@ -585,6 +585,56 @@ describe('refreshStalePr rerun uses the repo REST endpoint, never `gh run`', () 
     expect(out).toMatchObject({ ok: false, action: 'rerun-failed', error: expect.stringContaining('403') });
     expect(calls).toEqual([['api', '-X', 'POST', 'repos/o/r/actions/runs/123/rerun']]);
   });
+  it('triggers gate:refresh for an identified startup_failure without changing the head', async () => {
+    const head = 'a'.repeat(40), calls = [];
+    const out = await refreshStalePr({ ...base, expectedHead: head, readTip: () => head,
+      runConclusion: 'startup_failure',
+      execGh: args => {
+        calls.push(args);
+        if (args.at(-1).endsWith('/rerun')) throw Object.assign(new Error('gh api failed'), { stderr: 'HTTP 403: This workflow run cannot be retried' });
+        return JSON.stringify(args[0] === 'pr' && args[1] === 'view' ? { labels: calls.some(call => call.includes('--add-label')) ? [{ name: 'gate:refresh' }] : [] } : { head: { sha: head } });
+      } });
+    expect(out).toEqual({ ok: true, state: 'confirmed', action: 'gate-refresh', newCommit: null });
+    expect(calls).toEqual([
+      ['api', 'repos/o/r/pulls/7'],
+      ['pr', 'view', '7', '--repo', 'o/r', '--json', 'labels'],
+      ['label', 'create', 'gate:refresh', '--repo', 'o/r', '--color', 'ededed', '--description', 'Refresh merge-gate after acceptance restamp'],
+      ['pr', 'edit', '7', '--repo', 'o/r', '--add-label', 'gate:refresh'],
+      ['pr', 'view', '7', '--repo', 'o/r', '--json', 'labels'],
+      ['pr', 'edit', '7', '--repo', 'o/r', '--remove-label', 'gate:refresh'],
+    ]);
+  });
+  it.each([null, 'failure', 'success'])('a non-gate run 403 cannot-be-retried with conclusion %s never toggles the label', async runConclusion => {
+    const head = 'a'.repeat(40), calls = [];
+    const out = await refreshStalePr({ ...base, runConclusion, expectedHead: head, readTip: () => head,
+      execGh: args => {
+        calls.push(args);
+        if (args.includes('POST')) throw Object.assign(new Error('gh api failed'), { stderr: 'HTTP 403: This workflow run cannot be retried' });
+        return JSON.stringify(args[0] === 'pr' && args[1] === 'view' ? { labels: calls.some(call => call.includes('--add-label')) ? [{ name: 'gate:refresh' }] : [] } : { head: { sha: head } });
+      } });
+    expect(out).toMatchObject({ ok: false, action: 'rerun-failed' });
+    expect(calls).toEqual([['api', '-X', 'POST', 'repos/o/r/actions/runs/123/rerun']]);
+  });
+  it.each(['moved', 'unreadable', 'missing expected head'])('refuses label fallback with %s head evidence', async kind => {
+    const head = 'a'.repeat(40), calls = [];
+    const out = await refreshStalePr({ ...base, runConclusion: 'startup_failure',
+      ...(kind === 'missing expected head' ? {} : { expectedHead: head, readTip: () => head }),
+      execGh: args => { calls.push(args); return kind === 'unreadable' ? '{' : JSON.stringify({ head: { sha: 'b'.repeat(40) } }); } });
+    expect(out).toMatchObject({ ok: false, action: 'gate-refresh-failed', error: expect.stringContaining('operator') });
+    expect(calls.every(args => args[0] === 'api' && !args.includes('POST'))).toBe(true);
+  });
+  it('reports failed label writes instead of claiming a refresh succeeded', async () => {
+    const head = 'a'.repeat(40), calls = [];
+    const out = await refreshStalePr({ ...base, expectedHead: head, readTip: () => head,
+      runConclusion: 'startup_failure', execGh: args => {
+        calls.push(args);
+        if (args[0] === 'label') throw new Error('HTTP 403: Forbidden');
+        return JSON.stringify(args[0] === 'pr' && args[1] === 'view' ? { labels: calls.some(call => call.includes('--add-label')) ? [{ name: 'gate:refresh' }] : [] } : { head: { sha: head } });
+      } });
+    expect(out).toMatchObject({ ok: false, action: 'gate-refresh-failed', error: expect.stringContaining('operator') });
+    expect(calls.filter(args => args[0] === 'label')).toHaveLength(3);
+    expect(calls.some(args => args[0] === 'pr' && args[1] === 'edit')).toBe(false);
+  });
   it('reports a failed rerun and never calls `gh run`', async () => {
     const calls = [];
     const out = await refreshStalePr({ ...base, execGh: args => { calls.push(args); throw new Error('HTTP 404: Not Found'); } });

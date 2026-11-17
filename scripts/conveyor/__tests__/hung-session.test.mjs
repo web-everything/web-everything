@@ -24,6 +24,10 @@ import {
 } from '../hung-session.mjs';
 import { DEFAULT_LEASE_TTL_MINUTES } from '../../lib/lane-lease.mjs';
 
+// Warm the cold transform/evaluate cost of session-reaper.mjs once at file load (outside any test or hook budget), so the
+// per-test re-import after vi.resetModules() is a cheap cache hit instead of a load-dependent cold import.
+await import('../session-reaper.mjs');
+
 describe('classifyHungSession — PURE core', () => {
   const NOW = 1_000_000_000;
   const THRESHOLD = 30 * 60_000;
@@ -480,7 +484,7 @@ describe('resolveIdleFinishedThresholdMs — WE_IDLE_FINISHED_MINUTES, IO shell 
 });
 
 describe('readIdleFinishedInfo — the IO shell, against a REAL temp project store', () => {
-  let root, projects, cwd, sessionId, transcriptFile, readIdleFinishedInfo;
+  let root, projects, cwd, sessionId, transcriptFile, readIdleFinishedInfo, makeIdleFinishedResolver;
 
   beforeEach(async () => {
     root = mkdtempSync(join(tmpdir(), 'idle-finished-test-'));
@@ -493,6 +497,7 @@ describe('readIdleFinishedInfo — the IO shell, against a REAL temp project sto
     vi.stubEnv('CLAUDE_PROJECTS_DIR', projects);
     vi.resetModules();
     ({ readIdleFinishedInfo } = await import('../hung-session.mjs'));
+    ({ makeIdleFinishedResolver } = await import('../session-reaper.mjs'));
   });
   afterEach(() => { vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); });
 
@@ -524,11 +529,12 @@ describe('readIdleFinishedInfo — the IO shell, against a REAL temp project sto
     expect(info.reason).toBe('idle-row-dangling-tool-call');
   });
 
-  it('the session reaper call site (makeIdleFinishedResolver) never opts in: idle row + dangling call stays unfinished', async () => {
+  it('the session reaper call site (makeIdleFinishedResolver) never opts in: idle row + dangling call stays unfinished', () => {
     const now = Date.now();
     writeFileSync(transcriptFile, danglingLine(now, 500));
-    const { makeIdleFinishedResolver } = await import('../session-reaper.mjs');
-    expect(makeIdleFinishedResolver({ thresholdMs: 10 * 60_000, now: () => now })({ cwd, sessionId, status: 'idle' }).finished).toBe(false);
+    const info = makeIdleFinishedResolver({ thresholdMs: 10 * 60_000, now: () => now })({ cwd, sessionId, status: 'idle' });
+    expect(info.finished).toBe(false);
+    expect(info.reason).toBe('pending-tool-call');
   });
 
   it('reaper path unchanged: without trustIdleRow an idle row + dangling call stays unfinished', () => {

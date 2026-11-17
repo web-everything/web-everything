@@ -46,12 +46,15 @@ export function resolveAwaitVerifyPath(cwd, { statFn = statSync, readFileSyncFn 
 
 const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const nonEmpty = (value) => typeof value === 'string' && value.trim().length > 0;
+const isQueueId = (value) => typeof value === 'string' && value === value.trim()
+  && /^[A-Za-z][A-Za-z0-9._-]{0,31}$/.test(value);
+const validItem = (value) => (Number.isInteger(value) && value > 0) || isQueueId(value);
 /** Kinds that hold no PR yet and push nothing: the harness only reports the verdict, the agent's own `open-pr` pushes. */
 export const AWAIT_VERIFY_NO_PUSH_KINDS = Object.freeze(['delivery', 'prepare']);
 const validRecord = (record) => isObject(record) && record.v === 1
   && typeof record.requestedAt === 'string' && Number.isFinite(Date.parse(record.requestedAt))
   && ((Number.isInteger(record.pr) && record.pr > 0)
-    || (AWAIT_VERIFY_NO_PUSH_KINDS.includes(record.kind) && Number.isInteger(record.item) && record.item > 0));
+    || (AWAIT_VERIFY_NO_PUSH_KINDS.includes(record.kind) && validItem(record.item)));
 
 /** Read JSON objects only; missing, unreadable and malformed files are unknown. */
 export function readAwaitVerifyRecord(cwd, io = {}) {
@@ -309,7 +312,7 @@ export const AWAIT_VERIFY_KINDS = Object.freeze(['fix', 'ci-heal', 'delivery', '
 /** Is this a record the harness pass owns (written by `mark --ref`)? Shared with stale-wait classification. */
 export function isHarnessRecord(record) {
   return !!record && record.v === 1
-    && ((Number.isInteger(record.pr) && record.pr > 0) || (AWAIT_VERIFY_NO_PUSH_KINDS.includes(record.kind) && Number.isInteger(record.item) && record.item > 0))
+    && ((Number.isInteger(record.pr) && record.pr > 0) || (AWAIT_VERIFY_NO_PUSH_KINDS.includes(record.kind) && validItem(record.item)))
     && /^[a-f\d]{40}$/i.test(String(record.sha ?? '')) && typeof record.lane === 'string' && record.lane.startsWith('/')
     && AWAIT_VERIFY_REF_RE.test(String(record.ref ?? '')) && !String(record.ref).includes('..')
     && AWAIT_VERIFY_KINDS.includes(record.kind) && Number.isFinite(Date.parse(record.requestedAt));
@@ -361,7 +364,7 @@ export function main(argv = process.argv.slice(2), {
     const record = {
       v: 1, sessionId: callerSessionId(),
       who: flags.who, repo: noPush ? (flags.repo ?? ghRepoSlug(DEFAULT_REPO_KEY)) : flags.repo,
-      ...(noPush ? { item: Number(flags.item) } : { pr: Number(flags.pr) }),
+      ...(noPush ? { item: isQueueId(flags.item) ? flags.item : Number(flags.item) } : { pr: Number(flags.pr) }),
       sha: flags.sha ?? git(['rev-parse', 'HEAD']).trim(),
       requestedAt: new Date(now()).toISOString(), attempt: Number(flags.attempt ?? 1),
     };
@@ -377,7 +380,7 @@ export function main(argv = process.argv.slice(2), {
       if (!AWAIT_VERIFY_REF_RE.test(String(flags.ref)) || String(flags.ref).includes('..')) { err('malformed --ref (must be lane/*)'); return 2; }
       const kind = flags.kind ?? 'fix';
       if (!AWAIT_VERIFY_KINDS.includes(kind)) { err(`malformed --kind (one of ${AWAIT_VERIFY_KINDS.join(', ')})`); return 2; }
-      if (noPush && !(Number.isInteger(record.item) && record.item > 0)) { err('malformed: --kind=delivery|prepare needs --item=<NNN>'); return 2; }
+      if (noPush && !validItem(record.item)) { err('malformed: --kind=delivery|prepare needs --item=<NNN|queue-id>'); return 2; }
       // A fix pushes the committed sha, so its tree must BE that commit. A delivery/prepare lane pushes nothing here: its
       // verified working-tree hash is re-proven against the marker instead (a step-5 gate runs before the commit).
       if (!noPush && git(['status', '--porcelain', '--untracked-files=all']).trim()) {

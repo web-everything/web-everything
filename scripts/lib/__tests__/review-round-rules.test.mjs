@@ -5,6 +5,7 @@ import {
   projectAvoidedRounds,
 } from '../review-round-rules.mjs';
 import { resolveReviewSettings } from '../review-settings.mjs';
+import { FINDING_STATUS_VALUES } from '../verdict-ledger.mjs';
 
 const context = { repo: 'example/repo', pr: 42, symbol: 'check' };
 const finding = (overrides = {}) => ({
@@ -89,6 +90,17 @@ describe('findingIdentity', () => {
 
 describe('review history', () => {
   const rows = [{ headSha: 'a' }, { headSha: 'b' }, { headSha: 'b' }];
+  it.each([...FINDING_STATUS_VALUES, 'unknown', undefined])('counts only review statuses in finding rows: %s', (status) => {
+    const plain = [{ type: 'review-run', headSha: 'a' }];
+    const extra = { type: 'finding', headSha: 'B', status, source: 'red-team' };
+    const reviewed = ['raised', 'tolerated', 'fixed', 'carded'].includes(status);
+    expect(reviewRoundOf([...plain, extra], 'h')).toBe(reviewed ? 3 : 2);
+    expect(lastReviewedHead([...plain, extra], 'h')).toBe(reviewed ? 'b' : 'a');
+    expect(reviewRoundOf([extra], 'h')).toBe(reviewed ? 2 : 1);
+    expect(lastReviewedHead([extra], 'h')).toBe(reviewed ? 'b' : null);
+    expect(reviewRoundOf([...plain, extra], 'b')).toBe(2);
+    expect(lastReviewedHead([...plain, extra], 'b')).toBe('a');
+  });
   it.each([['b', 'a', 2], ['c', 'b', 3]])('scopes head %s against %s', (head, prior, number) => {
     expect(lastReviewedHead(rows, head)).toBe(prior);
     expect(reviewRoundOf(rows, head)).toBe(number);
