@@ -786,17 +786,23 @@ describe('JSONL store with fake filesystem', () => {
   it('ignores the removed environment state directory override for both ledger and lock', async () => {
     const previous = process.env.WE_CI_GHOST_RERUN_STATE_DIR;
     process.env.WE_CI_GHOST_RERUN_STATE_DIR = 'bypass-state';
+    // Hermetic: point the default state dir at a throwaway home so the test never names the real one.
+    const fakeHome = mkdtempSync(join(tmpdir(), 'ghost-rerun-home-'));
+    vi.stubEnv('HOME', fakeHome);
+    vi.stubEnv('USERPROFILE', fakeHome);
     try {
       const io = { mkdirSync: vi.fn(), appendFileSync: vi.fn(), rmdirSync: vi.fn(),
         statSync: vi.fn(() => ({ size: 0 })), readFileSync: vi.fn(() => '') };
       const state = createStateStore(undefined, io);
       await state.withLock(() => { state.read(); state.append({ outcome: 'test' }); });
-      const dir = join(homedir(), '.claude', 'ci-ghost-rerun');
+      const dir = join(fakeHome, '.claude', 'ci-ghost-rerun');
       expect(io.statSync).toHaveBeenCalledWith(join(dir, 'attempts.jsonl'));
       expect(io.appendFileSync).toHaveBeenCalledWith(join(dir, 'attempts.jsonl'), expect.any(String), expect.any(Object));
       expect(io.mkdirSync).toHaveBeenCalledWith(join(dir, 'operation.lock'), { mode: 0o700 });
       expect(io.rmdirSync).toHaveBeenCalledWith(join(dir, 'operation.lock'));
     } finally {
+      vi.unstubAllEnvs();
+      rmSync(fakeHome, { recursive: true, force: true });
       if (previous === undefined) delete process.env.WE_CI_GHOST_RERUN_STATE_DIR;
       else process.env.WE_CI_GHOST_RERUN_STATE_DIR = previous;
     }
