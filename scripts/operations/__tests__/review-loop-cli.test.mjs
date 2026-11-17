@@ -1886,14 +1886,14 @@ describe('post-accept advisory shadow wiring', () => {
 
 
 describe('CI-held record driver resume', () => {
-  async function fixture(max = 3) {
+  async function fixture(max = 3, { answer = CLEAN_ANSWER, ...overrides } = {}) {
     const declaration = reviewPrOperation({ readPr: input => {
       const view = stubReader({ rev: HEAD_A })(input);
       return { ...view, body: '<!-- authored-by-actor: author -->' };
     } });
     const registry = createRegistry(); registry.register(declaration);
     const store = createMemoryRunStore(), seen = [];
-    const judge = vi.fn(async () => judgeOutcome(CLEAN_ANSWER, {}));
+    const judge = vi.fn(async () => judgeOutcome(answer, {}));
     let time = 0;
     const publishGate = vi.fn(() => ({ allowed: false, headSha: HEAD_A, reason: 'required-checks-not-successful' }));
     const runNode = vi.fn(() => { throw Error('CI pending must prevent publication'); });
@@ -1910,6 +1910,7 @@ describe('CI-held record driver resume', () => {
     const args = { declaration, registry, store, sinks, argv: [...BASE_ARGV, '--json'], makeJudge: () => judge,
       mintRunId: () => 'ci-held-original', redTeamOnSkipSettings: () => ({ value: { ciHeldRecordRetryMax: max } }),
       readAcceptancePr: () => ({ headRefOid: HEAD_A, body: '<!-- authored-by-actor: author -->', comments: [] }),
+      ...overrides,
     };
     await runReviewLoopOnce(args);
     const saved = store.read('ci-held-original');
@@ -1918,6 +1919,59 @@ describe('CI-held record driver resume', () => {
       error: 'review held: CI still pending on reviewed head' });
     return { args, store, saved, judge, seen, publishGate, runNode, find };
   }
+
+  it.each(['card', 'not-real'].flatMap(result => [false, true].map(cleared => [result, cleared])))(
+    'prevention-outstanding CI-held resume rechecks live %s clearance (still holds=%s)', async (result, cleared) => {
+      const repo = BASE_ARGV[1].slice(7);
+      const original = { file: NET_PATHS[0], line: 7, summary: 'launch guard missing', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+      const seat = 'judge', key = referralFindingKey(seat, original);
+      const record = { version: 1, repo, pr: 1234, head: HEAD_A, runId: 'referred-run',
+        reviewer: mandatoryReferralReviewer('referred-run'), authorBody: '<!-- authored-by-actor: author -->',
+        attempted: true, referrals: [{ key, seat, original, finding: normalizeFinding(original) }], rulings: [] };
+      const comments = [{ body: renderReferralRecord(record), author: { login: 'web-everything' } },
+        { body: buildOperatorRulingComment({ version: 1, repo, pr: 1234, head: HEAD_A,
+          actor: 'chalbert', channel: 'operator-chat', reason: 'checked the finding', at: '2026-10-15T15:45:00Z', clearerId: 'operator-session',
+          rulings: [{ runId: record.runId, key, result, ...(result === 'card' ? { card: 'we:backlog/7-follow-up.md' } : {}) }] }),
+        author: { login: 'chalbert' } }];
+      let cardExists = true;
+      const readAcceptancePr = vi.fn(() => ({ headRefOid: HEAD_A, body: record.authorBody, comments }));
+      const fileItem = vi.fn(async () => ({ code: 0, lines: [] }));
+      const f = await fixture(3, {
+        answer: { ...PREVENTION_ANSWER, findings: PREVENTION_ANSWER.findings.map(({ impactIfUnfixed, ...finding }) => finding) },
+        acceptPolicy: { value: { unattendedAcceptRequiresCleanReferrals: true } },
+        readAcceptancePr, cardReadable: () => cardExists, fileItem,
+      });
+      expect(f.saved.verdict.verdict).toBe('prevention-outstanding');
+      expect(f.saved.findings.confirm).toBe('accept');
+      expect(fileItem).toHaveBeenCalledOnce();
+      if (!cleared) {
+        if (result === 'card') cardExists = false;
+        else comments.pop();
+      }
+      const judges = f.judge.mock.calls.length, writes = f.seen.length, checks = f.publishGate.mock.calls.length;
+      readAcceptancePr.mockClear();
+      const out = await runReviewLoopOnce({ ...f.args, findResumableRun: f.find,
+        mintRunId: () => { throw Error('fresh panel'); } });
+      expect(readAcceptancePr).toHaveBeenCalled();
+      expect(out.run.id).toBe(f.saved.id);
+      expect(f.judge).toHaveBeenCalledTimes(judges);
+      expect(f.seen).toHaveLength(writes);
+      expect(fileItem).toHaveBeenCalledOnce();
+      expect(f.runNode).not.toHaveBeenCalled();
+      if (cleared) {
+        expect(out.stopped).toBe('effect-halted');
+        expect(out.run.resumedAt).toBeTruthy();
+        expect(out.run.recordEffectResumeAttempts).toBe(1);
+        expect(out.run.cursor).toBe(f.saved.cursor);
+        expect(out.run.effects.find(e => e.type === REVIEW_EFFECTS.LABEL)).toMatchObject({ status: 'failed', unknownAttempts: 2 });
+        expect(f.publishGate.mock.calls.length).toBeGreaterThan(checks);
+      } else {
+        expect(out).toMatchObject({ code: 2, stopped: 'refused', run: f.saved });
+        expect(out.lines.join(' ')).toMatch(/unattended accept held: mandatory referrals remain open/);
+        expect(f.store.read(f.saved.id)).toEqual(f.saved);
+        expect(f.publishGate).toHaveBeenCalledTimes(checks);
+      }
+    });
 
   it('re-runs a failed notApplied label swap in place, rechecks pending CI, and never starts a fresh panel', async () => {
     const f = await fixture();

@@ -723,6 +723,11 @@ export async function runReviewLoopOnce({
         persistSpent = parked.id;
       } else if (parked && parked.op === declaration.name && (resumeAdvise ? adviseAttempts : attempts) < RESUME_MAX_ATTEMPTS && rosterMatches
         && (parked.pending?.kind === 'confirm' || unfinishedResume || parkedEvidence?.referralStageRefused || suspendedEffect || retryableRecordEffect)) {
+        // CI-held accepts resume at record, bypassing confirm's live referral check. Revalidate before
+        // touching the saved run; a lost clearance needs a ruling, never a replacement panel.
+        const hold = ciHeldRecordRetry ? acceptHold(parked, { filed: true }) : null;
+        if (hold) return { code: 2, run: parked, stopped: 'refused',
+          lines: [`error: run ${parked.id} unattended accept held: ${hold}; resume after restoring clearance.`] };
         // Continue an interrupted advisory step in place: its effect history skips applied writes and refuses
         // unknown non-idempotent outcomes. Rewinding it would discard both protections. Persistence attempts do
         // not consume this later step's retry budget.
