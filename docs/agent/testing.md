@@ -4422,6 +4422,7 @@ an unpublished local head, an exact-head pass, and another head's fingerprinted 
 the resolved local SHA without fetching the unpublished lane ref. A failed diff or main fetch still
 refuses. Include valid JSON negative records with invalid timestamps or contradictory findings next
 to an older pass, plus carried and waived paths; malformed records require repair before re-auditing.
+
 ## Bounded red-team probe fairness
 
 `red-team-dispatch-queue.test.mjs` pins the two-probe limit per repository and
