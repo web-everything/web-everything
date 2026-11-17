@@ -8,6 +8,8 @@ import {ordinaryPathKeyFinding} from '../forge-exec-manifest.mjs';
 import {keyBearingFixtureNames} from './forge-key-structure-fixtures.mjs';
 
 describe('forge-key-structure: tracked files (whole repository)',()=>{
+  // test-timings.json records 280s for this full-tree scan. Match the manifest
+  // test's CI headroom without changing the scanner's per-blob performance bound.
   it('pins the key-bearing fixtures in the repository tracked files',()=>{
     const files=new Set(execFileSync('git',['ls-files','-z'],{maxBuffer:1<<26}).toString().split('\0').filter(Boolean));
     const deleted=new Set(execFileSync('git',['ls-files','--deleted','-z'],{maxBuffer:1<<26}).toString().split('\0').filter(Boolean));
@@ -18,5 +20,5 @@ describe('forge-key-structure: tracked files (whole repository)',()=>{
       if(ordinaryPathKeyFinding(readFileSync(file)))hits.push(file);
     }
     expect(hits.sort()).toEqual([...keyBearingFixtureNames].sort());
-  },120000);
+  },600000);
 });

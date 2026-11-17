@@ -9,6 +9,8 @@ import {buildManifest,defaultExec} from '../remote-exec.mjs';
 import {keyBearingFixtureNames} from './forge-key-structure-fixtures.mjs';
 
 describe('operator send-back IC_kwDORBt1-c8AAAABnW58dw: tracked fixture exclusion (whole repository)',()=>{
+  // test-timings.json records 330s for this full-tree scan. Keep a finite
+  // deadline with CI headroom; the scanner's per-blob performance bound is separate.
   it('builds the real repository manifest with tracked fixtures excluded',async()=>{
     const cwd=realpathSync(new URL('../../..',import.meta.url));
     const files=execFileSync('git',['ls-files','-z'],{cwd,maxBuffer:1<<26}).toString().split('\0').filter(Boolean);
@@ -33,5 +35,5 @@ describe('operator send-back IC_kwDORBt1-c8AAAABnW58dw: tracked fixture exclusio
         expect([...shipped].some(path=>path.startsWith(file+'/')),file).toBe(true);
       } else expect(Number(shipped.has(file))+Number(excluded.has(file)),file).toBe(1);
     }
-  },180000);
+  },600000);
 });
