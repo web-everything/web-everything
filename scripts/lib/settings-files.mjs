@@ -17,6 +17,9 @@
  *
  * Every reader of these settings keeps its own `env` override and built-in default; this module only replaces
  * "read the one file" with "read the merged layers". Never throws.
+ * readSettingsChecked reports global read taint and removes duplicate leaves; lenient readers stay last-wins.
+ * R969 F2: safety keys will REFUSE (throw) on taint; tuning keys use the default plus a health smell.
+ * The per-key registry is intentionally empty in S1 and filled by S2 as resolvers migrate; unlisted = unclassified.
  */
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -28,6 +31,13 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 export const SETTINGS_DIR = resolve(HERE, '../settings');
 /** The legacy shared file, read first for compatibility. */
 export const LEGACY_SETTINGS_PATH = resolve(HERE, '../dispatch-settings.json');
+
+/** Leaf path -> 'safety' | 'tuning'; classification is applied by migrating resolvers. */
+export const SETTING_KEY_CLASSES = Object.freeze({});
+export const SETTING_CLASSES = Object.freeze(['safety', 'tuning']);
+export function settingKeyClass(path) {
+  return Object.hasOwn(SETTING_KEY_CLASSES, path) ? SETTING_KEY_CLASSES[path] : undefined;
+}
 
 /**
  * The leaves the legacy file may hold — frozen as of 2026-10-09. `freeze.mainRed` is listed because the in-flight
@@ -129,26 +139,144 @@ export function mergeSettingsLayers(layers) {
  * @returns {{settings:object, owners:Record<string,string>, duplicates:Array<{path:string,sources:string[]}>,
  *   sources:string[], errors:Array<{source:string, error:string}>}}
  */
-export function readDeclaredSettings({ dir = SETTINGS_DIR, legacyPath = LEGACY_SETTINGS_PATH } = {}) {
+export function readDeclaredSettings(o) {
+  const { layers, errors } = loadSettingsLayers(o);
+  return { ...mergeSettingsLayers(layers), sources: layers.map((l) => l.source), errors };
+}
+
+// Scan only already-valid JSON. Strings are consumed as tokens so punctuation inside them cannot affect
+// container tracking; decoded names catch escape-equivalent keys. Keep one key set per open object.
+function checkedFileKeys(text) {
+  const containers = [];
+  let dotted = false;
+  let duplicate = false;
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (char === '{') containers.push(new Set());
+    else if (char === '[') containers.push(null);
+    else if (char === '}' || char === ']') containers.pop();
+    else if (char === '"') {
+      const start = i++;
+      while (i < text.length && text[i] !== '"') {
+        if (text[i] === '\\') i++;
+        i++;
+      }
+      let next = i + 1;
+      while (/\s/.test(text[next] ?? '') && next < text.length) next++;
+      if (text[next] !== ':') continue;
+      const key = JSON.parse(text.slice(start, i + 1));
+      const keys = containers.at(-1);
+      dotted ||= key.includes('.');
+      duplicate ||= keys.has(key);
+      keys.add(key);
+    }
+  }
+  return { dotted, duplicate };
+}
+
+// Keep historical error messages separate from the bounded, content-free checked diagnostics.
+function loadSettingsLayers({ dir = SETTINGS_DIR, legacyPath = LEGACY_SETTINGS_PATH } = {}, checked = false) {
   const layers = [];
   const errors = [];
-  const load = (source, path) => {
+  const taint = [];
+  const recordError = (source, e, reason) => {
+    if (e?.code === 'ENOENT') return;
+    errors.push({ source, error: String(e?.message ?? e) });
+    taint.push({ source, reason: String(reason).slice(0, 200) });
+  };
+  const load = (source, path, listed = false) => {
+    let parsing = false;
     try {
-      const data = JSON.parse(readFileSync(path, 'utf8'));
-      if (!isPlainObject(data)) { errors.push({ source, error: 'not a JSON object' }); return; }
+      const text = readFileSync(path, 'utf8');
+      parsing = true;
+      const data = JSON.parse(text);
+      if (checked) {
+        const { dotted, duplicate } = checkedFileKeys(text);
+        if (dotted) taint.push({ source, reason: 'dotted key' });
+        if (duplicate) taint.push({ source, reason: 'duplicate key in file' });
+      }
+      if (!isPlainObject(data)) {
+        errors.push({ source, error: 'not a JSON object' });
+        taint.push({ source, reason: 'not a JSON object' });
+        return;
+      }
       layers.push({ source, data });
     } catch (e) {
-      if (e?.code !== 'ENOENT') errors.push({ source, error: String(e?.message ?? e) });
+      if (checked && listed && e?.code === 'ENOENT') taint.push({ source, reason: 'vanished' });
+      recordError(source, e, parsing ? 'invalid JSON' : (e?.code ?? 'read error'));
     }
   };
   if (legacyPath) load('dispatch-settings.json', legacyPath);
   let names = [];
   try { names = readdirSync(dir).filter((f) => f.endsWith('.json')).sort(); } catch (e) {
     names = [];
-    if (e?.code !== 'ENOENT') errors.push({ source: 'settings/', error: String(e?.message ?? e) });
+    recordError('settings/', e, e?.code ?? 'read error');
   }
-  for (const f of names) load(`settings/${f}`, join(dir, f));
-  return { ...mergeSettingsLayers(layers), sources: layers.map((l) => l.source), errors };
+  for (const f of names) load(`settings/${f}`, join(dir, f), true);
+  return { layers, errors, taint };
+}
+
+// Checked ownership uses a trie: a literal dotted key and a nested path are distinct nodes.
+function checkedCollisions(layers) {
+  const root = { children: new Map() };
+  const visit = (parent, data, source, keys = []) => {
+    for (const [key, value] of Object.entries(data)) {
+      if (UNSAFE_KEYS.has(key) || (!keys.length && key === DOC_KEY)) continue;
+      if (!parent.children.has(key)) {
+        parent.children.set(key, { children: new Map(), owners: new Set(), leaf: false });
+      }
+      const node = parent.children.get(key);
+      node.owners.add(source);
+      if (isPlainObject(value)) visit(node, value, source, [...keys, key]);
+      else node.leaf = true;
+    }
+  };
+  for (const { source, data } of layers) visit(root, data, source);
+  const duplicates = [];
+  const collect = (parent, keys = []) => {
+    for (const [key, node] of parent.children) {
+      const path = [...keys, key];
+      if (node.leaf && node.owners.size > 1) duplicates.push({ keys: path, sources: [...node.owners] });
+      collect(node, path);
+    }
+  };
+  collect(root);
+  return duplicates;
+}
+
+/**
+ * Read a dotted namespace (empty = whole tree). An exact top-level key takes precedence, including a literal
+ * dotted key; otherwise dots separate path segments. Read failures taint every namespace because an unreadable
+ * layer could own any leaf. Dotted keys and repeated keys within a file also taint every namespace.
+ * Duplicate nodes across layers are removed and taint their ancestors, themselves and descendants.
+ * @returns {{value:unknown, taint:Array<{source:string,reason:string}>, duplicates:Array<{path:string,sources:string[]}>}}
+ */
+export function readSettingsChecked({ namespace = '', dir, legacyPath } = {}) {
+  const { layers, taint } = loadSettingsLayers({ dir, legacyPath }, true);
+  const { settings } = mergeSettingsLayers(layers);
+  const allDuplicates = checkedCollisions(layers);
+  const namespaceKeys = !namespace ? [] : Object.hasOwn(settings, namespace) ? [namespace] : namespace.split('.');
+  const isPrefix = (prefix, path) => prefix.length <= path.length && prefix.every((key, i) => key === path[i]);
+  const duplicates = allDuplicates
+    .filter(({ keys }) => isPrefix(namespaceKeys, keys) || isPrefix(keys, namespaceKeys))
+    .map(({ keys, sources }) => ({ path: keys.join('.'), sources }));
+  for (const { keys } of allDuplicates) {
+    let parent = settings;
+    for (const key of keys.slice(0, -1)) {
+      parent = parent != null && Object.hasOwn(parent, key) ? parent[key] : undefined;
+    }
+    if (isPlainObject(parent)) delete parent[keys.at(-1)];
+  }
+  for (const { path, sources } of duplicates) {
+    taint.push({ source: sources.at(-1), reason: `duplicate leaf ${path}: ${sources.join(', ')}`.slice(0, 200) });
+  }
+  let value = settings;
+  for (const key of namespaceKeys) {
+    value = value != null && Object.hasOwn(value, key) ? value[key] : undefined;
+  }
+  taint.sort((a, b) => a.source < b.source ? -1 : a.source > b.source ? 1
+    : a.reason < b.reason ? -1 : a.reason > b.reason ? 1 : 0);
+  return { value, taint, duplicates };
 }
 
 /** The merged settings object alone (what the resolvers pass as `file`). Never throws. */
