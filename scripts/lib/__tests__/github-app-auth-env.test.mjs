@@ -10,6 +10,7 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
+import { CONSTELLATION_REPOS } from '../constellation-repos.mjs';
 import {
   resolveGithubAppEnvConfig, isCacheFresh, ensureFreshGithubAppEnv, withGithubAppAuth,
   REFRESH_BUFFER_MS, defaultCachePath, findInstallationGaps, CACHE_VERSION, REQUIRED_APP_PERMISSIONS, REQUIRED_APP_REPOS,
@@ -42,6 +43,26 @@ const allRepos = vi.fn(async () => [...REQUIRED_APP_REPOS]);
  *  pre-existing test below (written before `repository_selection` existed) keeps exercising `listRepos`
  *  exactly as it did before this file added the 'all' short-circuit. */
 const selectedInfo = vi.fn(async () => ({ permissions: FULL_PERMS, repositorySelection: 'selected' }));
+
+describe('REQUIRED_APP_REPOS — fleet capability boundary', () => {
+  const fleetRepos = [
+    CONSTELLATION_REPOS.we.slug,
+    CONSTELLATION_REPOS.frontierui.slug,
+    CONSTELLATION_REPOS['plateau-app'].slug,
+  ];
+
+  it('requires the three capable repos and excludes longshore', () => {
+    expect(REQUIRED_APP_REPOS).not.toContain(CONSTELLATION_REPOS.longshore.slug);
+    expect(REQUIRED_APP_REPOS).toEqual(fleetRepos);
+    expect(Object.isFrozen(REQUIRED_APP_REPOS)).toBe(true);
+  });
+
+  it('accepts a selected installation covering the fleet without longshore access', () => {
+    expect(findInstallationGaps({
+      permissions: FULL_PERMS, repos: fleetRepos, repositorySelection: 'selected',
+    })).toEqual({ missingPermissions: [], missingRepos: [] });
+  });
+});
 
 describe('resolveGithubAppEnvConfig — opt-in, all three or none', () => {
   it('returns the config when all three env vars are set', () => {
