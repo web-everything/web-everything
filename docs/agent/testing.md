@@ -4404,3 +4404,18 @@ automatic discovery and explicit resume behind both guards and both retry budget
 Exercise pending CI after timing settings change, revoked clearance, green completion,
 and budget exhaustion after that intervening failure. Unknown pending outcomes remain
 non-replayable; CI-held provenance does not establish that a write was never applied.
+
+Review lane setup uses one hardened environment for the config scrub, origin validation and fetch.
+Global and system config point at the same temporary empty file, system config is disabled, and
+inherited indexed config and config-source overrides are removed before applying the hardening
+pins. The empty file is removed on success or failure. Lane setup reuses `scrubRiskyLaneConfig`
+before fetching. Retained `origin.uploadpack` and
+`origin.vcs` must never select a command: fetch only the validated repository's explicit SSH URL,
+with the lane-pool transport pins (`protocol.ext.allow=never` and
+`--upload-pack=git-upload-pack`). `review-job-fetch-security.test.mjs` uses real local repositories
+and marker-writing helpers, proves the hostile fixtures execute through a remote-name fetch,
+then exercises the production SSH URL without networking and verifies the marker stays absent.
+Any scrub read/removal failure refuses fetching and records an infrastructure failure requiring
+lane inspection/repair. Only the scrubber's intentionally retained exact origin keys are exempt.
+SSH transport failure surfaces directly; there is no HTTPS fallback. The job suites
+cover unreadable/oversized config, inherited global and lane URL rewrites, no fallback, and terminal failure labels.

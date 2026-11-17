@@ -88,7 +88,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { heapCapArgs } from '../lib/node-heap-cap.mjs';
 import { execRead, READ_MAX_BUFFER } from '../lib/proc-read.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
-import { laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
+import { laneGitHardeningEnv, scrubGitRepoEnv, scrubRiskyLaneConfig } from '../lib/lane-git-hardening.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
 import { isPublishableRedTeamResult, liveResultGateState, parseRedTeamComment, readRedTeamProbes, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
@@ -102,8 +102,8 @@ import { RED_TEAM_STATUS_LABEL_META } from '../lib/red-team-status-label-meta.mj
 import { publishAttention } from './needs-you-feed.mjs';
 
 import { randomUUID } from 'node:crypto';
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir, hostname } from 'node:os';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, hostname, tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -450,15 +450,34 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       return { head: resolved };
     },
     prepareLane: ({ pr, repo, lanePath }) => {
+      if (!/^[\w.-]+\/[\w.-]+$/.test(repo ?? '')) throw Error('invalid review repository; inspect repo argument before retrying');
       const options = { cwd: lanePath, env, timeout: 180_000, maxBuffer: 1024 * 1024 };
       const { headRefOid: head } = JSON.parse(exec('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], options));
       if (!/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('review head missing; inspect PR evidence before retrying');
-      // Acquisition scrubs unsafe config, but command-valued pins must also apply to every lane Git call.
-      const gitOptions = { ...options, env: laneGitHardeningEnv(env) };
-      exec('git', ['fetch', '--no-tags', `https://github.com/${repo}.git`, `refs/pull/${pr}/head`], gitOptions);
-      const fetched = exec('git', ['rev-parse', 'FETCH_HEAD^{commit}'], gitOptions).trim();
-      if (fetched !== head) throw Error('review head changed during fetch; retry shared setup on the live head');
-      return { head };
+      const configDir = mkdtempSync(join(tmpdir(), 'review-git-config-'));
+      try {
+        const emptyConfig = join(configDir, 'empty');
+        writeFileSync(emptyConfig, '', { mode: 0o600 });
+        // One environment for every lane Git call: no inherited config sources or indexed overrides.
+        const gitOptions = { ...options, env: laneGitHardeningEnv({ ...scrubGitRepoEnv(env),
+          GIT_CONFIG_GLOBAL: emptyConfig, GIT_CONFIG_SYSTEM: emptyConfig, GIT_CONFIG_NOSYSTEM: '1' }) };
+        const { kept } = scrubRiskyLaneConfig(lanePath, { log, run: (args, opts) => exec('git', args,
+          { ...gitOptions, ...opts }) });
+        // Only these exact origin keys are intentionally retained by the scrubber. Everything else
+        // reports a failed read/removal, including failures that leave transport URL rewrites active.
+        if (kept.some(key => !/^remote\.origin\.(?:url|pushurl|proxy|receivepack|uploadpack|vcs)$/i.test(key))) {
+          throw Error('review lane config scrub failed; inspect and repair lane configuration before retrying');
+        }
+        const origin = exec('git', ['remote', 'get-url', 'origin'], gitOptions).trim();
+        const originRepo = /^(?:git@github\.com:|ssh:\/\/git@github\.com\/|https:\/\/github\.com\/)([^/]+\/[^/]+?)(?:\.git)?\/?$/i.exec(origin)?.[1];
+        if (originRepo?.toLowerCase() !== repo.toLowerCase()) throw Error('review lane origin repository mismatch or unreadable; inspect lane before retrying');
+        // Never resolve a remote name: retained origin.uploadpack/vcs can execute lane-owned commands.
+        exec('git', ['-c', 'protocol.ext.allow=never', 'fetch', '--upload-pack=git-upload-pack',
+          '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`], gitOptions);
+        const fetched = exec('git', ['rev-parse', 'FETCH_HEAD^{commit}'], gitOptions).trim();
+        if (fetched !== head) throw Error('review head changed during fetch; retry shared setup on the live head');
+        return { head };
+      } finally { rmSync(configDir, { recursive: true, force: true }); }
     },
     readRedTeamOnlyPayload: ({ pr, repo, head }) => {
       const w = readWitness({ pr, repo, head });
