@@ -59,11 +59,12 @@ export function parsePrResultTable(log, prNumber) {
   let ok = true;
   for (let i = 0; i < lines.length; i++) {
     const m = /^#(\d+):/.exec(lines[i]);
-    if (!m || (prNumber !== undefined && Number(m[1]) !== Number(prNumber))) continue;
+    if (!m) continue;
+    // Other PRs' tables are validated as strictly as ours: a header injected into a log must not hide our rows.
+    const mine = prNumber === undefined || Number(m[1]) === Number(prNumber);
     const tableHeader = /^#(\d+): (PASS|HOLD)\s*$/.exec(lines[i]);
     if (!tableHeader) return { error: 'unknown verdict or malformed PR verdict header' };
-    if (start < 0) { start = i; header = tableHeader; }
-    lastStart = i;
+    if (mine) { if (start < 0) { start = i; header = tableHeader; } lastStart = i; }
     const tableResults = [], seen = new Set();
     for (let j = i + 1; j < lines.length; j++) {
       const line = lines[j];
@@ -91,6 +92,7 @@ export function parsePrResultTable(log, prNumber) {
     const missing = GATE_IDS.filter(id => !seen.has(id));
     if (missing.length) return { error: `incomplete verdict table, missing gates: ${missing.join(', ')}` };
     if (!tableResults.length || (tableHeader[2] === 'HOLD') !== tableResults.some(blocking)) return { error: 'verdict header disagrees with rows' };
+    if (!mine) continue;
     results.push(...tableResults);
     if (tableHeader[2] === 'HOLD') ok = false;
   }
