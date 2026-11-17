@@ -1,3 +1,4 @@
+import { ciJobLogApiArgs } from '../lib/gh-ci-log.mjs';
 import { greenLedgerDir, hasGreenLedger } from '../lib/lane-verify.mjs';
 import { unread } from './dispatch-eligibility.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
@@ -889,7 +890,7 @@ export function defaultReadMainFixedSignatureFacts({
     root ??= resolveLanePoolRepoPath(repo) ?? REPO_ROOT;
     const options = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
       maxBuffer: 64 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' };
-    const log = exec('gh', ['api', `repos/${repo}/actions/jobs/${jobId}/logs`], options);
+    const log = exec('gh', ciJobLogApiArgs(`repos/${repo}/actions/jobs/${jobId}/logs`), options);
     const messages = extractCiErrorSignatures(log);
     if (!messages.length) return { signatures: [] };
     const git = (args) => exec('git', ['-C', root, ...args], options).trim();
@@ -2095,11 +2096,17 @@ function readTimeoutEvidenceOnce(pr, { repo, exec = execFileSyncThrottled, ts, r
   const plainApi = (path, raw = false) => {
     const remaining = deadline - Date.now();
     if (remaining <= 0) throw new Error('evidence-read-deadline');
-    const value = exec('gh', ['api', path], { encoding: 'utf8', timeout: remaining, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
+    const value = exec('gh', raw ? ciJobLogApiArgs(path) : ['api', path], { encoding: 'utf8', timeout: remaining, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
     return raw ? String(value) : JSON.parse(value);
   };
   const api = reader?.api ?? plainApi;
-  const readLog = reader?.readLog ?? ((job) => plainApi(`repos/${repo}/actions/jobs/${job.id}/logs`, true));
+  const rawLog = reader?.readLog ?? ((job) => plainApi(`repos/${repo}/actions/jobs/${job.id}/logs`, true));
+  const readLog = job => {
+    try { return rawLog(job); } catch (error) {
+      if (isEvidenceReadTimeout(error)) throw error;
+      throw Object.assign(new Error('log-unreadable'), { reason: 'log-unreadable', cause: error });
+    }
+  };
   const factsGate = reader || factsOverride ? (factsOverride ?? checkFixFacts)({ repo, number: pr.number, head: pr.headRefOid }) : null;
   if (factsGate?.stale) return { eligible: false, reason: `timeout-evidence:${factsGate.reason}` };
   const head = pr.headRefOid;
@@ -2194,7 +2201,9 @@ function readTimeoutEvidenceOnce(pr, { repo, exec = execFileSyncThrottled, ts, r
     return result;
   } catch (error) {
     if (isEvidenceReadTimeout(error)) return { eligible: false, unknown: true, reason: `timeout-evidence-unknown:${error.message}` };
-    return { eligible: false, reason: `timeout-evidence:${error.message}` };
+    return error.reason === 'log-unreadable'
+      ? { eligible: false, reason: 'log-unreadable' }
+      : { eligible: false, reason: `timeout-evidence:${error.message}` };
   }
 }
 

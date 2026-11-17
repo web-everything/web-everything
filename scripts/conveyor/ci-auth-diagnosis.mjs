@@ -1,3 +1,4 @@
+import { ciJobLogApiArgs } from '../lib/gh-ci-log.mjs';
 /** Read-only, attempt-scoped CI credential evidence; never reads credential values. */
 import yaml from 'js-yaml';
 import { runGhSync } from '../lib/gh-throttle.mjs';
@@ -38,6 +39,21 @@ function jobNames(id, definition) {
   }).filter((n) => !n.includes('${{'));
 }
 
+// Preserve historical run-view evidence; raw job API lines need unique step time attribution.
+function stepLogLines(log, job, step) {
+  return String(log ?? '').split('\n').flatMap(line => {
+    const parts = line.split('\t');
+    if (parts[0] === job.name && parts[1] === step.name) return [parts.slice(2).join('\t')];
+    const match = /^(\d{4}-\d\d-\d\dT[\d:.]+Z)\s+(.*)$/.exec(line);
+    if (!match || job.steps.some(s => s.conclusion !== 'skipped'
+      && (!timestamp(s.started_at) || !timestamp(s.completed_at)))) return [];
+    const at = Date.parse(match[1]);
+    const owners = job.steps.filter(s => timestamp(s.started_at) && timestamp(s.completed_at)
+      && at >= Date.parse(s.started_at) && at <= Date.parse(s.completed_at));
+    return owners.length === 1 && owners[0] === step ? [match[2]] : [];
+  });
+}
+
 /** Pure evidence -> allowlisted diagnosis. Logs and workflow text never leave this boundary. */
 export function diagnoseCiAuth(evidence = {}) {
   try {
@@ -61,12 +77,9 @@ export function diagnoseCiAuth(evidence = {}) {
       if (!Array.isArray(job.steps) || typeof logs?.[job.id] !== 'string') return unresolved('Failed-step logs are unavailable.');
       for (const step of job.steps.filter((s) => s.conclusion === 'failure')) {
         if (job.steps.filter((s) => s.name === step.name).length !== 1) return unresolved('Repeated step labels within a job make log attribution ambiguous.');
-        const lines = logs[job.id].split('\n').filter((line) => {
-          const parts = line.split('\t');
-          return parts[0] === job.name && parts[1] === step.name;
-        });
+        const lines = stepLogLines(logs[job.id], job, step);
         if (!lines.length) return unresolved('Failed-step logs could not be correlated to the job and step.');
-        if (lines.some((line) => /bad credentials|authentication failed|\bHTTP\s*401\b/i.test(line.split('\t').slice(2).join('\t')))) {
+        if (lines.some((line) => /bad credentials|authentication failed|\bHTTP\s*401\b/i.test(line))) {
           candidates.push({ job, step });
         }
       }
@@ -123,9 +136,8 @@ function sourceCheckoutRevisions(workflow, jobs, logs, repo) {
         || (step.with?.repository && step.with.repository !== repo)) continue;
       const actual = job.steps?.find((s) => s.number === i + 2 && s.conclusion === 'success');
       if (!actual || (step.name && step.name !== actual.name)) continue;
-      const lines = String(logs[job.id] ?? '').split('\n').map((l) => l.split('\t'))
-        .filter((parts) => parts[0] === job.name && parts[1] === actual.name)
-        .map((parts) => parts.slice(2).join('\t').replace(/^\d{4}-\d\d-\d\dT\S+\s+/, ''));
+      const lines = stepLogLines(logs[job.id], job, actual)
+        .map(line => line.replace(/^\d{4}-\d\d-\d\dT\S+\s+/, ''));
       for (let n = 0; n < lines.length - 1; n++) {
         if (/^\[command\].*\bgit log -1 --format=(?:%H|['"]%H['"])$/.test(lines[n]) && SHA.test(lines[n + 1].trim())) revisions.add(lines[n + 1].trim());
       }
@@ -155,7 +167,7 @@ export function collectCiAuthDiagnosis(input = {}, { read = runGhSync, now = () 
     const logs = {};
     for (const job of failed) {
       if (!positive(job.id)) return unavailable('Job identifier is malformed.');
-      try { logs[job.id] = get(['run', 'view', String(runId), '--repo', repo, '--attempt', String(attempt), '--job', String(job.id), '--log']); }
+      try { logs[job.id] = get(ciJobLogApiArgs(`repos/${repo}/actions/jobs/${job.id}/logs`)); }
       catch { /* Partial evidence is explained by the formatter. */ }
     }
     const file = json(['api', `${root}/contents/${run.path}?ref=${run.head_sha}`]);

@@ -77,7 +77,7 @@ describe('settings and row evidence', () => {
     expect(readVerdict).not.toHaveBeenCalled();
   });
   it('reads and caches immutable job evidence with throttled gh', () => {
-    const runGh = vi.fn(args => args[1].endsWith('/logs') ? candidacy : JSON.stringify({ head_sha: sha, completed_at: '2026-10-12T11:56:08Z' }));
+    const runGh = vi.fn(args => args[args[1] === '--allow-escape-sequences' ? 2 : 1].endsWith('/logs') ? candidacy : JSON.stringify({ head_sha: sha, completed_at: '2026-10-12T11:56:08Z' }));
     const cache = new Map();
     const options = { repo: 'owner/repo', jobId: 123, prNumber: 4965, runGh, cache };
     expect(readMergeGateVerdict(options)).toMatchObject({ num: 4965, head_sha: sha });

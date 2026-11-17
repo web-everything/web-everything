@@ -8,20 +8,38 @@ function runner({ secrets = [secret()], runs = [run()], logs = 'step Bad credent
   const exec = (cmd, args, options) => {
     calls.push(args);
     expect(cmd).toBe('gh'); expect(options.timeout).toBeGreaterThan(0); expect(options.maxBuffer).toBeGreaterThan(0);
-    if (args[0] === 'run') { if (error) throw error; return logs; }
+    if (args[1] === '--allow-escape-sequences') { if (error) throw error; return logs; }
+    if (args[3]?.includes('/jobs?')) return JSON.stringify({ total_count: 1, jobs: [{ id: 420, conclusion: 'failure' }] });
     expect(args.slice(0, 3)).toEqual(['api', '--method', 'GET']);
     return JSON.stringify(args[3].includes('/secrets?') ? { secrets, total_count: secrets.length } : { workflow_runs: runs, total_count: runs.length });
   };
   return { exec, calls };
 }
 describe('credential metadata collector', () => {
+  it('refuses incomplete attempt jobs and combined logs beyond the existing output bound', () => {
+    const base = runner();
+    const exec = (_cmd, args, options) => {
+      if (args[3]?.includes('/jobs?')) return JSON.stringify({ total_count: 2, jobs: [{ id: 420, conclusion: 'failure' }] });
+      return base.exec(_cmd, args, options);
+    };
+    expect(collect({ now, repos: ['a/b'], exec }).repositories[0].ci).toEqual({ complete: false, errors: ['incomplete'] });
+    const large = runner();
+    const bounded = (_cmd, args, options) => {
+      if (args[3]?.includes('/jobs?')) return JSON.stringify({ total_count: 2, jobs: [420, 421].map(id => ({ id, conclusion: 'failure' })) });
+      if (args[1] === '--allow-escape-sequences') return 'x'.repeat(600);
+      return large.exec(_cmd, args, options);
+    };
+    const result = collect({ now, repos: ['a/b'], maxBytes: 1000, exec: bounded });
+    expect(result.repositories[0].ci).toEqual({ complete: false, errors: ['output-limit'] });
+    expect(result.ciFindings).toEqual([]);
+  });
   it('collects all repositories, projects allowlists and never retains logs or extra API fields', () => {
     const { exec, calls } = runner(); const result = collect({ now, exec });
     expect(result.repositories).toHaveLength(3); expect(result.secrets).toHaveLength(3);
     expect(result.secrets.map((r) => r.repo)).toEqual([...DEFAULT_REPOS].sort());
     expect(result.ciFindings.every((r) => r.badCredentials)).toBe(true);
     expect(JSON.stringify(result)).not.toContain('SECRET_CANARY');
-    expect(calls.filter((a) => a[0] === 'run')[0]).toEqual(['run', 'view', '42', '--repo', 'frontier-ui/frontierui', '--attempt', '1', '--log-failed']);
+    expect(calls.filter((a) => a[1] === '--allow-escape-sequences')[0]).toEqual(['api', '--allow-escape-sequences', 'repos/frontier-ui/frontierui/actions/jobs/420/logs']);
   });
   it('paginates secrets and deduplicates; retains partial rows on a later denial', () => {
     const page = Array.from({ length: 100 }, (_, i) => secret(`S_${i}`));
@@ -47,13 +65,13 @@ describe('credential metadata collector', () => {
   it('reuses only successful run/attempt observations and retries missing logs', () => {
     const initial = collect({ now, repos: ['a/b'], exec: runner().exec });
     const cached = runner(); collect({ now: now + 1000, repos: ['a/b'], cache: initial.ciFindings, exec: cached.exec });
-    expect(cached.calls.filter((a) => a[0] === 'run')).toHaveLength(0);
+    expect(cached.calls.filter((a) => a[1] === '--allow-escape-sequences')).toHaveLength(0);
     const next = runner({ runs: [run({ run_attempt: 2 })] }); collect({ now, repos: ['a/b'], cache: initial.ciFindings, exec: next.exec });
-    expect(next.calls.filter((a) => a[0] === 'run')).toHaveLength(1);
+    expect(next.calls.filter((a) => a[1] === '--allow-escape-sequences')).toHaveLength(1);
     const failed = collect({ now, repos: ['a/b'], exec: runner({ error: new Error('SECRET_CANARY') }).exec });
     expect(failed.ciFindings).toEqual([]); expect(failed.repositories[0].ci.complete).toBe(false);
     const retry = runner(); collect({ now, repos: ['a/b'], cache: failed.ciFindings, exec: retry.exec });
-    expect(retry.calls.filter((a) => a[0] === 'run')).toHaveLength(1);
+    expect(retry.calls.filter((a) => a[1] === '--allow-escape-sequences')).toHaveLength(1);
     expect(JSON.stringify(failed)).not.toContain('SECRET_CANARY');
   });
   it.each([['ETIMEDOUT', 'timeout'], ['ENOBUFS', 'output-limit'], ['OTHER', 'unavailable']])('bounds error %s', (code, expected) => {

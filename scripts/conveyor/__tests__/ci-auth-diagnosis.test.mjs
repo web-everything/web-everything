@@ -119,7 +119,10 @@ function reader(e, calls, failAt) {
     expect(options.throttle.maxAttempts).toBe(1);
     if (args[0] === failAt) throw new Error('CANARY_SECRET_VALUE');
     if (args[0] === 'secret') return JSON.stringify(e.secrets);
-    if (args[0] === 'run') return e.logs[args[args.indexOf('--job') + 1]];
+    if (args[1] === '--allow-escape-sequences') {
+      if (failAt === 'run') throw new Error('CANARY_SECRET_VALUE');
+      return e.logs[/jobs\/(\d+)\/logs$/.exec(args[2])[1]];
+    }
     if (args[1].includes('/git/commits/')) return JSON.stringify(e.workflowCommit);
     if (args[1].includes('/jobs?')) return JSON.stringify({ total_count: e.jobs.length, jobs: e.jobs });
     if (args[1].includes('/contents/')) return JSON.stringify({ encoding: 'base64', content: Buffer.from(e.workflow).toString('base64') });
@@ -128,12 +131,30 @@ function reader(e, calls, failAt) {
 }
 
 describe('read-only collection bounds and failure isolation', () => {
+  it('attributes raw ANSI job API logs to the unique failed step interval', () => {
+    const e = fixture();
+    Object.assign(e.jobs[0].steps[0], { started_at: '2026-09-29T21:19:59Z', completed_at: '2026-09-29T21:20:01Z' });
+    e.logs[42] = '2026-09-29T21:20:00Z \x1b[31m##[error]Bad credentials\x1b[0m';
+    const calls = [];
+    expect(collectCiAuthDiagnosis(input, { read: reader(e, calls) }).status).toBe('resolved');
+    expect(calls).toContainEqual(['api', '--allow-escape-sequences', `repos/${repo}/actions/jobs/42/logs`]);
+  });
+  it('refuses ambiguous or missing raw-log step attribution', () => {
+    const e = fixture();
+    e.logs[42] = '2026-09-29T21:20:00Z ##[error]Bad credentials';
+    expect(collectCiAuthDiagnosis(input, { read: reader(e, []) }).status).toBe('unresolved');
+    Object.assign(e.jobs[0].steps[0], { started_at: '2026-09-29T21:19:59Z', completed_at: '2026-09-29T21:20:01Z' });
+    e.jobs[0].steps.push({ ...e.jobs[0].steps[0], number: 3, name: 'other', conclusion: 'success' });
+    expect(collectCiAuthDiagnosis(input, { read: reader(e, []) }).status).toBe('unresolved');
+    delete e.jobs[0].steps[1].started_at;
+    expect(collectCiAuthDiagnosis(input, { read: reader(e, []) }).status).toBe('unresolved');
+  });
   it('reads the executed revision instead of any local workflow, with exact attempt and repo', () => {
     const e = fixture(), calls = [];
     const result = collectCiAuthDiagnosis(input, { read: reader(e, calls), now: () => e.observedAt });
     expect(result.status).toBe('resolved');
     expect(calls).toContainEqual(['api', `repos/${repo}/contents/.github/workflows/ci.yml?ref=${revision}`]);
-    expect(calls).toContainEqual(['run', 'view', String(input.runId), '--repo', repo, '--attempt', '1', '--job', '42', '--log']);
+    expect(calls).toContainEqual(['api', '--allow-escape-sequences', `repos/${repo}/actions/jobs/42/logs`]);
     expect(calls).toContainEqual(['secret', 'list', '--repo', repo, '--json', 'name,updatedAt']);
     expect(calls).toHaveLength(6);
   });

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readCiJobLog } from '../lib/gh-ci-log.mjs';
 import { buildStandDownComment } from '../conveyor/stand-down.mjs';
 import { repeatedFindingPlan, applyScopeReset, resolveFixSafety } from '../conveyor/repeated-finding-reset.mjs';
 /**
@@ -421,7 +422,8 @@ export async function readCiHealInputs({ repo, pr, run = sh }) {
     let log = '';
     try {
       if (!slug) slug = String(await run('gh', ['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'])).trim();
-      log = cleanCiLog(await run('gh', ['api', `repos/${slug}/actions/jobs/${id}/logs`], { maxBuffer: BLOB_MAX_BYTES }));
+      const result = await readCiJobLog({ repo: slug, jobId: id, exec: run, opts: { maxBuffer: BLOB_MAX_BYTES } });
+      if (result.ok) log = cleanCiLog(result.text);
     } catch { /* one inaccessible job must not refuse the repair */ }
     jobs.push({ name: check.name, detailsUrl: check.detailsUrl, log });
   }

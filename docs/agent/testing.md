@@ -4411,3 +4411,7 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+## GitHub Actions job-log readers
+
+Use `ciJobLogApiArgs` or `readCiJobLog` from `scripts/lib/gh-ci-log.mjs` for every job-log read, with the caller’s existing throttled exec wrapper and output limits. The shared transport permits ANSI bytes and returns raw text; display callers retain their own control-character cleanup. A failed log read is `log-unreadable`: it refuses evidence-based mechanical reruns while ordinary bounded repair remains available. Actual request timeouts stay unknown and retry. The structural regression in `scripts/lib/__tests__/gh-ci-log.test.mjs` checks both `scripts/` and `skills-src/` for bypasses.

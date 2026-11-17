@@ -1,3 +1,4 @@
+import { ciJobLogApiArgs } from './gh-ci-log.mjs';
 /** Queue admission and removal share this policy and head-bound red-team evidence. */
 import { inspectMqReruns, requestMqReruns } from './drain-mq-flake-rerun.mjs';
 import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
@@ -438,7 +439,7 @@ function readQuarantineCover({ repo, commit, failed, exec, quarantine, flake }) 
     }
     const unitRe = new RegExp(QUARANTINE_SAFETY_NET_DEFAULTS.unitJobPattern);
     const derived = new Set(QUARANTINE_SAFETY_NET_DEFAULTS.derivedJobs);
-    const read1 = (endpoint, max) => String(exec('gh', ['api', endpoint], { encoding: 'utf8', timeout: 60_000,
+    const read1 = (endpoint, max, log = false) => String(exec('gh', log ? ciJobLogApiArgs(endpoint) : ['api', endpoint], { encoding: 'utf8', timeout: 60_000,
       maxBuffer: max, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
     let units = 0;
     for (const check of failed) {
@@ -454,7 +455,7 @@ function readQuarantineCover({ repo, commit, failed, exec, quarantine, flake }) 
       }
       const job = JSON.parse(read1(`repos/${repo}/actions/jobs/${check.id}`, 1024 * 1024));
       if (job?.name !== check.name || mqOid(job?.head_sha) !== commit) return null;
-      const text = read1(`repos/${repo}/actions/jobs/${check.id}/logs`, 64 * 1024 * 1024);
+      const text = read1(`repos/${repo}/actions/jobs/${check.id}/logs`, 64 * 1024 * 1024, true);
       const failures = parseVitestFailures(text);
       const plain = text.replace(/\x1b\[[0-9;]*m/g, '').replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z /gm, '');
       const summary = /^\s*Tests\s+(\d+) failed\b/m.exec(plain);
@@ -516,9 +517,9 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
       && event?.__typename === 'AddedToMergeQueueEvent').length !== 1) return null;
     const oid = mqOid(removals[1].beforeCommit?.oid), removedAt = Date.parse(removals[1].createdAt);
     if (!oid || !Number.isFinite(removedAt) || !Number.isFinite(now) || removedAt > now) return null;
-    const read = (endpoint, binary = false) => {
+    const read = (endpoint, binary = false, log = false) => {
       // The staged executor owns the shared allowance, including base-reader IO and cached requests.
-      return exec('gh', ['api', `repos/${repo}/${endpoint}`], { encoding: binary ? 'buffer' : 'utf8',
+      return exec('gh', log ? ciJobLogApiArgs(`repos/${repo}/${endpoint}`) : ['api', `repos/${repo}/${endpoint}`], { encoding: binary ? 'buffer' : 'utf8',
         timeout: binary ? 120_000 : 60_000, maxBuffer: binary ? 64 * 1024 * 1024 : 4 * 1024 * 1024,
         stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } });
     };
@@ -622,7 +623,7 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
       || failureNotes.length !== 1 || failureNotes[0].message.trim() !== 'Process completed with exit code 1.') return null;
     // Additional source: vitest's own final summary block, read from a bounded tail of the failed shard log
     // only (never classified as a whole; aggregators' logs are never read). `Errors  N error(s)` marks unhandled errors.
-    const rawLog = read(`actions/jobs/${shards[0].id}/logs`, true);
+    const rawLog = read(`actions/jobs/${shards[0].id}/logs`, true, true);
     const tail = Buffer.from(rawLog).subarray(-MQ_SUMMARY_TAIL_BYTES).toString('utf8')
       .replace(/\x1b\[[0-9;]*m/g, '').replace(/^\uFEFF?\d{4}-\d\d-\d\dT[\d:.]+Z /gm, '');
     const tailLines = tail.split(/\r?\n/);
@@ -819,7 +820,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         const jobPath = /^\/([^/]+)\/([^/]+)\/actions\/runs\/([1-9][0-9]*)\/job\/([1-9][0-9]*)$/.exec(new URL(gates[0].details_url).pathname);
         if (jobPath && `${jobPath[1]}/${jobPath[2]}` === repo && new URL(gates[0].details_url).origin === 'https://github.com') {
           budget--;
-          const log = String(exec('gh', ['api', `repos/${repo}/actions/jobs/${Number(jobPath[4])}/logs`], {
+          const log = String(exec('gh', ciJobLogApiArgs(`repos/${repo}/actions/jobs/${Number(jobPath[4])}/logs`), {
             encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
           // The WHOLE gate log must be read (a hold outside a tail window would be missed): oversize fails closed.
           if (Buffer.byteLength(log, 'utf8') >= MQ_INFRA_LOG_BYTES) throw new Error('gate log too large to classify');
@@ -904,7 +905,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         try {
           if (budget <= 2) throw new Error('retry evidence budget exhausted');
           budget--;
-          const text = exec('gh', ['api', `repos/${repo}/actions/jobs/${jobId}/logs`], {
+          const text = exec('gh', ciJobLogApiArgs(`repos/${repo}/actions/jobs/${jobId}/logs`), {
             encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES,
             stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 },
           });

@@ -213,7 +213,7 @@ Read what actually failed, then make the **smallest** change that turns it green
 
 ```bash
 gh pr checks {{PR_NUM}} --repo {{REPO}}          # which required check is red
-gh run view <run-id> --log-failed --repo {{REPO}} # the failing step's log (optional, for a non-obvious break)
+Use readCiJobLog from scripts/lib/gh-ci-log.mjs with repo {{REPO}} and the failing jobId (optional, for a non-obvious break).
 ```
 
 - For **CI authentication failures** (for example Bad credentials at Checkout FUI), capture the diagnosed

@@ -134,7 +134,7 @@ describe('readMergeGateVerdict', () => {
     expect(readMergeGateVerdict({ ...args, exec })).toEqual(verdict());
     expect(exec.mock.calls.map((call) => call.slice(0, 2))).toEqual([
       ['gh', ['api', 'repos/web-everything/web-everything/actions/jobs/114754411476']],
-      ['gh', ['api', 'repos/web-everything/web-everything/actions/jobs/114754411476/logs']],
+      ['gh', ['api', '--allow-escape-sequences', 'repos/web-everything/web-everything/actions/jobs/114754411476/logs']],
     ]);
   });
   it('fails closed without a job id and does no IO', () => {

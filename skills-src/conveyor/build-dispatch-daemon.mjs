@@ -48,6 +48,7 @@ import { resolveOperationRoute, routingPolicyEnv } from '../../scripts/lib/dispa
 import { childFailure } from '../../scripts/lib/child-failure.mjs';
 import { execFileSync, execFile } from 'node:child_process';
 import { execFileSyncThrottled } from '../../scripts/lib/gh-throttle.mjs';
+import { ciJobLogApiArgs } from '../../scripts/lib/gh-ci-log.mjs';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, writeFileSync, rmSync, readFileSync, readdirSync, mkdirSync, appendFileSync, renameSync, statSync } from 'node:fs';
 import os, { tmpdir, hostname, homedir } from 'node:os';
@@ -2666,7 +2667,7 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
     // GitHub Actions often publishes no annotations; retrieve the job's actual first error.
     const job = /\/job\/(\d+)/.exec(failed.details_url ?? '')?.[1];
     if (job && !annotations.some(a => a.annotation_level === 'failure')) {
-      const log = String(gh(['run', 'view', '--repo', repo, '--job', job, '--log-failed']));
+      const log = String(gh(ciJobLogApiArgs(`repos/${repo}/actions/jobs/${job}/logs`)));
       firstError = log.split('\n').find(line => /##\[error\]|AssertionError|(?:^|\s)FAIL\s|Error:/.test(line)) || firstError;
     }
     candidates.push({ pr: pr.number, num, itemNum: num, repo: 'we', laneRef: p.head.ref, headRefOid: p.head.sha,

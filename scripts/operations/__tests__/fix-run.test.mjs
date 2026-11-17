@@ -2074,7 +2074,7 @@ describe('launcher CI inputs, card 5947 (live #5045, 2026-10-13)', () => {
       ...Array.from({ length: 6 }, (_, i) => ({ name: `check-${i}`, conclusion: i === 1 ? 'timed_out' : 'failure', detailsUrl: `https://github.com/o/r/actions/runs/1/job/${i + 1}` }))];
     const run = vi.fn((cmd, args) => {
       if (args.includes('view')) return JSON.stringify({ title: 'T', body: 'B', statusCheckRollup: checks });
-      if (args[1].endsWith('/1/logs')) throw new Error('404');
+      if (args[args[1] === '--allow-escape-sequences' ? 2 : 1].endsWith('/1/logs')) throw new Error('404');
       return '\u001b[31m2026-10-13T13:19:27.2719622Z FAIL  a.test.mjs > test\u001b[0m\n2026-10-13T13:19:28Z Error: broken';
     });
     const inputs = await readCiHealInputs({ repo: 'o/r', pr: 7, run });
@@ -2082,7 +2082,7 @@ describe('launcher CI inputs, card 5947 (live #5045, 2026-10-13)', () => {
     expect(inputs.jobs).toHaveLength(4);
     expect(inputs.jobs[0].log).toBe('');
     expect(inputs.jobs[1].log).toBe('FAIL  a.test.mjs > test\nError: broken');
-    expect(run.mock.calls.filter(([, args]) => args[0] === 'api').map(([, args]) => args[1]))
+    expect(run.mock.calls.filter(([, args]) => args[0] === 'api').map(([, args]) => args[args[1] === '--allow-escape-sequences' ? 2 : 1]))
       .toEqual([1, 2, 3, 4].map(id => `repos/o/r/actions/jobs/${id}/logs`));
     expect(run.mock.calls[0][1]).toContain('title,body,statusCheckRollup');
     const context = renderCiHealContext(inputs);
