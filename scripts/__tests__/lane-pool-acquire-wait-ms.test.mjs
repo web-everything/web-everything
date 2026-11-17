@@ -4,12 +4,12 @@
  *   `acquire` (auto-pick, no `--lane`) read the pool as fully held/dirty and gave up on the VERY FIRST
  *   reading — no retry, no backoff — even though the pool freed up again within minutes under real
  *   concurrent load (PR #1908's independent review, `we:backlog/3383-*.md`). `acquire --wait-ms=<total>` is
- *   the fix: an OPT-IN bounded poll (no busy-wait; `sleepSyncMs` reused from `we:scripts/readiness/
+ *   the fix: a bounded poll (no busy-wait; `sleepSyncMs` reused from `we:scripts/readiness/
  *   drain-lock.mjs`) that lets a momentary capacity flicker self-heal instead of failing instantly. Three
  *   properties proven with a real throwaway origin + reference checkout (mirrors `lane-pool-acquire-stale-
  *   origin.test.mjs`'s own fixture shape), no shared pool root:
  *
- *   1. Omitting `--wait-ms` reproduces TODAY's behavior byte-for-byte: instant failure, same message.
+ *   1. Explicit `--wait-ms=0` preserves instant failure with the same message.
  *   2. `--wait-ms=<bound>` self-heals: a lane released mid-wait (by a real background OS process, since
  *      `spawnSync`'s blocking acquire call would otherwise starve any same-process `setTimeout`/async
  *      callback) is picked up before the bound elapses.
@@ -18,7 +18,7 @@
  *
  * #xj4tewd — flaky on a busy CI runner: live-caught on PR #2596's and #2634's CI (~11:05Z 2026-09-25, also
  * #2643) as `AssertionError: expected 1030 to be less than 1000` (also 1011, 1003). Property 1's ONLY job is
- * proving "omitting `--wait-ms` never polls at all", but it used to prove that indirectly via a tight
+ * proving "explicit `--wait-ms=0` never polls at all", but it used to prove that indirectly via a tight
  * `elapsed < ACQUIRE_POLL_MS` wall-clock bound — and on a loaded runner, plain process/git overhead alone
  * (zero polling) can exceed one poll interval, so the assertion false-failed on a perfectly correct run.
  * Fixed by asserting the fact itself: `we:scripts/lane-pool.mjs`'s auto-pick loop now counts its own poll
@@ -121,7 +121,7 @@ function scheduleRelease(delayMs) {
 }
 
 describe('lane-pool acquire --wait-ms bounded retry/backoff on a full pool (#x3jmao3)', () => {
-  it('omitting --wait-ms fails INSTANTLY on a full pool — today\'s behavior, unchanged', () => {
+  it('--wait-ms=0 fails INSTANTLY on a full pool — behavior unchanged', () => {
     const provision = runPool(['provision', '--count=1', ...poolArgs()]);
     expect(provision.code).toBe(0);
     const hold = runPool(['acquire', '--lane=1', ...poolArgs(), '--session=holder']);
@@ -131,12 +131,12 @@ describe('lane-pool acquire --wait-ms bounded retry/backoff on a full pool (#x3j
     // #3383 — `--hard-max=1` pins acquire's own growth-on-empty ceiling at this pool's real size (1 lane), so
     // this test's actual subject (the wait/poll/fail timing) isn't masked by the SEPARATE growth-on-empty fix
     // just cloning a fresh lane instead of failing.
-    const acquire = runPool(['acquire', ...poolArgs(), '--session=picker', '--hard-max=1']);
+    const acquire = runPool(['acquire', '--wait-ms=0', ...poolArgs(), '--session=picker', '--hard-max=1']);
     const elapsed = Date.now() - t0;
 
     expect(acquire.code).not.toBe(0);
     expect(acquire.err).toMatch(/no free lane/);
-    // #xj4tewd — the load-independent proof: no wait requested ⇒ no poll ever happens, PERIOD (not "usually
+    // #xj4tewd — the load-independent proof: explicit zero wait ⇒ no poll ever happens, PERIOD (not "usually
     // finishes before one poll interval would have elapsed", which a busy runner's own overhead can violate
     // with zero polling involved — see the file header). A generous wall-clock backstop stays alongside it,
     // only to catch a genuine hang (e.g. a wedged acquirability scan), never as the primary guard.
