@@ -12,7 +12,8 @@ import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { STAND_DOWN_LABEL } from './stand-down.mjs';
 import { bindAgents, assessLiveness } from './reconcile-core.mjs';
-import { planSendBacks, pendingOnly, headKey, validHead } from './review-sendback.mjs';
+import { planSendBacks, pendingOnly, headKey, validHead, renderFindingsBody } from './review-sendback.mjs';
+import { blockRuledReferralsFor } from './review-referral-hold.mjs';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
 export function resolveSendBackPolicy({ env = process.env, log = () => {}, tool } = {}) {
@@ -31,6 +32,7 @@ export function runSendBackTick({ repo, plan, prs, agents, log = () => {},
   enabled = resolveSendBackPolicy({ log }),
   ledgerPath = join(daemonConveyorStateRoot(), 'review-sendback.json'),
   readLive = (repo, pr) => createGhProvider().readPrState(repo, pr),
+  readReferrals = (live, repo) => blockRuledReferralsFor(live, { repo }),
   execute = execFileSync, publish = publishAttention,
   readLedger = () => {
     try { return JSON.parse(readFileSync(ledgerPath, 'utf8')); }
@@ -72,7 +74,11 @@ export function runSendBackTick({ repo, plan, prs, agents, log = () => {},
           const dir = mkdtempSync(join(tmpdir(), 'review-sendback-'));
           try {
             const body = join(dir, 'findings.md');
-            writeFileSync(body, row.body, 'utf8');
+            // Re-derive the blocking findings from the LIVE comments: a withdrawn or newly pending referral
+            // since planning must never authorize the send-back.
+            const fresh = readReferrals({ ...live, number: pr.number }, repo);
+            if (!fresh.length) { log(`review-sendback: #${pr.number} referral state changed since planning; not sent`); continue; }
+            writeFileSync(body, renderFindingsBody(fresh), 'utf8');
             execute(process.execPath, ['scripts/review-set-label.mjs', String(row.prNumber), '--to=changes', `--repo=${repo}`, `--body-file=${body}`, `--expect-head=${row.headSha}`],
               { cwd: ROOT, encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 120_000 });
             ledger.sent[row.key] = true;

@@ -17,7 +17,7 @@ export function planSendBacks({ plan, prs, sentLedger = {} }) {
 }
 
 const clean = value => String(value ?? '').replace(/[\p{Cc}\p{Cf}]/gu, ' ').replace(/\s+/g, ' ').trim();
-const normal = text => clean(text).toLowerCase().replace(/[\p{P}\p{S}\s]+/gu, '');
+const normal = text => clean(text).toLowerCase().replace(/[.!?;:,\s]+$/u, '');
 export function renderFindingsBody(referrals = []) {
   const groups = [];
   for (const ref of referrals) {
@@ -25,7 +25,7 @@ export function renderFindingsBody(referrals = []) {
     if (!clean(f?.summary)) throw new Error('blocking referral has no findings text; operator attention required');
     let seat = ref.seat;
     try { seat ??= JSON.parse(ref.key)[0]; } catch { /* legacy key: retain unknown seat */ }
-    const text = normal(f.summary);
+    const text = `${clean(f.file)}|${normal(f.summary)}`;
     const location = f.file && Number.isInteger(f.line) ? `${f.file}:${f.line}` : null;
     const matches = groups.filter(g => g.texts.has(text));
     const group = matches.shift() ?? { finding: f, texts: new Set(), locations: new Set(), seats: new Set() };

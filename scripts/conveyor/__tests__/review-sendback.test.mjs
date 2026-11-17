@@ -13,7 +13,7 @@ function fixture(extra = {}) {
   let disk = { sent: {}, escalated: {} };
   const o = { repo, plan, prs: [pr], agents: [], enabled: true,
     readLedger: () => structuredClone(disk), saveLedger: v => { disk = structuredClone(v); },
-    readLive: vi.fn(() => pr), execute: vi.fn(), publish: vi.fn(), log: vi.fn(), ...extra };
+    readLive: vi.fn(() => pr), readReferrals: vi.fn(() => entry.blockRuledReferrals), execute: vi.fn(), publish: vi.fn(), log: vi.fn(), ...extra };
   return { o, tick: () => runSendBackTick(o) };
 }
 describe('review send-back', () => {
@@ -28,10 +28,19 @@ describe('review send-back', () => {
     expect(pick(pr, { ...entry, ...patch })).toEqual([]);
   });
   it('deduplicates identical normalized text across seats but keeps distinct findings at one location', () => {
-    const body = renderFindingsBody([ref('a'), ref('b', 'BROKEN   case.', 'b.js', 8), ref('c', 'other', 'b.js', 8)]);
+    const body = renderFindingsBody([ref('a'), ref('b', 'BROKEN   case.', 'a.js', 8), ref('c', 'other', 'a.js', 8)]);
     expect(body.match(/^- /gm)).toHaveLength(2);
     expect(body).toContain('seats: a, b');
     expect(body).toContain('other');
+  });
+  it('keeps distinct findings that differ only by an operator or file', () => {
+    const body = renderFindingsBody([ref('a', 'Reject x < 0', 'a.js'), ref('b', 'Reject x > 0', 'a.js'), ref('c', 'Reject x < 0', 'b.js')]);
+    expect(body.match(/^- /gm)).toHaveLength(3);
+  });
+  it('does not send when live referral state no longer owes a block', () => {
+    const { o, tick } = fixture({ readReferrals: vi.fn(() => []) }); tick();
+    expect(o.execute).not.toHaveBeenCalled();
+    expect(o.readLedger().sent).toEqual({});
   });
   it('is idempotent per head and sends again on a new head', () => {
     const { o, tick } = fixture(); tick(); tick();
