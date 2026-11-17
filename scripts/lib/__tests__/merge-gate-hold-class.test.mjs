@@ -116,6 +116,13 @@ describe('all matching PR tables fail closed', () => {
       expect(read(log).mainCiGreen).toBe(false);
     }
   });
+  it('rejects gate rows after the footer (round 3 audit)', () => {
+    const late = '  hold              codeql                 CodeQL failed';
+    for (const log of [`${review}${footer}\n${late}`, `${review}${footer}\n\n${late}`]) {
+      expect(read(log).error).toMatch(/after the merge-gate footer/);
+      expect(excuse(log)).toEqual({ rows: [row], excused: false });
+    }
+  });
   it('rejects a footer that sits between tables (truncated later invocation)', () => {
     const log = `${review}${footer}\nmain CI (ci.yml@main): green\n${review}`;
     expect(read(log).error).toBeTruthy();
@@ -491,6 +498,8 @@ describe('PR-event candidacy deferral', () => {
   const pending = () => {
     const results = ['candidate-label', 'producer-certified', 'review-hold-labels', 'review-acceptance'].map(id => held(id));
     results.push(held('ledger', 'labels: labels hold'), held('codeql', 'clear', 'pass'));
+    // Real tables list the whole inventory, so the formatted table parses without completion.
+    for (const id of GATE_IDS) if (!results.some(r => r.id === id)) results.push(held(id, 'clear', 'pass'));
     return { num: 5011, ok: false, results, blocking: results.filter(r => r.status === 'hold'), clearanceCarry: { retained: true } };
   };
   it.each(['candidate-label', 'producer-certified', 'review-hold-labels', 'review-acceptance', 'ledger'])('recognizes only candidacy holds for %s', id => {
@@ -508,7 +517,7 @@ describe('PR-event candidacy deferral', () => {
     expect(out).toMatchObject({ num: 5011, ok: true, blocking: [], clearanceCarry: input.clearanceCarry });
     expect(out.results.slice(0, 5)).toEqual(input.blocking.map(r => ({ ...r, status: 'skipped-by-policy', reason: `candidacy hold deferred to the merge_group run (mergeGate.prEventCandidacyHoldsPass=on): ${r.reason}` })));
     expect(input).toEqual(before);
-    expect(parsePrResultTable(formatPrResult(out), 5011)).toMatchObject({ ok: true, results: expect.arrayContaining(out.results) });
+    expect(rawParse(formatPrResult(out), 5011)).toMatchObject({ ok: true, results: out.results });
   });
   it.each(['merge_group', 'workflow_dispatch', undefined, null, 'PULL_REQUEST', 'pull_request_target'])('leaves event %s unchanged', mergeEvent => {
     const input = pending();

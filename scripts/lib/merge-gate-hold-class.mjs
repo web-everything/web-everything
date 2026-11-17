@@ -67,7 +67,15 @@ export function parsePrResultTable(log, prNumber) {
     const tableResults = [], seen = new Set();
     for (let j = i + 1; j < lines.length; j++) {
       const line = lines[j];
-      if (/^#\d+:|^merge-gate:/.test(line)) break;
+      if (/^#\d+:|^merge-gate:/.test(line)) {
+        // Rows after the footer are evidence the producer never printed for this table: fail closed.
+        if (line.startsWith('merge-gate:')) {
+          for (let k = j + 1; k < lines.length && (!lines[k].trim() || lines[k].startsWith('  ')); k++) {
+            if (lines[k].trim()) return { error: 'verdict rows after the merge-gate footer' };
+          }
+        }
+        break;
+      }
       if (!line.trim()) continue;
       const row = /^  (\S+)\s+(\S+)\s+(.+)$/.exec(line);
       if (!row || !statuses.has(row[1]) || !gates.has(row[2]) || seen.has(row[2])) return { error: 'invalid status, gate, duplicate or malformed verdict row' };
