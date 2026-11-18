@@ -125,6 +125,10 @@ describe('shard balance metrics', () => {
     expect(predictedBalance(Object.keys(old), fresh, 2)).toBe(1);
   });
 
+  it('refuses a balance check with negative timings', () => {
+    expect(() => predictedBalance(['a', 'b'], { a: 1, b: -1 }, 2)).toThrow(/negative/);
+  });
+
   it('refuses a balance check without measurements', () => {
     expect(() => predictedBalance(['a', 'b'], {}, 2)).toThrow(/measured timings/);
   });
