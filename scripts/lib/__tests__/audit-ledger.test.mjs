@@ -4,7 +4,8 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { evaluateAudit, evaluateAuditFile } from '../audit-ledger.mjs';
-import { appendChained, buildGenesis, sha256Line } from '../audit-ledger-chain.mjs';
+import { appendChained, appendGenesis, buildGenesis, sha256Line } from '../audit-ledger-chain.mjs';
+import { genesisLine, resealLedger } from './audit-ledger-reseal-fixture.mjs';
 import { QUESTION_HASH, findAudit } from '../../operations/codex-audit.mjs';
 import { canonicalAuditEvidence, readyEvidence } from '../../operations/prototype-load.mjs';
 import { appendEntry, readStore } from '../../operations/ruled-weakened-store.mjs';
@@ -138,7 +139,7 @@ describe('R1047 attack table', () => {
   });
   it('a reseal does not make earlier chained records waivable without an auditId', () => {
     const first = ledger([weak()]);
-    const resealed = [...first.lines, JSON.stringify({ ...buildGenesis(Buffer.from(first.text), { reseal: true }) })];
+    const resealed = [...first.lines, JSON.stringify(genesisLine(Buffer.from(first.text), { actor: 'a', reason: 'r' }).record)];
     const text = resealed.join('\n') + '\n';
     const hwm = { seq: 0, lineHash: sha256Line(resealed.at(-1)) };
     const waivers = [{ sha: HEAD, findings: weak().findings }];
@@ -147,7 +148,7 @@ describe('R1047 attack table', () => {
   it('a reseal does not promote an unchained pass to trusted legacy evidence', () => {
     const first = ledger([weak()]);
     const stale = JSON.stringify(pass({ at: '2026-11-17T11:30:00Z' }));
-    const lines = [...first.lines, stale, JSON.stringify(buildGenesis(Buffer.from(`${first.lines.join('\n')}\n${stale}\n`), { reseal: true }))];
+    const lines = [...first.lines, stale, JSON.stringify(genesisLine(Buffer.from(`${first.lines.join('\n')}\n${stale}\n`), { actor: 'a', reason: 'r' }).record)];
     const hwm = { seq: 0, lineHash: sha256Line(lines.at(-1)) };
     expect(evaluateAudit(lines.join('\n') + '\n', { ...options, hwm }).ok).toBe(false);
   });
@@ -231,16 +232,16 @@ describe('R1047 attack table', () => {
     expect(evaluate(ledger([weak({ questionHash: prior }), pass()]), { priorQuestionHashes: [{ hash: prior, acceptUntil: '2026-11-20T00:00:00Z' }] }).ok).toBe(true);
   });
   it('concurrent appendChained race stays contiguous and passes', async () => {
-    await appendChained(path, { kind: 'genesis' });
+    await appendGenesis(path);
     await Promise.all(Array.from({ length: 8 }, () => appendChained(path, pass())));
     const records = fs.readFileSync(path, 'utf8').trim().split('\n').map(JSON.parse);
     expect(records.map(r => r.seq)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8]);
     expect(evaluateAuditFile({ ledgerPath: path, ...options }).ok).toBe(true);
   });
   it('last reseal genesis re-roots the chain over every prior byte', async () => {
-    await appendChained(path, { kind: 'genesis' }); await appendChained(path, weak());
+    await appendGenesis(path); await appendChained(path, weak());
     fs.appendFileSync(path, '{corrupt\n');
-    await appendChained(path, { kind: 'genesis', reseal: true, actor: 'test', reason: 'repair' });
+    await resealLedger(path);
     await appendChained(path, pass());
     // Unknown historical bytes remain negative evidence even though the new chain is valid.
     expect(evaluateAuditFile({ ledgerPath: path, ...options }).reason).toBe('weakened');

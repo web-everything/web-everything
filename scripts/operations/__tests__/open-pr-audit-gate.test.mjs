@@ -9,7 +9,7 @@ import { classifySubmit } from '../open-pr.mjs';
 import { admitCanonicalAudit } from '../../pr-land.mjs';
 import { checkCanonicalAuditForOpen } from '../canonical-audit-gate.mjs';
 import { QUESTION_HASH } from '../codex-audit.mjs';
-import { appendChained } from '../../lib/audit-ledger-chain.mjs';
+import { appendChained, appendGenesis } from '../../lib/audit-ledger-chain.mjs';
 
 const sha = 'a'.repeat(40);
 const base = 'b'.repeat(40);
@@ -148,7 +148,7 @@ describe('open-pr canonical gate', () => {
     const dir = mkdtempSync(join(tmpdir(), 'gate-v2-'));
     try {
       const ledger = join(dir, 'audit.jsonl');
-      await appendChained(ledger, { kind: 'genesis' });
+      await appendGenesis(ledger);
       await appendChained(ledger, { head: sha, base, questionHash: QUESTION_HASH, at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED',
         findings: [], fingerprint: 'c'.repeat(64) });
       const check = () => checkCanonicalAuditForOpen({ sha, env: { WE_PLATFORM_PREFERENCES_FILE: '/prefs' }, exec: () => sha,
