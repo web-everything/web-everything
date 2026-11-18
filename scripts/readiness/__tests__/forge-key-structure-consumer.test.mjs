@@ -150,6 +150,8 @@ describe('Forge key structure consumer compatibility',()=>{
     const jwk=Buffer.from(JSON.stringify({['kt'+'y']:'oct',k:'a'}));
     for(const bytes of [jwk,...fixtures().map(({bytes})=>bytes)]) {
       const base64=bytes.toString('base64');
+      const colonHex=Buffer.from(base64).toString('hex').match(/.{2}/g).join(':');
+      detections.push(Buffer.from(colonHex),Buffer.from(colonHex.toUpperCase()));
       for(const width of [1,2,3,4,7,64])detections.push(Buffer.from(base64.match(new RegExp(`.{1,${width}}`,'g')).join('\n')));
       detections.push(Buffer.from([...bytes].map(byte=>`%${byte.toString(16).padStart(2,'0')}`).join('')),
         Buffer.from('['+[...bytes].join(',')+']'));
@@ -161,6 +163,18 @@ describe('Forge key structure consumer compatibility',()=>{
     for(const fixture of detections) {
       expect(keyStructureFinding(fixture,{precheck:false})).toBe(FINDING);
       expect(keyStructurePrecheck(fixture)).toBe(true);
+      expect(keyStructureFinding(fixture)).toBe(FINDING);
+    }
+  });
+
+  it('I4 detects colon-hex of base64 for a minimal SEC1 scalar with the default pre-check',()=>{
+    // Assemble the reported example at runtime so the tracked source contains no key.
+    const example=['4d','41','59','43','41','51','45','45','41','51','63','3d'].join(':');
+    for(const text of [example,example.toUpperCase()]) {
+      const bytes=Buffer.from(text);
+      expect(keyStructureFinding(bytes,{precheck:false})).toBe(FINDING);
+      expect(keyStructurePrecheck(bytes)).toBe(true);
+      expect(keyStructureFinding(bytes)).toBe(FINDING);
     }
   });
 

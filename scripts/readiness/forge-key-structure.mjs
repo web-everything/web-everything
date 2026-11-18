@@ -185,11 +185,12 @@ function canonicalize(bytes,emit,tick) {
 // In particular, base64 chunks of ONE character may join across whitespace. Do not
 // require a long individual token or a particular alphabet/prefix. High bytes may
 // be Unicode whitespace; NUL preserves both UTF-16 decoding paths.
+// Colon admits the canonicalizer's (?:[\da-f]{2}:)+[\da-f]{2} hex entry pattern.
 export function keyStructurePrecheck(buffer) {
   if(!Buffer.isBuffer(buffer)||buffer.length>LIMITS.bytes)return true;
   let run=0;
   for(const byte of buffer) {
-    if([0,34,37,48,91,92,123].includes(byte))return true;
+    if([0,34,37,48,58,91,92,123].includes(byte))return true;
     if((byte>=65&&byte<=90)||(byte>=97&&byte<=122)||(byte>=48&&byte<=57)
       ||[43,45,47,61,95].includes(byte)) {
       if(++run>=8)return true;
