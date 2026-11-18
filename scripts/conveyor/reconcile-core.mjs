@@ -129,7 +129,7 @@ import { OPERATOR_ANSWER_MARKER, isOperatorAnswerStandDownSuperseded, latestOper
 import { classifyPr } from '../progress-board.mjs';
 import { resolveReviewRequiredChecks } from '../lib/merge-gate-hold-class.mjs';
 import { reduceCheckState, CI_TRUTH_EXCLUDED_CHECKS } from '../operations/pr-status.mjs';
-import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
+import { collapseRollupToLatestPerName, FAILED_CHECK_CONCLUSIONS } from '../lib/rollup-collapse.mjs';
 import { isForeignCompletionSessionId, sanitizeDeniedCommand } from '../operations/completion-record.mjs';
 import { NEGOTIATION_ROUND_CAP } from '../lib/jury-core.mjs';
 import { resolveRoundCap } from '../lib/round-cap.mjs';
@@ -1574,7 +1574,10 @@ function reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra = {} }
   if (ci.allowed && annotated && ['unknown', 'fail'].includes(resolved.state)) {
     ci = { ...ci, allowed: false, reason: `unverified-review-hold: ${resolved.reasons.join(', ')}` };
   }
-  const allowed = ci.allowed || resolved.state === 'held';
+  // Excuse only failed conclusions, preserving missing-head, wrong-head and incomplete-evidence refusals.
+  const onlyFailures = ci.reason === 'ci-red' || (ci.affected.length > 0
+    && ci.affected.every(row => FAILED_CHECK_CONCLUSIONS.includes(String(row.reason).toUpperCase())));
+  const allowed = ci.allowed || (onlyFailures && resolved.state === 'held');
   if (!allowed) refuse('review-ci', {
     ...withPhase, ...extra, ci, ...earlyStartShadowFields(pr, requiredChecks),
     why: `${ci.reason}: ${ci.affected.map(row => `${row.name}=${row.reason}`).join(', ')}`,
