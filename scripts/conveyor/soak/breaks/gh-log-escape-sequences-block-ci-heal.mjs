@@ -9,7 +9,7 @@ export async function runUnattributedBuilderRecovery() {
   const root = process.env.SOAK_TREE_ROOT || fileURLToPath(new URL('../../../../', import.meta.url));
   const { cliRecoverBuilderDrafts } = await import(pathToFileURL(join(root, 'skills-src/conveyor/build-dispatch-daemon.mjs')).href);
   const stateRoot = mkdtempSync(join(tmpdir(), 'builder-unattributed-soak-'));
-  const repo = 'web-everything/web-everything', ref = 'lane/4502-delivery';
+  const repo = 'o/r', ref = 'lane/4502-delivery';
   const effects = [], violations = [];
   const io = {
     stateRoot,
