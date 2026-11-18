@@ -125,6 +125,9 @@ describe('snapshot persistence', () => {
     JSON.stringify({ at: new Date(NOW + 86400000).toISOString() }),
     JSON.stringify({ at: new Date(NOW - 1000).toISOString() }),
     JSON.stringify({ ...complete(NOW + 86400000) }),
+    JSON.stringify({ ...complete(NOW - 1000), five_hour: { used_percentage: -5, resets_at: 1 } }),
+    JSON.stringify({ ...complete(NOW - 1000), seven_day: { used_percentage: 150, resets_at: 1 } }),
+    JSON.stringify({ ...complete(NOW - 1000), seven_day: { used_percentage: 1, resets_at: -1 } }),
   ])('does not let a future-dated or incomplete previous record suppress collection', async previous => {
     const h = fileFixture(previous);
     await runAgyUsageReader(h);

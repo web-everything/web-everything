@@ -94,7 +94,8 @@ export async function runAgyUsageReader({ home = homedir(), io = fs, now = Date.
   try {
     const previous = JSON.parse(await io.readFile(target, 'utf8'));
     const at = Date.parse(previous.at);
-    const valid = w => Number.isFinite(w?.used_percentage) && Number.isFinite(w?.resets_at);
+    const valid = w => Number.isFinite(w?.used_percentage) && w.used_percentage >= 0 && w.used_percentage <= 100
+      && Number.isSafeInteger(w?.resets_at) && w.resets_at > 0;
     // Only a complete, non-future previous record may suppress collection.
     if (Number.isFinite(at) && at <= now() && valid(previous.five_hour) && valid(previous.seven_day)
       && now() - at < settings.minIntervalMinutes * 60000) return { skipped: true };
