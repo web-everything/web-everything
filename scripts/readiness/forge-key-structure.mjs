@@ -57,7 +57,7 @@ function derFinding(bytes,tick) {
 function jwkFinding(bytes) {
   const text=bytes.toString('utf8');
   if(!text.trimStart().startsWith('{'))return false;
-  let depth=0,key=null,pending=null,kty=null,oct=false,priv=false;
+  let depth=0,key=null,pending=null,anyKty=false,octKty=false,oct=false,priv=false;
   const decoded=token=>{try {return JSON.parse(token);} catch {return '';}};
   for(const match of text.matchAll(/"(?:\\[\s\S]|[^"\\])*"|\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|[{}\[\]:,]/g)) {
     const token=match[0];
@@ -70,13 +70,13 @@ function jwkFinding(bytes) {
     else if(key===null)pending=decoded(token);
     else {
       const value=decoded(token);
-      if(key==='kty')kty=value;
+      if(key==='kty'&&typeof value==='string') {anyKty=true;octKty||=value==='oct';}
       else if(value.length>0&&key==='k')oct=true;
       else if(value.length>0&&['d','p','q','dp','dq','qi'].includes(key))priv=true;
       key=null;
     }
   }
-  return (kty==='oct'&&oct)||(typeof kty==='string'&&priv);
+  return (octKty&&oct)||(anyKty&&priv);
 }
 
 // All representations (including mixed base64 alphabets) converge here, before detection.

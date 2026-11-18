@@ -135,6 +135,8 @@ describe('Forge key structure slice 1',()=>{
   it('I3 scans every duplicate JSON member, not the parsed object',()=>{
     blocked(Buffer.from(jwk(['kty','oct'],['k','abcdefghijklmn'],['k',''])));
     blocked(Buffer.from(jwk(['d','abcd'],['kty','RSA'],['d',''])));
+    blocked(Buffer.from(jwk(['kty','oct'],['k','abcdefghijklmn'],['kty','RSA'])));
+    blocked(Buffer.from(jwk(['kty','RSA'],['k','abcdefghijklmn'],['kty','oct'])));
     expect(keyStructureFinding(Buffer.from(jwk(['kty','oct'],['k',''],['k',''])))).toBeNull();
   });
   it('I1 finds a JWK inside line and block comments',()=>{
