@@ -78,6 +78,7 @@
 import { CLAUDE_HELPER_MODEL_DEFAULT, resolveClaudeHelperRoute } from './claude-helper-route.mjs';
 import { spawn as nodeSpawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import Ajv from 'ajv';
 import { fileURLToPath } from 'node:url';
 import { resolve as resolvePath, dirname, join } from 'node:path';
 import { realpathSync, statSync, existsSync, readFileSync } from 'node:fs';
@@ -90,6 +91,8 @@ import { markWorkerEnv } from '../operations/session-role.mjs';
 import { sanitizeSpawnEnv } from './gh-app-shim.mjs';
 import { quotaHoldRow } from './provider-quota-hold.mjs';
 import { redactSpawnText } from './describe-spawn-failure.mjs';
+
+const judgeSchemas = new Ajv({ strict: false });
 
 /**
  * Are these two paths the SAME DIRECTORY? By inode + device, never by comparing the strings.
@@ -298,7 +301,8 @@ function killJudgeGroup(child, fallback = true) {
 
 /** Final unparseable output, with evidence from every failed attempt. */
 export class JudgeUnparseableError extends Error {
-  constructor({ attempt, attempts, exitCode, signal, stdout, stderr, wallMs, sessionId, failedAttempts, lastEvents = [], lastToolCall = null }) {
+  constructor({ attempt, attempts, exitCode, signal, stdout, stderr, wallMs, sessionId, failedAttempts, lastEvents = [], lastToolCall = null, reason = null }) {
+    stderr = redactSpawnText(String(stderr ?? ''));
     const bytes = Buffer.byteLength(String(stdout));
     const snippet = stderrSnippet(stderr);
     const tail = String(stderr).trim().slice(-600);
@@ -306,6 +310,7 @@ export class JudgeUnparseableError extends Error {
     signal = signal ?? null;
     super(
       `judge-spawn: the juror did not emit parseable JSON on stdout (attempt ${attempt}/${attempts}, exit ${exitCode ?? 'none'}, signal ${signal ?? 'none'}, stdout ${bytes} bytes${snippet ? `, stderr: ${snippet}` : ''}${lastToolCall ? `, last tool: ${lastToolCall}` : ''}).\n`
+      + (reason ? `${reason}\n` : '')
       + `last events: ${JSON.stringify(lastEvents).slice(0, 600)}\n`
       + (tail ? `stderr[-600..]: ${tail}` : 'stderr: <empty>')
       + (lastEvents.some(e => e.truncated) ? '\nStream diagnostics were truncated; rerun with a narrower mandate to inspect the step.' : ''),
@@ -875,10 +880,12 @@ export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
 
   const value = parsed?.structured_output;
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error(
-      'judge-spawn: the juror returned no `structured_output` object — the enforced shape did not land. ' +
-      `stop_reason=${JSON.stringify(parsed?.stop_reason)} result=${JSON.stringify(parsed?.result ?? null).slice(0, 400)}`,
-    );
+    const stopReason = ['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'pause_turn', 'refusal'].includes(parsed?.stop_reason)
+      ? parsed.stop_reason : 'unknown';
+    const error = new Error(`judge-spawn: structured_output schema violation: expected an object; the juror returned no \`structured_output\` object — the enforced shape did not land (stop_reason=${stopReason}).`);
+    error.unparseableStdout = true;
+    error.verdictIntegrity = true;
+    throw error;
   }
 
   return {
@@ -987,6 +994,7 @@ export async function judgeSpawn({
   }
   const setting = retries === undefined ? resolveUnparseableRetries({ env }) : { value: retries, source: 'caller' };
   retries = setting.value;
+  const validate = judgeSchemas.compile(shape);
   const total = 1 + retries;
   const failedAttempts = [];
   let wallMs = 0;
@@ -1058,42 +1066,50 @@ export async function judgeSpawn({
     const { lastEvents, lastToolCall } = evidence;
     const thisAttemptMs = Date.now() - startedAt;
     wallMs += thisAttemptMs;
-    // A KILLED JUROR IS TRIED, NOT DISCARDED. The wall is a bound on runaway, and a juror that emitted its
-    // answer and then failed to exit has produced a perfectly good review — the old code threw it away along
-    // with the ones that really had nothing. `timedOut` rides out on the result so the run record can say which
-    // happened, because "hit the bound" and "crashed" are different facts about a review.
-    if (timedOut) {
-      let outcome = null;
-      try { outcome = parseJudgeOutcome(stdout, stderr, budget); } catch { outcome = null; }
-      if (!outcome) {
-        const error = new JudgeTimeoutError({ timeoutMs, wallMs, stdout, stderr, sessionId: thisSid, lastEvents, lastToolCall });
-        log(error.message.split('\n')[0]);
-        throw error;
-      }
-      return { ...outcome, wallMs, attempts: attempt, failedAttempts, timedOut: true, lastEvents, lastToolCall, loadedContextTokens: loadedContextTokens(outcome.usage), argv };
-    }
-    // `parseJudgeOutcome` throws with the CLI's own words; a non-zero exit with unparseable stdout lands there too.
     let outcome;
     try {
+      // Keep the CLI's explicit is_error handling (including budget/quota failures) first.
       outcome = parseJudgeOutcome(stdout, stderr || (code === 0 ? '' : `exit code ${code}`), budget);
+      if (!validate(outcome.value)) {
+        // Ajv diagnostics contain schema paths/keywords, never the returned data.
+        const violation = validate.errors[0];
+        const error = new Error(`structured_output schema violation at ${violation.schemaPath}: ${violation.message}`);
+        error.unparseableStdout = true;
+        error.verdictIntegrity = true;
+        throw error;
+      }
+      if ((code !== null && code !== 0) || (!timedOut && signal)) {
+        const error = new Error(`juror process failed (exit ${code ?? 'none'}, signal ${signal ?? 'none'})`);
+        error.unparseableStdout = true;
+        error.verdictIntegrity = true;
+        throw error;
+      }
     } catch (error) {
+      if (timedOut && !error.verdictIntegrity) {
+        const failure = new JudgeTimeoutError({ timeoutMs, wallMs, stdout, stderr, sessionId: thisSid, lastEvents, lastToolCall });
+        log(failure.message.split('\n')[0]);
+        throw failure;
+      }
       if (error.unparseableStdout !== true) throw error;
+      const safeStderr = redactSpawnText(stderr);
+      const reason = error.verdictIntegrity ? error.message : null;
       failedAttempts.push({
         attempt, sessionId: thisSid, exitCode: code ?? null, signal: signal ?? null,
-        stdoutBytes: stdout.length, stderrTail: stderr.trim().slice(-1000), wallMs: thisAttemptMs, lastEvents, lastToolCall,
+        stdoutBytes: stdout.length, stderrTail: safeStderr.trim().slice(-1000), wallMs: thisAttemptMs, lastEvents, lastToolCall,
+        ...(reason ? { reason } : {}),
       });
       if (attempt < total) {
-        const snippet = stderrSnippet(stderr);
+        const snippet = stderrSnippet(safeStderr);
         const nextSid = retrySessionId(sid, attempt + 1);
         log(`judge-spawn: juror ${lens || '-'} attempt ${attempt}/${total} emitted no parseable JSON (exit ${code ?? 'none'}, signal ${signal ?? 'none'}, stdout ${stdout.length} bytes${snippet ? `, stderr: ${snippet}` : ''}${lastToolCall ? `, last tool: ${lastToolCall}` : ''}); retrying with a fresh session id ${nextSid} — ${UNPARSEABLE_RETRY_SETTING.key}=${retries} (source: ${setting.source})`);
         continue;
       }
       const failure = new JudgeUnparseableError({
-        attempt, attempts: total, exitCode: code, signal, stdout, stderr, wallMs, sessionId: thisSid, failedAttempts, lastEvents, lastToolCall,
+        attempt, attempts: total, exitCode: code, signal, stdout, stderr, wallMs, sessionId: thisSid, failedAttempts, lastEvents, lastToolCall, reason,
       });
       log(failure.message.split('\n')[0]);
       throw failure;
     }
-    return { ...outcome, wallMs, attempts: attempt, failedAttempts, timedOut: false, loadedContextTokens: loadedContextTokens(outcome.usage), argv };
+    return { ...outcome, wallMs, attempts: attempt, failedAttempts, timedOut, ...(timedOut ? { lastEvents, lastToolCall } : {}), loadedContextTokens: loadedContextTokens(outcome.usage), argv };
   }
 }

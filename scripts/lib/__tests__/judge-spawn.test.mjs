@@ -1470,6 +1470,61 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
   }
   const sidOf = (argv) => flagValue(argv, '--session-id');
 
+  it.each([
+    [{}, /required.*verdict/],
+    [null, /expected an object/],
+    [[], /expected an object/],
+    ['SECRET-RAW-CONTENT', /expected an object/],
+    [{ verdict: 7, findings: [] }, /type.*string/],
+    [{ verdict: 'SECRET-INVALID-VERDICT', findings: [] }, /enum.*allowed values/],
+    [{ verdict: 'accept', findings: [7] }, /type.*string/],
+    [{ verdict: 'accept', findings: [], extra: 'SECRET-RAW-CONTENT' }, /additionalProperties/],
+  ])('refuses schema-invalid structured_output %j with a safe diagnostic and retries', async (value, violation) => {
+    const shape = { ...SHAPE, properties: { ...SHAPE.properties,
+      verdict: { type: 'string', enum: ['accept', 'reject'] } } };
+    const invalid = JSON.stringify({ type: 'result', structured_output: value });
+    const { fn, calls } = scriptedSpawn([{ stdout: invalid, code: 0 }]);
+    const error = await judgeSpawn({ mandate: 'm', input: 'i', shape, retries: 1,
+      log: () => {}, spawnFn: fn }).catch(e => e);
+    expect(error).toBeInstanceOf(JudgeUnparseableError);
+    expect(calls).toHaveLength(2);
+    expect(error).not.toHaveProperty('value');
+    expect(error.message).toMatch(/structured_output schema violation/);
+    expect(error.message).toMatch(violation);
+    expect(JSON.stringify(error)).not.toMatch(/SECRET-INVALID-VERDICT|SECRET-RAW-CONTENT/);
+    expect(error.message).not.toMatch(/SECRET-INVALID-VERDICT|SECRET-RAW-CONTENT/);
+    const recovered = scriptedSpawn([{ stdout: invalid, code: 0 }, { stdout: ANSWER_JSON, code: 0 }]);
+    const answer = await judgeSpawn({ mandate: 'm', input: 'i', shape, retries: 1,
+      log: () => {}, spawnFn: recovered.fn });
+    expect(answer.value.verdict).toBe('accept');
+    expect(answer.failedAttempts[0].reason).toMatch(violation);
+  });
+
+  it.each([null, 'SIGTERM'])('refuses a valid result on nonzero exit, records redacted evidence and retries (signal=%s)', async signal => {
+    const failed = { stdout: ANSWER_JSON, code: 7, signal,
+      stderr: 'x'.repeat(1500) + '\nGH_TOKEN=private-credential crash-tail' };
+    const { fn, calls } = scriptedSpawn([failed]);
+    const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, retries: 1,
+      log: () => {}, spawnFn: fn }).catch(e => e);
+    expect(error).toBeInstanceOf(JudgeUnparseableError);
+    expect(error).not.toHaveProperty('value');
+    expect(calls).toHaveLength(2);
+    expect(error.telemetry).toMatchObject({ exitCode: 7, signal, stderrTail: error.stderrTail });
+    expect(error.message).toContain('exit 7');
+    expect(error.stderrTail).toContain('crash-tail');
+    expect(error.stderrTail.length).toBeLessThanOrEqual(1000);
+    expect(error.failedAttempts).toHaveLength(2);
+    expect(error.failedAttempts[0]).toMatchObject({ exitCode: 7, signal });
+    expect(error.message + JSON.stringify(error)).not.toContain('private-credential');
+    const recovered = scriptedSpawn([failed, { stdout: ANSWER_JSON, code: 0 }]);
+    const answer = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, retries: 1,
+      log: () => {}, spawnFn: recovered.fn });
+    expect(answer.value.verdict).toBe('accept');
+    expect(answer.failedAttempts[0]).toMatchObject({ exitCode: 7, signal });
+    expect(JSON.stringify(answer.failedAttempts)).not.toContain('private-credential');
+  });
+
+
   it('retries an EMPTY stdout once and returns the second attempt\'s answer', async () => {
     const { fn, calls } = scriptedSpawn([{ stdout: '', code: 1 }, { stdout: ANSWER_JSON, code: 0 }]);
     const r = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, runId: 'run-7', lens: 'rigor', retries: 1, log: () => {}, spawnFn: fn });
