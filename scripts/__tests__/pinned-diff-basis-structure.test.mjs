@@ -1,3 +1,4 @@
+// @repo-scanning-test scope=full — ratchet: no new ref-string net-diff evidence readers across scripts.
 import { describe, it, expect } from 'vitest';
 import { readFileSync, readdirSync } from 'node:fs';
 import ts from 'typescript';

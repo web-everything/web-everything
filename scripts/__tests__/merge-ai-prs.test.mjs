@@ -16,6 +16,7 @@ import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
+import { pinnedLeafGitFixture } from './fixtures/pinned-leaf-git-fixture.mjs';
 import { buildManifest, manifestBodyBlock } from '../readiness/lane-manifest.mjs';
 import { deriveResolutionBasis, graduatedToFromBody } from '../lib/review-render.mjs';
 
@@ -222,8 +223,8 @@ describe('round listing freshness at the CLI boundary', () => {
     const dir = mkdtempSync(join(tmpdir(), 'drain-round-cli-'));
     try {
       const row = (number, item, blockedBy = []) => ({ number, title: `PR ${number}`, state: 'OPEN',
-        headRefName: `lane/${number}`, headRefOid: `sha${number}`, baseRefName: 'main', updatedAt: '2026-01-01T00:00:00Z',
-        isDraft: false, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', files: [],
+        headRefName: `lane/${number}`, headRefOid: number.toString(16).padStart(40, '0'), baseRefName: 'main', updatedAt: '2026-01-01T00:00:00Z',
+        isDraft: false, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', files: [{ path: `leaf-${number}.txt`, changeType: 'ADDED' }],
         labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', checkSuite: { workflowRun: { workflow: { name: 'test' } } } }],
         body: manifestBodyBlock(buildManifest({ item, blockedBy, repos: [{ repo: 'we', ref: `lane/${number}` }] })) });
       const target = row(42, 42, ['43']);
@@ -265,8 +266,19 @@ else if (a[0] === 'api' && a[1] === 'graphql') {
 if (a[0] === 'pr' && a[1] === 'view' && a.includes('id')) out = { id: 'PR_43' };
 fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
 `);
-      // All git operations are local fixture responses, including the CLI's identity probe.
-      writeFileSync(join(dir, 'git'), '#!/bin/sh\nif [ "$1" = remote ]; then echo https://github.com/fixture/repo.git; exit 0; fi\nexit 1\n');
+      // Model the remote base and exact local head objects, plus each leaf's scored diff.
+      writeFileSync(join(dir, 'git'), `#!/usr/bin/env node
+const fs = require('node:fs');
+const a = process.argv.slice(2);
+fs.appendFileSync(process.env.ROWS_FILE + '.git-calls', JSON.stringify(a) + '\\n');
+const rows = JSON.parse(fs.readFileSync(process.env.ROWS_FILE, 'utf8'));
+const pinned = (${pinnedLeafGitFixture})(a, rows);
+if (pinned !== null) { process.stdout.write(pinned); process.exit(0); }
+if (a[0] === 'remote' && a[1] === 'get-url') {
+  process.stdout.write('https://github.com/fixture/repo.git\\n'); process.exit(0);
+}
+process.exit(1);
+`);
       for (const name of ['gh', 'git']) chmodSync(join(dir, name), 0o755);
       const result = spawnSync(process.execPath, [resolve(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'),
         '--only=42', '--this-repo', '--label=ready-to-merge', ...(!sendBack ? ['--dry-run'] : []), ...(!reconcile ? ['--no-reconcile-labels'] : []), '--no-drain-lease', '--no-red-main-freeze', '--json', `--listing-snapshot=${snapshot}`], {
@@ -278,15 +290,20 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
       });
       expect(result.status, result.stderr).toBe(0);
       return { payload: JSON.parse(result.stdout.trim()), stderr: result.stderr,
+        gitCalls: readFileSync(join(dir, 'rows.json.git-calls'), 'utf8').trim().split('\n').map(JSON.parse),
         calls: readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse) };
     } finally { rmSync(dir, { recursive: true, force: true }); }
   };
   it('sees a blockedBy sibling opened after --listing-snapshot via live context collection', () => {
-    const { payload, stderr, calls } = run('snapshot');
+    const { payload, stderr, calls, gitCalls } = run('snapshot');
     expect(stderr).toContain('served-from-snapshot');
     expect(calls.some(a => a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequests(states:OPEN')))).toBe(true);
     expect(calls.some(a => a[0] === 'pr' && a[1] === 'view' && a[2] === '43' && a.includes('fixture/repo'))).toBe(true);
-    expect(payload.deferred).toEqual(expect.arrayContaining([expect.objectContaining({ num: 42, waitOn: expect.arrayContaining([43]) })]));
+    expect(gitCalls.filter(a => a[0] === '-c' && a.includes('fetch'))).toEqual([
+      expect.arrayContaining(['fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main']),
+    ]);
+    expect(gitCalls.some(a => a.includes('diff') && a.includes('--numstat') && a.at(-1) === '2a'.padStart(40, '0'))).toBe(true);
+    expect(payload.deferred, stderr).toEqual(expect.arrayContaining([expect.objectContaining({ num: 42, waitOn: expect.arrayContaining([43]) })]));
   });
   it('ignores --listing-snapshot when WE_FAST_DRAIN_LISTING=live', () => {
     const { stderr, calls } = run('live');
