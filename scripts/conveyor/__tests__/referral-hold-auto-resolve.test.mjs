@@ -290,6 +290,11 @@ describe('same-head holds with no referral finding (#7012)', () => {
     expect(p.refusals.map(r => r.kind)).toEqual(['review-referrals-pending']);
   });
 
+  it('a PR that is not review:human is not released by a no-finding advisory', () => {
+    const pr = { ...held(), labels: [{ name: 'advisory:accepted' }] };
+    expect(decide(pr, pr.referralHold)).toMatchObject({ outcome: 'stay', why: expect.stringMatching(/no clean advisory accept/) });
+  });
+
   it('onClean=pause keeps a no-finding same-head hold', () => {
     const pr = held();
     const settings = { value: { enabled: true, onBlock: 'send-back', onClean: 'pause' }, sources: { onClean: 'env' } };

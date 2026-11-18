@@ -656,7 +656,9 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
     const basisLines = body.split(/\r?\n/).filter(l => /net\s+basis/i.test(l)).length;
     // The advisory note must LEAD the comment (a quoted or fenced example inside another comment is not a review).
     const leads = body.trimStart().startsWith('**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.**');
-    const clean = adv && leads && readable && basisLines === 1 && sameReview && notes[0]?.i === adv.index && advisoryCoversHead(adv, head) && String(adv.head).toLowerCase() === head.toLowerCase()
+    // Only a `review:human` PR is released this way (its next step is the human /review); a non-human PR would be sent to another panel.
+    const human = (Array.isArray(pr.labels) ? pr.labels : []).some(l => (typeof l === 'string' ? l : l?.name) === 'review:human');
+    const clean = adv && human && leads && readable && basisLines === 1 && sameReview && notes[0]?.i === adv.index && advisoryCoversHead(adv, head) && String(adv.head).toLowerCase() === head.toLowerCase()
       && outcomes.length === 1 && outcomes[0] === ADVISORY_OUTCOMES.ACCEPT && adv.outcome === ADVISORY_OUTCOMES.ACCEPT;
     if (!clean) return stay(`${why}, and no clean advisory accept names the full live head`);
     if (policy.onClean !== 'resume') return stay(`no referral finding exists, but referralHoldAutoResolve.onClean=${policy.onClean} (source: ${source('onClean')}) keeps the pause`);
