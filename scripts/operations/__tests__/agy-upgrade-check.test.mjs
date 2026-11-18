@@ -133,7 +133,7 @@ describe('scheduled upgrade check', () => {
     expect(replay({ path })).toHaveLength(2);
   });
   it.each(['initial smoke', 'brew outdated', 'brew upgrade', 'post-upgrade smoke'])(
-    'refused kill in %s reports dead while locked and stops subsequent commands', async step => {
+    'refused kill in %s reports dead, keeps the lock and stops subsequent commands', async step => {
       vi.useFakeTimers();
       const f = fixture([]), kill = vi.fn(() => { throw Object.assign(Error('refused'), { code: 'EPERM' }); });
       const preceding = { 'initial smoke': [], 'brew outdated': [good], 'brew upgrade': [good, outdated],
@@ -151,7 +151,9 @@ describe('scheduled upgrade check', () => {
       expect(kill.mock.calls).toEqual([[45678, 'SIGKILL']]);
       expect(f.exec).toHaveBeenCalledTimes(preceding.length + 1);
       expect(f.alert).toHaveBeenCalledTimes(1);
-      expect(fs.existsSync(join(f.dir, 'upgrade-check.lock'))).toBe(false);
+      // The lock stays so a later tick cannot overlap the surviving child.
+      expect(fs.existsSync(join(f.dir, 'upgrade-check.lock'))).toBe(true);
+      expect(await runUpgradeCheck(f.options)).toEqual({ status: 'locked' });
     });
   it('creates the binary folder and leaves only atomic destination files', async () => {
     const f = fixture([good, current]); fs.rmdirSync(join(f.dir, 'binary'));

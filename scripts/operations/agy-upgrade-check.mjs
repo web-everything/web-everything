@@ -81,6 +81,8 @@ export async function runUpgradeCheck({ dir = agyEvidenceDir(), env = process.en
   io.mkdirSync(dir, { recursive: true });
   const lock = join(dir, 'upgrade-check.lock');
   try { io.mkdirSync(lock); } catch (e) { if (e.code === 'EEXIST') return { status: 'locked' }; throw e; }
+  // A kill that could not be confirmed leaves the lock in place: no later tick may overlap a surviving child.
+  let leaveLock = false;
   try {
     const binaryDir = join(dir, 'binary');
     io.mkdirSync(binaryDir, { recursive: true });
@@ -113,9 +115,10 @@ export async function runUpgradeCheck({ dir = agyEvidenceDir(), env = process.en
     };
     let result = await smoke({ exec, smokeTimeoutMs: settings.smokeTimeoutMs });
     await record(result);
-    if (result.reason === 'cleanup incomplete') return { status: 'dead', ...result };
+    if (result.reason === 'cleanup incomplete') { leaveLock = true; return { status: 'dead', ...result }; }
     const outdated = await exec('brew', ['outdated', '--cask', '--json=v2'], { timeoutMs: 60000 });
     const cleanupFailed = async command => {
+      leaveLock = true;
       result = { ...result, ok: false, reason: 'cleanup incomplete', hung: !!command.hung };
       await record(result);
       return { status: 'dead', ...result };
@@ -132,10 +135,11 @@ export async function runUpgradeCheck({ dir = agyEvidenceDir(), env = process.en
       if (upgrade.reason === 'cleanup incomplete') return await cleanupFailed(upgrade);
       result = await smoke({ exec, smokeTimeoutMs: settings.smokeTimeoutMs });
       await record(result);
+      if (result.reason === 'cleanup incomplete') leaveLock = true;
       if (!upgrade.ok) log('agy-upgrade: upgrade failed; operator should inspect brew upgrade --cask antigravity-cli');
     }
     return { status: result.ok ? 'ok' : 'dead', ...result };
-  } finally { io.rmdirSync(lock); }
+  } finally { if (!leaveLock) io.rmdirSync(lock); }
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
