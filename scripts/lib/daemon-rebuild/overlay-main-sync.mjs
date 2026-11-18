@@ -55,7 +55,8 @@ function testOutputFailures(result) {
   const names = [...plain.matchAll(/^[ \t]*(?:not ok\b(?:[ \t]+\d+)?(?:[ \t]+-)?|FAIL\b|[×✗])[ \t]*([^\r\n]*)/gm)]
     .map(match => cleanText(match[1].trim())).filter(Boolean);
   return { red: names.length > 0 || /^\s*(?:not ok\b|FAIL\b|[×✗])/m.test(plain)
-    || /\b[1-9]\d*\s+failed\b/i.test(plain), names };
+    || /\b[1-9]\d*\s+failed\b/i.test(plain)
+    || plain.split(/\r?\n/).some(line => UNHANDLED_ERRORS.test(line)), names };
 }
 function testStderrTail(result, evidence = {}) {
   const stderr = stripVTControlCharacters(withoutDeprecations(result?.stderr || result?.error?.message));
@@ -608,6 +609,21 @@ function testRunCause(result, selected) {
     limitMs: limit ? Number(limit[1]) : null, files: selected.length };
 }
 
+function validatePartialTestReport(report) {
+  const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+  const statuses = ['passed', 'failed', 'pending', 'skipped', 'todo', 'disabled'];
+  if (!record(report) || !Array.isArray(report.testResults)
+    || (Object.hasOwn(report, 'success') && typeof report.success !== 'boolean')
+    || ['numFailedTests', 'numFailedTestSuites'].some(key => Object.hasOwn(report, key)
+      && (!Number.isSafeInteger(report[key]) || report[key] < 0))
+    || report.testResults.some(row => !record(row) || typeof row.name !== 'string' || !row.name.trim()
+      || (Object.hasOwn(row, 'status') && !statuses.includes(row.status))
+      || !Array.isArray(row.assertionResults)
+      || row.assertionResults.some(assertion => !record(assertion) || !statuses.includes(assertion.status)))) {
+    throw new Error('invalid partial test report structure');
+  }
+}
+
 async function syncTestEvidence({ root, scratch, selected, testReport, env, io, runner }) {
   let result, invocation, cause, timeoutRetried = false;
   for (let attempt = 1; attempt <= 2; attempt++) {
@@ -626,23 +642,37 @@ async function syncTestEvidence({ root, scratch, selected, testReport, env, io, 
     // Retry only interruptions with no red evidence, including rows outside the selected files.
     const partial = { failed: [], failedAssertions: [] };
     let red = testOutputFailures(result).red;
+    let reportError;
     try {
-      if (io.statSync(reportPath).size > 8 * 1024 * 1024) throw new Error('oversized report');
-      const report = JSON.parse(io.readFileSync(reportPath, 'utf8'));
-      red ||= report.success === false || report.numFailedTests > 0 || report.numFailedTestSuites > 0;
-      const rows = Array.isArray(report.testResults) ? report.testResults : [];
-      for (const row of rows) {
-        const assertions = Array.isArray(row?.assertionResults) ? row.assertionResults : [];
-        const failed = assertions.filter(a => a?.status === 'failed');
-        if (row?.status !== 'failed' && !failed.length) continue;
-        red = true;
-        const file = selected.find(file => row.name === join(io.realpathSync(scratch), file))
-          ?? (typeof row.name === 'string' ? row.name : 'unknown test file');
-        partial.failed.push(file);
-        partial.failedAssertions.push(...failed.map(a => assertionIdentity(file, a)));
+      let stat;
+      try { stat = io.statSync(reportPath); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+      // Only ENOENT from the initial stat means no evidence. A later read failure is corrupt evidence.
+      if (stat) {
+        if (stat.size > 8 * 1024 * 1024) throw new Error('partial test report over 8 MiB');
+        const text = io.readFileSync(reportPath, 'utf8');
+        if (Buffer.byteLength(text) > 8 * 1024 * 1024) throw new Error('partial test report over 8 MiB');
+        const report = JSON.parse(text);
+        red ||= report?.success === false || report?.numFailedTests > 0 || report?.numFailedTestSuites > 0;
+        const rows = Array.isArray(report?.testResults) ? report.testResults : [];
+        for (const row of rows) {
+          const assertions = Array.isArray(row?.assertionResults) ? row.assertionResults : [];
+          const failed = assertions.filter(a => a?.status === 'failed');
+          if (row?.status !== 'failed' && !failed.length) continue;
+          red = true;
+          const file = selected.find(file => row.name === join(io.realpathSync(scratch), file))
+            ?? (typeof row.name === 'string' ? row.name : 'unknown test file');
+          partial.failed.push(file);
+          partial.failedAssertions.push(...failed.map(a => assertionIdentity(file, a)));
+        }
+        validatePartialTestReport(report);
       }
-    } catch { /* Missing or malformed reports remain incomplete, with only runner diagnostics. */ }
-    const tail = testStderrTail(result, partial);
+    } catch (error) {
+      red = true;
+      reportError = `partial test report unreadable or invalid: ${cleanText(error.message)}`;
+    }
+    const diagnostic = testStderrTail(result, partial);
+    const tail = reportError ? `${reportError.slice(0, 400)} | ${diagnostic}`.slice(0, 500) : diagnostic;
     const failedTests = testResultNames(result, partial);
     if (attempt === 1 && !red) {
       timeoutRetried = true;

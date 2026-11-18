@@ -4746,5 +4746,9 @@ attempt only when neither stdout nor stderr (ANSI stripped) nor partial JSON con
 TAP `not ok`, Vitest `FAIL`/`×`/`✗`, positive failed summary counts, and failed JSON rows (including
 extra files and unnamed assertions) block immediately with the interruption cause, `attempts: 1`,
 and failing names preserved in the diagnostic tail. A green retry cannot erase an observed failure.
+Vitest's `Unhandled Errors`/`Unhandled Rejection` headers and `Errors N error(s)` summaries also
+block retry in either output stream. Only ENOENT at the initial report stat is absent evidence:
+an existing report that cannot be read, parsed or structurally validated, or exceeds 8 MiB, blocks
+the first attempt with the report failure in the diagnostic and an operator-review escalation.
 Keep ordinary flake rerun identity/count coverage checks unchanged. Run `overlay-main-sync-rerun.test.mjs`,
 `daemon-rebuild-overlay-main-sync.test.mjs`, and the killed-run soak through heavy admission.

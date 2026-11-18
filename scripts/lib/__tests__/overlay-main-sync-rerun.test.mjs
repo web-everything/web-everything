@@ -875,9 +875,78 @@ describe('overlay main sync interrupted test runs', () => {
     noPublication(f);
   });
 
-  it('a killed run with no partial report may proceed after a complete green retry', async () => {
+  it.each(['stdout', 'stderr'].flatMap(stream => [
+    'Unhandled Errors', '⎯⎯⎯ Unhandled Rejection ⎯⎯⎯', 'Errors  1 error', 'Errors  2 errors',
+  ].map(line => [stream, line])))(
+    'interrupted unhandled-errors text in %s (%s) is not retried even with a green report', async (stream, line) => {
+    const f = fixture({ reruns: 2 });
+    f.deps.testRunner = vi.fn(async options => ({ ...report(options), status: 124,
+      [stream]: `\x1b[31m${line}\x1b[0m\n` }));
+    f.deps.mainTestRunner = vi.fn();
+    await expect(job(f)).rejects.toMatchObject({ step: 'tests', cause: { kind: 'timeout', attempts: 1 },
+      message: expect.stringContaining('operator review required'), stderrTail: expect.stringContaining(line) });
+    expect(f.deps.testRunner).toHaveBeenCalledOnce();
+    expect(f.deps.mainTestRunner).not.toHaveBeenCalled();
+    expect(kinds(f)).not.toContain('overlay-main-timeout-retried');
+    noPublication(f);
+  });
+
+  it.each([
+    ['truncated JSON', '{"testResults":'], ['empty file', ''], ['null report', 'null'],
+    ['missing results', '{}'], ['non-array results', '{"testResults":{}}'],
+    ['null row', '{"testResults":[null]}'],
+    ['missing assertions', '{"testResults":[{"name":"worker.test.mjs"}]}'],
+    ['invalid assertion', '{"testResults":[{"name":"worker.test.mjs","assertionResults":[{}]}]}'],
+    ['invalid success', '{"testResults":[],"success":"false"}'],
+    ['invalid failed count', '{"testResults":[],"numFailedTests":"0"}'],
+  ])('an existing corrupt partial report (%s) is not retried and exposes the cause', async (_name, text) => {
+    const f = fixture({ reruns: 2 });
+    f.deps.testRunner = vi.fn(async options => {
+      if (f.deps.testRunner.mock.calls.length > 1) return report(options);
+      fs.writeFileSync(options.testReport, text);
+      return timeout;
+    });
+    f.deps.mainTestRunner = vi.fn();
+    const diagnostic = 'partial test report unreadable or invalid:';
+    await expect(job(f)).rejects.toMatchObject({ step: 'tests', cause: { kind: 'timeout', attempts: 1 },
+      message: expect.stringContaining(diagnostic), stderrTail: expect.stringContaining(diagnostic) });
+    expect(f.deps.testRunner).toHaveBeenCalledOnce();
+    expect(f.deps.mainTestRunner).not.toHaveBeenCalled();
+    expect(f.outcomes.find(e => e.kind === 'overlay-main-sync-failed').detail).toMatchObject({
+      cause: { kind: 'timeout', attempts: 1 }, stderrTail: expect.stringContaining(diagnostic),
+    });
+    expect(fs.readFileSync(alertsFilePath(f.root, f.env), 'utf8')).toContain(diagnostic);
+    expect(kinds(f)).not.toContain('overlay-main-timeout-retried');
+    noPublication(f);
+  });
+
+  it.each([['statSync', 'EACCES'], ['readFileSync', 'EACCES'], ['readFileSync', 'ENOENT']])(
+    'an existing partial report with %s %s is not retried and exposes the read failure', async (method, code) => {
+    const f = fixture({ reruns: 2 });
+    let partialPath;
+    f.deps.testRunner = vi.fn(async options => {
+      partialPath = options.testReport;
+      report(options);
+      return timeout;
+    });
+    f.deps.io[method] = (path, ...args) => {
+      if (path === partialPath) throw Object.assign(new Error(`${code}: partial report access failed`), { code });
+      return fs[method](path, ...args);
+    };
+    await expect(job(f)).rejects.toMatchObject({ cause: { kind: 'timeout', attempts: 1 },
+      message: expect.stringContaining(`${code}: partial report access failed`) });
+    expect(f.deps.testRunner).toHaveBeenCalledOnce();
+    expect(kinds(f)).not.toContain('overlay-main-timeout-retried');
+    noPublication(f);
+  });
+
+  it('an absent partial report with no red text is retried exactly once and proceeds after complete green evidence', async () => {
     const f = fixture({ reruns: 0 });
-    f.deps.testRunner = vi.fn(async options => f.deps.testRunner.mock.calls.length === 1 ? timeout : report(options));
+    f.deps.testRunner = vi.fn(async options => {
+      if (f.deps.testRunner.mock.calls.length > 1) return report(options);
+      expect(() => fs.statSync(options.testReport)).toThrow(expect.objectContaining({ code: 'ENOENT' }));
+      return timeout;
+    });
     expect(await job(f)).toMatchObject({ pushed: true });
     expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
     expect(kinds(f)).toContain('overlay-main-timeout-retried');
@@ -937,12 +1006,16 @@ describe('overlay main sync interrupted test runs', () => {
       fs.writeFileSync(options.testReport, ' '.repeat(8 * 1024 * 1024 + 1));
       return timeout;
     });
-    await expect(job(f)).rejects.toMatchObject({ cause: { kind: 'timeout', limitMs: 480000 },
-      failedTests: [], message: expect.stringContaining('operator review required') });
-    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    await expect(job(f)).rejects.toMatchObject({ cause: { kind: 'timeout', limitMs: 480000, attempts: 1 },
+      failedTests: [], message: expect.stringContaining('operator review required'),
+      stderrTail: expect.stringContaining('partial test report over 8 MiB') });
+    expect(f.deps.testRunner).toHaveBeenCalledOnce();
     expect(f.outcomes.find(e => e.kind === 'overlay-main-sync-failed').detail).toMatchObject({
-      cause: { kind: 'timeout', limitMs: 480000 }, failedTests: [],
+      cause: { kind: 'timeout', limitMs: 480000, attempts: 1 }, failedTests: [],
+      stderrTail: expect.stringContaining('partial test report over 8 MiB'),
     });
+    expect(fs.readFileSync(alertsFilePath(f.root, f.env), 'utf8')).toContain('partial test report over 8 MiB');
+    expect(kinds(f)).not.toContain('overlay-main-timeout-retried');
     noPublication(f);
   });
 
