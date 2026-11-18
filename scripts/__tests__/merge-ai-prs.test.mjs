@@ -126,7 +126,7 @@ describe('fast-drain round listing snapshot', () => {
     const write = vi.fn();
     const log = vi.fn();
     const result = await readFastDrainRoundListing({ path: 'round.json', repo, onlyPr: '42', now, env: {},
-      read: () => raw, write, listLive: live, readTarget: target, log, lock: async fn => ({ ok: true, value: await fn() }), ...extra });
+      read: () => raw, write, listLive: live, readTarget: target, log, lock: async fn => ({ ok: true, value: await fn(() => true) }), ...extra });
     return { result, live, target, write, log };
   };
   it('uses fresh same-repo rows and still re-reads and reclassifies the moved target', async () => {
@@ -164,18 +164,22 @@ describe('fast-drain round listing snapshot', () => {
     expect((await probe(snap({ writtenAt: now - 200_000 }), { env: { WE_FAST_DRAIN_LISTING_SNAPSHOT_TTL_SEC: '300' } })).live).not.toHaveBeenCalled();
     const { live, log } = await probe(snap(), { env: { WE_FAST_DRAIN_LISTING_SNAPSHOT_TTL_SEC: 'NaN' } });
     expect(live).not.toHaveBeenCalled();
-    expect(log).toHaveBeenCalledWith(expect.stringContaining('TTL=180s, source=standard'));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('TTL=60s, source=standard'));
   });
   it('falls back live for an oversized snapshot', async () => {
     expect((await probe(' '.repeat(64 * 1024 * 1024 + 1))).live).toHaveBeenCalledOnce();
   });
-  it('falls back to a live listing on population-lock timeout', async () => {
-    const { live, log } = await probe(null, { lock: async () => ({ ok: false, reason: 'timeout' }) });
-    expect(live).toHaveBeenCalledOnce();
-    expect(log).toHaveBeenCalledWith(expect.stringContaining('cache lock unavailable, live fallback'));
+  it('defers instead of starting an uncoordinated listing on population-lock failure', async () => {
+    const live = vi.fn();
+    await expect(probe(null, { listLive: live, lock: async () => ({ ok: false, reason: 'timeout' }) }))
+      .rejects.toThrow('lock unavailable (timeout) — retry next pass');
+    expect(live).not.toHaveBeenCalled();
   });
-  it('falls back live when the lock directory is unwritable', async () => {
-    expect((await probe(null, { lock: async () => { throw new Error('EACCES'); } })).live).toHaveBeenCalledOnce();
+  it('defers when the lock directory is unwritable', async () => {
+    const live = vi.fn();
+    await expect(probe(null, { listLive: live, lock: async () => { throw new Error('EACCES'); } }))
+      .rejects.toThrow('lock unreadable — retry next pass');
+    expect(live).not.toHaveBeenCalled();
   });
   it('re-evaluates new-head failed checks instead of the cached green checks', async () => {
     const { result } = await probe(snap(), { readTarget: async () => ({ ...old, state: 'OPEN', headRefOid: 'moved',
@@ -218,7 +222,7 @@ describe('round listing freshness at the CLI boundary', () => {
     expect(buildLiveListingsByRepo([{ repo: 'web-everything/web-everything', rows: [{ number: 42 }], listing: 'snapshot' }]).has('web-everything/web-everything')).toBe(false);
   });
 
-  const run = (listing, { sendBack, reconcile = true, omitSibling = false, failListing = false } = {}) => {
+  const run = (listing, { sendBack, reconcile = true, omitSibling = false, failListing = false, snapshotAgeMs = 0 } = {}) => {
     const dir = mkdtempSync(join(tmpdir(), 'drain-round-cli-'));
     try {
       const row = (number, item, blockedBy = []) => ({ number, title: `PR ${number}`, state: 'OPEN',
@@ -229,7 +233,7 @@ describe('round listing freshness at the CLI boundary', () => {
       const target = row(42, 42, ['43']);
       const sibling = row(43, 43);
       const snapshot = join(dir, 'round.json');
-      writeFileSync(snapshot, JSON.stringify({ repo: 'web-everything/web-everything', writtenAt: Date.now(), defaultBranch: 'main', rows: [target, ...(sendBack && !omitSibling ? [sibling] : [])] }));
+      writeFileSync(snapshot, JSON.stringify({ repo: 'web-everything/web-everything', writtenAt: Date.now() - snapshotAgeMs, defaultBranch: 'main', rows: [target, ...(sendBack && !omitSibling ? [sibling] : [])] }));
       if (sendBack) {
         // Neither PR has a follow-up entry. Only live rows know that manually queued #43 is now held.
         // Keep the target held but selected, so an empty candidate set does not trigger a label-lag re-poll.
@@ -288,6 +292,23 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
     expect(calls.some(a => a[0] === 'pr' && a[1] === 'view' && a[2] === '43' && a.includes('web-everything/web-everything'))).toBe(true);
     expect(payload.deferred).toEqual(expect.arrayContaining([expect.objectContaining({ num: 42, waitOn: expect.arrayContaining([43]) })]));
   });
+  it('re-lists fresh snapshot context live without resolving the stored default branch', () => {
+    const { stderr, calls } = run('snapshot');
+    expect(stderr).toContain('served-from-snapshot');
+    const localListings = calls.filter(a => a[0] === 'api' && a[1] === 'graphql'
+      && a.some(v => v.includes('repository(owner:"web-everything",name:"web-everything")') && v.includes('pullRequests(states:OPEN')));
+    expect(localListings).toHaveLength(1);
+    expect(calls.some(a => a[0] === 'repo' && a[1] === 'view')).toBe(false);
+    expect(calls.some(a => a[0] === 'pr' && a[1] === 'view' && a[2] === '42')).toBe(true);
+  });
+  it('discovers blockers live after an expired round is refreshed too', () => {
+    const { payload, stderr, calls } = run('snapshot', { snapshotAgeMs: 60_001 });
+    expect(stderr).toContain('listed-live');
+    const liveListings = calls.filter(a => a[0] === 'api' && a[1] === 'graphql'
+      && a.some(v => v.includes('repository(owner:"web-everything",name:"web-everything")') && v.includes('pullRequests(states:OPEN')));
+    expect(liveListings).toHaveLength(2);
+    expect(payload.deferred).toEqual(expect.arrayContaining([expect.objectContaining({ num: 42, waitOn: expect.arrayContaining([43]) })]));
+  });
   it('ignores --listing-snapshot when WE_FAST_DRAIN_LISTING=live', () => {
     const { stderr, calls } = run('live');
     expect(stderr).not.toContain('served-from-snapshot');
@@ -313,11 +334,14 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
       && a.some(v => v.includes('repository(owner:"web-everything",name:"web-everything")') && v.includes('pullRequests(states:OPEN')));
     expect(liveListings).toHaveLength(1);
   });
+
+
   it('keeps eviction on live evidence when round snapshots are disabled', () => {
     const { calls, stderr } = run('live', { sendBack: 'red-team:blocked' });
     expect(stderr).not.toContain('served-from-snapshot');
     expect(calls.filter(a => a.some(v => v.includes('dequeuePullRequest')))).toHaveLength(1);
   });
+
   it.each([true, false])('retries unreadable eviction evidence without stale mutations (reconcile=%s)', reconcile => {
     const { calls, stderr } = run('snapshot', { sendBack: 'red-team:blocked', reconcile, failListing: true });
     expect(calls.some(a => a.some(v => v.includes('dequeuePullRequest')))).toBe(false);
@@ -328,4 +352,24 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
 it('shadow policy retains pre-enqueue renaming by default (#6121)', async () => {
   const { resolveCardNumbering } = await import('../lib/policy-cascade.mjs');
   expect(resolveCardNumbering({ env: {}, platform: {} })).toMatchObject({ value: { mode: 'rename-before-enqueue', ledgerAuth: 'none', shadow: true } });
+});
+
+
+it('retries a failed default-branch read on a later call and caches the successful read', async () => {
+  const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
+  const start = source.indexOf('  const resolveDefaultBranch = async (repo) => {');
+  const end = source.indexOf('\n  let [listings]', start);
+  expect(start).toBeGreaterThan(-1);
+  expect(end).toBeGreaterThan(start);
+  const cache = new Map();
+  const read = vi.fn().mockRejectedValueOnce(new Error('transient read failure'))
+    .mockResolvedValueOnce({ stdout: 'trunk\n' });
+  const resolveDefaultBranch = new Function('defaultBranchByRepo', 'execFileP', 'listingSnapshot', 'AS_JSON',
+    `${source.slice(start, end)}; return resolveDefaultBranch;`)(cache, read, null, true);
+  await resolveDefaultBranch('fixture/repo');
+  expect(cache.has('fixture/repo')).toBe(false);
+  await resolveDefaultBranch('fixture/repo');
+  expect(cache.get('fixture/repo')).toBe('trunk');
+  await resolveDefaultBranch('fixture/repo');
+  expect(read).toHaveBeenCalledTimes(2);
 });

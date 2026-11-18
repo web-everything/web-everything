@@ -352,10 +352,12 @@ function summarizeLaunches(items, ticks) {
   return base;
 }
 const attemptTime = (row, tickAt) => [row?.recordedAt, row?.at, /\d{4}-\d\d-\d\dT[\d:.]+Z/.exec(String(row?.attempt ?? ''))?.[0], tickAt].find((v) => Number.isFinite(stamp(v)));
-/** Launch attempts: build/prevention-card from `dispatched`/`failures`; prepare from `prepare.launched`/`prepare.failures`. */
+/** Launch attempts from tick rows; prepare PR-list observation failures are counted separately per tick. */
 export function builderMetrics(ticks, window, cardNames = []) {
   const ordered = [...ticks].sort((x, y) => compare(x.at, y.at));
   const items = [], prepSeen = new Set(), headSeenAt = new Map();
+  const observationReasons = new Map();
+  let observationCount = 0;
   const list = (v) => Array.isArray(v) ? v : [];
   const failCause = (f) => /not confirmed/i.test(String(f.reason ?? f.evidence?.reason ?? '')) ? 'launch-not-confirmed' : 'failed';
   const headOf = (f) => `${f.num}|${f.stage ?? ''}|${String(f.reason ?? f.evidence?.reason ?? '').slice(0, 60)}`;
@@ -377,7 +379,23 @@ export function builderMetrics(ticks, window, cardNames = []) {
       const key = `l|${d.num ?? d}|${d.attempt ?? d.at ?? d.sessionSlug ?? ''}`;
       emit('launched', d, key, !prepSeen.has(key) && prepSeen.add(key));
     }
-    const failures = list(t.prepare?.failures).filter((f) => f && typeof f === 'object');
+    const observationSeen = new Set();
+    const failures = list(t.prepare?.failures).filter((f) => {
+      if (!f || typeof f !== 'object') return false;
+      const observationReason = String(f.reason ?? f.evidence?.reason ?? '');
+      if (f.cause !== 'daemon-observation' || f.stage !== 'retirement'
+        || !(/gh-throttle\.mjs pr list|PR listing call budget/.test(observationReason)
+          || (/^gh-throttle:.*throttl/i.test(observationReason) && /pr list/.test(observationReason)))) return true;
+      // No prepare launched: count each card + normalized reason once in this tick, independent of attempt metadata.
+      const reason = String(f.reason ?? f.evidence?.reason ?? '').replace(/\d+/g, 'N').slice(0, 90);
+      const key = `${f.num}|${reason}`;
+      if (live && !observationSeen.has(key)) {
+        observationSeen.add(key);
+        observationCount++;
+        observationReasons.set(reason, (observationReasons.get(reason) ?? 0) + 1);
+      }
+      return false;
+    });
     for (const f of [...failures.filter((x) => x.attempt), ...failures.filter((x) => !x.attempt)]) {
       const head = `h|${headOf(f)}`, key = f.attempt ? `f|${f.num}|${f.attempt}` : head, when = stamp(attemptTime(f, t.at));
       let fresh = !prepSeen.has(key) && prepSeen.add(key);
@@ -396,6 +414,7 @@ export function builderMetrics(ticks, window, cardNames = []) {
   const inTick = ordered.filter((t) => inWindow(t.at, window)).length;
   const main = summarizeLaunches(items.filter((i) => i.kind !== 'prepare'), inTick);
   main.byKind = Object.fromEntries(['build', 'prevention-card', 'prepare'].map((k) => [k, summarizeLaunches(items.filter((i) => i.kind === k), inTick)]));
+  if (observationCount) main.prepareObservationFailures = { count: observationCount, byReason: Object.fromEntries(observationReasons) };
   return main;
 }
 

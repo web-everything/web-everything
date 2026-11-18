@@ -37,7 +37,7 @@
  * `we:scripts/lib/github-app-auth-env.mjs`'s own shared, continuously-refreshed token cache file FRESH ON
  * EVERY `gh` INVOCATION — so a session's very first `gh` call and its five-hundredth, an hour later, each get
  * whatever the daemon fleet's own ongoing refresh has most recently written, never a stale spawn-time snapshot.
- * The wrapper needs no `WE_GITHUB_APP_*` var and never touches the private key itself — only the cache file's
+ * The wrapper needs no `WE_GITHUB_APP_*` var and never touches the app's signing credential itself — only the cache file's
  * already-minted, short-lived token, exactly the credential `GH_TOKEN` was always meant to carry.
  *
  * INTERACTIVE OPT-IN (#3866). {@link buildGhShimSettingsEnv} returns `null` — no fs
@@ -50,7 +50,7 @@
  * Daemon callers always need a refusal shim, including when App configuration is unavailable; inability
  * to install it throws instead of letting a dispatch omit the auth boundary.
  *
- * NEVER TOUCHES THE PRIVATE KEY. The generated shim only ever reads the shared token CACHE (a short-lived,
+ * NEVER TOUCHES THE SIGNING CREDENTIAL. The generated shim only ever reads the shared token CACHE (a short-lived,
  * already-minted installation token). Daemon cache misses delegate minting to the bounded refresh CLI.
  *
  * #4064 — EVERY BOT gh CALL IS NOW BOTH ON THE APP LOGIN AND THROTTLED. `we:scripts/lib/gh-throttle.mjs` built
