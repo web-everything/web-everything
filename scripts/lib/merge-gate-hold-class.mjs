@@ -5,7 +5,7 @@
  * Deliberately does not import merge-gate-ci or the drain's runtime graph.
  */
 import { readFileSync } from 'node:fs';
-import { HUMAN_REVIEW_HOLD_GATES } from './merge-gate-verdict.mjs';
+import { HUMAN_REVIEW_HOLD_GATES, humanReviewOnlyHold } from './merge-gate-verdict.mjs';
 import { GATE_IDS } from './merge-gate-inventory.mjs';
 import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
 import { FAILING_CONCLUSIONS } from '../operations/pr-status.mjs';
@@ -282,6 +282,17 @@ export function excusePrMergeGateHolds(prs, { repo, readMergeGateVerdict: readVe
     return prs.map(pr => {
       const out = excuseMergeGateRows(pr.statusCheckRollup, { prNumber: pr.number, headSha: pr.headRefOid, labels: pr.labels,
         readVerdict: args => readVerdict({ ...args, repo }), freeze: lazyFreeze, setting });
+      // The planner's review-owned-red path needs the original failed conclusion
+      // and a bound review-hold annotation. Compatibility SUCCESS alone is not
+      // strict CI success, and otherwise strands a head that is owed review.
+      if (out.excused) {
+        out.rows = out.rows.map(row => {
+          const hold = row.mergeGateHoldExcused;
+          if (!hold || !humanReviewOnlyHold(hold.holds).only) return row;
+          const original = pr.statusCheckRollup.find(candidate => candidate === latestFailingMergeGate(pr.statusCheckRollup));
+          return { ...row, conclusion: original.conclusion, mergeGateReviewHold: hold };
+        });
+      }
       return out.excused || out.reviewHold ? { ...pr, statusCheckRollup: out.rows } : pr;
     });
   } catch { return prs; }

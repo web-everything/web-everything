@@ -230,13 +230,21 @@ describe('settings and row evidence', () => {
   });
 });
 const identity = x => x;
+// These injected listings model exhaustive head-pinned reads. Preserve any explicit
+// incomplete provenance so negative fixtures still exercise the refusal path.
+const exhaustivePrRows = prs => prs.map(pr => ({ rowsHead: pr.headRefOid,
+  rowsComplete: true, rosterSource: 'live', ...pr }));
 function plan({ setting = 'on', draft = false, testRed = false, readVerdict = () => verdict(), ...extra } = {}) {
-  return runReconcilePass({ env: { WE_REVIEW_START_AFTER: 'ci-green' }, readPrs: () => [{ number: 4965, headRefOid: sha, headRefName: 'lane/4965-example', baseRefName: 'main', labels: [{ name: 'review:pending' }], comments: [], isDraft: draft, statusCheckRollup: [row, { ...green, conclusion: testRed ? 'FAILURE' : 'SUCCESS' }] }],
-    readAgents: () => [], enrich: identity, readRequiredChecks: () => ({ checks: ['test', 'merge-gate'] }), readChecks: exhaustiveReadChecks(() => [row, green]),
+  // A check-run ID alone does not identify the Actions job that produced the hold.
+  const mergeGateRow = { ...row, detailsUrl: 'https://github.com/owner/repo/actions/runs/100/job/123' };
+  const options = { env: { WE_REVIEW_START_AFTER: 'ci-green' }, readPrs: () => [{ number: 4965, headRefOid: sha, headRefName: 'lane/4965-example', baseRefName: 'main', labels: [{ name: 'review:pending' }], comments: [], isDraft: draft, statusCheckRollup: [mergeGateRow, { ...green, conclusion: testRed ? 'FAILURE' : 'SUCCESS' }] }],
+    readAgents: () => [], enrich: identity, readRequiredChecks: () => ({ checks: ['test', 'merge-gate'], source: 'live' }), readChecks: () => [mergeGateRow, green],
     readMergeGateVerdict: readVerdict, readFreeze: () => ({ error: 'not needed' }), mergeGateSetting: { value: setting },
     enrichMainRed: prs => ({ prs, mainRedWindows: [] }),
     ...Object.fromEntries(['enrichAlreadyLanded', 'enrichBaseRef', 'enrichSystemFix', 'enrichEscalationBase', 'enrichFixClaims', 'enrichTimeouts', 'enrichReferralHolds', 'enrichLedgerHolds', 'enrichRulings', 'enrichScopeBloat', 'enrichCodeQL', 'enrichMechanicalRound', 'enrichOwedMainRule'].map(k => [k, identity])),
-    resolveMainSha: () => null, readPriority: () => null, ...extra });
+    resolveMainSha: () => null, readPriority: () => null, ...extra };
+  return runReconcilePass({ ...options, readPrs: (...args) => exhaustivePrRows(options.readPrs(...args)),
+    readChecks: exhaustiveReadChecks(options.readChecks) });
 }
 describe('reconcile planner and fresh promotion', () => {
   it('off reproduces ci-heal; on owes review', () => {
