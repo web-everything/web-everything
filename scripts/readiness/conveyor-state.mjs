@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolveCheckRows } from '../lib/check-row-resolver.mjs';
 /**
  * @file scripts/readiness/conveyor-state.mjs
  * @description The CONVEYOR TICK STATE-READ (WE #2611, epic #2612). ONE `--json` read that returns the whole
@@ -40,7 +41,7 @@ import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { readQueueFile, resolveQueuePath, normNum, bornAsIndexFromItems, resolveBornAsRefs } from '../conveyor/queue-store.mjs';
-import { collapseRollupToLatestPerName } from '../merge-ai-prs.mjs';
+
 import { CI_TRUTH_EXCLUDED_CHECKS } from '../operations/pr-status.mjs';
 // #3296 — `standDownComments` recovers "has a fixer already stood down here" from the PR's own comments
 // (the same durable marker `reconcile-core.mjs`'s `planReconcile` already reads). Shaping it into the PR row
@@ -210,7 +211,7 @@ export function reverseLaneItemMap(reg) {
  * @returns {'pass'|'fail'|'pending'|'none'}
  */
 export function ciRollup(statusCheckRollup) {
-  const roll = collapseRollupToLatestPerName(statusCheckRollup)
+  const roll = resolveCheckRows(statusCheckRollup)
     .filter((c) => !CI_TRUTH_EXCLUDED_CHECKS.includes(String(c?.name ?? c?.context ?? '')));
   if (roll.length === 0) return 'none';
   const RED = new Set(['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE']);

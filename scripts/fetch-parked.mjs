@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolveCheckRows } from './lib/check-row-resolver.mjs';
 /**
  * fetch-parked.mjs — dump a stable per-PR review bundle reviewers currently hand-assemble from scattered `gh`
  * calls (#2434, one of three drain fetch/state helpers under `scripts/`).
@@ -31,7 +32,7 @@
 import { execFileSync } from 'node:child_process';
 // #2901 — the NET two-tree diff basis. merge-ai-prs.mjs guards its CLI behind `if (IS_CLI)`, so importing
 // this one function does not run the lander; the /review skill mandates the same import for the same reason.
-import { computeNetDiffText, computeNetDiffPaths, collapseRollupToLatestPerName } from './merge-ai-prs.mjs';
+import { computeNetDiffText, computeNetDiffPaths } from './merge-ai-prs.mjs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { classifyChecks } from './pr-land.mjs';
@@ -66,7 +67,7 @@ export function labelNames(labels) {
  * @returns {Array<{name:string, bucket:string}>}
  */
 export function rollupToCheckRows(rollup) {
-  const rows = collapseRollupToLatestPerName(rollup);
+  const rows = resolveCheckRows(rollup);
   return rows.map((c) => {
     const name = String((c && (c.name || c.context)) || '');
     let bucket;

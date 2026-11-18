@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { resolveCheckRows } from '../check-row-resolver.mjs';
 
-const failed = { workflowName: 'CI', name: 'test', status: 'completed', conclusion: 'failure', startedAt: '2026-10-28T01:00:00Z' };
+const failed = { workflow_id: 1, workflowName: 'CI', name: 'test', status: 'completed', conclusion: 'failure', startedAt: '2026-10-28T01:00:00Z' };
 const passed = { ...failed, conclusion: 'success', startedAt: '2026-10-28T02:00:00Z' };
 
 describe('fail-closed workflow/check attempt resolver', () => {
@@ -13,13 +13,13 @@ describe('fail-closed workflow/check attempt resolver', () => {
     id => ({ checkSuite: { workflowRun: { id: 999, workflow: { id, name: 'CI' } } } }),
     ...['resourcePath', 'url', 'path'].map(key => id => ({ workflow: { [key]: String(id), name: 'CI' } })),
   ])('partitions same-name workflows by identity and permits reruns only within it (%#)', identity => {
-    const red = { ...failed, ...identity(1) };
-    const green = { ...passed, ...identity(2) };
+    const red = { ...failed, workflow_id: undefined, ...identity(1) };
+    const green = { ...passed, workflow_id: undefined, ...identity(2) };
     for (const rows of [[red, green], [green, red]]) {
       expect(resolveCheckRows(rows)).toHaveLength(2);
       expect(resolveCheckRows(rows)).toContain(red);
     }
-    expect(resolveCheckRows([red, { ...passed, ...identity(1) }])).toEqual([{ ...passed, ...identity(1) }]);
+    expect(resolveCheckRows([red, { ...passed, workflow_id: undefined, ...identity(1) }])).toEqual([{ ...passed, workflow_id: undefined, ...identity(1) }]);
   });
   it('prefers database identity over matching workflow paths and display names', () => {
     expect(resolveCheckRows([1, 2].map((id, i) => ({ ...(i ? passed : failed), workflow: { databaseId: id, id: 'shared', path: 'shared' } })))).toHaveLength(2);
@@ -32,11 +32,11 @@ describe('fail-closed workflow/check attempt resolver', () => {
   it('name-only evidence bridges same-name identities ambiguously in every insertion position', () => {
     const red = { ...failed, workflow_id: 1 };
     const green = { ...passed, workflow_id: 2 };
-    const nameOnly = { ...passed };
+    const nameOnly = { ...passed, workflow_id: undefined };
     for (const rows of [[red, green, nameOnly], [nameOnly, green, red], [green, nameOnly, red]]) {
       expect(resolveCheckRows(rows)).toEqual([red]);
     }
-    for (const rows of [[red, nameOnly], [nameOnly, red], [failed, green], [green, failed]]) {
+    for (const rows of [[red, nameOnly], [nameOnly, red], [{ ...failed, workflow_id: undefined }, green], [green, { ...failed, workflow_id: undefined }]]) {
       expect(resolveCheckRows(rows)).toEqual([rows.find(row => row.conclusion === 'failure')]);
     }
   });
@@ -63,9 +63,9 @@ describe('fail-closed workflow/check attempt resolver', () => {
   it('prefers failure across the whole group when any timestamp is missing', () => {
     expect(resolveCheckRows([failed, passed, { ...passed, startedAt: undefined }])).toEqual([failed]);
   });
-  it('keeps the latest pending attempt pending', () => {
+  it('keeps an earlier failure red while the latest attempt is pending', () => {
     const pending = { ...passed, status: 'in_progress', conclusion: null };
-    expect(resolveCheckRows([failed, pending])).toEqual([pending]);
+    expect(resolveCheckRows([failed, pending])).toEqual([failed]);
   });
   it('an undated pending row blocks a dated success', () => {
     const pending = { ...passed, startedAt: undefined, status: 'queued', conclusion: null };
@@ -76,7 +76,7 @@ describe('fail-closed workflow/check attempt resolver', () => {
     [{ workflow: 'CI' }, { workflow: 'security' }],
     [{ checkSuite: { workflowRun: { workflow: { name: 'CI' } } } }, { checkSuite: { workflowRun: { workflow: { name: 'security' } } } }],
   ])('never collapses distinct workflows (%j)', (a, b) => {
-    expect(resolveCheckRows([{ ...failed, workflowName: undefined, ...a }, { ...passed, workflowName: undefined, ...b }])).toHaveLength(2);
+    expect(resolveCheckRows([{ ...failed, workflow_id: undefined, workflowName: undefined, ...a }, { ...passed, workflow_id: undefined, workflowName: undefined, ...b }])).toEqual([{ ...failed, workflow_id: undefined, workflowName: undefined, ...a }]);
   });
   it('keeps names exact, including legacy contexts', () => {
     expect(resolveCheckRows([failed, { context: 'TEST', state: 'success' }])).toHaveLength(2);
@@ -84,11 +84,11 @@ describe('fail-closed workflow/check attempt resolver', () => {
     expect(resolveCheckRows([legacyFailure, { context: 'test', state: 'success' }])).toEqual([legacyFailure]);
   });
   it('treats empty and absent workflow information as one group per name', () => {
-    expect(resolveCheckRows([{ ...failed, workflowName: undefined }, { ...passed, workflowName: '' }]))
-      .toEqual([{ ...failed, workflowName: undefined }]);
+    expect(resolveCheckRows([{ ...failed, workflow_id: undefined, workflowName: undefined }, { ...passed, workflow_id: undefined, workflowName: '' }]))
+      .toEqual([{ ...failed, workflow_id: undefined, workflowName: undefined }]);
   });
   it.each([undefined, null, ''])('workflow %j is ambiguous despite timestamps and run ids', workflowName => {
-    const red = { ...failed, workflowName, id: 1, run_id: 1 };
+    const red = { ...failed, workflow_id: undefined, workflowName, id: 1, run_id: 1 };
     const green = { ...passed, workflowName, id: 999, run_id: 999 };
     const pending = { ...green, status: 'in_progress', conclusion: null };
     for (const rows of [[red, pending, green], [green, pending, red]]) expect(resolveCheckRows(rows)).toEqual([red]);
@@ -113,4 +113,25 @@ describe('fail-closed workflow/check attempt resolver', () => {
       for (const rows of [[check, legacy], [legacy, check]]) expect(resolveCheckRows(rows)).toEqual(rows);
     }
   });
+});
+
+// Probe real resolution in both input orders, including an unidentified producer
+// whose display name cannot be connected to either identified workflow.
+it.each([undefined, 'CI', 'another producer'])('unknown workflow identity (%s) disables time collapse for the whole name', workflowName => {
+  const red = { ...failed };
+  const green = { ...passed };
+  const unknown = { ...passed, workflow_id: undefined, workflowName, startedAt: '2026-10-28T03:00:00Z' };
+  for (const rows of [[red, green, unknown], [unknown, green, red], [green, unknown, red]]) {
+    expect(resolveCheckRows(rows)).toEqual([red]);
+  }
+});
+it.each(['queued', 'in_progress', 'pending', 'waiting', 'requested'])('failure survives a %s rerun until completed SUCCESS', status => {
+  const pending = { ...passed, status, conclusion: null };
+  const success = { ...passed, startedAt: '2026-10-28T03:00:00Z' };
+  for (const rows of [[failed, pending], [pending, failed]]) expect(resolveCheckRows(rows)).toEqual([failed]);
+  for (const rows of [[failed, pending, success], [success, pending, failed]]) expect(resolveCheckRows(rows)).toEqual([success]);
+});
+it('a later completed success clears failure even when followed by another pending attempt', () => {
+  const pending = { ...passed, startedAt: '2026-10-28T03:00:00Z', status: 'in_progress', conclusion: null };
+  expect(resolveCheckRows([failed, passed, pending])).toEqual([pending]);
 });

@@ -4444,17 +4444,37 @@ The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true
 
 ## Workflow-scoped check attempts (R37)
 
-The review CI gate, CodeQL failure reader and ci-heal verdict recheck use
-`scripts/lib/check-row-resolver.mjs`: compare timestamps only within an exact
-workflow/check-name pair. Missing timestamps or ties prefer blocking evidence;
-IDs never establish recency. Workflow-less rows share one group per name.
-Fixtures representing independent producers must identify their workflows.
-A merge-gate review-hold annotation cannot outrank ordinary CI failure or pending
-evidence when attempt order is ambiguous. Run the resolver and affected gate tests
-through heavy admission.
+Gate readers use `scripts/lib/check-row-resolver.mjs`. Compare attempt start
+timestamps only when every row sharing the exact check name has stable workflow
+identity (workflow id, resource path/URL/path); display names and check/run ids
+never prove identity. Any unidentified row makes the whole name ambiguous,
+including identified producers with different display names. Missing timestamps
+or ties also prefer red, then pending, then green. Evidence kinds stay separate.
 
-Workflow identity (workflow id first, then resource path/URL/path) takes precedence
-over display names; check/run ids never identify a workflow. Name-only evidence
-matching identified rows makes the partition ambiguous and retains its worst state.
-A latest attempt consisting only of skipped, neutral, cancelled or stale results
-cannot clear an earlier failure. A later successful rerun can clear it.
+A failure remains unresolved until a strictly later attempt in the same identified
+group completes with conclusion SUCCESS. Pending, skipped, neutral, cancelled and
+stale attempts cannot clear it. `resolveCheckNames` selects the worst remaining
+workflow for consumers requiring a single row per name; never build a last-wins
+Map from `resolveCheckRows`. `rollup-collapse.mjs` remains a display helper, not a
+required-check verdict reader. Probe the resolver, CodeQL drain and ci-heal gates
+in both input orders through heavy admission.
+
+Required-verdict caller inventory (display collapse removed):
+
+- Drain and enqueue: `scripts/merge-ai-prs.mjs`,
+  `scripts/lib/merge-queue-enqueue.mjs`.
+- Review and repair gates: `scripts/lib/review-timing.mjs`,
+  `scripts/lib/merge-gate-hold-class.mjs`, `scripts/lib/renamed-pr-refresh.mjs`,
+  `scripts/conveyor/await-verify-pass.mjs`, `scripts/conveyor/exhausted-retry.mjs`,
+  `scripts/conveyor/fix-push-ci.mjs`, `scripts/conveyor/reconcile-core.mjs`,
+  `scripts/conveyor/reconcile-pass.mjs`, `scripts/conveyor/review-status-tag.mjs`.
+- Required CI state producers: `scripts/operations/pr-status.mjs`,
+  `scripts/lib/pr-state-io.mjs`, `scripts/progress-board.mjs`,
+  `scripts/readiness/conveyor-state.mjs`, `scripts/fetch-parked.mjs`.
+- `scripts/conveyor/ci-red-recovery-watch.mjs` now enumerates raw names and
+  delegates verdicts to `isRequiredCheckFailed`, which uses the resolver.
+
+Remaining direct display-collapse consumers do not decide required-check admission:
+`operations/fix-run.mjs` collects repair context; `conveyor/stale-base-refresh.mjs`
+collects workflow-specific remediation facts. The helper itself and its display
+compatibility exports remain unchanged.

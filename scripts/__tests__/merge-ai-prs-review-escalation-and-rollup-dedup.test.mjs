@@ -421,8 +421,8 @@ describe('latestRequiredCheck — a superseded run must not outvote the one that
   // The exact PR #1042 rollup: a concurrency-cancelled run at index 0, the real SUCCESS at index 1.
   const supersededThenGreen = {
     statusCheckRollup: [
-      { name: 'test', conclusion: 'CANCELLED', startedAt: '2026-08-05T18:34:02Z' },
-      { name: 'test', conclusion: 'SUCCESS', startedAt: '2026-08-05T18:35:32Z' },
+      { name: 'test', workflow_id: 1, conclusion: 'CANCELLED', startedAt: '2026-08-05T18:34:02Z' },
+      { name: 'test', workflow_id: 1, conclusion: 'SUCCESS', startedAt: '2026-08-05T18:35:32Z' },
     ],
   };
 
@@ -472,14 +472,14 @@ describe('latestRequiredCheck — a superseded run must not outvote the one that
     };
     expect(isRequiredCheckGreen(stampsContradictOrder)).toBe(false);
     const noTimes = { statusCheckRollup: [{ name: 'test', conclusion: 'CANCELLED' }, { name: 'test', conclusion: 'SUCCESS' }] };
-    expect(isRequiredCheckGreen(noTimes)).toBe(true);
+    expect(isRequiredCheckGreen(noTimes)).toBe(false);
     const badTimes = {
       statusCheckRollup: [
         { name: 'test', conclusion: 'CANCELLED', startedAt: 'not-a-date' },
         { name: 'test', conclusion: 'SUCCESS', startedAt: 'also-not-a-date' },
       ],
     };
-    expect(isRequiredCheckGreen(badTimes)).toBe(true);
+    expect(isRequiredCheckGreen(badTimes)).toBe(false);
   });
 
   it('a LONE StatusContext decides when the workflow produced no `test` CheckRun', () => {
@@ -528,7 +528,7 @@ describe('latestRequiredCheck — a superseded run must not outvote the one that
   });
 
   it('a PR whose ONLY run is cancelled still reads not-green (never landed on a superseded verdict)', () => {
-    const onlyCancelled = { statusCheckRollup: [{ name: 'test', conclusion: 'CANCELLED', startedAt: '2026-08-05T18:34:02Z' }] };
+    const onlyCancelled = { statusCheckRollup: [{ name: 'test', workflow_id: 1, conclusion: 'CANCELLED', startedAt: '2026-08-05T18:34:02Z' }] };
     expect(isRequiredCheckGreen(onlyCancelled)).toBe(false);
     expect(isRequiredCheckFailed(onlyCancelled)).toBe(true);
   });
@@ -559,10 +559,10 @@ describe('collapseRollupToLatestPerName — the #2925 shared seam every rollup-f
     expect(collapsed.find((c) => c.name === 'cla').conclusion).toBe('SUCCESS');
   });
 
-  it('is the SAME rule `latestRequiredCheck` uses — a by-name lookup over this output', () => {
+  it('display collapse stays positional while required verdicts fail closed for unknown identity', () => {
     const pr = { statusCheckRollup: cancelledThenSuccess };
-    expect(latestRequiredCheck(pr).conclusion)
-      .toBe(collapseRollupToLatestPerName(cancelledThenSuccess).find((c) => c.name === 'test').conclusion);
+    expect(collapseRollupToLatestPerName(cancelledThenSuccess)[0].conclusion).toBe('SUCCESS');
+    expect(latestRequiredCheck(pr).conclusion).toBe('CANCELLED');
   });
 
   it('tolerant of an absent/odd rollup', () => {
@@ -612,9 +612,9 @@ describe('rollupRowKind — the union member comes off `__typename`, it is not g
     expect(isRequiredCheckGreen(pr)).toBe(true);
   });
 
-  it('an all-untagged rollup still resolves latest-wins (fixtures / re-normalised rows keep working)', () => {
+  it('an all-untagged rollup without workflow identity stays ambiguous', () => {
     const pr = { statusCheckRollup: [{ name: 'test', conclusion: 'CANCELLED' }, { name: 'test', conclusion: 'SUCCESS' }] };
-    expect(isRequiredCheckGreen(pr)).toBe(true);
+    expect(isRequiredCheckGreen(pr)).toBe(false);
   });
 });
 

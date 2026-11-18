@@ -30,7 +30,7 @@ import { signalFixDispatch } from '../lib/fix-handoff.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { excusePrMergeGateHolds, readMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
-import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
+import { resolveCheckNames } from '../lib/check-row-resolver.mjs';
 import { FAILING_CONCLUSIONS } from '../operations/pr-status.mjs';
 import { loadPrStatusSettings, prStatusSettingValues } from './pr-status-settings.mjs';
 import { latestCiHealEscalationForHead } from './ci-heal-escalation-mark.mjs';
@@ -299,7 +299,7 @@ export function tagReviewStatus({
       try { prStatusSettings = prStatusSettingValues(loadStatusSettings()); } catch { /* Pure core retains its defaults. */ }
     }
     let statusSubject = { ...(subject ?? {}), labels: currentLabels };
-    const mergeGate = collapseRollupToLatestPerName(statusSubject.statusCheckRollup).find(row => row.name === 'merge-gate');
+    const mergeGate = resolveCheckNames(statusSubject.statusCheckRollup).find(row => row.name === 'merge-gate');
     const conclusion = String(mergeGate?.conclusion ?? '').toLowerCase();
     if (FAILING_CONCLUSIONS.includes(conclusion) || conclusion === 'error') {
       // Apply the planner's head-bound evidence to the raw daemon snapshot too.

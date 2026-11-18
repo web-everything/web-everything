@@ -50,3 +50,23 @@ describe('drain CodeQL gate (drainBlocksOnCodeQL)', () => {
     expect(loadDrainGateSettings(join(dir, 'missing.json')).drainBlocksOnCodeQL).toBe(true);
   });
 });
+
+it.each([undefined, 1, 2])('actual drain retains CodeQL failure despite another workflow success (id=%s)', workflow_id => {
+  const failed = { __typename: 'CheckRun', name: 'CodeQL', workflow_id: 1, workflowName: 'security', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-28T01:00:00Z' };
+  const passed = { ...failed, workflow_id, workflowName: 'other', conclusion: 'SUCCESS', startedAt: '2026-10-28T02:00:00Z' };
+  for (const rows of [[failed, passed], [passed, failed]]) {
+    const pr = landable([...rollup4236.filter(c => c.name !== 'CodeQL'), ...rows]);
+    expect(classifyPr(pr, { defaultBranch: 'main' })).toMatchObject(workflow_id === 1
+      ? { decision: 'merge', codeqlBlocked: false } : { decision: 'skip', codeqlBlocked: true });
+  }
+});
+it('actual drain remains CodeQL-blocked during a rerun, then releases on completed SUCCESS', () => {
+  const failed = { name: 'CodeQL', workflow_id: 1, status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-28T01:00:00Z' };
+  const pending = { ...failed, status: 'IN_PROGRESS', conclusion: null, startedAt: '2026-10-28T02:00:00Z' };
+  const success = { ...pending, status: 'COMPLETED', conclusion: 'SUCCESS' };
+  const base = rollup4236.filter(c => c.name !== 'CodeQL');
+  for (const rows of [[failed, pending], [pending, failed]]) {
+    expect(classifyPr(landable([...base, ...rows]), { defaultBranch: 'main' })).toMatchObject({ decision: 'skip', codeqlBlocked: true });
+  }
+  expect(classifyPr(landable([...base, failed, success]), { defaultBranch: 'main' }).decision).toBe('merge');
+});

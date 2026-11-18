@@ -1,3 +1,4 @@
+import { resolveCheckRows } from '../lib/check-row-resolver.mjs';
 import { parseMqFailureRoute } from '../lib/mq-failure-route.mjs';
 import { admitMqFailureRoute } from './mq-failure-intake.mjs';
 import { ghRepoSlug } from '../lib/constellation-repos.mjs';
@@ -128,7 +129,7 @@ const DEFAULT_FIXER_LADDER = Object.freeze({
 import { OPERATOR_ANSWER_MARKER, isOperatorAnswerStandDownSuperseded, latestOperatorAnswer } from './stand-down-answer-core.mjs';
 import { classifyPr } from '../progress-board.mjs';
 import { reduceCheckState, CI_TRUTH_EXCLUDED_CHECKS } from '../operations/pr-status.mjs';
-import { collapseRollupToLatestPerName, FAILED_CHECK_CONCLUSIONS } from '../lib/rollup-collapse.mjs';
+import { FAILED_CHECK_CONCLUSIONS } from '../lib/rollup-collapse.mjs';
 import { isForeignCompletionSessionId, sanitizeDeniedCommand } from '../operations/completion-record.mjs';
 import { NEGOTIATION_ROUND_CAP } from '../lib/jury-core.mjs';
 import { resolveRoundCap } from '../lib/round-cap.mjs';
@@ -500,7 +501,7 @@ export function countRealFixRounds(pr) {
 export function splitFailingChecks(rollup, requiredChecks) {
   const required = Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks : null;
   const out = { required: [], nonRequired: [] };
-  for (const name of failingCheckNames(collapseRollupToLatestPerName(rollup))) {
+  for (const name of failingCheckNames(resolveCheckRows(rollup))) {
     const isRequired = required ? required.includes(name) : !CI_TRUTH_EXCLUDED_CHECKS.includes(name);
     out[isRequired ? 'required' : 'nonRequired'].push(name);
   }
@@ -510,18 +511,19 @@ export function splitFailingChecks(rollup, requiredChecks) {
 /** PURE: every failing required check is a review-owned hold (review-gate, or an annotated merge-gate). */
 export function reviewHoldGatesOnlyRed(rollup, requiredChecks) {
   if (!Array.isArray(rollup)) return false;
-  const latest = collapseRollupToLatestPerName(rollup);
+  const latest = resolveCheckRows(rollup);
   if (latest.some(row => !row || typeof (row.name || row.context) !== 'string')) return false;
   const failing = splitFailingChecks(latest, requiredChecks).required;
-  const mergeGate = latest.find(row => row?.name === 'merge-gate');
+  const mergeGates = latest.filter(row => row?.name === 'merge-gate');
   return failing.length > 0 && failing.every(name => name === 'review-gate'
-    || (name === 'merge-gate' && Boolean(mergeGate?.mergeGateReviewHold)));
+    || (name === 'merge-gate' && mergeGates.every(row => row.mergeGateReviewHold
+      || String(row.conclusion ?? row.state ?? '').toUpperCase() === 'SUCCESS')));
 }
 
 /** PURE: required reds are exclusively review-owned holds, with all other required evidence green. */
 export function reviewHoldOnlyRed(rollup, requiredChecks) {
   if (!reviewHoldGatesOnlyRed(rollup, requiredChecks)) return false;
-  const latest = collapseRollupToLatestPerName(rollup);
+  const latest = resolveCheckRows(rollup);
   const failing = splitFailingChecks(latest, requiredChecks).required;
   // Removing the proven holds must leave complete, readable green CI, never pending or unknown evidence.
   return reduceCheckState(latest.map(row => failing.includes(row?.name || row?.context)
@@ -547,7 +549,7 @@ export function staleRequiredBaseRepair({ pr, requiredChecks, defaultBranch }) {
       || typeof pr?.headRefOid !== 'string' || !pr.headRefOid.trim()) return null;
   if (pr.isDraft || (pr.baseRefName != null && pr.baseRefName !== defaultBranch)
       || String(pr.mergeStateStatus).toUpperCase() === 'DIRTY') return null;
-  const rows = collapseRollupToLatestPerName(pr.statusCheckRollup)
+  const rows = resolveCheckRows(pr.statusCheckRollup)
     .filter(row => !row?.head_sha || row.head_sha === pr.headRefOid);
   if (!rows.length || rows.some(row =>
     ['queued', 'in_progress', 'pending', 'waiting', 'requested'].includes(String(row?.status ?? row?.state).toLowerCase())

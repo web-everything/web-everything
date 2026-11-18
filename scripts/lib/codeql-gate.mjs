@@ -31,7 +31,7 @@ export function loadDrainGateSettings(path = join(dirname(fileURLToPath(import.m
   } catch { return { drainBlocksOnCodeQL: true }; }
 }
 
-/** The newest `CodeQL` rollup row whose conclusion is FAILURE, or `null` (absent, pending and passing are all null). */
+/** An unresolved `CodeQL` FAILURE, retained until a proven successful rerun, or `null`. */
 export function failedCodeQLCheck(pr) {
   if (pr?.requiredCheckReadError) return null;
   const roll = Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : [];

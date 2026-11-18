@@ -82,7 +82,7 @@ import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { countTrustedLeadingMarker } from '../lib/marker-authorship.mjs';
-import { latestRequiredCheck, isRequiredCheckFailed, collapseRollupToLatestPerName, CI_LIFECYCLE_LABELS, restampAcceptance } from '../merge-ai-prs.mjs';
+import { latestRequiredCheck, isRequiredCheckFailed, CI_LIFECYCLE_LABELS, restampAcceptance } from '../merge-ai-prs.mjs';
 import { REVIEW_LABELS, hasReviewLabel } from '../lib/review-escalation.mjs';
 import { spawnCiHealRearm } from './ci-heal-mark.mjs';
 import {
@@ -270,7 +270,7 @@ export function sweepCiRedRecovery({
   // DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS), so a `daemon-soak`-only red PR is refreshed like a `test`-red one.
   // Required checks also judge terminal retry outcomes when the CLI shares green PRs with the next pass.
   const prList = Array.isArray(prs) ? prs : [];
-  const anyRed = prList.some((pr) => collapseRollupToLatestPerName(pr?.statusCheckRollup).some((c) => isRequiredCheckFailed(pr, c?.name || c?.context)));
+  const anyRed = prList.some((pr) => (pr?.statusCheckRollup ?? []).some((c) => isRequiredCheckFailed(pr, c?.name || c?.context)));
   const checks = requiredCheck ? [requiredCheck]
     : (((anyRed || (exhaustedRetrySettings?.enabled && exhaustedRetrySettings.maxRetries > 0 && prList.length))
       ? readAttributedRequiredChecks({ repo, branch: defaultBranch }) : null) ?? DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS);

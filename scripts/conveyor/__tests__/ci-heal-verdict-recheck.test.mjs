@@ -788,7 +788,7 @@ describe('R37 latest attempts within workflow partitions', () => {
     }
   });
   it.each(['CI'])('accepts a newer successful attempt within workflow %s', workflowName => {
-    const failed = { name: 'test', workflowName, status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-28T01:00:00Z' };
+    const failed = { name: 'test', workflow_id: 1, workflowName, status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-28T01:00:00Z' };
     const passed = { ...failed, conclusion: 'SUCCESS', startedAt: '2026-10-28T02:00:00Z' };
     for (const rollup of [[failed, passed], [passed, failed]]) {
       expect(requiredCheckStates({ rollup, requiredChecks: ['test'] })).toEqual({ red: [], pending: [], missing: [], green: ['test'] });
@@ -822,5 +822,19 @@ it.each(['SKIPPED', 'NEUTRAL', 'CANCELLED', 'STALE'])('ci-heal retains failure a
     expect(ciGreenForEscalation(args)).toBe(false);
     expect(unsettledRequiredChecks(args).red).toEqual(['test']);
     expect(contradictingChecks({ ...input, ...args })).toEqual(['test']);
+  }
+});
+
+it.each([null, 'SKIPPED', 'NEUTRAL', 'CANCELLED'])('CodeQL rerun (%s) cannot turn unresolved failure into gate-only red', conclusion => {
+  const failed = { name: 'CodeQL', workflow_id: 1, status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-28T01:00:00Z' };
+  const rerun = { ...failed, status: conclusion ? 'COMPLETED' : 'IN_PROGRESS', conclusion, startedAt: '2026-10-28T02:00:00Z' };
+  const success = { ...failed, conclusion: 'SUCCESS', startedAt: '2026-10-28T03:00:00Z' };
+  const gates = [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }, { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' }];
+  for (const rows of [[failed, rerun], [rerun, failed]]) {
+    const args = { rollup: [...gates, ...rows], requiredChecks: ['test'] };
+    expect(requiredCheckStates(args).red).toEqual(['CodeQL']);
+    expect(ciGreenForEscalation(args)).toBe(false);
+    expect(verdictRecheck.gateOnlyRedStates(args).gateOnlyRed).toBe(false);
+    expect(verdictRecheck.gateOnlyRedStates({ ...args, rollup: [...args.rollup, success] }).gateOnlyRed).toBe(true);
   }
 });

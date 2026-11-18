@@ -7,7 +7,7 @@
 import { readFileSync } from 'node:fs';
 import { HUMAN_REVIEW_HOLD_GATES } from './merge-gate-verdict.mjs';
 import { GATE_IDS } from './merge-gate-inventory.mjs';
-import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
+import { resolveCheckNames } from './check-row-resolver.mjs';
 import { FAILING_CONCLUSIONS } from '../operations/pr-status.mjs';
 import { PLATFORM_PREFERENCES_PATH } from './merge-delivery-policy.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
@@ -155,9 +155,9 @@ export function classifyMergeGateHold({ results, prLabels, freeze, verdictComple
   return { excused, kind, holds, others, why: candidate ? 'current candidate must pass merge-gate' : excused ? 'only candidacy or cleared shared-freeze holds' : 'real or absent blocking evidence' };
 }
 
-/** Latest failing completed run only; success/pending supersedes all older failures. */
+/** Worst unresolved completed failure; only a proven successful rerun clears it. */
 export function latestFailingMergeGate(rows) {
-  const row = collapseRollupToLatestPerName(rows).find(r => r.name === 'merge-gate');
+  const row = resolveCheckNames(rows).find(r => r.name === 'merge-gate');
   return row && String(row.status).toLowerCase() === 'completed'
     && FAILING_CONCLUSIONS.includes(String(row.conclusion).toLowerCase()) ? row : null;
 }
@@ -187,7 +187,8 @@ export function excuseMergeGateRows(rows, { prNumber, headSha, labels, readVerdi
     }
     const replacement = { ...row, conclusion: row.conclusion === row.conclusion.toLowerCase() ? 'success' : 'SUCCESS',
       mergeGateHoldExcused: { kind: classification.kind, holds: classification.holds, jobId } };
-    return { rows: rows.filter(r => r.name !== 'merge-gate' || r === row).map(r => r === row ? replacement : r), excused: true };
+    // Excusing this job cannot erase another workflow's failure or pending row.
+    return { rows: rows.map(r => r === row ? replacement : r), excused: true };
   } catch { return unchanged; }
 }
 

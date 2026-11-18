@@ -1,8 +1,8 @@
+import { resolveCheckNames } from '../lib/check-row-resolver.mjs';
 /** The pusher hands its exact new head to CI immediately; the existing missing-run watch repairs missed triggers. */
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { recordFixPush } from './fix-push-state.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
-import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { withoutImpliedRequiredChecks } from '../lib/required-check-implication.mjs';
 import { planSizeGrowth, planGrowthTransition, SIZE_OVER_CAP_LABEL } from '../lib/pr-size-admission.mjs';
@@ -75,7 +75,7 @@ const rowVerdict = row => {
  * including an unknown required set, so a missing read falls back to the ordinary hand-off.
  */
 export function headCiVerdict(rollup, requiredChecks) {
-  const rows = collapseRollupToLatestPerName(rollup);
+  const rows = resolveCheckNames(rollup);
   const required = withoutImpliedRequiredChecks(Array.isArray(requiredChecks) ? requiredChecks : [], rows);
   const ci = required.filter(name => name !== FIX_PUSH_GATE_CHECK);
   if (!rows.length || !ci.length) return 'pending';

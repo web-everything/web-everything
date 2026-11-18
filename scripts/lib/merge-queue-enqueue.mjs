@@ -1,3 +1,4 @@
+import { resolveCheckNames } from './check-row-resolver.mjs';
 /**
  * @file scripts/lib/merge-queue-enqueue.mjs
  * @description Strategy `github-merge-queue` (`./merge-delivery-policy.mjs`): instead of `gh pr merge`, the drain
@@ -18,7 +19,6 @@ import { fileURLToPath } from 'node:url';
 import { PLATFORM_PREFERENCES_PATH } from './merge-delivery-policy.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { reviewCiGate } from './review-ci-gate.mjs';
-import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
 import { latestFailingMergeGate, readMergeGateVerdict } from './merge-gate-hold-class.mjs';
 import { readSharedFreeze } from './red-main-freeze-shared.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
@@ -512,15 +512,17 @@ function readMergeGateRuns({ repo, headSha }) {
   return out.workflow_runs;
 }
 
-function everyOtherRequiredGreen(requiredChecks, rollup) {
+export function everyOtherRequiredGreen(requiredChecks, rollup) {
   if (!Array.isArray(requiredChecks) || !Array.isArray(rollup)) return false;
-  const latest = new Map(collapseRollupToLatestPerName(rollup).map(row => [row?.name ?? row?.context, row]));
-  return requiredChecks.filter(name => name !== 'merge-gate').every(name => {
-    const row = latest.get(name);
+  const passes = row => {
     if (!row) return false;
     if (typeof row.state === 'string') return row.state.toLowerCase() === 'success';
     return String(row.status).toLowerCase() === 'completed' && String(row.conclusion).toLowerCase() === 'success';
-  });
+  };
+  const latest = new Map(resolveCheckNames(rollup, row => passes(row) ? 'green' : 'red')
+    .map(row => [row?.name ?? row?.context, row]));
+  return requiredChecks.filter(name => name !== 'merge-gate').every(name => passes(latest.get(name)));
+
 }
 
 function ensureRefreshLedger(path) {

@@ -23,8 +23,8 @@ describe('strict review CI prerequisite', () => {
     }
   });
   it('uses the newest rerun regardless of REST ordering', () => {
-    const old = { ...success('test'), workflowName: 'CI', id: 1, startedAt: '2026-10-28T01:00:00Z', conclusion: 'failure' };
-    const fresh = { ...success('test'), workflowName: 'CI', id: 2, startedAt: '2026-10-28T02:00:00Z' };
+    const old = { ...success('test'), workflow_id: 1, workflowName: 'CI', id: 1, startedAt: '2026-10-28T01:00:00Z', conclusion: 'failure' };
+    const fresh = { ...success('test'), workflow_id: 1, workflowName: 'CI', id: 2, startedAt: '2026-10-28T02:00:00Z' };
     for (const rows of [[old, fresh], [fresh, old]]) expect(gate([...rows, success('daemon-soak')]).allowed).toBe(true);
     for (const status of ['in_progress', 'completed']) {
       expect(gate([{ ...fresh, id: 3, startedAt: '2026-10-28T03:00:00Z', status, conclusion: 'failure' }, fresh, success('daemon-soak')]).allowed).toBe(false);

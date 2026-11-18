@@ -1,3 +1,4 @@
+import { resolveCheckRows } from '../lib/check-row-resolver.mjs';
 import { greenLedgerDir, hasGreenLedger } from '../lib/lane-verify.mjs';
 import { unread } from './dispatch-eligibility.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
@@ -60,7 +61,6 @@ import { excusePrMergeGateHolds, readMergeGateVerdict as defaultReadMergeGateVer
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { readMainRedPriority } from '../lib/main-red-priority.mjs'; // card xu1nixv
 import { fetchPrCommits } from '../lib/pr-limit.mjs';
-import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { FAILING_CONCLUSIONS, NON_BLOCKING_CONCLUSIONS, reduceCheckState } from '../operations/pr-status.mjs';
 import { checksArgv, parseJsonLines, GH_TIMEOUT_MS } from '../operations/pr-status-io.mjs';
 import { isGhDeferred } from '../lib/gh-deferred.mjs';
@@ -1568,7 +1568,7 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch })
           || (row.completed_at != null && !Number.isFinite(Date.parse(row.completed_at))))) {
           throw new Error('malformed check runs');
         }
-        const unreadable = collapseRollupToLatestPerName(rows).filter(row => (!requiredChecks?.length || requiredChecks.includes(row.name))
+        const unreadable = resolveCheckRows(rows).filter(row => (!requiredChecks?.length || requiredChecks.includes(row.name))
           && row.status.toLowerCase() === 'completed'
           && !['success', ...FAILING_CONCLUSIONS, ...NON_BLOCKING_CONCLUSIONS].includes(row.conclusion?.toLowerCase()));
         if (unreadable.length) throw new Error(`unreadable conclusions: ${unreadable.map(row => row.name).join(', ')}`);
@@ -1577,7 +1577,7 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch })
         // missing names is the evidence incomplete — the reducer then reports `unchecked`, which never heals
         // or promotes, and the refusal below keeps that visible.
         const absent = withoutImpliedRequiredChecks(requiredChecks ?? [], rows).filter(name => !rows.some(row => row.name === name));
-        const observed = collapseRollupToLatestPerName(rows).some(row => (!requiredChecks?.length || requiredChecks.includes(row.name))
+        const observed = resolveCheckRows(rows).some(row => (!requiredChecks?.length || requiredChecks.includes(row.name))
           && (row.status.toLowerCase() !== 'completed' || FAILING_CONCLUSIONS.includes(row.conclusion?.toLowerCase())));
         cache.set(key, { rows: rows.map(row => ({ ...row, status: row.status.toUpperCase(),
           detailsUrl: row.detailsUrl ?? row.details_url ?? row.html_url ?? null,

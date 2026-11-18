@@ -1,3 +1,4 @@
+import { resolveCheckRows } from '../lib/check-row-resolver.mjs';
 /**
  * @file scripts/operations/pr-status.mjs
  * @description THE `pr-status` DECLARATION (#xewnork, under epic #3029) — for each open PR, did a check
@@ -77,7 +78,6 @@ import { compute } from './step-kinds.mjs';
 // READ-ONLY operation (`we:scripts/operations/http-adapter.test.mjs#3036`), which must import nothing that can
 // act, and `merge-ai-prs.mjs` imports `node:child_process`/`node:fs` writes/etc. throughout. See that lib
 // module's own header for the full reasoning.
-import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { withoutImpliedRequiredChecks } from '../lib/required-check-implication.mjs';
 
 export const PR_STATUS_OP = 'pr-status';
@@ -170,7 +170,7 @@ export const FAILING_CONCLUSIONS = Object.freeze([
  * @returns {{state: string, why: string, counts: {total: number, succeeded: number, failed: number, running: number, nonBlocking: number, unreadable: number}}}
  */
 export function reduceCheckState(runs = [], requiredChecks) {
-  const collapsed = collapseRollupToLatestPerName(runs);
+  const collapsed = resolveCheckRows(runs);
   const requiredRaw = Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks : null;
   // A required name implied by a green aggregate (`integration` by `test`) is not "missing" on a head that predates it.
   const required = requiredRaw ? withoutImpliedRequiredChecks(requiredRaw, collapsed) : null;

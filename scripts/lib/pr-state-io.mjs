@@ -1,3 +1,4 @@
+import { resolveCheckRows } from './check-row-resolver.mjs';
 /**
  * @file Bounded, read-only observations for /state. Runtime records can outlive a worker;
  * only `claude agents` busy/working is live evidence. Each failed probe remains visible.
@@ -12,7 +13,6 @@ import { tailLines, PROJECTS_DIR } from '../../skills-src/inspect-agent-health/a
 import { redactCommandLine, REDACTED } from '../operations/command-redact.mjs';
 import { reduceCheckState } from '../operations/pr-status.mjs';
 import { DECLARED_REQUIRED_STATUS_CHECKS, FALLBACK_REQUIRED_STATUS_CHECKS, getRequiredStatusChecks } from './required-status-checks.mjs';
-import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
 import { readFixDispatchClaim, fixDispatchSessionName } from '../conveyor/fix-claim-store.mjs';
 import { tryReadCompletion, resolveCompletionsDir } from '../operations/completion-store.mjs';
 import { buildPrToCardMap } from '../operations/pr-ownership-io.mjs';
@@ -121,8 +121,8 @@ export function readPrFacts(pr, io = {}) {
   }, [...(DECLARED_REQUIRED_STATUS_CHECKS[repo] ?? FALLBACK_REQUIRED_STATUS_CHECKS)]); // each repo's own declared policy
   if (!required.length) errors.push('required-check set empty; readiness unknown');
   if (commit?.statusCheckRollup?.contexts?.pageInfo?.hasNextPage) errors.push('check rollup truncated at 100');
-  const rollup = collapseRollupToLatestPerName(array(commit?.statusCheckRollup?.contexts?.nodes).map(c => c.context
-    ? { name: c.context, status: c.state === 'PENDING' ? 'IN_PROGRESS' : 'COMPLETED',
+  const rollup = resolveCheckRows(array(commit?.statusCheckRollup?.contexts?.nodes).map(c => c.context
+    ? { ...c, name: c.context, status: c.state === 'PENDING' ? 'IN_PROGRESS' : 'COMPLETED',
       conclusion: c.state === 'SUCCESS' ? 'SUCCESS' : c.state === 'PENDING' ? null : 'FAILURE', completedAt: c.createdAt } : c));
   // The rollup describes the current head only when BOTH probes answered for the same sha. Otherwise a check is
   // UNKNOWN — never "missing", which would read as CI still running and mask a stalled PR.

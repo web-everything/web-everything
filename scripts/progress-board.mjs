@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolveCheckRows } from './lib/check-row-resolver.mjs';
 /**
  * progress-board.mjs — the operator's published progress board (item `x9t5i5a`).
  *
@@ -99,7 +100,6 @@ import { isRequiredCheckGreen, isRequiredCheckPending } from './merge-ai-prs.mjs
 // than re-imported from `./merge-ai-prs.mjs` (where it also lives, re-exported) — see that lib module's own
 // header for why `./operations/pr-status.mjs` needed this split; this file has no such constraint itself
 // (it already imports `./merge-ai-prs.mjs` above) but there is no reason to prefer the heavier path either.
-import { collapseRollupToLatestPerName } from './lib/rollup-collapse.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const DEFAULT_STATE = join(ROOT, 'reports', 'progress-board.json');
@@ -510,7 +510,7 @@ function ghPrList(repo, args) {
  */
 export function ciFailed(rollup, requiredChecks) {
   const required = Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks : null;
-  return collapseRollupToLatestPerName(rollup).some((c) => {
+  return resolveCheckRows(rollup).some((c) => {
     const name = String(c?.name ?? '');
     if (required) {
       if (!required.includes(name)) return false;

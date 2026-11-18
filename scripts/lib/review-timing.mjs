@@ -1,6 +1,6 @@
+import { resolveCheckNames } from './check-row-resolver.mjs';
 /** Pure review/fixer timing decisions. Inputs always describe one pinned head. */
 import { reviewCiGate } from './review-ci-gate.mjs';
-import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
 import { withoutImpliedRequiredChecks } from './required-check-implication.mjs';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from './constellation-repos.mjs';
 
@@ -61,7 +61,7 @@ const isHealable = (row, requiredChecks) => {
 /** Is a healable check red on this head? An optional red (CodeQL, with a known required set) is not. */
 export function ciRedOnHead({ headSha, checks, requiredChecks = null } = {}) {
   if (!headSha) return false;
-  return collapseRollupToLatestPerName(checks).some(row => isHealable(row, requiredChecks)
+  return resolveCheckNames(checks).some(row => isHealable(row, requiredChecks)
     && (!row.head_sha || row.head_sha === headSha)
     && RED.has(String(row.conclusion ?? row.state ?? '').toLowerCase()));
 }
@@ -106,7 +106,7 @@ export function earlyStartShadow({ headSha, checks, requiredChecks, verifyGreen,
     };
     // Judge every RAW row (before rollup collapse or head filtering) so a malformed or contradictory row cannot vanish.
     if (!checks.every(row => readable(row) && !(row.state != null && (row.conclusion != null || row.status != null)))) return result('incomplete-checks');
-    const rows = collapseRollupToLatestPerName(checks).filter(row => !row.head_sha || row.head_sha === headSha);
+    const rows = resolveCheckNames(checks).filter(row => !row.head_sha || row.head_sha === headSha);
     if (!requiredChecks.every(name => rows.some(row => (row.name ?? row.context) === name && readable(row)))) return result('incomplete-checks');
     if (rows.some(row => !readable(row))) return result('incomplete-checks');
     if (ciRedOnHead({ headSha, checks, requiredChecks })) return result('ci-red');
@@ -137,7 +137,11 @@ function readableEarlyChecks(checks, headSha) {
 function registeredStartGate({ headSha, checks, requiredChecks }) {
   const strict = reviewCiGate({ headSha, checks, requiredChecks });
   if (!checkNames(requiredChecks) || typeof headSha !== 'string' || !headSha.trim()) return strict;
-  const latest = new Map(collapseRollupToLatestPerName(checks).map(row => [row?.name ?? row?.context, row]));
+  const latest = new Map(resolveCheckNames(checks, row => {
+    // This gate relaxes pending only; skipped/neutral remain strict refusals.
+    const verdict = reviewCiGate({ headSha, requiredChecks: [row?.name ?? row?.context], checks: [row] });
+    return verdict.allowed ? 'green' : verdict.affected.some(check => check.reason === 'pending') ? 'pending' : 'red';
+  }).map(row => [row?.name ?? row?.context, row]));
   // Same implication rule as the strict gate: a green aggregate (test) proves a split-out job (integration). The
   // strict gate reads a legacy commit status (`{context, state}`) as a check row first, so a green STATUS aggregate
   // implies too; the per-row judgment below reads the raw row, which already handles `state`. Only a row with NO
@@ -248,7 +252,7 @@ export function joinedFixDecision({ ciFailed = false, reviewFindings = false, fi
  * back to the heal path's own rule (every check but {@link NON_HEALABLE_CHECKS}).
  */
 export function fixReadiness({ headSha, checks = [], findings = [], reviewPending = false, requiredChecks = null } = {}) {
-  const latest = collapseRollupToLatestPerName(checks).filter(row =>
+  const latest = resolveCheckNames(checks).filter(row =>
     !isReviewHoldGate(row) && (!row.head_sha || row.head_sha === headSha));
   const failed = latest.filter(row => isHealable(row, requiredChecks)
     && RED.has(String(row.conclusion ?? row.state ?? '').toLowerCase()));
@@ -268,7 +272,7 @@ export function fixPushGate({ previousHeadChecks, requiredChecks, firstHeldAt, n
   const maxMin = Number.isSafeInteger(policy.pushAfterCiMaxMin) && policy.pushAfterCiMaxMin >= 0
     ? policy.pushAfterCiMaxMin : FIX_TIMING_DEFAULTS.pushAfterCiMaxMin;
   const deadline = firstHeldAt + maxMin * 60_000;
-  const latest = collapseRollupToLatestPerName(previousHeadChecks);
+  const latest = resolveCheckNames(previousHeadChecks);
   const rows = latest.filter(row => !isReviewHoldGate(row));
   const required = Array.isArray(requiredChecks) && requiredChecks.length
     ? requiredChecks.filter(name => name !== 'review-gate' && !latest

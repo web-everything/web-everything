@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolveCheckNames } from './lib/check-row-resolver.mjs';
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
@@ -137,10 +138,10 @@ import { OPEN_PR_LIST_LIMIT, isDegradedOpenPrListing, filterOpenPrsByLabel } fro
 // beside `latestRequiredCheck`) for why `collapseRollupToLatestPerName`/`rollupRowKind` now live in their own
 // dependency-free `./lib/rollup-collapse.mjs` rather than here.
 import {
-  collapseRollupToLatestPerName, latestCheckNamed, isFailedCheckRow,
+  collapseRollupToLatestPerName, isFailedCheckRow,
   requiredCheckReadNeeded, requiredCheckRunsEndpoint, mergeRequiredCheckRuns,
 } from './lib/rollup-collapse.mjs';
-import { CODEQL_CHECK_NAME, loadDrainGateSettings } from './lib/codeql-gate.mjs';
+import { CODEQL_CHECK_NAME, loadDrainGateSettings, failedCodeQLCheck } from './lib/codeql-gate.mjs';
 export { isAiAuthor, isAiCommit, isMechanicalMergeCommit, isDrainBookkeepingCommit } from './lib/ai-pr-authorship.mjs';
 export { isAiGeneratedPr, hasLabel };
 import { execFileSync, spawnSync } from 'node:child_process';
@@ -432,56 +433,15 @@ export function syncPrimaryOnLand({ exec, primary, hinted = false, isCwd = () =>
   catch { return { synced: false, reason: 'diverged', warn: true }; }
 }
 
-/**
- * #xkfv491 — the MOST RECENT rollup entry for a check name, which is the only one that describes the CURRENT
- * tree. A head SHA routinely carries SEVERAL runs of the same check: a workflow `concurrency` group cancels the
- * in-flight run when a new one supersedes it, leaving a CANCELLED entry sitting next to the SUCCESS that
- * actually finished.
- *
- * Both callers below used `roll.find(...)`, i.e. the FIRST entry by name — and GitHub returns the rollup in
- * creation order, so `find` reliably picked the OLDEST run. Observed on PR #1042: `test` had CANCELLED at
- * 18:34:02 (superseded) at index 0 and SUCCESS at 18:35:32 at index 1, so the drain read the PR as not-green
- * and skipped it every pass while `gh pr checks` reported a pass — the two disagreed because `gh` collapses to
- * the latest run per name and the drain did not. Three PRs were held at once (#1042, #1046, #1012), and the
- * twin `isRequiredCheckFailed` would have stamped `ci:failed` on a genuinely green PR from the same evidence.
- * Re-running CI does NOT clear it: the cancelled entry stays in the rollup and a re-run only appends.
- *
- * WE TRUST GITHUB'S ORDER — the rollup arrives in creation order, so the LAST matching entry is the newest.
- * An earlier cut of this fix ranked entries by a timestamp instead, to be robust to an ordering GitHub does
- * not actually emit. That bought three defects and no observed benefit (review of PR #1049), so it is gone:
- *   • it compared one run's `completedAt` against another's `startedAt` — different clocks, so a run that
- *     ENDED late outranked the newer run that had only STARTED;
- *   • an entry with no usable stamp ranked as globally OLDEST, so an in-flight run could never suppress a
- *     stale SUCCESS;
- *   • it needed a special case for the `0001-01-01T00:00:00Z` sentinel GitHub reports for an unfinished run.
- * If a rollup ever arrives out of creation order, that is the moment to revisit — not before.
- *
- * CHECK RUNS OUTRANK COMMIT STATUSES. A rollup can mix two shapes: a `CheckRun` (produced by the workflow) and
- * a legacy `StatusContext` (posted through the commit-statuses API by anyone holding `statuses:write` — a
- * collaborator, a bot, an installed App). Plain last-wins across both would let a `test`-named status posted
- * after the real run OVERRIDE its FAILURE and clear the merge gate, which the pre-#xkfv491 `find` did not
- * allow. So when any CheckRun matches the name, only CheckRuns are considered; a StatusContext decides only
- * when the workflow has produced nothing at all.
- *
- * THE UNION MEMBER IS READ OFF `__typename`, NOT GUESSED FROM `name` (PR #1049 review). Every live
- * `gh pr view --json statusCheckRollup` row carries `__typename` (verified on PR #1049 itself), so the
- * authoritative tag is free. An earlier cut inferred "this is a CheckRun" from the presence of `name` — correct
- * against raw gh output, but `rollupToCheckRows` (`we:scripts/fetch-parked.mjs#rollupToCheckRows`) re-normalises
- * rows to `{ name: c.name || c.context }`, so every StatusContext in that output would have classified as a
- * CheckRun and the preference above would have silently collapsed to plain last-wins. A row with NO (or an
- * unrecognised) `__typename` is therefore treated as UNTRUSTED rather than as a CheckRun: it ranks in its own
- * tier, below any tagged CheckRun. {@link rollupRowKind} does the classification; the pool is the FIRST
- * non-empty tier of `CheckRun` → untagged → `StatusContext`.
- *
- * Latest-wins is the principled rule, not "ignore CANCELLED": if the NEWEST run is cancelled then the check
- * genuinely has no current verdict and the PR must not land. Pure.
- * @param {{statusCheckRollup?: Array<object>}} pr
- * @param {string} requiredCheck
- * @returns {object|null} the newest matching entry, or `null` when the check has not reported at all.
- */
+/** Worst unresolved row for an exact required name. Compare reruns only within
+ * stable workflow identities; incomplete identity/order evidence fails closed.
+ * Separate evidence kinds cannot clear one another's failures. */
 export function latestRequiredCheck(pr, requiredCheck = 'test') {
   if (pr?.requiredCheckReadError) return null;
-  return latestCheckNamed(pr?.statusCheckRollup, requiredCheck);
+  return resolveCheckNames(pr?.statusCheckRollup, row => {
+    if (isFailedCheckRow(row)) return 'red';
+    return String(row?.conclusion || row?.state || '').toUpperCase() === 'SUCCESS' ? 'green' : 'pending';
+  }).find(row => (row?.name || row?.context) === requiredCheck) ?? null;
 }
 
 /**
@@ -495,11 +455,9 @@ export function latestRequiredCheck(pr, requiredCheck = 'test') {
 export { CODEQL_CHECK_NAME, loadDrainGateSettings };
 const DRAIN_GATE_SETTINGS = loadDrainGateSettings();
 
-/** Did the latest `CodeQL` check on this PR conclude FAILURE (new alerts)? Pure; an absent/pending/passing CodeQL is false. */
+/** Does this PR retain an unresolved CodeQL FAILURE? Pure; pending reruns cannot clear it. */
 export function isCodeQLFailed(pr) {
-  const check = latestRequiredCheck(pr, CODEQL_CHECK_NAME);
-  if (!check) return false;
-  return String(check.conclusion || check.state || '').toUpperCase() === 'FAILURE';
+  return failedCodeQLCheck(pr) !== null;
 }
 
 /** Resolve capped/missing rollup evidence against the listed head, never a moving branch.
@@ -524,22 +482,12 @@ export async function resolveRequiredCheck(pr, { repo = null, requiredCheck = 't
   return resolved;
 }
 
-// #2925/#xkfv491 — `collapseRollupToLatestPerName`/`rollupRowKind` now live in their OWN dependency-free module,
-// `we:scripts/lib/rollup-collapse.mjs` (we:backlog/fix-review-ciheal-deadlock): `we:scripts/operations/
-// pr-status.mjs` needed this exact collapse too (its `reduceCheckState` had the identical stale-rerun defect —
-// see that function's own header), but it is the declaring module of the `pr-reconcile` READ-ONLY operation,
-// which must import nothing that can act — and this file imports `node:child_process`/`node:fs` writes/etc.
-// throughout. `collapseRollupToLatestPerName` (imported up top, beside `./lib/ai-pr-authorship.mjs`) is used
-// here directly by `latestRequiredCheck` above and re-exported unchanged; `rollupRowKind` is re-exported ONLY
-// (nothing in THIS file calls it locally any more) — mirrors `./lib/ai-pr-authorship.mjs`'s own
-// used-here-vs-re-exported-only split. Every existing importer of either name FROM THIS FILE (`we:scripts/
-// fetch-parked.mjs`, `we:scripts/readiness/conveyor-state.mjs`, `we:scripts/conveyor/ci-red-recovery-watch.mjs`,
-// `we:scripts/progress-board.mjs`, and the test importing `rollupRowKind` directly) keeps working unchanged.
+// Display compatibility export only. Required verdicts above use the shared resolver.
 export { collapseRollupToLatestPerName };
 export { rollupRowKind } from './lib/rollup-collapse.mjs';
 
 /** Is the required `test` check green on this PR's rollup? (Other checks — cla, Workers Builds — are ignored.)
- *  Reads the LATEST run of that check (#xkfv491), never the first-listed one. */
+ *  Reads the worst unresolved workflow after resolving proven reruns. */
 export function isRequiredCheckGreen(pr, requiredCheck = 'test') {
   const check = latestRequiredCheck(pr, requiredCheck);
   if (!check) return false;
@@ -548,8 +496,8 @@ export function isRequiredCheckGreen(pr, requiredCheck = 'test') {
 }
 
 /** Is the required `test` check DEFINITIVELY red (failed/cancelled/timed-out/errored) on this PR's rollup? The
- *  twin of `isRequiredCheckGreen` (#2421), reading the same LATEST run (#xkfv491) — so a superseded CANCELLED
- *  run can no longer stamp `ci:failed` on a PR whose current run went green. A MISSING check (not yet reported)
+ *  twin of `isRequiredCheckGreen`, reading the same resolved evidence. A later
+ *  completed SUCCESS clears a failure only within a proven workflow identity. A MISSING check (not yet reported)
  *  is NOT failed — it reads as in-flight (`checking`), never `ci:failed`; only a check GitHub has actually
  *  concluded red counts. */
 export function isRequiredCheckFailed(pr, requiredCheck = 'test') {

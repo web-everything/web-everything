@@ -12,12 +12,11 @@ function workflowOf(row) {
   const id = first(workflows.map(workflow => workflow.databaseId))
     ?? first(workflows.map(workflow => workflow.id)) ?? present(row?.workflow_id)
     ?? first(workflows.flatMap(workflow => [workflow.resourcePath, workflow.url, workflow.path]));
-  const name = present(row?.workflowName)
-    ?? (typeof row?.workflow === 'string' ? present(row.workflow) : null) ?? first(workflows.map(workflow => workflow.name));
-  return { id, name };
+  return { id };
 }
 
-const nonProving = row => /^(skipped|neutral|cancelled|canceled|stale)$/i.test(row?.conclusion ?? row?.state ?? '');
+const successful = row => String(row?.conclusion ?? '').toUpperCase() === 'SUCCESS'
+  && (row?.status == null || String(row.status).toUpperCase() === 'COMPLETED');
 
 // Compare attempt starts only: completion order cannot establish attempt order.
 function attemptTime(row) {
@@ -33,7 +32,8 @@ const stateOf = row => classifyCheck({ ...row, required: true,
 });
 
 /**
- * One row per workflow identity/name/evidence kind. Missing workflows or start times make the whole group ambiguous; ties
+ * One row per stable workflow identity/check name/evidence kind. Any missing workflow id
+ * makes the entire check name ambiguous; missing start times also disable ordering. Ties
  * and ambiguous groups prefer red, then pending, then green. IDs/input order
  * never establish recency. Callers may supply their stricter state policy.
  * Rows without workflow information share one ambiguous group per name/kind. Inputs stay intact.
@@ -48,35 +48,44 @@ export function resolveCheckRows(rows, classify = stateOf) {
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(row);
   }
+  // One unknown identity makes the entire check name incomparable, even if
+  // the display names differ or the unknown row belongs to another evidence kind.
+  const ambiguousNames = new Set((Array.isArray(rows) ? rows : [])
+    .filter(row => !workflowOf(row).id).map(row => row?.name || row?.context));
   const partitions = [...groups.values()].flatMap(bucket => {
-    const parts = [];
+    if (ambiguousNames.has(bucket[0]?.name || bucket[0]?.context)) return [bucket];
+    const byWorkflow = new Map();
     for (const row of bucket) {
-      const workflow = workflowOf(row);
-      const matches = parts.filter(part => part.some(other => {
-        const candidate = workflowOf(other);
-        return workflow.id && candidate.id ? workflow.id === candidate.id : workflow.name === candidate.name;
-      }));
-      // A name-only row bridges every matching identity. Such evidence is
-      // ambiguous, so no timestamp can hide another member of the partition.
-      const merged = [...matches.flat(), row];
-      for (const part of matches) parts.splice(parts.indexOf(part), 1);
-      parts.push(merged);
+      const id = workflowOf(row).id;
+      if (!byWorkflow.has(id)) byWorkflow.set(id, []);
+      byWorkflow.get(id).push(row);
     }
-    return parts;
+    return [...byWorkflow.values()];
   });
   return partitions.map(group => {
-    const workflows = group.map(workflowOf);
-    const ambiguous = workflows.some(w => !w.id && !w.name)
-      || (workflows.some(w => w.id) && workflows.some(w => !w.id));
+    const ambiguous = ambiguousNames.has(group[0]?.name || group[0]?.context);
     const times = group.map(attemptTime);
     const latest = ambiguous || times.includes(null)
       ? null : times.reduce((max, time) => Math.max(max, time), 0);
     const candidates = latest === null ? group : group.filter((_, i) => times[i] === latest);
-    if (candidates.every(nonProving)) {
-      const failure = group.find(row => classify(row) === 'red' && !nonProving(row));
-      if (failure) return failure;
-    }
+    // Failure remains evidence until a strictly later completed SUCCESS in the
+    // same identified group. Pending and non-proving conclusions cannot clear it.
+    const failures = group.filter(row => classify(row) === 'red' && !successful(row));
+    const uncleared = failures.filter(failure => latest === null || !group.some(row =>
+      successful(row) && attemptTime(row) > attemptTime(failure)));
+    if (uncleared.length) return uncleared[0];
     const rank = row => ({ green: 0, pending: 1, red: 2 }[classify(row)] ?? 2);
     return candidates.reduce((worst, row) => rank(row) > rank(worst) ? row : worst);
   });
+}
+
+/** One worst row per exact check name, after resolving each workflow's attempts. */
+export function resolveCheckNames(rows, classify = stateOf) {
+  const byName = new Map();
+  const rank = row => ({ green: 0, pending: 1, red: 2 }[classify(row)] ?? 2);
+  for (const row of resolveCheckRows(rows, classify)) {
+    const name = row?.name || row?.context;
+    if (!byName.has(name) || rank(row) > rank(byName.get(name))) byName.set(name, row);
+  }
+  return [...byName.values()];
 }
