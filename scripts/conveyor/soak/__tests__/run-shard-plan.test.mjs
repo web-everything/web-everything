@@ -13,6 +13,16 @@ describe('soak run-shard planShard — a quarantine never turns a shard green wi
     expect(plan.files).toEqual([]);
   });
 
+  it('PASSES, naming each file, when every assigned file is covered by an active job-tagged entry', () => {
+    const plan = planShard({ assigned: ['a', 'b'], excluded: new Set(['a', 'b']), quarantined: new Set(['a', 'b']) });
+    expect(plan).toMatchObject({ exit: 0, files: [] });
+    expect(plan.message).toContain('a, b');
+  });
+
+  it('FAILS when only some emptied files are covered (a generic exclusion hides the rest)', () => {
+    expect(planShard({ assigned: ['a', 'b'], excluded: new Set(['a', 'b']), quarantined: new Set(['a']) }).exit).toBe(1);
+  });
+
   it('a shard with nothing assigned stays a clean no-op', () => {
     expect(planShard({ assigned: [], excluded: new Set() })).toMatchObject({ exit: 0 });
   });

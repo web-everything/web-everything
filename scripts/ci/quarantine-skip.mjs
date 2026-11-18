@@ -105,7 +105,7 @@ export function quarantineSkip({
   if (flags.nonblocking) return { line: d.skip.join(' '), why, skip: d.skip };
   const { line, refused } = renderExclude(d.skip);
   return {
-    line: /^soak-shard \(\d+\)$/.test(job) ? d.skip.filter((f) => !refused.includes(f)).map((f) => `--exclude=${f}`).join(' ') : line,
+    line: /^soak-shard \(\d+\)$/.test(job) ? d.skip.filter((f) => !refused.includes(f)).map((f) => `--exclude=${f} --quarantined=${f}`).join(' ') : line,
     why: `${why}${refused.length ? `; ${refused.length} file(s) not skipped (unsafe exclude paths; running): ${JSON.stringify(refused)}` : ''}`,
     skip: d.skip.filter((file) => !refused.includes(file)),
   };

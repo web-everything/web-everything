@@ -12,7 +12,8 @@
  * A shard with zero assigned files (more shards than break files) is a clean, logged no-op success — not an
  * error — so the shard count can grow ahead of the break count without turning red.
  * CI appends quarantine-skip's whole-file exclusions. Apply them AFTER assignment so quarantining a test
- * never moves other tests between shards. A fully quarantined shard FAILS (shard-plan.mjs), as do more than 5 exclusions.
+ * never moves other tests between shards. A shard emptied by anything but active job-tagged quarantine entries FAILS
+ * (shard-plan.mjs), as do more than 5 exclusions.
  */
 
 import { spawnSync } from 'node:child_process';
@@ -26,7 +27,9 @@ function main(argv) {
   // These are exact repo-relative file identities, not Vitest globs. CI's quarantine adapter owns the
   // eligibility guards (main, repair PRs, changed files, expiry and unknown evidence all run everything).
   const excluded = new Set(argv.filter((a) => a.startsWith('--exclude=')).map((a) => a.slice('--exclude='.length)));
-  const plan = planShard({ assigned, excluded });
+  // `--quarantined=<file>` is emitted ONLY by quarantine-skip for an active entry tagged for this exact job.
+  const quarantined = new Set(argv.filter((a) => a.startsWith('--quarantined=')).map((a) => a.slice('--quarantined='.length)));
+  const plan = planShard({ assigned, excluded, quarantined });
   const { files, skipped } = plan;
   if (skipped) process.stdout.write(`soak shard ${shard}/${total}: ${skipped} quarantined file(s) skipped.\n`);
   if (plan.exit !== null) {
