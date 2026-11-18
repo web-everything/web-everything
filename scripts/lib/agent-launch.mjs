@@ -44,8 +44,7 @@ export function agentResumeId(argv = []) {
 // scans more, so it can only over-refuse), and so are the short value options below.
 const SWITCH_OPTIONS = new Set([
   '--print', '--bg', '--verbose', '--continue', '--restricted', '--json', '--help', '--version', '--debug',
-  '--last', '--all', '--skip-git-repo-check', '--full-auto', '--ephemeral', '--oss',
-  '--dangerously-bypass-approvals-and-sandbox', '--dangerously-skip-permissions',
+  '--last', '--all', '--skip-git-repo-check', '--ephemeral', '--oss',
 ]);
 const SHORT_VALUE_OPTIONS = new Set(['-n', '-m', '-s', '-C']);
 // Codex's own short value options (-c config, -i image, -p profile, -o output file) are only consulted while
