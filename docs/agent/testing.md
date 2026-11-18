@@ -3470,11 +3470,8 @@ The real-host cases require permission to execute `ps` and read the boot UUID on
 a sandbox denying either operation produces unknown and cannot certify those cases.
 ## Optional early review and delayed fix push
 
-`review.startBeforeCi` requires both successful resolver evidence for the policy's CI prerequisites
-and `hasGreenLedger` evidence for the exact head. A marker never upgrades missing, malformed,
-pending, incomplete, foreign-head or untrusted-roster evidence, even with `startEarly: on`.
-Keep the named `verification only adds a requirement and never upgrades resolver evidence under %s`
-regression across push, fast-checks and ci-green, including a green-CI/false-marker denial. Keep ledger IO in the reconcile/publish shells and skip it when disabled. The existing
+`review.startBeforeCi` admits an early review only with `hasGreenLedger` evidence for the exact
+head. Keep ledger IO in the reconcile/publish shells and skip it when disabled. The existing
 red-main hold runs before CI-heal caps; test it with a PR behind main (`aheadByOnMain > 0`),
 since a PR already containing main has its own failure. `fix.pushAfterCi` waits before the
 agent so completed CI failures enter that same repair's fenced context. Its push boundary uses
@@ -4706,3 +4703,35 @@ unknown source. The named reconcile provenance regression covers complete green 
 under `ci-green` timing with live/cache evidence, unavailable provenance, incomplete
 rows. Its source lint checks every reconcile gate call for explicit
 forwarding, so a new call cannot silently depend on a removed provenance default.
+
+## Required-check evidence contract (PR1)
+
+`resolveRequiredChecks` ships without production callers. Its acceptance tests build
+job/head-bound hold annotations inline; no caller or hold-classifier change is required.
+Every required name needs its own evidence, a live/cache roster, an exact head and
+`rowsComplete: true`. Missing or false completeness returns `unknown`; neutral/skipped
+conclusions fail unless the exact name is in `optionalNames`.
+
+The fetch tests prove completeness only from matching connection counts, valid nodes
+and `hasNextPage: false`, and preserve the commit read head independently of the PR head.
+Legacy hydration reads at most ten batches of twenty heads. Unreadable, truncated or
+overflow evidence remains incomplete for retry on a later tick or operator inspection;
+an incomplete refresh preserves previously observed failures. Retry by exhausting
+pagination or explicitly reading every required name before attesting completeness.
+
+
+## PR1 audit: malformed rows, human holds and unavailable rosters
+
+`pr-list-paged.test.mjs` pins success beside null, empty and unknown-type nodes in both
+orders: mapping retains a nameless unknown row, marks the connection incomplete, and
+prevents a green legacy summary (which rejects the malformed identity). Strict resolution
+returns `unknown`. The open-PR fetch regression also proves that such an incomplete refresh
+preserves an already observed failure. Retry the read on a later tick or inspect the evidence
+before admission; never discard malformed nodes to obtain a green summary.
+
+`check-state-predicate.test.mjs` requires the shared `humanReviewOnlyHold` guard for each
+job/head-bound merge-gate hold source: IDs must be a nonempty subset of the human-review
+hold gates and include `review-hold-labels` or `review-acceptance`. Candidate-label-only
+and other incidental holds retain failure. Empty or malformed required rosters always
+return `unknown` with `roster-unavailable`, including persisted options containing the
+removed `allowEmptyRequiredNames` override and evidence with an observed merge-gate failure.

@@ -4327,7 +4327,7 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
       root,
       env: { WE_REVIEW_START_EARLY: 'on', WE_REVIEW_START_AFTER: 'push', WE_REVIEW_START_EARLY_PUBLISH_WAIT_MS: '250', WE_REVIEW_START_EARLY_POLL_MS: '100' },
       runNode, sleep, now: () => time, out: () => {}, readPublishHead: () => head,
-      publishGate: async () => decorate({ ...reviewCiGate({ rowsComplete: true, headSha: head, requiredChecks, checks }), requiredChecks, checks }),
+      publishGate: async () => decorate({ ...reviewCiGate({ headSha: head, requiredChecks, checks }), requiredChecks, checks }),
     });
     await sinks[REVIEW_EFFECTS.WRITE_UP]({ bodyFile: 'v.md', body: '# verdict' }, { runId: 'r' });
     const publish = () => sinks[REVIEW_EFFECTS.LABEL]({ repo: 'o/n', pr: 7, to: 'accepted', actor: 'operator', bodyFile: 'v.md', reviewedHead: head }, { runId: 'r' });

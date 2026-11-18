@@ -784,3 +784,106 @@ it.each(['review-gate', 'merge-gate'])('Rule 7 retains %s for non-admission cons
     expect(resolve(conclusion)).toMatchObject({ state: 'pending', perName: { [name]: { state: 'pending', reasons: ['needs-rerun'] } } });
   }
 });
+
+
+// PR1 stays dark: pin the evidence guarantees here without changing PR2 callers.
+describe('pre-review evidence regressions', () => {
+  const head = 'a'.repeat(40), foreign = 'b'.repeat(40);
+  const evidence = {
+    head, rowsHead: head, rowsComplete: true, rosterSource: 'live', requiredNames: ['test'],
+  };
+  const row = (name, conclusion, extra = {}) => ({ name, status: 'completed', conclusion, ...extra });
+
+  it('does not discard same-name failures based on job IDs', () => {
+    for (const lineage of [false, true]) {
+      const failed = row('test', 'failure', { id: 7, workflowName: 'build',
+        detailsUrl: 'https://github.com/o/r/actions/runs/10/job/7',
+        ...(lineage ? { run_id: 10, run_attempt: 1 } : {}) });
+      const passed = row('test', 'success', { id: 999, workflowName: 'deploy',
+        detailsUrl: 'https://github.com/o/r/actions/runs/20/job/999',
+        ...(lineage ? { run_id: 20, run_attempt: 2 } : {}) });
+      for (const rows of [[failed, passed], [passed, failed]]) {
+        expect(resolveRequiredChecks({ ...evidence, rows })).toMatchObject({
+          state: 'fail', perName: { test: { state: 'fail', rows: expect.arrayContaining([failed]) } },
+        });
+      }
+    }
+  });
+
+  it('incomplete all-success rollups never resolve to pass or held evidence', () => {
+    // This covers the resolver only; production retirement wiring belongs to PR2.
+    const success = row('test', 'success');
+    const held = row('review-gate', 'failure');
+    for (const invalid of [
+      { rowsComplete: undefined }, { rowsComplete: false },
+      { rowsHead: foreign }, { rosterSource: undefined }, { rosterSource: 'unavailable' },
+    ]) {
+      for (const rows of [[success], [success, held]]) {
+        const requiredNames = rows.map(r => r.name);
+        expect(resolveRequiredChecks({ ...evidence, rows, requiredNames, ...invalid }).state).toBe('unknown');
+      }
+    }
+    // Complete metadata does not make foreign-head success current-head proof either.
+    for (const rows of [[{ ...success, head_sha: foreign }],
+      [{ ...success, head_sha: foreign }, held]]) {
+      expect(resolveRequiredChecks({ ...evidence, rows, requiredNames: rows.map(r => r.name) }).state)
+        .toBe('pending');
+    }
+    expect(resolveRequiredChecks({ ...evidence, rows: [success] }).state).toBe('pass');
+    expect(resolveRequiredChecks({ ...evidence, rows: [success, held],
+      requiredNames: ['test', 'review-gate'] }).state).toBe('held');
+  });
+});
+
+
+describe('audit: roster and human-hold refusal paths', () => {
+  const head = 'a'.repeat(40);
+  const failed = { name: 'merge-gate', status: 'completed', conclusion: 'failure',
+    detailsUrl: 'https://github.com/o/r/actions/runs/1/job/7' };
+  const evidence = { head, rowsHead: head, rowsComplete: true, rosterSource: 'live',
+    rows: [failed], requiredNames: ['merge-gate'] };
+
+  it.each([
+    ['https://untrusted.invalid/o/r/actions/runs/999/job/7', 'fail'],
+    ['https://untrusted.invalid/actions/runs/999/job/7suffix', 'fail'],
+    ['http://github.com/o/r/actions/runs/999/job/7', 'fail'],
+    ['https://github.com:444/o/r/actions/runs/999/job/7', 'fail'],
+    ['https://github.com/o/r/actions/runs/999/job/7suffix', 'fail'],
+    ['https://github.com/extra/o/r/actions/runs/999/job/7', 'fail'],
+    ['https://github.com/actions/runs/999/job/7', 'fail'],
+    ['https://github.com/o/r/actions/runs/999/job/7/attempts/2', 'fail'],
+    ['not a URL', 'fail'],
+    ['https://github.com/o/r/actions/runs/999/job/7', 'held'],
+    ['https://github.com/o/r/actions/runs/999/job/7/', 'held'],
+    ['https://github.com/o/r/actions/runs/999/job/7?pr=123', 'held'],
+  ])('binds job holds only to a complete trusted Actions URL: %s => %s', (url, state) => {
+    const bound = { jobId: 7, headSha: head, holdIds: ['review-acceptance'] };
+    for (const field of ['detailsUrl', 'details_url']) {
+      const { detailsUrl, ...row } = failed;
+      expect(resolveRequiredChecks({ ...evidence, rows: [{ ...row, [field]: url }], holds: [bound] }).state).toBe(state);
+    }
+  });
+
+  it.each([[], null, 'merge-gate', [null], new Array(1)])(
+    'refuses invalid roster %j even with the historical empty-roster override and an observed failure', requiredNames => {
+      expect(resolveRequiredChecks({ ...evidence, requiredNames, allowEmptyRequiredNames: true }))
+        .toMatchObject({ state: 'unknown', reasons: ['roster-unavailable'] });
+    });
+
+  it.each([
+    [['candidate-label'], 'fail'],
+    [['producer-certified', 'test-gaming', 'ledger'], 'fail'],
+    [['candidate-label', 'review-hold-labels'], 'held'],
+    [['review-acceptance'], 'held'],
+    [['review-acceptance', 'codeql'], 'fail'],
+    [[], 'fail'],
+  ])('requires actual human-review hold evidence for %j => %s across every annotation source', (holdIds, state) => {
+    const bound = { jobId: 7, headSha: head, holdIds };
+    for (const source of ['holds', 'mergeGateReviewHold', 'mergeGateHoldExcused']) {
+      const options = source === 'holds' ? { holds: [bound] }
+        : { rows: [{ ...failed, [source]: bound }] };
+      expect(resolveRequiredChecks({ ...evidence, ...options }))
+        .toMatchObject({ state, perName: { 'merge-gate': { state } } });
+    }
+  });
+});

@@ -7,7 +7,7 @@ import { mkdtempSync, rmSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  buildOpenPrPageQuery, mapGraphqlPr, parseOpenPrPage, isTransientGhFailure, heavyIsFresh, resolveCheckAppsByCommit,
+  rollupEvidence, buildOpenPrPageQuery, mapGraphqlPr, parseOpenPrPage, isTransientGhFailure, heavyIsFresh, resolveCheckAppsByCommit,
   listOpenPrsLightPaged, listOpenPrsPagedHydrated, assertInventoryComplete, listOpenPrsPagedHydratedComplete, parseListOutput, hydrateHeavyFields, resolvePrListPaging, PrListUnreadableError,
   HEAVY_FIELDS, PAGED_LIGHT_FIELDS, PR_LIST_PAGING_DEFAULTS, PR_LIST_PAGE_SIZE_ENV,
 } from '../pr-list-paged.mjs';
@@ -163,6 +163,7 @@ describe('query and gh row shape', () => {
     expect(q).toContain('repository(owner:"owner",name:"name")');
     expect(q).toContain('states:OPEN,first:20,orderBy:');
     expect(q).not.toContain('after:');
+    expect(q).toContain('commit{oid statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} totalCount nodes{');
     expect([...q].filter(c => c === '{')).toHaveLength([...q].filter(c => c === '}').length);
     const after = 'cursor"\\\n';
     expect(buildOpenPrPageQuery({ repo, pageSize: 20, after })).toContain(`after:${JSON.stringify(after)}`);
@@ -641,3 +642,39 @@ describe('fail-closed list parsing and uniqueness (one class: a list read must n
     expect(parseListOutput(Buffer.from('[{"number":1}]'), { repo: 'owner/name' })).toEqual([{ number: 1 }]);
   });
 });
+
+it('preserves the commit read head when the PR head is newer', async () => {
+  const { resolveRequiredChecks } = await import('../check-state-predicate.mjs');
+  const current = 'a'.repeat(40), readHead = 'b'.repeat(40);
+  const pr = mapGraphqlPr({ headRefOid: current, commits: { nodes: [{ commit: { oid: readHead,
+    statusCheckRollup: { contexts: { pageInfo: { hasNextPage: false }, totalCount: 1,
+      nodes: [{ __typename: 'StatusContext', context: 'test', state: 'SUCCESS' }] } } } }] } });
+  expect(pr).toMatchObject({ headRefOid: current, rowsHead: readHead, rowsComplete: true });
+  expect(resolveRequiredChecks({ head: pr.headRefOid, rowsHead: pr.rowsHead, rowsComplete: pr.rowsComplete,
+    rows: pr.statusCheckRollup, requiredNames: ['test'], rosterSource: 'live' }))
+    .toMatchObject({ state: 'unknown', reasons: ['foreign-head'] });
+});
+
+
+it.each([null, {}, { __typename: 'Unexpected', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }])(
+  'malformed GraphQL node %j marks connection evidence incomplete', malformed => {
+    const head = 'a'.repeat(40);
+    const success = { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' };
+    for (const nodes of [[success, malformed], [malformed, success]]) {
+      const commit = { oid: head,
+        statusCheckRollup: { contexts: { pageInfo: { hasNextPage: false }, totalCount: 2, nodes } } };
+      expect(rollupEvidence(commit)).toEqual({ rowsHead: head, rowsComplete: false });
+      if (malformed === null) {
+        // Preserve main's mapping error for null nodes.
+        expect(() => mapGraphqlPr({ commits: { nodes: [{ commit }] } })).toThrow(TypeError);
+      } else {
+        const pr = mapGraphqlPr({ commits: { nodes: [{ commit }] } });
+        expect(pr.rowsComplete).toBe(false);
+        expect(pr.statusCheckRollup).toEqual(nodes.map(n => n === success
+          ? { __typename: 'CheckRun', completedAt: '0001-01-01T00:00:00Z', conclusion: 'SUCCESS',
+            detailsUrl: undefined, name: 'test', startedAt: '0001-01-01T00:00:00Z', status: 'COMPLETED',
+            workflowName: '', appSlug: '', appId: null }
+          : { __typename: 'StatusContext', context: undefined, startedAt: undefined, state: undefined, targetUrl: '' }));
+      }
+    }
+  });
