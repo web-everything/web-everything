@@ -4590,11 +4590,34 @@ head, and show process start at/after adoption with a later completed tick. Call
 must obtain boot evidence from that daemon's process record, not from a sibling or
 from the wrapper's first tick time. `evaluateProbation` passes only with all owed
 records, or immediately for a known empty owed set. Non-owed evidence is a no-op.
-Each function reads its input once into a deeply frozen plain copy (enumerable keys only)
-and validates and decides from that copy. A recorded proof returns that fresh copy, so
-mutating restored (for example JSON-parsed) state, a getter or a hidden key cannot
-discharge another daemon. A no-op still returns the caller's own input object.
+Each entry uses the same sanitizing boundary: one depth-first JSON copy, then deep
+freezing, validation and decisions using only that copy. Never spread an external
+object before serializing it: a later sibling getter can mutate an earlier array or
+record before a shallow snapshot copies it. `readClosure` is the sole callable
+dependency, captured once from adoption options; every closure result is copied before
+the next read. Functions in data and cycles reject the entire input. Undefined values
+become null so unknown fields remain visible to the validator and sparse arrays fail closed.
+Copy failures make `recordProof` return the original state and `freezeProbation` return
+the original options; callers must validate adoption results before persisting them.
+Invalid but readable rosters still throw the operator-recovery error. Validation and
+evaluation report invalid state/pending on copy failure; neither authorizes promotion.
+A successful proof returns a fresh frozen state without freezing or aliasing caller data.
 Legacy single-record state cannot promote; it requires operator recovery.
+
+The regression table in `scripts/lib/daemon-rebuild/__tests__/probation.test.mjs`
+exercises real transitions with reused closure maps, a records getter popping owed,
+and top-level/nested throwing evidence getters, alongside ordinary JSON proof cases.
+Direct module probes against `41aaa588c39397fc7ad7eca7f63e9bf5fa041483` and the repair:
+
+| Probe | Before | After |
+| --- | --- | --- |
+| Shared closure files map | pending, worker owed (already guarded) | pending, worker owed |
+| Records getter pops review from owed | pass (incorrect) | pending, review owed |
+| Throwing evidence.boot getter | throws `boot getter` | original state, no throw |
+| Throwing evidence.boot.pid getter | original state (already guarded) | original state, no throw |
+
+These are pure-core probes, not a live daemon promotion test. Conflict resolution is
+separate: merge the PR base and verify the resulting head before claiming merge readiness.
 
 The probation tests adapt the WIP adoption clock/heads and invalid-tick cases. The
 self-sync test uses the WIP injected rebuild/lock/closure fixture as a core consumer;

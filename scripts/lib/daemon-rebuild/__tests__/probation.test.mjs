@@ -21,6 +21,88 @@ const proof = (pid = 101, daemonId = 'worker') => ({
 const now = ADOPTED_AT + 2;
 
 describe('R986 I1 frozen owed set and per-daemon proofs (pure core)', () => {
+  it.each(['evaluate', 'record'])('copies owed before a records getter can pop it: %s', async transition => {
+    const { freezeProbation, recordProof, evaluateProbation } = await core();
+    const p = JSON.parse(JSON.stringify(recordProof(freezeProbation(options), 'worker', proof(), now)));
+    const records = p.records;
+    let reads = 0;
+    Object.defineProperty(p, 'records', { enumerable: true, get() {
+      reads++;
+      p.owed.pop();
+      return records;
+    } });
+    const result = transition === 'evaluate' ? evaluateProbation(p, now)
+      : evaluateProbation(recordProof(p, 'worker', proof(), now), now);
+    expect(result).toEqual({ action: 'pending', owed: ['review'] });
+    expect(reads).toBe(1);
+  });
+
+  it.each(['boot', 'tick', 'boot.pid', 'tick.head'])('throwing evidence getter is an identity no-op: %s', async path => {
+    const { freezeProbation, recordProof } = await core();
+    const p = freezeProbation(options);
+    const evidence = proof();
+    const [parent, child] = path.split('.');
+    Object.defineProperty(child ? evidence[parent] : evidence, child ?? parent, {
+      enumerable: true, get() { throw new Error('unreadable evidence'); },
+    });
+    expect(recordProof(p, 'worker', evidence, now)).toBe(p);
+  });
+
+  it.each(['function', 'cycle', 'undefined field'])('rejects uncopyable evidence without losing fields: %s', async kind => {
+    const { freezeProbation, recordProof } = await core();
+    const p = freezeProbation(options);
+    const evidence = proof();
+    evidence.boot.extra = kind === 'function' ? () => {} : kind === 'cycle' ? evidence : undefined;
+    expect(recordProof(p, 'worker', evidence, now)).toBe(p);
+  });
+
+  it('copies adoption fields before later getters mutate the roster', async () => {
+    const { freezeProbation, evaluateProbation } = await core();
+    const input = { ...options, registered: [{ id: 'worker' }, { id: 'review' }] };
+    let reads = 0;
+    Object.defineProperty(input, 'readClosure', { enumerable: true, get() {
+      reads++;
+      input.registered.pop();
+      return options.readClosure;
+    } });
+    expect(evaluateProbation(freezeProbation(input), now)).toEqual({ action: 'pending', owed: ['worker', 'review'] });
+    expect(reads).toBe(1);
+  });
+
+  it('unreadable adoption input is an identity no-op', async () => {
+    const { freezeProbation } = await core();
+    const input = { ...options, get registered() { throw new Error('unreadable roster'); } };
+    expect(freezeProbation(input)).toBe(input);
+  });
+
+  it('copies boot before a tick getter mutates the source boot', async () => {
+    const { freezeProbation, recordProof, evaluateProbation } = await core();
+    const evidence = proof();
+    const tick = evidence.tick;
+    let reads = 0;
+    Object.defineProperty(evidence, 'tick', { enumerable: true, get() {
+      reads++;
+      evidence.boot.pid = 999;
+      return tick;
+    } });
+    const next = recordProof(freezeProbation(options), 'worker', evidence, now);
+    expect(next.records.worker.boot.pid).toBe(101);
+    expect(evaluateProbation(next, now)).toEqual({ action: 'pending', owed: ['review'] });
+    expect(reads).toBe(1);
+  });
+
+  it.each(['throw', 'cycle', 'function'])('unreadable closure data keeps proof owed: %s', async kind => {
+    const { freezeProbation, evaluateProbation } = await core();
+    const p = freezeProbation({ ...options, registered: [{ id: 'worker' }], readClosure() {
+      const result = closure(GOOD);
+      if (kind === 'throw') Object.defineProperty(result, 'files', { get() { throw new Error('files'); } });
+      if (kind === 'cycle') result.extra = result;
+      if (kind === 'function') result.extra = () => {};
+      return result;
+    } });
+    expect(evaluateProbation(p, now)).toEqual({ action: 'pending', owed: ['worker'] });
+  });
+
   describe.each(['shared wrapper', 'shared files', 'independent results'])('%s closure reads', reuse => {
     it.each(['blob', 'membership', 'incomplete', 'empty', 'invalid blob', 'unchanged'])(
       'preserves the proven-good evidence before the adopted read: %s', async variant => {
