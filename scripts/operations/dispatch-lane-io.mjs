@@ -1402,6 +1402,9 @@ export function reserveBuildLane(payload, { enabled = process.env.WE_DISPATCH_RE
   const lane = Number(payload?.lane);
   const session = String(payload?.sessionSlug ?? '').trim();
   if (!enabled || (payload?.launchKind ?? 'build') !== 'build' || !Number.isInteger(lane) || lane < 1 || !session) return { reserved: false, lane: null, session: null };
+  if (!assertRuntimeAdmitted(payload, payload?.launchKind ?? 'build').admitted) throw notApplied('runtime admission refused');
+  const groupMembers = payload?.groupMembers ?? [];
+  if (groupMembers.some(member => !assertRuntimeAdmitted({ num: member }, payload?.launchKind ?? 'build').admitted)) throw notApplied('runtime admission refused group');
   const scope = Array.isArray(payload?.scope) ? payload.scope.join(',') : '';
   const argv = ['scripts/lane-pool.mjs', 'acquire', `--lane=${lane}`, '--purpose=conveyor-delivery', `--session=${session}`,
     ...(scope ? [`--scope=${scope}`] : []), ...(payload?.num != null ? [`--item=${payload.num}`] : [])];
@@ -1506,7 +1509,12 @@ export function releaseReservedLane(reservation, { run = execFileSync, root = RE
 export function createDispatchSinks({
   root = REPO_ROOT,
   exec = execFileSync,
-  spawnAgent = (argv, opts, card) => defaultSpawnAgent(argv, opts, { exec, card, readRuntimeSettings }),
+  spawnAgent = (argv, opts, card) => {
+    if (!assertRuntimeAdmitted(card, card?.launchKind ?? 'build').admitted) throw notApplied('runtime admission refused');
+    const groupMembers = card?.groupMembers ?? [];
+    if (groupMembers.some(member => !assertRuntimeAdmitted({ num: member }, card?.launchKind ?? 'build').admitted)) throw notApplied('runtime admission refused group');
+    return defaultSpawnAgent(argv, opts, { exec, card, readRuntimeSettings });
+  },
   // #3645/#3906 — EVERY REGISTERED KIND'S MODE, read from the environment ONCE, here, at sink-construction
   // time rather than per dispatch, so one tick cannot straddle two modes. Every row defaults to `agent` on main
   // (see `dispatch-provider-registry.mjs`), so an unset environment keeps every kind on `claude --bg`.
@@ -1521,9 +1529,19 @@ export function createDispatchSinks({
   // agy-launcher-probation — `on`/`off`, read ONCE here like `modes` (see `probationLaunchFromEnv`).
   probationLaunch = probationLaunchFromEnv(),
   providerAvailable = dispatchProviderAvailable,
-  provider = (request) => routeDispatchProvider(request, {
-    modes, registry, scriptExists, providerAvailable, agent: (r) => defaultClaudeProvider(r, { spawnAgent }), probationLaunch,
-  }),
+  provider = (request) => {
+    if (!assertRuntimeAdmitted(request, request?.launchKind ?? 'build').admitted) throw notApplied('runtime admission refused');
+    const groupMembers = request?.groupMembers ?? [];
+    if (groupMembers.some(member => !assertRuntimeAdmitted({ num: member }, request?.launchKind ?? 'build').admitted)) throw notApplied('runtime admission refused group');
+    return routeDispatchProvider(request, {
+      modes, registry, scriptExists, providerAvailable, agent: (r) => {
+        if (!assertRuntimeAdmitted(r, r?.launchKind ?? 'build').admitted) throw notApplied('runtime admission refused');
+        const groupMembers = r?.groupMembers ?? [];
+        if (groupMembers.some(member => !assertRuntimeAdmitted({ num: member }, r?.launchKind ?? 'build').admitted)) throw notApplied('runtime admission refused group');
+        return defaultClaudeProvider(r, { spawnAgent });
+      }, probationLaunch,
+    });
+  },
   mintSessionId = () => randomUUID(),
   now = () => new Date(),
   // x87v3ed — see {@link reserveBuildLane}. Injectable so a test can assert the order without a real lane pool.
@@ -1853,12 +1871,18 @@ export function routeDispatchProvider(request, {
   providerAvailable = () => true,
   resolveCodexRoute = resolveCodexTaskRoute,
 } = {}) {
+  if (!assertRuntimeAdmitted(request, request?.launchKind ?? 'build').admitted) throw notApplied('runtime admission refused');
+  const groupMembers = request?.groupMembers ?? [];
+  if (groupMembers.some(member => !assertRuntimeAdmitted({ num: member }, request?.launchKind ?? 'build').admitted)) throw notApplied('runtime admission refused group');
   const kind = String(request?.launchKind || 'build');
   const grouped = Boolean(request?.groupMembers?.length);
   if (grouped && !['build', 'prepare-item'].includes(kind)) {
     throw notApplied(`dispatch-lane: grouped requests are unsupported for ${kind}`);
   }
   const launchAgent = r => {
+    if (!assertRuntimeAdmitted(r, r?.launchKind ?? 'build').admitted) throw notApplied('runtime admission refused');
+    const groupMembers = r?.groupMembers ?? [];
+    if (groupMembers.some(member => !assertRuntimeAdmitted({ num: member }, r?.launchKind ?? 'build').admitted)) throw notApplied('runtime admission refused group');
     if (grouped) throw notApplied('dispatch-lane: grouped requests require a group-capable worker provider');
     return agent(r);
   };
@@ -1902,6 +1926,9 @@ export function routeDispatchProvider(request, {
     // Only a proven pre-launch refusal may advance the cascade. An indeterminate launch
     // stops here: another worker could otherwise race the first one in the same lane.
     const launch = () => {
+      if (!assertRuntimeAdmitted(request, request?.launchKind ?? 'build').admitted) throw notApplied('runtime admission refused');
+      const groupMembers = request?.groupMembers ?? [];
+      if (groupMembers.some(member => !assertRuntimeAdmitted({ num: member }, request?.launchKind ?? 'build').admitted)) throw notApplied('runtime admission refused group');
       if (probationLaunchDecision(request, probationLaunch).launch) {
         if (grouped && kind !== 'prepare-item') throw notApplied('dispatch-lane: grouped probation requests require prepare-item');
         return probation(request);
@@ -1978,12 +2005,20 @@ export function routeDispatchProvider(request, {
  * @returns {string}
  */
 export function defaultClaudeProvider(request, {
-  spawnAgent = (argv, opts, card) => defaultSpawnAgent(argv, opts, { card }),
+  spawnAgent = (argv, opts, card) => {
+    if (!assertRuntimeAdmitted(card, card?.launchKind ?? 'build').admitted) throw notApplied('runtime admission refused');
+    const groupMembers = card?.groupMembers ?? [];
+    if (groupMembers.some(member => !assertRuntimeAdmitted({ num: member }, card?.launchKind ?? 'build').admitted)) throw notApplied('runtime admission refused group');
+    return defaultSpawnAgent(argv, opts, { card });
+  },
   // 117 S3b (D7 FINAL) — a fix / ci-heal launched here runs to completion through the detached worker wrapper instead
   // of `claude --bg` (same argv, `-p` + `--json-schema`, a v2 completion record). `false` keeps the old spawn exactly.
   wrapKind = (kind) => WRAPPABLE_LAUNCH_KINDS.includes(kind) && workerWrapperEnabledFor(kind),
   launchWrapped = launchWrappedClaudeWorker,
 } = {}) {
+  if (!assertRuntimeAdmitted(request, request?.launchKind ?? 'build').admitted) throw notApplied('runtime admission refused');
+  const groupMembers = request?.groupMembers ?? [];
+  if (groupMembers.some(member => !assertRuntimeAdmitted({ num: member }, request?.launchKind ?? 'build').admitted)) throw notApplied('runtime admission refused group');
   if (request?.groupMembers?.length) {
     throw notApplied('dispatch-lane: grouped requests require a group-capable worker provider');
   }
@@ -2148,6 +2183,10 @@ export function workerSpawnEnv(env = process.env) {
  * @returns {Promise<{stdout: string, stderr: string, resourceUsage: object|null}>}
  */
 export function spawnAgentToCompletion(argv, opts = {}, io = {}) {
+  const card = io.card ?? {};
+  if (!assertRuntimeAdmitted(card, card?.launchKind ?? 'build').admitted) throw notApplied('runtime admission refused');
+  const groupMembers = card?.groupMembers ?? [];
+  if (groupMembers.some(member => !assertRuntimeAdmitted({ num: member }, card?.launchKind ?? 'build').admitted)) throw notApplied('runtime admission refused group');
   return spawnToCompletion('claude', argv, {
     encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: SPAWN_TIMEOUT_MS, killSignal: 'SIGKILL', ...opts,
     env: markWorkerEnv(sanitizeSpawnEnv(opts.env || process.env)),

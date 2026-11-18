@@ -4704,3 +4704,20 @@ before calling the provider, after lane reservation and session/settings setup.
 `dispatch-lane-io.test.mjs` changes the allowlist during reservation and final settings
 setup, including unreadable evidence, and asserts no provider call, lane lease release,
 `runtime-refused`, and no in-flight run-store entry. Still-listed groups launch unchanged.
+
+## Runtime admission process inventory
+
+`runtime-admission-spawn-guard.test.mjs` inventories native process primitives, aliases and dispatch
+ports independently of argv shape. Each call needs an exiting admission refusal in the same function,
+or a reviewed file/function exception explaining a read, cleanup or diagnostic filing. Delivery and
+PR recovery ports are gated even when their callers already checked admission. Infra recovery scopes
+its child to the admitted card and rechecks in the child; historical dispatch contexts supply group
+membership, and unreadable context retains the recovery entry for operator repair.
+
+Infra recovery's deadline covers the whole pass, including reads and earlier retries; each child receives
+only the remaining timeout. Excess entries stay in the store and are reported as waiting for the next tick.
+A corrupt historical dispatch context refuses only that record. Keep the mixed damaged/healthy identity
+regression and the multi-entry elapsed-budget regression alongside the single-child timeout checks.
+
+Aggregate only infra recovery's six array fields; scalar error/deadline metadata must not enter the
+collection loop. Mixed error/success child responses must retain earlier results and continue recovery.

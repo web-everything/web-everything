@@ -117,15 +117,58 @@ function groupsGuarded(call) {
     return false;
   });
 }
-function scan(source, { delegatedExecHelpers = [] } = {}) {
+// Names include injected ports as well as native primitives. Resolve import/variable aliases
+// to a fixed point, independently of argv shape (including inline literals).
+const primitives = /^(?:execFileSync|execFile|exec|execSync|spawn|spawnSync|fork|execFileSyncThrottled|execFileThrottledAsync|execFileFn|execAsync|runNode|defaultRunNode|spawnAgent|defaultSpawnAgent|spawnAgentToCompletion|spawnToCompletion|spawnResumeDelivery|routeDispatchProvider|defaultClaudeProvider|launchWrappedClaudeWorker|launchWrapped|probationWorkerDetachedProvider|agent|run|defaultExecAsync|probation|launchAgent)$/;
+function ownerName(node) {
+  if (node.name) return node.name.getText();
+  const parent = node.parent;
+  if (ts.isVariableDeclaration(parent) || ts.isPropertyAssignment(parent) || ts.isBindingElement(parent)) return parent.name.getText();
+  if (ts.isParameter(parent)) return parent.name.getText();
+  let outer = parent;
+  while (outer && !ts.isFunctionLike(outer)) outer = outer.parent;
+  return outer ? `${ownerName(outer)}/callback` : '<module>/callback';
+}
+function scan(source) {
   const ast = ts.createSourceFile('spawn.mjs', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  const aliases = new Set(), regexes = new Set();
+  const collectRegexes = node => {
+    if (ts.isVariableDeclaration(node) && node.initializer && ts.isRegularExpressionLiteral(node.initializer)) regexes.add(node.name.getText());
+    ts.forEachChild(node, collectRegexes);
+  };
+  collectRegexes(ast);
+  const launchName = expression => {
+    if (ts.isParenthesizedExpression(expression)) return launchName(expression.expression);
+    if (ts.isBinaryExpression(expression)) return launchName(expression.left) || launchName(expression.right);
+    if (ts.isCallExpression(expression) && ts.isPropertyAccessExpression(expression.expression)
+      && expression.expression.name.text === 'bind') return launchName(expression.expression.expression);
+    const name = ts.isPropertyAccessExpression(expression) ? expression.name.text : expression.getText();
+    // RegExp/string .exec is not a child-process port.
+    return (name !== 'exec' || !ts.isPropertyAccessExpression(expression) || (!ts.isRegularExpressionLiteral(expression.expression) && !regexes.has(expression.expression.getText()))) && (primitives.test(name) || launches.test(name)
+      || launches.test(expression.getText()) || aliases.has(name));
+  };
+  let changed;
+  do {
+    changed = false;
+    const alias = (name, value) => { if (value && launchName(value) && !aliases.has(name)) { aliases.add(name); changed = true; } };
+    const visit = node => {
+      if (ts.isImportSpecifier(node)) alias(node.name.text, node.propertyName || node.name);
+      if (ts.isVariableDeclaration(node) || ts.isBindingElement(node) || ts.isParameter(node)) {
+        alias(node.name.getText(), node.initializer);
+        if (ts.isBindingElement(node) && node.propertyName) alias(node.name.getText(), node.propertyName);
+      }
+      if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) alias(node.left.getText(), node.right);
+      ts.forEachChild(node, visit);
+    };
+    visit(ast);
+  } while (changed);
   const sites = [], bypasses = [];
   function visit(node) {
-    let owner = node.parent;
-    while (owner && !ts.isFunctionLike(owner)) owner = owner.parent;
-    const delegatedExec = delegatedExecHelpers.includes(owner?.name?.getText());
-    if (ts.isCallExpression(node) && (launches.test(node.expression.getText()) || /io\.dispatch\s*\?\?\s*dispatchCiHeal/.test(node.expression.getText()) || (!delegatedExec && node.expression.getText() === 'exec' && node.arguments[1]?.getText() === 'argv'))) {
-      const site = { call: node.expression.getText(), line: ast.getLineAndCharacterOfPosition(node.getStart()).line + 1 };
+    if (ts.isCallExpression(node) && launchName(node.expression)) {
+      let owner = node.parent;
+      while (owner && !ts.isFunctionLike(owner)) owner = owner.parent;
+      const site = { call: node.expression.getText(), line: ast.getLineAndCharacterOfPosition(node.getStart()).line + 1,
+        owner: owner ? ownerName(owner) : '<module>' };
       sites.push(site);
       if (!guarded(node) || !groupsGuarded(node)) bypasses.push(site);
     }
@@ -134,30 +177,66 @@ function scan(source, { delegatedExecHelpers = [] } = {}) {
   visit(ast);
   return { sites, bypasses };
 }
-it('inventories every conveyor launch and requires an exiting runtime refusal before the effect', () => {
+// Reviewed exceptions are keyed by file + function, never by argv or line number.
+const reviewedReads = new Map([
+  ['skills-src/conveyor/build-dispatch-daemon.mjs#cliPlanTick', 'Reads the tick plan; never executes its proposed work.'],
+  ['skills-src/conveyor/build-dispatch-daemon.mjs#defaultReadLanePool/callback', 'Reads acquirable lane status.'],
+  ['skills-src/conveyor/build-dispatch-daemon.mjs#launchBase', 'Reads the current Git commit.'],
+  ['skills-src/conveyor/build-dispatch-daemon.mjs#git', 'Reads card paths and their latest commit.'],
+  ['skills-src/conveyor/build-dispatch-daemon.mjs#defaultExecAsync/callback', 'Runs throttled GitHub discovery reads for prepare status.'],
+  ['skills-src/conveyor/build-dispatch-daemon.mjs#run', 'Refreshes the local main snapshot for prepare discovery.'],
+  ['skills-src/conveyor/build-dispatch-daemon.mjs#readTree', 'Reads backlog tree objects.'],
+  ['skills-src/conveyor/build-dispatch-daemon.mjs#loadBlobs', 'Reads backlog blobs through cat-file.'],
+  ['skills-src/conveyor/build-dispatch-daemon.mjs#ghPrList', 'Lists prepare PRs.'],
+  ['skills-src/conveyor/build-dispatch-daemon.mjs#worker/callback', 'Lists prepare PRs asynchronously.'],
+  ['skills-src/conveyor/build-dispatch-daemon.mjs#read', 'Reads prepare stamp contents from GitHub.'],
+  ['skills-src/conveyor/build-dispatch-daemon.mjs#fileCard', 'Files a diagnostic backlog card only; no delivery agent.'],
+  ['scripts/conveyor/tick-core.mjs#runJson/callback', 'Reads state, plan and acquirable lanes.'],
+  ['scripts/conveyor/tick-core.mjs#main/callback/callback', 'Prefetches acquirable lane status.'],
+  ['scripts/conveyor/tick-core.mjs#main/callback', 'Reads PR comments and heavy admission status/load/queue.'],
+  ['scripts/conveyor/build-dispatch-orphan-adopt.mjs#defaultCurrentLaneSession', 'Reads the current lane lease.'],
+  ['scripts/conveyor/build-dispatch-orphan-adopt.mjs#releaseReservedLaneLease', 'Releases a failed launch reservation; starts no delivery.'],
+  ['scripts/operations/dispatch-lane-io.mjs#runNode', 'Forwards only the read-only tick planner.'],
+  ['scripts/operations/dispatch-lane-io.mjs#readTick', 'Reads the tick plan.'],
+  ['scripts/operations/dispatch-lane-io.mjs#defaultRunNode', 'Executes only the read-only tick planner.'],
+  ['scripts/operations/dispatch-lane-io.mjs#releaseReservedLane', 'Releases a failed launch reservation.'],
+  ['scripts/operations/dispatch-lane-io.mjs#defaultListPrs', 'Lists PRs.'],
+  ['scripts/operations/dispatch-lane-io.mjs#defaultCheckAlreadyDone', 'Reads Git origin and merged PR evidence.'],
+  ['scripts/operations/dispatch-lane-io.mjs#execFileThrottledAsync', 'Throttled executor for GitHub evidence reads.'],
+  ['scripts/operations/dispatch-lane-io.mjs#defaultCheckAlreadyDoneAsync', 'Reads Git origin and merged PR evidence asynchronously.'],
+  ['scripts/operations/dispatch-lane-io.mjs#defaultLaneRefForPr', 'Reads a PR head ref.'],
+  ['scripts/operations/dispatch-lane-io.mjs#fetch', 'Lists existing Claude agents; starts no agent.'],
+]);
+it('inventories every conveyor process site and rejects unguarded or stale exceptions', () => {
   const files = ['skills-src/conveyor/build-dispatch-daemon.mjs', 'scripts/conveyor/tick-core.mjs',
-    'scripts/operations/dispatch-lane-io.mjs', ...readdirSync(join(root, 'scripts/conveyor'))
-      .filter(f => /^build-dispatch-.*\.mjs$/.test(f)).map(f => `scripts/conveyor/${f}`)];
+    ...readdirSync(join(root, 'scripts/operations')).filter(f => /^dispatch-lane.*\.mjs$/.test(f)).map(f => `scripts/operations/${f}`),
+    ...readdirSync(join(root, 'scripts/conveyor')).filter(f => /^build-dispatch-.*\.mjs$/.test(f)).map(f => `scripts/conveyor/${f}`)];
   let count = 0;
+  const found = new Set();
   for (const file of scopedScanFiles(files)) {
-    // defaultRunNode only reads the tick planner (readTick -> tickCli); it never launches a worker.
-    // defaultSpawnAgent's exec must be guarded independently, including its trust retry.
-    const result = scan(readFileSync(`${root}/${file}`, 'utf8'), {
-      delegatedExecHelpers: file === 'scripts/operations/dispatch-lane-io.mjs' ? ['defaultRunNode'] : [],
-    });
+    const result = scan(readFileSync(`${root}/${file}`, 'utf8'));
+    for (const site of result.sites) found.add(`${file}#${site.owner}`);
     count += result.sites.length;
-    expect(result.bypasses, file).toEqual([]);
+    expect(result.bypasses.filter(site => !reviewedReads.has(`${file}#${site.owner}`)), file).toEqual([]);
+  }
+  const scoped = new Set(scopedScanFiles(files));
+  for (const [key, reason] of reviewedReads) {
+    if (scoped.has(key.split('#')[0])) expect(found.has(key), `stale exception: ${key}`).toBe(true);
+    expect(reason.trim().length).toBeGreaterThan(0);
   }
   if (!process.env.VERIFY_SCAN_FILES) expect(count).toBeGreaterThan(10);
 });
-it('exempts only the read-only planner helper and scans the agent exec helper', () => {
-  const source = `function defaultRunNode(argv) { return exec(process.execPath, argv); }
-    function run(payload) { return provider(payload); }`;
-  const options = { delegatedExecHelpers: ['defaultRunNode'] };
-  expect(scan(`function defaultSpawnAgent(argv) { return exec('claude', argv); }`, options).bypasses).toHaveLength(1);
-  expect(scan(source, options).bypasses).toEqual([{ call: 'provider', line: 2 }]);
-  expect(scan(`function run(card, argv) { return exec(process.execPath, argv); }`, options).bypasses).toHaveLength(1);
-  expect(scan(`function run(card, argv) { return exec(process.execPath, argv); }`).bypasses).toHaveLength(1);
+it('flags aliased primitives, inline exec arguments, and wrapper ports', () => {
+  for (const source of [
+    `import { spawn as start } from 'node:child_process'; const launch = start; function run() { launch('node', []); }`,
+    `function recover() { exec('node', ['infra-blocked.mjs', 'retry']); }`,
+    `function deliver() { runNode(argv); }`,
+    `const start = childProcess.spawn.bind(childProcess); function deliver() { start(command, args); }`,
+    ...['execFileSync', 'execFile', 'exec', 'execSync', 'spawn', 'spawnSync', 'fork'].map(name => `function deliver() { cp.${name}(command, args); }`),
+  ]) expect(scan(source).bypasses).toHaveLength(1);
+});
+it.each(['spawnDetached', 'spawnAgent', 'runNode', 'defaultRunNode', 'spawnLand', 'spawnResume', 'provider', 'launchWrapped'])('flags the %s wrapper independently of argument shape', name => {
+  expect(scan(`function deliver() { ${name}('inline'); }`).bypasses).toHaveLength(1);
 });
 it('detects a bypass despite a gate in a sibling branch or comment', () => {
   expect(scan(`function run(card) {

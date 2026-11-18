@@ -618,11 +618,13 @@ export async function adoptOrphanedBuildClaims({
         try {
           // The real helper admits freshly BEFORE persisting the pending attempt.
           if (spawnResume) beforeSpawn();
-          pid = (spawnResume ?? (o => spawnResumeDelivery(o, { readSettings, beforeSpawn, onRefused: refusal => runtimeRefused.push(refusal) })))({
+          const request = {
             num, lane: payload.lane, scope: payload.scope, sessionSlug: payload.sessionSlug,
             bornAs: payload.bornAs,
             runId: row.runId, effectKey: row.entry?.key, groupMembers,
-          });
+          };
+          pid = spawnResume ? spawnResume(request)
+            : spawnResumeDelivery(request, { readSettings, beforeSpawn, onRefused: refusal => runtimeRefused.push(refusal) });
           if (pid === null && !spawnResume) { results.push({ num, action: 'runtime-refused', reason: 'runtime admission refused before resume spawn', ...(runtimeRefused.length ? { runtimeRefused } : {}) }); continue; }
           if (!Number.isInteger(pid) || pid <= 0) throw new Error(`resume spawn for #${num} reported no pid`);
         } catch (e) {

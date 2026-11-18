@@ -39,6 +39,8 @@
  *   parses tolerantly to `[]` so a bad file never wedges a tick.
  */
 
+import { producerBuildContext } from '../operations/build-pr-authorship.mjs';
+import { assertRuntimeAdmitted } from '../lib/runtime-admission.mjs';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, openSync, closeSync, statSync, unlinkSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { join, dirname, resolve } from 'node:path';
@@ -210,6 +212,7 @@ export function parseInfraStore(text) {
     seen.add(key);
     out.push({
       num: String(e.num),
+      ...(e.groupMembers !== undefined ? { groupMembers: e.groupMembers } : {}),
       ref: e.ref != null ? String(e.ref) : null,
       sha: e.sha != null ? String(e.sha) : null,
       base: e.base != null ? String(e.base) : 'main',
@@ -694,6 +697,15 @@ function parseArgv(argv) {
   return { flags, pos };
 }
 
+/** Historical infra records retain the dispatch context, which owns the full group. */
+export function infraRecoveryCard(entry, { readContext = producerBuildContext } = {}) {
+  if (!entry.builderContext) return entry;
+  const context = readContext({ WE_BUILD_PR_CONTEXT: entry.builderContext });
+  const card = context?.entry?.payload;
+  if (!card || normNum(card.num) !== normNum(entry.num)) throw new Error('unproven infra recovery identity');
+  return { ...entry, ...card };
+}
+
 /**
  * Resume-open the PR for one recorded entry — the ONLY "resume" mechanism, and it NEVER merges: it re-invokes
  * the producer `pr-land --label-on-green` against the ALREADY-PUSHED lane ref (fetched from origin so the tip
@@ -705,7 +717,17 @@ function parseArgv(argv) {
  * {@link markRefusedAttempt} vs {@link markRetryAttempt}. Best-effort — a failure just bumps the attempt (or,
  * for a refusal, does not — see that function's own docblock).
  */
-function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null } = {}) {
+export function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null, exec = execFileSync, readSettings, readContext } = {}) {
+  try { entry = infraRecoveryCard(entry, { readContext }); }
+  catch { return { ok: false, refused: true, reason: 'unproven infra recovery identity', detail: 'unproven infra recovery identity' }; }
+  // Recheck in the child: tick-local admission does not cross a process boundary.
+  const admission = assertRuntimeAdmitted(entry, 'infra-recovery', { readSettings });
+  if (!admission.admitted) return { ok: false, refused: true, reason: admission.reason, detail: admission.reason };
+  const groupMembers = entry.groupMembers ?? [];
+  if (!Array.isArray(groupMembers)) return { ok: false, refused: true, reason: 'invalid group', detail: 'invalid group' };
+  if (groupMembers.some(member => !assertRuntimeAdmitted({ num: member }, 'infra-recovery', { readSettings }).admitted)) {
+    return { ok: false, refused: true, reason: 'runtime admission refused group', detail: 'runtime admission refused group' };
+  }
   const ref = entry?.ref;
   const base = entry?.base || 'main';
   if (!ref) return { ok: false, detail: 'no resumable ref recorded' };
@@ -718,7 +740,7 @@ function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null } = {}) {
   // The ref is already on origin (it was pushed before the open failed). Fetch its objects so pr-land's push of
   // <sha>:<ref> is a local no-op and the create has a head to point at.
   // #x5n4zn3 — was bare (no timeout): a real network fetch.
-  try { execFileSync('git', ['fetch', 'origin', `+refs/heads/${ref}:refs/remotes/origin/${ref}`], { cwd, stdio: ['ignore', 'ignore', 'pipe'], timeout: 10 * 60_000, killSignal: 'SIGKILL' }); }
+  try { exec('git', ['fetch', 'origin', `+refs/heads/${ref}:refs/remotes/origin/${ref}`], { cwd, stdio: ['ignore', 'ignore', 'pipe'], timeout: 10 * 60_000, killSignal: 'SIGKILL' }); }
   catch (e) {
     // An OUTAGE during the fetch is an infra failure (the attempt/backoff budget), never a refusal — otherwise
     // the tip check below would read "no ref" and burn the refusal budget under a misleading `bad-ref`. Any
@@ -728,7 +750,7 @@ function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null } = {}) {
   }
   // PR #2899 review — pin the resume to the RECORDED (verified) sha, and refuse if the ref moved since.
   let tipSha = null;
-  try { tipSha = execFileSync('git', ['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${ref}^{commit}`], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 60_000, maxBuffer: 256 * 1024 * 1024 }).trim() || null; }
+  try { tipSha = exec('git', ['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${ref}^{commit}`], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 60_000, maxBuffer: 256 * 1024 * 1024 }).trim() || null; }
   catch { tipSha = null; }
   const pin = resumeShaDecision({ recordedSha: entry.sha, tipSha, ref });
   if (!pin.ok) return { ok: false, refused: true, reason: pin.reason, detail: pin.detail };
@@ -768,7 +790,7 @@ function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null } = {}) {
     // #x5n4zn3 — was bare (no timeout). `pr-land.mjs --label-on-green` has its OWN internal wait-for-green
     // deadline (`--timeout-min`, default 15 min) — this outer bound must exceed that, with margin for gh/push
     // overhead, or it would kill a wait pr-land itself would have given up on cleanly moments later.
-    const res = parse(execFileSync('node', args, { cwd, env: { ...process.env, WE_BUILD_PR_CONTEXT: entry.builderContext || '' }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, timeout: 20 * 60_000, killSignal: 'SIGKILL' }));
+    const res = parse(exec('node', args, { cwd, env: { ...process.env, WE_BUILD_PR_CONTEXT: entry.builderContext || '' }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, timeout: 20 * 60_000, killSignal: 'SIGKILL' }));
     return { ok: true, prNumber: res.pr ?? null, detail: res.detail || 'resume-opened' };
   } catch (e) {
     const res = parse(e.stdout);
