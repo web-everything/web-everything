@@ -5,7 +5,7 @@
  * against the same fold and cursor rules the deployed Durable Object uses.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createEventLog, createMemoryStorage, handleRequest, parseGithubEvent } from '../../conveyor/pr-events-worker/core.mjs';
@@ -199,6 +199,17 @@ describe('the mirror follows deltas', () => {
     const f = await readPrFacts({ ...w.opts(), number: 7 });
     expect(f.headSha).toBe(OLD);
     expect(f.checks).toEqual([]);
+  });
+
+  it('readRepoFacts never lists a row whose evidence was evicted', async () => {
+    const w = coveredWorker();
+    const { mirror } = await loadMirror(w.opts());
+    expect((await readRepoFacts(w.opts())).prs.map((p) => p.number)).toEqual([7]);
+    for (const tombstone of [{ evicted: [7] }, { evictedShas: [HEAD] }]) {
+      // A reopened row can be complete even though its earlier evidence is gone.
+      writeFileSync(mirrorPath(dir, REPO), JSON.stringify({ ...mirror, ...tombstone }));
+      expect((await readRepoFacts(w.opts())).prs).toEqual([]);
+    }
   });
 
   it('readRepoFacts serves every complete row of a trustworthy repo', async () => {
@@ -419,6 +430,116 @@ describe('mirror compaction', () => {
     expect(Object.values(r.mirror.buckets.checks).map((c) => c.sha).sort()).toEqual([HEAD, OLD].sort());
   });
 
+  it('default refresh retention expires observed closures at 24 hours', async () => {
+    const w = coveredWorker();
+    let { mirror } = await loadMirror(w.opts());
+    w.deliver('pull_request', prPayload('closed', { state: 'closed' }));
+    const refresh = async () => {
+      const r = await refreshMirror(mirror, { repo: REPO, url: 'https://w.local', token: 'read', nowMs: w.clock.t, fetchImpl: w.fetchImpl });
+      expect(r.mode).toBe('delta');
+      mirror = r.mirror;
+    };
+    await refresh();
+    expect(mirror.closedSeen).toEqual({ 7: T0 });
+    w.clock.t = T0 + 86_400_000 - 1;
+    await refresh();
+    expect(Object.values(mirror.buckets.prs).map((p) => p.number)).toEqual([7]);
+    expect(mirror.closedSeen).toEqual({ 7: T0 });
+    w.clock.t += 1;
+    await refresh();
+    expect(mirror.buckets).toEqual({ prs: {}, checks: {}, shas: {} });
+    expect(mirror.evicted).toEqual([7]);
+  });
+
+  it('bounds tombstones across repeated compactions over a long closed PR history', () => {
+    const cap = PR_FACTS_DEFAULTS.maxTombstones;
+    expect(cap).toBe(5000);
+    let m = seed([]);
+    const total = cap + 1000;
+    for (let start = 1; start <= total; start += 1000) {
+      for (let n = start; n < start + 1000; n += 1) {
+        m.buckets.prs[key(n)] = { ...row(n, 'closed'), sha: `sha-${total - n}`, checks: [] };
+        m.closedSeen[n] = T0 - 1000;
+      }
+      m = compact(m);
+      expect(m.evicted.length).toBeLessThanOrEqual(cap);
+      expect(m.evictedShas.length).toBeLessThanOrEqual(cap);
+      expect(compact(m)).toEqual(m);
+    }
+    expect(m.evicted).toEqual(Array.from({ length: cap }, (_, i) => i + 1001));
+    expect(m.evictedFloor).toBe(1000);
+    expect(m.evictedShas).toEqual(Array.from({ length: cap }, (_, i) => `sha-${cap - i - 1}`));
+    expect(m.evictedShasTruncated).toBe(true);
+  });
+
+  it('trimmed number tombstones still refuse retained or reopened rows and fall back to GitHub', async () => {
+    const m = seed([row(7)]);
+    m.evicted = [1, 2, 3, 8, 9];
+    const next = compactMirror(m, { nowMs: T0, maxTombstones: 2 });
+    expect(next.evicted).toEqual([8, 9]);
+    expect(next.evictedFloor).toBe(3);
+    expect(lookup(next).facts).toBeTruthy();
+    const reopened = applyDelta(next, [{ seq: 11, repo: REPO.toLowerCase(), type: 'pull_request', action: 'reopened', prs: [3], state: 'open', sha: HEAD, draft: false, labels: [] }]);
+    expect(lookup(reopened, 3)).toEqual({ facts: null, reason: 'evicted' });
+    expect(lookup({ ...reopened, evictedFloor: undefined }, 3).facts).toBeTruthy();
+    writeFileSync(mirrorPath(dir, REPO), JSON.stringify(reopened));
+    const fx = githubFixture();
+    fx[`repos/${REPO}/pulls/3`] = { ...fx[`repos/${REPO}/pulls/7`], number: 3 };
+    fx[`repos/${REPO}/pulls/3/reviews?per_page=100`] = [];
+    expect(await readPrFactsOrGithub({ repo: REPO, number: 3, dir, url: 'https://w.local', token: 'read', env: {}, now: () => T0, exec: fakeGh(fx) }))
+      .toMatchObject({ source: 'github', reason: 'evicted', facts: { number: 3 } });
+    const retained = compactMirror({ ...m, evicted: [8, 9, 10] }, { nowMs: T0, maxTombstones: 2 });
+    expect(lookup(retained)).toEqual({ facts: null, reason: 'evicted' });
+    expect(compactMirror(reopened, { nowMs: T0, maxTombstones: 2 })).toEqual(reopened);
+  });
+
+  it('trimmed SHA tombstones refuse heads even when checks or SHA mappings return', () => {
+    const m = seed([{ ...row(7), checks: [] }]);
+    m.buckets.shas = {};
+    m.evictedShas = [HEAD, 'z-newer', 'a-newest'];
+    const next = compactMirror(m, { nowMs: T0, maxTombstones: 2 });
+    expect(next.evictedShas).toEqual(['z-newer', 'a-newest']);
+    expect(next.evictedShasTruncated).toBe(true);
+    expect(lookup(next)).toEqual({ facts: null, reason: 'evicted' });
+    expect(lookup({ ...next, evictedShasTruncated: false }).facts).toBeTruthy();
+    expect(lookup({ ...next, buckets: { ...next.buckets, checks: { k: check(HEAD) } } })).toEqual({ facts: null, reason: 'evicted' });
+    expect(lookup({ ...next, buckets: { ...next.buckets, shas: { [shaKey(HEAD)]: [7] } } })).toEqual({ facts: null, reason: 'evicted' });
+    expect(compactMirror(next, { nowMs: T0, maxTombstones: 2 })).toEqual(next);
+  });
+
+  it('partial evidence returning after SHA tombstone truncation cannot hide historical failures', async () => {
+    let m = seed([]);
+    m.buckets.checks = { failure: { ...check(HEAD, [], T0 - 1000), name: 'security', conclusion: 'failure' } };
+    m = compactMirror(m, { nowMs: T0, retentionMs: 1000, maxTombstones: 2 });
+    expect(m.buckets.checks).toEqual({});
+    expect(m.evictedShas).toEqual([HEAD]);
+    m.buckets.checks = { older: check('z-newer', [], T0 - 1000), newer: check('a-newest', [], T0 - 1000) };
+    m = compactMirror(m, { nowMs: T0, retentionMs: 1000, maxTombstones: 2 });
+    expect(m.evictedShas).toEqual(['z-newer', 'a-newest']);
+    expect(m.evictedShasTruncated).toBe(true);
+    m = applyDelta(m, [
+      { ...parseGithubEvent('pull_request', prPayload('opened'), { receivedAt: T0 }), seq: 11 },
+      { ...parseGithubEvent('check_run', checkRun('lint', 'success'), { receivedAt: T0 }), seq: 12 },
+    ]);
+    // Both a current-head mapping and a successful check return; the security failure is still missing.
+    expect(m.buckets.shas[shaKey(HEAD)]).toEqual([7]);
+    expect(lookup({ ...m, evictedShasTruncated: false }).facts.checks)
+      .toEqual([{ name: 'lint', app: 'github-actions', conclusion: 'success' }]);
+    expect(lookup(m)).toEqual({ facts: null, reason: 'evicted' });
+    writeFileSync(mirrorPath(dir, REPO), JSON.stringify(m));
+    const opts = { repo: REPO, number: 7, dir, url: 'https://w.local', token: 'read', env: {}, now: () => T0 };
+    expect((await readRepoFacts(opts)).prs).toEqual([]);
+    const fx = githubFixture();
+    fx[`repos/${REPO}/commits/${HEAD}/check-runs?per_page=100`].check_runs.push({
+      id: 14, name: 'security', head_sha: HEAD, status: 'completed', conclusion: 'failure', app: { slug: 'github-actions' },
+    });
+    const result = await readPrFactsOrGithub({ ...opts, exec: fakeGh(fx) });
+    expect(result).toMatchObject({ source: 'github', reason: 'evicted' });
+    expect(result.facts.checks).toContainEqual({ name: 'security', app: 'github-actions', conclusion: 'failure' });
+    const reseeded = seedMirror({ repo: REPO, body: body([row(7)]), nowMs: T0, prev: m });
+    expect(lookup(reseeded)).toEqual({ facts: null, reason: 'evicted' });
+  });
+
   it('does not compact failed refreshes', async () => {
     const prev = seed([row(7, 'closed')]);
     const r = await refreshMirror(prev, { repo: REPO, url: 'https://w.local', nowMs: T0, retentionMs: 0,
@@ -462,6 +583,27 @@ describe('mirror compaction sha tombstones', () => {
 });
 
 describe('tombstones across full seeds', () => {
+  it('full seeds bound legacy tombstones and preserve truncation summaries across later seeds', () => {
+    const cap = PR_FACTS_DEFAULTS.maxTombstones;
+    const prev = {
+      evicted: Array.from({ length: cap + 2 }, (_, i) => i + 1),
+      evictedShas: Array.from({ length: cap }, (_, i) => `sha-${cap - i}`),
+      buckets: { checks: { vanished: { sha: 'newest' } } },
+    };
+    const opts = { repo: REPO, body: { prs: [], stateCursor: 1 }, nowMs: T0 };
+    const m = seedMirror({ ...opts, prev });
+    expect(m.evicted).toEqual(prev.evicted.slice(2));
+    expect(m.evictedFloor).toBe(2);
+    expect(m.evictedShas).toEqual([...prev.evictedShas.slice(1), 'newest']);
+    expect(m.evictedShasTruncated).toBe(true);
+    expect(seedMirror({ ...opts, prev: m })).toEqual(m);
+    const small = seedMirror({ ...opts, prev: m, maxTombstones: 1 });
+    expect(small.evicted).toEqual([cap + 2]);
+    expect(small.evictedFloor).toBe(cap + 1);
+    expect(small.evictedShas).toEqual(['newest']);
+    expect(small.evictedShasTruncated).toBe(true);
+  });
+
   it('a full seed keeps the previous tombstones', () => {
     const prev = { evicted: [3], evictedShas: ['f'.repeat(40)] };
     const m = seedMirror({ repo: 'web-everything/web-everything', body: { prs: [], stateCursor: 1 }, nowMs: 1, prev });
@@ -471,6 +613,47 @@ describe('tombstones across full seeds', () => {
 });
 
 describe('readPrFactsFromGithub pagination', () => {
+  const endpoints = ['reviews', 'check-runs', 'check-suites'];
+  const wrap = (endpoint, rows) => endpoint === 'reviews' ? rows : { [endpoint.replace('-', '_')]: rows };
+  const entry = (endpoint, id, conclusion = 'success') => endpoint === 'reviews'
+    ? { id, state: conclusion === 'failure' ? 'CHANGES_REQUESTED' : 'APPROVED', commit_id: HEAD, submitted_at: '2026-10-06T12:00:00Z' }
+    : { id, name: 'test', head_sha: HEAD, status: 'completed', conclusion, app: { slug: 'github-actions' } };
+  const execPages = (target, body, calls) => (_cmd, args) => {
+    const path = args.at(-1);
+    calls.push(path);
+    if (path === `repos/${REPO}/pulls/7`) return JSON.stringify(githubFixture()[path]);
+    const endpoint = endpoints.find((e) => path.includes(`/${e}?`));
+    if (!endpoint) throw new Error(`unexpected path ${path}`);
+    const page = Number(new URLSearchParams(path.split('?')[1]).get('page') || 1);
+    return JSON.stringify(endpoint === target ? body(page) : wrap(endpoint, []));
+  };
+
+  it.each(endpoints)('walks every page of %s including a first page larger than 100 rows', (endpoint) => {
+    const calls = [];
+    const exec = execPages(endpoint, (page) => wrap(endpoint, page === 1
+      ? Array.from({ length: 101 }, (_, i) => entry(endpoint, i))
+      : [entry(endpoint, 102, 'failure')]), calls);
+    const f = readPrFactsFromGithub({ repo: REPO, number: 7, exec });
+    expect(calls.filter((p) => p.includes(`/${endpoint}?`)).map((p) => p.split('?')[1]))
+      .toEqual(['per_page=100', 'per_page=100&page=2']);
+    if (endpoint === 'reviews') expect(f.review.state).toBe('changes_requested');
+    else expect(f[endpoint === 'check-runs' ? 'checks' : 'suites']).toEqual([expect.objectContaining({ conclusion: 'failure' })]);
+  });
+
+  it.each(endpoints)('rejects pagination exhaustion without returning partial evidence (%s)', (endpoint) => {
+    const calls = [];
+    const exec = execPages(endpoint, () => wrap(endpoint, Array.from({ length: 100 }, (_, i) => entry(endpoint, i))), calls);
+    expect(() => readPrFactsFromGithub({ repo: REPO, number: 7, exec })).toThrow(/more than 5000 rows/);
+    const pages = calls.filter((p) => p.includes(`/${endpoint}?`));
+    expect(pages).toHaveLength(50);
+    expect(pages.at(-1)).toContain('&page=50');
+  });
+
+  it.each(['check-runs', 'check-suites'])('rejects a malformed page with an empty object for %s', (endpoint) => {
+    expect(() => readPrFactsFromGithub({ repo: REPO, number: 7, exec: execPages(endpoint, () => ({}), []) }))
+      .toThrow(/malformed page/);
+  });
+
   it('walks every page so the latest review is never dropped', () => {
     const sha = 'c'.repeat(40);
     const reviewPage = (p) => Array.from({ length: p === 2 ? 5 : 100 }, (_, i) => ({ id: p * 1000 + i, state: p === 2 ? 'CHANGES_REQUESTED' : 'APPROVED',

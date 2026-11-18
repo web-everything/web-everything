@@ -64,6 +64,7 @@ export const PR_FACTS_DEFAULTS = Object.freeze({
   staleAfterMs: PR_EVENTS_DEFAULTS.staleAfterMs, // no webhook delivery for this long → feed 'stale' → null
   maxDeltaPages: 5,        // a backlog deeper than this many /events pages → one full /prs pull instead
   pageLimit: 500,
+  maxTombstones: 5000,    // bounded history; lost evidence beyond it falls back to GitHub
   timeoutMs: PR_EVENTS_DEFAULTS.timeoutMs,
   lockWaitMs: 10_000,
   lockStaleMs: 60_000,
@@ -112,11 +113,25 @@ function bucketStorage(buckets) {
   };
 }
 
+/** Bound tombstones while keeping permanent fail-closed summaries of trimmed history. */
+function boundTombstones(mirror, evicted, evictedShas, maxTombstones) {
+  const numbers = [...new Set(evicted)].sort((a, b) => a - b);
+  const trimmed = numbers.splice(0, Math.max(0, numbers.length - maxTombstones));
+  const evictedFloor = Math.max(mirror.evictedFloor ?? 0, trimmed.at(-1) ?? 0);
+  const shas = [...new Set(evictedShas)]; // deterministic insertion order, newest additions last
+  const shaTrimmed = shas.splice(0, Math.max(0, shas.length - maxTombstones));
+  return {
+    evicted: numbers.filter((n) => n > evictedFloor), evictedShas: shas,
+    ...(evictedFloor ? { evictedFloor } : {}),
+    ...(mirror.evictedShasTruncated || shaTrimmed.length ? { evictedShasTruncated: true } : {}),
+  };
+}
+
 /**
  * Build a mirror from one full `/prs` answer, keeping only `repo`'s rows. The served rows are folded back into
  * projection buckets keyed exactly as the Worker keys them, so later deltas replace (never duplicate) entries.
  */
-export function seedMirror({ repo, body, nowMs, prev, retentionMs = PR_FACTS_DEFAULTS.closedRetentionMs }) {
+export function seedMirror({ repo, body, nowMs, prev, retentionMs = PR_FACTS_DEFAULTS.closedRetentionMs, maxTombstones = PR_FACTS_DEFAULTS.maxTombstones }) {
   const r = repoKey(repo);
   const buckets = { prs: {}, checks: {}, shas: {} };
   const closedSeen = {};
@@ -141,9 +156,8 @@ export function seedMirror({ repo, body, nowMs, prev, retentionMs = PR_FACTS_DEF
   return {
     // Tombstones survive a full seed: /prs does not serve unattached or evicted checks back.
     // A previously cached check the snapshot no longer serves (unattached, or dropped) taints its sha too.
-    evicted: prev?.evicted || [],
-    evictedShas: [...new Set([...(prev?.evictedShas || []),
-      ...Object.entries(prev?.buckets?.checks || {}).filter(([k, c]) => c?.sha && !(k in buckets.checks)).map(([, c]) => c.sha)])].sort(),
+    ...boundTombstones(prev || {}, prev?.evicted || [], [...(prev?.evictedShas || []),
+      ...Object.entries(prev?.buckets?.checks || {}).filter(([k, c]) => c?.sha && !(k in buckets.checks)).map(([, c]) => c.sha)], maxTombstones),
     v: PR_FACTS_VERSION, repo: r, buckets, closedSeen, cursor: body.stateCursor ?? body.head ?? null,
     fetchedAtMs: nowMs, lastOkAt: nowMs, lastFailAt: null, lastError: null,
     lastDeliveryAt: body.lastDeliveryAt ?? null, lastEventAt: body.lastEventAt ?? null,
@@ -163,8 +177,8 @@ export function applyDelta(mirror, events) {
   return next;
 }
 
-/** Bound the disposable mirror without changing retained facts. PURE (no input mutation). */
-export function compactMirror(mirror, { nowMs, retentionMs = PR_FACTS_DEFAULTS.closedRetentionMs }) {
+/** Bound the disposable mirror; uncertain evidence falls back to GitHub. PURE (no input mutation). */
+export function compactMirror(mirror, { nowMs, retentionMs = PR_FACTS_DEFAULTS.closedRetentionMs, maxTombstones = PR_FACTS_DEFAULTS.maxTombstones }) {
   const prs = {}, checks = {}, shas = {}, closedSeen = {};
   const retained = new Map();
   // Numbers whose evidence was dropped: a later reopen recreates a row without it, so it must never be served as facts.
@@ -198,7 +212,7 @@ export function compactMirror(mirror, { nowMs, retentionMs = PR_FACTS_DEFAULTS.c
   // A dropped PR's head is tombstoned unless a retained PR still holds it (its checks stayed with that PR).
   const heldHeads = new Set([...retained.values()].map((r) => r.sha));
   for (const s of droppedHeads) if (!heldHeads.has(s)) evictedShas.add(s);
-  return { ...mirror, buckets: { ...mirror.buckets, prs, checks, shas }, closedSeen, evicted: [...evicted].sort((a, b) => a - b), evictedShas: [...evictedShas].sort() };
+  return { ...mirror, buckets: { ...mirror.buckets, prs, checks, shas }, closedSeen, ...boundTombstones(mirror, evicted, evictedShas, maxTombstones) };
 }
 
 const sortBy = (...keys) => (a, b) => { for (const k of keys) { const x = String(a[k] ?? ''); const y = String(b[k] ?? ''); if (x !== y) return x < y ? -1 : 1; } return 0; };
@@ -260,7 +274,13 @@ export function mirrorRows(mirror) {
 }
 
 /** Compaction dropped this PR's (or its head sha's) evidence: the row cannot prove its checks/review, so it is not served. */
-const lostEvidence = (mirror, row) => !!(mirror.evicted?.includes(row.number) || (row.sha && mirror.evictedShas?.includes(row.sha)));
+const lostEvidence = (mirror, row) => !!(
+  // No exemption for retained open PRs: trimmed number history cannot prove their evidence survived.
+  row.number <= (mirror.evictedFloor ?? 0) || mirror.evicted?.includes(row.number) ||
+  // Once SHA history is truncated, partial checks/mappings (even from /prs) cannot prove completeness.
+  // Keep falling back to GitHub; no independent completeness proof currently exists to clear this flag.
+  mirror.evictedShasTruncated || (row.sha && mirror.evictedShas?.includes(row.sha))
+);
 
 /** Look one PR up in a mirror. `{ facts }` or `{ facts:null, reason }`. PURE. */
 export function lookupInMirror(mirror, { number, nowMs, ttlMs, staleAfterMs }) {
