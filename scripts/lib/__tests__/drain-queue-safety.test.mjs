@@ -940,12 +940,31 @@ describe('merge-queue same-head failure admission', () => {
         expect(f.guard().hold).toBe(true);
         expect(f.mainReads).toBeUndefined();
       }));
-    it.each([false, true])('cancelled/regroup holds after repeated failed attempts (later success: %s)', laterSuccess => fixture(f => {
+    it.each([
+      ['missing start', { started_at: undefined }],
+      ['missing completion', { completed_at: undefined }],
+      ['invalid start', { started_at: 'not-a-date' }],
+      ['invalid completion', { completed_at: 'not-a-date' }],
+      ['completion before start', { completed_at: '2026-11-01T10:59:00Z' }],
+      ['completion at removal', { completed_at: removed().createdAt }],
+      ['missing commit', { head_sha: undefined }],
+    ])('cancelled/regroup holds with unreadable attempt evidence: %s', (_kind, overrides) => fixture(f => {
+      f.checks = regroupChecks();
+      Object.assign(f.checks[1], overrides);
+      f.expectHeld();
+      expect(f.log.mock.calls[1][0]).toMatch(/attempt evidence unreadable or incomplete; operator must inspect/);
+      expect(f.mainReads).toBeUndefined();
+      expect(f.exec.mock.calls.every(([, args]) => !args.includes('POST'))).toBe(true);
+    }));
+    it.each([
+      [false, {}], [true, {}],
+      [false, { started_at: undefined }], [true, { completed_at: undefined }],
+    ])('cancelled/regroup holds after repeated failed attempts (later success: %s, attempt metadata: %j)', (laterSuccess, overrides) => fixture(f => {
       f.checks = regroupChecks();
       const original = f.checks[1];
       f.checks.push({ ...original, id: 25,
         details_url: `https://github.com/${repo}/actions/runs/500/job/9025`,
-        started_at: '2026-11-01T11:20:00Z', completed_at: '2026-11-01T11:30:00Z' });
+        started_at: '2026-11-01T11:20:00Z', completed_at: '2026-11-01T11:30:00Z', ...overrides });
       if (laterSuccess) f.checks.push({ ...original, id: 26, conclusion: 'success',
         details_url: `https://github.com/${repo}/actions/runs/500/job/9026`,
         started_at: '2026-11-01T11:40:00Z', completed_at: '2026-11-01T11:50:00Z' });
@@ -958,6 +977,22 @@ describe('merge-queue same-head failure admission', () => {
       f.mainError = true;
       expect(f.guard().line).toContain('aggregate derived: none; PR CLEAN');
     }));
+    it.each([false, true])('cancelled/regroup enforces ten failed jobs (with aggregate: %s)', aggregate => {
+      for (const count of [10, 11]) fixture(f => {
+        const checks = regroupChecks();
+        f.checks = Array.from({ length: count - (aggregate ? 1 : 0) }, (_, i) => ({
+          ...checks[0], id: 100 + i, name: `cancelled-${i}`,
+        }));
+        if (aggregate) f.checks.push(checks[1]);
+        f.mainError = true;
+        const result = f.guard();
+        expect(result.hold).toBe(count > 10);
+        if (count > 10) expect(f.log.mock.calls[1][0]).toMatch(/10-job limit; operator must inspect failed jobs and enqueue manually/);
+        else expect(result.line).toContain('cancelled/regroup retry 1/2');
+        expect(f.mainReads).toBeUndefined();
+        expect(f.exec.mock.calls.every(([, args]) => !args.includes('POST'))).toBe(true);
+      });
+    });
     it('second cancelled/regroup retry is allowed at N=2; third holds even after manual withdrawal', () => {
       for (const spent of [1, 2]) fixture(f => {
         f.checks = regroupChecks();

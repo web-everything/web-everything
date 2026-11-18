@@ -798,7 +798,16 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
       && rawFailed.every(check => cancelled(check) || check.conclusion === 'failure'
         && retryPolicy.mqAggregateJobs.includes(localJob(check.name)));
     const attempts = inspectMqReruns({ checks: rawChecks, repo, commit: oid, removedAt });
-    if (cancelledRegroup && attempts.reason) return null;
+    if (cancelledRegroup) {
+      if (rawFailed.length > MQ_INFRA_MAX_JOBS)
+        return { logReason: `failed-job count exceeds ${MQ_INFRA_MAX_JOBS}-job limit; operator must inspect failed jobs and enqueue manually` };
+      const failures = rawFailed.filter(check => check.conclusion === 'failure');
+      // An absent reason is not proof: unreadable attempts also have no reason.
+      // Every failure must have a validated original candidate, or all reruns must be confirmed green.
+      if (attempts.reason || failures.length > 0 && attempts.confirmed !== true
+        && attempts.candidates.length !== failures.length)
+        return { logReason: attempts.reason || 'job attempt evidence unreadable or incomplete; operator must inspect failed jobs and enqueue manually' };
+    }
     // Other evidence kinds retain their historical removal and re-enqueue limits.
     if (!cancelledRegroup && (removals.length > 2 || timeline.nodes.filter(event => event?.__typename === 'AddedToMergeQueueEvent'
       && timeline.nodes.indexOf(event) > timeline.nodes.indexOf(removals[0])).length >= 2)) return null;
