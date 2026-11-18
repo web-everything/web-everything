@@ -484,11 +484,22 @@ export async function prepareRebuild({
     const sinceMs = sameHold ? Date.parse(state.held.since) : NaN;
     const since = Number.isFinite(sinceMs) && sinceMs <= nowMs() ? state.held.since : nowIso();
     const expired = sameHold && Number.isFinite(sinceMs) && nowMs() - sinceMs > park.value * 60_000;
+    // Age alone never authorizes losing live content. Recheck even previously parked tips:
+    // every lost overlay must be unpinned and add nothing to main or the superseding candidate.
+    let proven = false;
     if (park.value > 0 && (unparked.length === 0 || expired)) {
+      try {
+        proven = lost.every(l => l.reason === 'conflict' && !!l.sha
+          && (tipInMain(git, plan.mainSha, l.sha)
+            || (plan.applied.some(a => a.ref !== l.ref)
+              && tipInMain(git, plan.finalSha, l.sha))));
+      } catch { /* Unreadable content evidence retains the hold and its alert. */ }
+    }
+    if (proven) {
       for (const l of unparked) {
         const parked = { ...l, reason: 'established-overlay-parked', need: 'needs-you',
           since, parkMinutes: park.value, source: park.source,
-          message: 'Hold expired; building without this overlay. Registration retained; rebase onto main to rejoin.' };
+          message: 'Hold expired; content is already in main or the superseding candidate. Registration retained.' };
         appendOverlayEvent(root, { kind: 'established-overlay-parked', ...parked }, { env });
         alert('established-overlay-parked', parked);
         pinnedNow[l.ref] = `established-overlay-parked:${l.sha}`;

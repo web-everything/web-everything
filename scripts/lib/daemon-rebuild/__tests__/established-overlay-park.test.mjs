@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { prepareRebuild, readOverlayEventLog } from '../prepare.mjs';
 import { readRebuildState, writeRebuildState } from '../state.mjs';
 import * as planner from '../plan.mjs';
+import * as auditedTip from '../audited-tip.mjs';
 import * as edgeFetch from '../edge-fetch.mjs';
 import * as localState from '../local-state.mjs';
 import * as lease from '../lease.mjs';
@@ -33,6 +34,8 @@ describe('bounded established overlay hold', () => {
     vi.spyOn(repair, 'repairCloneRefs').mockReturnValue({ ok: true, pruned: [], reportedNew: [] });
     vi.spyOn(edgeFetch, 'fetchMainAndOverlays').mockReturnValue({ ok: true, goneRefs: [] });
     vi.spyOn(planner, 'planRebuild').mockImplementation(async () => plan);
+    // Positive cases explicitly supply proof that this exact tip adds nothing to main.
+    vi.spyOn(auditedTip, 'tipInMain').mockImplementation((_git, target, tip) => target === main && tip === plan.establishedLost[0].sha);
     vi.spyOn(lease, 'claimBuildLease').mockReturnValue({ token: 'test' });
   });
   afterEach(() => { vi.restoreAllMocks(); rmSync(root, { recursive: true, force: true }); });
@@ -55,7 +58,7 @@ describe('bounded established overlay hold', () => {
     expect(held().since).toBe(new Date(start).toISOString());
     expect(parked(r)).toEqual([]);
   });
-  it('parks beyond the threshold, keeps registration and clears held before building', async () => {
+  it('parks beyond the threshold only with content proof, keeps registration and clears held before building', async () => {
     const r = await tick();
     expect(r.terminal).toBe(false);
     expect(r.plan).toBe(plan);
@@ -74,6 +77,59 @@ describe('bounded established overlay hold', () => {
       expect(parked(r)).toEqual([]);
       expect(held()).toBeNull();
     }
+  });
+  it('an unproven overlay holds beyond the threshold', async () => {
+    auditedTip.tipInMain.mockReturnValue(false);
+    const r = await tick();
+    expect(r.result.reason).toBe('established-overlay-conflict');
+    expect(r.alerts.map(a => a.kind)).toContain('established-overlay-hold');
+    expect(parked(r)).toEqual([]);
+    expect(held()).not.toBeNull();
+  });
+  it('unreadable content evidence fails closed to the hold', async () => {
+    auditedTip.tipInMain.mockImplementation(() => { throw new Error('unreadable evidence'); });
+    const r = await tick();
+    expect(r.result.reason).toBe('established-overlay-conflict');
+    expect(r.alerts.map(a => a.kind)).toContain('established-overlay-hold');
+    expect(parked(r)).toEqual([]);
+  });
+  it('a pinned-conflict-skipped overlay holds beyond the threshold even with content proof', async () => {
+    plan.establishedLost[0].reason = 'pinned-conflict-skipped';
+    const r = await tick();
+    expect(r.result.reason).toBe('established-overlay-conflict');
+    expect(r.alerts.map(a => a.kind)).toContain('established-overlay-hold');
+    expect(parked(r)).toEqual([]);
+    expect(auditedTip.tipInMain).not.toHaveBeenCalled();
+  });
+  it.each(['conflict', 'pinned-conflict-skipped'])('a mixed set holds when the second overlay is unproven or pinned (%s)', async (reason) => {
+    const other = { ref: 'lane/other', sha: 'e'.repeat(40), reason };
+    addOverlay(root, { ref: other.ref }, { env });
+    plan.establishedLost.push(other);
+    plan.decisions.push({ ...other, action: 'drop' });
+    const state = readRebuildState(root, env);
+    state.adopted.applied.push({ ref: other.ref, sha: other.sha });
+    writeRebuildState(root, state, env);
+    const r = await tick();
+    expect(r.result.reason).toBe('established-overlay-conflict');
+    expect(r.alerts.map(a => a.kind)).toContain('established-overlay-hold');
+    expect(parked(r)).toEqual([]);
+    expect(readOverlayEventLog(root, env).filter(e => e.kind === 'established-overlay-parked')).toEqual([]);
+  });
+  it('parks a superseded tip only when its content reaches the candidate carrying another overlay', async () => {
+    plan.finalSha = 'f'.repeat(40);
+    plan.applied = [{ ref: 'lane/replacement', sha: 'e'.repeat(40) }];
+    auditedTip.tipInMain.mockImplementation((_git, target, tip) => target === plan.finalSha && tip === sha);
+    const r = await tick();
+    expect(r.terminal).toBe(false);
+    expect(parked(r)).toHaveLength(1);
+  });
+  it('a previous park notice does not bypass lost content proof on the next rebuild', async () => {
+    expect(parked(await tick())).toHaveLength(1);
+    auditedTip.tipInMain.mockReturnValue(false);
+    const r = await tick();
+    expect(r.result.reason).toBe('established-overlay-conflict');
+    expect(r.alerts.map(a => a.kind)).toContain('established-overlay-hold');
+    expect(parked(r)).toEqual([]);
   });
   it('setting zero disables parking', async () => {
     env.WE_DAEMON_ESTABLISHED_OVERLAY_PARK_MINUTES = '0';
