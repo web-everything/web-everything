@@ -761,9 +761,9 @@ describe('overlay main sync interrupted test runs', () => {
   const timeout = { status: 124, stdout: '', stderr: warnings.repeat(20)
     + 'heavy-command admission: run exceeded 480000ms and was stopped.\n' + warnings.repeat(20) };
 
-  it('warnings-only stderr with status 0 is green', async () => {
+  it.each([['warnings', warnings], ['stop text', timeout.stderr]])('%s stderr with status 0 is green without retry', async (_name, stderr) => {
     const f = fixture();
-    f.deps.testRunner = vi.fn(async options => ({ ...report(options), stderr: warnings }));
+    f.deps.testRunner = vi.fn(async options => ({ ...report(options), stderr }));
     expect(await job(f)).toMatchObject({ pushed: true });
     expect(f.deps.testRunner).toHaveBeenCalledOnce();
     expect(kinds(f)).not.toContain('overlay-main-timeout-retried');
@@ -775,7 +775,7 @@ describe('overlay main sync interrupted test runs', () => {
     ['signal', { status: null, signal: 'SIGTERM', stdout: '', stderr: '' }],
     ['ETIMEDOUT', { status: null, error: { code: 'ETIMEDOUT' } }],
     ['ENOBUFS', { status: null, error: { code: 'ENOBUFS' } }],
-    ['timeout stderr with status 0', { ...timeout, status: 0 }],
+    ['timeout stderr with nonordinary exit', { ...timeout, status: 137 }],
   ])('retries %s once on the same chunk with fresh evidence, then proceeds green', async (_name, killed) => {
     const f = fixture({ reruns: 0 }), paths = [], files = [], trees = [];
     f.deps.testRunner = vi.fn(async options => {
@@ -793,6 +793,126 @@ describe('overlay main sync interrupted test runs', () => {
     expect(f.events.filter(e => e.kind === 'overlay-main-timeout-retried')).toEqual([
       { kind: 'overlay-main-timeout-retried', ref, files: 3 },
     ]);
+  });
+
+  it.each([
+    ['missing failed identity', 'failed', 'renamed'],
+    ['reduced assertion count', 'baseline-failed', 'passed'],
+    ['duplicate failure multiplicity', 'twin-failed', 'baseline-passed'],
+    ['unnamed failed assertion', [{ status: 'failed' }], 'passed'],
+  ])('a killed partial red then green retry fails closed on %s with the original cause', async (_name, before, after) => {
+    const f = fixture({ reruns: 0 });
+    f.deps.testRunner = vi.fn(async options => {
+      if (f.deps.testRunner.mock.calls.length === 1) {
+        report(options, before);
+        return timeout;
+      }
+      return report(options, after);
+    });
+    f.deps.mainTestRunner = vi.fn();
+    await expect(job(f)).rejects.toMatchObject({ message: `tests: ${failure}`,
+      cause: { kind: 'timeout', status: 124, limitMs: 480000, files: 3 } });
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    expect(f.deps.mainTestRunner).not.toHaveBeenCalled();
+    expect(f.outcomes.find(e => e.kind === 'overlay-main-sync-failed').detail.cause.kind).toBe('timeout');
+    expect(kinds(f)).not.toContain('overlay-main-timeout-retried');
+    noPublication(f);
+  });
+
+  it('a killed partial red may proceed when the complete retry passes every failed assertion', async () => {
+    const f = fixture({ reruns: 0 });
+    f.deps.testRunner = vi.fn(async options => f.deps.testRunner.mock.calls.length === 1
+      ? (report(options, 'baseline-failed'), timeout) : report(options, 'baseline-passed'));
+    expect(await job(f)).toMatchObject({ pushed: true });
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    expect(kinds(f)).toContain('overlay-main-timeout-retried');
+  });
+
+  it.each([['A absent', false], ['A passed', true]])(
+    'interrupted A → ordinary failure B → green B with %s enforces interrupted coverage', async (_name, coversA) => {
+    const f = fixture({ reruns: 1 });
+    const assertion = (title, status) => ({ title, status, ancestorTitles: ['worker'] });
+    f.deps.testRunner = vi.fn(async options => {
+      const attempt = f.deps.testRunner.mock.calls.length;
+      if (attempt === 1) return (report(options, [assertion('A', 'failed')]), timeout);
+      if (attempt === 2) return report(options, [assertion('B', 'failed')], 1);
+      return report(options, [...(coversA ? [assertion('A', 'passed')] : []), assertion('B', 'passed')]);
+    });
+    f.deps.mainTestRunner = vi.fn();
+    if (coversA) {
+      expect(await job(f)).toMatchObject({ pushed: true });
+      expect(kinds(f)).toContain('overlay-main-flaky-retried');
+    } else {
+      await expect(job(f)).rejects.toMatchObject({ message: `tests: ${failure}`,
+        cause: { kind: 'timeout', status: 124, limitMs: 480000, files: 3 },
+        failedTests: [`${failedFile} > worker > A`] });
+      expect(f.outcomes.find(e => e.kind === 'overlay-main-sync-failed').detail.cause.kind).toBe('timeout');
+      noPublication(f);
+    }
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(3);
+    expect(selectedFiles(f.deps.testRunner.mock.calls[2][0])).toEqual([failedFile]);
+    expect(f.deps.mainTestRunner).not.toHaveBeenCalled();
+  });
+
+  it('an interrupted failure covered before another file clears survives narrower flake reruns', async () => {
+    const f = fixture({ reruns: 1 });
+    f.deps.testRunner = vi.fn(async options => {
+      const attempt = f.deps.testRunner.mock.calls.length;
+      if (attempt === 1) return (report(options, 'failed'), timeout);
+      const result = report(options, 'passed', attempt === 2 ? 1 : 0);
+      if (attempt === 2) {
+        const retry = json(options.testReport);
+        retry.testResults.find(row => row.name.endsWith('/worker1.test.mjs')).assertionResults[0].status = 'failed';
+        fs.writeFileSync(options.testReport, JSON.stringify(retry));
+      }
+      return result;
+    });
+    expect(await job(f)).toMatchObject({ pushed: true });
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(3);
+    expect(selectedFiles(f.deps.testRunner.mock.calls[2][0])).toEqual(['worker1.test.mjs']);
+    expect(kinds(f)).toContain('overlay-main-flaky-retried');
+  });
+
+  it('a killed partial report naming only a failed file cannot be cleared by a green retry', async () => {
+    const f = fixture({ reruns: 0 });
+    f.deps.testRunner = vi.fn(async options => {
+      const result = report(options);
+      if (f.deps.testRunner.mock.calls.length !== 1) return result;
+      const partial = json(options.testReport);
+      partial.testResults[0].status = 'failed';
+      partial.testResults[0].assertionResults = [];
+      fs.writeFileSync(options.testReport, JSON.stringify(partial));
+      return timeout;
+    });
+    await expect(job(f)).rejects.toMatchObject({ message: `tests: ${failure}`, cause: { kind: 'timeout' }, failedTests: [failedFile] });
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    noPublication(f);
+  });
+
+  it('a killed run with no partial report may proceed after a complete green retry', async () => {
+    const f = fixture({ reruns: 0 });
+    f.deps.testRunner = vi.fn(async options => f.deps.testRunner.mock.calls.length === 1 ? timeout : report(options));
+    expect(await job(f)).toMatchObject({ pushed: true });
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    expect(kinds(f)).toContain('overlay-main-timeout-retried');
+  });
+
+  it('a killed run cannot proceed when the green retry omits a selected file', async () => {
+    const f = fixture({ reruns: 0 });
+    f.deps.testRunner = vi.fn(async options => f.deps.testRunner.mock.calls.length === 1
+      ? timeout : report(options, 'missing'));
+    await expect(job(f)).rejects.toThrow(failure);
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    noPublication(f);
+  });
+
+  it('an interrupted retry cannot authorize publication even with a complete green report', async () => {
+    const f = fixture({ reruns: 0 });
+    f.deps.testRunner = vi.fn(async options => (report(options), timeout));
+    await expect(job(f)).rejects.toMatchObject({ cause: { kind: 'timeout' },
+      message: expect.stringContaining('2 attempts') });
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    noPublication(f);
   });
 
   it.each([
@@ -871,12 +991,14 @@ describe('overlay main sync interrupted test runs', () => {
     noPublication(f);
   });
 
-  it('real red with warning noise keeps flake reruns and main-red comparison', async () => {
+  it.each([['warning noise', warnings], ['stop text', 'run exceeded 1ms and was stopped']])(
+    'status 1 with %s keeps ordinary flake reruns and main-red comparison', async (_name, stderr) => {
     const f = fixture(); runners(f, ['failed', 'failed'], 'failed', 1);
     const runner = f.deps.testRunner;
-    f.deps.testRunner = vi.fn(async options => ({ ...await runner(options), stderr: warnings }));
+    f.deps.testRunner = vi.fn(async options => ({ ...await runner(options), stderr }));
     expect(await job(f)).toEqual({ skipped: true, reason: 'main-red' });
     expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    expect(selectedFiles(f.deps.testRunner.mock.calls[1][0])).toEqual([failedFile]);
     expect(f.deps.mainTestRunner).toHaveBeenCalledOnce();
     expect(kinds(f)).not.toContain('overlay-main-timeout-retried');
     noPublication(f);
@@ -893,8 +1015,10 @@ describe('overlay main sync interrupted test runs', () => {
     noPublication(f);
   });
 
-  it('a real red with flake reruns disabled is not retried and carries exit cause and names', async () => {
+  it('status 1 with stop text and flake reruns disabled stays ordinary red without retry', async () => {
     const f = fixture({ reruns: 0 }); runners(f, ['failed'], 'passed', 1);
+    const runner = f.deps.testRunner;
+    f.deps.testRunner = vi.fn(async options => ({ ...await runner(options), stderr: 'run exceeded 1ms and was stopped' }));
     await expect(job(f)).rejects.toMatchObject({ cause: { kind: 'exit', status: 1, files: 3 },
       failedTests: [`${failedFile} > worker > worker behaves`] });
     expect(f.deps.testRunner).toHaveBeenCalledOnce();

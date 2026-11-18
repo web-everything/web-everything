@@ -593,7 +593,8 @@ async function runnableTestFiles({ scratch, env, runner = spawnSync }) {
 
 // Only explicit interruption evidence earns a retry; an ordinary red remains on the flake path.
 function testRunCause(result, selected) {
-  const limit = /run exceeded (\d+)ms and was stopped/i.exec(result?.stderr ?? '');
+  const limit = result?.status !== 0 && result?.status !== 1
+    ? /run exceeded (\d+)ms and was stopped/i.exec(result?.stderr ?? '') : null;
   const timeout = result?.status === 124 || result?.error?.code === 'ETIMEDOUT' || limit !== null;
   return { kind: timeout ? 'timeout' : result?.signal || result?.error?.code === 'ENOBUFS' ? 'killed' : 'exit',
     status: result?.status ?? null, signal: result?.signal ?? null,
@@ -601,7 +602,7 @@ function testRunCause(result, selected) {
 }
 
 async function syncTestEvidence({ root, scratch, selected, testReport, env, io, runner }) {
-  let result, invocation, cause, timeoutRetried = false;
+  let result, invocation, cause, interrupted, timeoutRetried = false;
   for (let attempt = 1; attempt <= 2; attempt++) {
     const reportPath = attempt === 1 ? testReport : `${testReport}.retry`;
     io.rmSync(reportPath, { force: true }); // Never consume a previous attempt's evidence.
@@ -614,21 +615,30 @@ async function syncTestEvidence({ root, scratch, selected, testReport, env, io, 
     if (remoteUnconfirmed(result)) return { remoteUnconfirmed: true };
     cause = testRunCause(result, selected);
     if (cause.kind === 'exit') { testReport = reportPath; break; }
-    if (attempt === 1) { timeoutRetried = true; continue; }
-    // Partial reports can supply diagnostic names, but can never authorize publication.
-    const partial = { failed: [], failedAssertions: [] };
+    // A partial report cannot authorize publication, but its failures must survive the retry.
+    const partial = { failed: [], failedAssertions: [], byFile: new Map(), cause };
     try {
       if (io.statSync(reportPath).size > 8 * 1024 * 1024) throw new Error('oversized report');
       const rows = JSON.parse(io.readFileSync(reportPath, 'utf8')).testResults;
       for (const file of selected) {
-        const row = rows.find(row => row?.name === join(io.realpathSync(scratch), file));
-        const red = Array.isArray(row?.assertionResults) ? row.assertionResults.filter(a => a?.status === 'failed') : [];
-        if (row?.status === 'failed' || red.length) partial.failed.push(file);
-        partial.failedAssertions.push(...red.map(a => assertionIdentity(file, a)));
+        const matches = rows.filter(row => row?.name === join(io.realpathSync(scratch), file));
+        const assertions = matches.flatMap(row => Array.isArray(row.assertionResults) ? row.assertionResults : []);
+        const red = assertions.filter(a => a?.status === 'failed');
+        if (!matches.some(row => row.status === 'failed') && !red.length) continue;
+        partial.failed.push(file);
+        const failedIds = red.map(a => assertionIdentity(file, a));
+        partial.failedAssertions.push(...failedIds);
+        // A failed file without a named failed assertion cannot be cleared by a green retry.
+        partial.byFile.set(file, { total: assertions.length, failedIds: failedIds.length ? failedIds : [null] });
       }
     } catch { /* Missing or malformed reports remain incomplete, with only runner diagnostics. */ }
     const tail = testStderrTail(result, partial);
     const failedTests = testResultNames(result, partial);
+    if (attempt === 1) {
+      interrupted = { ...partial, stderrTail: tail, failedTests };
+      timeoutRetried = true;
+      continue;
+    }
     const description = cause.kind === 'timeout' ? `timeout${cause.limitMs === null ? '' : ` ${cause.limitMs}ms`}`
       : `signal ${cause.signal ?? result?.error?.code ?? 'unknown'}`;
     throw Object.assign(new Error(`tests: run killed (${description}, 2 attempts, ${selected.length} files); operator review required${tail ? `: ${tail}` : ''}`),
@@ -684,7 +694,10 @@ async function syncTestEvidence({ root, scratch, selected, testReport, env, io, 
   if (!commandOk && !(result?.status === 1 && (!result.error || validatedFailure) && complete && failed.length)) {
     output({ ...result, step: 'tests', cause, failedTests }, tail);
   }
-  return { green, failed, complete, failedAssertions, byFile, stderrTail: tail, cause, failedTests, timeoutRetried };
+  if (green && interrupted && !rerunCoversFailures(interrupted, { byFile }, interrupted.failed)) {
+    throw testFailure(interrupted);
+  }
+  return { green, failed, complete, failedAssertions, byFile, stderrTail: tail, cause, failedTests, timeoutRetried, interrupted };
 }
 // A green rerun only clears a failure it actually re-executed. Per previously failed file the rerun must
 // run at least as many assertions as the failing run did (a vanished assertion fails closed), and, when
@@ -855,10 +868,24 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     const { value: reruns, source: rerunsSource } = resolveOverlayFlakeReruns(env);
     for (let offset = 0; offset < tests.length; offset += chunkSize) {
       const chunk = tests.slice(offset, offset + chunkSize);
+      const interruptedFailures = [];
       const check = async (selected, attempt, tree = scratch, runner = deps.testRunner) => {
         const evidence = await syncTestEvidence({
           root, scratch: tree, selected, env, io, runner,
           testReport: join(scratchParent, `tests-${offset / chunkSize}-${attempt}.json`) });
+        if (tree === scratch && !evidence.remoteUnconfirmed) {
+          if (evidence.interrupted?.failed.length) interruptedFailures.push({
+            evidence: evidence.interrupted, remaining: [...evidence.interrupted.failed],
+          });
+          // Interrupted failures survive ordinary-red retries, including later flake reruns. Check
+          // each file when it clears; already-covered files need not appear in narrower later runs.
+          for (const pending of interruptedFailures) {
+            const cleared = pending.remaining.filter(file => !evidence.failed.includes(file) && evidence.byFile.has(file));
+            if ((evidence.green && cleared.length !== pending.remaining.length)
+              || !rerunCoversFailures(pending.evidence, evidence, cleared)) throw testFailure(pending.evidence);
+            pending.remaining = pending.remaining.filter(file => !cleared.includes(file));
+          }
+        }
         if (evidence.green && evidence.timeoutRetried) event(root,
           { kind: 'overlay-main-timeout-retried', ref, files: selected.length }, { env });
         return evidence;
