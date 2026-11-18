@@ -45,6 +45,18 @@ describe('post-plan stale detector', () => {
     expect(emit).toHaveBeenCalledTimes(1);
     expect(emit).toHaveBeenCalledWith({ ref, tip, count: 3, reason: 'conflict', ownerAction: `rebase ${ref} onto main` });
   });
+  it('a transient unknown does not suppress the later conflict alert', () => {
+    tick({ remoteTips: {} });
+    expect(emit).toHaveBeenCalledTimes(0 + emit.mock.calls.length);
+    const before = emit.mock.calls.length;
+    tick(); tick(); tick();
+    expect(emit.mock.calls.slice(before).some(([row]) => row.reason === 'conflict')).toBe(true);
+  });
+  it('a fork PR with the same branch name does not exclude the origin overlay', () => {
+    const heads = [{ headRefName: ref, headRefOid: sha('e'), isCrossRepository: true }];
+    expect(tick({ openPrHeads: heads })[0].count).toBe(1);
+    expect(tick({ openPrHeads: [{ ...heads[0], isCrossRepository: false }] })).toHaveLength(0);
+  });
   it('a failed publish is retried next tick and then marked delivered', () => {
     emit.mockImplementationOnce(() => { throw new Error('feed down'); });
     tick(); tick(); tick();

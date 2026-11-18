@@ -35,7 +35,7 @@ export function readOverlayStale(root, env = process.env) { return readState(roo
 /** One bounded read; a truncated or failed listing is unknown, never an empty open-PR set. */
 export function readOpenPrHeads(root, env, query = runGhSync) {
   try {
-    const rows = JSON.parse(query(['pr', 'list', '--state=open', '--limit=1000', '--json=headRefName,headRefOid'],
+    const rows = JSON.parse(query(['pr', 'list', '--state=open', '--limit=1000', '--json=headRefName,headRefOid,isCrossRepository'],
       { cwd: root, env, encoding: 'utf8', timeout: 20_000, maxBuffer: 2 * 1024 * 1024 }));
     return Array.isArray(rows) && rows.length < 1000
       && rows.every(r => typeof r.headRefName === 'string' && FULL_SHA_RE.test(r.headRefOid)) ? rows : null;
@@ -73,7 +73,8 @@ export function detectOverlayStale({ root, env = process.env, overlays, plan, ma
       || plan.alerts?.some(a => a.detail?.ref === ref && /pinned/.test(a.kind));
     if (excluded) { record.count = 0; continue; }
     if (heads === undefined) heads = readOpenPrHeads(root, env);
-    if (heads?.some(h => h.headRefName === ref)) { record.count = 0; continue; }
+    // A fork PR reusing the branch name is not this origin branch's PR.
+    if (heads?.some(h => h.headRefName === ref && h.isCrossRepository !== true)) { record.count = 0; continue; }
     let reason = null;
     if (!tip || !FULL_SHA_RE.test(mainSha) || !Array.isArray(heads)) reason = 'unknown';
     if (!reason) {
@@ -104,18 +105,21 @@ export function detectOverlayStale({ root, env = process.env, overlays, plan, ma
     const row = { ref, tip, count: record.count, reason: reason ?? 'clean',
       ownerAction: reason === 'superseded' ? `daemon-overlay.mjs remove ${ref}` : `rebase ${ref} onto main` };
     rows.push(row);
-    if (reason && (reason !== 'conflict' || record.count > settings.threshold) && !record.notified) {
-      // Persist the notice reservation before publication: interrupted publication never causes duplicate alerts.
-      record.notified = true;
-      record.notice = row;
+    if (reason && (reason !== 'conflict' || record.count > settings.threshold) && !(record.seen ??= {})[reason]) {
+      // One notice per (ref, tip, registration, reason): a transient `unknown` never suppresses a later conflict.
+      record.seen[reason] = true;
+      (record.pending ??= {})[reason] = row;
     }
   }
   state.rows = rows;
   const file = sidecar(root, env), tmp = `${file}.${process.pid}.tmp`;
   mkdirSync(dirname(file), { recursive: true });
-  const notices = Object.values(state.records).filter(r => r.notice && !r.published);
-  // Mark published only after delivery succeeds: a failed or interrupted publish retries next tick (never lost).
-  for (const record of notices) { try { emit(record.notice); record.published = true; } catch { /* retried next tick */ } }
+  // Clear a pending notice only after delivery succeeds: a failed publish retries next tick (never lost).
+  for (const record of Object.values(state.records)) {
+    for (const [why, notice] of Object.entries(record.pending ?? {})) {
+      try { emit(notice); delete record.pending[why]; } catch { /* retried next tick */ }
+    }
+  }
   writeFileSync(tmp, JSON.stringify(state));
   renameSync(tmp, file);
   return rows;
