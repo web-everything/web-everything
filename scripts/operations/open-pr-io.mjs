@@ -13,6 +13,7 @@
  *
  * IMPURE by construction: `child_process`.
  */
+import { checkCanonicalAuditForOpen } from './canonical-audit-gate.mjs';
 import { readMainCard, assertMachineTitle } from './machine-pr-title.mjs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { dirname, isAbsolute, join, sep } from 'node:path';
@@ -138,7 +139,7 @@ import { createGitReader } from '../lib/pr-size-admission.mjs';
  * The runner the declaration is injected with. ONE spawn; `spawn` is injected so every branch of
  * `classifySubmit` is reachable with no `gh`, no network and no PR.
  */
-export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSettings = loadPrePrSettings, spawn = spawnSync, cwd = process.cwd(),
+export function createPrLandRunner({ canonicalAudit = checkCanonicalAuditForOpen, prePrReview = checkPrePrReview, loadSettings = loadPrePrSettings, spawn = spawnSync, cwd = process.cwd(),
   // Advisory rollout until automated producers have migrated their generated bodies.
   // Enforce remains injectable so admission and path-parity tests cover the eventual strict gate.
   prepMode = 'advise', prepGate = prepVerdict, readPrepBody = readFileSync, prepLogPath,
@@ -221,6 +222,14 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
         return { outcome: 'refused', reason: String(e.message || e) };
       }
     }
+    let audit;
+    try { audit = canonicalAudit({ repo: cwd, ref: arg('ref'), sha: arg('sha'), env }); }
+    catch { audit = { ok: false, reason: 'canonical-audit-missing', message: 'canonical audit check failed; resolve the full head sha and run node scripts/operations/run.mjs codex-audit --base=origin/main --head=<fullsha>' }; }
+    if (audit?.ok !== true) {
+      cleanupBody();
+      return { outcome: 'refused', reason: audit?.reason || 'canonical-audit-missing', detail: audit?.message || 'canonical audit check returned no decision' };
+    }
+    if (audit.sha) argv = [...argv.filter(a => !a.startsWith('--sha=')), `--sha=${audit.sha}`];
     try {
       r = spawn(process.execPath, [PR_LAND_CLI, ...argv, '--json'], {
         encoding: 'utf8', timeout: OPEN_PR_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024, cwd, env,
