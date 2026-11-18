@@ -1075,7 +1075,7 @@ describe('empty net diff terminal publication through the production carry path'
       expect(readRedTeamCarry(c.key)).toBeNull();
       // The refusal came from the lane's own diff naming the changed file, not from a failed Git call.
       expect(new Set(c.gitCwds)).toEqual(new Set([c.lanePath]));
-      expect(c.gitOutputs).toEqual(['file.txt\0']);
+      expect(c.gitOutputs).toEqual([`${c.base}\n`, 'file.txt\0']);
     } finally { rmSync(c.root, { recursive: true, force: true }); }
   });
 
@@ -1097,7 +1097,7 @@ describe('empty net diff terminal publication through the production carry path'
       expect(readRedTeamCarry(c.key)).toBeNull();
       expect(new Set(c.gitCwds)).toEqual(new Set([c.lanePath]));
       expect(c.exec.mock.calls.filter(([file]) => file === 'git').every(([, args]) => args[0] === '--no-replace-objects')).toBe(true);
-      expect(c.gitOutputs).toEqual(['file.txt\0']);
+      expect(c.gitOutputs).toEqual([`${c.base}\n`, 'file.txt\0']);
     } finally { rmSync(c.root, { recursive: true, force: true }); }
   });
 

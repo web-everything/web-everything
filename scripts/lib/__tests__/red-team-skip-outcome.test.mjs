@@ -408,16 +408,16 @@ describe('empty net diff policy settlement', () => {
   it('publishes the terminal policy-clear reason exactly once using a config-independent emptiness probe', () => {
     const f = fixture();
     f.io.readStatus = () => ({ head, loopPayload: { findings: { read: { netBasis: { base: 'c'.repeat(40), rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true } } } });
-    f.io.gitExec = vi.fn(() => '');
+    f.io.gitExec = vi.fn((_file, args) => args.includes('rev-parse') ? 'c'.repeat(40) : '');
     const skip = { status: 'skipped', policy: 'empty-net-diff', reason: 'red team skipped: empty net diff' };
     expect(classifyRedTeamSkip(skip).kind).toBe('policy');
     expect(f.settle(skip).outcome).toBe('policy-clear');
     expect(f.comments[0].body).toContain('Red team not required on this head: not-owed: empty net diff');
     expect(f.settle(skip).outcome).toBe('already');
     expect(f.io.postComment).toHaveBeenCalledTimes(1);
-    expect(f.io.gitExec.mock.calls[0][1]).toContain(`${'c'.repeat(40)}..${head}`);
-    expect(f.io.gitExec.mock.calls[0][1][0]).toBe('--no-replace-objects');
-    expect(f.io.gitExec.mock.calls[0][1]).toEqual(expect.arrayContaining([
+    expect(f.io.gitExec.mock.calls[1][1]).toContain(`${'c'.repeat(40)}..${head}`);
+    expect(f.io.gitExec.mock.calls[1][1][0]).toBe('--no-replace-objects');
+    expect(f.io.gitExec.mock.calls[1][1]).toEqual(expect.arrayContaining([
       '--no-replace-objects', '--ignore-submodules=none', '--no-ext-diff', '--no-textconv', '--no-renames',
     ]));
   });

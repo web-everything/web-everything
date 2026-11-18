@@ -34,9 +34,14 @@ export function emptyNetDiffSkip(status, head = status?.head) {
 export function verifyEmptyNetDiff(read, head, { exec = execFileSync, cwd } = {}) {
   if (!provenEmptyNetDiff(read, head) || typeof read.netBasis.base !== 'string' || !read.netBasis.base) return false;
   try {
-    // --no-replace-objects: a replace ref planted in the checkout cannot make base..head read as empty.
-    return exec('git', ['--no-replace-objects', 'diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--ignore-submodules=none', '--name-only', '-z',
-      '--end-of-options', `${read.netBasis.base}..${head}`, '--'],
-    { cwd, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024 }) === '';
+    // Every Git read must ignore replacement objects, including resolution of the stored base.
+    const git = args => exec('git', ['--no-replace-objects', ...args],
+      { cwd, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024 });
+    const base = git(['rev-parse', '--verify', '--end-of-options', `${read.netBasis.base}^{commit}`]).trim();
+    // A replacement-aware merge-base may have recorded head itself. Even a replacement-free
+    // head..head diff then says nothing about the contribution; retain the hold for inspection.
+    if (!/^[a-f0-9]{40}$/i.test(base) || base.toLowerCase() === head.toLowerCase()) return false;
+    return git(['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--ignore-submodules=none', '--name-only', '-z',
+      '--end-of-options', `${base}..${head}`, '--']) === '';
   } catch { return false; }
 }

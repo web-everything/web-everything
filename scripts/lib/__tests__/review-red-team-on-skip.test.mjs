@@ -18,10 +18,12 @@ import { readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus, redTe
   readCarriedCheckUnpublished, publishCarriedCheckDurably, markCarriedCheckUnpublished } from '../drain-red-team-evidence.mjs';
 import { publishRedTeamCheckFromLive, evaluateRedTeamCheckFact, clearLivePublicationHold,
   readRedTeamPublicationHoldFact, withRedTeamCheckLock } from '../red-team-check-run.mjs';
+import { resolveScorecardStorePath } from '../../conveyor/run-scorecard-store.mjs';
+import { verifyEmptyNetDiff } from '../red-team-empty-net-diff.mjs';
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
 import { RESUME_MAX_ATTEMPTS, refusedReferralsAreRuled, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -3187,8 +3189,66 @@ describe('finished skipped empty net diff recovery', () => {
       failedSeatCount: 0, inFlight: false, queued: false };
     return { rawPrs: [{ number: pr, headRefOid: head, labels: ['review:accepted', 'ready-to-merge', 'red-team:pending'], reviews: [],
       comments: [{ body: `✅ review — accepted\n<!-- reviewed-sha: ${head} -->`, author: { login: 'web-everything' } }] }],
-      cwd: 'subject-checkout', gitExec: vi.fn(() => ''), readEvidence: () => evidence, readStatus: () => status };
+      cwd: 'subject-checkout', gitExec: vi.fn((_file, args) => args.includes('rev-parse') ? 'c'.repeat(40) : ''), readEvidence: () => evidence, readStatus: () => status };
   };
+  it.each(['malformed', 'unreadable'])('empty-diff recovery fails closed for a %s seat store', kind => {
+    const dir = mkdtempSync(join(tmpdir(), 'empty-diff-seat-store-'));
+    try {
+      const env = { CONVEYOR_STATE_ROOT: dir, WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+      const store = resolveScorecardStorePath(env);
+      mkdirSync(join(dir, '.conveyor'));
+      // A directory deterministically fails readFileSync, even under a privileged test runner.
+      if (kind === 'unreadable') mkdirSync(store);
+      else writeFileSync(store, '{broken');
+      const o = options();
+      recordRedTeamStatus({ repo, pr, status: 'finished', loopPayload: o.readStatus().loopPayload,
+        result: { status: 'skipped' } }, { env });
+      o.readEvidence = key => readDrainRedTeamEvidence({ ...key, env, lookup: () => ({ ok: true, run: null }) });
+      expect(decide({ ...o, env })).toMatchObject({ action: 'skip',
+        why: 'red-team evidence unreadable; inspect stored evidence before retrying' });
+      expect(o.gitExec).not.toHaveBeenCalled();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('empty-diff recovery still clears with a well-formed empty seat store', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'empty-diff-seat-store-'));
+    try {
+      const env = { CONVEYOR_STATE_ROOT: dir, WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+      mkdirSync(join(dir, '.conveyor'));
+      writeFileSync(resolveScorecardStorePath(env), JSON.stringify({ version: 1, records: [] }));
+      const o = options();
+      recordRedTeamStatus({ repo, pr, status: 'finished', loopPayload: o.readStatus().loopPayload,
+        result: { status: 'skipped' } }, { env });
+      o.readEvidence = key => readDrainRedTeamEvidence({ ...key, env, lookup: () => ({ ok: true, run: null }) });
+      expect(decide({ ...o, env })).toMatchObject({ action: 'clear', policy: 'empty-net-diff' });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('refuses an empty claim when a replace ref makes the recorded merge base equal head (real git)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'empty-diff-replaced-base-'));
+    const git = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' }).trim();
+    const commit = message => git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+      '-c', 'commit.gpgsign=false', 'commit', '--quiet', '-am', message);
+    try {
+      git('init', '--quiet');
+      writeFileSync(join(dir, 'file.txt'), 'base\n');
+      git('add', 'file.txt');
+      commit('base');
+      const base = git('rev-parse', 'HEAD');
+      writeFileSync(join(dir, 'file.txt'), 'head change\n');
+      commit('head');
+      const rev = git('rev-parse', 'HEAD');
+      // Give the apparent main/base a parent of head; replacement-aware merge-base now returns head.
+      const planted = git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+        'commit-tree', `${base}^{tree}`, '-p', rev, '-m', 'planted base');
+      git('replace', base, planted);
+      const poisonedBase = git('merge-base', base, rev);
+      expect(poisonedBase).toBe(rev);
+      expect(git('--no-replace-objects', 'merge-base', base, rev)).toBe(base);
+      expect(git('--no-replace-objects', 'diff', '--name-only', `${base}..${rev}`)).toBe('file.txt');
+      const read = { netBasis: { base: poisonedBase, rev, scored: true },
+        netChangedFiles: [], diffText: '', diffScored: true };
+      expect(verifyEmptyNetDiff(read, rev, { cwd: dir })).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it('heals a legacy finished skipped object using a config-independent emptiness probe', () => {
     const o = options();
     expect(decide(o)).toMatchObject({ action: 'clear', policy: 'empty-net-diff', why: 'red team skipped: empty net diff' });
@@ -3266,6 +3326,7 @@ it.each(['nonempty after recording', 'probe failure'])('R979 recovery refuses %s
   Object.assign(loopPayload.findings.read, { netBasis: { base, rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true });
   const status = { head, status: 'finished', loopPayload, result: { status: 'skipped' } };
   const gitExec = vi.fn((_file, args) => {
+    if (args.includes('rev-parse')) return base;
     expect(args).toContain(`${base}..${head}`);
     if (kind === 'probe failure') throw Error('unreadable');
     return 'code.mjs\0';
@@ -3276,5 +3337,5 @@ it.each(['nonempty after recording', 'probe failure'])('R979 recovery refuses %s
     readStatus: () => status, readEvidence: () => ({ status, loopPayload, recorded: false, seatRecorded: false,
       completedRecorded: false, failedSeatCount: 0, inFlight: false, queued: false }) });
   expect(result).toMatchObject({ action: 'skip', why: 'empty net diff not proven for this head; inspect stored evidence' });
-  expect(gitExec).toHaveBeenCalledTimes(1);
+  expect(gitExec).toHaveBeenCalledTimes(2);
 });
