@@ -119,6 +119,9 @@ export function addEntries(list, { tests = [], brokenSha, owner, reason, actor, 
   const next = { version: 1, entries, ...(Array.isArray(base.fixPrs) ? { fixPrs: base.fixPrs } : {}), ...(base.mode !== undefined ? { mode: base.mode } : {}) };
   const v = validateQuarantineList(next);
   if (!v.ok) return { ok: false, error: v.errors.join('; ') };
+  // The cap is global across every live entry and job, for manual adds as well as the safety net.
+  const liveFiles = new Set(activeEntries(next, { now }).map((e) => testFileOf(e.test)));
+  if (liveFiles.size > QUARANTINE_SAFETY_NET_DEFAULTS.maxTests) return { ok: false, error: `quarantine cap ${QUARANTINE_SAFETY_NET_DEFAULTS.maxTests} reached (${liveFiles.size} live files)` };
   return { ok: true, list: next, events };
 }
 
