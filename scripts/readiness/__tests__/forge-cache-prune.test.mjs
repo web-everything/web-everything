@@ -869,6 +869,8 @@ describe('readLiveEvidence', () => {
   });
 
   it.each([
+    // PR #7079 historical probe: phase order pruned two unrelated profiles;
+    // file-time ordering protects all three when the fieldless running is newest.
     {scenario: 'newer fieldless running protects the whole lock', runningAge: 1000, protectedLock: true},
     {scenario: 'no running record allows reclamation', runningAge: null, protectedLock: false},
     {scenario: 'running older than receipt allows reclamation', runningAge: 2500, protectedLock: false},
@@ -910,7 +912,9 @@ describe('readLiveEvidence', () => {
       const live = await readLiveEvidence({receipts, now});
       expect(live.complete).toBe(true);
       expect(live.locks).toEqual(new Set(protectedLock ? [lock] : []));
-      if (!protectedLock) expect(live.profiles).toEqual(new Set());
+      // A fieldless running record contributes no profile; earlier known evidence
+      // remains precise, while locks protects every profile under the same lock.
+      expect(live.profiles).toEqual(new Set(protectedLock ? [`${lock}/dev-v5-${hex('b')}`] : []));
       const profiles = [entry('b', 30), entry('c', 30), entry('f', 30)];
       expectDecision(plan(profiles, {live}), protectedLock ? [] : profiles, protectedLock ? profiles : []);
     } finally { vi.restoreAllMocks(); }

@@ -238,8 +238,9 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
         && now - (await fs.lstat(reservationFile)).mtimeMs >= MAX_RUNTIME_MS;
       if (lock === undefined && !leaked) throw new Error('Invalid reserved lock evidence');
       let latestKnown = false, unresolvedProfile = false;
-      // The newest present phase decides even when it carries no profile fields:
-      // an older known profile cannot narrow protection for a later unknown one.
+      // Greatest file mtime wins across ALL present records, including fieldless
+      // ones. Phase rank only breaks ties; an older receipt cannot hide a newer
+      // unknown profile and narrow protection from the whole lock.
       const phaseRank = {prepared: 0, running: 1, receipt: 2};
       const latest = records.reduce((newest, candidate) => candidate.mtimeMs > newest.mtimeMs
         || (candidate.mtimeMs === newest.mtimeMs && phaseRank[candidate.suffix] > phaseRank[newest.suffix])
