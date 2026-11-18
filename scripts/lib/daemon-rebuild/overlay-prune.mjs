@@ -37,7 +37,7 @@ export function readOverlayStale(root, env = process.env) { return readState(roo
 
 function originSlug(root, env) {
   try {
-    const url = spawnSync('git', ['remote', 'get-url', 'origin'], { cwd: root, env, encoding: 'utf8', timeout: 20_000 }).stdout;
+    const url = spawnSync('git', ['remote', 'get-url', 'origin'], { cwd: root, env, encoding: 'utf8', timeout: 20_000, maxBuffer: 64 * 1024 }).stdout;
     return String(url).trim().match(/github\.com[:/]+([^/]+)\/([^/.]+?)(?:\.git)?\/?$/)?.slice(1, 3).join('/') || null;
   } catch { return null; }
 }
