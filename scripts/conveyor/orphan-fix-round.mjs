@@ -31,7 +31,7 @@
  * Kill switch `WE_ORPHAN_FIX_GUARD=0` (report only). PURE core: {@link planOrphanFixRound}. IO shell:
  * {@link runOrphanFixRoundPass}, run by the fix daemon inside its stuck-fixer reclaim step.
  */
-import { constellationRepoKeysWith, repoProfile } from '../lib/repo-profile.mjs';
+import { constellationRepoKeysWith, repoHasCapability, repoProfile } from '../lib/repo-profile.mjs';
 import { execFileSync } from 'node:child_process';
 import { stripVTControlCharacters } from 'node:util';
 import { resolve } from 'node:path';
@@ -281,6 +281,7 @@ export async function runOrphanFixRoundPass({
   const enabled = orphanGuardEnabled(env);
   const rows = [];
   for (const { key, slug } of repos) {
+    if (!repoHasCapability(slug, 'fix', { resolveProfile })) continue;
     let prs;
     try { prs = listBounced(slug); } catch (e) { rows.push({ repo: slug, decision: 'error', reason: `listing failed: ${String(e?.message ?? e).split('\n')[0]}` }); continue; }
     for (const p of prs ?? []) {
@@ -293,6 +294,7 @@ export async function runOrphanFixRoundPass({
         Object.assign(row, { decision: plan.decision, reason: plan.reason });
         rows.push(row);
         if (!enabled) { row.result = 'report-only (WE_ORPHAN_FIX_GUARD=0)'; continue; }
+        if (!repoHasCapability(slug, 'fix', { resolveProfile })) { row.result = 'not-done: fix capability unavailable — operator must re-enable it'; continue; }
         const labels = labelNames(p.labels);
         const r = plan.decision === 'rearm' ? await rearm({ slug, pr: p.number, head: p.headRefOid })
           : plan.decision === 'redispatch' ? await redispatch({ slug, pr: p.number })

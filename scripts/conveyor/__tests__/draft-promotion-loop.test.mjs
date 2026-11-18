@@ -8,7 +8,7 @@ const draft = fixture.drafts[0];
 const check = (name, conclusion = 'success', extra = {}) => ({ name, status: 'completed', conclusion, ...extra });
 
 describe('runDraftPromotionStep — forwards reviewHoldOnly from the fresh head read', () => {
-  const run = (fresh, view = {}) => {
+  const run = (fresh, view = {}, overrides = {}) => {
     const ready = vi.fn();
     const clearAwaiting = vi.fn();
     const readHeadCheckState = vi.fn(() => fresh);
@@ -26,7 +26,7 @@ describe('runDraftPromotionStep — forwards reviewHoldOnly from the fresh head 
       mergeGateSetting: { value: 'off' }, absentNotApplicable: [],
       readMergeGateVerdict: () => { throw new Error('must not read live job evidence'); },
       readFreeze: () => { throw new Error('must not read a live freeze'); },
-      ready, clearAwaiting, now: () => Date.parse('2026-10-09T08:00:00Z'),
+      ready, clearAwaiting, now: () => Date.parse('2026-10-09T08:00:00Z'), ...overrides,
     });
     return { result, ready, clearAwaiting, readHeadCheckState, readPrView };
   };
@@ -42,6 +42,17 @@ describe('runDraftPromotionStep — forwards reviewHoldOnly from the fresh head 
     expect(ready).toHaveBeenCalledWith(fixture.repo, draft.number);
     expect(clearAwaiting).toHaveBeenCalledTimes(1);
     expect(clearAwaiting).toHaveBeenCalledWith(fixture.repo, draft.number);
+  });
+
+  it('rechecks review capability after reads and refuses promotion when disabled', () => {
+    let enabled = true;
+    const { result, ready, clearAwaiting } = run({ state: 'red', reviewHoldOnly: true }, {}, {
+      resolveProfile: () => ({ capabilities: { review: enabled } }),
+      readClaim: () => { enabled = false; return null; },
+    });
+    expect(result.rows[0]).toMatchObject({ action: 'skip', why: expect.stringContaining('review capability unavailable') });
+    expect(ready).not.toHaveBeenCalled();
+    expect(clearAwaiting).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -116,4 +127,11 @@ it('does not list drafts for a review-disabled repo in the default promotion swe
   const listDrafts = vi.fn(() => []);
   runDraftPromotionStep({ resolveProfile, listDrafts });
   expect(listDrafts.mock.calls.map(([o]) => o.repoSlug)).toEqual(['web-everything/web-everything', 'plateauapp/plateau-app']);
+});
+
+it('filters disabled explicit promotion repos before listing', () => {
+  const listDrafts = vi.fn(() => []);
+  runDraftPromotionStep({ repos: ['frontier-ui/frontierui', 'longshoreai/longshore'],
+    resolveProfile: () => ({ capabilities: { review: false } }), listDrafts });
+  expect(listDrafts).not.toHaveBeenCalled();
 });

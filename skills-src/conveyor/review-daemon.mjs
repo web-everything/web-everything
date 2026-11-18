@@ -72,7 +72,7 @@
  * pass in this repo (`runner.mjs`'s `makeCliMechanicalPasses`) — it never fails the review tick itself.
  */
 
-import { constellationRepoKeysWith, repoProfile } from '../../scripts/lib/repo-profile.mjs';
+import { constellationRepoKeysWith, repoHasCapability, repoProfile } from '../../scripts/lib/repo-profile.mjs';
 import { readFileSync, statSync } from 'node:fs';
 import { cascadePolicy } from '../../scripts/lib/policy-cascade.mjs';
 import { createPlannerFactCache } from '../../scripts/conveyor/planner-fact-cache.mjs';
@@ -955,8 +955,7 @@ export function sharedHostBudget(hostAdmission, log = console.error) {
 }
 
 export function runReviewTickAllRepos({ resolveProfile = repoProfile, repos = constellationRepoKeysWith('review', { resolveProfile }).map((key) => CONSTELLATION_REPOS[key].slug), tick = runReviewTick, authGateOverride, ...tickOpts } = {}) {
-  const eligible = new Set(constellationRepoKeysWith('review', { resolveProfile }));
-  repos = repos.filter(repo => repoKeyForSlug(repo) === null || eligible.has(repoKeyForSlug(repo)));
+  repos = repos.filter(repo => repoHasCapability(repo, 'review', { resolveProfile, allowUnknown: true }));
   // card x5kagse (epic #4075/#3383) — computed ONCE per tick (the login is a host-global fact, not per-repo),
   // then forwarded into every repo's own `runReviewTick` call below. Real IO runs only for a genuine production
   // tick (`tick` left at its real default) — mirrors `runTickAllRepos`'s own identical rule in
@@ -1136,8 +1135,7 @@ export async function runConvertAdvisoryTickAllRepos({
   resolveProfile = repoProfile, repos = constellationRepoKeysWith('review', { resolveProfile }).map((key) => CONSTELLATION_REPOS[key].slug), tick = runConvertAdvisoryTick,
   concurrency = resolveReviewTickSharing().repoConcurrency, ...tickOpts
 } = {}) {
-  const eligible = new Set(constellationRepoKeysWith('review', { resolveProfile }));
-  repos = repos.filter(repo => repoKeyForSlug(repo) === null || eligible.has(repoKeyForSlug(repo)));
+  repos = repos.filter(repo => repoHasCapability(repo, 'review', { resolveProfile, allowUnknown: true }));
   const perRepo = new Array(repos.length);
   const limit = Number.isInteger(concurrency) && concurrency >= 1 && concurrency <= 8
     ? concurrency : resolveReviewTickSharing().repoConcurrency;

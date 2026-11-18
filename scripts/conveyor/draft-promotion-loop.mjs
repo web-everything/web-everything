@@ -21,7 +21,7 @@
  * tick's `already-landed` refusal needs git reads (blob identity against `main`'s history) that a fast step must not
  * pay; a conflicting green draft is rare and the tick still promotes it when it is not already landed.
  */
-import { constellationRepoKeysWith, repoProfile } from '../lib/repo-profile.mjs';
+import { constellationRepoKeysWith, repoHasCapability, repoProfile } from '../lib/repo-profile.mjs';
 import { excusePrMergeGateHolds } from '../lib/merge-gate-hold-class.mjs';
 import { loadPromotionRequiredChecksSetting, promotionRequiredChecks } from '../lib/promotion-required-checks.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
@@ -106,6 +106,7 @@ export function runDraftPromotionStep({
   const absentNotApplicableOnce = once(() => absentNotApplicable !== undefined
     ? absentNotApplicable : loadPromotionRequiredChecksSetting().value);
   for (const repo of repos) {
+    if (!repoHasCapability(repo, 'review', { resolveProfile })) continue;
     let drafts;
     try { drafts = listDrafts({ repoSlug: repo }); } catch (e) { rows.push({ repo, pr: null, action: 'error', why: `draft list: ${oneLine(e)}` }); continue; }
     const requiredOnce = once(() => readRequiredChecks({ repoSlug: repo })?.checks ?? []);
@@ -168,6 +169,7 @@ export function runDraftPromotionStep({
         continue;
       }
 
+      if (!repoHasCapability(repo, 'review', { resolveProfile })) { row('skip', 'review capability unavailable — operator must re-enable it'); continue; }
       try { ready(repo, n); } catch (e) { row('error', `ready write failed: ${oneLine(e)}`); continue; }
       try { clearAwaiting(repo, n); } catch { /* best effort; the review-status sweep corrects it */ }
       row('promoted', decision.why);

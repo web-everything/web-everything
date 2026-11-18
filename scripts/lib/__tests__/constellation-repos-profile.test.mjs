@@ -272,7 +272,7 @@ describe('repoProfileForLanePath', () => {
   });
 });
 
-import { constellationRepoKeysWith } from '../repo-profile.mjs';
+import { constellationRepoKeysWith, repoHasCapability } from '../repo-profile.mjs';
 it.each(['review', 'fix', 'ciHeal', 'build'])('filters %s, excludes missing evidence and never enrolls pending repos', (cap) => {
   const repos = { on: {}, off: {}, missing: {} };
   const resolveProfile = key => key === 'missing' ? null : { capabilities: { [cap]: cap === 'build' ? (key === 'on' ? 'direct' : 'none') : key === 'on' } };
@@ -282,3 +282,23 @@ it.each(['review', 'fix', 'ciHeal', 'build'])('filters %s, excludes missing evid
   expect(constellationRepoKeysWith(cap, { repos, resolveProfile: () => ({ capabilities: {} }) })).toEqual([]);
 });
 it('rejects an unknown capability', () => expect(constellationRepoKeysWith('unknown')).toEqual([]));
+
+it.each(['review', 'fix', 'ciHeal', 'build'])('requires exact capability values for %s', cap => {
+  const values = [true, false, 'false', 'true', 1, 0, '', null, undefined, {}, 'none', 'direct', 'couple', 'other'];
+  const repos = Object.fromEntries(values.map((_, i) => [String(i), {}]));
+  const resolveProfile = key => ({ capabilities: { [cap]: values[Number(key)] } });
+  expect(constellationRepoKeysWith(cap, { repos, resolveProfile }))
+    .toEqual(cap === 'build' ? ['11', '12'] : ['0']);
+});
+
+it('explicit capability checks fail closed for missing, malformed or unreadable registered profiles', () => {
+  for (const resolveProfile of [() => null, () => false, () => ({}), () => ({ capabilities: { review: 'false' } }),
+    () => { throw new Error('unreadable profile'); }]) {
+    expect(repoHasCapability('frontier-ui/frontierui', 'review', { resolveProfile, allowUnknown: true })).toBe(false);
+    expect(repoHasCapability('longshoreai/longshore', 'review', { resolveProfile, allowUnknown: true })).toBe(false);
+  }
+  expect(repoHasCapability('outside/repo', 'review', { allowUnknown: true, resolveProfile: () => false })).toBe(false);
+  expect(repoHasCapability('outside/repo', 'review')).toBe(false);
+  expect(repoHasCapability('outside/repo', 'review', { allowUnknown: true })).toBe(true);
+  expect(repoHasCapability('we', 'unknown', { allowUnknown: true })).toBe(false);
+});

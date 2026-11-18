@@ -1486,3 +1486,14 @@ it('excludes review-disabled repos from the default lander, even when self is di
   expect(resolveRepos({ self: expected[0], resolveProfile })).toEqual(expected);
   expect(resolveRepos({ self: 'frontier-ui/frontierui', resolveProfile })).toEqual(expected);
 });
+
+it('filters explicit lander repos and refuses a disabled single-repo drain', () => {
+  const resolveProfile = key => key === 'frontierui' ? { capabilities: { review: false } } : capabilityProfile(key);
+  expect(resolveRepos({ repos: 'frontierui,longshoreai/longshore,outside/repo', resolveProfile })).toEqual(['outside/repo']);
+  expect(resolveRepos({ repos: 'frontierui', resolveProfile })).toEqual([]);
+  expect(resolveRepos({ repos: 'longshore', self: 'web-everything/web-everything', resolveProfile })).toEqual([]);
+  for (const self of ['frontier-ui/frontierui', 'longshoreai/longshore']) {
+    expect(resolveRepos({ self, singleRepo: true, resolveProfile })).toEqual([]);
+  }
+  expect(resolveRepos({ self: 'outside/repo', singleRepo: true, resolveProfile })).toEqual([null]);
+});

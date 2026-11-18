@@ -407,6 +407,7 @@ describe('planOrphanFixRound — #5608 operator referral rulings', () => {
     const rearm = vi.fn(async () => ({ ok: true }));
     const cardReadable = vi.fn((ref) => ref === card);
     const result = await runOrphanFixRoundPass({ repos: [{ key: 'test', slug: repo }], nowMs: NOW, env: {},
+      resolveProfile: () => ({ capabilities: { fix: true } }),
       listBounced: () => [pr], readComments: async () => pr.comments, isOwned: async () => false,
       cardReadable, rearm, postComment: vi.fn() });
     expect(result.rows[0]).toMatchObject({ decision: 'rearm', result: 're-armed' });
@@ -448,6 +449,26 @@ describe('runOrphanFixRoundPass — IO shell', () => {
     const r = await runOrphanFixRoundPass(refused);
     expect(r.rows[0].result).toBe('not-done: fix-cap: full');
     expect(refused.postComment).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['rearm', [VERDICT, EVIDENCE, BEGIN, RESTACK, END]],
+    ['redispatch', [VERDICT, BEGIN, RESTACK, END]],
+    ['escalate', [VERDICT, BEGIN, END,
+      c('2026-10-10T15:22:00Z', `${ORPHAN_GUARD_MARKER} — re-dispatched a fixer`),
+      c('2026-10-10T15:23:00Z', `${ORPHAN_GUARD_MARKER} — re-dispatched a fixer`)]],
+  ])('rechecks fix capability after awaited reads before %s', async (decision, comments) => {
+    let enabled = true;
+    const s = seams(comments, {
+      resolveProfile: () => ({ capabilities: { fix: enabled } }),
+      readComments: async () => { enabled = false; return comments; },
+    });
+    const r = await runOrphanFixRoundPass(s);
+    expect(r.rows[0]).toMatchObject({ decision, result: expect.stringContaining('fix capability unavailable') });
+    expect(s.rearm).not.toHaveBeenCalled();
+    expect(s.redispatch).not.toHaveBeenCalled();
+    expect(s.escalate).not.toHaveBeenCalled();
+    expect(s.postComment).not.toHaveBeenCalled();
   });
 
   it('WE_ORPHAN_FIX_GUARD=0 reports without acting; an owned PR is never even read', async () => {
@@ -503,4 +524,10 @@ it('does not list orphan fixes for a fix-disabled repo', async () => {
   const listBounced = vi.fn(() => []);
   await runOrphanFixRoundPass({ resolveProfile, listBounced, env: {} });
   expect(listBounced.mock.calls.map(([slug]) => slug)).toEqual(['web-everything/web-everything', 'plateauapp/plateau-app']);
+});
+
+it('filters disabled explicit orphan repos before listing', async () => {
+  const listBounced = vi.fn(() => []);
+  await runOrphanFixRoundPass({ repos: [{ key: 'longshore', slug: 'longshoreai/longshore' }], listBounced, env: {} });
+  expect(listBounced).not.toHaveBeenCalled();
 });

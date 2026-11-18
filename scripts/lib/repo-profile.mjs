@@ -149,8 +149,19 @@ export function constellationRepoKeysWith(capability, { repos = CONSTELLATION_RE
   if (!['review', 'fix', 'ciHeal', 'build'].includes(capability)) return [];
   return Object.keys(repos).filter((key) => {
     const value = resolveProfile(key)?.capabilities?.[capability];
-    return capability === 'build' ? value != null && value !== 'none' : Boolean(value);
+    return capability === 'build' ? value === 'couple' || value === 'direct' : value === true;
   });
+}
+
+/** Explicit targets honor registered profiles too; only legacy callers may allow truly unknown repos. */
+export function repoHasCapability(repo, capability, { resolveProfile = repoProfile, allowUnknown = false } = {}) {
+  if (!['review', 'fix', 'ciHeal', 'build'].includes(capability)) return false;
+  try {
+    const profile = resolveProfile(repoKeyForSlug(repo) ?? repo);
+    if (profile == null) return allowUnknown && repoProfile(repo) === null;
+    const value = profile.capabilities?.[capability];
+    return capability === 'build' ? value === 'couple' || value === 'direct' : value === true;
+  } catch { return false; }
 }
 
 /**

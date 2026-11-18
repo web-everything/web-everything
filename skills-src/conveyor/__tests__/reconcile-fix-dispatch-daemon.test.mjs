@@ -2946,3 +2946,15 @@ it.each([
   await run({ resolveProfile, repos: Object.values(CONSTELLATION_REPOS).map(r => r.slug), tick, createLedger: () => ({}) });
   expect(tick.mock.calls.map(([o]) => o.repo)).toEqual(['web-everything/web-everything', 'plateauapp/plateau-app']);
 });
+
+it.each([
+  [runReconcileFixDispatchAllRepos, 'fix'], [runReconcileCiHealDispatchAllRepos, 'ciHeal'],
+  [runPromoteDraftDispatchAllRepos, 'review'], [runHungCiRecoveryAllRepos, 'ciHeal'],
+  [runMainRedRebaseAllRepos, 'ciHeal'], [runMissingRunRecoveryAllRepos, 'ciHeal'],
+])('refuses explicit pending and disabled targets while preserving unknown targets (%s, %s)', async (run, capability) => {
+  const tick = vi.fn(() => ({}));
+  await run({ repos: ['longshoreai/longshore', 'longshore', 'frontier-ui/frontierui', 'outside/repo'],
+    resolveProfile: key => key === 'frontierui' ? { capabilities: { [capability]: false } } : capabilityProfile(key),
+    tick, createLedger: () => ({}) });
+  expect(tick.mock.calls.map(([o]) => o.repo)).toEqual(['outside/repo']);
+});

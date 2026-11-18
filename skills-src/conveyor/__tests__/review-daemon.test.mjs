@@ -3052,3 +3052,10 @@ it.each([runReviewTickAllRepos, runConvertAdvisoryTickAllRepos])('filters review
   await run({ resolveProfile, repos: Object.values(CONSTELLATION_REPOS).map(r => r.slug), tick, authGateOverride: () => ({ ok: true }) });
   expect(tick.mock.calls.map(([o]) => o.repo)).toEqual(['web-everything/web-everything', 'plateauapp/plateau-app']);
 });
+
+it.each([runReviewTickAllRepos, runConvertAdvisoryTickAllRepos])('refuses explicit pending and disabled review targets but preserves unknown targets', async run => {
+  const tick = vi.fn(() => ({ dispatched: [], failed: [] }));
+  await run({ repos: ['longshoreai/longshore', 'longshore', 'frontier-ui/frontierui', 'outside/repo'],
+    resolveProfile: key => key === 'frontierui' ? { capabilities: { review: false } } : capabilityProfile(key), tick });
+  expect(tick.mock.calls.map(([o]) => o.repo)).toEqual(['outside/repo']);
+});

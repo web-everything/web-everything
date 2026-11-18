@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { constellationRepoKeysWith, repoProfile } from '../../scripts/lib/repo-profile.mjs';
+import { constellationRepoKeysWith, repoHasCapability, repoProfile } from '../../scripts/lib/repo-profile.mjs';
 import { safeAdoptYield } from '../../scripts/lib/daemon-rebuild/adopt-yield.mjs';
 /**
  * @file skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs
@@ -191,10 +191,8 @@ export const FIX_DISPATCH_DAEMON_REPOS = constellationRepoKeysWith('fix').map((k
 const reposWith = (capability, resolveProfile) => constellationRepoKeysWith(capability, { resolveProfile }).map((key) => CONSTELLATION_REPOS[key].slug);
 // Keep lazy budget iterables lazy. Explicit non-constellation targets retain their existing validation path.
 function* eligibleRepos(repos, capability, resolveProfile) {
-  const eligible = new Set(constellationRepoKeysWith(capability, { resolveProfile }));
   for (const repo of repos) {
-    const key = repoKeyForSlug(repo);
-    if (key === null || eligible.has(key)) yield repo;
+    if (repoHasCapability(repo, capability, { resolveProfile, allowUnknown: true })) yield repo;
   }
 }
 
