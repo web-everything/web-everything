@@ -45,6 +45,7 @@
     "test:coverage": "node scripts/readiness/heavy-admission.mjs run -- vitest run --coverage",
     "test:coverage:shard": "node scripts/readiness/heavy-admission.mjs run -- vitest run --coverage --coverage.reporter=json --coverage.thresholds.lines=0 --coverage.thresholds.functions=0 --coverage.thresholds.branches=0 --coverage.thresholds.statements=0",
     "coverage:merge": "node scripts/merge-coverage.mjs",
+    "gen:agent-launch-capability-baseline": "node scripts/gen-agent-launch-capability-baseline.mjs",
     "gen:inventory": "node scripts/gen-inventory.mjs",
     "gen:inventory:staged": "node scripts/gen-inventory.mjs --staged",
     "gen:decision-docket": "node scripts/gen-decision-docket.mjs all",

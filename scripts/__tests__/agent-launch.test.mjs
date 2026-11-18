@@ -1,13 +1,28 @@
 import { describe, expect, it, vi } from 'vitest';
+import * as childProcess from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { AGENT_LAUNCH_MODES, AgentLaunchRefusedError, agentResumeId, launchAgent, launchAgentToCompletion } from '../lib/agent-launch.mjs';
+import { registerAgentLaunchTestPrimitive, AGENT_LAUNCH_MODES, AgentLaunchRefusedError, agentResumeId, launchAgent, launchAgentToCompletion } from '../lib/agent-launch.mjs';
 import { findAgentLaunches } from './fixtures/agent-launch-source.mjs';
 
+
+const testPrimitive = (...args) => registerAgentLaunchTestPrimitive(vi.fn(...args));
 
 const SID = '12345678-1234-4234-8234-123456789abc';
 
 // Audit probes use the real boundary with an injected primitive, never an actual agent process.
 it.each([
+  { name: 'R37.23 unchecked closure with fresh evidence refuses', opaque: 'closure', command: 'claude', argv: ['-p', 'hello'], refused: true, reason: 'unapproved primitive identity' },
+  { name: 'R37.23 registered primitive with fresh evidence positive control', command: 'claude', argv: ['-p', 'hello'] },
+  ...['exec', 'e'].flatMap(alias => ['array', 'string', 'argv-string', 'shell'].flatMap(form => {
+    const invocation = id => form === 'array' ? { command: 'codex', argv: [alias, 'resume', id] }
+      : form === 'string' ? { command: `codex ${alias} resume ${id}`, argv: [] }
+        : form === 'argv-string' ? { command: 'codex', argvText: `${alias} resume ${id}` }
+          : { command: 'sh', argv: ['-c', `codex ${alias} resume ${id}`] };
+    return [
+      { name: `R37.22 ${alias} ${form} unchecked resume refuses`, ...invocation('unchecked-id'), refused: true },
+      { name: `R37.22 ${alias} ${form} matching resume positive control`, ...invocation(SID), resumeId: SID },
+    ];
+  })),
   ...[';', '&', '|', '&&', '||', '\n'].flatMap(operator => [
     { name: `R37.19 shell string validates first segment before path suffix (${JSON.stringify(operator)})`,
       command: `claude --resume unchecked-id${operator} /bin/claude`, argv: [], refused: true },
@@ -42,9 +57,9 @@ it.each([
   { name: 'R37.1 computed primitive assignment', source: "let start; start=cp['spawn']; start('claude',[])", refused: true },
   ...['bind(null)', 'call', 'apply'].map(method => ({ name: `R37.1 reassigned ${method}`,
     source: `let start=console.log; start=spawn.${method}; start('claude',[])`, refused: true })),
-  { name: 'R37.1 reassignment with agent argument refuses', source: "let start=console.log; start=console.info; start('claude',[])", refused: true },
+  { name: 'R37.1 logging an agent name after reassignment is not a launch', source: "let start=console.log; start=console.info; start('claude',[])" },
   { name: 'R37.1 safe reassignment control', source: "let start=console.log; start=console.info; start('git',[])" },
-  { name: 'R37.1 shadow with agent argument refuses', source: "let start=console.log; { let start; start=console.warn; } start('claude',[])", refused: true },
+  { name: 'R37.1 logging an agent name with a shadow binding is not a launch', source: "let start=console.log; { let start; start=console.warn; } start('claude',[])" },
   { name: 'R37.1 lexical shadow control', source: "let start=console.log; { let start; start=console.warn; } start('git',[])" },
   { name: 'R37.2 short global option hides exec', argv: ['-p', 'exec', 'exec', 'resume', 'other-id'], refused: true },
   { name: 'R37.2 matching short global option control', argv: ['-p', 'exec', 'exec', 'resume', SID], resumeId: SID },
@@ -154,7 +169,7 @@ it.each([
 ])('$name', ({ source, command = 'codex', argv = ['exec', '-'], resumeId = null, mode = 'worker-result-probe',
   refused, mutate, mutateView, mutateShell, shell, guard, reason, opaque, noArgs, closureArg, argvText }) => {
   if (argvText !== undefined) argv = argvText;
-  const primitive = vi.fn(), original = Array.isArray(argv) ? [...argv] : argv, findings = source ? findAgentLaunches({ 'scripts/r37-audit.mjs': source }) : [];
+  const primitive = testPrimitive(), original = Array.isArray(argv) ? [...argv] : argv, findings = source ? findAgentLaunches({ 'scripts/r37-audit.mjs': source }) : [];
   let invoke = primitive;
   if (opaque === 'preset' || opaque === 'renamed') invoke = primitive.bind(null, 'claude', ['--resume', 'other-id']);
   if (opaque === 'renamed') Object.defineProperty(invoke, 'name', { value: 'start' });
@@ -187,7 +202,29 @@ it.each([
   }
 });
 
+it.each(['exec', 'e'])('R37.22 standalone helper canonicalises %s', alias => {
+  expect(agentResumeId([alias, 'resume', SID])).toBe(SID);
+  expect(agentResumeId(`${alias} resume ${SID}`)).toBe(SID);
+  expect(agentResumeId([alias, '--', 'resume', SID])).toBeNull();
+});
+
 describe('launch refusal', () => {
+  it.each(['spawn', 'spawnSync', 'exec', 'execFile', 'execSync', 'execFileSync', 'fork'])
+  ('R37.23 real %s identity reaches the guard positive control', name => {
+    const log = vi.fn();
+    expect(() => launchAgent({ mode: 'codex-exec', resumeId: null, log, launchGuard: () => false },
+      childProcess[name], 'codex', ['exec', '-'])).toThrow('launchGuard returned false');
+  });
+  it('R37.23 registration is refused outside Vitest, even with NODE_ENV=test', () => {
+    const env = { ...process.env, NODE_ENV: 'test' };
+    delete env.VITEST;
+    const result = childProcess.spawnSync(process.execPath, ['--input-type=module', '-e',
+      "import {registerAgentLaunchTestPrimitive} from './scripts/lib/agent-launch.mjs'; registerAgentLaunchTestPrimitive(()=>{});"],
+      { cwd: process.cwd(), env, encoding: 'utf8', timeout: 5000, maxBuffer: 4096 });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('registration requires Vitest');
+  });
+
   it.each([
     [undefined, 'descriptor is required'], [null, 'descriptor is required'],
     [{ resumeId: null }, 'mode is required'], [{ mode: 'invented', resumeId: null }, 'unknown mode'],
@@ -198,7 +235,7 @@ describe('launch refusal', () => {
     [{ mode: 'claude-print', resumeId: null, launchGuard: () => Promise.resolve(true) }, 'must be synchronous'],
   ])('refuses incomplete/unknown evidence and guard failures (%j)', (descriptor, reason) => {
     const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    const primitive = vi.fn();
+    const primitive = testPrimitive();
     try {
       expect(() => launchAgent(descriptor, primitive, 'claude', ['-p', 'hi'])).toThrow(AgentLaunchRefusedError);
       expect(stderr).toHaveBeenCalledWith(expect.stringContaining(reason));
@@ -206,41 +243,41 @@ describe('launch refusal', () => {
     } finally { stderr.mockRestore(); }
   });
   it('refuses a missing execution primitive with a logged reason', () => {
-    const log = vi.fn();
+    const log = testPrimitive();
     expect(() => launchAgent({ mode: 'claude-print', resumeId: null, log }, undefined))
       .toThrow('execution primitive is required');
     expect(log).toHaveBeenCalledWith(expect.stringContaining('execution primitive is required'));
   });
   it.each([undefined, null, false, 0, '', 1, 'guard', {}])('refuses a present non-function guard (%j) with a logged reason', launchGuard => {
-    const primitive = vi.fn(), log = vi.fn();
+    const primitive = testPrimitive(), log = testPrimitive();
     expect(() => launchAgent({ mode: 'claude-print', resumeId: null, launchGuard, log }, primitive, 'claude', []))
       .toThrow('launchGuard must be a function');
     expect(log).toHaveBeenCalledWith(expect.stringContaining('launchGuard must be a function'));
     expect(primitive).not.toHaveBeenCalled();
   });
   it.each([null, 0, '', 1, 'true', {}])('refuses a guard returning evidence other than true or undefined (%j)', result => {
-    const primitive = vi.fn(), log = vi.fn();
+    const primitive = testPrimitive(), log = testPrimitive();
     expect(() => launchAgent({ mode: 'claude-print', resumeId: null, launchGuard: () => result, log }, primitive, 'claude', ['-p', 'hi']))
       .toThrow('launchGuard must return true or undefined');
     expect(log).toHaveBeenCalledWith(expect.stringContaining('launchGuard must return true or undefined'));
     expect(primitive).not.toHaveBeenCalled();
   });
   it.each([true, undefined])('allows a guard returning %j', result => {
-    const primitive = vi.fn();
+    const primitive = testPrimitive();
     launchAgent({ mode: 'claude-print', resumeId: null, launchGuard: () => result }, primitive, 'claude', ['-p', 'hi']);
     expect(primitive).toHaveBeenCalledTimes(1);
   });
   it('logs a native-id mismatch to the supplied sink and never executes', () => {
-    const log = vi.fn(), primitive = vi.fn();
+    const log = testPrimitive(), primitive = testPrimitive();
     expect(() => launchAgent({ mode: 'claude-resume', resumeId: 'report-slug', log }, primitive, 'claude', ['--resume', SID, 'hi']))
       .toThrow('resumeId must equal the native resume id');
     expect(log).toHaveBeenCalledWith(expect.stringContaining('native resume id'));
     expect(primitive).not.toHaveBeenCalled();
   });
   it('calls the guard before executing and preserves its thrown cause', () => {
-    const order = [], cause = Error('gate closed'), primitive = vi.fn();
+    const order = [], cause = Error('gate closed'), primitive = testPrimitive();
     expect(launchAgent({ mode: 'claude-print', resumeId: undefined, launchGuard: () => { order.push('guard'); } },
-      (...args) => { order.push('exec'); return args; }, 'claude', ['-p', 'p'])).toEqual(['claude', ['-p', 'p']]);
+      registerAgentLaunchTestPrimitive((...args) => { order.push('exec'); return args; }), 'claude', ['-p', 'p'])).toEqual(['claude', ['-p', 'p']]);
     expect(order).toEqual(['guard', 'exec']);
     try { launchAgent({ mode: 'claude-print', resumeId: null, launchGuard: () => { throw cause; }, log() {} }, primitive, 'claude', ['-p', 'hi']); }
     catch (e) { expect(e).toMatchObject({ cause, code: 'EAGENTLAUNCHREFUSED' }); }
@@ -249,7 +286,7 @@ describe('launch refusal', () => {
   it('falls back to stderr if a log sink throws', () => {
     const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
-      expect(() => launchAgent({ mode: 'unknown', resumeId: null, log() { throw Error('sink down'); } }, vi.fn())).toThrow(AgentLaunchRefusedError);
+      expect(() => launchAgent({ mode: 'unknown', resumeId: null, log() { throw Error('sink down'); } }, testPrimitive())).toThrow(AgentLaunchRefusedError);
       expect(stderr).toHaveBeenCalledWith(expect.stringContaining('unknown mode'));
     } finally { stderr.mockRestore(); }
   });
@@ -262,7 +299,7 @@ describe('transparent execution', () => {
       : mode === 'claude-resume' ? ['--resume', SID, 'literal $() `text`', '\n'] : ['literal $() `text`', '\n'];
     const env = { PATH: 'fixture-bin', TOKEN: 'fixture-token' };
     const options = { cwd: 'fixture-lane', env, stdio: ['ignore', 'pipe', 7], timeout: 12, maxBuffer: 48, detached: true };
-    const result = {}, io = { [kind]: vi.fn(() => result) }, primitive = io[kind];
+    const result = {}, io = { [kind]: testPrimitive(() => result) }, primitive = io[kind];
     expect(launchAgent({ mode, resumeId: mode.endsWith('-resume') ? SID : null }, primitive, mode.startsWith('codex') ? 'codex' : 'claude', argv, options)).toBe(result);
     expect(primitive.mock.calls).toEqual([[mode.startsWith('codex') ? 'codex' : 'claude', argv, options]]);
     expect(primitive.mock.calls[0][1]).toBe(argv);
@@ -272,7 +309,7 @@ describe('transparent execution', () => {
   it('returns no resume id for fresh launches and preserves a single native id unchanged', () => {
     expect(agentResumeId()).toBeNull();
     expect(agentResumeId(['exec', '--json', '-'])).toBeNull();
-    const argv = ['exec', 'resume', SID, '--json', '-'], primitive = vi.fn();
+    const argv = ['exec', 'resume', SID, '--json', '-'], primitive = testPrimitive();
     launchAgent({ mode: 'codex-exec-resume', resumeId: SID }, primitive, 'codex', argv);
     expect(primitive).toHaveBeenCalledTimes(1);
     expect(primitive).toHaveBeenCalledWith('codex', argv);
@@ -280,15 +317,15 @@ describe('transparent execution', () => {
   });
   it('preserves errors and promises from injected primitives', () => {
     const error = Error('original'), promise = Promise.resolve('original');
-    expect(() => launchAgent({ mode: 'claude-print', resumeId: null }, () => { throw error; }, 'claude', ['-p', 'hi'])).toThrow(error);
-    expect(launchAgent({ mode: 'claude-print', resumeId: null }, () => promise, 'claude', ['-p', 'hi'])).toBe(promise);
+    expect(() => launchAgent({ mode: 'claude-print', resumeId: null }, registerAgentLaunchTestPrimitive(() => { throw error; }), 'claude', ['-p', 'hi'])).toThrow(error);
+    expect(launchAgent({ mode: 'claude-print', resumeId: null }, registerAgentLaunchTestPrimitive(() => promise), 'claude', ['-p', 'hi'])).toBe(promise);
   });
   it.each([
     ['--bg', '--resume', SID, 'prompt'], ['--restricted', '--resume', SID, 'prompt'],
     ['exec', 'resume', SID, '--json', 'prompt'], ['exec', '--json', '-s', 'workspace-write', 'resume', SID, '-'],
   ])('uses exactly the existing native resume id (%j)', (...argv) => {
     expect(agentResumeId(argv)).toBe(SID);
-    const primitive = vi.fn();
+    const primitive = testPrimitive();
     launchAgent({ mode: 'codex-exec-resume', resumeId: SID }, primitive, 'codex', argv);
     expect(primitive.mock.calls[0][1]).toBe(argv);
   });
@@ -301,7 +338,7 @@ describe('resume validation across execution forms', () => {
     ['env', ['sh', '-c', `env sh -c 'claude --resume ${SID}'`]],
     [`env sh -c 'claude --resume ${SID}'`],
   ])('validates native resume ids through nested shell wrappers (%j)', (...args) => {
-    const primitive = vi.fn(), log = vi.fn();
+    const primitive = testPrimitive(), log = testPrimitive();
     for (const resumeId of [null, 'other-id']) {
       expect(() => launchAgent({ mode: 'claude-resume', resumeId, log }, primitive, ...args)).toThrow('native resume id');
     }
@@ -316,7 +353,7 @@ describe('resume validation across execution forms', () => {
     ['env', ['sh', '-c']],
     ['env', ['sh', '-c', null]],
   ])('fails closed on unparseable nested shell scripts and names a literal-argv fallback (%j)', (...args) => {
-    const primitive = vi.fn(), log = vi.fn();
+    const primitive = testPrimitive(), log = testPrimitive();
     expect(() => launchAgent({ mode: 'claude-resume', resumeId: null, log }, primitive, ...args))
       .toThrow('use literal argv and a plain resume id');
     expect(log).toHaveBeenCalledWith(expect.stringContaining('cannot parse native resume id'));
@@ -326,7 +363,7 @@ describe('resume validation across execution forms', () => {
   ('refuses nonliteral native resume ids even when the descriptor matches (%j)', resumeId => {
     for (const args of [['claude', ['--resume', resumeId]], ['sh', ['-c', `claude --resume "${resumeId}"`]],
       ['env', ['sh', '-c', `codex exec resume "${resumeId}"`]]]) {
-      const primitive = vi.fn();
+      const primitive = testPrimitive();
       expect(() => launchAgent({ mode: 'claude-resume', resumeId, log() {} }, primitive, ...args)).toThrow('native resume id');
       expect(primitive).not.toHaveBeenCalled();
     }
@@ -359,14 +396,14 @@ describe('resume validation across execution forms', () => {
   ];
   it.each(launches.map(args => [JSON.stringify(args), args]))('refuses mismatched or absent resume evidence for %s', (_label, args) => {
     for (const resumeId of [null, undefined, 'report-slug']) {
-      const primitive = vi.fn(), log = vi.fn();
+      const primitive = testPrimitive(), log = testPrimitive();
       expect(() => launchAgent({ mode: 'claude-resume', resumeId, log }, primitive, ...args)).toThrow('native resume id');
       expect(log).toHaveBeenCalledWith(expect.stringContaining('native resume id'));
       expect(primitive).not.toHaveBeenCalled();
     }
   });
   it.each(launches.map(args => [JSON.stringify(args), args]))('forwards a matching resume launch unchanged for %s', (_label, args) => {
-    const result = {}, primitive = vi.fn(() => result);
+    const result = {}, primitive = testPrimitive(() => result);
     expect(launchAgent({ mode: 'claude-resume', resumeId: SID }, primitive, ...args)).toBe(result);
     expect(primitive).toHaveBeenCalledWith(...args);
     if (args.length > 1) expect(primitive.mock.calls[0][1]).toBe(args[1]);
@@ -378,7 +415,7 @@ describe('resume validation across execution forms', () => {
     [`claude --resume ${SID}; codex exec resume other-id`],
     ['sh', ['-c', `claude -r ${SID} | codex exec resume other-id`]],
   ])('checks every resume id rather than just the first (%j)', (...args) => {
-    const primitive = vi.fn(), log = vi.fn();
+    const primitive = testPrimitive(), log = testPrimitive();
     expect(() => launchAgent({ mode: 'claude-resume', resumeId: SID, log }, primitive, ...args)).toThrow('native resume id');
     expect(log).toHaveBeenCalledWith(expect.stringContaining('native resume id'));
     expect(primitive).not.toHaveBeenCalled();
@@ -407,7 +444,7 @@ describe('resume validation across execution forms', () => {
     [`claude -p -- -r ${SID} ; codex exec -- resume ${SID}`],
   ];
   it.each(afterDelimiter.map(args => [JSON.stringify(args), args]))('treats text after -- as prompt, not a resume flag, for %s', (_label, args) => {
-    const result = {}, primitive = vi.fn(() => result);
+    const result = {}, primitive = testPrimitive(() => result);
     expect(launchAgent({ mode: 'claude-print', resumeId: null }, primitive, ...args)).toBe(result);
     expect(primitive).toHaveBeenCalledTimes(1);
   });
@@ -422,12 +459,12 @@ describe('resume validation across execution forms', () => {
     ['claude', ['--permission-mode', '--', '--resume', 'other-id']],
     ['npx -- claude --resume other-id'],
   ])('still refuses a real resume hidden behind a non-delimiter -- (%j)', (...args) => {
-    const primitive = vi.fn(), log = vi.fn();
+    const primitive = testPrimitive(), log = testPrimitive();
     expect(() => launchAgent({ mode: 'claude-print', resumeId: null, log }, primitive, ...args)).toThrow('native resume id');
     expect(primitive).not.toHaveBeenCalled();
   });
   it('a wrapper -- before the binary does not count, but the binary\'s own -- still does', () => {
-    const primitive = vi.fn();
+    const primitive = testPrimitive();
     launchAgent({ mode: 'claude-print', resumeId: null }, primitive, 'npx', ['--yes', '--', 'claude', '-p', '--', '--resume']);
     expect(primitive).toHaveBeenCalledTimes(1);
   });
@@ -438,14 +475,14 @@ describe('resume validation across execution forms', () => {
     expect(agentResumeId(['--', '--resume', SID])).toBeNull();
   });
   it('still checks resume flags that precede the delimiter, and a resume flag whose value would be the delimiter', () => {
-    const primitive = vi.fn(), log = vi.fn();
+    const primitive = testPrimitive(), log = testPrimitive();
     expect(() => launchAgent({ mode: 'claude-resume', resumeId: SID, log }, primitive, 'claude', ['--resume', SID, '--', '-r', 'other'])).not.toThrow();
     expect(() => launchAgent({ mode: 'claude-resume', resumeId: SID, log }, primitive, 'claude', ['-r', 'other', '--', '--resume', SID])).toThrow('native resume id');
     expect(() => launchAgent({ mode: 'claude-resume', resumeId: null, log }, primitive, 'claude', ['--resume', '--', 'prompt'])).toThrow('native resume id');
   });
   it.each([['--resume'], ['-r'], ['--session-id'], ['--session-id='], ['--profile', 'fixture', 'exec', 'resume']])
   ('refuses missing native resume ids before execution (%j)', (...argv) => {
-    const primitive = vi.fn(), log = vi.fn();
+    const primitive = testPrimitive(), log = testPrimitive();
     expect(() => launchAgent({ mode: 'claude-resume', resumeId: null, log }, primitive, 'claude', argv)).toThrow('native resume id');
     expect(primitive).not.toHaveBeenCalled();
   });
@@ -455,8 +492,8 @@ describe('completion wrapper', () => {
   it('records argv, env and cwd through injected spawn and collects both output streams', async () => {
     const argv = ['--resume', SID, '-p', 'literal $() `text`'];
     const env = { PATH: 'fixture-bin' }, child = new EventEmitter();
-    child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.kill = vi.fn();
-    const spawnFn = vi.fn(() => {
+    child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.kill = testPrimitive();
+    const spawnFn = testPrimitive(() => {
       queueMicrotask(() => {
         child.stdout.emit('data', Buffer.from('answer'));
         child.stderr.emit('data', Buffer.from('diagnostic'));
@@ -475,7 +512,7 @@ describe('completion wrapper', () => {
     expect(child.kill).not.toHaveBeenCalled();
   });
   it('refuses a denied guard with its logged reason before injected spawn', async () => {
-    const spawnFn = vi.fn(), log = vi.fn();
+    const spawnFn = testPrimitive(), log = testPrimitive();
     await expect(launchAgentToCompletion({ mode: 'claude-dispatch-to-completion', resumeId: null,
       launchGuard: () => false, log }, 'claude', ['-p', 'hello'], {}, { spawnFn }))
       .rejects.toThrow('launchGuard returned false');
@@ -485,7 +522,7 @@ describe('completion wrapper', () => {
   it('preserves an injected spawn failure', async () => {
     const error = Error('spawn failed');
     await expect(launchAgentToCompletion({ mode: 'codex-exec', resumeId: null }, 'codex', ['exec', '-'], {},
-      { spawnFn: () => { throw error; } })).rejects.toBe(error);
+      { spawnFn: registerAgentLaunchTestPrimitive(() => { throw error; }) })).rejects.toBe(error);
   });
 });
 
@@ -507,13 +544,13 @@ describe('codex resume id is the positional session id, never an option', () => 
     ['exec', 'resume', '--ignore-rules', SID],
   ];
   it.each(ignoreRulesShapes.map(argv => [JSON.stringify(argv), argv]))('refuses a mismatched id with boolean --ignore-rules in %s', (_label, argv) => {
-    const primitive = vi.fn(), log = vi.fn();
+    const primitive = testPrimitive(), log = testPrimitive();
     expect(() => launchAgent({ mode: 'codex-exec-resume', resumeId: 'other-id', log }, primitive, 'codex', argv))
       .toThrow('native resume id');
     expect(primitive).not.toHaveBeenCalled();
   });
   it.each(ignoreRulesShapes.map(argv => [JSON.stringify(argv), argv]))('launches a matching id with boolean --ignore-rules in %s', (_label, argv) => {
-    const result = {}, primitive = vi.fn(() => result);
+    const result = {}, primitive = testPrimitive(() => result);
     expect(launchAgent({ mode: 'codex-exec-resume', resumeId: SID }, primitive, 'codex', argv)).toBe(result);
     expect(primitive).toHaveBeenCalledTimes(1);
     expect(primitive).toHaveBeenCalledWith('codex', argv);
@@ -522,7 +559,7 @@ describe('codex resume id is the positional session id, never an option', () => 
     [], ['exec'], ['exec', '--model', 'resume', SID], ['exec', '--', 'resume', SID],
     ['exec', 'resume', '--model'], ['exec', 'resume', '--ignore-rules'],
   ])('refuses unparseable codex-exec-resume argv (%j) before executing', (...argv) => {
-    const primitive = vi.fn(), log = vi.fn();
+    const primitive = testPrimitive(), log = testPrimitive();
     expect(() => launchAgent({ mode: 'codex-exec-resume', resumeId: SID, log }, primitive, 'codex', argv))
       .toThrow('native resume id');
     expect(log).toHaveBeenCalledWith(expect.stringContaining('native resume id'));
@@ -538,19 +575,19 @@ describe('codex resume id is the positional session id, never an option', () => 
   ];
   it.each(shapes.map(argv => [JSON.stringify(argv), argv]))('extracts the id from %s', (_label, argv) => {
     expect(agentResumeId(argv)).toBe(SID);
-    const primitive = vi.fn();
+    const primitive = testPrimitive();
     launchAgent({ mode: 'codex-exec-resume', resumeId: SID }, primitive, 'codex', argv);
     expect(primitive).toHaveBeenCalledTimes(1);
   });
   it.each([['--json'], ['-'], ['report-slug'], [null]])('refuses resumeId %j that is not the positional id', resumeId => {
-    const primitive = vi.fn();
+    const primitive = testPrimitive();
     expect(() => launchAgent({ mode: 'codex-exec-resume', resumeId, log() {} }, primitive, 'codex',
       ['exec', 'resume', '--json', SID, '-'])).toThrow('native resume id');
     expect(primitive).not.toHaveBeenCalled();
   });
   it('reads an option-only resume (no positional) as an empty id, which is refused', () => {
     expect(agentResumeId(['exec', 'resume', '--last'])).toBe('');
-    const primitive = vi.fn();
+    const primitive = testPrimitive();
     expect(() => launchAgent({ mode: 'codex-exec-resume', resumeId: null, log() {} }, primitive, 'codex',
       ['exec', 'resume', '--last'])).toThrow('native resume id');
     expect(primitive).not.toHaveBeenCalled();
@@ -558,10 +595,10 @@ describe('codex resume id is the positional session id, never an option', () => 
   it('applies the same extraction to string and shell -c forms', () => {
     expect(agentResumeId(`codex exec resume --json ${SID} -`)).toBe(SID);
     expect(agentResumeId(`exec resume --json '${SID}' -`)).toBe(SID);
-    const primitive = vi.fn();
+    const primitive = testPrimitive();
     launchAgent({ mode: 'codex-exec-resume', resumeId: SID }, primitive, 'sh', ['-c', `codex exec resume --json ${SID} -`]);
     expect(primitive).toHaveBeenCalledTimes(1);
-    expect(() => launchAgent({ mode: 'codex-exec-resume', resumeId: '--json', log() {} }, vi.fn(), 'sh',
+    expect(() => launchAgent({ mode: 'codex-exec-resume', resumeId: '--json', log() {} }, testPrimitive(), 'sh',
       ['-c', `codex exec resume --json ${SID} -`])).toThrow('native resume id');
   });
 });
@@ -579,14 +616,14 @@ describe('an empty descriptor resumeId never satisfies a missing native id', () 
   ];
   it.each(missing.map(c => [JSON.stringify(c), c]))('refuses %s with resumeId empty, null, undefined or whitespace', (_label, [command, argv]) => {
     for (const resumeId of ['', ' ', null, undefined]) {
-      const primitive = vi.fn(), log = vi.fn();
+      const primitive = testPrimitive(), log = testPrimitive();
       expect(() => launchAgent({ mode: 'claude-resume', resumeId, log }, primitive, command, argv)).toThrow('native resume id');
       expect(primitive).not.toHaveBeenCalled();
       expect(log).toHaveBeenCalledWith(expect.stringContaining('native resume id'));
     }
   });
   it('refuses a fresh launch with a supplied empty id; accepts a real resume id or an absent fresh id', () => {
-    const primitive = vi.fn();
+    const primitive = testPrimitive();
     expect(() => launchAgent({ mode: 'claude-print', resumeId: '', log() {} }, primitive, 'claude', ['-p', 'hello']))
       .toThrow('native resume id');
     expect(primitive).not.toHaveBeenCalled();
@@ -598,10 +635,10 @@ describe('an empty descriptor resumeId never satisfies a missing native id', () 
 
 describe('an async launchGuard is refused without leaking its rejection', () => {
   it('consumes a rejected guard promise so the caller can handle the refusal', async () => {
-    const unhandled = vi.fn();
+    const unhandled = testPrimitive();
     process.on('unhandledRejection', unhandled);
     try {
-      const primitive = vi.fn(), log = vi.fn();
+      const primitive = testPrimitive(), log = testPrimitive();
       expect(() => launchAgent({ mode: 'claude-print', resumeId: null, log,
         launchGuard: async () => { throw new Error('admission unavailable'); } }, primitive, 'claude', ['-p', 'hi']))
         .toThrow('launchGuard must be synchronous');
@@ -611,7 +648,7 @@ describe('an async launchGuard is refused without leaking its rejection', () => 
     } finally { process.off('unhandledRejection', unhandled); }
   });
   it('refuses a thenable whose then throws or whose then getter throws', () => {
-    const primitive = vi.fn();
+    const primitive = testPrimitive();
     const throwing = { then() { throw new Error('boom'); } };
     expect(() => launchAgent({ mode: 'claude-print', resumeId: null, log() {}, launchGuard: () => throwing }, primitive, 'claude', ['-p', 'hi']))
       .toThrow('launchGuard must be synchronous');

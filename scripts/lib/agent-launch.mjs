@@ -3,8 +3,27 @@
  * Normalise command evidence once; only validated argv may reach the injected primitive.
  * Inject the existing primitive so synchronous returns, promises and child handles stay intact.
  */
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync, exec, execFile, execSync, execFileSync, fork } from 'node:child_process';
 import { spawnToCompletion } from './spawn-to-completion.mjs';
+
+// Identity, never name/source text: closures, bound functions and proxies can discard argv.
+const approvedPrimitives = new Set([spawn, spawnSync, exec, execFile, execSync, execFileSync, fork]);
+const testPrimitives = new WeakSet();
+
+/** Explicit hermetic test seam; never enable registration in an ordinary Node process. */
+export function registerAgentLaunchTestPrimitive(primitive) {
+  if (process.env.VITEST !== 'true' || typeof primitive !== 'function') {
+    throw new TypeError('agent-launch test primitive registration requires Vitest and a function');
+  }
+  testPrimitives.add(primitive);
+  return primitive;
+}
+
+// Codex CLI help aliases: exec (e), review, resume, fork. Canonicalise before grammar checks.
+const CODEX_SUBCOMMANDS = new Map([
+  ['exec', 'exec'], ['e', 'exec'], ['review', 'review'], ['resume', 'resume'], ['fork', 'fork'],
+]);
+const codexSubcommand = word => CODEX_SUBCOMMANDS.get(word);
 
 /** Closed inventory of existing behaviours. Adding a launch requires choosing a mode explicitly. */
 export const AGENT_LAUNCH_MODES = Object.freeze([
@@ -38,7 +57,7 @@ function refuse(reason, descriptor, log, cause) {
 export function agentResumeId(argv = []) {
   // This helper also accepts argv without a binary: Codex's subcommands identify its grammar.
   const commands = typeof argv === 'string' ? normaliseScript(argv, 0, true)
-    : [normaliseOptions(argv, argv.some(word => ['exec', 'resume', 'fork'].includes(word)) ? 'codex' : 'claude')];
+    : [normaliseOptions(argv, argv.some(word => CODEX_SUBCOMMANDS.has(word)) ? 'codex' : 'claude')];
   return commands.flatMap(command => command.resumeIds)[0] ?? null;
 }
 
@@ -97,8 +116,9 @@ function normaliseOptions(argv, executable) {
   }
   const positionals = entries.filter(entry => entry.kind === 'positional');
   // Global option VALUES cannot hide a subcommand. Interactive resume/fork have no `exec` prefix.
-  const interactiveResume = executable === 'codex' && ['resume', 'fork'].includes(positionals[0]?.word);
-  const execResume = positionals[0]?.word === 'exec' && positionals[1]?.word === 'resume';
+  const interactiveResume = executable === 'codex' && ['resume', 'fork'].includes(codexSubcommand(positionals[0]?.word));
+  const execResume = executable === 'codex' && codexSubcommand(positionals[0]?.word) === 'exec'
+    && codexSubcommand(positionals[1]?.word) === 'resume';
   if (interactiveResume || execResume) {
     const subcommand = positionals[interactiveResume ? 0 : 1];
     const tail = entries.slice(entries.indexOf(subcommand) + 1);
@@ -178,8 +198,8 @@ function normaliseScript(text, depth, optionsOnly = false) {
     if (i !== words.length && words[i] !== separator) continue;
     const segment = words.slice(start, i); start = i + 1;
     if (!segment.length) continue;
-    if (optionsOnly && (isOption(segment[0]) || ['exec', 'resume', 'fork'].includes(segment[0]))) {
-      commands.push(normaliseOptions(segment, segment.some(word => ['exec', 'resume', 'fork'].includes(word)) ? 'codex' : 'claude'));
+    if (optionsOnly && (isOption(segment[0]) || CODEX_SUBCOMMANDS.has(segment[0]))) {
+      commands.push(normaliseOptions(segment, segment.some(word => CODEX_SUBCOMMANDS.has(word)) ? 'codex' : 'claude'));
     }
     else commands.push(...normaliseCommand(segment, depth, true));
   }
@@ -226,12 +246,7 @@ function normaliseCommand(words, depth = 0, shell = false) {
 }
 
 /** One entry point for array argv, command strings, and nested literal shell/env wrappers. */
-function normaliseInvocation(args, primitive) {
-  // JS exposes neither [[BoundArguments]] nor a proxy's target/receiver. Even apparently matching
-  // call-time argv cannot prove what an opaque callable will execute. Require an unbound primitive.
-  if (typeof primitive === 'function' && Function.prototype.toString.call(primitive).includes('[native code]')) {
-    throw new SyntaxError('opaque primitive; pass an unbound primitive and explicit invocation arguments');
-  }
+function normaliseInvocation(args) {
   if (!args.length) throw new SyntaxError('missing invocation evidence; use explicit literal argv');
   const [command, argv] = args;
   // A shell joining array argv destroys word boundaries. Require an explicit, literal -c script instead.
@@ -268,8 +283,11 @@ export function launchAgent(descriptor, primitive, ...args) {
   if (!modes.has(descriptor.mode)) refuse(`unknown mode ${String(descriptor.mode)}`, descriptor, log);
   if (!Object.hasOwn(descriptor, 'resumeId')) refuse('resumeId key is required', descriptor, log);
   if (typeof primitive !== 'function') refuse('execution primitive is required', descriptor, log);
+  if (!approvedPrimitives.has(primitive) && !testPrimitives.has(primitive)) {
+    refuse('unapproved primitive identity; use an approved unbound primitive and literal argv', descriptor, log);
+  }
   let normalised;
-  try { normalised = normaliseInvocation(args, primitive); }
+  try { normalised = normaliseInvocation(args); }
   catch (cause) {
     refuse('cannot parse native resume id; use literal argv and a plain resume id with an unbound primitive'
       + (cause.message.startsWith('implicit continuation') ? `; ${cause.message}` : ''), descriptor, log, cause);

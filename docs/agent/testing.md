@@ -4570,119 +4570,47 @@ The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true
 
 ## Agent launch normalisation (R37)
 
-R37.19 splits string commands into words and validates every shell segment before matching an
-executable; a trailing `/bin/claude` must not hide an earlier unchecked resume. Pair operator,
-shell `-c`, expansion-refusal and mismatched-id rows with matching native-id controls.
-R37.20 inventories execution builtins (including inspector/promises, repl, v8 and wasi) in both
-bare and `node:` forms, through imports, re-exports and loaders. R37.21 treats unknown computed
-keys, constructor/prototype access and Function-family references as capabilities in both direct
-and transitive binding scans. Only literal non-capability string/number keys remain clear;
-even a variable initialized to a safe string requires review. Non-literal module specifiers
-require review too. Use literal argv at runtime or an approved boundary after complete source
-review for structural refusals; never expand migration membership from scanner output alone.
-The R37.21 migration explicitly pins the inspected existing `model-settings`, `node-heap-cap`
-data readers and `smoke-classify/index` re-exports, with their whole-module fingerprints.
+Runtime `launchAgent` checks carry the security weight. The static gate is a **tripwire**,
+not proof that arbitrary JavaScript cannot launch a process. Its two inventories have separate jobs:
 
-`agent-launch.test.mjs` contains one R37 audit table covering reassigned primitive bindings,
-Codex global short-option values, unresolved shell executable words, and guard mutation, with
-positive controls. Exercise the real `launchAgent` boundary with an injected primitive and assert
-zero primitive calls on refusal; use `findAgentLaunches` for the structural rows. Resolve literal
-wrappers before splitting options and their values. Resume validation consumes only that canonical
-form. Unsupported shell syntax/expansions and excessive wrapper nesting refuse with the direct
-literal-argv fallback. Guards receive a frozen view; guarded launches forward validated argv
-snapshots and refuse mutation of the caller's argv or shell execution option.
+- `scripts/lib/agent-launch-approved.json` is the reviewed list of agent CLI launchers and local
+  launcher helpers used for agents. The structural test pins whole-function syntax/token
+  fingerprints, plus each launcher's whole-module fingerprint to cover captured constants,
+  defaults, imports and other surrounding definitions. Shell launchers pin the complete script.
+  Updating a fingerprint snapshot cannot approve a new launcher path.
+- `scripts/lib/agent-launch-capability-baseline.json` snapshots **EXISTING** source files importing
+  child_process-class capability (Node execution builtins and process execution packages).
+  It is **NOT approval of agent launching**. A new capability importer fails unless reviewed
+  into the baseline (if it does not launch agents) or the launcher list (if it does).
+  Baseline membership never exempts a file from agent-launch detection or fingerprints.
 
-The continued R37 runtime rows require native resume evidence whenever a descriptor supplies an id or
-selects a resume mode. Bound/native/proxy callables expose no inspectable bound arguments or
-receiver, so refuse them with the explicit unbound-primitive/literal-argv fallback.
+Regenerate the capability snapshot with `npm run gen:agent-launch-capability-baseline`, then review
+its diff. This command never edits the reviewed launcher list or its fingerprint snapshot.
+Both scans cover `.mjs`, `.cjs`, `.js`, `.mts`, `.cts`, `.ts` sources under `scripts/`, `skills-src/`
+and `.claude/skills/`. Agent launch detection also scans `.sh` and `.bash` command positions.
+Tests/spec files, test and fixture directories, `node_modules` and `.git` enter neither inventory.
+Symlinked source is inspected; unreadable paths, cycles and parse failures stop the scan. Repair
+source or request scanner support before rerunning; an incomplete scan never clears the gate.
 
-The structural gate uses a conservative binding dependency graph over the complete supplied local
-import tree. Every exported function or container that references a process-execution capability,
-or transitively references another such binding, carries that capability to its consumers.
-Definitions, assignments, returned closures, renamed/default/namespace imports, computed namespace
-members, local re-exports and cycles participate. Pure exports remain independent of unrelated
-execution imports in the same module. Namespace containers conservatively carry their exports.
-Unknown packages, missing local modules/exports, non-literal loaders, execution builtins,
-process execution/loader/evaluator/Worker references and capability containers require an approved file,
-regardless of arguments or whether a call occurs. Exact syntactic process data reads (`env`, `pid`,
-`argv`, etc.) and `module.exports` expose no execution entry point; taking either container or
-using another/computed member still requires review. Unused named launcher imports and escaped
-references require review too. There is no importer exemption for inspected local launchers.
-The exception is the resolved `launchAgent` definition in `scripts/lib/agent-launch.mjs`, including
-renamed imports and re-exports; a same-named function elsewhere and wrappers of that definition
-do not inherit the exception. Additionally every call/constructor argument containing a de-quoted
-Claude/Codex word in a string, nested array/object literal or template requires that boundary,
-even when the callee appears benign. Approved callers still require their exact whole-module
-fingerprint. Audit shorthand imports are added only when the snippet references them.
+The structural tests pair command-position detections with ordinary argv, logging, documentation
+and baseline-only controls. They check helper imports/aliases/re-exports, shell launches, typed
+sources, new-file capability refusal and baseline launch refusal. Dynamic execution beyond this
+static tripwire's inspection still requires runtime validation and source review.
 
-Every approved module has one `module-sha256-v2` fingerprint over its complete syntax/token tree,
-including all launching functions, callers, constructors, aliases and surrounding definitions.
-This deliberately includes unrelated edits and modules currently without launches. The hash ignores whitespace/comments while retaining exact literal/token contents and
-automatic-semicolon-insertion structure. The migration snapshot intentionally changes from per-call counts/argument hashes to
-one whole-module fingerprint per approved file (including the formerly exempt central launcher).
-Membership is pinned separately: adding an unapproved source to the snapshot cannot approve it.
-Parse failures remain uninventoryable, and unreadable source trees throw. The operator fallback is
-to use an existing approved boundary, or request human review of the complete module and its
-membership/fingerprint changes; unknown evidence never clears the gate.
+R37.22 canonicalises Codex's `exec` / `e` alias before detecting `resume`, including literal argv,
+argument strings, shell scripts and the standalone id extractor. The runtime audit table pairs
+unchecked `e resume` refusals with matching-id controls.
+R37.23 approves execution functions by imported identity: only Node's `spawn`, `spawnSync`,
+`exec`, `execFile`, `execSync`, `execFileSync` and `fork`. Closures, bound functions and proxies
+cannot ignore the validated arguments: they are refused even with plausible fresh-launch argv.
+The fallback is an approved primitive with explicit literal argv. Tests opt in using
+`registerAgentLaunchTestPrimitive(fn)` under Vitest; registration in a regular Node process fails,
+including with `NODE_ENV=test`. The completion wrapper checks injected spawn identity at the OS
+boundary. Helpers with their own injection arguments are not approved primitives.
 
-The R37 structural table retains historical bypass inputs with the new capability expectations.
-The four continued probes cover argv element mutation, aliased shell-option mutation with an
-escaped executable, dynamic environment arguments to an unknown package, and Worker eval code
-containing a child-process launch. Each has an unapproved-file refusal, an approved whole-module
-edit refusal, and an unchanged approved-file positive control. Additional rows pin capability
-references without invocation, package/subpath/loader forms, dependency cycles, missing source,
-malformed approved source, whole-module edits, literal preservation and formatting-only controls.
-
-R37.9–11 runtime rows refuse fresh as well as resumed launches without a non-empty inspectable
-command. Production migration checks and runtime checks remain separate guarantees.
-
-R37.12 runtime normalisation checks conservative shell-text evidence: inspect raw and de-quoted agent words; refuse mid-word quote concatenation, escapes,
-expansions and globbing even when the raw text hides the executable. Whole-word literal quotes
-remain supported; direct argv treats shell characters as data. The fallback is direct literal argv.
-R37.13 includes Codex's top-level `resume` and `fork`, after global options and before session
-options. These require `codex-exec-resume` mode and the matching literal `resumeId`. Pickers,
-`--last` (even alongside an id), and `--all` without an id refuse because session selection cannot
-be verified; supply an explicit session id instead. Keep matching-id controls for both subcommands,
-all invocation forms, and option-value/delimited-prompt controls in the R37 table.
-
-R37.14 refuses Claude's implicit continuation (`--continue`, `-c`, `--fork-session`) in all
-current modes: the selected session cannot be proven. The diagnostic directs callers to explicit
-`--resume <native-id>`; option values and delimited prompt data remain literal controls.
-R37.15–16 historical structural controls with execution imports, literal unrelated commands or
-`shell:false` now refuse outside the approved boundary. Those argument-based exemptions were
-removed intentionally: a capability reference is sufficient, independent of argument semantics.
-
-
-## Caller-side launcher export audit (R37.17–18)
-
-The R37.17 structural table row refuses
-`spawnToCompletion('claude', ['--resume','unchecked-id'])`. The companion regression imports the
-real existing helper from a new unapproved module and proves that its caller is flagged even
-though every approved fingerprint is unchanged. The approved existing completion-wrapper control
-uses the real `scripts/lib/agent-launch.mjs` source and passes its unchanged inventory.
-R37.18 covers unknown and benign callees, nested literal arguments, de-quoted shell words,
-interpolated templates and a counterfeit `launchAgent`. Transitive-wrapper tests cover references
-without invocation, aliases, namespace access, defaults, local re-exports, require/dynamic imports,
-assignments and export containers. Missing exports and malformed source fail closed; use
-`launchAgent` or request human review of complete source and approval changes when evidence is
-incomplete. Existing agent-word positive controls now explicitly refuse; unrelated literal
-controls remain clear. No graph traversal cutoff silently treats incomplete evidence as safe.
-
-Approval additions for human review are limited to these unchanged, pre-PR sources (the original
-1,857-member prefix remains independently hash-pinned):
-
-| Approved existing file | Existing reference newly covered |
-| --- | --- |
-| `scripts/conveyor/health-smells-notify-list.mjs` | `new Set([... 'claude-auth-expired', ...])`: constructor argument contains an agent word. |
-| `scripts/conveyor/maintenance-marker.mjs` | `maintenanceMarkerPath` calls `join(homedir(), '.claude', 'conveyor', 'maintenance.json')`. |
-| `scripts/lib/daemon-rebuild/index.mjs` | Existing public re-exports of launcher wrappers, including `rebuildClone`, `materializeCandidate`, `removeCandidate`, `dryRunRebuild`, `previewOverlayConflict` and `resolveOverlayConflict`. |
-| `scripts/operations/reopen-items-io.mjs` | Re-exports `createReopenItemsReader` and `createReopenItemsSinks` from the existing close-items IO shell, whose defaults reach `execFileSync`. |
-| `scripts/lib/raised-by.mjs` | Existing named re-exports from `raised-by.cjs`. The graph conservatively classifies this shared CommonJS export group as capability-bearing in the full production tree; this is an approval for that existing facade, not a claim that its filesystem/formatting functions launch agents. |
-
-No new production call sites are approved by this change. Fingerprints for the analyzer itself
-and these explicitly listed existing files are refreshed in the inventory snapshot.
-
+Runtime validation checks every shell segment and requires matching literal native resume IDs.
+Guards are synchronous, receive frozen views, and cannot mutate the validated arguments.
+Claude implicit continuation is refused; Codex resume/fork needs explicit session evidence.
 The focused boundary run comprises `scripts/__tests__/agent-launch.test.mjs`,
-`scripts/__tests__/agent-launch-structure.test.mjs`,
-`scripts/lib/__tests__/spawn-to-completion.test.mjs` and
-`scripts/__tests__/codex-direct-task-resume.test.mjs`, always through heavy admission.
+`scripts/__tests__/agent-launch-structure.test.mjs`, `scripts/__tests__/codex-direct-task.test.mjs`
+and `scripts/__tests__/codex-direct-task-resume.test.mjs`, always through heavy admission.
