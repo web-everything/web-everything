@@ -869,8 +869,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     if (isUnderTest() || isUnderTest(env)) return;
     let error;
     const result = settleRedTeamSkip({ repo, pr, head, redTeam: { status: 'skipped', reason: why },
-      io: { env, readLiveRedTeam: createLiveRedTeamReader({ provider, readComments, env,
-        gh: (args, options) => runGhSync(args, { ...options, env }) }), publishNeedsYou: publishAttention, log: message => { error = safeErrorText(message); } } });
+      io: { env, readLiveRedTeam: createLiveRedTeamReader({ env }), publishNeedsYou: publishAttention, log: message => { error = safeErrorText(message); } } });
     if (error) throw Error(error);
     return result;
   },
@@ -1110,7 +1109,8 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
             const result = settle({ redTeam: { status: 'not-owed' }, repo, pr: row.prNumber,
               head: row.head, readHead: row.head, accepted: true, storedReviewPolicyClear: true, comments: rawPr.comments, reason: row.why,
               io: { env, log: note,
-                readLiveRedTeam: createLiveRedTeamReader({ provider, readComments, env, readCheckFact }),
+                readLiveRedTeam: createLiveRedTeamReader({ env, ...(isUnderTest() || isUnderTest(env)
+                  ? { provider, readComments, readCheckFact } : {}) }),
                 // settleRedTeamSkip reaches this only once it decided policy-clear and the head shows no result.
                 postComment: ({ repo, pr, body }) => {
                   // settleRedTeamSkip bounds its reason to 80 chars for the needs-you feed, which would cut a yield's

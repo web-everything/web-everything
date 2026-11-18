@@ -11,6 +11,9 @@ import { advisoryLabelOutcome } from './review-advisory-outcome.mjs';
 import { redTeamOwedFor } from './review-red-team-policy.mjs';
 import { isPublishableRedTeamResult, redTeamForHead, redTeamMarker } from './red-team-gate.mjs';
 import { readRedTeamCheckFact, readRedTeamPublicationHoldFact, resolveWeAppId } from './red-team-check-run.mjs';
+import { runGhSync } from './gh-throttle.mjs';
+import { createGhProvider } from './review-label-provider.mjs';
+import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { resumeRedTeamCarry } from './red-team-carry-machine.mjs';
 
 /** Thrown values can have unreadable messages or unstringifiable JSON shapes. */
@@ -83,13 +86,23 @@ function storedReviewOwesNoRedTeam(io, { repo, pr, head, redTeam }) {
 }
 
 /** Read at the notification boundary, never reuse the job's earlier PR snapshot. */
-export function createLiveRedTeamReader({ provider, readComments, env = process.env, gh,
-  readCheckFact = args => {
-    const app = resolveWeAppId({ env });
-    return app.ok ? readRedTeamCheckFact({ ...args, appId: app.appId, gh }) : app;
-  },
-  readPublicationHoldFact = args => readRedTeamPublicationHoldFact({ ...args, gh }),
+export function createLiveRedTeamReader({ provider, readComments, env = process.env, gh: run = runGhSync,
+  readCheckFact, readPublicationHoldFact,
 }) {
+  // gh-throttle reads throttle.env; the child env alone does not disable the tick memo.
+  const liveEnv = { ...env };
+  delete liveEnv.WE_GH_READ_MEMO_DIR;
+  delete liveEnv.WE_PR_SNAPSHOT_STALE_OK_MS;
+  const gh = (args, options = {}) => run(args, { ...options, env: liveEnv,
+    throttle: { ...options.throttle, env: liveEnv } });
+  provider ??= createGhProvider({ exec: (args, options) => gh(args, { encoding: 'utf8', timeout: 60_000, ...options }) });
+  readComments ??= ({ repo, pr }) => readCompletePrComments(Number(pr), { repo,
+    exec: (_file, args, options) => gh(args, options) });
+  if (readCheckFact === undefined) readCheckFact = args => {
+    const app = resolveWeAppId({ env: liveEnv });
+    return app.ok ? readRedTeamCheckFact({ ...args, appId: app.appId, gh }) : app;
+  };
+  if (readPublicationHoldFact === undefined) readPublicationHoldFact = args => readRedTeamPublicationHoldFact({ ...args, gh });
   return ({ repo, pr, head }) => {
     const live = provider.readPrState(repo, pr);
     if (!isRealHead(live?.headRefOid)) throw Error('live PR head unreadable');

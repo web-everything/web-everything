@@ -406,6 +406,39 @@ describe('stored-review not-owed rule (R730)', () => {
 
 
 describe('live red-team alert suppression', () => {
+  it.each([false, true])('bypasses memo and stale snapshot env for every live read (hold=%s)', held => {
+    const env = { WE_GH_READ_MEMO_DIR: 'tick-memo', WE_PR_SNAPSHOT_STALE_OK_MS: '60000',
+      WE_APP_ID: '123', GH_TOKEN: 'fixture-token' };
+    vi.stubEnv('WE_GH_READ_MEMO_DIR', env.WE_GH_READ_MEMO_DIR);
+    vi.stubEnv('WE_PR_SNAPSHOT_STALE_OK_MS', env.WE_PR_SNAPSHOT_STALE_OK_MS);
+    const gh = vi.fn(args => {
+      if (args[0] === 'pr') return JSON.stringify({ headRefOid: head, labels: [] });
+      if (args.includes('--paginate')) return '';
+      if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: 0 } } } } });
+      if (args[1].includes('/check-runs?')) return JSON.stringify({ total_count: 1, check_runs: [{
+        id: 10, name: 'red-team', head_sha: head, external_id: `${repo}#${pr}`,
+        app: { id: 123 }, status: 'completed', conclusion: 'success',
+      }] });
+      if (args[1].includes('/status?')) return JSON.stringify({ total_count: held ? 1 : 0,
+        statuses: held ? [{ id: 1, context: `red-team/publication #${pr}`, state: 'pending' }] : [] });
+      if (args[1].includes('/statuses?')) return JSON.stringify([{ id: 1, context: `red-team/publication #${pr}`, state: 'pending' }]);
+      throw Error(`unexpected gh call: ${args}`);
+    });
+    const readLive = createLiveRedTeamReader({ env, gh });
+    expect(readLive({ repo, pr, head })).toEqual({ clear: !held });
+    expect(gh.mock.calls.length).toBe(held ? 6 : 5);
+    for (const [, options] of gh.mock.calls) {
+      for (const actual of [options.env, options.throttle.env]) {
+        expect(actual).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+        expect(actual).not.toHaveProperty('WE_PR_SNAPSHOT_STALE_OK_MS');
+        expect(actual.GH_TOKEN).toBe('fixture-token');
+      }
+    }
+    expect(env.WE_GH_READ_MEMO_DIR).toBe('tick-memo');
+    expect(env.WE_PR_SNAPSHOT_STALE_OK_MS).toBe('60000');
+    expect(process.env.WE_GH_READ_MEMO_DIR).toBe('tick-memo');
+  });
+
   it.each(['failure', 'pending', 'unreadable', 'clear'])
   ('a success check suppresses the alert only with validated publication evidence: %s', state => {
     const status = { id: 1, context: `red-team/publication #${pr}`, state };
