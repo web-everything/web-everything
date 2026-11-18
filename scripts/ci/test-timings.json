@@ -744,6 +744,7 @@
   "scripts/lib/__tests__/already-landed-content.test.mjs": 0.01,
   "scripts/lib/__tests__/antigravity-judge-spawn.integration.test.mjs": 0,
   "scripts/lib/__tests__/antigravity-judge-spawn.test.mjs": 4.18,
+  "scripts/lib/__tests__/external-juror-liveness.test.mjs": 2,
   "scripts/lib/__tests__/antigravity-run-evidence.test.mjs": 0.05,
   "scripts/lib/__tests__/approval-prevention-notice.test.mjs": 0.03,
   "scripts/lib/__tests__/approved-human-surface-hold.test.mjs": 0.02,
@@ -2028,6 +2029,7 @@
   "scripts/conveyor/soak/breaks/task-owner-dies-before-stop.soak.test.mjs": 0.18,
   "scripts/conveyor/soak/breaks/verdict-ledger-slow-push-race-refused.soak.test.mjs": 17.78,
   "scripts/conveyor/soak/breaks/ready-candidate-long-tick.soak.test.mjs": 1,
-  "scripts/conveyor/soak/breaks/timings-advisory-merge.soak.test.mjs": 2
+  "scripts/conveyor/soak/breaks/timings-advisory-merge.soak.test.mjs": 2,
+  "scripts/conveyor/soak/breaks/agy-juror-first-output.soak.test.mjs": 2
  }
 }
