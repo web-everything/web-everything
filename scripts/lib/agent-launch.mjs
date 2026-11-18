@@ -98,7 +98,10 @@ function shellWords(text) {
   const words = []; let word = '', quote = '', started = false;
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
-    if (c === '\\' && quote !== "'") { word += text[++i] ?? ''; started = true; }
+    if (c === '\\' && quote !== "'") {
+      if (i + 1 === text.length) throw new SyntaxError('incomplete shell escape');
+      word += text[++i]; started = true;
+    }
     else if (quote) { if (c === quote) quote = ''; else word += c; }
     else if (c === "'" || c === '"') { quote = c; started = true; }
     else if (/\s|[;|&()]/.test(c)) {
@@ -107,18 +110,26 @@ function shellWords(text) {
       if (/[;|&()\n]/.test(c)) words.push(';');
     } else { word += c; started = true; }
   }
+  if (quote) throw new SyntaxError('unterminated shell quote');
   if (started) words.push(word);
   return words;
 }
 
 function shellResumeIds(text) {
-  const words = shellWords(text), ids = [];
+  return shellWordResumeIds(shellWords(text));
+}
+
+function shellWordResumeIds(words, includeAgents = true) {
+  const ids = [];
   for (let i = 0; i < words.length; i++) {
     const end = words.indexOf(';', i + 1), tail = words.slice(i + 1, end < 0 ? undefined : end);
-    if (/(?:^|[/\\])(?:claude|codex)$/.test(words[i])) ids.push(...resumeIds(tail));
+    if (includeAgents && /(?:^|[/\\])(?:claude|codex)$/.test(words[i])) ids.push(...resumeIds(tail));
     if (/(?:^|\/)(?:ba|z|da|k)?sh$/.test(words[i])) {
       const flag = tail.findIndex(w => /^-[a-z]*c[a-z]*$/.test(w));
-      if (flag >= 0 && tail[flag + 1] != null) ids.push(...shellResumeIds(tail[flag + 1]));
+      if (flag >= 0) {
+        if (typeof tail[flag + 1] !== 'string') throw new SyntaxError('missing shell -c script');
+        ids.push(...shellResumeIds(tail[flag + 1]));
+      }
     }
   }
   return ids;
@@ -141,16 +152,18 @@ export function launchAgent(descriptor, primitive, ...args) {
   if (!descriptor.mode) refuse('mode is required', descriptor, log);
   if (!modes.has(descriptor.mode)) refuse(`unknown mode ${String(descriptor.mode)}`, descriptor, log);
   if (!Object.hasOwn(descriptor, 'resumeId')) refuse('resumeId key is required', descriptor, log);
-  const argv = Array.isArray(args[1]) ? args[1] : typeof args[1] === 'string' ? shellWords(args[1]) : [];
-  const nativeIds = [...resumeIds(argv), ...shellResumeIds(String(args[0] ?? ''))];
-  if (/(?:^|\/)(?:ba|z|da|k)?sh$/.test(args[0])) {
-    const flag = argv.findIndex(w => typeof w === 'string' && /^-[a-z]*c[a-z]*$/.test(w));
-    if (typeof argv[flag + 1] === 'string' && flag >= 0) nativeIds.push(...shellResumeIds(argv[flag + 1]));
+  let nativeIds;
+  try {
+    const argv = Array.isArray(args[1]) ? args[1] : typeof args[1] === 'string' ? shellWords(args[1]) : [];
+    nativeIds = [...resumeIds(argv), ...shellResumeIds(String(args[0] ?? '')),
+      ...shellWordResumeIds([args[0], ...argv], false)];
+  } catch (cause) {
+    refuse('cannot parse native resume id; use literal argv and a plain resume id', descriptor, log, cause);
   }
   // A resume flag with no value reads as an empty native id: that is a MISSING id, never one an empty/blank
-  // descriptor resumeId can "equal". Every native id must be a non-blank string and match descriptor.resumeId.
+  // descriptor resumeId can "equal". Require plain literal ids: never shell expansions or metacharacters.
   if ((descriptor.mode === 'codex-exec-resume' && nativeIds.length === 0)
-    || nativeIds.some(id => typeof id !== 'string' || id.trim() === '' || descriptor.resumeId !== id)) {
+    || nativeIds.some(id => typeof id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]*(?![\s\S])/.test(id) || descriptor.resumeId !== id)) {
     refuse('resumeId must equal the native resume id in argv', descriptor, log);
   }
   if ('launchGuard' in descriptor) {

@@ -85,22 +85,26 @@ export function findAgentLaunches(sources) {
     ts.forEachChild(body, visit);
     return out;
   }
-  function isPrimitive(node, seen = new Set()) {
+  function isPrimitive(node, seen = new Set(), allowDynamic = true) {
     if (!node || seen.has(node)) return false;
     seen.add(node);
+    if (ts.isCallExpression(node)) return isPrimitive(node.expression, seen, allowDynamic);
     if (ts.isPropertyAccessExpression(node)) {
+      // Method derivation needs a known primitive, not an arbitrary computed logger/callback.
+      if (/^(?:bind|call|apply)$/.test(node.name.text)) return isPrimitive(node.expression, seen, false);
       let receiver = node.expression;
       if (ts.isIdentifier(receiver)) { const d = declaration(receiver); receiver = d?.parent.flags & ts.NodeFlags.Const ? d.initializer : null; }
       if (receiver && (ts.isRegularExpressionLiteral(receiver) || (ts.isNewExpression(receiver) && receiver.expression.getText() === 'RegExp'))) return false;
       return primitives.test(node.name.text);
     }
-    if (ts.isElementAccessExpression(node)) return values(node.argumentExpression).some(v => v == null || primitives.test(v));
+    if (ts.isElementAccessExpression(node)) return values(node.argumentExpression).some(v => (v == null && allowDynamic) || primitives.test(v)
+      || (/^(?:bind|call|apply)$/.test(v) && isPrimitive(node.expression, new Set(seen), false)));
     if (ts.isIdentifier(node)) {
       if (primitives.test(node.text)) return true;
       const d = declaration(node);
       if ((d && ts.isImportSpecifier(d))) return primitives.test(d.propertyName?.text ?? d.name.text);
-      if (d && ts.isBindingElement(d)) return isPrimitive(d.initializer, seen) || isPrimitive(bindingExpression(d), seen);
-      if (d && (ts.isVariableDeclaration(d) || ts.isParameter(d))) return isPrimitive(d.initializer, seen);
+      if (d && ts.isBindingElement(d)) return isPrimitive(d.initializer, seen, allowDynamic) || isPrimitive(bindingExpression(d), seen, allowDynamic);
+      if (d && (ts.isVariableDeclaration(d) || ts.isParameter(d))) return isPrimitive(d.initializer, seen, allowDynamic);
     }
     return false;
   }

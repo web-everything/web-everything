@@ -111,6 +111,42 @@ describe('transparent execution', () => {
 });
 
 describe('resume validation across execution forms', () => {
+  it.each([
+    ['env', ['sh', '-c', `claude --resume ${SID}`]],
+    ['nohup', ['env', 'SID=fixture', '/bin/bash', '-lc', `codex exec resume ${SID}`]],
+    ['env', ['sh', '-c', `env sh -c 'claude --resume ${SID}'`]],
+    [`env sh -c 'claude --resume ${SID}'`],
+  ])('validates native resume ids through nested shell wrappers (%j)', (...args) => {
+    const primitive = vi.fn(), log = vi.fn();
+    for (const resumeId of [null, 'other-id']) {
+      expect(() => launchAgent({ mode: 'claude-resume', resumeId, log }, primitive, ...args)).toThrow('native resume id');
+    }
+    expect(primitive).not.toHaveBeenCalled();
+    expect(launchAgent({ mode: 'claude-resume', resumeId: SID, log }, primitive, ...args)).toBeUndefined();
+    expect(primitive).toHaveBeenCalledTimes(1);
+    expect(primitive).toHaveBeenCalledWith(...args);
+  });
+  it.each([
+    ['env', ['sh', '-c', 'claude --resume "unterminated']],
+    ['env', ['sh', '-c', 'claude --resume trailing\\']],
+    ['env', ['sh', '-c']],
+    ['env', ['sh', '-c', null]],
+  ])('fails closed on unparseable nested shell scripts and names a literal-argv fallback (%j)', (...args) => {
+    const primitive = vi.fn(), log = vi.fn();
+    expect(() => launchAgent({ mode: 'claude-resume', resumeId: null, log }, primitive, ...args))
+      .toThrow('use literal argv and a plain resume id');
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('cannot parse native resume id'));
+    expect(primitive).not.toHaveBeenCalled();
+  });
+  it.each(['$SID', '${SID}', '$(printf id)', '`printf id`', '~session', 'id*', 'id?', 'id[12]', 'id{1,2}', 'two words', 'id\n'])
+  ('refuses nonliteral native resume ids even when the descriptor matches (%j)', resumeId => {
+    for (const args of [['claude', ['--resume', resumeId]], ['sh', ['-c', `claude --resume "${resumeId}"`]],
+      ['env', ['sh', '-c', `codex exec resume "${resumeId}"`]]]) {
+      const primitive = vi.fn();
+      expect(() => launchAgent({ mode: 'claude-resume', resumeId, log() {} }, primitive, ...args)).toThrow('native resume id');
+      expect(primitive).not.toHaveBeenCalled();
+    }
+  });
   const launches = [
     ['claude', ['-r', SID]],
     ['codex', ['--sandbox', 'workspace-write', 'exec', 'resume', SID]],

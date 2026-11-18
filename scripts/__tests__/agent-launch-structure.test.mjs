@@ -1115,6 +1115,23 @@ describe('single agent launch boundary', () => {
     expect(findAgentLaunches({ 'scripts/cli.mjs': "export const CLI = 'claude';",
       'skills-src/task/run.mjs': "import { CLI as bin } from '../../scripts/cli.mjs'; import {spawn as s} from 'node:child_process'; s(bin, [])" })).toHaveLength(1);
   });
+  it.each([
+    "const start = spawn.bind(null); start('claude', [])",
+    "const start = cp.execFile.bind(null); start('codex', [])",
+    "const start = exec.bind(null); start('claude -p hi')",
+    "const start = spawn.call; start(null, 'claude', [])",
+    "const start = execFile.apply; start(null, ['codex', []])",
+    "const start = spawn['bind'](null); const next = start; next('claude', [])",
+    "spawn.call(null, 'claude', [])",
+    "execFile.apply(null, ['codex', []])",
+    "const start = spawn.bind(null); start(command, argv)",
+  ])('detects method-derived execution primitives (%s)', source => {
+    const findings = findAgentLaunches({ 'scripts/derived.mjs': source });
+    expect(findings.some(f => /^(?:start|next|spawn.call|execFile.apply)$/.test(f.kind))).toBe(true);
+  });
+  it('does not classify arbitrary computed logging methods as execution primitives', () => {
+    expect(findAgentLaunches({ 'scripts/log.mjs': 'originals[m].call(target, msg)' })).toEqual([]);
+  });
   it('fails closed when a source cannot be parsed', () => {
     expect(findAgentLaunches({ 'scripts/broken.mjs': "spawn('claude', [" })).toMatchObject([{ reason: expect.stringContaining('unparseable') }]);
   });
