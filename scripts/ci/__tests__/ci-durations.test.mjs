@@ -47,6 +47,13 @@ describe('ci-durations', () => {
     expect(() => collectDurations(parseArgs([]), truncated)).toThrow(/missing completed jobs/);
   });
 
+  it('refuses a job view that disagrees with the jobs API about a completed job', () => {
+    const skipped = vi.fn((_file, args) => JSON.stringify(args[1] === 'list' ? [list[0]] : args[1] === 'view'
+      ? { jobs: [{ databaseId: 7, name: 'x', status: 'completed', conclusion: 'skipped' }] }
+      : { total_count: 1, jobs: [{ id: 7, status: 'completed', conclusion: 'success', created_at: '2026-01-01T00:00:00Z' }] }));
+    expect(() => collectDurations(parseArgs([]), skipped)).toThrow(/missing completed jobs/);
+  });
+
   it('caps oversized limits at ten and refuses unknown, empty and invalid options', () => {
     expect(parseArgs([])).toEqual({ workflow: 'ci.yml', branch: 'main', limit: 10, json: false });
     expect(parseArgs(['--limit=999', '--workflow=other.yml', '--branch=topic', '--json'])).toEqual({ workflow: 'other.yml', branch: 'topic', limit: 10, json: true });

@@ -100,8 +100,9 @@ export function collectDurations(options, exec = execFileSyncThrottled) {
       byId.set(job.id, job);
     }
     // Every finished REST job must appear in the CLI view; a truncated view must not yield a quiet partial summary.
-    const viewIds = new Set(view.jobs.map(job => job.databaseId));
-    if (api.jobs.some(job => job.status === 'completed' && job.conclusion !== 'skipped' && !viewIds.has(job.id))) {
+    const viewById = new Map(view.jobs.map(job => [job.databaseId, job]));
+    if (api.jobs.some(job => job.status === 'completed' && job.conclusion !== 'skipped' &&
+        (viewById.get(job.id)?.status !== 'completed' || viewById.get(job.id)?.conclusion !== job.conclusion))) {
       throw new Error('Job views are missing completed jobs from the jobs API; retry or inspect the run');
     }
     const jobs = view.jobs.map(job => {
