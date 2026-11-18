@@ -106,9 +106,17 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
       };
       const rows = read(indexPath).split('\n').filter(Boolean).map(l => JSON.parse(l));
       const prior = rows.findLast(r => r.key === key);
-      const contents = read(cardsPath), lines = contents.split('\n');
-      // The card line carries a timestamp, so a re-run would differ: a key with a live card line keeps that line (one card per key).
-      const cardLine = (prior && lines.find(actual => cardHash(actual) === prior.cardLineHash)) || freshCardLine;
+      let contents = read(cardsPath), lines = contents.split('\n');
+      // The card line carries a timestamp: ignore it when comparing, keep the live line for an unchanged finding and base,
+      // and rewrite that line in place when the base or finding evidence changed (one card per key, never stale evidence).
+      const live = prior && lines.find(actual => cardHash(actual) === prior.cardLineHash);
+      const untimed = line => line.replace(/^(- \[R1053\]) .*? ET:/, '$1 ET:');
+      const cardLine = live && untimed(live) === untimed(freshCardLine) ? live : freshCardLine;
+      if (live && cardLine !== live) {
+        contents = lines.map(actual => (actual === live ? cardLine : actual)).join('\n');
+        fs.writeFileSync(cardsPath, contents, { encoding: 'utf8', mode: 0o600 });
+        lines = contents.split('\n');
+      }
       const date = new Date().toLocaleString('en-CA', { timeZone: 'America/New_York', hour12: false });
       const cls = key.split('|').at(-1);
       const security = /^B[1-7]$/.test(cls);

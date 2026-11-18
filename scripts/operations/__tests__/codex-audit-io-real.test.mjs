@@ -163,6 +163,20 @@ describe('R1053 base reproduction IO', () => {
       expect(readFileSync(cardsPath, 'utf8').trim().split('\n')).toHaveLength(1);
     });
   });
+  it('a re-audit against an advanced base rewrites the card line in place with the new base evidence', async () => {
+    await withRealRepo(async ({ root, tmp }) => {
+      const cardsPath = join(tmp, 'cards.md'), indexPath = join(tmp, 'index.jsonl');
+      const options = { cwd: root, home: join(tmp, 'home'), cardsPath, indexPath };
+      const at = (t, sha) => ({ key: 'x.mjs|X|E1', cardLine: `- [R1053] ${t} ET: pre-existing audit finding (E1) in we:x.mjs#X, reproduces on main ${sha}: x.mjs:2 weak` });
+      expect(createAuditDeps(options).fileCard(at('10:00:00', 'aaaaaaaaaa'))).toBe(true);
+      expect(createAuditDeps(options).fileCard(at('10:05:00', 'bbbbbbbbbb'))).toBe(true);
+      const lines = readFileSync(cardsPath, 'utf8').trim().split('\n');
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain('reproduces on main bbbbbbbbbb');
+      expect(createAuditDeps(options).fileCard(at('10:09:00', 'bbbbbbbbbb'))).toBe(true);
+      expect(readFileSync(cardsPath, 'utf8').trim().split('\n')).toEqual(lines);
+    });
+  });
   it.each(['success', 'timeout', 'malformed', 'add fails'])('removes detached scratch worktree in finally: %s', async kind => {
     await withRealRepo(async ({ root, tmp, head, git }) => {
       let dir;
