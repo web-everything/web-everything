@@ -382,6 +382,12 @@ describe('rolling timing refresh', () => {
     expect(Object.keys(JSON.parse(readFileSync(timingsFile, 'utf8')).unit)).not.toContain('deleted.test.mjs');
   });
 
+  it('refreshes despite min-stale when the stored map holds a deleted test', async () => {
+    writeFileSync(timingsFile, JSON.stringify({ unit: { ...Object.fromEntries(files.map(file => [file, 1])), 'deleted.test.mjs': 1 }, soak: {} }));
+    expect(await main(['--runs=1', '--min-stale=100'], { exec: rollingExec([1000], []), timingsFile, repoRoot })).toBe(0);
+    expect(Object.keys(JSON.parse(readFileSync(timingsFile, 'utf8')).unit)).not.toContain('deleted.test.mjs');
+  });
+
   it('writes when drift meets the threshold', async () => {
     expect(await main(['--runs=1', '--min-stale=1'], { exec: rollingExec([1000], []), timingsFile, repoRoot })).toBe(0);
     expect(readFileSync(timingsFile, 'utf8')).not.toBe(original);

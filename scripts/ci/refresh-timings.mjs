@@ -105,9 +105,11 @@ export async function refreshFromDir({ dir, timingsFile = TIMINGS_FILE, repoRoot
     const group = (await split(files)).covered;
     const ratio = staleRatio(group, all.unit, timings, total);
     // A stored map that no longer measures the current files is stale regardless of its apparent balance.
+    const known = new Set(files);
+    const obsolete = Object.keys(all.unit).filter(file => !known.has(file)).length;
     const storedCoverage = group.filter(file => Number.isFinite(all.unit[file])).length / Math.max(group.length, 1);
     const balance = `stale ratio old-assignment-on-new-timings ${ratio.toFixed(2)}`;
-    if (minStale !== undefined && ratio < minStale && storedCoverage >= 0.8) return { ok: true, reason: `${balance}; assignment still balanced.` };
+    if (minStale !== undefined && ratio < minStale && storedCoverage >= 0.8 && obsolete === 0) return { ok: true, reason: `${balance}; assignment still balanced.` };
     const output = formatUpdatedTimings(all, 'unit', timings);
     pending = `${timingsFile}.${randomUUID()}.pending`;
     await write(pending, output, { flag: 'wx' });
