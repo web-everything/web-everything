@@ -638,7 +638,11 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
     const adv = parseAdvisories(trusted)[0];
     const body = String(trusted[adv?.index]?.body ?? '');
     const outcomes = [...body.matchAll(/^\*\*Advisory outcome:\*\*\s*`?([a-z-]+)`?/gim)].map(m => m[1].toLowerCase());
-    const clean = adv && advisoryCoversHead(adv, head) && String(adv.head).toLowerCase() === head.toLowerCase()
+    // parseAdvisories skips a comment missing a Verdict or Net basis line, so a newer malformed advisory note must not be
+    // passed over: the newest advisory-note comment on the thread has to be the parsed one.
+    const notes = trusted.map((c, i) => ({ i, at: Date.parse(c?.createdAt) || 0, note: String(c?.body ?? '').includes('ADVISORY REVIEW, NOT A RECORDED VERDICT') }))
+      .filter(n => n.note).sort((a, b) => b.at - a.at || b.i - a.i);
+    const clean = adv && notes[0]?.i === adv.index && advisoryCoversHead(adv, head) && String(adv.head).toLowerCase() === head.toLowerCase()
       && outcomes.length === 1 && outcomes[0] === ADVISORY_OUTCOMES.ACCEPT && adv.outcome === ADVISORY_OUTCOMES.ACCEPT;
     if (!clean) return stay(`${why}, and no clean advisory accept names the full live head`);
     if (policy.onClean !== 'resume') return stay(`no referral finding exists, but referralHoldAutoResolve.onClean=${policy.onClean} (source: ${source('onClean')}) keeps the pause`);

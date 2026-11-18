@@ -265,6 +265,7 @@ describe('same-head holds with no referral finding (#7012)', () => {
     ['same-head hold with an advisory that states no outcome', [{ ...advisory, body: advisory.body.replace(/^\*\*Advisory outcome:\*\*.*$/im, '') }], {}, /no clean advisory accept/],
     ['same-head hold with an embedded accept then a real none outcome', [{ ...advisory, body: `${advisory.body}\n**Advisory outcome:** \`none\`` }], {}, /no clean advisory accept/],
     ['same-head hold with a newer outcome-less advisory', [advisory, { ...advisory, createdAt: '2999-01-01T00:00:00Z', body: advisory.body.replace(/^\*\*Advisory outcome:\*\*.*$/im, '') }], {}, /no clean advisory accept/],
+    ['same-head hold with a newer malformed advisory note', [advisory, { ...advisory, createdAt: '2999-01-01T00:00:00Z', body: advisory.body.replace(/^Net basis:.*$/im, '') }], {}, /no clean advisory accept/],
     ['same-head hold with a short-prefix advisory head', [{ ...advisory, body: advisory.body.replace(/(Net basis: `[a-f0-9]+\.\.)[a-f0-9]+`/i, '$1' + fx.headRefOid.slice(0, 1) + '`') }], {}, /no clean advisory accept/],
     ['failed persistence', comments, { persistenceFailed: true }, /save failed/],
     ['no verdict', comments, { noVerdict: {} }, /no verdict ever landed/],
