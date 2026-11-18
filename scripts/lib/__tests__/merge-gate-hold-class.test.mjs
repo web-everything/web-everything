@@ -442,6 +442,19 @@ describe('fresh review CI merge-gate holds', () => {
       runGh: () => JSON.stringify(row), getRequiredChecks: () => ({ source: 'live', checks: ['merge-gate'] }),
       readPrLabels: () => [], readMergeGateVerdict: () => verdict(log), mergeGateSetting: { value: 'on' } }).state).toBe('red');
   });
+  it('a failed legacy merge-gate status beside a bound excused run is not ignored', () => {
+    const annotated = { ...rest, mergeGateReviewHold: { holdIds: ['review-acceptance'], headSha: sha, jobId: 123 } };
+    expect(gate({ readMergeGateVerdict: () => ({ error: 'unavailable' }),
+      readChecks: () => [annotated, { context: 'merge-gate', state: 'failure' }, { context: 'legacy', state: 'success' }] }))
+      .toMatchObject({ allowed: false });
+  });
+  it('refuses a bound annotation whose detailsUrl is not a github.com Actions job URL', () => {
+    for (const detailsUrl of ['https://untrusted.invalid/o/r/actions/runs/1/job/123',
+      'https://github.com.evil.example/o/r/actions/runs/1/job/123', 'http://github.com/o/r/actions/runs/1/job/123']) {
+      const annotated = { ...rest, detailsUrl, mergeGateReviewHold: { holdIds: ['review-acceptance'], headSha: sha, jobId: 123 } };
+      expect(gate({ readMergeGateVerdict: () => ({ error: 'unavailable' }), readChecks: () => [annotated, { context: 'legacy', state: 'success' }] }).allowed).toBe(false);
+    }
+  });
   it('does not excuse a legacy merge-gate status', () => {
     const readMergeGateVerdict = vi.fn(() => verdict());
     expect(gate({ readChecks: () => [{ context: 'merge-gate', state: 'failure' },

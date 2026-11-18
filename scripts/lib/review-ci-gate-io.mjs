@@ -120,7 +120,8 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
     let requiredChecks = trustedRequired && required.source !== 'timing-policy' ? required.checks : [];
     // Review work must not deadlock its own review. Recheck the annotation against
     // THIS Actions job and head; the strict check-state contract still sees a failure.
-    const mergeRows = checks.filter(row => row?.name === 'merge-gate');
+    // Legacy commit statuses carry `context`, not `name`: a failed legacy merge-gate status is never excusable.
+    const mergeRows = checks.filter(row => (row?.name ?? row?.context) === 'merge-gate');
     if (mergeRows.length && mergeRows.every(row => excusalEnabled && boundMergeGateReviewHold(row, { headSha, labels })) && Array.isArray(requiredChecks))
       requiredChecks = requiredChecks.filter(name => name !== 'merge-gate');
     // A discovery fault or untrusted/empty set cannot excuse healable red in push mode.
