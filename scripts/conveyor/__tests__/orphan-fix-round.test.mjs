@@ -1,3 +1,4 @@
+import { CONSTELLATION_REPOS } from '../../lib/constellation-repos.mjs';
 /**
  * The orphaned-fix-round guard. Live 2026-10-10, PR #4715: a fix round addressed the findings but was killed before
  * re-arming, the next round was a restack that by design never touched labels, and the PR then sat `review:changes`
@@ -457,18 +458,22 @@ describe('runOrphanFixRoundPass — IO shell', () => {
     ['escalate', [VERDICT, BEGIN, END,
       c('2026-10-10T15:22:00Z', `${ORPHAN_GUARD_MARKER} — re-dispatched a fixer`),
       c('2026-10-10T15:23:00Z', `${ORPHAN_GUARD_MARKER} — re-dispatched a fixer`)]],
-  ])('rechecks fix capability after awaited reads before %s', async (decision, comments) => {
+  ])('rechecks capability only for dispatch, preserving %s recovery when disabled', async (decision, comments) => {
     let enabled = true;
     const s = seams(comments, {
       resolveProfile: () => ({ capabilities: { fix: enabled } }),
       readComments: async () => { enabled = false; return comments; },
     });
     const r = await runOrphanFixRoundPass(s);
-    expect(r.rows[0]).toMatchObject({ decision, result: expect.stringContaining('fix capability unavailable') });
-    expect(s.rearm).not.toHaveBeenCalled();
+    if (decision === 'redispatch') {
+      expect(r.rows[0]).toMatchObject({ decision, result: expect.stringContaining('fix capability unavailable') });
+      expect(s.postComment).not.toHaveBeenCalled();
+    } else {
+      expect(r.rows[0]).toMatchObject({ decision, result: decision === 'rearm' ? 're-armed' : 'escalated' });
+      expect(s[decision]).toHaveBeenCalledTimes(1);
+      expect(s.postComment).toHaveBeenCalledTimes(1);
+    }
     expect(s.redispatch).not.toHaveBeenCalled();
-    expect(s.escalate).not.toHaveBeenCalled();
-    expect(s.postComment).not.toHaveBeenCalled();
   });
 
   it('WE_ORPHAN_FIX_GUARD=0 reports without acting; an owned PR is never even read', async () => {
@@ -519,15 +524,15 @@ describe('wiring — the fix daemon runs the guard inside its stuck-fixer reclai
 });
 
 import { repoProfile as capabilityProfile } from '../../lib/repo-profile.mjs';
-it('does not list orphan fixes for a fix-disabled repo', async () => {
+it('lists orphan fixes for a fix-disabled repo', async () => {
   const resolveProfile = (key) => ({ ...capabilityProfile(key), capabilities: { ...capabilityProfile(key)?.capabilities, fix: key !== 'frontierui' } });
   const listBounced = vi.fn(() => []);
   await runOrphanFixRoundPass({ resolveProfile, listBounced, env: {} });
-  expect(listBounced.mock.calls.map(([slug]) => slug)).toEqual(['web-everything/web-everything', 'plateauapp/plateau-app']);
+  expect(listBounced.mock.calls.map(([slug]) => slug)).toEqual(Object.values(CONSTELLATION_REPOS).map(r => r.slug));
 });
 
-it('filters disabled explicit orphan repos before listing', async () => {
+it('observes disabled explicit orphan repos before action gating', async () => {
   const listBounced = vi.fn(() => []);
   await runOrphanFixRoundPass({ repos: [{ key: 'longshore', slug: 'longshoreai/longshore' }], listBounced, env: {} });
-  expect(listBounced).not.toHaveBeenCalled();
+  expect(listBounced).toHaveBeenCalledWith('longshoreai/longshore');
 });

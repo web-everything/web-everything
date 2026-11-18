@@ -211,9 +211,9 @@ function* eligibleRepos(repos, capability, resolveProfile) {
  *   outright refusals — a PR reconcile never even offered as a `fix`/`ci-heal` dispatch entry (#x0mn6x0, epic
  *   #4075/#3383; see `runReconcileFixDispatch`'s own `reconcileRefusalDetails` docblock for the full why).
  */
-export function runReconcileFixDispatchAllRepos({ resolveProfile = repoProfile, repos = reposWith('fix', resolveProfile), tick = runReconcileFixDispatch,
+export function runReconcileFixDispatchAllRepos({ resolveProfile = repoProfile, repos = FIX_DISPATCH_DAEMON_REPOS, tick = runReconcileFixDispatch,
   allowStandDownAutoProceed = resolveFixSettings().standDownAutoProceed, ...tickOpts } = {}) {
-  const perRepo = forEachRepo(eligibleRepos(repos, 'fix', resolveProfile), (repo) => tick({ ...tickOpts, repo, allowStandDownAutoProceed }));
+  const perRepo = forEachRepo(repos, (repo) => tick({ ...tickOpts, repo, resolveProfile, allowStandDownAutoProceed }));
   const dispatched = [];
   const refusals = [];
   const reconcileRefusals = [];
@@ -255,14 +255,14 @@ export function runReconcileFixDispatchAllRepos({ resolveProfile = repoProfile, 
  *   {@link runReconcileFixDispatchAllRepos}'s own identical field for the shape and the why (#x0mn6x0, epic
  *   #4075/#3383).
  */
-export async function runReconcileCiHealDispatchAllRepos({ resolveProfile = repoProfile, repos = reposWith('ciHeal', resolveProfile), tick = runReconcileCiHealDispatch, ...tickOpts } = {}) {
+export async function runReconcileCiHealDispatchAllRepos({ resolveProfile = repoProfile, repos = FIX_DISPATCH_DAEMON_REPOS, tick = runReconcileCiHealDispatch, ...tickOpts } = {}) {
   const perRepo = [];
-  for (const repo of eligibleRepos(repos, 'ciHeal', resolveProfile)) {
+  for (const repo of repos) {
     try {
       // eslint-disable-next-line no-await-in-loop -- sequential by design (see this fn's own docblock): one
       // repo's ci-heal tick must finish (or fail) before the next repo's is attempted, so a rejection is
       // captured per repo instead of racing every repo's dispatch concurrently.
-      const result = await tick({ ...tickOpts, repo });
+      const result = await tick({ ...tickOpts, repo, resolveProfile });
       perRepo.push({ repo, result });
     } catch (e) {
       perRepo.push({ repo, error: String((e && e.message) || e).split('\n')[0] });

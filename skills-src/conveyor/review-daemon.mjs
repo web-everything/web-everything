@@ -72,7 +72,7 @@
  * pass in this repo (`runner.mjs`'s `makeCliMechanicalPasses`) — it never fails the review tick itself.
  */
 
-import { constellationRepoKeysWith, repoHasCapability, repoProfile } from '../../scripts/lib/repo-profile.mjs';
+import { repoHasCapability, repoProfile } from '../../scripts/lib/repo-profile.mjs';
 import { readFileSync, statSync } from 'node:fs';
 import { cascadePolicy } from '../../scripts/lib/policy-cascade.mjs';
 import { createPlannerFactCache } from '../../scripts/conveyor/planner-fact-cache.mjs';
@@ -383,6 +383,7 @@ export function sweepReviewHolds(opts) {
  */
 export function runReviewTick({
   defaultBranch = 'main',
+  resolveProfile = repoProfile,
   reconcile = runReconcilePass,
   dispatch = dispatchReviewByMode,
   redTeamOnSkip = null,
@@ -721,7 +722,7 @@ export function runReviewTick({
   let redTeamOnSkipResult;
   const reservedRecoveryStarts = hostLimit >= 2 && reviews.length ? Math.min(1, hostLimit - 1) : 0;
   const recoverRedTeam = (recoveryStarts) => {
-    if (paused || typeof redTeamOnSkip !== 'function') return;
+    if (!repoHasCapability(repo, 'review', { resolveProfile }) || paused || typeof redTeamOnSkip !== 'function') return;
     const recoveryLanes = Math.max(0, acquirable - occupiedLanes);
     let taken = 0;
     const capacity = { lanes: recoveryLanes, budget: liveReviewBudget, remainingStarts: recoveryStarts,
@@ -753,7 +754,7 @@ export function runReviewTick({
   // and `onTick` reads both shapes.
   const notStarted = [];
   for (const d of reviews) {
-    if (paused || !host.admitted || occupiedLanes >= hostLimit || occupiedLanes >= acquirable || remainingReviewCapacity() <= 0) break;
+    if (!repoHasCapability(repo, 'review', { resolveProfile }) || paused || !host.admitted || occupiedLanes >= hostLimit || occupiedLanes >= acquirable || remainingReviewCapacity() <= 0) break;
     dispatchable.push(d);
     // Reserve only this start. A confirmed refusal releases the seat for the next PR (including later
     // repos). A throw may follow a successful spawn, so its reservation must remain until the next ps read.
@@ -954,8 +955,7 @@ export function sharedHostBudget(hostAdmission, log = console.error) {
   };
 }
 
-export function runReviewTickAllRepos({ resolveProfile = repoProfile, repos = constellationRepoKeysWith('review', { resolveProfile }).map((key) => CONSTELLATION_REPOS[key].slug), tick = runReviewTick, authGateOverride, ...tickOpts } = {}) {
-  repos = repos.filter(repo => repoHasCapability(repo, 'review', { resolveProfile }));
+export function runReviewTickAllRepos({ resolveProfile = repoProfile, repos = REVIEW_DAEMON_REPOS, tick = runReviewTick, authGateOverride, ...tickOpts } = {}) {
   // card x5kagse (epic #4075/#3383) — computed ONCE per tick (the login is a host-global fact, not per-repo),
   // then forwarded into every repo's own `runReviewTick` call below. Real IO runs only for a genuine production
   // tick (`tick` left at its real default) — mirrors `runTickAllRepos`'s own identical rule in
@@ -970,7 +970,7 @@ export function runReviewTickAllRepos({ resolveProfile = repoProfile, repos = co
   if (typeof tickOpts.hostAdmission === 'function') tickOpts.hostAdmission = sharedHostBudget(tickOpts.hostAdmission, tickOpts.log);
   const perRepo = forEachRepo(repos, (repo) => {
     const started = Date.now();
-    try { return tick({ ...tickOpts, repo, paused: authGate.paused, pauseReason: authGate.reason }); }
+    try { return tick({ ...tickOpts, repo, resolveProfile, paused: authGate.paused, pauseReason: authGate.reason }); }
     finally { perRepoMs[repo] = Date.now() - started; }
   });
   const dispatched = [];
@@ -1061,7 +1061,7 @@ export function runReviewTickAllRepos({ resolveProfile = repoProfile, repos = co
  */
 export async function runConvertAdvisoryTick({
   reconcile = runReconcilePass, convertAdvisory = dispatchConvertAdvisory, repo = WE_SLUG,
-  readPrs = null, readAgents = null, dryRun = false, plans = null,
+  readPrs = null, readAgents = null, dryRun = false, plans = null, resolveProfile = repoProfile,
 } = {}) {
   const sharedReads = typeof readPrs === 'function' && typeof readAgents === 'function';
   let plan;
@@ -1093,6 +1093,10 @@ export async function runConvertAdvisoryTick({
     // One bad entry never aborts the rest — the SAME per-PR isolation `runReviewTick`'s own dispatch loop uses.
     try {
       const pr = prsByNumber.get(Number(d.prNumber));
+      if (!repoHasCapability(repo, 'review', { resolveProfile })) {
+        skipped.push({ prNumber: d.prNumber, reason: 'unsupported-repo' });
+        continue;
+      }
       const result = await convertAdvisory(d, {
         repo, comments: pr?.comments ?? null, labels: pr?.labels ?? null, dryRun,
       });
@@ -1132,10 +1136,9 @@ export async function runConvertAdvisoryTick({
  *   posted:Array<object>, skipped:Array<object>, failed:Array<object>, reconcileFailed:Array<{repo:string, error:string}>}>}
  */
 export async function runConvertAdvisoryTickAllRepos({
-  resolveProfile = repoProfile, repos = constellationRepoKeysWith('review', { resolveProfile }).map((key) => CONSTELLATION_REPOS[key].slug), tick = runConvertAdvisoryTick,
+  resolveProfile = repoProfile, repos = REVIEW_DAEMON_REPOS, tick = runConvertAdvisoryTick,
   concurrency = resolveReviewTickSharing().repoConcurrency, ...tickOpts
 } = {}) {
-  repos = repos.filter(repo => repoHasCapability(repo, 'review', { resolveProfile }));
   const perRepo = new Array(repos.length);
   const limit = Number.isInteger(concurrency) && concurrency >= 1 && concurrency <= 8
     ? concurrency : resolveReviewTickSharing().repoConcurrency;
@@ -1144,7 +1147,7 @@ export async function runConvertAdvisoryTickAllRepos({
     while (next < repos.length) {
       const index = next++;
       const repo = repos[index];
-      try { perRepo[index] = { repo, result: await tick({ ...tickOpts, repo }) }; }
+      try { perRepo[index] = { repo, result: await tick({ ...tickOpts, repo, resolveProfile }) }; }
       catch (e) { perRepo[index] = { repo, error: String((e && e.message) || e).split('\n')[0] }; }
     }
   };

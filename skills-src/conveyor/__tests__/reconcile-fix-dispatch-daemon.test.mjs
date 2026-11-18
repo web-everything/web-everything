@@ -165,8 +165,8 @@ describe('runReconcileFixDispatchAllRepos — one runReconcileFixDispatch call p
       : { dispatched: [], refusals: [{ kind: 'unsupported-repo', prNumber: 20 }] }));
     const out = runReconcileFixDispatchAllRepos({ repos: ['repo-a', 'repo-b'], tick, allowStandDownAutoProceed: false });
     expect(tick).toHaveBeenCalledTimes(2);
-    expect(tick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false });
-    expect(tick).toHaveBeenCalledWith({ repo: 'repo-b', allowStandDownAutoProceed: false });
+    expect(tick).toHaveBeenCalledWith({ repo: 'repo-a', resolveProfile: fixtureProfile, allowStandDownAutoProceed: false });
+    expect(tick).toHaveBeenCalledWith({ repo: 'repo-b', resolveProfile: fixtureProfile, allowStandDownAutoProceed: false });
     expect(out.dispatched).toEqual([{ pr: 10, repo: 'repo-a' }]);
     expect(out.refusals).toEqual([{ kind: 'unsupported-repo', prNumber: 20, repo: 'repo-b' }]);
     expect(out.repos).toEqual([
@@ -378,8 +378,8 @@ describe('runReconcileCiHealDispatchAllRepos — one runReconcileCiHealDispatch 
     });
     const out = await runReconcileCiHealDispatchAllRepos({ repos: ['repo-a', 'repo-b'], tick });
     expect(tick).toHaveBeenCalledTimes(2);
-    expect(tick).toHaveBeenCalledWith({ repo: 'repo-a' });
-    expect(tick).toHaveBeenCalledWith({ repo: 'repo-b' });
+    expect(tick).toHaveBeenCalledWith({ repo: 'repo-a', resolveProfile: fixtureProfile });
+    expect(tick).toHaveBeenCalledWith({ repo: 'repo-b', resolveProfile: fixtureProfile });
     expect(calls).toEqual(['repo-a', 'repo-b']); // sequential, not raced
     expect(out.dispatched).toEqual([{ pr: 10, repo: 'repo-a' }]);
     expect(out.refusals).toEqual([{ kind: 'unsupported-repo', prNumber: 20, repo: 'repo-b' }]);
@@ -481,13 +481,13 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
     for (const [step, tickName] of Object.entries(steps)) {
       expect(opts[tickName]).toHaveBeenCalledTimes(1);
       expect(opts[tickName]).toHaveBeenCalledWith(step === 'fix'
-        ? { repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }
+        ? { repo: 'repo-a', resolveProfile: fixtureProfile, allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }
         : step === 'main-red-rebase'
           // The daemon wires a per-repo file-backed fairness ledger into the main-red rebase sweep only.
           ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) } }
           : ['hung-ci', 'missing-run'].includes(step)
             ? { repo: 'repo-a', apply: true } : ['ci-heal', 'promote-draft', 'notes'].includes(step)
-              ? { repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
+              ? { repo: 'repo-a', ...(step === 'ci-heal' ? { resolveProfile: fixtureProfile } : {}), cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
       expect(result.phaseMs[step]).toBeGreaterThan(0);
     }
     expect(readPrs).toHaveBeenCalledTimes(1);
@@ -503,7 +503,7 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
     // R242 audit round 3: preserve durable flush ordering and fresh-evidence writes.
     for (const step of ['ci-heal', 'notes']) {
       expect(opts[steps[step]]).toHaveBeenCalledTimes(1);
-      expect(opts[steps[step]]).toHaveBeenCalledWith({ repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
+      expect(opts[steps[step]]).toHaveBeenCalledWith({ repo: 'repo-a', ...(step === 'ci-heal' ? { resolveProfile: fixtureProfile } : {}), cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
       expect(result.skippedSteps).not.toContain(step);
       expect(result.phaseMs[step]).toBeGreaterThan(0);
     }
@@ -654,13 +654,13 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
     for (const [step, tickName] of Object.entries(steps)) {
       expect(opts[tickName]).toHaveBeenCalledTimes(1);
       expect(opts[tickName]).toHaveBeenCalledWith(step === 'fix'
-        ? { repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }
+        ? { repo: 'repo-a', resolveProfile: fixtureProfile, allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }
         : step === 'main-red-rebase'
           // The daemon wires a per-repo file-backed fairness ledger into the main-red rebase sweep only.
           ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) } }
           : ['hung-ci', 'missing-run'].includes(step)
             ? { repo: 'repo-a', apply: true } : ['ci-heal', 'promote-draft', 'notes'].includes(step)
-              ? { repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
+              ? { repo: 'repo-a', ...(step === 'ci-heal' ? { resolveProfile: fixtureProfile } : {}), cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
     }
     expect(result.skippedSteps ?? []).toEqual([]);
     expect(skipLines(log)).toEqual([]);
@@ -761,13 +761,13 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
       const options = opts[tickName].mock.calls[0][0];
       expect(opts[tickName]).toHaveBeenCalledTimes(1);
       expect(options).toEqual(step === 'fix'
-        ? { repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }
+        ? { repo: 'repo-a', resolveProfile: fixtureProfile, allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }
         : step === 'main-red-rebase'
           // The daemon wires a per-repo file-backed fairness ledger into the main-red rebase sweep only.
           ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) } }
           : ['hung-ci', 'missing-run'].includes(step)
             ? { repo: 'repo-a', apply: true } : ['ci-heal', 'promote-draft', 'notes'].includes(step)
-              ? { repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
+              ? { repo: 'repo-a', ...(step === 'ci-heal' ? { resolveProfile: fixtureProfile } : {}), cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
     }
   });
 
@@ -839,7 +839,7 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
       // R242 audit round 3 reverses earlier sharing expectations: these owners
       // must always run their historical paths for flush ordering and fresh writes.
       if (['ci-heal', 'notes'].includes(step)) {
-        expect(options).toEqual({ repo: options.repo, deadlineAt: expect.any(Number), cursor: undefined, now: expect.any(Function) });
+        expect(options).toEqual({ repo: options.repo, ...(step === 'ci-heal' ? { resolveProfile: fixtureProfile } : {}), deadlineAt: expect.any(Number), cursor: undefined, now: expect.any(Function) });
         seen.push([step, options.repo]);
         return fallback();
       }
@@ -891,8 +891,8 @@ describe('runTickAllRepos — the daemon tick now runs BOTH fix and ci-heal disp
     const out = await runTickAllRepos({
       repos: ['repo-a', 'repo-b'], fixTick, ciHealTick, hungCiTick: noopHungCiTick, mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick: noopMissingRunTick, notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick,
     });
-    expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }); // ci-heal still ran for repo-a despite fix's own failure there
-    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-b', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }); // fix still ran for repo-b despite ci-heal's own failure there
+    expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a', resolveProfile: fixtureProfile, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }); // ci-heal still ran for repo-a despite fix's own failure there
+    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-b', resolveProfile: fixtureProfile, allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }); // fix still ran for repo-b despite ci-heal's own failure there
     expect(out.refusals).toEqual(expect.arrayContaining([
       { repo: 'repo-a', prNumber: null, kind: 'tick-failed', why: 'fix broke' },
       { repo: 'repo-b', prNumber: null, kind: 'tick-failed', why: 'ci-heal broke' },
@@ -1318,8 +1318,8 @@ describe('runTickAllRepos — now runs THREE halves: fix, ci-heal, and hung-ci-r
     const out = await runTickAllRepos({
       repos: ['repo-a', 'repo-b'], fixTick, ciHealTick, hungCiTick, mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick: noopMissingRunTick, notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick,
     });
-    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
-    expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
+    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', resolveProfile: fixtureProfile, allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
+    expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a', resolveProfile: fixtureProfile, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
     expect(out.refusals).toEqual(expect.arrayContaining([{ repo: 'repo-a', prNumber: null, kind: 'tick-failed', why: 'hung-ci broke' }]));
   });
 });
@@ -1454,8 +1454,8 @@ describe('runTickAllRepos — now runs FOUR halves: fix, ci-heal, hung-ci-recove
       repos: ['repo-a', 'repo-b'], fixTick, ciHealTick, hungCiTick: noopHungCiTick, mainRedRebaseTick,
       missingRunTick: noopMissingRunTick, notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick,
     });
-    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
-    expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
+    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', resolveProfile: fixtureProfile, allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
+    expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a', resolveProfile: fixtureProfile, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
     expect(out.refusals).toEqual(expect.arrayContaining([{ repo: 'repo-a', prNumber: null, kind: 'tick-failed', why: 'rebase broke' }]));
   });
 });
@@ -1568,8 +1568,8 @@ describe('runTickAllRepos — now runs SIX halves, missing-run-recovery included
       repos: ['repo-a', 'repo-b'], fixTick, ciHealTick, hungCiTick: noopHungCiTick,
       mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick, notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick,
     });
-    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
-    expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
+    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', resolveProfile: fixtureProfile, allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
+    expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a', resolveProfile: fixtureProfile, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
     expect(out.refusals).toEqual(expect.arrayContaining([{ repo: 'repo-a', prNumber: null, kind: 'tick-failed', why: 'trigger broke' }]));
   });
 });
@@ -1669,7 +1669,7 @@ describe('runTickAllRepos — draft-first PRs: the promote-draft half rides THIS
       mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick: noopMissingRunTick, notesTick: noopNotesTick,
       promoteDraftTick,
     });
-    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
+    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', resolveProfile: fixtureProfile, allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
     expect(out.dispatched).toEqual(expect.arrayContaining([{ pr: 1, repo: 'repo-a' }]));
     expect(out.refusals).toEqual(expect.arrayContaining([{ repo: 'repo-a', prNumber: null, kind: 'tick-failed', why: 'promote-draft half: promote broke' }]));
   });
@@ -2946,7 +2946,6 @@ describe('runReconcileNotesAllRepos — cooperative deadline', () => {
 
 import { repoProfile as capabilityProfile } from '../../../scripts/lib/repo-profile.mjs';
 it.each([
-  [runReconcileFixDispatchAllRepos, 'fix'], [runReconcileCiHealDispatchAllRepos, 'ciHeal'],
   [runPromoteDraftDispatchAllRepos, 'review'], [runHungCiRecoveryAllRepos, 'ciHeal'],
   [runMainRedRebaseAllRepos, 'ciHeal'], [runMissingRunRecoveryAllRepos, 'ciHeal'],
 ])('filters disabled repos from each stage default roster (%s, %s)', async (run, capability) => {
@@ -2960,7 +2959,6 @@ it.each([
 });
 
 it.each([
-  [runReconcileFixDispatchAllRepos, 'fix'], [runReconcileCiHealDispatchAllRepos, 'ciHeal'],
   [runPromoteDraftDispatchAllRepos, 'review'], [runHungCiRecoveryAllRepos, 'ciHeal'],
   [runMainRedRebaseAllRepos, 'ciHeal'], [runMissingRunRecoveryAllRepos, 'ciHeal'],
 ])('refuses explicit pending and disabled targets and unknown targets (%s, %s)', async (run, capability) => {
@@ -2969,4 +2967,45 @@ it.each([
     resolveProfile: key => key === 'frontierui' ? { capabilities: { [capability]: false } } : capabilityProfile(key),
     tick, createLedger: () => ({}) });
   expect(tick.mock.calls.map(([o]) => o.repo)).toEqual([]);
+});
+
+
+it.each([[runReconcileFixDispatchAllRepos, 'fix'], [runReconcileCiHealDispatchAllRepos, 'ciHeal']])(
+  'ticks every repo regardless of %s capability', async (run, capability) => {
+    const resolveProfile = () => ({ capabilities: { [capability]: false } });
+    const tick = vi.fn(() => ({}));
+    await run({ resolveProfile, tick });
+    expect(tick.mock.calls.map(([o]) => o.repo)).toEqual(FIX_DISPATCH_DAEMON_REPOS);
+    expect(tick.mock.calls.every(([o]) => o.resolveProfile === resolveProfile)).toBe(true);
+    tick.mockClear();
+    const repos = ['longshoreai/longshore', 'frontier-ui/frontierui', 'outside/repo'];
+    await run({ resolveProfile, repos, tick });
+    expect(tick.mock.calls.map(([o]) => o.repo)).toEqual(repos);
+  });
+
+it('flushes owed writes and timeout follow-ups for a ciHeal-disabled repo without dispatch', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'disabled-ci-heal-'));
+  const owed = [{ pr: 7 }];
+  const flushOwed = vi.fn(() => owed.splice(0));
+  const flushTimeouts = vi.fn(async () => []);
+  const retryTimeout = vi.fn(async () => ({ status: 'requested' }));
+  const dispatch = vi.fn();
+  const reconcile = vi.fn(() => ({ dispatch: [
+    { kind: 'ci-heal', prNumber: 7 }, { kind: 'ci-timeout-rerun', prNumber: 8, timeoutRetry: {} },
+  ], refusals: [] }));
+  try {
+    const result = await realrunReconcileCiHealDispatchAllRepos({ repos: ['frontier-ui/frontierui'],
+      root: dir, unsupportedPath: join(dir, 'unsupported.json'),
+      resolveProfile: () => ({ capabilities: { ciHeal: false } }),
+      checkStaleness: () => ({ fresh: true, behind: 0 }), pollAttempts: () => [],
+      reconcile, flushOwed, flushTimeouts, retryTimeout, dispatch,
+    });
+    expect(flushOwed).toHaveBeenCalledWith('frontierui');
+    expect(owed).toEqual([]);
+    expect(flushTimeouts).toHaveBeenCalledWith({ root: dir, repo: 'frontier-ui/frontierui' });
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(retryTimeout).toHaveBeenCalledTimes(1);
+    expect(result.refusals).toEqual([expect.objectContaining({ kind: 'unsupported-repo', prNumber: 7 })]);
+    expect(dispatch).not.toHaveBeenCalled();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

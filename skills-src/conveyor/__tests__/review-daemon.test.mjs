@@ -49,7 +49,7 @@ vi.mock('../../../scripts/lib/author-stamp-restore.mjs', async (importOriginal) 
 });
 
 import {
-  runDaemonLoop, runReviewTick, runReviewTickAllRepos as realrunReviewTickAllRepos, REVIEW_DAEMON_REPOS, buildCliDaemonEffects, realSleep,
+  runDaemonLoop, runReviewTick as realRunReviewTick, runReviewTickAllRepos as realrunReviewTickAllRepos, REVIEW_DAEMON_REPOS, buildCliDaemonEffects, realSleep,
   REVIEW_DAEMON_LEASE_KEY, DEFAULT_INTERVAL_MS, defaultReapSessions, hasStaleMainRefusal, defaultAcquirableLaneCount,
   explainPendingNotDispatched, priorityNamesForLiveProcessPrs, runConvertAdvisoryTick, runConvertAdvisoryTickAllRepos as realrunConvertAdvisoryTickAllRepos,
   resolveConvertAdvisoryEnabled, sweepReviewHolds, operatorHoldsFromPlan, formatOperatorHoldsRecord, OPERATOR_HOLD_KINDS,
@@ -75,8 +75,9 @@ const reviewStatusCalls = (calls) => calls.filter((c) => !(String(c.spec?.add ??
 
 // Historical orchestration fixtures declare their synthetic repos explicitly; unknown targets stay denied.
 const fixtureProfile = key => ['repo-a', 'repo-b', 'repo-c', 'repo-bad', 'repo-good',
-  'review-cap-fixture/healthy', 'a/b', 'a', 'b', 'c', 'fui'].includes(key)
+  'waiting/repo', 'other/repo', 'review-cap-fixture/healthy', 'a/b', 'a', 'b', 'c', 'fui'].includes(key)
   ? { capabilities: { review: true, fix: true, ciHeal: true } } : capabilityProfile(key);
+const runReviewTick = options => realRunReviewTick({ resolveProfile: fixtureProfile, ...options });
 const runReviewTickAllRepos = options => realrunReviewTickAllRepos({ resolveProfile: fixtureProfile, ...options });
 const runConvertAdvisoryTickAllRepos = options => realrunConvertAdvisoryTickAllRepos({ resolveProfile: fixtureProfile, ...options });
 
@@ -1772,7 +1773,7 @@ describe('runReviewTickAllRepos — the Claude-auth-broken gate is computed ONCE
     const tick = vi.fn(() => ({ reviewsOwed: 0, dispatched: [], failed: [], refusals: 0 }));
     const out = runReviewTickAllRepos({ repos: ['repo-a'], tick });
     expect(out.authPaused).toBe(false);
-    expect(tick).toHaveBeenCalledWith({ repo: 'repo-a', paused: false, pauseReason: null });
+    expect(tick).toHaveBeenCalledWith({ repo: 'repo-a', resolveProfile: fixtureProfile, paused: false, pauseReason: null });
   });
 });
 
@@ -2200,7 +2201,7 @@ describe('runReviewTickAllRepos — one runReviewTick call per watched repo', ()
     // card x5kagse — `tick` here is a fake (not the real `runReviewTick`), so the auth gate defaults to
     // not-paused without any real IO; `paused`/`pauseReason` are still forwarded into every call, same as any
     // other shared per-tick fact (`acquirableLanes`, `readPrs`, ...).
-    expect(tick).toHaveBeenCalledWith({ dispatch, repo: 'repo-a', paused: false, pauseReason: null });
+    expect(tick).toHaveBeenCalledWith({ dispatch, repo: 'repo-a', resolveProfile: fixtureProfile, paused: false, pauseReason: null });
   });
 
   // Regression, #xvzwiew live-caught 2026-09-23: a repo whose `runReviewTick` catches its own reconcile
@@ -3051,19 +3052,48 @@ it.each(['idle', 'low', 'denied', 'floor throws', 'sample throws', 'infinite'])(
   });
 
 import { repoProfile as capabilityProfile } from '../../../scripts/lib/repo-profile.mjs';
-it.each([runReviewTickAllRepos, runConvertAdvisoryTickAllRepos])('filters review-disabled repos from the default review/advisory sweep', async (run) => {
+it.each([runReviewTickAllRepos, runConvertAdvisoryTickAllRepos])('ticks review-disabled repos in the default review/advisory sweep', async (run) => {
   const resolveProfile = (key) => ({ ...capabilityProfile(key), capabilities: { ...capabilityProfile(key)?.capabilities, review: key !== 'frontierui' } });
   const tick = vi.fn(() => ({ dispatched: [], failed: [] }));
   await run({ resolveProfile, tick, authGateOverride: () => ({ ok: true }) });
-  expect(tick.mock.calls.map(([o]) => o.repo)).toEqual(['web-everything/web-everything', 'plateauapp/plateau-app']);
+  expect(tick.mock.calls.map(([o]) => o.repo)).toEqual(Object.values(CONSTELLATION_REPOS).map(r => r.slug));
   tick.mockClear();
   await run({ resolveProfile, repos: Object.values(CONSTELLATION_REPOS).map(r => r.slug), tick, authGateOverride: () => ({ ok: true }) });
-  expect(tick.mock.calls.map(([o]) => o.repo)).toEqual(['web-everything/web-everything', 'plateauapp/plateau-app']);
+  expect(tick.mock.calls.map(([o]) => o.repo)).toEqual(Object.values(CONSTELLATION_REPOS).map(r => r.slug));
 });
 
-it.each([runReviewTickAllRepos, runConvertAdvisoryTickAllRepos])('refuses explicit pending and disabled review targets and unknown targets', async run => {
+it.each([runReviewTickAllRepos, runConvertAdvisoryTickAllRepos])('ticks explicit pending, disabled and unknown targets for reconciliation', async run => {
   const tick = vi.fn(() => ({ dispatched: [], failed: [] }));
   await run({ repos: ['longshoreai/longshore', 'longshore', 'frontier-ui/frontierui', 'outside/repo'],
     resolveProfile: key => key === 'frontierui' ? { capabilities: { review: false } } : capabilityProfile(key), tick });
-  expect(tick.mock.calls.map(([o]) => o.repo)).toEqual([]);
+  expect(tick.mock.calls.map(([o]) => o.repo)).toEqual(['longshoreai/longshore', 'longshore', 'frontier-ui/frontierui', 'outside/repo']);
+});
+
+
+it('sweeps disabled repo holds and reconciles without dispatching review or red-team recovery', () => {
+  const holdReconcile = vi.fn(() => [{ num: 7, repark: 're-parked' }]);
+  const reconcile = vi.fn(() => ({ dispatch: [{ kind: 'review', prNumber: 7 }], refusals: [] }));
+  const dispatch = vi.fn();
+  const redTeamOnSkip = vi.fn();
+  const result = realrunReviewTickAllRepos({ repos: ['frontier-ui/frontierui'],
+    resolveProfile: () => ({ capabilities: { review: false } }),
+    authGateOverride: () => ({ paused: false }), holdReconcile, reconcile, dispatch, redTeamOnSkip,
+    tagRound: vi.fn(), tagStatus: vi.fn(), statusCandidates: () => [],
+  });
+  expect(holdReconcile).toHaveBeenCalledWith(expect.objectContaining({ repo: 'frontier-ui/frontierui' }));
+  expect(reconcile).toHaveBeenCalledTimes(1);
+  expect(result.holdReconcile).toEqual([expect.objectContaining({ num: 7, repark: 're-parked' })]);
+  expect(result.reviewsOwed).toBe(1);
+  expect(dispatch).not.toHaveBeenCalled();
+  expect(redTeamOnSkip).not.toHaveBeenCalled();
+});
+
+it('reconciles a review-disabled advisory repo without dispatching conversion', async () => {
+  const reconcile = vi.fn(() => ({ dispatch: [{ kind: 'convert-advisory', prNumber: 7 }], refusals: [] }));
+  const convertAdvisory = vi.fn();
+  const result = await realrunConvertAdvisoryTickAllRepos({ repos: ['frontier-ui/frontierui'],
+    resolveProfile: () => ({ capabilities: { review: false } }), reconcile, convertAdvisory });
+  expect(reconcile).toHaveBeenCalledTimes(1);
+  expect(convertAdvisory).not.toHaveBeenCalled();
+  expect(result.skipped).toEqual([expect.objectContaining({ prNumber: 7, reason: 'unsupported-repo' })]);
 });

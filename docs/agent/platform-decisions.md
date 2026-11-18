@@ -5630,6 +5630,9 @@ frontierui or plateau-app. Six clauses:
 1. **Capability, not repo identity.** A conveyor stage refuses a repo only when that repo's profile
    (`we:scripts/lib/constellation-repos.mjs`) lacks the capability for the stage. A refusal keyed on "not WE"
    is the defect this rule removes. This supersedes #3803 Fork 5's acceptance of the fix-path refusal.
+   Capability filters belong at dispatch/spawn calls inside each tick, never on a lifecycle tick's repo
+   roster: reconciliation, sweeps, holds, owed-write flushes and timeout handling still run for every repo.
+   Pure sweepers whose only work is dispatch may filter their roster.
 2. **One backlog.** Work for every constellation repo lives in the WE backlog; the repo is carried by the
    scope prefix (`we:` / `fui:` / `plateau:`), never by a second backlog.
 3. **Item-less PRs are fixable.** A PR that maps to no backlog item is attributed to the PR itself, with scope
