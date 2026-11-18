@@ -172,6 +172,8 @@ export function laneGitHardeningEnv(env = process.env, { remoteProbe = false, cr
   // No prompt either: an inherited askpass program (a caller inside a lane controls its env) would run on a credential
   // request, and a terminal prompt would hang an unattended transport.
   const out = { ...env, GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' };
+  // Lane-owned replace refs must never substitute the commits used by history and review proofs.
+  out.GIT_NO_REPLACE_OBJECTS = '1';
   delete out.GIT_EXTERNAL_DIFF;
   delete out.GIT_ASKPASS;
   delete out.SSH_ASKPASS;
@@ -207,6 +209,28 @@ export function laneGitHardeningEnv(env = process.env, { remoteProbe = false, cr
     out[`GIT_CONFIG_VALUE_${start + i}`] = v;
   });
   out.GIT_CONFIG_COUNT = String(start + pins.length);
+  return out;
+}
+
+/**
+ * {@link laneGitHardeningEnv} for a git call that proves a lane's history (parents, ranges, diffs): also points the
+ * graft file at `/dev/null`, since replace refs off still reads `<git-dir>/info/grafts` and a lane-written one forges
+ * parents, and pins `core.commitGraph=false`: a lane-written commit-graph supplies commit parents without being an
+ * object, so neither index-pack nor GIT_NO_REPLACE_OBJECTS checks it (PR #7012 self-review). Neither belongs in the
+ * shared env: the health-watch fresh-safety probe resolves `--git-path info/grafts` to DETECT a lane grafts file (a
+ * pinned path would hide it), and lane-repair both reads the lane's on-disk `core.commitGraph` to decide whether to
+ * persist `false` and runs `git commit-graph write` to regenerate a shared store's graph (a command-scope `false`
+ * would mask the first and make the second write nothing). Pure.
+ * @param {Record<string,string|undefined>} env
+ * @param {Parameters<typeof laneGitHardeningEnv>[1]} [options]
+ * @returns {Record<string,string|undefined>}
+ */
+export function laneHistoryProofEnv(env = process.env, options) {
+  const out = { ...laneGitHardeningEnv(env, options), GIT_GRAFT_FILE: '/dev/null' };
+  const at = Number.parseInt(String(out.GIT_CONFIG_COUNT ?? '0'), 10);
+  out[`GIT_CONFIG_KEY_${at}`] = 'core.commitGraph';
+  out[`GIT_CONFIG_VALUE_${at}`] = 'false';
+  out.GIT_CONFIG_COUNT = String(at + 1);
   return out;
 }
 
