@@ -394,16 +394,60 @@ describe('overlay main sync', () => {
   });
 
   it.each([
-    [124, 'remote termination unconfirmed'],
-    [124, 'ordinary timeout'],
     [1, remoteUnconfirmed],
-    [124, '', remoteUnconfirmed],
   ])('keeps test failure handling for other status/stderr combinations (%s, %s)', async (status, stderr, stdout = '') => {
     const f = fixture({ exhausted: true });
     f.deps.testRunner = async () => ({ status, stderr, stdout });
     await expect(job(f)).rejects.toThrow('operator review required');
     expect(f.pushes).toEqual([]); expect(synced(f)).toEqual([]);
     attempted(f); unchanged(f);
+  });
+
+  it.each([
+    [124, 'remote termination unconfirmed'],
+    [124, 'ordinary timeout'],
+    [124, '', remoteUnconfirmed],
+    [1, 'heavy-admission: remote-timeout'],
+    [75, 'host overloaded; 480s wait exhausted'],
+    [1, 'heavy-admission timed-out'],
+    [1, 'heavy-admission timed out'],
+    [1, 'heavy-command admission: run exceeded 480000ms and was stopped.'],
+  ])('records admission timeout without consuming persisted failure state (%s, %s)', async (status, stderr, stdout = '') => {
+    const f = fixture({ exhausted: true }), outcomes = [];
+    ageFailure(f);
+    const before = json(sidecar(f));
+    f.deps.appendDaemonEvent = e => outcomes.push(e);
+    f.deps.testRunner = vi.fn(async () => ({ status, stderr, stdout }));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(await job(f)).toEqual({ pushed: false, step: 'tests', status: 'timeout' });
+    expect(f.deps.testRunner).toHaveBeenCalledOnce();
+    expect(json(sidecar(f))).toEqual(before);
+    expect(f.pushes).toEqual([]); expect(alerts(f)).toEqual([]);
+    expect(fs.existsSync(f.env.WE_NEEDS_YOU_FEED)).toBe(false);
+    expect(outcomes).toEqual([{ kind: 'overlay-main-sync-timeout', detail: expect.objectContaining({ step: 'tests', status: 'timeout' }) }]);
+    expect(f.events).toContainEqual(expect.objectContaining({ kind: 'overlay-main-chunk-timing',
+      chunkIndex: 1, files: 2, wallMs: expect.any(Number), outcome: 'timeout', attempt: 'initial' }));
+    expect(log.mock.calls.flat().join('\n')).toMatch(/chunk=1 files=2 wallMs=\d+ outcome=timeout/);
+    expect(fs.existsSync(marker(f))).toBe(false); unchanged(f);
+  });
+
+  it('keeps a test assertion timeout as a test failure and emits failure timing', async () => {
+    const f = fixture({ exhausted: true });
+    f.deps.testRunner = vi.fn(async () => ({ status: 1, stdout: 'FAIL worker0.test.mjs: Test timed out in 5000ms', stderr: '' }));
+    await expect(job(f)).rejects.toMatchObject({ step: 'tests', message: expect.stringContaining('operator review required') });
+    attempted(f);
+    expect(f.events).toContainEqual(expect.objectContaining({ kind: 'overlay-main-chunk-timing',
+      outcome: 'failure', files: 2, chunkIndex: 1, wallMs: expect.any(Number) }));
+  });
+
+  it.each([undefined, '2400000', '1000'])('preserves the operator admission timeout override %s and a consistent wait', async override => {
+    const f = fixture();
+    delete f.env.WE_HEAVY_ADMISSION_FAST_RUN_TIMEOUT_MS;
+    if (override !== undefined) f.env.WE_HEAVY_ADMISSION_FAST_RUN_TIMEOUT_MS = override;
+    await job(f);
+    const invocation = f.deps.testRunner.mock.calls[0][0];
+    expect(invocation.env.WE_HEAVY_ADMISSION_FAST_RUN_TIMEOUT_MS).toBe(override ?? '480000');
+    expect(invocation.args).toContain(`--wait-ms=${Math.max(540000, Number(override ?? 480000))}`);
   });
 
   it.each(['kick', 'worker'])('%s skips a stale registration without attention or failure memory, until one hour or registration changes', async entry => {
@@ -475,6 +519,7 @@ describe('overlay main sync', () => {
 
   it.each(['failed', 'missing', 'empty'])('later chunk %s evidence refuses push', async outcome => {
     const f = fixture({ count: 101 }), passing = f.deps.testRunner;
+    delete f.env.WE_HEAVY_ADMISSION_FAST_RUN_TIMEOUT_MS;
     let calls = 0;
     f.deps.testRunner = vi.fn(async options => {
       const result = await passing(options);
@@ -613,8 +658,12 @@ describe('overlay main sync', () => {
     if (outcome === 'failed') f.deps.testRunner = async () => ({ status: 1, stdout: '', stderr: 'broken tests' });
     if (outcome === 'busy') { fs.mkdirSync(dirname(marker(f)), { recursive: true }); fs.writeFileSync(marker(f), 'owner'); }
     await job(f).catch(() => {});
-    expect(log).toHaveBeenCalledTimes(outcome === 'busy' ? 1 : 2);
+    expect(log).toHaveBeenCalledTimes(outcome === 'busy' ? 1 : 4);
     if (outcome !== 'busy') expect(log.mock.calls[0][0]).toContain('filteredNotRunnable: 0');
+    if (outcome !== 'busy') {
+      expect(log.mock.calls[1][0]).toContain('chunk-budget files=2');
+      expect(log.mock.calls[2][0]).toMatch(/chunk-timing .*chunk=1 files=2 wallMs=\d+ outcome=/);
+    }
     expect(events).toHaveLength(1);
     expect(events[0].kind).toBe(`overlay-main-sync-${outcome === 'busy' ? 'skipped' : outcome}`);
   });
@@ -1140,8 +1189,11 @@ describe('overlay main sync', () => {
     expect(state.firstFailureAt[ref]).toBe(started);
     expect(state.lastSyncedMain[ref]).toBeUndefined();
     expect(events).toEqual([{ kind: 'overlay-main-sync-failed', detail: expect.objectContaining({ ref, step: 'push' }) }]);
-    expect(log).toHaveBeenCalledTimes(2);
+    expect(log).toHaveBeenCalledTimes(4);
     expect(log.mock.calls[0][0]).toContain('filteredNotRunnable: 0');
+    expect(log.mock.calls[1][0]).toContain('chunk-budget files=2');
+    expect(log.mock.calls[2][0]).toMatch(/chunk-timing .*outcome=passed/);
+    expect(log.mock.calls[3][0]).toContain('step=push');
     expect(alerts(f)).toEqual([]); expect(synced(f)).toEqual([]);
     expect(ok(f.origin, ['rev-parse', ref]) === f.oldSha).toBe(mode !== 'published');
     unchanged(f);
@@ -1240,6 +1292,7 @@ describe('overlay main sync', () => {
 
   it('a large related set (under the cap) runs in full, sequentially in fast-lane-sized chunks with distinct reports before push', async () => {
     const f = fixture({ count: 101 }), passing = f.deps.testRunner;
+    delete f.env.WE_HEAVY_ADMISSION_FAST_RUN_TIMEOUT_MS;
     let active = false;
     f.deps.testRunner = vi.fn(async options => {
       expect(active).toBe(false); active = true;
@@ -1252,6 +1305,13 @@ describe('overlay main sync', () => {
     const calls = f.deps.testRunner.mock.calls.map(([o]) => o.args);
     expect(calls.map(args => args.filter(a => a.endsWith('.test.mjs')).length)).toEqual([30, 30, 30, 12]);
     expect(new Set(f.deps.testRunner.mock.calls.map(([o]) => o.testReport)).size).toBe(4);
+    expect(f.deps.testRunner.mock.calls.map(([o]) => o.env.WE_HEAVY_ADMISSION_FAST_RUN_TIMEOUT_MS))
+      .toEqual(['1200000', '1200000', '1200000', '720000']);
+    expect(calls.map(args => args.find(arg => arg.startsWith('--wait-ms='))))
+      .toEqual(['--wait-ms=1200000', '--wait-ms=1200000', '--wait-ms=1200000', '--wait-ms=720000']);
+    expect(f.events.filter(e => e.kind === 'overlay-main-chunk-timing')).toEqual(
+      [30, 30, 30, 12].map((files, index) => expect.objectContaining({ chunkIndex: index + 1,
+        files, wallMs: expect.any(Number), outcome: 'passed', attempt: 'initial' })));
     expect(alerts(f)).toEqual([]); unchanged(f);
   });
 

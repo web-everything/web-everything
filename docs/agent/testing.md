@@ -2848,6 +2848,19 @@ merge/hold assertions. Several read stages can otherwise exhaust a child-process
 deadline with production waits alone. Verify production delay defaults separately
 in the retry helper tests.
 
+### Overlay main-sync admission timeouts
+
+Overlay main-sync chunks already use heavy admission. Their timeout defaults to
+60 seconds per file, with an eight-minute floor and twenty-minute ceiling;
+`WE_HEAVY_ADMISSION_FAST_RUN_TIMEOUT_MS` retains operator precedence. The queue
+wait budget must be at least that timeout. Each attempt emits
+`overlay-main-chunk-timing` with its chunk index, file count, wall time and outcome.
+Admission timeouts stop the sync with test-step status `timeout`, preserving failure
+memory and attention budgets; they never trigger flake reruns. Remote termination
+unconfirmed retains its separate skip path. Empty-origin test fixtures can emit
+harmless Git warnings; successful sibling-clone stderr is captured separately.
+Cover these paths in `daemon-rebuild-overlay-main-sync.test.mjs` through heavy admission.
+
 ### Overlay dispatch launch timeouts
 
 The real overlay dispatch smoke keeps its five-minute budget per attempt. Resolve

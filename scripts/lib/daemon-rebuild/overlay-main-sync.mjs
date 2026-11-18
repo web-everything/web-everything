@@ -16,7 +16,7 @@ import { buildReverseImportGraph, testDepths, isVitestTestFile, isGraphSourceFil
 import { alertsFilePath } from './state.mjs';
 import { REBUILD_IDENTITY_ENV } from './shared.mjs';
 import { tryLease } from '../../operations/coordination-lock.mjs';
-import { resolveFastMaxFiles } from '../../readiness/heavy-queue-projection.mjs';
+import { resolveFastMaxFiles, DEFAULT_FAST_RUN_TIMEOUT_MS, FAST_RUN_TIMEOUT_ENV, resolveFastRunTimeoutMs } from '../../readiness/heavy-queue-projection.mjs';
 import { buildHeavyTestInvocation, runHeavyTests, heavyTestReport } from './auto-rebase.mjs';
 import { resolveAdvisoryInWorktree } from './advisory-merge.mjs';
 
@@ -580,11 +580,29 @@ async function runnableTestFiles({ scratch, env, runner = spawnSync }) {
   }
 }
 
+function buildSyncHeavyTestInvocation({ root, scratch, selected, testReport, env, io }) {
+  // Include contention headroom per file, capped at twenty minutes. The operator can
+  // override this through admission's existing environment setting.
+  const timeoutMs = env[FAST_RUN_TIMEOUT_ENV] !== undefined ? resolveFastRunTimeoutMs(env)
+    : Math.min(20 * 60_000, Math.max(DEFAULT_FAST_RUN_TIMEOUT_MS, selected.length * 60_000));
+  const invocation = buildHeavyTestInvocation({ root, scratch, selected, testReport,
+    env: { ...env, [FAST_RUN_TIMEOUT_ENV]: env[FAST_RUN_TIMEOUT_ENV] ?? String(timeoutMs) }, io });
+  invocation.args = invocation.args.map(arg => arg.startsWith('--wait-ms=') ? `--wait-ms=${Math.max(540_000, timeoutMs)}` : arg);
+  return invocation;
+}
+
 async function syncTestEvidence({ root, scratch, selected, testReport, env, io, runner }) {
   io.rmSync(testReport, { force: true }); // Never consume a previous attempt's evidence.
-  const invocation = buildHeavyTestInvocation({ root, scratch, selected, testReport, env, io });
+  const invocation = buildSyncHeavyTestInvocation({ root, scratch, selected, testReport, env, io });
+  console.error(`overlay-main-sync chunk-budget files=${selected.length} timeoutMs=${resolveFastRunTimeoutMs(invocation.env)} source=${env[FAST_RUN_TIMEOUT_ENV] !== undefined ? 'environment' : 'standard'}`);
   const result = await (runner ?? (options => runHeavyTests(options, { io })))(invocation);
   if (remoteUnconfirmed(result)) return { remoteUnconfirmed: true };
+  if (result?.status === 124 || result?.error?.code === 'ETIMEDOUT'
+    || ((result?.status !== 0 || result?.error) && /remote-timeout|wait exhausted|(?:heavy-admission|heavy-command admission)[^\r\n]*(?:timed[ -]?out|run exceeded \d+ms)/i.test(
+      `${result?.stdout ?? ''}\n${result?.stderr ?? ''}\n${result?.error?.message ?? ''}`))) {
+    throw Object.assign(new Error('heavy-admission timeout; retry on a later sync tick'),
+      { step: 'tests', status: 'timeout', stderrTail: testStderrTail(result) });
+  }
   let validatedFailure = false;
   if (result?.status === 1) {
     try {
@@ -782,9 +800,12 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     // A real, clean clone, never a link: the Forge manifest refuses a symlinked or dirty sibling, so a link here
     // forced every scratch test run back onto the Mac. A local clone is cheap (hardlinked objects) and committed-only.
     if (io.existsSync(frontier)) output(git(['clone', '--quiet', '--local', frontier, join(scratchParent, 'frontierui')], scratchParent));
+    // Test fixtures deliberately clone unborn bare origins (e.g. daemon-self-sync.test.mjs).
+    // Their harmless empty-repository warnings belong to test output; this clone's
+    // successful stderr is captured and is never included in testStderrTail.
     setStep('test-select');
     // Discover tests in the environment they will run in: reuse the test run's own construction, never a copy.
-    const { env: testEnv } = buildHeavyTestInvocation({ root, scratch, selected: [], testReport: join(scratchParent, 'inventory.json'), env, io });
+    const { env: testEnv } = buildSyncHeavyTestInvocation({ root, scratch, selected: [], testReport: join(scratchParent, 'inventory.json'), env, io });
     const runnable = await runnableTestFiles({ scratch, env: testEnv, runner: deps.testListRunner });
     const scratchReal = io.realpathSync(scratch);
     tests = tests.filter(file => runnable.has(join(scratchReal, file)));
@@ -804,9 +825,22 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     const { value: reruns, source: rerunsSource } = resolveOverlayFlakeReruns(env);
     for (let offset = 0; offset < tests.length; offset += chunkSize) {
       const chunk = tests.slice(offset, offset + chunkSize);
-      const check = (selected, attempt, tree = scratch, runner = deps.testRunner) => syncTestEvidence({
-        root, scratch: tree, selected, env, io, runner,
-        testReport: join(scratchParent, `tests-${offset / chunkSize}-${attempt}.json`) });
+      const check = async (selected, attempt, tree = scratch, runner = deps.testRunner) => {
+        const started = Date.now();
+        let status = 'failure';
+        try {
+          const evidence = await syncTestEvidence({ root, scratch: tree, selected, env, io, runner,
+            testReport: join(scratchParent, `tests-${offset / chunkSize}-${attempt}.json`) });
+          status = evidence.remoteUnconfirmed ? 'timeout' : evidence.green ? 'passed' : 'failure';
+          return evidence;
+        } catch (error) { status = error.status === 'timeout' ? 'timeout' : 'failure'; throw error; }
+        finally {
+          const timing = { kind: 'overlay-main-chunk-timing', ref, chunkIndex: offset / chunkSize + 1,
+            files: selected.length, wallMs: Date.now() - started, outcome: status, attempt };
+          console.error(`overlay-main-sync chunk-timing ref=${cleanText(ref)} chunk=${timing.chunkIndex} files=${timing.files} wallMs=${timing.wallMs} outcome=${status} attempt=${attempt}`);
+          try { event(root, timing, { env }); } catch { /* Timing must not change the verdict. */ }
+        }
+      };
       let evidence = await check(chunk, 'initial');
       // The remote process may still be running: neither publication nor a local rerun is safe.
       if (evidence.remoteUnconfirmed) return await skip('remote-termination-unconfirmed');
@@ -849,7 +883,10 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
           && evidence.failedAssertions.every(identity => identity !== null)
           && comparison.complete && comparison.failedAssertions.every(identity => identity !== null)
           && coveredWithMultiplicity(evidence.failedAssertions, comparison.failedAssertions);
-      } catch { /* Unknown main evidence must retain the ordinary operator-review failure. */ }
+      } catch (error) {
+        if (error.status === 'timeout') throw error;
+        // Unknown main evidence must retain the ordinary operator-review failure.
+      }
       setStep('tests');
       if (mainRed) {
         updateSyncState(sidecar(root, env), state => {
@@ -903,6 +940,11 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     return { pushed: true, ref, from, to, tests };
   } catch (cause) {
     if (cause.transientGit && !mergeConflict) return await skip('transient-git');
+    if (cause.status === 'timeout') {
+      await outcome(root, env, ref, 'timeout', { step: 'tests', status: 'timeout', main,
+        reason: cause.message, stderrTail: cause.stderrTail }, deps);
+      return { pushed: false, step: 'tests', status: 'timeout' };
+    }
     const failedStep = cause.step ?? step;
     const message = cleanText(cause.message ?? cause);
     const error = Object.assign(new Error(message.startsWith(`${failedStep}: `) ? message : `${failedStep}: ${message}`),
