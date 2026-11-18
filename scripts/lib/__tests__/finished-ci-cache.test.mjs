@@ -42,6 +42,17 @@ function fixture(output = '{"total_count":1,"jobs":[{"status":"completed"}]}') {
 }
 
 describe('finished CI cache (card 309)', () => {
+  it('keeps job-log cache classification while permitting escape sequences only at execution', () => {
+    const f = fixture('ANSI log bytes\n');
+    expect(runGhSync(log, f.opts)).toBe('ANSI log bytes\n');
+    expect(runGhSync(log, f.opts)).toBe('ANSI log bytes\n');
+    expect(f.spawn).toHaveBeenCalledTimes(2);
+    expect(f.spawn.mock.calls[1][1]).toEqual([...log, '--allow-escape-sequences']);
+    expect(f.files()).toHaveLength(1);
+    expect(f.rows().at(-1)).toMatchObject({ outcome: 'ci_cache_hit', kind: 'job-log' });
+    expect(log).toEqual(['api', 'repos/o/r/actions/jobs/456/logs']);
+  });
+
   it.each([false, true])('amortizes unfinished proof reads across repeated polls (CLI=%s)', cli => {
     for (const args of [log, jobs]) {
       const f = fixture();

@@ -1854,6 +1854,13 @@ function logFinishedCiHit(args, cls, throttle, env) {
   });
 }
 
+/** Permit ANSI-bearing job logs on gh 2.104+, without mutating the caller's argv. */
+export function allowJobLogEscapeSequences(args) {
+  return args[0] === 'api' && !args.includes('--allow-escape-sequences')
+    && args.some(arg => typeof arg === 'string' && !arg.startsWith('-') && /\/actions\/jobs\/\d+\/logs$/.test(arg))
+    ? [...args, '--allow-escape-sequences'] : args;
+}
+
 /**
  * Run `gh` with `args`, gated by the concurrency semaphore and retried with bounded backoff on a rate-limit-
  * shaped failure. TRANSPARENT: on the attempt that finally returns or throws, this behaves EXACTLY like a
@@ -1894,6 +1901,7 @@ function logFinishedCiHit(args, cls, throttle, env) {
  * card 300 (live 2026-10-14: dispatch-dry-run 676s, reconcile-dry-run 215s on wev-health-watch).
  */
 export function runGhSync(args, opts = {}) {
+  const executionArgs = allowJobLogEscapeSequences(args);
   const { throttle = {}, ...execOpts } = opts;
   if (isGhLocalOnly(args)) return runGhSyncUnmemoized(args, opts);
   const childEnv = execOpts.env || process.env;
@@ -1918,7 +1926,8 @@ export function runGhSync(args, opts = {}) {
     recordFinishedCiProof(cls, completedBeforeRead, { ...cache, nowMs: (throttle.now || Date.now)() });
   }
   // Eligible CI reads bypass the smoke memo: it must not defeat revalidation or cache running CI.
-  const result = cls ? runGhSyncUnmemoized(args, opts) : runGhSyncReadMemo(args, opts);
+  // Classify/cache the original argv: the gh output-safety flag does not change the payload.
+  const result = cls ? runGhSyncUnmemoized(executionArgs, opts) : runGhSyncReadMemo(executionArgs, opts);
   if (!isGhDeferred(result)) invalidateForWrite(args, cache);
   if (cls && (typeof result === 'string' || Buffer.isBuffer(result)) && !isGhDeferred(result)) {
     const storable = cls.kind === 'job-log' ? completedBeforeRead : finishedCiStorable(cls, result, { runCompleted: completedBeforeRead });
