@@ -791,6 +791,67 @@ describe('standards input parity', () => {
     } finally { output.mockRestore(); }
   });
 
+  function cleanDiffStandardsFixture() {
+    const f=fixture();
+    f.argv=['npm','run','check:standards'];
+    for(const args of [['init','--quiet'],['add','.'],['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','--quiet','-m','fixture']]) {
+      const result=spawnSync('git',args,{cwd,encoding:'utf8',timeout:10000});
+      expect(result.status,result.stderr).toBe(0);
+    }
+    return f;
+  }
+
+  it.each(['stdout','stderr','both'])('accepts the real no-tier-lines producer across chunk boundaries on %s when the local diff agrees', async stream => {
+    const f=cleanDiffStandardsFixture(),original=f.exec;
+    const scan=scanDiffBranchCoverage(cwd,{base:'HEAD'});
+    expect(scan.status).toBe('no-scope');
+    const line=`\x1b[36m  ${scan.message}\x1b[0m\n`;
+    f.exec=vi.fn(async call=>{
+      const result=await original(call);
+      if(isRun(call)) {
+        for(const source of stream==='both'?['stdout','stderr']:[stream]) {
+          call.onOutput(line.slice(0,40),source);
+          call.onOutput(line.slice(40),source);
+        }
+      }
+      return result;
+    });
+    const log=vi.fn();
+    expect(await runWithRemoteDecision({argv:f.argv,cwd,env:{},lockRoot:f.lockRoot,log,loadPerCore:()=>0,
+      policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always'}}}),
+      remoteExec:async()=>{
+        const result=await runRemote(f);
+        expect(result).toMatchObject({mode:'remote',code:0});
+        return result;
+      },
+    })).toMatchObject({handled:true,exitCode:0});
+    expect(log.mock.calls.flat().join('\n')).not.toContain('falling back to local admission');
+  });
+
+  it.each(['changed tier file','invalid base','prefixed line','suffixed line'])('falls back for no-tier-lines output with %s', async fault => {
+    const f=cleanDiffStandardsFixture(),original=f.exec;
+    let line=scanDiffBranchCoverage(cwd,{base:'HEAD'}).message;
+    if(fault==='changed tier file') {
+      mkdirSync(join(cwd,'scripts/lib'),{recursive:true});
+      writeFileSync(join(cwd,'scripts/lib/disposition-judge.mjs'),'export const changed = true;\n');
+      expect(scanDiffBranchCoverage(cwd,{base:'HEAD'}).status).not.toBe('no-scope');
+    }
+    if(fault==='invalid base') line=line.replace('(base HEAD)','(base missing-base)');
+    if(fault==='prefixed line') line=`prefix ${line}`;
+    if(fault==='suffixed line') line+=' suffix';
+    f.exec=vi.fn(async call=>({...await original(call),...(isRun(call)?{stdout:line}: {})}));
+    const log=vi.fn();
+    expect(await runWithRemoteDecision({argv:f.argv,cwd,env:{},lockRoot:f.lockRoot,log,loadPerCore:()=>0,
+      policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always'}}}),
+      remoteExec:async()=>{
+        const result=await runRemote(f);
+        expect(result).toMatchObject({mode:'cancelled',terminated:true,reason:'incomplete-standards-inputs',detail:line});
+        return result;
+      },
+    })).toEqual({handled:false});
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('falling back to local admission'));
+  });
+
   it.each(['skipping', 'no-scope', 'ENOENT', 'no changed tier lines; nothing to attribute'])
   ('falls back through local admission after confirmed standards completion reports %s', async outcome => {
     const f = fixture(), original = f.exec;

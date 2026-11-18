@@ -14,6 +14,7 @@ import {resolveTransport,runnerSupportsBundle,planBundle,mainFreshness,bundleEvi
 import {routeNeedsGit,selectionUnproven} from './needs-git-route.mjs';
 import {writeJsonAtomic} from '../lib/atomic-json-file.mjs';
 import {SKIP_REASON, SECTION_INPUTS, DYNAMIC_SECTIONS, createSectionGate} from '../lib/standards-sections.mjs';
+import {scanDiffBranchCoverage} from '../lib/diff-branch-coverage.mjs';
 
 const ROOT = '/srv/forge-exec';
 const LIMIT = 4 * 1024 * 1024;
@@ -1391,6 +1392,12 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
     const plain = line.replace(/\x1b\[[0-9;]*m/g, '').trim();
     const prefix = `local ${SKIP_REASON}: `;
     let benign = false;
+    const noTierLines = /^Diff branch coverage \(base ([^\s()]+)\): no changed tier lines; nothing to attribute\.$/.exec(plain);
+    if (noTierLines) {
+      try {
+        benign = scanDiffBranchCoverage(cwd, {base:noTierLines[1]}).status === 'no-scope';
+      } catch { /* incomplete local evidence requires fallback */ }
+    }
     if (plain.startsWith(prefix) && argv.includes('--local') && standardsFiles.length) {
       try {
         // bindGit above verifies cwd is the repository root.
