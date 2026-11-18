@@ -24,7 +24,7 @@ export function parseAgyUsage(screen, now = Date.now()) {
   const group = text.split(/GEMINI MODELS/i)[1]?.split(/\n\s*[A-Z][A-Z ]+ MODELS/)[0];
   if (!group || !Number.isFinite(now)) throw new Error('Incomplete Gemini usage screen');
   const window = label => {
-    const match = group.match(new RegExp(`${label} Limit Remaining\\s+[^\\d%\\n+-]*?(\\d+(?:\\.\\d+)?)%\\s+Refreshes in[ \\t]+(?:(\\d+)h[ \\t]*)?(?:(\\d+)m)?[ \\t]*(?=\\n|$)`, 'i'));
+    const match = group.match(new RegExp(`${label} Limit Remaining\\s+[^\\d%\\n+-]*?(\\d+(?:\\.\\d+)?)%\\s+Refreshes in[ \\t]+(?:(\\d+)h[ \\t]*)?(?:(\\d+)m)?[ \\t]*(?=\\n)`, 'i'));
     if (!match || (!match[2] && !match[3])) throw new Error(`Missing ${label} usage or refresh time`);
     const remaining = Number(match[1]);
     const seconds = Number(match[2] || 0) * 3600 + Number(match[3] || 0) * 60;
@@ -83,7 +83,7 @@ export function collectAgyUsage({ home = homedir(), timeoutMs = 45000, spawnFn =
     later(() => finish(new Error('agy usage timed out; inspect agy startup or increase timeoutMs and retry')), timeoutMs);
     later(() => {
       send('\x1b');
-      later(() => { requested = true; send('/usage\r'); }, stepMs);
+      later(() => { requested = true; screen = ''; send('/usage\r'); }, stepMs);
     }, startupMs);
   });
 }

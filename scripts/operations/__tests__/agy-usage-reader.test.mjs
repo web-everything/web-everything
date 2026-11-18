@@ -11,7 +11,8 @@ Weekly Limit Remaining
 Refreshes in 167h 59m
 Five Hour Limit Remaining
 [bar] 99.99%
-Refreshes in 4h 59m`;
+Refreshes in 4h 59m
+`;
 const settings = { minIntervalMinutes: 15, timeoutMs: 45000 };
 afterEach(() => vi.useRealTimers());
 
@@ -87,6 +88,16 @@ describe('PTY collection', () => {
     await assertion;
     expect(h.kill).toHaveBeenCalledTimes(1);
     expect(h.kill).toHaveBeenCalledWith(-1234, "SIGKILL");
+  });
+  it('ignores usage-looking startup output and an unfinished refresh line', async () => {
+    const h = processFixture();
+    const assertion = expect(h.promise).rejects.toThrow('timed out');
+    h.child.stdout.write(SCREEN);
+    await vi.advanceTimersByTimeAsync(3300);
+    h.child.stdout.write(SCREEN.slice(0, -2));
+    await vi.advanceTimersByTimeAsync(41700);
+    await assertion;
+    expect(h.writes).toEqual(['\x1b', '/usage\r']);
   });
   it('fails closed instead of answering a folder-trust prompt', async () => {
     const h = processFixture();
