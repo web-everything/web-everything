@@ -284,9 +284,23 @@ export function stateChangingToolCalls(transcriptText, { allowedRoots = [], home
   }
   const out = [];
   for (const step of steps.values()) {
-    if (!step.isTool || step.errored) continue;
+    if (!step.isTool || (step.errored && step.name !== 'read_file')) continue;
     const name = step.name;
     if (typeof name !== 'string' || !READ_ONLY_AGY_TOOLS.includes(name)) { out.push(typeof name === 'string' ? name : '<unnamed tool>'); continue; }
+    if (name === 'read_file') {
+      let params = step.params;
+      if (typeof params === 'string') { try { params = JSON.parse(params); } catch { params = null; } }
+      // Carbon must name a direct path, not merely bury one in a list or nested options.
+      const paths = params && typeof params === 'object' && !Array.isArray(params)
+        ? Object.entries(params).filter(([key]) => PATH_PARAM_KEY.test(key)).map(([, value]) => value) : [];
+      const laneRoots = lanes.map(canonicalPath).filter(Boolean);
+      if (!cwd || !paths.length || paths.some(p => typeof p !== 'string' || !p.trim()
+        || readsOutside(p, laneRoots, cwd))
+        || pathLeaves(params, false).some(p => readsOutside(p, laneRoots, cwd))) {
+        out.push('read_file (missing or invalid in-lane path)');
+        continue;
+      }
+    }
     // A completed READ must stay inside the juror lane or this conversation's brain folder.
     // Every path-like parameter is judged — relative, `~`, URI, array and nested forms included — after following symlinks.
     if (roots.length && name !== 'finish' && step.params != null) {
@@ -485,9 +499,25 @@ export async function runAgyReviewJuror({ request, laneCwd, model, watch = [], d
     let transcriptText = '';
     if (transcriptFile) {
       try { transcriptText = readFile(transcriptFile); } catch { reasons.push('transcript unreadable — escape check incomplete'); }
-      // Fail closed: a transcript with any non-empty line that is not valid JSON is incomplete escape evidence.
-      if (transcriptText.split('\n').some((line) => { if (!line.trim()) return false; try { JSON.parse(line); return false; } catch { return true; } })) {
-        reasons.push('transcript malformed — escape check incomplete');
+      // Every line must be an event object; an answered juror must end with a successful result.
+      const lines = String(transcriptText).split('\n').filter(line => line.trim());
+      const events = [];
+      let malformed = false;
+      for (const line of lines) {
+        try {
+          const event = JSON.parse(line);
+          if (!event || typeof event !== 'object' || Array.isArray(event) || typeof event.event !== 'string') malformed = true;
+          else events.push(event);
+        } catch { malformed = true; }
+      }
+      if (malformed) reasons.push('transcript malformed — escape check incomplete');
+      const terminal = events.at(-1);
+      const successfulResult = terminal?.event === 'result' && terminal.result
+        && typeof terminal.result === 'object' && !Array.isArray(terminal.result)
+        && terminal.result.status === 'SUCCESS';
+      const relevant = events.some(event => event.event === 'step_update' || event.event === 'result');
+      if (!lines.length || !relevant || (outcome?.value != null && !successfulResult)) {
+        reasons.push('transcript empty/unrelated — escape check incomplete');
       }
       const calls = stateChangingToolCalls(transcriptText, {
         allowedRoots: [jurorLane, realpathOr(jurorLane)], home, sessionId: outcome?.sessionId,

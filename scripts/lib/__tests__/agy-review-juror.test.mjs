@@ -9,7 +9,8 @@ import { runAgyReviewJuror, stateChangingToolCalls } from '../agy-review-juror.m
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
-const transcript = (steps) => steps.map((step_update) => JSON.stringify({ event: 'step_update', step_update })).join('\n');
+const transcript = (steps) => [...steps.map(step_update => ({ event: 'step_update', step_update })),
+  { event: 'result', result: { status: 'SUCCESS' } }].map(event => JSON.stringify(event)).join('\n');
 const tool = (path, extra = {}) => ({
   step_type: 'tool', step_index: 1, conversation_id: 'own-id', state: 'DONE', tool_name: 'view_file',
   tool_info: { parameters: { AbsolutePath: path } }, ...extra,
@@ -390,4 +391,43 @@ describe('raw juror findings remain invalid shadow evidence', () => {
     expect(row).toMatchObject({ claudeValid: true, agyValid: false });
     expect(summarizeCarbonPromotion([row])).toEqual({ agree: 0, disagree: 0, invalid: 1, prs: 1, threshold: 10 });
   });
+});
+
+it.each([undefined, {}, { path: '' }, { path: '   ' }, { path: 7 }, { path: null },
+  { path: ['file.txt'] }, ['file.txt'], { options: { path: 'file.txt' } }])
+  ('read_file refuses missing, empty, non-string, array and nested-only paths: %j', async parameters => {
+    const fx = fixture();
+    const out = await fx.run(undefined, () => [tool('', { tool_name: 'read_file', tool_info: { parameters } })]);
+    expect(out.status).toBe('voided');
+    expect(out.reasons.join(' ')).toContain('read_file (missing or invalid in-lane path)');
+  });
+it('read_file refuses a symlink escape and accepts a direct in-lane read', async () => {
+  const fx = fixture();
+  symlinkSync(fx.shared, join(fx.home, 'escape'));
+  const outside = await fx.run(undefined, () => [tool(join(fx.home, 'escape', 'file.txt'), { tool_name: 'read_file' })]);
+  expect(outside.status).toBe('voided');
+  expect(outside.reasons.join(' ')).toContain('read_file (missing or invalid in-lane path)');
+  const accepted = await fx.run(undefined, cwd => [tool(join(cwd, 'file.txt'), { tool_name: 'read_file' })]);
+  expect(accepted.status).toBe('ok');
+});
+it.each(['', '   \n\t', '{"a":1}', 'null', '[]', '42', '"text"',
+  '{"event":"hello"}', '{"event":"result","result":{"status":"ERROR"}}',
+  '{"event":"step_update","step_update":{"step_type":"message"}}'])
+  ('empty, unrelated or incomplete transcript voids an unchanged run: %j', async transcriptText => {
+    const fx = fixture();
+    const out = await fx.run(undefined, undefined, { transcriptText });
+    expect(out.status).toBe('voided');
+    expect(out.reasons.join(' ')).toMatch(/transcript (empty\/unrelated|malformed) — escape check incomplete/);
+  });
+it('a realistic tool transcript with a successful terminal result is ok', async () => {
+  const fx = fixture();
+  expect((await fx.run()).status).toBe('ok');
+});
+
+it('read_file realpath containment refuses a link inside the lane targeting outside it', () => {
+  const fx = fixture();
+  symlinkSync(fx.shared, join(fx.lane, 'escape'));
+  const evidence = transcript([tool('escape/file.txt', { tool_name: 'read_file' })]);
+  expect(stateChangingToolCalls(evidence, { allowedRoots: [fx.lane] }))
+    .toEqual(['read_file (missing or invalid in-lane path)']);
 });

@@ -213,3 +213,25 @@ export function resolveCardOnlyReviewSettings({ env = process.env, platform,
   log(formatCascadeSourcesLine('review.cardOnly', result));
   return result;
 }
+
+/** R1062: only the orchestrator promotes Carbon after ten agreeing PRs; no automatic graduation. */
+export function resolveShadowPromoted({ env = process.env, file = REVIEW_SETTINGS_FILE,
+  readFile = (p) => readFileSync(p, 'utf8'), platform, log = (m) => console.error(m) } = {}) {
+  let tool = {};
+  try { tool = JSON.parse(readFile(file)); } catch { /* default refuses */ }
+  const project = value => typeof value === 'boolean' ? { promoted: value } : {};
+  const result = cascadePolicy('review.shadowSeats.antigravity', project(tool?.shadowSeats?.antigravity?.promoted), {
+    standard: { promoted: false },
+    platform: project((platform ?? platformPreference('review', { env }))?.shadowSeats?.antigravity?.promoted),
+    env, envValues: { promoted: env.WE_REVIEW_SHADOW_AGY_PROMOTED === undefined ? undefined
+      : env.WE_REVIEW_SHADOW_AGY_PROMOTED === 'true' ? true
+        : env.WE_REVIEW_SHADOW_AGY_PROMOTED === 'false' ? false : env.WE_REVIEW_SHADOW_AGY_PROMOTED },
+    valid: { promoted: v => typeof v === 'boolean' },
+  });
+  log(formatCascadeSourcesLine('review.shadowSeats.antigravity', result).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' '));
+  return { value: result.value.promoted, source: result.sources.promoted };
+}
+
+export function carbonNonShadowAllowed(model, options) {
+  return !/carbon/i.test(String(model)) || resolveShadowPromoted(options).value === true;
+}

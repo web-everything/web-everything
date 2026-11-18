@@ -22,7 +22,7 @@
  */
 import { aiRoutingInputs, resolveAiRouting } from './ai-routing.mjs';
 import { createHash } from 'node:crypto';
-import { resolveReviewSeatSafeguards, resolveShadowSeatModel } from './review-seat-settings.mjs';
+import { carbonNonShadowAllowed, resolveReviewSeatSafeguards, resolveShadowSeatModel } from './review-seat-settings.mjs';
 import { readRoutingPolicy } from './dispatch-routing-policy-io.mjs';
 import { resolveOperationRoute } from './dispatch-routing-policy.mjs';
 
@@ -69,6 +69,7 @@ export function settingsFromRoutingPolicy(policy, { shadowModel = null, aiRoutin
     const claudeRoute = route?.provider === 'claude' ? route : route?.fallback?.find(r => r.provider === 'claude');
     if (claudeRoute) claudeSeatModel[lens] = claudeRoute.model;
     if (!route || !AGY_PROVIDERS.includes(route.provider)) continue;
+    if (route.mode !== 'shadow' && !carbonNonShadowAllowed(route.model)) continue;
     seatProvider[lens] = route.mode === 'shadow' ? 'shadow' : 'agy';
     seatModel[lens] = route.model;
   }
@@ -79,7 +80,7 @@ export function settingsFromRoutingPolicy(policy, { shadowModel = null, aiRoutin
     seatModel: Object.freeze(seatModel),
     claudeSeatModel: Object.freeze(claudeSeatModel),
     agyModel: advisoryOn ? advisory.model : null,
-    agyCorrectnessAdvisory: advisoryOn,
+    agyCorrectnessAdvisory: advisoryOn && carbonNonShadowAllowed(advisory.model),
     shadowModelOverride: shadowModel?.value ? Object.freeze({ model: shadowModel.value, source: shadowModel.source }) : null,
   });
 }

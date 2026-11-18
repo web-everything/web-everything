@@ -1,3 +1,4 @@
+import { carbonNonShadowAllowed } from '../lib/review-seat-settings.mjs';
 import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
 /**
  * @file scripts/operations/cli-adapter.mjs
@@ -630,7 +631,12 @@ export function resolveJudgeProvider(name) {
   // repo's OPTIONAL-property shapes untransformed (`antigravity-judge-spawn.mjs`'s own header, item 3), so
   // there is nothing analogous to `requireAllProperties` to run here.
   if (name === 'antigravity') {
-    return (request) => antigravityJudgeSpawn({ model: ANTIGRAVITY_MODEL, ...request });
+    return (request) => {
+      if (!carbonNonShadowAllowed(request.model ?? ANTIGRAVITY_MODEL, { env: request.env ?? process.env })) {
+        throw new Error('Carbon not promoted — non-shadow seat refused');
+      }
+      return antigravityJudgeSpawn({ model: ANTIGRAVITY_MODEL, ...request });
+    };
   }
   if (name === 'claude' || name == null) return judgeSpawn;
   throw new Error(`operations: unknown judge provider ${JSON.stringify(name)} — one of ${JUDGE_PROVIDER_NAMES.join('|')}`);

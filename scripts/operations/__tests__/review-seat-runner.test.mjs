@@ -2,7 +2,7 @@
  * Card 84 — agy review seats: the settings, the shadow recording + agreement report, and void-on-escape.
  * Every test here is red on the code before card 84 (none of these modules existed).
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, rmSync, readFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -24,9 +24,9 @@ const FINDING = { summary: 'the guard is inverted so every caller passes', file:
 const OTHER = { summary: 'a log line leaks the token value', file: 'scripts/y.mjs', line: 3, disposition: 'blocker' };
 const REQUEST = { mandate: 'judge correctness', input: 'the diff', shape: { type: 'object' }, lens: 'correctness', runId: 'run-1', allowedTools: ['Read'] };
 const io = (extra) => ({ unwrap: unwrapJudgeOutcome, wrap: judgeOutcome, cwd: '/lanes/review-lane', ...extra });
+const withEntries = (entries) => validateRoutingPolicy({ ...structuredClone(DEFAULT_ROUTING_POLICY), operations: { ...structuredClone(DEFAULT_ROUTING_POLICY.operations), ...entries } });
 
 describe('settings — review.seatProvider.<lens> comes from the routing policy (one source)', () => {
-  const withEntries = (entries) => validateRoutingPolicy({ ...structuredClone(DEFAULT_ROUTING_POLICY), operations: { ...structuredClone(DEFAULT_ROUTING_POLICY.operations), ...entries } });
   const strip = () => {
     const ops = structuredClone(DEFAULT_ROUTING_POLICY.operations);
     for (const k of Object.keys(ops)) if (k.startsWith('review-seat:mandatory:') || k.startsWith('review-seat:advisory:')) delete ops[k];
@@ -168,7 +168,8 @@ function fixtureLane() {
   execFileSync('git', ['clone', '-q', lane, other]);
   return { root, lane, other, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
-const transcriptWith = (steps) => steps.map((s) => JSON.stringify({ event: 'step_update', step_update: s })).join('\n');
+const transcriptWith = (steps) => [...steps.map(step_update => ({ event: 'step_update', step_update })),
+  { event: 'result', result: { status: 'SUCCESS' } }].map(event => JSON.stringify(event)).join('\n');
 
 describe('void-on-escape — the agy juror\'s three escape checks (real git, fake agy)', () => {
   const run = (fx, behave) => runAgyReviewJuror({
@@ -614,7 +615,7 @@ describe('PR #4131 review fixes', () => {
     expect(c.overlap).toMatchObject({ matched: 1, agyOnly: 1, claudeOnly: 0, jaccard: 0.5 });
   });
 
-  const runWith = (fx, act, transcript = '') => runAgyReviewJuror({
+  const runWith = (fx, act, transcript = transcriptWith([])) => runAgyReviewJuror({
     request: REQUEST, laneCwd: fx.lane, model: 'm',
     deps: { repoRoot: fx.other, spawnJudge: async ({ cwd }) => {
       const t = join(fx.root, 'transcript.jsonl'); writeFileSync(t, transcript); act?.(cwd);
@@ -674,7 +675,7 @@ describe('first live shadow run (PR #4133) — the shared checkout\'s own churn 
       const r = await runAgyReviewJuror({
         request: REQUEST, laneCwd: fx.lane, model: 'm',
         deps: { repoRoot: fx.other, spawnJudge: async () => {
-          const t = join(fx.root, 't.jsonl'); writeFileSync(t, '');
+          const t = join(fx.root, 't.jsonl'); writeFileSync(t, transcriptWith([]));
           execFileSync('mkdir', ['-p', join(fx.other, '.conveyor')]);
           writeFileSync(join(fx.other, '.conveyor', 'daemon.log'), 'a concurrent run logged');
           writeFileSync(join(fx.other, 'backlog-card.md'), 'a concurrent run filed a card');
@@ -708,4 +709,17 @@ describe('first live shadow run (PR #4133) — the shared checkout\'s own churn 
     expect(prompt.lastIndexOf('NEVER use run_command')).toBeGreaterThan(prompt.indexOf('PANEL MANDATE'));
     expect(prompt).toContain('list_dir, view_file, grep_search');
   });
+});
+
+it('an unpromoted Carbon advisory route retains no live non-shadow seat', () => {
+  vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'false');
+  try {
+    const settings = settingsFromRoutingPolicy(withEntries({
+      'review-seat:advisory:agy-correctness': { provider: 'agy-gemini', model: 'gemini-4-carbon-high', fallback: [] },
+    }), { aiRouting: {} });
+    expect(settings.agyModel).toBe('gemini-4-carbon-high');
+    expect(settings.agyCorrectnessAdvisory).toBe(false);
+  } finally {
+    vi.unstubAllEnvs();
+  }
 });
