@@ -4552,3 +4552,9 @@ kill, and the parent's existing direct-child fallback.
 Successful-juror regressions exercise both direct spawn and the production supervisor
 with a grandchild whose standard streams are ignored. Socket closure proves it stops
 within five seconds of resolution without confusing zombie PIDs with live processes.
+
+Signal-killed juror exits and null exit codes always raise `JudgeTimeoutError`,
+even when the caller timer is disabled or stdout contains a complete verdict.
+The supervisor-deadline regression prints a valid verdict before the hard kill;
+unit cases also cover a null code without a signal and caller-timeout output.
+Timeout errors retain the streams for diagnosis without accepting a verdict.

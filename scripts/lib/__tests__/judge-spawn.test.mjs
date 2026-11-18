@@ -764,16 +764,9 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
       .rejects.toThrow(/exceeded 5ms and was killed/);
   });
 
-  /**
-   * #3203 — THE WALL IS NO LONGER TOTAL LOSS.
-   *
-   * The kill used to `reject`, discarding every byte the juror had already written. A tool-bearing juror at
-   * the wall has usually done most of the review, so the round cost full price and delivered nothing, could
-   * not resume, and — because which round dies depends on how much work the juror chose to do — read as
-   * flakiness rather than as a bound being hit. Two of ten measured rounds on 2026-08-19 died this way.
-   */
+  // Timeout errors preserve output for diagnosis, but never accept it as a verdict.
   describe('a juror that hits the wall', () => {
-    // A child that emits a COMPLETE answer and then never exits: the exact shape the old code threw away.
+    // A child that emits a complete answer and then never exits.
     const answeringChild = (payload) => {
       const handlers = {};
       return {
@@ -795,24 +788,28 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
       structured_output: { verdict: 'reject', findings: ['found it just before the wall'] },
     };
 
-    it('returns the review the juror had already produced, instead of discarding it', async () => {
-      const r = await judgeSpawn({
+    it('rejects a caller timeout despite a complete verdict and preserves the output', async () => {
+      const error = await judgeSpawn({
         mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, timeoutMs: 5,
         spawnFn: () => answeringChild(ANSWER),
-      });
-      expect(r.value).toEqual({ verdict: 'reject', findings: ['found it just before the wall'] });
-      expect(r.costUsd).toBe(1.42);
+      }).catch(error => error);
+      expect(error).toBeInstanceOf(JudgeTimeoutError);
+      expect(error.timedOut).toBe(true);
+      expect(JSON.parse(error.partialStdout)).toEqual(ANSWER);
     });
 
-    // "Hit the bound" and "crashed" are different facts about a review, and before this they arrived
-    // identically. A caller that cannot tell them apart learns to retry rather than to look.
-    it('marks the result as timed out, so the record can say which happened', async () => {
-      const r = await judgeSpawn({
-        mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, timeoutMs: 5,
-        spawnFn: () => answeringChild(ANSWER),
-      });
-      expect(r.timedOut).toBe(true);
-    });
+    it.each([[null, 'SIGKILL'], [0, 'SIGTERM'], [null, null]])(
+      'rejects exit code %s and signal %s despite a complete verdict with no caller timer', async (code, signal) => {
+        const error = await judgeSpawn({
+          mandate: 'm', input: 'i', shape: SHAPE, timeoutMs: 0,
+          spawnFn: () => ({ ...answeringChild(ANSWER), on: (event, cb) => {
+            if (event === 'close') queueMicrotask(() => cb(code, signal));
+          } }),
+        }).catch(error => error);
+        expect(error).toBeInstanceOf(JudgeTimeoutError);
+        expect(JSON.parse(error.partialStdout)).toEqual(ANSWER);
+      },
+    );
 
     it('marks an ordinary completed juror as NOT timed out', async () => {
       const spawnFn = () => {
@@ -1492,30 +1489,30 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
   it('still unparseable after the retry → a typed JudgeUnparseableError carrying exit code, signal and a bounded stderr tail', async () => {
     const bigStderr = `${'x'.repeat(5000)}\nTHE-LAST-STDERR-LINE`;
     const { fn, calls } = scriptedSpawn([
-      { stdout: '', stderr: 'first attempt died', code: null, signal: 'SIGTERM' },
-      { stdout: '', stderr: bigStderr, code: null, signal: 'SIGTERM' },
+      { stdout: '', stderr: 'first attempt failed', code: 1 },
+      { stdout: '', stderr: bigStderr, code: 1 },
     ]);
     const err = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, runId: 'run-7', lens: 'rigor', retries: 1, log: () => {}, spawnFn: fn })
       .then(() => null, (e) => e);
     expect(calls).toHaveLength(2);
     expect(err).toBeInstanceOf(JudgeUnparseableError);
-    expect(err.exitCode).toBe(null);
-    expect(err.signal).toBe('SIGTERM');
+    expect(err.exitCode).toBe(1);
+    expect(err.signal).toBe(null);
     expect(err.attempts).toBe(2);
     expect(err.stderrTail).toContain('THE-LAST-STDERR-LINE');
     expect(err.stderrTail.length).toBeLessThanOrEqual(1000);
-    expect(err.failedAttempts.map((a) => a.signal)).toEqual(['SIGTERM', 'SIGTERM']);
+    expect(err.failedAttempts.map((a) => a.signal)).toEqual([null, null]);
     // The FIRST LINE keeps the old wording (so existing labels still match) and now names the evidence, because a
     // caller that keeps only the first line (the review job's label) must still learn exit code and signal.
     const firstLine = err.message.split('\n')[0];
     expect(firstLine).toMatch(/^judge-spawn: the juror did not emit parseable JSON on stdout/);
     expect(firstLine).toMatch(/attempt 2\/2/);
-    expect(firstLine).toMatch(/signal SIGTERM/);
+    expect(firstLine).toMatch(/signal none/);
     expect(firstLine).toMatch(/THE-LAST-STDERR-LINE/);
     expect(firstLine.length).toBeLessThanOrEqual(400);
     // The run record's telemetry row is built from `err.telemetry`: it names the failure and the last actor.
     expect(err.telemetry).toMatchObject({
-      sessionId: retrySessionId(SID, 2), exitCode: null, signal: 'SIGTERM', attempts: 2, failure: 'unparseable-stdout',
+      sessionId: retrySessionId(SID, 2), exitCode: 1, signal: null, attempts: 2, failure: 'unparseable-stdout',
     });
     expect(typeof err.telemetry.wallMs).toBe('number');
     expect(err.telemetry.stderrTail).toContain('THE-LAST-STDERR-LINE');

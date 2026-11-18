@@ -275,9 +275,14 @@ describe.skipIf(process.platform === 'win32')('real juror process group cleanup'
           group = child.pid;
           return child;
         },
-      });
-      expect(outcome.value).toEqual({ verdict: 'accept' });
-      expect(outcome.timedOut).toBe(false);
+      }).catch(error => error);
+      if (mode === 'production supervisor') {
+        expect(outcome).toBeInstanceOf(JudgeTimeoutError);
+        expect(JSON.parse(outcome.partialStdout).structured_output).toEqual({ verdict: 'accept' });
+      } else {
+        expect(outcome.value).toEqual({ verdict: 'accept' });
+        expect(outcome.timedOut).toBe(false);
+      }
       expect(connection).toBeDefined();
       await Promise.race([
         closed,
@@ -294,6 +299,35 @@ describe.skipIf(process.platform === 'win32')('real juror process group cleanup'
       rmSync(dir, { recursive: true, force: true });
     }
   }, 25000);
+
+  it('rejects a supervisor deadline kill after a valid verdict with the caller timer disabled', async () => {
+    const dir = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), 'judge-deadline-'));
+    const cli = join(dir, 'fake-cli');
+    const verdict = JSON.stringify({ is_error: false, stop_reason: 'tool_use',
+      structured_output: { verdict: 'accept' } });
+    let supervisor;
+    try {
+      writeFileSync(cli, `#!${process.execPath}\n` + keepAliveScript({
+        anchorPid: process.pid, maxLifetimeMs: 30000,
+        prelude: `process.stdout.write(${JSON.stringify(verdict)});`,
+      }), { mode: 0o755 });
+      const error = await judgeSpawn({ ...request, cli, timeoutMs: 0,
+        spawnFn: (command, argv, options) => {
+          supervisor = spawn(process.execPath, [resolve('scripts/lib/judge-spawn-supervisor.mjs'),
+            String(process.pid), String(Date.now() + 1200), command, ...argv], options);
+          return supervisor;
+        },
+      }).catch(error => error);
+      expect(supervisor.exitCode).toBe(null);
+      expect(supervisor.signalCode).toBe('SIGKILL');
+      expect(error).toBeInstanceOf(JudgeTimeoutError);
+      expect(error.timedOut).toBe(true);
+      expect(error.partialStdout).toBe(verdict);
+    } finally {
+      if (supervisor?.pid) { try { process.kill(-supervisor.pid, 'SIGKILL'); } catch {} }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 5000);
 
   it.each(['stdout', 'stderr'])('enforces the supervisor deadline after juror exit with inherited %s and caller timeout disabled', async (stream) => {
     const dir = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), 'judge-exited-'));
@@ -327,7 +361,8 @@ describe.skipIf(process.platform === 'win32')('real juror process group cleanup'
       const bound = new Promise((_, reject) => {
         timer = setTimeout(() => reject(new Error('inherited pipe survived the supervisor deadline')), 3000);
       });
-      await Promise.race([Promise.all([outcome, closed, exited]).then(([, , status]) => {
+      await Promise.race([Promise.all([outcome, closed, exited]).then(([error, , status]) => {
+        expect(error).toBeInstanceOf(JudgeTimeoutError);
         expect(status).toEqual([null, 'SIGKILL']);
         expect(output).toContain('grandchild-ready');
         expect(Date.now()).toBeLessThan(hardDeadline + 1500);

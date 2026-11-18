@@ -258,7 +258,7 @@ export class JudgeUnparseableError extends Error {
 }
 
 /**
- * A juror that hit the wall AND left nothing parseable behind.
+ * A juror that timed out or exited without a normal exit status.
  *
  * A DISTINCT TYPE because the run record must distinguish "hit the bound" from "crashed", and before this it
  * could not (#3203, Done-when 3): both arrived as a bare `Error`, so a wall-clock kill read as a juror
@@ -269,7 +269,7 @@ export class JudgeTimeoutError extends Error {
   constructor({ timeoutMs, wallMs, stdout = '', stderr = '' }) {
     super(
       `judge-spawn: the juror exceeded ${timeoutMs}ms and was killed (ran ${wallMs}ms). `
-      + 'Its output did not parse, so no partial verdict is available — but this is a BOUND being hit, not a '
+      + 'Timeout takes precedence over any buffered verdict — this is a BOUND being hit, not a '
       + `crash: see JUDGE_TIMEOUT_MS for what the bound was derived from.\n`
       + `stdout[0..600]: ${String(stdout).slice(0, 600)}\n`
       + `stderr[-600..]: ${String(stderr).trim().slice(-600) || '<empty>'}`,
@@ -917,10 +917,7 @@ export async function judgeSpawn({
     assertNoForbiddenArgv(argv);
 
     const startedAt = Date.now();
-    // THE KILL RESOLVES, IT DOES NOT REJECT (#3203). It used to reject, which threw away every byte the juror had
-    // already written — and a tool-bearing juror at the wall has usually done most of the review. Killing and
-    // then settling with the accumulated streams turns total loss into a parse attempt: often the answer IS
-    // there and only the process failed to exit.
+    // Settle after buffered output drains so timeout errors retain the partial streams.
     const { stdout, stderr, code, signal, timedOut } = await new Promise((resolve, reject) => {
       let child;
       try {
@@ -994,7 +991,7 @@ export async function judgeSpawn({
         cleanup();
         reject(new Error(`judge-spawn: \`${cli}\` failed to run: ${e.message}`));
       });
-      child.on('close', (c, signal) => settle({ stdout: out, stderr: err, code: c, signal, timedOut: killed }));
+      child.on('close', (c, signal) => settle({ stdout: out, stderr: err, code: c, signal, timedOut: killed || signal != null || c === null }));
       // The judged material rides stdin — see the header on ARG_MAX and the variadic `--tools`.
       child.stdin?.on('error', () => { /* the child may exit before we finish writing; `close` reports it */ });
       child.stdin?.end(input);
@@ -1002,16 +999,8 @@ export async function judgeSpawn({
 
     const thisAttemptMs = Date.now() - startedAt;
     wallMs += thisAttemptMs;
-    // A KILLED JUROR IS TRIED, NOT DISCARDED. The wall is a bound on runaway, and a juror that emitted its
-    // answer and then failed to exit has produced a perfectly good review — the old code threw it away along
-    // with the ones that really had nothing. `timedOut` rides out on the result so the run record can say which
-    // happened, because "hit the bound" and "crashed" are different facts about a review.
-    if (timedOut) {
-      let outcome = null;
-      try { outcome = parseJudgeOutcome(stdout, stderr, budget); } catch { outcome = null; }
-      if (!outcome) throw new JudgeTimeoutError({ timeoutMs, wallMs, stdout, stderr });
-      return { ...outcome, wallMs, attempts: attempt, failedAttempts, timedOut: true, loadedContextTokens: loadedContextTokens(outcome.usage), argv };
-    }
+    // Timeout wins over buffered verdicts, including supervisor kills with no caller timer.
+    if (timedOut) throw new JudgeTimeoutError({ timeoutMs, wallMs, stdout, stderr });
     // `parseJudgeOutcome` throws with the CLI's own words; a non-zero exit with unparseable stdout lands there too.
     let outcome;
     try {
