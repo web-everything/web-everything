@@ -1,7 +1,17 @@
 /** Configurable fix-session scope holds; conservative region observations and shared policy cascade. */
 import { execFileSync } from 'node:child_process';
+import micromatch from 'micromatch';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
+import { parseScopeEntry } from '../readiness/overlap-chain.mjs';
+
+export const FIX_OVERLAP_PROSE_GLOBS = Object.freeze(['backlog/**/*.md', 'docs/**/*.md']);
+
+/** Ignore prose only when computing fix overlap; retain original dispatch/claim scopes. */
+export function stripProseScope(scope) {
+  return scope?.filter(entry => typeof entry !== 'string'
+    || !micromatch.isMatch(parseScopeEntry(entry)?.path ?? '', FIX_OVERLAP_PROSE_GLOBS));
+}
 
 export const FIX_SCOPE_DEFAULTS = Object.freeze({
   holdMode: 'active-session', overlapGranularity: 'region', regionMarginLines: 20,
