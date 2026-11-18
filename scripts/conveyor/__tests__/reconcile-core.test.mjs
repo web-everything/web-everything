@@ -63,6 +63,7 @@ import { reconcileHolds } from '../../operations/land-advance-items-io.mjs';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { parseRedTeamComment, redTeamResultId, redTeamMarker, redTeamGateMarker } from '../../lib/red-team-gate.mjs';
 import { planNoteComment } from '../reconcile-note-comment.mjs';
 
 // ── fixtures — measured shapes, 2026-08-26 ───────────────────────────────────────────────────────────────────
@@ -108,8 +109,9 @@ describe('same-head referral resume preserves a newer send-back', () => {
   const attempt = comment(buildFixEndComment({ who: 'fix-6945', headSha: head }), '2026-11-18T05:00:00Z');
   const advisory = comment(`${ADVISORY_NOTE_MARKER}\n\n**Verdict:** accept\n\nNet basis: \`${'a'.repeat(40)}..${head}\``, '2026-11-18T05:10:00Z');
   const sendBack = comment(`🔁 review — changes requested\n\nRecorded by orchestrator via console.\n\nFix the missing export.\n\nNet basis: \`${'a'.repeat(40)}..${head}\`\n\n${buildReviewedShaMarker(head)}`, '2026-11-18T05:22:00Z');
+  const redResult = comment(`${redTeamMarker(6989, head)}\n1. [**confirmed**] (correctness, broken) ` + '`src/export.mjs:1` — Restore the missing export.', '2026-11-18T05:15:00Z');
   const run = (labels, comments, extra = {}) => planReconcile({ prs: [pr1563({ number: 6945, headRefOid: head,
-    labels: lbl('review:human', ...labels), comments,
+    labels: lbl('review:human', ...labels), comments: [redResult, ...comments],
     referralHold: { kind: 'same-head', head, count: 1, attemptsSinceWake: 1, why: 'all findings ruled' },
     referralHoldAutoResolve: { outcome: 'resume', head, why: 'all findings ruled' },
     ...extra,
@@ -159,33 +161,29 @@ describe('same-head referral resume preserves a newer send-back', () => {
   });
 
   it('without a send-back after the last fixer attempt still refuses already-reviewed-head', () => {
-    const result = run([], [sendBack, { ...attempt, createdAt: '2026-11-18T05:30:00Z' }, advisory]);
+    const result = run(['status:sent-back-review'], [sendBack, { ...attempt, createdAt: '2026-11-18T05:30:00Z' }, advisory]);
     expect(result.dispatch).toEqual([]);
     expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
   });
 
-  it('a trusted send-back comment alone preserves the fixer obligation', () => {
-    expect(run([], [attempt, advisory, sendBack]).dispatch).toEqual([expect.objectContaining({ kind: 'fix' })]);
+  it('a trusted send-back comment with its label preserves the fixer obligation', () => {
+    expect(run(['status:sent-back-review'], [attempt, advisory, sendBack]).dispatch).toEqual([expect.objectContaining({ kind: 'fix' })]);
   });
 
-  it('a later send-back label event preserves the fixer obligation', () => {
+  it('a trusted label event alone does NOT release a clean-advisory hold', () => {
     const result = run(['status:sent-back-review'], [attempt, advisory], {
       headChangedAt: '2026-11-18T04:00:00Z',
       labelEvents: [{ actor: AUTOMATION, event: 'labeled', label: { name: 'status:sent-back-review' }, created_at: sendBack.createdAt }],
     });
-    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'fix' })]);
+    expect(countFindings([advisory])).toBe(1);
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
   });
 
-  it.each([
-    { outcome: 'round-cap', labels: ['status:sent-back-red-team', 'red-team:blocked'] },
-    { outcome: 'operator-block', labels: ['status:sent-back-red-team'] },
-  ])('a later same-head $outcome supersedes a trusted send-back label event ($labels)', ({ outcome, labels }) => {
-    const capped = comment(`<!-- we:red-team-gate pr=6989 rev=${head} outcome=${outcome} -->`, '2026-11-18T05:44:00Z');
-    const result = run(labels, [attempt, advisory, capped], {
-      number: 6989,
-      headChangedAt: '2026-11-18T04:00:00Z',
-      labelEvents: [{ actor: AUTOMATION, event: 'labeled', label: { name: 'status:sent-back-red-team' }, created_at: sendBack.createdAt }],
-    });
+  it('a delayed sent-back bound to an older result cannot reopen a newer clean result', () => {
+    const clean = comment(redTeamMarker(6989, head), '2026-11-18T05:40:00Z');
+    const delayed = comment(redTeamGateMarker(6989, head, 'sent-back', redTeamResultId(parseRedTeamComment(redResult.body))), '2026-11-18T05:43:00Z');
+    const result = run(['status:sent-back-red-team', 'red-team:blocked'], [attempt, advisory, clean, delayed], { number: 6989 });
     expect(result.dispatch).toEqual([]);
     expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
   });
@@ -197,27 +195,40 @@ describe('same-head referral resume preserves a newer send-back', () => {
     expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
   });
 
-  it.each([
-    { name: 'at the same time as round-cap', gateAt: sendBack.createdAt, released: false },
-    { name: 'after round-cap', gateAt: '2026-11-18T05:20:00Z', released: true },
-    { name: 'with unreadable gate chronology', gateAt: 'unknown', released: false },
-  ])('a trusted send-back label event $name respects supersession', ({ gateAt, released }) => {
-    const gate = comment(`<!-- we:red-team-gate pr=6989 rev=${head} outcome=round-cap -->`, gateAt);
-    const result = run(['status:sent-back-red-team', 'red-team:blocked'], [attempt, advisory, gate], {
-      number: 6989,
-      headChangedAt: '2026-11-18T04:00:00Z',
-      labelEvents: [{ actor: AUTOMATION, event: 'labeled', label: { name: 'status:sent-back-red-team' }, created_at: sendBack.createdAt }],
+  it('a trusted actionable comment cannot release the hold after its label is removed', () => {
+    const result = run([], [attempt, advisory, sendBack]);
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
+  });
+
+  it('a pinned changes verdict without a must-fix body cannot release the hold', () => {
+    const request = { ...sendBack, body: `🔁 review — changes requested\n\nRecorded by orchestrator via console.\n\n${buildReviewedShaMarker(head)}` };
+    const result = run(['status:sent-back-review'], [attempt, advisory, request]);
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
+  });
+
+  it.each(['missing result', 'empty fix list'])('a sent-back gate with %s cannot release the hold', evidence => {
+    const gate = comment(redTeamGateMarker(6989, head, 'sent-back'), '2026-11-18T05:43:00Z');
+    const comments = [attempt, advisory,
+      ...(evidence === 'empty fix list' ? [comment(redTeamMarker(6989, head), '2026-11-18T05:40:00Z')] : []), gate];
+    const result = run(['status:sent-back-red-team'], comments, { number: 6989,
+      ...(evidence === 'missing result' ? { comments } : {}),
     });
-    if (released) expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'fix' })]);
-    else {
-      expect(result.dispatch).toEqual([]);
-      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
-    }
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
+  });
+
+  it('a delayed round-cap bound to an older result cannot supersede a newer actionable comment', () => {
+    const older = comment(redTeamMarker(6989, head), '2026-11-18T04:50:00Z');
+    const delayed = comment(redTeamGateMarker(6989, head, 'round-cap', redTeamResultId(parseRedTeamComment(older.body))), '2026-11-18T05:43:00Z');
+    const result = run(['status:sent-back-review'], [older, redResult, attempt, advisory, sendBack, delayed], { number: 6989 });
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'fix' })]);
   });
 
   it('an unpinned automated request cannot release the current-advisory hold', () => {
     const request = { ...sendBack, body: '🔁 review — changes requested\n\nRecorded by orchestrator via console.\n\nFix the missing export.' };
-    const result = run([], [attempt, advisory, request]);
+    const result = run(['status:sent-back-review'], [attempt, advisory, request]);
     expect(result.dispatch).toEqual([]);
     expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
   });
@@ -225,7 +236,7 @@ describe('same-head referral resume preserves a newer send-back', () => {
   it('an unpinned sanctioned operator send-back still releases after review', () => {
     const request = { id: 'operator-send-back', author: { login: 'chalbert' }, createdAt: sendBack.createdAt,
       body: '🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.\n\nFix the missing export.' };
-    expect(run([], [attempt, advisory, request]).dispatch).toEqual([expect.objectContaining({ kind: 'fix' })]);
+    expect(run(['status:sent-back-review'], [attempt, advisory, request]).dispatch).toEqual([expect.objectContaining({ kind: 'fix' })]);
   });
 
   it.each([
@@ -238,7 +249,7 @@ describe('same-head referral resume preserves a newer send-back', () => {
     const request = { id: 'operator-send-back', author: { login: 'chalbert' }, createdAt: sendBack.createdAt,
       body: '🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.\n\nFix the missing export.' };
     const gate = comment(`<!-- we:red-team-gate pr=6989 rev=${head} outcome=${outcome} -->`, gateAt);
-    const result = run([], [advisory, request, gate], { number: 6989 });
+    const result = run(['status:sent-back-review'], [advisory, request, gate], { number: 6989 });
     if (released) expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'fix' })]);
     else {
       expect(result.dispatch).toEqual([]);
@@ -247,25 +258,7 @@ describe('same-head referral resume preserves a newer send-back', () => {
   });
 
   it('a later accept advisory supersedes a pinned request after the fixer attempt', () => {
-    const result = run([], [attempt, sendBack, { ...advisory, createdAt: '2026-11-18T05:30:00Z' }]);
-    expect(result.dispatch).toEqual([]);
-    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
-  });
-
-  it.each([
-    { name: 'missing actor', actor: undefined },
-    { name: 'untrusted actor', actor: { login: 'outsider' } },
-    { name: 'missing head-change evidence', actor: AUTOMATION, headChangedAt: null },
-    { name: 'unreadable head-change evidence', actor: AUTOMATION, headChangedAt: 'unknown' },
-    { name: 'event before the live head', actor: AUTOMATION, headChangedAt: '2026-11-18T05:30:00Z' },
-    { name: 'event consumed by a fixer', actor: AUTOMATION, attemptAt: '2026-11-18T05:30:00Z' },
-    { name: 'unreadable event time', actor: AUTOMATION, eventAt: 'unknown' },
-    { name: 'event superseded by advisory', actor: AUTOMATION, eventAt: '2026-11-18T05:05:00Z' },
-  ])('a label with $name cannot release the hold', ({ actor, headChangedAt = '2026-11-18T04:00:00Z', eventAt = sendBack.createdAt, attemptAt = attempt.createdAt }) => {
-    const result = run(['status:sent-back-review'], [{ ...attempt, createdAt: attemptAt }, advisory], {
-      headChangedAt,
-      labelEvents: [{ actor, event: 'labeled', label: { name: 'status:sent-back-review' }, created_at: eventAt }],
-    });
+    const result = run(['status:sent-back-review'], [attempt, sendBack, { ...advisory, createdAt: '2026-11-18T05:30:00Z' }]);
     expect(result.dispatch).toEqual([]);
     expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
   });
@@ -282,7 +275,7 @@ describe('same-head referral resume preserves a newer send-back', () => {
   });
 
   it('an unreadable fixer attempt time cannot prove a later send-back', () => {
-    const result = run([], [{ ...attempt, createdAt: 'unknown' }, advisory, sendBack]);
+    const result = run(['status:sent-back-review'], [{ ...attempt, createdAt: 'unknown' }, advisory, sendBack]);
     expect(result.dispatch).toEqual([]);
     expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
   });

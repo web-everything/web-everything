@@ -561,13 +561,14 @@ const indexedRecords = comments => {
 };
 
 /** Latest trusted gate decision for this PR/live head, using canonical thread chronology.
- * Every outcome supersedes earlier decisions, including outcomes unknown to this consumer. PURE. */
+ * Only records validated against the current result count. Every valid outcome supersedes earlier
+ * decisions, including outcomes unknown to this consumer. PURE. */
 export function latestGateForHead(comments, pr, head) {
   const live = String(head ?? '').toLowerCase();
-  const record = indexedRecords(comments)
-    .map(r => ({ ...r, gate: parseRedTeamGateMarker(recordBody(r)) }))
-    .filter(r => r.gate?.pr === Number(pr) && r.gate.rev === live)
-    .sort(threadOrder).at(-1);
+  const records = indexedRecords(comments);
+  const hit = latestResult(records, pr, live);
+  if (!hit) return null;
+  const record = gateRecordsFor(records, pr, live, hit).sort(threadOrder).at(-1);
   return record ? { comment: comments[record.at], outcome: record.gate.outcome } : null;
 }
 

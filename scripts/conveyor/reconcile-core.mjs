@@ -112,7 +112,7 @@ import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
 import { rulingDisputeText, noticedRungs } from '../lib/ruling-ledger.mjs';
 import { openOperatorSendBacks, operatorSendBackRuling } from '../lib/operator-send-backs.mjs';
 import { latestChangesVerdict } from '../review-set-label.mjs';
-import { latestGateForHead } from '../lib/red-team-gate.mjs';
+import { latestGateForHead, redTeamForHead } from '../lib/red-team-gate.mjs';
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
 import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
 import { AUTO_POLICY_ACTOR, activeReferrals, readOperatorRulings, readReferralRecords, referralRecordState } from '../lib/jury-core.mjs';
@@ -1494,6 +1494,8 @@ function refuseReferralHold({ pr, refuse, withPhase, extra = {} }) {
 /** A newer repair request survives a clean referral ruling on an unchanged head. Use the sanctioned
  * verdict/gate readers and the existing durable attempt markers; unknown chronology grants no release. */
 function sendBackAfterFixAttempt(pr) {
+  const labels = labelNames(pr.labels);
+  if (!['review:changes', 'status:sent-back-review', 'status:sent-back-red-team'].some(label => labels.includes(label))) return false;
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
   const trusted = comments.filter(isTrustedMarkerAuthor);
   const attempts = trusted.filter(c => [FIX_BEGIN_MARKER, FIX_END_MARKER, STAND_DOWN_MARKER,
@@ -1506,17 +1508,20 @@ function sendBackAfterFixAttempt(pr) {
   const verdict = latestChangesVerdict(trusted);
   const operatorRequest = operatorSendBackAfterReview(pr);
   const gate = latestGateForHead(comments, pr.number, pr.headRefOid);
-  const gateRequest = gate?.outcome === 'sent-back'
-    || (gate?.outcome === 'operator-block' && labelNames(pr.labels).includes('red-team:blocked'))
+  const gateHasFixes = redTeamForHead(comments, pr.number, pr.headRefOid)
+    ?.findings.some(f => f.summary.trim());
+  const gateRequest = gateHasFixes && (gate?.outcome === 'sent-back'
+    || (gate?.outcome === 'operator-block' && labels.includes('red-team:blocked')))
     ? gate.comment : null;
   const requests = trusted.filter(c => {
-    return (c === verdict && (!isOperatorAuthored(c) || Boolean(operatorRequest))) || c === gateRequest;
+    return (c === verdict && operatorSendBackBody(c.body)
+      && (!isOperatorAuthored(c) || Boolean(operatorRequest))) || c === gateRequest;
   });
   // Requests are not completed reviews. Keep their slots so thread order remains comparable,
   // and require readable review evidence before reopening an already-reviewed head.
   const review = latestHeadReview({ ...pr, comments: comments.map(c => requests.includes(c) ? {} : c) }, { currentHeadOnly: true });
   if (!review) return false;
-  // A gate decision supersedes label events just as it supersedes comment requests.
+  // A later gate decision supersedes comment requests.
   // Unreadable gate chronology cannot prove that a request is newer (NaN fails closed).
   const latestSupersedingAt = Math.max(review.at,
     gate && !gateRequest
@@ -1526,7 +1531,7 @@ function sendBackAfterFixAttempt(pr) {
   if (!attempts.length) return Boolean(operatorRequest && trusted.some(c =>
     String(c.id ?? c.node_id) === operatorRequest.verdictId
       && Date.parse(c.createdAt ?? c.created_at) > latestSupersedingAt));
-  if (requests.some(c => {
+  return requests.some(c => {
     const heads = reviewedHeadsOf(c);
     const pinned = heads.some(head => sameHeadSha(head, pr.headRefOid))
       || c === gateRequest;
@@ -1535,19 +1540,6 @@ function sendBackAfterFixAttempt(pr) {
     return (pinned || sanctionedOperator)
       && comments.indexOf(c) > Math.max(lastIndex, review.index)
       && Date.parse(c.createdAt ?? c.created_at) > Math.max(lastAt, latestSupersedingAt);
-  })) return true;
-  const labels = labelNames(pr.labels);
-  const headChangedAt = Date.parse(standDownHeadChangeAt(pr));
-  // A label has no SHA trailer: unknown actor/head chronology retains the hold. The
-  // operator can instead post a sanctioned send-back, or automation a head-pinned request.
-  if (!Number.isFinite(headChangedAt)) return false;
-  return (Array.isArray(pr.labelEvents) ? pr.labelEvents : []).some(e => {
-    const label = typeof e?.label === 'string' ? e.label : e?.label?.name;
-    const actor = typeof e?.actor === 'string' ? { login: e.actor } : e?.actor;
-    return isTrustedMarkerAuthor({ author: actor })
-      && labels.includes(label) && ['review:changes', 'status:sent-back-review', 'status:sent-back-red-team'].includes(label)
-      && (e.event === 'labeled' || e.event === undefined)
-      && Date.parse(e.created_at ?? e.at ?? e.createdAt) > Math.max(lastAt, latestSupersedingAt, headChangedAt);
   });
 }
 
