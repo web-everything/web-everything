@@ -8,8 +8,10 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 export async function runUnattributedBuilderRecovery() {
   const root = process.env.SOAK_TREE_ROOT || fileURLToPath(new URL('../../../../', import.meta.url));
   const { cliRecoverBuilderDrafts } = await import(pathToFileURL(join(root, 'skills-src/conveyor/build-dispatch-daemon.mjs')).href);
+  const { CONSTELLATION_REPOS } = await import(pathToFileURL(join(root, 'scripts/lib/constellation-repos.mjs')).href);
   const stateRoot = mkdtempSync(join(tmpdir(), 'builder-unattributed-soak-'));
-  const repo = 'o/r', ref = 'lane/4502-delivery';
+  // Builder recovery accepts WE-owned heads only; use its registry without hard-coding the slug.
+  const repo = CONSTELLATION_REPOS.we.slug, ref = 'lane/4502-delivery';
   const effects = [], violations = [];
   const io = {
     stateRoot,
