@@ -225,7 +225,7 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
       // A reservation whose run already wrote its final receipt and outlived the
       // maximum runtime leaked: nothing can still be using its profile. Only a
       // leased writer with a complete, newest receipt qualifies; every present
-      // lock/digest must still be valid.
+      // lock/digest must still be valid and asserted profiles must resolve.
       const final = records.find(r => r.suffix === 'receipt');
       const finalReceipt = final?.record;
       const leaked = writerGuard === 1 && finalReceipt?.v === 1 && finalReceipt.run === run
@@ -262,8 +262,7 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
         const profileKnown = typeof digest === 'string' && HEX.test(digest);
         // Keep refusing corrupt digests, even though the known lock is protected.
         if (digest !== undefined && !profileKnown) throw new Error('Invalid reserved profile evidence');
-        if (leaked) continue;
-        if (profileKnown) profiles.add(`${lock}/dev-v5-${digest}`);
+        if (!leaked && profileKnown) profiles.add(`${lock}/dev-v5-${digest}`);
         // Evidence asserting a profile must resolve even when a newer record is known.
         if (!profileKnown && (record.inputDigest !== undefined || record.manifestDigest !== undefined
           || typeof record.siblings === 'boolean' || manifestKnown
@@ -273,7 +272,7 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
         // The newest record decides: an older known profile must not mask a later unknown one.
         if (evidence === latest) latestKnown = profileKnown;
       }
-      if (leaked) continue;
+      if (leaked && !unresolvedProfile) continue;
       // A legacy writer can change profiles without taking a lease. Missing
       // profile evidence is likewise safe only at the whole-lock boundary.
       if (writerGuard !== 1 || !latestKnown || unresolvedProfile) locks.add(lock);

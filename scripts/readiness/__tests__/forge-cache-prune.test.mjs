@@ -672,6 +672,29 @@ describe('live reservation compatibility', () => {
 });
 
 describe('readLiveEvidence', () => {
+  it.each([
+    {scenario: 'protects the whole lock for an expired reservation with unresolved siblings evidence', resolved: false},
+    {scenario: 'reclaims an expired reservation with fully resolved siblings evidence', resolved: true},
+  ])('$scenario', async ({resolved}) => {
+    const run = await reserve();
+    const reservationPath = join(receipts, 'worker-active', 'reservation.json');
+    const runningPath = join(receipts, `${run}.running`);
+    const receiptPath = join(receipts, `${run}.receipt`);
+    await json(runningPath, {lock, siblings: true, ...(resolved ? {manifestDigest: hex('c')} : {})});
+    await json(receiptPath, {v: 1, run, phase: 'test', code: 0,
+      lock, inputDigest: hex('b'), manifestDigest: hex('c'), siblingShas: {frontierui: 'd'.repeat(40)}});
+    await fs.utimes(reservationPath, (now - 3 * HOUR) / 1000, (now - 3 * HOUR) / 1000);
+    await fs.utimes(runningPath, (now - 3000) / 1000, (now - 3000) / 1000);
+    await fs.utimes(receiptPath, (now - 2000) / 1000, (now - 2000) / 1000);
+
+    const live = await readLiveEvidence({receipts, now});
+    expect(live.complete).toBe(true);
+    expect(live.locks).toEqual(new Set(resolved ? [] : [lock]));
+    expect(live.profiles).toEqual(new Set());
+    const profiles = [entry('b', 30), entry('c', 30), entry('f', 30)];
+    expectDecision(plan(profiles, {live}), resolved ? profiles : [], resolved ? [] : profiles);
+  });
+
   it('protects the whole lock for an older digest-free siblings running record despite a newer known prepared profile', async () => {
     const run = await reserve();
     const runningPath = join(receipts, `${run}.running`);
