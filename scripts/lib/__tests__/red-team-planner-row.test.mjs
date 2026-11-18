@@ -161,6 +161,27 @@ describe('readPlannerRow', () => {
     expect(result.reviewOwnedChecks.onlyRed).toBe(false);
   });
 
+  it.each([
+    ['missing status', { name: 'test', conclusion: 'success' }],
+    ['unknown conclusion', check('test', 'unknown')],
+    ['in_progress status with success', check('test', 'success', { status: 'in_progress' })],
+    ['missing conclusion', { name: 'test', status: 'completed' }],
+  ])('fails closed on direct and implied required checks with %s', (_, malformed) => {
+    for (const requiredChecks of [['integration'], ['test']]) {
+      const result = readPlannerRow({ pr, refusals: [refusal('review-ci')],
+        rawPrs: [rawPr([{ ...malformed, head_sha: head }])], requiredChecks });
+      expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: false,
+        affected: [{ name: requiredChecks[0], reason: 'missing' }] });
+      expect(result.reviewOwnedChecks.onlyRed).toBe(false);
+    }
+  });
+
+  it('allows completed same-head test success to imply integration when only integration is required', () => {
+    const result = readPlannerRow({ pr, refusals: [refusal('review-ci')],
+      rawPrs: [rawPr([check('test', 'success', { head_sha: head })])], requiredChecks: ['integration'] });
+    expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: true, affected: [] });
+  });
+
   it('preserves same-head test implication and review-only failures', () => {
     const checks = [check('test', 'success', { head_sha: head })];
     const input = { pr, refusals: [refusal('review-ci')], rawPrs: [rawPr(checks)], requiredChecks: ['test', 'integration'] };
