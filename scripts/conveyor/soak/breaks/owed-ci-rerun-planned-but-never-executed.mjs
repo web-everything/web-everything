@@ -3,16 +3,23 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+/** The review tick must hand its planned ci-timeout-rerun rows to the executor, not merely import it. */
+const daemonWiresExecutor = (src) => /filter\(row => row\.kind === 'ci-timeout-rerun'\)/.test(src)
+  && /executeOwedReruns\(\{ rows: rerunRows/.test(src) && /executeOwedReruns = executeOwedCiReruns/.test(src);
+
 export default {
   id: 'owed-ci-rerun-planned-but-never-executed',
   title: 'PRs owed a ci-timeout-rerun, not a review, wait for the slow fix-daemon ci-heal phase',
   card: 'execute owed CI reruns promptly in the review daemon',
   fixedBy: { sha: 'HEAD', where: 'review-daemon', paths: ['skills-src/conveyor/review-daemon.mjs', 'scripts/conveyor/owed-ci-rerun-executor.mjs'] },
-  fixPresent(root) { return readFileSync(join(root, 'skills-src/conveyor/review-daemon.mjs'), 'utf8').includes('executeOwedCiReruns'); },
+  fixPresent(root) { return daemonWiresExecutor(readFileSync(join(root, 'skills-src/conveyor/review-daemon.mjs'), 'utf8')); },
   async run() {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
     const { executeOwedCiReruns } = await import(pathToFileURL(join(root, 'scripts/conveyor/owed-ci-rerun-executor.mjs')).href);
     const violations = [];
+    if (!daemonWiresExecutor(readFileSync(join(root, 'skills-src/conveyor/review-daemon.mjs'), 'utf8'))) {
+      violations.push('review daemon does not execute its planned ci-timeout-rerun rows');
+    }
     const plan = { dispatch: Array.from({ length: 13 }, (_, i) => ({
       kind: 'ci-timeout-rerun', prNumber: 20 - i, timeoutRetry: { pr: 20 - i },
     })) };
