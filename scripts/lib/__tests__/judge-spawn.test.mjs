@@ -1493,6 +1493,24 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
     expect(calls).toHaveLength(0);
   });
 
+  it.each([
+    ['unsupported keyword', { type: 'object', unevaluatedProperties: false }],
+    ['invalid keyword value', { type: 'object', properties: { verdict: { type: 'not-a-type' } } }],
+    ['oversized unsupported keyword', { type: 'object', ['private-schema-content' + 'x'.repeat(10_000)]: false }],
+  ])('refuses %s before spawning with a bounded no-verdict compile error', async (_name, shape) => {
+    const { fn, calls } = scriptedSpawn([{ stdout: ANSWER_JSON, code: 0 }]);
+    const err = await judgeSpawn({ mandate: 'm', input: 'i', shape, sessionId: SID, retries: 1, spawnFn: fn })
+      .catch(e => e);
+    expect(err).toBeInstanceOf(JudgeUnparseableError);
+    expect(err.message).toMatch(/schema compilation failed/);
+    expect(err.message).toContain('correct the schema before retrying; no verdict');
+    expect(err.message).not.toContain('private-schema-content');
+    expect(err.message.length).toBeLessThan(600);
+    expect(err).not.toHaveProperty('value');
+    expect(err.attempts).toBe(0);
+    expect(calls).toHaveLength(0);
+  });
+
   it.each(['before', 'after'])('rejects a truncated error object %s success with bounded redacted diagnostics', async position => {
     const truncated = '  {"type":"error","message":"private-juror-content' + 'x'.repeat(10_000);
     const stdout = position === 'before' ? `${truncated}\n${ANSWER_JSON}` : `${ANSWER_JSON}\n${truncated}`;
@@ -1513,6 +1531,8 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
   it.each([
     ['is_error result', { type: 'result', is_error: true, result: 'review failed' }],
     ['is_error event', { type: 'system', is_error: true, result: 'review failed' }],
+    ['string is_error event', { is_error: 'true' }],
+    ['numeric is_error event', { is_error: 1 }],
     ['error event', { type: 'error', error: 'x' }],
     ['unsuccessful subtype with output', { type: 'result', subtype: 'error_during_execution', is_error: false,
       structured_output: { verdict: 'accept', findings: [], private: 'private-juror-content' } }],

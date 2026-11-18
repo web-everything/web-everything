@@ -91,10 +91,10 @@ import { markWorkerEnv } from '../operations/session-role.mjs';
 import { sanitizeSpawnEnv } from './gh-app-shim.mjs';
 import { quotaHoldRow } from './provider-quota-hold.mjs';
 
-const judgeSchemas = new Ajv({ strict: false });
+const judgeSchemas = new Ajv({ strictSchema: true });
 
 // No format validators are installed. Refuse even nested/unused format constraints
-// instead of allowing Ajv's strict:false mode to silently ignore them.
+// including constraints in unused definitions that compilation may not visit.
 function assertNoSchemaFormats(schema) {
   const pending = [schema];
   const seen = new Set();
@@ -777,10 +777,10 @@ export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
 
   // A success cannot erase an error elsewhere in the CLI's JSON output.
   const failure = events.find(event => event && typeof event === 'object' && !Array.isArray(event)
-    && (event.type === 'error' || event.is_error === true
+    && (event.type === 'error' || event.is_error
       || (event.type === 'result' && 'subtype' in event && event.subtype !== 'success')));
   if (failure) {
-    if (failure.is_error === true) parsed = failure; // Preserve CLI and budget diagnostics below.
+    if (failure.is_error) parsed = failure; // Preserve CLI and budget diagnostics below.
     else {
       const error = new Error('judge-spawn: the juror emitted a JSON error event or unsuccessful result.');
       error.unparseableStdout = true;
@@ -952,7 +952,17 @@ export async function judgeSpawn({
   const setting = retries === undefined ? resolveUnparseableRetries({ env }) : { value: retries, source: 'caller' };
   retries = setting.value;
   assertNoSchemaFormats(shape);
-  const validate = judgeSchemas.compile(shape);
+  let validate;
+  try {
+    validate = judgeSchemas.compile(shape);
+  } catch {
+    // Compiler diagnostics can contain arbitrarily large, untrusted schema text.
+    // No child ran: the caller must correct the schema before requesting a verdict.
+    throw new JudgeUnparseableError({
+      attempt: 0, attempts: 0, stdout: '', stderr: '', wallMs: 0, sessionId: sid, failedAttempts: [],
+      reason: 'judge-spawn: juror schema is unvalidatable: schema compilation failed (details redacted); correct the schema before retrying; no verdict.',
+    });
+  }
   const total = 1 + retries;
   const failedAttempts = [];
   let wallMs = 0;
