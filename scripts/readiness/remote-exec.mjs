@@ -13,6 +13,7 @@ import {BASE_RETENTION} from './forge-exec-bases.mjs';
 import {resolveTransport,runnerSupportsBundle,planBundle,mainFreshness,bundleEvidence,makeBundleDirectory,removeBundleDirectory} from './remote-git-bundle.mjs';
 import {routeNeedsGit,selectionUnproven} from './needs-git-route.mjs';
 import {writeJsonAtomic} from '../lib/atomic-json-file.mjs';
+import {SKIP_REASON, SECTION_INPUTS, DYNAMIC_SECTIONS, createSectionGate} from '../lib/standards-sections.mjs';
 
 const ROOT = '/srv/forge-exec';
 const LIMIT = 4 * 1024 * 1024;
@@ -1377,11 +1378,45 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
   const cancel = { signal: cancelSignal ?? new AbortController().signal };
   const nonce = randomBytes(16).toString('hex');
   const tails = {stdout:'',stderr:''};
-  let incompleteStandards = false;
+  const standardsFilesArg = argv.find(arg => arg.startsWith('--files='));
+  const standardsFiles = standardsFilesArg
+    ? standardsFilesArg.split('=').slice(1).join('=').split(/[\s,]+/).map(file => file.trim()).filter(Boolean)
+    : [];
+  let incompleteStandards;
+  const inspectStandardsLine = line => {
+    // A whole-line summary is only a candidate: explicit argv scope and the
+    // local gate must independently agree. Remote backlog links only widen scope,
+    // so a local would-run always contradicts a remote skip. Dynamic inputs
+    // cannot be verified here, so their sections never qualify for the exemption.
+    const plain = line.replace(/\x1b\[[0-9;]*m/g, '').trim();
+    const prefix = `local ${SKIP_REASON}: `;
+    let benign = false;
+    if (plain.startsWith(prefix) && argv.includes('--local') && standardsFiles.length) {
+      try {
+        // bindGit above verifies cwd is the repository root.
+        const gate = createSectionGate({scoped:true, touched:standardsFiles, root:cwd});
+        benign = plain.slice(prefix.length).split(', ').every(id =>
+          Object.hasOwn(SECTION_INPUTS, id) && !DYNAMIC_SECTIONS.has(id) && gate.shouldRun(id) === false);
+      } catch { /* incomplete local evidence requires fallback */ }
+    }
+    // ANSI suffixes such as "2m" must not mask the word boundary before "skipped".
+    const evidence = benign ? '' : plain;
+    if (/\bskipp(?:ing|ed)\b|\bno-scope\b|\bENOENT\b|no changed tier lines; nothing to attribute/i.test(evidence))
+      incompleteStandards ??= line;
+  };
   const observeStandards = (chunk, stream = 'stdout') => {
     const text = tails[stream] + String(chunk);
-    if (/\bskipp(?:ing|ed)\b|\bno-scope\b|\bENOENT\b|no changed tier lines; nothing to attribute/i.test(text)) incompleteStandards = true;
-    tails[stream] = text.slice(-128);
+    const lines = text.split('\n');
+    tails[stream] = lines.pop();
+    for (const line of lines) {
+      if (line.length > 4096) incompleteStandards ??= `standards output line exceeds 4096 characters: ${line.slice(0, 4000)}`;
+      else inspectStandardsLine(line);
+    }
+    // An unbounded/unknown line is incomplete evidence, never a remote green.
+    if (tails[stream].length > 4096) {
+      incompleteStandards ??= `standards output line exceeds 4096 characters: ${tails[stream].slice(0, 4000)}`;
+      tails[stream] = '';
+    }
   };
   const ssh = (command, request, inherit = false) => exec({file:'ssh',
     args:[host, `sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs ${command}`],
@@ -1623,10 +1658,15 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
       }
       if(!result || !verifyReceipt(text,expected,result.code)) return {mode:'unconfirmed',reason:'ambiguous-result'};
       if (argv[2] === 'check:standards') {
+        for (const stream of ['stdout', 'stderr']) {
+          inspectStandardsLine(tails[stream]);
+          tails[stream] = '';
+        }
         observeStandards(result.stdout ?? '', 'stdout');
         observeStandards(result.stderr ?? '', 'stderr');
+        for (const stream of ['stdout', 'stderr']) inspectStandardsLine(tails[stream]);
         // Only a matching protected receipt proves it is safe to rerun locally.
-        if (incompleteStandards) return {mode:'cancelled',terminated:true,code:1,reason:'incomplete-standards-inputs'};
+        if (incompleteStandards !== undefined) return {mode:'cancelled',terminated:true,code:1,reason:'incomplete-standards-inputs',detail:incompleteStandards};
       }
       // A verified receipt proves it ran remotely. Without a usable report on a green run, rerun locally;
       // a red run keeps its verdict (verify-lane treats a missing report as unavailable, never green).
