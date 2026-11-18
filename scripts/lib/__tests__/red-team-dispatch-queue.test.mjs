@@ -1409,9 +1409,9 @@ describe('operator-db red-team capacity override', () => {
       const floor = loadRedTeamQueueFloor({ env: { ...operatorEnv(file), WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '2' }, log });
       expect(floor.minConcurrent).toBe(minimum);
       expect(log.mock.calls.flat().join(' ')).toMatch(/minConcurrent=.*operator-db/);
-      const bound = { lanes: 30, startsCeiling: 26, remainingStarts: 0, budget: { left: 30 } };
+      const bound = { lanes: 30, startsCeiling: 10, remainingStarts: 0, budget: { left: 30 } };
       applyRedTeamQueueFloor(bound, { floor, cpuIdlePct: 100 });
-      expect(redTeamQueueAdmitCount(bound)).toBe(Math.min(minimum, 26));
+      expect(redTeamQueueAdmitCount(bound)).toBe(Math.min(minimum, 10));
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it.each([12, 99])('clamps direct floor input %s to the non-operator cap 6', minimum => {
