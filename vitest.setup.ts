@@ -1,4 +1,4 @@
-import { beforeEach, afterEach, afterAll, expect } from 'vitest';
+import { beforeEach, afterEach, afterAll, expect, vi } from 'vitest';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import os, { tmpdir } from 'node:os';
 import { syncBuiltinESMExports } from 'node:module';
@@ -8,6 +8,14 @@ import { FAKE_GH_DIR_ENV, lazyTmpPath, writeFakeGhShim } from './scripts/lib/tes
 import { HERMETIC_ENV, isHermetic } from './scripts/lib/hermetic-tests.mjs';
 import { setupHermeticTestFile } from './scripts/lib/hermetic-tests-vitest.mjs';
 import { KEEPALIVE_ANCHOR_ENV, killKeepAlives } from './scripts/lib/test-keepalive.mjs';
+
+// Check-evidence contract: planner fixtures that declare no read provenance represent a healthy, completely read PR.
+// Lazy (the factory runs only for a file that imports the planner); a fixture stating any provenance key is untouched.
+vi.mock('./scripts/conveyor/reconcile-core.mjs', async importOriginal => {
+  const actual = await importOriginal<typeof import('./scripts/conveyor/reconcile-core.mjs')>();
+  const { withHealthyPlannerInput } = await import('./scripts/conveyor/__tests__/helpers/healthy-pr-evidence.mjs');
+  return { ...actual, planReconcile: (input: unknown, ...rest: unknown[]) => (actual.planReconcile as (...a: unknown[]) => unknown)(withHealthyPlannerInput(input), ...rest) };
+});
 
 // Host-store isolation: scripts/lib/operator-override-reader.mjs resolves the live operator-override store from
 // os.userInfo().homedir (account database, deliberately not $HOME). Point that at an empty path in every test
