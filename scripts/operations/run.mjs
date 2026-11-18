@@ -27,7 +27,7 @@ import { appendEntry } from './ruled-weakened-store.mjs';
 import { ruledWeakenedAddOperation, RULED_WEAKENED_ADD_OP, RULED_WEAKENED_ADD_EFFECT, finishRuledWeakenedAdd } from './ruled-weakened-add.mjs';
 import { OPERATOR_OVERRIDE_OPS, OPERATOR_OVERRIDE_EFFECT, operatorOverrideOperation, finishOperatorOverride } from './operator-override.mjs';
 import { readEffectivePolicies, writeWithEffective, effectiveOverrideReport } from '../lib/effective-policy.mjs';
-import { lastOverrideReason, readOperatorOverrides, writeOperatorOverride, clearOperatorOverride } from '../lib/operator-override-store.mjs';
+import { lastOverrideReason, readOperatorSnapshot, readOperatorOverrides, writeOperatorOverride, clearOperatorOverride } from '../lib/operator-override-store.mjs';
 import { aiRoutingOperation, AI_ROUTING_OP, finishAiRouting } from './ai-routing.mjs';
 import { resolveAiRouting, aiRoutingInputs, AI_ROUTING_ROLES } from '../lib/ai-routing.mjs';
 import { routingOverrideOperation, ROUTING_OVERRIDE_OP } from './routing-override.mjs';
@@ -274,7 +274,7 @@ export const OPERATIONS = Object.freeze({
     return { settings: routing.value, sources: routing.sources, invalid: routing.invalid,
       inputs: Object.fromEntries(AI_ROUTING_ROLES.map(role => [role, aiRoutingInputs(role, routing)])) };
   } }), sinks: {}, finish: finishAiRouting }),
-  'operator-override-show': () => ({ declaration: operatorOverrideOperation('operator-override-show', { readOverrides: () => readOperatorOverrides(), readEffective: values => effectiveOverrideReport(values, readEffectivePolicies()) }), sinks: {} }),
+  'operator-override-show': () => ({ declaration: operatorOverrideOperation('operator-override-show', { readOverrides: () => readOperatorSnapshot(), readEffective: (values, generation) => effectiveOverrideReport(values, readEffectivePolicies(), generation) }), sinks: {} }),
   [ROUTING_OVERRIDE_OP]: () => ({ declaration: routingOverrideOperation(), sinks: createRoutingOverrideSinks() }),
   [MANUAL_DAEMON_PASS_OP]: () => ({ declaration: manualDaemonPassOperation(), sinks: createManualDaemonPassSinks() }),
   [PR_TRACE_OP]: () => ({ declaration: prTraceOperation({ readFacts: createPrTraceReader() }), sinks: {}, finish: finishPrTrace }),

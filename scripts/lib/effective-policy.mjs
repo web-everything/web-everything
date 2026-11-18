@@ -1,9 +1,9 @@
 /** Observations only: never resolve a policy again in the operator process. */
+import { CAPACITY_LEAVES } from './operator-override-reader.mjs';
 import { discoverDaemonLogPaths } from '../operations/daemon-log-paths.mjs';
 import { openSync, fstatSync, readSync, closeSync } from 'node:fs';
 
 const marker = /policy-cascade · ([\w.-]+): (.*)/;
-const evidence = Symbol('cascade evidence');
 const policyOf = key => key.slice(0, key.indexOf('.'));
 const clean = value => String(value).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
 
@@ -13,14 +13,18 @@ export function parseCascadeLines(text) {
   for (const line of String(text).split('\n')) {
     const match = line.match(marker);
     if (!match) continue;
+    const suffix = match[2].match(/ · operator-gen=(\d+|unknown)$/);
+    const n = suffix && suffix[1] !== 'unknown' ? Number(suffix[1]) : null;
+    const gen = Number.isSafeInteger(n) && n >= 0 ? n : null;
+    const body = suffix ? match[2].slice(0, suffix.index) : match[2];
     const leaves = {};
     // Match complete JSON values, including strings/objects containing commas or parentheses.
     const parts = /(?:^|, )([\w.-]+)=(.*?) \((standard|platform|tool|env|operator-db)\)(?=, | · ignored invalid:|$)/g;
-    for (const part of match[2].matchAll(parts)) {
+    for (const part of body.matchAll(parts)) {
       try { Object.defineProperty(leaves, part[1], { value: { value: JSON.parse(part[2]), layer: part[3] }, enumerable: true, configurable: true }); }
       catch { /* Formatter truncates long values: refuse to guess. */ }
     }
-    Object.defineProperty(parsed, match[1], { value: leaves, enumerable: true, configurable: true });
+    Object.defineProperty(parsed, match[1], { value: { gen, leaves }, enumerable: true, configurable: true });
   }
   return parsed;
 }
@@ -30,7 +34,7 @@ export function effectiveForKeys(parsedByDaemon, keys) {
   return Object.fromEntries(keys.map(key => {
     const policy = policyOf(key), leaf = key.slice(policy.length + 1);
     return [key, Object.fromEntries(Object.entries(parsedByDaemon)
-      .map(([daemon, policies]) => [daemon, policies[policy]?.[leaf] ?? { value: null, layer: 'unknown' }]))];
+      .map(([daemon, policies]) => [daemon, { ...(policies[policy]?.leaves?.[leaf] ?? { value: null, layer: 'unknown' }), gen: policies[policy]?.gen ?? null }]))];
   }));
 }
 
@@ -48,24 +52,28 @@ export function shadowWarnings(overrideValues, effective) {
 }
 
 /** PURE: shared shape for the optional show report. */
-export function effectiveOverrideReport(values, parsedByDaemon) {
-  const effective = effectiveForKeys(parsedByDaemon, Object.keys(values));
-  return { effective: Object.entries(values).map(([key, value]) => ({ key, override: value, daemons: effective[key] })),
+export function effectiveOverrideReport(values, parsedByDaemon, generation = null) {
+  const keys = [...new Set([...Object.keys(values), ...Object.keys(CAPACITY_LEAVES).filter(key =>
+    Object.values(parsedByDaemon).some(policies => Object.hasOwn(policies, policyOf(key))))])];
+  const effective = effectiveForKeys(parsedByDaemon, keys);
+  for (const rows of Object.values(effective)) for (const seen of Object.values(rows))
+    seen.status = generation !== null && seen.gen !== null && seen.gen >= generation && seen.layer !== 'unknown' ? 'confirmed' : 'stale/unconfirmed';
+  return { generation, effective: keys.map(key => ({ key, override: values[key] ?? null, daemons: effective[key] })),
     warnings: shadowWarnings(values, effective) };
 }
 
-/** Read identity and bytes from the same descriptor, never a stat/open path race. */
+/** Read a bounded tail from one descriptor. */
 function policyTail(path, { maxBytes }) {
   const fd = openSync(path, 'r');
   try {
-    const { dev, ino, size } = fstatSync(fd);
+    const { size } = fstatSync(fd);
     const start = Math.max(0, size - maxBytes), buffer = Buffer.alloc(size - start);
     const count = readSync(fd, buffer, 0, buffer.length, start);
-    if (count !== buffer.length || fstatSync(fd).size < size) throw Error('log truncated during read');
+    if (count !== buffer.length) throw Error('log truncated during read');
     // Drop the partial first line as bytes, before decoding a possible split UTF-8 character.
     const skip = start > 0 ? (buffer.includes(10) ? buffer.indexOf(10) + 1 : buffer.length) : 0;
     const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(buffer.subarray(skip));
-    return { text, dev, ino, size, start: start + skip };
+    return { text };
   } finally { closeSync(fd); }
 }
 
@@ -74,34 +82,20 @@ export function readEffectivePolicies({ discover = discoverDaemonLogPaths, tail 
   let paths;
   try { paths = discover(); } catch { return {}; }
   return Object.fromEntries(Object.entries(paths).map(([daemon, path]) => {
-    let text = '', record, start;
+    let text = '';
     try {
       const result = tail(path, { maxBytes });
       if (result && !result.error) {
         text = result.text;
-        ({ start } = result);
-        if (result.truncated) {
-          const skipped = text.includes('\n') ? text.indexOf('\n') + 1 : text.length;
-          start += Buffer.byteLength(text.slice(0, skipped));
-          text = text.slice(skipped);
-        }
-        if ([result.dev, result.ino, result.size, start].every(n => Number.isSafeInteger(n) && n >= 0))
-          record = { dev: result.dev, ino: result.ino, size: result.size };
+        if (result.truncated) text = text.includes('\n') ? text.slice(text.indexOf('\n') + 1) : '';
       }
     } catch { /* Keep the daemon with unknown evidence. */ }
-    const parsed = parseCascadeLines(text), offsets = {};
-    let offset = start;
-    for (const line of text.split('\n')) {
-      const match = line.match(marker);
-      if (match) Object.defineProperty(offsets, match[1], { value: { start: offset, end: offset + Buffer.byteLength(line) }, configurable: true });
-      offset += Buffer.byteLength(line) + 1;
-    }
-    Object.defineProperty(parsed, evidence, { value: { record, offsets } });
+    const parsed = parseCascadeLines(text);
     return [daemon, parsed];
   }));
 }
 
-/** Capture BEFORE publication; only fresh policy evidence can confirm adoption. Write errors propagate. */
+/** Capture before publication; only committed generations confirm observation. Write errors propagate. */
 export async function writeWithEffective(input, { write, read = readEffectivePolicies,
   now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), pollMs = 1000 } = {}) {
   const { waitMs = 120000, ...payload } = input;
@@ -111,13 +105,10 @@ export async function writeWithEffective(input, { write, read = readEffectivePol
   const safeRead = () => { try { return read(); } catch { return {}; } };
   const initial = safeRead();
   const result = await write(payload);
-  // Timestamp-free logs need a conservative byte boundary AFTER publication completes.
-  // Adoption already logged during write() cannot be distinguished from the previous override.
-  const published = safeRead();
   const changes = result.changes ?? [{ key: result.key, new: result.new }];
   const values = Object.fromEntries(changes.map(c => [c.key, c.new])), keys = Object.keys(values);
   const before = effectiveForKeys(initial, keys);
-  let latest = published, after, pending;
+  let latest = safeRead(), after, pending;
   const deadline = now() + waitMs;
   const inspect = () => {
     after = effectiveForKeys(latest, keys);
@@ -125,20 +116,10 @@ export async function writeWithEffective(input, { write, read = readEffectivePol
       const daemons = new Set([...Object.keys(before[key]), ...Object.keys(after[key])]);
       if (!daemons.size) return [`${key}: not yet seen by any daemon (inspect daemon logs)`];
       return [...daemons].flatMap(daemon => {
-        const seen = after[key][daemon], policy = policyOf(key);
-        if (!Object.hasOwn(latest[daemon] ?? {}, policy))
-          return [clean(`${key}: no policy line seen (${daemon})`)];
-        const oldLog = initial[daemon]?.[evidence], newLog = latest[daemon]?.[evidence];
-        const old = oldLog?.record, boundary = published[daemon]?.[evidence]?.record, current = newLog?.record;
-        if (!old || !boundary || !current || old.dev !== boundary.dev || old.ino !== boundary.ino
-          || boundary.size < old.size || boundary.dev !== current.dev || boundary.ino !== current.ino
-          || current.size < boundary.size)
-          return [clean(`${key}: ${daemon}: log rotated/unverifiable; cannot prove the line is newer than the write`)];
-        const position = newLog.offsets[policy];
-        const fresh = position && position.start >= boundary.size && position.end <= current.size;
-        const matches = seen && seen.layer !== 'unknown' && (values[key] === null
-          ? seen.layer !== 'operator-db' : seen.layer === 'operator-db' && Object.is(seen.value, values[key]));
-        return fresh && matches ? [] : [clean(`${key}: not yet seen by ${daemon}`)];
+        const seen = after[key][daemon];
+        const confirmed = Number.isSafeInteger(result.generation) && seen?.gen !== null
+          && seen?.gen >= result.generation && seen.layer !== 'unknown';
+        return confirmed ? [] : [clean(`${key}: unconfirmed (${daemon}: last seen gen ${seen?.gen ?? 'unknown'})`)];
       });
     });
   };

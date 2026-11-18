@@ -29,7 +29,7 @@ import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readOperatorOverrides, CAPACITY_LEAVES, failClosedCapacity } from './operator-override-reader.mjs';
+import { readOperatorSnapshot, CAPACITY_LEAVES, failClosedCapacity } from './operator-override-reader.mjs';
 import { isUnderTest } from './under-test.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -203,7 +203,7 @@ export function resolveCascade({ standard, platform, tool, envValues = {}, valid
 const fmt = (v) => { const s = JSON.stringify(v); return s && s.length > 60 ? `${s.slice(0, 57)}...` : s; };
 
 /** PURE: the one source line for a resolved policy. */
-export function formatCascadeSourcesLine(policy, { value, sources = {}, leafValues, invalid = [] } = {}) {
+export function formatCascadeSourcesLine(policy, { value, sources = {}, leafValues, invalid = [], generation } = {}) {
   const parts = Object.entries(sources).map(([leaf, layer]) => {
     let v = value;
     if (leafValues && Object.hasOwn(leafValues, leaf)) v = leafValues[leaf];
@@ -211,7 +211,7 @@ export function formatCascadeSourcesLine(policy, { value, sources = {}, leafValu
     return `${leaf || 'value'}=${fmt(v)} (${layer})`;
   });
   const bad = invalid.length ? ` · ignored invalid: ${invalid.join('; ')}` : '';
-  return `policy-cascade · ${policy}: ${parts.join(', ') || '(no value)'}${bad}`;
+  return `policy-cascade · ${policy}: ${parts.join(', ') || '(no value)'}${bad}${generation === undefined ? '' : ` · operator-gen=${generation ?? 'unknown'}`}`;
 }
 
 const logged = new Map();
@@ -256,9 +256,11 @@ export function cascadePolicy(policy, tool, { standard, envValues, valid, platfo
   }
   let plat = platform;
   if (plat === undefined) { try { plat = platformPreference(policy, { env }); } catch { plat = undefined; } }
-  if (operatorOverride === undefined) operatorOverride = readOperatorPolicy(policy, { env, log });
+  let generation = null;
+  if (operatorOverride === undefined) ({ operatorOverride, generation } = readOperatorPolicy(policy, { log, snapshot: true }));
   const capacityLeaves = capacityPolicyLeaves(policy);
   const resolved = resolveCascade({ standard, platform: plat, tool, envValues, valid, operatorOverride, capacityLeaves, log });
+  resolved.generation = generation;
   logCascadeSources(policy, resolved, { env, ...(log ? { log } : {}) });
   // `layered`: platform under tool only (no standard, no env) — the drop-in replacement for a reader's tool block.
   const layered = resolveCascade({ standard: operatorOverride === null && capacityLeaves.length ? standard : undefined,
@@ -268,11 +270,12 @@ export function cascadePolicy(policy, tool, { standard, envValues, valid, platfo
 
 /** Read each call, filtering the exact policy prefix. Null means unreadable; {} means missing/empty.
  * Tests isolate the store through the explicit file seam, never environment flags. */
-export function readOperatorPolicy(policy, { file, log } = {}) {
-  const { readable, values, invalidPolicies = [] } = readOperatorOverrides({ ...(file !== undefined ? { file } : {}), ...(log ? { log } : {}) });
-  if (!readable || invalidPolicies.includes(policy) || invalidPolicies.includes('*')) return null;
+export function readOperatorPolicy(policy, { file, log, snapshot = false } = {}) {
+  const { readable, values, generation, invalidPolicies = [] } = readOperatorSnapshot({ ...(file !== undefined ? { file } : {}), ...(log ? { log } : {}) });
+  const invalid = !readable || invalidPolicies.includes(policy) || invalidPolicies.includes('*');
   const prefix = `${policy}.`;
-  return Object.fromEntries(Object.entries(values).filter(([key]) => key.startsWith(prefix)).map(([key, value]) => [key.slice(prefix.length), value]));
+  const operatorOverride = invalid ? null : Object.fromEntries(Object.entries(values).filter(([key]) => key.startsWith(prefix)).map(([key, value]) => [key.slice(prefix.length), value]));
+  return snapshot ? { operatorOverride, generation } : operatorOverride;
 }
 
 /** Test seam: forget what was logged. @test-only-export-ok */

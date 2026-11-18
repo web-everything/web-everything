@@ -1,13 +1,13 @@
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, writeFileSync, appendFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { formatCascadeSourcesLine } from '../policy-cascade.mjs';
-import { parseCascadeLines, effectiveForKeys, shadowWarnings, readEffectivePolicies, writeWithEffective } from '../effective-policy.mjs';
+import { parseCascadeLines, effectiveForKeys, shadowWarnings, readEffectivePolicies, writeWithEffective, effectiveOverrideReport } from '../effective-policy.mjs';
 import { discoverDaemonLogPaths } from '../../operations/daemon-log-paths.mjs';
 
 const key = 'reviewConcurrency.maxLiveReviewRounds';
-const line = (value, layer) => formatCascadeSourcesLine('reviewConcurrency', { value: { maxLiveReviewRounds: value }, sources: { maxLiveReviewRounds: layer } });
+const line = (value, layer, generation) => formatCascadeSourcesLine('reviewConcurrency', { value: { maxLiveReviewRounds: value }, generation, sources: { maxLiveReviewRounds: layer } });
 describe('effective policy observations', () => {
   it('round-trips the existing formatter for all layers, nested leaves and JSON values', () => {
     const leafValues = { count: 8, flag: false, text: 'a, b (env)', object: { x: 2 }, array: [1, 2], nil: null, 'nested.cap': 3 };
@@ -15,117 +15,73 @@ describe('effective policy observations', () => {
     const sources = Object.fromEntries(Object.keys(leafValues).map((leaf, i) => [leaf, layers[i % layers.length]]));
     const formatted = formatCascadeSourcesLine('test', { leafValues, sources });
     expect(parseCascadeLines(`[timestamp] ${formatted} · ignored invalid: test`)).toEqual({ test:
-      Object.fromEntries(Object.entries(leafValues).map(([leaf, value]) => [leaf, { value, layer: sources[leaf] }])) });
+      { gen: null, leaves: Object.fromEntries(Object.entries(leafValues).map(([leaf, value]) => [leaf, { value, layer: sources[leaf] }])) } });
   });
   it('keeps latest per policy, replacing absent/malformed leaves rather than retaining stale values', () => {
-    expect(parseCascadeLines(`${line(8, 'operator-db')}\n${line(6, 'env')}`)).toEqual({ reviewConcurrency: { maxLiveReviewRounds: { value: 6, layer: 'env' } } });
-    expect(parseCascadeLines(`${line(8, 'operator-db')}\npolicy-cascade · reviewConcurrency: maxLiveReviewRounds=bad (env)`)).toEqual({ reviewConcurrency: {} });
+    expect(parseCascadeLines(`${line(8, 'operator-db')}\n${line(6, 'env')}`)).toEqual({ reviewConcurrency: { gen: null, leaves: { maxLiveReviewRounds: { value: 6, layer: 'env' } } } });
+    expect(parseCascadeLines(`${line(8, 'operator-db')}\npolicy-cascade · reviewConcurrency: maxLiveReviewRounds=bad (env)`)).toEqual({ reviewConcurrency: { gen: null, leaves: {} } });
     expect(parseCascadeLines('noise')).toEqual({});
   });
   it('refuses formatter-truncated values and unknown layers', () => {
-    expect(parseCascadeLines(formatCascadeSourcesLine('test', { value: 'a'.repeat(80), sources: { '': 'env' } }))).toEqual({ test: {} });
-    expect(parseCascadeLines('policy-cascade · test: cap=8 (mystery)')).toEqual({ test: {} });
+    expect(parseCascadeLines(formatCascadeSourcesLine('test', { value: 'a'.repeat(80), sources: { '': 'env' } }))).toEqual({ test: { gen: null, leaves: {} } });
+    expect(parseCascadeLines('policy-cascade · test: cap=8 (mystery)')).toEqual({ test: { gen: null, leaves: {} } });
   });
   it('maps nested keys for every discovered daemon, including unrelated and unreadable logs', () => {
     expect(effectiveForKeys({ review: parseCascadeLines(line(6, 'env')), unreadable: {}, unrelated: { host: {} } }, [key])).toEqual({
-      [key]: { review: { value: 6, layer: 'env' }, unreadable: { value: null, layer: 'unknown' }, unrelated: { value: null, layer: 'unknown' } },
+      [key]: { review: { value: 6, layer: 'env', gen: null }, unreadable: { value: null, layer: 'unknown', gen: null }, unrelated: { value: null, layer: 'unknown', gen: null } },
     });
-  });
-  it('keeps a readable daemon with no requested policy line pending after another adopts', async () => {
-    let published = false;
-    const result = await writeWithEffective({ waitMs: 1 }, {
-      read: () => readEffectivePolicies({ discover: () => ({ review: 'review', other: 'other' }),
-        tail: path => {
-          const text = path === 'other' ? 'policy-cascade · host: cap=2 (env)'
-            : line(6, 'env') + (published ? '\n' + line(8, 'operator-db') : '');
-          return { text, dev: 1, ino: 1, size: Buffer.byteLength(text), start: 0 };
-        } }),
-      write: () => ({ key, new: 8 }), now: () => 100, sleep: async () => { published = true; }, pollMs: 1,
-    });
-    expect(result.observation).toBe('timeout');
-    expect(result.pending).toEqual([`${key}: no policy line seen (other)`]);
-    expect(result.warnings[0]).toContain('other: effective value unavailable');
   });
   it.each([
-    ['rotated log with old matching line and fresh unrelated activity', 2, 1, 'old', false, 'timeout'],
-    ['inode changed despite an appended match', 2, 1, 'append', false, 'timeout'],
-    ['device changed', 1, 2, 'append', false, 'timeout'],
-    ['truncated log', 1, 1, 'truncate', false, 'timeout'],
-    ['unreadable before write', 1, 1, 'append', true, 'timeout'],
-    ['normal append after offset with unchanged mtime', 1, 1, 'append', false, 'observed'],
-    ['identical policy line appended again', 1, 1, 'repeat', false, 'observed'],
-    ['old matching line plus unrelated append', 1, 1, 'old', false, 'timeout'],
-    ['line crossing the write offset', 1, 1, 'cross', false, 'timeout'],
-  ])('proves freshness by byte offset: %s', async (_name, ino, dev, mode, unreadable, observation) => {
-    let published = false;
-    const matching = line(8, 'operator-db');
-    const initial = mode === 'truncate' ? 'noise'.repeat(100) : mode === 'cross' ? matching.slice(0, 20)
-      : mode === 'old' || mode === 'repeat' ? matching + '\n' : 'é before\n' + line(6, 'env') + '\n';
-    const after = mode === 'truncate' ? matching + '\n' : mode === 'cross' ? matching + '\n'
-      : initial + (mode === 'old' ? 'fresh unrelated activity\n' : matching + '\n');
+    ['matching generation', 3, 'operator-db', 'observed'],
+    ['later generation', 4, 'operator-db', 'observed'],
+    ['environment shadow', 3, 'env', 'observed'],
+    ['lower generation', 2, 'operator-db', 'timeout'],
+    ['missing generation', undefined, 'operator-db', 'timeout'],
+    ['unknown generation', null, 'operator-db', 'timeout'],
+  ])('%s confirms only generation evidence', async (_name, gen, layer, observation) => {
     const result = await writeWithEffective({ waitMs: 1 }, {
-      read: () => readEffectivePolicies({ discover: () => ({ review: 'review' }), tail: () => {
-        if (!published && unreadable) throw Error('denied');
-        const text = published ? after : initial;
-        return { text, size: Buffer.byteLength(text), dev: published ? dev : 1,
-          ino: published ? ino : 1, start: 0, mtimeMs: mode === 'append' && ino === 1 && dev === 1 ? 90 : published ? 101 : 90 };
-      } }),
-      write: () => ({ key, new: 8 }), now: () => 100, sleep: async () => { published = true; }, pollMs: 1,
+      read: () => ({ review: parseCascadeLines(line(8, layer, gen)) }),
+      write: () => ({ key, new: 8, generation: 3 }), now: () => 100, sleep: async () => {}, pollMs: 1,
     });
     expect(result.observation).toBe(observation);
-    if (ino !== 1 || dev !== 1 || unreadable || mode === 'truncate')
-      expect(result.pending[0]).toContain('log rotated/unverifiable; cannot prove the line is newer than the write');
-    else expect(result.pending).toEqual(observation === 'observed' ? [] : [`${key}: not yet seen by review`]);
+    expect(result.pending).toEqual(observation === 'observed' ? [] : [`${key}: unconfirmed (review: last seen gen ${gen ?? 'unknown'})`]);
+    if (layer === 'env') expect(result.warnings[0]).toContain('env shadows');
   });
-  it('does not acknowledge a matching append before publication', async () => {
-    let text = line(6, 'env') + '\n', published = false;
-    const result = await writeWithEffective({ waitMs: 1 }, {
-      read: () => readEffectivePolicies({ discover: () => ({ review: 'review' }),
-        tail: () => ({ text, dev: 1, ino: 1, size: Buffer.byteLength(text), start: 0 }) }),
-      write: async () => {
-        // A daemon sees the previous matching override while publication is still waiting.
-        await Promise.resolve();
-        text += line(8, 'operator-db') + '\n';
-        await Promise.resolve();
-        published = true;
-        return { key, new: 8 };
-      },
-      now: () => 100, sleep: async () => {}, pollMs: 1,
-    });
-    expect(published).toBe(true);
-    expect(result.observation).toBe('timeout');
-    expect(result.pending).toEqual([`${key}: not yet seen by review`]);
+  it('round-trips generation suffix including invalid leaves and unknown generation', () => {
+    for (const generation of [0, 42, null]) {
+      const text = formatCascadeSourcesLine('test', { value: { cap: 8 }, sources: { cap: 'env' }, invalid: ['bad'], generation });
+      expect(parseCascadeLines(text)).toEqual({ test: { gen: generation, leaves: { cap: { value: 8, layer: 'env' } } } });
+    }
   });
-  it.each(['unreadable boundary', 'line crossing boundary'])('refuses %s after publication', async mode => {
-    const matching = line(8, 'operator-db') + '\n';
-    let text = line(6, 'env') + '\n', reads = 0;
+  it('keeps no-line, unreadable and unreported-value daemons unconfirmed while another adopts', async () => {
     const result = await writeWithEffective({ waitMs: 1 }, {
-      read: () => readEffectivePolicies({ discover: () => ({ review: 'review' }), tail: () => {
-        if (++reads === 2 && mode === 'unreadable boundary') throw Error('denied');
-        return { text, dev: 1, ino: 1, size: Buffer.byteLength(text), start: 0 };
+      read: () => readEffectivePolicies({ discover: () => ({ review: 'ok', other: 'other', bad: 'bad', malformed: 'malformed' }), tail: path => {
+        if (path === 'bad') throw Error('denied');
+        return { text: path === 'ok' ? line(8, 'operator-db', 3) : path === 'malformed'
+          ? 'policy-cascade · reviewConcurrency: maxLiveReviewRounds=bad (env) · operator-gen=3' : 'unrelated' };
       } }),
-      write: () => {
-        if (mode === 'line crossing boundary') text += matching.slice(0, 20);
-        return { key, new: 8 };
-      },
-      now: () => 100, sleep: async () => { text += mode === 'line crossing boundary' ? matching.slice(20) : matching; }, pollMs: 1,
+      write: () => ({ key, new: 8, generation: 3 }), now: () => 0, sleep: async () => {}, pollMs: 1,
     });
     expect(result.observation).toBe('timeout');
-    expect(result.pending[0]).toContain(mode === 'unreadable boundary' ? 'log rotated/unverifiable' : 'not yet seen');
+    expect(result.pending).toEqual(['other', 'bad', 'malformed'].map(d => `${key}: unconfirmed (${d}: last seen gen ${d === 'malformed' ? 3 : 'unknown'})`));
   });
-  it('reads real bounded tails with a split UTF-8 prefix and observes only appended bytes', async () => {
+  it('accepts adoption during an asynchronous write without needing another log append', async () => {
+    let text = line(6, 'env', 2);
+    const result = await writeWithEffective({ waitMs: 1 }, {
+      read: () => ({ review: parseCascadeLines(text) }),
+      write: async () => { await Promise.resolve(); text = line(8, 'operator-db', 3); return { key, new: 8, generation: 3 }; },
+      sleep: async () => { throw Error('already observed'); },
+    });
+    expect(result.observation).toBe('observed');
+  });
+  it('reads bounded real UTF-8 tails without filesystem freshness metadata', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'effective-policy-'));
     const path = join(dir, 'daemon.log');
     try {
-      const matching = line(8, 'operator-db') + '\n';
+      const matching = line(8, 'operator-db', 3) + '\n';
       writeFileSync(path, 'é'.repeat(100) + '\n' + matching);
-      const run = append => writeWithEffective({ waitMs: 1 }, {
-        read: () => readEffectivePolicies({ discover: () => ({ review: path }), maxBytes: Buffer.byteLength(matching) + 4 }),
-        write: () => ({ key, new: 8 }),
-        now: () => 100, sleep: async () => { appendFileSync(path, append); }, pollMs: 1,
-      });
-      expect((await run('x\n')).observation).toBe('timeout');
-      expect((await run(matching)).observation).toBe('observed');
+      expect(readEffectivePolicies({ discover: () => ({ review: path }), maxBytes: Buffer.byteLength(matching) + 4 }))
+        .toEqual({ review: parseCascadeLines(matching) });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('warns once per key on env-shadow, value mismatch, and missing evidence; operator-db match is clean', () => {
@@ -162,4 +118,23 @@ describe('effective policy observations', () => {
     expect(paths['pass:audit']).toBe('/pass-daemon.mjs.log');
     expect(paths.fix).toContain('fix-dispatch-daemon.log');
   });
+});
+
+it('show reports logged generations after clear and marks missing/lower evidence stale', () => {
+  const report = effectiveOverrideReport({}, {
+    current: parseCascadeLines(line(6, 'env', 3)), stale: parseCascadeLines(line(8, 'operator-db', 2)), absent: {},
+  }, 3);
+  expect(report.generation).toBe(3);
+  expect(report.effective.find(row => row.key === key)).toEqual({ key, override: null, daemons: {
+    current: { gen: 3, value: 6, layer: 'env', status: 'confirmed' },
+    stale: { gen: 2, value: 8, layer: 'operator-db', status: 'stale/unconfirmed' },
+    absent: { gen: null, value: null, layer: 'unknown', status: 'stale/unconfirmed' },
+  } });
+});
+
+it('a latest legacy or unknown line replaces earlier generation evidence', () => {
+  for (const gen of [undefined, null]) {
+    const parsed = parseCascadeLines(line(8, 'operator-db', 4) + '\n' + line(8, 'operator-db', gen));
+    expect(parsed.reviewConcurrency.gen).toBeNull();
+  }
 });

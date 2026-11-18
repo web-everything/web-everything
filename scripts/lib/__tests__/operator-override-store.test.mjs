@@ -166,7 +166,7 @@ describe('capacity-only operator store', () => {
     expect(append).toBeGreaterThanOrEqual(0); expect(stage).toBeGreaterThan(append); expect(publish).toBeGreaterThan(stage);
     const [, temporary] = io.events[stage];
     expect(temporary).not.toBe(file); expect(temporary.startsWith(dir + '/')).toBe(true);
-    expect(io.events[publish].slice(1)).toEqual([temporary, file]);
+    expect(io.events[publish].slice(1)).toEqual([temporary, store.operatorGenerationPath(file)]);
     expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ [key]: 3 });
   });
   it('audit append failure preserves the existing override store and propagates failure', () => {
@@ -266,6 +266,8 @@ describe('capacity-only operator store', () => {
       releaseNumberingLockIfOwned(lockRoot, owner, lockPath);
       await Promise.all(children.map(c => c.done));
       expect(store.readOperatorOverrides({ file }).values).toEqual({ [key]: 3, 'host.maxReviewDispatchPerTick': 3 });
+      expect(store.readOperatorGeneration({ file })).toBe(2);
+      expect(readFileSync(join(dir, 'operator-overrides.log.jsonl'), 'utf8').trim().split('\n').map(row => JSON.parse(row).generation)).toEqual([1, 2]);
       expect(readFileSync(join(dir, 'operator-overrides.log.jsonl'), 'utf8').trim().split('\n').map(JSON.parse)).toHaveLength(2);
     } finally {
       releaseNumberingLockIfOwned(lockRoot, owner, lockPath);
@@ -343,4 +345,36 @@ it('a hand-edited inverted store audits the floor the normalising write actually
   write(3);
   expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ [FLOOR]: 1, [CEILING]: 1, [key]: 3 });
   expect(auditRows()).toMatchObject([{ key, old: null, new: 3 }, { key: FLOOR, old: 7, new: 1 }]);
+});
+
+it('increments persistent generations on every set and clear, including repeated clears', () => {
+  expect(store.readOperatorGeneration({ file })).toBeNull();
+  expect(write(3).generation).toBe(1);
+  expect(write(3).generation).toBe(2);
+  expect(store.clearOperatorOverride({ file, key, reason: 'done', actor }).generation).toBe(3);
+  expect(store.clearOperatorOverride({ file, key, reason: 'again', actor }).generation).toBe(4);
+  expect(store.readOperatorSnapshot({ file })).toMatchObject({ generation: 4, values: {} });
+});
+it('never pairs a generation with values during publication and never reuses a failed reservation', () => {
+  write(2);
+  const observed = [];
+  const io = { ...writerIO, renameSync: (from, to) => {
+    renameSync(from, to);
+    observed.push(store.readOperatorSnapshot({ file }).generation);
+    if (to === file) throw Error('interrupted');
+  } };
+  expect(() => write(3, { io })).toThrow('interrupted');
+  expect(observed).toEqual([null, null]);
+  expect(write(4).generation).toBe(3);
+  expect(store.readOperatorSnapshot({ file })).toMatchObject({ generation: 3, values: { [key]: 4 } });
+});
+it.each(['broken', JSON.stringify({ generation: Number.MAX_SAFE_INTEGER })])('refuses corrupt/exhausted generation with an operator fallback: %s', text => {
+  writeFileSync(store.operatorGenerationPath(file), text);
+  expect(() => write(3)).toThrow('ask the operator to repair');
+});
+
+it('refuses an unreadable generation sidecar without resetting the counter', () => {
+  mkdirSync(store.operatorGenerationPath(file));
+  expect(() => write(3)).toThrow('ask the operator to repair');
+  expect(existsSync(file)).toBe(false);
 });

@@ -8,7 +8,7 @@ const operatorFixture = await vi.hoisted(async () => {
 });
 vi.mock('../operator-override-reader.mjs', async importOriginal => {
   const actual = await importOriginal();
-  return { ...actual, readOperatorOverrides: options => {
+  return { ...actual, readOperatorSnapshot: options => actual.readOperatorSnapshot({ ...options, file: options?.file ?? operatorFixture.file }), readOperatorOverrides: options => {
     const file = options?.file ?? operatorFixture.file;
     if (!file) throw new Error('Test must inject an operator-store file');
     return actual.readOperatorOverrides({ ...options, file });

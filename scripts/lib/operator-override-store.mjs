@@ -1,12 +1,12 @@
 /** Host-wide capacity override writer.
  * Audit is appended before atomic publication; a failed audit never changes the store.
  */
-import { appendFileSync, writeFileSync, renameSync, mkdirSync, unlinkSync } from 'node:fs';
+import { readFileSync, appendFileSync, writeFileSync, renameSync, mkdirSync, unlinkSync } from 'node:fs';
 import { withNumberingLock } from '../readiness/drain-lock.mjs';
 import { userInfo } from 'node:os';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { CAPACITY_LEAVES, readOperatorOverrides, operatorOverridesPath, validateKey } from './operator-override-reader.mjs';
+import { CAPACITY_LEAVES, operatorGenerationPath, readOperatorOverrides, operatorOverridesPath, validateKey } from './operator-override-reader.mjs';
 export * from './operator-override-reader.mjs';
 
 const safe = s => String(s).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
@@ -24,6 +24,14 @@ function publish({ file = operatorOverridesPath(), key, value, reason, actor,
   const locked = withNumberingLock(() => {
     const current = readOperatorOverrides({ file, normalize: false });
     if (!current.readable || current.invalidPolicies?.length) throw Error('operator-override: unreadable or invalid store; repair it before writing');
+    let previous = 0;
+    try {
+      previous = JSON.parse(readFileSync(operatorGenerationPath(file), 'utf8')).generation;
+      if (!Number.isSafeInteger(previous) || previous < 0 || previous === Number.MAX_SAFE_INTEGER) throw Error('invalid generation');
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw Error('operator-override: unreadable, invalid or exhausted generation; ask the operator to repair the sidecar');
+    }
+    const generation = previous + 1;
     const values = current.values;
     const before = { ...values };
     if (clear) delete values[key]; else values[key] = value;
@@ -35,16 +43,22 @@ function publish({ file = operatorOverridesPath(), key, value, reason, actor,
     const requested = clear ? null : value;
     mkdirSync(dirname(file), { recursive: true });
     io.appendFileSync(join(dirname(file), 'operator-overrides.log.jsonl'), changes.map(change => JSON.stringify({
-      ts: new Date().toISOString(), actor, osUser: userInfo().username, reason, ...change,
+      ts: new Date().toISOString(), generation, actor, osUser: userInfo().username, reason, ...change,
       ...(change.key === key && change.new !== requested ? { requested } : {}), source: 'operator-cli',
     }) + '\n').join(''), { mode: 0o600 });
-    const temporary = `${file}.${randomUUID()}.tmp`;
-    try {
-      io.writeFileSync(temporary, JSON.stringify(values, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
-      io.renameSync(temporary, file);
-    } finally { try { unlinkSync(temporary); } catch { /* Rename consumes the temporary file. */ } }
+    const atomic = (destination, data) => {
+      const temporary = `${destination}.${randomUUID()}.tmp`;
+      try {
+        io.writeFileSync(temporary, JSON.stringify(data, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+        io.renameSync(temporary, destination);
+      } finally { try { unlinkSync(temporary); } catch { /* Rename consumes the temporary file. */ } }
+    };
+    // Reserve first: a crash/failure can consume a generation, but can never reuse it.
+    atomic(operatorGenerationPath(file), { generation, values: null });
+    atomic(file, values);
+    atomic(operatorGenerationPath(file), { generation, values });
     const effective = changes[0];
-    return { key, old: effective.old, new: effective.new, ...(effective.new !== requested ? { requested } : {}),
+    return { generation, key, old: effective.old, new: effective.new, ...(effective.new !== requested ? { requested } : {}),
       ...(changes.length > 1 ? { changes } : {}), source: 'operator-cli' };
   }, { lockRoot: `${file}.locks`, lockPath: '<operator-overrides:transaction>',
     waitMs: lockWaitMs, pollMs: 25, runUnlockedOnContention: false });

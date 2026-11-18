@@ -6,6 +6,7 @@ vi.mock('../../lib/operator-override-store.mjs', async importOriginal => {
   const actual = await importOriginal();
   const inject = options => ({ ...options, ...(operatorFixture.file ? { file: operatorFixture.file } : {}) });
   return { ...actual,
+    readOperatorSnapshot: options => actual.readOperatorSnapshot(inject(options)),
     readOperatorOverrides: options => actual.readOperatorOverrides(inject(options)),
     writeOperatorOverride: options => actual.writeOperatorOverride(inject(options)),
     clearOperatorOverride: options => actual.clearOperatorOverride(inject(options)),
@@ -1219,51 +1220,51 @@ describe('capacity writers are CLI only', () => {
 
 describe('effective override observations', () => {
   const key = 'reviewConcurrency.maxLiveReviewRounds';
-  const line = (value, layer, stamp = 'now') => `${stamp} policy-cascade · reviewConcurrency: maxLiveReviewRounds=${value} (${layer})`;
+  const line = (value, layer, stamp = 'now', gen = stamp === 'now' ? 1 : 2) => `${stamp} policy-cascade · reviewConcurrency: maxLiveReviewRounds=${value} (${layer}) · operator-gen=${gen}`;
   const logTail = text => ({ text, dev: 1, ino: 1, size: Buffer.byteLength(text), start: 0 });
   const reader = getText => () => readEffectivePolicies({ discover: () => ({ review: 'review.log' }), tail: () => logTail(getText()) });
   const input = { key, value: 8, reason: 'test', actor: 'human', waitMs: 20 };
   const runWrite = async ({ initial = line(6, 'env'), next = initial, clear = false, waitMs = 20, changes } = {}) => {
     let text = initial, clock = 0;
-    const write = vi.fn(() => ({ key, new: clear ? null : 8, ...(changes ? { changes } : {}) }));
+    const write = vi.fn(() => ({ generation: 2, key, new: clear ? null : 8, ...(changes ? { changes } : {}) }));
     const sleep = vi.fn(ms => { clock += ms; text = next; });
     const result = await writeWithEffective({ ...input, waitMs }, { read: reader(() => text), write,
       now: () => clock, sleep, pollMs: 10 });
     return { result, write, sleep };
   };
   it('show is unchanged by default and --effective reports env-shadow 6 vs override 8', async () => {
-    const readOverrides = () => ({ readable: true, values: { [key]: 8 } });
-    const readEffective = vi.fn(values => effectiveOverrideReport(values, reader(() => line(6, 'env'))()));
+    const readOverrides = () => ({ generation: 2, readable: true, values: { [key]: 8 } });
+    const readEffective = vi.fn((values, generation) => effectiveOverrideReport(values, reader(() => line(6, 'env'))(), generation));
     const declaration = operatorOverrideOperation('operator-override-show', { readOverrides, readEffective });
     const registry = createRegistry(); registry.register(declaration);
     const invoke = argv => runOperationCli({ declaration, registry, argv, store: createMemoryRunStore(), newRunId: () => 'effective-show' });
     const plain = await invoke([]);
     expect(plain.run.verdict).toEqual(readOverrides()); expect(readEffective).not.toHaveBeenCalled();
     const shown = await invoke(['--effective']);
-    expect(shown.run.verdict.effective).toEqual([{ key, override: 8, daemons: { review: { value: 6, layer: 'env' } } }]);
+    expect(shown.run.verdict.effective).toEqual([{ key, override: 8, daemons: { review: { value: 6, layer: 'env', gen: 1, status: 'stale/unconfirmed' } } }]);
     expect(shown.run.verdict.warnings[0]).toContain('env shadows');
   });
   it('captures before write and observes a fresh operator-db match', async () => {
     const { result, sleep } = await runWrite({ initial: line(6, 'env'), next: line(6, 'env') + '\n' + line(8, 'operator-db', 'later') });
-    expect(result.before[key].review).toEqual({ value: 6, layer: 'env' });
-    expect(result.after[key].review).toEqual({ value: 8, layer: 'operator-db' });
+    expect(result.before[key].review).toEqual({ value: 6, layer: 'env', gen: 1 });
+    expect(result.after[key].review).toEqual({ value: 8, layer: 'operator-db', gen: 2 });
     expect(result.observation).toBe('observed'); expect(result.warnings).toEqual([]); expect(sleep).toHaveBeenCalledTimes(1);
   });
   it('env shadow times out with not yet seen, and preserves the write exit code in text/JSON', async () => {
     const { result, sleep } = await runWrite();
     expect(sleep).toHaveBeenCalledTimes(2);
-    expect(result.observation).toBe('timeout'); expect(result.pending).toEqual([`${key}: not yet seen by review`]);
+    expect(result.observation).toBe('timeout'); expect(result.pending).toEqual([`${key}: unconfirmed (review: last seen gen 1)`]);
     expect(result.warnings[0]).toContain('env shadows');
     const run = { effects: [{ type: OPERATOR_OVERRIDE_EFFECT, status: 'applied', result }] };
     const text = finishOperatorOverride({ run, code: 0, lines: ['write complete'] });
     expect(text.code).toBe(0); expect(text.lines.join('\n')).toMatch(/before.*6.*after.*6/);
-    expect(text.lines).toContain(`${key}: not yet seen by review`);
+    expect(text.lines).toContain(`${key}: unconfirmed (review: last seen gen 1)`);
     expect(JSON.parse(finishOperatorOverride({ run, code: 0, lines: ['{"code":0}'], json: true }).lines[0]).effective.observation).toBe('timeout');
   });
   it('stale matching log and unrelated new lines never confirm adoption', async () => {
     const stale = line(8, 'operator-db');
     const { result } = await runWrite({ initial: stale, next: `${stale}\nother activity` });
-    expect(result.observation).toBe('timeout'); expect(result.pending[0]).toContain('not yet seen by review');
+    expect(result.observation).toBe('timeout'); expect(result.pending[0]).toContain('unconfirmed (review: last seen gen 1)');
   });
   it('clear waits for fresh non-operator evidence and reports the actual fallback', async () => {
     const { result } = await runWrite({ initial: line(8, 'operator-db'), next: line(8, 'operator-db') + '\n' + line(6, 'env', 'later'), clear: true });
@@ -1273,9 +1274,9 @@ describe('effective override observations', () => {
   });
   it('unreadable logs and no discovered daemon cannot count as success', async () => {
     for (const discover of [() => ({ review: 'missing' }), () => ({})]) {
-      const result = await writeWithEffective({ ...input, waitMs: 0 }, { write: () => ({ key, new: 8 }),
+      const result = await writeWithEffective({ ...input, waitMs: 0 }, { write: () => ({ generation: 2, key, new: 8 }),
         read: () => readEffectivePolicies({ discover, tail: () => { throw Error('denied'); } }) });
-      expect(result.pending.join(' ')).toMatch(/not yet seen|no policy line seen/); expect(result.warnings).not.toEqual([]);
+      expect(result.pending.join(' ')).toMatch(/not yet seen|unconfirmed/); expect(result.warnings).not.toEqual([]);
     }
   });
   it('zero wait skips sleeping; oversized waits refuse before writing with a fallback', async () => {
@@ -1296,8 +1297,8 @@ describe('effective override observations', () => {
     const result = await writeWithEffective(input, {
       read: () => readEffectivePolicies({ discover: () => ({ first: 'first', second: 'second' }), tail: path => {
         const adopted = clock >= (path === 'first' ? 10 : 20);
-        return logTail(line(6, 'env', path) + (adopted ? '\n' + line(8, 'operator-db', path) : ''));
-      } }), write: () => ({ key, new: 8 }), now: () => clock, sleep, pollMs: 10,
+        return logTail(line(6, 'env', path, 1) + (adopted ? '\n' + line(8, 'operator-db', path) : ''));
+      } }), write: () => ({ generation: 2, key, new: 8 }), now: () => clock, sleep, pollMs: 10,
     });
     expect(sleep).toHaveBeenCalledTimes(2);
     expect(result.observation).toBe('observed'); expect(result.pending).toEqual([]);
@@ -1305,9 +1306,9 @@ describe('effective override observations', () => {
   it('polls all relevant daemons and normalized sibling changes', async () => {
     let clock = 0, published = false;
     const result = await writeWithEffective(input, {
-      read: () => readEffectivePolicies({ discover: () => ({ review: 'review', other: 'other' }), tail: path => logTail(line(6, 'env', path)
+      read: () => readEffectivePolicies({ discover: () => ({ review: 'review', other: 'other' }), tail: path => logTail(line(6, 'env', path, 1)
         + (published && clock >= 10 ? '\n' + line(8, 'operator-db', path) : '')) }),
-      write: () => { published = true; return { key, new: 8, changes: [{ key, new: 8 }, { key: 'reviewConcurrency.other', new: 2 }] }; },
+      write: () => { published = true; return { generation: 2, key, new: 8, changes: [{ key, new: 8 }, { key: 'reviewConcurrency.other', new: 2 }] }; },
       now: () => clock, sleep: ms => { clock += ms; }, pollMs: 10,
     });
     expect(result.after[key].other.value).toBe(8);

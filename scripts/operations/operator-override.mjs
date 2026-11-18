@@ -11,7 +11,7 @@ export function operatorOverrideOperation(name, { readOverrides = () => ({ reada
       const result = readOverrides();
       if (!result.readable) throw Error('operator-override: unreadable store; repair it before proceeding');
       if (!input.effective) return result;
-      return { ...result, ...readEffective(result.values) };
+      return { ...result, ...readEffective(result.values, result.generation) };
     } }),
   });
   const clear = name === 'operator-override-clear';

@@ -8,7 +8,7 @@ vi.mock('node:os', async importOriginal => {
   } };
 });
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { importGraph } from '../../operations/__tests__/import-graph.mjs';
@@ -117,4 +117,14 @@ describe('unresolvable host account', () => {
       expect(log.mock.calls.flat().join(' ')).toContain('operator-db-unreadable store path');
     } finally { osFixture.userInfoFails = false; }
   });
+});
+
+it.each(['broken', '{"generation":-1}', '{"generation":1.5}', '{"generation":9007199254740992}'])('generation reader never throws on invalid evidence %s', text => {
+  writeFileSync(reader.operatorGenerationPath(file), text);
+  expect(reader.readOperatorGeneration({ file })).toBeNull();
+});
+it('generation reader returns null for missing/unreadable evidence', () => {
+  expect(reader.readOperatorGeneration({ file })).toBeNull();
+  mkdirSync(reader.operatorGenerationPath(file));
+  expect(reader.readOperatorGeneration({ file })).toBeNull();
 });

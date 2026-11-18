@@ -4586,12 +4586,11 @@ review-job and review-daemon suites.
 
 `effective-policy.test.mjs` round-trips the cascade formatter; the operator-override cases in
 `http-adapter.test.mjs` exercise before/after adoption, environment shadows and bounded waits.
-Observation success requires every discovered daemon to log the requested policy with the expected
-value/source, entirely at or beyond a byte boundary captured after the write completes, in the same
-device/inode as both the pre-write and post-write snapshots, with no size shrink between snapshots.
-The post-write boundary conservatively excludes lines appended while an asynchronous write yields;
-unreadable boundary evidence stays pending even if a later read succeeds. File mtime and changed line text cannot prove freshness. Rotated, truncated or unreadable
-pre-write logs stay pending with “log rotated/unverifiable; cannot prove the line is newer than the write”;
-inspect daemon logs. Missing policy lines stay pending as “no policy line seen”; old lines stay
-“not yet seen”, even when the stored override matches.
+Observation success requires every discovered daemon's latest policy line to report a value/source
+and `operator-gen` at least the generation returned by the write. Missing, unknown or lower
+generations, absent policy lines and unreadable logs remain unconfirmed; inspect daemon logs on
+timeout. Shadows still warn even when observation succeeds. The locked writer reserves a persistent
+generation, publishes values, then commits the sidecar snapshot. Readers only attach a generation
+to matching values; interrupted publication cannot confirm adoption or reuse a generation.
+Tests cover set/clear bumps, concurrent ordering, suffix round trips, shadows and bounded timeout.
 Run these tests through heavy-admission, using `--wait-ms=0` in store-only CLI fixtures.

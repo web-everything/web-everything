@@ -51,6 +51,27 @@ function warn(log, message) { try { log(safe(message)); } catch { /* Diagnostics
 export function validateKey(key) {
   if (!Object.hasOwn(CAPACITY_LEAVES, key)) throw Error(`operator-override: refused ${key}; guard leaves need the signed-attestation slice`);
 }
+/** Sidecar is also the commit record: values=null reserves a generation during publication. */
+export const operatorGenerationPath = file => `${file}.generation.json`;
+function generationRecord(file) {
+  try { return JSON.parse(readFileSync(operatorGenerationPath(file ?? operatorOverridesPath()), 'utf8')); }
+  catch { return null; }
+}
+export function readOperatorGeneration({ file } = {}) {
+  const n = generationRecord(file)?.generation;
+  return Number.isSafeInteger(n) && n >= 0 ? n : null;
+}
+/** A single committed snapshot supplies both provenance and override values. */
+export function readOperatorSnapshot({ file, ...options } = {}) {
+  const record = generationRecord(file);
+  const result = readOperatorOverrides({ file, ...options, normalize: false });
+  const generation = result.readable && !result.invalidPolicies?.length && record?.values
+    && JSON.stringify(record.values) === JSON.stringify(result.values)
+    && Number.isSafeInteger(record.generation) && record.generation >= 0 ? record.generation : null;
+  if (options.normalize !== false && result.values['resourceGate.fixCap.ceiling'] < result.values['resourceGate.fixCap.floor'])
+    result.values['resourceGate.fixCap.floor'] = result.values['resourceGate.fixCap.ceiling'];
+  return { ...result, generation };
+}
 /** `normalize: false` returns the stored values without lowering an inverted floor (the writer audits against them). */
 export function readOperatorOverrides({ file, log = console.error, normalize = true } = {}) {
   if (file === undefined) {

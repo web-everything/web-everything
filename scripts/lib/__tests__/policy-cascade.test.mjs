@@ -8,7 +8,7 @@ const operatorFixture = await vi.hoisted(async () => {
 });
 vi.mock('../operator-override-reader.mjs', async importOriginal => {
   const actual = await importOriginal();
-  return { ...actual, readOperatorOverrides: options => {
+  return { ...actual, readOperatorSnapshot: options => actual.readOperatorSnapshot({ ...options, file: options?.file ?? operatorFixture.file }), readOperatorOverrides: options => {
     const file = options?.file ?? operatorFixture.file;
     if (!file) throw new Error('Test must inject an operator-store file');
     return actual.readOperatorOverrides({ ...options, file });
@@ -235,9 +235,22 @@ describe('source log', () => {
     cascadePolicy('prStack', undefined, { env, log: (l) => lines.push(l) });
     cascadePolicy('prStack', { detect: 'on' }, { env, log: (l) => lines.push(l) });
     expect(lines).toEqual([
-      'policy-cascade · prStack: detect="off" (platform)',
-      'policy-cascade · prStack: detect="on" (tool)',
+      'policy-cascade · prStack: detect="off" (platform) · operator-gen=unknown',
+      'policy-cascade · prStack: detect="on" (tool) · operator-gen=unknown',
     ]);
+  });
+  it('relogs identical values when the committed operator generation changes', async () => {
+    const path = file({});
+    operatorEnv(path);
+    const { writeOperatorOverride } = await import('../operator-override-store.mjs');
+    const lines = [];
+    const options = { platform: null, env: { [POLICY_CASCADE_LOG_ENV]: '1' }, log: line => lines.push(line) };
+    for (const generation of [1, 2]) {
+      expect(writeOperatorOverride({ file: path, key: 'reviewConcurrency.maxLiveReviewRounds', value: 5, reason: 'repeat', actor: 'test' }).generation).toBe(generation);
+      cascadePolicy('reviewConcurrency', {}, options);
+      cascadePolicy('reviewConcurrency', {}, options);
+    }
+    expect(lines).toEqual([1, 2].map(n => `policy-cascade · reviewConcurrency: maxLiveReviewRounds=5 (operator-db) · operator-gen=${n}`));
   });
   it('is silent under test unless enabled', () => {
     const lines = [];
@@ -332,7 +345,7 @@ describe('operator-db capacity layer above environment (R907/R915)', () => {
     expect(cascadePolicy('review', {}, options).value).toEqual({ maxLiveReviewRounds: 1 });
   });
   it('isolates the operator reader with a missing temporary file instead of test flags', () => {
-    const read = vi.spyOn(operatorStore, 'readOperatorOverrides');
+    const read = vi.spyOn(operatorStore, 'readOperatorSnapshot');
     try {
       expect(cascadePolicy('reviewConcurrency', {}, {
         standard: layers.standard, platform: null, env: { VITEST: 'true', WE_UNDER_TEST: '1' },
