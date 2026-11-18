@@ -108,6 +108,14 @@ function d2Verified(f, releaseStage, { readCard = readCardFromMain, now = Date.n
   try {
     if (typeof f.card !== 'string' || !CARD_PATH.test(f.card)) return false;
     const body = readCard(f.card);
+    return debtCardVerified(body, releaseStage, { now, requireOnMain, requirePayBy });
+  } catch { return false; }
+}
+
+/** Shared D2 card policy. The held-card adapter satisfies existence separately (D5), but never supplies model text here. */
+export function debtCardVerified(body, releaseStage, { now = Date.now, requireOnMain = true, requirePayBy = true } = {}) {
+  try {
+    if (!RELEASE_STAGES.includes(releaseStage)) return false;
     // A missing card has no pay-by date either, so it clears only when BOTH requirements are waived: waiving the
     // card alone never waives a required pay-by (PR #6381 red team).
     if (typeof body !== 'string' || !body.trim()) return requireOnMain === false && requirePayBy === false;
@@ -176,6 +184,8 @@ export const matchesSome = (file, patterns) => {
   return c === null || clean.some(p => c.some(x => matchesPath(x.toLowerCase(), p)));
 };
 
+export const productionFindingBlocks = (cls, releaseStage) => releaseStage === 'prod' && cls.startsWith('E');
+
 export function computeVerdict(findings, options = {}) {
   // Settings come from the trusted running checkout (strictest on any failure), never from the candidate or the
   // caller. There is deliberately no settings argument: tests mock the resolver module instead.
@@ -231,7 +241,7 @@ export function computeVerdict(findings, options = {}) {
     if (f.class === 'D2' && !(proveD2 && validProof(f, relationProofs, base, head) && d2Verified(f, releaseStage, { ...options, requireOnMain, requirePayBy }))) { result.blocks.push(f); continue; }
     // E findings in guard paths always block; a path that cannot be established blocks too.
     if (f.class.startsWith('E') && matchesSome(f.file, [...GUARD_FLOOR, ...guardFloorPaths])) { result.blocks.push(f); continue; }
-    if (f.class.startsWith('B') || (releaseStage === 'prod' && f.class.startsWith('E'))) { result.blocks.push(f); continue; }
+    if (f.class.startsWith('B') || productionFindingBlocks(f.class, releaseStage)) { result.blocks.push(f); continue; }
     result.ships.push(f);
     result.cards.push({ ...f, ...(f.class === 'E1' ? { outcome: 'expedite', deadlineHours: 72 }
       : f.class === 'D2' ? { outcome: 'debt', mustPayBefore: 'prod', mustExistOnMain: true }
