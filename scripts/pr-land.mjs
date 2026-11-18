@@ -969,8 +969,9 @@ async function runCli() {
     try {
       files = parseNameStatus(readPinnedDiff(diffExec, getDiffBasis(), ['--name-status']));
     } catch (e) {
-      process.stderr.write(`pr-land [${REPO}] · soak precheck: diff unavailable (${String(e.message || e).split('\n')[0]}); CI still enforces it\n`);
-      return { ok: true, skipped: 'diff unavailable; CI still enforces it' };
+      process.stderr.write(`pr-land [${REPO}] · soak precheck: diff unavailable (${String(e.message || e).split('\n')[0]}); refusing (fail closed)\n`);
+      // Fail closed: an unreadable pinned diff must not read as 'nothing to soak'. Retry once evidence is available.
+      return { ok: false, message: `soak precheck: pinned diff unavailable (${String(e.message || e).split('\n')[0]}); retry` };
     }
     return soakPrecheckAtOpen({ title: createParams.title, body: CREATE_BODY, files });
   }

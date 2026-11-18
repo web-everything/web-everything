@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -275,6 +275,27 @@ describe('pinned caller evidence', () => {
     expect(text).toContain('+two');
     expect(text).not.toContain('\u001b[');
     expect(text).toContain('diff --git a/a.txt b/a.txt');
+  });
+  it('pr-land soak precheck fails closed when the pinned diff is unavailable', () => {
+    const source = readFileSync('scripts/pr-land.mjs', 'utf8');
+    const start = source.indexOf('function soakCreatePrecheck');
+    const block = source.slice(start, source.indexOf('if (DRY_RUN)', start));
+    expect(block).toContain('ok: false');
+    expect(block).not.toMatch(/ok: true, skipped: 'diff unavailable/);
+  });
+  it('repo-local info/grafts cannot rewrite ancestry seen by pinned reads', () => {
+    const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'pinned-grafts-'));
+    dirs.push(dir);
+    const env = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@e.test', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@e.test' };
+    const git = args => execFileSync('git', args, { cwd: dir, encoding: 'utf8', env, stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+    git(['init', '-q']);
+    for (const n of ['one', 'two', 'three']) { writeFileSync(join(dir, 'a.txt'), n + '\n'); git(['add', '.']); git(['commit', '-q', '-m', n]); }
+    const tip = git(['rev-parse', 'HEAD']);
+    mkdirSync(join(dir, '.git', 'info'), { recursive: true });
+    writeFileSync(join(dir, '.git', 'info', 'grafts'), tip + '\n');
+    expect(git(['rev-list', '--count', tip])).toBe('1');
+    const run = (cmd, args, opts) => execFileSync(cmd, args, { ...opts, cwd: dir });
+    expect(pinnedGit(run, ['rev-list', '--count', tip]).trim()).toBe('3');
   });
   it('repo-local diff.submodule=log cannot render gitlink changes as opaque log text', () => {
     const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'pinned-submodule-'));
