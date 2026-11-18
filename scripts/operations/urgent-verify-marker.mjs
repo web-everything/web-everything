@@ -60,7 +60,7 @@ export function ciGatePlan(workflow) {
   return { coverage: merge.split(' '), hostPaths: host.split(' '), integration: integration.split(' -- $(')[0].split(' ') };
 }
 
-export function urgentMarker({ urgent, reason, sha, ledger, shards, now, repo, readKey }) {
+export function urgentMarker({ urgent, reason, sha, ledger, shards, expectedSteps, now, repo, readKey }) {
   const no = (detail) => ({ ok: false, detail, fallback: `Run node scripts/operations/run.mjs urgent-verify --sha=${sha} in a clean checkout, then retry with --urgent --reason=<at least 10 characters>; or wait for passing CI.` });
   if (urgent !== true || !urgentReason(reason) || !fullSha(sha)) return no('no-urgent-marker');
   try {
@@ -72,7 +72,10 @@ export function urgentMarker({ urgent, reason, sha, ledger, shards, now, repo, r
       || marker.shards !== shards || !Number.isFinite(now) || !Number.isFinite(finished) || !(started < finished)
       || now - finished > 2 * 60 * 60_000 || finished - now > 5 * 60_000
       || typeof marker.host !== 'string' || !marker.host.trim()) return no('no-urgent-marker');
-    if (!repo || marker.repo !== repo || !Array.isArray(marker.steps) || !/^[a-f0-9]{64}$/.test(marker.sig ?? '')
+    if (!repo || marker.repo !== repo || !Array.isArray(marker.steps)
+      || !Array.isArray(expectedSteps) || expectedSteps.length !== shards + 4
+      || marker.steps.length !== expectedSteps.length || !expectedSteps.every((step, i) => marker.steps[i] === step)
+      || !/^[a-f0-9]{64}$/.test(marker.sig ?? '')
       || !timingSafeEqual(Buffer.from(marker.sig, 'hex'), Buffer.from(urgentSignature(marker, readKey()), 'hex'))) return no('no-urgent-marker');
     return { ok: true, evidence: { source: 'urgent-local-full', marker, reason } };
   } catch { return no('no-urgent-marker'); }

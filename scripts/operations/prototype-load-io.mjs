@@ -530,6 +530,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       stage = 'no-ready';
       // Only an exact-sha successful `test` check-run can produce fresh readiness.
       // Injected runners must return {sha, name, status, conclusion}; missing integration fails closed.
+      let urgentCiFailed = false;
       const readTestCheck = testCheck || (({ sha }) => {
         const gh = (args) => {
           try { return { code: 0, stdout: String(execFileSyncThrottled('gh', args, { cwd: gitRepo, env: childEnv,
@@ -540,8 +541,14 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         if (!origin.repo) return null;
         const result = origin.gh(['api', `repos/${origin.repo}/commits/${sha}/check-runs?per_page=100`]);
         if (result.code !== 0) return null;
+        const data = JSON.parse(result.stdout);
+        // Any observed exact-SHA failure vetoes urgent loading, independently of suite selection or binding.
+        urgentCiFailed = input.urgent && Array.isArray(data?.check_runs) && data.check_runs.some(r =>
+          r?.head_sha === sha && r.status === 'completed'
+          && ['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'].includes(r.conclusion));
+        if (urgentCiFailed) return null;
         // Oversized/incomplete evidence refuses; operator completes or repairs the reader.
-        const evidence = testCheckEvidence(JSON.parse(result.stdout), sha);
+        const evidence = testCheckEvidence(data, sha);
         if (!evidence) return null;
         // Bind the check to the expected workflow file via its suite -> workflow run; any failed read refuses.
         const runs = origin.gh(['api', `repos/${origin.repo}/actions/runs?head_sha=${sha}&per_page=100`]);
@@ -552,17 +559,19 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       let checkRun;
       try { checkRun = await readTestCheck({ sha: input.sha, branch: input.branch }); }
       catch (e) { if (!input.urgent) throw e; }
-      if (checkRun?.sha === input.sha && checkRun.name === 'test' && checkRun.status === 'completed' && checkRun.conclusion !== 'success')
+      if (urgentCiFailed || (checkRun?.sha === input.sha && checkRun.name === 'test' && checkRun.status === 'completed' && checkRun.conclusion !== 'success'))
         return stop('no-ready', { detail: 'ci-test-failed', fallback: 'Repair the failed CI test gate on this SHA and wait for passing CI.' });
       if (checkRun?.sha !== input.sha || checkRun.name !== 'test' || checkRun.appId !== TEST_CHECK_APP_ID || checkRun.status !== 'completed' || checkRun.conclusion !== 'success') {
         if (!input.urgent) return stop('no-ready', { detail: 'no-passing-test-check', fallback: 'Complete the test check-run on this SHA and retry; repair the reader if evidence is unavailable, incomplete or exceeds 100 checks. --tests-run/--audit are labels only.' });
-        let ledger, shards, origin;
+        let ledger, shards, expectedSteps, origin;
         try {
           origin = normalizeUrgentRepo(requireGit('remote', 'get-url', 'origin'));
           ledger = fs.readFileSync(urgentLedger(env.HOME), 'utf8');
-          shards = ciUnitPlan(fs.readFileSync(join(repo, '.github/workflows/ci.yml'), 'utf8')).length;
+          const plan = ciUnitPlan(fs.readFileSync(join(repo, '.github/workflows/ci.yml'), 'utf8'));
+          shards = plan.length;
+          expectedSteps = [...plan.map(s => `unit:${s.group ?? 'unit'}:${s.shard}`), 'coverage', 'hostPaths', 'integration', 'standards'];
         } catch { /* Missing or unreadable evidence fails closed below. */ }
-        const urgent = urgentMarker({ ...input, ledger, shards, repo: origin, readKey: readUrgentKey, now: now() });
+        const urgent = urgentMarker({ ...input, ledger, shards, expectedSteps, repo: origin, readKey: readUrgentKey, now: now() });
         if (!urgent.ok) return stop('no-ready', urgent);
         checkRun = urgent.evidence;
       }

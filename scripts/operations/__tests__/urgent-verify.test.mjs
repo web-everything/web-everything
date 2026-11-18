@@ -8,8 +8,9 @@ import { parseOperationArgv } from '../cli-adapter.mjs';
 const sha = 'a'.repeat(40), now = Date.parse('2026-11-18T12:00:00Z');
 const key = Buffer.alloc(32, 7);
 const sign = m => ({ ...m, sig: urgentSignature(m, key) });
-const marker = sign( { sha, suite: 'full', shards: 10, result: 'green', startedAt: new Date(now - 2000).toISOString(), finishedAt: new Date(now - 1000).toISOString(), host: 'host', repo: 'https://example.com/org/repo', steps: ['coverage', 'hostPaths', 'integration', 'standards'] });
-const check = (m = marker, input = {}) => urgentMarker({ urgent: true, reason: 'Urgent daemon repair', sha, shards: 10, now, repo: marker.repo, readKey: () => key, ledger: JSON.stringify(m), ...input });
+const expectedSteps = [...Array.from({ length: 10 }, (_, i) => `unit:unit:${i + 1}/10`), 'coverage', 'hostPaths', 'integration', 'standards'];
+const marker = sign( { sha, suite: 'full', shards: 10, result: 'green', startedAt: new Date(now - 2000).toISOString(), finishedAt: new Date(now - 1000).toISOString(), host: 'host', repo: 'https://example.com/org/repo', steps: expectedSteps });
+const check = (m = marker, input = {}) => urgentMarker({ urgent: true, reason: 'Urgent daemon repair', sha, shards: 10, expectedSteps, now, repo: marker.repo, readKey: () => key, ledger: JSON.stringify(m), ...input });
 
 describe('urgent marker', () => {
   it('accepts an exact full green marker', () => expect(check()).toMatchObject({ ok: true, evidence: { source: 'urgent-local-full', marker } }));
@@ -30,6 +31,14 @@ describe('urgent marker', () => {
     ['wrong key', { readKey: () => Buffer.alloc(32, 8) }], ['short key', { readKey: () => Buffer.alloc(1) }],
     ['wrong repo', { repo: 'https://example.com/other/repo' }],
   ])('rejects %s', (_, input) => expect(check(marker, input).ok).toBe(false));
+  it.each([
+    ['empty', []], ['partial', expectedSteps.slice(1)],
+    ['reordered', [...expectedSteps].reverse()], ['extra', [...expectedSteps, 'extra']],
+    ['wrong group', expectedSteps.map(s => s.replace('unit:unit:', 'unit:covered:'))],
+  ])('refuses correctly signed %s steps', (_, steps) => {
+    expect(check(sign({ ...marker, steps }))).toMatchObject({ ok: false, detail: 'no-urgent-marker' });
+  });
+  it('refuses an unreadable expected step list', () => expect(check(marker, { expectedSteps: undefined }).ok).toBe(false));
   it.each([undefined, '0'.repeat(64), 'bad'])('refuses forged signature %s', sig => expect(check({ ...marker, sig }).ok).toBe(false));
   it('signature covers every evidence field', () => {
     for (const field of ['sha', 'suite', 'shards', 'result', 'startedAt', 'finishedAt', 'host', 'repo', 'steps'])

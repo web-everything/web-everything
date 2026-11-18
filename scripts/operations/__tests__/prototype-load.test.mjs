@@ -270,7 +270,7 @@ function fixture(options = {}) {
 const mutations = (f, action) => f.calls.filter((c) => c.cmd === 'node' && c.args[1] === action && !c.args.includes('--check'));
 describe('urgent prototype admission', () => {
   const reason = 'Restore critical daemon operation';
-  const marker = { sha: SHA, suite: 'full', shards: 1, result: 'green', startedAt: new Date(-2000).toISOString(), finishedAt: new Date(-1000).toISOString(), host: 'test-host', repo: 'https://example.com/org/repo', steps: ['coverage', 'hostPaths', 'integration', 'standards'] };
+  const marker = { sha: SHA, suite: 'full', shards: 1, result: 'green', startedAt: new Date(-2000).toISOString(), finishedAt: new Date(-1000).toISOString(), host: 'test-host', repo: 'https://example.com/org/repo', steps: ['unit:unit:1/1', 'coverage', 'hostPaths', 'integration', 'standards'] };
   marker.sig = urgentSignature(marker, urgentKey);
   it('logs the urgent event and writes explicit urgent readiness evidence', async () => {
     const f = fixture({ testCheck: async () => null, urgentLedger: JSON.stringify(marker) });
@@ -303,6 +303,13 @@ describe('urgent prototype admission', () => {
     if (kind === 'unsigned') delete forged.sig;
     if (kind === 'bad signature') forged.sig = '0'.repeat(64);
     const f = fixture({ testCheck: async () => null, urgentLedger: JSON.stringify(forged), missingUrgentKey: kind === 'missing key', ...(kind === 'wrong repo' ? { origin: 'https://example.com/other/repo' } : {}) });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, detail: 'no-urgent-marker' });
+    expect(f.readyWrites).toEqual([]);
+  });
+  it('refuses a correctly signed receipt with empty steps without readiness writes', async () => {
+    const empty = { ...marker, steps: [] };
+    empty.sig = urgentSignature(empty, urgentKey);
+    const f = fixture({ testCheck: async () => null, urgentLedger: JSON.stringify(empty) });
     expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, detail: 'no-urgent-marker' });
     expect(f.readyWrites).toEqual([]);
   });
@@ -3212,6 +3219,39 @@ describe('default test check-run reader (production wiring)', () => {
     expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-ready', detail });
     expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
   };
+  const urgentReceipt = () => {
+    const marker = { sha: SHA, suite: 'full', shards: 1, result: 'green', startedAt: new Date(-2000).toISOString(), finishedAt: new Date(-1000).toISOString(), host: 'test-host', repo: `https://github.com/${REPO_SLUG}`, steps: ['unit:unit:1/1', 'coverage', 'hostPaths', 'integration', 'standards'] };
+    return JSON.stringify({ ...marker, sig: urgentSignature(marker, urgentKey) });
+  };
+  it.each(['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'])(
+    'urgent refuses a pending suite plus another suite completed with %s', async conclusion => {
+      const f = ghFixture({ urgentLedger: urgentReceipt(), checks: { total_count: 2, check_runs: [
+        run({ status: 'in_progress', conclusion: null }),
+        run({ id: 2, name: 'other-check', app: { id: 1 }, check_suite: { id: 8 }, conclusion }),
+      ] } });
+      expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail: 'ci-test-failed' });
+      expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
+      expect(f.reads.some(p => p.includes('urgent-full-green'))).toBe(false);
+    });
+  it('urgent refuses a failed run even when the workflow-binding read is unavailable', async () => {
+    const f = ghFixture({ fail: 'runs', urgentLedger: urgentReceipt(), checks: { total_count: 1, check_runs: [run({ conclusion: 'failure' })] } });
+    expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail: 'ci-test-failed' });
+    expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
+    // The raw veto happens before the unavailable binding reader can hide the failure.
+    expect(f.gh.some(c => c.includes('/actions/runs'))).toBe(false);
+  });
+  it.each([
+    ['unreadable raw checks', { fail: 'checks' }],
+    ['pending CI', { checks: { total_count: 1, check_runs: [run({ status: 'in_progress', conclusion: null })] } }],
+    ['a failure on another SHA', { checks: { total_count: 1, check_runs: [run({ head_sha: TREE, conclusion: 'failure' })] } }],
+  ])('urgent requires a signed receipt with %s', async (_, options) => {
+    const f = ghFixture({ ...options, urgentLedger: urgentReceipt() });
+    expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: true });
+    expect(f.readyWrites.at(-1).testCheck.source).toBe('urgent-local-full');
+    const missing = ghFixture(options);
+    expect(await missing.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail: 'no-urgent-marker' });
+    expect(missing.readyWrites).toEqual([]);
+  });
   it('admits a passing test bound to the expected workflow file and writes fresh readiness', async () => {
     const f = ghFixture();
     expect(await f.run()).toMatchObject({ ok: true, gate: { source: 'canonical-check-run' } });

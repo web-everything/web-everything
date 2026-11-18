@@ -4626,6 +4626,10 @@ green/red receipts to `~/workspace/.operations/coordination/urgent-full-green.js
 
 `prototype-load --urgent --reason=<at least 10 characters>` prefers passing CI, otherwise requires
 the latest exact-SHA receipt to be full, green, current-shard-count and at most two hours old.
+Its signed steps must exactly match the current CI unit plan in order, followed by coverage,
+hostPaths, integration and standards. Before selecting or binding a test suite, any completed
+exact-SHA check-run with failure, cancelled, timed_out, action_required or startup_failure vetoes
+urgent loading. An unreadable raw check-runs response still requires the signed receipt.
 Other admission gates remain in force; merging still requires real CI. Urgent admissions append
 `prototype-load.urgent` events to `~/workspace/.operations/coordination/urgent-loads.jsonl`.
 `urgent-verify.test.mjs` and `prototype-load.test.mjs` cover runner authorship, closed paths,
