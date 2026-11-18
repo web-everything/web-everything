@@ -25,6 +25,8 @@ export function defaultFetchOpenPrs({ repo = null, exec = runGhSync, readComment
   const out = exec(argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 });
   const parsed = JSON.parse(String(out || '[]'));
   if (!Array.isArray(parsed)) return [];
+  // Legacy gh rows have no connection metadata to prove completeness or the read head.
+  for (const pr of parsed) Object.assign(pr, { rowsComplete: false, rowsHead: null });
   // The planner's external-check exemption binds to the posting app; `gh pr list` rows carry none (live #6926).
   resolveCheckAppsByCommit({ repo, rows: parsed, exec: (_cmd, args, o) => exec(args, o) });
   return enrichPrsWithCompleteComments(parsed, { repo, ...(readComments ? { readComments } : {}) });

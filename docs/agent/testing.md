@@ -4631,6 +4631,59 @@ share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and gran
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
 
+
+## R986 I1 probation core (production wiring pending)
+
+`scripts/lib/daemon-rebuild/probation.mjs` is a pure transition core, not a running
+probation service. At adoption, `freezeProbation` takes the complete registered roster
+for one clone and `readClosure(daemon, sha)` snapshots at proven-good and adopted heads.
+A snapshot is `{ complete: true, files: { repoRelativePath: gitBlobId } }`; include
+all imported files. Unknown, incomplete, empty or unreadable snapshots owe proof.
+The core copies and validates each closure's files before the next `readClosure` call;
+readers may reuse their result object or files map without changing earlier evidence.
+An unknown or ambiguous roster refuses adoption: the operator must recover the roster.
+`owed` stays fixed for this adoption. `recordProof` stores independent daemon records;
+boot and completed tick evidence must name that daemon, agree on its PID and adopted
+head, and show process start at/after adoption with a later completed tick. Callers
+must obtain boot evidence from that daemon's process record, not from a sibling or
+from the wrapper's first tick time. `evaluateProbation` passes only with all owed
+records, or immediately for a known empty owed set. Non-owed evidence is a no-op.
+Each entry uses the same sanitizing boundary to recursively capture enumerable data
+properties and reject accessor descriptors without invoking getters or setters, including
+when `records` precedes `owed` in key order. Validation and decisions use only the frozen
+plain copy. State and evidence restored from JSON contain no accessors.
+The boundary catches read/copy errors, rejects cycles and functions (except the separately
+captured injected closure reader), memoizes aliases, and does not execute `toJSON`.
+Copying is limited to 100,000 properties/array slots per entry.
+Oversized input follows the same closed path; recover a bounded roster or state
+before retrying, and treat an identity return from adoption as a refused adoption.
+It preserves invalid values such as `undefined` and `NaN` for the validator rather than
+silently dropping unknown fields or coercing values through JSON serialization.
+Unreadable adoption options return the original options; readable but invalid rosters
+still throw the operator recovery error. Unreadable proof/state input is a no-op for
+`recordProof`; validation reports invalid state and evaluation stays pending.
+A recorded proof returns a fresh frozen copy, so
+mutating restored (for example JSON-parsed) state, a getter or a hidden key cannot
+discharge another daemon. A no-op still returns the caller's own input object.
+Legacy single-record state cannot promote; it requires operator recovery.
+
+The probation tests adapt the WIP adoption clock/heads and invalid-tick cases. The
+self-sync test uses the WIP injected rebuild/lock/closure fixture as a core consumer;
+it does not establish production probation integration. Remaining wiring: enumerate
+clone registrations, read both import closures by SHA, persist adoption and daemon
+boot/tick records under a shared mutation lock, and advance proven-good only on pass.
+No rollback, boot counting or probation deadline policy ships in this I1 core.
+
+`scripts/conveyor/soak/breaks/probation-accessor-snapshot.mjs` replays the operator's
+shared-files-map, records-getter-popping-owed, interacting-getters and throwing-boot probes against the real
+core. Its soak wrapper is automatically registered by the breaks directory discovery.
+The shared-map case pins an earlier repair; the records getter and top-level boot getter
+reproduce the failure at `41aaa588c39397fc7ad7eca7f63e9bf5fa041483`. All accessor cases now
+also require zero getter calls, including nested evidence.
+At `a19d094c84a838c161105da3296c3558467fc319`, interacting `records` and `owed` getters
+remove `review` and return `pass`. Rejecting accessors returns the original state untouched,
+keeps both daemons owed, calls no getters, and returns `pending`.
+These pure-core probes do not establish live daemon integration or merge compatibility.
 ## Review job exit evidence
 
 Review-job diagnostics use `diagnostics/<slug>.exit.json` and `diagnostics/<slug>.ended.json`,
@@ -4639,6 +4692,37 @@ are usable only for the ended pid; SIGKILL cannot leave a marker. Keep missing/s
 marker, redaction, bounded-tail and diagnostic-write-failure regressions in the scoped
 review-job and review-daemon suites.
 
+## Required-check evidence contract (PR1)
+
+`resolveRequiredChecks` ships without production callers. Its acceptance tests build
+job/head-bound hold annotations inline; no caller or hold-classifier change is required.
+Every required name needs its own evidence, a live/cache roster, an exact head and
+`rowsComplete: true`. Missing or false completeness returns `unknown`; neutral/skipped
+conclusions fail unless the exact name is in `optionalNames`.
+
+The fetch tests prove completeness only from matching connection counts, valid nodes
+and `hasNextPage: false`, and preserve the commit read head independently of the PR head.
+Legacy hydration reads at most ten batches of twenty heads. Unreadable, truncated or
+overflow evidence remains incomplete for retry on a later tick or operator inspection;
+an incomplete refresh preserves previously observed failures. Retry by exhausting
+pagination or explicitly reading every required name before attesting completeness.
+
+
+## PR1 audit: malformed rows, human holds and unavailable rosters
+
+`pr-list-paged.test.mjs` pins success beside null, empty and unknown-type nodes in both
+orders: mapping retains a nameless unknown row, marks the connection incomplete, and
+prevents a green legacy summary (which rejects the malformed identity). Strict resolution
+returns `unknown`. The open-PR fetch regression also proves that such an incomplete refresh
+preserves an already observed failure. Retry the read on a later tick or inspect the evidence
+before admission; never discard malformed nodes to obtain a green summary.
+
+`check-state-predicate.test.mjs` requires the shared `humanReviewOnlyHold` guard for each
+job/head-bound merge-gate hold source: IDs must be a nonempty subset of the human-review
+hold gates and include `review-hold-labels` or `review-acceptance`. Candidate-label-only
+and other incidental holds retain failure. Empty or malformed required rosters always
+return `unknown` with `roster-unavailable`, including persisted options containing the
+removed `allowEmptyRequiredNames` override and evidence with an observed merge-gate failure.
 ## Fast-drain round listing and live target refresh
 
 Catch-up children share the `--listing-snapshot` round file. Its default TTL is 60 seconds;
@@ -4672,3 +4756,17 @@ oversized/incomplete/foreign evidence, target head invalidation, snapshot exclus
 a live target replacing a stale cached target with a different head and red check.
 Run it with `fast-drain-scope.test.mjs` and `merge-ai-prs.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
 comparison against daemon observations; fixtures prove IO counts without live GitHub calls.
+## Ready-candidate adoption during overlay churn
+
+`daemon-rebuild-ready.test.mjs` exercises adoption with real Git ancestry: newly registered
+refs and descendant advances remain pending after adoption, and the next adopt-only tick
+must return `needs-build` with a different plan. `ready-candidate-adopted-partial` is an
+open-kind rebuild alert emitted after successful adoption only when pending refs exist.
+A candidate containing a removed ref is refused as `overlay-no-longer-wanted`, even when
+another overlay contains its tip; `pr-merged`/`in-main` removals retain their existing wanted
+handling. Each wanted tip must equal or descend from the candidate's tip. Preserve the independent
+live-applied omission, build-provenance, smoke, forced-record and canonical-audit gates.
+Preserve `overlaysBefore` as a veto for omitted live tips: the regression for a live overlay
+retired during planning must reject its omission and preserve HEAD.
+Run this file and `daemon-rebuild-events.test.mjs` through heavy admission. This adoption
+rule does not reset overlay main-sync parking or add retries for parked overlays.
