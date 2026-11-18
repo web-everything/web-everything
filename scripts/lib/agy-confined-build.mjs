@@ -5,7 +5,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { escapingSymlinks, gitControlFiles, snapshotCheckout, changedControl, changedCheckouts,
-  stateChangingToolCalls, scrubPaths, MODULE_REPO_ROOT } from './agy-review-juror.mjs';
+  stateChangingToolCalls, READ_ONLY_AGY_TOOLS, scrubPaths, MODULE_REPO_ROOT } from './agy-review-juror.mjs';
 import { buildScratchCloneArgv, summarizeAgyEvents, runAgyDirectExec } from '../gemini-direct-task.mjs';
 import { buildSandboxProfile, sandboxedSpawnArgv, sandboxSecretPaths } from './agy-sandbox.mjs';
 import { resolveCascade, formatCascadeSourcesLine } from './policy-cascade.mjs';
@@ -41,22 +41,26 @@ function canonicalPath(path) {
 async function defaultSpawnAgy(options) {
   const homeDir = realpathSync(homedir());
   const temp = realpathSync(tmpdir());
-  const state = join(homeDir, '.gemini');
+  const state = join(homeDir, '.gemini/antigravity-cli');
+  if (canonicalPath(state) !== state || canonicalPath(join(homeDir, '.gemini/projects.json')) !== join(homeDir, '.gemini/projects.json'))
+    throw new Error('redirected agy state; use another provider or request operator review');
   mkdirSync(state, { recursive: true, mode: 0o700 });
-  const profile = buildSandboxProfile({ cloneDir: realpathSync(options.dir), homeDir,
-    workspaceDir: canonicalPath(join(homeDir, 'workspace')),
-    workspaceOps: canonicalPath(join(homeDir, 'workspace/.operations')),
-    deniedPaths: sandboxSecretPaths(homeDir).map(canonicalPath),
-    stateDirs: [realpathSync(state), temp, realpathSync('/private/var/folders')] });
   const profileDir = mkdtempSync(join(temp, 'we-agy-sandbox-'));
   try {
-    if ([options.dir, options.laneDir].some(p => profileDir === p || profileDir.startsWith(`${realpathSync(p)}/`)))
-      throw new Error('sandbox profile must be outside clone and lane');
+    const workspaceDir = canonicalPath(join(homeDir, 'workspace'));
+    if ([options.dir, options.laneDir, workspaceDir, join(homeDir, 'workspace')].some(p => profileDir === p || profileDir.startsWith(`${canonicalPath(p)}/`)))
+      throw new Error('sandbox profile must be outside clone, lane and workspace');
+    const privateTempDir = mkdtempSync(join(profileDir, 'tmp-'));
+    const profile = buildSandboxProfile({ cloneDir: realpathSync(options.dir), homeDir, privateTempDir,
+      laneDir: realpathSync(options.laneDir), workspaceDir,
+      workspaceOps: canonicalPath(join(homeDir, 'workspace/.operations')),
+      deniedPaths: sandboxSecretPaths(homeDir).map(canonicalPath) });
     const profileFile = join(profileDir, 'profile.sb');
     writeFileSync(profileFile, profile, { mode: 0o600, flag: 'wx' });
     return await runAgyDirectExec({ ...options, spawnFn: (bin, args, opts) => {
       const [, ...argv] = sandboxedSpawnArgv(profileFile, [bin, ...args]);
-      return spawn('/usr/bin/sandbox-exec', argv, opts);
+      return spawn('/usr/bin/sandbox-exec', argv, { ...opts,
+        env: { ...process.env, ...opts.env, TMPDIR: privateTempDir, TMP: privateTempDir, TEMP: privateTempDir } });
     } });
   } finally { rmSync(profileDir, { recursive: true, force: true }); }
 }
@@ -73,6 +77,12 @@ function auditTranscript(text, clone) {
     const name = s.tool_name ?? s.tool_info?.name;
     if (/git/i.test(name ?? '') || /\bgit\b/i.test(JSON.stringify(s.tool_info?.parameters ?? {}))
       && /command|shell|exec/i.test(name ?? '')) throw new Error('agy git call');
+    if (!WRITE_TOOLS.has(name) && !READ_ONLY_AGY_TOOLS.includes(name))
+      throw new Error('tool call outside the permitted native file tools');
+    // Status never exempts a tool update from the containment audit.
+    delete s.tool_info?.error;
+    delete s.status;
+    delete s.state;
     if (!WRITE_TOOLS.has(name)) continue;
     const params = typeof s.tool_info?.parameters === 'string'
       ? JSON.parse(s.tool_info.parameters) : s.tool_info?.parameters;
@@ -82,14 +92,11 @@ function auditTranscript(text, clone) {
     // Keep ALL parameters: nested/alternative path keys must pass the same containment test too.
     s.tool_name = 'view_file';
     s.tool_info = { ...s.tool_info, name: 'view_file', parameters: params };
-    delete s.tool_info.error; // even an errored edit must have confined parameters
-    delete s.status;
-    delete s.state;
   }
   // Audit every update separately: a later update must not hide an earlier outside path by
   // reusing its step index, changing its parameters, or reporting an error afterwards.
   const updates = events.filter(e => e?.step_update?.step_type === 'tool').map((e, i) => ({
-    ...e, step_update: { ...e.step_update, step_index: i, conversation_id: 'build-audit' },
+    ...e, event: 'step_update', step_update: { ...e.step_update, step_index: i, conversation_id: 'build-audit' },
   }));
   if (stateChangingToolCalls(updates.map(e => JSON.stringify(e)).join('\n'), { allowedRoots: [clone] }).length)
     throw new Error('tool call outside the permitted native file tools or clone');

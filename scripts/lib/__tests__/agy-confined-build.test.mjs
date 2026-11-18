@@ -237,6 +237,32 @@ describe('escape evidence', () => {
     })).status).toBe('voided');
     expect(git(f.lane, 'status', '--porcelain')).toBe('');
   });
+  it.each([
+    ['errored run_command', tool('run_command', '{bad json', { status: 'TOOL_ERROR' })],
+    ['errored outside write_to_file', tool('write_to_file', { TargetFile: '/dev/null' }, { state: 'ERROR' })],
+    ['unknown tool', tool('unknown_tool', {})],
+    ['cancelled shell', tool('shell', {}, { state: 'CANCELLED' })],
+    ['pending unknown tool', tool('unknown_tool', {}, { state: 'PENDING' })],
+    ['missing name', tool(undefined, {}, { state: 'ERROR' })],
+    ['error-bearing outside write', { ...tool('write_to_file', {}), step_update: {
+      step_type: 'tool', tool_name: 'write_to_file', tool_info: { error: 'failed', parameters: { TargetFile: '/dev/null' } },
+    } }],
+    ['errored outside read', tool('view_file', { AbsolutePath: '/dev/null' }, { state: 'ERROR' })],
+    ['mislabeled outside write event', { ...tool('write_to_file', { TargetFile: '/dev/null' }), event: 'unknown' }],
+  ])('voids %s regardless of status or malformed parameters', async (_label, event) => {
+    const f = fixture();
+    expect((await f.run(undefined, { transcript: [event, finish] })).status).toBe('voided');
+    expect(f.commands.some(a => a.includes('apply'))).toBe(false);
+    expect(git(f.lane, 'status', '--porcelain')).toBe('');
+  });
+  it('accepts native reads and writes confined to the clone', async () => {
+    const f = fixture();
+    expect((await f.run(dir => writeFileSync(join(dir, 'docs/a.md'), 'after\n'), { transcript: [
+      tool('view_file', { AbsolutePath: 'docs/a.md' }),
+      tool('write_to_file', { TargetFile: 'docs/a.md', CodeContent: 'after\n' }), finish,
+    ] })).status).toBe('ok');
+    expect(readFileSync(join(f.lane, 'docs/a.md'), 'utf8')).toBe('after\n');
+  });
   it('voids moved HEAD', async () => {
     const f = fixture();
     expect((await f.run(dir => git(dir, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '--allow-empty', '-qm', 'move'))).status).toBe('voided');

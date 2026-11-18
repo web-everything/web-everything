@@ -4694,3 +4694,10 @@ directory. It never touches real home secrets or launches agy. The injected buil
 cover unsupported hosts and missing sandbox-exec without launching a worker. Run these focused
 files and the fix-run fixtures only via the host heavy-admission queue; fake-worker evidence alone
 does not establish confinement. These slice B tests were authored without running them.
+
+The build profile grants only clone, private per-run temp, `~/.gemini/antigravity-cli`,
+and `~/.gemini/projects.json` / `projects.json.*.tmp` writes (plus the named devices).
+`TMPDIR`, `TMP` and `TEMP` point to the private temp; OS temp roots and shared `.gemini`
+remain read-only. The REAL probe covers these boundaries. Build transcript admission checks
+every tool update against the native-tool allowlist and clone containment regardless of status;
+errored tools cannot bypass it. The juror's separate error exemption does not apply to builds.
