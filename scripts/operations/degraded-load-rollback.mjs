@@ -1,6 +1,13 @@
 /** Refused R1075 candidates never need a forced-build rollback: withdraw through guarded retirement. */
 import fs from 'node:fs';
-import { retireRegistration, proveOverlayWithdrawal } from '../daemon-overlay.mjs';
+import { spawnSync } from 'node:child_process';
+import { retireRegistration } from '../daemon-overlay.mjs';
+import { defaultRetirePlanner } from './prototype-retire.mjs';
+
+const run = (cmd, args, cwd, env) => {
+  const r = spawnSync(cmd, args, { cwd, env, encoding: 'utf8', timeout: 120000, maxBuffer: 16 * 1024 * 1024 });
+  return { code: Number.isInteger(r.status) ? r.status : -1, stdout: r.stdout ?? '', stderr: r.stderr ?? '', error: r.stderr || r.error?.message || '' };
+};
 import { readOverlayState } from '../lib/daemon-overlays.mjs';
 import { reportNeedsYou } from '../lib/daemon-rebuild/auto-rebase.mjs';
 import { appendDaemonEvent } from '../lib/daemon-events.mjs';
@@ -8,15 +15,24 @@ import { readPendingAdoptions, clearPendingAdoption } from '../lib/overlay-adopt
 
 export async function rollbackDegradedLoad({ root, ref, sha, fastPath, reason, env,
   readState = readOverlayState, retire = retireRegistration, needsYou = reportNeedsYou,
-  emit = appendDaemonEvent, io = fs, now = () => Date.now(), git, tip }) {
+  emit = appendDaemonEvent, io = fs, now = () => Date.now(), tip, prove, planner = defaultRetirePlanner,
+  gitArgs = (args) => run('git', args, root, env), ghArgs = (args) => run('gh', args, root, env) }) {
   let rollback;
   try {
     const state = await readState(root, { env });
     if (state?.corrupt !== false || !Array.isArray(state.overlays)) throw new Error('unreadable registry');
     const entry = state.overlays.find(r => r.ref === ref);
-    rollback = entry ? await retire({ root, ref, expectedTip: sha, expectedEntry: entry, by: 'prototype-load.degraded-fast-path', env,
-      deps: { prove: () => proveOverlayWithdrawal({ root, ref, tip: sha, reason: 'degraded-fast-path-refused', env, ...(git ? { git } : {}) }),
-        ...(tip ? { tip } : {}) } }) : { retired: true, absent: true };
+    if (!entry) rollback = { retired: true, absent: true };
+    else {
+      // Same protections as the ordinary retirement planner (pinned closed PRs, edge resolution, merged/superseded proof).
+      // Unproven retirement keeps the overlay: the load stays registered, is refused, and NEEDS-YOU is raised.
+      const plan = await planner({ rows: [entry], proofRows: state.overlays, git: gitArgs, gh: ghArgs });
+      const decision = Array.isArray(plan) ? plan.find(d => d?.ref === ref && d.action === 'retire' && /^[a-f0-9]{40}$/.test(d.tip ?? '')) : null;
+      rollback = decision
+        ? await retire({ root, ref, expectedTip: decision.tip, expectedEntry: entry, by: 'prototype-load.degraded-fast-path', env,
+          deps: { ...(tip ? { tip } : {}), ...(prove ? { prove } : {}) } })
+        : { retired: false, refused: 'retirement-unproved', kept: true };
+    }
   } catch (e) { rollback = { retired: false, refused: String(e.message || e) }; }
   const detail = { ...fastPath, ref, reason, rollback };
   needsYou({ root, env, ref, stage: 'prototype-load.degraded-fast-path-failed',

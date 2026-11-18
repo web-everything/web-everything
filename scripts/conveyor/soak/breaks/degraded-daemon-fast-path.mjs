@@ -47,7 +47,7 @@ export default {
           eventAttempts++;
           return failEventOnce && eventAttempts === 1 ? false : appendDaemonEvent(event, opts);
         },
-        git: () => ({ code: 0, stdout: sha }), tip: () => sha, ...(retire ? { retire } : {}), ...(readState ? { readState } : {}) });
+        planner: async ({ rows }) => rows.map(r => ({ ref: r.ref, action: 'retire', reason: 'pr-squash-merged', tip: sha })), tip: () => sha, prove: () => ({ action: 'retire', reason: 'pr-squash-merged', tip: sha }), ...(retire ? { retire } : {}), ...(readState ? { readState } : {}) });
       await check();
       if (failEventOnce) {
         pendingAfterFailedEvent = readPendingAdoptions(root, { env }).length;

@@ -3434,9 +3434,10 @@ describe('R1075 degraded daemon admission', () => {
     expect(await degraded({ ready, audits }).run()).toMatchObject({ ok: false, stopReason: 'no-ready' });
     expect(await degraded({ ready, audits, settings: { ruledWeakened: [{ ref: BASE.branch, sha: SHA, ruling: 'R1075', findings }] } }).run()).toMatchObject({ ok: true, canonicalAudit: { ok: true } });
   });
-  it('requires an exact-SHA canonical audit even for an equal net diff', async () => {
+  it('keeps fingerprint matching: a newer WEAKENED on the same fingerprint still blocks', async () => {
     const fingerprint = 'a'.repeat(64);
-    const f = degraded({ audits: auditLines([auditRecord({ head: TREE, base: 'e'.repeat(40), fingerprint })]), fingerprint: () => fingerprint });
+    const f = degraded({ audits: auditLines([auditRecord({ head: TREE, base: 'e'.repeat(40), fingerprint }),
+      auditRecord({ head: 'd'.repeat(40), base: 'e'.repeat(40), fingerprint, verdict: 'WEAKENED', findings: ['scripts/x.mjs:1 newer negative evidence'] })]), fingerprint: () => fingerprint });
     expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
     expect(mutations(f, 'add')).toHaveLength(0);
   });
@@ -3454,11 +3455,20 @@ describe('R1075 degraded daemon admission', () => {
   });
   it('refused smoke withdraws the candidate through retirement and raises NEEDS-YOU', async () => {
     const retire = vi.fn(async () => ({ retired: true })), needsYou = vi.fn();
-    const f = degraded({ alerts: JSON.stringify({ at: new Date(0).toISOString(), kind: 'smoke-rejected', detail: { ref: BASE.branch } }), removeRegistration: retire, needsYou });
+    const f = degraded({ alerts: JSON.stringify({ at: new Date(0).toISOString(), kind: 'smoke-rejected', detail: { ref: BASE.branch } }), removeRegistration: retire, needsYou,
+      retirePlan: ({ rows }) => rows.map(r => ({ ref: r.ref, action: 'retire', reason: 'pr-merged', tip: SHA })) });
     expect(await f.run()).toMatchObject({ ok: false, stopReason: 'adoption-refused', registered: false, rollback: { retired: true }, needsYou: true });
     expect(retire).toHaveBeenCalledWith(expect.objectContaining({ ref: BASE.branch, expectedTip: SHA, expectedEntry: { ref: BASE.branch } }));
     expect(needsYou).toHaveBeenCalledWith(expect.objectContaining({ error: expect.stringContaining('NEEDS-YOU') }));
     expect(f.records.some(r => r.kind === 'prototype-load.degraded-fast-path-failed')).toBe(true);
+  });
+  it('unproven retirement keeps the overlay, refuses and raises NEEDS-YOU without withdrawing', async () => {
+    const retire = vi.fn(async () => ({ retired: true })), needsYou = vi.fn();
+    const f = degraded({ alerts: JSON.stringify({ at: new Date(0).toISOString(), kind: 'smoke-rejected', detail: { ref: BASE.branch } }), removeRegistration: retire, needsYou,
+      retirePlan: ({ rows }) => rows.map(r => ({ ref: r.ref, action: 'keep', reason: 'pr-open' })) });
+    expect(await f.run()).toMatchObject({ ok: false, registered: true, rollback: { retired: false, refused: 'retirement-unproved' }, needsYou: true });
+    expect(retire).not.toHaveBeenCalled();
+    expect(needsYou.mock.calls[0][0].error).toContain('NEEDS-YOU');
   });
   it('refused rollback stays visible and escalates manual recovery', async () => {
     const needsYou = vi.fn();
