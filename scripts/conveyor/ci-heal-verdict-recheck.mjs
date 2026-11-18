@@ -24,7 +24,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { withoutImpliedRequiredChecks } from '../lib/required-check-implication.mjs';
-import { classifyCheck, summarize } from '../lib/check-state-predicate.mjs';
+import { summarize, reviewHoldNames, requiredCheckPassing } from '../lib/check-state-predicate.mjs';
 import { CODEQL_CHECK_NAME } from '../lib/codeql-gate.mjs';
 
 export const CI_HEAL_VERDICT_ENV = 'WE_CI_HEAL_RECHECK_NOT_CI_BREAK';
@@ -105,14 +105,10 @@ function checkEvidence(rollup, requiredChecks) {
   const checks = (Array.isArray(rollup) ? rollup : []).map(normalizeRollupCheck);
   // Only the shared merge-gate hold classifier's annotation proves a review hold.
   // A job/setup failure (or unreadable verdict) must remain ordinary CI evidence.
-  const holdGateNames = [REVIEW_GATE_CHECK];
-  const mergeGates = checks.filter(row => row.name === 'merge-gate');
-  if (mergeGates.length && mergeGates.every(row =>
-    classifyCheck({ ...row, required: true }) === 'green' || row.mergeGateReviewHold)) {
-    holdGateNames.push('merge-gate');
-  }
+  const holdGateNames = reviewHoldNames(checks);
   const roster = withoutImpliedRequiredChecks(Array.isArray(requiredChecks) ? requiredChecks : [], checks)
-    .filter(name => !holdGateNames.includes(name));
+    .filter(name => !holdGateNames.includes(name)
+      && !(name === REVIEW_GATE_CHECK && requiredCheckPassing(checks, name)));
   // CodeQL evidence is never excused by a drain setting or an optional roster.
   if (checks.some(row => row.name === CODEQL_CHECK_NAME) && !roster.includes(CODEQL_CHECK_NAME)) {
     roster.push(CODEQL_CHECK_NAME);
@@ -142,9 +138,9 @@ export function requiredCheckStates({ rollup, requiredChecks }) {
 /** Include gates and CodeQL evidence, even outside the required roster. */
 export function gateOnlyRedStates({ rollup, requiredChecks }) {
   const { checks, roster, holdGateNames } = checkEvidence(rollup, requiredChecks);
-  const requiredNames = [...roster, ...gateNames];
-  const { gateOnlyRed, redSet } = summarize(checks, { requiredNames, holdGateNames });
-  return { gateOnlyRed, red: [...redSet] };
+  const requiredNames = [...new Set([...roster, ...gateNames.filter(name => checks.some(row => row.name === name))])];
+  const { gateOnlyRed, redSet, pendingSet } = summarize(checks, { requiredNames, holdGateNames });
+  return { gateOnlyRed, red: [...redSet], waitingOnReview: gateOnlyRed && pendingSet.size === 0 };
 }
 
 /**

@@ -1,3 +1,4 @@
+import { summarize, reviewHoldNames } from '../lib/check-state-predicate.mjs';
 import { parseMqFailureRoute } from '../lib/mq-failure-route.mjs';
 import { admitMqFailureRoute } from './mq-failure-intake.mjs';
 import { ghRepoSlug } from '../lib/constellation-repos.mjs';
@@ -510,23 +511,19 @@ export function splitFailingChecks(rollup, requiredChecks) {
 /** PURE: every failing required check is a review-owned hold (review-gate, or an annotated merge-gate). */
 export function reviewHoldGatesOnlyRed(rollup, requiredChecks) {
   if (!Array.isArray(rollup)) return false;
-  const latest = collapseRollupToLatestPerName(rollup);
-  if (latest.some(row => !row || typeof (row.name || row.context) !== 'string')) return false;
-  const failing = splitFailingChecks(latest, requiredChecks).required;
-  const mergeGate = latest.find(row => row?.name === 'merge-gate');
-  return failing.length > 0 && failing.every(name => name === 'review-gate'
-    || (name === 'merge-gate' && Boolean(mergeGate?.mergeGateReviewHold)));
+  const requiredNames = Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks
+    : rollup.map(row => row?.name || row?.context).filter(name => !CI_TRUTH_EXCLUDED_CHECKS.includes(name));
+  try {
+    return summarize(rollup, { requiredNames, holdGateNames: reviewHoldNames(rollup) }).gateOnlyRed;
+  } catch { return false; }
 }
 
 /** PURE: required reds are exclusively review-owned holds, with all other required evidence green. */
 export function reviewHoldOnlyRed(rollup, requiredChecks) {
   if (!reviewHoldGatesOnlyRed(rollup, requiredChecks)) return false;
-  const latest = collapseRollupToLatestPerName(rollup);
-  const failing = splitFailingChecks(latest, requiredChecks).required;
-  // Removing the proven holds must leave complete, readable green CI, never pending or unknown evidence.
-  return reduceCheckState(latest.map(row => failing.includes(row?.name || row?.context)
-    ? { ...row, conclusion: 'success' } : row), requiredChecks).state === 'green'
-    && reduceCheckState(latest, requiredChecks).counts.unreadable === 0;
+  const requiredNames = Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks
+    : rollup.map(row => row?.name || row?.context).filter(name => !CI_TRUTH_EXCLUDED_CHECKS.includes(name));
+  return summarize(rollup, { requiredNames, holdGateNames: reviewHoldNames(rollup) }).pendingSet.size === 0;
 }
 
 /**

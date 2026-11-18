@@ -58,6 +58,7 @@ import { isTerminalStatus } from '../lib/backlog-status.cjs';
  * — `undefined` for the WE-default path (byte-identical to before), the real slug otherwise.
  */
 import { excuseMergeGateRows, latestFailingMergeGate, loadMergeGateHoldSetting, readMergeGateVerdict as defaultReadMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
+import { HUMAN_REVIEW_HOLD_GATES } from '../lib/merge-gate-verdict.mjs';
 import { loadPromotionRequiredChecksSetting, promotionRequiredChecks } from '../lib/promotion-required-checks.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
@@ -67,11 +68,10 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createDraftPromoteProvider } from '../lib/draft-promote-provider.mjs';
 import { runReconcilePass } from '../conveyor/reconcile-pass.mjs';
-import { reviewHoldOnlyRed } from '../conveyor/reconcile-core.mjs';
+import { summarize, reviewHoldNames, passingAttempts } from '../lib/check-state-predicate.mjs';
 import { readPrsFromFile } from '../conveyor/open-pr-fetch.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { checksArgv, parseJsonLines } from './pr-status-io.mjs';
-import { reduceCheckState } from './pr-status.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { applyReviewStatus } from '../conveyor/review-status-tag.mjs';
 import { CLOSE_SUPERSEDED_MARKER } from '../conveyor/stand-down-answer-core.mjs';
@@ -102,8 +102,8 @@ export function isPromoteCodePath(path, { closure = promoteCodeClosure() } = {})
 /**
  * THE FRESH RE-READ (#2811). Asks GitHub's own commit-statuses endpoint for `sha`'s check runs RIGHT NOW —
  * bypassing whatever `statusCheckRollup` the reconcile snapshot carried — and reduces them with the SAME
- * `reduceCheckState`/`getRequiredStatusChecks` truth every other CI-truth reader in this family uses (never a
- * re-derived notion of "green"). Injectable so a test asserts the refusal with no `gh` on PATH.
+ * `check-state-predicate`/`getRequiredStatusChecks` policy. Review holds remain red evidence and
+ * are classified separately from successful admission. Injectable so a test asserts the refusal with no `gh` on PATH.
  * @param {{repoSlug:string, sha:string, runGh?:Function, getRequiredChecks?:Function}} o
  * @returns {{state:string, why:string, counts:object, reviewHoldOnly:boolean}}
  */
@@ -118,14 +118,25 @@ export function defaultReadHeadCheckState({
   });
   let rows = parseJsonLines(raw);
   try {
-    if (latestFailingMergeGate(rows)) {
+    const failingGate = latestFailingMergeGate(rows);
+    if (failingGate) {
       const setting = mergeGateSetting ?? loadMergeGateHoldSetting();
       if (setting.value === 'on') {
         const labels = readPrLabels({ repoSlug, prNumber, runGh });
-        rows = excuseMergeGateRows(rows, { prNumber, headSha: sha, labels, setting,
-          readVerdict: args => readMergeGateVerdict({ ...args, repo: repoSlug, runGh }),
+        let jobId;
+        const classified = excuseMergeGateRows(rows, { prNumber, headSha: sha, labels, setting,
+          readVerdict: args => { jobId = args.jobId; return readMergeGateVerdict({ ...args, repo: repoSlug, runGh }); },
           freeze: () => readFreeze(),
-        }).rows;
+        });
+        if (!classified.excused) rows = classified.rows;
+        else {
+          // Keep every original attempt and its conclusion: a policy excusal is not an actual SUCCESS.
+          const holds = classified.rows.find(row => row.mergeGateHoldExcused)?.mergeGateHoldExcused.holds;
+          if (holds?.length && holds.every(hold => hold.status === 'hold' && HUMAN_REVIEW_HOLD_GATES.includes(hold.id))) {
+            rows = rows.map(row => row === failingGate
+              ? { ...row, mergeGateReviewHold: { holds: holds.map(hold => hold.id), jobId } } : row);
+          }
+        }
       }
     }
   } catch { /* Preserve red on unreadable labels, settings or job evidence. */ }
@@ -133,8 +144,24 @@ export function defaultReadHeadCheckState({
   const promotionChecks = forPromotion
     ? promotionRequiredChecks(requiredChecks, rows, absentNotApplicable ?? loadPromotionRequiredChecksSetting().value)
     : requiredChecks;
-  const result = reduceCheckState(rows, promotionChecks);
-  return { ...result, reviewHoldOnly: result.state === 'red' && reviewHoldOnlyRed(rows, promotionChecks) };
+  const requiredNames = Array.isArray(promotionChecks) && promotionChecks.length
+    ? promotionChecks : rows.map(row => row.name || row.context);
+  const summary = summarize(rows, { requiredNames, holdGateNames: reviewHoldNames(rows) });
+  // Preserve this reader's terminal-cancellation display; it never passes shared admission.
+  for (const row of passingAttempts(rows)) {
+    if (summary.pendingSet.has(row.name) && String(row.status).toLowerCase() === 'completed'
+      && ['cancelled', 'stale'].includes(String(row.conclusion).toLowerCase())) {
+      summary.pendingSet.delete(row.name); summary.redSet.add(row.name); summary.gateOnlyRed = false;
+    }
+  }
+  const missing = [...summary.pendingSet].filter(name => !rows.some(row => (row.name || row.context) === name));
+  const counts = { total: requiredNames.length, failed: summary.redSet.size,
+    running: summary.pendingSet.size - missing.length, succeeded: requiredNames.length - summary.redSet.size - summary.pendingSet.size,
+    nonBlocking: 0, unreadable: missing.length };
+  const state = !rows.length ? 'unchecked' : counts.running ? 'pending' : counts.failed ? 'red' : counts.unreadable ? 'unchecked' : 'green';
+  const waitingOnReview = state === 'red' && summary.gateOnlyRed && !summary.pendingSet.size;
+  return { state, counts, why: waitingOnReview ? 'waiting-on-review' : `required checks: ${state}; not passing: ${[...summary.redSet, ...summary.pendingSet].join(', ') || 'none'}`,
+    reviewHoldOnly: waitingOnReview, waitingOnReview };
 }
 
 function validatePrLabels(labels) {

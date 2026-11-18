@@ -85,7 +85,7 @@ describe('operator send-back exact check identity', () => {
       { name: 'CODEQL', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-30T10:01:00Z' },
     ];
     expect(verdictRecheck.gateOnlyRedStates({ rollup, requiredChecks: ['test'],
-      drainGateSettings: { drainBlocksOnCodeQL: true } })).toEqual({ gateOnlyRed: false, red: ['review-gate', 'CodeQL'] });
+      drainGateSettings: { drainBlocksOnCodeQL: true } })).toEqual({ gateOnlyRed: false, red: ['review-gate', 'CodeQL'], waitingOnReview: false });
   });
 
   it('a differently cased required gate is ordinary CI evidence', () => {
@@ -480,8 +480,8 @@ describe('requiredCheckStates shared predicate regressions', () => {
     }
   });
 
-  it('undated success under a dated success stays green in both input orders', async () => {
-    await assertUndatedPair({ dated: 'SUCCESS', undated: 'SUCCESS', bucket: 'green' });
+  it('unordered dated and undated successes fail closed in both input orders', async () => {
+    await assertUndatedPair({ dated: 'SUCCESS', undated: 'SUCCESS', bucket: 'red' });
   });
 
   it.each([false, true])('an untagged failure stays red beside a legacy StatusContext success (reverse=%s)', reverse => {
@@ -573,7 +573,7 @@ describe('gateOnlyRedStates', () => {
     expect(verdictRecheck.gateOnlyRedStates({ ...input, rollup: [
       ...green, { name, status: 'COMPLETED', conclusion: 'FAILURE',
         ...(name === 'merge-gate' ? { mergeGateReviewHold: { holds: ['review-acceptance'], jobId: 123 } } : {}) },
-    ] })).toEqual({ gateOnlyRed: true, red: [name] });
+    ] })).toEqual({ gateOnlyRed: true, red: [name], waitingOnReview: true });
   });
 
   it('recognizes both gates red together', () => {
@@ -596,7 +596,7 @@ describe('gateOnlyRedStates', () => {
 
   it('no red checks is not gate-only red', () => {
     expect(verdictRecheck.gateOnlyRedStates({ ...input, rollup: green }))
-      .toEqual({ gateOnlyRed: false, red: [] });
+      .toEqual({ gateOnlyRed: false, red: [], waitingOnReview: false });
   });
 });
 
@@ -723,7 +723,7 @@ describe('R4 metadata regressions across verdict readers', () => {
 
 describe('R272 fail-closed evidence across every row', () => {
   it.each([
-    ['all successes', { status: 'COMPLETED', conclusion: 'SUCCESS' }, 'green'],
+    ['unordered successes', { status: 'COMPLETED', conclusion: 'SUCCESS' }, 'red'],
     ['mixed success and failure', { status: 'COMPLETED', conclusion: 'FAILURE' }, 'red'],
     ['pending alongside success', { status: 'PENDING' }, 'pending'],
     ['in-progress alongside success', { status: 'IN_PROGRESS' }, 'pending'],

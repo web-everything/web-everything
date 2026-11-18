@@ -13,8 +13,8 @@ const completedOutcomes = {
   cancelled: 'pending', // A re-run is expected; cancellation cannot pass admission.
   timed_out: 'red',
   action_required: 'red',
-  neutral: 'green',
-  skipped: 'green',
+  neutral: 'red',
+  skipped: 'red',
   stale: 'pending', // A re-run is expected here too.
   startup_failure: 'red',
   null: 'red',
@@ -528,7 +528,7 @@ describe('summarize required checks', () => {
 
   it('ignores optional failed and pending checks when deciding allRequiredGreen', () => {
     expect(summarize([
-      settled('ci', 'neutral'), settled('smoke', 'failure'),
+      settled('ci', 'success'), settled('smoke', 'failure'),
       { name: 'optional-build', status: 'queued', conclusion: null },
     ], { requiredNames: ['ci'] })).toEqual({
       redSet: new Set(), pendingSet: new Set(),
@@ -581,11 +581,11 @@ describe('gate-only-red detection', () => {
 
 
 describe('R272 every-row green rule', () => {
-  it('all successes for the same exact name are green', () => {
+  it('unordered successes for the same exact name fail closed', () => {
     expect(summarize([
       settled('ci', 'success', { run_attempt: 1 }),
       settled('ci', 'SUCCESS', { run_attempt: 2 }),
-    ], { requiredNames: ['ci'] }).allRequiredGreen).toBe(true);
+    ], { requiredNames: ['ci'] }).allRequiredGreen).toBe(false);
   });
 
   it.each([

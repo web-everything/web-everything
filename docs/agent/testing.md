@@ -4478,3 +4478,13 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+## Required-check attempt evidence
+
+Required-check readers share `scripts/lib/check-state-predicate.mjs`. A skipped or neutral required
+check never passes. Only an exact-name SUCCESS with the same workflow run ID and a strictly greater
+`run_attempt` can supersede older evidence; check IDs and timestamps cannot establish attempt order.
+Unordered attempts fail closed, including multiple successes. Keep the named regression cases for
+missing evidence, optional-name waivers, review-hold annotations and holds mixed with real failures.
+Promotion reports blocked check names for operator inspection; only proven review holds report
+`waitingOnReview`, and incomplete or unreadable evidence stays eligible for CI investigation.
