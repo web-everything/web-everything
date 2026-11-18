@@ -1,10 +1,34 @@
 /** A read-only view of reconciliation evidence; this module does not nominate work. */
 import { reviewCiGate } from './review-ci-gate.mjs';
-import { FAILED_CHECK_CONCLUSIONS, isFailedCheckRow } from './rollup-collapse.mjs';
+import { FAILED_CHECK_CONCLUSIONS, collapseRollupToLatestPerName, isFailedCheckRow } from './rollup-collapse.mjs';
+import { withoutImpliedRequiredChecks } from './required-check-implication.mjs';
 import { splitFailingChecks, reviewHoldGatesOnlyRed, reviewHoldOnlyRed } from '../conveyor/reconcile-core.mjs';
 
-const CHECK_CONCLUSIONS = new Set(['success', 'failure', 'neutral', 'cancelled', 'skipped',
-  'timed_out', 'action_required', 'stale', 'startup_failure']);
+/** A latest row that may prove an aggregate passed: explicit completed status (or a legacy success state). */
+function wellFormedGreen(row) {
+  if (row?.status === undefined && typeof row?.state === 'string') return row.state.toLowerCase() === 'success';
+  return typeof row?.status === 'string' && row.status.toLowerCase() === 'completed'
+    && typeof row?.conclusion === 'string' && row.conclusion.toLowerCase() === 'success';
+}
+
+/**
+ * reviewCiGate over the WHOLE rollup (never drop rows: a dropped pending or superseding run is blocking evidence
+ * the gate must see), plus one stricter rule: a required check the gate counted as implied must be implied by a
+ * well-formed aggregate. The shared implication defaults a missing status to completed; that is no evidence here.
+ */
+function evidenceGate({ headSha, requiredChecks, checks }) {
+  const gate = reviewCiGate({ headSha, requiredChecks, checks });
+  if (!gate.allowed) return gate;
+  const latest = collapseRollupToLatestPerName(checks);
+  // The gate allowed, so every required name without a row of its own was implied.
+  const implied = requiredChecks.filter(name => !latest.some(row => (row?.name ?? row?.context) === name));
+  const green = latest.filter(wellFormedGreen).map(row => ({ ...row, status: 'completed', conclusion: 'success' }));
+  const notProven = new Set(withoutImpliedRequiredChecks(requiredChecks, green));
+  const unproven = [...new Set(implied.filter(name => notProven.has(name)))];
+  if (!unproven.length) return gate;
+  const affected = unproven.map(name => ({ name, reason: 'missing' }));
+  return { allowed: false, headSha, reason: 'required-checks-not-successful', affected };
+}
 
 /**
  * Read one refusal without flattening its folded reviewRefusal. Always classify the current input;
@@ -23,14 +47,12 @@ export function readPlannerRow({ pr, plan, refusals = plan?.refusals ?? [],
   // Ask the existing normal-path classifier separately for each failing required check. In particular,
   // a plain merge-gate (or red-team) failure is not silently promoted to a review-owned hold.
   const reviewOwned = failing.required.filter(name => reviewHoldGatesOnlyRed(checks, [name]));
-  // Missing or malformed rows cannot supply implication evidence via shared status defaults.
-  const evidence = Array.isArray(checks) ? checks.filter(row => row?.status === 'completed'
-    && CHECK_CONCLUSIONS.has(row.conclusion)) : checks;
-  const fullCi = reviewCiGate({ headSha: rawPr?.headRefOid, requiredChecks, checks: evidence });
+  // Every row reaches the gate; malformed rows only lose their power to imply (evidenceGate).
+  const fullCi = evidenceGate({ headSha: rawPr?.headRefOid, requiredChecks, checks });
   // Preserve wrong-head refusals, and independently require current-head implication evidence.
   // Unheaded rollup rows retain the gate's assumption that they belong to the fetched PR head.
-  const currentCi = reviewCiGate({ headSha: rawPr?.headRefOid, requiredChecks,
-    checks: Array.isArray(evidence) ? evidence.filter(row => !row?.head_sha || row.head_sha === rawPr?.headRefOid) : evidence });
+  const currentCi = evidenceGate({ headSha: rawPr?.headRefOid, requiredChecks,
+    checks: Array.isArray(checks) ? checks.filter(row => !row?.head_sha || row.head_sha === rawPr?.headRefOid) : checks });
   const ci = fullCi.allowed ? currentCi : { ...fullCi, affected: [...fullCi.affected,
     ...currentCi.affected.filter(row => !fullCi.affected.some(full => full.name === row.name))] };
   // The SAME head-aware classification must prove that only failed review holds need excusing.

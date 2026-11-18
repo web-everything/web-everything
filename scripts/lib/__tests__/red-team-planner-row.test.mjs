@@ -162,18 +162,62 @@ describe('readPlannerRow', () => {
   });
 
   it.each([
-    ['missing status', { name: 'test', conclusion: 'success' }],
-    ['unknown conclusion', check('test', 'unknown')],
-    ['in_progress status with success', check('test', 'success', { status: 'in_progress' })],
-    ['missing conclusion', { name: 'test', status: 'completed' }],
-  ])('fails closed on direct and implied required checks with %s', (_, malformed) => {
-    for (const requiredChecks of [['integration'], ['test']]) {
+    ['missing status', { name: 'test', conclusion: 'success' }, 'malformed'],
+    ['null status', { name: 'test', status: null, conclusion: 'success' }, 'malformed'],
+    ['unknown conclusion', check('test', 'unknown'), 'unknown'],
+    ['in_progress status with success', check('test', 'success', { status: 'in_progress' }), 'pending'],
+    ['missing conclusion', { name: 'test', status: 'completed' }, 'malformed'],
+  ])('fails closed on direct and implied required checks with %s', (_, malformed, directReason) => {
+    for (const [requiredChecks, reason] of [[['integration'], 'missing'], [['test'], directReason]]) {
       const result = readPlannerRow({ pr, refusals: [refusal('review-ci')],
         rawPrs: [rawPr([{ ...malformed, head_sha: head }])], requiredChecks });
       expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: false,
-        affected: [{ name: requiredChecks[0], reason: 'missing' }] });
+        affected: [{ name: requiredChecks[0], reason }] });
       expect(result.reviewOwnedChecks.onlyRed).toBe(false);
     }
+  });
+
+  // Red-team break on 80c7c45b0ec4: dropping rows before the gate hid blocking evidence.
+  it.each([
+    ['newer pending run superseding success', ['test'],
+      [check('test', 'success', { id: 1 }), { name: 'test', status: 'in_progress', conclusion: null, id: 2 }],
+      { name: 'test', reason: 'pending' }],
+    ['explicit pending integration beside test success', ['integration'],
+      [check('test', 'success'), { name: 'integration', status: 'in_progress', conclusion: null }],
+      { name: 'integration', reason: 'pending' }],
+    ['queued integration beside test success', ['test', 'integration'],
+      [check('test', 'success'), { name: 'integration', status: 'queued', conclusion: null }],
+      { name: 'integration', reason: 'pending' }],
+    ['pending legacy status context', ['integration'],
+      [check('test', 'success'), { __typename: 'StatusContext', context: 'integration', state: 'PENDING' }],
+      { name: 'integration', reason: 'pending' }],
+    ['newer timestamped pending run', ['test'],
+      [check('test', 'success', { completedAt: '2026-11-17T10:00:00Z' }), { name: 'test', status: 'IN_PROGRESS', conclusion: null }],
+      { name: 'test', reason: 'pending' }],
+  ])('keeps pending evidence blocking: %s', (_, requiredChecks, checks, blocked) => {
+    const rows = checks.map(row => ({ ...row, head_sha: head }));
+    const result = readPlannerRow({ pr, refusals: [refusal('review-ci')], rawPrs: [rawPr(rows)], requiredChecks });
+    expect(reviewCiGate({ headSha: head, requiredChecks, checks: rows }).allowed).toBe(false);
+    expect(result.reviewOwnedChecks.ci.allowed).toBe(false);
+    expect(result.reviewOwnedChecks.ci.affected).toContainEqual(blocked);
+    expect(result.reviewOwnedChecks.onlyRed).toBe(false);
+  });
+
+  it('a malformed current-head test cannot imply integration behind a wrong-head success', () => {
+    const checks = [{ name: 'test', conclusion: 'success', head_sha: head, id: 1 },
+      check('test', 'success', { head_sha: 'b'.repeat(40), id: 2 })];
+    const result = readPlannerRow({ pr, refusals: [refusal('review-ci')], rawPrs: [rawPr(checks)], requiredChecks: ['integration'] });
+    expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: false, affected: [{ name: 'integration', reason: 'missing' }] });
+  });
+
+  it.each([
+    ['gh rollup uppercase check runs', [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }]],
+    ['legacy status context', [{ __typename: 'StatusContext', context: 'test', state: 'SUCCESS' }]],
+  ])('accepts well-formed %s as direct and implying evidence', (_, checks) => {
+    const requiredChecks = ['test', 'integration'];
+    const result = readPlannerRow({ pr, refusals: [refusal('review-ci')], rawPrs: [rawPr(checks)], requiredChecks });
+    expect(result.reviewOwnedChecks.ci).toEqual(reviewCiGate({ headSha: head, requiredChecks, checks }));
+    expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: true, affected: [] });
   });
 
   it('allows completed same-head test success to imply integration when only integration is required', () => {
