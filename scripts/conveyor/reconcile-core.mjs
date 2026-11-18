@@ -520,7 +520,9 @@ function requiredCheckEvidence(pr, requiredChecks) {
 export function reviewHoldGatesOnlyRed(pr, requiredChecks) {
   const resolved = requiredCheckEvidence(pr, requiredChecks);
   const states = Object.values(resolved.perName).map(value => value.state);
-  return resolved.state !== 'unknown' && !states.includes('fail') && states.includes('held');
+  // A required check that needs a rerun is still owed repair, never owned by the review hold.
+  const rerun = Object.values(resolved.perName).some(value => value.reasons?.includes?.('needs-rerun'));
+  return resolved.state !== 'unknown' && !rerun && !states.includes('fail') && states.includes('held');
 }
 
 /** PURE: at least one bound review hold; every other required check passes. */
