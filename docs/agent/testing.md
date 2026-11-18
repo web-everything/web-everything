@@ -4449,21 +4449,24 @@ historical snapshot missing the branch is upgraded under the same lock without l
 Waiters retry while the writer owns a live heartbeat lease, including beyond 180 seconds.
 The shared clone-lock primitive reclaims a dead PID or stale lease; the next writer refreshes
 the snapshot. Lock IO failures defer to the next pass with an explicit error rather than
-launching independent live listings. Context-only constellation repos share separate files
-under the round lock root, removed by the existing catch-up cleanup.
+launching independent live listings.
 
-Sibling context uses the same short-TTL, label/base-blind rows. Newly opened siblings can take
-until the next refresh to appear, as with siblings opened after a full drain's pass-start
-listing. This window supplies ordering context, never enqueue clearance: missing dependency
-proof still defers through the planner, and enqueue's mutating path runs a final LIVE target
-head and required-check verification. A moved head, red/missing check, unreadable target or
-unknown required set retains the hold. Cached sibling labels never authorize dequeue; a fast
-drain reads minimal live queue membership and then only queued PRs for eviction, including
-manually queued siblings omitted from the snapshot. Whole-repo drains retain their live sweep.
+Round rows are candidate evidence only (`complete:false`), including within the 60-second TTL.
+Ordering context always re-lists live pages to discover newly opened blockers and implementation
+siblings, including context-only constellation repos. Candidate repos reuse `readLiveRows` and
+its hydrated heavy-field cache/shared host seed; cached fields require a matching live head and
+`updatedAt`. Default-branch reuse avoids a second branch read without substituting cached rows
+for live sibling discovery. Eviction reuses live context rows, or re-lists when reconcile is off.
+Snapshot-mode eviction also reads live queue membership and fetches queued PRs absent from
+those rows, so a send-back beyond `OPEN_PR_LIST_LIMIT` is still dequeued. Unreadable membership
+or missing-PR evidence skips mutations and logs a retry-next-pass warning. The named cap and
+unreadable-evidence regressions in `merge-ai-prs.test.mjs` exercise these paths.
+Enqueue's mutating path retains a final LIVE target head and required-check verification. A moved
+head, red/missing check, unreadable target or unknown required set retains the hold.
 
 `fast-drain-round-lock.test.mjs` covers concurrent single-flight, a waiter past the old deadline,
 stale-writer takeover, lock failure, historical branch upgrade, branch failure, TTL bounds,
-oversized/incomplete/foreign evidence, target head invalidation, unfiltered context reuse, and
+oversized/incomplete/foreign evidence, target head invalidation, snapshot exclusion from live context, and
 final live evidence winning over a cached green row on the actual `enqueuePr` mutation path.
 Run it with `fast-drain-scope.test.mjs`, `enqueue-on-event.test.mjs` and
 `merge-queue-enqueue.test.mjs` through heavy-admission. Keep `listing.*` phase timers for

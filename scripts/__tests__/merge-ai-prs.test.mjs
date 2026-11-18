@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { buildManifest, manifestBodyBlock } from '../readiness/lane-manifest.mjs';
+import { OPEN_PR_LIST_LIMIT } from '../lib/no-search-backed-pr-list.mjs';
 import { deriveResolutionBasis, graduatedToFromBody } from '../lib/review-render.mjs';
 
 describe('withResolutionBasis — the drain park/skip comment (#2447)', () => {
@@ -222,7 +223,7 @@ describe('round listing freshness at the CLI boundary', () => {
     expect(buildLiveListingsByRepo([{ repo: 'fixture/repo', rows: [{ number: 42 }], listing: 'snapshot' }]).has('fixture/repo')).toBe(false);
   });
 
-  const run = (listing, { sendBack, reconcile = true, omitSibling = false, failListing = false, snapshotAgeMs = 0 } = {}) => {
+  const run = (listing, { sendBack, reconcile = true, omitSibling = false, failListing = false, snapshotAgeMs = 0, cappedListing = false, failQueue = false, failQueuedRead = false } = {}) => {
     const dir = mkdtempSync(join(tmpdir(), 'drain-round-cli-'));
     try {
       const row = (number, item, blockedBy = []) => ({ number, title: `PR ${number}`, state: 'OPEN',
@@ -240,7 +241,11 @@ describe('round listing freshness at the CLI boundary', () => {
         target.labels = [...target.labels, { name: 'review:changes' }];
         sibling.labels = sendBack === 'removed-ready' ? [] : [...sibling.labels, { name: sendBack }];
       }
-      writeFileSync(join(dir, 'rows.json'), JSON.stringify([target, sibling]));
+      // Fill the live listing cap with unselected PRs, leaving queued #43 on the next page.
+      const filler = cappedListing ? Array.from({ length: OPEN_PR_LIST_LIMIT - 1 }, (_, i) => ({
+        ...row(1000 + i, 1000 + i), labels: [], body: '',
+      })) : [];
+      writeFileSync(join(dir, 'rows.json'), JSON.stringify([target, ...filler, sibling]));
       writeFileSync(join(dir, 'merge-settings.json'), JSON.stringify({ mergeDelivery: { strategy: 'github-merge-queue' } }));
       writeFileSync(join(dir, 'gh'), `#!/usr/bin/env node
 const fs = require('node:fs');
@@ -250,7 +255,7 @@ const rows = JSON.parse(fs.readFileSync(process.env.ROWS_FILE, 'utf8'));
 let out = [];
 if (a[0] === 'repo') out = 'main';
 else if (a[0] === 'pr' && a[1] === 'view') {
-  if (process.env.FAIL_LISTING === '1' && a[2] === '43') { fs.writeSync(2, 'fixture queued PR unreadable'); process.exit(1); }
+  if ((process.env.FAIL_LISTING === '1' || process.env.FAIL_QUEUED_READ === '1') && a[2] === '43') { fs.writeSync(2, 'fixture queued PR unreadable'); process.exit(1); }
   out = { ...rows.find(r => r.number === Number(a[2])), commits: [] };
 }
 else if (a[0] === 'api' && a[1] === 'graphql') {
@@ -261,12 +266,18 @@ else if (a[0] === 'api' && a[1] === 'graphql') {
   } else if (q.includes('isInMergeQueue')) {
     out = { data: { repository: { pullRequest: { isInMergeQueue: !fs.existsSync(process.env.QUEUE_REMOVED) } } } };
   } else if (q.includes('mergeQueue(branch:')) {
+    if (process.env.FAIL_QUEUE === '1') { fs.writeSync(2, 'fixture queue unreadable'); process.exit(1); }
     out = { data: { repository: { mergeQueue: { entries: { nodes: fs.existsSync(process.env.QUEUE_REMOVED) ? [] : [{ pullRequest: { id: 'PR_43', number: 43 } }], pageInfo: { hasNextPage: false } } } } } };
   } else {
     if (process.env.FAIL_LISTING === '1') { fs.writeSync(2, 'fixture live listing unavailable'); process.exit(1); }
     const local = a.some(v => v.includes('repository(owner:"fixture",name:"repo")'));
-    const nodes = (local ? rows : []).map(r => ({ ...r, labels: { nodes: r.labels }, commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: r.statusCheckRollup } } } }] } }));
-    out = { data: { repository: { pullRequests: { nodes, totalCount: nodes.length, pageInfo: { hasNextPage: false, endCursor: null } } } } };
+    const allRows = local ? rows : [];
+    const offset = Number(q.split('after:"fixture-')[1]?.split('"')[0] || 0);
+    const pageSize = Number(q.split('pullRequests(states:OPEN,first:')[1]?.split(',')[0]?.split(')')[0] || 100);
+    const page = process.env.CAPPED_LISTING === '1' ? allRows.slice(offset, offset + pageSize) : allRows;
+    const end = offset + page.length;
+    const nodes = page.map(r => ({ ...r, labels: { nodes: r.labels }, commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: r.statusCheckRollup } } } }] } }));
+    out = { data: { repository: { pullRequests: { nodes, totalCount: allRows.length, pageInfo: { hasNextPage: end < allRows.length, endCursor: end < allRows.length ? 'fixture-' + end : null } } } } };
   }
 }
 if (a[0] === 'pr' && a[1] === 'view' && a.includes('id')) out = { id: 'PR_43' };
@@ -281,28 +292,38 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
         env: { ...process.env, ...daemonAppEnv(dir), PATH: `${dir}:${process.env.PATH}`, TMPDIR: dir,
           WE_FAST_DRAIN_LISTING: listing, WE_SHARED_SNAPSHOT: 'off', ROWS_FILE: join(dir, 'rows.json'), CALL_LOG: join(dir, 'calls.jsonl'),
           ...(sendBack ? { WE_MERGE_DELIVERY_SETTINGS_FILE: join(dir, 'merge-settings.json') } : {}),
-          QUEUE_REMOVED: join(dir, 'queue-removed'), FAIL_LISTING: failListing ? '1' : '0' },
+          QUEUE_REMOVED: join(dir, 'queue-removed'), FAIL_LISTING: failListing ? '1' : '0', CAPPED_LISTING: cappedListing ? '1' : '0',
+          FAIL_QUEUE: failQueue ? '1' : '0', FAIL_QUEUED_READ: failQueuedRead ? '1' : '0',
+          ...(cappedListing ? { WE_PR_LIST_PAGE_SIZE: '100' } : {}) },
       });
       expect(result.status, result.stderr).toBe(0);
       return { payload: JSON.parse(result.stdout.trim()), stderr: result.stderr,
         calls: readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse) };
     } finally { rmSync(dir, { recursive: true, force: true }); }
   };
-  it('sees a blockedBy sibling opened after --listing-snapshot when the 60-second context window expires', () => {
-    const { payload, stderr, calls } = run('snapshot', { snapshotAgeMs: 60_001 });
-    expect(stderr).toContain('listed-live');
+  it('sees a blockedBy sibling opened after --listing-snapshot via live context collection', () => {
+    const { payload, stderr, calls } = run('snapshot');
+    expect(stderr).toContain('served-from-snapshot');
     expect(calls.some(a => a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequests(states:OPEN')))).toBe(true);
     expect(calls.some(a => a[0] === 'pr' && a[1] === 'view' && a[2] === '43' && a.includes('fixture/repo'))).toBe(true);
     expect(payload.deferred).toEqual(expect.arrayContaining([expect.objectContaining({ num: 42, waitOn: expect.arrayContaining([43]) })]));
   });
-  it('reuses fresh context without re-listing PRs or resolving the stored default branch', () => {
+  it('re-lists fresh snapshot context live without resolving the stored default branch', () => {
     const { stderr, calls } = run('snapshot');
     expect(stderr).toContain('served-from-snapshot');
     const localListings = calls.filter(a => a[0] === 'api' && a[1] === 'graphql'
       && a.some(v => v.includes('repository(owner:"fixture",name:"repo")') && v.includes('pullRequests(states:OPEN')));
-    expect(localListings).toEqual([]);
+    expect(localListings).toHaveLength(1);
     expect(calls.some(a => a[0] === 'repo' && a[1] === 'view')).toBe(false);
     expect(calls.some(a => a[0] === 'pr' && a[1] === 'view' && a[2] === '42')).toBe(true);
+  });
+  it('discovers blockers live after an expired round is refreshed too', () => {
+    const { payload, stderr, calls } = run('snapshot', { snapshotAgeMs: 60_001 });
+    expect(stderr).toContain('listed-live');
+    const liveListings = calls.filter(a => a[0] === 'api' && a[1] === 'graphql'
+      && a.some(v => v.includes('repository(owner:"fixture",name:"repo")') && v.includes('pullRequests(states:OPEN')));
+    expect(liveListings).toHaveLength(2);
+    expect(payload.deferred).toEqual(expect.arrayContaining([expect.objectContaining({ num: 42, waitOn: expect.arrayContaining([43]) })]));
   });
   it('ignores --listing-snapshot when WE_FAST_DRAIN_LISTING=live', () => {
     const { stderr, calls } = run('live');
@@ -324,11 +345,29 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
     expect(stderr).toContain('served-from-snapshot');
     expect(calls.filter(a => a.some(v => v.includes('dequeuePullRequest')))).toHaveLength(1);
     expect(calls.filter(a => a[0] === 'pr' && a[1] === 'comment' && a[2] === '43')).toHaveLength(1);
-    // Queue membership plus live per-PR reads preserve eviction without listing every open PR.
+    // No second candidate listing is needed when the context already listed this repo live.
     const liveListings = calls.filter(a => a[0] === 'api' && a[1] === 'graphql'
       && a.some(v => v.includes('repository(owner:"fixture",name:"repo")') && v.includes('pullRequests(states:OPEN')));
-    expect(liveListings).toHaveLength(0);
+    expect(liveListings).toHaveLength(1);
+  });
+  it('dequeues a manually queued send-back PR omitted beyond OPEN_PR_LIST_LIMIT', () => {
+    const { calls } = run('snapshot', { sendBack: 'red-team:blocked', reconcile: false,
+      omitSibling: true, cappedListing: true });
+    const livePages = calls.filter(a => a[0] === 'api' && a[1] === 'graphql'
+      && a.some(v => v.includes('repository(owner:"fixture",name:"repo")') && v.includes('pullRequests(states:OPEN')));
+    expect(livePages).toHaveLength(OPEN_PR_LIST_LIMIT / 100);
+    expect(livePages.some(a => a.some(v => v.includes('after:"fixture-500"')))).toBe(false);
+    expect(calls.some(a => a.some(v => v.includes('mergeQueue(branch:')))).toBe(true);
     expect(calls.some(a => a[0] === 'pr' && a[1] === 'view' && a[2] === '43')).toBe(true);
+    expect(calls.filter(a => a.some(v => v.includes('dequeuePullRequest')))).toHaveLength(1);
+    expect(calls.filter(a => a[0] === 'pr' && a[1] === 'comment' && a[2] === '43')).toHaveLength(1);
+  });
+  it.each(['failQueue', 'failQueuedRead'])('defers eviction without mutation when omitted queue evidence is unreadable (%s)', failure => {
+    const { calls, stderr } = run('snapshot', { sendBack: 'red-team:blocked', reconcile: false,
+      omitSibling: true, cappedListing: true, [failure]: true });
+    expect(calls.some(a => a.some(v => v.includes('dequeuePullRequest')))).toBe(false);
+    expect(calls.some(a => a[0] === 'pr' && a[1] === 'comment' && a[2] === '43')).toBe(false);
+    expect(stderr).toMatch(/dequeue sweep.*retried next pass/);
   });
   it('keeps eviction on live evidence when round snapshots are disabled', () => {
     const { calls, stderr } = run('live', { sendBack: 'red-team:blocked' });
@@ -338,7 +377,7 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
   it.each([true, false])('retries unreadable eviction evidence without stale mutations (reconcile=%s)', reconcile => {
     const { calls, stderr } = run('snapshot', { sendBack: 'red-team:blocked', reconcile, failListing: true });
     expect(calls.some(a => a.some(v => v.includes('dequeuePullRequest')))).toBe(false);
-    expect(stderr).toMatch(/dequeue sweep.*retried next pass/);
+    expect(stderr).toMatch(reconcile ? /FAILED open-PR listing/ : /dequeue sweep.*retried next pass/);
   });
 });
 

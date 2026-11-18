@@ -128,10 +128,11 @@ it('invalidates the cached target row on a changed live head, retaining unrelate
   expect(listLive).not.toHaveBeenCalled();
 });
 
-it('reuses round context without narrowing out unlabelled/base-different siblings', () => {
+it('excludes snapshot rows even with historical roundContext while preserving live unfiltered siblings', () => {
   const sibling = { ...row(43), labels: [], baseRefName: 'release' };
   const rows = [row(), sibling];
-  expect(buildLiveListingsByRepo([{ repo, rows, prs: [row()], listing: 'snapshot', roundContext: true }]).get(repo)).toBe(rows);
+  expect(buildLiveListingsByRepo([{ repo, rows, prs: [row()], listing: 'snapshot', roundContext: true }]).has(repo)).toBe(false);
+  expect(buildLiveListingsByRepo([{ repo, rows, prs: [row()], listing: 'live' }]).get(repo)).toBe(rows);
   expect(buildLiveListingsByRepo([{ repo, rows, listing: 'snapshot' }]).has(repo)).toBe(false);
 });
 
