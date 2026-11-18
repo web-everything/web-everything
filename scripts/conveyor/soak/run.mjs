@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { runSoak } from './soak.mjs';
 import { BREAKS, breakById } from './breaks/index.mjs';
 import { knownUnfixed, soakBehaviourOptions } from './known-breaks.mjs';
+import { LONG_SOAK_LANES } from './long-soak-lanes.mjs';
 
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..', '..');
 
@@ -27,7 +28,7 @@ function flag(argv, name, fallback) {
 
 export async function runLongSoak({ rounds = 25, seed = 1, mainEvery = 4, log } = {}) {
   const opts = soakBehaviourOptions(REPO_ROOT, { log });
-  return runSoak({ name: 'daemon-soak', rounds, seed, mainEvery, churnEvery: 3, ...opts, log });
+  return runSoak({ name: 'daemon-soak', rounds, seed, mainEvery, churnEvery: 3, lanes: LONG_SOAK_LANES, ...opts, log });
 }
 
 async function main(argv) {
