@@ -1204,6 +1204,8 @@ export function isTransientUnknownMergeability(verdict) {
 
 /** Setting: how many extra re-reads a transient UNKNOWN gets, and the wait before each (bounded: ≤ 3 × 20 s by default). */
 export const UNKNOWN_MERGEABILITY_RETRY = Object.freeze({ retries: 3, delayMs: 20000 });
+/** Maximum REST mergeability recomputes per listing pass; excess candidates retain bounded retries. */
+export const UNKNOWN_MERGEABILITY_MAX_RECOMPUTE = 10;
 /** Env knob: an integer 0–3 overrides `retries` (0 = the old single read). Anything else keeps the default. */
 export const UNKNOWN_MERGEABILITY_RETRY_ENV = 'WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES';
 export function resolveUnknownMergeabilityRetry(env = {}, layers = {}) {
@@ -1330,9 +1332,9 @@ export function applyCiLifecycleLabelPlan({ plan, pr, repo = null, slug = repo, 
 }
 
 /** Refresh UNKNOWN listing facts before reading head-bound manifests/commits or classifying the pass. */
-export async function repollUnknownListings({ prsByRepo, read, sleep, setting = UNKNOWN_MERGEABILITY_RETRY, concurrency = 4, marks = new Map(), onPersistentUnknown, nudge }) {
+export async function repollUnknownListings({ prsByRepo, read, sleep, recompute, log = () => {}, maxRecompute = UNKNOWN_MERGEABILITY_MAX_RECOMPUTE, setting = UNKNOWN_MERGEABILITY_RETRY, concurrency = 4, marks = new Map(), onPersistentUnknown, nudge }) {
   const unknown = pr => !['CLOSED', 'MERGED'].includes(String(pr.state ?? '').toUpperCase())
-    && String(pr.mergeable ?? '').toUpperCase() === 'UNKNOWN';
+    && ['', 'UNKNOWN'].includes(String(pr.mergeable ?? '').toUpperCase());
   const marked = [...prsByRepo].flatMap(([repo, prs]) => prs
     .filter(pr => marks.has(`${repo}#${pr.number}`)).map(pr => ({ repo, pr })));
   await mapWithConcurrency(marked, concurrency, async ({ repo, pr }) => {
@@ -1340,6 +1342,20 @@ export async function repollUnknownListings({ prsByRepo, read, sleep, setting = 
     if (fresh?.number === pr.number) Object.assign(pr, fresh);
   });
   let pending = [...prsByRepo].flatMap(([repo, prs]) => prs.filter(unknown).map(pr => ({ repo, pr })));
+  const limit = Number.isInteger(maxRecompute) && maxRecompute >= 0 ? maxRecompute : UNKNOWN_MERGEABILITY_MAX_RECOMPUTE;
+  const recomputing = recompute ? pending.slice(0, limit) : [];
+  await mapWithConcurrency(recomputing, concurrency, async ({ repo, pr }) => {
+    log(`mergeable-unknown-recompute ${String(repo || '{owner}/{repo}').replace(/[\x00-\x1f\x7f]/g, '')}#${pr.number}`);
+    try { await recompute({ repo, num: pr.number }); } catch { /* best effort; fresh evidence still required */ }
+  });
+  if (recomputing.length) {
+    await sleep(setting.delayMs);
+    await mapWithConcurrency(recomputing, concurrency, async ({ repo, pr }) => {
+      const fresh = await read(repo, pr.number);
+      if (fresh?.number === pr.number) Object.assign(pr, fresh);
+    });
+    pending = pending.filter(({ pr }) => unknown(pr));
+  }
   for (let attempt = 0; pending.length && attempt < Math.min(3, setting.retries); attempt++) {
     await sleep(setting.delayMs);
     const unresolved = await mapWithConcurrency(pending, concurrency, async ({ repo, pr }) => {
@@ -5776,7 +5792,10 @@ async function runCli() {
   // fails closed (a coupled impl defers rather than orphan-landing past a carrier the gate cannot see).
   const prsByRepo = narrowPrsByRepo(listings, { onlyPr, onlyRepo, repos: REPOS, isLocalRepo });
   const openPrContext = await repollThenCollectContext({
-    repoll: async () => { await repollUnknownListings({ ...unknownRecovery, marks: passStuckUnknownMarks(), prsByRepo, read: fetchFreshPrForRevalidation, setting: UNKNOWN_RETRY, concurrency: resolvedMergePolicy.policy.concurrency.gateReads, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) }); emitStuckUnknownAlerts(); },
+    repoll: async () => { await repollUnknownListings({ ...unknownRecovery, marks: passStuckUnknownMarks(), prsByRepo, read: fetchFreshPrForRevalidation,
+      recompute: ({ repo, num }) => execFileP('gh', ['api', `repos/${repo || localSlug || '{owner}/{repo}'}/pulls/${num}`], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }),
+      log: line => process.stderr.write(`${line}\n`),
+      setting: UNKNOWN_RETRY, concurrency: resolvedMergePolicy.policy.concurrency.gateReads, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) }); emitStuckUnknownAlerts(); },
     collect: () => (RECONCILE ? __t.timeAsync('listing', () => __t.timeAsync('listing.context', () => collectContext(liveListingsByRepo))) : reduceOpenPrContext({ listings: [], reads: new Map(), reconcileRan: false })),
   });
   // Eviction needs live labels for ALL open PRs, including manually queued entries absent from follow-ups.

@@ -2864,8 +2864,12 @@ head with them. Test an initially empty repository label catalog and a same-head
 `gh pr edit --add-label` refuses labels that have not been created. The existing
 `ci-red-recovery-watch` missing-run pass re-requests absent CI after the configured
 age (using a recorded fixer push time when available), retaining its conflict, claim, head and retry-budget guards. The drain re-reads
-UNKNOWN listings before collecting head-bound context and also revalidates before
-merging, waiting for the configured delay at most three times per read stage.
+UNKNOWN listings (including null/absent/empty mergeability) before collecting
+head-bound context. It first requests one REST recompute per candidate, capped at
+ten per pass, waits the configured delay and re-reads. Excess or unresolved candidates
+retain the existing three bounded retries and persistent-unknown reporting.
+Revalidation before merging also retries at most
+three times. Recompute responses alone never authorize merging.
 Hermetic drain CLI fixtures with synthetic UNKNOWN reads pin
 `WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC=0` while retaining the retry count and
 merge/hold assertions. Several read stages can otherwise exhaust a child-process
