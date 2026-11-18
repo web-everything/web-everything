@@ -1786,6 +1786,26 @@ describe('runRemote', () => {
     expect(callsOf(f.exec).some(c=>c.file==='rsync'||isRun(c))).toBe(false);
     expect(callsOf(f.exec).filter(isCleanup)).toHaveLength(1);
   });
+  it.each([
+    ['staged deletion','D',':120000 000000'],['staged retarget','M',':120000 120000'],['mode change','T',':120000 100644'],
+  ])('falls back locally, with no copy or run, when a HEAD symlink changed in the index (%s)',async(_name,status,modes)=>{
+    const f=fixture(),original=f.exec;
+    f.argv=['npm','run','check:standards'];
+    f.exec=vi.fn(async call=>{
+      if(call.file==='git'&&gitArgs(call)[0]==='diff-index')
+        return {code:0,stdout:Buffer.from(`${modes} ${'a'.repeat(40)} ${'b'.repeat(40)} ${status}\0alias\0`)};
+      return original(call);
+    });
+    expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'head-symlink-changed',detail:'alias'});
+    expect(callsOf(f.exec).some(c=>c.file==='rsync'||isRun(c))).toBe(false);
+  });
+  it('falls back locally when the HEAD-link comparison is unreadable (fail closed)',async()=>{
+    const f=fixture(),original=f.exec;
+    f.argv=['npm','run','check:standards'];
+    f.exec=vi.fn(async call=>gitArgs(call)[0]==='diff-index'&&call.file==='git'?{code:1,stdout:Buffer.alloc(0)}:original(call));
+    expect(await runRemote(f)).toMatchObject({mode:'not-started',terminated:true,reason:'head-symlink-changed'});
+    expect(callsOf(f.exec).some(c=>c.file==='rsync'||isRun(c))).toBe(false);
+  });
   it('R807: a git-needing test routed remote on an unknown capability cache is refused safely at prepare by a runner without gitBundle',async()=>{
     const f=fixture(),original=f.exec,body=readFileSync(join(cwd,'a.test.mjs'));
     writeFileSync(join(cwd,'a.test.mjs'),"import { execFileSync } from 'node:child_process';\nexecFileSync('git', ['ls-files']);\n");
