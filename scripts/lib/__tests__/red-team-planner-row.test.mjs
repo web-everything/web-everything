@@ -93,15 +93,16 @@ describe('readPlannerRow', () => {
     }
   });
 
-  it('uses the producer classification with an adapted refusal instead of re-deriving it from the raw daemon snapshot', () => {
+  it('recomputes the current snapshot while preserving an adapted refusal', () => {
     const original = refusal('nothing-owed', { phase: 'queued' });
     const requiredChecks = ['review-gate'];
     const saved = readPlannerRow({ repo, pr, refusals: [original], rawPrs: [rawPr([check('review-gate')])], requiredChecks });
     const adapted = { ...original, kind: 'already-reviewed-head' };
     const result = readPlannerRow({ repo, pr, plan: { refusals: [adapted], plannerRows: [saved] }, rawPrs: [rawPr()], requiredChecks });
     expect(result.refusal).toBe(adapted);
-    expect(result.reviewOwnedChecks).toBe(saved.reviewOwnedChecks);
-    expect(result.reviewOwnedChecks.reviewOwned).toEqual(['review-gate']);
+    expect(result.reviewOwnedChecks).not.toBe(saved.reviewOwnedChecks);
+    expect(result.reviewOwnedChecks.reviewOwned).toEqual([]);
+    expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: false, affected: [{ name: 'review-gate', reason: 'missing' }] });
   });
 
   it.each(['failure', 'success'])('rejects %s checks entirely from another head for CI and red-only evidence', conclusion => {
@@ -116,26 +117,53 @@ describe('readPlannerRow', () => {
   });
 
   it.each([
-    ['same head and required set', {}, true],
-    ['reordered and duplicated required set', { requiredChecks: ['review-gate', 'test', 'test'] }, true],
-    ['head B with no checks', { rawPrs: [{ ...rawPr(), headRefOid: 'b'.repeat(40) }] }, false],
-    ['changed required set', { requiredChecks: ['test', 'review-gate', 'integration'] }, false],
-    ['different repo', { repo: 'other/repo' }, false],
+    ['same head and required set', {}],
+    ['reordered and duplicated required set', { requiredChecks: ['review-gate', 'test', 'test'] }],
+    ['head B with no checks', { rawPrs: [{ ...rawPr(), headRefOid: 'b'.repeat(40) }] }],
+    ['changed required set', { requiredChecks: ['test', 'review-gate', 'integration'] }],
+    ['different repo', { repo: 'other/repo' }],
     ['different PR', { pr: pr + 1, rawPrs: [{ ...rawPr(), number: pr + 1 }],
-      refusals: [refusal('review-ci', { prNumber: pr + 1 })] }, false],
-    ['missing repo', { repo: undefined }, false],
-    ['missing head', { rawPrs: [{ ...rawPr(), headRefOid: undefined }] }, false],
-    ['missing required set', { requiredChecks: null }, false],
-    ['empty required set', { requiredChecks: [] }, false],
-    ['malformed required set', { requiredChecks: ['test', ''] }, false],
-  ])('reuses saved classification only for a known matching key: %s', (_, changed, reuse) => {
+      refusals: [refusal('review-ci', { prNumber: pr + 1 })] }],
+    ['missing repo', { repo: undefined }],
+    ['missing head', { rawPrs: [{ ...rawPr(), headRefOid: undefined }] }],
+    ['missing required set', { requiredChecks: null }],
+    ['empty required set', { requiredChecks: [] }],
+    ['malformed required set', { requiredChecks: ['test', ''] }],
+  ])('recomputes saved classification from current evidence: %s', (_, changed) => {
     const input = { repo, pr, refusals: [refusal('review-ci')], requiredChecks: ['test', 'review-gate'] };
     const saved = readPlannerRow({ ...input, rawPrs: [rawPr([check('test', 'success'), check('review-gate', 'success')])] });
     expect(saved.reviewOwnedChecks.ci.allowed).toBe(true);
     const result = readPlannerRow({ ...input, rawPrs: [rawPr()], plan: { plannerRows: [saved] }, ...changed });
-    expect(result.reviewOwnedChecks === saved.reviewOwnedChecks).toBe(reuse);
-    expect(result.reviewOwnedChecks.ci.allowed).toBe(reuse);
-    if (!reuse) expect(result.reviewOwnedChecks.onlyRed).toBe(false);
+    expect(result.reviewOwnedChecks).not.toBe(saved.reviewOwnedChecks);
+    expect(result.reviewOwnedChecks.ci.allowed).toBe(false);
+    expect(result.reviewOwnedChecks.onlyRed).toBe(false);
+  });
+
+  it('rejects a current test failure on the same head despite a saved green classification', () => {
+    const input = { repo, pr, refusals: [refusal('review-ci')], requiredChecks: ['test', 'review-gate'] };
+    const saved = readPlannerRow({ ...input, rawPrs: [rawPr([check('test', 'success'), check('review-gate', 'success')])] });
+    expect(saved.reviewOwnedChecks.ci.allowed).toBe(true);
+    const checks = [check('test'), check('review-gate', 'success')];
+    const result = readPlannerRow({ ...input, rawPrs: [rawPr(checks)], plan: { plannerRows: [saved] } });
+    expect(result.reviewOwnedChecks).not.toBe(saved.reviewOwnedChecks);
+    expect(result.reviewOwnedChecks.ci).toEqual(reviewCiGate({ headSha: head, requiredChecks: input.requiredChecks, checks }));
+    expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: false, affected: [{ name: 'test', reason: 'failure' }] });
+    expect(result.reviewOwnedChecks.onlyRed).toBe(false);
+  });
+
+  it('reclassifies check reruns with changed conclusions on the same head', () => {
+    const input = { repo, pr, refusals: [refusal('review-ci')], requiredChecks: ['review-gate'] };
+    const checks = [check('review-gate', 'failure', { head_sha: head, id: 1, completedAt: '2026-11-17T10:00:00Z' })];
+    const saved = readPlannerRow({ ...input, rawPrs: [rawPr(checks)] });
+    expect(saved.reviewOwnedChecks.onlyRed).toBe(true);
+    checks.push(check('review-gate', 'success', { head_sha: head, id: 2, completedAt: '2026-11-17T11:00:00Z' }));
+    const green = readPlannerRow({ ...input, rawPrs: [rawPr(checks)], plan: { plannerRows: [saved] } });
+    expect(green.reviewOwnedChecks.ci.allowed).toBe(true);
+    expect(green.reviewOwnedChecks.onlyRed).toBe(false);
+    checks.push(check('review-gate', 'failure', { head_sha: head, id: 3, completedAt: '2026-11-17T12:00:00Z' }));
+    const red = readPlannerRow({ ...input, rawPrs: [rawPr(checks)], plan: { plannerRows: [green] } });
+    expect(red.reviewOwnedChecks.ci).toMatchObject({ allowed: false, affected: [{ name: 'review-gate', reason: 'failure' }] });
+    expect(red.reviewOwnedChecks.onlyRed).toBe(true);
   });
 
   it('recomputes legacy saved rows with no classification key', () => {
