@@ -1,3 +1,4 @@
+import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 /**
  * @file scripts/operations/dispatch-lane.mjs
  * @description THE `dispatch-lane` DECLARATION — the effect that STARTS rather than completes (#3037, epic #3029).
@@ -602,6 +603,15 @@ export function attemptTagFor(priorAttempts) {
   return String.fromCharCode(97 + Math.min(Math.trunc(n), 25));
 }
 
+/** Validate raw task text before policy or operator instructions can mask an empty template. */
+export function assertBriefTemplateContent(template) {
+  const text = String(template ?? '');
+  if (!text.trim()) {
+    throw new Error('dispatch-lane: the delivery-agent brief template is empty — refusing to dispatch an agent with no instructions');
+  }
+  return text;
+}
+
 /**
  * FILL an agent brief. PURE.
  *
@@ -669,10 +679,7 @@ export function fillBrief(
   optionalNames = OPTIONAL_BRIEF_PLACEHOLDERS,
   valuePatterns = {},
 ) {
-  const text = String(template ?? '');
-  if (!text.trim()) {
-    throw new Error('dispatch-lane: the delivery-agent brief template is empty — refusing to dispatch an agent with no instructions');
-  }
+  const text = assertBriefTemplateContent(template);
   for (const name of requiredNames) {
     const value = values[name];
     const blank = value === undefined || value === null || String(value).trim() === '';
@@ -1325,7 +1332,7 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes, groupMember
     // From the reader's card-record decision (planOperatorPostBuild), never a search of the filled prompt, which
     // card-influenced text can reach. A build only: no other kind composes post-build steps.
     operatorPostBuild: launchKind === 'build' && raw.operatorPostBuild === true,
-    prompt: brief.prompt,
+    prompt: renderNoPromptCommandRules(brief.prompt, launchKind),
     // REPORTED, never fatal — see `fillBrief`. Two of these are the brief's own prose today.
     briefUnknownTokens: brief.unknownTokens,
     // THE PR THIS DISPATCH REPAIRS, and (CI-heal only) WHY — riding the `read` finding so the effect payload

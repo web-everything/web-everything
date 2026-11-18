@@ -20,6 +20,22 @@ const log5008 = `main CI (ci.yml@main): green
   pass              ledger                 labels: labels clear (ledger not consulted)
 merge-gate: HOLD — held`;
 
+// Real job logs list the whole gate inventory (the parser refuses partial tables), so complete the abridged rows.
+function complete(log, gateIds) {
+  const out = [];
+  let seen = null;
+  const flush = () => { if (seen) for (const id of gateIds) if (!seen.has(id)) out.push(`  pass              ${id.padEnd(22)} fixture`); seen = null; };
+  for (const line of String(log).split('\n')) {
+    const bare = line.replace(/^\d{4}-\d\d-\d\dT\S+\s/, '');
+    if (/^#\d+:|^merge-gate:/.test(bare)) flush();
+    if (/^#\d+: (PASS|HOLD)\s*$/.test(bare)) seen = new Set();
+    else if (seen) { const m = /^  (\S+)\s+(\S+)/.exec(bare); if (m) seen.add(m[2]); }
+    out.push(line);
+  }
+  flush();
+  return out.join('\n');
+}
+
 export default {
   id: 'merge-gate-candidacy-hold-read-as-red-ci',
   title: "PR #5008 / drafts #5011–#5019 (2026-10-12): the required merge-gate's candidacy HOLD was read as red CI — ci-heal dispatched, review refused, drafts never promoted",
@@ -29,6 +45,7 @@ export default {
   async run() {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
     const { runReconcilePass } = await import(pathToFileURL(join(root, 'scripts/conveyor/reconcile-pass.mjs')).href);
+    const { GATE_IDS } = await import(pathToFileURL(join(root, 'scripts/lib/merge-gate-inventory.mjs')).href);
     const { parsePrResultTable } = await import(pathToFileURL(join(root, 'scripts/lib/merge-gate-hold-class.mjs')).href);
     const failureLogs = {
       5022: log5008.replaceAll('5008', '5022').replace('manual freeze: merge-queue switch: ruleset apply (operator go 2026-10-12)', 'main CI red since bbbbbbbbb'),
@@ -50,7 +67,7 @@ export default {
       readRequiredChecks: () => ({ checks: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'] }),
       readChecks: () => { throw new Error('complete fixture rollups must not hydrate checks'); },
       readMergeGateVerdict: ({ prNumber }) => ({
-        ...parsePrResultTable(failureLogs[prNumber] ?? (prNumber === 5008 ? log5008 : candidacyLog(prNumber)), prNumber),
+        ...parsePrResultTable(complete(failureLogs[prNumber] ?? (prNumber === 5008 ? log5008 : candidacyLog(prNumber)), GATE_IDS), prNumber),
         head_sha: sha, completed_at: '2026-10-12T11:56:08Z',
       }),
       readFreeze: () => ({ frozen: false, publishedAt: '2026-10-12T12:49:46.432Z' }),

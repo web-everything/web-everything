@@ -99,7 +99,7 @@ describe('live #5060 promotion', () => {
       headRefOid: 'a'.repeat(40), labels: [], isCrossRepository: false };
     const readHeadCheckState = vi.fn(() => ({ state: 'unchecked' }));
     runDraftPromotionStep({ repos: ['web-everything/web-everything'], listDrafts: () => [pr],
-      readHeadCheckState, absentNotApplicable: ['merge-gate'] });
+      readHeadCheckState, readPrView: () => pr, absentNotApplicable: ['merge-gate'] });
     expect(readHeadCheckState.mock.calls).toEqual([[{
       repoSlug: 'web-everything/web-everything', sha: pr.headRefOid, prNumber: 5060,
     }]]);
@@ -115,7 +115,7 @@ describe('live #5060 promotion', () => {
         expect(loadSetting).toHaveBeenCalledTimes(1);
         return { state: 'unchecked' };
       });
-      const options = { repos: ['web-everything/web-everything'], readHeadCheckState };
+      const options = { repos: ['web-everything/web-everything'], readHeadCheckState, readPrView: () => pr };
       step({ ...options, listDrafts: () => [] });
       step({ ...options, listDrafts: () => [{ ...pr, isDraft: false }] });
       expect(loadSetting).not.toHaveBeenCalled();
