@@ -148,6 +148,21 @@ describe('R1053 base reproduction IO', () => {
       expect(readFileSync(indexPath, 'utf8').trim().split('\n')).toHaveLength(1);
     });
   });
+  it('a re-run whose card line differs only by its timestamp adds no second card or index row', async () => {
+    await withRealRepo(async ({ root, tmp }) => {
+      const cardsPath = join(tmp, 'cards.md'), indexPath = join(tmp, 'index.jsonl');
+      const options = { cwd: root, home: join(tmp, 'home'), cardsPath, indexPath };
+      const at = t => ({ key: 'x.mjs|X|E1', cardLine: `- [R1053] ${t} ET: pre-existing audit finding (E1) in we:x.mjs#X` });
+      expect(createAuditDeps(options).fileCard(at('10:19:35'))).toBe(true);
+      const first = readFileSync(cardsPath, 'utf8');
+      expect(createAuditDeps(options).fileCard(at('10:19:36'))).toBe(true);
+      expect(readFileSync(cardsPath, 'utf8')).toBe(first);
+      expect(readFileSync(indexPath, 'utf8').trim().split('\n')).toHaveLength(1);
+      writeFileSync(cardsPath, '');
+      expect(createAuditDeps(options).fileCard(at('10:19:37'))).toBe(true);
+      expect(readFileSync(cardsPath, 'utf8').trim().split('\n')).toHaveLength(1);
+    });
+  });
   it.each(['success', 'timeout', 'malformed', 'add fails'])('removes detached scratch worktree in finally: %s', async kind => {
     await withRealRepo(async ({ root, tmp, head, git }) => {
       let dir;
