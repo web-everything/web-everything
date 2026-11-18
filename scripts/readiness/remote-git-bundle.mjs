@@ -160,6 +160,32 @@ function splitNul(buffer) {
 const SIGNATURE_ARMOR = /-----(?:BEGIN|END) (?:PGP SIGNATURE|SSH SIGNATURE|SIGNED MESSAGE)-----/g;
 const bytes = (value) => Buffer.isBuffer(value) ? value : Buffer.from(value ?? '');
 
+/** Reviewed allow-list of already-public tracked files that handle keys (code, not keys). Read from the PUBLIC base
+ *  (the prerequisite commit), never from the range being scanned, so a commit cannot allow-list its own content.
+ *  Keyed by path + sha256 of the blob: any edit changes the hash and re-triggers the full scan. */
+export const CREDENTIAL_ALLOWLIST_PATH = 'scripts/readiness/bundle-scan-allowlist.json';
+async function loadCredentialAllowlist({ git, prerequisite }) {
+  const map = new Map();
+  if (!prerequisite) return map;
+  let shown;
+  try { shown = await git(['show', `${prerequisite}:${CREDENTIAL_ALLOWLIST_PATH}`]); } catch { return map; }
+  if (shown.code !== 0 || shown.stdout == null) return map;
+  let doc;
+  try { doc = JSON.parse(bytes(shown.stdout).toString('utf8')); } catch { return map; }
+  for (const entry of Array.isArray(doc?.entries) ? doc.entries : []) {
+    if (typeof entry?.path !== 'string' || !/^[0-9a-f]{64}$/.test(entry?.sha256 ?? '') || !Array.isArray(entry.findings)) continue;
+    map.set(`${entry.path}\0${entry.sha256}`, new Set(entry.findings.filter(f => typeof f === 'string')));
+  }
+  return map;
+}
+/** True when every finding on this blob is listed for exactly this path and content hash. */
+function allowedFindings(allowed, label, content, findings) {
+  const present = findings.filter(Boolean);
+  if (!allowed.size || !present.length) return false;
+  const set = allowed.get(`${label}\0${createHash('sha256').update(content).digest('hex')}`);
+  return !!set && present.every(f => set.has(f));
+}
+
 /**
  * R559: scan every bundled commit's additions beyond the prerequisite tree (or the whole history when it is null).
  * Path policy is the manifest's own exclusion policy; content uses its raw token patterns.
@@ -176,6 +202,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings 
   const graftPath = await git(['rev-parse', '--git-path', 'info/grafts']);
   if (graftPath.code !== 0 || existsSync(resolve(cwd, bytes(graftPath.stdout).toString('utf8').trim()))) throw bundleError('bundle-credential-scan-failed', 'grafts-file');
   const prerequisiteEntries = new Set();
+  const allowed = await loadCredentialAllowlist({ git, prerequisite });
   if (prerequisite) {
     let tree;
     try { tree = await git(['ls-tree', '-r', '-t', '-z', '--full-tree', prerequisite]); }
@@ -334,7 +361,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings 
         let policy = null;
         try { policy = credentialContentFinding(path, content); } catch { policy = 'content-scan-error'; }
         const hit = policy ?? finding;
-        if (hit) return { path: label, finding: hit };
+        if (hit && !allowedFindings(allowed, label, content, [policy, finding])) return { path: label, finding: hit };
         const warning = credentialContentWarning(path, content);
         if (warning) warnings.push({ path: label, finding: warning });
       }

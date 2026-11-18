@@ -679,3 +679,40 @@ describe('R857 advisory bundle credential policy',()=>{
       expect(JSON.stringify(onWarning.mock.calls)).not.toContain('q8Zr2LmX9vT4pW7kJ1nB5cY3');
     });
 });
+
+describe('R830/R823 reviewed allow-list for tracked key-handling code', () => {
+  const keyish = '// handles keys\nconst h = "-----BEGIN ' + 'PRIVATE KEY-----";\n';
+  const mk = async (allowText) => {
+    const repo = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'gbt-allow-')); made.push(repo);
+    git(repo, 'init', '-q', '-b', 'main');
+    const files = { 'a.txt': 'base\n' };
+    if (allowText) files['scripts/readiness/bundle-scan-allowlist.json'] = allowText;
+    await fs.mkdir(join(repo, 'scripts/readiness'), { recursive: true });
+    const base = await put(repo, files, 'public base');
+    return { repo, base };
+  };
+  const put = async (repo, files, msg) => { for (const n of Object.keys(files)) await fs.mkdir(join(repo, n, '..'), { recursive: true }); return commit(repo, files, msg); };
+  const doc = (path, text, findings) => JSON.stringify({ entries: [{ path, sha256: hash(text), findings }] });
+
+  it('lets a listed path with the matching hash through', async () => {
+    const { repo, base } = await mk(doc('lib/shim.mjs', keyish, ['pem-header']));
+    const head = await put(repo, { 'lib/shim.mjs': keyish }, 'shim');
+    expect(await scanBundleRange({ cwd: repo, head, prerequisite: base, exec })).toBeNull();
+  });
+  it('re-triggers the scan when the content changes (hash differs)', async () => {
+    const { repo, base } = await mk(doc('lib/shim.mjs', keyish, ['pem-header']));
+    const head = await put(repo, { 'lib/shim.mjs': keyish + '// edited\n' }, 'edit');
+    expect(await scanBundleRange({ cwd: repo, head, prerequisite: base, exec })).toMatchObject({ path: 'lib/shim.mjs', finding: 'pem-header' });
+  });
+  it('still refuses a real-looking key in an unlisted file', async () => {
+    const { repo, base } = await mk(doc('lib/shim.mjs', keyish, ['pem-header']));
+    const head = await put(repo, { 'notes/untracked-key.txt': keyish }, 'leak');
+    expect(await scanBundleRange({ cwd: repo, head, prerequisite: base, exec })).toMatchObject({ path: 'notes/untracked-key.txt', finding: 'pem-header' });
+  });
+  it('ignores an allow-list the range itself adds (only the public base counts)', async () => {
+    const { repo, base } = await mk(null);
+    await put(repo, { 'scripts/readiness/bundle-scan-allowlist.json': doc('lib/shim.mjs', keyish, ['pem-header']) }, 'self-allow');
+    const head = await put(repo, { 'lib/shim.mjs': keyish }, 'shim');
+    expect(await scanBundleRange({ cwd: repo, head, prerequisite: base, exec })).toMatchObject({ path: 'lib/shim.mjs', finding: 'pem-header' });
+  });
+});
