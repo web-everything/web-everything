@@ -1,6 +1,7 @@
 /** Hermetic IO fixtures: report-only, no actions, no GitHub writes. */
 import { describe, it, expect } from 'vitest';
 import { join } from 'node:path';
+import { classifyPr } from '../assistant-babysit-rules.mjs';
 import { runTick, createTickRunner, main, DEFAULT_CLAIM_TTL_MIN } from '../assistant-babysit-pass.mjs';
 
 const nowMs = Date.parse('2026-01-01T12:00:00Z');
@@ -12,7 +13,7 @@ function fixture() {
   const files = new Map();
   const calls = [];
   const pr = { number: 1, isInMergeQueue: false, labels: [{ name: 'review:changes' }], isDraft: false, mergeable: 'MERGEABLE',
-    headRefOid: 'abc', updatedAt: old, statusCheckRollup: [] };
+    headRefOid: 'abc', headRefName: 'lane/test', headRepository: { nameWithOwner: 'web-everything/web-everything' }, isCrossRepository: false, updatedAt: old, statusCheckRollup: [] };
   const world = { files, calls, required: ['checks', 'infra'], rules: [], prs: [pr], events: [], commitDate: old, why: { verdict: { owner: 'fix operator', waitingFor: 'capacity', sections: [{ name: 'daemons', lines: ['review: idle', 'fix: waiting | capacity'] }] } }, claims: [] };
   world.io = {
     mkdirSync() {},
@@ -33,6 +34,14 @@ function fixture() {
   };
   world.exec = (command, args, options) => {
     calls.push({ command, args, options });
+    if (command === 'git') {
+      if (world.origin instanceof Error) throw world.origin;
+      return world.origin ?? 'https://github.com/web-everything/web-everything.git';
+    }
+    if (command === 'node' && args[1] === 'status') {
+      if (world.leases instanceof Error) throw world.leases;
+      return world.leaseJson ?? JSON.stringify(world.leases ?? { lanes: [] });
+    }
     if (command === 'node') {
       if (world.why instanceof Error) throw world.why;
       return JSON.stringify(world.why);
@@ -271,15 +280,16 @@ describe('precision and explanation budgets', () => {
     w.tick({ nowMs: nowMs + 30 * 60000 + 1 });
     expect(w.calls.filter((c) => c.command === 'node')).toHaveLength(2);
   });
-  it('caps fresh why calls at six, retains reports, and prioritizes missing then oldest caches across repos', () => {
+  it('caps fresh why calls at ten, retains reports, and prioritizes missing then oldest caches across repos', () => {
     const w = fixture();
     w.prs = Array.from({ length: 8 }, (_, index) => ({ ...w.prs[0], number: index + 1 }));
-    expect(w.tick({ repos: ['org/one', 'org/two'] }).summary).toMatchObject({ reports: 16, whySkipped: 10 });
-    expect(w.calls.filter((c) => c.command === 'node')).toHaveLength(6);
-    expect(w.files.get(join('output', 'digest.md'))).toContain('whySkipped: 10');
+    expect(w.tick({ repos: ['org/one', 'org/two'] }).summary).toMatchObject({ reports: 16, whySkipped: 6 });
+    expect(w.calls.filter((c) => c.command === 'node')).toHaveLength(10);
+    expect(w.files.get(join('output', 'digest.md'))).toContain('whySkipped: 6');
     w.calls.length = 0;
     w.tick({ repos: ['org/one', 'org/two'], nowMs: nowMs + 60000, maxWhy: 1 });
-    expect(w.calls.filter((c) => c.command === 'node').map((c) => c.args[2])).toEqual(['--pr=4']);
+    // Detail ordering interleaves repos by PR number: ten calls cover PRs 1–5 in each repo.
+    expect(w.calls.filter((c) => c.command === 'node').map((c) => c.args[2])).toEqual(['--pr=6']);
     const state = JSON.parse(w.files.get(join('output', 'state.json')));
     state.whyCache = Object.fromEntries(w.prs.map((pr) => [`org/one#${pr.number}@abc`, { at: nowMs - pr.number * 60000, verdict: { owner: 'operator' } }]));
     w.files.set(join('output', 'state.json'), JSON.stringify(state));
@@ -319,7 +329,7 @@ describe('report-only tick', () => {
       }
       expect(options).toMatchObject({ timeout: 60000, maxBuffer: 32 * 1024 * 1024, env: { GH_CALLER: 'wev-assistant', FIXTURE: 'yes' } });
     }
-    expect(gh[0].args).toEqual(['pr', 'list', '--repo', 'web-everything/web-everything', '--state', 'open', '--limit', '500', '--json', 'number,labels,isDraft,mergeable,mergeStateStatus,headRefOid,updatedAt,statusCheckRollup,isInMergeQueue']);
+    expect(gh[0].args).toEqual(['pr', 'list', '--repo', 'web-everything/web-everything', '--state', 'open', '--limit', '500', '--json', 'number,labels,isDraft,mergeable,mergeStateStatus,headRefOid,headRefName,headRepository,isCrossRepository,updatedAt,statusCheckRollup,isInMergeQueue']);
     expect(w.calls.at(-1)).toMatchObject({ command: 'node', args: ['why.mjs', 'why', '--pr=1', '--repo=web-everything/web-everything', '--json'], options: { timeout: 20000 } });
   });
 
@@ -644,12 +654,12 @@ describe('report-only tick', () => {
 
 
 describe('shadow action log', () => {
-  it('reads why for human-owned owed work before the report threshold', () => {
+  it('defers why for human-owned owed work until an ownership-sensitive report fires', () => {
     const w = fixture();
     w.prs[0].labels.push({ name: 'review:human' });
     w.commitDate = '2026-01-01T11:59:00Z';
     expect(w.tick().reports).toEqual([]);
-    expect(w.calls.some((c) => c.command === 'node')).toBe(true);
+    expect(w.calls.some((c) => c.command === 'node')).toBe(false);
   });
   it('escalates why suggestedOp without bare owner and refusal evidence', () => {
     const w = fixture();
@@ -783,7 +793,7 @@ describe('required green sticky labels', () => {
     ['status context', [{ context: 'checks', state: 'SUCCESS' }], ['checks'], true],
     ['pending required', [{ name: 'checks', status: 'IN_PROGRESS', conclusion: '' }], ['checks'], false],
     ['red required', [{ name: 'checks', conclusion: 'FAILURE' }], ['checks'], false],
-    ['missing required result', [{ name: 'checks', conclusion: 'SUCCESS' }], ['checks', 'infra'], false],
+    ['repo-wide absent required context is nonblocking', [{ name: 'checks', conclusion: 'SUCCESS' }], ['checks', 'infra'], true],
     ['no required result', [], ['checks'], false],
     ['unknown check', [{ name: 'checks', conclusion: 'UNKNOWN' }], ['checks'], false],
     ['unknown requirements', [{ name: 'checks', conclusion: 'SUCCESS' }], [], false],
@@ -945,4 +955,298 @@ describe('GitHub backoff', () => {
     expect(run().delayMs).toBe(expected[0]);
     expect(w.log().filter((l) => l.type === 'tick')).toHaveLength(2);
   });
+});
+
+
+const prStates = (w) => (w.files.get(join('output', 'pr-state.jsonl')) ?? '').trim().split('\n').filter(Boolean).map(JSON.parse);
+describe('live ownership feed', () => {
+  const cases = [
+    ['no-worker', ['review:changes'], []],
+    ['human-wait', ['review:human', 'review:changes'], []],
+    ['gate-red-stalled', [], [{ name: 'checks', conclusion: 'FAILURE' }]],
+    ['sticky-label', ['status:ci-red'], [{ name: 'checks', conclusion: 'SUCCESS' }]],
+  ];
+  it.each(cases.flatMap(([rule, labels, rollup]) => ['claim', 'daemon-note', 'lease'].map((by) => [rule, labels, rollup, by])))('%s suppressed with replay evidence: %j %j %s', (rule, labels, rollup, by) => {
+    const w = fixture();
+    w.required = ['checks'];
+    Object.assign(w.prs[0], { labels: labels.map((name) => ({ name })), statusCheckRollup: rollup });
+    if (by === 'claim') w.claims = [makeClaim()];
+    if (by === 'daemon-note') w.why.verdict.sections[0].lines = ['builder: 2026-01-01T11:30:00Z working'];
+    if (by === 'lease') w.leases = { lanes: [{ leased: true, path: 'lanes/active', branch: 'lane/test', lease: { holder: 'worker' } }] };
+    expect(w.tick({ lanePoolCli: 'lane-pool.mjs' }).reports.map((r) => r.rule)).not.toContain(rule);
+    expect(prStates(w)).toHaveLength(1);
+    expect(prStates(w)[0]).toMatchObject({ owned: { by }, fired: [], suppressed: [rule] });
+  });
+  it.each(['fix', 'review', 'drain', 'builder'])('parses %s timestamps only at the line start, choosing the youngest note', (name) => {
+    const w = fixture();
+    const noteLine = `${name}: 2026-01-01T11:50:00.000Z working`;
+    w.why.verdict.sections[0].lines = ['fix: 2026-01-01T11:40:00Z working', noteLine, 'review: idle 2026-01-01T12:00:00Z'];
+    expect(w.tick().reports).toEqual([]);
+    expect(prStates(w)[0].owned.detail).toEqual({ noteAgeMin: 10, noteLine });
+    expect(JSON.parse(w.files.get(join('output', 'state.json'))).whyCache['web-everything/web-everything#1@abc'].verdict).toMatchObject({ noteAgeMin: 10, noteLine });
+  });
+  it.each(['2026-01-01T11:29:00Z', '2026-01-01T12:01:00Z', 'invalid'])('does not suppress for an old, future or invalid daemon note: %s', (timestamp) => {
+    const w = fixture();
+    w.why.verdict.sections[0].lines = [`fix: ${timestamp} working`];
+    expect(w.tick().reports[0].rule).toBe('no-worker');
+    expect(prStates(w)[0].owned).toBeNull();
+  });
+  it('recomputes daemon note age when reusing the 30 minute why cache', () => {
+    const w = fixture();
+    w.why.verdict.sections[0].lines = ['fix: 2026-01-01T11:30:00Z working'];
+    expect(w.tick().reports).toEqual([]);
+    w.calls.length = 0;
+    expect(w.tick({ nowMs: nowMs + 60000 }).reports[0].rule).toBe('no-worker');
+    expect(w.calls.filter((c) => c.args[1] === 'why')).toHaveLength(0);
+    expect(prStates(w).at(-1).owned).toBeNull();
+  });
+  it.each([
+    ['execution failure', { leases: new Error('offline') }],
+    ['invalid JSON', { leaseJson: '{' }],
+    ['wrong shape', { leases: [] }],
+    ['incomplete live row', { leases: { lanes: [{ leased: true, path: 'lanes/active', branch: 'lane/test' }] } }],
+    ['oversized output', { leases: Object.assign(new Error('maxBuffer exceeded'), { code: 'ENOBUFS' }) }],
+  ])('lease feed fails closed once per tick: %s', (_, patch) => {
+    const w = fixture();
+    Object.assign(w, patch);
+    w.prs.push({ ...w.prs[0], number: 2 });
+    expect(w.tick({ lanePoolCli: 'lane-pool.mjs' }).reports.map((r) => r.rule)).toEqual(['no-worker', 'no-worker']);
+    expect(w.files.get(join('output', 'digest.md')).split('lease feed unavailable')).toHaveLength(2);
+    expect(w.calls.filter((c) => c.args[1] === 'status')).toHaveLength(1);
+    expect(prStates(w).every((row) => row.owned === null)).toBe(true);
+  });
+  it('reads leases once per tick, matches only live exact branches and discards the list on the next tick', () => {
+    const w = fixture();
+    w.leases = { lanes: [
+      { leased: false, branch: 'lane/test', lease: { holder: 'expired' } },
+      { leased: true, path: 'lanes/active', branch: 'lane/test-other', lease: { holder: 'worker' } },
+    ] };
+    w.prs.push({ ...w.prs[0], number: 2 });
+    expect(w.tick({ lanePoolCli: 'lane-pool.mjs' }).reports).toHaveLength(2);
+    w.leases.lanes.push({ leased: true, path: 'lanes/active', branch: 'lane/test', lease: { holder: 'worker' } });
+    expect(w.tick({ lanePoolCli: 'lane-pool.mjs' }).reports).toEqual([]);
+    const calls = w.calls.filter((c) => c.args[1] === 'status');
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toMatchObject({ command: 'node', args: ['lane-pool.mjs', 'status', '--json', '--leased-only'],
+      options: { timeout: 20000, maxBuffer: 4 * 1024 * 1024 } });
+  });
+  it('discovers the default lane CLI by walking up from the module', () => {
+    const w = fixture();
+    const exists = w.io.existsSync;
+    w.io.existsSync = (path) => exists(path) || /[/\\]scripts[/\\]lane-pool[.]mjs$/.test(path);
+    w.tick();
+    const call = w.calls.find((c) => c.args[1] === 'status');
+    expect(call.args[0]).toMatch(/[/\\]scripts[/\\]lane-pool[.]mjs$/);
+  });
+  it('why cap retains the report with ownerUnknown even when a matching lease exists', () => {
+    const w = fixture();
+    w.leases = { lanes: [{ leased: true, path: 'lanes/active', branch: 'lane/test', lease: { holder: 'worker' } }] };
+    expect(w.tick({ maxWhy: 0, lanePoolCli: 'lane-pool.mjs' }).reports[0]).toMatchObject({ rule: 'no-worker', detail: { ownerUnknown: true } });
+    expect(prStates(w)[0]).toMatchObject({ owned: null, fired: ['no-worker'], suppressed: [] });
+    expect(w.calls.filter((c) => c.args[1] === 'why')).toHaveLength(0);
+    expect(w.files.get(join('output', 'digest.md'))).toContain('higher --max-why');
+  });
+});
+
+describe('per PR replay state', () => {
+  it.each([
+    ['owed', ['review:changes'], ['no-worker'], [], false, false],
+    ['red CI', [], ['gate-red-stalled'], ['checks'], false, true],
+    ['human owned', ['review:human'], [], [], false, false],
+    ['ready', ['ready-to-merge'], ['ready-stalled'], [], true, false],
+  ])('records one complete state line per tick for %s', (_, labels, fired, failing, green, ciFailing) => {
+    const w = fixture();
+    w.required = ['checks', 'infra', 'merge-gate'];
+    w.prs[0].labels = [...labels, 'bug', 'needs-attention', 'red-team:accepted', 'merge-status:clean'].map((name) => ({ name }));
+    w.prs[0].statusCheckRollup = [
+      { name: 'checks', conclusion: ciFailing ? 'FAILURE' : 'SUCCESS' },
+      { name: 'infra', status: green ? 'COMPLETED' : 'IN_PROGRESS', conclusion: green ? 'SUCCESS' : '' },
+    ];
+    w.tick();
+    expect(prStates(w)).toEqual([{ type: 'pr-state', at: new Date(nowMs).toISOString(), repo: 'web-everything/web-everything', pr: 1,
+      head: 'abc', draft: false, inMergeQueue: false,
+      labels: [...labels, 'needs-attention', 'red-team:accepted', 'merge-status:clean'],
+      required: { names: ['checks', 'infra', 'merge-gate'], present: ['checks', 'infra'], missing: ['merge-gate'], failing, pending: green ? [] : ['infra'] },
+      requiredGreen: green, ciFailing, minutes: 120, owned: null, fired, suppressed: [] }]);
+    w.tick();
+    expect(prStates(w)).toHaveLength(2);
+  });
+  it('logs undetailed candidates with unknown age and bounds the log to 60 with operator fallback', () => {
+    const w = fixture();
+    w.prs = Array.from({ length: 61 }, (_, i) => ({ ...w.prs[0], number: i + 1 }));
+    expect(w.tick({ maxDetail: 0 }).summary.skipped).toBe(61);
+    expect(prStates(w)).toHaveLength(60);
+    expect(prStates(w)[0]).toMatchObject({ minutes: null, owned: null, fired: [], suppressed: [] });
+    expect(w.files.get(join('output', 'digest.md'))).toContain('pr-state limited to 60 of 61 candidates; operator inspection required');
+  });
+  it('pr-state append failure writes stderr and does not abort the tick or other PR logs', () => {
+    const w = fixture();
+    w.prs.push({ ...w.prs[0], number: 2 });
+    const append = w.io.appendFileSync;
+    w.io.appendFileSync = (path, data) => {
+      if (path.endsWith('pr-state.jsonl') && JSON.parse(data).pr === 1) throw new Error('unwritable');
+      append(path, data);
+    };
+    const stderr = [];
+    expect(w.tick({ stderr: (line) => stderr.push(line) }).summary.reports).toBe(2);
+    expect(stderr).toEqual(['assistant pr-state.jsonl append failed: unwritable\n']);
+    expect(prStates(w).map((row) => row.pr)).toEqual([2]);
+    expect(w.files.has(join('output', 'digest.md'))).toBe(true);
+  });
+});
+
+describe('sticky-label missing context replay', () => {
+  const setup = () => {
+    const w = fixture();
+    w.required = ['checks', 'merge-gate'];
+    w.prs[0].labels = ['review:pending', 'review-status:needs-human', 'status:ci-red'].map((name) => ({ name }));
+    w.prs[0].statusCheckRollup = [{ name: 'checks', conclusion: 'SUCCESS' }];
+    return w;
+  };
+  it('prior behavior: missing required merge-gate yields no sticky-label despite all present checks green at 120 minutes', () => {
+    const w = setup();
+    const requiredGreen = w.required.every((name) => w.prs[0].statusCheckRollup.some((check) => check.name === name));
+    expect(requiredGreen).toBe(false);
+    expect(classifyPr({ repo: 'org/repo', number: 7037, nowMs, headChangedAtMs: Date.parse(old), isDraft: false,
+      requiredGreen, labels: w.prs[0].labels.map((label) => label.name) }).reports).toEqual([]);
+  });
+  it('replays the #7037 hypothesis: repo-wide absent merge-gate no longer hides sticky-label', () => {
+    // #7037 is modeled as the repo-wide-absent (merge-queue-only) case supplied in the brief.
+    // This fixture reproduces the miss; no historical rollups were supplied to prove its live cause.
+    const w = setup();
+    expect(w.tick().reports.map((r) => r.rule)).toEqual(['sticky-label']);
+    expect(prStates(w)[0]).toMatchObject({ requiredGreen: true, required: { missing: ['merge-gate'] }, minutes: 120, fired: ['sticky-label'] });
+  });
+  it.each(['missing', 'pending'])('a context observed on another open PR still blocks when %s here', (status) => {
+    const w = setup();
+    w.prs.push({ ...w.prs[0], number: 2, labels: [], statusCheckRollup: [{ name: 'merge-gate', conclusion: 'SUCCESS' }] });
+    if (status === 'pending') w.prs[0].statusCheckRollup.push({ name: 'merge-gate', status: 'IN_PROGRESS', conclusion: '' });
+    expect(w.tick().reports).toEqual([]);
+    expect(prStates(w)[0].requiredGreen).toBe(false);
+  });
+  it('recomputes repo context presence every tick rather than caching the absence', () => {
+    const w = setup();
+    expect(w.tick().reports[0].rule).toBe('sticky-label');
+    w.prs.push({ ...w.prs[0], number: 2, labels: [], statusCheckRollup: [{ name: 'merge-gate', conclusion: 'SUCCESS' }] });
+    expect(w.tick().reports).toEqual([]);
+    expect(prStates(w).findLast((row) => row.pr === 1).requiredGreen).toBe(false);
+  });
+  it('does not infer repo-wide absence from a truncated open PR list', () => {
+    const w = setup();
+    w.prs = Array.from({ length: 500 }, (_, i) => ({ ...w.prs[0], number: i + 1 }));
+    expect(w.tick({ maxDetail: 1 }).reports).toEqual([]);
+    expect(prStates(w)[0].requiredGreen).toBe(false);
+  });
+  it('isolates repo-wide context evidence between repositories', () => {
+    const w = setup();
+    const exec = (command, args, options) => {
+      if (args[0] === 'pr' && args[3] === 'org/other') return JSON.stringify([{ ...w.prs[0], statusCheckRollup: [
+        { name: 'merge-gate', conclusion: 'SUCCESS' }, { name: 'checks', status: 'IN_PROGRESS', conclusion: '' },
+      ] }]);
+      return w.exec(command, args, options);
+    };
+    expect(w.tick({ repos: ['org/one', 'org/other'], exec }).reports.map((r) => [r.repo, r.rule])).toEqual([['org/one', 'sticky-label']]);
+  });
+});
+
+
+describe('incomplete ownership and repo context evidence', () => {
+  it('missing PR branch evidence cannot match a live lease', () => {
+    const w = fixture();
+    delete w.prs[0].headRefName;
+    w.leases = { lanes: [{ leased: true, path: 'lanes/active', branch: 'lane/test', lease: { holder: 'worker' } }] };
+    expect(w.tick({ lanePoolCli: 'lane-pool.mjs' }).reports[0].rule).toBe('no-worker');
+    expect(prStates(w)[0].owned).toBeNull();
+  });
+  it.each([null, {}, { name: '', conclusion: 'SUCCESS' }])('fails closed on an unnamed rollup entry before inferring repo-wide absence: %j', (check) => {
+    const w = fixture();
+    w.required = ['checks', 'merge-gate'];
+    w.prs[0].labels = [{ name: 'status:ci-red' }];
+    w.prs[0].statusCheckRollup = [{ name: 'checks', conclusion: 'SUCCESS' }];
+    w.prs.push({ ...w.prs[0], number: 2, statusCheckRollup: [check] });
+    expect(() => w.tick()).toThrow('Incomplete PR rollup evidence');
+    expect(prStates(w)).toEqual([]);
+    expect(w.files.has(join('output', 'digest.md'))).toBe(false);
+  });
+});
+
+
+describe('lease repository and source identity', () => {
+  const leased = () => {
+    const w = fixture();
+    w.leases = { lanes: [{ leased: true, path: 'lanes/active', branch: 'lane/test', lease: { holder: 'worker' } }] };
+    return w;
+  };
+  it('a foreign lease leaves no-worker visible for identical branch names across observed repositories', () => {
+    const w = leased();
+    w.prs[0].headRepository = { nameWithOwner: 'org/one' };
+    w.origin = 'https://github.com/org/one.git';
+    const exec = (command, args, options) => {
+      if (command === 'gh' && args[0] === 'pr' && args[3] === 'org/two') {
+        return JSON.stringify([{ ...w.prs[0], headRepository: { nameWithOwner: 'org/two' } }]);
+      }
+      return w.exec(command, args, options);
+    };
+    const result = w.tick({ repos: ['org/one', 'org/two'], lanePoolCli: 'lane-pool.mjs', exec });
+    expect(result.reports.map((r) => [r.repo, r.rule])).toEqual([['org/two', 'no-worker']]);
+    expect(prStates(w).map((row) => [row.repo, row.owned?.by ?? null])).toEqual([['org/one', 'lease'], ['org/two', null]]);
+    expect(w.calls.filter((c) => c.command === 'git')).toHaveLength(1);
+  });
+  it.each([
+    ['fork source with explicit fork flag', { headRepository: { nameWithOwner: 'contributor/web-everything' }, isCrossRepository: true }],
+    ['fork source despite same-repo flag', { headRepository: { nameWithOwner: 'contributor/web-everything' } }],
+    ['fork flag despite same source identity', { isCrossRepository: true }],
+    ['missing source repository', { headRepository: null }],
+    ['partial source repository', { headRepository: { name: 'web-everything' } }],
+    ['unknown fork status', { isCrossRepository: undefined }],
+  ])('same branch lease leaves no-worker visible for %s', (_, patch) => {
+    const w = leased();
+    Object.assign(w.prs[0], patch);
+    expect(w.tick({ lanePoolCli: 'lane-pool.mjs' }).reports.map((r) => r.rule)).toEqual(['no-worker']);
+    expect(prStates(w)[0].owned).toBeNull();
+  });
+  it.each([
+    ['foreign repository', 'https://github.com/other/web-everything.git'],
+    ['foreign host', 'https://example.com/web-everything/web-everything.git'],
+    ['unreadable origin', new Error('unreadable')],
+    ['oversized origin', Object.assign(new Error('maxBuffer exceeded'), { code: 'ENOBUFS' })],
+  ])('same branch lease fails closed for %s', (_, origin) => {
+    const w = leased();
+    w.origin = origin;
+    expect(w.tick({ lanePoolCli: 'lane-pool.mjs' }).reports[0].rule).toBe('no-worker');
+    expect(prStates(w)[0].owned).toBeNull();
+    if (origin instanceof Error) expect(w.files.get(join('output', 'digest.md'))).toContain('lease feed unavailable');
+  });
+  it.each(['https://github.com/web-everything/web-everything.git', 'git@github.com:web-everything/web-everything.git',
+    'ssh://git@github.com/web-everything/web-everything.git'])('matches full repository identity using %s and bounds the read', (origin) => {
+    const w = leased();
+    w.origin = origin;
+    expect(w.tick({ lanePoolCli: 'lane-pool.mjs' }).reports).toEqual([]);
+    expect(w.calls.find((c) => c.command === 'git')).toMatchObject({ args: ['-C', 'lanes/active', 'config', '--local', '--get', 'remote.origin.url'],
+      options: { timeout: 2000, maxBuffer: 16 * 1024, env: { GIT_OPTIONAL_LOCKS: '0' } } });
+    expect(prStates(w)[0].owned.detail).toMatchObject({ repo: 'web-everything/web-everything', sourceRepo: 'web-everything/web-everything' });
+  });
+  it('unavailable lane path cannot establish repository identity', () => {
+    const w = leased();
+    delete w.leases.lanes[0].path;
+    expect(w.tick({ lanePoolCli: 'lane-pool.mjs' }).reports[0].rule).toBe('no-worker');
+    expect(w.files.get(join('output', 'digest.md'))).toContain('lease feed unavailable');
+  });
+  it('caps lease identity reads at 60 and retains no-worker with an operator fallback', () => {
+    const w = leased();
+    w.origin = 'https://github.com/foreign/repo.git';
+    w.leases.lanes = Array.from({ length: 61 }, (_, i) => ({ ...w.leases.lanes[0], path: `lanes/active-${i}` }));
+    expect(w.tick({ lanePoolCli: 'lane-pool.mjs' }).reports[0].rule).toBe('no-worker');
+    expect(w.calls.filter((c) => c.command === 'git')).toHaveLength(60);
+    expect(w.files.get(join('output', 'digest.md'))).toContain('lease identity reads limited to 60; unmatched PRs need operator inspection');
+  });
+});
+
+
+it('lease identity reads ignore inherited Git repository and config overrides', () => {
+  const w = fixture();
+  w.leases = { lanes: [{ leased: true, path: 'lanes/active', branch: 'lane/test', lease: { holder: 'worker' } }] };
+  w.tick({ lanePoolCli: 'lane-pool.mjs', env: { FIXTURE: 'yes', GIT_DIR: 'foreign', GIT_WORK_TREE: 'foreign',
+    GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'remote.origin.url', GIT_CONFIG_VALUE_0: 'foreign' } });
+  expect(w.calls.find((c) => c.command === 'git').options.env).toEqual({ FIXTURE: 'yes', GIT_OPTIONAL_LOCKS: '0' });
 });

@@ -182,3 +182,30 @@ describe('sticky labels', () => {
     if (present) expect(reports.find((r) => r.rule === 'sticky-label').reason).toBe('stale ci-red/escalation label with green required checks');
   });
 });
+
+
+describe('ownership suppression stays separate from claim evidence', () => {
+  const cases = [
+    ['no-worker', { labels: ['review:changes'] }],
+    ['human-wait', { labels: ['review:human', 'review:changes'] }],
+    ['gate-red-stalled', { ciFailing: true }],
+    ['sticky-label', { labels: ['status:ci-red'], requiredGreen: true }],
+  ];
+  it.each(cases.flatMap(([rule, patch]) => ['claim', 'daemon-note', 'lease'].map((by) => [rule, patch, by])))('%s is suppressed by %s ownership (%s)', (rule, patch, by) => {
+    expect(classify(patch).reports.map((r) => r.rule)).toContain(rule);
+    const result = classify({ ...patch, owned: { by, detail: 'evidence' } });
+    expect(result.reports.map((r) => r.rule)).not.toContain(rule);
+    expect(result.suppressed).toContain(rule);
+  });
+  it.each(cases.flatMap(([rule, patch]) => ['fix', 'fixing', 'ci-heal'].map((kind) => [rule, patch, kind])))('%s is suppressed by live %s claim (%s)', (rule, patch, kind) => {
+    const result = classify({ ...patch, claims: [{ ...claim, kind, claimedAtMs: nowMs - 60000 }] });
+    expect(result.reports).toEqual([]);
+    expect(result.owned).toMatchObject({ by: 'claim', detail: { kind } });
+    expect(result.suppressed).toContain(rule);
+  });
+  it.each(['daemon-note', 'lease'])('%s does not suppress stale-claim, bad-claim or contradiction, or impersonate a claim', (by) => {
+    const result = classify({ owned: { by, detail: 'evidence' }, labels: ['status:fixing', 'review:accepted', 'review:changes'],
+      claims: [{ ...claim, heartbeatAtMs: 0 }], badClaims: [{ problem: 'bad evidence' }] });
+    expect(result.reports.map((r) => r.rule)).toEqual(['bad-claim', 'stale-claim', 'contradiction', 'contradiction']);
+  });
+});

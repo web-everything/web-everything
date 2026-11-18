@@ -5,7 +5,7 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { actionKey, decideActions } from './assistant-babysit-actions.mjs';
-import { classifyPr, nextActor, human } from './assistant-babysit-rules.mjs';
+import { classifyPr, nextActor, human, OWNER_SUPPRESSED_RULES } from './assistant-babysit-rules.mjs';
 
 const DEFAULT_REPOS = ['web-everything/web-everything', 'plateauapp/plateau-app'];
 export const DEFAULT_CLAIM_TTL_MIN = 10; // matches the dispatch claim store default lease
@@ -19,10 +19,10 @@ const readJson = (io, path, fallback) => {
   try { return JSON.parse(io.readFileSync(path, 'utf8')); }
   catch (error) { if (error.code === 'ENOENT') return fallback; throw error; }
 };
-function findWhy(io) {
+function findCli(io, relativePath) {
   let root = dirname(fileURLToPath(import.meta.url));
   while (true) {
-    const path = join(root, 'scripts/operations/run.mjs');
+    const path = join(root, relativePath);
     if (io.existsSync(path)) return path;
     const parent = dirname(root);
     if (parent === root) return null;
@@ -69,6 +69,23 @@ function loadClaims(io, coordDir) {
 const matchesRepo = (claim, repo) => [repo, repo.split('/')[1], ...(repo === 'web-everything/web-everything' ? ['we'] : [])].includes(claim.repo);
 const cell = (value) => String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').replace(/\|/g, '\\|');
 
+function daemonEvidence(verdict, raw, nowMs) {
+  const sections = verdict.sections ?? raw.sections;
+  const daemons = (Array.isArray(sections) ? sections.find((section) => section?.name === 'daemons')?.lines : undefined) ?? raw.daemons;
+  const lines = typeof daemons === 'string' ? daemons.split('\n') : Array.isArray(daemons) ? daemons : [];
+  let noteAgeMin;
+  let noteLine;
+  for (const line of lines) {
+    if (typeof line !== 'string') continue;
+    const timestamp = /^[\w-]+:\s+(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))(?:\s|$)/.exec(line)?.[1];
+    const age = (nowMs - Date.parse(timestamp)) / 60000;
+    if (Number.isFinite(age) && age >= 0 && (noteAgeMin === undefined || age < noteAgeMin)) { noteAgeMin = age; noteLine = line; }
+  }
+  return { ...verdict, sections: verdict.sections ?? raw.sections, daemons,
+    fixLogLine: lines.find((line) => typeof line === 'string' && /^fix:/.test(line)) ?? verdict.fixLogLine,
+    noteAgeMin, noteLine };
+}
+
 class GithubUnavailable extends Error {}
 const githubUnavailable = (error) => /HTTP 5\d\d|Gateway Timeout|Bad Gateway|Service Unavailable|ETIMEDOUT|ECONNRESET/i
   .test([error.message, error.stderr, error.stdout, error.code].join(' '));
@@ -101,7 +118,7 @@ export function createTickRunner({ interval = 300000, ...options } = {}) {
 function observeTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plateau/assistant'), nowMs = Date.now(),
   exec = execFileSync, io = fs, env = process.env,
   coordDir = env.WE_COORDINATION_ROOT || join(homedir(), 'workspace/.operations/coordination'),
-  validTicks = 1, whyCli, maxDetail = 25, maxWhy = 6, stderr = (line) => process.stderr.write(line) } = {}) {
+  validTicks = 1, whyCli, maxDetail = 25, maxWhy = 10, lanePoolCli, stderr = (line) => process.stderr.write(line) } = {}) {
   if (!Number.isInteger(maxDetail) || maxDetail < 0) throw new Error('max-detail must be a nonnegative integer');
   if (!Number.isInteger(maxWhy) || maxWhy < 0) throw new Error('max-why must be a nonnegative integer');
   io.mkdirSync(outDir, { recursive: true });
@@ -132,7 +149,55 @@ function observeTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plateau
     catch (error) { stderr(`assistant ${file} append failed: ${cell(error.message)}\n`); return false; }
   };
   const { claims, badClaims } = loadClaims(io, coordDir);
-  const whyPath = whyCli === undefined ? findWhy(io) : whyCli;
+  const whyPath = whyCli === undefined ? findCli(io, 'scripts/operations/run.mjs') : whyCli;
+  // Read lazily once per tick; never persist live lease evidence between ticks.
+  let leases;
+  const leaseOrigins = new Map();
+  let originReads = 0;
+  const unavailableLease = () => { if (!warnings.includes('lease feed unavailable')) warnings.push('lease feed unavailable'); };
+  const repoIdentity = (value) => typeof value === 'string' && /^[\w.-]+\/[\w.-]+$/.test(value) ? value.toLowerCase() : null;
+  const leaseOrigin = (path) => {
+    if (typeof path !== 'string' || !path) { unavailableLease(); return null; }
+    if (!leaseOrigins.has(path)) {
+      let identity = null;
+      if (originReads >= 60) {
+        const warning = 'lease identity reads limited to 60; unmatched PRs need operator inspection';
+        if (!warnings.includes(warning)) warnings.push(warning);
+      } else {
+        originReads++;
+        try {
+          const origin = String(exec('git', ['-C', path, 'config', '--local', '--get', 'remote.origin.url'],
+            { encoding: 'utf8', timeout: 2000, maxBuffer: 16 * 1024, env: { ...Object.fromEntries(Object.entries(env).filter(([key]) => !/^GIT_/i.test(key))), GIT_OPTIONAL_LOCKS: '0' } })).trim();
+          const slug = /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([\w.-]+\/[\w.-]+)\/?$/i.exec(origin)?.[1];
+          identity = repoIdentity(slug?.replace(/\.git$/i, ''));
+        } catch { /* Unknown local origin cannot establish ownership. */ }
+        if (!identity) unavailableLease();
+      }
+      leaseOrigins.set(path, identity);
+    }
+    return leaseOrigins.get(path);
+  };
+  const leaseOwner = (snapshot) => {
+    if (leases === undefined) {
+      try {
+        const path = lanePoolCli ?? findCli(io, 'scripts/lane-pool.mjs');
+        if (!path) throw new Error('missing lease CLI');
+        const feed = JSON.parse(exec('node', [path, 'status', '--json', '--leased-only'],
+          { encoding: 'utf8', timeout: 20000, maxBuffer: 4 * 1024 * 1024, env }));
+        if (!Array.isArray(feed?.lanes) || feed.lanes.some((row) => !row || typeof row.leased !== 'boolean'
+          || (row.leased && (typeof row.branch !== 'string' || !row.branch || typeof row.lease?.holder !== 'string' || !row.lease.holder)))) {
+          throw new Error('incomplete lease feed');
+        }
+        leases = feed.lanes.filter((row) => row.leased);
+      } catch { leases = []; unavailableLease(); }
+    }
+    const repo = repoIdentity(snapshot.repo);
+    const sourceRepo = repoIdentity(snapshot.headRepository?.nameWithOwner);
+    // A pool name / branch alone cannot identify a repo or prove a fork's source.
+    if (!repo || sourceRepo !== repo || snapshot.isCrossRepository !== false || !snapshot.headRefName) return null;
+    const lease = leases.find((row) => row.branch === snapshot.headRefName && leaseOrigin(row.path) === repo);
+    return lease ? { by: 'lease', detail: { repo, sourceRepo, branch: lease.branch, holder: lease.lease.holder } } : null;
+  };
   const gh = (args) => {
     try { return exec('gh', args, { encoding: 'utf8', timeout: 60000, maxBuffer: 32 * 1024 * 1024, env: { ...env, GH_CALLER: 'wev-assistant' } }); }
     catch (error) {
@@ -155,7 +220,7 @@ function observeTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plateau
   const candidates = [];
   let detailed = 0;
   for (const repo of repos) {
-    const listArgs = ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', String(PR_LIST_LIMIT), '--json', 'number,labels,isDraft,mergeable,mergeStateStatus,headRefOid,updatedAt,statusCheckRollup,isInMergeQueue'];
+    const listArgs = ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', String(PR_LIST_LIMIT), '--json', 'number,labels,isDraft,mergeable,mergeStateStatus,headRefOid,headRefName,headRepository,isCrossRepository,updatedAt,statusCheckRollup,isInMergeQueue'];
     let prs;
     let queueFallback = false;
     try { prs = JSON.parse(gh(listArgs)); }
@@ -207,6 +272,13 @@ function observeTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plateau
     summary.repoSummaries.push({ repo, open: prs.length, truncated });
     summary.truncated ||= truncated;
     summary.open += prs.length;
+    // Repo-wide absence is meaningful only with a complete list of open rollups.
+    if (prs.some((pr) => !Array.isArray(pr?.statusCheckRollup) || pr.statusCheckRollup.some((check) =>
+      !check || typeof (check.name ?? check.context) !== 'string' || !(check.name ?? check.context).trim()))) {
+      throw new Error('Incomplete PR rollup evidence');
+    }
+    const repoContexts = new Set(prs.flatMap((pr) => pr.statusCheckRollup.map((check) => check.name ?? check.context)));
+    const blockingNames = requiredNames === null ? null : [...requiredNames].filter((name) => truncated || repoContexts.has(name));
     for (const pr of prs) {
       if (!Number.isInteger(pr.number) || !Array.isArray(pr.labels) || !Array.isArray(pr.statusCheckRollup)
         || (queueFallback ? !Object.hasOwn(pr, 'autoMergeRequest') : typeof pr.isInMergeQueue !== 'boolean') || typeof pr.isDraft !== 'boolean' || !['MERGEABLE', 'CONFLICTING', 'UNKNOWN'].includes(pr.mergeable)
@@ -215,7 +287,7 @@ function observeTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plateau
       if (labels.some((label) => typeof label !== 'string')) throw new Error('Incomplete label evidence');
       const requiredRollup = pr.statusCheckRollup.filter((check) => requiredNames === null || requiredNames.has(check.name ?? check.context));
       const requiredGreen = requiredNames !== null && requiredRollup.length > 0
-        && [...requiredNames].every((name) => requiredRollup.some((check) => (check.name ?? check.context) === name))
+        && blockingNames.every((name) => requiredRollup.some((check) => (check.name ?? check.context) === name))
         && requiredRollup.every((check) => (!check.status || check.status === 'COMPLETED')
           && ['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(String(check.conclusion || check.state).toUpperCase()));
       const failedChecks = requiredRollup.filter((check) => ['FAILURE', 'TIMED_OUT', 'CANCELLED', 'ERROR', 'STARTUP_FAILURE'].includes(String(check.conclusion || check.state).toUpperCase()))
@@ -224,11 +296,19 @@ function observeTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plateau
       const snapshot = { repo, number: pr.number, inMergeQueue: queueFallback ? pr.mergeStateStatus === 'QUEUED' && (pr.autoMergeRequest != null || labels.includes('status:ready-to-merge')) : pr.isInMergeQueue, labels, isDraft: pr.isDraft, mergeable: pr.mergeable, mergeStateStatus: pr.mergeStateStatus,
         // Without a trustworthy required-check list no run id is offered, so no rerun would-act can be decided.
         failedChecks: required.names === null ? failedChecks.map((check) => ({ ...check, runId: null })) : failedChecks,
-        headSha: pr.headRefOid, nowMs, requiredGreen, ciFailing: failedChecks.length > 0,
+        headSha: pr.headRefOid, headRefName: pr.headRefName, headRepository: pr.headRepository, isCrossRepository: pr.isCrossRepository, nowMs, requiredGreen, ciFailing: failedChecks.length > 0,
         claims: claims.filter((claim) => claim.pr === pr.number && matchesRepo(claim, repo)) };
-      const { owed } = classifyPr(snapshot);
+      const present = [...new Set(requiredRollup.map((check) => check.name ?? check.context))];
+      snapshot.required = { names: required.names ?? [], present,
+        missing: required.names?.filter((name) => !present.includes(name)) ?? [],
+        failing: [...new Set(failedChecks.map((check) => check.name))],
+        pending: [...new Set(requiredRollup.filter((check) => !failedChecks.some((failed) => failed.name === (check.name ?? check.context))
+          && !((!check.status || check.status === 'COMPLETED') && ['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(String(check.conclusion || check.state).toUpperCase())))
+          .map((check) => check.name ?? check.context))] };
+      const { owed, owned } = classifyPr(snapshot);
+      snapshot.owned = owned;
       if (owed.length) summary.owing++;
-      const needsDetail = owed.length || snapshot.ciFailing || labels.some((l) => ['status:stood-down', 'review-status:stood-down'].includes(l)) || snapshot.mergeStateStatus === 'BEHIND' || labels.includes('ready-to-merge') || snapshot.claims.length
+      const needsDetail = owed.length || snapshot.ciFailing || human(labels) || snapshot.mergeStateStatus === 'BEHIND' || labels.includes('ready-to-merge') || snapshot.claims.length
         || labels.some((label) => ['status:fixing', 'review-status:fixing', 'status:ci-red', 'review-status:ci-heal-stalled', 'review-status:needs-human'].includes(label));
       if (needsDetail) {
         const detailKey = JSON.stringify([repo, pr.number]);
@@ -293,33 +373,45 @@ function observeTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plateau
   const cacheAt = (snapshot) => Number.isFinite(state.whyCache[whyKey(snapshot)]?.at) ? state.whyCache[whyKey(snapshot)].at : -Infinity;
   observed.sort((a, b) => cacheAt(a.snapshot) - cacheAt(b.snapshot));
   let whyCalls = 0;
-  for (const { snapshot, current } of observed) {
+  for (const observation of observed) {
+    const { snapshot } = observation;
+    let { current } = observation;
     const { repo } = snapshot;
     let explanation = {};
-    if ((current.length || snapshot.ciFailing || (human(snapshot.labels) && classifyPr(snapshot).owed.length)) && whyPath && io.existsSync(whyPath)) {
+    const needsOwner = current.some((report) => OWNER_SUPPRESSED_RULES.includes(report.rule));
+    let ownerUnknown = false;
+    if (needsOwner && whyPath && io.existsSync(whyPath)) {
       const key = whyKey(snapshot);
       const cached = state.whyCache[key];
       if (cached && Number.isFinite(cached.at) && nowMs >= cached.at && nowMs - cached.at < 30 * 60000
         && cached.verdict && typeof cached.verdict === 'object') explanation = cached.verdict;
-      else if (whyCalls >= maxWhy) summary.whySkipped++;
+      else if (whyCalls >= maxWhy) { summary.whySkipped++; ownerUnknown = true; }
       else {
         whyCalls++;
         try {
-          // Six default calls at 20s leave time for the other tick reads within the three-minute target.
           const why = JSON.parse(exec('node', [whyPath, 'why', `--pr=${snapshot.number}`, `--repo=${repo}`, '--json'], { encoding: 'utf8', timeout: 20000, maxBuffer: 32 * 1024 * 1024, env }));
           const verdict = why.verdict ?? why;
-          const daemons = (verdict.sections ?? why.sections)?.find((section) => section.name === 'daemons')?.lines ?? why.daemons;
-          const lines = typeof daemons === 'string' ? daemons.split('\n') : Array.isArray(daemons) ? daemons : [];
-          const fixLogLine = lines.find((line) => typeof line === 'string' && /^fix:/.test(line));
-          explanation = { ...verdict, fixLogLine };
+          explanation = daemonEvidence(verdict, why, nowMs);
           state.whyCache[key] = { at: nowMs, verdict: explanation };
         } catch { /* Optional local explanation cannot invalidate observed reports. */ }
       }
-      for (const report of current) {
-        if (explanation.owner) report.owner = nextActor(snapshot, explanation);
-        if (explanation.waitingFor !== undefined) report.waitingFor = explanation.waitingFor;
-        if (explanation.fixLogLine !== undefined) report.fixLogLine = explanation.fixLogLine;
-      }
+    }
+    // Recompute ages from cached source lines: cache freshness is not note freshness.
+    explanation = daemonEvidence(explanation, explanation, nowMs);
+    const leased = needsOwner ? leaseOwner(snapshot) : null;
+    if (needsOwner && !ownerUnknown) {
+      snapshot.owned = explanation.noteAgeMin !== undefined && explanation.noteAgeMin <= 30
+        ? { by: 'daemon-note', detail: { noteAgeMin: explanation.noteAgeMin, noteLine: explanation.noteLine } }
+        : leased;
+    }
+    const classification = classifyPr(snapshot);
+    current = classification.reports;
+    observation.classification = classification;
+    for (const report of current) {
+      if (ownerUnknown && OWNER_SUPPRESSED_RULES.includes(report.rule)) report.detail = { ...report.detail, ownerUnknown: true };
+      if (explanation.owner) report.owner = nextActor(snapshot, explanation);
+      if (explanation.waitingFor !== undefined) report.waitingFor = explanation.waitingFor;
+      if (explanation.fixLogLine !== undefined) report.fixLogLine = explanation.fixLogLine;
     }
     if (mode === 'shadow') {
       const minutes = (nowMs - Math.max(snapshot.headChangedAtMs, snapshot.labelChangedAtMs ?? -Infinity)) / 60000;
@@ -348,6 +440,16 @@ function observeTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plateau
     }
     reports.push(...current);
   }
+  const classifications = new Map(observed.map(({ snapshot, classification }) => [snapshot, classification]));
+  if (candidates.length > 60) warnings.push(`pr-state limited to 60 of ${candidates.length} candidates; operator inspection required`);
+  for (const { snapshot } of candidates.slice(0, 60)) {
+    const result = classifications.get(snapshot) ?? classifyPr(snapshot);
+    append('pr-state.jsonl', { type: 'pr-state', at, repo: snapshot.repo, pr: snapshot.number, head: snapshot.headSha,
+      draft: snapshot.isDraft, inMergeQueue: snapshot.inMergeQueue,
+      labels: snapshot.labels.filter((label) => /^(status:|review|red-team|ready|merge-status|needs-)/.test(label)),
+      required: snapshot.required, requiredGreen: snapshot.requiredGreen, ciFailing: snapshot.ciFailing,
+      minutes: result.minutes, owned: result.owned, fired: classifications.has(snapshot) ? result.reports.map((report) => report.rule) : [], suppressed: result.suppressed });
+  }
   summary.reports = reports.length;
   for (const report of reports) {
     const key = JSON.stringify([report.repo, report.pr, report.rule, report.reason]);
@@ -375,6 +477,7 @@ export async function main(argv, { runner = createTickRunner, stderr = (line) =>
     else if (arg.startsWith('--out-dir=')) options.outDir = arg.slice(10);
     else if (arg.startsWith('--repos=')) options.repos = arg.slice(8).split(',');
     else if (arg.startsWith('--why-cli=')) options.whyCli = arg.slice(10);
+    else if (arg.startsWith('--lane-pool-cli=')) options.lanePoolCli = arg.slice(16);
     else if (arg.startsWith('--max-why=')) options.maxWhy = Number(arg.slice(10));
     else if (arg.startsWith('--max-detail=')) options.maxDetail = Number(arg.slice(13));
     else throw new Error(`Unknown argument: ${arg}`);
