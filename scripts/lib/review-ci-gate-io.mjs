@@ -80,6 +80,7 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
     headSha = head({ repo, pr });
     if (typeof headSha !== 'string' || !headSha.trim()) return { ...reviewCiGate({ headSha }), startAfter: policy.startAfter };
     let checks;
+    let rowsComplete = false;
     const fast = ['fast-checks', 'push'].includes(policy.startAfter) ? fastChecksFor(policy.fastChecks, repo) : null;
     // A repo whose CI does not publish fast checks waits on its own required set, exactly as ci-green does.
     const needsRequired = reviewUsesRequiredChecks(policy, repo);
@@ -96,14 +97,19 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
       checks = readChecks({ repo, headSha });
       // Early review needs branch-protection discovery only to identify an owner for red CI.
       // Discovery faults retain the fast-check prerequisite, rather than stranding review.
-      if (reviewAdmissionCiRed({ headSha, checks })) {
+      if (reviewAdmissionCiRed({ headSha, rowsHead: headSha, checks, rowsComplete: checks?.rowsComplete === true,
+        rosterSource: undefined })) {
         try { required = readRequired({ repo, ttlMs: 0 }); } catch { /* Keep timing policy. */ }
       }
     }
     const stale = required?.source === 'stale-cache';
     const cacheAgeMs = required?.cacheAgeMs;
     const trustedStale = stale && Number.isFinite(cacheAgeMs) && cacheAgeMs >= 0 && cacheAgeMs <= MAX_STALE_CACHE_AGE_MS;
+    const rosterSource = ['live', 'cache'].includes(required?.source) ? required.source : undefined;
     const withSource = result => ({ ...result, startAfter: policy.startAfter, source: required?.source,
+      rowsHead: headSha, rowsComplete, rosterSource,
+      ...(!rosterSource ? { evidenceReason: 'roster-unavailable' }
+        : !rowsComplete ? { evidenceReason: 'rows-incomplete' } : {}),
       ...(stale ? { cacheAgeMs, reason: `${result.reason} (stale-cache cache-age-ms=${cacheAgeMs ?? 'unknown'})` } : {}),
     });
     // Repo-declared requirements are code-reviewed policy, not the last-resort fallback.
@@ -113,7 +119,7 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
     }
     checks ??= readChecks({ repo, headSha });
     // Capture proof before hold excusal replaces the array; bare/cached rollups lack it.
-    const rowsComplete = checks?.rowsComplete === true;
+    rowsComplete = checks?.rowsComplete === true;
     const currentHead = head({ repo, pr });
     if (currentHead !== headSha) return withSource({ allowed: false, headSha, currentHead, reason: 'head-changed' });
     try {
@@ -127,9 +133,9 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
     } catch { /* Unreadable excusal evidence preserves the original failed checks. */ }
     const requiredChecks = trustedRequired && required.source !== 'timing-policy' ? required.checks : [];
     // A discovery fault or untrusted/empty set cannot excuse healable red in push mode.
-    if (policy.startAfter === 'push' && reviewAdmissionCiRed({ headSha, checks,
+    if (policy.startAfter === 'push' && reviewAdmissionCiRed({ headSha, rowsHead: headSha, rowsComplete, rosterSource, checks,
       requiredChecks: Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks : null }))
-      return withSource({ allowed: false, headSha, reason: 'ci-red', affected: [], checks, requiredChecks });
+      return withSource({ allowed: false, headSha, reason: 'ci-red', affected: [], checks, rowsComplete, requiredChecks });
     // `requiredChecks` rides along so a publish-time void judges only healable reds, as review start does.
     let verifyGreen = false;
     if (policy.startBeforeCi) {

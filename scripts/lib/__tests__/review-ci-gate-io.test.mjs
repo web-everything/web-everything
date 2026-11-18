@@ -319,3 +319,18 @@ it('review reader ignores duplicate review-owned lineage while retaining complet
     readChecks: () => checks }))).toMatchObject({ allowed: true, rowsComplete: true });
   expect(run).toHaveBeenCalledTimes(2);
 });
+
+
+it.each(['live', 'cache'])('returns fetched rows provenance and retains required failure context (%s)', source => {
+  const checks = complete([{ context: 'test', state: 'failure', targetUrl: 'https://example.test/failure' }]);
+  const result = readGate({ repo: 'other/product', pr: 7, readHead: () => headSha,
+    policy: { startAfter: 'push' }, readChecks: () => checks, readRequired: () => ({ source, checks: ['test'] }) });
+  expect(result).toMatchObject({ allowed: false, reason: 'ci-red', headSha, rowsHead: headSha,
+    rowsComplete: true, rosterSource: source, checks, requiredChecks: ['test'] });
+});
+it('marks incomplete fetched evidence visibly and refuses review admission', () => {
+  const result = readGate({ repo: 'other/product', pr: 7, readHead: () => headSha,
+    policy: { startAfter: 'ci-green', startEarly: 'off' },
+    readChecks: () => [{ context: 'test', state: 'success' }], readRequired: () => ({ source: 'live', checks: ['test'] }) });
+  expect(result).toMatchObject({ allowed: false, rowsComplete: false, evidenceReason: 'rows-incomplete' });
+});

@@ -148,3 +148,17 @@ describe('early accepted verdict publication requires strict head CI', () => {
     expect(f.runNode).not.toHaveBeenCalled();
   });
 });
+
+
+it.each(['success', 'failure', 'incomplete'])('publication consumes the fetched CI provenance (%s)', async state => {
+  const f = fixture({ env: { WE_REVIEW_START_EARLY: 'off', WE_REVIEW_START_AFTER: 'ci-green', WE_REVIEW_CANCEL_ON_CI_RED: 'true' } });
+  f.publishGate.mockReturnValue({ headSha: head, rowsHead: head, rowsComplete: state !== 'incomplete',
+    rosterSource: 'live', requiredChecks: ['test'], checks: [{ context: 'test', state: state === 'failure' ? 'failure' : 'success' }] });
+  if (state === 'success') {
+    await expect(f.publish({ to: 'changes' })).resolves.toEqual({ ok: true });
+    expect(f.runNode).toHaveBeenCalledOnce();
+  } else {
+    await expect(f.publish({ to: 'changes' })).rejects.toMatchObject({ notApplied: true });
+    expect(f.runNode).not.toHaveBeenCalled();
+  }
+});

@@ -752,6 +752,7 @@ export async function runFixCli(argv = [], {
     let firstHeldAt;
     let previousChecks;
     let previousRequired;
+    let previousRosterSource;
     let lastChecksAt;
     let completedPushReadiness;
     const awaitPreviousCi = async () => {
@@ -759,13 +760,18 @@ export async function runFixCli(argv = [], {
       if (completedPushReadiness) return completedPushReadiness;
       firstHeldAt ??= clock();
       if (previousRequired === undefined) {
-        try { previousRequired = readRequired({ repo: launch.repo })?.checks ?? null; }
+        try {
+          const roster = readRequired({ repo: launch.repo });
+          previousRequired = roster?.checks ?? null;
+          previousRosterSource = ['live', 'cache'].includes(roster?.source) ? roster.source : undefined;
+        }
         catch { previousRequired = null; }
       }
       for (;;) {
         const now = clock();
         // The bound releases even when evidence is unreadable; never reset it after a poll or agent run.
-        const bound = fixPushGate({ previousHeadChecks: null, requiredChecks: previousRequired, firstHeldAt, now, policy: timingPolicy });
+        const bound = fixPushGate({ headSha: prHeadSha, rowsHead: prHeadSha, rowsComplete: false,
+          rosterSource: previousRosterSource, previousHeadChecks: null, requiredChecks: previousRequired, firstHeldAt, now, policy: timingPolicy });
         if (bound.action === 'push') {
           write('fix-run: previous-head CI wait bound elapsed; pushing available repair after safety checks\n');
           return bound;
@@ -775,13 +781,14 @@ export async function runFixCli(argv = [], {
         lastChecksAt = clock();
         try { previousChecks = await readChecks({ repo: launch.repo, headSha: prHeadSha }); }
         catch { previousChecks = null; }
-        const decision = fixPushGate({ previousHeadChecks: previousChecks, requiredChecks: previousRequired,
+        const decision = fixPushGate({ headSha: prHeadSha, rowsHead: prHeadSha, rowsComplete: previousChecks?.rowsComplete === true,
+          rosterSource: previousRosterSource, previousHeadChecks: previousChecks, requiredChecks: previousRequired,
           firstHeldAt, now: clock(), policy: timingPolicy });
         if (decision.action === 'push') {
           if (decision.reason === 'ci-complete') completedPushReadiness = decision;
           return decision;
         }
-        write(`fix-run: waiting for previous-head CI until ${decision.deadline}ms epoch; bound fallback is push\n`);
+        write(`fix-run: waiting for previous-head CI (rowsComplete=${previousChecks?.rowsComplete === true}, rosterSource=${previousRosterSource ?? 'unknown'}) until ${decision.deadline}ms epoch; bound fallback is push\n`);
       }
     };
     const pushReadiness = timingPolicy.pushAfterCi ? await awaitPreviousCi() : null;

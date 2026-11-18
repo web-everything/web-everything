@@ -1555,8 +1555,13 @@ function timingFacts(pr, { agents = [], repo, requiredChecks = null, reviewDispa
     ? [latest] : [];
   const reviewers = bindAgents(pr, agents, repo).filter(isReviewerBinding);
   const reviewCanFinish = reviewDispatched || Boolean(assessLiveness(reviewers));
-  return fixReadiness({ headSha: pr.headRefOid, checks: pr.statusCheckRollup, findings,
-    reviewPending: reviewCanFinish, requiredChecks });
+  const evidenceReason = !pr.rowsHead ? 'rows-head-unavailable'
+    : pr.rowsHead !== pr.headRefOid ? 'foreign-head'
+    : !['live', 'cache'].includes(pr.rosterSource) ? 'roster-unavailable'
+      : pr.rowsComplete !== true || pr.requiredCheckReadError ? 'rows-incomplete' : undefined;
+  return { ...fixReadiness({ headSha: pr.headRefOid, checks: pr.statusCheckRollup, findings,
+    rowsHead: pr.rowsHead, rowsComplete: pr.rowsComplete === true && pr.rowsHead === pr.headRefOid && !pr.requiredCheckReadError,
+    rosterSource: pr.rosterSource, reviewPending: reviewCanFinish, requiredChecks }), evidenceReason };
 }
 
 /** A shared prerequisite for every review emission, including advisory review branches. */
@@ -4091,7 +4096,7 @@ export function planReconcile({
       reviewDispatched: dispatch.some(d => d.prNumber === entry.prNumber && d.kind === 'review') });
     const decision = joinedFixDecision({ ...facts, now, policy: fixTiming });
     if (decision.action === 'wait') {
-      refusals.push({ ...entry, kind: 'fix-join-wait', deadline: decision.deadline,
+      refusals.push({ ...entry, kind: 'fix-join-wait', deadline: decision.deadline, evidenceReason: facts.evidenceReason,
         why: 'waiting for the other CI/review input within fix.joinWaitMaxMin' });
       continue;
     }

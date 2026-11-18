@@ -17,8 +17,8 @@ function harness({ early = true, enabled = true } = {}) {
     pushPolicy: () => ({ pushBeforeGate: early }),
     fixTimingPolicy: () => ({ pushAfterCi: enabled, pushAfterCiMaxMin: 2 }),
     readPreviousHead: args => { state.reads.push(args); return state.head; },
-    readPreviousChecks: args => { state.reads.push(args); return state.checks; },
-    readPreviousRequired: () => ({ checks: state.required }),
+    readPreviousChecks: args => { state.reads.push(args); return Object.assign(state.checks, { rowsComplete: state.rowsComplete !== false }); },
+    readPreviousRequired: () => ({ source: state.rosterSource ?? 'live', checks: state.required }),
     listRecords: () => record ? [{ key: 'claude-fix', record }] : [],
     writeRecord: next => { if (!state.writes) return { ok: false }; record = next; return { ok: true }; },
     clearRecord: () => { state.cleared.push(record); record = null; },
@@ -322,7 +322,7 @@ describe('Claude verify harness honors fix.pushAfterCi', () => {
     if (!early) h.state.status = 'green';
     h.io.readPreviousChecks = () => {
       h.state.status = 'red';
-      return [{ name: 'test', status: 'completed', conclusion: 'success' }];
+      return Object.assign([{ name: 'test', status: 'completed', conclusion: 'success' }], { rowsComplete: true });
     };
     await h.tick();
     expect(h.state.pushes).toHaveLength(0);
@@ -367,4 +367,28 @@ describe('Claude verify harness honors fix.pushAfterCi', () => {
   it('replays the supported Claude path as a daemon soak break', async () => {
     expect(ciBreak.judge(await ciBreak.run())).toEqual([]);
   });
+});
+
+
+it('completed failed required CI releases the caller gate promptly with failure context', async () => {
+  const h = harness();
+  h.state.checks = [{ name: 'test', status: 'completed', conclusion: 'failure', details_url: 'https://example.test/failure' }];
+  await h.tick();
+  expect(h.record().previousCi.ready).toMatchObject({ action: 'push', reason: 'ci-complete',
+    ciFailures: [{ name: 'test', conclusion: 'failure', detailsUrl: 'https://example.test/failure' }] });
+  expect(h.state.resumes[0].prompt).toContain('https://example.test/failure');
+});
+it.each(['incomplete', 'unknown-roster'])('caller holds %s evidence with a visible reason and bounded fallback', async mode => {
+  const h = harness();
+  h.state.checks = [{ name: 'test', status: 'completed', conclusion: 'failure' }];
+  if (mode === 'incomplete') h.state.rowsComplete = false;
+  else h.state.rosterSource = 'fallback';
+  const result = await h.tick();
+  expect(h.record().previousCi.ready).toBeUndefined();
+  expect(h.state.resumes).toEqual([]);
+  expect(h.state.pushes).toEqual([]);
+  expect(result.rows).toContainEqual(expect.objectContaining({ action: 'push-ci-gate',
+    evidenceReason: mode === 'incomplete' ? 'rows-incomplete' : 'roster-unavailable' }));
+  await h.tick(120000);
+  expect(h.state.pushes).toHaveLength(1);
 });

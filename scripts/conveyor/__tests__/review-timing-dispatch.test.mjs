@@ -1,4 +1,5 @@
-import { it, expect } from 'vitest';
+import { it, expect, vi } from 'vitest';
+import * as timing from '../../lib/review-timing.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
 import { planFixesFromReconcile, withPlannedContext } from '../reconcile-fix-dispatch.mjs';
 import { REVIEW_PR_CHANNEL } from '../../lib/review-escalation.mjs';
@@ -11,9 +12,9 @@ const check = (name, conclusion = 'SUCCESS') => ({ name, status: conclusion ? 'C
   head_sha: head, completedAt: new Date(now - 60_000).toISOString() });
 const finding = { author: { login: 'web-everything' }, createdAt: new Date(now - 60_000).toISOString(), body:
   `🔁 review — changes requested\n\nRecorded by juror via ${REVIEW_PR_CHANNEL}.\n\nRepair the unit failure.\n\n---\n\nNet basis: \`0000..${head}\` — 1 net changed file(s) vs current main\n\n_Recorded through ${REVIEW_PR_CHANNEL}._` };
-const pr = (over = {}) => ({ number: 7, state: 'OPEN', headRefOid: head, headRefName: 'lane/xabc-test',
+const pr = (over = {}) => ({ number: 7, state: 'OPEN', headRefOid: head, rowsHead: head, rowsComplete: true, rosterSource: 'live', headRefName: 'lane/xabc-test',
   labels: labels('review:pending'), comments: [], files: [{ path: 'scripts/example.mjs' }], statusCheckRollup: [check('standards'), check('test-shard (1)'), check('test', null)], ...over });
-const plan = (row, extra = {}) => planReconcile({ prs: [row], requiredChecks: ['test'], now, ...extra });
+const plan = (row, extra = {}) => planReconcile({ prs: [row], requiredChecks: ['test'], rosterSource: 'live', now, ...extra });
 it('the production planner releases fast-check review while aggregate CI is pending', () => {
   const row = pr();
   expect(plan(row).dispatch.map(d => d.kind)).toContain('review');
@@ -116,8 +117,9 @@ it('a reviewer set aside for a CI heal past the join cap releases only the heal,
   const reviewer = { name: 'review-7', pid: 123, pidAlive: true, state: 'working' };
   for (const [requiredChecks, rollup] of [[['test'], [check('standards'), check('test-shard (1)'), check('test', 'FAILURE')]],
     [null, [check('standards'), check('test-shard (1)'), check('CodeQL', 'FAILURE')]]]) {
-    const result = planReconcile({ prs: [pr({ statusCheckRollup: rollup })], requiredChecks, now: now + 15 * 60_000, agents: [reviewer] });
-    expect(result.dispatch.map(d => d.kind)).toEqual(['ci-heal']);
+    const result = planReconcile({ prs: [pr({ statusCheckRollup: rollup })], requiredChecks, rosterSource: requiredChecks ? 'live' : undefined, now: now + 15 * 60_000, agents: [reviewer] });
+    // An unknown roster cannot prove a healable failure: that reader fails closed (the contract never guesses a roster).
+    expect(result.dispatch.map(d => d.kind)).toEqual(requiredChecks ? ['ci-heal'] : []);
   }
 });
 
@@ -141,4 +143,23 @@ it('still charges and caps own-code CI failures when early review is enabled', (
   const row = pr({ labels: labels('review:changes', 'ci:failed'), comments: [finding], statusCheckRollup: [check('test', 'FAILURE')] });
   const result = plan(row, { reviewTiming: { startBeforeCi: true }, durableCounts: { 7: 100 } });
   expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted' }));
+});
+
+
+it('passes fetched provenance to readiness: finished required failure is promptly healable with context', () => {
+  const read = vi.spyOn(timing, 'fixReadiness');
+  try {
+    const result = plan(pr({ labels: labels('review:changes'), comments: [finding],
+      statusCheckRollup: [{ ...check('test', 'FAILURE'), detailsUrl: 'https://example.test/failure' }] }));
+    expect(result.dispatch[0]).toMatchObject({ kind: 'fix', joinedInputs: {
+      ciFailures: [{ name: 'test', detailsUrl: 'https://example.test/failure' }] } });
+    expect(read.mock.results[0].value).toMatchObject({ ciFailed: true,
+      ciFailures: [{ name: 'test', conclusion: 'FAILURE', detailsUrl: 'https://example.test/failure' }] });
+  } finally { read.mockRestore(); }
+});
+it.each([false, undefined])('incomplete fetched rows keep the joined fix closed (%s)', rowsComplete => {
+  const result = plan(pr({ labels: labels('review:changes'), comments: [finding], rowsComplete,
+    statusCheckRollup: [check('test')] }));
+  expect(result.dispatch).toEqual([]);
+  expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'fix-join-wait', evidenceReason: 'rows-incomplete' }));
 });

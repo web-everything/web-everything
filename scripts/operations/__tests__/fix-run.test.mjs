@@ -1,3 +1,4 @@
+import * as timingReaders from '../../lib/review-timing.mjs';
 import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { existsSync, readFileSync, statSync, mkdtempSync, rmSync, writeFileSync, symlinkSync, mkdirSync, linkSync, truncateSync } from 'node:fs';
@@ -119,9 +120,10 @@ describe('runFixCli', () => {
     const m = mk(['a'.repeat(40), 'b'.repeat(40)]);
     let now = 1000;
     const sleeps = [];
-    const readChecks = vi.fn(() => now < 31000 ? [{ name: 'test', status: 'in_progress' }] : [{ name: 'test', status: 'completed', conclusion: 'failure' }]);
+    const readChecks = vi.fn(() => Object.assign(now < 31000 ? [{ name: 'test', status: 'in_progress' }]
+      : [{ name: 'test', status: 'completed', conclusion: 'failure', details_url: 'https://example.test/failure' }], { rowsComplete: true }));
     const result = await runFixCli(argv, { ...m.io, timingPolicy: { pushAfterCi: enabled, pushAfterCiMaxMin: 1 },
-      readRequired: () => ({ checks: ['test'] }), readChecks, clock: () => now,
+      readRequired: () => ({ source: 'live', checks: ['test'] }), readChecks, clock: () => now,
       sleep: async ms => { sleeps.push(ms); now += ms; } });
     expect(result.code).toBe(0);
     expect(sleeps).toEqual(enabled ? [30000] : []);
@@ -144,6 +146,31 @@ describe('runFixCli', () => {
     expect(result.code).toBe(0);
     expect(sleeps).toEqual([30000, 30000]);
     expect(m.calls.filter(c => c.includes('push'))).toHaveLength(1);
+  });
+  it.each([true, false, undefined])('previous-head caller preserves completed failure context or holds incomplete rows (%s)', async rowsComplete => {
+    const m = mk(['a'.repeat(40), 'b'.repeat(40)]);
+    let now = 1000;
+    const logs = [];
+    const gate = vi.spyOn(timingReaders, 'fixPushGate');
+    try {
+      const result = await runFixCli(argv, { ...m.io, timingPolicy: { pushAfterCi: true, pushAfterCiMaxMin: 1 },
+        readRequired: () => ({ source: 'cache', checks: ['test'] }),
+        readChecks: () => Object.assign([{ name: 'test', status: 'completed', conclusion: 'failure',
+          details_url: 'https://example.test/failure' }], { rowsComplete }),
+        write: line => logs.push(line), clock: () => now, sleep: async ms => { now += ms; } });
+      expect(result.code).toBe(0);
+      if (rowsComplete === true) {
+        expect(now).toBe(1000);
+        expect(gate.mock.results.map(r => r.value)).toContainEqual(expect.objectContaining({ action: 'push', reason: 'ci-complete',
+          ciFailures: [{ name: 'test', conclusion: 'failure', detailsUrl: 'https://example.test/failure' }] }));
+        expect(m.spawn.mock.calls[0][0].prompt).toContain('https://example.test/failure');
+      } else {
+        expect(now).toBe(61000);
+        expect(logs.join('')).toContain('rowsComplete=false');
+        expect(logs.join('')).toContain('bound fallback is push');
+        expect(m.spawn.mock.calls[0][0].prompt).not.toContain('Previous-head CI failures (same repair)');
+      }
+    } finally { gate.mockRestore(); }
   });
   const citedEvidence = '- send-back 1001 item 1: src/fix.mjs:1\n- send-back 1001 item 2: src/fix.mjs:2';
   const withSendBack = ({ evidence = citedEvidence, after = 'b'.repeat(40), failPost = false, fileText = 'one\ntwo\n',
