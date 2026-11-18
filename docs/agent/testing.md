@@ -4435,11 +4435,13 @@ original reconciliation refusals are `review-ci`, `ci-heal-escalated`, `owed-ci-
 separate enriched PR objects in production, so raw snapshot fields alone cannot prove clearance.
 Missing or unknown refusals keep recovery closed. A stale/missing stored review requires a fresh advisory
 loop before red-team-only recovery; never re-key an old accepting payload to a content-changed head.
-Human recovery never supplies a CI waiver or consults the ownership advisory setting. Required
-checks must succeed before nomination; unknown requirements, missing checks and unreadable evidence
+All recovery dispatches share `redTeamRecoveryGuard`; requests retain enriched reconciliation holds.
+Recovery never supplies a CI waiver or consults the ownership advisory setting. Required
+checks must succeed before dispatch; unknown requirements, missing checks and unreadable evidence
 keep recovery closed. The red-team/review/merge gate checks themselves remain recovery prerequisites
 that the recovery can complete, so their holds alone do not block nomination.
-Formal review holds and other review-hold labels still block advisory recovery.
+Formal review holds and other review-hold labels block all three dispatch paths. The guard parity
+table exercises every refusal kind and hold for normal, human-held and non-human requested heads.
 The advisory preserves the human hold and shares the queue, retry cooldown, lane allowance
 and live-review budget. Unreadable absence
 of stored work, scope/referral holds and incomplete reviews keep dispatch closed.

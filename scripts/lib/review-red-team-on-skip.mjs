@@ -331,6 +331,45 @@ function publishableClearGuard({ labels, acceptance, comments, reviews, settlesP
   return null;
 }
 
+/** Single admission boundary for ordinary, human-held and explicitly requested recovery. PURE. */
+function redTeamRecoveryGuard({ refusal, rawPr, requiredChecks, referralsRuled = false, allowHumanHold = false }) {
+  const skip = why => ({ ok: false, why,
+    ...(why === 'conflicting label prevents policy-clear' ? { escalate: true } : {}) });
+  const human = rawPr?.labels?.some?.(label => (typeof label === 'string' ? label : label?.name) === 'review:human');
+  const originals = refusal.reconcileRefusals;
+  const allowed = human ? ['review-ci', 'ci-heal-escalated', 'owed-ci-heal', 'already-reviewed-head'] : ['already-reviewed-head'];
+  if ((human && !originals.length) || originals.some(original => !allowed.includes(original.kind))) {
+    return skip('reconciliation refusal prevents recovery; inspect the original review hold');
+  }
+  if ([rawPr, refusal, ...originals].some(original => original?.scopeBloat || original?.referralHold)) {
+    return skip('scope or referral hold prevents recovery');
+  }
+  const comments = referralsRuled && Array.isArray(rawPr?.comments)
+    ? rawPr.comments.filter(comment => !isSettledReferralPauseNotice(comment, { persistRecovered: true })) : rawPr?.comments;
+  const labels = Array.isArray(rawPr?.labels) && human && allowHumanHold
+    ? rawPr.labels.filter(label => (typeof label === 'string' ? label : label?.name) !== 'review:human') : rawPr?.labels;
+  const reviews = Array.isArray(rawPr?.reviews) ? rawPr.reviews : null;
+  const acceptance = labels?.some?.(label => (typeof label === 'string' ? label : label?.name) === 'review:accepted')
+    ? latestAcceptRecord(comments, reviews) : null;
+  const hold = publishableClearGuard({ labels, acceptance, comments, reviews, settlesPending: true,
+    settlesReviewPending: human || referralsRuled || refusal.kind === RED_TEAM_REQUEST_KIND });
+  if (hold) return skip(hold);
+  if (reviews === null) return skip('PR reviews unreadable; inspect formal reviews before full review');
+  if (laterReviewHold(reviews)) return skip('formal review hold prevents full review; inspect formal reviews');
+  if (labels.some(label => typeof (typeof label === 'string' ? label : label?.name) !== 'string')) return skip('PR labels unreadable');
+  const head = rawPr?.headRefOid;
+  const ci = reviewCiGate({ headSha: head, requiredChecks, checks: rawPr?.statusCheckRollup });
+  // Recovery itself completes these gate checks; every other required check must succeed.
+  const recoveryGatesOnly = ci.affected.length > 0 && ci.affected.every(check =>
+    ['red-team', 'review-gate', 'merge-gate'].includes(check.name) && !['wrong-head', 'malformed'].includes(check.reason));
+  if (!ci.allowed && !recoveryGatesOnly) return skip(`${formatReviewCiSkip(ci)}; inspect required checks before recovery`);
+  if (!isRealHead(head) || [refusal, ...originals].some(original => original.headSha != null && original.headSha !== head)) {
+    return skip('live head missing or changed');
+  }
+  if (!Array.isArray(rawPr?.comments) || rawPr.comments.some(comment => typeof comment?.body !== 'string')) return skip('PR comments unreadable');
+  return { ok: true };
+}
+
 /** Normalize both persisted production result shapes at the recovery boundary. */
 export function normalizeRedTeamResult(result) {
   return {
@@ -496,7 +535,6 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
     const rawPr = (rawPrs ?? []).find(p => Number(p?.number) === pr);
     const head = rawPr?.headRefOid ?? null;
     const row = { prNumber: pr, head, action: 'skip' };
-    const requestedRecovery = refusal.kind === RED_TEAM_REQUEST_KIND;
     const human = Array.isArray(rawPr?.labels) && rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:human');
     const skip = why => ({ ...row, why });
     // #6606: a verdict carry settles the head with a result but no round, so nothing else republishes its check. While
@@ -539,16 +577,10 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
     };
     const guardedSkip = why => ({ ...skip(why),
       ...(why === 'conflicting label prevents policy-clear' ? { escalate: true } : {}) });
-    const dispatchDecision = decision => {
-      if (human) {
-        const ci = reviewCiGate({ headSha: head, requiredChecks, checks: rawPr.statusCheckRollup });
-        // These checks are completed by review/red-team recovery itself. All other required
-        // checks must succeed; unknown requirements and incomplete evidence keep recovery closed.
-        const recoveryGatesOnly = ci.affected.length > 0 && ci.affected.every(check =>
-          ['red-team', 'review-gate', 'merge-gate'].includes(check.name)
-          && !['wrong-head', 'malformed'].includes(check.reason));
-        if (!ci.allowed && !recoveryGatesOnly) return skip(`${formatReviewCiSkip(ci)}; inspect required checks before recovery`);
-      }
+    const dispatchDecision = (decision, context = {}) => {
+      const { ok, ...guard } = redTeamRecoveryGuard({ refusal, rawPr, requiredChecks,
+        allowHumanHold: decision.action === 'dispatch' || Boolean(decision.advisoryHead), ...context });
+      if (!ok) return { ...row, ...guard };
       const last = lastDispatch.get(`${repo}#${pr}@${head}`);
       if (last != null && now - last < setting.retryCooldownMin * 60_000) return skip('retry cooldown active');
       return { ...row, ...decision };
@@ -576,13 +608,6 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         let neverReviewed = false;
         try { neverReviewed = headNeverReviewed({ repo, pr, head }) === true; } catch { /* Unknown scan keeps escalation. */ }
         if (neverReviewed) {
-          const reviews = Array.isArray(rawPr.reviews) ? rawPr.reviews : null;
-          const acceptance = latestAcceptRecord(rawPr.comments, reviews);
-          const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance,
-            comments: rawPr.comments, reviews, settlesPending: true });
-          if (refusal) return guardedSkip(refusal);
-          if (reviews === null) return skip('PR reviews unreadable; inspect formal reviews before full review');
-          if (laterReviewHold(reviews)) return skip('formal review hold prevents full review; inspect formal reviews');
           // R640: a review is always allowed here; a red team still needs a finished review.
           return dispatchDecision({ action: 'review', why: 'head never reviewed; a review is always allowed' });
         }
@@ -595,15 +620,6 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (!isRealHead(head) || (refusal.headSha != null && refusal.headSha !== head)) return skip('live head missing or changed');
       // Unknown comments cannot establish that no result was published.
       if (!Array.isArray(rawPr.comments)) return skip('PR comments unreadable');
-      if (human) {
-        if (!refusal.reconcileRefusals.length || refusal.reconcileRefusals.some(original =>
-          !['review-ci', 'ci-heal-escalated', 'owed-ci-heal', 'already-reviewed-head'].includes(original.kind))) {
-          return skip('reconciliation refusal prevents human recovery; inspect the original review hold');
-        }
-        if ([rawPr, ...refusal.reconcileRefusals].some(original => original.scopeBloat || original.referralHold)) {
-          return skip('scope or referral hold prevents advisory recovery');
-        }
-      }
       const journal = readCarry({ repo, pr, head });
       if (redTeamForHead(rawPr.comments, pr, head) && (!journal || journal.step === 'done')) return resultOnHead();
       if (readWitness) {
@@ -621,17 +637,6 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (evidence?.carryConflict) return skip('later review supersedes the carry');
       const unfinishedCarry = evidence?.carry && evidence.carry.step !== 'done';
       if (redTeamForHead(rawPr.comments, pr, head) && !unfinishedCarry) return resultOnHead();
-      if (human) {
-        const reviews = Array.isArray(rawPr.reviews) ? rawPr.reviews : null;
-        // The advisory retains review:human; every other hold uses the full-review guards.
-        const refusal = publishableClearGuard({
-          labels: rawPr.labels.filter(label => (typeof label === 'string' ? label : label?.name) !== 'review:human'),
-          acceptance: null, comments: rawPr.comments, reviews, settlesPending: true, settlesReviewPending: true,
-        });
-        if (refusal) return guardedSkip(refusal);
-        if (reviews === null) return skip('PR reviews unreadable; inspect formal reviews before full review');
-        if (laterReviewHold(reviews)) return skip('formal review hold prevents full review; inspect formal reviews');
-      }
       if (human
         && !rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:accepted')
         && evidence?.loopPayload?.findings?.read?.netBasis?.rev !== head) {
@@ -641,10 +646,6 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         if (evidence?.inFlight !== false || evidence.queued || evidence.recorded !== false
           || evidence.seatRecorded !== false || evidence.completedRecorded === true
           || readStatus({ repo, pr, head }) != null) return skip('live-head review or red-team state is not absent');
-        if (rawPr.labels.some(label => {
-          const name = typeof label === 'string' ? label : label?.name;
-          return name.startsWith('review:') && !['review:human', 'review:pending'].includes(name);
-        })) return skip('additional review hold prevents advisory recovery');
         return dispatchDecision({ action: 'review', advisoryHead: head,
           why: 'human hold at an unreviewed head needs an advisory review before red team' });
       }
@@ -729,24 +730,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         && evidence.completedRecorded !== true && evidence.cleanRecorded !== true
         && (evidence.status == null || (isRealHead(evidence.status.head) && evidence.status.head !== head))
         && readStatus({ repo, pr, head }) == null;
-      const fullReviewDecision = (why, { referralsRuled = false } = {}) => {
-        if (requestedRecovery && (rawPr.scopeBloat || rawPr.referralHold)) return skip('scope or referral hold prevents requested review');
-        // R640: pending is a merge hold, and does not prevent the full review.
-        // Once every refused referral is ruled, the daemon's own "referrals need a ruling" pause notice (trusted author
-        // only) is settled, and the parked run's retained review:pending is the resume's own label. Every other hold stands.
-        const guardComments = referralsRuled && Array.isArray(rawPr.comments)
-          ? rawPr.comments.filter(comment => !isSettledReferralPauseNotice(comment, { persistRecovered: true })) : rawPr.comments;
-        const guardAcceptance = referralsRuled ? (accepted ? latestAcceptRecord(guardComments, reviews) : null) : acceptance;
-        const context = { labels: rawPr.labels, acceptance: guardAcceptance, comments: guardComments, reviews,
-          settlesPending: true, settlesReviewPending: referralsRuled || requestedRecovery };
-        const refusal = publishableClearGuard(context);
-        if (refusal) return guardedSkip(refusal);
-        // Formal holds apply even without an acceptance comment. No timestamp
-        // floor: a missing acceptance cannot establish that a review was cleared.
-        if (reviews === null) return skip('PR reviews unreadable; inspect formal reviews before full review');
-        if (laterReviewHold(reviews)) return skip('formal review hold prevents full review; inspect formal reviews');
-        return dispatchDecision({ action: 'review', why });
-      };
+      const fullReviewDecision = (why, context) => dispatchDecision({ action: 'review', why }, context);
       if (needsReview) return fullReviewDecision('unprovable head move needs a full review');
       if (verdict === VERDICTS.NEEDS_HUMAN && storedHead === head) {
         let ruled = false;
@@ -989,11 +973,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
         || !refusals.some(r => isRedTeamRecoveryRefusal(r) && Number(r.prNumber) === pr
           && (r.headSha == null || r.headSha === head))
         || !Array.isArray(rawPr.comments) || redTeamForHead(rawPr.comments, pr, head)
-        || !Array.isArray(rawPr.labels) || !rawPr.labels.some(label =>
-          // review:pending is the parked run's own retained label: a ruled referral-blocked review resumes through
-          // fullReviewDecision, which needs the formal reviews even when no accept or red-team label is present.
-          ['review:accepted', 'red-team:pending', 'review:pending', 'review:human'].includes(typeof label === 'string' ? label : label?.name))
-          && !refusals.some(row => row.kind === RED_TEAM_REQUEST_KIND && Number(row.prNumber) === pr)) return rawPr;
+        || !Array.isArray(rawPr.labels)) return rawPr;
       if (reviewsByPr.has(pr)) return { ...rawPr, reviews: reviewsByPr.get(pr) };
       let reviews;
       try {
@@ -1004,8 +984,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       return { ...rawPr, reviews };
     });
     let recoveryRequiredChecks = requiredChecks;
-    if (recoveryRequiredChecks === undefined && planningPrs.some(raw =>
-      Array.isArray(raw?.labels) && raw.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:human'))) {
+    if (recoveryRequiredChecks === undefined && resolved.enabled && refusals.some(isRedTeamRecoveryRefusal)) {
       try {
         const required = readRequiredChecks({ repo });
         if (['live', 'cache', 'declared'].includes(required?.source)
@@ -1013,7 +992,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
             && required.cacheAgeMs >= 0 && required.cacheAgeMs <= 24 * 60 * 60_000) {
           recoveryRequiredChecks = required.checks;
         }
-      } catch { /* Unknown required checks keep human recovery closed. */ }
+      } catch { /* Unknown required checks keep recovery closed. */ }
     }
     const planningOptions = { repo, refusals, rawPrs: planningPrs,
       readEvidence, readStatus, readReviewRuns, readCheckFact, readSeal, env, requiredChecks: recoveryRequiredChecks,

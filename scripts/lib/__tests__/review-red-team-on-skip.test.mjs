@@ -1,6 +1,7 @@
 import { runGhSync } from '../gh-throttle.mjs';
 import { redTeamForHead, redTeamMarker } from '../red-team-gate.mjs';
-import { redTeamRecoveryRefusals } from '../red-team-request.mjs';
+import { redTeamRecoveryRefusals, redTeamRequestBody } from '../red-team-request.mjs';
+import { REFUSAL_KINDS } from '../../conveyor/reconcile-core.mjs';
 import { publishRedTeamPolicyClearCheck, POLICY_CLEAR_HOLD_OWED } from '../red-team-check-run.mjs';
 import { readSealedStatus, sealedStatusPath } from '../red-team-sealed-status.mjs';
 import { writeJsonAtomic } from '../atomic-json-file.mjs';
@@ -42,7 +43,7 @@ const repo = 'web-everything/web-everything', head = 'a'.repeat(40), pr = 5762;
 const payload = () => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
 function fixture(over = {}) {
   return { repo, refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }],
-    rawPrs: [{ number: pr, headRefOid: head, comments: [], reviews: [],
+    rawPrs: [{ number: pr, headRefOid: head, labels: [], comments: [], reviews: [],
       statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] }],
     requiredChecks: ['test'],
     readEvidence: () => ({ loopPayload: payload(), recorded: false }), readStatus: () => null,
@@ -141,7 +142,7 @@ describe('unfinished retryable record effect', () => {
   });
   it('still resumes over an older operator comment', () => {
     const comments = [{ body: 'earlier note', createdAt: new Date(0).toISOString(), author: { login: 'chalbert' } }];
-    expect(decide({ ...options([row]), rawPrs: [{ number: pr, headRefOid: head, comments, reviews: [] }] }))
+    expect(decide({ ...options([row]), rawPrs: [{ ...fixture().rawPrs[0], comments }] }))
       .toMatchObject({ action: 'review', why: 'unfinished review has only a retryable pre-write effect; resume it' });
   });
   it('keeps unreadable evidence held', () => {
@@ -375,7 +376,7 @@ describe('#6345 — resume a stored needs-human review after its refused referra
     const onlyReviewPending = /only review:pending/.test(kind);
     const labels = [...(onlyReviewPending ? [] : ['red-team:pending']), ...(/review:pending/.test(kind) ? ['review:pending'] : []),
       ...(/review:human/.test(kind) ? ['review:human'] : [])];
-    const rawPr = { number: pr, headRefOid: head, body, comments, reviews: [], labels };
+    const rawPr = { ...fixture().rawPrs[0], body, comments, labels };
     // Validate the fixture through the real shared gate, without a planner-only mock seam.
     expect(refusedReferralsAreRuled(rawPr, projected, { repo })).toBe(![
       'unruled referral', 'partial rulings', 'ruling for other head', 'ruling for other run', 'unreadable referral card',
@@ -1413,12 +1414,17 @@ describe('daemon rows without formal reviews', () => {
     } finally { runGhSync.mockReset(); }
   });
 
-  it.each(['disabled', 'not-refused', 'unaccepted', 'unreadable-comments', 'changed-head', 'reviews-present'])(
+  it('fetches formal reviews for unaccepted recovery candidates too', () => {
+    const o = daemonOptions(); o.rawPrs[0].labels = [];
+    runRedTeamOnSkip(o);
+    expect(o.readReviews).toHaveBeenCalledOnce();
+    expect(o.readReviews).toHaveBeenCalledWith({ repo, pr: 5929 });
+  });
+  it.each(['disabled', 'not-refused', 'unreadable-comments', 'changed-head', 'reviews-present'])(
     'avoids formal review reads for %s PRs', kind => {
       const o = daemonOptions();
       if (kind === 'disabled') o.setting.enabled = false;
       if (kind === 'not-refused') o.plan.refusals = [];
-      if (kind === 'unaccepted') o.rawPrs[0].labels = [];
       if (kind === 'unreadable-comments') delete o.rawPrs[0].comments;
       if (kind === 'changed-head') o.plan.refusals[0].headSha = head;
       if (kind === 'reviews-present') { o.rawPrs[0].reviews = []; o.dryRun = true; }
@@ -1508,7 +1514,7 @@ describe('runRedTeamOnSkip', () => {
     const o = runFixture({ capacity: { lanes: 5, budget: { left: 5 }, remainingStarts: 1, take } });
     for (const prNumber of [5530, 5531, 5532]) {
       o.plan.refusals.push({ kind: 'already-reviewed-head', prNumber, headSha: head });
-      o.rawPrs.push({ number: prNumber, headRefOid: head, comments: [] });
+      o.rawPrs.push({ ...fixture().rawPrs[0], number: prNumber });
     }
     const out = runRedTeamOnSkip(o);
     expect(out.dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'fresh' }]);
@@ -2072,7 +2078,7 @@ describe('R100 recovery regressions', () => {
       .flatMap(label => [label, { name: label }]).map(label => ({ mode, label })),
     ...['Please hold this acceptance', 'manifest baseline mismatch', '🔁 review — changes requested']
       .map(body => ({ mode, body })),
-  ]))('publication guard preserves the complete $mode dispatch plan with $label / $body', ({ mode, label, body }) => {
+  ]))('shared admission guards $mode dispatch with $label / $body', ({ mode, label, body }) => {
     const o = publicationOptions('null-status');
     const completed = mode === 'resume';
     const input = fixture({ rawPrs: o.rawPrs.map(raw => ({ ...raw,
@@ -2086,7 +2092,10 @@ describe('R100 recovery regressions', () => {
       why: completed ? 'recorded pass needs its result comment/effects' : 'head never had a red-team pass' }]);
     if (label) input.rawPrs[0].labels.push(label);
     if (body) input.rawPrs[0].comments.push(trusted(body));
-    expect(planRedTeamOnSkip(input)).toEqual(expected);
+    const blockingLabel = label && !['red-team:pending', 'review:human'].includes(typeof label === 'string' ? label : label.name);
+    expect(planRedTeamOnSkip(input)).toEqual(blockingLabel || body ? [{ prNumber: pr, head, action: 'skip',
+      why: blockingLabel ? 'conflicting label prevents policy-clear' : 'later verdict or hold supersedes acceptance',
+      ...(blockingLabel ? { escalate: true } : {}) }] : expected);
   });
   it.each(['untrusted', 'extra-prose', 'malformed-marker'])(
     'source policy-clear remains a possible hold with %s', kind => {
@@ -2208,7 +2217,7 @@ describe('R100 recovery regressions', () => {
     expect(o.syncLabels).not.toHaveBeenCalled();
   });
   it.each(['missing', 'untrusted'])(
-    'falls back to the normal red-team run when the declared from acceptance is %s', kind => {
+    'refuses red-team dispatch when the declared from acceptance is %s', kind => {
       const o = carryOptions(), missing = 'd'.repeat(40);
       const comments = o.rawPrs[0].comments;
       if (kind === 'missing') comments.at(-1).body = comments.at(-1).body.replace(`from=${old}`, `from=${missing}`);
@@ -2216,7 +2225,9 @@ describe('R100 recovery regressions', () => {
       o.readEvidence = () => ({ loopPayload: payload(), inFlight: false, recorded: false });
       expect(latestAcceptRecord(comments.slice(0, -1), [], { sha: kind === 'missing' ? missing : old })).toBeNull();
       runGhSync.mockClear();
-      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'dispatch', mode: 'fresh' });
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip',
+        why: 'invalid acceptance re-stamp; withdraw stranded records before recovery' });
+      expect(o.dispatch).not.toHaveBeenCalled();
       expect(runGhSync).not.toHaveBeenCalled();
       expect(o.syncLabels).not.toHaveBeenCalled();
     });
@@ -2390,7 +2401,7 @@ describe('unprovable accepted head move — fresh full review', () => {
     const loopPayload = payload();
     loopPayload.findings.read.netBasis.rev = old;
     return runFixture({
-      rawPrs: [{ number: pr, headRefOid: head, labels: ['review:accepted'], reviews: [], comments: [
+      rawPrs: [{ ...fixture().rawPrs[0], labels: ['review:accepted'], comments: [
         { body: `✅ review — accepted\n<!-- reviewed-sha: ${old} -->`, author: { login: 'web-everything' } },
         { body: `${redTeamMarker(pr, old)}\nRed team not required on this head: card-only diff`, author: { login: 'web-everything' } },
       ] }],
@@ -3208,7 +3219,7 @@ describe('human hold red-team recovery respects reconcile refusals', () => {
       expect(o.rawPrs[0]).not.toHaveProperty('scopeBloat');
       expect(o.rawPrs[0]).not.toHaveProperty('referralHold');
       expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip',
-        why: 'reconciliation refusal prevents human recovery; inspect the original review hold' });
+        why: 'reconciliation refusal prevents recovery; inspect the original review hold' });
       expect(o.dispatch).not.toHaveBeenCalled();
       expect(o.syncLabels).not.toHaveBeenCalled();
     });
@@ -3216,7 +3227,7 @@ describe('human hold red-team recovery respects reconcile refusals', () => {
     const o = options('review-ci');
     o.plan.refusals[0][field] = { kind: 'same-head' };
     expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip',
-      why: 'scope or referral hold prevents advisory recovery' });
+      why: 'scope or referral hold prevents recovery' });
     expect(o.dispatch).not.toHaveBeenCalled();
   });
   it.each(['review-ci', 'already-reviewed-head'])('an additional scope-bloat refusal vetoes %s nomination', kind => {
@@ -3335,5 +3346,102 @@ describe('human hold red-team recovery respects reconcile refusals', () => {
     expect(o.readReviews).toHaveBeenCalledOnce();
     expect(o.readReviews).toHaveBeenCalledWith({ repo, pr });
     expect(o.dispatch).toHaveBeenCalledOnce();
+  });
+});
+
+
+describe('one recovery admission guard for normal, human and explicit requests', () => {
+  const allowedHumanKinds = ['review-ci', 'ci-heal-escalated', 'owed-ci-heal', 'already-reviewed-head'];
+  const refusalWhy = 'reconciliation refusal prevents recovery; inspect the original review hold';
+  const scopeWhy = 'scope or referral hold prevents recovery';
+  const cases = [
+    ...[...REFUSAL_KINDS.filter(kind => !allowedHumanKinds.includes(kind)), 'unknown', undefined]
+      .map(kind => [`refusal ${kind}`, o => { o.plan.refusals.push({ kind, prNumber: pr, headSha: head }); }, refusalWhy]),
+    ...['scopeBloat', 'referralHold'].flatMap(field => [
+      [`enriched refusal ${field}`, o => { o.plan.refusals.push({ kind: 'already-reviewed-head', prNumber: pr, headSha: head, [field]: { kind: 'same-head' } }); }, scopeWhy],
+      [`raw ${field}`, o => { o.rawPrs[0][field] = { kind: 'same-head' }; }, scopeWhy],
+    ]),
+    ['formal CHANGES_REQUESTED', o => { o.rawPrs[0].reviews = [{ state: 'CHANGES_REQUESTED' }]; },
+      'formal review hold prevents full review; inspect formal reviews'],
+    ...['review:changes', 'review-status:blocked'].map(label => [label, o => { o.rawPrs[0].labels.push({ name: label }); },
+      'conflicting label prevents policy-clear']),
+    ['later hold comment', o => { o.rawPrs[0].comments.push({ body: '🔁 review — changes requested' }); },
+      'explicit review hold comment prevents full review; inspect the PR thread'],
+    ['required CI failure (no waiver)', o => {
+      o.rawPrs[0].statusCheckRollup[0].conclusion = 'FAILURE'; o.env.WE_REVIEW_ALLOW_CI_RED = '1';
+    }, /test=failure/],
+    ['unknown required checks', o => { o.requiredChecks = null; }, /unknown-required-set/],
+    ['missing required check', o => { o.rawPrs[0].statusCheckRollup = []; }, /test=missing/],
+    ['pending required check', o => { o.rawPrs[0].statusCheckRollup[0].status = 'IN_PROGRESS'; }, /test=pending/],
+    ['wrong-head required check', o => { o.rawPrs[0].statusCheckRollup[0].head_sha = 'b'.repeat(40); }, /test=wrong-head/],
+    ['unreadable reviews', o => { o.rawPrs[0].reviews = null; }, 'PR reviews unreadable; inspect formal reviews before full review'],
+    ['unreadable comments', o => { o.rawPrs[0].comments = null; }, 'PR comments unreadable'],
+    ['unreadable comment body', o => { o.rawPrs[0].comments.push({ body: null }); }, 'PR comments unreadable'],
+    ['malformed label', o => { o.rawPrs[0].labels.push({ name: null }); }, 'PR labels unreadable'],
+    ['live head mismatch', o => { o.rawPrs[0].headRefOid = 'b'.repeat(40); }, 'live head missing or changed'],
+    ['enriched refusal head mismatch', o => { o.plan.refusals.push({ kind: 'already-reviewed-head', prNumber: pr, headSha: 'b'.repeat(40) }); }, 'live head missing or changed'],
+  ];
+  function options(path, current) {
+    const raw = { ...fixture().rawPrs[0], state: 'OPEN', isDraft: false,
+      labels: path === 'human' ? ['review:human'] : path === 'normal' ? ['review:accepted'] : [] };
+    if (path === 'request') raw.comments.push({ author: { login: 'web-everything' },
+      body: redTeamRequestBody({ repo, pr, head, reason: 'rerun this head' }) });
+    const refusals = path === 'request' ? [] : [{ kind: path === 'human' ? 'review-ci' : 'already-reviewed-head', prNumber: pr, headSha: head }];
+    // Preserve the queue's nomination before live evidence changes, exercising unreadability and head movement too.
+    const nominated = redTeamRecoveryRefusals({ repo, rawPrs: [raw], refusals });
+    expect(nominated.some(row => row.kind === (path === 'normal' ? 'already-reviewed-head' : 'red-team-requested'))).toBe(true);
+    return runFixture({ env: {}, rawPrs: [raw], plan: { refusals: nominated },
+      readReviews: () => raw.reviews,
+      readEvidence: () => ({ loopPayload: current ? payload() : null, inFlight: false, queued: false,
+        recorded: false, seatRecorded: false, completedRecorded: false }) });
+  }
+  it.each(cases)('all three paths refuse identically: %s', (_name, mutate, why) => {
+    for (const current of [false, true]) {
+      const outcomes = ['normal', 'human', 'request'].map(path => {
+        const o = options(path, current); mutate(o);
+        const [row] = runRedTeamOnSkip(o).rows;
+        expect(row, `${path}, current=${current}`).toMatchObject({ action: 'skip',
+          why: typeof why === 'string' ? why : expect.stringMatching(why) });
+        expect(o.dispatch).not.toHaveBeenCalled();
+        expect(o.capacity.budget.left).toBe(1);
+        expect(o.syncLabels).not.toHaveBeenCalled();
+        return { action: row.action, why: row.why, escalate: row.escalate, escalationContext: row.escalationContext };
+      });
+      expect(outcomes[1]).toEqual(outcomes[0]);
+      expect(outcomes[2]).toEqual(outcomes[0]);
+    }
+  });
+  it.each([false, true])('all paths reach dispatch with complete guard evidence (current=%s)', current => {
+    for (const path of ['normal', 'human', 'request']) {
+      const o = options(path, current);
+      expect(runRedTeamOnSkip(o).rows[0].action).toBe(current ? 'dispatch' : 'review');
+      expect(o.dispatch).toHaveBeenCalledOnce();
+    }
+  });
+  it('unreadable labels cannot authorize recovery or establish a human nomination', () => {
+    for (const path of ['normal', 'human', 'request']) {
+      const o = options(path, true); o.rawPrs[0].labels = null;
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip',
+        why: path === 'human' ? refusalWhy : 'PR labels unreadable' });
+      expect(o.dispatch).not.toHaveBeenCalled();
+    }
+  });
+  it.each(allowedHumanKinds.filter(kind => kind !== 'already-reviewed-head'))(
+    'the human-only %s refusal cannot authorize a non-human request', kind => {
+      for (const current of [false, true]) {
+        const o = options('request', current);
+        o.plan.refusals.push({ kind, prNumber: pr, headSha: head });
+        expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: refusalWhy });
+        expect(o.dispatch).not.toHaveBeenCalled();
+      }
+    });
+  it.each(['red-team', 'review-gate', 'merge-gate'])('all paths retain only the existing %s CI exception', name => {
+    for (const path of ['normal', 'human', 'request']) {
+      const o = options(path, true);
+      o.requiredChecks.push(name);
+      o.rawPrs[0].statusCheckRollup.push({ name, status: 'COMPLETED', conclusion: 'FAILURE' });
+      expect(runRedTeamOnSkip(o).rows[0].action).toBe('dispatch');
+      expect(o.dispatch).toHaveBeenCalledOnce();
+    }
   });
 });
