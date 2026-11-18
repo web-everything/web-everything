@@ -1,4 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
+import { mkdtempSync, writeFileSync, appendFileSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { formatCascadeSourcesLine } from '../policy-cascade.mjs';
 import { parseCascadeLines, effectiveForKeys, shadowWarnings, readEffectivePolicies, writeWithEffective } from '../effective-policy.mjs';
 import { discoverDaemonLogPaths } from '../../operations/daemon-log-paths.mjs';
@@ -32,32 +35,98 @@ describe('effective policy observations', () => {
     let published = false;
     const result = await writeWithEffective({ waitMs: 1 }, {
       read: () => readEffectivePolicies({ discover: () => ({ review: 'review', other: 'other' }),
-        tail: path => ({ text: path === 'other' ? 'policy-cascade · host: cap=2 (env)'
-          : line(published ? 8 : 6, published ? 'operator-db' : 'env'), mtimeMs: published ? 101 : 90 }) }),
-      write: () => { published = true; return { key, new: 8 }; }, now: () => 100, sleep: async () => {}, pollMs: 1,
+        tail: path => {
+          const text = path === 'other' ? 'policy-cascade · host: cap=2 (env)'
+            : line(6, 'env') + (published ? '\n' + line(8, 'operator-db') : '');
+          return { text, dev: 1, ino: 1, size: Buffer.byteLength(text), start: 0 };
+        } }),
+      write: () => ({ key, new: 8 }), now: () => 100, sleep: async () => { published = true; }, pollMs: 1,
     });
     expect(result.observation).toBe('timeout');
     expect(result.pending).toEqual([`${key}: no policy line seen (other)`]);
     expect(result.warnings[0]).toContain('other: effective value unavailable');
   });
   it.each([
-    ['stale changed line', 90, 95, false, 'timeout'],
-    ['publish-time boundary', 90, 100, false, 'timeout'],
-    ['unchanged pre-write mtime', 101, 101, false, 'timeout'],
-    ['initially unreadable stale log', 90, 95, true, 'timeout'],
-    ['missing mtime evidence', undefined, undefined, false, 'timeout'],
-    ['post-publish line', 90, 101, false, 'observed'],
-  ])('requires post-publish mtime proof: %s', async (_name, beforeMtime, afterMtime, unreadable, observation) => {
+    ['rotated log with old matching line and fresh unrelated activity', 2, 1, 'old', false, 'timeout'],
+    ['inode changed despite an appended match', 2, 1, 'append', false, 'timeout'],
+    ['device changed', 1, 2, 'append', false, 'timeout'],
+    ['truncated log', 1, 1, 'truncate', false, 'timeout'],
+    ['unreadable before write', 1, 1, 'append', true, 'timeout'],
+    ['normal append after offset with unchanged mtime', 1, 1, 'append', false, 'observed'],
+    ['identical policy line appended again', 1, 1, 'repeat', false, 'observed'],
+    ['old matching line plus unrelated append', 1, 1, 'old', false, 'timeout'],
+    ['line crossing the write offset', 1, 1, 'cross', false, 'timeout'],
+  ])('proves freshness by byte offset: %s', async (_name, ino, dev, mode, unreadable, observation) => {
     let published = false;
+    const matching = line(8, 'operator-db');
+    const initial = mode === 'truncate' ? 'noise'.repeat(100) : mode === 'cross' ? matching.slice(0, 20)
+      : mode === 'old' || mode === 'repeat' ? matching + '\n' : 'é before\n' + line(6, 'env') + '\n';
+    const after = mode === 'truncate' ? matching + '\n' : mode === 'cross' ? matching + '\n'
+      : initial + (mode === 'old' ? 'fresh unrelated activity\n' : matching + '\n');
     const result = await writeWithEffective({ waitMs: 1 }, {
       read: () => readEffectivePolicies({ discover: () => ({ review: 'review' }), tail: () => {
         if (!published && unreadable) throw Error('denied');
-        return { text: line(published ? 8 : 6, published ? 'operator-db' : 'env'), mtimeMs: published ? afterMtime : beforeMtime };
+        const text = published ? after : initial;
+        return { text, size: Buffer.byteLength(text), dev: published ? dev : 1,
+          ino: published ? ino : 1, start: 0, mtimeMs: mode === 'append' && ino === 1 && dev === 1 ? 90 : published ? 101 : 90 };
       } }),
-      write: () => { published = true; return { key, new: 8 }; }, now: () => 100, sleep: async () => {}, pollMs: 1,
+      write: () => ({ key, new: 8 }), now: () => 100, sleep: async () => { published = true; }, pollMs: 1,
     });
     expect(result.observation).toBe(observation);
-    expect(result.pending).toEqual(observation === 'observed' ? [] : [`${key}: not yet seen by review`]);
+    if (ino !== 1 || dev !== 1 || unreadable || mode === 'truncate')
+      expect(result.pending[0]).toContain('log rotated/unverifiable; cannot prove the line is newer than the write');
+    else expect(result.pending).toEqual(observation === 'observed' ? [] : [`${key}: not yet seen by review`]);
+  });
+  it('does not acknowledge a matching append before publication', async () => {
+    let text = line(6, 'env') + '\n', published = false;
+    const result = await writeWithEffective({ waitMs: 1 }, {
+      read: () => readEffectivePolicies({ discover: () => ({ review: 'review' }),
+        tail: () => ({ text, dev: 1, ino: 1, size: Buffer.byteLength(text), start: 0 }) }),
+      write: async () => {
+        // A daemon sees the previous matching override while publication is still waiting.
+        await Promise.resolve();
+        text += line(8, 'operator-db') + '\n';
+        await Promise.resolve();
+        published = true;
+        return { key, new: 8 };
+      },
+      now: () => 100, sleep: async () => {}, pollMs: 1,
+    });
+    expect(published).toBe(true);
+    expect(result.observation).toBe('timeout');
+    expect(result.pending).toEqual([`${key}: not yet seen by review`]);
+  });
+  it.each(['unreadable boundary', 'line crossing boundary'])('refuses %s after publication', async mode => {
+    const matching = line(8, 'operator-db') + '\n';
+    let text = line(6, 'env') + '\n', reads = 0;
+    const result = await writeWithEffective({ waitMs: 1 }, {
+      read: () => readEffectivePolicies({ discover: () => ({ review: 'review' }), tail: () => {
+        if (++reads === 2 && mode === 'unreadable boundary') throw Error('denied');
+        return { text, dev: 1, ino: 1, size: Buffer.byteLength(text), start: 0 };
+      } }),
+      write: () => {
+        if (mode === 'line crossing boundary') text += matching.slice(0, 20);
+        return { key, new: 8 };
+      },
+      now: () => 100, sleep: async () => { text += mode === 'line crossing boundary' ? matching.slice(20) : matching; }, pollMs: 1,
+    });
+    expect(result.observation).toBe('timeout');
+    expect(result.pending[0]).toContain(mode === 'unreadable boundary' ? 'log rotated/unverifiable' : 'not yet seen');
+  });
+  it('reads real bounded tails with a split UTF-8 prefix and observes only appended bytes', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'effective-policy-'));
+    const path = join(dir, 'daemon.log');
+    try {
+      const matching = line(8, 'operator-db') + '\n';
+      writeFileSync(path, 'é'.repeat(100) + '\n' + matching);
+      const run = append => writeWithEffective({ waitMs: 1 }, {
+        read: () => readEffectivePolicies({ discover: () => ({ review: path }), maxBytes: Buffer.byteLength(matching) + 4 }),
+        write: () => ({ key, new: 8 }),
+        now: () => 100, sleep: async () => { appendFileSync(path, append); }, pollMs: 1,
+      });
+      expect((await run('x\n')).observation).toBe('timeout');
+      expect((await run(matching)).observation).toBe('observed');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('warns once per key on env-shadow, value mismatch, and missing evidence; operator-db match is clean', () => {
     expect(shadowWarnings({ [key]: 8 }, { [key]: { review: { value: 6, layer: 'env' } } })[0]).toContain('env shadows');

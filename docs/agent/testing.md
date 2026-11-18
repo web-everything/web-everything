@@ -4587,7 +4587,11 @@ review-job and review-daemon suites.
 `effective-policy.test.mjs` round-trips the cascade formatter; the operator-override cases in
 `http-adapter.test.mjs` exercise before/after adoption, environment shadows and bounded waits.
 Observation success requires every discovered daemon to log the requested policy with the expected
-value/source, a changed line, and a file mtime strictly newer than both the readable pre-write
-snapshot and override publication. Missing policy lines stay pending as “no policy line seen”; stale
-or unavailable freshness evidence stays “not yet seen”, even when the stored override matches.
+value/source, entirely at or beyond a byte boundary captured after the write completes, in the same
+device/inode as both the pre-write and post-write snapshots, with no size shrink between snapshots.
+The post-write boundary conservatively excludes lines appended while an asynchronous write yields;
+unreadable boundary evidence stays pending even if a later read succeeds. File mtime and changed line text cannot prove freshness. Rotated, truncated or unreadable
+pre-write logs stay pending with “log rotated/unverifiable; cannot prove the line is newer than the write”;
+inspect daemon logs. Missing policy lines stay pending as “no policy line seen”; old lines stay
+“not yet seen”, even when the stored override matches.
 Run these tests through heavy-admission, using `--wait-ms=0` in store-only CLI fixtures.

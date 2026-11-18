@@ -1,6 +1,6 @@
 /** Observations only: never resolve a policy again in the operator process. */
 import { discoverDaemonLogPaths } from '../operations/daemon-log-paths.mjs';
-import { tailFile } from '../operations/daemon-status-io.mjs';
+import { openSync, fstatSync, readSync, closeSync } from 'node:fs';
 
 const marker = /policy-cascade · ([\w.-]+): (.*)/;
 const evidence = Symbol('cascade evidence');
@@ -54,25 +54,49 @@ export function effectiveOverrideReport(values, parsedByDaemon) {
     warnings: shadowWarnings(values, effective) };
 }
 
+/** Read identity and bytes from the same descriptor, never a stat/open path race. */
+function policyTail(path, { maxBytes }) {
+  const fd = openSync(path, 'r');
+  try {
+    const { dev, ino, size } = fstatSync(fd);
+    const start = Math.max(0, size - maxBytes), buffer = Buffer.alloc(size - start);
+    const count = readSync(fd, buffer, 0, buffer.length, start);
+    if (count !== buffer.length || fstatSync(fd).size < size) throw Error('log truncated during read');
+    // Drop the partial first line as bytes, before decoding a possible split UTF-8 character.
+    const skip = start > 0 ? (buffer.includes(10) ? buffer.indexOf(10) + 1 : buffer.length) : 0;
+    const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(buffer.subarray(skip));
+    return { text, dev, ino, size, start: start + skip };
+  } finally { closeSync(fd); }
+}
+
 /** Bounded tails, independent failures. Missing logs remain unknown, never an empty success. */
-export function readEffectivePolicies({ discover = discoverDaemonLogPaths, tail = tailFile, maxBytes = 512 * 1024 } = {}) {
+export function readEffectivePolicies({ discover = discoverDaemonLogPaths, tail = policyTail, maxBytes = 512 * 1024 } = {}) {
   let paths;
   try { paths = discover(); } catch { return {}; }
   return Object.fromEntries(Object.entries(paths).map(([daemon, path]) => {
-    let text = '', mtimeMs;
+    let text = '', record, start;
     try {
       const result = tail(path, { maxBytes });
       if (result && !result.error) {
-        text = result.truncated ? (result.text.includes('\n') ? result.text.slice(result.text.indexOf('\n') + 1) : '') : result.text;
-        mtimeMs = result.mtimeMs;
+        text = result.text;
+        ({ start } = result);
+        if (result.truncated) {
+          const skipped = text.includes('\n') ? text.indexOf('\n') + 1 : text.length;
+          start += Buffer.byteLength(text.slice(0, skipped));
+          text = text.slice(skipped);
+        }
+        if ([result.dev, result.ino, result.size, start].every(n => Number.isSafeInteger(n) && n >= 0))
+          record = { dev: result.dev, ino: result.ino, size: result.size };
       }
     } catch { /* Keep the daemon with unknown evidence. */ }
-    const parsed = parseCascadeLines(text), stamps = {};
+    const parsed = parseCascadeLines(text), offsets = {};
+    let offset = start;
     for (const line of text.split('\n')) {
       const match = line.match(marker);
-      if (match) Object.defineProperty(stamps, match[1], { value: line, configurable: true });
+      if (match) Object.defineProperty(offsets, match[1], { value: { start: offset, end: offset + Buffer.byteLength(line) }, configurable: true });
+      offset += Buffer.byteLength(line) + 1;
     }
-    Object.defineProperty(parsed, evidence, { value: { stamps, mtimeMs } });
+    Object.defineProperty(parsed, evidence, { value: { record, offsets } });
     return [daemon, parsed];
   }));
 }
@@ -87,11 +111,13 @@ export async function writeWithEffective(input, { write, read = readEffectivePol
   const safeRead = () => { try { return read(); } catch { return {}; } };
   const initial = safeRead();
   const result = await write(payload);
-  const publishedAt = now();
+  // Timestamp-free logs need a conservative byte boundary AFTER publication completes.
+  // Adoption already logged during write() cannot be distinguished from the previous override.
+  const published = safeRead();
   const changes = result.changes ?? [{ key: result.key, new: result.new }];
   const values = Object.fromEntries(changes.map(c => [c.key, c.new])), keys = Object.keys(values);
   const before = effectiveForKeys(initial, keys);
-  let latest = safeRead(), after, pending;
+  let latest = published, after, pending;
   const deadline = now() + waitMs;
   const inspect = () => {
     after = effectiveForKeys(latest, keys);
@@ -103,11 +129,13 @@ export async function writeWithEffective(input, { write, read = readEffectivePol
         if (!Object.hasOwn(latest[daemon] ?? {}, policy))
           return [clean(`${key}: no policy line seen (${daemon})`)];
         const oldLog = initial[daemon]?.[evidence], newLog = latest[daemon]?.[evidence];
-        // A changed tail alone can reveal old bytes. Require a readable pre-write
-        // snapshot and an mtime strictly beyond both that snapshot and publication.
-        const fresh = newLog?.stamps[policy] !== undefined && newLog.stamps[policy] !== oldLog?.stamps[policy]
-          && Number.isFinite(oldLog?.mtimeMs) && Number.isFinite(newLog.mtimeMs)
-          && newLog.mtimeMs > oldLog.mtimeMs && newLog.mtimeMs > publishedAt;
+        const old = oldLog?.record, boundary = published[daemon]?.[evidence]?.record, current = newLog?.record;
+        if (!old || !boundary || !current || old.dev !== boundary.dev || old.ino !== boundary.ino
+          || boundary.size < old.size || boundary.dev !== current.dev || boundary.ino !== current.ino
+          || current.size < boundary.size)
+          return [clean(`${key}: ${daemon}: log rotated/unverifiable; cannot prove the line is newer than the write`)];
+        const position = newLog.offsets[policy];
+        const fresh = position && position.start >= boundary.size && position.end <= current.size;
         const matches = seen && seen.layer !== 'unknown' && (values[key] === null
           ? seen.layer !== 'operator-db' : seen.layer === 'operator-db' && Object.is(seen.value, values[key]));
         return fresh && matches ? [] : [clean(`${key}: not yet seen by ${daemon}`)];
