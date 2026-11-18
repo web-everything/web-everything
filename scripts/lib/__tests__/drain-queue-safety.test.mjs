@@ -980,18 +980,16 @@ describe('merge-queue same-head failure admission', () => {
         ['completion at removal', { completed_at: removed().createdAt }],
         ['completion after removal', { completed_at: '2026-11-01T14:00:00Z' }],
         ['pending status', { status: 'in_progress' }],
-      ])('holds with %s, with or without an aggregate', (_kind, overrides) => {
-        for (const aggregate of [false, true]) fixture(f => {
-          f.checks = regroupChecks(conclusion).slice(0, aggregate ? 2 : 1);
-          Object.assign(f.checks[0], overrides);
-          expect(f.guard().hold).toBe(true);
-          expect(f.exec.mock.calls.every(([, args]) => !args.includes('POST')
-            && !args.some(arg => arg.includes('/logs')))).toBe(true);
-        });
-      });
+      ])('holds with %s alongside a derived aggregate', (_kind, overrides) => fixture(f => {
+        f.checks = regroupChecks(conclusion);
+        Object.assign(f.checks[0], overrides);
+        expect(f.guard().hold).toBe(true);
+        expect(f.exec.mock.calls.every(([, args]) => !args.includes('POST')
+          && !args.some(arg => arg.includes('/logs')))).toBe(true);
+      }));
       it.each(['repeated cancellation', 'pending rerun', 'incomplete successful rerun'])(
         'holds with %s on the same Actions run', kind => fixture(f => {
-          f.checks = [regroupChecks(conclusion)[0]];
+          f.checks = regroupChecks(conclusion);
           f.checks.push({ ...f.checks[0], id: 25,
             details_url: `https://github.com/${repo}/actions/runs/500/job/9025`,
             started_at: '2026-11-01T11:20:00Z', completed_at: '2026-11-01T11:30:00Z',
@@ -1004,8 +1002,8 @@ describe('merge-queue same-head failure admission', () => {
         }));
       it.each(['missing page', 'duplicate check identity', 'missing check identity'])(
         'holds with an incomplete check-run list: %s', kind => fixture(f => {
-          f.checks = [regroupChecks(conclusion)[0]];
-          if (kind === 'missing page') f.checkTotal = 2;
+          f.checks = regroupChecks(conclusion);
+          if (kind === 'missing page') f.checkTotal = f.checks.length + 1;
           if (kind === 'duplicate check identity') f.checks.push({ ...f.checks[0] });
           if (kind === 'missing check identity') delete f.checks[0].id;
           expect(f.guard().hold).toBe(true);
@@ -1028,26 +1026,46 @@ describe('merge-queue same-head failure admission', () => {
       expect(f.mainReads).toBeUndefined();
       expect(f.exec.mock.calls.every(([, args]) => !args.includes('POST'))).toBe(true);
     }));
-    it('cancelled-only evidence also retries without main CI', () => fixture(f => {
-      f.checks = [regroupChecks()[0]];
-      f.mainError = true;
-      expect(f.guard().line).toContain('aggregate derived: none; PR CLEAN');
-    }));
-    it.each([false, true])('cancelled/regroup enforces ten failed jobs (with aggregate: %s)', aggregate => {
+    describe.each(['cancelled', 'startup_failure'])('pure %s evidence uses the legacy main-green path', conclusion => {
+      it.each([1, 10, 11])('requires main green with %i failed jobs, including above the job cap', count => {
+        for (const main of ['green', 'red', 'unreadable']) fixture(f => {
+          f.checks = Array.from({ length: count }, (_, i) => ({
+            ...regroupChecks(conclusion)[0], id: 100 + i, name: `cancelled-${i}`,
+            details_url: `https://github.com/${repo}/actions/runs/500/job/${9100 + i}`,
+          }));
+          if (main === 'red') f.runs[0].conclusion = 'failure';
+          if (main === 'unreadable') f.mainError = true;
+          const result = f.guard();
+          expect(result.hold).toBe(main !== 'green');
+          expect(result.line).not.toContain('cancelled/regroup');
+          if (main === 'green') expect(result.line).toContain('failed_checks infra retry 1/2 (main green, PR CLEAN, infra)');
+          expect(f.mainReads).toBeGreaterThan(0);
+          expect(f.exec.mock.calls.every(([, args]) => !args.includes('POST'))).toBe(true);
+        });
+      });
+      it.each(['success', 'neutral', 'skipped'])('a %s aggregate still requires main green', aggregateConclusion => fixture(f => {
+        f.checks = regroupChecks(conclusion);
+        f.checks[1].conclusion = aggregateConclusion;
+        f.mainError = true;
+        expect(f.guard().hold).toBe(true);
+        expect(f.mainReads).toBeGreaterThan(0);
+        expect(f.log.mock.calls.every(([line]) => !line.includes('cancelled/regroup'))).toBe(true);
+      }));
+    });
+    it('cancelled/regroup enforces ten failed jobs with a derived aggregate', () => {
       for (const count of [10, 11]) fixture(f => {
         const checks = regroupChecks();
-        f.checks = Array.from({ length: count - (aggregate ? 1 : 0) }, (_, i) => ({
+        f.checks = Array.from({ length: count - 1 }, (_, i) => ({
           ...checks[0], id: 100 + i, name: `cancelled-${i}`,
           details_url: `https://github.com/${repo}/actions/runs/500/job/${9100 + i}`,
         }));
-        if (aggregate) f.checks.push(checks[1]);
+        f.checks.push(checks[1]);
         f.mainError = true;
         const result = f.guard();
         expect(result.hold).toBe(count > 10);
-        // A purely cancelled set above the cap falls back to the existing main-green path (which reads main).
-        if (count > 10 && aggregate) expect(f.log.mock.calls[1][0]).toMatch(/10-job limit; operator must inspect failed jobs and enqueue manually/);
-        else if (count <= 10) expect(result.line).toContain('cancelled/regroup retry 1/2');
-        if (!(count > 10 && !aggregate)) expect(f.mainReads).toBeUndefined();
+        if (count > 10) expect(f.log.mock.calls[1][0]).toMatch(/10-job limit; operator must inspect failed jobs and enqueue manually/);
+        else expect(result.line).toContain('cancelled/regroup retry 1/2');
+        expect(f.mainReads).toBeUndefined();
         expect(f.exec.mock.calls.every(([, args]) => !args.includes('POST'))).toBe(true);
       });
     });
@@ -1065,7 +1083,7 @@ describe('merge-queue same-head failure admission', () => {
     });
     it('cancelled/regroup still holds past two failed removals even with fewer than two re-enqueues', () => {
       const result = retryDecision({ infra: 'cancelled-regroup', mqCancelledRetryMax: 2,
-        mergeState: 'CLEAN', cancelledNames: ['CI / integration'], derivedNames: [] },
+        mergeState: 'CLEAN', cancelledNames: ['CI / integration'], derivedNames: ['CI / test'] },
       [removed(), removed(), removed()]);
       expect(result.hold).toBe(true);
       expect(result.line).toMatch(/3 removals on this head/);
@@ -1073,7 +1091,7 @@ describe('merge-queue same-head failure admission', () => {
     it('a configured cancellation limit of one allows the first retry and holds the second', () => {
       for (const spent of [0, 1]) {
         const result = retryDecision({ infra: 'cancelled-regroup', mqCancelledRetryMax: 1,
-          mergeState: 'CLEAN', cancelledNames: ['CI / integration'], derivedNames: [] },
+          mergeState: 'CLEAN', cancelledNames: ['CI / integration'], derivedNames: ['CI / test'] },
         spent ? [removed(), added, removed()] : [removed()]);
         expect(result.hold).toBe(spent === 1);
         expect(result.line).toContain(spent ? 'already spent: 1/1' : 'cancelled/regroup retry 1/1');
@@ -1081,7 +1099,7 @@ describe('merge-queue same-head failure admission', () => {
     });
     it.each([0, 3, 4, 5, 100])('direct cancellation evidence rejects invalid bound %s', mqCancelledRetryMax => {
       expect(retryDecision({ infra: 'cancelled-regroup', mqCancelledRetryMax,
-        mergeState: 'CLEAN' }).line).toMatch(/invalid cancellation retry bound; operator must inspect/);
+        mergeState: 'CLEAN', cancelledNames: ['CI / integration'], derivedNames: ['CI / test'] }).line).toMatch(/invalid cancellation retry bound; operator must inspect/);
     });
     it.each(['1', '3', '4', '5'])('cancelled/regroup respects the historical cap with override %s', override => {
       const previous = process.env.WE_DRAIN_MQ_CANCELLED_RETRY_MAX;

@@ -795,8 +795,8 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
     const passingCheck = check => ['success', 'neutral', 'skipped'].includes(check.conclusion);
     const rawFailed = rawChecks.filter(check => !passingCheck(check));
     const cancelledRegroup = rawChecks.every(check => check.status === 'completed') && rawFailed.some(cancelled)
-      // A purely cancelled set above the job cap keeps the existing main-green path instead of this kind.
-      && !(rawFailed.length > MQ_INFRA_MAX_JOBS && rawFailed.every(cancelled))
+      && rawFailed.some(check => check.conclusion === 'failure'
+        && retryPolicy.mqAggregateJobs.includes(localJob(check.name)))
       && rawFailed.every(check => cancelled(check) || check.conclusion === 'failure'
         && retryPolicy.mqAggregateJobs.includes(localJob(check.name)));
     const attempts = inspectMqReruns({ checks: rawChecks, repo, commit: oid, removedAt });
