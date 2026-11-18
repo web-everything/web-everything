@@ -170,7 +170,7 @@ export function shadowSeatStatus(settings, { repo, pr, earnedShape, careLevel, r
 
 /** Count actual panel vendors; shadows keep their Claude seat. Unknown evidence refuses. */
 export function assertCrossVendorPanel(providers, builder) {
-  const vendors = { claude: 'Anthropic', shadow: 'Anthropic', codex: 'OpenAI', agy: 'Google', carbon: 'Google', 'agy-gemini': 'Google', 'agy-claude': 'Anthropic' };
+  const vendors = { claude: 'Anthropic', shadow: 'Anthropic', codex: 'OpenAI', carbon: 'Google', 'agy-gemini': 'Google', 'agy-claude': 'Anthropic' };
   const vendorOf = p => Object.hasOwn(vendors, p) ? vendors[p] : null;
   const panel = providers.map(vendorOf);
   const vendor = vendorOf(builder);

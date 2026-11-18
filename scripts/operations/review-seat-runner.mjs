@@ -23,6 +23,7 @@
  */
 import { runAgyReviewJuror, scrubPaths } from '../lib/agy-review-juror.mjs';
 import { appendShadowRow, buildShadowRow, compareShadowAnswers, isQuotaHeldShadow } from '../lib/review-shadow-agreement.mjs';
+import { resolveProviderCap } from '../lib/review-seat-caps.mjs';
 import { reserveShadowSession } from '../lib/review-shadow-budget.mjs';
 import { logReviewSeat } from '../lib/review-seat-provider.mjs';
 
@@ -51,6 +52,11 @@ export async function runSeatWithProvider(request, {
   }
   const model = directive.model;
   const runAgy = async (runModel = model) => {
+    // R1062: only Gemini 4 Carbon may shadow under cap 0; every other Gemini model keeps the seat cap (default 0).
+    if (/gemini/i.test(String(runModel)) && !/carbon/i.test(String(runModel)) && resolveProviderCap('agy-gemini') <= 0) {
+      logReviewSeat(log, 'review-seat: agy shadow skipped: non-Carbon Gemini seat cap is 0');
+      return { status: 'skipped', reasons: ['non-carbon gemini seat cap 0'] };
+    }
     if (directive.mode === 'shadow' && directive.dailyCap !== undefined) {
       const admission = reserveSession({ dailyCap: directive.dailyCap, now: now() });
       if (!admission.allowed) {

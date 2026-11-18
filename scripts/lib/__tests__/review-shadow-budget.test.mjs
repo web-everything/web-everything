@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,6 +11,9 @@ import { runSeatWithProvider } from '../../operations/review-seat-runner.mjs';
 const resolve = (options = {}) => resolveReviewSeatSafeguards({
   env: {}, platform: {}, readFile: () => '{}', log: () => {}, ...options,
 });
+// Exercise daily-budget and quota admission with non-Carbon Gemini explicitly enabled.
+beforeEach(() => vi.stubEnv('WE_REVIEW_SEAT_CAP_AGY_GEMINI', '5'));
+afterEach(() => vi.unstubAllEnvs());
 describe('high-care shadow admission', () => {
   const settings = loadReviewSeatSettings({ safeguards: resolve({ env: { WE_REVIEW_SHADOW_AGY_ENABLED: 'true' } }), log: () => {} });
   it.each(['scripts/lib/review-seat-provider.mjs', 'scripts/lib/gate-config.mjs'])('seats an earned high-care PR: %s', (file) => {

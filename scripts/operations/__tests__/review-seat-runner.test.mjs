@@ -227,7 +227,7 @@ describe('void-on-escape — the agy juror\'s three escape checks (real git, fak
 
 describe('the agreement report (#76a identity, #76b sameAs through the PR table)', () => {
   const carbonRow = (extra = {}) => ({ repo: 'o/r', pr: 1, model: 'gemini-4-carbon-high', servedModel: 'gemini-4-carbon-high',
-    status: 'ok', overlap: { jaccard: 1, matched: 1, claudeCount: 1, agyCount: 1 }, verdictAgree: true, lens: 'correctness', ...extra });
+    status: 'ok', overlap: { jaccard: 1, matched: 1, claudeCount: 1, agyCount: 1, claudeOnly: 0, agyOnly: 0 }, verdictAgree: true, lens: 'correctness', ...extra });
   it('counts each PR once across heads, runs and lenses, requiring every compared Carbon verdict to agree', () => {
     const rows = [carbonRow(), carbonRow({ lens: 'security' }), carbonRow({ head: 'next', runId: 'next' }),
       carbonRow({ pr: 2 }), carbonRow({ pr: 2, verdictAgree: false }),
@@ -237,13 +237,36 @@ describe('the agreement report (#76a identity, #76b sameAs through the PR table)
     expect(summarizeCarbonPromotion(rows, { threshold: 3 }).reached).toBe(false);
     expect(rows).toEqual(before);
   });
-  it('excludes other models, failed, voided, skipped, uncompared and fallback attempts and missing PR identity', () => {
-    const ignored = [null, carbonRow({ servedModel: 'gemini-4-argon-high' }), carbonRow({ servedModel: undefined }),
-      ...['failed', 'voided', 'skipped'].map(status => carbonRow({ status })),
-      carbonRow({ overlap: null }), carbonRow({ fellBackTo: 'routing-model' }),
+  it('excludes non-Carbon attempts and missing PR identity without poisoning a valid PR', () => {
+    const ignored = [null, carbonRow({ model: 'gemini-4-argon-high', servedModel: 'gemini-4-argon-high' }),
       carbonRow({ repo: null }), carbonRow({ pr: null })];
     expect(summarizeCarbonPromotion(ignored)).toEqual({ agreeingPrs: 0, comparedPrs: 0, threshold: 10, reached: false });
     expect(summarizeCarbonPromotion([carbonRow(), ...ignored.map(row => row && { ...row, verdictAgree: false })]).agreeingPrs).toBe(1);
+  });
+  it.each([
+    { status: 'failed', servedModel: null },
+    { status: 'voided' },
+    { status: 'skipped' },
+    { overlap: null },
+    { servedModel: undefined },
+    { servedModel: 'gemini-4-argon-high' },
+    { fellBackTo: 'routing-model' },
+    { model: 'gemini-4-argon-high', status: 'failed' },
+  ])('incomplete Carbon attempt %j poisons its PR even alongside an agreeing row', extra => {
+    const poisoned = carbonRow(extra);
+    const summary = { agreeingPrs: 0, comparedPrs: 1, threshold: 10, reached: false };
+    expect(summarizeCarbonPromotion([poisoned])).toEqual(summary);
+    expect(summarizeCarbonPromotion([carbonRow(), poisoned])).toEqual(summary);
+    expect(summarizeCarbonPromotion([poisoned, carbonRow()])).toEqual(summary);
+    expect(summarizeCarbonPromotion([carbonRow(), poisoned, carbonRow({ pr: 2 })]))
+      .toEqual({ ...summary, agreeingPrs: 1, comparedPrs: 2 });
+  });
+  it.each([
+    { claudeOnly: 1, agyOnly: 0 },
+    { claudeOnly: 0, agyOnly: 1 },
+  ])('requires exact finding agreement: %j disqualifies an otherwise agreeing PR', overlap => {
+    expect(summarizeCarbonPromotion([carbonRow(), carbonRow({ overlap })]))
+      .toMatchObject({ agreeingPrs: 0, comparedPrs: 1 });
   });
   it('requires real finding overlap or a clean accept as well as verdict agreement', () => {
     const comparison = (claude, agy) => compareShadowAnswers({ claude: { findings: claude }, agy: { findings: agy } });
@@ -258,7 +281,7 @@ describe('the agreement report (#76a identity, #76b sameAs through the PR table)
     expect(summarizeCarbonPromotion([carbonRow(), different]).agreeingPrs).toBe(0);
   });
   it.each([undefined, null, '', 'unknown', 'gemini-4-argon-high'])('refuses requested Carbon without served Carbon evidence: %s', servedModel => {
-    expect(summarizeCarbonPromotion([carbonRow({ servedModel })]).comparedPrs).toBe(0);
+    expect(summarizeCarbonPromotion([carbonRow({ servedModel })])).toMatchObject({ agreeingPrs: 0, comparedPrs: 1 });
   });
   it('refuses invalid and oversized explicit thresholds rather than claiming promotion', () => {
     for (const threshold of [0, -1, 1.5, '1', NaN, Number.MAX_SAFE_INTEGER + 1]) {

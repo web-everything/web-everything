@@ -189,11 +189,11 @@ export function summarizeCarbonPromotion(rows = [], { threshold = 10 } = {}) {
   const prs = new Map();
   const isCarbon = (row) => `${row?.servedModel ?? ''} ${row?.model ?? ''}`.toLowerCase().includes('carbon');
   for (const row of rows) {
-    if (!isCarbon(row) || Object.hasOwn(row, 'fellBackTo') || row.repo == null || row.pr == null) continue;
+    if (!isCarbon(row) || row.repo == null || row.pr == null) continue;
     const key = `${row.repo}#${row.pr}`;
     // Any failed, voided, skipped, uncompared or unserved Carbon trial on the PR disqualifies it: incomplete evidence.
     const complete = typeof row.servedModel === 'string' && row.servedModel.toLowerCase().includes('carbon')
-      && row.status === 'ok' && Boolean(row.overlap);
+      && row.status === 'ok' && Boolean(row.overlap) && !Object.hasOwn(row, 'fellBackTo');
     // Carbon must match every Claude finding and add none of its own (no Claude-only, no Carbon-only findings).
     const findingsAgree = complete && (row.overlap.claudeOnly ?? row.overlap.claudeCount) === 0
       && (row.overlap.agyOnly ?? row.overlap.agyCount) === 0;

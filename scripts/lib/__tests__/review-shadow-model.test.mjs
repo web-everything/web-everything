@@ -2,7 +2,7 @@ import { callsUsedToday, callsUsedTodayForProvider, reviewSeatCapUsage } from '.
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, it, expect } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { resolveReviewSeatSafeguards, resolveShadowSeatModel, resolveShadowPromotionPrs, resolveShadowPromotionReplaces, SHADOW_AGY_MODEL_ENV } from '../review-seat-settings.mjs';
 import { resolveProviderCap } from '../review-seat-caps.mjs';
 import { assertCrossVendorPanel, settingsFromRoutingPolicy, shadowSeatStatus, seatProviderDirective, loadReviewSeatSettings } from '../review-seat-provider.mjs';
@@ -30,6 +30,10 @@ async function run(runs, extraDirective = {}) {
   return { ...answer, rows, logs, models };
 }
 const ok = { status: 'ok', sessionId: 'agy', value: { summary: 'agy', findings: [finding] } };
+
+// These legacy Argon trials explicitly opt in to non-Carbon Gemini execution.
+beforeEach(() => vi.stubEnv('WE_REVIEW_SEAT_CAP_AGY_GEMINI', '5'));
+afterEach(() => vi.unstubAllEnvs());
 
 describe('shadow model cascade', () => {
   const readFile = () => JSON.stringify({ shadowSeats: { antigravity: { model } } });
@@ -84,6 +88,22 @@ describe('Carbon promotion settings and advisory guards', () => {
     expect(resolveProviderCap('agy-gemini', { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '5' })).toBe(5);
     expect(resolveProviderCap('agy-gemini', { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' })).toBe(0);
     expect(resolveProviderCap('agy-gemini', { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '-1' })).toBe(0);
+  });
+  it('skips non-Carbon Gemini shadow at cap zero while Carbon runs', async () => {
+    vi.stubEnv('WE_REVIEW_SEAT_CAP_AGY_GEMINI', '0');
+    const skipped = await run([ok]);
+    expect(skipped.models).toEqual([]);
+    expect(skipped.value.findings).toEqual(claudeAnswer.findings);
+    expect(skipped.value.shadow).toMatchObject({ status: 'skipped', reasons: ['non-carbon gemini seat cap 0'] });
+    expect(skipped.rows).toHaveLength(1);
+    expect(skipped.rows[0]).toMatchObject({ model, status: 'skipped', verdictAgree: null });
+    expect(skipped.logs.join(' ')).not.toContain('FALLING BACK');
+
+    const carbonModel = 'gemini-4-carbon-high';
+    const carbon = await run([{ ...ok, servedModel: carbonModel }], { model: carbonModel });
+    expect(carbon.models).toEqual([carbonModel]);
+    expect(carbon.value.findings).toEqual(claudeAnswer.findings);
+    expect(carbon.rows[0]).toMatchObject({ model: carbonModel, servedModel: carbonModel, status: 'ok', verdictAgree: true });
   });
   it('keeps the Claude answer when Carbon disagrees in shadow', async () => {
     const result = await run([{ ...ok, value: { findings: [] } }], { model: 'gemini-4-carbon-high' });
@@ -325,9 +345,19 @@ describe('Carbon replacement target', () => {
       expect(() => assertCrossVendorPanel(panel, builder)).toThrow(/operator must replace an existing seat/);
     }
   });
+  it('refuses the ambiguous agy panel provider for a Claude builder', () => {
+    expect(() => assertCrossVendorPanel(['agy'], 'claude')).toThrow(/operator must replace an existing seat/);
+  });
+  it.each(['carbon', 'agy-gemini'])('recognizes %s as Google and agy-claude as Anthropic', provider => {
+    expect(() => assertCrossVendorPanel([provider], 'claude')).not.toThrow();
+    expect(() => assertCrossVendorPanel([provider], 'agy-gemini')).toThrow(/operator must replace an existing seat/);
+    expect(() => assertCrossVendorPanel(['agy-claude'], 'claude')).toThrow(/operator must replace an existing seat/);
+    expect(() => assertCrossVendorPanel(['agy-claude'], provider)).not.toThrow();
+  });
 });
 
 it.each([0, 1])('Carbon shadow respects daily cap %i separately from shared and per-provider seat caps', async dailyCap => {
+  vi.stubEnv('WE_REVIEW_SEAT_CAP_AGY_GEMINI', '0');
   const root = mkdtempSync(join(tmpdir(), 'carbon-budget-'));
   const rows = [];
   const reservations = [], launches = [];
