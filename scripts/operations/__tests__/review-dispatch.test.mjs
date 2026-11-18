@@ -65,6 +65,15 @@ describe('planReviewDispatch', () => {
     expect(() => planReviewDispatch({ pr: 1, repo: 'not-a-slug' })).toThrow(/not a constellation repo/);
     expect(() => planReviewDispatch({ pr: 1, repo: '' })).toThrow(/not a constellation repo/);
   });
+
+  it('refuses longshore without review capability even when its checkout exists', () => {
+    expect(() => planReviewDispatch({ pr: 1, repo: repoProfile('longshore').slug, checkoutExists: () => true }))
+      .toThrow(/not a constellation repo/);
+  });
+
+  it.each(['we', 'frontierui', 'plateau-app'])('still accepts review-capable %s', (key) => {
+    expect(planReviewDispatch({ pr: 1, repo: repoProfile(key).slug, checkoutExists: () => true }).repoKey).toBe(key);
+  });
 });
 
 describe('reviewSessionSlug', () => {
