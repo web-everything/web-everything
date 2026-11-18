@@ -4578,3 +4578,12 @@ wrappers before splitting options and their values. Resume validation consumes o
 form. Unsupported shell syntax/expansions and excessive wrapper nesting refuse with the direct
 literal-argv fallback. Guards receive a frozen view; guarded launches forward validated argv
 snapshots and refuse mutation of the caller's argv or shell execution option.
+
+The continued R37 rows require native resume evidence whenever a descriptor supplies an id or
+selects a resume mode. Bound/native/proxy callables expose no inspectable bound arguments or
+receiver, so refuse them with the explicit unbound-primitive/literal-argv fallback. The structural
+table covers agent words in any invocation argument, imported and conditional primitive aliases,
+and migration fingerprints over all argument bindings. Fingerprints hash complete initializer,
+assignment and import text (including transitive initializer dependencies); unresolved values do
+not exempt edits to those definitions. Keep matching resume, safe-alias and unchanged-binding
+controls beside the refusal rows. Migration snapshots pin exact historical calls and counts.

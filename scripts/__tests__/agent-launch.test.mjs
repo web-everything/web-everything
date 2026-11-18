@@ -40,12 +40,31 @@ it.each([
   { name: 'R37.4 frozen guard view mutation', command: 'claude', argv: ['--resume', SID], resumeId: SID, mutateView: true, refused: true },
   { name: 'R37.4 shell option mutation', command: 'claude', argv: ['--resume', SID], resumeId: SID, mutateShell: true, refused: true },
   { name: 'R37.4 observing guard control', command: 'claude', argv: ['--resume', SID], resumeId: SID, guard: true },
-])('$name', ({ source, command = 'codex', argv = ['exec', '-'], resumeId = null, refused, mutate, mutateView, mutateShell, shell, guard, reason }) => {
+  { name: 'R37.5 descriptor id without invocation evidence', resumeId: SID, noArgs: true, refused: true },
+  { name: 'R37.5 descriptor id without native resume flag', resumeId: SID, refused: true },
+  ...['claude-resume', 'codex-exec-resume'].flatMap(mode => [
+    { name: `R37.5 ${mode} without invocation evidence`, mode, noArgs: true, refused: true },
+    { name: `R37.5 ${mode} without native resume flag`, mode, refused: true },
+  ]),
+  ...['preset', 'renamed', 'receiver', 'proxy'].map(opaque => ({
+    name: `R37.5 uninspectable ${opaque} primitive refuses with explicit unbound fallback`,
+    opaque, command: 'claude', argv: ['--resume', SID], resumeId: SID, refused: true, reason: 'unbound primitive' })),
+  { name: 'R37.5 bound primitive with no call-time arguments', opaque: 'preset', noArgs: true, resumeId: SID, refused: true },
+  { name: 'R37.5 bound fresh primitive also refuses', opaque: 'preset', refused: true },
+  { name: 'R37.5 explicit unbound matching resume control', command: 'claude', argv: ['--resume', SID], resumeId: SID, mode: 'claude-resume' },
+  { name: 'R37.5 explicit unbound fresh control', command: 'claude', argv: ['-p', 'hello'] },
+])('$name', ({ source, command = 'codex', argv = ['exec', '-'], resumeId = null, mode = 'worker-result-probe',
+  refused, mutate, mutateView, mutateShell, shell, guard, reason, opaque, noArgs }) => {
   const primitive = vi.fn(), original = [...argv], findings = source ? findAgentLaunches({ 'scripts/r37-audit.mjs': source }) : [];
+  let invoke = primitive;
+  if (opaque === 'preset' || opaque === 'renamed') invoke = primitive.bind(null, 'claude', ['--resume', 'other-id']);
+  if (opaque === 'renamed') Object.defineProperty(invoke, 'name', { value: 'start' });
+  if (opaque === 'receiver') invoke = Function.prototype.call.bind(primitive, null, 'claude', ['--resume', 'other-id']);
+  if (opaque === 'proxy') invoke = new Proxy(primitive, { apply(target) { return target('claude', ['--resume', 'other-id']); } });
   const options = shell || mutateShell ? { shell: shell ?? false } : undefined;
   const execute = () => {
     if (findings.length) throw new Error('structural launch gate refused');
-    return launchAgent({ mode: 'worker-result-probe', resumeId, log() {},
+    return launchAgent({ mode, resumeId, log() {},
       ...((mutate || mutateView || mutateShell || guard) ? { launchGuard(view) {
         expect(Object.isFrozen(view)).toBe(true);
         expect(Object.isFrozen(view.argv)).toBe(true);
@@ -54,7 +73,7 @@ it.each([
         if (mutateShell) options.shell = true;
         return true;
       } } : {}),
-    }, primitive, command, argv, ...(options ? [options] : []));
+    }, invoke, ...(noArgs ? [] : [command, argv, ...(options ? [options] : [])]));
   };
   if (refused) {
     if (source) expect(findings.some(finding => /^(?:start|go)$/.test(finding.kind))).toBe(true);
@@ -139,11 +158,12 @@ describe('launch refusal', () => {
 describe('transparent execution', () => {
   it.each(AGENT_LAUNCH_MODES.flatMap(mode => ['spawn', 'exec'].map(kind => [mode, kind])))
   ('preserves argv, env, cwd, options, return identity for %s via %s', (mode, kind) => {
-    const argv = mode === 'codex-exec-resume' ? ['exec', 'resume', SID, 'literal $() `text`', '\n'] : ['literal $() `text`', '\n'];
+    const argv = mode === 'codex-exec-resume' ? ['exec', 'resume', SID, 'literal $() `text`', '\n']
+      : mode === 'claude-resume' ? ['--resume', SID, 'literal $() `text`', '\n'] : ['literal $() `text`', '\n'];
     const env = { PATH: 'fixture-bin', TOKEN: 'fixture-token' };
     const options = { cwd: 'fixture-lane', env, stdio: ['ignore', 'pipe', 7], timeout: 12, maxBuffer: 48, detached: true };
     const result = {}, io = { [kind]: vi.fn(() => result) }, primitive = io[kind];
-    expect(launchAgent({ mode, resumeId: mode === 'codex-exec-resume' ? SID : null }, primitive, mode.startsWith('codex') ? 'codex' : 'claude', argv, options)).toBe(result);
+    expect(launchAgent({ mode, resumeId: mode.endsWith('-resume') ? SID : null }, primitive, mode.startsWith('codex') ? 'codex' : 'claude', argv, options)).toBe(result);
     expect(primitive.mock.calls).toEqual([[mode.startsWith('codex') ? 'codex' : 'claude', argv, options]]);
     expect(primitive.mock.calls[0][1]).toBe(argv);
     expect(primitive.mock.calls[0][2]).toBe(options);
@@ -454,10 +474,13 @@ describe('an empty descriptor resumeId never satisfies a missing native id', () 
       expect(log).toHaveBeenCalledWith(expect.stringContaining('native resume id'));
     }
   });
-  it('still launches a real native id, and a fresh launch with an empty resumeId', () => {
+  it('refuses a fresh launch with a supplied empty id; accepts a real resume id or an absent fresh id', () => {
     const primitive = vi.fn();
+    expect(() => launchAgent({ mode: 'claude-print', resumeId: '', log() {} }, primitive, 'claude', ['-p', 'hello']))
+      .toThrow('native resume id');
+    expect(primitive).not.toHaveBeenCalled();
     launchAgent({ mode: 'claude-resume', resumeId: SID }, primitive, 'claude', ['--resume', SID]);
-    launchAgent({ mode: 'claude-print', resumeId: '' }, primitive, 'claude', ['-p', 'hello']);
+    launchAgent({ mode: 'claude-print', resumeId: null }, primitive, 'claude', ['-p', 'hello']);
     expect(primitive).toHaveBeenCalledTimes(2);
   });
 });

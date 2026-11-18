@@ -181,7 +181,12 @@ function normaliseCommand(words, depth = 0, shell = false) {
 }
 
 /** One entry point for array argv, command strings, and nested literal shell/env wrappers. */
-function normaliseInvocation(args) {
+function normaliseInvocation(args, primitive) {
+  // JS exposes neither [[BoundArguments]] nor a proxy's target/receiver. Even apparently matching
+  // call-time argv cannot prove what an opaque callable will execute. Require an unbound primitive.
+  if (typeof primitive === 'function' && Function.prototype.toString.call(primitive).includes('[native code]')) {
+    throw new SyntaxError('opaque primitive; pass an unbound primitive and explicit invocation arguments');
+  }
   if (!args.length) return []; // Primitive-only injection is supported by existing callers/tests.
   const [command, argv] = args;
   // A shell joining array argv destroys word boundaries. Require an explicit, literal -c script instead.
@@ -217,9 +222,9 @@ export function launchAgent(descriptor, primitive, ...args) {
   if (!modes.has(descriptor.mode)) refuse(`unknown mode ${String(descriptor.mode)}`, descriptor, log);
   if (!Object.hasOwn(descriptor, 'resumeId')) refuse('resumeId key is required', descriptor, log);
   let normalised;
-  try { normalised = normaliseInvocation(args); }
+  try { normalised = normaliseInvocation(args, primitive); }
   catch (cause) {
-    refuse('cannot parse native resume id; use literal argv and a plain resume id', descriptor, log, cause);
+    refuse('cannot parse native resume id; use literal argv and a plain resume id with an unbound primitive', descriptor, log, cause);
   }
   const nativeIds = normalised.flatMap(command => command.resumeIds);
   // Snapshot the validated words before the guard can mutate a captured argv reference.
@@ -227,7 +232,7 @@ export function launchAgent(descriptor, primitive, ...args) {
   const validatedShell = args[2]?.shell;
   // A resume flag with no value reads as an empty native id: that is a MISSING id, never one an empty/blank
   // descriptor resumeId can "equal". Require plain literal ids: never shell expansions or metacharacters.
-  if ((descriptor.mode === 'codex-exec-resume' && nativeIds.length === 0)
+  if (((descriptor.resumeId != null || descriptor.mode.endsWith('-resume')) && nativeIds.length === 0)
     || nativeIds.some(id => typeof id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]*(?![\s\S])/.test(id) || descriptor.resumeId !== id)) {
     refuse('resumeId must equal the native resume id in argv', descriptor, log);
   }
