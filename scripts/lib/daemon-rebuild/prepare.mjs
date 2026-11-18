@@ -596,7 +596,15 @@ export async function prepareRebuild({
           registered: (r) => registeredRefs.has(r) || overlaysBefore.some((o) => o?.ref === r),
         }),
         contentInBuild: (sha, build) => contentContainedInBuild(git, sha, build),
-        removedForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
+        removedForMain: (ref, sha) => {
+          if (plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main'))) return true;
+          // Historical merge retirement vouches only for this exact live tip, while still unregistered.
+          // The shared reader rejects the entire log on unreadable input; any later event vetoes this proof.
+          if (registeredRefs.has(ref) || overlaysBefore.some((o) => o?.ref === ref)) return false;
+          const last = readOverlayEvents().findLast((event) => event?.ref === ref);
+          return !!last && ['auto-retired', 'auto-dropped'].includes(last.kind) && last.tip === sha
+            && typeof last.reason === 'string' && /merged|in-main|in main/i.test(last.reason);
+        },
         // R508: a forced record is only adoptable while its rollback watch is intact (read under this write lock).
         forcedWatch: (sha) => forcedWatchStatus(root, stEnv, sha),
       });
