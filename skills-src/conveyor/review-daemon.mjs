@@ -1679,13 +1679,16 @@ export function countLiveReviewRounds(lines, { isScriptFile = null, isOptionPath
  *  (`scripts/settings/review-concurrency.json`, source logged by the cascade). Counts live `review-job.mjs` /
  *  `review-loop-cli.mjs` processes (a round is one job, or one bare loop). An unreadable `ps` fails closed (no new
  *  review this tick). Revert condition: see the settings file's comment. */
+const DEFAULT_MAX_LIVE_REVIEW_ROUNDS = 8;
 export function liveReviewRoundBudget({ env = process.env, listCommands = () => execFileSync('ps', ['-Aww', '-o', 'pid=,ppid=,command='], { encoding: 'utf8', timeout: 10_000, maxBuffer: 32 * 1024 * 1024 }),
   toolPath = join(dirname(fileURLToPath(import.meta.url)), '../../scripts/settings/review-concurrency.json') } = {}) {
   let tool;
   try { tool = JSON.parse(readFileSync(toolPath, 'utf8')); } catch { tool = undefined; }
+  // Unreadable settings fail closed to the code default, never to "unlimited".
+  if (tool === undefined) process.stderr.write(`review-daemon: review-concurrency settings unreadable; using code default maxLiveReviewRounds=${DEFAULT_MAX_LIVE_REVIEW_ROUNDS}\n`);
   const raw = env?.WE_REVIEW_MAX_LIVE_ROUNDS;
   const r = cascadePolicy('reviewConcurrency', tool && { maxLiveReviewRounds: tool.maxLiveReviewRounds }, {
-    env, standard: { maxLiveReviewRounds: null },
+    env, standard: { maxLiveReviewRounds: DEFAULT_MAX_LIVE_REVIEW_ROUNDS },
     envValues: { maxLiveReviewRounds: typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : undefined },
     valid: { maxLiveReviewRounds: (v) => v === null || (Number.isSafeInteger(v) && v >= 1) },
   });

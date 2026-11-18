@@ -71,3 +71,11 @@ describe('shared review seats across repos', () => {
     expect(result.deferredForCapReason).toBe(liveReviewBudget.reason ?? null);
   });
 });
+
+describe('liveReviewRoundBudget with unreadable cap settings', () => {
+  it('falls back to the code default of 8 instead of unlimited', async () => {
+    const { liveReviewRoundBudget } = await import('../../../skills-src/conveyor/review-daemon.mjs');
+    const budget = liveReviewRoundBudget({ env: {}, toolPath: '/nonexistent/review-concurrency.json', listCommands: () => '' });
+    expect(budget).toMatchObject({ max: 8, live: 0, left: 8 });
+  });
+});
