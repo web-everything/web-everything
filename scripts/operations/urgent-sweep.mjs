@@ -219,14 +219,17 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
         }
         const data = await deps.checks(r);
         let unload = Array.isArray(data?.check_runs) && data.check_runs.some(c => failedCheck(c, r.sha));
-        let required, checks, unloadReason;
+        let required, checks, requiredSucceeded, unloadReason;
         if (!unload) {
           validateChecks(data, r.sha);
           required = await deps.required(r);
           if (!Array.isArray(required) || !required.includes('test')) throw new Error('unreadable required CI jobs');
           checks = data.check_runs.filter(c => c.app.id === TEST_CHECK_APP_ID
             && required.some(n => c.name === n || c.name.startsWith(`${n} (`)));
-          if (!checks.some(c => c.status === 'completed')) {
+          requiredSucceeded = testWorkflowBound(testCheckEvidence(data, r.sha), data.workflows, r.sha, data.testWorkflowPath)
+            && required.every(n => checks.some(c => c.name === n || c.name.startsWith(`${n} (`)))
+            && checks.every(c => c.status === 'completed' && c.conclusion === 'success');
+          if (!requiredSucceeded) {
             const loadedAt = Date.parse(r.at), now = Date.parse(deps.now());
             if (!Number.isFinite(loadedAt) || !Number.isFinite(now) || now < loadedAt)
               throw new Error('unreadable urgent load timestamp; inspect CI or unload manually');
@@ -249,10 +252,7 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           await notifyUnload(id, r, receipt, notificationErrors);
           report({ id, status: 'unloaded-pending-adoption' });
         } else {
-          if (testWorkflowBound(testCheckEvidence(data, r.sha), data.workflows, r.sha, data.testWorkflowPath)
-            && required.every(n => checks.some(c => c.name === n || c.name.startsWith(`${n} (`)))
-            && checks.every(c => c.status === 'completed' && c.conclusion === 'success')
-            && data.check_runs.every(c => c.status === 'completed')) {
+          if (requiredSucceeded && data.check_runs.every(c => c.status === 'completed')) {
             const at = deps.now(), greenAt = green.get(id) ?? at;
             if (!Number.isFinite(Date.parse(at)) || !Number.isFinite(Date.parse(greenAt))) throw new Error('unreadable green monitoring timestamp');
             const status = 'monitoring-green';

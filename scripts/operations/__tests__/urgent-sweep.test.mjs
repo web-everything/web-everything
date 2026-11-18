@@ -66,9 +66,31 @@ describe('urgent CI sweep', () => {
     expect(f.d.escalate.mock.calls.some(([p]) => p.evidence.includes('urgent load has no CI verdict after 6h'))).toBe(alerted);
     expect(f.d.remove.mock.calls.length > 0).toBe(removed);
   });
-  it('keeps an old load with a completed required check and another pending check', async () => {
-    const f = fixture([check('changes'), check('test', null, { status: 'queued' })]);
-    f.loads[0] = { ...load, at: '2026-11-01T12:00:00Z' };
+  describe.each([
+    ['queued test', () => [check('changes'), check('test-shard'), check('test', null, { status: 'queued' })]],
+    ['missing test', () => [check('changes'), check('test-shard')]],
+    ['queued prerequisite', () => [check('changes'), check('test-shard', null, { status: 'queued' }), check('test')]],
+    ['missing prerequisite', () => [check('changes'), check('test')]],
+    ['skipped prerequisite', () => [check('changes'), check('test-shard', 'skipped'), check('test')]],
+    ['unbound test', () => [check('changes'), check('test-shard'), check('test', 'success', { check_suite: { id: 8 } })]],
+  ])('required result timeout with %s despite completed checks', (_, rows) => {
+    it.each([
+      [6 * 60 - 1, false, false],
+      [6 * 60, true, false],
+      [24 * 60 - 1, true, false],
+      [24 * 60, true, true],
+    ])('at %i minutes escalated=%s unloaded=%s', async (minutes, alerted, unloaded) => {
+      const f = fixture([...rows(), check('unrelated')]);
+      f.d.now = () => new Date(Date.parse(load.at) + minutes * 60 * 1000).toISOString();
+      expect(await f.run()).toMatchObject({ results: [{ status: unloaded ? 'unloaded-pending-adoption' : 'pending' }] });
+      expect(f.d.escalate.mock.calls.some(([p]) => p.evidence.includes('urgent load has no CI verdict after 6h'))).toBe(alerted);
+      expect(f.d.remove).toHaveBeenCalledTimes(unloaded ? 1 : 0);
+      if (unloaded) expect(f.settlements()[0]).toMatchObject({ unloadReason: expect.stringContaining('no CI verdict after 24h') });
+    });
+  });
+  it('does not time out successful required results while an unrelated check remains queued', async () => {
+    const f = fixture([...required.map(n => check(n)), check('unrelated', null, { status: 'queued' })]);
+    f.d.now = () => new Date(Date.parse(load.at) + 24 * 60 * 60 * 1000).toISOString();
     expect(await f.run()).toMatchObject({ results: [{ status: 'pending' }] });
     expect(f.d.remove).not.toHaveBeenCalled();
     expect(f.d.escalate).not.toHaveBeenCalled();
