@@ -565,7 +565,7 @@ describe('loopFailureLabel — the loop\'s own error is recorded, never swallowe
 
 
 describe('CLI exit evidence', () => {
-  const marker = () => JSON.parse(readFileSync(join(dir, 'review-we-42.exit.json'), 'utf8'));
+  const marker = () => JSON.parse(readFileSync(join(dir, 'diagnostics', 'review-we-42.exit.json'), 'utf8'));
   function hooks() {
     const proc = new EventEmitter();
     proc.pid = 123;
@@ -576,7 +576,7 @@ describe('CLI exit evidence', () => {
   it('skips an unknown slug, then synchronously records normal exit', () => {
     const { proc, setSlug } = hooks();
     proc.emit('exit', 1);
-    expect(readdirSync(dir)).toEqual([]);
+    expect(readdirSync(dir)).not.toContain('diagnostics');
     setSlug('review-we-42');
     proc.emit('exit', 7);
     expect(marker()).toEqual({ pid: 123, exitCode: 7, signal: null, endedAt: expect.any(String) });

@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { afterEach, beforeEach, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { diagnoseEndedJob, summarizeDiagnosis, writeEndedJobDiagnosis } from '../review-job-end-diagnosis.mjs';
@@ -8,7 +8,7 @@ let dir;
 const slug = 'review-we-42';
 const pid = 123;
 const diagnose = () => diagnoseEndedJob({ slug, pid, dir });
-beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'job-diagnosis-')); });
+beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'job-diagnosis-')); mkdirSync(join(dir, 'diagnostics')); });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 it('keeps the last 40 lines, redacts tokens, and chooses the last error over later progress', () => {
   const token = 'ghp_abcdefgh12345678';
@@ -30,23 +30,23 @@ it('bounds oversized input in bytes and truncates the chosen line to 200 charact
   expect(d.lastErrorLine).toHaveLength(200);
 });
 it('names the log-inspection fallback for an oversized partial line', () => {
-  writeFileSync(join(dir, `${slug}.log`), 'x'.repeat(100000));
+  writeFileSync(join(dir, `${slug}.log`), 'x'.repeat(5000000));
   expect(diagnose().tail).toContain('inspect job log');
 });
 it.each([123, 456])('accepts only a matching exit-marker pid (%s)', markerPid => {
-  writeFileSync(join(dir, `${slug}.exit.json`), JSON.stringify({ pid: markerPid, exitCode: null, signal: 'SIGTERM' }));
+  writeFileSync(join(dir, 'diagnostics', `${slug}.exit.json`), JSON.stringify({ pid: markerPid, exitCode: null, signal: 'SIGTERM' }));
   const d = diagnose();
   expect(d.marker).toBe(markerPid === pid);
   expect(d.signal).toBe(markerPid === pid ? 'SIGTERM' : 'unknown (no exit marker: killed hard or crashed)');
 });
 it('handles missing log and malformed marker, then atomically persists the full diagnosis', () => {
-  writeFileSync(join(dir, `${slug}.exit.json`), '{');
+  writeFileSync(join(dir, 'diagnostics', `${slug}.exit.json`), '{');
   const d = diagnose();
   expect(d.tail).toBe('');
   expect(d.lastErrorLine).toBe('');
   expect(d.marker).toBe(false);
   writeEndedJobDiagnosis({ slug, pid, dir }, d);
-  expect(JSON.parse(readFileSync(join(dir, `${slug}.ended.json`), 'utf8'))).toEqual({ pid, ...d });
+  expect(JSON.parse(readFileSync(join(dir, 'diagnostics', `${slug}.ended.json`), 'utf8'))).toEqual({ pid, ...d });
 });
 it('falls back to the last nonempty line and makes summaries one terminal-safe line', () => {
   writeFileSync(join(dir, `${slug}.log`), 'starting\nfinished\n\n');

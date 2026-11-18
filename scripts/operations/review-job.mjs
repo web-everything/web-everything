@@ -104,12 +104,12 @@ import { publishAttention } from './needs-you-feed.mjs';
 import { randomUUID } from 'node:crypto';
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
-import { basename, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { assertNotALaneCheckout, REPO_ROOT, resolveGhShimSettingsEnv } from './dispatch-lane-io.mjs';
 import {
-  decideJobClaim, jobLogPath, jobRecordPath, pidAlive, readJobRecord, removeJobRecord, reviewJobsDir, writeJobRecord,
+  decideJobClaim, diagnosticPath, jobLogPath, pidAlive, readJobRecord, removeJobRecord, reviewJobsDir, writeJobRecord,
 } from './review-job-store.mjs';
 import { assertMainNotStale, dispatchReview, isReviewCodePath, planReviewDispatch } from './review-dispatch.mjs';
 import { runReport } from './completion-cli.mjs';
@@ -1566,8 +1566,8 @@ export function installReviewJobExitHooks({ proc = process, dir = reviewJobsDir(
   const record = (exitCode, signal) => {
     try {
       if (!slug) return;
-      const path = jobRecordPath(slug, dir).replace(/\.json$/, '.exit.json');
-      mkdirSync(dir, { recursive: true });
+      const path = diagnosticPath(slug, dir, 'exit');
+      mkdirSync(dirname(path), { recursive: true });
       writeFileSync(path, `${JSON.stringify({ pid: proc.pid, exitCode, signal, endedAt: new Date().toISOString() })}\n`);
     } catch { /* Exit diagnostics must never prevent termination. */ }
   };

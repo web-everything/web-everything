@@ -44,6 +44,8 @@ function assertSlug(slug) {
 }
 export function jobRecordPath(slug, dir = reviewJobsDir()) { assertSlug(slug); return join(dir, `${slug}.json`); }
 export function jobLogPath(slug, dir = reviewJobsDir()) { assertSlug(slug); return join(dir, `${slug}.log`); }
+/** Exit marker / ended diagnosis live in a subdirectory so no valid slug can collide with a live record name. */
+export function diagnosticPath(slug, dir, kind) { assertSlug(slug); return join(dir, 'diagnostics', `${slug}.${kind}.json`); }
 
 /** @returns {object|null} the record, or null when absent/unparseable (an unparseable record is not a live job). */
 export function readJobRecord(slug, dir = reviewJobsDir()) {
@@ -106,7 +108,7 @@ export function jobRecordToAgentRow(record) {
  */
 export function listReviewJobAgents({ dir = reviewJobsDir(), isAlive = pidAlive, readOnly = false } = {}) {
   let names;
-  try { names = readdirSync(dir).filter((n) => n.endsWith('.json') && !n.endsWith('.exit.json') && !n.endsWith('.ended.json')); } catch (error) {
+  try { names = readdirSync(dir).filter((n) => n.endsWith('.json')); } catch (error) {
     return error?.code === 'ENOENT' ? [] : incompleteListing('review-jobs-unreadable');
   }
   const rows = [];

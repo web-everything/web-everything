@@ -1,6 +1,7 @@
 /** Bounded, read-only evidence collection; no job lifecycle decisions live here. */
 import { closeSync, fstatSync, mkdirSync, openSync, readSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { jobLogPath, jobRecordPath, reviewJobsDir } from './review-job-store.mjs';
+import { dirname } from 'node:path';
+import { diagnosticPath, jobLogPath, reviewJobsDir } from './review-job-store.mjs';
 import { redactSpawnText } from '../lib/describe-spawn-failure.mjs';
 
 const UNKNOWN = 'unknown (no exit marker: killed hard or crashed)';
@@ -9,7 +10,7 @@ const MAX_TAIL = 8192;
 export function diagnoseEndedJob({ slug, pid, dir = reviewJobsDir() }) {
   let marker;
   try {
-    const value = JSON.parse(readFileSync(jobRecordPath(slug, dir).replace(/\.json$/, '.exit.json'), 'utf8'));
+    const value = JSON.parse(readFileSync(diagnosticPath(slug, dir, 'exit'), 'utf8'));
     if (value.pid === pid) marker = value;
   } catch { /* Missing, stale or unreadable evidence cannot identify the exit. */ }
   let tail = '';
@@ -17,7 +18,8 @@ export function diagnoseEndedJob({ slug, pid, dir = reviewJobsDir() }) {
   try {
     fd = openSync(jobLogPath(slug, dir), 'r');
     const size = fstatSync(fd).size;
-    const start = Math.max(0, size - 64 * 1024);
+    // Redact a large window, not just the tail, so a multiline credential container keeps its opening context.
+    const start = Math.max(0, size - 4 * 1024 * 1024);
     const bytes = Buffer.alloc(size - start);
     const read = readSync(fd, bytes, 0, bytes.length, start);
     let text = bytes.subarray(0, read).toString('utf8');
@@ -43,8 +45,8 @@ export function summarizeDiagnosis(d) {
 
 /** Atomic run record, separate from the live job record. */
 export function writeEndedJobDiagnosis({ slug, pid, dir = reviewJobsDir() }, diagnosis) {
-  const path = jobRecordPath(slug, dir).replace(/\.json$/, '.ended.json');
-  mkdirSync(dir, { recursive: true });
+  const path = diagnosticPath(slug, dir, 'ended');
+  mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, `${JSON.stringify({ pid, ...diagnosis }, null, 2)}\n`);
   renameSync(tmp, path);

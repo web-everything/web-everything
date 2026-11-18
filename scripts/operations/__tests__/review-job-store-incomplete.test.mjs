@@ -39,8 +39,8 @@ it('merging preserves incomplete evidence from every population', () => {
     listWrapped: () => listing('wrapped') }).incomplete).toEqual(['agents', 'jobs', 'wrapped']);
 });
 
-it('exit and ended sidecars are not live-job records or incomplete listings', () => {
-  readdirSync.mockReturnValueOnce(['review-7.exit.json', 'review-7.ended.json']);
+it('the diagnostics subdirectory is not a live-job record or incomplete listing', () => {
+  readdirSync.mockReturnValueOnce(['diagnostics']);
   const rows = listReviewJobAgents({ dir: 'fixture' });
   expect(rows).toEqual([]);
   expect(rows).not.toHaveProperty('incomplete');
