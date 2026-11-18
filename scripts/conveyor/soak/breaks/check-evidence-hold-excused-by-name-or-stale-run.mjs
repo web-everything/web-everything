@@ -10,11 +10,7 @@ const OTHER = 'd'.repeat(40);
 const URL = job => `https://github.com/owner/repo/actions/runs/100/job/${job}`;
 const SCENARIO = `
 const m = await import(process.argv[1]);
-const head = ${JSON.stringify(HEAD)};
-const row = { name: 'merge-gate', status: 'completed', conclusion: 'failure', head_sha: head, detailsUrl: ${JSON.stringify(URL(123))},
-  mergeGateReviewHold: { holds: ['review-acceptance'], holdIds: ['review-acceptance'], headSha: head, jobId: 123, originalConclusion: 'failure' } };
-const ok = typeof m.boundMergeGateReviewHold === 'function' && typeof m.resolveReviewRequiredChecks === 'function'
-  && m.boundMergeGateReviewHold(row, { headSha: head, labels: ['review:pending'] }) === true;
+const ok = typeof m.boundMergeGateReviewHold === 'function' && typeof m.resolveReviewRequiredChecks === 'function';
 process.stdout.write(String(ok));`;
 
 export default {
@@ -23,7 +19,7 @@ export default {
   card: 'check-evidence-contract stack #7084 (PR2c)',
   fixedBy: { sha: 'e944247ee0', where: 'lane/check-evidence-contract-pr2c', paths: [MODULE] },
   // Decided by behaviour (a child process runs the capability probe against this tree), never by marker strings.
-  // The probe only proves the bound-hold resolver exists and accepts a valid hold; every invariant under test is
+  // The probe only proves the bound-hold resolver is exported (never that it accepts or rejects anything); every invariant under test is
   // judged in run(), so a regression of one stays a required failure instead of flipping this to expected-fail.
   fixPresent(root) {
     try {
