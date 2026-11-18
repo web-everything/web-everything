@@ -841,3 +841,21 @@ describe('a reviewer\'s hold applied after the stage released its own is never r
     expect(out.removeLabels).toEqual(['review:changes']);
   });
 });
+
+
+it('capability-off daemon prep stage never launches a judge or publishes a review while stale label cleanup runs', async () => {
+  const { runPrepReviewStage } = await import('../../../skills-src/conveyor/review-daemon.mjs');
+  const { deps, calls } = mkDeps();
+  const judge = vi.fn();
+  const stale = {...prepPr(), number: 999, labels: ['review:prep'],
+    files: [{path: 'scripts/example.mjs'}]};
+  const result = await runPrepReviewStage({
+    resolveProfile: () => ({capabilities: {review: false}}),
+    makeDeps: () => ({...deps, judge}), readPrs: () => [prepPr(), stale],
+  });
+  expect(result.capabilityRefusal.kind).toBe('unsupported-repo');
+  expect(result.reviewed).toEqual([]);
+  expect(judge).not.toHaveBeenCalled();
+  expect(calls.comments).toEqual([]);
+  expect(result.stripped).toEqual([{prNumber: 999}]);
+});

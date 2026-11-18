@@ -2527,3 +2527,16 @@ describe('fix pass PR metadata snapshot', () => {
     expect(exec.mock.calls.filter(([, args]) => args[1] === 'view')).toHaveLength(2);
   });
 });
+
+it('capability-off still observes fixer claims for lifecycle cleanup', async () => {
+  const { planFixDispatchClaimStatus } = await import('../reconcile-fix-dispatch.mjs');
+  const readClaim = vi.fn(() => ({ state: 'held' }));
+  const out = planFixDispatchClaimStatus({ root: '/repo', checkStaleness: FRESH,
+    resolveProfile: () => ({ capabilities: { fix: false } }),
+    reconcile: () => ({ dispatch: [{ kind: 'fix', prNumber: 49, headRefName: 'lane/3438-wire-reconcile-pass', headRefOid: 'head' }], refusals: [] }),
+    findItemFn: findItemStub, loadItems: () => [], resolveFallbackScope: () => [],
+    fetchItemlessDiffPaths: () => [], resolveCardScopeAtRef: () => [], readClaim,
+  });
+  expect(out.entries).toEqual([expect.objectContaining({ pr: 49, claim: { state: 'held' } })]);
+  expect(readClaim).toHaveBeenCalledOnce();
+});

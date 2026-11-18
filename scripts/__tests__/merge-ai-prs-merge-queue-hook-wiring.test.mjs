@@ -31,7 +31,7 @@ if (a[0] === 'api' && a[1] === 'graphql') {
   const query = a.find(v => v.startsWith('query=')) || '';
   if (query.includes('comments{totalCount}')) {
     const p = prs.find(p => 'n=' + p.number === a.find(v => v.startsWith('n=')));
-    if (!p || !a.includes('owner=fixture') || !a.includes('name=drain-mq')) process.exit(1);
+    if (!p || !(a.includes('owner=web-everything') && a.includes('name=web-everything'))) process.exit(1);
     out({ data: { repository: { pullRequest: { comments: { totalCount: p.comments.length } } } } });
   }
   out(openPrPageFixture(prs.filter(p => !landed(p.number)), query));
@@ -88,13 +88,13 @@ if (process.env.MQ_APPROVED_HEAD) {
 process.exit(0);
 `;
 
-function runCli({ hookOn, seedRefreshed = null, ages = [[3001, 5], [3002, 120]], mainFixPr = null, mergeStateStatus = 'CLEAN', approvedHeadPlan = null, env: extraEnv = {} }) {
+function runCli({ capabilityOff = false, hookOn, seedRefreshed = null, ages = [[3001, 5], [3002, 120]], mainFixPr = null, mergeStateStatus = 'CLEAN', approvedHeadPlan = null, env: extraEnv = {} }) {
   const dir = mkdtempSync(join(tmpdir(), 'drain-mq-'));
   try {
     const bin = join(dir, 'bin');
     mkdirSync(bin);
     // (the main-fix record names the WE repo by key, so that run's clone must read as WE: the couple shim's `origin`)
-    for (const [name, code] of [['gh', fakeGh], ['git', mainFixPr ? fakeGitCouple : fakeGit]]) writeFileSync(join(bin, name), code, { mode: 0o755 });
+    for (const [name, code] of [['gh', fakeGh], ['git', mainFixPr ? fakeGitCouple : fakeGit.replace('fixture/drain-mq.git', capabilityOff ? 'longshoreai/longshore.git' : 'web-everything/web-everything.git')]]) writeFileSync(join(bin, name), code, { mode: 0o755 });
     const fixture = join(dir, 'prs.json');
     const head = number => approvedHeadPlan ? 'a'.repeat(40) : `sha-${number}`;
     const comments = approvedHeadPlan ? [{ author: { login: 'chalbert' }, body: `<!-- reviewed-sha: ${head()} -->\n<!-- cleared-human: operator -->` }] : [];
@@ -126,10 +126,14 @@ function runCli({ hookOn, seedRefreshed = null, ages = [[3001, 5], [3002, 120]],
     const mainFixFile = join(dir, 'main-red-priority.json');
     if (mainFixPr) writeFileSync(mainFixFile, JSON.stringify({ repo: 'we', pr: mainFixPr, prs: [mainFixPr], firstRedSha: 'red', reason: 'owns the red-main fix', setAt: NOW, expiresAt: NOW + 3_600_000 }));
     const preload = 'data:text/javascript,' + encodeURIComponent("import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module'; os.homedir = () => process.env.MQ_HOME; syncBuiltinESMExports();");
+    const appEnv = daemonAppEnv(dir);
+    if (capabilityOff) appEnv.WE_GITHUB_APP_INSTALLATIONS = JSON.stringify({
+      ...JSON.parse(appEnv.WE_GITHUB_APP_INSTALLATIONS), longshoreai: appEnv.WE_GITHUB_APP_INSTALLATION_ID,
+    });
     const r = spawnSync(process.execPath, ['--import', preload, script, approvedHeadPlan?.repo ? `--repos=${approvedHeadPlan.repo}` : '--this-repo', '--label=ready-to-merge',
       '--no-reconcile-labels', '--no-drain-lease', '--no-red-main-freeze', ...(approvedHeadPlan ? ['--dry-run'] : ['--json'])], {
       cwd, encoding: 'utf8', timeout: 30_000 * TIMEOUT_SCALE,
-      env: { ...process.env, ...daemonAppEnv(dir), WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'off', PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir,
+      env: { ...process.env, ...appEnv, WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'off', PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir,
         // hook OFF = no settings file at all: the built-in default (a test run never reads the live file)
         ...(hookOn ? { WE_MERGE_QUEUE_SETTINGS_FILE: settings } : {}), ...(mainFixPr ? { WE_MERGE_QUEUE_MAIN_FIX_FILE: mainFixFile } : {}),
         WE_COORDINATION_ROOT: coord,
@@ -205,7 +209,7 @@ describe('card xs1hdl7 — merge-queue hook wired at the drain merge site', () =
 
   // The record a refresh writes: the head AND the pass it was requested against (the fixture's check-run id is 7 and
   // its pass completed at `iso(120)`), plus when it was requested.
-  const seedFor = (over = {}) => Object.fromEntries(['fixture/drain-mq#3002', 'cwd#3002'].map((k) => [k,
+  const seedFor = (over = {}) => Object.fromEntries(['web-everything/web-everything#3002', 'cwd#3002'].map((k) => [k,
     { head: 'sha-3002', checkRunId: 7, completedAtMs: Date.parse(iso(120)), atMs: NOW, ...over }]));
 
   it('once per pass: a head refreshed against the pass still in force waits — no second refresh, no merge', () => {
@@ -223,7 +227,7 @@ describe('card xs1hdl7 — merge-queue hook wired at the drain merge site', () =
   }, 30_000 * TIMEOUT_SCALE);
 
   it('a legacy head-only record (key → head) does not park the head either', () => {
-    const seed = Object.fromEntries(['fixture/drain-mq#3002', 'cwd#3002'].map((k) => [k, 'sha-3002']));
+    const seed = Object.fromEntries(['web-everything/web-everything#3002', 'cwd#3002'].map((k) => [k, 'sha-3002']));
     const { stderr } = runCli({ hookOn: true, seedRefreshed: seed });
     expect(stderr).not.toMatch(/refresh-already-requested/);
     expect(stderr).toMatch(/merge-queue: refresh \(pass-too-old\)/);
