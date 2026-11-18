@@ -854,6 +854,12 @@ describe('merge-queue same-head failure admission', () => {
           if (f.checkReads > 1) throw new Error('next check-runs page unavailable');
           return f.checkJson ?? JSON.stringify({ total_count: f.checkTotal ?? f.checks.length, check_runs: f.checks });
         }
+        if (/\/actions\/jobs\/[0-9]+$/.test(endpoint ?? '')) {
+          if (f.jobError) throw new Error('job metadata unavailable');
+          return JSON.stringify(f.jobData ?? { id: 9022, name: 'CI / test',
+            head_sha: removed().beforeCommit.oid, status: 'completed', conclusion: 'failure',
+            steps: [{ name: 'Gate on shard results', conclusion: 'failure' }] });
+        }
         if (endpoint?.includes('/actions/') || (args[0] === 'run' && args[1] === 'list')) {
           f.mainReads = (f.mainReads ?? 0) + 1;
           if (f.mainError) throw new Error('main runs unavailable');
@@ -895,7 +901,10 @@ describe('merge-queue same-head failure admission', () => {
     }));
     const regroupChecks = (conclusion = 'cancelled') => [
       { id: 21, name: 'CI / integration', status: 'completed', conclusion },
-      { id: 22, name: 'CI / test', status: 'completed', conclusion: 'failure' },
+      { id: 22, name: 'CI / test', status: 'completed', conclusion: 'failure',
+        details_url: `https://github.com/${repo}/actions/runs/500/job/9022`,
+        head_sha: removed().beforeCommit.oid,
+        started_at: '2026-11-01T11:00:00Z', completed_at: '2026-11-01T11:10:00Z' },
       { id: 23, name: 'merge-gate', status: 'completed', conclusion: 'success' },
       { id: 24, name: 'soak', status: 'completed', conclusion: 'success' },
     ];
@@ -908,9 +917,42 @@ describe('merge-queue same-head failure admission', () => {
         expect(result.line).toContain('mq-same-head-retry:');
         expect(result.line).toContain('failed_checks cancelled/regroup retry 1/2 (no failed required job; cancelled: CI / integration; aggregate derived: CI / test; PR CLEAN)');
         expect(f.exec.mock.calls.every(([, args]) => !args.includes('POST')
-          && !args.some(arg => arg.includes('/actions/') || arg.includes('/logs')))).toBe(true);
+          && !args.some(arg => arg.includes('/workflows/') || arg.includes('/logs')))).toBe(true);
         expect(f.mainReads).toBeUndefined();
       }));
+    it.each(['intrinsic step', 'missing steps', 'wrong job id', 'wrong commit', 'wrong job name',
+      'wrong status', 'wrong conclusion', 'unreadable metadata', 'missing details URL', 'foreign details URL'])(
+      'cancelled/regroup holds with %s even when main is green', kind => fixture(f => {
+        f.checks = regroupChecks();
+        f.jobData = { id: 9022, name: 'CI / test', head_sha: removed().beforeCommit.oid,
+          status: 'completed', conclusion: 'failure',
+          steps: [{ name: 'Gate on shard results', conclusion: 'failure' }] };
+        if (kind === 'intrinsic step') f.jobData.steps.push({ name: 'Install', conclusion: 'failure' });
+        if (kind === 'missing steps') delete f.jobData.steps;
+        if (kind === 'wrong job id') f.jobData.id = 22;
+        if (kind === 'wrong commit') f.jobData.head_sha = head;
+        if (kind === 'wrong job name') f.jobData.name = 'test';
+        if (kind === 'wrong status') f.jobData.status = 'in_progress';
+        if (kind === 'wrong conclusion') f.jobData.conclusion = 'success';
+        if (kind === 'unreadable metadata') f.jobError = true;
+        if (kind === 'missing details URL') delete f.checks[1].details_url;
+        if (kind === 'foreign details URL') f.checks[1].details_url = 'https://github.com/other/repo/actions/runs/500/job/9022';
+        expect(f.guard().hold).toBe(true);
+        expect(f.mainReads).toBeUndefined();
+      }));
+    it.each([false, true])('cancelled/regroup holds after repeated failed attempts (later success: %s)', laterSuccess => fixture(f => {
+      f.checks = regroupChecks();
+      const original = f.checks[1];
+      f.checks.push({ ...original, id: 25,
+        details_url: `https://github.com/${repo}/actions/runs/500/job/9025`,
+        started_at: '2026-11-01T11:20:00Z', completed_at: '2026-11-01T11:30:00Z' });
+      if (laterSuccess) f.checks.push({ ...original, id: 26, conclusion: 'success',
+        details_url: `https://github.com/${repo}/actions/runs/500/job/9026`,
+        started_at: '2026-11-01T11:40:00Z', completed_at: '2026-11-01T11:50:00Z' });
+      expect(f.guard().hold).toBe(true);
+      expect(f.mainReads).toBeUndefined();
+      expect(f.exec.mock.calls.every(([, args]) => !args.includes('POST'))).toBe(true);
+    }));
     it('cancelled-only evidence also retries without main CI', () => fixture(f => {
       f.checks = [regroupChecks()[0]];
       f.mainError = true;
@@ -1682,6 +1724,7 @@ describe('drain policy cascade', () => {
   });
   it.each([
     ['platform', {}, {}, { mqCancelledRetryMax: 5 }, 5],
+    ['env', { WE_DRAIN_MQ_CANCELLED_RETRY_MAX: '1' }, {}, {}, 1],
     ['tool', {}, { mqCancelledRetryMax: 4 }, { mqCancelledRetryMax: 5 }, 4],
     ['env', { WE_DRAIN_MQ_CANCELLED_RETRY_MAX: '3' }, { mqCancelledRetryMax: 4 }, { mqCancelledRetryMax: 5 }, 3],
   ])('resolves mqCancelledRetryMax from %s and logs provenance', (source, env, tool, platform, value) => {
@@ -1691,7 +1734,7 @@ describe('drain policy cascade', () => {
     });
     expect(log.mock.calls.flat().join('')).toContain(`mqCancelledRetryMax=${value} (${source})`);
   });
-  it.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity, 'typo', true, null])(
+  it.each([0, -1, 1.5, 6, 100, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity, 'typo', true, null])(
     'invalid mqCancelledRetryMax %s falls back to the next valid layer', value => {
       const r = readDrainQueueSafety({ env: {}, tool: { mqCancelledRetryMax: value }, platform: {} });
       expect(r).toMatchObject({ value: { mqCancelledRetryMax: 2 }, sources: { mqCancelledRetryMax: 'standard' } });
