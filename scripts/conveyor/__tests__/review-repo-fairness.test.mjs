@@ -41,6 +41,33 @@ describe('shared review seats across repos', () => {
     expect(new Set([...first.dispatched, ...second.dispatched].map(d => d.repo))).toEqual(new Set(repos));
   });
 
+  // Fresh module state per test: the default rotation cursor is module-level.
+  const fresh = async () => {
+    vi.resetModules();
+    return (await import('../../../skills-src/conveyor/review-daemon.mjs')).runReviewTickAllRepos;
+  };
+
+  it('does not spend a repo\'s turn on ticks with no free seat (seats 1,0,0 repeating over three repos)', async () => {
+    const runAll = await fresh();
+    const three = ['fixture/a', 'fixture/b', 'fixture/c'];
+    const opts = { ...options(), repos: three };
+    const seen = [];
+    for (const left of [1, 0, 0, 1, 0, 0, 1, 0, 0]) {
+      const r = runAll({ ...opts, liveReviewBudget: { live: 8 - left, max: 8, left, reason: 'live review rounds (tool)' } });
+      seen.push(...r.dispatched.map(d => d.repo));
+    }
+    expect(seen).toEqual(three);
+  });
+
+  it('keeps the cursor when no repo dispatched, and an injected startIndex never moves it', async () => {
+    const runAll = await fresh();
+    const opts = options();
+    runAll({ ...opts, liveReviewBudget: { live: 8, max: 8, left: 0, reason: 'live review rounds 8 of maxLiveReviewRounds=8 (tool)' } });
+    runAll({ ...opts, startIndex: 1, liveReviewBudget: budget() });
+    const next = runAll({ ...opts, liveReviewBudget: budget() });
+    expect(next.dispatched.map(d => d.repo)).toEqual([repos[0]]);
+  });
+
   it.each([0, 1])('reports all eight occupied seats and the earlier dispatch for startIndex=%i', startIndex => {
     const shared = budget();
     const result = runReviewTickAllRepos({ ...options(), startIndex, liveReviewBudget: shared });

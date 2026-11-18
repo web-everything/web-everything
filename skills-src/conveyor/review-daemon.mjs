@@ -968,10 +968,15 @@ export function sharedHostBudget(hostAdmission, log = console.error) {
   };
 }
 
+// Round-robin cursor for first access to the shared review seats. It moves only when a tick actually handed out
+// a seat (see the end of the repo loop below): a tick with no free seat must not spend any repo's turn, or a
+// seat pattern that repeats with the rotation (1,0,0 over three repos) would serve the same repo forever.
 let reviewRepoRotation = 0;
 
 export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runReviewTick, authGateOverride,
-  startIndex = reviewRepoRotation++, ...tickOpts } = {}) {
+  startIndex, ...tickOpts } = {}) {
+  const pinnedStart = startIndex !== undefined;
+  if (!pinnedStart) startIndex = reviewRepoRotation;
   // card x5kagse (epic #4075/#3383) — computed ONCE per tick (the login is a host-global fact, not per-repo),
   // then forwarded into every repo's own `runReviewTick` call below. Real IO runs only for a genuine production
   // tick (`tick` left at its real default) — mirrors `runTickAllRepos`'s own identical rule in
@@ -997,6 +1002,13 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
   // Preserve the public result (and aggregate) order even when execution starts at another repo.
   const split = repos.length - start;
   const perRepo = [...rotatedResults.slice(split), ...rotatedResults.slice(0, split)];
+  // Advance the default rotation past the last repo (in execution order) that actually took a seat; leave it
+  // untouched when nobody dispatched, and never move it for an injected `startIndex`.
+  if (!pinnedStart && repos.length) {
+    let lastServed = -1;
+    rotatedResults.forEach((entry, i) => { if ((entry?.result?.dispatched?.length ?? 0) > 0) lastServed = i; });
+    if (lastServed >= 0) reviewRepoRotation = (start + lastServed + 1) % repos.length;
+  }
   const dispatched = [];
   const failed = [];
   const notStarted = [];

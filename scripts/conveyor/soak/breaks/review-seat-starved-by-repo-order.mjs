@@ -43,6 +43,28 @@ function exercise(runAll) {
       violations.push(`${repo}: did not get exactly one dispatch over two ticks`);
     }
   }
+  // Seat availability that repeats with the rotation (one free seat, then two ticks with none) must not let a
+  // no-capacity tick spend a repo's turn: each of three repos owes work and must be served once in three seats.
+  const three = ['fixture/a', 'fixture/b', 'fixture/c'];
+  const served = [];
+  for (const seats of [1, 0, 0, 1, 0, 0, 1, 0, 0]) {
+    const result = runAll({
+      repos: three,
+      hostAdmission: () => ({ admitted: true, maxPerTick: seats }),
+      log() {},
+      tick({ repo, hostAdmission }) {
+        const budget = hostAdmission();
+        const dispatched = [];
+        if (budget.admitted && budget.maxPerTick > 0) { budget.take(1); dispatched.push({ prNumber: 1 }); }
+        return { reviewsOwed: 1, dispatched, failed: [], refusals: 0 };
+      },
+    });
+    served.push(...result.dispatched.map(d => d.repo));
+  }
+  ticks.push(served.map(repo => ({ repo })));
+  for (const repo of three) {
+    if (served.filter(r => r === repo).length !== 1) violations.push(`${repo}: starved under repeating 1,0,0 seat availability`);
+  }
   return { ticks, violations };
 }
 
