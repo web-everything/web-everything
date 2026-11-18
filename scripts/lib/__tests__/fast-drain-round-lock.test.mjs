@@ -4,9 +4,8 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir, hostname } from 'node:os';
 import { join } from 'node:path';
 import { acquireWrite, releaseWrite } from '../daemon-clone-lock.mjs';
-import { readFastDrainRoundListing, readFastDrainRoundSnapshot, withFastDrainRoundLock, verifyFastDrainEnqueue } from '../fast-drain-scope.mjs';
-import { enqueuePr } from '../merge-queue-enqueue.mjs';
-import { buildLiveListingsByRepo, classifyPr } from '../../merge-ai-prs.mjs';
+import { readFastDrainRoundListing, readFastDrainRoundSnapshot, withFastDrainRoundLock } from '../fast-drain-scope.mjs';
+import { buildLiveListingsByRepo } from '../../merge-ai-prs.mjs';
 
 const roots = [];
 afterEach(() => { vi.useRealTimers(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -163,6 +162,21 @@ it('invalidates the cached target row on a changed live head, retaining unrelate
   expect(listLive).not.toHaveBeenCalled();
 });
 
+it('snapshot target always comes from readTarget, replacing a stale red row on a different head', async () => {
+  const path = setup();
+  const stale = { ...row(), headRefOid: 'b'.repeat(40),
+    statusCheckRollup: [{ ...green, conclusion: 'FAILURE' }] };
+  save(path, [stale, row(43)]);
+  const live = row();
+  const readTarget = vi.fn(async () => live);
+  const listLive = vi.fn();
+  const rows = await readFastDrainRoundListing({ ...options(path), readTarget, listLive });
+  expect(readTarget).toHaveBeenCalledOnce();
+  expect(rows.find(pr => pr.number === 42)).toBe(live);
+  expect(rows).toEqual([live, row(43)]);
+  expect(listLive).not.toHaveBeenCalled();
+});
+
 it('excludes snapshot rows even with historical roundContext while preserving live unfiltered siblings', () => {
   const sibling = { ...row(43), labels: [], baseRefName: 'release' };
   const rows = [row(), sibling];
@@ -187,48 +201,6 @@ it.each(['foreign', 'incomplete', 'oversized'])('rejects %s snapshot evidence', 
   expect(readFastDrainRoundSnapshot({ path, repo, env: {},
     ...(kind === 'oversized' ? { read: () => 'x'.repeat(64 * 1024 * 1024 + 1) } : {}),
   })).toBeNull();
-});
-
-it.each(['head moved', 'red check', 'missing checks', 'unreadable'])('final LIVE %s beats a cached green row on the actual enqueue path', async kind => {
-  const path = setup(); save(path);
-  const [candidate] = await readFastDrainRoundListing({ ...options(path), listLive: vi.fn() });
-  const tip = 'c'.repeat(40);
-  const calls = [];
-  const exec = (cmd, args) => {
-    calls.push([cmd, args]);
-    if (cmd === 'git' && args[0] === 'ls-remote') return `${tip}\trefs/heads/main\n`;
-    if (cmd === 'gh' && args[0] === 'pr') return JSON.stringify({ id: 'PR_42', headRefOid: head, baseRefName: 'main' });
-    if (cmd === 'gh' && args.includes('graphql')) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: false, headRefOid: head } } } });
-    throw Error(`unexpected IO ${cmd} ${args}`);
-  };
-  const live = { ...candidate,
-    ...(kind === 'head moved' ? { headRefOid: 'b'.repeat(40) } : {}),
-    ...(kind === 'red check' ? { statusCheckRollup: [{ ...green, conclusion: 'FAILURE' }] } : {}),
-    ...(kind === 'missing checks' ? { statusCheckRollup: [] } : {}),
-  };
-  const readLive = vi.fn(() => { if (kind === 'unreadable') throw Error('offline'); return live; });
-  const result = enqueuePr({ repo, num: 42, headSha: candidate.headRefOid, exec, cwd: join(path, '..'),
-    preparedSurface: { headSha: head, base: 'main', baseSha: tip, files: [] },
-    sameHeadAdmission: () => verifyFastDrainEnqueue({ headSha: head, requiredChecks: ['test'], classifyPr,
-      readLive }),
-  });
-  expect(readLive).toHaveBeenCalledOnce();
-  expect(result).toMatchObject({ ok: false, held: true });
-  expect(calls.some(([, args]) => args.some(arg => arg.includes('mutation')))).toBe(false);
-});
-
-it('final live green checks on the pinned open head permit admission; an unknown required set refuses', () => {
-  expect(verifyFastDrainEnqueue({ headSha: head, requiredChecks: ['test'], classifyPr, readLive: () => row() }).hold).toBe(false);
-  expect(verifyFastDrainEnqueue({ headSha: head, requiredChecks: null, classifyPr, readLive: () => row() }).hold).toBe(true);
-});
-
-it('final classifier holds green test when required integration has no row', () => {
-  expect(verifyFastDrainEnqueue({ headSha: head, requiredChecks: ['test', 'integration'], classifyPr,
-    readLive: () => row() })).toMatchObject({ hold: true, line: expect.stringContaining('integration (missing)') });
-});
-
-it('final verification holds when the standard classifier is unavailable', () => {
-  expect(verifyFastDrainEnqueue({ headSha: head, requiredChecks: ['test'], readLive: () => row() }).hold).toBe(true);
 });
 
 it.each([undefined, null, false])('refuses cached rows when the live target reader is missing (%s)', async readTarget => {

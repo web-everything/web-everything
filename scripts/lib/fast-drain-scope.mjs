@@ -8,17 +8,6 @@ import { withWriteLock } from './daemon-clone-lock.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 
-/** Only a fresh, pinned target may authorize enqueue; cached green context grants no clearance. */
-export function verifyFastDrainEnqueue({ headSha, requiredChecks, readLive, classifyPr, classifyOptions = {} }) {
-  try {
-    const live = readLive();
-    if (live?.state !== 'OPEN' || live.headRefOid !== headSha) return { hold: true, line: 'fast-drain: final live head changed or unreadable — retry next pass' };
-    if (!Array.isArray(requiredChecks)) return { hold: true, line: 'fast-drain: final required checks unreadable — retry next pass' };
-    const gate = classifyPr(live, { ...classifyOptions, queueRequiredChecks: requiredChecks });
-    return { hold: gate.decision !== 'merge', line: `fast-drain: final live checks ${gate.reason} — retry next pass` };
-  } catch { return { hold: true, line: 'fast-drain: final live target unreadable — retry next pass' }; }
-}
-
 /** The cwd-repo sentinel must share the full pass's persistent cache namespace. */
 export function shaCacheRepo(repo, localSlug) {
   return repo || localSlug;

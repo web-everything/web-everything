@@ -129,7 +129,7 @@ import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, re
 // are re-exported ONLY (mirrors `pr-land.mjs`'s own `forge-land-provider.mjs` split of used-here vs.
 // re-exported-only names) — every existing importer of THIS file keeps resolving all five unchanged.
 import { runRenamedPrRefresh, resolveRefreshSettings, logRefreshSettings } from './lib/renamed-pr-refresh.mjs';
-import { shaCacheRepo, resolveFastDrainScopeSetting, resolveFastDrainListingSetting, readFastDrainRoundListing, readFastDrainRoundSnapshot, verifyFastDrainEnqueue, mergeLiveTargetIntoRows, shouldReadContextCommits, filterToFastDrainTarget, readLegacyManifestCached, readLegacyLocalManifestAt } from './lib/fast-drain-scope.mjs';
+import { shaCacheRepo, resolveFastDrainScopeSetting, resolveFastDrainListingSetting, readFastDrainRoundListing, readFastDrainRoundSnapshot, mergeLiveTargetIntoRows, shouldReadContextCommits, filterToFastDrainTarget, readLegacyManifestCached, readLegacyLocalManifestAt } from './lib/fast-drain-scope.mjs';
 import { isTrustedMarkerAuthor, isOperatorAuthored } from './lib/marker-authorship.mjs';
 import { isAiGeneratedPr, hasLabel } from './lib/ai-pr-authorship.mjs';
 import { OPEN_PR_LIST_LIMIT, isDegradedOpenPrListing, filterOpenPrsByLabel } from './lib/no-search-backed-pr-list.mjs';
@@ -507,67 +507,21 @@ export function isCodeQLFailed(pr) {
  * beyond that cap. Read all REST pages before replacing the required name's evidence.
  * Read failures are unknown, not CI failures, and must be retried next pass.
  */
-export async function resolveRequiredCheck(pr, options = {}) {
-  return resolveRequiredCheckResult(pr, options);
-}
-
-// Share the pagination and fail-closed handling with the synchronous enqueue boundary.
-function resolveRequiredCheckResult(pr, { repo = null, requiredCheck = 'test', exec = execFileP, onDeferred = () => {}, forceRead = false } = {}) {
-  if (!forceRead && !requiredCheckReadNeeded(pr, requiredCheck)) return pr;
+export async function resolveRequiredCheck(pr, { repo = null, requiredCheck = 'test', exec = execFileP, onDeferred = () => {} } = {}) {
+  if (!requiredCheckReadNeeded(pr, requiredCheck)) return pr;
   const resolved = { ...pr };
   delete resolved.requiredCheckReadError;
-  const failed = error => {
-    resolved.requiredCheckReadError = `required check "${requiredCheck}" direct read failed; deferred this pass: ${String(error.message || error).split('\n')[0]}`;
-    onDeferred(resolved.requiredCheckReadError);
-    return resolved;
-  };
-  const complete = ({ stdout }) => {
-    try {
-      resolved.statusCheckRollup = mergeRequiredCheckRuns(pr, requiredCheck, stdout);
-      return resolved;
-    } catch (error) { return failed(error); }
-  };
   try {
     if (!pr?.headRefOid) throw new Error('PR head SHA is missing');
-    const result = exec('gh', ['api', requiredCheckRunsEndpoint(repo, pr.headRefOid, requiredCheck), '--paginate', '--slurp'], {
+    const { stdout } = await exec('gh', ['api', requiredCheckRunsEndpoint(repo, pr.headRefOid, requiredCheck), '--paginate', '--slurp'], {
       encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
     });
-    return result?.then ? result.then(complete, failed) : complete(result);
-  } catch (error) { return failed(error); }
-}
-
-/** Both listing reads and final admission use this resolver, including the 100-context safeguard. */
-export function resolveListedChecks(repo, prs, { concurrency = 1, synchronous = false, ...options } = {}) {
-  const resolve = pr => resolveRequiredCheckResult(pr, { repo, ...options });
-  return synchronous ? prs.map(resolve) : mapWithConcurrency(prs, concurrency, resolve);
-}
-
-/** Production final-admission wiring; inject only the external reads in tests. */
-export function createFastDrainEnqueueVerifier({ localSlug, requiredCheck = 'test', exec = createMqLiveReader(),
-  escalationRelief = { prs: [], passWide: false }, label = null,
-  ...requiredChecksOptions }) {
-  return (candidate, headSha) => {
-    try {
-      const queueRequiredChecksOf = createQueueRequiredChecksOf({ localSlug, ...requiredChecksOptions });
-      const repo = candidate.repo ?? localSlug;
-      const requiredChecks = queueRequiredChecksOf(candidate.repo);
-      let live = JSON.parse(exec('gh', ['pr', 'view', String(candidate.num), '--repo', repo,
-        '--json', 'number,state,title,body,headRefOid,baseRefName,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,labels,commits'], { encoding: 'utf8', timeout: 60_000,
-        maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
-      const original = live;
-      // Every required name can have a newer run hidden beyond gh's rollup cap.
-      for (const name of new Set([requiredCheck, ...(requiredChecks || [])])) {
-        [live] = resolveListedChecks(repo, [live], { requiredCheck: name, synchronous: true,
-          forceRead: requiredCheckReadNeeded(original, name),
-          exec: (file, args, options) => ({ stdout: exec(file, args, { ...options, timeout: 60_000 }) }) });
-        if (live.requiredCheckReadError) throw new Error(live.requiredCheckReadError);
-      }
-      return verifyFastDrainEnqueue({ headSha, requiredChecks, readLive: () => live, classifyPr,
-        classifyOptions: { requiredCheck,
-          defaultBranch: requiredChecksOptions.defaultBranchOf?.(candidate.repo) || null,
-          allowPendingReview: (escalationRelief.prs || []).includes(Number(candidate.num)) || (escalationRelief.passWide && !!label) } });
-    } catch { return { hold: true, line: 'fast-drain: final live target unreadable — retry next pass' }; }
-  };
+    resolved.statusCheckRollup = mergeRequiredCheckRuns(pr, requiredCheck, stdout);
+  } catch (error) {
+    resolved.requiredCheckReadError = `required check "${requiredCheck}" direct read failed; deferred this pass: ${String(error.message || error).split('\n')[0]}`;
+    onDeferred(resolved.requiredCheckReadError);
+  }
+  return resolved;
 }
 
 // #2925/#xkfv491 — `collapseRollupToLatestPerName`/`rollupRowKind` now live in their OWN dependency-free module,
@@ -5073,12 +5027,8 @@ async function runCli() {
     const result = mergeStrategy.enqueue(c, sha, { ...options,
       // The early queued bypass authorizes bookkeeping only. If membership disappears during the
       // strategy's other checks, require fresh timeline admission immediately before any mutation.
-      sameHeadAdmission: () => {
-        const admission = mqSameHeadGuard({ repo: c.repo ?? localSlug, pr: c.num, head: sha,
-          allowAlreadyQueued: false, refresh, dryRun: DRY_RUN, log: line => process.stderr.write(`${line}\n`) });
-        if (admission.hold || !listingSnapshot || !isFastDrainTarget(c.repo, { number: c.num })) return admission;
-        return verifyFinalFastDrainEnqueue(c, sha);
-      } });
+      sameHeadAdmission: () => mqSameHeadGuard({ repo: c.repo ?? localSlug, pr: c.num, head: sha,
+        allowAlreadyQueued: false, refresh, dryRun: DRY_RUN, log: line => process.stderr.write(`${line}\n`) }) });
     if (result?.enqueued === true) {
       try { shadow?.recordActual({ repo: c.repo || localSlug, num: c.num, headSha: sha }); } catch { /* Timing only. */ }
     }
@@ -5135,10 +5085,7 @@ async function runCli() {
       },
     });
   };
-  const resolveListing = (repo, prs) => resolveListedChecks(repo, prs, {
-    concurrency: resolvedMergePolicy.policy.concurrency.gateReads, requiredCheck: REQUIRED,
-    onDeferred: reason => process.stderr.write(`  ⚠ ${repoTag(repo)} ${reason}\n`),
-  });
+  const resolveListedChecks = (repo, prs) => mapWithConcurrency(prs, resolvedMergePolicy.policy.concurrency.gateReads, (pr) => resolveChecks(repo, pr));
   const fetchFreshPrForRevalidation = async (repo, num, fields = null) => {
     try {
       const { stdout: raw } = await execFileP('gh', ['pr', 'view', String(num), ...repoFlag(repo),
@@ -5285,10 +5232,6 @@ async function runCli() {
   // VALUE inside the `prepareDrainVerdicts` call's argument object and is invisible everywhere else in this
   // closure). The stacked-PR retarget call further down needs the SAME lookup by NAME, not re-derived.
   const defaultBranchOf = (repo) => defaultBranchByRepo.get(repo) ?? null;
-  const verifyFinalFastDrainEnqueue = createFastDrainEnqueueVerifier({
-    localSlug, requiredCheck: REQUIRED, queueEnqueueMode: queueEnqueueModeFromPolicy(resolvedMergePolicy),
-    isLocalRepo, defaultBranchOf, escalationRelief, label,
-  });
   // #2417 review — returns `{ commits, degraded }`. `degraded:true` means the gh read THREW (a swallowed transient
   // failure): the empty `[]` is a fallback, not a confirmed "no commits", so `fetchPrReadsCached` declines to cache
   // it and re-fetches next `--watch` pass rather than latching an empty read for the head-SHA lifetime. Behaviour
@@ -5366,10 +5309,10 @@ async function runCli() {
           heavyFields: ['body', 'files'], cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
           maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain context page)' } } }), { repo: slug, op: 'drain-context-list', daemon: 'drain' });
         drainHeavyCacheByRepo.set(repo, listed.cache);
-        return resolveListing(repo, listed.rows);
+        return resolveListedChecks(repo, listed.rows);
       }
       const { stdout } = await execFileP('gh', ['pr', 'list', ...repoFlag(repo), '--state', 'open', '--limit', String(OPEN_PR_LIST_LIMIT), '--json', CONTEXT_LIST_FIELDS], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-      return resolveListing(repo, parseListOutput(stdout, { repo }));
+      return resolveListedChecks(repo, parseListOutput(stdout, { repo }));
     },
     // #2417 — fan out the per-PR manifest + commits reads across ALL repos' open PRs at once (bounded pool), cached
     // across `--watch` passes on unchanged head SHA + body. Returns key→{manifest, commits, degraded}.
@@ -5727,7 +5670,7 @@ async function runCli() {
         const { stdout } = await execFileP('gh', ['pr', 'view', String(number), '--repo', slug, '--json', `${fields},updatedAt,state`],
           { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
         const target = JSON.parse(stdout.trim() || 'null');
-        return target ? (await resolveListing(repo, [target]))[0] : null;
+        return target ? (await resolveListedChecks(repo, [target]))[0] : null;
       });
       const listLive = async () => {
         let snapshotSeed;
@@ -5768,7 +5711,7 @@ async function runCli() {
           if (rows.length >= sized) rows = await run(OPEN_PR_LIST_LIMIT);
           listed = { rows, truncated: rows.length >= OPEN_PR_LIST_LIMIT };
         }
-        return __t.timeAsync('listing.checks', () => resolveListing(repo, listed.rows));
+        return __t.timeAsync('listing.checks', () => resolveListedChecks(repo, listed.rows));
       };
       const rows = roundPath && slug
         ? await readFastDrainRoundListing({ path: roundPath, repo: slug, onlyPr, readTarget, requireDefaultBranch: true,

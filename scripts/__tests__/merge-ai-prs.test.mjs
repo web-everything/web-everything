@@ -8,7 +8,7 @@
  *   base is not the repo's default branch is skipped with `base is not <default> (<base>)`.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { withResolutionBasis, buildDrainReasonComment, hasDrainReasonComment, buildDrainVerdicts, classifyPr, isRebaseDropCandidate, buildLiveListingsByRepo, createFastDrainEnqueueVerifier } from '../merge-ai-prs.mjs';
+import { withResolutionBasis, buildDrainReasonComment, hasDrainReasonComment, buildDrainVerdicts, classifyPr, isRebaseDropCandidate, buildLiveListingsByRepo } from '../merge-ai-prs.mjs';
 import { readFastDrainRoundListing, withFastDrainRoundLock } from '../lib/fast-drain-scope.mjs';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -395,88 +395,4 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
 it('shadow policy retains pre-enqueue renaming by default (#6121)', async () => {
   const { resolveCardNumbering } = await import('../lib/policy-cascade.mjs');
   expect(resolveCardNumbering({ env: {}, platform: {} })).toMatchObject({ value: { mode: 'rename-before-enqueue', ledgerAuth: 'none', shadow: true } });
-});
-
-describe('production fast-drain final admission wiring', () => {
-  const repo = 'owner/repo', headSha = 'a'.repeat(40);
-  const green = { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' };
-  const probe = ({ capped = false, conclusion = 'success', unreadable = false, requiredChecks = ['test'], state = 'OPEN', head = headSha, checks = [green], requiredCheck = 'test' } = {}) => {
-    const live = { number: 42, state, headRefOid: head, body: 'Describe the change', baseRefName: 'main',
-      mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED', labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [...checks,
-      ...(capped ? Array.from({ length: 99 }, (_, i) => ({ ...green, name: `other-${i}` })) : [])] };
-    const exec = vi.fn((_file, args) => {
-      if (args[0] === 'pr') return JSON.stringify(live);
-      if (unreadable) throw Error('pages unreadable');
-      if (args[1].includes('check_name=integration')) return JSON.stringify([{ total_count: 0, check_runs: [] }]);
-      return JSON.stringify([{ total_count: 2, check_runs: [
-        { id: 1, name: 'test', head_sha: headSha, status: 'completed', conclusion: 'success' },
-        { id: 2, name: 'test', head_sha: headSha, status: conclusion === 'pending' ? 'in_progress' : 'completed', conclusion },
-      ] }]);
-    });
-    const readChecks = vi.fn(() => requiredChecks);
-    // Call the shipped verifier: only GitHub I/O is injected, never the admission callback.
-    const verify = createFastDrainEnqueueVerifier({ localSlug: repo, requiredCheck, queueEnqueueMode: true,
-      isLocalRepo: candidate => candidate == null || candidate === repo, defaultBranchOf: () => 'main', exec, readChecks });
-    return { result: verify({ repo: null, num: 42 }, headSha), exec, readChecks };
-  };
-  it('resolves the real required-checks source and allows complete live green evidence', () => {
-    const { result, readChecks, exec } = probe();
-    expect(readChecks).toHaveBeenCalledWith({ repo, branch: 'main' });
-    expect(result.hold).toBe(false);
-    expect(exec).toHaveBeenCalledTimes(1);
-  });
-  it.each(['failure', 'pending'])('blocks a newer %s run hidden beyond the 100-context rollup', conclusion => {
-    const { result, exec } = probe({ capped: true, conclusion });
-    expect(result.hold).toBe(true);
-    expect(exec.mock.calls[1][1]).toEqual(['api', `repos/${repo}/commits/${headSha}/check-runs?check_name=test&filter=latest&per_page=100`, '--paginate', '--slurp']);
-  });
-  it('allows capped evidence only after resolving all pages to the current green run', () => {
-    const { result, exec } = probe({ capped: true });
-    expect(result.hold).toBe(false);
-    expect(exec).toHaveBeenCalledTimes(2);
-  });
-  it('holds unreadable pagination with an operator-visible retry fallback', () => {
-    expect(probe({ capped: true, unreadable: true }).result).toMatchObject({ hold: true, line: expect.stringContaining('retry next pass') });
-  });
-  it('holds an unreadable required-checks source', () => {
-    expect(probe({ requiredChecks: null }).result.hold).toBe(true);
-  });
-  it('holds green test plus missing required integration instead of accepting an implication', () => {
-    expect(probe({ requiredChecks: ['test', 'integration'] }).result).toMatchObject({
-      hold: true, line: expect.stringContaining('integration (missing)') });
-  });
-  it('holds red configured test even when protection requires only green lint', () => {
-    expect(probe({ requiredChecks: ['lint'], checks: [{ ...green, conclusion: 'FAILURE' }, { ...green, name: 'lint' }] }).result)
-      .toMatchObject({ hold: true, line: expect.stringContaining('required check "test" is not green') });
-  });
-  it('uses the configured check name alongside the protection requirements', () => {
-    expect(probe({ requiredCheck: 'custom', requiredChecks: ['lint'],
-      checks: [{ ...green, name: 'custom', conclusion: 'FAILURE' }, { ...green, name: 'lint' }] }).result)
-      .toMatchObject({ hold: true, line: expect.stringContaining('required check "custom" is not green') });
-  });
-  it.each([{ state: 'CLOSED' }, { head: 'b'.repeat(40) }])('holds changed live identity (%j)', extra => {
-    expect(probe(extra).result.hold).toBe(true);
-  });
-});
-
-it('production final admission re-reads required checks and resolves every name from an originally capped rollup', () => {
-  const repo = 'owner/repo', headSha = 'a'.repeat(40);
-  let required = ['test', 'lint'];
-  const readChecks = vi.fn(() => required);
-  const exec = vi.fn((_file, args) => {
-    if (args[0] === 'pr') return JSON.stringify({ number: 42, state: 'OPEN', headRefOid: headSha,
-      body: 'Describe the change', baseRefName: 'main', mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED', labels: [{ name: 'ready-to-merge' }],
-      statusCheckRollup: Array.from({ length: 100 }, (_, i) => ({ __typename: 'CheckRun',
-        name: i < 50 ? 'test' : 'lint', status: 'COMPLETED', conclusion: 'SUCCESS' })) });
-    const name = args[1].includes('check_name=lint') ? 'lint' : 'test';
-    return JSON.stringify([{ check_runs: [{ id: 200, name, head_sha: headSha,
-      status: 'completed', conclusion: name === 'lint' ? 'failure' : 'success' }] }]);
-  });
-  const verify = createFastDrainEnqueueVerifier({ localSlug: repo, queueEnqueueMode: true,
-    isLocalRepo: () => true, defaultBranchOf: () => 'main', exec, readChecks });
-  expect(verify({ repo, num: 42 }, headSha).hold).toBe(true);
-  expect(exec.mock.calls.filter(([, args]) => args[0] === 'api')).toHaveLength(2);
-  required = ['test'];
-  expect(verify({ repo, num: 42 }, headSha).hold).toBe(false);
-  expect(readChecks).toHaveBeenCalledTimes(2);
 });
