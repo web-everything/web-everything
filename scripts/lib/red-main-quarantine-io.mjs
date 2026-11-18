@@ -30,12 +30,11 @@ import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 import { resolveRedMainMode, RED_MAIN_HOLD_SETTINGS_FILE } from './red-main-hold.mjs';
-import { mainRedState, mainCiRedSettings } from '../conveyor/main-ci-red-core.mjs';
-import { readRunJobs } from '../conveyor/main-ci-red-probe.mjs';
+import { mainRedState } from '../conveyor/main-ci-red-core.mjs';
 import {
   QUARANTINE_BRANCH, QUARANTINE_REF, QUARANTINE_LIST_PATH, QUARANTINE_EVENTS_PATH,
   validateQuarantineList, addEntries, pruneOnGreen, testsToSkip, canWriteQuarantine, vitestExcludeArgs,
-  setFixPrs, setMode, activeEntries, parseVitestFailures, planSafetyNet, QUARANTINE_SAFETY_NET_DEFAULTS, REPEAT_RUN_LIMIT, decideCiSkip, testFileOf,
+  setFixPrs, setMode, activeEntries, parseVitestFailures, planSafetyNet, QUARANTINE_SAFETY_NET_DEFAULTS, REPEAT_RUN_LIMIT,
 } from './red-main-quarantine.mjs';
 
 const git = (args, opts) => execFileSync('git', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000, killSignal: 'SIGKILL', ...opts });
@@ -271,39 +270,8 @@ function readRepeatRuns(mainCiRuns, { state, jobFailures, readJobs, readLog, set
 
 /** One failed job's vitest failures from its log (`gh api …/jobs/<id>/logs`). Throws on an unreadable log. */
 export function readJobFailures(jobId, { exec, repoSlug }) {
-  return parseVitestFailures(readJobLog(jobId, { exec, repoSlug }));
-}
-
-function readJobLog(jobId, { exec, repoSlug }) {
   const text = exec('gh', ['api', `repos/${repoSlug}/actions/jobs/${jobId}/logs`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL' });
-  return String(text ?? '');
-}
-
-/** Aggregates own no test failures: only the workflow's dependency message and final exit are covered. */
-function aggregateFailureCovered(job, text) {
-  const messages = {
-    test: /^(?:Unit shards|Coverage merge|Integration) did not succeed\.$/,
-    'coverage-merge': /^Unit shards did not succeed; refusing incomplete coverage\.$/,
-    'daemon-soak': /^One or more soak shards did not succeed \(soak-shard result: failure\)\.$/,
-  };
-  if (!Object.hasOwn(messages, job) || typeof text !== 'string') return false;
-  const lines = text.trimEnd().split('\n');
-  let command = false, message = false, exit = false;
-  for (const [index, raw] of lines.entries()) {
-    const line = raw.replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z /, '').replace(/\x1b\[[0-9;]*m/g, '').trim();
-    // Actions prints the shell script in a Run group; those quoted branches are not executed errors.
-    if (/^##\[group\]Run\b/.test(line)) { command = true; continue; }
-    if (command) {
-      if (/^(?:##\[error\]|::error::|\w*Error:)/i.test(line)) return false;
-      if (line === '##[endgroup]') command = false;
-      continue;
-    }
-    const plain = line.replace(/^(?:##\[error\]|::error::)/, '');
-    if (messages[job].test(plain)) { message = true; continue; }
-    if (index === lines.length - 1 && /^##\[error\]Process completed with exit code 1\.$/.test(line)) { exit = true; continue; }
-    if (/error|fail|did not succeed|timed?\s*out|timeout|ELIFECYCLE/i.test(line)) return false;
-  }
-  return !command && message && exit;
+  return parseVitestFailures(String(text ?? ''));
 }
 
 /**
@@ -655,43 +623,6 @@ function flagsOf(argv) {
 export function skipForList(r, { now, prNumber = null, fixPrs = [], onMain = false }) {
   if (!r?.ok || r.list?.mode !== 'quarantine') return [];
   return testsToSkip({ list: r.list, now, prNumber, fixPrs, onMain });
-}
-
-/** Fresh, complete evidence only. At most five shard + three aggregate logs; larger/unknown reds need operator repair. */
-export function mainQuarantineCovered({ list, signal, now, exec = execFileSyncThrottled, repoSlug = CONSTELLATION_REPOS.we.slug,
-  readJobs = (id) => readRunJobs(id, { exec, repoSlug }), readLog = (id) => readJobFailures(id, { exec, repoSlug }),
-  readAggregateLog = (id) => readJobLog(id, { exec, repoSlug }) }) {
-  try {
-    if (!validateQuarantineList(list).ok || list.mode !== 'quarantine') return false;
-    const settings = mainCiRedSettings();
-    const [run] = JSON.parse(String(exec('gh', ['run', 'list', '--repo', repoSlug, '--workflow', settings.mainCiRedWorkflow,
-      '--branch', settings.mainCiRedBranch, '--limit', '1', '--json', 'databaseId,status,conclusion,headSha'],
-    { encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] })));
-    if (run?.status !== 'completed' || !['failure', 'timed_out'].includes(run.conclusion)
-      || !/^[1-9]\d*$/.test(String(run.databaseId)) || !run.headSha || run.headSha !== (signal.latestRedSha ?? signal.firstRedSha)) return false;
-    const jobs = readJobs(run.databaseId);
-    if (!jobs?.complete || !Array.isArray(jobs.jobs) || !Array.isArray(jobs.failed) || !jobs.failed.length) return false;
-    const local = (name) => String(name).split(' / ').at(-1);
-    const shards = jobs.failed.filter((j) => /^(test|soak)-shard \(\d+\)$/.test(local(j.name)));
-    if (!shards.length || shards.length > 5) return false;
-    // The failed projection omits cancelled/infra jobs. Only covered failed shards may time out.
-    if (jobs.jobs.some((j) => !['success', 'skipped', 'neutral', 'failure', 'timed_out'].includes(j.conclusion)
-      || (j.conclusion === 'timed_out' && !shards.some((s) => s.id === j.id)))) return false;
-    const derived = { test: 'test-shard', 'coverage-merge': 'test-shard', 'daemon-soak': 'soak-shard' };
-    const aggregates = jobs.failed.filter((j) => !shards.includes(j));
-    if (aggregates.length > 3 || aggregates.some((j) => !Object.hasOwn(derived, local(j.name))
-      || !shards.some((s) => local(s.name).startsWith(`${derived[local(j.name)]} (`)))) return false;
-    if (!aggregates.every((j) => aggregateFailureCovered(local(j.name), readAggregateLog(j.id)))) return false;
-    const shas = [signal.firstRedSha, signal.latestRedSha].filter(Boolean);
-    const entries = list.entries.filter((e) => shas.some((s) => s.startsWith(e.brokenSha) || e.brokenSha.startsWith(s)));
-    return shards.every((j) => {
-      const failures = readLog(j.id);
-      if (failures?.complete !== true || !Array.isArray(failures.files) || !failures.files.length) return false;
-      const { skip } = decideCiSkip({ mode: 'quarantine', read: { ok: true, list: { ...list, entries } },
-        ctx: { known: true, onMain: false, prNumber: null }, changedFiles: [], now, job: j.name });
-      return failures.files.every((f) => skip.includes(testFileOf(f)));
-    });
-  } catch { return false; }
 }
 
 /**

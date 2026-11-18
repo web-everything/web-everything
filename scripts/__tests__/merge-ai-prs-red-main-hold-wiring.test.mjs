@@ -36,11 +36,6 @@ const F = process.env.RMH_FIXTURE;
 const prs = JSON.parse(fs.readFileSync(F, 'utf8'));
 const landed = n => fs.existsSync(F + '.merged-' + n);
 const out = x => { process.stdout.write(JSON.stringify(x)); process.exit(0); };
-if (process.env.RMH_QUARANTINE) {
-  if (a[0] === 'run' && a[1] === 'list') out([{ databaseId: 1, status: 'completed', conclusion: 'failure', headSha: 'abc1234567' }]);
-  if (a[0] === 'api' && /actions\\/runs\\/1\\/jobs/.test(a[1])) out({ total_count: 1, jobs: [{ id: 1, name: 'soak-shard (1)', conclusion: 'failure' }] });
-  if (a[0] === 'api' && /actions\\/jobs\\/1\\/logs/.test(a[1])) { process.stdout.write(' FAIL scripts/covered.test.mjs > covered case\\nAssertionError: failed\\n Test Files 1 failed\\n'); process.exit(0); }
-}
 if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('main'); process.exit(0); }
 // RMH_LATE_FREEZE: the operator raises the freeze DURING the pass (after the drain's pre-pass freeze check).
 if (a[0] === 'pr' && a[1] === 'list' && process.env.RMH_LATE_FREEZE && !fs.existsSync(process.env.RMH_LATE_FREEZE)) {
@@ -80,10 +75,6 @@ process.exit(0);
 `;
 const fakeGit = `#!/usr/bin/env node
 const a = process.argv.slice(2);
-if (process.env.RMH_QUARANTINE) {
-  if (a[0] === 'ls-tree' && a.includes('quarantine.json')) { process.stdout.write('quarantine.json'); process.exit(0); }
-  if (a[0] === 'show' && a[1]?.endsWith(':quarantine.json')) { process.stdout.write(process.env.RMH_QUARANTINE); process.exit(0); }
-}
 if (process.env.RMH_SHARED_FREEZE) {
   if (a[0] === 'ls-tree' && a.includes('red-main-freeze.json')) { process.stdout.write('red-main-freeze.json'); process.exit(0); }
   if (a[0] === 'show' && a[1]?.endsWith(':red-main-freeze.json')) { process.stdout.write(process.env.RMH_SHARED_FREEZE); process.exit(0); }
@@ -111,7 +102,7 @@ const OTHER = 3002; // an unrelated PR that is otherwise fully mergeable
  * @param {{ freeze?: 'env'|'legacy'|'both'|null, priorityPrs?: number[]|null, publishedRed?: boolean, holdSetting?: 'on'|'off'|null,
  *           fixMergeable?: string, unfreezeFirst?: boolean, dryRun?: boolean, stranded?: boolean, lateFreeze?: boolean }} o
  */
-function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdSetting = null, fixMergeable = 'MERGEABLE', unfreezeFirst = false, dryRun = false, stranded = false, lateFreeze = false, shared = null, markerKind = null, manualFix = 'hold', cardGroup = false, lateGroup = null, quarantine = false } = {}) {
+function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdSetting = null, fixMergeable = 'MERGEABLE', unfreezeFirst = false, dryRun = false, stranded = false, lateFreeze = false, shared = null, markerKind = null, manualFix = 'hold', cardGroup = false, lateGroup = null } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'drain-rmh-'));
   try {
     const bin = join(dir, 'bin');
@@ -168,10 +159,7 @@ function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdS
     if (lateFreeze) { env.WE_RED_MAIN_FREEZE = envMarker; env.RMH_LATE_FREEZE = envMarker; } // written by the fake gh mid-pass
     // Pin the hold + mode: with VITEST cleared the live scripts/settings/red-main-hold.json would otherwise be read.
     env.WE_DRAIN_RED_MAIN_HOLD = holdSetting || 'on';
-    env.WE_DRAIN_RED_MAIN_MODE = quarantine ? 'quarantine' : 'stop';
-    if (quarantine) env.RMH_QUARANTINE = JSON.stringify({ version: 1, mode: 'quarantine', entries: [{
-      test: 'scripts/covered.test.mjs', job: 'soak-shard (1)', brokenSha: 'abc1234567', owner: 'operator', reason: 'fixture', addedAt: NOW, expiresAt: FUTURE,
-    }] });
+    env.WE_DRAIN_RED_MAIN_MODE = 'stop';
     // R546: with VITEST cleared the drain-read source defaults to GitHub REST; this fixture serves a fake git, so pin it.
     env.WE_DRAIN_READS_SOURCE = 'git';
     env.WE_DRAIN_RED_MAIN_MANUAL_FREEZE_FIX_PR = manualFix;
@@ -346,17 +334,6 @@ describe('card xx7ckd6 — red-main hold wired at the drain merge site (no --no-
     const { mainPushes, stderr, result } = runCli({ publishedRed: true, priorityPrs: [FIX], stranded: true });
     expect(mainPushes, stderr).toEqual([]);
     expect(result.strandedSweep).toMatchObject({ skipped: 'red-main-hold', applied: [] });
-  }, CLI_TEST_TIMEOUT_MS);
-
-  it('full quarantine coverage retains the stranded-card main-write hold while PR files are unknown', () => {
-    const { mainPushes, attempts, stderr, result } = runCli({ publishedRed: true, stranded: true, quarantine: true });
-    // --no-reconcile-labels leaves PR files unknown. Prove coverage enabled the quarantine overlap guard,
-    // rather than falling back to stop mode, before checking the independent pass-level write hold.
-    expect(attempts, stderr).toEqual([]);
-    expect(result.skipped).toHaveLength(2);
-    expect(result.skipped.every((v) => v.reason.includes('main is red (quarantine)'))).toBe(true);
-    expect(mainPushes, stderr).toEqual([]);
-    expect(result.strandedSweep).toMatchObject({ skipped: 'red-main-hold', applied: [], autoResolvable: [{ id: '7001' }] });
   }, CLI_TEST_TIMEOUT_MS);
 
   // Rollback/switch: with the setting OFF the only guard used to be the pre-pass stop, so a freeze raised after it

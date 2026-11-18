@@ -2388,8 +2388,6 @@ limits, idle-hook order and real local packing that preserves recent unreachable
 oversized stamp skips GC (`stamp-unreadable` in the `clone-maintenance` event); inspect
 and repair `clone-maintenance-<cloneLockKey>.json` under the daemon state directory.
 
-Quarantine coverage probes must use the latest completed main run, complete shard failure logs, and active job-matched entries; missing evidence retains the drain hold. Soak case IDs map to scenario files only in explicitly tagged soak jobs; unit name-qualified entries still run.
-
 The `heavy-enforce` guard requires admission even for one-file Vitest runs, `related`,
 and direct `check-standards.mjs` execution. Use `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <file>`
 or the admitted `npm run test:unit -- <file>` / `npm run check:standards` scripts.
@@ -4616,10 +4614,3 @@ oversized/incomplete/foreign evidence, target head invalidation, snapshot exclus
 a live target replacing a stale cached target with a different head and red check.
 Run it with `fast-drain-scope.test.mjs` and `merge-ai-prs.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
 comparison against daemon observations; fixtures prove IO counts without live GitHub calls.
-
-## Quarantine aggregate log evidence
-
-Named quarantine entries never exclude files, including single-case soak files. Drain release also
-reads each failed aggregate log: only its known workflow dependency message and final exit are covered;
-unreadable, incomplete, independent or unknown failures retain the operator hold. Keep these regressions
-in `quarantine-job-wiring.test.mjs` and `red-main-quarantine-io.test.mjs` and run them through heavy admission.

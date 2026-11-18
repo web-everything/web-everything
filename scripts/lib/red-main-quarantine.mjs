@@ -175,42 +175,21 @@ const LOG_TS = /^\d{4}-\d\d-\d\dT[\d:.]+Z /;
 /**
  * Failing vitest tests from one CI job's log (untrusted text). `complete` only when the run's own summary line
  * (`Test Files  N failed | …`) names exactly as many failed files as were parsed — anything else (a crash before the
- * summary, a cut-off log, a failure outside vitest) is NOT a known-failing-test case. Trailing errors/failures and
- * a test-count mismatch also make the evidence incomplete: retain the hold for operator repair. PURE.
+ * summary, a cut-off log, a failure outside vitest) is NOT a known-failing-test case. PURE.
  * @returns {{files:string[], tests:Array<{file:string,name:string|null}>, failedFiles:number|null, complete:boolean}}
  */
 export function parseVitestFailures(logText) {
   const tests = [];
-  let failedFiles = null, failedTests = null, incomplete = false, assertionBlock = false, assertionErrorSeen = false;
-  const lines = String(logText ?? '').trimEnd().split('\n');
-  for (const [index, raw] of lines.entries()) {
+  let failedFiles = null;
+  for (const raw of String(logText ?? '').split('\n')) {
     const line = raw.replace(LOG_TS, '').replace(ANSI, '').trimEnd();
-    // A listed FAIL owns only its assertion block, never independent runner/worker errors.
-    if (/^\s*(?:[⎯─═-]{3,}|Test Files\b|Tests\b)/.test(line)) assertionBlock = false;
-    const finalExit = index === lines.length - 1 && failedFiles !== null
-      && /^\s*##\[error\]Process completed with exit code [1-9]\d*\.$/.test(line);
-    if (!finalExit && (/Unhandled|worker.*(?:crash|exit|error)|##\[error\]|ELIFECYCLE/i.test(line)
-      || (!assertionBlock && /Error|timed?\s*out|timeout/i.test(line))
-      || (failedFiles !== null && /^\s*(?:FAIL\b|[×❯])/.test(line)))) incomplete = true;
-    if (/^\s*(?:\w*Error|Timeout):/i.test(line)) {
-      if (assertionErrorSeen) incomplete = true;
-      assertionErrorSeen = true;
-    }
     const m = /^\s*FAIL\s+(\S+)(?:\s+\[[^\]]*\])?(?:\s+>\s+(.+))?$/.exec(line); // `FAIL file > a > b`, or `FAIL file [ file ]` (a suite that failed to load)
-    if (m && SAFE_TEST.test(m[1]) && !m[1].includes('..') && /\.test\.[cm]?[jt]sx?$/.test(m[1])) {
-      tests.push({ file: m[1], name: m[2] ? m[2].replace(/\s+>\s+/g, ' > ').slice(0, 200) : null });
-      assertionBlock = failedFiles === null;
-      assertionErrorSeen = false;
-    }
-    else if (/^\s*FAIL\b/.test(line)) incomplete = true;
+    if (m && SAFE_TEST.test(m[1]) && !m[1].includes('..') && /\.test\.[cm]?[jt]sx?$/.test(m[1])) tests.push({ file: m[1], name: m[2] ? m[2].replace(/\s+>\s+/g, ' > ').slice(0, 200) : null });
     const s = /^\s*Test Files\s+(\d+) failed\b/.exec(line);
     if (s) failedFiles = Number(s[1]);
-    const t = /^\s*Tests\s+(\d+) failed\b/.exec(line);
-    if (t) failedTests = Number(t[1]);
   }
   const files = [...new Set(tests.map((t) => t.file))];
-  return { files, tests, failedFiles, complete: !incomplete && failedFiles !== null && failedFiles === files.length && files.length > 0
-    && (failedTests === null || failedTests === tests.filter((t) => t.name !== null).length) };
+  return { files, tests, failedFiles, complete: failedFiles !== null && failedFiles === files.length && files.length > 0 };
 }
 
 /** Built-in (standard) knobs of the safety net; the IO resolves each through the policy cascade. */

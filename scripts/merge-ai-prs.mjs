@@ -244,7 +244,7 @@ import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward
 import { decideQuarantineHold, resolveFixFiles, listedPrFiles } from './lib/red-main-quarantine.mjs'; // mode `quarantine` (OFF by default until its red-team review)
 import { readPinnedChangedFiles, workflowEditHold } from './lib/merge-queue-enqueue.mjs';
 import { decideDrainWorkflowEditHold, decideWorkflowHoldRepark, resolveDrainWorkflowEditHuman } from './lib/drain-workflow-edit-hold.mjs';
-import { readQuarantine, mainQuarantineCovered } from './lib/red-main-quarantine-io.mjs'; // the "contain" third of the red-main safety net
+import { readQuarantine } from './lib/red-main-quarantine-io.mjs'; // the "contain" third of the red-main safety net: while main is red only the main-fix PR(s) land
 export { remoteManifestApiArgs };
 
 // #2414 — the local, machine-scoped FIRST-DRAIN-SIGHTING manifest baseline the land-time tamper gate diffs a
@@ -6802,18 +6802,15 @@ async function runCli() {
         redMainHeld = true;
         let held = 0;
         // Mode `quarantine`: hold only PRs overlapping the fix PR's files or a quarantined test's area; no live
-        // coverage missing or unreadable ⇒ STOP. Other main writes stay held even with complete coverage.
+        // quarantine entry (or an unreadable list) ⇒ every PR falls back to STOP inside decideQuarantineHold.
         // A MANUAL freeze is the operator's stop-the-line: quarantine never relaxes it (stop mode for every PR).
         const mode = resolveRedMainMode();
-        let quarantine = mode.value === 'quarantine' && !sig.sources.includes('manual') && !sig.sources.includes('freeze-unreadable');
+        const quarantine = mode.value === 'quarantine' && !sig.sources.includes('manual') && !sig.sources.includes('freeze-unreadable');
         let qList = null;
         let filesOf = () => null;
         if (quarantine) {
           const q = readQuarantine();
           qList = q.ok ? q.list : null;
-          quarantine = mainQuarantineCovered({ list: qList, signal: sig, now: Date.now() });
-          if (!quarantine && !AS_JSON) process.stderr.write('  red-main-hold: quarantine coverage incomplete or unreadable; held until complete evidence or operator repair\n');
-          else if (!AS_JSON) process.stderr.write('  quarantine: latest main failures fully covered; drain resumes with PR overlap guards\n');
           const localPrs = [...(openPrContext?.prsByRepo instanceof Map ? openPrContext.prsByRepo : new Map())].filter(([r]) => isLocalRepo(r)).flatMap(([, prs]) => prs || []);
           filesOf = (n) => listedPrFiles(localPrs.find((x) => Number(x?.number) === Number(n))); // null ⇒ unknown OR cut off at the listing cap (fail closed)
         }

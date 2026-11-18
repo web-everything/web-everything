@@ -61,12 +61,6 @@ describe('CI consumes quarantine for every automatically quarantined suite', () 
   it.each(['integration', 'test-shard (1)', 'soak-shard (1)'])('%s never excludes a named entry even for a matching single test', (job) => {
     expect(skip(job, `${soakFile}::${soakName}`).skip).toEqual([]);
   });
-
-  it('named quarantine never suppresses aliased unrelated assertions or scans their source', () => {
-    const readSource = vi.fn(() => "import { it, test as scenario } from 'vitest';\nit('named case', () => {});\nscenario('unrelated failure', () => { throw new Error('failure'); });");
-    expect(skip('soak-shard (1)', `${soakFile}::named case`, { readSource }).skip).toEqual([]);
-    expect(readSource).not.toHaveBeenCalled();
-  });
 });
 
 // Exercise the actual soak CLI module, replacing only process execution and assignment.
