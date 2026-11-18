@@ -4731,3 +4731,13 @@ Preserve `overlaysBefore` as a veto for omitted live tips: the regression for a 
 retired during planning must reject its omission and preserve HEAD.
 Run this file and `daemon-rebuild-events.test.mjs` through heavy admission. This adoption
 rule does not reset overlay main-sync parking or add retries for parked overlays.
+
+
+## Overlay main-sync interrupted test evidence
+
+A heavy-admission test timeout or killed process is incomplete evidence even if it left a green
+report. Retry the same chunk once with a distinct report path; a second interruption fails closed
+with the structured cause ahead of the cleaned diagnostic tail and asks for operator review.
+Remote termination unconfirmed remains a skip, including on the retry. Ordinary test failures
+retain the failed-file flake reruns and plain-main comparison. The killed-run soak proves the retry
+by executing an injected killed-once, then green runner; its presence probe uses behavior, not source markers.

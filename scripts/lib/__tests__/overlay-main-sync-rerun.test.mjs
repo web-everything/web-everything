@@ -753,3 +753,152 @@ describe('resolveOverlayMainRedExpiryHours policy cascade', () => {
     expect(log.mock.calls.flat().join('\n')).toMatch(/mainRedExpiryHours.*2.*env/);
   });
 });
+
+
+describe('overlay main sync interrupted test runs', () => {
+  const warnings = '(node:123) [DEP0040] DeprecationWarning: The `punycode` module is deprecated.\n'
+    + '(Use `node --trace-deprecation ...` to show where the warning was created)\n';
+  const timeout = { status: 124, stdout: '', stderr: warnings.repeat(20)
+    + 'heavy-command admission: run exceeded 480000ms and was stopped.\n' + warnings.repeat(20) };
+
+  it('warnings-only stderr with status 0 is green', async () => {
+    const f = fixture();
+    f.deps.testRunner = vi.fn(async options => ({ ...report(options), stderr: warnings }));
+    expect(await job(f)).toMatchObject({ pushed: true });
+    expect(f.deps.testRunner).toHaveBeenCalledOnce();
+    expect(kinds(f)).not.toContain('overlay-main-timeout-retried');
+  });
+
+  it.each([
+    ['admission timeout', timeout],
+    ['status 124', { status: 124, stdout: '', stderr: '' }],
+    ['signal', { status: null, signal: 'SIGTERM', stdout: '', stderr: '' }],
+    ['ETIMEDOUT', { status: null, error: { code: 'ETIMEDOUT' } }],
+    ['ENOBUFS', { status: null, error: { code: 'ENOBUFS' } }],
+    ['timeout stderr with status 0', { ...timeout, status: 0 }],
+  ])('retries %s once on the same chunk with fresh evidence, then proceeds green', async (_name, killed) => {
+    const f = fixture({ reruns: 0 }), paths = [], files = [], trees = [];
+    f.deps.testRunner = vi.fn(async options => {
+      paths.push(options.testReport); files.push(selectedFiles(options)); trees.push(options.root);
+      expect(fs.existsSync(options.testReport)).toBe(false);
+      // Even a complete-looking green report cannot clear an interrupted command.
+      const green = report(options);
+      return paths.length === 1 ? killed : green;
+    });
+    expect(await job(f)).toMatchObject({ pushed: true });
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    expect(new Set(paths).size).toBe(2);
+    expect(files[1]).toEqual(files[0]);
+    expect(trees[1]).toBe(trees[0]);
+    expect(f.events.filter(e => e.kind === 'overlay-main-timeout-retried')).toEqual([
+      { kind: 'overlay-main-timeout-retried', ref, files: 3 },
+    ]);
+  });
+
+  it.each([
+    ['timeout', timeout, { kind: 'timeout', status: 124, signal: null, limitMs: 480000, files: 3 }],
+    ['signal', { status: null, signal: 'SIGKILL', stdout: '', stderr: warnings },
+      { kind: 'killed', status: null, signal: 'SIGKILL', limitMs: null, files: 3 }],
+    ['buffer exhaustion', { status: null, stdout: '', stderr: warnings, error: { code: 'ENOBUFS' } },
+      { kind: 'killed', status: null, signal: null, limitMs: null, files: 3 }],
+  ])('fails closed after two interruptions (%s), with cause in the error, event and card', async (_name, killed, cause) => {
+    const f = fixture({ reruns: 2 });
+    f.deps.testRunner = vi.fn(async options => {
+      report(options, 'failed');
+      return killed;
+    });
+    f.deps.mainTestRunner = vi.fn();
+    await expect(job(f)).rejects.toMatchObject({ step: 'tests', cause,
+      message: expect.stringMatching(/^tests: run killed \(.+, 2 attempts, 3 files\)/),
+      failedTests: [`${failedFile} > worker > worker behaves`] });
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    expect(f.deps.mainTestRunner).not.toHaveBeenCalled();
+    const detail = f.outcomes.find(e => e.kind === 'overlay-main-sync-failed').detail;
+    expect(detail).toMatchObject({ cause, failedTests: [`${failedFile} > worker > worker behaves`] });
+    expect(detail.stderrTail).not.toMatch(/DeprecationWarning|--trace-deprecation/);
+    expect(detail.stderrTail.length).toBeLessThanOrEqual(500);
+    if (cause.kind === 'timeout') expect(detail.stderrTail).toContain('run exceeded 480000ms and was stopped');
+    const reason = fs.readFileSync(alertsFilePath(f.root, f.env), 'utf8');
+    expect(reason).toContain('tests: run killed (');
+    expect(reason).not.toMatch(/DeprecationWarning|--trace-deprecation/);
+    expect(kinds(f)).not.toContain('overlay-main-timeout-retried');
+    noPublication(f);
+  });
+
+  it('an oversized partial report still fails closed with timeout cause and operator escalation', async () => {
+    const f = fixture();
+    f.deps.testRunner = vi.fn(async options => {
+      fs.writeFileSync(options.testReport, ' '.repeat(8 * 1024 * 1024 + 1));
+      return timeout;
+    });
+    await expect(job(f)).rejects.toMatchObject({ cause: { kind: 'timeout', limitMs: 480000 },
+      failedTests: [], message: expect.stringContaining('operator review required') });
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    expect(f.outcomes.find(e => e.kind === 'overlay-main-sync-failed').detail).toMatchObject({
+      cause: { kind: 'timeout', limitMs: 480000 }, failedTests: [],
+    });
+    noPublication(f);
+  });
+
+  it('a thrown timeout gets the same single retry as a returned timeout', async () => {
+    const f = fixture();
+    f.deps.testRunner = vi.fn(async options => {
+      if (f.deps.testRunner.mock.calls.length === 1) throw Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' });
+      return report(options);
+    });
+    expect(await job(f)).toMatchObject({ pushed: true });
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    expect(kinds(f)).toContain('overlay-main-timeout-retried');
+  });
+
+  it('a retry with absent report fails closed instead of reusing the first green report', async () => {
+    const f = fixture();
+    f.deps.testRunner = vi.fn(async options => f.deps.testRunner.mock.calls.length === 1
+      ? (report(options), timeout) : { status: 0, stdout: '', stderr: warnings });
+    await expect(job(f)).rejects.toMatchObject({ step: 'tests' });
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    noPublication(f);
+  });
+
+  it('a remote-unconfirmed retry stays a skip without further execution', async () => {
+    const f = fixture();
+    f.deps.testRunner = vi.fn(async () => f.deps.testRunner.mock.calls.length === 1 ? timeout : {
+      status: 124, stderr: 'remote termination unconfirmed; refusing local rerun (exit 124).',
+    });
+    expect(await job(f)).toEqual({ skipped: true, reason: 'remote-termination-unconfirmed' });
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    expect(f.outcomes.some(e => e.kind === 'overlay-main-sync-failed')).toBe(false);
+    noPublication(f);
+  });
+
+  it('real red with warning noise keeps flake reruns and main-red comparison', async () => {
+    const f = fixture(); runners(f, ['failed', 'failed'], 'failed', 1);
+    const runner = f.deps.testRunner;
+    f.deps.testRunner = vi.fn(async options => ({ ...await runner(options), stderr: warnings }));
+    expect(await job(f)).toEqual({ skipped: true, reason: 'main-red' });
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    expect(f.deps.mainTestRunner).toHaveBeenCalledOnce();
+    expect(kinds(f)).not.toContain('overlay-main-timeout-retried');
+    noPublication(f);
+  });
+
+  it('a twice-killed main comparison retains its cause instead of classifying main-red', async () => {
+    const f = fixture(); runners(f, ['failed', 'failed'], 'passed', 1);
+    f.deps.mainTestRunner = vi.fn(async () => timeout);
+    await expect(job(f)).rejects.toMatchObject({ cause: { kind: 'timeout', limitMs: 480000, files: 1 } });
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    expect(f.deps.mainTestRunner).toHaveBeenCalledTimes(2);
+    expect(f.outcomes.find(e => e.kind === 'overlay-main-sync-failed').detail.cause.kind).toBe('timeout');
+    expect(kinds(f)).not.toContain('overlay-main-red');
+    noPublication(f);
+  });
+
+  it('a real red with flake reruns disabled is not retried and carries exit cause and names', async () => {
+    const f = fixture({ reruns: 0 }); runners(f, ['failed'], 'passed', 1);
+    await expect(job(f)).rejects.toMatchObject({ cause: { kind: 'exit', status: 1, files: 3 },
+      failedTests: [`${failedFile} > worker > worker behaves`] });
+    expect(f.deps.testRunner).toHaveBeenCalledOnce();
+    expect(f.deps.mainTestRunner).not.toHaveBeenCalled();
+    noPublication(f);
+  });
+});
