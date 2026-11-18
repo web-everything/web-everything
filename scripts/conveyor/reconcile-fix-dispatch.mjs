@@ -1,4 +1,5 @@
-import { publishRedTeamFixLaunch } from './red-team-fix-round-count.mjs';
+import { sharedRoundAttempts } from './reconcile-core.mjs';
+import { publishRedTeamFixLaunch, lockRedTeamFixCharge } from './red-team-fix-round-count.mjs';
 import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 import { safeAdoptYield } from '../lib/daemon-rebuild/adopt-yield.mjs';
 import { admitMqFailureRoute } from './mq-failure-intake.mjs';
@@ -1419,16 +1420,20 @@ export function publishRedTeamFixDispatch({ repo, planned }, {
   readComments = () => readCompletePrComments(planned.pr, { repo: ghRepoSlug(repo) }),
   exec = execFileSyncThrottled,
 } = {}) {
-  const comments = readComments(); // Complete reader throws on missing evidence; never launch uncounted.
-  const head = planned.headRefOid;
-  if (planned.redTeamSentBack?.head !== head
-      || !Number.isSafeInteger(planned.attempts) || planned.attempts < 0) {
-    throw new Error('red-team repair dispatch evidence unreadable; retry with a fresh reconciliation or ask an operator');
-  }
-  return publishRedTeamFixLaunch({ comments, pr: planned.pr, head, attemptId: planned.attempts + 1,
-    publish: body => exec('gh', ['pr', 'comment', String(planned.pr), '--repo', ghRepoSlug(repo), '--body', body],
-      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 1024 * 1024 }),
-  });
+  const release = lockRedTeamFixCharge(ghRepoSlug(repo), planned.pr);
+  try {
+    const comments = readComments(); // Complete reader throws on missing evidence; never launch uncounted.
+    const head = planned.headRefOid;
+    if (planned.redTeamSentBack?.head !== head
+        || !Number.isSafeInteger(planned.attempts) || planned.attempts < 0) {
+      throw new Error('red-team repair dispatch evidence unreadable; retry with a fresh reconciliation or ask an operator');
+    }
+    return publishRedTeamFixLaunch({ comments, pr: planned.pr, head, attemptId: planned.attempts + 1,
+      chargedRounds: sharedRoundAttempts({ comments, headRefOid: head }), cap: planned.roundCap,
+      publish: body => exec('gh', ['pr', 'comment', String(planned.pr), '--repo', ghRepoSlug(repo), '--body', body],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 1024 * 1024 }),
+    });
+  } finally { release(); }
 }
 
 /**
@@ -1657,6 +1662,8 @@ export function dispatchFix(planned, {
           pr: planned.pr, num: planned.itemNum, sessionSlug, cwd: root,
           ref: planned.laneRef, repo: ghRepoSlug(repo), laneRepo: tokens.LANE_REPO, scope: planned.scope.join(','),
           promptFile, claimRepo: repo,
+          mode: planned.mode, head: planned.headRefOid, attempts: planned.attempts,
+          resultId: planned.redTeamSentBack?.resultId, roundCap: planned.roundCap,
           mergeOnto: mergeOntoFor(planned),
           policyRoute: decision.policyRoute ?? { provider: decision.executor === 'codex' ? 'codex' : 'antigravity-claude' },
         });

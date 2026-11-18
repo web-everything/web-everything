@@ -254,7 +254,7 @@ export function shapePrs(prList) {
   const rows = Array.isArray(prList) ? prList : [];
   return rows.map((p) => ({
     num: itemNumFromRef(p?.headRefName),
-    prNumber: Number(p?.number) || null,
+    prNumber: Number(p?.number ?? p?.prNumber) || null,
     state: String(p?.state || ''),
     ci: ciRollup(p?.statusCheckRollup),
     // gh labels arrive as `[{name}]`; tolerate a bare-string array too.
@@ -264,6 +264,7 @@ export function shapePrs(prList) {
     // Raw gh mergeable-state (e.g. `BEHIND`) — the CI-heal loop's BEHIND branch reads this (#2666/#2738).
     mergeStateStatus: String(p?.mergeStateStatus || ''),
     stoodDown: standDownComments(p?.comments).length > 0,
+    ...(p?.mode ? { mode: p.mode } : {}),
   }));
 }
 

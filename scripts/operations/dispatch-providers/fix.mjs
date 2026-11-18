@@ -1,3 +1,4 @@
+import { redTeamFixLaunchId } from '../../conveyor/red-team-fix-round-count.mjs';
 /**
  * @file scripts/operations/dispatch-providers/fix.mjs
  * @description THE `fix` LAUNCH KIND'S MECHANICAL DISPATCH PROVIDER (#3640) — copied from the template
@@ -114,7 +115,11 @@ export function fixDetachedProvider(request, {
   const argv = [String(runScript), `--pr=${pr}`, `--session=${sessionSlug}`];
   // Session slugs repeat across dispatches. Preserve this ID on a retry of the same launch;
   // a fresh dispatch gets its own counted repair, even if no executor makes a commit.
-  argv.push(`--launch-id=${request.launchId ?? randomUUID()}`);
+  const launchId = request.mode === 'red-team-sent-back'
+    ? redTeamFixLaunchId({ repo: request.repo, pr, head: request.head, resultId: request.resultId, attempts: request.attempts })
+    : request.launchId ?? randomUUID();
+  argv.push(`--launch-id=${launchId}`);
+  if (request.roundCap !== undefined) argv.push(`--red-team-round-cap=${request.roundCap}`);
   // The ITEM is optional for a repair (`planFixDispatchWrapper` takes `item: null`, and the brief documents
   // `$FIX_ITEM` as "when known"), so it is passed only when there is one rather than as an empty flag the
   // wrapper would have to re-normalise.

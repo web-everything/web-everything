@@ -1,7 +1,8 @@
 #!/usr/bin/env node
+import { sharedRoundAttempts } from '../conveyor/reconcile-core.mjs';
 import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 import { redTeamSentBackFindings } from '../conveyor/dispatch-eligibility-facts.mjs';
-import { publishRedTeamFixLaunch } from '../conveyor/red-team-fix-round-count.mjs';
+import { publishRedTeamFixLaunch, lockRedTeamFixCharge } from '../conveyor/red-team-fix-round-count.mjs';
 import { randomUUID } from 'node:crypto';
 import { buildStandDownComment } from '../conveyor/stand-down.mjs';
 import { repeatedFindingPlan, applyScopeReset, resolveFixSafety } from '../conveyor/repeated-finding-reset.mjs';
@@ -121,6 +122,7 @@ export function parseFixRunArgv(argv = []) {
   const repairKind = flags['repair-kind'] === undefined ? 'fix' : String(flags['repair-kind']).trim();
   if (!['fix', 'ci-heal'].includes(repairKind)) throw new TypeError(`fix-run: invalid --repair-kind=${repairKind} (supported: fix|ci-heal)`);
   return {
+    redTeamRoundCap: flags['red-team-round-cap'] === undefined ? undefined : Number(flags['red-team-round-cap']),
     repairKind, launchId: opt('launch-id') ?? randomUUID(), pr: String(flags.pr).trim(), sessionSlug: String(flags.session).trim(), ref: String(flags.ref).trim(),
     promptFile: String(flags['prompt-file']).trim(),
     item: opt('num'), repo: opt('repo'), claimRepo: opt('claim-repo'), laneRepo: opt('lane-repo'), scope: opt('scope'),
@@ -742,20 +744,25 @@ export async function runFixCli(argv = [], {
     let prContext;
     let openSendBacks = [];
     let repeatPlan = { action: 'patch' };
-    const chargeRedTeamLaunch = comments => {
-      const charged = publishRedTeamFixLaunch({
-        comments, pr: Number(pr), head: prHeadSha, attemptId: launch.launchId,
-        publish: body => withMessageFile(body, file => run('gh', ['pr', 'comment', pr,
-          ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot })),
-      });
-      // A durable receipt spends the launch even if its executor failed or never returned.
-      if (!charged) throw new LauncherError('launch already spent; a new dispatch is required');
+    const chargeRedTeamLaunch = async () => {
+      const release = lockRedTeamFixCharge(launch.repo, pr);
+      try {
+        const comments = await readComments(pr, { repo: launch.repo });
+        const charged = publishRedTeamFixLaunch({
+          comments, pr: Number(pr), head: prHeadSha, attemptId: launch.launchId,
+          chargedRounds: sharedRoundAttempts({ ...prHead, comments }), cap: launch.redTeamRoundCap,
+          publish: body => withMessageFile(body, file => run('gh', ['pr', 'comment', pr,
+            ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot })),
+        });
+        // A durable receipt spends the launch even if its executor failed or never returned.
+        if (!charged) throw new LauncherError('launch already spent; a new dispatch is required');
+      } finally { release(); }
     };
     if (launch.repairKind === 'ci-heal') {
       if (hasRedTeamSentBackLabels(prHead)) {
         const comments = await readComments(pr, { repo: launch.repo });
         redTeamRepair = redTeamSentBackFindings({ ...prHead, number: Number(pr), comments, commentsComplete: true }).length > 0;
-        if (redTeamRepair) chargeRedTeamLaunch(comments);
+        if (redTeamRepair) await chargeRedTeamLaunch();
       }
       const inputs = await readCiHeal({ repo: launch.repo, pr, run: (cmd, args, opts) => run(cmd, args, { cwd: weRoot, ...opts }) });
       if (!inputs.checks?.length) throw new LauncherError(`no-ci-failure: PR #${pr} has no failing check to heal`);
@@ -764,7 +771,7 @@ export async function runFixCli(argv = [], {
       const comments = await readComments(pr, { repo: launch.repo });
       redTeamRepair = hasRedTeamSentBackLabels(prHead)
         && redTeamSentBackFindings({ ...prHead, number: Number(pr), comments, commentsComplete: true }).length > 0;
-      if (redTeamRepair) chargeRedTeamLaunch(comments);
+      if (redTeamRepair) await chargeRedTeamLaunch();
       openSendBacks = openOperatorSendBacks({ comments, headRefOid: prHeadSha });
       const safety = resolveFixSafety();
       for (const k of ['alertAtRoundCap', 'resetOnRepeatedFinding']) write(`policy · fix.${k}=${safety.value[k]} (${safety.sources[k]})\n`);

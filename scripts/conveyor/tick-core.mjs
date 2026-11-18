@@ -789,7 +789,7 @@ export function planFixSpawns({ prs = [], launchedNums = [], liveFixGuards = [],
   const notes = [];
 
   for (const p of Array.isArray(prs) ? prs : []) {
-    if (!p || !isOpenPr(p) || !hasReviewChanges(p)) continue;
+    if (!p || !isOpenPr(p) || (!hasReviewChanges(p) && p.mode !== 'red-team-sent-back')) continue;
     if (!launched.has(normNum(p.num))) continue; // only PRs THIS conveyor launched
     const pr = Number(p.prNumber);
     if (!pr) continue;

@@ -11,7 +11,13 @@ import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
  * `we:scripts/operations/__tests__/review-dispatch.test.mjs`'s own style for the sibling operation this file's
  * `dispatchFix` composition was mirrored from.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join as chargeJoin } from 'node:path';
+let chargeRoot;
+beforeEach(() => { chargeRoot = mkdtempSync(chargeJoin(tmpdir(), 'red-team-charge-test-')); vi.stubEnv('WE_COORDINATION_ROOT', chargeRoot); });
+afterEach(() => { rmSync(chargeRoot, { recursive: true, force: true }); vi.unstubAllEnvs(); });
 import { spawnSync } from 'node:child_process';
 import * as ghThrottle from '../../lib/gh-throttle.mjs';
 import {

@@ -4592,3 +4592,14 @@ defer with a retry note on read failure, page-cap exhaustion, count mismatch or 
 unset floor; complete reads at zero/below/at cap preserve admission accounting.
 Keep ordinary modes fail-open on the same read failure. Persistent deferral asks
 the operator to inspect the full thread; the next tick reads fresh evidence.
+
+## Red-team repair charge transaction
+
+Carry reconcile mode through `shapePrs` and test the resulting row through `planFixSpawns`;
+a hand-built planner row does not prove restart floor admission. Borrowed launch IDs hash the
+planned repository, PR, head, gate result and charged attempt count. Test replay through
+`fixDetachedProvider` into `runFixCli`, with a mutable trusted thread and executor spy.
+Both receipt writers serialize fresh complete-thread reads, shared-round counting and publication
+under the same per-repository/PR charge lock in the shared coordination root. A busy or unreadable
+lock refuses admission; after a crashed writer an operator must inspect the full thread and remove
+the abandoned lock before retrying. Never reclaim a charge lock merely because time elapsed.

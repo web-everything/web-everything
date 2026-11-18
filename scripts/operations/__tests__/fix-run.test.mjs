@@ -12,7 +12,8 @@ import { openOperatorSendBacks } from '../../lib/operator-send-backs.mjs';
 import { dispatchFix, writePrivateBorrowedPrompt, withPlannedContext } from '../../conveyor/reconcile-fix-dispatch.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
 import { redTeamGateMarker, liveResultGateState } from '../../lib/red-team-gate.mjs';
-import { RED_TEAM_FIX_COMMENT_MARKER, countRedTeamFixComments } from '../../conveyor/red-team-fix-round-count.mjs';
+import { ADVISORY_NOTE_MARKER } from '../../conveyor/advisory-round-count.mjs';
+import { lockRedTeamFixCharge, RED_TEAM_FIX_COMMENT_MARKER, countRedTeamFixComments } from '../../conveyor/red-team-fix-round-count.mjs';
 import { buildFixEndComment } from '../../conveyor/fix-procedure.mjs';
 import { planReconcile } from '../../conveyor/reconcile-core.mjs';
 import { resolveFixBorrowSettings } from '../../lib/dispatch-throttle.mjs';
@@ -22,8 +23,9 @@ import { childFailureReason, resolveAcquireWaitPolicy, parseFixRunArgv, readCiHe
 
 // x6nuodj — these tests pin the LEGACY gate's verdicts, so the shared decision only observes here (`shadow`); the
 // cut-over itself (admit() deciding) is covered in we:scripts/lib/__tests__/resource-gate.test.mjs.
-beforeEach(() => { vi.stubEnv('WE_RESOURCE_CUTOVER', 'shadow'); vi.stubEnv('WE_RESOURCE_SHADOW', 'off'); });
-afterEach(() => vi.unstubAllEnvs());
+let chargeRoot;
+beforeEach(() => { chargeRoot = mkdtempSync(join(tmpdir(), 'red-team-charge-test-')); vi.stubEnv('WE_COORDINATION_ROOT', chargeRoot); vi.stubEnv('WE_RESOURCE_CUTOVER', 'shadow'); vi.stubEnv('WE_RESOURCE_SHADOW', 'off'); });
+afterEach(() => { rmSync(chargeRoot, { recursive: true, force: true }); vi.unstubAllEnvs(); });
 
 
 const MIN = 60_000;
@@ -196,6 +198,94 @@ describe('runFixCli', () => {
     expect(m.spawn).not.toHaveBeenCalled();
     expect(m.calls.some(c => c.includes('acquire') || c.includes('push') || c.includes('comment'))).toBe(false);
   });
+  it.each(['red-team', 'advisory'])('real provider replays the same red-team plan four times with one charge and executor launch, and refuses at the live shared cap (%s)', async budget => {
+    const pr = acceptedRedTeamPr();
+    const head = pr.headRefOid;
+    const m = mk([head, head]);
+    const request = { repo: 'o/r', pr: 7, sessionSlug: 'fix-7', ref: 'lane/7-x', promptFile: '/brief.md',
+      policyRoute: { provider: 'codex' }, mode: 'red-team-sent-back', head,
+      resultId: liveResultGateState(pr.comments, 7, head).resultId, attempts: 0, roundCap: 3 };
+    const run = (cmd, args, opts) => {
+      const result = m.run(cmd, args, opts);
+      if (cmd === 'gh' && args.includes('comment') && args.includes('--body-file')) {
+        pr.comments.push({ author: { login: 'web-everything' }, body: readFileSync(args.at(-1), 'utf8') });
+      }
+      return cmd === 'gh' && args.includes('view') ? JSON.stringify(pr) : result;
+    };
+    m.spawn.mockRejectedValue(Error('executor failed after charge'));
+    const runs = [], ids = [];
+    const spawnDetached = args => {
+      ids.push(args.find(a => a.startsWith('--launch-id=')));
+      runs.push(runFixCli(args.slice(1), { ...m.io, run, readComments: async () => pr.comments }));
+      return { pid: 99 };
+    };
+    const providerIo = { spawnDetached, readDeliveryAgentMarker: () => null, logPathFor: () => '/logs/fix-7' };
+    for (let replay = 0; replay < 4; replay++) {
+      fixDetachedProvider({ ...request }, providerIo);
+      expect((await runs.at(-1)).code).toBe(1);
+    }
+    expect(new Set(ids).size).toBe(1);
+    expect(countRedTeamFixComments(pr.comments)).toBe(1);
+    expect(m.spawn).toHaveBeenCalledTimes(1);
+    expect(m.calls.filter(c => c.includes('comment'))).toHaveLength(1);
+    // Fill the shared budget with legacy rounds, then submit a different unspent planned ID.
+    pr.comments.push(...Array.from({ length: 2 }, () => ({ author: { login: 'web-everything' }, body: budget === 'advisory' ? ADVISORY_NOTE_MARKER : RED_TEAM_FIX_COMMENT_MARKER })));
+    const writeErr = vi.fn();
+    const refused = [];
+    fixDetachedProvider({ ...request, attempts: 1 }, { ...providerIo, spawnDetached: args => {
+      refused.push(runFixCli(args.slice(1), { ...m.io, run, writeErr, readComments: async () => pr.comments }));
+      return { pid: 100 };
+    } });
+    expect((await refused[0]).code).toBe(1);
+    expect(writeErr).toHaveBeenCalledWith(expect.stringContaining('cap exhausted'));
+    expect(countRedTeamFixComments(pr.comments)).toBe(budget === 'advisory' ? 1 : 3);
+    expect(m.spawn).toHaveBeenCalledTimes(1);
+    expect(m.calls.filter(c => c.includes('comment'))).toHaveLength(1);
+  });
+
+  it.each(['busy lock', 'unreadable live thread', 'oversized cap'])('real provider refuses %s without a receipt or executor launch', async failure => {
+    const pr = acceptedRedTeamPr(), m = mk(['a'.repeat(40)]);
+    const request = { repo: 'o/r', pr: 7, sessionSlug: 'fix-7', ref: 'lane/7-x', promptFile: '/brief.md',
+      policyRoute: { provider: 'codex' }, mode: 'red-team-sent-back', head: pr.headRefOid,
+      resultId: liveResultGateState(pr.comments, 7, pr.headRefOid).resultId, attempts: 0,
+      roundCap: failure === 'oversized cap' ? Number.MAX_SAFE_INTEGER + 1 : 3 };
+    const release = failure === 'busy lock' ? lockRedTeamFixCharge('o/r', 7) : () => {};
+    let reads = 0, launched;
+    const writeErr = vi.fn();
+    const run = (cmd, args, opts) => cmd === 'gh' && args.includes('view') ? JSON.stringify(pr) : m.run(cmd, args, opts);
+    try {
+      fixDetachedProvider(request, { logPathFor: () => '/logs/fix-7', readDeliveryAgentMarker: () => null,
+        spawnDetached: args => {
+          launched = runFixCli(args.slice(1), { ...m.io, run, writeErr, readComments: async () => {
+            if (++reads === 2 && failure === 'unreadable live thread') throw Error('thread unavailable');
+            return pr.comments;
+          } });
+          return { pid: 99 };
+        } });
+      expect((await launched).code).toBe(1);
+      expect(m.spawn).not.toHaveBeenCalled();
+      expect(m.calls.some(c => c.includes('comment') || c.includes('push'))).toBe(false);
+      expect(countRedTeamFixComments(pr.comments)).toBe(0);
+      if (failure === 'busy lock') expect(writeErr).toHaveBeenCalledWith(expect.stringContaining('ask an operator'));
+    } finally { release(); }
+  });
+
+  it('charge re-reads the live thread under the PR lock and refuses evidence that reached the cap after the snapshot', async () => {
+    const pr = acceptedRedTeamPr(), m = mk([pr.headRefOid]);
+    const snapshot = [...pr.comments];
+    const readComments = vi.fn().mockResolvedValueOnce(snapshot).mockImplementation(async () => {
+      pr.comments.push(...Array.from({ length: 3 }, () => ({ author: { login: 'web-everything' }, body: RED_TEAM_FIX_COMMENT_MARKER })));
+      return pr.comments;
+    });
+    const writeErr = vi.fn();
+    const run = (cmd, args, opts) => cmd === 'gh' && args.includes('view') ? JSON.stringify(pr) : m.run(cmd, args, opts);
+    expect((await runFixCli([...argv, '--red-team-round-cap=3'], { ...m.io, run, readComments, writeErr })).code).toBe(1);
+    expect(readComments).toHaveBeenCalledTimes(2);
+    expect(writeErr).toHaveBeenCalledWith(expect.stringContaining('cap exhausted'));
+    expect(m.spawn).not.toHaveBeenCalled();
+    expect(m.calls.some(c => c.includes('comment'))).toBe(false);
+  });
+
   it('gives each detached dispatch a fresh launch ID and preserves an explicit retry ID', () => {
     const spawnDetached = vi.fn(() => ({ pid: 99 }));
     const request = { pr: 7, sessionSlug: 'fix-7', policyRoute: { provider: 'codex' } };
