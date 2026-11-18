@@ -625,6 +625,16 @@ describe('review-hold annotation (card 273, #5157)', () => {
       } }],
     });
   });
+  it('sees colour-coded post-footer blocking rows and fails closed on other escapes', () => {
+    const mk = extra => vi.fn(args => args.at(-1).endsWith('/logs') ? `${log4965}${extra}\n`
+      : JSON.stringify({ head_sha: sha, completed_at: '2026-10-12T11:56:08Z' }));
+    const read = runGh => readMergeGateVerdict({ repo: 'owner/repo', jobId: 124, prNumber: 4965, runGh, cache: new Map() });
+    const row = '  fail-closed       codeql                 blocking evidence';
+    const plain = read(mk(row)), coloured = read(mk(`\u001b[31m${row}\u001b[0m`));
+    expect(plain.error).toBeTruthy();
+    expect(coloured).toEqual(plain);
+    expect(read(mk('\u001b[2J  hold  x')).error).toMatch(/unsupported terminal escape/);
+  });
   it('annotates the latest failing row without making CI green', () => {
     const readVerdict = () => ({ num: 4965, head_sha: sha, ok: false, results: [{ id: 'test-gaming', status: 'hold' }] });
     const out = excuseMergeGateRows([row], opts({ readVerdict }));

@@ -202,7 +202,9 @@ export function readMergeGateVerdict({ repo, jobId, prNumber, runGh = runGhSync,
       const options = { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024,
         stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'merge-gate-verdict', repo } };
       const job = JSON.parse(runGh(['api', path], options));
-      const log = String(runGh(ciJobLogApiArgs(`${path}/logs`), options));
+      // Colour markup would hide blocking rows from the line parser: strip SGR, fail closed on any other escape.
+      const log = String(runGh(ciJobLogApiArgs(`${path}/logs`), options)).replace(/\u001b\[[0-9;]*m/g, '');
+      if (/[\u001b\u009b\u009d]/.test(log)) throw new Error('merge-gate log contains unsupported terminal escape sequences');
       cache.set(key, { job, log });
     }
     const { job, log } = cache.get(key);
