@@ -203,6 +203,13 @@ describe('readPlannerRow', () => {
     expect(result.reviewOwnedChecks.onlyRed).toBe(false);
   });
 
+  it.each([undefined, null])('a status=%s test cannot imply integration beside a failed review hold', status => {
+    const checks = [check('review-gate', 'failure', { head_sha: head }), { name: 'test', status, conclusion: 'success', head_sha: head }];
+    const result = readPlannerRow({ pr, refusals: [refusal('review-ci')], rawPrs: [rawPr(checks)], requiredChecks: ['review-gate', 'integration'] });
+    expect(result.reviewOwnedChecks.ci.affected).toEqual([{ name: 'review-gate', reason: 'failure' }, { name: 'integration', reason: 'missing' }]);
+    expect(result.reviewOwnedChecks.onlyRed).toBe(false);
+  });
+
   it('a malformed current-head test cannot imply integration behind a wrong-head success', () => {
     const checks = [{ name: 'test', conclusion: 'success', head_sha: head, id: 1 },
       check('test', 'success', { head_sha: 'b'.repeat(40), id: 2 })];

@@ -18,16 +18,19 @@ function wellFormedGreen(row) {
  */
 function evidenceGate({ headSha, requiredChecks, checks }) {
   const gate = reviewCiGate({ headSha, requiredChecks, checks });
-  if (!gate.allowed) return gate;
+  // Refusals before any per-check judgement (missing head, unknown required set) have nothing to add.
+  if (!gate.allowed && !gate.affected.length) return gate;
   const latest = collapseRollupToLatestPerName(checks);
-  // The gate allowed, so every required name without a row of its own was implied.
-  const implied = requiredChecks.filter(name => !latest.some(row => (row?.name ?? row?.context) === name));
+  // Applies on BOTH branches: a refusal for another check must still name an implied check that lacks proof,
+  // or a review-hold excuse (onlyRed) could rest on it. Implied = no row of its own and not judged by the gate.
+  const implied = requiredChecks.filter(name => !latest.some(row => (row?.name ?? row?.context) === name)
+    && !gate.affected.some(row => row.name === name));
   const green = latest.filter(wellFormedGreen).map(row => ({ ...row, status: 'completed', conclusion: 'success' }));
   const notProven = new Set(withoutImpliedRequiredChecks(requiredChecks, green));
   const unproven = [...new Set(implied.filter(name => notProven.has(name)))];
   if (!unproven.length) return gate;
-  const affected = unproven.map(name => ({ name, reason: 'missing' }));
-  return { allowed: false, headSha, reason: 'required-checks-not-successful', affected };
+  const affected = [...gate.affected, ...unproven.map(name => ({ name, reason: 'missing' }))];
+  return { allowed: false, headSha, reason: gate.allowed ? 'required-checks-not-successful' : gate.reason, affected };
 }
 
 /**
