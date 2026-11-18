@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { withRuntimeProcessAdmission } from './runtime-admission.mjs';
 /**
  * @file scripts/lib/gh-throttle.mjs
  * @description A TRANSPARENT local queue/throttle for `gh` CLI calls (we:backlog/3621's "Amendment (2026-09-08,
@@ -1081,7 +1082,7 @@ export function stdioPipesStderr(stdio) {
  */
 export function spawnWithGhDebugCapture(file, args, opts = {}, { spawn = spawnSync, strip = true } = {}) {
   const maxBuffer = opts.maxBuffer != null ? opts.maxBuffer : EXEC_SYNC_DEFAULT_MAX_BUFFER;
-  const ret = spawn(file, args, { ...opts, maxBuffer: maxBuffer * DEBUG_CAPTURE_BUFFER_FACTOR, env: { ...(opts.env || process.env), GH_DEBUG: 'api' } });
+  const ret = withRuntimeProcessAdmission(spawn, [file, args, { ...opts, maxBuffer: maxBuffer * DEBUG_CAPTURE_BUFFER_FACTOR, env: { ...(opts.env || process.env), GH_DEBUG: 'api' } }]);
   const raw = ret.stderr;
   const rawStderrText = raw == null ? '' : String(raw);
   const parsed = stripGhDebug(rawStderrText);
@@ -1514,7 +1515,7 @@ export function personalGhToken({ bin = 'gh', exec = execFileSync } = {}) {
   try {
     const cleanEnv = { ...process.env };
     for (const k of GH_TOKEN_ENV_KEYS) delete cleanEnv[k];
-    const out = exec(bin, ['auth', 'token'], { env: cleanEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    const out = withRuntimeProcessAdmission(exec, [bin, ['auth', 'token'], { env: cleanEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }]);
     const trimmed = String(out == null ? '' : out).trim();
     token = trimmed || null;
   } catch {
@@ -1979,7 +1980,7 @@ function runGhSyncReadMemo(args, opts = {}) {
 function runGhSyncUnmemoized(args, opts = {}) {
   const { throttle = {}, ...execOpts } = opts;
   // Local-only calls (see isGhLocalOnly) bypass every gate: no GitHub budget, slot or block applies to them.
-  if (isGhLocalOnly(args)) return throttle.exec ? throttle.exec(args, execOpts) : execFileSync(throttle.bin || 'gh', args, execOpts);
+  if (isGhLocalOnly(args)) return throttle.exec ? throttle.exec(args, execOpts) : withRuntimeProcessAdmission(execFileSync, [throttle.bin || 'gh', args, execOpts]);
   const env = throttle.env || process.env;
   const repo = throttle.repo || process.cwd();
   const lockRoot = throttle.lockRoot || ghThrottleLockRoot(repo, env);
@@ -2008,7 +2009,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
     const held = ghExecOptions(o, a, ghHolderPolicy(env));
     const childOpts = { ...held, env: { ...(o.env || process.env), [GH_OUTER_INV_ENV]: inv, [GH_OUTER_TIMEOUT_ENV]: String(held.timeout ?? 0),
       ...(held.killSignal != null ? { [GH_OUTER_KILL_SIGNAL_ENV]: String(held.killSignal) } : {}) } };
-    if (!capture) return (throttle.execFileSync || execFileSync)(bin, a, childOpts);
+    if (!capture) return withRuntimeProcessAdmission((throttle.execFileSync || execFileSync), [bin, a, childOpts]);
     lastCapture = spawnWithGhDebugCapture(bin, a, childOpts, { spawn: throttle.spawn || spawnSync, strip: !calibrateHeaders });
     return settleLikeExecFileSync(bin, a, o, lastCapture.result);
   });
@@ -2122,7 +2123,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
       const boundedOpts = reserved ? { ...routedOpts, timeout: reservedLeftMs() } : routedOpts;
       const callExecOpts = calibrateHeaders ? withDebugEnv(boundedOpts) : boundedOpts;
       lastCapture = null;
-      result = exec(args, callExecOpts);
+      result = withRuntimeProcessAdmission(exec, [args, callExecOpts]);
     } catch (e) {
       failure = e;
     } finally {
@@ -2170,7 +2171,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
     // would only re-ask a bucket GitHub (or that block) refuses until its reset.
     if (exhausted && shimRouted) throw failure;
     if (exhausted) {
-      const probe = throttle.probeBudget || ((probeArgs) => exec(probeArgs, { ...effectiveExecOpts(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+      const probe = throttle.probeBudget || ((probeArgs) => withRuntimeProcessAdmission(exec, [probeArgs, { ...effectiveExecOpts(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }]));
       // Strict-budget background readers cannot spend an extra diagnostic request; use headers/fallback.
       // A reserved read never spends the extra diagnostic request: it would run past the read's own call bound. Headers/fallback decide the block instead.
       const until = resolveBudgetBlockUntil({ headers, resource: exhausted, probe: reserved || env.WE_GH_THROTTLE_NO_BUDGET_PROBE === '1' ? () => '' : probe });
@@ -2225,7 +2226,7 @@ function withDebugEnv(execOpts) {
  */
 export function execFileSyncThrottled(file, args, opts = {}) {
   if (file === 'gh') return runGhSync(args, opts);
-  return execFileSync(file, args, opts);
+  return withRuntimeProcessAdmission(execFileSync, [file, args, opts]);
 }
 
 // ── the standalone CLI passthrough — full-process transparency, including a SUCCESSFUL call's stderr ────────
@@ -2394,7 +2395,7 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
       if (deferred) return { status: 0, deferred: true, stdout: Buffer.from(JSON.stringify(deferred)), stderr: Buffer.from(deferred.message) };
       if (reserved && now() - reservedStartMs >= reservedCapMs) return { status: 1, throttled: true, stdout: Buffer.alloc(0), stderr: Buffer.from(reservedThrottledMessage()) };
       // A nested call runs under the outer exec's timeout and kill signal, never its own default over the outer's.
-      r = spawn(bin, argv, ghExecOptions(outerLimits === null ? (reserved ? { ...spawnOpts, timeout: reservedLeftMs() } : spawnOpts) : { ...spawnOpts, ...outerLimits }, argv, ghHolderPolicy(env)));
+      r = withRuntimeProcessAdmission(spawn, [bin, argv, ghExecOptions(outerLimits === null ? (reserved ? { ...spawnOpts, timeout: reservedLeftMs() } : spawnOpts) : { ...spawnOpts, ...outerLimits }, argv, ghHolderPolicy(env))]);
     } finally {
       if (acq.ok) failOpenGate('release', () => releaseGhSlotSync({ lockRoot, cap: slotCap, owner }), gateOpts);
     }
@@ -2455,7 +2456,7 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
         const probeOpts = callEnv === env
           ? { stdio: ['ignore', 'pipe', 'pipe'], maxBuffer }
           : { stdio: ['ignore', 'pipe', 'pipe'], maxBuffer, env: callEnv };
-        const pr = spawn(bin, probeArgs, probeOpts);
+        const pr = withRuntimeProcessAdmission(spawn, [bin, probeArgs, probeOpts]);
         return pr && pr.status === 0 && pr.stdout ? pr.stdout.toString('utf8') : '';
       });
       // Strict-budget background readers cannot spend an extra diagnostic request; use headers/fallback.

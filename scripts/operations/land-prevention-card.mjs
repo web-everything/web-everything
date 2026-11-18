@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { withRuntimeProcessAdmission } from '../lib/runtime-admission.mjs';
 /**
  * @file scripts/operations/land-prevention-card.mjs
  * @description #4317 — THE DETACHED LANDING JOB for an approval-time prevention card. Spawned by
@@ -287,7 +288,7 @@ export function postLandingRetraction({ repo, pr, headSha, session, result }, {
     return false;
   }
   try {
-    exec('gh', ['pr', 'comment', String(pr), '--repo', String(repo), '--body', body], { encoding: 'utf8' });
+    withRuntimeProcessAdmission(exec, ['gh', ['pr', 'comment', String(pr), '--repo', String(repo), '--body', body], { encoding: 'utf8' }]);
     return true;
   } catch (e) {
     write(`land-prevention-card: retraction comment failed to post on ${repo}#${pr} — ${String(e?.message || e).split('\n')[0]}\n`);
@@ -327,7 +328,7 @@ export function runCardDedupe(input, {
   lane, root = REPO_ROOT, env = process.env, write = () => {},
   loadPolicy = () => loadCardDedupePolicy({ root, env }),
   readCards = (dir) => readOpenCards(dir),
-  readPrCards = (dir) => readPrHostedCards({ exec: (c, a, o) => String(execFileSyncThrottled(c, a, o)), cwd: dir }),
+  readPrCards = (dir) => readPrHostedCards({ exec: (c, a, o) => String(withRuntimeProcessAdmission(execFileSyncThrottled, [c, a, o])), cwd: dir }),
 } = {}) {
   const policy = loadPolicy();
   write(`land-prevention-card: dedupe policy ${formatCardDedupePolicy(policy)}\n`);
@@ -352,9 +353,9 @@ export function buildPrMentionComment({ card, lines }) {
     + `filing a new card. Carry them onto the card when it lands.\n\n${lines.join('\n')}\n`;
 }
 
-const defaultExec = (cmd, args, opts = {}) => String(execFileSync(cmd, args, {
+const defaultExec = (cmd, args, opts = {}) => String(withRuntimeProcessAdmission(execFileSync, [cmd, args, {
   encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, ...opts,
-}));
+}]));
 const errorReason = (error) => String(error?.message || error).split('\n')[0];
 const pendingPreventionDir = () => join(cardBatchStateDir(), 'pending-prevention');
 
@@ -399,7 +400,7 @@ export async function drainPendingPrevention({ lane }, {
     try {
       const entry = JSON.parse(readFileSync(path, 'utf8'));
       if (!cardOnlyEligibility([{ status: 'A', mode: '100644', path: entry.rel }]).ok) throw new Error('invalid pending card path');
-      if (String(exec('git', ['-C', lane, 'ls-tree', 'origin/main', '--', entry.rel], {})).trim()) {
+      if (String(withRuntimeProcessAdmission(exec, ['git', ['-C', lane, 'ls-tree', 'origin/main', '--', entry.rel], {}])).trim()) {
         rmSync(path);
         continue;
       }
@@ -419,8 +420,8 @@ export async function drainPendingPrevention({ lane }, {
 export async function foldOpenSingles({ lane }, {
   exec = defaultExec, batch = fileIntoBatch, write = (line) => process.stdout.write(line), batchOptions = {},
 } = {}) {
-  const prs = JSON.parse(exec('gh', ['pr', 'list', '--repo', CONSTELLATION_REPOS.we.slug,
-    '--state', 'open', '--limit', '200', '--json', 'number,headRefName,headRefOid,files'], {}));
+  const prs = JSON.parse(withRuntimeProcessAdmission(exec, ['gh', ['pr', 'list', '--repo', CONSTELLATION_REPOS.we.slug,
+    '--state', 'open', '--limit', '200', '--json', 'number,headRefName,headRefOid,files'], {}]));
   const summary = { folded: [], notFolded: [] };
   for (const pr of prs.filter(pr => /^lane\/.+-prevention-card$/.test(pr.headRefName))) {
     let reason;
@@ -430,10 +431,10 @@ export async function foldOpenSingles({ lane }, {
         throw new Error('not exactly one added backlog card');
       }
       if (!/^[a-f0-9]{40}$/.test(pr.headRefOid)) throw new Error('invalid PR head');
-      exec('git', ['-C', lane, 'fetch', '--no-tags', '-q', 'origin', pr.headRefOid], {});
-      const changes = String(exec('git', ['-C', lane, 'diff', '--name-status', `origin/main...${pr.headRefOid}`], {})).trim();
+      withRuntimeProcessAdmission(exec, ['git', ['-C', lane, 'fetch', '--no-tags', '-q', 'origin', pr.headRefOid], {}]);
+      const changes = String(withRuntimeProcessAdmission(exec, ['git', ['-C', lane, 'diff', '--name-status', `origin/main...${pr.headRefOid}`], {}])).trim();
       if (changes !== `A\t${rel}`) throw new Error('not exactly one added backlog card');
-      const content = exec('git', ['-C', lane, 'show', `${pr.headRefOid}:${rel}`], {});
+      const content = withRuntimeProcessAdmission(exec, ['git', ['-C', lane, 'show', `${pr.headRefOid}:${rel}`], {}]);
       const result = await withRecoveryCard(lane, rel, content, () => batch({
         laneDir: lane, cardPath: rel, kind: 'prevention', actor: 'mechanical', idemKey: `prevention:${cardIdOf(rel)}`,
         source: { repo: CONSTELLATION_REPOS.we.slug, pr: pr.number, head: pr.headRefOid, note: `folded from #${pr.number}` },
@@ -548,9 +549,9 @@ export async function landPreventionCard(input, {
     let acquired;
     try {
       write(`land-prevention-card: acquiring a lane (session ${input.session})…\n`);
-      acquired = parseRunJsonTail(exec('node', [
+      acquired = parseRunJsonTail(withRuntimeProcessAdmission(exec, ['node', [
         LANE_POOL_CLI, 'acquire', '--purpose=prevention-card', `--session=${input.session}`, ...canonicalAcquireArgs({ repoRoot: REPO_ROOT }), '--wait-ms=120000', '--json',
-      ], { cwd: REPO_ROOT, timeout: ACQUIRE_TIMEOUT_MS }));
+      ], { cwd: REPO_ROOT, timeout: ACQUIRE_TIMEOUT_MS }]));
     } catch (e) {
       return fail('acquire', String(e?.message || e).split('\n')[0]);
     }
@@ -604,7 +605,7 @@ export async function landPreventionCard(input, {
             const path = join(lane, file.path);
             mkdirSync(resolve(path, '..'), { recursive: true });
             writeFile(path, file.content, 'utf8');
-            exec('git', ['-C', lane, 'add', '--', file.path], {});
+            withRuntimeProcessAdmission(exec, ['git', ['-C', lane, 'add', '--', file.path], {}]);
             paths.push(file.path);
             known.add(key);
           }
@@ -612,7 +613,7 @@ export async function landPreventionCard(input, {
           recorded.push(...asMatches);
         } else if (m.card.host?.pr) {
           try {
-            exec('gh', ['pr', 'comment', String(m.card.host.pr), '--repo', CONSTELLATION_REPOS.we.slug, '--body', buildPrMentionComment(m)], { cwd: lane });
+            withRuntimeProcessAdmission(exec, ['gh', ['pr', 'comment', String(m.card.host.pr), '--repo', CONSTELLATION_REPOS.we.slug, '--body', buildPrMentionComment(m)], { cwd: lane }]);
             recorded.push(...asMatches);
           } catch (e) {
             write(`land-prevention-card: mention comment on PR #${m.card.host.pr} failed, filing instead — ${String(e?.message || e).split('\n')[0]}\n`);
@@ -635,7 +636,7 @@ export async function landPreventionCard(input, {
       ];
       let filed;
       try {
-        filed = parseRunJsonTail(exec('node', fileArgv, { cwd: lane, timeout: FILE_ITEM_TIMEOUT_MS }));
+        filed = parseRunJsonTail(withRuntimeProcessAdmission(exec, ['node', fileArgv, { cwd: lane, timeout: FILE_ITEM_TIMEOUT_MS }]));
       } catch (e) {
         filed = parseRunJsonTail(e?.stdout);
         if (!filed) return fail('file-item', String(e?.message || e).split('\n')[0]);
@@ -700,7 +701,7 @@ export async function landPreventionCard(input, {
 
     write(`land-prevention-card: committing ${[rel, ...mentioned.flatMap((m) => m.paths)].filter(Boolean).join(', ')}…\n`);
     try {
-      if (rel) exec('git', ['-C', lane, 'add', '--', rel], {});
+      if (rel) withRuntimeProcessAdmission(exec, ['git', ['-C', lane, 'add', '--', rel], {}]);
       const msgPath = scratchFile('commit-msg.txt');
       const item = rel
         ? (num ?? /^(x[0-9a-z]{6})-/.exec(basename(rel))?.[1] ?? '?')
@@ -711,7 +712,7 @@ export async function landPreventionCard(input, {
         : machinePrTitle({ item, kind: 'prevention', card: { title: mentionTitle(input, mentioned[0].items[0]) } });
       writeFile(msgPath, `${subject}\n\n`
         + 'Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n', 'utf8');
-      exec('git', ['-C', lane, 'commit', '-F', msgPath], {});
+      withRuntimeProcessAdmission(exec, ['git', ['-C', lane, 'commit', '-F', msgPath], {}]);
     } catch (e) {
       return fail('commit', String(e?.message || e).split('\n')[0], { num, rel });
     }
@@ -719,7 +720,7 @@ export async function landPreventionCard(input, {
     write('land-prevention-card: running the gate…\n');
     let verified;
     try {
-      verified = parseRunJsonTail(exec('node', [laneRunMjs, 'verify', `--checkout=${lane}`, '--mode=run', '--json'], { cwd: lane, timeout: VERIFY_TIMEOUT_MS }));
+      verified = parseRunJsonTail(withRuntimeProcessAdmission(exec, ['node', [laneRunMjs, 'verify', `--checkout=${lane}`, '--mode=run', '--json'], { cwd: lane, timeout: VERIFY_TIMEOUT_MS }]));
     } catch (e) {
       verified = parseRunJsonTail(e?.stdout);
     }
@@ -737,10 +738,10 @@ export async function landPreventionCard(input, {
     const ref = preventionCardRef({ num, rel, session: input.session });
     let opened;
     try {
-      opened = parseRunJsonTail(exec('node', [
+      opened = parseRunJsonTail(withRuntimeProcessAdmission(exec, ['node', [
         laneRunMjs, 'open-pr', `--ref=${ref}`, '--base=main', `--bodyFile=${bodyPath}`,
         '--mode=label-on-green', '--requireVerified=true', '--json',
-      ], { cwd: lane, timeout: OPEN_PR_TIMEOUT_MS }));
+      ], { cwd: lane, timeout: OPEN_PR_TIMEOUT_MS }]));
     } catch (e) {
       opened = parseRunJsonTail(e?.stdout);
       if (!opened) return fail('open-pr', String(e?.message || e).split('\n')[0], { num, rel });
@@ -750,7 +751,7 @@ export async function landPreventionCard(input, {
       return fail('open-pr', submit?.reason ?? 'PR was not opened', { num, rel, pr: submit?.pr, url: submit?.url });
     }
     try {
-      exec('gh', ['pr', 'edit', String(submit.pr), '--repo', CONSTELLATION_REPOS.we.slug, '--add-label', 'review:pending'], { cwd: lane });
+      withRuntimeProcessAdmission(exec, ['gh', ['pr', 'edit', String(submit.pr), '--repo', CONSTELLATION_REPOS.we.slug, '--add-label', 'review:pending'], { cwd: lane }]);
     } catch (error) { write(`land-prevention-card: review:pending label failed (non-fatal) — ${errorReason(error)}\n`); }
     write(`land-prevention-card: landed — PR #${submit.pr} (${submit.url})\n`);
     durable = true;
@@ -775,9 +776,9 @@ export async function landPreventionCard(input, {
     if (laneNum != null && laneHolder) {
       try {
         // Assert only this acquisition's holder; the ambient ownerSession fallback cannot prove it.
-        exec('node', [LANE_POOL_CLI, 'release', `--lane=${laneNum}`, `--session=${laneHolder}`], {
+        withRuntimeProcessAdmission(exec, ['node', [LANE_POOL_CLI, 'release', `--lane=${laneNum}`, `--session=${laneHolder}`], {
           cwd: REPO_ROOT, timeout: ACQUIRE_TIMEOUT_MS, env: { ...process.env, CLAUDE_CODE_SESSION_ID: '' },
-        });
+        }]);
       } catch (e) {
         write(`land-prevention-card: lane-${laneNum} release failed (non-fatal, will age out on its own TTL) — ${String(e?.message || e)}\n`);
       }

@@ -1,3 +1,4 @@
+import { withRuntimeProcessAdmission } from './runtime-admission.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { candidateQueueClass } from './merge-queue.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
@@ -249,7 +250,7 @@ export function createDrainMergeStrategy({
   const grantScopeFor = (c, headSha, comments) => {
     try { return readGrantScope({ repo: slugOf(c.repo), pr: { number: c.num, headRefOid: headSha, comments } }) ?? null; } catch { return null; }
   };
-  const statusProvider = labelProvider ?? createGhProvider({ exec: (args, opts) => exec('gh', args, opts) });
+  const statusProvider = labelProvider ?? createGhProvider({ exec: (args, opts) => withRuntimeProcessAdmission(exec, ['gh', args, opts]) });
   const say = (line) => { if (!quiet) log.write(`${line}\n`); };
   /**
    * Read-modify-write of the shared follow-up state file: under the land lock, RE-READ the file (so an enqueue by
@@ -270,7 +271,7 @@ export function createDrainMergeStrategy({
   let drainLoginMemo; // undefined = not looked up yet; null = the lookup failed (stay on the stamp-again side)
   const drainLogin = () => {
     if (drainLoginMemo !== undefined) return drainLoginMemo;
-    try { drainLoginMemo = String(exec('gh', ['api', 'user', '--jq', '.login'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })).trim() || null; }
+    try { drainLoginMemo = String(withRuntimeProcessAdmission(exec, ['gh', ['api', 'user', '--jq', '.login'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }])).trim() || null; }
     catch { drainLoginMemo = null; }
     return drainLoginMemo;
   };
@@ -284,7 +285,7 @@ export function createDrainMergeStrategy({
   const redTeamAppId = () => (appIdMemo ??= resolveWeAppId({ env, log: line => log.write(`  ${line}\n`) }));
   const checkRunAdmission = (c, head, before) => {
     const unpublished = publicationHold(c, head);
-    const checkGh = (args, options) => exec('gh', args, options);
+    const checkGh = (args, options) => withRuntimeProcessAdmission(exec, ['gh', args, options]);
     // The drain's env never carries WE_APP_ID: the id is the `redTeamGate.appId` setting (#6535, ruling R907/R905),
     // resolved once per strategy with its source logged. An unresolved id passes `undefined` on, so the read keeps its
     // existing fail-closed reason.
@@ -337,9 +338,9 @@ export function createDrainMergeStrategy({
     return { enqueued: false, deferred: true, kind: 'red-team-pending', reason: pending.reason, healthSmell,
       ...(pending.deadlineHeldAt != null ? { deadlineHeld: true } : {}) };
   };
-  const readLive = (repo, num) => JSON.parse(exec('gh', ['pr', 'view', String(num), '--repo', slugOf(repo), '--json', 'headRefOid,labels,reviews'], { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] }));
+  const readLive = (repo, num) => JSON.parse(withRuntimeProcessAdmission(exec, ['gh', ['pr', 'view', String(num), '--repo', slugOf(repo), '--json', 'headRefOid,labels,reviews'], { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] }]));
   // The complete thread as pages. The drain's own comment reader allows 256 MiB: a long thread must not hit the 1 MiB default.
-  const readThreadPages = (repo, num) => JSON.parse(exec('gh', ['api', '--paginate', '--slurp', `repos/${slugOf(repo)}/issues/${num}/comments`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: COMMENTS_MAX_BUFFER, timeout: 120_000 }));
+  const readThreadPages = (repo, num) => JSON.parse(withRuntimeProcessAdmission(exec, ['gh', ['api', '--paginate', '--slurp', `repos/${slugOf(repo)}/issues/${num}/comments`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: COMMENTS_MAX_BUFFER, timeout: 120_000 }]));
   // A successful check is a snapshot: live rulings and comments can restore a break hold on the same head.
   // Check-run mode needs this disposition decision at each admission boundary, without legacy waits or label sync.
   const checkRunDispositionHold = (c, head, live) => {
@@ -384,9 +385,9 @@ export function createDrainMergeStrategy({
       const candidates = rows.filter(row => Array.isArray(row.labels) && sendBackReason(row.labels));
       // Discover membership once, before any per-PR read. An incomplete discovery retries next pass;
       // never replace it with an API sweep of every non-ready open PR.
-      const queue = candidates.length ? readQueueFacts({ repo: slugOf(repo), exec: (cmd, args, opts) => exec(cmd, args, { ...opts, timeout: 60_000 }) }) : null;
+      const queue = candidates.length ? readQueueFacts({ repo: slugOf(repo), exec: (cmd, args, opts) => withRuntimeProcessAdmission(exec, [cmd, args, { ...opts, timeout: 60_000 }]) }) : null;
       if (queue?.error) { say(`  ⚠ merge-queue discovery failed (${queue.error}) — dequeue sweep retried next pass`); return; }
-      sweepStuckEntries({ repo: slugOf(repo), exec: (cmd, args, opts) => exec(cmd, args, { ...opts, timeout: 60_000 }),
+      sweepStuckEntries({ repo: slugOf(repo), exec: (cmd, args, opts) => withRuntimeProcessAdmission(exec, [cmd, args, { ...opts, timeout: 60_000 }]),
         max: safety.value.queueRebuildMax, nowMs: now(),
         statePath: join(dirname(statePath), 'drain-merge-queue-stuck.json'), readFile, writeFile, log: say,
         // Reuse complete empty discovery to prune history without another API call.
@@ -643,16 +644,16 @@ export function createDrainMergeStrategy({
             const pages = readThreadPages(c.repo, c.num);
             if (!Array.isArray(pages) || pages.some(page => !Array.isArray(page))) throw new Error('malformed comments response');
             if (!countTrustedLeadingMarker(pages.flat(), marker)) {
-              exec('gh', ['pr', 'comment', String(c.num), '--repo', slugOf(c.repo), '--body', `${marker}\n${body}`],
-                { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] });
+              withRuntimeProcessAdmission(exec, ['gh', ['pr', 'comment', String(c.num), '--repo', slugOf(c.repo), '--body', `${marker}\n${body}`],
+                { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] }]);
             }
             commented = true;
           } catch { /* Unknown thread/delivery retries next pass without posting duplicates. */ }
           let labelled = kind !== 'bornas-collision';
           if (!labelled) {
             try {
-              exec('gh', ['pr', 'edit', String(c.num), '--repo', slugOf(c.repo), '--add-label', 'review:changes'],
-                { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] });
+              withRuntimeProcessAdmission(exec, ['gh', ['pr', 'edit', String(c.num), '--repo', slugOf(c.repo), '--add-label', 'review:changes'],
+                { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] }]);
               labelled = true;
             } catch { /* Retry the label independently of the durable comment marker. */ }
           }
@@ -738,7 +739,7 @@ export function createDrainMergeStrategy({
       const alreadyStamped = savedStamp || Array.isArray(comments) && anyClearanceMarkerFor(comments, headSha) && (() => { const me = drainLogin(); return !!me && hasClearanceFor(comments, headSha, [me]); })();
       let stamped = alreadyStamped;
       if (!alreadyStamped && comments !== null) {
-        try { exec('gh', ['pr', 'comment', String(c.num), '--repo', slugOf(c.repo), '--body', buildClearanceComment(headSha)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); stamped = true; }
+        try { withRuntimeProcessAdmission(exec, ['gh', ['pr', 'comment', String(c.num), '--repo', slugOf(c.repo), '--body', buildClearanceComment(headSha)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }]); stamped = true; }
         catch (e) { say(`  ⚠ ${keyOf(c.repo, c.num)} enqueue clearance stamp failed (${firstLine(e)}) — merge-gate's couple/blockedBy gates will fail closed for it`); }
       }
       if (!state.pending.some((p) => keyOf(p.repo, p.num) === keyOf(c.repo, c.num))) {
@@ -776,7 +777,7 @@ export function createDrainMergeStrategy({
       const followedUpKeys = new Set(state.followedUp);
       for (const p of state.pending) {
         let v;
-        try { v = JSON.parse(exec('gh', ['pr', 'view', String(p.num), '--repo', slugOf(p.repo), '--json', 'number,state,mergedAt,mergeCommit,labels'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}'); }
+        try { v = JSON.parse(withRuntimeProcessAdmission(exec, ['gh', ['pr', 'view', String(p.num), '--repo', slugOf(p.repo), '--json', 'number,state,mergedAt,mergeCommit,labels'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }]) || '{}'); }
         catch (e) { say(`  ⚠ ${keyOf(p.repo, p.num)} queue follow-up read failed (${firstLine(e)}) — retried next pass`); continue; }
         if (v?.state === 'OPEN') {
           try { removeSentBack(p.repo, p.num, v.labels); }

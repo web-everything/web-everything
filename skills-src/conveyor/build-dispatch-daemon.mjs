@@ -2021,7 +2021,7 @@ export function cliDispatchDetached(args, { spawn, root = pendingLaunchesRoot(),
   try {
     const { argv, env } = prepareDispatchLaunch(args, dir);
     const base = readBase();
-    const record = withRuntimeAdmission(args, args.launchKind ?? 'build', () => startDetachedLaunch({ root, num: args.num, kind: args.launchKind ?? 'build', base, argv, env, cwd: REPO_ROOT, workDir: dir, ...(spawn ? { spawn } : {}) }));
+    const record = withRuntimeAdmission(args, args.launchKind ?? 'build', () => startDetachedLaunch({ root, num: args.num, groupMembers: args.groupMembers, runtimeIdentity: args, kind: args.launchKind ?? 'build', base, argv, env, cwd: REPO_ROOT, workDir: dir, ...(spawn ? { spawn } : {}) }));
     if (record?.outcome === 'runtime-refused') { rmSync(dir, { recursive: true, force: true }); return record; }
     return { dispatching: true, pending: true, lane: null, sessionSlug: null, attempt: record.attempt };
   } catch (e) {

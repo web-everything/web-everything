@@ -127,7 +127,7 @@ export function requestWrappedResume({ session, prompt, specDir = defaultWorkerS
  * @returns {{handle: string, wrapperPid: number|null, sessionId: string, argv: string[]}}
  */
 export function launchWrappedClaudeWorker({
-  role, session, bgArgv, cwd, env = process.env, pr = null, item = null, model = null,
+  role, session, bgArgv, cwd, env = process.env, pr = null, item = null, groupMembers, runtimeIdentity, model = null,
   sessionId = randomUUID(), specDir = defaultWorkerSpecDir(), launch = launchDetached,
   allowRealSentinel = resolveSmokeRealWorker({ env }).allowSentinel,
 } = {}) {
@@ -142,11 +142,13 @@ export function launchWrappedClaudeWorker({
     return { handle: `refused:smoke-sentinel-${sentinelPr}`, wrapperPid: null, sessionId, argv: [], refused };
   }
   const argv = wrappedArgvFromBg(bgArgv, { sessionId });
-  const { wrapperPid } = launch({
+  const launched = launch({
     role, launcher: 'claude-p', session, command: 'claude', argv, cwd, env, timeoutMs: wrappedTimeoutMs(role, env),
-    model, pr: pr == null ? null : String(pr), item: item == null || item === '' ? null : String(item), sessionId,
+    groupMembers, runtimeIdentity, model, pr: pr == null ? null : String(pr), item: item == null || item === '' ? null : String(item), sessionId,
     legacyFromCompletion: true, preserveLegacyWords: true,
   }, { specDir });
+  if (launched?.outcome === 'runtime-refused') return launched;
+  const { wrapperPid } = launched;
   return { handle: Number.isInteger(wrapperPid) ? `pid:${wrapperPid}` : null, wrapperPid: Number.isInteger(wrapperPid) ? wrapperPid : null, sessionId, argv };
 }
 

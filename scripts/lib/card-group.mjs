@@ -1,3 +1,4 @@
+import { withRuntimeProcessAdmission } from './runtime-admission.mjs';
 /**
  * Post-approval card grouping (card xym8nt4).
  *
@@ -652,7 +653,7 @@ export function createCardGrouping({
       return { enabled: r?.value?.autoResolveRaisedBy === true, source: r?.sources?.autoResolveRaisedBy ?? 'standard' };
     } catch (e) { return { enabled: false, source: `unreadable (${firstLine(e)})` }; }
   };
-  const gh = (args, opts = {}) => String(exec('gh', args, { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'], ...opts }));
+  const gh = (args, opts = {}) => String(withRuntimeProcessAdmission(exec, ['gh', args, { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'], ...opts }]));
   const lockPath = `${statePath}.lock`;
   const mutate = fn => {
     try { mkdirSync(dirname(statePath), { recursive: true }); } catch { /* the lock open reports a real failure */ }

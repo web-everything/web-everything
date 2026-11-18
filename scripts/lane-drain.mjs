@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { withRuntimeProcessAdmission } from './lib/runtime-admission.mjs';
 /**
  * lane-drain.mjs — the deferred merge-queue drain (#2162, spine of #2138). CORE SLICE: drain-one-couple
  * (#2172) — land ONE already-queued lane couple onto main via the #2153 PR transport, in the manifest's
@@ -430,7 +431,7 @@ function runDrainOne() {
     const repoPath = repoCfg && repoCfg.path ? expandHome(repoCfg.path) : CWD; // WE = the resolved WE root (review #1), never implicit cwd
     const args = buildPrLandArgs({ ref: step.ref, repoPath, bodyFile });
     let res = null;
-    try { res = JSON.parse(execFileSync('node', args, { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })); }
+    try { res = JSON.parse(withRuntimeProcessAdmission(execFileSync, ['node', args, { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }])); }
     catch (e) {
       // pr-land exits non-zero (red check / conflict / gh error) — its JSON is on stdout even then.
       try { res = JSON.parse(String(e.stdout || '').trim()); } catch { res = { merged: false, reason: 'pr-land-error', detail: String(e.message || e).split('\n')[0] }; }
@@ -527,7 +528,7 @@ function readManifestOffRef(CWD, ref) {
   if (fromPr) return fromPr;
   // Legacy fallback: the tree-committed manifest is a NEW file in the WE lane commit, not on main yet — fetch
   // the ref and read it out of the object.
-  try { execFileSync('git', ['fetch', 'origin', ref, '--quiet'], { cwd: CWD, stdio: ['ignore', 'ignore', 'ignore'] }); } catch { /* best-effort; the ref may already be local */ }
+  try { withRuntimeProcessAdmission(execFileSync, ['git', ['fetch', 'origin', ref, '--quiet'], { cwd: CWD, stdio: ['ignore', 'ignore', 'ignore'] }]); } catch { /* best-effort; the ref may already be local */ }
   for (const rev of ['FETCH_HEAD', `origin/${ref}`, ref]) {
     try {
       const txt = readGit(['show', `${rev}:${MANIFEST_FILENAME}`], { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
@@ -546,7 +547,7 @@ function drainOneCouple(CWD, num, manifestPath, bodyFile) {
   const args = ['scripts/lane-drain.mjs', 'drain-one', num, `--manifest=${manifestPath}`, '--json'];
   if (bodyFile) args.push(`--body-file=${bodyFile}`);
   try {
-    return JSON.parse(execFileSync('node', args, { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim());
+    return JSON.parse(withRuntimeProcessAdmission(execFileSync, ['node', args, { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }]).trim());
   } catch (e) {
     try { return JSON.parse(String(e.stdout || '').trim()); } catch { return { landed: false, reason: 'spawn-error', detail: String(e.message || e).split('\n')[0] }; }
   }
@@ -559,7 +560,7 @@ function regenDerived(CWD) {
   const done = [];
   const failedGen = [];
   for (const cmd of DERIVED_REGEN) {
-    try { execFileSync(cmd[0], cmd.slice(1), { cwd: CWD, stdio: ['ignore', 'ignore', 'pipe'] }); done.push(cmd.join(' ')); }
+    try { withRuntimeProcessAdmission(execFileSync, [cmd[0], cmd.slice(1), { cwd: CWD, stdio: ['ignore', 'ignore', 'pipe'] }]); done.push(cmd.join(' ')); }
     catch (e) { failedGen.push({ cmd: cmd.join(' '), detail: String(e.message || e).split('\n')[0] }); }
   }
   return { done, failed: failedGen };
@@ -779,10 +780,10 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1, execFile
       ...docsPaths, ...memoryPaths, ...flowsPaths, ...breakPaths,
     ];
     try {
-      const batch = execFile('git', ['cat-file', '--batch'], {
+      const batch = withRuntimeProcessAdmission(execFile, ['git', ['cat-file', '--batch'], {
         cwd: CWD, input: trackedPaths.map((rel) => `HEAD:${rel}\n`).join(''),
         stdio: ['pipe', 'pipe', 'ignore'], maxBuffer: 128 * 1024 * 1024,
-      });
+      }]);
       const contents = new Map();
       let offset = 0;
       for (const rel of trackedPaths) {
@@ -874,10 +875,10 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1, execFile
   const sweptRelPaths = new Set(files.map((f) => pathFor(f.name).relPath));
   let unsweptHashPathCites = [];
   try {
-    const scan = spawn(
+    const scan = withRuntimeProcessAdmission(spawn, [
       'git', ['grep', '--threads=1', '-nE', HASH_PATH_CITE_SOURCE, ...(readSource === 'head' ? ['HEAD'] : []), '--', '.', ':!node_modules', ':!backlog'],
       { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024 },
-    );
+    ]);
     // Git may exit 0 after matching one file even if another could not be read. Retain stderr
     // on success too; execFileSync returns only stdout and would hide that incomplete scan.
     if (scan.error || scan.status !== 0 || scan.signal || String(scan.stderr ?? '').length) {
@@ -939,10 +940,10 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1, execFile
   // A held card must not be renamed by a STALE ledger entry either (the ledger is append-only and applyLedger
   // swaps the whole of it), so drop any old mapping for it before anything reads the ledger.
   for (const hash of heldHashes) delete ledger[hash];
-  const numberingGit = (args, options = {}) => execFile('git', args, {
+  const numberingGit = (args, options = {}) => withRuntimeProcessAdmission(execFile, ['git', args, {
     cwd: CWD, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 10_000, maxBuffer: 1024 * 1024,
     env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, ...options,
-  });
+  }]);
   let remoteNumbering;
   let numberingEvidence;
   try {
@@ -965,8 +966,8 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1, execFile
   const dupDropped = [];
   const bornAsOnMain = new Map(); // hash → repo-relative path of the numbered card on origin/main
   try {
-    const out = execFile('git', ['grep', '-E', '^bornAs: x[0-9a-z]{6}$', 'origin/main', '--', 'backlog/'],
-      { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 });
+    const out = withRuntimeProcessAdmission(execFile, ['git', ['grep', '-E', '^bornAs: x[0-9a-z]{6}$', 'origin/main', '--', 'backlog/'],
+      { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 }]);
     for (const line of out.split('\n')) {
       const m = line.match(/^origin\/main:(backlog\/.*):bornAs: (x[0-9a-z]{6})$/);
       if (m && !bornAsOnMain.has(m[2])) bornAsOnMain.set(m[2], m[1]); // first path wins, as landedNumbers did
@@ -978,7 +979,7 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1, execFile
     const onMain = /^backlog\/\d{1,5}-.*\.md$/.test(bornAsOnMain.get(hash) ?? '') ? bornAsOnMain.get(hash) : null;
     if (!onMain || heldHashes.has(hash)) continue;
     let mainBody = null;
-    try { mainBody = bodyOf(execFile('git', ['show', `origin/main:${onMain}`], { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 })); } catch { /* unreadable → treat as differing */ }
+    try { mainBody = bodyOf(withRuntimeProcessAdmission(execFile, ['git', ['show', `origin/main:${onMain}`], { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 }])); } catch { /* unreadable → treat as differing */ }
     if (mainBody !== null && mainBody === bodyOf(contentByName.get(stem) ?? '')) {
       dupDropped.push({ hash, stem, existing: onMain });
       ledger[hash] = idFromName(onMain.replace(/^backlog\//, '').replace(/\.md$/, ''));
@@ -1080,8 +1081,8 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1, execFile
       remoteHashSetCache = new Set(cached.hashes);
       if (!newTips.length) return remoteHashSetCache;
     }
-    const walk = (args) => execFile('git', ['rev-list', '--objects', ...args, '--', 'backlog/'],
-      { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 });
+    const walk = (args) => withRuntimeProcessAdmission(execFile, ['git', ['rev-list', '--objects', ...args, '--', 'backlog/'],
+      { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 }]);
     let out = '';
     try {
       if (tips.length) {
@@ -1326,7 +1327,7 @@ function syncMain(CWD) { repairCloneRefs(CWD, { log: (m) => process.stderr.write
 // couple's tree was just gated by pr-land's required CI, so `--assume-green` skips the redundant re-gate (the
 // documented integrator path). ff-only inside the helper; a non-ff leaves origin untouched and is reported.
 function publishMain(CWD) {
-  try { const r = JSON.parse(execFileSync('node', ['scripts/push-if-green.mjs', '--assume-green', '--json'], { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()); return !!r.pushed; }
+  try { const r = JSON.parse(withRuntimeProcessAdmission(execFileSync, ['node', ['scripts/push-if-green.mjs', '--assume-green', '--json'], { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }]).trim()); return !!r.pushed; }
   catch (e) { try { return !!JSON.parse(String(e.stdout || '').trim()).pushed; } catch { return false; } }
 }
 
@@ -1335,7 +1336,7 @@ function publishMain(CWD) {
 // leftover manifest / un-pushed unqueue is recoverable cruft, never a reason to unwind a successful landing.
 // `deps` is a test seam only (review #2668): `unqueue`/`publish` replace the backlog.mjs + push-if-green spawns,
 // `lockOpts` points the numbering mutex at a throwaway lock root. Production calls pass nothing.
-const unqueueViaBacklog = (CWD, num) => execFileSync('node', ['scripts/backlog.mjs', 'unqueue', num], { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+const unqueueViaBacklog = (CWD, num) => withRuntimeProcessAdmission(execFileSync, ['node', ['scripts/backlog.mjs', 'unqueue', num], { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }]);
 export function finalizeLand(CWD, num, { unqueue = unqueueViaBacklog, publish = publishMain, lockOpts = {} } = {}) {
   syncMain(CWD); // bring the merged origin/main (incl. the manifest the WE lane commit carried) local
   // Clear the queued marker (the single clear point) + stage the manifest deletion if it's tracked on main.
@@ -1393,7 +1394,7 @@ export function finalizeLand(CWD, num, { unqueue = unqueueViaBacklog, publish = 
 // queued with its durable refs for the NEXT drain pass to retry. Best-effort commit + publish of the flip.
 function reopenStrandedItem(CWD, num) {
   syncMain(CWD); // reconcile against the merged state before reading/writing the item's status
-  try { execFileSync('node', ['scripts/backlog.mjs', 'release', num, '--force'], { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); }
+  try { withRuntimeProcessAdmission(execFileSync, ['node', ['scripts/backlog.mjs', 'release', num, '--force'], { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }]); }
   catch { return { reopened: false, pushed: false }; } // not `active` (already open/resolved, or another session owns it) → leave it
   const path = (quietGit(CWD, ['ls-files', `backlog/${num}-*.md`]) || '').split('\n').filter(Boolean)[0];
   let pushed = false;
@@ -1469,7 +1470,7 @@ export function resolveLandedItem(CWD, num, { sync = true, publish = true } = {}
   let body = null;
   try { body = readFileSync(join(CWD, path), 'utf8'); } catch { body = null; }
   if (body != null && readField(body, 'status') === 'resolved') return { flipped: false, alreadyResolved: true }; // producer authored it — nothing to do
-  try { execFileSync('node', ['scripts/backlog.mjs', 'resolve', num], { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); }
+  try { withRuntimeProcessAdmission(execFileSync, ['node', ['scripts/backlog.mjs', 'resolve', num], { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }]); }
   catch { return { flipped: false, alreadyResolved: false }; } // illegal from-status / decision-needs-codifiedTo / epic-open-child / guard → leave it (caller reopens)
   // Scope the commit to ONLY this item's backlog file (explicit `-- <path>`) — never a bare commit that would
   // absorb a foreign staged hunk (the shared-index commit race, as finalizeLand/reopenStrandedItem guard).
@@ -1498,7 +1499,7 @@ export function resolveLandedItem(CWD, num, { sync = true, publish = true } = {}
 // slug. Best-effort: a release hiccup is reported, never unwinds a green land. Returns { released, pools } | null.
 function releaseItemLeases(CWD, num) {
   const args = ['scripts/lane-pool.mjs', 'release', '--all-pools', `--item=${Number(num)}`, '--json'];
-  try { return JSON.parse(execFileSync('node', args, { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()); }
+  try { return JSON.parse(withRuntimeProcessAdmission(execFileSync, ['node', args, { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }]).trim()); }
   catch (e) { try { return JSON.parse(String(e.stdout || '').trim()); } catch { return null; } }
 }
 

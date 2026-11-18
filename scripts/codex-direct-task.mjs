@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { withRuntimeProcessAdmission } from './lib/runtime-admission.mjs';
 /**
  * codex-direct-task.mjs — a PERSONAL, manually-invoked escape hatch: delegate one real coding task to Codex
  * CLI's agentic (tool-bearing) mode, for a Claude Code operator whose own usage is running low.
@@ -610,8 +611,8 @@ export function cleanupScratchClone({ dir, startSha, execFn = defaultExecFn, rmF
   // `core.fileMode=true` is pinned for cleanup only: Codex (or the host) can set `core.fileMode=false` in the clone's
   // config, which hides an executable-bit change from `status`. Forcing it on can only keep more clones (a filesystem
   // that cannot hold the bit reports a change), never delete one that holds a mode edit.
-  const gitHardened = (args) => String(execFn('git', ['-C', dir, '--no-optional-locks', ...laneGitConfigArgs(), '-c', 'core.fileMode=true', '--no-replace-objects', ...hardenLaneGitArgs(args)],
-    { env: laneGitHardeningEnv(scrubGitRepoEnv(process.env)), timeout: GIT_STEP_TIMEOUT_MS }));
+  const gitHardened = (args) => String(withRuntimeProcessAdmission(execFn, ['git', ['-C', dir, '--no-optional-locks', ...laneGitConfigArgs(), '-c', 'core.fileMode=true', '--no-replace-objects', ...hardenLaneGitArgs(args)],
+    { env: laneGitHardeningEnv(scrubGitRepoEnv(process.env)), timeout: GIT_STEP_TIMEOUT_MS }]));
   const git = (...args) => gitHardened(args);
   try {
     // A filter driver would run on worktree content during `status`; refuse such a clone (kept, not deleted).
@@ -705,7 +706,7 @@ export function createScratchGuard({ proc = process, execFn = defaultExecFn, rmF
 
 /** `execFileSync`-shaped default with room for large diffs and git/npm/gate output. */
 export const defaultExecFn = (bin, args, opts = {}) =>
-  execFileSync(bin, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 50 * 1024 * 1024, ...opts });
+  withRuntimeProcessAdmission(execFileSync, [bin, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 50 * 1024 * 1024, ...opts }]);
 
 /** How long a gate may hold its pipes after it exited or failed before the wrapper settles without `close`. */
 export const GATE_CLOSE_GRACE_MS = 2000;
@@ -715,7 +716,7 @@ export function detachedGateExecFn(bin, args, opts = {}) {
   return new Promise((resolveExec, reject) => {
     const { timeout = DEFAULT_TIMEOUT_MS, maxBuffer = 50 * 1024 * 1024, closeGraceMs = GATE_CLOSE_GRACE_MS,
       ...spawnOpts } = opts;
-    const child = nodeSpawn(bin, args, { ...spawnOpts, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = withRuntimeProcessAdmission(nodeSpawn, [bin, args, { ...spawnOpts, detached: true, stdio: ['ignore', 'pipe', 'pipe'] }]);
     const output = { stdout: [], stderr: [] };
     const sizes = { stdout: 0, stderr: 0 };
     let failure;
@@ -866,7 +867,7 @@ export function setupScratchClone({
     return runDiagnosedStep(cloneExecFn, 'scratch clone (git clone)', 'git', cloneArgs,
       { timeout: cloneTimeoutMs }, diagnosticFn).then(afterClone);
   }
-  execFn('git', cloneArgs);
+  withRuntimeProcessAdmission(execFn, ['git', cloneArgs]);
   return afterClone();
 }
 
@@ -902,13 +903,13 @@ function finishScratchClone({
   // that matters.
   let realOrigin = null;
   try {
-    const url = execFn('git', ['-C', repoRoot, 'remote', 'get-url', 'origin'], { timeout: GIT_STEP_TIMEOUT_MS }).trim();
+    const url = withRuntimeProcessAdmission(execFn, ['git', ['-C', repoRoot, 'remote', 'get-url', 'origin'], { timeout: GIT_STEP_TIMEOUT_MS }]).trim();
     if (url) realOrigin = url;
   } catch { /* no origin on repoRoot, or remote command unavailable */ }
   let originWired = false;
   if (wireOriginToRemote && realOrigin) {
     try {
-      execFn('git', ['-C', dest, 'remote', 'set-url', 'origin', realOrigin], { timeout: GIT_STEP_TIMEOUT_MS });
+      withRuntimeProcessAdmission(execFn, ['git', ['-C', dest, 'remote', 'set-url', 'origin', realOrigin], { timeout: GIT_STEP_TIMEOUT_MS }]);
       originWired = true;
     } catch { /* set-url failed — clone still works with the local-path origin */ }
   }
@@ -920,7 +921,7 @@ function finishScratchClone({
       depsInstall.bin, depsInstall.args, { cwd: dest, stdio: installStdio, timeout: installTimeoutMs }, diagnosticFn)
       .then(() => result);
   }
-  if (depsInstall) execFn(depsInstall.bin, depsInstall.args, { cwd: dest, stdio: installStdio });
+  if (depsInstall) withRuntimeProcessAdmission(execFn, [depsInstall.bin, depsInstall.args, { cwd: dest, stdio: installStdio }]);
   return result;
 }
 
@@ -947,8 +948,8 @@ export function captureDiff({ dir, startSha, execFn = defaultExecFn }) {
 
   // Codex can write this checkout's git config: the shared lane pins apply, diff drivers and textconv stay off, and a
   // checkout that defines a filter driver (which `status`/`diff` would run on worktree content) is refused first.
-  const git = (args) => execFn('git', ['-C', dir, ...laneGitConfigArgs(), '--no-replace-objects', ...hardenLaneGitArgs(args)],
-    { env: laneGitHardeningEnv(), timeout: GIT_STEP_TIMEOUT_MS });
+  const git = (args) => withRuntimeProcessAdmission(execFn, ['git', ['-C', dir, ...laneGitConfigArgs(), '--no-replace-objects', ...hardenLaneGitArgs(args)],
+    { env: laneGitHardeningEnv(), timeout: GIT_STEP_TIMEOUT_MS }]);
   assertNoLaneFilterDrivers(git);
   const status = git(['status', '--porcelain', '-z']);
   const untracked = status.split('\0').filter((l) => l.startsWith('?? ')).map((l) => l.slice(3));
@@ -1012,7 +1013,7 @@ export function runGate({ dir, mode, execFn = defaultExecFn, asyncExecFn, env = 
   }
   try {
     // Same wall the async gate gets: a descendant holding the pipes must not block the sync gate forever.
-    return result(true, execFn(bin, args, { cwd: dir, env: gateEnv, timeout: DEFAULT_TIMEOUT_MS }));
+    return result(true, withRuntimeProcessAdmission(execFn, [bin, args, { cwd: dir, env: gateEnv, timeout: DEFAULT_TIMEOUT_MS }]));
   } catch (e) {
     return failed(e);
   }
@@ -1076,8 +1077,8 @@ export async function runCodexDirectExec({
   return new Promise((resolvePromise, reject) => {
     let child;
     try {
-      child = spawnFn(cli, argv, { cwd: dir, stdio: ['pipe', 'pipe', 'pipe'], detached: true,
-        env: review ? env : { ...env, PATH: codexShimPath(env), ...(tempRoot ? { TMPDIR: tempRoot, TMP: tempRoot, TEMP: tempRoot } : {}) } });
+      child = withRuntimeProcessAdmission(spawnFn, [cli, argv, { cwd: dir, stdio: ['pipe', 'pipe', 'pipe'], detached: true,
+        env: review ? env : { ...env, PATH: codexShimPath(env), ...(tempRoot ? { TMPDIR: tempRoot, TMP: tempRoot, TEMP: tempRoot } : {}) } }]);
     } catch (e) {
       reject(new Error(`codex-direct-task: could not start \`${cli}\`: ${e.message}`));
       return;
@@ -1321,11 +1322,11 @@ async function runCodexDirectTask({
     throw new Error(`codex-direct-task: gate-unavailable — --gate=${gate} needs scripts/verify-lane.mjs, which ${targetDir} does not have; pass --gate=standards or --gate=none`);
   }
 
-  const startSha = execFn('git', ['-C', targetDir, 'rev-parse', 'HEAD'], { timeout: GIT_STEP_TIMEOUT_MS }).trim();
+  const startSha = withRuntimeProcessAdmission(execFn, ['git', ['-C', targetDir, 'rev-parse', 'HEAD'], { timeout: GIT_STEP_TIMEOUT_MS }]).trim();
   scratchGuard?.setStart(startSha);
   // Same `.git/`-hiding reasoning as `outputLastMessageFile` above — the default log file must never leak
   // into `captureDiff`'s output. A caller-supplied `--log=<path>` is trusted as-is (their choice, their risk).
-  const gitDir = execFn('git', ['-C', targetDir, 'rev-parse', '--absolute-git-dir'], { timeout: GIT_STEP_TIMEOUT_MS }).trim();
+  const gitDir = withRuntimeProcessAdmission(execFn, ['git', ['-C', targetDir, 'rev-parse', '--absolute-git-dir'], { timeout: GIT_STEP_TIMEOUT_MS }]).trim();
   const resolvedLogFile = logFile || join(gitDir, review ? `codex-self-review-${randomUUID()}.jsonl` : 'codex-direct-task.jsonl');
   mkdirSync(dirname(resolvedLogFile), { recursive: true });
 
@@ -1514,9 +1515,9 @@ export async function startDetachedJob({
   try {
     fds.push(fsDeps.openSync(resultPath, 'w', 0o600));
     fds.push(fsDeps.openSync(join(jobsDir, `${id}.stderr.log`), 'w', 0o600));
-    const child = spawnFn(nodePath, [scriptPath, ...args.filter(a => a !== '--detach' && !a.startsWith('--detach=')), '--json', '--no-stream', `--job=${id}`], {
+    const child = withRuntimeProcessAdmission(spawnFn, [nodePath, [scriptPath, ...args.filter(a => a !== '--detach' && !a.startsWith('--detach=')), '--json', '--no-stream', `--job=${id}`], {
       detached: true, stdio: ['ignore', ...fds], env: { ...env, CODEX_JOBS_DIR: jobsDir },
-    });
+    }]);
     await new Promise((resolveSpawn, reject) => {
       child.once('spawn', resolveSpawn);
       child.once('error', reject);
@@ -1542,7 +1543,7 @@ export const PID_START_TIMEOUT_MS = 1000;
  */
 export function readPidStart(pid, { execFn = execFileSync, timeoutMs = PID_START_TIMEOUT_MS } = {}) {
   return readProcStart(pid, {
-    execFn: (bin, args, opts) => execFn(bin, args, { ...opts, timeout: timeoutMs, env: { ...opts.env, TZ: 'UTC' } }),
+    execFn: (bin, args, opts) => withRuntimeProcessAdmission(execFn, [bin, args, { ...opts, timeout: timeoutMs, env: { ...opts.env, TZ: 'UTC' } }]),
   });
 }
 /**
@@ -1552,9 +1553,9 @@ export function readPidStart(pid, { execFn = execFileSync, timeoutMs = PID_START
 export function readPidState(pid, { execFn = execFileSync, timeoutMs = PID_START_TIMEOUT_MS } = {}) {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   try {
-    const out = execFn('ps', ['-o', 'stat=', '-p', String(pid)], {
+    const out = withRuntimeProcessAdmission(execFn, ['ps', ['-o', 'stat=', '-p', String(pid)], {
       env: { ...process.env, LC_ALL: 'C', TZ: 'UTC' }, encoding: 'utf8', timeout: timeoutMs, stdio: ['ignore', 'pipe', 'ignore'],
-    });
+    }]);
     return String(out ?? '').trim() || null;
   } catch (error) {
     if (error && error.status === 1) return null; // ps: no such process
@@ -1737,7 +1738,7 @@ function isWaitInvocation(args) {
 }
 
 function repoRootFromCwd() {
-  return execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8', timeout: GIT_STEP_TIMEOUT_MS }).trim();
+  return withRuntimeProcessAdmission(execFileSync, ['git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8', timeout: GIT_STEP_TIMEOUT_MS }]).trim();
 }
 
 async function main() {

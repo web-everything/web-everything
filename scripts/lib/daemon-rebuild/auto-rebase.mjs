@@ -1,3 +1,4 @@
+import { withRuntimeProcessAdmission } from '../runtime-admission.mjs';
 /** Detached, fail-closed repair of established overlays; registration precedes adoption cleanup. */
 import * as fs from 'node:fs';
 import { execFile, spawn, spawnSync } from 'node:child_process';
@@ -56,8 +57,8 @@ export function kickAutoRebase({ root, env = process.env, lost, spawnFn = spawn 
       token = randomUUID();
       try { fs.writeFileSync(p.marker, token, { flag: 'wx' }); }
       catch (e) { if (e.code === 'EEXIST') { skipped.push(ref); continue; } throw e; }
-      const child = spawnFn(process.execPath, [SELF, `--clone=${root}`, `--ref=${ref}`, `--token=${token}`],
-        { cwd: root, env, detached: true, stdio: 'ignore' });
+      const child = withRuntimeProcessAdmission(spawnFn, [process.execPath, [SELF, `--clone=${root}`, `--ref=${ref}`, `--token=${token}`],
+        { cwd: root, env, detached: true, stdio: 'ignore' }]);
       child.once?.('error', error => {
         try { if (fs.readFileSync(p.marker, 'utf8') === token) fs.unlinkSync(p.marker); } catch { /* next tick */ }
         reportNeedsYou({ root, env, ref, stage: 'launch', error });
@@ -73,11 +74,11 @@ export function kickAutoRebase({ root, env = process.env, lost, spawnFn = spawn 
   return { started, skipped };
 }
 
-const execute = (bin, args, opts) => spawnSync(bin, args, { encoding: 'utf8', timeout: 30 * 60_000, maxBuffer: 8 * 1024 * 1024, ...opts });
+const execute = (bin, args, opts) => withRuntimeProcessAdmission(spawnSync, [bin, args, { encoding: 'utf8', timeout: 30 * 60_000, maxBuffer: 8 * 1024 * 1024, ...opts }]);
 // Long-running agents and tests must leave the event loop free to heartbeat the lock.
 const executeAsync = (bin, args, opts) => new Promise(resolve => {
-  execFile(bin, args, { encoding: 'utf8', timeout: 30 * 60_000, maxBuffer: 8 * 1024 * 1024, ...opts },
-    (error, stdout, stderr) => resolve({ status: error ? (Number.isInteger(error.code) ? error.code : 1) : 0, error, stdout, stderr }));
+  withRuntimeProcessAdmission(execFile, [bin, args, { encoding: 'utf8', timeout: 30 * 60_000, maxBuffer: 8 * 1024 * 1024, ...opts },
+    (error, stdout, stderr) => resolve({ status: error ? (Number.isInteger(error.code) ? error.code : 1) : 0, error, stdout, stderr })]);
 });
 const requireOutput = (r, failure = 'command failed or incomplete') => { if (r?.status !== 0 || r?.error) throw new Error(failure); return String(r.stdout ?? ''); };
 const requireOk = (r, failure) => requireOutput(r, failure).trim();

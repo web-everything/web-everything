@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { withRuntimeProcessAdmission } from '../lib/runtime-admission.mjs';
 /**
  * @file scripts/operations/probation-heal-run.mjs
  * @description THE PROBATION HEAL RUN (agy-launcher-probation, operator 2026-09-27) — the detached per-dispatch
@@ -117,7 +118,7 @@ export function bindHealAttempt(id, handle, { dir = healAttemptsDir() } = {}) {
 }
 
 /** Publication is confirmed by a trusted read; an ambiguous write remains owed and blocks new attempts. */
-export function publishHealAttempt(row, { readComments = r => JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(r.pr), '--repo', REPO_SLUG, '--json', 'comments'], { encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'] })).comments,
+export function publishHealAttempt(row, { readComments = r => JSON.parse(withRuntimeProcessAdmission(execFileSyncThrottled, ['gh', ['pr', 'view', String(r.pr), '--repo', REPO_SLUG, '--json', 'comments'], { encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'] }])).comments,
   post = args => postPrComment({ ...args, exec: execFileSyncThrottled }), owe = recordOwedWrite, clear = clearOwedWrite } = {}) {
   const body = buildCiHealComment({ attemptId: row.attemptId, headSha: row.headSha,
     // Structured fields only: the raw worker/log tail stays in the local attempt row (a denylist redactor cannot
@@ -455,7 +456,7 @@ async function runHealArc(args, io, evidence) {
 // ─── the real processes ────────────────────────────────────────────────────────────────────────────────────
 
 function sh(bin, args, opts = {}) {
-  return execFileSync(bin, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, ...opts });
+  return withRuntimeProcessAdmission(execFileSync, [bin, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, ...opts }]);
 }
 function trySh(bin, args, opts = {}) {
   try { return { ok: true, out: sh(bin, args, opts) }; } catch (e) { return { ok: false, status: e.status, signal: e.signal, stdout: String(e?.stdout ?? ''), out: `${e?.stdout ?? ''}${e?.stderr ?? ''}` || String(e?.message ?? e) }; }

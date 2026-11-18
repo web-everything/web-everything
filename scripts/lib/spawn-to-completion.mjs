@@ -61,6 +61,7 @@
  * @param {{spawnFn?: Function}} [io] - injectable ONLY for tests; real callers never pass it.
  * @returns {Promise<{stdout: string, stderr: string, resourceUsage: object|null}>}
  */
+import { withRuntimeProcessAdmission } from './runtime-admission.mjs';
 import { spawn } from 'node:child_process';
 
 export function spawnToCompletion(cmd, argv, opts = {}, { spawnFn = spawn } = {}) {
@@ -72,7 +73,7 @@ export function spawnToCompletion(cmd, argv, opts = {}, { spawnFn = spawn } = {}
     let settled = false;
     let child;
     try {
-      child = spawnFn(cmd, argv, spawnOpts);
+      child = withRuntimeProcessAdmission(spawnFn, [cmd, argv, spawnOpts]);
     } catch (e) {
       reject(e);
       return;

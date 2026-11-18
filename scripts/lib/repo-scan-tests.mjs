@@ -40,7 +40,10 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
  * `inputs`   = paths that define the scanner's RULE; a change to one runs the scanner full.
  */
 
-/** Shared inventory for the launch guard and its changed-file selector. Patterns match filenames. */
+/** Supplemental launch-port contracts (injected providers and group projection).
+ * NOT the process inventory: the spawn-guard test computes the full static delivery
+ * closure and pins every process-bearing module separately. Selection is whole-tree.
+ */
 export const RUNTIME_ADMISSION_SPAWN_SCAN = Object.freeze([
   'skills-src/conveyor/build-dispatch-daemon.mjs',
   'scripts/conveyor/tick-core.mjs',
@@ -55,10 +58,10 @@ export const RUNTIME_ADMISSION_SPAWN_SCAN = Object.freeze([
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
-    test: 'scripts/lib/__tests__/runtime-admission-spawn-guard.test.mjs', scope: 'files',
+    test: 'scripts/lib/__tests__/runtime-admission-spawn-guard.test.mjs', scope: 'full',
     why: 'every conveyor work launch must pass the fresh runtime admission boundary',
-    matches: f => RUNTIME_ADMISSION_SPAWN_SCAN.some(entry => typeof entry === 'string' ? f === entry
-      : f.startsWith(`${entry.directory}/`) && entry.files.test(f.slice(entry.directory.length + 1))),
+    // Any source can become a new transitive dependency; select the complete closure scan.
+    matches: f => SOURCE_EXT.test(f),
     inputs: ['scripts/lib/__tests__/runtime-admission-spawn-guard.test.mjs', 'scripts/lib/runtime-admission.mjs'],
   },
   {

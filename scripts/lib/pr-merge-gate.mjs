@@ -1,3 +1,4 @@
+import { withRuntimeProcessAdmission } from './runtime-admission.mjs';
 /**
  * pr-merge-gate.mjs — the ONE place a `gh pr merge` to `main` may originate (#2290).
  *
@@ -272,7 +273,7 @@ export function assertMayMerge({ caller, pr = null, repo = null, env = process.e
  */
 export function mergePr({ pr, repo = null, method = 'merge', matchHeadCommit = null, deleteBranch = true, caller, exec = execFileSync, env = process.env, log = process.stderr } = {}) {
   assertMayMerge({ caller, pr, repo, env, log });
-  return exec('gh', buildGateMergeArgs({ pr, repo, method, matchHeadCommit, deleteBranch }), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  return withRuntimeProcessAdmission(exec, ['gh', buildGateMergeArgs({ pr, repo, method, matchHeadCommit, deleteBranch }), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }]);
 }
 
 // ── #3383 — retarget a stacked PR BEFORE its base branch is deleted ────────────────────────────────────
@@ -319,7 +320,7 @@ export function retargetStackedPrs({ repo = null, headRef, defaultBranch, exec =
   const failed = [];
   let stacked;
   try {
-    const out = exec('gh', buildStackedPrListArgs({ repo, headRef }), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    const out = withRuntimeProcessAdmission(exec, ['gh', buildStackedPrListArgs({ repo, headRef }), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }]);
     stacked = JSON.parse(String(out || '[]').trim() || '[]');
   } catch { return { retargeted, failed, listed: false }; } // listing miss — nothing to safely act on, never blocks the merge
   if (!Array.isArray(stacked)) return { retargeted, failed, listed: false };
@@ -328,7 +329,7 @@ export function retargetStackedPrs({ repo = null, headRef, defaultBranch, exec =
     const num = s && s.number;
     if (num == null) { listed = false; continue; }
     try {
-      exec('gh', buildRetargetArgs({ pr: num, repo, base: defaultBranch }), { stdio: ['ignore', 'ignore', 'pipe'] });
+      withRuntimeProcessAdmission(exec, ['gh', buildRetargetArgs({ pr: num, repo, base: defaultBranch }), { stdio: ['ignore', 'ignore', 'pipe'] }]);
       retargeted.push(num);
       onRetarget(num);
     } catch {

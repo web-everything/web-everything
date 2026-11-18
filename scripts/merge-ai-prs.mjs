@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { withRuntimeProcessAdmission } from './lib/runtime-admission.mjs';
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
@@ -423,7 +424,7 @@ export function resolvePrimaryPath(cwd, { flag, env } = {}, readAlt = (p) => rea
 export function syncPrimaryOnLand({ exec, primary, hinted = false, isCwd = () => false }) {
   if (!primary) return { synced: false, reason: 'not-located', warn: !!hinted };
   try { if (isCwd(primary)) return { synced: false, reason: 'from-primary', warn: false }; } catch { return { synced: false, reason: 'from-primary', warn: false }; }
-  const at = (a) => String(exec(['-C', primary, ...a]) ?? '').trim();
+  const at = (a) => String(withRuntimeProcessAdmission(exec, [['-C', primary, ...a]]) ?? '').trim();
   let branch; try { branch = at(['rev-parse', '--abbrev-ref', 'HEAD']); } catch { return { synced: false, reason: 'not-a-repo', warn: true }; }
   if (branch !== 'main') return { synced: false, reason: 'not-on-main', warn: true, branch: branch || 'unknown' };
   let dirty; try { dirty = at(['status', '--porcelain', '--untracked-files=no']); } catch { return { synced: false, reason: 'status-failed', warn: true }; }
@@ -513,9 +514,9 @@ export async function resolveRequiredCheck(pr, { repo = null, requiredCheck = 't
   delete resolved.requiredCheckReadError;
   try {
     if (!pr?.headRefOid) throw new Error('PR head SHA is missing');
-    const { stdout } = await exec('gh', ['api', requiredCheckRunsEndpoint(repo, pr.headRefOid, requiredCheck), '--paginate', '--slurp'], {
+    const { stdout } = await withRuntimeProcessAdmission(exec, ['gh', ['api', requiredCheckRunsEndpoint(repo, pr.headRefOid, requiredCheck), '--paginate', '--slurp'], {
       encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
-    });
+    }]);
     resolved.statusCheckRollup = mergeRequiredCheckRuns(pr, requiredCheck, stdout);
   } catch (error) {
     resolved.requiredCheckReadError = `required check "${requiredCheck}" direct read failed; deferred this pass: ${String(error.message || error).split('\n')[0]}`;
@@ -778,10 +779,10 @@ export function acceptStandsUnsuperseded({ comments, acceptedSha, readReviews })
  * `readReviews` (injectable) reads the PR's formal reviews, only when a marker-less accept's fingerprint is derived.
  */
 export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execFileSync, netDiff = computeNetDiffText, carrySetting = null, readReviews = null }) {
-  const d = JSON.parse(exec('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []),
+  const d = JSON.parse(withRuntimeProcessAdmission(exec, ['gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []),
     '--json', 'headRefOid,headRefName,comments'], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
-  }));
+  }]));
   if (!d || typeof d.headRefOid !== 'string' || !d.headRefOid.trim() || !Array.isArray(d.comments)) {
     throw new Error('incomplete PR head/comments verification response');
   }
@@ -806,7 +807,7 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
   let formalReviews;
   const readFormalReviews = () => {
     if (formalReviews === undefined) {
-      const r = (readReviews ?? (() => parseJsonLines(exec('gh', GH_ARGV.readPrReviews(repo || '{owner}/{repo}', pr), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }))))();
+      const r = (readReviews ?? (() => parseJsonLines(withRuntimeProcessAdmission(exec, ['gh', GH_ARGV.readPrReviews(repo || '{owner}/{repo}', pr), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }]))))();
       if (!Array.isArray(r)) throw new Error('formal reviews read returned no array');
       formalReviews = r;
     }
@@ -823,7 +824,7 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
     && acceptStandsUnsuperseded({ comments: d.comments, acceptedSha: evidence.acceptedSha, readReviews: readFormalReviews })) {
     try {
       const old = readNetDiffAtHead({
-        exec: (cmd, args, opts) => exec(cmd, args, { cwd, ...opts }),
+        exec: (cmd, args, opts) => withRuntimeProcessAdmission(exec, [cmd, args, { cwd, ...opts }]),
         headSha: evidence.acceptedSha, headRef: evidence.acceptedSha, netDiff,
       });
       const fp = old.scored ? normalizeDiffFingerprint(old.text) : null;
@@ -853,7 +854,7 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
       // `readNetDiffAtHead`); a diff read at the branch name could be another commit's. #xnqxtdy: `pinRev` also resolves
       // that sha once BEFORE the diff and diffs from the resolved sha (and its fork point), and names it as `revSha`.
       const net = readNetDiffAtHead({
-        exec: (cmd, args, opts) => exec(cmd, args, { cwd, ...opts }),
+        exec: (cmd, args, opts) => withRuntimeProcessAdmission(exec, [cmd, args, { cwd, ...opts }]),
         headSha, headRef: d.headRefName, netDiff, pinRev: true,
       });
       // The carry still refuses a diff whose named sha is not the head it would stamp. A scored read that names no sha leaves
@@ -871,14 +872,14 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
 function readLiveDrainCarryEvidence({ pr, repo, cwd, exec = execFileSync, readReviews } = {}) {
   repo ||= localRepoSlug({ cwd, exec });
   const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 };
-  const d = JSON.parse(exec('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []),
-    '--json', 'headRefOid'], opts));
+  const d = JSON.parse(withRuntimeProcessAdmission(exec, ['gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []),
+    '--json', 'headRefOid'], opts]));
   if (!d?.headRefOid) throw Error('incomplete live head');
   const comments = readCompletePrComments(pr, { repo, exec });
   const slug = repo || '{owner}/{repo}';
   return { headSha: d.headRefOid, ...readDrainCarryEvidence({ comments,
     readComments: () => readCompletePrComments(pr, { repo, exec }),
-    readReviews: readReviews ?? (() => parseJsonLines(exec('gh', GH_ARGV.readPrReviews(slug, pr), opts))),
+    readReviews: readReviews ?? (() => parseJsonLines(withRuntimeProcessAdmission(exec, ['gh', GH_ARGV.readPrReviews(slug, pr), opts]))),
   }) };
 }
 
@@ -968,7 +969,7 @@ export function reconcileDrainReviewPending({ currentLabels, dryRun = false, ...
     const coverage = acceptanceCoversHead(readDrainAcceptance(readOptions));
     if (!coverage.covers) return { ok: false, reason: coverage.reason };
     if (dryRun) return { ok: true };
-    return spawn({ pr: readOptions.pr, repo: readOptions.repo, to: 'accepted', cwd: readOptions.cwd });
+    return withRuntimeProcessAdmission(spawn, [{ pr: readOptions.pr, repo: readOptions.repo, to: 'accepted', cwd: readOptions.cwd }]);
   } catch (error) {
     return { ok: false, reason: `review acceptance verification unreadable: ${error.message || error}` };
   }
@@ -1336,9 +1337,9 @@ export async function repollThenCollectContext({ repoll, collect }) {
 export function applyCiLifecycleLabelPlan({ plan, pr, repo = null, slug = repo, exec = execFileSync, signal = signalFixDispatch, onLabelNotFound = null }) {
   const flag = repo ? ['--repo', repo] : [];
   let ok = true;
-  for (const rm of plan.toRemove) { try { exec('gh', ['pr', 'edit', String(pr), ...flag, '--remove-label', rm], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { ok = false; } }
+  for (const rm of plan.toRemove) { try { withRuntimeProcessAdmission(exec, ['gh', ['pr', 'edit', String(pr), ...flag, '--remove-label', rm], { stdio: ['ignore', 'ignore', 'pipe'] }]); } catch { ok = false; } }
   const writeOnce = (add) => {
-    const write = () => exec('gh', ['pr', 'edit', String(pr), ...flag, '--add-label', add], { stdio: ['ignore', 'ignore', 'pipe'] });
+    const write = () => withRuntimeProcessAdmission(exec, ['gh', ['pr', 'edit', String(pr), ...flag, '--add-label', add], { stdio: ['ignore', 'ignore', 'pipe'] }]);
     try { return write(); }
     catch (err) { if (!onLabelNotFound || !isLabelNotFoundError(err) || !onLabelNotFound(add)) throw err; return write(); }
   };
@@ -1451,7 +1452,7 @@ export function spawnReviewSetLabel({ pr, repo, to, cwd, actor, channel, reason,
   if (channel) args.push(`--channel=${channel}`);
   if (reason) args.push(`--reason=${reason}`);
   try {
-    const r = spawn(process.execPath, [new URL('./review-set-label.mjs', import.meta.url).pathname, ...args], { encoding: 'utf8', cwd });
+    const r = withRuntimeProcessAdmission(spawn, [process.execPath, [new URL('./review-set-label.mjs', import.meta.url).pathname, ...args], { encoding: 'utf8', cwd }]);
     if (r.status === 0) return { ok: true };
     return { ok: false, reason: String(r.stdout || r.stderr || `exit ${r.status}`).trim().split('\n').pop() };
   } catch (e) {
@@ -1463,7 +1464,7 @@ export function restampAcceptance({ pr, repo, newHead, cwd, spawn = spawnSync, l
   try {
     const target = repo || localRepo();
     if (!target) return { ok: false, reason: 'no repo to re-stamp (PR repo unset and the local repo slug unreadable)' };
-    const r = spawn(process.execPath, [
+    const r = withRuntimeProcessAdmission(spawn, [process.execPath, [
       new URL('./review-set-label.mjs', import.meta.url).pathname,
       String(pr), `--repo=${target}`, '--to=restamp', '--actor=drain',
       '--channel=drain-rebase', `--reason=head moved to ${newHead} by this drain's own content-preserving rebase`,
@@ -1477,7 +1478,7 @@ export function restampAcceptance({ pr, repo, newHead, cwd, spawn = spawnSync, l
       // NO `--body-file` HERE, and that must stay true while `cwd` is set: the CLI's body-file allowlist is
       // rooted at `process.cwd()`, so a body staged under THIS checkout would be refused by a child pinned to
       // another repo's clone. A caller that needs both has to widen that allowlist deliberately.
-    ], { encoding: 'utf8', cwd });
+    ], { encoding: 'utf8', cwd }]);
     if (r.status === 0) return { ok: true };
     return { ok: false, reason: String(r.stdout || r.stderr || `exit ${r.status}`).trim().split('\n').pop() };
   } catch (e) {
@@ -1992,7 +1993,7 @@ export function runStrandedSweepStep({
  * @returns {{ok:boolean, reason?:string, head?:string}}
  */
 export function defaultStrandedSweepSync({ exec = execFileSync } = {}) {
-  const git = (args) => String(exec('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '').trim();
+  const git = (args) => String(withRuntimeProcessAdmission(exec, ['git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }]) || '').trim();
   let branch;
   try { branch = git(['symbolic-ref', '--short', '-q', 'HEAD']); } catch { branch = ''; }
   if (branch !== 'main') return { ok: false, reason: `checkout not attached to main (${branch || 'detached HEAD'})` };
@@ -2247,7 +2248,7 @@ export function isContentsNotFound(err) {
  */
 export async function readRemoteManifestViaApi({ exec, repo, headRef, apiArgs = remoteManifestApiArgs } = {}) {
   try {
-    const { stdout } = await exec('gh', apiArgs(repo, headRef), { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+    const { stdout } = await withRuntimeProcessAdmission(exec, ['gh', apiArgs(repo, headRef), { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }]);
     const b64 = (stdout || '').trim();
     if (b64) {
       // card 8036 — a 200 whose body is not valid JSON is a poison record, not a transport failure: flag it
@@ -3900,11 +3901,11 @@ export function parseNumstat(numstat) {
  */
 function isStrictAncestor(exec, ancestor, descendant) {
   try {
-    exec('git', ['merge-base', '--is-ancestor', '--end-of-options', ancestor, descendant], { stdio: ['ignore', 'ignore', 'ignore'] });
+    withRuntimeProcessAdmission(exec, ['git', ['merge-base', '--is-ancestor', '--end-of-options', ancestor, descendant], { stdio: ['ignore', 'ignore', 'ignore'] }]);
   } catch { return false; } // non-zero exit (not an ancestor) or unresolvable → don't trust the base
   try {
-    const a = String(exec('git', ['rev-parse', '--verify', '--end-of-options', ancestor], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').trim();
-    const b = String(exec('git', ['rev-parse', '--verify', '--end-of-options', descendant], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').trim();
+    const a = String(withRuntimeProcessAdmission(exec, ['git', ['rev-parse', '--verify', '--end-of-options', ancestor], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }]) || '').trim();
+    const b = String(withRuntimeProcessAdmission(exec, ['git', ['rev-parse', '--verify', '--end-of-options', descendant], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }]) || '').trim();
     if (a && b && a === b) return false; // base == head → degenerate empty own-delta, reject
   } catch { /* can't resolve to SHAs → is-ancestor already vouched it's a distinct ancestor path */ }
   return true;
@@ -4048,7 +4049,7 @@ function basisAnswersRequest(basis, { remote, base, rev }) {
 function ancestryNetDiff(exec, baseRef, candidate) {
   let parsed;
   try {
-    parsed = parseNumstat(exec('git', ['log', '--numstat', '--diff-merges=first-parent', '--pretty=format:', '--end-of-options', `${baseRef}..${candidate}`, '--'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+    parsed = parseNumstat(withRuntimeProcessAdmission(exec, ['git', ['log', '--numstat', '--diff-merges=first-parent', '--pretty=format:', '--end-of-options', `${baseRef}..${candidate}`, '--'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }]));
   } catch (err) {
     if (isExecContractError(err)) throw err; // let the caller's own contract short-circuit classify it
     return null; // git can't answer (old git, unresolvable range) — caller keeps the base-tip basis
@@ -4097,7 +4098,7 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
     // `--end-of-options` FIRST: `fetchExtraRefs` carries a branch name straight off the `gh` API, and a
     // dash-leading refname is legal (`git check-ref-format 'refs/heads/--output=/tmp/pwn'` exits 0), so without
     // the guard git parses it as an option — `--upload-pack=<script>` EXECUTES. Verified against git 2.50.1.
-    exec('git', ['fetch', '--quiet', '--end-of-options', remote, `+${base}:refs/remotes/${remote}/${base}`, ...fetchExtraRefs], { stdio: ['ignore', 'ignore', 'ignore'] });
+    withRuntimeProcessAdmission(exec, ['git', ['fetch', '--quiet', '--end-of-options', remote, `+${base}:refs/remotes/${remote}/${base}`, ...fetchExtraRefs], { stdio: ['ignore', 'ignore', 'ignore'] }]);
   } catch (err) {
     // #2952 — a shape-violating exec fails EVERY call the same way; bail immediately rather than degrade to
     // "whatever is locally cached", which would just re-throw on the very next call below.
@@ -4121,7 +4122,7 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
       // newline in a would-be single revision arg, making it an invalid `git diff` argument (a "continue" to
       // the next candidate, or a `null` resolve if both candidates hit it — always the safe over-scoring
       // fallback, never wrong data, but avoidable).
-      const mb = String(exec('git', ['merge-base', '--end-of-options', baseRef, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').split('\n')[0].trim();
+      const mb = String(withRuntimeProcessAdmission(exec, ['git', ['merge-base', '--end-of-options', baseRef, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }]) || '').split('\n')[0].trim();
       if (mb) { diffBase = mb; basisKind = 'merge-base'; }
     } catch (err) {
       if (isExecContractError(err)) return { ok: false, reason: 'exec-contract', requestedFor };
@@ -4134,7 +4135,7 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
       // Verified on git 2.50.1: unguarded, `git diff --numstat <base> '--output=<path>'` exits 0 and WRITES that
       // file, and the swallowed numstat then reads EMPTY while the candidate still resolves — a zero blast-radius
       // score for a PR about to land, the exact de-inflation the #2390-review-fix comments assert is impossible.
-      humanBasis = parseNumstat(exec('git', ['diff', '--numstat', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+      humanBasis = parseNumstat(withRuntimeProcessAdmission(exec, ['git', ['diff', '--numstat', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }]));
     } catch (err) {
       if (isExecContractError(err)) return { ok: false, reason: 'exec-contract', requestedFor };
       continue; /* candidate doesn't resolve — try the next one */
@@ -4188,7 +4189,7 @@ export function computeNetDiffChangedFiles({ exec, remote = 'origin', base = 'ma
     // refname. Every argv position in this file that takes a caller-supplied ref is now guarded; `merge-base`
     // and `rev-parse` are hardening rather than live holes (both reject an unknown option on git 2.50.1, and
     // the surrounding catch absorbs it), while the `git diff` positions are genuinely exploitable — verified.
-    try { own = parseNumstat(exec('git', ['diff', '--numstat', '--end-of-options', baseRev, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })); }
+    try { own = parseNumstat(withRuntimeProcessAdmission(exec, ['git', ['diff', '--numstat', '--end-of-options', baseRev, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }])); }
     catch { own = humanBasis; /* own-delta diff failed → fall back to the cumulative basis */ }
   }
   // #3343 — the basis's `basisKind` / `basisNarrowed` are DELIBERATELY not re-exported here. This function's
@@ -4238,14 +4239,14 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
   let revSha;
   if (pinRev) {
     try {
-      revSha = String(exec('git', ['rev-parse', '--verify', '--end-of-options', `${candidate}^{commit}`],
-        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '').trim().toLowerCase();
+      revSha = String(withRuntimeProcessAdmission(exec, ['git', ['rev-parse', '--verify', '--end-of-options', `${candidate}^{commit}`],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }]) || '').trim().toLowerCase();
       if (!/^[0-9a-f]{40,64}$/.test(revSha)) return { ...unscored, reason: 'diff-failed' };
       // Only the fork-point basis can be pinned on BOTH sides: a `base-tip` / `ancestry` basis diffs against the moving
       // `<remote>/<base>` NAME, which is an unpinned ref read next to the stamp — it is unscored here (fail closed).
       if (basis.basisKind !== 'merge-base') return { ...unscored, reason: 'diff-failed' };
-      diffBase = String(exec('git', ['merge-base', '--end-of-options', basis.baseRef, revSha],
-        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').split('\n')[0].trim();
+      diffBase = String(withRuntimeProcessAdmission(exec, ['git', ['merge-base', '--end-of-options', basis.baseRef, revSha],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }]) || '').split('\n')[0].trim();
       if (!/^[0-9a-f]{40,64}$/i.test(diffBase)) return { ...unscored, reason: 'diff-failed' };
       candidate = revSha;
     } catch (err) {
@@ -4262,7 +4263,7 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
     // Deliberately NOT `--text`: unlike the single-file write-time diff, this is a whole-PR diff and forcing
     // binary blobs into it would splat megabytes of asset bytes into the reviewer-facing text (see
     // `diff-hunks.mjs`, where `--text` is right precisely because the payload is one bounded file).
-    const text = String(exec('git', ['diff', '--no-ext-diff', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '');
+    const text = String(withRuntimeProcessAdmission(exec, ['git', ['diff', '--no-ext-diff', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }]) || '');
     return { text, base: diffBase, rev: candidate, scored: true, ...(revSha ? { revSha } : {}) };
   } catch (err) {
     // the text diff failed even though the basis resolved → caller falls back to `gh pr diff`
@@ -4375,7 +4376,7 @@ export function computeNetDiffPaths({ exec, remote = 'origin', base = 'main', re
   if (!basis.ok) return { ...unscored, reason: basis.reason };
   const { diffBase, candidate } = basis;
   try {
-    const raw = exec('git', ['diff', '--name-only', '-z', '--end-of-options', `${diffBase}..${candidate}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    const raw = withRuntimeProcessAdmission(exec, ['git', ['diff', '--name-only', '-z', '--end-of-options', `${diffBase}..${candidate}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }]);
     const paths = String(raw || '').split('\0').filter(Boolean);
     return { paths, base: diffBase, rev: candidate, scored: true };
   } catch (err) {
@@ -4405,7 +4406,7 @@ export function regenDerivedOnLand({ exec, cwd = process.cwd(), landed = false, 
   const done = [];
   const failed = [];
   for (const [cmd, ...args] of regenSet) {
-    try { exec(cmd, args, { cwd, stdio: ['ignore', 'ignore', 'pipe'] }); done.push([cmd, ...args].join(' ')); }
+    try { withRuntimeProcessAdmission(exec, [cmd, args, { cwd, stdio: ['ignore', 'ignore', 'pipe'] }]); done.push([cmd, ...args].join(' ')); }
     catch (e) { failed.push({ cmd: [cmd, ...args].join(' '), detail: firstLine(e) }); }
   }
   if (done.length === 0) return { ran: true, done, failed, committed: false, pushed: false, warning: failed.length ? `derived-artifact regen failed (non-fatal): ${failed.map((f) => f.cmd).join(', ')}` : undefined };
@@ -4415,16 +4416,16 @@ export function regenDerivedOnLand({ exec, cwd = process.cwd(), landed = false, 
   // shared-index hazard `finalizeLand` guards with an explicit pathspec). Intersecting with `outputPaths` means
   // the commit provably carries ONLY `AGENTS.md` / `referenceIndex.json`, whatever else is dirty in the tree.
   let dirty = [];
-  try { dirty = String(exec('git', ['diff', '--name-only', '--', ...outputPaths], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '').split('\n').filter(Boolean); }
+  try { dirty = String(withRuntimeProcessAdmission(exec, ['git', ['diff', '--name-only', '--', ...outputPaths], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }]) || '').split('\n').filter(Boolean); }
   catch { dirty = []; }
   const changed = dirty.filter((f) => outputPaths.includes(f));
   if (changed.length === 0) return { ran: true, done, failed, committed: false, pushed: false }; // regen was a no-op (derived inputs didn't change)
   try {
     // Explicit pathspec — only these derived files ride the commit (never `git add -A`, and never the broad
     // `git diff` sweep). Mirror pr-land's runRegen commit message + gated main push exactly (#2182).
-    exec('git', ['add', ...changed], { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
-    exec('git', ['commit', '-m', `chore: regen derived artifacts post-land (#2182) [${done.map((c) => c.replace('npm run ', '')).join(', ')}]`], { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
-    exec('git', ['push', remote, `HEAD:${base}`], { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, MAIN_PUSH_OK: '1' } });
+    withRuntimeProcessAdmission(exec, ['git', ['add', ...changed], { cwd, stdio: ['ignore', 'pipe', 'pipe'] }]);
+    withRuntimeProcessAdmission(exec, ['git', ['commit', '-m', `chore: regen derived artifacts post-land (#2182) [${done.map((c) => c.replace('npm run ', '')).join(', ')}]`], { cwd, stdio: ['ignore', 'pipe', 'pipe'] }]);
+    withRuntimeProcessAdmission(exec, ['git', ['push', remote, `HEAD:${base}`], { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, MAIN_PUSH_OK: '1' } }]);
     return { ran: true, done, failed, committed: true, pushed: true };
   } catch (e) {
     return { ran: true, done, failed, committed: false, pushed: false, warning: `derived-artifact regen committed/pushed FAILED (${firstLine(e)}) — run gen:inventory + gen:reference-index on ${base} + push by hand (no force-push)` };
@@ -4451,7 +4452,7 @@ export function regenDerivedOnLand({ exec, cwd = process.cwd(), landed = false, 
 export function pushNumberingOnLand({ exec, cwd = process.cwd(), remote = 'origin', base = 'main', shouldPush = false } = {}) {
   if (!shouldPush || typeof exec !== 'function') return { pushed: false };
   try {
-    exec('git', ['push', remote, `HEAD:${base}`], { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, MAIN_PUSH_OK: '1' } });
+    withRuntimeProcessAdmission(exec, ['git', ['push', remote, `HEAD:${base}`], { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, MAIN_PUSH_OK: '1' } }]);
     return { pushed: true };
   } catch (e) {
     return { pushed: false, warning: `numbering/resolve committed locally but push FAILED (${String((e && e.message) || e).split('\n')[0]}) — push main by hand` };
@@ -4497,25 +4498,25 @@ export function pushNumberingOnLand({ exec, cwd = process.cwd(), remote = 'origi
 export function resyncDetachedCwdForLand({ exec, landedLocal, localSynced, remote = 'origin', base = 'main' }) {
   if (!landedLocal || localSynced || typeof exec !== 'function') return { resynced: false, skipped: 'not-applicable' };
   let ref = null;
-  try { ref = exec('git', ['symbolic-ref', '-q', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }); }
+  try { ref = withRuntimeProcessAdmission(exec, ['git', ['symbolic-ref', '-q', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }]); }
   catch { ref = null; } // throws → HEAD is genuinely detached
   const detached = ref == null;
   const attachedBranch = detached ? null : String(ref).trim().replace(/^refs\/heads\//, '');
   const staleLaneBranch = !detached && /^lane\//.test(attachedBranch); // #2419 — the widened trigger
   if (!detached && !staleLaneBranch) return { resynced: false, skipped: 'attached' };
   let dirty = true;
-  try { dirty = isPostLandTreeDirty(exec('git', ['status', '--porcelain', '--untracked-files=no'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })); }
+  try { dirty = isPostLandTreeDirty(withRuntimeProcessAdmission(exec, ['git', ['status', '--porcelain', '--untracked-files=no'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }])); }
   catch { dirty = true; } // status unreadable → treat as dirty, never reset blind
   if (dirty) return { resynced: false, skipped: 'dirty' };
   try {
-    exec('git', ['fetch', remote, base, '--quiet'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    withRuntimeProcessAdmission(exec, ['git', ['fetch', remote, base, '--quiet'], { stdio: ['ignore', 'pipe', 'pipe'] }]);
   } catch (e) {
     return { resynced: false, skipped: 'exec-failed', detail: String((e && e.message) || e).split('\n')[0] };
   }
-  try { exec('git', ['merge-base', '--is-ancestor', 'HEAD', `${remote}/${base}`], { stdio: ['ignore', 'ignore', 'ignore'] }); }
+  try { withRuntimeProcessAdmission(exec, ['git', ['merge-base', '--is-ancestor', 'HEAD', `${remote}/${base}`], { stdio: ['ignore', 'ignore', 'ignore'] }]); }
   catch { return { resynced: false, skipped: 'unpublished-commits' }; } // HEAD carries commits origin/${base} doesn't — never orphan them
   try {
-    exec('git', ['checkout', '--detach', `${remote}/${base}`, '--quiet'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    withRuntimeProcessAdmission(exec, ['git', ['checkout', '--detach', `${remote}/${base}`, '--quiet'], { stdio: ['ignore', 'pipe', 'pipe'] }]);
     return { resynced: true };
   } catch (e) {
     return { resynced: false, skipped: 'exec-failed', detail: String((e && e.message) || e).split('\n')[0] };
@@ -4676,8 +4677,8 @@ export function removeDeescalatedHumanLabels({ gate, labels, dryRun, pr, repo, a
   if (!gate.deescalatedHuman || dryRun || applyOk !== true) return removed;
   for (const label of (gate.removeLabels || []).filter((l) => hasReviewLabel(labels, l))) {
     try {
-      exec('gh', ['pr', 'edit', String(pr), ...(repo ? ['--repo', repo] : []), '--remove-label', label],
-        { stdio: ['ignore', 'ignore', 'pipe'] });
+      withRuntimeProcessAdmission(exec, ['gh', ['pr', 'edit', String(pr), ...(repo ? ['--repo', repo] : []), '--remove-label', label],
+        { stdio: ['ignore', 'ignore', 'pipe'] }]);
       removed.push(label);
     } catch { /* label best-effort */ }
   }
@@ -4694,8 +4695,8 @@ export function applyDrainParkLabel({ gate, labels, dryRun, pr, repo, onBeforeAd
   let applyOk = true; // already present => nothing to add
   if (shouldApplyReviewLabel(gate.applyLabel, labels)) {
     onBeforeAdd?.();
-    const addOnce = () => exec('gh', ['pr', 'edit', String(pr), ...(repo ? ['--repo', repo] : []), '--add-label', gate.applyLabel],
-      { stdio: ['ignore', 'ignore', 'pipe'] });
+    const addOnce = () => withRuntimeProcessAdmission(exec, ['gh', ['pr', 'edit', String(pr), ...(repo ? ['--repo', repo] : []), '--add-label', gate.applyLabel],
+      { stdio: ['ignore', 'ignore', 'pipe'] }]);
     try {
       try { addOnce(); }
       catch (err) {
@@ -4872,8 +4873,8 @@ async function runCli() {
   const memoRepo = (repo) => {
     if (repo || process.env.GH_REPO) return repo || process.env.GH_REPO;
     if (!implicitLabelRepo) {
-      implicitLabelRepo = execFileSync('gh', ['repo', 'view', '--json', 'url', '--jq', '.url'],
-        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 64 * 1024 }).trim();
+      implicitLabelRepo = withRuntimeProcessAdmission(execFileSync, ['gh', ['repo', 'view', '--json', 'url', '--jq', '.url'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 64 * 1024 }]).trim();
       if (!implicitLabelRepo) throw new Error('Cannot resolve implicit label repository');
     }
     return implicitLabelRepo;
@@ -4889,7 +4890,7 @@ async function runCli() {
     return true;
   };
   const addPrLabel = (repo, num, label) => {
-    const add = () => execFileSync('gh', ['pr', 'edit', String(num), ...repoFlag(repo), '--add-label', label], { stdio: ['ignore', 'ignore', 'pipe'] });
+    const add = () => withRuntimeProcessAdmission(execFileSync, ['gh', ['pr', 'edit', String(num), ...repoFlag(repo), '--add-label', label], { stdio: ['ignore', 'ignore', 'pipe'] }]);
     try { add(); }
     catch (err) { if (!isLabelNotFoundError(err) || !healLabelNotFoundIn(repo)(label)) throw err; add(); }
   };
@@ -4909,7 +4910,7 @@ async function runCli() {
   // entry and re-mints it (`healLabelNotFoundIn`), so a label deleted on GitHub is created again exactly when needed.
   const labelEnsurer = createLabelEnsurer({
     path: process.env.WE_DRAIN_LABEL_MEMO_PATH || join(homedir(), '.claude', 'conveyor', 'drain-label-memo.json'),
-    run: (args, repo) => execFileSync('gh', [...args, ...(repo && !repo.startsWith('cwd:') ? ['--repo', repo] : [])], { stdio: ['ignore', 'ignore', 'pipe'] }),
+    run: (args, repo) => withRuntimeProcessAdmission(execFileSync, ['gh', [...args, ...(repo && !repo.startsWith('cwd:') ? ['--repo', repo] : [])], { stdio: ['ignore', 'ignore', 'pipe'] }]),
   });
 
   // #2263 — a SIBLING clone of a non-local constellation repo (`../frontierui`, `../plateau-app` next to this
@@ -4940,7 +4941,7 @@ async function runCli() {
   // "there are none" — see the land-path call site.
   const fetchPrComments = (repo, num) => {
     try {
-      const data = JSON.parse(execFileSync('gh', ['pr', 'view', String(num), ...repoFlag(repo), '--json', 'comments'], { encoding: 'utf8', maxBuffer: PR_COMMENTS_MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}');
+      const data = JSON.parse(withRuntimeProcessAdmission(execFileSync, ['gh', ['pr', 'view', String(num), ...repoFlag(repo), '--json', 'comments'], { encoding: 'utf8', maxBuffer: PR_COMMENTS_MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'] }]).trim() || '{}');
       return { comments: Array.isArray(data.comments) ? data.comments : [], read: true };
     } catch { return { comments: [], read: false }; }
   };
@@ -4952,7 +4953,7 @@ async function runCli() {
     if (!fetched.read) return false;
     const comments = fetched.comments;
     if (hasDrainReasonComment(comments, kind, reasonText, auditLine)) return false;
-    try { execFileSync('gh', ['pr', 'comment', String(num), ...repoFlag(repo), '--body', buildDrainReasonComment(kind, reasonText, auditLine)], { stdio: ['ignore', 'ignore', 'pipe'] }); return true; }
+    try { withRuntimeProcessAdmission(execFileSync, ['gh', ['pr', 'comment', String(num), ...repoFlag(repo), '--body', buildDrainReasonComment(kind, reasonText, auditLine)], { stdio: ['ignore', 'ignore', 'pipe'] }]); return true; }
     catch { return false; }
   };
 
@@ -4963,8 +4964,8 @@ async function runCli() {
     if (!fetched.read) return false;
     const plan = planHeldParkUpsert(fetched.comments, reasonText);
     try {
-      if (plan.action === 'post') { execFileSync('gh', ['pr', 'comment', String(num), ...repoFlag(repo), '--body', buildDrainReasonComment('park', reasonText)], { stdio: ['ignore', 'ignore', 'pipe'] }); return true; }
-      if (plan.action === 'edit') { execFileSync('gh', ['api', '-X', 'PATCH', `repos/${repo || '{owner}/{repo}'}/issues/comments/${plan.commentId}`, '-f', `body=${buildDrainReasonComment('park', reasonText)}`], { stdio: ['ignore', 'ignore', 'pipe'] }); return true; }
+      if (plan.action === 'post') { withRuntimeProcessAdmission(execFileSync, ['gh', ['pr', 'comment', String(num), ...repoFlag(repo), '--body', buildDrainReasonComment('park', reasonText)], { stdio: ['ignore', 'ignore', 'pipe'] }]); return true; }
+      if (plan.action === 'edit') { withRuntimeProcessAdmission(execFileSync, ['gh', ['api', '-X', 'PATCH', `repos/${repo || '{owner}/{repo}'}/issues/comments/${plan.commentId}`, '-f', `body=${buildDrainReasonComment('park', reasonText)}`], { stdio: ['ignore', 'ignore', 'pipe'] }]); return true; }
     } catch { /* best-effort */ }
     return false;
   };
@@ -5001,8 +5002,8 @@ async function runCli() {
       enqueueAllowed: () => {
         const repo = c.repo ?? localSlug;
         const exec = createMqLiveReader();
-        const gh = args => exec('gh', args, { encoding: 'utf8', timeout: 60_000,
-          maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { personalRoute: false } });
+        const gh = args => withRuntimeProcessAdmission(exec, ['gh', args, { encoding: 'utf8', timeout: 60_000,
+          maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { personalRoute: false } }]);
         const log = line => process.stderr.write(`  ${line}\n`);
         try {
           const comments = readCompletePrComments(c.num, { repo, exec });
@@ -5018,9 +5019,9 @@ async function runCli() {
             if (redTeamEnqueueHold({ ...evidence, repo, pr: c.num, head: sha, comments, standingRuling })) return false;
           }
           // Use the live base, as enqueuePr does: a retarget can expose a workflow edit.
-          const live = JSON.parse(exec('gh', ['pr', 'view', String(c.num), '--repo', repo,
+          const live = JSON.parse(withRuntimeProcessAdmission(exec, ['gh', ['pr', 'view', String(c.num), '--repo', repo,
             '--json', 'headRefOid,baseRefName'], { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
-            stdio: ['ignore', 'pipe', 'pipe'] }));
+            stdio: ['ignore', 'pipe', 'pipe'] }]));
           if (live?.headRefOid !== sha || typeof live.baseRefName !== 'string' || !live.baseRefName) return false;
           const read = readPinnedChangedFiles({ headSha: sha, base: live.baseRefName, cwd: process.cwd(), exec });
           if (read.error) return false;
@@ -5057,8 +5058,8 @@ async function runCli() {
   const cardGrouping = createCardGrouping({ localSlug, dryRun: DRY_RUN, isMainFix, requiredCheck: REQUIRED, prestage: (c, sha) => mergeStrategy.prestage(c, sha),
     queueOwnsFreshness: () => mergeStrategy.queueOwnsFreshness(null),
     withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }),
-    readQueue: () => readQueueFacts({ repo: localSlug, exec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, timeout: 60_000 }) }),
-    readQueueFiles: () => readQueueEntryFiles({ repo: localSlug, exec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, timeout: 60_000 }) }) });
+    readQueue: () => readQueueFacts({ repo: localSlug, exec: (cmd, args, opts) => withRuntimeProcessAdmission(execFileSync, [cmd, args, { ...opts, timeout: 60_000 }]) }),
+    readQueueFiles: () => readQueueEntryFiles({ repo: localSlug, exec: (cmd, args, opts) => withRuntimeProcessAdmission(execFileSync, [cmd, args, { ...opts, timeout: 60_000 }]) }) });
   // PR #5195 — the drain's ledger facts (review-exempt, carried-acceptance restamp, drain-hold release) can clear a
   // head, so they are written per candidate only once an enqueue entry point CONFIRMS its merge or enqueue: the
   // cascade below and the green-event pre-stage shortcut both call this one recorder. The pass-start `decision` is
@@ -5495,7 +5496,7 @@ async function runCli() {
               if (!AS_JSON) process.stderr.write(`  🏷 ${repoTag(repo)}${p.number} would clear stale ci-lifecycle label(s) (${staleOwned.join(', ')}) — required check green, PR uncertified\n`);
             } else {
               let ok = true;
-              for (const rm of staleOwned) { try { execFileSync('gh', ['pr', 'edit', String(p.number), ...repoFlag(repo), '--remove-label', rm], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { ok = false; /* best-effort — the next pass retries */ } }
+              for (const rm of staleOwned) { try { withRuntimeProcessAdmission(execFileSync, ['gh', ['pr', 'edit', String(p.number), ...repoFlag(repo), '--remove-label', rm], { stdio: ['ignore', 'ignore', 'pipe'] }]); } catch { ok = false; /* best-effort — the next pass retries */ } }
               if (ok) { touched = true; if (!AS_JSON) process.stderr.write(`  🏷 ${repoTag(repo)}${p.number} cleared stale ci-lifecycle label(s) (${staleOwned.join(', ')}) — required check green\n`); }
             }
           }
@@ -5562,7 +5563,7 @@ async function runCli() {
       const decision = readApprovedHumanSurfaceHold({ setting: settingValue, pr: v.num, repo: v.repo || localSlug,
         expectedHead: headSha, exec: (file, args, opts) => file === 'gh'
           ? (strict ? createMqLiveReader((_file, argv, options) => readGh(argv, options))('gh', args, opts) : readGh(args, opts))
-          : execFileSync(file, args, { ...opts, cwd }) });
+          : withRuntimeProcessAdmission(execFileSync, [file, args, { ...opts, cwd }]) });
       if (decision.hold && !AS_JSON) process.stderr.write(`  ⏸ PR ${repoTag(v.repo)}${v.num}: ${decision.reason}\n`);
       return decision.hold;
     } catch (e) {
@@ -6214,7 +6215,7 @@ async function runCli() {
   const stripReadyOnPark = (v, { applyLabel = null, staleAcceptance = false } = {}) => {
     if (DRY_RUN || v.prestagePendingCi) return;
     if (!decideParkReadyStrip(v.prLabels, { applyLabel, staleAcceptance })) return;
-    try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--remove-label', READY_TO_MERGE_LABEL], { stdio: ['ignore', 'ignore', 'pipe'] }); }
+    try { withRuntimeProcessAdmission(execFileSync, ['gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--remove-label', READY_TO_MERGE_LABEL], { stdio: ['ignore', 'ignore', 'pipe'] }]); }
     catch { /* label best-effort */ }
   };
   if (REVIEW_ESCALATION) {
@@ -6315,7 +6316,7 @@ async function runCli() {
       // The clone-pinned git runner, kept for the test-gaming carry's SHA-bound re-read below (null = no clone).
       let diffExec = null;
       if (v.headRef && (isLocalRepo(v.repo) || escCwd)) {
-        const exec = (cmd, args, opts) => execFileSync(cmd, args, { cwd: escCwd, ...opts });
+        const exec = (cmd, args, opts) => withRuntimeProcessAdmission(execFileSync, [cmd, args, { cwd: escCwd, ...opts }]);
         diffExec = exec;
         const sig = computeNetDiffSignals({ exec, rev: v.headRef, baseRev: v.base, fetchExtraRefs: [v.headRef] });
         changedFiles = sig.changedFiles;
@@ -6413,7 +6414,7 @@ async function runCli() {
             try { addPrLabel(v.repo, v.num, parkDecision.addLabel); } catch { /* label best-effort */ }
           }
           for (const staleLabel of parkDecision.removeLabels.filter((l) => hasReviewLabel(v.prLabels, l))) {
-            try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--remove-label', staleLabel], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
+            try { withRuntimeProcessAdmission(execFileSync, ['gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--remove-label', staleLabel], { stdio: ['ignore', 'ignore', 'pipe'] }]); } catch { /* label best-effort */ }
           }
           // mechanical-dispatcher — re-parking to review:human means the advisory panel has not seen THIS
           // diff either; carry review:awaiting-advisory alongside it so "not yet advised" stays a label even on
@@ -6534,7 +6535,7 @@ async function runCli() {
             try { addPrLabel(v.repo, v.num, parkDecision.addLabel); } catch { /* label best-effort */ }
           }
           for (const staleLabel of parkDecision.removeLabels.filter((l) => hasReviewLabel(v.prLabels, l))) {
-            try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--remove-label', staleLabel], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
+            try { withRuntimeProcessAdmission(execFileSync, ['gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--remove-label', staleLabel], { stdio: ['ignore', 'ignore', 'pipe'] }]); } catch { /* label best-effort */ }
           }
           // mechanical-dispatcher — same as the manifest-tamper park above: a re-park has not been re-advised
           // either, so carry review:awaiting-advisory alongside review:human here too (#xlw02hw clears it). Not on a
@@ -6730,7 +6731,7 @@ async function runCli() {
           const reconciled = liveBodyRead ? reconcileEscalationReasonBlock(liveBody, parkReasons) : { changed: false, body: liveBody };
           let verified = false;
           if (reconciled.changed) {
-            try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--body', reconciled.body], { stdio: ['ignore', 'ignore', 'pipe'] }); }
+            try { withRuntimeProcessAdmission(execFileSync, ['gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--body', reconciled.body], { stdio: ['ignore', 'ignore', 'pipe'] }]); }
             catch { if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} could not write the review:human escalation reason into the PR body (#2324) — add it by hand: ${parkReasons.join('; ')}\n`); }
             // Verify the write actually landed (never trust the edit call's exit code alone — gh can succeed
             // against a stale body if two edits race). A miss is loud, not silent.
@@ -6887,9 +6888,9 @@ async function runCli() {
     if (!names.length || !slug) return null;
     let byOperator = false;
     try {
-      const events = JSON.parse(String(execFileSyncThrottled('gh', ['api', `repos/${slug}/issues/${c.num}/events`, '--paginate'], {
+      const events = JSON.parse(String(withRuntimeProcessAdmission(execFileSyncThrottled, ['gh', ['api', `repos/${slug}/issues/${c.num}/events`, '--paginate'], {
         encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: 30_000, throttle: { op: 'drain-order override' },
-      }) || '[]'));
+      }]) || '[]'));
       const last = (Array.isArray(events) ? events : []).filter((e) => e?.event === 'labeled' && e?.label?.name === names[0]).at(-1);
       byOperator = isOperatorAuthored({ author: { login: last?.actor?.login } });
     } catch { byOperator = false; }

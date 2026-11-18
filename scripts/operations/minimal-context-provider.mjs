@@ -11,7 +11,8 @@
  * never literal duplication. The parts of `deliver-item-wrapper.mjs`'s pattern that are genuinely NOT
  * delivery-specific — the `CLAUDE_RESTRICTED_PROVIDER` argv shape, the trimmed-hooks-settings-file generation,
  * lane acquire/release, and the "run one declared operation, read its structured verdict" gate-running pattern
- * — live HERE, so both mechanisms import the same proven code instead of each re-deriving or copy-pasting it.
+ * — live HERE, so both mechanisms import { withRuntimeProcessAdmission } from '../lib/runtime-admission.mjs';
+import the same proven code instead of each re-deriving or copy-pasting it.
  *
  * HONESTY LABEL, SAME CONVENTION `deliver-item-wrapper.mjs` USES. Every export below is a VERBATIM or
  * mechanically-generalized (parameterized, never behaviourally changed) lift of code that was already proven
@@ -55,7 +56,7 @@ export const REPO_ROOT = new URL('../..', import.meta.url).pathname;
  *  that no longer exists — callers degrade to a safe fallback rather than propagate. */
 function tryGitToplevel(cwd, execFn = execFileSync) {
   try {
-    return execFn('git', ['rev-parse', '--show-toplevel'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    return withRuntimeProcessAdmission(execFn, ['git', ['rev-parse', '--show-toplevel'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }]).trim();
   } catch {
     return null;
   }
@@ -104,9 +105,9 @@ export const RUN_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
  *  goes through — cwd defaults to {@link resolveRunCwd}'s answer (the ACTUAL working checkout, never this
  *  module's own script-location-derived `REPO_ROOT` alone — see that function's docblock for the bug this
  *  fixes), still overridable per-call via `opts.cwd` exactly as before. */
-export const run = (cmd, args, opts = {}) => execFileSync(cmd, args, {
+export const run = (cmd, args, opts = {}) => withRuntimeProcessAdmission(execFileSync, [cmd, args, {
   encoding: 'utf8', cwd: resolveRunCwd(), maxBuffer: RUN_MAX_BUFFER_BYTES, ...opts,
-});
+}]);
 
 /**
  * build-orphan-adopt (#4131/#4382 fix) — does `lane`'s working tree still hold at least one commit ahead of

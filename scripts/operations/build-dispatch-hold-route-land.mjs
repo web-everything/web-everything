@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { withRuntimeProcessAdmission } from '../lib/runtime-admission.mjs';
 /**
  * @file scripts/operations/build-dispatch-hold-route-land.mjs
  * @description #4465 — THE LANE-BOUND LANDING PASS for a build-dispatch hold's routed action, planned by
@@ -266,9 +267,9 @@ export function clearScopeAndAppendFinding(cardText, { num, reason, today = loca
 // ── IO shell ─────────────────────────────────────────────────────────────────────────────────────────────────
 
 export function runCmd(cmd, args, cwd, { timeoutMs = resolveChildTimeoutMs() } = {}) {
-  return execFileSync(cmd, args, {
+  return withRuntimeProcessAdmission(execFileSync, [cmd, args, {
     cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: timeoutMs, killSignal: 'SIGKILL',
-  });
+  }]);
 }
 
 export function acquireLane(runFn = runCmd) {

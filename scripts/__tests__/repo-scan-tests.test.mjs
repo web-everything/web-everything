@@ -27,9 +27,8 @@ describe('selectScanTests', () => {
     expect(files).toEqual(expect.arrayContaining(['scripts/conveyor/infra-blocked.mjs', 'scripts/operations/ci-heal-pr-dispatch.mjs',
       'scripts/operations/dispatch-providers/build.mjs', 'scripts/operations/detached-dispatch.mjs']));
     for (const file of [...files, 'scripts/conveyor/build-dispatch-future.mjs', 'scripts/operations/dispatch-lane-future.mjs']) {
-      const { scoped, scopedFiles } = selectScanTests({ changedFiles: [file] });
-      expect(scoped.map(e => e.test), file).toContain('scripts/lib/__tests__/runtime-admission-spawn-guard.test.mjs');
-      expect(scopedFiles, file).toContain(file);
+      const { full } = selectScanTests({ changedFiles: [file] });
+      expect(full.map(e => e.test), file).toContain('scripts/lib/__tests__/runtime-admission-spawn-guard.test.mjs');
     }
   });
   it.each(['mjs', 'cjs', 'js', 'mts', 'cts', 'ts', 'sh', 'bash', 'py'])('ruling-label reference guard covers new production .%s scripts', ext => {
@@ -40,8 +39,9 @@ describe('selectScanTests', () => {
     const { scoped, full, scopedFiles } = selectScanTests({ changedFiles: ['scripts/lib/new-thing.mjs'] });
     expect(scoped.map((e) => e.test)).toContain(MULTI);
     expect(scopedFiles).toEqual(['scripts/lib/new-thing.mjs']);
-    // The ownership, sole-writer, review-policy, and sandbox-list guards derive whole-tree facts.
+    // The import closure, ownership, sole-writer, review-policy, and sandbox-list guards derive whole-tree facts.
     expect(full.map((e) => [e.test, e.scope])).toEqual([
+      ['scripts/lib/__tests__/runtime-admission-spawn-guard.test.mjs', 'full'],
       ['scripts/lib/__tests__/constellation-ownership.test.mjs', 'full'],
       ['scripts/conveyor/__tests__/pr-label-mirror.test.mjs', 'full'],
       ['scripts/lib/__tests__/review-policy.conformance.test.mjs', 'full'],

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { withRuntimeAdmission } from '../../lib/runtime-admission.mjs';
 import { startDetachedLaunch, settleLaunches, listPendingLaunches } from '../pending-launches.mjs';
 
 describe('pending-launches (78b non-blocking launch)', () => {
@@ -19,6 +20,24 @@ describe('pending-launches (78b non-blocking launch)', () => {
     expect(spawn.mock.calls[0][2]).toMatchObject({ detached: true });
     expect(rec).toMatchObject({ num: '4131', kind: 'prepare-item', attempt: 'a1', pid: 777 });
     expect(listPendingLaunches(root)).toHaveLength(1);
+  });
+
+  it('revocation during log setup leaves no process or pending artifacts', () => {
+    const spawn = fakeSpawn(777);
+    const readSettings = () => ({ mode: 'only', only: true, ids: readdirSync(root).length ? [] : ['4131'] });
+    const result = withRuntimeAdmission({ num: '4131' }, 'prepare-item', () => start({ spawn }), { readSettings });
+    expect(result).toMatchObject({ outcome: 'runtime-refused', spawned: false });
+    expect(spawn).not.toHaveBeenCalled();
+    expect(readdirSync(root)).toEqual([]);
+  });
+
+  it('a still-admitted complete group reaches the final pending-launch check', () => {
+    const spawn = fakeSpawn(777);
+    const result = withRuntimeAdmission({ num: '4131', groupMembers: ['4132'] }, 'prepare-item',
+      () => start({ spawn, groupMembers: ['4132'] }),
+      { readSettings: () => ({ mode: 'only', only: true, ids: ['4131', '4132'] }) });
+    expect(result.pid).toBe(777);
+    expect(spawn).toHaveBeenCalledOnce();
   });
 
   it('a still-running launch stays pending and is not settled', () => {

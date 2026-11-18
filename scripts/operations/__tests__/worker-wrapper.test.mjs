@@ -10,6 +10,8 @@ import { join } from 'node:path';
 import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { withRuntimeAdmission } from '../../lib/runtime-admission.mjs';
+import { launchWrappedClaudeWorker } from '../worker-wrapper-launch.mjs';
 import { writeStoredAwaitVerify, clearStoredAwaitVerify, awaitVerifyStoreKey } from '../../conveyor/await-verify.mjs';
 import { validateCompletionRecord } from '../completion-record.mjs';
 import { tryReadCompletion, writeCompletion } from '../completion-store.mjs';
@@ -506,6 +508,73 @@ describe('detached launch', () => {
     expect(calls[0].argv[1]).toBe(`--spec=${r.specFile}`);
     expect(calls).toContain('unref');
     expect(JSON.parse(readFileSync(r.specFile, 'utf8'))).toMatchObject({ session: 'build-4001', specDir });
+  });
+
+  it.each(['fix', 'ci-heal'])('revocation during the %s spec write refuses the launcher and rolls setup back', role => {
+    const parent = tmp();
+    const specDir = join(parent, 'specs');
+    const diagnosticsDir = tmp();
+    const spawnFn = vi.fn();
+    let settings = { mode: 'lift' };
+    const result = launchDetached(spec({ role, session: `${role}-123`, diagnosticsDir }), {
+      specDir, spawnFn, readRuntimeSettings: () => settings,
+      writeSpec: (...args) => { writeFileSync(...args); settings = { mode: 'only', only: true, ids: [] }; },
+    });
+    expect(result).toMatchObject({ outcome: 'runtime-refused', spawned: false });
+    expect(spawnFn).not.toHaveBeenCalled();
+    expect(existsSync(specDir)).toBe(false);
+    expect(existsSync(join(diagnosticsDir, 'wrapper.stderr'))).toBe(false);
+  });
+
+  it.each(['fix', 'ci-heal'])('the admitted %s provider path forwards a spec-write refusal without a handle', role => {
+    let settings = { mode: 'only', only: true, ids: ['4001'] };
+    const specDir = join(tmp(), 'specs');
+    const spawnFn = vi.fn();
+    const result = withRuntimeAdmission({ num: 4001 }, role, () => launchWrappedClaudeWorker({
+      role, session: `${role}-123`, item: 4001, bgArgv: ['--bg', '-p', 'repair'], specDir,
+      launch: (workerSpec, options) => launchDetached(workerSpec, {
+        ...options, spawnFn,
+        writeSpec: (...args) => { writeFileSync(...args); settings = { mode: 'only', only: true, ids: [] }; },
+      }),
+    }), { readSettings: () => settings });
+    expect(result).toMatchObject({ outcome: 'runtime-refused', spawned: false });
+    expect(result.handle).toBeUndefined();
+    expect(spawnFn).not.toHaveBeenCalled();
+    expect(existsSync(specDir)).toBe(false);
+  });
+
+  it('refusal restores a pre-existing spec and preserves pre-existing diagnostics', () => {
+    const specDir = tmp();
+    const diagnosticsDir = tmp();
+    const specFile = join(specDir, 'fix-123.spec.json');
+    writeFileSync(specFile, 'previous spec');
+    writeFileSync(join(diagnosticsDir, 'wrapper.stderr'), 'previous diagnostics');
+    const spawnFn = vi.fn();
+    const result = launchDetached(spec({ role: 'fix', session: 'fix-123', diagnosticsDir }), {
+      specDir, spawnFn, readRuntimeSettings: () => ({ mode: 'only', only: true, ids: [] }),
+    });
+    expect(result.outcome).toBe('runtime-refused');
+    expect(spawnFn).not.toHaveBeenCalled();
+    expect(readFileSync(specFile, 'utf8')).toBe('previous spec');
+    expect(readFileSync(join(diagnosticsDir, 'wrapper.stderr'), 'utf8')).toBe('previous diagnostics');
+  });
+
+  it('the detached spec preserves durable aliases at final admission', () => {
+    const spawnFn = vi.fn(() => ({ pid: 988, unref() {} }));
+    const result = launchDetached(spec({ runtimeIdentity: { num: 4001, bornAs: 'xabcdef0' } }), {
+      specDir: tmp(), spawnFn, readRuntimeSettings: () => ({ mode: 'only', only: true, ids: ['xabcdef0'] }),
+    });
+    expect(result.wrapperPid).toBe(988);
+    expect(spawnFn).toHaveBeenCalledOnce();
+    expect(JSON.parse(readFileSync(result.specFile, 'utf8')).runtimeIdentity.bornAs).toBe('xabcdef0');
+  });
+
+  it('an admitted spec write preserves the detached launch contract', () => {
+    const spawnFn = vi.fn(() => ({ pid: 987, unref: vi.fn() }));
+    const result = launchDetached(spec(), { specDir: tmp(), spawnFn, readRuntimeSettings: () => ({ mode: 'lift' }) });
+    expect(result.wrapperPid).toBe(987);
+    expect(spawnFn).toHaveBeenCalledOnce();
+    expect(existsSync(result.specFile)).toBe(true);
   });
 
   it('the CLI runs a spec file to completion, leaves the v2 record and deletes the spec (a real child process)', () => {

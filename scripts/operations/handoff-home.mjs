@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { withRuntimeProcessAdmission } from '../lib/runtime-admission.mjs';
 /**
  * @file scripts/operations/handoff-home.mjs
  * @description WHERE THE ORCHESTRATOR HANDOFF LIVES, AND HOW IT IS VERSIONED — the location slice of #3779.
@@ -88,14 +89,14 @@ export function githubSlug(url) {
 export function ghVisibility(slug) {
   if (!slug) return null;
   try {
-    return execFileSync('gh', ['repo', 'view', slug, '--json', 'visibility', '-q', '.visibility'], { encoding: 'utf8' }).trim() || null;
+    return withRuntimeProcessAdmission(execFileSync, ['gh', ['repo', 'view', slug, '--json', 'visibility', '-q', '.visibility'], { encoding: 'utf8' }]).trim() || null;
   } catch {
     return null;
   }
 }
 
 function defaultGit(args, opts) {
-  return execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+  return withRuntimeProcessAdmission(execFileSync, ['git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts }]);
 }
 
 const isCheckout = (dir) => existsSync(join(dir, '.git'));

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { withRuntimeProcessAdmission } from '../lib/runtime-admission.mjs';
 /**
  * @file scripts/conveyor/fix-procedure.mjs
  * @description THE FIX PROCEDURE every fixer follows (operator-approved 2026-09-27): a durable per-PR FIX CLAIM
@@ -344,7 +345,7 @@ export function refuseHeldPush({ run, cwd, remote = 'origin', branch }) {
  *  directory, never a `owner/name` slug — a slug is not a directory, so it always reads `null`. */
 export function repoKeyForCheckout(cwd, { remote = 'origin', exec = execFileSync } = {}) {
   try {
-    const url = exec('git', ['remote', 'get-url', remote], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 });
+    const url = withRuntimeProcessAdmission(exec, ['git', ['remote', 'get-url', remote], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 }]);
     return repoKeyFromRemoteUrl(url);
   } catch { return null; }
 }
@@ -448,7 +449,7 @@ export function resolvePushDestinations(cmd, opts = {}) {
 function resolveParsedPush(push, { cwd: baseCwd = process.cwd(), exec = execFileSync } = {}) {
   const cwd = push.dir ? resolve(baseCwd, push.dir) : baseCwd;
   const git = (args) => {
-    try { return String(exec('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 }) ?? '').trim() || null; } catch { return null; }
+    try { return String(withRuntimeProcessAdmission(exec, ['git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 }]) ?? '').trim() || null; } catch { return null; }
   };
   let current;
   const currentBranch = () => (current === undefined ? (current = git(['symbolic-ref', '-q', '--short', 'HEAD'])) : current);
@@ -854,7 +855,7 @@ if (IS_CLI) {
       if (refusal) { writeLineSync(2, `✗ ${refusal.message}`); out({ ok: false, ...refusal }, 3); }
       if (cmd === 'push-check') out({ ok: true, branch, repo: repoKey });
       const src = typeof flags.src === 'string' ? flags.src : 'HEAD';
-      execFileSync('git', ['push', remote, `${src}:refs/heads/${branch}`], { stdio: ['ignore', 'inherit', 'inherit'] });
+      withRuntimeProcessAdmission(execFileSync, ['git', ['push', remote, `${src}:refs/heads/${branch}`], { stdio: ['ignore', 'inherit', 'inherit'] }]);
       const awaitingCi = handClaimedPushToCi({ repoKey, branch, src }, { log: line => writeLineSync(2, line) });
       out({ ok: true, pushed: true, branch, repo: repoKey, awaitingCi });
     }

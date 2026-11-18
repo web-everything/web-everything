@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { withRuntimeProcessAdmission, withRuntimeAdmission } from '../lib/runtime-admission.mjs';
 /**
  * @file scripts/operations/worker-wrapper.mjs
  * @description THE UNIFIED WORKER WRAPPER (item 117, slice S3a; decision D7 FINAL, operator 2026-10-08).
@@ -27,7 +28,7 @@
  * so the tests run it against a fake child. The CLI at the bottom runs a JSON spec detached.
  */
 import { spawn } from 'node:child_process';
-import { appendFileSync, closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, rmSync, rmdirSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -303,7 +304,8 @@ async function runWorkerOnce(spec, io, stop) {
   // The job record: written the moment the child has a pid (the spawn seam below), before it can finish.
   let graceTimer = null;
   const spawnWithPid = (cmd, argv, opts) => {
-    const child = spawnFn(cmd, argv, opts);
+    const child = withRuntimeAdmission({ ...spec.runtimeIdentity, num: spec.item ?? spec.runtimeIdentity?.num, groupMembers: spec.groupMembers ?? spec.runtimeIdentity?.groupMembers }, spec.role, () => spawnFn(cmd, argv, opts), { readSettings: io.readRuntimeSettings });
+    if (child?.outcome === 'runtime-refused') throw Object.assign(new Error('runtime admission refused: ' + child.reason), child);
     // Opt-in smoke evidence: persist the first byte time and stderr while the worker is still running.
     if (spec.diagnosticsDir) {
       let first = true;
@@ -380,12 +382,12 @@ async function runWorkerOnce(spec, io, stop) {
   let resourceUsage = null;
   const run = async (argv) => {
     try {
-      const launch = () => spawnToCompletionFn(spec.command, argv, {
+      const launch = () => withRuntimeProcessAdmission(spawnToCompletionFn, [spec.command, argv, {
         // EVERY launch path gets the same env hygiene (a static GH_TOKEN stripped, the worker marker set), not just the callers that
         // happen to pass a sanitising spawn: the detached CLI and any future launcher inherit it here.
         cwd: spec.cwd, env: markWorkerEnv(sanitizeSpawnEnv(spec.env ?? process.env)), timeout: Math.max(1, deadlineMs - clock()), killSignal: 'SIGKILL',
         stdio: ['ignore', 'pipe', 'pipe'], // stdin closed: codex hangs on an open pipe (S0)
-      }, { spawnFn: spawnWithPid });
+      }, { spawnFn: spawnWithPid }]);
       const out = spec.launcher === 'codex-exec' ? await withCodexUsage({ model: spec.model ?? (argv.includes('-m') ? argv[argv.indexOf('-m') + 1] : null), effort: spec.effort ?? argv.find(a => a.startsWith('model_reasoning_effort='))?.split('=')[1], taskKind: spec.taskKind ?? spec.role, caller: 'worker-wrapper.mjs', repo: spec.repo, pr: spec.pr, card: spec.item, cwd: spec.cwd }, launch, { env: spec.env ?? process.env }) : await launch();
       stdout = out.stdout; stderr = out.stderr; resourceUsage = out.resourceUsage ?? null;
     } catch (e) {
@@ -569,22 +571,34 @@ export function preserveLegacyWords(envelope, legacy) {
  * wrapper process; the v2 record's `pid` is the WORKER child the wrapper then spawns (a different process).
  * @returns {{wrapperPid: number, specFile: string}}
  */
-export function launchDetached(spec, { specDir, spawnFn = spawn, nodePath = process.execPath, entry = fileURLToPath(import.meta.url) } = {}) {
+export function launchDetached(spec, { specDir, spawnFn = spawn, nodePath = process.execPath, entry = fileURLToPath(import.meta.url), readRuntimeSettings, writeSpec = writeFileSync } = {}) {
   if (!specDir) throw new TypeError('operations: launchDetached needs specDir');
   if (!isValidSessionSlug(spec?.session)) throw new TypeError(`operations: launchDetached: invalid session slug ${JSON.stringify(spec?.session)}`);
+  const createdDir = !existsSync(specDir);
   mkdirSync(specDir, { recursive: true, mode: 0o700 });
   const specFile = join(specDir, `${spec.session}.spec.json`);
   // The spec file never carries `env` (it can hold tokens): the detached child inherits the launcher's environment
   // instead, with a static GH_TOKEN stripped and the worker marker set (the worker it spawns is sanitised again in runWorker).
   // Owner-only permissions; the child deletes it once read.
   const { env: _env, ...safe } = spec;
-  writeFileSync(specFile, `${JSON.stringify({ ...safe, specDir })}\n`, { mode: 0o600 });
+  const previousSpec = existsSync(specFile) ? readFileSync(specFile) : null;
+  const stderrFile = spec.diagnosticsDir ? join(spec.diagnosticsDir, 'wrapper.stderr') : null;
+  const hadStderr = stderrFile ? existsSync(stderrFile) : false;
+  writeSpec(specFile, `${JSON.stringify({ ...safe, specDir })}\n`, { mode: 0o600 });
   let stderrFd;
   let child;
   try {
     if (spec.diagnosticsDir) stderrFd = openSync(join(spec.diagnosticsDir, 'wrapper.stderr'), 'a', 0o600);
-    child = spawnFn(nodePath, [entry, `--spec=${specFile}`], { detached: true, stdio: stderrFd === undefined ? 'ignore' : ['ignore', 'ignore', stderrFd], env: markWorkerEnv(sanitizeSpawnEnv(spec.env ?? process.env)) });
+    const spawnOptions = { detached: true, stdio: stderrFd === undefined ? 'ignore' : ['ignore', 'ignore', stderrFd], env: markWorkerEnv(sanitizeSpawnEnv(spec.env ?? process.env)) };
+    child = withRuntimeAdmission({ ...spec.runtimeIdentity, num: spec.item ?? spec.runtimeIdentity?.num, groupMembers: spec.groupMembers ?? spec.runtimeIdentity?.groupMembers }, spec.role, () => spawnFn(nodePath, [entry, `--spec=${specFile}`], spawnOptions), { readSettings: readRuntimeSettings });
   } finally { if (stderrFd !== undefined) closeSync(stderrFd); }
+  if (child?.outcome === 'runtime-refused') {
+    if (previousSpec !== null) writeFileSync(specFile, previousSpec);
+    else rmSync(specFile, { force: true });
+    if (stderrFile && !hadStderr) rmSync(stderrFile, { force: true });
+    if (createdDir) { try { rmdirSync(specDir); } catch (error) { if (error.code !== 'ENOTEMPTY') throw error; } }
+    return child;
+  }
   child.unref?.();
   return { wrapperPid: child.pid, specFile };
 }

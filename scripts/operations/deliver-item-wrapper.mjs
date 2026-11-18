@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { withRuntimeAdmission, withRuntimeProcessAdmission } from '../lib/runtime-admission.mjs';
 /**
  * @file scripts/operations/deliver-item-wrapper.mjs
  * @description The wrapper a MINIMAL delivery agent (`we:skills-src/conveyor/delivery-agent-brief-v2.md`) runs
@@ -585,7 +586,7 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
       return finish('group-member-dropped', { status: 'error', outcome: 'group-member-dropped' });
     }
     const gate = await runGateWithOneRetry({
-      lane, item, sessionSlug, attemptTag, provider, claudeSessionId, lanePathOverride: implLanePath,
+      lane, item, sessionSlug, attemptTag, groupMembers: requestedMembers, provider, claudeSessionId, lanePathOverride: implLanePath,
     });
     if (gate.status === 'red') {
       releaseClaimAndLane({ item, lane, sessionSlug, implLanePath });
@@ -617,9 +618,10 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
         { cwd: gate.lanePath, env: laneGitHardeningEnv(), maxBuffer: SELF_REVIEW_MAX_DIFF_BYTES + 1 })),
       review: reviewBuild,
       fix: async prompt => {
-        const resumed = await provider.spawn({ sessionId: claudeSessionId, resumeSessionId: claudeSessionId,
+        const resumed = await withRuntimeAdmission({ num: item, groupMembers: requestedMembers }, 'build', () => withRuntimeProcessAdmission(provider.spawn, [{ sessionId: claudeSessionId, resumeSessionId: claudeSessionId,
           prompt: appendBuildRequirements(prompt, { policy: buildPolicy, selfReview: false }),
-          lane, sessionSlug, item, attemptTag, lanePathOverride: implLanePath });
+          lane, sessionSlug, item, attemptTag, lanePathOverride: implLanePath }], provider));
+        if (resumed?.outcome === 'runtime-refused') throw Object.assign(new Error('runtime admission refused'), resumed);
         const updated = resumed?.envelope ? buildReportFromEnvelope(resumed, sessionSlug)
           : tryReadDeliveryReport(sessionSlug, resolveDeliveryReportsDir(gate.lanePath));
         if (!updated || updated.status !== 'done' || !['done', 'needs-human-judgment'].includes(updated.outcome)) {
@@ -639,7 +641,7 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
     const convergeVerdict = buildPolicy.selfReview.enabled
       ? { verdict: 'land', selfReview }
       : spanAround('converge.round', { attributes: { item: String(item), buildProvider: provider.name } },
-        () => runConverge({ lane: gate.lanePath, item }, { provider }));
+        () => runConverge({ lane: gate.lanePath, item, groupMembers: requestedMembers }, { provider }));
 
     // ---- 5. Map outcome + convergeVerdict + statute-touch to a park mode, via the EXISTING deterministic
     // rubric (`review-escalation.mjs`) — REAL import, SKETCH call (the real `scoreEscalation` signature takes
@@ -1682,9 +1684,11 @@ export async function runAgentToCompletion(
   // #3627 bug 7 — `lane`/`sessionSlug`/`item`/`attemptTag` threaded through so the provider can resolve the
   // real lane path (`cwd`) and mint the real env vars the brief needs (`buildDeliveryAgentEnv`) — see
   // `CLAUDE_RESTRICTED_PROVIDER.spawn`'s own docblock.
-  const spawned = await provider.spawn({
+  const spawned = await withRuntimeAdmission({ num: item, groupMembers }, 'build', () => withRuntimeProcessAdmission(provider.spawn, [{
     sessionId: claudeSessionId, prompt, lane, sessionSlug, item, attemptTag, lanePathOverride,
-  }); // AWAITS — see DeliveryAgentProvider's own docblock.
+  }], provider)); // AWAITS — see DeliveryAgentProvider's own docblock.
+
+  if (spawned?.outcome === 'runtime-refused') return spawned;
 
   // 117 S3a — a provider that ran through the unified worker wrapper hands back its v2 envelope: the report the
   // rest of this file acts on is derived from THAT (same shape as the delivery report it replaces).
@@ -1771,7 +1775,7 @@ export function fillMinimalBrief(template, { item, sessionSlug, lane, attemptTag
  *  convention) so this second-report branch is testable without a real delivery-report sidecar on disk. */
 export async function runGateWithOneRetry(
   {
-    lane, item, sessionSlug, attemptTag, provider = CLAUDE_RESTRICTED_PROVIDER, claudeSessionId,
+    lane, item, sessionSlug, attemptTag, groupMembers, provider = CLAUDE_RESTRICTED_PROVIDER, claudeSessionId,
     // build-path-codex-isolation-locus — same meaning and same source as `runAgentToCompletion`'s own
     // `lanePathOverride`: `deliverItem` passes the SAME value to both, so the gate runs against exactly the
     // lane the agent's turn just edited.
@@ -1800,7 +1804,7 @@ export async function runGateWithOneRetry(
   // `resumeAgentWithGateFailure` below.
   const resumed = await resumeAgentWithGateFailure({
     sessionSlug, lane, item, attemptTag, failureOutput: first.detail, gateOutcome: first.outcome, provider,
-    claudeSessionId, lanePathOverride,
+    claudeSessionId, lanePathOverride, groupMembers,
   }); // SKETCH — see below
   // #3383 mechanical-dispatcher fix — read back from the SAME lane-scoped directory the resume just used
   // (see `runAgentToCompletion`'s own comment for the full root-cause account), never the wrapper's own
@@ -1837,7 +1841,7 @@ export async function runGateWithOneRetry(
  *  its fresh-spawn and its resume shape, so `CODEX_PROVIDER` (once real) would supply both from one place. */
 async function resumeAgentWithGateFailure({
   sessionSlug, lane, item, attemptTag, failureOutput, gateOutcome = 'fail', provider = CLAUDE_RESTRICTED_PROVIDER,
-  claudeSessionId, lanePathOverride = null,
+  claudeSessionId, lanePathOverride = null, groupMembers,
 }) {
   // #3627 attempt-5 finding — an `unrun` gate gets an HONEST prompt, not "your gate failed, fix it": that
   // wording is nonsensical when the gate never ran at all (a wrapper/environment problem, e.g. the stale
@@ -1856,10 +1860,10 @@ async function resumeAgentWithGateFailure({
   // #3627 bug 7 — this prompt says `$LANE` above, same as the fresh brief, so this resume needs the SAME real
   // cwd/env treatment (`lane`/`sessionSlug`/`item`/`attemptTag` threaded through to the provider) or a resumed
   // agent hits the identical "no real $LANE to cd into" failure the fresh spawn did.
-  return provider.spawn({
+  return withRuntimeAdmission({ num: item, groupMembers }, 'build', () => withRuntimeProcessAdmission(provider.spawn, [{
     sessionId: claudeSessionId, prompt, resumeSessionId: claudeSessionId, lane, sessionSlug, item, attemptTag,
     lanePathOverride,
-  }); // AWAITS. Returned (not dropped): a wrapped provider hands back its v2 envelope for the resumed turn.
+  }], provider)); // AWAITS. Returned (not dropped): a wrapped provider hands back its v2 envelope for the resumed turn.
 }
 
 /** The resumed turn's prompt after a red or unrun gate (`resumeAgentWithGateFailure`), with the build requirements once. */
@@ -2151,7 +2155,7 @@ export function parseConvergeEditResult(rawOut) {
 export function runConvergeEdit(
   editInstruction,
   {
-    item, round, lane, run: runFn, ensureSettingsFile = ensureDeliveryHooksSettingsFile, newSessionId = randomUUID,
+    item, round, lane, groupMembers, run: runFn, ensureSettingsFile = ensureDeliveryHooksSettingsFile, newSessionId = randomUUID,
     dispatchKind = 'delivery', provider = CLAUDE_RESTRICTED_PROVIDER,
   },
 ) {
@@ -2171,7 +2175,9 @@ export function runConvergeEdit(
   // note refused to write one for exactly that reason). The fix wrapper passes `repair`, a WRAPPER-AGENT kind
   // (`dispatch-lane.mjs#WRAPPER_AGENT_KINDS`) — the same half of the value space this default's own
   // `'delivery'` has always been in. The gap that note called an open follow-up is closed.
-  const out = runFn('claude', argv, { cwd: lane, env: markWorkerEnv(sanitizeSpawnEnv({ ...process.env, WE_DISPATCH_KIND: dispatchKind })) });
+  const options = { cwd: lane, env: markWorkerEnv(sanitizeSpawnEnv({ ...process.env, WE_DISPATCH_KIND: dispatchKind })) };
+  const out = withRuntimeAdmission({ num: item, groupMembers }, 'fix', () => runFn('claude', argv, options));
+  if (out?.outcome === 'runtime-refused') return out;
   // Additive fields only — see this function's own docblock ("VISIBILITY fix") for why these two are always
   // `requestedProvider !== editorProvider` on a Codex-selected delivery, on purpose, not a bug.
   return { ...parseConvergeEditResult(out), requestedProvider: provider.name, editorProvider: CLAUDE_RESTRICTED_PROVIDER.name };
@@ -2456,7 +2462,7 @@ export function commitBuildTurn(
  * agent handed it.
  */
 export function runConverge(
-  { lane, item, goal },
+  { lane, item, goal, groupMembers },
   {
     run: runFn = run, ensureSettingsFile = ensureDeliveryHooksSettingsFile, dispatchKind = 'delivery',
     provider = CLAUDE_RESTRICTED_PROVIDER,
@@ -2504,7 +2510,7 @@ export function runConverge(
       obs.lensResults = lastLensResults;
       obs.redTeamResult = runConvergeRedTeam(step.redTeam, { lane, item, round: step.round, material, run: runFn });
     } else if (step.action === 'edit') {
-      obs.editResult = runConvergeEdit(step.edit, { item, round: step.round, lane, run: runFn, ensureSettingsFile, dispatchKind, provider });
+      obs.editResult = runConvergeEdit(step.edit, { item, groupMembers, round: step.round, lane, run: runFn, ensureSettingsFile, dispatchKind, provider });
       // BUG-14 FIX — commit a genuinely accepted round's real edits NOW, before the `step` call below reads
       // the lane's state (`converge-cli.mjs`'s own `read` action re-reads the lane fresh each round, so a
       // later round must see THIS round's commit, not just uncommitted working-tree changes it happens to
@@ -2738,6 +2744,7 @@ export function openPr({ item, attemptTag, lane, park, report, slug, delegation 
     throw new Error(`deliver-item-wrapper: openPr needs the item's real slug for #${item} — never substitutes a literal placeholder`);
   }
   const ref = `lane/${item}${attemptTag ?? ''}-${slug}`;
+  const previousBody = existsSync(`${lane}/.pr-body.md`) ? readFileSync(`${lane}/.pr-body.md`) : null;
   const bodyFile = writePrBody({ item, lane, report, delegation, groupMembers, groupDropped, groupDropReasons }); // REAL — was a PLACEHOLDER path nothing wrote.
   const args = [
     // build-path-codex-isolation-locus — ABSOLUTE, never the bare relative `scripts/operations/run.mjs`. This
@@ -2757,9 +2764,14 @@ export function openPr({ item, attemptTag, lane, park, report, slug, delegation 
   ];
   args.push(park.mode === 'park' ? `--mode=park` : '--mode=label-on-green');
   if (park.mode === 'park') args.push(`--parkLabel=${park.label}`);
-  const out = runFn('node', args, { cwd: lane, ...(runId && effectKey ? { env: { ...process.env,
+  const options = { cwd: lane, ...(runId && effectKey ? { env: { ...process.env,
     WE_BUILD_PR_CONTEXT: JSON.stringify({ runId, key: effectKey, dir: resolveRunsDir() }),
-  } } : {}) });
+  } } : {}) };
+  const out = withRuntimeAdmission({ num: item, groupMembers }, 'build', () => runFn('node', args, options));
+  if (out?.outcome === 'runtime-refused') {
+    if (previousBody === null) rmSync(bodyFile, { force: true }); else writeFileSync(bodyFile, previousBody);
+    return out;
+  }
   // #3627 bug 13 (real fix) — `run.mjs open-pr --json` prints the FULL run-outcome envelope, never a flat
   // `{pr, url}` object; the actual submit result (the only place `.pr`/`.url` live) is buried at
   // `findings.submit.effects[0].result`. See `extractSubmitResult`'s own docblock for the full story.

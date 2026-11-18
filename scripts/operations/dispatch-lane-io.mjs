@@ -1,3 +1,4 @@
+import { withRuntimeProcessAdmission } from '../lib/runtime-admission.mjs';
 import { assertRuntimeAdmitted, withRuntimeAdmission } from '../lib/runtime-admission.mjs';
 import { NO_PROMPT_SESSION_KINDS } from '../lib/no-prompt-command-rules.mjs';
 import { appendBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
@@ -651,9 +652,9 @@ export function readTick({
  * @returns {string}
  */
 export function defaultRunNode(argv, opts = {}, { exec = execFileSync } = {}) {
-  return exec(process.execPath, argv, {
+  return withRuntimeProcessAdmission(exec, [process.execPath, argv, {
     encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: TICK_TIMEOUT_MS, killSignal: 'SIGKILL', ...opts,
-  });
+  }]);
 }
 
 /**
@@ -1418,8 +1419,8 @@ export function reserveBuildLane(payload, { enabled = process.env.WE_DISPATCH_RE
 export function releaseReservedLane(reservation, { run = execFileSync, root = REPO_ROOT, env = process.env } = {}) {
   if (!reservation?.reserved) return false;
   try {
-    run('node', ['scripts/lane-pool.mjs', 'release', `--lane=${reservation.lane}`, `--session=${reservation.session}`],
-      { cwd: root, env, encoding: 'utf8', stdio: 'ignore', timeout: 60_000 });
+    withRuntimeProcessAdmission(run, ['node', ['scripts/lane-pool.mjs', 'release', `--lane=${reservation.lane}`, `--session=${reservation.session}`],
+      { cwd: root, env, encoding: 'utf8', stdio: 'ignore', timeout: 60_000 }]);
     return true;
   } catch { return false; }
 }
@@ -2041,7 +2042,9 @@ export function defaultClaudeProvider(request, {
   if (wrapKind(kind)) {
     const launched = requireRuntimeLaunch(withRuntimeAdmission(request, request?.launchKind ?? 'build', () => launchWrapped({
       role: kind, session: request.sessionSlug, bgArgv: argv, cwd: request.cwd, env: workerSpawnEnv(request.spawnEnv ?? process.env), pr: request.pr ?? null,
-      item: request.num ?? null, model: launchedModel, sessionId: request.sessionId,
+      item: request.num ?? null, groupMembers: request.groupMembers,
+      runtimeIdentity: { num: request.num, bornAs: request.bornAs, id: request.id, groupMembers: request.groupMembers },
+      model: launchedModel, sessionId: request.sessionId,
     })));
     request.reportWrapped?.(launched.wrapperPid);
     // `pid:<wrapper>` is the detached-handle shape the run store and liveness already read (route `detached`).
@@ -3165,13 +3168,13 @@ export function classifyDispatchPr({ num, startedAt = null, prs = null, attempt 
  *   `gh pr list` PR-listing read, the exact shape `gh-throttle.mjs` attributes and paces.
  */
 export function defaultListPrs({ exec = execFileSyncThrottled, env = process.env } = {}) {
-  const out = exec('gh', ['pr', 'list', '--state', 'all', '--limit', String(PR_LIST_LIMIT), '--json', PR_LIST_JSON_FIELDS], {
+  const out = withRuntimeProcessAdmission(exec, ['gh', ['pr', 'list', '--state', 'all', '--limit', String(PR_LIST_LIMIT), '--json', PR_LIST_JSON_FIELDS], {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     maxBuffer: 32 * 1024 * 1024,
     timeout: prListTimeoutMs(env),
     killSignal: 'SIGKILL',
-  });
+  }]);
   return JSON.parse(String(out || '[]'));
 }
 
@@ -3343,7 +3346,7 @@ export function defaultCheckAlreadyDone(num, { exec = execFileSyncThrottled, env
   if (!key) return { done: false, pr: null, checked: false };
   if (exec === execFileSyncThrottled) {
     try {
-      const remote = String(execFileSync('git', ['remote', 'get-url', 'origin'], { cwd, encoding: 'utf8', timeout: 5000 })).trim();
+      const remote = String(withRuntimeProcessAdmission(execFileSync, ['git', ['remote', 'get-url', 'origin'], { cwd, encoding: 'utf8', timeout: 5000 }])).trim();
       const slug = remote.match(/github\.com[:/]([^/]+\/[^/]+?)(?:\.git)?$/)?.[1];
       if (slug) {
         const matches = filterAlreadyDoneCandidates(meteredAlreadyDone(slug, key, { opts: { stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 4 * 1024 * 1024, timeout: prListTimeoutMs(env), killSignal: 'SIGKILL' } }), key);
@@ -3353,7 +3356,7 @@ export function defaultCheckAlreadyDone(num, { exec = execFileSyncThrottled, env
   }
   let raw;
   try {
-    raw = exec('gh', [
+    raw = withRuntimeProcessAdmission(exec, ['gh', [
       'pr', 'list', '--search', `${key} in:title`, '--state', 'merged',
       '--limit', String(ALREADY_DONE_SEARCH_LIMIT), '--json', ALREADY_DONE_JSON_FIELDS,
     ], {
@@ -3362,7 +3365,7 @@ export function defaultCheckAlreadyDone(num, { exec = execFileSyncThrottled, env
       maxBuffer: 4 * 1024 * 1024,
       timeout: prListTimeoutMs(env), // #3460 — reuses the existing `gh pr list` network bound, no new knob
       killSignal: 'SIGKILL',
-    });
+    }]);
   } catch {
     return { done: false, pr: null, checked: false };
   }
@@ -3389,7 +3392,7 @@ export function defaultCheckAlreadyDone(num, { exec = execFileSyncThrottled, env
  * @returns {Promise<{stdout: string, stderr: string}>}
  */
 async function execFileThrottledAsync(file, args, opts = {}) {
-  const stdout = execFileSyncThrottled(file, args, opts);
+  const stdout = withRuntimeProcessAdmission(execFileSyncThrottled, [file, args, opts]);
   return { stdout, stderr: '' };
 }
 
@@ -3445,12 +3448,12 @@ export async function defaultCheckAlreadyDoneAsync(num, { execFileFn = execFileT
   if (!key) return { done: false, pr: null, checked: false };
   if (execFileFn === execFileThrottledAsync) {
     try {
-      const remote = String(execFileSync('git', ['remote', 'get-url', 'origin'], { cwd, encoding: 'utf8', timeout: 5000 })).trim();
+      const remote = String(withRuntimeProcessAdmission(execFileSync, ['git', ['remote', 'get-url', 'origin'], { cwd, encoding: 'utf8', timeout: 5000 }])).trim();
       const slug = remote.match(/github\.com[:/]([^/]+\/[^/]+?)(?:\.git)?$/)?.[1];
       if (slug) {
         // Awaited through the injectable executor (not a bare runGhSync) so the #3460 bounds ride along and a test can inject.
         const req = alreadyDoneRequest(slug, key, { stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 4 * 1024 * 1024, timeout: prListTimeoutMs(env), killSignal: 'SIGKILL' });
-        const { stdout } = await execFileFn('gh', req.args, req.opts);
+        const { stdout } = await withRuntimeProcessAdmission(execFileFn, ['gh', req.args, req.opts]);
         const matches = filterAlreadyDoneCandidates(JSON.parse(String(stdout)), key);
         return { done: matches.length > 0, pr: matches[0] ?? null, checked: true };
       }
@@ -3458,7 +3461,7 @@ export async function defaultCheckAlreadyDoneAsync(num, { execFileFn = execFileT
   }
   let raw;
   try {
-    ({ stdout: raw } = await execFileFn('gh', [
+    ({ stdout: raw } = await withRuntimeProcessAdmission(execFileFn, ['gh', [
       'pr', 'list', '--search', `${key} in:title`, '--state', 'merged',
       '--limit', String(ALREADY_DONE_SEARCH_LIMIT), '--json', ALREADY_DONE_JSON_FIELDS,
     ], {
@@ -3466,7 +3469,7 @@ export async function defaultCheckAlreadyDoneAsync(num, { execFileFn = execFileT
       maxBuffer: 4 * 1024 * 1024,
       timeout: prListTimeoutMs(env), // #3460 — reuses the existing `gh pr list` network bound, no new knob
       killSignal: 'SIGKILL',
-    }));
+    }]));
   } catch {
     return { done: false, pr: null, checked: false };
   }
@@ -3506,13 +3509,13 @@ export function defaultLaneRefForPr(pr, { exec = execFileSyncThrottled, env = pr
   // `fillBrief`'s own "no value for {{LANE_REF}}" refusal is exactly the right failure mode once this bubbles
   // up unmodified. So this function does the one thing it can do honestly: ask, and let a failure be a
   // failure.
-  const out = exec('gh', ['pr', 'view', String(pr), '--json', 'headRefName'], {
+  const out = withRuntimeProcessAdmission(exec, ['gh', ['pr', 'view', String(pr), '--json', 'headRefName'], {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     maxBuffer: 1024 * 1024,
     timeout: prListTimeoutMs(env),
     killSignal: 'SIGKILL',
-  });
+  }]);
   const parsed = JSON.parse(String(out || '{}'));
   const ref = String(parsed?.headRefName || '').trim();
   return ref || null;
@@ -3545,7 +3548,7 @@ export function defaultLaneRefForPr(pr, { exec = execFileSyncThrottled, env = pr
  *   unchanged; pass `all: true` ONLY from a caller whose job requires seeing completed sessions too.
  */
 export function defaultListAgents({ exec = execFileSync, env = process.env, all = false } = {}) {
-  const out = cachedClaudeAgents({ all, env, fetch: () => exec('claude', ['agents', '--json', ...(all ? ['--all'] : [])], {
+  const out = cachedClaudeAgents({ all, env, fetch: () => withRuntimeProcessAdmission(exec, ['claude', ['agents', '--json', ...(all ? ['--all'] : [])], {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     maxBuffer: 8 * 1024 * 1024,
@@ -3556,7 +3559,7 @@ export function defaultListAgents({ exec = execFileSync, env = process.env, all 
     // pointed `PATH` at a fake got a real spawn and a REAL listing back. The default is `process.env`, so
     // every existing caller — all of which pass `{ exec }` alone — is byte-identical.
     env,
-  }) });
+  }]) });
   return JSON.parse(String(out || '[]'));
 }
 

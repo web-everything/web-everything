@@ -1,3 +1,4 @@
+import { withRuntimeProcessAdmission } from './runtime-admission.mjs';
 /**
  * @file scripts/lib/daemon-jobs-runtime.mjs
  * @description THE DAEMON JOB RUNTIME — the io half of the shared job layer (#4125, statute `#daemon-jobs`).
@@ -73,9 +74,9 @@ export function localHostAliases({ host = hostName(), platform = process.platfor
   if (platform === 'darwin') {
     for (const key of ['LocalHostName', 'ComputerName']) {
       try {
-        const name = execFn('scutil', ['--get', key], {
+        const name = withRuntimeProcessAdmission(execFn, ['scutil', ['--get', key], {
           timeout: PS_TIMEOUT_MS, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
-        }).trim();
+        }]).trim();
         if (key === 'LocalHostName') addLocal(name);
         else add(name);
       } catch { /* An unavailable macOS name does not prevent probing known local names. */ }
@@ -93,9 +94,9 @@ export function localHostAliases({ host = hostName(), platform = process.platfor
 export function readProcStart(pid, { execFn = execFileSync } = {}) {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   try {
-    const out = execFn('ps', ['-o', 'lstart=', '-p', String(pid)], {
+    const out = withRuntimeProcessAdmission(execFn, ['ps', ['-o', 'lstart=', '-p', String(pid)], {
       env: { ...process.env, LC_ALL: 'C' }, encoding: 'utf8', timeout: PS_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'],
-    });
+    }]);
     return normalizeProcStart(out) || null;
   } catch (e) {
     if (e && e.status === 1) return null; // ps: no such process
@@ -301,7 +302,7 @@ export function prepareJobCode({ store, record, kindDef, snapshot = {} }) {
 export function spawnDetached({ entryPath, cwd, env, logPath }) {
   const fd = openSync(logPath, 'a');
   try {
-    const child = spawn(process.execPath, [entryPath], { cwd, env, detached: true, stdio: ['ignore', fd, fd] });
+    const child = withRuntimeProcessAdmission(spawn, [process.execPath, [entryPath], { cwd, env, detached: true, stdio: ['ignore', fd, fd] }]);
     child.unref();
     return child.pid;
   } finally {
@@ -338,7 +339,7 @@ export function launchJob({ store, id, kindDef, snapshot, evict = evictSnapshots
   };
   let pid;
   try {
-    pid = spawnFn({ entryPath: join(code.cwd, kindDef.entry), cwd: code.cwd, env: childEnv, logPath: join(store.dir, `${id}.log`) });
+    pid = withRuntimeProcessAdmission(spawnFn, [{ entryPath: join(code.cwd, kindDef.entry), cwd: code.cwd, env: childEnv, logPath: join(store.dir, `${id}.log`) }]);
   } catch (e) {
     // Never launched: the attempt stays counted, the launch grace turns it into a dead launch next tick.
     return store.update(id, (r) => ({ ...r, job: { ...r.job, error: `spawn failed: ${e.message}` } }));
@@ -410,9 +411,9 @@ export async function stopHandle(handle, {
 /** Start times (ms) of every process in group `pgid`, or null when `ps` did not answer. */
 export function readGroupStarts(pgid, { execFn = execFileSync } = {}) {
   try {
-    const out = execFn('ps', ['-A', '-o', 'pgid=,lstart='], {
+    const out = withRuntimeProcessAdmission(execFn, ['ps', ['-A', '-o', 'pgid=,lstart='], {
       env: { ...process.env, LC_ALL: 'C' }, encoding: 'utf8', timeout: PS_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'],
-    });
+    }]);
     return out.split('\n').map((l) => l.trim().match(/^(\d+)\s+(.+)$/)).filter((m) => m && Number(m[1]) === pgid).map((m) => Date.parse(m[2]));
   } catch { return null; }
 }
@@ -424,7 +425,7 @@ export function readBootTime({ execFn = execFileSync, readFile = readFileSync } 
       const s = Number(readFile('/proc/stat', 'utf8').match(/^btime (\d+)$/m)?.[1]);
       return Number.isFinite(s) ? s * 1000 : null;
     }
-    const s = Number(execFn('sysctl', ['-n', 'kern.boottime'], { encoding: 'utf8', timeout: PS_TIMEOUT_MS }).match(/sec = (\d+)/)?.[1]);
+    const s = Number(withRuntimeProcessAdmission(execFn, ['sysctl', ['-n', 'kern.boottime'], { encoding: 'utf8', timeout: PS_TIMEOUT_MS }]).match(/sec = (\d+)/)?.[1]);
     return Number.isFinite(s) ? s * 1000 : null;
   } catch { return null; }
 }

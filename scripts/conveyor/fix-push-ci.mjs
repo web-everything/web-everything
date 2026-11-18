@@ -1,3 +1,4 @@
+import { withRuntimeProcessAdmission } from '../lib/runtime-admission.mjs';
 /** The pusher hands its exact new head to CI immediately; the existing missing-run watch repairs missed triggers. */
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { recordFixPush } from './fix-push-state.mjs';
@@ -13,7 +14,7 @@ import { planSizeGrowth, planGrowthTransition, SIZE_OVER_CAP_LABEL } from '../li
  * `reduceCheckState`.
  */
 export const FIX_PUSH_GATE_CHECK = 'merge-gate';
-const defaultRun = (cmd, args) => execFileSyncThrottled(cmd, args, { encoding: 'utf8', timeout: resolveChildTimeoutMs(), maxBuffer: 4 * 1024 * 1024 });
+const defaultRun = (cmd, args) => withRuntimeProcessAdmission(execFileSyncThrottled, [cmd, args, { encoding: 'utf8', timeout: resolveChildTimeoutMs(), maxBuffer: 4 * 1024 * 1024 }]);
 function defaultReadNumstat({ repo, pr, run, expectedFiles }) {
   // The PR's own file count is the cross-check: an empty, stale or short read must never pass as a smaller diff.
   if (!Number.isSafeInteger(expectedFiles) || expectedFiles < 0) throw new Error('PR file count unknown');

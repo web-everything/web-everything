@@ -93,5 +93,18 @@ export function withRuntimeAdmission(card, kind, effect, { readSettings } = {}) 
   };
   // Nested provider ports inherit the reader, never its snapshot. Every nested
   // launch re-reads it, including a trust retry or a fallback provider.
-  return ticks.run({ readSettings: reader, cards: tick?.cards ?? new Map(), refused: tick?.refused ?? [] }, effect);
+  return ticks.run({ readSettings: reader, cards: tick?.cards ?? new Map(), refused: tick?.refused ?? [], launch: { card, kind } }, effect);
+}
+
+/** Shared subprocess transports also serve diagnostics outside a delivery launch.
+ * Inside a launch, inherit its complete identity and re-read admission at the native
+ * process call, after transport setup. A refusal must never look like command output.
+ */
+export function withRuntimeProcessAdmission(invoke, args, receiver) {
+  const effect = () => Reflect.apply(invoke, receiver, args);
+  const launch = ticks.getStore()?.launch;
+  if (!launch) return effect();
+  const result = withRuntimeAdmission(launch.card, launch.kind, effect);
+  if (result?.outcome === 'runtime-refused') throw Object.assign(new Error('runtime admission refused: ' + result.reason), result);
+  return result;
 }

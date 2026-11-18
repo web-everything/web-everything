@@ -4737,3 +4737,22 @@ uses its explicit diagnostic spawner and stays available under an empty allowlis
 Orphan resume pending writes must roll back on final refusal: remove the pending
 marker and restore any previous dead attempt count. The named final-refusal cases
 in `build-dispatch-orphan-adopt.test.mjs` prove a later tick sees dead work and recovers.
+
+
+## Delivery process inventory and final admission
+
+The runtime spawn guard computes the complete relative static import/re-export closure of
+its explicit delivery entry points. Its process ledger pins files, function owners and the
+call multiset; missing imports, new wrappers, changed sites and stale rows fail closed.
+The scanner runs in full whenever any source changes, since a new import can change reachability.
+The older launch-port checks additionally enforce persisted group projection at injected ports.
+
+Shared process transports use `withRuntimeProcessAdmission(invoke, args, receiver)` with
+arguments fully evaluated before admission. During an admitted delivery effect, the transport
+inherits the complete card/group identity and reads settings again immediately before invoking
+the primitive. Standalone diagnostic commands have no delivery identity and retain their behavior.
+Keep final direct admission at detached worker boundaries, which cannot inherit async context
+across processes; serialize only the card identity, never the settings snapshot or environment.
+A setup-time refusal must restore prior specs and remove newly created launch artifacts.
+Regression cases cover revocation during spec writing, admitted launches, durable aliases,
+pre-existing artifacts, eager transport arguments and a synthetic imported wrapper.

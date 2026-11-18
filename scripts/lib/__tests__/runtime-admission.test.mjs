@@ -8,7 +8,7 @@ import { it, expect, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { decideRuntimeAdmission, assertRuntimeAdmitted, withRuntimeAdmission, setRuntimeAdmissionCards, withRuntimeAdmissionTick } from '../runtime-admission.mjs';
+import { decideRuntimeAdmission, assertRuntimeAdmitted, withRuntimeAdmission, withRuntimeProcessAdmission, setRuntimeAdmissionCards, withRuntimeAdmissionTick } from '../runtime-admission.mjs';
 import { readBuildPrioritySettings } from '../build-queue.mjs';
 import { routeHeldItems } from '../../conveyor/build-dispatch-hold-router.mjs';
 
@@ -277,4 +277,26 @@ it('diagnostic card filing still spawns under an empty runtime allowlist', async
     expect(closeLog).toHaveBeenCalledWith(123);
     return {};
   });
+});
+
+it('a shared process transport freshly refuses revocation after eager argument setup, preserving the whole group', () => {
+  let settings = only(['12', '13']);
+  const spawn = vi.fn();
+  const setup = () => { settings = only(['12']); return 'agent'; };
+  expect(() => withRuntimeAdmission({ num: 12, groupMembers: [13] }, 'fix', () =>
+    withRuntimeProcessAdmission(spawn, [setup(), []]), { readSettings: () => settings }))
+    .toThrow(/runtime admission refused/);
+  expect(spawn).not.toHaveBeenCalled();
+});
+it('an admitted process transport preserves receiver, arguments and return value', () => {
+  const receiver = { marker: 'transport' };
+  const invoke = vi.fn(function (...args) { expect(this).toBe(receiver); return args; });
+  expect(withRuntimeAdmission({ num: 12 }, 'build', () => withRuntimeProcessAdmission(invoke, ['agent', ['arg']], receiver),
+    { readSettings: () => only(['12']) })).toEqual(['agent', ['arg']]);
+  expect(invoke).toHaveBeenCalledOnce();
+});
+it('process transport without a delivery identity preserves standalone diagnostic commands', () => {
+  const read = vi.fn(() => 'diagnostic');
+  expect(withRuntimeProcessAdmission(read, [])).toBe('diagnostic');
+  expect(read).toHaveBeenCalledOnce();
 });

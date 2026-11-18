@@ -1,3 +1,4 @@
+import { withRuntimeProcessAdmission } from './runtime-admission.mjs';
 /**
  * @file scripts/lib/merge-queue-enqueue.mjs
  * @description Strategy `github-merge-queue` (`./merge-delivery-policy.mjs`): instead of `gh pr merge`, the drain
@@ -194,9 +195,9 @@ export function buildEnqueueArgs({ nodeId, headSha }) {
  * This does not call the drain's `enqueuePr` or alter its workflow-edit refusal.
  */
 export function requestOperatorQueueEntry({ nodeId, headSha, bin, env, exec = execFileSync }) {
-  return JSON.parse(String(exec(bin, buildEnqueueArgs({ nodeId, headSha }), {
+  return JSON.parse(String(withRuntimeProcessAdmission(exec, [bin, buildEnqueueArgs({ nodeId, headSha }), {
     env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000,
-  }) || '{}'));
+  }]) || '{}'));
 }
 
 /** Read queue membership and its head together; missing or malformed membership is never `false`. */
@@ -275,7 +276,7 @@ export function readPinnedChangedFiles({ headSha, base = 'main', cwd, exec = exe
   if (!SHA_RE.test(String(headSha))) return { error: 'head sha is not a 40-hex commit id' };
   if (!SAFE_BRANCH_RE.test(String(base)) || String(base).startsWith('-')) return { error: 'base branch name unusable' };
   if (!cwd) return { error: 'no checkout to read the pinned diff from' };
-  const git = (args) => String(exec('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 256 * 1024 * 1024 }) ?? '');
+  const git = (args) => String(withRuntimeProcessAdmission(exec, ['git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 256 * 1024 * 1024 }]) ?? '');
   try {
     git(['fetch', '--quiet', '--end-of-options', 'origin', headSha, `+refs/heads/${base}:refs/remotes/origin/${base}`]);
     git(['cat-file', '-e', `${headSha}^{commit}`]);
@@ -295,7 +296,7 @@ export function readPinnedChangedFiles({ headSha, base = 'main', cwd, exec = exe
 function readBaseTip({ base, cwd, exec }) {
   if (!cwd || !SAFE_BRANCH_RE.test(String(base)) || String(base).startsWith('-')) return null;
   try {
-    const out = String(exec('git', ['ls-remote', '--exit-code', 'origin', `refs/heads/${base}`], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 }) ?? '');
+    const out = String(withRuntimeProcessAdmission(exec, ['git', ['ls-remote', '--exit-code', 'origin', `refs/heads/${base}`], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 }]) ?? '');
     const rows = out.split('\n').filter(Boolean).map(l => l.split('\t'));
     return rows.length === 1 && rows[0][1] === `refs/heads/${base}` && SHA_RE.test(rows[0][0]) ? rows[0][0] : null;
   } catch { return null; }
@@ -321,7 +322,7 @@ export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync, prepar
   }
   let pr;
   try {
-    pr = JSON.parse(exec('gh', ['pr', 'view', String(num), '--repo', repo, '--json', 'id,headRefOid,baseRefName'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}');
+    pr = JSON.parse(withRuntimeProcessAdmission(exec, ['gh', ['pr', 'view', String(num), '--repo', repo, '--json', 'id,headRefOid,baseRefName'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }]) || '{}');
   } catch (e) { return { ok: false, error: `node id read failed: ${errText(e)}` }; }
   const nodeId = pr?.id;
   if (!nodeId) return { ok: false, error: 'node id missing' };
@@ -348,7 +349,7 @@ export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync, prepar
   const licensed = license?.licensed === true && ['exact', 'numbering', 'mechanical'].includes(license.tier);
   const licenseResult = licensed ? { licensedBy: license.tier } : {};
   if (hold.hold && !licensed) return { ok: false, held: true, humanOnly: hold.humanOnly, retryable: hold.retryable === true, reason: hold.reason, paths: hold.paths, error: read.error ? `${hold.error}: ${read.error}` : hold.error, ...(license?.reason ? { licenseReason: license.reason } : {}) };
-  const queueState = () => readMergeQueueState({ repo, pr: num, readJson: args => JSON.parse(exec('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}') });
+  const queueState = () => readMergeQueueState({ repo, pr: num, readJson: args => JSON.parse(withRuntimeProcessAdmission(exec, ['gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }]) || '{}') });
   const existing = queueState();
   if (existing.inQueue === true && existing.head === headSha) return { ok: true, already: true, ...licenseResult };
   // A prior already-queued observation must never license a new mutation after a concurrent removal.
@@ -360,7 +361,7 @@ export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync, prepar
       error: decision?.line || 'mq-same-head-failed: unreadable fresh merge-queue admission; inspect timeline before retrying' };
   }
   try {
-    const out = JSON.parse(exec('gh', buildEnqueueArgs({ nodeId, headSha }), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}');
+    const out = JSON.parse(withRuntimeProcessAdmission(exec, ['gh', buildEnqueueArgs({ nodeId, headSha }), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }]) || '{}');
     const errs = out?.errors;
     if (Array.isArray(errs) && errs.length) {
       const msg = errs.map((x) => x?.message).join('; ');
@@ -505,9 +506,9 @@ export function classifyStartupFailureGate({ runs, headSha } = {}) {
 
 // The per-workflow endpoint lists no startup_failure runs; the repo-wide one does, so filter by path in the classifier.
 function readMergeGateRuns({ repo, headSha }) {
-  const out = JSON.parse(execFileSyncThrottled('gh', ['api',
+  const out = JSON.parse(withRuntimeProcessAdmission(execFileSyncThrottled, ['gh', ['api',
     `repos/${repo}/actions/runs?head_sha=${encodeURIComponent(headSha)}&event=pull_request_target&per_page=100`],
-  { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 2 * 1024 * 1024, timeout: 30_000 }));
+  { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 2 * 1024 * 1024, timeout: 30_000 }]));
   if (!Array.isArray(out?.workflow_runs) || !Number.isSafeInteger(out.total_count) || out.total_count !== out.workflow_runs.length) throw new Error('workflow run list incomplete or unreadable');
   return out.workflow_runs;
 }
