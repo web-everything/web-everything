@@ -154,12 +154,12 @@ function concludedReviewRow(row, evidence, now, readRecord) {
     const began = timestampMs(record?.startedAt);
     if (!record || record.session !== row.name || record.pid !== row.pid || !Number.isInteger(record.pid)
       || !Number.isFinite(began) || began < start || began >= verdict) return false;
-    const ended = timestampMs(record.endedAt);
-    if (record.status === 'done' && Number.isFinite(ended) && ended >= began && ended <= now) return true;
     const run = record.run;
-    if (run?.op === 'review-pr' && run.findings?.read?.netBasis?.rev === evidence.head
-      && ['accept', 'changes', 'needs-human'].includes(run.verdict?.verdict)
-      && run.stepTimings?.some(t => t?.step === 'advise' && Number.isFinite(timestampMs(t.finishedAt))
+    if (run?.op === 'review-pr' && run.pending === null && /^[a-f0-9]{40}$/.test(evidence.head)
+      && run.findings?.read?.netBasis?.rev === evidence.head
+      && ['accept', 'changes'].includes(run.verdict?.verdict)
+      && ['accept', 'changes'].includes(run.findings?.confirm)
+      && run.stepTimings?.some(t => t?.step === 'record' && Number.isFinite(timestampMs(t.finishedAt))
         && timestampMs(t.finishedAt) >= began && timestampMs(t.finishedAt) <= now)) return true;
     const heartbeat = timestampMs(record.heartbeatAt);
     return Number.isFinite(heartbeat) && heartbeat >= began && heartbeat <= now

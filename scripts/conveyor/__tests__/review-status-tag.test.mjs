@@ -562,7 +562,9 @@ describe('concluded head review with a lingering process', () => {
   const subject = { number: 7099, headRefOid, commentsComplete: true, comments: [gate, comment] };
   const row = { name: 'review-7099', state: 'working', pid: 12345, startedAt: now - 600_000 };
   const finished = { session: row.name, pid: row.pid, startedAt: new Date(row.startedAt).toISOString(),
-    status: 'done', endedAt: new Date(now - 120_000).toISOString() };
+    status: 'done', endedAt: new Date(now - 120_000).toISOString(),
+    run: { op: 'review-pr', pending: null, findings: { read: { netBasis: { rev: headRefOid } }, confirm: 'accept' },
+      verdict: { verdict: 'accept' }, stepTimings: [{ step: 'record', finishedAt: new Date(now - 120_000).toISOString() }] } };
   const derive = (fields = {}, options = {}) => deriveReviewStatus({ pr: 7099,
     reviewConcluded: reviewConcluded(accepted, subject), readReviewRecord: () => finished, now, agents: [{ ...row, ...fields }], ...options });
 
@@ -577,13 +579,29 @@ describe('concluded head review with a lingering process', () => {
   it('clears a working row with acceptance and its finished record', () => {
     expect(derive()).toBeNull();
   });
-  it('clears a final verdict written for this head in the linked run only', () => {
-    const run = { op: 'review-pr', findings: { read: { netBasis: { rev: headRefOid } } },
-      verdict: { verdict: 'accept' }, stepTimings: [{ step: 'advise', finishedAt: finished.endedAt }] };
-    const readReviewRecord = () => ({ ...finished, status: 'started', endedAt: null, run });
-    expect(derive({}, { readReviewRecord })).toBeNull();
-    run.findings.read.netBasis.rev = 'b'.repeat(40);
-    expect(derive({}, { readReviewRecord })?.state).toBe('reviewing');
+  it.each(['accept', 'needs-human'])('keeps a suspended run whose advise finished with %s', verdict => {
+    const run = { ...finished.run, pending: { kind: 'confirm', step: 'confirm' },
+      verdict: { verdict }, stepTimings: [{ step: 'advise', finishedAt: finished.endedAt }] };
+    expect(derive({}, { readReviewRecord: () => ({ ...finished, run }) })?.state).toBe('reviewing');
+  });
+  it('clears a final verdict recorded for this head in the linked run', () => {
+    expect(derive({}, { readReviewRecord: () => ({ ...finished, status: 'started', endedAt: null }) })).toBeNull();
+  });
+  it('keeps a final verdict recorded for a different head', () => {
+    const run = { ...finished.run, findings: { ...finished.run.findings, read: { netBasis: { rev: 'b'.repeat(40) } } } };
+    expect(derive({}, { readReviewRecord: () => ({ ...finished, run }) })?.state).toBe('reviewing');
+  });
+  it.each([
+    undefined, {}, { ...finished.run, pending: undefined },
+    { ...finished.run, pending: { kind: 'confirm', step: 'confirm' } },
+    { ...finished.run, verdict: { verdict: 'needs-human' } },
+    { ...finished.run, findings: { ...finished.run.findings, confirm: 'abstain' } },
+    { ...finished.run, findings: { ...finished.run.findings, confirm: undefined } },
+    { ...finished.run, stepTimings: undefined },
+    { ...finished.run, stepTimings: [{ step: 'record' }] },
+    { ...finished.run, stepTimings: [{ step: 'record', finishedAt: 'bad' }] },
+  ])('keeps a done process without complete final verdict evidence %j', run => {
+    expect(derive({}, { readReviewRecord: () => ({ ...finished, run }) })?.state).toBe('reviewing');
   });
   it.each([
     ['stale heartbeat', 120_001, 120_000, null],
@@ -595,7 +613,7 @@ describe('concluded head review with a lingering process', () => {
     ['invalid heartbeat', 'bad', 120_000, 'reviewing'],
   ])('%s requires the run own timeout and heartbeat', (_name, age, timeoutMs, expected) => {
     const heartbeatAt = typeof age === 'number' ? new Date(now - age).toISOString() : age;
-    const result = derive({}, { readReviewRecord: () => ({ ...finished, status: 'started', endedAt: null, heartbeatAt, timeoutMs }) });
+    const result = derive({}, { readReviewRecord: () => ({ ...finished, status: 'started', endedAt: null, run: null, heartbeatAt, timeoutMs }) });
     expect(result?.state ?? null).toBe(expected);
   });
   it.each(['missing', 'unreadable'])('keeps a working row when its record is %s', mode => {
@@ -638,7 +656,7 @@ describe('concluded head review with a lingering process', () => {
   });
   it('uses the verdict age with an inclusive two-minute bound in epoch, numeric string and ISO shapes', () => {
     for (const createdAt of [now - 120_000, String(now - 120_000), new Date(now - 120_000).toISOString()]) {
-      expect(derive({}, { reviewConcluded: { createdAt } })).toBeNull();
+      expect(derive({}, { reviewConcluded: { createdAt, head: headRefOid } })).toBeNull();
     }
     expect(derive({}, { reviewConcluded: { createdAt: now - 119_999 } })?.state).toBe('reviewing');
   });

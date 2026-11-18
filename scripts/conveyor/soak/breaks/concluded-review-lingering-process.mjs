@@ -45,9 +45,9 @@ export default {
       [accepted, 'reviewing', 'red-team', {}, {}, false, () => null, null],
       [accepted, 'reviewing', 'red-team', {}, {}, false, () => null, 'unreadable'],
       [accepted, null, 'ready-to-merge', {}, {}, false, () => null,
-        { status: 'started', endedAt: null, heartbeatAt: new Date(now - 300_000).toISOString(), timeoutMs: 120_000 }],
+        { status: 'started', endedAt: null, run: null, heartbeatAt: new Date(now - 300_000).toISOString(), timeoutMs: 120_000 }],
       [accepted, 'reviewing', 'red-team', {}, {}, false, () => null,
-        { status: 'started', endedAt: null, heartbeatAt: new Date(now - 60_000).toISOString(), timeoutMs: 120_000 }],
+        { status: 'started', endedAt: null, run: null, heartbeatAt: new Date(now - 60_000).toISOString(), timeoutMs: 120_000 }],
       [accepted, 'reviewing', 'red-team', {}, {}, false, () => ({ unreadable: true })],
       [accepted, 'reviewing', 'red-team', {}, {}, false, () => { throw new Error('sealed evidence unavailable'); }],
       [accepted, 'reviewing', 'red-team', { comments: [broken] }],
@@ -106,7 +106,10 @@ export default {
           if (recordFields === 'unreadable') throw Error('review record unreadable');
           return recordFields === null ? null : { session: 'review-7099', pid: 7099,
             startedAt: new Date(now - 600_000).toISOString(), status: 'done',
-            endedAt: new Date(now - 180_000).toISOString(), ...recordFields };
+            endedAt: new Date(now - 180_000).toISOString(),
+            run: { op: 'review-pr', pending: null, findings: { read: { netBasis: { rev: headRefOid } }, confirm: 'accept' },
+              verdict: { verdict: 'accept' }, stepTimings: [{ step: 'record', finishedAt: new Date(now - 180_000).toISOString() }] },
+            ...recordFields };
         },
         readFixClaim: () => null, planRows: [], requiredChecks: ['test'],
         prStatusSettings: { acceptedRedTeamStatus: 'red-team' }, signalFix: () => {},
