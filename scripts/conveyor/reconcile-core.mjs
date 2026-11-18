@@ -3071,6 +3071,17 @@ export function planReconcile({
       continue;
     }
 
+    // Expiry schedules reconciliation even when the retry cap is spent. Keep the heal hold until
+    // the executor has bound an observation; this row cannot request another run or spend budget.
+    const pendingRetry = [pr.owedCiRerunRetry, pr.timeoutRetry].find(retry => retry?.eligible
+      && retry.head === pr.headRefOid && retry.pr === prNumber);
+    if (pr.timeoutRetryBudget?.pending && pr.timeoutRetryBudget.pendingStale && !pr.timeoutRetryBudget.reason && pendingRetry) {
+      dispatch.push({ ...base, ...withPhase, kind: 'ci-timeout-rerun',
+        timeoutRetry: { ...pendingRetry, reconcilePendingOnly: true },
+        why: 'expired CI rerun reservation needs a bound observation before rerun or heal can proceed' });
+      continue;
+    }
+
     // ── CODEQL-HELD PR (card x8cnbii) — LIVE 2026-10-08, PR #4370: ready-to-merge + review:accepted (phase `queued`)
     // with every REQUIRED check green, but the drain refuses to land it because its non-required `CodeQL` check
     // failed (`drainBlocksOnCodeQL`). Phase `queued` answers `nothing-owed`, so the drain skipped it every pass and

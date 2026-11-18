@@ -4614,3 +4614,15 @@ oversized/incomplete/foreign evidence, target head invalidation, snapshot exclus
 a live target replacing a stale cached target with a different head and red check.
 Run it with `fast-drain-scope.test.mjs` and `merge-ai-prs.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
 comparison against daemon observations; fixtures prove IO counts without live GitHub calls.
+
+## Owed CI rerun recovery
+
+The review daemon executes its planned `ci-timeout-rerun` rows independently of fixer seats.
+Keep `owed-ci-rerun-executor.test.mjs` and `owed-ci-rerun-recovery.test.mjs` in the scoped gate
+with the timeout dispatcher and review daemon suites. Cover oldest-first limits, non-fatal effects,
+and daemon completion waiting. Expiry schedules a reconciliation-only planner row, including when the retry cap is spent;
+it never clears the heal hold. Release pending state only after a bound observation proves the
+attempt has not advanced. Reconciliation-only rows never request a run; the next plan selects
+a retry or heal from the observed state. Direct retries may reselect once under the per-head lock.
+Keep the expired-reservation/failed-observation regression asserting zero heal dispatches. Missing timestamps and unreadable state remain held.
+Pin historical young-reservation fixtures to their original clock, and test the spent-budget heal path.
