@@ -4402,15 +4402,21 @@ describe('pending label swap observation', () => {
   const entry = {
     status: 'pending', attempts: 1, lastAttemptAt: '2026-11-18T19:15:30.155Z',
     payload: { pr: 7109, repo: 'o/n', reviewedHead: 'd20084f7c427cdb0000c40f298fff4f6bdff3179',
-      addLabel: 'review:accepted', removeLabels: ['review:pending'], to: 'accepted' },
+      addLabel: 'review:accepted', removeLabels: ['review:pending'], to: 'accepted', bodyFile: '7109-verdict.md' },
   };
+  const body = '# Review 7109\r\n\r\nAccepted after checking this run.  \r\n';
+  const run = { id: 'observe-7109', effects: [{ type: REVIEW_EFFECTS.WRITE_UP, status: 'applied',
+    payload: { bodyFile: entry.payload.bodyFile, body } }] };
   const live = ['ready-to-merge', 'review:accepted', 'review-round:1', 'status:ready-to-merge', 'red-team:pending'];
   const comment = { author: { login: 'web-everything' },
-    body: '<!-- reviewed-sha: d20084f7c427cdb0000c40f298fff4f6bdff3179 -->', createdAt: '2026-11-18T19:16:30Z' };
-  const observer = (options = {}) => createReviewPrSinks({ root,
-    readHead: async () => entry.payload.reviewedHead, readLabels: async () => live,
-    labelProvider: { readComments: () => [comment] }, ...options,
-  })[REVIEW_EFFECTS.LABEL].observeOutcome;
+    body: `Recorded by reviewer.\n\n${body.replace(/\r\n/g, '\n').trim()}\n\n<!-- reviewed-sha: d20084f7c427cdb0000c40f298fff4f6bdff3179 -->`, createdAt: '2026-11-18T19:16:30Z' };
+  const observer = (options = {}) => {
+    const observe = createReviewPrSinks({ root,
+      readHead: async () => entry.payload.reviewedHead, readLabels: async () => live,
+      labelProvider: { readComments: () => [comment] }, ...options,
+    })[REVIEW_EFFECTS.LABEL].observeOutcome;
+    return (entry, record = run) => observe(entry, record);
+  };
 
   it('observes PR 7109 applied on its reviewed head using the live forge readers', async () => {
     const readHead = vi.fn(() => entry.payload.reviewedHead);
@@ -4424,6 +4430,8 @@ describe('pending label swap observation', () => {
 
   it.each([
     ['no verdict comment', []],
+    ['unrelated trusted same-head later review', [{ ...comment, body: `Unrelated review.\n\n<!-- reviewed-sha: ${entry.payload.reviewedHead} -->` }]],
+    ['changed write-up text', [{ ...comment, body: comment.body.replace('checking this run', 'checking another run') }]],
     ['untrusted author', [{ ...comment, author: { login: 'someone' } }]],
     ['missing author', [{ ...comment, author: undefined }]],
     ['older verdict', [{ ...comment, createdAt: '2026-11-18T19:15:30.154Z' }]],
@@ -4434,6 +4442,28 @@ describe('pending label swap observation', () => {
     ['incomplete comments result', { comments: [comment], complete: false }],
   ])('keeps matching labels unknown with %s', async (_name, comments) => {
     await expect(observer({ labelProvider: { readComments: () => comments } })(entry)).resolves.toBeNull();
+  });
+
+  it.each([
+    ['missing run', undefined],
+    ['missing frozen write-up', { ...run, effects: [] }],
+    ['empty frozen write-up', { ...run, effects: [{ ...run.effects[0], payload: { ...run.effects[0].payload, body: '  \r\n' } }] }],
+  ])('keeps matching labels unknown with %s', async (_name, record) => {
+    await expect(createReviewPrSinks({ root,
+      readHead: () => entry.payload.reviewedHead, readLabels: () => live,
+      labelProvider: { readComments: () => [comment] },
+    })[REVIEW_EFFECTS.LABEL].observeOutcome(entry, record)).resolves.toBeNull();
+  });
+
+  it('keeps matching labels unknown when the staged body cannot be recovered or read', async () => {
+    const path = reviewBodyPath({ root, runId: run.id, bodyFile: entry.payload.bodyFile });
+    mkdirSync(path, { recursive: true }); // A directory cannot be read or replaced as the body file.
+    await expect(observer()(entry)).resolves.toBeNull();
+  });
+
+  it('recovers the frozen write-up from the observer run instead of a different sink store', async () => {
+    await expect(observer({ runStore: { read: () => { throw new Error('wrong store'); } } })(entry)).resolves.toBe('applied');
+    expect(readFileSync(reviewBodyPath({ root, runId: run.id, bodyFile: entry.payload.bodyFile }), 'utf8')).toBe(body);
   });
 
   it('accepts a trusted verdict created exactly at the attempt timestamp', async () => {

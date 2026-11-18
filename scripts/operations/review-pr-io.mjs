@@ -2064,7 +2064,7 @@ export function createReviewPrSinks({
   sinks[REVIEW_EFFECTS.LABEL].provablyNotApplied = entry => isBodyFileRefusal(entry.error);
   // Removal labels were narrowed at declaration time: only the complete applied state resolves observation.
   // A not-applied retry needs comment dedupe by a marker (follow-up card): review-set-label posts a durable comment.
-  sinks[REVIEW_EFFECTS.LABEL].observeOutcome = async entry => {
+  sinks[REVIEW_EFFECTS.LABEL].observeOutcome = async (entry, run) => {
     const payload = entry?.payload;
     const nonempty = value => typeof value === 'string' && value.trim().length > 0;
     if (!payload || !Number.isInteger(payload.pr) || payload.pr <= 0
@@ -2073,6 +2073,11 @@ export function createReviewPrSinks({
     const attemptedAt = nonempty(entry.lastAttemptAt) ? Date.parse(entry.lastAttemptAt) : NaN;
     if (!Number.isFinite(attemptedAt) || typeof labelProvider.readComments !== 'function') return null;
     try {
+      const staged = ensureStagedBody({ root, runId: run?.id, bodyFile: payload.bodyFile, runStore, readRun: () => run });
+      // buildVerdictComment trims the body-file text; tolerate line-ending differences in the forge read.
+      const normalize = text => text.replace(/\r\n?/g, '\n').trim();
+      const body = normalize(readFileSync(staged, 'utf8'));
+      if (!body) return null;
       const head = await readHead({ repo: payload.repo, pr: payload.pr });
       if (head !== payload.reviewedHead) return null;
       const labels = await readLabels(payload.repo, payload.pr);
@@ -2087,6 +2092,7 @@ export function createReviewPrSinks({
       const comments = await labelProvider.readComments(payload.repo, payload.pr);
       if (!Array.isArray(comments)) return null;
       if (comments.some(comment => isTrustedMarkerAuthor(comment)
+        && typeof comment.body === 'string' && normalize(comment.body).includes(body)
         && parseReviewedSha([comment]) === payload.reviewedHead
         && typeof comment.createdAt === 'string' && Date.parse(comment.createdAt) >= attemptedAt)) return 'applied';
       return null;

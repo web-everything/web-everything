@@ -1,5 +1,7 @@
 /** PR #7109: a completed label swap with a lost response must resume through observation. */
 import { join } from 'node:path';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = fileURLToPath(new URL('../../../../', import.meta.url));
@@ -25,21 +27,27 @@ export default {
     const violations = [];
     const check = (ok, reason) => { if (!ok) violations.push(reason); };
     const payload = { pr: 7109, repo: 'o/n', reviewedHead: HEAD, addLabel: 'review:accepted',
-      removeLabels: ['review:pending'], to: 'accepted' };
+      removeLabels: ['review:pending'], to: 'accepted', bodyFile: '7109-verdict.md' };
     const labels = ['ready-to-merge', 'review:accepted', 'review-round:1', 'status:ready-to-merge', 'red-team:pending'];
     const registry = createRegistry();
-    registry.register(op('observe-label', { land: effect({ effects: () => [{ type: REVIEW_EFFECTS.LABEL, payload }] }) }));
+    const body = '# Review 7109\n\nAccepted after checking this run.';
+    registry.register(op('observe-label', { land: effect({ effects: () => [
+      { type: REVIEW_EFFECTS.LABEL, payload },
+      { type: REVIEW_EFFECTS.WRITE_UP, payload: { bodyFile: payload.bodyFile, body } },
+    ] }) }));
 
-    for (const state of ['same-head', 'no-comment', 'moved-head', 'unreadable-labels', 'source-labels-still-present', 'not-applied']) {
+    for (const state of ['same-head', 'unrelated-comment', 'no-comment', 'moved-head', 'unreadable-labels', 'source-labels-still-present', 'not-applied']) {
       const store = createMemoryRunStore();
       const run = advance(startRun({ op: 'observe-label', id: `observe-${state}`, registry }), { registry });
       Object.assign(run.effects[0], { status: 'pending', attempts: 1, error: 'UNKNOWN: response lost',
         lastAttemptAt: '2026-11-18T19:15:30.155Z' });
+      run.effects[1].status = 'applied';
       store.write(run);
       let writes = 0;
-      const sinks = createReviewPrSinks({ runStore: store,
+      const root = mkdtempSync(join(tmpdir(), 'observe-label-'));
+      const sinks = createReviewPrSinks({ root, runStore: store,
         labelProvider: { readComments: () => state === 'no-comment' ? [] : [{
-          author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${HEAD} -->`, createdAt: '2026-11-18T19:16:30Z',
+          author: { login: 'web-everything' }, body: `${state === 'unrelated-comment' ? 'Unrelated review.' : body}\n\n<!-- reviewed-sha: ${HEAD} -->`, createdAt: '2026-11-18T19:16:30Z',
         }] },
         readHead: () => state === 'moved-head' ? 'b'.repeat(40) : HEAD,
         readLabels: () => state === 'unreadable-labels' ? null
@@ -51,6 +59,7 @@ export default {
       let refusal;
       try { outcome = await applyPendingEffects(run, { sinks, store }); }
       catch (error) { refusal = error; }
+      finally { rmSync(root, { recursive: true, force: true }); }
       if (state === 'same-head') {
         check(!refusal, 'observable pending swap was refused');
         const saved = store.read(run.id);
