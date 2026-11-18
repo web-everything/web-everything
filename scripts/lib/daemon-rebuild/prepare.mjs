@@ -508,7 +508,10 @@ export async function prepareRebuild({
       const proof = d.reason === 'pr-merged' ? prMergedDropEvidence({ git, ref: d.ref, mainSha: plan.mainSha }) : {};
       // Bind the removal to the registration the plan judged: a re-registration after planning is not removed.
       try { removeOverlay(root, d.ref, { env, why: d.reason, expectedOverlay: overlaysBefore.find((o) => o.ref === d.ref) }); }
-      catch (error) { alert('overlay-removal-refused', { ref: d.ref, error: String(error.message) }); continue; }
+      catch (error) { // a refused removal stops this build; the next tick replans from the current registrations
+        alert('overlay-removal-refused', { ref: d.ref, error: String(error.message) });
+        return terminal({ moved: false, reason: 'overlay-removal-refused', plan });
+      }
       appendOverlayEvent(root, { kind: 'auto-dropped', ref: d.ref, pr: d.pr, reason: d.reason, ...proof }, { env });
       alert('overlay-auto-dropped', { ref: d.ref, reason: d.reason });
     } else if (d.action === 'drop') {
