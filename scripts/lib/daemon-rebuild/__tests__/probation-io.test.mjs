@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, basename } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { withWriteLock } from '../../daemon-clone-lock.mjs';
 
@@ -34,6 +34,61 @@ const previous = () => ({ head: good, at: iso(at - 100) });
 const adopted = () => ({ head, at: iso(at) });
 
 describe('R986 report-only probation persistence', () => {
+  it('unions every canonical clone alias group so all registered daemons owe proof', async () => {
+    const m = await load();
+    const alias = join(dir, 'alias'); symlinkSync(root, alias, 'dir');
+    const plists = Object.fromEntries([['com.we.X', root], ['com.we.Y', alias]].map(([id, path]) =>
+      [id, { Label: id, WorkingDirectory: path, ProgramArguments: ['node', 'x.mjs'] }]));
+    const roster = m.registeredDaemons(root, { env: { WE_LAUNCH_AGENTS_DIR: dir },
+      readdir: () => Object.keys(plists).map(id => `${id}.plist`),
+      exec: (_, args) => JSON.stringify(plists[basename(args.at(-1), '.plist')]) });
+    expect(roster.map(d => d.id).sort()).toEqual(['com.we.X', 'com.we.Y']);
+    expect(await m.createProbationObserver({ ...opts, registered: roster }).adopt(previous(), adopted()))
+      .toMatchObject({ action: 'pending', owed: ['com.we.Y', 'com.we.X'] });
+  });
+  it.each(['duplicate discovery', 'ambiguous label'])('refuses an incomplete roster on %s', async mode => {
+    const m = await load();
+    expect(() => m.registeredDaemons(root, { env: { WE_LAUNCH_AGENTS_DIR: dir },
+      readdir: () => mode === 'duplicate discovery' ? ['com.we.X.plist', 'com.we.X.plist'] : ['com.we.X.plist'],
+      exec: () => JSON.stringify({ Label: mode === 'ambiguous label' ? 'com.we.Y' : 'com.we.X',
+        WorkingDirectory: root, ProgramArguments: ['node', 'x.mjs'] }) })).toThrow(/roster|identity/);
+  });
+  it('changed CommonJS required dependency owes proof through an incomplete closure', async () => {
+    const m = await load();
+    writeFileSync(join(root, 'entry.cjs'), "module.exports = require('./required.cjs');");
+    writeFileSync(join(root, 'required.cjs'), 'module.exports = 1;');
+    git(['add', '.']); good = git(['commit-tree', git(['write-tree']), '-m', 'cjs before']);
+    writeFileSync(join(root, 'required.cjs'), 'module.exports = 2;');
+    git(['add', '.']); head = git(['commit-tree', git(['write-tree']), '-m', 'cjs after']);
+    const roster = [{ id: 'CJS', entry: 'entry.cjs' }];
+    expect(m.readClosure(root, roster[0], head)).toEqual({ complete: false });
+    expect(await m.createProbationObserver({ ...opts, registered: roster }).adopt(previous(), adopted()))
+      .toMatchObject({ action: 'pending', owed: ['CJS'] });
+  });
+  it.each(['require(target)', 'module.require(target)', "require.resolve('./required.cjs')"])
+    ('unresolved CommonJS form %s fails closed', async source => {
+      const m = await load();
+      writeFileSync(join(root, 'y.mjs'), source); git(['add', '.']);
+      const sha = git(['commit-tree', git(['write-tree']), '-m', 'unresolved require']);
+      expect(m.readClosure(root, registered[1], sha)).toEqual({ complete: false });
+    });
+  it('snapshots runtime JSON names across directories so a changed config owes proof', async () => {
+    const m = await load();
+    writeFileSync(join(root, 'y.mjs'), "export const config = 'runtime.json';");
+    mkdirSync(join(root, 'config')); mkdirSync(join(root, 'other'));
+    writeFileSync(join(root, 'config/runtime.json'), '{"value":1}');
+    writeFileSync(join(root, 'other/runtime.json'), '{}');
+    git(['add', '.']); good = git(['commit-tree', git(['write-tree']), '-m', 'json before']);
+    writeFileSync(join(root, 'config/runtime.json'), '{"value":2}');
+    git(['add', '.']); head = git(['commit-tree', git(['write-tree']), '-m', 'json after']);
+    expect(m.readClosure(root, registered[1], head)).toEqual({ complete: true, files: {
+      'y.mjs': git(['rev-parse', head + ':y.mjs']),
+      'config/runtime.json': git(['rev-parse', head + ':config/runtime.json']),
+      'other/runtime.json': git(['rev-parse', head + ':other/runtime.json']),
+    } });
+    expect(await m.createProbationObserver(opts).adopt(previous(), adopted()))
+      .toMatchObject({ action: 'pending', owed: ['Y'] });
+  });
   it('shared-entry registrations retain distinct identities selected by differing process arguments', async () => {
     const { ownDaemonId } = await load();
     const roster = [

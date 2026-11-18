@@ -1,6 +1,6 @@
 /** R986 S2a-1b: report-only probation IO. No result from here authorizes any lifecycle decision. */
 import { mkdirSync, readFileSync, writeFileSync, renameSync, readdirSync, realpathSync } from 'node:fs';
-import { join, dirname, relative, resolve, isAbsolute } from 'node:path';
+import { join, dirname, relative, resolve, isAbsolute, basename } from 'node:path';
 import { homedir, hostname } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -22,17 +22,24 @@ export function registeredDaemons(root, { env = process.env, exec = execFileSync
   const dir = env.WE_LAUNCH_AGENTS_DIR || join(homedir(), 'Library', 'LaunchAgents');
   let incomplete = false;
   const clones = resolveDaemonClones({ env, exec, launchAgentsDir: dir,
-    readdir: p => readdir(p), onIncomplete: () => { incomplete = true; } });
+    readdir: p => {
+      const entries = readdir(p);
+      if (new Set(entries).size !== entries.length) incomplete = true;
+      return entries;
+    }, onIncomplete: () => { incomplete = true; } });
   if (incomplete) throw new Error('daemon roster incomplete; inspect launchd registrations');
-  const clone = clones.find(c => canonical(c.path) === canonical(root));
-  if (!clone?.labels.length) throw new Error('daemon roster unknown; inspect launchd registrations');
-  return clone.labels.map(id => {
+  const cloneRoot = canonical(root);
+  const labels = new Set(clones.filter(c => canonical(c.path) === cloneRoot).flatMap(c => c.labels));
+  if (!labels.size) throw new Error('daemon roster unknown; inspect launchd registrations');
+  return [...labels].map(id => {
     const plist = readPlistAsJson(join(dir, `${id}.plist`), { exec });
+    if (plist?.Label !== id || canonical(plist.WorkingDirectory) !== cloneRoot)
+      throw new Error('daemon roster identity ambiguous; inspect launchd registrations');
     const argv = plist?.ProgramArguments;
     if (!Array.isArray(argv) || argv.some(a => typeof a !== 'string')) throw new Error('daemon argv unreadable');
     const index = argv.findIndex(a => /\.(?:mjs|cjs|js)$/.test(a));
     if (index < 0) throw new Error('daemon entry unknown; inspect launchd registration');
-    const entry = relative(root, resolve(plist.WorkingDirectory, argv[index]));
+    const entry = relative(cloneRoot, resolve(canonical(plist.WorkingDirectory), argv[index]));
     if (!entry || entry.startsWith('..') || isAbsolute(entry)) throw new Error('daemon entry outside clone');
     return { id, entry, args: argv.slice(index + 1) };
   });
@@ -55,6 +62,9 @@ export function readClosure(root, daemon, sha) {
     let unresolved = false;
     const closure = collectImportClosure({ root, entries: [daemon.entry], exists, readFile: p => {
       const text = source(p);
+      // CommonJS resolution (including computed/member forms) is not modeled by this walker.
+      // Refuse even literal require calls: the operator must inspect them; all daemons owe proof.
+      if (/\brequire\b/.test(text)) unresolved = true;
       for (const spec of parseImportSpecifiers(text)) {
         if (!spec.startsWith('.')) { if (!spec.startsWith('node:')) unresolved = true; continue; }
         const base = resolve(dirname(p), spec);
@@ -63,6 +73,12 @@ export function readClosure(root, daemon, sha) {
       return text;
     } });
     if (!closure?.complete || unresolved || closure.bareDeps) return { complete: false };
+    for (const [file, blob] of blobs) {
+      if (file.endsWith('.json') && closure.jsonNames.has(basename(file))) {
+        if (!blob) return { complete: false };
+        closure.files.add(file);
+      }
+    }
     return { complete: true, files: Object.fromEntries([...closure.files].map(p => [p, blobs.get(p)])) };
   } catch { return { complete: false }; } // Includes Git/output bounds: operator can inspect imports; all daemons owe proof.
 }
