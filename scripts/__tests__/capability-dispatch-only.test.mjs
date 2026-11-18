@@ -78,13 +78,15 @@ describe('capabilities admit dispatch only', () => {
 });
 
 // card: scope every gh write with an explicit --repo / known remaining unguarded write sites
-// Debt inventory only: these existing writes are not additional capability-admission sites.
+// Debt inventory only: existing writes and new-work sites to guard later; no runtime changes.
 // Pin argv and multiplicity, not line numbers, so a new call cannot borrow an existing exception.
 // The daemon delegates writes; include its label/comment helpers as well as direct gh effects.
 const delegatedWrites = new Set([
   'sweepHumanSurfaceRepark', 'sweepReviewHoldLabels', 'holdReconcile', 'notifyReferral',
   'tagStatus', 'tagRound', 'tagReviewRound', 'tagReviewStatus', 'postRefreshMarker',
   'syncResultOnHeadLabels', 'runGateCatchUp',
+  'promoteDraftsThenReplan', 'promoteDraftsGuarded', 'runDraftPromotionStep',
+  'fileCard', 'spawnPreventionLandingJob', 'io.acquire', 'io.verify', 'io.push',
 ]);
 function remainingWriteSites(source) {
   const file = ts.createSourceFile('source.mjs', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
@@ -109,6 +111,11 @@ function remainingWriteSites(source) {
   return sites;
 }
 const remainingUnguardedWrites = [
+  {"file":"scripts/conveyor/load-flake-reverify.mjs","description":"Acquire saved-fix lane before capability admission","call":"io.acquire"},
+  {"file":"scripts/conveyor/load-flake-reverify.mjs","description":"Verify saved fix before capability admission","call":"io.verify"},
+  {"file":"scripts/conveyor/load-flake-reverify.mjs","description":"Push saved fix after late capability admission (acquire/verify already ran)","call":"io.push"},
+  {"file":"scripts/conveyor/load-flake-reverify.mjs","description":"Publish saved-fix hold/reverify result comment","call":"command('gh', ['pr', 'comment', String(pr), '--repo', slug, '--body', body])"},
+  {"file":"scripts/conveyor/load-flake-reverify.mjs","description":"Opaque gh argv forwarding boundary (includes existing readers)","call":"command('gh', args)"},
   {"file":"scripts/merge-ai-prs.mjs","description":"Opaque gh argv forwarding boundary (includes existing readers)","call":"exec('gh', GH_ARGV.readPrReviews(repo || '{owner}/{repo}', pr))"},
   {"file":"scripts/merge-ai-prs.mjs","description":"Opaque gh argv forwarding boundary (includes existing readers)","call":"exec('gh', GH_ARGV.readPrReviews(slug, pr))"},
   {"file":"scripts/merge-ai-prs.mjs","description":"Remove lifecycle/hold/stale label","call":"exec('gh', ['pr', 'edit', String(pr), ...flag, '--remove-label', rm])"},
@@ -132,19 +139,20 @@ const remainingUnguardedWrites = [
   {"file":"skills-src/conveyor/review-daemon.mjs","description":"Repark human review surfaces","call":"sweepHumanSurfaceRepark"},
   {"file":"skills-src/conveyor/review-daemon.mjs","description":"Reconcile hold labels","call":"sweepReviewHoldLabels"},
   {"file":"skills-src/conveyor/review-daemon.mjs","description":"Run hold/stamp reconciliation","call":"holdReconcile"},
+  {"file":"skills-src/conveyor/review-daemon.mjs","description":"Same-pass draft promotion via promoteDraftsGuarded -> runDraftPromotionStep -> ready without review capability admission","call":"promoteDraftsThenReplan"},
   {"file":"skills-src/conveyor/review-daemon.mjs","description":"Refresh review/status labels","call":"tagStatus"},
   {"file":"skills-src/conveyor/review-daemon.mjs","description":"Publish referral pause notice","call":"notifyReferral"},
   {"file":"skills-src/conveyor/review-daemon.mjs","description":"Publish scope-refresh result marker","call":"postRefreshMarker"},
   {"file":"skills-src/conveyor/review-daemon.mjs","description":"Publish dispatched review round","call":"tagRound"},
   {"file":"skills-src/conveyor/review-daemon.mjs","description":"Refresh review/status labels","call":"tagStatus"},
   {"file":"skills-src/conveyor/review-daemon.mjs","description":"Repair result labels on current head","call":"syncResultOnHeadLabels"},
-  {"file":"skills-src/conveyor/review-daemon.mjs","description":"Publish missing red-team gate result","call":"runGateCatchUp"},
+  {"file":"skills-src/conveyor/review-daemon.mjs","description":"Gate catch-up reaches applyRedTeamGate: fileCard creates follow-up work; spawnPreventionLandingJob starts prevention landing work; both lack new-work capability admission (the safety callback itself stays unguarded)","call":"runGateCatchUp"},
   {"file":"skills-src/conveyor/review-daemon.mjs","description":"Wire round-label writer","call":"tagReviewRound"},
   {"file":"skills-src/conveyor/review-daemon.mjs","description":"Wire status-label writer","call":"tagReviewStatus"},
 ];
 
 describe('remaining GitHub write debt ratchet', () => {
-  it.each(['scripts/merge-ai-prs.mjs', 'skills-src/conveyor/review-daemon.mjs'])
+  it.each(['scripts/merge-ai-prs.mjs', 'skills-src/conveyor/review-daemon.mjs', 'scripts/conveyor/load-flake-reverify.mjs'])
     ('%s adds no write sites outside the documented debt inventory', path => {
       const expected = remainingUnguardedWrites.filter(site => site.file === path);
       expect(expected.every(site => site.description.trim().length > 0)).toBe(true);
@@ -160,6 +168,14 @@ describe('remaining GitHub write debt ratchet', () => {
     `exec('gh', ['api', 'repos/owner/repo/issues', ...writeFlags])`,
     `exec('gh', dynamicArgs)`,
     `tagStatus({repo, pr: 42})`,
+    `promoteDraftsThenReplan({ plan, repo, promote: promoteDraftsGuarded })`,
+    `promoteDraftsGuarded({ repo })`,
+    `runDraftPromotionStep({ repo })`,
+    `fileCard({ repo })`,
+    `spawnPreventionLandingJob({ repo })`,
+    `io.acquire(branch, pr, repo)`,
+    `io.verify(lane.path)`,
+    `io.push(lane.path, sha, branch)`,
   ])('detects an added write or opaque gh boundary: %s', source => {
     expect(remainingWriteSites(source)).toHaveLength(1);
     expect(remainingWriteSites(`${source}; ${source};`)).toHaveLength(2);
@@ -167,5 +183,9 @@ describe('remaining GitHub write debt ratchet', () => {
   it('ignores comments and positively identified reads', () => {
     expect(remainingWriteSites(`// exec('gh', ['pr', 'edit', '42'])
       exec('gh', ['pr', 'view', '42']); exec('gh', ['api', 'repos/owner/repo/pulls']);`)).toEqual([]);
+  });
+  it('leaves the red-team gate safety callback outside new-work debt', () => {
+    expect(remainingWriteSites(`applyRedTeamGate({ repo }); // fileCard({ repo })
+      /* spawnPreventionLandingJob({ repo }); io.acquire(branch); */`)).toEqual([]);
   });
 });
