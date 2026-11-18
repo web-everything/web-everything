@@ -118,6 +118,7 @@ import {
 } from './lib/daemon-overlays.mjs';
 import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository } from './operations/prototype-retire.mjs';
 import { isDeepStrictEqual } from 'node:util';
+import { safeRegistrationRef, validSha } from './operations/prototype-load.mjs';
 import { previewOverlayConflict, writeRebuildRequest } from './lib/daemon-rebuild.mjs';
 import { overlaySafetySettings } from './lib/daemon-load-overlay.mjs';
 import { pruneStaleOverlayRecords } from './lib/daemon-clone-registry.mjs';
@@ -451,6 +452,37 @@ export function removeRegistration({ root, ref, expectedTip, by = null, reason =
   return result;
 }
 
+/** Shared explicit/urgent withdrawal proof. Call under the add guard; cached stacks alone cannot prove independence. */
+export function proveOverlayWithdrawal({ root, ref, tip, reason, env = process.env, git = (...args) => {
+  const result = spawnSync('git', args, { cwd: root, env, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
+  return { code: result.status, stdout: result.stdout ?? '' };
+} }) {
+  const requireGit = (...args) => {
+    const result = git(...args);
+    if (result.code !== 0) throw new Error(`git ${args[0]} failed; inspect stacked dependents before unloading manually`);
+    return result.stdout.trim();
+  };
+  const state = readOverlayState(root, { env });
+  const stacked = state.overlays.some((r) => r.ref !== ref && r.stackBases?.includes(ref));
+  if (state.corrupt || stacked) return { action: 'keep', reason: 'stacked-or-unreadable' };
+  const current = requireGit('ls-remote', 'origin', `refs/heads/${ref}`).split(/\s+/)[0];
+  // stackBases is only a cache. Re-prove ancestry under the add guard so
+  // an uncached or newly registered stack top cannot lose its base.
+  const others = state.overlays.filter((r) => r.ref !== ref);
+  // Explicit --remove already fetched the target; urgent callers may not have its objects yet.
+  if (others.length) requireGit('fetch', 'origin', `+refs/heads/${ref}:refs/remotes/origin/${ref}`);
+  for (const other of others) {
+    if (!safeRegistrationRef(other.ref)) return { action: 'keep', reason: 'unreadable-stack-evidence' };
+    requireGit('fetch', 'origin', `+refs/heads/${other.ref}:refs/remotes/origin/${other.ref}`);
+    const otherTip = requireGit('rev-parse', '--verify', `refs/remotes/origin/${other.ref}^{commit}`);
+    if (!validSha(otherTip)) return { action: 'keep', reason: 'stacked-dependents' };
+    const ancestry = git('merge-base', '--is-ancestor', tip, otherTip);
+    if (![0, 1].includes(ancestry.code)) throw new Error('ancestry unverifiable; inspect stacked dependents before unloading manually');
+    if (ancestry.code === 0) return { action: 'keep', reason: 'stacked-dependents' };
+  }
+  return { action: 'retire', tip: current, reason };
+}
+
 /**
  * R310 `retire`: drop `ref` only when (a) its entry still equals `expectedEntry` (the one the caller proved),
  * (b) this process re-proves it retired at `expectedTip`, and (c) its remote tip is still `expectedTip` AFTER the
@@ -503,6 +535,10 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
         : decision?.reason === 'ci-expired' && Number.isFinite(loadedAt) && at - loadedAt >= 24 * 60 * 60 * 1000;
       if (!matches || !/^[a-f0-9]{40}$/.test(load.sha ?? '') || typeof load.ref !== 'string'
         || !Number.isFinite(loadedAt) || !Number.isFinite(at) || at < loadedAt || at > Date.now() || !negative) return refuse('urgent-decision-required');
+      let withdrawal;
+      try { withdrawal = proveOverlayWithdrawal({ root, ref, tip: expectedTip, reason: 'urgent-failed', env }); }
+      catch { return refuse('stacked-or-unreadable'); }
+      if (withdrawal.action !== 'retire') return refuse(withdrawal.reason);
     }
     let proof = prove(entry);
     if (proof.action === 'keep' && ['unique-commits-not-on-main', 'pr-open'].includes(proof.reason) && mode === 'urgent-failed') {

@@ -4814,13 +4814,15 @@ only after the suite pipeline stops. `urgent-sweep` is one bounded pass (32 load
 the orchestrator schedules it. Its durable settlement ledger prevents repeat handling and stores a
 `sweep-cursor` before each batch so pending or unreadable loads cannot starve later entries.
 Cursor records never settle a load; older ledgers without a cursor start at the beginning. Completed
-failures in any check-run on the SHA, regardless of job or app, remove the recorded clone/ref with a tip guard and open a NEEDS-YOU escalation through
+failures in any check-run on the SHA, regardless of job or app, open a once-per-tracking-ID NEEDS-YOU escalation through
 `land-advance-escalations`; unreadable/oversized evidence and legacy records without registrations
 require operator repair or manual unloading. Settlement identity includes the load tracking ID, so a reload
 starts fresh. Check failures authorize removal only for the GitHub Actions app and jobs in the configured
 `test` needs closure, with each suite bound to that workflow run on the exact SHA. Validate complete,
 bounded check pages before acting; malformed pages may still unload on an explicit bound failure.
-Unrelated app/workflow/job failures never authorize removal. Unknown workflow or required-job
+Unrelated app/workflow/job failures never authorize removal or green monitoring; they remain tracked
+with a durable failure-escalation receipt. The 24h verdict expiry still permits unloading.
+Unknown workflow or required-job
 evidence stays tracked and requires operator inspection; the existing verdict expiry still applies. Green loads are checked every pass while their clone/ref remains in the shared overlay
 store, including historical time-complete receipts. Only confirmed absence ends monitoring; corrupt
 overlay state escalates and stays tracked. A failed registration command can leave a persisted overlay:
@@ -4838,6 +4840,10 @@ Urgent retirement requires both the matching load and a persisted `unload-decisi
 write failure leaves the registration intact. Decisions bind tracking ID, clone, source ref/SHA
 and registration ref/SHA, with either an exact-source-SHA completed failure or a `ci-expired`
 decision at least 24 hours after loading. A load record alone never authorizes withdrawal.
+Urgent withdrawal reuses explicit `--remove`'s `proveOverlayWithdrawal` guard under the add lock:
+cached stacked dependents or live ancestry to another registration refuse removal. Unreadable
+dependent evidence also refuses; inspect the stack before unloading manually. Fetch the target
+as well as each potential dependent before comparing ancestry: urgent clones may lack the target's objects.
 Missing, unreadable, mismatched, future or incomplete decisions refuse; inspect CI and repair the
 ledger or unload manually. The production decision reader shares the 4 MiB ledger bound and
 archive fallback. Decisions are authorization records, not unload settlements: refused removals

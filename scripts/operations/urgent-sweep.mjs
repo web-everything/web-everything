@@ -135,6 +135,7 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
     const absent = new Map(settlements.filter(r => r.status === 'monitoring-unregistered').map(r => [r.id, r]));
     for (const [id, r] of unloaded) if (r.status === 'unloaded-adopted' && notificationsComplete(r)) settled.add(id);
     const ciEscalated = new Set(settlements.filter(r => r.status === 'monitoring-ci' && r.noVerdictEscalated === true).map(r => r.id));
+    const failureEscalated = new Set(settlements.filter(r => r.status === 'monitoring-ci' && r.failureEscalated === true).map(r => r.id));
     const green = new Map(settlements.filter(r => r.status === 'monitoring-green').map(r => [r.id, r.greenAt]));
     const records = deps.loads();
     const failed = new Set(records.filter(r => r.type === 'prototype-load.urgent-registration-failed'
@@ -225,9 +226,10 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
         if (!Number.isFinite(loadedAt) || !Number.isFinite(now) || now < loadedAt)
           throw new Error('unreadable urgent load timestamp; inspect CI or unload manually');
         const age = now - loadedAt;
-        let data, boundFailure, unload = false, requiredSucceeded = false, unloadReason, evidenceError;
+        let data, boundFailure, anyFailure, unload = false, requiredSucceeded = false, unloadReason, evidenceError;
         try {
           data = await deps.checks(r);
+          anyFailure = Array.isArray(data?.check_runs) && data.check_runs.some(c => failedCheck(c, r.sha));
           try { validateChecks(data, r.sha); } catch (e) { evidenceError = e; }
           const required = await deps.required(r, data?.testWorkflowPath);
           if (!Array.isArray(required) || !required.includes('test') || required.some(n => typeof n !== 'string' || !n))
@@ -241,19 +243,29 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           unload = Boolean(boundFailure);
           if (evidenceError) throw evidenceError;
           if (!unload) {
-            requiredSucceeded = testWorkflowBound(testCheckEvidence(data, r.sha), data.workflows, r.sha, data.testWorkflowPath)
+            requiredSucceeded = !anyFailure && testWorkflowBound(testCheckEvidence(data, r.sha), data.workflows, r.sha, data.testWorkflowPath)
               && required.every(n => checks.some(c => c.name === n || c.name.startsWith(`${n} (`)))
               && checks.every(c => c.status === 'completed' && c.conclusion === 'success');
           }
         } catch (e) { evidenceError = e; }
-        if (!unload && !requiredSucceeded && !green.has(id)) {
-          if (age >= 6 * 60 * 60 * 1000 && !ciEscalated.has(id)) {
+        if (!unload && !requiredSucceeded && (anyFailure || !green.has(id))) {
+          if (!anyFailure && age >= 6 * 60 * 60 * 1000 && !ciEscalated.has(id)) {
             await escalate(`${id}-no-ci-verdict`, r.ref, 'urgent load has no CI verdict after 6h');
             await deps.settle({ id, ref: r.ref, sha: r.sha, at: deps.now(), status: 'monitoring-ci', noVerdictEscalated: true });
             ciEscalated.add(id);
           }
           unload = age >= 24 * 60 * 60 * 1000;
           if (unload) unloadReason = `Unloaded ${r.sha}: urgent load has no CI verdict after 24h. Inspect and repair before reloading.`;
+        }
+        if (anyFailure && !unload) {
+          const detail = `CI failed on ${r.sha} outside the bound test closure. Inspect CI or unload manually.`;
+          if (!failureEscalated.has(id)) {
+            await escalate(`${id}-ci-failed`, r.ref, detail);
+            await deps.settle({ id, ref: r.ref, sha: r.sha, at: deps.now(), status: 'monitoring-ci', failureEscalated: true });
+            failureEscalated.add(id);
+          }
+          results.push({ id, status: 'needs-you', detail });
+          continue;
         }
         if (evidenceError && !unload) {
           if (age < 6 * 60 * 60 * 1000 || green.has(id)) throw evidenceError;

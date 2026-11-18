@@ -331,6 +331,30 @@ describe.each(['unique-commits-not-on-main', 'pr-open'])('guarded urgent-failed 
     expect(f.events().at(-1)).toMatchObject({ reason: 'urgent-failed', evidence: { urgentUnload: true } });
     expect(f.events().at(-1).operatorReason).toBeUndefined();
   });
+  it.each([true, false])('refuses urgent withdrawal with a stacked dependent (cached=%s)', async cached => {
+    const { f, args } = await urgent();
+    f.push('lane/top', 'top.txt', 'depends on urgent\n', 'origin/lane/urgent');
+    addOverlay(f.clone, { ref: 'lane/top', ...(cached ? { stackBases: ['lane/urgent'] } : {}) }, { env: f.env });
+    expect(await retireRegistration(args)).toMatchObject({ retired: false,
+      refused: cached ? 'stacked-or-unreadable' : 'stacked-dependents' });
+    expect(f.list()).toEqual(['lane/urgent', 'lane/top']);
+    expect(readPendingDrops(f.clone, f.env)).toEqual([]);
+    expect(f.events().some(e => e.kind === 'auto-retired')).toBe(false);
+  });
+  it('allows urgent withdrawal with an independent registration', async () => {
+    const { f, args } = await urgent();
+    f.push('lane/independent', 'independent.txt', 'independent work\n');
+    addOverlay(f.clone, { ref: 'lane/independent' }, { env: f.env });
+    expect(await retireRegistration(args)).toMatchObject({ retired: true, reason: 'urgent-failed' });
+    expect(f.list()).toEqual(['lane/independent']);
+  });
+  it('refuses urgent withdrawal when a potential dependent cannot be read', async () => {
+    const { f, args } = await urgent();
+    addOverlay(f.clone, { ref: 'lane/missing' }, { env: f.env });
+    expect(await retireRegistration(args)).toMatchObject({ retired: false, refused: 'stacked-or-unreadable' });
+    expect(f.list()).toEqual(['lane/urgent', 'lane/missing']);
+    expect(readPendingDrops(f.clone, f.env)).toEqual([]);
+  });
   it.each(['missing-reader', 'unreadable', 'incomplete', 'absent', 'trackingId', 'clone', 'ref', 'sha', 'registration', 'reason', 'pending', 'green', 'check-sha', 'timestamp', 'future', 'early-expiry'])(
     'refuses %s negative unload evidence even with a matching load', async kind => {
       const { f, args } = await urgent();

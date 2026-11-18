@@ -547,10 +547,54 @@ describe('urgent CI sweep', () => {
     expect(f.d.required).toHaveBeenCalledWith(load, path);
     expect(f.d.remove).toHaveBeenCalled();
   });
-  it('keeps an unrelated job failure in the bound workflow', async () => {
-    const f = fixture([check('smoke', 'failure')]);
-    await f.run();
+  it.each(['smoke', 'daemon-soak'])('escalates failed %s once per tracking ID without unloading or settling green', async name => {
+    const f = fixture([...required.map(n => check(n)), check(name, 'failure')]);
+    expect(await f.run()).toMatchObject({ ok: false, results: [{ status: 'needs-you' }] });
+    expect(await f.run()).toMatchObject({ ok: false, results: [{ status: 'needs-you' }] });
+    expect(f.d.escalate).toHaveBeenCalledTimes(1);
+    expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you', question: expect.stringContaining('NEEDS-YOU') }));
     expect(f.d.remove).not.toHaveBeenCalled();
+    expect(f.events).toEqual([]);
+    expect(f.state.some(r => ['monitoring-green', 'settled-green', 'settled-unregistered'].includes(r.status))).toBe(false);
+    f.loads[0] = { ...load, trackingId: 'reloaded' };
+    expect(await f.run()).toMatchObject({ results: [{ status: 'needs-you' }] });
+    expect(f.d.escalate).toHaveBeenCalledTimes(2);
+    expect(f.d.escalate.mock.calls[0][0].id).not.toBe(f.d.escalate.mock.calls[1][0].id);
+  });
+  it.each(['monitoring-green', 'settled-green'])('keeps a failed outside job tracked after persisted %s', async status => {
+    const f = fixture();
+    await f.run();
+    Object.assign(f.settlements()[0], { status });
+    const rows = [...required.map(n => check(n)), check('daemon-soak', 'failure', { app: { id: 1 }, check_suite: { id: 8 } })];
+    f.d.checks.mockReturnValue({ total_count: rows.length, check_runs: rows, workflows });
+    const before = f.state.length;
+    expect(await f.run()).toMatchObject({ results: [{ status: 'needs-you' }] });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'needs-you' }] });
+    expect(f.d.escalate).toHaveBeenCalledTimes(1);
+    expect(f.d.remove).not.toHaveBeenCalled();
+    expect(f.state.slice(before).some(r => ['monitoring-green', 'settled-green'].includes(r.status))).toBe(false);
+  });
+  it('still expires an outside-job failure after 24h', async () => {
+    const f = fixture([...required.map(n => check(n)), check('smoke', 'failure')]);
+    await f.run();
+    f.d.now = () => '2026-11-19T12:00:00Z';
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+    expect(f.state).toContainEqual(expect.objectContaining({ status: 'unload-decision', reason: 'ci-expired' }));
+  });
+  it.each(['smoke', 'daemon-soak'])('expires a persisted monitoring-green load with a later %s failure at 24h', async name => {
+    const f = fixture();
+    expect(await f.run()).toMatchObject({ results: [{ status: 'monitoring-green' }] });
+    expect(f.state).toContainEqual(expect.objectContaining({ status: 'monitoring-green' }));
+    const rows = [...required.map(n => check(n)), check(name, 'failure')];
+    f.d.checks.mockReturnValue({ total_count: rows.length, check_runs: rows, workflows });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'needs-you' }] });
+    expect(f.d.remove).not.toHaveBeenCalled();
+    f.d.now = () => '2026-11-19T12:00:00Z';
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+    expect(f.d.remove).toHaveBeenCalledWith(load, { ref: load.registration.ref });
+    expect(f.state).toContainEqual(expect.objectContaining({ status: 'unload-decision', reason: 'ci-expired' }));
   });
   it('unloads and raises NEEDS-YOU when required CI fails after required green with another run pending', async () => {
     const f = fixture([...required.map(n => check(n)), check('smoke', null, { status: 'in_progress' })]);
