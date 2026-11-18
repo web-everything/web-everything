@@ -10,6 +10,7 @@ const fixtures=[
   'scripts/operations/__tests__/coroner-transcripts.test.mjs',
   'scripts/readiness/__tests__/remote-git-bundle.test.mjs',
   'scripts/readiness/__tests__/forge-key-structure.test.mjs',
+  'scripts/readiness/__tests__/forge-key-structure-consumer.test.mjs',
   'scripts/readiness/forge-key-structure.mjs',
 ];
 describe('Forge key structure tracked fixture sources',()=>{

@@ -5,29 +5,64 @@ const EXHAUSTED='private-key-scan-budget-exhausted-use-local';
 const FINDING='private-key-structure';
 
 function derFinding(bytes,tick) {
-  const tlv=(offset,end)=>{
+  const cache=new Map();
+  const tlv=(offset,end,depth=0)=>{
     tick();
+    if(depth>64)throw EXHAUSTED;
+    const cached=cache.get(offset);
+    if(cached)return cached.next<=end?cached:null;
     if(offset+2>end)return null;
     const tag=bytes[offset++];
     let length=bytes[offset++];
+    const header=offset-2,start=offset;
+    if(length===128) {
+      if(!(tag&32))return null; // BER indefinite lengths require a constructed tag.
+      while(offset+2<=end) {
+        if(bytes[offset]===0&&bytes[offset+1]===0) {
+          const node={tag,start,end:offset,next:offset+2};
+          cache.set(header,node);return node;
+        }
+        const child=tlv(offset,end,depth+1);
+        if(!child||child.tag===0)return null;
+        offset=child.next;
+      }
+      return null; // An unfinished BER container is not a complete key.
+    }
     if(length&128) {
       const count=length&127;
       if(!count||count>4||offset+count>end)return null;
       length=0;
       for(let i=0;i<count;i++)length=length*256+bytes[offset++];
     }
-    return offset+length<=end?{tag,start:offset,end:offset+length}:null;
+    if(offset+length>end||tag===0)return null;
+    const node={tag,start:offset,end:offset+length,next:offset+length};
+    cache.set(header,node);return node;
   };
   const children=node=>{
     const result=[];
     for(let offset=node.start;offset<node.end;) {
       const child=tlv(offset,node.end);
       if(!child)return null;
-      result.push(child);offset=child.end;
+      result.push(child);offset=child.next;
     }
     return result;
   };
   const nonempty=(node,tag)=>node?.tag===tag&&node.end>node.start;
+  const octets=(node,depth=0)=>{
+    tick();
+    if(depth>64)throw EXHAUSTED;
+    if(node?.tag===4)return node.end-node.start;
+    if(node?.tag!==36)return -1;
+    const parts=children(node);
+    if(!parts)return -1;
+    let size=0;
+    for(const part of parts) {
+      const length=octets(part,depth+1);
+      if(length<0)return -1;
+      size+=length;
+    }
+    return size;
+  };
   for(let offset=0;offset<bytes.length;offset++) {
     if(bytes[offset]!==48)continue;
     const sequence=tlv(offset,bytes.length);
@@ -42,9 +77,9 @@ function derFinding(bytes,tick) {
     if(fields.length>=9&&fields.slice(1,9).every(node=>nonempty(node,2))
       &&(fields.length===9||(value===1&&fields.length===10&&fields[9].tag===48)))return true;
     // SEC1: version one, scalar OCTET STRING, optional parameters/public key.
-    if(value===1&&nonempty(fields[1],4)&&fields.slice(2).every(node=>[160,161].includes(node.tag)))return true;
+    if(value===1&&octets(fields[1])>0&&fields.slice(2).every(node=>[160,161].includes(node.tag)))return true;
     // PKCS#8 v0/v1: AlgorithmIdentifier and privateKey OCTET STRING.
-    if(fields[1].tag===48&&nonempty(fields[2],4)
+    if(fields[1].tag===48&&octets(fields[2])>0
       &&fields.slice(3).every(node=>[160,129,161].includes(node.tag))) {
       const algorithm=children(fields[1]);
       if(algorithm?.length&&nonempty(algorithm[0],6))return true;
@@ -146,8 +181,28 @@ function canonicalize(bytes,emit,tick) {
   }
 }
 
-export function keyStructureFinding(buffer) {
+// A negative result proves none of the pipeline's entry representations are present.
+// In particular, base64 chunks of ONE character may join across whitespace. Do not
+// require a long individual token or a particular alphabet/prefix. High bytes may
+// be Unicode whitespace; NUL preserves both UTF-16 decoding paths.
+export function keyStructurePrecheck(buffer) {
+  if(!Buffer.isBuffer(buffer)||buffer.length>LIMITS.bytes)return true;
+  let run=0;
+  for(const byte of buffer) {
+    if([0,34,37,48,91,92,123].includes(byte))return true;
+    if((byte>=65&&byte<=90)||(byte>=97&&byte<=122)||(byte>=48&&byte<=57)
+      ||[43,45,47,61,95].includes(byte)) {
+      if(++run>=8)return true;
+    } else if(byte<128&&![9,10,11,12,13,32].includes(byte))run=0;
+  }
+  return false;
+}
+
+// The bypass lets differential tests compare the optimization with the full scan.
+export function keyStructureFinding(buffer,{precheck=true}={}) {
   if(!Buffer.isBuffer(buffer))return 'private-key-scan-unreadable-use-local';
+  if(buffer.length>LIMITS.bytes)return EXHAUSTED;
+  if(precheck&&!keyStructurePrecheck(buffer))return null;
   const queue=[],seen=new Set();
   let total=0,steps=0;
   const tick=()=>{if(++steps>LIMITS.steps)throw EXHAUSTED;};

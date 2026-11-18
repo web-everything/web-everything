@@ -2,7 +2,7 @@
 import {createPrivateKey,generateKeyPairSync} from 'node:crypto';
 import {describe,expect,it} from 'vitest';
 import {credentialBufferFinding,credentialContentFinding,manifestEntry} from '../forge-exec-manifest.mjs';
-import {keyStructureFinding} from '../forge-key-structure.mjs';
+import {keyStructureFinding,keyStructurePrecheck} from '../forge-key-structure.mjs';
 
 // Adapted from origin/lane/forge-key-structure-s1; generate material instead of shipping secrets.
 const FINDING='private-key-structure';
@@ -24,7 +24,9 @@ const views={
   decimal:bytes=>'['+[...bytes].join(', /* byte */ \n')+']',
   pem:bytes=>'-----BEGIN '+['PRIVATE','KEY'].join(' ')+'-----\n'+bytes.toString('base64')+'\n-----END '+['PRIVATE','KEY'].join(' ')+'-----',
 };
+const detectionFixtures=[];
 const blocked=content=>{
+  detectionFixtures.push(content);
   expect(keyStructureFinding(content)).toBe(FINDING);
   const finding=credentialBufferFinding(content);
   expect([FINDING,'pem-header']).toContain(finding);
@@ -110,8 +112,9 @@ describe('Forge key structure slice 1',()=>{
     // Minimal short scalar: no cryptographic-size threshold in structural recognition.
     const scalar=version=>Buffer.from([48,6,2,1,version,4,1,7]);
     blocked(scalar(1));
-    for(const bytes of [scalar(0),scalar(2),
-      Buffer.from([48,128,2,1,1,4,1,7,0,0]),Buffer.from([48,130,255,255,2,1,1])])
+    // Assemble at runtime: a literal positive byte array would flag this tracked source.
+    blocked(Buffer.concat([Buffer.from([48,128]),scalar(1).subarray(2),Buffer.alloc(2)]));
+    for(const bytes of [scalar(0),scalar(2),Buffer.from([48,130,255,255,2,1,1])])
       expect(keyStructureFinding(bytes)).toBeNull();
   });
   it('fails closed on oversized input and names the operator local fallback',()=>{
@@ -147,5 +150,13 @@ describe('Forge key structure slice 1',()=>{
   });
   it('fails closed on unreadable input',()=>{
     expect(keyStructureFinding(null)).toBe('private-key-scan-unreadable-use-local');
+  });
+  it('I4 pre-check is a superset of detection (every slice 1 detection fixture)',()=>{
+    expect(detectionFixtures.length).toBeGreaterThan(1000);
+    for(const fixture of detectionFixtures) {
+      // Bypass the pre-check so a filtering miss cannot make this assertion vacuous.
+      expect(keyStructureFinding(fixture,{precheck:false})).toBe(FINDING);
+      expect(keyStructurePrecheck(fixture)).toBe(true);
+    }
   });
 });
