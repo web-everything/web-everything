@@ -4849,13 +4849,15 @@ async function runCli() {
   const REPOS = resolveRepos({ repos: typeof flags.repos === 'string' ? flags.repos : null, singleRepo: !!flags['this-repo'], self: localSlug });
   const LIFECYCLE_REPOS = resolveLifecycleRepos({ repos: typeof flags.repos === 'string' ? flags.repos : null, singleRepo: !!flags['this-repo'], self: localSlug });
   // #xc7p3q9 (Fix 1 / B8) — the CONTEXT repo set for `collectOpenPrContext` is the FULL constellation, UNION'd
-  // with REPOS, regardless of `--only`/`--repos`/`--this-repo` narrowing. The couple gate reads carrier HEALTH
+  // with LIFECYCLE_REPOS, regardless of dispatch capability or `--only`/`--repos`/`--this-repo` narrowing.
+  // The couple gate reads carrier HEALTH
   // (held / nameable / degraded) out of this blind context, so a WE carrier NARROWED out of a `--repos=<impl>` /
   // `--this-repo` candidate sweep is STILL visible here — its coupled impl half joins it and defers if it is held,
   // instead of orphan-landing past a hidden held carrier. `resolveContextRepos` canonicalizes the local repo so
   // it is never listed twice (B8). For the common full-constellation drain (REPOS === the constellation) this is a
   // no-op — no extra listings.
-  const CONTEXT_REPOS = resolveContextRepos(REPOS, localSlug, flags.repos);
+  // Preserve the lifecycle's local token even when review capability leaves REPOS empty.
+  const CONTEXT_REPOS = resolveContextRepos(LIFECYCLE_REPOS, localSlug, flags.repos);
   // #2458 — THIS run's repo scope (`null` = the cwd repo → normalize to localSlug), recorded in the drain
   // lease so a differently-scoped launch can tell whether the holder actually covers its repos.
   const leaseScope = [...new Set(LIFECYCLE_REPOS.map((r) => r || localSlug).filter(Boolean))].sort();

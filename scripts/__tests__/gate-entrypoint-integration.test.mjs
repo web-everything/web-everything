@@ -42,6 +42,9 @@ function out(o) { fs.writeSync(1, JSON.stringify(o)); process.exit(0); }
 if (a[0] === 'label' && a[1] === 'create' && process.env.GATE_LABEL_LOG) {
   fs.appendFileSync(process.env.GATE_LABEL_LOG, JSON.stringify(a) + '\\n');
 }
+if (a[0] === 'pr' && a[1] === 'edit' && process.env.GATE_EDIT_LOG) {
+  fs.appendFileSync(process.env.GATE_EDIT_LOG, JSON.stringify(a) + '\\n');
+}
 // Label provisioning resolves gh's effective repository before writing a repo-keyed memo.
 if (a[0] === 'repo' && a[1] === 'view' && fields === 'url' && a[a.indexOf('--jq') + 1] === '.url') {
   if (fx._repoRead === 'error') { process.stderr.write('HTTP 502\\n'); process.exit(1); }
@@ -159,7 +162,7 @@ process.stdout.write(''); process.exit(0);
 // ── fake git: canned origin slug; `diff` FAILS (forces the gh-files escalation fallback); else no-op ──
 const FAKE_GIT = `#!/usr/bin/env node
 const a = process.argv.slice(2);
-if (a[0] === 'remote' && a[1] === 'get-url') { process.stdout.write('git@github.com:web-everything/web-everything.git\\n'); process.exit(0); }
+if (a[0] === 'remote' && a[1] === 'get-url') { process.stdout.write('git@github.com:' + (process.env.GATE_LOCAL_REPO || 'web-everything/web-everything') + '.git\\n'); process.exit(0); }
 if (a[0] === 'diff') { process.exit(1); } // force computeNetDiffChangedFiles → gh 'pr view --json files' fallback
 process.exit(0);
 `;
@@ -235,6 +238,27 @@ const GREEN = [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }];
 const AI_COMMIT = [{ authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }];
 
 describe('label provisioning through the real drain entrypoint', () => {
+  it('--this-repo reconciles CI labels on a review-disabled local repo without review dispatch', () => {
+    const editLog = join(workDir, 'review-disabled-local-edits.log');
+    writeFileSync(editLog, '');
+    const { result } = runDrainLive({
+      _id: 'review-disabled-local',
+      prs: [{ number: 991, title: 'local CI failure', body: 'a real summary', headRefName: 'lane/local-ci', baseRefName: 'main',
+        mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE',
+        statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE', status: 'COMPLETED' }],
+        labels: [{ name: 'ready-to-merge' }], _commits: AI_COMMIT,
+        _files: [{ path: 'backlog/local-ci.md', additions: 1, deletions: 0 }] }],
+    }, ['--label=ready-to-merge'], { GATE_LOCAL_REPO: 'longshoreai/longshore', GATE_EDIT_LOG: editLog });
+    expect(result.reconciledLabels).toEqual([991]);
+    expect(result.repos).toEqual([]);
+    expect(result.considered).toBe(0);
+    expect(result.parked).toEqual([]);
+    expect(result.toMerge).toEqual([]);
+    const edits = readFileSync(editLog, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
+    expect(edits.some(args => args.includes('--add-label') && args.includes('ci:failed'))).toBe(true);
+    expect(edits.some(args => args.some(arg => arg.startsWith('review:')))).toBe(false);
+  });
+
   const fixtureFor = (_id) => ({
     _id,
     prs: [{ number: 990, title: 'leaf label fixture', body: 'a real summary', headRefName: 'lane/labels', baseRefName: 'main',
