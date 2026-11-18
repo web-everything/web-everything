@@ -1039,14 +1039,16 @@ export async function judgeSpawn({
         stdoutBytes: stdout.length, stderrTail: stderr.trim().slice(-1000), wallMs: thisAttemptMs,
         ...(reason ? { reason } : {}),
       });
-      if (!error.processFailed && attempt < total) {
+      // Only main's lost/unparseable stdout path may retry. Integrity failures are terminal.
+      const retryable = !error.verdictIntegrity && !error.processFailed;
+      if (retryable && attempt < total) {
         const snippet = stderrSnippet(stderr);
         const nextSid = retrySessionId(sid, attempt + 1);
         log(`judge-spawn: juror ${lens || '-'} attempt ${attempt}/${total} emitted no parseable JSON (exit ${code ?? 'none'}, signal ${signal ?? 'none'}, stdout ${stdout.length} bytes${snippet ? `, stderr: ${snippet}` : ''}); retrying with a fresh session id ${nextSid} — ${UNPARSEABLE_RETRY_SETTING.key}=${retries} (source: ${setting.source})`);
         continue;
       }
       throw new JudgeUnparseableError({
-        attempt, attempts: error.processFailed ? attempt : total, exitCode: code, signal, stdout, stderr, wallMs, sessionId: thisSid, failedAttempts, reason,
+        attempt, attempts: retryable ? total : attempt, exitCode: code, signal, stdout, stderr, wallMs, sessionId: thisSid, failedAttempts, reason,
       });
     }
     return { ...outcome, wallMs, attempts: attempt, failedAttempts, timedOut, loadedContextTokens: loadedContextTokens(outcome.usage), argv };
