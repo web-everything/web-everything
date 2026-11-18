@@ -253,6 +253,22 @@ describe('applyRedTeamGate', () => {
     expect(calls).toEqual([]);
   });
 
+  it.each(['broken', 'degraded'])('a live-result operator card is already acted on (%s)', async impact => {
+    const comments = [comment([F({ impactIfUnfixed: impact })])];
+    const resultId = redTeamResultId(parseRedTeamComment(comments[0].body));
+    comments.push({ author: { login: 'web-everything' }, createdAt: '2026-10-10T02:05:00Z',
+      body: `${redTeamGateMarker(4722, HEAD, 'round-cap', resultId)}\n- 1 confirmed break(s) NOT sent back: cap (#1).` });
+    comments.push({ author: { login: 'chalbert', type: 'User' }, createdAt: '2026-10-10T02:06:00Z',
+      body: `${redTeamGateMarker(4722, HEAD, 'operator-card', resultId)}\n- 1 finding(s) carded by the operator to \`we:backlog/x.md\` (#1).` });
+    const { io, calls } = fakeIo({ comments });
+    expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({
+      status: 'already-acted', plan: { sendBack: [], card: [] },
+    });
+    expect(calls).toEqual([]);
+    expect(readRedTeamDisposition({ comments, repo: REPO, pr: 4722, head: HEAD,
+      setting: CONFIRMED_BREAKS_DEFAULTS, sealed: null }).dispositions.get(1).state).toBe('released carded');
+  });
+
   it('a comment on a stale head is ignored', async () => {
     const { io, calls } = fakeIo({ comments: [comment([F()], OTHER)] });
     expect((await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).status).toBe('no-red-team-on-head');

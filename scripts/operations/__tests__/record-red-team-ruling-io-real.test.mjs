@@ -1,7 +1,8 @@
+vi.mock('../../lib/red-team-check-run.mjs', () => ({ createLiveCheckPublisher: () => ({ publish: () => ({ ok: true }) }) }));
 /** #2949 fidelity: resolve an operator's existing card against a real backlog tree. */
 import { unlinkSync } from 'node:fs';
 import { join } from 'node:path';
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
 import { withNarrowClone } from './helpers/real-repo.mjs';
 import { createRecordRedTeamRulingReader, createRecordRedTeamRulingSinks } from '../record-red-team-ruling-io.mjs';
 import { planRedTeamRuling, RED_TEAM_RULING_CARD_EFFECT } from '../record-red-team-ruling.mjs';

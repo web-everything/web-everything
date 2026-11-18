@@ -39,14 +39,15 @@ export default {
       const { CONFIRMED_BREAKS_DEFAULTS, liveResultGateState, readRedTeamDisposition, redTeamGateMarker } = await load('scripts/lib/red-team-gate.mjs');
       const { redTeamEnqueueHold } = await load('scripts/lib/drain-queue-safety.mjs');
       const { syncRedTeamStatusLabels } = await load('scripts/lib/red-team-status-labels.mjs');
+      const { applyRedTeamGate } = await load('scripts/operations/red-team-gate-apply.mjs');
       const pr = 5768, head = 'b'.repeat(40), actor = OPERATOR_LOGINS[0];
       const cardPath = 'backlog/5768-prepare-runs-an-earned-design-review-and-every-design-keeps.md';
       const card = `we:${cardPath}`;
       const bot = body => ({ author: { login: AUTOMATION_LOGINS[0], type: 'Bot' }, createdAt: '2026-10-21T12:00:00Z', body });
       const human = body => ({ author: { login: actor, type: 'User' }, createdAt: '2026-10-21T13:00:00Z', body });
-      const result = rev => bot(renderRedTeamComment({ pr, rev, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+      const result = (rev, finding = {}) => bot(renderRedTeamComment({ pr, rev, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
         findings: [{ summary: 'an earned design decision is lost', category: 'edge-case', impactIfUnfixed: 'broken',
-          file: 'scripts/conveyor/prepare-item.mjs', line: 24, confirmedByRecheck: true }] }));
+          file: 'scripts/conveyor/prepare-item.mjs', line: 24, confirmedByRecheck: true, ...finding }] }));
       const first = result(head), rid = liveResultGateState([first], pr, head).resultId;
       const cap = bot(`${redTeamGateMarker(pr, head, 'round-cap', rid)}\n**Red-team gate** on head \`${head.slice(0, 12)}\`:\n- 1 confirmed break(s) NOT sent back: round cap (#1).`);
       cap.createdAt = '2026-10-21T12:01:00Z';
@@ -91,14 +92,19 @@ export default {
         const reader = createRecordRedTeamRulingReader({ assertFresh: () => {}, readThread, resolveIdentity,
           readSetting: () => ({ value: CONFIRMED_BREAKS_DEFAULTS }), now: () => '2026-10-21T13:00:00Z',
           runGit });
+        const published = [], warnings = [];
         const sinks = createRecordRedTeamRulingSinks({ readThread, resolveIdentity, runGit,
-          post: (_repo, _pr, body) => state.comments.push(human(body)), syncLabels: () => tick(), warn: () => {} });
+          publishCheck: args => { published.push(args); return { ok: true }; },
+          post: (_repo, _pr, body) => state.comments.push(human(body)), syncLabels: () => tick(), warn: message => warnings.push(message) });
         const code = await main([`--pr=${pr}`, `--repo=${repo}`, '--break=1', '--ruling=card', `--card=${card}`,
           `--actor=${actor}`, '--channel=soak-replay', '--reason=card the confirmed break and release this head'], {
           entry: () => ({ declaration: recordRedTeamRulingOperation({ readRulingContext: reader }), sinks }),
           stores: { store: createMemoryRunStore(), callLog: createMemoryCallLogStore() },
         });
         check(code === 0 && state.comments.length === original.comments.length + 2, 'write-mode CLI must post one release record and the operator reason');
+        check(published.length === 1 && published[0].repo === repo && published[0].pr === pr && published[0].headSha === head,
+          'the operator card must republish the red-team check for the ruled PR and head exactly once');
+        check(warnings.length === 0, 'the operator card must sync labels and republish without warnings');
       }
       for (let n = 0; n < 3; n++) {
         if (n === 1) state = JSON.parse(JSON.stringify(state)); // restart: only the persisted thread/labels survive
@@ -106,10 +112,36 @@ export default {
         observations.push({ phase: n === 1 ? 'restart' : `tick-${n}`, ...after });
         check(after.hold === null && after.held === 0 && after.clear && !after.blocked, `tick ${n}: release must persist and red-team admission must allow the ready head`);
       }
-      const next = { ...state, headRefOid: 'c'.repeat(40), labels: [...state.labels], comments: [...state.comments, result('c'.repeat(40))] };
+      // The same finding inherits the human card across fresh heads, including cited-line drift.
+      const next = { ...state, headRefOid: 'c'.repeat(40), labels: [...state.labels], comments: [...state.comments, result('c'.repeat(40), { line: 38 })] };
       next.comments.at(-1).createdAt = '2026-10-21T14:00:00Z';
-      const fresh = tick(next);
-      check(fresh.hold && fresh.held === 1 && fresh.blocked && !fresh.clear, 'a fresh confirmed break on a new head must re-hold admission');
+      // Run the real writer before any admission read. It must neither bounce the
+      // fixer nor post a hold/card that would retire the inherited human release.
+      const gateWrites = [];
+      const applied = await applyRedTeamGate({ repo, pr }, {
+        readPr: () => next, readHead: () => next.headRefOid,
+        readSetting: () => ({ value: CONFIRMED_BREAKS_DEFAULTS }), readRound: () => 5,
+        sendBack: args => { gateWrites.push(['send-back', args]); return { ok: true }; },
+        appendSendBackEvent: async () => {}, dequeueSentBack: () => {},
+        fileCard: args => { gateWrites.push(['card', args]); return { ok: true }; },
+        postComment: args => { gateWrites.push(['comment', args]); next.comments.push(bot(args.body)); },
+        log: () => {},
+      });
+      check(applied.status === 'advisory-only' && gateWrites.length === 0,
+        'fresh-head gate writer must skip the inherited card without a send-back, hold, or duplicate card');
+      observations.push({ phase: 'fresh-head-gate-writer', status: applied.status, writes: gateWrites.length });
+      for (const [phase, s] of [['same-finding-new-head', next], ['same-finding-restart', JSON.parse(JSON.stringify(next))]]) {
+        const carried = tick(s);
+        check(carried.hold === null && carried.held === 0 && carried.clear && !carried.blocked,
+          `${phase}: the same carded finding must stay released`);
+        observations.push({ phase, ...carried });
+      }
+      // A changed fingerprint still requires a fresh operator ruling.
+      const changed = { ...next, headRefOid: 'd'.repeat(40), labels: [...next.labels], comments: [...next.comments,
+        result('d'.repeat(40), { summary: 'an earned design decision is applied to the wrong item' })] };
+      changed.comments.at(-1).createdAt = '2026-10-21T15:00:00Z';
+      const fresh = tick(changed);
+      check(fresh.hold && fresh.held === 1 && fresh.blocked && !fresh.clear, 'a changed confirmed break on a new head must re-hold admission');
       observations.push({ phase: 'new-head', ...fresh });
     } catch (error) { violations.push(`scenario failed: ${error.stack ?? error}`); }
     return { violations, observations };

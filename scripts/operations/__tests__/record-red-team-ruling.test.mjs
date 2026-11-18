@@ -1,3 +1,4 @@
+vi.mock('../../lib/red-team-check-run.mjs', () => ({ createLiveCheckPublisher: () => ({ publish: () => ({ ok: true }) }) }));
 /** Cap-held card rulings: declaration and retry-safe automatic filing, with injected IO. */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -318,13 +319,18 @@ describe('automatic card filing with shared durable claims', () => {
   const result = { ok: true, step: 'held', rel: 'backlog/xabcdef-card.md' };
   function fake({ coordinationRoot = root(), initial = thread(), fileCard, postFails, changeAfterReason,
     cardOk = true, noPid = false, transitionFails, liveHead = () => HEAD,
-    env = {}, runGit, readOnPr, readScope = () => OFF, resolveCard = runGit ? undefined : ref => ({ ref, readable: true }) } = {}) {
-    const comments = [...initial], posted = [], cards = [], labelSyncs = [];
+    env = {}, runGit, readOnPr, readScope = () => OFF, resolveCard = runGit ? undefined : ref => ({ ref, readable: true }),
+    publishCheck = vi.fn(() => ({ ok: true })), ledger = ledgerIO() } = {}) {
+    const comments = [...initial], posted = [], cards = [], labelSyncs = [], readBacks = [];
     const actions = createActionStore({ root: coordinationRoot });
     const realTransition = actions.transition;
     if (transitionFails) actions.transition = (...args) => transitionFails(...args) || realTransition(...args);
     const sinks = createRecordRedTeamRulingSinks({ coordinationRoot, actions, env, runGit, readOnPr, readScope, resolveCard,
-      readThread: () => ({ headRefOid: liveHead(), labels: [], comments: [...comments] }),
+      publishCheck, ...ledger,
+      readThread: () => {
+        readBacks.push(comments.at(-1)?.body);
+        return { headRefOid: liveHead(), labels: [], comments: [...comments] };
+      },
       resolveIdentity: () => OP, readStandingRulingScope: () => null,
       fileCard: (input, session, binding) => {
         cards.push(binding);
@@ -338,13 +344,46 @@ describe('automatic card filing with shared durable claims', () => {
       },
       warn: () => {}, syncLabels: a => labelSyncs.push(a),
     });
-    return { actions, cards, comments, posted, labelSyncs, coordinationRoot,
+    return { actions, cards, comments, posted, labelSyncs, readBacks, coordinationRoot, sinks,
       act: p => sinks[RED_TEAM_RULING_CARD_EFFECT](p),
       complete: (landing = { code: 0, result }, binding = cards[0]) => runCardLandingWithReceipt(binding, [], {
         actions, land: async () => landing,
       }),
     };
   }
+
+  it.each(['card-existing', 'card-queued', 'not-real'].flatMap(sink =>
+    ['success', 'refusal', 'throw'].map(mode => [sink, mode])))(
+    'republish after an operator release: %s proves the release before publishing once (%s)', async (sink, mode) => {
+      const atPublish = [];
+      const publishCheck = vi.fn(() => {
+        atPublish.push({ held: heldAfter(f.comments).map(f => f.index), posted: f.posted.at(-1),
+          readBack: f.readBacks.at(-1), labelCount: f.labelSyncs.length });
+        if (mode === 'throw') throw new Error('publisher unavailable');
+        return mode === 'success' ? { ok: true } : { ok: false, reason: 'publisher refused' };
+      });
+      const f = fake({ publishCheck });
+      const p = sink === 'card-existing' ? planRedTeamRuling(read({ comments: f.comments, card }), input({ repo }))
+        : payloadFor(sink === 'not-real' ? { ruling: 'not-real', cause: 'other' } : {});
+      let out;
+      if (sink === 'card-queued') {
+        expect(p.cardRef).toBeFalsy();
+        expect(f.act(p)).toMatchObject({ pending: true, released: false });
+        expect(publishCheck).not.toHaveBeenCalled();
+        expect(heldAfter(f.comments)).toHaveLength(1);
+        await f.complete({ code: 0, result: { ok: true, step: 'done', rel: 'backlog/xabcdef-card.md' } });
+        out = f.act(p);
+        expect(f.cards).toHaveLength(1);
+      } else {
+        out = await f.sinks[p.effect](p);
+      }
+      expect(publishCheck).toHaveBeenCalledTimes(1);
+      expect(publishCheck).toHaveBeenCalledWith({ repo, pr: PR, headSha: HEAD });
+      const outcome = `outcome=operator-${sink === 'not-real' ? 'not-real' : 'card'}`;
+      expect(atPublish).toEqual([{ held: [], posted: expect.stringContaining(outcome),
+        readBack: expect.stringContaining(outcome), labelCount: 1 }]);
+      expect(out.check).toMatchObject({ ok: mode === 'success' });
+    });
 
   it('declares an optional card and dispatches the complete automatic-card payload; preview writes nothing', () => {
     const operation = recordRedTeamRulingOperation({ readRulingContext: () => read({ card: null }) });

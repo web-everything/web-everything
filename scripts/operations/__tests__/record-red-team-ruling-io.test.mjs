@@ -1,3 +1,4 @@
+vi.mock('../../lib/red-team-check-run.mjs', () => ({ createLiveCheckPublisher: () => ({ publish: () => ({ ok: true }) }) }));
 /** Live existing-card reader, sink and CLI subset; all IO injected. */
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -10,7 +11,7 @@ import { CONFIRMED_BREAKS_DEFAULTS, redTeamGateMarker, readRedTeamDisposition, l
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
 import { buildStandingRulingBody, pickStandingRuling } from '../../conveyor/standing-ruling-mark.mjs';
 import { standingRulingScope } from '../../conveyor/standing-ruling-io.mjs';
-import { planRedTeamRuling, selectBreaks, recordRedTeamRulingOperation, buildRuleReasonComment, RED_TEAM_RULING_CARD_EFFECT, RED_TEAM_RULING_BLOCK_EFFECT } from '../record-red-team-ruling.mjs';
+import { planRedTeamRuling, selectBreaks, recordRedTeamRulingOperation, buildRuleReasonComment, RED_TEAM_RULING_CARD_EFFECT, RED_TEAM_RULING_BLOCK_EFFECT, RED_TEAM_RULING_NOT_REAL_EFFECT } from '../record-red-team-ruling.mjs';
 import { operatorBoundComments } from '../../lib/operator-identity.mjs';
 
 import { createRecordRedTeamRulingReader, createRecordRedTeamRulingSinks } from '../record-red-team-ruling-io.mjs';
@@ -32,24 +33,42 @@ const read = (over = {}) => ({ identity: OP, card, head: HEAD, labels: [{ name: 
 const input = (over = {}) => ({ repo, pr: PR, card: CARD, break: '1', ruling: 'card', actor: 'chalbert', channel: 'claude-code-chat', reason: 'card it, ship the PR', ...over });
 
 function fake({ liveHead = HEAD, labels = [], identity = OP, author = 'chalbert', initial = thread(), failPost = 0,
-  readStandingRulingScope = () => null } = {}) {
+  readStandingRulingScope = () => null, publishCheck = vi.fn(() => ({ ok: true })), warn = vi.fn() } = {}) {
   const comments = [...initial], posted = [], labelSyncs = [];
   let attempts = 0;
   const sinks = createRecordRedTeamRulingSinks({
     readThread: () => ({ headRefOid: liveHead, labels, comments: [...comments] }),
     resolveIdentity: () => identity,
     resolveCard: () => card,
-    readStandingRulingScope,
+    readStandingRulingScope, publishCheck, appendEvents: async () => {},
     post: (r, n, body) => {
       if (++attempts === failPost) throw new Error('transient post failure');
       posted.push(body); comments.push({ author: { login: author }, createdAt: '2026-10-20T23:55:00Z', body });
     },
-    warn: () => {}, syncLabels: a => { labelSyncs.push(a); return { add: null, remove: [] }; },
+    warn, syncLabels: a => { labelSyncs.push(a); return { add: null, remove: [] }; },
   });
-  return { sinks, comments, posted, labelSyncs };
+  return { sinks, comments, posted, labelSyncs, publishCheck, warn };
 }
 const payloadFor = (over = {}, readOver = {}) => planRedTeamRuling(read(readOver), input(over));
 const heldAfter = comments => readRedTeamDisposition({ comments, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS }).held;
+
+it('default publishCheck builds the publisher with the sink env and forwards repo, pr, headSha', () => {
+  const comments = thread();
+  const env = { WE_TEST_PUBLISHER: 'sink environment' };
+  const publish = vi.fn(() => ({ ok: true }));
+  const createCheckPublisher = vi.fn(() => ({ publish }));
+  const sinks = createRecordRedTeamRulingSinks({ env, createCheckPublisher,
+    readThread: () => ({ headRefOid: HEAD, labels: [], comments }),
+    readStandingRulingScope: () => null, resolveIdentity: () => OP, resolveCard: () => card,
+    post: (_repo, _pr, body) => comments.push({ author: OP, createdAt: '2026-10-20T23:55:00Z', body }),
+    syncLabels: () => {}, warn: message => { throw new Error(message); },
+  });
+  sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor());
+  expect(createCheckPublisher).toHaveBeenCalledTimes(1);
+  expect(createCheckPublisher).toHaveBeenCalledWith({ env });
+  expect(publish).toHaveBeenCalledTimes(1);
+  expect(publish).toHaveBeenCalledWith({ repo, pr: PR, headSha: HEAD });
+});
 
 describe('published backing cards at the production reader and release boundary', () => {
   const file = '6935-prevention-require-named-refusal-and-post-failure-coverage-f.md';
@@ -289,7 +308,7 @@ describe('existing-card IO', () => {
     expect(heldAfter(comments)).toHaveLength(1);
     const result = sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor());
 
-    expect(result).toEqual({ ruling: 'card', head: HEAD, indices: [1], card: { ref: CARD }, labels: null });
+    expect(result).toEqual({ ruling: 'card', head: HEAD, indices: [1], card: { ref: CARD }, labels: null, check: { ok: true } });
     expect(posted).toHaveLength(2);
     expect(heldAfter(comments)).toEqual([]);
     expect(readRedTeamDisposition({ comments, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS }).sendBack).toEqual([]);
@@ -589,4 +608,30 @@ describe('standalone CLI', () => {
     expect(heldAfter(f.comments)).toHaveLength(preview ? 1 : 0);
     expect(f.labelSyncs).toHaveLength(preview ? 0 : 1);
   });
+});
+
+
+describe('republish after an operator release', () => {
+  it.each(['success', 'refusal', 'throw'])('publishes after the card record is proved and survives %s', mode => {
+    const publishCheck = vi.fn(() => {
+      expect(heldAfter(f.comments)).toEqual([]);
+      expect(f.labelSyncs).toHaveLength(1);
+      if (mode === 'throw') throw Error('publisher unavailable');
+      return mode === 'success' ? { ok: true } : { ok: false, reason: 'publisher refused' };
+    });
+    const f = fake({ publishCheck });
+    const out = f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor());
+    expect(publishCheck).toHaveBeenCalledTimes(1);
+    expect(publishCheck).toHaveBeenCalledWith({ repo, pr: PR, headSha: HEAD });
+    expect(out.check).toMatchObject({ ok: mode === 'success' });
+    expect(f.warn).toHaveBeenCalledTimes(mode === 'success' ? 0 : 1);
+  });
+});
+
+it('republishes after a not-real ruling reaches the ledger and trusted thread', async () => {
+  const f = fake();
+  const out = await f.sinks[RED_TEAM_RULING_NOT_REAL_EFFECT](payloadFor({ ruling: 'not-real', card: undefined, cause: 'other' }));
+  expect(out).toMatchObject({ ruling: 'not-real', check: { ok: true } });
+  expect(f.publishCheck).toHaveBeenCalledWith({ repo, pr: PR, headSha: HEAD });
+  expect(heldAfter(f.comments)).toEqual([]);
 });

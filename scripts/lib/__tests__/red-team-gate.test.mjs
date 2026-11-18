@@ -563,3 +563,82 @@ describe('planRedTeamActions: class deferral × confirmed × impact', () => {
     expect(where(planRedTeamActions({ findings: [f] }, setting), f)).toBe('sendBack');
   });
 });
+
+
+describe('operator card fingerprints across fresh results on later heads', () => {
+  const pr = 7001, old = 'b'.repeat(40), head = 'c'.repeat(40);
+  const result = (rev, overrides = {}) => ({ author: { login: 'web-everything' }, body: renderRedTeamComment({
+    pr, rev, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes', findings: [{
+      summary: 'Snapshot writer escapes retirement.', category: 'edge-case', impactIfUnfixed: 'broken',
+      file: 'scripts/core.mjs', line: 325, confirmedByRecheck: true, ...overrides,
+    }] }) });
+  it.each(['match', 'title', 'backtick', 'punctuation', 'file', 'category', 'bot', 'wrong-result', 'other-pr', 'not-real', 'block'])(
+    'carries only a human card bound to a matching fingerprint: %s', mode => {
+      const prior = result(old);
+      const id = redTeamResultId(parseRedTeamComment(prior.body));
+      const ruling = { author: { login: mode === 'bot' ? 'web-everything' : 'chalbert' },
+        body: redTeamGateMarker(mode === 'other-pr' ? pr + 1 : pr, old,
+          mode === 'not-real' ? 'operator-not-real' : mode === 'block' ? 'operator-block' : 'operator-card',
+          mode === 'wrong-result' ? '0'.repeat(16) : id)
+          + '\n- 1 finding(s) carded by the operator to `we:backlog/follow-up.md` (#1).' };
+      const next = result(head, { line: 331,
+        summary: mode === 'title' ? 'Different break'
+          : mode === 'backtick' ? 'Snapshot `writer` escapes retirement.'
+          : mode === 'punctuation' ? 'Snapshot writer escapes retirement!'
+          : '  Snapshot writer   escapes retirement. ',
+        file: mode === 'file' ? 'scripts/other.mjs' : './scripts/core.mjs',
+        category: mode === 'category' ? 'failing-input' : 'edge-case' });
+      const d = readRedTeamDisposition({ comments: [prior, ruling, next], pr, head,
+        setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true }, sealed: null });
+      expect([...d.held, ...d.sendBack]).toHaveLength(mode === 'match' ? 0 : 1);
+      if (mode === 'match') expect(d.dispositions.get(1)).toMatchObject({ state: 'released carded', by: { source: 'operator' } });
+    });
+  const carded = (priorOver, nextOver, mutate = r => r) => {
+    const prior = result(old, priorOver);
+    const ruling = { author: { login: 'chalbert' }, body: redTeamGateMarker(pr, old, 'operator-card',
+      redTeamResultId(parseRedTeamComment(prior.body))) + '\n- 1 finding(s) carded by the operator to `we:backlog/follow-up.md` (#1).' };
+    const d = readRedTeamDisposition({ comments: mutate([prior, ruling, result(head, { line: 331, ...nextOver })]), pr, head,
+      setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true }, sealed: null });
+    return [...d.held, ...d.sendBack].length;
+  };
+  const cls = findingClass => ({ findingClass, classBasis: 'basis' });
+  it('re-raises when the finding class differs, carries when it is the same', () => {
+    expect(carded(cls('live-reproduced'), cls('live-reproduced'))).toBe(0);
+    expect(carded(cls('live-reproduced'), cls('correctness-in-normal-use'))).toBe(1);
+  });
+  it('re-raises when the scenario snippet changes, carries when only the line moves', () => {
+    expect(carded({ failure_scenario: 'writer drops row' }, { failure_scenario: 'writer drops row' })).toBe(0);
+    expect(carded({ failure_scenario: 'writer drops row' }, { failure_scenario: 'writer drops the whole table' })).toBe(1);
+  });
+  it('keeps decimal points and identifier case: version 1.2 vs 12 and Foo vs foo re-raise', () => {
+    expect(carded({ summary: 'Pinned to version 1.2.' }, { summary: 'Pinned to version 1.2.' })).toBe(0);
+    expect(carded({ summary: 'Pinned to version 1.2.' }, { summary: 'Pinned to version 12.' })).toBe(1);
+    expect(carded({ failure_scenario: 'key Foo is read' }, { failure_scenario: 'key foo is read' })).toBe(1);
+  });
+  it('summary case is kept: key Foo vs key foo re-raises', () => {
+    expect(carded({ summary: 'Reject key Foo.' }, { summary: 'Reject key Foo.' })).toBe(0);
+    expect(carded({ summary: 'Reject key Foo.' }, { summary: 'Reject key foo.' })).toBe(1);
+  });
+  it('quotes and brackets are kept: key "a" vs key a re-raises', () => {
+    expect(carded({ summary: 'Reject key "a".' }, { summary: 'Reject key "a".' })).toBe(0);
+    expect(carded({ summary: 'Reject key "a".' }, { summary: 'Reject key a.' })).toBe(1);
+    expect(carded({ summary: 'Reject list [a].' }, { summary: 'Reject list a.' })).toBe(1);
+  });
+  it('one card releases one fresh finding: a second finding with the same fingerprint stays held', () => {
+    const prior = result(old);
+    const ruling = { author: { login: 'chalbert' }, body: redTeamGateMarker(pr, old, 'operator-card',
+      redTeamResultId(parseRedTeamComment(prior.body))) + '\n- 1 finding(s) carded by the operator to `we:backlog/follow-up.md` (#1).' };
+    const f = line => ({ summary: 'Snapshot writer escapes retirement.', category: 'edge-case', impactIfUnfixed: 'broken',
+      file: 'scripts/core.mjs', line, confirmedByRecheck: true });
+    const next = { author: { login: 'web-everything' }, body: renderRedTeamComment({ pr, rev: head, provider: 'codex',
+      model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes', findings: [f(331), f(900)] }) };
+    const d = readRedTeamDisposition({ comments: [prior, ruling, next], pr, head, setting: CONFIRMED_BREAKS_DEFAULTS,
+      operatorRulings: { anyState: true }, sealed: null });
+    expect([...d.held, ...d.sendBack]).toHaveLength(1);
+  });
+  it('fails closed: an unreadable or truncated ruling record carries nothing', () => {
+    expect(carded({}, {}, rs => [rs[0], { author: { login: 'chalbert' }, body: null }, rs[2]])).toBe(1);
+    expect(carded({}, {}, rs => [rs[0], { author: { login: 'chalbert' }, body: rs[1].body.slice(0, 20) }, rs[2]])).toBe(1);
+    expect(carded({}, {}, rs => [rs[0], rs[2]])).toBe(1);
+  });
+});

@@ -14,6 +14,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveDisposition } from '../lib/red-team-disposition.mjs';
 import { liveResultGateState, readConfirmedBreaks, readOperatorRulings, readRedTeamDisposition, redTeamGateMarker } from '../lib/red-team-gate.mjs';
+import { createLiveCheckPublisher } from '../lib/red-team-check-run.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { resolveCardRef } from './record-referral-ruling-io.mjs';
 import { CARD_REF_RE, readCardAtPrHead, referralCardReadable } from '../lib/referral-card-readable.mjs';
@@ -203,6 +204,8 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
   post = (repo, pr, body, actor) => gh(['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'], body, env, actor),
   runSetLabel = execFileSync, appendEvents = appendLedgerEvents,
   readEvents = repo => readLedgerEventsFromStore(repo, { env }),
+  createCheckPublisher = createLiveCheckPublisher,
+  publishCheck = args => createCheckPublisher({ env }).publish(args),
   syncLabels = ({ repo, pr, head }) => syncRedTeamStatusLabels({ repo, pr, head, env }),
   warn = (m) => process.stderr.write(`${m}\n`), now = () => new Date().toISOString() } = {}) {
   // An opt-out takes effect on retries too; a later opt-in cannot widen the approved plan.
@@ -278,6 +281,13 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
     try { return syncLabels({ repo: p.repo, pr: p.pr, head: p.head }); }
     catch (e) { warn(`red-team-status-label-miss: ${p.repo}#${p.pr}: ${String(e?.message ?? e)}`); return null; }
   };
+  const republish = p => {
+    let outcome;
+    try { outcome = publishCheck({ repo: p.repo, pr: p.pr, headSha: p.head }); }
+    catch (e) { outcome = { ok: false, reason: String(e?.message ?? e) }; }
+    if (outcome?.ok !== true) warn(`red-team-check-publish-miss: ${p.repo}#${p.pr}: ${outcome?.reason ?? 'unreadable publisher outcome'}`);
+    return outcome ?? { ok: false, reason: 'unreadable publisher outcome' };
+  };
   const reasonBody = (p, cardNote) => judgeEvidenceComment(p.judgeEvidence) + buildRuleReasonComment({ head: p.head, ruling: p.ruling, actor: p.actor, channel: p.channel,
     at: p.at, reason: p.reason, findings: p.findings, cardNote, cause: p.cause ?? null });
   // Only judge block records carry the distinct actor and attribution.
@@ -309,7 +319,7 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
         recheck(p, 'reason posted; no release record written');
         post(p.repo, p.pr, record, p.actor);
         proveReleased(p, 'the operator-card record', record);
-        return { ruling: 'card', head: p.head, indices: p.indices, card: { ref: p.cardRef }, labels: resync(p) };
+        return { ruling: 'card', head: p.head, indices: p.indices, card: { ref: p.cardRef }, labels: resync(p), check: republish(p) };
       }
       assertRulingCardInputFits(p.cardInput);
       const pending = conflictingPendingCardJobs(comments, p);
@@ -422,7 +432,7 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
       recheck(p, 'card queued and reason posted; no release record written');
       post(p.repo, p.pr, record, p.actor);
       proveReleased(p, 'the operator-card record', record);
-      return { ruling: 'card', head: p.head, indices: p.indices, card, labels: resync(p) };
+      return { ruling: 'card', head: p.head, indices: p.indices, card, labels: resync(p), check: republish(p) };
     },
     [RED_TEAM_RULING_NOT_REAL_EFFECT]: async (p) => {
       if (p.actor === JUDGE_ACTOR) assertJudgeAuthority({}, p);
@@ -443,7 +453,7 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
       recheck(p, 'reason posted and ledger recorded; no release record written');
       post(p.repo, p.pr, record, p.actor);
       proveReleased(p, 'the not-real record', record);
-      return { ruling: 'not-real', head: p.head, indices: p.indices, cause: p.cause ?? null, labels: resync(p) };
+      return { ruling: 'not-real', head: p.head, indices: p.indices, cause: p.cause ?? null, labels: resync(p), check: republish(p) };
     },
     [RED_TEAM_RULING_BLOCK_EFFECT]: async (p) => {
       // Each invocation reconstructs progress; no process-local receipt can stand in for durable facts.

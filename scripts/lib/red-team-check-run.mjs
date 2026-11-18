@@ -10,7 +10,7 @@ import { createHash } from 'node:crypto';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { LEGACY_ROLE, ROLE_ENV } from './github-app-identity.mjs';
 import { resolveCascade, platformPreference, formatCascadeSourcesLine } from './policy-cascade.mjs';
-import { isPublishableRedTeamResult, readRedTeamDisposition, redTeamForHead, redTeamResultId, redTeamResultRecordTimes } from './red-team-gate.mjs';
+import { isPublishableRedTeamResult, readRedTeamDisposition, redTeamForHead, redTeamResultId, redTeamResultRecordTimes, redTeamOperatorRulingTimes } from './red-team-gate.mjs';
 import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
 import { REVIEW_HOLD_LABELS } from './review-escalation.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
@@ -452,8 +452,10 @@ function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = ru
         // Parsed dispositions omit comment metadata. Bind the clock evidence to the same trusted
         // head/result, never a later unrelated comment. Ambiguous legacy timestamps cannot clear failure.
         // Read the records exactly as the disposition reader does, so a carried result is dated by its carry.
-        const dates = redTeamResultRecordTimes(comments, pr, headSha, redTeamResultId(disposition.result));
-        // A result produced during a round cannot resolve that round's later failure.
+        const resultId = redTeamResultId(disposition.result);
+        const dates = [...redTeamResultRecordTimes(comments, pr, headSha, resultId),
+          ...redTeamOperatorRulingTimes(comments, pr, headSha, resultId, { env, repo, standingRuling })];
+        // A result or trusted releasing ruling must postdate the failed round.
         const failedAt = Date.parse(latest.completed_at);
         if (!dates.length || dates.some(date => !Number.isFinite(date)) || !Number.isFinite(failedAt)
           || Math.max(...dates) <= failedAt)
