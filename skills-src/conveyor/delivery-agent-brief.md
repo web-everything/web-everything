@@ -377,6 +377,23 @@ exported from the design artifact). A brand-new surface with no target must **no
 nobody has drawn its baseline yet — you STILL Read the screenshot and do the by-eye pass (2), and note the
 documented skip on the automated diff. The automated layer only bites once a baseline is committed.
 
+### 7a. Quality bar before the PR: related tests, Codex audit (R968), PREP block, public text (R971)
+
+Run these four, in this order, after step 7 and before step 8's `open-pr`.
+
+1. **Related tests green on the exact commit, BEFORE the audit.** Commit, then run the diff-driven related-test
+   selection (`verify-lane.mjs request`/`check`, no explicit `--gate` override). Any later code change invalidates the
+   audit record and its waiver binding, so do not change code after this point without re-running both.
+2. **Codex audit on the net diff.** Push the commit, then run
+   `node scripts/operations/run.mjs codex-audit --base=origin/main --head=<40-hex sha of your lane HEAD>` from the lane.
+   Open the PR only on the verdict `NOT WEAKENED`. On `WEAKENED`: fix the findings, re-test, re-audit; at most 2 repair
+   rounds. A new finding class in round 3 means stop and return `not-ready (audit-non-convergence)` with the findings;
+   never open the PR over a `WEAKENED` verdict and never write a waiver yourself.
+3. **PREP block in the PR body.** `open-pr --bodyFile=<file>` needs the block from `docs/agent/prep-gate.md`
+   (`PREP:` then `Acceptance:`, `Pre-mortem:`, `Files:`, `Tests:`, each with a real item of 8+ non-whitespace characters).
+4. **Public text carries no machine names or paths (R971).** Commit messages, PR bodies, comments, tests and docs must
+   not contain machine or host names, home-directory paths or usernames; use repo-relative paths and generic words.
+
 ### 8. Resolve the card in the lane, commit, publish HEAD to the `lane/...` ref + open the PR (label green ONLY after `test` passes)
 
 **Resolve the card FIRST — here, in the lane clone, just before the commit, and never earlier.** Resolving is the
