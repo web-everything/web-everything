@@ -4267,7 +4267,9 @@ resolved runs directory. The run-store writer updates it fail-soft under a file 
 open-PR context advances one persisted backfill cursor (50 review records total per tick). Partial
 backfills are staged, never published. Indexed payloads still pass the same PR/head, ordering and
 unfinished-review checks. Missing/corrupt/unverified/overflowed hints take the original bounded scan;
-`scan-capped` still holds. Index bounds are 512 PR keys, 32 ids per key and 1 MiB per file. Per-PR
+`scan-capped` still holds. Indexed payload read attempts and the fallback share one
+`runs.scan.maxParses` budget, including failed reads; cached indexed payloads count once.
+Index bounds are 512 PR keys, 32 ids per key and 1 MiB per file. Per-PR
 overflow becomes an empty sentinel, forcing fallback instead of silently discarding a review.
 On a persistent backfill error or overflow, inspect omitted records manually; the index cannot clear
 unknown evidence. The scoped regressions are `review-run-index`, `drain-red-team-evidence`,

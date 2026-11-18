@@ -11,7 +11,7 @@ import { hostname } from 'node:os';
 import { foreignStaleOwnerDead } from './red-team-foreign-host-stale.mjs';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { isRunRecordTerminal, listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operations/run-store.mjs';
-import { createNewestRunFinder, RUN_SCAN_CAPPED } from './stream-filter-runs.mjs';
+import { createNewestRunFinder, resolveRunScanSettings, RUN_SCAN_CAPPED } from './stream-filter-runs.mjs';
 import { readReviewRunIndex } from './review-run-index.mjs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { pidNamespace, pidStartTime } from './pid-alive.mjs';
@@ -423,23 +423,44 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     return completeReads.get(settleAt);
   };
   const indexReads = new Map(); // at most the bounded index ids; reuse on fallback, never parse a hint twice
+  const setting = resolveRunScanSettings(scanSettings);
+  const maxParses = setting.value.scan.maxParses;
+  let parsed = 0;
+  const budgetExhausted = Symbol('shared review parse budget exhausted');
   const runScan = (indexedIds) => {
     const slots = Object.fromEntries(TIE_ORDERS.map(order => [order, { newer: newerBy(order), newest: null, exact: null, unfinished: null, unfinishedExact: null, since: -Infinity, active: -Infinity, undecided: true }]));
     const startless = []; // ids and mtimes only, never payloads
+    const mtimes = new Map();
     let count = 0, newestSettled = false, boundary = -Infinity;
     // The read window is fixed in one order (equal mtimes by ascending id) for every caller: the tie
     // order only ranks matches in the slots. Otherwise equal mtimes straddling the cap would put
     // different records in the drain's and recovery's windows, and the two could disagree.
     const find = createNewestRunFinder({ ids: indexedIds ?? list(runsDir).filter(id => id.startsWith('review-pr-')), tieBreak: 'id-asc',
-      stat: id => stat(join(runsDir, `${id}.json`)), read: id => {
-        const run = indexReads.has(id) ? indexReads.get(id) : read(id, runsDir);
+      stat: id => {
+        const metadata = stat(join(runsDir, `${id}.json`));
+        mtimes.set(id, metadata.mtimeMs);
+        return metadata;
+      }, read: id => {
+        if (!indexReads.has(id) && parsed >= maxParses) {
+          // This record remains unread: preserve its boundary for the existing capped-scan rules.
+          boundary = mtimes.get(id);
+          (warn ?? console.warn)(`runs.scan.maxParses=${maxParses} (source: ${setting.sources['scan.maxParses']}) reached: scan-capped; HOLD and inspect omitted runs before increasing the setting`);
+          throw budgetExhausted;
+        }
+        let run;
+        if (indexReads.has(id)) run = indexReads.get(id);
+        else {
+          parsed++; // Failed reads also consume the shared budget.
+          run = read(id, runsDir);
+        }
         if (indexedIds) indexReads.set(id, run);
         if (indexedIds && (run?.id !== id || run.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr))) {
           throw Error('unverified review index entry');
         }
         return run;
       }, scanSettings, warn });
-    const end = find((run, id, at, nextAt) => {
+    let end;
+    try { end = find((run, id, at, nextAt) => {
       if (run?.op === 'review-pr' && run.input?.repo === repo && Number(run.input?.pr) === Number(pr)) {
         const hit = { run, id, at };
         if (!abandonedReview(hit, now)) {
@@ -467,7 +488,10 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
       boundary = nextAt;
       if (newest !== null && reviewStartedAt(newest) > nextAt + RUN_MTIME_SLACK_MS) newestSettled = true;
       return !indexedIds && exact !== null && reviewStartedAt(exact) > nextAt + RUN_MTIME_SLACK_MS;
-    });
+    }); } catch (error) {
+      if (error !== budgetExhausted) throw error;
+      end = RUN_SCAN_CAPPED;
+    }
     scan = { slots, startless, count, end, newestSettled, boundary };
   };
   const failureFor = (order, exactHead, writtenAfter, newestHead) => {

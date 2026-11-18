@@ -41,6 +41,31 @@ it.each(['miss', 'corrupt', 'other PR', 'other head', 'missing record'])('%s ind
   if (kind === 'missing record') io.read = id => { if (id === f.run.id) throw Error('missing'); return null; };
   expect(readDrainRedTeamEvidence({ ...f, ...io })).toMatchObject({ ok: false, reason: 'scan-capped' });
 });
+it.each([readDrainRedTeamEvidence, readRecoveryWitness])('index fallback shares one payload-read budget (%#)', reader => {
+  for (const { indexedCount, overlap, throws } of [
+    { indexedCount: 1 }, { indexedCount: 3 }, { indexedCount: 3, overlap: true }, { indexedCount: 1, throws: true },
+  ]) {
+    const f = fixture();
+    f.run.findings.read.netBasis.rev = 'b'.repeat(40);
+    const indexed = Array.from({ length: indexedCount }, (_, i) => ({ ...f.run, id: i ? `review-pr-index-${i}` : f.run.id }));
+    let reads = 0, fail = false;
+    const io = {
+      list: () => [...indexed.map(run => run.id), ...Array.from({ length: 301 }, (_, i) => `review-pr-new-${i}`)],
+      stat: path => ({ mtimeMs: indexed.some(run => path.endsWith(`${run.id}.json`)) ? (overlap ? 200_000 : 2000) : 100_000 }),
+      read: id => {
+        reads++;
+        if (fail && throws && id === f.run.id) throw Error('unreadable indexed payload');
+        return indexed.find(run => run.id === id) ?? null;
+      },
+      reset: () => { reads = 0; }, warn: () => {},
+    };
+    completeIndex(f, io);
+    fail = true;
+    expect(reader({ ...f, ...io, scanSettings: { file: { runs: { scan: { maxParses: 300 } } }, platform: {}, env: {} } }))
+      .toMatchObject({ ok: false, reason: 'scan-capped' });
+    expect(reads).toBe(300);
+  }
+});
 it('run writer populates the index and index write failure never fails the run', () => {
   const f = fixture(); writeRun(f.run, f.runsDir);
   expect(readReviewRunIndex(f.runsDir, f.repo, f.pr)).toEqual([]); // appending alone proves no completeness
