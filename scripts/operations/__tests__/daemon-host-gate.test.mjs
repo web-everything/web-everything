@@ -507,6 +507,119 @@ describe('runGate while the daemon runs', () => {
   });
 });
 
+describe('A3 ownership is read remotely on every poll; no cache is trusted or written', () => {
+  const tick = () => new Promise((r) => setTimeout(r, 5));
+  const STALE_ACTIVE = { host: HOST_A, version: 'stale-cache', readAt: 0 };
+
+  /** A harness whose source also offers a stale ACTIVE cache; every property the gate touches on it is recorded. */
+  function withCache(owners) {
+    const h = harness({ owners });
+    const cache = {
+      entry: STALE_ACTIVE, reads: 0, writes: 0,
+      read() { this.reads += 1; return this.entry; },
+      write(value) { this.writes += 1; this.entry = value; },
+    };
+    const touched = new Set();
+    const inner = h.deps.source;
+    inner.cache = cache;
+    inner.readCache = () => cache.read();
+    inner.writeCache = (value) => cache.write(value);
+    h.deps.source = new Proxy(inner, {
+      get(target, prop, receiver) { touched.add(String(prop)); return Reflect.get(target, prop, receiver); },
+      set(target, prop, value, receiver) { touched.add(`set:${String(prop)}`); return Reflect.set(target, prop, value, receiver); },
+      defineProperty(target, prop, descriptor) { touched.add(`define:${String(prop)}`); return Reflect.defineProperty(target, prop, descriptor); },
+    });
+    h.deps.killGraceMs = 10;
+    return { h, cache, touched };
+  }
+  const expectNoCacheUse = ({ cache, touched }) => {
+    expect(cache.reads).toBe(0);
+    expect(cache.writes).toBe(0);
+    expect(cache.entry).toBe(STALE_ACTIVE);
+    expect([...touched]).toEqual(['readOwner']);
+  };
+
+  it.each([
+    ['other', { host: HOST_B, version: 'file' }, 'other'],
+    ['unset', { host: '', version: 'unset' }, 'unset'],
+    ['thrown read', new Error('rate limited'), 'unreadable'],
+    ['malformed read', { host: 'bad host!', version: 'file' }, 'unreadable'],
+  ])('A3 a stale active cache is ignored and never written: remote %s keeps standby', async (_label, remote, owner) => {
+    const rig = withCache([remote]);
+    rig.h.deps.maxPolls = 4;
+    expect(await runGate({ cmd: 'd', args: [] }, rig.h.deps)).toBe(75);
+    expect(rig.h.spawns).toHaveLength(0);
+    expect(rig.h.polls()).toBe(4);
+    expect(rig.h.logs).toEqual(Array(4).fill(`host-gate: standby owner=${owner} self=${HOST_A}`));
+    expectNoCacheUse(rig);
+  });
+
+  it('A3 makes a remote read on each standby poll, even while a cache says active', async () => {
+    const rig = withCache([{ host: HOST_B, version: 'file' }]);
+    rig.h.deps.maxPolls = 7;
+    await runGate({ cmd: 'd', args: [] }, rig.h.deps);
+    expect(rig.h.polls()).toBe(7);
+    expectNoCacheUse(rig);
+  });
+
+  it('A3 makes a remote read on each poll while the daemon runs and revokes on a remote standby, ignoring a stale active cache', async () => {
+    const rig = withCache([
+      { host: HOST_A, version: 'file' }, { host: HOST_A, version: 'file' },
+      { host: HOST_A, version: 'file' }, { host: HOST_B, version: 'file' },
+    ]);
+    const ticks = [];
+    rig.h.deps.watchSleep = () => new Promise((r) => ticks.push(r));
+    rig.h.deps.maxPolls = 1;
+    const run = runGate({ cmd: 'd', args: [] }, rig.h.deps);
+    await tick();
+    expect(rig.h.polls()).toBe(1);
+    for (let n = 1; n <= 2; n += 1) {
+      ticks[n - 1]();
+      await tick();
+      expect(rig.h.polls()).toBe(1 + n);
+      expect(rig.h.children[0].kills).toEqual([]);
+    }
+    ticks[2]();
+    await tick();
+    expect(rig.h.polls()).toBe(4);
+    expect(rig.h.children[0].kills).toContain('SIGTERM');
+    rig.h.children[0].emit('exit', null, 'SIGTERM');
+    expect(await run).toBe(75);
+    expect(rig.h.spawns).toHaveLength(1);
+    expectNoCacheUse(rig);
+  });
+
+  it('A3 a remote read error while the daemon runs revokes it despite a stale active cache', async () => {
+    const rig = withCache([{ host: HOST_A, version: 'file' }, new Error('unavailable')]);
+    const ticks = [];
+    rig.h.deps.watchSleep = () => new Promise((r) => ticks.push(r));
+    rig.h.deps.maxPolls = 1;
+    const run = runGate({ cmd: 'd', args: [] }, rig.h.deps);
+    await tick();
+    ticks[0]();
+    await tick();
+    expect(rig.h.children[0].kills).toContain('SIGTERM');
+    rig.h.children[0].emit('exit', null, 'SIGTERM');
+    expect(await run).toBe(75);
+    expect(rig.h.logs).toContain(`host-gate: owner=unreadable self=${HOST_A}; stopping daemon, back to standby`);
+    expectNoCacheUse(rig);
+  });
+
+  it('A3 the cache spies are live: a source that does consult the cache is observed', async () => {
+    const rig = withCache([]);
+    rig.h.deps.source.readOwner = async () => rig.cache.read();
+    rig.h.deps.maxPolls = 1;
+    expect(await runGate({ cmd: 'd', args: [] }, rig.h.deps)).toBe(75);
+    expect(rig.cache.reads).toBe(1);
+    expect(rig.h.spawns).toHaveLength(0); // the raw cache entry is not a valid owner result either
+  });
+
+  it('A3 the gate module has no cache or file-write path of its own', () => {
+    const cli = readFileSync(fileURLToPath(new URL('../daemon-host-gate.mjs', import.meta.url)), 'utf8');
+    expect(cli).not.toMatch(/cache|writeFile|appendFile|createWriteStream|renameSync|mkdirSync|readFileSync|openSync|copyFile/i);
+  });
+});
+
 describe('isEntrypoint', () => {
   it('matches through a symlinked argv path', () => {
     expect(isEntrypoint('file:///private/tmp/a/g.mjs', '/tmp/a/g.mjs', () => '/private/tmp/a/g.mjs')).toBe(true);
