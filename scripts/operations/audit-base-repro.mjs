@@ -1,6 +1,6 @@
 /** @file Pure base-reproduction protocol and fail-closed classification; no worktrees, cards or callers wired. */
 import { createHash } from 'node:crypto';
-import { FINDING_CLASSES, matchesSome } from './audit-verdict.mjs';
+import { FINDING_CLASSES, matchesSome, debtCardVerified, productionFindingBlocks } from './audit-verdict.mjs';
 import { GUARD_FLOOR, AUDITOR_FLOOR, REVIEW_AUTH_FLOOR, LOCK_PRIMITIVES, LOCK_HOLDERS, LOCK_USERS } from '../lib/audit-settings.mjs';
 import { findingKey, parseFindingLocation, symbolAt, symbolRangeAt } from '../lib/audit-finding-key.mjs';
 
@@ -53,19 +53,29 @@ export function parseReproAnswer(text, count) {
   return invalidEnvelope ? Array.from({ length: count }, unknown) : result;
 }
 
-/** Findings: strings, or {text,file,line,class,symbol,sourceText}; sourceText is HEAD, never base.
- * IO seams are synchronous: readBaseFile(path) returns git-show base:path text, cardWritten(key) returns true.
+/** Findings: strings, or {text,file,line,class,symbol,sourceText,card}; sourceText is HEAD, never base.
+ * IO seams are synchronous: readCard(path) returns trusted persisted card text, never model text.
+ * cardWritten(key) returns true, or {written, expedite, needsYou} confirmations for security findings.
  * changedLines must be a Map; absent files in a complete diff have no changed lines.
  */
 export function classifyPreExisting({ findings, answers, baseSha, headSha, readBaseFile, changedLines, recheckMax, cardWritten,
-  protectedPaths, isProtectedPath = path => !Array.isArray(protectedPaths) || protectedPath(path, protectedPaths) }) {
+  auditPolicy, readCard, now, protectedPaths, isProtectedPath = path => !Array.isArray(protectedPaths) || protectedPath(path, protectedPaths) }) {
   return findings.map((finding, i) => {
     const block = reason => ({ blocking: true, reason: `${reason}; human review required` });
     try {
+      if (!auditPolicy || !['prod', 'prerelease'].includes(auditPolicy.releaseStage)
+        || typeof auditPolicy.requirePayBy !== 'boolean' || typeof auditPolicy.requireOnMain !== 'boolean') return block('audit policy unavailable');
       if (!Number.isSafeInteger(recheckMax) || i >= recheckMax) return block('recheck limit');
       const a = answers?.[i];
       if (!baseSha || !headSha || a?.status !== 'REPRODUCES' || a.relation !== 'SAME') return block('base reproduction is not SAME');
       if (!PREEXISTING_ELIGIBLE.includes(a.class) || (finding?.class && finding.class !== a.class)) return block('ineligible or conflicting class');
+      if (productionFindingBlocks(a.class, auditPolicy.releaseStage)) return block('production finding');
+      // Pay-by authority is the persisted card, just as in computeVerdict. The model may name a card but cannot set its date.
+      // D5: the held card is checked below; requireOnMain does not add a second existence check here.
+      const body = typeof finding?.card === 'string' && /^backlog\/[A-Za-z0-9._-]+\.md(?![\s\S])/.test(finding.card)
+        ? readCard(finding.card) : null;
+      if (!debtCardVerified(body, auditPolicy.releaseStage, { requirePayBy: auditPolicy.requirePayBy,
+        requireOnMain: false, now })) return block('debt pay-by policy');
       const text = findingText(finding), location = parseFindingLocation(text);
       if (!location || (finding?.file && finding.file !== location.file) || (finding?.line && finding.line !== location.line)) return block('invalid head location');
       if (isProtectedPath(location.file) !== false) return block('protected path');
@@ -92,10 +102,12 @@ export function classifyPreExisting({ findings, answers, baseSha, headSha, readB
       if (changedLines.removed?.get(base.path)?.has(base.line) || inside(changedLines.removed?.get(base.path), bs, be)
         || inside(changedLines.deletedAt?.get(location.file), hs, he) || inside(changed, hs, he)) return block('head or base symbol touched by the diff');
       const key = findingKey({ file: location.file, symbol, class: a.class });
-      if (cardWritten(key) !== true) return block('card not written');
+      const security = a.class.startsWith('B'), receipt = cardWritten(key);
+      if (security ? receipt?.written !== true || receipt.expedite !== true || receipt.needsYou !== true
+        : receipt !== true) return block('card or security expedite/needs-you not confirmed');
       return { blocking: false, preExisting: { line: text, key, base: { sha: baseSha, ...base, quote: a.quote },
         relation: 'SAME', cardHash: cardHash(key) }, reason: 'verified pre-existing finding',
-      ...(a.class === 'B1' ? { expedite: true, tag: 'security', needsYou: true } : {}) };
+      ...(security ? { expedite: true, tag: 'security', needsYou: true } : {}) };
     } catch { return block('unreadable evidence or card failure'); }
   });
 }

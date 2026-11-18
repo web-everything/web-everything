@@ -93,7 +93,7 @@ export function findAudit(records, { head, base, questionHash, priorQuestionHash
 async function proveFindings(findings, base, head, deps) {
   const extra = { modelVerdict: 'WEAKENED', findingKeys: [], preExisting: [] };
   try {
-    for (const name of ['reproOnBase', 'readBaseFile', 'readHeadFile', 'diffText', 'numstatText', 'baseRecheckMax', 'protectedPaths', 'fileCard']) {
+    for (const name of ['reproOnBase', 'readBaseFile', 'readHeadFile', 'diffText', 'numstatText', 'baseRecheckMax', 'protectedPaths', 'fileCard', 'auditPolicy']) {
       if (typeof deps[name] !== 'function') throw new Error('missing proof dependency');
     }
     const answers = parseReproAnswer(await deps.reproOnBase(`${REPRO_QUESTION(findings)}\nCompare with head ${head}: read git diff ${base}...${head} and answer WORSENED if it adds a reaching path, removes a guard, or makes the weakness easier to trigger.\n`, findings, base), findings.length);
@@ -101,7 +101,7 @@ async function proveFindings(findings, base, head, deps) {
       const loc = parseFindingLocation(text);
       const sourceText = loc ? deps.readHeadFile(loc.file, head) : undefined;
       if (loc && typeof sourceText !== 'string') throw new Error('unreadable head source');
-      return { text, sourceText, class: answers[i]?.class };
+      return { text, sourceText, class: answers[i]?.class, card: /\bbacklog\/[A-Za-z0-9._-]+\.md\b/.exec(text)?.[0] };
     });
     extra.findingKeys = detailed.flatMap((f, i) => {
       const loc = parseFindingLocation(f.text);
@@ -115,19 +115,20 @@ async function proveFindings(findings, base, head, deps) {
       baseFiles.set(a.base.path, source);
     }
     const options = { findings: detailed, answers, baseSha: base, headSha: head,
-      readBaseFile: path => baseFiles.get(path), changedLines, recheckMax: deps.baseRecheckMax(), protectedPaths: deps.protectedPaths() };
-    const candidates = classifyPreExisting({ ...options, cardWritten: () => true });
-    const written = new Set();
+      readBaseFile: path => baseFiles.get(path), changedLines, recheckMax: deps.baseRecheckMax(), protectedPaths: deps.protectedPaths(),
+      auditPolicy: deps.auditPolicy(), readCard: deps.readCard };
+    const candidates = classifyPreExisting({ ...options, cardWritten: key => /\|B[1-7]$/.test(key) ? { written: true, expedite: true, needsYou: true } : true });
+    const written = new Map();
     const date = new Date(deps.now()).toLocaleString('en-CA', { timeZone: 'America/New_York', hour12: false });
     for (let i = 0; i < candidates.length; i++) {
       const c = candidates[i];
       if (c.blocking) continue;
       const { key } = c.preExisting, [path, symbol, cls] = key.split('|');
-      if (await deps.fileCard({ key, cardLine: cardLine({ date, cls, path, symbol, sha10: base.slice(0, 10), text: findings[i] }),
-        expedite: c.expedite === true, needsYou: c.needsYou === true }) !== true) throw new Error('card not confirmed');
-      written.add(key);
+      const receipt = await deps.fileCard({ key, cardLine: cardLine({ date, cls, path, symbol, sha10: base.slice(0, 10), text: findings[i] }),
+        expedite: c.expedite === true, needsYou: c.needsYou === true });
+      written.set(key, receipt);
     }
-    const classified = classifyPreExisting({ ...options, cardWritten: key => written.has(key) });
+    const classified = classifyPreExisting({ ...options, cardWritten: key => written.get(key) });
     const blocking = findings.filter((_, i) => classified[i].blocking);
     for (const c of classified) if (c.blocking) deps.stderr(`Base proof blocked: ${c.reason}.\n`);
     extra.preExisting = classified.filter(c => !c.blocking).map(c => c.preExisting);

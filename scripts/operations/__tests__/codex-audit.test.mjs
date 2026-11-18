@@ -232,6 +232,43 @@ function adapter(report = { exitCode: 0, timedOut: false, lastMessage: 'NOT WEAK
 }
 
 describe('audit IO with injected filesystem and subprocesses', () => {
+  it('resolves exemption policy through the settings cascade and logs provenance', () => {
+    const log = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const f = adapter(undefined, { settingsOptions: { env: {}, platform: { releaseStage: 'prod' },
+        fileRead: () => JSON.stringify({ audit: { releaseStage: 'prerelease', cards: { requirePayBy: false, requireOnMain: true } } }) } });
+      expect(f.deps.auditPolicy()).toEqual({ releaseStage: 'prerelease', requirePayBy: false, requireOnMain: true });
+      for (const name of ['releaseStage', 'requirePayBy', 'requireOnMain']) {
+        expect(log.mock.calls.flat().join('')).toContain(`audit.${name}=`);
+        expect(log.mock.calls.flat().join('')).toMatch(new RegExp(`audit\\.${name}=.* source=`));
+      }
+    } finally { log.mockRestore(); }
+  });
+  it.each(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7'])('persists and verifies both security lines for %s, including replay', cls => {
+    const files = new Map();
+    const f = adapter();
+    f.fs.readFileSync.mockImplementation(path => files.get(path) ?? '');
+    f.fs.appendFileSync.mockImplementation((path, text) => files.set(path, (files.get(path) ?? '') + text));
+    const input = { key: `x.mjs|X|${cls}`, cardLine: `held ${cls}`, expedite: true, needsYou: true };
+    expect(f.deps.fileCard(input)).toEqual({ written: true, expedite: true, needsYou: true });
+    const held = [...files.values()].find(text => text.startsWith(`held ${cls}`));
+    expect(held).toContain(`[needs-you]`);
+    expect(held).toContain(`security pre-existing (${cls}) x.mjs|X|${cls}`);
+    const count = f.fs.appendFileSync.mock.calls.length;
+    expect(f.deps.fileCard(input)).toEqual({ written: true, expedite: true, needsYou: true });
+    expect(f.fs.appendFileSync).toHaveBeenCalledTimes(count);
+    for (const patch of [{ expedite: false }, { needsYou: false }]) {
+      expect(() => f.deps.fileCard({ ...input, ...patch })).toThrow('security escalation required');
+    }
+  });
+  it('cannot confirm security when the needs-you line was not persisted', () => {
+    const files = new Map(), f = adapter();
+    f.fs.readFileSync.mockImplementation(path => files.get(path) ?? '');
+    f.fs.appendFileSync.mockImplementation((path, text) => files.set(path,
+      (files.get(path) ?? '') + text.split('\n').filter(line => !line.includes('[needs-you]')).join('\n')));
+    expect(() => f.deps.fileCard({ key: 'x.mjs|X|B2', cardLine: 'held', expedite: true, needsYou: true }))
+      .toThrow('card persistence verification failed');
+  });
   it('refuses a contradictory launcher report before the persistence adapter runs', async () => {
     const f = adapter({ exitCode: 0, timedOut: false,
       lastMessage: 'NOT WEAKENED\nWEAKENED\nscripts/gate.mjs:12 the fail-closed guard was removed' });
@@ -564,12 +601,49 @@ describe('R1053 prove mode', () => {
   const reply = (cls = 'B2', status = 'REPRODUCES', relation = 'SAME') => `#1 ${status} ${relation} CLASS=${cls} BASE=x.mjs:2\nQUOTE: return unsafeValue;`;
   function proof(answer = reply()) {
     const f = fixture(`WEAKENED\n${finding}`);
-    Object.assign(f.deps, { preExistingMode: () => 'prove', baseRecheckMax: () => 6, protectedPaths: () => [],
+    Object.assign(f.deps, { auditPolicy: () => ({ releaseStage: 'prerelease', requirePayBy: false, requireOnMain: true }),
+      preExistingMode: () => 'prove', baseRecheckMax: () => 6, protectedPaths: () => [],
       reproOnBase: vi.fn(async () => answer), readBaseFile: () => source, readHeadFile: () => source,
       diffText: () => 'diff --git a/x.mjs b/x.mjs\n--- a/x.mjs\n+++ b/x.mjs\n@@ -5 +5 @@\n-  return oldValue;\n+  return changedValue;\n',
-      numstatText: () => '1\t1\tx.mjs\n', fileCard: vi.fn(() => true) });
+      numstatText: () => '1\t1\tx.mjs\n', fileCard: vi.fn(({ expedite }) => expedite ? { written: true, expedite: true, needsYou: true } : true) });
     return f;
   }
+  it.each(['E1', 'E2'])('production policy blocks %s before filing', async cls => {
+    const f = proof(reply(cls));
+    f.deps.auditPolicy = () => ({ releaseStage: 'prod', requirePayBy: false, requireOnMain: true });
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.deps.fileCard).not.toHaveBeenCalled();
+  });
+  it('missing policy dep blocks every finding and names human review', async () => {
+    const f = proof(); delete f.deps.auditPolicy;
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.records[0]).toMatchObject({ findings: [finding], preExisting: [] });
+    expect(f.deps.fileCard).not.toHaveBeenCalled();
+    expect(f.errors.join('')).toContain('human review');
+  });
+  it('required pay-by ignores model dates and clears only with a valid persisted card', async () => {
+    for (const body of [null, '', 'mustPayBefore: 2099-02-31', 'mustPayBefore: 2099-01-01']) {
+      const f = proof(reply('D2'));
+      f.deps.auditPolicy = () => ({ releaseStage: 'prerelease', requirePayBy: true, requireOnMain: true });
+      f.deps.runCodex = () => `WEAKENED\n${finding} backlog/debt.md mustPayBefore: 2099-01-01`;
+      f.deps.readCard = vi.fn(() => body);
+      expect(await main(ARGS, f.deps)).toBe(body === 'mustPayBefore: 2099-01-01' ? 0 : 1);
+      expect(f.deps.readCard).toHaveBeenCalledWith('backlog/debt.md');
+    }
+  });
+  it('confirmed held card satisfies requireOnMain for D2', async () => {
+    const f = proof(reply('D2'));
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.deps.fileCard).toHaveBeenCalledOnce();
+  });
+  it.each(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7'])('%s clears only with expedite and needs-you confirmed', async cls => {
+    for (const confirmed of [true, false]) {
+      const f = proof(reply(cls));
+      f.deps.fileCard = vi.fn(() => ({ written: true, expedite: true, needsYou: confirmed }));
+      expect(await main(ARGS, f.deps)).toBe(confirmed ? 0 : 1);
+      expect(f.deps.fileCard).toHaveBeenCalledWith(expect.objectContaining({ expedite: true, needsYou: true }));
+    }
+  });
   it('the repro prompt names the head and the diff range', async () => {
     const f = proof();
     await main(ARGS, f.deps);

@@ -10,8 +10,10 @@ const answer = (cls = 'B2', status = 'REPRODUCES', relation = 'SAME') =>
   `#1 ${status} ${relation} CLASS=${cls} BASE=lib/x.mjs:2\nQUOTE: return unsafe();`;
 const diff = 'diff --git a/lib/x.mjs b/lib/x.mjs\n--- a/lib/x.mjs\n+++ b/lib/x.mjs\n@@ -5 +5 @@\n-  return old();\n+  return fixed();\n';
 const stat = '1\t1\tlib/x.mjs\n';
+const receipt = () => ({ written: true, expedite: true, needsYou: true });
 const options = over => ({ findings: [finding], answers: parseReproAnswer(answer(), 1), baseSha: 'base-sha', headSha: 'head-sha',
-  readBaseFile: () => source, changedLines: parseDiffChangedLines(diff, stat), recheckMax: 6, protectedPaths: [], cardWritten: () => true, ...over });
+  readBaseFile: () => source, changedLines: parseDiffChangedLines(diff, stat), recheckMax: 6, protectedPaths: [], auditPolicy: { releaseStage: 'prerelease', requirePayBy: false, requireOnMain: true },
+  cardWritten: receipt, ...over });
 const classify = over => classifyPreExisting(options(over));
 
 describe('strict reproduction protocol', () => {
@@ -59,7 +61,41 @@ describe('strict reproduction protocol', () => {
 describe('pre-existing classification', () => {
   it('exports exactly the eligible classes and permits each on unprotected unchanged source', () => {
     expect(PREEXISTING_ELIGIBLE).toEqual(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'E1', 'E2', 'D2']);
-    for (const cls of PREEXISTING_ELIGIBLE) expect(classify({ answers: parseReproAnswer(answer(cls), 1) })[0].blocking).toBe(false);
+    for (const cls of PREEXISTING_ELIGIBLE) expect(classify({ answers: parseReproAnswer(answer(cls), 1),
+      cardWritten: () => cls.startsWith('B') ? receipt() : true })[0].blocking).toBe(false);
+  });
+  it.each(['E1', 'E2'])('production stage blocks %s', cls => {
+    expect(classify({ auditPolicy: { releaseStage: 'prod', requirePayBy: false, requireOnMain: true },
+      answers: parseReproAnswer(answer(cls), 1) })[0].blocking).toBe(true);
+  });
+  it('missing or incomplete policy blocks with human review fallback', () => {
+    for (const auditPolicy of [undefined, null, {}, { releaseStage: 'prerelease' }]) {
+      expect(classify({ auditPolicy })[0]).toMatchObject({ blocking: true, reason: expect.stringContaining('human review required') });
+    }
+  });
+  it('required pay-by uses only a persisted card and a valid future date', () => {
+    const opts = { auditPolicy: { releaseStage: 'prerelease', requirePayBy: true, requireOnMain: true },
+      findings: [{ ...finding, card: 'backlog/debt.md', text: finding.text + ' mustPayBefore: 2099-01-01' }],
+      answers: parseReproAnswer(answer('D2'), 1), cardWritten: () => true };
+    for (const body of [null, '', 'mustPayBefore: 2000-01-01', 'mustPayBefore: 2099-02-31']) {
+      expect(classify({ ...opts, readCard: () => body })[0].blocking).toBe(true);
+    }
+    expect(classify({ ...opts, readCard: () => 'mustPayBefore: 2099-01-01' })[0].blocking).toBe(false);
+    expect(classify({ ...opts, readCard: () => 'mustPayBefore: prod' })[0].blocking).toBe(false);
+    expect(classify({ ...opts, auditPolicy: { ...opts.auditPolicy, releaseStage: 'prod' },
+      readCard: () => 'mustPayBefore: prod' })[0].blocking).toBe(true);
+  });
+  it('a held card satisfies requireOnMain without a main card', () => {
+    expect(classify({ auditPolicy: { releaseStage: 'prerelease', requirePayBy: false, requireOnMain: true },
+      answers: parseReproAnswer(answer('D2'), 1), cardWritten: () => true })[0].blocking).toBe(false);
+  });
+  it.each(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7'])('%s requires confirmed expedite and needs-you', cls => {
+    const opts = { answers: parseReproAnswer(answer(cls), 1) };
+    expect(classify({ ...opts, cardWritten: () => ({ written: true, expedite: true, needsYou: true }) })[0])
+      .toMatchObject({ blocking: false, expedite: true, needsYou: true });
+    for (const receipt of [true, { written: true, expedite: true, needsYou: false }, { written: true, expedite: false, needsYou: true }]) {
+      expect(classify({ ...opts, cardWritten: () => receipt })[0].blocking).toBe(true);
+    }
   });
   it('uses one-based inclusive base symbol ranges and permits shifted base lines', () => {
     expect(symbolRangeAt(source, 2)).toEqual({ symbol: 'X', start: 1, end: 3 });
@@ -99,9 +135,9 @@ describe('pre-existing classification', () => {
     expect(classify({ isProtectedPath: () => { throw Error('unreadable'); } })[0].blocking).toBe(true);
   });
   it('a1 finding in X while PR edits Y is non-blocking with a stable card identity', () => {
-    const readBaseFile = vi.fn(() => source), cardWritten = vi.fn(() => true);
+    const readBaseFile = vi.fn(() => source), cardWritten = vi.fn(receipt);
     const [result] = classify({ readBaseFile, cardWritten });
-    expect(result).toEqual({ blocking: false, reason: 'verified pre-existing finding', preExisting: {
+    expect(result).toEqual({ blocking: false, expedite: true, tag: 'security', needsYou: true, reason: 'verified pre-existing finding', preExisting: {
       line: finding.text, key: 'lib/x.mjs|X|B2', base: { sha: 'base-sha', path: 'lib/x.mjs', line: 2, quote: 'return unsafe();' },
       relation: 'SAME', cardHash: cardHash('lib/x.mjs|X|B2'),
     } });
@@ -181,7 +217,7 @@ describe('pre-existing classification', () => {
     expect(classify({ answers: parseReproAnswer(answer('B2', 'REPRODUCES', 'WORSENED'), 1) })[0].blocking).toBe(true);
   });
   it('a5 excess findings block with explicit human-review fallback and no card attempt', () => {
-    const cardWritten = vi.fn(() => true);
+    const cardWritten = vi.fn(receipt);
     const result = classify({ findings: [finding, finding], answers: [parseReproAnswer(answer(), 1)[0], parseReproAnswer(answer(), 1)[0]], recheckMax: 1, cardWritten });
     expect(result.map(r => r.blocking)).toEqual([false, true]);
     expect(result[1].reason).toContain('human review required');

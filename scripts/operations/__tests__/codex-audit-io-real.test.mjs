@@ -69,18 +69,18 @@ describe('R1053 base reproduction IO', () => {
       createAuditDeps(options).fileCard(card);
       const first = readFileSync(cardsPath, 'utf8');
       writeFileSync(cardsPath, first.split('\n').filter(l => missing === 'card' ? l !== card.cardLine : !l.includes('[needs-you]')).join('\n'));
-      expect(createAuditDeps(options).fileCard(card)).toBe(true);
+      expect(createAuditDeps(options).fileCard(card)).toEqual({ written: true, expedite: true, needsYou: true });
       const repaired = readFileSync(cardsPath, 'utf8');
       expect(repaired.split('\n').filter(l => l === card.cardLine)).toHaveLength(1);
       expect(repaired.split('\n').filter(l => l.includes('[needs-you]'))).toHaveLength(1);
-      expect(createAuditDeps(options).fileCard(card)).toBe(true);
+      expect(createAuditDeps(options).fileCard(card)).toEqual({ written: true, expedite: true, needsYou: true });
       expect(readFileSync(cardsPath, 'utf8')).toBe(repaired);
     });
   });
   it.each(['lost write', 'write throws', 'verification throws'])('fails closed on card persistence failure: %s', async failure => {
     await withRealRepo(async ({ root, tmp }) => {
       const cardsPath = join(tmp, 'cards.md'), indexPath = join(tmp, 'index.jsonl');
-      const card = { key: 'x.mjs|X|B2', cardLine: '- [R1053] test' };
+      const card = { key: 'x.mjs|X|B2', cardLine: '- [R1053] test', expedite: true, needsYou: true };
       createAuditDeps({ cwd: root, cardsPath, indexPath }).fileCard(card);
       writeFileSync(cardsPath, '');
       let wrote = false;
@@ -103,11 +103,11 @@ describe('R1053 base reproduction IO', () => {
       const cardsPath = join(tmp, 'cards.md'), indexPath = join(tmp, 'index.jsonl');
       const options = { cwd: root, home: join(tmp, 'home'), cardsPath, indexPath };
       const card = { key: 'x.mjs|X|B1', cardLine: '- [R1053] test security', expedite: true, needsYou: true };
-      expect(createAuditDeps(options).fileCard(card)).toBe(true);
+      expect(createAuditDeps(options).fileCard(card)).toEqual({ written: true, expedite: true, needsYou: true });
       const first = readFileSync(cardsPath, 'utf8');
       expect(first).toContain('[R1053][needs-you]');
       expect(first).toContain('security pre-existing (B1)');
-      expect(createAuditDeps(options).fileCard(card)).toBe(true);
+      expect(createAuditDeps(options).fileCard(card)).toEqual({ written: true, expedite: true, needsYou: true });
       expect(readFileSync(cardsPath, 'utf8')).toBe(first);
       expect(readFileSync(indexPath, 'utf8').trim().split('\n')).toHaveLength(1);
     });

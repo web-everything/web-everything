@@ -1,4 +1,5 @@
 /** @file Real Git/Codex and JSONL persistence adapters for the standalone audit. */
+import { readCardFromMain } from './audit-verdict.mjs';
 import { cardHash } from './audit-base-repro.mjs';
 import { resolveAuditSettings } from '../lib/audit-settings.mjs';
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
@@ -65,11 +66,16 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
     if (!settings) {
       settings = resolveAuditSettings({ fileRead: fs.readFileSync, ...settingsOptions,
         log: message => process.stderr.write(`${message}\n`) });
-      for (const name of ['preExistingMode', 'baseRecheckMax']) process.stderr.write(`audit.${name}=${settings.value[name]} source=${settings.sources[name]}\n`);
+      for (const name of ['preExistingMode', 'baseRecheckMax', 'releaseStage', 'requirePayBy', 'requireOnMain']) process.stderr.write(`audit.${name}=${settings.value[name]} source=${settings.sources[name]}\n`);
     }
     return settings;
   };
   const deps = {
+    auditPolicy: () => {
+      const { releaseStage, requirePayBy, requireOnMain } = auditSettings().value;
+      return { releaseStage, requirePayBy, requireOnMain };
+    },
+    readCard: path => readCardFromMain(path, { run: spawnSync }),
     preExistingMode: () => auditSettings().value.preExistingMode,
     baseRecheckMax: () => auditSettings().value.baseRecheckMax,
     protectedPaths: () => [...auditSettings().value.raceBlockPaths, ...auditSettings().value.guardFloorPaths],
@@ -96,10 +102,14 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
       const prior = rows.findLast(r => r.key === key);
       const contents = read(cardsPath), lines = contents.split('\n');
       const date = new Date().toLocaleString('en-CA', { timeZone: 'America/New_York', hour12: false });
+      const cls = key.split('|').at(-1);
+      const security = /^B[1-7]$/.test(cls);
+      if (security && (expedite !== true || needsYou !== true)) throw new Error('security escalation required');
+      const receipt = security ? { written: true, expedite: true, needsYou: true } : true;
       const securityLine = line => typeof line === 'string' && line.startsWith('- [R1053][needs-you] ')
-        && line.endsWith(` ET: security pre-existing (B1) ${key}`);
+        && line.endsWith(` ET: security pre-existing (${cls}) ${key}`);
       const needsYouLine = expedite && needsYou ? (securityLine(prior?.needsYouLine) && prior.needsYouHash === cardHash(prior.needsYouLine)
-        ? prior.needsYouLine : lines.find(securityLine) || `- [R1053][needs-you] ${date} ET: security pre-existing (B1) ${key}`) : null;
+        ? prior.needsYouLine : lines.find(securityLine) || `- [R1053][needs-you] ${date} ET: security pre-existing (${cls}) ${key}`) : null;
       const expected = [cardLine, ...(needsYouLine ? [needsYouLine] : [])];
       const missing = expected.filter(line => !lines.some(actual => cardHash(actual) === cardHash(line)));
       if (missing.length) {
@@ -110,11 +120,11 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
       if (!expected.every(line => verified.some(actual => cardHash(actual) === cardHash(line)))) throw new Error('card persistence verification failed');
       const row = { key, cardHash: cardHash(key), cardLineHash: cardHash(cardLine),
         ...(needsYouLine ? { needsYouLine, needsYouHash: cardHash(needsYouLine) } : {}) };
-      if (!missing.length && prior && Object.entries(row).every(([k, v]) => prior[k] === v)) return true;
+      if (!missing.length && prior && Object.entries(row).every(([k, v]) => prior[k] === v)) return receipt;
       fs.mkdirSync(dirname(indexPath), { recursive: true });
       fs.appendFileSync(indexPath, `${JSON.stringify(row)}\n`, { encoding: 'utf8', mode: 0o600 });
       if (!read(indexPath).split('\n').includes(JSON.stringify(row))) throw new Error('card index verification failed');
-      return true;
+      return receipt;
     },
     fingerprint: (base, head) => netDiffFingerprint(cwd, base, head),
     resolveSha: ref => run('git', ['rev-parse', '--verify', `${ref}^{commit}`], 30_000).trim(),
