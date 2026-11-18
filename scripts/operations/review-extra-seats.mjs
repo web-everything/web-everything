@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
+import { provenEmptyNetDiff, EMPTY_NET_DIFF_SKIP } from '../lib/red-team-empty-net-diff.mjs';
 import { FINDING_CLASSES, classAction, stricterClass, readFindingClassPolicy, validAlsoClasses } from '../lib/finding-class-policy.mjs';
 import { decodeRecoveryAdmission } from '../lib/drain-red-team-evidence.mjs';
 import { recordRedTeamStatus, readRedTeamStatus, redTeamStatusDir } from '../lib/drain-red-team-evidence.mjs';
@@ -1818,18 +1819,23 @@ export async function speculateRedTeam({
 } = {}, io = createRedTeamIo({ env })) {
   try {
     if (!redTeamEnabled(env)) return { status: 'disabled', reason: `${RED_TEAM_ENV}=${env?.[RED_TEAM_ENV] ?? ''} ${EXTRA_SEATS_ENV}=${env?.[EXTRA_SEATS_ENV] ?? ''}`.trim() };
-    if (!read || typeof read.diffText !== 'string' || !read.diffText.trim()) return { status: 'skipped', reason: 'the review printed no diff' };
+    const emptyNetDiff = provenEmptyNetDiff(read);
+    if (!emptyNetDiff && (!read || typeof read.diffText !== 'string' || !read.diffText.trim())) return { status: 'skipped', reason: 'the review printed no diff' };
     const rev = read.netBasis?.rev;
     if (!isPinnedRev(rev)) return { status: 'skipped', reason: 'the review printed no pinned head commit (netBasis.rev)' };
     const settings = readRedTeamProbes({ env, log: io.log });
     const now = io.now();
     let records = [];
-    try { records = io.readRecords(); } catch (e) {
+    let recordsReadable = false;
+    try { records = emptyNetDiff ? io.readRecords({ strict: true }) : io.readRecords(); recordsReadable = true; } catch (e) {
       if (resumeOnly) return { status: 'skipped', reason: 'resume-only: scorecard store unreadable — no call launched' };
       io.log(`red team: could not read the scorecard store (${e.message}) — treating it as empty`);
     }
+    // Empty-diff clearance requires proof that no recorded pass still needs its effects finished.
+    if (emptyNetDiff && !recordsReadable) return { status: 'skipped', reason: 'scorecard store unreadable — inspect stored evidence before retrying; no call launched' };
     const prior = priorRedTeamRow(records, pr, rev, repo);
     if (resumeOnly && !prior) return { status: 'skipped', reason: 'resume-only: no clean prior red-team row — no call launched' };
+    if (emptyNetDiff && recordsReadable && !prior) return { ...EMPTY_NET_DIFF_SKIP };
     // A speculative pass (`resume: false`) must not finish a prior pass's effects before the verdict is known: it
     // reports the row and the job's sequential pass resumes it if, and only if, the review accepts.
     if (prior && !resume) return { status: 'prior-row', reason: `a completed red-team seat row already exists for #${pr} at ${rev.slice(0, 12)}` };

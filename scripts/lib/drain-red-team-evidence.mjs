@@ -1,3 +1,4 @@
+import { emptyNetDiffSkip, provenEmptyNetDiffPayload, EMPTY_NET_DIFF_SKIP } from './red-team-empty-net-diff.mjs';
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
 import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher } from './red-team-check-run.mjs';
 import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
@@ -920,7 +921,7 @@ function writeRedTeamStatusLocked(path, { repo, pr, head, loopPayload, status, r
 /** Each conjunct is independently pinned by the historical fallback predicate tests. PURE. */
 export function historicalCardOnlySkipCandidate(old) {
   const prior = old?.status;
-  return prior?.status === 'finished' && prior.skipCardOnly === true
+  return prior?.status === 'finished' && (prior.skipCardOnly === true || emptyNetDiffSkip(prior))
     && (typeof prior.result === 'string' ? prior.result : prior.result?.status) === 'skipped'
     && !old.recorded && !old.inFlight && !old.queued;
 }
@@ -954,20 +955,26 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     if (latestHit.ok === false) return latestHit;
     const latest = latestHit.run;
     const laterPanel = latest && latest.findings?.read?.netBasis?.rev !== carriedFrom;
+    // An empty-net-diff carry is its own policy: its stored skip is proven by the head-bound read, not by the
+    // writer's card-only setting, so it stays the carry's own status with that setting disabled.
+    const emptyOwn = emptyNetDiffSkip(status, head);
     const ownStatus = status === undefined || (status?.repo === repo && Number(status.pr) === Number(pr) && status.head === head
-      && (status.loopPayload?.carriedFrom === carriedFrom || (status.head === carriedFrom && status.skipCardOnly === true))
+      && (status.loopPayload?.carriedFrom === carriedFrom || (status.head === carriedFrom && (status.skipCardOnly === true || emptyOwn)))
       && status.status === 'finished'
-      && (status.result === 'skipped' || (status.result?.status === 'skipped' && status.result.policy === 'card-only')));
+      && (status.result === 'skipped' || (status.result?.status === 'skipped' && (status.result.policy === 'card-only' || emptyOwn))));
     if (laterPanel || (carry && !ownStatus) || recorded) {
       return { loopPayload: latest, status, carryConflict: true, inFlight: false,
         recorded, ...seatEvidence, scheduled: false };
     }
     if (carry) {
       // The journal survives a crash before the compatibility status exists. Never invent an accept.
+      // Project the carry's own policy: an empty-net-diff carry never claims the card-only setting.
+      const empty = provenEmptyNetDiffPayload(carry.loopPayload, head);
+      const skipCardOnly = empty ? status?.skipCardOnly === true : true;
       const projected = { repo, pr, head, loopPayload: carry.loopPayload, status: 'finished',
-        result: { status: 'skipped', policy: 'card-only' }, skipCardOnly: true };
+        result: empty ? { ...EMPTY_NET_DIFF_SKIP } : { status: 'skipped', policy: 'card-only' }, skipCardOnly };
       return { carry, status: projected, loopPayload: carry.loopPayload, inFlight: false,
-        recorded: false, ...seatEvidence, scheduled: false, skipCardOnly: true };
+        recorded: false, ...seatEvidence, scheduled: false, skipCardOnly };
     }
   }
   if (status?.repo === repo && Number(status.pr) === Number(pr) && status.head === head) {

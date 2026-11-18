@@ -1,3 +1,4 @@
+import { provenEmptyNetDiff } from './red-team-empty-net-diff.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 /** Shared scheduling policy; importing it never loads a review dispatcher or CLI. */
 import { redTeamRequired, VERDICTS } from './jury-core.mjs';
@@ -59,6 +60,6 @@ export function redTeamCardOnly(read) {
 export function redTeamOwedOnHead({ read, evidence = {}, skipCardOnly = true } = {}) {
   if (evidence.inFlight || evidence.recorded) return true;
   const skip = typeof evidence.skipCardOnly === 'boolean' ? evidence.skipCardOnly : skipCardOnly;
-  if (skip && redTeamCardOnly(read)) return false;
+  if ((!evidence.scheduled && provenEmptyNetDiff(read)) || (skip && redTeamCardOnly(read))) return false;
   return !!evidence.scheduled;
 }

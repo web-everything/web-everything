@@ -1,3 +1,7 @@
+import { redTeamForHead } from './red-team-gate.mjs';
+import { redTeamCardOnly } from './review-red-team-policy.mjs';
+import { emptyNetDiffSkip } from './red-team-empty-net-diff.mjs';
+import { skippedRedTeamRetry, failedRedTeamRetry } from './red-team-run-result.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { candidateQueueClass } from './merge-queue.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
@@ -196,14 +200,14 @@ const isEntry = (p) => !!p && typeof p === 'object' && p.num != null;
 export function readQueueState(path, readFile = readFileSync) {
   try {
     const s = JSON.parse(readFile(path, 'utf8'));
-    return { pending: Array.isArray(s?.pending) ? s.pending.filter(isEntry) : [], ...(s?.enqueueFailures ? { enqueueFailures: s.enqueueFailures } : {}), ...(s?.redTeamRequestAttempts ? { redTeamRequestAttempts: s.redTeamRequestAttempts } : {}), ...(s?.redTeamCheckRecovery ? { redTeamCheckRecovery: s.redTeamCheckRecovery } : {}), ...(s?.redTeamPending ? { redTeamPending: s.redTeamPending } : {}), followedUp: Array.isArray(s?.followedUp) ? s.followedUp.filter((k) => typeof k === 'string') : [], exists: true, unreadable: false };
+    return { pending: Array.isArray(s?.pending) ? s.pending.filter(isEntry) : [], ...(s?.enqueueFailures ? { enqueueFailures: s.enqueueFailures } : {}), ...(s?.redTeamRequestAttempts ? { redTeamRequestAttempts: s.redTeamRequestAttempts } : {}), ...(s?.redTeamCheckRecovery ? { redTeamCheckRecovery: s.redTeamCheckRecovery } : {}), ...(s?.redTeamStallNotices ? { redTeamStallNotices: s.redTeamStallNotices } : {}), ...(s?.redTeamPending ? { redTeamPending: s.redTeamPending } : {}), followedUp: Array.isArray(s?.followedUp) ? s.followedUp.filter((k) => typeof k === 'string') : [], exists: true, unreadable: false };
   } catch (e) { return { pending: [], followedUp: [], exists: false, unreadable: e?.code !== 'ENOENT' }; }
 }
 
 function writeQueueState(path, state) {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify({ ...(state.enqueueFailures ? { enqueueFailures: state.enqueueFailures } : {}), ...(state.redTeamRequestAttempts ? { redTeamRequestAttempts: state.redTeamRequestAttempts } : {}), ...(state.redTeamCheckRecovery ? { redTeamCheckRecovery: state.redTeamCheckRecovery } : {}), ...(state.redTeamPending ? { redTeamPending: state.redTeamPending } : {}), pending: state.pending, followedUp: state.followedUp.slice(-FOLLOWED_UP_CAP) }, null, 2)}\n`);
+  writeFileSync(tmp, `${JSON.stringify({ ...(state.enqueueFailures ? { enqueueFailures: state.enqueueFailures } : {}), ...(state.redTeamRequestAttempts ? { redTeamRequestAttempts: state.redTeamRequestAttempts } : {}), ...(state.redTeamCheckRecovery ? { redTeamCheckRecovery: state.redTeamCheckRecovery } : {}), ...(state.redTeamStallNotices ? { redTeamStallNotices: state.redTeamStallNotices } : {}), ...(state.redTeamPending ? { redTeamPending: state.redTeamPending } : {}), pending: state.pending, followedUp: state.followedUp.slice(-FOLLOWED_UP_CAP) }, null, 2)}\n`);
   renameSync(tmp, path);
 }
 
@@ -261,7 +265,7 @@ export function createDrainMergeStrategy({
     const lock = withLock(() => {
       const st = readQueueState(statePath, readFile);
       if (st.unreadable) { unreadable = true; return false; }
-      fn(st); writeState(statePath, { pending: st.pending, followedUp: st.followedUp, ...(st.enqueueFailures ? { enqueueFailures: st.enqueueFailures } : {}), ...(st.redTeamRequestAttempts ? { redTeamRequestAttempts: st.redTeamRequestAttempts } : {}), ...(st.redTeamCheckRecovery ? { redTeamCheckRecovery: st.redTeamCheckRecovery } : {}), ...(st.redTeamPending ? { redTeamPending: st.redTeamPending } : {}) }); return true;
+      fn(st); writeState(statePath, { pending: st.pending, followedUp: st.followedUp, ...(st.enqueueFailures ? { enqueueFailures: st.enqueueFailures } : {}), ...(st.redTeamRequestAttempts ? { redTeamRequestAttempts: st.redTeamRequestAttempts } : {}), ...(st.redTeamCheckRecovery ? { redTeamCheckRecovery: st.redTeamCheckRecovery } : {}), ...(st.redTeamStallNotices ? { redTeamStallNotices: st.redTeamStallNotices } : {}), ...(st.redTeamPending ? { redTeamPending: st.redTeamPending } : {}) }); return true;
     });
     if (lock?.ran === false) { say(`  ⚠ merge-queue follow-up state lock not acquired — ${what} not recorded this pass; retried next pass`); return false; }
     if (unreadable) { say(`  ⚠ merge-queue follow-up state ${statePath} is unreadable — ${what} not recorded (file left untouched); fix or remove it`); return false; }
@@ -496,6 +500,29 @@ export function createDrainMergeStrategy({
         }
         const pages = readThreadPages(c.repo, c.num);
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team admission: unreadable complete comments');
+        // A terminal writer with no runnable recovery must reach the operator even before the deadline.
+        const writer = evidence.status;
+        const stalled = writer?.status === 'finished' && writer.head === headSha
+          && admissionLabels.includes('review:accepted') && admissionLabels.includes('red-team:pending')
+          && !redTeamForHead(pages.flat(), c.num, headSha)
+          && !evidence.inFlight && !evidence.queued && !evidence.recorded
+          && !emptyNetDiffSkip(writer, headSha)
+          && !(writer.skipCardOnly === true && redTeamCardOnly(writer.loopPayload?.findings?.read))
+          && (writer.retryCount >= 1
+            || (!skippedRedTeamRetry(writer, evidence) && !failedRedTeamRetry(writer, evidence)));
+        if (stalled && publishNote) {
+          before.redTeamStallNotices ??= {};
+          before.redTeamStallNotices[key] ??= {};
+          if (before.redTeamStallNotices[key][headSha] == null) {
+            try {
+              publishNote({ repo: slugOf(c.repo), pr: Number(c.num), head: headSha,
+                kind: 'red-team-finished-pending', reason: 'finished red-team status has no advancing path; inspect stored evidence',
+                pick: `https://github.com/${slugOf(c.repo)}/pull/${c.num}` });
+              before.redTeamStallNotices[key][headSha] = now();
+              writeState(statePath, before);
+            } catch (error) { say(`red-team stall notice #${c.num}: ${firstLine(error)}`); }
+          }
+        }
         const standingRuling = grantScopeFor(c, headSha, pages.flat());
         evidence = settleUnknownEvidenceByComment(evidence, pages.flat(), c.num, headSha, live.reviews);
         const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env, standingRuling });
@@ -582,7 +609,7 @@ export function createDrainMergeStrategy({
               wait.deadlineHeldAt = now();
               log.write(`  merge-queue: HOLD ${slugOf(c.repo)}#${c.num} on ${headSha}: ${heldReason}; redTeamPendingMaxMin=${maxMin} (${safety.sources?.redTeamPendingMaxMin ?? 'standard'}), redTeam.deadlineAction=${deadlineAction} (${source}); never enqueued without a result\n`);
             }
-            if (wait.notifiedAt == null && publishNote) {
+            if (wait.notifiedAt == null && before.redTeamStallNotices?.[key]?.[headSha] == null && publishNote) {
               try {
                 publishNote({ repo: slugOf(c.repo), pr: Number(c.num), head: headSha, kind: 'red-team-deadline-held', reason: heldReason,
                   pick: `https://github.com/${slugOf(c.repo)}/pull/${c.num}` });

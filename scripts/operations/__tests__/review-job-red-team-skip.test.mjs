@@ -5,16 +5,22 @@ import { settleRedTeamSkip } from '../../lib/red-team-skip-outcome.mjs';
 import { publishAttention, replay } from '../needs-you-feed.mjs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { runReviewJob, createReviewJobIo } from '../review-job.mjs';
-import { readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir } from '../../lib/drain-red-team-evidence.mjs';
+import { runReviewJob, createReviewJobIo, redTeamRunnerArgs } from '../review-job.mjs';
+import { decodeRecoveryAdmission, readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus, readRecoveryWitness, redTeamStatusDir } from '../../lib/drain-red-team-evidence.mjs';
+import { failedRedTeamRetry } from '../../lib/red-team-run-result.mjs';
 import { normalizeRedTeamResult, planRedTeamOnSkip, redTeamSkipNeedsSettlement, planRedTeamRecovery, abandonStaleRedTeamRun, recoveryProbe } from '../../lib/review-red-team-on-skip.mjs';
 import { newRunRecord, writeRun } from '../run-store.mjs';
 import { redTeamOwedOnHead } from '../../lib/review-red-team-policy.mjs';
 import { planRedTeamStatusLabels } from '../../lib/red-team-status-labels.mjs';
 import { redTeamMarker } from '../../lib/red-team-gate.mjs';
-import { speculateRedTeam, runRedTeam } from '../review-extra-seats.mjs';
+import { createRedTeamIo, speculateRedTeam, runRedTeam } from '../review-extra-seats.mjs';
+import { execFileSync } from 'node:child_process';
+import { readRedTeamCarry } from '../../lib/red-team-carry-machine.mjs';
+import { createRedTeamCarryIo } from '../../lib/red-team-carry-io.mjs';
+import { emptyNetDiffSkip, provenEmptyNetDiffPayload, verifyEmptyNetDiff } from '../../lib/red-team-empty-net-diff.mjs';
 
 const repo = 'web-everything/web-everything', pr = 5872, head = 'a'.repeat(40);
+const emptySkip = { status: 'skipped', policy: 'empty-net-diff', reason: 'red team skipped: empty net diff' };
 const skipped = { status: 'skipped', policy: 'card-only', reason: 'red team skipped: card-only' };
 const payload = () => ({ runId: 'review-pr-skip', stopped: 'complete',
   verdict: { verdict: 'accept', loop: { outcome: 'converged' }, findings: [], admittedFindings: [] },
@@ -43,6 +49,7 @@ function fixture(redTeam = skipped) {
 
 describe('review-job red-team skip settlement', () => {
   it.each([
+    [emptySkip, emptySkip],
     [{ status: 'skipped', policy: 'card-only' }, { status: 'skipped', policy: 'card-only' }],
     [{ status: 'skipped', reason: 'quota exhausted' }, { status: 'skipped' }],
     [{ status: 'skipped', policy: 'other' }, { status: 'skipped' }],
@@ -74,19 +81,96 @@ describe('review-job red-team skip settlement', () => {
     try {
       runReviewJob({ repo, pr }, f.io);
       const stored = readRedTeamStatus(key);
-      expect(stored.result).toEqual(cardOnly ? { status: 'skipped', policy: 'card-only' } : { status: 'skipped' });
+      expect(stored.result).toEqual(cardOnly ? skipped : { status: 'skipped' });
       expect(normalizeRedTeamResult(stored.result)).toEqual({ priorResult: 'skipped', priorComment: undefined });
       expect(redTeamSkipNeedsSettlement(stored)).toBe(cardOnly);
       expect(readEvidence()).toMatchObject({ loopPayload: f.loopPayload, scheduled: false, recorded: false, inFlight: false, skipCardOnly: true });
       writeRun({ ...newRunRecord({ id: 'review-pr-skip', op: 'review-pr', input: { repo, pr } }), ...f.loopPayload }, env.WE_SHARED_RUNS_DIR);
       if (!cardOnly) {
-        expect(() => production.redTeamStatus({ repo, pr, loopPayload: f.loopPayload, status: 'queued', redTeamMode: 'fresh' })).toThrow('prior pass cannot restart');
-        expect(readRedTeamStatus(key)).toEqual(stored); return;
+        const admission = production.redTeamStatus({ repo, pr, loopPayload: f.loopPayload, status: 'queued', redTeamMode: 'fresh' });
+        expect(admission.redTeamAdmission.retrySpent).toBe(true);
+        expect(readRedTeamStatus(key).retryCount).toBe(1);
+        expect(() => production.redTeamStatus({ repo, pr, loopPayload: f.loopPayload, status: 'queued', redTeamMode: 'fresh' })).toThrow();
+        return;
       }
       const admission = production.redTeamStatus({ repo, pr, loopPayload: f.loopPayload, status: 'queued', redTeamMode: 'fresh' });
       expect(admission.redTeamAdmission.prior).toEqual(cardOnly ? null : {
         repo, pr, head, status: 'finished', result: { status: 'skipped' },
       });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(['accept', 'advisory', 'missing-read', 'mismatched-rev', 'missing-verdict', 'degraded-advisory'])
+  ('serialized non-policy skip recovery launches one seat only with intact pinned evidence (%s)', async variant => {
+    const root = mkdtempSync(join(tmpdir(), 'skip-runner-admission-'));
+    const env = { WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_STATUS_LABELS: '0',
+      WE_REVIEW_RED_TEAM: '1', WE_REVIEW_EXTRA_SEATS: '1', WE_RED_TEAM_SKIP_CARD_ONLY: '0' };
+    const key = { repo, pr, head, env }, loopPayload = payload();
+    Object.assign(loopPayload.findings.read, {
+      netChangedFiles: ['scripts/example.mjs'],
+      diffText: 'diff --git a/scripts/example.mjs b/scripts/example.mjs\n+export const value = 1;\n',
+    });
+    if (variant === 'advisory' || variant === 'degraded-advisory') Object.assign(loopPayload.verdict, {
+      verdict: 'needs-human', humanRequired: true,
+      lensVerdicts: { correctness: 'accept', security: 'accept' },
+    });
+    const readEvidence = () => readDrainRedTeamEvidence({ ...key, list: () => [], readScorecards: () => [] });
+    const production = createReviewJobIo({ env, readEvidence, readSeatRecords: () => [] });
+    const io = {
+      now: () => 1_000, log: vi.fn(), readRecords: vi.fn(() => []), readRecoveryComments: () => [],
+      readRedTeamStatus: () => readRedTeamStatus(key),
+      cliAvailable: vi.fn(provider => provider === 'codex'),
+      reserveCalls: vi.fn(() => ({ used: 0, callIds: ['skip-retry-seat'] })),
+      makeScratch: () => root, removeScratch: vi.fn(), writeFile: vi.fn(), readHeadMessage: () => '',
+      runSeat: vi.fn(async () => ({ report: { lastMessage: JSON.stringify({
+        lenses: { 'red-team': { verdict: 'accept', findings: [] } },
+      }) } })),
+      runRecheck: vi.fn(),
+    };
+    try {
+      writeRun({ ...newRunRecord({ id: loopPayload.runId, op: 'review-pr', input: { repo, pr } }), ...loopPayload }, env.WE_SHARED_RUNS_DIR);
+      production.redTeamStatus({ repo, pr, loopPayload, status: 'finished', result: { status: 'skipped' } });
+      const { redTeamAdmission } = production.redTeamStatus({ repo, pr, loopPayload, status: 'queued', redTeamMode: 'fresh' });
+      expect(redTeamAdmission.retrySpent).toBe(true);
+      expect(readRedTeamStatus(key).retryCount).toBe(1);
+      // Mirror the production runner's file/argv boundary, then its CLI decoder.
+      const admissionFile = join(root, 'admission.json');
+      writeFileSync(admissionFile, JSON.stringify(redTeamAdmission));
+      const args = redTeamRunnerArgs({ repo, pr, lanePath: root, loopFile: join(root, 'loop.json'),
+        redTeamMode: 'fresh', redTeamAdmission: admissionFile });
+      const file = args.find(arg => arg.startsWith('--red-team-admission=')).slice('--red-team-admission='.length);
+      const decoded = decodeRecoveryAdmission(readFileSync(file, 'utf8'));
+      // Corrupt only the prior; the current review still owes a pass on this head.
+      if (variant === 'missing-read') delete decoded.prior.loopPayload?.findings?.read;
+      if (variant === 'mismatched-rev' && decoded.prior.loopPayload) decoded.prior.loopPayload.findings.read.netBasis.rev = 'b'.repeat(40);
+      if (variant === 'missing-verdict') delete decoded.prior.loopPayload?.verdict;
+      if (variant === 'degraded-advisory' && decoded.prior.loopPayload) decoded.prior.loopPayload.findings.read.degraded = true;
+      const eligible = variant === 'accept' || variant === 'advisory';
+      expect(failedRedTeamRetry(decoded.prior, { failedSeatCount: 0, completedRecorded: false })).toBe(eligible);
+      const input = { repo, pr, lanePath: root, loopPayload, env, post: false, record: false,
+        redTeamMode: 'fresh', redTeamAdmission: decoded };
+      const result = await runRedTeam(input, io);
+      if (!eligible) {
+        expect(result).toMatchObject({ status: 'not-owed', deferredByGuard: true,
+          reason: expect.stringContaining('red-team retry already spent') });
+        expect(io.cliAvailable).not.toHaveBeenCalled();
+        expect(io.reserveCalls).not.toHaveBeenCalled();
+        expect(io.runSeat).not.toHaveBeenCalled();
+        return;
+      }
+      expect(decoded.prior.loopPayload).toEqual({ verdict: loopPayload.verdict, findings: { read: loopPayload.findings.read } });
+      expect(result.status).toBe('ran');
+      expect(io.runSeat).toHaveBeenCalledOnce();
+      expect(io.reserveCalls).toHaveBeenCalledOnce();
+      // Even without seat rows, losing the retry's result cannot replenish its budget.
+      production.redTeamStatus({ repo, pr, loopPayload, status: 'finished', result: { status: 'skipped' } });
+      expect(readRedTeamStatus(key).retryCount).toBe(1);
+      expect(() => production.redTeamStatus({ repo, pr, loopPayload, status: 'queued', redTeamMode: 'fresh' })).toThrow();
+      expect(await runRedTeam({ ...input, redTeamAdmission: undefined }, io)).toMatchObject({
+        status: 'not-owed', deferredByGuard: true, reason: expect.stringContaining('red-team retry already spent'),
+      });
+      expect(io.runSeat).toHaveBeenCalledOnce();
+      expect(io.reserveCalls).toHaveBeenCalledOnce();
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -800,5 +884,252 @@ describe('readRedTeamOnlyPayload fails closed on a held carry fallback', () => {
   ])('throws a hold for a %s ok:false witness', (_n, witness) => {
     const io = createReviewJobIo({ env: {}, readWitness: () => witness, readSeatRecords: () => [] });
     expect(() => io.readRedTeamOnlyPayload({ pr: 1, repo: 'o/r', head: 'h' })).toThrow(/hold and inspect run evidence/);
+  });
+});
+
+describe('empty net diff producer proof', () => {
+  const read = () => ({ netBasis: { rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true });
+  it('owes a scheduled red-team result even with a proven empty net diff', () => {
+    expect(redTeamOwedOnHead({ read: read(), evidence: { scheduled: true, skipCardOnly: false } })).toBe(true);
+  });
+  it('does not owe an unscheduled red-team result with a proven empty net diff', () => {
+    expect(redTeamOwedOnHead({ read: read(), evidence: { scheduled: false, skipCardOnly: false } })).toBe(false);
+  });
+  it('skips a proven empty net diff before provider work with policy and reason', async () => {
+    expect(await speculateRedTeam({ repo, pr, read: read(), env: {} }, { now: () => 1000, readRecords: () => [], log: vi.fn() })).toEqual(emptySkip);
+  });
+  it('refuses empty net diff clearance when the production scorecard reader encounters a directory', async () => {
+    const storePath = mkdtempSync(join(tmpdir(), 'red-team-scorecard-directory-'));
+    try {
+      const production = createRedTeamIo({ env: {}, storePath });
+      expect(production.readRecords()).toEqual([]);
+      const io = { now: () => 1000, readRecords: production.readRecords, log: vi.fn(),
+        cliAvailable: vi.fn(), reserveCalls: vi.fn(), runSeat: vi.fn(), append: vi.fn(), postComment: vi.fn() };
+      const result = await speculateRedTeam({ repo, pr, read: read(), env: {} }, io);
+      expect(result).toEqual({ status: 'skipped', reason: 'scorecard store unreadable — inspect stored evidence before retrying; no call launched' });
+      expect(result).not.toHaveProperty('policy');
+      for (const effect of ['cliAvailable', 'reserveCalls', 'runSeat', 'append', 'postComment']) {
+        expect(io[effect]).not.toHaveBeenCalled();
+      }
+    } finally {
+      rmSync(storePath, { recursive: true, force: true });
+    }
+  });
+  it.each([
+    ['unscored text', r => { r.diffScored = false; }],
+    ['missing text score', r => { delete r.diffScored; }],
+    ['missing score', r => { delete r.netBasis.scored; }],
+    ['missing head', r => { delete r.netBasis.rev; }],
+    ['missing paths', r => { delete r.netChangedFiles; }],
+    ['nonempty paths', r => { r.netChangedFiles = ['scripts/example.mjs']; }],
+    ['unreadable diff', r => { delete r.diffText; }],
+  ])('never grants a policy for %s', async (_, mutate) => {
+    const r = read(); mutate(r);
+    expect(await speculateRedTeam({ repo, pr, read: r, env: {} }, {})).toEqual({ status: 'skipped', reason: 'the review printed no diff' });
+  });
+
+  it('empty net diff preserves resume-only refusal when the scorecard store is unreadable', async () => {
+    const read = { netBasis: { rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true };
+    expect(await speculateRedTeam({ repo, pr, read, env: {}, resumeOnly: true }, {
+      now: () => 1000, readRecords: () => { throw Error('unreadable'); }, log: vi.fn(),
+    })).toEqual({ status: 'skipped', reason: 'resume-only: scorecard store unreadable — no call launched' });
+  });
+  it('empty net diff preserves resume-only refusal when the readable scorecard store has no prior row', async () => {
+    const io = {
+      now: () => 1000, readRecords: () => [], log: vi.fn(),
+      cliAvailable: vi.fn(), reserveCalls: vi.fn(), runSeat: vi.fn(),
+      append: vi.fn(), postComment: vi.fn(),
+    };
+    expect(await speculateRedTeam({ repo, pr, read: read(), env: {}, resumeOnly: true }, io))
+      .toEqual({ status: 'skipped', reason: 'resume-only: no clean prior red-team row — no call launched' });
+    for (const effect of ['cliAvailable', 'reserveCalls', 'runSeat', 'append', 'postComment']) {
+      expect(io[effect]).not.toHaveBeenCalled();
+    }
+  });
+  it.each([
+    ['default', {}],
+    ['resumable', { resumeOnly: false, resume: true }],
+    ['speculative', { resumeOnly: false, resume: false }],
+  ])('refuses empty net diff policy clearance with an unreadable scorecard store (%s)', async (_, mode) => {
+    const io = {
+      now: () => 1000, readRecords: () => { throw Error('unreadable'); }, log: vi.fn(),
+      cliAvailable: vi.fn(), reserveCalls: vi.fn(), runSeat: vi.fn(),
+      append: vi.fn(), postComment: vi.fn(),
+    };
+    expect(await speculateRedTeam({ repo, pr, read: read(), env: {}, ...mode }, io))
+      .toEqual({ status: 'skipped', reason: 'scorecard store unreadable — inspect stored evidence before retrying; no call launched' });
+    for (const effect of ['cliAvailable', 'reserveCalls', 'runSeat', 'append', 'postComment']) {
+      expect(io[effect]).not.toHaveBeenCalled();
+    }
+  });
+  it.each([true, false])('empty net diff preserves completed prior row (resume=%s)', async resume => {
+    const read = { netBasis: { rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true };
+    const row = { dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head, status: 'ok' };
+    const result = await speculateRedTeam({ repo, pr, read, env: {}, resume }, {
+      now: () => 1000, readRecords: () => [row], log: vi.fn(),
+      listComments: () => [{ body: redTeamMarker(pr, head), author: { login: 'web-everything' } }],
+    });
+    expect(result.status).toBe(resume ? 'already-ran' : 'prior-row');
+  });
+});
+
+describe('empty net diff terminal publication through the production carry path', () => {
+  const git = (cwd, args) => execFileSync('git', ['-C', cwd, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+    '-c', 'commit.gpgsign=false', ...args], { encoding: 'utf8' }).trim();
+  // A real lane clone: the empty-diff proof is re-read from Git in the review checkout, never trusted from the payload.
+  function laneFixture(root, { realDiff = false, replaceRef = false } = {}) {
+    const lanePath = join(root, 'lane');
+    execFileSync('git', ['init', '--quiet', '--initial-branch=main', lanePath]);
+    writeFileSync(join(lanePath, 'file.txt'), 'base\n');
+    git(lanePath, ['add', 'file.txt']);
+    git(lanePath, ['commit', '--quiet', '-m', 'base']);
+    const base = git(lanePath, ['rev-parse', 'HEAD']);
+    if (realDiff) {
+      writeFileSync(join(lanePath, 'file.txt'), 'changed\n');
+      git(lanePath, ['commit', '--quiet', '-am', 'head']);
+    } else git(lanePath, ['commit', '--quiet', '--allow-empty', '-m', 'head']);
+    const sha = git(lanePath, ['rev-parse', 'HEAD']);
+    if (replaceRef) {
+      // Plant refs/replace/<head> → a commit carrying the base tree, so a replace-honouring diff of base..head reads empty.
+      const planted = git(lanePath, ['commit-tree', `${base}^{tree}`, '-p', base, '-m', 'planted']);
+      git(lanePath, ['replace', sha, planted]);
+    }
+    return { lanePath, base, sha };
+  }
+  function productionCarry({ skipCardOnly, realDiff = false, replaceRef = false }) {
+    const root = mkdtempSync(join(tmpdir(), 'empty-net-diff-carry-'));
+    const { lanePath, base, sha } = laneFixture(root, { realDiff, replaceRef });
+    const env = { WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_SKIP_CARD_ONLY: skipCardOnly ? '1' : '0',
+      WE_RED_TEAM_STATUS_LABELS: '0' };
+    const comments = [], labels = ['red-team:pending'], gitCwds = [], gitOutputs = [];
+    const exec = vi.fn((file, args, options = {}) => {
+      if (file === 'git') {
+        gitCwds.push(options.cwd);
+        const output = execFileSync(file, args, options);
+        gitOutputs.push(output);
+        return output;
+      }
+      expect(file).toBe('gh');
+      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefOid: sha, labels });
+      if (args[0] === 'api' && args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: comments.length } } } } });
+      if (args[0] === 'api') return comments.map(comment => [
+        comment.body.replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/\t/g, '\\t'),
+        '2026-11-17T00:00:00Z', comment.author.login, comment.id, '',
+      ].join('\t')).join('\n');
+      if (args[0] === 'label') return '';
+      if (args[1] === 'edit') { labels.splice(0, labels.length, 'red-team:clear'); return ''; }
+      if (args[1] === 'comment') {
+        comments.push({ id: `IC_${comments.length}`, body: options.input, author: { login: 'web-everything' } });
+        return '';
+      }
+      throw Error(`unexpected command ${file} ${args.join(' ')}`);
+    });
+    const loopPayload = { runId: 'review-pr-empty', stopped: 'complete', verdict: { verdict: 'changes' }, findings: { read: {
+      title: 'Empty head', body: '', diffText: '', diffScored: true, netChangedFiles: [], netRenameSources: [],
+      netBasis: { rev: sha, base, scored: true } } } };
+    const key = { repo, pr, head: sha, env };
+    const readEvidence = k => readDrainRedTeamEvidence({ ...k, env, runsDir: env.WE_SHARED_RUNS_DIR, readScorecards: () => [] });
+    writeRun({ ...newRunRecord({ id: loopPayload.runId, op: 'review-pr', input: { repo, pr } }), ...loopPayload }, env.WE_SHARED_RUNS_DIR);
+    recordRedTeamStatus({ repo, pr, loopPayload, status: 'finished', result: { ...emptySkip } }, { env });
+    const production = createReviewJobIo({ root, env, exec, readEvidence, readSeatRecords: () => [] });
+    const f = fixture();
+    Object.assign(f.io, {
+      acquireLane: () => ({ lanePath }), readRedTeamOnlyPayload: k => ({ ...readEvidence(k), head: sha }),
+      prepareLane: () => ({ head: sha }), fetchRedTeamHead: () => ({ head: sha }), redTeamSkipCardOnlySetting: production.redTeamSkipCardOnlySetting,
+      settleRedTeamSkip: vi.fn(production.settleRedTeamSkip),
+    });
+    return { root, lanePath, base, sha, key, comments, labels, gitCwds, gitOutputs, exec, io: f.io, loopPayload };
+  }
+
+  it.each([true, false])('publishes empty-net-diff clearance with card-only skipping %s', skipCardOnly => {
+    const c = productionCarry({ skipCardOnly });
+    try {
+      expect(c.io.redTeamSkipCardOnlySetting()).toBe(skipCardOnly);
+      const out = runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' }, c.io);
+      expect(out.redTeam).toMatchObject({ ...emptySkip, outcome: 'policy-clear' });
+      expect(c.io.settleRedTeamSkip).toHaveBeenCalledWith(expect.objectContaining({ redTeam: emptySkip }));
+      // Terminal marker: exactly one trusted result comment naming the empty-diff exemption, label cleared.
+      expect(c.comments.map(comment => comment.body)).toEqual([
+        `${redTeamMarker(pr, c.sha)}\n\nRed team not required on this head: not-owed: empty net diff`]);
+      expect(c.labels).toEqual(['red-team:clear']);
+      expect(readRedTeamCarry(c.key).step).toBe('done');
+      // The carry's stored policy and reason are the empty-diff provenance, never card-only.
+      expect(readRedTeamStatus(c.key)).toMatchObject({ status: 'finished', result: emptySkip, loopPayload: { verdict: null } });
+      // The proof was re-read inside the prepared review lane, not the daemon checkout.
+      expect(c.gitCwds.length).toBeGreaterThan(0);
+      expect(new Set(c.gitCwds)).toEqual(new Set([c.lanePath]));
+      for (const hook of ['redTeamStatus', 'runRedTeam', 'runLoop']) expect(c.io[hook]).not.toHaveBeenCalled();
+      // A repeated dispatch is idempotent: no second comment or label write.
+      expect(runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' }, c.io).redTeam?.outcome ?? 'settled').not.toBe('policy-clear');
+      expect(c.comments).toHaveLength(1);
+    } finally { rmSync(c.root, { recursive: true, force: true }); }
+  });
+
+  it.each([true, false])('refuses an empty-diff claim the review lane disproves (card-only skipping %s)', skipCardOnly => {
+    const c = productionCarry({ skipCardOnly, realDiff: true });
+    try {
+      const out = runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' }, c.io);
+      expect(out.redTeam).toMatchObject({ outcome: 'non-policy', reason: expect.stringContaining('empty net diff not proven') });
+      expect(c.comments).toEqual([]);
+      expect(c.labels).toEqual(['red-team:pending']);
+      expect(readRedTeamCarry(c.key)).toBeNull();
+      // The refusal came from the lane's own diff naming the changed file, not from a failed Git call.
+      expect(new Set(c.gitCwds)).toEqual(new Set([c.lanePath]));
+      expect(c.gitOutputs).toEqual(['file.txt\0']);
+    } finally { rmSync(c.root, { recursive: true, force: true }); }
+  });
+
+  it.each([true, false])('refuses an empty-diff claim a planted replace ref fakes (card-only skipping %s)', skipCardOnly => {
+    const c = productionCarry({ skipCardOnly, realDiff: true, replaceRef: true });
+    try {
+      // Control: the planted replace ref really does make a replace-honouring diff of base..head read empty.
+      expect(git(c.lanePath, ['diff', '--name-only', `${c.base}..${c.sha}`])).toBe('');
+      // Mutation: the exact production probe minus --no-replace-objects would accept the faked empty diff.
+      const read = c.loopPayload.findings.read;
+      const dropFlag = (file, args, options) => execFileSync(file, args.filter(arg => arg !== '--no-replace-objects'), options);
+      expect(verifyEmptyNetDiff(read, c.sha, { exec: dropFlag, cwd: c.lanePath })).toBe(true);
+      expect(verifyEmptyNetDiff(read, c.sha, { cwd: c.lanePath })).toBe(false);
+      // Production: the claim is refused — non-policy, no comment, label unchanged, no carry.
+      const out = runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' }, c.io);
+      expect(out.redTeam).toMatchObject({ outcome: 'non-policy', reason: expect.stringContaining('empty net diff not proven') });
+      expect(c.comments).toEqual([]);
+      expect(c.labels).toEqual(['red-team:pending']);
+      expect(readRedTeamCarry(c.key)).toBeNull();
+      expect(new Set(c.gitCwds)).toEqual(new Set([c.lanePath]));
+      expect(c.exec.mock.calls.filter(([file]) => file === 'git').every(([, args]) => args[0] === '--no-replace-objects')).toBe(true);
+      expect(c.gitOutputs).toEqual(['file.txt\0']);
+    } finally { rmSync(c.root, { recursive: true, force: true }); }
+  });
+
+  it('carry eligibility exempts only a proven empty read when card-only skipping is disabled', () => {
+    const proven = { netBasis: { rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true };
+    const readLive = vi.fn(() => null);
+    const carry = createRedTeamCarryIo({ env: { WE_RED_TEAM_SKIP_CARD_ONLY: '0' }, readLive, readComments: () => [] });
+    expect(carry.eligible({ repo, pr, head, loopPayload: { findings: { read: { ...proven, netChangedFiles: ['backlog/5872.md'], diffText: '+card' } } } })).toBe(false);
+    expect(carry.eligible({ repo, pr, head, loopPayload: { findings: { read: { ...proven, diffScored: false } } } })).toBe(false);
+    expect(readLive).not.toHaveBeenCalled();
+    // A proven empty read passes the policy gate and reaches the live guards (which then refuse a missing head).
+    expect(carry.eligible({ repo, pr, head, loopPayload: { findings: { read: proven } } })).toBe(false);
+    expect(readLive).toHaveBeenCalledOnce();
+  });
+
+  it('a head-move carry rebinding an empty source read never proves the new head empty', () => {
+    const from = 'b'.repeat(40);
+    const read = { netBasis: { rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true };
+    expect(provenEmptyNetDiffPayload({ findings: { read } }, head)).toBe(true);
+    expect(provenEmptyNetDiffPayload({ carriedFrom: head, findings: { read } }, head)).toBe(true);
+    expect(provenEmptyNetDiffPayload({ carriedFrom: from, findings: { read } }, head)).toBe(false);
+    const rebound = { repo, pr, head, loopPayload: { carriedFrom: from, verdict: null, findings: { read } } };
+    expect(emptyNetDiffSkip({ repo, pr, head, status: 'finished', result: { ...emptySkip }, loopPayload: rebound.loopPayload }, head)).toBe(false);
+    // Policy off: the rebound read cannot buy the empty-diff exemption past the policy gate.
+    const readLive = vi.fn(() => null), writeStatus = vi.fn(), postResult = vi.fn();
+    const carry = createRedTeamCarryIo({ env: { WE_RED_TEAM_SKIP_CARD_ONLY: '0' }, readLive, readComments: () => [], writeStatus, postResult });
+    expect(carry.eligible(rebound)).toBe(false);
+    expect(readLive).not.toHaveBeenCalled();
+    // Any effect for a moved carry keeps card-only provenance and text.
+    carry.recordIntent(rebound);
+    expect(writeStatus.mock.calls[0][0].result).toEqual({ status: 'skipped', policy: 'card-only' });
+    carry.postResult(rebound);
+    expect(postResult.mock.calls[0][0].body).toContain('card-only diff (policy redTeam.skipCardOnly)');
   });
 });

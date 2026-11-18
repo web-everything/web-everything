@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { provenEmptyNetDiffPayload, EMPTY_NET_DIFF_SKIP } from '../lib/red-team-empty-net-diff.mjs';
 import { proveCardOnlyHeadMove } from '../lib/card-only-head-move.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus, redTeamStatusDir, readRecoveryWitness, restoreRecoveryWriter, createCarriedCheckPublisher, markCarriedCheckUnpublished } from '../lib/drain-red-team-evidence.mjs';
@@ -346,7 +347,12 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       env,
       log: line => process.stderr.write(`${line}\n`),
       readComments,
+      readStatus,
       postComment,
+      // The empty-diff proof is re-read in the prepared review checkout, with hardened lane Git; no
+      // checkout leaves cwd unset, and missing objects fail the proof closed (operator hold).
+      cwd: input.carry?.lanePath ?? input.lanePath,
+      gitExec: (file, args, options) => exec(file, args, { ...options, env: laneGitHardeningEnv(env) }),
       ...(input.carry ? { carry: createRedTeamCarryIo({ env, readStatus, writeStatus, readEvidence,
         readLive: ({ repo, pr }) => provider.readPrState(repo, pr), readComments,
         lanePath: input.carry.lanePath,
@@ -436,6 +442,11 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
         ...(input.retryCount === 1 ? { retrySpent: true } : {}),
         prior: admissionPrior == null ? null : { repo: admissionPrior.repo, pr: admissionPrior.pr, head: admissionPrior.head,
           status: admissionPrior.status, result: admissionPrior.result,
+          // Only a skipped retry needs the prior read and owed verdict when the runner
+          // rechecks failedRedTeamRetry. Keep ordinary resume admissions unchanged.
+          ...(normalizeRedTeamResult(admissionPrior.result).priorResult === 'skipped' && admissionPrior.loopPayload
+            ? { loopPayload: { verdict: admissionPrior.loopPayload.verdict,
+            findings: { read: admissionPrior.loopPayload.findings?.read } } } : {}),
           ...(admissionPrior.retryCount !== undefined ? { retryCount: admissionPrior.retryCount } : {}) } } } : {}) };
     },
     root,
@@ -797,7 +808,7 @@ export function summarizeRedTeam(r) {
     ...(r.deferredByCap ? { deferredByCap: true } : {}),
     ...(r.deferredByGuard ? { deferredByGuard: true } : {}),
     ...(r.reason ? { reason: r.reason } : {}),
-    ...(r.status === 'skipped' && classifyRedTeamSkip(r).kind === 'policy' ? { policy: 'card-only' } : {}),
+    ...(r.status === 'skipped' && classifyRedTeamSkip(r).kind === 'policy' ? { policy: r.policy } : {}),
     ...(r.status === 'ran' ? {
       provider: r.provider, model: r.model, seatStatus: r.seat?.status ?? null, foldedVerdict: r.foldedVerdict ?? null,
       recheckStatus: r.recheckStatus ?? null, confirmedMissCount: r.confirmedMissCount ?? 0,
@@ -976,7 +987,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
         const readHead = isRealHead(rev) ? rev : null;
         const head = readHead ?? seatsBox.laneHead;
         const settled = io.settleRedTeamSkip({ redTeam: settlementOutcome, repo: out.repo, pr: out.pr,
-          head, readHead, runId: out.runId });
+          head, readHead, runId: out.runId, lanePath: seatsBox.input?.lanePath });
         out.redTeam = { ...out.redTeam, ...settled };
       } catch (error) {
         try { io.log(`review-job ${out.sessionSlug}: red-team skip settlement failed (${tail(error?.message ?? error, 300)})`); }
@@ -1005,7 +1016,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
       const result = admissionDeferred && prior ? prior.result
         : seatsBox.priorRedTeamResult != null && !['ran', 'resumed', 'failed'].includes(out.redTeam?.status)
           ? seatsBox.priorRedTeamResult : out.redTeam?.status === 'skipped'
-            ? { status: 'skipped', ...(out.redTeam.policy === 'card-only' ? { policy: 'card-only' } : {}) }
+            ? { status: 'skipped', ...(classifyRedTeamSkip(out.redTeam).kind === 'policy' ? { policy: out.redTeam.policy, ...(out.redTeam.reason ? { reason: out.redTeam.reason } : {}) } : {}) }
             : out.redTeam?.status ?? null;
       // A cap or guard deferral (including a disabled switch) precedes the model call. Return this
       // admission's retry spend so the failed seat stays eligible once the cap, switch or transient read
@@ -1280,13 +1291,16 @@ function runReviewArc({
         // potentially slow proof/fetch, before admission writes or settlement.
         let skipCardOnly = false;
         try { skipCardOnly = io.redTeamSkipCardOnlySetting?.() === true; } catch { /* fail closed */ }
-        if (!skipCardOnly) {
+        // A head-move carry's rebound read is the source's diff, so it never proves this head empty.
+        const emptyNetDiff = provenEmptyNetDiffPayload(loopPayload, head);
+        if (!skipCardOnly && !emptyNetDiff) {
           classified = { outcome: 'red-team-not-owed', reason: 'live card-only skip policy is disabled or unreadable' };
           return result({ ...classified, lanePath });
         }
         // Carry publication owns its journal, compatibility status, label and comment while
         // this job still holds the lane/claim. It never enters queued model admission.
-        const redTeam = { status: 'skipped', policy: 'card-only', reason: 'red team skipped: card-only' };
+        const redTeam = emptyNetDiff ? { ...EMPTY_NET_DIFF_SKIP }
+          : { status: 'skipped', policy: 'card-only', reason: 'red team skipped: card-only' };
         const settled = io.settleRedTeamSkip({ repo: planned.repo, pr: planned.pr, head, readHead: head,
           redTeam, carry: { loopPayload, lanePath } });
         classified = { outcome: 'red-team-only' };

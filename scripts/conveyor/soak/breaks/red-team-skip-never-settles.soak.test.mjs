@@ -25,9 +25,9 @@ it('settlement module alone is incomplete evidence of the daemon fix', () => {
 
 it.each([
   ['stored-review authority', settlement, 'const storedClear = input.storedReviewPolicyClear === true'],
-  ['stored-review classification', settlement, 'const classified = storedClear ?'],
+  ['stored-review classification', settlement, 'let classified = storedClear ?'],
   ['default daemon settlement', recovery, 'settle = settleRedTeamSkip'],
-  ['daemon settlement call', recovery, "const result = settle({ redTeam: { status: 'not-owed' }"],
+  ['daemon settlement call', recovery, "const result = settle({ redTeam: row.policy === EMPTY_NET_DIFF_SKIP.policy ? { ...EMPTY_NET_DIFF_SKIP } : { status: 'not-owed' }"],
   ['daemon policy authority', recovery, 'storedReviewPolicyClear: true'],
   ['job settlement call', job, 'const settled = io.settleRedTeamSkip('],
 ])('fix detection refuses missing %s', (_name, path, feature) => {

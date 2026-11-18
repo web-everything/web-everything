@@ -403,3 +403,69 @@ describe('stored-review not-owed rule (R730)', () => {
     });
   });
 });
+
+describe('empty net diff policy settlement', () => {
+  it('publishes the terminal policy-clear reason exactly once using a config-independent emptiness probe', () => {
+    const f = fixture();
+    f.io.readStatus = () => ({ head, loopPayload: { findings: { read: { netBasis: { base: 'c'.repeat(40), rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true } } } });
+    f.io.gitExec = vi.fn(() => '');
+    const skip = { status: 'skipped', policy: 'empty-net-diff', reason: 'red team skipped: empty net diff' };
+    expect(classifyRedTeamSkip(skip).kind).toBe('policy');
+    expect(f.settle(skip).outcome).toBe('policy-clear');
+    expect(f.comments[0].body).toContain('Red team not required on this head: not-owed: empty net diff');
+    expect(f.settle(skip).outcome).toBe('already');
+    expect(f.io.postComment).toHaveBeenCalledTimes(1);
+    expect(f.io.gitExec.mock.calls[0][1]).toContain(`${'c'.repeat(40)}..${head}`);
+    expect(f.io.gitExec.mock.calls[0][1][0]).toBe('--no-replace-objects');
+    expect(f.io.gitExec.mock.calls[0][1]).toEqual(expect.arrayContaining([
+      '--no-replace-objects', '--ignore-submodules=none', '--no-ext-diff', '--no-textconv', '--no-renames',
+    ]));
+  });
+});
+
+it.each(['absent', 'unreadable', 'wrong head', 'unscored text', 'nonempty'])('empty net diff settlement refuses %s stored proof', kind => {
+  const f = fixture();
+  const read = { netBasis: { base: 'c'.repeat(40), rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true };
+  f.io.readStatus = () => {
+    if (kind === 'unreadable') throw Error('unreadable');
+    if (kind === 'absent') return null;
+    if (kind === 'unscored text') read.diffScored = false;
+    if (kind === 'nonempty') read.diffText = '+code';
+    return { head: kind === 'wrong head' ? 'b'.repeat(40) : head, loopPayload: { findings: { read } } };
+  };
+  const result = f.settle({ status: 'skipped', policy: 'empty-net-diff' });
+  expect(result.outcome).not.toBe('policy-clear');
+  expect(f.io.postComment).not.toHaveBeenCalled();
+  expect(f.io.publishNeedsYou).toHaveBeenCalled();
+});
+
+
+it.each(['nonempty after recording', 'probe error', 'oversized probe', 'missing base'])('R979 refuses empty-net settlement on %s', kind => {
+  const f = fixture();
+  const base = 'c'.repeat(40);
+  const read = { netBasis: { base, rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true };
+  if (kind === 'missing base') delete read.netBasis.base;
+  f.io.readStatus = () => ({ head, loopPayload: { findings: { read } } });
+  f.io.gitExec = vi.fn((_file, args, options) => {
+    expect(args).toContain(`${base}..${head}`);
+    expect(options.maxBuffer).toBe(1024 * 1024);
+    if (kind === 'probe error' || kind === 'oversized probe') throw Error(kind);
+    return 'code.mjs\0';
+  });
+  expect(f.settle({ status: 'skipped', policy: 'empty-net-diff' }).outcome).toBe('non-policy');
+  expect(f.io.postComment).not.toHaveBeenCalled();
+  expect(f.io.publishNeedsYou).toHaveBeenCalled();
+});
+
+
+it('R979 refuses an advanced nonempty head between recording and settlement', () => {
+  const f = fixture();
+  const advancedHead = 'b'.repeat(40);
+  f.io.readStatus = () => ({ head: advancedHead, loopPayload: { findings: { read: {
+    netBasis: { base: 'c'.repeat(40), rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true,
+  } } } });
+  f.io.gitExec = vi.fn(() => 'code.mjs\0');
+  expect(f.settle({ status: 'skipped', policy: 'empty-net-diff' }, { head: advancedHead, readHead: advancedHead }).outcome).toBe('non-policy');
+  expect(f.io.postComment).not.toHaveBeenCalled();
+  expect(f.io.publishNeedsYou).toHaveBeenCalled();
+});
