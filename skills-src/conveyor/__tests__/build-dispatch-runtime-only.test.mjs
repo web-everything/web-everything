@@ -112,6 +112,17 @@ describe('runtime-only build dispatch', () => {
     expect(effects.dispatch).not.toHaveBeenCalled();
   });
 
+  it('launches no allowed prepare with prepareAheadWindow 0, including with an older planner', async () => {
+    const effects = effectsFor({ decisions: { spawnPrepareItems: [rows[0]],
+      admission: { queue: [rows[0]], held: [{ num: '7201', reason: 'needs-prepare' }] } }, nextState: {} });
+    const tick = await runBuildDispatchTick({ live: true, effects,
+      policy: { ...policy, prepareAheadWindow: 0, prepareAheadWindowExplicit: true },
+      buildPriority: only(['7201']) });
+    expect(tick.prepare.planned).toEqual([]);
+    expect(tick.prepare.launched).toEqual([]);
+    expect(effects.dispatch).not.toHaveBeenCalled();
+  });
+
   it('admits nothing for the top listed id when builds fill prepareAheadWindow', async () => {
     const settings = only(['7204', '8001', '8002']);
     const data = input(settings);

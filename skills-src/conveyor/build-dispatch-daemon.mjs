@@ -1439,6 +1439,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   if (prepareEnabled && !prepare.freezeHeld) {
     for (const pick of prepareSpawns) {
       const num = normNum(pick.num);
+      if ((buildPriority?.only || buildPriority?.held) && !windowNums?.has(num)) continue;
       // tick-core's cap is two (the light cap with the rule ON); it may offer fewer after its own admission checks.
       if (prepareGroupPlan.absorbed.has(num) || prepareMembers.has(num)
         || finishedPrepares.has(num) || heldNums.has(num) || refusedPrepares.has(num) || refusalHeldNums.has(num)
