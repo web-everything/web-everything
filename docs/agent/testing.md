@@ -4665,3 +4665,8 @@ comparison against daemon observations; fixtures prove IO counts without live Gi
 The standalone provider read does not guarantee complete comments. Keep the unknown-gate,
 incomplete-newest-advisory, stale-result-id and standalone cases in
 `review-status-tag.test.mjs` and the `concluded-review-lingering-process` soak break.
+Read results through `redTeamResultCommentForHead` (including trusted verdict carries) and
+use the holding comment's creation time. Publishability alone does not establish clearance:
+`planRedTeamActions` must yield no send-back under the live confirmed-break policy, and
+`liveResultGateState` must agree with the result id and allowed gate outcomes. Inject the
+policy reader in fixtures; an unreadable policy preserves the reviewing hold.

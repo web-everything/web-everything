@@ -4,11 +4,14 @@
  * one IO test over injected fakes — no `claude`/`gh` process anywhere in this file.
  */
 import { describe, it, expect } from 'vitest';
-import { parseRedTeamComment, redTeamResultId } from '../../lib/red-team-gate.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, parseRedTeamComment, redTeamResultId, redTeamForHead } from '../../lib/red-team-gate.mjs';
 
-import { reviewConcluded, deriveReviewStatus, describeReviewState, planStatusLabelChange, tagReviewStatus as tagReviewStatusIo, applyReviewStatus, STATUS_LABEL_RE } from '../review-status-tag.mjs';
+import { reviewConcluded as reviewConcludedIo, deriveReviewStatus, describeReviewState, planStatusLabelChange, tagReviewStatus as tagReviewStatusIo, applyReviewStatus, STATUS_LABEL_RE } from '../review-status-tag.mjs';
+const readConfirmedBreaks = () => ({ value: { ...CONFIRMED_BREAKS_DEFAULTS, findingClasses: {} } });
+const reviewConcluded = (labels, subject, pr = subject?.number, options = {}) =>
+  reviewConcludedIo(labels, subject, pr, { readConfirmedBreaks, ...options });
 const tagReviewStatus = (options) => tagReviewStatusIo({
-  signalFix: () => {}, readRequiredChecks: () => ({ checks: undefined }), loadStatusSettings: () => { throw new Error('settings unavailable'); },
+  readConfirmedBreaks, signalFix: () => {}, readRequiredChecks: () => ({ checks: undefined }), loadStatusSettings: () => { throw new Error('settings unavailable'); },
   ...options,
 });
 
@@ -552,9 +555,9 @@ describe('concluded head review with a lingering process', () => {
   const accepted = ['review:accepted', 'red-team:clear'];
   const headRefOid = 'ad05aa50' + 'a'.repeat(32);
   const now = Date.parse('2026-11-18T12:00:00Z');
-  const comment = { author: { login: 'chalbert' }, createdAt: now - 180_000,
+  const comment = { author: { login: 'chalbert' }, createdAt: new Date(now - 180_000).toISOString(),
     body: `<!-- we:red-team-advisory pr=7099 rev=${headRefOid} -->\n\nRed team not required on this head: not owed (stored review)` };
-  const gate = { author: comment.author, body: `<!-- we:red-team-gate pr=7099 rev=${headRefOid} outcome=no-send-back -->` };
+  const gate = { author: comment.author, body: `<!-- we:red-team-gate pr=7099 rev=${headRefOid} outcome=no-send-back result=${redTeamResultId(parseRedTeamComment(comment.body))} -->` };
   const subject = { number: 7099, headRefOid, comments: [gate, comment] };
   const row = { name: 'review-7099', state: 'working', pid: 12345, startedAt: now - 600_000 };
   const derive = (fields = {}, options = {}) => deriveReviewStatus({ pr: 7099,
@@ -640,21 +643,53 @@ describe('concluded head review with a lingering process', () => {
     expect(reviewConcluded(accepted, { ...subject, comments: [comment] })).toEqual({ createdAt: comment.createdAt });
   });
   it('keeps reviewing on incomplete advisory evidence, including a newest incomplete result', () => {
-    const incomplete = { ...comment, createdAt: now - 150_000, body: comment.body.split('\n')[0] };
+    const incomplete = { ...comment, createdAt: new Date(now - 150_000).toISOString(), body: comment.body.split('\n')[0] };
     for (const comments of [[gate, incomplete], [gate, comment, incomplete]]) {
       expect(reviewConcluded(accepted, { ...subject, comments })).toBe(false);
     }
   });
   it('keeps reviewing when an older card-queued result differs from the newest trusted advisory', () => {
-    const newer = { ...comment, createdAt: now - 150_000,
+    const newer = { ...comment, createdAt: new Date(now - 150_000).toISOString(),
       body: `${comment.body.split('\n')[0]}\n1. [not confirmed] (edge-case, degraded) \`scripts/x.mjs:1\` — newer result\nAdvisory only: red team · recorded verdict \`accept\`.` };
     const resultGate = { ...gate, body: gate.body.replace('outcome=no-send-back',
-      `outcome=card-queued result=${redTeamResultId(parseRedTeamComment(comment.body))}`) };
+      'outcome=card-queued') };
     // Thread order in the array cannot make the older result the newest.
     expect(reviewConcluded(accepted, { ...subject, comments: [newer, resultGate, comment] })).toBe(false);
     const matching = { ...resultGate, body: resultGate.body.replace(
       redTeamResultId(parseRedTeamComment(comment.body)), redTeamResultId(parseRedTeamComment(newer.body))) };
     expect(reviewConcluded(accepted, { ...subject, comments: [newer, matching, comment] })).toEqual({ createdAt: newer.createdAt });
+  });
+  const findingResult = (impact = 'broken') => ({ ...comment,
+    createdAt: new Date(now - 150_000).toISOString(),
+    body: `${comment.body.split('\n')[0]}\n1. [**confirmed**] (edge-case, ${impact}) \`scripts/x.mjs:1\` — confirmed break\nAdvisory only: red team · recorded verdict \`changes\`.` });
+  it('keeps reviewing for completed changes with a confirmed broken finding and no gate record', () => {
+    expect(redTeamForHead([findingResult()], 7099, headRefOid)?.findings[0]?.confirmed).toBe(true);
+    const evidence = reviewConcluded(accepted, { ...subject, comments: [findingResult()] });
+    expect(evidence).toBe(false);
+    expect(derive({}, { reviewConcluded: evidence })?.state).toBe('reviewing');
+  });
+  it('keeps reviewing when a newer verdict carry contains a confirmed break after an older policy-clear', () => {
+    const broken = findingResult();
+    const carried = { ...broken, body: `<!-- review-verdict-carried from=${'b'.repeat(40)} to=${headRefOid} patch-id=${'c'.repeat(40)} -->\nReview verdict carried across an identical contribution.\n${broken.body}` };
+    const comments = [gate, comment, carried];
+    expect(redTeamForHead(comments, 7099, headRefOid)?.findings[0]?.confirmed).toBe(true);
+    const evidence = reviewConcluded(accepted, { ...subject, comments });
+    expect(evidence).toBe(false);
+    expect(derive({}, { reviewConcluded: evidence })?.state).toBe('reviewing');
+  });
+  it('clears a completed changes result with a card-queued degraded finding (PR 7105 shape)', () => {
+    const degraded = findingResult('degraded');
+    const card = { ...gate, body: `<!-- we:red-team-gate pr=7099 rev=${headRefOid} outcome=card-queued result=${redTeamResultId(parseRedTeamComment(degraded.body))} -->` };
+    const evidence = reviewConcluded(accepted, { ...subject, comments: [degraded, card] });
+    expect(evidence).toEqual({ createdAt: degraded.createdAt });
+    expect(derive({}, { reviewConcluded: evidence })).toBeNull();
+  });
+  it('keeps reviewing when the confirmed-break policy read fails', () => {
+    const evidence = reviewConcluded(accepted, subject, 7099, {
+      readConfirmedBreaks: () => { throw new Error('unreadable policy'); },
+    });
+    expect(evidence).toBe(false);
+    expect(derive({}, { reviewConcluded: evidence })?.state).toBe('reviewing');
   });
   it('standalone calls keep reviewing without a supplied complete daemon snapshot; supplied snapshots clear', () => {
     for (const supplied of [false, true]) {

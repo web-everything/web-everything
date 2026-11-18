@@ -14,7 +14,7 @@ export default {
   fixPresent() { return true; },
   async run({ sourceRoot = ROOT, log } = {}) {
     const { tagReviewStatus } = await import(pathToFileURL(join(sourceRoot, PATH)).href);
-    const { parseRedTeamComment, redTeamResultId } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/red-team-gate.mjs')).href);
+    const { CONFIRMED_BREAKS_DEFAULTS, parseRedTeamComment, redTeamResultId } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/red-team-gate.mjs')).href);
     const violations = [];
     const check = (ok, name) => {
       if (!ok) violations.push(name);
@@ -26,14 +26,22 @@ export default {
     const advisory = { author: { login: 'chalbert' }, createdAt: new Date(now - 180_000).toISOString(),
       body: `<!-- we:red-team-advisory pr=7099 rev=${headRefOid} -->\n\nRed team not required on this head: not owed (stored review)` };
     const gate = { author: advisory.author,
-      body: `<!-- we:red-team-gate pr=7099 rev=${headRefOid} outcome=no-send-back -->` };
+      body: `<!-- we:red-team-gate pr=7099 rev=${headRefOid} outcome=no-send-back result=${redTeamResultId(parseRedTeamComment(advisory.body))} -->` };
     const comments = [gate, advisory];
     const newer = { ...advisory, createdAt: new Date(now - 150_000).toISOString(),
       body: `${advisory.body.split('\n')[0]}\n1. [not confirmed] (edge-case, degraded) \`scripts/x.mjs:1\` — newer result\nAdvisory only: red team · recorded verdict \`accept\`.` };
     const olderGate = { ...gate, body: gate.body.replace('outcome=no-send-back',
-      `outcome=card-queued result=${redTeamResultId(parseRedTeamComment(advisory.body))}`) };
+      'outcome=card-queued') };
+    const broken = { ...newer, body: newer.body.replace('[not confirmed]', '[**confirmed**]')
+      .replace('degraded', 'broken').replace('`accept`', '`changes`') };
+    const carried = { ...broken, body: `<!-- review-verdict-carried from=${'b'.repeat(40)} to=${headRefOid} patch-id=${'c'.repeat(40)} -->\nReview verdict carried across an identical contribution.\n${broken.body}` };
+    const degraded = { ...broken, body: broken.body.replace('broken', 'degraded') };
+    const card = { ...gate, body: `<!-- we:red-team-gate pr=7099 rev=${headRefOid} outcome=card-queued result=${redTeamResultId(parseRedTeamComment(degraded.body))} -->` };
     for (const [verdict, expectedReview, expectedStatus, prFields = {}, agentFields = {}, standalone = false] of [
       [accepted, null, 'ready-to-merge'],
+      [accepted, 'reviewing', 'red-team', { comments: [broken] }],
+      [accepted, 'reviewing', 'red-team', { comments: [...comments, carried] }],
+      [accepted, null, 'ready-to-merge', { comments: [degraded, card] }],
       [accepted, 'reviewing', 'red-team', {}, {}, true],
       [accepted, 'reviewing', 'red-team', { comments: [newer, olderGate, advisory] }],
       [accepted, 'reviewing', 'red-team', { comments: [...comments,
@@ -80,6 +88,7 @@ export default {
         agents: [{ name: 'review-7099', state: 'working', pid: 7099,
           startedAt: now - 600_000, ...agentFields }],
         ...(standalone ? {} : { prState: snapshot }),
+        readConfirmedBreaks: () => ({ value: { ...CONFIRMED_BREAKS_DEFAULTS, findingClasses: {} } }),
         readFixClaim: () => null, planRows: [], requiredChecks: ['test'],
         prStatusSettings: { acceptedRedTeamStatus: 'red-team' }, signalFix: () => {},
       });

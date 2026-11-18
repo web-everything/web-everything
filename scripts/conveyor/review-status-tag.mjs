@@ -27,8 +27,7 @@
  * migrate; `legacyReviewStatus:false` removes them except the durable `review-status:draft-withdrawn` hold.
  */
 import { signalFixDispatch } from '../lib/fix-handoff.mjs';
-import { trustedAdvisoryComments } from '../lib/advisory-labels.mjs';
-import { parseRedTeamGateMarker, gateOutcomesForHead, parseRedTeamComment, isPublishableRedTeamResult, redTeamResultId } from '../lib/red-team-gate.mjs';
+import { redTeamResultCommentForHead, gateOutcomesForHead, liveResultGateState, planRedTeamActions, readConfirmedBreaks, isPublishableRedTeamResult, redTeamResultId } from '../lib/red-team-gate.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { excusePrMergeGateHolds, readMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
@@ -101,7 +100,7 @@ export const STATUS_LABEL_RE = /^review-status:(reviewing|review-stalled|fixing|
 const LIVE_STATES = Object.freeze({ working: 'reviewing', blocked: 'stalled' });
 
 /** Head-bound acceptance is complete only with an unambiguous red-team clearance. */
-export function reviewConcluded(labels, subject, pr = subject?.number) {
+export function reviewConcluded(labels, subject, pr = subject?.number, { readConfirmedBreaks: readPolicy = readConfirmedBreaks } = {}) {
   const head = subject?.headRefOid;
   if (!Number.isSafeInteger(Number(pr)) || Number(pr) <= 0
     || !Array.isArray(labels) || typeof head !== 'string' || !/^[a-f0-9]{40}$/i.test(head)) return false;
@@ -110,22 +109,22 @@ export function reviewConcluded(labels, subject, pr = subject?.number) {
   if (!names.includes('review:accepted') || !names.includes('red-team:clear')
     || names.some(name => ['review:pending', 'review:changes', 'review:human',
       'red-team:pending', 'red-team:blocked', 'review-status:draft-withdrawn'].includes(name))) return false;
-  const comments = trustedAdvisoryComments(subject?.comments);
-  const outcomes = gateOutcomesForHead(comments, pr, head);
-  if ([...outcomes].some(outcome => !['card-queued', 'no-send-back'].includes(outcome))) return false;
-  const advisories = comments.map(comment => ({ comment, parsed: parseRedTeamComment(comment.body) }))
-    .filter(({ parsed }) => parsed?.pr === Number(pr) && parsed.rev === head.toLowerCase());
-  // Unknown chronology cannot establish which result is newest. Equal times retain thread order.
-  if (advisories.some(({ comment }) => !Number.isFinite(timestampMs(comment.createdAt)))) return false;
-  const advisory = advisories.sort((a, b) => timestampMs(a.comment.createdAt) - timestampMs(b.comment.createdAt)).at(-1);
-  if (!isPublishableRedTeamResult(advisory?.parsed)) return false;
-  const resultId = redTeamResultId(advisory.parsed);
-  if (comments.some(comment => {
-    const marker = parseRedTeamGateMarker(comment.body);
-    return marker?.pr === Number(pr) && marker.rev === head.toLowerCase()
-      && marker.result && marker.result !== resultId;
-  })) return false;
-  return { createdAt: advisory.comment.createdAt };
+  const comments = subject?.comments;
+  // The canonical reader filters trusted authors and includes verdict-carry records.
+  const evidence = redTeamResultCommentForHead(comments, pr, head);
+  if (!isPublishableRedTeamResult(evidence?.parsed)
+    || !Number.isFinite(timestampMs(evidence.comment.createdAt))) return false;
+  try {
+    const policy = readPolicy({ strict: true });
+    if (!policy?.value || planRedTeamActions(evidence.parsed, policy.value).sendBack.length) return false;
+    const state = liveResultGateState(comments, pr, head);
+    const outcomes = gateOutcomesForHead(comments, pr, head);
+    if (!state.resultId || state.resultId !== redTeamResultId(evidence.parsed)
+      || state.reopened || state.sendBackOutcome
+      || [...outcomes, ...state.outcomes].some(outcome => !['card-queued', 'no-send-back'].includes(outcome))
+      || (outcomes.size > 0 && state.outcomes.size === 0)) return false;
+  } catch { return false; }
+  return { createdAt: evidence.comment.createdAt };
 }
 
 // Only a verdict posted after this row began can conclude it. Missing timestamps
@@ -305,6 +304,7 @@ export function tagReviewStatus({
   legacyReviewStatus = LEGACY_REVIEW_STATUS_DEFAULT,
   requiredChecks, prStatusSettings, signalFix = signalFixDispatch,
   readRequiredChecks = readCachedRequiredChecks, loadStatusSettings = loadPrStatusSettings,
+  readConfirmedBreaks: readBreakPolicy = readConfirmedBreaks,
   excuseMergeGate = (pr, { repo }) => excusePrMergeGateHolds([pr], {
     repo, readMergeGateVerdict: args => readMergeGateVerdict({ ...args }), readFreeze: readSharedFreeze,
   })[0],
@@ -320,7 +320,7 @@ export function tagReviewStatus({
   const escalation = latestCiHealEscalationForHead(subject?.comments, subject?.headRefOid);
   const currentLabels = suppliedLabels ?? provider.readLabels(repo, pr);
   const status = deriveReviewStatus({ pr, agents, repo: repoKey, isDraft: isDraft ?? subject?.isDraft ?? false,
-    baseRefName: baseRefName ?? subject?.baseRefName, defaultBranch, mergeConflicted, fixClaim, escalation, reviewConcluded: prState != null && reviewConcluded(currentLabels, subject, pr) });
+    baseRefName: baseRefName ?? subject?.baseRefName, defaultBranch, mergeConflicted, fixClaim, escalation, reviewConcluded: prState != null && reviewConcluded(currentLabels, subject, pr, { readConfirmedBreaks: readBreakPolicy }) });
   const plan = legacyReviewStatus ? planStatusLabelChange({ status, currentLabels }) : {
     add: null,
     remove: currentLabels.map((l) => typeof l === 'string' ? l : l?.name)
