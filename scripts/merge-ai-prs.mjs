@@ -203,6 +203,7 @@ import { deliveredItemNumsFromPr, deliveredHashFromPr, declaredResolvedIdsFromPr
 import { parseArgvFlags, reconcileWouldRunFor } from './lib/reconcile-predicate.mjs';
 import { createPrestageCache, resolvePrestageSettings, prestageCi, prestageRequiredChecks, labelSignature, enqueuePrestage } from './lib/drain-prestage.mjs';
 import { reviewCiGate } from './lib/review-ci-gate.mjs';
+import { summarize as checkStateSummarize } from './lib/check-state-predicate.mjs';
 import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRefreshOnUnsatisfiedWorkflows, handleRequiredWorkflowsRefusal, resolveRefreshOnStaleMergeGate, handleStaleMergeGate } from './lib/merge-queue-enqueue.mjs';
 import { recordEnqueueOutcome } from './lib/drain-poison-guard.mjs';
 import { createAsyncShadow } from './lib/drain-async-shadow.mjs';
@@ -1426,13 +1427,34 @@ export function routeRebaseBeforeEnqueue(v, { setting, mergeStrategy, manifestFr
   return rebase;
 }
 
+/**
+ * Excuse BEHIND only after every required context has its own passing row on this head.
+ * Unknown required sets or incomplete evidence preserve the original skip/rebase path.
+ */
+export function retainCheckedQueueHead(pr, { requiredCheck = 'test', queueRequiredChecks = null, ...options } = {}) {
+  if (!pr || pr.requiredCheckReadError || !Array.isArray(queueRequiredChecks)) return pr;
+  const required = [...new Set([requiredCheck, ...queueRequiredChecks])];
+  // Shared fail-closed predicate: a missing row stays pending, a missing status/conclusion is red.
+  const rows = required.map(name => {
+    const row = latestRequiredCheck(pr, name);
+    if (!row) return null;
+    // Fail closed: evidence must carry a status and, when it names a head, be this PR's head.
+    const stale = (row.head_sha ?? row.headSha) != null && (row.head_sha ?? row.headSha) !== pr.headRefOid;
+    return { ...row, name, ...((row.status == null || stale) ? { status: 'unknown', conclusion: null } : {}) };
+  }).filter(Boolean);
+  let allGreen = false;
+  try { allGreen = checkStateSummarize(rows, { requiredNames: required }).allRequiredGreen; } catch { allGreen = false; }
+  if (!allGreen) return pr;
+  return retainApprovedHumanQueueHead(pr, options);
+}
+
 /** Excuse only BEHIND for the exact manifest-free head retained by this pass's bypass. */
-export function retainBypassedQueueHead(pr, { verdict, setting, queueOwnsFreshness, expectedHeadSha }) {
+export function retainBypassedQueueHead(pr, { verdict, setting, queueOwnsFreshness, expectedHeadSha, requiredCheck, queueRequiredChecks }) {
   const retained = setting === 'conflict-only' && queueOwnsFreshness === true
     && verdict?.rebaseDrop === 'skipped-behind-clean'
     && !!expectedHeadSha && (verdict.listedHeadSha || verdict.headSha) === expectedHeadSha
     && pr?.headRefOid === expectedHeadSha;
-  return retainApprovedHumanQueueHead(pr, { hold: retained, queueOwnsFreshness });
+  return retainCheckedQueueHead(pr, { hold: retained, queueOwnsFreshness, requiredCheck, queueRequiredChecks });
 }
 
 /** Pure: injected settings layers keep IO outside the resolver; invalid values retain the legacy rebase path. */
@@ -6044,8 +6066,10 @@ async function runCli() {
       const retained = retainBypassedQueueHead(pr, {
         verdict: verdicts.find(v => v.repo === repo && v.num === num),
         setting: rebaseBeforeEnqueue.value, queueOwnsFreshness, expectedHeadSha: opts.expectedHeadSha,
+        requiredCheck: REQUIRED, queueRequiredChecks: queueRequiredChecksOf(repo),
       });
-      return retainApprovedHumanQueueHead(retained, { queueOwnsFreshness,
+      return retainCheckedQueueHead(retained, { queueOwnsFreshness,
+        requiredCheck: REQUIRED, queueRequiredChecks: queueRequiredChecksOf(repo),
         hold: pr?.mergeStateStatus === 'BEHIND' && approvedHeadHold({ repo, num }, opts.expectedHeadSha) });
     }, opts, setting: UNKNOWN_RETRY, sleep: sleepSync,
   });
@@ -6096,7 +6120,7 @@ async function runCli() {
       if (approvedHeadHold(v)) {
         const pr = (prsByRepo.get(v.repo) || []).find(p => p.number === v.num);
         if (pr && mergeStrategy.queueOwnsFreshness(v.repo) && v.reason?.startsWith('merge state ')
-          && classifyPr(retainApprovedHumanQueueHead(pr, { hold: true, queueOwnsFreshness: mergeStrategy.queueOwnsFreshness(v.repo) }), { requiredCheck: REQUIRED, defaultBranch: defaultBranchOf(v.repo), queueRequiredChecks: queueRequiredChecksOf(v.repo) }).decision === 'merge') {
+          && classifyPr(retainCheckedQueueHead(pr, { hold: true, queueOwnsFreshness: mergeStrategy.queueOwnsFreshness(v.repo), requiredCheck: REQUIRED, queueRequiredChecks: queueRequiredChecksOf(v.repo) }), { requiredCheck: REQUIRED, defaultBranch: defaultBranchOf(v.repo), queueRequiredChecks: queueRequiredChecksOf(v.repo) }).decision === 'merge') {
           v.decision = 'merge'; v.reason = 'approved human head retained for merge queue';
         }
         continue;
@@ -6107,7 +6131,7 @@ async function runCli() {
         // exactly as the approved-head path does; BEHIND alone must be the only thing that was blocking.
         reclassifiesMerge: () => {
           const live = (prsByRepo.get(v.repo) || []).find(p => p.number === v.num);
-          return !!live && classifyPr(retainApprovedHumanQueueHead(live, { hold: true, queueOwnsFreshness: true }), { requiredCheck: REQUIRED,
+          return !!live && classifyPr(retainCheckedQueueHead(live, { hold: true, queueOwnsFreshness: true, requiredCheck: REQUIRED, queueRequiredChecks: queueRequiredChecksOf(v.repo) }), { requiredCheck: REQUIRED,
             defaultBranch: defaultBranchOf(v.repo), queueRequiredChecks: queueRequiredChecksOf(v.repo) }).decision === 'merge';
         },
         manifestFree: () => !!behindCleanDir && headTreeLacksManifestFile({

@@ -8,7 +8,7 @@
  *   base is not the repo's default branch is skipped with `base is not <default> (<base>)`.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { withResolutionBasis, buildDrainReasonComment, hasDrainReasonComment, buildDrainVerdicts, classifyPr, isRebaseDropCandidate, isBehindButClean, headTreeLacksManifestFile, routeRebaseBeforeEnqueue, retainBypassedQueueHead, revalidateWithUnknownRetry, resolveRebaseBeforeEnqueue, buildLiveListingsByRepo, unlandableStateReason } from '../merge-ai-prs.mjs';
+import { withResolutionBasis, buildDrainReasonComment, hasDrainReasonComment, buildDrainVerdicts, classifyPr, isRebaseDropCandidate, isBehindButClean, headTreeLacksManifestFile, routeRebaseBeforeEnqueue, retainCheckedQueueHead, retainBypassedQueueHead, revalidateWithUnknownRetry, resolveRebaseBeforeEnqueue, buildLiveListingsByRepo, unlandableStateReason } from '../merge-ai-prs.mjs';
 import { readFastDrainRoundListing, withFastDrainRoundLock } from '../lib/fast-drain-scope.mjs';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -63,13 +63,17 @@ describe('isBehindButClean — retain only proven clean BEHIND heads', () => {
 describe('routeRebaseBeforeEnqueue — queue freshness owns the bypass', () => {
   const clean = { repo: 'fixture/repo', decision: 'skip', reason: unlandableStateReason('BEHIND'), state: 'BEHIND',
     mergeable: 'MERGEABLE', hasManifest: false, certifyLabel: true, testGreen: true, headSha: 'reviewed-head' };
-  const route = ({ setting = 'conflict-only', ownsFreshness = true, manifestFree = true, reclassified = true, patch = {} } = {}) => {
+  const route = ({ setting = 'conflict-only', ownsFreshness = true, manifestFree = true, reclassified = true, patch = {}, prPatch = {}, queueRequiredChecks = ['test', 'smoke'] } = {}) => {
     const verdict = { ...clean, ...patch };
     const before = { ...verdict };
     const rebaseDropManifest = vi.fn(() => ({ action: 'skip', reason: 'fixture rebase probe' }));
     const mergeStrategy = { queueOwnsFreshness: vi.fn(() => ownsFreshness) };
     const operation = routeRebaseBeforeEnqueue(verdict, {
-      setting, mergeStrategy, manifestFree: () => manifestFree, reclassifiesMerge: () => reclassified, rebase: rebaseDropManifest,
+      setting, mergeStrategy, manifestFree: () => manifestFree,
+      reclassifiesMerge: () => reclassified && classifyPr(retainCheckedQueueHead({ ...freshPr, ...prPatch }, {
+        hold: true, queueOwnsFreshness: ownsFreshness, requiredCheck: 'test', queueRequiredChecks,
+      }), { requiredCheck: 'test', defaultBranch: 'main', queueRequiredChecks }).decision === 'merge',
+      rebase: rebaseDropManifest,
     });
     const args = { laneRef: 'lane/fixture', base: 'origin/main' };
     const result = operation?.(args);
@@ -78,11 +82,12 @@ describe('routeRebaseBeforeEnqueue — queue freshness owns the bypass', () => {
 
   const freshPr = { number: 42, title: 'Retained head', body: 'What changed and why', headRefOid: clean.headSha,
     baseRefName: 'main', mergeStateStatus: 'BEHIND', mergeable: 'MERGEABLE', labels: [{ name: 'ready-to-merge' }],
-    statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS' }] };
+    statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
+      { name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
   const revalidate = (verdict, { patch = {}, setting = 'conflict-only', queueOwnsFreshness = true,
-    expectedHeadSha = clean.headSha } = {}) => revalidateWithUnknownRetry({
-    read: async () => retainBypassedQueueHead({ ...freshPr, ...patch }, { verdict, setting, queueOwnsFreshness, expectedHeadSha }),
-    opts: { defaultBranch: 'main', expectedHeadSha }, setting: { retries: 0 },
+    expectedHeadSha = clean.headSha, queueRequiredChecks = ['test', 'smoke'] } = {}) => revalidateWithUnknownRetry({
+    read: async () => retainBypassedQueueHead({ ...freshPr, ...patch }, { verdict, setting, queueOwnsFreshness, expectedHeadSha, requiredCheck: 'test', queueRequiredChecks }),
+    opts: { defaultBranch: 'main', expectedHeadSha, requiredCheck: 'test', queueRequiredChecks }, setting: { retries: 0 },
   });
 
   it('conflict-only retains a clean BEHIND head without rebase, passes fresh revalidation and enqueues it', async () => {
@@ -101,6 +106,58 @@ describe('routeRebaseBeforeEnqueue — queue freshness owns the bypass', () => {
     expect(enqueue).toHaveBeenCalledTimes(1);
     expect(enqueue).toHaveBeenCalledWith(clean.headSha);
     expect(rebaseDropManifest).not.toHaveBeenCalled();
+  });
+
+  const testGreen = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' };
+  const incompleteChecks = [
+    ['failing smoke', [testGreen, { name: 'smoke', status: 'COMPLETED', conclusion: 'FAILURE' }]],
+    ['missing smoke', [testGreen]],
+    ['pending smoke', [testGreen, { name: 'smoke', status: 'IN_PROGRESS', conclusion: null }]],
+    ['smoke from another head', [testGreen, { name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: 'other-head' }]],
+    ['malformed smoke', [testGreen, { name: 'smoke', conclusion: 'SUCCESS' }]],
+    ['missing configured required test', [{ name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS' }]],
+  ];
+
+  it.each(incompleteChecks)('BEHIND with %s preserves the legacy rebase and skip, without enqueue', async (_name, statusCheckRollup) => {
+    const { verdict, before, operation, rebaseDropManifest, args } = route({ prPatch: { statusCheckRollup } });
+    expect(verdict).toEqual(before);
+    expect(operation).toBe(rebaseDropManifest);
+    expect(rebaseDropManifest).toHaveBeenCalledTimes(1);
+    expect(rebaseDropManifest).toHaveBeenCalledWith(args);
+    const fresh = await revalidate(verdict, { patch: { statusCheckRollup } });
+    expect(fresh.decision).toBe('skip');
+    const enqueue = vi.fn();
+    if (verdict.decision === 'merge' && fresh.decision === 'merge') enqueue(fresh.headSha);
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it.each(incompleteChecks)('fresh bypass and approved-human retention refuse %s after admission', async (_name, statusCheckRollup) => {
+    const { verdict } = route();
+    expect(verdict.decision).toBe('merge');
+    const pr = { ...freshPr, statusCheckRollup };
+    expect(retainCheckedQueueHead(pr, { hold: true, queueOwnsFreshness: true,
+      requiredCheck: 'test', queueRequiredChecks: ['smoke'] })).toBe(pr);
+    const fresh = await revalidate(verdict, { patch: { statusCheckRollup } });
+    expect(fresh.decision).toBe('skip');
+    const enqueue = vi.fn();
+    if (fresh.decision === 'merge') enqueue(fresh.headSha);
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('unknown required checks preserve the legacy path and refuse fresh retention', async () => {
+    const { verdict, before, operation, rebaseDropManifest } = route({ queueRequiredChecks: null });
+    expect(verdict).toEqual(before);
+    expect(operation).toBe(rebaseDropManifest);
+    expect(rebaseDropManifest).toHaveBeenCalledTimes(1);
+    const admitted = route().verdict;
+    expect((await revalidate(admitted, { queueRequiredChecks: null })).decision).toBe('skip');
+  });
+
+  it('approved-human retention accepts all required checks green but preserves a BEHIND conflict', () => {
+    const options = { hold: true, queueOwnsFreshness: true, requiredCheck: 'test', queueRequiredChecks: ['smoke'] };
+    expect(retainCheckedQueueHead(freshPr, options).mergeStateStatus).toBe('CLEAN');
+    const conflicting = { ...freshPr, mergeable: 'CONFLICTING' };
+    expect(retainCheckedQueueHead(conflicting, options)).toBe(conflicting);
   });
 
   it.each([
