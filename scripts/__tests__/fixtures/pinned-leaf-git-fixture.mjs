@@ -1,4 +1,4 @@
-/** Serialized into CLI shims: pinned evidence for leaf PRs adding one file each. */
+/** Serialized into CLI shims: paired stats and patches for known PR file changes. */
 export function pinnedLeafGitFixture(argv, prs) {
   // Recognize pinnedGit's config prefix; leave other Git runners' fixture behavior alone.
   if (argv[0] !== '-c' || argv[1] !== 'core.attributesFile=/dev/null') return null;
@@ -20,8 +20,18 @@ export function pinnedLeafGitFixture(argv, prs) {
   if (!pr || a.at(-2) !== base) throw new Error('unknown fixture diff basis');
   if (a[0] === 'merge-base') return base + '\n';
   if (a[0] !== 'diff') throw new Error('unknown pinned fixture command');
-  const path = pr.files[0].path;
-  if (a.includes('--numstat')) return '1\t0\t' + path + '\n';
-  if (a.includes('--name-only')) return path + '\0';
-  return 'diff --git a/' + path + ' b/' + path + '\nnew file mode 100644\n--- /dev/null\n+++ b/' + path + '\n@@ -0,0 +1 @@\n+leaf\n';
+  const files = pr.files.map(f => ({ ...f, additions: f.additions ?? 1, deletions: f.deletions ?? 0 }));
+  if (a.includes('--numstat')) return files.map(f => `${f.additions}\t${f.deletions}\t${f.path}\n`).join('');
+  if (a.includes('--name-only')) return files.map(f => f.path + '\0').join('');
+  return files.map(({ path, additions, deletions }) => {
+    if (!Number.isSafeInteger(additions) || additions < 0 || !Number.isSafeInteger(deletions) || deletions < 0) {
+      throw new Error('unknown fixture change counts');
+    }
+    return 'diff --git a/' + path + ' b/' + path + '\n' +
+      (!deletions ? 'new file mode 100644\n' : !additions ? 'deleted file mode 100644\n' : '') +
+      '--- ' + (deletions ? 'a/' + path : '/dev/null') +
+      '\n+++ ' + (additions ? 'b/' + path : '/dev/null') +
+      `\n@@ -${deletions ? 1 : 0},${deletions} +${additions ? 1 : 0},${additions} @@\n` +
+      '-base\n'.repeat(deletions) + '+leaf\n'.repeat(additions);
+  }).join('');
 }
