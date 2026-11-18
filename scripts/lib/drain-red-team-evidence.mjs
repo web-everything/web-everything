@@ -423,7 +423,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     return completeReads.get(settleAt);
   };
   const indexReadErrors = new Map();
-  const indexReads = new Map(); // at most the bounded index ids; reuse on fallback, never parse a hint twice
+  const indexReads = new Map(); // at most the bounded index ids; reused only within the index attempt
   const setting = resolveRunScanSettings(scanSettings);
   const maxParses = setting.value.scan.maxParses;
   let parsed = 0;
@@ -545,7 +545,13 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
           if (!scan.slots[order].exact || scan.end?.ok === false) scan = null;
         } catch { scan = null; }
       }
-      if (!scan) runScan();
+      if (!scan) {
+        // Verification may have observed a replacement after reading a payload. The
+        // fallback must read fresh evidence, charging the same budget (including failures).
+        indexReads.clear();
+        indexReadErrors.clear();
+        runScan();
+      }
       indexReads.clear();
       indexReadErrors.clear();
     }
