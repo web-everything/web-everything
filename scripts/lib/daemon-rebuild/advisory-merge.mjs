@@ -1,11 +1,12 @@
-/** Narrow, fail-closed resolution of advisory timing data; never resolves source conflicts. */
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+/** Narrow, fail-closed resolution of append-only advisory registries; never resolves source conflicts. */
+import { lstatSync, mkdtempSync, readFileSync, readlinkSync, symlinkSync, writeFileSync, rmSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { isDeepStrictEqual } from 'node:util';
+import { spawnSync } from 'node:child_process';
 import { FULL_SHA_RE } from './shared.mjs';
 
-export const ADVISORY_MERGE_PATHS = Object.freeze(['scripts/ci/test-timings.json']);
+export const ADVISORY_MERGE_PATHS = Object.freeze(['scripts/ci/test-timings.json', 'scripts/conveyor/soak/breaks/index.mjs']);
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 
 /** Union object entries, conservatively retaining the larger numeric observation. */
@@ -32,10 +33,49 @@ export function mergeTimingsJson(baseText, oursText, theirsText) {
   } catch { return null; }
 }
 
+// Preserve every base line; match identical cross-side additions one-for-one at each base gap.
+// A non-additive edit is outside this registry contract; leave it for operator resolution.
+function mergeRegistryLines(baseText, oursText, theirsText) {
+  const lines = text => text.match(/[^\n]*\n|[^\n]+$/g) || [];
+  const base = lines(baseText), gaps = base.map(() => []);
+  const headerEnd = base.findIndex(line => line.includes('*/'));
+  if (base[0] !== '/**\n' || headerEnd < 1 || ![' */\n', ' */'].includes(base[headerEnd])) return null;
+  gaps.push([]);
+  const added = gaps.map(() => new Map());
+  for (const [side, text] of [oursText, theirsText].entries()) {
+    let cursor = 0;
+    for (const line of lines(text)) {
+      if (cursor < base.length && line === base[cursor]) cursor++;
+      else {
+        if (cursor === 0 || cursor > headerEnd || !/^ \* /.test(line) || line.includes('/*') || line.includes('*/')) return null;
+        const count = added[cursor].get(line) || 0;
+        if (side === 1 && count > 0) added[cursor].set(line, count - 1);
+        else {
+          gaps[cursor].push(line);
+          if (side === 0) added[cursor].set(line, count + 1);
+        }
+      }
+    }
+    if (cursor !== base.length) return null;
+  }
+  const merged = gaps.map((gap, i) => gap.join('') + (base[i] || '')).join('');
+  return /^(?:<{7}|={7}|>{7}|\|{7})/m.test(merged) ? null : merged;
+}
+
+// The card's "must import" requirement is satisfied by construction plus node --check:
+// only delimiter-free header comment lines can be added, so executable bytes stay unchanged.
+// Syntax validation must never execute the registry or resolve its imports.
+function checkModuleSyntax(path) {
+  return spawnSync(process.execPath, ['--check', path], {
+    encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
+  }).status === 0;
+}
+
 function readMerge(git, revisions, path) {
   const inputs = revisions.map(revision => git(['show', `${revision}:${path}`]));
   if (inputs.some(result => result.status !== 0)) return null;
-  return mergeTimingsJson(...inputs.map(result => String(result.stdout)));
+  return (path === ADVISORY_MERGE_PATHS[0] ? mergeTimingsJson : mergeRegistryLines)(
+    ...inputs.map(result => String(result.stdout)));
 }
 
 const advisoryOnly = paths => paths.length > 0 && paths.every(path => ADVISORY_MERGE_PATHS.includes(path));
@@ -56,18 +96,21 @@ export function resolveAdvisoryConflicts({ git, cur, ovSha }) {
     const base = git(['merge-base', '--all', cur, ovSha]);
     const baseSha = String(base.stdout ?? '').trim();
     if (base.status !== 0 || !FULL_SHA_RE.test(baseSha)) return null;
-    const text = readMerge(git, [baseSha, cur, ovSha], paths[0]);
-    if (text === null) return null;
     // A private index permits adopting the clean merge-tree entries without touching the real index.
     scratch = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'we-advisory-merge-'));
-    const blobPath = join(scratch, 'timings.json');
-    writeFileSync(blobPath, text);
-    const blob = git(['hash-object', '-w', '--', blobPath]);
-    const blobSha = String(blob.stdout ?? '').trim();
-    if (blob.status !== 0 || !FULL_SHA_RE.test(blobSha)) return null;
     const options = { env: { GIT_INDEX_FILE: join(scratch, 'index') } };
     if (git(['read-tree', tree], options).status !== 0) return null;
-    if (git(['update-index', '--add', '--cacheinfo', '100644', blobSha, paths[0]], options).status !== 0) return null;
+    for (const path of paths) {
+      const text = readMerge(git, [baseSha, cur, ovSha], path);
+      if (text === null) return null;
+      const blobPath = join(scratch, path.endsWith('.mjs') ? 'index.mjs' : 'timings.json');
+      writeFileSync(blobPath, text);
+      if (path.endsWith('.mjs') && !checkModuleSyntax(blobPath)) return null;
+      const blob = git(['hash-object', '-w', '--', blobPath]);
+      const blobSha = String(blob.stdout ?? '').trim();
+      if (blob.status !== 0 || !FULL_SHA_RE.test(blobSha)) return null;
+      if (git(['update-index', '--add', '--cacheinfo', '100644', blobSha, path], options).status !== 0) return null;
+    }
     const written = git(['write-tree'], options);
     const mergedTree = String(written.stdout ?? '').trim();
     return written.status === 0 && FULL_SHA_RE.test(mergedTree)
@@ -85,11 +128,39 @@ export function resolveAdvisoryInWorktree({ git, cwd }) {
     if (!advisoryOnly(paths)) return false;
     const mergeHead = git(['rev-parse', '--verify', 'MERGE_HEAD']);
     if (mergeHead.status !== 0 || !FULL_SHA_RE.test(String(mergeHead.stdout ?? '').trim())) return false;
-    const text = readMerge(git, [':1', ':2', ':3'], paths[0]);
-    if (text === null) return false;
-    const restore = () => { try { git(['checkout', '-m', '--', ...paths]); } catch { /* caller aborts the merge */ } return false; };
+    const merged = paths.map(path => ({ path, text: readMerge(git, [':1', ':2', ':3'], path) }));
+    if (merged.some(({ text }) => text === null)) return false;
+    // Back up only the files we will stage and the index, for rollback on any failure.
+    const originals = new Map(paths.map(path => {
+      const fullPath = join(cwd, path);
+      const stat = lstatSync(fullPath);
+      if (!stat.isFile() && !stat.isSymbolicLink()) throw new Error('unsupported advisory file');
+      return [path, { link: stat.isSymbolicLink(),
+        data: stat.isSymbolicLink() ? readlinkSync(fullPath) : readFileSync(fullPath) }];
+    }));
+    const index = git(['rev-parse', '--git-path', 'index']);
+    if (index.status !== 0 || !String(index.stdout ?? '').trim()) return false;
+    const indexPath = resolve(cwd, String(index.stdout).trim());
+    const originalIndex = readFileSync(indexPath);
+    const restore = () => {
+      for (const [path, original] of originals) {
+        const fullPath = join(cwd, path);
+        if (original === null) rmSync(fullPath, { force: true });
+        else {
+          const current = lstatSync(fullPath, { throwIfNoEntry: false });
+          if (original.link || (current && !current.isFile())) rmSync(fullPath, { recursive: true, force: true });
+          if (original.link) symlinkSync(original.data, fullPath);
+          else writeFileSync(fullPath, original.data);
+        }
+      }
+      writeFileSync(indexPath, originalIndex);
+      return false;
+    };
     try {
-      writeFileSync(join(cwd, paths[0]), text);
+      for (const { path, text } of merged) writeFileSync(join(cwd, path), text);
+      for (const { path } of merged) {
+        if (path.endsWith('.mjs') && !checkModuleSyntax(join(cwd, path))) return restore();
+      }
       if (git(['add', '--', ...paths]).status !== 0) return restore();
       const remaining = git(['diff', '--name-only', '-z', '--diff-filter=U']);
       if (remaining.status !== 0 || String(remaining.stdout ?? '') !== '') return restore();

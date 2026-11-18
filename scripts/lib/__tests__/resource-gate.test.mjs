@@ -488,8 +488,8 @@ describe('operator-db host and resource capacity leaves', () => {
   });
   it('fails closed on oversized capacity and guard keys despite looser lower layers', () => {
     const env = { WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK: '3', WE_FIX_DISPATCH_MAX_CONCURRENT: '4',
-      ...operatorEnv(overrideFile({ 'host.maxReviewDispatchPerTick': 9, 'host.capacity.memAvailableFloorMb': 1,
-        'resourceGate.fixCap.floor': 13, 'resourceGate.cutover': 'shadow' })) };
+      ...operatorEnv(overrideFile({ 'host.maxReviewDispatchPerTick': 17, 'host.capacity.memAvailableFloorMb': 1,
+        'resourceGate.fixCap.floor': 25, 'resourceGate.cutover': 'shadow' })) };
     const host = resolveHostOverloadSettings({ env, log: quiet });
     expect(host.settings.host.maxReviewDispatchPerTick).toBe(2);
     expect(host.settings.host.capacity.memAvailableFloorMb).toBe(2048);
@@ -529,11 +529,11 @@ it('resolved operator ceiling stays at least the floor when only one bound overr
 });
 
 
-it('floor-only operator override 12 derives a ceiling no higher than 12', () => {
+it('floor-only operator override 24 derives a ceiling no higher than 24', () => {
   const file = join(root, 'operator-floor-only.json');
-  writeFileSync(file, JSON.stringify({ 'resourceGate.fixCap.floor': 12 }));
+  writeFileSync(file, JSON.stringify({ 'resourceGate.fixCap.floor': 24 }));
   const r = resolveResourceGateSettings({ env: { ...operatorEnv(file) } });
-  expect(r.settings.fixCap).toMatchObject({ floor: 12, ceiling: 12 });
+  expect(r.settings.fixCap).toMatchObject({ floor: 24, ceiling: 24 });
 });
 
 it.each(['corrupt', 'unreadable'])('%s operator store preserves configured fixCap 1/1 and memory 60 percent', kind => {
@@ -561,7 +561,7 @@ it.each([undefined, 8])('R907 operator ceiling 1 lowers the default/configured f
 describe('R907 malformed host/resource policy evidence', () => {
   it.each([
     ['wrong type', 'fixCap.floor', '1'],
-    ['out of range', 'fixCap.ceiling', 13],
+    ['out of range', 'fixCap.ceiling', 25],
     ['unknown key', 'unknownCapacity', 1],
     ['non-allowlisted guard', 'cutover', 'shadow'],
   ])('%s closes every capacity leaf in the affected policy, direction-aware', (_label, key, value) => {
@@ -590,7 +590,7 @@ describe('R907 malformed host/resource policy evidence', () => {
   });
   it.each([
     ['host.maxReviewDispatchPerTick', '1'],
-    ['host.maxReviewDispatchPerTick', 9],
+    ['host.maxReviewDispatchPerTick', 17],
     ['host.unknownCapacity', 1],
     ['host.capacity.memAvailableFloorMb', 1],
   ])('malformed %s=%j bounds host dispatch by the finite fallback', (key, value) => {

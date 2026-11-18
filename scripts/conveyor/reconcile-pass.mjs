@@ -1302,10 +1302,9 @@ export function defaultReadPullsForCommit(sha, { exec = execFileSyncThrottled, r
  * file-by-file, present on `main` — see `we:scripts/lib/already-landed-content.mjs`'s own header for the full
  * incident and why this needs blob identity rather than a plain diff.
  *
- * PAYS THE EXTRA READS ONLY FOR A PR CARRYING `merge-status:conflicting` — the population
- * `we:scripts/conveyor/parked-pr-conflict-watch.mjs` already narrows this to (a real merge conflict on a
- * review-parked PR), and the ONLY phase `reconcile-core.mjs`'s own `isConflictBounce` would otherwise dispatch a
- * mechanical conflict-fix for. A pass with no such PR (the common case) costs nothing beyond the label scan
+ * PAYS THE EXTRA READS ONLY FOR A PR CARRYING `merge-status:conflicting` OR `mergeStateStatus: DIRTY` —
+ * the same conflict evidence `reconcile-core.mjs`'s own `isConflictBounce` would dispatch a mechanical
+ * conflict-fix for. A pass with no such PR (the common case) costs nothing beyond the conflict scan
  * `defaultReadPrs` already fetched every field for.
  * @param {Array<object>} prs
  * @param {{fetchRef?:Function, readMergeBase?:Function, readChanges?:Function, findMatchingCommit?:Function,
@@ -1320,7 +1319,8 @@ export function enrichPrsWithAlreadyLandedFacts(prs, {
   const list = Array.isArray(prs) ? prs : [];
   const mainRef = mainRefFor(defaultBranch);
   return list.map((pr) => {
-    if (!hasLabel(pr?.labels, CONFLICT_LABEL)) return pr;
+    if (!hasLabel(pr?.labels, CONFLICT_LABEL)
+      && String(pr?.mergeStateStatus ?? '').toUpperCase() !== 'DIRTY') return pr;
     const prNumber = Number(pr?.number);
     const headSha = pr?.headRefOid;
     if (!Number.isInteger(prNumber) || prNumber <= 0 || !isSha(headSha) || !mainRef) return pr;

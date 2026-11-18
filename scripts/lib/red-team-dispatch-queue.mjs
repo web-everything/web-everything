@@ -1,5 +1,5 @@
 import { readPlannerRows } from './red-team-planner-row.mjs';
-import { failClosedCapacity } from './operator-override-reader.mjs';
+import { failClosedCapacity, OPERATOR_CAPACITY_MAX } from './operator-override-reader.mjs';
 import { readOperatorPolicy } from './policy-cascade.mjs';
 import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -37,7 +37,7 @@ const note = (log, message) => {
   catch { /* Diagnostics must not interrupt recovery. */ }
 };
 
-export const RED_TEAM_QUEUE_MIN_CONCURRENT_MAX = 12;
+export const RED_TEAM_QUEUE_MIN_CONCURRENT_MAX = OPERATOR_CAPACITY_MAX.redTeam;
 export const RED_TEAM_QUEUE_MIN_CONCURRENT_CAP = 6;
 export const RED_TEAM_QUEUE_REVIEW_STARTS_CAP = 6;
 
