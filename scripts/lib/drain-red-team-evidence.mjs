@@ -422,6 +422,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     if (!completeReads.has(settleAt)) completeReads.set(settleAt, completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, settleAt }));
     return completeReads.get(settleAt);
   };
+  const indexReadErrors = new Map();
   const indexReads = new Map(); // at most the bounded index ids; reuse on fallback, never parse a hint twice
   const setting = resolveRunScanSettings(scanSettings);
   const maxParses = setting.value.scan.maxParses;
@@ -448,6 +449,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
           throw budgetExhausted;
         }
         let run;
+        if (indexReadErrors.has(id)) throw indexReadErrors.get(id);
         if (indexReads.has(id)) run = indexReads.get(id);
         else {
           parsed++; // Failed reads also consume the shared budget.
@@ -523,7 +525,18 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
   return (exactHead = true, order = tieBreak, { writtenAfter, newestHead } = {}) => {
     if (!TIE_ORDERS.includes(order)) throw new TypeError('unknown run tieBreak');
     if (!scan) {
-      const ids = readReviewRunIndex(runsDir, repo, pr, { list, stat: id => stat(join(runsDir, `${id}.json`)) });
+      const ids = readReviewRunIndex(runsDir, repo, pr, { list, stat: id => stat(join(runsDir, `${id}.json`)),
+        read: id => {
+          if (!indexReads.has(id)) {
+            if (parsed >= maxParses) throw budgetExhausted;
+            parsed++;
+            // Failed reads consume budget and retain the scan's unreadable-record refusal.
+            try { indexReads.set(id, read(id, runsDir)); }
+            catch (error) { indexReads.set(id, null); indexReadErrors.set(id, error); throw error; }
+          }
+          return indexReads.get(id);
+        },
+      });
       if (ids.length) {
         try {
           runScan(ids);
@@ -534,6 +547,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
       }
       if (!scan) runScan();
       indexReads.clear();
+      indexReadErrors.clear();
     }
     const key = `${order}|${exactHead}|${writtenAfter}|${newestHead}`;
     if (!failures.has(key)) failures.set(key, failureFor(order, exactHead, writtenAfter, newestHead));

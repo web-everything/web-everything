@@ -4280,7 +4280,7 @@ Unreadable records still throw, never skip.
 
 Review discovery first tries the bounded `<runs-dir-name>-review-index.json` sidecar beside the
 resolved runs directory. The run-store writer updates it fail-soft under a file lock; drain's complete
-open-PR context advances one persisted backfill cursor (50 review records total per tick). Partial
+open-PR context advances persisted per-id verification (50 review records total per tick). Partial
 backfills are staged, never published. Indexed payloads still pass the same PR/head, ordering and
 unfinished-review checks. Missing/corrupt/unverified/overflowed hints take the original bounded scan;
 `scan-capped` still holds. Indexed payload read attempts and the fallback share one
@@ -4640,15 +4640,24 @@ review-job and review-daemon suites.
 
 Appending a review id is only a discovery hint. Trust requires a completed backfill's
 `completeThroughMtimeMs`, stat-only id/mtime/file-identity snapshot, rebuilt PR keys, and acknowledged
-create-only poison markers. A changed listing restarts a staged pass, including ids behind
-the cursor. Failed appends poison the whole sidecar independently of its write lock; only a
+create-only poison markers. Listing or open-set changes retain verified id/mtime/file-identity
+and ownership rows; requeue changed/new ids and drop removed ids. An unreadable or mismatched
+candidate aborts the batch without publishing completeness, persists verified progress, and
+records a blocking id with a 60-second retry cooldown. Other ids advance during cooldown;
+completeness remains unpublished until every blocking record is verified or removed. Failed appends poison the whole sidecar independently of its write lock; only a
 complete rebuild acknowledges those markers. Readers stat the current listing before parsing
-indexed ids and fall back on unknown ids, changed unindexed mtimes, missing watermarks,
-unreadable listings or new poison markers. File identity also detects atomic replacements with
+indexed ids. Unknown or rewritten unindexed ids require strict record identity verification
+(at most 20 reads, sharing the evidence scan budget); unrelated PR ownership permits the hit.
+Same-PR, unreadable or over-bound unknown evidence, missing watermarks, unreadable listings
+or new poison markers force the unchanged bounded fallback. File identity also detects atomic replacements with
 unchanged mtimes when marker creation fails. Even an older/coarse mtime cannot hide an unknown id.
 Oversized snapshots retain the bounded scan and its scan-capped
-HOLD; inspect omitted runs manually. Keep the lost-append, poison, complete-hit and restart
-regressions in `review-run-index.test.mjs`, run alongside `drain-red-team-evidence.test.mjs`
+HOLD; inspect omitted runs manually. Optional backfill side effects, including argument and
+directory resolution, must return the drain context unchanged on exceptions.
+For every bounded-read risk, the test plan must name a regression counting actual read attempts
+or asserting the read range, including the default shared budget across repositories. Inject a
+failure after a successful staged read to prove no partial completeness can be published.
+Keep the lost-append, poison, complete-hit, churn, cooldown, budget and wiring regressions in `review-run-index.test.mjs`, run alongside `drain-red-team-evidence.test.mjs`
 through heavy admission.
 ## Fast-drain round listing and live target refresh
 
@@ -4690,8 +4699,11 @@ comparison against daemon observations; fixtures prove IO counts without live Gi
 `headNeverReviewedFromRuns` may bypass its 400-run scan only through
 `readCompleteReviewRunsForPr`: an all-PR backfill watermark, acknowledged poison
 markers, stat-only listing verification, and no overflow or eviction for that PR.
-The full-backfill cursor lives in the index and parses at most 50 records per drain
-tick by default. Open-PR hint refreshes must preserve that cursor and proof.
+The full-backfill verified staging state lives in the index and uses the same identity
+reconciliation and bad-record cooldown as the open-PR backfill, parsing at most 50
+records per call by default. Concurrent writes requeue only changed identities; a bad
+or unreadable record blocks the global watermark while other candidates advance.
+Open-PR hint refreshes must preserve that staging state and proof.
 Unverifiable indexed identities return to the original capped scan; they never
 establish absence. Keep bounded resumption, a 3,012-file snapshot, eviction, poison
 races, and capped negative fallbacks in `review-run-index.test.mjs`, alongside the

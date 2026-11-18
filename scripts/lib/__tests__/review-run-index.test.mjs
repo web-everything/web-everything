@@ -233,7 +233,7 @@ it('failed poison creation still detects an unindexed file even with an older mt
   rmSync(`${path}.poison`); rmSync(`${path}.lock`);
   expect(readReviewRunIndex(f.runsDir, f.repo, f.pr)).toEqual([]);
 });
-it('a new id behind the persisted cursor restarts backfill before publishing completeness', () => {
+it('a new id behind staged progress is verified before publishing completeness', () => {
   const f = fixture();
   writeFileSync(join(f.runsDir, `${f.run.id}.json`), JSON.stringify(f.run));
   const z = { ...f.run, id: 'review-pr-z' };
@@ -451,7 +451,10 @@ it.each(['completed', 'staged'])('legacy %s full backfill revalidates records be
   expect(readCompleteReviewRunsForPr(n.f.runsDir, n.f.repo, n.f.pr, n.io)).toBeNull();
   expect(headNeverReviewedFromRuns({ ...n.f, ...n.io })).toBe(false);
   n.records[1].verdict = { verdict: 'accept' };
-  fullNegativeIndex(n);
+  expect(backfillAllReviewRuns({ ...n.f, ...n.io, maxParsesPerCall: 200, now: () => Date.now() + 60_001 }).complete).toBe(false);
+  expect(n.fill().complete).toBe(false);
+  expect(n.fill().complete).toBe(true);
+  n.reset();
   expect(headNeverReviewedFromRuns({ ...n.f, ...n.io })).toBe(true);
 });
 it('full backfill eviction cannot turn a lost key into a proof of absence', () => {
@@ -463,12 +466,12 @@ it('full backfill eviction cannot turn a lost key into a proof of absence', () =
   expect(readCompleteReviewRunsForPr(n.f.runsDir, n.f.repo, n.f.pr, n.io)).toBeNull();
   expect(headNeverReviewedFromRuns({ ...n.f, ...n.io })).toBe(false);
 });
-it('full backfill restarts if a file appears behind its cursor and publishes no partial proof', () => {
+it('full backfill retains verified progress if a file appears behind its cursor and publishes no partial proof', () => {
   const n = negativeFixture(); n.fill();
   n.records.push({ ...n.f.run, id: 'review-pr-a', findings: { read: { netBasis: { rev: n.f.head } } } });
   expect(n.fill()).toEqual({ complete: false, parsed: 200 });
   expect(readCompleteReviewRunsForPr(n.f.runsDir, n.f.repo, n.f.pr, n.io)).toBeNull();
-  n.fill(); expect(n.fill().complete).toBe(true);
+  expect(n.fill()).toEqual({ complete: true, parsed: 3 });
   expect(headNeverReviewedFromRuns({ ...n.f, ...n.io })).toBe(false);
 });
 it('full backfill does not acknowledge poison created during a staged pass', () => {
@@ -493,4 +496,151 @@ it('full and open snapshots fit a 3012-file run store within the bounded index',
   for (let i = 0; i < 10; i++) expect(backfillReviewRunIndex(open).complete).toBe(false);
   expect(backfillReviewRunIndex(open).complete).toBe(true);
   expect(readCompleteReviewRunsForPr(n.f.runsDir, n.f.repo, n.f.pr, { ...n.io, stat })).toEqual([n.f.run.id]);
+});
+
+it("an unrelated PR's new review run does not invalidate this PR's index hit", () => {
+  const f = fixture(); completeIndex(f);
+  const other = { ...f.run, id: 'review-pr-unrelated', input: { repo: f.repo, pr: 8 } };
+  writeFileSync(join(f.runsDir, `${other.id}.json`), JSON.stringify(other));
+  expect(readReviewRunIndex(f.runsDir, f.repo, f.pr)).toEqual([f.run.id]);
+  // Rewrites of known unrelated ids must also be verified without invalidating PR 7.
+  backfillReviewRunIndex({ ...f, openPrs: new Set([7, 8]) });
+  writeFileSync(join(f.runsDir, `${other.id}.json`), JSON.stringify({ ...other, verdict: null }));
+  expect(readReviewRunIndex(f.runsDir, f.repo, f.pr)).toEqual([f.run.id]);
+});
+it('a new run for the queried PR forces fallback', () => {
+  const f = fixture(); completeIndex(f);
+  writeFileSync(join(f.runsDir, 'review-pr-added.json'), JSON.stringify({ ...f.run, id: 'review-pr-added' }));
+  expect(readReviewRunIndex(f.runsDir, f.repo, f.pr)).toEqual([]);
+});
+it('unknown listing ids require strict identity and at most 20 reads before fallback', () => {
+  const f = fixture(); completeIndex(f);
+  let reads = 0;
+  const ids = Array.from({ length: 21 }, (_, i) => `review-pr-extra-${i}`);
+  const io = { list: () => ids, stat: () => ({ mtimeMs: 3000 }),
+    read: id => { reads++; return { ...f.run, id, input: { repo: f.repo, pr: 8 } }; } };
+  expect(readReviewRunIndex(f.runsDir, f.repo, f.pr, io)).toEqual([]);
+  expect(reads).toBe(20);
+  expect(readReviewRunIndex(f.runsDir, f.repo, f.pr, { ...io, list: () => ids.slice(0, 1),
+    read: () => ({ ...f.run, id: 'review-pr-wrong', input: { repo: f.repo, pr: 8 } }) })).toEqual([]);
+  expect(readReviewRunIndex(f.runsDir, f.repo, f.pr, { ...io, list: () => ids.slice(0, 1),
+    read: () => { throw Error('unreadable'); } })).toEqual([]);
+});
+it('unreadable backfill candidate aborts without publishing completeness', () => {
+  const f = fixture(), io = window(f);
+  const records = [ { ...f.run, id: 'review-pr-a' }, { ...f.run, id: 'review-pr-b' }, { ...f.run, id: 'review-pr-c' } ];
+  let attempts = 0, clock = 0, bad = true;
+  const args = { ...f, openPrs: new Set([7]), list: () => records.map(r => r.id),
+    stat: () => ({ mtimeMs: 2000 }), now: () => clock, warn: () => {},
+    read: id => { attempts++; if (id === records[1].id && bad) throw Error('unreadable'); return records.find(r => r.id === id); } };
+  expect(backfillReviewRunIndex(args).complete).toBe(false);
+  expect(attempts).toBe(2);
+  expect(readReviewRunIndex(f.runsDir, f.repo, 7, args)).toEqual([]);
+  const path = reviewRunIndexPath(f.runsDir);
+  expect(() => readFileSync(path)).toThrow();
+  const staged = JSON.parse(readFileSync(`${path}.backfill`, 'utf8'));
+  expect(staged.completeness).toBeUndefined();
+  expect(staged.blocked[records[1].id]).toBeDefined();
+  expect(readDrainRedTeamEvidence({ ...f, ...io })).toMatchObject({ ok: false, reason: 'scan-capped' });
+  expect(backfillReviewRunIndex(args).complete).toBe(false);
+  expect(attempts).toBe(3); // cooldown lets the remaining candidate make progress
+  bad = false; clock = 60_001;
+  expect(backfillReviewRunIndex(args).complete).toBe(true);
+  expect(attempts).toBe(4); // verified progress was retained
+});
+it('default backfill budget reads at most 50 records total across repositories', () => {
+  const f = fixture(); let reads = 0;
+  const records = Array.from({ length: 62 }, (_, i) => ({ ...f.run, id: `review-pr-${i}`, input: { repo: i % 2 ? 'x/y' : f.repo, pr: 7 } }));
+  const context = { contextComplete: true, prsByRepo: new Map([[f.repo, [{ number: 7 }]], ['x/y', [{ number: 7 }]]]) };
+  const args = { runsDir: f.runsDir, list: () => records.map(r => r.id), stat: () => ({ mtimeMs: 1 }),
+    read: id => { reads++; return records.find(r => r.id === id); } };
+  expect(backfillOpenReviewRuns(context, args)).toEqual({ complete: false, parsed: 50 });
+  expect(reads).toBe(50);
+  expect(backfillOpenReviewRuns(context, { ...args, maxParses: 1 })).toEqual({ complete: false, parsed: 1 });
+  expect(reads).toBe(51);
+  expect(backfillOpenReviewRuns(context, { ...args, maxParses: 301, warn: () => {} }).complete).toBe(false);
+  expect(reads).toBe(51);
+});
+it('backfill eventually indexes an old open PR while unrelated reviews change between default-budget ticks', () => {
+  const f = fixture();
+  const records = Array.from({ length: 121 }, (_, i) => ({ ...f.run, id: `review-pr-${String(i).padStart(3, '0')}`, input: { repo: f.repo, pr: 8 } }));
+  records.push(f.run);
+  const times = new Map(records.map(r => [r.id, 2000]));
+  let reads = 0;
+  const args = { ...f, openPrs: new Set([7]), list: () => records.map(r => r.id), stat: id => ({ mtimeMs: times.get(id) }),
+    read: id => { reads++; return records.find(r => r.id === id); } };
+  expect(backfillReviewRunIndex(args).complete).toBe(false);
+  times.set(records[0].id, 3000);
+  records.push({ ...records[0], id: 'review-pr-added' }); times.set('review-pr-added', 3000);
+  args.openPrs.add(8); // changing the open set must preserve verified identities too
+  expect(backfillReviewRunIndex(args).complete).toBe(false);
+  records.splice(1, 1); // deleted ids must be pruned
+  times.set(records[0].id, 4000);
+  expect(backfillReviewRunIndex(args).complete).toBe(true);
+  expect(reads).toBeLessThan(150);
+  expect(readReviewRunIndex(f.runsDir, f.repo, 7, args)).toEqual([f.run.id]);
+  const newer = { ...f.run, id: 'review-pr-new-rejection', verdict: { verdict: 'changes' },
+    stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(50_000).toISOString() }] };
+  records.push(newer); times.set(newer.id, 100_000);
+  expect(readReviewRunIndex(f.runsDir, f.repo, 7, args)).toEqual([]);
+  const result = readDrainRedTeamEvidence({ ...f, list: args.list, read: args.read,
+    stat: path => args.stat(path.split('/').at(-1).slice(0, -5)) });
+  expect(result.loopPayload).toEqual(newer);
+});
+
+
+it.each([readDrainRedTeamEvidence, readRecoveryWitness])('unknown-id verification shares the fallback parse budget (%#)', reader => {
+  const f = fixture(), io = window(f); completeIndex(f, io);
+  const extra = Array.from({ length: 21 }, (_, i) => `review-pr-added-${i}`);
+  let reads = 0;
+  const args = { ...f, ...io, list: () => [...io.list(), ...extra],
+    read: id => { reads++; return extra.includes(id) ? { ...f.run, id, input: { repo: f.repo, pr: 8 } } : io.read(id); } };
+  expect(reader(args)).toMatchObject({ ok: false, reason: 'scan-capped' });
+  expect(reads).toBe(300);
+});
+it('an unreadable unknown id retains the fallback unreadable-record refusal', () => {
+  const f = fixture(); completeIndex(f);
+  const unknown = 'review-pr-unreadable'; let attempts = 0;
+  expect(() => readDrainRedTeamEvidence({ ...f, list: () => [unknown, f.run.id], stat: () => ({ mtimeMs: 100_000 }),
+    read: id => { if (id === unknown) { attempts++; throw Error('unreadable unknown'); } return f.run; },
+  })).toThrow('unreadable unknown');
+  expect(attempts).toBe(1);
+});
+it('a mismatched backfill identity blocks completeness and a changed file retries immediately', () => {
+  const f = fixture(); let correct = false, mtimeMs = 1;
+  const args = { ...f, openPrs: new Set([7]), list: () => [f.run.id], stat: () => ({ mtimeMs }),
+    read: () => correct ? f.run : { ...f.run, id: 'review-pr-wrong' }, now: () => 0, warn: () => {} };
+  expect(backfillReviewRunIndex(args).complete).toBe(false);
+  expect(readReviewRunIndex(f.runsDir, f.repo, 7, args)).toEqual([]);
+  correct = true; mtimeMs++;
+  expect(backfillReviewRunIndex(args).complete).toBe(true);
+  expect(readReviewRunIndex(f.runsDir, f.repo, 7, args)).toEqual([f.run.id]);
+});
+
+
+it('full backfill retains progress under churn and never publishes while an unreadable record cools down', () => {
+  const f = fixture();
+  const records = Array.from({ length: 121 }, (_, i) => ({ ...f.run,
+    id: `review-pr-${String(i).padStart(3, '0')}`, input: { repo: 'else/where', pr: i + 1 } }));
+  const times = new Map(records.map(run => [run.id, 2000]));
+  let clock = 0, bad = true, reads = 0;
+  const args = { ...f, now: () => clock, warn: () => {}, list: () => records.map(run => run.id),
+    stat: id => ({ mtimeMs: times.get(id) }), read: id => {
+      reads++;
+      if (id === records[1].id && bad) throw Error('unreadable');
+      return records.find(run => run.id === id);
+    } };
+  expect(backfillAllReviewRuns(args)).toEqual({ complete: false, parsed: 2 });
+  times.set(records[0].id, 3000);
+  expect(backfillAllReviewRuns(args)).toEqual({ complete: false, parsed: 50 });
+  expect(backfillAllReviewRuns(args)).toEqual({ complete: false, parsed: 50 });
+  expect(backfillAllReviewRuns(args)).toEqual({ complete: false, parsed: 20 });
+  const index = JSON.parse(readFileSync(reviewRunIndexPath(f.runsDir)));
+  expect(index.fullReviewRuns.completeness).toBeUndefined();
+  expect(index.fullReviewRuns.backfill.blocked[records[1].id]).toBeDefined();
+  expect(readCompleteReviewRunsForPr(f.runsDir, f.repo, f.pr, args)).toBeNull();
+  bad = false; clock = 60_001;
+  expect(backfillAllReviewRuns(args)).toEqual({ complete: true, parsed: 1 });
+  expect(reads).toBe(123);
+  expect(readCompleteReviewRunsForPr(f.runsDir, f.repo, f.pr, args)).toEqual([]);
 });
