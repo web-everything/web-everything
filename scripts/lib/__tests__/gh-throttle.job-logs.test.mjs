@@ -39,6 +39,13 @@ describe('job-log escape-sequence permission', () => {
     } })).toThrow(/unsupported terminal escape/);
   });
 
+  it('fails closed on raw C1 CSI bytes in an unencoded Buffer', () => {
+    const root = mkdtempSync(join(tmpdir(), 'gh-job-logs-')); roots.push(root);
+    expect(() => runGhSync(['api', 'repos/o/r/actions/jobs/123/logs'], { throttle: {
+      env: {}, lockRoot: root, logPath: join(root, 'calls.jsonl'), personalRoute: false, exec: () => Buffer.from([0x9b, 0x32, 0x4a]),
+    } })).toThrow(/unsupported terminal escape/);
+  });
+
   it.each([undefined, 'buffer'])('preserves binary bytes in job-log output (encoding %s)', encoding => {
     const root = mkdtempSync(join(tmpdir(), 'gh-job-logs-')); roots.push(root);
     const bytes = Buffer.from([0, 255, 128, 10]);
@@ -85,6 +92,8 @@ describe('job-log escape-sequence permission', () => {
     ['pr', 'view', 'repos/o/r/actions/jobs/123/logs'],
   ])('leaves unrelated or already-permitted calls untouched: %j', (...args) => {
     expect(allowJobLogEscapeSequences(args)).toBe(args);
+    const post = ['api', 'repos/o/r/issues/1/comments', '-f', 'body=see /actions/jobs/123/logs'];
+    expect(allowJobLogEscapeSequences(post)).toBe(post);
     expect(allowJobLogEscapeSequences(['api', 'repos/o/r/actions/jobs/1/logs'], { stdio: 'inherit' })).toEqual(['api', 'repos/o/r/actions/jobs/1/logs']);
   });
 

@@ -1863,8 +1863,9 @@ export function allowJobLogEscapeSequences(args, opts = {}) {
 }
 
 function isJobLogRead(args) {
-  return args[0] === 'api'
-    && args.some(arg => typeof arg === 'string' && !arg.startsWith('-') && /\/actions\/jobs\/\d+\/logs$/.test(arg));
+  // Exactly a GET of the logs endpoint: no field/body/method flags, anchored endpoint operand.
+  return args[0] === 'api' && args.some(arg => /^(?:repos\/[^/]+\/[^/]+\/)?actions\/jobs\/\d+\/logs$/.test(String(arg)))
+    && !args.some(arg => /^(?:-[fFXH]|--(?:field|raw-field|input|method|header))/.test(String(arg)));
 }
 
 /** Strip 7-bit terminal escapes without consuming log lines or changing other bytes. */
@@ -1875,7 +1876,8 @@ function sanitizeJobLog(args, result, encoding) {
   const clean = text
     .replace(/\u001b\[[0-9;]*m/g, '');
   // Fail closed: only SGR colour markup (ESC[...m) is understood; OSC/hyperlink/lone ESC could hide verdict rows from parsers.
-  const c1 = Buffer.isBuffer(result) ? result.toString('utf8') : clean;
+  const utf8 = Buffer.isBuffer(result) ? result.toString('utf8') : null;
+  const c1 = utf8 !== null && Buffer.from(utf8, 'utf8').equals(result) ? utf8 : clean;
   if (clean.includes('\u001b') || /[\u009b\u009d]/.test(c1)) throw new Error('job log contains unsupported terminal escape sequences');
   return Buffer.isBuffer(result) ? Buffer.from(clean, codec) : clean;
 }
