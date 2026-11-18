@@ -6,14 +6,15 @@ import { readReviewCiGate } from '../../lib/review-ci-gate-io.mjs';
  * store (we:scripts/operations/review-job-store.mjs). Every effect is faked: no lane pool, no `claude`, no `gh`.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readdirSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, readdirSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { dirname } from 'node:path';
+import { EventEmitter } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
-  BLOCKED_ON_INFRA, DEFERRED_NO_LANE, MAX_LANE_DEFERRALS, REVIEW_JOB_KIND, REVIEW_JOB_LANE_WAIT_MS,
+  installReviewJobExitHooks, BLOCKED_ON_INFRA, DEFERRED_NO_LANE, MAX_LANE_DEFERRALS, REVIEW_JOB_KIND, REVIEW_JOB_LANE_WAIT_MS,
   classifyReviewLoopOutcome, crashLabelFromLoop, loopFailureLabel, createReviewJobIo, decideJobClaim, dispatchReviewByMode, dispatchReviewJob,
   jobRecordToAgentRow, laneCooloffActive, listAgentsWithReviewJobs, listReviewJobAgents, nextLaneDeferral,
   parseReviewLoopStdout, readJobRecord, resolveReviewDispatchMode, runReviewJob, writeJobRecord,
@@ -580,5 +581,34 @@ describe('loopFailureLabel — the loop\'s own error is recorded, never swallowe
   it('is null on a clean exit and a bare exit code when the payload has no error', () => {
     expect(loopFailureLabel({ stopped: 'complete' }, 0)).toBeNull();
     expect(loopFailureLabel({ stopped: 'confirm' }, 2)).toBe('exit 2');
+  });
+});
+
+
+describe('CLI exit evidence', () => {
+  const marker = () => JSON.parse(readFileSync(join(dir, 'diagnostics', 'review-we-42.exit.json'), 'utf8'));
+  function hooks() {
+    const proc = new EventEmitter();
+    proc.pid = 123;
+    proc.kill = vi.fn();
+    const setSlug = installReviewJobExitHooks({ proc, dir });
+    return { proc, setSlug };
+  }
+  it('skips an unknown slug, then synchronously records normal exit', () => {
+    const { proc, setSlug } = hooks();
+    proc.emit('exit', 1);
+    expect(readdirSync(dir)).not.toContain('diagnostics');
+    setSlug('review-we-42');
+    proc.emit('exit', 7);
+    expect(marker()).toEqual({ pid: 123, exitCode: 7, signal: null, endedAt: expect.any(String) });
+  });
+  it.each(['SIGTERM', 'SIGHUP', 'SIGINT'])('installs no %s handler, so a signal still terminates the job', signal => {
+    const { proc } = hooks();
+    expect(proc.listenerCount(signal)).toBe(0);
+  });
+  it('never throws on an unwritable marker', () => {
+    const { proc, setSlug } = hooks();
+    setSlug('../invalid');
+    expect(() => proc.emit('exit', 1)).not.toThrow();
   });
 });

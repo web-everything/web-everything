@@ -30,7 +30,7 @@ Rebuild smokes spend 768 of 1,365 rebuild-minutes a day (`dispatch-dry-run` 510,
 - Checks live in `SMOKE_CHECKS` (we:scripts/lib/daemon-live-smoke.mjs:827). Code checks carry `codeEntries`; today they are skipped only when no changed file touches the check's own import closure since the last live-verified build (we:scripts/lib/daemon-live-smoke.mjs:805-820). `dispatch-dry-run` and `reconcile-dry-run` pull in the dispatch/reconcile machinery, which changes on most merges, so they rarely skip (the xa4qo7n note at we:scripts/lib/daemon-live-smoke.mjs:815).
 - The whole-rebuild skip `skipUnrelated` already exists (we:scripts/lib/daemon-rebuild/skip-unrelated.mjs:1) but unions everything the shared candidate smoke exercises across all daemons, so one daemon's smoke surface keeps every daemon's rebuild awake.
 - Reuse key = `smokePassKey({tree, lockHash, nodeVersion, harnessHash, cloneKind})` (we:scripts/lib/daemon-rebuild/smoke.mjs:71), stored in each clone's own rebuild state and read at we:scripts/lib/daemon-rebuild/smoke.mjs:448 with a 12 h window. Five clones never see each other's pass, and `cloneKind` splits the key further. That is why reuse is 2/107 while 20 of 84 targets were rebuilt 2-3 times.
-- Forge is 96-100 % idle with 32 cores, and only about 6 % of heavy minutes run there (perf pack C, section 1). Remote routing and admission: we:scripts/lib/verify-remote-routing.mjs, we:scripts/lib/remote-manifest.mjs.
+- Forge is 96-100 % idle with spare CPU capacity, and only about 6 % of heavy minutes run there (perf pack C, section 1). Remote routing and admission: we:scripts/lib/verify-remote-routing.mjs, we:scripts/lib/remote-manifest.mjs.
 
 ## Fork 1 - Which changed files trigger which smoke checks?
 

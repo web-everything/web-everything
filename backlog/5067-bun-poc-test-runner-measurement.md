@@ -127,7 +127,7 @@ untouched. Run: `bun test --parallel=4 --preload we:bun-trial/setup.ts <files in
 Slice: 17 slowest by recent vitest timing, 22 mock-module files, 8 plain. 2126 vitest tests; bun passes all but 13
 (gh-app-shim 7, docket-refresh 5, judge-spawn firmlink 1).
 
-Host was NEVER quiet (1-min load 16 to 44 on 12 cores, 1.3 to 3.7 per core; load checked, then measured with load
+Host was NEVER quiet (1-min load 16 to 44 against the host core count, 1.3 to 3.7 per core; load checked, then measured with load
 recorded). Peak RSS = `/usr/bin/time -l` largest process; the bun small-run RSS (about 70 MB) only saw the parent: unusable.
 
 | run | runner | wall s (3 runs) | CPU s user+sys | peak RSS MB | load at start |
