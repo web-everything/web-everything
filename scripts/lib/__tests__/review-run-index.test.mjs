@@ -391,6 +391,69 @@ it('full backfill uses the default parser and refuses corrupt payloads without s
   expect(backfillAllReviewRuns(f)).toEqual({ complete: true, parsed: 1 });
   expect(readCompleteReviewRunsForPr(f.runsDir, f.repo, f.pr)).toEqual([f.run.id]);
 });
+it('an unrelated malformed verdict blocks full completeness and retains the fallback hold until repaired', () => {
+  const f = fixture(), warnings = [];
+  const other = { ...f.run, id: 'review-pr-unrelated', input: { repo: 'else/where', pr: 99 }, verdict: {} };
+  const path = join(f.runsDir, `${other.id}.json`);
+  writeFileSync(path, JSON.stringify(other));
+  expect(headNeverReviewedFromRuns(f)).toBe(false); // original scan refuses unrelated invalid evidence
+  expect(backfillAllReviewRuns({ ...f, warn: message => warnings.push(message) }).complete).toBe(false);
+  expect(warnings.join(' ')).toMatch(/bounded scan still applies.*inspect omitted runs/);
+  expect(readCompleteReviewRunsForPr(f.runsDir, f.repo, f.pr)).toBeNull();
+  expect(headNeverReviewedFromRuns(f)).toBe(false);
+  other.verdict = { verdict: 'accept' };
+  writeFileSync(path, JSON.stringify(other));
+  expect(backfillAllReviewRuns(f)).toEqual({ complete: true, parsed: 1 });
+  expect(readCompleteReviewRunsForPr(f.runsDir, f.repo, f.pr)).toEqual([]);
+  expect(headNeverReviewedFromRuns(f)).toBe(true);
+});
+it.each([
+  ['null run', () => null],
+  ['array run', () => []],
+  ['missing op', run => ({ ...run, op: undefined })],
+  ['empty op', run => ({ ...run, op: '  ' })],
+  ['missing input', run => ({ ...run, input: undefined })],
+  ['empty repo', run => ({ ...run, input: { ...run.input, repo: '  ' } })],
+  ['invalid pr', run => ({ ...run, input: { ...run.input, pr: true } })],
+  ['zero pr', run => ({ ...run, input: { ...run.input, pr: 0 } })],
+  ['unsafe pr', run => ({ ...run, input: { ...run.input, pr: Number.MAX_SAFE_INTEGER + 1 } })],
+  ['missing effects', run => ({ ...run, effects: undefined })],
+  ['array pending', run => ({ ...run, pending: [] })],
+  ['missing verdict', run => ({ ...run, verdict: undefined })],
+  ['array verdict', run => ({ ...run, verdict: [] })],
+  ['empty verdict', run => ({ ...run, verdict: {} })],
+  ['blank verdict', run => ({ ...run, verdict: { verdict: '  ' } })],
+  ['non-string verdict', run => ({ ...run, verdict: { verdict: 1 } })],
+  ['unreadable record', () => { throw Error('unreadable'); }],
+])('unrelated %s refuses full backfill and falls back to the scan hold', (_kind, change) => {
+  const f = fixture(), warnings = [];
+  const other = { ...f.run, id: 'review-pr-unrelated', input: { repo: 'else/where', pr: 99 } };
+  const io = { list: () => [other.id], stat: () => ({ mtimeMs: 2000 }), read: () => change(other) };
+  expect(headNeverReviewedFromRuns({ ...f, ...io })).toBe(false);
+  expect(backfillAllReviewRuns({ ...f, ...io, warn: message => warnings.push(message) }).complete).toBe(false);
+  expect(warnings.join(' ')).toMatch(/bounded scan still applies.*inspect omitted runs/);
+  expect(readCompleteReviewRunsForPr(f.runsDir, f.repo, f.pr, io)).toBeNull();
+  expect(headNeverReviewedFromRuns({ ...f, ...io })).toBe(false);
+});
+it.each(['completed', 'staged'])('legacy %s full backfill revalidates records before proving absence', kind => {
+  const n = negativeFixture(), warnings = [];
+  if (kind === 'completed') fullNegativeIndex(n);
+  else expect(n.fill()).toEqual({ complete: false, parsed: 200 });
+  const path = reviewRunIndexPath(n.f.runsDir), index = JSON.parse(readFileSync(path));
+  const proof = kind === 'completed' ? index.fullReviewRuns.completeness : index.fullReviewRuns.backfill;
+  delete proof.validationVersion; // persisted before strict evidence validation
+  writeFileSync(path, JSON.stringify(index));
+  n.records[1].verdict = {}; // unrelated record already passed by the old cursor
+  expect(readCompleteReviewRunsForPr(n.f.runsDir, n.f.repo, n.f.pr, n.io)).toBeNull();
+  expect(backfillAllReviewRuns({ ...n.f, ...n.io, maxParsesPerCall: 200,
+    warn: message => warnings.push(message) }).complete).toBe(false);
+  expect(warnings.join(' ')).toMatch(/evidence unreadable.*bounded scan still applies/);
+  expect(readCompleteReviewRunsForPr(n.f.runsDir, n.f.repo, n.f.pr, n.io)).toBeNull();
+  expect(headNeverReviewedFromRuns({ ...n.f, ...n.io })).toBe(false);
+  n.records[1].verdict = { verdict: 'accept' };
+  fullNegativeIndex(n);
+  expect(headNeverReviewedFromRuns({ ...n.f, ...n.io })).toBe(true);
+});
 it('full backfill eviction cannot turn a lost key into a proof of absence', () => {
   const n = negativeFixture();
   n.records.push(...Array.from({ length: 112 }, (_, i) => ({ ...n.f.run,

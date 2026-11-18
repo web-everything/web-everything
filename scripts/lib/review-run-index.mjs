@@ -8,6 +8,25 @@ import { basename, dirname, join } from 'node:path';
 import { isValidRunId, parseRunRecord } from '../operations/run-record.mjs';
 import { withFileLock, writeJsonAtomic } from './atomic-json-file.mjs';
 
+/** Shared scan/backfill guard: even unrelated malformed evidence prevents a negative proof. */
+export function assertReviewRunEvidence(run) {
+  const object = value => value != null && typeof value === 'object' && !Array.isArray(value);
+  if (!object(run) || typeof run.op !== 'string' || !run.op.trim()) throw Error('run identity unreadable');
+  // The filename is only a candidate selector. Missing identity must not classify
+  // a corrupt review as unrelated and turn an incomplete scan into a proof.
+  if (run.op === 'review-pr' && (!object(run.input)
+    || typeof run.input.repo !== 'string' || !run.input.repo.trim()
+    || !['string', 'number'].includes(typeof run.input.pr)
+    || !Number.isSafeInteger(Number(run.input.pr)) || Number(run.input.pr) <= 0
+    || !Array.isArray(run.effects)
+    || !(run.pending == null || object(run.pending))
+    || !(run.verdict === null || (object(run.verdict)
+      && typeof run.verdict.verdict === 'string' && run.verdict.verdict.trim())))) {
+    throw Error('review run identity or evidence unreadable');
+  }
+}
+
+const FULL_VALIDATION_VERSION = 1; // Older full snapshots did not validate verdict evidence.
 const MAX_KEYS = 512, MAX_IDS = 32, MAX_BYTES = 1024 * 1024;
 const FULL_MAX_BYTES = 4 * MAX_BYTES; // open/full snapshots plus a bounded staged pass
 const reviewId = id => isValidRunId(id) && id.startsWith('review-pr-');
@@ -64,7 +83,7 @@ function readIndexedRuns(runsDir, repo, pr, full, {
     const key = keyOf(repo, pr);
     if (!key || !validEntries(index?.entries)) return null;
     const rows = index.entries[key] ?? [];
-    if (full && (proof?.all !== true || !Array.isArray(index.evicted)
+    if (full && (proof?.validationVersion !== FULL_VALIDATION_VERSION || proof?.all !== true || !Array.isArray(index.evicted)
       || index.evicted.some(key => typeof key !== 'string') || index.evicted.includes(key)
       || (Object.hasOwn(index.entries, key) && rows.length === 0))) return null;
     if (!proof || !Number.isFinite(proof.completeThroughMtimeMs)
@@ -223,21 +242,24 @@ export function backfillAllReviewRuns({ runsDir, maxParsesPerCall = 50,
       const files = listing(runsDir, list, stat), poisons = poisonNames(path);
       const full = index.fullReviewRuns;
       if (validEntries(full?.entries) && Array.isArray(full.evicted) && full.completeness?.all === true
+        && full.completeness.validationVersion === FULL_VALIDATION_VERSION
         && Number.isFinite(full.completeness.completeThroughMtimeMs)
         && JSON.stringify(full.completeness.files) === JSON.stringify(files)
         && JSON.stringify(full.completeness.poisons) === JSON.stringify(poisons)) return { complete: true, parsed: 0 };
       let state = full?.backfill;
       // A replacement or a new id behind the cursor restarts the snapshot, never
       // publishing a watermark over a file we have not parsed.
-      if (!validEntries(state?.entries) || !Array.isArray(state.evicted)
+      if (state?.validationVersion !== FULL_VALIDATION_VERSION || !validEntries(state?.entries) || !Array.isArray(state.evicted)
         || state.evicted.some(key => typeof key !== 'string') || typeof state.after !== 'string'
         || JSON.stringify(state.files) !== JSON.stringify(files)) {
-        state = { after: '', entries: {}, evicted: [], files, poisons };
+        state = { validationVersion: FULL_VALIDATION_VERSION, after: '', entries: {}, evicted: [], files, poisons };
       }
       const ids = files.filter(row => row.id > state.after);
       const batch = ids.slice(0, maxParsesPerCall);
       for (const row of batch) {
-        const record = read(row.id), key = keyOf(record?.input?.repo, record?.input?.pr);
+        const record = read(row.id);
+        assertReviewRunEvidence(record);
+        const key = keyOf(record.input?.repo, record.input?.pr);
         if (record?.id !== row.id || record.op !== 'review-pr' || !key) throw Error('unverified backfill record');
         const evicted = add(state.entries, key, { id: row.id, mtimeMs: row.mtimeMs });
         if (evicted && !state.evicted.includes(evicted)) state.evicted.push(evicted);
@@ -247,7 +269,7 @@ export function backfillAllReviewRuns({ runsDir, maxParsesPerCall = 50,
       if (complete) {
         if (JSON.stringify(files) !== JSON.stringify(listing(runsDir, list, stat))) throw Error('review listing changed during backfill');
         index.fullReviewRuns = { entries: state.entries, evicted: state.evicted,
-          completeness: { all: true, files, poisons: state.poisons,
+          completeness: { validationVersion: FULL_VALIDATION_VERSION, all: true, files, poisons: state.poisons,
             completeThroughMtimeMs: files.reduce((max, row) => Math.max(max, row.mtimeMs), 0) } };
       } else {
         index.fullReviewRuns = { entries: full?.entries ?? {}, evicted: full?.evicted ?? [], backfill: state };
