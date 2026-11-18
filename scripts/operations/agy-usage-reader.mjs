@@ -9,7 +9,7 @@ import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 
 /** Exact PIDs of every descendant of `root` (script moves agy into its own session, so the group kill misses it). */
-export function descendantPids(root, list = () => execFileSync('ps', ['-axo', 'pid=,ppid='], { encoding: 'utf8' })) {
+export function descendantPids(root, list = () => execFileSync('ps', ['-axo', 'pid=,ppid='], { encoding: 'utf8', timeout: 3000 })) {
   const children = new Map();
   for (const line of list().split('\n')) {
     const [pid, ppid] = line.trim().split(/\s+/).map(Number);
@@ -63,12 +63,12 @@ export function collectAgyUsage({ home = homedir(), timeoutMs = 45000, spawnFn =
       if (Number.isInteger(child.pid) && child.pid > 0) {
         // Exact PIDs only: descendants first (agy lives in script's own session), then the wrapper and its group.
         try {
-          for (const pid of descendants(child.pid)) { try { kill(pid, 'SIGKILL'); } catch { /* already exited */ } }
+          for (const pid of descendants(child.pid)) { try { kill(pid, 'SIGKILL'); } catch (e) { if (e?.code !== 'ESRCH') leaked = true; } }
         } catch { leaked = true; }
-        try { kill(-child.pid, 'SIGKILL'); } catch { /* child may already have exited */ }
+        try { kill(-child.pid, 'SIGKILL'); } catch (e) { if (e?.code !== 'ESRCH') leaked = true; }
       }
       if (leaked) console.error(`agy-usage-reader: could not list child processes of ${child.pid}; check for a stray agy process`);
-      if (error && leaked) error.message += ' (cleanup incomplete: a stray agy process may remain)';
+      if (leaked) error = Object.assign(error ?? new Error('agy usage collected'), {}), error.message += ' (cleanup incomplete: a stray agy process may remain)';
       error ? reject(error) : resolve(value);
     };
     const send = value => { if (!settled) child.stdin.write(value); };

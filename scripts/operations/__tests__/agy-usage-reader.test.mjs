@@ -95,6 +95,14 @@ describe('PTY collection', () => {
     await assertion;
     expect(h.kill).toHaveBeenCalledWith(-1234, 'SIGKILL');
   });
+  it('fails a successful read when a kill is refused', async () => {
+    const kill = vi.fn(() => { throw Object.assign(new Error('nope'), { code: 'EPERM' }); });
+    const h = processFixture({ kill });
+    const assertion = expect(h.promise).rejects.toThrow('cleanup incomplete');
+    await vi.advanceTimersByTimeAsync(3300);
+    h.child.stdout.write(SCREEN);
+    await assertion;
+  });
   it('lists descendants leaf first from ps output', () => {
     expect(descendantPids(10, () => '10 1\n11 10\n12 11\n13 99\n')).toEqual([12, 11]);
   });
