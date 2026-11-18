@@ -4278,8 +4278,18 @@ so a crashed re-review cannot hold a PR forever. A run waiting on a pending step
 abandoned, and neither is a rewound resume (`resumeOf`), which the review loop may still finish.
 Unreadable records still throw, never skip.
 
-The scoped regressions are `drain-red-team-evidence`, `stream-filter-runs`, and the settings layout
-test `settings-files`; use heavy admission.
+Review discovery first tries the bounded `<runs-dir-name>-review-index.json` sidecar beside the
+resolved runs directory. The run-store writer updates it fail-soft under a file lock; drain's complete
+open-PR context advances persisted per-id verification (50 review records total per tick). Partial
+backfills are staged, never published. Indexed payloads still pass the same PR/head, ordering and
+unfinished-review checks. Missing/corrupt/unverified/overflowed hints take the original bounded scan;
+`scan-capped` still holds. Indexed payload read attempts and the fallback share one
+`runs.scan.maxParses` budget, including failed reads; cached indexed payloads count once.
+Index bounds are 512 PR keys, 32 ids per key and 1 MiB per file. Per-PR
+overflow becomes an empty sentinel, forcing fallback instead of silently discarding a review.
+On a persistent backfill error or overflow, inspect omitted records manually; the index cannot clear
+unknown evidence. The scoped regressions are `review-run-index`, `drain-red-team-evidence`,
+`stream-filter-runs`, and the settings layout test `settings-files`; use heavy admission.
 
 
 ## Refused referral reviews re-read standing rulings
@@ -4625,6 +4635,30 @@ are usable only for the ended pid; SIGKILL cannot leave a marker. Keep missing/s
 marker, redaction, bounded-tail and diagnostic-write-failure regressions in the scoped
 review-job and review-daemon suites.
 
+
+## Review index completeness proof
+
+Appending a review id is only a discovery hint. Trust requires a completed backfill's
+`completeThroughMtimeMs`, stat-only id/mtime/file-identity snapshot, rebuilt PR keys, and acknowledged
+create-only poison markers. Listing or open-set changes retain verified id/mtime/file-identity
+and ownership rows; requeue changed/new ids and drop removed ids. An unreadable or mismatched
+candidate aborts the batch without publishing completeness, persists verified progress, and
+records a blocking id with a 60-second retry cooldown. Other ids advance during cooldown;
+completeness remains unpublished until every blocking record is verified or removed. Failed appends poison the whole sidecar independently of its write lock; only a
+complete rebuild acknowledges those markers. Readers stat the current listing before parsing
+indexed ids. Unknown or rewritten unindexed ids require strict record identity verification
+(at most 20 reads, sharing the evidence scan budget); unrelated PR ownership permits the hit.
+Same-PR, unreadable or over-bound unknown evidence, missing watermarks, unreadable listings
+or new poison markers force the unchanged bounded fallback. File identity also detects atomic replacements with
+unchanged mtimes when marker creation fails. Even an older/coarse mtime cannot hide an unknown id.
+Oversized snapshots retain the bounded scan and its scan-capped
+HOLD; inspect omitted runs manually. Optional backfill side effects, including argument and
+directory resolution, must return the drain context unchanged on exceptions.
+For every bounded-read risk, the test plan must name a regression counting actual read attempts
+or asserting the read range, including the default shared budget across repositories. Inject a
+failure after a successful staged read to prove no partial completeness can be published.
+Keep the lost-append, poison, complete-hit, churn, cooldown, budget and wiring regressions in `review-run-index.test.mjs`, run alongside `drain-red-team-evidence.test.mjs`
+through heavy admission.
 ## Fast-drain round listing and live target refresh
 
 Catch-up children share the `--listing-snapshot` round file. Its default TTL is 60 seconds;
