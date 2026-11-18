@@ -924,7 +924,7 @@ export async function judgeSpawn({
     const { stdout, stderr, code, signal, timedOut } = await new Promise((resolve, reject) => {
       let child;
       try {
-        child = spawnFn(cli, argv, { cwd: spawnCwd, env: markWorkerEnv(sanitizeSpawnEnv(env)), stdio: ['pipe', 'pipe', 'pipe'] });
+        child = spawnFn(cli, argv, { cwd: spawnCwd, env: markWorkerEnv(sanitizeSpawnEnv(env)), stdio: ['pipe', 'pipe', 'pipe'], detached: true });
       } catch (e) {
         reject(new Error(`judge-spawn: could not start \`${cli}\`: ${e.message}`));
         return;
@@ -946,7 +946,11 @@ export async function judgeSpawn({
       if (timeoutMs > 0) {
         timer = setTimeout(() => {
           killed = true;
-          try { child.kill('SIGKILL'); } catch { /* already gone */ }
+          let groupKilled = false;
+          if (Number.isInteger(child.pid) && child.pid > 0) {
+            try { process.kill(-child.pid, 'SIGKILL'); groupKilled = true; } catch { /* fallback below */ }
+          }
+          if (!groupKilled) { try { child.kill('SIGKILL'); } catch { /* already gone */ } }
           // Settling on `close` rather than here is what preserves the partial output: Node delivers the
           // buffered `data` events first. The grace timer only covers a `close` that never arrives.
           grace = setTimeout(() => settle({ stdout: out, stderr: err, code: null, signal: null, timedOut: true }), JUDGE_TIMEOUT_GRACE_MS);
