@@ -36,7 +36,7 @@ export default {
       { type: REVIEW_EFFECTS.WRITE_UP, payload: { bodyFile: payload.bodyFile, body } },
     ] }) }));
 
-    for (const state of ['same-head', 'unmarked-comment', 'unrelated-comment', 'no-comment', 'moved-head', 'unreadable-labels', 'source-labels-still-present', 'later-changes', 'ruling-hold', 'not-applied']) {
+    for (const state of ['same-head', 'unmarked-comment', 'unrelated-comment', 'no-comment', 'moved-head', 'unreadable-labels', 'source-labels-still-present', 'later-changes', 'ruling-hold', 'pipeline-refusal', 'not-applied']) {
       const store = createMemoryRunStore();
       const run = advance(startRun({ op: 'observe-label', id: `observe-${state}`, registry }), { registry });
       Object.assign(run.effects[0], { status: 'pending', attempts: 1, error: 'UNKNOWN: response lost',
@@ -45,15 +45,16 @@ export default {
       store.write(run);
       let writes = 0;
       const root = mkdtempSync(join(tmpdir(), 'observe-label-'));
+      const readLabels = () => state === 'unreadable-labels' ? null
+        : state === 'later-changes' ? [...labels, 'review:changes']
+        : state === 'ruling-hold' ? [...labels, 'advisory:ruling-needed']
+        : state === 'source-labels-still-present' ? ['review:pending', 'ready-to-merge'] : labels;
       const sinks = createReviewPrSinks({ root, runStore: store,
-        labelProvider: { readComments: () => state === 'no-comment' ? [] : [{
+        labelProvider: { readPrState: () => ({ state: 'OPEN', body: '', headRefOid: HEAD, labels: readLabels() }), readComments: () => state === 'no-comment' ? [] : [{
           author: { login: 'web-everything' }, body: `${state === 'unrelated-comment' ? 'Unrelated review.' : body}\n\n<!-- reviewed-sha: ${HEAD} -->${!['unmarked-comment', 'unrelated-comment'].includes(state) ? `\n<!-- review-attempt: ${run.effects[0].key} -->` : ''}`, createdAt: '2026-11-18T19:16:30Z',
-        }] },
+        }, ...(state === 'pipeline-refusal' ? [{ author: { login: 'web-everything' }, body: '<!-- mandatory-referrals-v1: truncated' }] : [])] },
         readHead: () => state === 'moved-head' ? 'b'.repeat(40) : HEAD,
-        readLabels: () => state === 'unreadable-labels' ? null
-          : state === 'later-changes' ? [...labels, 'review:changes']
-          : state === 'ruling-hold' ? [...labels, 'advisory:ruling-needed']
-          : state === 'source-labels-still-present' ? ['review:pending', 'ready-to-merge'] : labels,
+        readLabels,
         runNode: () => { writes++; throw new Error('sink replayed'); },
       });
       if (state === 'not-applied') sinks[REVIEW_EFFECTS.LABEL].observeOutcome = async () => 'not-applied';

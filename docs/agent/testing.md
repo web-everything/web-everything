@@ -4740,3 +4740,10 @@ Re-run `decideSetLabel` on live labels and require its target present and every 
 frozen removal lists miss holds added later. Unmarked historical comments remain unknown for
 operator reconciliation. The observation tests and soak break must cover both an unmarked
 same-head refusal and marked recovery without replaying the write.
+
+## Label-swap observation (R115)
+
+Keep live review-label eligibility in `scripts/lib/review-set-label-preflight.mjs`, shared by
+the writer and the unknown-outcome observer. A trusted exact attempt marker proves identity;
+only a passing preflight with `settled: true` proves completion. Keep the malformed referral
+thread case in the direct, observer and soak tests: matching labels alone cannot clear it.

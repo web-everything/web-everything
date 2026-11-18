@@ -1,3 +1,4 @@
+import { reviewSetLabelPreflight } from '../lib/review-set-label-preflight.mjs';
 import { redTeamCheckRunIsEvidence, redTeamCheckRunPayload, postRedTeamCheckRun as defaultPostRedTeamCheckRun } from '../lib/red-team-check-run.mjs';
 import { redTeamForHead } from '../lib/red-team-gate.mjs';
 import { basisLineOf, isReviewVerdictComment, reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
@@ -2074,19 +2075,17 @@ export function createReviewPrSinks({
     try {
       const head = await readHead({ repo: payload.repo, pr: payload.pr });
       if (head !== payload.reviewedHead) return null;
-      const labels = await readLabels(payload.repo, payload.pr);
-      if (!Array.isArray(labels)) return null;
-      const names = labels.map(label => typeof label === 'string' ? label : label?.name);
-      if (!names.every(nonempty)) return null;
-      const decision = decideSetLabel({ to: payload.to, currentLabels: names });
-      if (!decision.allowed || !names.includes(decision.addLabel)
-        || decision.removeLabels.some(label => names.includes(label))) return null;
-      // The provider checks pagination completeness; failures and non-array evidence fail closed.
+      // Both reads must be complete: the attempt marker is not a substitute for current guard evidence.
       const comments = await labelProvider.readComments(payload.repo, payload.pr);
-      if (!Array.isArray(comments)) return null;
-      if (comments.some(comment => isTrustedMarkerAuthor(comment)
+      if (!Array.isArray(comments) || !comments.some(comment => isTrustedMarkerAuthor(comment)
         && parseReviewAttempt([comment]) === entry.key
-        && parseReviewedSha([comment]) === payload.reviewedHead)) return 'applied';
+        && parseReviewedSha([comment]) === payload.reviewedHead)) return null;
+      const state = await labelProvider.readPrState(payload.repo, payload.pr);
+      const result = reviewSetLabelPreflight({
+        state: { ...state, comments }, repo: payload.repo, pr: payload.pr,
+        to: payload.to, expectedHead: payload.reviewedHead,
+      });
+      if (result.settled) return 'applied';
       return null;
     } catch { return null; }
   };

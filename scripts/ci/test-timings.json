@@ -305,6 +305,7 @@
   "scripts/__tests__/review-set-label.approval-prevention-filing.test.mjs": 4.11,
   "scripts/__tests__/review-set-label.gh-throttle-fidelity.test.mjs": 0,
   "scripts/__tests__/review-set-label.test.mjs": 63.29,
+  "scripts/lib/__tests__/review-set-label-preflight.test.mjs": 1,
   "scripts/__tests__/route-reference-remediation.test.mjs": 0.01,
   "scripts/__tests__/rules-anchors.test.mjs": 4.89,
   "scripts/__tests__/run-fresh.test.mjs": 3.14,

@@ -4419,9 +4419,12 @@ describe('pending label swap observation', () => {
   const comment = { author: { login: 'web-everything' },
     body: `<!-- review-attempt: ${entry.key} -->\nRecorded by reviewer.\n\n${body.replace(/\r\n/g, '\n').trim()}\n\n<!-- reviewed-sha: d20084f7c427cdb0000c40f298fff4f6bdff3179 -->`, createdAt: '2026-11-18T19:16:30Z' };
   const observer = (options = {}) => {
+    const readPrState = async () => ({ state: 'OPEN', body: '', headRefOid: entry.payload.reviewedHead,
+      labels: await (options.readLabels ?? (() => live))('o/n', 7109) });
+    if (options.labelProvider) options = { ...options, labelProvider: { readPrState, ...options.labelProvider } };
     const observe = createReviewPrSinks({ root,
       readHead: async () => entry.payload.reviewedHead, readLabels: async () => live,
-      labelProvider: { readComments: () => [comment] }, ...options,
+      labelProvider: { readPrState, readComments: () => [comment] }, ...options,
     })[REVIEW_EFFECTS.LABEL].observeOutcome;
     return (entry, record = run) => observe(entry, record);
   };
@@ -4450,6 +4453,19 @@ describe('pending label swap observation', () => {
     ['incomplete comments result', { comments: [comment], complete: false }],
   ])('keeps matching labels unknown with %s', async (_name, comments) => {
     await expect(observer({ labelProvider: { readComments: () => comments } })(entry)).resolves.toBeNull();
+  });
+
+  it('keeps a settled marked swap unknown when the mandatory-referral pipeline refuses', async () => {
+    const malformed = { author: { login: 'web-everything' }, body: '<!-- mandatory-referrals-v1: truncated' };
+    await expect(observer({ labelProvider: { readComments: () => [comment, malformed] } })(entry)).resolves.toBeNull();
+  });
+
+  it.each([null, {}, { state: 'CLOSED', headRefOid: entry.payload.reviewedHead }])('keeps unreadable or inert PR state unknown: %j', async state => {
+    await expect(observer({ labelProvider: { readPrState: () => state, readComments: () => [comment] } })(entry)).resolves.toBeNull();
+  });
+
+  it('keeps a failed live preflight read unknown', async () => {
+    await expect(observer({ labelProvider: { readPrState: () => { throw new Error('unreadable'); } } })(entry)).resolves.toBeNull();
   });
 
   it('does not require staged text, a run record or attempt timestamp', async () => {

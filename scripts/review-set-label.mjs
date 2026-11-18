@@ -1,3 +1,4 @@
+import { reviewSetLabelPreflight } from './lib/review-set-label-preflight.mjs';
 import { RED_TEAM_STATUS_LABELS } from './lib/red-team-status-label-meta.mjs';
 import { readConfirmedBreaks, redTeamRulingNeeded } from './lib/red-team-gate.mjs';
 import { standingRulingScope } from './conveyor/standing-ruling-io.mjs';
@@ -147,8 +148,7 @@ import { referralLiveContext } from './lib/referral-live-context.mjs';
 // #2844 — WHO cleared this verdict, and the refusal when that is the PR's own author. See that module's header
 // for what the id rests on (the harness session identity, NOT the free-text `--actor`) and for the residual.
 import {
-  currentActorId, parseAuthorActorId, buildClearerActorMarker, decideClearerIndependence, INDEPENDENCE,
-  hasStampLostMarker,
+  currentActorId, buildClearerActorMarker, decideClearerIndependence, INDEPENDENCE,
 } from './lib/review-independence.mjs';
 // #3007 PHASE 1 (SHADOW) — the append-only verdict ledger. This CLI is the SINGLE HOME of a label swap, so it
 // is also the single home of a ledger row: every caller (the `/review` ceremony, the #3035 operation's label
@@ -227,7 +227,7 @@ import {
 } from './lib/approval-prevention-notice.mjs';
 // #xwp8ioh — the #2953 inert-PR predicate, extracted so `review-pr`'s `read` step enforces the same rule
 // before a juror is paid instead of this site being the only place it is checked.
-import { classifyPrLiveness, inertPrMessage } from './lib/pr-liveness.mjs';
+import { classifyPrLiveness } from './lib/pr-liveness.mjs';
 // #3334 — the reasonless-bounce rule. A LEAF module with no imports, so the other route that must hold it
 // (`we:scripts/operations/record-verdict.mjs`, which asserts an EMPTY external import graph) can too; see that
 // file's header for why the split exists. Re-exported below so this file stays the single place to look.
@@ -1373,35 +1373,27 @@ export function runReviewLabelCli({
   let headSha = '';
   let headRefName = '';
   let baseRefName = '';
-  let prState = '';
   let prBody = '';
   let prTitle = '';
-  let prCreatedAt = '';
   let prComments = [];
   let prCommentsReadable = false;
   // #4708 — set when the referral gate accepted this head on an earlier head's carried clean review (see
   // `referralEvidenceCarry`); the durable comment then records which head, which run and which diff fingerprint.
   let referralCarry = null;
+  let observedState;
   try {
     const parsed = provider.readPrState(repo, pr);
-    if (['accepted', 'restamp', 'clear-human'].includes(to)) {
-      referralCarry = assertMandatoryReferralsCleared(parsed, { repo, pr, ...referralOptions })?.carry ?? null;
-    }
+    observedState = parsed;
     currentLabels = onlyIf === 'missing' ? parsed.labels : Array.isArray(parsed.labels) ? parsed.labels : [];
     headSha = typeof parsed.headRefOid === 'string' ? parsed.headRefOid : '';
     // #2979 — the branch name the NET diff is resolved against (see the fingerprint block below). Same gh call,
     // one more json field, no extra hop.
     headRefName = typeof parsed.headRefName === 'string' ? parsed.headRefName : '';
     baseRefName = typeof parsed.baseRefName === 'string' ? parsed.baseRefName : '';
-    prState = typeof parsed.state === 'string' ? parsed.state : '';
     // #2844 — the PR body carries the `authored-by-actor` stamp pr-land wrote at open. Same gh call, one more
     // json field, no extra hop — the same "ride the existing read" pattern #2953 used for `state`.
     prBody = typeof parsed.body === 'string' ? parsed.body : '';
     prTitle = typeof parsed.title === 'string' ? parsed.title : '';
-    // #3067 — and its open date, on that same call. A stamp missing from a PR opened AFTER the regime began was
-    // STRIPPED; one missing from an older PR was never written. Until this was read, both looked identical and
-    // both were tolerated.
-    prCreatedAt = typeof parsed.createdAt === 'string' ? parsed.createdAt : '';
     // #x9krtkb — the restamp path's own read-back (see the import note above). Read unconditionally, off the
     // SAME call, for every target: it costs nothing extra to parse a field already in the response, and a
     // conditional read here would be the second copy of "which targets need comments" for no reason.
@@ -1434,81 +1426,8 @@ export function runReviewLabelCli({
     headSha = newHeadArg.toLowerCase();
   }
 
-  // #2953 — FAIL CLOSED on anything but an OPEN PR. Every sanctioned caller (the hand-run `/review` skill, the
-  // conveyor's `rearm-review.mjs`, and `auto-land-seam.mjs`'s `defaultWriteAccept`, which applies `accepted`
-  // BEFORE the merge itself) only ever swaps a label on a PR that is still open — so this cannot break a
-  // legitimate caller. What it stops: a verdict posted on a PR the drain already merged (observed on WE PR #1073
-  // — `review:changes` landed six minutes after `mergedAt`) used to report `{"ok":true}`, which reads as a live
-  // bounce the drain ignored when in fact the merge gate was never involved. The findings belong on a NEW PR, not
-  // on the merged one.
-  //
-  // #xwp8ioh — the predicate and its wording now live in `we:scripts/lib/pr-liveness.mjs`, imported rather
-  // than restated here, because `we:scripts/operations/review-pr.mjs` gained the SAME check at its `read`
-  // step and two copies of one rule is the drift #2644 forbids. The behaviour at THIS site is unchanged: any
-  // non-OPEN state still fails closed with the same sentence and the same exit code. What moved forward is
-  // WHEN it first fires — the read side now refuses before a juror is paid, so this write-side guard becomes
-  // the backstop it should always have been rather than the only line of defence.
-  const liveness = classifyPrLiveness({ state: prState });
-  if (liveness.outcome !== 'reviewable') {
-    fail(inertPrMessage({ pr, state: liveness.state }), 1);
-  }
-
-  // #2844 — THE SELF-CLEAR REFUSAL. Independence is EVALUATED for both targets that record an acceptance
-  // (`accepted`, `clear-human`) so the durable comment can state the outcome either way; a `changes` bounce and a
-  // `rearm` land nothing, so neither needs an independence bar at all. Checked HERE: after the OPEN-state gate,
-  // BEFORE the pure decision and therefore before ANY gh mutation, and refusing through the same `{"error":…}`
-  // JSON contract every other refusal here honours.
-  //
-  // ONLY `--to=accepted` — the AGENT verdict path — is REFUSED, and only on a PROVEN self-clear. Two separate
-  // narrowings, each with its own reason:
-  //   • the two "cannot establish it" statuses PROCEED and say so verbatim in the durable comment
-  //     (`buildVerdictComment`). That asymmetry with the autonomous seam (`we:scripts/lib/auto-land-seam.mjs`,
-  //     which refuses all three) is argued in full in `we:scripts/lib/review-independence.mjs`'s header:
-  //     refusing `unknown-author` HERE would strand every PR opened before the stamp existed with no way for a
-  //     HUMAN to clear it, which trades a real hole for a worse one.
-  //   • `clear-human` is EXEMPT (PR #1100 review, THE BLOCKER). The comparison is SESSION-level — a subagent
-  //     inherits its parent's `CLAUDE_CODE_SESSION_ID` — and the operator's `/review` ceremony shells this CLI
-  //     from inside the session that opened the PR, so refusing `clear-human` too refused the operator's entire
-  //     normal workflow and left NOTHING clearable through the sanctioned path. The exemption costs nothing the
-  //     guard was buying, because `clear-human` already carries a stronger human signal than a session id: it is
-  //     refused unless the PR actually carries `review:human` (`decideSetLabel`, below — that refusal still
-  //     stands and is reached precisely because this one no longer fires first), and it demands an explicit
-  //     `--actor` plus a quoted `--reason`. `buildVerdictComment` RECORDS the exemption, so the trail says a
-  //     human ceremony cleared it rather than an established-independent agent.
   const clearerId = currentActorId();
-  // `restamp` stamps the markers — carrying them across a head the drain moved is the entire point — but it is
-  // EXCLUDED from the independence check: no clearer is asserting anything, so there is nobody to be
-  // independent OF. The acceptance it carries already passed that check when it was earned.
-  const stampsAcceptance = to === 'accepted' || to === 'clear-human' || to === 'restamp';
-  const independence = (stampsAcceptance && to !== 'restamp')
-    // #3067 WIRED HERE — the module's own header named this as the owed follow-up: the pure decider grew
-    // `prCreatedAt` and `stampLostMarked` as OPT-IN inputs, and until a live caller passed them a stripped
-    // stamp stayed indistinguishable from an absent one. Both are supplied now, so a post-regime PR with no
-    // stamp resolves to STAMP_LOST (refused) instead of UNKNOWN_AUTHOR (tolerated).
-    ? decideClearerIndependence({
-      authorId: parseAuthorActorId(prBody),
-      clearerId,
-      prCreatedAt,
-      stampLostMarked: hasStampLostMarker(prBody),
-    })
-    : null;
-  if (to === 'accepted' && independence && independence.status === INDEPENDENCE.SELF_CLEAR) {
-    // THE MESSAGE NAMES ONLY ROUTES THAT ACTUALLY WORK (PR #1100 review). The first cut inherited the decider's
-    // "…or let a human clear it", which pointed at a door this same refusal had shut. There is deliberately NO
-    // `--force` and no flag on this command: an agent recording an accept on its own session's PR is not an
-    // independent review, and #2844 exists to stop that record being written as if it were.
-    fail(
-      `${independence.reason} — nothing was changed (#2844). TWO ROUTES ACTUALLY CLEAR THIS PR, and neither is a `
-      + 'flag on this command. (1) THE HUMAN CEREMONY: if the PR carries review:human, re-run with '
-      + '--to=clear-human --actor=<name> --reason="<the operator instruction authorising it>" — that target is '
-      + 'EXEMPT from this refusal and the durable comment records the clearance as a human ceremony; it is itself '
-      + 'refused when the PR does NOT carry review:human. (2) A DIFFERENT SESSION: run the review, and this '
-      + 'command, from a session that did not open the PR — its own session id is then the clearing actor and the '
-      + 'independence bar is genuinely met. There is no --force.',
-      1,
-    );
-  }
-
+  const stampsAcceptance = ['accepted', 'restamp', 'clear-human'].includes(to);
   // we:scripts/review-set-label.mjs#runReviewLabelCli — the PURE decision. A refusal (INVARIANT 2, a reasonless
   // bounce, or nothing to re-arm) changes NOTHING and exits non-zero.
   //
@@ -1580,18 +1499,24 @@ export function runReviewLabelCli({
   const redTeamRulingHold = to === 'clear-human' && hasReviewLabel(currentLabels, REVIEW_LABELS.accepted)
     && !hasReviewLabel(currentLabels, REVIEW_LABELS.human) && !hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical)
     && redTeamRulingHeld({ repo, pr, headSha, labels: currentLabels, comments: fullThread(), setting: readConfirmedBreaks().value, readGrantScope });
-  let decision = decideSetLabel({
-    to,
-    currentLabels,
-    findingCount: bounceEvidence.findingCount,
-    reason: clearReason || bounceEvidence.reason,
-    requireLive: onlyIf,
-    humanOnlyHold,
-    redTeamRulingHold,
-    acceptanceStillCoversHead: parseReviewedSha(prComments.filter(isTrustedMarkerAuthor)) === headSha,
-    humanClearedHead: to === 'rearm' && headEverHumanCleared(rearmThread, headSha.trim()),
-    operatorRestamp: to === 'restamp' && actorArg.trim().toLowerCase() === 'operator',
-  });
+  let preflight;
+  try {
+    preflight = reviewSetLabelPreflight({
+      state: { ...observedState, labels: currentLabels }, repo, pr, to, clearerId, referralOptions,
+      decisionOptions: {
+        findingCount: bounceEvidence.findingCount,
+        reason: clearReason || bounceEvidence.reason,
+        requireLive: onlyIf,
+        humanOnlyHold,
+        redTeamRulingHold,
+        acceptanceStillCoversHead: parseReviewedSha(prComments.filter(isTrustedMarkerAuthor)) === headSha,
+        humanClearedHead: to === 'rearm' && headEverHumanCleared(rearmThread, headSha.trim()),
+        operatorRestamp: to === 'restamp' && actorArg.trim().toLowerCase() === 'operator',
+      },
+    });
+  } catch (e) { fail(ghErr(e, 'review preflight failed'), 1); }
+  let { decision, independence } = preflight;
+  referralCarry = preflight.referralCarry;
   if (resumePinnedRearm) {
     decision = { ...decision, allowed: true, addLabel: REVIEW_LABELS.pending, removeLabels: [],
       rearmFrom: REVIEW_LABELS.pending, reason: 'resuming the marker for a pinned pending re-arm' };
