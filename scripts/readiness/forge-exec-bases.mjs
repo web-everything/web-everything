@@ -192,7 +192,10 @@ export async function materializeWorktree({work,root,baseSha,head,manifest,manif
       let parts;
       try {parts=pathParts(linkPath);}catch {continue;}
       const prefix=Buffer.concat([linkPath,Buffer.from('/')]);
-      if(!entries.some(entry=>!entry.tracked&&entry.path.subarray(0,prefix.length).equals(prefix)))continue;
+      const under=entries.filter(entry=>entry.path.subarray(0,prefix.length).equals(prefix));
+      // A tracked descendant means the client replaced this link with a real
+      // directory; restoring the link would conflict with it as parent and child.
+      if(under.some(entry=>entry.tracked)||!under.length)continue;
       const target=await git(['cat-file','blob',match[1]],cloned,undefined,true,true);
       if(!target?.length||target[0]===47||target.some(b=>b===0||b===10||b===13))continue;
       const targetParts=parts.slice(0,-1).map(part=>part.toString('latin1'));

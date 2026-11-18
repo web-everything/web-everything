@@ -78,11 +78,14 @@ describe('R593 bundle ingest on the runner', () => {
     // tested without ever creating or following a filesystem symlink.
     const links = [
       ['.claude/agent-memory', '.././agent-memory-src/../agent-memory-src', false],
-      ['absolute', '/outside', false],
-      ['escaping', '../outside', false],
-      ['nested/escaping', '../../outside', false],
-      ['newline', 'agent-memory-src\n', false],
-      ['nul', 'agent-memory-src\0suffix', false],
+      // Each guard gets its own link whose target would match the projected
+      // `agent-memory-src` directory if that guard were removed.
+      ['absolute', '/agent-memory-src', false],
+      ['escaping', '../agent-memory-src', false],
+      ['nested/escaping', '../../agent-memory-src', false],
+      ['newline', 'agent-memory-src\n/../agent-memory-src', false],
+      ['nul', 'agent-memory-src\0/../agent-memory-src', false],
+      ['empty', '', false],
       ['no-alias', 'agent-memory-src', null],
       ['prefix-only', 'agent-memory-src', null],
       ['tracked-alias', 'agent-memory-src', true],
@@ -135,6 +138,34 @@ describe('R593 bundle ingest on the runner', () => {
     }
     expect((await fs.lstat(join(work, '.claude/agent-memory'))).isDirectory()).toBe(true);
     expect(await fs.readFile(join(work, '.claude/agent-memory/file.md'), 'utf8')).toBe('projected');
+  });
+  it('does not restore a HEAD symlink the client replaced with a real directory holding tracked files', async () => {
+    // HEAD: `alias -> src` plus tracked `src/copied.md`. The client removed the
+    // link and added a real, tracked `alias/new.md`; the untracked projection
+    // `alias/copied.md` still mirrors `src/copied.md`, so alias matching alone passes.
+    const oid = (await exec({ file: 'git', args: ['hash-object', '-w', '--stdin'], cwd: lane, input: 'src' })).stdout.toString().trim();
+    git(lane, 'update-index', '--add', '--cacheinfo', `120000,${oid},alias`);
+    const entries = [{ path: Buffer.from('tracked.txt'), sha256: hash('changed'), executable: false, tracked: true }];
+    for (const [path, content, tracked] of [['src/copied.md', 'copied', true], ['alias/copied.md', 'copied', false], ['alias/new.md', 'new', true]]) {
+      await fs.mkdir(join(work, path, '..'), { recursive: true });
+      await fs.writeFile(join(work, path), content);
+      entries.push({ path: Buffer.from(path), sha256: hash(content), executable: false, tracked });
+    }
+    await fs.mkdir(join(lane, 'src'), { recursive: true });
+    await fs.writeFile(join(lane, 'src/copied.md'), 'copied');
+    git(lane, 'add', '--', 'src/copied.md');
+    git(lane, ...ident, 'commit', '-qm', 'HEAD alias');
+    const head = git(lane, 'rev-parse', 'HEAD');
+    await fs.rm(join(root, 'repo.git'), { recursive: true, force: true });
+    git(root, 'clone', '--bare', lane, join(root, 'repo.git'));
+    git(join(root, 'repo.git'), 'update-ref', 'refs/remotes/origin/main', runnerMain);
+    entries.sort((a, b) => Buffer.compare(a.path, b.path));
+    const manifest = { ...manifestWire({ entries, excluded: [] }), git: { head } };
+    await materializeWorktree({ work, root, head, manifest, manifestDigest: digestManifest(manifest),
+      bundle: { mode: 'none', maxMainAgeMs: 600000 } });
+    const staged = git(work, 'ls-files', '--stage');
+    expect(staged).toMatch(/^100644 [0-9a-f]+ 0\talias\/new\.md$/m);
+    expect(staged).not.toMatch(/^120000 [0-9a-f]+ 0\talias$/m);
   });
   it('fetches a verified incremental bundle into a per-run clone and checks out the exact tip', async () => {
     const plan = await run();
