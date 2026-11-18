@@ -233,6 +233,12 @@ export function changedControl(before = {}, after = {}) {
   return Object.keys(before).filter((dir) => !sameJson(before[dir]?.control, after[dir]));
 }
 
+/** WHICH control files differ for one checkout (names only, never contents), for the void reason. PURE. */
+export function changedControlNames(beforeControl = {}, afterControl = {}) {
+  const names = new Set([...Object.keys(beforeControl ?? {}), ...Object.keys(afterControl ?? {})]);
+  return [...names].filter((n) => (beforeControl ?? {})[n] !== (afterControl ?? {})[n]).sort().slice(0, 6);
+}
+
 /** Which watched checkouts differ between two snapshots. PURE. */
 export function changedCheckouts(before = {}, after = {}) {
   return Object.keys(before).filter((dir) => {
@@ -536,7 +542,7 @@ export async function runAgyReviewJuror({ request, laneCwd, model, watch = [], d
     const touched = touchedPaths(transcriptText, jurorLane, home, watched);
     for (const dir of watched) {
       if (dir === resolve(laneCwd)) {
-        if (controlChanged.has(dir)) reasons.push(`git config, hooks or attributes changed outside the juror lane: ${label(dir)}`);
+        if (controlChanged.has(dir)) reasons.push(`git config, hooks or attributes changed outside the juror lane: ${label(dir)} (${changedControlNames(before[dir]?.control, controlAfter[dir]).join(', ') || 'unknown file'})`);
         else if (changedCheckouts({ [dir]: before[dir] }, { [dir]: after[dir] }).length) reasons.push(`change outside the juror lane: ${label(dir)}`);
       } else if (sharedChangeTouched(dir, before[dir], after[dir], touched, exec)) {
         reasons.push(`change outside the juror lane touched by the juror: ${label(dir)}`);
