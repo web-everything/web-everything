@@ -1931,6 +1931,29 @@ describe('case 5f — conflict-fix dispatch, capped by its OWN durable marker, n
     expect(plan.refusals[0].capKind).toBe('fix');
   });
 
+  it.each([NEGOTIATION_ROUND_CAP, NEGOTIATION_ROUND_CAP + 1])('a DIRTY bounce without the conflict label refuses cap-exhausted after %i shared rounds', (attempts) => {
+    const shared = Array.from({ length: attempts }, () => ({ body: REARM_COMMENT_MARKER, author: AUTOMATION }));
+    const plan = planReconcile({
+      prs: [pr1563({ mergeStateStatus: 'DIRTY', comments: [finding(), ...shared] })], agents: [], now: NOW,
+    });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toEqual([expect.objectContaining({
+      kind: 'cap-exhausted', attempts, cap: NEGOTIATION_ROUND_CAP, capKind: 'fix',
+      why: expect.stringContaining('a person must take it'),
+    })]);
+  });
+
+  it('a DIRTY bounce without the conflict label dispatches a conflict fix while the shared cap is not spent', () => {
+    const shared = Array.from({ length: NEGOTIATION_ROUND_CAP - 1 }, () => ({ body: REARM_COMMENT_MARKER, author: AUTOMATION }));
+    const plan = planReconcile({
+      prs: [pr1563({ mergeStateStatus: 'DIRTY', comments: [finding(), ...shared] })], agents: [], now: NOW,
+    });
+    expect(plan.refusals).toEqual([]);
+    expect(plan.dispatch).toEqual([expect.objectContaining({
+      kind: 'fix', prNumber: 1563, isConflict: true, attempts: 0, cap: CONFLICT_FIX_ROUND_CAP,
+    })]);
+  });
+
   it('`countConflictFixComments` narrows on the leading line, like every sibling counter', async () => {
     const { countConflictFixComments } = await import('../conflict-fix-round-count.mjs');
     expect(countConflictFixComments([{ body: CONFLICT_FIX_COMMENT_MARKER + '\n\nmore', author: AUTOMATION }])).toBe(1);

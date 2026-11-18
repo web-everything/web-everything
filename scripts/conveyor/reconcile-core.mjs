@@ -3990,8 +3990,10 @@ export function planReconcile({
     // floor below, which a PR can independently have already exhausted on real review negotiation (CONFIRMED
     // LIVE: `web-everything/web-everything#2549`, `review-round:5` against the shared cap of 5, zero conflict-fix
     // rounds ever run). See that constant's own docblock for the full incident.
+    // DIRTY alone may route an eligible repair to conflict resolution, but cannot reopen exhausted review
+    // repairs. Only the explicit conflict label retains the independent conflict budget past the shared cap.
     const isConflictBounce = phase === 'bounced' && (withPhase.labels.includes(CONFLICT_LABEL)
-      || String(pr?.mergeStateStatus ?? '').toUpperCase() === 'DIRTY');
+      || (attempts < effectiveRoundCap && String(pr?.mergeStateStatus ?? '').toUpperCase() === 'DIRTY'));
     if (isConflictBounce) {
       // #2787-live-incident — `currentRef` is `defaultBranch` (this population is, by definition, a main-base
       // conflict); `mainSha` is `origin/<defaultBranch>`'s own current tip, when the IO shell supplied one (see
