@@ -30,7 +30,7 @@ function closureDiffers(daemon, from, to, readClosure) {
 export function freezeProbation({ adoptionId, sha, provenGood, adoptedAt, registered, readClosure } = {}) {
   if (!nameOK(adoptionId) || !shaOK(sha) || !Number.isFinite(dateMs(adoptedAt))
     || (provenGood != null && !shaOK(provenGood)) || !Array.isArray(registered)
-    || registered.some(d => !object(d) || !nameOK(d.id))
+    || Array.from(registered).some(d => !object(d) || !nameOK(d.id))
     || new Set(registered.map(d => d.id)).size !== registered.length) throw rosterError();
   const owed = registered.filter(d => closureDiffers(d, provenGood, sha, readClosure)).map(d => d.id);
   return Object.freeze({ version: 2, adoptionId, sha, provenGood: provenGood ?? null, adoptedAt,
@@ -50,7 +50,7 @@ function validProof(p, daemonId, evidence, now) {
     && boot.daemonId === daemonId && tick.daemonId === daemonId
     && Number.isSafeInteger(boot.pid) && boot.pid > 0 && tick.pid === boot.pid
     && boot.head === p.sha && tick.head === p.sha
-    && start >= dateMs(p.adoptedAt) && done > start && done <= now + 60_000;
+    && start >= dateMs(p.adoptedAt) && done > start && done <= now;
 }
 
 /** The boot and tick must come from this daemon's own process record, independently of siblings.

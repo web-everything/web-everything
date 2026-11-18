@@ -37,6 +37,18 @@ describe('R986 I1 frozen owed set and per-daemon proofs (pure core)', () => {
     expect(p.records).toEqual({});
   });
 
+  it('a tick completed in the future of now is not proof', async () => {
+    const { freezeProbation, recordProof, evaluateProbation } = await core();
+    const p = freezeProbation(options);
+    expect(recordProof(p, 'worker', proof(101, 'worker'), ADOPTED_AT)).toBe(p);
+    expect(evaluateProbation(p, ADOPTED_AT)).toMatchObject({ action: 'pending' });
+  });
+
+  it('a sparse roster (holes) refuses adoption instead of an empty owed set', async () => {
+    const { freezeProbation } = await core();
+    expect(() => freezeProbation({ ...options, registered: new Array(1) })).toThrow();
+  });
+
   it('empty owed set promotes immediately with no boot or tick evidence', async () => {
     const { freezeProbation, evaluateProbation } = await core();
     const p = freezeProbation({ ...options, readClosure: () => closure(GOOD) });
