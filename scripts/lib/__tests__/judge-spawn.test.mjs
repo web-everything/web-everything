@@ -1475,6 +1475,64 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
   }
   const sidOf = (argv) => flagValue(argv, '--session-id');
 
+  const genericFailure = { type: 'error', error: 'transient failure' };
+  const spendingFailures = [
+    ['budget', { type: 'result', is_error: true, stop_reason: 'tool_use', total_cost_usd: 0.596, result: '' }],
+    ['quota', { type: 'result', is_error: true, result: "You've hit your weekly limit · resets tomorrow" }],
+  ];
+  const expectSpendingFailure = (error, kind) => {
+    if (kind === 'budget') {
+      expect(error).toBeInstanceOf(JudgeBudgetError);
+      expect(error).toMatchObject({ budgetExceeded: true, budget: 0.5, costUsd: 0.596 });
+    } else {
+      expect(error).toMatchObject({ quota: true,
+        holdRow: { provider: 'claude', status: 'quota-exhausted', scoredAt: expect.any(String), quotaResetsAt: null },
+        telemetry: { failureKind: 'provider-quota', failureText: spendingFailures[1][1].result } });
+    }
+  };
+
+  it.each(spendingFailures.flatMap(([kind, failure]) => ['before', 'after'].map(position => [kind, position, failure])))
+    ('preserves %s metadata and never retries with a generic error %s', async (kind, position, failure) => {
+      const events = position === 'before' ? [genericFailure, failure] : [failure, genericFailure];
+      const stdout = [...events.map(event => JSON.stringify(event)), ANSWER_JSON].join('\n');
+      const { fn, calls } = scriptedSpawn([{ stdout, code: 1 }, { stdout: ANSWER_JSON, code: 0 }]);
+      const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID,
+        budget: 0.5, retries: 1, log: () => {}, spawnFn: fn }).catch(e => e);
+      expectSpendingFailure(error, kind);
+      expect(calls).toHaveLength(1);
+    });
+
+  it.each([...spendingFailures, ['generic', genericFailure]])
+    ('ranks %s failure against timeout without retrying', async (kind, failure) => {
+      let spawns = 0;
+      const spawnFn = () => {
+        spawns += 1;
+        let close;
+        return {
+          stdout: { on: (event, cb) => { if (event === 'data') cb([genericFailure, failure].map(value => JSON.stringify(value)).join('\n')); } },
+          stderr: { on: () => {} }, stdin: { on: () => {}, end: () => {} },
+          on: (event, cb) => { if (event === 'close') close = cb; },
+          kill: () => { close(null, 'SIGKILL'); },
+        };
+      };
+      const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID,
+        budget: 0.5, timeoutMs: 5, retries: 1, log: () => {}, spawnFn }).catch(e => e);
+      if (kind === 'generic') expect(error).toBeInstanceOf(JudgeTimeoutError);
+      else expectSpendingFailure(error, kind);
+      expect(spawns).toBe(1);
+    });
+
+  it('retries a generic-only error stream and returns the next successful verdict', async () => {
+    const { fn, calls } = scriptedSpawn([
+      { stdout: JSON.stringify(genericFailure), code: 1 }, { stdout: ANSWER_JSON, code: 0 },
+    ]);
+    const result = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID,
+      retries: 1, log: () => {}, spawnFn: fn });
+    expect(calls).toHaveLength(2);
+    expect(result.attempts).toBe(2);
+    expect(result.value).toEqual({ verdict: 'accept', findings: [] });
+  });
+
   it.each([
     { type: 'object', format: 'uri' },
     { type: 'object', properties: { url: { type: 'string', format: 'uri' } } },

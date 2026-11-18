@@ -757,10 +757,14 @@ export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
     }
   }
 
-  // A success cannot erase an error elsewhere in the CLI's JSON output.
-  const failure = events.find(event => event && typeof event === 'object' && !Array.isArray(event)
+  // A success or generic error cannot erase a spending limit elsewhere in the stream.
+  const failures = events.filter(event => event && typeof event === 'object' && !Array.isArray(event)
     && (event.type === 'error' || event.is_error
       || (event.type === 'result' && 'subtype' in event && event.subtype !== 'success')));
+  const priority = event => event?.is_error
+    && ((event.stop_reason === 'tool_use' && budget !== null)
+      || (typeof event.result === 'string' && quotaHoldRow({ provider: 'claude', error: event.result }))) ? 1 : 0;
+  const failure = failures.reduce((worst, event) => priority(event) > priority(worst) ? event : worst, failures[0]);
   if (failure) {
     if (failure.is_error) parsed = failure; // Preserve CLI and budget diagnostics below.
     else {
@@ -1006,11 +1010,11 @@ export async function judgeSpawn({
 
     const thisAttemptMs = Date.now() - startedAt;
     wallMs += thisAttemptMs;
-    if (timedOut) throw new JudgeTimeoutError({ timeoutMs, wallMs, stdout, stderr });
     let outcome;
     try {
       // Preserve explicit CLI failures (including quota and budget errors).
       outcome = parseJudgeOutcome(stdout, stderr || (code === 0 ? '' : `exit code ${code}`), budget);
+      if (timedOut) throw new JudgeTimeoutError({ timeoutMs, wallMs, stdout, stderr });
       const valid = validate(outcome.value);
       if (!valid || Object.keys(outcome.value).length === 0) {
         const violation = validate.errors?.[0];
@@ -1028,6 +1032,9 @@ export async function judgeSpawn({
         throw error;
       }
     } catch (error) {
+      // Spending limits outrank the wall-clock bound; both outrank generic failures.
+      if (error instanceof JudgeBudgetError || error.quota === true) throw error;
+      if (timedOut) throw new JudgeTimeoutError({ timeoutMs, wallMs, stdout, stderr });
       if (error.unparseableStdout !== true) throw error;
       const reason = error.verdictIntegrity ? error.message : null;
       failedAttempts.push({
