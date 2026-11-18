@@ -7,7 +7,7 @@
  *   thing no amount of injected fakes can substitute for).
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, symlinkSync, appendFileSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, symlinkSync, appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir, hostname } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -26,7 +26,7 @@ import {
   resolveWriterPriorityAfter,
 } from '../daemon-clone-lock.mjs';
 
-import { heartbeat } from '../../readiness/file-locks.mjs';
+import { heartbeat, lockDirFor, readLockEntry } from '../../readiness/file-locks.mjs';
 
 const MODULE_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'daemon-clone-lock.mjs');
 
@@ -46,6 +46,45 @@ afterEach(() => {
 
 const alwaysAlive = () => 'alive';
 const alwaysDead = () => 'dead';
+
+it.each(['heartbeat', 'stillHeld'])('detects a replacement meta.writerToken via %s without refreshing or releasing it', async (detection) => {
+  vi.useFakeTimers();
+  try {
+    const checkReplacement = async (replacementOwner) => {
+      const lockRoot = mkTmp('dcl-lost-lockroot-');
+      const clone = mkTmp('dcl-lost-clone-');
+      const { writerRoot } = cloneLockDirs(clone, lockRoot);
+      const file = join(lockDirFor(writerRoot, '<clone:writer>'), 'lock.json');
+      const log = vi.fn();
+      let replacement;
+      const result = await withWriteLock(clone, async (stillHeld) => {
+        const original = readFileSync(file, 'utf8');
+        await vi.advanceTimersByTimeAsync(HEARTBEAT_INTERVAL_MS);
+        expect(readFileSync(file, 'utf8')).toBe(original);
+        expect(readLockEntry(writerRoot, '<clone:writer>').heartbeatAt).toBe(new Date().toISOString());
+        const entry = JSON.parse(original);
+        expect(entry.meta.writerToken).toEqual(expect.any(String));
+        expect(entry).not.toHaveProperty('token');
+        replacement = JSON.stringify({ ...entry, owner: replacementOwner, meta: { ...entry.meta, writerToken: 'replacement-token' } });
+        writeFileSync(file, replacement);
+        const replacementHeartbeat = readLockEntry(writerRoot, '<clone:writer>').heartbeatAt;
+        if (detection === 'stillHeld') expect(stillHeld()).toBe(false);
+        await vi.advanceTimersByTimeAsync(HEARTBEAT_INTERVAL_MS);
+        expect(readLockEntry(writerRoot, '<clone:writer>').heartbeatAt).toBe(replacementHeartbeat);
+        expect(readFileSync(file, 'utf8')).toBe(replacement);
+        expect(vi.getTimerCount()).toBe(0);
+        await vi.advanceTimersByTimeAsync(HEARTBEAT_INTERVAL_MS * 2);
+        expect(log).toHaveBeenCalledTimes(1);
+        expect(log).toHaveBeenCalledWith(expect.stringContaining('write lock lost'));
+        return 'must not publish';
+      }, { owner: 'stale-writer', lockRoot, log });
+      expect(result).toEqual({ ok: false, reason: 'lock-lost', heldBy: replacementOwner });
+      expect(readFileSync(file, 'utf8')).toBe(replacement);
+    };
+    await checkReplacement('new-writer');
+    await checkReplacement('stale-writer'); // owner equality alone does not establish ownership
+  } finally { vi.useRealTimers(); }
+});
 
 describe('symmetric reader/writer fairness', () => {
   // Build real reader starvation records, then rotate through three different priority readers.
@@ -525,6 +564,28 @@ describe('acquireWrite waiting on readers', () => {
   });
 });
 
+it.each(['writer-c', 'writer-a'])('does not reclaim replacement %s with the same heartbeat and a different meta.writerToken', async (replacementOwner) => {
+  const lockRoot = mkTmp('dcl-replaced-lockroot-');
+  const clone = mkTmp('dcl-replaced-clone-');
+  expect(await acquireWrite(clone, { owner: 'writer-a', lockRoot, probe: alwaysAlive })).toEqual({ ok: true });
+  const { writerRoot } = cloneLockDirs(clone, lockRoot);
+  const file = join(lockDirFor(writerRoot, '<clone:writer>'), 'lock.json');
+  const original = JSON.parse(readFileSync(file, 'utf8'));
+  expect(original.meta.writerToken).toEqual(expect.any(String));
+  expect(original).not.toHaveProperty('token');
+  const replacement = { ...original, owner: replacementOwner, meta: { ...original.meta, writerToken: 'replacement-token' } };
+  expect(replacement.heartbeatAt).toBe(original.heartbeatAt);
+  const probe = vi.fn(entry => {
+    if (entry?.owner !== 'writer-a') return 'alive';
+    writeFileSync(file, JSON.stringify(replacement));
+    return 'dead';
+  });
+  expect(await acquireWrite(clone, { owner: 'writer-b', lockRoot, probe }))
+    .toMatchObject({ ok: false, reason: 'concurrent-mover', heldBy: replacementOwner });
+  expect(probe).toHaveBeenCalled();
+  expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual(replacement);
+});
+
 describe('defaultProbePidLiveness', () => {
   it('reports unknown for a different host', () => {
     expect(defaultProbePidLiveness({ owner: 'some-other-host:99999', pid: 99999 })).toBe('unknown');
@@ -598,4 +659,38 @@ describe('real cross-process mutual exclusion (two real child node processes)', 
     // the second interval must not start before the first one ended — the core mutual-exclusion property
     expect(intervals[1].start).toBeGreaterThanOrEqual(intervals[0].end);
   }, 30_000);
+});
+
+
+it('a stalled writer cannot overwrite its successor during drain or pass stillHeld after takeover', async () => {
+  for (const stage of ['draining', 'held']) {
+    const lockRoot = mkTmp('dcl-takeover-lockroot-');
+    const clone = mkTmp('dcl-takeover-clone-');
+    const { writerRoot } = cloneLockDirs(clone, lockRoot);
+    const file = join(lockDirFor(writerRoot, '<clone:writer>'), 'lock.json');
+    let clock = 0;
+    let replacement;
+    const takeover = async () => {
+      clock = 11 * 60_000;
+      releaseRead(clone, { owner: 'reader', lockRoot });
+      expect(await acquireWrite(clone, {
+        owner: 'successor', lockRoot, now: () => clock, pid: 222, probe: alwaysAlive,
+      })).toEqual({ ok: true });
+      replacement = readFileSync(file, 'utf8');
+    };
+    if (stage === 'draining') {
+      expect(acquireRead(clone, { owner: 'reader', lockRoot, nowMs: clock, probe: alwaysAlive }).ok).toBe(true);
+    }
+    const callback = vi.fn(async stillHeld => {
+      await takeover();
+      expect(stillHeld()).toBe(false);
+    });
+    const result = await withWriteLock(clone, callback, {
+      owner: 'stalled', lockRoot, now: () => clock, pid: 111, probe: alwaysAlive,
+      waitMs: 15 * 60_000, sleep: takeover, log: vi.fn(),
+    });
+    expect(result).toEqual({ ok: false, reason: 'lock-lost', heldBy: 'successor' });
+    expect(callback).toHaveBeenCalledTimes(stage === 'draining' ? 0 : 1);
+    expect(readFileSync(file, 'utf8')).toBe(replacement);
+  }
 });
