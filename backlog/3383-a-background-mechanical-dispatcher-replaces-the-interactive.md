@@ -2894,7 +2894,7 @@ never what any one of them can do to the host once admitted.
 - **Cap enforcement, reproducing #3621's own busy-spin containment method**: 8 unbounded `while :; do :;
   done` spinners inside a `--cpus 2 --memory 2g` container held the host-side
   `com.apple.Virtualization.VirtualMachine` process at ~190-205% CPU throughout the run (sampled 3x during a
-  live run) — on this 12-core host, the SAME shape ran unconstrained reaches ~800% per #3621's own prior
+  live run) — on the host, the SAME shape ran unconstrained reaches ~800% per #3621's own prior
   measurement. The cap is real, not aspirational.
 - **End-to-end via the actual wrapper**: `node we:scripts/readiness/heavy-admission.mjs run --container --
   node we:scripts/check-standards.mjs` correctly acquired a real admission slot (this host's cap was genuinely
@@ -3093,7 +3093,7 @@ infrastructure (a fresh lane, `lane-20`, acquired specifically for this test).**
 a guest where `os.cpus().length` reports **3** (a confirmed off-by-one, N+1, consistent across `--cpus 1`→2 and
 `--cpus 4`→5) but `os.availableParallelism()` correctly reports **2**. THIS repo's own `test:unit` config
 (`we:vitest.shared.ts#maxTestWorkers`) does not call either API — it is a **hardcoded literal `4`**, already
-tuned (by an existing, unrelated `#3650` fix) for the HOST's 12-core budget under a 3-concurrent-invocation
+tuned (by an existing, unrelated `#3650` fix) for the HOST's core budget under a 3-concurrent-invocation
 burst assumption, with zero awareness of whatever container it might run inside. Ran the real 35-file/441-test
 `we:blocks/__tests__` subset inside an actual `--cpus 2 --memory 2g` container via `node
 we:scripts/readiness/heavy-admission.mjs run --container --container-node-modules -- npx vitest run …` — passed

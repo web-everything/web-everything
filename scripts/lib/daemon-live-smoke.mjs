@@ -228,7 +228,7 @@ export function resolveSmokeBudgets(env = process.env, { load = () => loadavg()[
 }
 
 // Live 2026-10-10 (wev-fix-daemon): with x9xkupj's admission, `admit` (CPU 16–28% idle) left reconcile/dispatch at
-// 120s/180s at load 30–46 on 12 cores. Both wait on gh/git children, so CPU idle says nothing about them: they were
+// 120s/180s at load 30–46 against the host core count. Both wait on gh/git children, so CPU idle says nothing about them: they were
 // killed, and plain main and last-good failed identically. These two keep the load factor through the cascade.
 const IO_BOUND_BUDGET_KEYS = new Set(['reconcileMs', 'dispatchDryRunMs']);
 export const SMOKE_IO_LOAD_SCALE_ENV = 'WE_SMOKE_IO_LOAD_SCALE';
@@ -1310,7 +1310,7 @@ export function isEnvTimeoutRow(row, { minElapsedMs = DEFAULT_ENV_TIMEOUT_MIN_EL
   if (!ENV_TIMEOUT_PATTERNS.some((re) => re.test(detail))) return false;
   // `runBounded`'s OWN kill ("timed out after Nms (process group killed)") is the gate's clock, not tree text: the
   // row really spent its whole cap N. A cheap probe has a cap far under the 30s floor (live 2026-10-03 22:01 ET,
-  // load 31 on 12 cores: `tree-stays-clean`'s `git status` hit its 10s cap), and the floor then read that
+  // load 31 against the host core count: `tree-stays-clean`'s `git status` hit its 10s cap), and the floor then read that
   // load-induced kill as a code failure and rejected a good build. Judge such a kill against its own cap — but only
   // a cap that is a real budget: one under {@link MIN_OWN_CAP_MS} is a starved harness (the soak break
   // `broken-smoke-harness-holds-last-good` sets 1ms), which load cannot explain, so it keeps the 30s floor.
