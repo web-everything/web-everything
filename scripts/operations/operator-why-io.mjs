@@ -16,7 +16,8 @@ import { isClaimSessionLive } from '../conveyor/fix-dispatch-claim.mjs';
 import { listBuildDispatchHolds } from '../conveyor/build-dispatch-claim.mjs';
 import { listBuildBackoffs } from '../conveyor/build-dispatch-failures.mjs';
 import { countGrantedRoundExtensions } from '../conveyor/round-extension-mark.mjs';
-import { listDaemonPlistFiles, readPlistAsJson, extractDaemonSpec, classifyDaemonSpec, tailFile } from './daemon-status-io.mjs';
+import { listDaemonPlistFiles, readPlistAsJson, tailFile } from './daemon-status-io.mjs';
+import { discoverDaemonLogPaths } from './daemon-log-paths.mjs';
 import { resolveCoordinationRoot } from './coordination-root.mjs';
 import { evaluatePr, rulingNeededRow, redTeamRulingRow } from './operator-queue.mjs';
 import { orderReadyCandidates } from '../merge-ai-prs.mjs';
@@ -97,18 +98,7 @@ export function createWhyReader({
     facts.buildHolds = safe('build holds', () => readBuildHolds(), []).filter(matches);
     facts.backoffs = safe('build backoffs', () => readBackoffs(), []).filter(matches);
     facts.prepareFailures = Object.values(safe('prepare failures', readPrepareFailures, { failures: {} }).failures ?? {}).filter(matches).sort((a, b) => Number(Boolean(b.held && !b.completed)) - Number(Boolean(a.held && !a.completed)) || String(b.recordedAt ?? '').localeCompare(String(a.recordedAt ?? '')));
-    const workspace = join(home, 'workspace'), reviewRoot = join(workspace, 'wev-review-daemon', '.conveyor');
-    const paths = { fix: join(workspace, 'wev-fix-daemon', '.conveyor', 'fix-dispatch-daemon.log'), review: join(reviewRoot, 'review-daemon.log'), drain: join(workspace, 'plateau-app', '.drain-daemon', 'daemon.log'), builder: join(coordinationRoot, 'build-dispatch-daemon.log') };
-    const launchDir = join(home, 'Library', 'LaunchAgents');
-    for (const label of safe('daemon plists', () => { const entries = listFiles(launchDir); return listPlists(launchDir, { readdir: () => entries }); }, [])) {
-      safe(`plist ${label}`, () => {
-        const plist = readPlist(join(launchDir, `${label}.plist`)); if (!plist) throw new Error('unreadable plist');
-        const spec = extractDaemonSpec(label, plist), family = classifyDaemonSpec(spec);
-        const name = spec.programArguments.some(a => a.endsWith('/build-dispatch-daemon.mjs')) ? 'builder' : ({ 'fix-dispatch-daemon': 'fix', 'review-daemon': 'review', 'build-dispatch-daemon': 'builder', 'drain-daemon': 'drain' })[family.kind] ?? (family.kind === 'pass-daemon' ? `pass:${family.pass}` : null);
-        if (name && spec.logPath) paths[name] = spec.logPath;
-      });
-    }
-    for (const file of safe('pass logs', () => listFiles(reviewRoot), [])) if (/^pass-daemon\..*\.log$/.test(file)) paths[`pass:${file.slice(12, -4)}`] ??= join(reviewRoot, file);
+    const paths = discoverDaemonLogPaths({ home, coordinationRoot, listFiles, listPlists, readPlist, safe });
     facts.logs = Object.entries(paths).map(([name, path]) => ({ name, path, kb: 512, line: safe(`log ${name}`, () => {
       const result = tail(path, { maxBytes: 512 * 1024 }); if (!result || result.error) throw new Error(result?.error ?? 'log missing');
       return lastMentionLine(result.text, subject);

@@ -4580,3 +4580,12 @@ a subdirectory beside the live `<slug>.json` records so no valid slug can collid
 are usable only for the ended pid; SIGKILL cannot leave a marker. Keep missing/stale
 marker, redaction, bounded-tail and diagnostic-write-failure regressions in the scoped
 review-job and review-daemon suites.
+
+
+## Effective capacity observations
+
+`effective-policy.test.mjs` round-trips the cascade formatter; the operator-override cases in
+`http-adapter.test.mjs` exercise before/after adoption, environment shadows and bounded waits.
+Observation success requires a changed policy log line as well as the expected value/source;
+unchanged or unavailable evidence stays “not yet seen”, even when the stored override matches.
+Run these tests through heavy-admission, using `--wait-ms=0` in store-only CLI fixtures.
