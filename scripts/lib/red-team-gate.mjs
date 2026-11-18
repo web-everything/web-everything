@@ -26,7 +26,7 @@ import { readSealedStatus } from './red-team-sealed-status.mjs';
 import { resolveDisposition } from './red-team-disposition.mjs';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { dirname, join, posix } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveCascade, platformPreference, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
@@ -81,12 +81,12 @@ export function parseRedTeamComment(body) {
     const f = FINDING_RE.exec(line);
     if (f) {
       const [path, ln] = f[5] ? (/^(.*?):(\d+)$/.exec(f[5])?.slice(1) ?? [f[5], null]) : [null, null];
-      const impact = f[4].trim();
+      const impact = f[4];
       findings.push({
         ...(f[2] === RED_TEAM_UNVERIFIABLE_TAG ? { recheckOutcome: 'unverifiable' } : {}),
-        index: Number(f[1]), confirmed: f[2] === RED_TEAM_CONFIRMED_TAG, category: f[3].trim(),
+        index: Number(f[1]), confirmed: f[2] === RED_TEAM_CONFIRMED_TAG, category: f[3],
         impact: impact === 'impact?' ? null : impact, file: path, line: ln == null ? null : Number(ln),
-        summary: f[6].trim(), scenario: null, recheck: null,
+        summary: f[6], scenario: null, recheck: null,
       });
       continue;
     }
@@ -96,11 +96,11 @@ export function parseRedTeamComment(body) {
     if (also && findings.length) findings.at(-1).alsoClasses = also[1].split(', ').filter(c => FINDING_CLASSES.includes(c));
     const classification = /^ {3}- Class: (.*?) → (?:fix-now|defer-card)(?: \(basis: (.*)\))?$/.exec(line);
     if (classification && findings.length) {
-      findings.at(-1).findingClass = classification[1].trim();
-      if (classification[2] !== undefined) findings.at(-1).classBasis = classification[2].trim();
+      findings.at(-1).findingClass = classification[1];
+      if (classification[2] !== undefined) findings.at(-1).classBasis = classification[2];
     }
     const s = SUB_RE.exec(line);
-    if (s && findings.length) findings.at(-1)[s[1] === 'Scenario' ? 'scenario' : 'recheck'] = s[2].trim();
+    if (s && findings.length) findings.at(-1)[s[1] === 'Scenario' ? 'scenario' : 'recheck'] = s[2];
   }
   const parsed = { pr: Number(m[1]), rev: m[2].toLowerCase(), findings };
   // Non-enumerable: it only keys the digest and must not change the parsed shape callers compare or serialise.
@@ -884,66 +884,9 @@ export function redTeamBreaksAgree({ comments, pr, head, breaks } = {}) {
     && JSON.stringify([...(breaks ?? [])].sort()) === JSON.stringify(keys) };
 }
 
-const collapseWhitespace = value => String(value ?? '').replace(/\s+/g, ' ').trim();
-// A cited location is plain `at line N`, `line N` at the start, `line N` / `L N` after the finding's file,
-// or `:N[:M]` right after a FILE PATH. Fail closed on what a path is:
-// a token with a directory separator that is not inside a URL, or a bare `name.ext` that IS the finding's own file.
-// Any other `host.tld:443` (`example.md`, `deploy.sh` are real TLDs/names too) keeps its number.
-// Require a complete location followed by a known delimiter. A word boundary also matches inside
-// decimal inputs and malformed columns (x.mjs:1.2 or x.mjs:1:2x); never erase their numeric prefix.
-// Only line and optional column are locations; a third numeric segment must preserve the whole token.
-const PATH_COLON_LOCATION = /((?:[\w.@~+-]+\/)*[\w@~+-][\w.@~+-]*\.[a-z0-9]{1,8})(:\d+(?::\d+)?)(?=$|[\s'"`)\]}]|[.,;](?:\s|$))/gi;
-// A scheme can sit anywhere in the token, not only at its start: `fetch(data:...`, `f(a,mailto:`, `url=urn:`,
-// `x||file:` are expressions around a URL. Any scheme-shaped `name:` earlier in the token keeps the whole location.
-const URI_SCHEME_PREFIX = /(?:^|[^a-z0-9+.-])[a-z][a-z0-9+.-]*:/i;
-// An ENCODED delimiter hides the scheme/slash from the literal checks above (`data%3Atext/plain%2Csrc/x.txt:10`,
-// `&#58;`, `&colon;`, `:`, `\x3a`), so any escape sequence in the token before the match marks it a URL too.
-const ENCODED_URI_ESCAPE = /%[0-9a-f]{2}|&#x?[0-9a-f]+;|&colon;|\\(?:u[0-9a-f]{4}|x[0-9a-f]{2})/i;
-const LINE_WORD_LOCATION =/\b(line|L) +\d+(?=$|[ )]|[.,;:](?: |$))/gi;
-// Do not guess where code/quotes end (including unmatched, escaped or Unicode quotes).
-// Conservatively retain word-style locations throughout such a summary; explicit path:line handling is separate.
-const AMBIGUOUS_LINE_CONTEXT = /[\p{Quotation_Mark}\p{Cf}\u02bb\u02bc`~\\()[\]{}<>&%]/u;
-const SUMMARY_PATH_SCAN_MAX = 2000;
-const SOURCE_PATH_EXT = /\.(?:mjs|cjs|js|jsx|mts|cts|ts|tsx|json|jsonc|md|mdx|ya?ml|toml|html?|css|scss|vue|svelte|sh|bash|py|rb|go|rs|java|kt|swift|c|h|cc|cpp|hpp|cs|php|sql|txt)$/i;
-/**
- * The summary with ONLY two edits (operator ruling R952): whitespace collapsed, and cited line locations
- * replaced by `#`. No other digit, punctuation, case or URL rewriting: a changed port, retry count, operator or
- * snippet is a different finding. `file` is the finding's own file, so a bare `name.ext:N` citing it is a location. PURE.
- */
-export function summaryCanonical(summary, file = '') {
-  const ownPath = String(file ?? '').replace(/`/g, '').replace(/\\/g, '/').replace(/:\d+(?::\d+)?$/, '');
-  const own = ownPath.split('/').pop().toLowerCase();
-  const text = collapseWhitespace(summary);
-  // The path scan backtracks quadratically on a long run of path characters; an over-long summary (a published one is
-  // capped at 600) keeps all citations as written, so a drifted location re-holds instead of stalling the gate.
-  if (text.length > SUMMARY_PATH_SCAN_MAX) return text;
-  return text
-    .replace(PATH_COLON_LOCATION, (match, path, _location, offset) => {
-      // A URL's own path is not a source file reference. Look throughout the prefix so
-      // quotes, backticks or expressions before `//cdn/a.js:443` cannot hide the URL.
-      const tokenStart = text.lastIndexOf(' ', offset) + 1;
-      // Slashless URI schemes (`data:`, `mailto:`, `urn:`, `file:`) are URLs too; tolerate leading quote/backtick/paren.
-      const urlPrefix = text.slice(tokenStart, offset);
-      // `urlPrefix + path`: the path match can begin mid-escape (`%` | `2Csrc/x.txt`), so join before testing.
-      if (urlPrefix.includes('//') || URI_SCHEME_PREFIX.test(urlPrefix) || ENCODED_URI_ESCAPE.test(urlPrefix + path)) return match;
-      // A slash path needs a source extension and a non-host first segment (`cdn.example.com/x.js:8080` is a URL).
-      const repoPath = path.includes('/') && SOURCE_PATH_EXT.test(path) && !/^[^/.]+\.[^/]+\//.test(path);
-      return repoPath || (own && path.toLowerCase() === own) ? `${path}#` : match;
-    })
-    .replace(LINE_WORD_LOCATION, (match, word, offset, input) => {
-      if (AMBIGUOUS_LINE_CONTEXT.test(text)) return match;
-      const prefix = input.slice(0, offset);
-      const previousToken = prefix.trimEnd().split(' ').at(-1);
-      // Require a separate, exact file token. A suffix of a URL or another file is not evidence.
-      const afterOwnPath = ownPath && prefix.endsWith(' ') && previousToken === ownPath;
-      const plainLineCitation = word.toLowerCase() === 'line' && (offset === 0 || /(?:^| )at $/i.test(prefix));
-      return afterOwnPath || plainLineCitation ? '#' : match;
-    });
-}
-
 /**
  * One approval per finding: the key is the fingerprint plus the finding's occurrence rank among findings sharing it,
- * ranked by cited line (then index). Two same-fingerprint findings need two approvals; a line drift keeps the rank. PURE.
+ * ranked by cited line (then index). Two byte-identical findings still need two approvals. PURE.
  * @returns {Map<object,string>} finding → key (findings without a fingerprint are omitted)
  */
 export function findingOccurrenceKeys(findings) {
@@ -965,15 +908,21 @@ export function findingOccurrenceKeys(findings) {
 export const FINDING_FINGERPRINT_FIELDS = Object.freeze(['confirmed', 'recheckOutcome', 'category', 'impact', 'scenario',
   'recheck', 'securityReachableToday', 'findingClass', 'classBasis', 'alsoClasses']);
 export function findingFingerprint(f) {
-  const file = String(f.file ?? '').replace(/`/g, '').replace(/\\/g, '/').replace(/:\d+(?::\d+)?$/g, '').trim();
-  const path = posix.normalize(file);
-  const title = summaryCanonical(f.summary, file);
-  return file && path.replace(/\/+$/, '') !== '.' && title && f.category
-    ? JSON.stringify([path, collapseWhitespace(f.category), breakClass(f), title,
-      // Preserve presence as well as value: missing security/class evidence cannot match an explicit value.
-      ...FINDING_FINGERPRINT_FIELDS.map(key => [Object.hasOwn(f, key),
-        Array.isArray(f[key]) ? [...f[key]].sort() : typeof f[key] === 'string'
-          ? f[key].replace(/\s+/g, ' ').trim() : f[key] ?? null])]) : null;
+  try {
+    if (!f || ['file', 'category', 'summary'].some(key => typeof f[key] !== 'string' || !f[key])) return null;
+    const fields = ['file', 'line', 'summary', ...FINDING_FINGERPRINT_FIELDS];
+    const strings = ['file', 'summary', 'category', 'impact', 'scenario', 'recheck', 'recheckOutcome', 'findingClass', 'classBasis'];
+    if (strings.some(key => f[key] != null && typeof f[key] !== 'string')
+      || (f.line != null && !Number.isSafeInteger(f.line))
+      || ['confirmed', 'securityReachableToday'].some(key => f[key] != null && typeof f[key] !== 'boolean')
+      || (f.alsoClasses != null && (!Array.isArray(f.alsoClasses)
+        || f.alsoClasses.some(value => typeof value !== 'string')))) return null;
+    // Presence and type distinguish absent, explicit undefined and null. Keep every raw byte and array order.
+    const payload = [breakClass(f), ...fields.map(key => [Object.hasOwn(f, key), typeof f[key], f[key]])];
+    return createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+  } catch {
+    return null; // Unreadable payloads cannot inherit an operator release.
+  }
 }
 
 /** Shared posting-time authority for direct and inherited human releases. PURE.

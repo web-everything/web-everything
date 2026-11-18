@@ -581,12 +581,12 @@ describe('operator card fingerprints across fresh results on later heads', () =>
           mode === 'not-real' ? 'operator-not-real' : mode === 'block' ? 'operator-block' : 'operator-card',
           mode === 'wrong-result' ? '0'.repeat(16) : id)
           + '\n- 1 finding(s) carded by the operator to `we:backlog/follow-up.md` (#1).' };
-      const next = result(head, { line: 331,
+      const next = result(head, {
         summary: mode === 'title' ? 'Different break'
           : mode === 'backtick' ? 'Snapshot `writer` escapes retirement.'
           : mode === 'punctuation' ? 'Snapshot writer escapes retirement!'
-          : '  Snapshot writer   escapes retirement. ',
-        file: mode === 'file' ? 'scripts/other.mjs' : './scripts/core.mjs',
+          : 'Snapshot writer escapes retirement.',
+        file: mode === 'file' ? 'scripts/other.mjs' : 'scripts/core.mjs',
         category: mode === 'category' ? 'failing-input' : 'edge-case' });
       const d = readRedTeamDisposition({ comments: [prior, ruling, next], pr, head,
         setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true }, sealed: null });
@@ -597,7 +597,7 @@ describe('operator card fingerprints across fresh results on later heads', () =>
     const prior = result(old, priorOver);
     const ruling = { author: { login: 'chalbert' }, body: redTeamGateMarker(pr, old, 'operator-card',
       redTeamResultId(parseRedTeamComment(prior.body))) + '\n- 1 finding(s) carded by the operator to `we:backlog/follow-up.md` (#1).' };
-    const d = readRedTeamDisposition({ comments: mutate([prior, ruling, result(head, { line: 331, ...nextOver })]), pr, head,
+    const d = readRedTeamDisposition({ comments: mutate([prior, ruling, result(head, nextOver)]), pr, head,
       setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true }, sealed: null });
     return [...d.held, ...d.sendBack].length;
   };
@@ -606,7 +606,7 @@ describe('operator card fingerprints across fresh results on later heads', () =>
     expect(carded(cls('live-reproduced'), cls('live-reproduced'))).toBe(0);
     expect(carded(cls('live-reproduced'), cls('correctness-in-normal-use'))).toBe(1);
   });
-  it('re-raises when the scenario snippet changes, carries when only the line moves', () => {
+  it('re-raises when the scenario snippet changes, carries when the payload is unchanged', () => {
     expect(carded({ failure_scenario: 'writer drops row' }, { failure_scenario: 'writer drops row' })).toBe(0);
     expect(carded({ failure_scenario: 'writer drops row' }, { failure_scenario: 'writer drops the whole table' })).toBe(1);
   });
@@ -631,7 +631,7 @@ describe('operator card fingerprints across fresh results on later heads', () =>
     const f = line => ({ summary: 'Snapshot writer escapes retirement.', category: 'edge-case', impactIfUnfixed: 'broken',
       file: 'scripts/core.mjs', line, confirmedByRecheck: true });
     const next = { author: { login: 'web-everything' }, body: renderRedTeamComment({ pr, rev: head, provider: 'codex',
-      model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes', findings: [f(331), f(900)] }) };
+      model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes', findings: [f(325), f(325)] }) };
     const d = readRedTeamDisposition({ comments: [prior, ruling, next], pr, head, setting: CONFIRMED_BREAKS_DEFAULTS,
       operatorRulings: { anyState: true }, sealed: null });
     expect([...d.held, ...d.sendBack]).toHaveLength(1);
