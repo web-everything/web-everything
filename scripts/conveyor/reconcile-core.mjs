@@ -600,6 +600,12 @@ export const CONFLICT_FIX_ROUND_CAP = 3;
  */
 export const CONFLICT_FIX_ABSOLUTE_CEILING = CONFLICT_FIX_ROUND_CAP * 3;
 
+/** Shared durable conflict-fix accounting for planners and mechanical refreshes. */
+export function conflictFixAccounting(comments, { currentRef, currentSha = null, cap = CONFLICT_FIX_ROUND_CAP } = {}) {
+  const { stale, total } = countStaleConflictFixRounds(comments, { currentRef, currentSha });
+  return { stale, total, exhausted: stale >= cap || total >= CONFLICT_FIX_ABSOLUTE_CEILING };
+}
+
 /**
  * we:scripts/conveyor/reconcile-core.mjs#ADVISORY_FIX_ROUND_CAP — the durable cap an ADVISORY-FIX round on a
  * `needs-human` PR binds on (#xkmu3gv). Mirrors {@link CI_HEAL_ROUND_CAP} exactly: its OWN, smaller cap, counted
@@ -3838,11 +3844,11 @@ export function planReconcile({
     if (staleBase) {
       if (refuseReferralHold({ pr, refuse, withPhase })) continue;
       if (refuseUnreviewable({ pr, requiredChecks, refuse, withPhase })) continue;
-      const { stale: attempts, total } = countStaleConflictFixRounds(pr.comments, {
-        currentRef: defaultBranch, currentSha: mainSha,
+      const { stale: attempts, total, exhausted } = conflictFixAccounting(pr.comments, {
+        currentRef: defaultBranch, currentSha: mainSha, cap: conflictFixCapHere,
       });
       const why = `PR base predates required job(s) ${staleBase.missing.join(', ')} — rebase onto current ${defaultBranch}`;
-      if (attempts >= conflictFixCapHere || total >= CONFLICT_FIX_ABSOLUTE_CEILING) {
+      if (exhausted) {
         refuseCapExhausted({ ...withPhase, attempts, cap: conflictFixCapHere, capKind: 'stale-base-rebase',
           why: `${why}; durable conflict-fix count ${attempts}/${conflictFixCapHere}, total ${total}/${CONFLICT_FIX_ABSOLUTE_CEILING} — mechanical repair exhausted; a person must take it` });
       } else {
@@ -3904,10 +3910,10 @@ export function planReconcile({
         // smaller per-target cap even though each repair genuinely targeted a NEW tip. `base.baseRefSha` is
         // this PR's OWN base ref's current tip, resolved the SAME way (a plain local `git rev-parse`) as
         // `mainSha` is for the main-base branch — see `reconcile-pass.mjs#enrichPrsWithBaseRefFacts`.
-        const { stale: conflictAttempts, total: conflictTotal } = countStaleConflictFixRounds(pr?.comments, {
-          currentRef: baseRefName, currentSha: base.baseRefSha,
+        const { stale: conflictAttempts, total: conflictTotal, exhausted } = conflictFixAccounting(pr?.comments, {
+          currentRef: baseRefName, currentSha: base.baseRefSha, cap: conflictFixCapHere,
         });
-        if (conflictAttempts >= conflictFixCapHere || conflictTotal >= CONFLICT_FIX_ABSOLUTE_CEILING) {
+        if (exhausted) {
           refuseCapExhausted({
             ...withPhase, attempts: conflictAttempts, cap: conflictFixCapHere, capKind: 'stacked-rebase',
             why: conflictTotal >= CONFLICT_FIX_ABSOLUTE_CEILING
@@ -3998,10 +4004,10 @@ export function planReconcile({
       // {@link CONFLICT_FIX_ABSOLUTE_CEILING}'s own docblock). A round that resolved against an EARLIER main —
       // main moved and created a genuinely NEW conflict since — does not count against the smaller per-target
       // cap below, only the hard ceiling.
-      const { stale: conflictAttempts, total: conflictTotal } = countStaleConflictFixRounds(pr?.comments, {
-        currentRef: defaultBranch, currentSha: mainSha,
+      const { stale: conflictAttempts, total: conflictTotal, exhausted } = conflictFixAccounting(pr?.comments, {
+        currentRef: defaultBranch, currentSha: mainSha, cap: conflictFixCapHere,
       });
-      if (conflictAttempts >= conflictFixCapHere || conflictTotal >= CONFLICT_FIX_ABSOLUTE_CEILING) {
+      if (exhausted) {
         refuseCapExhausted({
           ...withPhase, attempts: conflictAttempts, cap: conflictFixCapHere, capKind: 'conflict-fix',
           why: conflictTotal >= CONFLICT_FIX_ABSOLUTE_CEILING

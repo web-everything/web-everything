@@ -4620,11 +4620,18 @@ comparison against daemon observations; fixtures prove IO counts without live Gi
 `conflict-mechanical-rebase.test.mjs` and `reconcile-fix-dispatch-daemon.test.mjs`
 cover the independent pre-fix mechanical step. Inject `conflictRebaseTick` in daemon
 fixtures; a refresh must invalidate shared PR discovery before fix planning. Keep
-restart/same-main-SHA ledger checks paired with failure-before-refresh checks:
-unreadable or unwritable attempt state leaves ownership with existing fix dispatch.
+same-pass ledger checks paired with failure-before-refresh checks:
+unreadable or unwritable dedupe state leaves ownership with existing fix dispatch.
 Run these scoped suites through the host heavy-admission queue.
 
 The mechanical sweep uses checked settings and opts into strict manifest/count evidence;
 keep the drain defaults lenient. Fetch and verify the local default-branch ref against
 the live main SHA before claiming a ledger attempt. Cover stale/unreadable evidence
 without ledger consumption and strict refusals without commit/push in the scoped suites.
+The sweep shares reconcile-core's conflict-fix accounting against the current default-branch
+ref and SHA, including the per-target cap and absolute ceiling. File claims dedupe the
+PR head, target and observed durable count across overlapping passes, independent of pass
+timestamps. Fresh evidence validation, marker posting and refresh share exclusion; a later
+attempt requires new durable evidence. Legacy target-only claims require ledger inspection/repair. Its target-stamped conflict-fix
+marker must post before rebasing; failed posts leave the dedupe claim unconsumed. Cover failed
+rebases remaining counted after ledger loss, and orphan-guard deferral of both fix and rebase.

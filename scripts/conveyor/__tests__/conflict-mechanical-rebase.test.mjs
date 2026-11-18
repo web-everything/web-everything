@@ -12,9 +12,9 @@ import { buildOperatorAnswer } from '../stand-down-answer-core.mjs';
 import { readSettingsChecked } from '../../lib/settings-files.mjs';
 import { runTickAllRepos, buildCliDaemonEffects, runConflictRebaseAllRepos, resolveFixPassBudgets } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
 
-import { CONFLICT_FIX_ABSOLUTE_CEILING } from '../reconcile-core.mjs';
-import { CONFLICT_FIX_COMMENT_MARKER, countConflictFixComments } from '../conflict-fix-round-count.mjs';
-import { defaultPostRebaseComment } from '../ci-red-recovery-watch.mjs';
+import { CONFLICT_FIX_ABSOLUTE_CEILING, CONFLICT_FIX_ROUND_CAP } from '../reconcile-core.mjs';
+import { CONFLICT_FIX_COMMENT_MARKER, countConflictFixComments, countStaleConflictFixRounds } from '../conflict-fix-round-count.mjs';
+import { buildConflictFixMarkComment, postConflictFixMarkComment } from '../conflict-fix-mark.mjs';
 
 const sha = 'a'.repeat(40), nextSha = 'b'.repeat(40);
 const pr = (number, extra = {}) => ({ number, state: 'OPEN', baseRefName: 'main', isCrossRepository: false,
@@ -41,13 +41,71 @@ describe('mechanical conflict rebase', () => {
     expect(opts.ledger.read()).toEqual({}); expect(opts.refresh).not.toHaveBeenCalled();
   });
 
-  it('durable sweep comment uses the shared trusted round counter, preserving the existing rebase marker', () => {
+  it('posts the shared target-stamped durable marker before refresh', () => {
     const exec = vi.fn();
-    const opts = fixture({ readOpenPrs: () => [pr(1)], postComment: (n, options) => defaultPostRebaseComment(n, { ...options, exec }) });
+    const opts = fixture({ readOpenPrs: () => [pr(1)], postComment: (n, options) => postConflictFixMarkComment(n, { ...options, exec }) });
+    opts.refresh.mockImplementation(() => {
+      expect(exec).toHaveBeenCalledOnce();
+      const body = exec.mock.calls[0][1][4];
+      expect(countStaleConflictFixRounds([trusted(body)], { currentRef: 'main', currentSha: sha }))
+        .toEqual({ stale: 1, total: 1 });
+      return { ok: true, action: 'rebased', newCommit: nextSha };
+    });
     sweepMechanicalConflictRebases(opts);
+    expect(exec).toHaveBeenCalledOnce();
     const body = exec.mock.calls[0][1][4];
     expect(body.startsWith(CONFLICT_FIX_COMMENT_MARKER + '\n')).toBe(true);
     expect(countConflictFixComments([trusted(body)])).toBe(1);
+  });
+
+  it.each(['discovery', 'fresh'])('shared per-target cap at %s refuses below the absolute ceiling', phase => {
+    const comments = Array.from({ length: CONFLICT_FIX_ROUND_CAP }, () => trusted(
+      buildConflictFixMarkComment({ baseRefName: 'main', baseSha: sha })));
+    const opts = fixture({ readOpenPrs: () => [pr(1, { comments: phase === 'discovery' ? comments : [] })],
+      readPr: () => pr(1, { comments }) });
+    expect(sweepMechanicalConflictRebases(opts).refusals).toMatchObject([{ kind: 'conflict-rebase-ceiling' }]);
+    expect(opts.refresh).not.toHaveBeenCalled(); expect(opts.postComment).not.toHaveBeenCalled();
+    expect(opts.ledger.read()).toEqual({});
+  });
+
+  it.each(['old-sha', 'other-ref', 'legacy', 'ceiling'])(
+    'shared accounting handles %s history against the current main tip', history => {
+      const comments = Array.from({ length: history === 'ceiling' ? CONFLICT_FIX_ABSOLUTE_CEILING : CONFLICT_FIX_ROUND_CAP },
+        () => trusted(history === 'legacy' ? CONFLICT_FIX_COMMENT_MARKER : buildConflictFixMarkComment({
+          baseRefName: history === 'other-ref' ? 'lane/stack' : 'main', baseSha: nextSha,
+        })));
+      const opts = fixture({ readOpenPrs: () => [pr(1, { comments })] });
+      const blocked = ['legacy', 'ceiling'].includes(history);
+      expect(sweepMechanicalConflictRebases(opts).applied).toHaveLength(blocked ? 0 : 1);
+      expect(opts.refresh).toHaveBeenCalledTimes(blocked ? 0 : 1);
+    });
+
+  it('failed marker post leaves no rebase or consumed attempt and can retry', () => {
+    const opts = fixture({ readOpenPrs: () => [pr(1)],
+      postComment: vi.fn().mockImplementationOnce(() => { throw Error('comment unavailable'); }) });
+    expect(sweepMechanicalConflictRebases(opts)).toMatchObject({ applied: [], refusals: [
+      { kind: 'conflict-rebase-comment-failed', why: expect.stringContaining('existing fix path') },
+    ] });
+    expect(opts.refresh).not.toHaveBeenCalled(); expect(opts.ledger.read()).toEqual({});
+    expect(sweepMechanicalConflictRebases(opts).applied).toHaveLength(1);
+    expect(opts.refresh).toHaveBeenCalledOnce();
+  });
+
+  it('failed rebases remain durably counted after losing the file ledger', () => {
+    const comments = [];
+    const opts = fixture({ readOpenPrs: () => [pr(1, { comments })],
+      postComment: (n, options) => comments.push(trusted(buildConflictFixMarkComment(options))),
+      refresh: vi.fn(() => ({ ok: false, action: 'error', error: 'code conflict' })),
+    });
+    for (let i = 0; i < CONFLICT_FIX_ROUND_CAP; i++) {
+      sweepMechanicalConflictRebases({ ...opts, ledger: createConflictRebaseLedger({ env: { WE_UNDER_TEST: '1' } }) });
+    }
+    expect(sweepMechanicalConflictRebases({ ...opts,
+      ledger: createConflictRebaseLedger({ env: { WE_UNDER_TEST: '1' } }),
+    }).refusals).toMatchObject([{ kind: 'conflict-rebase-ceiling' }]);
+    expect(opts.refresh).toHaveBeenCalledTimes(CONFLICT_FIX_ROUND_CAP);
+    expect(countStaleConflictFixRounds(comments, { currentRef: 'main', currentSha: sha }))
+      .toEqual({ stale: CONFLICT_FIX_ROUND_CAP, total: CONFLICT_FIX_ROUND_CAP });
   });
 
   it.each(['head', 'base', 'same-repo', 'clean', 'labels', 'comments', 'stand-down', 'pause', 'load-flake', 'claim', 'read-failed'])(
@@ -220,13 +278,16 @@ describe('mechanical conflict rebase', () => {
 
   it('fetches and verifies the configured default branch in the repo root before claiming', () => {
     const opts = fixture({ defaultBranch: 'trunk', readOpenPrs: () => [pr(1, { baseRefName: 'trunk' })] });
-    opts.ledger.claim = vi.fn(() => {
+    opts.ledger.claim = vi.fn((evidenceKey, _at, recordAttempt, applyRefresh) => {
       expect(opts.run.mock.calls.map(call => call[1])).toEqual([['fetch', 'origin', 'trunk'], ['rev-parse', 'origin/trunk']]);
       expect(opts.run.mock.calls[0][2]).toEqual(opts.run.mock.calls[1][2]);
+      evidenceKey();
+      recordAttempt();
+      applyRefresh();
       return true;
     });
     expect(sweepMechanicalConflictRebases(opts).applied).toHaveLength(1);
-    expect(opts.ledger.claim).toHaveBeenCalledWith(`1@${sha}`, 1000);
+    expect(opts.ledger.claim).toHaveBeenCalledWith(expect.any(Function), 1000, expect.any(Function), expect.any(Function));
     expect(opts.refresh).toHaveBeenCalledWith('lane/test-1', expect.objectContaining({ base: 'origin/trunk' }));
   });
 
@@ -241,7 +302,7 @@ describe('mechanical conflict rebase', () => {
     const opts = fixture({ refresh: undefined, run, readOpenPrs: () => [pr(1)] });
     expect(sweepMechanicalConflictRebases(opts).refusals).toMatchObject([{ kind: 'conflict-rebase-not-mechanical' }]);
     expect(run.mock.calls.some(call => ['commit-tree', 'push'].includes(call[1][0]))).toBe(false);
-    expect(opts.ledger.read()).toEqual({ [`1@${sha}`]: 1000 });
+    expect(opts.ledger.read()).toEqual({ [`1@${sha}@${pr(1).headRefOid}@0`]: 1000 });
   });
 
   it('includes drafts and review:human/accepted across all conflict signals; excludes non-main, closed, forks and unknown evidence', () => {
@@ -255,25 +316,40 @@ describe('mechanical conflict rebase', () => {
     expect(buildConflictRebaseCandidates([pr(4, { baseRefName: 'trunk' })], { defaultBranch: 'trunk' })).toHaveLength(1);
   });
 
-  it('persists attempts before refresh, excludes same main SHA after restart, allows new SHA and prunes expired records', () => {
+  it('dedupes stale evidence across passes and permits later attempts only after observing a new durable marker', () => {
     const dir = mkdtempSync(join(tmpdir(), 'conflict-rebase-'));
     const path = join(dir, 'ledger.json');
     try {
       const opts = fixture({ readOpenPrs: () => [pr(1)], ledger: createConflictRebaseLedger({ path }),
         refresh: vi.fn(() => {
-          expect(createConflictRebaseLedger({ path }).read()[`1@${sha}`]).toBe(1000);
+          expect(createConflictRebaseLedger({ path }).read()[`1@${sha}@${pr(1).headRefOid}@0`]).toBe(1000);
           return { ok: true, action: 'current' };
         }) });
       sweepMechanicalConflictRebases(opts);
       expect(sweepMechanicalConflictRebases({ ...opts, ledger: createConflictRebaseLedger({ path }) }).applied).toEqual([]);
       expect(sweepMechanicalConflictRebases({ ...opts, readMainTip: () => ({ sha: nextSha }), run: () => ({ status: 0, stdout: nextSha }) }).applied).toHaveLength(1);
-      const later = 31 * 86400000;
-      expect(sweepMechanicalConflictRebases({ ...opts, now: () => later, refresh: () => ({ ok: true, action: 'current' }) }).applied).toHaveLength(1);
-      expect(opts.ledger.read()).toEqual({ [`1@${sha}`]: later });
+      const later = 1001;
+      expect(sweepMechanicalConflictRebases({ ...opts, now: () => later }).applied).toEqual([]);
+      const comments = [trusted(buildConflictFixMarkComment({ baseRefName: 'main', baseSha: sha }))];
+      expect(sweepMechanicalConflictRebases({ ...opts, now: () => later,
+        readOpenPrs: () => [pr(1, { comments })], readPr: () => pr(1, { comments }),
+        refresh: () => ({ ok: true, action: 'current' }),
+      }).applied).toHaveLength(1);
+      expect(opts.ledger.read()[`1@${sha}@${pr(1).headRefOid}@1`]).toBe(later);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it('concurrent file-backed claims permit exactly one successful claim and one refresh for the same PR/main SHA', async () => {
+  it('legacy target-only claims fail closed with an operator repair fallback', () => {
+    const ledger = createConflictRebaseLedger({ env: { WE_UNDER_TEST: '1' } });
+    ledger.write({ [`1@${sha}`]: 999 });
+    const opts = fixture({ readOpenPrs: () => [pr(1)], ledger });
+    expect(sweepMechanicalConflictRebases(opts).refusals).toMatchObject([
+      { kind: 'conflict-rebase-ledger-unreadable', why: expect.stringContaining('inspect/repair ledger') },
+    ]);
+    expect(opts.postComment).not.toHaveBeenCalled(); expect(opts.refresh).not.toHaveBeenCalled();
+  });
+
+  it('overlapping passes with different timestamps and stale cap-minus-one snapshots post only one marker and refresh', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'conflict-concurrent-'));
     const path = join(dir, 'ledger.json');
     const release = new Int32Array(new SharedArrayBuffer(4));
@@ -310,22 +386,30 @@ describe('mechanical conflict rebase', () => {
         const { createConflictRebaseLedger, sweepMechanicalConflictRebases } = await import(workerData.module);
         const ledger = createConflictRebaseLedger({ path: workerData.path });
         const claims = [];
-        let refreshes = 0;
+        let refreshes = 0, markers = 0;
         const result = sweepMechanicalConflictRebases({
-          repo: 'web-everything/web-everything', apply: true, maxPerPass: 1, now: () => 1000,
-          readOpenPrs: () => [workerData.pr], readPr: () => workerData.pr, readMainTip: () => ({ sha: workerData.sha }),
+          repo: 'web-everything/web-everything', apply: true, maxPerPass: 1, now: () => workerData.first ? 1000 : 1001,
+          readOpenPrs: () => [workerData.pr], readPr: () => {
+            if (!fs.existsSync(workerData.path + '.lock')) throw Error('fresh read outside exclusion');
+            return workerData.pr;
+          }, readMainTip: () => ({ sha: workerData.sha }),
           checkClaim: () => null, readIsCrossRepository: () => false,
           run: () => ({ status: 0, stdout: workerData.sha }),
           ledger: { claim: (...args) => { const won = ledger.claim(...args); claims.push(won); return won; } },
-          refresh: () => { refreshes++; return { ok: true, action: 'current' }; },
-          reconcileAcceptance: () => { throw Error('current must not reconcile acceptance'); }, postComment: () => {},
+          refresh: () => {
+            if (!fs.existsSync(workerData.path + '.lock')) throw Error('refresh outside exclusion');
+            refreshes++; return { ok: true, action: 'current' };
+          },
+          reconcileAcceptance: () => { throw Error('current must not reconcile acceptance'); },
+          postComment: () => { markers++; },
         });
-        parentPort.postMessage({ done: true, claims, refreshes, refusals: result.refusals });
+        parentPort.postMessage({ done: true, claims, refreshes, markers, refusals: result.refusals });
       })().catch(error => { throw error; });
     `;
     const run = (first, onHolding = () => {}) => new Promise((resolve, reject) => {
       const worker = new Worker(source, { eval: true, workerData: { first, path, release: release.buffer,
-        module: pathToFileURL(join(process.cwd(), 'scripts/conveyor/conflict-mechanical-rebase.mjs')).href, pr: pr(1), sha } });
+        module: pathToFileURL(join(process.cwd(), 'scripts/conveyor/conflict-mechanical-rebase.mjs')).href, pr: pr(1, { comments: Array.from({ length: CONFLICT_FIX_ROUND_CAP - 1 },
+          () => trusted(buildConflictFixMarkComment({ baseRefName: 'main', baseSha: sha }))) }), sha } });
       workers.push(worker);
       timers.push(setTimeout(() => reject(Error('concurrent ledger worker timed out')), 10000));
       let result;
@@ -345,8 +429,9 @@ describe('mechanical conflict rebase', () => {
       const results = [first, await second];
       expect(results.flatMap(result => result.claims).sort()).toEqual([false, true]);
       expect(results.reduce((sum, result) => sum + result.refreshes, 0)).toBe(1);
+      expect(results.reduce((sum, result) => sum + result.markers, 0)).toBe(1);
       expect(results.flatMap(result => result.refusals)).toEqual([]);
-      expect(createConflictRebaseLedger({ path }).read()).toEqual({ [`1@${sha}`]: 1000 });
+      expect(createConflictRebaseLedger({ path }).read()).toEqual({ [`1@${sha}@${pr(1).headRefOid}@2`]: 1000 });
     } finally {
       timers.forEach(clearTimeout);
       await Promise.all(workers.map(worker => worker.terminate()));

@@ -1419,7 +1419,7 @@ export async function runTickAllRepos({
     ? stepRepos.get('fix').filter(repo => !orphanGuardCompleted.has(repo)) : [];
   const guardedFixRepos = stepRepos.get('fix').filter(repo => !orphanGuardDeferred.includes(repo));
   const conflictRebase = stepTimed('conflict-rebase', () => runConflictRebaseAllRepos({
-    repos: stepRepos.get('conflict-rebase'),
+    repos: guardedFixRepos,
     tick: sharedTick('conflict-rebase', conflictRebaseTick ?? (anyTickInjected
       ? (() => ({ applied: [], refusals: [] })) : sweepMechanicalConflictRebases)),
   }));

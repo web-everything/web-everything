@@ -1,4 +1,4 @@
-/** Mechanical conflict refreshes have a per-pass cap and share the durable conflict-fix ceiling.
+/** Mechanical conflict refreshes have a per-pass cap and share the durable conflict-fix accounting.
  * Real code conflicts remain owned by the existing conflict fixer/escalation path. */
 import { readFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -10,15 +10,15 @@ import { REPO_ROOT } from '../operations/dispatch-lane-io.mjs';
 import { handoffHome } from '../operations/handoff-home.mjs';
 import { resolveLanePoolRepoPath } from './lane-pool-health-watch.mjs';
 import { pushRefusal } from './fix-procedure.mjs';
-import { CONFLICT_FIX_ABSOLUTE_CEILING, countUnresolvedStandDowns, concurrentAuthorPauseState } from './reconcile-core.mjs';
+import { conflictFixAccounting, countUnresolvedStandDowns, concurrentAuthorPauseState } from './reconcile-core.mjs';
 import { standDownHeadChangeAt, concurrentAuthorPauses } from './stand-down.mjs';
 import { loadFlakeHoldState } from './load-flake-hold.mjs';
 import { answerDisposition, latestOperatorAnswer } from './stand-down-answer-core.mjs';
 import { LIST_COMMENTS_PAGE_SIZE } from './pr-comments-complete.mjs';
 import { defaultReadOpenPrs, defaultReadMainTip, refreshOntoMain, defaultReadIsCrossRepository,
-  sameRepoRefusal, reconcileAcceptanceAfterRebase, defaultPostRebaseComment } from './ci-red-recovery-watch.mjs';
+  sameRepoRefusal, reconcileAcceptanceAfterRebase } from './ci-red-recovery-watch.mjs';
 
-import { countConflictFixComments, CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
+import { postConflictFixMarkComment } from './conflict-fix-mark.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 
@@ -31,8 +31,6 @@ export function defaultReadConflictRebasePr(prNumber, { repo, exec = execFileSyn
     }));
   } catch { return null; }
 }
-
-const TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 /** standard → platform → tool → environment; malformed/oversized caps disable this pass.
  * The cascade logs the effective value and source. Existing fix dispatch remains the fallback. */
@@ -63,7 +61,8 @@ export function buildConflictRebaseCandidates(prs, { defaultBranch = 'main' } = 
       || pr.labels?.some(label => (label?.name ?? label) === 'merge-status:conflicting')));
 }
 
-/** Separate per-repo ledger. Corrupt/unreadable state refuses work rather than forgetting attempts.
+/** Per-repo evidence dedupe ledger; PR comments alone own durable attempt accounting.
+ * Corrupt/unreadable state refuses work rather than forgetting claims.
  * Claim uses the shared atomic file lock, so overlapping ticks cannot attempt the same key twice. */
 export function createConflictRebaseLedger({ repo, path, env = process.env } = {}) {
   let memory = {};
@@ -80,19 +79,29 @@ export function createConflictRebaseLedger({ repo, path, env = process.env } = {
     mkdirSync(dirname(file), { recursive: true });
     return withFileLock(`${file}.lock`, fn, { timeoutMs: 1000 });
   };
-  return { read, write, claim: (key, at) => locked(() => claimAttempt({ read, write }, key, at)) };
+  return { read, write, claim: (key, at, beforeClaim, afterClaim) => locked(() => claimAttempt({ read, write }, key, at, beforeClaim, afterClaim)) };
 }
 
-function claimAttempt(ledger, key, at) {
+function claimAttempt(ledger, key, at, beforeClaim, afterClaim) {
   const stored = ledger.read();
   if (!stored || typeof stored !== 'object' || Array.isArray(stored)
-    || Object.entries(stored).some(([k, ts]) => !/^\d+@[a-f0-9]{40}$/i.test(k) || !Number.isFinite(ts))) {
+    || Object.entries(stored).some(([k, ts]) => !/^\d+@[a-f0-9]{40}(?:@[a-f0-9]{40}@\d+)?$/i.test(k) || !Number.isFinite(ts))) {
     throw new Error('invalid conflict rebase ledger; repair ledger or use existing fix dispatch');
   }
-  const state = Object.fromEntries(Object.entries(stored).filter(([, ts]) => at - ts <= TTL_MS));
-  if (Object.hasOwn(state, key)) return false;
-  state[key] = at;
+  const state = { ...stored };
+  // Resolve evidence only after acquiring exclusion, and retain claims across overlapping passes.
+  const resolvedKey = typeof key === 'function' ? key() : key;
+  if (!resolvedKey || Object.hasOwn(state, resolvedKey)) return false;
+  const targetKey = resolvedKey.split('@').slice(0, 2).join('@');
+  // Historical PR/target claims cannot prove which evidence was consumed.
+  if (resolvedKey !== targetKey && Object.hasOwn(state, targetKey)) {
+    throw new Error('legacy conflict rebase claim; inspect/repair ledger or use existing fix dispatch');
+  }
+  if (Object.entries(state).some(([k, ts]) => k.startsWith(`${targetKey}@`) && ts === at)) return false;
+  beforeClaim?.(); // Fail closed: a failed durable comment leaves the dedupe claim unconsumed.
+  state[resolvedKey] = at;
   ledger.write(state); // durable BEFORE refresh, including crashes, skips and errors
+  afterClaim?.(); // Exclusion spans the refresh as well as evidence validation and marker posting.
   return true;
 }
 
@@ -120,8 +129,9 @@ export function sweepMechanicalConflictRebases({ repo, apply = false, defaultBra
   }),
   ledger = createConflictRebaseLedger({ repo }), maxPerPass = resolveConflictRebaseSettings().value.conflictRebasePerPass,
   now = Date.now, checkClaim = pushRefusal, readIsCrossRepository = defaultReadIsCrossRepository,
-  reconcileAcceptance = reconcileAcceptanceAfterRebase, postComment = defaultPostRebaseComment,
+  reconcileAcceptance = reconcileAcceptanceAfterRebase, postComment = postConflictFixMarkComment,
 } = {}) {
+  const passAt = now();
   const dispatch = [], applied = [], refusals = [];
   const result = { dispatch, applied, refusals };
   if (!Number.isInteger(maxPerPass) || maxPerPass < 1 || maxPerPass > 100) return result;
@@ -140,8 +150,8 @@ export function sweepMechanicalConflictRebases({ repo, apply = false, defaultBra
     const row = { prNumber: pr.number, headRefName: pr.headRefName, headSha: pr.headRefOid };
     const why = holdWhy(pr, now);
     if (why) { refusals.push({ ...row, kind: 'conflict-rebase-held', why }); continue; }
-    if (countConflictFixComments(pr.comments) >= CONFLICT_FIX_ABSOLUTE_CEILING) {
-      refusals.push({ ...row, kind: 'conflict-rebase-ceiling', why: 'absolute conflict-fix ceiling reached; existing escalation retains human takeover' }); continue;
+    if (conflictFixAccounting(pr.comments, { currentRef: defaultBranch, currentSha: mainSha }).exhausted) {
+      refusals.push({ ...row, kind: 'conflict-rebase-ceiling', why: 'durable conflict-fix cap reached; existing escalation retains human takeover' }); continue;
     }
     if (!apply) { dispatch.push(row); continue; }
     const held = checkClaim({ repo, branch: pr.headRefName });
@@ -159,42 +169,52 @@ export function sweepMechanicalConflictRebases({ repo, apply = false, defaultBra
         why: 'main fetch/verification failed; existing fix path retains ownership' });
       break;
     }
-    let fresh;
-    try { fresh = readPr(pr.number, { repo }); } catch { fresh = null; }
-    if (!fresh || fresh.number !== pr.number || fresh.headRefOid !== pr.headRefOid
-      || !/^[a-f0-9]{40}$/i.test(fresh.headRefOid ?? '') || fresh.headRefName !== pr.headRefName
-      || !Array.isArray(fresh.labels) || fresh.mergeable !== 'CONFLICTING'
-      || !buildConflictRebaseCandidates([fresh], { defaultBranch }).length) {
-      refusals.push({ ...row, kind: 'conflict-rebase-held', why: 'fresh PR evidence changed or unreadable; existing fix path retains ownership' }); continue;
-    }
-    const freshWhy = holdWhy(fresh, now);
-    const freshGuard = checkClaim({ repo, branch: fresh.headRefName })
-      || sameRepoRefusal(fresh.number, { repo, readIsCrossRepository });
-    if (freshWhy || freshGuard) {
-      refusals.push({ ...row, kind: 'conflict-rebase-held', why: freshWhy ?? freshGuard.message ?? freshGuard.error }); continue;
-    }
-    if (countConflictFixComments(fresh.comments) >= CONFLICT_FIX_ABSOLUTE_CEILING) {
-      refusals.push({ ...row, kind: 'conflict-rebase-ceiling', why: 'absolute conflict-fix ceiling reached; existing escalation retains human takeover' }); continue;
-    }
+    const evidenceKey = () => {
+      let fresh;
+      try { fresh = readPr(pr.number, { repo }); } catch { fresh = null; }
+      if (!fresh || fresh.number !== pr.number || fresh.headRefOid !== pr.headRefOid
+        || !/^[a-f0-9]{40}$/i.test(fresh.headRefOid ?? '') || fresh.headRefName !== pr.headRefName
+        || !Array.isArray(fresh.labels) || fresh.mergeable !== 'CONFLICTING'
+        || !buildConflictRebaseCandidates([fresh], { defaultBranch }).length) {
+        refusals.push({ ...row, kind: 'conflict-rebase-held', why: 'fresh PR evidence changed or unreadable; existing fix path retains ownership' }); return null;
+      }
+      const freshWhy = holdWhy(fresh, now);
+      const freshGuard = checkClaim({ repo, branch: fresh.headRefName })
+        || sameRepoRefusal(fresh.number, { repo, readIsCrossRepository });
+      if (freshWhy || freshGuard) {
+        refusals.push({ ...row, kind: 'conflict-rebase-held', why: freshWhy ?? freshGuard.message ?? freshGuard.error }); return null;
+      }
+      const accounting = conflictFixAccounting(fresh.comments, { currentRef: defaultBranch, currentSha: mainSha });
+      if (accounting.exhausted) {
+        refusals.push({ ...row, kind: 'conflict-rebase-ceiling', why: 'durable conflict-fix cap reached; existing escalation retains human takeover' }); return null;
+      }
+      return `${pr.number}@${mainSha}@${fresh.headRefOid}@${accounting.total}`;
+    };
+    let commentFailed = false;
+    const recordAttempt = () => {
+      try { postComment(pr.number, { repo, baseRefName: defaultBranch, baseSha: mainSha, attempting: true }); }
+      catch (e) { commentFailed = true; throw e; }
+    };
+    const applyRefresh = () => {
+      let refreshed;
+      try { refreshed = refresh(pr.headRefName, { repo, root, base: `origin/${defaultBranch}`, prNumber: pr.number, readIsCrossRepository }); }
+      catch (e) { refreshed = { ok: false, action: 'error', error: e.message }; }
+      if (!refreshed.deferred) attempts += 1;
+      const action = { ...row, ...refreshed };
+      applied.push(action);
+      if (refreshed.ok && refreshed.action === 'rebased' && refreshed.newCommit) {
+        action.acceptance = reconcileAcceptance({ repo, root, prNumber: pr.number, newHead: refreshed.newCommit });
+      }
+      if (!refreshed.ok) refusals.push({ ...row, kind: 'conflict-rebase-not-mechanical', why: refreshed.error ?? refreshed.action });
+    };
     try {
-      if (!(ledger.claim ? ledger.claim(`${pr.number}@${mainSha}`, now())
-        : claimAttempt(ledger, `${pr.number}@${mainSha}`, now()))) continue;
+      if (!(ledger.claim ? ledger.claim(evidenceKey, passAt, recordAttempt, applyRefresh)
+        : claimAttempt(ledger, evidenceKey, passAt, recordAttempt, applyRefresh))) continue;
     } catch (e) {
-      refusals.push({ ...row, kind: 'conflict-rebase-ledger-unreadable', why: `${e.message}; existing fix path retains ownership` });
+      refusals.push({ ...row, kind: commentFailed ? 'conflict-rebase-comment-failed' : 'conflict-rebase-ledger-unreadable',
+        why: `${e.message}; existing fix path retains ownership` });
       break;
     }
-    let refreshed;
-    try { refreshed = refresh(pr.headRefName, { repo, root, base: `origin/${defaultBranch}`, prNumber: pr.number, readIsCrossRepository }); }
-    catch (e) { refreshed = { ok: false, action: 'error', error: e.message }; }
-    if (!refreshed.deferred) attempts += 1;
-    const action = { ...row, ...refreshed };
-    applied.push(action);
-    if (refreshed.ok && refreshed.action === 'rebased' && refreshed.newCommit) {
-      action.acceptance = reconcileAcceptance({ repo, root, prNumber: pr.number, newHead: refreshed.newCommit });
-    }
-    if (!refreshed.ok) refusals.push({ ...row, kind: 'conflict-rebase-not-mechanical', why: refreshed.error ?? refreshed.action });
-    try { postComment(pr.number, { repo, ...row, ...refreshed, commentMarker: CONFLICT_FIX_COMMENT_MARKER }); }
-    catch (e) { refusals.push({ ...row, kind: 'conflict-rebase-comment-failed', why: e.message }); }
   }
   return result;
 }

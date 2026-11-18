@@ -29,6 +29,7 @@
  * the PR itself — no parallel state store (#2612 invariant).
  */
 import { resolve } from 'node:path';
+import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { execFileSync } from 'node:child_process';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
@@ -40,15 +41,20 @@ export { CONFLICT_FIX_COMMENT_MARKER };
  * we:scripts/conveyor/conflict-fix-mark.mjs#buildConflictFixMarkComment — the durable comment body a completed
  * STACKED-BASE mechanical rebase round posts. Its FIRST line MUST be {@link CONFLICT_FIX_COMMENT_MARKER}
  * (single-sourced, shared with the ordinary conflict-fix round) so posting and counting can never drift. Pure.
- * @param {{ actor?:string, baseRefName?:string|null, baseSha?:string|null }} o - #2787-live-incident:
+ * @param {{ actor?:string, baseRefName?:string|null, baseSha?:string|null, attempting?:boolean }} o - #2787-live-incident:
  *   `baseSha` (the base's own tip at the time this round resolved, read locally — see
  *   `rearm-review.mjs#resolveLocalRefSha`'s own docblock) rides an OPTIONAL trailer so a LATER round against
  *   that same base's NEWER tip (rebased again since) is not misread as this round recurring — see
  *   `conflict-fix-round-count.mjs#countStaleConflictFixRounds`. Omitted (no trailer) when `baseRefName` or
  *   `baseSha` is unknown — exactly today's behaviour before this param existed.
+ *   `attempting` records admission before a mechanical sweep rebases, without claiming success.
  * @returns {string}
  */
-export function buildConflictFixMarkComment({ actor = 'conveyor fix agent', baseRefName = null, baseSha = null } = {}) {
+export function buildConflictFixMarkComment({ actor = 'conveyor fix agent', baseRefName = null, baseSha = null, attempting = false } = {}) {
+  if (attempting) return [CONFLICT_FIX_COMMENT_MARKER, '',
+    `${actor} is attempting a mechanical conflict rebase against \`${baseRefName}\`.`,
+    'This attempt is recorded before rebasing; failure still consumes a conflict-fix round. Labels are unchanged.',
+  ].join('\n') + conflictFixTargetTrailer(baseRefName, baseSha);
   const base = baseRefName ? `\`${baseRefName}\`` : 'its own base branch';
   return [
     CONFLICT_FIX_COMMENT_MARKER,
@@ -62,6 +68,14 @@ export function buildConflictFixMarkComment({ actor = 'conveyor fix agent', base
       'PR to `main` (its stacked base merged and was deleted — the normal path), the NEXT conflict on this PR is ' +
       'handled by the ordinary main-base conflict-fix flow instead, unaffected by this marker.',
   ].join('\n') + (baseRefName ? conflictFixTargetTrailer(baseRefName, baseSha) : '');
+}
+
+/** Post the shared durable marker; a throwing post must prevent the caller's rebase. */
+export function postConflictFixMarkComment(prNumber, { exec = execFileSyncThrottled, repo, ...options } = {}) {
+  const args = ['pr', 'comment', String(prNumber), '--body', buildConflictFixMarkComment(options)];
+  if (repo) args.push('--repo', repo);
+  exec('gh', args, { stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8',
+    timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
 }
 
 // ── IO SHELL (runs only as a CLI — the pure exports above stay side-effect-free on import) ────────────────────────

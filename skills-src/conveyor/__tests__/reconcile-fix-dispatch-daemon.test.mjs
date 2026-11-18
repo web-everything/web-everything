@@ -2183,11 +2183,14 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
       } };
     const first = await realRunTickAllRepos(options);
     expect(visited).toEqual(['we']);
+    expect(conflictRebase.sweepMechanicalConflictRebases.mock.calls.map(([options]) => options.repo)).toEqual([repos[0]]);
+    conflictRebase.sweepMechanicalConflictRebases.mockClear();
     expect(first.stuckFixers.rows).toEqual([]);
     expect(first.budgets['orphan-guard']).toMatchObject({ hit: true, skipped: [repos[1]] });
     visited.length = 0;
     const second = await realRunTickAllRepos(options);
     expect(visited).toEqual(['frontierui']);
+    expect(conflictRebase.sweepMechanicalConflictRebases.mock.calls.map(([options]) => options.repo)).toEqual([repos[1]]);
     expect(second.stuckFixers.rows).toEqual([]);
     expect(second.budgets['orphan-guard']).toMatchObject({ hit: true, skipped: [repos[0]] });
     expect(time).toBe(2002);
@@ -2292,7 +2295,7 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     }));
   });
 
-  it.each(['throws', 'returns early'])('defers fix until next pass when orphan-guard %s before completing a repo', async mode => {
+  it.each(['throws', 'returns early'])('defers fix and conflict rebase until next pass when orphan-guard %s before completing a repo', async mode => {
     const f = productionFixture();
     const result = await realRunTickAllRepos({ ...f.options,
       orphanGuardTick: async ({ repos }) => {
@@ -2302,6 +2305,7 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
           return { rows: [] };
         }
       } });
+    expect(conflictRebase.sweepMechanicalConflictRebases).not.toHaveBeenCalled();
     expect(fixDispatch.runReconcileFixDispatch).not.toHaveBeenCalled();
     expect(result.refusals).toContainEqual({ repo: 'we', prNumber: null,
       kind: 'orphan-guard-deferred', why: 'orphan-cap guard did not complete this repo; fix deferred until next pass' });
