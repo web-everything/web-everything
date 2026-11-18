@@ -42,8 +42,8 @@ export function readPlannerRow({ pr, plan, refusals = plan?.refusals ?? [],
   const rawPr = rawPrs?.find(row => Object.is(Number(row?.number), Number(pr)));
   const checks = rawPr?.statusCheckRollup;
   // Preserve the normal gate's row-bound mergeGateReviewHold / mergeGateHoldExcused annotations.
-  const checkEvidence = resolveRequiredChecks({ rows: checks, rowsHead: rawPr?.headRefOid,
-    rowsComplete: rawPr?.rowsComplete === true, requiredNames: requiredChecks, rosterSource,
+  const checkEvidence = resolveRequiredChecks({ rows: checks, rowsHead: rawPr?.rowsHead ?? undefined,
+    rowsComplete: rawPr?.rowsComplete === true && Boolean(rawPr?.rowsHead), requiredNames: requiredChecks, rosterSource,
     head: refusal.headSha, holds: rawPr?.holds ?? plan?.holds });
   const { state, perName, reasons } = checkEvidence;
   const unsettled = Object.entries(perName).filter(([, row]) => row.state !== 'pass');

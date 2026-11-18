@@ -1,5 +1,6 @@
 import { expect, it, vi } from 'vitest';
 import { readPlannerRow } from '../../lib/red-team-planner-row.mjs';
+import { mapGraphqlPr } from '../../lib/pr-list-paged.mjs';
 import { runReconcilePass } from '../reconcile-pass.mjs';
 import { buildCiHealEscalationComment } from '../ci-heal-escalation-mark.mjs';
 import { runRedTeamOnSkip } from '../../lib/review-red-team-on-skip.mjs';
@@ -11,6 +12,17 @@ vi.mock('../../lib/gh-throttle.mjs', async original => ({ ...await original(),
 const identity = value => value;
 const head = 'a'.repeat(40), pr = 5762;
 const check = (name, conclusion = 'failure', extra = {}) => ({ name, status: 'completed', conclusion, ...extra });
+it.each([['b'.repeat(40), 'unknown'], [head, 'pass'], [undefined, 'unknown']])(
+  'uses the GraphQL rollup parent commit %s for planner evidence', (snapshotHead, state) => {
+    const raw = mapGraphqlPr({ number: pr, headRefOid: head, commits: { nodes: [{ commit: {
+      oid: snapshotHead, statusCheckRollup: { contexts: { pageInfo: { hasNextPage: false }, totalCount: 1,
+        nodes: [{ __typename: 'CheckRun', ...check('test', 'success') }] } },
+    } }] } });
+    const row = readPlannerRow({ pr, rawPrs: [raw], requiredChecks: ['test'], rosterSource: 'live',
+      refusals: [{ kind: 'review-ci', prNumber: pr, headSha: head }] });
+    expect(row.checkEvidence.state).toBe(state);
+    expect(row.reviewOwnedChecks.onlyRed).toBe(state === 'pass');
+  });
 const options = source => ({ repo: 'we', now: 2_000_000, env: {},
   readPrs: () => [source], readAgents: () => [], enrich: identity,
   readRequiredChecks: () => ({ checks: ['test', 'review-gate', 'merge-gate'], source: 'live' }), resolveMainSha: () => null,

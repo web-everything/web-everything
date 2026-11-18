@@ -8,7 +8,7 @@ import { createRedTeamDispatchQueue, runWithRedTeamQueue } from '../red-team-dis
 // reconcile-core.test.mjs (foldReviewRefusalInto and the annotated held-gate fixtures).
 const repo = 'web-everything/web-everything', pr = 5762, head = 'a'.repeat(40);
 const check = (name, conclusion = 'failure', extra = {}) => ({ name, status: 'completed', conclusion, ...extra });
-const rawPr = (statusCheckRollup = []) => ({ number: pr, headRefOid: head, rowsComplete: true, comments: [], reviews: [], statusCheckRollup });
+const rawPr = (statusCheckRollup = []) => ({ number: pr, headRefOid: head, rowsHead: head, rowsComplete: true, comments: [], reviews: [], statusCheckRollup });
 const refusal = (kind, extra = {}) => ({ kind, prNumber: pr, headSha: head, ...extra });
 const scopeBloat = { stale: true, why: 'stale base carries unrelated changes' };
 function folded(kind) {
@@ -102,12 +102,25 @@ describe('readPlannerRow', () => {
     }
   });
 
-  it('uses the refusal head rather than accepting checks fetched for a moved PR head', () => {
+  it.each([
+    ['foreign', 'b'.repeat(40), 'unknown'],
+    ['matching', head, 'pass'],
+    ['missing', undefined, 'unknown'],
+    ['unavailable', null, 'unknown'],
+  ])('binds checks to the %s snapshot head rather than the current PR head', (_, rowsHead, state) => {
+    const result = classify([check('test', 'success')], {
+      rawPrs: [{ ...rawPr([check('test', 'success')]), rowsHead }],
+    });
+    expect(result.checkEvidence.state).toBe(state);
+    expect(result.reviewOwnedChecks).toMatchObject({ ci: { allowed: state === 'pass', headSha: head }, onlyRed: state === 'pass' });
+  });
+
+  it('keeps the refusal head when the current PR head has moved beyond the snapshot', () => {
     const result = classify([check('test', 'success')], {
       rawPrs: [{ ...rawPr([check('test', 'success')]), headRefOid: 'b'.repeat(40) }],
     });
-    expect(result.checkEvidence.state).toBe('unknown');
-    expect(result.reviewOwnedChecks).toMatchObject({ ci: { allowed: false, headSha: head }, onlyRed: false });
+    expect(result.checkEvidence.state).toBe('pass');
+    expect(result.reviewOwnedChecks).toMatchObject({ ci: { allowed: true, headSha: head }, onlyRed: true });
   });
 
   it.each([

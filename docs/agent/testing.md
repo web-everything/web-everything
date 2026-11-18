@@ -4589,8 +4589,9 @@ Always recompute from the current checks and required set; saved classifications
 reflect check reruns on the same head. Explicit raw snapshots carry only their own ownership
 annotations. Normal passes carry `plannerRequiredChecks` and `plannerRequiredChecksSource`;
 read-only passes also carry the roster and its `rosterSource` in `plannerOptions`.
-Use one `resolveRequiredChecks` call with the refusal's head, the snapshot's `headRefOid`,
-and explicit snapshot completeness. Preserve bound hold annotations on the rows. Missing
+Use one `resolveRequiredChecks` call with the refusal's head, the snapshot's `rowsHead`
+(the rollup parent commit's oid), and explicit snapshot completeness. An unavailable
+snapshot head makes the evidence incomplete (`unknown`). Preserve bound hold annotations on the rows. Missing
 roster provenance defaults to `declared` and fails closed; retry with live/cache roster
 and complete head-bound evidence. `checkEvidence` records the contract result. Only `held`
 required names are review-owned; non-held fail/unknown/pending names block red-only eligibility.
