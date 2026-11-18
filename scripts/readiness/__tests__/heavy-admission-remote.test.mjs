@@ -11,6 +11,8 @@ import { bindingEvidence } from './fixtures/forge-bound-git.mjs';
 import { execContainerized } from '../../lib/container-exec.mjs';
 import { LEASE_FILENAME } from '../../lib/lane-lease.mjs';
 import { createRunFinisher } from '../forge-run-finish.mjs';
+import { buildMarkerTags, HOLD_SESSION_ENV } from '../heavy-admission.mjs'; // marker tag builder round-trip (R1012)
+import { markerContent, createMarkerReaper } from '../forge-slot-markers.mjs';
 
 vi.mock('../forge-run-finish.mjs', () => ({createRunFinisher: vi.fn(() => vi.fn(async () => ({finished: true})))}));
 
@@ -1214,4 +1216,34 @@ it.each([false,true])('R857 credential warnings reach the fallbacks log without 
     const rows=readFileSync(file,'utf8').trim().split('\n').map(JSON.parse);
     expect(rows).toEqual([expect.objectContaining({reason:'credential-warn',detail:'notes.md: high-entropy-key'})]);
   }
+});
+
+describe('R1012 marker tags from the real builder stay readable at boundary values', () => {
+  const NOW = Date.parse('2026-11-17T12:00:00-05:00');
+  const idle = async () => ({sampledAtET: new Date(NOW + 120_000).toISOString().replace('Z', '+00:00'), activeRuns: 0, recent: []});
+  it.each([
+    ['ppid 0 (parent outside the PID namespace)', {ppid: 0}, {ppid: 0}],
+    ['ppid 1', {ppid: 1}, {ppid: 1}],
+    ['negative ppid', {ppid: -1}, {}],
+    ['non-integer ppid', {ppid: Number.NaN}, {}],
+    ['empty session', {ppid: 0, env: {[HOLD_SESSION_ENV]: ''}}, {ppid: 0}],
+    ['blank session', {ppid: 0, env: {[HOLD_SESSION_ENV]: '   '}}, {ppid: 0}],
+    ['overlong session', {ppid: 0, env: {[HOLD_SESSION_ENV]: 's'.repeat(500)}}, {session: 's'.repeat(200), ppid: 0}],
+    ['control-char session', {ppid: 0, env: {[HOLD_SESSION_ENV]: 'a\nb'}}, {ppid: 0}],
+    ['path and spaced command', {ppid: 0, argv: ['/usr/bin/npm run x']}, {ppid: 0, cmd: 'npm'}],
+    ['bare slash command', {ppid: 0, argv: ['/']}, {ppid: 0}],
+    ['overlong command', {ppid: 0, argv: ['c'.repeat(90)]}, {ppid: 0, cmd: 'c'.repeat(40)}],
+  ])('%s: the marker round-trips and a dead owner on idle Forge is released', async (_name, {ppid, env = {}, argv = []}, caller) => {
+    const root = mkdtempSync(join(tmpdir(), 'marker-tags-')); testRoots.push(root);
+    const file = join(root, 'slot-0.unconfirmed');
+    const tags = buildMarkerTags({kind: 'files', env, lease: null, argv, ppid});
+    writeFileSync(file, markerContent({owner: 'o', pid: 111, nowMs: NOW - 600_000, host: 'forge', ...tags}));
+    utimesSync(file, (NOW - 600_000) / 1000, (NOW - 600_000) / 1000);
+    expect(JSON.parse(readFileSync(file, 'utf8')).caller).toEqual({kind: 'files', ...caller});
+    const logs = [];
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: () => 'dead', log: line => logs.push(line)});
+    expect(await reaper.step(idle)).toEqual(['slot-0.unconfirmed']);
+    expect(existsSync(file)).toBe(false);
+    expect(logs.some(line => line.includes('released unconfirmed') && line.includes(JSON.stringify({kind: 'files', ...caller})))).toBe(true);
+  });
 });

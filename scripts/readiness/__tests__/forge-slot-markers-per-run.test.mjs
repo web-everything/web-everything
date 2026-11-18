@@ -108,6 +108,38 @@ describe('R1017 finish settled active runs for dead owners', () => {
     expect(existsSync(f.file)).toBe(true);
     expect(f.log.mock.calls.filter(([line]) => line.includes('finish failed'))).toHaveLength(1);
   });
+  it('shares the 30-second per-run finish retry limit across reaper instances (one per runWithRemoteDecision call)', async () => {
+    const f = fixture({finishRun: vi.fn().mockRejectedValue(new Error('transport failed'))});
+    expect(await f.reaper.step(f.sample())).toEqual([]);
+    expect(f.finishRun).toHaveBeenCalledTimes(1);
+    let now = NOW + 1_000;
+    const log = vi.fn();
+    const second = createMarkerReaper({root: f.root, host: 'forge', clock: () => now, liveness: () => 'dead', finishRun: f.finishRun, log});
+    const sample = async () => ({sampledAtET: iso(now), activeRuns: 1, activeRunIds: [RUN_DEAD], recent: [{...dead, code: 97}]});
+    expect(await second.step(sample)).toEqual([]);
+    expect(f.finishRun).toHaveBeenCalledTimes(1);
+    now = NOW + FINISH_RETRY_MS - 1;
+    expect(await second.step(sample)).toEqual([]);
+    expect(f.finishRun).toHaveBeenCalledTimes(1);
+    now = NOW + FINISH_RETRY_MS;
+    expect(await second.step(sample)).toEqual([]);
+    expect(f.finishRun).toHaveBeenCalledTimes(2);
+    expect(existsSync(f.file)).toBe(true);
+  });
+  it('shares the finish retry limit across processes through a stamp under the remote root', async () => {
+    const f = fixture({finishRun: vi.fn().mockRejectedValue(new Error('transport failed'))});
+    expect(await f.reaper.step(f.sample())).toEqual([]);
+    const stamp = JSON.parse(readFileSync(join(f.root, `.finish-${RUN_DEAD}`), 'utf8'));
+    expect(stamp).toEqual({at: NOW});
+  });
+  it('ignores a future-dated or malformed finish stamp instead of suppressing the retry for good', async () => {
+    for (const text of [JSON.stringify({at: NOW + 3_600_000}), 'garbage']) {
+      const f = fixture({finishRun: vi.fn().mockRejectedValue(new Error('transport failed'))});
+      writeFileSync(join(f.root, `.finish-${RUN_DEAD}`), text);
+      expect(await f.reaper.step(f.sample())).toEqual([]);
+      expect(f.finishRun).toHaveBeenCalledTimes(1);
+    }
+  });
   it('logs finish and exit evidence while omitting unknown provenance', async () => {
     const f = fixture(), exit = {owner: 'o', code: 143, signal: 'SIGTERM', at: NOW - 120_000};
     writeFileSync(f.file + '.exit', JSON.stringify(exit));

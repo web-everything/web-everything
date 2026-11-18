@@ -148,13 +148,42 @@ describe('R1017 marker traceability', () => {
     {lane: {}}, {lane: -1}, {lane: ''}, {pr: '1017'}, {pr: 0},
   ])('treats a malformed present trace field as unreadable: %j', async bad => {
     const root = setup({0: {pid: 111}}), file = join(root, 'slot-0.unconfirmed');
-    writeFileSync(file, markerContent({owner: 'o', pid: 111, nowMs: NOW - 600_000, host: 'forge', ...bad}));
+    // Raw bytes, not markerContent: the writer now normalises these away; the reader must still refuse them on disk.
+    writeFileSync(file, JSON.stringify({v: 1, note: 'remote termination unconfirmed', host: 'forge', owner: 'o', pid: 111,
+      at: NOW - 600_000, ...bad}) + '\n');
     utimesSync(file, (NOW - 600_000) / 1000, (NOW - 600_000) / 1000);
     let probes = 0;
     const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: () => 'dead'});
     expect(await reaper.step(async () => { probes++; return await tel(0)(); })).toEqual([]);
     expect(probes).toBe(0);
     expect(existsSync(file)).toBe(true);
+  });
+  it.each([
+    [{caller: null}, {}], [{caller: []}, {}], [{caller: {ppid: '22'}}, {}], [{caller: {ppid: -1, kind: 'files'}}, {caller: {kind: 'files'}}],
+    [{caller: {ppid: 1.5}}, {}], [{caller: {kind: 4, ppid: 3}}, {caller: {ppid: 3}}], [{caller: {session: 'bad\ntext'}}, {}],
+    [{caller: {session: ''}}, {}], [{caller: {session: 's'.repeat(201)}}, {}], [{caller: {unknown: 'x', cmd: 'npm'}}, {caller: {cmd: 'npm'}}],
+    [{caller: {cmd: 'npm run'}}, {}], [{caller: {cmd: '/bin/npm'}}, {}], [{caller: {cmd: 'a'.repeat(41)}}, {}],
+    [{lane: {}}, {}], [{lane: -1}, {}], [{lane: ''}, {}], [{pr: '1017'}, {}], [{pr: 0}, {}],
+  ])('the writer omits any tag the reader would reject, so the marker stays readable and reapable: %j', async (bad, kept) => {
+    const root = setup({0: {pid: 111}}), file = join(root, 'slot-0.unconfirmed');
+    writeFileSync(file, markerContent({owner: 'o', pid: 111, nowMs: NOW - 600_000, host: 'forge', ...bad}));
+    utimesSync(file, (NOW - 600_000) / 1000, (NOW - 600_000) / 1000);
+    const written = JSON.parse(readFileSync(file, 'utf8'));
+    expect({caller: written.caller, lane: written.lane, pr: written.pr}).toEqual({caller: undefined, lane: undefined, pr: undefined, ...kept});
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: () => 'dead'});
+    expect(await reaper.step(tel(0))).toEqual(['slot-0.unconfirmed']);
+  });
+  it.each([0, 1])('releases a dead owner on idle Forge alike for caller.ppid %s (0 = parent outside the PID namespace)', async ppid => {
+    const root = setup({0: {pid: 111}}), file = join(root, 'slot-0.unconfirmed');
+    const caller = {kind: 'files', session: 'fix-7024', ppid, cmd: 'npm'};
+    writeFileSync(file, markerContent({owner: 'o', pid: 111, nowMs: NOW - 600_000, host: 'forge', caller, lane: 0, pr: 7024}));
+    utimesSync(file, (NOW - 600_000) / 1000, (NOW - 600_000) / 1000);
+    expect(JSON.parse(readFileSync(file, 'utf8')).caller).toEqual(caller);
+    const logs = [];
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111]), log: line => logs.push(line)});
+    expect(await reaper.step(tel(0))).toEqual(['slot-0.unconfirmed']);
+    const line = logs.find(text => text.includes('released unconfirmed'));
+    expect(JSON.parse(line.slice(line.indexOf('{'), line.lastIndexOf('}') + 1))).toMatchObject({caller, lane: 0, pr: 7024, pid: 111});
   });
   it.each([false, true])('includes per-slot trace and exit evidence in release logs and stuck details (record=%s)', async withExit => {
     const root = setup({0: {pid: 111}}), file = join(root, 'slot-0.unconfirmed');

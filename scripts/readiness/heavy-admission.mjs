@@ -1231,14 +1231,7 @@ export async function runWithRemoteDecision({
   const kind = classifyAdmissionCommandKind(argv.map(shellQuoteWord).join(' '), env);
   let lease = null;
   try { lease = readLaneLease(cwd); } catch { /* unknown identity grants no priority */ }
-  const cleanTag = value => typeof value === 'string' && value.trim() && !/[\x00-\x1f\x7f]/.test(value) ? value.trim().slice(0, 200) : undefined;
-  const session = cleanTag(env?.[HOLD_SESSION_ENV]) ?? cleanTag(lease?.session);
-  const cmd = basename(String(argv[0] ?? '').trim().split(/\s+/)[0]).replace(/[\x00-\x1f\x7f\\]/g, '').slice(0, 40);
-  const lane = Number.isSafeInteger(lease?.lane) && lease.lane >= 0 ? lease.lane : cleanTag(lease?.lane);
-  const prValue = lease?.pr ?? lease?.prNumber ?? env?.WE_PR_NUMBER ?? env?.PR_NUMBER;
-  const pr = /^[1-9]\d*$/.test(String(prValue ?? '')) && Number.isSafeInteger(Number(prValue)) ? Number(prValue) : undefined;
-  const markerTags = {caller: {...(kind ? {kind} : {}), ...(session ? {session} : {}), ppid: process.ppid, ...(cmd ? {cmd} : {})},
-    ...(lane !== undefined ? {lane} : {}), ...(pr !== undefined ? {pr} : {})};
+  const markerTags = buildMarkerTags({kind, env, lease, argv});
   const priority = classifyWaiterPriority({purpose:lease?.purpose,session:lease?.session,holder:lease?.holder,
     envSession:clipIdentity(env?.[HOLD_SESSION_ENV])}, policy.settings.priority).class === 'P0';
   try {
@@ -2620,6 +2613,21 @@ function recordReleasedHold(lockRoot, entry, nowMs = Date.now()) {
 export const HOLD_SESSION_ENV = 'WE_HEAVY_SESSION';
 export const HOLD_DISPATCH_KIND_ENV = 'WE_HEAVY_DISPATCH_KIND';
 export const HOLD_RUN_ID_ENV = 'WE_HEAVY_RUN_ID';
+
+/**
+ * The advisory trace tags a remote slot marker carries (caller, lane, PR). `markerContent` drops any tag the marker
+ * reader would reject, so a boundary value here (ppid 0, an empty or overlong session) can never make a marker unreadable.
+ */
+export function buildMarkerTags({kind, env, lease, argv = [], ppid = process.ppid}) {
+  const cleanTag = value => typeof value === 'string' && value.trim() && !/[\x00-\x1f\x7f]/.test(value) ? value.trim().slice(0, 200) : undefined;
+  const session = cleanTag(env?.[HOLD_SESSION_ENV]) ?? cleanTag(lease?.session);
+  const cmd = basename(String(argv[0] ?? '').trim().split(/\s+/)[0]).replace(/[\x00-\x1f\x7f\\]/g, '').slice(0, 40);
+  const lane = Number.isSafeInteger(lease?.lane) && lease.lane >= 0 ? lease.lane : cleanTag(lease?.lane);
+  const prValue = lease?.pr ?? lease?.prNumber ?? env?.WE_PR_NUMBER ?? env?.PR_NUMBER;
+  const pr = /^[1-9]\d*$/.test(String(prValue ?? '')) && Number.isSafeInteger(Number(prValue)) ? Number(prValue) : undefined;
+  return {caller: {...(kind ? {kind} : {}), ...(session ? {session} : {}), ppid, ...(cmd ? {cmd} : {})},
+    ...(lane !== undefined ? {lane} : {}), ...(pr !== undefined ? {pr} : {})};
+}
 
 const clipIdentity = (v) => { const s = String(v ?? '').trim(); return s ? s.slice(0, 200) : null; };
 

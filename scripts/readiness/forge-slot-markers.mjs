@@ -20,11 +20,16 @@ export const FINISH_TIMEOUT_MS = 10_000;
 const NAME = /^slot-(\d+)\.unconfirmed$/;
 const HELD_NAME = /^slot-(\d+)\.unconfirmed(?:\.held-[0-9a-f]{16})?$/;
 
-/** New markers carry their owner pid so a later client can prove the owner is dead. `run` (the Forge run id) is added once known. */
+/**
+ * New markers carry their owner pid so a later client can prove the owner is dead. `run` (the Forge run id) is added once known.
+ * The trace tags (caller, lane, pr) are advisory: the writer drops any tag the reader would reject, because one rejected
+ * tag makes the whole marker unreadable and so never reaped (a slot stuck for good). The SAME predicates judge both sides.
+ */
 export function markerContent({owner, pid, nowMs, host, run, caller, lane, pr}) {
+  const tagCaller = normalizeCaller(caller);
   return JSON.stringify({v: 1, note: 'remote termination unconfirmed', host, owner, pid, at: nowMs,
-    ...(run ? {run} : {}), ...(caller !== undefined ? {caller} : {}),
-    ...(lane !== undefined ? {lane} : {}), ...(pr !== undefined ? {pr} : {})}) + '\n';
+    ...(run ? {run} : {}), ...(tagCaller ? {caller: tagCaller} : {}),
+    ...(validLane(lane) ? {lane} : {}), ...(validPr(pr) ? {pr} : {})}) + '\n';
 }
 
 const CLOCK_SKEW_MS = 60_000;
@@ -34,10 +39,20 @@ const NONCE = /^[a-f0-9]{32}(?![\s\S])/;
 const SLOT = /^forge-exec(?:-[1-9]\d*)?(?![\s\S])/;
 const NUMBERED_SLOT = /^forge-exec-[1-9]\d*(?![\s\S])/;
 const shortText = v => typeof v === 'string' && v.length > 0 && v.length <= 200 && !/[\x00-\x1f\x7f]/.test(v);
+// ppid is advisory provenance: 0 is real (the parent lives outside this PID namespace), so only a non-integer or negative is malformed.
+const CALLER_FIELDS = {kind: shortText, session: shortText, ppid: v => Number.isSafeInteger(v) && v >= 0,
+  cmd: v => shortText(v) && v.length <= 40 && !/[\s/\\]/.test(v)};
+const validCallerField = (k, value) => Object.hasOwn(CALLER_FIELDS, k) && CALLER_FIELDS[k](value);
 const validCaller = v => v && typeof v === 'object' && !Array.isArray(v)
-  && Object.keys(v).every(k => ['kind', 'session', 'ppid', 'cmd'].includes(k))
-  && Object.entries(v).every(([k, value]) => k === 'ppid' ? Number.isSafeInteger(value) && value > 0
-    : k === 'cmd' ? shortText(value) && value.length <= 40 && !/[\s/\\]/.test(value) : shortText(value));
+  && Object.entries(v).every(([k, value]) => validCallerField(k, value));
+const validLane = v => Number.isSafeInteger(v) && v >= 0 || shortText(v);
+const validPr = v => Number.isSafeInteger(v) && v > 0;
+/** The caller tag with every field the reader would reject dropped; undefined when nothing valid is left. */
+function normalizeCaller(caller) {
+  if (!caller || typeof caller !== 'object' || Array.isArray(caller)) return undefined;
+  const kept = Object.fromEntries(Object.entries(caller).filter(([k, value]) => validCallerField(k, value)));
+  return Object.keys(kept).length ? kept : undefined;
+}
 
 /** Synchronous, advisory crash evidence; owner binding prevents writing over a successor's evidence. */
 export function recordMarkerExit(file, {owner, code = null, signal = null, at}) {
@@ -48,6 +63,9 @@ export function recordMarkerExit(file, {owner, code = null, signal = null, at}) 
 }
 
 const exitWatchers = new WeakMap();
+/** Per remote root: finish attempt times, logged failures and finished run:nonce keys, shared by every reaper. */
+const sharedFinishState = new Map();
+const FINISH_STATE_MAX = 1024;
 /** One synchronous exit listener per client, including markers retained after an unconfirmed return. */
 export function watchMarkerExit({files, owner, clock = Date.now, client = process}) {
   let registry = exitWatchers.get(client);
@@ -204,8 +222,7 @@ function readMarker(file) {
       const ok = (key, test) => marker[key] === undefined || test(marker[key]);
       if (!ok('host', v => typeof v === 'string') || !ok('owner', v => typeof v === 'string') || !ok('pid', Number.isInteger)
         || !ok('at', Number.isFinite) || !ok('run', v => typeof v === 'string' && RUN.test(v))
-        || !ok('caller', validCaller) || !ok('lane', v => Number.isSafeInteger(v) && v >= 0 || shortText(v))
-        || !ok('pr', v => Number.isSafeInteger(v) && v > 0)) {
+        || !ok('caller', validCaller) || !ok('lane', validLane) || !ok('pr', validPr)) {
         return {unreadable: true, legacy: false, host: undefined, pid: null, run: null, at: null};
       }
       const saved = marker.owner !== undefined ? sidecarRun(file, marker.owner) : null;
@@ -272,7 +289,24 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
   graceMs = MARKER_GRACE_MS, log = () => {}, fs = {readdirSync, statSync, unlinkSync}, finishRun,
   signal = () => {}, idleConfirmMs = 30_000, stuckMinSlots = 2, stuckAgeMs = 600_000, signalEveryMs = 600_000}) {
   const signalledAt = new Map();
-  const finishAttempts = new Map(), finishFailuresLogged = new Set(), finishedRuns = new Set();
+  // Every runWithRemoteDecision call builds its own reaper, so per-run finish state is shared per remote root: in this
+  // process through a module map, across processes through a `.finish-<run>` stamp (newest wins). A missing, unreadable
+  // or future-dated stamp is ignored: it can only allow one extra attempt, never suppress the retry for good.
+  let shared = sharedFinishState.get(root);
+  if (!shared) { shared = {attempts: new Map(), logged: new Set(), finished: new Set()}; sharedFinishState.set(root, shared); }
+  const {attempts: finishAttempts, logged: finishFailuresLogged, finished: finishedRuns} = shared;
+  // Bounded: the oldest entries go first (insertion order); forgetting one can only allow one extra throttled attempt.
+  const trim = store => { while (store.size > FINISH_STATE_MAX) store.delete(store.keys().next().value); };
+  const finishStamp = run => join(root, `.finish-${run}`);
+  const lastFinishAt = (run, now) => {
+    let at = finishAttempts.get(run);
+    if (at !== undefined && at > now) at = undefined;
+    try {
+      const saved = JSON.parse(readFileSync(finishStamp(run), 'utf8'))?.at;
+      if (Number.isFinite(saved) && saved <= now && (at === undefined || saved > at)) at = saved;
+    } catch { /* none yet */ }
+    return at;
+  };
   // The last-signalled time is shared through a stamp under the remote root, so every wait loop (one reaper each) on this
   // host throttles together. A missing, unreadable or future-dated stamp is ignored: it can only cause an extra advisory
   // event, never suppress one for good. The in-memory time still throttles this instance when writes fail.
@@ -332,7 +366,12 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
       // The tombstone still blocks the slot here, so no successor can have written its own sidecar yet.
       try { if (entry.owner !== undefined && sidecarRun(entry.file, entry.owner) !== null) unlinkSync(`${entry.file}.run`); } catch { /* absent */ }
       try { unlinkSync(`${entry.file}.exit`); } catch { /* absent */ }
-      try { unlinkSync(tomb); return true; } catch { /* fall through and restore */ }
+      let removed = false;
+      try { unlinkSync(tomb); removed = true; } catch { /* fall through and restore */ }
+      if (removed) {
+        if (entry.run) try { unlinkSync(finishStamp(entry.run)); } catch { /* absent */ }
+        return true;
+      }
     }
     try { linkSync(tomb, entry.file); unlinkSync(tomb); } catch { /* the held tombstone stays and keeps blocking its slot */ }
     return false;
@@ -394,17 +433,19 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
                   || !ownerGone(root, entry.index, entry.file, liveness, selfPid)) continue;
                 const finishKey = `${entry.run}:${entry.nonce}`;
                 if (!finishedRuns.has(finishKey)) {
-                  const last = finishAttempts.get(entry.run);
+                  const last = lastFinishAt(entry.run, decisionAt);
                   if (last !== undefined && decisionAt - last < FINISH_RETRY_MS) continue;
-                  finishAttempts.set(entry.run, decisionAt);
+                  finishAttempts.delete(entry.run); finishAttempts.set(entry.run, decisionAt); trim(finishAttempts);
+                  try { writeFileSync(finishStamp(entry.run), JSON.stringify({at: decisionAt}), {mode: 0o600}); } catch { /* the in-memory time still throttles */ }
                   let timer;
                   try {
                     await Promise.race([Promise.resolve().then(() => finishRun({run: entry.run, nonce: entry.nonce})),
                       new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('finish timeout')), FINISH_TIMEOUT_MS); })]);
-                    finishedRuns.add(finishKey);
+                    finishedRuns.add(finishKey); trim(finishedRuns);
+                    try { unlinkSync(finishStamp(entry.run)); } catch { /* none */ }
                   } catch {
                     if (!finishFailuresLogged.has(entry.run)) {
-                      finishFailuresLogged.add(entry.run);
+                      finishFailuresLogged.add(entry.run); trim(finishFailuresLogged);
                       log(`heavy-admission: finish failed for ${entry.run}; marker retained; retry after ${FINISH_RETRY_MS}ms (operator cleanup if persistent)\n`);
                     }
                     continue;
