@@ -275,6 +275,7 @@ describe('same-head holds with no referral finding (#7012)', () => {
     ['same-head hold with an unreadable comment on the thread', [advisory, { ...advisory, body: null }], {}, /no clean advisory accept/],
     ['same-head hold with a conflicting second Net basis line', [{ ...advisory, body: `${advisory.body}\nNet basis: \`${'1'.repeat(40)}..${'2'.repeat(40)}\`` }], {}, /no clean advisory accept/],
     ['same-head hold with a quoted advisory inside another comment', [{ ...advisory, body: `quoted example, not a review:\n\n${advisory.body}` }], {}, /no clean advisory accept/],
+    ['same-head hold whose advisory note carries a fenced example', [{ ...advisory, body: `${advisory.body}\n\`\`\`\n**Advisory outcome:** \`accept\`\n\`\`\`` }], {}, /no clean advisory accept/],
     ['same-head hold with a short-prefix advisory head', [{ ...advisory, body: advisory.body.replace(/(Net basis: `[a-f0-9]+\.\.)[a-f0-9]+`/i, '$1' + fx.headRefOid.slice(0, 1) + '`') }], {}, /no clean advisory accept/],
     ['failed persistence', comments, { persistenceFailed: true }, /save failed/],
     ['no verdict', comments, { noVerdict: {} }, /no verdict ever landed/],
