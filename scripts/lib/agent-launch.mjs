@@ -39,10 +39,21 @@ export function agentResumeId(argv = []) {
   return resumeIds(typeof argv === 'string' ? shellWords(argv) : argv)[0] ?? null;
 }
 
+// Options that consume the next word, so a `--` right after one is that option's value, not the delimiter.
+const VALUE_OPTIONS = new Set([
+  '--append-system-prompt', '--system-prompt', '--model', '--allowedTools', '--allowed-tools', '--disallowedTools',
+  '--disallowed-tools', '--add-dir', '--mcp-config', '--settings', '--permission-mode', '--output-format',
+  '--input-format', '--max-turns', '--agent', '--agents', '--plugin-dir', '--fallback-model', '--name', '-n', '-m',
+  '--profile', '--sandbox', '-s', '-C', '--cd', '--config', '--effort',
+]);
+
 function resumeIds(allWords) {
-  // `--` ends option parsing: everything after it is prompt text, never a resume flag. A resume flag
-  // directly before it therefore has no value (reads as '' and is refused as a missing native id).
-  const delimiter = allWords.indexOf('--');
+  // `--` ends the launched claude/codex's option parsing: everything after it is prompt text, never a
+  // resume flag. A resume flag directly before it therefore has no value (reads as '' and is refused).
+  // Only a `--` AFTER the claude/codex binary word counts (a wrapper's own `--` — `npx -- claude -r X` —
+  // must not hide the real command), and a `--` that is an option's value never counts.
+  const binary = allWords.findIndex(w => typeof w === 'string' && /(?:^|[/\\])(?:claude|codex)$/.test(w));
+  const delimiter = allWords.findIndex((w, i) => w === '--' && i > binary && !VALUE_OPTIONS.has(allWords[i - 1]));
   const argv = delimiter < 0 ? allWords : allWords.slice(0, delimiter);
   let hasExec = false;
   return argv.flatMap((word, i) => {

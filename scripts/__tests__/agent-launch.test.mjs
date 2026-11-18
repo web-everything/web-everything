@@ -187,6 +187,23 @@ describe('resume validation across execution forms', () => {
     expect(launchAgent({ mode: 'claude-print', resumeId: null }, primitive, ...args)).toBe(result);
     expect(primitive).toHaveBeenCalledTimes(1);
   });
+  // A `--` that is not the launched claude/codex's own end-of-options marker must not hide a real resume.
+  it.each([
+    ['npx', ['--yes', '--', 'claude', '--resume', 'other-id']],
+    ['env', ['--', 'claude', '-r', 'other-id']],
+    ['claude', ['--append-system-prompt', '--', '--resume', 'other-id']],
+    ['claude', ['--model', '--', '-r', 'other-id']],
+    ['npx -- claude --resume other-id'],
+  ])('still refuses a real resume hidden behind a non-delimiter -- (%j)', (...args) => {
+    const primitive = vi.fn(), log = vi.fn();
+    expect(() => launchAgent({ mode: 'claude-print', resumeId: null, log }, primitive, ...args)).toThrow('native resume id');
+    expect(primitive).not.toHaveBeenCalled();
+  });
+  it('a wrapper -- before the binary does not count, but the binary\'s own -- still does', () => {
+    const primitive = vi.fn();
+    launchAgent({ mode: 'claude-print', resumeId: null }, primitive, 'npx', ['--yes', '--', 'claude', '-p', '--', '--resume']);
+    expect(primitive).toHaveBeenCalledTimes(1);
+  });
   it('agentResumeId ignores resume-looking words after the delimiter but keeps ones before it', () => {
     expect(agentResumeId(['-p', '--', '--resume'])).toBeNull();
     expect(agentResumeId('-p -- --resume')).toBeNull();
