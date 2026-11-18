@@ -27,6 +27,8 @@ const RED_TEAM_PENDING = 'red-team check run in progress or incomplete';
 const isRedTeamMissing = result => result?.status === 'hold' && result.id === 'red-team'
   && (result.reason === RED_TEAM_MISSING || result.reason === RED_TEAM_PENDING);
 const blocking = r => r.status === 'hold' || r.status === 'fail-closed';
+const isWorkflowTouchHold = r => r.id === 'review-acceptance' && r.status === 'hold'
+  && /^human-only: the diff at [0-9a-f]{9} touches \.github\/(?:workflows|actions)\//.test(r.reason);
 // The evaluator wraps both main-CI failures and manual freezes in `(freeze: ...)`.
 // Only combineRedMain's explicit manual origin can be cleared by the shared document.
 const manualFreeze = r => r.id === 'red-main-freeze' && r.status === 'hold'
@@ -174,13 +176,12 @@ export function excuseMergeGateRows(rows, { prNumber, headSha, labels, readVerdi
     const verdict = readVerdict({ jobId, prNumber });
     if (verdict?.error || verdict?.num !== prNumber || !verdict?.head_sha
       || verdict.head_sha.toLowerCase() !== headSha.toLowerCase() || verdict.ok !== false) return unchanged;
-    // A workflow self-protection failure is review-owned only with job/step proof from the reader.
+    // Workflow protection is review-owned only with job/step proof and exactly the workflow-touch hold.
     // Keep the failed conclusion: this annotation grants review admission, never merge clearance.
     if (verdict.workflowEditProtection === true) {
       const holds = verdict.results?.filter(blocking);
       if (!Array.isArray(labels) || labels.some(l => typeof (typeof l === 'string' ? l : l?.name) !== 'string')
-        || !holds || holds.some(r => r.status !== 'hold'
-          || !(HUMAN_REVIEW_HOLD_GATES.includes(r.id) || isCandidacyHold(r)))) return unchanged;
+        || holds?.length !== 1 || !isWorkflowTouchHold(holds[0])) return unchanged;
       const replacement = { ...row, mergeGateReviewHold: {
         holds: [...holds.map(r => r.id), 'workflow-edit-protection'], jobId,
       } };
@@ -215,8 +216,7 @@ function parseWorkflowProtection(job, log, prNumber) {
     || summaries[0] !== 'merge-gate: HOLD — held') {
     return { error: 'unknown or ambiguous workflow-protection merge-gate diagnostic' };
   }
-  const tableWorkflowHold = table.results.some(r => r.id === 'review-acceptance'
-    && r.status === 'hold' && /^human-only: the diff at [0-9a-f]{9} touches \.github\/(?:workflows|actions)\//.test(r.reason));
+  const tableWorkflowHold = table.results.some(isWorkflowTouchHold);
   if (!tableWorkflowHold) return null;
   // The evaluator must be the sole failed step in the gate's own completed job.
   const steps = job.steps;

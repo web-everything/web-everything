@@ -649,6 +649,30 @@ describe('workflow-edit protection uses PR 7106 job-backed rollup evidence', () 
     const { out } = probe(e => { e.log = e.log.split('\n').filter(l => !l.startsWith('merge-gate:')).concat('merge-gate: HOLD — held').join('\n'); });
     expect(out.statusCheckRollup[0].mergeGateReviewHold).toBeTruthy();
   });
+  it('keeps workflow protection plus test-gaming and missing red-team red without review ownership', () => {
+    expect(probe(e => {
+      e.log = e.log.replace('pass  test-gaming  ok', 'hold  test-gaming  test-gaming suspected: tests-removed')
+        .replace('pass  red-team  ok', 'hold  red-team  no red-team check run on head');
+    }).out.statusCheckRollup).toEqual([workflowRow]);
+  });
+  it.each(GATE_IDS.filter(id => id !== 'review-acceptance').flatMap(id =>
+    ['hold', 'fail-closed'].map(status => [id, status])))('keeps workflow protection plus %s %s red', (id, status) => {
+    expect(probe(e => {
+      e.log = e.log.replace(`pass  ${id}  ok`, `${status}  ${id}  additional blocker`);
+    }).out.statusCheckRollup).toEqual([workflowRow]);
+  });
+  it.each([
+    [],
+    [{ id: 'test-gaming', status: 'hold' }],
+    [{ id: 'review-acceptance', status: 'hold', reason: 'awaiting review' }],
+    [{ id: 'review-acceptance', status: 'fail-closed', reason: `human-only: the diff at ${HEAD.slice(0, 9)} touches .github/actions/check/action.yml` }],
+  ].map(results => ({ results })))('requires the specific singleton workflow-touch hold despite the protection flag ($results)', ({ results }) => {
+    const out = excuseMergeGateRows([workflowRow], { prNumber: 7106, headSha: HEAD,
+      labels: ['review:pending'], setting: 'on',
+      readVerdict: () => ({ num: 7106, head_sha: HEAD, ok: false, workflowEditProtection: true, results }),
+    });
+    expect(out).toEqual({ rows: [workflowRow], excused: false });
+  });
   function selfCheckFailure(e, verdict = 'HOLD') {
     const mismatch = `running workflow .github/workflows/ci.yml at ${HEAD.slice(0, 9)} differs from main's — a PR may not change the gate that judges it`;
     e.log = e.log.replace(/merge-gate: workflow self-check — ok: [^\n]+/,
