@@ -365,6 +365,7 @@ export async function prepareRebuild({
   unsafe.untracked = remaining;
   if (remaining.length > 0) alert('untracked-kept', { paths: remaining });
 
+  let quarantined = [];
   if (!readyOnly && !mainOnly) {
     const pruneStates = new Map();
     if (prState && overlaysBefore.length <= 100 && resolveOverlayPrune(env).enabled) {
@@ -372,9 +373,10 @@ export async function prepareRebuild({
         try { pruneStates.set(entry.pr, await prState(entry.pr)); } catch { pruneStates.set(entry.pr, null); }
       }
     }
-    pruneOverlays({ root, env, deps: { git, ...(prState ? { prState: pr => pruneStates.get(pr) } : {}),
+    const overlayActions = pruneOverlays({ root, env, deps: { git, ...(prState ? { prState: pr => pruneStates.get(pr) } : {}),
       adoptedHead: state.adopted?.head === prevHead ? prevHead : null, adopted: state.adopted?.head === prevHead ? state.adopted.applied : [],
       alertAdopted: item => alert('overlay-pruned-adopted', item), alert: message => alert('overlay-prune-failed', message) } });
+    quarantined = overlayActions.filter(item => item.action === 'quarantine');
     const remainingOverlays = readOverlayState(root, { env });
     if (remainingOverlays.corrupt) {
       alert('overlay-state-corrupt', { file: overlayFilePath(root, env) });
@@ -389,7 +391,7 @@ export async function prepareRebuild({
   const stack = resolveOverlayStackMode(env);
   const chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysBefore, env });
   const plan = await planRebuild({
-    auditedTip: makeAuditedTipGate(env),
+    quarantined, auditedTip: makeAuditedTipGate(env),
     git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysBefore, prState, mainOnly, edgeResolve,
     stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
     prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,

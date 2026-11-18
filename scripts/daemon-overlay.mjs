@@ -559,7 +559,7 @@ async function main() {
   let output;
   if (cmd === 'prune') {
     const listing = pruneOverlays({ root, env, dryRun: !!flags['dry-run'], deps: { countConflicts: false } });
-    process.stdout.write(asJson ? `${JSON.stringify(listing)}\n` : listing.map(o => `${String(o.ref).replace(/[\p{Cc}\p{Cf}]/gu, '')} pr=${o.pr ?? 0} ${o.reason}\n`).join(''));
+    process.stdout.write(asJson ? `${JSON.stringify(listing)}\n` : listing.map(o => `${String(o.ref).replace(/[\p{Cc}\p{Cf}]/gu, '')} pr=${o.pr ?? 0} ${o.action} ${o.reason}\n`).join(''));
     return;
   } else if (cmd === 'list') {
     // A corrupt file must not read as a plain empty list: flag it and exit 1 (add/remove throw on it instead).

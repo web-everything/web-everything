@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { planOverlayPrune, pruneOverlays, resolveOverlayPrune } from '../overlay-prune.mjs';
 import { readPendingDrops, settlePendingDrops, restoreRegistration, withAddGuardLock } from '../../overlay-registration.mjs';
-import { pinnedStatus, REBUILD_MECHANISM_PATHS } from '../plan.mjs';
+import { planRebuild, pinnedStatus, REBUILD_MECHANISM_PATHS } from '../plan.mjs';
 import { writeRebuildState } from '../state.mjs';
 import { kickOverlayMainSync } from '../overlay-main-sync.mjs';
 import { addOverlay, removeOverlay, readOverlayState, overlayFilePath, writeOverlays } from '../../daemon-overlays.mjs';
@@ -24,7 +24,7 @@ function fixture(overrides = {}) {
   const events = [], removed = [];
   const deps = { resolveSetting: () => ({ enabled: true }), readOverlayState: () => state,
     git: unpinnedGit, mainSha: main, openPrHeads: () => [], tipOf: () => a, isAncestor: () => false,
-    conflictsWithMain: () => true, prState: () => null, alert: vi.fn(),
+    conflictsWithMain: () => true, prState: () => null, alert: vi.fn(), publishAttention: vi.fn(),
     removeOverlay: (root, ref, options) => { removed.push({ ref, options }); state.overlays = state.overlays.filter(o => o.ref !== ref); return { removed: true }; },
     appendOverlayEvent: (root, event) => events.push(event), ...overrides };
   const run = (extra = {}) => pruneOverlays({ root, env, deps, ...extra });
@@ -55,7 +55,7 @@ describe('overlay prune planner', () => {
         .toEqual([expect.objectContaining({ ref: 'new', reason: state === 'CLOSED' ? 'pr-closed' : 'pr-merged' })]);
     }
   });
-  it('keeps an ancestor whose only successor is pruned for repeated conflicts', () => {
+  it('keeps an ancestor whose only successor is quarantined for repeated conflicts', () => {
     expect(planOverlayPrune(base({ overlays: [{ ref: 'old' }, { ref: 'new' }],
       tipOf: ref => ref === 'old' ? a : b, isAncestor: (x, y) => x === a && y === b,
       conflictsWithMain: () => true, conflictCounts: { new: 3 } })))
@@ -116,12 +116,28 @@ describe('overlay prune planner', () => {
 });
 
 describe('overlay prune IO', () => {
-  it('persists rebuild conflicts, then prunes on the third and emits reason and tip', () => {
+  it('quarantines after three conflicts, stays registered, emits attention once and skips the fourth rebuild', async () => {
     const f = fixture();
     expect(f.run()).toEqual([]); expect(f.run()).toEqual([]);
     expect(f.run()).toEqual([expect.objectContaining({ reason: 'pr0-conflicting', conflictCount: 3 })]);
-    expect(f.events).toEqual([expect.objectContaining({ kind: 'overlay-pruned', reason: 'pr0-conflicting', tip: a })]);
-    expect(f.removed[0].options.expectedOverlay).toMatchObject({ ref: 'old', pr: 0 });
+    expect(f.events).toEqual([expect.objectContaining({ kind: 'overlay-quarantined', ref: 'old', tip: a, count: 3 })]);
+    expect(f.removed).toEqual([]);
+    expect(f.state.overlays).toEqual([{ ref: 'old', pr: 0 }]);
+    expect(readPendingDrops(f.root, f.env)).toEqual([]);
+    expect(JSON.parse(fs.readFileSync(`${overlayFilePath(f.root, f.env)}.quarantine`, 'utf8')))
+      .toEqual([expect.objectContaining({ ref: 'old', tip: a, identity: expect.any(Object), since: expect.any(String), count: 3 })]);
+    const actions = f.run();
+    expect(actions).toEqual([expect.objectContaining({ action: 'quarantine', ref: 'old' })]);
+    expect(f.events).toHaveLength(1);
+    expect(f.deps.publishAttention).toHaveBeenCalledTimes(1);
+    expect(f.deps.publishAttention).toHaveBeenCalledWith(expect.objectContaining({ kind: 'overlay-quarantined', pr: 0 }), expect.any(Object));
+    const plan = await planRebuild({ git: args => args[0] === 'merge-tree'
+      ? { status: 1, stdout: main } : unpinnedGit(args), headSha: b, mainRef: 'origin/main',
+      overlays: f.state.overlays, quarantined: actions });
+    expect(plan.ok).toBe(true);
+    expect(plan.decisions).toEqual([expect.objectContaining({ action: 'skip', reason: 'overlay-quarantined' })]);
+    expect(plan.establishedLost).toEqual([]);
+    expect(plan.applied).toEqual([]);
   });
   it.each(['constructor', 'toString', '__proto__', 'hasOwnProperty'])('prototype-named ref %s preserves valid counters and unrelated pruning', ref => {
     const f = fixture({ tipOf: name => name === ref ? a : b });
@@ -132,10 +148,10 @@ describe('overlay prune IO', () => {
     expect(f.run()).toEqual([]);
     expect(counterValues(f.file)).toEqual({ [ref]: 2, unrelated: 1 });
     expect(f.run()).toEqual([expect.objectContaining({ ref, reason: 'pr0-conflicting', conflictCount: 3 })]);
-    expect(counterValues(f.file)).toEqual({ unrelated: 2 });
-    expect(f.run()).toEqual([expect.objectContaining({ ref: 'unrelated', reason: 'pr0-conflicting', conflictCount: 3 })]);
-    expect(counterValues(f.file)).toEqual({});
-    // A parsed empty sidecar must behave like the initially missing sidecar.
+    expect(counterValues(f.file)).toEqual({ [ref]: 3, unrelated: 2 });
+    expect(f.run()).toEqual([expect.objectContaining({ ref, action: 'quarantine' }), expect.objectContaining({ ref: 'unrelated', reason: 'pr0-conflicting', conflictCount: 3 })]);
+    expect(counterValues(f.file)).toEqual({ [ref]: 3, unrelated: 3 });
+    f.state.overlays = []; f.run();
     f.state.overlays = [{ ref, pr: 0 }];
     expect(f.run()).toEqual([]);
     expect(counterValues(f.file)).toEqual({ [ref]: 1 });
@@ -335,7 +351,7 @@ it.each([a, b])('settles an interrupted prune using the durable drop protocol (%
 
 
 it('restores the pruned tip when its registered carrier moves after removal', () => {
-  const f = fixture({ isAncestor: (x, y) => x === a && y === b });
+  const f = fixture({ isAncestor: (x, y) => x === a && y === b, conflictsWithMain: () => false });
   addOverlay(f.root, { ref: 'old', pr: 0 }, { env: f.env });
   addOverlay(f.root, { ref: 'carrier', pr: 0, pinned: true }, { env: f.env });
   delete f.deps.readOverlayState; delete f.deps.removeOverlay;
@@ -451,7 +467,7 @@ describe('third audit regression guarantees', () => {
     expect(f.run()).toEqual([expect.objectContaining({ reason: 'pr0-conflicting' })]);
   });
   it.each(['missing', 're-registered'])('keeps the ancestor if the survivor is %s at removal under the add guard', change => {
-    const f = fixture({ isAncestor: (x, y) => x === a && y === b });
+    const f = fixture({ isAncestor: (x, y) => x === a && y === b, conflictsWithMain: () => false });
     const old = { ref: 'old', pr: 0 }, carrier = { ref: 'carrier', pinned: true, addedAt: 'first' };
     writeOverlays(f.root, [old, carrier], { env: f.env });
     delete f.deps.readOverlayState;
@@ -523,4 +539,88 @@ it('protects an older adopted tip from running-build records even without cached
       stdout: `${main} ${b}\tdaemon-rebuild@localhost\tdaemon-rebuild: merge overlay old onto ${main}\n` } : unpinnedGit(args) });
   f.state.overlays[0].pr = 7;
   expect(f.run()).toEqual([]); expect(f.removed).toEqual([]);
+});
+
+
+describe('quarantine recovery and clean supersession', () => {
+  it.each(['clean', 'tip', 'registration'])('lifts quarantine on %s and emits once', change => {
+    const f = fixture(); f.run(); f.run(); f.run();
+    if (change === 'clean') f.deps.conflictsWithMain = () => false;
+    if (change === 'tip') f.deps.tipOf = () => b;
+    if (change === 'registration') f.state.overlays[0].addedAt = 'new-registration';
+    expect(f.run()).toEqual([]);
+    expect(fs.existsSync(`${overlayFilePath(f.root, f.env)}.quarantine`)).toBe(false);
+    expect(f.events.map(e => e.kind)).toEqual(['overlay-quarantined', 'overlay-quarantine-lifted']);
+    f.run();
+    expect(f.events).toHaveLength(2);
+    expect(f.removed).toEqual([]);
+  });
+  it.each(['open-pr', 'pinned', 'edgeResolution', 'adopted'])('does not quarantine protected %s', protection => {
+    const f = fixture();
+    if (protection === 'open-pr') f.deps.openPrHeads = () => [{ ref: 'old', number: 8, headSha: a }];
+    if (protection === 'pinned') f.state.overlays[0].pinned = true;
+    if (protection === 'edgeResolution') f.state.overlays[0].edgeResolution = { sha: b };
+    if (protection === 'adopted') f.deps.adopted = [{ ref: 'old', sha: a }];
+    f.run(); f.run(); expect(f.run()).toEqual([]);
+    expect(f.events).toEqual([]); expect(f.removed).toEqual([]);
+    expect(fs.existsSync(`${overlayFilePath(f.root, f.env)}.quarantine`)).toBe(false);
+  });
+  it.each([true, null, false])('supersession requires a proven clean survivor (%s)', conflict => {
+    const f = fixture({ tipOf: ref => ref === 'old' ? a : b, isAncestor: (x, y) => x === a && y === b,
+      conflictsWithMain: () => conflict });
+    f.state.overlays.push({ ref: 'carrier', pinned: true });
+    expect(f.run()).toEqual(conflict === false ? [expect.objectContaining({ action: 'prune', reason: 'superseded' })] : []);
+    expect(f.removed.length).toBe(conflict === false ? 1 : 0);
+  });
+  it('dry-run lists prune and quarantine actions without writing', () => {
+    const f = fixture({ prState: () => 'CLOSED' }); f.run(); f.run(); f.run();
+    f.state.overlays.push({ ref: 'closed', pr: 7 });
+    const before = fs.readFileSync(f.file, 'utf8'), events = f.events.length;
+    expect(f.run({ dryRun: true })).toEqual([
+      expect.objectContaining({ ref: 'old', action: 'quarantine' }),
+      expect.objectContaining({ ref: 'closed', action: 'prune' }),
+    ]);
+    expect(fs.readFileSync(f.file, 'utf8')).toBe(before);
+    expect(f.events).toHaveLength(events); expect(f.removed).toEqual([]);
+  });
+  it('corrupt quarantine evidence retains registrations with an operator fallback', () => {
+    const f = fixture(); f.run();
+    fs.writeFileSync(`${overlayFilePath(f.root, f.env)}.quarantine`, '[{}]');
+    expect(f.run()).toEqual([]); expect(f.removed).toEqual([]);
+    expect(f.deps.alert).toHaveBeenCalledWith(expect.stringContaining('inspect registrations manually'));
+  });
+});
+
+
+it('unknown applicability preserves an existing quarantine skip without repeat events', () => {
+  const f = fixture(); f.run(); f.run(); f.run();
+  const path = `${overlayFilePath(f.root, f.env)}.quarantine`;
+  const before = fs.readFileSync(path, 'utf8');
+  f.deps.conflictsWithMain = () => null;
+  expect(f.run()).toEqual([expect.objectContaining({ action: 'quarantine' })]);
+  expect(fs.readFileSync(path, 'utf8')).toBe(before);
+  f.deps.conflictsWithMain = () => true;
+  expect(f.run()).toEqual([expect.objectContaining({ action: 'quarantine' })]);
+  expect(f.events).toHaveLength(1);
+  expect(f.deps.publishAttention).toHaveBeenCalledTimes(1);
+});
+
+it('oversized quarantine state refuses actions and names the manual fallback', () => {
+  const f = fixture(); f.run(); f.run(); f.run();
+  const path = `${overlayFilePath(f.root, f.env)}.quarantine`;
+  const [record] = JSON.parse(fs.readFileSync(path, 'utf8'));
+  fs.writeFileSync(path, JSON.stringify(Array.from({ length: 101 }, () => record)));
+  expect(f.run()).toEqual([]); expect(f.removed).toEqual([]);
+  expect(f.deps.alert).toHaveBeenCalledWith(expect.stringContaining('inspect registrations manually'));
+});
+
+
+it('separate quarantines at the same tip receive distinct needs-you identities', () => {
+  const f = fixture(); f.run(); f.run(); f.run();
+  f.state.overlays[0].addedAt = 're-registered';
+  f.run(); f.run(); f.run(); f.run();
+  expect(f.deps.publishAttention).toHaveBeenCalledTimes(2);
+  const [first, second] = f.deps.publishAttention.mock.calls.map(([item]) => item.head);
+  expect(first).not.toBe(second);
+  expect(f.events.map(e => e.kind)).toEqual(['overlay-quarantined', 'overlay-quarantine-lifted', 'overlay-quarantined']);
 });

@@ -324,7 +324,8 @@ export async function planOverlayStacks({
  *   prState?:(pr:number)=>(Promise<string|null>|string|null), mainOnly?:boolean, edgeResolve?:boolean,
  *   prBaseChain?:((pr:number)=>(Promise<string[]|null>|string[]|null))|null,
  *   prForcePushes?:((pr:number)=>(Promise<Array<{before:string,after?:string|null}>|null>))|null, stackMode?:'tops'|'independent',
- *   stackModeSource?:string, auditedTip?:((ref:string, sha:string)=>boolean)|null}} o
+ *   stackModeSource?:string, auditedTip?:((ref:string, sha:string)=>boolean)|null,
+ *   quarantined?:Array<{ref:string, pr?:number|null, tip:string}>}} o
  * @returns {Promise<{ok:false, reason:'main-unresolved'}|{ok:true, mainSha:string, finalSha:string,
  *   applied:Array<{ref:string,pr:number|null,sha:string}>,
  *   decisions:Array<{ref:string,pr:number|null,action:'remove'|'drop'|'skip'|'apply',reason:string,sha:string|null}>,
@@ -333,7 +334,7 @@ export async function planOverlayStacks({
 export async function planRebuild({
   git, headSha, mainRef, overlays = [], prState, mainOnly = false, edgeResolve = true,
   prBaseChain = null, prForcePushes = null, stackMode = 'tops', stackModeSource = 'standard', keepIndependent = new Set(),
-  noPin = new Set(), auditedTip = null,
+  noPin = new Set(), auditedTip = null, quarantined = [],
 }) {
   const mainSha = verifyRev(git, `${mainRef}^{commit}`);
   if (!mainSha) return { ok: false, reason: 'main-unresolved' };
@@ -358,7 +359,10 @@ export async function planRebuild({
     const sha = verifyRev(git, `refs/remotes/origin/${raw.ref}^{commit}`);
     return !!sha && git(['merge-base', '--is-ancestor', sha, headSha]).status === 0;
   };
-  const listed = mainOnly ? [] : overlays;
+  const quarantineRefs = new Set(quarantined.map(q => q.ref));
+  if (!mainOnly) for (const q of quarantined) decisions.push({ ref: q.ref, pr: q.pr ?? null,
+    action: 'skip', reason: 'overlay-quarantined', sha: q.tip });
+  const listed = mainOnly ? [] : overlays.filter(o => !quarantineRefs.has(o.ref));
   const establishedRefs = new Set(listed.filter(isEstablished).map((o) => o.ref));
   // Application priority belongs to the proven TIP, but loss protection belongs to the carried OVERLAY.
   // A docs-only fast-forward (or a force-push) must not turn a live hotfix into a disposable newcomer.
@@ -879,7 +883,7 @@ export async function planRebuild({
     if (holdFailure) return holdRefusal();
     return planRebuild({
       git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
-      keepIndependent: new Set([...keepIndependent, ...lostBases]), noPin, auditedTip,
+      keepIndependent: new Set([...keepIndependent, ...lostBases]), noPin, auditedTip, quarantined,
     });
   }
 
@@ -1023,7 +1027,7 @@ export async function planRebuild({
       for (const refs of retryPinGroups()) {
         const alt = await planRebuild({
           git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
-          keepIndependent, noPin: new Set(refs), auditedTip,
+          keepIndependent, noPin: new Set(refs), auditedTip, quarantined,
         });
         if (!alt.ok || alt.establishedLost.length > 0) continue;
         const altApplied = new Map(alt.applied.map((a) => [a.ref, a]));

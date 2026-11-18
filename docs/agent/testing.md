@@ -4450,7 +4450,7 @@ and conflict probes use the fetched tips. Ready-only and main-only rebuilds skip
 runs it before selecting registrations (off skips it; shadow previews only). `overlayPrune.enabled`
 defaults on through the policy cascade; `WE_OVERLAY_PRUNE=0` disables it. The effective setting
 and source are logged. `node scripts/daemon-overlay.mjs prune --clone=<path> --dry-run --json`
-previews the candidates without writing counters, events, registrations, or locks.
+previews explicit `prune` and `quarantine` actions without writing counters, events, registrations, or locks.
 
 Only rebuilds increment the consecutive-conflict counter in `<overlay-file>.prune-state`.
 Counts cap at three, reset on clean/unknown evidence, and disappear when unregistered.
@@ -4472,7 +4472,9 @@ bound and the 100-registration per-invocation bound alert for manual registratio
 Supersession evidence must point directly to a retained overlay or live PR head. A successor
 also selected for pruning cannot justify removing its ancestor; without another retained
 successor, keep the ancestor. The named ancestor/successor regression covers closed, merged,
-and repeated-conflict removal, and the chain regression checks the retained evidence target.
+and repeated-conflict quarantine, and the chain regression checks the retained evidence target.
+The surviving carrier must itself merge cleanly with main using the same merge-tree probe;
+conflicting or unknown applicability retains the ancestor.
 Pins use the planner’s shared `pinnedStatus`: explicit, mechanism-derived, and unknown-evidence
 pins are retained. The moved `overlay-registration.mjs` guards remain mechanism-protected.
 An overlay whose current tip is carried by the running adopted head is retained for every rule
@@ -4483,6 +4485,17 @@ registrations and alert for operator repair/recovery. Pruning takes the existing
 refuses unsettled drop intents, and uses the rebuild's list-locked removal helper with the observed
 registration identity. `overlay-prune.test.mjs` covers these closed paths with injected IO and no network.
 
+
+PR-less registrations without open PRs enter non-destructive quarantine after three consecutive
+conflicting rebuilds. `<overlay-file>.quarantine` stores `{ref, tip, identity, since, count}` records.
+Quarantine writes no drop intent and keeps the registration. The rebuild planner records a skip,
+excludes the overlay from stack application and established-loss holds, and never counts it as applied.
+Each quarantine publishes one `overlay-quarantined` audit event and needs-you attention. Each rebuild
+still probes main applicability: clean application, a changed tip, or re-registration removes the record
+and emits `overlay-quarantine-lifted`. Unknown conflict evidence preserves the existing quarantine skip;
+corrupt or oversized records alert for manual inspection. Pins, adopted content and approved edges
+keep their existing protections. `overlay-prune.test.mjs` covers threshold, deduplication, recovery,
+plan skip/no-hold, protected entries, dry-run actions and clean/unknown/conflicting survivors.
 
 ### Overlay pruning uses the registration drop protocol
 

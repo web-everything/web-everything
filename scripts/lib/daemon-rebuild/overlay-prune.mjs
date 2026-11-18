@@ -3,12 +3,13 @@ import * as fs from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { cascadePolicy } from '../policy-cascade.mjs';
 import { runGhSync } from '../gh-throttle.mjs';
 import { readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent, registrationIdentity } from '../daemon-overlays.mjs';
 import { remoteTip, withAddGuardLock, readPendingDrops, addPending, clearPending, restoreRegistration } from '../overlay-registration.mjs';
+import { feedPath, publishAttention } from '../../operations/needs-you-feed.mjs';
 import { defaultPrState } from './edge-fetch.mjs';
 import { pinnedStatus } from './plan.mjs';
 import { readRebuildState } from './state.mjs';
@@ -28,7 +29,7 @@ export function resolveOverlayPrune(env = process.env, { settingsPath = SETTINGS
 }
 
 export function planOverlayPrune({ overlays, mainSha, prState, openPrHeads, tipOf, isAncestor, conflictsWithMain,
-  conflictCounts = {}, pinStatus = () => null, adoptedHead = null, adoptedOverlays = [] }) {
+  conflictCounts = {}, quarantinedRefs = new Set(), pinStatus = () => null, adoptedHead = null, adoptedOverlays = [] }) {
   const heads = openPrHeads(); // null means discovery failed: rules b/c have no proof.
   const unregisteredHeads = heads?.filter(p => !overlays.some(o => o.ref === p.ref || (o.pr > 0 && o.pr === p.number)));
   const states = new Map([...new Set(overlays.filter(o => o.pr > 0).map(o => o.pr))].map(pr => [pr, prState(pr)]));
@@ -36,7 +37,7 @@ export function planOverlayPrune({ overlays, mainSha, prState, openPrHeads, tipO
   const tips = new Map(overlays.map(o => [o.ref, tipOf(o.ref)]));
   const supersedes = (other, o) => {
     const tip = tips.get(o.ref), next = tips.get(other.ref);
-    if (other.ref === o.ref || !tip || !next) return false;
+    if (other.ref === o.ref || !tip || !next || conflictsWithMain(other.ref) !== false) return false;
     if (tip === next) return live(other) || other.ref < o.ref;
     return probe(tip, next) === true;
   };
@@ -75,8 +76,9 @@ export function planOverlayPrune({ overlays, mainSha, prState, openPrHeads, tipO
     if (successor) {
       planned.push({ ...evidence, reason: 'superseded', supersededBy: successor.ref,
         supersedingTip: tips.get(successor.ref) });
-    } else if (!(o.pr > 0) && mainSha && conflictsWithMain(o.ref) === true && conflictCounts[o.ref] > 2) {
-      planned.push({ ...evidence, reason: 'pr0-conflicting', conflictCount: conflictCounts[o.ref] });
+    } else if (!(o.pr > 0) && mainSha && (quarantinedRefs.has(o.ref)
+      || (conflictsWithMain(o.ref) === true && conflictCounts[o.ref] > 2))) {
+      planned.push({ ...evidence, action: 'quarantine', reason: 'pr0-conflicting', conflictCount: conflictCounts[o.ref] });
     }
   }
   // Supersession must end at retained work, never at another candidate for removal.
@@ -84,9 +86,9 @@ export function planOverlayPrune({ overlays, mainSha, prState, openPrHeads, tipO
   const removing = new Set(planned.map(o => o.ref));
   const survivors = overlays.filter(o => !removing.has(o.ref));
   return planned.flatMap(item => {
-    if (item.reason !== 'superseded') return [item];
+    if (item.reason !== 'superseded') return [{ action: 'prune', ...item }];
     const successor = survivors.find(other => supersedes(other, item));
-    return successor ? [{ ...item, supersededBy: successor.ref,
+    return successor ? [{ action: 'prune', ...item, supersededBy: successor.ref,
       supersedingTip: tips.get(successor.ref) }] : [];
   });
 }
@@ -102,6 +104,12 @@ export function pruneOverlays({ root, env = process.env, dryRun = false, deps = 
   try {
     if (!(deps.resolveSetting ?? resolveOverlayPrune)(env).enabled) return [];
     const io = deps.io ?? fs, file = `${overlayFilePath(root, env)}.prune-state`;
+    const quarantineFile = `${overlayFilePath(root, env)}.quarantine`;
+    const persist = (path, value) => {
+      const temp = `${path}.${randomUUID()}.tmp`;
+      try { io.writeFileSync(temp, JSON.stringify(value)); io.renameSync(temp, path); }
+      finally { io.rmSync(temp, { force: true }); }
+    };
     const execute = () => {
       if (readPendingDrops(root, env).length) throw new Error('pending drops require recovery; run recover-drops');
       const state = (deps.readOverlayState ?? readOverlayState)(root, { env });
@@ -109,10 +117,6 @@ export function pruneOverlays({ root, env = process.env, dryRun = false, deps = 
       const overlays = state.overlays;
       // At most 101 GitHub reads per invocation, including the single open-PR inventory.
       if (overlays.length > 100) throw new Error('overlay prune limit 100 exceeded; inspect registrations manually');
-      if (!overlays.length) {
-        if (!dryRun) io.rmSync(file, { force: true });
-        return [];
-      }
       const git = deps.git ?? (args => spawnSync('git', args, { cwd: root, env, encoding: 'utf8', timeout: 20_000, maxBuffer: 4 * 1024 * 1024 }));
       const currentTip = deps.remoteTip ?? deps.tipOf ?? (ref => remoteTip({ root, ref, env, run: (cmd, args) => git(args) }));
       const mainSha = deps.mainSha ?? currentTip('main');
@@ -168,6 +172,22 @@ export function pruneOverlays({ root, env = process.env, dryRun = false, deps = 
         previous = JSON.parse(io.readFileSync(file, 'utf8'));
         if (!previous || typeof previous !== 'object' || Array.isArray(previous) || Object.values(previous).some(n => !(Number.isSafeInteger(n) && n >= 0) && (!n || !Number.isSafeInteger(n.count) || n.count < 0 || typeof n.tip !== 'string' || !n.identity || typeof n.identity !== 'object' || Array.isArray(n.identity)))) throw new Error('invalid prune counters');
       } catch (e) { if (e.code !== 'ENOENT') throw e; }
+      let quarantines = [];
+      try {
+        quarantines = JSON.parse(io.readFileSync(quarantineFile, 'utf8'));
+        if (!Array.isArray(quarantines) || quarantines.length > 100 || quarantines.some(q =>
+          !q || typeof q.ref !== 'string' || !/^[a-f0-9]{40}$/.test(q.tip) || !q.identity
+          || typeof q.identity !== 'object' || Array.isArray(q.identity)
+          || typeof q.since !== 'string' || !Number.isSafeInteger(q.count) || q.count < 3)) {
+          throw new Error('invalid overlay quarantine; inspect registrations manually');
+        }
+      } catch (e) { if (e.code !== 'ENOENT') throw e; }
+      const lifted = quarantines.filter(q => {
+        const entry = overlays.find(o => o.ref === q.ref);
+        return !entry || (tipOf(q.ref) && tipOf(q.ref) !== q.tip)
+          || !isDeepStrictEqual(q.identity, registrationIdentity(entry)) || conflictsWithMain(q.ref) === false;
+      });
+      quarantines = quarantines.filter(q => !lifted.includes(q));
       const counts = Object.create(null), records = Object.create(null);
       for (const o of overlays) {
         const hasPrior = Object.hasOwn(previous, o.ref);
@@ -179,15 +199,43 @@ export function pruneOverlays({ root, env = process.env, dryRun = false, deps = 
           ? Math.min(3, (same ? prior.count : 0) + (!dryRun && deps.countConflicts !== false ? 1 : 0)) : 0;
         records[o.ref] = { tip: tip ?? '', identity, count: counts[o.ref] };
       }
+      // Unknown conflict evidence cannot lift an existing quarantine. Preserve its
+      // skip while keeping the original consecutive-conflict counter unchanged.
+      const quarantineCounts = { ...counts };
+      for (const q of quarantines) quarantineCounts[q.ref] = q.count;
       const planned = planOverlayPrune({ overlays, mainSha, prState: deps.prState ?? (pr => defaultPrState({ pr, root })),
-        openPrHeads: () => heads, tipOf, conflictsWithMain, conflictCounts: counts,
+        openPrHeads: () => heads, tipOf, conflictsWithMain, conflictCounts: quarantineCounts, quarantinedRefs: new Set(quarantines.map(q => q.ref)),
         pinStatus: (entry, tip) => mainSha ? pinnedStatus(git, entry, mainSha, tip) : null,
         adoptedHead, adoptedOverlays, isAncestor });
       if (dryRun) return planned;
-      const removed = [];
+      if (lifted.length) {
+        if (quarantines.length) persist(quarantineFile, quarantines);
+        else io.rmSync(quarantineFile, { force: true });
+        for (const q of lifted) (deps.appendOverlayEvent ?? appendOverlayEvent)(root,
+          { kind: 'overlay-quarantine-lifted', ...q }, { env });
+      }
+      const completed = [];
       for (const item of planned) {
         const entry = overlays.find(o => o.ref === item.ref);
         if (entry.pinned === true) continue;
+        if (item.action === 'quarantine') {
+          if (currentTip(item.ref) !== item.tip) continue;
+          if (!quarantines.some(q => q.ref === item.ref)) {
+            const record = { ref: item.ref, tip: item.tip, identity: registrationIdentity(entry),
+              since: new Date().toISOString(), count: item.conflictCount };
+            quarantines.push(record);
+            persist(quarantineFile, quarantines);
+            (deps.appendOverlayEvent ?? appendOverlayEvent)(root, { kind: 'overlay-quarantined', ...record }, { env });
+            try {
+              (deps.publishAttention ?? publishAttention)({ repo: 'web-everything', pr: 0,
+                head: createHash('sha256').update(JSON.stringify(record)).digest('hex'),
+                ref: item.ref, kind: 'overlay-quarantined', title: `Overlay ${item.ref} quarantined`,
+                reason: 'Repeated conflicts with main; rebase the branch to resume application' }, { path: feedPath({ env }) });
+            } catch (e) { alert(`quarantine attention publication failed: ${e.message}`); }
+          }
+          completed.push(item);
+          continue;
+        }
         const adopted = adoptedOverlays?.find(o => o.ref === item.ref);
         if (adopted) Object.assign(item, { wasAdopted: true, adoptedTip: adopted.sha });
         const carrier = item.reason === 'superseded' ? { newRef: item.supersededBy, newTip: item.supersedingTip } : {};
@@ -208,14 +256,13 @@ export function pruneOverlays({ root, env = process.env, dryRun = false, deps = 
         }
         clearPending(root, env, item.ref);
         delete records[item.ref];
-        removed.push(item);
+        completed.push(item);
         (deps.appendOverlayEvent ?? appendOverlayEvent)(root, { kind: 'overlay-pruned', ...item }, { env });
         if (item.wasAdopted) deps.alertAdopted?.(item);
       }
-      const temp = `${file}.${randomUUID()}.tmp`;
-      try { io.writeFileSync(temp, JSON.stringify(records)); io.renameSync(temp, file); }
-      finally { io.rmSync(temp, { force: true }); }
-      return removed;
+      if (overlays.length) persist(file, records);
+      else io.rmSync(file, { force: true });
+      return completed;
     };
     if (dryRun && io.existsSync(`${overlayFilePath(root, env)}.add-guard.lock`)) throw new Error('add guard busy; retry');
     return dryRun ? execute() : withAddGuardLock(root, env, execute, { noWait: true });
