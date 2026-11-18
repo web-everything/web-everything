@@ -3,11 +3,15 @@ import ts from 'typescript';
 import { createHash } from 'node:crypto';
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve, relative } from 'node:path';
+import { isBuiltin } from 'node:module';
 import { agentShellEvidence } from './agent-launch.mjs';
 
 const primitives = /^(?:spawn(?:Sync|Fn|Process|ToCompletion(?:Fn)?)?|exec(?:File(?:Sync)?(?:Throttled)?|Sync|Fn)?|fork|run(?:Fn|Default)?|listing)$/;
 const agent = /(?:^|[^\w-])(?:claude|codex)(?=$|[^\w-])/;
 const wrapper = /(?:^|[/\\])(?:(?:ba|z|da|k)?sh|cmd|powershell|env|nohup|command|exec|xargs|sudo|time|nice|setsid|stdbuf|arch|caffeinate|node|npx|npm|pnpm|yarn|bun)$/;
+const executionModule = /^(?:execa|cross-spawn|shelljs|zx|node-pty|tinyexec|nano-spawn|foreground-child|@npmcli\/promise-spawn)(?:\/|$)/;
+const executionBuiltin = /^(?:node:)?(?:child_process|worker_threads|cluster|vm|process)(?:\/|$)/;
+const benignModule = name => typeof name === 'string' && isBuiltin(name) && !executionBuiltin.test(name);
 export const AGENT_LAUNCH_ALLOWLIST = Object.freeze(['scripts/lib/agent-launch.mjs']);
 
 /** Scan source strings, resolving lexical aliases, constants, defaults and imported bindings with the TS parser. */
@@ -248,7 +252,7 @@ export function findAgentLaunches(sources) {
     }
     return false;
   }
-  const unrelatedCache = new Map();
+  const unrelatedCaches = [new Map(), new Map()];
   const safeGlobals = new Set(['console', 'Math', 'JSON', 'Object', 'Array', 'String', 'Number',
     'Boolean', 'Date', 'RegExp', 'Map', 'Set', 'WeakMap', 'WeakSet', 'Buffer']);
   function valueReference(n) {
@@ -263,50 +267,54 @@ export function findAgentLaunches(sources) {
   }
   // Structural proof, deliberately conservative: opaque parameters, call results, cycles, shared
   // object members and unmodelled syntax require review. No alias-enumeration escape hatch.
-  function unrelated(node, seen = new Set()) {
+  function unrelated(node, seen = new Set(), agentArguments = false) {
     node = unwrap(node);
     if (!node || seen.has(node)) return false;
+    const unrelatedCache = unrelatedCaches[Number(agentArguments)];
     if (unrelatedCache.has(node)) return unrelatedCache.get(node);
     seen = new Set(seen).add(node);
     let safe = false;
     if (isPrimitive(node)) return false;
     if (ts.isIdentifier(node)) {
       const d = declaration(node);
-      safe = d ? unrelated(d, seen) : safeGlobals.has(node.text);
-      if (assignments.has(d)) safe &&= assignments.get(d).every(n => unrelated(n, seen));
+      safe = d ? unrelated(d, seen, agentArguments) : safeGlobals.has(node.text);
+      if (assignments.has(d)) safe &&= assignments.get(d).every(n => unrelated(n, seen, agentArguments));
       if (bindingWrites.has(d) && !assignments.has(d)) safe = false;
     } else if (ts.isExportSpecifier(node)) {
-      safe = !childProcess.test(node.parent.parent.moduleSpecifier?.text);
+      const source = node.parent.parent.moduleSpecifier?.text;
+      safe = benignModule(source) || !agentArguments && !childProcess.test(source) && !executionModule.test(source);
     } else if (ts.isImportSpecifier(node) || ts.isImportClause(node) || ts.isNamespaceImport(node)) {
       const target = imported(node);
-      // An explicitly imported non-child_process API is an unrelated binding. Local sources,
-      // when present, must establish that same proof through their actual definition.
-      safe = target ? unrelated(target, seen) : !childProcess.test(importSource(node));
+      // Only benign builtins prove an unresolved import cannot launch an agent. Other imports
+      // require review with agent arguments; process-exec modules require review for any args.
+      const source = importSource(node);
+      safe = target ? unrelated(target, seen, agentArguments)
+        : benignModule(source) || !agentArguments && !childProcess.test(source) && !executionModule.test(source);
     } else if (ts.isVariableDeclaration(node)) {
-      safe = unrelated(node.initializer, seen) && (assignments.get(node) ?? []).every(n => unrelated(n, seen))
+      safe = unrelated(node.initializer, seen, agentArguments) && (assignments.get(node) ?? []).every(n => unrelated(n, seen, agentArguments))
         && !(bindingWrites.get(node)?.some(n => !ts.isIdentifier(n.left)));
     } else if (ts.isBindingElement(node)) {
-      safe = unrelated(bindingExpression(node, true), seen);
+      safe = unrelated(bindingExpression(node, true), seen, agentArguments);
     } else if (functionNode(node)) {
       safe = true;
       const inspect = n => {
         if (!safe) return;
-        if (ts.isCallExpression(n) && !unrelated(n.expression, seen)) safe = false;
+        if (ts.isCallExpression(n) && !unrelatedCall(n, seen, agentArguments)) safe = false;
         if ((ts.isIdentifier(n) || ts.isPropertyAccessExpression(n) || ts.isElementAccessExpression(n))
           && valueReference(n) && isPrimitive(n)) safe = false;
         ts.forEachChild(n, inspect);
       };
       if (node.body) inspect(node.body); else safe = false;
     } else if (ts.isConditionalExpression(node)) {
-      safe = unrelated(node.whenTrue, seen) && unrelated(node.whenFalse, seen);
+      safe = unrelated(node.whenTrue, seen, agentArguments) && unrelated(node.whenFalse, seen, agentArguments);
     } else if (ts.isBinaryExpression(node) && [ts.SyntaxKind.BarBarToken, ts.SyntaxKind.AmpersandAmpersandToken,
       ts.SyntaxKind.QuestionQuestionToken].includes(node.operatorToken.kind)) {
-      safe = unrelated(node.left, seen) && unrelated(node.right, seen);
+      safe = unrelated(node.left, seen, agentArguments) && unrelated(node.right, seen, agentArguments);
     } else if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
       const members = ts.isPropertyAccessExpression(node) ? [node.name.text] : values(node.argumentExpression);
       safe = !members.includes(null) && members.every(member => {
         const target = importedMember(node.expression, member);
-        return target ? unrelated(target, seen) : unrelated(node.expression, seen);
+        return target ? unrelated(target, seen, agentArguments) : unrelated(node.expression, seen, agentArguments);
       });
     } else if (ts.isNewExpression(node) && ts.isIdentifier(node.expression)
       && node.expression.text === 'RegExp' && !declaration(node.expression)) safe = true;
@@ -315,6 +323,62 @@ export function findAgentLaunches(sources) {
     // No provisional safe assumption can escape a cycle.
     unrelatedCache.set(node, safe);
     return safe;
+  }
+  function unrelatedCall(node, seen = new Set(), agentArguments = false) {
+    // Resolve the callee first. Benign/inspected APIs need no argument expansion; only a binding
+    // whose proof depends on the absence of agent words needs command evidence.
+    return unrelated(node.expression, seen) && (unrelated(node.expression, seen, true)
+      || !(agentArguments || hasAgentArguments(node.arguments)));
+  }
+  function hasAgentArguments(args) {
+    const seen = new Set();
+    const visit = node => {
+      node = unwrap(node);
+      if (!node || seen.has(node)) return false;
+      seen.add(node);
+      // Argument evidence follows values, not arbitrary referenced function/type bodies.
+      if (functionNode(node) || ts.isParameter(node)) return false;
+      if (values(node).some(value => value != null && agent.test(agentShellEvidence(value).unquoted))) return true;
+      if (ts.isIdentifier(node)) return visit(declaration(node));
+      if (ts.isImportSpecifier(node) || ts.isImportClause(node)) return visit(imported(node));
+      if (ts.isVariableDeclaration(node)) return visit(node.initializer);
+      if (ts.isObjectLiteralExpression(node)) return node.properties.some(visit);
+      if (ts.isPropertyAssignment(node)) return visit(node.initializer);
+      if (ts.isShorthandPropertyAssignment(node)) return visit(node.name);
+      if (ts.isArrayLiteralExpression(node)) return node.elements.some(visit);
+      if (ts.isSpreadAssignment(node) || ts.isSpreadElement(node)) return visit(node.expression);
+      if (ts.isConditionalExpression(node)) return visit(node.whenTrue) || visit(node.whenFalse);
+      if (ts.isBinaryExpression(node)) return visit(node.left) || visit(node.right);
+      if (ts.isTemplateExpression(node)) return node.templateSpans.some(span => visit(span.expression));
+      if (ts.isCallExpression(node)) return node.arguments.some(visit);
+      if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+        const members = ts.isPropertyAccessExpression(node) ? [node.name.text] : values(node.argumentExpression);
+        return members.some(member => member != null && visit(importedMember(node.expression, member)));
+      }
+      return false;
+    };
+    return args.some(visit);
+  }
+  function literalOptions(node, seen = new Set()) {
+    node = unwrap(node);
+    if (!node || seen.has(node)) return null;
+    seen.add(node);
+    if (ts.isIdentifier(node)) return literalOptions(declaration(node), seen);
+    if (ts.isVariableDeclaration(node)) return node.parent.flags & ts.NodeFlags.Const && !bindingWrites.has(node)
+      ? literalOptions(node.initializer, seen) : null;
+    return node;
+  }
+  function mayUseShell(args) {
+    const second = literalOptions(args[1]);
+    const option = args[2] ?? (second && ts.isArrayLiteralExpression(second) ? undefined : args[1]);
+    if (!option) return false;
+    const object = literalOptions(option);
+    if (!object || !ts.isObjectLiteralExpression(object)) return true;
+    // Spreads/computed keys/accessors can override shell:false. Unknown evidence is shell-capable.
+    if (object.properties.some(p => !ts.isPropertyAssignment(p) && !ts.isShorthandPropertyAssignment(p)
+      || p.name && ts.isComputedPropertyName(p.name))) return true;
+    const shell = object.properties.findLast(p => p.name?.text === 'shell');
+    return shell ? shell.initializer?.kind !== ts.SyntaxKind.FalseKeyword : false;
   }
   function approvedWrapper(node) {
     node = unwrap(node);
@@ -399,8 +463,7 @@ export function findAgentLaunches(sources) {
           const wrapped = command.some(c => wrapper.test(c)) && values(n.arguments[1]).includes(null);
           // Inspect shell text even if quote concatenation hides the agent name. Keep literal argv
           // opaque to shell syntax: e.g. a glob in a direct git argument is only data.
-          const shellOption = n.arguments.some(arg => ts.isObjectLiteralExpression(unwrap(arg))
-            && unwrap(arg).properties.some(p => p.name?.text === 'shell' && p.initializer?.kind !== ts.SyntaxKind.FalseKeyword));
+          const shellOption = mayUseShell(n.arguments);
           const shellText = /^(?:exec|execSync|execFn)$/.test(primitiveName) || shellOption
             || argumentsEvidence.some(c => c != null && /(?:^|[/\\])(?:ba|z|da|k)?sh$/.test(c))
             || command.some(c => c != null && /\s|[;|&'"`$]/.test(c));
@@ -412,7 +475,7 @@ export function findAgentLaunches(sources) {
           if (unresolved || argumentsEvidence.some(c => c != null && agent.test(c)) || wrapped || hiddenShell) {
             report(n, n.arguments, unresolved ? 'unresolved command; cannot establish launch boundary' : 'agent execution outside agent-launch.mjs');
           }
-        } else if (!unrelated(n.expression)) {
+        } else if (!unrelatedCall(n)) {
           report(n, n.arguments, 'potential execution through an opaque callee; use a literal approved launch binding', true);
         }
       }

@@ -4609,3 +4609,17 @@ options. These require `codex-exec-resume` mode and the matching literal `resume
 `--last` (even alongside an id), and `--all` without an id refuse because session selection cannot
 be verified; supply an explicit session id instead. Keep matching-id controls for both subcommands,
 all invocation forms, and option-value/delimited-prompt controls in the R37 table.
+
+R37.14 refuses Claude's implicit continuation (`--continue`, `-c`, `--fork-session`) in all
+current modes: the selected session cannot be proven. The diagnostic directs callers to explicit
+`--resume <native-id>`; option values and delimited prompt data remain literal controls.
+R37.15 treats unresolved imported callees with raw or de-quoted agent arguments as potential
+launchers, including aliases and uninspected local modules. Known process-exec packages require
+review for any arguments. Node's child_process/worker_threads/cluster/vm/process modules cannot
+establish benign import proof for agent arguments.
+Only benign Node builtins or inspected local definitions establish unrelated imported bindings
+with agent arguments. Route findings through the approved boundary or supply inspectable source.
+R37.16 resolves constant options bindings before inspecting shell capability; unknown, mutable,
+spread or computed options conservatively permit shell execution. Inspect executable and argv
+with shared de-quoting/de-escaping evidence. Bound `shell:false`, unrelated shell commands, and
+benign/inspected imports are positive controls beside the refusal rows.

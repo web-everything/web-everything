@@ -71,6 +71,11 @@ function normaliseOptions(argv, executable) {
     const word = argv[i];
     if (ended) { entries.push({ kind: 'prompt', word }); continue; }
     if (word === '--') { ended = true; entries.push({ kind: 'delimiter', word }); continue; }
+    // These select an implicit session, which a descriptor id cannot prove. Keep continuation
+    // closed until a mode explicitly supports it; callers can use --resume with a literal id.
+    if (executable === 'claude' && /^(?:--continue(?:=|$)|-c(?:=|$)|--fork-session(?:=|$))/.test(word)) {
+      throw new SyntaxError('implicit continuation is unsupported; use --resume with an explicit native session id');
+    }
     const inlineResume = /^(?:--resume=|--session-id=|-r=?)([\s\S]*)/.exec(word);
     if (RESUME_OPTIONS.has(word)) {
       const value = argv[i + 1] === '--' ? '' : (argv[++i] ?? '');
@@ -254,7 +259,8 @@ export function launchAgent(descriptor, primitive, ...args) {
   let normalised;
   try { normalised = normaliseInvocation(args, primitive); }
   catch (cause) {
-    refuse('cannot parse native resume id; use literal argv and a plain resume id with an unbound primitive', descriptor, log, cause);
+    refuse('cannot parse native resume id; use literal argv and a plain resume id with an unbound primitive'
+      + (cause.message.startsWith('implicit continuation') ? `; ${cause.message}` : ''), descriptor, log, cause);
   }
   if (!normalised.length) refuse('missing invocation evidence; use explicit literal argv', descriptor, log);
   const nativeIds = normalised.flatMap(command => command.resumeIds);

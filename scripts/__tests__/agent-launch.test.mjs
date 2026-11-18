@@ -105,6 +105,22 @@ it.each([
   { name: 'R37.13 Claude prompt word control', command: 'claude', argv: ['resume', 'unchecked-id'] },
   { name: 'R37.13 exec --last cannot be validated by an accompanying id', mode: 'codex-exec-resume',
     argv: ['exec', 'resume', '--last', SID], resumeId: SID, refused: true },
+  ...[['--continue'], ['-c'], ['--continue=true'], ['--fork-session'], ['--fork-session', '--continue'],
+    ['--fork-session', '-c'], ['--continue', '--resume', SID]].map(argv => ({
+    name: `R37.14 implicit Claude continuation refuses: ${argv.join(' ')}`, command: 'claude',
+    mode: 'claude-print', argv, refused: true, reason: 'use --resume with an explicit native session id',
+  })),
+  { name: 'R37.14 resume mode cannot prove implicit continuation selection', command: 'claude',
+    mode: 'claude-resume', resumeId: SID, argv: ['-c'], refused: true },
+  { name: 'R37.14 shell continuation refuses', command: 'sh',
+    argv: ['-c', 'claude --continue'], mode: 'claude-print', refused: true },
+  { name: 'R37.14 explicit native resume positive control', command: 'claude',
+    mode: 'claude-resume', resumeId: SID, argv: ['--resume', SID] },
+  { name: 'R37.14 continuation flags after delimiter are prompt data control', command: 'claude',
+    mode: 'claude-print', argv: ['--', '--continue', '-c', '--fork-session'] },
+  { name: 'R37.14 continuation flag as option value control', command: 'claude',
+    mode: 'claude-print', argv: ['--system-prompt', '--continue', '--model', '-c'] },
+  { name: 'R37.14 Codex -c remains a value option control', argv: ['-c', 'model=fixture', 'exec', '-'] },
 ])('$name', ({ source, command = 'codex', argv = ['exec', '-'], resumeId = null, mode = 'worker-result-probe',
   refused, mutate, mutateView, mutateShell, shell, guard, reason, opaque, noArgs, closureArg, argvText }) => {
   if (argvText !== undefined) argv = argvText;

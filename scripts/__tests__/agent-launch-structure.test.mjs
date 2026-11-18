@@ -111,14 +111,75 @@ describe('single agent launch boundary', () => {
     { name: 'R37.10 unbound namespace-name callee', source: "cp.spawn('git',[])", bare: true, refused: true },
     { name: 'R37.10 local unrelated function control', source: "function start(){return 'ok'} start('claude',[])" },
     { name: 'R37.10 local unrelated closure control', source: "const start=() => console.log('ok'); start('claude',[])" },
-    { name: 'R37.10 imported unrelated primitive-name control', source: "import {spawn} from 'unrelated'; spawn('claude',[])" },
+    { name: 'R37.15 unknown imported primitive-name callee requires review', source: "import {spawn} from 'unrelated'; spawn('claude',[])", refused: true },
     { name: 'R37.7 imported non-primitive control', source: "import {log as start} from 'node:console'; start('claude',[])" },
+    ...['execa', 'cross-spawn', 'shelljs', 'zx', 'node-pty', 'tinyexec', 'nano-spawn',
+      'foreground-child', '@npmcli/promise-spawn', 'execa/subpath'].map(module => ({
+      name: `R37.15 process-exec module ${module} is never presumed benign`,
+      source: `import launch from '${module}'; launch('git',[])`, refused: true,
+    })),
+    ...['node:worker_threads', 'worker_threads', 'node:cluster', 'cluster', 'node:vm', 'vm',
+      'node:process', 'process'].map(module => ({
+      name: `R37.15 execution builtin ${module} cannot clear agent arguments`,
+      source: `import launch from '${module}'; launch('claude',[])`, refused: true,
+    })),
+    ...[
+      "import {execa} from 'execa'; execa('codex',['exec','resume','unchecked-id'])",
+      "import launch from './uninspected-launcher.mjs'; launch('claude',[])",
+      "import {launch} from 'unknown-package'; launch('git',['claude'])",
+      "import * as tools from 'unknown-package'; tools.launch('git',['codex'])",
+      "import tools from 'unknown-package'; tools['launch']('git',['codex'])",
+      "import launch from 'unknown-package'; const run=launch; const binary='codex'; run(binary,[])",
+      "import launch from 'unknown-package'; const argv=['claude']; launch('git',argv)",
+      "import launch from 'unknown-package'; launch({command:'claude'})",
+      "import launch from 'unknown-package'; const options={command:'codex'}; launch(options)",
+      "import launch from 'unknown-package'; launch('clau'+'de',[])",
+      `import launch from 'unknown-package'; launch('git',[${JSON.stringify("clau'de'")}])`,
+      `import launch from 'unknown-package'; launch(${JSON.stringify('co\\dex')},[])`,
+      "import launch from 'unknown-package'; launch('git'); launch('claude')",
+    ].map(source => ({ name: `R37.15 imported agent argument: ${source}`, source, refused: true })),
+    { name: 'R37.15 benign builtin positive control', source: "import {basename} from 'node:path'; basename('claude')" },
+    { name: 'R37.15 unknown package without agent arguments control', source: "import launch from 'unknown-package'; launch('git',[])" },
+    { name: 'R37.15 agent substring control', source: "import launch from 'unknown-package'; launch('claude-tools',['mycodex'])" },
+    ...[
+      `const options={shell:true}; spawn(${JSON.stringify('clau\\de')},[],options)`,
+      `const options={shell:true}; const alias=options; spawn(${JSON.stringify('clau\\de')},[],alias)`,
+      `const options={shell:true}; spawn('git',[${JSON.stringify('co"dex"')}],options)`,
+      `const options={shell:true}; spawn(${JSON.stringify('clau\\de')},options)`,
+      `spawn(${JSON.stringify('clau\\de')},[],options)`,
+      `spawn('git',[${JSON.stringify("clau'de'")}],options)`,
+      `const options=buildOptions(); spawn(${JSON.stringify('clau\\de')},[],options)`,
+      `let options={shell:false}; spawn(${JSON.stringify('clau\\de')},[],options)`,
+      `const options={shell:false}; options.shell=true; spawn(${JSON.stringify('clau\\de')},[],options)`,
+      `const options={shell:false,...other}; spawn(${JSON.stringify('clau\\de')},[],options)`,
+      `const options={shell:false,[key]:true}; spawn(${JSON.stringify('clau\\de')},[],options)`,
+    ].map(source => ({ name: `R37.16 bound or unknown shell options: ${source}`, source, refused: true })),
+    { name: 'R37.16 bound shell:false keeps escaped executable literal positive control',
+      source: `const options={shell:false}; spawn(${JSON.stringify('clau\\de')},[],options)` },
+    { name: 'R37.16 bound shell:false keeps argv shell syntax literal control',
+      source: `const options={shell:false}; spawn('git',[${JSON.stringify("clau'de'")}],options)` },
+    { name: 'R37.16 known empty options positive control', source: "const options={}; spawn('git',['$tool'],options)" },
+    { name: 'R37.16 literal unrelated shell command control', source: "const options={shell:true}; spawn('git',['status'],options)" },
   ])('$name', ({ source, refused, bare, potentialKinds = [], escape }) => {
     const findings = (bare ? scanAgentLaunches : findAgentLaunches)({ 'scripts/r37-structure.mjs': source });
     if (refused) expect(findings.length).toBeGreaterThan(0);
     else expect(findings).toEqual([]);
     for (const kind of potentialKinds) expect(findings.some(f => f.kind === kind && /opaque callee/.test(f.reason))).toBe(true);
     if (escape) expect(findings.some(f => /primitive reference escapes/.test(f.reason))).toBe(true);
+  });
+
+  it.each([
+    ['R37.15 inspected local function positive control', "export function launch(){return 'ok'}", false],
+    ['R37.15 inspected local re-export of benign builtin positive control', "export {log as launch} from 'node:console'", false],
+    ['R37.15 inspected re-export cannot hide an uninspected launcher', "export {launch} from './missing.mjs'", true],
+    ['R37.15 inspected re-export cannot hide a process-exec module', "export {execa as launch} from 'execa'", true],
+  ])('%s', (_name, implementation, refused) => {
+    const findings = scanAgentLaunches({
+      'scripts/local.mjs': implementation,
+      'scripts/consumer.mjs': "import {launch} from './local.mjs'; launch('claude',[])",
+    });
+    if (refused) expect(findings.some(f => f.file.endsWith('/consumer.mjs') && f.kind === 'launch')).toBe(true);
+    else expect(findings).toEqual([]);
   });
 
   it.each([
