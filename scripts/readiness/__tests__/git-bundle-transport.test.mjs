@@ -85,7 +85,8 @@ describe('R593 bundle ingest on the runner', () => {
       ['nested/escaping', '../../agent-memory-src', false],
       ['newline', 'agent-memory-src\n/../agent-memory-src', false],
       ['nul', 'agent-memory-src\0/../agent-memory-src', false],
-      ['empty', '', false],
+      // An empty target resolves to the link's parent, so it must sit inside the projected directory.
+      ['agent-memory-src/empty', '', false],
       ['no-alias', 'agent-memory-src', null],
       ['prefix-only', 'agent-memory-src', null],
       ['tracked-alias', 'agent-memory-src', true],
