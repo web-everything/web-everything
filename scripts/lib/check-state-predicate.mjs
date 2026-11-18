@@ -159,13 +159,13 @@ const evidenceIdentity = row => {
 };
 
 /** Resolve required evidence without guessing a roster, head, attempt order, or read completeness.
- * Implication is opt-in via allowImplication (default false); only the review-ci-gate adapter opts in.
+ * Every required name needs its own evidence; historical implication options are ignored.
  * rowsComplete is true only after exhausting pages or explicitly fetching every required name.
  */
-export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNames, rosterSource, head, holds = [], optionalNames = [], allowImplication = false } = {}) {
+export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNames, rosterSource, head, holds = [], optionalNames = [], allowEmptyRequiredNames = false } = {}) {
   const perName = Object.create(null), reasons = [];
   const validNames = names => Array.isArray(names) && [...names].every(n => typeof n === 'string' && n.trim());
-  if (!['live', 'cache'].includes(rosterSource) || !validNames(requiredNames) || !requiredNames.length) reasons.push('roster-unavailable');
+  if (!['live', 'cache'].includes(rosterSource) || !validNames(requiredNames) || (!requiredNames.length && allowEmptyRequiredNames !== true)) reasons.push('roster-unavailable');
   if (!sha(head)) reasons.push('missing-head');
   if (rowsHead !== undefined && (!sha(rowsHead) || sha(rowsHead) !== sha(head))) reasons.push('foreign-head');
   if (!Array.isArray(rows)) reasons.push('rows-unavailable');
@@ -185,9 +185,10 @@ export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNa
     }
     let state = 'unknown';
     if (contradictoryEvidence(row) || typeof name !== 'string' || !name.trim() || !Object.hasOwn(CHECK_STATE_TABLE, status)
+      || (row?.conclusion != null && !Object.hasOwn(CHECK_STATE_TABLE.completed, normalize(row.conclusion)))
       || (status === 'completed' && !Object.hasOwn(CHECK_STATE_TABLE.completed, conclusion) && !legacyError)) why.push('malformed');
     else if (status !== 'completed') { state = 'pending'; why.push('pending'); }
-    else if (['cancelled', 'stale'].includes(conclusion)) { state = 'pending'; why.push('needs-rerun'); }
+    else if (['cancelled', 'stale'].includes(conclusion) || (['review-gate', 'merge-gate'].includes(name) && ['timed_out', 'startup_failure', 'action_required'].includes(conclusion))) { state = 'pending'; why.push('needs-rerun'); }
     else if (conclusion === 'success' || (optionalNames.includes(name) && ['neutral', 'skipped'].includes(conclusion))) state = 'pass';
     else { state = 'fail'; why.push(conclusion); }
     const rowHead = sha(row?.head_sha ?? rowsHead);
@@ -195,8 +196,8 @@ export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNa
       // Foreign success is waiting for this head's evidence; foreign failure is unreadable.
       state = state === 'pass' ? 'pending' : 'unknown'; why.unshift('foreign-head');
     }
-    if (state === 'fail' && name === 'review-gate') state = 'held';
-    if (state === 'fail' && name === 'merge-gate') {
+    if (state === 'fail' && name === 'review-gate' && conclusion === 'failure') state = 'held';
+    if (state === 'fail' && name === 'merge-gate' && conclusion === 'failure') {
       const candidates = [row.mergeGateReviewHold, row.mergeGateHoldExcused, ...(Array.isArray(holds) ? holds : [])];
       if (candidates.some(hold => evidenceJob(row) && evidenceInteger(hold?.jobId) === evidenceInteger(evidenceJob(row))
         && sha(hold?.headSha) === sha(head) && Array.isArray(hold?.holdIds) && hold.holdIds.length
@@ -222,9 +223,6 @@ export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNa
       reasons: active.length ? [...new Set(active.flatMap(r => r.reasons))].sort() : ['missing'] };
   };
   for (const name of [...new Set(requiredNames)].sort()) perName[name] = resolveName(name);
-  if (allowImplication === true && Object.hasOwn(perName, 'integration') && !classified.some(r => r.name === 'integration') && resolveName('test').state === 'pass') {
-    perName.integration = { state: 'pass', rows: [], via: 'test', rerunInFlight: false, reasons: [] };
-  }
   return { state: reasons.length ? 'unknown' : worstEvidence(Object.values(perName).map(r => r.state)), perName,
     reasons: [...new Set([...reasons, ...Object.values(perName).flatMap(r => r.reasons)])].sort() };
 }
