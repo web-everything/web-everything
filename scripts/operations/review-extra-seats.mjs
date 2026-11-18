@@ -2,7 +2,7 @@
 import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 import { FINDING_CLASSES, classAction, stricterClass, readFindingClassPolicy, validAlsoClasses } from '../lib/finding-class-policy.mjs';
 import { decodeRecoveryAdmission } from '../lib/drain-red-team-evidence.mjs';
-import { recordRedTeamStatus, readRedTeamStatus, redTeamStatusDir } from '../lib/drain-red-team-evidence.mjs';
+import { recordRedTeamStatus, readRedTeamStatus, redTeamStatusDir, readRedTeamAdmissionRecords } from '../lib/drain-red-team-evidence.mjs';
 import { publishStoredRedTeamResult } from '../lib/red-team-withheld-publish.mjs';
 import { redTeamCheckRunIsEvidence } from '../lib/red-team-check-run.mjs';
 import { normalizeRedTeamResult } from '../lib/review-red-team-on-skip.mjs';
@@ -11,7 +11,7 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { PR_COMMENTS_PAGE_SIZE } from '../lib/review-label-provider.mjs';
 import { execRead } from '../lib/proc-read.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
-import { redTeamCardOnly } from '../lib/review-red-team-policy.mjs';
+import { redTeamCardOnly, redTeamReadReviewable } from '../lib/review-red-team-policy.mjs';
 import { acquireSeatSlot, cleanGitEnv, pruneSeatPool } from '../lib/review-seat-pool.mjs';
 import { ownReviewScratch, removeReviewScratch, retainReviewScratch, REVIEW_SCRATCH_PREFIXES } from '../lib/review-scratch.mjs';
 import { openOperatorSendBacks, renderOperatorSendBackReviewBlock } from '../lib/operator-send-backs.mjs';
@@ -1818,7 +1818,7 @@ export async function speculateRedTeam({
 } = {}, io = createRedTeamIo({ env })) {
   try {
     if (!redTeamEnabled(env)) return { status: 'disabled', reason: `${RED_TEAM_ENV}=${env?.[RED_TEAM_ENV] ?? ''} ${EXTRA_SEATS_ENV}=${env?.[EXTRA_SEATS_ENV] ?? ''}`.trim() };
-    if (!read || typeof read.diffText !== 'string' || !read.diffText.trim()) return { status: 'skipped', reason: 'the review printed no diff' };
+    if (!redTeamReadReviewable(read)) return { status: 'skipped', reason: 'the review printed no scored nonempty diff; inspect the read before retrying' };
     const rev = read.netBasis?.rev;
     if (!isPinnedRev(rev)) return { status: 'skipped', reason: 'the review printed no pinned head commit (netBasis.rev)' };
     const settings = readRedTeamProbes({ env, log: io.log });
@@ -2007,6 +2007,7 @@ export async function speculateRedTeam({
  */
 export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true, record = true } = {}, io = createRedTeamIo()) {
   try {
+    if (!redTeamReadReviewable(loopPayload?.findings?.read)) return { status: 'skipped', reason: 'the review printed no scored nonempty diff; inspect the read before retrying' };
     const verdict = loopPayload?.verdict?.verdict ?? null;
     const claudeFindings = claudeFindingsFromLoop(loopPayload);
     const { rev, provider, model, effort, callId, call, parsed, evidence, quota, durationMs } = pass;
@@ -2168,7 +2169,7 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
     ...base,
     readAiRouting,
     readRecords: ({ strict = false } = {}) => strict
-      ? readStore({ path: storePath ?? resolveScorecardStorePath(env), strict: true }).records : base.readRecords(),
+      ? readRedTeamAdmissionRecords({ env, path: storePath ?? resolveScorecardStorePath(env) }) : base.readRecords(),
     readRedTeamStatus: input => readRedTeamStatus({ ...input, env }),
     readRecoveryComments: readCompleteComments,
     redTeamStatus: input => {

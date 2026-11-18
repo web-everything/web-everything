@@ -46,7 +46,7 @@ describe('head-bound red-team operator labels', () => {
     expect(provider.setLabels).not.toHaveBeenCalled();
   });
   it('shows a card-only head as pending only when the pass is not skipped or has started', () => {
-    const loopPayload = { findings: { read: { netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] } } };
+    const loopPayload = { findings: { read: { diffScored: true, diffText: '+card', netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] } } };
     const plan = (env, evidence) => planRedTeamStatusLabels({ ...input, labels: [], comments: [], env, evidence: { loopPayload, ...evidence } }).add;
     expect(plan({}, { scheduled: true })).toBeNull();
     expect(plan({ WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, { scheduled: true })).toBe('red-team:pending');

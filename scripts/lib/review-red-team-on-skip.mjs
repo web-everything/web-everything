@@ -25,7 +25,7 @@ import { createPolicyClearPublisher, readRedTeamGateSource, readRedTeamRecoveryF
   POLICY_CLEAR_HOLD_OWED } from './red-team-check-run.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
-import { failedRedTeamRetry, redTeamStatusWithoutRun, completedRedTeamSeat } from './red-team-run-result.mjs';
+import { skippedRedTeamRetry, failedRedTeamRetry, redTeamStatusWithoutRun, completedRedTeamSeat } from './red-team-run-result.mjs';
 
 import { redTeamRequired, VERDICTS } from './jury-core.mjs';
 import { isLaterVerdictBody, latestAcceptRecord, laterReviewHold } from './accept-carry-forward.mjs';
@@ -746,9 +746,9 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       let mode;
       if (movedCardOnly && (status != null || evidence.completedRecorded === true)) return skip('live head already has red-team state');
       if (comment === 'posted') return skip('result posted; comment not visible yet');
-      // Only one explicitly failed seat permits a fresh retry. Successful execution
+      // A non-policy skip or one explicitly failed seat permits a bounded fresh retry. Successful execution
       // can resume effects even when its verdict contains confirmed breaks.
-      if (movedCardOnly || failedRedTeamRetry(status, evidence)) mode = 'fresh';
+      if (movedCardOnly || skippedRedTeamRetry(status, evidence) || failedRedTeamRetry(status, evidence)) mode = 'fresh';
       else if (status?.status === 'finished' && (['ran', 'resumed'].includes(prior) || status.result === 'resumed')
         && (completedSeat || (!placeholder && typeof status.result === 'object'
           && evidence.recorded === true && evidence.completedRecorded !== false))) {

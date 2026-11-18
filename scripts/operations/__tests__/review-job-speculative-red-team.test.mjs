@@ -27,7 +27,7 @@ const REV = 'a'.repeat(40);
 const NOW = Date.parse('2026-10-10T14:00:00Z');
 
 const read = (rev = REV) => ({
-  title: 'fix the thing', body: 'Claims: adds a guard.', diffText: 'diff --git a/x.mjs b/x.mjs\n+export const f = (n) => 10 / n;\n',
+  diffScored: true, title: 'fix the thing', body: 'Claims: adds a guard.', diffText: 'diff --git a/x.mjs b/x.mjs\n+export const f = (n) => 10 / n;\n',
   netChangedFiles: ['x.mjs'], netBasis: { base: 'b'.repeat(40), rev },
 });
 const payload = (verdict, r = read()) => ({

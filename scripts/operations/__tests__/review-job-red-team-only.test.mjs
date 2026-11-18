@@ -24,7 +24,9 @@ vi.mock('../../lib/atomic-json-file.mjs', async importOriginal => {
 });
 
 const repo = 'web-everything/web-everything', head = 'a'.repeat(40), pr = 5762;
-const payload = () => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
+const payload = () => ({ verdict: { verdict: 'accept' }, findings: { read: {
+  diffScored: true, diffText: '+code', netBasis: { rev: head },
+} } });
 
 // Migrate legacy normalized fixtures to raw witnesses; the production reader is exercised below
 // and in review-recovery-witness.test.mjs. Each queued fixture persists its panel read first.
@@ -1137,7 +1139,7 @@ describe('red-team-only review job', () => {
     const source = `
       import { speculateRedTeam } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../review-extra-seats.mjs')).href)};
       const result = await speculateRedTeam({ repo: ${JSON.stringify(repo)}, pr: ${pr},
-        read: { diffText: '+code', netBasis: { rev: ${JSON.stringify(head)} } }, resumeOnly: true, env: {} }, {
+        read: { diffScored: true, diffText: '+code', netBasis: { rev: ${JSON.stringify(head)} } }, resumeOnly: true, env: {} }, {
         now: () => 1000, log: () => {}, readRecords: () => [{ dispatchKind: 'review-seat',
           seat: 'red-team', repo: 'frontier-ui/frontierui', pr: ${pr}, rev: ${JSON.stringify(head)}, status: 'ok' }],
         cliAvailable: () => { throw Error('must refuse before provider selection'); },

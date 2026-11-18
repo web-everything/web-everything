@@ -4567,3 +4567,20 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+## Finished skipped red-team recovery
+
+Non-policy skips with a pinned, scored, nonempty read may spend one durable retry.
+Keep the admission-file round-trip and spent-budget cases in `review-job-red-team-skip.test.mjs`,
+planner refusals in `review-red-team-on-skip.test.mjs`, and the durable stall notice in
+`drain-merge-strategy.test.mjs`. Empty or unscored reads remain owed and cannot retry or publish
+clearance; `review-red-team.test.mjs` also tests an accepting speculative response against them.
+Inspect the stored read when this guard refuses. Admission validates the store bytes before using
+the existing non-strict scorecard reader; missing, malformed or unreadable history never proves zero
+seats. Keep the reader/planner/queued-admission/runner matrix in `review-job-red-team-skip.test.mjs`.
+Inspect or restore the scorecard store before retrying when history cannot be read.
+Positive recovery and card-only fixtures must include a scored, nonempty read. Scheduled work
+with empty or unscored input stays owed even when its paths are all cards; test its pending label
+and non-policy settlement without changing the read guard's no-call/no-publication assertions.
+Point `WE_SHARED_RUNS_DIR` at `<fixture>/runs`: status and skip markers are siblings of the runs
+directory, so pointing it at the fixture root leaks deduplication state across test cases.

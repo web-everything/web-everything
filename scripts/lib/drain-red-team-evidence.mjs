@@ -26,12 +26,20 @@ export function pidExistence(pid, kill = (p, s) => process.kill(p, s)) {
     throw Error(`pid existence unknown: ${error?.code ?? 'unreadable'}`);
   }
 }
-import { redTeamEnabled, redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
+import { redTeamEnabled, redTeamOwedFor, redTeamCardOnly, redTeamReadReviewable } from './review-red-team-policy.mjs';
 import { readRedTeamProbes, redTeamForHead, redTeamResultCommentForHead } from './red-team-gate.mjs';
 import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
 import { completedRedTeamSeat } from './red-team-run-result.mjs';
 import { latestAcceptRecord } from './accept-carry-forward.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
+
+/** Admission needs observed history, including an explicitly empty store. Do not infer absence of seats from a failed read. */
+export function readRedTeamAdmissionRecords({ env = process.env, path = resolveScorecardStorePath(env), read = readFileSync } = {}) {
+  const text = read(path, 'utf8');
+  if (!Array.isArray(JSON.parse(text)?.records)) throw Error('red-team seat history malformed; inspect the scorecard store before retrying');
+  // Feed the same validated bytes to the existing reader; no second filesystem read or store-policy change.
+  return readStore({ path, exists: () => true, read: () => text }).records;
+}
 
 export const redTeamStatusDir = (env = process.env) => join(dirname(sharedRunsDir(env)), 'red-team-status');
 /** How `redTeamEnqueueHold` names a hold that is only "result not sealed yet" (PR #6622); a test pins it to that text. */
@@ -501,7 +509,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
 // Match resolveRunsDir's override precedence without migrating runs during a raw read.
 export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir = env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(env),
   list = listRunIds, read = readRun, stat = statSync, scanSettings = { env }, warn, now = Date.now(),
-  readScorecards = () => readStore({ path: resolveScorecardStorePath(env), strict: true }).records } = {}) {
+  readScorecards = () => readRedTeamAdmissionRecords({ env }) } = {}) {
   const key = { repo, pr, head }, path = statusPath(key, env), bytes = optionalBytes(path);
   const parsed = bytes === null ? null : JSON.parse(bytes);
   // The writer file's mtime is the age of a record whose pid cannot be probed here (foreign host name). Unreadable stays unknown.
@@ -928,7 +936,7 @@ export function historicalCardOnlySkipCandidate(old) {
 /** Absence of a review payload is not an accept. Labels alone never schedule a post-accept pass. */
 export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   runsDir = resolveRunsDir(), list = listRunIds, read = readRun, stat = statSync, lookup, scanSettings = { env }, warn, now = Date.now(), isAlive = pidExistence, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime,
-  readScorecards = () => readStore({ path: resolveScorecardStorePath(env) }).records } = {}) {
+  readScorecards = () => readRedTeamAdmissionRecords({ env }) } = {}) {
   const seats = readScorecards().filter(row => row.dispatchKind === 'review-seat' && row.seat === 'red-team'
     && row.repo === repo && Number(row.pr) === Number(pr) && row.rev === head);
   const recorded = seats.length > 0;
@@ -1006,8 +1014,12 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     // Settlement provenance cannot stand in for a panel verdict, even if an older
     // writer retained one. Keep the status intact for recovery's provenance checks.
     const loopPayload = status.loopPayload?.carriedFrom != null ? { ...status.loopPayload, verdict: null } : status.loopPayload;
+    // A skip with no policy settlement still owes its pass while recovery retries or escalates.
+    const skippedOwed = resultStatus === 'skipped' && redTeamOwedFor(loopPayload)
+      && !(status.skipCardOnly === true && redTeamReadReviewable(loopPayload?.findings?.read)
+        && redTeamCardOnly(loopPayload?.findings?.read));
     return { status, loopPayload, ...seatEvidence, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
-      ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: ['queued', 'running'].includes(status.status) || ['ran', 'error', 'failed'].includes(resultStatus), recorded: recorded || resultStatus === 'ran' };
+      ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: skippedOwed || ['queued', 'running'].includes(status.status) || ['ran', 'error', 'failed'].includes(resultStatus), recorded: recorded || resultStatus === 'ran' };
   }
   const exactHit = latestRun();
   if (exactHit.ok === false) return exactHit;
