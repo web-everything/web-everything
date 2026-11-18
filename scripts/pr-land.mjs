@@ -72,12 +72,14 @@
  * Exit codes: 0 = merged (or opened --no-wait / opened --park / labelled-on-green / dry-run OK); 2 = required check RED (nothing merged);
  * 3 = unmergeable / gh error / push failed / EMPTY DESCRIPTION (#2324 — nothing merged; recoverable — rebase the
  * ref and re-run, or pass --fallback-git; an empty-body refusal is fixed by editing the PR body and re-running);
+ * 3 also covers canonical-audit-missing / canonical-audit-weakened: run the canonical audit or obtain an exact ruled waiver.
  * 3 also covers soak-declaration: add a break scenario or body waiver before publishing a new PR.
  * 4 = BLOCKED-ON-INFRA (#2659) — the lane ref was PUSHED but `gh pr create` failed on an OUTSIDE dependency (a
  * GitHub outage / network fault). NOT a hard fail: the pushed handle is recorded in the conveyor infra-blocked
  * state, which auto-retries with backoff and resume-opens the PR once infra recovers (nothing is stranded; the
  * drain stays the sole writer to main). A non-zero exit means `main` was left UNTOUCHED.
  */
+import { checkCanonicalAuditForOpen } from './operations/canonical-audit-gate.mjs';
 import { defaultShimDir, resolveOrgAwareShimDir, pathWithOrgAwareShim } from './lib/gh-app-shim.mjs';
 import { publicationTitle, readMainCard } from './operations/machine-pr-title.mjs';
 import { producerBuildContext, checkpointBuildPr } from './operations/build-pr-authorship.mjs';
@@ -92,6 +94,13 @@ import { createSizeAdmissionRunner } from './lib/pr-size-admission.mjs';
 /** Shared, injected admission for direct and operation-based producers. */
 export function admitPrSize(request, effects = {}) {
   return createSizeAdmissionRunner(effects)(request);
+}
+
+/** Pre-create admission also runs before the direct CLI's dry-run branch. */
+export function admitCanonicalAudit(request, { check = checkCanonicalAuditForOpen, refuse } = {}) {
+  const gate = check(request);
+  if (!gate.ok) refuse({ repo: request.repo, merged: false, reason: gate.reason, detail: gate.message }, 3);
+  return gate;
 }
 
 /** Measure the resolved commit published by runCli, against its selected remote base. */
@@ -919,6 +928,8 @@ async function runCli() {
     } catch { /* ledger miss never changes a hold */ }
   };
   if (!refSha) emit({ repo: REPO, merged: false, reason: 'no-such-src', detail: `source commit "${SRC}" not found — pass --sha=<commit> or run from a checkout whose HEAD carries the lane work` }, 3);
+
+  admitCanonicalAudit({ repo: REPO, ref: REF, sha: refSha }, { refuse: emit });
 
   // Derive a title when none was passed: `--fill` can't autofill for a lane/* head (it's remote-only, so
   // gh can't diff it locally). Use the source commit's subject — a meaningful, always-available title —

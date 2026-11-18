@@ -176,7 +176,8 @@ import {
 import { routeNeedsGit } from './needs-git-route.mjs';
 import { capabilityBundleVerdict, capabilityRecord } from './remote-git-bundle.mjs'; // R501: test files that spawn git cannot run on Forge's .git-less snapshot
 import { recordRemoteRun } from '../lib/forge-share.mjs'; // R501: the one durable remote-success row forgeShare reads
-import { createMarkerReaper, markerContent, recordMarkerRun, blockedSlots, heldTombstone, runVerdict } from './forge-slot-markers.mjs';
+import { createMarkerReaper, markerContent, recordMarkerRun, watchMarkerExit, blockedSlots, heldTombstone, runVerdict } from './forge-slot-markers.mjs';
+import { createRunFinisher } from './forge-run-finish.mjs';
 import { classifyWaiterPriority, waiterPriorityClass, validRepairPatterns, DEFAULT_REPAIR_PATTERNS, ADMISSION_PRIORITY_MODES } from './heavy-repair-priority.mjs'; // red-main repair class — kept out of the projection (which the read-only `heavy-queue` op imports) because it needs `node:vm`
 export * from './heavy-queue-projection.mjs';
 export * from './heavy-repair-priority.mjs';
@@ -1243,9 +1244,12 @@ export async function runWithRemoteDecision({
   const cap = policy.settings.remote.maxConcurrent;
   const slotOptions = {lockRoot:remoteRoot,cap,owner,pid:process.pid};
   let unitPolicy;
-  const kind = classifyAdmissionCommandKind(argv.map(shellQuoteWord).join(' '), env);
+  const command = argv.map(shellQuoteWord).join(' ');
+  const kind = classifyAdmissionCommandKind(command, env);
+  const wholeSuite = isWholeSuiteCommand(command, env);
   let lease = null;
   try { lease = readLaneLease(cwd); } catch { /* unknown identity grants no priority */ }
+  const markerTags = buildMarkerTags({kind, env, lease, argv});
   const priority = classifyWaiterPriority({purpose:lease?.purpose,session:lease?.session,holder:lease?.holder,
     envSession:clipIdentity(env?.[HOLD_SESSION_ENV])}, policy.settings.priority).class === 'P0';
   try {
@@ -1261,7 +1265,7 @@ export async function runWithRemoteDecision({
   let healthAt = waitAt;
   let reapedAt = -Infinity;
   const stuck = policy.settings.remote;
-  const markerReaper = createMarkerReaper({root:remoteRoot,host,clock,log,
+  const markerReaper = createMarkerReaper({root:remoteRoot,host,clock,log,finishRun:createRunFinisher({host}),
     stuckMinSlots:stuck.stuckMinSlots,stuckAgeMs:stuck.stuckAgeMs,signalEveryMs:stuck.stuckSignalEveryMs,
     signal:({kind,detail})=>{void appendEvent({kind:'forge-slots-stuck',daemon:'heavy-admission',detail:{reason:kind,host,...detail}});}});
   let overloadWaitLogged = false;
@@ -1355,10 +1359,11 @@ export async function runWithRemoteDecision({
   let terminated = false;
   let executionRun = null;
   const executor = remoteExec ?? createRemoteExec({ policy, cwd, env, lockRoot, log, runOverride: remoteClientOverride });
-  remoteExec = options => executor({...options,slotUnits:units,onRun:run => {
-    options.onRun(run);
-    for (const file of extraMarkers) recordMarkerRun(file,{owner,run});
+  remoteExec = options => executor({...options,slotUnits:units,onRun:(run, metadata) => {
+    try { options.onRun(run, metadata); } catch { /* advisory */ }
+    for (const file of extraMarkers) recordMarkerRun(file,{owner,run,nonce:metadata?.nonce,slot:metadata?.slot});
   }});
+  let exitWatcher;
   const refuseLocal = (reason) => {
     log(`heavy-admission: remote failed (${oneLine(reason)}) - remote termination unconfirmed; refusing local rerun (exit 124). Confirm remote termination before retrying; remote slot-${slot.slot} retained until its .unconfirmed marker is cleared.\n`);
     return { handled: true, exitCode: 124 };
@@ -1370,7 +1375,7 @@ export async function runWithRemoteDecision({
   const cancelController = new AbortController();
   let signalled = null; let onSignal;
   let escalate; const escalatePromise = new Promise((resolve) => { escalate = () => resolve(null); });
-  const signalPromise = new Promise((resolve) => { onSignal = (name) => { if (signalled) { escalate(); return; } signalled = name; resolve({ clientSignal: name }); cancelController.abort(); controller.abort(); }; });
+  const signalPromise = new Promise((resolve) => { onSignal = (name) => { exitWatcher?.record(128 + CLIENT_SIGNAL_NUMBERS[name], name); if (signalled) { escalate(); return; } signalled = name; resolve({ clientSignal: name }); cancelController.abort(); controller.abort(); }; });
   let signalHandlers = [];
   // A kill that lands while a result is being recorded is honoured: exit with the signal code, keeping `terminated` as is.
   const killedExit = () => signalled ? { handled: true, exitCode: 128 + CLIENT_SIGNAL_NUMBERS[signalled], signal: signalled } : null;
@@ -1411,7 +1416,7 @@ export async function runWithRemoteDecision({
     try {
       // A held tombstone for this slot (an in-flight or interrupted reap) still means termination is unconfirmed.
       if(blockedSlots(remoteRoot,slot.slot+1).has(slot.slot))return localFallback('remote-slot-held');
-      writeFileSync(executionMarker,markerContent({owner,pid:process.pid,nowMs:clock(),host}),{flag:'wx',mode:0o600});
+      writeFileSync(executionMarker,markerContent({owner,pid:process.pid,nowMs:clock(),host,...markerTags}),{flag:'wx',mode:0o600});
       primaryCreated = true;
       // A reaper may have parked a tombstone for this slot between the check and the create. Nothing has been
       // dispatched yet, so withdraw our own marker and fall back; the tombstone keeps its evidence.
@@ -1419,11 +1424,12 @@ export async function runWithRemoteDecision({
       for (const n of slot.slots.slice(1)) {
         const file = join(remoteRoot,`slot-${n}.unconfirmed`);
         if (blockedSlots(remoteRoot,n+1).has(n)) throw new Error('Slot held');
-        writeFileSync(file,markerContent({owner,pid:process.pid,nowMs:clock(),host}),{flag:'wx',mode:0o600});
+        writeFileSync(file,markerContent({owner,pid:process.pid,nowMs:clock(),host,...markerTags}),{flag:'wx',mode:0o600});
         extraMarkers.push(file);
         if (heldTombstone(remoteRoot,n)) throw new Error('Slot held');
       }
       outstanding = true;
+      exitWatcher = watchMarkerExit({files:[executionMarker, ...extraMarkers], owner, clock});
     } catch { return localFallback('remote-execution-marker-unwritable'); }
     signalHandlers = Object.keys(CLIENT_SIGNAL_NUMBERS).map((name) => { const h = () => onSignal(name); process.on(name, h); return [name, h]; });
     const timeout = new Promise((resolve) => {
@@ -1436,8 +1442,8 @@ export async function runWithRemoteDecision({
       executionRun = null;
       return Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, cancelSignal: cancelController.signal, transport: policy.settings.remote.transport, bundleMainMaxAgeMs: policy.settings.remote.bundle.mainMaxAgeMin * 60_000,
       onWarning: (reason, detail) => recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock}),
-      onCapabilities: capabilities => writeRunnerCapabilities({ root: remoteRoot, host, capabilities, clock }), onRun: run => {
-        if (recordMarkerRun(executionMarker, {owner, run})) executionRun = run;
+      onCapabilities: capabilities => writeRunnerCapabilities({ root: remoteRoot, host, capabilities, clock }), onRun: (run, metadata) => {
+        if (recordMarkerRun(executionMarker, {owner, run, nonce:metadata?.nonce, slot:metadata?.slot})) executionRun = run;
       } }));
     };
     let remote = dispatch();
@@ -1447,7 +1453,7 @@ export async function runWithRemoteDecision({
     const busyBudget = policy.settings.remote.busyWaitMs ?? 0;
     const busyStart = clock();
     const isBusy = (r) => r?.mode === 'not-started' && r.terminated === true && (r.reason === 'forge-busy'
-      || ((kind === 'FULL' || kind === 'coverage') && ['sibling-inventory-failed', 'git-head-unavailable'].includes(r.reason)));
+      || (wholeSuite && ['sibling-inventory-failed', 'git-head-unavailable'].includes(r.reason)));
     while (isBusy(result) && busyBudget > 0) {
       const spent = clock() - busyStart;
       const backoff = Math.max(1000, policy.settings.remote.busyBackoffMs ?? 45000);
@@ -1551,8 +1557,9 @@ export async function runWithRemoteDecision({
     clearTimeout(timer); clearInterval(heartbeat);
     for (const [name, h] of signalHandlers) process.removeListener(name, h);
     if (!outstanding || terminated) {
+      exitWatcher?.stop();
       for (const file of extraMarkers) {
-        try { try {unlinkSync(`${file}.run`);} catch {} unlinkSync(file); }
+        try { try {unlinkSync(`${file}.run`);} catch {} try {unlinkSync(`${file}.exit`);} catch {} unlinkSync(file); }
         catch { log(`heavy-admission: remote unit marker retained; operator cleanup required\n`); }
       }
       if (!outstanding) {if (primaryCreated) {try {unlinkSync(executionMarker);} catch {}} releaseUnits();}
@@ -1561,13 +1568,13 @@ export async function runWithRemoteDecision({
       // Unconfirmed results, throws and client death leave the pre-dispatch
       // marker intact across PID reclaim and lease expiry. Only confirmed
       // completion/termination can make this index available again.
-      try {try{unlinkSync(`${executionMarker}.run`);}catch{/* none */}unlinkSync(executionMarker);outstanding = false;}
+      try {try{unlinkSync(`${executionMarker}.run`);}catch{/* none */}try{unlinkSync(`${executionMarker}.exit`);}catch{/* none */}unlinkSync(executionMarker);outstanding = false;}
       catch {log(`heavy-admission: remote slot-${slot.slot} retained; execution confirmed terminated but its .unconfirmed marker could not be removed; operator cleanup required\n`);}
       if(!outstanding)releaseUnits();
     }
   }
   recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock});
-  if ((kind === 'FULL' || kind === 'coverage') && ['sibling-inventory-failed', 'bundle-credential-hit', 'bundle-credential-scan-too-large', 'git-head-unavailable'].includes(reason)) {
+  if (wholeSuite && ['sibling-inventory-failed', 'bundle-credential-hit', 'bundle-credential-scan-too-large', 'git-head-unavailable'].includes(reason)) {
     log(`heavy-admission: refusing local fallback (${oneLine(reason)})\n`);
     return { handled: true, exitCode: 125 };
   }
@@ -2648,6 +2655,21 @@ function recordReleasedHold(lockRoot, entry, nowMs = Date.now()) {
 export const HOLD_SESSION_ENV = 'WE_HEAVY_SESSION';
 export const HOLD_DISPATCH_KIND_ENV = 'WE_HEAVY_DISPATCH_KIND';
 export const HOLD_RUN_ID_ENV = 'WE_HEAVY_RUN_ID';
+
+/**
+ * The advisory trace tags a remote slot marker carries (caller, lane, PR). `markerContent` drops any tag the marker
+ * reader would reject, so a boundary value here (ppid 0, an empty or overlong session) can never make a marker unreadable.
+ */
+export function buildMarkerTags({kind, env, lease, argv = [], ppid = process.ppid}) {
+  const cleanTag = value => typeof value === 'string' && value.trim() && !/[\x00-\x1f\x7f]/.test(value) ? value.trim().slice(0, 200) : undefined;
+  const session = cleanTag(env?.[HOLD_SESSION_ENV]) ?? cleanTag(lease?.session);
+  const cmd = basename(String(argv[0] ?? '').trim().split(/\s+/)[0]).replace(/[\x00-\x1f\x7f\\]/g, '').slice(0, 40);
+  const lane = Number.isSafeInteger(lease?.lane) && lease.lane >= 0 ? lease.lane : cleanTag(lease?.lane);
+  const prValue = lease?.pr ?? lease?.prNumber ?? env?.WE_PR_NUMBER ?? env?.PR_NUMBER;
+  const pr = /^[1-9]\d*$/.test(String(prValue ?? '')) && Number.isSafeInteger(Number(prValue)) ? Number(prValue) : undefined;
+  return {caller: {...(kind ? {kind} : {}), ...(session ? {session} : {}), ppid, ...(cmd ? {cmd} : {})},
+    ...(lane !== undefined ? {lane} : {}), ...(pr !== undefined ? {pr} : {})};
+}
 
 const clipIdentity = (v) => { const s = String(v ?? '').trim(); return s ? s.slice(0, 200) : null; };
 
