@@ -20,21 +20,22 @@ the daemon on standby. Cached ownership, throttles, locks and fences are removed
   `we:scripts/operations/__tests__/daemon-preflight.test.mjs` (omit the locus prefix in shell arguments).
 - A fresh read naming the local ID activates; another ID or unset owner stays standby.
   Success followed by failure must never reuse the earlier grant, including after restart.
-- Ownership sources implement `readOwner(): Promise<{host, version}>`. The GitHub
+- Ownership sources implement `readOwner(): Promise<{host, version, legacyOwnerValues?}>`. The GitHub
   adapter reads `host` on `daemon-host-owner`, pinning contents to the observed commit.
 - Generate a random UUID once in `~/.claude/host-id`, mode 600. Publish without
   overwriting another process's ID. Malformed or inaccessible identity fails closed.
-- Deprecated aliases come only from the local, uncommitted environment variable
-  `WE_DAEMON_LEGACY_OWNER_VALUES` (comma-separated `alias=uuid` bindings, at most
-  1024 characters total; each alias at most 253 lowercase letters, digits, dots or
-  hyphens, starting and ending with a letter or digit, never a UUID; each UUID a
-  valid host ID; no duplicate aliases). Unset or malformed configuration disables
-  migration. An alias only names a host and never replaces the UUID check: a fresh
-  legacy owner activates this host only when the alias is bound to this host's UUID
-  and equals the name `scutil --get HostName` reports. If `scutil` fails the guard
-  stays standby; the OS hostname is never used as a fallback.
+- Deprecated aliases require bindings from the same shared ownership record as the
+  owner, never from per-host configuration. The `host` file has the owner on line one
+  and optional comma-separated `alias=uuid` bindings on line two. Both are read from
+  the same commit; the encoded file remains bounded to 1024 characters. Each alias
+  has at most 253 lowercase letters, digits, dots or hyphens, starting and ending with
+  a letter or digit, never a UUID; each UUID is a valid host ID. Missing, malformed or
+  duplicate bindings produce standby `owner-alias-ambiguous`. Local
+  `WE_DAEMON_LEGACY_OWNER_VALUES` cannot grant ownership. An alias activates only its
+  shared UUID match and must equal the name `scutil --get HostName` reports. If
+  `scutil` fails the guard stays standby; the OS hostname is never a fallback.
 - Preflight reads existing identity without provisioning it, uses the same resolver,
-  reports unreadable ownership as a failed check, and continues unrelated checks.
+  reports unreadable or ambiguous ownership as a failed check, and continues unrelated checks.
 - Clone discovery errors remain explicit failures; valid stale overlays and sidecars
   remain excluded.
 
@@ -45,8 +46,9 @@ the daemon on standby. Cached ownership, throttles, locks and fences are removed
 
 ## Edge cases
 
-1. Owner contents must be a canonical base64 encoding of one ID, optionally ending
-   in LF or CRLF. Unknown values, extra lines and invisible characters fail closed.
+1. Owner contents must be canonical base64: one UUID, or an alias with an optional
+   second bindings line, optionally ending in LF or CRLF. Missing alias bindings,
+   extra lines and invisible characters fail closed; the UUID-only format is unchanged.
 2. GitHub, local-name migration, git and SSH subprocesses retain 15-second and 1 MiB
    limits. Resolver reads time out; expired or backwards elapsed time fails closed.
 3. Identity publication uses a unique mode-600 temporary file and an atomic no-overwrite
@@ -63,6 +65,9 @@ permissions, malformed files and migration. The preflight suite retains strict d
 output sanitation, executable detection, checkout-root validation and subprocess bounds.
 The registered `host-handoff-cache-write-race` soak now exercises two opaque identities
 through success, handoff, outage, unset and recovery with a fresh read on each call.
+It also exercises conflicting local alias bindings, a single shared binding, duplicate
+shared bindings and direct UUID ownership through the real decision and preflight paths.
+The wrapper pins a renamed ownership-source export as a failing required break.
 Obsolete cache, lock and fence scenarios are deleted.
 
 ## Duplicate admission

@@ -409,20 +409,18 @@ describe('preflight CLI IO hooks', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it('preflight supports migration aliases through the same resolver', async () => {
+  it('preflight supports shared migration bindings through the same resolver', async () => {
     for (const alias of ['legacy-alpha', 'legacy-beta']) {
-      const io = cliIO({ WE_DAEMON_LEGACY_OWNER_VALUES: `legacy-alpha=${ME},legacy-beta=${ME}` }, {
-        source: { readOwner: () => ({ host: alias, version: VERSION }) }, legacyHost: alias,
+      const io = cliIO({ WE_DAEMON_LEGACY_OWNER_VALUES: `${alias}=${OTHER}` }, {
+        source: { readOwner: () => ({ host: alias, version: VERSION, legacyOwnerValues: { [alias]: ME } }) }, legacyHost: alias,
       });
       expect((await io.resolveRole({ thisHost: ME })).role).toBe('active');
     }
   });
 
-  it.each([[undefined, 'owner-unreadable'], ['', 'owner-unreadable'], [`legacy-beta=${ME}`, 'owner-unreadable'],
-    [`legacy-alpha=${ME}\n`, 'owner-unreadable'], ['legacy-alpha', 'owner-unreadable'],
-    // A valid alias bound to another host's UUID is a different host, never this one.
-    [`legacy-alpha=${OTHER}`, 'owner-is-other-host'], [`legacy-alpha=${ME}`, 'fresh-owner-is-this-host']])(
-    'default source and resolver share the preflight alias configuration %j', async (configured, reason) => {
+  it.each([undefined, '', `legacy-beta=${ME}`, `legacy-alpha=${ME}\n`, 'legacy-alpha',
+    `legacy-alpha=${OTHER}`, `legacy-alpha=${ME}`])(
+    'default source and resolver ignore per-host alias configuration %j', async (configured) => {
       const alias = 'legacy-alpha';
       const env = configured === undefined ? {} : { WE_DAEMON_LEGACY_OWNER_VALUES: configured };
       const adapter = cliIO(env, { legacyHost: alias, execFileSync: (_file, args) => JSON.stringify(
@@ -430,9 +428,37 @@ describe('preflight CLI IO hooks', () => {
           : { type: 'file', encoding: 'base64', content: Buffer.from(alias + '\n').toString('base64') },
       ) });
       expect(await adapter.resolveRole({ thisHost: ME })).toMatchObject({
-        role: reason === 'fresh-owner-is-this-host' ? 'active' : 'standby', reason });
+        role: 'standby', reason: 'owner-alias-ambiguous' });
     },
   );
+
+  it.each([
+    [`legacy-alpha=${ME}`, ['active', 'standby']],
+    [`legacy-alpha=${ME},legacy-alpha=${OTHER}`, ['standby', 'standby']],
+  ])('two preflights use only shared bindings %j despite conflicting local configuration', async (bindings, expected) => {
+    const decisions = await Promise.all([ME, OTHER].map(async (thisHost) => {
+      const adapter = cliIO({ WE_DAEMON_LEGACY_OWNER_VALUES: `legacy-alpha=${thisHost}` }, {
+        legacyHost: 'legacy-alpha', execFileSync: (_file, args) => JSON.stringify(
+          args[1].includes('/git/ref/') ? { object: { type: 'commit', sha: VERSION } }
+            : { type: 'file', encoding: 'base64', content: Buffer.from(`legacy-alpha\n${bindings}\n`).toString('base64') }),
+      });
+      return adapter.resolveRole({ thisHost });
+    }));
+    expect(decisions.map(({ role }) => role)).toEqual(expected);
+    if (expected[0] === 'standby') expect(decisions.map(({ reason }) => reason)).toEqual([
+      'owner-alias-ambiguous', 'owner-alias-ambiguous',
+    ]);
+  });
+
+  it('preflight exits nonzero for an ambiguous shared owner alias', async () => {
+    const adapter = cliIO({}, { legacyHost: 'legacy-alpha',
+      source: { readOwner: () => ({ host: 'legacy-alpha', version: VERSION }) },
+    });
+    const { io } = fixture({ resolveRole: adapter.resolveRole });
+    const lines = [];
+    expect(await main({ thisHost: ME, io, env: ENV, log: (line) => lines.push(line) })).toBe(1);
+    expect(lines[0]).toContain('FAIL role role=standby reason=owner-alias-ambiguous');
+  });
 
   it('default source wires bounded GitHub reads and pinned contents into preflight', async () => {
     const calls = [];

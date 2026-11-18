@@ -19,6 +19,7 @@ const LEGACY_NAMES = ['legacy-alpha', 'legacy-beta'];
 const LEGACY_ALIASES = Object.freeze({ 'legacy-alpha': ME, 'legacy-beta': ME });
 const LEGACY_ENV = LEGACY_NAMES.map((name) => name + '=' + ME).join(',');
 const record = (host = ME) => ({ host, version: VERSION });
+const aliasRecord = (host = LEGACY_NAMES[0], legacyOwnerValues = LEGACY_ALIASES) => ({ ...record(host), legacyOwnerValues });
 const resolve = (readOwner, extra = {}) => guard.resolveHostRole({
   thisHost: ME, source: { readOwner }, ...extra,
 });
@@ -27,6 +28,37 @@ function home() { const root = mkdtempSync(join(tmpdir(), 'host-id-')); roots.pu
 afterEach(() => { vi.useRealTimers(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
 describe('fresh ownership only', () => {
+  it('two local alias bindings cannot authorize either host; one shared binding authorizes only its UUID', () => {
+    const owner = 'legacy-alpha';
+    const decide = (thisHost, ownerRecord) => guard.decideHostRole({ thisHost, owner,
+      ownerReadAt: NOW, now: NOW, legacyHost: owner, legacyOwnerValues: { [owner]: thisHost }, ownerRecord });
+    expect([decide(ME), decide(OTHER)]).toEqual([
+      { role: 'standby', reason: 'owner-alias-ambiguous' },
+      { role: 'standby', reason: 'owner-alias-ambiguous' },
+    ]);
+    const shared = { ...record(owner), legacyOwnerValues: { [owner]: ME } };
+    expect(decide(ME, shared)).toEqual({ role: 'active', reason: 'fresh-owner-is-this-host' });
+    expect(decide(OTHER, shared)).toEqual({ role: 'standby', reason: 'owner-is-other-host' });
+    expect(guard.decideHostRole({ thisHost: ME, owner: ME, now: NOW, ownerReadAt: NOW }).role).toBe('active');
+  });
+
+  it.each([undefined, {}, { 'legacy-alpha': [ME, OTHER] }, { 'legacy-alpha': ME + ',' + OTHER },
+    { 'legacy-alpha': ME + '\n' }, Object.create({ 'legacy-alpha': ME })])(
+    'missing or ambiguous shared alias binding %j fails closed despite a local binding', (bindings) => {
+      expect(guard.decideHostRole({ thisHost: ME, owner: 'legacy-alpha', now: NOW, ownerReadAt: NOW,
+        legacyHost: 'legacy-alpha', legacyOwnerValues: LEGACY_ALIASES,
+        ownerRecord: { ...record('legacy-alpha'), legacyOwnerValues: bindings },
+      })).toEqual({ role: 'standby', reason: 'owner-alias-ambiguous' });
+    },
+  );
+
+  it('shared bindings must belong to the record naming the observed owner', () => {
+    expect(guard.decideHostRole({ thisHost: ME, owner: 'legacy-alpha', now: NOW, ownerReadAt: NOW,
+      legacyHost: 'legacy-alpha', legacyOwnerValues: LEGACY_ALIASES,
+      ownerRecord: { ...record('legacy-beta'), legacyOwnerValues: LEGACY_ALIASES },
+    })).toEqual({ role: 'standby', reason: 'owner-alias-ambiguous' });
+  });
+
   it('fresh local owner activates; another owner and unset stay standby', async () => {
     expect((await resolve(() => record())).role).toBe('active');
     expect(await resolve(() => record(OTHER))).toMatchObject({ role: 'standby', reason: 'owner-is-other-host' });
@@ -119,8 +151,8 @@ describe('opaque local identity', () => {
       return 'legacy-alpha\n';
     });
     try {
-      const decision = await resolve(() => { now += sourceMs; return record('legacy-alpha'); }, {
-        legacyOwnerValues: LEGACY_ALIASES, timeoutMs: 20, clock: () => now,
+      const decision = await resolve(() => { now += sourceMs; return aliasRecord(); }, {
+        timeoutMs: 20, clock: () => now,
       });
       expect(exec).toHaveBeenCalledTimes(1);
       expect(exec).toHaveBeenCalledWith('scutil', ['--get', 'HostName'],
@@ -134,8 +166,8 @@ describe('opaque local identity', () => {
     let now = 1000;
     const exec = vi.spyOn(childProcess, 'execFileSync').mockReturnValue('legacy-alpha\n');
     try {
-      const decision = await resolve(() => { now += sourceMs; return record('legacy-alpha'); }, {
-        legacyOwnerValues: LEGACY_ALIASES, timeoutMs: 20, clock: () => now,
+      const decision = await resolve(() => { now += sourceMs; return aliasRecord(); }, {
+        timeoutMs: 20, clock: () => now,
       });
       expect(exec).not.toHaveBeenCalled();
       expect(decision).toEqual({ role: 'standby', reason: 'owner-unreadable', source: 'remote-failed' });
@@ -211,13 +243,13 @@ describe('opaque local identity', () => {
     } finally { children.forEach((child) => child.kill()); }
   });
 
-  it('legacy migration matches only the locally established alias', async () => {
+  it('shared legacy migration still requires the locally established alias', async () => {
     for (const alias of LEGACY_NAMES) {
-      expect((await resolve(() => record(alias), { legacyOwnerValues: LEGACY_ALIASES, legacyHost: alias })).role).toBe('active');
-      expect((await resolve(() => record(alias), { legacyOwnerValues: LEGACY_ALIASES, legacyHost: '' })).role).toBe('standby');
+      expect((await resolve(() => aliasRecord(alias), { legacyHost: alias })).role).toBe('active');
+      expect((await resolve(() => aliasRecord(alias), { legacyHost: '' })).role).toBe('standby');
     }
-    expect((await resolve(() => record(LEGACY_NAMES[0]), {
-      legacyOwnerValues: LEGACY_ALIASES, legacyHost: LEGACY_NAMES[1],
+    expect((await resolve(() => aliasRecord(LEGACY_NAMES[0]), {
+      legacyHost: LEGACY_NAMES[1],
     })).role).toBe('standby');
   });
 
@@ -227,16 +259,16 @@ describe('opaque local identity', () => {
     const bindings = Object.freeze({ [alias]: ME });
     const legacyHost = guard.getLegacyHost({ exec: () => alias + '\n', legacyOwnerValues: bindings });
     expect(legacyHost).toBe(alias);
-    const roleOf = (thisHost) => guard.resolveHostRole({ thisHost, legacyHost, legacyOwnerValues: bindings,
-      source: { readOwner: () => record(alias) } });
+    const roleOf = (thisHost) => guard.resolveHostRole({ thisHost, legacyHost,
+      source: { readOwner: () => aliasRecord(alias, bindings) } });
     expect(await roleOf(ME)).toMatchObject({ role: 'active', reason: 'fresh-owner-is-this-host' });
     expect(await roleOf(OTHER)).toMatchObject({ role: 'standby', reason: 'owner-is-other-host' });
     // The pure decision agrees: a matching alias name alone never replaces the UUID check.
     expect(guard.decideHostRole({ thisHost: OTHER, owner: alias, ownerReadAt: NOW, now: NOW,
-      legacyHost: alias, legacyOwnerValues: bindings })).toEqual({ role: 'standby', reason: 'owner-is-other-host' });
+      legacyHost: alias, ownerRecord: aliasRecord(alias, bindings) })).toEqual({ role: 'standby', reason: 'owner-is-other-host' });
   });
 
-  it('legacy aliases come only from local environment configuration, defaulting to none', () => {
+  it('the deprecated discovery helper parses local configuration without supplying ownership evidence', () => {
     expect({ ...guard.getLegacyOwnerValues({}) }).toEqual({});
     expect({ ...guard.getLegacyOwnerValues({ WE_DAEMON_LEGACY_OWNER_VALUES: LEGACY_ENV }) }).toEqual(LEGACY_ALIASES);
     vi.stubEnv('WE_DAEMON_LEGACY_OWNER_VALUES', LEGACY_ENV);
@@ -261,8 +293,8 @@ describe('opaque local identity', () => {
       // A stray hostname option must not be honoured: the OS name is never consulted.
       const legacyHost = guard.getLegacyHost({ exec: failure, hostname: osHostname, legacyOwnerValues: LEGACY_ALIASES });
       expect(legacyHost).toBe('');
-      expect(await guard.resolveHostRole({ thisHost: ME, legacyHost, legacyOwnerValues: LEGACY_ALIASES,
-        source: { readOwner: () => record(alias) } })).toMatchObject({ role: 'standby', reason: 'owner-is-other-host' });
+      expect(await guard.resolveHostRole({ thisHost: ME, legacyHost,
+        source: { readOwner: () => aliasRecord(alias) } })).toMatchObject({ role: 'standby', reason: 'owner-is-other-host' });
     }
     expect(osHostname).not.toHaveBeenCalled();
   });
@@ -278,9 +310,9 @@ describe('opaque local identity', () => {
   it('unconfigured aliases fail closed even when the local name matches', async () => {
     const owner = LEGACY_NAMES[0];
     expect(await resolve(() => record(owner), { legacyOwnerValues: {}, legacyHost: owner }))
-      .toMatchObject({ role: 'standby', reason: 'owner-unreadable' });
+      .toMatchObject({ role: 'standby', reason: 'owner-alias-ambiguous' });
     expect(guard.decideHostRole({ thisHost: ME, owner, ownerReadAt: NOW, now: NOW, legacyHost: owner }))
-      .toEqual({ role: 'standby', reason: 'owner-unreadable' });
+      .toEqual({ role: 'standby', reason: 'owner-alias-ambiguous' });
   });
 
   it('legacy discovery bounds argv execution and fails closed on unknown names', () => {
@@ -301,6 +333,42 @@ describe('GitHub ownership source', () => {
     body: { type: 'file', encoding: 'base64', content: Buffer.from(text).toString('base64') } });
   const ref = { ok: true, status: 200, body: { object: { type: 'commit', sha: VERSION } } };
   const source = (responses) => guard.createGitHubOwnershipSource({ ghApi: () => responses.shift() });
+
+  it.each(['\n', '\r\n'])('reads owner and alias bindings from the same pinned file with %j endings', async (newline) => {
+    const api = vi.fn().mockResolvedValueOnce(ref)
+      .mockResolvedValueOnce(file(['legacy-alpha', LEGACY_ENV, ''].join(newline)));
+    const shared = await guard.createGitHubOwnershipSource({ ghApi: api,
+      legacyOwnerValues: { 'legacy-alpha': OTHER } }).readOwner();
+    expect(shared).toEqual(aliasRecord());
+    expect(api).toHaveBeenCalledTimes(2);
+    expect(api.mock.calls[1][0]).toContain('/contents/host?ref=' + VERSION);
+    expect(await resolve(() => shared, { legacyHost: 'legacy-alpha' })).toMatchObject({ role: 'active' });
+    expect(await resolve(() => shared, { thisHost: OTHER, legacyHost: 'legacy-alpha',
+      legacyOwnerValues: { 'legacy-alpha': OTHER } })).toMatchObject({ role: 'standby', reason: 'owner-is-other-host' });
+  });
+
+  it.each([undefined, '', 'legacy-beta=' + ME, 'legacy-alpha=' + ME + ',legacy-alpha=' + OTHER,
+    'legacy-alpha=' + ME + ',legacy-alpha=' + ME, 'legacy-alpha=' + ME + ',',
+    'legacy-alpha=' + ME + '\rjunk', 'legacy-alpha=' + ME + '\u2028',
+    'legacy-alpha=AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA', 'legacy-alpha=not-a-uuid',
+    '`legacy-alpha=' + ME, '"legacy-alpha=' + ME, '--legacy-alpha=' + ME,
+    '../legacy-alpha=' + ME, '\u200blegacy-alpha=' + ME, 'ｌegacy-alpha=' + ME])(
+    'shared alias record with missing, duplicate or malformed bindings %j cannot use local fallback', async (bindings) => {
+      const contents = 'legacy-alpha' + (bindings === undefined ? '' : '\n' + bindings) + '\n';
+      expect(await resolve(() => source([ref, file(contents)]).readOwner(), {
+        legacyHost: 'legacy-alpha', legacyOwnerValues: LEGACY_ALIASES,
+      })).toMatchObject({ role: 'standby', reason: 'owner-alias-ambiguous' });
+    },
+  );
+
+  it('does not reuse shared alias authority after it disappears or the next read fails', async () => {
+    const values = [aliasRecord(), record('legacy-alpha'), aliasRecord('legacy-alpha', { 'legacy-alpha': OTHER }), null];
+    const roles = [];
+    for (const value of values) roles.push(await resolve(() => value, { legacyHost: 'legacy-alpha', legacyOwnerValues: LEGACY_ALIASES }));
+    expect(roles.map(({ reason }) => reason)).toEqual([
+      'fresh-owner-is-this-host', 'owner-alias-ambiguous', 'owner-is-other-host', 'owner-unreadable',
+    ]);
+  });
 
   it('reads owner at the observed commit and returns host and version', async () => {
     const api = vi.fn().mockResolvedValueOnce(ref).mockResolvedValueOnce(file());
