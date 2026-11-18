@@ -486,3 +486,12 @@ describe('readPrFactsFromGithub pagination', () => {
     expect(f.review.state).toBe('changes_requested');
   });
 });
+
+describe('full seed taints shas of vanished cached checks', () => {
+  it('a cached unattached check that a full seed no longer serves tombstones its sha', () => {
+    const sha = 'd'.repeat(40);
+    const prev = { buckets: { checks: { k: { sha, repo: 'o/r', prs: [] } } }, evictedShas: [] };
+    const m = seedMirror({ repo: 'o/r', body: { prs: [], stateCursor: 1 }, nowMs: 1, prev });
+    expect(m.evictedShas).toEqual([sha]);
+  });
+});
