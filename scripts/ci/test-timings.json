@@ -1914,6 +1914,7 @@
   "scripts/conveyor/soak/breaks/refused-stage-pending-referrals-never-resume.soak.test.mjs": 1.5,
   "scripts/conveyor/soak/breaks/red-team-stale-refusal-burns-start-slot.soak.test.mjs": 1.5,
   "scripts/conveyor/soak/breaks/overlay-main-sync-tests-stderr-tail.soak.test.mjs": 1.5,
+  "scripts/conveyor/soak/breaks/overlay-main-sync-killed-run-cause.soak.test.mjs": 1.5,
   "scripts/conveyor/soak/breaks/red-team-clear-reverted-by-unfinished-review.soak.test.mjs": 1.5,
   "scripts/conveyor/soak/breaks/red-team-gate-send-back-failed-never-retried.soak.test.mjs": 1.5,
   "scripts/conveyor/soak/breaks/withdrawn-operator-block-directs-takeover.soak.test.mjs": 0.53,
