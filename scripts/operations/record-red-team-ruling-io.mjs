@@ -17,6 +17,7 @@ import { liveResultGateState, readConfirmedBreaks, readOperatorRulings, readRedT
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { resolveCardRef } from './record-referral-ruling-io.mjs';
 import { CARD_REF_RE, readCardAtPrHead, referralCardReadable } from '../lib/referral-card-readable.mjs';
+import { roundCardsFindingsFingerprint } from '../lib/review-loop-policy.mjs';
 import { trackingRefspec } from '../lib/git-transport-branch.mjs';
 import { assertRulingIdentity, isRulingComment, judgePolicyOnce, assertHumanOperator, isHumanOperatorComment, operatorBoundComments, operatorGhEnv, resolveOperatorIdentity } from '../lib/operator-identity.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
@@ -61,7 +62,7 @@ const git = args => {
 /** Unsuffixed references mean published on main, never the feature checkout. Each resolution (including
  * the final sink recheck) fetches afresh; failed refreshes cannot fall back to stale local evidence.
  * Open-PR cards require the explicit @pr<N> form and retain the shared PR-state/readability checks. */
-const resolveCardDefault = (card, { runGit = git, readOnPr = readCardAtPrHead } = {}) => {
+const resolveCardDefault = (card, { runGit = git, readOnPr = readCardAtPrHead, fingerprint } = {}) => {
   let attempted = false, fetchError;
   const main = args => {
     if (!attempted) {
@@ -80,7 +81,7 @@ const resolveCardDefault = (card, { runGit = git, readOnPr = readCardAtPrHead } 
     if (!CARD_REF_RE.test(ref)) return false;
     // No published-card lookup here: the sink re-resolves the unsuffixed ref through the fresh origin/main fetch
     // below (bornAs included), so a renumbered card still releases; a probe of its own would be a live git read.
-    if (/@pr\d+$/.test(ref)) return referralCardReadable(ref, REPO_ROOT, { readOnPr, readMainByBornAs: () => null });
+    if (/@pr\d+$/.test(ref)) return referralCardReadable(ref, REPO_ROOT, { readOnPr, readMainByBornAs: () => null, fingerprint });
     try { return hasFrontmatter(readText(ref)); }
     catch {
       // Preserve references to provisional cards renumbered on landing, using only main's content.
@@ -118,7 +119,7 @@ export function createRecordRedTeamRulingReader({ tool, log = line => console.er
   readStandingRulingScope = standingRulingScope, readFile = readFileSync,
   readEvents = repo => readJudgeLedgerSync(repo, { env }),
   readScope = () => readScopeLogged(env), runGit = git, readOnPr = readCardAtPrHead,
-  resolveCard = card => resolveCardDefault(card, { runGit, readOnPr }),
+  resolveCard = (card, ctx) => resolveCardDefault(card, { runGit, readOnPr, fingerprint: ctx?.fingerprint }),
   resolveIdentity = actor => resolveOperatorIdentity({ env, ...(actor === JUDGE_ACTOR ? { automation: true } : {}) }), now = () => new Date().toISOString(),
   assertFresh = () => assertOperatorCliFresh(REPO_ROOT, { label: 'record-red-team-ruling', env }) } = {}) {
   return ({ repo, pr, card, actor, asJudge, evidenceFile, break: breakSpec }) => {
@@ -144,13 +145,25 @@ export function createRecordRedTeamRulingReader({ tool, log = line => console.er
           disagreements = Math.max(0, ...indices.map(i => counts.get(i)?.size ?? 0));
         }
       }
+      let fingerprint;
+      if (card !== undefined && card !== '') {
+        try {
+          const { rulable } = rulableBreaks({ comments: operatorBoundComments(thread.comments), repo,
+            labels: thread.labels, pr, head, setting: readSetting().value, scope: scope.value,
+            ruling: 'card', citesCard: true, standingRuling });
+          // Older operation readers omit --break. A sole rulable finding is unambiguous;
+          // multiple findings without a selection leave Longshore unreadable (fail closed).
+          const selected = breakSpec ? selectBreaks(rulable, breakSpec) : rulable.length === 1 ? rulable : [];
+          if (selected.length) fingerprint = roundCardsFindingsFingerprint(selected);
+        } catch { /* selection is not proven; the planner will report the refusal */ }
+      }
       return { head, ...(actor === JUDGE_ACTOR ? { judgeActorPolicy: readJudgeWriterPolicy({ env, tool: tool?.judgeActor, log }) } : {}),
         ...(asJudge ? { judgeNotRealMode: readJudgeNotRealMode({ env, tool, log }),
           evidence: readJudgeEvidence(evidenceFile, readFile), disagreements } : {}),
         cardFileMode: readCardRulingFileMode({ env, tool, log }), cardAllowNonRegression: readCardAllowNonRegression({ env, tool, log }), labels: thread.labels ?? [], comments: thread.comments ?? [],
         standingRuling,
         setting: readSetting().value, scope: { value: scope.value, sources: scope.sources ?? {} }, now: now(), identity: resolveIdentity(actor),
-        card: card === undefined || card === '' ? null : resolveCard(card, { repo, pr, head }) };
+        card: card === undefined || card === '' ? null : resolveCard(card, { repo, pr, head, fingerprint }) };
     };
     let ledger;
     if (asJudge) {
@@ -197,7 +210,7 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
   readStandingRulingScope = standingRulingScope,
   readScope = () => readScopeLogged(env),
   runGit = git, readOnPr = readCardAtPrHead,
-  resolveCard = card => resolveCardDefault(card, { runGit, readOnPr }),
+  resolveCard = (card, ctx) => resolveCardDefault(card, { runGit, readOnPr, fingerprint: ctx?.fingerprint }),
   resolveIdentity = actor => resolveOperatorIdentity({ env, ...(actor === JUDGE_ACTOR ? { automation: true } : {}) }),
   coordinationRoot = resolveCoordinationRoot(), actions = createActionStore({ root: coordinationRoot }), fileCard = spawnStableCardJob,
   post = (repo, pr, body, actor) => gh(['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'], body, env, actor),
@@ -301,7 +314,7 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
         post(p.repo, p.pr, reasonBody(p, `Carded to the existing card \`${p.cardRef}\`; no new card is filed.`), p.actor);
         // The reason POST may outlive the card. Validate the exact planned reference at the release boundary.
         let card;
-        try { card = resolveCard(p.cardRef, { repo: p.repo, pr: p.pr, head: p.head }); }
+        try { card = resolveCard(p.cardRef, { repo: p.repo, pr: p.pr, head: p.head, fingerprint: roundCardsFindingsFingerprint(p.findings) }); }
         catch { throw new Error(`--card ${p.cardRef} could not be re-read; reason posted; no release record written`); }
         if (!card?.readable || card.ref !== p.cardRef) {
           throw new Error(`--card ${p.cardRef} no longer resolves to the same readable backlog card (${card?.reason ?? 'unreadable'}); reason posted; no release record written`);
@@ -384,7 +397,7 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
       try {
         const readableRef = reference => {
           try {
-            const current = resolveCard(reference, { repo: p.repo, pr: p.pr, head: p.head });
+            const current = resolveCard(reference, { repo: p.repo, pr: p.pr, head: p.head, fingerprint: roundCardsFindingsFingerprint(p.findings) });
             return current?.readable === true && current.ref === reference;
           } catch { return false; }
         };

@@ -3,6 +3,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
+import { roundCardsFindingsFingerprint } from '../../lib/review-loop-policy.mjs';
 import * as redTeamGate from '../../lib/red-team-gate.mjs';
 import { buildReviewedShaMarker, buildClearedHumanMarker } from '../../lib/review-escalation.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
@@ -130,7 +131,7 @@ describe('published backing cards at the production reader and release boundary'
   it('keeps explicit open-PR references on the PR readability path', () => {
     const reads = [];
     const io = main();
-    const context = reader({ ...io, readOnPr: (name, pr) => { reads.push([name, pr]); return text; } })(input({ card: `${ref}@pr5829` }));
+    const context = reader({ ...io, readOnPr: (name, pr) => { reads.push([name, pr]); return `---\nstatus: resolved\n---\n${roundCardsFindingsFingerprint(payloadFor().findings)}`; } })(input({ card: `${ref}@pr5829` }));
     expect(context.card).toMatchObject({ ref: `${ref}@pr5829`, foundIn: 'pr-head', readable: true });
     expect(reads).toEqual([[file, '5829']]);
     expect(io.calls).toEqual([]);
@@ -265,7 +266,7 @@ describe('existing-card IO', () => {
       syncLabels: args => labelSyncs.push(args), warn: () => {},
     });
     expect(() => sinks[RED_TEAM_RULING_CARD_EFFECT](plan)).toThrow(/card.*no release record written/);
-    expect(resolutions.at(-1)).toEqual([CARD, { repo, pr: PR, head: HEAD }, 1]);
+    expect(resolutions.at(-1)).toEqual([CARD, { repo, pr: PR, head: HEAD, fingerprint: roundCardsFindingsFingerprint(payloadFor().findings) }, 1]);
     expect(posted).toHaveLength(1);
     expect(posted[0]).not.toContain('outcome=operator-card');
     expect(heldAfter(comments)).toHaveLength(1);
@@ -390,7 +391,7 @@ describe('existing-card IO', () => {
       ? /head moved.*reason posted; no release record written/
       : /no red-team break is held.*reason posted; no release record written/;
     expect(() => sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(refusal);
-    expect(resolutions).toEqual([[CARD, { repo, pr: PR, head: HEAD }, 1]]);
+    expect(resolutions).toEqual([[CARD, { repo, pr: PR, head: HEAD, fingerprint: roundCardsFindingsFingerprint(payloadFor().findings) }, 1]]);
     expect(posted).toHaveLength(1);
     expect(posted[0]).toContain('> card it, ship the PR');
     expect(synced).toEqual([]);
@@ -517,12 +518,12 @@ describe('existing-card IO', () => {
       resolveCard: (ref, context) => { resolutions.push([ref, context]); return card; } })({ repo, pr: PR, card: CARD });
     expect(r).toMatchObject({ head: HEAD, labels: ['review:changes'], comments: thread(), now: 'T', setting: CONFIRMED_BREAKS_DEFAULTS, identity: OP, card });
     expect(reads).toEqual([{ repo, pr: PR }]);
-    expect(resolutions).toEqual([[CARD, { repo, pr: PR, head: HEAD }]]);
+    expect(resolutions).toEqual([[CARD, { repo, pr: PR, head: HEAD, fingerprint: roundCardsFindingsFingerprint(payloadFor().findings) }]]);
   });
 });
 
 describe('standalone CLI', () => {
-  it.each(['readable', 'vanished', 'unsafe'])('handles a Longshore card through the shared reader and writer (%s)', async state => {
+  it.each(['readable', 'vanished', 'unsafe', 'status-only', 'duplicate', 'open', 'quoted-status'])('handles a Longshore card through the shared reader and writer (%s)', async state => {
     const { main } = await import('../record-red-team-ruling-cli.mjs');
     const { createMemoryRunStore } = await import('../run-store.mjs');
     const { createMemoryCallLogStore } = await import('../call-log-store.mjs');
@@ -535,7 +536,12 @@ describe('standalone CLI', () => {
       runGit: () => { throw new Error('Longshore must never read the WE backlog'); },
       readOnPr: (file, pr, options) => {
         reads.push({ file, pr, options, posts: posted.length });
-        return state === 'vanished' && posted.length ? null : '---\nstatus: open\n---\n# Card\n';
+        if (state === 'vanished' && posted.length) return null;
+        const fingerprint = roundCardsFindingsFingerprint(payloadFor().findings);
+        const frontmatter = state === 'duplicate' ? 'status: resolved\nstatus: closed'
+          : state === 'open' ? 'status: open'
+          : state === 'quoted-status' ? 'title: "start\nstatus: resolved\nend"' : 'status: resolved';
+        return `---\n${frontmatter}\n---\n${state === 'status-only' ? '' : fingerprint}`;
       },
     };
     const sinks = createRecordRedTeamRulingSinks({ ...io,
@@ -563,7 +569,7 @@ describe('standalone CLI', () => {
         expect(chunks.join('')).toMatch(state === 'vanished' ? /no release record written/ : /does not resolve to a readable backlog card/);
         expect(heldAfter(comments)).toHaveLength(1);
       }
-      expect(reads).toEqual(state === 'unsafe' ? [] : [0, 1].map(posts => ({
+      expect(reads).toEqual(state === 'unsafe' ? [] : (['readable', 'vanished'].includes(state) ? [0, 1] : [0]).map(posts => ({
         file: '1234-a.md', pr: '77', options: { repo: 'longshoreai/longshore' }, posts,
       })));
     } finally { output.mockRestore(); }

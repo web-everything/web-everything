@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CONSTELLATION_REPOS } from '../constellation-repos.mjs';
 import { execFileSync } from 'node:child_process';
-import { CARD_REF_RE, readCardAtPrHead, readMainCardByBornAs, referralCardReadable } from '../referral-card-readable.mjs';
+import { CARD_REF_RE, cardResolvesFinding, readCardAtPrHead, readMainCardByBornAs, referralCardReadable } from '../referral-card-readable.mjs';
 
 const CARD = '---\nstatus: open\n---\n# card\n';
 const SHA = 'b'.repeat(40);
@@ -60,10 +60,42 @@ describe('referralCardReadable @pr<N> (xc7ctn1)', () => {
     })).toBe(false);
   });
 
-  it.each(['open', '"active"', "'parked' # waiting", 'resolved'])('accepts a real longshore top-level status: %s', status => {
+  it.each(['resolved', '"closed"', "'folded'"])('accepts a terminal Longshore card naming the fingerprint: %s', status => {
     expect(referralCardReadable('longshore:backlog/xabcdef-card.md@pr7', root, {
-      readOnPr: () => `---\ntitle: |\n  status: unknown\nstatus: ${status}\n---\n# card\n`,
+      fingerprint: 'finding-123', readOnPr: () => `---\nstatus: ${status}\n---\nfinding-123`,
     })).toBe(true);
+  });
+
+  it.each(['open', 'resolved', 'closed', 'folded'])('fails closed without a fingerprint option: %s', status => {
+    expect(referralCardReadable('longshore:backlog/xabcdef-card.md@pr7', root, {
+      readOnPr: () => `---\nstatus: ${status}\n---\n`,
+    })).toBe(false);
+  });
+
+  it.each([
+    'status: resolved\nstatus: closed', 'status: open', 'title: "start\nstatus: resolved\nend"',
+    "title: 'start\nstatus: resolved\nend'", 'title: |\n  status: resolved',
+    'status: resolved\nignored garbage', 'status: resolved\n  nested: value',
+    'status: resolved\n# ignored comment', 'status: resolved\n\nextra: value',
+  ])('rejects malformed, nonterminal or scalar-contained status: %s', frontmatter => {
+    expect(cardResolvesFinding(`---\n${frontmatter}\n---\nfinding-123`, 'finding-123')).toBe(false);
+  });
+
+  it('requires a nonempty literal fingerprint and accepts it in body or frontmatter', () => {
+    const text = '---\nstatus: resolved\n---\nfinding-123';
+    for (const fingerprint of [undefined, null, '', 123, 'different']) expect(cardResolvesFinding(text, fingerprint)).toBe(false);
+    expect(cardResolvesFinding(text, 'finding-123')).toBe(true);
+    expect(cardResolvesFinding('---\nstatus: resolved\nfinding: finding-123\n---\n', 'finding-123')).toBe(true);
+  });
+
+  it('preserves WE @pr callers without a fingerprint, but checks supplied fingerprints including main fallback', () => {
+    const ref = 'we:backlog/xabcdef-card.md@pr7';
+    const readOnPr = () => CARD;
+    expect(referralCardReadable(ref, root, { readOnPr })).toBe(true);
+    expect(referralCardReadable(ref, root, { readOnPr, fingerprint: 'finding-123', readMainByBornAs: () => null })).toBe(false);
+    const published = '---\nbornAs: xabcdef\nstatus: resolved\n---\n';
+    expect(referralCardReadable(ref, root, { readOnPr: () => null, fingerprint: 'finding-123', readMainByBornAs: () => published })).toBe(false);
+    expect(referralCardReadable(ref, root, { readOnPr: () => null, fingerprint: 'finding-123', readMainByBornAs: () => published + 'finding-123' })).toBe(true);
   });
 
   it.each(['null', 'throw', 'no frontmatter'])('resolves a merged, renumbered PR card through bornAs when the PR read returns %s', failure => {

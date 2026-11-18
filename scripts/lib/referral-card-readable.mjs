@@ -20,13 +20,21 @@ const CARD_REPO = CONSTELLATION_REPOS.we.slug;
 const CARD_BASE = 'main'; // a card only "will land" if its PR targets the branch the backlog is read from
 const hasFrontmatter = text => /^---\r?\n[\s\S]+?\r?\n---\r?\n/.test(text);
 
-function hasTopLevelStatus(text) {
-  const frontmatter = /^---\r?\n([\s\S]+?)\r?\n---\r?\n/.exec(text)?.[1];
-  if (!frontmatter || !/^status:/m.test(frontmatter)) return false;
-  // Parse scalar boundaries rather than mistaking a quoted title's continuation for a key.
-  const data = yaml.safeLoad(frontmatter, { schema: yaml.FAILSAFE_SCHEMA });
-  return data != null && Object.hasOwn(data, 'status')
-    && ['open', 'active', 'preparing', 'parked', 'resolved', 'closed', 'folded'].includes(data.status);
+/** Strict, pure proof that a flat frontmatter card resolves the named finding set. */
+export function cardResolvesFinding(text, fingerprint) {
+  if (typeof text !== 'string' || typeof fingerprint !== 'string' || !fingerprint.trim()) return false;
+  const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(text)?.[1];
+  if (!frontmatter) return false;
+  const lines = frontmatter.split(/\r?\n/);
+  // Every physical line must be a top-level key/value. Never skip malformed lines, comments,
+  // indentation or scalar continuations and then accidentally treat their contents as keys.
+  if (!lines.every(line => /^[A-Za-z_][A-Za-z0-9_-]*:[ \t]+\S.*$/.test(line))) return false;
+  if (lines.filter(line => line.startsWith('status:')).length !== 1) return false;
+  try {
+    const data = yaml.safeLoad(frontmatter, { schema: yaml.FAILSAFE_SCHEMA });
+    return data != null && Object.values(data).every(value => typeof value === 'string')
+      && ['resolved', 'closed', 'folded'].includes(data.status) && text.includes(fingerprint);
+  } catch { return false; }
 }
 
 /**
@@ -46,7 +54,7 @@ export function readCardAtPrHead(file, pr, { repo = CARD_REPO, run = execFileSyn
 }
 
 /** A deferral is discharged only by an existing readable backlog card, never an intention to file. */
-export function referralCardReadable(ref, root = process.cwd(), { readOnPr = readCardAtPrHead, readMainByBornAs = readMainCardByBornAs } = {}) {
+export function referralCardReadable(ref, root = process.cwd(), { readOnPr = readCardAtPrHead, readMainByBornAs = readMainCardByBornAs, fingerprint } = {}) {
   if (!CARD_REF_RE.test(ref ?? '')) return false;
   // Prefer the PR head. After landing, JIT numbering may have renamed the card there, so when the PR read fails
   // ONLY the provisional (`x…`) birth name may resolve through a card PUBLISHED on origin/main whose `bornAs:` names
@@ -58,13 +66,17 @@ export function referralCardReadable(ref, root = process.cwd(), { readOnPr = rea
     const repo = prefix === 'longshore' ? CONSTELLATION_REPOS.longshore.slug : CARD_REPO;
     try {
       const text = (prefix === 'we' ? readOnPr(file, pr) : readOnPr(file, pr, { repo })) ?? '';
-      // A longshore card is read remotely only, so require a real card (a known `status:` value), not just a delimiter pair.
-      if (hasFrontmatter(text) && (prefix === 'we' || hasTopLevelStatus(text))) return true;
+      if (prefix === 'longshore' || fingerprint !== undefined) {
+        if (cardResolvesFinding(text, fingerprint)) return true;
+      } else if (hasFrontmatter(text)) return true;
     } catch { /* try the published WE card */ }
     if (prefix !== 'we') return false;
     const born = BORN_RE.exec(file)?.[1];
     if (!born) return false;
-    try { return hasBornAs(readMainByBornAs(born, root) ?? '', born); } catch { return false; }
+    try {
+      const text = readMainByBornAs(born, root) ?? '';
+      return hasBornAs(text, born) && (fingerprint === undefined || cardResolvesFinding(text, fingerprint));
+    } catch { return false; }
   }
   try { return hasFrontmatter(readFileSync(`${root}/${ref.slice(3)}`, 'utf8')); }
   catch { return landedByBornAs(ref, root); }

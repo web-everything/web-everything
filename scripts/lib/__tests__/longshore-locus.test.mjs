@@ -96,18 +96,19 @@ describe('longshore cites and card refs', () => {
   it('a longshore PR card ref reads from the longshore slug, not WE', () => {
     const seen = [];
     const ok = referralCardReadable('longshore:backlog/1234-a.md@pr77', '/nowhere', {
-      readOnPr: (file, pr, o) => { seen.push([file, pr, o]); return '---\nstatus: open\n---\n'; },
-      readMainByBornAs: () => null,
+      readOnPr: (file, pr, o) => { seen.push([file, pr, o]); return '---\nstatus: resolved\n---\nresolves fp1\n'; },
+      readMainByBornAs: () => null, fingerprint: 'fp1',
     });
     expect(ok).toBe(true);
     expect(seen[0].slice(0, 2)).toEqual(['1234-a.md', '77']);
     expect(seen[0][2]?.repo).toBe(SLUG);
   });
   it('a longshore PR card without a status field is refused (delimiters alone are not a card)', () => {
-    const run = text => referralCardReadable('longshore:backlog/1234-a.md@pr77', '/nowhere', { readOnPr: () => text, readMainByBornAs: () => null });
-    expect(run('---\narbitrary: true\n---\n')).toBe(false);
-    expect(run('---\nstatus: arbitrary-garbage\n---\n')).toBe(false);
-    expect(run('---\nstatus: open\n---\n')).toBe(true);
+    const run = text => referralCardReadable('longshore:backlog/1234-a.md@pr77', '/nowhere', { readOnPr: () => text, readMainByBornAs: () => null, fingerprint: 'fp1' });
+    expect(run('---\narbitrary: true\n---\nfp1\n')).toBe(false);
+    expect(run('---\nstatus: arbitrary-garbage\n---\nfp1\n')).toBe(false);
+    expect(run('---\nstatus: open\n---\nfp1\n')).toBe(false);
+    expect(run('---\nstatus: resolved\n---\nfp1\n')).toBe(true);
   });
   it('a longshore ref without @pr fails closed (no local checkout)', () => {
     expect(referralCardReadable('longshore:backlog/1234-a.md', process.cwd())).toBe(false);
