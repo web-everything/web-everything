@@ -1,4 +1,11 @@
 import { it, expect, vi, afterAll, beforeEach } from 'vitest';
+// The host operator store (~/.claude/operator-overrides.json) outranks env, so a developer's live
+// redTeamQueue override would leak into these fixtures; read a missing store instead (= no overrides).
+const operatorFixture = vi.hoisted(() => ({ file: `/nonexistent-operator-store-${process.pid}-${Date.now()}.json` }));
+vi.mock('../../../scripts/lib/operator-override-reader.mjs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, readOperatorOverrides: options => actual.readOperatorOverrides({ ...options, file: options?.file ?? operatorFixture.file }) };
+});
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,6 +17,7 @@ import * as resultLabelSync from '../../../scripts/lib/red-team-result-label-syn
 import * as gateCatchUp from '../../../scripts/lib/red-team-gate-catchup.mjs';
 import * as redTeamRecovery from '../../../scripts/lib/review-red-team-on-skip.mjs';
 import * as hostSample from '../../../scripts/lib/host-sample.mjs';
+import * as operatorOverrideReader from '../../../scripts/lib/operator-override-reader.mjs';
 import { planReconcile } from '../../../scripts/conveyor/reconcile-core.mjs';
 import { buildReviewedShaMarker } from '../../../scripts/lib/review-escalation.mjs';
 
@@ -24,6 +32,8 @@ beforeEach(() => {
   vi.stubEnv('WE_RED_TEAM_QUEUE_MIN_CONCURRENT', '2');
   vi.stubEnv('WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT', '10');
   vi.spyOn(hostSample, 'sampleHost').mockReturnValue({ idlePct: 0 });
+  // Hermetic: the host's real operator overrides (e.g. redTeamQueue.minConcurrent) must not raise the pinned floor.
+  vi.spyOn(operatorOverrideReader, 'readOperatorOverrides').mockReturnValue({ readable: true, values: {} });
 });
 const readQueueFile = () => existsSync(QUEUE_FILE) ? readFileSync(QUEUE_FILE, 'utf8') : null;
 
@@ -207,7 +217,8 @@ it.each(['fresh', 'resume'])('CLI tick options recover an already-reviewed head 
     const take = vi.fn();
     const out = runReviewTick({ ...production, repo,
       readPrs: () => [{ number: pr, headRefOid: head, labels: [], comments: [] }],
-      readAgents: () => [], holdReconcile: () => [], acquirableLanes: () => 1,
+      // Production wires a separate (unhalved) recovery lane reader; pin both seams so the fixture never reads the real pool.
+      readAgents: () => [], holdReconcile: () => [], acquirableLanes: () => 1, recoveryAcquirableLanes: () => 1,
       liveReviewBudget: { left: 1 }, hostAdmission: () => ({ admitted: true, maxPerTick: 1, take }),
       reconcile: () => ({ dispatch: [], refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] }),
       tagRound: vi.fn(), tagStatus: vi.fn(), statusCandidates: () => [],
@@ -337,7 +348,7 @@ it('a throwing host check blocks recovery-only starts', () => {
   expect(recoveryDispatch).not.toHaveBeenCalled();
 });
 
-it.each([38, 'throws'])('CLI queue uses the shared CPU sample (%s) and preserves lane/budget bounds', idle => {
+it.each([38, 5, 'throws'])('CLI queue uses the shared CPU sample (%s) and preserves lane/budget bounds', idle => {
   vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
   vi.spyOn(hostSample, 'sampleHost').mockImplementation(() => {
     if (idle === 'throws') throw new Error('sample unavailable');
@@ -354,7 +365,7 @@ it.each([38, 'throws'])('CLI queue uses the shared CPU sample (%s) and preserves
     });
     expect(hostSample.sampleHost).toHaveBeenCalledOnce();
     expect(recovery.mock.calls[0][0].capacity).toBe(capacity);
-    expect(capacity).toEqual({ lanes: 4, startsCeiling: 3, remainingStarts: idle === 'throws' ? 1 : 2, budget: { left: 3 } });
+    expect(capacity).toEqual({ lanes: 4, startsCeiling: 3, remainingStarts: idle === 38 ? 2 : 1, budget: { left: 3 } });
     expect(capacity.budget).toBe(budget);
   } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
 });

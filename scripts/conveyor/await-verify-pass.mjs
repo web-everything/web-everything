@@ -1,3 +1,4 @@
+import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 /**
  * The fix daemon's verify-verdict pass — we:backlog/5137-harness-owns-the-verify-wait-not-the-model.md slices 2+3.
  *
@@ -230,7 +231,11 @@ function buildNoPushResumePrompt({ kind, record, marker, detail, head, next }) {
  * The message the resumed session receives. Pure. Every variant names the sha, the attempt, and the exact next
  * step in the session's own brief, and repeats the one invariant: the session never pushes `{{LANE_REF}}` itself.
  */
-export function buildAwaitVerifyResumePrompt({ kind, record, marker = null, detail = '' }) {
+export function buildAwaitVerifyResumePrompt(options) {
+  return renderNoPromptCommandRules(buildAwaitVerifyTask(options), options.record.kind);
+}
+
+function buildAwaitVerifyTask({ kind, record, marker = null, detail = '' }) {
   const subject = isNoPushRecord(record) ? `item #${record.item} (${record.repo})` : `PR #${record.pr} (${record.repo})`;
   const head = `[harness verify verdict — #5137] ${subject}, sha ${record.sha}, attempt ${record.attempt ?? 1}.`;
   const next = `Re-mark with --attempt=${(record.attempt ?? 1) + 1} after committing and re-requesting, then end your turn again.`;

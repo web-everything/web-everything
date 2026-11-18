@@ -1,3 +1,4 @@
+import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
 import { applyTestsFirstPolicy } from '../../lib/tests-first-policy.mjs';
 /**
  * @file dispatch-lane.test.mjs — the effect that STARTS rather than completes (#3037, under epic #3029).
@@ -2952,7 +2953,7 @@ describe('#3332: the planner\'s fix and CI-heal lists reach the spawner', () => 
   /** The brief a kind SHOULD produce, filled from the file on disk — byte-exact, so it cannot drift. `fix`/
    *  `ci-heal` need `REPO_AWARE_VALUE_PATTERNS` (#3960: `GATE_COMMAND`/`ATTRIBUTION` legitimately carry a space). */
   function expectedPrompt(kind, values) {
-    return fillBrief(
+    return `${NO_PROMPT_COMMAND_RULES}\n\n` + fillBrief(
       applyTestsFirstPolicy(readFileSync(briefPath(REPO_ROOT, kind), 'utf8')) + '\n\n' + renderBuildRequirements(), values, BRIEF_REQUIRED_BY_KIND[kind],
       undefined, kind === 'fix' || kind === 'ci-heal' ? REPO_AWARE_VALUE_PATTERNS : undefined,
     ).prompt;

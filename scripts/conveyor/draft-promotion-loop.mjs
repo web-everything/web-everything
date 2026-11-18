@@ -41,7 +41,7 @@ import {
 
 export const DRAFT_LIST_FIELDS = 'number,state,isDraft,headRefName,headRefOid,baseRefName,labels,isCrossRepository';
 /** The one fresh read per candidate: everything the tick's pre-`promote-draft` refusals and the rule decide on. */
-export const PR_VIEW_FIELDS = 'number,state,isDraft,headRefName,headRefOid,baseRefName,labels,comments,body,statusCheckRollup,mergeStateStatus,isCrossRepository';
+export const PR_VIEW_FIELDS = 'number,state,isDraft,headRefName,headRefOid,baseRefName,labels,comments,body,statusCheckRollup,mergeStateStatus,mergeable,isCrossRepository';
 
 /** The one list read per repo: open drafts only. */
 export function defaultListDrafts({ repoSlug, runGh = runGhSync } = {}) {
@@ -80,7 +80,7 @@ export function defaultReadPrView({ repoSlug, prNumber, runGh = runGhSync, readC
 
 /**
  * One promotion step over every repo. Never throws: a failed read or write is a row, and the next step retries.
- * @returns {{rows:Array<{repo:string, pr:number|null, action:'promoted'|'skip'|'error', why:string}>}}
+ * @returns {{rows:Array<{repo:string, pr:number|null, action:'promoted'|'skip'|'error', why:string, reason?:string}>}}
  */
 export function runDraftPromotionStep({
   repos = Object.values(CONSTELLATION_REPOS).map((r) => r.slug),
@@ -109,7 +109,7 @@ export function runDraftPromotionStep({
     const requiredOnce = once(() => readRequiredChecks({ repoSlug: repo })?.checks ?? []);
     for (const pr of drafts.filter(isPromotionCandidate)) {
       const n = Number(pr.number);
-      const row = (action, why) => rows.push({ repo, pr: n, action, why });
+      const row = (action, why, reason) => rows.push({ repo, pr: n, action, why, ...(reason ? { reason } : {}) });
       let checks; let notApplicable;
       try {
         notApplicable = absentNotApplicableOnce();
@@ -119,7 +119,7 @@ export function runDraftPromotionStep({
         checks = { state: fresh?.state, sha: pr.headRefOid, reviewHoldOnly: fresh?.reviewHoldOnly === true };
       } catch (e) { row('error', `check read: ${oneLine(e)}`); continue; }
       const decision = isDraftOwedPromotion({ pr, checks });
-      if (!decision.owed) { row('skip', decision.why); continue; }
+      if (!decision.owed && checks.state !== 'unchecked') { row('skip', decision.why); continue; }
 
       // The PR as it is NOW. A push, a label or a comment between the list read and the write changes the answer.
       let view;
@@ -127,10 +127,10 @@ export function runDraftPromotionStep({
       if (!view || typeof view !== 'object') { row('error', 'pr view: no record returned'); continue; }
       if (view.headRefOid !== pr.headRefOid) { row('skip', `head moved since the check read (${String(pr.headRefOid).slice(0, 9)} → ${String(view.headRefOid).slice(0, 9)}) — the next step re-reads it`); continue; }
       const fresh = isDraftOwedPromotion({
-        pr: { ...pr, state: view.state, isDraft: view.isDraft, headRefName: view.headRefName, baseRefName: view.baseRefName, labels: view.labels, isCrossRepository: view.isCrossRepository },
+        pr: { ...pr, state: view.state, isDraft: view.isDraft, headRefName: view.headRefName, baseRefName: view.baseRefName, mergeable: view.mergeable, labels: view.labels, isCrossRepository: view.isCrossRepository },
         checks,
       });
-      if (!fresh.owed) { row('skip', `${fresh.why} (re-read just before the write)`); continue; }
+      if (!fresh.owed) { row('skip', `${fresh.why} (re-read just before the write)`, fresh.reason); continue; }
       if ((view.labels ?? []).some((l) => (typeof l === 'string' ? l : l?.name) === CONFLICT_LABEL)) {
         row('skip', `${CONFLICT_LABEL}: the tick's already-landed check decides this one (it needs git reads this step does not pay)`);
         continue;
@@ -178,7 +178,7 @@ export function runDraftPromotionStep({
 export function formatDraftPromotionLines(result) {
   return (result?.rows ?? []).map((r) => (r.action === 'promoted'
     ? `draft-promotion: promoted ${r.repo} PR #${r.pr} to ready for review — ${logText(r.why)}`
-    : `draft-promotion: ${r.action} ${r.repo}${r.pr == null ? '' : ` PR #${r.pr}`} — ${logText(r.why)}`));
+    : `draft-promotion: ${r.action} ${r.repo}${r.pr == null ? '' : ` PR #${r.pr}`} — ${r.reason ? `${logText(r.reason)}: ` : ''}${logText(r.why)}`));
 }
 
 /**

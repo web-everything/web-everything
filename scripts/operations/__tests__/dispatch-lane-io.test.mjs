@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createTickReader, createDispatchSinks, reserveBuildLane, resolveDispatchSettingsEnv, DISPATCH_BASH_TIMEOUT_ENV } from '../dispatch-lane-io.mjs';
 import { spawnPreventionLandingJob } from '../../lib/prevention-landing-job.mjs';
-import { DISPATCH_EFFECT } from '../dispatch-lane.mjs';
+import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
+import { shapeDispatchRead, DISPATCH_EFFECT } from '../dispatch-lane.mjs';
 
 describe('the tick reader handoff', () => {
   const at = '2026-10-06T12:00:00.000Z';
@@ -18,7 +19,7 @@ describe('the tick reader handoff', () => {
   const envelope = {
     at, bookkeepingHash: createHash('sha256').update(stdin).digest('hex'), tick,
   };
-  function fixture(file = envelope, overrides = {}) {
+  function fixture(file = envelope, overrides = {}, template = 'dispatch brief') {
     const runNode = vi.fn(() => JSON.stringify({ decisions: {}, nextState: { tick: 99 } }));
     const readText = vi.fn((path) => {
       if (path === '/tmp/bookkeeping.json') return JSON.stringify({ bookkeeping, config: { verbose: true } });
@@ -26,7 +27,7 @@ describe('the tick reader handoff', () => {
         if (file instanceof Error) throw file;
         return typeof file === 'string' ? file : JSON.stringify(file);
       }
-      return 'dispatch brief';
+      return template;
     });
     const read = createTickReader({
       runNode, readText, now: () => new Date(at),
@@ -86,6 +87,24 @@ describe('the tick reader handoff', () => {
   });
 
   // xykwe0h — the build-delivered gate only fires if readTick carries checkBuildDelivery's answer through as `buildDelivery`.
+  describe.each([['fix', 'spawnFixes'], ['ci-heal', 'spawnCiHeals']])('%s raw template boundary', (kind, list) => {
+    const repairEnvelope = { ...envelope, tick: {
+      decisions: { [list]: [{ num: '3037', lane: 8, pr: 701, reason: 'red-ci' }] }, nextState: {},
+    } };
+    it.each(['', ' ', '\t', '\n', '\r', '\r\n', ' \t\r\n'])('refuses %j before build requirements or operator steps', task => {
+      const { read } = fixture(repairEnvelope, { laneRefForPr: () => 'lane/3037-repair' }, task);
+      expect(() => read()).toThrow('dispatch-lane: the delivery-agent brief template is empty — refusing to dispatch an agent with no instructions');
+    });
+    it('accepts a non-empty template and injects the complete block exactly once', () => {
+      const { read } = fixture(repairEnvelope, { laneRefForPr: () => 'lane/3037-repair' }, 'Repair this PR.');
+      const shaped = shapeDispatchRead(read(), { num: '3037' });
+      expect(shaped.launchKind).toBe(kind);
+      expect(shaped.prompt.startsWith(`${NO_PROMPT_COMMAND_RULES}\n\n`)).toBe(true);
+      expect(shaped.prompt.split(NO_PROMPT_COMMAND_RULES)).toHaveLength(2);
+      expect(shaped.prompt).toContain('Repair this PR.');
+    });
+  });
+
   it('wires checkBuildDelivery into the read as buildDelivery for a build launch', () => {
     const delivered = { outcome: 'pr-merged', pr: 4288, reason: 'PR #4288 merged' };
     const checkBuildDelivery = vi.fn(() => delivered);

@@ -17,6 +17,7 @@ import { isAutomationAuthored } from './marker-authorship.mjs';
 import { readSettings } from './settings-files.mjs';
 import { cascadePolicy, platformPreference } from './policy-cascade.mjs';
 import { execFileSync } from 'node:child_process';
+import { laneGitHardeningEnv, scrubInheritedGitEnv } from './lane-git-hardening.mjs';
 import { BORN_AS_RE } from '../backlog/id.mjs';
 import { finishRecordedAcceptanceLabels } from './review-label-provider.mjs';
 import { isKnownMachineBody, latestAcceptRecord, laterReviewHold, resolveAcceptCarryForward } from './accept-carry-forward.mjs';
@@ -45,7 +46,7 @@ export const MAX_NUMBERING_FILES = 256;
 export const MAX_NUMBERING_BLOB_BYTES = 1024 * 1024;
 export const MAX_NUMBERING_TOTAL_BYTES = 8 * 1024 * 1024;
 const MAX_GIT_OUTPUT_BYTES = 8 * 1024 * 1024;
-const GIT_TIMEOUT_MS = 5000;
+export const GIT_TIMEOUT_MS = 5000;
 const canonicalNumber = (number) => number.replace(/^0+(?=\d)/, '');
 
 /** PURE: parse exact, unique hash→number pairs; malformed subjects and duplicate drops return null. */
@@ -222,15 +223,6 @@ export function checkNumberingCommit({ subject, parents, changes, extraMap = new
   return { ok: true, pairs: [...map], renames };
 }
 
-/** IO: a missing commit gets one fetch and re-check, with every failure handled by the outer refusal boundary. */
-function ensureReadable(git, sha) {
-  try { git(['cat-file', '-e', `${sha}^{commit}`]); }
-  catch {
-    git(['fetch', '--no-tags', '-q', 'origin', sha]);
-    git(['cat-file', '-e', `${sha}^{commit}`]);
-  }
-}
-
 /** IO: main's bornAs aliases are optional evidence; failed reads must not settle a refusal that needs them. */
 export function readExtraMap(git, mainRef) {
   const map = new Map();
@@ -263,39 +255,90 @@ function readExistingNumbers(git, ref) {
   return numbers;
 }
 
-/**
- * IO (read-only git proof, apart from fetching missing objects): verify every new commit is drain numbering
- * in a bounded linear chain on fromSha. No git error escapes this function; grep is optional evidence.
- * @param {{exec:Function,fromSha:string,toSha:string,mainRef?:string,cwd?:string}} o
- * @returns {{ok:true,commits:string[],pairs:Array<[string,string]>,reason:string}|{ok:false,reason:string,retryable?:boolean}}
- */
-export function proveNumberingOnlyMove({ exec, fromSha, toSha, mainRef = 'origin/main', cwd } = {}) {
-  try {
-    if (typeof exec !== 'function' || !fromSha || !toSha) return refuse('no git reader or head');
-    if (fromSha === toSha) return refuse('no head move');
-    // Fatal decoding makes string equality lossless for valid UTF-8. Preserve a BOM:
-    // dropping it would itself conceal a non-numbering byte change.
-    const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
-    const gitBytes = (args, maxBuffer = MAX_GIT_OUTPUT_BYTES) => {
-      const output = exec('git', args, {
-        encoding: null, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer, timeout: GIT_TIMEOUT_MS,
+/** Fatal decoding preserves a BOM and refuses lossy Git text evidence. */
+export const decodeNumberingGitText = bytes => new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+
+/** Internal test seam for bounded local Git reads; the public proof never accepts a runner. */
+export function numberingGitRunner({ cwd, run = execFileSync } = {}) {
+  let readFailed = false;
+  const env = { ...laneGitHardeningEnv(scrubInheritedGitEnv()), GIT_NO_REPLACE_OBJECTS: '1',
+    GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_GRAFT_FILE: '/nonexistent',
+    GIT_TERMINAL_PROMPT: '0' };
+  const pins = ['-c', 'protocol.allow=never', '-c', 'extensions.partialClone=', '-c', 'remote.origin.promisor=false'];
+  const read = (args, options) => {
+    try {
+      const { maxBuffer, timeout } = options ?? {};
+      if (!Number.isSafeInteger(maxBuffer) || maxBuffer <= 0 || !Number.isSafeInteger(timeout) || timeout <= 0) throw Error('explicit Git read bounds required');
+      const output = run('git', [...pins, ...args], {
+        env,
+        encoding: null, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer, timeout,
         ...(cwd === undefined ? {} : { cwd }),
       }) ?? Buffer.alloc(0);
       if (!Buffer.isBuffer(output)) throw Error('git reader must return raw bytes');
       if (output.length > maxBuffer) throw Error('git output exceeds byte limit');
       return output;
-    };
-    const git = (args, maxBuffer) => decoder.decode(gitBytes(args, maxBuffer));
+    } catch (error) {
+      if (!(error?.status === 1 && (args[0] === 'grep'
+        || (args[0] === 'config' && args[1] === '--get-regexp')))) readFailed = true;
+      throw error;
+    }
+  };
+  let initialized = false;
+  const gitBytes = (args, options) => {
+    if (!initialized) {
+      // Discover every promisor before any object read. Config itself cannot lazy-fetch.
+      let promisors = '';
+      try { promisors = decodeNumberingGitText(read(['config', '--get-regexp', '^remote\\..*\\.promisor'],
+        { maxBuffer: MAX_GIT_OUTPUT_BYTES, timeout: GIT_TIMEOUT_MS })); }
+      catch (error) { if (error?.status !== 1) { readFailed = true; throw error; } }
+      for (const line of promisors.split('\n').filter(Boolean)) {
+        const key = /^(remote\..*\.promisor)\s/.exec(line)?.[1];
+        if (!key) { readFailed = true; throw Error('unreadable promisor config key'); }
+        pins.push('-c', `${key}=false`);
+      }
+      initialized = true;
+    }
+    return read(args, options);
+  };
+  return { gitBytes, get readFailed() { return readFailed; } };
+}
+
+/**
+ * IO (local-only, read-only git proof): verify every new commit is drain numbering
+ * in a bounded linear chain on fromSha. No git error escapes this function; grep is optional evidence.
+ * @param {{exec?:Function,fromSha:string,toSha:string,mainRef?:string,cwd?:string}} o — exec is retained for compatibility only.
+ * @returns {{ok:boolean,reason:string,readFailed:boolean,commits?:string[],pairs?:Array<[string,string]>,retryable?:boolean}}
+ */
+export function proveNumberingOnlyMove(options = {}) {
+  let runner;
+  try {
+    runner = numberingGitRunner({ cwd: options.cwd });
+    return { ...proveNumberingWithRunner(options, runner), readFailed: runner.readFailed };
+  } catch (error) {
+    return { ...refuse(`numbering proof failed: ${String(error?.message ?? error).split('\n')[0]}`),
+      retryable: true, readFailed: true };
+  }
+}
+
+export function proveNumberingWithRunner({ fromSha, toSha, mainRef = 'origin/main' } = {}, runner) {
+  try {
+    if (!fromSha || !toSha) return refuse('no head');
+    if (fromSha === toSha) return refuse('no head move');
+    // Fatal decoding makes string equality lossless for valid UTF-8. Preserve a BOM:
+    // dropping it would itself conceal a non-numbering byte change.
+    const { gitBytes } = runner;
+    const git = args => decodeNumberingGitText(gitBytes(args, { maxBuffer: MAX_GIT_OUTPUT_BYTES, timeout: GIT_TIMEOUT_MS }));
     // Blob content is compared as text only once its text re-encodes to the exact bytes git stored, so no decoding
     // step (a dropped BOM, a replaced byte, a normalisation) can make two different byte sequences compare equal.
     const blobText = (object) => {
-      const bytes = gitBytes(['cat-file', 'blob', object], MAX_NUMBERING_BLOB_BYTES);
-      const text = decoder.decode(bytes);
+      const bytes = gitBytes(['cat-file', 'blob', object], { maxBuffer: MAX_NUMBERING_BLOB_BYTES, timeout: GIT_TIMEOUT_MS });
+      const text = decodeNumberingGitText(bytes);
       if (!Buffer.from(text, 'utf8').equals(bytes)) throw Object.assign(Error('blob text does not round-trip to its bytes'), { code: 'NUMBERING_BYTES_NOT_EXACT' });
       return text;
     };
-    ensureReadable(git, fromSha);
-    ensureReadable(git, toSha);
+    // Missing commits/objects stay missing: the outer boundary returns a retryable refusal.
+    git(['cat-file', '-e', `${fromSha}^{commit}`]);
+    git(['cat-file', '-e', `${toSha}^{commit}`]);
     // rev-list prints full shas: compare the chain's first parent against the resolved accepted head, not its spelling.
     fromSha = git(['rev-parse', '--verify', `${fromSha}^{commit}`]).trim();
     const lines = git(['rev-list', `--max-count=${MAX_NUMBERING_COMMITS + 1}`, '--topo-order', '--reverse', '--parents', toSha, `^${fromSha}`]).trim().split('\n').filter(Boolean);

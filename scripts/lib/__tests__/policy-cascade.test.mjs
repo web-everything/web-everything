@@ -402,9 +402,18 @@ it('review daemon budget never returns uncapped concurrency on corrupt operator 
 
 
 describe('R907 malformed review capacity evidence', () => {
+  it('accepts an operator live-review cap of 16 with operator provenance', () => {
+    operatorEnv(file({ 'reviewConcurrency.maxLiveReviewRounds': 16 }));
+    const budget = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '8' },
+      listCommands: () => '', toolPath: file({ maxLiveReviewRounds: 8 }) });
+    expect(budget).toMatchObject({ max: 16, live: 0, left: 16 });
+    expect(budget.reason).toContain('maxLiveReviewRounds=16 (operator-db)');
+  });
+
   it.each([
     ['wrong type', 'reviewConcurrency.maxLiveReviewRounds', '1'],
-    ['out of range', 'reviewConcurrency.maxLiveReviewRounds', 9],
+    ['above hard cap', 'reviewConcurrency.maxLiveReviewRounds', 17],
+    ['below hard floor', 'reviewConcurrency.maxLiveReviewRounds', 0],
     ['unknown key', 'reviewConcurrency.unknown', 1],
     ['non-allowlisted guard', 'reviewConcurrency.enabled', false],
   ])('%s fails closed for both cascade results and daemon budget', (_label, key, value) => {

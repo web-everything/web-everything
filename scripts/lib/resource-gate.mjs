@@ -29,7 +29,7 @@ import { resolveHandoffSettings } from './handoff-settings.mjs';
  *   threshold (e.g. `WE_FIX_CAP_RAISE_MAX_SWAP_USED_PCT`). Every leaf's source is logged once per
  *   process per distinct set ({@link logGateSettingsOnce}).
  */
-import { failClosedCapacity } from './operator-override-reader.mjs';
+import { failClosedCapacity, OPERATOR_CAPACITY_MAX } from './operator-override-reader.mjs';
 import { readOperatorPolicy } from './policy-cascade.mjs';
 import { readFileSync } from 'node:fs';
 import os, { homedir } from 'node:os';
@@ -148,10 +148,10 @@ export function resolveResourceGateSettings({ platform, tool, env = {}, legacyFl
       if (values[leaf] !== before) sources[leaf] = 'standard';
     }
   }
-  // The operator hard range (1..12) bounds only what an operator value derives: a ceiling computed from an
-  // operator floor. A tool, platform or env ceiling above 12 is honoured exactly as before the operator layer.
+  // The operator hard bound applies to ceilings derived from an operator floor.
+  // Explicit tool, platform or env ceilings retain their existing authority.
   if (sources['fixCap.floor'] === 'operator-db' && ceilingDerived) {
-    values['fixCap.ceiling'] = Math.min(12, values['fixCap.ceiling']);
+    values['fixCap.ceiling'] = Math.min(OPERATOR_CAPACITY_MAX.fix, values['fixCap.ceiling']);
   }
   const fixCap = {};
   for (const leaf of LEAVES.filter((l) => l.startsWith('fixCap.'))) fixCap[leaf.slice('fixCap.'.length)] = values[leaf];
