@@ -12,8 +12,8 @@
  *   pass) that run INSIDE an already-dispatched lane — it never gates whether a lane is dispatched at all.
  *   Confirmed live 2026-09-07: freeing one lane cascaded `dispatch-plan.mjs` + `tick-core.mjs` into launching
  *   42 concurrent lanes in ONE tick (19 builds + 23 prepare-scope), each its own `claude -p` process, with zero
- *   shared budget between the two — driving the host's 1-minute load average to 34.95 on a 12-core/64GB
- *   machine. Neither module had, or has via heavy-admission, any concept of "how many lanes total may run
+ *   shared budget between the two — driving the host's 1-minute load average to 34.95 on the primary
+ *   host. Neither module had, or has via heavy-admission, any concept of "how many lanes total may run
  *   right now" — this module is that missing ceiling, upstream of heavy-admission entirely.
  *
  * DELIBERATELY NOT THE FULL HARDWARE-USAGE-AWARE PROJECT (`xc1idt1`/`xhvpyxb`/`xqraqab`, staged in PR #1998,
@@ -34,7 +34,7 @@
  * module's pure core, not just its IO shell.
  */
 
-/** Conservative default — see the file header for the reasoning behind 8 on a 12-core host. */
+/** Conservative default — see the file header for the reasoning behind 8 on the host. */
 export const DEFAULT_MAX_CONCURRENT_LANES = 8;
 
 /** The env var a machine overrides the default with (mirrors `WE_HEAVY_ADMISSION_CAP`). */

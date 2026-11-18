@@ -42,7 +42,7 @@
  *                                                       free a lane).
  *
  * CONCURRENCY CEILING (#xupukxa, live incident 2026-09-07 — freeing one lane cascaded into 42 concurrent lane
- * dispatches, 1-min load average 34.95 on a 12-core host). `maxConcurrentLanes` (default from
+ * dispatches, 1-min load average 34.95 on the host). `maxConcurrentLanes` (default from
  * {@link ../lib/lane-concurrency.mjs resolveMaxConcurrentLanes}, `WE_MAX_CONCURRENT_LANES` env-overridable) caps
  * `freeLanes` against the ALREADY-ACTIVE lease count via {@link ../lib/lane-concurrency.mjs capToConcurrency}
  * BEFORE any assignment: `room = maxConcurrentLanes - leases.length`, so this dispatcher's OWN build launches
