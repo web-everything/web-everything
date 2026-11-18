@@ -1,6 +1,7 @@
 import { greenLedgerDir, hasGreenLedger } from '../lib/lane-verify.mjs';
 import { unread } from './dispatch-eligibility.mjs';
-import { defaultComputeConflictDisposition } from './parked-pr-conflict-watch.mjs';
+import { isDrainTransientPath } from '../lib/transient-paths.mjs';
+import { gitMergeTreeParsed } from './parked-pr-conflict-watch.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { pidIdentity, holderStartedBy } from '../lib/pid-alive.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
@@ -1386,8 +1387,8 @@ export function enrichPrsWithBaseRefFacts(prs, { resolveRef = defaultResolveMain
 
 export const CONFLICT_DISPOSITION_MAX_PER_PASS = 20;
 /** Bound git probes; unprobed rows retain the ordinary dispatch budget (no exemption). */
-export function enrichPrsWithConflictDisposition(prs, { compute = defaultComputeConflictDisposition,
-  defaultBranch = 'main', max = CONFLICT_DISPOSITION_MAX_PER_PASS } = {}) {
+export function enrichPrsWithConflictDisposition(prs, { compute = gitMergeTreeParsed,
+  defaultBranch = 'main', mainSha = defaultResolveMainSha(defaultBranch), max = CONFLICT_DISPOSITION_MAX_PER_PASS } = {}) {
   let remaining = Number.isInteger(max) && max > 0 ? max : 0;
   return prs.map(pr => {
     if (!remaining || (pr.state != null && pr.state !== 'OPEN') || pr.baseRefName !== defaultBranch
@@ -1395,8 +1396,13 @@ export function enrichPrsWithConflictDisposition(prs, { compute = defaultCompute
     remaining--;
     let conflictDisposition = null;
     try {
-      const disposition = compute({ pr });
-      if (['clean', 'manifest-only', 'real'].includes(disposition)) conflictDisposition = disposition;
+      const parsed = compute({ pr, includeRefEvidence: true });
+      if (isSha(mainSha) && isSha(pr.headRefOid) && parsed?.fetchSucceeded === true
+        && parsed.headSha === pr.headRefOid && parsed.baseSha === mainSha) {
+        if (parsed.clean === true) conflictDisposition = 'clean';
+        else if (parsed.clean === false && parsed.conflictPaths?.length > 0
+          && parsed.conflictPaths.every(path => isDrainTransientPath(path))) conflictDisposition = 'manifest-only';
+      }
     } catch { /* Unknown evidence never earns a mechanical exemption. */ }
     return { ...pr, conflictDisposition };
   });
@@ -1834,12 +1840,13 @@ export function runReconcilePass({
   const baseRefPrs = enrichBaseRef(alreadyLandedPrs, { defaultBranch });
   let fixSettings = {};
   try { fixSettings = loadFixSettings({ env }); } catch { /* No exemption without settings. */ }
+  const mainSha = resolveMainSha(defaultBranch);
   const conflictCap = fixSettings?.conflictFixExemptPerPass;
   console.error(`fix.conflictFixExemptPerPass=${conflictCap ?? 0} (source: ${fixSettings?.sources?.conflictFixExemptPerPass ?? 'unknown'})`);
   const conflictPrs = Number.isInteger(conflictCap) && conflictCap > 0
-    ? enrichConflictDisposition(baseRefPrs, { defaultBranch, compute: ({ pr }) => {
+    ? enrichConflictDisposition(baseRefPrs, { defaultBranch, mainSha, compute: ({ pr, includeRefEvidence }) => {
       const cwd = repoKey === 'we' ? REPO_ROOT : resolveLanePoolRepoPath(CONSTELLATION_REPOS[repoKey].slug);
-      return cwd ? defaultComputeConflictDisposition({ pr, cwd, ...(readOnly ? { exec: readOnlyGitExec } : {}) }) : null;
+      return cwd ? gitMergeTreeParsed({ pr, cwd, includeRefEvidence, ...(readOnly ? { exec: readOnlyGitExec } : {}) }) : null;
     } }) : baseRefPrs;
   // #4263 — re-check any `waiting-on-system-fix` escalation's named fix PR for having since landed.
   const fixerLadder = loadLadder();
@@ -1859,7 +1866,6 @@ export function runReconcilePass({
   const rulingPrs = step('enrich-review-churn', () => enrichPrsWithReviewChurn(enrichStandingRulingGrants(prsBeforeRulings, { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug }));
   const listedAgents = readAgents(readOnly ? { readOnly: true } : {});
   const agents = preserveIncomplete(listedAgents, enrich(listedAgents));
-  const mainSha = resolveMainSha(defaultBranch);
   const owedCiRerunSetting = loadOwedCiRerunSettings({ env });
   console.error(`fix.owedCiRerun rerun=${owedCiRerunSetting.value.rerun} maxRerunsPerHead=${owedCiRerunSetting.value.maxRerunsPerHead} (${owedCiRerunSetting.source})`);
   const staleCiRerunSetting = loadStaleCiRerunSetting({ env });

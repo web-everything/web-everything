@@ -297,10 +297,11 @@ export function defaultConflictLabelRemovedAtMs({ pr, repo, exec = execFileSyncT
  * Returns `null` on ANY failure to resolve/fetch/probe (no `headRefName`, both `git` calls throwing with no
  * parseable output, an unparseable `merge-tree` result) — every caller reads `null` as "cannot tell" and keeps
  * its own existing safe-direction fallback (an unnarrowed wait, or the full changed-file list) unchanged.
- * @param {{pr:{headRefName?:string, baseRefName?:string}, cwd?:string, exec?:Function}} o
- * @returns {?{tree:string, clean:boolean, conflictPaths:string[]}}
+ * @param {{pr:{headRefName?:string, baseRefName?:string}, cwd?:string, exec?:Function, includeRefEvidence?:boolean}} o
+ * Opt-in `includeRefEvidence` requires a successful fetch and pins the probe to resolved commit SHAs.
+ * @returns {?{tree:string, clean:boolean, conflictPaths:string[], headSha?:string, baseSha?:string, fetchSucceeded?:boolean}}
  */
-function gitMergeTreeParsed({ pr, cwd = REPO_ROOT, exec = execFileSyncThrottled } = {}) {
+export function gitMergeTreeParsed({ pr, cwd = REPO_ROOT, exec = execFileSyncThrottled, includeRefEvidence = false } = {}) {
   const head = pr?.headRefName;
   if (typeof head !== 'string' || head === '') return null;
   const base = (typeof pr?.baseRefName === 'string' && pr.baseRefName) || 'main';
@@ -309,11 +310,21 @@ function gitMergeTreeParsed({ pr, cwd = REPO_ROOT, exec = execFileSyncThrottled 
     exec('git', ['fetch', 'origin', '--quiet',
       `+${base}:refs/remotes/origin/${base}`, `+${head}:refs/remotes/origin/${head}`],
     { ...childOpts, stdio: ['ignore', 'ignore', 'pipe'] });
-  } catch { /* best-effort — a stale local ref may still resolve below */ }
+  } catch { if (includeRefEvidence) return null; /* Legacy callers keep best-effort fetch. */ }
+  let headSha, baseSha;
+  if (includeRefEvidence) {
+    try {
+      const tip = ref => String(exec('git', ['rev-parse', '--verify', `${ref}^{commit}`],
+        { ...childOpts, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })).trim();
+      headSha = tip(`refs/remotes/origin/${head}`);
+      baseSha = tip(`refs/remotes/origin/${base}`);
+      if (![headSha, baseSha].every(sha => /^[0-9a-f]{40}$/.test(sha))) return null;
+    } catch { return null; }
+  }
   let stdout = '';
   let exitCode = 0;
   try {
-    stdout = exec('git', ['merge-tree', '--write-tree', `origin/${base}`, `origin/${head}`],
+    stdout = exec('git', ['merge-tree', '--write-tree', baseSha ?? `origin/${base}`, headSha ?? `origin/${head}`],
       { ...childOpts, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
   } catch (e) {
     // A conflicting merge-tree exits non-zero, which execFileSync/execFileSyncThrottled THROWS on — the
@@ -325,7 +336,7 @@ function gitMergeTreeParsed({ pr, cwd = REPO_ROOT, exec = execFileSyncThrottled 
   }
   const parsed = parseMergeTree(stdout, exitCode);
   if (!parsed.tree) return null;
-  return parsed;
+  return includeRefEvidence ? { ...parsed, headSha, baseSha, fetchSucceeded: true } : parsed;
 }
 
 /**
