@@ -1,5 +1,5 @@
 {
-  "_comment": "R1063a warn-only migration baseline: existing tracked tests with literal node/git/gh child_process calls. Move these to *.real.test.mjs over time; remove retired entries.",
+  "$comment": "R1063a warn-only migration baseline: existing tracked tests with literal node/git/gh child_process calls. Move these to *.real.test.mjs over time; remove retired entries.",
   "files": [
     "bun-trial/scripts/__tests__/capability-search.test.mjs",
     "bun-trial/scripts/__tests__/daemon-overlay.test.mjs",
