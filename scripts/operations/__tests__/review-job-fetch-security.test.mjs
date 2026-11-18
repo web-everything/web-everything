@@ -744,7 +744,8 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s canonical repository iden
 
   // GitHub's own ports name the same repository (as drain-api-reads' origin parser accepts them).
   it.each(['ssh://git@github.com:22/', 'https://github.com:443/', 'ssh://git@ssh.github.com:443/',
-    'ssh://git@ssh.github.com/', 'ssh://git@ssh.github.com:22/', 'https://x-access-token@github.com/'])(
+    'ssh://git@ssh.github.com/', 'ssh://git@ssh.github.com:22/', 'https://x-access-token@github.com/',
+    'https://x-access-token:ghs_A1b2-C3%2F@github.com/'])(
     'accepts a GitHub default-port or credentialed origin form without an API call (%s)', prefix => {
       const f = fixture({ origin: `${prefix}${canonical}.git` });
       expect(f.run()).toEqual({ head });
@@ -758,6 +759,9 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s canonical repository iden
     'ssh://git@ssh.github.com:2222/chalbert/web-everything.git', 'ssh://other@github.com:22/chalbert/web-everything.git',
     'ssh://git@github.com:443/chalbert/web-everything.git', 'https://github.com:22/chalbert/web-everything.git',
     'https://github.com.evil.example/chalbert/web-everything.git', 'https://a@b@github.com/chalbert/web-everything.git',
+    'https://evil.example#@github.com/chalbert/web-everything.git', 'https://evil.example?@github.com/chalbert/web-everything.git',
+    'https://evil.example\\@github.com/chalbert/web-everything.git', 'https://u:tok\n@github.com/chalbert/web-everything.git',
+    'https://u tok@github.com/chalbert/web-everything.git', 'https://evil.example/@github.com/chalbert/web-everything.git',
     'git@github.com:../user.git', 'git@github.com:./web-everything.git', 'git@github.com:chalbert/...git'])(
     'refuses unsupported URLs or malformed origin slugs without API calls (%s)', origin => {
       const f = fixture({ origin });

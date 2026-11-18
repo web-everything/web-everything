@@ -343,7 +343,9 @@ function fetchPinnedPrHead({ lanePath, repo, pr, head, headChangedError, env, ex
     const origin = exec('git', ['remote', 'get-url', 'origin'], gitOptions).trim();
     // Only GitHub's own ports name github.com: 22 for ssh, 443 for https, 22 or 443 for ssh.github.com (as
     // drain-api-reads' origin parser does). The origin is identity evidence only: the fetch below uses a fixed URL.
-    const originRepo = /^(?:git@github\.com:|ssh:\/\/git@github\.com(?::22)?\/|ssh:\/\/git@ssh\.github\.com(?::22|:443)?\/|https:\/\/(?:[^@/]+@)?github\.com(?::443)?\/)([^/]+\/[^/]+?)(?:\.git)?\/?$/i.exec(origin)?.[1];
+    // An https login part is RFC 3986 userinfo characters only: `#`, `?`, `\` or whitespace would end the real host
+    // before `@github.com` (`https://evil.example#@github.com/o/r` is evil.example).
+    const originRepo = /^(?:git@github\.com:|ssh:\/\/git@github\.com(?::22)?\/|ssh:\/\/git@ssh\.github\.com(?::22|:443)?\/|https:\/\/(?:[\w.~%!$&'()*+,;=:-]+@)?github\.com(?::443)?\/)([^/]+\/[^/]+?)(?:\.git)?\/?$/i.exec(origin)?.[1];
     const identityError = 'review lane origin repository mismatch or unreadable; inspect lane before retrying';
     if (!isGithubSlug(originRepo)) throw Error(identityError);
     if (originRepo.toLowerCase() !== repo.toLowerCase()) {
