@@ -469,3 +469,20 @@ describe('tombstones across full seeds', () => {
     expect(m.evictedShas).toEqual(['f'.repeat(40)]);
   });
 });
+
+describe('readPrFactsFromGithub pagination', () => {
+  it('walks every page so the latest review is never dropped', () => {
+    const sha = 'c'.repeat(40);
+    const reviewPage = (p) => Array.from({ length: p === 2 ? 5 : 100 }, (_, i) => ({ id: p * 1000 + i, state: p === 2 ? 'CHANGES_REQUESTED' : 'APPROVED',
+      commit_id: sha, submitted_at: `2026-01-0${p}T00:00:${String(i % 60).padStart(2, '0')}Z` }));
+    const exec = (_cmd, args) => {
+      const path = args[args.length - 1];
+      if (/pulls\/4$/.test(path)) return JSON.stringify({ number: 4, state: 'open', draft: false, head: { sha }, labels: [] });
+      if (/check-runs|check-suites/.test(path)) return JSON.stringify({ check_runs: [], check_suites: [] });
+      const page = Number(/&page=(\d+)/.exec(path)?.[1] ?? 1);
+      return JSON.stringify(page === 1 ? reviewPage(1) : page === 2 ? reviewPage(2) : []);
+    };
+    const f = readPrFactsFromGithub({ repo: 'o/r', number: 4, exec });
+    expect(f.review.state).toBe('changes_requested');
+  });
+});

@@ -443,9 +443,19 @@ export function readPrFactsFromGithub({ repo, number, exec = execFileSyncThrottl
   }) || 'null'));
   const pull = api(`repos/${repo}/pulls/${Number(number)}`);
   const sha = pull?.head?.sha;
-  const checkRuns = sha ? api(`repos/${repo}/commits/${sha}/check-runs?per_page=100`)?.check_runs || [] : [];
-  const checkSuites = sha ? api(`repos/${repo}/commits/${sha}/check-suites?per_page=100`)?.check_suites || [] : [];
-  const reviews = api(`repos/${repo}/pulls/${Number(number)}/reviews?per_page=100`) || [];
+  // Every page: the latest review / check must never fall off the end (a short page ends the walk; the cap fails loud).
+  const paged = (path, pick) => {
+    const all = [];
+    for (let page = 1; page <= 50; page += 1) {
+      const rows = pick(api(`${path}?per_page=100${page > 1 ? `&page=${page}` : ''}`)) || [];
+      all.push(...rows);
+      if (rows.length < 100) return all;
+    }
+    throw new Error(`${path}: more than 5000 rows; refusing a truncated read`);
+  };
+  const checkRuns = sha ? paged(`repos/${repo}/commits/${sha}/check-runs`, (b) => b?.check_runs) : [];
+  const checkSuites = sha ? paged(`repos/${repo}/commits/${sha}/check-suites`, (b) => b?.check_suites) : [];
+  const reviews = paged(`repos/${repo}/pulls/${Number(number)}/reviews`, (b) => b);
   return { ...normalizeGithubPr({ repo, pull, checkRuns, checkSuites, reviews }), source: 'github', asOfMs: Date.now(), cursor: null };
 }
 
