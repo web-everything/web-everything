@@ -26,16 +26,19 @@ const source = () => ({ number: pr, headRefOid: head, headRefName: 'lane/5762-ex
   labels: [{ name: 'review:pending' }], comments: [], mergeStateStatus: 'CLEAN',
   statusCheckRollup: [check('test', 'success'), check('review-gate'), check('merge-gate')] });
 
-it.each([false, true])('carries the normal reconciler classification to daemon and external readers (readOnly=%s)', readOnly => {
+it.each([false, true])('recomputes daemon and external classifications from their current snapshots (readOnly=%s)', readOnly => {
   const raw = source();
   const plan = runReconcilePass({ ...options(raw), readOnly });
+  expect(plan.plannerRequiredChecks).toEqual(['test', 'review-gate', 'merge-gate']);
   const row = readPlannerRow({ repo: 'web-everything/web-everything', pr, plan, rawPrs: [raw] });
   expect(row.absent).toBe(false);
   expect(row.refusal).toBe(plan.refusals.find(r => r.prNumber === pr));
-  expect(row.reviewOwnedChecks).toMatchObject({ reviewOwned: ['review-gate', 'merge-gate'],
+  expect(plan.plannerRows[0].reviewOwnedChecks).toMatchObject({ reviewOwned: ['review-gate', 'merge-gate'],
     nonReviewOwned: [], gatesOnlyRed: true, onlyRed: true });
+  expect(row.reviewOwnedChecks).toMatchObject({ reviewOwned: ['review-gate'],
+    nonReviewOwned: ['merge-gate'], gatesOnlyRed: false, onlyRed: false });
   expect(raw.statusCheckRollup[2]).not.toHaveProperty('mergeGateReviewHold');
-  expect(row.reviewOwnedChecks).toBe(plan.plannerRows[0].reviewOwnedChecks);
+  expect(row.reviewOwnedChecks).not.toBe(plan.plannerRows[0].reviewOwnedChecks);
 });
 
 it('exposes scope-bloat folded by the normal not-a-ci-break escalation, without nominating a new path', () => {

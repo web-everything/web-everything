@@ -4445,7 +4445,12 @@ The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true
 ## Red-team planner row parity
 
 The daemon receives a raw PR snapshot, while reconciliation hydrates checks and annotates
-review-owned merge-gate holds. Preserve the classification from that enriched snapshot in
-`plannerRows`; use `readPlannerRow` / `readPlannerRows` when consuming refusals, retaining
+review-owned merge-gate holds. `plannerRows` records that enriched snapshot's classification;
+use `readPlannerRow` / `readPlannerRows` when consuming refusals, retaining
 top-level ownership and the folded `reviewRefusal` separately. The planner-row unit and
 production suites pin refusal parity and propagation through normal and read-only passes.
+Always recompute from the current checks and required set; saved classifications cannot
+reflect check reruns on the same head. Explicit raw snapshots carry only their own ownership
+annotations. Normal passes carry `plannerRequiredChecks` for validation.
+Derive red-only eligibility from the same head-aware CI classification: wrong-head,
+missing-head and unknown-required-set evidence must remain closed.
