@@ -1944,6 +1944,42 @@ describe('prototype-load', () => {
   });
   // R310 (incident 2026-11-01): a superseded registration and old tops froze two daemons for hours.
   describe('auto-retire and replace (R310)', () => {
+    it('R1048 strict containment bypasses retirement and stale checks and completes automatic supersession', async () => {
+      const superseded = [{ entry: { ref: 'lane/old' }, oldTip: 'd'.repeat(39) + '0', newTip: SHA }];
+      const check = { ok: true, clean: true, candSha: SHA, superseded };
+      const f = fixture({ list: ['lane/old'], contained: ['lane/old'], conflicts: ['lane/old'], retireRefuses: 'lane/old',
+        checkRaw: JSON.stringify({ check, wouldRegister: true }), addRaw: JSON.stringify({ conflictCheck: check }),
+        retirePlan: ({ rows }) => rows.map(row => ({ ref: row.ref, action: 'retire', tip: TREE, reason: 'superseded' })) });
+      expect(await f.run()).toMatchObject({ ok: true, adopted: true, stopReason: null, superseded });
+      expect(mutations(f, 'retire')).toEqual([]);
+      expect(f.retirePlanner).not.toHaveBeenCalled();
+      expect(f.calls.some(c => c.args.includes('--ref=lane/old') && c.args.includes('--check'))).toBe(false);
+    });
+
+    it('R1048 retains an ancestor if the fresh add guard no longer supersedes it', async () => {
+      const check = { ok: true, clean: true, candSha: SHA,
+        superseded: [{ entry: { ref: 'lane/old' }, oldTip: 'd'.repeat(39) + '0', newTip: SHA }] };
+      const f = fixture({ list: ['lane/old'], contained: ['lane/old'], checkRaw: JSON.stringify({ check, wouldRegister: true }) });
+      expect(await f.run()).toMatchObject({ ok: false, adopted: true, stopReason: 'swap-remove-failed' });
+      expect(mutations(f, 'remove')).toEqual([]);
+    });
+
+    it('R1048 does not count an explicit replacement target as an uncompleted automatic supersession', async () => {
+      const check = { ok: true, clean: true, candSha: SHA,
+        superseded: [{ entry: { ref: 'lane/old' }, oldTip: 'd'.repeat(39) + '0', newTip: SHA }] };
+      const f = fixture({ list: ['lane/old'], contained: ['lane/old'], checkRaw: JSON.stringify({ check, wouldRegister: true }) });
+      expect(await f.run({ replace: 'lane/old' })).toMatchObject({ ok: true, adopted: true, replaced: 'lane/old', stopReason: null });
+    });
+
+    it('R1048 re-registers an already listed candidate to finish supersession', async () => {
+      const superseded = [{ entry: { ref: 'lane/old' }, oldTip: 'd'.repeat(39) + '0', newTip: SHA }];
+      const check = { ok: true, clean: true, candSha: SHA, superseded };
+      const f = fixture({ list: ['lane/old', BASE.branch], contained: ['lane/old'],
+        checkRaw: JSON.stringify({ check, wouldRegister: true }), addRaw: JSON.stringify({ conflictCheck: check }) });
+      expect(await f.run()).toMatchObject({ ok: true, adopted: true, superseded });
+      expect(mutations(f, 'add')).toHaveLength(1);
+    });
+
     const retireOld = (extra = {}) => ({ retirePlan: ({ rows }) => rows.map((row) => (row.ref === 'lane/old'
       ? { ref: 'lane/old', action: 'retire', reason: 'superseded', tip: TREE, pr: 6056, evidence: { supersededBy: 6132 }, ...extra }
       : { ref: row.ref, action: 'keep', reason: 'unique-commits-not-on-main' })) });

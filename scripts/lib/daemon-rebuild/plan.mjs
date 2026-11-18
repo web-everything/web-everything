@@ -7,6 +7,7 @@ import { resolveOverlayConflict } from './overlay-strategies.mjs';
 import { recordedEdgeSha } from './edge-fetch.mjs';
 import { tipInMain } from './audited-tip.mjs';
 import { createHash } from 'node:crypto';
+import { isSafeBranchName } from '../daemon-self-sync.mjs';
 
 // ── pinned overlays — the self-destruct guard ───────────────────────────────────────────────────────────────
 
@@ -50,6 +51,28 @@ export function pinnedStatus(git, raw, mainSha, ovSha) {
   const diff = git(['diff', '--name-only', base, ovSha, '--', ...REBUILD_MECHANISM_PATHS]);
   if (diff.status !== 0) return { pinned: true, why: 'unknown' };
   return String(diff.stdout ?? '').trim() ? { pinned: true, why: 'mechanism' } : { pinned: false, why: null };
+}
+
+/** R1048: only verified strict ancestors can be replaced without dropping work.
+ * Unknown Git evidence retains the registration for the existing refusal/operator path.
+ * Edge resolutions can carry additional work outside the branch tip, so retain those too.
+ */
+export function supersededOverlays(git, overlays, mainSha, candidateSha) {
+  try {
+    if (![mainSha, candidateSha].every(sha => FULL_SHA_RE.test(sha ?? '')
+      && verifyRev(git, `${sha}^{commit}`) === sha)) return [];
+  } catch { return []; }
+  return overlays.flatMap(entry => {
+    try {
+      if (!isSafeBranchName(entry?.ref) || entry.pinned === true || entry.edgeResolution) return [];
+      const oldTip = verifyRev(git, `refs/remotes/origin/${entry.ref}^{commit}`);
+      if (!FULL_SHA_RE.test(oldTip ?? '') || oldTip === candidateSha
+        || verifyRev(git, `${oldTip}^{commit}`) !== oldTip
+        || pinnedStatus(git, entry, mainSha, oldTip).pinned
+        || git(['merge-base', '--is-ancestor', oldTip, candidateSha]).status !== 0) return [];
+      return [{ entry, oldTip, newTip: candidateSha }];
+    } catch { return []; }
+  });
 }
 
 /** The mechanism files main itself must carry for a build WITHOUT a skipped pinned overlay to still rebuild

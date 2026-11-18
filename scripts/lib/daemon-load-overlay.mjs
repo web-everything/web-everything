@@ -80,8 +80,9 @@ import {
  */
 export async function guardedRegister({ root, ref, pr, env, gate, register }) {
   // Lazy: daemon-overlay.mjs imports this module (overlaySafetySettings), so a static import would be a cycle.
-  const { stackAwareOverlayCheck, withAddGuardLock } = await import('../daemon-overlay.mjs');
+  const { stackAwareOverlayCheck, withAddGuardLock, registerSuperseding, settlePendingDrops } = await import('../daemon-overlay.mjs');
   return withAddGuardLock(root, env, async () => {
+    await settlePendingDrops({ root, env });
     const st = readOverlayState(root, { env });
     if (st.corrupt) return { registered: false, reason: 'overlay-store-corrupt' };
     const check = await stackAwareOverlayCheck({
@@ -89,7 +90,10 @@ export async function guardedRegister({ root, ref, pr, env, gate, register }) {
     });
     if (!check.ok) return { registered: false, reason: 'conflict-check-failed', check };
     if (!check.clean && !gate.override) return { registered: false, reason: 'conflict', check };
-    register(!check.clean ? { ...gate.override, files: check.files, conflicting: check.conflicting } : null);
+    const registration = await registerSuperseding({ root, ref, check, env,
+      register: () => register(!check.clean ? { ...gate.override, files: check.files, conflicting: check.conflicting } : null, check.superseded),
+    });
+    if (!registration.ok) return { registered: false, reason: registration.reason, check };
     return { registered: true, check };
   });
 }
@@ -718,9 +722,9 @@ export async function runDaemonLoadOverlay({
 
   // Every REAL registration goes through add's guard (guardedRegister). An injected `addOverlayFn` (unit wiring tests)
   // registers nothing real, so it is not guarded unless the caller also injects `admit`.
-  const register = (override) => addOverlayFn(root, {
+  const register = (override, superseded) => addOverlayFn(root, {
     ref, pr, addedBy: by, reason, now, ...(override ? { conflictOverride: override } : {}),
-  }, { env });
+  }, { env, superseded });
   const admitFn = admit ?? (addOverlayFn === addOverlay ? guardedRegister : null);
   if (admitFn) {
     const admitted = await admitFn({ root, ref, pr, env, gate, register });

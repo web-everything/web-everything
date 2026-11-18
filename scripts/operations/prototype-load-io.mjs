@@ -626,11 +626,15 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         requireGit('push', 'origin', `${commit}:refs/heads/${out.wouldMerge.ref}`);
         out.effectiveRef = out.wouldMerge.ref; out.effectiveSha = commit;
       }
-      if (!input.replace) out.check = check(out.clone, out.effectiveRef, out.effectiveSha);
+      out.check = check(out.clone, out.effectiveRef, out.effectiveSha);
+      // The guarded add re-proves these strict ancestors and swaps them atomically with
+      // the new registration. They need neither independent retirement nor stale checks.
+      const superseding = out.check.ok === true && out.check.clean === true && out.check.candSha === out.effectiveSha
+        ? (out.check.superseded || []).map(s => s.entry.ref).filter(ref => ref !== input.replace) : [];
       if (!settleIntents()) return stop('drop-recovery-failed', { fallback: 'Drop intents are unsettled; run daemon-overlay.mjs recover-drops and inspect them.' });
       const listed = listRows();
       if (!listed.ok) return stop('check-unverifiable', { listing: listed.listing });
-      const retiredRefs = retireStep(listed.rows, [out.effectiveRef, input.replace].filter(Boolean));
+      const retiredRefs = retireStep(listed.rows, [out.effectiveRef, input.replace, ...superseding].filter(Boolean));
       if (out.retireRefused.length) return stop('retire-refused', { fallback: 'A proved retirement was refused by the loader (tip moved or entry changed); rerun to re-prove it.' });
       const rows = listed.rows.filter((r) => !retiredRefs.includes(r.ref));
       if (input.replace) {
@@ -647,7 +651,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       const overlapping = [], combinedChanged = new Set(effectivePaths);
       const blockingReasons = Object.create(null);
       out.staleChecks = {};
-      for (const ref of established.filter((ref) => ref !== out.effectiveRef)) {
+      for (const ref of established.filter((ref) => ref !== out.effectiveRef && !superseding.includes(ref))) {
         if (git('fetch', 'origin', ref).code !== 0) {
           if (git('ls-remote', '--exit-code', 'origin', `refs/heads/${ref}`).code === 2) {
             // Registrations do not pin an authoritative tip. A cached tracking ref may
@@ -742,6 +746,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       if (rows.some((row) => row.ref === out.effectiveRef)) out.registered = 'already';
       if (input.dryRun) {
         out.wouldRegister = out.registered !== 'already'; out.wouldRemove = []; out.wouldRetain = contained;
+        if (superseding.length) out.wouldSupersede = superseding;
         if (input.replace) out.wouldReplace = input.replace;
         if (contained.length) out.wouldStopReason = 'swap-remove-failed';
         out.ok = true; return out;
@@ -768,7 +773,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           return stop('register-failed', { detail: 'admitted-sha-unverified', fallback: 'Inspect the candidate registration and loader evidence before retrying.' });
         }
         out.replaced = input.replace;
-      } else if (out.registered !== 'already') {
+        out.superseded = evidence.superseded || [];
+      } else if (out.registered !== 'already' || superseding.length) {
         const result = loader('add', out.clone, out.effectiveRef, [`--expected-sha=${out.effectiveSha}`, `--reason=${input.why || `prototype-load: ${input.daemon} ${out.effectiveRef}`}`, `--by=${env.USER || 'unknown'}`]);
         out.registration = result;
         if (result.code !== 0) return stop('register-failed');
@@ -777,7 +783,12 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         if (evidence?.ok !== true || evidence.clean !== true || evidence.candSha !== out.effectiveSha) {
           return stop('register-failed', { detail: 'admitted-sha-unverified', fallback: 'Inspect the candidate registration and loader evidence before retrying; prior registrations were retained.' });
         }
+        out.superseded = evidence.superseded || [];
       }
+      const supersededRefs = (out.superseded || []).map(s => s.entry.ref);
+      // A fresh guard may retain a tip that moved after preview. Re-enter the existing
+      // retained-registration refusal instead of claiming the preview completed a swap.
+      contained.push(...superseding.filter(ref => !supersededRefs.includes(ref)));
       const readyPath = expand(config.readyRecordPath);
       fs.mkdirSync(dirname(readyPath), { recursive: true });
       fs.appendFileSync(readyPath, `${JSON.stringify(producedReady)}\n`, 'utf8');

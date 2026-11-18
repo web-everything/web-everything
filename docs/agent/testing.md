@@ -4762,3 +4762,19 @@ Preserve `overlaysBefore` as a veto for omitted live tips: the regression for a 
 retired during planning must reject its omission and preserve HEAD.
 Run this file and `daemon-rebuild-events.test.mjs` through heavy admission. This adoption
 rule does not reset overlay main-sync parking or add retries for parked overlays.
+
+## Prototype overlay containment and shared ledgers (R1048)
+
+Admission replaces a registration only when its verified current tip is a strict ancestor of the
+candidate tip. Equal tips, explicit or mechanism pins, edge resolutions, unreadable Git evidence,
+and changed registration identities keep the existing path. The guarded add rechecks remote tips
+and records `overlay-superseded` with both SHAs; no retirement ruling is needed for contained work.
+Reuse the durable drop intent and post-write tip check: moved or unreadable tips restore the old entry,
+including recovery after an interrupted registration.
+`daemon-overlay-supersede.test.mjs` and the `overlay-containment-ledger-union` soak replay cover this.
+
+The shared advisory resolver also unions additive `docs/agent/testing.md` notes: every base line
+must survive in order, with common additions deduplicated at each insertion gap. Edits, deletions,
+conflict markers, and conflicts outside the three shared ledgers still require operator resolution.
+Run the scoped unit files and the soak wrapper through heavy admission, using
+`--config vitest.soak.config.ts` for the soak.

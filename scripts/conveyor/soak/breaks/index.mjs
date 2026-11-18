@@ -50,6 +50,7 @@
  * `unchecked-draft-and-stale-accepted-status.mjs` uses the same automatic registration.
  *
  * `daemon-load-overlay-stale-tracking-ref.mjs` uses the same automatic registration.
+ * `overlay-containment-ledger-union.mjs` registers the R1048 containment/ledger replay through discovery.
  *
  * This file itself stays a thin, EAGER entry point (a top-level `await` builds `BREAKS` once, at import time) —
  * the discovery/validation logic lives in `../registry-discovery.mjs` (generic, no eager directory scan) and

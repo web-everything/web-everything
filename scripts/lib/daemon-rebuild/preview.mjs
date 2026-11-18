@@ -12,7 +12,7 @@ import { join, isAbsolute, resolve as resolvePath, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fetchMainAndOverlays, defaultPrState } from './edge-fetch.mjs';
-import { planRebuild } from './plan.mjs';
+import { planRebuild, supersededOverlays } from './plan.mjs';
 import { makeAuditedTipGate } from './audited-tip.mjs';
 import { isSafeBranchName } from '../daemon-self-sync.mjs';
 import { acquireSmokeSlot } from '../daemon-smoke-slots.mjs';
@@ -250,6 +250,11 @@ export async function previewOverlayConflict({
     const mainSha = verifyRev(scratchGit, 'origin/main^{commit}');
     if (!mainSha) return { ok: false, reason: 'main-unresolved' };
 
+    const candSha = fetched.goneRefs.includes(ref) ? null : verifyRev(scratchGit, `origin/${ref}^{commit}`);
+    if (!candSha) return { ok: false, reason: 'ref-unresolved' };
+    const superseded = supersededOverlays(scratchGit, existingOverlays, mainSha, candSha);
+    existingOverlays = existingOverlays.filter(o => !superseded.some(s => s.entry.ref === o.ref));
+
     // 1. Fold every ALREADY-registered overlay using the running HEAD — the SAME `planRebuild` a real rebuild runs —
     // to compute `cur`, the exact tree the candidate would land on top of (never re-derived by hand here).
     // Main is still the fold's base; HEAD supplies established priority and adopted heads for moving-tip pins.
@@ -279,17 +284,13 @@ export async function previewOverlayConflict({
     if (!planExisting.ok) return { ok: false, reason: 'existing-overlays-unresolved', detail: planExisting, setAside };
     const cur = planExisting.finalSha;
 
-    // 2. The candidate's own tip (already fetched above).
-    const candSha = fetched.goneRefs.includes(ref) ? null : verifyRev(scratchGit, `origin/${ref}^{commit}`);
-    if (!candSha) return { ok: false, reason: 'ref-unresolved' };
-
-    // 3. THE CHECK — deliberately WITH messages (unlike planRebuild's own internal folds), so a real conflict
+    // THE CHECK — deliberately WITH messages (unlike planRebuild's own internal folds), so a real conflict
     // names its file(s) for the refusal/`--allow-conflict` print.
     const mt = scratchGit(['merge-tree', '--write-tree', cur, candSha]);
-    if (mt.status === 0) return { ok: true, clean: true, mainSha, cur, candSha, setAside };
+    if (mt.status === 0) return { ok: true, clean: true, mainSha, cur, candSha, setAside, superseded };
     if (mt.status === 1 && env[OVERLAY_EDGE_RESOLVE_ENV] !== '0'
       && resolveOverlayConflict({ git: scratchGit, cur, ovSha: candSha, ref }).ok) {
-      return { ok: true, clean: true, mainSha, cur, candSha, setAside };
+      return { ok: true, clean: true, mainSha, cur, candSha, setAside, superseded };
     }
 
     // A repair can unlock a moving tip's retry even when it conflicts with the stack's pinned head.
@@ -312,7 +313,7 @@ export async function previewOverlayConflict({
           && FULL_SHA_RE.test(o.sha ?? '') && FULL_SHA_RE.test(a.sha ?? '')
           && (a.sha === o.sha || scratchGit(['merge-base', '--is-ancestor', o.sha, a.sha]).status === 0)))
         && planCandidate.establishedLost.length === 0) {
-        return { ok: true, clean: true, mainSha, cur, candSha, setAside };
+        return { ok: true, clean: true, mainSha, cur, candSha, setAside, superseded };
       }
     }
 

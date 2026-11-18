@@ -6,7 +6,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { spawnSync } from 'node:child_process';
 import { FULL_SHA_RE } from './shared.mjs';
 
-export const ADVISORY_MERGE_PATHS = Object.freeze(['scripts/ci/test-timings.json', 'scripts/conveyor/soak/breaks/index.mjs']);
+export const ADVISORY_MERGE_PATHS = Object.freeze(['scripts/ci/test-timings.json', 'scripts/conveyor/soak/breaks/index.mjs', 'docs/agent/testing.md']);
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 
 /** Union object entries, conservatively retaining the larger numeric observation. */
@@ -35,11 +35,11 @@ export function mergeTimingsJson(baseText, oursText, theirsText) {
 
 // Preserve every base line; match identical cross-side additions one-for-one at each base gap.
 // A non-additive edit is outside this registry contract; leave it for operator resolution.
-function mergeRegistryLines(baseText, oursText, theirsText) {
+function mergeRegistryLines(baseText, oursText, theirsText, markdown = false) {
   const lines = text => text.match(/[^\n]*\n|[^\n]+$/g) || [];
   const base = lines(baseText), gaps = base.map(() => []);
   const headerEnd = base.findIndex(line => line.includes('*/'));
-  if (base[0] !== '/**\n' || headerEnd < 1 || ![' */\n', ' */'].includes(base[headerEnd])) return null;
+  if (!markdown && (base[0] !== '/**\n' || headerEnd < 1 || ![' */\n', ' */'].includes(base[headerEnd]))) return null;
   gaps.push([]);
   const added = gaps.map(() => new Map());
   for (const [side, text] of [oursText, theirsText].entries()) {
@@ -47,7 +47,7 @@ function mergeRegistryLines(baseText, oursText, theirsText) {
     for (const line of lines(text)) {
       if (cursor < base.length && line === base[cursor]) cursor++;
       else {
-        if (cursor === 0 || cursor > headerEnd || !/^ \* /.test(line) || line.includes('/*') || line.includes('*/')) return null;
+        if (!markdown && (cursor === 0 || cursor > headerEnd || !/^ \* /.test(line) || line.includes('/*') || line.includes('*/'))) return null;
         const count = added[cursor].get(line) || 0;
         if (side === 1 && count > 0) added[cursor].set(line, count - 1);
         else {
@@ -74,8 +74,9 @@ function checkModuleSyntax(path) {
 function readMerge(git, revisions, path) {
   const inputs = revisions.map(revision => git(['show', `${revision}:${path}`]));
   if (inputs.some(result => result.status !== 0)) return null;
-  return (path === ADVISORY_MERGE_PATHS[0] ? mergeTimingsJson : mergeRegistryLines)(
-    ...inputs.map(result => String(result.stdout)));
+  const texts = inputs.map(result => String(result.stdout));
+  return path === ADVISORY_MERGE_PATHS[0] ? mergeTimingsJson(...texts)
+    : mergeRegistryLines(...texts, path === 'docs/agent/testing.md');
 }
 
 const advisoryOnly = paths => paths.length > 0 && paths.every(path => ADVISORY_MERGE_PATHS.includes(path));

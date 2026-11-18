@@ -208,9 +208,11 @@ export function writeOverlays(root, list, { env = process.env } = {}) {
  * stacked on lane/b, itself on lane/a). The rebuild reads it only when gh cannot answer; leaving it out keeps it as is.
  * @param {{ref:string, pr?:number|null, addedBy?:string|null, reason?:string|null, now?:string, pinned?:boolean,
  *   stackBases?:string[]}} entry
- * @param {{env?:NodeJS.ProcessEnv, expectedOverlay?:object}} [o]
+ * @param {{env?:NodeJS.ProcessEnv, expectedOverlay?:object, superseded?:Array<{entry:object,oldTip:string,newTip:string}>}} [o]
  * `expectedOverlay`, when supplied, must still match the source registration under the list mutex.
  * Detached repairs use this snapshot to avoid undoing a concurrent unload or update.
+ * `superseded` comes from the admission guard's verified strict-containment proof; callers
+ * recheck its remote tips before writing. Replace those exact entries in this same list mutation.
  * @returns {Array<object>} the new list
  */
 /**
@@ -256,13 +258,22 @@ export function registrationIdentity(entry) {
 
 export function addOverlay(root, {
   ref, pr = null, addedBy = null, reason = null, now, pinned, stackBases, conflictOverride,
-} = {}, { env = process.env, expectedOverlay } = {}) {
+} = {}, { env = process.env, expectedOverlay, superseded = [] } = {}) {
   if (!isSafeBranchName(ref)) {
     throw new TypeError(`daemon-overlays: ref ${JSON.stringify(ref)} is not a safe branch name — refusing to add it`);
   }
   const bases = Array.isArray(stackBases) ? stackBases.filter((b) => isSafeBranchName(b)) : null;
   return withListLock(root, env, (pause) => {
-    const list = readOverlaysForWrite(root, env).slice();
+    let list = readOverlaysForWrite(root, env).slice();
+    for (const proof of superseded) {
+      const entry = list.find(o => o?.ref === proof?.entry?.ref);
+      if (!entry || entry.ref === ref || entry.pinned === true || entry.edgeResolution
+        || !/^[a-f0-9]{40}$/.test(proof.oldTip ?? '') || !/^[a-f0-9]{40}$/.test(proof.newTip ?? '')
+        || proof.oldTip === proof.newTip
+        || !isDeepStrictEqual(registrationIdentity(entry), registrationIdentity(proof.entry))) {
+        throw new Error('supersession evidence changed; retain registrations and retry admission');
+      }
+    }
     pause();
     if (expectedOverlay !== undefined && (!expectedOverlay || !isSafeBranchName(expectedOverlay.ref)
       || !isDeepStrictEqual(registrationIdentity(list.find(o => o?.ref === expectedOverlay.ref)), registrationIdentity(expectedOverlay)))) {
@@ -284,7 +295,12 @@ export function addOverlay(root, {
       if (conflictOverride) next.conflictOverride = conflictOverride;
       list[idx] = next;
     }
-    return writeOverlays(root, list, { env });
+    list = list.filter(o => !superseded.some(s => s.entry.ref === o.ref));
+    const written = writeOverlays(root, list, { env });
+    for (const { entry, oldTip, newTip } of superseded) appendOverlayEvent(root, {
+      kind: 'overlay-superseded', ref: entry.ref, pr: entry.pr ?? null, replacedBy: ref, oldTip, newTip, by: addedBy,
+    }, { env });
+    return written;
   });
 }
 
