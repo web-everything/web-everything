@@ -414,7 +414,8 @@ describe('R972 Windows home paths', () => {
   });
   // PR 7008 self-review: host patterns restarted at every inner dot or dash (quadratic on a long run).
   it('stays linear on long dotted and dashed runs', () => {
-    for (const text of ['1.'.repeat(40000), 'a-'.repeat(40000), 'a.'.repeat(40000) + 'workers', 'fd00:'.repeat(20000)]) {
+    for (const text of ['1.'.repeat(40000), 'a-'.repeat(40000), 'a.'.repeat(40000) + 'workers', 'fd00:'.repeat(20000),
+      `a::${'.'.repeat(80000)}a`, `a::${'1.'.repeat(40000)}`, `x:${'a:'.repeat(40000)}`]) {
       const started = performance.now();
       scanText(text);
       expect(performance.now() - started).toBeLessThan(1500);
@@ -465,6 +466,9 @@ describe('R972 tier-three patterns', () => {
     // A sentence colon after the hex mapped form, and the zero-prefixed mapped spelling.
     `Address ${ula('', '', 'ffff', 'a00', '1')}: blocked`, ula('0', '', 'ffff', 'a00', '1'),
     `ip::${ula('', 'ffff', 'a00', '1')}`, `${ula('fd00', v4(10, 0, 0, 1))}`,
+    // Self-review round 2: a port or word joined after the address, and an underscore key before it.
+    `IP6 ${ula('fe80', '', '1')}.546 > ff02::1:2.547`, `${ula('fd00', '', '1')}.53`, `host ${ula('fd00', '', '1')}:http`,
+    `bind_addr:${ula('fd00', '', '1')}`, `node_ip:${ula('fe80', '', '1')}`,
   ])('detects private IPs beside ordinary punctuation: %s', text => {
     expect(scanText(text).some(hit => hit.pattern === 'private-network-ip')).toBe(true);
   });
@@ -499,6 +503,9 @@ describe('R972 tier-three patterns', () => {
     ['home-path', '/Users/alice'], ['home-path', '/home\u002ffirst.last/source'],
     ['private-service-url', 'https://personal-api.alice-projects.workers.dev/path'],
     ['network-name', 'build.tail123abc.ts.net'], ['network-name', 'builder.tailscale'],
+    // PR 7008 self-review round 2: wildcard, leading-dot and leading-dash hosts.
+    ['private-service-url', '*.my-app.workers.dev'], ['private-service-url', '-foo.workers.dev'],
+    ['network-name', '*.tail1234.ts.net'], ['network-name', '.foo.ts.net'],
     ['network-name', 'tailscale hostname: private-builder'],
     ['private-network-ip', '10.23.45.67'], ['private-network-ip', '172.16.0.2'],
     ['private-network-ip', '172.31.255.254'], ['private-network-ip', '192.168.3.4'],

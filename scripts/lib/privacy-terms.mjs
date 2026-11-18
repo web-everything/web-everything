@@ -91,7 +91,8 @@ const HOME_PATH_SOURCE = `(?<![/\\\\])${SEP}(?:Users|home|Documents and Settings
   + `|${WINDOWS_ROOT}${SEP}${USERS_ANY_CASE}${SEP}${HOME_TOKEN}|${BACKSLASH}${USERS_ANY_CASE}${SEP}${HOME_TOKEN}`;
 const IPV4_SOURCE = String.raw`(?<!\w|\d\.)(?:\d{1,3}\.){3}\d{1,3}(?!\w|\.\d)`;
 // One start per run of token characters (the lookbehind), at least two colons, optional zone.
-const IPV6_TOKEN_SOURCE = String.raw`(?<![\w:.%])(?:[0-9a-z]*:){2,}[0-9a-z:.]*(?:%[\w.-]+)?`;
+// Word characters (with `_`) are token characters, so a key like bind_addr: joins the token instead of hiding it.
+const IPV6_TOKEN_SOURCE = String.raw`(?<![\w:.%])(?:\w*:){2,}[\w:.]*(?:%[\w.-]+)?`;
 const SERVICE_PLACEHOLDERS = new Set(['example.workers.dev', 'your-worker.workers.dev']);
 const NETWORK_PLACEHOLDERS = new Set(['example.ts.net']);
 export const PATTERNS = Object.freeze([
@@ -101,10 +102,12 @@ export const PATTERNS = Object.freeze([
   { id: 'home-path', source: HOME_PATH_SOURCE, flags: 'g' },
   // Committed identity digests and optional local identity; never store the actual identity here.
   { id: 'operator-username', source: null, flags: 'gi' },
-  // PR 7008: a host match starts only at the start of a host run, never after an inner dot or dash. The
-  // leftmost start already matched there, so results are unchanged, but a long dotted run is now linear.
-  { id: 'private-service-url', source: String.raw`(?<![\w.-])([a-z0-9][a-z0-9.-]*)\.workers\.dev\b`, flags: 'gi' },
-  { id: 'network-name', source: String.raw`(?<![\w.-])[a-z0-9][a-z0-9.-]*\.(?:ts\.net|tailscale)\b|\btailscale(?:[- ]host(?:name)?)?\s*[:=]\s*["']?([a-z0-9][a-z0-9.-]*)`, flags: 'gi' },
+  // PR 7008: a host match never restarts after an inner dot or dash of a run that already began with a
+  // letter or digit (the leftmost start covers it), so a long dotted run is linear. A host after a
+  // leading `*.`, `.` or `-` still matches, as with the plain word boundary. The look-back is capped at
+  // 8 separators so it stays constant-time; past that, a restart finds nothing the leftmost start missed.
+  { id: 'private-service-url', source: String.raw`\b(?<![a-z0-9][.-]{0,8})([a-z0-9][a-z0-9.-]*)\.workers\.dev\b`, flags: 'gi' },
+  { id: 'network-name', source: String.raw`\b(?<![a-z0-9][.-]{0,8})[a-z0-9][a-z0-9.-]*\.(?:ts\.net|tailscale)\b|\btailscale(?:[- ]host(?:name)?)?\s*[:=]\s*["']?([a-z0-9][a-z0-9.-]*)`, flags: 'gi' },
   // PR 7008: two scans (see scanPrivacyView). IPv4 boundaries reject only a longer dotted number, so
   // sentence punctuation and colon-joined syntax (ssh -L port:host:port, key:value) still match.
   // IPv6 is matched as a whole colon-joined token and resolved by privateIpv6InToken.
@@ -133,29 +136,36 @@ function isPrivateIp(value) {
 }
 
 /**
- * PR 7008 — the private IPv6 address inside one colon-joined token, or null. Candidates start at the token
- * start, after each `:` or `.`, and at each `::`; trailing sentence dots and one trailing colon are dropped.
- * The LONGEST valid address wins: a valid public address is never reported for a private-looking tail
- * (2001:db8:fc00::1), while a non-address prefix (source:, ip:) is skipped to reach the address after it.
- * A hex-only key (db:fd00::5) forms a valid public address itself and is read as one.
+ * PR 7008 — the private IPv6 address inside one colon-joined token, or null. A candidate starts at the token
+ * start, after a `:` or `.`, or at a `::`, and ends at the token end or just before a `:` or `.`, so a key
+ * before (source:, bind_addr:) and a port or word after (.546, :http, a sentence dot or colon) are skipped.
+ * The LONGEST valid address wins: a valid public address is never reported for a private-looking part
+ * (2001:db8:fc00::1). A hex-only key (db:fd00::5) forms a valid public address itself and is read as one.
+ * No valid IPv6 text exceeds 45 characters, so each start tries a bounded number of ends: linear per token.
  */
 function privateIpv6InToken(token) {
   const zoneAt = token.indexOf('%');
   const body = zoneAt < 0 ? token : token.slice(0, zoneAt);
   const zone = zoneAt < 0 ? '' : token.slice(zoneAt);
-  const dotless = body.replace(/\.+$/, '');
-  const ends = [...new Set([body, dotless, dotless.replace(/([^:]):$/, '$1')])];
-  for (const end of ends) {
-    // No valid IPv6 text exceeds 45 characters, so skip longer suffixes without slicing: one token stays linear.
-    for (let start = Math.max(0, end.length - 45); start < end.length; start += 1) {
-      if (start > 0 && !/[:.]/.test(end[start - 1]) && end.slice(start, start + 2) !== '::') continue;
-      const candidate = end.slice(start);
-      if (isIP(candidate) !== 6) continue;
-      if (!isPrivateIp(candidate)) return null;
-      return { offset: start, text: candidate + (end === body ? zone : '') };
+  const ends = [];
+  for (let at = 0; at < body.length; at += 1) if (body[at] === ':' || body[at] === '.') ends.push(at);
+  ends.push(body.length);
+  let best = null;
+  let first = 0;
+  for (let start = 0; start < body.length; start += 1) {
+    const boundary = start === 0 || body[start - 1] === ':' || body[start - 1] === '.'
+      || (body[start] === ':' && body[start + 1] === ':');
+    if (!boundary) continue;
+    while (first < ends.length && ends[first] <= start) first += 1;
+    for (let e = first; e < ends.length && ends[e] - start <= 45; e += 1) {
+      const end = ends[e];
+      if (best && end - start <= best.text.length) continue;
+      const candidate = body.slice(start, end);
+      if (isIP(candidate) === 6) best = { offset: start, text: candidate, atEnd: end === body.length };
     }
   }
-  return null;
+  if (!best || !isPrivateIp(best.text)) return null;
+  return { offset: best.offset, text: best.text + (best.atEnd ? zone : '') };
 }
 
 /** PR 7008 — private-network-ip hits as `{ match, index }`, IPv6 tokens first so an IPv4 tail inside a reported
