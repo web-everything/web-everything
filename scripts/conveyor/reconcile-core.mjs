@@ -1501,9 +1501,6 @@ function sendBackAfterFixAttempt(pr) {
     .some(marker => String(c?.body ?? '').trimStart().startsWith(marker)));
   const times = attempts.map(c => Date.parse(c.createdAt ?? c.created_at));
   if (times.some(at => !Number.isFinite(at))) return false;
-  // Preserve the existing operator request's review-order and one-shot consumption proof. An automated
-  // copy with no fixer episode cannot create a new repair obligation on an already-reviewed head.
-  if (!attempts.length) return Boolean(operatorSendBackAfterReview(pr));
   const lastAt = Math.max(-Infinity, ...times);
   const lastIndex = Math.max(-1, ...attempts.map(c => comments.indexOf(c)));
   const verdict = latestChangesVerdict(trusted);
@@ -1522,8 +1519,13 @@ function sendBackAfterFixAttempt(pr) {
   // A gate decision supersedes label events just as it supersedes comment requests.
   // Unreadable gate chronology cannot prove that a request is newer (NaN fails closed).
   const latestSupersedingAt = Math.max(review.at,
-    gate && !['sent-back', 'operator-block'].includes(gate.outcome)
+    gate && !gateRequest
       ? Date.parse(gate.comment.createdAt ?? gate.comment.created_at) : -Infinity);
+  // Preserve the operator request's review-order and one-shot consumption proof, but apply the
+  // same gate/review supersession even before any fixer episode. Automated copies cannot create one.
+  if (!attempts.length) return Boolean(operatorRequest && trusted.some(c =>
+    String(c.id ?? c.node_id) === operatorRequest.verdictId
+      && Date.parse(c.createdAt ?? c.created_at) > latestSupersedingAt));
   if (requests.some(c => {
     const heads = reviewedHeadsOf(c);
     const pinned = heads.some(head => sameHeadSha(head, pr.headRefOid))
@@ -3123,6 +3125,8 @@ export function planReconcile({
       ?? ((ciRepairOwed || (phase === 'bounced' && !withPhase.labels.includes(CONFLICT_LABEL)))
         ? operatorSendBackRearm(pr, operatorBudget) : null);
     if (sendBack) {
+      // The direct operator route must honor the same supersession proof as ordinary fixes.
+      if (refuseReferralHold({ pr, refuse, withPhase })) continue;
       const attempts = roundAttempts();
       if (attempts >= effectiveRoundCap) {
         refuseCapExhausted({

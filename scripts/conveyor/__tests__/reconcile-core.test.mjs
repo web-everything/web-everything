@@ -176,9 +176,12 @@ describe('same-head referral resume preserves a newer send-back', () => {
     expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'fix' })]);
   });
 
-  it('a later same-head round-cap supersedes a trusted send-back label event', () => {
-    const capped = comment(`<!-- we:red-team-gate pr=6989 rev=${head} outcome=round-cap -->`, '2026-11-18T05:44:00Z');
-    const result = run(['status:sent-back-red-team', 'red-team:blocked'], [attempt, advisory, capped], {
+  it.each([
+    { outcome: 'round-cap', labels: ['status:sent-back-red-team', 'red-team:blocked'] },
+    { outcome: 'operator-block', labels: ['status:sent-back-red-team'] },
+  ])('a later same-head $outcome supersedes a trusted send-back label event ($labels)', ({ outcome, labels }) => {
+    const capped = comment(`<!-- we:red-team-gate pr=6989 rev=${head} outcome=${outcome} -->`, '2026-11-18T05:44:00Z');
+    const result = run(labels, [attempt, advisory, capped], {
       number: 6989,
       headChangedAt: '2026-11-18T04:00:00Z',
       labelEvents: [{ actor: AUTOMATION, event: 'labeled', label: { name: 'status:sent-back-red-team' }, created_at: sendBack.createdAt }],
@@ -187,7 +190,7 @@ describe('same-head referral resume preserves a newer send-back', () => {
     expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
   });
 
-  it.each(['round-cap', 'clear', 'card-queued', 'unknown'])('a later same-head %s supersedes a trusted send-back comment', outcome => {
+  it.each(['round-cap', 'clear', 'card-queued', 'unknown', 'operator-block'])('a later same-head %s supersedes a trusted send-back comment', outcome => {
     const gate = comment(`<!-- we:red-team-gate pr=6989 rev=${head} outcome=${outcome} -->`, '2026-11-18T05:44:00Z');
     const result = run(['status:sent-back-review'], [attempt, advisory, sendBack, gate], { number: 6989 });
     expect(result.dispatch).toEqual([]);
@@ -223,6 +226,24 @@ describe('same-head referral resume preserves a newer send-back', () => {
     const request = { id: 'operator-send-back', author: { login: 'chalbert' }, createdAt: sendBack.createdAt,
       body: '🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.\n\nFix the missing export.' };
     expect(run([], [attempt, advisory, request]).dispatch).toEqual([expect.objectContaining({ kind: 'fix' })]);
+  });
+
+  it.each([
+    { outcome: 'round-cap', gateAt: '2026-11-18T05:44:00Z', released: false },
+    { outcome: 'operator-block', gateAt: '2026-11-18T05:44:00Z', released: false },
+    { outcome: 'round-cap', gateAt: sendBack.createdAt, released: false },
+    { outcome: 'round-cap', gateAt: 'unknown', released: false },
+    { outcome: 'round-cap', gateAt: '2026-11-18T05:20:00Z', released: true },
+  ])('without fixer markers, operator send-back respects $outcome at $gateAt (released=$released)', ({ outcome, gateAt, released }) => {
+    const request = { id: 'operator-send-back', author: { login: 'chalbert' }, createdAt: sendBack.createdAt,
+      body: '🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.\n\nFix the missing export.' };
+    const gate = comment(`<!-- we:red-team-gate pr=6989 rev=${head} outcome=${outcome} -->`, gateAt);
+    const result = run([], [advisory, request, gate], { number: 6989 });
+    if (released) expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'fix' })]);
+    else {
+      expect(result.dispatch).toEqual([]);
+      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
+    }
   });
 
   it('a later accept advisory supersedes a pinned request after the fixer attempt', () => {
