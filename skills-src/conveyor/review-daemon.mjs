@@ -1453,8 +1453,8 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
       livePrs.clear();
       if (['off', '0', 'false', 'no'].includes(String(process.env.WE_RED_TEAM_DISPATCH_QUEUE ?? '').trim().toLowerCase())) return;
       redTeamDispatchQueue ??= createRedTeamDispatchQueue({ log: line => log.error(line) });
-      // Only the dispatch wrapper replans: maintenance must not double the per-tick probe budget.
-      redTeamDispatchQueue.reconcile({ readLivePr: readQueuePr, replan: false });
+      // Maintenance evicts terminal PRs and re-keys changed live heads.
+      redTeamDispatchQueue.reconcile({ readLivePr: readQueuePr });
     },
     redTeamOnSkip: o => {
       let rawPrs = o.rawPrs;

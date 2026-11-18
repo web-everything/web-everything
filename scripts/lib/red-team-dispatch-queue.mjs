@@ -12,8 +12,6 @@ import { isUnderTest } from './under-test.mjs';
 import { readRedTeamProbes } from './red-team-gate.mjs';
 import { runGhSync } from './gh-throttle.mjs';
 
-// Bound the interval to one year; malformed/oversized values fall back visibly to 15 minutes.
-const replanMinutes = value => Number.isSafeInteger(value) && value > 0 && value <= 525600 ? value : 15;
 export function readLiveRedTeamPr({ repo, pr }) {
   if (isUnderTest()) return null; // Hermetic callers inject evidence; never spawn gh under tests.
   return JSON.parse(runGhSync(['pr', 'view', String(pr), '--repo', repo, '--json', 'state,headRefOid'],
@@ -56,8 +54,6 @@ export function loadRedTeamQueueFloor({ env = process.env,
   let settings;
   try { settings = JSON.parse(readFile(file, 'utf8'))?.redTeam?.queue; }
   catch { /* Unavailable settings never create extra capacity. */ }
-  const plannerSkipReplanMinutes = replanMinutes(settings?.['planner-skip']?.replanMinutes);
-  note(log, `planner-skip replanMinutes=${plannerSkipReplanMinutes} (source: ${plannerSkipReplanMinutes === settings?.['planner-skip']?.replanMinutes ? 'scripts/settings/red-team-queue.json' : 'default 15; invalid/missing setting'})`);
   const minimumEnv = env.WE_RED_TEAM_QUEUE_MIN_CONCURRENT;
   const idleEnv = env.WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT;
   const reviewStartsEnv = env.WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE;
@@ -65,13 +61,12 @@ export function loadRedTeamQueueFloor({ env = process.env,
   const reviewStarts = reviewStartsEnv === undefined ? settings?.reviewStartsPerTickWhileIdle : parseEnv(reviewStartsEnv);
   const operator = readOperatorPolicy('redTeamQueue', { env, log });
   const operatorMinimum = operator?.minConcurrent;
-  if (operator === null) return { minConcurrent: failClosedCapacity('redTeamQueue.minConcurrent', 0, { log }), idlePct: 10, reviewStartsPerTick: 0, plannerSkipReplanMinutes };
+  if (operator === null) return { minConcurrent: failClosedCapacity('redTeamQueue.minConcurrent', 0, { log }), idlePct: 10, reviewStartsPerTick: 0 };
   const minimum = operatorMinimum ?? (minimumEnv === undefined ? settings?.minConcurrent : parseEnv(minimumEnv));
   const validIdle = value => Number.isInteger(value) && value >= 0 && value <= 100;
   // An invalid override never replaces a valid file threshold with a looser one: it is ignored.
   const idle = idleEnv !== undefined && validIdle(parseEnv(idleEnv)) ? parseEnv(idleEnv) : settings?.minConcurrentIdlePct;
   const floor = {
-    plannerSkipReplanMinutes,
     // A missing threshold means the default 10; a present but invalid one disables the floor (never a looser guess).
     minConcurrent: (idle === undefined || validIdle(idle)) && Number.isInteger(minimum) && minimum >= 0
       ? Math.min(minimum, operatorMinimum === undefined ? RED_TEAM_QUEUE_MIN_CONCURRENT_CAP : RED_TEAM_QUEUE_MIN_CONCURRENT_MAX) : 0,
@@ -115,7 +110,7 @@ export function defaultQueueFile(env = process.env, home = homedir()) {
 export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile = readFileSync,
   writeFile = writeFileSync, rename = renameSync, unlink = unlinkSync, now = Date.now, log = () => {}, maxAttempts = 3, readLivePr = readLiveRedTeamPr } = {}) {
   let entries = [];
-  let live = new Map(), waiting = new Set(), replanned = new Set();
+  let live = new Map(), waiting = new Set();
   let pending = null;
   let stale = false; // true after a failed persist, until a later write succeeds
   const limit = Number.isInteger(maxAttempts) && maxAttempts > 0 ? maxAttempts : 3;
@@ -127,7 +122,6 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         || !Number.isSafeInteger(entry.pr) || entry.pr < 1 || !isRealHead(entry.head)
         || entry.key !== `${entry.repo}#${entry.pr}` || keys.has(entry.key)
         || (entry.blocked !== undefined && !NON_RUNNABLE_REASONS.has(entry.blocked))
-        || (entry.blockedAt !== undefined && (!Number.isSafeInteger(entry.blockedAt) || entry.blockedAt < 0))
         || (entry.lastProbeTurn !== undefined && (!Number.isSafeInteger(entry.lastProbeTurn) || entry.lastProbeTurn < 0))
         || !Number.isFinite(entry.enqueuedAt) || !Number.isInteger(entry.attempts) || entry.attempts < 0) return false;
       keys.add(entry.key);
@@ -169,9 +163,8 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
     entries: () => copy(entries),
     // Validate incoming PRs too: maintenance may have removed a terminal PR still present in a stale plan.
     // Each PR is read once per reconciliation; the daemon reader shares evidence across the tick.
-    reconcile({ readLivePr: read = readLivePr, plannerSkipReplanMinutes = 15, candidates = [], replan = true } = {}) {
-      live = new Map(); waiting = new Set(); replanned = new Set();
-      const expired = [];
+    reconcile({ readLivePr: read = readLivePr, candidates = [] } = {}) {
+      live = new Map(); waiting = new Set();
       const persisted = new Set(entries);
       const subjects = new Map(entries.map(entry => [entry.key, entry]));
       for (const { repo, pr } of candidates) {
@@ -192,21 +185,9 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         if (pr.headRefOid !== entry.head) {
           // Re-key in place, preserving FIFO position; stale planner rows are deferred until they match.
           entry.head = pr.headRefOid; entry.attempts = 0;
-          delete entry.blocked; delete entry.blockedAt; delete entry.lastProbeTurn;
+          delete entry.blocked; delete entry.lastProbeTurn;
           changed(`re-key ${entry.key}: live head changed; position preserved`);
         }
-        if (replan && entry.blocked === 'planner-skip') {
-          if (now() - (entry.blockedAt ?? entry.enqueuedAt) >= replanMinutes(plannerSkipReplanMinutes) * 60000) {
-            expired.push(entry);
-          } // Before expiry, retain the existing bounded fair probes.
-        }
-      }
-      // Replans share the worker-free probe budget with still-blocked entries in admit().
-      // Leave the rest blocked and eligible for a later turn, oldest hold first (including legacy state).
-      for (const entry of expired.sort((a, b) => (a.blockedAt ?? a.enqueuedAt) - (b.blockedAt ?? b.enqueuedAt)).slice(0, MAX_PROBES)) {
-        replanned.add(entry.key);
-        delete entry.blocked; delete entry.blockedAt;
-        changed(`replan ${entry.key}: planner-skip interval elapsed`);
       }
       return live;
     },
@@ -238,9 +219,8 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
       // Missing turns get one-time legacy catch-up; newly blocked entries always carry a turn.
       const mine = entries.filter(entry => entry.repo === repo && !waiting.has(entry.key));
       // Disabled probes or an invalid count fail closed; a valid zero count still allows worker-free probes.
-      const probeLimit = Math.max(0, MAX_PROBES - mine.filter(entry => replanned.has(entry.key)).length);
       const selected = mine.filter(entry => NON_RUNNABLE_REASONS.has(entry.blocked) && allowProbes && validCount)
-        .sort((a, b) => (a.lastProbeTurn ?? 0) - (b.lastProbeTurn ?? 0)).slice(0, probeLimit);
+        .sort((a, b) => (a.lastProbeTurn ?? 0) - (b.lastProbeTurn ?? 0)).slice(0, MAX_PROBES);
       const probes = new Set(selected.map(entry => entry.key));
       if (selected.length) {
         advanceProbeTurns(mine, selected);
@@ -279,7 +259,6 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
               advanceProbeTurns(entries.filter(candidate => candidate.repo === repo), [entry]);
             }
             entry.blocked = failure.skipped ? 'planner-skip' : failure.reason;
-            if (entry.blocked === 'planner-skip') entry.blockedAt = now();
           }
           entry.attempts++;
           if (entry.attempts >= limit) {
@@ -303,7 +282,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
   // Stage all queue mutations, including reconciliation, until the runner succeeds.
   transactions.set(queue, () => {
     const before = copy(entries), previousAdmissions = new Map(admissions);
-    const previousLive = live, previousWaiting = new Set(waiting), previousReplanned = new Set(replanned);
+    const previousLive = live, previousWaiting = new Set(waiting);
     pending = [];
     return {
       commit() {
@@ -322,7 +301,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
       },
       abort() {
         entries = before;
-        live = previousLive; waiting = previousWaiting; replanned = previousReplanned;
+        live = previousLive; waiting = previousWaiting;
         admissions.clear();
         for (const [repo, admitted] of previousAdmissions) admissions.set(repo, admitted);
         pending = null;
@@ -373,7 +352,7 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
     const incoming = (plan?.refusals ?? []).filter(row => row.kind === 'already-reviewed-head'
       && isRealHead(row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid))
       .map(row => ({ repo, pr: Number(row.prNumber) }));
-    const liveEvidence = queue.reconcile({ readLivePr, plannerSkipReplanMinutes: floor?.plannerSkipReplanMinutes, candidates: incoming });
+    const liveEvidence = queue.reconcile({ readLivePr, candidates: incoming });
     const candidates = [], cardOnlyCandidates = [];
     for (const row of plan?.refusals ?? []) {
       if (row.kind !== 'already-reviewed-head') continue;
