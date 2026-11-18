@@ -1,3 +1,4 @@
+import { hardenedGitDiffCommand } from '../../lib/hardened-git-diff.mjs';
 import { buildOperatorRulingComment, referralFindingKey, mandatoryReferralReviewer, normalizeFinding, renderReferralRecord,
   readReferralRecords, validateReferralRecord, mandatoryReferralState, activeReferrals, REFERRAL_CARRY_REASON } from '../../lib/jury-core.mjs';
 import { assertMandatoryReferralsCleared } from '../../review-set-label.mjs';
@@ -3504,7 +3505,8 @@ describe('#5135 latest fix range', () => {
     const calls = [];
     const exec = (...args) => { calls.push(args); return ''; };
     expect(read(exec, [comment('cccc'), comment(priorHead), comment(head.slice(0, 8))], head.toUpperCase())).toEqual({ priorHead, head: head.toUpperCase(), files: {} });
-    expect(calls).toEqual([['git', ['diff', '--no-ext-diff', '--no-color', '--no-renames', '--src-prefix=a/', '--dst-prefix=b/', '--unified=0', priorHead, head.toUpperCase()], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 }]]);
+    const command = hardenedGitDiffCommand(['diff', '--src-prefix=a/', '--dst-prefix=b/', '--unified=0', priorHead, head.toUpperCase()], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 }, process.env);
+    expect(calls).toEqual([['git', command.args, command.opts]]);
     expect(read(exec, [comment(priorHead)], 'not-a-sha')).toEqual({ priorHead, error: 'head-unpinned' });
   });
   it('pins the diff prefixes so a user diff.noprefix / mnemonicPrefix config cannot mis-key paths', () => {
@@ -3589,7 +3591,7 @@ describe('#5135 fix range read wiring', () => {
     expect(result.net.revSha).toBe(head);
     expect(result.latestFix).toEqual({ priorHead, head, files: {} });
     expect(calls.filter(args => args[0] === 'rev-parse')).toEqual([['rev-parse', '--verify', '--end-of-options', 'origin/lane/x^{commit}']]);
-    expect(calls).toContainEqual(['diff', '--no-ext-diff', '--no-color', '--no-renames', '--src-prefix=a/', '--dst-prefix=b/', '--unified=0', priorHead, head]);
+    expect(calls).toContainEqual(hardenedGitDiffCommand(['diff', '--src-prefix=a/', '--dst-prefix=b/', '--unified=0', priorHead, head]).args);
   });
 });
 

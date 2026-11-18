@@ -14,6 +14,10 @@ import { computeNetDiffPaths, parseNumstat, computeNetDiffChangedFiles, computeN
 import { scoreEscalation, diffHunksFrom } from '../lib/review-escalation.mjs';
 
 
+// Intent fixtures normalize only the shared global prefix. Real-Git policy tests
+// assert the full command/environment separately; keep diff flags for argv assertions.
+const scoringArgs = args => args[0]?.startsWith('--attr-source=') ? args.slice(5) : args;
+
 describe('parseNumstat (#1821 — net two-dot diff for the review-escalation backstop)', () => {
   it('parses `<added>\\t<deleted>\\t<path>` lines into changedFiles + total diffLines', () => {
     const out = parseNumstat('3\t1\tscripts/merge-ai-prs.mjs\n0\t5\tbacklog/1821-foo.md\n');
@@ -44,12 +48,13 @@ describe('computeNetDiffChangedFiles (#2373 — SHARED net-diff basis, producer 
   const fakeExec = (script = {}) => {
     const calls = [];
     const exec = (cmd, args, opts) => {
+      args = scoringArgs(args);
       // The stub key names WHICH TREES are compared, deliberately ignoring `--end-of-options` and
       // (#2890-review-r2 finding 2b) `--no-ext-diff`. Both are argv hygiene, not intent: encoding them in every
       // fixture key means adding one guard to one more call site reds 17 unrelated tests and tempts the author
       // to drop the guard instead of the fixtures. Each has its own dedicated assertion (`guards the git-diff
       // argv…`, `computeNetDiffText passes --no-ext-diff`), which is where a regression must fail.
-      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff');
+      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && !['--no-ext-diff', '--no-textconv', '--no-renames', '--no-color'].includes(a));
       calls.push({ cmd, args, opts, key: `${cmd} ${intent.join(' ')}` });
       const h = script[`${cmd} ${intent.join(' ')}`];
       if (h && h.throw) throw new Error(h.throw);
@@ -482,12 +487,13 @@ describe('computeNetDiffText (#2450 — reviewer-facing NET diff TEXT, SAME basi
   const fakeExec = (script = {}) => {
     const calls = [];
     const exec = (cmd, args, opts) => {
+      args = scoringArgs(args);
       // The stub key names WHICH TREES are compared, deliberately ignoring `--end-of-options` and
       // (#2890-review-r2 finding 2b) `--no-ext-diff`. Both are argv hygiene, not intent: encoding them in every
       // fixture key means adding one guard to one more call site reds 17 unrelated tests and tempts the author
       // to drop the guard instead of the fixtures. Each has its own dedicated assertion (`guards the git-diff
       // argv…`, `computeNetDiffText passes --no-ext-diff`), which is where a regression must fail.
-      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff');
+      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && !['--no-ext-diff', '--no-textconv', '--no-renames', '--no-color'].includes(a));
       calls.push({ cmd, args, opts, key: `${cmd} ${intent.join(' ')}` });
       const h = script[`${cmd} ${intent.join(' ')}`];
       if (h && h.throw) throw new Error(h.throw);
@@ -581,7 +587,8 @@ describe('resolveNetDiffBasis shared across both helpers (#2890-review-fix findi
   const fakeExec = (script = {}) => {
     const calls = [];
     const exec = (cmd, args, opts) => {
-      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff');
+      args = scoringArgs(args);
+      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && !['--no-ext-diff', '--no-textconv', '--no-renames', '--no-color'].includes(a));
       calls.push({ cmd, args, opts, key: `${cmd} ${intent.join(' ')}` });
       const h = script[`${cmd} ${intent.join(' ')}`];
       if (h && h.throw) throw new Error(h.throw);
@@ -654,7 +661,8 @@ describe('#2890-review-r2 finding 1 — a basis resolved for a DIFFERENT request
   const fakeExec = (script = {}) => {
     const calls = [];
     const exec = (cmd, args, opts) => {
-      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff');
+      args = scoringArgs(args);
+      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && !['--no-ext-diff', '--no-textconv', '--no-renames', '--no-color'].includes(a));
       calls.push({ cmd, args, opts, key: `${cmd} ${intent.join(' ')}` });
       const h = script[`${cmd} ${intent.join(' ')}`];
       if (h && h.throw) throw new Error(h.throw);
@@ -754,7 +762,8 @@ describe('computeNetDiffSignals — the ONE net-diff derivation both call sites 
   const fakeExec = (script = {}) => {
     const calls = [];
     const exec = (cmd, args, opts) => {
-      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff');
+      args = scoringArgs(args);
+      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && !['--no-ext-diff', '--no-textconv', '--no-renames', '--no-color'].includes(a));
       calls.push({ cmd, args, opts, key: `${cmd} ${intent.join(' ')}` });
       const h = script[`${cmd} ${intent.join(' ')}`];
       if (h && h.throw) throw new Error(h.throw);
@@ -882,6 +891,7 @@ describe('computeNetDiffText passes --no-ext-diff (#2890-review-r2 finding 2b)',
   it('the flag is on the argv, ahead of --end-of-options', () => {
     const calls = [];
     const exec = (cmd, args) => {
+      args = scoringArgs(args);
       calls.push(args);
       if (args[0] === 'diff' && args.includes('--numstat')) return '1\t0\tREADME.md\n';
       return 'diff --git a/README.md b/README.md\n';
@@ -894,6 +904,7 @@ describe('computeNetDiffText passes --no-ext-diff (#2890-review-r2 finding 2b)',
   it('but NOT --text: a whole-PR diff must not force binary assets into the reviewer-facing text', () => {
     const calls = [];
     const exec = (cmd, args) => {
+      args = scoringArgs(args);
       calls.push(args);
       if (args[0] === 'diff' && args.includes('--numstat')) return '1\t0\tREADME.md\n';
       return 'diff\n';
@@ -907,7 +918,8 @@ describe('computeNetDiffPaths (#2901/#1031 — NET changed-file list as plain pa
   const fakeExec = (script = {}) => {
     const calls = [];
     const exec = (cmd, args, opts) => {
-      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff');
+      args = scoringArgs(args);
+      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && !['--no-ext-diff', '--no-textconv', '--no-renames', '--no-color'].includes(a));
       calls.push({ cmd, args, opts, key: `${cmd} ${intent.join(' ')}` });
       const h = script[`${cmd} ${intent.join(' ')}`];
       if (h && h.throw) throw new Error(h.throw);

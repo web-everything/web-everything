@@ -122,12 +122,13 @@ describe('fetchTestGamingDiffEvidence / resolveTargetedCheckEvidence', () => {
     const exec = (cmd, args) => {
       calls.push(args.join(' '));
       if (args[0] === 'fetch') return '';
-      if (args[0] === 'merge-base') return 'deadbeef';
-      if (args[0] === 'diff') return FAKE_DIFF;
+      if (args.includes('rev-parse')) return `${HEAD}\n`;
+      if (args.includes('merge-base')) return 'd'.repeat(40);
+      if (args.includes('diff')) return FAKE_DIFF;
       return '';
     };
     const result = fetchTestGamingDiffEvidence({ exec, rev: HEAD, paths: ['scripts/operations/__tests__/review-loop-cli.test.mjs'] });
-    expect(result).toEqual({ text: FAKE_DIFF, scored: true, base: 'deadbeef', rev: `origin/${HEAD}` });
+    expect(result).toEqual({ text: FAKE_DIFF, scored: true, base: 'd'.repeat(40), rev: HEAD });
     expect(calls.some((c) => c.includes('review-loop-cli.test.mjs'))).toBe(true);
   });
   it('fetchTestGamingDiffEvidence: an unresolvable basis (no candidate resolves) reports scored:false', () => {
@@ -178,8 +179,9 @@ describe('fetchTestGamingDiffEvidence / resolveTargetedCheckEvidence', () => {
     const exec = (cmd, args) => {
       if (cmd === 'git' && args[0] === 'remote') return 'https://github.com/web-everything/web-everything.git\n';
       if (args[0] === 'fetch') return '';
-      if (args[0] === 'merge-base') return 'deadbeef';
-      if (args[0] === 'diff') return FAKE_DIFF;
+      if (args.includes('rev-parse')) return `${HEAD}\n`;
+      if (args.includes('merge-base')) return 'd'.repeat(40);
+      if (args.includes('diff')) return FAKE_DIFF;
       throw new Error(`unexpected ${cmd}`);
     };
     expect(fetchTestGamingDiffEvidence({ exec, repo: 'web-everything/web-everything', prNumber: 1, rev: HEAD, paths: ['x.test.mjs'] }))

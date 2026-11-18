@@ -51,6 +51,7 @@ import { planAdvisoryLabels, ADVISORY_LABELS } from '../lib/advisory-labels.mjs'
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { judgeSpawn } from '../lib/judge-spawn.mjs';
 import { resolveNetDiffBasis } from '../merge-ai-prs.mjs';
+import { hardenedGitDiff } from '../lib/hardened-git-diff.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 
@@ -237,12 +238,12 @@ export function fetchTestGamingDiffEvidence({
       return { text: '', scored: false, reason: 'gh-diff-failed' };
     }
   }
-  const basis = resolveNetDiffBasis({ exec, remote, base, rev });
+  const basis = resolveNetDiffBasis({ exec, remote, base, rev, pinRev: true });
   if (!basis.ok) return { text: '', scored: false, reason: basis.reason };
   try {
-    const text = String(exec('git', [
-      'diff', '--no-ext-diff', '--end-of-options', basis.diffBase, basis.candidate, '--', ...paths,
-    ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '');
+    const text = String(hardenedGitDiff(exec, [
+      'diff', '--end-of-options', basis.diffBase, basis.candidate, '--', ...paths,
+    ]) || '');
     return { text, scored: true, base: basis.diffBase, rev: basis.candidate };
   } catch {
     return { text: '', scored: false, reason: 'diff-failed' };

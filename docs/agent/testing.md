@@ -4451,3 +4451,20 @@ the existing empty degraded-read refusal requires a resolvable checkout before r
 `scripts/operations/__tests__/review-pr-io-pinned-head.test.mjs` uses real Git in a
 temporary repository, moves the tracking ref between merge-base and the first scoring
 diff, and covers replacement objects, missing commits and unrelated histories.
+
+Scorer diffs share `scripts/lib/hardened-git-diff.mjs`: fixed built-in rendering,
+no replacement objects, textconv, external drivers, renames or copies, and an empty
+attribute-source tree (including attributes committed in the head). The explicit
+`--attr-source` option refuses older Git rather than silently ignoring the environment.
+Every failed diff invalidates the paired text/path evidence; the operator must repair
+the checkout/read and rerun review, never treat partial evidence as clearance.
+The real-Git table in `review-pr-io-pinned-head.test.mjs` proves each hostile driver/
+attribute hides the executable hunk with the legacy plain diff before asserting the
+shared reader retains it. Replacement and ref-race cases reproduce origin/main's
+replace-enabled reads and mutable-ref scoring; half-failure cases reproduce its
+independently scored text/path reads. Run affected tests through heavy-admission.
+External-driver rows also assert the production command/environment policy:
+origin/main already used `--no-ext-diff` on text, but lacked environment removal
+and the shared hardening on numstat/path reads. Do not describe those existing
+text guards as a newly reproduced vulnerability. Bounded-output, stack, latest-fix
+and delta failures have named negative tests requiring a wholly unscored result.

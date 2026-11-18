@@ -143,6 +143,7 @@ import {
 import { CODEQL_CHECK_NAME, loadDrainGateSettings } from './lib/codeql-gate.mjs';
 export { isAiAuthor, isAiCommit, isMechanicalMergeCommit, isDrainBookkeepingCommit } from './lib/ai-pr-authorship.mjs';
 export { isAiGeneratedPr, hasLabel };
+import { hardenedGitDiff } from './lib/hardened-git-diff.mjs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { cascadePolicy } from './lib/policy-cascade.mjs';
 import { readGit, readGh } from './lib/proc-read.mjs';
@@ -4029,7 +4030,7 @@ function basisAnswersRequest(basis, { remote, base, rev }) {
 function ancestryNetDiff(exec, baseRef, candidate) {
   let parsed;
   try {
-    parsed = parseNumstat(exec('git', ['log', '--numstat', '--diff-merges=first-parent', '--pretty=format:', '--end-of-options', `${baseRef}..${candidate}`, '--'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+    parsed = parseNumstat(hardenedGitDiff(exec, ['log', '--numstat', '--diff-merges=first-parent', '--pretty=format:', '--end-of-options', `${baseRef}..${candidate}`, '--'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
   } catch (err) {
     if (isExecContractError(err)) throw err; // let the caller's own contract short-circuit classify it
     return null; // git can't answer (old git, unresolvable range) — caller keeps the base-tip basis
@@ -4070,7 +4071,7 @@ function isExecContractError(err) {
 export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [], pinRev = false } = {}) {
   if (pinRev && typeof exec === 'function') {
     const run = exec;
-    exec = (cmd, args, opts) => run(cmd, args, { ...opts, env: { ...process.env, ...opts?.env, GIT_NO_REPLACE_OBJECTS: '1' } });
+    exec = (cmd, args, opts) => run(cmd, args, { ...opts, env: { ...(opts?.env ?? process.env), GIT_NO_REPLACE_OBJECTS: '1' } });
   }
   // The identity of the REQUEST this basis answers. Rides both the ok and the failure shape so a shared basis
   // is checkable in every case — an `{ok:false}` basis for the wrong ref must not be reported as this ref's
@@ -4135,7 +4136,7 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
       // Verified on git 2.50.1: unguarded, `git diff --numstat <base> '--output=<path>'` exits 0 and WRITES that
       // file, and the swallowed numstat then reads EMPTY while the candidate still resolves — a zero blast-radius
       // score for a PR about to land, the exact de-inflation the #2390-review-fix comments assert is impossible.
-      humanBasis = parseNumstat(exec('git', ['diff', '--numstat', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+      humanBasis = parseNumstat(hardenedGitDiff(exec, ['diff', '--numstat', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
     } catch (err) {
       if (isExecContractError(err)) return { ok: false, reason: 'exec-contract', requestedFor };
       if (pinRev) return { ok: false, reason: 'diff-failed', requestedFor };
@@ -4190,8 +4191,8 @@ export function computeNetDiffChangedFiles({ exec, remote = 'origin', base = 'ma
     // refname. Every argv position in this file that takes a caller-supplied ref is now guarded; `merge-base`
     // and `rev-parse` are hardening rather than live holes (both reject an unknown option on git 2.50.1, and
     // the surrounding catch absorbs it), while the `git diff` positions are genuinely exploitable — verified.
-    try { own = parseNumstat(exec('git', ['diff', '--numstat', '--end-of-options', baseRev, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })); }
-    catch { own = humanBasis; /* own-delta diff failed → fall back to the cumulative basis */ }
+    try { own = parseNumstat(hardenedGitDiff(exec, ['diff', '--numstat', '--end-of-options', baseRev, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })); }
+    catch { return { ...empty, reason: 'diff-failed' }; }
   }
   // #3343 — the basis's `basisKind` / `basisNarrowed` are DELIBERATELY not re-exported here. This function's
   // return shape is the SIZE/blast-radius payload, asserted whole (`toEqual`) at a dozen call sites; the
@@ -4230,7 +4231,7 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
   if (sharedBasis && !basisAnswersRequest(sharedBasis, { remote, base, rev })) return { ...unscored, reason: 'basis-mismatch' };
   // #2890-review-fix finding 3 — reuse a caller-resolved basis for this ref when given one (one fetch, one
   // candidate probe, shared with `computeNetDiffChangedFiles`); otherwise resolve our own exactly as before.
-  const basis = sharedBasis || resolveNetDiffBasis({ exec, remote, base, rev, fetchExtraRefs });
+  const basis = sharedBasis || resolveNetDiffBasis({ exec, remote, base, rev, fetchExtraRefs, pinRev });
   if (!basis.ok) return { ...unscored, reason: basis.reason }; // caller falls back to `gh pr diff`
   let { diffBase, candidate } = basis;
   // #xnqxtdy — `pinRev`: a caller that STAMPS the tip next to this text (the human-clearance carry) cannot read the
@@ -4238,7 +4239,9 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
   // a newer sha. Resolve the tip to ONE commit sha first, then take the fork point AND the text from that sha only, and
   // hand the sha back as `revSha` — the diff and its label can no longer disagree. Any failure is unscored (fail closed).
   let revSha;
-  if (pinRev) {
+  if (pinRev && basis.revSha) {
+    revSha = basis.revSha; // Already pinned before merge-base; never resolve mutable refs a second time.
+  } else if (pinRev) {
     try {
       revSha = String(exec('git', ['rev-parse', '--verify', '--end-of-options', `${candidate}^{commit}`],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '').trim().toLowerCase();
@@ -4264,7 +4267,7 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
     // Deliberately NOT `--text`: unlike the single-file write-time diff, this is a whole-PR diff and forcing
     // binary blobs into it would splat megabytes of asset bytes into the reviewer-facing text (see
     // `diff-hunks.mjs`, where `--text` is right precisely because the payload is one bounded file).
-    const text = String(exec('git', ['diff', '--no-ext-diff', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '');
+    const text = String(hardenedGitDiff(exec, ['diff', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '');
     return { text, base: diffBase, rev: candidate, scored: true, ...(revSha ? { revSha } : {}) };
   } catch (err) {
     // the text diff failed even though the basis resolved → caller falls back to `gh pr diff`
@@ -4379,7 +4382,7 @@ export function computeNetDiffPaths({ exec, remote = 'origin', base = 'main', re
   if (!basis.ok) return { ...unscored, reason: basis.reason };
   const { diffBase, candidate } = basis;
   try {
-    const raw = exec('git', ['diff', '--name-only', '-z', '--end-of-options', `${diffBase}..${candidate}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    const raw = hardenedGitDiff(exec, ['diff', '--name-only', '-z', '--end-of-options', `${diffBase}..${candidate}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
     const paths = String(raw || '').split('\0').filter(Boolean);
     return { paths, base: diffBase, rev: candidate, scored: true };
   } catch (err) {

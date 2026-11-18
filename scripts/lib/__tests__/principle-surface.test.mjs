@@ -414,6 +414,7 @@ describe('the assumptions the content triggers rest on — what is pinned (produ
     const { computeNetDiffText } = await import('../../merge-ai-prs.mjs');
     const calls = [];
     const exec = (cmd, args) => {
+      args = args[0]?.startsWith('--attr-source=') ? args.slice(5) : args;
       calls.push(args);
       if (args[0] === 'diff' && !args.includes('--numstat')) return 'diff --git a/x b/x\n';
       if (args[0] === 'diff') return '1\t0\tx\n';

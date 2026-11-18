@@ -1,3 +1,4 @@
+import { hardenedGitDiff } from '../lib/hardened-git-diff.mjs';
 import { redTeamCheckRunIsEvidence, redTeamCheckRunPayload, postRedTeamCheckRun as defaultPostRedTeamCheckRun } from '../lib/red-team-check-run.mjs';
 import { redTeamForHead } from '../lib/red-team-gate.mjs';
 import { basisLineOf, isReviewVerdictComment, reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
@@ -349,7 +350,7 @@ export function readPr({
   // for the opposite reason — see the `escCwd` note in `we:scripts/merge-ai-prs.mjs`).
   const run = exec || execFileIn(cwd);
   const gitExec = (cmd, args, opts) => run(cmd, args, {
-    ...opts, env: { ...process.env, ...opts?.env, GIT_NO_REPLACE_OBJECTS: '1' },
+    ...opts, env: { ...(opts?.env ?? process.env), GIT_NO_REPLACE_OBJECTS: '1' },
   });
   const stackRun = (args, opts) => String(gitExec('git', args, {
     encoding: 'utf8', timeout: 60e3, maxBuffer: 64 * 1024 * 1024, ...opts,
@@ -444,17 +445,21 @@ export function readPr({
           netPaths = { ...netPaths, paths, base: stack.tree, scored: true };
           stackBase = { pr: stack.pr, ref: stack.ref, head: stack.head, contained: stack.contained, tree: stack.tree, fingerprint };
         }
-      } catch { stackBase = null; }
+      } catch {
+        stackBase = null;
+        netText = { text: '', scored: false, reason: 'diff-failed' };
+        netPaths = { paths: [], scored: false, reason: 'diff-failed' };
+      }
     }
   }
   const latestFix = readLatestFixRange({ exec: gitExec, comments: view.comments, head: revSha });
   let deltaReview = null;
-  if (latestFix.priorHead && !latestFix.error && latestFix.head === revSha && !outstandingVerdictSince(view.comments, latestFix.priorHead)) {
+  if (netPaths.scored && latestFix.priorHead && !latestFix.error && latestFix.head === revSha && !outstandingVerdictSince(view.comments, latestFix.priorHead)) {
     try {
-      const text = String(gitExec('git', ['diff', '--no-ext-diff', '--no-color', '--no-renames', latestFix.priorHead, revSha],
+      const text = String(hardenedGitDiff(gitExec, ['diff', latestFix.priorHead, revSha],
         { encoding: 'utf8', maxBuffer: LATEST_FIX_DIFF_MAX_BUFFER }));
       const sizeSince = from => {
-        const stat = String(gitExec('git', ['diff', '--numstat', '-z', '--no-renames', from, revSha],
+        const stat = String(hardenedGitDiff(gitExec, ['diff', '--numstat', '-z', from, revSha],
           { encoding: 'utf8', maxBuffer: LATEST_FIX_DIFF_MAX_BUFFER })).split('\0').filter(Boolean);
         return { files: stat.length, lines: stat.reduce((sum, row) => {
           const [a, d] = row.split('\t');
@@ -471,7 +476,14 @@ export function readPr({
         deltaReview = { priorHead: latestFix.priorHead, head: revSha, lines, files, anchor, totalLines: total.lines, totalFiles: total.files, text,
           priorFindings: (view.comments ?? []).filter(c => isTrustedMarkerAuthor(c) && reviewedHeadsOf(c).includes(latestFix.priorHead)).map(c => c.body).join('\n\n') };
       }
-    } catch { /* unreadable delta requires full review */ }
+    } catch {
+      netText = { text: '', scored: false, reason: 'diff-failed' };
+      netPaths = { paths: [], scored: false, reason: 'diff-failed' };
+    }
+  }
+  if (latestFix.error === 'git-diff-failed') {
+    netText = { text: '', scored: false, reason: 'diff-failed' };
+    netPaths = { paths: [], scored: false, reason: 'diff-failed' };
   }
   const scopedMode = resolveScopedRereviewMode(scopedRereview);
   const budget = resolveRoundBudget(roundBudget);
@@ -498,7 +510,7 @@ export function readPr({
     clearerId: currentActorId(),
     // Identity comes from the single pin taken BEFORE the shared basis and all diffs.
     comments: view.comments,
-    net: { ...netPaths, revSha },
+    net: { ...netPaths, revSha: netPaths.scored ? revSha : null },
     latestFix, deltaReview,
     diff: netText,
     ...(stackBase ? { stackBase } : {}),
@@ -739,7 +751,7 @@ export function readFixRange({ exec, priorHead, head } = {}) {
     if (!current) return { priorHead, error: 'head-unpinned' };
     let diff;
     try {
-      diff = String(exec('git', ['diff', '--no-ext-diff', '--no-color', '--no-renames', '--src-prefix=a/', '--dst-prefix=b/', '--unified=0', priorHead, head], {
+      diff = String(hardenedGitDiff(exec, ['diff', '--src-prefix=a/', '--dst-prefix=b/', '--unified=0', priorHead, head], {
         // A rebase between rounds can make this diff several MB; the 1 MB default would throw and fall back to `all`.
         encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: LATEST_FIX_DIFF_MAX_BUFFER,
       }) ?? '');
