@@ -290,6 +290,7 @@ export default defineConfig({
       'scripts/conveyor/__tests__/sim-scenarios-smoke.test.mjs',
       'scripts/conveyor/__tests__/sim-scenario-*.test.mjs',
       'scripts/operations/__tests__/fake-claude-sessions.test.mjs',
+      '**/*.real.test.mjs', // R1063a real-process tier
     ],
   },
   resolve: {

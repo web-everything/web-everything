@@ -1,0 +1,76 @@
+# THE SCHEDULED REAL-PROCESS TIER (R1063a) — real node/git/gh subprocess tests run hourly.
+#
+# Why a separate, scheduled, NON-BLOCKING job: PR CI is mock-only; real-process checks belong here.
+# Files named *.real.test.mjs are excluded from the default suite and collected by vitest.real.config.ts.
+# Never a PR gate: no pull_request trigger, and this must not become a required check. A failure opens
+# or updates ONE health-smell issue, following live-tests.yml's alert path. The title prefix is stable
+# even as failing files change. Scheduled checkout uses main; dispatch checkout uses the selected ref.
+name: Real-process tests (scheduled, non-blocking)
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: real-tests
+  cancel-in-progress: false
+
+jobs:
+  real:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Real-process suite
+        id: real
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: npm run test:real -- --reporter=default --reporter=json --outputFile=real-tests.json
+
+      - name: Report a failure as a health smell (never fails the workflow)
+        if: steps.real.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          files=$(node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs';
+          import { relative } from 'node:path';
+          try {
+            const report = JSON.parse(readFileSync('real-tests.json', 'utf8'));
+            const files = [...new Set(report.testResults
+              .filter((test) => test.status === 'failed' || test.assertionResults?.some((a) => a.status === 'failed'))
+              .map((test) => relative(process.cwd(), test.name).replace(/[\x00-\x1f\x7f]/g, '')))].sort();
+            console.log(files.length ? files.join(', ') : 'unknown (no failing files reported; inspect run)');
+          } catch {
+            console.log('unknown (missing or unreadable JSON; inspect run)');
+          }
+          NODE
+          )
+          title="health-smell: real-process tier red: $files"
+          body=$(printf 'The scheduled real-process tier failed. This never gates a PR or main.\n\nNEEDS-YOU health-smell real-process tier red: %s %s\n' "$files" "$RUN_URL")
+          gh label create health-smell --repo "$GITHUB_REPOSITORY" --color B60205 --description "Health signal from a scheduled check" 2>/dev/null || true
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --label health-smell --limit 100 --json number,title --jq '.[] | select(.title | startswith("health-smell: real-process tier red:")) | .number' | head -n 1)
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --repo "$GITHUB_REPOSITORY" --title "$title"
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --label health-smell --body "$body"
+          fi
