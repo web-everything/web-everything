@@ -263,7 +263,7 @@ export function proveHumanClearanceCarry({ evidence, enabled = true, exec, cwd, 
       // A scored, pinned live diff is still required to write the new record.
       if (!enabled || !numberingSetting.value || !/^[0-9a-f]{40}$/i.test(clearance.sha ?? '')
         || !clearance.actor || !liveCarryFingerprints(evidence.headDiff).diff) return { ...pre, carry: false, applicable: true };
-      const proof = proveNumbering({ exec: gitExec, fromSha: clearance.sha, toSha: evidence.headSha, mainRef });
+      const proof = proveNumbering({ exec: gitExec, cwd, fromSha: clearance.sha, toSha: evidence.headSha, mainRef });
       if (proof.ok) return { carry: true, applicable: true, fromSha: clearance.sha, toSha: evidence.headSha,
         fingerprint: liveCarryFingerprints(evidence.headDiff).diff || 'unscored', actor: clearance.actor,
         tier: 'numbering', mechanicalReason: proof.reason, reason: proof.reason };

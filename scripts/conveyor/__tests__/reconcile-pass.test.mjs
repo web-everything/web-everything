@@ -454,11 +454,11 @@ const HEAD_2752 = '253d75c2b82988be773903cba4e5ed172be57fb8';
 const BASE_2752 = '06d01a43e0000000000000000000000000000000';
 const BLOB = 'b'.repeat(40);
 
-it('enrichPrsWithAlreadyLandedFacts skips a PR with no merge-status:conflicting label entirely — zero extra IO', async () => {
+it('enrichPrsWithAlreadyLandedFacts skips a PR with neither conflict label nor DIRTY merge state entirely — zero extra IO', async () => {
   const { enrichPrsWithAlreadyLandedFacts } = await import('../reconcile-pass.mjs');
   const fetchRef = vi.fn();
   const readMergeBase = vi.fn();
-  const prs = [{ number: 1, labels: [{ name: 'review:changes' }] }];
+  const prs = [{ number: 1, headRefOid: HEAD_2752, mergeStateStatus: 'CLEAN', labels: [{ name: 'review:changes' }] }];
   const out = enrichPrsWithAlreadyLandedFacts(prs, { fetchRef, readMergeBase });
   expect(fetchRef).not.toHaveBeenCalled();
   expect(readMergeBase).not.toHaveBeenCalled();
@@ -519,6 +519,42 @@ it('enrichPrsWithAlreadyLandedFacts never guesses containment with no merge-base
   expect(readChanges).not.toHaveBeenCalled();
   expect(enrichPrsWithAlreadyLandedFacts([pr], { fetchRef: vi.fn(), readMergeBase: () => BASE_2752, readChanges })[0]
     .alreadyLandedInMain).toBeUndefined();
+  const readMergeBase = vi.fn();
+  const hostile = { ...pr, headRefOid: '--output=/x' };
+  expect(enrichPrsWithAlreadyLandedFacts([hostile], { fetchRef: vi.fn(), readMergeBase })[0]).toBe(hostile);
+  expect(readMergeBase).not.toHaveBeenCalled();
+});
+
+// A PR whose conflict is only visible as `mergeStateStatus: DIRTY` (no `merge-status:conflicting` label yet) takes
+// the same already-landed enrichment path as a labelled one — same attach / never-guess guarantees.
+it.each([
+  { labels: [{ name: 'review:changes' }], mergeStateStatus: 'DIRTY' },
+  { labels: [], mergeStateStatus: 'dirty' },
+])('enrichPrsWithAlreadyLandedFacts treats a DIRTY merge state as conflict evidence: attaches the carrier PR on a full match, evidence %j', async (conflictEvidence) => {
+  const { enrichPrsWithAlreadyLandedFacts } = await import('../reconcile-pass.mjs');
+  const pr = { number: 2752, headRefName: 'lane/4034-critical-work-gate', headRefOid: HEAD_2752, ...conflictEvidence };
+  const readChanges = vi.fn(() => [{ status: 'A', path: 'a.txt', dstMode: '100644', dstBlob: BLOB }]);
+  const out = enrichPrsWithAlreadyLandedFacts([pr], {
+    fetchRef: vi.fn(), readMergeBase: () => BASE_2752, readChanges,
+    findMatchingCommit: vi.fn(() => '22faaaa916445657928d5e30720881b830387ab6'), readPulls: vi.fn(() => [2759]),
+  });
+  expect(out[0].alreadyLandedInMain).toEqual({ carrierPr: 2759 });
+});
+
+it.each([
+  { labels: [], mergeStateStatus: 'DIRTY' },
+  { labels: [], mergeStateStatus: 'dirty' },
+])('enrichPrsWithAlreadyLandedFacts with DIRTY merge state never guesses partial containment or a non-sha head, evidence %j', async (conflictEvidence) => {
+  const { enrichPrsWithAlreadyLandedFacts } = await import('../reconcile-pass.mjs');
+  const pr = { number: 2752, headRefName: 'lane/4034-critical-work-gate', headRefOid: HEAD_2752, ...conflictEvidence };
+  const readChanges = vi.fn(() => [
+    { status: 'A', path: 'b.txt', dstMode: '100644', dstBlob: BLOB },
+    { status: 'D', path: 'a.txt', dstMode: '000000', dstBlob: '0'.repeat(40) },
+  ]);
+  const findMatchingCommit = vi.fn((change) => (change.path === 'b.txt' ? 'commit1' : null));
+  expect(enrichPrsWithAlreadyLandedFacts([pr], {
+    fetchRef: vi.fn(), readMergeBase: () => BASE_2752, readChanges, findMatchingCommit, readPulls: vi.fn(),
+  })[0].alreadyLandedInMain).toBeUndefined();
   const readMergeBase = vi.fn();
   const hostile = { ...pr, headRefOid: '--output=/x' };
   expect(enrichPrsWithAlreadyLandedFacts([hostile], { fetchRef: vi.fn(), readMergeBase })[0]).toBe(hostile);
