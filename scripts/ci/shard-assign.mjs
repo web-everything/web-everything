@@ -167,6 +167,10 @@ async function main(argv) {
     const reports = update.slice('--update='.length).split(',').filter(Boolean).map((p) => JSON.parse(readFileSync(p, 'utf8')));
     const all = loadTimings();
     const timings = timingsFromReports(reports);
+    // An empty or malformed report must never wipe populated timings.
+    if (!reports.every((r) => Array.isArray(r?.testResults)) || !Object.keys(timings).length) {
+      throw new Error('shard-assign: --update reports hold no timed test files; refusing to overwrite existing timings');
+    }
     writeFileSync(TIMINGS_FILE, formatUpdatedTimings(all, suite, timings));
     process.stdout.write(`updated ${suite}: ${Object.keys(timings).length} files\n`);
     return 0;

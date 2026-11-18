@@ -146,6 +146,11 @@ describe('integration timing persistence', () => {
         expect(result.stderr).toMatch(/requires|forbids/);
       }
       expect(loadTimings(file)).toEqual(updated);
+      writeFileSync(report, '{}');
+      const empty = spawnSync(process.execPath, [script, '--suite=integration', `--update=${report}`], { encoding: 'utf8', timeout: 5000 });
+      expect(empty.status).toBe(2);
+      expect(empty.stderr).toMatch(/refusing to overwrite/);
+      expect(loadTimings(file)).toEqual(updated);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

@@ -105,7 +105,8 @@ export function collectDurations(options, exec = execFileSyncThrottled) {
       throw new Error('Job views are missing completed jobs from the jobs API; retry or inspect the run');
     }
     const jobs = view.jobs.map(job => {
-      if (job.status !== 'completed' || job.conclusion === 'skipped' || seconds(job.startedAt, job.completedAt) === null) return job;
+      if (job.status !== 'completed' || job.conclusion === 'skipped') return job;
+      if (seconds(job.startedAt, job.completedAt) === null) throw new Error('Invalid CLI job timestamps for a completed job; inspect the run and retry');
       const createdAt = byId.get(job.databaseId)?.created_at;
       if (seconds(createdAt, job.startedAt) === null) {
         throw new Error('Missing or invalid job creation evidence; inspect jobs API timestamps/IDs and retry');
