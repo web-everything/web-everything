@@ -397,6 +397,34 @@ it.each([readDrainRedTeamEvidence, readRecoveryWitness])('unknown-id verificatio
   expect(reader(args)).toMatchObject({ ok: false, reason: 'scan-capped' });
   expect(reads).toBe(300);
 });
+it.each([readDrainRedTeamEvidence, readRecoveryWitness])('index identity change cannot reuse an unrelated payload over a newer rejection (%#)', reader => {
+  for (const maxParses of [1, 3]) {
+    const f = fixture(); completeIndex(f);
+    const unrelated = { ...f.run, id: 'review-pr-added', input: { repo: f.repo, pr: 8 } };
+    const rejection = { ...unrelated, input: f.run.input, verdict: { verdict: 'changes' },
+      stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(50_000).toISOString() }] };
+    const path = join(f.runsDir, `${unrelated.id}.json`);
+    writeFileSync(path, JSON.stringify(unrelated)); utimesSync(path, 100, 100);
+    let reads = 0, changed = false;
+    const result = reader({ ...f,
+      scanSettings: { file: { runs: { scan: { maxParses } } }, platform: {}, env: {} }, warn: () => {},
+      read: id => {
+        reads++;
+        const payload = readRun(id, f.runsDir);
+        if (id === unrelated.id && !changed) {
+          changed = true;
+          writeFileSync(path, JSON.stringify(rejection)); utimesSync(path, 101, 101);
+        }
+        return payload;
+      },
+    });
+    expect(changed).toBe(true);
+    expect(result.loopPayload ?? result.newest).not.toEqual(f.run);
+    if (maxParses === 1) expect(result).toMatchObject({ ok: false, reason: 'scan-capped' });
+    else expect(result.loopPayload ?? result.newest).toEqual(rejection);
+    expect(reads).toBeLessThanOrEqual(maxParses);
+  }
+});
 it('an unreadable unknown id retains the fallback unreadable-record refusal', () => {
   const f = fixture(); completeIndex(f);
   const unknown = 'review-pr-unreadable'; let attempts = 0;
