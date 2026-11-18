@@ -260,6 +260,7 @@ describe('same-head holds with no referral finding (#7012)', () => {
     ['malformed referral', [...comments, { ...advisory, body: '<!-- mandatory-referrals-v1: broken -->' }], {}, /malformed/],
     ['pending referral', [...comments, recordComment({ rulings: [], carried: [], superseded: [] })], {}, /no readable ruling/],
     ['referral-kind hold without records', comments, { kind: 'referral' }, /no referral record names/],
+    ['same-head hold with no current advisory', [], {}, /no current advisory covers the head/],
     ['failed persistence', comments, { persistenceFailed: true }, /save failed/],
     ['no verdict', comments, { noVerdict: {} }, /no verdict ever landed/],
     ['ledger cause', comments, { cause: 'ledger-unreadable' }, /ledger cannot answer/],
@@ -272,6 +273,12 @@ describe('same-head holds with no referral finding (#7012)', () => {
     const p = plan(out);
     expect(p.dispatch).toEqual([]);
     expect(p.refusals.map(r => r.kind)).toEqual(['review-referrals-pending']);
+  });
+
+  it('onClean=pause keeps a no-finding same-head hold', () => {
+    const pr = held();
+    const settings = { value: { enabled: true, onBlock: 'send-back', onClean: 'pause' }, sources: { onClean: 'env' } };
+    expect(decide(pr, pr.referralHold, { settings })).toMatchObject({ outcome: 'stay', why: expect.stringMatching(/onClean=pause/) });
   });
 
   it('an unreadable live referral state keeps the hold', () => {
@@ -324,12 +331,12 @@ describe('fail closed: anything unproven keeps the pause, and says why', () => {
     const out = decide(asPr(fx, [...fx.comments, bad]), hold);
     expect(out.outcome).toBe('stay');
   });
-  it('records only on an older head leave no referral finding owed by a clean same-head hold', () => {
+  it('records only on an older head, with no advisory on the live head, stay paused', () => {
     const f = FX[5800];
     const r = liveRecord(f);
     const other = '1'.repeat(40);
     const prOther = asPr({ ...f, headRefOid: other });
-    expect(decide(prOther, { ...hold, head: other })).toMatchObject({ outcome: 'resume', findings: [], counts: {} });
+    expect(decide(prOther, { ...hold, head: other })).toMatchObject({ outcome: 'stay', why: expect.stringMatching(/no referral record names the live head/) });
     expect(r.head).toBe(f.headRefOid);
   });
   it('an operator carry the gate backs (source ruling on an older head) counts; the same ruling without the carry does not', () => {

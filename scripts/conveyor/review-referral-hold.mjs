@@ -24,6 +24,7 @@ import { createActionStore } from '../operations/action-store.mjs';
 import { actionResource } from '../operations/action-record.mjs';
 import { isQuotaError } from '../lib/provider-quota-hold.mjs';
 import { isBodyFileRefusal } from '../operations/review-pr-io.mjs';
+import { latestAdvisory, advisoryCoversHead } from '../lib/advisory-labels.mjs';
 import { reverifyStaleReferrals } from './referral-reverify.mjs';
 
 /** Maximum drives of a saved run before its resume budget is exhausted. Shared with the driver. */
@@ -627,10 +628,15 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
   if (hold.cause) return stay(`the verdict ledger cannot answer for this PR (${hold.cause})`);
   if (!Array.isArray(pr.comments)) return stay('the comment thread is unreadable; read the full thread before resuming');
   if (pr.comments.length >= GH_LIST_COMMENT_CAP) return stay('the comment thread may be truncated; read the full thread before resuming');
-  const noFinding = why => hold.kind === 'same-head'
-    ? { outcome: 'resume', head, findings: [], counts: {},
-      why: `no referral finding exists on head ${head.slice(0, 9)}; no ruling is owed` }
-    : stay(why);
+  // Zero findings is proof only when the head's finished review left its advisory: that is the evidence the review ran
+  // and raised nothing. Without it (a lost write-back) the pause stays; onClean is honoured like any clean resume.
+  const noFinding = why => {
+    if (hold.kind !== 'same-head') return stay(why);
+    if (!advisoryCoversHead(latestAdvisory(pr.comments.filter(isTrustedMarkerAuthor)), head)) return stay(`${why}, and no current advisory covers the head`);
+    if (policy.onClean !== 'resume') return stay(`no referral finding exists, but referralHoldAutoResolve.onClean=${policy.onClean} (source: ${source('onClean')}) keeps the pause`);
+    return { outcome: 'resume', head, findings: [], counts: {},
+      why: `no referral finding exists on head ${head.slice(0, 9)}; no ruling is owed` };
+  };
   let live;
   try { live = liveReferralState(pr, { repo, pr: Number(pr.number), cardReadable }); }
   catch (e) { return stay(`the referral state is unreadable (${String(e?.message ?? e).split('\n')[0]})`); }
