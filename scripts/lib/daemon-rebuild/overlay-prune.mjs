@@ -2,16 +2,17 @@
 import * as fs from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { cascadePolicy } from '../policy-cascade.mjs';
 import { runGhSync } from '../gh-throttle.mjs';
-import { readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
+import { readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent, registrationIdentity } from '../daemon-overlays.mjs';
 import { remoteTip, withAddGuardLock, readPendingDrops, addPending, clearPending, restoreRegistration } from '../overlay-registration.mjs';
 import { defaultPrState } from './edge-fetch.mjs';
 import { pinnedStatus } from './plan.mjs';
 import { readRebuildState } from './state.mjs';
-import { verifyRev } from './shared.mjs';
+import { REBUILD_IDENTITY_ENV, verifyRev } from './shared.mjs';
 
 const SETTINGS = join(dirname(fileURLToPath(import.meta.url)), '../daemon-rebuild-settings.json');
 let lastSetting;
@@ -27,7 +28,7 @@ export function resolveOverlayPrune(env = process.env, { settingsPath = SETTINGS
 }
 
 export function planOverlayPrune({ overlays, mainSha, prState, openPrHeads, tipOf, isAncestor, conflictsWithMain,
-  conflictCounts = {}, pinStatus = () => null, adoptedHead = null }) {
+  conflictCounts = {}, pinStatus = () => null, adoptedHead = null, adoptedOverlays = [] }) {
   const heads = openPrHeads(); // null means discovery failed: rules b/c have no proof.
   const unregisteredHeads = heads?.filter(p => !overlays.some(o => o.ref === p.ref || (o.pr > 0 && o.pr === p.number)));
   const states = new Map([...new Set(overlays.filter(o => o.pr > 0).map(o => o.pr))].map(pr => [pr, prState(pr)]));
@@ -37,7 +38,13 @@ export function planOverlayPrune({ overlays, mainSha, prState, openPrHeads, tipO
     const tip = tips.get(o.ref), next = tips.get(other.ref);
     if (other.ref === o.ref || !tip || !next) return false;
     if (tip === next) return live(other) || other.ref < o.ref;
-    return isAncestor(tip, next) === true;
+    return probe(tip, next) === true;
+  };
+  const ancestry = new Map();
+  const probe = (a, b) => {
+    const key = `${a}:${b}`;
+    if (!ancestry.has(key)) ancestry.set(key, a && b ? isAncestor(a, b) : null);
+    return ancestry.get(key);
   };
   const planned = [];
   for (const o of overlays) {
@@ -47,16 +54,21 @@ export function planOverlayPrune({ overlays, mainSha, prState, openPrHeads, tipO
     if (pin?.pinned !== false || pin.why !== null) continue;
     // A numbered registration with unknown state cannot be retired by ancestry either.
     if (o.pr > 0 && !['CLOSED', 'MERGED'].includes(state)) continue;
+    // Unknown containment against any possible carrier blocks every retirement rule.
+    const carriers = [...overlays.filter(other => other.ref !== o.ref).map(other => tips.get(other.ref)),
+      ...(heads ?? []).map(p => p.headSha)];
+    if (carriers.some(sha => { const result = probe(tip, sha); return result !== true && result !== false; })) continue;
+    if (state !== 'MERGED' && (adoptedOverlays === null || adoptedOverlays.some(entry => entry.ref === o.ref))) continue;
     // The running build carries this tip; let established-overlay hold/auto-rebase handle it.
     // Only a merged PR proves that retiring it cannot discard live content.
-    if (state !== 'MERGED' && adoptedHead && isAncestor(tip, adoptedHead) !== false) continue;
+    if (state !== 'MERGED' && adoptedHead && probe(tip, adoptedHead) !== false) continue;
     const evidence = { ref: o.ref, pr: o.pr ?? null, tip, mainSha };
     if (state === 'CLOSED' || state === 'MERGED') {
       planned.push({ ...evidence, reason: state === 'CLOSED' ? 'pr-closed' : 'pr-merged', prState: state });
       continue;
     }
     if (!heads || !tip) continue;
-    if (unregisteredHeads.some(p => p.headSha === tip || isAncestor(tip, p.headSha) === true)) continue;
+    if (unregisteredHeads.some(p => p.headSha === tip || probe(tip, p.headSha) === true)) continue;
     // Resolution commits may live on an edge rather than the ordinary overlay tip.
     if (o.edgeResolution || o.conflictOverride) continue;
     const successor = overlays.find(other => supersedes(other, o));
@@ -107,8 +119,26 @@ export function pruneOverlays({ root, env = process.env, dryRun = false, deps = 
       const tips = new Map(overlays.map(o => [o.ref, currentTip(o.ref)]));
       const tipOf = ref => tips.get(ref);
       const adoptedState = readRebuildState(root, env).adopted;
+      const runningHead = verifyRev(git, 'HEAD');
       const adoptedHead = Object.hasOwn(deps, 'adoptedHead') ? deps.adoptedHead
-        : adoptedState?.head && adoptedState.head === verifyRev(git, 'HEAD') ? adoptedState.head : null;
+        : adoptedState?.head && adoptedState.head === runningHead ? adoptedState.head : null;
+      const historyHead = adoptedHead ?? runningHead;
+      let adoptedOverlays = deps.adopted ?? [];
+      if (historyHead) {
+        const log = git(['log', '--first-parent', '--format=%P%x09%ce%x09%s', historyHead, '--not', mainSha]);
+        if (log.error || log.status !== 0) adoptedOverlays = null;
+        else {
+          adoptedOverlays = [...adoptedOverlays, ...(adoptedState?.head === historyHead ? adoptedState.applied ?? [] : [])];
+          for (const line of String(log.stdout ?? '').split('\n')) {
+            const [parents, committer, ...subject] = line.split('\t');
+            const hit = subject.join('\t').match(/^daemon-rebuild: merge overlay (\S+) /);
+            const ps = parents.split(' ');
+            if (hit && committer === REBUILD_IDENTITY_ENV.GIT_COMMITTER_EMAIL && [2, 3].includes(ps.length)) {
+              adoptedOverlays.push({ ref: hit[1], sha: ps[1] });
+            }
+          }
+        }
+      }
       const isAncestor = deps.isAncestor ?? ((a, b) => {
         const r = git(['merge-base', '--is-ancestor', a, b]);
         return !r.error && r.status === 0 ? true : !r.error && r.status === 1 ? false : null;
@@ -136,31 +166,36 @@ export function pruneOverlays({ root, env = process.env, dryRun = false, deps = 
       let previous = {};
       try {
         previous = JSON.parse(io.readFileSync(file, 'utf8'));
-        if (!previous || typeof previous !== 'object' || Array.isArray(previous) || Object.values(previous).some(n => !Number.isSafeInteger(n) || n < 0)) throw new Error('invalid prune counters');
+        if (!previous || typeof previous !== 'object' || Array.isArray(previous) || Object.values(previous).some(n => !(Number.isSafeInteger(n) && n >= 0) && (!n || !Number.isSafeInteger(n.count) || n.count < 0 || typeof n.tip !== 'string' || !n.identity || typeof n.identity !== 'object' || Array.isArray(n.identity)))) throw new Error('invalid prune counters');
       } catch (e) { if (e.code !== 'ENOENT') throw e; }
-      const counts = Object.create(null);
+      const counts = Object.create(null), records = Object.create(null);
       for (const o of overlays) {
-        counts[o.ref] = heads && !(o.pr > 0) && !heads.some(p => p.ref === o.ref) && conflictsWithMain(o.ref) === true
-          ? Math.min(3, (Object.hasOwn(previous, o.ref) ? previous[o.ref] : 0) + (!dryRun && deps.countConflicts !== false ? 1 : 0)) : 0;
+        const hasPrior = Object.hasOwn(previous, o.ref);
+        const prior = hasPrior ? previous[o.ref] : undefined;
+        const identity = registrationIdentity(o), tip = tipOf(o.ref);
+        const same = prior && prior.tip === tip && isDeepStrictEqual(prior.identity, identity);
+        const eligible = heads && tip && !(o.pr > 0) && !heads.some(p => p.ref === o.ref) && conflictsWithMain(o.ref) === true;
+        counts[o.ref] = eligible && (!hasPrior || same)
+          ? Math.min(3, (same ? prior.count : 0) + (!dryRun && deps.countConflicts !== false ? 1 : 0)) : 0;
+        records[o.ref] = { tip: tip ?? '', identity, count: counts[o.ref] };
       }
       const planned = planOverlayPrune({ overlays, mainSha, prState: deps.prState ?? (pr => defaultPrState({ pr, root })),
         openPrHeads: () => heads, tipOf, conflictsWithMain, conflictCounts: counts,
         pinStatus: (entry, tip) => mainSha ? pinnedStatus(git, entry, mainSha, tip) : null,
-        adoptedHead, isAncestor });
+        adoptedHead, adoptedOverlays, isAncestor });
       if (dryRun) return planned;
       const removed = [];
       for (const item of planned) {
         const entry = overlays.find(o => o.ref === item.ref);
         if (entry.pinned === true) continue;
-        const adopted = deps.adopted?.find(o => o.ref === item.ref);
-        if (adopted && item.reason === 'superseded' && (!adopted.sha ||
-          (adopted.sha !== item.supersedingTip && !(deps.isAncestor ?? ((a, b) => git(['merge-base', '--is-ancestor', a, b]).status === 0))(adopted.sha, item.supersedingTip)))) continue;
+        const adopted = adoptedOverlays?.find(o => o.ref === item.ref);
         if (adopted) Object.assign(item, { wasAdopted: true, adoptedTip: adopted.sha });
         const carrier = item.reason === 'superseded' ? { newRef: item.supersededBy, newTip: item.supersedingTip } : {};
         const carrierHeld = () => !carrier.newRef || currentTip(carrier.newRef) === carrier.newTip;
         addPending(root, env, { kind: 'prune', ref: item.ref, entry, tip: item.tip, event: item, ...carrier, at: new Date().toISOString() });
         if (!carrierHeld() || currentTip(item.ref) !== item.tip) { clearPending(root, env, item.ref); continue; }
-        const result = (deps.removeOverlay ?? removeOverlay)(root, item.ref, { env, why: item.reason, expectedOverlay: overlays.find(o => o.ref === item.ref) });
+        const result = (deps.removeOverlay ?? removeOverlay)(root, item.ref, { env, why: item.reason, expectedOverlay: entry,
+          ...(carrier.newRef ? { requireRef: carrier.newRef, expectedRequiredOverlay: overlays.find(o => o.ref === carrier.newRef) } : {}) });
         if (!result.removed) { clearPending(root, env, item.ref); continue; }
         deps.afterDrop?.(item);
         let after, carrierAfter = false;
@@ -172,13 +207,13 @@ export function pruneOverlays({ root, env = process.env, dryRun = false, deps = 
           continue;
         }
         clearPending(root, env, item.ref);
-        delete counts[item.ref];
+        delete records[item.ref];
         removed.push(item);
         (deps.appendOverlayEvent ?? appendOverlayEvent)(root, { kind: 'overlay-pruned', ...item }, { env });
         if (item.wasAdopted) deps.alertAdopted?.(item);
       }
       const temp = `${file}.${randomUUID()}.tmp`;
-      try { io.writeFileSync(temp, JSON.stringify(counts)); io.renameSync(temp, file); }
+      try { io.writeFileSync(temp, JSON.stringify(records)); io.renameSync(temp, file); }
       finally { io.rmSync(temp, { force: true }); }
       return removed;
     };

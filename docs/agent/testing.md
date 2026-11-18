@@ -4448,6 +4448,15 @@ previews the candidates without writing counters, events, registrations, or lock
 
 Only rebuilds increment the consecutive-conflict counter in `<overlay-file>.prune-state`.
 Counts cap at three, reset on clean/unknown evidence, and disappear when unregistered.
+Sidecar records bind each count to its tip and `registrationIdentity` (excluding the mutable
+`stackBases` cache). Tip/identity changes and legacy ref-only counts reset to zero.
+The third-audit regressions cover both resets, historical sidecars, and cache-only updates.
+Unknown ancestry against any registered overlay or open PR head blocks every prune rule.
+Running-build first-parent overlay merge records and the matching adopted state protect
+all recorded tips of a ref even after it moves, except for confirmed merged PRs.
+Supersession passes `requireRef` and the survivor identity to removal; both are checked
+inside the list mutex while pruning holds the add guard. Missing or re-registered
+survivors retain the ancestor, as exercised by the removal-time race regressions.
 Counter reads use own properties: prototype-named refs such as `constructor` start at zero
 when absent. The named prototype-ref regression checks valid sidecars across repeated runs
 and confirms an unrelated registration can still reach its prune threshold.

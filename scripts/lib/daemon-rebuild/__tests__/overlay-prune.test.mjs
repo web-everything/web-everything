@@ -7,13 +7,14 @@ import { readPendingDrops, settlePendingDrops, restoreRegistration, withAddGuard
 import { pinnedStatus, REBUILD_MECHANISM_PATHS } from '../plan.mjs';
 import { writeRebuildState } from '../state.mjs';
 import { kickOverlayMainSync } from '../overlay-main-sync.mjs';
-import { addOverlay, readOverlayState, overlayFilePath, writeOverlays } from '../../daemon-overlays.mjs';
+import { addOverlay, removeOverlay, readOverlayState, overlayFilePath, writeOverlays } from '../../daemon-overlays.mjs';
 
 const a = 'a'.repeat(40), b = 'b'.repeat(40), main = 'c'.repeat(40);
 const unpinnedGit = args => ({ status: 0, stdout: args[0] === 'diff' ? '' : main });
 const base = overrides => ({ overlays: [{ ref: 'old', pr: 0 }], mainSha: main, prState: () => null,
   pinStatus: (entry, tip) => pinnedStatus(unpinnedGit, entry, main, tip),
   openPrHeads: () => [], tipOf: () => a, isAncestor: () => false, conflictsWithMain: () => false, ...overrides });
+const counterValues = file => Object.fromEntries(Object.entries(JSON.parse(fs.readFileSync(file, 'utf8'))).map(([ref, value]) => [ref, value.count]));
 const dirs = [];
 afterEach(() => { for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 function fixture(overrides = {}) {
@@ -126,31 +127,31 @@ describe('overlay prune IO', () => {
     const f = fixture({ tipOf: name => name === ref ? a : b });
     f.state.overlays = [{ ref, pr: 0 }];
     expect(f.run()).toEqual([]);
-    expect(JSON.parse(fs.readFileSync(f.file, 'utf8'))).toEqual({ [ref]: 1 });
+    expect(counterValues(f.file)).toEqual({ [ref]: 1 });
     f.state.overlays.push({ ref: 'unrelated', pr: 0 });
     expect(f.run()).toEqual([]);
-    expect(JSON.parse(fs.readFileSync(f.file, 'utf8'))).toEqual({ [ref]: 2, unrelated: 1 });
+    expect(counterValues(f.file)).toEqual({ [ref]: 2, unrelated: 1 });
     expect(f.run()).toEqual([expect.objectContaining({ ref, reason: 'pr0-conflicting', conflictCount: 3 })]);
-    expect(JSON.parse(fs.readFileSync(f.file, 'utf8'))).toEqual({ unrelated: 2 });
+    expect(counterValues(f.file)).toEqual({ unrelated: 2 });
     expect(f.run()).toEqual([expect.objectContaining({ ref: 'unrelated', reason: 'pr0-conflicting', conflictCount: 3 })]);
-    expect(JSON.parse(fs.readFileSync(f.file, 'utf8'))).toEqual({});
+    expect(counterValues(f.file)).toEqual({});
     // A parsed empty sidecar must behave like the initially missing sidecar.
     f.state.overlays = [{ ref, pr: 0 }];
     expect(f.run()).toEqual([]);
-    expect(JSON.parse(fs.readFileSync(f.file, 'utf8'))).toEqual({ [ref]: 1 });
+    expect(counterValues(f.file)).toEqual({ [ref]: 1 });
     expect(f.deps.alert).not.toHaveBeenCalled();
   });
   it('resets counts when clean or unregistered', () => {
     const f = fixture(); f.run(); f.run();
     f.deps.conflictsWithMain = () => false; f.run();
-    expect(JSON.parse(fs.readFileSync(f.file, 'utf8'))).toEqual({ old: 0 });
+    expect(counterValues(f.file)).toEqual({ old: 0 });
     f.deps.conflictsWithMain = () => true; expect(f.run()).toEqual([]);
     f.state.overlays = []; f.run(); expect(fs.existsSync(f.file)).toBe(false);
     f.state.overlays = [{ ref: 'old' }]; expect(f.run()).toEqual([]);
   });
   it('does not advance counters during main sync', () => {
     const f = fixture({ countConflicts: false }); f.run(); f.run(); f.run();
-    expect(JSON.parse(fs.readFileSync(f.file, 'utf8'))).toEqual({ old: 0 });
+    expect(counterValues(f.file)).toEqual({ old: 0 });
   });
   it('dry-run lists only and writes nothing, including counters and locks', () => {
     const f = fixture({ prState: () => 'CLOSED' }); f.state.overlays[0].pr = 7;
@@ -171,7 +172,7 @@ describe('overlay prune IO', () => {
   });
   it('keeps overlays on corrupt sidecar or unknown merge evidence', () => {
     const f = fixture({ conflictsWithMain: () => null }); f.run();
-    expect(JSON.parse(fs.readFileSync(f.file, 'utf8'))).toEqual({ old: 0 });
+    expect(counterValues(f.file)).toEqual({ old: 0 });
     fs.writeFileSync(f.file, 'broken'); expect(f.run()).toEqual([]); expect(f.deps.alert).toHaveBeenCalled();
   });
   it('does not bypass an add guard or pending drops', () => {
@@ -292,12 +293,13 @@ it.each([b, undefined])('uses the current remote tip instead of a stale tracking
 });
 
 
-it('reports an adopted conflicting tip in the prune event and alert', () => {
+it('retains a previously adopted different tip despite repeated conflicts', () => {
   const alertAdopted = vi.fn();
   const f = fixture({ adopted: [{ ref: 'old', sha: b }], alertAdopted });
   f.run(); f.run(); f.run();
-  expect(f.events).toEqual([expect.objectContaining({ wasAdopted: true, tip: a, adoptedTip: b })]);
-  expect(alertAdopted).toHaveBeenCalledWith(expect.objectContaining({ wasAdopted: true, adoptedTip: b }));
+  expect(f.events).toEqual([]);
+  expect(f.removed).toEqual([]);
+  expect(alertAdopted).not.toHaveBeenCalled();
 });
 
 it('retains an adopted ancestor when the registered carrier does not contain the adopted tip', () => {
@@ -345,11 +347,11 @@ it('restores the pruned tip when its registered carrier moves after removal', ()
   expect(f.events).toEqual([]);
 });
 
-it('reports adopted supersession when a registered survivor contains the adopted tip', () => {
+it('retains adopted supersession even when a registered survivor contains the adopted tip', () => {
   const f = fixture({ adopted: [{ ref: 'old', sha: a }], isAncestor: (x, y) => x === a && y === b });
   f.state.overlays.push({ ref: 'carrier', pinned: true });
   f.deps.tipOf = ref => ref === 'old' ? a : b;
-  expect(f.run()).toEqual([expect.objectContaining({ ref: 'old', reason: 'superseded', wasAdopted: true, adoptedTip: a, supersedingTip: b })]);
+  expect(f.run()).toEqual([]); expect(f.removed).toEqual([]);
 });
 
 
@@ -423,4 +425,102 @@ describe('audit retention guarantees', () => {
       expect(readOverlayState(f.root, { env: f.env }).overlays).toEqual([entry]);
     }, { noWait: true });
   });
+});
+
+
+describe('third audit regression guarantees', () => {
+  it.each(['tip', 'registration'])('resets conflict count to zero when %s changes after two conflicts', changed => {
+    const f = fixture(); f.state.overlays[0].addedAt = 'first';
+    f.run(); f.run();
+    if (changed === 'tip') f.deps.tipOf = () => b;
+    else f.state.overlays[0].addedAt = 'second';
+    expect(f.run()).toEqual([]);
+    expect(counterValues(f.file)).toEqual({ old: 0 });
+    expect(f.run()).toEqual([]); expect(f.run()).toEqual([]);
+    expect(f.run()).toEqual([expect.objectContaining({ reason: 'pr0-conflicting', conflictCount: 3 })]);
+  });
+  it('resets historical ref-only sidecars rather than inheriting their count', () => {
+    const f = fixture();
+    fs.mkdirSync(join(f.root, 'overlays'), { recursive: true });
+    fs.writeFileSync(f.file, JSON.stringify({ old: 3 }));
+    expect(f.run()).toEqual([]); expect(counterValues(f.file)).toEqual({ old: 0 });
+  });
+  it('preserves counters when only the mutable stack-base cache changes', () => {
+    const f = fixture(); f.run(); f.run();
+    f.state.overlays[0].stackBases = ['base'];
+    expect(f.run()).toEqual([expect.objectContaining({ reason: 'pr0-conflicting' })]);
+  });
+  it.each(['missing', 're-registered'])('keeps the ancestor if the survivor is %s at removal under the add guard', change => {
+    const f = fixture({ isAncestor: (x, y) => x === a && y === b });
+    const old = { ref: 'old', pr: 0 }, carrier = { ref: 'carrier', pinned: true, addedAt: 'first' };
+    writeOverlays(f.root, [old, carrier], { env: f.env });
+    delete f.deps.readOverlayState;
+    f.deps.tipOf = ref => ref === 'old' ? a : b;
+    f.deps.removeOverlay = (root, ref, options) => {
+      expect(fs.existsSync(`${overlayFilePath(root, f.env)}.add-guard.lock`)).toBe(true);
+      expect(options).toMatchObject({ requireRef: 'carrier', expectedRequiredOverlay: carrier });
+      writeOverlays(root, change === 'missing' ? [old] : [old, { ...carrier, addedAt: 'second' }], { env: f.env });
+      return removeOverlay(root, ref, options);
+    };
+    expect(f.run()).toEqual([]);
+    expect(readOverlayState(f.root, { env: f.env }).overlays).toContainEqual(old);
+    expect(f.events).toEqual([]);
+  });
+  it.each(['history', 'state'])('protects an older adopted sha from %s after the ref moves, except pr-merged', source => {
+    const f = fixture({ prState: () => 'CLOSED', isAncestor: () => false,
+      git: args => args[0] === 'log' ? { status: 0, stdout: source === 'history'
+        ? `${main} ${b}\tdaemon-rebuild@localhost\tdaemon-rebuild: merge overlay old (PR #7) onto ${main}\n` : '' }
+        : unpinnedGit(args) });
+    f.state.overlays[0].pr = 7;
+    writeRebuildState(f.root, { adopted: { head: main, applied: source === 'state' ? [{ ref: 'old', sha: b }] : [] } }, f.env);
+    expect(f.run({ dryRun: true })).toEqual([]); expect(f.run()).toEqual([]);
+    f.deps.prState = () => 'MERGED';
+    expect(f.run()).toEqual([expect.objectContaining({ reason: 'pr-merged' })]);
+  });
+  it.each(['registered', 'open-pr'])('unknown ancestry against a %s carrier blocks every removal rule', carrier => {
+    for (const state of ['CLOSED', 'MERGED', null]) {
+      const f = fixture({ prState: () => state, isAncestor: () => null,
+        tipOf: ref => ref === 'old' ? a : b,
+        openPrHeads: () => carrier === 'open-pr' ? [{ number: 9, ref: 'live', headSha: b }] : [] });
+      f.state.overlays[0].pr = state ? 7 : 0;
+      if (carrier === 'registered') f.state.overlays.push({ ref: 'carrier', pinned: true });
+      f.run(); f.run(); expect(f.run()).toEqual([]);
+      expect(f.removed).toEqual([]); expect(f.events).toEqual([]);
+    }
+  });
+  it('keeps overlays if reading adopted merge history fails', () => {
+    const f = fixture({ adoptedHead: main, prState: () => 'CLOSED',
+      git: args => args[0] === 'log' ? { status: 128 } : unpinnedGit(args) });
+    f.state.overlays[0].pr = 7;
+    expect(f.run()).toEqual([]); expect(f.removed).toEqual([]);
+  });
+});
+
+
+it.each([2, 128])('failed carrier ancestry status %s blocks closed, merged, and conflicting pruning', status => {
+  for (const state of ['CLOSED', 'MERGED', null]) {
+    const f = fixture({ prState: () => state,
+      tipOf: ref => ref === 'old' ? a : b,
+      openPrHeads: () => [{ number: 9, ref: 'live', headSha: b }],
+      git: args => args[0] === 'merge-base' && args[1] === '--is-ancestor' ? { status } : unpinnedGit(args) });
+    delete f.deps.isAncestor;
+    f.state.overlays[0].pr = state ? 7 : 0;
+    f.run(); f.run(); expect(f.run()).toEqual([]);
+    expect(f.removed).toEqual([]);
+  }
+});
+
+it('unknown carrier evidence overrides a known superseding overlay', () => {
+  expect(planOverlayPrune(base({ overlays: [{ ref: 'old' }, { ref: 'carrier', pinned: true }],
+    tipOf: ref => ref === 'old' ? a : b,
+    openPrHeads: () => [{ number: 9, ref: 'live', headSha: main }],
+    isAncestor: (x, y) => y === main ? null : true }))).toEqual([]);
+});
+
+it('protects an older adopted tip from running-build records even without cached adopted state', () => {
+  const f = fixture({ prState: () => 'CLOSED', isAncestor: () => false,
+    git: args => args[0] === 'log' ? { status: 0,
+      stdout: `${main} ${b}\tdaemon-rebuild@localhost\tdaemon-rebuild: merge overlay old onto ${main}\n` } : unpinnedGit(args) });
+  f.state.overlays[0].pr = 7;
+  expect(f.run()).toEqual([]); expect(f.removed).toEqual([]);
 });
