@@ -1,9 +1,29 @@
 {
   "_comment": "Reviewed allow-list for the git-bundle credential scan: already-public tracked repo CODE that handles keys (not keys). Read from the public base commit, never from the range being scanned. Keyed by path + sha256 of the blob; any edit changes the hash and re-triggers the full scan. Add an entry only for a tracked file whose finding was reviewed as a pattern in code.",
   "entries": [
-    { "path": "scripts/lib/gh-app-shim.mjs", "sha256": "845c02b45b143d42298c1486a8bd7a033d1ebc13547327bdb50b440820f3aa31", "findings": ["private-key"], "reason": "GitHub App shim: handles key files, contains no key material" },
-    { "path": "scripts/guard-bash.mjs", "sha256": "682c642f52c4bc4214b1e47f408dff8e5634f3783d7da5b1da96844ef4ce2cc0", "findings": ["unsupported-text-encoding"], "reason": "guard source with non-UTF8-clean literals" },
-    { "path": "scripts/lib/component-render-build-hook.cjs", "sha256": "3831d3f03f3987196bbe468e262a4facb48a682efca89ee4bdd063d6fd5ac443", "findings": ["unsupported-text-encoding"], "reason": "build hook source with non-UTF8-clean literals" },
-    { "path": "skills-src/conveyor/__tests__/review-daemon.test.mjs", "sha256": "0266731bcc0b55dfb2685e6da10940ebde7dccc9d7323cd6c50157122f4a3ffd", "findings": ["github-token"], "reason": "test fixture with a fake token-shaped string" }
+    {
+      "path": "scripts/lib/gh-app-shim.mjs",
+      "sha256": "845c02b45b143d42298c1486a8bd7a033d1ebc13547327bdb50b440820f3aa31",
+      "findings": [
+        "private-key"
+      ],
+      "reason": "GitHub App shim: handles key files, contains no key material"
+    },
+    {
+      "path": "scripts/guard-bash.mjs",
+      "sha256": "682c642f52c4bc4214b1e47f408dff8e5634f3783d7da5b1da96844ef4ce2cc0",
+      "findings": [
+        "unsupported-text-encoding"
+      ],
+      "reason": "guard source with non-UTF8-clean literals"
+    },
+    {
+      "path": "scripts/lib/component-render-build-hook.cjs",
+      "sha256": "3831d3f03f3987196bbe468e262a4facb48a682efca89ee4bdd063d6fd5ac443",
+      "findings": [
+        "unsupported-text-encoding"
+      ],
+      "reason": "build hook source with non-UTF8-clean literals"
+    }
   ]
 }

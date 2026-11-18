@@ -183,7 +183,19 @@ function allowedFindings(allowed, label, content, findings) {
   const present = findings.filter(Boolean);
   if (!allowed.size || !present.length) return false;
   const set = allowed.get(`${label}\0${createHash('sha256').update(content).digest('hex')}`);
-  return !!set && present.every(f => set.has(f));
+  if (!set || !present.every(f => set.has(f))) return false;
+  // The scanners report only the FIRST match, so a listed finding could hide another one behind it. Mask every
+  // listed pattern out of the bytes and rescan the rest (re-encoded as UTF-8 so a listed encoding finding cannot
+  // mask the remaining checks): anything left over refuses the bundle as before.
+  try {
+    let text = content.toString('latin1');
+    if (set.has('unsupported-text-encoding')) text = text.replace(/\0/g, ' ');
+    for (const name of set) {
+      const rule = secretText.find(([, n]) => n === name);
+      if (rule) text = text.replace(new RegExp(rule[0].source, rule[0].flags.replace('g', '') + 'g'), ' ');
+    }
+    return credentialContentFinding(Buffer.from(label), Buffer.from(text, 'utf8')) === null;
+  } catch { return false; }
 }
 
 /**
