@@ -202,16 +202,21 @@ export function sweepReviewHoldLabels({
         if (r.action === 'skip') continue; // a stamped PR is the normal case: no result, no log line
         results.push({ num: r.num, stampRestore: r.action, detail: r.detail });
         if (r.action === 'refuse' && r.detail?.contentRefusal && !dryRun) {
-          if (!/^[a-f0-9]{40}$/i.test(r.headSha ?? '')) throw new Error(`missing author-stamp head for PR #${r.num}; retry from fresh evidence`);
-          // Event-only kind: report polling cannot resolve this independently owned condition.
-          // publishAttention's locked open keys dedupe across passes and process restarts.
-          const key = `author-stamp:${r.num}:${r.headSha}`;
-          const published = publishNeedsYou({ repo: repoOf(), pr: r.num, head: r.headSha, kind: 'author-stamp', key,
-            reason: 'Author stamp content refused; inspect PR edit history',
-            snapshotId: r.detail.snapshotId, offender: r.detail.offender,
-            pick: `PR #${r.num} head ${r.headSha}; snapshot ${r.detail.snapshotId}; offender ${r.detail.offender}. Inspect that edit in the PR history; add the stamp line by hand if legitimate.` });
-          log(`  PR #${r.num}: author stamp ${published.lines.length ? 'NEEDS-YOU published' : 'already reported'}`);
-          continue;
+          // One failing publish must not hide later PRs: fall through to the plain per-pass refusal line.
+          try {
+            if (!/^[a-f0-9]{40}$/i.test(r.headSha ?? '')) throw new Error('missing head sha');
+            // Event-only kind: report polling cannot resolve this independently owned condition.
+            // publishAttention's locked open keys dedupe across passes and process restarts.
+            const key = `author-stamp:${r.num}:${r.headSha}`;
+            const published = publishNeedsYou({ repo: repoOf(), pr: r.num, head: r.headSha, kind: 'author-stamp', key,
+              reason: 'Author stamp content refused; inspect PR edit history',
+              snapshotId: r.detail.snapshotId, offender: r.detail.offender,
+              pick: `PR #${r.num} head ${r.headSha}; snapshot ${r.detail.snapshotId}; offender ${r.detail.offender}. Inspect that edit in the PR history and decide with the operator; do not hand-edit the stamp without verifying author provenance.` });
+            log(`  PR #${r.num}: author stamp ${published.lines.length ? 'NEEDS-YOU published' : 'already reported'}`);
+            continue;
+          } catch (publishError) {
+            log(`  PR #${r.num}: author stamp NEEDS-YOU publish failed: ${String(publishError?.message ?? publishError).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ')}`);
+          }
         }
         log(`  PR #${r.num}: author stamp ${r.action} — ${String(r.detail?.reason ?? '').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ')}`);
       }

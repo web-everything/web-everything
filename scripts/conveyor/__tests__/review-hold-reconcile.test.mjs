@@ -926,7 +926,7 @@ describe('author-stamp operator attention', () => {
       expect(events.map(e => e.key)).toEqual([`author-stamp:6989:${first}`, `author-stamp:6989:${next}`]);
       expect(events[0]).toMatchObject({ pr: 6989, head: first, kind: 'author-stamp',
         snapshotId: detail.snapshotId, offender: detail.offender });
-      for (const text of ['PR #6989', first, detail.snapshotId, detail.offender, 'Inspect that edit in the PR history', 'add the stamp line by hand if legitimate']) {
+      for (const text of ['PR #6989', first, detail.snapshotId, detail.offender, 'Inspect that edit in the PR history', 'do not hand-edit the stamp without verifying author provenance']) {
         expect(events[0].pick).toContain(text);
       }
     } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -939,13 +939,24 @@ describe('author-stamp operator attention', () => {
     expect(publish).not.toHaveBeenCalled();
   });
 
+  it('a failing publisher does not hide later refusals; each logs its plain refusal', () => {
+    const logs = [];
+    const results = sweepFixture({ repo: 'o/n', provider: provider(), listPrs: () => [],
+      restoreStamps: () => [{ num: 1, headSha: 'a'.repeat(40), action: 'refuse', detail },
+        { num: 2, headSha: 'b'.repeat(40), action: 'refuse', detail }],
+      publishNeedsYou: () => { throw new Error('feed unavailable'); }, log: line => logs.push(line) });
+    expect(results.filter(r => r.stampRestore === 'refuse').map(r => r.num)).toEqual([1, 2]);
+    expect(logs.filter(l => l.includes('publish failed'))).toHaveLength(2);
+    expect(logs.filter(l => l.includes('author stamp refuse'))).toHaveLength(2);
+  });
+
   it('does not publish during dry run or when the head is unreadable', () => {
     const publish = vi.fn();
     run('a'.repeat(40), publish, { dryRun: true });
     const log = vi.fn();
     run(undefined, publish, { log });
     expect(publish).not.toHaveBeenCalled();
-    expect(log).toHaveBeenCalledWith(expect.stringContaining('missing author-stamp head'));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('publish failed: missing head sha'));
   });
 
   it('retries publication after a failed feed write rather than marking it reported', () => {
