@@ -7,6 +7,7 @@
  */
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
+import { refineKind, holderLabel } from '../readiness/heavy-queue-projection.mjs';
 
 const MAX_BYTES = 512 * 1024;
 const bounded = value => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, '?').slice(0, 4096);
@@ -70,8 +71,15 @@ export function readFallbackRows(file) {
   return readFallbackLog(file).rows;
 }
 
-export function recordLocalSlotFallback({ lockRoot, reason, detail, repo, kind, now = () => Date.now() } = {}) {
+/** FB1: the slot's duration row refines a missing/`other` kind from the holder label (heavy-admission refineKind), so the
+ *  fallback row must carry the same refined kind or the report join (lane + kind) misses it. Only `other` is refined. */
+export function refinedFallbackKind(kind, argv = process.argv) {
+  return kind == null || kind === 'other' ? refineKind(kind, { holder: holderLabel(argv) }) : kind;
+}
+
+export function recordLocalSlotFallback({ lockRoot, reason, detail, repo, kind: rawKind, now = () => Date.now() } = {}) {
   try {
+    const kind = rawKind == null ? rawKind : refinedFallbackKind(rawKind);
     const file = join(lockRoot, 'remote-fallbacks.jsonl');
     const row = { ts: new Date(now()).toISOString(), reason: bounded(reason ?? 'unknown'), detail: detail == null ? null : bounded(detail), lane: basename(String(repo)), kind: kind == null ? null : bounded(kind) };
     mkdirSync(lockRoot, { recursive: true });
