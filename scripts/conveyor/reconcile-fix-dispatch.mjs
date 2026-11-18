@@ -1,4 +1,5 @@
 import { sharedRoundAttempts } from './reconcile-core.mjs';
+import { readRoundCommits } from './mechanical-round-cap.mjs';
 import { publishRedTeamFixLaunch, lockRedTeamFixCharge } from './red-team-fix-round-count.mjs';
 import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 import { safeAdoptYield } from '../lib/daemon-rebuild/adopt-yield.mjs';
@@ -89,7 +90,7 @@ import { withSalvageHint } from '../lib/salvage-index.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS, ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { repoProfile, briefTokensForRepo } from '../lib/repo-profile.mjs';
 import { resolvePrWorkUnit, isSafeFallbackScopeEntry } from './pr-work-unit.mjs';
-import { resolveFixScopePolicy, resolveOperatorPriorityPrs, createRegionReader, createLiveRegionOverlap, createHolderStateReader, landingHolderDecision } from './fix-scope-policy.mjs';
+import { resolveFixScopePolicy, resolveOperatorPriorityPrs, createRegionReader, createLiveRegionOverlap, createHolderStateReader, landingHolderDecision, stripProseScope } from './fix-scope-policy.mjs';
 import { DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES } from './fix-claim-store.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { execFileSync } from 'node:child_process';
@@ -538,6 +539,7 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
 /** Card xrbu1bp — the planner's spent-round count and the PR's base ref, carried onto a planned fix. */
 function roundFields(entry) {
   return {
+    ...(entry.redTeamSentBack && entry.roundCommits ? { roundCommits: entry.roundCommits } : {}),
     ...(entry.roundCap !== undefined ? { roundCap: entry.roundCap } : {}),
     ...(Number.isFinite(Number(entry.attempts)) && entry.attempts != null ? { attempts: Number(entry.attempts) } : {}),
     ...(Number.isFinite(Number(entry.cap)) && entry.cap != null ? { cap: Number(entry.cap) } : {}),
@@ -1420,6 +1422,14 @@ export function writePrivateBorrowedPrompt(slug, text, base = tmpdir()) {
 export function publishRedTeamFixDispatch({ repo, planned }, {
   readComments = () => readCompletePrComments(planned.pr, { repo: ghRepoSlug(repo) }),
   exec = execFileSyncThrottled,
+  readCommits = pr => {
+    const live = JSON.parse(exec('gh', ['pr', 'view', String(planned.pr), '--repo', ghRepoSlug(repo),
+      '--json', 'headRefOid,headRefName,baseRefName'],
+    { encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024 }));
+    if (live.headRefOid !== pr.headRefOid) throw new Error('red-team repair head moved; reconcile again');
+    return readRoundCommits({ pr: live,
+      exec: (cmd, args, opts) => exec(cmd, args, { ...opts, cwd: repoProfile(repo).checkoutPath }) });
+  },
 } = {}) {
   const release = lockRedTeamFixCharge(ghRepoSlug(repo), planned.pr);
   try {
@@ -1430,7 +1440,8 @@ export function publishRedTeamFixDispatch({ repo, planned }, {
       throw new Error('red-team repair dispatch evidence unreadable; retry with a fresh reconciliation or ask an operator');
     }
     return publishRedTeamFixLaunch({ comments, pr: planned.pr, head, attemptId: planned.attempts + 1,
-      chargedRounds: sharedRoundAttempts({ comments, headRefOid: head }), cap: planned.roundCap,
+      chargedRounds: sharedRoundAttempts({ comments, headRefOid: head, roundCommits: planned.roundCommits },
+        { requireRoundCommits: true, readCommits }), cap: planned.roundCap,
       publish: body => exec('gh', ['pr', 'comment', String(planned.pr), '--repo', ghRepoSlug(repo), '--body', body],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 1024 * 1024 }),
     });
@@ -2762,7 +2773,8 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
     const ms = Date.parse(entry.waitingSince);
     return Number.isFinite(ms) ? ms : Number.MAX_SAFE_INTEGER;
   };
-  const scopeFor = (entry) => entry.overlapScope ?? entry.scope;
+  const scopeFor = (entry) => stripProseScope(entry.overlapScope ?? entry.scope);
+  const overlapClaim = (claim) => ({ ...claim, scope: stripProseScope(claim.scope) });
   const ranks = planned.map((entry) => {
     const blocks = new Set(planned.filter((other) => other.pr !== entry.pr
       && overlapsInFlight(scopeFor(other), [{ scope: scopeFor(entry) }])).map((other) => other.pr)).size;
@@ -2804,11 +2816,11 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
     }
     if (settings?.holdMode === 'active-session') {
       for (const c of released.filter(c => !above.has(c.pr))) {
-        if (overlapsInFlight(scopeFor(entry), [c])) decide(entry, c, 'holdMode', false, 'refused waiter has no running fixer session');
+        if (overlapsInFlight(scopeFor(entry), [overlapClaim(c)])) decide(entry, c, 'holdMode', false, 'refused waiter has no running fixer session');
       }
     }
     let blockers = urgentPrs.has(entry.pr) ? [] : inFlight.filter((c) => {
-      if (!overlapsInFlight(scopeFor(entry), [c])) return false;
+      if (!overlapsInFlight(scopeFor(entry), [overlapClaim(c)])) return false;
       if (!settings) return true; // Public API compatibility: historical policy when omitted.
       if (settings.holdMode === 'active-session' && c.claim && expired(c.claim)) {
         decide(entry, c, 'holdMode', false, 'fixer heartbeat exceeds claim TTL'); return false;
@@ -2817,7 +2829,7 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
       if (settings.overlapGranularity === 'region') {
         const results = [];
         for (const file of scopeFor(entry) ?? []) {
-          for (const held of c.scope ?? []) {
+          for (const held of stripProseScope(c.scope) ?? []) {
             if (!overlapsInFlight([file], [{ scope: [held] }])) continue;
             let result = { overlap: true, why: 'region observation unavailable; retaining file hold', failedClosed: true };
             if (!c.build && file === held && !file.endsWith('/') && regionOverlap) {
@@ -2859,11 +2871,11 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
       }
       blockers = blockers.filter((c) => acceptedIds.has(c.id));
     }
-    const hit = overlapsInFlight(scopeFor(entry), blockers);
+    const hit = overlapsInFlight(scopeFor(entry), blockers.map(overlapClaim));
     // Only pr-lifetime retains refused waiters. Accepted fixes hold in either mode.
     // Deduplicate claims for the same fixer when formatting the queue position.
     const ahead = [...new Set(blockers.map((c) => c.id))];
-    const waiter = { ...entry, id: `fix PR #${entry.pr}`, scope: scopeFor(entry) };
+    const waiter = { ...entry, id: `fix PR #${entry.pr}`, scope: entry.overlapScope ?? entry.scope };
     if (hit && settings?.holdMode === 'active-session') released.push(waiter);
     else picked.push(waiter);
     if (hit) {

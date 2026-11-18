@@ -63,6 +63,13 @@ export function redTeamFact(comments, prNumber, head) {
   return unread();
 }
 
+/** CI-heal owns required-check failures even when the same PR also owes a gate repair. */
+export function hasRedTeamSentBackLabels(pr, repairKind = 'fix') {
+  const labels = (pr?.labels ?? []).map(l => typeof l === 'string' ? l : l?.name);
+  return repairKind === 'fix' && labels.includes('review:accepted') && labels.includes('red-team:blocked')
+    && !labels.includes('review:changes');
+}
+
 /** Unresolved send-back findings, bound to a trusted, named gate result on this head. */
 export function redTeamSentBackFindings(pr) {
   if (pr?.commentsComplete !== true || pr?.readFailed || !Array.isArray(pr?.comments)) return [];

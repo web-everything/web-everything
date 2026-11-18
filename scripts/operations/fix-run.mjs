@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { sharedRoundAttempts } from '../conveyor/reconcile-core.mjs';
 import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
-import { redTeamSentBackFindings } from '../conveyor/dispatch-eligibility-facts.mjs';
+import { redTeamSentBackFindings, hasRedTeamSentBackLabels } from '../conveyor/dispatch-eligibility-facts.mjs';
+import { readRoundCommits } from '../conveyor/mechanical-round-cap.mjs';
 import { publishRedTeamFixLaunch, lockRedTeamFixCharge, hasRedTeamFixLaunch } from '../conveyor/red-team-fix-round-count.mjs';
 import { randomUUID } from 'node:crypto';
 import { buildStandDownComment } from '../conveyor/stand-down.mjs';
@@ -389,10 +390,6 @@ function withMessageFile(message, action) {
 }
 
 const CHANGES_COMMENT_RE = /changes requested|THIS IS AN ADVISORY REVIEW/i;
-const hasRedTeamSentBackLabels = pr => {
-  const labels = (pr?.labels ?? []).map(l => typeof l === 'string' ? l : l?.name);
-  return labels.includes('review:accepted') && labels.includes('red-team:blocked') && !labels.includes('review:changes');
-};
 const cap = (t, n) => (String(t ?? '').length > n ? `${String(t).slice(0, n)}\n[... truncated ...]` : String(t ?? ''));
 
 /**
@@ -646,6 +643,7 @@ export async function runFixCli(argv = [], {
   resolveProvider = resolveFixProvider,
   spawnCodex = async (...args) => (await import('./codex-delivery-provider.mjs')).defaultSpawnCodexAgent(...args),
   readComments = readAllComments,
+  readCommits = (pr, { cwd = weRoot } = {}) => readRoundCommits({ pr, exec: (cmd, args, opts) => run(cmd, args, { ...opts, cwd }) }),
   readCiHeal = readCiHealInputs,
   timingPolicy = resolveTimingPolicy().fix,
   readChecks = readReviewChecks,
@@ -736,7 +734,7 @@ export async function runFixCli(argv = [], {
   try {
     const brief = assertBriefTaskContent(readPrompt(launch.promptFile));
     // The launcher has the network, the agent does not: fetch the reviewer's finding here and hand it over in the brief.
-    const prHead = JSON.parse(run('gh', ['pr', 'view', pr, '--json', 'title,body,baseRefName,mergeable,headRefOid,labels', ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot }) || '{}');
+    const prHead = JSON.parse(run('gh', ['pr', 'view', pr, '--json', 'title,body,baseRefName,mergeable,headRefOid,headRefName,labels', ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot }) || '{}');
     const redTeamRepair = launch.plannedRepairMode === 'red-team-sent-back';
     prHeadSha = prHead.headRefOid ?? null;
     const mergeConflictingBase = !launch.mergeOnto && prHead.mergeable === 'CONFLICTING';
@@ -754,7 +752,8 @@ export async function runFixCli(argv = [], {
         const comments = await readComments(pr, { repo: launch.repo });
         const charged = publishRedTeamFixLaunch({
           comments, pr: Number(pr), head: prHeadSha, attemptId: launch.launchId,
-          chargedRounds: sharedRoundAttempts({ ...prHead, comments }), cap: launch.redTeamRoundCap,
+          chargedRounds: sharedRoundAttempts({ ...prHead, comments }, { requireRoundCommits: true,
+            readCommits: p => readCommits(p, { cwd: launch.laneRepo ?? weRoot }) }), cap: launch.redTeamRoundCap,
           publish: body => withMessageFile(body, file => run('gh', ['pr', 'comment', pr,
             ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot })),
         });
@@ -769,7 +768,7 @@ export async function runFixCli(argv = [], {
     // The plan owns accounting. Publish before context rendering or execution, including
     // when the accepted/blocked labels have already changed to review:changes.
     if (redTeamRepair) await chargeRedTeamLaunch();
-    else if (hasRedTeamSentBackLabels(prHead)
+    else if (hasRedTeamSentBackLabels(prHead, launch.repairKind)
       && redTeamSentBackFindings({ ...prHead, number: Number(pr), comments, commentsComplete: true }).length > 0) {
       throw new LauncherError('red-team repair requires --planned-repair-mode=red-team-sent-back; reconcile again');
     }

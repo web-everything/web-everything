@@ -1,5 +1,5 @@
 import { parseMqFailureRoute } from '../lib/mq-failure-route.mjs';
-import { redTeamFact, redTeamSentBackFindings } from './dispatch-eligibility-facts.mjs';
+import { redTeamFact, redTeamSentBackFindings, hasRedTeamSentBackLabels } from './dispatch-eligibility-facts.mjs';
 import { admitMqFailureRoute } from './mq-failure-intake.mjs';
 import { ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { reviewStartGate, earlyStartShadow, fastChecksFor, REVIEW_TIMING_DEFAULTS, joinedFixDecision, fixReadiness, FIX_TIMING_DEFAULTS } from '../lib/review-timing.mjs';
@@ -1876,7 +1876,15 @@ export function resolveRoundExtensionAnchor({ env = {}, platform = null, repo = 
 
 /** Shared fix/review counter. A sliced thread deliberately omits the unsliceable durableCounts fallback. */
 export function sharedRoundAttempts(pr, { durableCount = 0, mechanicalRoundsCountTowardCap = false,
+  requireRoundCommits = false, readCommits,
   realFixRounds = countRealFixRounds(pr), operatorBudget = operatorFixBudget(pr?.comments, 0) } = {}) {
+  // A receipt must retain the planner's refunds. Re-read missing/stale evidence instead of
+  // silently charging the raw re-arm count and rejecting the same admitted repair forever.
+  if (requireRoundCommits && !realFixRounds.ok && pr?.comments?.some(isFixRoundRearmComment)) {
+    const roundCommits = readCommits?.(pr);
+    realFixRounds = countRealFixRounds({ ...pr, roundCommits });
+    if (!realFixRounds.ok) throw new Error('red-team repair round commit evidence unreadable; reconcile again or ask an operator');
+  }
   return Math.max(
     realFixRounds.ok ? realFixRounds.real : Number(durableCount) || 0,
     operatorBudget?.attempts ?? 0,
@@ -2892,8 +2900,7 @@ export function planReconcile({
     // A later accept on an unchanged head cannot retire the red-team gate's confirmed send-back.
     // review:changes remains owned by the ordinary bounced path; accepted heads must never be rearmed.
     if (phase === 'queued' && pr?.state === 'OPEN' && !pr?.isDraft
-        && withPhase.labels.includes('review:accepted') && withPhase.labels.includes('red-team:blocked')
-        && !withPhase.labels.includes('review:changes')) {
+        && hasRedTeamSentBackLabels(pr)) {
       const findings = redTeamSentBackFindings(pr);
       if (findings.length) {
         // Mandatory holds still bind a repair launch: never dispatch past a referral hold or an unreviewable head.
@@ -2905,6 +2912,7 @@ export function planReconcile({
             why: 'red-team send-back remains unresolved on the accepted head; automatic fix rounds exhausted' }, { allowTakeover: false });
         } else {
           dispatch.push({ ...base, ...withPhase, kind: 'fix', mode: 'red-team-sent-back', state: pr.state, findings: findings.length, attempts, roundCap: effectiveRoundCap,
+            ...(realFixRounds.ok ? { roundCommits: pr.roundCommits } : {}),
             redTeamSentBack: { head: pr.headRefOid, findings, resultId: redTeamFact(pr.comments, prNumber, pr.headRefOid)?.value?.resultId },
             why: 'confirmed red-team send-back remains unresolved on this accepted head; repair and push the same branch without rearming' });
         }

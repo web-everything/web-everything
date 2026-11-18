@@ -16,6 +16,7 @@ import { ADVISORY_NOTE_MARKER } from '../../conveyor/advisory-round-count.mjs';
 import { publishRedTeamFixLaunch, lockRedTeamFixCharge, RED_TEAM_FIX_COMMENT_MARKER, countRedTeamFixComments } from '../../conveyor/red-team-fix-round-count.mjs';
 import { buildFixEndComment } from '../../conveyor/fix-procedure.mjs';
 import { planReconcile } from '../../conveyor/reconcile-core.mjs';
+import { acceptedRedTeamRepair, failingRedTeamRepair, roundCommitGitOutput } from '../../conveyor/__tests__/fixtures/accepted-red-team-repair.mjs';
 import { resolveFixBorrowSettings } from '../../lib/dispatch-throttle.mjs';
 import { fixDetachedProvider, fixLauncherAvailable, FIX_RUN_SCRIPT, FIX_RUN_EXECUTORS, FIX_RUN_CONFINEMENT } from '../dispatch-providers/fix.mjs';
 import { resolveDeliveryAgentProvider } from '../deliver-item-wrapper.mjs';
@@ -205,7 +206,7 @@ describe('runFixCli', () => {
     expect(m.spawn).not.toHaveBeenCalled();
     expect(m.calls.some(c => c.includes('acquire') || c.includes('push') || c.includes('comment'))).toBe(false);
   });
-  it.each(['fix', 'ci-heal'])('refuses a legacy %s launch missing the planned red-team mode instead of inferring a charge from labels', async repairKind => {
+  it.each(['fix'])('refuses a legacy %s launch missing the planned red-team mode instead of inferring a charge from labels', async repairKind => {
     const pr = acceptedRedTeamPr(), m = mk([pr.headRefOid]);
     const writeErr = vi.fn();
     const run = (cmd, args, opts) => cmd === 'gh' && args.includes('view') ? JSON.stringify(pr) : m.run(cmd, args, opts);
@@ -216,6 +217,55 @@ describe('runFixCli', () => {
     expect(m.spawn).not.toHaveBeenCalled();
     expect(m.calls.some(c => c.includes('acquire') || c.includes('push') || c.includes('comment'))).toBe(false);
     expect(countRedTeamFixComments(pr.comments)).toBe(0);
+  });
+  it('accepts the real planner ci-heal for an accepted blocked PR and reads CI evidence', async () => {
+    const pr = failingRedTeamRepair(7), m = mk([pr.headRefOid, pr.headRefOid]);
+    const plan = planReconcile({ prs: [pr], agents: [], now: Date.now(), requiredChecks: ['test'] });
+    expect(plan.dispatch).toMatchObject([{ kind: 'ci-heal', prNumber: 7 }]);
+    const readCiHeal = vi.fn(() => ({ title: 'CI red', checks: [{ name: 'test' }], jobs: [{ name: 'test', log: 'CI regression evidence' }] }));
+    const run = (cmd, args, opts) => cmd === 'gh' && args.includes('view') ? JSON.stringify(pr) : m.run(cmd, args, opts);
+    const writeErr = vi.fn();
+    const result = await runFixCli([...argv, `--repair-kind=${plan.dispatch[0].kind}`], {
+      ...m.io, run, writeErr, readComments: async () => pr.comments, readCiHeal,
+    });
+    expect(result.code, writeErr.mock.calls.flat().join('')).toBe(0);
+    expect(readCiHeal).toHaveBeenCalledOnce();
+    expect(m.spawn).toHaveBeenCalledOnce();
+    expect(m.spawn.mock.calls[0][0].prompt).toContain('CI regression evidence');
+    expect(countRedTeamFixComments(pr.comments)).toBe(0);
+  });
+
+  it.each(['evidence', 'git', 'unreadable'])('recounts the real planner mechanical refunds before a borrowed receipt (%s)', async source => {
+    const readable = source !== 'unreadable';
+    const pr = acceptedRedTeamRepair(7), m = mk([pr.headRefOid, pr.headRefOid]);
+    const plan = planReconcile({ prs: [pr], agents: [], now: Date.now(), roundCap: 3 });
+    expect(plan.dispatch).toMatchObject([{ kind: 'fix', attempts: 0, roundCap: 3, mode: 'red-team-sent-back' }]);
+    const readCommits = vi.fn(() => readable ? pr.roundCommits : { ok: false });
+    const writeErr = vi.fn();
+    const run = (cmd, args, opts) => {
+      if (cmd === 'git' && ['fetch', 'log', 'merge-tree'].includes(args[0])) {
+        expect(opts.cwd).toBe('/w');
+        return roundCommitGitOutput(pr, args);
+      }
+      if (cmd === 'gh' && args.includes('view')) {
+        const { roundCommits, ...livePr } = pr; // gh does not return local commit enrichment.
+        return JSON.stringify(livePr);
+      }
+      if (cmd === 'gh' && args.includes('comment')) {
+        expect(m.spawn).not.toHaveBeenCalled();
+        pr.comments.push({ author: { login: 'web-everything' }, body: readFileSync(args.at(-1), 'utf8') });
+      }
+      return m.run(cmd, args, opts);
+    };
+    const result = await runFixCli([...redTeamArgv, '--red-team-round-cap=3'], {
+      ...m.io, run, writeErr, readComments: async () => pr.comments,
+      ...(source === 'git' ? {} : { readCommits }),
+    });
+    expect(result.code, writeErr.mock.calls.flat().join('')).toBe(readable ? 0 : 1);
+    expect(readCommits).toHaveBeenCalledTimes(source === 'git' ? 0 : 1);
+    expect(m.spawn).toHaveBeenCalledTimes(readable ? 1 : 0);
+    expect(countRedTeamFixComments(pr.comments)).toBe(readable ? 1 : 0);
+    if (!readable) expect(writeErr).toHaveBeenCalledWith(expect.stringContaining('round commit evidence unreadable'));
   });
   it.each(['fix', 'ci-heal'])('refuses %s before execution when the spent-launch thread cannot be read', async repairKind => {
     const m = mk(['a'.repeat(40)]);
@@ -1234,7 +1284,7 @@ describe('runFixCli', () => {
     } else {
       expect(m.calls.some(c => c.includes('fetch') || c.includes('merge'))).toBe(false);
     }
-    expect(m.calls).toContainEqual(['gh', 'pr', 'view', '7', '--json', 'title,body,baseRefName,mergeable,headRefOid,labels', '--repo=o/r']);
+    expect(m.calls).toContainEqual(['gh', 'pr', 'view', '7', '--json', 'title,body,baseRefName,mergeable,headRefOid,headRefName,labels', '--repo=o/r']);
   });
   it('uses the supplied commit message with the shared provider trailer outside the lane', async () => {
     const m = mk(['aaa', 'bbb']);
@@ -1408,7 +1458,7 @@ describe('runFixCli', () => {
     const m = mk(['aaa', 'bbb']);
     const run = (cmd, args, opts) => {
       if (cmd === 'gh' && args.includes('view')) {
-        expect(['title,body,baseRefName,mergeable,headRefOid,labels', 'headRefOid,labels,statusCheckRollup,changedFiles']).toContain(args[args.indexOf('--json') + 1]);
+        expect(['title,body,baseRefName,mergeable,headRefOid,headRefName,labels', 'headRefOid,labels,statusCheckRollup,changedFiles']).toContain(args[args.indexOf('--json') + 1]);
         m.calls.push([cmd, ...args]);
         return JSON.stringify({ title: 'T', body: 'B', headRefOid: 'aaa', baseRefName: base });
       }
