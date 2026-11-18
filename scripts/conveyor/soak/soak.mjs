@@ -32,6 +32,7 @@ import { runScenario, scenario } from '../__tests__/sim/scenario.mjs';
 import { cloneFacts, checkTick, explainNoDispatch, formatTickLine, DEFAULT_BOUNDS, OWED_KIND_DAEMON, sessionMatches } from './invariants.mjs';
 import { seededRandom, stepBehaviours } from './behaviours.mjs';
 import { openChurnPr, seedDefaultFleet } from './fleet.mjs';
+import { advanceMsForRound } from './round-clock.mjs';
 
 /** In-process daemon kind → its module in the clone (for the daemon's OWN `hasStaleMainRefusal`). */
 const DAEMON_MODULES = Object.freeze({
@@ -61,6 +62,8 @@ function dispatchedPrs(result) {
  * @param {Record<string,string>} [o.env] - extra env for every daemon/session in this world.
  * @param {boolean} [o.scorecards=true] - whether review sessions write scorecard rows (see `behaviours.mjs`).
  * @param {boolean} [o.junkInCwd=true] - whether a lane-less session's junk lands in its spawn cwd (the daemon clone).
+ * @param {boolean} [o.pinRoundClock=false] - end every round at a fixed virtual instant (see `round-clock.mjs`) instead of
+ *   `real elapsed + 3m`, so a slow host cannot shift the soak's time-dependent decisions. The long soak sets it.
  * @param {(w:object, o:{fleet:object[], owed:object[], api:object}) => (object|void)} [o.setup] - runs after the
  *   default fleet is seeded; its return is `ctx`.
  * @param {(w:object, round:number, ctx:object, api:{violation:Function, say:Function, mainMoves:Function,
@@ -73,7 +76,7 @@ function dispatchedPrs(result) {
  */
 export async function runSoak({
   name, rounds = 25, daemons = ['review', 'fix-dispatch'], mainEvery = 4, seed = 1, bounds: boundsIn = {},
-  lanes = 4, env = {}, scorecards = true, junkInCwd = true, setup, perRound, fleet = true, churnEvery = 0,
+  lanes = 4, env = {}, scorecards = true, junkInCwd = true, setup, perRound, fleet = true, churnEvery = 0, pinRoundClock = false,
   log = (line) => process.stdout.write(`${line}\n`),
 } = {}) {
   const bounds = { ...DEFAULT_BOUNDS, ...boundsIn };
@@ -157,6 +160,9 @@ export async function runSoak({
   }
 
   const play = [];
+  // `pinRoundClock`: the wall-clock instant the previous round ended (round 0 counts from the first play step).
+  let lastRoundEndAt = null;
+  play.push(() => { lastRoundEndAt = Date.now(); });
   for (let round = 0; round < rounds; round += 1) {
     if (mainEvery > 0 && round > 0 && round % mainEvery === 0) {
       play.push((w) => {
@@ -188,7 +194,11 @@ export async function runSoak({
       if (stepped.length) {
         say(`r${String(round).padStart(2, '0')} sessions   ${stepped.map((s) => `${s.session}:${s.kind}${s.error ? `(failed: ${s.error})` : ''}`).join(' ')}`);
       }
-      w.clock.advance('3m');
+      if (pinRoundClock) {
+        const now = Date.now();
+        w.clock.advance(advanceMsForRound(now - (lastRoundEndAt ?? now)));
+        lastRoundEndAt = Date.now();
+      } else w.clock.advance('3m');
     });
   }
 
