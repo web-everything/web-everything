@@ -4,60 +4,70 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs"]
+scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/__tests__/merge-ai-prs-listing-dedupe.test.mjs"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-10-02"
-preparedAgainstSha: "c9cddb03988f9433ee9beb96c21f91011dfc6a6e"
+preparedDate: "2026-11-18"
+preparedAgainstSha: "32fbad6f48ce3ccdfd1df70dd42ba1a5da64cf96"
 tags: []
 ---
 
 # File the prevention guard(s) owed by chalbert/web-everything#2974's independent review
 
-Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-
-1. `we:scripts/merge-ai-prs.mjs:3851` — Add a before/after cost test that runs with a warm `WE_PR_SNAPSHOT_DIR` snapshot (snapshot enabled). Alternatively, when the snapshot is servable for a repo, prefer it over the live rows for the context and widen the candidate listing's `--json` only when it is not. A gh-call-count fixture running under both snapshot modes would catch this class.
-2. `we:scripts/merge-ai-prs.mjs:4137` — Add a deterministic CLI regression test with more than OPEN_PR_LIST_LIMIT off-base PRs preceding an eligible requested-base PR, and require that candidate to remain discoverable; preserve candidate completeness through pagination or a filtered fallback when the raw listing is truncated.
+Track the two prevention debts from the approved independent review: warm shared-snapshot listing cost coverage, and discovery of a requested-base candidate beyond the raw open-PR cap. The original citations have moved to `we:scripts/merge-ai-prs.mjs:5308` (context reuse) and `we:scripts/merge-ai-prs.mjs:5662` (candidate listing).
 
 Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2974@231c3429288e74c55e0a4b1bfd364a20f379218d
 
-## Done when
-
-1. **Executable** — `npx vitest run we:scripts/__tests__/merge-ai-prs-listing-dedupe.test.mjs` — the past-cap `--base` case fails before this item lands and passes after; the warm-snapshot case is a regression pin guarding future changes.
-
 ## Progress
 
-- **Premise check (2026-10-02, prepare-item-4529):** goal NOT delivered. `git log --grep=4529` shows only the JIT-numbering commit `f8699a734`; no test exists for either guard. Citations drifted (card says `:3851` / `:4137`): the code is now `collectContext.listOpenPrs` (`we:scripts/merge-ai-prs.mjs:3898-3901`, snapshot via `readSharedOpenPrs` then live `gh pr list`) and `listOne` (`:4124-4155`: `run(sized)` → escalate to `OPEN_PR_LIST_LIMIT` (500, `we:scripts/lib/no-search-backed-pr-list.mjs:28`) → `filterOpenPrsByLabel` → client-side `filterOpenPrsByBase`). Scope (`we:scripts/merge-ai-prs.mjs` + its test) is accurate; the test lands in the existing `we:scripts/__tests__/merge-ai-prs-listing-dedupe.test.mjs` harness (fake `gh` on PATH, `GH_CALL_LOG`, `GH_FIXTURE_PRS_FILE`) — no new scope file needed beyond the declared test path family.
+- **Premise correction (2026-11-18):** the old preparation assumed every repo used a sized `gh pr list`, escalating to 500, and that a warm snapshot only affected sizing. Named repos now use live GraphQL cursor pages with snapshot-seeded heavy fields at `we:scripts/merge-ai-prs.mjs:5711`; only unresolved cwd identity retains sized listing at `we:scripts/merge-ai-prs.mjs:5726`. The reader still stops at its row bound (`we:scripts/lib/pr-list-paged.mjs:276`), and the drain still passes `maxRows: OPEN_PR_LIST_LIMIT` (`we:scripts/merge-ai-prs.mjs:5724`). Thus pagination exists but does not deliver the past-cap guarantee. This is source inspection, not a claimed runtime reproduction.
+- **Old scope → corrected scope:** replace the generic `we:scripts/__tests__/merge-ai-prs.test.mjs` with the actual `we:scripts/__tests__/merge-ai-prs-listing-dedupe.test.mjs`; retain `we:scripts/merge-ai-prs.mjs`. The existing shim supports only legacy list calls (`we:scripts/__tests__/merge-ai-prs-listing-dedupe.test.mjs:40`); extending it for GraphQL and heavy-field reads is necessary to exercise production behavior. Existing context tests at `we:scripts/__tests__/merge-ai-prs-listing-dedupe.test.mjs:76` and `we:scripts/__tests__/merge-ai-prs-listing-dedupe.test.mjs:106` already pin truncation and raw-row reuse, but do not exercise a warm shared snapshot or a past-cap requested-base candidate.
+- **Estimate:** retain size 3 (old 3 → new 3): approximately 50–80 changed source lines for a bounded supplementary candidate read and error handling, plus 180–240 test lines for paged fixtures, snapshot setup, call accounting and negative cases, in the two scoped files. No shared reader API/default changes are needed.
+- The previous proposal to prefer snapshot rows as context is withdrawn: current context deliberately reads the live open set because a snapshot can omit new blockers (`we:scripts/merge-ai-prs.mjs:5315`). Preserve that safety rule. Preparation stamps are left to the runner.
 
 ## Design
 
-Two independent guards, both in the existing #4108 listing-dedupe harness (`we:scripts/__tests__/merge-ai-prs-listing-dedupe.test.mjs:122-250`).
+Keep the initial listing base-blind and live. When it is capped and an explicit base is requested, make one supplementary `gh pr list --base <base> --state open --limit OPEN_PR_LIST_LIMIT` through the existing throttled execution path. Use the same candidate/context field selection as the initial listing, without server-side label search. Parse with the existing strict list parser and resolve checks through the existing check-resolution path. This applies to both named-repo GraphQL listing and the unresolved-cwd legacy branch.
 
-1. **Warm-snapshot cost PIN (not a RED test).** A repo in `REPOS` is served from the pass's live rows (`liveByRepo.has(repo)` in `listOpenPrs`, ~`:3898`) and never reaches `readSharedOpenPrs`, so a warm snapshot changes nothing for it today — only the snapshot's `count` affects `candidateListLimit` (`:3672`). The guard therefore PINS the call count under both modes so a future change cannot add a live call. Harness recipe: the existing `runCli` uses `--this-repo` (`REPOS=[null]`, snapshot never consulted), so the pin uses `--repos=owner/name`, sets `WE_PR_SNAPSHOT_DIR` to a temp dir seeded with a per-repo snapshot file = `{v:1, repo, fetchedAtMs: Date.now(), fields ⊇ CONTEXT_LIST_FIELDS, count, prs}` (format per `we:scripts/lib/pr-snapshot-store.mjs`), with a raised the snapshot TTL env override and no `.dirty` marker so the fake `gh` is not hit by a refresh. Asserts exactly one live `gh pr list` per swept repo and `--json` equal to `SWEEP_LIST_FIELDS` in cold and warm modes, and equal `considered`/`toMerge`.
-2. **Pagination-completeness test + fix.** `listOne` filters by `--base` client-side AFTER the raw page is cut at `OPEN_PR_LIST_LIMIT`. With >500 open PRs where the first 500 are off-base, an eligible requested-base PR at position 501+ is dropped; only a stderr `DEGRADED` warning is emitted (`:4153`). Test: a fixture of `OPEN_PR_LIST_LIMIT + 1` PRs — 500 `develop`-based first, one labeled `main`-based last — run with `--base=main`; assert `considered === 1`. This is RED today (`considered` is 0). Fix (minimal): when the raw listing is truncated AND `base` is set, issue one supplementary `gh pr list --base <base> --limit OPEN_PR_LIST_LIMIT` with the same `--json` as `run()` (so `labels`/`statusCheckRollup` are present; `--base` is NOT search-backed, unlike `--label`, so safe), de-duplicate by PR number against the first page, then run the merged rows through `filterOpenPrsByLabel` client-side (the supplementary call carries no `--label`). Compute the DEGRADED/`truncated` flag AFTER the merge, so a supplementary page that itself hits the cap is still surfaced. The test's `FAKE_GH` must be taught to honour `--base` (filter before slicing to `--limit`), otherwise it ignores `--base` and the fallback cannot go green; that change is in `we:scripts/__tests__/merge-ai-prs-listing-dedupe.test.mjs`. The base-blind `rows` handed to the RECONCILE context (`buildLiveListingsByRepo`) stay untouched, preserving the #4108 converge-round-1 invariant.
+Union supplementary rows with initial rows by PR number for candidate selection only; prefer the later supplemental observation on duplicates. Apply the existing operator selector to that union, retaining release-label, requested-label, base and only-PR behavior. Return the original base-blind rows for context. Do not convert incomplete context into complete context merely because a base-filtered page was short. Retain the original degraded signal and warning; if the supplemental page is also full, additionally report that requested-base discovery remains bounded and may omit candidates. The operator fallback is to reduce the open backlog and rerun; never claim exhaustive discovery in that case. A failed or malformed supplementary read follows the existing per-repo listing error path, never an empty-success fallback.
+
+For cost coverage, use an explicit fixture repo with RECONCILE enabled. Extend the existing fake executable to log every API/list/view request and implement cursor pages, totalCount, heavy-field reads, and base filtering before slicing. Unknown requests must fail the fixture. Seed a fresh shared snapshot using the format documented at `we:scripts/lib/pr-snapshot-store.mjs:15`, with matching updatedAt/head SHA and body/files. Snapshot hydration only reuses matching rows (`we:scripts/lib/pr-list-paged.mjs:339`). Isolate all stores under the task temporary directory. Compare snapshot-disabled, enabled-empty and enabled-warm runs; distinguish snapshot refresh calls from live candidate/context calls rather than counting only legacy `pr list` calls. A warm seed must reduce heavy hydration while retaining live page reads and identical candidate results.
+
+No CLI, paging-setting or snapshot-default change. Existing callers continue using the same selector and raw context map (`we:scripts/merge-ai-prs.mjs:2523`); the supplementary request is restricted to capped explicit-base sweeps. Fast-drain round snapshots remain candidate evidence only and are not relabeled as complete live inventories.
 
 ## MVP
 
-Musts only:
-- Test 1 (warm vs cold snapshot call count + field set).
-- Test 2 (RED regression: >500 off-base PRs then an eligible requested-base PR is still discovered) plus the supplementary base-filtered fallback that turns it green.
-- The existing `DEGRADED` warning stays.
+- Extend the scoped CLI harness to exercise both production GraphQL and legacy cwd listing paths deterministically.
+- Add the two owed guards and the bounded base-filtered supplementary read.
+- Cover cost, duplicate elimination, unchanged ordinary-call behavior, raw context preservation, and failed/incomplete supplemental evidence.
+- Keep all storage and subprocess calls hermetic; no real GitHub or host cache access.
 
-Out of scope (→ Follow-ups): preferring the snapshot over live rows for the context; true cursor pagination of the raw listing; the same fallback for `--label` truncation.
+## Acceptance
+
+All named tests below belong in `we:scripts/__tests__/merge-ai-prs-listing-dedupe.test.mjs`. Executable acceptance includes presence of the named cases: a missing case is a failure, never a successful empty selection. The builder must first add each assertion and record its result against unchanged source. Past-cap discovery must be behaviorally RED; preservation/cost cases may already be GREEN and require the explicit mutation RED described below, rather than a fabricated before-build failure.
+
+- [A1] Executable — test `4529 past-cap base discovery`: more than 500 off-base rows precede one labeled requested-base row; both paged and legacy CLI modes discover that exact PR once. Fails on unchanged source, passes after the fallback.
+- [A2] Executable — test `4529 warm shared snapshot cost`: disabled, enabled-empty and warm modes yield identical considered/candidate results; warm mode performs one live page sequence per swept repo, no second context sequence and fewer heavy reads than disabled mode. Before the test build the required named coverage is absent; additionally prove RED by disabling seed reuse or duplicating the context read, then GREEN after restoring source.
+- [A3] Executable — test `4529 fallback preserves callers and defaults`: capped explicit-base input makes exactly one supplemental request, with correct fields and no label search; overlapping rows are considered once; ordinary under-cap and no-base inputs make none. Assert original cross-base context rows remain present and truncated context remains incomplete. Required coverage is absent before build; mutation RED removes the base/cap guard or substitutes filtered context rows; restored implementation is GREEN.
+- [A4] Executable — test `4529 fallback fails closed`: malformed JSON, non-array response and command failure produce the existing listing-failure outcome with no candidate action; a full supplemental page retains visible incomplete-discovery warning and incomplete context. Required coverage is absent before build; mutation RED swallows the read error or clears completeness warnings; restored implementation is GREEN.
 
 ## Test plan
 
-- `warm snapshot pin: context is not re-listed live` (a PIN, passes today by design) — seeds `WE_PR_SNAPSHOT_DIR`, runs `--label=ready-to-merge`, asserts ≤1 live `gh pr list` and that its `--json` equals `SWEEP_LIST_FIELDS`. Fails if a future change issues a second live call when the snapshot is enabled (the unguarded class today).
-- `cold vs warm parity` (pin) — same fixture under both modes yields identical `considered`/`toMerge`, so the snapshot mode cannot change the candidate set.
-- `truncated listing + --base keeps a past-cap requested-base candidate` — 500 off-base PRs first, 1 eligible `main` PR last, `--base=main`; asserts `considered === 1`. RED before the fix (candidate dropped at the cap).
-- `truncated listing without --base` — behavior unchanged (still exactly 2 `gh pr list` calls, DEGRADED warning), so the fallback is inert when no base is requested.
-- `fallback never narrows the context rows` — the supplementary call carries `--base`, the primary call still does not (existing assertion at `:204` extended to the 2-call truncated case).
+Run the four named cases and existing tests in the scoped harness via the host heavy queue. Define the shell command below with repository-qualified paths, stripping only the locus for execution from the WE root:
+
+`queue=we:scripts/readiness/heavy-admission.mjs; suite=we:scripts/__tests__/merge-ai-prs-listing-dedupe.test.mjs; node "${queue#we:}" run -- npx vitest run "${suite#we:}"`
+
+For each acceptance case, the same command with `-t '4529 <case name>'` is its focused run; verify the report contains the named executed test, not merely exit zero. Cover both listing branches for A1/A4. Use fixture files for the oversized payload rather than environment JSON. Keep existing raw-row, field-set, no-base and no-label tests; adapt only their explicitly chosen listing mode, never weaken assertions to accommodate the fake executable.
+
+For A2, include a changed-head snapshot row and a live PR absent from the snapshot: both require live evidence/hydration and must remain visible. Count only hydration requests separately from commit/check reads. Make fixture repo discovery deterministic so a test cannot accidentally exercise only the unresolved-slug path. Existing related coverage is in `we:scripts/lib/__tests__/pr-list-paged.test.mjs` and `we:scripts/__tests__/merge-ai-prs.test.mjs`; these are reference coverage, not planned edit targets.
 
 ## Proof plan
 
-Run the new tests against `origin/main`'s `we:scripts/merge-ai-prs.mjs` (RED on the pagination case) and against the lane's fix (GREEN), capturing both outputs. Live probe: `we:scripts/merge-ai-prs.mjs --this-repo --label=ready-to-merge --base=main --dry-run --json` on the real repo with `GH_CALL_LOG`-style counting via a shim, showing the call count and unchanged `considered` on a normal (<500 PR) repo.
+Capture baseline source SHA, new-test output against that unchanged source, implementation output, and focused mutation results. Do not use a moving remote branch as the before image. Report behavioral RED separately from missing-coverage and mutation RED. Save argv logs showing GraphQL cursors, the single supplementary base request, hydration counts, and unchanged base-blind context. All probes use the real CLI with the fake executable and isolated temporary state; no live GitHub probe is required or authorized for this preparation.
+
+The builder runs the scoped queued tests; the preparation runner owns stamping and checks. If admission is busy, use the queue's own bounded wait once, then stop and report. This card-only preparation does not claim the planned tests have been run or the fix has shipped.
 
 ## Follow-ups
 
-- Prefer the warm snapshot over live rows for the context when servable; widen `--json` live only when it is not (card point 1's alternative).
-- Real cursor pagination of the raw open-PR listing, retiring the 500 cap.
-- Equivalent past-cap guard for `--label` truncation (cannot use server-side `--label`: search-backed, #no-label-search).
+- Complete discovery beyond a full requested-base supplemental page would require a separately bounded pagination design; the MVP keeps that limitation operator-visible.
+- Revisit removal of the unresolved-cwd legacy listing only with repository-identity caller coverage.
+- Label-only past-cap discovery remains outside this item; do not introduce search-backed label filtering as a shortcut.
