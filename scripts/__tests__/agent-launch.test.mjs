@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { AGENT_LAUNCH_MODES, AgentLaunchRefusedError, agentResumeId, launchAgent, launchAgentToCompletion } from '../lib/agent-launch.mjs';
-import { findAgentLaunches } from '../lib/agent-launch-structure.mjs';
+import { findAgentLaunches } from './fixtures/agent-launch-source.mjs';
+
 
 const SID = '12345678-1234-4234-8234-123456789abc';
 
@@ -14,7 +15,7 @@ it.each([
   ...['bind(null)', 'call', 'apply'].map(method => ({ name: `R37.1 reassigned ${method}`,
     source: `let start=console.log; start=spawn.${method}; start('claude',[])`, refused: true })),
   { name: 'R37.1 safe reassignment control', source: "let start=console.log; start=console.info; start('claude',[])" },
-  { name: 'R37.1 lexical shadow control', source: "let start=console.log; { let start; start=spawn; } start('claude',[])" },
+  { name: 'R37.1 lexical shadow control', source: "let start=console.log; { let start; start=console.warn; } start('claude',[])" },
   { name: 'R37.2 short global option hides exec', argv: ['-p', 'exec', 'exec', 'resume', 'other-id'], refused: true },
   { name: 'R37.2 matching short global option control', argv: ['-p', 'exec', 'exec', 'resume', SID], resumeId: SID },
   { name: 'R37.2 attached short option', argv: ['-pexec', 'exec', 'resume', 'other-id'], refused: true },
@@ -53,13 +54,22 @@ it.each([
   { name: 'R37.5 bound fresh primitive also refuses', opaque: 'preset', refused: true },
   { name: 'R37.5 explicit unbound matching resume control', command: 'claude', argv: ['--resume', SID], resumeId: SID, mode: 'claude-resume' },
   { name: 'R37.5 explicit unbound fresh control', command: 'claude', argv: ['-p', 'hello'] },
+  { name: 'R37.9 fresh descriptor without invocation evidence', noArgs: true, refused: true, reason: 'use literal argv' },
+  { name: 'R37.9 fresh closure executing unchecked resume without argv', opaque: 'closure', noArgs: true, refused: true },
+  { name: 'R37.9 closure passed as invocation evidence', closureArg: true, refused: true },
+  { name: 'R37.9 empty command string', command: '', refused: true },
+  { name: 'R37.9 whitespace script has no invocation evidence', command: '  ', argv: [], refused: true },
+  { name: 'R37.9 empty nested shell script', command: 'sh', argv: ['-c', ''], refused: true },
+  { name: 'R37.9 inspectable fresh command control', command: 'claude', argv: ['-p', 'hello'] },
+  { name: 'R37.9 inspectable argv-less command control', command: 'claude', argv: [] },
 ])('$name', ({ source, command = 'codex', argv = ['exec', '-'], resumeId = null, mode = 'worker-result-probe',
-  refused, mutate, mutateView, mutateShell, shell, guard, reason, opaque, noArgs }) => {
+  refused, mutate, mutateView, mutateShell, shell, guard, reason, opaque, noArgs, closureArg }) => {
   const primitive = vi.fn(), original = [...argv], findings = source ? findAgentLaunches({ 'scripts/r37-audit.mjs': source }) : [];
   let invoke = primitive;
   if (opaque === 'preset' || opaque === 'renamed') invoke = primitive.bind(null, 'claude', ['--resume', 'other-id']);
   if (opaque === 'renamed') Object.defineProperty(invoke, 'name', { value: 'start' });
   if (opaque === 'receiver') invoke = Function.prototype.call.bind(primitive, null, 'claude', ['--resume', 'other-id']);
+  if (opaque === 'closure') invoke = () => primitive('claude', ['--resume', 'unchecked-id']);
   if (opaque === 'proxy') invoke = new Proxy(primitive, { apply(target) { return target('claude', ['--resume', 'other-id']); } });
   const options = shell || mutateShell ? { shell: shell ?? false } : undefined;
   const execute = () => {
@@ -73,7 +83,7 @@ it.each([
         if (mutateShell) options.shell = true;
         return true;
       } } : {}),
-    }, invoke, ...(noArgs ? [] : [command, argv, ...(options ? [options] : [])]));
+    }, invoke, ...(noArgs ? [] : closureArg ? [() => primitive('claude', ['--resume', 'unchecked-id'])] : [command, argv, ...(options ? [options] : [])]));
   };
   if (refused) {
     if (source) expect(findings.some(finding => /^(?:start|go)$/.test(finding.kind))).toBe(true);
@@ -120,14 +130,14 @@ describe('launch refusal', () => {
   });
   it.each([null, 0, '', 1, 'true', {}])('refuses a guard returning evidence other than true or undefined (%j)', result => {
     const primitive = vi.fn(), log = vi.fn();
-    expect(() => launchAgent({ mode: 'claude-print', resumeId: null, launchGuard: () => result, log }, primitive))
+    expect(() => launchAgent({ mode: 'claude-print', resumeId: null, launchGuard: () => result, log }, primitive, 'claude', ['-p', 'hi']))
       .toThrow('launchGuard must return true or undefined');
     expect(log).toHaveBeenCalledWith(expect.stringContaining('launchGuard must return true or undefined'));
     expect(primitive).not.toHaveBeenCalled();
   });
   it.each([true, undefined])('allows a guard returning %j', result => {
     const primitive = vi.fn();
-    launchAgent({ mode: 'claude-print', resumeId: null, launchGuard: () => result }, primitive);
+    launchAgent({ mode: 'claude-print', resumeId: null, launchGuard: () => result }, primitive, 'claude', ['-p', 'hi']);
     expect(primitive).toHaveBeenCalledTimes(1);
   });
   it('logs a native-id mismatch to the supplied sink and never executes', () => {
@@ -142,7 +152,7 @@ describe('launch refusal', () => {
     expect(launchAgent({ mode: 'claude-print', resumeId: undefined, launchGuard: () => { order.push('guard'); } },
       (...args) => { order.push('exec'); return args; }, 'claude', ['-p', 'p'])).toEqual(['claude', ['-p', 'p']]);
     expect(order).toEqual(['guard', 'exec']);
-    try { launchAgent({ mode: 'claude-print', resumeId: null, launchGuard: () => { throw cause; }, log() {} }, primitive); }
+    try { launchAgent({ mode: 'claude-print', resumeId: null, launchGuard: () => { throw cause; }, log() {} }, primitive, 'claude', ['-p', 'hi']); }
     catch (e) { expect(e).toMatchObject({ cause, code: 'EAGENTLAUNCHREFUSED' }); }
     expect(primitive).not.toHaveBeenCalled();
   });
@@ -180,8 +190,8 @@ describe('transparent execution', () => {
   });
   it('preserves errors and promises from injected primitives', () => {
     const error = Error('original'), promise = Promise.resolve('original');
-    expect(() => launchAgent({ mode: 'claude-print', resumeId: null }, () => { throw error; })).toThrow(error);
-    expect(launchAgent({ mode: 'claude-print', resumeId: null }, () => promise)).toBe(promise);
+    expect(() => launchAgent({ mode: 'claude-print', resumeId: null }, () => { throw error; }, 'claude', ['-p', 'hi'])).toThrow(error);
+    expect(launchAgent({ mode: 'claude-print', resumeId: null }, () => promise, 'claude', ['-p', 'hi'])).toBe(promise);
   });
   it.each([
     ['--bg', '--resume', SID, 'prompt'], ['--restricted', '--resume', SID, 'prompt'],
@@ -492,7 +502,7 @@ describe('an async launchGuard is refused without leaking its rejection', () => 
     try {
       const primitive = vi.fn(), log = vi.fn();
       expect(() => launchAgent({ mode: 'claude-print', resumeId: null, log,
-        launchGuard: async () => { throw new Error('admission unavailable'); } }, primitive))
+        launchGuard: async () => { throw new Error('admission unavailable'); } }, primitive, 'claude', ['-p', 'hi']))
         .toThrow('launchGuard must be synchronous');
       await new Promise(resolve => setTimeout(resolve, 20));
       expect(unhandled).not.toHaveBeenCalled();
@@ -502,10 +512,10 @@ describe('an async launchGuard is refused without leaking its rejection', () => 
   it('refuses a thenable whose then throws or whose then getter throws', () => {
     const primitive = vi.fn();
     const throwing = { then() { throw new Error('boom'); } };
-    expect(() => launchAgent({ mode: 'claude-print', resumeId: null, log() {}, launchGuard: () => throwing }, primitive))
+    expect(() => launchAgent({ mode: 'claude-print', resumeId: null, log() {}, launchGuard: () => throwing }, primitive, 'claude', ['-p', 'hi']))
       .toThrow('launchGuard must be synchronous');
     const getter = { get then() { throw new Error('getter boom'); } };
-    expect(() => launchAgent({ mode: 'claude-print', resumeId: null, log() {}, launchGuard: () => getter }, primitive))
+    expect(() => launchAgent({ mode: 'claude-print', resumeId: null, log() {}, launchGuard: () => getter }, primitive, 'claude', ['-p', 'hi']))
       .toThrow('launchGuard must be synchronous');
     expect(primitive).not.toHaveBeenCalled();
   });

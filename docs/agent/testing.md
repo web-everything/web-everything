@@ -4587,3 +4587,15 @@ and migration fingerprints over all argument bindings. Fingerprints hash complet
 assignment and import text (including transitive initializer dependencies); unresolved values do
 not exempt edits to those definitions. Keep matching resume, safe-alias and unchanged-binding
 controls beside the refusal rows. Migration snapshots pin exact historical calls and counts.
+
+R37.9–11 refuse fresh as well as resumed launches without a non-empty inspectable command.
+The structural gate clears calls only with a literal primitive/boundary binding or a structural
+proof that the callee is unrelated. Opaque call results, parameters, closures and recursive or
+unmodelled callees require review; primitive references escaping direct calls are findings too.
+The operator fallback is to use the approved launch boundary with explicit literal argv, or
+provide a locally inspectable unrelated function/import. Migration evidence includes each generic
+wrapper caller and its argument definitions, so changing caller inputs invalidates the inventory.
+Production migration snapshots pin sorted per-file inventories with exact counts and SHA-256
+digests over every call kind, classification and fingerprint; line movement remains irrelevant.
+Audit snippets declare their shorthand primitive imports through the shared fixture helper.
+Unbound names and mutable default/require namespaces provide no literal-binding exemption.

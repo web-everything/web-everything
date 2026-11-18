@@ -187,7 +187,7 @@ function normaliseInvocation(args, primitive) {
   if (typeof primitive === 'function' && Function.prototype.toString.call(primitive).includes('[native code]')) {
     throw new SyntaxError('opaque primitive; pass an unbound primitive and explicit invocation arguments');
   }
-  if (!args.length) return []; // Primitive-only injection is supported by existing callers/tests.
+  if (!args.length) throw new SyntaxError('missing invocation evidence; use explicit literal argv');
   const [command, argv] = args;
   // A shell joining array argv destroys word boundaries. Require an explicit, literal -c script instead.
   if (Array.isArray(argv) && args[2]?.shell) throw new SyntaxError('shell execution of array argv is ambiguous');
@@ -221,11 +221,13 @@ export function launchAgent(descriptor, primitive, ...args) {
   if (!descriptor.mode) refuse('mode is required', descriptor, log);
   if (!modes.has(descriptor.mode)) refuse(`unknown mode ${String(descriptor.mode)}`, descriptor, log);
   if (!Object.hasOwn(descriptor, 'resumeId')) refuse('resumeId key is required', descriptor, log);
+  if (typeof primitive !== 'function') refuse('execution primitive is required', descriptor, log);
   let normalised;
   try { normalised = normaliseInvocation(args, primitive); }
   catch (cause) {
     refuse('cannot parse native resume id; use literal argv and a plain resume id with an unbound primitive', descriptor, log, cause);
   }
+  if (!normalised.length) refuse('missing invocation evidence; use explicit literal argv', descriptor, log);
   const nativeIds = normalised.flatMap(command => command.resumeIds);
   // Snapshot the validated words before the guard can mutate a captured argv reference.
   const validatedArgv = Array.isArray(args[1]) ? [...args[1]] : args[1];
@@ -256,7 +258,6 @@ export function launchAgent(descriptor, primitive, ...args) {
     || validatedArgv.some((word, i) => word !== args[1][i])))) {
     refuse('launchGuard changed validated argv; use literal argv and a plain resume id', descriptor, log);
   }
-  if (typeof primitive !== 'function') refuse('execution primitive is required', descriptor, log);
   // Guarded calls forward the validated snapshot, even if the guard retained the caller's array.
   const forwarded = [...args];
   if ('launchGuard' in descriptor && Array.isArray(validatedArgv)) forwarded[1] = validatedArgv;

@@ -38,8 +38,7 @@ export function findAgentLaunches(sources) {
           continue;
         }
         const target = files.get(resolve(dirname(file.fileName), statement.moduleSpecifier.text));
-        return target ? exported(target, original, seen)
-          : primitives.test(original) ? ts.factory.createIdentifier(original) : null;
+        return target ? exported(target, original, seen) : specifier;
       }
     }
     for (const statement of file.statements) {
@@ -164,52 +163,172 @@ export function findAgentLaunches(sources) {
     ts.forEachChild(body, visit);
     return out;
   }
-  function isPrimitive(node, seen = new Set(), allowDynamic = true) {
+  const childProcess = /^(?:node:)?child_process$/;
+  const functionNode = n => n && (ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n)
+    || ts.isArrowFunction(n) || ts.isMethodDeclaration(n));
+  function importSource(decl) {
+    while (decl && !ts.isImportDeclaration(decl)) decl = decl.parent;
+    return decl?.moduleSpecifier?.text;
+  }
+  function unwrap(node) {
+    while (node && (ts.isParenthesizedExpression(node) || ts.isAsExpression(node)
+      || ts.isNonNullExpression(node) || ts.isTypeAssertionExpression(node))) node = node.expression;
+    return node;
+  }
+  function processNamespace(node, seen = new Set(), literalOnly = false) {
+    node = unwrap(node);
     if (!node || seen.has(node)) return false;
     seen.add(node);
-    if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node)) return isPrimitive(node.expression, seen, allowDynamic);
-    if (ts.isConditionalExpression(node)) return [node.whenTrue, node.whenFalse].some(n => isPrimitive(n, new Set(seen), false));
-    if (ts.isBinaryExpression(node) && [ts.SyntaxKind.BarBarToken, ts.SyntaxKind.AmpersandAmpersandToken,
-      ts.SyntaxKind.QuestionQuestionToken].includes(node.operatorToken.kind)) {
-      return [node.left, node.right].some(n => isPrimitive(n, new Set(seen), false));
-    }
-    if (ts.isCallExpression(node)) return isPrimitive(node.expression, seen, allowDynamic);
-    if (ts.isPropertyAccessExpression(node)) {
-      // Method derivation needs a known primitive, not an arbitrary computed logger/callback.
-      if (/^(?:bind|call|apply)$/.test(node.name.text)) return isPrimitive(node.expression, seen, false);
-      let receiver = node.expression;
-      if (ts.isIdentifier(receiver)) { const d = declaration(receiver); receiver = d?.parent.flags & ts.NodeFlags.Const ? d.initializer : null; }
-      if (receiver && (ts.isRegularExpressionLiteral(receiver) || (ts.isNewExpression(receiver) && receiver.expression.getText() === 'RegExp'))) return false;
-      return primitives.test(node.name.text) || isPrimitive(importedMember(node.expression, node.name.text), seen, allowDynamic);
-    }
-    if (ts.isElementAccessExpression(node)) return values(node.argumentExpression).some(v => (v == null && allowDynamic) || primitives.test(v)
-      || (v != null && isPrimitive(importedMember(node.expression, v), new Set(seen), allowDynamic))
-      || (/^(?:bind|call|apply)$/.test(v) && isPrimitive(node.expression, new Set(seen), false)));
     if (ts.isIdentifier(node)) {
-      if (primitives.test(node.text)) return true;
       const d = declaration(node);
-      // Assignment taint needs primitive provenance, as method derivation does above: an arbitrary
-      // runtime-selected callback is not evidence that this binding holds an execution primitive.
-      if (assignments.get(d)?.some(n => isPrimitive(n, new Set(seen), false))) return true;
-      if (d && ts.isImportSpecifier(d)) return primitives.test(d.propertyName?.text ?? d.name.text) || isPrimitive(imported(d), seen, allowDynamic);
-      if (d && ts.isImportClause(d)) return isPrimitive(imported(d), seen, allowDynamic);
-      if (d && ts.isBindingElement(d)) return isPrimitive(d.initializer, seen, allowDynamic) || isPrimitive(bindingExpression(d), seen, allowDynamic);
-      if (d && (ts.isVariableDeclaration(d) || ts.isParameter(d))) return isPrimitive(d.initializer, seen, allowDynamic);
+      if (!d || literalOnly && bindingWrites.has(d)) return false;
+      if (ts.isImportClause(d) || ts.isNamespaceImport(d)) return childProcess.test(importSource(d))
+        && (!literalOnly || ts.isNamespaceImport(d));
+      if (ts.isVariableDeclaration(d)) return processNamespace(d.initializer, seen, literalOnly);
     }
-    if (ts.isVariableDeclaration(node)) return isPrimitive(node.initializer, seen, allowDynamic);
-    if (ts.isImportSpecifier(node)) return primitives.test(node.propertyName?.text ?? node.name.text) || isPrimitive(imported(node), seen, allowDynamic);
-    if (ts.isImportClause(node)) return isPrimitive(imported(node), seen, allowDynamic);
+    return !literalOnly && ts.isCallExpression(node) && node.expression.getText() === 'require'
+      && !declaration(node.expression) && childProcess.test(node.arguments[0]?.text);
+  }
+  // This predicate identifies literal primitive REFERENCES, not arbitrary callables with matching
+  // names. Everything else must prove it is unrelated below; uncertainty never becomes clearance.
+  function isPrimitive(node, seen = new Set()) {
+    node = unwrap(node);
+    if (!node || seen.has(node)) return false;
+    seen = new Set(seen).add(node);
+    if (ts.isIdentifier(node)) {
+      const d = declaration(node);
+      if (!d) return false;
+      if (assignments.get(d)?.some(n => isPrimitive(n, seen))) return true;
+      return isPrimitive(d, seen);
+    }
+    if (ts.isConditionalExpression(node)) return [node.whenTrue, node.whenFalse].some(n => isPrimitive(n, seen));
+    if (ts.isBinaryExpression(node) && [ts.SyntaxKind.BarBarToken, ts.SyntaxKind.AmpersandAmpersandToken,
+      ts.SyntaxKind.QuestionQuestionToken].includes(node.operatorToken.kind)) return [node.left, node.right].some(n => isPrimitive(n, seen));
+    if (ts.isExportSpecifier(node)) {
+      const module = node.parent.parent.moduleSpecifier?.text;
+      return childProcess.test(module) && primitives.test(node.propertyName?.text ?? node.name.text);
+    }
+    if (ts.isImportSpecifier(node)) {
+      const target = imported(node);
+      return target ? isPrimitive(target, seen)
+        : childProcess.test(importSource(node)) && primitives.test(node.propertyName?.text ?? node.name.text);
+    }
+    if (ts.isImportClause(node)) return isPrimitive(imported(node), seen);
+    if (ts.isBindingElement(node)) return isPrimitive(node.initializer, seen) || isPrimitive(bindingExpression(node), seen);
+    if (ts.isVariableDeclaration(node) || ts.isParameter(node)) return isPrimitive(node.initializer, seen);
+    if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      const members = ts.isPropertyAccessExpression(node) ? [node.name.text] : values(node.argumentExpression);
+      return members.some(member => member != null && (/^(?:bind|call|apply)$/.test(member) && isPrimitive(node.expression, seen)
+        || processNamespace(node.expression) && primitives.test(member)
+        || isPrimitive(importedMember(node.expression, member), seen)));
+    }
     return false;
+  }
+  function literalPrimitive(node, seen = new Set()) {
+    node = unwrap(node);
+    if (!node || seen.has(node)) return false;
+    seen = new Set(seen).add(node);
+    if (ts.isIdentifier(node)) {
+      const d = declaration(node);
+      if (!d) return false;
+      if (bindingWrites.has(d)) return false;
+      if (ts.isImportSpecifier(d)) return childProcess.test(importSource(d))
+        && primitives.test(d.propertyName?.text ?? d.name.text);
+      if (ts.isVariableDeclaration(d)) return literalPrimitive(d.initializer, seen);
+      if (ts.isBindingElement(d)) return literalPrimitive(bindingExpression(d), seen);
+      return false;
+    }
+    if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      const members = ts.isPropertyAccessExpression(node) ? [node.name.text] : values(node.argumentExpression);
+      return processNamespace(node.expression, new Set(), true) && members.length === 1 && members[0] != null && primitives.test(members[0]);
+    }
+    return false;
+  }
+  const unrelatedCache = new Map();
+  const safeGlobals = new Set(['console', 'Math', 'JSON', 'Object', 'Array', 'String', 'Number',
+    'Boolean', 'Date', 'RegExp', 'Map', 'Set', 'WeakMap', 'WeakSet', 'Buffer']);
+  function valueReference(n) {
+    const p = n.parent;
+    if (!p) return true;
+    if ((ts.isPropertyAccessExpression(p) && p.name === n) || ((ts.isPropertyAssignment(p)
+      || ts.isMethodDeclaration(p)) && p.name === n && !ts.isComputedPropertyName(n))) return false;
+    if ((ts.isVariableDeclaration(p) || ts.isParameter(p) || ts.isBindingElement(p)
+      || functionNode(p) || ts.isClassDeclaration(p)) && p.name === n) return false;
+    return !ts.isImportSpecifier(p) && !ts.isImportClause(p) && !ts.isNamespaceImport(p)
+      && !ts.isExportSpecifier(p) && !ts.isLabeledStatement(p);
+  }
+  // Structural proof, deliberately conservative: opaque parameters, call results, cycles, shared
+  // object members and unmodelled syntax require review. No alias-enumeration escape hatch.
+  function unrelated(node, seen = new Set()) {
+    node = unwrap(node);
+    if (!node || seen.has(node)) return false;
+    if (unrelatedCache.has(node)) return unrelatedCache.get(node);
+    seen = new Set(seen).add(node);
+    let safe = false;
+    if (isPrimitive(node)) return false;
+    if (ts.isIdentifier(node)) {
+      const d = declaration(node);
+      safe = d ? unrelated(d, seen) : safeGlobals.has(node.text);
+      if (assignments.has(d)) safe &&= assignments.get(d).every(n => unrelated(n, seen));
+      if (bindingWrites.has(d) && !assignments.has(d)) safe = false;
+    } else if (ts.isExportSpecifier(node)) {
+      safe = !childProcess.test(node.parent.parent.moduleSpecifier?.text);
+    } else if (ts.isImportSpecifier(node) || ts.isImportClause(node) || ts.isNamespaceImport(node)) {
+      const target = imported(node);
+      // An explicitly imported non-child_process API is an unrelated binding. Local sources,
+      // when present, must establish that same proof through their actual definition.
+      safe = target ? unrelated(target, seen) : !childProcess.test(importSource(node));
+    } else if (ts.isVariableDeclaration(node)) {
+      safe = unrelated(node.initializer, seen) && (assignments.get(node) ?? []).every(n => unrelated(n, seen))
+        && !(bindingWrites.get(node)?.some(n => !ts.isIdentifier(n.left)));
+    } else if (ts.isBindingElement(node)) {
+      safe = unrelated(bindingExpression(node, true), seen);
+    } else if (functionNode(node)) {
+      safe = true;
+      const inspect = n => {
+        if (!safe) return;
+        if (ts.isCallExpression(n) && !unrelated(n.expression, seen)) safe = false;
+        if ((ts.isIdentifier(n) || ts.isPropertyAccessExpression(n) || ts.isElementAccessExpression(n))
+          && valueReference(n) && isPrimitive(n)) safe = false;
+        ts.forEachChild(n, inspect);
+      };
+      if (node.body) inspect(node.body); else safe = false;
+    } else if (ts.isConditionalExpression(node)) {
+      safe = unrelated(node.whenTrue, seen) && unrelated(node.whenFalse, seen);
+    } else if (ts.isBinaryExpression(node) && [ts.SyntaxKind.BarBarToken, ts.SyntaxKind.AmpersandAmpersandToken,
+      ts.SyntaxKind.QuestionQuestionToken].includes(node.operatorToken.kind)) {
+      safe = unrelated(node.left, seen) && unrelated(node.right, seen);
+    } else if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      const members = ts.isPropertyAccessExpression(node) ? [node.name.text] : values(node.argumentExpression);
+      safe = !members.includes(null) && members.every(member => {
+        const target = importedMember(node.expression, member);
+        return target ? unrelated(target, seen) : unrelated(node.expression, seen);
+      });
+    } else if (ts.isNewExpression(node) && ts.isIdentifier(node.expression)
+      && node.expression.text === 'RegExp' && !declaration(node.expression)) safe = true;
+    else if (ts.isStringLiteralLike(node) || ts.isNumericLiteral(node) || ts.isRegularExpressionLiteral(node)) safe = true;
+    // Cache completed proofs only; encountering a recursive dependency returns unknown above.
+    // No provisional safe assumption can escape a cycle.
+    unrelatedCache.set(node, safe);
+    return safe;
+  }
+  function approvedWrapper(node) {
+    node = unwrap(node);
+    if (!node || !ts.isIdentifier(node)) return false;
+    const d = declaration(node);
+    return d && ts.isImportSpecifier(d) && ['launchAgent', 'launchAgentToCompletion'].includes(d.propertyName?.text ?? d.name.text)
+      && AGENT_LAUNCH_ALLOWLIST.includes(relative(process.cwd(), resolve(dirname(d.getSourceFile().fileName), importSource(d))).split('\\').join('/'))
+      && !bindingWrites.has(d);
   }
   // A mutable/unresolved value still has a definition. Pin its source, every possible assignment,
   // and transitive initializer dependencies rather than granting an exemption to the call text alone.
-  function bindingEvidence(args) {
+  function bindingEvidence(args, followFunctionBodies = true) {
     const evidence = [], seen = new Set(), visitedNodes = new Set();
     const visitTarget = target => {
       if (!target || visitedNodes.has(target)) return;
       if (target.pos >= 0) evidence.push([relative(process.cwd(), target.getSourceFile().fileName).split('\\').join('/'),
         'import-target', target.getText()]);
-      visit(target);
+      if (followFunctionBodies || !functionNode(target)) visit(target);
     };
     const visit = node => {
       if (visitedNodes.has(node)) return;
@@ -252,21 +371,54 @@ export function findAgentLaunches(sources) {
       findings.push({ file: name, line: 1, reason: 'unparseable source; cannot establish launch boundary' });
       continue;
     }
+    const report = (n, args, reason, potential = false) => {
+      const callee = ts.isCallExpression(n) ? n.expression : n;
+      // Opaque callees cannot establish executable values. Preserve their exact input text and
+      // definitions without expanding arbitrary builders into a combinatorial value set.
+      const command = potential ? [null] : values(args[0]);
+      const argv = potential ? [null] : values(args[1]);
+      const unresolved = potential || !command.length || command.includes(null);
+      const definitions = [...(potential ? bindingEvidence([callee], false) : []), ...bindingEvidence(args)];
+      findings.push({ file: name, line: file.getLineAndCharacterOfPosition(n.getStart()).line + 1,
+        kind: callee.getText(file), classification: unresolved ? 'unresolved' : 'resolved',
+        fingerprint: JSON.stringify([command, argv, ...args.map(a => a.getText(file)),
+          ...(potential ? [`callee:${callee.getText(file)}`] : []),
+          ...(definitions.length ? [`bindings-sha256:${createHash('sha256').update(JSON.stringify(definitions)).digest('hex')}`] : [])]), reason });
+    };
     const visit = n => {
-      if (ts.isCallExpression(n) && isPrimitive(n.expression)) {
-        const command = values(n.arguments[0]);
-        const unresolved = !command.length || command.includes(null);
-        const dynamicMember = ts.isElementAccessExpression(n.expression) && values(n.expression.argumentExpression).includes(null);
-        const argumentsEvidence = n.arguments.flatMap(a => values(a));
-        const wrapped = (dynamicMember || command.some(c => wrapper.test(c))) && values(n.arguments[1]).includes(null);
-        const definitions = bindingEvidence(n.arguments);
-        if (unresolved || argumentsEvidence.some(c => c != null && agent.test(c)) || wrapped) findings.push({ file: name,
-          line: file.getLineAndCharacterOfPosition(n.getStart()).line + 1, kind: n.expression.getText(file),
-          classification: unresolved ? 'unresolved' : 'resolved',
-          // Hash the complete definition/assignment text to keep the checked-in migration table small.
-          fingerprint: JSON.stringify([command, values(n.arguments[1]), ...n.arguments.map(a => a.getText(file)),
-            ...(definitions.length ? [`bindings-sha256:${createHash('sha256').update(JSON.stringify(definitions)).digest('hex')}`] : [])]),
-          reason: unresolved ? 'unresolved command; cannot establish launch boundary' : 'agent execution outside agent-launch.mjs' });
+      if (ts.isCallExpression(n) && !approvedWrapper(n.expression)) {
+        if (literalPrimitive(n.expression)) {
+          const command = values(n.arguments[0]);
+          const unresolved = !command.length || command.includes(null);
+          const argumentsEvidence = n.arguments.flatMap(a => values(a));
+          const wrapped = command.some(c => wrapper.test(c)) && values(n.arguments[1]).includes(null);
+          if (unresolved || argumentsEvidence.some(c => c != null && agent.test(c)) || wrapped) {
+            report(n, n.arguments, unresolved ? 'unresolved command; cannot establish launch boundary' : 'agent execution outside agent-launch.mjs');
+          }
+        } else if (!unrelated(n.expression)) {
+          report(n, n.arguments, 'potential execution through an opaque callee; use a literal approved launch binding', true);
+        }
+      }
+      if ((ts.isIdentifier(n) || ts.isPropertyAccessExpression(n) || ts.isElementAccessExpression(n))
+        && valueReference(n) && isPrimitive(n)) {
+        let parent = n.parent, ref = n;
+        while (parent && (ts.isParenthesizedExpression(parent) || ts.isAsExpression(parent)
+          || ts.isNonNullExpression(parent) || ts.isTypeAssertionExpression(parent))) { ref = parent; parent = parent.parent; }
+        // The boundary may receive a primitive as its second argument; every other escape is a finding.
+        const direct = parent && ts.isCallExpression(parent) && (parent.expression === ref
+          || approvedWrapper(parent.expression) && parent.arguments[1] === ref);
+        const memberReceiver = parent && (ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent)) && parent.expression === ref;
+        if (!direct && !memberReceiver) report(n, [n], 'execution primitive reference escapes a direct launch; use the approved boundary', true);
+      }
+      if (ts.isBindingElement(n) && isPrimitive(n)) {
+        report(n, [n], 'execution primitive reference stored by destructuring; use the approved boundary', true);
+      }
+      // Export specifiers are declarations syntactically, but export their value at runtime.
+      if (ts.isExportDeclaration(n) && n.exportClause && ts.isNamedExports(n.exportClause)) {
+        for (const spec of n.exportClause.elements) {
+          const target = exported(file, spec.name.text);
+          if (isPrimitive(target)) report(spec, [spec], 'exported execution primitive reference', true);
+        }
       }
       ts.forEachChild(n, visit);
     };
