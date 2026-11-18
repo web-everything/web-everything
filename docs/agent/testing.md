@@ -4608,3 +4608,13 @@ locked prepare/finalize callers. Telemetry-only hooks need caller tests for pass
 invalid persistence and lock refusal: assert lifecycle results, rebuild state and
 protected marker bytes, not only the observer's return value. Prepare/planning and
 launchd identity are stubbed; probation persistence and the shared lock remain real.
+
+Probation closure evidence uses the installed Acorn parser: literal import/export-from,
+dynamic import and require edges must enter the Git blob map; unsupported syntax or
+unknown targets owe proof. Adoption may create a record only when none exists or the
+existing record validates. Invalid/unreadable records (including dangling symlinks)
+remain untouched and require operator recovery; they never reset the debt baseline.
+Retain loader kind through resolution: collision tests must distinguish exact ESM paths
+from CommonJS file/.js/.json/.node ordering; unsupported loaders/directories fail closed.
+The loader-form gate covers direct/member/computed calls and extracted loaders: computed
+require properties and unknown computed module access refuse complete closure evidence.

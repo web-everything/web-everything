@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, lstatSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, basename } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -53,7 +53,7 @@ describe('R986 report-only probation persistence', () => {
       exec: () => JSON.stringify({ Label: mode === 'ambiguous label' ? 'com.we.Y' : 'com.we.X',
         WorkingDirectory: root, ProgramArguments: ['node', 'x.mjs'] }) })).toThrow(/roster|identity/);
   });
-  it('changed CommonJS required dependency owes proof through an incomplete closure', async () => {
+  it('changed CommonJS required dependency is included and owes proof', async () => {
     const m = await load();
     writeFileSync(join(root, 'entry.cjs'), "module.exports = require('./required.cjs');");
     writeFileSync(join(root, 'required.cjs'), 'module.exports = 1;');
@@ -61,10 +61,73 @@ describe('R986 report-only probation persistence', () => {
     writeFileSync(join(root, 'required.cjs'), 'module.exports = 2;');
     git(['add', '.']); head = git(['commit-tree', git(['write-tree']), '-m', 'cjs after']);
     const roster = [{ id: 'CJS', entry: 'entry.cjs' }];
-    expect(m.readClosure(root, roster[0], head)).toEqual({ complete: false });
+    expect(m.readClosure(root, roster[0], head)).toEqual({ complete: true, files: {
+      'entry.cjs': git(['rev-parse', head + ':entry.cjs']),
+      'required.cjs': git(['rev-parse', head + ':required.cjs']),
+    } });
     expect(await m.createProbationObserver({ ...opts, registered: roster }).adopt(previous(), adopted()))
       .toMatchObject({ action: 'pending', owed: ['CJS'] });
   });
+  it('CommonJS extensionless require tracks dep.js before dep.mjs and changing dep.js owes proof', async () => {
+    const m = await load();
+    writeFileSync(join(root, 'entry.cjs'), "module.exports = require('./dep');");
+    writeFileSync(join(root, 'dep.js'), 'module.exports = 1;');
+    git(['add', '.']); good = git(['commit-tree', git(['write-tree']), '-m', 'require collision before']);
+    writeFileSync(join(root, 'dep.js'), 'module.exports = 2;');
+    git(['add', '.']); head = git(['commit-tree', git(['write-tree']), '-m', 'require collision after']);
+    expect(execFileSync(process.execPath, ['-p', "require.resolve('./dep')"],
+      { cwd: root, encoding: 'utf8' }).trim()).toBe(join(root, 'dep.js'));
+    const roster = [{ id: 'CJS', entry: 'entry.cjs' }];
+    expect(m.readClosure(root, roster[0], head)).toEqual({ complete: true, files: {
+      'entry.cjs': git(['rev-parse', head + ':entry.cjs']), 'dep.js': git(['rev-parse', head + ':dep.js']),
+    } });
+    expect(await m.createProbationObserver({ ...opts, registered: roster }).adopt(previous(), adopted()))
+      .toMatchObject({ action: 'pending', owed: ['CJS'] });
+  });
+  it.each(['mjs only', 'cjs only', 'directory', 'JSON', 'native', 'symlink'])(
+    'CommonJS extensionless require fails closed for unsupported resolution: %s', async mode => {
+      const m = await load();
+      writeFileSync(join(root, 'entry.cjs'), "module.exports = require('./target');");
+      if (mode === 'directory') {
+        mkdirSync(join(root, 'target'));
+        writeFileSync(join(root, 'target/index.js'), 'module.exports = 1;');
+      } else if (mode === 'symlink') {
+        symlinkSync('dep.mjs', join(root, 'target'));
+        writeFileSync(join(root, 'target.js'), 'module.exports = 1;');
+      } else {
+        const ext = { 'mjs only': 'mjs', 'cjs only': 'cjs', JSON: 'json', native: 'node' }[mode];
+        writeFileSync(join(root, `target.${ext}`), '1');
+      }
+      git(['add', '.']); const sha = git(['commit-tree', git(['write-tree']), '-m', 'unsupported require']);
+      expect(m.readClosure(root, { entry: 'entry.cjs' }, sha)).toEqual({ complete: false });
+    });
+  it.each([
+    ["require('./loaded.cjs')", true],
+    ["module.require('./loaded.cjs')", false],
+    ["module['require']('./loaded.cjs')", false],
+    ['module["require"]("./loaded.cjs")', false],
+    ['module[`require`]("./loaded.cjs")', false],
+    ["module['requ\\u0069re']('./loaded.cjs')", false],
+    ["module['re' + 'quire']('./loaded.cjs')", false],
+    ["module[loader]('./loaded.cjs')", false],
+    ['module[`${loader}`]("./loaded.cjs")', false],
+    ["globalThis['require']('./loaded.cjs')", false],
+    ["const load = module['require']; load('./loaded.cjs')", false],
+  ])('CommonJS loader-form gate includes dependency or fails closed and retains changed dependency debt: %s',
+    async (source, complete) => {
+      const m = await load();
+      writeFileSync(join(root, 'entry.cjs'), source);
+      writeFileSync(join(root, 'loaded.cjs'), 'module.exports = 1;');
+      git(['add', '.']); good = git(['commit-tree', git(['write-tree']), '-m', 'loader form before']);
+      writeFileSync(join(root, 'loaded.cjs'), 'module.exports = 2;');
+      git(['add', '.']); head = git(['commit-tree', git(['write-tree']), '-m', 'loader form after']);
+      const roster = [{ id: 'CJS', entry: 'entry.cjs' }];
+      expect(m.readClosure(root, roster[0], head)).toEqual(complete ? { complete: true, files: {
+        'entry.cjs': git(['rev-parse', head + ':entry.cjs']), 'loaded.cjs': git(['rev-parse', head + ':loaded.cjs']),
+      } } : { complete: false });
+      expect(await m.createProbationObserver({ ...opts, registered: roster }).adopt(previous(), adopted()))
+        .toMatchObject({ action: 'pending', owed: ['CJS'] });
+    });
   it.each(['require(target)', 'module.require(target)', "require.resolve('./required.cjs')"])
     ('unresolved CommonJS form %s fails closed', async source => {
       const m = await load();
@@ -73,6 +136,18 @@ describe('R986 report-only probation persistence', () => {
       expect(m.readClosure(root, registered[1], sha)).toEqual({ complete: false });
     });
   it.each([
+    'import"./dep.mjs";',
+    "import'./dep.mjs';",
+    'import\n"./dep.mjs";',
+    'export*from"./dep.mjs";',
+    "export * /*c*/ from\n './dep.mjs';",
+    'import{default as value}from"./dep.mjs";',
+    'import(`./dep.mjs`);',
+    'import(\n`./dep.mjs`\n);',
+    "require('./dep.mjs');",
+    'require("./dep.mjs");',
+    'require /*c*/ ( /*c*/ `./dep.mjs` /*c*/ );',
+    "require( //c\n './dep.mjs'\n);",
     'import /* comment */ "./dep.mjs";',
     'import // comment\n "./dep.mjs";',
     "export { default } from /*c*/ './dep.mjs';",
@@ -107,6 +182,29 @@ describe('R986 report-only probation persistence', () => {
     } });
     expect(await m.createProbationObserver(opts).adopt(previous(), adopted()))
       .toMatchObject({ action: 'pending', owed: ['X'] });
+  });
+  it.each([
+    'import`./dep.mjs`;', 'export * from `./dep.mjs`;',
+    "import('./dep.mjs' + suffix);", 'import(`./${target}.mjs`);',
+    "require('./dep.mjs' + suffix);", 'require(`./${target}.mjs`);',
+    'import"./missing.mjs";', 'import"./dep";', 'require("package-name");',
+    'import"./dep.mjs"; import"./missing.mjs";',
+  ])('unknown or unsupported dependency syntax fails closed: %s', async source => {
+    const m = await load();
+    writeFileSync(join(root, 'x.mjs'), source); git(['add', '.']);
+    const sha = git(['commit-tree', git(['write-tree']), '-m', 'incomplete syntax']);
+    expect(m.readClosure(root, registered[0], sha)).toEqual({ complete: false });
+  });
+  it('ignores loader-looking text in comments, strings, templates and regexes', async () => {
+    const m = await load();
+    writeFileSync(join(root, 'y.mjs'), [
+      '// import"./missing.mjs";', '/* require("./missing.mjs"); */',
+      'const text = \'import"./missing.mjs"\';',
+      'const template = `require("./missing.mjs")`;', 'const re = /require("missing")/;',
+    ].join('\n'));
+    git(['add', '.']); const sha = git(['commit-tree', git(['write-tree']), '-m', 'inert text']);
+    expect(m.readClosure(root, registered[1], sha)).toEqual({ complete: true,
+      files: { 'y.mjs': git(['rev-parse', sha + ':y.mjs']) } });
   });
   it('unreadable comment syntax refuses a complete closure', async () => {
     const m = await load();
@@ -210,6 +308,33 @@ describe('R986 report-only probation persistence', () => {
     expect(persisted.provenGood).toBe(good);
     expect(await observer.adopt(adopted(), adopted())).toMatchObject({ action: 'pass' });
   });
+  it.each(['empty object', 'truncated JSON', 'directory', 'wrong version', 'dangling symlink'])(
+    'adoption preserves invalid persisted %s and requires operator recovery', async mode => {
+      const m = await load(), observer = m.createProbationObserver(opts);
+      await observer.adopt(previous(), adopted());
+      const file = m.probationPath(root, env);
+      const valid = JSON.parse(readFileSync(file, 'utf8'));
+      rmSync(file);
+      const bytes = mode === 'empty object' ? '{}' : mode === 'truncated JSON' ? '{"version":' :
+        JSON.stringify({ ...valid, version: 999 });
+      if (mode === 'directory') mkdirSync(file);
+      else if (mode === 'dangling symlink') symlinkSync(join(dir, 'missing'), file);
+      else writeFileSync(file, bytes);
+      // A later head with identical closures would pass if the corrupt debt were discarded.
+      const next = { head: 'e'.repeat(40), at: iso(at + 1) };
+      let closureReads = 0;
+      const later = m.createProbationObserver({ ...opts, readClosure() {
+        closureReads++;
+        return { complete: true, files: { 'x.mjs': 'c'.repeat(40) } };
+      } });
+      expect(await later.adopt(adopted(), next)).toMatchObject({ status: 'invalid', action: 'pending',
+        reason: expect.stringContaining('operator recovery required') });
+      expect(closureReads).toBe(0);
+      expect(await observer.status()).toMatchObject({ status: 'invalid', action: 'pending' });
+      if (mode === 'directory') expect(lstatSync(file).isDirectory()).toBe(true);
+      else if (mode === 'dangling symlink') expect(lstatSync(file).isSymbolicLink()).toBe(true);
+      else expect(readFileSync(file, 'utf8')).toBe(bytes);
+    });
   it('missing, unreadable and invalid files report invalid, never pass or empty', async () => {
     const m = await load(), observer = m.createProbationObserver(opts);
     expect(await observer.status()).toMatchObject({ status: 'invalid', action: 'pending' });
