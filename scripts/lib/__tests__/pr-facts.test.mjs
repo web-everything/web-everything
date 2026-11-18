@@ -344,6 +344,17 @@ describe('mirror compaction', () => {
     expect(lookup(next)).toEqual(lookup(m));
   });
 
+  it('a PR reopened after eviction is never served from the mirror', () => {
+    const m = seed([row(7, 'closed')]);
+    m.closedSeen = { 7: T0 - 1000 };
+    const next = compact(m);
+    expect(next.evicted).toEqual([7]);
+    const reopened = applyDelta(next, [{ seq: 11, repo: REPO.toLowerCase(), type: 'pull_request', action: 'reopened', number: 7, sha: HEAD, draft: false, labels: [] }]);
+    expect(lookup(reopened).facts).toBeNull();
+    expect(lookup({ ...reopened, evicted: [] }).reason).not.toBe('evicted');
+    expect(lookup(compact(reopened, 10 ** 9)).facts).toBeNull();
+  });
+
   it('keeps a current-head check joined to an open PR only through the sha bucket', () => {
     const m = seed();
     const c = check(HEAD, [], T0);
@@ -383,7 +394,7 @@ describe('mirror compaction', () => {
     const event = { ...parseGithubEvent('pull_request_review', review('approved'), { receivedAt: T0 }), seq: 11 };
     const next = compact(applyDelta(evicted, [event]));
     expect(next.closedSeen).toEqual({ 7: T0 });
-    expect(lookup(next)).toEqual({ facts: null, reason: 'incomplete-row' });
+    expect(lookup(next)).toEqual({ facts: null, reason: 'evicted' });
     expect(compact(next, 1000, T0 + 1000).buckets.prs).toEqual({});
     expect(compact(applyDelta(evicted, [event]), 0).buckets.prs).toEqual({});
   });
