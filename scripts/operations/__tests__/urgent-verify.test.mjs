@@ -165,6 +165,23 @@ describe('CI gate mirroring fails closed', () => {
       integration: ['npm', 'run', 'test:integration:vitest'],
     });
   });
+  const real = yaml.safeLoad(workflow);
+  const runSteps = Object.entries(real.jobs).filter(([job]) => ['changes', 'test-shard', 'coverage-merge', 'host-paths', 'integration', 'test', 'standards'].includes(job))
+    .flatMap(([job, spec]) => spec.steps.flatMap((step, index) => typeof step.run === 'string' ? [[job, index, step.name]] : []));
+  it.each(runSteps)('refuses changed execution context for %s step %i (%s)', (job, index) => {
+    for (const [key, value] of Object.entries({ 'working-directory': 'unexpected', env: { NODE_OPTIONS: '--require=unexpected' }, shell: 'bash', if: '${{ false }}', 'continue-on-error': true })) {
+      const changed = yaml.safeLoad(workflow);
+      changed.jobs[job].steps[index][key] = value;
+      expect(() => ciGatePlan(yaml.safeDump(changed)), key).toThrow('unreadable-ci-gates');
+    }
+  });
+  it.each(Object.keys(real.jobs).filter(job => runSteps.some(([name]) => name === job)))(
+    'refuses job execution overrides in %s', job => {
+      for (const [key, value] of Object.entries({ defaults: { run: { shell: 'bash' } }, env: {}, container: 'node:22', 'continue-on-error': true })) {
+        const changed = yaml.safeLoad(workflow); changed.jobs[job][key] = value;
+        expect(() => ciGatePlan(yaml.safeDump(changed)), key).toThrow('unreadable-ci-gates');
+      }
+    });
   it.each(['test-shard', 'coverage-merge', 'host-paths', 'integration', 'test', 'standards'])(
     'refuses an extra unknown run step in %s and tells the operator to update the mirror', job => {
       const changed = yaml.safeLoad(workflow);

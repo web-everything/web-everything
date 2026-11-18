@@ -1,6 +1,7 @@
 /** Urgent evidence permits prototype loading only; merging still requires real CI. */
 import yaml from 'js-yaml';
 import { createHmac, timingSafeEqual } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 export const urgentKeyPath = home => `${home}/workspace/.operations/state/urgent-verify.key`;
 export const normalizeUrgentRepo = url => {
   const value = String(url ?? '').trim().replace(/\/+$/, '').replace(/\.git$/, '');
@@ -137,6 +138,29 @@ const mirroredActions = new Set([
   'actions/upload-artifact@v4', 'actions/download-artifact@v4',
 ]);
 
+// Execution contexts observed in ci.yml, pinned independently of the input workflow.
+const fullUnit = "${{ needs.changes.outputs.light != 'true' }}";
+const fullIntegration = "${{ steps.gate.outputs.run == 'true' }}";
+function mirroredRunContext(job, text) {
+  const index = mirroredRuns[job].map(runText).indexOf(text);
+  const setup = setupRuns.includes(text);
+  const directory = text === 'npm ci\nnpm run build:tools' ? 'frontierui'
+    : setup || job === 'standards' || (job === 'coverage-merge' && index === 1)
+      || (job === 'test-shard' && index > 0) || (job === 'integration' && index === 1) ? 'web-everything' : undefined;
+  const condition = job === 'test-shard' ? (setup ? fullUnit : [
+    "${{ needs.changes.outputs.light == 'true' }}",
+    "${{ needs.changes.outputs.light != 'true' && (matrix.shard != 10) }}",
+    "${{ needs.changes.outputs.light != 'true' && (matrix.shard == 10) }}",
+  ][index]) : job === 'integration' && (setup || index === 1) ? fullIntegration : undefined;
+  return {
+    'working-directory': directory, if: condition, shell: undefined, 'continue-on-error': undefined,
+    env: job === 'changes' ? {
+      EVENT_NAME: '${{ github.event_name }}', BASE_SHA: '${{ github.event.pull_request.base.sha }}',
+      MG_BASE_SHA: '${{ github.event.merge_group.base_sha }}', BASE_REF: '${{ github.event.pull_request.base.ref }}',
+    } : undefined,
+  };
+}
+
 /** Required closure is workflow-owned; an unfamiliar dependency refuses urgent loading. */
 export function ciRequiredJobs(workflow) {
   const jobs = yaml.safeLoad(workflow)?.jobs, seen = new Set(), visiting = new Set();
@@ -157,8 +181,10 @@ export function ciRequiredJobs(workflow) {
 
 /** Mirror only the known CI command and artifact layout; changes require an operator update. */
 export function ciGatePlan(workflow) {
-  const jobs = yaml.safeLoad(workflow)?.jobs, plan = ciUnitPlan(workflow);
+  const document = yaml.safeLoad(workflow), jobs = document?.jobs;
   const requiredJobs = ciRequiredJobs(workflow);
+  if (document.env !== undefined || document.defaults?.run !== undefined)
+    throw new Error('unreadable-ci-gates: workflow execution context; update the urgent verification mirror');
   for (const job of requiredJobs) {
     const mirrored = mirroredRuns[job];
     const steps = jobs?.[job]?.steps;
@@ -167,7 +193,16 @@ export function ciGatePlan(workflow) {
       (typeof s.run !== 'string' || !allowed.has(runText(s.run)))))
       || steps.some(s => 'uses' in s && !mirroredActions.has(s.uses)))
       throw new Error(`unreadable-ci-gates: update the urgent verification mirror for ${job} run or uses steps`);
+    if (jobs[job].defaults?.run !== undefined || jobs[job].env !== undefined || jobs[job].container !== undefined
+      || jobs[job]['continue-on-error'] !== undefined)
+      throw new Error(`unreadable-ci-gates: ${job} execution context; update the urgent verification mirror`);
+    for (const step of steps.filter(s => 'run' in s)) {
+      const expected = mirroredRunContext(job, runText(step.run));
+      if (Object.entries(expected).some(([key, value]) => !isDeepStrictEqual(step[key], value)))
+        throw new Error(`unreadable-ci-gates: ${job} step execution context; update the urgent verification mirror`);
+    }
   }
+  const plan = ciUnitPlan(workflow);
   const covered = plan.filter(s => s.group === 'covered').length;
   const step = (job, name) => {
     const matches = jobs?.[job]?.steps?.filter(s => s.name === name);

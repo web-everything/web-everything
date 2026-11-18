@@ -4666,3 +4666,12 @@ Cursor records never settle a load; older ledgers without a cursor start at the 
 failures in any check-run on the SHA, regardless of job or app, remove the recorded clone/ref with a tip guard and open a NEEDS-YOU escalation through
 `land-advance-escalations`; unreadable/oversized evidence and legacy records without registrations
 require operator repair or manual unloading. Keep these paths in `urgent-sweep.test.mjs`.
+
+The CI mirror also pins each run step's directory, environment, shell, condition and error policy,
+and refuses job run defaults, environments and containers. A context change requires updating the
+mirror or waiting for passing CI; command equality alone cannot authorize an urgent receipt.
+Health-watch schedules `urgent-sweep-tick.mjs` every five minutes, persisting `urgentSweep.lastAttemptAt`
+even on failure. `scripts/settings/urgent-sweep.json` controls the interval through the policy cascade
+(`WE_URGENT_SWEEP_INTERVAL_MINUTES` is the environment override). Fixture, redirected and dry-run ticks
+skip host urgent loads. Errors are logged and recorded as probe errors without interrupting the tick.
+Keep cadence, persisted-stamp and fail-soft wiring regressions in `urgent-sweep-tick.test.mjs`.
