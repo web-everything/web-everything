@@ -9,6 +9,7 @@ import * as redTeamEvidence from '../../../scripts/lib/drain-red-team-evidence.m
 import * as resultLabelSync from '../../../scripts/lib/red-team-result-label-sync.mjs';
 import * as gateCatchUp from '../../../scripts/lib/red-team-gate-catchup.mjs';
 import * as redTeamRecovery from '../../../scripts/lib/review-red-team-on-skip.mjs';
+import * as repoProfiles from '../../../scripts/lib/repo-profile.mjs';
 import * as hostSample from '../../../scripts/lib/host-sample.mjs';
 import { planReconcile } from '../../../scripts/conveyor/reconcile-core.mjs';
 import { buildReviewedShaMarker } from '../../../scripts/lib/review-escalation.mjs';
@@ -28,7 +29,8 @@ beforeEach(() => {
 const readQueueFile = () => existsSync(QUEUE_FILE) ? readFileSync(QUEUE_FILE, 'utf8') : null;
 
 it('CLI catches up gates after label repair, before capacity recovery, and survives catch-up exceptions', () => {
-  const repo = 'web-everything/web-everything', rawPrs = [], repaired = [], refusals = [];
+  const repo = 'frontier-ui/frontierui', rawPrs = [], repaired = [], refusals = [];
+  vi.spyOn(repoProfiles, 'repoProfile').mockReturnValue({ checkoutPath: 'subject-checkout' });
   const order = [];
   vi.spyOn(resultLabelSync, 'syncResultOnHeadLabels').mockImplementation(() => {
     order.push('labels'); return { rawPrs: repaired };
@@ -45,6 +47,7 @@ it('CLI catches up gates after label repair, before capacity recovery, and survi
     const input = { repo, rawPrs, plan: { refusals } };
     expect(() => production.redTeamOnSkip(input)).not.toThrow();
     expect(order).toEqual(['labels', 'gate', 'capacity']);
+    expect(redTeamRecovery.runRedTeamOnSkip).toHaveBeenCalledWith(expect.objectContaining({ repo, cwd: 'subject-checkout' }));
     const history = catchUp.mock.calls[0][0].history;
     expect(catchUp).toHaveBeenCalledWith({ repo, refusals, rawPrs: repaired, history, log: expect.any(Function) });
     production.redTeamOnSkip(input);

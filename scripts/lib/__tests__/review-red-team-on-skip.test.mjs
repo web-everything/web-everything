@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { runGhSync } from '../gh-throttle.mjs';
 import { redTeamForHead, redTeamMarker } from '../red-team-gate.mjs';
 import { publishRedTeamPolicyClearCheck, POLICY_CLEAR_HOLD_OWED } from '../red-team-check-run.mjs';
@@ -3186,7 +3187,7 @@ describe('finished skipped empty net diff recovery', () => {
       failedSeatCount: 0, inFlight: false, queued: false };
     return { rawPrs: [{ number: pr, headRefOid: head, labels: ['review:accepted', 'ready-to-merge', 'red-team:pending'], reviews: [],
       comments: [{ body: `✅ review — accepted\n<!-- reviewed-sha: ${head} -->`, author: { login: 'web-everything' } }] }],
-      gitExec: vi.fn(() => ''), readEvidence: () => evidence, readStatus: () => status };
+      cwd: 'subject-checkout', gitExec: vi.fn(() => ''), readEvidence: () => evidence, readStatus: () => status };
   };
   it('heals a legacy finished skipped object using a config-independent emptiness probe', () => {
     const o = options();
@@ -3196,6 +3197,44 @@ describe('finished skipped empty net diff recovery', () => {
     ]), expect.anything());
     // A global git option only binds before the subcommand.
     expect(o.gitExec.mock.calls[0][1][0]).toBe('--no-replace-objects');
+  });
+  it('clears an empty net diff in the subject repo when the daemon repo lacks both revisions (real git, two repositories)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-subject-cwd-'));
+    const daemonCwd = join(dir, 'daemon'), subjectCwd = join(dir, 'subject');
+    const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    try {
+      for (const cwd of [daemonCwd, subjectCwd]) {
+        mkdirSync(cwd);
+        git(cwd, 'init', '--quiet');
+      }
+      const commit = message => git(subjectCwd, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+        '-c', 'commit.gpgsign=false', 'commit', '--quiet', '--allow-empty', '-m', message);
+      commit('subject base');
+      const base = git(subjectCwd, 'rev-parse', 'HEAD');
+      commit('subject head');
+      const rev = git(subjectCwd, 'rev-parse', 'HEAD');
+      for (const sha of [base, rev]) expect(() => git(daemonCwd, 'cat-file', '-e', sha)).toThrow();
+      const o = options();
+      o.cwd = subjectCwd;
+      // Reproduce a daemon whose implicit Git cwd is a different repository, without changing Vitest's cwd.
+      o.gitExec = (file, args, opts) => execFileSync(file, args, { ...opts, cwd: opts.cwd ?? daemonCwd,
+        stdio: ['ignore', 'pipe', 'pipe'] });
+      const status = o.readStatus();
+      status.head = rev;
+      Object.assign(status.loopPayload.findings.read.netBasis, { base, rev });
+      o.rawPrs[0].headRefOid = rev;
+      o.rawPrs[0].comments[0].body = `✅ review — accepted\n<!-- reviewed-sha: ${rev} -->`;
+      const input = fixture({ ...o, refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: rev }] });
+      expect(planRedTeamOnSkip(input)[0]).toMatchObject({ action: 'clear', policy: 'empty-net-diff' });
+      expect(planRedTeamOnSkip({ ...input, cwd: daemonCwd })[0]).toMatchObject({ action: 'skip',
+        why: 'empty net diff not proven for this head; inspect stored evidence' });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('holds empty-net-diff recovery without an explicit subject cwd and asks to inspect stored evidence', () => {
+    const o = options();
+    delete o.cwd;
+    expect(decide(o)).toMatchObject({ action: 'skip', why: 'empty net diff not proven for this head; inspect stored evidence' });
+    expect(o.gitExec).not.toHaveBeenCalled();
   });
   it.each([
     ['unscored', o => { delete o.readStatus().loopPayload.findings.read.netBasis.scored; }],
@@ -3231,7 +3270,7 @@ it.each(['nonempty after recording', 'probe failure'])('R979 recovery refuses %s
     if (kind === 'probe failure') throw Error('unreadable');
     return 'code.mjs\0';
   });
-  const result = decide({ gitExec,
+  const result = decide({ gitExec, cwd: 'subject-checkout',
     rawPrs: [{ number: pr, headRefOid: head, labels: ['review:accepted', 'ready-to-merge', 'red-team:pending'], reviews: [],
       comments: [{ body: `✅ review — accepted\n<!-- reviewed-sha: ${head} -->`, author: { login: 'web-everything' } }] }],
     readStatus: () => status, readEvidence: () => ({ status, loopPayload, recorded: false, seatRecorded: false,

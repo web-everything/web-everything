@@ -1293,7 +1293,8 @@ export function cliReviewTickOpts({ log = console, factCache = null } = {}) {
         runGateCatchUp({ repo: o.repo, refusals: o.plan?.refusals, rawPrs,
           history: redTeamGateRetryHistory, log: line => log.error(line) });
       } catch { /* Gate catch-up must never block the capacity queue. */ }
-      const options = { ...o, rawPrs,
+      // Use the same subject checkout as review-lane dispatch; never the daemon cwd.
+      const options = { ...o, rawPrs, cwd: repoProfile(o.repo)?.checkoutPath ?? null,
         dispatch: d => dispatchReviewJob(d), log: line => log.error(line) };
       // Operator escape hatch: WE_RED_TEAM_DISPATCH_QUEUE=off runs the recovery directly, with no queue filtering or IO.
       const queueSetting = process.env.WE_RED_TEAM_DISPATCH_QUEUE;

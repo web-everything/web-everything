@@ -713,7 +713,8 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance,
           comments: rawPr.comments, reviews, settlesPending: true });
         if (refusal) return guardedSkip(refusal);
-        if (!verifyEmptyNetDiff(evidence.loopPayload?.findings?.read, head, { exec: gitExec, cwd }))
+        // The subject checkout must be explicit: the daemon may be reviewing another repository.
+        if (!cwd || !verifyEmptyNetDiff(evidence.loopPayload?.findings?.read, head, { exec: gitExec, cwd }))
           return skip('empty net diff not proven for this head; inspect stored evidence');
         return { ...row, action: 'clear', policy: EMPTY_NET_DIFF_SKIP.policy, why: EMPTY_NET_DIFF_SKIP.reason };
       }
@@ -873,7 +874,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
   readHeadFiles = key => isUnderTest() || isUnderTest(env)
     ? rawPrs?.find(raw => Number(raw.number) === Number(key.number))?.netFiles
     : readBacklogOnlyNetFiles(key),
-  exec = execFileSync, cwd = process.cwd(), mainRef = 'origin/main',
+  exec = execFileSync, cwd, mainRef = 'origin/main',
   proveMove = move => proveCardOnlyHeadMove({ ...move, exec, cwd, mainRef }),
   readWitness = readEvidence === readDrainRedTeamEvidence && readStatus === readRedTeamStatus
     ? key => readRecoveryWitness({ ...key, env }) : null,
