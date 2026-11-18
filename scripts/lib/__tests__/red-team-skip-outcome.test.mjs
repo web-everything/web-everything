@@ -446,13 +446,34 @@ it.each(['nonempty after recording', 'probe error', 'oversized probe', 'missing 
   const read = { netBasis: { base, rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true };
   if (kind === 'missing base') delete read.netBasis.base;
   f.io.readStatus = () => ({ head, loopPayload: { findings: { read } } });
-  f.io.gitExec = vi.fn((_file, args, options) => {
-    expect(args).toContain(`${base}..${head}`);
-    expect(options.maxBuffer).toBe(1024 * 1024);
-    if (kind === 'probe error' || kind === 'oversized probe') throw Error(kind);
-    return 'code.mjs\0';
-  });
+  const probeError = Error('git diff failed');
+  const bufferError = Object.assign(Error('stdout maxBuffer length exceeded'), { code: 'ENOBUFS' });
+  f.io.gitExec = vi.fn()
+    .mockReturnValueOnce(`${base}\n`)
+    .mockImplementation((_file, _args, options) => {
+      if (kind === 'probe error') throw probeError;
+      const output = kind === 'oversized probe' ? 'x'.repeat(1024 * 1024 + 1) : 'code.mjs\0';
+      if (Buffer.byteLength(output) > options.maxBuffer) throw bufferError;
+      return output;
+    });
   expect(f.settle({ status: 'skipped', policy: 'empty-net-diff' }).outcome).toBe('non-policy');
+  if (kind === 'missing base') {
+    expect(f.io.gitExec).not.toHaveBeenCalled();
+  } else {
+    // Assert outside the verifier's catch so a failed mock assertion cannot prove refusal.
+    const options = expect.objectContaining({ maxBuffer: 1024 * 1024 });
+    expect(f.io.gitExec).toHaveBeenCalledTimes(2);
+    expect(f.io.gitExec).toHaveBeenNthCalledWith(1, 'git', [
+      '--no-replace-objects', 'rev-parse', '--verify', '--end-of-options', `${base}^{commit}`,
+    ], options);
+    expect(f.io.gitExec).toHaveBeenNthCalledWith(2, 'git', [
+      '--no-replace-objects', 'diff', '--no-ext-diff', '--no-textconv', '--no-renames',
+      '--ignore-submodules=none', '--name-only', '-z', '--end-of-options', `${base}..${head}`, '--',
+    ], options);
+    expect(f.io.gitExec.mock.results[1]).toEqual(kind === 'nonempty after recording'
+      ? { type: 'return', value: 'code.mjs\0' }
+      : { type: 'throw', value: kind === 'probe error' ? probeError : bufferError });
+  }
   expect(f.io.postComment).not.toHaveBeenCalled();
   expect(f.io.publishNeedsYou).toHaveBeenCalled();
 });
