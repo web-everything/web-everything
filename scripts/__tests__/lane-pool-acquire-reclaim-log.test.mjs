@@ -110,15 +110,18 @@ describe('lane-pool acquire reclaim log', () => {
     const flags = Array.from({ length: 2000 }, (_, i) => `--unknown-${String(i).padStart(4, '0')}-${'x'.repeat(90)}`);
     const child = spawn(process.execPath, [SCRIPT, 'status', ...flags], { stdio: ['ignore', 'ignore', 'pipe'],
       env: { PATH: process.env.PATH, HOME: process.env.HOME, LANE_POOL_ROOT: pool } }); // small env: argv+env stay under ARG_MAX
-    const exited = new Promise((done) => child.on('exit', done));
+    // 'close' (not 'exit'): fires only after the child exited AND its stderr pipe is fully drained, so a child that
+    // is merely slow to start under a loaded CI shard (main 661a07fbc: err === '') is waited for, never mistaken for
+    // a lost tail. The old async-pipe bug still fails: the child exits, the pipe closes, and the tail is missing.
+    const exited = new Promise((done) => child.on('close', done));
     child.stderr.pause();
     await new Promise((done) => setTimeout(done, 1_500)); // a stalled reader: the pipe fills meanwhile
     let err = '';
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (d) => { err += d; });
-    // Bounded: with the old async pipe the dropped tail never arrives, so stop reading after 5s and assert.
-    await new Promise((done) => { child.stderr.on('end', done).resume(); setTimeout(done, 5_000).unref(); });
-    const code = await exited;
+    child.stderr.resume();
+    // Bounded well inside the 60s test timeout: a hung child fails the exit-code assertion, it never stalls the suite.
+    const code = await Promise.race([exited, new Promise((done) => setTimeout(() => { child.kill('SIGKILL'); done('timeout'); }, 40_000).unref())]);
     expect(code).toBe(1);
     expect(err).toContain('unrecognized flag(s)');
     expect(err).toContain('full flag list');
