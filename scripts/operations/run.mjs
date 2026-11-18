@@ -327,7 +327,7 @@ export const OPERATIONS = Object.freeze({
         ...seats,
         readPr: createReviewPrReader(cwd ? { cwd } : {}),
       }),
-      sinks: createReviewPrSinks({ json }),
+      sinks: createReviewPrSinks({ json, ...(cwd ? { cwd } : {}) }),
     };
   },
   // backlog/xzdi27a-* — the sibling of `review-pr` for a BACKLOG CARD instead of a PR diff (no `gh`, no diff,

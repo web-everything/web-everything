@@ -761,6 +761,30 @@ describe('the label sink', () => {
     expect(argv.join(' ')).not.toContain('gh ');
   });
 
+  it('staged in checkout A, child cwd B: passes a private copy accepted by the child allowlist', async () => {
+    const cwd = join(root, 'checkout-b'), scratch = join(root, 'temp');
+    mkdirSync(cwd); mkdirSync(scratch);
+    const staged = reviewBodyPath({ root, runId: CTX.runId, bodyFile: payload.bodyFile });
+    // Model distinct checkout/temp roots even though the fixture itself lives in the host temp dir.
+    expect(checkBodyFileLocation(staged, bodyFileRoots(cwd, scratch)).ok).toBe(false);
+    let copy;
+    const sinks = createReviewPrSinks({ root, cwd, tmpDir: scratch,
+      publishGate: () => ({ allowed: true, headSha: payload.reviewedHead }),
+      runNode: (argv, opts) => {
+        expect(opts.cwd).toBe(cwd);
+        copy = argv.find(a => a.startsWith('--body-file=')).slice(12);
+        expect(copy).not.toBe(staged);
+        expect(checkBodyFileLocation(copy, bodyFileRoots(opts.cwd))).toEqual({ ok: true });
+        expect(checkBodyFileLocation(copy, bodyFileRoots(opts.cwd, scratch))).toEqual({ ok: true });
+        expect(readFileSync(copy, 'utf8')).toBe('# verdict');
+        expect(statSync(copy).mode & 0o777).toBe(0o600);
+        return '{"ok":true,"pr":7,"to":"accepted"}';
+      } });
+    await expect(sinks[REVIEW_EFFECTS.LABEL](payload, CTX)).resolves.toMatchObject({ ok: true });
+    expect(existsSync(copy)).toBe(false);
+    expect(readFileSync(staged, 'utf8')).toBe('# verdict');
+  });
+
   // Resume from a DIFFERENT checkout: the staged file lives under the first lane's root, so this root has none.
   // The durable run record still holds the frozen write-up effect, and the sink regenerates the file from it.
   const runRecord = { id: 'run-1', effects: [

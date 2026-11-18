@@ -4036,6 +4036,13 @@ review loop with in-memory runs, ledger IO and effect sinks. It replays an accep
 a later reviewed head, compares off/shadow/on live effects, distinguishes confirmed from plausible
 broken ratings, and injects writer and logger failures without contacting GitHub or changing Git.
 
+## Review label body-file checkout regression
+
+Keep staging `root` separate from the label child's `cwd`: `--cwd` reaches the sinks through
+`resolveOperation`. Test checkout A staging against checkout B's `bodyFileRoots`, with a separate
+temp root so a host-temp fixture cannot hide the mismatch. The `review-label-body-child-cwd`
+soak break probes the real sink to decide fix presence and checks private-copy cleanup.
+
 ## Verdict-ledger contention regression (R365 fix 2)
 
 `verdict-ledger-io.test.mjs` uses local bare origins and real rejected pushes to
