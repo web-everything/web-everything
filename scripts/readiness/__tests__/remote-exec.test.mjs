@@ -1103,7 +1103,7 @@ describe('standards input parity', () => {
       return {code:outcome === 'ok' ? 0 : 1};
     });
     const now = Date.now(), maxRuntimeMs = 3*1_740_000+15*60*1000;
-    const runner = createRunner({testRoot:root, testPath:'/usr/bin:/bin', testWorkerExec:cleanup, clock:()=>now});
+    const runner = createRunner({testRoot:root, testPath:'/usr/bin:/bin', testWorkerExec:cleanup, testReapProbe:{uidBusy:async()=>false}, clock:()=>now});
     const nonce = 'a'.repeat(32), prepared = await runner.prepare({nonce});
     const active = join(root, 'receipts/worker-active-1'), executing = join(active, 'executing');
     mkdirSync(executing);

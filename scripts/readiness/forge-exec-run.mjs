@@ -1691,6 +1691,8 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
               await directory(container,true,operator);
               const reaped=await workCommand(worker,['/usr/bin/true'],container,{PATH:path,HOME:'/nonexistent'},undefined,{cleanup:true});
               if(reaped.code!==0)throw new Error('uid cleanup unconfirmed');
+              // The reap scan keys on /proc ownership; the credential-based probe also sees non-dumpable workers.
+              if(await reapProbe.uidBusy((await identity(record.slot)).uid))throw new Error('uid still busy');
               // UID emptiness cannot see a root supervisor paused before dropping identity.
               // Require the hard runtime bound too, when the old controller must be dead.
               if(!(clock()-(await lstat(join(worker.active,'executing'))).mtimeMs>=PAST_MAX_RUNTIME_MS))throw new Error('execution age unconfirmed');
