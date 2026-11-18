@@ -49,3 +49,5 @@ What it does, in order, stopping at the first failure (`stopReason`):
 On `behind-main-conflict`: have Codex resolve the conflict, re-run only the touched test files, complete the SHA's test check and canonical audit, then run again. Do not re-test anything else.
 
 See [prototype-based-dev.md](../../docs/agent/prototype-based-dev.md#loading-a-fix-on-a-daemon-prototype-prototype-load).
+
+For automatic degraded-daemon receipt admission (R1075; no new flag), follow *prototype-based-dev.md → Loading a fix on a daemon prototype (`prototype-load`)*.

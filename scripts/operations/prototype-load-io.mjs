@@ -28,6 +28,9 @@ import { DISPATCH_PATH_DEFAULTS, matchDispatchPaths, runRealDispatchSmoke } from
 import { netDiffFingerprint, carriesAcross } from '../lib/net-diff-fingerprint.mjs';
 import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository } from './prototype-retire.mjs';
 import { ciUnitPlan, urgentLedger, urgentMarker, urgentReason, urgentKeyPath, normalizeUrgentRepo } from './urgent-verify-marker.mjs';
+import { assessDegraded } from './degraded-daemon.mjs';
+import { rollbackDegradedLoad } from './degraded-load-rollback.mjs';
+import { appendDaemonEvent, daemonEventsPath } from '../lib/daemon-events.mjs';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
 // Per-test, hook and teardown bounds mitigate a shell-backed runner outliving its wrapper.
@@ -237,15 +240,30 @@ export function loadRuledWeakened({ platform, tool, fs, env, warn = console.warn
 export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, combinedTest, cloneKey: keyForClone = cloneKey,
   readState = readOverlayState,
   retirePlanner = defaultRetirePlanner, fingerprint = null, testCheck = null, readUrgentKey = () => fs.readFileSync(urgentKeyPath(env.HOME)), dispatchSmoke = null, realDispatchSmoke = runRealDispatchSmoke, removeRegistration = null,
-  resolveOperatorIdentity: operatorIdentity = resolveOperatorIdentity }) {
+  emitDaemonEvent = appendDaemonEvent, needsYou, resolveOperatorIdentity: operatorIdentity = resolveOperatorIdentity }) {
   const expand = (p) => p.startsWith('~/') ? join(env.HOME, p.slice(2)) : p;
   const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return ''; throw e; } };
   const tool = settings || JSON.parse(read(join(repo, 'scripts/settings/prototype-load.json')));
   const platform = readPlatformPreferences({ env, readFile: (p, encoding) => fs.readFileSync(p, encoding) });
   // Mode settings have no authority: refuse is the only admission policy.
-  const withoutMode = ({ canonicalAuditMode: ignored, ...layer } = {}) => layer;
-  const policy = resolveCascade({ standard: { combinedTest: COMBINED_TEST_DEFAULTS },
-    platform: withoutMode(platform.prefs.prototypeLoad), tool: withoutMode(tool) });
+  const settingErrors = [];
+  const withoutMode = ({ canonicalAuditMode: ignored, ...layer } = {}, source) => {
+    const v = layer.degradedFastPath;
+    if (v !== undefined && (!v || typeof v !== 'object' || Array.isArray(v)
+      || Object.keys(v).some(k => !['enabled', 'degradedAfterMinutes'].includes(k))
+      || (v.enabled !== undefined && typeof v.enabled !== 'boolean')
+      || (v.degradedAfterMinutes !== undefined && (!Number.isFinite(v.degradedAfterMinutes) || v.degradedAfterMinutes <= 0)))) {
+      settingErrors.push(`${source}.degradedFastPath malformed; disabled. Fix the setting and retry.`);
+      layer.degradedFastPath = { enabled: false, degradedAfterMinutes: 60 };
+    }
+    return layer;
+  };
+  const policy = resolveCascade({ standard: { combinedTest: COMBINED_TEST_DEFAULTS, degradedFastPath: { enabled: true, degradedAfterMinutes: 60 } },
+    platform: withoutMode(platform.prefs.prototypeLoad, 'platform'), tool: withoutMode(tool, 'tool') });
+  if (settingErrors.length || platform.errors.length) {
+    policy.value.degradedFastPath.enabled = false;
+    policy.leafValues['degradedFastPath.enabled'] = false;
+  }
   const config = { ...policy.value, ruledWeakened: loadRuledWeakened({
     platform: platform.prefs.prototypeLoad?.ruledWeakened, tool: tool.ruledWeakened, fs, env }) };
   // Explicit allowlist: no operator bypasses, credentials, git config injection or NODE_OPTIONS.
@@ -347,9 +365,10 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       stopReason: null, branch: input.branch, sha: input.sha, effectiveRef: input.branch, effectiveSha: input.sha,
       dryRun: !!input.dryRun, stale: [], staleTolerated: [], removed: [], removedTips: {}, why: input.why || '',
       retired: [], retireRefused: [], ...(input.replace ? { replace: input.replace } : {}),
-      settings: { sources: policy.sources, values: policy.value, log: formatCascadeSourcesLine('prototypeLoad', policy), errors: platform.errors } };
+      settings: { sources: policy.sources, values: policy.value, log: formatCascadeSourcesLine('prototypeLoad', policy), errors: [...platform.errors, ...settingErrors] } };
     let stage = 'bad-input';
     let pendingAdoption = null;
+    let degradedEventWritten = false;
     const stop = (reason, details = {}) => { Object.assign(out, details, { stopReason: reason }); return out; };
     // Once the replacement is registered, failures name the retained contained registrations.
     const keptNote = () => {
@@ -487,15 +506,26 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       if (!Number.isFinite(config.adoption?.timeoutMs) || config.adoption.timeoutMs < 0
         || !Number.isFinite(config.adoption.pollMs) || config.adoption.pollMs <= 0) return stop('bad-input', { detail: 'bad-adoption-settings', fallback: 'Fix adoption.timeoutMs and adoption.pollMs in scripts/settings/prototype-load.json.' });
       if (input.waitAdoptionMs !== undefined && input.waitAdoptionMs !== '' && (!Number.isFinite(Number(input.waitAdoptionMs)) || Number(input.waitAdoptionMs) < 0)) return stop('bad-input', { detail: 'bad-wait-adoption-ms', fallback: 'Pass --wait-adoption-ms as a number of milliseconds (0 returns right after registration; the cap is 160000).' });
+      // Only this log read can enable R1075; extra caller fields have no authority.
+      if (!input.urgent && config.degradedFastPath.enabled && !settingErrors.length && !platform.errors.length) {
+        let events;
+        try { events = fs.readFileSync(daemonEventsPath({ env, home: env.HOME }), 'utf8'); } catch { /* no evidence */ }
+        const assessment = assessDegraded({ events, daemon: input.daemon, clone: out.clone,
+          now: now(), afterMinutes: config.degradedFastPath.degradedAfterMinutes });
+        if (assessment.degraded) {
+          out.degradedFastPath = { ...assessment.evidence, branch: input.branch, sha: input.sha, daemon: input.daemon, marker: null };
+          input = { ...input, urgent: true, reason: `Daemon degraded for ${assessment.evidence.ageMinutes} minutes: ${assessment.evidence.signals.map(s => `${s.kind}@${s.at}`).join(', ')}` };
+        }
+      }
       stage = 'no-ready';
       const readyRecords = jsonLines(read(expand(config.readyRecordPath)));
       let readyFp = null;
       out.gate = readyEvidence(readyRecords, input, config.ruledWeakened,
-        () => (readyFp = liveFingerprint([...readyRecords, ...(Array.isArray(config.ruledWeakened) ? config.ruledWeakened : [])])));
+        () => (readyFp = out.degradedFastPath ? null : liveFingerprint([...readyRecords, ...(Array.isArray(config.ruledWeakened) ? config.ruledWeakened : [])])));
       // Only evidence about THIS head's code can refuse here (its sha, or the same net diff). A record left by an
       // earlier load of different code must not strand the branch: the check-run path below writes fresh readiness.
       const hasReady = readyRecordSpeaksFor(readyRecords, input, readyFp);
-      if (!out.gate && hasReady) {
+      if (!out.gate && (hasReady || out.degradedFastPath)) {
         const mismatch = diagnoseWaiverMismatch(readyRecords, input, config.ruledWeakened);
         if (mismatch) return stop('no-ready', { detail: 'waiver-mismatch', mismatch: { field: mismatch.field, record: mismatch.record, waiver: mismatch.waiver }, fallback: `Fix-ready record exists but no ruledWeakened waiver matches exactly: ${mismatch.message}. Make the waiver's ref, sha and ruling equal the record's.` });
         return stop('no-ready', { detail: 'no-fix-ready-record', fallback: 'Fix the latest readiness evidence; arguments are labels only.' });
@@ -508,9 +538,12 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         fetchMain();
         return ancestor(base, 'origin/main');
       } catch { return false; } };
-      const liveFp = liveFingerprint(auditRecords);
+      if (out.degradedFastPath) auditRecords = auditRecords.filter(r => typeof r?.head === 'string' && r.head.toLowerCase() === input.sha.toLowerCase());
+      const liveFp = out.degradedFastPath ? null : liveFingerprint(auditRecords);
       out.canonicalAudit = { mode: 'refuse', ...canonicalAuditEvidence(auditRecords, input.sha, covers, liveFp,
         { ruledWeakened: out.gate }) };
+      if (out.degradedFastPath && out.gate?.ruledWeakened?.findings.some(f => /\b(?:security|B[- ]class|R37)\b|(?:^|\s)\[B\]/i.test(f)))
+        return stop('no-canonical-audit', { detail: 'security-finding', fallback: 'Fix the security finding and obtain an exact-SHA canonical audit before retrying.' });
       if (!out.canonicalAudit.ok) return stop('no-canonical-audit', {
         fallback: `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load. WEAKENED requires a matching ruledWeakened entry and fix-ready disclosure.` });
       if (out.gate?.ruledWeakened) console.warn(`WARNING: RULED-WEAKENED EXCEPTION ${out.gate.ruledWeakened.ruling}: loading ${input.branch}@${input.sha} despite audit WEAKENED (source layer: ${out.gate.ruledWeakened.layer || 'tool'}). Disclosed findings: ${out.gate.ruledWeakened.findings.join(' | ')}`);
@@ -575,7 +608,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         && (['queued', 'in_progress'].includes(checkRun.status)
           || (checkRun.appId === TEST_CHECK_APP_ID && checkRun.status === 'completed' && checkRun.conclusion === 'success'))))
         return stop('no-ready', { detail: 'ci-evidence-unreadable', fallback: 'Repair the CI evidence reader and retry with complete evidence.' });
-      if (checkRun?.sha !== input.sha || checkRun.name !== 'test' || checkRun.appId !== TEST_CHECK_APP_ID || checkRun.status !== 'completed' || checkRun.conclusion !== 'success') {
+      if (out.degradedFastPath || checkRun?.sha !== input.sha || checkRun.name !== 'test' || checkRun.appId !== TEST_CHECK_APP_ID || checkRun.status !== 'completed' || checkRun.conclusion !== 'success') {
         if (!input.urgent) return stop('no-ready', { detail: 'no-passing-test-check', fallback: 'Complete the test check-run on this SHA and retry; repair the reader if evidence is unavailable, incomplete or exceeds 100 checks. --tests-run/--audit are labels only.' });
         let ledger, shards, expectedSteps, origin;
         try {
@@ -588,6 +621,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         const urgent = urgentMarker({ ...input, ledger, shards, expectedSteps, repo: origin, readKey: readUrgentKey, now: now() });
         if (!urgent.ok) return stop('no-ready', urgent);
         checkRun = urgent.evidence;
+        if (out.degradedFastPath) out.degradedFastPath.marker = checkRun.marker;
       }
       const canonical = out.canonicalAudit.record;
       // R503: with only same-sha evidence no live fingerprint is computed (liveFp is null), yet the record we append
@@ -641,6 +675,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       const contains = ancestor('origin/main', input.sha);
       out.mainCheck = { contains, own };
       let comparison = input.sha;
+      if (!contains && out.degradedFastPath) return stop('no-ready', { detail: 'exact-sha-required',
+        fallback: 'Rebase onto main, run scoped tests, the canonical audit and urgent-verify on that exact SHA, then retry.' });
       if (!contains) {
         const merge = git('merge-tree', '--write-tree', 'origin/main', input.sha);
         if (merge.code === 1) {
@@ -802,6 +838,17 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         urgentIntent = { trackingId: randomUUID(), at: new Date(now()).toISOString(), type: 'prototype-load.urgent', ref: input.branch, sha: input.sha, clone: out.clone, repo: normalizeUrgentRepo(requireGit('remote', 'get-url', 'origin')), registration: { clone: out.clone, ref: out.effectiveRef, sha: out.effectiveSha }, reason: input.reason, marker: checkRun.marker ?? null };
         // Persist intent before any registration mutation; failure refuses admission.
         appendUrgent(urgentIntent);
+        if (out.degradedFastPath) {
+          degradedEventWritten = await emitDaemonEvent({ kind: 'prototype-load.degraded-fast-path', daemon: input.daemon,
+            detail: out.degradedFastPath }, { env, now: () => new Date(now()) });
+          if (!degradedEventWritten) throw new Error('degraded event log unwritable; repair logging and retry');
+        }
+      }
+      if (out.degradedFastPath) {
+        pendingAdoption = { ref: out.effectiveRef, sha: out.effectiveSha, at: new Date(registeredAt).toISOString(),
+          loadedBy: env.USER || null, nonce: randomUUID(), degradedFastPath: out.degradedFastPath };
+        out.adoptionEventTracked = recordPendingAdoption(out.clone, pendingAdoption, { env: childEnv, fs });
+        if (!out.adoptionEventTracked) throw new Error('degraded adoption tracking unwritable; repair storage and retry');
       }
       try {
         if (input.replace) {
@@ -879,8 +926,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       // about 180 s. By default return right after registration; the rebuild path emits overlay-adopted later.
       const waitMs = Math.min(WAIT_ADOPTION_CAP_MS, Math.max(0, Number(input.waitAdoptionMs) || 0), config.adoption.timeoutMs);
       const deadline = registeredAt + waitMs;
-      pendingAdoption = { ref: out.effectiveRef, sha: out.effectiveSha, at: new Date(registeredAt).toISOString(), loadedBy: env.USER || null, nonce: randomUUID() };
-      out.adoptionEventTracked = recordPendingAdoption(out.clone, pendingAdoption, { env: childEnv, fs });
+      pendingAdoption ||= { ref: out.effectiveRef, sha: out.effectiveSha, at: new Date(registeredAt).toISOString(), loadedBy: env.USER || null, nonce: randomUUID(), ...(out.degradedFastPath ? { degradedFastPath: out.degradedFastPath } : {}) };
+      out.adoptionEventTracked ||= recordPendingAdoption(out.clone, pendingAdoption, { env: childEnv, fs });
       // Rebuilds currently emit to the self-sync state directory. Also read the requested overlay
       // sibling trail, so both the loader events and rebuild refusals are observed.
       const rebuildAlerts = join(env.WE_DAEMON_STATE_DIR || join(env.HOME, '.claude/daemon-self-sync-state'), `${basename(state)}.alerts.jsonl`);
@@ -888,7 +935,17 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         const alerts = refusal(jsonLines(read(`${state}.alerts.jsonl`)), out.effectiveRef, registeredAt, true)
           || refusal(jsonLines(read(rebuildAlerts)), out.effectiveRef, registeredAt, true)
           || refusal(jsonLines(read(`${state}.events.jsonl`)), out.effectiveRef, registeredAt);
-        if (alerts) return stop('adoption-refused', { adoption: { refusal: alerts }, fallback: `Fix the refused replacement and rerun.${keptNote()}` });
+        if (alerts) {
+          if (out.degradedFastPath) {
+            out.rollback = await rollbackDegradedLoad({ root: out.clone, ref: out.effectiveRef, sha: out.effectiveSha,
+              fastPath: out.degradedFastPath, reason: 'adoption-refused', env: { ...childEnv, WE_DAEMON_STATE_DIR: env.WE_DAEMON_STATE_DIR, WE_DAEMON_EVENTS: env.WE_DAEMON_EVENTS },
+              readState, retire: removeRegistration || undefined, needsYou, io: fs, emit: emitDaemonEvent, now, git,
+              tip: ref => requireGit('ls-remote', 'origin', `refs/heads/${ref}`).split(/\s+/)[0] });
+            out.needsYou = true;
+            if (out.rollback?.retired) out.registered = false;
+          }
+          return stop('adoption-refused', { adoption: { refusal: alerts }, fallback: out.degradedFastPath ? `NEEDS-YOU: inspect the refused replacement and registry, then rerun.${keptNote()}` : `Fix the refused replacement and rerun.${keptNote()}` });
+        }
         let probe = git('-C', out.clone, 'merge-base', '--is-ancestor', out.effectiveSha, 'HEAD');
         let missing = false;
         if (probe.code === 128) {
@@ -936,12 +993,20 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       return out;
     } catch (e) { return stop(stage, { error: String(e.message || e), fallback: `Inspect the failed step evidence and rerun after resolving it.${keptNote()}` }); }
     finally {
+      if (out.degradedFastPath && !input.dryRun && !degradedEventWritten) {
+        await emitDaemonEvent({ kind: 'prototype-load.degraded-fast-path', daemon: out.daemon,
+          detail: out.degradedFastPath }, { env, now: () => new Date(now()) });
+      }
       const record = { at: new Date(now()).toISOString(), ...out };
       try { const file = expand(config.recordPath); fs.mkdirSync(dirname(file), { recursive: true }); fs.appendFileSync(file, `${JSON.stringify(record)}\n`, 'utf8'); }
       catch (e) { out.ok = false; out.stopReason ||= 'check-unverifiable'; out.recordError = String(e.message || e); }
+      if (out.degradedFastPath && !out.ok && !input.dryRun && !out.rollback) {
+        await emitDaemonEvent({ kind: 'prototype-load.degraded-fast-path-failed', daemon: out.daemon,
+          detail: { ...out.degradedFastPath, stopReason: out.stopReason } }, { env, now: () => new Date(now()) });
+      }
       // Pending is the only outcome that delegates its adoption notice to the rebuild path. Do not leave
       // refused/unverifiable loads or a load already adopted during its wait to emit misleading notices.
-      if (out.adoptionEventTracked && (out.result !== 'registered-pending' || !out.ok)) {
+      if (out.adoptionEventTracked && (!out.rollback || (out.rollback.retired === true && out.rollback.eventRecorded)) && (out.result !== 'registered-pending' || !out.ok)) {
         clearPendingAdoption(out.clone, pendingAdoption, { env: childEnv, fs });
       }
     }
