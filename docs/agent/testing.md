@@ -4584,8 +4584,10 @@ Always recompute from the current checks and required set; saved classifications
 reflect check reruns on the same head. Explicit raw snapshots carry only their own ownership
 annotations. Normal passes carry `plannerRequiredChecks` and `plannerRequiredChecksSource`;
 read-only passes also carry the roster and its `rosterSource` in `plannerOptions`.
-Use one `resolveRequiredChecks` call with the refusal's head, the snapshot's `headRefOid`,
-and explicit snapshot completeness. Preserve bound hold annotations on the rows. Missing
+Use one `resolveRequiredChecks` call with the refusal's head, the snapshot's recorded `rowsHead`,
+and explicit snapshot completeness. Never replace `rowsHead` with the PR's current `headRefOid`;
+missing snapshot provenance fails closed, even when individual checks name the current head.
+Preserve bound hold annotations on the rows. Missing
 roster provenance defaults to `declared` and fails closed; retry with live/cache roster
 and complete head-bound evidence. `checkEvidence` records the contract result. Only `held`
 required names are review-owned; non-held fail/unknown/pending names block red-only eligibility.
@@ -4620,6 +4622,13 @@ job, preserve observed real CI failures, and reuse the already-read hold verdict
 `merge-gate-hold-class.test.mjs` planner cases cover unreadable/incomplete feeds, foreign heads,
 pending checks and replacement jobs. Recording refusals retain the required-check names even
 when incomplete evidence also blocks the verdict; an unavailable roster still refuses recording.
+
+Strict review admission preserves a successful `mergeGateHoldExcused` projection only after
+binding its job, head, kind and hold records. Candidacy (including missing/pending red-team)
+and proven cleared-freeze excusals let review proceed; `mergeGateReviewHold` alone does not.
+The shared resolver and planner keep their original held/failing classification. The review
+adapter leaves original rows intact, and still refuses incomplete reads, foreign heads,
+pending reruns and independent failures. The gate unit and IO suites pin both sides.
 
 
 REST check-run rows omit workflow run/attempt fields. For duplicate GitHub Actions check

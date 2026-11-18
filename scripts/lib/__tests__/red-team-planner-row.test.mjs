@@ -8,7 +8,7 @@ import { createRedTeamDispatchQueue, runWithRedTeamQueue } from '../red-team-dis
 // reconcile-core.test.mjs (foldReviewRefusalInto and the annotated held-gate fixtures).
 const repo = 'web-everything/web-everything', pr = 5762, head = 'a'.repeat(40);
 const check = (name, conclusion = 'failure', extra = {}) => ({ name, status: 'completed', conclusion, ...extra });
-const rawPr = (statusCheckRollup = []) => ({ number: pr, headRefOid: head, rowsComplete: true, comments: [], reviews: [], statusCheckRollup });
+const rawPr = (statusCheckRollup = []) => ({ number: pr, headRefOid: head, rowsHead: head, rowsComplete: true, comments: [], reviews: [], statusCheckRollup });
 const refusal = (kind, extra = {}) => ({ kind, prNumber: pr, headSha: head, ...extra });
 const scopeBloat = { stale: true, why: 'stale base carries unrelated changes' };
 function folded(kind) {
@@ -104,13 +104,16 @@ describe('readPlannerRow', () => {
 
   it('uses the refusal head rather than accepting checks fetched for a moved PR head', () => {
     const result = classify([check('test', 'success')], {
-      rawPrs: [{ ...rawPr([check('test', 'success')]), headRefOid: 'b'.repeat(40) }],
+      rawPrs: [{ ...rawPr([check('test', 'success')]), headRefOid: 'b'.repeat(40), rowsHead: 'b'.repeat(40) }],
     });
     expect(result.checkEvidence.state).toBe('unknown');
     expect(result.reviewOwnedChecks).toMatchObject({ ci: { allowed: false, headSha: head }, onlyRed: false });
   });
 
   it.each([
+    ['stale snapshot head', { rawPrs: [{ ...rawPr([check('test', 'success')]), rowsHead: 'b'.repeat(40) }] }],
+    ['missing snapshot head', { rawPrs: [{ ...rawPr([check('test', 'success')]), rowsHead: undefined }] }],
+    ['null snapshot head', { rawPrs: [{ ...rawPr([check('test', 'success')]), rowsHead: null }] }],
     ['unstated roster source', { rosterSource: undefined }],
     ['declared roster', { rosterSource: 'declared' }],
     ['unstated completeness', { rawPrs: [{ ...rawPr([check('test', 'success')]), rowsComplete: undefined }] }],

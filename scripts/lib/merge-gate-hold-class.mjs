@@ -155,6 +155,28 @@ export function classifyMergeGateHold({ results, prLabels, freeze, verdictComple
   return { excused, kind, holds, others, why: candidate ? 'current candidate must pass merge-gate' : excused ? 'only candidacy or cleared shared-freeze holds' : 'real or absent blocking evidence' };
 }
 
+/**
+ * Review admission may consume the successful projection produced by excuseMergeGateRows.
+ * Bind its in-memory classification to the same job/head and retain its exact hold shape.
+ * A stale-freeze kind attests the classifier's fresh freeze/main-CI checks; it is not
+ * inferred from a red-main-freeze row here. Review-only annotations are never excusals.
+ */
+export function isBoundMergeGateExcusal(row, headSha) {
+  const proof = row?.mergeGateHoldExcused;
+  const jobId = Number(/\/actions\/runs\/\d+\/job\/(\d+)/.exec(row?.detailsUrl ?? row?.details_url ?? '')?.[1]);
+  if (row?.name !== 'merge-gate' || String(row.status).toLowerCase() !== 'completed'
+    || String(row.conclusion).toLowerCase() !== 'success' || !proof
+    || !Number.isSafeInteger(jobId) || jobId <= 0 || proof.jobId !== jobId
+    || typeof headSha !== 'string' || typeof proof.headSha !== 'string'
+    || proof.headSha.toLowerCase() !== headSha.toLowerCase()
+    || !Array.isArray(proof.holds) || !proof.holds.length || !Array.isArray(proof.holdIds)
+    || proof.holdIds.length !== proof.holds.length
+    || ![...proof.holds].every(hold => hold?.status === 'hold' && proof.holdIds.includes(hold.id)
+      && (isCandidacyHold(hold) || manualFreeze(hold)))) return false;
+  const candidacy = proof.holds.some(isCandidacyHold), freeze = proof.holds.some(manualFreeze);
+  return proof.kind === (freeze ? candidacy ? 'candidacy+stale-freeze' : 'stale-freeze' : 'candidacy');
+}
+
 /** Latest failing completed run only; success/pending supersedes all older failures. */
 export function latestFailingMergeGate(rows) {
   const row = collapseRollupToLatestPerName(rows).find(r => r.name === 'merge-gate');

@@ -1,9 +1,17 @@
 /** Strict review prerequisite: adapt the shared evidence contract to the review API. */
 import { resolveRequiredChecks } from './check-state-predicate.mjs';
+import { isBoundMergeGateExcusal } from './merge-gate-hold-class.mjs';
 
 export function reviewCiGate({ headSha, requiredChecks, checks, rowsHead = headSha, rowsComplete = false, rosterSource = 'live' } = {}) {
   // Bare rollup arrays carry no pagination proof; callers must attest completeness.
-  const result = resolveRequiredChecks({ rows: checks, rowsHead, rowsComplete, head: headSha, requiredNames: requiredChecks, rosterSource, allowImplication: true });
+  // Only review consumes the classifier's successful candidacy projection. Keep
+  // the original annotated rows for planner/merge consumers, which still see held CI.
+  const rows = Array.isArray(checks) ? checks.map(row => {
+    if (!isBoundMergeGateExcusal(row, headSha)) return row;
+    const { mergeGateHoldExcused, ...excused } = row;
+    return excused;
+  }) : checks;
+  const result = resolveRequiredChecks({ rows, rowsHead, rowsComplete, head: headSha, requiredNames: requiredChecks, rosterSource, allowImplication: true });
   const affected = Object.entries(result.perName).filter(([, r]) => r.state !== 'pass').map(([name, r]) => ({
     name, reason: r.reasons.includes('foreign-head') ? 'wrong-head' : r.reasons[0] ?? r.state,
   }));

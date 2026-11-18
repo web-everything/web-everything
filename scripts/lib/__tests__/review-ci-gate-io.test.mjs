@@ -7,6 +7,59 @@ import { readReviewCiGate as readGate, readReviewHead, readReviewChecks, formatR
 // Hermetic readers attest that these fixtures contain every page, as readReviewChecks does.
 const complete = rows => Object.defineProperty(rows, 'rowsComplete', { value: true });
 const readReviewCiGate = o => readGate({ policy: { startAfter: 'ci-green' }, ...o });
+
+describe('strict admission preserves classified merge-gate excusals', () => {
+  const sha = 'a'.repeat(40);
+  const merge = { name: 'merge-gate', id: 7, head_sha: sha, status: 'completed', conclusion: 'failure',
+    details_url: 'https://github.com/owner/repo/actions/runs/1/job/7' };
+  const test = { name: 'test', head_sha: sha, status: 'completed', conclusion: 'success' };
+  const io = (results, extra = {}) => ({ repo: 'owner/repo', pr: 1,
+    readHeadAndLabels: () => ({ headRefOid: sha, labels: ['review:pending'] }),
+    readChecks: () => complete([test, merge]), readRequired: () => ({ source: 'live', checks: ['test', 'merge-gate'] }),
+    mergeGateSetting: 'on', readMergeGateVerdict: () => ({ num: 1, head_sha: sha, ok: false, results }),
+    ...extra });
+  it.each([
+    ['candidate-label', 'not a candidate'], ['producer-certified', 'review owed'],
+    ['review-hold-labels', 'review pending'], ['review-acceptance', 'review owed'],
+    ['ledger', 'labels: review pending'], ['red-team', 'no red-team check run on head'],
+    ['red-team', 'red-team check run in progress or incomplete'],
+  ])('admits review after the real classifier excuses %s / %s', (id, reason) => {
+    const result = readReviewCiGate(io([{ id, status: 'hold', reason }]));
+    expect(result).toMatchObject({ allowed: true, reason: 'required-checks-successful', affected: [] });
+    expect(result.checks[1].mergeGateHoldExcused.kind).toBe('candidacy');
+  });
+  it.each([
+    [{ id: 'codeql', status: 'hold', reason: 'red' }],
+    [{ id: 'review-acceptance', status: 'fail-closed', reason: 'unreadable' }],
+    [{ id: 'red-team', status: 'hold', reason: 'red-team failed' }],
+    [{ id: 'test-gaming', status: 'hold', reason: 'human review owed' }],
+  ])('refuses unexcused merge-gate evidence %j', hold => {
+    expect(readReviewCiGate(io([hold])).allowed).toBe(false);
+  });
+  it('keeps candidate, feature-off, stale-head, incomplete and independent CI failures blocking', () => {
+    const holds = [{ id: 'review-acceptance', status: 'hold', reason: 'review owed' }];
+    for (const extra of [
+      { readHeadAndLabels: () => ({ headRefOid: sha, labels: ['ready-to-merge'] }) },
+      { mergeGateSetting: 'off' },
+      { readMergeGateVerdict: () => ({ num: 1, head_sha: 'b'.repeat(40), ok: false, results: holds }) },
+      { readChecks: () => [test, merge] },
+      { readChecks: () => complete([{ ...test, conclusion: 'failure' }, merge]) },
+      { readChecks: () => complete([test, merge, { ...merge, id: 8, status: 'in_progress', conclusion: null,
+        details_url: 'https://github.com/owner/repo/actions/runs/2/job/8' }]) },
+    ]) expect(readReviewCiGate(io(holds, extra)).allowed).toBe(false);
+  });
+  it.each([false, true])('preserves a proven cleared freeze excusal (with candidacy=%s)', candidacy => {
+    const results = [{ id: 'red-main-freeze', status: 'hold', reason: 'main is RED (freeze: manual freeze: operator)' },
+      ...(candidacy ? [{ id: 'review-acceptance', status: 'hold', reason: 'review owed' }] : [])];
+    const options = io(results, {
+      readMergeGateVerdict: () => ({ num: 1, head_sha: sha, ok: false, results,
+        mainCiGreen: true, completed_at: '2026-11-18T01:00:00Z' }),
+      readFreeze: () => ({ frozen: false, publishedAt: '2026-11-18T02:00:00Z' }),
+    });
+    expect(readReviewCiGate(options).allowed).toBe(true);
+    expect(readReviewCiGate({ ...options, readFreeze: () => ({ frozen: true }) }).allowed).toBe(false);
+  });
+});
 it('push requires both fast prerequisites, and discovers required checks for repos with no fast set', () => {
   const sha = 'a'.repeat(40);
   const row = name => ({ name, head_sha: sha, status: 'queued', conclusion: null });

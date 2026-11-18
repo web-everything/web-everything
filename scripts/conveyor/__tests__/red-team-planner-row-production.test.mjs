@@ -56,3 +56,13 @@ it('exposes scope-bloat folded by the normal not-a-ci-break escalation, without 
   expect(row.refusal.reviewRefusal).not.toHaveProperty('ciHealNotCiBreak');
   expect(plan.dispatch).toEqual([]);
 });
+
+it.each(['b'.repeat(40), undefined, null])('keeps snapshot provenance through the production planner (%s)', rowsHead => {
+  const raw = { ...source(), rowsHead };
+  const plan = runReconcilePass({ ...options(raw), readOnly: true });
+  const row = readPlannerRow({ pr, plan });
+  expect(row.absent).toBe(false);
+  expect(row.checkEvidence.state).toBe('unknown');
+  expect(row.reviewOwnedChecks).toMatchObject({ ci: { allowed: false }, onlyRed: false });
+  expect(plan.plannerRows[0].checkEvidence.state).toBe('unknown');
+});

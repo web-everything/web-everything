@@ -3,6 +3,36 @@ import { reviewCiGate } from '../review-ci-gate.mjs';
 const headSha = 'a'.repeat(40);
 const success = name => ({ name, status: 'completed', conclusion: 'success' });
 const gate = checks => reviewCiGate({ rowsComplete: true, headSha, requiredChecks: ['test', 'daemon-soak'], checks });
+
+describe('row-bound candidacy excusal', () => {
+  const hold = { id: 'review-acceptance', status: 'hold', reason: 'review owed' };
+  const annotation = { kind: 'candidacy', holds: [hold], holdIds: [hold.id], headSha, jobId: 7 };
+  const row = { ...success('merge-gate'), detailsUrl: 'https://github.com/o/r/actions/runs/1/job/7',
+    mergeGateHoldExcused: annotation };
+  const admit = (checks, extra = {}) => reviewCiGate({ headSha, rowsHead: headSha, rowsComplete: true,
+    requiredChecks: ['merge-gate'], checks, ...extra });
+  it('admits only the bound excused row without mutating evidence', () => {
+    expect(admit([row])).toMatchObject({ allowed: true, affected: [] });
+    expect(row.mergeGateHoldExcused).toBe(annotation);
+  });
+  it.each([
+    { jobId: 8 }, { jobId: null }, { headSha: 'b'.repeat(40) }, { headSha: null },
+    { holdIds: [] }, { holdIds: ['codeql'] }, { holds: [] }, { holds: null },
+    { holds: [{ ...hold, status: 'fail-closed' }] }, { kind: 'unknown' },
+    { holds: [{ id: 'red-team', status: 'hold', reason: 'red-team failed' }], holdIds: ['red-team'] },
+  ])('rejects stale or malformed excusal %j', invalid => {
+    expect(admit([{ ...row, mergeGateHoldExcused: { ...annotation, ...invalid } }]).allowed).toBe(false);
+  });
+  it('preserves pending, foreign-head, incomplete and separate failed-run evidence', () => {
+    expect(admit([{ ...row, status: 'in_progress', conclusion: null }]).allowed).toBe(false);
+    expect(admit([{ ...row, head_sha: 'b'.repeat(40) }]).allowed).toBe(false);
+    expect(admit([row], { rowsComplete: false }).allowed).toBe(false);
+    expect(admit([row, { ...success('merge-gate'), conclusion: 'failure' }]).allowed).toBe(false);
+    expect(admit([{ ...row, mergeGateHoldExcused: undefined, mergeGateReviewHold: annotation }]).allowed).toBe(true);
+    expect(admit([{ ...row, conclusion: 'failure', mergeGateHoldExcused: undefined,
+      mergeGateReviewHold: annotation }]).allowed).toBe(false);
+  });
+});
 describe('strict review CI prerequisite', () => {
   it('admits complete success, ignoring an advisory failure', () => {
     expect(gate([success('test'), success('daemon-soak'), { name: 'review-gate', status: 'completed', conclusion: 'failure' }]).allowed).toBe(true);

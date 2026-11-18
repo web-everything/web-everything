@@ -17,7 +17,9 @@ export function readPlannerRow({ pr, plan, refusals = plan?.refusals ?? [],
   const rawPr = rawPrs?.find(row => Object.is(Number(row?.number), Number(pr)));
   const checks = rawPr?.statusCheckRollup;
   // Preserve the normal gate's row-bound mergeGateReviewHold / mergeGateHoldExcused annotations.
-  const checkEvidence = resolveRequiredChecks({ rows: checks, rowsHead: rawPr?.headRefOid,
+  // The listing head may have moved since these checks were read. Missing snapshot
+  // provenance is unknown, even when individual rows happen to name the current head.
+  const checkEvidence = resolveRequiredChecks({ rows: checks, rowsHead: rawPr?.rowsHead ?? null,
     rowsComplete: rawPr?.rowsComplete === true, requiredNames: requiredChecks, rosterSource,
     head: refusal.headSha, holds: rawPr?.holds ?? plan?.holds });
   const { state, perName, reasons } = checkEvidence;
