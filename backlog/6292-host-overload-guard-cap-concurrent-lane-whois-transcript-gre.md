@@ -11,7 +11,7 @@ tags: []
 
 # Host overload guard: cap concurrent lane-whois transcript greps and git gc across lanes
 
-Live 2026-10-17 23:00-00:30 ET: host load ~98 on 12 cores, from `grep -hF -f lane-whois-patterns` over all ~/.claude/projects transcripts (we:scripts/lane-whois.mjs), several `git pack-objects` (gc), and vitest. It caused dispatch-smoke timeouts (431s and 468s) that rolled back the edge-loads of PR #5510 and PR #5551. [A1] Executable: a host-wide cap on concurrent lane-whois transcript greps and git gc runs, with a test that a second concurrent grep waits or refuses.
+Live 2026-10-17 23:00-00:30 ET: host load ~98 against the host core count, from `grep -hF -f lane-whois-patterns` over all ~/.claude/projects transcripts (we:scripts/lane-whois.mjs), several `git pack-objects` (gc), and vitest. It caused dispatch-smoke timeouts (431s and 468s) that rolled back the edge-loads of PR #5510 and PR #5551. [A1] Executable: a host-wide cap on concurrent lane-whois transcript greps and git gc runs, with a test that a second concurrent grep waits or refuses.
 
 ## Acceptance
 
