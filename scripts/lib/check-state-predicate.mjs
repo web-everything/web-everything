@@ -147,10 +147,11 @@ const evidenceJob = row => {
 // outcome categories, before legacy mapping or hold excusal rewrites evidence.
 // A present state has its own closed vocabulary, independent of conclusions.
 const knownEvidenceStates = new Set(['success', 'failure', 'error', 'pending', 'expected']);
+const hasConclusion = value => value != null && value !== '';
 const contradictoryEvidence = row => {
   const status = normalize(row?.status), state = normalize(row?.state);
   // Every conclusion is terminal, including outcomes that require a rerun.
-  if (row?.conclusion != null && ((status && status !== 'completed')
+  if (hasConclusion(row?.conclusion) && ((status && status !== 'completed')
     || ['pending', 'expected'].includes(state))) return true;
   if (status === 'completed' && ['pending', 'expected'].includes(state)) return true;
   const outcomes = [row?.status, row?.conclusion, row?.state].map(normalize).map(value => {
@@ -202,7 +203,7 @@ export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNa
     if ((row != null && Object.hasOwn(row, 'state') && !knownEvidenceStates.has(normalize(row.state)))
       || (row?.status !== undefined && !Object.hasOwn(CHECK_STATE_TABLE, normalize(row.status)))
       || contradictoryEvidence(row) || typeof name !== 'string' || !name.trim() || !Object.hasOwn(CHECK_STATE_TABLE, status)
-      || (row?.conclusion != null && !Object.hasOwn(CHECK_STATE_TABLE.completed, normalize(row.conclusion)))
+      || (hasConclusion(row?.conclusion) && !Object.hasOwn(CHECK_STATE_TABLE.completed, normalize(row.conclusion)))
       || (status === 'completed' && !Object.hasOwn(CHECK_STATE_TABLE.completed, conclusion) && !legacyError)) why.push('malformed');
     else if (status !== 'completed') { state = 'pending'; why.push('pending'); }
     else if (['cancelled', 'stale'].includes(conclusion) || (['review-gate', 'merge-gate'].includes(name) && ['timed_out', 'startup_failure', 'action_required'].includes(conclusion))) { state = 'pending'; why.push('needs-rerun'); }
