@@ -1416,14 +1416,15 @@ export function defaultReviewHostAdmission({ env = process.env, admission = host
 let redTeamDispatchQueue;
 const redTeamGateRetryHistory = new Map();
 let lastRedTeamQueueFloorLine;
-export function cliReviewTickOpts({ log = console, factCache = null } = {}) {
+export function cliReviewTickOpts({ log = console, factCache = null, listCommands } = {}) {
   const factsProvider = withFactsLabels(createGhProvider());
   return {
     log: line => log.error(line),
     acquirableLanes: defaultAcquirableLaneNumbers, recoveryAcquirableLanes: defaultRecoveryLaneNumbers,
     readPrs: factCache ? opts => defaultReadPrs({ ...opts, factCache }) : defaultReadPrs, readAgents: defaultReadAgents,
     hostAdmission: defaultReviewHostAdmission,
-    liveReviewBudget: liveReviewRoundBudget(),
+    // `listCommands` is a test seam: the default lists the host's real processes (`ps`), which a hermetic test must not.
+    liveReviewBudget: liveReviewRoundBudget(listCommands ? { listCommands } : {}),
     redTeamOnSkip: o => {
       let rawPrs = o.rawPrs;
       try {
