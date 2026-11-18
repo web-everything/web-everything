@@ -178,6 +178,7 @@ describe('plain snapshot provenance — oldest author snapshot and agreeing ids'
     ['mismatched backtick runs', '``<path>`'],
     ['multiline code span around balanced tag span', '`\n`<div>`\n`'],
     ['backtick inside comment hiding attribute', '<!-- ` --> <div data-note=" <!-- ` -->\n<x>\n">'],
+    ['cdata block hiding marker', '<![CDATA[\n`<path>`'],
     ['escaped backticks around a tag','\\`<details>\\`'],
     ['unclosed comment hiding a marker', '<!-- hidden\n'],
     ['unclosed comment inside inline code', '`<!-- hidden`\n'],

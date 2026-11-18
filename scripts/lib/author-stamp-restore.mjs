@@ -113,7 +113,11 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
     }
     // Tags can span lines and contain an apparently standalone stamp in an attribute.
     // Preserve snapshot-wide detection after exempting only validated inline spans.
-    if (/<\/?[a-z][^>]*>/i.test(ambiguousTicks ? edit.diff : htmlLines.join('\n'))) {
+    // Raw HTML constructs (CDATA, processing instructions, declarations, comments other than a bare stamp
+    // marker) open HTML blocks where backticks are not code: refuse them outright, outside code spans too.
+    const candidate = (ambiguousTicks ? edit.diff.split(/\r\n|[\r\n]/) : htmlLines)
+      .filter((l) => !/^<!--[ \t]*authored-by-actor:[^<>\r\n]*-->[^\S\r\n]*$/.test(l)).join('\n');
+    if (/<\/?[a-z][^>]*>/i.test(ambiguousTicks ? edit.diff : htmlLines.join('\n')) || /<[!?]/.test(candidate)) {
       return refusal('unsupported HTML edit snapshot; inspect complete GitHub history manually');
     }
     // GitHub lists newest first for equal timestamps: the later position is older.
