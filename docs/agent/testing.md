@@ -8,7 +8,17 @@
 the shared numbering proof, and main merges whose sensitive blobs match `origin/main`.
 Admission reads complete comments and live head/labels; missing or unreadable evidence retains
 the human hold. Successor proof is read-only, with 8 MiB per Git output and 1024 changed paths;
-exceeding either limit asks the operator to re-approve the current head or queue it.
+exceeding either limit asks the operator to re-approve the current head or queue it. All license
+and numbering Git reads share `numberingGitRunner`, which discovers and disables every promisor
+before reading objects, denies transports and lazy fetch, and isolates global config and replacement
+objects. Caller `exec` handles only GitHub evidence. The runner's `readFailed` flag blocks license
+fallback even when optional alias reads fail; only grep status 1 and config `--get-regexp` status 1
+mean absent optional evidence. Keep real missing/corrupt objects, output overflow, and marker-writing
+promisor helpers in the license/numbering suites. Drive the actual proofs through their internal runner
+seams with a spy wrapping real Git: assert every call's explicit 5-second timeout and exact 8 MiB
+output / 1 MiB numbering-blob caps, environment and pins. Replaying commands through factory defaults
+does not verify proof call sites. The structural AST test ignores comments and allows only the shared
+runner's Git process site and the license's `gh pr view`; its inline bypass samples must fail.
 `drain-merge-strategy.test.mjs` covers the setting-off refusal and best-effort `needs-you` event.
 Run these and `merge-queue-enqueue.test.mjs` through the host heavy-admission queue.
 
@@ -835,6 +845,12 @@ clearances remain confined to the explicitly requested numbering-only proof. Tes
 commits and changed trees through the writer, alongside refusal cases with zero writer calls.
 
 ## Human clearance across drain numbering
+
+`proveNumberingOnlyMove` owns its hardened local Git runner; its compatibility `exec` argument
+is ignored. Pass `cwd` explicitly through callers. Use real repositories and remove loose objects
+to test unreadable evidence; use Trace2 only to observe reads, never to replace them. Promisor
+regressions also run without `GIT_TRACE*` and assert no upload-pack marker is written. Missing
+objects refuse with `retryable: true`; restore local evidence before retrying.
 
 An approved human-surface head hold suppresses rebasing, never pending-card numbering before
 enqueue. Regress that preparation predicate with an approved human-only head carrying a hash card,
@@ -2164,9 +2180,13 @@ For 97/254, finishing on behalf requires a persisted numbered worker slot (`forg
 A run-less dead-owner marker keeps the existing zero-active and 120-minute-plus-skew orphan
 rules. R1017 also permits release when the marker is at least `RUNLESS_DEAD_GRACE_MS = 15 * 60_000`
 old and a fresh sample is at least that grace after first-seen-dead. Require `activeRunIds` and
-a parseable start in `recent` for EVERY active id, strictly outside the inclusive ownership
+a parseable start in `recent` for every unclaimed active id, strictly outside the inclusive ownership
 window `[marker.at - CLOCK_SKEW_MS, diedBy + CLOCK_SKEW_MS]`. Any in-window null-code or 97/254
 receipt retains the marker.
+Both the 15-minute and bounded-orphan checks skip active IDs bound to another marker in the
+same root (inline or owner-matched `.run` sidecar), whether its owner is live or dead. This
+permits recovery when that run has fallen out of the newest-50 receipt window. Unclaimed
+active IDs missing from `recent` still fail closed; receipt-window guards remain unchanged.
 
 The accepted residual risk is a request the dead client already dispatched that Forge starts
 MORE than 15 minutes after owner death. Observed start lag is about one minute; client SSH
@@ -2850,6 +2870,7 @@ head with them. Test an initially empty repository label catalog and a same-head
 age (using a recorded fixer push time when available), retaining its conflict, claim, head and retry-budget guards. The drain re-reads
 UNKNOWN listings before collecting head-bound context and also revalidates before
 merging, waiting for the configured delay at most three times per read stage.
+Before listing re-polls, a bounded REST GET trigger requests mergeability computation for up to ten unknown or empty candidates without changing their facts or classification.
 Hermetic drain CLI fixtures with synthetic UNKNOWN reads pin
 `WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC=0` while retaining the retry count and
 merge/hold assertions. Several read stages can otherwise exhaust a child-process
@@ -4551,3 +4572,45 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+## Review job exit evidence
+
+Review-job diagnostics use `diagnostics/<slug>.exit.json` and `diagnostics/<slug>.ended.json`,
+a subdirectory beside the live `<slug>.json` records so no valid slug can collide. Exit markers
+are usable only for the ended pid; SIGKILL cannot leave a marker. Keep missing/stale
+marker, redaction, bounded-tail and diagnostic-write-failure regressions in the scoped
+review-job and review-daemon suites.
+
+## Fast-drain round listing and live target refresh
+
+Catch-up children share the `--listing-snapshot` round file. Its default TTL is 60 seconds;
+`WE_FAST_DRAIN_LISTING_SNAPSHOT_TTL_SEC` retains the existing override. Publication time starts
+the TTL after the cold listing completes. Rows retain both PR number and head OID; the target
+row is replaced wholesale by a live read, so checks/body from an old head never carry forward.
+The writer stores the resolved default branch with the rows; readers reuse it in process. A
+historical snapshot missing the branch is upgraded under the same lock without listing again.
+
+Waiters retry while the writer owns a live heartbeat lease up to the unchanged overall
+180-second default deadline. At expiry they log an exact live-listing fallback
+without publishing over the writer's shared snapshot.
+The shared clone-lock primitive reclaims a dead PID or stale lease; the next writer refreshes
+the snapshot. Lock IO failures defer to the next pass with an explicit error rather than
+launching independent live listings.
+
+Round rows are candidate evidence only (`complete:false`), including within the 60-second TTL.
+Ordering context always re-lists live pages to discover newly opened blockers and implementation
+siblings, including context-only constellation repos. Candidate repos reuse `readLiveRows` and
+its hydrated heavy-field cache/shared host seed; cached fields require a matching live head and
+`updatedAt`. Default-branch reuse avoids a second branch read without substituting cached rows
+for live sibling discovery. Eviction reuses live context rows, or re-lists when reconcile is off.
+The target always comes from `readTarget` and passes through `resolveListedChecks`, never the
+snapshot's cached target row. Missing target readers throw instead of returning cached rows.
+The existing drain gates and enqueue-time live revalidation run unchanged.
+
+`fast-drain-round-lock.test.mjs` covers concurrent single-flight, a waiter within the 180-second deadline,
+exact live fallback at the overall deadline despite a heartbeating writer,
+stale-writer takeover, lock failure, historical branch upgrade, branch failure, TTL bounds,
+oversized/incomplete/foreign evidence, target head invalidation, snapshot exclusion from live context, and
+a live target replacing a stale cached target with a different head and red check.
+Run it with `fast-drain-scope.test.mjs` and `merge-ai-prs.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
+comparison against daemon observations; fixtures prove IO counts without live GitHub calls.

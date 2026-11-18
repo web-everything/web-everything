@@ -58,7 +58,7 @@ export const REVIEW_AUTH_FLOOR = Object.freeze([
 export const AUDITOR_FLOOR = Object.freeze(['scripts/operations/audit-verdict.mjs', 'scripts/operations/codex-audit*',
   'scripts/lib/audit-settings.mjs', 'scripts/lib/audit-path.mjs', 'scripts/lib/policy-cascade.mjs', 'scripts/settings/codex-audit.json',
   'scripts/settings/audit-scope.json',
-  'scripts/codex-direct-task.mjs']);
+  'scripts/codex-direct-task.mjs', 'scripts/lib/audit-finding-key.mjs', 'scripts/operations/audit-base-repro.mjs']);
 /** Modules the auditor imports or launches directly that no other floor entry names (the source-scan test pins each). */
 const AUDITOR_IMPORTS = Object.freeze(['scripts/lib/net-diff-fingerprint.mjs', 'scripts/lib/under-test.mjs',
   // The audit launcher's imports, and the transcript-check settings its policy reads.

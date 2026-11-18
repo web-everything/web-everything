@@ -1156,6 +1156,20 @@ function recordRemoteFallback({lockRoot, reason, detail = null, cwd, argv, env, 
   } catch { /* Observability must never prevent local admission. */ }
 }
 
+/** R830/R823: the reason a run executes locally when no remote attempt logged one. Pure. */
+export function localReasonFor({ useContainer = false, forceLocal = false, bypass = null, decisionReason = null } = {}) {
+  if (forceLocal) return 'local-flag';
+  if (useContainer) return 'local-container';
+  if (bypass) return `local-admission-${bypass}`;
+  if (decisionReason) return /load-unreadable/.test(decisionReason) ? 'local-load-unreadable'
+    : /remote\.enabled=false/.test(decisionReason) ? 'local-remote-disabled'
+    : /<=/.test(decisionReason) ? 'local-below-threshold' : 'local-by-policy';
+  return 'local-held-or-unrouted';
+}
+
+/** Logs a local-by-design run's reason into remote-fallbacks.jsonl (never throws). */
+export function recordLocalReason(args) { recordRemoteFallback(args); }
+
 /** Attempt remote execution before taking a local slot; remote is disabled by default.
  * Only { mode: 'remote', code: <integer 0..254> } exits with that code. Local admission requires
  * { mode: 'not-started', terminated: true } or { mode: 'cancelled', terminated: true }.
@@ -1642,7 +1656,7 @@ export function isAdmissionOff(env = process.env) {
 //
 // #4343 — NOT `load1/cores` ALONE ANY MORE. macOS `load1` counts RUNNABLE THREADS, and our own daemons
 // (cards 4344/4345/4346) start ~400 short-lived processes per second — a fork storm that inflates `load1` into
-// the 20s–60s on this 12-core host while CPU idle sits at 25–65% and memory is never under pressure (live
+// the 20s–60s on the host while CPU idle sits at 25–65% and memory is never under pressure (live
 // evidence on #4343's own card: 08:30 ET held on "load 21.24/12 (1.77 > 1.5)" while `top` read 29.6% idle).
 // The gate was holding dispatch on ITS OWN polling, not on real host saturation. The PRIMARY signal is now the
 // host-sampler's own `host.cpu.busy_pct` sample's `idle_pct` ATTRIBUTE (see `telemetry.mjs`'s own header: the
@@ -1659,7 +1673,7 @@ export function isAdmissionOff(env = process.env) {
 // confirm it directly) for a saturation shape idle% alone might miss (a true CPU-bound compute storm with
 // little forking). `load1` here is ALSO the median over the SAME window as idle% ({@link readLatestLoad}'s own
 // doc comment) — an earlier draft read a single instantaneous sample, which the card's own evidence (fork-storm
-// `load1` reaching the 20s–60s range on this 12-core host, i.e. up to ~5/core) shows can itself spuriously
+// `load1` reaching the 20s–60s range on the host, i.e. up to ~5/core) shows can itself spuriously
 // cross even this much-higher backstop threshold during an ordinary burst, reintroducing this very card's own
 // bug at a higher bar rather than closing it. The backstop's env var is its OWN new name
 // (`WE_LOAD_ADMISSION_BACKSTOP_PER_CORE`), never the OLD `WE_LOAD_ADMISSION_MAX_PER_CORE`: that name meant a
@@ -1833,7 +1847,7 @@ export function loadAdmissionDecision({
  *
  * `load1` is ALSO the MEDIAN over the same `window`, never a single instantaneous sample — deliberately, not an
  * oversight (#4343 review finding): the card's own evidence is that the fork-storm daemons this fix targets
- * push `load1` into the 20s–60s range on a 12-core host, i.e. up to ~5/core — ABOVE the new backstop's default
+ * push `load1` into the 20s–60s range on the host, i.e. up to ~5/core — ABOVE the new backstop's default
  * ratio (4) — so an unwindowed backstop reading could still spuriously hold on the exact burst this card exists
  * to stop admitting on, even while idle%/pressure are comfortable. Medianing it exactly like idle% closes that
  * gap: a brief fork-storm spike is absorbed, a SUSTAINED runaway (the #xupukxa cascade this backstop exists to
@@ -3260,6 +3274,10 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
     // Preflight may have chosen remote before policy/load changed or admission was bypassed.
     // Every local completion of that handoff still needs evidence of the first local verdict.
     let reportLocalExecution = forgeGate;
+    // R830/R823: every local run records WHY it is local. A remote-routed decision that fell back already logged its
+    // own reason; every other local path (decided local, --local, container, bypass) is logged below.
+    let remoteDecided = false;
+    let localDecisionReason = null;
     if (!useContainer && !forceLocal && ((!bypass && !process.env[ADMISSION_HELD_ENV]) || (bypass==='held' && forgeGate && !isAdmissionOff(process.env) && !/^(true|1)$/i.test(process.env.CI??'')))) {
       const requested=argv.slice(dashDashIdx+1);
       // package.json wraps the underlying executable, so reconstruct only the
@@ -3277,7 +3295,7 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
       const result = await runWithRemoteDecision({
         argv: remoteArgv, policy, cwd: repo ?? process.cwd(),
         env: process.env, remoteExec, readTelemetry, lockRoot, remoteClientOverride,
-        onDecision: decision => { reportLocalExecution ||= decision.remote; },
+        onDecision: decision => { reportLocalExecution ||= decision.remote; remoteDecided = decision.remote; localDecisionReason = decision.reason; },
         timeoutMs: runCeilingMs > 0 ? runCeilingMs : classifyAdmissionCommandKind(command, process.env) === 'files' ? resolveFastRunTimeoutMs(process.env) : ceilingMs,
       });
       if (result.handled) {
@@ -3315,6 +3333,8 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
     }
     const runOpts = { lockRoot, cap, owner, policy, lane: lane ?? (/lane-(\d+)/.exec(repo) || [])[1] ?? null, num, repo, ceilingMs, command, cwd: repo, bypass, kind: typeof flags.kind === 'string' ? flags.kind : null, waitMs, waitSource, runCeilingMs, ...(forceLocal ? { location: 'local' } : {}) };
     if (useContainer) runOpts.exec = (cmd, o) => execContainerized(cmd, { ...o, nodeModulesVolume: useNodeModulesVolume });
+    // A bypass (CI pass-through, held re-entry, admission off) takes no slot and records no duration, so it needs no reason.
+    if (!remoteDecided && !bypass) recordLocalReason({ lockRoot, reason: localReasonFor({ useContainer, forceLocal, bypass, decisionReason: localDecisionReason }), detail: localDecisionReason, cwd: repo ?? process.cwd(), argv: argv.slice(dashDashIdx + 1), env: process.env, clock: Date.now });
     const { exitCode } = await runUnderAdmission(runOpts);
     if (reportLocalExecution) appendVerifyRemoteReport(process.env, { location: 'local-fallback', exitCode });
     process.exit(exitCode);
