@@ -79,6 +79,23 @@ describe('R1017 run-less dead-owner recovery', () => {
     }});
     expect(await late.reaper.step(late.sample)).toEqual(['slot-0.unconfirmed']);
   });
+  it.each(['inline', 'sidecar', 'unclaimed'])('handles an active run absent from recent at 20 minutes: %s', async binding => {
+    const f = fixture({minutes: 20, change: t => {
+      t.activeRuns = 1; t.activeRunIds = [RUN_B]; t.recent = [];
+    }});
+    if (binding !== 'unclaimed') {
+      const other = join(f.root, 'slot-1.unconfirmed');
+      writeFileSync(other, markerContent({owner: 'other', pid: 222, host: 'forge', nowMs: NOW - 600_000,
+        run: binding === 'inline' ? RUN_B : undefined}));
+      utimesSync(other, (NOW - 600_000) / 1000, (NOW - 600_000) / 1000);
+      if (binding === 'sidecar') expect(recordMarkerRun(other, {owner: 'other', run: RUN_B})).toBe(true);
+      // Both owners are dead: bindings must be collected before filtering verdicts.
+    }
+    const released = binding !== 'unclaimed';
+    expect(await f.reaper.step(f.sample)).toEqual(released ? ['slot-0.unconfirmed'] : []);
+    expect(existsSync(f.file)).toBe(!released);
+    if (released) expect(existsSync(join(f.root, 'slot-1.unconfirmed'))).toBe(true);
+  });
   it.each([
     ['14 minutes', {minutes: 14}],
     ['possibly live owner', {state: 'unknown'}], ['live owner', {state: 'alive'}],
@@ -775,6 +792,25 @@ describe('bounded orphan release of run-less markers', () => {
     const {root, reaper} = make();
     expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1_000, [RUN_B], [unrelated]))).toEqual(['slot-0.unconfirmed']);
     expect(names(root)).toEqual([]);
+  });
+  it.each(['inline', 'sidecar', 'unclaimed'])('handles an active run absent from recent past the orphan bound: %s', async binding => {
+    const {root, reaper} = make();
+    // No dispatch timestamp: the 15-minute grace cannot settle this marker.
+    const file = join(root, 'slot-0.unconfirmed'), marker = JSON.parse(readFileSync(file, 'utf8'));
+    delete marker.at;
+    writeFileSync(file, JSON.stringify(marker));
+    utimesSync(file, (NOW - 600_000) / 1000, (NOW - 600_000) / 1000);
+    if (binding !== 'unclaimed') {
+      const other = join(root, 'slot-1.unconfirmed');
+      writeFileSync(other, markerContent({owner: 'other', pid: 222, host: 'forge', nowMs: NOW - 600_000,
+        run: binding === 'inline' ? RUN_B : undefined}));
+      if (binding === 'sidecar') expect(recordMarkerRun(other, {owner: 'other', run: RUN_B})).toBe(true);
+      // PID 222 is alive: its binding must still count.
+    }
+    const released = binding !== 'unclaimed';
+    expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1_000, [RUN_B]))).toEqual(released ? ['slot-0.unconfirmed'] : []);
+    expect(existsSync(file)).toBe(!released);
+    if (released) expect(existsSync(join(root, 'slot-1.unconfirmed'))).toBe(true);
   });
   it('keeps it when the sample is not yet past the run ceiling plus skew after the owner was first seen dead', async () => {
     const {root, reaper} = make();

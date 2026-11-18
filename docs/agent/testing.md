@@ -2164,9 +2164,13 @@ For 97/254, finishing on behalf requires a persisted numbered worker slot (`forg
 A run-less dead-owner marker keeps the existing zero-active and 120-minute-plus-skew orphan
 rules. R1017 also permits release when the marker is at least `RUNLESS_DEAD_GRACE_MS = 15 * 60_000`
 old and a fresh sample is at least that grace after first-seen-dead. Require `activeRunIds` and
-a parseable start in `recent` for EVERY active id, strictly outside the inclusive ownership
+a parseable start in `recent` for every unclaimed active id, strictly outside the inclusive ownership
 window `[marker.at - CLOCK_SKEW_MS, diedBy + CLOCK_SKEW_MS]`. Any in-window null-code or 97/254
 receipt retains the marker.
+Both the 15-minute and bounded-orphan checks skip active IDs bound to another marker in the
+same root (inline or owner-matched `.run` sidecar), whether its owner is live or dead. This
+permits recovery when that run has fallen out of the newest-50 receipt window. Unclaimed
+active IDs missing from `recent` still fail closed; receipt-window guards remain unchanged.
 
 The accepted residual risk is a request the dead client already dispatched that Forge starts
 MORE than 15 minutes after owner death. Observed start lag is about one minute; client SSH
