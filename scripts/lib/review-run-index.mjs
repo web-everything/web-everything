@@ -54,8 +54,19 @@ function listing(runsDir, list, stat) {
     return { id, mtimeMs, identity };
   });
 }
+function readRecord(runsDir, id) {
+  const parsed = parseRunRecord(readFileSync(join(runsDir, `${id}.json`), 'utf8'));
+  if (!parsed.ok) throw Error(parsed.reason);
+  return parsed.record;
+}
+function recordKey(record, id) {
+  const key = keyOf(record?.input?.repo, record?.input?.pr);
+  if (record?.id !== id || record.op !== 'review-pr' || !key) throw Error('unverified backfill record');
+  return key;
+}
 export function readReviewRunIndex(runsDir, repo, pr, {
   list = listReviewIds, stat = id => statSync(join(runsDir, `${id}.json`)),
+  read = id => readRecord(runsDir, id),
 } = {}) {
   try {
     const path = reviewRunIndexPath(runsDir), index = load(path), proof = index.completeness;
@@ -67,10 +78,15 @@ export function readReviewRunIndex(runsDir, repo, pr, {
       || JSON.stringify(proof.poisons) !== JSON.stringify(poisonNames(path))) return [];
     const seen = new Map(proof.files.map(row => [row.id, JSON.stringify(row)]));
     const indexed = new Map(rows.map(row => [row.id, row.mtimeMs]));
+    let unknownReads = 0;
     for (const row of listing(runsDir, list, stat)) {
       if (indexed.get(row.id) === row.mtimeMs) continue;
-      // Also reject absent ids with old/coarse mtimes: a failed poison write cannot hide them.
-      if (seen.get(row.id) !== JSON.stringify(row) || row.mtimeMs > proof.completeThroughMtimeMs) return [];
+      if (seen.get(row.id) === JSON.stringify(row) && row.mtimeMs <= proof.completeThroughMtimeMs) continue;
+      // Unknown includes replacements at the same mtime. Never infer ownership from
+      // a stale key. The caller shares these reads with its bounded fallback scan.
+      if (unknownReads++ >= 20) return [];
+      if (recordKey(read(row.id), row.id) === key) return [];
+      if (JSON.stringify(row) !== JSON.stringify(listing(runsDir, () => [row.id], stat)[0])) return [];
     }
     if (JSON.stringify(proof.poisons) !== JSON.stringify(poisonNames(path))) return [];
     return rows.map(row => row.id);
@@ -131,46 +147,68 @@ export function appendReviewRunIndex(record, runsDir, mtimeMs) {
  */
 export function backfillReviewRunIndex({ runsDir, repo, openPrs, maxParses = 50,
   list = listReviewIds,
-  read = id => {
-    const parsed = parseRunRecord(readFileSync(join(runsDir, `${id}.json`), 'utf8'));
-    if (!parsed.ok) throw Error(parsed.reason);
-    return parsed.record;
-  }, stat = id => statSync(join(runsDir, `${id}.json`)), warn = message => console.warn(message) } = {}) {
+  read = id => readRecord(runsDir, id),
+  stat = id => statSync(join(runsDir, `${id}.json`)), now = Date.now,
+  warn = message => console.warn(message) } = {}) {
   const path = reviewRunIndexPath(runsDir), statePath = `${path}.backfill`;
   try {
     if (!Number.isSafeInteger(maxParses) || maxParses < 1 || maxParses > 300) throw Error('invalid backfill budget');
     const keys = [...openPrs].map(pr => repo ? keyOf(repo, pr) : pr).filter(Boolean).sort();
     if (keys.length > MAX_KEYS) throw Error('open PR set oversized; inspect omitted runs manually');
-    const signature = JSON.stringify(keys), wanted = new Set(keys);
     mkdirSync(dirname(path), { recursive: true });
     return withFileLock(`${path}.lock`, () => {
       let state;
       try { state = readJson(statePath); } catch { /* start a pass */ }
       const files = listing(runsDir, list, stat);
-      if (state?.signature !== signature || !validEntries(state.entries) || typeof state.after !== 'string'
-        || JSON.stringify(state.files) !== JSON.stringify(files)) {
-        state = { signature, after: '', entries: {}, files, poisons: poisonNames(path) };
+      if (Buffer.byteLength(JSON.stringify(files)) > MAX_BYTES) throw Error('review index snapshot oversized; inspect omitted runs manually');
+      if (state?.version !== 3 || !Array.isArray(state.verified) || !state.blocked
+        || typeof state.blocked !== 'object' || Array.isArray(state.blocked) || !Array.isArray(state.poisons)
+        || new Set(state.verified.map(row => row?.id)).size !== state.verified.length
+        || !state.verified.every(row => reviewId(row?.id) && Number.isFinite(row.mtimeMs)
+          && Array.isArray(row.identity) && row.identity.length === 5 && keyOf(...String(row.key).split('#')))) {
+        state = { version: 3, verified: [], blocked: {}, poisons: poisonNames(path) };
       }
-      const ids = files.map(row => row.id).filter(id => id > state.after);
-      const batch = ids.slice(0, maxParses);
-      for (const id of batch) {
-        const record = read(id), key = keyOf(record?.input?.repo, record?.input?.pr);
-        if (record?.id !== id || record.op !== 'review-pr' || !key) throw Error('unverified backfill record');
-        if (wanted.has(key)) add(state.entries, key, { id, mtimeMs: stat(id).mtimeMs });
-        state.after = id;
+      const snapshots = new Map(files.map(row => [row.id, JSON.stringify(row)]));
+      state.verified = state.verified.filter(({ key, ...row }) => snapshots.get(row.id) === JSON.stringify(row));
+      for (const [id, blocked] of Object.entries(state.blocked)) {
+        if (snapshots.get(id) !== blocked.snapshot) delete state.blocked[id];
       }
-      const complete = batch.length === ids.length;
+      const verified = new Set(state.verified.map(row => row.id));
+      const batch = files.filter(row => !verified.has(row.id)
+        && !(state.blocked[row.id]?.retryAt > now())).slice(0, maxParses);
+      let parsed = 0;
+      for (const row of batch) {
+        try {
+          parsed++;
+          const key = recordKey(read(row.id), row.id);
+          if (JSON.stringify(row) !== JSON.stringify(listing(runsDir, () => [row.id], stat)[0])) throw Error('review record changed during read');
+          state.verified.push({ ...row, key });
+          delete state.blocked[row.id];
+        } catch (error) {
+          state.blocked[row.id] = { snapshot: JSON.stringify(row), retryAt: now() + 60_000 };
+          writeBounded(statePath, state);
+          warn(`review run index backfill blocked at ${row.id}: ${error.message}; bounded scan still applies; HOLD on scan-capped and inspect omitted runs`);
+          return { complete: false, parsed };
+        }
+      }
+      const complete = state.verified.length === files.length && Object.keys(state.blocked).length === 0;
       if (complete) {
-        if (JSON.stringify(files) !== JSON.stringify(listing(runsDir, list, stat))) throw Error('review listing changed during backfill');
+        if (JSON.stringify(files) !== JSON.stringify(listing(runsDir, list, stat))) {
+          writeBounded(statePath, state);
+          throw Error('review listing changed during backfill');
+        }
         // Replace, rather than merge, every rebuilt key. Only this complete pass clears poison.
-        const entries = Object.fromEntries(keys.map(key => [key, state.entries[key] ?? []]));
+        const entries = {};
+        const wanted = new Set(keys);
+        for (const { id, mtimeMs, key } of state.verified) if (wanted.has(key)) add(entries, key, { id, mtimeMs });
+        for (const key of keys) entries[key] ??= [];
         const completeThroughMtimeMs = files.reduce((max, row) => Math.max(max, row.mtimeMs), 0);
         writeBounded(path, { version: 2, entries,
           completeness: { keys, files, completeThroughMtimeMs, poisons: state.poisons } });
-        state = { signature, after: '', entries: {} };
+        state = {};
       }
       writeBounded(statePath, state);
-      return { complete, parsed: batch.length };
+      return { complete, parsed };
     }, { timeoutMs: 0 });
   } catch (error) {
     warn(`review run index backfill unavailable: ${error.message}; bounded scan still applies; HOLD on scan-capped and inspect omitted runs`);
