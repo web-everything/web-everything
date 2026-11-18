@@ -8,10 +8,11 @@ import { CONFIRMED_BREAKS_DEFAULTS, parseRedTeamComment, redTeamResultId, redTea
 
 import { reviewConcluded as reviewConcludedIo, deriveReviewStatus, describeReviewState, planStatusLabelChange, tagReviewStatus as tagReviewStatusIo, applyReviewStatus, STATUS_LABEL_RE } from '../review-status-tag.mjs';
 const readConfirmedBreaks = () => ({ value: { ...CONFIRMED_BREAKS_DEFAULTS, findingClasses: {} } });
+const readSealedStatus = () => null;
 const reviewConcluded = (labels, subject, pr = subject?.number, options = {}) =>
-  reviewConcludedIo(labels, subject, pr, { readConfirmedBreaks, ...options });
+  reviewConcludedIo(labels, subject, pr, { readConfirmedBreaks, readSealedStatus, ...options });
 const tagReviewStatus = (options) => tagReviewStatusIo({
-  readConfirmedBreaks, signalFix: () => {}, readRequiredChecks: () => ({ checks: undefined }), loadStatusSettings: () => { throw new Error('settings unavailable'); },
+  readConfirmedBreaks, readSealedStatus, signalFix: () => {}, readRequiredChecks: () => ({ checks: undefined }), loadStatusSettings: () => { throw new Error('settings unavailable'); },
   ...options,
 });
 
@@ -642,6 +643,31 @@ describe('concluded head review with a lingering process', () => {
   it('allows complete advisory evidence without any gate record', () => {
     expect(reviewConcluded(accepted, { ...subject, comments: [comment] })).toEqual({ createdAt: comment.createdAt });
   });
+  it.each(['unreadable', 'thrown'])('keeps reviewing when sealed evidence is %s despite clear comments', failure => {
+    const reads = [];
+    const result = tagReviewStatus({ pr: 7099, repo: 'we', agents: [row], prState: subject,
+      currentLabels: [...accepted, 'review-status:reviewing'], readFixClaim: () => null,
+      readSealedStatus: ({ repo, pr, head }) => {
+        reads.push({ repo, pr, head });
+        if (failure === 'thrown') throw new Error('sealed evidence unavailable');
+        return { unreadable: true };
+      },
+      provider: { ensureLabel: () => {}, setLabels: () => {} },
+    });
+    expect(result.label).toBe('review-status:reviewing');
+    expect(reads).toEqual([{ repo: 'web-everything/web-everything', pr: 7099, head: headRefOid }]);
+  });
+  it('keeps reviewing when a carried verdict source has an unreadable seal', () => {
+    const from = 'b'.repeat(40), reads = [];
+    const origin = { ...comment, body: comment.body.replace(headRefOid, from) };
+    const carried = { ...comment, body: `<!-- review-verdict-carried from=${from} to=${headRefOid} patch-id=${'c'.repeat(40)} -->\nReview verdict carried across an identical contribution.\n${comment.body}` };
+    const evidence = reviewConcluded(accepted, { ...subject, comments: [origin, carried] }, 7099, {
+      readSealedStatus: ({ head }) => { reads.push(head); return head === from ? { unreadable: true } : null; },
+    });
+    expect(evidence).toBe(false);
+    expect(reads).toEqual([headRefOid, from]);
+    expect(derive({}, { reviewConcluded: evidence })?.state).toBe('reviewing');
+  });
   it('keeps reviewing on incomplete advisory evidence, including a newest incomplete result', () => {
     const incomplete = { ...comment, createdAt: new Date(now - 150_000).toISOString(), body: comment.body.split('\n')[0] };
     for (const comments of [[gate, incomplete], [gate, comment, incomplete]]) {
@@ -683,6 +709,11 @@ describe('concluded head review with a lingering process', () => {
     const evidence = reviewConcluded(accepted, { ...subject, comments: [degraded, card] });
     expect(evidence).toEqual({ createdAt: degraded.createdAt });
     expect(derive({}, { reviewConcluded: evidence })).toBeNull();
+  });
+  it('keeps reviewing for a confirmed degraded finding until its follow-up card is queued', () => {
+    const evidence = reviewConcluded(accepted, { ...subject, comments: [findingResult('degraded')] });
+    expect(evidence).toBe(false);
+    expect(derive({}, { reviewConcluded: evidence })?.state).toBe('reviewing');
   });
   it('keeps reviewing when the confirmed-break policy read fails', () => {
     const evidence = reviewConcluded(accepted, subject, 7099, {

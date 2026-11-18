@@ -27,7 +27,8 @@
  * migrate; `legacyReviewStatus:false` removes them except the durable `review-status:draft-withdrawn` hold.
  */
 import { signalFixDispatch } from '../lib/fix-handoff.mjs';
-import { redTeamResultCommentForHead, gateOutcomesForHead, liveResultGateState, planRedTeamActions, readConfirmedBreaks, isPublishableRedTeamResult, redTeamResultId } from '../lib/red-team-gate.mjs';
+import { redTeamResultCommentForHead, gateOutcomesForHead, liveResultGateState, planRedTeamActions, readConfirmedBreaks, readRedTeamDisposition, redTeamGateOwed, isPublishableRedTeamResult, redTeamResultId } from '../lib/red-team-gate.mjs';
+import { readSealedStatus } from '../lib/red-team-sealed-status.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { excusePrMergeGateHolds, readMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
@@ -37,7 +38,7 @@ import { loadPrStatusSettings, prStatusSettingValues } from './pr-status-setting
 import { latestCiHealEscalationForHead } from './ci-heal-escalation-mark.mjs';
 import { mintSessionSlug } from './session-slug.mjs';
 import { readLiveFixClaim, FIX_DRAFT_REASONS } from './fix-procedure.mjs';
-import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
+import { repoKeyForSlug, ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -100,7 +101,7 @@ export const STATUS_LABEL_RE = /^review-status:(reviewing|review-stalled|fixing|
 const LIVE_STATES = Object.freeze({ working: 'reviewing', blocked: 'stalled' });
 
 /** Head-bound acceptance is complete only with an unambiguous red-team clearance. */
-export function reviewConcluded(labels, subject, pr = subject?.number, { readConfirmedBreaks: readPolicy = readConfirmedBreaks } = {}) {
+export function reviewConcluded(labels, subject, pr = subject?.number, { readConfirmedBreaks: readPolicy = readConfirmedBreaks, readSealedStatus: readSeal = readSealedStatus, repo = subject?.repo ?? ghRepoSlug('we') } = {}) {
   const head = subject?.headRefOid;
   if (!Number.isSafeInteger(Number(pr)) || Number(pr) <= 0
     || !Array.isArray(labels) || typeof head !== 'string' || !/^[a-f0-9]{40}$/i.test(head)) return false;
@@ -116,8 +117,11 @@ export function reviewConcluded(labels, subject, pr = subject?.number, { readCon
     || !Number.isFinite(timestampMs(evidence.comment.createdAt))) return false;
   try {
     const policy = readPolicy({ strict: true });
-    if (!policy?.value || planRedTeamActions(evidence.parsed, policy.value).sendBack.length) return false;
-    const state = liveResultGateState(comments, pr, head);
+    if (!policy?.value) return false;
+    const disposition = readRedTeamDisposition({ comments, pr, head, repo, setting: policy.value, readSealedStatus: readSeal });
+    if (disposition.held.length || disposition.sendBack.length) return false;
+    const state = liveResultGateState(comments, pr, head, repo);
+    if (redTeamGateOwed(state, planRedTeamActions(evidence.parsed, policy.value))) return false;
     const outcomes = gateOutcomesForHead(comments, pr, head);
     if (!state.resultId || state.resultId !== redTeamResultId(evidence.parsed)
       || state.reopened || state.sendBackOutcome
@@ -305,6 +309,7 @@ export function tagReviewStatus({
   requiredChecks, prStatusSettings, signalFix = signalFixDispatch,
   readRequiredChecks = readCachedRequiredChecks, loadStatusSettings = loadPrStatusSettings,
   readConfirmedBreaks: readBreakPolicy = readConfirmedBreaks,
+  readSealedStatus: readSeal = readSealedStatus,
   excuseMergeGate = (pr, { repo }) => excusePrMergeGateHolds([pr], {
     repo, readMergeGateVerdict: args => readMergeGateVerdict({ ...args }), readFreeze: readSharedFreeze,
   })[0],
@@ -320,7 +325,7 @@ export function tagReviewStatus({
   const escalation = latestCiHealEscalationForHead(subject?.comments, subject?.headRefOid);
   const currentLabels = suppliedLabels ?? provider.readLabels(repo, pr);
   const status = deriveReviewStatus({ pr, agents, repo: repoKey, isDraft: isDraft ?? subject?.isDraft ?? false,
-    baseRefName: baseRefName ?? subject?.baseRefName, defaultBranch, mergeConflicted, fixClaim, escalation, reviewConcluded: prState != null && reviewConcluded(currentLabels, subject, pr, { readConfirmedBreaks: readBreakPolicy }) });
+    baseRefName: baseRefName ?? subject?.baseRefName, defaultBranch, mergeConflicted, fixClaim, escalation, reviewConcluded: prState != null && reviewConcluded(currentLabels, subject, pr, { readConfirmedBreaks: readBreakPolicy, readSealedStatus: readSeal, repo: ghRepoSlug(repoKey) }) });
   const plan = legacyReviewStatus ? planStatusLabelChange({ status, currentLabels }) : {
     add: null,
     remove: currentLabels.map((l) => typeof l === 'string' ? l : l?.name)

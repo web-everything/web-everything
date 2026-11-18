@@ -37,11 +37,14 @@ export default {
     const carried = { ...broken, body: `<!-- review-verdict-carried from=${'b'.repeat(40)} to=${headRefOid} patch-id=${'c'.repeat(40)} -->\nReview verdict carried across an identical contribution.\n${broken.body}` };
     const degraded = { ...broken, body: broken.body.replace('broken', 'degraded') };
     const card = { ...gate, body: `<!-- we:red-team-gate pr=7099 rev=${headRefOid} outcome=card-queued result=${redTeamResultId(parseRedTeamComment(degraded.body))} -->` };
-    for (const [verdict, expectedReview, expectedStatus, prFields = {}, agentFields = {}, standalone = false] of [
+    for (const [verdict, expectedReview, expectedStatus, prFields = {}, agentFields = {}, standalone = false, readSeal = () => null] of [
       [accepted, null, 'ready-to-merge'],
+      [accepted, 'reviewing', 'red-team', {}, {}, false, () => ({ unreadable: true })],
+      [accepted, 'reviewing', 'red-team', {}, {}, false, () => { throw new Error('sealed evidence unavailable'); }],
       [accepted, 'reviewing', 'red-team', { comments: [broken] }],
       [accepted, 'reviewing', 'red-team', { comments: [...comments, carried] }],
       [accepted, null, 'ready-to-merge', { comments: [degraded, card] }],
+      [accepted, 'reviewing', 'red-team', { comments: [degraded] }],
       [accepted, 'reviewing', 'red-team', {}, {}, true],
       [accepted, 'reviewing', 'red-team', { comments: [newer, olderGate, advisory] }],
       [accepted, 'reviewing', 'red-team', { comments: [...comments,
@@ -89,6 +92,7 @@ export default {
           startedAt: now - 600_000, ...agentFields }],
         ...(standalone ? {} : { prState: snapshot }),
         readConfirmedBreaks: () => ({ value: { ...CONFIRMED_BREAKS_DEFAULTS, findingClasses: {} } }),
+        readSealedStatus: readSeal,
         readFixClaim: () => null, planRows: [], requiredChecks: ['test'],
         prStatusSettings: { acceptedRedTeamStatus: 'red-team' }, signalFix: () => {},
       });

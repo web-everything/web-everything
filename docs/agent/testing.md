@@ -4667,6 +4667,9 @@ incomplete-newest-advisory, stale-result-id and standalone cases in
 `review-status-tag.test.mjs` and the `concluded-review-lingering-process` soak break.
 Read results through `redTeamResultCommentForHead` (including trusted verdict carries) and
 use the holding comment's creation time. Publishability alone does not establish clearance:
-`planRedTeamActions` must yield no send-back under the live confirmed-break policy, and
-`liveResultGateState` must agree with the result id and allowed gate outcomes. Inject the
-policy reader in fixtures; an unreadable policy preserves the reviewing hold.
+Use `readRedTeamDisposition` for the entire hold/send-back decision, including sealed stored
+evidence, and `redTeamGateOwed(liveResultGateState(...), planRedTeamActions(...))` to require
+queued follow-up cards before clearance. `liveResultGateState` must agree with the result id
+and allowed gate outcomes. Inject policy and sealed-status readers in fixtures; unreadable
+evidence preserves the reviewing hold. Pass the sealed-status reader through the canonical
+disposition reader so every head in a verdict carry chain is checked.

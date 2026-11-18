@@ -875,8 +875,9 @@ export function redTeamBreaksAgree({ comments, pr, head, breaks } = {}) {
  * the head's persisted status, so no caller reads the flag or the thread on its own. {@link redTeamHoldDecision} turns it
  * into ONE held finding (index 0, which no real finding uses) whenever the stored evidence holds a confirmed break that the
  * posted comment does not show in full: the result is never read as clear while it stands. `legacyHold` forces the same hold.
+ * `readSealedStatus` is injectable for hermetic callers; the reader still checks every head in the carry chain.
  */
-export function readRedTeamDisposition({ comments, pr, head, setting, env = process.env, repo = null, standingRuling = null, operatorRulings, legacyHold = false, sealed } = {}) {
+export function readRedTeamDisposition({ comments, pr, head, setting, env = process.env, repo = null, standingRuling = null, operatorRulings, legacyHold = false, sealed, readSealedStatus: readSeal = readSealedStatus } = {}) {
   const live = String(head ?? '').toLowerCase();
   const records = indexedRecords(comments);
   const result = latestResult(records, pr, live)?.parsed ?? null;
@@ -1000,7 +1001,7 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     const sealEnv = { ...process.env, ...(env ?? {}) };
     // The sweep seals these source heads too (seal only), so an unsealed source cannot hold a carried head forever.
     seals = [live, ...redTeamCarrySources({ comments, pr, head: live })]
-      .map(h => readSealedStatus({ repo, pr, head: h, env: sealEnv }));
+      .map(h => readSeal({ repo, pr, head: h, env: sealEnv }));
   }
   const holds = seals.map(s => ({ seal: s, ...redTeamHoldDecision({ comments, pr, head: live, sealed: s }) })).filter(h => h.held);
   // A conflict outranks "publication pending": report the pending-only hold only when no seal holds for a stronger reason.
