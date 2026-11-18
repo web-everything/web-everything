@@ -611,7 +611,7 @@ export async function prepareRebuild({
           if (last.evidence?.contentInMain === false || last.evidence?.cleanMerges === false) return false;
           const retiredMs = Date.parse(last.at || '');
           const readyMs = Date.parse(ready.at ?? ready.passedAt ?? '');
-          return Number.isFinite(retiredMs) && Number.isFinite(readyMs) && retiredMs <= readyMs;
+          return Number.isFinite(retiredMs) && Number.isFinite(readyMs) && retiredMs < readyMs;
         },
         // R508: a forced record is only adoptable while its rollback watch is intact (read under this write lock).
         forcedWatch: (sha) => forcedWatchStatus(root, stEnv, sha),
