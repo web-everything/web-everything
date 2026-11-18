@@ -1,4 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
+import { dispatchPlan, projectBuildQueueRow } from '../../../scripts/readiness/dispatch-plan.mjs';
+import { shapeQueue } from '../../../scripts/readiness/conveyor-state.mjs';
 import { planTick } from '../../../scripts/conveyor/tick-core.mjs';
 import { runBuildDispatchTick, buildPriorityLog } from '../build-dispatch-daemon.mjs';
 import { BUILD_DISPATCH_POLICY } from '../../../scripts/conveyor/build-dispatch-policy.mjs';
@@ -177,4 +179,40 @@ describe('runtime-only build dispatch', () => {
     expect(nums(out.nextState.prepareGuards)).toContain('7201');
     expect(nums(out.nextState.buildGuards)).toContain('8001');
   });
+});
+
+it('runtime-only removes an unlisted epic child before lane and rival-scope assignment', () => {
+  const queue = [
+    { num: '7000', kind: 'epic' },
+    { num: '7001', parent: '7000', kind: 'task', scope: ['we:scripts/shared.mjs'] },
+    { num: '8001', kind: 'task', scope: ['we:scripts/shared.mjs'] },
+  ];
+  const settings = only(['7000', '8001']);
+  const plan = dispatchPlan({ queue, leases: [], freeLanes: [20, 21], buildPriority: settings });
+  const out = planTick({ state: { queue }, plan, freeLanes: [20, 21], config: { buildPriority: settings } });
+  expect(nums(out.decisions.spawnBuilds)).toEqual(['8001']);
+  expect(plan.held).toEqual([{ num: '7000', reason: 'needs-slice' }]);
+});
+
+it.each(['build', 'prepare'])('durable bornAs alias survives the %s planning and daemon filters', async kind => {
+  const row = { ...builds[0], id: '8001-renamed', bornAs: 'xabcdef0' };
+  const settings = only(['xabcdef0']);
+  const data = input(settings, {
+    state: { queue: [row], lanes: [], prs: [] },
+    plan: kind === 'build' ? { launch: [{ num: row.num, lane: 20 }], held: [] }
+      : { launch: [], held: [{ num: row.num, reason: 'needs-prepare' }] },
+  });
+  const out = planTick(data);
+  expect(nums(kind === 'build' ? out.decisions.spawnBuilds : out.decisions.spawnPrepareItems)).toEqual(['8001']);
+  const tick = await runBuildDispatchTick({ live: true, effects: effectsFor(out), policy, buildPriority: settings });
+  expect(nums(kind === 'build' ? tick.dispatched : tick.prepare.launched)).toEqual(['8001']);
+  expect(projectBuildQueueRow(row, row)).toMatchObject({ bornAs: row.bornAs, id: row.id });
+  expect(shapeQueue([row])[0]).toMatchObject({ bornAs: row.bornAs, id: row.id });
+});
+
+it.each([only([]), { ...only(['xabcdef0']), held: true }])('dispatch assignment fails closed for runtime settings %j', buildPriority => {
+  const plan = dispatchPlan({ queue: [{ num: '8001', bornAs: 'xabcdef0', scope: ['scripts/shared.mjs'] }],
+    leases: [], freeLanes: [20, 21], buildPriority });
+  expect(plan.launch).toEqual([]);
+  expect(plan.held).toEqual([]);
 });

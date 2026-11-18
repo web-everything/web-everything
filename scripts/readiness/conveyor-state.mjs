@@ -102,6 +102,8 @@ export function shapeQueue(buildQueue, clearedNums = null) {
   const classEnforced = !Array.isArray(buildQueue) && buildQueue?.priorityMode === 'enforce';
   return rows.map((r) => ({
     num: r?.num != null ? String(r.num) : null,
+    ...(r?.id != null ? { id: r.id } : {}),
+    ...(r?.bornAs != null ? { bornAs: r.bornAs } : {}),
     rank: r?.rank ?? null,
     ...(Number.isFinite(r?.buildPriority) ? { buildPriority: r.buildPriority } : {}),
     // Card 80 — the build-queue tier (`pinned` first), read by the prepare-ahead window. Omitted when absent.

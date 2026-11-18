@@ -109,8 +109,8 @@ export function readBuildPrioritySettings({ env = process.env, read = readSettin
 export function filterIdsToRuntimeOnly(ids, settings) {
   if (settings.held) return [];
   if (!settings.only) return ids;
-  const allowed = new Set(settings.ids);
-  return ids.filter(id => allowed.has(id));
+  const allowed = new Set(settings.ids.map(normalizePriorityNum));
+  return ids.filter(id => allowed.has(normalizePriorityNum(id)));
 }
 
 /** PURE: top id eligible for an extra NEW prepare slot, or null. Never affects in-flight work.
@@ -414,7 +414,7 @@ export function orderQueueDetailed(items, config = DEFAULT_CONFIG, now = Date.no
   return ready;
 }
 
-const normalizePriorityNum = value => String(value).replace(/^0+(?=\d)/, '');
+const normalizePriorityNum = value => String(value).replace(/^#/, '').replace(/^0+(?=\d)/, '');
 function buildPriorityAliases(item) {
   const stem = String(item.id ?? '').split('-')[0];
   return [item.num == null ? null : normalizePriorityNum(item.num), item.bornAs,
@@ -554,9 +554,13 @@ function clamp01(v) { return Math.max(0, Math.min(1, v)); }
 function cmp(a, b) { return a < b ? -1 : a > b ? 1 : 0; }
 function item_dateKey(it) { return String(it.dateOpened ?? ''); }
 
-/** Filter candidate rows with the runtime allowlist; unrestricted rows retain identity. */
-export function filterRuntimeCandidates(rows, settings = {}) {
+/** Filter direct priority aliases; `candidates` supplies metadata for num-only plan rows. Unrestricted rows retain identity. */
+export function filterRuntimeCandidates(rows, settings = {}, candidates = rows) {
   if (!settings.only && !settings.held) return rows;
-  const allowed = new Set(filterIdsToRuntimeOnly(rows.map(r => String(r.num).replace(/^#/, '')), settings));
-  return rows.filter(r => allowed.has(String(r.num).replace(/^#/, '')));
+  if (settings.held) return [];
+  const allowed = new Set(settings.ids.map(normalizePriorityNum));
+  const byNum = new Map(candidates.map(r => [normalizePriorityNum(r.num), r]));
+  // Plan/hold rows carry only num; recover their direct aliases, never ancestor membership.
+  return rows.filter(r => buildPriorityAliases({ ...byNum.get(normalizePriorityNum(r.num)), ...r })
+    .some(alias => allowed.has(normalizePriorityNum(alias))));
 }

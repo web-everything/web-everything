@@ -150,7 +150,7 @@
 import { planningRead, PLANNING_SNAPSHOT_ENV } from '../lib/planning-snapshot.mjs';
 import { childFailure } from '../lib/child-failure.mjs';
 import { mintSessionSlug } from './session-slug.mjs';
-import { filterRuntimeCandidates } from '../lib/build-queue.mjs';
+import { filterRuntimeCandidates as filterCandidates } from '../lib/build-queue.mjs';
 import { normNum } from './queue-store.mjs';
 import { capToConcurrency, resolveMaxConcurrentLanes } from '../lib/lane-concurrency.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
@@ -1279,6 +1279,7 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
     .map(([num, timestamps]) => [num, recentPrepareRefusals(timestamps, refusalNow)])
     .filter(([, timestamps]) => timestamps.length > 0));
   const { queue = [], unshaped = [], needsSlice = [], decisions = [], lanes = [], prs = [], health = {}, infraBlocked = [] } = state;
+  const filterRuntimeCandidates = (rows, settings) => filterCandidates(rows, settings, queue);
   // #3567 — the `needs-investigation` holds, read straight off THIS TICK's dispatch plan (not off `state`, the
   // way `unshaped`/`decisions` are): an investigation has no separate state-derivation step (no `prepared`
   // flag to persist), so a freshly-clearable SPAWN candidate is simply "held `needs-investigation` this tick"

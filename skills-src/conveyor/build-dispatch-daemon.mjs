@@ -35,7 +35,7 @@ import { planPrepareBatches, prepareAheadNums } from '../../scripts/conveyor/bui
 import { isLanePreparePrFor, isPreparePrFor, prepareLaunchRefusal, recentMergedPrepare } from '../../scripts/conveyor/prepare-pr-match.mjs';
 import { readBuilderPrCapSettings } from '../../scripts/lib/open-pr-cap-scope.mjs';
 import { readPreparePolicy } from '../../scripts/conveyor/prepare-policy-settings.mjs';
-import { readBuildPrioritySettings, filterRuntimeCandidates } from '../../scripts/lib/build-queue.mjs';
+import { readBuildPrioritySettings, filterRuntimeCandidates as filterCandidates } from '../../scripts/lib/build-queue.mjs';
 import { readBuildGroupingSettings, formatBuildGroupingLine, planBuildGroups, retireMemberWhy } from '../../scripts/conveyor/build-grouping.mjs';
 import { retryTransientGit } from '../../scripts/lib/git-fetch-retry.mjs';
 import { PLANNING_SNAPSHOT_ENV, planningRead } from '../../scripts/lib/planning-snapshot.mjs';
@@ -607,6 +607,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const tickAt = new Date(effects.now?.() ?? Date.now()).toISOString();
   const d = out?.decisions || {};
   const admission = d.admission || {};
+  const filterRuntimeCandidates = (rows, settings) => filterCandidates(rows, settings, admission.queue ?? []);
   const scopeByNum = new Map((admission.queue || []).map((r) => [normNum(r.num), Array.isArray(r.scope) ? r.scope : []]));
   const clearedNums = new Set((admission.cleared || []).map((r) => normNum(r.num)));
   const rawOpenPrs = await effects.fetchOpenPrs();

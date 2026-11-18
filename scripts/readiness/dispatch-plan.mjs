@@ -76,6 +76,7 @@
  * codified in a sibling statute PR).
  */
 
+import { filterRuntimeCandidates, readBuildPrioritySettings } from '../lib/build-queue.mjs';
 import { planningRead } from '../lib/planning-snapshot.mjs';
 import { childFailure } from '../lib/child-failure.mjs';
 import { getCachedVerdict, readAlreadyDoneCacheState, resolveAlreadyDoneCacheStorePath,
@@ -445,6 +446,7 @@ function hasOpenBlockers(item) {
  *                   FORMAT check on self-attested frontmatter, not a verified/signed claim — it proves the field
  *                   is well-formed, never that a real prepare pass happened. This is a card lacking DoR
  *                   (Definition of Ready), never "not sized yet" (that is `no-size`'s own, separate axis).
+ * Runtime `buildPriority` restricts direct candidate aliases before lane/scope assignment; held settings admit nothing.
  * @returns {{ launch: Array<{num, lane, sized?:boolean}>, held: Array<{num, reason:string}> }}
  *   `launch` — the SCOPED items to start now, each on the free lane it was assigned, in rank order. An UNSCOPED
  *              item is NEVER launched (it is held `unshaped-no-scope` for the skill to auto-prepare). `sized` is
@@ -452,13 +454,14 @@ function hasOpenBlockers(item) {
  *              `false` when it launched on the `default-size` fallback.
  *   `held`   — every other queued item with its single reason ∈ {@link HELD_REASONS}.
  */
-export function dispatchPlan({ queue, leases, freeLanes, driftBlockedScope, driftGraduationItem, maxConcurrentLanes = Infinity, dispatchPaused = false, dispatchPausedKinds = null, sizePolicy = null, preparePolicy = null, prLimitHeld = false, trace = false } = {}) {
+export function dispatchPlan({ queue, buildPriority = {}, leases, freeLanes, driftBlockedScope, driftGraduationItem, maxConcurrentLanes = Infinity, dispatchPaused = false, dispatchPausedKinds = null, sizePolicy = null, preparePolicy = null, prLimitHeld = false, trace = false } = {}) {
   // The pause is per-KIND now, and this core only ever decides ONE kind: `build`. Resolving the marker's
   // declared scope through the shared predicate (rather than reading the raw boolean) is what makes an
   // old-format `{paused:true}` — and every caller that still passes only the boolean — keep holding builds,
   // while `--kinds=fix` alone leaves builds launching.
   const buildPaused = resolvePausedKinds({ paused: dispatchPaused === true, pausedKinds: dispatchPausedKinds }).includes('build');
-  const items = Array.isArray(queue) ? queue.filter((it) => it && typeof it === 'object') : [];
+  // Runtime membership must precede every lane and scope decision.
+  const items = filterRuntimeCandidates(Array.isArray(queue) ? queue.filter((it) => it && typeof it === 'object') : [], buildPriority);
   const activeLeases = (Array.isArray(leases) ? leases : [])
     .filter((l) => l && typeof l === 'object')
     .map((l) => ({ lane: l.lane ?? null, scope: normScope(l.scope) }));
@@ -833,6 +836,8 @@ export function parseFreeLanes(raw) {
 export function projectBuildQueueRow(r, it) {
   return {
     num: r.num,
+    ...(it?.id != null ? { id: it.id } : {}),
+    ...(it?.bornAs != null ? { bornAs: it.bornAs } : {}),
     // `kind` drives the epic → `needs-slice` hold (#2645): a container is never built. Absent when the loader
     // failed to load (the catch above) — then it reads as non-epic and falls through to the scope gate, a SAFE
     // degradation (an unscoped epic still holds `unshaped-no-scope` rather than launching to build).
@@ -1187,7 +1192,7 @@ async function main(argv) {
 
   // #xupukxa — the concurrency ceiling, env-overridable exactly like heavy-admission.mjs's own cap knob.
   const maxConcurrentLanes = resolveMaxConcurrentLanes(process.env);
-  const plan = dispatchPlan({ queue, leases, freeLanes, driftBlockedScope, driftGraduationItem, maxConcurrentLanes, dispatchPaused, dispatchPausedKinds, sizePolicy, preparePolicy, prLimitHeld, trace: true });
+  const plan = dispatchPlan({ queue, buildPriority: readBuildPrioritySettings(), leases, freeLanes, driftBlockedScope, driftGraduationItem, maxConcurrentLanes, dispatchPaused, dispatchPausedKinds, sizePolicy, preparePolicy, prLimitHeld, trace: true });
   // Surface cleared-but-not-ready ids as held entries so a clear never silently vanishes (#2613 review, 2b).
   plan.groundTruth = groundTruth;
   // 78c — each read's own wall time (they overlap). Observation only; the decision never reads it.

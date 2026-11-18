@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
-import { readBuildPrioritySettings, filterIdsToRuntimeOnly, extraPrepareSlot } from '../build-queue.mjs';
+import { readBuildPrioritySettings, filterIdsToRuntimeOnly, filterRuntimeCandidates, extraPrepareSlot } from '../build-queue.mjs';
 import { resolveCoordinationRoot } from '../../operations/coordination-root.mjs';
 
 const now = Date.parse('2026-11-17T12:00:00Z');
@@ -147,4 +147,18 @@ describe('runtime build priority', () => {
   it('invalid env cannot bypass a malformed runtime hold', () => {
     expect(read(null, { env: { ...options.env, WE_BUILD_PRIORITY: 'bad' } }).held).toBe(true);
   });
+});
+
+it.each([
+  [{ num: '8001', bornAs: 'xabcdef0' }, 'xabcdef0'],
+  [{ num: '#008001' }, '8001'],
+  [{ num: '8001', id: 'xabcdef0-title' }, 'xabcdef0'],
+])('runtime candidate filtering accepts direct priority aliases %j', (row, alias) => {
+  const settings = read({ ...record, ids: [alias] });
+  expect(filterRuntimeCandidates([row], settings)).toEqual([row]);
+  expect(filterRuntimeCandidates([row], { ...settings, held: true })).toEqual([]);
+  expect(filterRuntimeCandidates([row], read(null))).toEqual([]);
+  expect(filterRuntimeCandidates([row], read({ ...record, ids: [alias] }, {
+    env: { ...options.env, WE_BUILD_PRIORITY: '9999' },
+  }))).toEqual([]);
 });

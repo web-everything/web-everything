@@ -4623,3 +4623,8 @@ the original queues for retiring existing guards. Filter the prepare group pool 
 are new work even when their lead is allowed. The runtime top ID obeys the configured prepare concurrency, light concurrency guard,
 and prepare-ahead window; listing it grants no additional capacity. Malformed runtime evidence holds new work and logs the
 operator fallback (repair or remove the runtime file). Lift/no-file output stays unchanged.
+
+Runtime-only build-priority regressions live in `scripts/lib/__tests__/build-priority-runtime.test.mjs`
+and `skills-src/conveyor/__tests__/build-dispatch-runtime-only.test.mjs`. Filter direct card aliases
+before dispatch lane/scope assignment; a listed ancestor lifts priority but does not grant membership.
+Keep `bornAs` and id metadata through queue projections so num-only build/prepare plans retain direct alias membership.
