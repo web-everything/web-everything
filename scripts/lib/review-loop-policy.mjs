@@ -441,8 +441,8 @@ export function preventionGuardAnchor(f) {
 }
 
 /**
- * DOES THIS FILED CARD'S TEXT ALREADY CARRY THIS GUARD? PURE (PR #2766 advisory). Compares with every locus
- * prefix removed, because the digest's locus pass rewrites bare paths inside a no-file guard's text; a no-file
+ * DOES THIS FILED CARD'S TEXT ALREADY CARRY THIS GUARD? PURE (PR #2766 advisory). Preserves repo identity,
+ * applying only the digest's locus pass to bare paths inside a no-file guard's text; a no-file
  * anchor must also end its line, so the text `z` never matches a card line `… — zebra`.
  *
  * @param {string} cardText
@@ -450,9 +450,9 @@ export function preventionGuardAnchor(f) {
  * @returns {boolean}
  */
 export function cardCoversGuard(cardText, f) {
-  const strip = (s) => String(s).replace(new RegExp(String.raw`(?<![\w-])(?:${LOCUS_PREFIX_RE_SOURCE}):`, 'g'), '');
-  const anchor = strip(preventionGuardAnchor(f));
-  return `${strip(cardText)}\n`.includes(cleanFindingFile(f) ? anchor : `${anchor}\n`);
+  const file = cleanFindingFile(f);
+  const anchor = file ? preventionGuardAnchor(f) : qualifyLocusRefs(preventionGuardAnchor(f));
+  return `${String(cardText)}\n`.includes(file ? anchor : `${anchor}\n`);
 }
 
 /** Where a filed-prevention entry is filed from, for a reader of the pool who has never heard of this operation. */

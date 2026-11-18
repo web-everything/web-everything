@@ -46,6 +46,26 @@ const readOnPr = (file, pr) => readCardAtPrHead(file, pr, { run: fakeGh });
 const ok = ref => referralCardReadable(ref, root, { readOnPr });
 
 describe('referralCardReadable @pr<N> (xc7ctn1)', () => {
+  it.each([
+    'title: "a multiline title\nstatus: open\nend"',
+    "title: 'a multiline title\nstatus: open\nend'",
+    'title: |\n  status: open',
+    'title: >\n  status: open',
+    'nested:\n  status: open',
+    '  status: open',
+    'title: "unterminated\nstatus: open',
+  ])('refuses a longshore card without a real top-level status: %s', frontmatter => {
+    expect(referralCardReadable('longshore:backlog/xabcdef-card.md@pr7', root, {
+      readOnPr: () => `---\n${frontmatter}\n---\n# card\n`,
+    })).toBe(false);
+  });
+
+  it.each(['open', '"active"', "'parked' # waiting", 'resolved'])('accepts a real longshore top-level status: %s', status => {
+    expect(referralCardReadable('longshore:backlog/xabcdef-card.md@pr7', root, {
+      readOnPr: () => `---\ntitle: |\n  status: unknown\nstatus: ${status}\n---\n# card\n`,
+    })).toBe(true);
+  });
+
   it.each(['null', 'throw', 'no frontmatter'])('resolves a merged, renumbered PR card through bornAs when the PR read returns %s', failure => {
     const landedRoot = mkdtempSync(join(tmpdir(), 'card-landed-'));
     const readOnPr = vi.fn(() => {

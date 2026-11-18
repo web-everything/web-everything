@@ -2,6 +2,7 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
+import yaml from 'js-yaml';
 
 /** A card reference: `we:backlog/<file>.md`, optionally `@pr<N>` = "the card as it stands on PR N's head" (xc7ctn1). */
 // The file name is a strict alphabet (every backlog file already fits it): it is spliced into a local path AND a GitHub
@@ -18,6 +19,15 @@ const PR_NUMBER_RE = new RegExp(`^${PR_DIGITS}$`);
 const CARD_REPO = CONSTELLATION_REPOS.we.slug;
 const CARD_BASE = 'main'; // a card only "will land" if its PR targets the branch the backlog is read from
 const hasFrontmatter = text => /^---\r?\n[\s\S]+?\r?\n---\r?\n/.test(text);
+
+function hasTopLevelStatus(text) {
+  const frontmatter = /^---\r?\n([\s\S]+?)\r?\n---\r?\n/.exec(text)?.[1];
+  if (!frontmatter || !/^status:/m.test(frontmatter)) return false;
+  // Parse scalar boundaries rather than mistaking a quoted title's continuation for a key.
+  const data = yaml.safeLoad(frontmatter, { schema: yaml.FAILSAFE_SCHEMA });
+  return data != null && Object.hasOwn(data, 'status')
+    && ['open', 'active', 'preparing', 'parked', 'resolved', 'closed', 'folded'].includes(data.status);
+}
 
 /**
  * Default reader for a card on a PR: PR state + head sha, then the file at THAT sha, through gh. Throws on failure
@@ -49,7 +59,7 @@ export function referralCardReadable(ref, root = process.cwd(), { readOnPr = rea
     try {
       const text = (prefix === 'we' ? readOnPr(file, pr) : readOnPr(file, pr, { repo })) ?? '';
       // A longshore card is read remotely only, so require a real card (a known `status:` value), not just a delimiter pair.
-      if (hasFrontmatter(text) && (prefix === 'we' || /^status:[ \t]*["']?(?:open|active|preparing|parked|resolved|closed|folded)["']?[ \t]*(?:#.*)?$/m.test(text.split(/\r?\n---\r?\n/)[0]))) return true;
+      if (hasFrontmatter(text) && (prefix === 'we' || hasTopLevelStatus(text))) return true;
     } catch { /* try the published WE card */ }
     if (prefix !== 'we') return false;
     const born = BORN_RE.exec(file)?.[1];

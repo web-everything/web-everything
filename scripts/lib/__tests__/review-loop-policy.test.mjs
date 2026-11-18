@@ -1481,6 +1481,18 @@ describe('preventionGuardAnchor — the per-guard duplicate key (PR #2766 adviso
 describe('cardCoversGuard — does a filed card already carry this guard? (PR #2766 self-review)', () => {
   const cardFor = (findings) => `# t\n\n${buildPreventionFilingInput({ repo: 'o/r', pr: 1, findings }).digest}\n\n## Done when\n`;
 
+  it('a longshore citation never covers a WE guard at the same path and line', () => {
+    const card = '`longshore:scripts/a.mjs:12` — add a check\n';
+    expect(cardCoversGuard(card, { file: 'we:scripts/a.mjs', line: 12, prevention: 'add a check' })).toBe(false);
+    expect(cardCoversGuard(card, { file: 'scripts/a.mjs', line: 12, prevention: 'add a check' })).toBe(false);
+  });
+
+  it('a no-file guard preserves explicit repo citations while normalizing bare digest paths', () => {
+    const f = { prevention: 'add a check in we:scripts/x.mjs', preventionCaptured: false };
+    expect(cardCoversGuard(cardFor([f]), f)).toBe(true);
+    expect(cardCoversGuard(cardFor([{ ...f, prevention: 'add a check in longshore:scripts/x.mjs' }]), f)).toBe(false);
+  });
+
   it('a no-file guard whose text names a path is found again, after the digest\'s locus pass rewrote that path', () => {
     const f = { prevention: 'add a check in scripts/x.mjs', preventionCaptured: false };
     const card = cardFor([f]);
