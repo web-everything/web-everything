@@ -10,7 +10,7 @@ tags: []
 
 # pid-alive probe returns not-alive on any non-EPERM error (should be unknown); red-team status records keyed by hostname break on a Mac rename
 
-2026-11-13. The pid-alive helper (we:scripts/lib/pid-alive.mjs, line 24) returns not-alive on any non-EPERM probe error; it should return unknown. Separately, red-team status records keyed by hostname break when the Mac renames (MacBook-Pro.local to Mac); add a host alias or machine id.
+2026-11-13. The pid-alive helper (we:scripts/lib/pid-alive.mjs, line 24) returns not-alive on any non-EPERM probe error; it should return unknown. Separately, red-team status records keyed by hostname break when the Mac renames (previous-host.local to primary-host); add a host alias or machine id.
 
 ## Acceptance
 

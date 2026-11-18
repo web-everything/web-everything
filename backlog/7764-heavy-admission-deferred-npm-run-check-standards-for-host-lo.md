@@ -8,9 +8,9 @@ dateOpened: "2026-11-02"
 tags: []
 ---
 
-# heavy-admission DEFERRED `npm run check:standards` for host load (84/12 cores > 6/core) in lane-2 while heavyA
+# heavy-admission DEFERRED `npm run check:standards` for host load (84/host core count > 6/core) in lane-2 while heavyA
 
-HIGH priority hint. - [HIGH 2026-10-31 10:40 ET] heavy-admission DEFERRED `npm run check:standards` for host load (84/12 cores > 6/core) in lane-2 while heavyAdmission.remote.mode=always and Forge idle (~1). Overload should route remote, not defer; check order of load-cap vs remote decision and whether check:standards is on the remote allowlist. Prove on a lane run under load.
+HIGH priority hint. - [HIGH 2026-10-31 10:40 ET] heavy-admission DEFERRED `npm run check:standards` for host load (84/host core count > 6/core) in lane-2 while heavyAdmission.remote.mode=always and Forge idle (~1). Overload should route remote, not defer; check order of load-cap vs remote decision and whether check:standards is on the remote allowlist. Prove on a lane run under load.
 
 ## Acceptance
 

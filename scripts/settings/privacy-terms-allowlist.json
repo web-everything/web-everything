@@ -1,0 +1,2287 @@
+{
+  "operatorUsernameSha256": [
+    "cb89fdbcb4b894166b90fca32c9a56935d21f27c40f0f8c1611ee46240dc80d5"
+  ],
+  "entries": [
+    {
+      "path": "scripts/lib/__tests__/daemon-jobs-runtime.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "MacBook",
+      "matchSha256": "ac92e7613044a45682e8cf01eb2471d084016fe18aa1c112e2898474663a1d47",
+      "lineSha256": "a291a19b4d0e09856ed1435f951f967175b40e164be12cd7345a80c20404f3af",
+      "reason": "Synthetic hostname aliases exercise cross-host process identity; R971 preserves these fixtures."
+    },
+    {
+      "path": "scripts/lib/__tests__/daemon-jobs-runtime.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "MacBook",
+      "matchSha256": "ac92e7613044a45682e8cf01eb2471d084016fe18aa1c112e2898474663a1d47",
+      "lineSha256": "669126140ae5c87051bf75e0ea9688324e14fd7ae2d137133ef63a27fbd2752c",
+      "reason": "Synthetic hostname aliases exercise cross-host process identity; R971 preserves these fixtures."
+    },
+    {
+      "path": "scripts/lib/__tests__/daemon-jobs-runtime.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "MacBook",
+      "matchSha256": "ac92e7613044a45682e8cf01eb2471d084016fe18aa1c112e2898474663a1d47",
+      "lineSha256": "3bb38dea944fbc50add2501b31896d4a41513db2574265387730c0dce9576a7d",
+      "reason": "Synthetic hostname aliases exercise cross-host process identity; R971 preserves these fixtures."
+    },
+    {
+      "path": "scripts/lib/__tests__/daemon-jobs-runtime.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "MacBook",
+      "matchSha256": "ac92e7613044a45682e8cf01eb2471d084016fe18aa1c112e2898474663a1d47",
+      "lineSha256": "6001a98dbfea9c8124287b69d2f526345920f38d24516e31d7ecf52db7aed26e",
+      "reason": "Synthetic hostname aliases exercise cross-host process identity; R971 preserves these fixtures."
+    },
+    {
+      "path": "scripts/lib/__tests__/daemon-jobs-runtime.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "MacBook",
+      "matchSha256": "ac92e7613044a45682e8cf01eb2471d084016fe18aa1c112e2898474663a1d47",
+      "lineSha256": "e8212e95fa11e88b677b504d61ce05e61284067c829b510dcf8c52cd3771c564",
+      "reason": "Synthetic hostname aliases exercise cross-host process identity; R971 preserves these fixtures."
+    },
+    {
+      "path": "scripts/lib/__tests__/daemon-jobs-runtime.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "MacBook",
+      "matchSha256": "ac92e7613044a45682e8cf01eb2471d084016fe18aa1c112e2898474663a1d47",
+      "lineSha256": "d1024d93c6b559841969090a9c4d7120794f72fed703d89ccc3668ed24113102",
+      "reason": "Synthetic hostname aliases exercise cross-host process identity; R971 preserves these fixtures."
+    },
+    {
+      "path": "scripts/lib/__tests__/daemon-jobs-runtime.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "MacBook",
+      "matchSha256": "ac92e7613044a45682e8cf01eb2471d084016fe18aa1c112e2898474663a1d47",
+      "lineSha256": "15e9d540870847e4f0b0bb8fa25d2a5e097a1666ca69b019604493883c6fd08c",
+      "reason": "Synthetic hostname aliases exercise cross-host process identity; R971 preserves these fixtures."
+    },
+    {
+      "path": "scripts/lib/__tests__/daemon-jobs-runtime.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "MacBook",
+      "matchSha256": "ac92e7613044a45682e8cf01eb2471d084016fe18aa1c112e2898474663a1d47",
+      "lineSha256": "dfe419ece4acd7ebc16345671b4df8a93f12fc97f283dd20518e7cbb0eda93e8",
+      "reason": "Synthetic hostname aliases exercise cross-host process identity; R971 preserves these fixtures."
+    },
+    {
+      "path": "scripts/lib/__tests__/daemon-jobs-runtime.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "MacBook",
+      "matchSha256": "ac92e7613044a45682e8cf01eb2471d084016fe18aa1c112e2898474663a1d47",
+      "lineSha256": "d315f6dceee8816aaaf8644733cab6df9a86650614694ef3cb70500089d0fbc8",
+      "reason": "Synthetic hostname aliases exercise cross-host process identity; R971 preserves these fixtures."
+    },
+    {
+      "path": "scripts/lib/__tests__/daemon-jobs-runtime.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "MacBook",
+      "matchSha256": "ac92e7613044a45682e8cf01eb2471d084016fe18aa1c112e2898474663a1d47",
+      "lineSha256": "e92e8a74c93e5cd40e6f71a3508812be363a340a121ad5ced78c2f980d8d687b",
+      "reason": "Synthetic hostname aliases exercise cross-host process identity; R971 preserves these fixtures."
+    },
+    {
+      "path": "scripts/lib/__tests__/daemon-jobs-runtime.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "MacBook",
+      "matchSha256": "ac92e7613044a45682e8cf01eb2471d084016fe18aa1c112e2898474663a1d47",
+      "lineSha256": "29237d2d88de24a1e491118a4c04f38ca0445357a90fd06ac917b3b1822396ec",
+      "reason": "Synthetic hostname aliases exercise cross-host process identity; R971 preserves these fixtures."
+    },
+    {
+      "path": "scripts/lib/__tests__/daemon-jobs-runtime.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "MacBook",
+      "matchSha256": "ac92e7613044a45682e8cf01eb2471d084016fe18aa1c112e2898474663a1d47",
+      "lineSha256": "e85889a29c0ffab8b1e1c7bf3d9a0052b5dc92e0ca1bc6902545b8d03865f9db",
+      "reason": "Synthetic hostname aliases exercise cross-host process identity; R971 preserves these fixtures."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "Mac Studio",
+      "matchSha256": "3636a04dba0914ab0750bd92928ca8cb21166e537d320d29fd8d2d738ad44d73",
+      "lineSha256": "eddf0eefd007dda6feaa9fd65bdacbe4e787b4cdd9bf734d65e0bfa77b58a99d",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "MacStudio",
+      "matchSha256": "f5c399a7b834d102a24d8e63d5bedcd963a2a52e0770df65ea650250635a4eec",
+      "lineSha256": "eddf0eefd007dda6feaa9fd65bdacbe4e787b4cdd9bf734d65e0bfa77b58a99d",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "Studio host",
+      "matchSha256": "1d04e2fc8e514bb975d908529be45ec43a80a8ed2eaf02c55642ad705b001ad9",
+      "lineSha256": "eddf0eefd007dda6feaa9fd65bdacbe4e787b4cdd9bf734d65e0bfa77b58a99d",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "MacBook",
+      "matchSha256": "ac92e7613044a45682e8cf01eb2471d084016fe18aa1c112e2898474663a1d47",
+      "lineSha256": "eddf0eefd007dda6feaa9fd65bdacbe4e787b4cdd9bf734d65e0bfa77b58a99d",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "Mac mini",
+      "matchSha256": "b85cef81cd7ba015449fbf196e58aad826b64ff4049029670b77121648695d80",
+      "lineSha256": "eddf0eefd007dda6feaa9fd65bdacbe4e787b4cdd9bf734d65e0bfa77b58a99d",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "mac studio",
+      "matchSha256": "9f893fcc020070b14a9cb9cd74e70950708ed896e9abb9f203bf826b3310fccf",
+      "lineSha256": "10382e679ddc94c58d5d4a3d1674aa0f05ed3a968b23275c793245894d5e53fa",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "Mac mini",
+      "matchSha256": "b85cef81cd7ba015449fbf196e58aad826b64ff4049029670b77121648695d80",
+      "lineSha256": "fb468efd529f2fce5c29af489cb25f75f9aa8ccb465993dc37e0d2bfd5777a3c",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "MacBook",
+      "matchSha256": "ac92e7613044a45682e8cf01eb2471d084016fe18aa1c112e2898474663a1d47",
+      "lineSha256": "b9c383fd6d4b69936ce702b01a9b2d7b2d36bb5ba6691bdcb2035d17c2867eeb",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "Mac Studio",
+      "matchSha256": "3636a04dba0914ab0750bd92928ca8cb21166e537d320d29fd8d2d738ad44d73",
+      "lineSha256": "c87a9a94bf30419865008553b5b01c804daf8709d833f8dee0c70fad11bff303",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "MacBook",
+      "matchSha256": "ac92e7613044a45682e8cf01eb2471d084016fe18aa1c112e2898474663a1d47",
+      "lineSha256": "f7c338e63a14cdde12360dcfab5bbe2ded69e78935d698faafff7930d6f1c36a",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "MacBook",
+      "matchSha256": "ac92e7613044a45682e8cf01eb2471d084016fe18aa1c112e2898474663a1d47",
+      "lineSha256": "aa7b82f761e9f15d10ffd09d3086711b33bc065eba2cced8a6fcce597055d4a1",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "MacBook",
+      "matchSha256": "ac92e7613044a45682e8cf01eb2471d084016fe18aa1c112e2898474663a1d47",
+      "lineSha256": "4753569aaa9ae4e08e358b771e05b4ed5b631044f5cb26217bd5d8f333f7b63b",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "MacBook",
+      "matchSha256": "ac92e7613044a45682e8cf01eb2471d084016fe18aa1c112e2898474663a1d47",
+      "lineSha256": "e62406d385d95eb00bbddfa0ea16513fd5988f61456e237ead46309830db2be6",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "MacBook",
+      "matchSha256": "ac92e7613044a45682e8cf01eb2471d084016fe18aa1c112e2898474663a1d47",
+      "lineSha256": "b1fcc696369b8db1e56d858ee5cdc4638d86733923752ccee219e80c69aafae1",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "MacBook",
+      "matchSha256": "ac92e7613044a45682e8cf01eb2471d084016fe18aa1c112e2898474663a1d47",
+      "lineSha256": "559beadb2fb56dda05dcf02a76da8136101c6c0bc0e8d4984078e91f46ac60ba",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "Mac mini",
+      "matchSha256": "b85cef81cd7ba015449fbf196e58aad826b64ff4049029670b77121648695d80",
+      "lineSha256": "ad972c984968bbb90306cfbcceb3513eefbf86c692b09dc024f7db5a3e0f306f",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "Mac mini",
+      "matchSha256": "b85cef81cd7ba015449fbf196e58aad826b64ff4049029670b77121648695d80",
+      "lineSha256": "8c74ae2015600ca15ec8bc6d2850f1196c56dc55cda378418d7ab67db7c49671",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "MacBook",
+      "matchSha256": "ac92e7613044a45682e8cf01eb2471d084016fe18aa1c112e2898474663a1d47",
+      "lineSha256": "8c74ae2015600ca15ec8bc6d2850f1196c56dc55cda378418d7ab67db7c49671",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "machine-name",
+      "matchText": "Mac mini",
+      "matchSha256": "b85cef81cd7ba015449fbf196e58aad826b64ff4049029670b77121648695d80",
+      "lineSha256": "cf5ff7eb056432d5ed904ecbe8390407d03f045c3510963371489b1e477aee73",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "host-spec",
+      "matchText": "30 cores, 96 GB",
+      "matchSha256": "7f83d19d9fd982448abd19203a719b1a7c0f07ce2087d056633f585c7c71d34f",
+      "lineSha256": "10382e679ddc94c58d5d4a3d1674aa0f05ed3a968b23275c793245894d5e53fa",
+      "reason": "R971 detector positive fixtures must quote paired host specifications."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "host-spec",
+      "matchText": "12-core, 64GB",
+      "matchSha256": "1c3775e438dc07f98c31ecea58f607883c7b4ac1f18c9644611a2fd9e5298ef2",
+      "lineSha256": "10382e679ddc94c58d5d4a3d1674aa0f05ed3a968b23275c793245894d5e53fa",
+      "reason": "R971 detector positive fixtures must quote paired host specifications."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "host-spec",
+      "matchText": "30 cores, 96 GiB",
+      "matchSha256": "ce86e596396611b52b1a4170bfb834f513e09dda22d3a990fa317e0a52a21d93",
+      "lineSha256": "10382e679ddc94c58d5d4a3d1674aa0f05ed3a968b23275c793245894d5e53fa",
+      "reason": "R971 detector positive fixtures must quote paired host specifications."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "host-spec",
+      "matchText": "20 GB disk',\n    'GitHub 8-core",
+      "matchSha256": "92da18b972dc4df470e2b7f72d8e480602d5e08fefcf54d36d5d08f36761df01",
+      "lineSha256": "5e4346cdbc5a94655bb4b23772cfbbff6e57a1fc79c9401432f6aaa4b584637b",
+      "reason": "R971 detector positive fixtures must quote paired host specifications."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "host-spec",
+      "matchText": "30 cores, 96 GB",
+      "matchSha256": "7f83d19d9fd982448abd19203a719b1a7c0f07ce2087d056633f585c7c71d34f",
+      "lineSha256": "fb468efd529f2fce5c29af489cb25f75f9aa8ccb465993dc37e0d2bfd5777a3c",
+      "reason": "R971 detector positive fixtures must quote paired host specifications."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "host-spec",
+      "matchText": "30 cores, 96 GB",
+      "matchSha256": "7f83d19d9fd982448abd19203a719b1a7c0f07ce2087d056633f585c7c71d34f",
+      "lineSha256": "f6170694a2782c1c1dbeac1a95732524d23b83a79235c6f4d149f0b3253c4ed9",
+      "reason": "R971 detector positive fixtures must quote paired host specifications."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "host-spec",
+      "matchText": "12-core/64GB",
+      "matchSha256": "9ed486bbe11b51ca83099ecea7e3bb4bbf9695ecbb237012990c245b691cd3c8",
+      "lineSha256": "30ee3d21880e55c79b112f5036f21213d24ac45249c0796420e5bc3e14b56650",
+      "reason": "R971 detector positive fixtures must quote paired host specifications."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "host-spec",
+      "matchText": "12 cores 64 GB",
+      "matchSha256": "52faa8b66b89b9a86966e185bf61a38899e9b12eef16b1fa1e4a8fe1097ac177",
+      "lineSha256": "30ee3d21880e55c79b112f5036f21213d24ac45249c0796420e5bc3e14b56650",
+      "reason": "R971 detector positive fixtures must quote paired host specifications."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "host-spec",
+      "matchText": "64GB RAM, 12-core",
+      "matchSha256": "38cf6110b15119d71e29149169dd96e951a81095e94745951821a32719768ac4",
+      "lineSha256": "30ee3d21880e55c79b112f5036f21213d24ac45249c0796420e5bc3e14b56650",
+      "reason": "R971 detector positive fixtures must quote paired host specifications."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "host-spec",
+      "matchText": "12 cores | RAM: 64 GiB",
+      "matchSha256": "4cfcef0bb51d05464610470021689090f342e5175f665b50ceb2e8c1b8ac4780",
+      "lineSha256": "30ee3d21880e55c79b112f5036f21213d24ac45249c0796420e5bc3e14b56650",
+      "reason": "R971 detector positive fixtures must quote paired host specifications."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "host-spec",
+      "matchText": "96 GB RAM / 30 cores",
+      "matchSha256": "df5c58689a5cf80ff00d37b0dc650d9432aa888cdaae39c01ed4f75f4bcf1d33",
+      "lineSha256": "f56424cd106d0b9fc120c5d68ea039e513b76b7bdd549baa12403fa757ca9a20",
+      "reason": "R971 detector positive fixtures must quote paired host specifications."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "host-spec",
+      "matchText": "M2 Max 96GB",
+      "matchSha256": "b49d94c990ad74fe96292e583d12d0505a5051e00854ecd7f8a3b9a078e28313",
+      "lineSha256": "f56424cd106d0b9fc120c5d68ea039e513b76b7bdd549baa12403fa757ca9a20",
+      "reason": "R971 detector positive fixtures must quote paired host specifications."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "host-spec",
+      "matchText": "96GB RAM M2 Max",
+      "matchSha256": "0d93a98b42d744e5296804a7f5b4474ea0af46a19c234edc169fa5967ee3cf0e",
+      "lineSha256": "f56424cd106d0b9fc120c5d68ea039e513b76b7bdd549baa12403fa757ca9a20",
+      "reason": "R971 detector positive fixtures must quote paired host specifications."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "host-spec",
+      "matchText": "M3 Pro with 48 GB",
+      "matchSha256": "b92d3327cdbf9b3eab8d7f4c751a6e5c5897b90624cdae2a2efd41bcab9591ac",
+      "lineSha256": "f56424cd106d0b9fc120c5d68ea039e513b76b7bdd549baa12403fa757ca9a20",
+      "reason": "R971 detector positive fixtures must quote paired host specifications."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "host-spec",
+      "matchText": "12-core host', 'on 12 cores', '~2 GB",
+      "matchSha256": "bf3d06ecf1bacd1f36f5c8615480c5154acb3448572627097f9ee2689c701999",
+      "lineSha256": "ee5d249a31c17adf1613fe5df2053bf65943cebd57da1cea768237d30006ebb7",
+      "reason": "R971 detector positive fixtures must quote paired host specifications."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "host-spec",
+      "matchText": "64GB', 'M2 Max', `12 cores",
+      "matchSha256": "05a294e982522f94649130f8d114f144d6219ce439c826fd30acc3d4ccc68199",
+      "lineSha256": "95ae815d3f5cd1db2cbb9515cbb475daba08aeffc5b7fb7fd67129e5c03dbe15",
+      "reason": "R971 detector positive fixtures must quote paired host specifications."
+    },
+    {
+      "path": "scripts/lib/privacy-terms.mjs",
+      "pattern": "machine-name",
+      "matchText": "Studio host",
+      "matchSha256": "1d04e2fc8e514bb975d908529be45ec43a80a8ed2eaf02c55642ad705b001ad9",
+      "lineSha256": "1ab198e0bcdb8dcdbbba61a5df4e837651598d50fe9f18c205f3c38f1f828040",
+      "reason": "R971 detector definitions necessarily name the terms they prohibit."
+    },
+    {
+      "path": "scripts/lib/privacy-terms.mjs",
+      "pattern": "machine-name",
+      "matchText": "MacBook",
+      "matchSha256": "ac92e7613044a45682e8cf01eb2471d084016fe18aa1c112e2898474663a1d47",
+      "lineSha256": "1ab198e0bcdb8dcdbbba61a5df4e837651598d50fe9f18c205f3c38f1f828040",
+      "reason": "R971 detector definitions necessarily name the terms they prohibit."
+    },
+    {
+      "path": "scripts/lib/privacy-terms.mjs",
+      "pattern": "machine-name",
+      "matchText": "Mac mini",
+      "matchSha256": "b85cef81cd7ba015449fbf196e58aad826b64ff4049029670b77121648695d80",
+      "lineSha256": "1ab198e0bcdb8dcdbbba61a5df4e837651598d50fe9f18c205f3c38f1f828040",
+      "reason": "R971 detector definitions necessarily name the terms they prohibit."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "d4fd6bf095bd45f15b53b3bf2aaa3e764aa2bc40d7aaa53244b20440f721b38c",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "44769bd40146c8a5904427166dc37190450c54260e62f002ff41349802f5d65d",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "9c7e11692fc450d4a279f909b9e6da67237f9a80ee82ad980f99378fac925b91",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/&#89",
+      "matchSha256": "0c2bf8733102a307bf49b17078e7e00736d6a3423b30a18cacf16102ceefbda1",
+      "lineSha256": "aa50ee10b29c80bbb601cdf4dd54cf0789f0983e45dafba5309172bebae4753b",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "aa50ee10b29c80bbb601cdf4dd54cf0789f0983e45dafba5309172bebae4753b",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/YWxpY2U=",
+      "matchSha256": "a3a4d5aea7b14e92d2baf8dd380a790e8e4389a664f11a7626908a16eb1091f3",
+      "lineSha256": "aa50ee10b29c80bbb601cdf4dd54cf0789f0983e45dafba5309172bebae4753b",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "a76bfd995eb68b3f7a58db44387ddcceb34367f38236a62d71b1dc9ae5b72d27",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/bob",
+      "matchSha256": "ffb0a9ec888277c655a4c7c4d60a3e596540c51f45849040ae07e62aedeba518",
+      "lineSha256": "4ee04c9f3cd86042cea28e30ea9644a415d739157dc92e940cccef49ad8e30dd",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/bob",
+      "matchSha256": "ffb0a9ec888277c655a4c7c4d60a3e596540c51f45849040ae07e62aedeba518",
+      "lineSha256": "869596888c76dd50cfa0fd4eb5d5ece317ab98b0ae1be712c362e28d15e1d4a7",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/bob",
+      "matchSha256": "ffb0a9ec888277c655a4c7c4d60a3e596540c51f45849040ae07e62aedeba518",
+      "lineSha256": "ec17c35ebe38f258aa78bc6381ecb1f13b853b7bafd21a7dc5695b9644df787c",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/bob",
+      "matchSha256": "ffb0a9ec888277c655a4c7c4d60a3e596540c51f45849040ae07e62aedeba518",
+      "lineSha256": "3b545d56155bea65f03d8c10b68c8b4f9384e081aa12f4aa537dfddd4247e2f8",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "8bfc4ce2cd7821a8a3e9d9611a5f143cc6c1c3e30c3368872e8619acb38e98b9",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "2614dc2e09221d6dcf114f449e4b83fdf6b5e9e9be6deb9907732db45df82f4a",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "721014b2055a4e0c953d93835b4bd0d7351b18dbb25e8b8d84446ac901168850",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "ac293413a728bad4d904b09ed224a2a366381446a99a18dfa7e6f5ff4a1bbc4c",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "9b95008cc286120a3eb73c38b07803a355fdfa2074da321bdee7bef25740ab40",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "c61efc228fc551ef4a673617164ddffbf5539ce81a559e50a4d711ecd949d1f6",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "73c9ff2ebd0a28ec0f86c909cba5e402a91c8b66e71246e3869c1cdfb9727339",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "16a7a6b39bba6f54233bd6145d804b445a2cdc70c779b93a9e33619e9793fdb8",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "9eaf936fe00f6223bc21d3bbac1f70d9ef5a6c3415de6f8d822258f3779590d8",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "d21aae3ac73e98a6d294f4c9449939d4e555db44766b6bd0b8428ee417a2fe08",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "7c58efc707aa71e585b37f0300924f191cbded2dc3ff392ae54a3919f157c1df",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "06b6e20ec9eb60b9dfcc2982b18c111ddbc2a1bd5306da465215898789ebccda",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "6f7c946d11575c56b6eac9fe6d78ac67a95b44dc23f28cfe6fdd0dae2ac46ce9",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "0790c2407e547a12d001ca19640be905e6b8ed853ed7b289352b6baa2c070352",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "12e86e5dc434f332b40b09dc09561153cbe51d60056e01da13715219b6252d92",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "547f18df2b2c442a1a9951a8ba32688e9a44abf734194f6394ff28068b533c04",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "6518edcc28c53ef178942f14c11369278faa384154fb52b65f722f26ad811948",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "9600c4e27b82fda7e765c697f7155d7cb508708956894a2d3a5d8d1f74b22cef",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "1dab14b925a39d2d4b63eebc1c37d956d0f56e8f8c2d4e07c3cdc5e1e8f3c7ce",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "efea63d5980c4042a9adacdd5e21e0f32684380d1abda1f416ebb5d343f34c59",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "42f10b546fa9a3fd24b2a5d37ae60d789a5b322cdc4f00d2997c80c09d01341a",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "c028a0538c87effbe458508366f6f236dabdcdc6092b5714a68db96b36fbdd87",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "529e53ef6e38c7f64c7168b52338948d7af7abc81072336d6971ea6a97c78aa4",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "a4960fa31e9974f0523c2b557d2880dbd4ca098dfe470c738273c4e6b3225aa0",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "fbe89bd0757bbc8976640d252f66561697b7e7b073acc2c0adbec5397876b013",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "09c3bcb7f0548b395ee347ea2038aa64e20e082f5aa9fa753b1866ed9f9724d5",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "8024f1b42654dd7d9a71584578209722c3df92597ac212031b1444fde4677ec1",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "333d0009072834c97a41f62458880edf27e0748b423e198526ba9c114f6107f9",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "d30d34ef97340bf71dc00868dca89be95485d545fcc639bfb90b9eea6ae8757f",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "bbfb6632645cb78533ccdef0bfa7dbb089f789d6f9e314204c8c97ee46019043",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "96ba9d3c86b0e7af8b6d739c0f36c2edf38c3d40bf2033940b2bc635849b1a67",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "bd8de298bf739680a7dd01081e2272aabec3c70697d5e5334816501638bc84f9",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "5aaee89a7b64ff555983710b88be92190b466fd2c08d1061c38dd6659e01cc68",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "085e76f7bfd9b3aca2cfb2bd8b6d5096fe3d2328b6f947c23f202f6d1c6e9557",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "0ba212e57b8c13e3b2796805a24f2a16e1f90c5879a313fadd91abec72f333e2",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "cde8ebfe02f1c085466e3a1f844fa898fa0f476a8a94d0effa2a487f50ffe1fa",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "df5d16f87750d76beb59d47ce471d6b9f2ba5cb8f04f08107b3361ee7719137c",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "548619fb1df212176ff6ecc4e694f7ebc10f79df4a2b736771cd22e250ddecbf",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "05561eaea67be0d787c3b77ae0959b1da340d1b3950dee887b7ec82c358dd351",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "520518e1a7675d05fe91181db63196e26b959ef85ca656c12c900f88444ddf2f",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "9ea7c03ceb456fc574ee9a0fa80cdb49a4498d7b6d838472d1ca749184845ac1",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "054180a358414c93262403fd25af7aaebed4566b4c3c68a475012f2fae76fe79",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "3b28ae546155072587bf7d87283d4553c694f0b7ea0cb2bcc6d716f3ab9be0fc",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "46162026d57bb887890147d6299f8f516e0ab3ab4594c552b5a0719c21ac64f7",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "09bb0ac9fecb62ef8d1d463649c3a499ed07e7a5133e3d3fe69e5cd34bc00141",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "b1b90598d3d6e875b0ac9184330a0227323eb4c94d11da56081f3a48144dcc14",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "ea6367de5b731c3dc94133ff1e93a748f57df0674b7f39285bb88214c7ea0c17",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "5174de0e7d6aa656dede055fb6dc9a1b9fb53c459fc397b8e5c77068489d3fd9",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "5663a964e4e6831feaa01d2e963836a950f41d37ff44963a33db44493dbf488a",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "f013af1b66107dc0630d6d71466321ec41dd3faaaac0d5d4d8db70dcbb9967ec",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "2f5e9168b7f229b16649c013b45a8f0f7a19d901333cd1250d3c77fb03998441",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/bob",
+      "matchSha256": "ffb0a9ec888277c655a4c7c4d60a3e596540c51f45849040ae07e62aedeba518",
+      "lineSha256": "2f5e9168b7f229b16649c013b45a8f0f7a19d901333cd1250d3c77fb03998441",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "daf2eae44134bafb4f2776ec91d448df4bdbbe25f352b635b05f003df24e541a",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/Users/alice",
+      "matchSha256": "69eb62f06f02a93acd61567cf258bb5e3eda3ffd22430beab14cfd7e0bb03177",
+      "lineSha256": "daf2eae44134bafb4f2776ec91d448df4bdbbe25f352b635b05f003df24e541a",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "e0a4ee3e945488ddb08a67b074aefe8bc64a470f57672c23eadff37c416d76dc",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/Users/alice",
+      "matchSha256": "69eb62f06f02a93acd61567cf258bb5e3eda3ffd22430beab14cfd7e0bb03177",
+      "lineSha256": "e0a4ee3e945488ddb08a67b074aefe8bc64a470f57672c23eadff37c416d76dc",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/ali&#99",
+      "matchSha256": "2fb4a944d7a0c6d229c9e171e0044d97e9b004c1568c36095822df99b3ec8ba5",
+      "lineSha256": "37ed8a794004f7060a3df43edd50e8ebd7250e0deaf4ffcbc906a9f6877cf9ed",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "37ed8a794004f7060a3df43edd50e8ebd7250e0deaf4ffcbc906a9f6877cf9ed",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "c5b21fe98b00659b57894ab3a97031eeef1d1ce977ded8ccb859b80d1fe968a0",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "5192a78019f2a097597ab546b90d46d68b4b36d8050deb00e144af06c7ead366",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "cc4f032b659751d437aab978c3e74e2dee6defab7bda36f7f76292b554844d12",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/bob",
+      "matchSha256": "ffb0a9ec888277c655a4c7c4d60a3e596540c51f45849040ae07e62aedeba518",
+      "lineSha256": "cc4f032b659751d437aab978c3e74e2dee6defab7bda36f7f76292b554844d12",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/bob",
+      "matchSha256": "ffb0a9ec888277c655a4c7c4d60a3e596540c51f45849040ae07e62aedeba518",
+      "lineSha256": "eee02289986bd37f0e67881938d4f1551558bf16955e9bcc2bf26c7bf7d45fe5",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/Users/alice",
+      "matchSha256": "69eb62f06f02a93acd61567cf258bb5e3eda3ffd22430beab14cfd7e0bb03177",
+      "lineSha256": "50aa728c8e1218f3bd0d371bb76f4b441779b026288a9951806809c68d6347a6",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "50aa728c8e1218f3bd0d371bb76f4b441779b026288a9951806809c68d6347a6",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/Users/alice",
+      "matchSha256": "69eb62f06f02a93acd61567cf258bb5e3eda3ffd22430beab14cfd7e0bb03177",
+      "lineSha256": "5046edefa7d6690249e635b7303eecc6b2b0b3c96a41d261a17ce5c1ef1a3e1d",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/first.last",
+      "matchSha256": "278b8cf49629bdc83cf416ff125b990c6b37a5fbe3c425440ff55504955de026",
+      "lineSha256": "5046edefa7d6690249e635b7303eecc6b2b0b3c96a41d261a17ce5c1ef1a3e1d",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/Users/syntheticoperator",
+      "matchSha256": "3ea59a6c6c21a7741be22a41389f9bb2d52acda1a5aaaab9371fe63590763bfb",
+      "lineSha256": "a2a20bda40ebd486196ff27266af4e6f4f4c643dc49d8096da7ade57f9fcc29e",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/syntheticoperator",
+      "matchSha256": "04619c74ab4c3df4a73faebf8a653efb1378475b4b46d6123ff68c7c9ae454eb",
+      "lineSha256": "a2a20bda40ebd486196ff27266af4e6f4f4c643dc49d8096da7ade57f9fcc29e",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/synthetic.operator",
+      "matchSha256": "3095054014c95381ecbdd4a9447340a42577f9eb68d702c4118ca746e1fadc72",
+      "lineSha256": "a78aa5ef39c9fb1e28516f2131c3aee5e2ef73e98ac2933ce70aceaceecac1bf",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/Users/synthetic.operator",
+      "matchSha256": "6a62b551db7c6e980442629ca56977036269ce80db640198017a5231b2f592ab",
+      "lineSha256": "2e6154d36a8412b499585ec8b4cd1a5fefed7cd9bf034b0577713b00168e28d6",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "35c03965f065d2735fc57d1f8d235b23e2593c9559fb2aeeaec97eff91cdb750",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "4a6bbafdacc049dfef547cfce2af737c9da182e8b5545d458fb9658f25c246a9",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "e5fd678fa2cb3a0a4bfb81db30b49080e84deaad0cf5a5ff11034d2d6fefc141",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/bob",
+      "matchSha256": "ffb0a9ec888277c655a4c7c4d60a3e596540c51f45849040ae07e62aedeba518",
+      "lineSha256": "31edd10b87b4a69f6c5395f91f56c1b7793573d48f30b2980912f2d49c0aba81",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "8929154e7329f958c2d0df555ba510d48982cc8aa625a9b199c6336eb383c54a",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/bob",
+      "matchSha256": "ffb0a9ec888277c655a4c7c4d60a3e596540c51f45849040ae07e62aedeba518",
+      "lineSha256": "8929154e7329f958c2d0df555ba510d48982cc8aa625a9b199c6336eb383c54a",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/bob",
+      "matchSha256": "ffb0a9ec888277c655a4c7c4d60a3e596540c51f45849040ae07e62aedeba518",
+      "lineSha256": "e23ebf362b635acaaa6198ef774d8dbb9fcb2dea8b6b32b00f3a72bdf3c12018",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "ddc00a17218d4954ba47bdae05c6e729bc13fdc89ff54d85b43524598a397aad",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "7847f2d1d1f7f940981b45da565f89cb8d929006c4f789998963e2db33e38526",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/example-alice-private",
+      "matchSha256": "08355fc1f495ad7788890392a5d3b68eec2ecc78e4201ee86f4fa7317e10c168",
+      "lineSha256": "6eae8a09e266d93a99ac5f743171c26a807f9eaf70b5ba0af6b6294215d86dfa",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/test-alice-private",
+      "matchSha256": "57008e5bdec4a9bb74cfc92051ff66aff9d1a673a5a511e9c2ff5da9c18169a0",
+      "lineSha256": "6eae8a09e266d93a99ac5f743171c26a807f9eaf70b5ba0af6b6294215d86dfa",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/<alice>",
+      "matchSha256": "9fd782f78a6b9f7e8346190cc42a13248fb3781b505a16d66db91ddf0eb7775f",
+      "lineSha256": "6eae8a09e266d93a99ac5f743171c26a807f9eaf70b5ba0af6b6294215d86dfa",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "3145c293e8c28ce1a537f2b84e5783f8e101f06d0c191e20fae5522afba4bbf0",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "9a3b45a228553bc8a4549807c9bf6e75a816bf0997aa31d9f63ecb78ba52bdea",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "c0666b1b6ee01e5a459937814b411f472b1d09623ab3bdfed0030289354af02a",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "beac91190ddcb5867cab1f5a2dafa427c3f4615956dc74a6a53e715cd1f464dc",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "d7af50a9049a2057e58e9b2b83b25f07707fa0828562e49c62b97ade47efa15f",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "b233394ea03eedb39db20856834ec4ad5dc36fc97e78c594bbc2b0d16e0142ab",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "cf23dfc22d9ce930257ff5ba0ce390ff4496684b56ad2fe653025012f0ffd324",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "9572ddec8da70869444ec22c011e8ee3e09161b834b84e768a6aa8a4a171ebde",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "bf31c749888eb79b0a3a79e2ee25207122079ab7fce28bf9fb0fd86d6299acda",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "9c0c67cb6893defd7bbb19e0827487759f618ecc5a68f3771030f8a71bf8ef96",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "a06b9b8dc740be06137504eda15997bb6ce8adccab01446ca5bc3bbb207a33a6",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "2c9b88481af215b3147f645a915e30dabed22efedbacb3cec33a12169e4c6c72",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "4da869df4dd6792558d3c2744548fcb25f51111bb867d3b34731c5d4201d58b0",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "197d4cd2640e56e26e50ee055e413acc56811f678d7c65e25d6fef5607cc8b5a",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "92fdc292efb920fd7d0606b9f390ecf04ea545fff8f861e2d6f339e5dcfea67f",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-service-url",
+      "matchText": "personal-api.alice-projects.workers.dev",
+      "matchSha256": "9e5b6bebfce0f3ed9c0e29ff3c21be5769dc9f42d9909fd59a92a249f9a50e66",
+      "lineSha256": "ab8722a77e77b36ac306951ba279cf3aca5be8c4fbc13346239a6f5a0735d2e0",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-service-url",
+      "matchText": "example-private-account.workers.dev",
+      "matchSha256": "6572c894e73fe7e785936f018468ddc49cb515e0da9bce5ecd20d49d051fdaec",
+      "lineSha256": "503c43e660394f5155037623ecba936cd3acecbd51bea7f339a22d8184654b3c",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-service-url",
+      "matchText": "test-private-account.workers.dev",
+      "matchSha256": "e2dd26d07c6fecd4bcf5c7a76f928d98d01e3eb7abaeb29dd834ea90fe7e9318",
+      "lineSha256": "503c43e660394f5155037623ecba936cd3acecbd51bea7f339a22d8184654b3c",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "network-name",
+      "matchText": "build.tail123abc.ts.net",
+      "matchSha256": "c78156cfcd01dc2c78734e7b3e87d317f9c44715ce4a3901f17e933720ae69e5",
+      "lineSha256": "2af58e13aeac31acbbcd037fa155e0654f75b52390c19479546627968a4ec3bf",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "network-name",
+      "matchText": "builder.tailscale",
+      "matchSha256": "1401bbcab076b9e15ed12e6782c99ea654b4f6285991fa6cb0fe9a3d3e3d8649",
+      "lineSha256": "2af58e13aeac31acbbcd037fa155e0654f75b52390c19479546627968a4ec3bf",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "network-name",
+      "matchText": "tailscale hostname: private-builder",
+      "matchSha256": "968394847c383a377dfaf141a105b709ac9b3e7c03fde345259be916fc2a9108",
+      "lineSha256": "b569ec8297a3c0d198a3f907594efe53070b2f1b38ae624ed6a33744d9a6ae4e",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "network-name",
+      "matchText": "example-private-account.ts.net",
+      "matchSha256": "43a9c5fccfaed8f7c597ffa670df1d9efc15275ac7c94fc1f48d01348e5631a5",
+      "lineSha256": "f426092517cb974b99ffa96a7e0c3a1a641653d9558ed2b875c1f59f7909d836",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-network-ip",
+      "matchText": "10.1.2.3",
+      "matchSha256": "8e099943f7370d7ecd46ad56442e02670e8ed1a8b2ba5c42a69f06f1c050189b",
+      "lineSha256": "9bc255e76c436098189c21d603ac9e252c4120d52ae472b51442bf728c8f5301",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-network-ip",
+      "matchText": "10.1.2.3",
+      "matchSha256": "8e099943f7370d7ecd46ad56442e02670e8ed1a8b2ba5c42a69f06f1c050189b",
+      "lineSha256": "4fc7f25d013456ce1939e46e8522b03282048f506d8d844aa16a354b76032f95",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-network-ip",
+      "matchText": "::ffff:10.2.3.4",
+      "matchSha256": "ead3b1e099b1ed5b4a4621295df67d7a09245449146e4ccbc01b469834d43db3",
+      "lineSha256": "ec6a630c37f247d5041270f9268748b8d2c2c24397545e715473eafa7c759c52",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-network-ip",
+      "matchText": "::ffff:192.168.1.2",
+      "matchSha256": "adb6f852ed651226ea8cc68828c4296c6c73aa2b00f6d33b63b41c1763ab12f3",
+      "lineSha256": "ec6a630c37f247d5041270f9268748b8d2c2c24397545e715473eafa7c759c52",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-network-ip",
+      "matchText": "::ffff:172.16.1.2",
+      "matchSha256": "900567d0bc0ee10be5b544ea6cb4d4e331709b4dc77e47fe16e6522ff1c5a9f9",
+      "lineSha256": "ec6a630c37f247d5041270f9268748b8d2c2c24397545e715473eafa7c759c52",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-network-ip",
+      "matchText": "::ffff:100.64.1.2",
+      "matchSha256": "37f5fa0a05a072715c8e0b4d1bb2ddad495290d96dda09760a46cdf62181bfe9",
+      "lineSha256": "20c9f0b76953853c627ab0d04b64f4a42ffbe76e360b3dcc4139bdc307c75a78",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-network-ip",
+      "matchText": "::ffff:a00:1",
+      "matchSha256": "51dcbd4d95fb6dfa95b989d4dd46e580146795b288aebc30395ca3aaa05f0c42",
+      "lineSha256": "20c9f0b76953853c627ab0d04b64f4a42ffbe76e360b3dcc4139bdc307c75a78",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-network-ip",
+      "matchText": "0:0:0:0:0:ffff:c0a8:102",
+      "matchSha256": "23218325ddf25d80c762390d9baf192464c7be17c5eb458705a3f131e3c628c4",
+      "lineSha256": "20c9f0b76953853c627ab0d04b64f4a42ffbe76e360b3dcc4139bdc307c75a78",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-network-ip",
+      "matchText": "fd12::1",
+      "matchSha256": "aa0766e50e80b2e96b2335313e04063392e50d6ada623bf400bdeff3ef3990ec",
+      "lineSha256": "20c9f0b76953853c627ab0d04b64f4a42ffbe76e360b3dcc4139bdc307c75a78",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-network-ip",
+      "matchText": "10.2.3.4",
+      "matchSha256": "34ade61af2a6985cfe3bd013338bd7137237eb78ac9a19015e75d6f371d5daf6",
+      "lineSha256": "20c9f0b76953853c627ab0d04b64f4a42ffbe76e360b3dcc4139bdc307c75a78",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-network-ip",
+      "matchText": "10.23.45.67",
+      "matchSha256": "7cb8f0e4e5f29e11d31c470ce80f495888925e6d375c634aee641006271e81dc",
+      "lineSha256": "7935245668b110a9aadd3b401b8e1cea94d66b8c9bb7809299db304d6a3e151f",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-network-ip",
+      "matchText": "172.16.0.2",
+      "matchSha256": "3fd8e0d2810f7b370a8439b71aa99795421388b12bbcd6ac024bf02f3259fd69",
+      "lineSha256": "7935245668b110a9aadd3b401b8e1cea94d66b8c9bb7809299db304d6a3e151f",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-network-ip",
+      "matchText": "172.31.255.254",
+      "matchSha256": "ee3871fb71e8bab7d7f5368d5472a6e34e63e80ce40a3d388431dc242e3a7fef",
+      "lineSha256": "15142a644d5c47f6df44464b1fc0c0d7c72f0a4261b16489819737140348e2ee",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-network-ip",
+      "matchText": "192.168.3.4",
+      "matchSha256": "07ba227e099259ba0c21d4c2907f23a0c9eb210a88d1bc5d846f50418e714166",
+      "lineSha256": "15142a644d5c47f6df44464b1fc0c0d7c72f0a4261b16489819737140348e2ee",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-network-ip",
+      "matchText": "100.64.1.2",
+      "matchSha256": "b561751746c6b986134f7802acf540666c18c1f35cbcb132a55f9a98e1a4a23a",
+      "lineSha256": "e607d245b89d89cd3e5316f24d0406b4f6ebfce7bc982efb9c8249beae1c8d4e",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-network-ip",
+      "matchText": "100.127.255.254",
+      "matchSha256": "8160b689c8825f3b2bd3c94e601febb64f427e0fdc98d4043b6c1883d7b07ff3",
+      "lineSha256": "e607d245b89d89cd3e5316f24d0406b4f6ebfce7bc982efb9c8249beae1c8d4e",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-network-ip",
+      "matchText": "169.254.2.3",
+      "matchSha256": "c0d9cd9dfb2b0be7db7eecece92f2231d741c74e2dd6660d930974b7ec4bc392",
+      "lineSha256": "54a2485f6feec7b6a1ec4bb20fecfa6e28bad83993c6726959d3e82d6c83eccc",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-network-ip",
+      "matchText": "fd12:3456::1",
+      "matchSha256": "f7fad60241980e9ef49cae7be999322ab9af75d8f1d7316ed70299d64eee7ec9",
+      "lineSha256": "54a2485f6feec7b6a1ec4bb20fecfa6e28bad83993c6726959d3e82d6c83eccc",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-network-ip",
+      "matchText": "fc00::1",
+      "matchSha256": "3513b013d2cc6165d33766b008d411319e4b0a14d9fb5e203df1651393b26a40",
+      "lineSha256": "453157f253a7c7dd1e0d2c8d1edec930f3ebb788f27fe6d187bdca57051d54bd",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-network-ip",
+      "matchText": "fe80::1%eth0",
+      "matchSha256": "016a8c975c3c87db7d169cfa6e8eeb541152b328a464dc7b48b5b60eff33eef5",
+      "lineSha256": "453157f253a7c7dd1e0d2c8d1edec930f3ebb788f27fe6d187bdca57051d54bd",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-network-ip",
+      "matchText": "10.23.45.67",
+      "matchSha256": "7cb8f0e4e5f29e11d31c470ce80f495888925e6d375c634aee641006271e81dc",
+      "lineSha256": "8d10cd4d19de09abceb8c027211b54b1f1df0a7d916df905d99b52b88a4f763b",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "account-id",
+      "matchText": "GitHub App ID: 1234567",
+      "matchSha256": "547edc812023fae24695c7e45d2cfe8825ecc5288019b04cae2feb765a94999f",
+      "lineSha256": "598590a8719c19379958d990309f4a1e764fb92aaf1d2643bb60f261fb0de3a4",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "account-id",
+      "matchText": "installation ID = 7654321",
+      "matchSha256": "130e2489d764251a6f15d54396bb4da8c4287946d77a9e297695b9dbccdcf153",
+      "lineSha256": "598590a8719c19379958d990309f4a1e764fb92aaf1d2643bb60f261fb0de3a4",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "account-id",
+      "matchText": "appId\": \"1234567",
+      "matchSha256": "f3a0b1e9809b21089a47ff656797c149b8ef0a08cf42d1275fb11efe682b705b",
+      "lineSha256": "29e44116995f0444d1431944b6c975114519de168c56c910b54bc65d4fa72387",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "account-id",
+      "matchText": "installation_id: 7654321",
+      "matchSha256": "ffa19f56eb6633d74feed1fcc7d7b45c3bd58d3d8069800475c8eb8d38ec7f73",
+      "lineSha256": "29e44116995f0444d1431944b6c975114519de168c56c910b54bc65d4fa72387",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "account-id",
+      "matchText": "WE_GITHUB_APP_ID=1234567",
+      "matchSha256": "001fb242110c2e4c4d2ec97c07a90f5de622f52c6b58e80c8abec9c5d3027fea",
+      "lineSha256": "510d0e19b232fac71e820ac3b488a63f151c40e5db9ccbe3b66bc0a1c4609138",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "account-id",
+      "matchText": "LEGACY_PERSONAL_INSTALLATION_ID = \"7654321",
+      "matchSha256": "13949dfc6cf630a0187956a6e3f47ec01ef4e67378e660f687ba4c95fc72c37c",
+      "lineSha256": "510d0e19b232fac71e820ac3b488a63f151c40e5db9ccbe3b66bc0a1c4609138",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "account-id",
+      "matchText": "OWNER_INSTALLATIONS = Object.freeze({ \"example-org\": \"7654321\" }",
+      "matchSha256": "adfb3b399941f4c409c3cac006444060dab4eacd765e0c81bb33fd8f73177bf0",
+      "lineSha256": "6a78b370840791b80a73902e28ef4999846dda5d52087f5740a42a2a752559b3",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "account-id",
+      "matchText": "/app/installations/7654321",
+      "matchSha256": "cd5e00e89970de28afe0efe123a1a3afdef5e46d6acdf5e46b52f516490dfe39",
+      "lineSha256": "66981a297095cfd4c7c963cd22af21ac8dd8df1a24eaf8483a297959e027c3f4",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "account-id",
+      "matchText": "installations\": { \"example-org\": \"7654321\" }",
+      "matchSha256": "52f1b07a3262f628ebace1a5e7045c845b2ea1f1d32ed8576fd4537a1b8d4629",
+      "lineSha256": "1bebf1eec331a6f6aeeb5fc845b0d0cf602c7e954bcc8e555a94776ef754d012",
+      "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "machine-name",
+      "matchText": "MacBook",
+      "matchSha256": "ac92e7613044a45682e8cf01eb2471d084016fe18aa1c112e2898474663a1d47",
+      "lineSha256": "4455023d2e8eb931e57c83e59877bbd94e5dd9d86d1a44f53917bee29e56a941",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "machine-name",
+      "matchText": "Mac Studio",
+      "matchSha256": "3636a04dba0914ab0750bd92928ca8cb21166e537d320d29fd8d2d738ad44d73",
+      "lineSha256": "d368857f9b6ed7047cb918efce711d2200f8d00a0c5ef6b1eb45cb4da8ba9d2d",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "machine-name",
+      "matchText": "MacStudio",
+      "matchSha256": "f5c399a7b834d102a24d8e63d5bedcd963a2a52e0770df65ea650250635a4eec",
+      "lineSha256": "116c62d8ff07750d9dee19a623d3af6aecca9de149a34bd70e59b4441e9c02f5",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "machine-name",
+      "matchText": "Studio host",
+      "matchSha256": "1d04e2fc8e514bb975d908529be45ec43a80a8ed2eaf02c55642ad705b001ad9",
+      "lineSha256": "da17fefa48ab6988112b1575174f33c805d6d534beb9b8aee15b72c5c260d91c",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "machine-name",
+      "matchText": "Mac mini",
+      "matchSha256": "b85cef81cd7ba015449fbf196e58aad826b64ff4049029670b77121648695d80",
+      "lineSha256": "2d99c357954aaa03ab8331a84c3c0edeaedeb3c8f87215d774461420aaf61cd7",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "machine-name",
+      "matchText": "mac studio",
+      "matchSha256": "9f893fcc020070b14a9cb9cd74e70950708ed896e9abb9f203bf826b3310fccf",
+      "lineSha256": "b743859021f7e965653af4d146aed82e8189dea1e8919c0bab4b91ce6555da95",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "host-spec",
+      "matchText": "30 cores, 96 GB",
+      "matchSha256": "7f83d19d9fd982448abd19203a719b1a7c0f07ce2087d056633f585c7c71d34f",
+      "lineSha256": "07017b5c854bf8e7fa049393d2abc1111dc5e15eb28af3419bdbcbd71baf8cc3",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "host-spec",
+      "matchText": "12-core, 64GB",
+      "matchSha256": "1c3775e438dc07f98c31ecea58f607883c7b4ac1f18c9644611a2fd9e5298ef2",
+      "lineSha256": "fe80adf41baf85ef711b48dec26248a23ff60e05cf70d5ac4a93a2cc07e87940",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "host-spec",
+      "matchText": "30 cores, 96 GiB",
+      "matchSha256": "ce86e596396611b52b1a4170bfb834f513e09dda22d3a990fa317e0a52a21d93",
+      "lineSha256": "09c2fd649e5e4ae148c497104981a0b98ce1a86a55dfaa6ef458265d28a4294c",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "host-spec",
+      "matchText": "20 GB disk',\\n    'GitHub 8-core",
+      "matchSha256": "21f7afb75366b69258b8cfa84f9f90fe3e55e0e5c3c1cb1afe0e779723ac5d46",
+      "lineSha256": "f626fe0a17d43a34809456476fef096d88c528329169060dae2f20d74d2279b3",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "host-spec",
+      "matchText": "20 GB disk',\n    'GitHub 8-core",
+      "matchSha256": "92da18b972dc4df470e2b7f72d8e480602d5e08fefcf54d36d5d08f36761df01",
+      "lineSha256": "f626fe0a17d43a34809456476fef096d88c528329169060dae2f20d74d2279b3",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "host-spec",
+      "matchText": "12-core/64GB",
+      "matchSha256": "9ed486bbe11b51ca83099ecea7e3bb4bbf9695ecbb237012990c245b691cd3c8",
+      "lineSha256": "7bf225c23fd7bb2995591b58d49da6d9d1db4e44f8978a882fb0bc52bc2e2883",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "host-spec",
+      "matchText": "12 cores 64 GB",
+      "matchSha256": "52faa8b66b89b9a86966e185bf61a38899e9b12eef16b1fa1e4a8fe1097ac177",
+      "lineSha256": "20f47c241c0d5a75a37c1cc8b671f15a6cf26c6a8aaba8e0bb87f3d6206d0c88",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "host-spec",
+      "matchText": "64GB RAM, 12-core",
+      "matchSha256": "38cf6110b15119d71e29149169dd96e951a81095e94745951821a32719768ac4",
+      "lineSha256": "5d2590249278063118a5b6cde4b48e06e66c9361a7374fb8efa866647186df15",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "host-spec",
+      "matchText": "12 cores | RAM: 64 GiB",
+      "matchSha256": "4cfcef0bb51d05464610470021689090f342e5175f665b50ceb2e8c1b8ac4780",
+      "lineSha256": "e5fa5e05d837467e4202f65b04ac426bef26bbf85f219e8f8e984b965c752618",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "host-spec",
+      "matchText": "96 GB RAM / 30 cores",
+      "matchSha256": "df5c58689a5cf80ff00d37b0dc650d9432aa888cdaae39c01ed4f75f4bcf1d33",
+      "lineSha256": "0a1e0c5ff2416324c259b45925f83217ae84a3e592e952c8ec1e7db0fbe2e172",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "host-spec",
+      "matchText": "M2 Max 96GB",
+      "matchSha256": "b49d94c990ad74fe96292e583d12d0505a5051e00854ecd7f8a3b9a078e28313",
+      "lineSha256": "27fb176ddf7e91954e453d7008aff5b0a4f20a80e34b0e1dbbaeb626ae1177d5",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "host-spec",
+      "matchText": "96GB RAM M2 Max",
+      "matchSha256": "0d93a98b42d744e5296804a7f5b4474ea0af46a19c234edc169fa5967ee3cf0e",
+      "lineSha256": "0e02e4c38b6274f9f5ace99eda9c568a1133a93bfef634add2e3fc9ec13d7f1d",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "host-spec",
+      "matchText": "M3 Pro with 48 GB",
+      "matchSha256": "b92d3327cdbf9b3eab8d7f4c751a6e5c5897b90624cdae2a2efd41bcab9591ac",
+      "lineSha256": "5df81130d1fb1705828256bfc55475d9b6f6b123502ee14d3a56619dd74a39b6",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "host-spec",
+      "matchText": "12-core host', 'on 12 cores', '~2 GB",
+      "matchSha256": "bf3d06ecf1bacd1f36f5c8615480c5154acb3448572627097f9ee2689c701999",
+      "lineSha256": "5b23b5b3a8631499ab845216685f1a2da101da3f14f2ad63fdef8898b4d766cf",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "host-spec",
+      "matchText": "64GB', 'M2 Max', `12 cores",
+      "matchSha256": "05a294e982522f94649130f8d114f144d6219ce439c826fd30acc3d4ccc68199",
+      "lineSha256": "db3ed0e3f41f78f975025c67251a9aaaffa614fbf98e7b36ca1a65a217533ed2",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "home-path",
+      "matchText": "/home/alice",
+      "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
+      "lineSha256": "c59caeae6fe96bb628f2fd46823bd7c11e521fc7c6f5384d2a4bb59921e0de39",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "home-path",
+      "matchText": "/home/&#89",
+      "matchSha256": "0c2bf8733102a307bf49b17078e7e00736d6a3423b30a18cacf16102ceefbda1",
+      "lineSha256": "76c8f647175fa7dd07256ecba3d04d805ed53a5c1f5be67a1d3a12c80e6bda7f",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "home-path",
+      "matchText": "/home/YWxpY2U=",
+      "matchSha256": "a3a4d5aea7b14e92d2baf8dd380a790e8e4389a664f11a7626908a16eb1091f3",
+      "lineSha256": "a006add745bbe2aa528ba2fb9440841fd2ad8bfcd4f48be0451cd053ac0cb510",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "home-path",
+      "matchText": "/home/bob",
+      "matchSha256": "ffb0a9ec888277c655a4c7c4d60a3e596540c51f45849040ae07e62aedeba518",
+      "lineSha256": "e90c22b2d69214a0b6cd650178723d033ca3690b866b282c01a067da380248e7",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "home-path",
+      "matchText": "/Users/alice",
+      "matchSha256": "69eb62f06f02a93acd61567cf258bb5e3eda3ffd22430beab14cfd7e0bb03177",
+      "lineSha256": "2bcbf356a8ac7a13dede2e6d6cdd5a6a818e7282474265596f09f0c2f4f72c45",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "home-path",
+      "matchText": "/home/ali&#99",
+      "matchSha256": "2fb4a944d7a0c6d229c9e171e0044d97e9b004c1568c36095822df99b3ec8ba5",
+      "lineSha256": "16f1f897344a67494871cad046c577af1116e6a10de3f5b4991c7b493b17c52b",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "home-path",
+      "matchText": "/home/first.last",
+      "matchSha256": "278b8cf49629bdc83cf416ff125b990c6b37a5fbe3c425440ff55504955de026",
+      "lineSha256": "bebf3fe1b237c1685d738080aa0fc02daeb2d143d8b992784bc864b34502ebb4",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "home-path",
+      "matchText": "/Users/syntheticoperator",
+      "matchSha256": "3ea59a6c6c21a7741be22a41389f9bb2d52acda1a5aaaab9371fe63590763bfb",
+      "lineSha256": "ae9e9432ed5ee613831a0f878ddec589ce0ae2ac633fe5d7fae10f224b2734c1",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "home-path",
+      "matchText": "/home/syntheticoperator",
+      "matchSha256": "04619c74ab4c3df4a73faebf8a653efb1378475b4b46d6123ff68c7c9ae454eb",
+      "lineSha256": "416c74399c40354187e0ef94446750848d63936e9de82ccf83af2572ab943e3b",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "home-path",
+      "matchText": "/home/synthetic.operator",
+      "matchSha256": "3095054014c95381ecbdd4a9447340a42577f9eb68d702c4118ca746e1fadc72",
+      "lineSha256": "3437578c5fecbb20bbab75612b6a1e98ed69d14ea432a11a1730a1d8bf0ed134",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "home-path",
+      "matchText": "/Users/synthetic.operator",
+      "matchSha256": "6a62b551db7c6e980442629ca56977036269ce80db640198017a5231b2f592ab",
+      "lineSha256": "56a2299246ca00e0466d4a9a71229b8356f57b98990e55e081148315292892d3",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "home-path",
+      "matchText": "/home/example-alice-private",
+      "matchSha256": "08355fc1f495ad7788890392a5d3b68eec2ecc78e4201ee86f4fa7317e10c168",
+      "lineSha256": "729d935f4b171d07130d0adcbd6a21bb5bbdb45974509fb279d242bfc249d501",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "home-path",
+      "matchText": "/home/test-alice-private",
+      "matchSha256": "57008e5bdec4a9bb74cfc92051ff66aff9d1a673a5a511e9c2ff5da9c18169a0",
+      "lineSha256": "b84b2c943e61155e112b31cd5ff75e1f392a4aaed5ccb3f272257fc641928d4d",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "home-path",
+      "matchText": "/home/<alice>",
+      "matchSha256": "9fd782f78a6b9f7e8346190cc42a13248fb3781b505a16d66db91ddf0eb7775f",
+      "lineSha256": "29151cd8f5984cdc7b7ee6ef0d8d2137716fbc3ff4eedcb988fddc6d3c4707dd",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-service-url",
+      "matchText": "personal-api.alice-projects.workers.dev",
+      "matchSha256": "9e5b6bebfce0f3ed9c0e29ff3c21be5769dc9f42d9909fd59a92a249f9a50e66",
+      "lineSha256": "73690747dfc0052112d56e2a778c1184e18def75ffa34f367049ea144203f4c2",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-service-url",
+      "matchText": "example-private-account.workers.dev",
+      "matchSha256": "6572c894e73fe7e785936f018468ddc49cb515e0da9bce5ecd20d49d051fdaec",
+      "lineSha256": "88c1757a3f9e3a3efcd480e882a2433f6559cbbda483b6337e8185c0d4c78781",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-service-url",
+      "matchText": "test-private-account.workers.dev",
+      "matchSha256": "e2dd26d07c6fecd4bcf5c7a76f928d98d01e3eb7abaeb29dd834ea90fe7e9318",
+      "lineSha256": "43e1d7d1694fc71d4a9d6af0f4d221e5c9ba38c634d28e17c28cd39265bba356",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "network-name",
+      "matchText": "build.tail123abc.ts.net",
+      "matchSha256": "c78156cfcd01dc2c78734e7b3e87d317f9c44715ce4a3901f17e933720ae69e5",
+      "lineSha256": "023c967efad0ca4a8a28b189ecf75b23c4e7ee6a7987e13d72b957ddf2b2558f",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "network-name",
+      "matchText": "builder.tailscale",
+      "matchSha256": "1401bbcab076b9e15ed12e6782c99ea654b4f6285991fa6cb0fe9a3d3e3d8649",
+      "lineSha256": "85f652ab7c9443fcb0d6d3e199de721f2636820cf6fb7ca2896521154e5bd2a8",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "network-name",
+      "matchText": "tailscale hostname: private-builder",
+      "matchSha256": "968394847c383a377dfaf141a105b709ac9b3e7c03fde345259be916fc2a9108",
+      "lineSha256": "af65a9137912d64bd47089cf42196d164f8582cd968daadb0150024a88840279",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "network-name",
+      "matchText": "example-private-account.ts.net",
+      "matchSha256": "43a9c5fccfaed8f7c597ffa670df1d9efc15275ac7c94fc1f48d01348e5631a5",
+      "lineSha256": "77e77c57e7e0dfe585c2f184552c685cef240dd6bb23b1e6b8e59a66f8ba51ce",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-network-ip",
+      "matchText": "10.1.2.3",
+      "matchSha256": "8e099943f7370d7ecd46ad56442e02670e8ed1a8b2ba5c42a69f06f1c050189b",
+      "lineSha256": "608d02b8f4c59da5d177fc1c7901baf4b13cb5ebd70ecc11e26e75b20f8fb559",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-network-ip",
+      "matchText": "::ffff:10.2.3.4",
+      "matchSha256": "ead3b1e099b1ed5b4a4621295df67d7a09245449146e4ccbc01b469834d43db3",
+      "lineSha256": "8dd3912bf257c1f580d5f28826fc14427e42e2d2acd2482d7afdbfc6b393bd74",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-network-ip",
+      "matchText": "::ffff:192.168.1.2",
+      "matchSha256": "adb6f852ed651226ea8cc68828c4296c6c73aa2b00f6d33b63b41c1763ab12f3",
+      "lineSha256": "781e0566ff28d175a4836b7a2b813e4cc2ea1a988cec46424686ff9f6f937b0f",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-network-ip",
+      "matchText": "::ffff:172.16.1.2",
+      "matchSha256": "900567d0bc0ee10be5b544ea6cb4d4e331709b4dc77e47fe16e6522ff1c5a9f9",
+      "lineSha256": "79bafa7571a19ef283abcbc2f7b7d73fefaaf9956fef1641326d1eb3caee1b0d",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-network-ip",
+      "matchText": "::ffff:100.64.1.2",
+      "matchSha256": "37f5fa0a05a072715c8e0b4d1bb2ddad495290d96dda09760a46cdf62181bfe9",
+      "lineSha256": "05e486ca65d18dab5dd409607d38f40c7176573089c2384e65a54255259a036a",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-network-ip",
+      "matchText": "::ffff:a00:1",
+      "matchSha256": "51dcbd4d95fb6dfa95b989d4dd46e580146795b288aebc30395ca3aaa05f0c42",
+      "lineSha256": "5c88bb53a6ed85394463bc9b0a9ac44e9507184782b8dea210ebd2ae51a42221",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-network-ip",
+      "matchText": "0:0:0:0:0:ffff:c0a8:102",
+      "matchSha256": "23218325ddf25d80c762390d9baf192464c7be17c5eb458705a3f131e3c628c4",
+      "lineSha256": "c095a624e8c997a7a32021d3bed4c3be2f46cce985d4689cd29ceb6c5a4ed87e",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-network-ip",
+      "matchText": "fd12::1",
+      "matchSha256": "aa0766e50e80b2e96b2335313e04063392e50d6ada623bf400bdeff3ef3990ec",
+      "lineSha256": "9c01a70e917bda5d4d42ebf7a6643376d09503cf8386cfc9a86bf091178cb9e9",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-network-ip",
+      "matchText": "10.2.3.4",
+      "matchSha256": "34ade61af2a6985cfe3bd013338bd7137237eb78ac9a19015e75d6f371d5daf6",
+      "lineSha256": "be0aa0a25a6877c5db0fa920af6dcaf0e3cd61d670041770bd9f48c8ee4f14ee",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-network-ip",
+      "matchText": "10.23.45.67",
+      "matchSha256": "7cb8f0e4e5f29e11d31c470ce80f495888925e6d375c634aee641006271e81dc",
+      "lineSha256": "1778c754e55164a29d8ac66ef89e4e6dfcd5015411d3f161dc8191d0a97ceb43",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-network-ip",
+      "matchText": "172.16.0.2",
+      "matchSha256": "3fd8e0d2810f7b370a8439b71aa99795421388b12bbcd6ac024bf02f3259fd69",
+      "lineSha256": "5cc806358496ecaf2524bce6574cd6ba05d0c684160d17797937da5ca183dfb8",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-network-ip",
+      "matchText": "172.31.255.254",
+      "matchSha256": "ee3871fb71e8bab7d7f5368d5472a6e34e63e80ce40a3d388431dc242e3a7fef",
+      "lineSha256": "f66196a3e0bda33f00dcfa356bcd0ecc0ccba68b5b1583f2077a131f4cbf8a0c",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-network-ip",
+      "matchText": "192.168.3.4",
+      "matchSha256": "07ba227e099259ba0c21d4c2907f23a0c9eb210a88d1bc5d846f50418e714166",
+      "lineSha256": "44ea34d4541a75a88d10096f32e4a45687d934ed4c47b7d912c898bd00e76e57",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-network-ip",
+      "matchText": "100.64.1.2",
+      "matchSha256": "b561751746c6b986134f7802acf540666c18c1f35cbcb132a55f9a98e1a4a23a",
+      "lineSha256": "a03d5d8e978563ea82d20151d2b3bae08bbff6b751def8516f60a358b8a04d11",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-network-ip",
+      "matchText": "100.127.255.254",
+      "matchSha256": "8160b689c8825f3b2bd3c94e601febb64f427e0fdc98d4043b6c1883d7b07ff3",
+      "lineSha256": "91ede604f3a9b1bd8a7381de1502aee97defa0d221394aa881347dfb05e69c34",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-network-ip",
+      "matchText": "169.254.2.3",
+      "matchSha256": "c0d9cd9dfb2b0be7db7eecece92f2231d741c74e2dd6660d930974b7ec4bc392",
+      "lineSha256": "d629acd759fec944708701d9ed0300f3bb54cc71dd5e1073fa5844ab319b9c26",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-network-ip",
+      "matchText": "fd12:3456::1",
+      "matchSha256": "f7fad60241980e9ef49cae7be999322ab9af75d8f1d7316ed70299d64eee7ec9",
+      "lineSha256": "32f5ea0d2a685053d33cf434a383fdf9bc474796896420c87bb27072d0b68efa",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-network-ip",
+      "matchText": "fc00::1",
+      "matchSha256": "3513b013d2cc6165d33766b008d411319e4b0a14d9fb5e203df1651393b26a40",
+      "lineSha256": "065e88e9d7d1ed7f2f55d7af38ee861fa776dbd573532cdedea7f0a7bf83f34e",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-network-ip",
+      "matchText": "fe80::1%eth0",
+      "matchSha256": "016a8c975c3c87db7d169cfa6e8eeb541152b328a464dc7b48b5b60eff33eef5",
+      "lineSha256": "74f041c8a078f0e7c26138c80a66db559c3e7d4470cb91232dd6d9a52292ee27",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "account-id",
+      "matchText": "GitHub App ID: 1234567",
+      "matchSha256": "547edc812023fae24695c7e45d2cfe8825ecc5288019b04cae2feb765a94999f",
+      "lineSha256": "91068854966946ff1a3c28bdc67d918f64f68b2a6102cce83e886d927f7fed9e",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "account-id",
+      "matchText": "installation ID = 7654321",
+      "matchSha256": "130e2489d764251a6f15d54396bb4da8c4287946d77a9e297695b9dbccdcf153",
+      "lineSha256": "e2f0e1f909f1224e27fab8028c0fba4d73b69f39298a55ad40be492f293af0e3",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "account-id",
+      "matchText": "appId\": \"1234567",
+      "matchSha256": "f3a0b1e9809b21089a47ff656797c149b8ef0a08cf42d1275fb11efe682b705b",
+      "lineSha256": "1d70af60fac19495e0680df179e791a883d8ae1e62441b3813bc3a5df9aed0cf",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "account-id",
+      "matchText": "installation_id: 7654321",
+      "matchSha256": "ffa19f56eb6633d74feed1fcc7d7b45c3bd58d3d8069800475c8eb8d38ec7f73",
+      "lineSha256": "db3d1a2133d0989efad4e8eec348417f76f39b3eb7be1224d27863e593ddcdb7",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "account-id",
+      "matchText": "WE_GITHUB_APP_ID=1234567",
+      "matchSha256": "001fb242110c2e4c4d2ec97c07a90f5de622f52c6b58e80c8abec9c5d3027fea",
+      "lineSha256": "ca9ca490fa1edc7e5b542962cb4b7a5929429d0e0db7292aade493fff35b4cd5",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "account-id",
+      "matchText": "LEGACY_PERSONAL_INSTALLATION_ID = \"7654321",
+      "matchSha256": "13949dfc6cf630a0187956a6e3f47ec01ef4e67378e660f687ba4c95fc72c37c",
+      "lineSha256": "8ad251dffd0bf04f12062b48df90917e461a44359557d0e319f734b675c4478b",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "account-id",
+      "matchText": "OWNER_INSTALLATIONS = Object.freeze({ \"example-org\": \"7654321\" }",
+      "matchSha256": "adfb3b399941f4c409c3cac006444060dab4eacd765e0c81bb33fd8f73177bf0",
+      "lineSha256": "12385c337fac5e8e750ab9a8f61817320b1c3c7c9004eba23d30345cd2955d4f",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "account-id",
+      "matchText": "/app/installations/7654321",
+      "matchSha256": "cd5e00e89970de28afe0efe123a1a3afdef5e46d6acdf5e46b52f516490dfe39",
+      "lineSha256": "9378850bda36d9c025da76e194dd53045870c48c32e79449fd826319a12cd8f0",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "account-id",
+      "matchText": "installations\": { \"example-org\": \"7654321\" }",
+      "matchSha256": "52f1b07a3262f628ebace1a5e7045c845b2ea1f1d32ed8576fd4537a1b8d4629",
+      "lineSha256": "ae026f73b63ab41af79f1a2ad98a5d910e16f9acdc86f4a5aa895885ed1310b6",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "host-spec",
+      "matchText": "20 GB disk',\\\\n    'GitHub 8-core",
+      "matchSha256": "3f5c81abb302ab250dc23fdf694ea67ecd4071caf79d568d794f3ae1a0f4e251",
+      "lineSha256": "7337e12cc91e61325a3094df54ddc014e3a03b448eae201516562e88553804d0",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "host-spec",
+      "matchText": "20 GB disk',\\n    'GitHub 8-core",
+      "matchSha256": "21f7afb75366b69258b8cfa84f9f90fe3e55e0e5c3c1cb1afe0e779723ac5d46",
+      "lineSha256": "7337e12cc91e61325a3094df54ddc014e3a03b448eae201516562e88553804d0",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "host-spec",
+      "matchText": "20 GB disk',\\\\\\\\n    'GitHub 8-core",
+      "matchSha256": "e22a02de1361446669031d48f34c5ba3c35d4f564db5a16a0e0c855a8d9bd502",
+      "lineSha256": "bca9de09809a8aeb139112d96f2e4478a2582ab1ecc63ade8b15329dcc442e14",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "host-spec",
+      "matchText": "20 GB disk',\\\\n    'GitHub 8-core",
+      "matchSha256": "3f5c81abb302ab250dc23fdf694ea67ecd4071caf79d568d794f3ae1a0f4e251",
+      "lineSha256": "bca9de09809a8aeb139112d96f2e4478a2582ab1ecc63ade8b15329dcc442e14",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "host-spec",
+      "matchText": "20 GB disk',\\\\\\\\\\\\\\\\n    'GitHub 8-core",
+      "matchSha256": "4dc0b5f3d98ae75cccb488082dcd16461d47fb09f63c8b1d0128ff5eaf93b9e2",
+      "lineSha256": "a12db33a1baf4ee946854b4dd9ca8977d2dcf2308e13795bd5da654a4e1f1375",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "host-spec",
+      "matchText": "20 GB disk',\\\\\\\\n    'GitHub 8-core",
+      "matchSha256": "e22a02de1361446669031d48f34c5ba3c35d4f564db5a16a0e0c855a8d9bd502",
+      "lineSha256": "a12db33a1baf4ee946854b4dd9ca8977d2dcf2308e13795bd5da654a4e1f1375",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "host-spec",
+      "matchText": "20 GB disk',\\\\\\\\\\\\\\\\n    'GitHub 8-core",
+      "matchSha256": "4dc0b5f3d98ae75cccb488082dcd16461d47fb09f63c8b1d0128ff5eaf93b9e2",
+      "lineSha256": "d74e87f968616c030762ab14ef1f1d85dc9e1f3bb9977cf7472b3f560d69fa44",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-network-ip",
+      "matchText": "::ffff:10.0.0.1",
+      "matchSha256": "fa6dbcd9ee860534dedfa96a2476f25ce08089465449ab03482a56d75eec299a",
+      "lineSha256": "132dada843bbcbaaa77119b9cc79320272837a228ce8e8edd75a3ae349905e6d",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-network-ip",
+      "matchText": "::ffff:10.0.0.1",
+      "matchSha256": "fa6dbcd9ee860534dedfa96a2476f25ce08089465449ab03482a56d75eec299a",
+      "lineSha256": "e18b5308557b6451ceaf866578cbb56bd528873931661f6825b030bfa4a16117",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-service-url",
+      "matchText": "my-app.workers.dev",
+      "matchSha256": "299ded47c1d35c7b44b1dce5c9ce0fe0997c0c891cbb9a00d1daeb02e8a65ddb",
+      "lineSha256": "3de15de4ee865135e7328346150959f247958730bf5f2f45a85d61b9e0a2f0ff",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-service-url",
+      "matchText": "foo.workers.dev",
+      "matchSha256": "0c89c27f9196f082eade1d678d3432dd6ea4aa317ef0a11b0c9df36c8c1957ef",
+      "lineSha256": "3de15de4ee865135e7328346150959f247958730bf5f2f45a85d61b9e0a2f0ff",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "network-name",
+      "matchText": "tail1234.ts.net",
+      "matchSha256": "998b264c552eb9b67bccd4d06ace631020277cffb480aee41962134648aff04d",
+      "lineSha256": "bff444d66560df1e0161cafaa3785696cc84a447523f65d300f246d7d87a05f6",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "network-name",
+      "matchText": "foo.ts.net",
+      "matchSha256": "640080cfdeac80415a6282f3cad716cfd141b01747a818e15e35859fd937b24f",
+      "lineSha256": "bff444d66560df1e0161cafaa3785696cc84a447523f65d300f246d7d87a05f6",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/privacy-terms.mjs",
+      "pattern": "private-network-ip",
+      "matchText": "::ffff:10.2.3.4",
+      "matchSha256": "ead3b1e099b1ed5b4a4621295df67d7a09245449146e4ccbc01b469834d43db3",
+      "lineSha256": "a38a0a9d89e3f4770f85b39e90b76b43153b4d5e53d848c895c9273bf27d4393",
+      "reason": "R971 detector doc comment quotes one synthetic address; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-network-ip",
+      "matchText": "::ffff:10.0.0.1",
+      "matchSha256": "fa6dbcd9ee860534dedfa96a2476f25ce08089465449ab03482a56d75eec299a",
+      "lineSha256": "ebe75d68f1b1a0bd2d42022ee670228105aff4baf5d5fdefbda442716de38ffb",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-service-url",
+      "matchText": "my-app.workers.dev",
+      "matchSha256": "299ded47c1d35c7b44b1dce5c9ce0fe0997c0c891cbb9a00d1daeb02e8a65ddb",
+      "lineSha256": "297b89ed9f4852b6a701ee24ca16bccc20fd31d06c59afdfd66e981dc98a89c7",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-service-url",
+      "matchText": "foo.workers.dev",
+      "matchSha256": "0c89c27f9196f082eade1d678d3432dd6ea4aa317ef0a11b0c9df36c8c1957ef",
+      "lineSha256": "9d2cef9dea8cf60b3355f9f9088076fd587e559bf126931e1f7b10992eed0496",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "network-name",
+      "matchText": "tail1234.ts.net",
+      "matchSha256": "998b264c552eb9b67bccd4d06ace631020277cffb480aee41962134648aff04d",
+      "lineSha256": "ef7c60f890abec21cb5cace0d21b4b1dcaeacb5dd9e8dbb39b8c038852c0e2e3",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "network-name",
+      "matchText": "foo.ts.net",
+      "matchSha256": "640080cfdeac80415a6282f3cad716cfd141b01747a818e15e35859fd937b24f",
+      "lineSha256": "30526bb6386f1e77cb68e26f39aa26cee5c087f7b369fbc6d579acff3e20eed8",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    }
+  ]
+}

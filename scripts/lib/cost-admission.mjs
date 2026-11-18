@@ -3,7 +3,7 @@
  * @description Card x60i0ie — COST-CLASS ADMISSION: the one pure rule every dispatching daemon shares for "may this
  *   job START now", split by what the job costs the Mac.
  *
- *   The Mac is the limit, not the model budget (2026-10-08: 12 cores, load 21–31, CPU idle at fix launch p50 41%,
+ *   The Mac is the limit, not the model budget (2026-10-08: load 21–31, CPU idle at fix launch p50 41%,
  *   min 5%; heavy test slots mostly free). Jobs fall in two classes:
  *   - HEAVY — runs tests or builds locally (build, fix, ci-heal, investigate, a review that runs tools). Heavy work
  *     keeps every cap and CPU guard it has today. This rule never loosens a heavy gate.
