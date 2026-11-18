@@ -37,8 +37,8 @@ export function failedCodeQLCheck(pr) {
     head: pr?.headRefOid, requiredNames: [CODEQL_CHECK_NAME], rosterSource: 'live',
     rowsComplete: pr?.rowsComplete === true && !pr?.requiredCheckReadError });
   const codeql = result.perName.CodeQL;
-  if (!pr?.requiredCheckReadError && codeql?.state === 'pending'
-    && (codeql.rows.length > 0 || result.state !== 'unknown')) return null;
+  // Unknown (e.g. rows-incomplete) evidence may hide a failure: only fully-read pending is not a failure.
+  if (!pr?.requiredCheckReadError && codeql?.state === 'pending' && result.state !== 'unknown') return null;
   if (result.state === 'pass') return null;
   // Preserve the row API even when unreadable evidence cannot supply a display row.
   return codeql?.rows[0] ?? { name: CODEQL_CHECK_NAME, status: 'UNKNOWN', conclusion: null };

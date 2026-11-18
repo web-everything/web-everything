@@ -57,6 +57,12 @@ describe.each(cases)('%s', (_label, rows, state) => {
   });
 });
 
+it('CodeQL pending on incomplete rows is not excused (unseen rows may hold a failure)', () => {
+  const pending = row(null, { name: 'CodeQL', status: 'in_progress', run_attempt: 2 });
+  expect(failedCodeQLCheck({ ...pr([pending]), rowsComplete: false })).toBeTruthy();
+  expect(failedCodeQLCheck(pr([pending]))).toBeNull();
+});
+
 it('CodeQL fails closed for missing head, unreadable/incomplete rows and malformed evidence', () => {
   for (const input of [{ statusCheckRollup: [row('success')] }, { ...pr([]), requiredCheckReadError: 'unreadable' },
     { ...pr([row('success', { name: 'CodeQL' })]), rowsComplete: false },
