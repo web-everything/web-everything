@@ -129,10 +129,11 @@ export function validateVerifySettings(raw) {
 
 /** The file is the tool layer over the team's platform preference `verify` (shared policy cascade,
  *  we:scripts/lib/policy-cascade.mjs): a key the file leaves unset takes the platform value. */
-export function loadVerifySettingsFile(path = defaultVerifySettingsPath(), { env = process.env } = {}) {
+export function loadVerifySettingsFile(path = defaultVerifySettingsPath(), { env = process.env, platform, operatorOverride } = {}) {
   let tool;
   try { tool = JSON.parse(readFileSync(path, 'utf8')); } catch { tool = undefined; }
-  const c = cascadePolicy('verify', tool, { env, standard: BUILT_IN_VERIFY_SETTINGS,
+  // `platform` / `operatorOverride` are injectable layers (tests pass empty ones); undefined reads the host files.
+  const c = cascadePolicy('verify', tool, { env, platform, operatorOverride, standard: BUILT_IN_VERIFY_SETTINGS,
     envValues: Object.fromEntries(Object.entries(envKeys).map(([k, n]) => [k, env?.[n] || undefined])) });
   return validateVerifySettings(c.layered ?? null);
 }

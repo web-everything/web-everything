@@ -4762,3 +4762,34 @@ Preserve `overlaysBefore` as a veto for omitted live tips: the regression for a 
 retired during planning must reject its omission and preserve HEAD.
 Run this file and `daemon-rebuild-events.test.mjs` through heavy admission. This adoption
 rule does not reset overlay main-sync parking or add retries for parked overlays.
+
+
+## Static selection edges and replay (affected-only CI S1)
+
+`related-test-selection.mjs` shares forward and reverse edges for imports, aliases,
+spawned script paths and literal reads. Its source-wide path scan is conservative:
+ambiguous literal expressions can add tests. Sibling aliases retain their textual
+key and match a tracked vendored counterpart when available; they do not read sibling
+repositories. CI uses the unlimited `ci.selection.maxTestsInCi` setting; local
+`relatedMaxTests` stays caller-owned. Truncation carries `partial: true`.
+Before graph-reachable tests replace changed-file targets, require every changed target
+in the tracked inventory; an absent target (including a committed deletion) forces the full suite.
+
+`selection-replay.mjs` compares import-only and static selection on the current tracked
+tree. PR diff test paths are only related-test proxies. Supply `--evidence=relative.json`
+with failing/related test lists to assess misses; absent evidence is labelled incomplete.
+A historical miss cannot be attributed to the parser merely because it happened:
+probe the actual imports. The current merge-gate-hold-class test is a direct importer
+and is reached even with all new static edge kinds disabled.
+
+
+## Shadow dependency tracing (S2)
+
+Append ` --import="file:///absolute/repo/scripts/ci/dep-trace.mjs"` to existing `NODE_OPTIONS`
+and set `WE_TRACE_TEST` to the repo-relative test file and `WE_TRACE_DIR` to an artifact directory.
+Node 22 uses `module.register` plus a loader message port; synchronous exit drains pending loader edges.
+Each process emits `trace-<pid>.json`; merge with `mergeTraces`, then replay via
+`scripts/readiness/trace-coverage.mjs trace-map.json misses.json [static-selected.json]`.
+Tracing stays shadow-only. The edge cap applies per process; a cap warning means incomplete evidence:
+rerun with a larger `ci.selection.trace.maxEdgesPerTest` before interpreting coverage.
+Keep tracer tests mock-only: inject filesystem/child-process objects and exercise loader hooks directly.
