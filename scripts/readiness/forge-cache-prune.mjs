@@ -206,8 +206,11 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
       if (typeof run !== 'string' || !RUN.test(run)) throw new Error('Invalid reserved run');
       const records = [];
       for (const suffix of ['prepared', 'running', 'receipt']) {
-        try { records.push({suffix, record: await readJson(join(receipts, `${run}.${suffix}`))}); }
+        const path = join(receipts, `${run}.${suffix}`);
+        let record;
+        try { record = await readJson(path); }
         catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+        records.push({suffix, record, mtimeMs: (await fs.lstat(path)).mtimeMs});
       }
       if (!records.length) throw new Error('Missing reserved run record');
       // The run writer used to omit `lock` from `.running`: take it from whichever
@@ -221,9 +224,13 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
       }
       // A reservation whose run already wrote its final receipt and outlived the
       // maximum runtime leaked: nothing can still be using its profile. Only a
-      // leased writer qualifies, and every present lock/digest must still be valid.
-      const finalReceipt = records.find(r => r.suffix === 'receipt')?.record;
-      const leaked = writerGuard === 1 && finalReceipt?.run === run
+      // leased writer with a complete, newest receipt qualifies; every present
+      // lock/digest must still be valid.
+      const final = records.find(r => r.suffix === 'receipt');
+      const finalReceipt = final?.record;
+      const leaked = writerGuard === 1 && finalReceipt?.v === 1 && finalReceipt.run === run
+        && typeof finalReceipt.phase === 'string' && Number.isInteger(finalReceipt.code)
+        && final.mtimeMs <= now && records.every(r => r.mtimeMs <= final.mtimeMs)
         && now - (await fs.lstat(reservationFile)).mtimeMs >= MAX_RUNTIME_MS;
       if (lock === undefined && !leaked) throw new Error('Invalid reserved lock evidence');
       let latestKnown = false;

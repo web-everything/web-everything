@@ -22,6 +22,7 @@ afterEach(async () => { if (tmp) await fs.rm(tmp, {recursive: true, force: true}
 async function json(path, value) {
   await fs.mkdir(join(path, '..'), {recursive: true});
   await fs.writeFile(path, JSON.stringify(value));
+  await fs.utimes(path, now / 1000, now / 1000);
 }
 async function reserve(run = `r-${'1'.repeat(32)}`, worker = 'worker-active', mtime = now, fields = {}) {
   const path = join(receipts, worker, 'reservation.json');
@@ -33,7 +34,7 @@ const record = siblings => ({lock, inputDigest, manifestDigest,
   manifest: siblings ? {siblings: {frontierui: {sha: 'd'.repeat(40)}}} : {}});
 const running = run => ({v: 1, nonce: 'e'.repeat(32), run,
   receiptCapabilities: {taskPressure: 1}, slot: 'forge-exec-1', owner: {pid: 123, start: '456'}});
-const receipt = siblings => ({v: 1, lock, inputDigest, manifestDigest,
+const receipt = siblings => ({v: 1, phase: 'test', code: 0, lock, inputDigest, manifestDigest,
   ...(siblings ? {siblingShas: {frontierui: 'd'.repeat(40)}} : {})});
 const entry = (digest, profileLock = lock) => ({lock: profileLock, name: `dev-v5-${digest}`, path: join(root, profileLock, `dev-v5-${digest}`),
   mtimeMs: now - 20 * HOUR, bytes: 10});
@@ -146,6 +147,48 @@ describe('leaked reservation lifetime', () => {
 });
 
 describe('leaked reservation proof guards', () => {
+  it.each([
+    {phase: undefined}, {code: undefined}, {v: undefined},
+    {phase: 1}, {code: 0.5}, {v: 2},
+  ])('keeps protection with an incomplete final receipt: %j', async incomplete => {
+    const run = await reserve(undefined, undefined, now - MAX_RUNTIME - 1000);
+    await json(join(receipts, `${run}.running`), record(false));
+    await json(join(receipts, `${run}.receipt`), {...receipt(false), run, ...incomplete});
+    const live = await readLiveEvidence({receipts, now});
+    expectPrecise(live, inputDigest);
+    expect(plan([entry(inputDigest)], live).prune).toEqual([]);
+  });
+  it.each(['prepared', 'running'])('keeps protection when the receipt is older than the .%s record', async suffix => {
+    const run = await reserve(undefined, undefined, now - MAX_RUNTIME - 1000);
+    await json(join(receipts, `${run}.${suffix}`), record(false));
+    const final = join(receipts, `${run}.receipt`);
+    await json(final, {...receipt(false), run});
+    await fs.utimes(final, (now - 1000) / 1000, (now - 1000) / 1000);
+    const live = await readLiveEvidence({receipts, now});
+    expectPrecise(live, inputDigest);
+    expect(plan([entry(inputDigest)], live).prune).toEqual([]);
+  });
+  it('keeps protection when the complete receipt is newer than now', async () => {
+    const run = await reserve(undefined, undefined, now - MAX_RUNTIME - 1000);
+    const final = join(receipts, `${run}.receipt`);
+    await json(final, {...receipt(false), run});
+    await fs.utimes(final, (now + 1000) / 1000, (now + 1000) / 1000);
+    const live = await readLiveEvidence({receipts, now});
+    expectPrecise(live, inputDigest);
+    expect(plan([entry(inputDigest)], live).prune).toEqual([]);
+  });
+  it('ignores an expired reservation with a complete receipt newer than every other phase', async () => {
+    const run = await reserve(undefined, undefined, now - MAX_RUNTIME - 1000);
+    for (const suffix of ['prepared', 'running']) {
+      const file = join(receipts, `${run}.${suffix}`);
+      await json(file, record(false));
+      await fs.utimes(file, (now - 1000) / 1000, (now - 1000) / 1000);
+    }
+    await json(join(receipts, `${run}.receipt`), {...receipt(false), run});
+    const live = await readLiveEvidence({receipts, now});
+    expect(live).toMatchObject({complete: true, profiles: new Set(), locks: new Set()});
+    expect(plan([entry(inputDigest)], live).prune).toEqual([{...entry(inputDigest), reason: 'Expired age'}]);
+  });
   it.each([undefined, 0, 2, '1', true, null])
   ('requires a leased writer: writerGuard=%s protects the whole lock despite an expired matching receipt', async writerGuard => {
     const run = await reserve(undefined, undefined, now - MAX_RUNTIME - 1000, {writerGuard});
