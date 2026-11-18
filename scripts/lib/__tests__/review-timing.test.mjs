@@ -270,6 +270,18 @@ describe('parallel review start and void', () => {
     expect(reviewMustVoid({ ...args, currentHead: 'b'.repeat(40), policy: { ...review, cancelOnCiRed: false } })).toBe(true);
     expect(reviewMustVoid({ ...args, checks: [check('review-gate', 'failure'), check('merge-gate', 'failure')], policy: { ...review, cancelOnCiRed: true } })).toBe(false);
   });
+  it('a cancelled required check is CI red: voids the review and refuses the start paths', () => {
+    const args = { reviewedHead: head, currentHead: head, requiredChecks: ['test'], checks: [check('test', 'cancelled')],
+      policy: { ...review, cancelOnCiRed: true } };
+    expect(reviewMustVoid(args)).toBe(true);
+    expect(ciRedOnHead({ headSha: head, checks: args.checks, requiredChecks: ['test'] })).toBe(true);
+    const gate = reviewStartGate({ headSha: head, checks: args.checks, requiredChecks: ['test'], rowsComplete: true,
+      policy: { ...review, startAfter: 'push' } });
+    expect(gate.allowed).toBe(false);
+    const marker = reviewStartGate({ headSha: head, checks: args.checks, requiredChecks: ['test'], rowsComplete: true,
+      verifyGreen: true, policy: { ...review, startBeforeCi: true } });
+    expect(marker.allowed).toBe(false);
+  });
   it('cancellation voids only for a healable red: an optional check never voids a finished review', () => {
     const cancel = { ...review, cancelOnCiRed: true };
     const args = { reviewedHead: head, currentHead: head, policy: cancel, requiredChecks: ['integration'] };

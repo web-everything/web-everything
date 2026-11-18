@@ -59,7 +59,9 @@ const resolveTimingChecks = (headSha, checks, requiredChecks, rowsComplete = fal
 export function ciRedOnHead({ headSha, checks, requiredChecks = null } = {}) {
   const result = resolveTimingChecks(headSha, checks, requiredChecks);
   if (!Object.keys(result.perName).length || result.reasons.includes('malformed')) return true;
-  return Object.values(result.perName).some(r => ['fail', 'unknown'].includes(r.state));
+  // Reader policy: the contract keeps cancelled as pending (needs-rerun, so the healer reruns it);
+  // for review timing a cancelled required check is still CI red.
+  return Object.values(result.perName).some(r => ['fail', 'unknown'].includes(r.state) || r.reasons.includes('needs-rerun'));
 }
 /** Diagnostic only, including drafts: a wait retains the existing review gates; never grants merge permission. */
 export function earlyStartShadow({ headSha, checks, requiredChecks, verifyGreen, care, lines, files, kinds,
@@ -117,7 +119,7 @@ function registeredStartGate({ headSha, checks, requiredChecks, rowsComplete }) 
   if (strict.unknown || !checkNames(requiredChecks) || typeof headSha !== 'string' || !headSha.trim()) return strict;
   const evidence = resolveTimingChecks(headSha, checks, requiredChecks, rowsComplete);
   const affected = Object.entries(evidence.perName).filter(([, r]) => r.state !== 'pass').map(([name, r]) => ({
-    name, reason: r.reasons.includes('foreign-head') ? 'wrong-head' : r.reasons[0] ?? r.state,
+    name, reason: r.reasons.includes('foreign-head') ? 'wrong-head' : r.reasons.includes('needs-rerun') ? 'cancelled' : r.reasons[0] ?? r.state,
   }));
   if (affected.some(row => RED.has(row.reason))) return { allowed: false, headSha, reason: 'ci-red', affected };
   const missing = affected.filter(row => row.reason === 'missing');
