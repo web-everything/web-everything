@@ -1,4 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { dispatchReviewJob } from '../review-job.mjs';
+import { readRecoveryWitness } from '../../lib/drain-red-team-evidence.mjs';
 import { redTeamEnqueueOperation, createRedTeamEnqueueSinks, RED_TEAM_ENQUEUE_EFFECT } from '../red-team-enqueue.mjs';
 import { redTeamRequestBody, redTeamRequestForHead } from '../../lib/red-team-request.mjs';
 import { parseOperationArgv, runOperationCli } from '../cli-adapter.mjs';
@@ -23,7 +27,7 @@ const live = () => ({ number: pr, state: 'OPEN', isDraft: false, headRefOid: hea
   labels: ['review:human'], comments: [], reviews: [],
   statusCheckRollup: [check('test', 'success'), check('review-gate'), ...REVIEW_TIMING_DEFAULTS.fastChecks.we.map(name => check(name, 'success'))] });
 const planning = () => ({ readOwnership: resolvePrOwnershipSettings, log: vi.fn(), env: {}, now: 2_000_000, setting: { enabled: true, retryCooldownMin: 30 },
-  lastDispatch: new Map(), readWitness: null, readCarry: () => null, readReviewRuns: () => [],
+  lastDispatch: new Map(), readWitness: () => ({ rawWriter: { parsed: null }, seats: [] }), readCarry: () => null, readReviewRuns: () => [],
   readStatus: () => null, readEvidence: () => ({ inFlight: false, queued: false, recorded: false,
     seatRecorded: false, completedRecorded: false, cleanRecorded: false,
     loopPayload: { verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: 'b'.repeat(40) } } } } }) });
@@ -208,7 +212,7 @@ describe('finished-head automatic nomination / registered enqueue guard parity',
       readNetFiles: () => ({ ok: false }), run: args => runRedTeamOnSkip({ ...args, ...planning(), now: () => 2_000_000, dispatch, syncLabels: sync }) });
     expect(observer).toHaveBeenCalledWith(repo, [{ pr, head }]);
     expect(out.rows[0]).toMatchObject({ action: 'review', requestReason: input.reason });
-    expect(dispatch).toHaveBeenCalledWith({ repo, pr });
+    expect(dispatch).toHaveBeenCalledWith({ repo, pr, expectedHead: head });
     expect(raw.labels).toEqual(['review:human']);
   });
 });
@@ -403,4 +407,107 @@ it('all-required-checks-green nomination dispatches the owed red team for a fini
   const opts = planning(), evidence = opts.readEvidence(); evidence.loopPayload.findings.read.netBasis.rev = head;
   opts.readEvidence = () => evidence;
   expect(planRedTeamOnSkip({ repo, plan: result, rawPrs: [raw], ...opts })[0]).toMatchObject({ action: 'dispatch', mode: 'fresh' });
+});
+
+
+describe('nomination stage pipeline', () => {
+  it.each(['automatic', 'op'])('%s head move between nomination and dispatch refuses through the real job guard', path => {
+    const raw = live(), opts = planning(), evidence = opts.readEvidence();
+    if (path === 'automatic') {
+      raw.labels = [];
+      evidence.loopPayload.findings.read.netBasis.rev = head;
+    } else raw.comments.push(trusted(redTeamRequestBody({ ...input, head })));
+    opts.readEvidence = () => evidence;
+    const result = plan(raw, { kind: path === 'automatic' ? 'already-reviewed-head' : 'review-ci', prNumber: pr, headSha: head });
+    const dir = mkdtempSync(join(process.env.TMPDIR, 'nomination-head-race-'));
+    const capacity = { lanes: 1, remainingStarts: 1, budget: { left: 1 } }, spawnJob = vi.fn(() => 12345);
+    let refusal;
+    const dispatch = vi.fn(args => {
+      // Simulate a push after planning, immediately before the existing dispatch admission guard.
+      const moved = 'f'.repeat(40);
+      refusal = dispatchReviewJob({ ...args, root: dir, dir, env: {}, home: dir, checkoutExists: () => true,
+        checkStaleness: () => ({ fresh: true, behind: 0 }), resolveSettingsEnv: () => ({}), spawnJob,
+        io: { liveHead: () => moved } });
+      return refusal;
+    });
+    try {
+      const out = runRedTeamOnSkip({ ...opts, repo, plan: result, rawPrs: [raw], capacity,
+        now: () => 2_000_000, dispatch });
+      expect(dispatch).toHaveBeenCalledOnce();
+      expect(dispatch).toHaveBeenCalledWith({ repo, pr, expectedHead: head,
+        ...(path === 'automatic' ? { redTeamOnly: true, redTeamMode: 'fresh' } : {}) });
+      expect(out.rows[0]).toMatchObject({ action: 'skip', head, expectedHead: head });
+      expect(refusal).toMatchObject({ refused: true, outcome: 'refused-head-moved' });
+      expect(spawnJob).not.toHaveBeenCalled();
+      expect(out.dispatched).toEqual([]);
+      expect(capacity).toEqual({ lanes: 1, remainingStarts: 1, budget: { left: 1 } });
+      expect(opts.lastDispatch.size).toBe(0);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each(['automatic', 'op'])('%s skips unreadable, malformed and missing scorecard witness failures before reading review evidence', path => {
+    const raw = live();
+    if (path === 'op') raw.comments.push(trusted(redTeamRequestBody({ ...input, head })));
+    for (const reason of ['scorecard unreadable', 'scorecard store malformed', 'scorecard missing']) {
+      const opts = planning(), readEvidence = vi.fn(opts.readEvidence), dispatch = vi.fn();
+      // #6999 owns scorecard validation. Exercise its shared witness failure boundary here.
+      const readScorecards = vi.fn(() => { throw Error(reason); });
+      opts.readWitness = key => readRecoveryWitness({ ...key, env: { WE_SHARED_RUNS_DIR: join(process.env.TMPDIR, 'witness-failure-runs') }, readScorecards });
+      const out = runRedTeamOnSkip({ ...opts, repo, plan: plan(raw), rawPrs: [raw], readEvidence,
+        now: () => 2_000_000, capacity: { lanes: 1, remainingStarts: 1 }, dispatch });
+      expect(out.rows[0]).toMatchObject({ action: 'skip', why: 'red-team evidence unreadable; inspect stored evidence before retrying' });
+      expect(readScorecards).toHaveBeenCalledOnce();
+      expect(readEvidence).not.toHaveBeenCalled();
+      expect(dispatch).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each(['automatic', 'op'])('%s skips every non-ok or incomplete witness without falling back to a fresh review', path => {
+    const raw = live();
+    if (path === 'op') raw.comments.push(trusted(redTeamRequestBody({ ...input, head })));
+    for (const witness of [null, undefined, {}, { ok: false, reason: 'review-unfinished' },
+      { ok: null, rawWriter: { parsed: null }, seats: [] }, { rawWriter: { parsed: null } }]) {
+      const opts = planning(), readEvidence = vi.fn(opts.readEvidence);
+      const decision = planRedTeamOnSkip({ repo, plan: plan(raw), rawPrs: [raw], ...opts,
+        readWitness: () => witness, readEvidence, headNeverReviewed: () => true })[0];
+      expect(decision.action).toBe('skip');
+      expect(readEvidence).not.toHaveBeenCalled();
+    }
+  });
+
+  it('an ok witness continues to the shared hold guard and explicit advisory dispatch cooldown', () => {
+    const raw = live(), opts = planning();
+    const readWitness = vi.fn(() => ({ ok: true, rawWriter: { parsed: null }, seats: [] }));
+    const readEvidence = vi.fn(opts.readEvidence);
+    const automatic = planRedTeamOnSkip({ repo, plan: plan(raw), rawPrs: [raw], ...opts, readWitness, readEvidence })[0];
+    expect(automatic).toMatchObject({ action: 'skip', why: expect.stringContaining('red-team-enqueue') });
+    expect(readWitness).toHaveBeenCalledOnce();
+    expect(readWitness).toHaveBeenCalledWith({ repo, pr, head });
+    expect(readEvidence).toHaveBeenCalledOnce();
+    expect(readEvidence).toHaveBeenCalledWith({ repo, pr, head });
+    raw.comments.push(trusted(redTeamRequestBody({ ...input, head })));
+    const nominate = lastDispatch => planRedTeamOnSkip({ repo, plan: plan(raw), rawPrs: [raw], ...opts,
+      readWitness, lastDispatch })[0];
+    expect(nominate(new Map())).toMatchObject({ action: 'review', expectedHead: head });
+    expect(nominate(new Map([[`${repo}#${pr}@${head}`, opts.now]]))).toMatchObject({ action: 'skip', why: 'retry cooldown active' });
+  });
+
+  it('a request marker loses its advisory authority when the live head changes', () => {
+    const raw = live(), moved = 'f'.repeat(40), opts = planning();
+    raw.comments.push(trusted(redTeamRequestBody({ ...input, head })));
+    raw.headRefOid = moved;
+    const decision = planRedTeamOnSkip({ repo, plan: plan(raw, { kind: 'review-ci', prNumber: pr, headSha: moved }),
+      rawPrs: [raw], ...opts })[0];
+    expect(decision).toMatchObject({ action: 'skip', head: moved, expectedHead: moved, why: expect.stringContaining('red-team-enqueue') });
+    expect(decision).not.toHaveProperty('requestReason');
+  });
+});
+
+
+it('nomination refuses a missing witness reader instead of bypassing scorecard validation', () => {
+  const raw = live(), opts = planning(), readEvidence = vi.fn(opts.readEvidence);
+  raw.comments.push(trusted(redTeamRequestBody({ ...input, head })));
+  const row = planRedTeamOnSkip({ repo, plan: plan(raw), rawPrs: [raw], ...opts, readWitness: null, readEvidence })[0];
+  expect(row).toMatchObject({ action: 'skip', why: 'red-team witness unreadable; inspect stored evidence before retrying' });
+  expect(readEvidence).not.toHaveBeenCalled();
 });

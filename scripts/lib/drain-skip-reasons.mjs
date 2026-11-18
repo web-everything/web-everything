@@ -23,7 +23,7 @@ export function classifySkipReason(reason) {
   const r = String(reason ?? '');
   // All four card-group hold reasons (we:scripts/lib/card-group.mjs#cardGroupHold).
   if (/^grouped into | is reserved by open card group |^card-group state unreadable|^card-group repository identity missing/.test(r)) return 'card-grouped';
-  if (/^red-main-hold\b/.test(r)) return 'red-main-hold'; // we:scripts/lib/red-main-hold.mjs — main is red, only the fix PR lands
+  if (/^(?:red-main-hold|freeze-unreadable-hold)\b/.test(r)) return 'red-main-hold'; // Stable pass-level kind, including unreadable freeze evidence.
   if (/mergeable=UNKNOWN|merge state UNKNOWN/i.test(r)) return 'unknown-mergeability';
   if (/mergeable=CONFLICTING|DIRTY/.test(r) && !/BEHIND⇒/.test(r)) return 'conflicting';
   if (/\bBEHIND\b/.test(r)) return 'behind';

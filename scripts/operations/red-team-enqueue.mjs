@@ -20,7 +20,6 @@ function liveRedTeamRequest(input, live) {
   if (redTeamForHead(live.comments, request.pr, live.headRefOid)) throw Error('red-team-enqueue: head already has a red-team result');
   return { ...request, head: live.headRefOid };
 }
-
 export function planRedTeamEnqueue(input, live, planning) {
   const request = liveRedTeamRequest(input, live);
   const decision = planRedTeamNomination({ ...planning, repo: request.repo, pr: request.pr,
@@ -28,18 +27,14 @@ export function planRedTeamEnqueue(input, live, planning) {
   if (!['dispatch', 'review'].includes(decision.action)) throw Error(`red-team-enqueue: ${decision.why}`);
   return request;
 }
-
 export function redTeamEnqueueOperation() {
   return op(RED_TEAM_ENQUEUE_OP, {
-    input: { pr: 'number', repo: { type: 'string', required: false, default: 'web-everything/web-everything' }, actor: 'string', reason: 'string' },
-    verdictFrom: 'plan',
+    input: { pr: 'number', repo: { type: 'string', required: false, default: 'web-everything/web-everything' }, actor: 'string', reason: 'string' }, verdictFrom: 'plan',
     plan: compute({ reads: ['input.pr', 'input.repo', 'input.actor', 'input.reason'], fn: ({ input }) => validateRedTeamRequest(input) }),
     request: effect({ reads: ['verdict'], effects: ({ verdict }) => [{
-      type: RED_TEAM_ENQUEUE_EFFECT, payload: verdict, idempotent: true,
-    }] }),
+      type: RED_TEAM_ENQUEUE_EFFECT, payload: verdict, idempotent: true }] }),
   });
 }
-
 /** Re-read live evidence at the effect; the durable comment shares the daemon queue. */
 export function createRedTeamEnqueueSinks({ env = process.env,
   gh = args => runGhSync(args, { env, throttle: { env: { ...env, WE_GH_READ_MEMO_DIR: '' } }, encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 }),
@@ -54,8 +49,7 @@ export function createRedTeamEnqueueSinks({ env = process.env,
 } = {}) {
   return { [RED_TEAM_ENQUEUE_EFFECT]: async input => {
     validateRedTeamRequest(input);
-    const live = await readLive(input);
-    const comments = await readComments(input);
+    const live = await readLive(input), comments = await readComments(input);
     liveRedTeamRequest(input, { ...live, comments });
     const request = planRedTeamEnqueue(input, { ...live, comments, reviews: await readReviews(input) },
       { env, log: line => console.error(line), ...planning, plan: await readPlan(input) });

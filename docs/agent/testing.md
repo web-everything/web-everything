@@ -4415,6 +4415,12 @@ Exercise pending CI after timing settings change, revoked clearance, green compl
 and budget exhaustion after that intervening failure. Unknown pending outcomes remain
 non-replayable; CI-held provenance does not establish that a write was never applied.
 
+## Drain freeze read recovery
+
+The named failed-cache-replacement regression seeds a clear, observes a live freeze while replacement fails, then forces a transient read before TTL expiry. Failed writes remove old evidence and block reuse in-process even when removal fails; only a successful cache write restores eligibility.
+
+`freeze-last-good.test.mjs` exercises transient-read retries and persistent successful reads with an injected clock, sleep and temporary cache path. Reused evidence must keep its original fetch timestamp: rewriting it during reuse would let an outage extend a cached clear indefinitely. Expired, future-dated, corrupt or missing evidence holds the line. Permanent errors never reuse the cache. `freeze-unreadable-hold` retains the `red-main-hold` skip kind and `redMainHold` flag so pass-level admission and PR-comment suppression still apply. Run these tests through heavy admission.
+
 ## Bounded red-team probe fairness
 
 `red-team-dispatch-queue.test.mjs` pins the two-probe limit per repository and
@@ -4445,14 +4451,10 @@ top-level ownership and the folded `reviewRefusal` separately. The planner-row u
 production suites pin refusal parity and propagation through normal and read-only passes.
 ## Human-head red-team nomination
 
-`readPlannerRow` reuses reconciliation with `reviewSafetyOnly` to expose holds behind CI refusals.
-Only proven review-owned checks may excuse `review-ci`, `ci-heal-escalated` or `owed-ci-rerun`;
-pending prerequisites and `startEarly: off` still hold. Automatic nomination requires a finished,
-accepting live-head review, runs the normal hold guard (including `review:human`), and never starts
-full review. A stale advisory human-held head skips naming `red-team-enqueue`.
-The explicit op requires `--actor=<login> --reason=<text>` and records a trusted head-bound marker
-with `version`, `repo`, `pr`, `actor`, `reason`, `head` and ISO `time`. Legacy/incomplete markers
-have no authority. Only this request may start a fresh advisory for a stale human-held head,
-with `advisoryReviewOnHumanHandoff=on` from the normal resolver; unreadable/invalid settings refuse.
-Other holds and queue limits stay shared; inspect reconciliation evidence before retrying and shorten
-reasons over 1000 characters. Run enqueue, planner-row, queue, on-skip and HTTP-adapter tests through heavy-admission.
+Planner-row safety evidence retains later holds behind CI refusals; only proven review-owned checks may excuse `review-ci`, `ci-heal-escalated` or `owed-ci-rerun`. Pending prerequisites and `startEarly: off` still hold.
+Automatic nomination needs a finished accepting live-head review and never starts full review. All candidates cross the witness, guard and dispatch stages; unreadable witnesses skip. Dispatch carries `expectedHead`.
+Stale advisory human-held heads name `red-team-enqueue --actor=<login> --reason=<text>`. Only a trusted head-bound
+request permits fresh advisory review, with `advisoryReviewOnHumanHandoff=on`; invalid/unreadable settings refuse.
+Markers require version/repo/pr/actor/reason/head/ISO time; legacy or stale markers grant nothing. Other holds
+and queue limits stay shared. Shorten reasons over 1000 characters. Run enqueue, planner-row, queue, on-skip
+and HTTP-adapter tests through heavy-admission; cover witness failures and pushes before dispatch.

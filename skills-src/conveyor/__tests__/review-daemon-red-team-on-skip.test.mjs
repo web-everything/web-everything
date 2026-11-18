@@ -82,7 +82,7 @@ it('CLI routes red-team recovery through the FIFO queue: capacity 1 dispatches o
     expect(recovery.mock.calls[0][0].plan.refusals.map(row => row.prNumber)).toEqual([6001]);
     expect(recovery.mock.calls[0][0].rawPrs.map(pr => pr.number)).toEqual([6001]);
     expect(dispatch).toHaveBeenCalledTimes(1);
-    expect(dispatch).toHaveBeenCalledWith({ pr: 6001, repo, redTeamOnly: true, redTeamMode: 'fresh' });
+    expect(dispatch).toHaveBeenCalledWith({ pr: 6001, repo, expectedHead: String(6001).padStart(40, '0'), redTeamOnly: true, redTeamMode: 'fresh' });
     expect(result.dispatched).toEqual([{ prNumber: 6001, jobPid: 42, mode: 'fresh' }]);
     // The two held-out PRs stay queued, in FIFO order, in the persisted file.
     expect(JSON.parse(readQueueFile()).map(entry => entry.pr)).toEqual([6002, 6003]);
@@ -184,7 +184,7 @@ it('CLI label repair exception preserves original PRs and still dispatches red-t
     expect(sync.mock.invocationCallOrder[0]).toBeLessThan(recovery.mock.invocationCallOrder[0]);
     expect(rawPrs).toEqual(before);
     expect(dispatch).toHaveBeenCalledTimes(1);
-    expect(dispatch).toHaveBeenCalledWith({ pr, repo, redTeamOnly: true, redTeamMode: 'fresh' });
+    expect(dispatch).toHaveBeenCalledWith({ pr, repo, expectedHead: head, redTeamOnly: true, redTeamMode: 'fresh' });
     expect(result.dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'fresh' }]);
   } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
 });
@@ -216,7 +216,7 @@ it.each(['fresh', 'resume'])('CLI tick options recover an already-reviewed head 
     expect(readEvidence).toHaveBeenCalledWith({ repo, pr, head });
     expect(readStatus).toHaveBeenCalledWith({ repo, pr, head });
     expect(dispatch).toHaveBeenCalledOnce();
-    expect(dispatch).toHaveBeenCalledWith({ pr, repo, redTeamOnly: true, redTeamMode: mode });
+    expect(dispatch).toHaveBeenCalledWith({ pr, repo, expectedHead: head, redTeamOnly: true, redTeamMode: mode });
     expect(take).toHaveBeenCalledOnce();
   } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
 });

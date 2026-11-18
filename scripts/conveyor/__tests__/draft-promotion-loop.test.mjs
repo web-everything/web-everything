@@ -1,20 +1,20 @@
 // @vitest-environment node
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { runDraftPromotionStep } from '../draft-promotion-loop.mjs';
+import { runDraftPromotionStep, runDraftPromotionIfDue, formatDraftPromotionLines } from '../draft-promotion-loop.mjs';
 
 const fixture = JSON.parse(readFileSync(new URL('./fixtures/draft-promotion/pr4567-2026-10-09.json', import.meta.url), 'utf8'));
 const draft = fixture.drafts[0];
 const check = (name, conclusion = 'success', extra = {}) => ({ name, status: 'completed', conclusion, ...extra });
 
 describe('runDraftPromotionStep — forwards reviewHoldOnly from the fresh head read', () => {
-  const run = (fresh) => {
+  const run = (fresh, view = {}) => {
     const ready = vi.fn();
     const clearAwaiting = vi.fn();
     const readHeadCheckState = vi.fn(() => fresh);
     const readPrView = vi.fn(() => ({
       ...draft, baseRefName: 'main', comments: [], isCrossRepository: false,
-      mergeStateStatus: 'CLEAN', body: '',
+      mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE', body: '', ...view,
       statusCheckRollup: [check('test'), check('review-gate', 'failure'),
         check('merge-gate', 'failure', { mergeGateReviewHold: { holds: ['review-gate'], jobId: 123 } })],
     }));
@@ -45,6 +45,49 @@ describe('runDraftPromotionStep — forwards reviewHoldOnly from the fresh head 
   });
 
   it.each([
+    [{ mergeable: 'MERGEABLE', labels: [] }, 'awaiting-ci-trigger', /missing-run recovery/],
+    [{ mergeable: 'CONFLICTING', labels: [] }, 'ci-blocked-by-conflict', /until rebased/],
+    [{ mergeable: 'MERGEABLE', labels: [{ name: 'status:conflict' }] }, 'ci-blocked-by-conflict', /until rebased/],
+    [{ mergeable: 'MERGEABLE', labels: ['merge-status:conflicting'] }, 'ci-blocked-by-conflict', /until rebased/],
+  ])('types unchecked skips from the fresh view: %j', (view, reason, explanation) => {
+    const { result, ready, readPrView } = run({ state: 'unchecked' }, view);
+    expect(readPrView).toHaveBeenCalledTimes(1);
+    expect(result.rows[0]).toMatchObject({ action: 'skip', reason, why: expect.stringMatching(explanation) });
+    expect(formatDraftPromotionLines(result)[0]).toContain(`— ${reason}:`);
+    expect(ready).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when the unchecked PR view is unreadable', () => {
+    const ready = vi.fn();
+    const result = runDraftPromotionStep({
+      repos: [fixture.repo], listDrafts: () => [draft], absentNotApplicable: [],
+      readHeadCheckState: () => ({ state: 'unchecked' }),
+      readPrView: () => { throw new Error('unreadable PR view'); }, ready,
+    });
+    expect(result.rows).toEqual([expect.objectContaining({ action: 'error', why: 'pr view: unreadable PR view' })]);
+    expect(ready).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when the unchecked head moves during the fresh view read', () => {
+    const { result, ready } = run({ state: 'unchecked' }, { headRefOid: 'b'.repeat(40) });
+    expect(result.rows[0]).toMatchObject({ action: 'skip', why: expect.stringContaining('head moved') });
+    expect(ready).not.toHaveBeenCalled();
+  });
+
+  it('re-logs a changed typed reason and dedups an unchanged reason', () => {
+    const write = vi.fn();
+    const invoke = (reason, now, previous = {}) => runDraftPromotionIfDue({ ...previous, write,
+      now: () => now, resolveSettings: () => ({ loop: true, intervalSeconds: 60 }),
+      step: () => ({ rows: [{ repo: fixture.repo, pr: draft.number, action: 'skip', why: 'no checks', reason }] }),
+    });
+    let state = invoke('awaiting-ci-trigger', 0);
+    state = invoke('awaiting-ci-trigger', 60_000, state);
+    expect(write).toHaveBeenCalledTimes(1);
+    invoke('ci-blocked-by-conflict', 120_000, state);
+    expect(write).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
     ['absent', {}],
     ['false', { reviewHoldOnly: false }],
     ['null', { reviewHoldOnly: null }],
@@ -62,7 +105,7 @@ describe('runDraftPromotionStep — forwards reviewHoldOnly from the fresh head 
   it.each(['pending', 'unchecked', undefined])('still refuses %s evidence even with reviewHoldOnly true', state => {
     const { result, ready, readPrView } = run({ state, reviewHoldOnly: true });
     expect(result.rows).toEqual([expect.objectContaining({ action: 'skip' })]);
-    expect(readPrView).not.toHaveBeenCalled();
+    expect(readPrView).toHaveBeenCalledTimes(state === 'unchecked' ? 1 : 0);
     expect(ready).not.toHaveBeenCalled();
   });
 });

@@ -185,7 +185,7 @@ export default {
           } });
         };
         let dispatches = 0, runnerCalls = 0, job;
-        const arc = { root: scratch, now: Date.now, newActorId: () => 'soak-skip-daemon',
+        const arc = { root: scratch, liveHead: () => head, now: Date.now, newActorId: () => 'soak-skip-daemon',
           readPrevCompletion: () => null, claim: () => ({ ok: true }), updateRecord: () => {}, unclaim: () => {},
           acquireLane: () => ({ lanePath: scratch }), releaseLane: () => {}, report: () => {}, log: () => {},
           prepareLane: () => ({ head }), fetchRedTeamHead: () => ({ head }),

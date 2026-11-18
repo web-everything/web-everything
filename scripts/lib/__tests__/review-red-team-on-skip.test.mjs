@@ -63,7 +63,7 @@ describe('unfinished CI-held record retry', () => {
     const o = runFixture(options(saved(attempts)));
     expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review',
       why: 'unfinished review is held only on pending CI at record; resume it (bounded)' });
-    expect(o.dispatch).toHaveBeenCalledWith({ repo, pr });
+    expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, expectedHead: head });
   });
   it.each([
     ['off at zero', () => options(saved(), 0)],
@@ -108,7 +108,7 @@ describe('unfinished retryable record effect', () => {
     const o = runFixture(options([row]));
     expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review',
       why: 'unfinished review has only a retryable pre-write effect; resume it' });
-    expect(o.dispatch).toHaveBeenCalledWith({ repo, pr });
+    expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, expectedHead: head });
   });
   it.each([
     ['not retryable', [{ ...row, retryableRecordEffect: false }]],
@@ -411,7 +411,7 @@ describe('#6345 — resume a stored needs-human review after its refused referra
       why: 'stored review needs-human only on referrals now ruled; resume the parked run' });
     expect(o.readReviewRuns).toHaveBeenCalled();
     expect(o.dispatch).toHaveBeenCalledTimes(1);
-    expect(o.dispatch).toHaveBeenCalledWith({ pr, repo });
+    expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, expectedHead: head });
   });
 
   it.each([
@@ -526,7 +526,7 @@ describe('R100 — #5910 accepted stored review does not owe a red team', () => 
   it.each([['review:accepted'], [{ name: 'review:accepted' }]].map(labels => [labels]))(
     'refuses historical non-accepting stored review despite accepted labels %j', labels => {
       const f = storedFixture(); f.rawPrs[0].labels = labels;
-      expect(planRedTeamOnSkip(f)).toEqual([{ prNumber: storedPr, head: storedHead,
+      expect(planRedTeamOnSkip(f)).toEqual([{ prNumber: storedPr, head: storedHead, expectedHead: storedHead,
         action: 'skip', why: 'stored review does not owe a red team' }]);
     });
 
@@ -1536,7 +1536,7 @@ describe('runRedTeamOnSkip', () => {
   });
   it('dispatches the existing job, spends capacity and records cooldown only for starts', () => {
     const log = vi.fn(), o = runFixture({ log, preferLane: 7 }); const out = runRedTeamOnSkip(o);
-    expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, redTeamOnly: true, redTeamMode: 'fresh', preferLane: 7 });
+    expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, expectedHead: head, redTeamOnly: true, redTeamMode: 'fresh', preferLane: 7 });
     expect(out.dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'fresh' }]);
     expect(o.capacity).toEqual({ lanes: 0, budget: { left: 0 } }); expect(o.lastDispatch.size).toBe(1);
     expect(log).toHaveBeenCalledTimes(1); expect(log.mock.calls[0][0]).toContain('dispatched (fresh)');
@@ -1722,7 +1722,7 @@ describe('card-only head move recovery', () => {
       now: () => 2_000_000, readEvidence: oldEvidence, proveMove: () => ({ ok: true }),
       capacity: { lanes: 1 }, dispatch });
     expect(out.dispatched).toHaveLength(1);
-    expect(dispatch).toHaveBeenCalledWith({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' });
+    expect(dispatch).toHaveBeenCalledWith({ repo, pr, expectedHead: head, redTeamOnly: true, redTeamMode: 'fresh' });
   });
   it('runner default move proof forwards exec, cwd and mainRef to the numbering proof', () => {
     const exec = vi.fn(), cwd = '/fixture/checkout', mainRef = 'fixture/main';
@@ -1734,7 +1734,7 @@ describe('card-only head move recovery', () => {
         capacity: { lanes: 1 }, dispatch, lastDispatch: new Map() });
       expect(out.dispatched).toHaveLength(1);
       expect(detector).toHaveBeenCalledWith({ exec, cwd, mainRef, fromSha, toSha: head });
-      expect(dispatch).toHaveBeenCalledWith({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' });
+      expect(dispatch).toHaveBeenCalledWith({ repo, pr, expectedHead: head, redTeamOnly: true, redTeamMode: 'fresh' });
     } finally { detector.mockRestore(); }
   });
   it('runner default move proof executes the card-path proof with its supplied cwd', () => {
@@ -2077,7 +2077,7 @@ describe('R100 recovery regressions', () => {
       readStatus: () => completed ? { status: 'finished', result: 'ran' } : null,
     });
     const expected = planRedTeamOnSkip(input);
-    expect(expected).toEqual([{ prNumber: pr, head, action: 'dispatch', mode,
+    expect(expected).toEqual([{ prNumber: pr, head, expectedHead: head, action: 'dispatch', mode,
       why: completed ? 'recorded pass needs its result comment/effects' : 'head never had a red-team pass' }]);
     if (label) input.rawPrs[0].labels.push(label);
     if (body) input.rawPrs[0].comments.push(trusted(body));
@@ -2400,7 +2400,7 @@ describe('unprovable accepted head move — fresh full review', () => {
     if (kind === 'no-prior-clear') o.rawPrs[0].comments.pop();
     if (kind === 'absent') o.readEvidence = () => ({ inFlight: false, recorded: false, seatRecorded: false });
     expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review', head });
-    expect(o.dispatch).toHaveBeenCalledTimes(1); expect(o.dispatch).toHaveBeenCalledWith({ pr, repo });
+    expect(o.dispatch).toHaveBeenCalledTimes(1); expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, expectedHead: head });
     expect(o.settle).not.toHaveBeenCalled(); expect(o.syncLabels).not.toHaveBeenCalled();
     expect(o.log).toHaveBeenCalledWith(`review-daemon: ${repo}#${pr} already-reviewed-head — fresh review dispatched for unprovable head move ${head.slice(0, 12)}`);
     o.capacity = { lanes: 1, budget: { left: 1 } };
@@ -2432,7 +2432,7 @@ describe('unprovable accepted head move — fresh full review', () => {
     const o = moved({ readEvidence: () => ({ inFlight: false, recorded: false, seatRecorded: false }) });
     o.rawPrs[0].comments = [];
     expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review', head });
-    expect(o.dispatch).toHaveBeenCalledWith({ pr, repo });
+    expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, expectedHead: head });
   });
   it.each([
     '🔁 review — changes requested\n\nFix the guard.',
@@ -2457,7 +2457,7 @@ describe('unprovable accepted head move — fresh full review', () => {
   it('R640 (operator ruling): a lone red-team:pending does not block the full review', () => {
     const o = moved(); o.rawPrs[0].labels.push('red-team:pending');
     expect(runRedTeamOnSkip(o).rows[0].action).toBe('review');
-    expect(o.dispatch).toHaveBeenCalledWith({ pr, repo });
+    expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, expectedHead: head });
     expect(o.rawPrs[0].labels).toContain('red-team:pending');
   });
   it.each(['inFlight', 'queued', 'recorded', 'seatRecorded', 'completedRecorded', 'status', 'unknown'])(
@@ -2499,7 +2499,7 @@ describe('unprovable accepted head move — fresh full review', () => {
   it('keeps the red-team-only dispatch for an owed stored payload at the live head', () => {
     const o = moved({ readEvidence: () => ({ loopPayload: payload(), inFlight: false, recorded: false, seatRecorded: false }) });
     expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'dispatch', mode: 'fresh' });
-    expect(o.dispatch).toHaveBeenCalledTimes(1); expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, redTeamOnly: true, redTeamMode: 'fresh' });
+    expect(o.dispatch).toHaveBeenCalledTimes(1); expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, expectedHead: head, redTeamOnly: true, redTeamMode: 'fresh' });
   });
 });
 
@@ -3175,4 +3175,43 @@ it('a recovered result check settles the next pass without a recovery seat', () 
   expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'red-team result already on head' });
   expect(o.publishCheck).toHaveBeenCalledTimes(1);
   expect(o.dispatch).not.toHaveBeenCalled();
+});
+
+
+describe('normal candidate pipeline parity', () => {
+  const recoveryWitness = status => ({ head, newest: payload(), seats: [], markers: {},
+    rawWriter: { parsed: { status, host: 'here', pidNamespace: 'ns', pid: 123 } } });
+  const recoveryOptions = { now: 2_000_000, probe: { host: 'here', namespace: 'ns', isAlive: () => false } };
+  const fresh = { action: 'dispatch', mode: 'fresh', why: 'head never had a red-team pass' };
+  it.each([
+    ['no witness', {}, fresh, true],
+    ...['queued', 'running'].map(status => [status + ' witness recovery',
+      { readWitness: () => recoveryWitness(status), recoveryOptions },
+      { action: 'dispatch', mode: 'fresh', staleRecovery: true, why: 'dead owner recovery' }, false]),
+    ['failedRead review-unfinished', { readWitness: () => ({ ok: false, reason: 'review-unfinished' }),
+      headNeverReviewed: () => false },
+      { action: 'skip', why: 'review-unfinished', escalate: true,
+        escalationContext: 'review-unfinished: an unfinished review run holds this head; a human must answer or cancel the pending confirmation' }, false],
+    ['cooldown', { lastDispatch: new Map([[`${repo}#${pr}@${head}`, 2_000_000]]) },
+      { action: 'skip', why: 'retry cooldown active' }, true],
+    ['recovery cooldown', { readWitness: () => recoveryWitness('running'), recoveryOptions,
+      lastDispatch: new Map([[`${repo}#${pr}@${head}`, 2_000_000]]) },
+      { action: 'skip', why: 'retry cooldown active' }, false],
+  ])('%s preserves the decision and evidence-read boundary', (_name, overrides, expected, readsEvidence) => {
+    const readEvidence = vi.fn(() => ({ loopPayload: payload(), recorded: false }));
+    expect(decide({ readEvidence, ...overrides })).toEqual({ prNumber: pr, head, expectedHead: head, ...expected });
+    expect(readEvidence).toHaveBeenCalledTimes(readsEvidence ? 1 : 0);
+  });
+
+  it.each(['dispatch', 'review'])('preserves the %s dispatch arguments', action => {
+    const o = runFixture(action === 'review' ? {
+      rawPrs: [{ number: pr, headRefOid: head, comments: [], reviews: [], labels: [] }],
+      readEvidence: () => ({ ok: false, reason: 'review-unfinished' }), headNeverReviewed: () => true,
+    } : {});
+    const out = runRedTeamOnSkip(o);
+    expect(out.rows[0]).toMatchObject({ action, head });
+    expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, expectedHead: head,
+      ...(action === 'dispatch' ? { redTeamOnly: true, redTeamMode: 'fresh' } : {}) });
+    expect(out.dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: action === 'dispatch' ? 'fresh' : 'review' }]);
+  });
 });

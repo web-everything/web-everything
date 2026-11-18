@@ -495,7 +495,8 @@ export function planRedTeamOnSkip({ repo, plan, refusals = plan?.refusals ?? [],
     const rawPr = (rawPrs ?? []).find(p => Number(p?.number) === pr);
     const head = rawPr?.headRefOid ?? null;
     const request = explicitRequest?.head === head ? explicitRequest : redTeamRequestForHead(rawPr?.comments, { repo, pr, head });
-    const row = { prNumber: pr, head, action: 'skip', ...(request ? { requestReason: request.reason } : {}) };
+    const candidate = { pr, head, expectedHead: head, mode: nomination ? 'nomination' : 'normal' };
+    const row = { prNumber: pr, head, expectedHead: candidate.expectedHead, action: 'skip', ...(request ? { requestReason: request.reason } : {}) };
     const skip = why => ({ ...row, why });
     // #6606: a verdict carry settles the head with a result but no round, so nothing else republishes its check. While
     // its outbox marker says the check is unconfirmed, a result on head is not settled: republish from live evidence,
@@ -538,12 +539,14 @@ export function planRedTeamOnSkip({ repo, plan, refusals = plan?.refusals ?? [],
     const guardedSkip = why => ({ ...skip(why),
       ...(why === 'conflicting label prevents policy-clear' ? { escalate: true } : {}) });
     const fallback = 'automatic nomination requires a finished live-head review; use red-team-enqueue --actor=<login> --reason=<text>';
-    const dispatchDecision = decision => {
-      if (nomination && !request && decision.action === 'review') return skip(fallback);
+    const proposeDispatch = decision => ({ ...candidate, decision });
+    function dispatchDecision(candidate) {
+      if (!candidate.decision) return candidate;
+      if (candidate.mode === 'nomination' && !request && candidate.decision.action === 'review') return skip(fallback);
       const last = lastDispatch.get(`${repo}#${pr}@${head}`);
       if (last != null && now - last < setting.retryCooldownMin * 60_000) return skip('retry cooldown active');
-      return { ...row, ...decision };
-    };
+      return { ...row, ...candidate.decision };
+    }
     const failedRead = result => {
       if (result.reason === 'review-unfinished') {
         try {
@@ -555,13 +558,13 @@ export function planRedTeamOnSkip({ repo, plan, refusals = plan?.refusals ?? [],
             ? findResumableParkedRun({ number: pr, headRefOid: head, comments: rawPr.comments }, runs, { repo, ciHeldRecordRetryMax: setting.ciHeldRecordRetryMax }) : null;
           const matching = resumable && runs.find(r => r.id === resumable.id);
           if (matching?.retryableRecordEffect === true) {
-            return dispatchDecision({ action: 'review', why: 'unfinished review has only a retryable pre-write effect; resume it' });
+            return proposeDispatch({ action: 'review', why: 'unfinished review has only a retryable pre-write effect; resume it' });
           }
           if (setting.ciHeldRecordRetryMax > 0 && Number.isFinite(matching?.ciHeldRecordRetry?.attempts)
             && matching.ciHeldRecordRetry.attempts <= setting.ciHeldRecordRetryMax
             && Number.isSafeInteger(matching.ciHeldRecordRetry.resumeAttempts) && matching.ciHeldRecordRetry.resumeAttempts >= 0
             && matching.ciHeldRecordRetry.resumeAttempts < RESUME_MAX_ATTEMPTS) {
-            return dispatchDecision({ action: 'review', why: 'unfinished review is held only on pending CI at record; resume it (bounded)' });
+            return proposeDispatch({ action: 'review', why: 'unfinished review is held only on pending CI at record; resume it (bounded)' });
           }
         } catch { /* Unreadable evidence keeps the human hold. */ }
         let neverReviewed = false;
@@ -575,25 +578,36 @@ export function planRedTeamOnSkip({ repo, plan, refusals = plan?.refusals ?? [],
           if (reviews === null) return skip('PR reviews unreadable; inspect formal reviews before full review');
           if (laterReviewHold(reviews)) return skip('formal review hold prevents full review; inspect formal reviews');
           // R640: a review is always allowed here; a red team still needs a finished review.
-          return dispatchDecision({ action: 'review', why: 'head never reviewed; a review is always allowed' });
+          return proposeDispatch({ action: 'review', why: 'head never reviewed; a review is always allowed' });
         }
         return { ...skip(result.reason), escalate: true, escalationContext: UNFINISHED_REVIEW_CONTEXT };
       }
       return skip(result.reason);
     };
-    try {
-      if (nomination) {
-        const reason = redTeamNominationRefusal(plannerRow, rawPr, plannerRows);
-        if (reason) return skip(reason);
+    function witnessDecision(candidate) {
+      if (candidate.mode === 'nomination' && !readWitness) return skip('red-team witness unreadable; inspect stored evidence before retrying');
+      if (readWitness) {
+        const w = readWitness({ repo, pr, head });
+        if (w?.ok === false) return candidate.mode === 'nomination' ? skip(w.reason) : failedRead(w);
+        // Successful shared witnesses carry rawWriter/seats (legacy success has no ok field).
+        if (candidate.mode === 'nomination' && (!w?.rawWriter || !Array.isArray(w.seats) || ('ok' in w && w.ok !== true)))
+          return skip('red-team witness unreadable; inspect stored evidence before retrying');
+        if (['queued', 'running'].includes(w.rawWriter.parsed?.status) || w.rawWriter.parsed?.staleAbandoned) {
+          const recovery = planRedTeamRecovery(w, { ...recoveryOptions, setting });
+          return recovery.mode === 'skip' ? { ...skip(recovery.why),
+            ...(recovery.escalate ? { escalate: true, escalationContext: recovery.escalationContext } : {}) }
+            : proposeDispatch({ action: 'dispatch', mode: recovery.mode, staleRecovery: true, why: 'dead owner recovery' });
+        }
       }
-      if (!setting.enabled) return skip('reviewRedTeamOnSkip.enabled=false');
-      if (!isRealHead(head) || ((refusal.headSha ?? refusal.headRefOid) != null && (refusal.headSha ?? refusal.headRefOid) !== head)) return skip('live head missing or changed');
-      // Unknown comments cannot establish that no result was published.
-      if (!Array.isArray(rawPr.comments)) return skip('PR comments unreadable');
-      const nominationEvidence = nomination ? readEvidence({ repo, pr, head }) : null;
-      if (nomination) {
-        if (nominationEvidence?.ok === false) return skip(nominationEvidence.reason);
-        const payload = nominationEvidence?.loopPayload, storedHead = payload?.findings?.read?.netBasis?.rev;
+      return candidate;
+    }
+    function guardDecision(candidate) {
+      // Recovery and failed-read decisions retain their existing bypass of the stored-review guards.
+      if (candidate.action || (candidate.mode !== 'nomination' && candidate.decision)) return candidate;
+      const evidence = readEvidence({ repo, pr, head });
+      if (evidence?.ok === false) return candidate.mode === 'nomination' ? skip(evidence.reason) : failedRead(evidence);
+      if (candidate.mode === 'nomination') {
+        const payload = evidence?.loopPayload, storedHead = payload?.findings?.read?.netBasis?.rev;
         const stale = isRealHead(storedHead) && storedHead !== head;
         const explicitAdvisory = request && stale;
         if (explicitAdvisory) {
@@ -612,27 +626,14 @@ export function planRedTeamOnSkip({ repo, plan, refusals = plan?.refusals ?? [],
           && !rawPr.labels.some(l => (typeof l === 'string' ? l : l?.name) !== 'review:human' && conflictsWithPolicyClear(l, { settlesPending: true })) ? `${hold}; ${fallback}` : hold);
         if (storedHead !== head) {
           if (!explicitAdvisory) return skip(fallback);
-          if (nominationEvidence.inFlight !== false || nominationEvidence.queued || nominationEvidence.recorded !== false
-            || nominationEvidence.seatRecorded !== false || nominationEvidence.completedRecorded || nominationEvidence.cleanRecorded
-            || nominationEvidence.status?.head === head || readStatus({ repo, pr, head }) != null) return skip('live head already has review/red-team state');
-          return dispatchDecision({ action: 'review', why: 'explicit request for a fresh human-handoff advisory' });
+          if (evidence.inFlight !== false || evidence.queued || evidence.recorded !== false
+            || evidence.seatRecorded !== false || evidence.completedRecorded || evidence.cleanRecorded
+            || evidence.status?.head === head || readStatus({ repo, pr, head }) != null) return skip('live head already has review/red-team state');
+          return proposeDispatch({ action: 'review', why: 'explicit request for a fresh human-handoff advisory' });
         }
         if (!redTeamOwedFor(payload)) return skip('stored finished review does not owe a red team');
       }
-      const journal = readCarry({ repo, pr, head });
-      if (redTeamForHead(rawPr.comments, pr, head) && (!journal || journal.step === 'done')) return resultOnHead();
-      if (readWitness) {
-        const w = readWitness({ repo, pr, head });
-        if (w?.ok === false) return nomination ? skip(w.reason) : failedRead(w);
-        if (['queued', 'running'].includes(w.rawWriter.parsed?.status) || w.rawWriter.parsed?.staleAbandoned) {
-          const recovery = planRedTeamRecovery(w, { ...recoveryOptions, setting });
-          return recovery.mode === 'skip' ? { ...skip(recovery.why),
-            ...(recovery.escalate ? { escalate: true, escalationContext: recovery.escalationContext } : {}) }
-            : dispatchDecision({ action: 'dispatch', mode: recovery.mode, staleRecovery: true, why: 'dead owner recovery' });
-        }
-      }
-      const evidence = nominationEvidence ?? readEvidence({ repo, pr, head });
-      if (evidence?.ok === false) return nomination ? skip(evidence.reason) : failedRead(evidence);
+      if (candidate.decision) return candidate;
       if (evidence?.carryConflict) return skip('later review supersedes the carry');
       const unfinishedCarry = evidence?.carry && evidence.carry.step !== 'done';
       if (redTeamForHead(rawPr.comments, pr, head) && !unfinishedCarry) return resultOnHead();
@@ -732,7 +733,7 @@ export function planRedTeamOnSkip({ repo, plan, refusals = plan?.refusals ?? [],
         // floor: a missing acceptance cannot establish that a review was cleared.
         if (reviews === null) return skip('PR reviews unreadable; inspect formal reviews before full review');
         if (laterReviewHold(reviews)) return skip('formal review hold prevents full review; inspect formal reviews');
-        return dispatchDecision({ action: 'review', why });
+        return proposeDispatch({ action: 'review', why });
       };
       if (needsReview) return fullReviewDecision('unprovable head move needs a full review');
       if (verdict === VERDICTS.NEEDS_HUMAN && storedHead === head) {
@@ -805,7 +806,20 @@ export function planRedTeamOnSkip({ repo, plan, refusals = plan?.refusals ?? [],
       else return skip(`prior result ${typeof prior === 'string' ? prior : 'unknown'} (status ${status?.status ?? 'missing'}); not re-run`);
       // Even a policy-settlement fallback must not turn a spent retry into fresh provider work.
       if (mode === 'fresh' && status?.retryCount >= 1) return skip('red-team retry already spent; inspect stored evidence');
-      return dispatchDecision({ action: 'dispatch', mode, why: mode === 'resume' ? 'recorded pass needs its result comment/effects' : 'head never had a red-team pass' });
+      return proposeDispatch({ action: 'dispatch', mode, why: mode === 'resume' ? 'recorded pass needs its result comment/effects' : 'head never had a red-team pass' });
+    }
+    try {
+      if (nomination) {
+        const reason = redTeamNominationRefusal(plannerRow, rawPr, plannerRows);
+        if (reason) return skip(reason);
+      }
+      if (!setting.enabled) return skip('reviewRedTeamOnSkip.enabled=false');
+      if (!isRealHead(head) || ((refusal.headSha ?? refusal.headRefOid) != null && (refusal.headSha ?? refusal.headRefOid) !== head)) return skip('live head missing or changed');
+      // Unknown comments cannot establish that no result was published.
+      if (!Array.isArray(rawPr.comments)) return skip('PR comments unreadable');
+      const journal = readCarry({ repo, pr, head });
+      if (redTeamForHead(rawPr.comments, pr, head) && (!journal || journal.step === 'done')) return resultOnHead();
+      return dispatchDecision(guardDecision(witnessDecision(candidate)));
     } catch { return skip('red-team evidence unreadable; inspect stored evidence before retrying'); }
   });
 }
@@ -1058,6 +1072,53 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       }
       return rawPr;
     };
+    function executeDispatchDecision(row) {
+      if (row.action !== 'dispatch' && row.action !== 'review') return false;
+      let started = false;
+      const budget = capacity?.budget;
+      if (!hasReviewCapacity(capacity)) row.why = 'no review capacity left';
+      else if (dryRun) row.why = `dry run (${row.mode ?? row.action})`;
+      else {
+        const reserved = budget && Number.isFinite(budget.left);
+        if (reserved) budget.left--;
+        try {
+          if (row.staleRecovery && !abandon({ repo, pr: row.prNumber, head: row.head }).ok) throw new PreStartDispatchRefusalError('stale abandonment refused');
+          const result = dispatch({ pr: row.prNumber, repo, expectedHead: row.expectedHead,
+            ...(row.action === 'dispatch' ? { redTeamOnly: true, redTeamMode: row.mode } : {}),
+            ...(preferLane != null ? { preferLane } : {}) });
+          if (result?.skipped || !Number.isInteger(result?.jobPid)) {
+            const refundable = result?.skipped !== 'live-job'
+              || (budget?.countedJobPids instanceof Set && budget.countedJobPids.has(result.jobPid));
+            if (reserved && refundable) budget.left++;
+            row.why = result?.skipped ?? 'job did not start';
+          } else {
+            capacity.lanes--;
+            if (capacity.remainingStarts != null) capacity.remainingStarts--;
+            capacity.take?.();
+            history.set(`${repo}#${row.prNumber}@${row.head}`, at);
+            dispatched.push({ prNumber: row.prNumber, jobPid: result.jobPid, mode: row.mode ?? row.action });
+            started = true;
+          }
+        } catch (error) {
+          const message = safeErrorText(error);
+          const text = safeLine(message).slice(0, 300);
+          note(`review-daemon: ${repo}#${row.prNumber} red-team dispatch threw: ${text}`);
+          if (error instanceof PreStartDispatchRefusalError) {
+            // These guards refuse before spawning; leave capacity and cooldown available for retry.
+            if (reserved) budget.left++;
+            row.why = `dispatch refused before start: ${text}`;
+          } else {
+            // An unclassified throw may follow a spawn: retain its reservation until the next live process read.
+            capacity.lanes--;
+            if (capacity.remainingStarts != null) capacity.remainingStarts--;
+            capacity.take?.();
+            row.why = `dispatch failed; start unknown: ${text}`;
+          }
+        }
+      }
+      if (!started) { row.action = 'skip'; notStarted.push({ prNumber: row.prNumber, reason: row.why }); }
+      return started;
+    }
     const publicationAttempts = new Set();
     for (const row of rows) {
       if (row.settleError) note(`review-daemon: ${repo}#${row.prNumber} ${row.settleError}`);
@@ -1094,7 +1155,6 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           }
         }
       }
-      let started = false;
       if (!dryRun && row.action === 'skip') {
         try {
           const key = { repo, pr: row.prNumber, head: row.head };
@@ -1195,50 +1255,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           }
         }
       }
-      if (row.action === 'dispatch' || row.action === 'review') {
-        const budget = capacity?.budget;
-        if (!hasReviewCapacity(capacity)) row.why = 'no review capacity left';
-        else if (dryRun) row.why = `dry run (${row.mode ?? row.action})`;
-        else {
-          const reserved = budget && Number.isFinite(budget.left);
-          if (reserved) budget.left--;
-          try {
-            if (row.staleRecovery && !abandon({ repo, pr: row.prNumber, head: row.head }).ok) throw new PreStartDispatchRefusalError('stale abandonment refused');
-            const result = dispatch({ pr: row.prNumber, repo,
-              ...(row.action === 'dispatch' ? { redTeamOnly: true, redTeamMode: row.mode } : {}),
-              ...(preferLane != null ? { preferLane } : {}) });
-            if (result?.skipped || !Number.isInteger(result?.jobPid)) {
-              const refundable = result?.skipped !== 'live-job'
-                || (budget?.countedJobPids instanceof Set && budget.countedJobPids.has(result.jobPid));
-              if (reserved && refundable) budget.left++;
-              row.why = result?.skipped ?? 'job did not start';
-            } else {
-              capacity.lanes--;
-              if (capacity.remainingStarts != null) capacity.remainingStarts--;
-              capacity.take?.();
-              history.set(`${repo}#${row.prNumber}@${row.head}`, at);
-              dispatched.push({ prNumber: row.prNumber, jobPid: result.jobPid, mode: row.mode ?? row.action });
-              started = true;
-            }
-          } catch (error) {
-            const message = safeErrorText(error);
-            const text = safeLine(message).slice(0, 300);
-            note(`review-daemon: ${repo}#${row.prNumber} red-team dispatch threw: ${text}`);
-            if (error instanceof PreStartDispatchRefusalError) {
-              // These guards refuse before spawning; leave capacity and cooldown available for retry.
-              if (reserved) budget.left++;
-              row.why = `dispatch refused before start: ${text}`;
-            } else {
-              // An unclassified throw may follow a spawn: retain its reservation until the next live process read.
-              capacity.lanes--;
-              if (capacity.remainingStarts != null) capacity.remainingStarts--;
-              capacity.take?.();
-              row.why = `dispatch failed; start unknown: ${text}`;
-            }
-          }
-        }
-        if (!started) { row.action = 'skip'; notStarted.push({ prNumber: row.prNumber, reason: row.why }); }
-      }
+      const started = executeDispatchDecision(row);
       if (started && row.action === 'review') {
         note(`review-daemon: ${repo}#${row.prNumber} already-reviewed-head — fresh review dispatched for unprovable head move ${String(row.head).slice(0, 12)}`);
       } else note(`review-daemon: ${repo}#${row.prNumber} already-reviewed-head — red team ${started ? `dispatched (${row.mode})` : ['clear', 'carry'].includes(row.action) && !dryRun ? 'cleared' : 'not dispatched'} for head ${String(row.head ?? 'unknown').slice(0, 12)}: ${row.why}`);

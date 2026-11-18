@@ -1,9 +1,7 @@
 /** Head-bound requests share the daemon's ordinary recovery queue, never a direct dispatch. */
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { isRealHead } from './red-team-skip-outcome.mjs';
-
 const PREFIX = '<!-- red-team-request: ';
-
 export function validateRedTeamRequest(input) {
   if (!Number.isSafeInteger(input?.pr) || input.pr < 1) throw Error('red-team-enqueue: --pr must be a positive safe integer');
   if (typeof input.repo !== 'string' || input.repo.length > 240 || !/^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(input.repo)) throw Error('red-team-enqueue: --repo must be owner/repo');
@@ -14,7 +12,6 @@ export function validateRedTeamRequest(input) {
   }
   return { ...input, reason: input.reason.trim() };
 }
-
 export function redTeamRequestBody(request) {
   const record = validateRedTeamRequest(request);
   if (!isRealHead(record.head)) throw Error('red-team-enqueue: live head unreadable');
@@ -23,7 +20,6 @@ export function redTeamRequestBody(request) {
     .replace(/</g, '\\u003c').replace(/>/g, '\\u003e');
   return `${PREFIX}${json} -->\nRed-team run requested at the recorded head. The daemon applies its normal evidence, queue and capacity guards.`;
 }
-
 export function redTeamRequestForHead(comments, { repo, pr, head }) {
   if (!Array.isArray(comments)) return null;
   for (const comment of [...comments].reverse()) {
@@ -39,4 +35,3 @@ export function redTeamRequestForHead(comments, { repo, pr, head }) {
   }
   return null;
 }
-
