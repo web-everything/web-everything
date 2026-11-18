@@ -4682,6 +4682,11 @@ Runtime-only build-priority regressions live in `scripts/lib/__tests__/build-pri
 and `skills-src/conveyor/__tests__/build-dispatch-runtime-only.test.mjs`. Filter direct card aliases
 before dispatch lane/scope assignment; a listed ancestor lifts priority but does not grant membership.
 Keep `bornAs` and id metadata through queue projections so num-only build/prepare plans retain direct alias membership.
+The `runtime-only-assignment-and-alias` soak checks both pre-assignment filtering and
+the shared `assertRuntimeAdmitted`/`withRuntimeAdmission` boundary. Its companion test
+pins fix detection to true: removing a landed gate must not silently turn the scenario
+into an expected failure. Preserve grouped-provider refusals independently of runtime
+membership, including CI-heal: an admitted group still needs a group-capable provider.
 Runtime-only admission validates `bornAs` with the build-priority settings validator and requires a durable hash: numeric aliases never authorize another card, and a different hash never grants membership. Cover both build and prepare paths.
 
 

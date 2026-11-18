@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { orderQueueDetailed, readBuildPrioritySettings } from '../../../lib/build-queue.mjs';
 import { dispatchPlan, projectBuildQueueRow } from '../../../readiness/dispatch-plan.mjs';
 import { planTick } from '../../tick-core.mjs';
+import { assertRuntimeAdmitted, withRuntimeAdmission, withRuntimeAdmissionTick, setRuntimeAdmissionCards } from '../../../lib/runtime-admission.mjs';
 
 const now = Date.parse('2026-11-18T13:14:00Z');
 const freeLanes = [20, 21];
@@ -36,12 +37,20 @@ export default {
     'scripts/readiness/dispatch-plan.mjs', 'scripts/lib/build-queue.mjs',
     'scripts/conveyor/tick-core.mjs', 'scripts/readiness/conveyor-state.mjs',
     'skills-src/conveyor/build-dispatch-daemon.mjs',
+    'scripts/lib/runtime-admission.mjs',
   ] },
   fixPresent(root) {
     const planner = readFileSync(join(root, 'scripts/readiness/dispatch-plan.mjs'), 'utf8');
-    const admission = readFileSync(join(root, 'scripts/lib/build-queue.mjs'), 'utf8');
+    const admission = readFileSync(join(root, 'scripts/lib/runtime-admission.mjs'), 'utf8');
+    const identity = readFileSync(join(root, 'scripts/lib/build-queue.mjs'), 'utf8');
+    const daemon = readFileSync(join(root, 'skills-src/conveyor/build-dispatch-daemon.mjs'), 'utf8');
     return planner.includes('filterRuntimeCandidates(items, buildPriority)')
-      && /(?:card\?\.|item\.)bornAs/.test(admission);
+      && planner.includes("blocked('runtime-only', !runtimeCandidates.has(item)")
+      && admission.includes('export function assertRuntimeAdmitted(')
+      && admission.includes('export function withRuntimeAdmission(')
+      && admission.includes('if (runtimeRefused.length) return')
+      && daemon.includes('withRuntimeAdmission({ ...pick, groupMembers }')
+      && /card\?\.bornAs/.test(identity);
   },
   async run({ log } = {}) {
     const violations = [];
@@ -76,6 +85,29 @@ export default {
     log?.(`alias rank=${aliasOrder.ranked[0]?.buildPriorityIndex} builds=${aliasBuilds.join(',')} prepares=${aliasPrepares.join(',')}`);
     if (JSON.stringify(aliasBuilds) !== '["8001"]') violations.push(`bornAs build withheld: ${JSON.stringify(build.plan)}`);
     if (JSON.stringify(aliasPrepares) !== '["8001"]') violations.push(`bornAs prepare withheld: ${JSON.stringify(prepare.plan)}`);
+    // Exercise the shared launch gate as well as the pure pre-assignment filter.
+    // Num-only plans must recover the persisted bornAs identity at the IO boundary.
+    await withRuntimeAdmissionTick(() => aliasPriority, async () => {
+      setRuntimeAdmissionCards(aliasOrder.queue);
+      for (const kind of ['build', 'prepare-item']) {
+        if (!assertRuntimeAdmitted({ num: alias.num }, kind).admitted) violations.push(`bornAs ${kind} refused by shared admission`);
+        let launches = 0;
+        withRuntimeAdmission({ num: alias.num }, kind, () => { launches++; });
+        if (launches !== 1) violations.push(`bornAs ${kind} launch withheld by shared gate`);
+      }
+      return {};
+    });
+    // A disallowed child must remain refused even if an older planner forwards it.
+    await withRuntimeAdmissionTick(() => priority, async () => {
+      setRuntimeAdmissionCards(queue);
+      for (const kind of ['build', 'prepare-item']) {
+        if (assertRuntimeAdmitted({ num: '7001' }, kind).admitted) violations.push(`unlisted child admitted for ${kind}`);
+        let launches = 0;
+        const result = withRuntimeAdmission({ num: '7001' }, kind, () => { launches++; });
+        if (launches !== 0 || result?.outcome !== 'runtime-refused') violations.push(`unlisted child escaped ${kind} launch gate`);
+      }
+      return {};
+    });
     return { violations };
   },
   judge(report) { return report.violations; },

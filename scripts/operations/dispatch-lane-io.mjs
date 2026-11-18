@@ -1848,7 +1848,7 @@ export function routeDispatchProvider(request, {
   resolveCodexRoute = resolveCodexTaskRoute,
 } = {}) {
   const kind = String(request?.launchKind || 'build');
-  const grouped = Boolean(request?.groupMembers?.length) && kind !== 'ci-heal';
+  const grouped = Boolean(request?.groupMembers?.length);
   if (grouped && !['build', 'prepare-item'].includes(kind)) {
     throw notApplied(`dispatch-lane: grouped requests are unsupported for ${kind}`);
   }
@@ -1982,7 +1982,7 @@ export function defaultClaudeProvider(request, {
 } = {}) {
   // Preserve the early refusal before brief validation and session bookkeeping.
   if (!assertRuntimeAdmitted(request, request?.launchKind ?? 'build').admitted) throw notApplied('runtime admission refused');
-  if (request?.groupMembers?.length && request.launchKind !== 'ci-heal') {
+  if (request?.groupMembers?.length) {
     throw notApplied('dispatch-lane: grouped requests require a group-capable worker provider');
   }
   // #x2psfwz — a PR_KIND session name (`review-`/`fix-`/`ci-heal-`/`inspect-<PR>`) carries NO attempt suffix

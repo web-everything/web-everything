@@ -244,14 +244,23 @@ describe('x87v3ed — the build launch reserves its lane first', () => {
       expect(releaseLane).not.toHaveBeenCalled();
     });
   });
-  it('repairs a fully admitted grouped PR through the default Claude CI-heal provider', async () => {
+  it('default Claude provider refuses a fully admitted grouped CI-heal request', async () => {
     const spawnAgent = vi.fn(() => 'backgrounded · healed-group · n');
     const sinks = baseSinks({ readRuntimeSettings: () => ({ mode: 'only', only: true, ids: ['12', '13'] }),
       reserveLane: () => ({}), provider: request => defaultClaudeProvider(request, { wrapKind: () => false, spawnAgent }),
     });
-    await sinks[DISPATCH_EFFECT]({ ...payload, num: '12', launchKind: 'ci-heal', groupMembers: ['13'] });
-    expect(spawnAgent).toHaveBeenCalledTimes(1);
-    expect(spawnAgent.mock.calls[0][2]).toMatchObject({ num: '12', groupMembers: ['13'], launchKind: 'ci-heal' });
+    await expect(sinks[DISPATCH_EFFECT]({ ...payload, num: '12', launchKind: 'ci-heal', groupMembers: ['13'] }))
+      .rejects.toMatchObject({ notApplied: true, message: 'dispatch-lane: grouped requests require a group-capable worker provider' });
+    expect(spawnAgent).not.toHaveBeenCalled();
+  });
+  it('rejects a grouped CI-heal request before routing to a non-group-capable provider', async () => {
+    const agent = vi.fn(() => 'pid:123');
+    await withRuntimeAdmissionTick(() => ({ mode: 'only', only: true, ids: ['12', '13'] }), async () => {
+      expect(() => routeDispatchProvider({ num: '12', launchKind: 'ci-heal', groupMembers: ['13'] }, { agent }))
+        .toThrow('dispatch-lane: grouped requests are unsupported for ci-heal');
+      expect(agent).not.toHaveBeenCalled();
+      return {};
+    });
   });
   it('passes the sink settings reader and card identity into the default raw spawn', async () => {
     const readRuntimeSettings = vi.fn(() => ({ mode: 'only', only: true, ids: ['12'] }));
