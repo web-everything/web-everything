@@ -86,12 +86,20 @@ export function freezeProbation({ adoptionId, sha, provenGood, adoptedAt, regist
  */
 export function recordProof(probation, daemonId, evidence, now) {
   if (validateProbation(probation, now) !== null || !probation.owed.includes(daemonId)) return probation;
-  const copy = e => (object(e) ? { ...e } : e);
-  const next = { ...probation, records: { ...probation.records,
-    [daemonId]: { boot: copy(evidence?.boot), tick: copy(evidence?.tick) } } };
-  if (validateProbation(next, now) !== null) return probation;
-  return Object.freeze({ ...next, records: Object.freeze(Object.fromEntries(
-    Object.entries(next.records).map(([id, r]) => [id, Object.freeze({ boot: Object.freeze(r.boot), tick: Object.freeze(r.tick) })]))) });
+  const next = snapshot({ ...probation, records: { ...probation.records,
+    [daemonId]: { boot: evidence?.boot, tick: evidence?.tick } } });
+  return validateProbation(next, now) === null ? next : probation;
+}
+
+/** A fresh, deeply frozen copy: the returned state shares no array or object with its input,
+ * so a caller mutating restored (e.g. JSON-parsed) state can never change a state it was given.
+ * Validation runs on the copy, so what was checked is exactly what is returned.
+ */
+function snapshot(p) {
+  const copy = e => (object(e) ? Object.freeze({ ...e }) : e);
+  const records = object(p.records) ? p.records : {};
+  return Object.freeze({ ...p, owed: Object.freeze(Array.from(p.owed)), records: Object.freeze(Object.fromEntries(
+    Object.entries(records).map(([id, r]) => [id, object(r) ? Object.freeze({ boot: copy(r.boot), tick: copy(r.tick) }) : r]))) });
 }
 
 /** Promotion is a caller-owned effect, authorized only by `pass`. Legacy/malformed state cannot pass. */

@@ -122,6 +122,46 @@ describe('R986 I1 frozen owed set and per-daemon proofs (pure core)', () => {
     expect(() => second.owed.pop()).toThrow();
   });
 
+  it('a proof transition on state restored from JSON never aliases or freezes the caller input', async () => {
+    const { freezeProbation, recordProof, evaluateProbation } = await core();
+    const restored = JSON.parse(JSON.stringify(recordProof(freezeProbation(options), 'worker', proof(101), now)));
+    const next = recordProof(restored, 'review', proof(202, 'review'), now);
+    expect(evaluateProbation(next, now)).toEqual({ action: 'pass' });
+    expect(next).not.toBe(restored);
+    expect(next.owed).not.toBe(restored.owed);
+    expect(next.records.worker.boot).not.toBe(restored.records.worker.boot);
+    expect(next.records.worker.tick).not.toBe(restored.records.worker.tick);
+    for (const part of [next, next.owed, next.records, next.records.worker, next.records.worker.boot,
+      next.records.worker.tick, next.records.review.boot, next.records.review.tick]) expect(Object.isFrozen(part)).toBe(true);
+    // The caller's restored input stays its own, mutable object: no freezing as a side effect.
+    expect(Object.isFrozen(restored.owed)).toBe(false);
+    expect(Object.isFrozen(restored.records.worker.boot)).toBe(false);
+    restored.owed.pop();
+    restored.owed.push('ghost');
+    restored.records.worker.boot.pid = 999;
+    expect(next.owed).toEqual(['worker', 'review']);
+    expect(next.records.worker.boot.pid).toBe(101);
+    expect(evaluateProbation(next, now)).toEqual({ action: 'pass' });
+    // A restored state with only one proof stays pending after its input is mutated.
+    const half = JSON.parse(JSON.stringify(freezeProbation(options)));
+    const one = recordProof(half, 'worker', proof(101), now);
+    half.owed.pop();
+    half.owed.pop();
+    expect(evaluateProbation(one, now)).toEqual({ action: 'pending', owed: ['review'] });
+  });
+
+  it('a proof transition never aliases the caller evidence objects', async () => {
+    const { freezeProbation, recordProof, evaluateProbation } = await core();
+    const evidence = proof(101);
+    const next = recordProof(freezeProbation({ ...options, registered: [{ id: 'worker' }] }), 'worker', evidence, now);
+    evidence.boot.pid = 5;
+    evidence.tick.head = OTHER;
+    expect(next.records.worker.boot.pid).toBe(101);
+    expect(next.records.worker.tick.head).toBe(FAILED);
+    expect(Object.isFrozen(evidence.boot)).toBe(false);
+    expect(evaluateProbation(next, now)).toEqual({ action: 'pass' });
+  });
+
   it.each(['pid', 'head', 'before-adoption', 'before-boot', 'future', 'unapproved-head', 'missing-start', 'wrong-daemon', 'wrong-boot-daemon'])(
     'rejects invalid previous tick evidence: %s', async kind => {
       const { freezeProbation, recordProof, evaluateProbation } = await core();
