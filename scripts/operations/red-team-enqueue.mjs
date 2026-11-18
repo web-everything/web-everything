@@ -23,7 +23,8 @@ function liveRedTeamRequest(input, live) {
 export function planRedTeamEnqueue(input, live, planning) {
   const request = liveRedTeamRequest(input, live);
   const decision = planRedTeamNomination({ ...planning, repo: request.repo, pr: request.pr,
-    explicitRequest: request, rawPrs: [{ ...live, number: request.pr }] });
+    explicitRequest: request, rawPrs: [{ ...planning.plan?.enrichedPrs?.find(raw =>
+      Number(raw.number) === request.pr && raw.headRefOid === request.head), ...live, number: request.pr }] });
   if (!['dispatch', 'review'].includes(decision.action)) throw Error(`red-team-enqueue: ${decision.why}`);
   return request;
 }

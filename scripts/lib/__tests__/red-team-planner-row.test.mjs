@@ -93,14 +93,125 @@ describe('readPlannerRow', () => {
     }
   });
 
-  it('uses the producer classification with an adapted refusal instead of re-deriving it from the raw daemon snapshot', () => {
+  it('recomputes the current snapshot while preserving an adapted refusal', () => {
     const original = refusal('nothing-owed', { phase: 'queued' });
-    const saved = readPlannerRow({ pr, refusals: [original], rawPrs: [rawPr([check('review-gate')])], requiredChecks: ['review-gate'] });
+    const requiredChecks = ['review-gate'];
+    const saved = readPlannerRow({ repo, pr, refusals: [original], rawPrs: [rawPr([check('review-gate')])], requiredChecks });
     const adapted = { ...original, kind: 'already-reviewed-head' };
-    const result = readPlannerRow({ repo, pr, plan: { refusals: [adapted], plannerRows: [saved] }, rawPrs: [rawPr()] });
+    const result = readPlannerRow({ repo, pr, plan: { refusals: [adapted], plannerRows: [saved] }, rawPrs: [rawPr()], requiredChecks });
     expect(result.refusal).toBe(adapted);
-    expect(result.reviewOwnedChecks).toBe(saved.reviewOwnedChecks);
-    expect(result.reviewOwnedChecks.reviewOwned).toEqual(['review-gate']);
+    expect(result.reviewOwnedChecks).not.toBe(saved.reviewOwnedChecks);
+    expect(result.reviewOwnedChecks.reviewOwned).toEqual([]);
+    expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: false, affected: [{ name: 'review-gate', reason: 'missing' }] });
+  });
+
+  it.each(['failure', 'success'])('rejects %s checks entirely from another head for CI and red-only evidence', conclusion => {
+    const checks = [check('test', 'success'), check('review-gate', conclusion)]
+      .map(row => ({ ...row, head_sha: 'b'.repeat(40) }));
+    const result = readPlannerRow({ repo, pr, refusals: [refusal('review-ci')],
+      rawPrs: [rawPr(checks)], requiredChecks: ['test', 'review-gate'] });
+    expect(result.reviewOwnedChecks.onlyRed).toBe(false);
+    expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: false, affected: [
+      { name: 'test', reason: 'missing' }, { name: 'review-gate', reason: 'missing' },
+    ] });
+  });
+
+  it.each([
+    ['integration'], ['test', 'integration'], ['review-gate', 'integration'],
+  ])('wrong-head test success never implies missing required checks: %j', (...requiredChecks) => {
+    const checks = [check('test', 'success', { head_sha: 'b'.repeat(40) })];
+    if (requiredChecks.includes('review-gate')) checks.push(check('review-gate', 'failure', { head_sha: head }));
+    const result = readPlannerRow({ pr, refusals: [refusal('review-ci')], rawPrs: [rawPr(checks)], requiredChecks });
+    expect(result.reviewOwnedChecks.ci.allowed).toBe(false);
+    expect(result.reviewOwnedChecks.ci.affected).toContainEqual({ name: 'integration', reason: 'missing' });
+    expect(result.reviewOwnedChecks.onlyRed).toBe(false);
+  });
+
+  it('same-head test success still implies missing integration before wrong-head reruns are collapsed', () => {
+    const checks = [check('test', 'success', { head_sha: head, id: 1, completedAt: '2026-11-17T10:00:00Z' }),
+      check('test', 'failure', { head_sha: 'b'.repeat(40), id: 2, completedAt: '2026-11-17T11:00:00Z' })];
+    const result = readPlannerRow({ pr, refusals: [refusal('review-ci')],
+      rawPrs: [rawPr(checks)], requiredChecks: ['test', 'integration'] });
+    expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: true, affected: [] });
+    expect(result.reviewOwnedChecks.required).toEqual([]);
+  });
+
+  it('preserves unheaded rollup checks as current for the fetched PR head, including implication', () => {
+    const checks = [check('test', 'success')];
+    const requiredChecks = ['test', 'integration'];
+    const result = readPlannerRow({ pr, refusals: [refusal('review-ci')], rawPrs: [rawPr(checks)], requiredChecks });
+    expect(result.reviewOwnedChecks.ci).toEqual(reviewCiGate({ headSha: head, requiredChecks, checks }));
+    expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: true, affected: [] });
+  });
+
+  it.each([
+    ['same head and required set', {}],
+    ['reordered and duplicated required set', { requiredChecks: ['review-gate', 'test', 'test'] }],
+    ['head B with no checks', { rawPrs: [{ ...rawPr(), headRefOid: 'b'.repeat(40) }] }],
+    ['changed required set', { requiredChecks: ['test', 'review-gate', 'integration'] }],
+    ['different repo', { repo: 'other/repo' }],
+    ['different PR', { pr: pr + 1, rawPrs: [{ ...rawPr(), number: pr + 1 }],
+      refusals: [refusal('review-ci', { prNumber: pr + 1 })] }],
+    ['missing repo', { repo: undefined }],
+    ['missing head', { rawPrs: [{ ...rawPr(), headRefOid: undefined }] }],
+    ['missing required set', { requiredChecks: null }],
+    ['empty required set', { requiredChecks: [] }],
+    ['malformed required set', { requiredChecks: ['test', ''] }],
+  ])('recomputes saved classification from current evidence: %s', (_, changed) => {
+    const input = { repo, pr, refusals: [refusal('review-ci')], requiredChecks: ['test', 'review-gate'] };
+    const saved = readPlannerRow({ ...input, rawPrs: [rawPr([check('test', 'success'), check('review-gate', 'success')])] });
+    expect(saved.reviewOwnedChecks.ci.allowed).toBe(true);
+    const result = readPlannerRow({ ...input, rawPrs: [rawPr()], plan: { plannerRows: [saved] }, ...changed });
+    expect(result.reviewOwnedChecks).not.toBe(saved.reviewOwnedChecks);
+    expect(result.reviewOwnedChecks.ci.allowed).toBe(false);
+    expect(result.reviewOwnedChecks.onlyRed).toBe(false);
+  });
+
+  it('rejects a current test failure on the same head despite a saved green classification', () => {
+    const input = { repo, pr, refusals: [refusal('review-ci')], requiredChecks: ['test', 'review-gate'] };
+    const saved = readPlannerRow({ ...input, rawPrs: [rawPr([check('test', 'success'), check('review-gate', 'success')])] });
+    expect(saved.reviewOwnedChecks.ci.allowed).toBe(true);
+    const checks = [check('test'), check('review-gate', 'success')];
+    const result = readPlannerRow({ ...input, rawPrs: [rawPr(checks)], plan: { plannerRows: [saved] } });
+    expect(result.reviewOwnedChecks).not.toBe(saved.reviewOwnedChecks);
+    expect(result.reviewOwnedChecks.ci).toEqual(reviewCiGate({ headSha: head, requiredChecks: input.requiredChecks, checks }));
+    expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: false, affected: [{ name: 'test', reason: 'failure' }] });
+    expect(result.reviewOwnedChecks.onlyRed).toBe(false);
+  });
+
+  it('reclassifies check reruns with changed conclusions on the same head', () => {
+    const input = { repo, pr, refusals: [refusal('review-ci')], requiredChecks: ['review-gate'] };
+    const checks = [check('review-gate', 'failure', { head_sha: head, id: 1, completedAt: '2026-11-17T10:00:00Z' })];
+    const saved = readPlannerRow({ ...input, rawPrs: [rawPr(checks)] });
+    expect(saved.reviewOwnedChecks.onlyRed).toBe(true);
+    checks.push(check('review-gate', 'success', { head_sha: head, id: 2, completedAt: '2026-11-17T11:00:00Z' }));
+    const green = readPlannerRow({ ...input, rawPrs: [rawPr(checks)], plan: { plannerRows: [saved] } });
+    expect(green.reviewOwnedChecks.ci.allowed).toBe(true);
+    expect(green.reviewOwnedChecks.onlyRed).toBe(false);
+    checks.push(check('review-gate', 'failure', { head_sha: head, id: 3, completedAt: '2026-11-17T12:00:00Z' }));
+    const red = readPlannerRow({ ...input, rawPrs: [rawPr(checks)], plan: { plannerRows: [green] } });
+    expect(red.reviewOwnedChecks.ci).toMatchObject({ allowed: false, affected: [{ name: 'review-gate', reason: 'failure' }] });
+    expect(red.reviewOwnedChecks.onlyRed).toBe(true);
+  });
+
+  it('recomputes legacy saved rows with no classification key', () => {
+    const input = { repo, pr, refusals: [refusal('review-ci')], requiredChecks: ['test'] };
+    const saved = readPlannerRow({ ...input, rawPrs: [rawPr([check('test', 'success')])] });
+    delete saved.classificationKey;
+    const result = readPlannerRow({ ...input, rawPrs: [rawPr()], plan: { plannerRows: [saved] } });
+    expect(result.reviewOwnedChecks).not.toBe(saved.reviewOwnedChecks);
+    expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: false, affected: [{ name: 'test', reason: 'missing' }] });
+  });
+
+  it.each([
+    ['missing head', { headRefOid: undefined }, ['review-gate'], 'missing-head'],
+    ['missing required set', {}, null, 'unknown-required-set'],
+    ['empty required set', {}, [], 'unknown-required-set'],
+  ])('fails closed on red-only evidence with %s', (_, changed, requiredChecks, reason) => {
+    const result = readPlannerRow({ repo, pr, refusals: [refusal('review-ci')],
+      rawPrs: [{ ...rawPr([check('review-gate')]), ...changed }], requiredChecks });
+    expect(result.reviewOwnedChecks.ci).toMatchObject({ allowed: false, reason });
+    expect(result.reviewOwnedChecks.onlyRed).toBe(false);
   });
 
   it('preserves refusal order and multiple refusals for the same PR', () => {
@@ -108,21 +219,28 @@ describe('readPlannerRow', () => {
     expect(readPlannerRows({ refusals: rows }).map(row => row.refusal)).toEqual(rows);
   });
 
-  it('keeps historical saved rows without safety evidence closed, with an operator fallback', () => {
-    const raw = { ...rawPr([check('review-gate')]), state: 'OPEN', isDraft: false, labels: ['review:human'] };
+  it('rejects missing safety evidence directly and recomputes it from the current snapshot', () => {
+    const raw = { ...rawPr([check('review-gate')]), state: 'OPEN', isDraft: false,
+      labels: ['review:human'], scopeBloat };
     const saved = readPlannerRow({ pr, refusals: [refusal('review-ci')], rawPrs: [raw], requiredChecks: ['review-gate'] });
     delete saved.nominationSafety;
-    const row = readPlannerRow({ pr, rawPrs: [raw], plan: { refusals: [saved.refusal], plannerRows: [saved] } });
-    expect(redTeamNominationRefusal(row, raw)).toBe('planner safety evidence unreadable; inspect reconciliation before retrying');
+    expect(redTeamNominationRefusal(saved, raw)).toBe('planner safety evidence unreadable; inspect reconciliation before retrying');
+    const row = readPlannerRow({ pr, rawPrs: [raw], requiredChecks: ['review-gate'],
+      plan: { refusals: [saved.refusal], plannerRows: [saved] } });
+    expect(row.nominationSafety).toMatchObject({ head, hold: expect.stringContaining('scope-bloat') });
+    expect(redTeamNominationRefusal(row, raw)).toContain('scope-bloat');
   });
 
-  it('preserves the producer safety evidence when the daemon only has a raw snapshot', () => {
+  it('recomputes safety from the explicit raw snapshot instead of saved producer evidence', () => {
     const enriched = { ...rawPr([check('review-gate')]), state: 'OPEN', isDraft: false,
       labels: ['review:human'], scopeBloat };
     const saved = readPlannerRow({ pr, refusals: [refusal('review-ci')], rawPrs: [enriched], requiredChecks: ['review-gate'] });
-    const row = readPlannerRow({ pr, rawPrs: [rawPr()], plan: { refusals: [saved.refusal], plannerRows: [saved] } });
-    expect(row.nominationSafety).toBe(saved.nominationSafety);
-    expect(redTeamNominationRefusal(row, { ...enriched, scopeBloat: undefined })).toContain('scope-bloat');
+    const raw = { ...enriched, scopeBloat: undefined, files: undefined };
+    const row = readPlannerRow({ pr, rawPrs: [raw], requiredChecks: ['review-gate'],
+      plan: { refusals: [saved.refusal], plannerRows: [saved] } });
+    expect(row.nominationSafety).not.toBe(saved.nominationSafety);
+    expect(row.nominationSafety.hold).toContain('scope inputs unreadable or incomplete');
+    expect(redTeamNominationRefusal(row, raw)).toContain('inspect the full changed files and size');
   });
 });
 
@@ -164,4 +282,12 @@ it('classifies a pending review-gate owner without making pending CI successful'
     rawPrs: [rawPr([check('review-gate', null, { status: 'in_progress' })])] });
   expect(result.reviewOwnedChecks).toMatchObject({ reviewOwned: ['review-gate'], onlyRed: false,
     ci: { allowed: false, affected: [{ name: 'review-gate', reason: 'pending' }] } });
+});
+
+it('fails closed with an operator fallback when fresh nomination safety lacks a repository', () => {
+  const raw = { ...rawPr([check('review-gate')]), state: 'OPEN', isDraft: false,
+    labels: ['review:human'], files: [{ path: 'scripts/guard.mjs', additions: 1, deletions: 0 }] };
+  const row = readPlannerRow({ pr, refusals: [refusal('review-ci')], rawPrs: [raw], requiredChecks: ['review-gate'] });
+  expect(row.nominationSafety).toMatchObject({ head, hold: 'planner options unreadable; inspect reconciliation before retrying' });
+  expect(redTeamNominationRefusal(row, raw)).toContain('inspect reconciliation before retrying');
 });

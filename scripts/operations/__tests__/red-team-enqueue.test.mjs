@@ -32,7 +32,7 @@ const planning = () => ({ readOwnership: resolvePrOwnershipSettings, log: vi.fn(
     seatRecorded: false, completedRecorded: false, cleanRecorded: false,
     loopPayload: { verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: 'b'.repeat(40) } } } } }) });
 const plan = (raw = live(), refusal = { kind: 'review-ci', prNumber: pr, headSha: head }, requiredChecks = ['test', 'review-gate']) => {
-  const result = { refusals: refusal ? [refusal] : [], plannerOptions: { requiredChecks } };
+  const result = { refusals: refusal ? [refusal] : [], enrichedPrs: [raw], plannerOptions: { requiredChecks } };
   return { ...result, plannerRows: readPlannerRows({ repo, plan: result, rawPrs: [raw] }) };
 };
 function fixture(over = {}) {
@@ -217,15 +217,15 @@ describe('finished-head automatic nomination / registered enqueue guard parity',
   });
 });
 
-it('default fast-check policy preserves a scope hold behind the real early review-ci row for automatic nomination and enqueue', async () => {
+it('default fast-check policy recomputes a scope hold behind the real early review-ci row for automatic nomination and enqueue', async () => {
   const raw = { ...live(), scopeBloat: { stale: true, why: 'unrelated files' } };
   const core = planReconcile({ repo: 'we', prs: [raw], requiredChecks: ['test', 'review-gate'] });
   expect(core.refusals).toEqual([expect.objectContaining({ kind: 'review-ci' })]);
   expect(core.refusals[0].reviewRefusal).toBeUndefined();
-  const result = { ...core, plannerRows: readPlannerRows({ repo, plan: core, rawPrs: [raw], requiredChecks: ['test', 'review-gate'] }) };
-  // The daemon's un-enriched snapshot must not erase the producer's safety classification.
-  const liveOnly = live();
-  expect(planRedTeamOnSkip({ repo, plan: result, rawPrs: [liveOnly], ...planning() })[0])
+  const result = { ...core, enrichedPrs: [raw], plannerRequiredChecks: ['test', 'review-gate'],
+    plannerRows: readPlannerRows({ repo, plan: core, rawPrs: [raw], requiredChecks: ['test', 'review-gate'] }) };
+  // Reclassify the current enriched snapshot; saved planner rows have no authority.
+  expect(planRedTeamOnSkip({ repo, plan: result, rawPrs: [raw], ...planning() })[0])
     .toMatchObject({ action: 'skip', why: expect.stringContaining('scope-bloat') });
   const f = fixture({ readPlan: () => result });
   await expect(f.run()).rejects.toThrow('scope-bloat');
@@ -510,4 +510,38 @@ it('nomination refuses a missing witness reader instead of bypassing scorecard v
   const row = planRedTeamOnSkip({ repo, plan: plan(raw), rawPrs: [raw], ...opts, readWitness: null, readEvidence })[0];
   expect(row).toMatchObject({ action: 'skip', why: 'red-team witness unreadable; inspect stored evidence before retrying' });
   expect(readEvidence).not.toHaveBeenCalled();
+});
+
+it('enqueue reclassifies the matching enriched head when the live reader only supplies state and labels', async () => {
+  const raw = live(), result = plan(raw);
+  const readLive = () => ({ state: raw.state, isDraft: raw.isDraft, headRefOid: head, labels: raw.labels });
+  const f = fixture({ readLive, readPlan: () => result });
+  expect(await f.run()).toMatchObject({ status: 'requested', head });
+  expect(f.post).toHaveBeenCalledOnce();
+  // A check rerun must override the previously saved review-owned classification.
+  raw.statusCheckRollup[0] = check('test');
+  const rerun = fixture({ readLive, readPlan: () => result });
+  await expect(rerun.run()).rejects.toThrow('planner safety hold: review-ci');
+  expect(rerun.post).not.toHaveBeenCalled();
+});
+
+it('enqueue refuses an enriched snapshot for another head instead of borrowing its scope and check evidence', async () => {
+  const raw = live(), moved = 'f'.repeat(40);
+  const result = plan(raw, { kind: 'review-ci', prNumber: pr, headSha: moved });
+  const f = fixture({ readLive: () => ({ state: 'OPEN', isDraft: false, headRefOid: moved, labels: raw.labels }),
+    readPlan: () => result });
+  await expect(f.run()).rejects.toThrow('scope inputs unreadable or incomplete');
+  expect(f.post).not.toHaveBeenCalled();
+});
+
+it('nomination safety drops wrong-head reruns before required-check matching too', async () => {
+  const raw = live();
+  raw.statusCheckRollup[0] = check('test', 'success', { head_sha: head, id: 1, completedAt: '2026-11-17T10:00:00Z' });
+  raw.statusCheckRollup.push(check('test', 'failure', { head_sha: 'b'.repeat(40), id: 2, completedAt: '2026-11-17T11:00:00Z' }));
+  const result = plan(raw), row = result.plannerRows[0];
+  expect(row.reviewOwnedChecks).toMatchObject({ reviewOwned: ['review-gate'], nonReviewOwned: [] });
+  expect(row.nominationSafety.hold).toBeNull();
+  const f = fixture({ readLive: () => raw, readPlan: () => result });
+  expect(await f.run()).toMatchObject({ status: 'requested', head });
+  expect(f.post).toHaveBeenCalledOnce();
 });

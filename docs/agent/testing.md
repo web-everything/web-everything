@@ -4445,16 +4445,17 @@ The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true
 ## Red-team planner row parity
 
 The daemon receives a raw PR snapshot, while reconciliation hydrates checks and annotates
-review-owned merge-gate holds. Preserve the classification from that enriched snapshot in
-`plannerRows`; use `readPlannerRow` / `readPlannerRows` when consuming refusals, retaining
+review-owned merge-gate holds. `plannerRows` records that enriched snapshot's classification;
+use `readPlannerRow` / `readPlannerRows` when consuming refusals, retaining
 top-level ownership and the folded `reviewRefusal` separately. The planner-row unit and
 production suites pin refusal parity and propagation through normal and read-only passes.
 ## Human-head red-team nomination
 
-Planner-row safety evidence retains later holds behind CI refusals; only proven review-owned checks may excuse `review-ci`, `ci-heal-escalated` or `owed-ci-rerun`. Pending prerequisites and `startEarly: off` still hold.
-Automatic nomination needs a finished accepting live-head review and never starts full review. All candidates cross the witness, guard and dispatch stages; unreadable witnesses skip. Dispatch carries `expectedHead`.
-Stale advisory human-held heads name `red-team-enqueue --actor=<login> --reason=<text>`. Only a trusted head-bound
-request permits fresh advisory review, with `advisoryReviewOnHumanHandoff=on`; invalid/unreadable settings refuse.
-Markers require version/repo/pr/actor/reason/head/ISO time; legacy or stale markers grant nothing. Other holds
-and queue limits stay shared. Shorten reasons over 1000 characters. Run enqueue, planner-row, queue, on-skip
-and HTTP-adapter tests through heavy-admission; cover witness failures and pushes before dispatch.
+Planner-row safety evidence retains later holds behind CI refusals; only proven review-owned checks may excuse `review-ci`, `ci-heal-escalated` or `owed-ci-rerun`. Pending prerequisites and `startEarly: off` still hold. Automatic nomination needs a finished accepting live-head review and never starts full review. All candidates cross the witness, guard and dispatch stages; unreadable witnesses skip. Dispatch carries `expectedHead`.
+Stale advisory human-held heads name `red-team-enqueue --actor=<login> --reason=<text>`. Only a trusted head-bound request permits fresh advisory review, with `advisoryReviewOnHumanHandoff=on`; invalid/unreadable settings refuse.
+Markers require version/repo/pr/actor/reason/head/ISO time; legacy or stale markers grant nothing. Other holds and queue limits stay shared. Shorten reasons over 1000 characters. Run enqueue, planner-row, queue, on-skip and HTTP-adapter tests through heavy-admission; cover witness failures and pushes before dispatch.
+Always recompute from the current checks and required set; saved classifications cannot
+reflect check reruns on the same head. Explicit raw snapshots carry only their own ownership
+annotations. Normal passes carry `plannerRequiredChecks` for validation.
+Derive red-only eligibility from the same head-aware CI classification: wrong-head,
+missing-head and unknown-required-set evidence must remain closed.
