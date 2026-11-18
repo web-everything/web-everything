@@ -706,11 +706,13 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     expect(numbers(f.open().entries())).toEqual([1, 2]);
   });
 
-  it('planner skip rows count one attempt and free capacity during the replan cooldown', async () => {
+  it('planner skip probes count attempts and free capacity before the replan interval elapses', async () => {
     const f = fixture({ maxAttempts: 2 });
     const reason = 'stale re-dispatch already spent';
     const dispatchedPrs = [];
+    const received = [];
     const run = options => {
+      received.push(options.plan.refusals.map(row => row.prNumber));
       const rest = options.plan.refusals.filter(row => row.prNumber !== 1);
       const res = started({ plan: { refusals: rest } });
       dispatchedPrs.push(...res.dispatched.map(d => d.prNumber));
@@ -718,13 +720,18 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       return { rows: [...(skipped ? [{ prNumber: 1, action: 'skip', why: reason }] : []), ...res.rows],
         dispatched: res.dispatched, notStarted: [] };
     };
-    for (let tick = 0; tick < 2; tick++) {
-      await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2]), capacity: capacity(1), run, log: f.log });
-    }
+    await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2]), capacity: capacity(1), run, log: f.log });
+    expect(dispatchedPrs).toEqual([]);
+    expect(numbers(f.open().entries())).toEqual([1, 2]);
+    expect(f.open().entries()[0]).toMatchObject({ attempts: 1, blocked: 'planner-skip' });
+    expect(f.logs.filter(line => line.includes('requeue'))).toHaveLength(0);
+    f.advance(1_000); // Still inside the default 15-minute replan interval.
+    await runWithRedTeamQueue({ queue: f.open(), ...inputs([1, 2]), capacity: capacity(1), run, log: f.log });
     expect(dispatchedPrs).toEqual([2]); // PR2 really dispatched on tick 2 despite capacity 1
-    expect(numbers(f.queue.entries())).toEqual([1]);
-    expect(f.queue.entries()[0]).toMatchObject({ attempts: 1, blocked: 'planner-skip' });
-    expect(f.logs.some(line => line.includes('requeue'))).toBe(false);
+    expect(received).toEqual([[1], [1, 2]]);
+    expect(numbers(f.open().entries())).toEqual([1]);
+    expect(f.open().entries()[0]).toMatchObject({ attempts: 0, blocked: 'planner-skip' });
+    expect(f.logs.filter(line => line.includes('requeue'))).toHaveLength(1);
   });
 
   it('stuck head skip-and-requeue after K attempts logs reason and lets the rest dispatch', async () => {
@@ -1048,7 +1055,10 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     const persistedBlocked = (f, reason, runnable = []) => {
       f.files.set(f.file, JSON.stringify(candidates([1, 2, 3, 4, 5, ...runnable]).map(c => ({
         key: `${repo}#${c.pr}`, repo, pr: c.pr, head: c.head, enqueuedAt: 1, attempts: 0,
-        ...(c.pr <= 5 ? { blocked: reason } : {}),
+        ...(c.pr <= 5 ? { blocked: reason,
+          // Keep planner skips inside the interval so these cases exercise probes, not expiry.
+          ...(reason === 'planner-skip' ? { blockedAt: Date.parse('2026-11-09T12:00:00Z') } : {}),
+        } : {}),
       }))));
       return f.open();
     };
@@ -1136,7 +1146,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       expect(f.open().entries()).toEqual(reopened.entries());
       expect(numbers(reopened.admit(repo, 0))).toEqual([1, 2]);
     });
-    it.each(['review-unfinished'])('probes all five persisted %s entries within three ticks, capped at two even across restarts', reason => {
+    it.each(['review-unfinished', 'planner-skip'])('probes all five persisted %s entries within three ticks, capped at two even across restarts', reason => {
       const f = fixture();
       let queue = persistedBlocked(f, reason);
       const turns = [[1, 2], [3, 4], [1, 5]]; // selected entries retain queue order in runner input
@@ -1162,7 +1172,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       }
       expect([...seen]).toEqual([1, 2, 3, 4, 5]);
     });
-    it.each(['review-unfinished'])('settles all five persisted %s entries over capped ticks', reason => {
+    it.each(['review-unfinished', 'planner-skip'])('settles all five persisted %s entries over capped ticks', reason => {
       const f = fixture();
       const queue = persistedBlocked(f, reason);
       const remaining = [[1, 2, 3, 4, 5], [3, 4, 5], [5]];
@@ -1558,22 +1568,29 @@ describe('live red-team queue reconciliation and planner-skip expiry', () => {
   });
   it('honors the configured interval across restarts and replans as runnable at the boundary', () => {
     const f = fixture(); seed(f);
-    let expectedIds = [2];
+    let expectedIds = [1];
     const tick = queue => runWithRedTeamQueue({ queue, ...inputs([1, 2]),
-      floor: { plannerSkipReplanMinutes: 20 }, run: options => {
+      capacity: capacity(1), floor: { plannerSkipReplanMinutes: 20 }, run: options => {
         const ids = options.plan.refusals.map(row => row.prNumber);
         expect(ids).toEqual(expectedIds);
         return { rows: ids.map(prNumber => ({ prNumber, action: 'skip', why: 'still superseded' })) };
       } });
     f.advance(20 * 60000 - 1);
-    tick(f.open());
+    const beforeExpiry = f.open();
+    beforeExpiry.reconcile({ plannerSkipReplanMinutes: 20 });
+    expect(numbers(beforeExpiry.admit(repo, 0))).toEqual([1]);
+    expect(beforeExpiry.entries()[0].blocked).toBe('planner-skip');
     expect(f.logs.filter(line => line.includes('replan '))).toHaveLength(0);
     f.advance(1);
-    expectedIds = [1];
-    const queue = f.open(); tick(queue);
+    const queue = f.open();
+    queue.reconcile({ plannerSkipReplanMinutes: 20 });
+    expect(queue.entries()[0].blocked).toBeUndefined();
+    expect(queue.entries()[0].blockedAt).toBeUndefined();
+    expect(queue.admit(repo, 0)).toEqual([]); // Now runnable, so it needs capacity.
+    tick(queue);
     expect(f.logs.filter(line => line.includes('replan '))).toHaveLength(1);
     expect(queue.entries()[0].blocked).toBe('planner-skip');
-    expectedIds = [];
+    expectedIds = [1, 2];
     tick(f.open());
     expect(f.logs.filter(line => line.includes('replan '))).toHaveLength(1);
   });

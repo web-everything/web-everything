@@ -4536,6 +4536,13 @@ when it stays blocked. Replay two new planner skips per tick alongside four bloc
 heads across restarts, and bound repeat probes by `ceil(blockedCount / 2)` ticks;
 new arrivals must never overtake heads already waiting in the rotation.
 
+Planner skips remain eligible for bounded probes during `planner-skip.replanMinutes`;
+the interval additionally clears their blocked state, restoring capacity-bound FIFO
+admission. Keep exact per-probe attempt counts and max-attempt requeue assertions.
+The `red-team-queue-stale-eviction` soak break replays terminal PR eviction against
+stale planner candidates, persisted probe fairness, and capacity-bound replan expiry.
+Run its `.soak.test.mjs` with `--config vitest.soak.config.ts` through heavy admission.
+
 ## Timeout evidence synchronous worker pool
 
 `timeout-evidence-pool.mjs` runs the unchanged collector once per red PR per pass,

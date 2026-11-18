@@ -198,7 +198,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
           if (now() - (entry.blockedAt ?? entry.enqueuedAt) >= replanMinutes(plannerSkipReplanMinutes) * 60000) {
             delete entry.blocked; delete entry.blockedAt;
             changed(`replan ${entry.key}: planner-skip interval elapsed`);
-          } else waiting.add(entry.key);
+          } // Before expiry, retain the existing bounded fair probes.
         }
       }
       return live;
