@@ -750,12 +750,23 @@ export function acceptJurorStream(stream, { sessionId, schema, exit }) {
     const bad = event.type === 'error' || event.is_error || event.error
       || (isResult && 'subtype' in event && event.subtype !== 'success');
     if (bad) {
-      const texts = [event.result, event.message, event.error, event.error?.message]
-        .filter(text => typeof text === 'string');
+      // Classify each diagnostic independently: quota in one field cannot excuse
+      // execution evidence in another. Envelope flags (type/is_error) carry no cause.
+      const diagnosticValues = value => value && typeof value === 'object'
+        ? Object.keys(value).length ? Object.values(value).flatMap(diagnosticValues) : [value]
+        : [value];
+      const evidence = [event.result, event.message, event.error,
+        ...(Object.hasOwn(event, 'subtype') && event.subtype !== 'success' ? [event.subtype] : []),
+        event.code, event.stderr]
+        .filter(value => value !== undefined && value !== '')
+        .flatMap(diagnosticValues);
+      const texts = evidence.filter(text => typeof text === 'string');
       let eventQuota = false;
-      for (const text of texts) {
+      let nonQuotaEvidence = false;
+      for (const text of evidence) {
         const holdRow = quotaHoldRow({ provider: 'claude', error: text, now: exit.now ?? 0 });
         if (holdRow) eventQuota = true;
+        else nonQuotaEvidence = true;
         if (holdRow && !quota) quota = Object.assign(new Error(`judge-spawn: the juror failed: ${text}`), {
           quota: true, holdRow, telemetry: { failureKind: 'provider-quota', failureText: text.slice(0, 500) },
         });
@@ -769,7 +780,7 @@ export function acceptJurorStream(stream, { sessionId, schema, exit }) {
           stopReason: event.stop_reason, result: text, stderr });
         recordFailure('budget', 'Juror budget exhausted or exceeded (content redacted).');
       }
-      else if (!eventQuota) recordFailure('execution-error',
+      else if (!eventQuota || nonQuotaEvidence) recordFailure('execution-error',
         'Juror emitted an execution error or unsuccessful result (content redacted); no verdict.');
       failure ??= event.is_error
         ? new Error(text ? `judge-spawn: the juror failed: ${text}`
@@ -797,6 +808,9 @@ export function acceptJurorStream(stream, { sessionId, schema, exit }) {
     }
   }
   if (quota) {
+    if (String(stderr).trim() && !quotaHoldRow({ provider: 'claude', error: String(stderr), now: exit.now ?? 0 })) {
+      recordFailure('execution-error', 'Juror stderr contains non-quota diagnostics (content redacted); no verdict.');
+    }
     if (results > 1) recordFailure('result-count', 'Expected exactly one result event; no verdict.');
     quota.telemetry = { ...quota.telemetry,
       // reviewRunEvidence exempts only rows whose failureKind is provider-quota.

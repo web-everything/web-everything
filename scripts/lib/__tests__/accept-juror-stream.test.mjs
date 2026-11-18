@@ -52,6 +52,23 @@ const probes = [
 describe('acceptJurorStream audit probes', () => {
   it.each([
     ['quota alone', lines(quota), exit, []],
+    ['quota message and execution error in the same event', lines({ ...quota, error: 'execution failed' }), exit, ['execution-error']],
+    ...[
+      ['message', { type: 'error', result: quota.message, message: 'execution failed' }],
+      ['result', { ...quota, result: 'execution failed' }],
+      ['subtype', { ...quota, subtype: 'error_during_execution' }],
+      ['code', { ...quota, code: 'execution_failed' }],
+      ['nested error message', { ...quota, error: { message: 'execution failed' } }],
+      ['nested error code', { ...quota, error: { message: quota.message, code: 'execution_failed' } }],
+      ['stderr', { ...quota, stderr: 'execution failed SECRET_TOKEN' }],
+      ['unknown error object', { ...quota, error: {} }],
+      ['numeric code', { ...quota, code: 1 }],
+    ].map(([field, event]) => [`quota and non-quota ${field} in the same event`, lines(event), exit, ['execution-error']]),
+    ['quota in every diagnostic field', lines({ ...quota, error: { message: quota.message }, result: quota.message }), exit, []],
+    ['quota is_error result alone', lines({ type: 'result', is_error: true, result: quota.message }), exit, []],
+    ['quota is_error result and execution event', lines({ type: 'result', is_error: true, result: quota.message }, generic), exit, ['execution-error']],
+    ['quota and process stderr execution error', lines(quota), { ...exit, stderr: 'execution failed SECRET_TOKEN' }, ['execution-error']],
+    ['quota and process stderr quota', lines(quota), { ...exit, stderr: quota.message }, []],
     ['execution error then quota', lines(generic, quota), exit, ['execution-error']],
     ['quota then execution error', lines(quota, generic), exit, ['execution-error']],
     ['quota and nonzero exit', lines(quota), { ...exit, code: 1 }, ['process-failure']],
