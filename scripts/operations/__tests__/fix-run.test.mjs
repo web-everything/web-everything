@@ -641,20 +641,31 @@ describe('runFixCli', () => {
     // A new process sees the pushed tip, but the gate evidence still names the old head.
     const m2 = mk([pushed]);
     pr.headRefOid = pushed;
+    pr.changedFiles = 1;
+    const recordPush = vi.fn();
     // Cover current push markers as well as the legacy records without a kind.
     m.pendingRearm.read.mockImplementation(() => m.owed.sha
       ? { sha: m.owed.sha, ...(retry === 'fresh' ? { kind: 'push' } : {}) } : null);
     const runRetry = (cmd, args, opts) => {
       const result = m2.run(cmd, args, opts);
+      // Recovery repeats the CI handoff, which needs complete size evidence to avoid
+      // an unrelated pr-size-unmeasurable comment. Match the live file count above.
+      if (cmd === 'gh' && args[0] === 'api' && args.includes('repos/o/r/pulls/7/files')) {
+        return JSON.stringify({ additions: 1, deletions: 0, filename: 'scripts/example.mjs', hasPatch: true }) + '\n';
+      }
       return cmd === 'gh' && args.includes('view') ? JSON.stringify(pr) : result;
     };
     const result = await runFixCli([...redTeamArgv, `--launch-id=${retry === 'same' ? 'failed-hand-back' : 'new-hand-back'}`], {
-      ...m2.io, run: runRetry, pendingRearm: m.pendingRearm, readComments: async () => comments,
+      ...m2.io, run: runRetry, recordPush, pendingRearm: m.pendingRearm, readComments: async () => comments,
     });
     expect(result.code).toBe(0);
     expect(result.result).toContain('already pushed');
     expect(m2.spawn).not.toHaveBeenCalled();
     expect(m2.calls.some(c => c.includes('push') || c.includes('comment'))).toBe(false);
+    expect(recordPush).toHaveBeenCalledOnce();
+    expect(recordPush).toHaveBeenCalledWith({ repo: 'o/r', pr: '7', head: pushed });
+    expect(m2.calls).toContainEqual(['gh', 'api', '--paginate', 'repos/o/r/pulls/7/files', '--jq',
+      '.[]|{additions,deletions,filename,previous_filename,hasPatch:(.patch != null)}|tojson']);
     expect(m2.calls.filter(c => c[1] === '/we/scripts/conveyor/rearm-review.mjs')).toEqual([
       ['node', '/we/scripts/conveyor/rearm-review.mjs', '7', '--repo=o/r', '--round=red-team', `--expect-head=${pushed}`],
     ]);
