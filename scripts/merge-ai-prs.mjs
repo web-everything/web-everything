@@ -1204,6 +1204,25 @@ export function isTransientUnknownMergeability(verdict) {
 
 /** Setting: how many extra re-reads a transient UNKNOWN gets, and the wait before each (bounded: ≤ 3 × 20 s by default). */
 export const UNKNOWN_MERGEABILITY_RETRY = Object.freeze({ retries: 3, delayMs: 20000 });
+export const UNKNOWN_MERGEABILITY_MAX_RECOMPUTE = 10;
+
+/** Trigger GitHub's computation without refreshing or changing this pass's PR facts. */
+export async function triggerMergeabilityRecompute({ prsByRepo, recompute, log, max = UNKNOWN_MERGEABILITY_MAX_RECOMPUTE }) {
+  const seen = new Set();
+  for (const [repo, prs] of prsByRepo) {
+    for (const pr of prs) {
+      if (['CLOSED', 'MERGED'].includes(String(pr.state ?? '').toUpperCase())
+        || !['UNKNOWN', ''].includes(String(pr.mergeable ?? '').toUpperCase())) continue;
+      const key = `${repo}#${pr.number}`;
+      if (seen.has(key)) continue;
+      if (seen.size >= max) return;
+      seen.add(key);
+      try { await recompute({ repo, num: pr.number }); } catch { /* best effort; next pass reads fresh */ }
+      log(`mergeable-unknown-recompute ${String(repo ?? '').replace(/[\x00-\x1f\x7f-\x9f]/g, '')}#${pr.number}`);
+    }
+  }
+}
+
 /** Env knob: an integer 0–3 overrides `retries` (0 = the old single read). Anything else keeps the default. */
 export const UNKNOWN_MERGEABILITY_RETRY_ENV = 'WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES';
 export function resolveUnknownMergeabilityRetry(env = {}, layers = {}) {
@@ -5776,7 +5795,16 @@ async function runCli() {
   // fails closed (a coupled impl defers rather than orphan-landing past a carrier the gate cannot see).
   const prsByRepo = narrowPrsByRepo(listings, { onlyPr, onlyRepo, repos: REPOS, isLocalRepo });
   const openPrContext = await repollThenCollectContext({
-    repoll: async () => { await repollUnknownListings({ ...unknownRecovery, marks: passStuckUnknownMarks(), prsByRepo, read: fetchFreshPrForRevalidation, setting: UNKNOWN_RETRY, concurrency: resolvedMergePolicy.policy.concurrency.gateReads, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) }); emitStuckUnknownAlerts(); },
+    repoll: async () => {
+      await triggerMergeabilityRecompute({ prsByRepo,
+        recompute: ({ repo, num }) => {
+          const slug = repo || localSlug;
+          return execFileP('gh', ['api', `repos/${slug}/pulls/${num}`], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+        },
+        log: line => process.stderr.write(`${line}\n`),
+      });
+      await repollUnknownListings({ ...unknownRecovery, marks: passStuckUnknownMarks(), prsByRepo, read: fetchFreshPrForRevalidation, setting: UNKNOWN_RETRY, concurrency: resolvedMergePolicy.policy.concurrency.gateReads, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) }); emitStuckUnknownAlerts();
+    },
     collect: () => (RECONCILE ? __t.timeAsync('listing', () => __t.timeAsync('listing.context', () => collectContext(liveListingsByRepo))) : reduceOpenPrContext({ listings: [], reads: new Map(), reconcileRan: false })),
   });
   // Eviction needs live labels for ALL open PRs, including manually queued entries absent from follow-ups.
