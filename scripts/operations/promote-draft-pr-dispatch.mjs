@@ -145,7 +145,9 @@ export function defaultReadHeadCheckState({
     ? promotionRequiredChecks(requiredChecks, rows, absentNotApplicable ?? loadPromotionRequiredChecksSetting().value)
     : requiredChecks;
   const result = reduceCheckState(rows, promotionChecks);
-  const state = reviewHoldRollupState({ rollup: rows, requiredChecks: promotionChecks, labels });
+  const rawState = reviewHoldRollupState({ rollup: rows, requiredChecks: promotionChecks, labels });
+  // Raw review-hold evidence cannot turn skipped/neutral-only checks into a pass.
+  const state = rawState === 'green' && result.counts.succeeded === 0 ? result.state : rawState;
   return { ...result, state, ...(state !== result.state ? { why: `raw check evidence is ${state}` } : {}),
     reviewHoldOnly: state === 'red' && reviewHoldOnlyRed(rows, promotionChecks, labels) };
 }

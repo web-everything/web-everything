@@ -12,12 +12,6 @@ const attemptOf = row => row?.run_attempt ?? row?.runAttempt
   ?? row?.checkSuite?.workflowRun?.runAttempt ?? row?.workflow_run?.run_attempt;
 const attemptNumber = value => /^(?:[1-9]\d*)$/.test(String(value))
   && Number.isSafeInteger(Number(value)) ? Number(value) : null;
-const completedTime = row => {
-  const value = row?.completedAt ?? row?.completed_at;
-  if (typeof value !== 'string' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)$/.test(value)) return null;
-  const time = Date.parse(value);
-  return Number.isFinite(time) && time >= Date.UTC(2000, 0, 1) ? time : null;
-};
 const completed = row => typeof row?.status === 'string' && row.status.toLowerCase() === 'completed';
 
 function laterSameJob(older, newer) {
@@ -31,19 +25,13 @@ function laterSameJob(older, newer) {
     const a = scalar(source(older)), b = scalar(source(newer));
     if (a && b && a !== b) return false;
   }
-  const a = attemptOf(older), b = attemptOf(newer);
-  if (a !== undefined || b !== undefined) {
-    const first = attemptNumber(a), next = attemptNumber(b);
-    if (first === null || next === null) return false;
-    if (first !== next) return next > first;
-  }
-  const first = completedTime(older), next = completedTime(newer);
+  const first = attemptNumber(attemptOf(older)), next = attemptNumber(attemptOf(newer));
   return first !== null && next !== null && next > first;
 }
 
 /**
  * Retain RAW rows except a known completed failure cleared by a proven green rerun.
- * Check IDs, suites, workflow names and start times alone never prove supersession.
+ * Only a strictly later attempt of the same run and job proves supersession; timestamps never do.
  * Pending, cancelled, malformed and unknown rows always remain, even beside a rerun.
  */
 export function reviewHoldRollupRows(rollup) {

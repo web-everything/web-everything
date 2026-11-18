@@ -6,6 +6,7 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { runReconcilePromoteDraftDispatch, defaultReadHeadCheckState, defaultReadPrLabels, isPromoteCodePath, promoteCodeClosure } from '../promote-draft-pr-dispatch.mjs';
+import { reduceCheckState } from '../pr-status.mjs';
 
 const FRESH = () => ({ fresh: true, behind: 0 });
 // Every pre-existing test in this file promotes cleanly, so it pins a fresh re-read that always says green —
@@ -429,6 +430,31 @@ describe('runReconcilePromoteDraftDispatch — stale-green re-verification (#281
   });
 
   describe('defaultReadHeadCheckState — the real per-sha re-read (gh/getRequiredStatusChecks injected)', () => {
+    it.each([
+      ['skipped', 'skipped'], ['neutral', 'neutral'], ['skipped', 'neutral'],
+    ])('keeps required %s / %s unchecked despite an optional SUCCESS and refuses promotion', (test, build) => {
+      const required = ['test', 'build'];
+      const rows = [
+        { name: 'test', status: 'completed', conclusion: test },
+        { name: 'build', status: 'completed', conclusion: build },
+        { name: 'optional', status: 'completed', conclusion: 'success' },
+      ];
+      const ready = vi.fn();
+      const readHeadCheckState = args => defaultReadHeadCheckState({ ...args,
+        runGh: () => rows.map(row => JSON.stringify(row)).join('\n'),
+        getRequiredChecks: () => ({ checks: required }),
+      });
+      expect(readHeadCheckState({ sha: 'abc123' })).toEqual({
+        ...reduceCheckState(rows, required), state: 'unchecked', reviewHoldOnly: false,
+      });
+      const result = runReconcilePromoteDraftDispatch({ root: '/repo',
+        reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 198, headRefOid: 'abc123' }], refusals: [] }),
+        provider: { ready }, checkStaleness: FRESH, readHeadCheckState, clearAwaitingCi: NOOP_STATUS,
+      });
+      expect(ready).not.toHaveBeenCalled();
+      expect(result.refusals).toEqual([expect.objectContaining({ kind: 'stale-check-refused', checkState: 'unchecked' })]);
+    });
+
     it.each([
       ['red', [{ name: 'test', status: 'completed', conclusion: 'failure' }]],
       ['pending', [{ name: 'test', status: 'in_progress', conclusion: null }]],

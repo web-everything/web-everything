@@ -3598,6 +3598,8 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
       { id: 10, checkSuite: { id: 42 } }, { id: 20, checkSuite: { id: 42 } }, false],
     ['different workflows',
       { workflowName: 'ci', run_id: 1, run_attempt: 1 }, { workflowName: 'review', run_id: 2, run_attempt: 2 }, false],
+    ['same run with later completion but no attempts',
+      { run_id: 42, completedAt: '2026-09-30T10:00:00Z' }, { run_id: 42, completedAt: '2026-09-30T11:00:00Z' }, false],
     ['a genuine same-run rerun',
       { workflowRun: { databaseId: 42 }, run_attempt: 1 }, { workflowRun: { databaseId: 42 }, run_attempt: 2 }, true],
   ])('planReconcile requires supersession proof for %s', (_label, failed, passed, waiting) => {

@@ -652,6 +652,9 @@ describe('raw review-wait supersession proof', () => {
       { checkSuite: { id: 1 }, id: 10 }, { checkSuite: { id: 2 }, id: 20 }],
     ['different runs of the same workflow', { run_id: 1, run_attempt: 1 }, { run_id: 2, run_attempt: 2 }],
     ['same run without attempt or completion order', { run_id: 1, id: 10 }, { run_id: 1, id: 20 }],
+    ['same run with later completion but no attempts',
+      { checkSuite: { workflowRun: { databaseId: 42 } }, completedAt: '2026-11-17T10:00:00Z' },
+      { checkSuite: { workflowRun: { databaseId: 42 } }, completedAt: '2026-11-17T11:00:00Z' }],
   ])('%s retains the failing row in either order', (_label, failed, passed) => {
     const rows = [done('FAILURE', failed), done('SUCCESS', passed)];
     for (const ordered of [rows, rows.toReversed()]) {
@@ -665,8 +668,6 @@ describe('raw review-wait supersession proof', () => {
   it.each([
     [{ workflowRun: { databaseId: 42 }, run_attempt: 1 }, { workflowRun: { databaseId: 42 }, run_attempt: 2 }],
     [{ run_id: 42, run_attempt: 1 }, { run_id: 42, run_attempt: 2 }],
-    [{ checkSuite: { workflowRun: { databaseId: 42 } }, completedAt: '2026-11-17T10:00:00Z' },
-      { checkSuite: { workflowRun: { databaseId: 42 } }, completedAt: '2026-11-17T11:00:00Z' }],
   ])('a genuine same-run green rerun clears only its older failure (%j)', (failed, passed) => {
     const rows = [done('FAILURE', failed), done('SUCCESS', passed)];
     for (const ordered of [rows, rows.toReversed()]) {

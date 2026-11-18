@@ -4466,6 +4466,12 @@ all consume this shared enrichment. Promotion regressions use raw summary-less R
 rows plus injected job logs and assert the ready call or the fail-closed refusal and
 cover both merge-gate hold setting values. Fresh review-gate label reads are
 independent of that merge-gate setting; unreadable or mismatched labels still refuse.
+
+Review-hold supersession requires the same run and job name plus a strictly later run
+attempt. Later timestamps and equal or missing attempts retain the failure. Pin these
+closed paths in `review-hold-rollup.test.mjs`; fresh promotion must also preserve the
+reducer's `unchecked` answer when every required check is skipped or neutral.
+
 Tests inject `readReviewGateLog` to cover hold, checkout failure and read failure.
 `waitingOnReview` additionally requires a non-empty required roster and complete green
 evidence for the remaining checks. The verdict and gate-wait suites cover unknown
