@@ -64,6 +64,19 @@ describe('round clock', () => {
     expect(advances).toEqual([0, ROUND_VIRTUAL_MS - 1_000]);
   });
 
+  it('charges the time the advance itself takes to the next round, so a slow advance is compensated, not leaked', () => {
+    const wall = { t: 0 };
+    const advances = [];
+    const SLOW_ADVANCE_MS = 2_000;
+    const pin = createRoundClock({ advance: (ms) => { advances.push(ms); wall.t += SLOW_ADVANCE_MS; } }, () => wall.t);
+    pin.begin();
+    wall.t += 10_000;
+    pin.endRound(); // round 0: 10 s of work, then a 2 s advance
+    wall.t += 8_000; // round 1's own work
+    pin.endRound(); // round 1 is timed from before the 2 s advance: 10 s
+    expect(advances).toEqual([ROUND_VIRTUAL_MS - 10_000, ROUND_VIRTUAL_MS - 10_000]);
+  });
+
   it('requires begin() before endRound()', () => {
     expect(() => createRoundClock({ advance() {} }).endRound()).toThrow(/before begin/);
   });

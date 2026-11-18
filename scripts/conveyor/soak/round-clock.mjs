@@ -46,9 +46,12 @@ export function createRoundClock(clock, now = Date.now) {
     /** @returns {{overrunMs:number}} how far the round's real time exceeded its virtual budget (0 = pinned). */
     endRound() {
       if (roundStartedAt === null) throw new Error('round-clock: endRound() before begin()');
-      const realElapsedMs = now() - roundStartedAt;
+      // The next round is timed from BEFORE the advance, so the time the advance itself takes (a clock-file write) is
+      // charged to that round and compensated there, instead of leaking into virtual time unmeasured.
+      const endedAt = now();
+      const realElapsedMs = endedAt - roundStartedAt;
       clock.advance(advanceMsForRound(realElapsedMs));
-      roundStartedAt = now();
+      roundStartedAt = endedAt;
       return { overrunMs: Math.max(0, realElapsedMs - ROUND_VIRTUAL_MS) };
     },
   };
