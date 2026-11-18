@@ -95,6 +95,8 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
       const stripped = fence || delimiter ? line : outsideInlineCode(line);
       // One ambiguous backtick line may open a multiline span: no inline-code exemption anywhere in the snapshot.
       if (stripped === undefined) ambiguousTicks = true;
+      // Backticks inside any HTML comment other than a bare stamp marker are not code: disable the exemption.
+      if (line.includes('<!--') && !/^<!--[ \t]*authored-by-actor:[^<>\r\n]*-->[^\S\r\n]*$/.test(line)) ambiguousTicks = true;
       htmlLines.push(stripped ?? line);
       if (line.includes('authored-by-actor:')) {
         // A stamp is evidence only as a whole, unindented line outside code fences.
