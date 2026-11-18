@@ -3398,7 +3398,7 @@ describe('R324 elastic request envelope',()=>{
   it('omits the extension for a one-unit legacy request',async()=>{
     const f=fixture();await runRemote(f);
     expect(JSON.parse(callsOf(f.exec).find(isPrepare).input)).not.toHaveProperty('slotUnits');
-    expect(JSON.parse(callsOf(f.exec).find(isPrepare).input).capabilities).toEqual({taskPressure:1});
+    expect(JSON.parse(callsOf(f.exec).find(isPrepare).input).capabilities).toEqual({taskPressure:1,throttle:1});
   });
   it.each([0,257,1.5,NaN])('rejects invalid units before transport: %s',async slotUnits=>{
     const f=fixture();
@@ -3466,5 +3466,30 @@ describe('safeFallbackDetail', () => {
     expect(remoteManifestAPI.safeFallbackDetail('command-not-allowed',['npm','run','x','--token=abc'])).toBe('npm');
     expect(remoteManifestAPI.safeFallbackDetail('command-not-allowed',['./evil-ghp_secret','x'])).toBe('other');
     expect(remoteManifestAPI.safeFallbackDetail('command-not-allowed','nope')).toBe('other');
+  });
+});
+
+describe('negotiated throttle resources',()=>{
+  const legacy={cpuUsec:10,memoryPeakBytes:20,oomKills:0,slotCpus:8};
+  it.each([undefined,'1',1])('accepts extended resources only after strict echo %s',async throttle=>{
+    const resources={...legacy,throttledUsec:5,nrThrottled:2};
+    const f=fixture({receipt:(_n,v)=>JSON.stringify({...v,resources,timings:{installMs:2,runMs:8}})});
+    const execute=f.exec;
+    f.exec=vi.fn(async call=>{
+      const reply=await execute(call);
+      return isPrepare(call) ? {...reply,stdout:JSON.stringify({...JSON.parse(reply.stdout),receiptCapabilities:{throttle}})} : reply;
+    });
+    const result=await runRemote({...f,slotUnits:3});
+    expect(JSON.parse(callsOf(f.exec).find(isPrepare).input).capabilities).toEqual({taskPressure:1,throttle:1});
+    expect(result).toMatchObject(throttle===1 ? {mode:'remote',resources,runMs:8,slotUnits:3} : {mode:'unconfirmed',reason:'ambiguous-result'});
+  });
+  it.each([legacy,{...legacy,throttledUsec:null,nrThrottled:null},
+    ...[-1,1.5,Number.MAX_SAFE_INTEGER+1,'2'].flatMap(value=>[
+      {...legacy,throttledUsec:value,nrThrottled:0},{...legacy,throttledUsec:0,nrThrottled:value}]),
+    {...legacy,throttledUsec:1},{...legacy,nrThrottled:1},{...legacy,throttledUsec:0,nrThrottled:0,extra:1}])
+  ('validates exact sets and safe nullable throttle counters %j',resources=>{
+    const expected={v:1,nonce:'n',run:'r',inputDigest:'i',argvDigest:'a',lock:'l',manifestDigest:'a'.repeat(64)};
+    const valid=resources===legacy || resources.throttledUsec===null;
+    expect(remoteManifestAPI.verifyReceipt(JSON.stringify({...expected,phase:'test',code:0,resources}),expected,0,{throttle:1})).toBe(valid);
   });
 });
