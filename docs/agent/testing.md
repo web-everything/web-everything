@@ -4580,3 +4580,35 @@ a subdirectory beside the live `<slug>.json` records so no valid slug can collid
 are usable only for the ended pid; SIGKILL cannot leave a marker. Keep missing/stale
 marker, redaction, bounded-tail and diagnostic-write-failure regressions in the scoped
 review-job and review-daemon suites.
+
+## Required-check evidence contract (PR1)
+
+`resolveRequiredChecks` ships without production callers. Its acceptance tests build
+job/head-bound hold annotations inline; no caller or hold-classifier change is required.
+Every required name needs its own evidence, a live/cache roster, an exact head and
+`rowsComplete: true`. Missing or false completeness returns `unknown`; neutral/skipped
+conclusions fail unless the exact name is in `optionalNames`.
+
+The fetch tests prove completeness only from matching connection counts, valid nodes
+and `hasNextPage: false`, and preserve the commit read head independently of the PR head.
+Legacy hydration reads at most ten batches of twenty heads. Unreadable, truncated or
+overflow evidence remains incomplete for retry on a later tick or operator inspection;
+an incomplete refresh preserves previously observed failures. Retry by exhausting
+pagination or explicitly reading every required name before attesting completeness.
+
+
+## PR1 audit: malformed rows, human holds and unavailable rosters
+
+`pr-list-paged.test.mjs` pins success beside null, empty and unknown-type nodes in both
+orders: mapping retains a nameless unknown row, marks the connection incomplete, and
+prevents a green legacy summary (which rejects the malformed identity). Strict resolution
+returns `unknown`. The open-PR fetch regression also proves that such an incomplete refresh
+preserves an already observed failure. Retry the read on a later tick or inspect the evidence
+before admission; never discard malformed nodes to obtain a green summary.
+
+`check-state-predicate.test.mjs` requires the shared `humanReviewOnlyHold` guard for each
+job/head-bound merge-gate hold source: IDs must be a nonempty subset of the human-review
+hold gates and include `review-hold-labels` or `review-acceptance`. Candidate-label-only
+and other incidental holds retain failure. Empty or malformed required rosters always
+return `unknown` with `roster-unavailable`, including persisted options containing the
+removed `allowEmptyRequiredNames` override and evidence with an observed merge-gate failure.
