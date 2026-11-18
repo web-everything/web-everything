@@ -349,13 +349,13 @@ export function needsHumanVoidState(comments, headSha) {
  * one refuses it. `pr` is `{ headRefOid, statusCheckRollup }` for the PR now. A different head is not judged here
  * (the rollup describes another commit). Pure.
  */
-export function notCiBreakRecordRefusal({ headSha, pr, requiredChecks }) {
+export function notCiBreakRecordRefusal({ headSha, pr, requiredChecks, rosterSource }) {
   const head = String(headSha ?? '').trim().toLowerCase();
   const prHead = String(pr?.headRefOid ?? '').trim().toLowerCase();
   if (!head || !prHead || !(prHead.startsWith(head) || head.startsWith(prHead))) return null;
-  const u = unsettledRequiredChecks({ headSha: prHead, rowsHead: pr?.rowsHead, rowsComplete: pr?.rowsComplete === true, rollup: pr?.statusCheckRollup, requiredChecks });
-  if (u.red.includes('check-evidence'))
-    return `Cannot prove every required check green (check-evidence unknown${requiredChecks?.length ? `; required: ${requiredChecks.join(', ')}` : ''}); restore the required-check roster and inspect complete checks on the current head before retrying.`;
+  const u = unsettledRequiredChecks({ headSha: prHead, rowsHead: pr?.rowsHead, rowsComplete: pr?.rowsComplete === true, rollup: pr?.statusCheckRollup, requiredChecks, rosterSource });
+  if (u.missing.includes('check-evidence'))
+    return `Cannot prove every required check green (check-evidence unknown${requiredChecks?.length ? `; required: ${requiredChecks.join(', ')}` : ''}${u.red.length ? `; red: ${u.red.join(', ')}` : ''}); restore the required-check roster and inspect complete checks on the current head before retrying.`;
   const parts = [];
   if (u.pending.length) parts.push(`still running: ${u.pending.join(', ')}`);
   if (u.missing.length) parts.push(`not started: ${u.missing.join(', ')}`);
@@ -367,13 +367,13 @@ export function notCiBreakRecordRefusal({ headSha, pr, requiredChecks }) {
 }
 
 /** Refuse a human CI escalation only when required CI is green and review/merge gates alone are red. Pure. */
-export function needsHumanGateOnlyRefusal({ headSha, pr, requiredChecks }) {
+export function needsHumanGateOnlyRefusal({ headSha, pr, requiredChecks, rosterSource }) {
   if (!sameSha(headSha, pr?.headRefOid)) return null;
   if (!Array.isArray(requiredChecks) || !requiredChecks.length) return null;
   // A cancelled, stale, running, or missing required check may need human help.
   // Gate-only red describes failures, not whether the rest of CI finished green.
   const evidence = { headSha: pr.headRefOid, rowsHead: pr.rowsHead, rowsComplete: pr.rowsComplete === true,
-    rollup: pr.statusCheckRollup, requiredChecks };
+    rollup: pr.statusCheckRollup, requiredChecks, rosterSource };
   if (!ciGreenForEscalation(evidence)) return null;
   const { gateOnlyRed, red } = gateOnlyRedStates(evidence);
   if (!gateOnlyRed) return null;
@@ -448,10 +448,10 @@ async function checkEscalationRecordable({ pr, repo, headSha, outcome, settings 
   readRequired = defaultReadRequiredChecks }, expectedOutcome, refusalFor) {
   if (outcome !== expectedOutcome || !settings?.recheckNotCiBreak) return { refusal: null };
   const warningFor = error => `could not re-check required checks before recording ${expectedOutcome}: ${String(error?.message || error).split('\n')[0]}`;
-  let facts, checks;
+  let facts, checks, rosterSource;
   try {
     facts = await (readPr ?? (args => defaultReadPrChecks(args, prChecksOptions)))({ pr, repo });
-    ({ checks } = await readRequired({ repo: repo ?? facts?.slug ?? null }));
+    ({ checks, source: rosterSource } = await readRequired({ repo: repo ?? facts?.slug ?? null }));
   } catch (e) {
     return { refusal: expectedOutcome === 'not-a-ci-break'
       ? 'Cannot prove every required check green; inspect complete checks on the current head before retrying.' : null, warning: warningFor(e) };
@@ -461,7 +461,7 @@ async function checkEscalationRecordable({ pr, repo, headSha, outcome, settings 
   summarize(facts?.statusCheckRollup, { requiredNames: [] });
   if (!readPr) facts = classifyPrChecks(facts, { pr, repo }, prChecksOptions);
   const refusal = facts?.readError && expectedOutcome === 'needs-human'
-    ? null : refusalFor({ headSha, pr: facts, requiredChecks: checks });
+    ? null : refusalFor({ headSha, pr: facts, requiredChecks: checks, rosterSource });
   return { refusal, ...(facts?.readError ? { warning: warningFor(facts.readError) } : {}) };
 }
 

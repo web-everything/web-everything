@@ -8,7 +8,17 @@
 the shared numbering proof, and main merges whose sensitive blobs match `origin/main`.
 Admission reads complete comments and live head/labels; missing or unreadable evidence retains
 the human hold. Successor proof is read-only, with 8 MiB per Git output and 1024 changed paths;
-exceeding either limit asks the operator to re-approve the current head or queue it.
+exceeding either limit asks the operator to re-approve the current head or queue it. All license
+and numbering Git reads share `numberingGitRunner`, which discovers and disables every promisor
+before reading objects, denies transports and lazy fetch, and isolates global config and replacement
+objects. Caller `exec` handles only GitHub evidence. The runner's `readFailed` flag blocks license
+fallback even when optional alias reads fail; only grep status 1 and config `--get-regexp` status 1
+mean absent optional evidence. Keep real missing/corrupt objects, output overflow, and marker-writing
+promisor helpers in the license/numbering suites. Drive the actual proofs through their internal runner
+seams with a spy wrapping real Git: assert every call's explicit 5-second timeout and exact 8 MiB
+output / 1 MiB numbering-blob caps, environment and pins. Replaying commands through factory defaults
+does not verify proof call sites. The structural AST test ignores comments and allows only the shared
+runner's Git process site and the license's `gh pr view`; its inline bypass samples must fail.
 `drain-merge-strategy.test.mjs` covers the setting-off refusal and best-effort `needs-you` event.
 Run these and `merge-queue-enqueue.test.mjs` through the host heavy-admission queue.
 
@@ -575,6 +585,14 @@ prior status/result); only a trusted result already on the head is terminal. Reg
 **a transient comments-unreadable guard refusal leaves status absent and fresh recovery eligible**
 and **a confirmed-dead queued/ran prior admits and reaches the shared resume path without a model call**.
 Recovery shares the tick's lane/live-review capacity and host admission (including recovery-only ticks).
+`reviewConcurrency.maxLiveReviewRounds` accepts 1..16 (configured default 8); the host per-tick
+start burst remains independently bounded at 1..8. The review daemon's production lane scan budgets
+two acquirable lanes per ordinary round. Red-team-only recovery starts need one lane each and use
+the unhalved free lane count, less starts already accounted for in the tick (minimum zero); a failed
+recovery lane read gives recovery zero lanes and never aborts ordinary dispatch.
+Excess owed ordinary reviews, including a pool with only one lane left, stay
+queued with the existing lane deferral / `poolExhaustion` reason. The focused live-cap-16 pool-fit
+cases in `review-daemon.test.mjs` cover empty, single-lane, even and odd pools without dispatch failures.
 Ordinary and recovery starts share the remaining host per-tick allowance; confirmed starts and
 unknown outcomes consume the cross-repo host budget, while confirmed non-starts do not.
 Recovery defaults to a 30-minute retry cooldown through
@@ -827,6 +845,12 @@ clearances remain confined to the explicitly requested numbering-only proof. Tes
 commits and changed trees through the writer, alongside refusal cases with zero writer calls.
 
 ## Human clearance across drain numbering
+
+`proveNumberingOnlyMove` owns its hardened local Git runner; its compatibility `exec` argument
+is ignored. Pass `cwd` explicitly through callers. Use real repositories and remove loose objects
+to test unreadable evidence; use Trace2 only to observe reads, never to replace them. Promisor
+regressions also run without `GIT_TRACE*` and assert no upload-pack marker is written. Missing
+objects refuse with `retryable: true`; restore local evidence before retrying.
 
 An approved human-surface head hold suppresses rebasing, never pending-card numbering before
 enqueue. Regress that preparation predicate with an approved human-only head carrying a hash card,
@@ -4457,6 +4481,25 @@ non-replayable; CI-held provenance does not establish that a write was never app
 The named failed-cache-replacement regression seeds a clear, observes a live freeze while replacement fails, then forces a transient read before TTL expiry. Failed writes remove old evidence and block reuse in-process even when removal fails; only a successful cache write restores eligibility.
 
 `freeze-last-good.test.mjs` exercises transient-read retries and persistent successful reads with an injected clock, sleep and temporary cache path. Reused evidence must keep its original fetch timestamp: rewriting it during reuse would let an outage extend a cached clear indefinitely. Expired, future-dated, corrupt or missing evidence holds the line. Permanent errors never reuse the cache. `freeze-unreadable-hold` retains the `red-main-hold` skip kind and `redMainHold` flag so pass-level admission and PR-comment suppression still apply. Run these tests through heavy admission.
+## Canonical audit admission regression fixtures
+
+Keep the default canonical checker in producer integration tests and replace only filesystem and
+Git effects. Exercise both `open-pr` and direct `pr-land`, including dry runs, with a docs-only
+changed-file list and missing evidence; refusal must precede publication. First-open fixtures need
+an unpublished local head, an exact-head pass, and another head's fingerprinted history: fingerprint
+the resolved local SHA without fetching the unpublished lane ref. A failed diff or main fetch still
+refuses. Include valid JSON negative records with invalid timestamps or contradictory findings next
+to an older pass, plus carried and waived paths; malformed records require repair before re-auditing.
+
+## Canonical audit before opening PRs
+
+`open-pr` and direct `pr-land` require the canonical codex-audit JSONL evidence, including in dry runs
+and for docs-only changes. They resolve the local PR source to a full SHA and use the shared canonical
+evaluator and origin/main coverage check. The record file comes from the same settings the audit writer
+reads (`scripts/settings/prototype-load.json` beside these scripts), never the target checkout's, so
+sibling-repo PRs work. WEAKENED requires a `ruledWeakened` waiver matching ref, full SHA and findings
+exactly, from the same layers `prototype-load` reads: those settings, platform preferences, or the
+operator ops store (`ruled-weakened-add`). Another head cannot supply the audit.
 
 ## Bounded red-team probe fairness
 
@@ -4562,3 +4605,27 @@ cached within the read and capped at 20; missing/mismatched evidence or overflow
 review with an operator-visible request to inspect Actions jobs/reruns before retrying.
 The REST rerun integration cases in `review-ci-completeness.test.mjs` cover successful reruns,
 different runs, invalid lineage, foreign repositories, unavailable jobs, and the read cap.
+
+## Required-check evidence opt-in and provenance (PR1)
+
+`resolveRequiredChecks` leaves absent required checks pending by default. Only the
+`review-ci-gate` adapter opts into `allowImplication`; CI-heal requires an own row.
+CI-heal fixtures that prove green or held evidence must explicitly attest both
+`rowsComplete: true` and `rosterSource: live|cache`. Preserve the required-check
+reader's `source` through escalation recording and reconcile; an omitted source
+is unavailable evidence, never an implicit live roster. Named negative tests in
+`check-state-predicate`, `ci-heal-verdict-recheck`, and `ci-heal-escalation-mark`
+pin these defaults and the recording preflights.
+
+## Review CI refusal ordering
+
+An observed pending or failed required check takes precedence over `rows-incomplete`
+in the review adapter's primary reason. Incompleteness remains in `secondaryReasons`
+and preserves `unknown: true` with `allowed: false`. Missing checks alone do not
+establish an observed blocker. The ordering cases in `review-ci-gate.test.mjs` and
+the producer formatting cases in `review-ci-gate-io.test.mjs` pin these guarantees.
+Retry after exhausting pagination or explicitly reading every required name;
+successful observed names alone cannot establish admission.
+Consumers that decide whether to recheck evidence must inspect `unknown`, rather
+than infer completeness from the primary reason. The facts-first regression in
+`merge-gate-hold-class.test.mjs` requires a live recheck of an incomplete failure.

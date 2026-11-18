@@ -1301,10 +1301,9 @@ export function defaultReadPullsForCommit(sha, { exec = execFileSyncThrottled, r
  * file-by-file, present on `main` — see `we:scripts/lib/already-landed-content.mjs`'s own header for the full
  * incident and why this needs blob identity rather than a plain diff.
  *
- * PAYS THE EXTRA READS ONLY FOR A PR CARRYING `merge-status:conflicting` — the population
- * `we:scripts/conveyor/parked-pr-conflict-watch.mjs` already narrows this to (a real merge conflict on a
- * review-parked PR), and the ONLY phase `reconcile-core.mjs`'s own `isConflictBounce` would otherwise dispatch a
- * mechanical conflict-fix for. A pass with no such PR (the common case) costs nothing beyond the label scan
+ * PAYS THE EXTRA READS ONLY FOR A PR CARRYING `merge-status:conflicting` OR `mergeStateStatus: DIRTY` —
+ * the same conflict evidence `reconcile-core.mjs`'s own `isConflictBounce` would dispatch a mechanical
+ * conflict-fix for. A pass with no such PR (the common case) costs nothing beyond the conflict scan
  * `defaultReadPrs` already fetched every field for.
  * @param {Array<object>} prs
  * @param {{fetchRef?:Function, readMergeBase?:Function, readChanges?:Function, findMatchingCommit?:Function,
@@ -1319,7 +1318,8 @@ export function enrichPrsWithAlreadyLandedFacts(prs, {
   const list = Array.isArray(prs) ? prs : [];
   const mainRef = mainRefFor(defaultBranch);
   return list.map((pr) => {
-    if (!hasLabel(pr?.labels, CONFLICT_LABEL)) return pr;
+    if (!hasLabel(pr?.labels, CONFLICT_LABEL)
+      && String(pr?.mergeStateStatus ?? '').toUpperCase() !== 'DIRTY') return pr;
     const prNumber = Number(pr?.number);
     const headSha = pr?.headRefOid;
     if (!Number.isInteger(prNumber) || prNumber <= 0 || !isSha(headSha) || !mainRef) return pr;
@@ -1785,7 +1785,7 @@ export function runReconcilePass({
   // one pass over the same PRs. A repo this constellation does not know the gh slug for (`resolvedRepo` stays
   // `null`, `gh` infers from cwd) can return an unavailable empty set. The shared reducer then evaluates
   // observed CI checks, retaining red/pending/unchecked evidence; [] never means an automatic pass.
-  const { checks: requiredChecks } = readRequiredChecks({ repo: resolvedRepo, branch: defaultBranch,
+  const { checks: requiredChecks, source: rosterSource } = readRequiredChecks({ repo: resolvedRepo, branch: defaultBranch,
     ...(readOnly ? { readOnly: true } : {}) });
   // we:backlog/x5uqim1-*.md — attach `requiredCheckCompletedAt`/`aheadByOnMain` to any currently-failing
   // PR and read `main`'s own red windows, so `planReconcile` can tell a `ci-red` PR caused by a red `main` apart
@@ -1867,7 +1867,7 @@ export function runReconcilePass({
     staleCiRerun: staleCiRerunSetting.value,
     roundCap: resolveRoundCap(env),
     repo: repoKey, prs, agents, durableCounts: durableCountsFrom(prs), now, defaultBranch, mainRedWindows,
-    mainLatestCheckRuns, requiredChecks, mainSha, fixerLadder,
+    mainLatestCheckRuns, requiredChecks, rosterSource, mainSha, fixerLadder,
     ...fixCapSettings(loadFixSettings, env, loadTakeoverBudget),
     ...operatorRulingRoundsSetting(loadOperatorRulingRounds, env),
     ...roundExtensionAnchorSetting(loadRoundExtensionAnchorSetting, env),

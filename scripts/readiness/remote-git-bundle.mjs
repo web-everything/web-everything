@@ -160,6 +160,61 @@ function splitNul(buffer) {
 const SIGNATURE_ARMOR = /-----(?:BEGIN|END) (?:PGP SIGNATURE|SSH SIGNATURE|SIGNED MESSAGE)-----/g;
 const bytes = (value) => Buffer.isBuffer(value) ? value : Buffer.from(value ?? '');
 
+/** Reviewed allow-list of already-public tracked files that handle keys (code, not keys). Read from the PUBLIC base
+ *  (the prerequisite commit), never from the range being scanned, so a commit cannot allow-list its own content.
+ *  Keyed by path + sha256 of the blob: any edit changes the hash and re-triggers the full scan. */
+export const CREDENTIAL_ALLOWLIST_PATH = 'scripts/readiness/bundle-scan-allowlist.json';
+async function loadCredentialAllowlist({ git, prerequisite }) {
+  const map = new Map();
+  if (!prerequisite) return map;
+  let shown;
+  try { shown = await git(['show', `${prerequisite}:${CREDENTIAL_ALLOWLIST_PATH}`]); } catch { return map; }
+  if (shown.code !== 0 || shown.stdout == null) return map;
+  let doc;
+  try { doc = JSON.parse(bytes(shown.stdout).toString('utf8')); } catch { return map; }
+  for (const entry of Array.isArray(doc?.entries) ? doc.entries : []) {
+    if (typeof entry?.path !== 'string' || !/^[0-9a-f]{64}$/.test(entry?.sha256 ?? '') || !Array.isArray(entry.findings)) continue;
+    map.set(`${entry.path}\0${entry.sha256}`, new Set(entry.findings.filter(f => typeof f === 'string')));
+  }
+  return map;
+}
+/** Only findings that name key-HANDLING code or an unreadable encoding can be listed; a real token format (github-token,
+ *  aws-access-key, pem-header, ...) is never maskable, whatever the allow-list says. */
+const ALLOWLISTABLE_FINDINGS = new Set(['private-key', 'unsupported-text-encoding']);
+/** The exact blob must already be public: it appears in the prerequisite (public base) history of that path. */
+async function isPublicBlob({ git, prerequisite, label, sha }) {
+  if (!prerequisite) return false;
+  try {
+    const log = await git(['log', prerequisite, '--format=', '--raw', '--no-abbrev', '--no-renames', '--', label]);
+    return log.code === 0 && log.stdout != null && bytes(log.stdout).toString('latin1').split('\n').some(line => line.startsWith(':') && line.split(' ')[3] === sha);
+  } catch { return false; }
+}
+/** True when every finding on this blob is listed for exactly this path and content hash. */
+function allowedFindings(allowed, label, content, findings) {
+  const present = findings.filter(Boolean);
+  if (!allowed.size || !present.length) return false;
+  const set = allowed.get(`${label}\0${createHash('sha256').update(content).digest('hex')}`);
+  if (!set || !present.every(f => set.has(f)) || [...set].some(f => !ALLOWLISTABLE_FINDINGS.has(f))) return false;
+  // The scanners report only the FIRST match, so a listed finding could hide another one behind it. Mask every
+  // listed pattern out of the bytes and rescan the rest (re-encoded as UTF-8 so a listed encoding finding cannot
+  // mask the remaining checks): anything left over refuses the bundle as before.
+  try {
+    let text = content.toString('latin1');
+    for (const name of set) {
+      const rule = secretText.find(([, n]) => n === name);
+      if (rule) text = text.replace(new RegExp(rule[0].source, rule[0].flags.replace('g', '') + 'g'), ' ');
+    }
+    // Byte-preserving mask first: every raw view (latin1, utf8, utf16 either order) of what is left must be clean, so
+    // a NUL-separated (UTF-16) token cannot hide behind a listed encoding finding.
+    if (credentialBufferFinding(Buffer.from(text, 'latin1')) !== null) return false;
+    // The scanners do not detect a bare key BODY (base64 lines under a PEM label): code has no 64+ base64 run and no
+    // line that is only a long base64 token, so either one means key material and keeps the bundle refused.
+    if (/[A-Za-z0-9+/]{64,}/.test(text) || /^[ \t]*[A-Za-z0-9+/]{40,}={0,2}[ \t]*$/m.test(text)) return false;
+    if (set.has('unsupported-text-encoding')) text = text.replace(/\0/g, ' ');
+    return credentialContentFinding(Buffer.from(label), Buffer.from(text, 'utf8')) === null;
+  } catch { return false; }
+}
+
 /**
  * R559: scan every bundled commit's additions beyond the prerequisite tree (or the whole history when it is null).
  * Path policy is the manifest's own exclusion policy; content uses its raw token patterns.
@@ -176,6 +231,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings 
   const graftPath = await git(['rev-parse', '--git-path', 'info/grafts']);
   if (graftPath.code !== 0 || existsSync(resolve(cwd, bytes(graftPath.stdout).toString('utf8').trim()))) throw bundleError('bundle-credential-scan-failed', 'grafts-file');
   const prerequisiteEntries = new Set();
+  const allowed = await loadCredentialAllowlist({ git, prerequisite });
   if (prerequisite) {
     let tree;
     try { tree = await git(['ls-tree', '-r', '-t', '-z', '--full-tree', prerequisite]); }
@@ -334,7 +390,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings 
         let policy = null;
         try { policy = credentialContentFinding(path, content); } catch { policy = 'content-scan-error'; }
         const hit = policy ?? finding;
-        if (hit) return { path: label, finding: hit };
+        if (hit && !(allowedFindings(allowed, label, content, [policy, finding]) && await isPublicBlob({ git, prerequisite, label, sha }))) return { path: label, finding: hit };
         const warning = credentialContentWarning(path, content);
         if (warning) warnings.push({ path: label, finding: warning });
       }

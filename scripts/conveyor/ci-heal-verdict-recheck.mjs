@@ -14,7 +14,7 @@
  *   - {@link unsettledRequiredChecks}: the escalation CLI refuses to record `not-a-ci-break` while a required check is
  *     still pending, missing, or red — the verdict can only be true once they have all finished green.
  *
- * Reuses the shared required-check evidence contract, including head-bound integration implication.
+ * Reuses the shared required-check evidence contract, without implication of absent required checks.
  * Declared setting `ci-heal-verdict-settings.json` (env `WE_CI_HEAL_RECHECK_NOT_CI_BREAK` beats the file);
  * missing, malformed or `off` = the behaviour before this card. PURE apart from the settings file read.
  */
@@ -90,7 +90,7 @@ export function latestRollupAttempts(rollup) {
 }
 
 /** Bind rollup evidence to its read head; never infer a head or roster from rows. */
-function checkEvidence({ rollup, requiredChecks, headSha, rowsHead = headSha, rowsComplete = false, rosterSource = 'live', holds }) {
+function checkEvidence({ rollup, requiredChecks, headSha, rowsHead = headSha, rowsComplete = false, rosterSource, holds }) {
   const rows = Array.isArray(rollup) ? rollup : [];
   const roster = Array.isArray(requiredChecks) ? [...requiredChecks] : [];
   // Observed CodeQL and review gates participate even outside branch protection.
@@ -131,12 +131,14 @@ export function gateOnlyRedStates(options) {
  * @param {{escalation:{outcome?:string, headSha?:string}|null, headSha:string, rollup:Array<object>, requiredChecks:string[]}} o
  * @returns {string[]}
  */
-export function contradictingChecks({ escalation, headSha, rollup, requiredChecks, rowsComplete = false }) {
+export function contradictingChecks({ escalation, headSha, rollup, requiredChecks, rowsComplete = false, rowsHead = headSha, rosterSource }) {
   if (escalation?.outcome !== 'not-a-ci-break' || !sameSha(escalation.headSha, headSha)) return [];
-  const result = checkEvidence({ rollup, requiredChecks, headSha, rowsComplete });
+  const result = checkEvidence({ rollup, requiredChecks, headSha, rowsHead, rowsComplete, rosterSource });
   // An incomplete snapshot can still contain an observed failure, but absence
   // of proof (including malformed or foreign-head rows) never voids a verdict.
-  return Object.entries(result.perName).filter(([, r]) => r.state === 'fail').map(([name]) => name);
+  return Object.entries(result.perName).filter(([name, r]) => r.state === 'fail'
+    || r.rows.some(row => checkEvidence({ rollup: [row], requiredChecks: [name], headSha, rowsHead, rowsComplete: true, rosterSource })
+      .perName[name]?.state === 'fail')).map(([name]) => name);
 }
 
 /** {@link contradictingChecks} as a yes/no. PURE. */

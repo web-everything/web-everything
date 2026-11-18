@@ -64,6 +64,7 @@ import { reconcileHolds } from '../../operations/land-advance-items-io.mjs';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { planNoteComment } from '../reconcile-note-comment.mjs';
 
 // ── fixtures — measured shapes, 2026-08-26 ───────────────────────────────────────────────────────────────────
 const NOW = Date.parse('2026-08-26T17:34:00Z');
@@ -102,6 +103,36 @@ const pr1563 = (over = {}) => ({
   statusCheckRollup: greenRollup,
   comments: [finding()],
   ...over,
+});
+
+describe('live send-back supersedes stale accepted phase and verdict', () => {
+  const oldHead = 'a'.repeat(40), head = 'b'.repeat(40);
+  const accepted = { author: AUTOMATION, createdAt: '2026-08-26T15:00:00Z', body: buildReviewedShaMarker(oldHead) };
+  const sentBack = { ...finding(), createdAt: '2026-08-26T16:00:00Z' };
+  it.each([
+    ['review:changes', { name: 'ready-to-merge' }],
+    ['review:changes', { name: 'review:accepted' }],
+    ['review:changes', { name: 'review:human' }],
+  ])('uses the live changes label despite stale acceptance: %j', (...labels) => {
+    const plan = planReconcile({ prs: [pr1563({ labels, headRefOid: head, comments: [accepted, sentBack] })], agents: [], now: NOW });
+    expect(plan.dispatch).toMatchObject([{ kind: 'fix', phase: 'bounced', headRefOid: head }]);
+    expect(plan.refusals).toEqual([]);
+  });
+  it.each(['label', 'merge-state'])('repairs a same-head conflict after acceptance using %s evidence', evidence => {
+    const plan = planReconcile({ prs: [pr1563({
+      labels: ['review:changes', { name: 'review:pending' }, ...(evidence === 'label' ? ['merge-status:conflicting'] : [])],
+      headRefOid: head, mergeStateStatus: evidence === 'merge-state' ? 'DIRTY' : 'CLEAN',
+      comments: [{ ...accepted, body: buildReviewedShaMarker(head) }, sentBack],
+    })], agents: [], now: NOW });
+    expect(plan.dispatch).toMatchObject([{ kind: 'fix', phase: 'bounced' }]);
+    expect(plan.dispatch[0].isConflict).toBe(evidence === 'label' ? true : undefined);
+    expect(plan.refusals).toEqual([]);
+  });
+  it('keeps the no-findings guard for a send-back without conflict evidence', () => {
+    const plan = planReconcile({ prs: [pr1563({ labels: ['review:changes'], comments: [] })], agents: [], now: NOW });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals[0].kind).toBe('no-findings');
+  });
 });
 
 /** The four PRs actually open at 17:34Z, with the labels and comment counts measured then. */
@@ -217,6 +248,57 @@ describe('case 2 — refusal 1: a fixer that stopped to ASK is never restarted (
     expect(plan.refusals[0].kind).toBe('stood-down');
     expect(plan.refusals[0].prNumber).toBe(1563);
     expect(plan.refusals[0].standDowns).toBe(1);
+  });
+
+  it('escalates an unanswered stand-down once through trusted operator-note markers', () => {
+    const run = pr => planReconcile({ prs: [pr], agents: [], now: NOW });
+    const first = run(stoodDown);
+    expect(first.notes).toMatchObject([{ kind: 'stood-down', prNumber: 1563 }]);
+    const note = first.notes[0];
+    const publication = planNoteComment(note, stoodDown.comments);
+    expect(publication.alreadyPosted).toBe(false);
+    expect(publication.body).toContain('needs your decision');
+    const comments = [...stoodDown.comments, { author: AUTOMATION, body: publication.body }];
+    const next = run({ ...stoodDown, comments });
+    expect(next.dispatch).toEqual([]);
+    expect(next.refusals[0].kind).toBe('stood-down');
+    expect(planNoteComment(next.notes[0], comments).alreadyPosted).toBe(true);
+    expect(planNoteComment(note, [...stoodDown.comments, { author: { login: 'stranger' }, body: publication.body }]).alreadyPosted).toBe(false);
+  });
+
+  it('a cleared stand-down with only its operator note and bookkeeping refuses no-findings', () => {
+    const held = pr1563({ comments: [{ author: AUTOMATION,
+      body: buildStandDownComment({ reason: 'needs-judgment', head: pr1563().headRefOid }) }] });
+    const first = planReconcile({ prs: [held], agents: [], now: NOW });
+    expect(first.refusals[0].kind).toBe('stood-down');
+    const publication = planNoteComment(first.notes[0], held.comments);
+    const comments = [...held.comments, { author: AUTOMATION, body: publication.body }];
+    expect(countFindings(comments)).toBe(0);
+    const cleared = { ...held, headRefOid: 'f'.repeat(40), comments };
+    const plan = planReconcile({ prs: [cleared], agents: [], now: NOW });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals.map(r => r.kind)).toEqual(['no-findings']);
+    expect(countFindings([{ body: `> ${publication.body}\nThis still needs repair.` }])).toBe(1);
+  });
+
+  it('does not count a trusted published note as a finding', () => {
+    const { body } = planNoteComment({ kind: 'stood-down', prNumber: 1563, text: 'Needs a decision.' }, []);
+    expect(countFindings([{ author: AUTOMATION, body }])).toBe(0);
+  });
+
+  it('counts an untrusted note lookalike containing a repair request even with a valid episode marker', () => {
+    const { body } = planNoteComment({ kind: 'stood-down', prNumber: 1563, text: 'Repair the broken guard.' }, []);
+    expect(countFindings([{ author: { login: 'stranger' }, body }])).toBe(1);
+    expect(countFindings([{ body }])).toBe(1);
+    expect(countFindings([body])).toBe(1);
+  });
+
+  it('counts a trusted note lookalike containing a repair request without a valid episode marker', () => {
+    const { body } = planNoteComment({ kind: 'stood-down', prNumber: 1563, text: 'Repair the broken guard.' }, []);
+    const withoutKey = body.replace(/^<!-- conveyor-note-key: .* -->$/m, '');
+    expect(countFindings([{ author: AUTOMATION, body: withoutKey }])).toBe(1);
+    expect(countFindings([{ author: AUTOMATION, body: `${withoutKey}\n<!-- conveyor-note-key: -->` }])).toBe(1);
+    expect(countFindings([{ author: AUTOMATION, body: `${withoutKey}\n<!-- conveyor-note-key: invalid -->` }])).toBe(1);
   });
 
   it('TERMINAL — a week later the answer is byte-identical: no decay, no clock', () => {
@@ -1855,6 +1937,35 @@ describe('case 5f — conflict-fix dispatch, capped by its OWN durable marker, n
     expect(plan.refusals[0].capKind).toBe('fix');
   });
 
+  it.each([NEGOTIATION_ROUND_CAP, NEGOTIATION_ROUND_CAP + 1])('a DIRTY bounce without the conflict label refuses cap-exhausted after %i shared rounds', (attempts) => {
+    const shared = Array.from({ length: attempts }, () => ({ body: REARM_COMMENT_MARKER, author: AUTOMATION }));
+    const plan = planReconcile({
+      prs: [pr1563({ mergeStateStatus: 'DIRTY', comments: [finding(), ...shared,
+        { body: CONFLICT_FIX_COMMENT_MARKER, author: AUTOMATION },
+      ] })], agents: [], now: NOW,
+    });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toEqual([expect.objectContaining({
+      kind: 'cap-exhausted', attempts, cap: NEGOTIATION_ROUND_CAP, capKind: 'fix',
+      why: expect.stringContaining('a person must take it'),
+    })]);
+  });
+
+  it('a DIRTY review:changes bounce with a live finding dispatches an ordinary fix at four shared rounds plus one completed conflict round', () => {
+    const shared = Array.from({ length: NEGOTIATION_ROUND_CAP - 1 }, () => ({ body: REARM_COMMENT_MARKER, author: AUTOMATION }));
+    const plan = planReconcile({
+      prs: [pr1563({ mergeStateStatus: 'DIRTY', comments: [finding(), ...shared,
+        { body: CONFLICT_FIX_COMMENT_MARKER, author: AUTOMATION },
+      ] })], agents: [], now: NOW,
+    });
+    expect(plan.refusals).toEqual([]);
+    expect(plan.dispatch).toEqual([expect.objectContaining({
+      kind: 'fix', prNumber: 1563, phase: 'bounced', attempts: NEGOTIATION_ROUND_CAP - 1,
+    })]);
+    expect(plan.dispatch[0].isConflict).toBeUndefined();
+    expect(plan.dispatch[0].why).toContain(`${NEGOTIATION_ROUND_CAP - 1} of ${NEGOTIATION_ROUND_CAP} attempts are spent`);
+  });
+
   it('`countConflictFixComments` narrows on the leading line, like every sibling counter', async () => {
     const { countConflictFixComments } = await import('../conflict-fix-round-count.mjs');
     expect(countConflictFixComments([{ body: CONFLICT_FIX_COMMENT_MARKER + '\n\nmore', author: AUTOMATION }])).toBe(1);
@@ -3431,6 +3542,7 @@ describe('#xconv1 (web-everything/web-everything#2766/#2767 unblock) — CONVERT
 
   it('THE LIVE #2766/#2767 SHAPE: needs-human + accepted-then-test-gaming-parked-then-healed on the SAME head dispatches `convert-advisory`, never `already-reviewed-head`', () => {
     const pr = {
+      rowsComplete: true, rowsHead: HEAD,
       number: 2766, state: 'OPEN', headRefName: 'lane/2766', headRefOid: HEAD,
       labels: lbl('review:human', 'review:awaiting-advisory'), mergeStateStatus: 'CLEAN', statusCheckRollup: pendingRollup,
       comments: [acceptComment(), testGamingParkComment(), healComment()],
@@ -3447,6 +3559,7 @@ describe('#xconv1 (web-everything/web-everything#2766/#2767 unblock) — CONVERT
 
   it('a needs-human PR accepted then healed with NO substantive park reason still converts, off the heal comment alone', () => {
     const pr = {
+      rowsComplete: true, rowsHead: HEAD,
       number: 2777, state: 'OPEN', headRefName: 'lane/2777', headRefOid: HEAD,
       labels: lbl('review:human'), mergeStateStatus: 'CLEAN', statusCheckRollup: pendingRollup,
       comments: [acceptComment(), healComment()],
@@ -3899,8 +4012,20 @@ describe('required review-gate conflict still refuses a superseded-verdict conve
     { author: { login: 'web-everything' }, createdAt: '2026-09-26T23:15:40Z',
       body: '**`review:accepted` removed — mutual exclusivity (#2766/#2767).**\n\nThis PR carried both `review:accepted` and `review:human` at once.' },
   ];
-  it.each(['failure', 'in_progress'])('needs-human PR with a %s required review-gate gets review-ci, not convert-advisory', state => {
-    const pr = { rowsComplete: true, rowsHead: HEAD, number: 2777, state: 'OPEN', headRefName: 'lane/2777', headRefOid: HEAD, labels: lbl('review:human'), mergeStateStatus: 'CLEAN', comments,
+  it.each([
+    ['incomplete', { rowsComplete: false }, { reason: 'rows-incomplete' }],
+    ['malformed', { statusCheckRollup: [{ name: 'test' }] }, { unknown: true }],
+    ['unknown roster', { requiredChecks: [] }, { reason: 'unknown-required-set' }],
+  ])('refuses conversion with %s evidence even without a review-gate conflict', (_label, over, expected) => {
+    const pr = { rowsComplete: true, rowsHead: HEAD, number: 2777, state: 'OPEN', headRefName: 'lane/2777',
+      headRefOid: HEAD, labels: lbl('review:human'), mergeStateStatus: 'CLEAN', comments,
+      statusCheckRollup: [{ name: 'test', status: 'completed', conclusion: 'success' }], ...over };
+    const plan = planReconcile({ requiredChecks: over.requiredChecks ?? ['test'], prs: [pr], agents: [], durableCounts: {}, now: NOW });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'review-ci', ci: expect.objectContaining(expected) })]);
+  });
+  it.each([[true, 'failure'], [true, 'in_progress'], [false, 'failure'], [false, 'in_progress']])('needs-human PR with completeness %s and %s required review-gate refuses conversion', (rowsComplete, state) => {
+    const pr = { rowsComplete, rowsHead: HEAD, number: 2777, state: 'OPEN', headRefName: 'lane/2777', headRefOid: HEAD, labels: lbl('review:human'), mergeStateStatus: 'CLEAN', comments,
       statusCheckRollup: [{ name: 'test', status: 'completed', conclusion: 'success' },
         state === 'failure' ? { name: 'review-gate', status: 'completed', conclusion: 'failure' } : { name: 'review-gate', status: 'in_progress', conclusion: null }] };
     const plan = planReconcile({ requiredChecks: ['test', 'review-gate'], prs: [pr], agents: [], durableCounts: {}, now: NOW });
@@ -4259,7 +4384,12 @@ describe('green-head needs-human retirement (#5012)', () => {
       body: buildCiHealEscalationComment({ headSha: head, outcome: 'needs-human' }) }],
     statusCheckRollup: requiredChecks.map(name => ({ name, status: 'COMPLETED', conclusion: name === 'review-gate' ? 'FAILURE' : 'SUCCESS' })),
   };
-  const plan = (row = pr, on = true) => planReconcileCore({ prs: [row], requiredChecks, verdictSettings: { voidNeedsHumanWhenCiGreen: on } });
+  const plan = (row = pr, on = true) => planReconcileCore({ prs: [row], requiredChecks, rosterSource: 'live', verdictSettings: { voidNeedsHumanWhenCiGreen: on } });
+  it.each([undefined, 'fallback', 'declared'])('never retires needs-human with unavailable roster provenance %s', rosterSource => {
+    const result = planReconcileCore({ prs: [pr], requiredChecks, rosterSource,
+      verdictSettings: { voidNeedsHumanWhenCiGreen: true } });
+    expect(result.notes.filter(n => n.kind === 'ci-heal-escalation-moot')).toEqual([]);
+  });
   it('emits one moot note outside ci-red without changing dispatch/refusals', () => {
     const on = plan(), off = plan(pr, false);
     expect(on.notes.filter(n => n.kind === 'ci-heal-escalation-moot')).toEqual([expect.objectContaining({ prNumber: 5012, headSha: head, outcome: 'needs-human' })]);
@@ -4321,8 +4451,8 @@ describe('stale required-job base repair (2026-10-19 live PRs)', () => {
     expect(repair({}, required)).toBeNull();
   });
   it('collapses superseded failures and ignores other-head rows', () => {
-    expect(repair({ statusCheckRollup: [{ ...rows[0], conclusion: 'failure', run_id: 1, run_attempt: 1 },
-      ...rows.map(row => ({ ...row, run_id: 1, run_attempt: 2 })),
+    expect(repair({ statusCheckRollup: [{ ...rows[0], conclusion: 'failure', id: 1, detailsUrl: 'https://github.com/o/r/actions/runs/1/job/7', run_id: 1, run_attempt: 1 },
+      ...rows.map(row => ({ ...row, id: 2, detailsUrl: 'https://github.com/o/r/actions/runs/1/job/7', run_id: 1, run_attempt: 2 })),
       { name: 'other', status: 'queued', head_sha: 'old' }] })).toEqual({ missing: ['standards'] });
   });
   it.each([
@@ -4733,7 +4863,7 @@ it('review-hold override refuses incomplete rows whose affected rows are only fa
     reviewTiming: { startAfter: 'fast-checks', fastChecks: ['review-gate'], startEarly: 'off' } });
   expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
   expect(result.refusals.flatMap(row => [row, row.reviewRefusal])).toContainEqual(expect.objectContaining({ kind: 'review-ci',
-    ci: expect.objectContaining({ unknown: true, reason: 'rows-incomplete' }) }));
+    ci: expect.objectContaining({ unknown: true, reason: 'required-review-gate-conflict' }) }));
 });
 
 
@@ -4747,5 +4877,6 @@ it('paged fetch evidence remains unknown to the planner even when every fetched 
   expect(fetched.rowsComplete).toBe(false);
   expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
   expect(result.refusals.flatMap(row => [row, row.reviewRefusal])).toContainEqual(expect.objectContaining({
+    // No review-gate row was observed, so no more specific reason exists: rows-incomplete stays the (fail-closed) reason.
     kind: 'review-ci', ci: expect.objectContaining({ unknown: true, reason: 'rows-incomplete' }) }));
 });

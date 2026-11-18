@@ -86,7 +86,7 @@ describe('mechanical round enrichment port (#5948)', () => {
   const head = 'b'.repeat(40), priorHead = 'a'.repeat(40);
   const comment = (body, hour) => ({ author: { login: 'web-everything' }, body,
     createdAt: `2026-10-10T${String(hour).padStart(2, '0')}:00:00Z` });
-  const snapshot = (ordinary = false) => ({ number: 5948, headRefName: 'lane/mechanical', headRefOid: head,
+  const snapshot = (ordinary = false) => ({ rowsHead: head, rowsComplete: true, number: 5948, headRefName: 'lane/mechanical', headRefOid: head,
     baseRefName: 'main', labels: [{ name: 'review:pending' }], files: [{ path: 'src/a.mjs' }],
     statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', headSha: head }],
     comments: [...[1, 2, 3, 4, 5].map(h => comment(REARM_COMMENT_MARKER, h)),
@@ -186,7 +186,7 @@ it('maps repo slugs before binding and refuses unknown repos before IO', async (
   const options = {
     env: { WE_REVIEW_START_AFTER: 'ci-green' },
     readRequiredChecks: () => ({ checks: requiredChecks, source: 'live' }),
-    readPrs: () => [{ statusCheckRollup: requiredChecks.map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })), number: 49, headRefName: 'lane/1-x', headRefOid: 'a'.repeat(40), labels: [{ name: 'review:pending' }], comments: [] }],
+    readPrs: () => [{ rowsHead: 'a'.repeat(40), rowsComplete: true, statusCheckRollup: requiredChecks.map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })), number: 49, headRefName: 'lane/1-x', headRefOid: 'a'.repeat(40), labels: [{ name: 'review:pending' }], comments: [] }],
     readAgents: () => [{ name: 'review-fui-49', pidAlive: true, pid: 1 }], enrich: (agents) => agents,
   };
   expect(runReconcilePass({ ...options, repo: 'frontier-ui/frontierui' }).refusals.some((r) => r.kind === 'live-process')).toBe(true);
@@ -454,11 +454,11 @@ const HEAD_2752 = '253d75c2b82988be773903cba4e5ed172be57fb8';
 const BASE_2752 = '06d01a43e0000000000000000000000000000000';
 const BLOB = 'b'.repeat(40);
 
-it('enrichPrsWithAlreadyLandedFacts skips a PR with no merge-status:conflicting label entirely — zero extra IO', async () => {
+it('enrichPrsWithAlreadyLandedFacts skips a PR with neither conflict label nor DIRTY merge state entirely — zero extra IO', async () => {
   const { enrichPrsWithAlreadyLandedFacts } = await import('../reconcile-pass.mjs');
   const fetchRef = vi.fn();
   const readMergeBase = vi.fn();
-  const prs = [{ number: 1, labels: [{ name: 'review:changes' }] }];
+  const prs = [{ number: 1, headRefOid: HEAD_2752, mergeStateStatus: 'CLEAN', labels: [{ name: 'review:changes' }] }];
   const out = enrichPrsWithAlreadyLandedFacts(prs, { fetchRef, readMergeBase });
   expect(fetchRef).not.toHaveBeenCalled();
   expect(readMergeBase).not.toHaveBeenCalled();
@@ -519,6 +519,42 @@ it('enrichPrsWithAlreadyLandedFacts never guesses containment with no merge-base
   expect(readChanges).not.toHaveBeenCalled();
   expect(enrichPrsWithAlreadyLandedFacts([pr], { fetchRef: vi.fn(), readMergeBase: () => BASE_2752, readChanges })[0]
     .alreadyLandedInMain).toBeUndefined();
+  const readMergeBase = vi.fn();
+  const hostile = { ...pr, headRefOid: '--output=/x' };
+  expect(enrichPrsWithAlreadyLandedFacts([hostile], { fetchRef: vi.fn(), readMergeBase })[0]).toBe(hostile);
+  expect(readMergeBase).not.toHaveBeenCalled();
+});
+
+// A PR whose conflict is only visible as `mergeStateStatus: DIRTY` (no `merge-status:conflicting` label yet) takes
+// the same already-landed enrichment path as a labelled one — same attach / never-guess guarantees.
+it.each([
+  { labels: [{ name: 'review:changes' }], mergeStateStatus: 'DIRTY' },
+  { labels: [], mergeStateStatus: 'dirty' },
+])('enrichPrsWithAlreadyLandedFacts treats a DIRTY merge state as conflict evidence: attaches the carrier PR on a full match, evidence %j', async (conflictEvidence) => {
+  const { enrichPrsWithAlreadyLandedFacts } = await import('../reconcile-pass.mjs');
+  const pr = { number: 2752, headRefName: 'lane/4034-critical-work-gate', headRefOid: HEAD_2752, ...conflictEvidence };
+  const readChanges = vi.fn(() => [{ status: 'A', path: 'a.txt', dstMode: '100644', dstBlob: BLOB }]);
+  const out = enrichPrsWithAlreadyLandedFacts([pr], {
+    fetchRef: vi.fn(), readMergeBase: () => BASE_2752, readChanges,
+    findMatchingCommit: vi.fn(() => '22faaaa916445657928d5e30720881b830387ab6'), readPulls: vi.fn(() => [2759]),
+  });
+  expect(out[0].alreadyLandedInMain).toEqual({ carrierPr: 2759 });
+});
+
+it.each([
+  { labels: [], mergeStateStatus: 'DIRTY' },
+  { labels: [], mergeStateStatus: 'dirty' },
+])('enrichPrsWithAlreadyLandedFacts with DIRTY merge state never guesses partial containment or a non-sha head, evidence %j', async (conflictEvidence) => {
+  const { enrichPrsWithAlreadyLandedFacts } = await import('../reconcile-pass.mjs');
+  const pr = { number: 2752, headRefName: 'lane/4034-critical-work-gate', headRefOid: HEAD_2752, ...conflictEvidence };
+  const readChanges = vi.fn(() => [
+    { status: 'A', path: 'b.txt', dstMode: '100644', dstBlob: BLOB },
+    { status: 'D', path: 'a.txt', dstMode: '000000', dstBlob: '0'.repeat(40) },
+  ]);
+  const findMatchingCommit = vi.fn((change) => (change.path === 'b.txt' ? 'commit1' : null));
+  expect(enrichPrsWithAlreadyLandedFacts([pr], {
+    fetchRef: vi.fn(), readMergeBase: () => BASE_2752, readChanges, findMatchingCommit, readPulls: vi.fn(),
+  })[0].alreadyLandedInMain).toBeUndefined();
   const readMergeBase = vi.fn();
   const hostile = { ...pr, headRefOid: '--output=/x' };
   expect(enrichPrsWithAlreadyLandedFacts([hostile], { fetchRef: vi.fn(), readMergeBase })[0]).toBe(hostile);
@@ -2062,4 +2098,11 @@ it('runs the file-based synchronous pool with real child processes and cleans it
     })).toEqual([{ eligible: true, number: 1 }, { eligible: true, number: 2 }, { eligible: true, number: 3 }]);
     expect(evidenceExists(folder)).toBe(false);
   } finally { rmSync(lockRoot, { recursive: true, force: true }); }
+});
+
+it.each([undefined, 'live', 'cache', 'fallback'])('forwards required-check roster provenance %s into planner options', async source => {
+  const { runReconcilePass } = await import('../reconcile-pass.mjs');
+  const result = runReconcilePass({ ...xxOptions(), readOnly: true, readPrs: () => [],
+    readRequiredChecks: () => ({ checks: ['test'], ...(source === undefined ? {} : { source }) }) });
+  expect(result.plannerOptions.rosterSource).toBe(source);
 });

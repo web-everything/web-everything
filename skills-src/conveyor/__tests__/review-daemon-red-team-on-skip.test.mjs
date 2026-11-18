@@ -1,4 +1,11 @@
 import { it, expect, vi, afterAll, beforeEach } from 'vitest';
+// The host operator store (~/.claude/operator-overrides.json) outranks env, so a developer's live
+// redTeamQueue override would leak into these fixtures; read a missing store instead (= no overrides).
+const operatorFixture = vi.hoisted(() => ({ file: `/nonexistent-operator-store-${process.pid}-${Date.now()}.json` }));
+vi.mock('../../../scripts/lib/operator-override-reader.mjs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, readOperatorOverrides: options => actual.readOperatorOverrides({ ...options, file: options?.file ?? operatorFixture.file }) };
+});
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -210,7 +217,8 @@ it.each(['fresh', 'resume'])('CLI tick options recover an already-reviewed head 
     const take = vi.fn();
     const out = runReviewTick({ ...production, repo,
       readPrs: () => [{ number: pr, headRefOid: head, labels: [], comments: [] }],
-      readAgents: () => [], holdReconcile: () => [], acquirableLanes: () => 1,
+      // Production wires a separate (unhalved) recovery lane reader; pin both seams so the fixture never reads the real pool.
+      readAgents: () => [], holdReconcile: () => [], acquirableLanes: () => 1, recoveryAcquirableLanes: () => 1,
       liveReviewBudget: { left: 1 }, hostAdmission: () => ({ admitted: true, maxPerTick: 1, take }),
       reconcile: () => ({ dispatch: [], refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] }),
       tagRound: vi.fn(), tagStatus: vi.fn(), statusCandidates: () => [],

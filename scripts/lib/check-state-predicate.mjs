@@ -136,10 +136,33 @@ const evidenceInteger = value => typeof value === 'number'
 const evidenceName = row => row?.name ?? row?.context;
 const evidenceJob = row => /\/actions\/runs\/\d+\/job\/(\d+)/.exec(row?.detailsUrl ?? row?.details_url ?? '')?.[1];
 
+// Completed is a lifecycle marker, not an outcome. Compare only explicit
+// outcome categories, before legacy mapping or hold excusal rewrites evidence.
+const contradictoryEvidence = row => {
+  const outcomes = [row?.status, row?.conclusion, row?.state].map(normalize).map(value => {
+    if (value === 'error') return 'red';
+    if (value === 'expected') return 'pending';
+    if (Object.hasOwn(CHECK_STATE_TABLE.completed, value)) return CHECK_STATE_TABLE.completed[value];
+    if (value !== 'completed' && Object.hasOwn(CHECK_STATE_TABLE, value)) return CHECK_STATE_TABLE[value];
+    return null;
+  }).filter(Boolean);
+  return new Set(outcomes).size > 1;
+};
+
+// A name/run pair alone cannot identify a matrix job. Prefer the Actions job
+// identity; otherwise require the same check-run identity, never infer lineage.
+const evidenceIdentity = row => {
+  const job = evidenceInteger(evidenceJob(row));
+  if (job !== null) return `job:${job}`;
+  const check = evidenceInteger(row?.check_run_id ?? row?.databaseId ?? row?.id);
+  return check === null ? null : `check:${check}`;
+};
+
 /** Resolve required evidence without guessing a roster, head, attempt order, or read completeness.
+ * Implication is opt-in via allowImplication (default false); only the review-ci-gate adapter opts in.
  * rowsComplete is true only after exhausting pages or explicitly fetching every required name.
  */
-export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNames, rosterSource, head, holds = [], optionalNames = [] } = {}) {
+export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNames, rosterSource, head, holds = [], optionalNames = [], allowImplication = false } = {}) {
   const perName = Object.create(null), reasons = [];
   const validNames = names => Array.isArray(names) && [...names].every(n => typeof n === 'string' && n.trim());
   if (!['live', 'cache'].includes(rosterSource) || !validNames(requiredNames) || !requiredNames.length) reasons.push('roster-unavailable');
@@ -161,7 +184,7 @@ export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNa
       else if (['pending', 'expected'].includes(legacy)) status = 'pending';
     }
     let state = 'unknown';
-    if (typeof name !== 'string' || !name.trim() || !Object.hasOwn(CHECK_STATE_TABLE, status)
+    if (contradictoryEvidence(row) || typeof name !== 'string' || !name.trim() || !Object.hasOwn(CHECK_STATE_TABLE, status)
       || (status === 'completed' && !Object.hasOwn(CHECK_STATE_TABLE.completed, conclusion) && !legacyError)) why.push('malformed');
     else if (status !== 'completed') { state = 'pending'; why.push('pending'); }
     else if (['cancelled', 'stale'].includes(conclusion)) { state = 'pending'; why.push('needs-rerun'); }
@@ -179,16 +202,17 @@ export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNa
         && sha(hold?.headSha) === sha(head) && Array.isArray(hold?.holdIds) && hold.holdIds.length
         && [...hold.holdIds].every(id => HUMAN_REVIEW_HOLD_GATES.includes(id)))) state = 'held';
     }
-    return { row, name, state, reasons: why, rowHead, run: evidenceInteger(row?.run_id), attempt: evidenceInteger(row?.run_attempt) };
+    return { row, name, state, reasons: why, rowHead, identity: evidenceIdentity(row), run: evidenceInteger(row?.run_id), attempt: evidenceInteger(row?.run_attempt) };
   });
   // A nameless row cannot safely be assigned to an advisory check.
   if (classified.some(r => typeof r.name !== 'string' || !r.name.trim())) reasons.push('malformed');
   const resolveName = name => {
     const all = classified.filter(r => r.name === name);
     const active = all.filter(r => !all.some(other => r.rowHead && r.rowHead === other.rowHead
-      && r.run !== null && r.run === other.run && r.attempt !== null && other.attempt !== null
+      && r.run !== null && r.run === other.run && r.identity !== null && r.identity === other.identity
+      && r.attempt !== null && other.attempt !== null
       && other.attempt > r.attempt && !r.reasons.includes('malformed') && !r.reasons.includes('foreign-head')));
-    // Sorting is for display only. Metadata other than run_attempt never supersedes evidence.
+    // Sorting is for display only. Only run_attempt orders rows of a proven identity.
     const key = r => JSON.stringify([String(r.run ?? ''), String(evidenceJob(r.row) ?? r.row.id ?? ''),
       Object.keys(r.row).sort().map(k => [k, r.row[k]])]);
     active.sort((a, b) => evidenceRank[b.state] - evidenceRank[a.state] || key(a).localeCompare(key(b)));
@@ -198,7 +222,7 @@ export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNa
       reasons: active.length ? [...new Set(active.flatMap(r => r.reasons))].sort() : ['missing'] };
   };
   for (const name of [...new Set(requiredNames)].sort()) perName[name] = resolveName(name);
-  if (Object.hasOwn(perName, 'integration') && !classified.some(r => r.name === 'integration') && resolveName('test').state === 'pass') {
+  if (allowImplication === true && Object.hasOwn(perName, 'integration') && !classified.some(r => r.name === 'integration') && resolveName('test').state === 'pass') {
     perName.integration = { state: 'pass', rows: [], via: 'test', rerunInFlight: false, reasons: [] };
   }
   return { state: reasons.length ? 'unknown' : worstEvidence(Object.values(perName).map(r => r.state)), perName,

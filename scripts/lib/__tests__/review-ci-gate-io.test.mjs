@@ -258,6 +258,19 @@ it('publish-time gate reads the exact head marker only when enabled', () => {
   expect(readVerifyGreen).not.toHaveBeenCalled();
 });
 
+it.each([
+  [{ status: 'in_progress' }, 'pending'],
+  [{ status: 'completed', conclusion: 'failure' }, 'failure'],
+])('formats the observed blocker before incomplete evidence: %s', (fields, reason) => {
+  const result = readGate(fixture({ policy: { startAfter: 'ci-green' },
+    readRequired: () => ({ source: 'live', checks: ['daemon-soak'] }),
+    readChecks: () => [{ name: 'daemon-soak', ...fields }],
+  }));
+  expect(result).toMatchObject({ allowed: false, unknown: true, rowsComplete: false,
+    reason: 'required-checks-not-successful', secondaryReasons: ['rows-incomplete'] });
+  expect(formatReviewCiSkip(result)).toBe(`review-ci: required-checks-not-successful: daemon-soak=${reason}`);
+});
+
 it.each([false, undefined])('refuses incomplete injected check pages (%s) without logging early start', rowsComplete => {
   const log = vi.fn();
   const checks = Object.defineProperty([{ name: 'custom', status: 'completed', conclusion: 'success' }],
