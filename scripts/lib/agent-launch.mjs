@@ -40,17 +40,21 @@ export function agentResumeId(argv = []) {
 }
 
 // A `--` right after an option that consumes the next word is that option's VALUE, not the delimiter.
-// Fail closed: any long option not known to be a plain switch is assumed to take a value (the unknown case
-// scans more, so it can only over-refuse), and so are the short value options below.
-const SWITCH_OPTIONS = new Set([
-  '--print', '--bg', '--verbose', '--continue', '--restricted', '--json', '--help', '--version', '--debug',
-  '--last', '--all', '--skip-git-repo-check', '--ephemeral', '--oss',
+// Only explicitly known value options consume the next word. Every other long option is a boolean
+// (including Codex's --ignore-rules), so it cannot swallow the `resume` subcommand or session id.
+const VALUE_OPTIONS = new Set([
+  '--model', '--permission-mode', '--append-system-prompt', '--system-prompt', '--mcp-config',
+  '--resume', '--session-id', '--output-format', '--input-format', '--json-schema', '--max-turns',
+  '--max-budget-usd', '--tools', '--allowedTools', '--disallowedTools', '--agent', '--agents',
+  '--settings', '--setting-sources', '--fallback-model', '--effort', '--add-dir',
+  '--config', '--profile', '--sandbox', '--ask-for-approval', '--cd', '--image',
+  '--output-schema', '--output-last-message', '--color', '--enable', '--disable',
 ]);
 const SHORT_VALUE_OPTIONS = new Set(['-n', '-m', '-s', '-C']);
 // Codex's own short value options (-c config, -i image, -p profile, -o output file) are only consulted while
 // walking `codex exec [resume]` options, so they never change where the `--` delimiter is found.
 const CODEX_SHORT_VALUE_OPTIONS = new Set(['-c', '-i', '-p', '-o']);
-const takesValue = (word) => SHORT_VALUE_OPTIONS.has(word) || (typeof word === 'string' && /^--[\w-]+$/.test(word) && !SWITCH_OPTIONS.has(word));
+const takesValue = (word) => SHORT_VALUE_OPTIONS.has(word) || VALUE_OPTIONS.has(word);
 const codexTakesValue = (word) => CODEX_SHORT_VALUE_OPTIONS.has(word) || takesValue(word);
 const isOption = (word) => typeof word === 'string' && word.length > 1 && word.startsWith('-');
 
@@ -145,7 +149,8 @@ export function launchAgent(descriptor, primitive, ...args) {
   }
   // A resume flag with no value reads as an empty native id: that is a MISSING id, never one an empty/blank
   // descriptor resumeId can "equal". Every native id must be a non-blank string and match descriptor.resumeId.
-  if (nativeIds.some(id => typeof id !== 'string' || id.trim() === '' || descriptor.resumeId !== id)) {
+  if ((descriptor.mode === 'codex-exec-resume' && nativeIds.length === 0)
+    || nativeIds.some(id => typeof id !== 'string' || id.trim() === '' || descriptor.resumeId !== id)) {
     refuse('resumeId must equal the native resume id in argv', descriptor, log);
   }
   if ('launchGuard' in descriptor) {

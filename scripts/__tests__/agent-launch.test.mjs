@@ -75,10 +75,11 @@ describe('launch refusal', () => {
 describe('transparent execution', () => {
   it.each(AGENT_LAUNCH_MODES.flatMap(mode => ['spawn', 'exec'].map(kind => [mode, kind])))
   ('preserves argv, env, cwd, options, return identity for %s via %s', (mode, kind) => {
-    const argv = ['literal $() `text`', '\n'], env = { PATH: 'fixture-bin', TOKEN: 'fixture-token' };
+    const argv = mode === 'codex-exec-resume' ? ['exec', 'resume', SID, 'literal $() `text`', '\n'] : ['literal $() `text`', '\n'];
+    const env = { PATH: 'fixture-bin', TOKEN: 'fixture-token' };
     const options = { cwd: 'fixture-lane', env, stdio: ['ignore', 'pipe', 7], timeout: 12, maxBuffer: 48, detached: true };
     const result = {}, io = { [kind]: vi.fn(() => result) }, primitive = io[kind];
-    expect(launchAgent({ mode, resumeId: null }, primitive, mode.startsWith('codex') ? 'codex' : 'claude', argv, options)).toBe(result);
+    expect(launchAgent({ mode, resumeId: mode === 'codex-exec-resume' ? SID : null }, primitive, mode.startsWith('codex') ? 'codex' : 'claude', argv, options)).toBe(result);
     expect(primitive.mock.calls).toEqual([[mode.startsWith('codex') ? 'codex' : 'claude', argv, options]]);
     expect(primitive.mock.calls[0][1]).toBe(argv);
     expect(primitive.mock.calls[0][2]).toBe(options);
@@ -178,6 +179,7 @@ describe('resume validation across execution forms', () => {
     ['claude', ['-p', '--', `--resume=${SID}`]],
     ['claude', ['-p', '--', `--session-id=${SID}`]],
     ['codex', ['exec', '--', 'resume', SID]],
+    ['claude', ['--some-future-option', '--', '--resume', SID]],
     ['claude', '-p -- --resume'],
     ['claude', `-p -- --resume ${SID}`],
     ['claude -p -- --resume'],
@@ -197,7 +199,7 @@ describe('resume validation across execution forms', () => {
     ['claude', ['--model', '--', '-r', 'other-id']],
     ['claude', ['--mcp-config', '--', '--resume', 'other-id']],
     ['codex', ['--profile', '--', 'exec', 'resume', 'other-id']],
-    ['claude', ['--some-future-option', '--', '--resume', 'other-id']],
+    ['claude', ['--permission-mode', '--', '--resume', 'other-id']],
     ['npx -- claude --resume other-id'],
   ])('still refuses a real resume hidden behind a non-delimiter -- (%j)', (...args) => {
     const primitive = vi.fn(), log = vi.fn();
@@ -269,6 +271,32 @@ describe('completion wrapper', () => {
 
 // Codex `exec resume [OPTIONS] [SESSION_ID] [PROMPT]`: the id is the first POSITIONAL after `resume`.
 describe('codex resume id is the positional session id, never an option', () => {
+  const ignoreRulesShapes = [
+    ['exec', '--ignore-rules', 'resume', SID],
+    ['exec', 'resume', '--ignore-rules', SID],
+  ];
+  it.each(ignoreRulesShapes.map(argv => [JSON.stringify(argv), argv]))('refuses a mismatched id with boolean --ignore-rules in %s', (_label, argv) => {
+    const primitive = vi.fn(), log = vi.fn();
+    expect(() => launchAgent({ mode: 'codex-exec-resume', resumeId: 'other-id', log }, primitive, 'codex', argv))
+      .toThrow('native resume id');
+    expect(primitive).not.toHaveBeenCalled();
+  });
+  it.each(ignoreRulesShapes.map(argv => [JSON.stringify(argv), argv]))('launches a matching id with boolean --ignore-rules in %s', (_label, argv) => {
+    const result = {}, primitive = vi.fn(() => result);
+    expect(launchAgent({ mode: 'codex-exec-resume', resumeId: SID }, primitive, 'codex', argv)).toBe(result);
+    expect(primitive).toHaveBeenCalledTimes(1);
+    expect(primitive).toHaveBeenCalledWith('codex', argv);
+  });
+  it.each([
+    [], ['exec'], ['exec', '--model', 'resume', SID], ['exec', '--', 'resume', SID],
+    ['exec', 'resume', '--model'], ['exec', 'resume', '--ignore-rules'],
+  ])('refuses unparseable codex-exec-resume argv (%j) before executing', (...argv) => {
+    const primitive = vi.fn(), log = vi.fn();
+    expect(() => launchAgent({ mode: 'codex-exec-resume', resumeId: SID, log }, primitive, 'codex', argv))
+      .toThrow('native resume id');
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('native resume id'));
+    expect(primitive).not.toHaveBeenCalled();
+  });
   const shapes = [
     ['exec', 'resume', '--json', SID, '-'],
     ['exec', 'resume', '--json', '--skip-git-repo-check', SID, 'prompt'],
