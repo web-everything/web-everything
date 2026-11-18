@@ -249,6 +249,10 @@ describe('the agreement report (#76a identity, #76b sameAs through the PR table)
     const rows = Array.from({ length: 10 }, (_, i) => carbonRow({ pr: i + 1 }));
     expect(summarizeCarbonPromotion(rows)).toEqual({ agree: 10, disagree: 0, invalid: 0, prs: 10, threshold: 10 });
   });
+  it('a matching verdict with completely disjoint findings is disagreement, not agreement', () => {
+    const overlap = { jaccard: 0, matched: 0, claudeCount: 1, agyCount: 1, claudeOnly: 1, agyOnly: 1 };
+    expect(summarizeCarbonPromotion([carbonRow({ overlap })])).toMatchObject({ agree: 0, disagree: 1, invalid: 0 });
+  });
   it('counts each PR once across repositories, heads, runs and lenses', () => {
     const rows = [carbonRow({ head: null }), carbonRow({ head: 'next', lens: 'security' }),
       carbonRow({ pr: 2 }), carbonRow({ pr: 2, verdictAgree: false }),
@@ -282,14 +286,14 @@ describe('the agreement report (#76a identity, #76b sameAs through the PR table)
     expect(summarizeCarbonPromotion([...carbonPr(), carbonRow({ verdictAgree })]))
       .toEqual({ agree: 0, disagree: 1, invalid: 0, prs: 1, threshold: 10 });
   });
-  it('reports verdict agreement regardless of differing finding identities', () => {
+  it('differing finding identities keep verdict agreement but count as disagreement for promotion', () => {
     const comparison = compareShadowAnswers({
       claude: { findings: [{ file: 'a.mjs', summary: 'first defect', disposition: 'blocker' }] },
       agy: { findings: [{ file: 'b.mjs', summary: 'another defect', disposition: 'blocker' }] },
     });
     expect(comparison.verdictAgree).toBe(true);
     expect(comparison.overlap.jaccard).toBe(0);
-    expect(summarizeCarbonPromotion([carbonRow(comparison)])).toMatchObject({ agree: 1, invalid: 0 });
+    expect(summarizeCarbonPromotion([carbonRow(comparison)])).toMatchObject({ agree: 0, disagree: 1, invalid: 0 });
   });
   it.each([0, -1, 1, 9, 1.5, '10', NaN, Number.MAX_SAFE_INTEGER + 1])('rejects thresholds below ten or invalid/oversized thresholds: %j', threshold => {
     expect(() => summarizeCarbonPromotion([], { threshold })).toThrow(RangeError);

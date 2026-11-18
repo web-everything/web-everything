@@ -218,7 +218,7 @@ export function summarizeCarbonPromotion(rows = [], { threshold = 10 } = {}) {
       && typeof row.servedModel === 'string' && row.servedModel.toLowerCase().includes('carbon')
       && row.claudeValid === true && row.agyValid === true
       && !Object.hasOwn(row, 'fellBackTo') && !Object.hasOwn(row, 'fallbackFrom');
-    const classification = !valid ? 'invalid' : row.verdictAgree !== true ? 'disagree' : 'agree';
+    const classification = !valid ? 'invalid' : row.verdictAgree !== true || !(row.overlap.matched > 0) ? 'disagree' : 'agree';
     const previous = prs.get(key);
     prs.set(key, previous === 'invalid' || classification === 'invalid' ? 'invalid'
       : previous === 'disagree' || classification === 'disagree' ? 'disagree' : 'agree');
