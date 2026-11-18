@@ -93,8 +93,8 @@ describe('Carbon promotion settings and advisory guards', () => {
     expect(resolveProviderCap('agy-gemini', { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '-1' })).toBe(0);
   });
   it.each([
-    [undefined, 1], ['0', 0], ['1', 1], ['4', 4], ['-1', 1], ['1.5', 1], ['', 1], ['nope', 1],
-    [String(Number.MAX_SAFE_INTEGER + 1), 1],
+    [undefined, 1], ['0', 0], ['1', 1], ['4', 4], ['-1', 0], ['1.5', 0], ['', 1], ['nope', 0],
+    [String(Number.MAX_SAFE_INTEGER + 1), 0],
   ])('resolves the independent Carbon shadow cap %j to %i', (value, expected) => {
     expect(resolveCarbonShadowCap({ [CARBON_SHADOW_CAP_ENV]: value })).toBe(expected);
     expect(resolveCarbonShadowCap({ WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' })).toBe(1);
@@ -116,7 +116,15 @@ describe('Carbon promotion settings and advisory guards', () => {
     if (mode === 'shadow') expect(result.value.findings).toEqual(claudeAnswer.findings);
     if (carbonShadow) expect(result.logs.join(' ')).toContain(`${CARBON_SHADOW_CAP_ENV}=${carbonCap} (env)`);
   });
-  it.each([undefined, '-1', 'invalid'])('Carbon shadow runs with its default cap when the override is %j and Gemini is off', async value => {
+  it.each(['-1', 'invalid'])('a malformed Carbon shadow override %j fails closed (shadow off)', async value => {
+    vi.stubEnv(CARBON_SHADOW_CAP_ENV, value);
+    vi.stubEnv('WE_REVIEW_SEAT_CAP_AGY_GEMINI', '3');
+    const selectedModel = 'gemini-4-carbon-high';
+    const result = await run([{ ...ok, servedModel: selectedModel }], { model: selectedModel });
+    expect(result.models).toEqual([]);
+    expect(result.value.shadow).toMatchObject({ status: 'skipped', reasons: ['carbon shadow seat off'] });
+  });
+  it.each([''])('Carbon shadow runs with its default cap when the override is %j (blank) and Gemini is off', async value => {
     vi.stubEnv(CARBON_SHADOW_CAP_ENV, value);
     vi.stubEnv('WE_REVIEW_SEAT_CAP_AGY_GEMINI', '0');
     const selectedModel = 'gemini-4-carbon-high';
