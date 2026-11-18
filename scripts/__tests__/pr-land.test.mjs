@@ -635,7 +635,7 @@ describe('pr-land contract guards (source-level, mirrors gated-push-wiring)', ()
   // producer at all, so the mis-mapping the review caught is not expressible here.
   it('#2890: derives the net-diff signals from the ONE shared function, and cannot hand-roll them', () => {
     expect(src).toMatch(/import \{ computeNetDiffSignals, recordParkVerdict \} from '\.\/merge-ai-prs\.mjs'/);
-    expect(src).toMatch(/computeNetDiffSignals\(\{ exec, remote: REMOTE, base: BASE, baseRev, rev: refSha \}\)/);
+    expect(src).toMatch(/computeNetDiffSignals\(\{ exec, remote: REMOTE, base: BASE, baseRev, rev: refSha, pinRev: true \}\)/);
     // The raw producers are deliberately OUT of scope in this file.
     expect(src).not.toMatch(/\bcomputeNetDiffText\b\s*[,}]/);
     expect(src).not.toMatch(/\bresolveNetDiffBasis\b\s*[,}]/);
@@ -1105,10 +1105,14 @@ describe('pr-land refuses incomplete net diff evidence before readiness', () => 
     for (const signal of [null, {}, { scored: false, changedFiles: ['README.md'] }, { scored: true, needsReview: ['payload'] }, { scored: true, netDiffText: { needsReview: ['payload'] } }]) {
       expect(() => requireScoredNetDiff(signal)).toThrow(/Repair the checkout/);
     }
-    expect(requireScoredNetDiff({ scored: true })).toEqual({ scored: true });
+    const head = 'a'.repeat(40);
+    const complete = { scored: true, revSha: head, netDiffText: { scored: true, revSha: head } };
+    expect(requireScoredNetDiff(complete, head)).toEqual(complete);
+    expect(() => requireScoredNetDiff(complete, 'b'.repeat(40))).toThrow(/unscored/);
+    expect(() => requireScoredNetDiff({ scored: true }, head)).toThrow(/unscored/);
     const src = readFileSync(resolve(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
-    expect(src.indexOf('requireScoredNetDiff(sig);')).toBeLessThan(src.indexOf('const applyReviewEscalationLabel ='));
-    expect(src.indexOf('requireScoredNetDiff(sig);')).toBeLessThan(src.indexOf('    applyLabel();'));
+    expect(src.indexOf('requireScoredNetDiff(sig, refSha);')).toBeLessThan(src.indexOf('const applyReviewEscalationLabel ='));
+    expect(src.indexOf('requireScoredNetDiff(sig, refSha);')).toBeLessThan(src.indexOf('    applyLabel();'));
 
   });
 });

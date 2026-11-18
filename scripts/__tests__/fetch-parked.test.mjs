@@ -447,7 +447,7 @@ describe('scopeFilesToNet — the file list rides the diff\'s basis, or refuses 
 describe('resolveNetDiff — a `net` basis is CLAIMED only when it is PROVEN', () => {
   const OID = 'a2a99afb73cde5f2d1c1be09a15d10e3b7083885';
   // A fake git that answers the shape resolveNetDiff drives. `overrides` swap in one behaviour at a time.
-  function fakeExec({ fetchThrows = false, refAt = OID, diffText = 'diff --git a/a.ts b/a.ts\n+x\n', names = 'a.ts\0b.ts\0', unresolvable = false } = {}) {
+  function fakeExec({ fetchThrows = false, refAt = OID, diffText = 'diff --git a/a.ts b/a.ts\nold mode 100644\nnew mode 100755\ndiff --git a/b.ts b/b.ts\nold mode 100644\nnew mode 100755\n', names = 'a.ts\0b.ts\0', unresolvable = false } = {}) {
     const calls = [];
     return {
       calls,
@@ -463,7 +463,9 @@ describe('resolveNetDiff — a `net` basis is CLAIMED only when it is PROVEN', (
         if (a.includes('--name-only')) return names;
         if (a.startsWith('rev-parse')) return `${OID}\n`;          // resolveNetDiffBasis' own probes
         if (a.startsWith('merge-base')) return `${OID}\n`;
-        if (a.startsWith('diff')) return diffText;
+        if (args.includes('--raw')) return names.split('\0').filter(Boolean).map(path => `:100644 100755 ${OID} ${OID} M\0${path}\0`).join('');
+        if (args.includes('--numstat')) return names.split('\0').filter(Boolean).map(path => `0\t0\t${path}\n`).join('');
+        if (args.includes('diff')) return diffText;
         return '';
       },
     };
@@ -532,15 +534,14 @@ describe('resolveNetDiff — a `net` basis is CLAIMED only when it is PROVEN', (
     expect(resolveNetDiff().basis).toBe('three-dot');
   });
 
-  it('does NOT pass --no-renames — with it, every rename-carrying PR degrades', () => {
-    // git WITHOUT --no-renames reports only the new path for a rename, which is exactly what `gh` reports. WITH
-    // it, git reports old AND new, gh has no previous-path field, so scopeFilesToNet loses an entry and fails
-    // open on every rename. Dropping the flag makes renames work instead of degrade.
+  it('uses hardened rename expansion consistently for text and path evidence', () => {
     const { exec, calls } = fakeExec();
-    resolveNetDiff({ exec, headRef: 'lane/x', headRefOid: OID });
-    for (const c of calls.filter((x) => x.includes('--name-only'))) {
-      expect(c, `--no-renames re-introduced: ${c}`).not.toContain('--no-renames');
-    }
+    const result = resolveNetDiff({ exec, headRef: 'lane/x', headRefOid: OID });
+    expect(result.basis).toBe('net');
+    expect(result.paths).toEqual(['a.ts', 'b.ts']);
+    const pathReads = calls.filter(c => c.includes('--name-only'));
+    expect(pathReads.length).toBeGreaterThan(0);
+    for (const call of pathReads) expect(call).toContain('--no-renames');
   });
 });
 
@@ -567,7 +568,9 @@ describe('resolveNetDiff binds the diff to the OID, not the ref NAME (PR #1039 f
       if (a.startsWith('fetch')) return '';
       if (a.startsWith('rev-parse --verify --end-of-options refs/remotes/')) return `${OID2}\n`;
       if (a.includes('--name-only')) { seen.push(a); return 'a.ts\0'; }
-      if (a.startsWith('diff')) { seen.push(a); return 'diff --git a/a.ts b/a.ts\n'; }
+      if (args.includes('--raw')) return `:100644 100755 ${OID2} ${OID2} M\0a.ts\0`;
+      if (args.includes('--numstat')) return '0\t0\ta.ts\n';
+      if (args.includes('diff')) { seen.push(a); return 'diff --git a/a.ts b/a.ts\nold mode 100644\nnew mode 100755\n'; }
       if (a.startsWith('rev-parse')) return `${OID2}\n`;
       if (a.startsWith('merge-base')) return `${OID2}\n`;
       return '';

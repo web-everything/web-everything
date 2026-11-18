@@ -408,7 +408,7 @@ describe('#3184 — the drain records a fingerprint READ MISS instead of collaps
         expect(rev).toBe(REBASED);
         expect(fetchExtraRefs).toEqual(['lane/3432']);
         git('git', ['diff'], { encoding: 'utf8' });
-        return { scored: true, text: REVIEWED_DIFF, rev };
+        return { scored: true, text: REVIEWED_DIFF, rev, revSha: rev };
       },
     });
     expect(exec.mock.calls[1][2].cwd).toBe('/ws/frontierui');
@@ -481,12 +481,21 @@ describe('#3184 — the drain records a fingerprint READ MISS instead of collaps
 describe('computeNetDiffSignals carries the basis trust question (#3343)', () => {
   const fakeExec = (script = {}) => {
     const exec = (cmd, args) => {
-      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff');
+      const diffAt = args.findIndex(a => a === 'diff' || a === 'log');
+      const logical = diffAt < 0 ? args : args.slice(diffAt);
+      const intent = logical.filter(a => !['--end-of-options', '--verify', '--no-ext-diff', '--no-textconv', '--no-renames', '--no-color'].includes(a));
+      if (logical.includes('--raw')) {
+        const textArgs = intent.filter(a => !['--raw', '--no-abbrev', '-z', '--ignore-submodules=none', '--'].includes(a));
+        const text = script[`${cmd} ${textArgs.join(' ')}`]?.stdout;
+        if (text == null) throw new Error('unstubbed raw diff');
+        return [...text.matchAll(/^diff --git a\/(.+) b\/.*$/gm)].map(([, path]) =>
+          `:100644 100755 ${'a'.repeat(40)} ${'a'.repeat(40)} M\0${path}\0`).join('');
+      }
       const h = script[`${cmd} ${intent.join(' ')}`];
       if (h && h.throw) throw new Error(h.throw);
       if (h && 'stdout' in h) return h.stdout;
-      if (args[0] === 'diff') throw new Error('unknown revision (unstubbed)');
-      if (args[0] === 'log') throw new Error('unknown revision range (unstubbed)');
+      if (logical[0] === 'diff') throw new Error('unknown revision (unstubbed)');
+      if (logical[0] === 'log') throw new Error('unknown revision range (unstubbed)');
       return '';
     };
     return { exec };
@@ -552,7 +561,7 @@ function acceptanceOptions(view = acceptanceView()) {
     // The listing is only trusted with explicit completeness and the head it was read at (#6021).
     filesComplete: true, listedHeadSha: view.headRefOid,
     // `rev` echoes the commit asked for, as `computeNetDiffText` does: the read is bound to that SHA.
-    exec: () => JSON.stringify(view), netDiff: ({ rev }) => ({ scored: true, text: REVIEWED_DIFF, rev }),
+    exec: () => JSON.stringify(view), netDiff: ({ rev }) => ({ scored: true, text: REVIEWED_DIFF, rev, revSha: rev }),
     // PR #4631 round 11: a moved head covered by diff identity reads the PR's formal reviews (none here).
     readReviews: () => [] };
 }
@@ -664,7 +673,7 @@ describe('PR #3432 — drain acceptance verification and pending reconciliation'
     const view = acceptanceView();
     if (failure === 'no markers') view.comments = [];
     const options = { ...acceptanceOptions(view), netDiff: ({ rev }) => failure === 'unreadable diff'
-      ? { scored: false } : { scored: true, text: REVIEWED_DIFF.replace('+new', '+unreviewed'), rev } };
+      ? { scored: false } : { scored: true, text: REVIEWED_DIFF.replace('+new', '+unreviewed'), rev, revSha: rev } };
     const spawn = vi.fn();
     expect(reconcileDrainReviewPending({ currentLabels: labels, ...options }, { spawn }).ok).toBe(false);
     expect(spawn).not.toHaveBeenCalled();

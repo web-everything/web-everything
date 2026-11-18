@@ -415,11 +415,12 @@ export function readPr({
 
   // ONE basis, shared. `fetchExtraRefs` carries the head ref so a lane branch this clone has never seen still
   // resolves — and NOTHING here moves HEAD (#2336): it fetches tracking refs and diffs two trees in place.
+  // This review selects and records the current branch tip as revSha before scoring.
   const basis = resolveNetDiffBasis({
     exec: gitExec, rev: headRefName, fetchExtraRefs: headRefName ? [headRefName] : [], pinRev: true,
   });
-  let netText = computeNetDiffText({ exec: gitExec, rev: headRefName, fetchExtraRefs: [], basis });
-  let netPaths = computeNetDiffPaths({ exec: gitExec, rev: headRefName, fetchExtraRefs: [], basis });
+  let netText = computeNetDiffText({ exec: gitExec, rev: headRefName, fetchExtraRefs: [], basis, pinRev: true });
+  let netPaths = computeNetDiffPaths({ exec: gitExec, rev: headRefName, fetchExtraRefs: [], basis, pinRev: true });
   // Fail closed: the two reads answer one question. If either is unscored, neither may stand as a scored read.
   if (netText.scored !== true || netText.needsReview?.length || netPaths.scored !== true) {
     netText = { text: '', base: null, rev: null, scored: false, reason: netText.reason || (netText.needsReview?.length ? 'needs-human-review' : netPaths.reason) || 'diff-failed' };

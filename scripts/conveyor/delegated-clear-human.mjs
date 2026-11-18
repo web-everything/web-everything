@@ -135,8 +135,9 @@ export async function liveReaders({ cwd = process.cwd(), repo = ghRepoSlug('we')
   const exec = (cmd, args, opts) => execFileSync(cmd, args, { cwd, maxBuffer: 64 * 1024 * 1024, ...opts });
   return {
     scoreNet: (pr) => {
-      const sig = computeNetDiffSignals({ exec, rev: pr.headRefName, baseRev: pr.baseRefName, fetchExtraRefs: [pr.headRefName] });
-      if (!sig.scored) return { scored: false };
+      if (!/^[0-9a-f]{40}$/i.test(pr.headRefOid ?? '')) return { scored: false };
+      const sig = computeNetDiffSignals({ exec, rev: pr.headRefOid, baseRev: pr.baseRefName, fetchExtraRefs: [pr.headRefName], pinRev: true });
+      if (!sig.scored || sig.revSha !== pr.headRefOid || sig.netDiffText?.revSha !== pr.headRefOid) return { scored: false };
       const s = scoreEscalation({ changedFiles: sig.changedFiles, diffLines: sig.diffLines, humanBasisFiles: sig.humanBasisFiles,
         cumulativeDiffLines: sig.cumulativeDiffLines, diffHunks: sig.diffHunks, basisNarrowed: sig.basisNarrowed !== false });
       return { scored: true, humanRequired: s.humanRequired === true, files: sig.humanBasisFiles.length };

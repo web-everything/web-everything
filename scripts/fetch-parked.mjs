@@ -309,6 +309,7 @@ export function resolveNetDiff({ exec, headRef, headRefOid } = {}) {
   } catch { return degraded; }
   // The ref must now BE the head gh reported. No oid to compare against → we cannot prove it, so we do not claim it.
   if (!/^[0-9a-f]{7,64}$/i.test(String(headRefOid || ''))) return degraded;
+  let pinnedHead;
   try {
     // `--verify` is LOAD-BEARING, not decoration. Plain `git rev-parse --end-of-options <ref>` ECHOES the
     // guard as an output line — rev-parse prints back any argument it cannot interpret, unlike `fetch`/`diff`
@@ -323,7 +324,8 @@ export function resolveNetDiff({ exec, headRef, headRefOid } = {}) {
     // fetch-parked.test.mjs, which runs this against an actual repo — a fake `exec` cannot catch this class,
     // because a fake encodes what git was ASSUMED to do.
     const at = String(exec('git', ['rev-parse', '--verify', '--end-of-options', `refs/remotes/origin/${headRef}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '').trim();
-    if (!sameCommit(at, headRefOid)) return degraded;
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(at) || !sameCommit(at, headRefOid)) return degraded;
+    pinnedHead = at.toLowerCase();
   } catch { return degraded; }
   // THE DIFF IS TAKEN ON THE OID, NOT THE NAME (PR #1039 review, finding 1 — two lenses, one root cause).
   // Proving `refs/remotes/origin/<headRef>` and then diffing `origin/<headRef>` proves nothing about the diff:
@@ -336,13 +338,13 @@ export function resolveNetDiff({ exec, headRef, headRefOid } = {}) {
   //     twice, after the fact. A head that moves mid-run (a rebase-drop force-push, a producer push landing
   //     mid-drain — both routine here) yields a `net`-labelled diff of commit B while `view.files` and the
   //     reviewed sha are commit A: verbatim the failure this function claims to eliminate.
-  // Passing the object id closes both: candidate 1 (`origin/<oid>`) fails fast, candidate 2 resolves the oid
-  // EXACTLY, and an object id cannot move. `fetchExtraRefs` still carries the NAME so the fetch stays correct.
-  const rev = headRefOid;
-  const net = computeNetDiffText({ exec, rev, fetchExtraRefs: [headRef] });
-  if (!net || !net.scored || typeof net.text !== 'string') return degraded;
-  const list = computeNetDiffPaths({ exec, rev, fetchExtraRefs: [headRef] });
-  if (!list || !list.scored) return degraded;
+  // Passing the pinned object id closes both: only the exact oid is resolved,
+  // and an object id cannot move. `fetchExtraRefs` still carries the NAME so the fetch stays correct.
+  const rev = pinnedHead;
+  const net = computeNetDiffText({ exec, rev, fetchExtraRefs: [headRef], pinRev: true });
+  if (!net || !net.scored || net.revSha !== pinnedHead || typeof net.text !== 'string') return degraded;
+  const list = computeNetDiffPaths({ exec, rev, fetchExtraRefs: [headRef], pinRev: true });
+  if (!list || !list.scored || list.revSha !== pinnedHead) return degraded;
   // An EMPTY net diff is not a failure — it is this basis's most valuable signal: the branch is
   // content-identical to main. `scored` already separates "empty" from "could not resolve", so discarding it in
   // favour of the inflated three-dot diff would throw away the one case a reviewer most needs told about.

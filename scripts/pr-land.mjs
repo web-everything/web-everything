@@ -693,8 +693,8 @@ export function classifyChecks(rows) {
   return { status: 'passed', reason: 'all required checks passed' };
 }
 
-export function requireScoredNetDiff(signal) {
-  if (signal?.scored !== true || signal.needsReview?.length || signal.netDiffText?.needsReview?.length) {
+export function requireScoredNetDiff(signal, headSha) {
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(headSha ?? '') || signal?.revSha !== headSha.toLowerCase() || signal?.netDiffText?.revSha !== headSha.toLowerCase() || signal?.netDiffText?.scored !== true || signal?.scored !== true || signal.needsReview?.length || signal.netDiffText?.needsReview?.length) {
     const error = new Error('Net diff is unscored; refusing review scoring and landing. Repair the checkout/read and rerun, or request human review of the full diff.');
     error.code = 'UNSCORED_NET_DIFF';
     throw error;
@@ -1255,8 +1255,8 @@ async function runCli() {
   // of `resolveNetDiffBasis`, measured 5 → 11 git subprocesses and 1 → 2 network fetches per PR open; sharing
   // brings that to 6 subprocesses and 1 fetch. Assembling it here instead would leave that sharing — and the
   // `diffHunks` mapping below — pinned by nothing a test can observe at this call site.
-  const sig = computeNetDiffSignals({ exec, remote: REMOTE, base: BASE, baseRev, rev: refSha });
-  requireScoredNetDiff(sig);
+  const sig = computeNetDiffSignals({ exec, remote: REMOTE, base: BASE, baseRev, rev: refSha, pinRev: true });
+  requireScoredNetDiff(sig, refSha);
 
   const applyReviewEscalationLabel = () => {
     const changedFiles = sig.changedFiles;

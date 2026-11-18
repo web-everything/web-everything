@@ -143,7 +143,7 @@ import {
 import { CODEQL_CHECK_NAME, loadDrainGateSettings } from './lib/codeql-gate.mjs';
 export { isAiAuthor, isAiCommit, isMechanicalMergeCommit, isDrainBookkeepingCommit } from './lib/ai-pr-authorship.mjs';
 export { isAiGeneratedPr, hasLabel };
-import { hardenedGitDiff, verifyRenderedDiff } from './lib/hardened-git-diff.mjs';
+import { hardenedGitDiff, hardenedGitRead, verifyRenderedDiff } from './lib/hardened-git-diff.mjs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { cascadePolicy } from './lib/policy-cascade.mjs';
 import { readGit, readGh } from './lib/proc-read.mjs';
@@ -3882,11 +3882,11 @@ export function parseNumstat(numstat) {
  */
 function isStrictAncestor(exec, ancestor, descendant) {
   try {
-    exec('git', ['merge-base', '--is-ancestor', '--end-of-options', ancestor, descendant], { stdio: ['ignore', 'ignore', 'ignore'] });
+    hardenedGitRead(exec, ['merge-base', '--is-ancestor', '--end-of-options', ancestor, descendant], { stdio: ['ignore', 'ignore', 'ignore'] });
   } catch { return false; } // non-zero exit (not an ancestor) or unresolvable → don't trust the base
   try {
-    const a = String(exec('git', ['rev-parse', '--verify', '--end-of-options', ancestor], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').trim();
-    const b = String(exec('git', ['rev-parse', '--verify', '--end-of-options', descendant], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').trim();
+    const a = String(hardenedGitRead(exec, ['rev-parse', '--verify', '--end-of-options', ancestor], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').trim();
+    const b = String(hardenedGitRead(exec, ['rev-parse', '--verify', '--end-of-options', descendant], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').trim();
     if (a && b && a === b) return false; // base == head → degenerate empty own-delta, reject
   } catch { /* can't resolve to SHAs → is-ancestor already vouched it's a distinct ancestor path */ }
   return true;
@@ -4068,7 +4068,9 @@ function isExecContractError(err) {
  */
 // `pinRev` resolves a commit before merge-base and every probe, disables replace objects,
 // and refuses a failed fork point instead of using the legacy ancestry/base-tip fallback.
-export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [], pinRev = false } = {}) {
+// Full SHA requests always pin, including legacy explicit false; only branch display reads may opt out.
+export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [], pinRev = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(rev ?? '') } = {}) {
+  pinRev = pinRev || /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(rev ?? '');
   if (pinRev && typeof exec === 'function') {
     const run = exec;
     exec = (cmd, args, opts) => run(cmd, args, { ...opts, env: { ...(opts?.env ?? process.env), GIT_NO_REPLACE_OBJECTS: '1' } });
@@ -4092,15 +4094,17 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
     if (isExecContractError(err)) return { ok: false, reason: 'exec-contract', requestedFor };
     /* a real fetch failure degrades to whatever is locally cached — the diff attempts below still run */
   }
-  const candidates = pinRev && /^[0-9a-f]{40,64}$/i.test(rev) ? [rev] : [`${remote}/${rev}`, rev];
+  const candidates = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(rev) ? [rev.toLowerCase()]
+    : [`${remote}/${rev}`, rev];
   for (let candidate of candidates) {
     // Pin BEFORE merge-base or any scoring probe. Once a candidate resolves, never
     // retry a mutable name if subsequent evidence fails.
     if (pinRev) {
       try {
-        candidate = String(exec('git', ['rev-parse', '--verify', '--end-of-options', `${candidate}^{commit}`],
+        candidate = String(hardenedGitRead(exec, ['rev-parse', '--verify', '--end-of-options', `${candidate}^{commit}`],
           { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '').trim().toLowerCase();
-        if (!/^[0-9a-f]{40,64}$/.test(candidate)) continue;
+        if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(candidate)) continue;
+        if (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(rev) && candidate !== rev.toLowerCase()) return { ok: false, reason: 'head-mismatch', requestedFor };
       } catch (err) {
         if (isExecContractError(err)) return { ok: false, reason: 'exec-contract', requestedFor };
         continue;
@@ -4121,8 +4125,8 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
       // newline in a would-be single revision arg, making it an invalid `git diff` argument (a "continue" to
       // the next candidate, or a `null` resolve if both candidates hit it — always the safe over-scoring
       // fallback, never wrong data, but avoidable).
-      const mb = String(exec('git', ['merge-base', '--end-of-options', baseRef, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').split('\n')[0].trim();
-      if (pinRev && !/^[0-9a-f]{40,64}$/i.test(mb)) return { ok: false, reason: 'diff-failed', requestedFor };
+      const mb = String(hardenedGitRead(exec, ['merge-base', '--end-of-options', baseRef, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').split('\n')[0].trim();
+      if (pinRev && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(mb)) return { ok: false, reason: 'diff-failed', requestedFor };
       if (mb) { diffBase = mb; basisKind = 'merge-base'; }
     } catch (err) {
       if (isExecContractError(err)) return { ok: false, reason: 'exec-contract', requestedFor };
@@ -4168,7 +4172,8 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
   return { ok: false, reason: 'ref-unresolved', requestedFor };
 }
 
-export function computeNetDiffChangedFiles({ exec, remote = 'origin', base = 'main', baseRev = null, rev, fetchExtraRefs = [], basis: sharedBasis = null, pinRev = false } = {}) {
+export function computeNetDiffChangedFiles({ exec, remote = 'origin', base = 'main', baseRev = null, rev, fetchExtraRefs = [], basis: sharedBasis = null, pinRev = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(rev ?? '') } = {}) {
+  pinRev = pinRev || /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(rev ?? '');
   const empty = { changedFiles: [], diffLines: 0, scored: false, humanBasisFiles: [] };
   if (typeof exec !== 'function' || !rev) return empty;
   const baseRevOk = typeof baseRev === 'string' && /^[0-9a-f]{7,64}$/i.test(baseRev);
@@ -4179,7 +4184,7 @@ export function computeNetDiffChangedFiles({ exec, remote = 'origin', base = 'ma
   // #2890-review-fix finding 3 — reuse a basis the caller already resolved for this same ref (see
   // `resolveNetDiffBasis`); absent one, resolve our own exactly as before.
   const basis = sharedBasis || resolveNetDiffBasis({ exec, remote, base, rev, fetchExtraRefs, pinRev });
-  if (pinRev && basis.ok && !basis.revSha) return { ...empty, reason: 'basis-mismatch' };
+  if (pinRev && basis.ok && (!basis.revSha || basis.candidate !== basis.revSha || (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(rev) && basis.revSha !== rev.toLowerCase()))) return { ...empty, reason: 'basis-mismatch' };
   // #2952 — additive: `reason` distinguishes a fixable caller-side `exec`-contract violation ('exec-contract')
   // from a legitimately absent ref ('ref-unresolved'). Existing consumers that read only `scored` are untouched.
   if (!basis.ok) return { ...empty, reason: basis.reason };
@@ -4223,7 +4228,8 @@ export function computeNetDiffChangedFiles({ exec, remote = 'origin', base = 'ma
  *   pass it to share ONE fetch + candidate probe with `computeNetDiffChangedFiles` instead of resolving twice.
  * @returns {{text:string, base:string|null, rev:string|null, scored:boolean, needsReview?:string[], reason?:'exec-contract'|'ref-unresolved'|'diff-failed'|'basis-mismatch'}}
  */
-export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [], basis: sharedBasis = null, pinRev = false } = {}) {
+export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [], basis: sharedBasis = null, pinRev = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(rev ?? '') } = {}) {
+  pinRev = pinRev || /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(rev ?? '');
   const unscored = { text: '', base: null, rev: null, scored: false };
   if (typeof exec !== 'function' || !rev) return unscored;
   // #2890-review-r2 finding 1 — refuse a basis resolved for a DIFFERENT request rather than answering about the
@@ -4235,29 +4241,11 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
   const basis = sharedBasis || resolveNetDiffBasis({ exec, remote, base, rev, fetchExtraRefs, pinRev });
   if (!basis.ok) return { ...unscored, reason: basis.reason }; // caller falls back to `gh pr diff`
   let { diffBase, candidate } = basis;
-  // #xnqxtdy — `pinRev`: a caller that STAMPS the tip next to this text (the human-clearance carry) cannot read the
-  // tip in a second step: a concurrent fetch can move the tracking ref between the two reads and label an old diff with
-  // a newer sha. Resolve the tip to ONE commit sha first, then take the fork point AND the text from that sha only, and
-  // hand the sha back as `revSha` — the diff and its label can no longer disagree. Any failure is unscored (fail closed).
-  let revSha;
-  if (pinRev && basis.revSha) {
-    revSha = basis.revSha; // Already pinned before merge-base; never resolve mutable refs a second time.
-  } else if (pinRev) {
-    try {
-      revSha = String(exec('git', ['rev-parse', '--verify', '--end-of-options', `${candidate}^{commit}`],
-        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '').trim().toLowerCase();
-      if (!/^[0-9a-f]{40,64}$/.test(revSha)) return { ...unscored, reason: 'diff-failed' };
-      // Only the fork-point basis can be pinned on BOTH sides: a `base-tip` / `ancestry` basis diffs against the moving
-      // `<remote>/<base>` NAME, which is an unpinned ref read next to the stamp — it is unscored here (fail closed).
-      if (basis.basisKind !== 'merge-base') return { ...unscored, reason: 'diff-failed' };
-      diffBase = String(exec('git', ['merge-base', '--end-of-options', basis.baseRef, revSha],
-        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').split('\n')[0].trim();
-      if (!/^[0-9a-f]{40,64}$/i.test(diffBase)) return { ...unscored, reason: 'diff-failed' };
-      candidate = revSha;
-    } catch (err) {
-      return { ...unscored, reason: isExecContractError(err) ? 'exec-contract' : 'diff-failed' };
-    }
+  if (pinRev && (!basis.revSha || basis.candidate !== basis.revSha ||
+      (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(rev) && basis.revSha !== rev.toLowerCase()))) {
+    return { ...unscored, reason: 'basis-mismatch' };
   }
+  const revSha = pinRev ? basis.revSha : null;
   try {
     // Same guard, same reason — this is the reviewer-facing diff TEXT, off the same caller-supplied candidate.
     // #2890-review-r2 finding 2b — `--no-ext-diff`. A `diff.external` in the caller's git config, or a
@@ -4288,13 +4276,13 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
  * @param {{exec:Function, headSha:string, headRef?:string|null, netDiff?:Function, pinRev?:boolean}} o
  * @returns {{text:string, base:string|null, rev:string|null, scored:boolean, reason?:string}}
  */
-export function readNetDiffAtHead({ exec, headSha, headRef = null, netDiff = computeNetDiffText, pinRev = false } = {}) {
+export function readNetDiffAtHead({ exec, headSha, headRef = null, netDiff = computeNetDiffText } = {}) {
   const miss = (reason) => ({ text: '', base: null, rev: null, scored: false, reason });
   if (typeof headSha !== 'string' || !/^[0-9a-f]{40}$/i.test(headSha)) return miss('head-unbound');
   let net;
-  try { net = netDiff({ exec, rev: headSha, fetchExtraRefs: headRef ? [headRef] : [], ...(pinRev ? { pinRev: true } : {}) }); } catch { return miss('diff-failed'); }
+  try { net = netDiff({ exec, rev: headSha, fetchExtraRefs: headRef ? [headRef] : [], pinRev: true }); } catch { return miss('diff-failed'); }
   if (!net?.scored) return miss(net?.reason || 'unscored');
-  if (net.rev !== headSha) return miss('head-mismatch');
+  if (net.rev !== headSha.toLowerCase() || net.revSha !== headSha.toLowerCase()) return miss('head-mismatch');
   return net;
 }
 
@@ -4321,7 +4309,8 @@ export function readNetDiffAtHead({ exec, headSha, headRef = null, netDiff = com
  * @returns {{changedFiles:string[], diffLines:number, humanBasisFiles:string[], cumulativeDiffLines:number,
  *   scored:boolean, netDiffText:{text:string,scored:boolean,reason?:string}, diffHunks:string|null}}
  */
-export function computeNetDiffSignals({ exec, remote = 'origin', base = 'main', baseRev = null, rev, fetchExtraRefs = [], pinRev = false } = {}) {
+export function computeNetDiffSignals({ exec, remote = 'origin', base = 'main', baseRev = null, rev, fetchExtraRefs = [], pinRev = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(rev ?? '') } = {}) {
+  pinRev = pinRev || /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(rev ?? '');
   // Keep ancestry probes as well as hardened diffs on the original objects.
   if (pinRev && typeof exec === 'function') {
     const run = exec;
@@ -4357,7 +4346,7 @@ export function readDrainNetDiffSignals({ exec, headSha, headRef = null, baseRev
   const validHead = typeof headSha === 'string' && /^[0-9a-f]{40}$/i.test(headSha);
   const sig = computeNetDiffSignals({ exec, rev: validHead ? headSha : null, baseRev,
     fetchExtraRefs: headRef ? [headRef] : [], pinRev: true });
-  if (validHead && sig.revSha === headSha && sig.netDiffText.revSha === headSha) return sig;
+  if (validHead && sig.revSha === headSha.toLowerCase() && sig.netDiffText.revSha === headSha.toLowerCase()) return sig;
   // Invalidate BOTH consumers: a file-list fallback must not revive clean tamper evidence.
   return { ...sig, scored: false, diffHunks: null,
     netDiffText: { text: '', base: null, rev: null, scored: false, reason: validHead ? 'head-mismatch' : 'head-unbound' } };
@@ -4403,12 +4392,13 @@ export function scanDrainTestTampering(netDiffText) {
  * @returns {{paths:string[], base:string|null, rev:string|null, scored:boolean, reason?:'exec-contract'|'ref-unresolved'|'diff-failed'}}
  */
 // Accept the same request-checked basis as text, including a basis pinned before resolution.
-export function computeNetDiffPaths({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [], basis: sharedBasis = null, pinRev = false } = {}) {
+export function computeNetDiffPaths({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [], basis: sharedBasis = null, pinRev = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(rev ?? '') } = {}) {
+  pinRev = pinRev || /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(rev ?? '');
   const unscored = { paths: [], base: null, rev: null, scored: false };
   if (typeof exec !== 'function' || !rev) return unscored;
   if (sharedBasis && !basisAnswersRequest(sharedBasis, { remote, base, rev })) return { ...unscored, reason: 'basis-mismatch' };
   const basis = sharedBasis || resolveNetDiffBasis({ exec, remote, base, rev, fetchExtraRefs, pinRev });
-  if (pinRev && basis.ok && !basis.revSha) return { ...unscored, reason: 'basis-mismatch' };
+  if (pinRev && basis.ok && (!basis.revSha || basis.candidate !== basis.revSha || (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(rev) && basis.revSha !== rev.toLowerCase()))) return { ...unscored, reason: 'basis-mismatch' };
   if (!basis.ok) return { ...unscored, reason: basis.reason };
   const { diffBase, candidate } = basis;
   try {

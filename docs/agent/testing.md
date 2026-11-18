@@ -4507,3 +4507,17 @@ and compares both signal and text `revSha` with that head. Branch names only fet
 resolved SHA, an unavailable head, and a matching SHA containing test removals. Missing or
 mismatched identity invalidates text and hunks as well as scoring: file-list fallbacks and
 old human clearance keep the tamper hold. Repair the read or request human review.
+
+Pr-land and other net-diff gates explicitly pin the intended full head SHA and compare
+signal/text `revSha` before accepting evidence. Full 40/64-hex revs always pin, even
+when an old caller passes `pinRev:false`; `origin/<sha>` is never a candidate.
+Identity/merge-base reads share the hardened diff environment with replacement objects
+disabled. Unreadable fork points or mismatched identity require repairing the read
+and rerunning, or human review of the full diff. `pr-land-pinned-sha.test.mjs`
+exercises moved refs, origin/SHA collisions, false replacement ancestry and all SHA reader defaults.
+
+Pinned-diff fixtures must answer identity and merge-base reads with full object IDs and
+provide raw blob records matching the rendered sections. Real-git CLI fixtures select
+the checkout through the subprocess `cwd` seam: hardened reads intentionally strip
+`GIT_DIR`. SHA spelling is canonicalized before identity comparisons; abbreviated
+fetch-parked heads bind to the verified full fetched identity, never a display ref.

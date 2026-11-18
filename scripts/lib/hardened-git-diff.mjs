@@ -35,6 +35,11 @@ export function hardenedGitDiffCommand(args, opts = {}, env = {}) {
   };
 }
 
+/** Harden identity/ancestry reads with the same protected environment as diffs. */
+export function hardenedGitRead(exec, args, opts) {
+  return exec('git', args, hardenedGitDiffCommand(args, opts, process.env).opts);
+}
+
 export function hardenedGitDiff(exec, args, opts, { needsReview = null } = {}) {
   const command = hardenedGitDiffCommand(args, opts, process.env);
   const output = exec('git', command.args, command.opts);

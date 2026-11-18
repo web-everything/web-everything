@@ -360,8 +360,8 @@ export function stackNetDiffText({ tree, topHead, root = ROOT, run = gitRun(root
 export function mainNetDiffText({ headRefName, headRefOid }, { root = ROOT } = {}) {
   if (!SHA.test(String(headRefOid ?? '')) || !LANE_REF.test(String(headRefName ?? ''))) return { text: '', base: null, rev: null, scored: false };
   const exec = (cmd, args, o = {}) => execFileSync(cmd, args, { cwd: root, timeout: 120e3, maxBuffer: 64 * 1024 * 1024, ...o });
-  const net = computeNetDiffText({ exec, rev: headRefOid, fetchExtraRefs: [headRefName] });
-  return net?.scored && net.rev === headRefOid ? net : { text: '', base: null, rev: null, scored: false };
+  const net = computeNetDiffText({ exec, rev: headRefOid, fetchExtraRefs: [headRefName], pinRev: true });
+  return net?.scored && net.revSha === headRefOid ? net : { text: '', base: null, rev: null, scored: false };
 }
 
 /**
