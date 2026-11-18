@@ -64,6 +64,9 @@ export const LANE_GIT_CONFIG_PINS = Object.freeze([
   ['core.checkStat', 'default'],
   ['core.trustctime', 'true'],
   ['core.ignoreStat', 'false'],
+  // PR #7012 self-review: a lane-written commit-graph supplies commit parents without being an object, so neither
+  // index-pack nor GIT_NO_REPLACE_OBJECTS checks it; a forged one hides a commit from every history and review proof.
+  ['core.commitGraph', 'false'],
 ]);
 
 // Remote proofs use a restricted transport policy. Ordinary hardened callers also fetch/clone
@@ -174,6 +177,8 @@ export function laneGitHardeningEnv(env = process.env, { remoteProbe = false, cr
   const out = { ...env, GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' };
   // Lane-owned replace refs must never substitute the commits used by history and review proofs.
   out.GIT_NO_REPLACE_OBJECTS = '1';
+  // Replace refs off still reads `<git-dir>/info/grafts`, which forges parents the same way; an empty graft file wins.
+  out.GIT_GRAFT_FILE = '/dev/null';
   delete out.GIT_EXTERNAL_DIFF;
   delete out.GIT_ASKPASS;
   delete out.SSH_ASKPASS;
