@@ -20,7 +20,7 @@ describe('job-log escape-sequence permission', () => {
       + '\u007f\u0080\u009b\u009c\u009d\u00ff';
     const raw = '\u001b[31mhéllo\u001b[0m\u001b]0;hidden title\u0007\u001b]8;;https://example.com\u001b\\link\u001b]8;;\u001b\\'
       + controls + '\u001b\tline\r\n';
-    const clean = 'héllolink' + controls + '\tline\r\n';
+    const clean = 'héllo]0;hidden title\u0007]8;;https://example.com\\link]8;;\\' + controls + '\tline\r\n';
     const codec = encoding && encoding !== 'buffer' ? encoding : 'latin1';
     const output = type === 'Buffer' ? Buffer.from(raw, codec) : raw;
     const exec = vi.fn(() => output);

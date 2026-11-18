@@ -1872,7 +1872,6 @@ function sanitizeJobLog(args, result, encoding) {
   const text = Buffer.isBuffer(result) ? result.toString(codec) : result;
   const clean = text
     .replace(/\u001b\[[0-?]*[ -\/]*[@-~]/g, '')
-    .replace(/\u001b\][^\u0007\u001b\n]*(?:\u0007|\u001b\\)/g, '')
     .replace(/\u001b/g, '');
   return Buffer.isBuffer(result) ? Buffer.from(clean, codec) : clean;
 }
