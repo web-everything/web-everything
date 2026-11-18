@@ -2042,6 +2042,7 @@ export function defaultClaudeProvider(request, {
     const launched = requireRuntimeLaunch(withRuntimeAdmission(request, request?.launchKind ?? 'build', () => launchWrapped({
       role: kind, session: request.sessionSlug, bgArgv: argv, cwd: request.cwd, env: workerSpawnEnv(request.spawnEnv ?? process.env), pr: request.pr ?? null,
       item: request.num ?? null, model: launchedModel, sessionId: request.sessionId,
+      runtimeAdmission: { num: request.num, bornAs: request.bornAs, id: request.id, groupMembers: request.groupMembers },
     })));
     request.reportWrapped?.(launched.wrapperPid);
     // `pid:<wrapper>` is the detached-handle shape the run store and liveness already read (route `detached`).

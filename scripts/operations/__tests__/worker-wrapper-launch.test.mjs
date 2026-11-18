@@ -1,7 +1,9 @@
 /** @file worker-wrapper-launch.test.mjs — wrapped launch, liveness and legacy completion compatibility. */
-import { mkdtempSync, rmSync, readFileSync, statSync, readdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, statSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { launchDetached } from '../worker-wrapper.mjs';
+import { withRuntimeAdmissionTick } from '../../lib/runtime-admission.mjs';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 
 import {
@@ -78,6 +80,28 @@ describe('wrappedTimeoutMs', () => {
 });
 
 describe('launchWrappedClaudeWorker', () => {
+  it('forwards persisted identity and returns final refusal after spec setup without a pid handle', async () => {
+    const specDir = tmp();
+    const spawnFn = vi.fn();
+    const runtimeAdmission = { num: '12', bornAs: 'xabcdef0', groupMembers: ['13'] };
+    let settings = { mode: 'only', ids: ['xabcdef0', '13'] };
+    const result = await withRuntimeAdmissionTick(() => settings, async () => launchWrappedClaudeWorker({
+      role: 'fix', session: 'fix-12', bgArgv: ['--bg', '-n', 'fix-12', 'PROMPT'],
+      item: '12', sessionId: SESSION_ID, env: {}, specDir, runtimeAdmission,
+      launch: (spec, opts) => {
+        expect(spec.runtimeAdmission).toEqual(runtimeAdmission);
+        return launchDetached(spec, { ...opts, spawnFn, writeSpec: (...args) => {
+          writeFileSync(...args);
+          settings = { mode: 'only', ids: ['xabcdef0'] };
+        } });
+      },
+    }));
+    expect(result).toMatchObject({ outcome: 'runtime-refused', spawned: false, runtimeRefused: [{ num: '13', kind: 'fix', reason: 'runtime-only' }] });
+    expect(result.handle).toBeUndefined();
+    expect(spawnFn).not.toHaveBeenCalled();
+    expect(readdirSync(specDir)).toEqual([]);
+  });
+
   it('passes the wrapper spec to the injected launcher and returns a pid handle', () => {
     const specDir = tmp();
     const launch = vi.fn(() => ({ wrapperPid: 4321 }));
