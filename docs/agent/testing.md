@@ -4589,3 +4589,6 @@ on the shared scanner paths, including byte views, escape decoding, JSON literal
 scalar continuations. `git-bundle-transport.test.mjs` covers public GitHub/AWS mixtures in raw,
 UTF-16, escaped, JSON and folded-scalar forms; `forge-exec-manifest.test.mjs` pins collection
 and preserves the ordinary first-finding API. Unreadable evidence still refuses exemption.
+Public-history fixtures must provide an origin remote whose main verifies the local tracking
+ref. Keep matching, known-newer ancestry, unknown remote objects, forged local refs and failed
+or malformed remote listings covered; every scan rechecks the remote without cached exemptions.

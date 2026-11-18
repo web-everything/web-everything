@@ -19,8 +19,8 @@ const git = (cwd, ...args) => {
   if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
   return r.stdout.trim();
 };
-const exec = async ({ file, args, cwd, input }) => {
-  const r = spawnSync(file, args, { cwd, input });
+const exec = async ({ file, args, cwd, input, env, signal }) => {
+  const r = spawnSync(file, args, { cwd, input, env, ...(signal ? { timeout: 15000 } : {}) });
   return { code: r.status ?? 254, stdout: r.stdout ?? Buffer.alloc(0), stderr: r.stderr ?? Buffer.alloc(0) };
 };
 const hash = (text) => createHash('sha256').update(text).digest('hex');
@@ -314,16 +314,23 @@ describe('bundle scan public origin/main history exemptions', () => {
     git(lane, 'checkout', '-q', '-b', 'public-history', runnerMain);
     await put(path, text);
     const publicTip = await put(path, 'clean\n', 'scrub public fixture');
-    git(lane, 'update-ref', 'refs/remotes/origin/main', publicTip);
+    await publishMain(publicTip);
     git(lane, 'checkout', '-q', '-');
     return publicTip;
+  };
+  const publishMain = async sha => {
+    const remote = await fs.mkdtemp(join(root, 'public-origin-'));
+    git(root, 'clone', '--bare', lane, remote);
+    git(remote, 'update-ref', 'refs/heads/main', sha);
+    git(lane, 'remote', 'set-url', 'origin', remote);
+    git(lane, 'update-ref', 'refs/remotes/origin/main', sha);
   };
   const scan = (head, injected = exec, prerequisite = runnerMain) =>
     scanBundleRange({ cwd: lane, head, prerequisite, exec: injected });
 
   it('excludes public commit messages and raw objects while preserving the bundled range', async () => {
     const publicCommit = await put('public.txt', 'public\n', 'document private' + '-key handling');
-    git(lane, 'update-ref', 'refs/remotes/origin/main', publicCommit);
+    await publishMain(publicCommit);
     const head = await put('local.txt', 'local\n');
     const calls = [];
     const observed = async call => { calls.push(call); return exec(call); };
@@ -338,11 +345,57 @@ describe('bundle scan public origin/main history exemptions', () => {
     expect(bundleArgs).toContain(`^${runnerMain}`);
     expect(bundleArgs).not.toContain(`^${publicCommit}`);
   });
-  it('handles an entirely public scanned range', async () => {
+  it('exempts an entirely public scanned range when remote main matches', async () => {
     const head = await put('public.txt', token, 'document private' + '-key handling');
-    git(lane, 'update-ref', 'refs/remotes/origin/main', head);
+    await publishMain(head);
     expect(await scan(head)).toBeNull();
   });
+  it('keeps the hit when the local tracking ref points at an unpushed commit', async () => {
+    const head = await put('local.test.mjs', token);
+    git(lane, 'update-ref', 'refs/remotes/origin/main', head);
+    expect(await scan(head)).toEqual({ path: 'local.test.mjs', finding: 'github-token' });
+  });
+  it('rechecks remote main on each scan without caching an exemption', async () => {
+    const head = await put('public.test.mjs', token);
+    await publishMain(head);
+    expect(await scan(head)).toBeNull();
+    git(git(lane, 'remote', 'get-url', 'origin'), 'update-ref', 'refs/heads/main', runnerMain);
+    expect(await scan(head)).toEqual({ path: 'public.test.mjs', finding: 'github-token' });
+  });
+  it('exempts a local tracking ref that is an ancestor of a known newer remote main', async () => {
+    const older = await put('public.test.mjs', token);
+    const newer = await put('newer.txt', 'safe\n');
+    await publishMain(newer);
+    git(lane, 'update-ref', 'refs/remotes/origin/main', older);
+    expect(await scan(newer)).toBeNull();
+  });
+  it('keeps the hit when newer remote main is not present locally', async () => {
+    const older = await put('public.test.mjs', token);
+    await publishMain(older);
+    const remote = git(lane, 'remote', 'get-url', 'origin');
+    const newer = git(remote, ...ident, 'commit-tree', `${older}^{tree}`, '-p', older, '-m', 'newer');
+    git(remote, 'update-ref', 'refs/heads/main', newer);
+    expect(await scan(older)).toEqual({ path: 'public.test.mjs', finding: 'github-token' });
+  });
+  it.each(['error exit', 'timeout', 'missing output', 'invalid sha', 'wrong ref', 'extra line', 'extra newline', 'truncated output'])(
+    'keeps the hit when ls-remote has %s', async failure => {
+      const head = await put('public.test.mjs', token);
+      await publishMain(head);
+      const injected = async call => {
+        if (!call.args.includes('ls-remote')) return exec(call);
+        expect(call.env.GIT_TERMINAL_PROMPT).toBe('0');
+        expect(call.signal).toBeInstanceOf(AbortSignal);
+        if (failure === 'timeout') throw new Error('timed out');
+        if (failure === 'missing output') return { code: 0 };
+        const line = `${head}\trefs/heads/main\n`;
+        return { code: failure === 'error exit' ? 1 : 0, stdout:
+          failure === 'invalid sha' ? 'unknown\trefs/heads/main\n'
+            : failure === 'wrong ref' ? `${head}\trefs/heads/other\n`
+              : failure === 'extra line' ? line + line : failure === 'extra newline' ? line + '\n'
+                : failure === 'truncated output' ? line.slice(0, -1) : line };
+      };
+      expect(await scan(head, injected)).toEqual({ path: 'public.test.mjs', finding: 'github-token' });
+    });
   it.each(['symlink', 'gitlink', 'secret name', 'token name', 'empty tree name'])(
     'refuses a %s in shipped public ancestry', async kind => {
       if (kind === 'symlink') {
@@ -364,7 +417,7 @@ describe('bundle scan public origin/main history exemptions', () => {
         git(lane, ...ident, 'commit', '-qm', 'public fixture');
       }
       const head = git(lane, 'rev-parse', 'HEAD');
-      git(lane, 'update-ref', 'refs/remotes/origin/main', head);
+      await publishMain(head);
       const finding = kind === 'secret name' ? 'excluded-path'
         : kind === 'token name' || kind === 'empty tree name' ? 'github-token' : kind;
       expect(await scan(head)).toMatchObject({ finding });
@@ -373,13 +426,13 @@ describe('bundle scan public origin/main history exemptions', () => {
   it.each(['commit count', 'path count', 'blob bytes'])(
     'retains the %s bound for an entirely public range', async bound => {
       const head = await put('public.txt', 'public fixture\n');
-      git(lane, 'update-ref', 'refs/remotes/origin/main', head);
+      await publishMain(head);
       if (bound === 'path count') {
         await put('another.txt', 'another fixture\n');
         // A single public commit can carry more paths than the commit-count bound.
         git(lane, 'reset', '--soft', runnerMain);
         git(lane, ...ident, 'commit', '-qm', 'public paths');
-        git(lane, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+        await publishMain('HEAD');
       }
       await expect(scanBundleRange({ cwd: lane, head: git(lane, 'rev-parse', 'HEAD'), prerequisite: runnerMain, exec,
         ...(bound === 'blob bytes' ? { maxTotalBytes: 1 } : { maxBlobs: bound === 'commit count' ? 0 : 1 }),
@@ -388,7 +441,7 @@ describe('bundle scan public origin/main history exemptions', () => {
   it.each(['revision list', 'path log'])(
     'refuses incomplete non-public %s evidence', async kind => {
       const head = await put('public.txt', 'safe\n');
-      git(lane, 'update-ref', 'refs/remotes/origin/main', head);
+      await publishMain(head);
       let rawLogs = 0;
       const injected = async call => {
         if (call.args.includes('--raw')) rawLogs++;
@@ -498,7 +551,7 @@ describe('bundle scan public origin/main history exemptions', () => {
   it.each(['missing ref', 'error exit', 'throw', 'invalid sha'])(
     'retains the original scan when origin/main has %s', async failure => {
       const head = await put('public.txt', 'ok\n', `fixture ${token}`);
-      git(lane, 'update-ref', 'refs/remotes/origin/main', head);
+      await publishMain(head);
       if (failure === 'missing ref') git(lane, 'update-ref', '-d', 'refs/remotes/origin/main');
       const injected = async call => {
         if (!call.args.includes('refs/remotes/origin/main^{commit}') || failure === 'missing ref') return exec(call);

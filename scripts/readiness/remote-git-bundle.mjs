@@ -251,7 +251,21 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings 
   try {
     const resolved = await git(['rev-parse', '--verify', 'refs/remotes/origin/main^{commit}']);
     const sha = bytes(resolved.stdout).toString('utf8').trim();
-    if (resolved.code === 0 && REVISION.test(sha)) publicMain = sha;
+    if (resolved.code === 0 && REVISION.test(sha)) {
+      // A local tracking ref can be forged. Verify it against origin on every scan;
+      // unavailable evidence keeps the original full scan (no public exemption).
+      const signal = AbortSignal.timeout(15000);
+      const remote = await exec({ file: 'git', args: ['--no-replace-objects', 'ls-remote', 'origin', 'refs/heads/main'], cwd,
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, signal });
+      const listing = bytes(remote.stdout).toString('utf8');
+      const match = /^([0-9a-f]{40}(?:[0-9a-f]{24})?)\trefs\/heads\/main\n$/.exec(listing);
+      if (!signal.aborted && remote.code === 0 && match && match[0] === listing) {
+        const remoteSha = match[1];
+        if (sha === remoteSha) publicMain = sha;
+        else if ((await git(['cat-file', '-e', `${remoteSha}^{commit}`])).code === 0
+          && (await git(['merge-base', '--is-ancestor', sha, remoteSha])).code === 0) publicMain = sha;
+      }
+    }
   } catch { /* Unresolved public history: retain the original scan. */ }
   const range = [prerequisite ? `${prerequisite}..${head}` : head];
   const contentRange = [...range, ...(publicMain ? [`^${publicMain}`] : [])];
