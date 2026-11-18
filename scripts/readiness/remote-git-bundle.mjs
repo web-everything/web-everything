@@ -95,8 +95,8 @@ export async function planBundle({ cwd, head, runnerBase, exec, directory }) {
     }
   }
   if (prerequisite === head) return { mode: 'none', tip: head, warnings: [] };
-  // R559: the same credential policy as the rsync path, over EVERY commit in the bundled range (a secret
-  // committed and later deleted still travels in the pack). Fail closed before any bundle is built or sent.
+  // Scan non-public commits in the bundled range, including later-deleted secrets. Publicness only
+  // changes scanning: the bundle still contains the entire range required by the runner.
   const warnings = [];
   const hit = await scanBundleRange({ cwd, head, prerequisite, exec, warnings });
   if (hit) throw bundleError('bundle-credential-hit', `${hit.path}: ${hit.finding}`);
@@ -181,14 +181,27 @@ async function loadCredentialAllowlist({ git, prerequisite }) {
 /** Only findings that name key-HANDLING code or an unreadable encoding can be listed; a real token format (github-token,
  *  aws-access-key, pem-header, ...) is never maskable, whatever the allow-list says. */
 const ALLOWLISTABLE_FINDINGS = new Set(['private-key', 'unsupported-text-encoding']);
-/** The exact blob must already be public: it appears in the prerequisite (public base) history of that path. */
-async function isPublicBlob({ git, prerequisite, label, sha }) {
-  if (!prerequisite) return false;
+/** Exact path AND blob identity in the supplied public history; unreadable evidence grants no exemption. */
+async function isPublicBlob({ git, base, label, sha }) {
+  if (!base) return false;
   try {
-    const log = await git(['log', prerequisite, '--format=', '--raw', '--no-abbrev', '--no-renames', '--', label]);
-    return log.code === 0 && log.stdout != null && bytes(log.stdout).toString('latin1').split('\n').some(line => line.startsWith(':') && line.split(' ')[3] === sha);
+    const log = await git(['--literal-pathspecs', 'log', base, '--full-history', '--diff-merges=separate', '--format=', '--raw', '-z', '--no-abbrev', '--no-renames', '--no-relative', '--no-ext-diff', '--no-textconv', '--', label]);
+    if (log.code !== 0 || log.stdout == null) return false;
+    const out = bytes(log.stdout);
+    if (out.length && out.at(-1) !== NUL) return false;
+    const entries = splitNul(out);
+    let found = false;
+    for (let i = 0; i < entries.length; i++) {
+      if (!entries[i].length) continue;
+      const match = /^:[0-7]{6} [0-7]{6} [0-9a-f]{40,64} ([0-9a-f]{40,64}) [ADMT]$/.exec(entries[i].toString('ascii'));
+      const path = entries[++i];
+      if (!match || !path) return false;
+      if (match[1] === sha && path.equals(Buffer.from(label))) found = true;
+    }
+    return found;
   } catch { return false; }
 }
+const PUBLIC_CONTENT_FINDINGS = new Set(['github-token', 'private-key', 'pem-header']);
 /** True when every finding on this blob is listed for exactly this path and content hash. */
 function allowedFindings(allowed, label, content, findings) {
   const present = findings.filter(Boolean);
@@ -216,14 +229,20 @@ function allowedFindings(allowed, label, content, findings) {
 }
 
 /**
- * R559: scan every bundled commit's additions beyond the prerequisite tree (or the whole history when it is null).
+ * R559: scan non-public bundled commits' additions beyond the prerequisite tree.
  * Path policy is the manifest's own exclusion policy; content uses its raw token patterns.
  * Returns the first {path, finding} or null; throws bundle-credential-scan-too-large instead of skipping.
  */
 export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings = [], maxBlobs = 20000, maxTotalBytes = 128 * 1024 * 1024 }) {
   // The pack carries the RAW stored objects. --no-replace-objects keeps refs/replace/* from showing the scan a clean substitute.
   const git = (args, input) => exec({ file: 'git', args: ['--no-replace-objects', ...args], cwd, ...(input === undefined ? {} : { input }) });
-  const range = prerequisite ? `${prerequisite}..${head}` : head;
+  let publicMain = null;
+  try {
+    const resolved = await git(['rev-parse', '--verify', 'refs/remotes/origin/main^{commit}']);
+    const sha = bytes(resolved.stdout).toString('utf8').trim();
+    if (resolved.code === 0 && REVISION.test(sha)) publicMain = sha;
+  } catch { /* Unresolved public history: retain the original scan. */ }
+  const range = [prerequisite ? `${prerequisite}..${head}` : head, ...(publicMain ? [`^${publicMain}`] : [])];
   // Grafts and shallow files cut history out of rev-list/log but NOT out of `git bundle create` (it still packs the cut-off
   // objects), so a repo carrying either cannot be scanned faithfully: refuse rather than scan a truncated view.
   const shallow = await git(['rev-parse', '--is-shallow-repository']);
@@ -249,7 +268,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings 
   }
   // Enumerate the full bundled ancestry: a merged branch can add and delete a credential
   // before its merge, leaving no trace in the merge's first-parent diff.
-  const revs = await git(['rev-list', '--root', range]);
+  const revs = await git(['rev-list', '--root', ...range]);
   // Missing or unterminated output is unknown evidence, never an empty range (which would skip all scanning).
   if (revs.code !== 0 || revs.stdout == null) throw bundleError('bundle-credential-scan-failed');
   const revText = bytes(revs.stdout).toString('utf8');
@@ -264,12 +283,12 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings 
   // history and merge resolutions remain visible, independent of user config.
   let log;
   try {
-    log = prerequisite && !commits.length ? { code: 0, stdout: Buffer.alloc(0) }
-      : await git(['log', '--raw', '-t', '--ignore-submodules=none', '-z', '--no-renames', '--no-abbrev', '--root', '--diff-merges=separate', ...(prerequisite ? ['--first-parent', '--diff-merges=first-parent', '--no-walk=unsorted'] : []), '--no-relative', '--no-ext-diff', '--no-textconv', '--no-show-signature', '--diff-filter=d', '--format=', ...(prerequisite ? commits : [range])]);
+    log = !commits.length ? { code: 0, stdout: Buffer.alloc(0) }
+      : await git(['log', '--raw', '-t', '--ignore-submodules=none', '-z', '--no-renames', '--no-abbrev', '--root', '--diff-merges=separate', ...(prerequisite ? ['--first-parent', '--diff-merges=first-parent', '--no-walk=unsorted'] : []), '--no-relative', '--no-ext-diff', '--no-textconv', '--no-show-signature', '--diff-filter=d', '--format=', ...(prerequisite ? commits : range)]);
   } catch { throw bundleError('bundle-credential-scan-failed'); }
   if (log.code !== 0 || log.stdout == null) throw bundleError('bundle-credential-scan-failed');
   // Commit messages (and author/committer identity lines) travel in the pack too. Tags are not bundled: only the pinned ref is.
-  const messages = await git(['log', '-z', '--root', '--format=%an%n%ae%n%cn%n%ce%n%B', range]);
+  const messages = await git(['log', '-z', '--root', '--format=%an%n%ae%n%cn%n%ce%n%B', ...range]);
   if (messages.code !== 0 || messages.stdout == null) throw bundleError('bundle-credential-scan-failed');
   for (const message of splitNul(bytes(messages.stdout))) {
     // Same scanner as blobs (secret assignments included); a message is plain text.
@@ -390,7 +409,14 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings 
         let policy = null;
         try { policy = credentialContentFinding(path, content); } catch { policy = 'content-scan-error'; }
         const hit = policy ?? finding;
-        if (hit && !(allowedFindings(allowed, label, content, [policy, finding]) && await isPublicBlob({ git, prerequisite, label, sha }))) return { path: label, finding: hit };
+        if (hit) {
+          const publicContent = path.equals(Buffer.from(label))
+            && [policy, finding].filter(Boolean).every(f => PUBLIC_CONTENT_FINDINGS.has(f))
+            && await isPublicBlob({ git, base: publicMain, label, sha });
+          const reviewed = !publicContent && allowedFindings(allowed, label, content, [policy, finding])
+            && await isPublicBlob({ git, base: prerequisite, label, sha });
+          if (!publicContent && !reviewed) return { path: label, finding: hit };
+        }
         const warning = credentialContentWarning(path, content);
         if (warning) warnings.push({ path: label, finding: warning });
       }

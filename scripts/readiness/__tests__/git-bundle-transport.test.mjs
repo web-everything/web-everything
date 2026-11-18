@@ -295,6 +295,131 @@ describe('R593 credential scan over the whole bundled range (R559)', () => {
   });
 });
 
+describe('bundle scan public origin/main history exemptions', () => {
+  const token = 'ghs_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8';
+  const shapes = [
+    ['conveyor token fixture', 'skills-src/conveyor/__tests__/review-daemon.test.mjs', `const fixture = "${token}";\n`, 'github-token'],
+    ['coroner token fixture', 'scripts/operations/__tests__/coroner-extract.test.mjs', `const fixture = "${token}";\n`, 'github-token'],
+    ['shim redaction regex', 'scripts/lib/gh-app-shim.mjs', 'return text.replace(/PRIVATE' + ' KEY/g, "[redacted]");\n', 'private-key'],
+    ['flagged-name-rule fixture', 'scripts/readiness/__tests__/forge-flagged-name-rule.test.mjs', 'it.each(["private' + ' key", "PRIVATE' + ' KEY"])("blocks markers", check);\n', 'private-key'],
+    ['PEM content fixture', 'fixtures/armor.test.mjs', 'const armor = "-----' + 'BEGIN OPENSSH PRIVATE' + ' KEY-----";\n', 'pem-header'],
+  ];
+  const put = async (path, text, message = 'fixture') => {
+    await fs.mkdir(join(lane, path, '..'), { recursive: true });
+    return commit(lane, { [path]: text }, message);
+  };
+  // Public history is divergent from the lane and newer than Forge's prerequisite. The blob
+  // has been scrubbed at the public tip, so checking only that tip's tree cannot pass these tests.
+  const publishHistory = async (path, text) => {
+    git(lane, 'checkout', '-q', '-b', 'public-history', runnerMain);
+    await put(path, text);
+    const publicTip = await put(path, 'clean\n', 'scrub public fixture');
+    git(lane, 'update-ref', 'refs/remotes/origin/main', publicTip);
+    git(lane, 'checkout', '-q', '-');
+    return publicTip;
+  };
+  const scan = (head, injected = exec, prerequisite = runnerMain) =>
+    scanBundleRange({ cwd: lane, head, prerequisite, exec: injected });
+
+  it('excludes public commit messages and raw objects while preserving the bundled range', async () => {
+    const publicCommit = await put('public.txt', 'public\n', 'document private' + '-key handling');
+    git(lane, 'update-ref', 'refs/remotes/origin/main', publicCommit);
+    const head = await put('local.txt', 'local\n');
+    const calls = [];
+    const observed = async call => { calls.push(call); return exec(call); };
+    const directory = join(root, 'public-bundle'); await fs.mkdir(directory);
+    const plan = await planBundle({ cwd: lane, head, runnerBase: runnerMain, exec: observed, directory });
+    expect(plan).toMatchObject({ mode: 'incremental', tip: head, base: runnerMain });
+    expect(calls.find(c => c.args.includes('rev-list')).args).toContain(`^${publicCommit}`);
+    expect(calls.filter(c => c.args.includes('cat-file')).every(c => !String(c.input ?? '').includes(publicCommit))).toBe(true);
+    const bundleArgs = calls.find(c => c.args.includes('create')).args;
+    expect(bundleArgs).toContain(`^${runnerMain}`);
+    expect(bundleArgs).not.toContain(`^${publicCommit}`);
+  });
+  it('handles an entirely public scanned range', async () => {
+    const head = await put('public.txt', token, 'document private' + '-key handling');
+    git(lane, 'update-ref', 'refs/remotes/origin/main', head);
+    expect(await scan(head)).toBeNull();
+  });
+  it.each(shapes)('exempts exact historical %s without an allow-list', async (_name, path, text) => {
+    await publishHistory(path, text);
+    const oldLaneCommit = await put(path, text);
+    const head = await put(path, 'clean\n', 'scrub lane fixture');
+    expect(git(lane, 'merge-base', '--is-ancestor', oldLaneCommit, head)).toBe('');
+    expect(await scan(head)).toBeNull();
+    expect(await scan(head, exec, null)).toBeNull();
+  });
+  it.each(shapes)('still blocks non-public %s', async (_name, path, text, finding) => {
+    const head = await put(path, text);
+    expect(await scan(head)).toMatchObject({ path, finding });
+  });
+  it.each(shapes)('still blocks a modified copy of public %s', async (_name, path, text, finding) => {
+    await publishHistory(path, text);
+    const head = await put(path, text + '// modified\n');
+    expect(await scan(head)).toMatchObject({ path, finding });
+  });
+  it('requires the same path as well as the same blob sha', async () => {
+    await publishHistory('old.test.mjs', token);
+    expect(await scan(await put('new.test.mjs', token))).toMatchObject({ path: 'new.test.mjs', finding: 'github-token' });
+  });
+  it('matches exact public paths containing quotes and Unicode', async () => {
+    const path = 'fixture-"é.test.mjs';
+    await publishHistory(path, token);
+    expect(await scan(await put(path, token))).toBeNull();
+  });
+  it('does not treat pathspec metacharacters as public path matches', async () => {
+    await publishHistory('a.test.mjs', token);
+    expect(await scan(await put('*.test.mjs', token))).toMatchObject({ path: '*.test.mjs', finding: 'github-token' });
+  });
+  it('still blocks a non-public commit message containing a real token shape', async () => {
+    await publishHistory('public.test.mjs', token);
+    const head = await put('ok.txt', 'ok\n', `fixture ${token}`);
+    expect(await scan(head)).toEqual({ path: 'commit-message', finding: 'github-token' });
+  });
+  it('does not exempt other token types even when their exact blob is public', async () => {
+    const text = 'AKIA' + 'ABCDEFGHIJKLMNOP';
+    await publishHistory('aws.test.mjs', text);
+    expect(await scan(await put('aws.test.mjs', text))).toMatchObject({ finding: 'aws-access-key' });
+  });
+  it('does not exempt excluded paths even when their exact blob is public', async () => {
+    await publishHistory('credentials.txt', token);
+    expect(await scan(await put('credentials.txt', token))).toMatchObject({ finding: 'excluded-path' });
+  });
+  it('does not exempt a mode change to a symlink with public blob bytes', async () => {
+    await publishHistory('link.txt', 'tracked.txt');
+    await fs.symlink('tracked.txt', join(lane, 'link.txt'));
+    git(lane, 'add', 'link.txt'); git(lane, ...ident, 'commit', '-qm', 'link');
+    expect(await scan(git(lane, 'rev-parse', 'HEAD'))).toMatchObject({ finding: 'symlink' });
+  });
+  it.each(['error exit', 'throw', 'missing output', 'truncated output'])(
+    'keeps the hit when public blob lookup has %s', async failure => {
+      const path = 'public.test.mjs';
+      await publishHistory(path, token);
+      const head = await put(path, token);
+      const injected = async call => {
+        if (!call.args.includes('--literal-pathspecs')) return exec(call);
+        if (failure === 'throw') throw new Error('unreadable history');
+        if (failure === 'error exit') return { code: 1, stdout: Buffer.alloc(0) };
+        if (failure === 'missing output') return { code: 0 };
+        const result = await exec(call);
+        return { ...result, stdout: result.stdout.subarray(0, -1) };
+      };
+      expect(await scan(head, injected)).toMatchObject({ path, finding: 'github-token' });
+    });
+  it.each(['missing ref', 'error exit', 'throw', 'invalid sha'])(
+    'retains the original scan when origin/main has %s', async failure => {
+      const head = await put('public.txt', 'ok\n', `fixture ${token}`);
+      git(lane, 'update-ref', 'refs/remotes/origin/main', head);
+      if (failure === 'missing ref') git(lane, 'update-ref', '-d', 'refs/remotes/origin/main');
+      const injected = async call => {
+        if (!call.args.includes('refs/remotes/origin/main^{commit}') || failure === 'missing ref') return exec(call);
+        if (failure === 'throw') throw new Error('unreadable ref');
+        return { code: failure === 'error exit' ? 1 : 0, stdout: 'unknown\n' };
+      };
+      expect(await scan(head, injected)).toEqual({ path: 'commit-message', finding: 'github-token' });
+    });
+});
+
 describe('R909 runner base newer than the Mac clone (fetch it, keep the range small)', () => {
   it('fetches an unknown runner base so the merge-base keeps an incremental range', async () => {
     const source = join(root, 'public');
