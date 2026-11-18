@@ -883,8 +883,15 @@ describe('PR 7008 compression headers and wrapped base64', () => {
     ['UTF-8 next-line', Buffer.from('x wait\u0085\n')]])('treats text with %s and a zlib-like header as text', (_name, bytes) => {
     expect(compressionFlagged(bytes)).toBe(false);
   });
-  it('still fails closed on a zlib header cut short, even when its bytes look like text', () => {
-    expect(compressionFlagged(Buffer.from('x^'))).toBe(true);
+  // Self-review round 2: short text that parses to its end is not a cut-short stream.
+  it.each(['hCard\n', '8OZ jar\n', '8Os\n', 'x^2', 'hC', '(S)', 'XG', 'x^'])('treats short text that parses to its end as text: %j', text => {
+    expect(zlibHeader(text)).toBe(true);
+    expect(compressionFlagged(Buffer.from(text))).toBe(false);
+  });
+  it('still fails closed on a default zlib header cut short', () => {
+    for (const bytes of [[0x78, 0x9c], [0x78, 0xda], [0x78, 0x01]]) expect(compressionFlagged(Buffer.from(bytes))).toBe(true);
+    const whole = deflateSync(`${HOME}/projects`);
+    expect(compressionFlagged(whole.subarray(0, whole.length - 4))).toBe(true);
   });
   // Self-review: raw deflate has no header, so its first two bytes can form a zlib checksum; it is still inflated.
   it('inflates raw deflate whose first two bytes form a zlib checksum', () => {
@@ -949,6 +956,14 @@ describe('PR 7008 compression headers and wrapped base64', () => {
     ['> quote prefix', split([8, 40], '\n', '> ')], ['* block-comment prefix', split([8, 40], '\n', ' * ')],
     ['lone CR line ends', split([8, 40], '\r')], ['U+2028 separators', split([8, 40], ' ')],
     ['a blank line between parts', split([8, 40], '\n\n')], ['JSON \\r escapes', `"${split([8, 40], '\\r')}"`],
+    // Self-review round 2.
+    ['line-number prefixes', split([8, 40], '\n', '10 ')], ['table pipes', '| ' + split([8, 40], ' |\n| ') + ' |'],
+    ['shell continuation', split([8, 40], '\\\n')], ['VT line breaks', split([8, 40], '\v')],
+    ['FF line breaks', split([8, 40], '\f')],
+    ['ragged widths 2/3', split(Array.from({ length: 30 }, (_, at) => Math.floor(at / 2) * 5 + (at % 2 ? 2 : 0)).filter(cut => cut > 0))],
+    ['ragged widths 1..9', split([1, 3, 6, 10, 15, 21, 28, 36, 45, 46, 48, 51])],
+    ['ragged widths 5/7', split([5, 12, 17, 24, 29, 36, 41, 48])],
+    ['ragged widths after a label line', 'Payload\n' + split([5, 12, 17, 24, 29, 36, 41, 48])],
   ])('decodes wrapped base64 %s', (_name, text) => {
     expect(scanText(text)).toContainEqual(expect.objectContaining({ pattern: 'home-path', match: HOME }));
   });

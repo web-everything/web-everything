@@ -67,12 +67,12 @@ export function decodePrivacyContent(content, { onCompressionError = () => {} } 
         }
       } catch { onCompressionError(); return; }
       // Still uninspectable compression: a damaged gzip stream (its magic is unambiguous), a zlib-header
-      // candidate holding binary control bytes, or a stream cut short (every byte parsed, the end missing).
-      // A header asking for a preset dictionary (FDICT, bit 5 of the second byte) is cut short in any text under
-      // six bytes ("x = 1"), and no reader inflates it without that dictionary, so text with it is just text.
-      // Longer text whose first two bytes happen to form a zlib checksum fails on a data error and is text too.
-      const presetDictionary = zlib && (input[1] & 0x20) !== 0;
-      if (gzip || !isPlainText(input) || (truncated && !presetDictionary)) onCompressionError();
+      // candidate holding binary control bytes, or a stream cut short (every byte parsed, the end missing)
+      // behind one of zlib's own default headers (78 9c, 78 da; 78 01 is binary already). Short text such as
+      // "hCard" or "x^2" also parses to its end, so a cut-short stream behind any other header counts as text;
+      // its decodable prefix was scanned above either way.
+      const defaultHeader = zlib && input[0] === 0x78 && (input[1] === 0x9c || input[1] === 0xda);
+      if (gzip || !isPlainText(input) || (truncated && defaultHeader)) onCompressionError();
       if (recovered?.length && recovered.length <= remaining) {
         inflatedSize += recovered.length;
         buffers.push(recovered);
@@ -290,15 +290,17 @@ function decodeBase64Text(token) {
 
 // PR 7008: base64 is routinely wrapped (MIME 76, PEM 64, any width), so a value split across lines must be
 // decoded whole. A run is two or more base64 segments joined by one or more line breaks:
-//   - a real break (LF, CRLF, lone CR, U+2028, U+2029) or a JSON-escaped one (\n, \r\n, \r);
+//   - a real break (LF, CRLF, lone CR, VT, FF, U+2028, U+2029) or a JSON-escaped one (\n, \r\n, \r);
 //   - optional spaces or tabs around it, blank lines in between;
-//   - an optional comment or quote prefix on the next line (#, ;, >, *, %, !, or // or -- followed by a space,
-//     since a bare // or -- can begin base64 data).
+//   - an optional table pipe or shell continuation backslash before the break;
+//   - an optional prefix on the next line: comment or quote marks (#, ;, >, *, %, !, |), or a line number,
+//     // or -- followed by a space (a bare // or -- can begin base64 data; data lines never hold a space).
 // The look-behind starts a run only at a token start (after "=" too, as in KEY=<base64>), so each character
 // begins at most one attempt; every alternative in a separator consumes a break, so the scan stays linear.
-const LINE_BREAK = String.raw`(?:\r\n|[\r\n  ]|\\r\\n|\\[nr])`;
-const LINE_PREFIX = String.raw`(?:[#;>*%!]+[ \t]*|(?://|--)[ \t]+)`;
-const WRAP_SEPARATOR = String.raw`[ \t]*(?:${LINE_BREAK}[ \t]*${LINE_PREFIX}?)+`;
+const LINE_BREAK = String.raw`(?:\r\n|[\r\n\v\f  ]|\\r\\n|\\[nr])`;
+const LINE_SUFFIX = String.raw`(?:\|[ \t]*|\\(?=\r?\n))`;
+const LINE_PREFIX = String.raw`(?:[#;>*%!|]+[ \t]*|(?://|--|\d+)[ \t]+)`;
+const WRAP_SEPARATOR = String.raw`[ \t]*${LINE_SUFFIX}?(?:${LINE_BREAK}[ \t]*${LINE_PREFIX}?)+`;
 const WRAPPED_BASE64 = new RegExp(
   String.raw`(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]+(?:${WRAP_SEPARATOR}[A-Za-z0-9+/_-]+)+={0,2}`, 'g');
 
@@ -358,16 +360,47 @@ function decodeWrappedRun(run) {
   return pieces.join('') + run.slice(cursor);
 }
 
-/** PR 7008 — the text with each wrapped base64 run decoded, or null when no run decodes. */
+/** PR 7008 — ragged wrapping (no shared line width, e.g. widths 2/3/2/3 or 1..9), decoded as one stream: the
+ *  run's segments joined and decoded at each of the four base64 alignments, so data after a stray word of any
+ *  length still lines up at one of them. Kept only for a run of three or more lines whose best decode is
+ *  mostly printable text (garbage from joined prose words is not). Up to two leading lines (labels) may be
+ *  left out when that decodes more cleanly, so the decode sits on the block's first line, as the width view
+ *  puts it. On a tie the fewest are left out: dropping a real data line also decodes cleanly, but loses its
+ *  text. The run's LF breaks are kept. Twelve linear decodes per run. */
+function decodeJoinedRun(run) {
+  const separators = [...run.matchAll(new RegExp(WRAP_SEPARATOR, 'g'))];
+  if (separators.length < 2) return null;
+  const strip = text => text.replace(new RegExp(WRAP_SEPARATOR, 'g'), '').replace(/=+$/, '').replace(/-/g, '+').replace(/_/g, '/');
+  let best = null;
+  for (let skip = 0; skip <= 2 && skip < separators.length; skip += 1) {
+    const from = skip ? separators[skip - 1].index + separators[skip - 1][0].length : 0;
+    const joined = strip(run.slice(from));
+    if (joined.length < 16) continue;
+    for (let offset = 0; offset < 4; offset += 1) {
+      const aligned = joined.slice(offset, joined.length - ((joined.length - offset) % 4));
+      const decoded = new TextDecoder('utf-8').decode(Buffer.from(aligned, 'base64'));
+      const printable = decoded.replace(/[\p{Cc}�]/gu, '').length / Math.max(1, decoded.length);
+      if (!best || printable > best.printable) best = { from, decoded, printable };
+    }
+  }
+  if (!best || best.printable < 0.75) return null;
+  return run.slice(0, best.from) + best.decoded.replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu, ' ')
+    + '\n'.repeat((run.slice(best.from).match(/\n/g) ?? []).length);
+}
+
+/** PR 7008 — the text views with wrapped base64 decoded: one by line width, one as joined streams (ragged
+ *  wrapping). A view is left out when no run in it decodes. */
 function unwrapBase64(text) {
-  let changed = false;
-  const view = text.replace(WRAPPED_BASE64, (run) => {
-    const decoded = decodeWrappedRun(run);
-    if (decoded === null) return run;
-    changed = true;
-    return decoded;
-  });
-  return changed ? view : null;
+  return [decodeWrappedRun, decodeJoinedRun].map((decodeRun) => {
+    let changed = false;
+    const view = text.replace(WRAPPED_BASE64, (run) => {
+      const decoded = decodeRun(run);
+      if (decoded === null) return run;
+      changed = true;
+      return decoded;
+    });
+    return changed ? view : null;
+  }).filter(view => view !== null);
 }
 
 // R972: entity decoding may expand a single source line into several scan lines.
@@ -417,8 +450,7 @@ export function scanText(content, options = {}) {
     const variants = lines.reduce((max, line) => Math.max(max, line.views.length), 0);
     const scans = [{ view: raw }, ...Array.from({ length: variants }, (_, variant) => normalizedView(lines, variant))];
     // PR 7008: base64 wrapped across lines, decoded whole; lines still map to (and are exempted by) raw lines.
-    const unwrapped = unwrapBase64(raw);
-    if (unwrapped !== null) {
+    for (const unwrapped of unwrapBase64(raw)) {
       // The whole unwrapped text is scanned once; per-line decodings are rebuilt only for the lines the unwrap
       // changed (an unchanged line's decodings were scanned above), keeping this view's cost near one scan.
       const unwrappedLines = unwrapped.split('\n').map((text, index) => ({ lineText: rawLines[index],
