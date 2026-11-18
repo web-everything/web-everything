@@ -13,6 +13,11 @@ export function isAgyFixPathAllowed(p, kind) {
       const tail = parts.slice(i).join('/');
       return tail === s || tail.startsWith(`${s}/`) || s.startsWith(`${tail}/`);
     }))) return false;
+  if (parts.includes('.gitattributes')
+    || /^(?:\.github(?:\/|$)|scripts\/hooks(?:\/|$)|scripts\/lib\/[^/]*policy)/.test(p)) return false;
+  try {
+    if (criticalWorkVerdict({ taskType: kind, filesTouched: [p, `${p}/`] }).critical !== false) return false;
+  } catch { return false; } // Unknown criticality uses the next provider/operator.
   return kind === 'doc-fix' ? isDoc(p) : kind === 'test-fix' ? isTest(p) : true;
 }
 
@@ -36,8 +41,7 @@ export function deriveAgyFixAdmission(item = {}, launch = {}) {
   // Recheck the actual admitted paths, including directory forms, against the routing gate.
   try {
     if (criticalWorkVerdict({ ...launch, ...item, taskType: taskKind,
-      filesTouched: scope.flatMap(p => [p, `${p}/`]) }).critical
-      || scope.some(p => /^(?:\.github(?:\/|$)|scripts\/hooks(?:\/|$)|scripts\/lib\/[^/]*policy)/.test(p))) return null;
+      filesTouched: scope.flatMap(p => [p, `${p}/`]) }).critical) return null;
   } catch { return null; } // Unknown criticality advances to the next provider/operator.
   if (!Number.isFinite(size) || size !== 1) return null;
   if (typeof taskKind !== 'string' || !/^[a-z][a-z0-9-]*$/.test(taskKind)) return null;

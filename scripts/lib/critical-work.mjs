@@ -40,6 +40,31 @@ const POLICY_TIER_HOMES = Object.freeze(new Set(
   TRUST_CHAIN.filter((m) => m.tier === 'policy').flatMap((m) => m.homes ?? []),
 ));
 
+// Confinement entrypoints, their direct local imports, and the AgY spawn/juror chain.
+// Deeper generic infrastructure is intentionally not critical merely by transitive import.
+const CONFINEMENT_MODULES = Object.freeze([
+  'scripts/lib/agy-confined-build.mjs',
+  'scripts/lib/agy-sandbox.mjs',
+  'scripts/lib/agy-fix-admission.mjs',
+  'scripts/operations/agy-fix-provider.mjs',
+  'scripts/gemini-direct-task.mjs',
+  'scripts/lib/agy-review-juror.mjs',
+  'scripts/lib/antigravity-judge-spawn.mjs',
+  'scripts/lib/antigravity-model-effort.mjs',
+  'scripts/lib/antigravity-run-evidence.mjs',
+  'scripts/lib/judge-spawn.mjs',
+  'scripts/lib/policy-cascade.mjs',
+  'scripts/lib/mandate-fence.mjs',
+  'scripts/lib/critical-work.mjs',
+  'scripts/lib/provider-quota-hold.mjs',
+  'scripts/lib/secret-scrub.mjs',
+  'scripts/lib/bounded-child.mjs',
+  'scripts/lib/dispatch-routing-policy.mjs',
+  'scripts/lib/dispatch-routing-policy.json',
+  'scripts/lib/provider-routing.mjs',
+  'scripts/lib/dispatch-routing-policy-source.mjs',
+]);
+
 /** The file-level gate/approval boundary, distinct from the broader full-review roster. */
 const CRITICAL_PATH_PREFIXES = Object.freeze({
   statute: NEVER_SPOT_CHECK_PATH_PREFIXES.statute,
@@ -69,6 +94,9 @@ const CRITICAL_PATH_PREFIXES = Object.freeze({
     'scripts/lib/github-app-', 'scripts/lib/forge-land-provider.mjs', 'scripts/operations/land-advance',
     'scripts/operations/pr-land-reasons.mjs', 'scripts/lib/ai-pr-authorship.mjs', 'scripts/lib/marker-authorship.mjs',
     'scripts/lib/verdict-totality.mjs', 'scripts/lib/trust-chain-tier.mjs', 'scripts/conveyor/hiccup-approve.mjs',
+    // Enforcement dependencies and their sibling regression tests are part of the same trust boundary.
+    ...CONFINEMENT_MODULES,
+    ...CONFINEMENT_MODULES.filter(p => p.endsWith('.mjs')).map(p => p.replace(/([^/]+)\.mjs$/, '__tests__/$1.test.mjs')),
     // Untrusted diff producer: its confinement, admission, settings and regression harness are gate code.
     'scripts/lib/agy-confined-', 'scripts/lib/agy-sandbox.mjs', 'scripts/lib/agy-fix-admission.mjs',
     'scripts/operations/agy-fix-provider.mjs', 'scripts/settings/agy-build.json',

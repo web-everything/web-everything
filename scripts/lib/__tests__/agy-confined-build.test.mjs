@@ -5,6 +5,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync,
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { runConfinedAgyBuild } from '../agy-confined-build.mjs';
+import { deriveAgyFixAdmission, isAgyFixPathAllowed } from '../agy-fix-admission.mjs';
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -152,6 +153,52 @@ describe('agy build fail-closed admission', () => {
 });
 
 describe('launcher-owned atomic application', () => {
+  it.each([false, true])('voids policy-cascade.mjs under scripts/lib scope before apply (tracked=%s)', async tracked => {
+    const f = fixture();
+    const path = 'scripts/lib/policy-cascade.mjs';
+    if (tracked) {
+      mkdirSync(dirname(join(f.lane, path)), { recursive: true });
+      writeFileSync(join(f.lane, path), 'before\n');
+      commit(f.lane);
+    }
+    expect(await f.run(dir => {
+      mkdirSync(dirname(join(dir, path)), { recursive: true });
+      writeFileSync(join(dir, path), 'changed\n');
+    }, { input: { kind: 'fix', scope: ['scripts/lib'] } })).toMatchObject({ status: 'voided', applied: [] });
+    expect(f.spawnAgy).toHaveBeenCalledOnce();
+    expect(f.commands.some(a => a.includes('apply'))).toBe(false);
+    expect(git(f.lane, 'status', '--porcelain')).toBe('');
+  });
+  it.each([
+    ...['docs/agent', 'docs/agent/testing.md', 'scripts/hooks', 'scripts/hooks/check.mjs',
+      'scripts/lib/review-policy.mjs', 'scripts/lib/new-policy.mjs', 'scripts/lib/policy-cascade.mjs',
+      'scripts/lib/critical-work.mjs', 'scripts/settings/agy-build.json', '.github', '.github/CODEOWNERS',
+      'AGENTS.md', '.git/config', '.GIT/config', '.github/workflows/ci.yml', 'package.json',
+      'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lockb', 'bun.lock', 'npm-shrinkwrap.json',
+      'Cargo.lock', 'Gemfile.lock', 'docs/.github/workflows/x.yml', 'tests/deep/pnpm-lock.yaml',
+      'docs/scripts/settings/config.json', 'scripts/settings', 'scripts', 'nested/package.json',
+      '.gitattributes', 'docs/.gitattributes', '../escape.md', '/absolute.md', 'bad\\path', 'bad:repo',
+      'bad//path', 'bad/./path', 'bad\x00path', 'bad*glob', 'bad?glob', 'bad[glob]', 'bad{glob}']
+      .map(path => ['fix', path]),
+    ['doc-fix', 'scripts/operations/fix-run.mjs'], ['doc-fix', 'src/_data/blocks.json'],
+    ['test-fix', 'src'], ['test-fix', 'src/main.ts'], ['test-fix', '__fixtures__/data.json'],
+  ].map(([kind, path]) => [`${kind} ${JSON.stringify(path)}`, kind, path]))(
+    'refuses admission denylist entry %s as an applied path too', async (_label, kind, path) => {
+    expect(deriveAgyFixAdmission({ taskKind: kind, size: 1, scope: [path] }, { scope: [path] })).toBeNull();
+    expect(isAgyFixPathAllowed(path, kind)).toBe(false);
+    const f = fixture();
+    // A permitted ancestor keeps valid paths in scope, so containment cannot mask a policy gap.
+    const ancestor = path.split('/')[0];
+    const scope = /^[^\x00-\x1f\x7f\\*?\[\]{}:]+$/.test(ancestor)
+      && ancestor && ancestor !== '..' && ancestor.toLowerCase() !== '.git' ? ancestor : 'docs';
+    const result = await f.run(undefined, { input: { kind, scope: [scope] },
+      raw: `:100644 100644 ${'0'.repeat(40)} ${'1'.repeat(40)} M\0${path}\0` });
+    expect(result).toMatchObject({ status: 'voided', applied: [] });
+    expect(result.reasons).toContain('unsafe or out-of-scope changed path');
+    expect(f.spawnAgy).toHaveBeenCalledOnce();
+    expect(f.commands.some(a => a.includes('apply'))).toBe(false);
+    expect(git(f.lane, 'status', '--porcelain')).toBe('');
+  });
   it.each([false, true])('voids critical docs/agent/testing.md under docs scope atomically (tracked=%s)', async tracked => {
     const f = fixture();
     const path = 'docs/agent/testing.md';

@@ -1,9 +1,43 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, relative, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { criticalWorkVerdict } from '../critical-work.mjs';
 import { deriveAgyFixAdmission } from '../agy-fix-admission.mjs';
 
 const admit = item => deriveAgyFixAdmission(item, { scope: item.scope });
+
+it('marks depth-1 local enforcement imports, the AgY spawn/juror chain and existing sibling tests critical', () => {
+  const root = fileURLToPath(new URL('../../../', import.meta.url));
+  const entrypoints = ['scripts/lib/agy-confined-build.mjs', 'scripts/lib/agy-sandbox.mjs',
+    'scripts/lib/agy-fix-admission.mjs', 'scripts/operations/agy-fix-provider.mjs'];
+  const targets = new Set([...entrypoints,
+    'scripts/gemini-direct-task.mjs', 'scripts/lib/agy-review-juror.mjs',
+    'scripts/lib/antigravity-judge-spawn.mjs', 'scripts/lib/antigravity-model-effort.mjs',
+    'scripts/lib/antigravity-run-evidence.mjs', 'scripts/lib/judge-spawn.mjs',
+    'scripts/lib/policy-cascade.mjs', 'scripts/lib/mandate-fence.mjs', 'scripts/lib/critical-work.mjs',
+    'scripts/lib/provider-quota-hold.mjs', 'scripts/lib/secret-scrub.mjs', 'scripts/lib/bounded-child.mjs',
+    'scripts/lib/dispatch-routing-policy.mjs', 'scripts/lib/dispatch-routing-policy.json',
+    'scripts/lib/provider-routing.mjs', 'scripts/lib/dispatch-routing-policy-source.mjs',
+  ]);
+  // Inspect only entrypoint imports (depth 1): deeper generic infrastructure is intentionally
+  // not critical merely by transitive import. The named spawn/juror chain is pinned above.
+  for (const path of entrypoints) {
+    const source = readFileSync(resolve(root, path), 'utf8');
+    const imports = source.matchAll(/^import\s+[^;]*?\s+from\s*['"](\.{1,2}\/[^'"]+)['"]/gm);
+    for (const [, specifier] of imports) {
+      const dependency = relative(root, resolve(root, dirname(path), specifier));
+      if (dependency !== '..' && !dependency.startsWith('../')) targets.add(dependency);
+    }
+  }
+  for (const path of targets) {
+    const sibling = path.endsWith('.mjs') ? path.replace(/([^/]+)\.mjs$/, '__tests__/$1.test.mjs') : null;
+    for (const target of [path, ...(sibling && existsSync(resolve(root, sibling)) ? [sibling] : [])]) {
+      expect(criticalWorkVerdict({ filesTouched: [target] }).critical, target).toBe(true);
+    }
+  }
+});
 
 describe('repair scope admission', () => {
   it.each([

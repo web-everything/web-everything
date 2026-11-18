@@ -4742,3 +4742,10 @@ and never accept clone controls as routing authority. Recheck every tracked and 
 against the shared critical-work verdict as well as the protected-path predicate before applying anything.
 Keep regression cases asserting zero post-run exec calls after control tampering and atomic refusal
 of critical descendants within an otherwise permitted directory scope.
+
+The confinement depth-1 regression checks static local imports from all four enforcement
+entrypoints, plus the named AgY spawn/juror chain, and requires each module and existing sibling
+test to pass the shared critical verdict. New direct dependencies must be added to the pinned
+critical list; deeper generic infrastructure is intentionally not critical merely by transitive import. Scope admission and applied paths use
+`isAgyFixPathAllowed`, including policy paths; keep the admission-denylist parity table and the
+tracked/untracked policy-cascade refusal under a broader `scripts/lib` scope.

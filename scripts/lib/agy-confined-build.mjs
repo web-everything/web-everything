@@ -12,7 +12,6 @@ import { buildSandboxEnv, buildSandboxProfile, preparePrivateAgyHome, sandboxedS
 import { readAgyHold, saveAgyHold } from './antigravity-run-evidence.mjs';
 import { resolveCascade, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { isAgyFixPathAllowed } from './agy-fix-admission.mjs';
-import { criticalWorkVerdict } from './critical-work.mjs';
 import { fenceUntrusted, FENCED_DATA_RULE } from './mandate-fence.mjs';
 
 // The juror's SAFE_GIT is private; keep its pins at every git boundary, including injected exec.
@@ -240,8 +239,7 @@ export async function runConfinedAgyBuild({ task, laneDir, scope, kind, size, mo
     const diffFlags = ['--no-ext-diff', '--no-textconv', '--no-renames'];
     const raw = cloneGit(['-C', clone, 'diff', '--raw', '-z', ...diffFlags, startHead]).split('\0');
     const paths = [];
-    const rejectPath = p => !isAgyFixPathAllowed(p, kind) || !inScope(p, scope) || p.split('/').includes('.gitattributes')
-      || criticalWorkVerdict({ taskType: kind, filesTouched: [p] }).critical !== false;
+    const rejectPath = p => !isAgyFixPathAllowed(p, kind) || !inScope(p, scope);
     for (let i = 0; i < raw.length && raw[i]; i += 2) {
       const match = /^:(\d{6}) (\d{6}) [a-f0-9]+ [a-f0-9]+ ([AMD])$/.exec(raw[i]);
       const p = raw[i + 1];
