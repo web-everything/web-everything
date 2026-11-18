@@ -70,8 +70,8 @@ describe('longshore registry entry', () => {
   });
   it('scope routing and locus table', () => {
     expect(deliveryLocusForScope('longshore:backlog/x.md')).toEqual({ multiRepo: false, keys: ['longshore'] });
-    expect(LOCI.longshore.commitTarget).toBe('longshore');
-    expect(LOCUS_NAMES.has('longshore')).toBe(true);
+    expect(LOCI.longshore).toBeUndefined(); // authored-locus allowlist stays closed until the citation/close-out slice
+    expect(LOCUS_NAMES.has('longshore')).toBe(false);
   });
   it('backlog loader maps longshore: scope to the longshore locus only', () => {
     const b = require('../../../src/_data/backlog.js');
