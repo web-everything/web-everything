@@ -1,3 +1,4 @@
+import { decideSetLabel, buildVerdictComment } from '../../review-set-label.mjs';
 import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { existsSync, readFileSync, statSync, mkdtempSync, rmSync, writeFileSync, symlinkSync, mkdirSync, linkSync, truncateSync } from 'node:fs';
@@ -36,10 +37,18 @@ const acceptedRedTeamPr = () => {
 };
 
 describe('red-team sent-back fix context', () => {
+  it('the sanctioned hand-back records pending review without fabricating a changes verdict or a second counted round', () => {
+    const body = buildVerdictComment({ to: 'rearm', actor: 'fix agent', headSha: 'b'.repeat(40) });
+    expect(body).toContain('pending independent re-review');
+    expect(body).not.toContain('changes requested');
+    expect(body).not.toContain('review — accepted');
+    expect(body).not.toContain('<!-- reviewed-sha:');
+    expect(countRedTeamFixComments([{ author: { login: 'web-everything' }, body }])).toBe(0);
+  });
   it('uses the gate findings even without a changes-requested review comment', () => {
     const context = renderPrContext(acceptedRedTeamPr());
     expect(context).toContain('Gate break to repair');
-    expect(context).toContain('Never rearm review');
+    expect(context).toContain('review:pending for independent re-review');
   });
   it('refuses unread gate evidence instead of falling back to an unrelated review', () => {
     const pr = acceptedRedTeamPr();
@@ -47,10 +56,10 @@ describe('red-team sent-back fix context', () => {
     pr.comments.push({ body: '🔁 review — changes requested\nUNRELATED' });
     expect(() => renderPrContext(pr)).toThrow('no trusted current-head red-team send-back');
   });
-  it('fences the gate findings and gives fresh and resumed prompts the accepted-head hand-back', () => {
+  it('fences the gate findings and gives fresh and resumed prompts the independent re-review hand-back', () => {
     const text = withPlannedContext('BRIEF', { mode: 'red-team-sent-back', redTeamSentBack: { findings: ['Gate break'] } });
     expect(text).toContain('push the same PR branch');
-    expect(text).toContain('preserve review:accepted');
+    expect(text).toContain('--to=rearm --expect-head=<pushed-sha>');
     expect(text).toContain('<findings>');
     expect(text).toContain('Gate break');
   });
@@ -147,13 +156,23 @@ describe('runFixCli', () => {
     };
     return { calls, envs, run, spawn, owed, pendingRearm, io: { persistEvidence: () => {}, readLease: () => ({ holder: 'test-holder' }), recordPush: () => {}, run, pendingRearm, readComments: async () => [{ createdAt: '2026-01-01', body: '🔁 review — changes requested\nFIX THE THING' }], releaseClaim: async () => ({ released: [] }), recordOutcome: () => {}, recordRouted: () => ({}), appendLoopRow: () => {}, removePrompt: () => {}, readPrompt: () => 'BRIEF', resolveProvider: () => ({ spawn }), weRoot: '/we', write: () => {}, writeErr: () => {} } };
   };
-  it('pushes an accepted red-team repair to the same branch without rearm, even under fail policy', async () => {
+  it('pushes an accepted red-team repair and drops acceptance and readiness through the sanctioned writer', async () => {
     vi.stubEnv('WE_FIX_REARM_NOTHING_TO_REARM', 'fail');
     const m = mk(['a'.repeat(40), 'b'.repeat(40)]);
     const pr = acceptedRedTeamPr();
+    pr.labels.push('ready-to-merge');
     const posted = [];
     const run = (cmd, args, opts) => {
       const result = m.run(cmd, args, opts);
+      if (args[0] === '/we/scripts/review-set-label.mjs') {
+        expect(m.calls.some(c => c.includes('push'))).toBe(true);
+        expect(countRedTeamFixComments(posted)).toBe(1);
+        expect(args).toEqual(['/we/scripts/review-set-label.mjs', '7', '--repo=o/r', '--to=rearm', `--expect-head=${'b'.repeat(40)}`]);
+        const decision = decideSetLabel({ to: args.find(a => a.startsWith('--to=')).slice(5), currentLabels: pr.labels });
+        expect(decision.allowed).toBe(true);
+        pr.labels = pr.labels.map(l => typeof l === 'string' ? l : l.name).filter(l => !decision.removeLabels.includes(l));
+        pr.labels.push(decision.addLabel);
+      }
       if (cmd === 'gh' && args.includes('comment') && args.includes('--body-file')) {
         expect(m.calls.some(c => c.includes('push'))).toBe(true);
         posted.push({ author: { login: 'web-everything' }, body: readFileSync(args.at(-1), 'utf8') });
@@ -162,7 +181,10 @@ describe('runFixCli', () => {
     };
     const result = await runFixCli(argv, { ...m.io, run, readComments: async () => pr.comments });
     expect(result.code).toBe(0);
-    expect(result.result).toContain('preserved review:accepted');
+    expect(result.result).toContain('re-armed review:pending');
+    expect(pr.labels).toContain('review:pending');
+    expect(pr.labels).not.toContain('review:accepted');
+    expect(pr.labels).not.toContain('ready-to-merge');
     expect(m.calls.filter(c => c.includes('push'))).toHaveLength(1);
     expect(m.calls.find(c => c.includes('push'))).toContain('HEAD:refs/heads/lane/7-x');
     expect(m.calls.flat().some(a => String(a).endsWith('rearm-review.mjs'))).toBe(false);
@@ -194,6 +216,20 @@ describe('runFixCli', () => {
       expect(result.result).toContain('re-armed review:pending');
       expect(m.calls.flat().some(a => String(a).endsWith('rearm-review.mjs'))).toBe(true);
     });
+  it('retains pending debt when the red-team label writer refuses, even under the ordinary no-op policy', async () => {
+    vi.stubEnv('WE_FIX_REARM_NOTHING_TO_REARM', 'noop');
+    const m = mk(['a'.repeat(40), 'b'.repeat(40)]);
+    const pr = acceptedRedTeamPr();
+    const run = (cmd, args, opts) => {
+      const result = m.run(cmd, args, opts);
+      if (args[0] === '/we/scripts/review-set-label.mjs') throw new Error('nothing to re-arm');
+      return cmd === 'gh' && args.includes('view') ? JSON.stringify(pr) : result;
+    };
+    const result = await runFixCli(argv, { ...m.io, run, readComments: async () => pr.comments });
+    expect(result.code).toBe(1);
+    expect(m.owed.sha).toBe('b'.repeat(40));
+    expect(m.pendingRearm.clear).not.toHaveBeenCalled();
+  });
   it('fails the hand-back and retains pending debt if the counted red-team round cannot be posted', async () => {
     const m = mk(['a'.repeat(40), 'b'.repeat(40)]);
     const pr = acceptedRedTeamPr();

@@ -399,7 +399,7 @@ export function renderPrContext(json) {
   if (hasRedTeamSentBackLabels(pr)) {
     const findings = redTeamSentBackFindings(pr);
     if (!findings.length) throw new LauncherError('no-finding: no trusted current-head red-team send-back');
-    return '## Red-team sent-back findings (authoritative ask)\nRepair and push the same branch; preserve review:accepted. Never rearm review.\n'
+    return '## Red-team sent-back findings (authoritative ask)\nRepair and push the same branch; hand the new head back as review:pending for independent re-review.\n'
       + `${FENCED_DATA_RULE}\n${fenceUntrusted('findings', JSON.stringify(findings))}\n`;
   }
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
@@ -730,7 +730,7 @@ export async function runFixCli(argv = [], {
     const brief = assertBriefTaskContent(readPrompt(launch.promptFile));
     // The launcher has the network, the agent does not: fetch the reviewer's finding here and hand it over in the brief.
     const prHead = JSON.parse(run('gh', ['pr', 'view', pr, '--json', 'title,body,baseRefName,mergeable,headRefOid,labels', ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot }) || '{}');
-    let preserveAccepted = false;
+    let redTeamRepair = false;
     prHeadSha = prHead.headRefOid ?? null;
     const mergeConflictingBase = !launch.mergeOnto && prHead.mergeable === 'CONFLICTING';
     const mergeOnto = mergeConflictingBase ? PR_BASE_MERGE_TARGET : launch.mergeOnto;
@@ -744,14 +744,14 @@ export async function runFixCli(argv = [], {
     if (launch.repairKind === 'ci-heal') {
       if (hasRedTeamSentBackLabels(prHead)) {
         const comments = await readComments(pr, { repo: launch.repo });
-        preserveAccepted = redTeamSentBackFindings({ ...prHead, number: Number(pr), comments, commentsComplete: true }).length > 0;
+        redTeamRepair = redTeamSentBackFindings({ ...prHead, number: Number(pr), comments, commentsComplete: true }).length > 0;
       }
       const inputs = await readCiHeal({ repo: launch.repo, pr, run: (cmd, args, opts) => run(cmd, args, { cwd: weRoot, ...opts }) });
       if (!inputs.checks?.length) throw new LauncherError(`no-ci-failure: PR #${pr} has no failing check to heal`);
       prContext = renderCiHealContext(inputs);
     } else {
       const comments = await readComments(pr, { repo: launch.repo });
-      preserveAccepted = hasRedTeamSentBackLabels(prHead)
+      redTeamRepair = hasRedTeamSentBackLabels(prHead)
         && redTeamSentBackFindings({ ...prHead, number: Number(pr), comments, commentsComplete: true }).length > 0;
       openSendBacks = openOperatorSendBacks({ comments, headRefOid: prHeadSha });
       const safety = resolveFixSafety();
@@ -834,10 +834,13 @@ export async function runFixCli(argv = [], {
     const risky = riskyLaneConfig(configBefore);
     if (risky.length) throw new LauncherError(`lane git config defines command/credential/remote-rewrite keys (${risky.join(', ')}); refusing to run in it`);
     before = checkLane(prHeadSha).laneHead;
-    const rearmReview = () => {
-      if (preserveAccepted) {
-        write(`fix-run: PR #${pr} re-arm skipped — preserving review:accepted\n`);
-        return;
+    const rearmReview = head => {
+      if (redTeamRepair) {
+        // Use the sanctioned writer, pinned to the repaired head. The separate red-team marker already
+        // counts this repair; an ordinary rearm-review marker would charge the shared cap twice.
+        // Keep this outside the ordinary nothing-to-rearm no-op policy: a failed hand-back remains owed.
+        return run('node', [resolve(weRoot, 'scripts', 'review-set-label.mjs'), pr,
+          ...(launch.repo ? [`--repo=${launch.repo}`] : []), '--to=rearm', `--expect-head=${head}`], { cwd: weRoot });
       }
       try {
         return run('node', [resolve(weRoot, 'scripts', 'conveyor', 'rearm-review.mjs'), pr, ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot });
@@ -851,15 +854,15 @@ export async function runFixCli(argv = [], {
       }
     };
     const rearm = head => {
-      if (preserveAccepted) {
+      if (redTeamRepair) {
         // Publication is required before clearing the pending hand-back: this path never posts a rearm marker.
-        withMessageFile(`${RED_TEAM_FIX_COMMENT_MARKER}\n\nRed-team send-back repair pushed: ${head}. Preserved review:accepted.\n`,
+        withMessageFile(`${RED_TEAM_FIX_COMMENT_MARKER}\n\nRed-team send-back repair pushed: ${head}. Independent re-review owed.\n`,
           file => run('gh', ['pr', 'comment', pr, ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot }));
       }
       // Best effort: the push already landed, and a label hiccup must never stop the re-arm (the CI-lifecycle label pass relabels it).
       try { markFixPushAwaitingCi({ repo: launch.repo, pr, head }, { run: (cmd, args) => run(cmd, args, { cwd: weRoot }), recordPush }); }
       catch (e) { writeErr(`fix-run: PR #${pr} CI hand-off failed, re-arming anyway: ${String(e?.message ?? e).split('\n')[0]}\n`); }
-      return rearmReview();
+      return rearmReview(head);
     };
     // Recover only at the recorded tip. An evidence marker precedes publication, so it alone cannot prove that
     // publication succeeded: unresolved requests must go through the agent/evidence path again.
@@ -869,7 +872,7 @@ export async function runFixCli(argv = [], {
       comments: await readComments(pr, { repo: launch.repo }), headRefOid: prHeadSha,
     }).length);
     if (recoverPending) {
-      if (pendingEvidence) rearmReview();
+      if (pendingEvidence) rearmReview(before);
       else rearm(before);
       pendingRearm.clear(launch.repo, pr);
       const result = `PR #${pr} (${pendingEvidence ? 'evidence already posted for' : 'already pushed'} ${before.slice(0, 9)}; re-armed review:pending after a failed earlier re-arm)`;
@@ -1206,7 +1209,7 @@ export async function runFixCli(argv = [], {
       const evidence = await postEvidence(after);
       if (openSendBacks.length || evidence.reason) {
         if (evidence.posted) {
-          rearmReview();
+          rearmReview(after);
           pendingRearm.clear(launch.repo, pr);
           reason = `evidence posted for send-back(s) ${openSendBacks.map(item => item.id).join(', ')}; review re-armed: ${finalMessage}`;
         } else {
@@ -1231,7 +1234,7 @@ export async function runFixCli(argv = [], {
       await postEvidence(after);
       rearm(after);
       pendingRearm.clear(launch.repo, pr);
-      result = `PR #${pr} (pushed ${after.slice(0, 9)}, ${preserveAccepted ? 'preserved review:accepted' : 're-armed review:pending'})`;
+      result = `PR #${pr} (pushed ${after.slice(0, 9)}, re-armed review:pending)`;
       outcome = FIX_RUN_OUTCOME.PUSHED; reason = finalMessage || `pushed ${after.slice(0, 9)}`;
     }
     write(`fix-run: PR #${pr} finished - ${result}\n`);

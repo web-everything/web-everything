@@ -2166,7 +2166,7 @@ describe('stale-base mechanical fix brief', () => {
     expect(refusals).toEqual([]);
     expect(planned).toMatchObject([{ mode: 'red-team-sent-back', redTeamSentBack }]);
     expect(withPlannedContext('brief', planned[0])).toContain('Gate break');
-    expect(withPlannedContext('brief', planned[0])).toContain('preserve review:accepted');
+    expect(withPlannedContext('brief', planned[0])).toContain('--to=rearm --expect-head=<pushed-sha>');
   });
   const staleBase = { missing: ['standards', 'new-job'], defaultBranch: 'main' };
   it('leaves ordinary prompts alone and spells out the mechanical-only hand-back', () => {

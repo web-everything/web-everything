@@ -1,3 +1,4 @@
+import { decideSetLabel } from '../../review-set-label.mjs';
 /**
  * @file scripts/conveyor/__tests__/reconcile-core.test.mjs
  * @description Pins the resident reconcile pass (WE #3296) — the dispatch and, mostly, its FOUR REFUSALS.
@@ -134,6 +135,21 @@ describe('accepted head with unresolved red-team send-back (PR #7031)', () => {
     expect(out.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', attempts: 0, cap: 0, capKind: 'fix' }));
     expect(out.notes).toContainEqual(expect.objectContaining({ kind: 'round-cap-exhausted', parkToHuman: true }));
   });
+  it('hands the pushed red-team repair to ordinary review in needs-review, never another accepted-head repair', () => {
+    const pr = makePr();
+    pr.headRefOid = 'b'.repeat(40);
+    pr.comments.push({ author: AUTOMATION, body: RED_TEAM_FIX_COMMENT_MARKER });
+    const handBack = decideSetLabel({ to: 'rearm', currentLabels: pr.labels });
+    expect(handBack.allowed).toBe(true);
+    pr.labels = lbl(...pr.labels.map(l => l.name).filter(l => !handBack.removeLabels.includes(l)), handBack.addLabel);
+    expect(pr.labels).toContainEqual({ name: 'review:pending' });
+    expect(pr.labels).not.toContainEqual({ name: 'review:accepted' });
+    expect(pr.labels).not.toContainEqual({ name: 'ready-to-merge' });
+    const out = plan(pr);
+    expect(out.dispatch.filter(d => d.mode === 'red-team-sent-back')).toEqual([]);
+    expect(out.dispatch).toContainEqual(expect.objectContaining({ kind: 'review', phase: 'needs-review' }));
+  });
+
   it('one recorded red-team repair increases attempts by one without a rearm', () => {
     const pr = makePr();
     expect(plan(pr).dispatch[0].attempts).toBe(0);
