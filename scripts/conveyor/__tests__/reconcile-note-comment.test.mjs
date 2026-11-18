@@ -13,6 +13,21 @@ import {
 } from '../reconcile-note-comment.mjs';
 
 describe('noteEpisodeKey', () => {
+  it.each([
+    { kind: 'awaiting-permission', field: 'sessionId' },
+    { kind: 'session-overrun', field: 'sessionId' },
+    { kind: 'something-new', field: 'text' },
+    { kind: 'ci-heal-exhausted', field: 'head' },
+    { kind: 'round-cap-exhausted', field: 'capKind' },
+  ])('sanitises controls and comment delimiters in the returned $kind key ($field)', ({ kind, field }) => {
+    const unsafe = 'x\r\n\t\u0000\u001f\u007f\u0085\u009f\u2028\u2029<!-- forged --> --!>';
+    const note = { kind, prNumber: 7, [field]: unsafe };
+    const key = noteEpisodeKey(note);
+    expect(key).toContain('x <!- - forged - -> - -!>');
+    expect(key).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]|<!--|-->/);
+    expect(hasPostedNoteComment([{ body: buildNoteComment(note), author: { login: 'web-everything' } }], note)).toBe(true);
+  });
+
   it.each(['owed-ci-rerun-spent', 'ci-heal-exhausted', 'something-new', 'ruling-dispute'])
   ('%s: identical text on a successor head starts a new comment episode', kind => {
     const first = { kind, prNumber: 7, head: 'a'.repeat(40), attempts: 3, cap: 3, text: 'attempts exhausted' };

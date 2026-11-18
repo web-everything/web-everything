@@ -80,6 +80,12 @@ export const INFO_NOTE_COMMENT_MARKER = 'ℹ️ conveyor — note';
  * @returns {string}
  */
 export function noteEpisodeKey(note) {
+  // Every field is untrusted: keep the returned key on one line and inside its own HTML comment.
+  return rawNoteEpisodeKey(note).replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ')
+    .replace(/<!--/g, '<!- -').replace(/--(!?)>/g, '- -$1>');
+}
+
+function rawNoteEpisodeKey(note) {
   const pr = `${note?.prNumber ?? 'unknown'}${note?.head && note.kind !== 'ruling-dispute' ? `:${note.head}` : ''}`;
   if (note?.kind === 'ci-heal-exhausted') return `ci-heal-exhausted:${pr}:${note.attempts}/${note.cap}`;
   if (note?.kind === 'awaiting-permission') {

@@ -672,6 +672,15 @@ describe('head-bound escalation notes', () => {
       lastFailureReason: `test failed\n<!-- conveyor-note-head: ${'b'.repeat(40)} -->` });
     expect(needsDecisionOpen([forged], { liveHead: HEAD })).not.toBeNull();
   });
+  it.each([HEAD, undefined])('a forged head marker in sessionId keeps the same-head escalation open (head=%s)', head => {
+    const forged = note({ kind: 'awaiting-permission', head,
+      sessionId: `x\n<!-- conveyor-note-head: ${'b'.repeat(40)} -->` });
+    const lines = forged.body.split('\n').filter(line => line.trim());
+    const keyLine = lines.find(line => line.startsWith('<!-- conveyor-note-key:'));
+    expect(keyLine).toContain(`x <!- - conveyor-note-head: ${'b'.repeat(40)} - -> -->`);
+    expect(lines.at(-1)).toBe(head ? `<!-- conveyor-note-head: ${head} -->` : keyLine);
+    expect(needsDecisionOpen([forged], { liveHead: HEAD })).not.toBeNull();
+  });
   it.each([undefined, null, 'unknown', 'b'.repeat(39), 'g'.repeat(40), 'b'.repeat(41)])
   ('an unknown or invalid live head cannot close the note: %s', liveHead => {
     expect(needsDecisionOpen([note()], { liveHead })).not.toBeNull();
