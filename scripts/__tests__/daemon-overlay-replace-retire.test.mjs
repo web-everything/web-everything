@@ -288,7 +288,12 @@ describe('guarded urgent-failed unload', () => {
     let dropped = false;
     const args = { root: f.clone, ref: entry.ref, expectedTip: tip,
       expectedEntry: snapshot === 'missing' ? undefined : snapshot === 'changed' ? { ...entry, addedAt: 'newer' } : entry,
-      mode: 'urgent-failed', env: f.env, deps: {
+      mode: 'urgent-failed', trackingId: 'urgent-attempt', env: f.env, deps: {
+        readUrgentLoads: () => {
+          expect(readdirSync(f.env.WE_DAEMON_OVERLAY_DIR).some(n => n.endsWith('.add-guard.lock'))).toBe(true);
+          return [{ type: 'prototype-load.urgent', trackingId: 'urgent-attempt',
+            clone: f.clone, registration: { clone: f.clone, ref: entry.ref, sha: tip } }];
+        },
         tip: () => {
           if (dropped && outcome === 'post-drop-moved') return 'f'.repeat(40);
           if (outcome === 'unreadable') throw new Error('offline');
@@ -310,6 +315,34 @@ describe('guarded urgent-failed unload', () => {
     expect(readPendingDrops(f.clone, f.env)).toEqual([]);
     expect(f.events().at(-1)).toMatchObject({ reason: 'urgent-failed', evidence: { urgentUnload: true } });
     expect(f.events().at(-1).operatorReason).toBeUndefined();
+  });
+  it.each(['pinned-closed-pr', 'edge-resolution-recorded', 'pr-open', 'fetch-failed', 'history-unreadable', 'pr-state-unknown', 'unprovable'])('preserves the %s keep verdict for an authorized urgent request', async reason => {
+    const { f, args, tip } = await urgent();
+    args.deps.prove = () => ({ action: 'keep', reason, tip });
+    expect(await retireRegistration(args)).toMatchObject({ retired: false, refused: 'not-proved', proof: { reason } });
+    expect(f.list()).toEqual(['lane/urgent']);
+    expect(readPendingDrops(f.clone, f.env)).toEqual([]);
+  });
+  it.each(['reader-missing', 'unreadable', 'incomplete', 'absent', 'ref', 'sha', 'trackingId', 'clone', 'type', 'request-id'])('refuses %s urgent tracking evidence before dropping', async kind => {
+    const { f, args } = await urgent();
+    const records = [{ type: 'prototype-load.urgent', trackingId: args.trackingId, clone: f.clone,
+      registration: { clone: f.clone, ref: args.ref, sha: args.expectedTip } }];
+    if (kind === 'reader-missing') delete args.deps.readUrgentLoads;
+    else if (kind === 'unreadable') args.deps.readUrgentLoads = () => { throw new Error('corrupt ledger'); };
+    else if (kind === 'incomplete') args.deps.readUrgentLoads = () => null;
+    else {
+      if (kind === 'ref') records[0].registration.ref = 'lane/other';
+      if (kind === 'sha') records[0].registration.sha = 'f'.repeat(40);
+      if (kind === 'trackingId') records[0].trackingId = 'another-attempt';
+      if (kind === 'clone') records[0].clone = '/other';
+      if (kind === 'type') records[0].type = 'prototype-load.urgent-unloaded';
+      if (kind === 'request-id') delete args.trackingId;
+      args.deps.readUrgentLoads = () => kind === 'absent' ? [] : records;
+    }
+    expect(await retireRegistration(args)).toMatchObject({ retired: false,
+      refused: ['reader-missing', 'unreadable', 'incomplete'].includes(kind) ? 'urgent-tracking-unreadable' : 'urgent-tracking-required' });
+    expect(f.list()).toEqual(['lane/urgent']);
+    expect(readPendingDrops(f.clone, f.env)).toEqual([]);
   });
   it.each([{ mode: 'unknown' }, { expectedTip: 'bad' }, { expectedEntry: { ref: 'lane/other' } }])('refuses invalid urgent authorization %j', async override => {
     const { f, args } = await urgent();

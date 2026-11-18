@@ -47,6 +47,51 @@ describe('urgent CI sweep', () => {
     await f.run();
     expect(f.d.escalate).toHaveBeenCalledTimes(2);
   });
+  describe.each(['throws', 'incomplete', 'oversized', 'required-unreadable'])('unreadable CI timeout (%s)', kind => {
+    function unreadable() {
+      const f = fixture();
+      if (kind === 'throws') f.d.checks.mockImplementation(() => { throw new Error('API unavailable'); });
+      if (kind === 'incomplete') f.d.checks.mockReturnValue({ total_count: 1, check_runs: [] });
+      if (kind === 'oversized') f.d.checks.mockReturnValue({ total_count: 101, check_runs: [] });
+      if (kind === 'required-unreadable') f.d.required.mockImplementation(() => { throw new Error('workflow unavailable'); });
+      return f;
+    }
+    it('unloads after 24h through removal and tracks adoption despite unreadable CI', async () => {
+      const f = unreadable();
+      f.d.now = () => '2026-11-19T12:00:00Z';
+      expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+      expect(f.d.remove).toHaveBeenCalledWith(load, { ref: load.registration.ref });
+      expect(f.settlements()[0]).toMatchObject({ unloadReason: expect.stringContaining('after 24h') });
+      await f.run();
+      expect(f.d.remove).toHaveBeenCalledTimes(1);
+    });
+    it('escalates once after 6h across repeated API failures without unloading', async () => {
+      const f = unreadable();
+      f.d.now = () => '2026-11-18T18:00:00Z';
+      expect(await f.run()).toMatchObject({ results: [{ status: 'needs-you' }] });
+      await urgentSweep({}, { ...f.d });
+      expect(f.d.escalate).toHaveBeenCalledTimes(1);
+      expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ evidence: ['urgent load has no CI verdict after 6h'] }));
+      expect(f.d.remove).not.toHaveBeenCalled();
+    });
+  });
+  it('preserves a recorded green completion beyond 24h when CI becomes unreadable', async () => {
+    const f = fixture();
+    await f.run();
+    f.d.now = () => '2026-11-19T13:00:00Z';
+    f.d.checks.mockImplementation(() => { throw new Error('API unavailable'); });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'needs-you' }] });
+    expect(f.d.remove).not.toHaveBeenCalled();
+  });
+  it('raises NEEDS-YOU when guarded expiry retirement refuses a protected overlay', async () => {
+    const f = fixture();
+    f.d.now = () => '2026-11-19T13:00:00Z';
+    f.d.checks.mockImplementation(() => { throw new Error('API unavailable'); });
+    f.d.remove.mockReturnValue({ retired: false, refused: 'not-proved' });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'needs-you', detail: 'overlay removal refused: not-proved' }] });
+    expect(f.events).toEqual([]);
+    expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ evidence: ['overlay removal refused: not-proved'] }));
+  });
   it.each(['bad', undefined, '2026-11-19T12:00:00Z'])('fails closed on missing or invalid load time %s', async at => {
     const f = fixture([]);
     f.loads[0] = { ...load, at };
@@ -615,7 +660,8 @@ describe('production sweep storage and removal guards', () => {
     const ghExec = vi.fn((cmd, args) => JSON.stringify(args[0] === 'repo'
       ? { nameWithOwner: 'org/repo', url: load.repo } : args[1].includes('/actions/runs') ? workflows : { total_count: 0, check_runs: [] }));
     const retire = vi.fn(() => ({ retired: true })), recover = vi.fn(() => ({ pending: [] })), env = {};
-    const io = { readFileSync: p => {
+    const io = { statSync: () => ({ size: 1024 }), readFileSync: p => {
+      if (p.endsWith('/coordination/urgent-loads.jsonl')) return `${JSON.stringify(load)}\n`;
       if (p.endsWith('prototype-load.json')) return JSON.stringify({ testWorkflowPath: '.github/workflows/custom.yml' });
       throw Object.assign(new Error('missing'), { code: 'ENOENT' });
     } };
@@ -635,7 +681,9 @@ describe('production sweep storage and removal guards', () => {
     expect(recover.mock.invocationCallOrder[0]).toBeLessThan(retire.mock.invocationCallOrder[0]);
     expect(recover.mock.invocationCallOrder[1]).toBeLessThan(retire.mock.invocationCallOrder[1]);
     expect(retire).toHaveBeenCalledWith({ root: load.clone, ref: load.registration.ref,
-      expectedTip: load.registration.sha, expectedEntry: entry, mode: 'urgent-failed', by: 'urgent-sweep', env });
+      expectedTip: load.registration.sha, expectedEntry: entry, mode: 'urgent-failed', trackingId: load.trackingId,
+      by: 'urgent-sweep', env, deps: { readUrgentLoads: expect.any(Function) } });
+    expect(retire.mock.calls[0][0].deps.readUrgentLoads()).toEqual([load]);
   });
   it('retrieves failures before the production workflow and required-job readers', async () => {
     const exec = vi.fn((cmd, args) => {

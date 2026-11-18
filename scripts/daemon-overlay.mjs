@@ -458,15 +458,16 @@ export function removeRegistration({ root, ref, expectedTip, by = null, reason =
  * the registration is restored (`tip-moved-restored`). A push after the check is a push to an unregistered ref.
  * Runs under the add-guard lock (no guarded add can interleave) with a durable drop intent (see settlePendingDrops).
  * Library-only `mode: 'urgent-failed'` permits a failed/expired urgent CI load to withdraw even when
- * retirement proof says keep. Requires an explicit entry snapshot and exact live tip; all drop guards still apply.
- * The sweep supplies CI authorization; this mode never supplies operator retirement evidence.
- * `deps` ({prove, tip, afterDrop}) is a test seam; production passes none.
+ * retirement proof says unique-commits-not-on-main. Requires an explicit entry snapshot, exact live tip,
+ * and a matching trackingId in the coordination urgent-loads ledger via deps.readUrgentLoads.
+ * Other keep verdicts still refuse. This mode never supplies operator retirement evidence.
+ * `deps.readUrgentLoads` reads the bounded coordination ledger; {prove, tip, afterDrop} are test seams.
  * Same race class as the rebuild's own auto-drop (`daemon-rebuild/prepare.mjs` removes `in-main`/`pr-merged` decisions by
  * name with no tip re-check at all); this path adds a re-proof, a pre- and post-drop tip check and a durable intent.
  */
 // `actor` is the authenticated lowercase login verified by the explicit withdrawal caller.
 // Automatic retirement callers omit it and cannot produce operator retirement evidence.
-export async function retireRegistration({ root, ref, expectedTip, expectedEntry, mode = 'retired', by = null, actor, env = process.env, deps = {} }) {
+export async function retireRegistration({ root, ref, expectedTip, expectedEntry, mode = 'retired', trackingId, by = null, actor, env = process.env, deps = {} }) {
   const prove = deps.prove ?? ((entry) => proveRetirement({ root, entry, env }));
   const tip = deps.tip ?? ((r) => remoteTip({ root, ref: r, env }));
   return withAddGuardLock(root, env, async () => {
@@ -479,8 +480,17 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
     if (mode === 'urgent-failed' && (!expectedEntry || expectedEntry.ref !== ref || !/^[a-f0-9]{40}$/.test(expectedTip ?? ''))) return refuse('urgent-snapshot-required');
     if (!entry) return refuse('not-registered');
     if (expectedEntry !== undefined && !isDeepStrictEqual(registrationIdentity(entry), registrationIdentity(expectedEntry))) return refuse('registration-changed');
+    if (mode === 'urgent-failed') {
+      let records;
+      try { records = await deps.readUrgentLoads?.(); } catch { return refuse('urgent-tracking-unreadable'); }
+      if (!Array.isArray(records)) return refuse('urgent-tracking-unreadable');
+      if (typeof trackingId !== 'string' || !trackingId.trim() || !records.some(r =>
+        r?.type === 'prototype-load.urgent' && r.trackingId === trackingId
+        && r.clone === root && r.registration?.clone === root
+        && r.registration.ref === ref && r.registration.sha === expectedTip)) return refuse('urgent-tracking-required');
+    }
     let proof = prove(entry);
-    if (proof.action === 'keep' && mode === 'urgent-failed') {
+    if (proof.action === 'keep' && proof.reason === 'unique-commits-not-on-main' && mode === 'urgent-failed') {
       // CI failure / expired verdict authorizes withdrawal, not a claim that the work landed.
       let current;
       try { current = tip(ref); } catch { /* unreadable evidence refuses below */ }

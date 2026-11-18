@@ -93,7 +93,8 @@ export function createSweepDeps({ home = homedir(), io = fs, exec = execFileSync
       const recovery = await recover({ root: r.clone, by: 'urgent-sweep', env });
       if (!Array.isArray(recovery?.pending) || recovery.pending.length) throw new Error('unsettled overlay drops; run recover-drops for the clone before retrying');
       return retire({ root: r.clone, ref: r.registration.ref, expectedTip: r.registration.sha,
-        expectedEntry, mode: 'urgent-failed', by: 'urgent-sweep', env });
+        expectedEntry, mode: 'urgent-failed', trackingId: r.trackingId, by: 'urgent-sweep', env,
+        deps: { readUrgentLoads: () => read('urgent-loads') } });
     },
     event: r => append('urgent-loads', r), settle: r => append('urgent-sweep-state', r),
     escalate: packet => writeEscalationPacket(packet, { dir: join(home, 'workspace/.operations/escalations'), fs: io }),
@@ -221,31 +222,38 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           } else results.push({ id, status: receipt.status });
           continue;
         }
-        const data = await deps.checks(r);
-        let unload = Array.isArray(data?.check_runs) && data.check_runs.some(c => failedCheck(c, r.sha));
-        let required, checks, requiredSucceeded, unloadReason;
-        if (!unload) {
-          validateChecks(data, r.sha);
-          required = await deps.required(r);
-          if (!Array.isArray(required) || !required.includes('test')) throw new Error('unreadable required CI jobs');
-          checks = data.check_runs.filter(c => c.app.id === TEST_CHECK_APP_ID
-            && required.some(n => c.name === n || c.name.startsWith(`${n} (`)));
-          requiredSucceeded = testWorkflowBound(testCheckEvidence(data, r.sha), data.workflows, r.sha, data.testWorkflowPath)
-            && required.every(n => checks.some(c => c.name === n || c.name.startsWith(`${n} (`)))
-            && checks.every(c => c.status === 'completed' && c.conclusion === 'success');
-          if (!requiredSucceeded) {
-            const loadedAt = Date.parse(r.at), now = Date.parse(deps.now());
-            if (!Number.isFinite(loadedAt) || !Number.isFinite(now) || now < loadedAt)
-              throw new Error('unreadable urgent load timestamp; inspect CI or unload manually');
-            const age = now - loadedAt;
-            if (age >= 6 * 60 * 60 * 1000 && !ciEscalated.has(id)) {
-              await escalate(`${id}-no-ci-verdict`, r.ref, 'urgent load has no CI verdict after 6h');
-              await deps.settle({ id, ref: r.ref, sha: r.sha, at: deps.now(), status: 'monitoring-ci', noVerdictEscalated: true });
-              ciEscalated.add(id);
-            }
-            unload = age >= 24 * 60 * 60 * 1000;
-            if (unload) unloadReason = `Unloaded ${r.sha}: urgent load has no CI verdict after 24h. Inspect and repair before reloading.`;
+        const loadedAt = Date.parse(r.at), now = Date.parse(deps.now());
+        if (!Number.isFinite(loadedAt) || !Number.isFinite(now) || now < loadedAt)
+          throw new Error('unreadable urgent load timestamp; inspect CI or unload manually');
+        const age = now - loadedAt;
+        let data, unload = false, requiredSucceeded = false, unloadReason, evidenceError;
+        try {
+          data = await deps.checks(r);
+          unload = Array.isArray(data?.check_runs) && data.check_runs.some(c => failedCheck(c, r.sha));
+          if (!unload) {
+            validateChecks(data, r.sha);
+            const required = await deps.required(r);
+            if (!Array.isArray(required) || !required.includes('test')) throw new Error('unreadable required CI jobs');
+            const checks = data.check_runs.filter(c => c.app.id === TEST_CHECK_APP_ID
+              && required.some(n => c.name === n || c.name.startsWith(`${n} (`)));
+            requiredSucceeded = testWorkflowBound(testCheckEvidence(data, r.sha), data.workflows, r.sha, data.testWorkflowPath)
+              && required.every(n => checks.some(c => c.name === n || c.name.startsWith(`${n} (`)))
+              && checks.every(c => c.status === 'completed' && c.conclusion === 'success');
           }
+        } catch (e) { evidenceError = e; }
+        if (!unload && !requiredSucceeded && !green.has(id)) {
+          if (age >= 6 * 60 * 60 * 1000 && !ciEscalated.has(id)) {
+            await escalate(`${id}-no-ci-verdict`, r.ref, 'urgent load has no CI verdict after 6h');
+            await deps.settle({ id, ref: r.ref, sha: r.sha, at: deps.now(), status: 'monitoring-ci', noVerdictEscalated: true });
+            ciEscalated.add(id);
+          }
+          unload = age >= 24 * 60 * 60 * 1000;
+          if (unload) unloadReason = `Unloaded ${r.sha}: urgent load has no CI verdict after 24h. Inspect and repair before reloading.`;
+        }
+        if (evidenceError && !unload) {
+          if (age < 6 * 60 * 60 * 1000 || green.has(id)) throw evidenceError;
+          results.push({ id, status: 'needs-you', detail: String(evidenceError.message) });
+          continue;
         }
         if (unload) {
           const removal = await deps.remove(r, overlay.overlays.find(e => e.ref === r.registration.ref));
