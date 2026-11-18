@@ -52,8 +52,10 @@ export async function traceStuckPr({ repo, pr, head, kind, stateDir, now = Date.
     const evidence = Promise.all(['why', 'pr-trace'].map(async op => {
       try {
         const result = await (run ?? (args => runner(args, env)))([op, `--pr=${pr}`, `--repo=${repo}`, '--json']);
-        if (!result?.verdict || typeof result.verdict !== 'object') throw Error('missing verdict');
-        return result.verdict;
+        if (result?.verdict && typeof result.verdict === 'object' && !Array.isArray(result.verdict)) return result.verdict;
+        const field = op === 'pr-trace' ? 'likelyBlocker' : 'owner';
+        if (!result || Array.isArray(result) || typeof result[field] !== 'string') throw Error('missing verdict');
+        return result;
       } catch { report(); return null; }
     }));
     let why, trace;

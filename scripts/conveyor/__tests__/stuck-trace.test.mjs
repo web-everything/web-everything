@@ -20,7 +20,7 @@ function fixture(t) {
     looping: [{ source: 'fix', count: 12 }], latest: { fix: 'refused #17', drain: 'behind #9' },
     latestAtET: { fix: '07:00 ET', drain: '06:59 ET' }, unavailable: ['review ledger'], incomplete: [] };
   const options = { repo, pr: 17, head, kind: 'ready-stuck', stateDir: root, now, env: {},
-    run: async args => { calls.push(args); return { verdict: args[0] === 'why' ? why : trace }; },
+    run: async args => { calls.push(args); return args[0] === 'why' ? { runId: 'why-17', verdict: why } : trace; },
     emit: event => { events.push(event); return true; } };
   return { root, options, events, calls, why, trace };
 }
@@ -47,6 +47,26 @@ test('one event contains owner, suggested operation, gates, holds, stage, labels
   for (const text of ['root cause: waiting behind', 'operator', 'human ruling', 'unpark', 'OPEN', 'review:human',
     'FAILURE', 'PENDING', 'build hold', 'landingHolder', 'label conflicts', 'looping', 'fix (07:00 ET)', 'drain (06:59 ET)', 'review ledger'])
     assert.ok(detail.note.includes(text), text);
+});
+
+test('reads both direct and wrapped verdict shapes for each operation', async t => {
+  for (const wrapped of [false, true]) {
+    const f = fixture(t);
+    await traceStuckPr({ ...f.options, run: async ([op]) => {
+      const verdict = op === 'why' ? f.why : f.trace;
+      return wrapped ? { runId: 'test-17', verdict } : verdict;
+    } });
+    assert.equal(f.events[0].detail.owner, f.why.owner);
+    assert.equal(f.events[0].detail.headline, f.trace.likelyBlocker);
+    assert.doesNotMatch(f.events[0].detail.note, /INCOMPLETE/);
+  }
+});
+
+test('unknown direct shapes emit incomplete evidence with a manual inspection fallback', async t => {
+  const f = fixture(t);
+  await traceStuckPr({ ...f.options, run: async () => ({ owner: 17, likelyBlocker: null }) });
+  assert.match(f.events[0].detail.note, /INCOMPLETE/);
+  assert.match(f.events[0].detail.note, /inspect manually/);
 });
 
 test('operation failure emits one incomplete note with unavailable fields and never retries', async t => {

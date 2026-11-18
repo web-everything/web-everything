@@ -100,9 +100,15 @@ export async function runMergeWatch({ repos = [], gh, now = new Date().toISOStri
       }
       if (compacted) save();
       const send = async event => {
+        // Defer delivery too, so its receipt cannot suppress next tick's trace.
+        if (TRACE_TRIGGERS.includes(event.kind) && calls + 12 > 128) {
+          budgetExhausted = true;
+          throw Error('GitHub trace tick budget exceeded');
+        }
         if (await emitEvent(event) === false) throw Error('event delivery unavailable');
         delivered++;
         if (TRACE_TRIGGERS.includes(event.kind)) {
+          calls += 12;
           try { await trace({ repo, pr: event.pr, head: event.detail?.head
             ?? open.find(p => p.number === event.pr)?.head?.sha,
           kind: event.kind, stateDir, now }); } catch { log('stuck-trace: hook unavailable'); }

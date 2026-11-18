@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import { join } from 'node:path';
 import { humanReviewHold } from '../../operations/pr-sweep-core.mjs';
+import { traceStuckPr } from '../stuck-trace.mjs';
 import { redTeamGateMarker } from '../../lib/red-team-gate.mjs';
 
 // Only the not-yet-shipped tool settings file is virtual. State and platform
@@ -281,6 +282,46 @@ describe('runMergeWatch — acceptedRedTeamClearAndClean (humanReviewHold + fina
     expect(emitEvent).toHaveBeenCalledTimes(140);
     expect(new Set(emitEvent.mock.calls.map(([event]) => event.pr)).size).toBe(140);
     expect(emitEvent.mock.calls.every(([event]) => event.kind === 'pr-merged')).toBe(true);
+  });
+
+  it('defers a trace near the tick budget without arming receipts, then traces next tick', async () => {
+    const target = readyPr({ number: 200, labels: labels('ready-to-merge'), mergeStateStatus: 'BLOCKED' });
+    prs.set(REPO, [...Array.from({ length: 115 }, (_, i) => readyPr({ number: i + 1 })), target]);
+    const read = gh.getMockImplementation();
+    gh.mockImplementation(args => {
+      if (args[0] === 'pr' && Number(args[2]) !== target.number) throw Error('view unavailable');
+      return read(args);
+    });
+    const run = vi.fn(async ([op]) => op === 'why'
+      ? { runId: 'why-200', verdict: { owner: 'operator' } } : { likelyBlocker: 'held' });
+    const trace = vi.fn(args => traceStuckPr({ ...args, run, emit: () => true }));
+    const options = { trace, readyStuck: { readLabelTime: () => at(0), readSkipReason: () => 'held' } };
+    expect(await tick(181, options)).toMatchObject({ incomplete: true });
+    expect(trace).not.toHaveBeenCalled();
+    expect(emitEvent).not.toHaveBeenCalled();
+    expect(fs.existsSync(join(stateDir, 'stuck-trace.json'))).toBe(false);
+    const state = JSON.parse(fs.readFileSync(join(stateDir, `${encodeURIComponent(REPO)}.json`), 'utf8'));
+    expect(state.prs[200].heads[HEAD].readyStuckAlerted).not.toBe(true);
+    expect(log.mock.calls.flat().join(' ')).toMatch(/operator.*inspect/i);
+    await tick(182, options);
+    expect(trace).toHaveBeenCalledTimes(1);
+    expect(run).toHaveBeenCalledTimes(2);
+    const receipts = JSON.parse(fs.readFileSync(join(stateDir, 'stuck-trace.json'), 'utf8'));
+    expect(receipts[`${REPO}#200@${HEAD}`]).toBeDefined();
+  });
+
+  it('charges twelve calls for a trace against subsequent guarded reads', async () => {
+    prs.set(REPO, Array.from({ length: 140 }, (_, i) => readyPr({ number: i + 1,
+      labels: labels('ready-to-merge'), mergeStateStatus: 'BLOCKED' })));
+    const read = gh.getMockImplementation();
+    gh.mockImplementation(args => {
+      if (args[0] === 'pr' && Number(args[2]) !== 1) throw Error('view unavailable');
+      return read(args);
+    });
+    const trace = vi.fn();
+    await tick(181, { trace, readyStuck: { readLabelTime: () => at(0), readSkipReason: () => 'held' } });
+    expect(trace).toHaveBeenCalledTimes(1);
+    expect(gh).toHaveBeenCalledTimes(128 - 12);
   });
 
   it('closed without merged_at is not proof of a merge', async () => {
