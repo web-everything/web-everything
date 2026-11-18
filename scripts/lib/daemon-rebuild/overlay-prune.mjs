@@ -45,7 +45,7 @@ function notify(root, env, row) {
   const kind = row.reason === 'conflict' ? 'overlay-stale-conflict' : `overlay-stale-${row.reason}`;
   appendOverlayEvent(root, { kind, ...row }, { env });
   if (row.reason !== 'superseded') publishAttention({ repo: 'web-everything', pr: 0,
-    head: row.ref, ref: row.ref, kind, title: `Overlay ${row.ref}`, reason: row.reason, ...row,
+    head: `${row.ref}@${row.tip ?? 'unknown'}`, ref: row.ref, kind, title: `Overlay ${row.ref}`, reason: row.reason, ...row,
   }, { path: feedPath({ env }) });
 }
 /** Unknown inputs retain the registration and request operator inspection. No loss inference lives here. */
@@ -114,9 +114,9 @@ export function detectOverlayStale({ root, env = process.env, overlays, plan, ma
   const file = sidecar(root, env), tmp = `${file}.${process.pid}.tmp`;
   mkdirSync(dirname(file), { recursive: true });
   const notices = Object.values(state.records).filter(r => r.notice && !r.published);
-  for (const record of notices) record.published = true;
+  // Mark published only after delivery succeeds: a failed or interrupted publish retries next tick (never lost).
+  for (const record of notices) { try { emit(record.notice); record.published = true; } catch { /* retried next tick */ } }
   writeFileSync(tmp, JSON.stringify(state));
   renameSync(tmp, file);
-  for (const record of notices) { try { emit(record.notice); } catch { /* observational only */ } }
   return rows;
 }

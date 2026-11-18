@@ -45,6 +45,15 @@ describe('post-plan stale detector', () => {
     expect(emit).toHaveBeenCalledTimes(1);
     expect(emit).toHaveBeenCalledWith({ ref, tip, count: 3, reason: 'conflict', ownerAction: `rebase ${ref} onto main` });
   });
+  it('a failed publish is retried next tick and then marked delivered', () => {
+    emit.mockImplementationOnce(() => { throw new Error('feed down'); });
+    tick(); tick(); tick();
+    expect(emit).toHaveBeenCalledTimes(1);
+    tick();
+    expect(emit).toHaveBeenCalledTimes(2);
+    tick();
+    expect(emit).toHaveBeenCalledTimes(2);
+  });
   it('resets a moved tip and re-registration; returning to an alerted tuple does not alert twice', () => {
     tick(); tick(); tick();
     const moved = { remoteTips: { [ref]: sha('d') } };
