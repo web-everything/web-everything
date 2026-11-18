@@ -132,15 +132,16 @@ export function matchReadyCandidate({
   // Carried means by CONTENT: the live applied sha is inside the record's build (the same ref at an OLDER head does
   // not count — Codex audit).
   // Graduation (`leftForMain`) proves both registry history and content in this candidate's own build.
-  // Separately, an overlay this tick's plan removed as `pr-merged`/`in-main` (`removedForMain`) is safe only
+  // Separately, an overlay removed for main in this tick or its recorded history (`removedForMain`) is safe only
   // with independent content proof. Current main containing an overlay alone never satisfies either path.
   // An explicit operator retirement instead proves intentional removal of this exact live tip.
   const retired = [];
-  const omitted = liveApplied.filter((a) => {
+  const uniqueLiveApplied = [...new Map(liveApplied.map((a) => [JSON.stringify([a?.ref, a?.sha]), a])).values()];
+  const omitted = uniqueLiveApplied.filter((a) => {
     if (!a?.ref) return false;
     if (a.sha && carries(a.sha, ready.adopt.finalSha)) return false;
     if (a.sha && leftForMain(a, ready.adopt.finalSha) === true) return false;
-    if (a.sha && removedForMain(a.ref) && contentInBuild(a.sha, ready.adopt.finalSha)) { retired.push(a.ref); return false; }
+    if (a.sha && removedForMain(a.ref, a.sha) && contentInBuild(a.sha, ready.adopt.finalSha)) { retired.push(a.ref); return false; }
     if (a.sha && retiredByOperator(a) === true) { retired.push(a.ref); return false; }
     return true;
   });

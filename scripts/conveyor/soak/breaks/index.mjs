@@ -44,6 +44,7 @@
  * `red-team-gate-send-back-failed-never-retried.mjs` uses the same automatic registration.
  * `ready-candidate-diagnostic-event-masks-drop.mjs` uses the same automatic registration.
  * `ready-candidate-adopted-across-overlay-churn.mjs` uses the same automatic registration.
+ * `superseded-omits-retired-merged-overlay.mjs` uses the same automatic registration.
  * `restamp-comment-does-not-retrigger-merge-gate.mjs` uses the same automatic registration.
  * `live-changes-stale-accepted-phase.mjs` uses the same automatic registration.
  *
