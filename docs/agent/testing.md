@@ -4612,3 +4612,5 @@ hold gates and include `review-hold-labels` or `review-acceptance`. Candidate-la
 and other incidental holds retain failure. Empty or malformed required rosters always
 return `unknown` with `roster-unavailable`, including persisted options containing the
 removed `allowEmptyRequiredNames` override and evidence with an observed merge-gate failure.
+
+Review timing fixtures must carry the fetch's `rowsHead`, `rowsComplete` and unchanged live/cache roster source. `readReviewChecks` attests its paginated SHA-pinned REST read on the returned array; injected readers must attest their own snapshots. Unknown provenance refuses review admission; fix push waits until its existing bounded fallback. Keep failed same-name rows in both input orders, and cancellations in the review-void and verification-marker tests.

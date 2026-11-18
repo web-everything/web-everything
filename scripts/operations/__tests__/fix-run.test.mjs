@@ -119,9 +119,9 @@ describe('runFixCli', () => {
     const m = mk(['a'.repeat(40), 'b'.repeat(40)]);
     let now = 1000;
     const sleeps = [];
-    const readChecks = vi.fn(() => now < 31000 ? [{ name: 'test', status: 'in_progress' }] : [{ name: 'test', status: 'completed', conclusion: 'failure' }]);
+    const readChecks = vi.fn(({ headSha }) => Object.assign(now < 31000 ? [{ name: 'test', status: 'in_progress' }] : [{ name: 'test', status: 'completed', conclusion: 'failure' }], { rowsHead: headSha, rowsComplete: true }));
     const result = await runFixCli(argv, { ...m.io, timingPolicy: { pushAfterCi: enabled, pushAfterCiMaxMin: 1 },
-      readRequired: () => ({ checks: ['test'] }), readChecks, clock: () => now,
+      readRequired: () => ({ source: 'live', checks: ['test'] }), readChecks, clock: () => now,
       sleep: async ms => { sleeps.push(ms); now += ms; } });
     expect(result.code).toBe(0);
     expect(sleeps).toEqual(enabled ? [30000] : []);
@@ -139,7 +139,7 @@ describe('runFixCli', () => {
     let now = 0;
     const sleeps = [];
     const result = await runFixCli(argv, { ...m.io, timingPolicy: { pushAfterCi: true, pushAfterCiMaxMin: 1 },
-      readRequired: () => ({ checks: ['test'] }), readChecks: () => { throw Error('offline'); }, clock: () => now,
+      readRequired: () => ({ source: 'live', checks: ['test'] }), readChecks: () => { throw Error('offline'); }, clock: () => now,
       sleep: async ms => { sleeps.push(ms); now += ms; } });
     expect(result.code).toBe(0);
     expect(sleeps).toEqual([30000, 30000]);

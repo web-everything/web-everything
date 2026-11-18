@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { reviewCiGate } from '../review-ci-gate.mjs';
+import { reviewCiGate as rawGate } from '../review-ci-gate.mjs';
 const headSha = 'a'.repeat(40);
+const reviewCiGate = input => rawGate({ rowsHead: headSha, rowsComplete: true, rosterSource: 'live', ...input });
 const success = name => ({ name, status: 'completed', conclusion: 'success' });
 const gate = checks => reviewCiGate({ headSha, requiredChecks: ['test', 'daemon-soak'], checks });
 describe('strict review CI prerequisite', () => {
@@ -22,10 +23,10 @@ describe('strict review CI prerequisite', () => {
       expect(reviewCiGate({ headSha, requiredChecks: ['test'], checks: [success('test')], ...over }).allowed).toBe(false);
     }
   });
-  it('uses the newest rerun regardless of REST ordering', () => {
+  it('a failed required job followed by a passing same-named row is refused in either order', () => {
     const old = { ...success('test'), id: 1, conclusion: 'failure' };
     const fresh = { ...success('test'), id: 2 };
-    for (const rows of [[old, fresh], [fresh, old]]) expect(gate([...rows, success('daemon-soak')]).allowed).toBe(true);
+    for (const rows of [[old, fresh], [fresh, old]]) expect(gate([...rows, success('daemon-soak')])).toMatchObject({ allowed: false, affected: [{ name: 'test', reason: 'failure' }] });
     for (const status of ['in_progress', 'completed']) {
       expect(gate([{ ...fresh, id: 3, status, conclusion: 'failure' }, fresh, success('daemon-soak')]).allowed).toBe(false);
     }
@@ -43,4 +44,24 @@ describe('strict review CI prerequisite', () => {
       expect(reviewCiGate({ headSha, requiredChecks: ['legacy'], checks: [{ context: 'legacy', state }] }))
         .toMatchObject({ allowed: false, affected: [{ name: 'legacy', reason }] });
     });
+});
+
+it.each([
+  [{ rowsComplete: false }, 'rows-incomplete'],
+  [{ rowsComplete: undefined }, 'rows-incomplete'],
+  [{ rowsHead: 'b'.repeat(40) }, 'foreign-head'],
+  [{ rowsHead: undefined }, 'foreign-head'],
+  [{ rosterSource: 'declared' }, 'unknown-required-set'],
+  [{ rosterSource: 'fallback' }, 'unknown-required-set'],
+])('fails closed on incomplete or unknown provenance %j', (over, reason) => {
+  expect(reviewCiGate({ headSha, requiredChecks: ['test'], checks: [success('test')], ...over }))
+    .toMatchObject({ allowed: false, reason });
+});
+it('supersedes only a proven attempt of the same run and job, permutation invariant', () => {
+  const old = { ...success('test'), id: 1, run_id: 7, run_attempt: 1, conclusion: 'failure' };
+  const fresh = { ...old, run_attempt: 2, conclusion: 'success' };
+  for (const checks of [[old, fresh], [fresh, old]]) {
+    expect(reviewCiGate({ headSha, requiredChecks: ['test'], checks }).allowed).toBe(true);
+    expect(reviewCiGate({ headSha, requiredChecks: ['test'], checks: checks.map(row => row === fresh ? { ...row, run_id: 8 } : row) }).allowed).toBe(false);
+  }
 });

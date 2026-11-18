@@ -61,18 +61,18 @@ it.each([
   await expect(sinks[REVIEW_EFFECTS.LABEL]({ pr: 7, repo: 'o/n', ...payload })).rejects.toThrow('review void');
   expect(runNode).not.toHaveBeenCalled(); expect(postComment).not.toHaveBeenCalled();
 });
-it.each([REVIEW_EFFECTS.LABEL, REVIEW_EFFECTS.ADVISORY_NOTE, REVIEW_EFFECTS.STACK_HOLD])('voids %s before any publish when same-head CI turns red and cancellation is enabled', async effect => {
+it.each([REVIEW_EFFECTS.LABEL, REVIEW_EFFECTS.ADVISORY_NOTE, REVIEW_EFFECTS.STACK_HOLD].flatMap(effect => ['failure', 'cancelled'].map(conclusion => [effect, conclusion])))('voids %s before any publish when same-head CI is %s and cancellation is enabled', async (effect, conclusion) => {
   const runNode = vi.fn(); const postComment = vi.fn();
   const sinks = createReviewPrSinks({ readPublishHead: () => head, env: { WE_REVIEW_CANCEL_ON_CI_RED: 'true' }, runNode, postComment,
-    publishGate: () => ({ headSha: head, checks: [{ name: 'unit', head_sha: head, conclusion: 'failure' }] }) });
+    publishGate: () => ({ headSha: head, rowsHead: head, rowsComplete: true, rosterSource: 'live', requiredChecks: ['unit'], checks: [{ name: 'unit', head_sha: head, status: 'completed', conclusion }] }) });
   await expect(sinks[effect]({ pr: 7, repo: 'o/n', reviewedHead: head, body: 'verdict' })).rejects.toThrow('review void');
   expect(runNode).not.toHaveBeenCalled(); expect(postComment).not.toHaveBeenCalled();
 });
 it('with cancellation on, an optional red never voids a finished review', async () => {
   const postComment = vi.fn();
   const sinks = createReviewPrSinks({ readPublishHead: () => head, env: { WE_REVIEW_CANCEL_ON_CI_RED: 'true' }, postComment,
-    publishGate: () => ({ headSha: head, requiredChecks: ['unit'],
-      checks: [{ name: 'CodeQL', head_sha: head, conclusion: 'failure' }, { name: 'unit', head_sha: head, conclusion: 'success' }] }) });
+    publishGate: () => ({ headSha: head, rowsHead: head, rowsComplete: true, rosterSource: 'live', requiredChecks: ['unit'],
+      checks: [{ name: 'CodeQL', head_sha: head, status: 'completed', conclusion: 'failure' }, { name: 'unit', head_sha: head, status: 'completed', conclusion: 'success' }] }) });
   await expect(sinks[REVIEW_EFFECTS.ADVISORY_NOTE]({ pr: 7, repo: 'o/n', reviewedHead: head, body: 'verdict' })).resolves.toEqual({ posted: true });
   expect(postComment).toHaveBeenCalledTimes(1);
 });
@@ -84,15 +84,16 @@ it('publishes an advisory on same-head red CI when cancellation is disabled', as
   expect(postComment).toHaveBeenCalledTimes(1);
   expect(postComment).toHaveBeenCalledWith('o/n', 7, 'verdict');
 });
-it.each([false, true])('publishes with unreadable CI when the head is pinned (cancel=%s)', cancel => {
+it.each([false, true])('unknown CI fails closed only when cancellation is enabled (cancel=%s)', async cancel => {
   const postComment = vi.fn();
   const publishGate = vi.fn(() => ({ allowed: false, reason: 'unreadable-ci' }));
   const sinks = createReviewPrSinks({ readPublishHead: () => head, publishGate, postComment,
     env: { WE_REVIEW_CANCEL_ON_CI_RED: String(cancel) } });
-  return expect(sinks[REVIEW_EFFECTS.ADVISORY_NOTE]({ pr: 7, repo: 'o/n', reviewedHead: head, body: 'verdict' })).resolves.toEqual({ posted: true }).then(() => {
-    expect(postComment).toHaveBeenCalledTimes(1);
-    expect(publishGate).toHaveBeenCalledTimes(cancel ? 1 : 0);
-  });
+  const result = sinks[REVIEW_EFFECTS.ADVISORY_NOTE]({ pr: 7, repo: 'o/n', reviewedHead: head, body: 'verdict' });
+  if (cancel) await expect(result).rejects.toThrow('review void');
+  else await expect(result).resolves.toEqual({ posted: true });
+  expect(postComment).toHaveBeenCalledTimes(cancel ? 0 : 1);
+  expect(publishGate).toHaveBeenCalledTimes(cancel ? 1 : 0);
 });
 it.each([REVIEW_EFFECTS.LABEL, REVIEW_EFFECTS.ADVISORY_NOTE, REVIEW_EFFECTS.STACK_HOLD])('refuses %s with a missing or superseded reviewed head', async effect => {
   for (const reviewedHead of [undefined, 'b'.repeat(40)]) {
@@ -116,7 +117,7 @@ it.each([
   const io = createReviewJobIo({ env, readFile: () => JSON.stringify({ carryAcrossRebase: file }) });
   expect(io.carryAcrossRebaseSetting()).toMatchObject({ value, source });
 });
-it('fails open on a thrown CI read but refuses an unreadable head or a head change during that read', async () => {
+it('fails closed on a thrown CI read, unreadable head or head change', async () => {
   for (const mode of ['ci-fault', 'head-fault', 'head-moved']) {
     const postComment = vi.fn(); let reads = 0;
     const sinks = createReviewPrSinks({ env: { WE_REVIEW_CANCEL_ON_CI_RED: 'true' }, postComment,
@@ -125,9 +126,8 @@ it('fails open on a thrown CI read but refuses an unreadable head or a head chan
         return ++reads > 1 && mode === 'head-moved' ? 'b'.repeat(40) : head;
       }, publishGate: () => { throw Error('offline'); } });
     const result = sinks[REVIEW_EFFECTS.ADVISORY_NOTE]({ pr: 7, repo: 'o/n', reviewedHead: head, body: 'verdict' });
-    if (mode === 'ci-fault') await expect(result).resolves.toEqual({ posted: true });
-    else await expect(result).rejects.toThrow('review void');
-    expect(postComment).toHaveBeenCalledTimes(mode === 'ci-fault' ? 1 : 0);
+    await expect(result).rejects.toThrow('review void');
+    expect(postComment).not.toHaveBeenCalled();
   }
 });
 it('reads a real small fix as a delta while keeping the full net diff and head fingerprint basis', () => {

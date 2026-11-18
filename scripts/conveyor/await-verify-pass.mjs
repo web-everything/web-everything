@@ -436,7 +436,7 @@ async function previousCiPushGate({ io, record, nowMs, policy, persist }) {
   if (!Number.isFinite(state.firstHeldAt)) state = { firstHeldAt: nowMs };
   if (!persist({ ...record, previousCi: state })) return { action: 'wait', reason: 'persist-failed' };
   if (state.ready) return state.ready;
-  const bound = fixPushGate({ firstHeldAt: state.firstHeldAt, now: nowMs, policy });
+  const bound = fixPushGate({ headSha: state.headSha, rowsComplete: false, firstHeldAt: state.firstHeldAt, now: nowMs, policy });
   if (bound.action === 'push') return bound; // Unknown evidence falls back to a normal push at the fixed bound.
   if (Number.isFinite(state.lastReadAt) && nowMs - state.lastReadAt < 30_000) return bound;
   if (!state.headSha) {
@@ -449,14 +449,18 @@ async function previousCiPushGate({ io, record, nowMs, policy, persist }) {
   }
   let checks = null;
   let required = [];
+  let rosterSource;
   if (state.headSha) {
     try {
-      required = (await io.readPreviousRequired({ repo: record.repo, ttlMs: 0 }))?.checks ?? [];
+      const roster = await io.readPreviousRequired({ repo: record.repo, ttlMs: 0 });
+      required = roster?.checks;
+      rosterSource = roster?.source;
       checks = await io.readPreviousChecks({ repo: record.repo, headSha: state.headSha });
     } catch { /* Incomplete evidence remains held until the bound. */ }
   }
   const decision = state.headSha === lower(record.sha) ? { action: 'push', reason: 'already-on-remote' }
-    : fixPushGate({ previousHeadChecks: checks, requiredChecks: required, firstHeldAt: state.firstHeldAt, now: nowMs, policy });
+    : fixPushGate({ headSha: state.headSha, rowsHead: checks?.rowsHead, rowsComplete: checks?.rowsComplete === true,
+      rosterSource, previousHeadChecks: checks, requiredChecks: required, firstHeldAt: state.firstHeldAt, now: nowMs, policy });
   state = { ...state, lastReadAt: nowMs, ...(decision.action === 'push' ? { ready: decision } : {}) };
   if (!persist({ ...record, previousCi: state })) return { action: 'wait', reason: 'persist-failed' };
   return decision;
@@ -651,7 +655,7 @@ export async function runAwaitVerifyPass({
         earlyOwed = !(record?.infraRetry?.scheduled && d.action === 'wait') && isEarlyPushOwed({ record, decision: d, policy, limits });
       }
       if (ciReadiness && timing?.pushAfterCi && record.kind === 'fix') {
-        rows.push({ ...row, action: 'push-ci-gate', reason: ciReadiness.reason,
+        rows.push({ ...row, action: 'push-ci-gate', reason: ciReadiness.reason, evidenceReason: ciReadiness.evidenceReason,
           result: ciReadiness.action === 'wait' ? `held until ${ciReadiness.deadline ?? 'state is persisted'}; bound fallback is push` : 'push allowed' });
       }
       if (d.action === 'push' && ciReadiness?.action === 'wait') {

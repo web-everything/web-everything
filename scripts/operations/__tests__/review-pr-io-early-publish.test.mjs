@@ -9,7 +9,8 @@ import { REVIEW_EFFECTS } from '../review-pr.mjs';
 const head = 'a'.repeat(40);
 const payload = { repo: 'o/n', pr: 7, to: 'accepted', actor: 'operator', bodyFile: 'verdict.md', reviewedHead: head };
 const pending = { allowed: false, headSha: head, reason: 'required-checks-not-successful' };
-const green = { allowed: true, headSha: head, reason: 'required-checks-successful' };
+const green = { allowed: true, headSha: head, rowsHead: head, rowsComplete: true, rosterSource: 'live',
+  requiredChecks: ['test'], checks: [{ name: 'test', status: 'completed', conclusion: 'success' }], reason: 'required-checks-successful' };
 function fixture(overrides = {}) {
   let time = 0;
   const runNode = vi.fn(() => '{"ok":true}');

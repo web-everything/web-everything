@@ -17,8 +17,8 @@ function harness({ early = true, enabled = true } = {}) {
     pushPolicy: () => ({ pushBeforeGate: early }),
     fixTimingPolicy: () => ({ pushAfterCi: enabled, pushAfterCiMaxMin: 2 }),
     readPreviousHead: args => { state.reads.push(args); return state.head; },
-    readPreviousChecks: args => { state.reads.push(args); return state.checks; },
-    readPreviousRequired: () => ({ checks: state.required }),
+    readPreviousChecks: args => { state.reads.push(args); return Object.assign(state.checks, { rowsHead: args.headSha, rowsComplete: true }); },
+    readPreviousRequired: () => ({ source: 'live', checks: state.required }),
     listRecords: () => record ? [{ key: 'claude-fix', record }] : [],
     writeRecord: next => { if (!state.writes) return { ok: false }; record = next; return { ok: true }; },
     clearRecord: () => { state.cleared.push(record); record = null; },
@@ -322,7 +322,7 @@ describe('Claude verify harness honors fix.pushAfterCi', () => {
     if (!early) h.state.status = 'green';
     h.io.readPreviousChecks = () => {
       h.state.status = 'red';
-      return [{ name: 'test', status: 'completed', conclusion: 'success' }];
+      return Object.assign([{ name: 'test', status: 'completed', conclusion: 'success' }], { rowsHead: PREVIOUS, rowsComplete: true });
     };
     await h.tick();
     expect(h.state.pushes).toHaveLength(0);
@@ -367,4 +367,16 @@ describe('Claude verify harness honors fix.pushAfterCi', () => {
   it('replays the supported Claude path as a daemon soak break', async () => {
     expect(ciBreak.judge(await ciBreak.run())).toEqual([]);
   });
+});
+
+it.each([
+  { rowsHead: PREVIOUS, rowsComplete: false },
+  { rowsHead: SHA, rowsComplete: true },
+])('holds incomplete or foreign previous-head CI until the bound: %j', async metadata => {
+  const h = harness();
+  h.io.readPreviousChecks = () => Object.assign([{ name: 'test', status: 'completed', conclusion: 'success' }], metadata);
+  await h.tick();
+  expect(h.state.pushes).toHaveLength(0);
+  await h.tick(120_000);
+  expect(h.state.pushes).toHaveLength(1);
 });

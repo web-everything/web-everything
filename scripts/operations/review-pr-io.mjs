@@ -1145,7 +1145,7 @@ export function createReviewPrSinks({
     const assertHead = async () => {
       let currentHead;
       try { currentHead = await readPublishHead(args); } catch { /* An unreadable head cannot authorize publication. */ }
-      if (reviewMustVoid({ reviewedHead: payload.reviewedHead, currentHead }))
+      if (!currentHead || payload.reviewedHead !== currentHead)
         throw notApplied('review void: head moved or current head could not be read');
     };
     await assertHead();
@@ -1174,11 +1174,11 @@ export function createReviewPrSinks({
     if (!policy.cancelOnCiRed) return;
     let ci;
     try { ci = await publishGate({ ...args, policy, expectedHead: payload.reviewedHead }); }
-    catch { /* CI read faults do not void a completed review. The head is checked independently. */ }
+    catch { /* Unknown CI fails closed below; the head is checked independently. */ }
     if (ci?.reason === 'head-changed' || (ci?.headSha && ci.headSha !== payload.reviewedHead)
       || reviewMustVoid({ reviewedHead: payload.reviewedHead, currentHead: payload.reviewedHead, checks: ci?.checks,
-        requiredChecks: ci?.requiredChecks, policy }))
-      throw notApplied('review void: head moved or CI became red');
+        requiredChecks: ci?.requiredChecks, rowsHead: ci?.rowsHead, rowsComplete: ci?.rowsComplete, rosterSource: ci?.rosterSource, policy }))
+      throw notApplied(`review void: head moved or CI became red (${ci?.reason ?? 'unreadable-ci'})`);
     await assertHead();
   };
   // Supersede any same-head success before acceptance can become visible. A failed publication is
