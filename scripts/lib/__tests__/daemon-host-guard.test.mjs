@@ -4,8 +4,11 @@ import { chmodSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, s
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
+import * as childProcess from 'node:child_process';
 import { once } from 'node:events';
 import * as guard from '../daemon-host-guard.mjs';
+
+vi.mock('node:child_process', async (importOriginal) => ({ ...await importOriginal() }));
 
 const ME = '11111111-1111-4111-8111-111111111111';
 const OTHER = '22222222-2222-4222-8222-222222222222';
@@ -106,6 +109,39 @@ describe('fresh ownership only', () => {
 });
 
 describe('opaque local identity', () => {
+  it.each([0, 7])('legacy discovery uses the remaining resolver budget after %i ms of source work', async (sourceMs) => {
+    let now = 1000;
+    const started = now;
+    // Model a synchronous 100 ms scutil call that respects its supplied timeout.
+    const exec = vi.spyOn(childProcess, 'execFileSync').mockImplementation((_file, _args, options) => {
+      now += Math.min(100, options.timeout);
+      if (options.timeout < 100) throw new Error('scutil timed out');
+      return 'legacy-alpha\n';
+    });
+    try {
+      const decision = await resolve(() => { now += sourceMs; return record('legacy-alpha'); }, {
+        legacyOwnerValues: LEGACY_ALIASES, timeoutMs: 20, clock: () => now,
+      });
+      expect(exec).toHaveBeenCalledTimes(1);
+      expect(exec).toHaveBeenCalledWith('scutil', ['--get', 'HostName'],
+        expect.objectContaining({ timeout: 20 - sourceMs }));
+      expect(now - started).toBeLessThanOrEqual(20);
+      expect(decision).toEqual({ role: 'standby', reason: 'owner-unreadable', source: 'remote-failed' });
+    } finally { exec.mockRestore(); }
+  });
+
+  it.each([20, 21])('legacy discovery skips scutil when the resolver budget expired after %i ms', async (sourceMs) => {
+    let now = 1000;
+    const exec = vi.spyOn(childProcess, 'execFileSync').mockReturnValue('legacy-alpha\n');
+    try {
+      const decision = await resolve(() => { now += sourceMs; return record('legacy-alpha'); }, {
+        legacyOwnerValues: LEGACY_ALIASES, timeoutMs: 20, clock: () => now,
+      });
+      expect(exec).not.toHaveBeenCalled();
+      expect(decision).toEqual({ role: 'standby', reason: 'owner-unreadable', source: 'remote-failed' });
+    } finally { exec.mockRestore(); }
+  });
+
   it('generates once, persists mode 600, and independent homes have different IDs', () => {
     const root = home();
     const id = guard.getThisHost({ home: root });
@@ -312,5 +348,79 @@ describe('GitHub ownership source', () => {
     expect(exec).toHaveBeenCalledWith('gh', ['api', 'fixture'], expect.objectContaining({ timeout: 15000, maxBuffer: 1024 * 1024 }));
     expect(guard.runGhApi('fixture', { execFile: () => '{' }).ok).toBe(false);
     expect(guard.runGhApi('fixture', { execFile: () => { throw new Error('HTTP 403'); } })).toMatchObject({ ok: false, status: 403 });
+  });
+
+  describe('synchronous production source honors the read deadline', () => {
+    // A real sync child (`exec sleep`) cannot be interrupted by a timer: only the child's own timeout can stop it.
+    function stubGh(seconds) {
+      const dir = home();
+      const bin = join(dir, 'gh');
+      const marker = join(dir, 'started');
+      writeFileSync(bin, '#!/bin/sh\n: > "' + marker + '"\nexec sleep ' + seconds + '\n');
+      chmodSync(bin, 0o755);
+      return { bin, marker };
+    }
+    const syncSource = (bin, errors = []) => guard.createGitHubOwnershipSource({
+      ghApi: (path, options) => guard.runGhApi(path, { ...options, execFile: (_file, args, opts) => {
+        try { return execFileSync(bin, args, opts); } catch (error) { errors.push(error); throw error; }
+      } }),
+    });
+
+    it('kills a stalled gh child at the deadline and fails closed', async () => {
+      const { bin, marker } = stubGh(30);
+      const errors = [];
+      const started = Date.now();
+      const decision = await guard.resolveHostRole({ thisHost: ME, source: syncSource(bin, errors), timeoutMs: 300 });
+      expect(Date.now() - started).toBeLessThan(5000);
+      // The stub really ran and was killed by its own timeout (not a fast spawn failure).
+      expect(statSync(marker).isFile()).toBe(true);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toMatchObject({ code: 'ETIMEDOUT' });
+      expect(decision).toMatchObject({ role: 'standby', reason: 'owner-unreadable', source: 'remote-failed' });
+    });
+
+    it('runGhApi caps the child timeout at the caller deadline and kills with SIGKILL', () => {
+      const exec = vi.fn(() => '{"ok":true}');
+      guard.runGhApi('fixture', { execFile: exec, timeoutMs: 250 });
+      expect(exec.mock.calls[0][2]).toMatchObject({ timeout: 250, killSignal: 'SIGKILL' });
+      guard.runGhApi('fixture', { execFile: exec, timeoutMs: 10 ** 9 });
+      expect(exec.mock.calls[1][2]).toMatchObject({ timeout: 15000, killSignal: 'SIGKILL' });
+      guard.runGhApi('fixture', { execFile: exec, timeoutMs: 0.2 });
+      expect(exec.mock.calls[2][2].timeout).toBe(1);
+      guard.runGhApi('fixture', { execFile: exec });
+      expect(exec.mock.calls[3][2]).toMatchObject({ timeout: 15000, killSignal: 'SIGKILL' });
+    });
+
+    it('gives each read only the time left before the shared deadline, and stops once it has passed', async () => {
+      let now = 1000;
+      const seen = [];
+      const api = vi.fn(async (path, options) => { seen.push(options.timeoutMs); now += 400; return path.includes('/git/ref/') ? ref : file(); });
+      const clock = () => now;
+      expect(await guard.createGitHubOwnershipSource({ ghApi: api }).readOwner({ deadline: 2000, clock })).toEqual(record());
+      expect(seen).toEqual([1000, 600]);
+      now = 1000;
+      api.mockClear();
+      await expect(guard.createGitHubOwnershipSource({ ghApi: api }).readOwner({ deadline: 1300, clock }))
+        .rejects.toThrow('owner read deadline');
+      expect(api).toHaveBeenCalledTimes(1);
+      now = 5000;
+      api.mockClear();
+      await expect(guard.createGitHubOwnershipSource({ ghApi: api }).readOwner({ deadline: 4000, clock }))
+        .rejects.toThrow('owner read deadline');
+      expect(api).not.toHaveBeenCalled();
+    });
+
+    it('resolveHostRole hands the source the read deadline derived from timeoutMs', async () => {
+      const readOwner = vi.fn(() => record());
+      await guard.resolveHostRole({ thisHost: ME, source: { readOwner }, timeoutMs: 700, clock: () => 50 });
+      expect(readOwner.mock.calls[0][0]).toMatchObject({ deadline: 750 });
+      expect(typeof readOwner.mock.calls[0][0].clock).toBe('function');
+    });
+
+    it('legacy hostname lookup also kills a stalled child', () => {
+      const exec = vi.fn(() => LEGACY_NAMES[0] + '\n');
+      guard.getLegacyHost({ exec, legacyOwnerValues: LEGACY_ALIASES });
+      expect(exec.mock.calls[0][2]).toMatchObject({ timeout: 15000, killSignal: 'SIGKILL' });
+    });
   });
 });

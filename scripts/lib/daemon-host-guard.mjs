@@ -79,12 +79,15 @@ export function getThisHost({ home = homedir(), create = true } = {}) {
 }
 
 /** Local name consulted only for deprecated aliases; any failure fails closed (no OS-hostname fallback). */
-export function getLegacyHost({ exec = execFileSync, legacyOwnerValues = getLegacyOwnerValues() } = {}) {
+export function getLegacyHost({ exec = execFileSync, legacyOwnerValues = getLegacyOwnerValues(),
+  timeoutMs = READ_TIMEOUT_MS } = {}) {
   if (!isBindings(legacyOwnerValues) || Object.keys(legacyOwnerValues).length === 0) return '';
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return '';
+  const timeout = Math.min(READ_TIMEOUT_MS, Math.max(1, Math.floor(timeoutMs)));
   let name;
   try {
     name = String(exec('scutil', ['--get', 'HostName'], {
-      encoding: 'utf8', timeout: READ_TIMEOUT_MS, maxBuffer: MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'],
+      encoding: 'utf8', timeout, killSignal: 'SIGKILL', maxBuffer: MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'],
     })).trim();
   } catch { return ''; }
   return legacyOwner(name, legacyOwnerValues) ? name : '';
@@ -105,10 +108,15 @@ export function decideHostRole({ thisHost, owner, ownerReadAt, now, legacyHost =
     : standby('owner-is-other-host');
 }
 
-export function runGhApi(path, { execFile = execFileSync } = {}) {
+/**
+ * One bounded `gh api` read. The child is synchronous, so a timer cannot interrupt it: the caller's remaining
+ * deadline (`timeoutMs`, never above READ_TIMEOUT_MS, at least 1 ms) is the child's own timeout and it is SIGKILLed.
+ */
+export function runGhApi(path, { execFile = execFileSync, timeoutMs = READ_TIMEOUT_MS } = {}) {
+  const timeout = Number.isFinite(timeoutMs) ? Math.min(READ_TIMEOUT_MS, Math.max(1, Math.floor(timeoutMs))) : 1;
   try {
     const output = execFile('gh', ['api', path], {
-      timeout: READ_TIMEOUT_MS, maxBuffer: MAX_BUFFER, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+      timeout, killSignal: 'SIGKILL', maxBuffer: MAX_BUFFER, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
     });
     return { ok: true, status: 200, body: JSON.parse(output) };
   } catch (error) {
@@ -121,15 +129,22 @@ export function runGhApi(path, { execFile = execFileSync } = {}) {
 /** OwnershipSource: readOwner() -> Promise<{host: string, version: string}>. */
 export function createGitHubOwnershipSource({ ghApi: api = runGhApi, legacyOwnerValues = getLegacyOwnerValues() } = {}) {
   return {
-    async readOwner() {
+    /** `deadline` is an absolute `clock()` time shared by both reads; each read gets only the time left. */
+    async readOwner({ deadline, clock = () => performance.now() } = {}) {
+      const end = Number.isFinite(deadline) ? deadline : clock() + READ_TIMEOUT_MS;
+      const read = (path) => {
+        const remaining = end - clock();
+        if (!(remaining > 0)) throw new Error('owner read deadline');
+        return api(path, { timeoutMs: remaining });
+      };
       const base = `repos/${CONSTELLATION_REPOS.we.slug}`;
-      const ref = await api(`${base}/git/ref/heads/${OWNER_REF}`);
+      const ref = await read(`${base}/git/ref/heads/${OWNER_REF}`);
       if (ref?.ok === false && ref.status === 404) return { host: '', version: 'unset' };
       const version = ref?.body?.object?.sha;
       if (ref?.ok !== true || ref.status !== 200 || ref.body?.object?.type !== 'commit'
         || typeof version !== 'string' || version.length !== 40 || !/^[a-f0-9]{40}$/.test(version)) throw new Error('owner ref unreadable');
       // Pin contents to the observed commit so a moving branch cannot mix versions.
-      const file = await api(`${base}/contents/${OWNER_FILE}?ref=${version}`);
+      const file = await read(`${base}/contents/${OWNER_FILE}?ref=${version}`);
       if (file?.ok !== true || file.status !== 200 || file.body?.type !== 'file'
         || file.body.encoding !== 'base64' || typeof file.body.content !== 'string'
         || file.body.content.length > 1024) throw new Error('owner contents unreadable');
@@ -156,8 +171,9 @@ export async function resolveHostRole({ thisHost = getThisHost(), legacyOwnerVal
       return { ...standby('invalid-input'), source: 'remote-failed' };
     }
     const started = clock();
+    const deadline = started + timeoutMs;
     const result = await Promise.race([
-      Promise.resolve().then(() => source.readOwner()),
+      Promise.resolve().then(() => source.readOwner({ deadline, clock })),
       new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('owner read timeout')), timeoutMs); }),
     ]);
     if (!result || Object.keys(result).some((key) => !['host', 'version'].includes(key))
@@ -166,7 +182,14 @@ export async function resolveHostRole({ thisHost = getThisHost(), legacyOwnerVal
       || /[^A-Za-z0-9._-]/.test(result.version)) {
       throw new Error('unexpected owner result');
     }
-    const localAlias = legacyOwner(result.host, legacyOwnerValues) ? legacyHost ?? getLegacyHost({ legacyOwnerValues }) : '';
+    let localAlias = '';
+    if (legacyOwner(result.host, legacyOwnerValues)) {
+      if (legacyHost != null) localAlias = legacyHost;
+      else {
+        const remaining = Math.max(0, deadline - clock());
+        if (remaining > 0) localAlias = getLegacyHost({ legacyOwnerValues, timeoutMs: remaining });
+      }
+    }
     const finished = clock();
     if (!Number.isFinite(started) || !Number.isFinite(finished) || finished < started
       || finished - started >= timeoutMs) throw new Error('owner read expired');

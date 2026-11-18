@@ -1,5 +1,5 @@
 /** PR #6945: fresh ownership must be re-established after every handoff or failure. */
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
@@ -10,16 +10,37 @@ export default {
   card: 'PR #6945 / x2fybk1',
   fixedBy: { sha: 'PR #6945 R970 R971 repair', where: 'lane/daemon-host-guard',
     paths: ['scripts/lib/daemon-host-guard.mjs', 'scripts/operations/daemon-preflight.mjs'] },
-  fixPresent(root) {
-    return readFileSync(join(root, 'scripts/lib/daemon-host-guard.mjs'), 'utf8').includes('createGitHubOwnershipSource');
+  fixPresent() {
+    // The fix ships with this break, so it is always required. A deleted or renamed guard must make run() fail
+    // (a required pass), never flip the test to it.fails where the resulting import error would satisfy it.
+    return true;
   },
   async run() {
     const root = process.env.SOAK_TREE_ROOT || fileURLToPath(new URL('../../../../', import.meta.url));
-    const guard = await import(pathToFileURL(join(root, 'scripts/lib/daemon-host-guard.mjs')).href);
-    const { cliIO, main } = await import(pathToFileURL(join(root, 'scripts/operations/daemon-preflight.mjs')).href);
-    const home = mkdtempSync(join(tmpdir(), 'host-handoff-'));
     const violations = [];
+    let guard;
+    let preflight;
     try {
+      guard = await import(pathToFileURL(join(root, 'scripts/lib/daemon-host-guard.mjs')).href);
+      preflight = await import(pathToFileURL(join(root, 'scripts/operations/daemon-preflight.mjs')).href);
+    } catch (error) {
+      return { violations: [`host guard module import failed: ${error?.message ?? error}`] };
+    }
+    const missing = [['getThisHost', guard], ['resolveHostRole', guard], ['createGitHubOwnershipSource', guard],
+      ['cliIO', preflight], ['main', preflight]].filter(([name, mod]) => typeof mod[name] !== 'function');
+    if (missing.length) return { violations: [`missing callable exports: ${missing.map(([name]) => name).join(', ')}`] };
+    const { cliIO, main } = preflight;
+    const home = mkdtempSync(join(tmpdir(), 'host-handoff-'));
+    try {
+      // The ownership source must be callable and read through a fixture: a 404 means unset, a valid ref+file yields the host.
+      const fixtureHost = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+      const fixtureSource = guard.createGitHubOwnershipSource({ ghApi: async (path) => (path.includes('/git/ref/')
+        ? { ok: true, status: 200, body: { object: { type: 'commit', sha: 'f'.repeat(40) } } }
+        : { ok: true, status: 200, body: { type: 'file', encoding: 'base64', content: Buffer.from(fixtureHost + '\n').toString('base64') } }) });
+      const fixtureRead = await fixtureSource.readOwner();
+      if (fixtureRead?.host !== fixtureHost || fixtureRead.version !== 'f'.repeat(40)) {
+        violations.push('ownership source did not read the fixture owner');
+      }
       const first = guard.getThisHost({ home: join(home, 'first') });
       const second = guard.getThisHost({ home: join(home, 'second') });
       if (!first || !second || first === second) violations.push('identities are not independent');

@@ -113,7 +113,9 @@ export function cliIO(env = process.env, options = {}) {
     resolveRole: ({ thisHost = getThisHost({ home: env.HOME || homedir(), create: false }) } = {}) =>
       resolveHostRole({ thisHost, legacyHost, legacyOwnerValues, source: source ?? createGitHubOwnershipSource({
         legacyOwnerValues,
-        ghApi: (path) => runGhApi(path, { execFile: (file, args, options) => exec(file, args, { ...options, env }) }),
+        // Forward the remaining deadline: the sync child must carry its own timeout (a timer cannot interrupt it).
+        ghApi: (path, readOptions) => runGhApi(path, { ...readOptions,
+          execFile: (file, args, options) => exec(file, args, { ...options, env }) }),
       }) }),
     which: (tool) => (env.PATH ?? '').split(delimiter).filter(Boolean).some((dir) => {
       try {
@@ -130,8 +132,11 @@ export function cliIO(env = process.env, options = {}) {
     statFile: (path) => statSync(path).isFile(),
     cloneDirs: () => cloneRoots(env.WE_WORKSPACE_ROOT || dirname(checkout), { env }),
     readHead: (dir) => {
+      // Inherited GIT_* (GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR, GIT_INDEX_FILE, GIT_CONFIG_*, ...) can redirect
+      // discovery so `-C dir` answers for another repo; strip them all for git only (HOME, PATH etc. are kept).
+      const gitEnv = Object.fromEntries(Object.entries(env).filter(([key]) => !/^GIT_/i.test(key)));
       const git = (...args) => exec('git', ['-C', dir, ...args], {
-        env, encoding: 'utf8', timeout: 15_000, maxBuffer: MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'],
+        env: gitEnv, encoding: 'utf8', timeout: 15_000, killSignal: 'SIGKILL', maxBuffer: MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'],
       }).trim();
       // A plain directory inside another checkout must not pass via the parent repo's HEAD.
       if (realpathSync(git('rev-parse', '--show-toplevel')) !== realpathSync(dir)) throw new Error('not a git checkout root');
@@ -139,7 +144,7 @@ export function cliIO(env = process.env, options = {}) {
     },
     parsePreferences: () => JSON.parse(readFileSync(new URL('../lib/delivery-platform-preferences.json', import.meta.url), 'utf8')),
     sshForge: () => spawn('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', 'forge', 'true'], {
-      env, timeout: 15_000, maxBuffer: MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'],
+      env, timeout: 15_000, killSignal: 'SIGKILL', maxBuffer: MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'],
     }),
   };
 }
