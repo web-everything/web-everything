@@ -70,6 +70,11 @@ describe('pre-existing classification', () => {
     expect(classify({ changedLines: parseDiffChangedLines('') })[0].blocking).toBe(true);
     expect(classify({ changedLines: parseDiffChangedLines(diff.replace('+  return fixed();\n', '')) })[0].blocking).toBe(true);
     expect(classify({ changedLines: new Map() })[0].blocking).toBe(true);
+    const headerOnly = 'diff --git a/lib/x.mjs b/lib/x.mjs\n--- a/lib/x.mjs\n+++ b/lib/x.mjs\n';
+    expect(parseDiffChangedLines(headerOnly).complete).toBe(false);
+    const cutEarlier = diff.replace('+  return fixed();\n', '') + diff;
+    expect(parseDiffChangedLines(cutEarlier).complete).toBe(false);
+    expect(parseDiffChangedLines(diff).complete).toBe(true);
   });
   it('the base quote must sit at the claimed base line and path', () => {
     const wrongLine = parseReproAnswer(answer().replace('lib/x.mjs:2', 'lib/x.mjs:999999'), 1);

@@ -85,23 +85,26 @@ export function classifyPreExisting({ findings, answers, baseSha, headSha, readB
 
 /** Parse added head ranges, including additions replacing removed lines; deletions add no head lines. */
 export function parseDiffChangedLines(diffU0Text) {
-  const files = new Map(); let file = null, remaining = 0, headLine = 0;
+  const files = new Map(); let file = null, remaining = 0, headLine = 0, hunks = 0, bad = false;
+  const endSection = () => { if (remaining > 0 || (file && !hunks)) bad = true; remaining = 0; hunks = 0; };
   for (const line of diffU0Text.split('\n')) {
     if (remaining > 0 && /^[ +]/.test(line)) {
       if (line.startsWith('+')) files.get(file).add(headLine);
       headLine++; remaining--; continue;
     }
-    if (line.startsWith('diff --git ')) { file = null; remaining = 0; }
+    if (line.startsWith('diff --git ')) { endSection(); file = null; }
     if (line.startsWith('+++ b/')) {
       const path = line.slice(6);
       try { file = findingKey({ file: path, class: 'B1' }).split('|')[0]; files.set(file, files.get(file) || new Set()); }
-      catch { file = null; }
+      catch { file = null; bad = true; }
     }
     const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line);
-    if (hunk && file) { headLine = Number(hunk[1]); remaining = Number(hunk[2] ?? 1); }
+    if (hunk && remaining > 0) bad = true;
+    if (hunk && file) { headLine = Number(hunk[1]); remaining = Number(hunk[2] ?? 1); hunks++; }
   }
-  // Complete only for a non-empty diff whose last hunk was read in full; an empty or cut-off diff clears nothing.
-  files.complete = remaining === 0 && /^diff --git /m.test(diffU0Text);
+  endSection();
+  // Complete only for a non-empty diff where every file section had a hunk read in full; anything else clears nothing.
+  files.complete = !bad && /^diff --git /m.test(diffU0Text);
   return files;
 }
 
