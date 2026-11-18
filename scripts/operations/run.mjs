@@ -28,6 +28,8 @@ import { ruledWeakenedAddOperation, RULED_WEAKENED_ADD_OP, RULED_WEAKENED_ADD_EF
 import { OPERATOR_OVERRIDE_OPS, OPERATOR_OVERRIDE_EFFECT, operatorOverrideOperation } from './operator-override.mjs';
 import { lastOverrideReason, readOperatorOverrides, writeOperatorOverride, clearOperatorOverride } from '../lib/operator-override-store.mjs';
 import { aiRoutingOperation, AI_ROUTING_OP, finishAiRouting } from './ai-routing.mjs';
+import { briefModeOperation, BRIEF_MODE_OP, finishBriefMode } from './brief-mode.mjs';
+import { loadDeliveryRoutes } from '../lib/delivery-routes.mjs';
 import { resolveAiRouting, aiRoutingInputs, AI_ROUTING_ROLES } from '../lib/ai-routing.mjs';
 import { routingOverrideOperation, ROUTING_OVERRIDE_OP } from './routing-override.mjs';
 import { createRoutingOverrideSinks } from './routing-override-file.mjs';
@@ -267,6 +269,8 @@ export const CLI_ONLY_OPERATIONS = Object.freeze({
 });
 
 export const OPERATIONS = Object.freeze({
+  [BRIEF_MODE_OP]: () => ({ declaration: briefModeOperation({ collect: () => loadDeliveryRoutes(readSettings) }),
+    sinks: {}, finish: finishBriefMode }),
   [AI_ROUTING_OP]: () => ({ declaration: aiRoutingOperation({ collect: () => {
     const routing = resolveAiRouting();
     return { settings: routing.value, sources: routing.sources, invalid: routing.invalid,
