@@ -1784,7 +1784,7 @@ export function runReconcilePass({
   // one pass over the same PRs. A repo this constellation does not know the gh slug for (`resolvedRepo` stays
   // `null`, `gh` infers from cwd) can return an unavailable empty set. The shared reducer then evaluates
   // observed CI checks, retaining red/pending/unchecked evidence; [] never means an automatic pass.
-  const { checks: requiredChecks } = readRequiredChecks({ repo: resolvedRepo, branch: defaultBranch,
+  const { checks: requiredChecks, source: rosterSource } = readRequiredChecks({ repo: resolvedRepo, branch: defaultBranch,
     ...(readOnly ? { readOnly: true } : {}) });
   // we:backlog/x5uqim1-*.md — attach `requiredCheckCompletedAt`/`aheadByOnMain` to any currently-failing
   // PR and read `main`'s own red windows, so `planReconcile` can tell a `ci-red` PR caused by a red `main` apart
@@ -1863,7 +1863,7 @@ export function runReconcilePass({
   const refusals = [...hydrated.refusals, ...plan.refusals].map(row =>
     row.headSha === undefined ? { ...row, headSha: row.headRefOid } : row);
   const plannerRows = readPlannerRows({ repo: resolvedRepo, refusals, rawPrs: prs, requiredChecks, rosterSource });
-  return { ...plan, nominationPrs: prs, nominationOptions: plannerOptions, plannerRows, plannerRequiredChecks: requiredChecks, plannerRequiredChecksSource: rosterSource, ...(readOnly ? { enrichedPrs: prs, agentList: agents, agentsIncomplete: Object.hasOwn(agents, 'incomplete'), plannerOptions } : {}), owedTriggers: hydrated.owedTriggers, notes: [...hydrated.notes, ...plan.notes], refusals, prs: rawPrs.length, agents: agents.length,
+  return { ...plan, nominationPrs: prs, nominationOptions: plannerOptions, plannerRows, plannerRequiredChecks: requiredChecks, plannerRequiredChecksSource: rosterSource, ...(readOnly ? { enrichedPrs: prs, agentList: agents, agentsIncomplete: Object.hasOwn(agents, 'incomplete'), plannerOptions: { ...plannerOptions, rosterSource } } : {}), owedTriggers: hydrated.owedTriggers, notes: [...hydrated.notes, ...plan.notes], refusals, prs: rawPrs.length, agents: agents.length,
     openPrFiles: rawPrs.map((pr) => ({ pr: pr.number, files: Array.isArray(pr.files) && pr.files.length < 100
       ? pr.files.map((file) => typeof file === 'string' ? file : file.path) : null })),
   };
