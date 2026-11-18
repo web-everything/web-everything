@@ -599,3 +599,10 @@ describe('fail-closed provenance and strict admission (PR2a audit)', () => {
     expect(gate.reason).toBe('required-review-gate-conflict');
   });
 });
+
+it('a failed review-gate named as a fast prerequisite blocks push-mode admission', () => {
+  const gate = reviewStartGate({ headSha: head, rowsHead: head, rowsComplete: true, rosterSource: 'live', repo: 'we',
+    requiredChecks: ['test', 'review-gate'], checks: [check('test'), check('review-gate', 'failure')],
+    policy: { ...review, startAfter: 'push', startEarly: 'off', fastChecks: { we: ['review-gate'] } } });
+  expect(gate.allowed).toBe(false);
+});

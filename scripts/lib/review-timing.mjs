@@ -151,7 +151,9 @@ export function reviewStartGate({ headSha, checks, requiredChecks, rowsHead, row
   // Rollback preserves the original strict CI-green result, including its reason and affected rows.
   if (policy.startEarly === 'off' && !policy.startBeforeCi && policy.startAfter === 'ci-green') return strict();
   const prerequisites = policy.startAfter === 'ci-green' ? requiredChecks : fastChecksFor(policy.fastChecks, repo) ?? requiredChecks;
-  const registered = () => registeredStartGate({ headSha, checks, requiredChecks: prerequisites, ...provenance });
+  // A review-gate named as a prerequisite is never excused as held.
+  const prereq = { ...provenance, reviewStart: false };
+  const registered = () => registeredStartGate({ headSha, checks, requiredChecks: prerequisites, ...prereq });
   const pendingStart = gate => {
     const mode = policy.startEarly ?? REVIEW_TIMING_DEFAULTS.startEarly;
     if (!['shadow', 'on'].includes(mode)) return gate;
@@ -189,7 +191,7 @@ export function reviewStartGate({ headSha, checks, requiredChecks, rowsHead, row
     return { allowed: true, headSha, reason: 'verify-marker', affected: [] };
   }
   if (policy.startAfter === 'ci-green') return pendingStart(strict());
-  return pendingStart(reviewCiGate({ headSha, checks, requiredChecks: prerequisites, ...provenance }));
+  return pendingStart(reviewCiGate({ headSha, checks, requiredChecks: prerequisites, ...prereq }));
 }
 export function reviewMustVoid({ reviewedHead, currentHead, checks, requiredChecks = null, rowsHead, rowsComplete, rosterSource, policy = REVIEW_TIMING_DEFAULTS } = {}) {
   return !reviewedHead || reviewedHead !== currentHead || (policy.cancelOnCiRed && reviewAdmissionCiRed({ headSha: currentHead, checks, requiredChecks, rowsHead, rowsComplete, rosterSource }));
