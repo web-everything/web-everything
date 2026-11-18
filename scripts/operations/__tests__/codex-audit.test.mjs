@@ -181,10 +181,10 @@ describe('canonical audit', () => {
     expect(findAudit([first, later], { base: BASE, head: HEAD, questionHash: QUESTION_HASH })).toBe(later);
   });
 
-  it('findAudit selects latest exact base, head and canonical hash, rejecting other hashes and heads', () => {
+  it('findAudit selects the last-appended exact base, head and canonical hash, rejecting other hashes and heads', () => {
     const first = { base: BASE, head: HEAD, questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', at: '2026-01-01T00:00:00.000Z' };
     const latest = { ...first, at: AT };
-    const records = [latest, { ...latest, head: BASE }, { ...latest, questionHash: 'other' }, first];
+    const records = [first, { ...latest, head: BASE }, { ...latest, questionHash: 'other' }, latest];
     expect(findAudit(records, { base: BASE, head: HEAD, questionHash: QUESTION_HASH })).toBe(latest);
     expect(findAudit(records, { base: BASE, head: BASE, questionHash: 'other' })).toBeNull();
     expect(findAudit([first], { base: BASE, head: BASE, questionHash: QUESTION_HASH })).toBeNull();
@@ -523,5 +523,30 @@ describe('audit record fingerprint (R503)', () => {
       expect(await main(ARGS, g.deps)).toBe(0);
       expect(g.records[0]).not.toHaveProperty('fingerprint');
     }
+  });
+});
+
+describe('findAudit ordering and clock trust (#7011)', () => {
+  const NOW = Date.parse('2026-11-17T12:00:00Z');
+  const rec = (verdict, at) => ({ head: HEAD, base: BASE, questionHash: QUESTION_HASH, verdict, at, findings: [] });
+  const find = records => findAudit(records, { base: BASE, head: HEAD, questionHash: QUESTION_HASH, priorQuestionHashes: [], now: NOW });
+
+  it('a future-dated NOT WEAKENED does not override a later-appended WEAKENED', () => {
+    const pass = rec('NOT WEAKENED', '2099-01-01T00:00:00Z');
+    const weak = rec('WEAKENED', '2026-11-17T11:59:00Z');
+    expect(find([pass, weak])).toBe(weak);
+    expect(find([pass])).toBeNull();
+  });
+
+  it('tolerates up to 5 minutes of clock skew but not more', () => {
+    expect(find([rec('NOT WEAKENED', '2026-11-17T12:04:00Z')])).not.toBeNull();
+    expect(find([rec('NOT WEAKENED', '2026-11-17T12:06:00Z')])).toBeNull();
+  });
+
+  it('append order decides, not the self-reported timestamp', () => {
+    const first = rec('NOT WEAKENED', '2026-11-17T11:00:00Z');
+    const second = rec('WEAKENED', '2026-11-17T10:00:00Z');
+    expect(find([first, second])).toBe(second);
+    expect(find([second, first])).toBe(first);
   });
 });
