@@ -1097,3 +1097,18 @@ describe('accepted-head carry — a fresh hold verdict must not re-hold a PR alr
     expect(decideHoldReadyStrip(REVIEW_LABELS.pending, [REVIEW_LABELS.accepted, REVIEW_LABELS.human], { acceptedAtHead: true }).held).toBe(true);
   });
 });
+
+
+describe('pr-land refuses incomplete net diff evidence before readiness', () => {
+  it('requires an explicitly scored result, including retained cumulative evidence', async () => {
+    const { requireScoredNetDiff } = await import('../pr-land.mjs');
+    for (const signal of [null, {}, { scored: false, changedFiles: ['README.md'] }]) {
+      expect(() => requireScoredNetDiff(signal)).toThrow(/Repair the checkout/);
+    }
+    expect(requireScoredNetDiff({ scored: true })).toEqual({ scored: true });
+    const src = readFileSync(resolve(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
+    expect(src.indexOf('requireScoredNetDiff(sig);')).toBeLessThan(src.indexOf('const applyReviewEscalationLabel ='));
+    expect(src.indexOf('requireScoredNetDiff(sig);')).toBeLessThan(src.indexOf('    applyLabel();'));
+
+  });
+});

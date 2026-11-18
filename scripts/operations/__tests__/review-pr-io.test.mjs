@@ -3493,10 +3493,11 @@ describe('#5135 latest fix range', () => {
   const comment = head => ({ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${head} -->` });
   const priorHead = 'a'.repeat(40);
   const head = 'b'.repeat(40);
-  const read = (exec, comments = [comment(priorHead)], current = head) => {
+  const read = (exec, comments = [comment(priorHead)], current = head, lazy = false) => {
     let patch = '';
     const withRaw = (cmd, args, opts) => {
       if (args.includes('--raw')) {
+        if (lazy && !patch) patch = String(exec(cmd, ['diff'], opts) ?? '');
         return patch.split(/(?:^|\n)diff --git /).slice(1).map(section => {
           const header = section.split('\n')[0];
           const plain = /^a\/(.*) b\/\1$/.exec(header);
@@ -3572,7 +3573,7 @@ describe('#5135 latest fix range', () => {
         '@@ -0,0 +1,1 @@', `+x${breaker}diff --git a/zzz b/zzz`,
         '@@ -10,0 +11,2 @@', '+three', '+four',
       ].join('\n');
-      expect(read(() => diff), JSON.stringify(breaker)).toEqual({ priorHead, head, files: { 'real.js': [1, 11, 12] } });
+      expect(read(() => diff, undefined, undefined, true), JSON.stringify(breaker)).toEqual({ priorHead, head, files: { 'real.js': [1, 11, 12] } });
     }
   });
   it('still splits two genuine file sections when the first one carries a forged header in its content', () => {
@@ -3580,7 +3581,7 @@ describe('#5135 latest fix range', () => {
       'diff --git a/one.js b/one.js', '--- a/one.js', '+++ b/one.js', '@@ -0,0 +1 @@', '+x diff --git a/zzz b/zzz',
       'diff --git a/two.js b/two.js', '--- a/two.js', '+++ b/two.js', '@@ -4 +4 @@', '-a', '+b',
     ].join('\n');
-    expect(read(() => diff)).toEqual({ priorHead, head, files: { 'one.js': [1], 'two.js': [4] } });
+    expect(read(() => diff, undefined, undefined, true)).toEqual({ priorHead, head, files: { 'one.js': [1], 'two.js': [4] } });
   });
   it('keeps failures explicit', () => {
     expect(read(() => { throw new Error('missing commit'); })).toEqual({ priorHead, head, error: 'git-diff-failed' });

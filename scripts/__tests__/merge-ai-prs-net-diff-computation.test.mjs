@@ -11,6 +11,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { computeNetDiffPaths, parseNumstat, computeNetDiffChangedFiles, computeNetDiffText, resolveNetDiffBasis, computeNetDiffSignals } from '../merge-ai-prs.mjs';
+import { requireScoredNetDiff } from '../pr-land.mjs';
 import { scoreEscalation, diffHunksFrom } from '../lib/review-escalation.mjs';
 
 
@@ -827,6 +828,19 @@ describe('computeNetDiffSignals — the ONE net-diff derivation both call sites 
     expect(sig.diffHunks).toBe(sig.netDiffText.text);
   });
 
+  it('own-delta read failure retains the cumulative set, remains unscored, and pr-land refuses it', () => {
+    const { exec } = fakeExec({ ...script,
+      'git diff --numstat deadbeef origin/lane/x': { throw: 'own delta unreadable' },
+    });
+    const sig = computeNetDiffSignals({ exec, rev: 'lane/x', baseRev: 'deadbeef' });
+    expect(sig.changedFiles).toEqual(['README.md']);
+    expect(sig.humanBasisFiles).toEqual(['README.md']);
+    expect(sig.diffLines).toBe(4);
+    expect(sig.netDiffText.scored).toBe(true);
+    expect(sig.scored).toBe(false);
+    expect(() => requireScoredNetDiff(sig)).toThrow(/unscored.*refusing/);
+  });
+
   it('a FAILED text diff leaves the whole signal unscored while retaining fallback escalation paths', () => {
     // This is round 1's blocker in the shape it actually reaches a detector — a real file list beside a content
     // signal that must say "I could not look", not "there was nothing to see".
@@ -925,7 +939,7 @@ describe('computeNetDiffText passes --no-ext-diff (#2890-review-r2 finding 2b)',
     expect(textDiff).toContain('--no-ext-diff');
     expect(textDiff.indexOf('--no-ext-diff')).toBeLessThan(textDiff.indexOf('--end-of-options'));
   });
-  it('forces --text so repository binary thresholds cannot suppress hunks', () => {
+  it('omits --text and preserves the hardened diff flags', () => {
     const calls = [];
     const exec = (cmd, args) => {
       args = scoringArgs(args);
@@ -934,7 +948,9 @@ describe('computeNetDiffText passes --no-ext-diff (#2890-review-r2 finding 2b)',
       return 'diff\n';
     };
     computeNetDiffText({ exec, rev: 'deadbeef' });
-    expect(calls.find((a) => a[0] === 'diff' && !a.includes('--numstat'))).toContain('--text');
+    const textDiff = calls.find((a) => a[0] === 'diff' && !a.includes('--numstat'));
+    expect(textDiff).not.toContain('--text');
+    expect(textDiff).toEqual(expect.arrayContaining(['--no-ext-diff', '--no-textconv', '--no-renames', '--no-color']));
   });
 });
 

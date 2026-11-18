@@ -4470,10 +4470,20 @@ text guards as a newly reproduced vulnerability. Bounded-output, stack, latest-f
 and delta failures have named negative tests requiring a wholly unscored result.
 
 Scorer rendering ignores inherited Git config and pins repository-local diff defaults,
-including `core.bigFileThreshold`, while forcing text. An independent NUL-delimited
+including `core.bigFileThreshold`, without forcing binary blobs into text. An independent NUL-delimited
 raw oid diff must match the listed paths and rendered sections; each changed blob
 needs a hunk. Mode-only sections are allowed; symlinks need hunks and changed
 submodules require human review. Empty renderers, binary summaries, unreadable raw
 evidence and output bounds leave the whole result unscored: repair and rerun or
 request human review of the full diff. Pin these cases with real Git and an empty
 renderer stub in `review-pr-io-pinned-head.test.mjs` and `hardened-git-diff.test.mjs`.
+
+Raw full blob OIDs and modes for every changed path are bound into both strict and
+contribution fingerprints, independently of textual `index` headers, including mechanically excluded paths.
+Older fingerprints lacking raw identities cannot clear newly bound evidence; rerun
+review to record a fresh fingerprint. Binary output
+(including `GIT binary patch`) and changed OIDs without hunks require human review.
+An own-delta read failure retains the measured cumulative file set but stays
+`scored:false`; pr-land refuses that result before scoring or readiness labelling.
+Regression cases live in `hardened-git-diff.test.mjs`,
+`merge-ai-prs-net-diff-computation.test.mjs`, and `pr-land.test.mjs`.

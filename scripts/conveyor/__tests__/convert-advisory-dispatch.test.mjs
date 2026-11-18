@@ -31,6 +31,13 @@ const d = { prNumber: 2766, headSha: HEAD, reviewedSha: HEAD, acceptComment, esc
  *  `git`, exactly like `provider`'s own default shells real `gh`). */
 const FAKE_DIFF = 'diff --git a/scripts/operations/__tests__/review-loop-cli.test.mjs b/scripts/operations/__tests__/review-loop-cli.test.mjs\n--- a/scripts/operations/__tests__/review-loop-cli.test.mjs\n'
   + "+++ b/scripts/operations/__tests__/review-loop-cli.test.mjs\n@@ -1 +1 @@\n-it('old case', () => {});\n+it('new case', () => {});\n";
+const FAKE_RAW_RECORD = {
+  path: 'scripts/operations/__tests__/review-loop-cli.test.mjs',
+  oldMode: '100644', newMode: '100644',
+  oldOid: '1'.repeat(40), newOid: '2'.repeat(40),
+};
+const FAKE_RAW_DIFF = `:${FAKE_RAW_RECORD.oldMode} ${FAKE_RAW_RECORD.newMode} ${FAKE_RAW_RECORD.oldOid} ${FAKE_RAW_RECORD.newOid} M\0${FAKE_RAW_RECORD.path}\0`;
+const FAKE_BOUND_DIFF = FAKE_DIFF.replace('\n', `\nwe-raw-blob ${JSON.stringify(FAKE_RAW_RECORD)}\n`);
 function fakeAvailableEvidence() {
   return vi.fn(async () => ({ text: FAKE_DIFF, scored: true }));
 }
@@ -124,12 +131,12 @@ describe('fetchTestGamingDiffEvidence / resolveTargetedCheckEvidence', () => {
       if (args[0] === 'fetch') return '';
       if (args.includes('rev-parse')) return `${HEAD}\n`;
       if (args.includes('merge-base')) return 'd'.repeat(40);
-      if (args.includes('--raw')) return `:100644 100644 ${'1'.repeat(40)} ${'2'.repeat(40)} M\0scripts/operations/__tests__/review-loop-cli.test.mjs\0`;
+      if (args.includes('--raw')) return FAKE_RAW_DIFF;
       if (args.includes('diff')) return FAKE_DIFF;
       return '';
     };
     const result = fetchTestGamingDiffEvidence({ exec, rev: HEAD, paths: ['scripts/operations/__tests__/review-loop-cli.test.mjs'] });
-    expect(result).toEqual({ text: FAKE_DIFF, scored: true, base: 'd'.repeat(40), rev: HEAD });
+    expect(result).toEqual({ text: FAKE_BOUND_DIFF, scored: true, base: 'd'.repeat(40), rev: HEAD });
     expect(calls.some((c) => c.includes('review-loop-cli.test.mjs'))).toBe(true);
   });
   it('fetchTestGamingDiffEvidence: an unresolvable basis (no candidate resolves) reports scored:false', () => {
@@ -180,12 +187,12 @@ describe('fetchTestGamingDiffEvidence / resolveTargetedCheckEvidence', () => {
       if (args[0] === 'fetch') return '';
       if (args.includes('rev-parse')) return `${HEAD}\n`;
       if (args.includes('merge-base')) return 'd'.repeat(40);
-      if (args.includes('--raw')) return `:100644 100644 ${'1'.repeat(40)} ${'2'.repeat(40)} M\0scripts/operations/__tests__/review-loop-cli.test.mjs\0`;
+      if (args.includes('--raw')) return FAKE_RAW_DIFF;
       if (args.includes('diff')) return FAKE_DIFF;
       throw new Error(`unexpected ${cmd}`);
     };
     expect(fetchTestGamingDiffEvidence({ exec, repo: 'web-everything/web-everything', prNumber: 1, rev: HEAD, paths: ['scripts/operations/__tests__/review-loop-cli.test.mjs'] }))
-      .toMatchObject({ scored: true, text: FAKE_DIFF });
+      .toMatchObject({ scored: true, text: FAKE_BOUND_DIFF });
   });
   it('resolveTargetedCheckEvidence: heal-mutual-exclusivity REQUIRES the PR comment history and hands it to the judge (PR #2781 review)', async () => {
     const heal = { kind: 'heal-mutual-exclusivity', reasonText: '**`review:accepted` removed — mutual exclusivity' };

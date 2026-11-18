@@ -1,5 +1,10 @@
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { normalizeDiffFingerprint, normalizeContributionFingerprint } from '../review-escalation.mjs';
 import { describe, expect, it } from 'vitest';
-import { hardenedGitDiff, hardenedGitDiffCommand, verifyRenderedDiff } from '../hardened-git-diff.mjs';
+import { hardenedGitDiff, hardenedGitDiffCommand, verifyRenderedDiff, bindRawBlobEvidence, readRawBlobRecords } from '../hardened-git-diff.mjs';
 
 const oid = n => String(n).repeat(40);
 const record = (path = 'x', { oldMode = '100644', newMode = '100644', oldOid = oid(1), newOid = oid(2) } = {}) =>
@@ -59,8 +64,57 @@ describe('raw oid rendering backstop', () => {
       GIT_DIR: 'other', GIT_WORK_TREE: 'other', GIT_COMMON_DIR: 'other', GIT_INDEX_FILE: 'other',
       GIT_OBJECT_DIRECTORY: 'other', GIT_ALTERNATE_OBJECT_DIRECTORIES: 'other', GIT_EXTERNAL_DIFF: 'hide', GIT_DIFF_OPTS: '-U0',
     });
+    expect(args).not.toContain('--text');
     expect(opts.env).toMatchObject({ PATH: 'tools', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_COUNT: '0' });
     for (const key of ['GIT_CONFIG_SYSTEM', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_EXTERNAL_DIFF', 'GIT_DIFF_OPTS']) expect(opts.env).not.toHaveProperty(key);
-    expect(args).toEqual(expect.arrayContaining(['core.bigFileThreshold=2g', 'diff.algorithm=myers', 'diff.context=3', 'core.quotepath=false', '--text', '--no-textconv', '--no-ext-diff']));
+    expect(args).toEqual(expect.arrayContaining(['core.bigFileThreshold=2g', 'diff.algorithm=myers', 'diff.context=3', 'core.quotepath=false', '--no-textconv', '--no-ext-diff']));
+  });
+});
+
+
+describe('raw blob fingerprint identity', () => {
+  it('different binary payloads at one path have different strict and contribution fingerprints and refuse scoring', () => {
+    const root = mkdtempSync(join(tmpdir(), 'we-binary-evidence-'));
+    const exec = (cmd, args, opts) => execFileSync(cmd, args, { ...opts, cwd: root });
+    const git = (...args) => exec('git', args, { encoding: 'utf8' }).trim();
+    try {
+      git('init', '--quiet');
+      git('config', 'user.name', 'Fixture');
+      git('config', 'user.email', 'fixture@example.test');
+      writeFileSync(join(root, 'payload'), Buffer.from([0, 255, 1]));
+      git('add', '.'); git('commit', '--quiet', '-m', 'base');
+      const base = git('rev-parse', 'HEAD');
+      const evidence = [];
+      for (const byte of [254, 253]) {
+        writeFileSync(join(root, 'payload'), Buffer.from([0, byte, 1]));
+        git('add', '.'); git('commit', '--quiet', '-m', 'payload');
+        const head = git('rev-parse', 'HEAD');
+        const text = git('diff', base, head);
+        expect(text).toContain('Binary files');
+        expect(() => hardenedGitDiff(exec, ['diff', base, head])).toThrow(/human review required/);
+        // Remove renderer-provided index identities: only the independent raw
+        // backstop may distinguish these otherwise identical binary summaries.
+        const summary = text.replace(/^index .*\n/gm, '');
+        evidence.push(bindRawBlobEvidence(summary, readRawBlobRecords(exec, base, head)));
+      }
+      for (const fingerprint of [normalizeDiffFingerprint, normalizeContributionFingerprint]) {
+        expect(fingerprint(evidence[0])).not.toBe(fingerprint(evidence[1]));
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('retains every raw oid and mode even for identical rendered hunks and excluded mechanical paths', () => {
+    for (const path of ['x', '.lane-manifest.json']) {
+      const read = (newOid, newMode = '100644') => hardenedGitDiff(
+        (_cmd, args) => args.includes('--raw') ? record(path, { newOid, newMode }) : patch(path), ['diff', 'base', 'head']);
+      for (const fingerprint of [normalizeDiffFingerprint, normalizeContributionFingerprint]) {
+        expect(fingerprint(read(oid(2)))).not.toBe(fingerprint(read(oid(3))));
+        expect(fingerprint(read(oid(2)))).not.toBe(fingerprint(read(oid(2), '100755')));
+      }
+    }
+  });
+
+  it('refuses GIT binary patch rendering even beside a hunk', () => {
+    expect(() => verifyRenderedDiff(() => record(), 'base', 'head', patch('x') + 'GIT binary patch\n')).toThrow(/human review required/);
   });
 });

@@ -4192,7 +4192,7 @@ export function computeNetDiffChangedFiles({ exec, remote = 'origin', base = 'ma
     // and `rev-parse` are hardening rather than live holes (both reject an unknown option on git 2.50.1, and
     // the surrounding catch absorbs it), while the `git diff` positions are genuinely exploitable — verified.
     try { own = parseNumstat(hardenedGitDiff(exec, ['diff', '--numstat', '--end-of-options', baseRev, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })); }
-    catch { return { ...empty, reason: 'diff-failed' }; }
+    catch { return { ...humanBasis, humanBasisFiles: humanBasis.changedFiles, scored: false, reason: 'diff-failed' }; }
   }
   // #3343 — the basis's `basisKind` / `basisNarrowed` are DELIBERATELY not re-exported here. This function's
   // return shape is the SIZE/blast-radius payload, asserted whole (`toEqual`) at a dozen call sites; the
