@@ -36,7 +36,7 @@ export default {
       { type: REVIEW_EFFECTS.WRITE_UP, payload: { bodyFile: payload.bodyFile, body } },
     ] }) }));
 
-    for (const state of ['same-head', 'unrelated-comment', 'no-comment', 'moved-head', 'unreadable-labels', 'source-labels-still-present', 'not-applied']) {
+    for (const state of ['same-head', 'unmarked-comment', 'unrelated-comment', 'no-comment', 'moved-head', 'unreadable-labels', 'source-labels-still-present', 'later-changes', 'ruling-hold', 'not-applied']) {
       const store = createMemoryRunStore();
       const run = advance(startRun({ op: 'observe-label', id: `observe-${state}`, registry }), { registry });
       Object.assign(run.effects[0], { status: 'pending', attempts: 1, error: 'UNKNOWN: response lost',
@@ -47,10 +47,12 @@ export default {
       const root = mkdtempSync(join(tmpdir(), 'observe-label-'));
       const sinks = createReviewPrSinks({ root, runStore: store,
         labelProvider: { readComments: () => state === 'no-comment' ? [] : [{
-          author: { login: 'web-everything' }, body: `${state === 'unrelated-comment' ? 'Unrelated review.' : body}\n\n<!-- reviewed-sha: ${HEAD} -->`, createdAt: '2026-11-18T19:16:30Z',
+          author: { login: 'web-everything' }, body: `${state === 'unrelated-comment' ? 'Unrelated review.' : body}\n\n<!-- reviewed-sha: ${HEAD} -->${!['unmarked-comment', 'unrelated-comment'].includes(state) ? `\n<!-- review-attempt: ${run.effects[0].key} -->` : ''}`, createdAt: '2026-11-18T19:16:30Z',
         }] },
         readHead: () => state === 'moved-head' ? 'b'.repeat(40) : HEAD,
         readLabels: () => state === 'unreadable-labels' ? null
+          : state === 'later-changes' ? [...labels, 'review:changes']
+          : state === 'ruling-hold' ? [...labels, 'advisory:ruling-needed']
           : state === 'source-labels-still-present' ? ['review:pending', 'ready-to-merge'] : labels,
         runNode: () => { writes++; throw new Error('sink replayed'); },
       });

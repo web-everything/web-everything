@@ -1173,6 +1173,25 @@ export function partitionAgentClearable(prs) {
   return { clearable, skippedHuman, skippedUnverified };
 }
 
+/** Attempt evidence is bounded to an effect-key-safe alphabet; invalid input stamps nothing. */
+export const REVIEW_ATTEMPT_MARKER = 'review-attempt';
+export function isValidReviewAttemptId(id) {
+  return typeof id === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:#-]{0,255}$/.test(id);
+}
+export function buildReviewAttemptMarker(id) {
+  return isValidReviewAttemptId(id) ? `<!-- ${REVIEW_ATTEMPT_MARKER}: ${id} -->` : '';
+}
+/** Last marker wins, using the same trusted-author boundary as reviewed-sha. */
+export function parseReviewAttempt(comments) {
+  let latest = null;
+  const pattern = /<!--\s*review-attempt:\s*([A-Za-z0-9][A-Za-z0-9._:#-]{0,255})\s*-->/g;
+  for (const comment of Array.isArray(comments) ? comments : []) {
+    if (!isTrustedMarkerAuthor(comment) || typeof comment.body !== 'string') continue;
+    for (const match of comment.body.matchAll(pattern)) latest = match[1];
+  }
+  return latest;
+}
+
 /**
  * #2409 — the machine-readable marker that records WHICH commit-set a `review:accepted` verdict actually
  * covered. `review-set-label.mjs` stamps it into the durable accept comment at the moment it applies

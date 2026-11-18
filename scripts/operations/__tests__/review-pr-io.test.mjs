@@ -755,10 +755,18 @@ describe('the label sink', () => {
     expect(argv).toContain('--repo=o/n');
     expect(argv).toContain('--to=accepted');
     expect(argv).toContain('--actor=operator');
+    expect(argv.some(arg => arg.startsWith('--attempt-id='))).toBe(Boolean(CTX.key));
     // The SAME run-scoped path effect 0 staged — derived from `ctx.runId`, not re-derived from the payload.
     expect(argv).toContain(`--body-file=${join(reviewSidecarDir(root), 'run-1', 'o-n-7-verdict.md')}`);
     // It never builds a `gh` call of its own — the single home owns the write arc, the markers and the ordering.
     expect(argv.join(' ')).not.toContain('gh ');
+  });
+
+  it('passes the exact executor key as attempt-id', async () => {
+    const runNode = vi.fn(() => '{"ok":true}');
+    const sinks = createReviewPrSinks({ root, publishGate: async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' }), runNode });
+    await sinks[REVIEW_EFFECTS.LABEL](payload, { ...CTX, key: 'run-1#2#1' });
+    expect(runNode.mock.calls[0][0]).toContain('--attempt-id=run-1#2#1');
   });
 
   // Resume from a DIFFERENT checkout: the staged file lives under the first lane's root, so this root has none.
@@ -4398,9 +4406,9 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
 
 
 describe('pending label swap observation', () => {
-  // Persisted PR #7109 shape: both writes landed but the response did not.
+  // Marked successor to the historical unmarked PR #7109 shape.
   const entry = {
-    status: 'pending', attempts: 1, lastAttemptAt: '2026-11-18T19:15:30.155Z',
+    key: 'observe-7109#0#0', status: 'pending', attempts: 1, lastAttemptAt: '2026-11-18T19:15:30.155Z',
     payload: { pr: 7109, repo: 'o/n', reviewedHead: 'd20084f7c427cdb0000c40f298fff4f6bdff3179',
       addLabel: 'review:accepted', removeLabels: ['review:pending'], to: 'accepted', bodyFile: '7109-verdict.md' },
   };
@@ -4409,7 +4417,7 @@ describe('pending label swap observation', () => {
     payload: { bodyFile: entry.payload.bodyFile, body } }] };
   const live = ['ready-to-merge', 'review:accepted', 'review-round:1', 'status:ready-to-merge', 'red-team:pending'];
   const comment = { author: { login: 'web-everything' },
-    body: `Recorded by reviewer.\n\n${body.replace(/\r\n/g, '\n').trim()}\n\n<!-- reviewed-sha: d20084f7c427cdb0000c40f298fff4f6bdff3179 -->`, createdAt: '2026-11-18T19:16:30Z' };
+    body: `<!-- review-attempt: ${entry.key} -->\nRecorded by reviewer.\n\n${body.replace(/\r\n/g, '\n').trim()}\n\n<!-- reviewed-sha: d20084f7c427cdb0000c40f298fff4f6bdff3179 -->`, createdAt: '2026-11-18T19:16:30Z' };
   const observer = (options = {}) => {
     const observe = createReviewPrSinks({ root,
       readHead: async () => entry.payload.reviewedHead, readLabels: async () => live,
@@ -4418,7 +4426,7 @@ describe('pending label swap observation', () => {
     return (entry, record = run) => observe(entry, record);
   };
 
-  it('observes PR 7109 applied on its reviewed head using the live forge readers', async () => {
+  it('observes an exact attempt marker applied on its reviewed head using the live forge readers', async () => {
     const readHead = vi.fn(() => entry.payload.reviewedHead);
     const readLabels = vi.fn(() => live.map(name => ({ name })));
     const readComments = vi.fn(() => [comment]);
@@ -4431,47 +4439,25 @@ describe('pending label swap observation', () => {
   it.each([
     ['no verdict comment', []],
     ['unrelated trusted same-head later review', [{ ...comment, body: `Unrelated review.\n\n<!-- reviewed-sha: ${entry.payload.reviewedHead} -->` }]],
-    ['changed write-up text', [{ ...comment, body: comment.body.replace('checking this run', 'checking another run') }]],
+    ['another attempt', [{ ...comment, body: comment.body.replace(entry.key, 'other#0#0') }]],
+    ['old run with reviewed-sha only', [{ ...comment, body: comment.body.replace(`<!-- review-attempt: ${entry.key} -->`, '') }]],
     ['untrusted author', [{ ...comment, author: { login: 'someone' } }]],
     ['missing author', [{ ...comment, author: undefined }]],
-    ['older verdict', [{ ...comment, createdAt: '2026-11-18T19:15:30.154Z' }]],
-    ['another head', [{ ...comment, body: `<!-- reviewed-sha: ${'b'.repeat(40)} -->` }]],
-    ['missing timestamp', [{ ...comment, createdAt: undefined }]],
-    ['unparsable timestamp', [{ ...comment, createdAt: 'invalid' }]],
+    ['another head', [{ ...comment, body: comment.body.replace(entry.payload.reviewedHead, 'b'.repeat(40)) }]],
+    ['markers split across comments', [{ ...comment, body: `<!-- review-attempt: ${entry.key} -->` },
+      { ...comment, body: `<!-- reviewed-sha: ${entry.payload.reviewedHead} -->` }]],
     ['unreadable comments', null],
     ['incomplete comments result', { comments: [comment], complete: false }],
   ])('keeps matching labels unknown with %s', async (_name, comments) => {
     await expect(observer({ labelProvider: { readComments: () => comments } })(entry)).resolves.toBeNull();
   });
 
-  it.each([
-    ['missing run', undefined],
-    ['missing frozen write-up', { ...run, effects: [] }],
-    ['empty frozen write-up', { ...run, effects: [{ ...run.effects[0], payload: { ...run.effects[0].payload, body: '  \r\n' } }] }],
-  ])('keeps matching labels unknown with %s', async (_name, record) => {
-    await expect(createReviewPrSinks({ root,
-      readHead: () => entry.payload.reviewedHead, readLabels: () => live,
-      labelProvider: { readComments: () => [comment] },
-    })[REVIEW_EFFECTS.LABEL].observeOutcome(entry, record)).resolves.toBeNull();
+  it('does not require staged text, a run record or attempt timestamp', async () => {
+    await expect(observer({ runStore: { read: () => { throw new Error('unavailable'); } } })({ ...entry, lastAttemptAt: undefined }, null)).resolves.toBe('applied');
   });
 
-  it('keeps matching labels unknown when the staged body cannot be recovered or read', async () => {
-    const path = reviewBodyPath({ root, runId: run.id, bodyFile: entry.payload.bodyFile });
-    mkdirSync(path, { recursive: true }); // A directory cannot be read or replaced as the body file.
-    await expect(observer()(entry)).resolves.toBeNull();
-  });
-
-  it('recovers the frozen write-up from the observer run instead of a different sink store', async () => {
-    await expect(observer({ runStore: { read: () => { throw new Error('wrong store'); } } })(entry)).resolves.toBe('applied');
-    expect(readFileSync(reviewBodyPath({ root, runId: run.id, bodyFile: entry.payload.bodyFile }), 'utf8')).toBe(body);
-  });
-
-  it('accepts a trusted verdict created exactly at the attempt timestamp', async () => {
-    await expect(observer({ labelProvider: { readComments: () => [{ ...comment, createdAt: entry.lastAttemptAt }] } })(entry)).resolves.toBe('applied');
-  });
-
-  it.each([undefined, null, '', 'invalid'])('fails closed for missing or unparsable lastAttemptAt %s', async lastAttemptAt => {
-    await expect(observer()({ ...entry, lastAttemptAt })).resolves.toBeNull();
+  it.each([undefined, '', 'bad id', 'x'.repeat(257)])('fails closed for missing or invalid effect key %s', async key => {
+    await expect(observer()({ ...entry, key })).resolves.toBeNull();
   });
 
   it('fails closed without a complete comments reader', async () => {
@@ -4493,6 +4479,10 @@ describe('pending label swap observation', () => {
   });
 
   it.each([
+    ['later changes label', [...live, 'review:changes']],
+    ['later ruling hold', [...live, 'advisory:ruling-needed']],
+    ['human hold', [...live, 'review:human']],
+    ['mechanical hold', [...live, 'review:held-mechanical']],
     ['partial swap', ['review:pending', 'review:accepted']],
     ['neither before nor after', ['ready-to-merge']],
     ['unreadable labels', null],
@@ -4515,13 +4505,13 @@ describe('pending label swap observation', () => {
     await expect(observer()(addOnly)).resolves.toBe('applied');
   });
 
-  it.each(['pr', 'repo', 'reviewedHead', 'addLabel', 'removeLabels'])('fails closed for missing payload field %s', async field => {
+  it.each(['pr', 'repo', 'reviewedHead', 'to'])('fails closed for missing payload field %s', async field => {
     const payload = { ...entry.payload };
     delete payload[field];
     await expect(observer()({ ...entry, payload })).resolves.toBeNull();
   });
 
-  it.each([null, { repo: '' }, { pr: 0 }, { removeLabels: [null] }, { removeLabels: 'review:pending' }, { reviewedHead: '' }])('fails closed for incomplete payload %j', async invalid => {
+  it.each([null, { repo: '' }, { pr: 0 }, { to: 'invalid' }, { reviewedHead: '' }])('fails closed for incomplete payload %j', async invalid => {
     const payload = invalid === null ? null : { ...entry.payload, ...invalid };
     await expect(observer()({ ...entry, payload })).resolves.toBeNull();
   });

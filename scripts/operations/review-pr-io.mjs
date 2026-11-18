@@ -14,7 +14,7 @@ import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryRef
 import { judgeSpawn } from '../lib/judge-spawn.mjs';
 import { loadDaemonVersionsSettingsFile, resolveDaemonVersionsSettings } from '../lib/daemon-versions-settings.mjs';
 import { appendJuryEvent } from '../lib/jury-ledger.mjs';
-import { decideParkToHuman, referralCardReadable } from '../review-set-label.mjs';
+import { decideSetLabel, decideParkToHuman, referralCardReadable } from '../review-set-label.mjs';
 import { buildReviewJudgeRequest } from './review-pr.mjs';
 import { referralSeatDisabled } from './review-seat-policy.mjs';
 export { referralSeatDisabled } from './review-seat-policy.mjs';
@@ -88,7 +88,7 @@ import { REVIEW_EFFECTS, FULL_REVIEW_ANCHOR } from './review-pr.mjs';
 import { canonicalizeSlug } from '../lib/constellation-repos.mjs';
 import { isValidRunId } from './run-record.mjs';
 // mechanical-dispatcher — the `AWAITING_ADVISORY_CLEAR` sink's own label name, imported rather than restated.
-import { REVIEW_LABELS, hasReviewLabel, parseReviewedSha } from '../lib/review-escalation.mjs';
+import { REVIEW_LABELS, hasReviewLabel, parseReviewedSha, parseReviewAttempt, isValidReviewAttemptId } from '../lib/review-escalation.mjs';
 
 export { PR_VIEW_FIELDS, prViewFileName };
 
@@ -1788,6 +1788,7 @@ export function createReviewPrSinks({
         `--repo=${payload.repo}`,
         `--to=${payload.to}`,
         `--actor=${payload.actor}`,
+        ...(ctx?.key ? [`--attempt-id=${ctx.key}`] : []),
         // #2898 — state the surface the verdict actually came through. Conditional because the payload shape
         // predates the flag: a run record written before it (a `--resume` across the upgrade) has no `channel`,
         // and the single home's own default for an absent one is the NEUTRAL sentence, never a wrong channel.
@@ -2062,39 +2063,30 @@ export function createReviewPrSinks({
   };
   // Only historical body-file argument refusals prove a pending label attempt never wrote.
   sinks[REVIEW_EFFECTS.LABEL].provablyNotApplied = entry => isBodyFileRefusal(entry.error);
-  // Removal labels were narrowed at declaration time: only the complete applied state resolves observation.
-  // A not-applied retry needs comment dedupe by a marker (follow-up card): review-set-label posts a durable comment.
-  sinks[REVIEW_EFFECTS.LABEL].observeOutcome = async (entry, run) => {
+  // Unknown outcomes require this effect's trusted marker and the complete live decision state.
+  // Old unmarked runs remain blocked for operator reconciliation; observation never authorizes replay.
+  sinks[REVIEW_EFFECTS.LABEL].observeOutcome = async (entry) => {
     const payload = entry?.payload;
     const nonempty = value => typeof value === 'string' && value.trim().length > 0;
-    if (!payload || !Number.isInteger(payload.pr) || payload.pr <= 0
-      || !nonempty(payload.repo) || !nonempty(payload.reviewedHead) || !nonempty(payload.addLabel)
-      || !Array.isArray(payload.removeLabels) || !payload.removeLabels.every(nonempty)) return null;
-    const attemptedAt = nonempty(entry.lastAttemptAt) ? Date.parse(entry.lastAttemptAt) : NaN;
-    if (!Number.isFinite(attemptedAt) || typeof labelProvider.readComments !== 'function') return null;
+    if (!isValidReviewAttemptId(entry?.key) || !payload || !Number.isInteger(payload.pr) || payload.pr <= 0
+      || !nonempty(payload.repo) || !nonempty(payload.reviewedHead) || !nonempty(payload.to)
+      || typeof labelProvider.readComments !== 'function') return null;
     try {
-      const staged = ensureStagedBody({ root, runId: run?.id, bodyFile: payload.bodyFile, runStore, readRun: () => run });
-      // buildVerdictComment trims the body-file text; tolerate line-ending differences in the forge read.
-      const normalize = text => text.replace(/\r\n?/g, '\n').trim();
-      const body = normalize(readFileSync(staged, 'utf8'));
-      if (!body) return null;
       const head = await readHead({ repo: payload.repo, pr: payload.pr });
       if (head !== payload.reviewedHead) return null;
       const labels = await readLabels(payload.repo, payload.pr);
       if (!Array.isArray(labels)) return null;
       const names = labels.map(label => typeof label === 'string' ? label : label?.name);
       if (!names.every(nonempty)) return null;
-      const added = names.includes(payload.addLabel);
-      const removed = payload.removeLabels.filter(label => names.includes(label));
-      if (!added || removed.length !== 0) return null;
-      // LABEL couples the swap with a verdict comment, in either writeOrder. Old labels/markers cannot
-      // prove this attempt finished both writes. Always read the complete thread through the provider.
+      const decision = decideSetLabel({ to: payload.to, currentLabels: names });
+      if (!decision.allowed || !names.includes(decision.addLabel)
+        || decision.removeLabels.some(label => names.includes(label))) return null;
+      // The provider checks pagination completeness; failures and non-array evidence fail closed.
       const comments = await labelProvider.readComments(payload.repo, payload.pr);
       if (!Array.isArray(comments)) return null;
       if (comments.some(comment => isTrustedMarkerAuthor(comment)
-        && typeof comment.body === 'string' && normalize(comment.body).includes(body)
-        && parseReviewedSha([comment]) === payload.reviewedHead
-        && typeof comment.createdAt === 'string' && Date.parse(comment.createdAt) >= attemptedAt)) return 'applied';
+        && parseReviewAttempt([comment]) === entry.key
+        && parseReviewedSha([comment]) === payload.reviewedHead)) return 'applied';
       return null;
     } catch { return null; }
   };

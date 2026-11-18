@@ -72,7 +72,7 @@ import { readPinnedChangedFiles, workflowEditHold } from './lib/merge-queue-enqu
 // fingerprint, `READY_TO_MERGE_LABEL` is #2832's hold invariant, `buildReviewedContributionMarker` is
 // #x9xqexm's base-independent third marker. Independent concerns.
 import {
-  REVIEW_PR_CHANNEL, REVIEW_LABELS, hasReviewLabel, buildReviewedShaMarker, buildReviewedDiffMarker,
+  REVIEW_PR_CHANNEL, REVIEW_LABELS, hasReviewLabel, buildReviewedShaMarker, buildReviewAttemptMarker, isValidReviewAttemptId, buildReviewedDiffMarker,
   buildReviewedContributionMarker, buildClearedHumanMarker, buildClearedFromMarker, latestHumanClearanceSourceId, latestHumanClearanceComment, READY_TO_MERGE_LABEL,
   // #3007 — the SAME two digests the markers carry, taken raw so the ledger row records the witnesses
   // themselves rather than re-deriving them from the rendered comment. One computation, two consumers.
@@ -1180,6 +1180,12 @@ export function runReviewLabelCli({
   let repo = (argv.find((a) => a.startsWith('--repo=')) || '').slice('--repo='.length);
   const actorArg = (argv.find((a) => a.startsWith('--actor=')) || '').slice('--actor='.length);
   const actor = actorArg || defaultActor;
+  const attemptFlags = argv.filter(a => a === '--attempt-id' || a.startsWith('--attempt-id='));
+  const attemptId = attemptFlags[0]?.slice('--attempt-id='.length);
+  if (attemptFlags.length && (attemptFlags.length !== 1 || !isValidReviewAttemptId(attemptId))) {
+    fail('--attempt-id must be 1–256 characters: letters, digits, dot, underscore, colon, # or hyphen; omit it only for an unmarked run requiring manual outcome reconciliation');
+  }
+
   let clearReason = (argv.find((a) => a.startsWith('--reason=')) || '').slice('--reason='.length).trim();
   // #3007 — the SURFACE, read here so the ledger row can record it. The rendered COMMENT gets its channel
   // from the caller's `buildComment` closure (#2898); this read is only for the durable row, and it is the
@@ -1897,7 +1903,8 @@ export function runReviewLabelCli({
   }
   const commentBody = buildComment({
     to, actor, decision, headSha, reason: clearReason, reviewedDiff, clearerId, independence, humanClearance,
-  }) + renderReferralCarryRecord(referralCarry) + rearmBinding;
+  }) + renderReferralCarryRecord(referralCarry) + rearmBinding
+    + (attemptId ? `\n\n${buildReviewAttemptMarker(attemptId)}` : '');
 
   // we:scripts/review-set-label.mjs#runReviewLabelCli — THE SIZE GUARD, on the RENDERED bytes, before ANY write.
   // GitHub rejects a comment over `GH_COMMENT_MAX`. The cause this guard exists for: an oversize comment used to
@@ -2801,7 +2808,7 @@ if (IS_CLI) {
     // Handed over so the harness can refuse an empty `--to=changes` alongside its other pre-flight checks
     // (#xd6moh1). The rendered body still comes from the `buildComment` closure below — same text, one read.
     verdictBody,
-    usage: 'usage: review-set-label.mjs <pr> --repo=<owner/name> --to=accepted|changes|clear-human [--actor=<name>] [--channel=<surface>] [--body-file=<path>]  (pr must be a positive integer; changes REQUIRES --body-file=<the findings>; clear-human additionally requires --actor and --reason=<stated reason>)',
+    usage: 'usage: review-set-label.mjs <pr> --repo=<owner/name> --to=accepted|changes|clear-human [--actor=<name>] [--channel=<surface>] [--body-file=<path>] [--attempt-id=<effect-key>]  (pr must be a positive integer; changes REQUIRES --body-file=<the findings>; clear-human additionally requires --actor and --reason=<stated reason>)',
     buildComment: ({ to, actor, headSha, reason, reviewedDiff, clearerId, independence, humanClearance }) => buildVerdictComment({
       to, actor, headSha, reason, reviewedDiff, clearerId, independence, body: verdictBody, channel: verdictChannel,
       humanClearance,

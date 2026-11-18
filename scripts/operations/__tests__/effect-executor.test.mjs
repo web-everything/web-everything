@@ -112,6 +112,20 @@ describe('pending outcome observation', () => {
     return run;
   };
 
+  it('passes the persisted effect key unchanged to the write sink', async () => {
+    const store = createMemoryRunStore();
+    const run = atEffectStep();
+    store.write(run);
+    const healthy = recordingSinks();
+    const original = healthy.sinks['comment.post'];
+    healthy.sinks['comment.post'] = (payload, ctx) => {
+      expect(ctx.key).toBe(run.effects[0].key);
+      return original(payload, ctx);
+    };
+    await applyPendingEffects(run, { sinks: healthy.sinks, store });
+    expect(healthy.calls).toHaveLength(2);
+  });
+
   it.each([false, true])('persists observed applied without replay and advances, including restart (async: %s)', async asynchronous => {
     const store = createMemoryRunStore();
     const run = pending(store);

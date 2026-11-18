@@ -4731,3 +4731,12 @@ Preserve `overlaysBefore` as a veto for omitted live tips: the regression for a 
 retired during planning must reject its omission and preserve HEAD.
 Run this file and `daemon-rebuild-events.test.mjs` through heavy admission. This adoption
 rule does not reset overlay main-sync parking or add retries for parked overlays.
+
+## Label-swap outcome evidence (R115)
+
+Unknown `review.label-swap` outcomes require a trusted `review-attempt` marker equal to the
+persisted effect key, paired with the same comment's `reviewed-sha` and the unchanged live head.
+Re-run `decideSetLabel` on live labels and require its target present and every removal absent;
+frozen removal lists miss holds added later. Unmarked historical comments remain unknown for
+operator reconciliation. The observation tests and soak break must cover both an unmarked
+same-head refusal and marked recovery without replaying the write.

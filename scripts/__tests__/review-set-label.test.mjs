@@ -1,3 +1,4 @@
+import { buildReviewAttemptMarker, parseReviewAttempt } from '../lib/review-escalation.mjs';
 import { normalizeFinding, referralFindingKey, mandatoryReferralReviewer, renderReferralRecord } from '../lib/jury-core.mjs';
 import { assertMandatoryReferralsCleared } from '../review-set-label.mjs';
 /**
@@ -2219,6 +2220,27 @@ describe('the write arc and its #2964 ordering', () => {
     finally { process.exit = realExit; }
     return { exitCode, payload: JSON.parse(chunks.join('') || '{}') };
   };
+
+  it('posts the exact attempt marker when requested and no marker when absent', () => {
+    for (const attempt of [undefined, 'run-1#2#1']) {
+      const p = stubProvider();
+      const post = vi.fn();
+      p.postComment = post;
+      const result = run(p, ['1048', '--repo=o/n', '--to=accepted', '--actor=op',
+        ...(attempt ? [`--attempt-id=${attempt}`] : [])]);
+      expect(result.exitCode).toBe(0);
+      const body = post.mock.calls[0][2];
+      if (attempt) expect(body).toContain(`<!-- review-attempt: ${attempt} -->`);
+      else expect(body).not.toContain('review-attempt:');
+    }
+  });
+
+  it.each(['', 'bad id', '<!-- forged -->', 'x'.repeat(257)])('refuses invalid attempt-id before writing: %s', id => {
+    const p = stubProvider();
+    expect(run(p, ['1048', '--repo=o/n', '--to=accepted', `--attempt-id=${id}`]).exitCode).not.toBe(0);
+    expect(p.calls).not.toContain('postComment');
+    expect(p.calls).not.toContain('setLabels');
+  });
 
   it('COMMENT FIRST when review:accepted is not already live — an orphan label would disarm #2409', () => {
     const p = stubProvider({ labels: ['review:pending'] });
@@ -5055,5 +5077,23 @@ describe('new-head rearm merge clearance', () => {
     expect(plan.allowed).toBe(true);
     expect(plan.addLabel).toBe('review:pending');
     expect(plan.removeLabels).toEqual(expect.arrayContaining(['ready-to-merge', 'red-team:clear']));
+  });
+});
+
+describe('review attempt marker helpers', () => {
+  it('round-trips only trusted exact markers and rejects oversized ids', () => {
+    const id = 'run-1#2#1';
+    const body = buildReviewAttemptMarker(id);
+    expect(parseReviewAttempt([{ author: { login: 'web-everything' }, body }])).toBe(id);
+    expect(parseReviewAttempt([{ author: { login: 'outsider' }, body }])).toBeNull();
+    expect(parseReviewAttempt([{ body }])).toBeNull();
+    expect(buildReviewAttemptMarker('x'.repeat(257))).toBe('');
+    expect(parseReviewAttempt([{ author: { login: 'web-everything' }, body: `<!-- review-attempt: ${'x'.repeat(257)} -->` }])).toBeNull();
+  });
+
+  it('neutralizes a quoted attempt marker in a verdict write-up', () => {
+    const body = buildVerdictComment({ to: 'accepted', actor: 'reviewer', headSha: 'a'.repeat(40),
+      body: buildReviewAttemptMarker('other#0#0') });
+    expect(parseReviewAttempt([{ author: { login: 'web-everything' }, body }])).toBeNull();
   });
 });
