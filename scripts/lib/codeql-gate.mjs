@@ -15,7 +15,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
+import { resolveRequiredChecks } from './check-state-predicate.mjs';
 import { redactSecrets } from '../conveyor/ci-heal-mark.mjs';
 
 export const CODEQL_CHECK_NAME = 'CodeQL';
@@ -31,13 +31,17 @@ export function loadDrainGateSettings(path = join(dirname(fileURLToPath(import.m
   } catch { return { drainBlocksOnCodeQL: true }; }
 }
 
-/** The newest `CodeQL` rollup row whose conclusion is FAILURE, or `null` (absent, pending and passing are all null). */
+/** Failing or unknown CodeQL evidence; a running rerun is pending, never a failure. */
 export function failedCodeQLCheck(pr) {
-  if (pr?.requiredCheckReadError) return null;
-  const roll = Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : [];
-  const latest = collapseRollupToLatestPerName(roll).find((c) => (c?.name || c?.context) === CODEQL_CHECK_NAME);
-  if (!latest) return null;
-  return String(latest.conclusion || latest.state || '').toUpperCase() === 'FAILURE' ? latest : null;
+  const result = resolveRequiredChecks({ rows: pr?.statusCheckRollup, rowsHead: pr?.headRefOid,
+    head: pr?.headRefOid, requiredNames: [CODEQL_CHECK_NAME], rosterSource: 'live',
+    rowsComplete: pr?.rowsComplete === true && !pr?.requiredCheckReadError });
+  const codeql = result.perName.CodeQL;
+  if (!pr?.requiredCheckReadError && codeql?.state === 'pending'
+    && (codeql.rows.length > 0 || result.state !== 'unknown')) return null;
+  if (result.state === 'pass') return null;
+  // Preserve the row API even when unreadable evidence cannot supply a display row.
+  return codeql?.rows[0] ?? { name: CODEQL_CHECK_NAME, status: 'UNKNOWN', conclusion: null };
 }
 
 /** The numeric check-run id out of a CheckRun `detailsUrl` (`https://github.com/<o>/<r>/runs/<id>`), or `null`. */

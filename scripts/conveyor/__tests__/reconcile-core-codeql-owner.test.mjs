@@ -25,7 +25,7 @@ const ANNOTATIONS = [{
   title: 'Incomplete multi-character sanitization', message: 'This string may still contain [<!--](1), which may cause an HTML element injection vulnerability.',
 }];
 const pr4370 = (over = {}) => ({
-  number: 4370, state: 'OPEN', headRefName: 'lane/velocity', headRefOid: HEAD, mergeStateStatus: 'UNSTABLE', mergeable: 'MERGEABLE',
+  number: 4370, state: 'OPEN', headRefName: 'lane/velocity', headRefOid: HEAD, rowsComplete: true, mergeStateStatus: 'UNSTABLE', mergeable: 'MERGEABLE',
   labels: lbl('ready-to-merge', 'review:accepted', 'review-round:1'), statusCheckRollup: rollup(), comments: [], ...over,
 });
 const enriched = (over, exec = () => JSON.stringify(ANNOTATIONS)) =>
@@ -90,12 +90,12 @@ describe('codeql-gate lib', () => {
     expect(p.codeqlFailure).toMatchObject({ checkRunId: '113109095870', alerts: [], readError: 'HTTP 403' });
     expect(planReconcile({ prs: [p], agents: [], now: NOW, requiredChecks: ['test'] }).dispatch).toHaveLength(1);
   });
-  it('only the LATEST CodeQL run counts (a superseded failure does not hold)', () => {
+  it('timestamps cannot supersede a CodeQL failure without run-attempt proof', () => {
     const roll = [
       { __typename: 'CheckRun', name: 'CodeQL', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-08T01:00:00Z', completedAt: '2026-10-08T01:01:00Z' },
       { __typename: 'CheckRun', name: 'CodeQL', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-08T02:00:00Z', completedAt: '2026-10-08T02:01:00Z' },
     ];
-    expect(failedCodeQLCheck({ statusCheckRollup: roll })).toBeNull();
+    expect(failedCodeQLCheck({ headRefOid: HEAD, rowsComplete: true, statusCheckRollup: roll })).toMatchObject({ conclusion: 'FAILURE' });
   });
   it('the heal brief names rule, file, line, message and the annotations command', () => {
     const planned = { reason: 'codeql', pr: 4370, codeql: enriched().codeqlFailure };

@@ -90,7 +90,7 @@ describe('pending-CI start policy', () => {
   it.each(['push', 'fast-checks', 'ci-green'])('refuses unknown prerequisites under %s', startAfter => {
     expect(reviewStartGate({ rowsComplete: true, headSha: head, checks: [check('unrelated', null, { status: 'queued' })],
       requiredChecks: [], policy: { ...review, fastChecks: null, startAfter, startEarly: 'on' } }))
-      .toMatchObject({ allowed: false, reason: 'unknown-required-set' });
+      .toMatchObject({ allowed: false, reason: startAfter === 'push' ? 'ci-red' : 'unknown-required-set' });
   });
   it('keeps the off-mode strict refusal for missing and pending prerequisites', () => {
     expect(reviewStartGate({ rowsComplete: true, headSha: head, checks: [check('test', null, { status: 'queued' })],
@@ -140,21 +140,13 @@ describe('pending-CI start policy', () => {
       }
     }
   });
-  it('push mode waits for registered head CI and refuses unknown-set healable red', () => {
+  it('push mode fails closed when the required roster is unavailable', () => {
     const policy = { ...review, startAfter: 'push', fastChecks: ['test'] };
-    expect(reviewStartGate({ rowsComplete: true, headSha: head, checks: [], verifyGreen: true, policy: { ...policy, startBeforeCi: true } }))
-      .toMatchObject({ allowed: false, reason: 'ci-not-registered', affected: [{ name: 'test', reason: 'missing' }] });
-    for (const checks of [[], undefined, null]) {
-      expect(reviewStartGate({ rowsComplete: true, headSha: head, checks, policy }))
-        .toMatchObject(checks == null
-          ? { allowed: false, unknown: true, reason: 'required-checks-not-successful', affected: [] }
-          : { allowed: false, reason: 'ci-not-registered', affected: [{ name: 'test', reason: 'missing' }] });
-    }
-    for (const requiredChecks of [undefined, null, []]) {
-      expect(reviewStartGate({ rowsComplete: true, headSha: head, checks: [check('test', 'failure')], requiredChecks, policy }))
-        .toMatchObject({ allowed: false, reason: 'ci-red', affected: [] });
-      expect(reviewStartGate({ rowsComplete: true, headSha: head, checks: [check('test', null, { status: 'queued' })], requiredChecks, policy }))
-        .toMatchObject({ allowed: true, reason: 'push', headSha: head });
+    for (const checks of [[], undefined, null, [check('test', 'failure')], [check('test', null, { status: 'queued' })]]) {
+      for (const requiredChecks of [undefined, null, []]) {
+        expect(reviewStartGate({ rowsComplete: true, headSha: head, checks, requiredChecks, policy }))
+          .toMatchObject({ allowed: false, reason: 'ci-red', affected: [] });
+      }
     }
   });
   it.each(['on', 'shadow'])('refuses empty or absent registered CI evidence without an early-start note (%s)', startEarly => {
@@ -236,7 +228,7 @@ describe('parallel review start and void', () => {
     expect(reviewStartGate({ rowsComplete: true, headSha: head, repo: 'we', checks, requiredChecks: ['integration'] }).allowed).toBe(true);
     expect(reviewStartGate({ rowsComplete: true, headSha: head, repo: 'we', checks, requiredChecks: ['integration'], policy: { ...review, startAfter: 'ci-green' } }).allowed).toBe(false);
     expect(reviewStartGate({ rowsComplete: true, headSha: head, repo: 'we', checks: [], policy: { ...review, startAfter: 'push' } }))
-      .toMatchObject({ allowed: false, reason: 'ci-not-registered' });
+      .toMatchObject({ allowed: false, reason: 'ci-red' });
   });
   it('requires each fast check on the head and refuses a red non-fast check', () => {
     for (const checks of [[], [check('standards')], fast.map(n => check(n, 'success', { head_sha: 'b'.repeat(40) })),
@@ -271,7 +263,7 @@ describe('parallel review start and void', () => {
     expect([fastChecksFor(kept, 'web-everything/web-everything'), fastChecksFor(kept, 'frontierui')]).toEqual([['lint'], ['test']]);
   });
   it('voids red-head and superseded reviews while excluding the review-dependent gates', () => {
-    const args = { reviewedHead: head, currentHead: head, checks: [check('integration', 'failure')] };
+    const args = { reviewedHead: head, currentHead: head, requiredChecks: ['integration'], checks: [check('integration', 'failure')] };
     expect(reviewMustVoid(args)).toBe(false);
     expect(reviewMustVoid({ ...args, policy: { ...review, cancelOnCiRed: true } })).toBe(true);
     expect(reviewMustVoid({ ...args, policy: { ...review, cancelOnCiRed: false } })).toBe(false);
@@ -284,12 +276,12 @@ describe('parallel review start and void', () => {
     expect(reviewMustVoid({ ...args, checks: [check('CodeQL', 'failure'), check('integration')] })).toBe(false);
     expect(reviewMustVoid({ ...args, checks: [check('integration', 'failure')] })).toBe(true);
     // Unknown set: the CI-heal rule — soak-replay-gate is never healable, any other red is.
-    expect(reviewMustVoid({ ...args, requiredChecks: null, checks: [check('soak-replay-gate', 'failure')] })).toBe(false);
+    expect(reviewMustVoid({ ...args, requiredChecks: null, checks: [check('soak-replay-gate', 'failure')] })).toBe(true);
     expect(reviewMustVoid({ ...args, requiredChecks: null, checks: [check('CodeQL', 'failure')] })).toBe(true);
   });
   it.each([
     ['review-gate red', [check('review-gate', 'failure')], false],
-    ['merge-gate red on a review hold', [check('merge-gate', 'failure', { mergeGateReviewHold: { holds: ['review-gate'], jobId: 1 } })], false],
+    ['merge-gate red on a review hold', [check('merge-gate', 'failure', { detailsUrl: 'https://github.com/o/r/actions/runs/1/job/1', mergeGateReviewHold: { holdIds: ['review-acceptance'], jobId: 1, headSha: head } })], false],
     ['plain merge-gate red', [check('merge-gate', 'failure')], true],
   ])('required %s: healable=%s, the same rule the CI heal uses (#5463)', (_name, rows, healable) => {
     const requiredChecks = ['test', 'review-gate', 'merge-gate'];
@@ -302,7 +294,7 @@ describe('parallel review start and void', () => {
   });
   it('a review-dependent gate is never healable red, even when branch protection requires it', () => {
     const requiredChecks = ['test', 'review-gate', 'merge-gate'];
-    const gates = [check('review-gate', 'failure'), check('merge-gate', 'failure', { mergeGateReviewHold: { holds: ['review-gate'], jobId: 1 } }), check('test')];
+    const gates = [check('review-gate', 'failure'), check('merge-gate', 'failure', { detailsUrl: 'https://github.com/o/r/actions/runs/1/job/1', mergeGateReviewHold: { holdIds: ['review-acceptance'], jobId: 1, headSha: head } }), check('test')];
     expect(ciRedOnHead({ headSha: head, checks: gates, requiredChecks })).toBe(false);
     expect(fixReadiness({ headSha: head, checks: gates, requiredChecks }).ciFailed).toBe(false);
     for (const startAfter of ['fast-checks', 'push'])
@@ -358,7 +350,7 @@ describe('joined fix round', () => {
     const checks = [check('CodeQL', 'failure'), check('unit')];
     expect(fixReadiness({ headSha: head, checks, requiredChecks: ['unit'] })).toMatchObject({ ciFailed: false, ciFailures: [] });
     expect(fixReadiness({ headSha: head, checks: [...checks, check('unit', 'failure')], requiredChecks: ['unit'] }).ciFailures.map(r => r.name)).toEqual(['unit']);
-    expect(fixReadiness({ headSha: head, checks }).ciFailed).toBe(true); // unknown set keeps the old reading
+    expect(fixReadiness({ headSha: head, checks }).otherPending).toBe(true); // unknown roster cannot prove readiness
   });
 });
 it('resolves every timing leaf through the cascade, logging sources and rejecting malformed overrides', () => {
@@ -395,7 +387,7 @@ describe('verified early review', () => {
 });
 describe('fix push gate', () => {
   const policy = { ...fix, pushAfterCi: true, pushAfterCiMaxMin: 1 };
-  const args = { previousHeadChecks: [check('test', null, { status: 'in_progress' })], requiredChecks: ['test'], firstHeldAt: 1000, now: 1000, policy };
+  const args = { headSha: head, rowsComplete: true, previousHeadChecks: [check('test', null, { status: 'in_progress' })], requiredChecks: ['test'], firstHeldAt: 1000, now: 1000, policy };
   it('is immediate when off, waits with a fixed deadline when on, and pushes at the bound', () => {
     expect(fixPushGate({ ...args, policy: fix })).toEqual({ action: 'push', reason: 'off' });
     expect(fixPushGate(args)).toEqual({ action: 'wait', reason: 'ci-pending', deadline: 61000 });
@@ -515,7 +507,7 @@ describe('R359 early start shadow (xtxt36v / xrz0ezn)', () => {
   it('waits on healable CI red on the current head', () => {
     expect(shadow({ checks: [check('test', 'failure')] }))
       .toEqual({ wouldStartEarly: false, reason: 'ci-red', mergeAllowed: false });
-    expect(shadow({ checks: [check('test', 'failure', { head_sha: 'b'.repeat(40) }), ...args.checks] }).wouldStartEarly).toBe(true);
+    expect(shadow({ checks: [check('test', 'failure', { head_sha: 'b'.repeat(40) }), ...args.checks] }).wouldStartEarly).toBe(false);
   });
   it.each(['fast-checks', 'ci-green', 'push'])('never changes reviewStartGate under %s', startAfter => {
     for (const checks of [args.checks, [check('test')], [check('test', 'failure')]]) {

@@ -1,7 +1,6 @@
 /** Pure review/fixer timing decisions. Inputs always describe one pinned head. */
 import { reviewCiGate } from './review-ci-gate.mjs';
-import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
-import { withoutImpliedRequiredChecks } from './required-check-implication.mjs';
+import { resolveRequiredChecks } from './check-state-predicate.mjs';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from './constellation-repos.mjs';
 
 // cancelOnCiRed: default off (operator 2026-10-16: keep the option, don't use it yet).
@@ -53,17 +52,14 @@ export const isReviewHoldGate = row => {
   return name === 'review-gate' || (name === 'merge-gate' && !!row.mergeGateReviewHold);
 };
 /** The CI-heal rule (reconcile-core `splitFailingChecks`): a known required set names the healable checks. */
-const isHealable = (row, requiredChecks) => {
-  const name = row.name ?? row.context;
-  if (isReviewHoldGate(row)) return false;
-  return Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks.includes(name) : !NON_HEALABLE_CHECKS.includes(name);
-};
-/** Is a healable check red on this head? An optional red (CodeQL, with a known required set) is not. */
+const resolveTimingChecks = (headSha, checks, requiredChecks, rowsComplete = false) => resolveRequiredChecks({
+  head: headSha, rowsHead: headSha, rows: checks, requiredNames: requiredChecks, rosterSource: 'live', rowsComplete,
+});
+/** Unknown evidence blocks start/continuation just as red CI does; no observed-name roster fallback. */
 export function ciRedOnHead({ headSha, checks, requiredChecks = null } = {}) {
-  if (!headSha) return false;
-  return collapseRollupToLatestPerName(checks).some(row => isHealable(row, requiredChecks)
-    && (!row.head_sha || row.head_sha === headSha)
-    && RED.has(String(row.conclusion ?? row.state ?? '').toLowerCase()));
+  const result = resolveTimingChecks(headSha, checks, requiredChecks);
+  if (!Object.keys(result.perName).length || result.reasons.includes('malformed')) return true;
+  return Object.values(result.perName).some(r => ['fail', 'unknown'].includes(r.state));
 }
 /** Diagnostic only, including drafts: a wait retains the existing review gates; never grants merge permission. */
 export function earlyStartShadow({ headSha, checks, requiredChecks, verifyGreen, care, lines, files, kinds,
@@ -87,28 +83,10 @@ export function earlyStartShadow({ headSha, checks, requiredChecks, verifyGreen,
     && typeof (row.name ?? row.context) === 'string' && (row.name ?? row.context).trim())) return result('missing-checks');
   if (!dense(requiredChecks) || !checkNames(requiredChecks)) return result('missing-required-checks');
   try {
-    // Every required check needs a readable row on THIS head; anything else is incomplete evidence and waits.
-    const low = v => (typeof v === 'string' ? v : '');  // exact lowercase tokens only, as ciRedOnHead compares
-    const STATUS = ['queued', 'in_progress', 'pending', 'waiting', 'requested', 'completed'];
-    const CONCLUSION = ['success', 'failure', 'neutral', 'cancelled', 'skipped', 'timed_out', 'action_required', 'startup_failure', 'stale', 'error'];
-    const STATE = ['pending', 'success', 'failure', 'error', 'expected'];
-    const readable = row => {
-      // An explicit kind fixes the required shape: a CheckRun needs a status, a StatusContext needs a state. Unknown kinds wait.
-      const kind = row.__typename ?? row.type;
-      if (kind != null && !['CheckRun', 'StatusContext'].includes(kind)) return false;
-      if (kind === 'CheckRun' && row.status == null) return false;
-      if (kind === 'StatusContext' && (row.state == null || row.status != null)) return false;
-      if (row.head_sha != null && (typeof row.head_sha !== 'string' || !row.head_sha.trim())) return false;
-      if (row.conclusion != null && !CONCLUSION.includes(low(row.conclusion))) return false;
-      if (row.state != null && !STATE.includes(low(row.state))) return false;
-      if (row.status != null) return STATUS.includes(low(row.status)) && ((low(row.status) === 'completed') === (row.conclusion != null));
-      return row.state != null;  // a CheckRun needs a status; a conclusion alone is incomplete
-    };
-    // Judge every RAW row (before rollup collapse or head filtering) so a malformed or contradictory row cannot vanish.
-    if (!checks.every(row => readable(row) && !(row.state != null && (row.conclusion != null || row.status != null)))) return result('incomplete-checks');
-    const rows = collapseRollupToLatestPerName(checks).filter(row => !row.head_sha || row.head_sha === headSha);
-    if (!requiredChecks.every(name => rows.some(row => (row.name ?? row.context) === name && readable(row)))) return result('incomplete-checks');
-    if (rows.some(row => !readable(row))) return result('incomplete-checks');
+    if (!readableEarlyChecks(checks, headSha)) return result('incomplete-checks');
+    const evidence = resolveTimingChecks(headSha, checks, requiredChecks, true);
+    if (evidence.state === 'unknown' || Object.values(evidence.perName).some(r => r.reasons.includes('missing')))
+      return result('incomplete-checks');
     if (ciRedOnHead({ headSha, checks, requiredChecks })) return result('ci-red');
   } catch { return result('unreadable-checks'); }
   return result('eligible', true);
@@ -137,35 +115,10 @@ function readableEarlyChecks(checks, headSha) {
 function registeredStartGate({ headSha, checks, requiredChecks, rowsComplete }) {
   const strict = reviewCiGate({ headSha, checks, requiredChecks, rowsComplete });
   if (strict.unknown || !checkNames(requiredChecks) || typeof headSha !== 'string' || !headSha.trim()) return strict;
-  const latest = new Map(collapseRollupToLatestPerName(checks).map(row => [row?.name ?? row?.context, row]));
-  // Same implication rule as the strict gate: a green aggregate (test) proves a split-out job (integration). The
-  // strict gate reads a legacy commit status (`{context, state}`) as a check row first, so a green STATUS aggregate
-  // implies too; the per-row judgment below reads the raw row, which already handles `state`. Only a row with NO
-  // `status` key is a status (as review-ci-gate.mjs#statusAsCheckRow): `status: null` stays raw and implies nothing.
-  // The WHOLE mapping mirrors statusAsCheckRow, `state` overriding any `conclusion` on the row: a contradictory
-  // `{state: 'failure', conclusion: 'success'}` aggregate is red to the strict gate, so it must imply nothing here.
-  const asCheckRow = row => {
-    if (!row || typeof row !== 'object' || row.status !== undefined || typeof row.state !== 'string') return row;
-    const state = row.state.toLowerCase();
-    if (state === 'success') return { ...row, status: 'completed', conclusion: 'success' };
-    if (state === 'failure' || state === 'error') return { ...row, status: 'completed', conclusion: state };
-    if (state === 'pending' || state === 'expected') return { ...row, status: 'pending' };
-    return row;
-  };
-  const affected = [...new Set(withoutImpliedRequiredChecks(requiredChecks, [...latest.values()].map(asCheckRow)))].flatMap(name => {
-    const row = latest.get(name);
-    let reason;
-    if (!row) reason = 'missing';
-    else if (row.head_sha != null && row.head_sha !== headSha) reason = 'wrong-head';
-    else if (!readableEarlyChecks([row], headSha)) reason = 'malformed';
-    else {
-      const state = String(row.status ?? row.state).toLowerCase();
-      if (['queued', 'in_progress', 'pending', 'waiting'].includes(state)) reason = 'pending';
-      else if (!(state === 'completed' && row.conclusion.toLowerCase() === 'success') && state !== 'success')
-        reason = row.conclusion?.toLowerCase() ?? row.state?.toLowerCase() ?? 'malformed';
-    }
-    return reason ? [{ name, reason }] : [];
-  });
+  const evidence = resolveTimingChecks(headSha, checks, requiredChecks, rowsComplete);
+  const affected = Object.entries(evidence.perName).filter(([, r]) => r.state !== 'pass').map(([name, r]) => ({
+    name, reason: r.reasons.includes('foreign-head') ? 'wrong-head' : r.reasons[0] ?? r.state,
+  }));
   if (affected.some(row => RED.has(row.reason))) return { allowed: false, headSha, reason: 'ci-red', affected };
   const missing = affected.filter(row => row.reason === 'missing');
   if (missing.length) return { allowed: false, headSha, reason: 'ci-not-registered', affected: missing };
@@ -212,6 +165,7 @@ export function reviewStartGate({ headSha, checks, requiredChecks, rowsComplete 
     return { allowed: true, headSha, reason: 'push', affected: [] };
   }
   if (!policy.startBeforeCi && policy.startAfter === 'ci-green') return pendingStart(strict());
+  if (policy.startBeforeCi && strict().unknown) return { ...strict(), reason: 'ci-red' };
   if (policy.startBeforeCi && verifyGreen === true && typeof headSha === 'string' && headSha.trim()) {
     // An unknown required set must not let a red check ride past the marker: any healable red blocks, as in CI-green.
     if (ciRedOnHead({ headSha, checks, requiredChecks: Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks : null }))
@@ -246,43 +200,33 @@ export function joinedFixDecision({ ciFailed = false, reviewFindings = false, fi
 /**
  * PURE: select timestamped head-local readiness facts. findings are validated producer records supplied by caller.
  * With a known required set, only REQUIRED failures count: those are the only ones a CI heal repairs, so an optional
- * red (CodeQL) must not start the joined-fix clock or release a live reviewer's liveness hold. An unknown set falls
- * back to the heal path's own rule (every check but {@link NON_HEALABLE_CHECKS}).
+ * red (CodeQL) must not start the joined-fix clock or release a live reviewer's liveness hold. Unknown evidence waits.
  */
-export function fixReadiness({ headSha, checks = [], findings = [], reviewPending = false, requiredChecks = null } = {}) {
-  const latest = collapseRollupToLatestPerName(checks).filter(row =>
-    !isReviewHoldGate(row) && (!row.head_sha || row.head_sha === headSha));
-  const failed = latest.filter(row => isHealable(row, requiredChecks)
-    && RED.has(String(row.conclusion ?? row.state ?? '').toLowerCase()));
+export function fixReadiness({ headSha, checks = [], findings = [], reviewPending = false, requiredChecks = null, rowsComplete = false } = {}) {
+  const evidence = resolveTimingChecks(headSha, checks, requiredChecks, rowsComplete);
+  const entries = Object.entries(evidence.perName);
+  const failed = entries.filter(([, r]) => r.state === 'fail').flatMap(([, r]) => r.rows.slice(0, 1));
   const times = [...failed.map(row => row.completed_at ?? row.completedAt), ...findings.map(row => row.createdAt)]
     .map(t => Date.parse(t)).filter(Number.isFinite);
   return { ciFailed: failed.length > 0, reviewFindings: findings.length > 0,
     firstReadyAt: times.length ? Math.min(...times) : NaN,
     otherPending: failed.length > 0 ? reviewPending && findings.length === 0
-      : latest.some(row => ['queued', 'in_progress', 'pending', 'waiting', 'requested'].includes(String(row.status ?? row.state).toLowerCase())),
+      : evidence.state === 'unknown' || entries.some(([, r]) => ['pending', 'unknown'].includes(r.state)),
     ciFailures: failed.map(row => ({ name: row.name ?? row.context, conclusion: row.conclusion ?? row.state,
       detailsUrl: row.details_url ?? row.detailsUrl ?? row.targetUrl ?? null })), findings };
 }
 
 /** Unknown or incomplete CI waits until the fixed bound; review holds never delay a fix push. */
-export function fixPushGate({ previousHeadChecks, requiredChecks, firstHeldAt, now, policy = FIX_TIMING_DEFAULTS } = {}) {
+export function fixPushGate({ previousHeadChecks, requiredChecks, headSha, rowsComplete = false, firstHeldAt, now, policy = FIX_TIMING_DEFAULTS } = {}) {
   if (!policy.pushAfterCi) return { action: 'push', reason: 'off' };
   const maxMin = Number.isSafeInteger(policy.pushAfterCiMaxMin) && policy.pushAfterCiMaxMin >= 0
     ? policy.pushAfterCiMaxMin : FIX_TIMING_DEFAULTS.pushAfterCiMaxMin;
   const deadline = firstHeldAt + maxMin * 60_000;
-  const latest = collapseRollupToLatestPerName(previousHeadChecks);
-  const rows = latest.filter(row => !isReviewHoldGate(row));
-  const required = Array.isArray(requiredChecks) && requiredChecks.length
-    ? requiredChecks.filter(name => name !== 'review-gate' && !latest
-      .some(row => (row.name ?? row.context) === name && isReviewHoldGate(row))) : [];
-  const complete = Array.isArray(previousHeadChecks) && required.length > 0 && required.every(name => {
-    const row = rows.find(row => (row.name ?? row.context) === name);
-    const conclusion = String(row?.conclusion ?? row?.state ?? '').toLowerCase();
-    return row && ['success', 'neutral', 'skipped', ...RED].includes(conclusion)
-      && (row.status === undefined || String(row.status).toLowerCase() === 'completed');
-  });
+  const evidence = resolveTimingChecks(headSha, previousHeadChecks, requiredChecks, rowsComplete);
+  const complete = evidence.state !== 'unknown' && Object.values(evidence.perName)
+    .every(r => ['pass', 'fail', 'held'].includes(r.state));
   if (complete) return { action: 'push', reason: 'ci-complete',
-    ciFailures: fixReadiness({ checks: rows.map(({ head_sha, ...row }) => row), requiredChecks }).ciFailures };
+    ciFailures: fixReadiness({ headSha, checks: previousHeadChecks, requiredChecks, rowsComplete }).ciFailures };
   if (Number.isFinite(now) && Number.isFinite(deadline) && now >= deadline)
     return { action: 'push', reason: 'bound', deadline };
   return { action: 'wait', reason: 'ci-pending', deadline };

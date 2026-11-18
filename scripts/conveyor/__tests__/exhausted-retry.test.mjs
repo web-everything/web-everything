@@ -33,7 +33,7 @@ const basePlan = extra => planExhaustedRetry({ facts, retriesUsed: 0, settings: 
 describe('PR #5331 production wiring and complete threads', () => {
   it.each(['SUCCESS', 'FAILURE', 'ERROR'])('recognizes terminal required StatusContext results after retry: %s', state => {
     const comments = [trusted(buildExhaustedRetryComment({ headSha }))];
-    const pr = { headRefOid: headSha, statusCheckRollup: [
+    const pr = { headRefOid: headSha, rowsComplete: true, statusCheckRollup: [
       { __typename: 'StatusContext', context: 'external-ci', state, createdAt: later },
     ] };
     expect(retryOutcome({ comments, pr, requiredChecks: ['external-ci'] })).toEqual(
@@ -62,7 +62,7 @@ describe('PR #5331 production wiring and complete threads', () => {
     const reservation = trusted(buildExhaustedRetryComment({ headSha, attemptId: 'attempt-1', reserved: true }));
     const outcome = { ...trusted(buildExhaustedRetryComment({ headSha, attemptId: 'attempt-1' })),
       createdAt: '2026-10-14T03:00:00Z' };
-    const pr = { headRefOid: headSha, statusCheckRollup: [{ context: 'external-ci', state: 'SUCCESS', createdAt: later }] };
+    const pr = { headRefOid: headSha, rowsComplete: true, statusCheckRollup: [{ context: 'external-ci', state: 'SUCCESS', createdAt: later }] };
     expect(countExhaustedRetries([reservation, outcome])).toBe(1);
     expect(countExhaustedRetries([reservation, outcome, trusted(buildExhaustedRetryComment({ headSha }))])).toBe(2);
     expect(retryOutcome({ comments: [reservation, outcome], pr, requiredChecks: ['external-ci'] })).toEqual({ state: 'recovered' });
@@ -115,7 +115,7 @@ describe('PR #5331 production wiring and complete threads', () => {
       return ok ? { ok: true, newHeadSha: currentHead } : { ok: false, error: 'conflict' };
     });
     const options = { apply: true, settings: settings(), ciHealCap: 3, mainRuns: [],
-      readOpenPrs: () => [{ number: 5195, headRefName: 'lane/5195', headRefOid: currentHead,
+      readOpenPrs: () => [{ number: 5195, headRefName: 'lane/5195', headRefOid: currentHead, rowsComplete: true,
         statusCheckRollup: [{ context: 'external-ci', state: 'FAILURE', createdAt: at }] }],
       excuseHolds: prs => prs, readAttributedRequiredChecks: () => ['external-ci'],
       readComments: () => comments, readAheadBy: () => aheadBy, readMainFailureSignature: () => null,
@@ -147,7 +147,7 @@ describe('PR #5331 production wiring and complete threads', () => {
     expect(sweepExhaustedRetry(options).refusals[0].kind).toBe('needs-you');
   });
 
-  const redPr = () => ({ number: 5195, headRefName: 'lane/5195', headRefOid: headSha,
+  const redPr = () => ({ number: 5195, headRefName: 'lane/5195', headRefOid: headSha, rowsComplete: true,
     statusCheckRollup: [{ name: 'daemon-soak', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: at }] });
   const io = () => ({ exhaustedRetrySettings: settings(), settings: settings(), ciHealCap: 3,
     excuseHolds: prs => prs, readOpenPrs: vi.fn(() => [redPr()]),
@@ -350,7 +350,7 @@ describe('exhausted retry', () => {
     const refresh = vi.fn(() => { currentHead = 'c'.repeat(40); return { ok: true, action: 'rebased', newCommit: currentHead }; });
     const postComment = vi.fn((n, { body }) => comments.push(trusted(body)));
     const options = { excuseHolds: prs => prs, repo: 'web-everything/web-everything', apply: true, settings: settings(), ciHealCap: 3,
-      readOpenPrs: () => [{ number: 5195, headRefName: 'lane/5195', headRefOid: currentHead,
+      readOpenPrs: () => [{ number: 5195, headRefName: 'lane/5195', headRefOid: currentHead, rowsComplete: true,
         statusCheckRollup: [{ name: 'daemon-soak', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: currentHead === headSha ? at : '2026-10-14T04:00:00Z' }] }],
       readAttributedRequiredChecks: () => ['daemon-soak'], readAheadBy: () => 2, readComments: () => comments,
       readMainRuns: () => [redRun, greenRun],
@@ -429,7 +429,7 @@ describe('exhausted retry', () => {
     const refresh = vi.fn(() => { currentHead = retryHead; return { ok: true, action: 'rebased', newCommit: retryHead }; });
     const postComment = vi.fn((n, { body }) => comments.push({ ...trusted(body), createdAt: later }));
     const options = { apply: true, settings: settings(), ciHealCap: 3,
-      readOpenPrs: () => [{ number: 5195, headRefName: 'lane/5195', headRefOid: currentHead,
+      readOpenPrs: () => [{ number: 5195, headRefName: 'lane/5195', headRefOid: currentHead, rowsComplete: true,
         statusCheckRollup: [{ name: 'daemon-soak', status: 'COMPLETED', conclusion: 'FAILURE',
           completedAt: currentHead === headSha ? at : '2026-10-14T04:00:00Z' }] }],
       readAttributedRequiredChecks: () => ['daemon-soak'], readAheadBy: () => 2, readComments: () => comments,
@@ -442,7 +442,7 @@ describe('exhausted retry', () => {
     expect(refresh).toHaveBeenCalledOnce();
     expect(standDownComments(comments, { headRefOid: retryHead, lapseOnNewHead: 'on' })).toHaveLength(1);
     currentHead = 'd'.repeat(40); // manual push, without fix-begin/fix-end
-    expect(standDownComments(comments, { headRefOid: currentHead, lapseOnNewHead: 'on' })).toHaveLength(0);
+    expect(standDownComments(comments, { headRefOid: currentHead, rowsComplete: true, lapseOnNewHead: 'on' })).toHaveLength(0);
     expect(exhaustionFacts({ comments, headSha: currentHead, lapseOnNewHead: 'on' }).exhausted).toBe(false);
     expect(exhaustionFacts({ comments, headSha: currentHead, lapseOnNewHead: 'off' }).exhausted).toBe(true);
     expect(sweepExhaustedRetry(options).refusals).toEqual([]);
@@ -511,7 +511,7 @@ describe('main failure signatures', () => {
   });
   it('reads a signature only after the existing attribution paths refuse; shares exhausted facts', () => {
     const readMainFailureSignature = vi.fn(() => signature), readComments = vi.fn(() => heals), refresh = vi.fn();
-    const options = { readOpenPrs: () => [{ number: 5195, headRefName: 'lane/5195', headRefOid: headSha,
+    const options = { readOpenPrs: () => [{ number: 5195, headRefName: 'lane/5195', headRefOid: headSha, rowsComplete: true,
       statusCheckRollup: [{ name: 'daemon-soak', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: at }] }],
       readMainRuns: () => [redRun], readAheadBy: () => 2, readAttributedRequiredChecks: () => ['daemon-soak'],
       readMainLatestCheckRuns: () => [], readMainFixedSignatureFacts: () => null, readMainGreenFixFacts: () => ({}), readPriority: () => null,
@@ -534,7 +534,7 @@ describe('main failure signatures', () => {
   it.each([{ enabled: false }, { maxRetries: 0 }])('disabling retries preserves own-failure decisions (%j)', disabled => {
     const readMainFailureSignature = vi.fn(() => signature), refresh = vi.fn();
     const result = sweepCiRedRecovery({ apply: true, exhaustedRetrySettings: { ...settings(), ...disabled },
-      readOpenPrs: () => [{ number: 5195, headRefName: 'lane/5195', headRefOid: headSha,
+      readOpenPrs: () => [{ number: 5195, headRefName: 'lane/5195', headRefOid: headSha, rowsComplete: true,
         statusCheckRollup: [{ name: 'daemon-soak', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: at }] }],
       readMainRuns: () => [redRun, greenRun], readAheadBy: () => 2,
       readAttributedRequiredChecks: () => ['daemon-soak'], readMainLatestCheckRuns: () => [], readMainGreenFixFacts: () => ({}),
@@ -547,7 +547,7 @@ describe('main failure signatures', () => {
   it('keeps exhausted main-red PRs on the existing recovery path, before and after main recovers', () => {
     const failureAt = '2026-10-14T02:30:00Z';
     for (const recovered of [false, true]) {
-      const options = { readOpenPrs: () => [{ number: 5195, headRefName: 'lane/5195', headRefOid: headSha,
+      const options = { readOpenPrs: () => [{ number: 5195, headRefName: 'lane/5195', headRefOid: headSha, rowsComplete: true,
         statusCheckRollup: [{ name: 'daemon-soak', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: failureAt }] }],
         readMainRuns: () => recovered ? [redRun, greenRun] : [redRun], readAheadBy: () => 2,
         readAttributedRequiredChecks: () => ['daemon-soak'], readMainLatestCheckRuns: () => [], readPriority: () => null,
@@ -587,7 +587,7 @@ describe('retried CI verdicts', () => {
   const sha = 'fcf351d' + '0'.repeat(33);
   const required = ['test', 'smoke', 'daemon-soak', 'integration', 'merge-gate', 'review-gate'];
   const retry = { ...trusted(buildExhaustedRetryComment({ kind: facts.kind })), createdAt: later };
-  const green = () => ({ number: 5169, headRefName: 'lane/5169', headRefOid: sha, labels: [{ name: 'review:human' }],
+  const green = () => ({ number: 5169, headRefName: 'lane/5169', headRefOid: sha, rowsComplete: true, labels: [{ name: 'review:human' }],
     statusCheckRollup: required.map(name => ({ name, status: 'COMPLETED', completedAt: '2026-10-14T03:00:00Z',
       conclusion: name.endsWith('gate') ? 'FAILURE' : 'SUCCESS' })) });
   const fixture = (pr = green(), initial = [...heals, retry]) => {
@@ -597,7 +597,7 @@ describe('retried CI verdicts', () => {
     const unexpected = () => { throw Error('unexpected IO'); };
     const options = { apply: true, settings: settings(), ciHealCap: 3, readOpenPrs: () => [pr],
       excuseHolds: vi.fn(prs => prs.map(p => ({ ...p, statusCheckRollup: p.statusCheckRollup.map(row =>
-        row.name === 'merge-gate' ? { ...row, mergeGateReviewHold: { holds: ['review-acceptance'] } } : row) }))),
+        row.name === 'merge-gate' ? { ...row, detailsUrl: 'https://github.com/o/r/actions/runs/1/job/1', mergeGateReviewHold: { holdIds: ['review-acceptance'], jobId: 1, headSha: p.headRefOid } } : row) }))),
       readAttributedRequiredChecks: () => required, readComments: () => comments, postComment, editComment,
       readAheadBy: () => 2, readMainRuns: () => [], readMainTip: () => ({ sha: mainSha, committedAt: later }),
       readMainFailureSignature: () => null, refresh: unexpected, trigger: unexpected, checkClaim: unexpected,
@@ -619,7 +619,7 @@ describe('retried CI verdicts', () => {
     pr.labels = ['review:pending'];
     expect(realRequiredFailures(pr, ['review-gate'])).toEqual([]);
     pr.labels = [];
-    expect(realRequiredFailures(pr, ['review-gate'])).toEqual(['review-gate']);
+    expect(realRequiredFailures(pr, ['review-gate'])).toEqual([]); // review-gate is held by contract, independent of labels
   });
   it('waits for pending, missing and pre-retry rows on the current head', () => {
     const pr = green();
@@ -664,14 +664,14 @@ describe('retried CI verdicts', () => {
     expect(f.postComment).not.toHaveBeenCalled();
     expect(f.options.excuseHolds).toHaveBeenCalledOnce();
   });
-  it('uses latest rows and treats excused merge-gate as a hold even if still red', () => {
+  it('retains unordered failures and refuses an unbound merge-gate hold', () => {
     const pr = green();
     pr.statusCheckRollup.find(row => row.name === 'merge-gate').mergeGateHoldExcused = { kind: 'candidacy' };
     pr.statusCheckRollup.unshift({ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: at });
-    expect(realRequiredFailures(pr, required)).toEqual([]);
-    expect(retryOutcome({ comments: [retry], pr, requiredChecks: required })).toEqual({ state: 'recovered' });
+    expect(realRequiredFailures(pr, required)).toEqual(['merge-gate', 'test']);
+    expect(retryOutcome({ comments: [retry], pr, requiredChecks: required })).toEqual({ state: 'pending' }); // older failure predates retry
     pr.statusCheckRollup.find(row => row.name === 'daemon-soak').conclusion = 'FAILURE';
-    expect(retryOutcome({ comments: [retry], pr, requiredChecks: required })).toEqual({ state: 'failed', failures: ['daemon-soak'] });
+    expect(retryOutcome({ comments: [retry], pr, requiredChecks: required })).toEqual({ state: 'pending' }); // unresolved older test failure still predates retry
     expect(wrongSpentStandDowns({ comments: [trusted(buildExhaustedRetrySpentComment({ headSha: sha }))], pr, requiredChecks: required })).toEqual([]);
   });
   it('preserves the node id in the reader and sends the edit via GraphQL', () => {
@@ -739,7 +739,7 @@ describe('retry marker trust across recovery', () => {
 
   it('does not let forged recovery suppress publication or quoted resolution hide our spent record', () => {
     const requiredChecks = ['test'];
-    const pr = { headRefOid: headSha, statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: later }] };
+    const pr = { headRefOid: headSha, rowsComplete: true, statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: later }] };
     const retry = trusted(buildExhaustedRetryComment({ headSha }));
     const recovered = { ...trusted(`${EXHAUSTED_RETRY_RECOVERED_MARKER}\nhead: ${headSha}`), createdAt: later };
     for (const bogus of [{ ...recovered, author: { login: 'outsider' } }, { ...recovered, body: `quoted\n${recovered.body}` }]) {

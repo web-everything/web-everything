@@ -1,6 +1,6 @@
 /** One durable retry after exhaustion — live PR #5195, 2026-10-14.
  * Review-HOLD and premature-spent correction: live PR #5169, 2026-10-14. */
-import { collapseRollupToLatestPerName, isRequiredCheckFailed } from '../merge-ai-prs.mjs';
+import { resolveRequiredChecks } from '../lib/check-state-predicate.mjs';
 import { isAutomationAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { readFileSync } from 'node:fs';
 import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
@@ -36,32 +36,22 @@ export function countBlockingRetryStandDowns(comments, headSha) {
     && !isOperatorAnswerStandDownSuperseded(list, i)).length;
 }
 
-/** Required failures on this head, excluding proven review holds. */
+const retryChecks = (pr, requiredChecks) => resolveRequiredChecks({ rows: pr?.statusCheckRollup,
+  head: pr?.headRefOid, rowsHead: pr?.headRefOid, requiredNames: requiredChecks, rosterSource: 'live',
+  rowsComplete: pr?.rowsComplete === true && !pr?.requiredCheckReadError });
+
+/** Required failures on this head, excluding only holds proven by the shared contract. */
 export function realRequiredFailures(pr, requiredChecks) {
-  const rows = collapseRollupToLatestPerName(pr?.statusCheckRollup);
-  const human = (pr?.labels ?? []).some(l => REVIEW_HOLD_LABELS.includes(typeof l === 'string' ? l : l?.name));
-  return rows.filter(row => {
-    const name = row.name || row.context;
-    return requiredChecks.includes(name)
-      && !(name === 'merge-gate' && (row.mergeGateReviewHold || row.mergeGateHoldExcused))
-      && !(name === 'review-gate' && human)
-      && isRequiredCheckFailed({ ...pr, statusCheckRollup: [row] }, name);
-  }).map(row => row.name || row.context);
+  const evidence = retryChecks(pr, requiredChecks);
+  return Object.entries(evidence.perName).filter(([, r]) => r.state === 'fail').map(([name]) => name);
 }
 
 function requiredCompleted(pr, requiredChecks, after = null) {
-  if (!pr?.headRefOid || !requiredChecks?.length) return false;
-  const rows = collapseRollupToLatestPerName(pr.statusCheckRollup);
-  return requiredChecks.every(name => {
-    const row = rows.find(r => (r.name || r.context) === name);
-    if (!row || (row.headSha && row.headSha !== pr.headRefOid)) return false;
-    const statusContext = !row.status && typeof row.context === 'string';
-    const completed = statusContext
-      ? ['success', 'failure', 'error'].includes(String(row.state).toLowerCase())
-      : String(row.status ?? '').toLowerCase() === 'completed';
-    // StatusContext publishes a new row per state change; it has createdAt, never completedAt.
-    return completed && (after === null || Date.parse(statusContext ? row.createdAt : row.completedAt) > after);
-  });
+  const evidence = retryChecks(pr, requiredChecks);
+  if (evidence.state === 'unknown') return false;
+  return Object.values(evidence.perName).every(r => ['pass', 'fail', 'held'].includes(r.state)
+    && (after === null || (r.rows.length > 0 && r.rows.every(row =>
+      Date.parse(row.status === undefined && typeof row.context === 'string' ? row.createdAt : row.completedAt) > after))));
 }
 
 export function retryOutcome({ comments = [], pr, requiredChecks } = {}) {
