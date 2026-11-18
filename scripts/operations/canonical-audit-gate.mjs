@@ -1,9 +1,9 @@
 /** Canonical codex-audit admission shared by every PR producer. No docs-only exemption. */
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { canonicalAuditEvidence, mergeRuledWeakened, validSha } from './prototype-load.mjs';
-import { readPlatformPreferences, resolveCascade } from '../lib/policy-cascade.mjs';
+import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
+import { readAuditSettings, resolveAuditRecordPath } from './codex-audit-io.mjs';
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
 import { findAudit, QUESTION_HASH } from './codex-audit.mjs';
 
@@ -37,13 +37,14 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     message: `${detail}. Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${fullSha}, then retry opening the PR.` });
   let records, config;
   try {
-    const tool = JSON.parse(readFile(join(repo, 'scripts/settings/prototype-load.json'), 'utf8'));
+    // Same settings source and path resolution as the audit writer (codex-audit-io.mjs): the file beside
+    // these scripts, never <repo>/scripts/settings — a sibling-repo target has none (#7011).
+    const tool = readAuditSettings(readFile);
+    if (!tool || typeof tool !== 'object' || Array.isArray(tool)) throw new Error('audit settings malformed');
     const platform = readPlatformPreferences({ env, readFile, warn });
     if (platform.errors.length) throw new Error('platform preferences unreadable');
-    config = { ...resolveCascade({ platform: platform.prefs.prototypeLoad, tool }).value,
-      ruledWeakened: mergeRuledWeakened(platform.prefs.prototypeLoad?.ruledWeakened, tool.ruledWeakened, warn) };
-    const path = config.auditRecordPath;
-    const contents = readFile(path.startsWith('~/') ? join(env.HOME, path.slice(2)) : path, 'utf8');
+    config = { ruledWeakened: mergeRuledWeakened(platform.prefs.prototypeLoad?.ruledWeakened, tool.ruledWeakened, warn) };
+    const contents = readFile(resolveAuditRecordPath(tool, { home: env.HOME, cwd: repo }), 'utf8');
     try {
       records = String(contents).split(/\r?\n/).filter(line => line.trim()).map(line => JSON.parse(line));
     } catch {

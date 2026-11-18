@@ -36,7 +36,9 @@ function defaultProducer({ direct = false, dry = false, records = [] } = {}) {
     import cp from 'node:child_process';
     import { syncBuiltinESMExports } from 'node:module';
     const read = fs.readFileSync;
-    fs.readFileSync = (path, ...args) => String(path) === ${JSON.stringify(join(dir, 'scripts/settings/prototype-load.json'))}
+    // The audited checkout (dir) has no scripts/settings at all, like a sibling repo: the gate must read
+    // the settings beside the audit writer in this checkout, never <target>/scripts/settings.
+    fs.readFileSync = (path, ...args) => String(path) === ${JSON.stringify(join(root, 'scripts/settings/prototype-load.json'))}
       ? JSON.stringify({ auditRecordPath: ${JSON.stringify(audit)} }) : read(path, ...args);
     cp.execFileSync = (cmd, args) => {
       fs.appendFileSync(${JSON.stringify(trace)}, JSON.stringify([cmd, args]) + '\\n');

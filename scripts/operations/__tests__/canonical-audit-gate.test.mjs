@@ -1,21 +1,29 @@
 import { describe, it, expect } from 'vitest';
 import { checkCanonicalAuditForOpen } from '../canonical-audit-gate.mjs';
 import { QUESTION_HASH } from '../codex-audit.mjs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+// The audit writer (codex-audit-io.mjs) reads the settings beside its own script; the gate must read the
+// same file, never <target repo>/scripts/settings (a sibling repo has none).
+const WRITER_SETTINGS = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', 'settings', 'prototype-load.json');
 
 const sha = 'a'.repeat(40), base = 'b'.repeat(40), other = 'c'.repeat(40);
 const ref = 'lane/audit-gate';
 const green = { head: sha, base, questionHash: QUESTION_HASH, at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED', findings: [] };
 const weak = { ...green, verdict: 'WEAKENED', findings: ['missing guard'] };
 const waiver = { ref, sha, ruling: 'R123', findings: weak.findings };
-function fixture({ records = [green], auditText, tool = {}, platform = {}, resolved = sha, fetchMain = () => {}, ancestor = () => true, readOverride, liveFingerprint = () => null, execOverride } = {}) {
+function fixture({ records = [green], auditText, tool = {}, writerSettings, targetSettings, platform = {}, resolved = sha, fetchMain = () => {}, ancestor = () => true, readOverride, liveFingerprint = () => null, execOverride, auditAt = '/fixture-home/audit.jsonl' } = {}) {
   const reads = [], calls = [];
   const env = { HOME: '/fixture-home', WE_PLATFORM_PREFERENCES_FILE: '/fixture-prefs' };
+  const enoent = () => { const error = new Error('missing'); error.code = 'ENOENT'; throw error; };
   const readFile = (path) => {
     reads.push(path);
     if (readOverride) return readOverride(path);
-    if (path === '/repo/scripts/settings/prototype-load.json') return JSON.stringify({ auditRecordPath: '~/audit.jsonl', ...tool });
+    if (path === WRITER_SETTINGS) return writerSettings === null ? enoent() : writerSettings ?? JSON.stringify({ auditRecordPath: '~/audit.jsonl', ...tool });
+    if (path === '/repo/scripts/settings/prototype-load.json' && targetSettings) return JSON.stringify(targetSettings);
     if (path === '/fixture-prefs') return JSON.stringify({ prototypeLoad: platform });
-    if (path === '/fixture-home/audit.jsonl') return auditText ?? records.map(r => JSON.stringify(r)).join('\n');
+    if (path === auditAt) return auditText ?? records.map(r => JSON.stringify(r)).join('\n');
     const error = new Error('missing'); error.code = 'ENOENT'; throw error;
   };
   const result = checkCanonicalAuditForOpen({ repo: '/repo', ref, sha: 'aaaaaaa', env, readFile, fetchMain, ancestor, liveFingerprint,
@@ -140,6 +148,34 @@ describe('canonical audit before opening a PR', () => {
   });
   it('unreadable audit evidence or settings fails closed', () => {
     expect(fixture({ readOverride: () => { throw new Error('unreadable'); } }).result.reason).toBe('canonical-audit-missing');
+  });
+  describe('settings come from the audit writer, not the target checkout (sibling repos)', () => {
+    it('admits audited evidence for a target checkout that has no scripts/settings file', () => {
+      const { result, reads } = fixture();
+      expect(result).toMatchObject({ ok: true, record: green });
+      expect(reads).toContain(WRITER_SETTINGS);
+      expect(reads).not.toContain('/repo/scripts/settings/prototype-load.json');
+    });
+    it("ignores the target checkout's own settings file (its path and waivers)", () => {
+      const { result } = fixture({ records: [weak],
+        targetSettings: { auditRecordPath: '/elsewhere.jsonl', ruledWeakened: [waiver] } });
+      expect(result).toMatchObject({ ok: false, reason: 'canonical-audit-weakened' });
+    });
+    it('uses the writer default record path when the writer settings file is absent', () => {
+      expect(fixture({ writerSettings: null, auditAt: '/fixture-home/workspace/.operations/coordination/audits.jsonl' }).result)
+        .toMatchObject({ ok: true, record: green });
+    });
+    it('resolves a relative auditRecordPath against the audited checkout, like the writer', () => {
+      expect(fixture({ tool: { auditRecordPath: 'records/audit.jsonl' }, auditAt: '/repo/records/audit.jsonl' }).result)
+        .toMatchObject({ ok: true, record: green });
+    });
+    it('ignores a platform auditRecordPath the writer never consults', () => {
+      expect(fixture({ platform: { auditRecordPath: '/platform.jsonl' } }).result).toMatchObject({ ok: true, record: green });
+    });
+    it.each([['malformed JSON', '{not json'], ['blank path', JSON.stringify({ auditRecordPath: ' ' })],
+      ['non-string path', JSON.stringify({ auditRecordPath: 7 })]])('refuses unreadable writer settings: %s', (_name, text) => {
+      expect(fixture({ writerSettings: text }).result).toMatchObject({ ok: false, reason: 'canonical-audit-missing' });
+    });
   });
   it('a short unresolved source fails closed before any evidence read', () => {
     const { result, reads } = fixture({ resolved: 'aaaaaaa' });
