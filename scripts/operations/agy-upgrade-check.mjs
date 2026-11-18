@@ -33,14 +33,17 @@ export function boundedExec(command, args, { timeoutMs, spawn = nodeSpawn,
       done = true;
       clearTimer(timer);
       if (terminate && Number.isInteger(child?.pid) && child.pid > 0) {
-        try { kill(child.pid, 'SIGKILL'); } catch (error) {
-          if (error.code !== 'ESRCH') result = { ok: false, hung: !!result.hung, reason: 'cleanup incomplete' };
+        // Own process group (detached): the negative exact PID also reaches the child's descendants.
+        for (const target of [-child.pid, child.pid]) {
+          try { kill(target, 'SIGKILL'); } catch (error) {
+            if (error.code !== 'ESRCH') result = { ok: false, hung: !!result.hung, reason: 'cleanup incomplete' };
+          }
         }
       }
       resolveResult({ stdout, ...result });
     };
     try {
-      child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+      child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], detached: true });
       timer = setTimer(() => finish({ ok: false, hung: true, reason: 'timeout' }, true), timeoutMs);
       const collect = (chunk, output) => {
         bytes += Buffer.byteLength(chunk);
@@ -88,7 +91,9 @@ export async function runUpgradeCheck({ dir = agyEvidenceDir(), env = process.en
     io.mkdirSync(binaryDir, { recursive: true });
     const at = now(), cachePath = join(binaryDir, 'upgrade-check.json'), healthPath = join(binaryDir, 'health.json');
     const cache = readBounded(io, cachePath);
-    const lastRun = typeof cache?.at === 'string' ? Date.parse(cache.at) : NaN;
+    // A cache record is trusted only when every field is well-formed; otherwise it is ignored and the check runs.
+    const wellFormed = typeof cache?.at === 'string' && (cache.alerted === undefined || (typeof cache.alerted === 'string' && cache.alerted.length <= 128));
+    const lastRun = wellFormed ? Date.parse(cache.at) : NaN;
     if (Number.isFinite(lastRun) && lastRun <= at && at - lastRun < settings.minIntervalMinutes * 60000)
       return { status: 'rate-limited' };
     const state = { at: new Date(at).toISOString(), alerted: Number.isFinite(lastRun) && lastRun <= at

@@ -36,7 +36,7 @@ describe('bounded commands and smoke', () => {
     const pending = smoke({ spawn, kill });
     child.stdout.write('Antigravity CLI 1.5.11\n'); child.emit('close', 0);
     expect(await pending).toEqual({ ok: true, version: '1.5.11', hung: false });
-    expect(spawn).toHaveBeenCalledWith('agy', ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    expect(spawn).toHaveBeenCalledWith('agy', ['--version'], { stdio: ['ignore', 'pipe', 'pipe'], detached: true });
     expect(kill).not.toHaveBeenCalled();
   });
   it('smoke hang kills only the exact child PID and resolves without close', async () => {
@@ -46,21 +46,21 @@ describe('bounded commands and smoke', () => {
     await vi.advanceTimersByTimeAsync(19999); expect(kill).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
     expect(await pending).toEqual({ ok: false, version: 'unknown', hung: true });
-    expect(kill.mock.calls).toEqual([[45678, 'SIGKILL']]);
+    expect(kill.mock.calls).toEqual([[-45678, 'SIGKILL'], [45678, 'SIGKILL']]);
   });
   it.each([60000, 120000])('brew deadline %s kills the exact PID', async timeoutMs => {
     vi.useFakeTimers(); const kill = vi.fn();
     const pending = boundedExec('brew', ['test'], { spawn: fakeChild, kill, timeoutMs });
     await vi.advanceTimersByTimeAsync(timeoutMs);
     expect(await pending).toMatchObject({ ok: false, hung: true });
-    expect(kill.mock.calls).toEqual([[45678, 'SIGKILL']]);
+    expect(kill.mock.calls).toEqual([[-45678, 'SIGKILL'], [45678, 'SIGKILL']]);
   });
   it('oversized output kills the child and reports a bounded failure', async () => {
     const child = fakeChild(), kill = vi.fn();
     const pending = boundedExec('agy', ['--version'], { spawn: () => child, kill, timeoutMs: 20000 });
     child.stderr.write('x'.repeat(65537));
     expect(await pending).toMatchObject({ ok: false, reason: 'output-limit', stdout: '' });
-    expect(kill.mock.calls).toEqual([[45678, 'SIGKILL']]);
+    expect(kill.mock.calls).toEqual([[-45678, 'SIGKILL'], [45678, 'SIGKILL']]);
   });
   it('ESRCH means the child already exited and preserves the bounded timeout result', async () => {
     vi.useFakeTimers();
@@ -148,7 +148,7 @@ describe('scheduled upgrade check', () => {
       const pending = runUpgradeCheck(f.options);
       await vi.advanceTimersByTimeAsync(120000);
       expect(await pending).toMatchObject({ status: 'dead', ok: false, reason: 'cleanup incomplete' });
-      expect(kill.mock.calls).toEqual([[45678, 'SIGKILL']]);
+      expect(kill.mock.calls).toEqual([[-45678, 'SIGKILL'], [45678, 'SIGKILL']]);
       expect(f.exec).toHaveBeenCalledTimes(preceding.length + 1);
       expect(f.alert).toHaveBeenCalledTimes(1);
       // The lock stays so a later tick cannot overlap the surviving child.
@@ -164,6 +164,12 @@ describe('scheduled upgrade check', () => {
     await vi.advanceTimersByTimeAsync(120000);
     await pending;
     expect(fs.existsSync(join(f.dir, 'upgrade-check.lock'))).toBe(true);
+  });
+  it.each([{ alerted: false }, { alerted: 5 }, { alerted: 'x'.repeat(200) }])('ignores a malformed cache record %j and runs the check', async bad => {
+    const f = fixture([good, current]);
+    fs.mkdirSync(join(f.dir, 'binary'), { recursive: true });
+    fs.writeFileSync(join(f.dir, 'binary', 'upgrade-check.json'), JSON.stringify({ at: new Date(f.options.now()).toISOString(), ...bad }));
+    expect(await runUpgradeCheck(f.options)).not.toEqual({ status: 'rate-limited' });
   });
   it('creates the binary folder and leaves only atomic destination files', async () => {
     const f = fixture([good, current]); fs.rmdirSync(join(f.dir, 'binary'));
