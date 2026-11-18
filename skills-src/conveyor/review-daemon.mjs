@@ -747,11 +747,12 @@ export function runReviewTick({
   // Compute deferrals after confirmed starts, so skipped attempts neither spend capacity nor leave later
   // eligible PRs outside a preselected batch. Only an actual lane shortfall uses the starvation diagnostic.
   const liveCap = remainingReviewCapacity();
-  const live = Number.isFinite(liveReviewBudget?.max)
-    ? liveReviewBudget.max - liveCap
-    : liveReviewBudget?.live + (initialReviewCapacity - liveCap);
   const earlierDispatches = Number.isFinite(liveReviewBudget?.max) && Number.isFinite(liveReviewBudget?.live)
     ? Math.max(0, liveReviewBudget.max - liveReviewBudget.live - initialReviewCapacity) : 0;
+  // Never clamp: an overrun (10 live of max 8) must still read "10 of 8".
+  const live = Number.isFinite(liveReviewBudget?.live)
+    ? liveReviewBudget.live + earlierDispatches + (initialReviewCapacity - liveCap)
+    : Number.isFinite(liveReviewBudget?.max) ? liveReviewBudget.max - liveCap : NaN;
   let capReason = Number.isFinite(live)
     ? liveReviewBudget?.reason?.replace(/live review rounds \d+ of /, `live review rounds ${live} of `)
     : liveReviewBudget?.reason;
