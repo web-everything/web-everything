@@ -134,6 +134,7 @@ import { NEGOTIATION_ROUND_CAP } from '../lib/jury-core.mjs';
 import { resolveRoundCap } from '../lib/round-cap.mjs';
 import { countRearmComments, REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { isFixRoundRearmComment } from './rearm-round-count.mjs';
+import { NOTE_COMMENT_MARKER } from './reconcile-note-comment.mjs';
 // #3383 — see this module's own REFUSAL 3 note below, and `advisory-round-count.mjs`'s header for the
 // `#2117`/`#2298` incident this closes.
 import { countAdvisoryComments, ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
@@ -388,7 +389,7 @@ export function concurrentAuthorPauseState({ comments, headRefOid = null, now = 
  */
 export const BOOKKEEPING_MARKERS = Object.freeze([
   '<!-- mq-failure-recovery:',
-  REFERRAL_HOLD_MARKER,
+  REFERRAL_HOLD_MARKER, NOTE_COMMENT_MARKER,
   REARM_COMMENT_MARKER, CI_HEAL_COMMENT_MARKER, STAND_DOWN_MARKER, SUPERSEDE_STAND_DOWN_MARKER, OPERATOR_ANSWER_MARKER,
   // #xkmu3gv — the two new completed-round markers. Neither is a reviewer speaking, so neither may ever count as
   // a finding (`countFindings`) or the pass would read its OWN handback comment as fresh work to fix.

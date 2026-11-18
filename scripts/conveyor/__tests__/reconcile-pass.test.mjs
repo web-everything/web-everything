@@ -454,11 +454,11 @@ const HEAD_2752 = '253d75c2b82988be773903cba4e5ed172be57fb8';
 const BASE_2752 = '06d01a43e0000000000000000000000000000000';
 const BLOB = 'b'.repeat(40);
 
-it('enrichPrsWithAlreadyLandedFacts skips a PR with no merge-status:conflicting label entirely — zero extra IO', async () => {
+it('enrichPrsWithAlreadyLandedFacts skips a PR with neither conflict label nor DIRTY merge state entirely — zero extra IO', async () => {
   const { enrichPrsWithAlreadyLandedFacts } = await import('../reconcile-pass.mjs');
   const fetchRef = vi.fn();
   const readMergeBase = vi.fn();
-  const prs = [{ number: 1, labels: [{ name: 'review:changes' }] }];
+  const prs = [{ number: 1, headRefOid: HEAD_2752, mergeStateStatus: 'CLEAN', labels: [{ name: 'review:changes' }] }];
   const out = enrichPrsWithAlreadyLandedFacts(prs, { fetchRef, readMergeBase });
   expect(fetchRef).not.toHaveBeenCalled();
   expect(readMergeBase).not.toHaveBeenCalled();
@@ -466,11 +466,15 @@ it('enrichPrsWithAlreadyLandedFacts skips a PR with no merge-status:conflicting 
   expect(out[0].alreadyLandedInMain).toBeUndefined();
 });
 
-it('enrichPrsWithAlreadyLandedFacts attaches alreadyLandedInMain with the attributed carrier PR when every change matches (PR #2752\'s real shape)', async () => {
+it.each([
+  { labels: [{ name: 'review:changes' }, { name: 'merge-status:conflicting' }] },
+  { labels: [{ name: 'review:changes' }], mergeStateStatus: 'DIRTY' },
+  { labels: [], mergeStateStatus: 'dirty' },
+])('enrichPrsWithAlreadyLandedFacts attaches alreadyLandedInMain with the attributed carrier PR when every change matches (PR #2752\'s real shape), evidence %j', async (conflictEvidence) => {
   const { enrichPrsWithAlreadyLandedFacts } = await import('../reconcile-pass.mjs');
   const pr = {
     number: 2752, headRefName: 'lane/4034-critical-work-gate', headRefOid: HEAD_2752,
-    labels: [{ name: 'review:changes' }, { name: 'merge-status:conflicting' }],
+    ...conflictEvidence,
   };
   const fetchRef = vi.fn();
   const readMergeBase = vi.fn(() => BASE_2752);
@@ -493,11 +497,15 @@ it('enrichPrsWithAlreadyLandedFacts attaches alreadyLandedInMain with the attrib
   expect(readPulls).toHaveBeenCalledTimes(1);
 });
 
-it('enrichPrsWithAlreadyLandedFacts leaves the PR untouched when even one change has no match — never guesses partial containment', async () => {
+it.each([
+  { labels: [{ name: 'merge-status:conflicting' }] },
+  { labels: [], mergeStateStatus: 'DIRTY' },
+  { labels: [], mergeStateStatus: 'dirty' },
+])('enrichPrsWithAlreadyLandedFacts leaves the PR untouched when even one change has no match — never guesses partial containment, evidence %j', async (conflictEvidence) => {
   const { enrichPrsWithAlreadyLandedFacts } = await import('../reconcile-pass.mjs');
   const pr = {
     number: 2752, headRefName: 'lane/4034-critical-work-gate', headRefOid: HEAD_2752,
-    labels: [{ name: 'merge-status:conflicting' }],
+    ...conflictEvidence,
   };
   const readChanges = vi.fn(() => [
     { status: 'A', path: 'b.txt', dstMode: '100644', dstBlob: BLOB },
@@ -510,9 +518,13 @@ it('enrichPrsWithAlreadyLandedFacts leaves the PR untouched when even one change
   expect(out[0].alreadyLandedInMain).toBeUndefined();
 });
 
-it('enrichPrsWithAlreadyLandedFacts never guesses containment with no merge-base, no readable changes, or a non-sha head', async () => {
+it.each([
+  { labels: [{ name: 'merge-status:conflicting' }] },
+  { labels: [], mergeStateStatus: 'DIRTY' },
+  { labels: [], mergeStateStatus: 'dirty' },
+])('enrichPrsWithAlreadyLandedFacts never guesses containment with no merge-base, no readable changes, or a non-sha head, evidence %j', async (conflictEvidence) => {
   const { enrichPrsWithAlreadyLandedFacts } = await import('../reconcile-pass.mjs');
-  const pr = { number: 2752, headRefOid: HEAD_2752, labels: [{ name: 'merge-status:conflicting' }] };
+  const pr = { number: 2752, headRefOid: HEAD_2752, ...conflictEvidence };
   const readChanges = vi.fn(() => []);
   expect(enrichPrsWithAlreadyLandedFacts([pr], { fetchRef: vi.fn(), readMergeBase: () => null, readChanges })[0]
     .alreadyLandedInMain).toBeUndefined();

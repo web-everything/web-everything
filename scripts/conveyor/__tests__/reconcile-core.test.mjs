@@ -262,6 +262,21 @@ describe('case 2 — refusal 1: a fixer that stopped to ASK is never restarted (
     expect(planNoteComment(note, [...stoodDown.comments, { author: { login: 'stranger' }, body: publication.body }]).alreadyPosted).toBe(false);
   });
 
+  it('a cleared stand-down with only its operator note and bookkeeping refuses no-findings', () => {
+    const held = pr1563({ comments: [{ author: AUTOMATION,
+      body: buildStandDownComment({ reason: 'needs-judgment', head: pr1563().headRefOid }) }] });
+    const first = planReconcile({ prs: [held], agents: [], now: NOW });
+    expect(first.refusals[0].kind).toBe('stood-down');
+    const publication = planNoteComment(first.notes[0], held.comments);
+    const comments = [...held.comments, { author: AUTOMATION, body: publication.body }];
+    expect(countFindings(comments)).toBe(0);
+    const cleared = { ...held, headRefOid: 'f'.repeat(40), comments };
+    const plan = planReconcile({ prs: [cleared], agents: [], now: NOW });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals.map(r => r.kind)).toEqual(['no-findings']);
+    expect(countFindings([{ body: `> ${publication.body}\nThis still needs repair.` }])).toBe(1);
+  });
+
   it('TERMINAL — a week later the answer is byte-identical: no decay, no clock', () => {
     const a = planReconcile({ prs: [stoodDown], agents: [], durableCounts: {}, now: NOW });
     const b = planReconcile({ prs: [stoodDown], agents: [], durableCounts: {}, now: NOW + 7 * 24 * HOUR });
