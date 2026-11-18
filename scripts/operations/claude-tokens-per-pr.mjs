@@ -7,6 +7,7 @@ import { parseArgs } from 'node:util';
 import { entries, blocks } from './agent-usage-report.mjs';
 import { PROJECTS_DIR, flattenToolResultText, stripControlSequences } from '../../skills-src/inspect-agent-health/agent-health.mjs';
 import { codexUsageLedgerPath } from '../lib/codex-usage-ledger.mjs';
+import { ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 
 // Lane clones and the primary checkout of this repository share one PR namespace.
@@ -145,7 +146,7 @@ export async function readSessions({ projectsDir = PROJECTS_DIR, since, now, rep
 
 export function listMergedPrs({ since = 0, gh = runGhSync } = {}) {
   const limit = 2000;
-  const prs = JSON.parse(gh(['pr', 'list', '--state', 'merged', '--limit', String(limit), '--json', 'number,headRefName,mergedAt,url'], {
+  const prs = JSON.parse(gh(['pr', 'list', '--repo', ghRepoSlug('we'), '--state', 'merged', '--limit', String(limit), '--json', 'number,headRefName,mergedAt,url'], {
     encoding: 'utf8', timeout: 120000, maxBuffer: 32 * 1024 * 1024,
   }));
   if (!Array.isArray(prs)) throw new Error('Invalid merged PR response');

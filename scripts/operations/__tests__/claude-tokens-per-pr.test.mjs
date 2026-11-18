@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { ghRepoSlug } from '../../lib/constellation-repos.mjs';
 import { attributeSessions, readSession, readReport, formatReport, main } from '../claude-tokens-per-pr.mjs';
 
 let temp, projects, project, children, ledger, cwd;
@@ -284,7 +285,7 @@ describe('windowed report and CLI', () => {
     const gh = vi.fn(() => JSON.stringify(listed));
     await assert.rejects(readReport({ ...options(), listMergedPrs: undefined, gh }), /gh listing limit; shorten --days/);
     assert.equal(gh.mock.calls.length, 1);
-    assert.deepEqual(gh.mock.calls[0][0], ['pr', 'list', '--state', 'merged', '--limit', '2000', '--json', 'number,headRefName,mergedAt,url']);
+    assert.deepEqual(gh.mock.calls[0][0], ['pr', 'list', '--repo', ghRepoSlug('we'), '--state', 'merged', '--limit', '2000', '--json', 'number,headRefName,mergedAt,url']);
     assert.equal(gh.mock.calls[0][1].maxBuffer, 32 * 1024 * 1024);
   });
   it('allows 500+ default-reader results when the raw cap is not saturated inside the window', async () => {
