@@ -27,6 +27,8 @@ import {
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
+import { readPendingDrops } from '../../daemon-overlay.mjs';
+import { detectOverlayStale } from './overlay-prune.mjs';
 import { makeAuditedTipGate, tipInMain } from './audited-tip.mjs';
 import { carriedBeyondMain } from '../../operations/prototype-retire.mjs';
 import * as realAutoRebase from './auto-rebase.mjs';
@@ -96,6 +98,8 @@ export async function prepareRebuild({
   if (process.env.VITEST === 'true' && env?.WE_DAEMON_AUTO_REBASE === undefined) {
     env = { ...env, WE_DAEMON_AUTO_REBASE: '0' };
   }
+  // Tests must opt in to the detector: it queries GitHub for open PR heads.
+  if (process.env.VITEST === 'true' && env?.WE_OVERLAY_STALE === undefined) env = { ...env, WE_OVERLAY_STALE: '0' };
   // Status must not refresh the live index while an excluded spawner may still be reading it.
   if (readyOnly) env = { ...env, GIT_OPTIONAL_LOCKS: '0' };
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
@@ -129,6 +133,15 @@ export async function prepareRebuild({
 
   const state = readRebuildState(root, stEnv);
   const writeState = () => writeRebuildState(root, state, stEnv);
+  // A pending (or unreadable) drop intent blocks only a NEW build that changes what is applied (checked after planning).
+  // Recovery paths — unverified-build recovery, quarantine lift, rollback — never drop registrations and still run.
+  // Re-read at each mutation point (not one early snapshot): a retirement can start during recovery or planning.
+  const dropPendingNow = () => {
+    try { return readPendingDrops(root, env).length > 0; } catch (error) {
+      alert('drop-pending-unsettled', { error: String(error.message) });
+      return true;
+    }
+  };
 
   const finishVerifiedSwaps = async () => {
     try {
@@ -375,6 +388,11 @@ export async function prepareRebuild({
     stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
     prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
   });
+  if (plan.ok && (plan.finalSha !== prevHead || plan.decisions?.some(d => d.action === 'remove')) && dropPendingNow()) return terminal({ moved: false, reason: 'drop-pending-unsettled' });
+  if (!readyOnly) {
+    try { detectOverlayStale({ root, env, overlays: overlaysBefore, plan, mainSha: fetchedMainSha, git }); }
+    catch (error) { alert('overlay-stale-unknown', { error: String(error.message) }); }
+  }
   // The chains gh answered completely are written back onto the entries (only when they changed), so a rebuild that
   // cannot reach gh later still knows the stacks. Best effort: a busy or unwritable list never fails the rebuild.
   // A chain only names a stack's members; setting a base aside still needs hard evidence it moved (planOverlayStacks).
@@ -482,6 +500,7 @@ export async function prepareRebuild({
     }
     return terminal({ moved: false, reason: 'established-overlay-conflict', detail });
   }
+  if ((plan.finalSha !== prevHead || plan.decisions.some(d => d.action === 'remove')) && dropPendingNow()) return terminal({ moved: false, reason: 'drop-pending-unsettled' });
   for (const d of plan.decisions) {
     if (d.pr != null && (d.action === 'apply' || d.action === 'remove') && !d.pinned) clearOverlayConflictWake(env, d.pr);
     if (d.action === 'remove') {
