@@ -1,4 +1,11 @@
 import { it, expect, vi, afterAll, beforeEach } from 'vitest';
+// The host operator store (~/.claude/operator-overrides.json) outranks env, so a developer's live
+// redTeamQueue override would leak into these fixtures; read a missing store instead (= no overrides).
+const operatorFixture = vi.hoisted(() => ({ file: `/nonexistent-operator-store-${process.pid}-${Date.now()}.json` }));
+vi.mock('../../../scripts/lib/operator-override-reader.mjs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, readOperatorOverrides: options => actual.readOperatorOverrides({ ...options, file: options?.file ?? operatorFixture.file }) };
+});
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
