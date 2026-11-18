@@ -26,6 +26,9 @@ import { writeLineSync } from '../lib/write-all-sync.mjs';
 import { resolve } from 'node:path';
 import { decideSetLabel, runReviewLabelCli, presentRemoveLabels, neutralizeCommentMarkers } from '../review-set-label.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
+import { RED_TEAM_FIX_COMMENT_MARKER } from './red-team-fix-round-count.mjs';
+import { redTeamFact } from './dispatch-eligibility-facts.mjs';
+import { latestRedTeamResultPosition } from '../lib/red-team-gate.mjs';
 import { AUTOMATION_LOGINS, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { reviewedHeadsOf } from './mechanical-round-cap.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
@@ -262,6 +265,7 @@ export function hasUnexpectedPositionals(argv) {
 
 /** True when a known flag is malformed/typo'd (`--expect-head-typo=x`, bare `--repo`), repeated, or a validated value is bad. */
 export function hasInvalidArgs(argv) {
+  if (argv.includes('--round=red-team') && !argv.some(a => /^--expect-head=[0-9a-f]{40}$/i.test(a))) return true;
   const seen = new Set();
   for (const a of argv) {
     if (!a.startsWith('--')) continue;
@@ -316,6 +320,30 @@ export function buildRedTeamRearmComment(input) {
   return buildRearmComment(input).replace(REARM_COMMENT_MARKER, RED_TEAM_REARM_COMMENT_MARKER);
 }
 
+/** A red-team hand-back may omit the ordinary charge only after a counted dispatch for the latest gate result.
+ * The receipt names the pre-repair head; --expect-head pins the pushed head separately in the shared writer.
+ */
+export function redTeamRearmRefusal({ comments, pr }) {
+  const refused = 'red-team dispatch evidence missing, stale or unreadable — retry with fresh reconciliation or ask an operator';
+  if (!Array.isArray(comments)) return refused;
+  const resultAt = latestRedTeamResultPosition(comments, pr);
+  if (resultAt < 0) return refused;
+  for (let i = comments.length - 1; i > resultAt; i--) {
+    const c = comments[i];
+    if (!isTrustedMarkerAuthor(c) || typeof c?.body !== 'string') continue;
+    const text = c.body.trim();
+    // A later ordinary verdict or completed hand-back closes this dispatch's repair window.
+    if (CHANGES_VERDICT_HEADING_RE.test(text) || text.startsWith(RED_TEAM_REARM_COMMENT_MARKER)) return refused;
+    if (!text.startsWith(RED_TEAM_FIX_COMMENT_MARKER)) continue;
+    const receipt = /^Red-team repair dispatched: head=([0-9a-f]{40}) result=(\S{1,256}) attempt=([\w-]{1,128})$/.exec(
+      text.slice(RED_TEAM_FIX_COMMENT_MARKER.length).trim());
+    if (!receipt || text.split('\n')[0] !== RED_TEAM_FIX_COMMENT_MARKER) return refused;
+    const fact = redTeamFact(comments.slice(resultAt), pr, receipt[1])?.value;
+    return fact?.state === 'send-back' && fact.resultId === receipt[2] ? null : refused;
+  }
+  return refused;
+}
+
 // we:scripts/conveyor/rearm-review.mjs — allow importing the pure decider without running the CLI (the test file
 // imports this module). The standard main check used across the conveyor scripts.
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname);
@@ -368,6 +396,7 @@ if (IS_CLI) {
   }
   runReviewLabelCli({
     fixedTo: 'rearm',
+    rearmEvidenceGuard: roundArg === 'red-team' ? redTeamRearmRefusal : null,
     defaultActor: 'conveyor fix agent',
     repoOptional: true, // the fix agent runs inside its WE lane clone, so a missing --repo derives from cwd.
     usage: 'usage: rearm-review.mjs <pr> [--repo=<owner/name>] [--actor=<name>] [--round=conflict|red-team] [--main-ref=<name>] [--only-if=accepted|missing] [--expect-head=<sha>]  (pr must be a positive integer)',

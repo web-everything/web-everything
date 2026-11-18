@@ -38,13 +38,13 @@
 **RED-TEAM SENT-BACK MODE (`mode: red-team-sent-back`).** An accepted PR can still owe the gate's unresolved
 confirmed findings on its current head. Use the gate findings supplied in the dispatch context as the ask,
 instead of step 2's latest review comment. Repair, verify, and push to the same PR branch. Skip step 7's
-`rearm-review.mjs`: hand the pushed head back through the sanctioned label writer instead:
-`node "{{WE_ROOT}}/scripts/review-set-label.mjs" {{PR_NUM}} --repo={{REPO}} --to=rearm --expect-head=<full-pushed-sha>`.
+ordinary command: hand the pushed head back through the pinned red-team rearm command instead:
+`node "{{WE_ROOT}}/scripts/conveyor/rearm-review.mjs" {{PR_NUM}} --repo={{REPO}} --round=red-team --expect-head=<full-pushed-sha>`.
 This removes inherited `review:accepted` and `ready-to-merge`, returning the PR to `review:pending` for an
 independent ordinary review. Human review holds and clearance protections still apply; a refused hand-back
 is unfinished work. Report completion and release the lane as usual. For borrowed repairs, fix-run owns
 this hand-back after push. Claude dispatch publishes the counted repair-round marker before launch (bound
-to head, gate result, and attempt); fix-run publishes its marker after push. Do not publish another round
+to head, gate result, and attempt); fix-run also publishes its marker before execution. Do not publish another round
 marker or use the ordinary rearm marker: the shared cap must count this repair once.
 
 | Placeholder | What the conveyor fills it with |
