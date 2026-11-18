@@ -20,6 +20,7 @@ import {
   retirePrepareGuards,
   planPrepareSpawns,
   planFixSpawns,
+  readTickCommentFloors,
   retireFixGuards,
   clearTerminalFixAttempts,
   planCiHealSpawns,
@@ -47,6 +48,7 @@ import {
   lanePoolListArgsForRepo,
   reuseFailedLanePoolRead,
 } from '../tick-core.mjs';
+import { readCompletePrComments } from '../pr-comments-complete.mjs';
 import { countFixRoundComments, REARM_COMMENT_MARKER, SAME_HEAD_WAKE_TRAILER } from '../rearm-round-count.mjs';
 import { RED_TEAM_FIX_COMMENT_MARKER, RED_TEAM_REARM_COMMENT_MARKER, countRedTeamFixComments } from '../red-team-fix-round-count.mjs';
 import { buildCiHealComment, CI_HEAL_ROUND_CAP } from '../ci-heal-mark.mjs';
@@ -488,6 +490,65 @@ describe('planFixSpawns — in-flight test + retry cap across bounce cycles (SKI
     });
     expect(r.spawns).toEqual([]);
     expect(r.notes[0]).toMatchObject({ kind: 'fix-exhausted', pr: 99, attempts: 3 });
+  });
+
+  describe('red-team-sent-back complete durable floor admission', () => {
+    const pr = { ...changesPr(99, 40), mode: 'red-team-sent-back' };
+    const plan = floors => planFixSpawns({ prs: [pr], launchedNums: [40], fixAttempts: {},
+      ...floors, retryCap: 3, availableLanes: [5], tick: 0 });
+    const read = gh => readTickCommentFloors({ prs: [pr],
+      readComments: () => { throw Error('must use complete reader'); },
+      readCompleteComments: p => readCompletePrComments(p.prNumber, { repo: 'owner/repo', gh }),
+    });
+    const countProof = totalCount => ({ data: { repository: { pullRequest: { comments: { totalCount } } } } });
+    const comment = i => ({ node_id: `IC_${i}`, user: { login: 'web-everything' }, body: RED_TEAM_FIX_COMMENT_MARKER });
+
+    it('comment-read failure after restart defers without a spawn, guard, lane or attempt; next tick retries', () => {
+      const floors = read(() => { throw Error('comment read failed'); });
+      expect(floors.prRearmCounts).toEqual({});
+      const r = plan(floors);
+      expect(r).toMatchObject({ spawns: [], newGuards: [], consumedLanes: [], fixAttempts: {} });
+      expect(r.notes).toEqual([expect.objectContaining({ kind: 'fix-floor-unavailable', pr: 99,
+        text: expect.stringContaining('retry next tick') })]);
+      expect(plan(read(args => args[1] === 'graphql' ? countProof(0) : [])).spawns).toHaveLength(1);
+    });
+
+    it('incomplete pagination at the ten-page cap defers instead of counting the prefix', () => {
+      let calls = 0;
+      const floors = read(() => Array.from({ length: 100 }, (_, i) => comment(calls++ * 100 + i)));
+      expect(calls).toBe(1000);
+      expect(floors.prRearmCounts).toEqual({});
+      expect(plan(floors).notes[0].kind).toBe('fix-floor-unavailable');
+      expect(plan(floors).spawns).toEqual([]);
+    });
+
+    it('a short REST read with a mismatching total count defers', () => {
+      const floors = read(args => args[1] === 'graphql' ? countProof(3) : []);
+      expect(floors.prRearmCounts).toEqual({});
+      expect(plan(floors).spawns).toEqual([]);
+    });
+
+    it.each([undefined, null, -1, NaN, '0'])('unset or invalid floor %s defers', floor => {
+      const r = plan({ prRearmCounts: { 99: floor } });
+      expect(r.spawns).toEqual([]);
+      expect(r.notes[0].kind).toBe('fix-floor-unavailable');
+    });
+
+    it.each([0, 2, 3])('successful complete read with %i spent rounds enforces cap 3', spent => {
+      const floors = read(args => args[1] === 'graphql' ? countProof(spent) : Array.from({ length: spent }, (_, i) => comment(i)));
+      expect(floors.prRearmCounts).toEqual({ 99: spent });
+      const r = plan(floors);
+      expect(r.spawns).toEqual(spent < 3 ? [{ pr: 99, num: 40, lane: 5 }] : []);
+      if (spent === 3) expect(r.notes[0]).toMatchObject({ kind: 'fix-exhausted', attempts: 3 });
+    });
+
+    it.each([undefined, 'ordinary'])('other mode %s retains fail-open behavior on comment failure', mode => {
+      const ordinary = { ...pr, mode };
+      const floors = readTickCommentFloors({ prs: [ordinary], readComments: () => { throw Error('read failed'); },
+        readCompleteComments: () => { throw Error('must not be called'); } });
+      expect(planFixSpawns({ prs: [ordinary], launchedNums: [40], fixAttempts: {}, ...floors,
+        retryCap: 3, availableLanes: [5] }).spawns).toEqual([{ pr: 99, num: 40, lane: 5 }]);
+    });
   });
 
   it('shares marker trust and launch deduplication while retaining ordinary rounds and failed launches', () => {

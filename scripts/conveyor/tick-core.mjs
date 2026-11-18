@@ -158,6 +158,7 @@ import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { resolvePausedKinds, isScopedPause } from '../readiness/dispatch-pause.mjs';
 import { createQueueBudget, dispatchDemandMinutes, DEFAULT_ARRIVAL_WINDOW_MINUTES } from '../readiness/heavy-queue-projection.mjs'; // card xkyw1x4 — the pure queue-time admission (the IO half lives in heavy-admission.mjs)
 import { readPreparePolicy } from './prepare-policy-settings.mjs';
+import { countFixRoundComments } from './rearm-round-count.mjs';
 import { prepareAheadNums } from './build-dispatch-policy.mjs'; // card 80 — prepare just in time (pure)
 import { costAdmissionOn, jobCostClass } from '../lib/cost-admission.mjs'; // card x60i0ie — heavy/light cost classes (pure)
 import { ciHealBudgetEvidence, resolveCiHealBudget, resolveCiHealBudgetRestore } from './ci-heal-mark.mjs'; // #5968 — the shared CI-heal budget calculation
@@ -793,6 +794,13 @@ export function planFixSpawns({ prs = [], launchedNums = [], liveFixGuards = [],
     const pr = Number(p.prNumber);
     if (!pr) continue;
     if (guardedPrs.has(pr)) continue; // a fix agent for this PR is already live
+    // Red-team rounds must survive a restart: unknown evidence is never a zero floor.
+    if (p.mode === 'red-team-sent-back' && (!Object.hasOwn(durable, pr)
+      || !Number.isSafeInteger(durable[pr]) || durable[pr] < 0)) {
+      notes.push({ kind: 'fix-floor-unavailable', num: p.num, pr,
+        text: `PR #${pr} red-team fix deferred: complete comment round floor unavailable; retry next tick (inspect full thread if persistent)` });
+      continue;
+    }
     // The DURABLE re-arm-comment count is the restart-surviving floor; the in-session tally the within-session
     // overlay (it alone catches a claimed fix that died before posting a re-arm comment). The cap binds on
     // whichever is higher, so a restart can never reset a PR that already burned its attempts (#2643).
@@ -946,6 +954,32 @@ export function planCiHealSpawns({ prs = [], launchedNums = [], liveCiHealGuards
 export function ciHealFloorFromComments(comments, { policy = resolveCiHealBudget({ env: process.env }), restore = resolveCiHealBudgetRestore(process.env) } = {}) {
   const { chargeable, refunded } = ciHealBudgetEvidence(comments, { resetOnFixHead: policy.resetOnFixHead, restore });
   return { count: chargeable, refunded };
+}
+
+/** IO seam: only red-team hand-backs require a proven complete comment thread.
+ * A failed read leaves its floor absent; planFixSpawns defers that PR and retries next tick.
+ * Other modes retain their best-effort floors. Readers are injected by the CLI shell.
+ */
+export function readTickCommentFloors({ prs = [], readComments, readCompleteComments } = {}) {
+  const prRearmCounts = {};
+  const prCiHealCounts = {};
+  const prCiHealRefunds = {};
+  for (const p of Array.isArray(prs) ? prs : []) {
+    const wantsRearm = p?.prNumber && Array.isArray(p.labels) && p.labels.includes('review:changes');
+    const wantsCiHeal = p?.prNumber && isCiHealTarget(p);
+    if (!wantsRearm && !wantsCiHeal) continue;
+    try {
+      const comments = p.mode === 'red-team-sent-back' ? readCompleteComments(p) : readComments(p);
+      if (p.mode === 'red-team-sent-back' && !Array.isArray(comments)) throw Error('missing comment thread');
+      if (wantsRearm) prRearmCounts[p.prNumber] = countFixRoundComments(comments);
+      if (wantsCiHeal) {
+        const floor = ciHealFloorFromComments(comments);
+        prCiHealCounts[p.prNumber] = floor.count;
+        prCiHealRefunds[p.prNumber] = floor.refunded;
+      }
+    } catch { /* Absent floor blocks red-team fixes only; other modes remain fail-open. */ }
+  }
+  return { prRearmCounts, prCiHealCounts, prCiHealRefunds };
 }
 
 /**
@@ -2180,46 +2214,31 @@ async function main(argv) {
     }
   } catch { /* leave the floor unset — the in-session TTL still guards */ }
 
-  // DURABLE retry-cap floor (#2643): for each OPEN `review:changes` PR, read its re-arm comments off the PR and
-  // count ordinary re-arms and spent red-team rounds (`countFixRoundComments`). This is the restart-surviving
-  // source of truth for "how many times this PR was auto-fixed" — the in-session `fixAttempts` map is gone after a restart, so without this the cap could
-  // never bind on a fresh conveyor. Only `review:changes` PRs are read (rare), so it adds no per-tick gh cost in
-  // the common case; a comment read that fails is best-effort (floor 0 — the in-session tally still guards).
-  const { countFixRoundComments } = await import('./rearm-round-count.mjs');
-  const prRearmCounts = {};
-  const prCiHealCounts = {};
-  const prCiHealRefunds = {};
-  // ONE `gh pr view … --json comments` per PR that is EITHER a `review:changes` bounce (fix-loop floor, #2643) OR a
-  // CI-heal target (CI-heal floor, #2666). Both durable floors read the SAME comment thread, so a single read serves
-  // both counters — a red/BEHIND PR that is also `review:changes` is owned by the fix loop, but reading its comments
-  // once and counting both markers costs nothing extra. Both are RARE (a red / bounced PR), so this adds no per-tick
-  // gh cost in the common all-green case.
-  for (const p of Array.isArray(state?.prs) ? state.prs : []) {
-    const labels = Array.isArray(p?.labels) ? p.labels : [];
-    const wantsRearm = p?.prNumber && labels.includes('review:changes');
-    const wantsCiHeal = p?.prNumber && isCiHealTarget(p);
-    if (!wantsRearm && !wantsCiHeal) continue;
-    // Best-effort, NON-fatal (unlike `runJson`, which exits the tick on error): a single PR's comment read must
-    // never kill the whole tick — on failure the floor stays unset (0) and the in-session tally still binds.
-    // Thread `--repo` exactly as the state read does (line above): without it, `gh pr view` resolves the repo from
-    // cwd, so in explicit-`--repo` mode every read would 404 → floor 0 → the durable cap silently drops (the very
-    // restart bug this fixes, re-exposed for that invocation).
-    const prViewArgs = ['pr', 'view', String(p.prNumber), '--json', 'comments'];
-    if (typeof flags.repo === 'string') { prViewArgs.push(`--repo=${flags.repo}`); }
-    try {
-      // #x5n4zn3 — was bare (no timeout); best-effort per-PR read, so a bound here just means one PR's
-      // floor stays unset instead of the whole tick stalling on it.
-      const raw = time('prCommentReadsMs', () => execFileSync('gh', prViewArgs,
-        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' }));
-      const comments = JSON.parse(raw)?.comments;
-      if (wantsRearm) prRearmCounts[p.prNumber] = countFixRoundComments(comments);
-      if (wantsCiHeal) {
-        const floor = ciHealFloorFromComments(comments);
-        prCiHealCounts[p.prNumber] = floor.count;
-        prCiHealRefunds[p.prNumber] = floor.refunded;
-      }
-    } catch { /* leave the floor unset — the in-session tally still guards the cap */ }
-  }
+  // Red-team hand-backs require complete, count-proven evidence. Bound pagination to
+  // ten pages per PR and share 128 calls across these reads for the tick. Exhaustion
+  // leaves the floor unset: defer with an operator-visible note and retry next tick.
+  const { readCompletePrComments } = await import('./pr-comments-complete.mjs');
+  let completeCommentCalls = 0;
+  const completeCommentGh = args => {
+    if (completeCommentCalls >= 128) throw Error('tick comment request budget exceeded');
+    completeCommentCalls++;
+    return JSON.parse(time('prCommentReadsMs', () => execFileSync('gh', args,
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' })));
+  };
+  const { prRearmCounts, prCiHealCounts, prCiHealRefunds } = readTickCommentFloors({
+    prs: state?.prs,
+    readCompleteComments: p => readCompletePrComments(p.prNumber, {
+      repo: repoProfile(flags.repo ?? 'we')?.slug ?? flags.repo,
+      gh: completeCommentGh, maxPages: 10,
+    }),
+    // Preserve the existing best-effort read and fail-open behavior for other modes.
+    readComments: p => {
+      const args = ['pr', 'view', String(p.prNumber), '--json', 'comments'];
+      if (typeof flags.repo === 'string') args.push(`--repo=${flags.repo}`);
+      return JSON.parse(time('prCommentReadsMs', () => execFileSync('gh', args,
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' })))?.comments;
+    },
+  });
 
   // #3461 — the admission queue's live `status` read. Best-effort (`runJson` exits the whole tick on failure,
   // which a still-forming `.admission` dir before the first heavy command ever ran must NOT trigger) — a read

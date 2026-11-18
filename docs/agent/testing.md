@@ -4583,3 +4583,12 @@ crash-restart exemption without proof that execution never started. Recovery use
 new dispatch and launch ID, consuming another round under the shared cap. Keep the
 failed/no-change/executor-fallback replay refusal and fresh-launch assertions in
 `fix-run.test.mjs`.
+
+### Tick red-team durable floor admission
+
+`tick-core.test.mjs` drives the tick comment-read seam through the shared complete
+reader, then plans with an empty post-restart attempt tally. Red-team hand-backs
+defer with a retry note on read failure, page-cap exhaustion, count mismatch or an
+unset floor; complete reads at zero/below/at cap preserve admission accounting.
+Keep ordinary modes fail-open on the same read failure. Persistent deferral asks
+the operator to inspect the full thread; the next tick reads fresh evidence.
