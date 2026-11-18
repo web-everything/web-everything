@@ -258,13 +258,15 @@ export function enrichPrRollupEvidence({ repo, rows, exec, execOpts = {} }) {
   return rows;
 }
 
-/** PURE: exactly gh pr list --json's labels and flattened statusCheckRollup shape. */
+/** PURE: gh-shaped labels and rollup rows. Malformed nodes become nameless unknown
+ * evidence: strict resolution stays unknown and legacy summaries reject the read.
+ */
 export function mapGraphqlPr(n) {
   return { ...rollupEvidence(n.commits?.nodes?.[0]?.commit), number: n.number, title: n.title, url: n.url, isDraft: n.isDraft, createdAt: n.createdAt, updatedAt: n.updatedAt,
     headRefName: n.headRefName, headRefOid: n.headRefOid, baseRefName: n.baseRefName, isCrossRepository: n.isCrossRepository,
     mergeable: n.mergeable, mergeStateStatus: n.mergeStateStatus, reviewDecision: n.reviewDecision ?? '',
     labels: n.labels?.nodes ?? [],
-    statusCheckRollup: (n.commits?.nodes?.[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? []).filter(n => n && ['CheckRun', 'StatusContext'].includes(n.__typename)).map(mapCtx) };
+    statusCheckRollup: (n.commits?.nodes?.[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? []).map(n => n && ['CheckRun', 'StatusContext'].includes(n.__typename) ? mapCtx(n) : { status: 'UNKNOWN' }) };
 }
 
 /** PURE: reject GraphQL errors even when accompanied by partial data. */

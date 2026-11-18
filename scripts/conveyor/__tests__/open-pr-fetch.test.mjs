@@ -295,11 +295,8 @@ describe('rollup connection completeness at the fetch boundary', () => {
     ['empty complete', { pageInfo: { hasNextPage: false }, totalCount: 0, nodes: [] }, true],
   ])('%s metadata is proved strictly on both read paths', (_name, contexts, complete) => {
     const commit = { oid: head, statusCheckRollup: { contexts } };
-    // Invalid nodes are still rejected as evidence; mapGraphqlPr's row mapping expects valid GraphQL nodes.
-    if (!contexts.nodes?.includes(null)) {
-      expect(mapGraphqlPr({ headRefOid: head, commits: { nodes: [{ commit }] } }))
-        .toMatchObject({ rowsHead: head, rowsComplete: complete });
-    }
+    expect(mapGraphqlPr({ headRefOid: head, commits: { nodes: [{ commit }] } }))
+      .toMatchObject({ rowsHead: head, rowsComplete: complete });
     const exec = vi.fn(args => args[0] === 'pr'
       ? JSON.stringify([{ number: 1, headRefOid: head, statusCheckRollup: [] }])
       : JSON.stringify({ data: { repository: { h0: commit } } }));
@@ -331,4 +328,19 @@ it.each([null, 'wrong-head', 'read-error', 'graphql-error'])('legacy rollup read
   };
   expect(defaultFetchOpenPrs({ repo: 'o/r', exec, readComments: () => [] })[0])
     .toMatchObject({ rowsComplete: false, rowsHead: null });
+});
+
+
+it('malformed refresh beside success preserves an existing legacy failure at the fetch boundary', () => {
+  const head = 'a'.repeat(40);
+  const oldRows = [{ name: 'merge-gate', status: 'COMPLETED', conclusion: 'FAILURE' }];
+  const commit = { oid: head, statusCheckRollup: { contexts: { totalCount: 2,
+    pageInfo: { hasNextPage: false }, nodes: [
+      { __typename: 'CheckRun', name: 'merge-gate', status: 'COMPLETED', conclusion: 'SUCCESS' }, null,
+    ] } } };
+  const exec = vi.fn(args => args[0] === 'pr'
+    ? JSON.stringify([{ number: 1, headRefOid: head, statusCheckRollup: oldRows }])
+    : JSON.stringify({ data: { repository: { h0: commit } } }));
+  expect(defaultFetchOpenPrs({ repo: 'o/r', exec, readComments: () => [] })[0])
+    .toMatchObject({ rowsHead: head, rowsComplete: false, statusCheckRollup: oldRows });
 });

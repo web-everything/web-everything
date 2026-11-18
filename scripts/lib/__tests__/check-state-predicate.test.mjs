@@ -834,3 +834,35 @@ describe('pre-review evidence regressions', () => {
       requiredNames: ['test', 'review-gate'] }).state).toBe('held');
   });
 });
+
+
+describe('audit: roster and human-hold refusal paths', () => {
+  const head = 'a'.repeat(40);
+  const failed = { name: 'merge-gate', status: 'completed', conclusion: 'failure',
+    detailsUrl: 'https://github.com/o/r/actions/runs/1/job/7' };
+  const evidence = { head, rowsHead: head, rowsComplete: true, rosterSource: 'live',
+    rows: [failed], requiredNames: ['merge-gate'] };
+
+  it.each([[], null, 'merge-gate', [null], new Array(1)])(
+    'refuses invalid roster %j even with the historical empty-roster override and an observed failure', requiredNames => {
+      expect(resolveRequiredChecks({ ...evidence, requiredNames, allowEmptyRequiredNames: true }))
+        .toMatchObject({ state: 'unknown', reasons: ['roster-unavailable'] });
+    });
+
+  it.each([
+    [['candidate-label'], 'fail'],
+    [['producer-certified', 'test-gaming', 'ledger'], 'fail'],
+    [['candidate-label', 'review-hold-labels'], 'held'],
+    [['review-acceptance'], 'held'],
+    [['review-acceptance', 'codeql'], 'fail'],
+    [[], 'fail'],
+  ])('requires actual human-review hold evidence for %j => %s across every annotation source', (holdIds, state) => {
+    const bound = { jobId: 7, headSha: head, holdIds };
+    for (const source of ['holds', 'mergeGateReviewHold', 'mergeGateHoldExcused']) {
+      const options = source === 'holds' ? { holds: [bound] }
+        : { rows: [{ ...failed, [source]: bound }] };
+      expect(resolveRequiredChecks({ ...evidence, ...options }))
+        .toMatchObject({ state, perName: { 'merge-gate': { state } } });
+    }
+  });
+});

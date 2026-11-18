@@ -1,4 +1,4 @@
-import { HUMAN_REVIEW_HOLD_GATES } from './merge-gate-verdict.mjs';
+import { humanReviewOnlyHold } from './merge-gate-verdict.mjs';
 
 /**
  * Pure check-state policy. Known unfinished statuses are pending. Completed
@@ -162,10 +162,10 @@ const evidenceIdentity = row => {
  * Every required name needs its own evidence; historical implication options are ignored.
  * rowsComplete is true only after exhausting pages or explicitly fetching every required name.
  */
-export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNames, rosterSource, head, holds = [], optionalNames = [], allowEmptyRequiredNames = false } = {}) {
+export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNames, rosterSource, head, holds = [], optionalNames = [] } = {}) {
   const perName = Object.create(null), reasons = [];
   const validNames = names => Array.isArray(names) && [...names].every(n => typeof n === 'string' && n.trim());
-  if (!['live', 'cache'].includes(rosterSource) || !validNames(requiredNames) || (!requiredNames.length && allowEmptyRequiredNames !== true)) reasons.push('roster-unavailable');
+  if (!['live', 'cache'].includes(rosterSource) || !validNames(requiredNames) || !requiredNames.length) reasons.push('roster-unavailable');
   if (!sha(head)) reasons.push('missing-head');
   if (rowsHead !== undefined && (!sha(rowsHead) || sha(rowsHead) !== sha(head))) reasons.push('foreign-head');
   if (!Array.isArray(rows)) reasons.push('rows-unavailable');
@@ -201,7 +201,7 @@ export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNa
       const candidates = [row.mergeGateReviewHold, row.mergeGateHoldExcused, ...(Array.isArray(holds) ? holds : [])];
       if (candidates.some(hold => evidenceJob(row) && evidenceInteger(hold?.jobId) === evidenceInteger(evidenceJob(row))
         && sha(hold?.headSha) === sha(head) && Array.isArray(hold?.holdIds) && hold.holdIds.length
-        && [...hold.holdIds].every(id => HUMAN_REVIEW_HOLD_GATES.includes(id)))) state = 'held';
+        && humanReviewOnlyHold([...hold.holdIds].map(id => ({ id, status: 'hold' }))).only)) state = 'held';
     }
     return { row, name, state, reasons: why, rowHead, identity: evidenceIdentity(row), run: evidenceInteger(row?.run_id), attempt: evidenceInteger(row?.run_attempt) };
   });

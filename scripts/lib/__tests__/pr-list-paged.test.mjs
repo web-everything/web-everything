@@ -666,3 +666,21 @@ it('preserves the commit read head when the PR head is newer', async () => {
     rows: pr.statusCheckRollup, requiredNames: ['test'], rosterSource: 'live' }))
     .toMatchObject({ state: 'unknown', reasons: ['foreign-head'] });
 });
+
+
+it.each([null, {}, { __typename: 'Unexpected', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }])(
+  'malformed GraphQL node %j remains unknown beside success, never a green legacy summary', async malformed => {
+    const { resolveRequiredChecks, summarize } = await import('../check-state-predicate.mjs');
+    const head = 'a'.repeat(40);
+    const success = { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' };
+    for (const nodes of [[success, malformed], [malformed, success]]) {
+      const pr = mapGraphqlPr({ headRefOid: head, commits: { nodes: [{ commit: { oid: head,
+        statusCheckRollup: { contexts: { pageInfo: { hasNextPage: false }, totalCount: 2, nodes } } } }] } });
+      expect(pr.rowsComplete).toBe(false);
+      expect(pr.statusCheckRollup).toHaveLength(2);
+      expect(() => summarize(pr.statusCheckRollup)).toThrow(TypeError);
+      expect(resolveRequiredChecks({ head, rowsHead: pr.rowsHead, rowsComplete: pr.rowsComplete,
+        rows: pr.statusCheckRollup, requiredNames: ['test'], rosterSource: 'live' }))
+        .toMatchObject({ state: 'unknown', reasons: expect.arrayContaining(['malformed', 'rows-incomplete']) });
+    }
+  });
