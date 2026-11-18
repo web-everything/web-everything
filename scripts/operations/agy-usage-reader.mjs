@@ -23,7 +23,7 @@ export function descendantPids(root, list = () => execFileSync('ps', ['-axo', 'p
   return out.reverse();
 }
 
-export function readAgyUsageSettings({ env = process.env, read = noSettingsFile, platform, log = console.error } = {}) {
+export function readAgyUsageSettings({ env = process.env, read = noSettingsFile, platform = {}, log = console.error } = {}) {
   const number = key => env[key] === undefined ? undefined : Number(env[key]);
   return cascadePolicy('agyUsage', read()?.agyUsage, {
     standard: { minIntervalMinutes: 15, timeoutMs: 45000 }, platform, env: { ...env, WE_POLICY_CASCADE_LOG: '1' }, log,
@@ -55,7 +55,9 @@ function parseAgyFrame(screen, now) {
   if (!group || !Number.isFinite(now)) throw new Error('Incomplete Gemini usage screen');
   const window = label => {
     const match = group.match(new RegExp(`${label} Limit Remaining\\s+[^\\d%\\n+-]*?(\\d+(?:\\.\\d+)?)%\\s+Refreshes in[ \\t]+(?:(\\d+)h[ \\t]*)?(?:(\\d+)m)?[ \\t]*(?=\\n)`, 'i'));
-    if (!match || (!match[2] && !match[3])) throw new Error(`Missing ${label} usage or refresh time`);
+    // A frame that shows a percent or refresh for this window but does not parse is INVALID, never a reason to use older evidence.
+    const shown = new RegExp(`${label} Limit Remaining[\\s\\S]*?(?:%|Refreshes in)`, 'i').test(group);
+    if (!match || (!match[2] && !match[3])) throw Object.assign(new Error(`Missing ${label} usage or refresh time`), { invalid: shown });
     const remaining = Number(match[1]);
     const seconds = Number(match[2] || 0) * 3600 + Number(match[3] || 0) * 60;
     if (remaining > 100 || !Number.isSafeInteger(seconds)) throw Object.assign(new Error('Invalid usage bounds'), { invalid: true });

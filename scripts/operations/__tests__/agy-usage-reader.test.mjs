@@ -35,6 +35,14 @@ describe('Gemini usage parser', () => {
     const invalid = SCREEN.replace('100.00%', '101.00%');
     expect(() => parseAgyUsage(`${SCREEN}\x1b[2J${invalid}`, NOW)).toThrow('Invalid usage bounds');
   });
+  it.each(['-5.00%', 'abc%'])('does not fall back to older evidence when the newest frame shows %s', bad => {
+    const broken = SCREEN.replace('100.00%', bad);
+    expect(() => parseAgyUsage(`${SCREEN}\x1b[2J${broken}`, NOW)).toThrow();
+  });
+  it('does not fall back when the newest frame has an unknown reset time', () => {
+    const broken = SCREEN.replace('Refreshes in 167h 59m', 'Refreshes in soon');
+    expect(() => parseAgyUsage(`${SCREEN}\x1b[2J${broken}`, NOW)).toThrow();
+  });
   it('uses the last GEMINI MODELS block within one frame', () => {
     const stale = SCREEN.replace('100.00%', '40.00%');
     expect(parseAgyUsage(`${stale}\n${SCREEN}`, NOW).seven_day.used_percentage).toBe(0);
