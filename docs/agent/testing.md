@@ -4587,7 +4587,6 @@ review-job and review-daemon suites.
 also with older planner output. Pass the once-per-tick `buildPriority` snapshot through
 `config.buildPriority`: filter new build/prepare candidates before cost admission, but keep
 the original queues for retiring existing guards. Filter the prepare group pool too: members
-are new work even when their lead is allowed. The runtime top ID reserves one additional
-prepare slot/window position only when newly eligible; an in-flight or absent top ID cannot
-lend that slot to another card. Malformed runtime evidence holds new work and logs the
+are new work even when their lead is allowed. The runtime top ID obeys the configured prepare concurrency, light concurrency guard,
+and prepare-ahead window; listing it grants no additional capacity. Malformed runtime evidence holds new work and logs the
 operator fallback (repair or remove the runtime file). Lift/no-file output stays unchanged.

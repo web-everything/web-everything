@@ -35,7 +35,7 @@ import { planPrepareBatches, prepareAheadNums } from '../../scripts/conveyor/bui
 import { isLanePreparePrFor, isPreparePrFor, prepareLaunchRefusal, recentMergedPrepare } from '../../scripts/conveyor/prepare-pr-match.mjs';
 import { readBuilderPrCapSettings } from '../../scripts/lib/open-pr-cap-scope.mjs';
 import { readPreparePolicy } from '../../scripts/conveyor/prepare-policy-settings.mjs';
-import { readBuildPrioritySettings, filterRuntimeCandidates, extraPrepareSlot } from '../../scripts/lib/build-queue.mjs';
+import { readBuildPrioritySettings, filterRuntimeCandidates } from '../../scripts/lib/build-queue.mjs';
 import { readBuildGroupingSettings, formatBuildGroupingLine, planBuildGroups, retireMemberWhy } from '../../scripts/conveyor/build-grouping.mjs';
 import { retryTransientGit } from '../../scripts/lib/git-fetch-retry.mjs';
 import { PLANNING_SNAPSHOT_ENV, planningRead } from '../../scripts/lib/planning-snapshot.mjs';
@@ -355,7 +355,6 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     for (const row of rows) if (!nums.has(normNum(row.num))) removed.add(normNum(row.num));
     return kept;
   };
-  const extraPrepareId = extraPrepareSlot(buildPriority ?? {});
   const groupingSettings = readBuildGroupingSettings();
   console.error(formatBuildGroupingLine(groupingSettings));
   // Item 95 — held transient prepare failures whose backoff elapsed become dispatchable again BEFORE holds are read.
@@ -955,8 +954,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   };
   // A LIGHT launch under the rule ON: its own budget / cap / CPU floor; the heavy host gate is not consulted.
   const lightGateFor = (kind, num, lightInFlight) => {
-    const d = admitLaunch({ kind, settings: kind === 'prepare-item' && normNum(num) === extraPrepareId
-      ? { ...costSettings, lightMaxConcurrent: costSettings.lightMaxConcurrent + 1 } : costSettings, facts: { ...readFacts(), lightInFlight } });
+    const d = admitLaunch({ kind, settings: costSettings, facts: { ...readFacts(), lightInFlight } });
     costDecisions.push({ num: normNum(num), kind, ...d });
     if (!d.admit) {
       loadHolds.push({ num: normNum(num), kind, reason: d.reason, why: d.why });
@@ -1406,11 +1404,10 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     held: filterRuntimeCandidates(admission.held ?? [], buildPriority).map(h => h.reason === 'no-size' && preparePolicy.autoSize ? { ...h, reason: 'needs-prepare' } : h),
     // With the window off, every queued card is eligible for batching. The shared helper uses
     // non-finite windows as its "no filter" sentinel, so give it the complete queue's size here.
-    window: effectivePrepareAheadWindow ?? admission.queue?.length ?? 0, skip: [...(bookkeeping.prepareHeldNums ?? []), ...(prepareSpawns.some(p => normNum(p.num) === extraPrepareId) ? [extraPrepareId] : [])] });
-  if (prepareSpawns.some(p => normNum(p.num) === extraPrepareId)) windowNums?.add(extraPrepareId);
+    window: effectivePrepareAheadWindow ?? admission.queue?.length ?? 0, skip: bookkeeping.prepareHeldNums ?? [] });
   const windowOrder = new Map([...(windowNums ?? [])].map((num, i) => [num, i]));
   prepareSpawns.sort((a, b) => (windowOrder.get(normNum(a.num)) ?? Infinity) - (windowOrder.get(normNum(b.num)) ?? Infinity));
-  const preparePool = [...(windowNums ?? [])].filter(num => num !== extraPrepareId).map(num => groupRowsByNum.get(num))
+  const preparePool = [...(windowNums ?? [])].map(num => groupRowsByNum.get(num))
     .filter(r => r && (needsPrepare.has(normNum(r.num)) || (preparePolicy.autoSize && (admission.held ?? []).some(h => normNum(h.num) === normNum(r.num) && h.reason === 'no-size')))
       && !otherPrepareHolds.has(normNum(r.num)) && !lightRevalidateCandidate(r.num)
       && !groupDropped.has(normNum(r.num)) && prepareAvailable(r.num));
@@ -1439,18 +1436,17 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     prepareGroupPlan = planPrepareGroups();
   }
   prepare.groups = prepareGroupPlan.groups;
-  let extraPrepareUsed = false;
   if (prepareEnabled && !prepare.freezeHeld) {
     for (const pick of prepareSpawns) {
       const num = normNum(pick.num);
       // tick-core's cap is two (the light cap with the rule ON); it may offer fewer after its own admission checks.
       if (prepareGroupPlan.absorbed.has(num) || prepareMembers.has(num)
         || finishedPrepares.has(num) || heldNums.has(num) || refusedPrepares.has(num) || refusalHeldNums.has(num)
-        || prepareBusy.has(num) || (num === extraPrepareId ? prepareBusy.size >= prepareCap + 1 : prepareBusy.size - Number(extraPrepareUsed) >= prepareCap)) continue;
+        || prepareBusy.has(num) || prepareBusy.size >= prepareCap) continue;
       const group = prepareGroupPlan.groups.find(g => normNum(g.lead) === num);
       let groupMembers = [];
       prepare.planned.push({ ...pick, num, ...(group ? { groupMembers: group.members } : {}) });
-      if (!live) { prepareBusy.add(num); if (num === extraPrepareId) extraPrepareUsed = true; continue; }
+      if (!live) { prepareBusy.add(num); continue; }
       if (launchSlotBusy()) continue;
       const clash = sameTickClash(num, scopeByNum.get(num));
       if (clash) { sameTickHolds.push({ num, kind: 'prepare', why: clash }); continue; }
@@ -1462,7 +1458,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       };
       try {
         if (!(await cloneGate('prepare', num))) continue;
-        if (!(costOn ? lightGateFor('prepare-item', num, prepareBusy.size - Number(extraPrepareUsed)) : loadGateFor('prepare', num)).admit) continue;
+        if (!(costOn ? lightGateFor('prepare-item', num, prepareBusy.size) : loadGateFor('prepare', num)).admit) continue;
         // Record the stamp this attempt starts from (`null` = unstamped), so a re-prepare's result is told from the
         // stamp it replaces by identity, not by how recent its date is. A failed read does NOT spawn: without the
         // record the claim would fall back to the date rule, which retires it on the very stamp it replaces. (An
@@ -1508,7 +1504,6 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         prepareClaimed = false;
         if (res?.dispatching) {
           prepareBusy.add(num);
-          if (num === extraPrepareId) extraPrepareUsed = true;
           launchedThisTick.push({ num, kind: 'prepare', scope: scopeByNum.get(num) ?? [] });
           for (const member of groupMembers) {
             prepareMembers.add(member);

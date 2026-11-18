@@ -95,27 +95,46 @@ describe('runtime-only build dispatch', () => {
     expect(decisions.runtimeOnly.filteredPrepare.sort()).toEqual(['7201', '9001', '9002', '9003', '9004']);
   });
 
-  it('gives only the new top id one extra prepare slot beyond the cap and window', async () => {
-    const settings = only(['7204', '7201', '7202', '7203']);
-    const out = planTick(input(settings));
-    expect(nums(out.decisions.spawnPrepareItems)).toEqual(['7201', '7202', '7204']);
-    const effects = effectsFor(out);
-    effects.predictRoute = () => ({ groupCapable: false });
-    const tick = await runBuildDispatchTick({ live: true, effects, policy, buildPriority: settings });
-    expect(nums(tick.prepare.launched)).toEqual(['7201', '7202', '7204']);
-    const absent = planTick(input(only(['9999', '7201', '7202', '7203', '7204'])));
-    expect(nums(absent.decisions.spawnPrepareItems)).toEqual(['7201', '7202']);
+  it('admits nothing for the top listed id with prepare concurrency 0', async () => {
+    const settings = only(['7204']);
+    const data = input(settings);
+    data.config.maxConcurrentItemPrepares = 0;
+    expect(planTick(data).decisions.spawnPrepareItems).toEqual([]);
+    const costAdmission = { ...resolveCostAdmissionSettings({ env: { WE_COST_ADMISSION: 'on' } }), lightMaxConcurrent: 0 };
+    data.config.costAdmission = costAdmission;
+    expect(planTick(data).decisions.spawnPrepareItems).toEqual([]);
+    // Older planner output must also obey the daemon's configured zero cap.
+    const effects = effectsFor(planTick(input(settings)));
+    effects.costFacts = () => ({ cpuIdlePct: 80 });
+    const tick = await runBuildDispatchTick({ live: true, effects, policy: { ...policy, costAdmission }, buildPriority: settings });
+    expect(tick.prepare.planned).toEqual([]);
+    expect(tick.prepare.launched).toEqual([]);
+    expect(effects.dispatch).not.toHaveBeenCalled();
   });
 
-  it('reserves the bonus window for a top id at the head, and never lends it to another card', () => {
+  it('admits nothing for the top listed id when builds fill prepareAheadWindow', async () => {
+    const settings = only(['7204', '8001', '8002']);
+    const data = input(settings);
+    data.state.queue = [...builds, ...rows];
+    const out = planTick(data);
+    expect(out.decisions.spawnPrepareItems).toEqual([]);
+    const effects = effectsFor(out);
+    const tick = await runBuildDispatchTick({ live: true, effects,
+      policy: { ...policy, prepareAheadWindow: 2, prepareAheadWindowExplicit: true }, buildPriority: settings });
+    expect(tick.prepare.planned).toEqual([]);
+    expect(tick.prepare.launched).toEqual([]);
+    expect(effects.dispatch.mock.calls.every(([pick]) => pick.launchKind !== 'prepare-item')).toBe(true);
+  });
+
+  it('keeps top listed ids within the ordinary window, including with an in-flight top id', () => {
     const settings = only(['7201', '7202', '7203', '7204']);
-    expect(nums(planTick(input(settings)).decisions.spawnPrepareItems)).toEqual(['7201', '7202', '7203']);
+    expect(nums(planTick(input(settings)).decisions.spawnPrepareItems)).toEqual(['7201', '7202']);
     const data = input(settings);
     data.bookkeeping = { tick: 1, prepareGuards: [{ num: '7201', kind: 'prepare-item', lane: 1, spawnedTick: 1 }] };
     expect(nums(planTick(data).decisions.spawnPrepareItems)).toEqual(['7202']);
   });
 
-  it('honors the top-only bonus under light cost admission and still refuses the CPU floor', async () => {
+  it('obeys light concurrency and the CPU floor for the top listed id', async () => {
     const settings = only(['7204', '7201', '7202', '7203']);
     const costAdmission = { ...resolveCostAdmissionSettings({ env: { WE_COST_ADMISSION: 'on' } }), lightMaxConcurrent: 2 };
     const data = input(settings);
@@ -123,7 +142,7 @@ describe('runtime-only build dispatch', () => {
     const make = idle => ({ ...effectsFor(planTick(data)),
       predictRoute: () => ({ groupCapable: false }), costFacts: () => ({ cpuIdlePct: idle }) });
     const tick = await runBuildDispatchTick({ live: true, effects: make(80), policy: { ...policy, costAdmission }, buildPriority: settings });
-    expect(nums(tick.prepare.launched)).toEqual(['7201', '7202', '7204']);
+    expect(nums(tick.prepare.launched)).toEqual(['7201', '7202']);
     const blocked = await runBuildDispatchTick({ live: true, effects: make(0), policy: { ...policy, costAdmission }, buildPriority: settings });
     expect(blocked.prepare.launched).toEqual([]);
   });

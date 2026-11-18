@@ -150,7 +150,7 @@
 import { planningRead, PLANNING_SNAPSHOT_ENV } from '../lib/planning-snapshot.mjs';
 import { childFailure } from '../lib/child-failure.mjs';
 import { mintSessionSlug } from './session-slug.mjs';
-import { filterRuntimeCandidates, extraPrepareSlot } from '../lib/build-queue.mjs';
+import { filterRuntimeCandidates } from '../lib/build-queue.mjs';
 import { normNum } from './queue-store.mjs';
 import { capToConcurrency, resolveMaxConcurrentLanes } from '../lib/lane-concurrency.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
@@ -660,7 +660,7 @@ function prepareRefusalSkipNote(num, prepareRefusals, guardNums, prs, now) {
  * @param {{ unshaped?:object[], decisions?:object[], investigations?:object[], needsPrepare?:object[], prs?:object[], livePrepareGuards?:object[], availableLanes?:Array<*>, maxConcurrentItemPrepares?:number, prepareRefusals?:Record<string, number[]>, tick:number, now?:number|null, trace?:boolean, dispatchPaused?:boolean, pausedKinds?:string[]|null }} ctx
  * @returns {{ scopeSpawns:Array<{num:*, lane:*}>, decisionSpawns:Array<{num:*, lane:*}>, investigationSpawns:Array<{num:*, lane:*}>, itemPrepareSpawns:Array<{num:*, lane:*}>, newGuards:Array<object>, consumedLanes:Array<*>, notes:Array<{kind:string, num:*, text:string}> }}
  */
-export function planPrepareSpawns({ unshaped = [], decisions = [], investigations = [], needsPrepare = [], prepareHeldNums = [], prs = [], livePrepareGuards = [], availableLanes = [], maxConcurrentItemPrepares = 2, extraPrepareId = null, itemPrepareAttempts = {}, prepareRefusals = {}, itemPrepareRetryCap = DEFAULT_PREPARE_ITEM_RETRY_CAP, tick = 0, now = null, trace = false, dispatchPaused = false, pausedKinds = null } = {}) {
+export function planPrepareSpawns({ unshaped = [], decisions = [], investigations = [], needsPrepare = [], prepareHeldNums = [], prs = [], livePrepareGuards = [], availableLanes = [], maxConcurrentItemPrepares = 2, itemPrepareAttempts = {}, prepareRefusals = {}, itemPrepareRetryCap = DEFAULT_PREPARE_ITEM_RETRY_CAP, tick = 0, now = null, trace = false, dispatchPaused = false, pausedKinds = null } = {}) {
   const prepareHeld = new Set(prepareHeldNums.map(normNum));
   livePrepareGuards = livePrepareGuards.filter((g) => g.kind !== 'prepare-item' || !prepareHeld.has(normNum(g.num)));
   const guardNums = new Set((Array.isArray(livePrepareGuards) ? livePrepareGuards : []).map((g) => normNum(g.num)));
@@ -735,9 +735,7 @@ export function planPrepareSpawns({ unshaped = [], decisions = [], investigation
     // stayed held, instead of the silent in-flight no-op `plan()` already gives it — and, worse, meant a
     // SECOND genuinely-new candidate the same tick was never even considered, because the loop never reached
     // `plan()` to learn the first one was a no-op.
-    if (!guardNums.has(normNum(p.num)) && (normNum(p.num) === extraPrepareId
-      ? liveItemPrepareCount + itemPrepareSpawns.length >= maxConcurrentItemPrepares + 1
-      : liveItemPrepareCount + itemPrepareSpawns.filter(s => normNum(s.num) !== extraPrepareId).length >= maxConcurrentItemPrepares)) {
+    if (!guardNums.has(normNum(p.num)) && liveItemPrepareCount + itemPrepareSpawns.length >= maxConcurrentItemPrepares) {
       notes.push({ kind: 'prepare-item-cap', num: p.num, text: `⏸ #${p.num} — prepare-item concurrency cap (${maxConcurrentItemPrepares}) reached` });
       continue;
     }
@@ -1361,7 +1359,6 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
     for (const row of rows) if (!nums.has(normNum(row.num))) removed.add(normNum(row.num));
     return kept;
   };
-  const extraPrepareId = extraPrepareSlot(config.buildPriority ?? {});
   const prepareCandidates = runtimeCandidates((Array.isArray(plan.held) ? plan.held : [])
     .filter((h) => h && (h.reason === 'needs-prepare' || h.reason === 'prepare-stale' || (prepareAutoSize && h.reason === 'no-size')) && h.num != null), runtimeFilteredPrepare);
   const refusalNotes = prepareCandidates.filter(h => !prepareHeld.has(normNum(h.num)))
@@ -1374,9 +1371,7 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
       ? filterRuntimeCandidates(plan.held, config.buildPriority).map(h => h?.reason === 'no-size' ? { ...h, reason: 'needs-prepare' } : h)
       : filterRuntimeCandidates(plan.held ?? [], config.buildPriority),
     window: Number.isFinite(config.prepareAheadWindow) ? config.prepareAheadWindow : Infinity,
-    skip: [...prepareHeld, ...refusalSkippedNums,
-      ...(extraPrepareId && eligiblePrepareCandidates.some(h => normNum(h.num) === extraPrepareId)
-        && !prepareGuardNums.has(extraPrepareId) ? [extraPrepareId] : [])],
+    skip: [...prepareHeld, ...refusalSkippedNums],
   });
   const readyOrder = new Map(queue.map((r, i) => [normNum(r.num), i]));
   const stalePriority = new Map(queue
@@ -1384,7 +1379,7 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
     .map(r => [normNum(r.num), r.buildPriority]));
   const staleRank = h => h.reason === 'prepare-stale' ? stalePriority.get(normNum(h.num)) ?? Infinity : Infinity;
   const needsPrepareHeld = eligiblePrepareCandidates
-    .filter((h) => normNum(h.num) === extraPrepareId || !prepareWindow || prepareWindow.has(normNum(h.num)))
+    .filter((h) => !prepareWindow || prepareWindow.has(normNum(h.num)))
     // Stale operator-priority cards get the slots first, then fresh cards in ready order.
     .sort((a, b) => prepareWindow ? staleRank(a) - staleRank(b)
       || (readyOrder.get(normNum(a.num)) ?? Infinity) - (readyOrder.get(normNum(b.num)) ?? Infinity) : 0)
@@ -1590,7 +1585,6 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
     decisions: runtimeCandidates(decisions, runtimeFilteredPrepare),
     investigations: runtimeCandidates(investigations, runtimeFilteredPrepare),
     needsPrepare: needsPrepareHeld,
-    extraPrepareId,
     prepareHeldNums: [...prepareHeld],
     prs,
     livePrepareGuards: prepare.live,
