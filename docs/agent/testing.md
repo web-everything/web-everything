@@ -4580,3 +4580,18 @@ a subdirectory beside the live `<slug>.json` records so no valid slug can collid
 are usable only for the ended pid; SIGKILL cannot leave a marker. Keep missing/stale
 marker, redaction, bounded-tail and diagnostic-write-failure regressions in the scoped
 review-job and review-daemon suites.
+
+## Ready-candidate adoption during overlay churn
+
+`daemon-rebuild-ready.test.mjs` exercises adoption with real Git ancestry: newly registered
+refs and descendant advances remain pending after adoption, and the next adopt-only tick
+must return `needs-build` with a different plan. `ready-candidate-adopted-partial` is an
+open-kind rebuild alert emitted after successful adoption only when pending refs exist.
+A candidate containing a removed ref is refused as `overlay-no-longer-wanted`, even when
+another overlay contains its tip; `pr-merged`/`in-main` removals retain their existing wanted
+handling. Each wanted tip must equal or descend from the candidate's tip. Preserve the independent
+live-applied omission, build-provenance, smoke, forced-record and canonical-audit gates.
+Preserve `overlaysBefore` as a veto for omitted live tips: the regression for a live overlay
+retired during planning must reject its omission and preserve HEAD.
+Run this file and `daemon-rebuild-events.test.mjs` through heavy admission. This adoption
+rule does not reset overlay main-sync parking or add retries for parked overlays.
