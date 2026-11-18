@@ -80,6 +80,14 @@ describe('pre-existing classification', () => {
     expect(parseDiffChangedLines(cutEarlier, stat).complete).toBe(false);
     expect(parseDiffChangedLines(diff, stat).complete).toBe(true);
   });
+  it('a binary-changed file blocks its findings', () => {
+    const changedLines = parseDiffChangedLines(diff + 'diff --git a/lib/y.png b/lib/y.png\n', stat + '-\t-\tlib/x.mjs\n');
+    expect(classify({ changedLines })[0].blocking).toBe(true);
+  });
+  it('a bare-punctuation quote is no evidence', () => {
+    const brace = parseReproAnswer(answer().replace('return unsafe();', '}'), 1);
+    expect(classify({ answers: brace, readBaseFile: () => 'a\n}\n' })[0].blocking).toBe(true);
+  });
   it('the base quote must sit at the claimed base line and path', () => {
     const wrongLine = parseReproAnswer(answer().replace('lib/x.mjs:2', 'lib/x.mjs:999999'), 1);
     expect(classify({ answers: wrongLine })[0].blocking).toBe(true);

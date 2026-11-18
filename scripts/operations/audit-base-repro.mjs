@@ -64,12 +64,12 @@ export function classifyPreExisting({ findings, answers, baseSha, headSha, readB
       if (!location || (finding?.file && finding.file !== location.file) || (finding?.line && finding.line !== location.line)) return block('invalid head location');
       if (!(changedLines instanceof Map) || changedLines.complete !== true) return block('diff evidence missing or truncated');
       const changed = changedLines.get(location.file) ?? new Set();
-      if (!(changed instanceof Set) || changed.has(location.line)) return block('head line changed or diff evidence missing');
+      if (!(changed instanceof Set) || changed.has(location.line) || changedLines.binary?.has(location.file)) return block('head line changed or diff evidence missing');
       const base = a.base;
       if (!base || !Number.isSafeInteger(base.line) || base.line < 1) return block('invalid base location');
       findingKey({ file: base.path, class: a.class });
       const source = readBaseFile(base.path);
-      if (base.path !== location.file) return block('base path differs from the finding');
+      if (base.path !== location.file || !/\w{3,}[\s\S]*\w{3,}/.test(a.quote ?? '')) return block('base path differs from the finding');
       const quoteLines = typeof a.quote === 'string' ? a.quote.split('\n').length : 0;
       if (typeof source !== 'string' || !quoteLines || !a.quote.trim()
         || !source.split('\n').slice(base.line - 1, base.line - 1 + quoteLines).join('\n').includes(a.quote)) return block('base quote not at the claimed base line');
@@ -107,7 +107,8 @@ export function parseDiffChangedLines(diffU0Text, numstatText) {
   endHunk();
   // Complete only when `git diff --numstat -U0` counts agree with every file's hunks; anything else clears nothing.
   const stat = String(numstatText ?? '').split('\n').filter(Boolean).map(l => /^(\d+|-)\t(\d+|-)\t(.+)$/.exec(l));
-  const agrees = stat.length > 0 && stat.every(m => m && (m[1] === '-' ? true : (() => {
+  files.binary = new Set();
+  const agrees = stat.length > 0 && stat.every(m => m && (m[1] === '-' ? (files.binary.add(m[3]), true) : (() => {
     try { const p = findingKey({ file: m[3], class: 'B1' }).split('|')[0], t = seen.get(p);
       return !!t && t[0] === Number(m[1]) && t[1] === Number(m[2]); } catch { return false; } })()));
   files.complete = !bad && agrees;
