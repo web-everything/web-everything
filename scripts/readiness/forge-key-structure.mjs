@@ -187,7 +187,9 @@ function canonicalize(bytes,emit,tick) {
 // be Unicode whitespace; NUL preserves both UTF-16 decoding paths.
 // Colon admits the canonicalizer's (?:[\da-f]{2}:)+[\da-f]{2} hex entry pattern.
 export function keyStructurePrecheck(buffer) {
-  if(!Buffer.isBuffer(buffer)||buffer.length>LIMITS.bytes)return true;
+  // Even non-candidates (e.g. unmatched closing braces) can consume one tick per
+  // byte. Leave potential step exhaustion to the full scan's fail-closed path.
+  if(!Buffer.isBuffer(buffer)||buffer.length>Math.min(LIMITS.bytes,LIMITS.steps))return true;
   let run=0;
   for(const byte of buffer) {
     if([0,34,37,48,58,91,92,123].includes(byte))return true;
