@@ -1426,6 +1426,15 @@ export function routeRebaseBeforeEnqueue(v, { setting, mergeStrategy, manifestFr
   return rebase;
 }
 
+/** Excuse only BEHIND for the exact manifest-free head retained by this pass's bypass. */
+export function retainBypassedQueueHead(pr, { verdict, setting, queueOwnsFreshness, expectedHeadSha }) {
+  const retained = setting === 'conflict-only' && queueOwnsFreshness === true
+    && verdict?.rebaseDrop === 'skipped-behind-clean'
+    && !!expectedHeadSha && (verdict.listedHeadSha || verdict.headSha) === expectedHeadSha
+    && pr?.headRefOid === expectedHeadSha;
+  return retainApprovedHumanQueueHead(pr, { hold: retained, queueOwnsFreshness });
+}
+
 /** Pure: injected settings layers keep IO outside the resolver; invalid values retain the legacy rebase path. */
 export function resolveRebaseBeforeEnqueue(env = {}, { platform, tool } = {}) {
   const checked = value => value === undefined || ['conflict-only', 'always'].includes(value) ? value : 'invalid';
@@ -6031,7 +6040,12 @@ async function runCli() {
     ...unknownRecovery, repo: repo || localSlug, num,
     read: async () => {
       const pr = await fetchFreshPrForRevalidation(repo, num);
-      return retainApprovedHumanQueueHead(pr, { queueOwnsFreshness: mergeStrategy.queueOwnsFreshness(repo),
+      const queueOwnsFreshness = mergeStrategy.queueOwnsFreshness(repo);
+      const retained = retainBypassedQueueHead(pr, {
+        verdict: verdicts.find(v => v.repo === repo && v.num === num),
+        setting: rebaseBeforeEnqueue.value, queueOwnsFreshness, expectedHeadSha: opts.expectedHeadSha,
+      });
+      return retainApprovedHumanQueueHead(retained, { queueOwnsFreshness,
         hold: pr?.mergeStateStatus === 'BEHIND' && approvedHeadHold({ repo, num }, opts.expectedHeadSha) });
     }, opts, setting: UNKNOWN_RETRY, sleep: sleepSync,
   });

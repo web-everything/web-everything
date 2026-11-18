@@ -8,7 +8,7 @@
  *   base is not the repo's default branch is skipped with `base is not <default> (<base>)`.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { withResolutionBasis, buildDrainReasonComment, hasDrainReasonComment, buildDrainVerdicts, classifyPr, isRebaseDropCandidate, isBehindButClean, headTreeLacksManifestFile, routeRebaseBeforeEnqueue, resolveRebaseBeforeEnqueue, buildLiveListingsByRepo, unlandableStateReason } from '../merge-ai-prs.mjs';
+import { withResolutionBasis, buildDrainReasonComment, hasDrainReasonComment, buildDrainVerdicts, classifyPr, isRebaseDropCandidate, isBehindButClean, headTreeLacksManifestFile, routeRebaseBeforeEnqueue, retainBypassedQueueHead, revalidateWithUnknownRetry, resolveRebaseBeforeEnqueue, buildLiveListingsByRepo, unlandableStateReason } from '../merge-ai-prs.mjs';
 import { readFastDrainRoundListing, withFastDrainRoundLock } from '../lib/fast-drain-scope.mjs';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -76,7 +76,16 @@ describe('routeRebaseBeforeEnqueue — queue freshness owns the bypass', () => {
     return { verdict, before, operation, rebaseDropManifest, mergeStrategy, args, result };
   };
 
-  it('conflict-only retains a clean BEHIND verdict for the queue without calling rebaseDropManifest', () => {
+  const freshPr = { number: 42, title: 'Retained head', body: 'What changed and why', headRefOid: clean.headSha,
+    baseRefName: 'main', mergeStateStatus: 'BEHIND', mergeable: 'MERGEABLE', labels: [{ name: 'ready-to-merge' }],
+    statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS' }] };
+  const revalidate = (verdict, { patch = {}, setting = 'conflict-only', queueOwnsFreshness = true,
+    expectedHeadSha = clean.headSha } = {}) => revalidateWithUnknownRetry({
+    read: async () => retainBypassedQueueHead({ ...freshPr, ...patch }, { verdict, setting, queueOwnsFreshness, expectedHeadSha }),
+    opts: { defaultBranch: 'main', expectedHeadSha }, setting: { retries: 0 },
+  });
+
+  it('conflict-only retains a clean BEHIND head without rebase, passes fresh revalidation and enqueues it', async () => {
     const { verdict, operation, rebaseDropManifest, mergeStrategy } = route();
     expect(verdict).toEqual({ ...clean, decision: 'merge', rebaseDrop: 'skipped-behind-clean',
       reason: 'behind main but clean; merge queue tests PR + main - enqueued on its existing head' });
@@ -84,6 +93,44 @@ describe('routeRebaseBeforeEnqueue — queue freshness owns the bypass', () => {
     expect(rebaseDropManifest).not.toHaveBeenCalled();
     expect(mergeStrategy.queueOwnsFreshness).toHaveBeenCalledOnce();
     expect(mergeStrategy.queueOwnsFreshness).toHaveBeenCalledWith(clean.repo);
+    const fresh = await revalidate(verdict);
+    expect(fresh.decision).toBe('merge');
+    expect(fresh.headSha).toBe(clean.headSha);
+    const enqueue = vi.fn();
+    if (fresh.decision === 'merge') enqueue(fresh.headSha);
+    expect(enqueue).toHaveBeenCalledTimes(1);
+    expect(enqueue).toHaveBeenCalledWith(clean.headSha);
+    expect(rebaseDropManifest).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['bypass disabled', { setting: 'always' }],
+    ['queue no longer owns freshness', { queueOwnsFreshness: false }],
+    ['unknown queue freshness ownership', { queueOwnsFreshness: null }],
+    ['fresh conflict', { patch: { mergeable: 'CONFLICTING' } }],
+    ['fresh unknown mergeability', { patch: { mergeable: 'UNKNOWN' } }],
+    ['fresh DIRTY state', { patch: { mergeStateStatus: 'DIRTY' } }],
+    ['fresh missing head', { patch: { headRefOid: null } }],
+    ['fresh moved head', { patch: { headRefOid: 'new-head' } }],
+    ['missing pinned head', { expectedHeadSha: null }],
+    ['fresh red CI', { patch: { statusCheckRollup: [] } }],
+    ['fresh missing certification', { patch: { labels: [] } }],
+    ['fresh review hold', { patch: { labels: [...freshPr.labels, { name: 'review:changes' }] } }],
+    ['fresh requested changes', { patch: { reviewDecision: 'CHANGES_REQUESTED' } }],
+    ['fresh required review', { patch: { reviewDecision: 'REVIEW_REQUIRED' } }],
+    ['fresh missing body', { patch: { body: '' } }],
+    ['fresh off-default base', { patch: { baseRefName: 'lane/other' } }],
+    ['fresh fix claim', { patch: { fixClaim: { who: 'fixer' } } }],
+    ['fresh unreadable checks', { patch: { requiredCheckReadError: 'unreadable' } }],
+  ])('fresh revalidation refuses retained BEHIND head with %s', async (_name, options) => {
+    const { verdict } = route();
+    expect((await revalidate(verdict, options)).decision).toBe('skip');
+  });
+
+  it('fresh revalidation refuses BEHIND without proof this pinned head took the bypass', async () => {
+    expect((await revalidate(clean)).decision).toBe('skip');
+    const { verdict } = route();
+    expect((await revalidate({ ...verdict, headSha: 'other-head' })).decision).toBe('skip');
   });
 
   it.each([
