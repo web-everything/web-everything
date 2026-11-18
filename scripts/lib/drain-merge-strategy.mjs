@@ -433,11 +433,10 @@ export function createDrainMergeStrategy({
         const pages = readThreadPages(c.repo, c.num);
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) return { allowed: false, reason: 'red-team comments unreadable' };
         const comments = pages.flat();
-        if (checkRunOnly || !safety.value.waitForRedTeamBeforeEnqueue) return { allowed: true, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
         const evidence = settleUnknownEvidenceByComment(readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env }), pages.flat(), c.num, headSha, live.reviews);
         const hold = redTeamAdmissionHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env,
           standingRuling: grantScopeFor(c, headSha, pages.flat()) });
-        return { allowed: !hold, reason: hold?.message ?? null, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
+        return { allowed: !hold || (checkRunOnly && !hold.blocking), reason: hold?.message ?? null, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
       } catch { return { allowed: false, reason: 'red-team evidence unreadable' }; }
     },
     enqueue(c, headSha, { comments = null, prepared = null, sameHeadAdmission } = {}) {
@@ -471,7 +470,7 @@ export function createDrainMergeStrategy({
       let admissionLabels = queueLabels(live.labels);
       let deadlineOverride = false;
       // Head-bound file preparation is reusable; authorization evidence is always live.
-      if (!checkRunOnly && safety.value.waitForRedTeamBeforeEnqueue) {
+      if (!checkRunOnly) {
         let evidence = readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env });
         const pending = before.redTeamPending?.[key];
         // Migrate legacy current-head spend before replacing transient wait state.

@@ -9,6 +9,7 @@ import {
   createDrainMergeStrategy, resolveDrainMergePolicy, readEnqueueClearance, buildClearanceComment, hasClearanceFor, DRY_RUN_STRATEGY_ENV,
   readQueueState, FOLLOW_UP_MAX_ATTEMPTS, readMergeDeliveryToolSettings, MERGE_DELIVERY_SETTINGS_FILE_ENV,
 } from '../drain-merge-strategy.mjs';
+import { readDrainQueueSafety } from '../drain-queue-safety.mjs';
 import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
 import { rulesetSuggestion } from '../merge-queue-enqueue.mjs';
 // Load the renderer during collection: its cold import graph must not consume a gate assertion's timeout.
@@ -335,7 +336,11 @@ describe('enqueue delegates red-team verdicts to merge-gate', () => {
           } } });
         const prepared = h.s.prestage({ num: 5283 }, HEAD);
         expect(prepared.allowed).toBe(true);
-        liveReads = 0; // prestage is preparation, before either admission boundary
+        expect(readRedTeamEvidence).toHaveBeenCalledTimes(1);
+        expect(readGrantScope).toHaveBeenCalledTimes(1);
+        readRedTeamEvidence.mockClear();
+        readGrantScope.mockClear();
+        liveReads = 0; // count the enqueue boundaries separately from preparation
         if (phase === 'revoked before admission') setDeferral(false);
         // The caller's old comments and prepared admission cannot authorize the live disposition.
         const result = h.s.enqueue({ num: 5283 }, HEAD, { comments: [], prepared });
@@ -1859,6 +1864,37 @@ describe('queue safeguard overrides and untracked queue entries', () => {
       expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] }).enqueued).toBe(status === 'red-team:clear');
       expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(status === 'red-team:clear');
     }
+  });
+  it.each(['tool', 'platform'])('canonical audit: %s waitForRedTeamBeforeEnqueue=false never bypasses missing or invalid evidence', layer => {
+    for (const waitForRedTeamBeforeEnqueue of [false, true]) {
+      const queueSafety = readDrainQueueSafety({ env: {}, tool: layer === 'tool' ? { waitForRedTeamBeforeEnqueue } : {},
+        platform: layer === 'platform' ? { waitForRedTeamBeforeEnqueue } : {} });
+      expect(queueSafety.value.waitForRedTeamBeforeEnqueue).toBe(waitForRedTeamBeforeEnqueue);
+      expect(queueSafety.sources.waitForRedTeamBeforeEnqueue).toBe(layer);
+      for (const evidence of [
+        { ...idleEvidence(), loopPayload: { findings: { read: reviewedRead(HEAD) } } },
+        { ...idleEvidence(), loopPayload: { findings: { read: { ...reviewedRead(HEAD), diffScored: false } } } },
+        { ...idleEvidence(), seats: [{ ...completedSeat(HEAD), valid: false }] },
+        { ...idleEvidence(), ok: false, reason: 'unreadable evidence' },
+      ]) {
+        const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'],
+          env: { WE_UNDER_TEST: '1', WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE: '0' }, evidence, strategyExtra: { queueSafety } });
+        expect(h.s.prestage({ num: 5283 }, HEAD).allowed).toBe(false);
+        expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+        expect(h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+      }
+    }
+  });
+  it.each(['tool', 'platform'])('check-run source cannot skip invalid evidence with %s wait setting off', layer => {
+    const queueSafety = readDrainQueueSafety({ env: {}, tool: layer === 'tool' ? { waitForRedTeamBeforeEnqueue: false } : {},
+      platform: layer === 'platform' ? { waitForRedTeamBeforeEnqueue: false } : {} });
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'],
+      env: { WE_UNDER_TEST: '1', WE_RED_TEAM_GATE_SOURCE: 'check-run' },
+      evidence: { ...idleEvidence(), loopPayload: { findings: { read: { ...reviewedRead(HEAD), diffScored: false } } } },
+      strategyExtra: { queueSafety, readRedTeamCheck: () => ({ ok: true }) } });
+    expect(h.s.prestage({ num: 5283 }, HEAD).allowed).toBe(false);
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+    expect(h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
   });
   it.each(['WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE', 'WE_REVIEW_RED_TEAM', 'WE_REVIEW_EXTRA_SEATS'])('canonical audit A: %s=0 cannot bypass admission without a result', key => {
     const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], env: { ...process.env, [key]: '0' } });

@@ -214,6 +214,7 @@ function assertStructure(source) {
       && !/label/i.test(n.expression.expression.getText()));
     expect(proseIncludes.map(n => n.getText())).toEqual([]);
   }
+  expect(merge.text).not.toMatch(/waitForRedTeamBeforeEnqueue|WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE/);
   const admission = all(queue, n => ts.isFunctionDeclaration(n) && n.name?.text === 'redTeamAdmissionHold');
   expect(admission).toHaveLength(1);
   expect(calls(admission[0], 'redTeamOwedDecision')).toHaveLength(1);
@@ -222,12 +223,51 @@ function assertStructure(source) {
     const fn = all(merge, n => (name === 'checkRunDispositionHold' ? ts.isVariableDeclaration(n) : ts.isMethodDeclaration(n)) && n.name?.getText() === name);
     expect(fn).toHaveLength(1);
     expect(calls(fn[0], 'redTeamAdmissionHold')).toHaveLength(1);
+    const decision = calls(fn[0], 'redTeamAdmissionHold')[0];
+    const conditions = [];
+    for (let parent = decision.parent; parent && parent !== fn[0]; parent = parent.parent) {
+      if (ts.isIfStatement(parent)) conditions.push(parent.expression.getText());
+    }
+    expect(conditions).toEqual(name === 'enqueue' ? ['!checkRunOnly'] : []);
+    if (name === 'enqueue') {
+      const alternate = calls(fn[0], 'checkRunDispositionHold');
+      expect(alternate).toHaveLength(2);
+      for (const call of alternate) {
+        const guards = [];
+        for (let parent = call.parent; parent && parent !== fn[0]; parent = parent.parent) {
+          if (ts.isIfStatement(parent)) guards.push(parent.expression.getText());
+        }
+        expect(guards).toEqual(['checkRunOnly']);
+      }
+    }
+    if (name === 'prestage') {
+      const returns = all(fn[0], n => ts.isReturnStatement(n));
+      const earlySuccesses = returns.filter(n => n.pos < decision.pos && n.expression && ts.isObjectLiteralExpression(n.expression)
+        && n.expression.properties.some(p => p.name?.getText() === 'allowed' && p.initializer?.kind !== ts.SyntaxKind.FalseKeyword));
+      expect(earlySuccesses.map(n => n.getText())).toEqual([]);
+    }
+
   }
 }
 it('structural: each admission delegates exactly once; holds never branch on includes or duplicate result policy', () => {
   assertStructure(sources());
 });
 it.each([
+  ['prestage setting bypass restored', 'drain-merge-strategy.mjs', text => text.replace(
+    'const comments = pages.flat();\n        const evidence',
+    'const comments = pages.flat();\n        if (!safety.value.waitForRedTeamBeforeEnqueue) return { allowed: true };\n        const evidence')],
+  ['enqueue setting guard restored', 'drain-merge-strategy.mjs', text => text.replace('if (!checkRunOnly) {', 'if (!checkRunOnly && safety.value.waitForRedTeamBeforeEnqueue) {')],
+  ['prestage environment bypass restored', 'drain-merge-strategy.mjs', text => text.replace(
+    'const comments = pages.flat();\n        const evidence',
+    "const comments = pages.flat();\n        if (env.WE_REVIEW_RED_TEAM === '0') return { allowed: true };\n        const evidence")],
+  ['enqueue environment guard restored', 'drain-merge-strategy.mjs', text => text.replace('if (!checkRunOnly) {', "if (!checkRunOnly && env.WE_REVIEW_RED_TEAM !== '0') {")],
+  ...[0, 1].map(index => [`check-run alternate decision ${index + 1} deleted`, 'drain-merge-strategy.mjs', text => {
+    let seen = 0;
+    return text.replaceAll('checkRunDispositionHold(', call => seen++ === index ? 'removedDisposition(' : call);
+  }]),
+  ['check-run preparation bypass restored', 'drain-merge-strategy.mjs', text => text.replace(
+    'const comments = pages.flat();\n        const evidence',
+    'const comments = pages.flat();\n        if (checkRunOnly) return { allowed: true };\n        const evidence')],
   ...Object.keys(RED_TEAM_CLEARANCE_INPUTS).map(key => [`completed-pass prerequisite ${key} deleted`, 'review-red-team-policy.mjs', text =>
     text.replace(new RegExp(`^  '${key.replaceAll('.', '\\.')}': '[^']+',\n`, 'm'), '')]),
   ['completed-pass table call deleted', 'review-red-team-policy.mjs', text => text.replace('Object.entries(RED_TEAM_CLEARANCE_INPUTS)', 'Object.entries({})')],

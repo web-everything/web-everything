@@ -4607,3 +4607,10 @@ a subdirectory beside the live `<slug>.json` records so no valid slug can collid
 are usable only for the ended pid; SIGKILL cannot leave a marker. Keep missing/stale
 marker, redaction, bounded-tail and diagnostic-write-failure regressions in the scoped
 review-job and review-daemon suites.
+
+
+`waitForRedTeamBeforeEnqueue` is never permission to omit the admission decision:
+preparation and enqueue must evaluate evidence even when tool/platform settings disable
+waiting. Cover missing results and invalid reads/rows with both setting values and no
+hold labels. Structural mutations restore setting/env guards and early check-run success
+returns, proving every successful admission route still reaches the evidence decision.
