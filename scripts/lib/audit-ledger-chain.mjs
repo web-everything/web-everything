@@ -19,10 +19,10 @@ function linesOf(raw) {
 }
 
 /** Returns null when already migrated. Hashes original bytes, including trailing newlines. */
-export function buildGenesis(rawBytes, reseal) {
+export function buildGenesis(rawBytes) {
   const raw = Buffer.from(rawBytes), lines = linesOf(raw);
-  if (!reseal && lines.some(line => parse(line)?.kind === 'genesis')) return null;
-  return { ...reseal, kind: 'genesis', seq: 0, id: newId(), legacyCount: lines.length,
+  if (lines.some(line => parse(line)?.kind === 'genesis')) return null;
+  return { kind: 'genesis', seq: 0, id: newId(), legacyCount: lines.length,
     legacyDigest: sha256Line(raw), prev: lines.length ? sha256Line(lines.at(-1)) : null,
     at: new Date().toISOString() };
 }
@@ -83,8 +83,8 @@ function writeHighWater(path, record, line, fs) {
   fs.renameSync(tmp, hwmPath(path));
 }
 
-/** 40 bounded retries; on contention, inspect both lock files before operator repair. */
-export async function appendChained(path, record, { fs = realFs, sleep = setTimeout, now = Date.now } = {}) {
+/** Runs body under the exclusive ledger lock (40 bounded retries; on contention, inspect both lock files before operator repair). */
+export async function withLedgerLock(path, body, { fs = realFs, sleep = setTimeout, now = Date.now } = {}) {
   fs.mkdirSync(dirname(path), { recursive: true });
   const lock = `${path}.lock`, coordinator = `${lock}.reap`;
   let owner, guard;
@@ -110,34 +110,7 @@ export async function appendChained(path, record, { fs = realFs, sleep = setTime
   }
   try {
     fs.writeFileSync(owner, String(process.pid));
-    const raw = readLedger(path, fs), lines = linesOf(raw), parsed = lines.map(parse);
-    const separator = raw.length && raw.at(-1) !== 10 ? '\n' : '';
-    const lastIdx = record.reseal ? -1 : assertHighWater(path, raw, lines, parsed, fs);
-    if (record.kind === 'genesis') {
-      record = buildGenesis(separator ? Buffer.concat([raw, Buffer.from(separator)]) : raw, record.reseal && record);
-      if (!record) return null;
-    } else if (lastIdx !== -1) {
-      const last = parsed[lastIdx];
-      if (last.seq === Number.MAX_SAFE_INTEGER) throw new Error('Invalid audit sequence; repair the ledger before retrying.');
-      record = { ...record, id: newId(), seq: last.seq + 1, prev: sha256Line(lines[lastIdx]) };
-    } else {
-      record = { ...record };
-      delete record.id; delete record.seq; delete record.prev;
-    }
-    const fd = fs.openSync(path, 'a', 0o600);
-    try {
-      fs.appendFileSync(fd, `${separator}${JSON.stringify(record)}\n`, { encoding: 'utf8' });
-      fs.fsyncSync(fd);
-    } finally { fs.closeSync(fd); }
-    if (Number.isSafeInteger(record.seq)) writeHighWater(path, record, Buffer.from(JSON.stringify(record)), fs);
-    return record;
-  } catch (error) {
-    // Nothing is silently lost: the record the writer meant to append goes to a side file.
-    if (error.code === 'LEDGER_TAMPER') {
-      fs.appendFileSync(join(dirname(path), 'audits.quarantine.jsonl'),
-        `${JSON.stringify({ ...record, quarantinedAt: new Date().toISOString(), quarantineReason: error.message })}\n`, { mode: 0o600 });
-    }
-    throw error;
+    return await body();
   } finally {
     try {
       try { fs.closeSync(owner); } finally { fs.unlinkSync(lock); }
@@ -145,4 +118,58 @@ export async function appendChained(path, record, { fs = realFs, sleep = setTime
       try { fs.closeSync(guard); } finally { fs.unlinkSync(coordinator); }
     }
   }
+}
+
+function appendLine(path, record, separator, fs) {
+  const fd = fs.openSync(path, 'a', 0o600);
+  try {
+    fs.appendFileSync(fd, `${separator}${JSON.stringify(record)}\n`, { encoding: 'utf8' });
+    fs.fsyncSync(fd);
+  } finally { fs.closeSync(fd); }
+  if (Number.isSafeInteger(record.seq)) writeHighWater(path, record, Buffer.from(JSON.stringify(record)), fs);
+}
+// Nothing is silently lost: the record the writer meant to append goes to a side file.
+function quarantine(path, record, error, fs) {
+  if (error.code === 'LEDGER_TAMPER') {
+    fs.appendFileSync(join(dirname(path), 'audits.quarantine.jsonl'),
+      `${JSON.stringify({ ...record, quarantinedAt: new Date().toISOString(), quarantineReason: error.message })}\n`, { mode: 0o600 });
+  }
+  throw error;
+}
+
+/** The only append path for records. It cannot write genesis or reseal lines and never skips the rollback check. */
+export async function appendChained(path, record, deps = {}) {
+  if (record?.kind === 'genesis' || record?.kind === 'reseal' || 'reseal' in (record ?? {})) throw new Error('appendChained cannot write genesis or reseal records');
+  const { fs = realFs } = deps;
+  return withLedgerLock(path, () => {
+    try {
+      const raw = readLedger(path, fs), lines = linesOf(raw), parsed = lines.map(parse);
+      const separator = raw.length && raw.at(-1) !== 10 ? '\n' : '';
+      const lastIdx = assertHighWater(path, raw, lines, parsed, fs);
+      if (lastIdx !== -1) {
+        const last = parsed[lastIdx];
+        if (last.seq === Number.MAX_SAFE_INTEGER) throw new Error('Invalid audit sequence; repair the ledger before retrying.');
+        record = { ...record, id: newId(), seq: last.seq + 1, prev: sha256Line(lines[lastIdx]) };
+      } else {
+        record = { ...record };
+        delete record.id; delete record.seq; delete record.prev;
+      }
+      appendLine(path, record, separator, fs);
+      return record;
+    } catch (error) { return quarantine(path, record, error, fs); }
+  }, deps);
+}
+
+/** The one-time migration: anchors the legacy bytes. Idempotent (null when migrated) and refused when a sidecar shows a rollback. */
+export async function appendGenesis(path, deps = {}) {
+  const { fs = realFs } = deps;
+  return withLedgerLock(path, () => {
+    const raw = readLedger(path, fs), lines = linesOf(raw), parsed = lines.map(parse);
+    const separator = raw.length && raw.at(-1) !== 10 ? '\n' : '';
+    if (parsed.some(entry => entry?.kind === 'genesis')) return null;
+    assertHighWater(path, raw, lines, parsed, fs);
+    const record = buildGenesis(separator ? Buffer.concat([raw, Buffer.from(separator)]) : raw);
+    appendLine(path, record, separator, fs);
+    return record;
+  }, deps);
 }

@@ -5,7 +5,8 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { appendChained, buildGenesis, newId, sha256Line } from '../audit-ledger-chain.mjs';
+import { appendChained, appendGenesis, buildGenesis, newId, sha256Line } from '../audit-ledger-chain.mjs';
+import { resealLedger } from './audit-ledger-reseal-fixture.mjs';
 import { createGenesisRunner } from '../../operations/audit-ledger-genesis.mjs';
 
 let root, path;
@@ -13,7 +14,7 @@ beforeEach(() => { root = fs.mkdtempSync(join(tmpdir(), 'ledger-chain-')); path 
 afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
 const records = () => fs.readFileSync(path, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
 const hash = raw => createHash('sha256').update(raw).digest('hex');
-const genesis = () => appendChained(path, { kind: 'genesis' });
+const genesis = () => appendGenesis(path);
 
 describe('audit ledger chain', () => {
   it('generates 128-bit hex ids and hashes raw line bytes', () => {
@@ -110,9 +111,21 @@ describe('audit ledger chain', () => {
     expect(error.code).toBe('LEDGER_TAMPER');
     const quarantined = fs.readFileSync(join(root, 'audits.quarantine.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
     expect(quarantined[0]).toMatchObject({ verdict: 'WEAKENED', n: 1, quarantineReason: expect.stringContaining('rollback') });
-    const sealed = await appendChained(path, { kind: 'genesis', reseal: true, actor: 'orchestrator', reason: 'test' });
+    const sealed = await resealLedger(path, { actor: 'orchestrator', reason: 'test' });
     expect(sealed).toMatchObject({ kind: 'genesis', seq: 0, actor: 'orchestrator', reason: 'test' });
     expect(await appendChained(path, { verdict: 'WEAKENED' })).toMatchObject({ seq: 1 });
+  });
+  it('the library has no reseal path: appendChained refuses genesis, reseal and a reseal option', async () => {
+    await genesis();
+    for (const record of [{ kind: 'genesis' }, { kind: 'reseal' }, { verdict: 'WEAKENED', reseal: true }]) {
+      await expect(appendChained(path, record)).rejects.toThrow(/cannot write genesis or reseal/);
+    }
+    expect(buildGenesis.length).toBe(1);
+    expect(appendChained.length).toBeLessThanOrEqual(3);
+    expect(Object.keys(await import('../audit-ledger-chain.mjs')).filter(k => /reseal/i.test(k))).toEqual([]);
+    // Truncated ledger with its sidecar: a fresh migration cannot re-anchor it either.
+    fs.writeFileSync(path, '');
+    await expect(appendGenesis(path)).rejects.toThrow(/rollback/);
   });
   it('serializes parallel calls with contiguous seq, unique ids and correct prev hashes', async () => {
     await genesis();
@@ -129,8 +142,8 @@ describe('audit ledger chain', () => {
     fs.utimesSync(`${path}.lock`, 0, 0);
     await Promise.all(Array.from({ length: 6 }, () => new Promise((resolveChild, reject) => {
       const child = spawn(process.execPath, ['--input-type=module', '-e', `
-        const { appendChained } = await import(process.argv[1]);
-        await appendChained(process.argv[2], { kind: 'genesis' });
+        const { appendChained, appendGenesis } = await import(process.argv[1]);
+        await appendGenesis(process.argv[2]);
         await appendChained(process.argv[2], { verdict: 'WEAKENED' });
       `, moduleUrl, path], { stdio: 'ignore' });
       child.on('error', reject);
