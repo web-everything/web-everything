@@ -191,10 +191,18 @@ import { backfillAllReviewRuns, backfillOpenReviewRuns } from './lib/review-run-
 export function backfillDrainReviewRuns(context, {
   backfill = backfillOpenReviewRuns, backfillAll = backfillAllReviewRuns, resolveDir = resolveRunsDir, localSlug,
 } = {}) {
-  try { backfill(context, { runsDir: resolveDir(), localSlug }); }
-  catch { /* The unchanged bounded evidence scan remains authoritative. */ }
-  try { backfillAll({ runsDir: resolveDir() }); }
-  catch { /* The full backfill is a hint too: the capped scan stays authoritative. */ }
+  // One shared budget per drain tick: the full backfill only gets what the open-PR backfill left of the 50 parses.
+  const TICK_PARSE_BUDGET = 50;
+  let used = TICK_PARSE_BUDGET; // unknown spend (a throw) leaves nothing for the second backfill: fail toward fewer reads
+  try {
+    const spent = backfill(context, { runsDir: resolveDir(), localSlug });
+    used = Number.isSafeInteger(spent?.parsed) && spent.parsed >= 0 ? spent.parsed : TICK_PARSE_BUDGET;
+  } catch { /* The unchanged bounded evidence scan remains authoritative. */ }
+  const left = TICK_PARSE_BUDGET - used;
+  if (left > 0) {
+    try { backfillAll({ runsDir: resolveDir(), maxParsesPerCall: left }); }
+    catch { /* The full backfill is a hint too: the capped scan stays authoritative. */ }
+  }
   return context;
 }
 import { resolveRunsDir } from './operations/run-store.mjs';
