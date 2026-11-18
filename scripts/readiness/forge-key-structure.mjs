@@ -1,6 +1,11 @@
 // One bounded decoding pipeline feeds byte-only DER and parsed-JSON detectors.
 // Exhaustion refuses remote admission; the operator can inspect the file and run locally.
-const LIMITS={bytes:32*1024*1024,candidates:16384,depth:8,steps:4*1024*1024};
+const LIMITS={bytes:32*1024*1024,candidates:16384,depth:8,steps:4*1024*1024,derDepth:64,jsonDepth:64};
+// Reserve the initial candidate and conservatively allow one counted unit per
+// input byte. This bounds bytes, candidates and ticks by their smallest budget.
+// Depth budgets require a separate proof: a negative precheck below permits NO
+// emitted candidates, DER entry or JSON opening container, so all depths stay 0.
+const PRECHECK_SAFE_BYTES=Math.min(LIMITS.bytes,LIMITS.candidates-1,LIMITS.steps);
 const EXHAUSTED='private-key-scan-budget-exhausted-use-local';
 const FINDING='private-key-structure';
 
@@ -8,7 +13,7 @@ function derFinding(bytes,tick) {
   const cache=new Map();
   const tlv=(offset,end,depth=0)=>{
     tick();
-    if(depth>64)throw EXHAUSTED;
+    if(depth>LIMITS.derDepth)throw EXHAUSTED;
     const cached=cache.get(offset);
     if(cached)return cached.next<=end?cached:null;
     if(offset+2>end)return null;
@@ -50,7 +55,7 @@ function derFinding(bytes,tick) {
   const nonempty=(node,tag)=>node?.tag===tag&&node.end>node.start;
   const octets=(node,depth=0)=>{
     tick();
-    if(depth>64)throw EXHAUSTED;
+    if(depth>LIMITS.derDepth)throw EXHAUSTED;
     if(node?.tag===4)return node.end-node.start;
     if(node?.tag!==36)return -1;
     const parts=children(node);
@@ -130,7 +135,7 @@ function canonicalize(bytes,emit,tick) {
     // Broken UTF-8 outside strings cannot extend a JSON container's scope.
     } else if(token==='\ufffd')stack.length=0;
     else if(token==='{'||token==='[') {
-      if(stack.length>=64)throw EXHAUSTED;
+      if(stack.length>=LIMITS.jsonDepth)throw EXHAUSTED;
       stack.push({token,start:match.index});
     } else if(token==='}'||token===']') {
       const open=stack.pop();
@@ -181,23 +186,30 @@ function canonicalize(bytes,emit,tick) {
   }
 }
 
-// A negative result proves none of the pipeline's entry representations are present.
+// A negative result proves none of the pipeline's entry representations are present,
+// including non-key candidates that could consume the shared scan budgets.
 // In particular, base64 chunks of ONE character may join across whitespace. Do not
-// require a long individual token or a particular alphabet/prefix. High bytes may
-// be Unicode whitespace; NUL preserves both UTF-16 decoding paths.
+// require a long individual token or a particular alphabet/prefix. High bytes go
+// to the full scan (they may be Unicode whitespace); NUL covers UTF-16 decoding.
 // Colon admits the canonicalizer's (?:[\da-f]{2}:)+[\da-f]{2} hex entry pattern.
 export function keyStructurePrecheck(buffer) {
-  // Even non-candidates (e.g. unmatched closing braces) can consume one tick per
-  // byte. Leave potential step exhaustion to the full scan's fail-closed path.
-  if(!Buffer.isBuffer(buffer)||buffer.length>Math.min(LIMITS.bytes,LIMITS.steps))return true;
-  let run=0;
+  if(!Buffer.isBuffer(buffer)||buffer.length>PRECHECK_SAFE_BYTES)return true;
+  let run=0,hexRun=0;
   for(const byte of buffer) {
-    if([0,34,37,48,58,91,92,123].includes(byte))return true;
+    // Slash covers comment emissions; even a two-character hex token can emit
+    // a candidate. Reject non-ASCII here so byte and token bounds coincide.
+    if(byte>=128||[0,34,37,47,48,58,91,92,123].includes(byte))return true;
+    if((byte>=48&&byte<=57)||(byte>=65&&byte<=70)||(byte>=97&&byte<=102)) {
+      if(++hexRun>=2)return true;
+    } else hexRun=0;
     if((byte>=65&&byte<=90)||(byte>=97&&byte<=122)||(byte>=48&&byte<=57)
       ||[43,45,47,61,95].includes(byte)) {
       if(++run>=8)return true;
     } else if(byte<128&&![9,10,11,12,13,32].includes(byte))run=0;
   }
+  // No emissions means only the root candidate's bytes are charged, candidate
+  // and decode depths cannot grow, and only disjoint closing-container/base64
+  // tokens can tick (at most once per ASCII byte). DER/JSON recursion never starts.
   return false;
 }
 

@@ -1,7 +1,8 @@
 // @vitest-environment node
 import {createPrivateKey,createPublicKey,generateKeyPairSync,getCurves,webcrypto} from 'node:crypto';
 import {performance} from 'node:perf_hooks';
-import {describe,expect,it} from 'vitest';
+import {describe,expect,it,vi} from 'vitest';
+import * as keyStructure from '../forge-key-structure.mjs';
 import {keyStructureFinding,keyStructurePrecheck} from '../forge-key-structure.mjs';
 import {manifestEntry} from '../forge-exec-manifest.mjs';
 
@@ -179,22 +180,39 @@ describe('Forge key structure consumer compatibility',()=>{
     }
   });
 
-  it('I4 fails closed on scan-step exhaustion with the default pre-check and tracked manifest admission',()=>{
-    const bytes=Buffer.alloc(4*1024*1024+1,125);
+  it.each([
+    ['candidate-count',()=>Buffer.from(Array.from({length:16400},(_,index)=>
+      index.toString(6).replace(/[0-5]/g,digit=>'abcdef'[Number(digit)]).padStart(6,'a')).join('!'))],
+    ['scan-step',()=>Buffer.alloc(4*1024*1024+1,125)],
+  ])('I4 preserves %s exhaustion with default/bypassed precheck through finding and manifest admission',(_name,input)=>{
+    const bytes=input();
+    expect(bytes.length).toBe(_name==='candidate-count'?114799:4194305);
     const exhausted='private-key-scan-budget-exhausted-use-local';
     expect(keyStructureFinding(bytes,{precheck:false})).toBe(exhausted);
     expect(keyStructurePrecheck(bytes)).toBe(true);
     expect(keyStructureFinding(bytes)).toBe(exhausted);
     expect(()=>manifestEntry(Buffer.from('docs/token.md'),bytes,false,true))
       .toThrow(expect.objectContaining({code:'excluded-source-file',message:expect.stringContaining(exhausted)}));
+    const fullScan=keyStructureFinding;
+    const scan=vi.spyOn(keyStructure,'keyStructureFinding').mockImplementation(content=>fullScan(content,{precheck:false}));
+    try {
+      expect(()=>manifestEntry(Buffer.from('docs/token.md'),bytes,false,true))
+        .toThrow(expect.objectContaining({code:'excluded-source-file',message:expect.stringContaining(exhausted)}));
+      expect(scan).toHaveBeenCalled();
+    } finally {scan.mockRestore();}
   });
 
-  it('I4 1 MiB speed: skips innocuous non-candidates before canonicalization',()=>{
-    const bytes=Buffer.alloc(1024*1024,33);
+  it('I4 skips small benign non-candidates before canonicalization',()=>{
+    const bytes=Buffer.alloc(1024,33);
     const start=performance.now();
     expect(keyStructurePrecheck(bytes)).toBe(false);
     expect(keyStructureFinding(bytes)).toBeNull();
     expect(performance.now()-start).toBeLessThan(250);
+  });
+
+  it.each(['aa','//!!','}!!',String.fromCharCode(255)])('I4 leaves possible emissions and oversized input to the full scan: %s',text=>{
+    expect(keyStructurePrecheck(Buffer.from(text.repeat(16400)))).toBe(true);
+    expect(keyStructurePrecheck(Buffer.from(text))).toBe(text!=='}!!');
   });
 
   it('I4 1 MiB speed: conservative encoded-looking and prose inputs stay bounded',()=>{
