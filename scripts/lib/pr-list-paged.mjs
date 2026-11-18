@@ -251,6 +251,22 @@ export function enrichPrRollupEvidence({ repo, rows, exec, execOpts = {} }) {
           Object.assign(pr, rollupEvidence(commit));
           const nodes = commit?.statusCheckRollup?.contexts?.nodes;
           if (pr.rowsComplete === true) pr.statusCheckRollup = nodes.map(mapCtx);
+          else if (Array.isArray(nodes)) {
+            // A partial read cannot retire old evidence, but must retain every
+            // newly observed blocker for consumers that do not read rowsComplete.
+            const blockers = nodes.map(n => n && ['CheckRun', 'StatusContext'].includes(n.__typename)
+              ? mapCtx(n) : { status: 'UNKNOWN' }).filter(row => {
+              const name = row.name ?? row.context;
+              const success = row.__typename === 'CheckRun'
+                ? String(row.status).toLowerCase() === 'completed' && String(row.conclusion).toLowerCase() === 'success'
+                : String(row.state).toLowerCase() === 'success';
+              return !(typeof name === 'string' && name.trim() && success);
+            });
+            if (blockers.length) {
+              pr.statusCheckRollup ??= [];
+              pr.statusCheckRollup.push(...blockers);
+            }
+          }
         }
       });
     } catch { /* unknown: retain fail-closed evidence */ }

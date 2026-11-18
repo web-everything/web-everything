@@ -655,6 +655,34 @@ it('incomplete GraphQL enrichment preserves previously observed failure evidence
 });
 
 
+it.each(['test', 'other'])('incomplete refresh retains newly observed blockers for %s beside old success', async name => {
+  const { resolveRequiredChecks, summarize } = await import('../check-state-predicate.mjs');
+  const head = 'a'.repeat(40);
+  const blockers = [
+    { __typename: 'CheckRun', name, status: 'COMPLETED', conclusion: 'FAILURE' },
+    { __typename: 'CheckRun', name, status: 'IN_PROGRESS', conclusion: null },
+    { __typename: 'CheckRun', name, status: 'COMPLETED', conclusion: 'CANCELLED' },
+    { __typename: 'StatusContext', context: name, state: 'FAILURE' },
+    { __typename: 'CheckRun', name, status: 'BOGUS', conclusion: 'SUCCESS' },
+    null, {}, { __typename: 'Unexpected', name, status: 'COMPLETED', conclusion: 'SUCCESS' },
+  ];
+  for (const blocker of blockers) {
+    const old = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' };
+    const pr = { headRefOid: head, statusCheckRollup: [old] };
+    enrichPrRollupEvidence({ repo, rows: [pr], exec: () => JSON.stringify({ data: { repository: { h0: {
+      oid: head, statusCheckRollup: { contexts: { totalCount: 2, pageInfo: { hasNextPage: true }, nodes: [blocker] } },
+    } } } }) });
+    expect(pr.rowsComplete).toBe(false);
+    expect(pr.statusCheckRollup[0]).toBe(old);
+    expect(pr.statusCheckRollup).toHaveLength(2);
+    if (blocker && ['CheckRun', 'StatusContext'].includes(blocker.__typename)) {
+      expect(summarize(pr.statusCheckRollup).allRequiredGreen).toBe(false);
+    } else expect(() => summarize(pr.statusCheckRollup)).toThrow(TypeError);
+    expect(resolveRequiredChecks({ head, rowsHead: pr.rowsHead, rowsComplete: pr.rowsComplete,
+      rows: pr.statusCheckRollup, requiredNames: ['test', name], rosterSource: 'live' }).state).not.toBe('pass');
+  }
+});
+
 it('preserves the commit read head when the PR head is newer', async () => {
   const { resolveRequiredChecks } = await import('../check-state-predicate.mjs');
   const current = 'a'.repeat(40), readHead = 'b'.repeat(40);

@@ -342,5 +342,6 @@ it('malformed refresh beside success preserves an existing legacy failure at the
     ? JSON.stringify([{ number: 1, headRefOid: head, statusCheckRollup: oldRows }])
     : JSON.stringify({ data: { repository: { h0: commit } } }));
   expect(defaultFetchOpenPrs({ repo: 'o/r', exec, readComments: () => [] })[0])
-    .toMatchObject({ rowsHead: head, rowsComplete: false, statusCheckRollup: oldRows });
+    .toMatchObject({ rowsHead: head, rowsComplete: false,
+      statusCheckRollup: [...oldRows, { status: 'UNKNOWN' }] });
 });

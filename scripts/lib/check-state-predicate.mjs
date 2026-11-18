@@ -134,7 +134,13 @@ const evidenceInteger = value => typeof value === 'number'
   ? (Number.isSafeInteger(value) && value > 0 ? BigInt(value) : null)
   : (typeof value === 'string' && /^[1-9][0-9]*(?![\s\S])/.test(value) ? BigInt(value) : null);
 const evidenceName = row => row?.name ?? row?.context;
-const evidenceJob = row => /\/actions\/runs\/\d+\/job\/(\d+)/.exec(row?.detailsUrl ?? row?.details_url ?? '')?.[1];
+const evidenceJob = row => {
+  try {
+    const url = new URL(row?.detailsUrl ?? row?.details_url ?? '');
+    if (url.protocol !== 'https:' || url.host !== 'github.com') return undefined;
+    return /^\/[^/]+\/[^/]+\/actions\/runs\/(\d+)\/job\/(\d+)\/?$/.exec(url.pathname)?.[2];
+  } catch { return undefined; }
+};
 
 // Completed is a lifecycle marker, not an outcome. Compare only explicit
 // outcome categories, before legacy mapping or hold excusal rewrites evidence.

@@ -843,6 +843,27 @@ describe('audit: roster and human-hold refusal paths', () => {
   const evidence = { head, rowsHead: head, rowsComplete: true, rosterSource: 'live',
     rows: [failed], requiredNames: ['merge-gate'] };
 
+  it.each([
+    ['https://untrusted.invalid/o/r/actions/runs/999/job/7', 'fail'],
+    ['https://untrusted.invalid/actions/runs/999/job/7suffix', 'fail'],
+    ['http://github.com/o/r/actions/runs/999/job/7', 'fail'],
+    ['https://github.com:444/o/r/actions/runs/999/job/7', 'fail'],
+    ['https://github.com/o/r/actions/runs/999/job/7suffix', 'fail'],
+    ['https://github.com/extra/o/r/actions/runs/999/job/7', 'fail'],
+    ['https://github.com/actions/runs/999/job/7', 'fail'],
+    ['https://github.com/o/r/actions/runs/999/job/7/attempts/2', 'fail'],
+    ['not a URL', 'fail'],
+    ['https://github.com/o/r/actions/runs/999/job/7', 'held'],
+    ['https://github.com/o/r/actions/runs/999/job/7/', 'held'],
+    ['https://github.com/o/r/actions/runs/999/job/7?pr=123', 'held'],
+  ])('binds job holds only to a complete trusted Actions URL: %s => %s', (url, state) => {
+    const bound = { jobId: 7, headSha: head, holdIds: ['review-acceptance'] };
+    for (const field of ['detailsUrl', 'details_url']) {
+      const { detailsUrl, ...row } = failed;
+      expect(resolveRequiredChecks({ ...evidence, rows: [{ ...row, [field]: url }], holds: [bound] }).state).toBe(state);
+    }
+  });
+
   it.each([[], null, 'merge-gate', [null], new Array(1)])(
     'refuses invalid roster %j even with the historical empty-roster override and an observed failure', requiredNames => {
       expect(resolveRequiredChecks({ ...evidence, requiredNames, allowEmptyRequiredNames: true }))
