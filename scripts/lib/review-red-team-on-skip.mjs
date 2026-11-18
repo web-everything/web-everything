@@ -1,5 +1,7 @@
 /** Recover an owed red-team result on an already-reviewed head through the existing review job. */
 import { readPlannerRow, readPlannerRows, nominationSafety, RED_TEAM_NOMINATION_KINDS } from './red-team-planner-row.mjs';
+import { mapGraphqlPr } from './pr-list-paged.mjs';
+import { runReconcilePass } from '../conveyor/reconcile-pass.mjs';
 import { redTeamRequestForHead, validateRedTeamRequest } from './red-team-request.mjs';
 import { loadPrOwnershipSettings } from '../conveyor/pr-ownership-settings.mjs';
 import { latestAdvisory } from './advisory-labels.mjs';
@@ -915,6 +917,34 @@ const hasReviewCapacity = capacity => capacity?.lanes > 0
   && (!capacity.budget || capacity.budget.left > 0)
   && (capacity.remainingStarts == null || capacity.remainingStarts > 0);
 
+/** One bounded PR read, then the normal read-only enrichers for current scope/referral/CI holds. */
+export function readLiveRedTeamPr({ repo, pr, readComments, env = process.env, exec = runGhSync, reconcile = runReconcilePass }) {
+  const [owner, name] = repo.split('/');
+  const query = `query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){
+    number title state isDraft headRefOid headRefName baseRefName body createdAt mergeStateStatus
+    labels(first:100){totalCount pageInfo{hasNextPage} nodes{name}}
+    files(first:100){totalCount pageInfo{hasNextPage} nodes{path additions deletions}}
+    commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100){totalCount pageInfo{hasNextPage} nodes{
+      __typename ...on CheckRun{name status conclusion startedAt completedAt detailsUrl databaseId checkSuite{app{slug databaseId} workflowRun{workflow{name}}}}
+      ...on StatusContext{context state targetUrl createdAt}
+    }}}}}}
+  }}}`;
+  const result = JSON.parse(exec(['api', 'graphql', '-f', `query=${query}`, '-f', `owner=${owner}`, '-f', `name=${name}`, '-F', `pr=${pr}`],
+    { env, throttle: { env: { ...env, WE_GH_READ_MEMO_DIR: '' } }, encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 }));
+  const raw = result.data?.repository?.pullRequest;
+  if (result.errors?.length || Number(raw?.number) !== Number(pr) || [raw?.labels, raw?.files].some(c =>
+    c?.pageInfo?.hasNextPage !== false || !Array.isArray(c.nodes) || c.nodes.length !== c.totalCount))
+    throw Error('live PR inputs incomplete; inspect the full PR before retrying');
+  const snapshot = { ...raw, ...mapGraphqlPr(raw), files: raw.files.nodes, comments: readComments({ repo, pr }) };
+  if (!snapshot.rowsComplete || snapshot.rowsHead !== snapshot.headRefOid || !isRealHead(snapshot.headRefOid)
+    || !Array.isArray(snapshot.comments) || snapshot.comments.some(c => typeof c?.body !== 'string'))
+    throw Error('live check/thread inputs incomplete; inspect the full PR before retrying');
+  const fresh = reconcile({ repo, readOnly: true, readPrs: () => [snapshot], readAgents: () => [], env }).enrichedPrs
+    ?.find(row => Number(row.number) === Number(pr));
+  if (!fresh) throw Error('live reconciliation unreadable; inspect the PR before retrying');
+  return fresh;
+}
+
 /** The recovery pass's production carried-check republisher (#6606): the shared publisher bound to this repo. */
 export const carriedCheckPublisher = ({ repo, env = process.env, run = runGhSync }) => {
   const publish = createCarriedCheckPublisher({ env, run });
@@ -938,10 +968,13 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     setLabels: () => {}, ensureLabel: () => {},
   } : createGhProvider({ exec: (args, options) => runGhSync(args,
     { ...options, env, encoding: 'utf8', timeout: 60_000 }) }),
-  readComments = ({ repo, pr }) => isUnderTest() || isUnderTest(env)
+  readLive = key => isUnderTest() || isUnderTest(env) ? provider.readPrState(key.repo, key.pr)
+    : readLiveRedTeamPr({ ...key, env, readComments: key => readComments(key, { fresh: true }) }),
+  readComments = ({ repo, pr }, { fresh = false } = {}) => isUnderTest() || isUnderTest(env)
     ? rawPrs?.find(raw => Number(raw.number) === Number(pr))?.comments
     : readCompletePrComments(Number(pr), { repo,
-      exec: (_file, args, options) => runGhSync(args, { ...options, env }) }),
+      exec: (_file, args, options) => runGhSync(args, { ...options, env,
+        ...(fresh ? { throttle: { env: { ...env, WE_GH_READ_MEMO_DIR: '' } } } : {}) }) }),
   readHeadFiles = key => isUnderTest() || isUnderTest(env)
     ? rawPrs?.find(raw => Number(raw.number) === Number(key.number))?.netFiles
     : readBacklogOnlyNetFiles(key),
@@ -1102,10 +1135,28 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
         if (reserved) budget.left--;
         try {
           if (row.nomination) {
-            const live = provider.readPrState(repo, row.prNumber);
-            if (live?.headRefOid !== row.expectedHead || live.state !== 'OPEN' || live.isDraft !== false
-              || row.requested && !redTeamRequestForHead(readComments({ repo, pr: row.prNumber }), { repo, pr: row.prNumber, head: live.headRefOid }))
-              throw new PreStartDispatchRefusalError('request or PR head changed before dispatch');
+            try {
+              const key = { repo, pr: row.prNumber }, live = readLive(key);
+              if (live?.headRefOid !== row.expectedHead) throw Error('PR head changed before dispatch; retry at the live head');
+              if (!Array.isArray(live.labels) || live.labels.some(label =>
+                typeof (typeof label === 'string' ? label : label?.name) !== 'string'))
+                throw Error('fresh PR labels unreadable; inspect the PR before retrying');
+              const comments = readComments(key, { fresh: true });
+              const reviews = readCompleteReviews ? readCompleteReviews(key)
+                : readReviews ? reviewReader(key) : isUnderTest() || isUnderTest(env) ? live.reviews
+                  : readCompletePrReviews({ ...key, env, exec: (args, options) => runGhSync(args,
+                    { ...options, throttle: { env: { ...env, WE_GH_READ_MEMO_DIR: '' } } }) });
+              if (!Array.isArray(reviews) || reviews.some(review => !['APPROVED', 'CHANGES_REQUESTED', 'COMMENTED', 'DISMISSED', 'PENDING'].includes(review?.state)))
+                throw Error('fresh formal reviews unreadable; inspect the PR before retrying');
+              if (row.requested && !redTeamRequestForHead(comments, { ...key, head: live.headRefOid }))
+                throw Error('request changed before dispatch; inspect the PR before retrying');
+              const [fresh] = planRedTeamOnSkip({ ...planningOptions,
+                refusals: refusals.filter(r => Number(r.prNumber) === row.prNumber),
+                rawPrs: [{ ...live, number: row.prNumber, comments, reviews }], now: now() });
+              if (fresh?.head !== live.headRefOid || fresh?.action !== row.action || fresh?.mode !== row.mode)
+                throw Error(fresh?.why ?? 'fresh PR evidence incomplete; inspect the PR before retrying');
+              row.expectedHead = fresh.head;
+            } catch (error) { throw new PreStartDispatchRefusalError(safeErrorText(error)); }
           }
           if (row.staleRecovery && !abandon({ repo, pr: row.prNumber, head: row.head }).ok) throw new PreStartDispatchRefusalError('stale abandonment refused');
           const result = dispatch({ pr: row.prNumber, repo,

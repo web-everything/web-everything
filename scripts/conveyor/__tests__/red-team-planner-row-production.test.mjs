@@ -84,6 +84,8 @@ it.each([false, true])('an allow-listed nomination consumes hydrated bound holds
   expect(p.refusals[0].kind).toBe('review-hold-red');
   const nominated = { ...p, refusals: [{ kind: 'review-ci', prNumber: pr, headSha: head }] };
   const out = runRedTeamOnSkip({ repo: 'web-everything/web-everything', plan: nominated, rawPrs: [raw],
+    // The final live reader must supply freshly hydrated, bound holds too; raw stale CI cannot authorize dispatch.
+    readLive: vi.fn(() => structuredClone(p.nominationPrs[0])),
     dispatch, now: () => 2_000_000, setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(),
     readWitness: () => ({ rawWriter: { parsed: null }, seats: [], newest: run }),
     readEvidence: () => ({ loopPayload: run, recorded: false }), readStatus: () => null,

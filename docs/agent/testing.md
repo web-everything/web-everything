@@ -4735,3 +4735,12 @@ hold gates and include `review-hold-labels` or `review-acceptance`. Candidate-la
 and other incidental holds retain failure. Empty or malformed required rosters always
 return `unknown` with `roster-unavailable`, including persisted options containing the
 removed `allowEmptyRequiredNames` override and evidence with an observed merge-gate failure.
+
+## Nomination and explicit-request dispatch revalidation (PR-B)
+
+`red-team-enqueue.test.mjs` changes the live snapshot after planning and exercises labels,
+formal reviews, thread holds, CI completeness, scope/referrals and head movement at dispatch.
+The live reader bounds its GraphQL connections and reuses read-only reconciliation for scope
+and referral evidence. Incomplete connections refuse with an instruction to inspect the full PR.
+Only nominations and explicit requests re-run the shared planner; normal reviewed-head recovery
+retains its existing behavior. Producer tests pin the single-PR read and incomplete-read refusals.

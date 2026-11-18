@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { planRedTeamNomination, planRedTeamOnSkip, runRedTeamOnSkip } from '../../lib/review-red-team-on-skip.mjs';
+import { planRedTeamNomination, planRedTeamOnSkip, runRedTeamOnSkip, readLiveRedTeamPr } from '../../lib/review-red-team-on-skip.mjs';
 import { readPlannerRow } from '../../lib/red-team-planner-row.mjs';
 import { redTeamRequestBody, redTeamRequestForHead } from '../../lib/red-team-request.mjs';
 import { createRedTeamEnqueueSinks, RED_TEAM_ENQUEUE_EFFECT, redTeamEnqueueOperation } from '../red-team-enqueue.mjs';
@@ -200,6 +200,62 @@ describe('nomination execution and queue', () => {
     const { opts, out } = run({ readComments: () => [trusted(redTeamRequestBody({ ...input, head: oldHead }))] }, true);
     expect(opts.dispatch).not.toHaveBeenCalled(); expect(out.rows[0].why).toMatch(/request/);
   });
+  describe.each(['automatic nomination', 'explicit request', 'explicit full review'])('%s dispatch-time revalidation', kind => {
+    function race(change = () => {}, overrides = {}) {
+      const raw = live(), opts = planning();
+      if (kind === 'explicit full review') stale(raw, opts);
+      if (kind !== 'automatic nomination') raw.comments.push(trusted(redTeamRequestBody(request())));
+      const fresh = structuredClone(raw); change(fresh);
+      const p = plan(raw, { kind: kind === 'automatic nomination' ? 'review-ci' : 'already-reviewed-head', prNumber: pr, headSha: head });
+      const provider = { readPrState: vi.fn(() => fresh) };
+      const options = { ...opts, repo, plan: p, rawPrs: [raw], now: () => 2_000_000, provider,
+        readComments: vi.fn(() => fresh.comments), readCompleteReviews: vi.fn(() => fresh.reviews),
+        capacity: { lanes: 1, remainingStarts: 1, budget: { left: 1 } }, dispatch: vi.fn(() => ({ jobPid: 123 })), ...overrides };
+      return { options, out: runRedTeamOnSkip(options) };
+    }
+    it.each([
+      ['new review:changes label', raw => raw.labels.push('review:changes'), /conflicting label|planner safety hold/],
+      ['new review-status:blocked label', raw => raw.labels.push('review-status:blocked'), /conflicting label|planner safety hold/],
+      ['failed required CI', raw => { raw.statusCheckRollup[0].conclusion = 'failure'; }, /pass or held/],
+      ['pending required CI', raw => { raw.statusCheckRollup[0] = check('test', null, { status: 'in_progress' }); }, /pass or held/],
+      ['unknown required CI', raw => { raw.statusCheckRollup[0].conclusion = 'unreadable'; }, /pass or held/],
+      ['incomplete check rows', raw => { raw.rowsComplete = false; }, /pass or held/],
+      ['foreign check rows', raw => { raw.rowsHead = oldHead; }, /pass or held/],
+      ['missing check rows', raw => { delete raw.statusCheckRollup; }, /pass or held/],
+      ['new formal CHANGES_REQUESTED', raw => { raw.reviews = [{ state: 'CHANGES_REQUESTED', author: { login: 'reviewer' } }]; }, /formal review hold/],
+      ['later hold comment', raw => raw.comments.push(trusted('🔁 review — changes requested\nFix the guard.')), /hold/],
+      ['new scope refusal', raw => { raw.scopeBloat = { stale: true, why: 'unrelated changes' }; }, /scope-bloat/],
+      ['new referral refusal', raw => { raw.referralHold = { why: 'ruling owed' }; }, /review-referrals-pending/],
+      ['oversized scope (inspect full changed files)', raw => { raw.files = Array.from({ length: 100 }, () => live().files[0]); }, /scope inputs unreadable or incomplete; inspect full changed files/],
+      ['unreadable scope', raw => { delete raw.files; }, /scope inputs unreadable/],
+      ['unreadable labels', raw => { raw.labels = null; }, /unreadable/],
+      ['unreadable reviews', raw => { raw.reviews = null; }, /formal reviews unreadable/],
+      ['malformed reviews', raw => { raw.reviews = [null]; }, /formal reviews unreadable/],
+      ['unknown formal review state', raw => { raw.reviews = [{ state: 'UNKNOWN' }]; }, /formal reviews unreadable/],
+      ['unreadable comments', raw => { raw.comments = null; }, /unreadable|request changed/],
+      ['head changed', raw => { raw.headRefOid = oldHead; }, /head changed/],
+    ])('refuses %s after planning, without spending capacity or cooldown', (_name, change, reason) => {
+      const { options, out } = race(change);
+      expect(options.provider.readPrState).toHaveBeenCalledWith(repo, pr);
+      expect(options.dispatch).not.toHaveBeenCalled(); expect(out.dispatched).toEqual([]);
+      expect(out.rows[0]).toMatchObject({ action: 'skip', why: expect.stringMatching(reason) });
+      expect(options.capacity).toEqual({ lanes: 1, remainingStarts: 1, budget: { left: 1 } });
+      expect(options.lastDispatch.size).toBe(0);
+    });
+    it('refuses an unreadable fresh read with an operator fallback', () => {
+      const { options, out } = race(undefined, { readLive: () => { throw Error('fresh PR unreadable; inspect the PR before retrying'); } });
+      expect(options.dispatch).not.toHaveBeenCalled(); expect(out.dispatched).toEqual([]);
+      expect(out.rows[0]).toMatchObject({ action: 'skip', why: expect.stringContaining('fresh PR unreadable; inspect the PR before retrying') });
+      expect(options.capacity.budget.left).toBe(1); expect(options.lastDispatch.size).toBe(0);
+    });
+    it.each(['pass', 'held'])('dispatches an unchanged clean snapshot with %s CI', state => {
+      const { options, out } = race(raw => { if (state === 'pass') raw.statusCheckRollup[1].conclusion = 'success'; });
+      expect(out.dispatched).toHaveLength(1);
+      expect(options.readCompleteReviews).toHaveBeenCalledWith({ repo, pr });
+      expect(options.dispatch).toHaveBeenCalledWith({ repo, pr, expectedHead: head,
+        ...(kind === 'explicit full review' ? {} : { redTeamOnly: true, redTeamMode: 'fresh' }) });
+    });
+  });
   it('queues allow-listed refusals under the existing capacity bound', () => {
     const raw = live(), p = plan(raw), writes = new Map();
     const queue = createRedTeamDispatchQueue({ file: 'queue.json', readFile: path => { if (!writes.has(path)) throw Object.assign(Error('missing'), { code: 'ENOENT' }); return writes.get(path); },
@@ -208,5 +264,47 @@ describe('nomination execution and queue', () => {
     runWithRedTeamQueue({ queue, repo, plan: p, rawPrs: [raw], capacity: { lanes: 1, remainingStarts: 1 }, run: runner, readNetFiles: () => ({ ok: false }) });
     expect(runner.mock.calls[0][0].plan.refusals).toEqual(p.refusals);
     expect(queue.entries()).toEqual([expect.objectContaining({ repo, pr, head })]);
+  });
+});
+
+describe('bounded live nomination snapshot producer', () => {
+  function source() {
+    const raw = live();
+    const connection = nodes => ({ nodes, totalCount: nodes.length, pageInfo: { hasNextPage: false } });
+    return { data: { repository: { pullRequest: { ...raw,
+      labels: connection(raw.labels.map(name => ({ name }))), files: connection(raw.files),
+      commits: { nodes: [{ commit: { oid: head, statusCheckRollup: { contexts: connection(raw.statusCheckRollup.map(row => ({ ...row, __typename: 'CheckRun' }))) } } }] },
+    } } } };
+  }
+  function read(result = source(), patch = {}) {
+    const exec = vi.fn(() => JSON.stringify(result)), readComments = vi.fn(() => []);
+    const reconcile = vi.fn(opts => ({ enrichedPrs: opts.readPrs() }));
+    return { exec, readComments, reconcile, run: () => readLiveRedTeamPr({ repo, pr, exec, readComments, reconcile, env: {}, ...patch }) };
+  }
+  it('binds complete check rows to the commit and reconciles only the requested PR read-only', () => {
+    const f = read(), raw = f.run();
+    expect(raw).toMatchObject({ number: pr, state: 'OPEN', rowsHead: head, rowsComplete: true, comments: [], files: live().files });
+    expect(raw.statusCheckRollup[0]).toMatchObject(check('test'));
+    expect(f.exec).toHaveBeenCalledTimes(1);
+    expect(f.exec).toHaveBeenCalledWith(expect.arrayContaining(['api', 'graphql', `pr=${pr}`]), expect.objectContaining({ timeout: 60_000, maxBuffer: 1024 * 1024,
+      throttle: { env: { WE_GH_READ_MEMO_DIR: '' } } }));
+    expect(f.readComments).toHaveBeenCalledWith({ repo, pr });
+    expect(f.reconcile).toHaveBeenCalledWith(expect.objectContaining({ repo, readOnly: true }));
+    expect(f.reconcile.mock.calls[0][0].readPrs()).toEqual([raw]);
+    expect(f.reconcile.mock.calls[0][0].readAgents()).toEqual([]);
+  });
+  it.each([
+    ['partial GraphQL errors', r => { r.errors = [{ message: 'partial result' }]; }],
+    ['missing PR', r => { r.data.repository.pullRequest = null; }],
+    ['truncated files (inspect full PR)', r => { r.data.repository.pullRequest.files.pageInfo.hasNextPage = true; }],
+    ['truncated labels (inspect full PR)', r => { r.data.repository.pullRequest.labels.totalCount++; }],
+    ['incomplete checks', r => { r.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.hasNextPage = true; }],
+    ['foreign-head checks', r => { r.data.repository.pullRequest.commits.nodes[0].commit.oid = oldHead; }],
+  ])('refuses %s before enrichment', (_name, change) => {
+    const result = source(); change(result); const f = read(result);
+    expect(f.run).toThrow(/incomplete; inspect the full PR/); expect(f.reconcile).not.toHaveBeenCalled();
+  });
+  it('refuses unreadable enrichment instead of using the original snapshot', () => {
+    expect(read(undefined, { reconcile: () => ({}) }).run).toThrow(/reconciliation unreadable; inspect the PR/);
   });
 });
