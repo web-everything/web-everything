@@ -50,7 +50,9 @@ export function resolveGhInstallation({ env, caller, callerRoles, roles, cachePa
     }
     if (cached) {
       if (conservative && cached.installationId != null && String(cached.installationId) !== String(id)) return { role, misses, reason: 'ambiguous' };
-      return { role, name, cached, used, installationId: id, misses, reason: 'shim-cache' };
+      // A map or filename selects a cache; neither identifies the token stored in it.
+      const installationId = /^\d+$/.test(String(cached.installationId ?? '')) ? String(cached.installationId) : null;
+      return { role, name, cached, used, installationId, misses, reason: installationId === null ? 'unknown-installation' : 'shim-cache' };
     }
     misses.push(name + ': no fresh token cached');
   }
@@ -88,5 +90,5 @@ export function resolveGhSlotBucket({ identity, env = {}, args = [], caller, cwd
   }
   if (!owner) return { bucket: null, reason: 'no-owner' };
   const selected = resolveGhInstallation({ env, caller, callerRoles: delivery.callerRoles, roles, cachePath, owner, readFresh, conservative: true, roleForCaller, installationForOwner, installationCachePath });
-  return { bucket: selected.cached ? String(selected.installationId) : null, reason: selected.reason };
+  return { bucket: selected.cached ? selected.installationId : null, reason: selected.reason };
 }

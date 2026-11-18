@@ -775,8 +775,8 @@ function freshCachedToken() {
       process.stderr.write('gh-shim: GitHub App role "' + role + '" unavailable (' + misses.join('; ') + ') - using the ' + selected.name + ' App for this call\\n');
     }
     usedCachePath = selected.used;
-    // A legacy cache may carry no id; the resolver then charges the owner-map id, so forward that same id.
-    cachedInstallationId = selected.cached.installationId ?? selected.installationId ?? null;
+    // Only the selected token's own identity may cross into admission/budget accounting.
+    cachedInstallationId = selected.installationId ?? null;
     return selected.cached.token;
   }
   if (!DAEMON && misses.some(miss => miss.startsWith('legacy: no installation for owner '))) {

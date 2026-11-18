@@ -217,7 +217,7 @@ console.log(result);`;
   });
   it.each([
     ['101', true],
-    ['202', false],
+    ['202', true],
     // A legacy parent publishes no label; its only pool was the shared one, so 202 still needs its own slot.
     [undefined, true],
   ])('a nested call whose outer was admitted to pool %s is throttled: %s (inner resolves installation 202, which is full)', (outerBucket, throttled) => {
@@ -267,7 +267,7 @@ console.log(result);`;
     expect(full.status).not.toBe(0);
     expect(readGhSlotHolders({ lockRoot: root, cap: 1, includeInstallations: false })).toHaveLength(1);
   });
-  it('forwards the owner-map installation for a legacy cache without an installation id (same pool as the resolver)', () => {
+  it('keeps an unidentified legacy token shared across owners in the resolver and generated shim', () => {
     expect(acquire(null, 'shared-holder').ok).toBe(true);
     const cachePath = defaultCachePath();
     writeFileSync(cachePath, JSON.stringify({ v: 2, token: 'ghs_fixture_legacy', expiresAt: new Date(Date.now() + 3600000).toISOString() }));
@@ -281,24 +281,34 @@ console.log(result);`;
       writeFileSync(shim, renderGhShimScript({ realGhPath: executable, cachePath, roleTable: {}, callerRoles: {} }));
     } finally { if (priorControl === undefined) delete process.env.WE_CONTROL_CLONE; else process.env.WE_CONTROL_CLONE = priorControl; }
     const env = { PATH: process.env.PATH, HOME: root, ...baseEnv(),
-      WE_GITHUB_APP_INSTALLATIONS: '{"example":"101"}', WE_GH_THROTTLE_LOCK_ROOT: root,
+      WE_GITHUB_APP_INSTALLATIONS: '{"example":"101","other":"202"}', WE_GH_THROTTLE_LOCK_ROOT: root,
       WE_GH_THROTTLE_CAP: '20', WE_GH_THROTTLE_SHARED_FALLBACK_CAP: '1', WE_GH_THROTTLE_ACQUIRE_TIMEOUT_MS: '0' };
-    expect(resolveGhSlotBucket({ identity: 'default', args, env }).bucket).toBe('101');
-    const actual = execFileSync(process.execPath, [shim, ...args], { env, encoding: 'utf8', timeout: 10000, maxBuffer: 65536 });
-    expect(actual.trim()).toBe('executed');
-    expect(rows('calls.jsonl').find(r => r.outcome === 'call')).toMatchObject({ id: 'app-installation-101' });
+    const buckets = ['example', 'other'].map(owner => resolveGhSlotBucket({ identity: 'default', args: ['pr', 'list', '--repo', `${owner}/repo`], env }).bucket);
+    for (const owner of ['example', 'other']) {
+      const actual = spawnSync(process.execPath, [shim, 'pr', 'list', '--repo', `${owner}/repo`], { env, encoding: 'utf8', timeout: 10000, maxBuffer: 65536 });
+      expect(actual.status).toBe(1);
+      expect(actual.stdout).not.toContain('executed');
+    }
+    expect(buckets).toEqual([null, null]);
+    expect(rows('calls.jsonl').filter(r => r.outcome === 'slot_throttled').map(r => r.bucket)).toEqual(['shared', 'shared']);
+    expect(new Set(rows('calls.jsonl').filter(r => r.outcome === 'slot_throttled').map(r => r.id)).size).toBe(1);
+  });
+  it.each(['legacy', 'installation'])('does not infer token identity from the %s cache location', kind => {
+    const env = { WE_GITHUB_APP_INSTALLATIONS: '{"example":"101","other":"202"}' };
+    const readFresh = path => kind === 'installation' || path === defaultCachePath() ? { token: 'ghs_same_unidentified' } : null;
+    expect(['example', 'other'].map(owner => resolveGhSlotBucket({ identity: 'default', args: ['pr', 'list', '--repo', `${owner}/repo`], env, readFresh }).bucket)).toEqual([null, null]);
   });
   // PR #7018 red team: the parent holds a shared slot while its shim-routed child resolves installation 101. The
   // child must not count its own parent against perCallerMax (the parent cannot release until the child returns).
   describe('a nested call moving to another pool counts its parent once against perCallerMax', () => {
-    const nestedRun = ({ perCallerMax, before = () => {}, parentEnv = {}, childBucket = '101', parentCap = 1, callArgs = args }) => {
+    const nestedRun = ({ perCallerMax, before = () => {}, parentEnv = {}, childBucket = '101', parentCap = 1, callArgs = args, childThrottle = {} }) => {
       const env = { ...baseEnv(), ...parentEnv, GH_CALLER: 'review-pr.mjs', WE_GH_THROTTLE_PER_CALLER_MAX: String(perCallerMax) };
       const child = vi.fn(ok);
       let nested = null;
       const execFileSync = vi.fn((bin, a, o) => {
         before(o.env);
         nested = runGhCliPassthrough(a, { throttle: { lockRoot: root, cap: 20, env: o.env, personalRoute: false, acquireTimeoutMs: 0, warn: () => {}, budgetPerMin: 10000,
-          shimRouted: true, resolveSlotBucket: () => ({ bucket: childBucket }) }, spawn: child });
+          shimRouted: true, resolveSlotBucket: () => ({ bucket: childBucket }), ...childThrottle }, spawn: child });
         return Buffer.from('[]');
       });
       runGhSync(callArgs, { env, throttle: { lockRoot: root, cap: parentCap, env, personalRoute: false, acquireTimeoutMs: 0, warn: () => {}, budgetPerMin: 10000, execFileSync } });
@@ -342,6 +352,63 @@ console.log(result);`;
       const { nested, child } = nestedRun({ perCallerMax: 1, before: env => { env.WE_GH_THROTTLE_OUTER_OWNER = 'not-the-parent'; } });
       expect(nested).toMatchObject({ status: 1, throttled: true });
       expect(child).not.toHaveBeenCalled();
+    });
+    it.each(['invocation', 'bucket', 'owner', 'command', 'released', 'expired', 'dead-pid'])('rejects a %s parent claim even when the nested pool matches', kind => {
+      const { nested, child } = nestedRun({ perCallerMax: 0, childBucket: null, parentEnv: { WE_GH_THROTTLE_SHARED_FALLBACK_CAP: '1' }, before: env => {
+        const path = join(lockDirFor(root, slotPath(0)), 'lock.json');
+        if (kind === 'invocation') env.WE_GH_THROTTLE_OUTER_INV = 'forged';
+        if (kind === 'bucket') env.WE_GH_THROTTLE_OUTER_BUCKET = '../shared';
+        if (kind === 'owner') delete env.WE_GH_THROTTLE_OUTER_OWNER;
+        if (kind === 'command') {
+          const entry = JSON.parse(readFileSync(path, 'utf8'));
+          entry.meta.callHash = 'different-command';
+          writeFileSync(path, JSON.stringify(entry));
+        }
+        if (kind === 'released') releaseGhSlotSync({ lockRoot: root, cap: 1, owner: env.WE_GH_THROTTLE_OUTER_OWNER });
+        if (kind === 'expired' || kind === 'dead-pid') {
+          const entry = JSON.parse(readFileSync(path, 'utf8'));
+          if (kind === 'expired') entry.heartbeatAt = entry.meta.acquiredAt = '2000-01-01T00:00:00Z';
+          else entry.pid = 2147483647;
+          writeFileSync(path, JSON.stringify(entry));
+        }
+        if (kind === 'released' || kind === 'expired' || kind === 'dead-pid') {
+          acquireGhSlotSync({ lockRoot: root, cap: 1, owner: 'replacement', timeoutMs: 0, policy, meta: ghHolderMeta({ caller: 'other', args }) });
+        }
+      } });
+      expect(nested).toMatchObject({ status: 1, throttled: true });
+      expect(child).not.toHaveBeenCalled();
+      expect(JSON.parse(readFileSync(ghPointsBudgetStatePath(root), 'utf8')).spent).toBe(2);
+    });
+    it('refuses an unrelated live process even with matching slot labels', async () => {
+      const unrelated = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 10000)'], { stdio: 'ignore' });
+      const exited = once(unrelated, 'exit');
+      try {
+        const { nested, child } = nestedRun({ perCallerMax: 0, childBucket: null, parentEnv: { WE_GH_THROTTLE_SHARED_FALLBACK_CAP: '1' }, before: () => {
+          const path = join(lockDirFor(root, slotPath(0)), 'lock.json');
+          const entry = JSON.parse(readFileSync(path, 'utf8'));
+          entry.pid = unrelated.pid;
+          writeFileSync(path, JSON.stringify(entry));
+        } });
+        expect(nested).toMatchObject({ status: 1, throttled: true });
+        expect(child).not.toHaveBeenCalled();
+        expect(JSON.parse(readFileSync(ghPointsBudgetStatePath(root), 'utf8')).spent).toBe(2);
+      } finally { unrelated.kill(); await exited; }
+    });
+    it('revalidates a parent released while the child waits for another pool and releases the child slot', () => {
+      let parentOwner;
+      let clock = Date.now() + 1000;
+      const { nested, child } = nestedRun({ perCallerMax: 0, before: env => {
+        parentOwner = env.WE_GH_THROTTLE_OUTER_OWNER;
+        acquire('101', 'first'); acquire('101', 'second');
+      }, childThrottle: { acquireTimeoutMs: 1000, now: () => clock, sleep: ms => {
+        clock += ms;
+        releaseGhSlotSync({ lockRoot: root, cap: 1, owner: parentOwner });
+        releaseGhSlotSync({ ...pool('101'), owner: 'first' });
+      } } });
+      expect(nested).toMatchObject({ status: 1, throttled: true });
+      expect(nested.stderr.toString()).toContain('parent slot expired');
+      expect(child).not.toHaveBeenCalled();
+      expect(readGhSlotHolders({ lockRoot: root, cap: 20 })).toHaveLength(1);
     });
   });
   it('fails closed on absent caches and unknown owners', () => {
@@ -466,6 +533,26 @@ process.send('ready');
 });
 
 describe.each(['sync', 'passthrough'])('%s slot routing', mode => {
+  it.each(['setup', 'points', 'write', 'slot'])('refuses %s admission errors even with the timeout ungated override', stage => {
+    let lockRoot = root;
+    const extra = {};
+    if (stage === 'setup') {
+      writeFileSync(join(root, 'not-directory'), 'x');
+      lockRoot = join(root, 'not-directory', 'locks');
+    } else if (stage === 'points' || stage === 'write') {
+      mkdirSync(stage === 'points' ? ghPointsBudgetStatePath(root) : ghWriteBudgetStatePath(root));
+      if (stage === 'write') extra.args = ['pr', 'comment', '1', '--body', 'x'];
+    } else {
+      acquire(null, 'occupied');
+      extra.acquireTimeoutMs = 1000;
+      extra.sleep = () => { throw new Error('slot poll failed'); };
+    }
+    const execute = vi.fn(ok);
+    const env = { WE_GH_THROTTLE_ON_SLOT_TIMEOUT: 'ungated' };
+    if (mode === 'sync') expect(() => invoke(mode, env, execute, { ...extra, lockRoot })).toThrow(/admission failed/);
+    else expect(invoke(mode, env, execute, { ...extra, lockRoot })).toMatchObject({ status: 1, throttled: true });
+    expect(execute).not.toHaveBeenCalled();
+  });
   it('passes the execution cwd to bucket resolution', () => {
     const resolveSlotBucket = vi.fn(() => ({ bucket: null }));
     const cwd = join(root, 'child');

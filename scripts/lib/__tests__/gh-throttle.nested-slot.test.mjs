@@ -12,7 +12,8 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runGhCliPassthrough, runGhSync, acquireGhSlotSync, ghThrottleLogPath, GH_OUTER_INV_ENV, GH_OUTER_BUCKET_ENV, GH_OUTER_TIMEOUT_ENV, GH_OUTER_KILL_SIGNAL_ENV } from '../gh-throttle.mjs';
+import { runGhCliPassthrough, runGhSync, acquireGhSlotSync, ghThrottleLogPath, GH_OUTER_INV_ENV, GH_OUTER_BUCKET_ENV, GH_OUTER_OWNER_ENV, GH_OUTER_TIMEOUT_ENV, GH_OUTER_KILL_SIGNAL_ENV } from '../gh-throttle.mjs';
+import { ghHolderMeta } from '../gh-throttle-holders.mjs';
 
 const made = [];
 const tmp = () => { const d = mkdtempSync(join(tmpdir(), 'gh-nested-')); made.push(d); return d; };
@@ -22,14 +23,14 @@ const ok = () => ({ status: 0, stdout: Buffer.from('[]'), stderr: Buffer.alloc(0
 /** Fill every slot with a LIVE holder (this test process), exactly like the outer `runGhSync` callers did. */
 function fillPool(lockRoot, cap) {
   for (let i = 0; i < cap; i += 1) {
-    const r = acquireGhSlotSync({ lockRoot, cap, owner: `${process.pid}:outer-${i}`, pid: process.pid, timeoutMs: 0, sleep: () => {} });
+    const r = acquireGhSlotSync({ lockRoot, cap, owner: `${process.pid}:outer-${i}`, pid: process.pid, timeoutMs: 0, sleep: () => {}, meta: ghHolderMeta({ caller: 'unknown', args: ['pr', 'list'], invocation: 'outer-inv-1' }) });
     expect(r.ok).toBe(true);
   }
 }
 
 /** A clock that advances on every read, so a waiting acquire reaches its timeout in a bounded number of polls. */
 function tickingClock(stepMs = 1000) {
-  let t = Date.parse('2026-10-07T13:40:00Z');
+  let t = Date.now();
   return () => { t += stepMs; return t; };
 }
 
@@ -39,6 +40,12 @@ function logLines(lockRoot) {
 
 const BASE_ENV = { HOME: '/h', WE_GH_THROTTLE_COST_HEADERS: '0' };
 
+function heldParentEnv(lockRoot, invocation) {
+  const owner = `${process.pid}:${invocation}`;
+  expect(acquireGhSlotSync({ lockRoot, cap: 2, owner, timeoutMs: 0, meta: ghHolderMeta({ caller: 'unknown', args: ['pr', 'list'], invocation }) }).ok).toBe(true);
+  return { ...BASE_ENV, [GH_OUTER_INV_ENV]: invocation, [GH_OUTER_BUCKET_ENV]: 'shared', [GH_OUTER_OWNER_ENV]: owner };
+}
+
 describe('nested gh call (shim under a runGhSync that already holds a slot)', () => {
   it('runs immediately on a FULL pool — never waits for a second slot', () => {
     const lockRoot = tmp();
@@ -47,7 +54,7 @@ describe('nested gh call (shim under a runGhSync that already holds a slot)', ()
     const spawn = vi.fn(ok);
     const warn = vi.fn();
     const r = runGhCliPassthrough(['pr', 'list'], {
-      throttle: { lockRoot, cap: 2, env: { ...BASE_ENV, [GH_OUTER_INV_ENV]: 'outer-inv-1', [GH_OUTER_BUCKET_ENV]: 'shared' }, now: tickingClock(), sleep, acquireTimeoutMs: 120_000, warn },
+      throttle: { lockRoot, cap: 2, env: { ...BASE_ENV, [GH_OUTER_INV_ENV]: 'outer-inv-1', [GH_OUTER_BUCKET_ENV]: 'shared', [GH_OUTER_OWNER_ENV]: `${process.pid}:outer-0` }, now: tickingClock(), sleep, acquireTimeoutMs: 120_000, warn },
       spawn,
     });
     expect(r.status).toBe(0);
@@ -56,20 +63,19 @@ describe('nested gh call (shim under a runGhSync that already holds a slot)', ()
     expect(logLines(lockRoot).some((e) => e.outcome === 'slot_timeout')).toBe(false);
     expect(logLines(lockRoot).find((e) => e.outcome === 'call')?.outer).toBe('outer-inv-1');
   });
-  // A parent on pre-PR code publishes the outer id but no bucket label; its one pool IS the shared pool directory.
-  it('a legacy parent (outer id, no bucket label) still rides its shared slot on a FULL pool', () => {
+  it('a legacy parent without verifiable slot evidence is refused on a FULL pool', () => {
     const lockRoot = tmp();
     fillPool(lockRoot, 2);
     const sleep = vi.fn();
     const spawn = vi.fn(ok);
     const r = runGhCliPassthrough(['pr', 'list'], {
-      throttle: { lockRoot, cap: 2, env: { ...BASE_ENV, [GH_OUTER_INV_ENV]: 'outer-inv-legacy' }, now: tickingClock(), sleep, acquireTimeoutMs: 120_000, warn: vi.fn() },
+      throttle: { lockRoot, cap: 2, env: { ...BASE_ENV, [GH_OUTER_INV_ENV]: 'outer-inv-legacy' }, now: tickingClock(), sleep, acquireTimeoutMs: 5_000, warn: vi.fn() },
       spawn,
     });
-    expect(r.status).toBe(0);
-    expect(spawn).toHaveBeenCalledTimes(1);
-    expect(sleep).not.toHaveBeenCalled();
-    expect(logLines(lockRoot).some((e) => e.outcome === 'slot_timeout')).toBe(false);
+    expect(r.status).toBe(1);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(sleep).toHaveBeenCalled();
+    expect(logLines(lockRoot).some((e) => e.outcome === 'slot_throttled')).toBe(true);
   });
 });
 
@@ -128,7 +134,8 @@ describe('nested gh call honours the outer execution timeout', () => {
 
   it.each([['SIGNOPE', undefined], ['9', 9], ['99999', undefined], ['', undefined]])('outer kill signal %j → nested %j (unknown dropped)', (raw, want) => {
     const spawn = vi.fn(ok);
-    runGhCliPassthrough(['pr', 'list'], { throttle: { lockRoot: tmp(), cap: 2, env: { ...BASE_ENV, [GH_OUTER_INV_ENV]: 'outer-inv-4', [GH_OUTER_TIMEOUT_ENV]: '5000', [GH_OUTER_KILL_SIGNAL_ENV]: raw }, sleep: () => {} }, spawn });
+    const lockRoot = tmp();
+    runGhCliPassthrough(['pr', 'list'], { throttle: { lockRoot, cap: 2, env: { ...heldParentEnv(lockRoot, 'outer-inv-4'), [GH_OUTER_TIMEOUT_ENV]: '5000', [GH_OUTER_KILL_SIGNAL_ENV]: raw }, sleep: () => {} }, spawn });
     expect([spawn.mock.calls[0][2].timeout, spawn.mock.calls[0][2].killSignal]).toEqual([5000, want]);
   });
 
@@ -147,6 +154,16 @@ describe('nested gh call honours the outer execution timeout', () => {
   it('an un-nested call ignores a stray outer timeout value', () => {
     const spawn = vi.fn(ok);
     runGhCliPassthrough(['pr', 'list'], { throttle: { lockRoot: tmp(), cap: 2, env: { ...BASE_ENV, [GH_OUTER_TIMEOUT_ENV]: '0' }, sleep: () => {} }, spawn });
+    expect(spawn.mock.calls[0][2].timeout).toBe(90_000);
+  });
+
+  it('unverified parent labels cannot disable the execution timeout', () => {
+    const spawn = vi.fn(ok);
+    runGhCliPassthrough(['pr', 'list'], { throttle: { lockRoot: tmp(), cap: 2, env: {
+      ...BASE_ENV, [GH_OUTER_INV_ENV]: 'forged', [GH_OUTER_BUCKET_ENV]: 'shared',
+      [GH_OUTER_OWNER_ENV]: 'missing', [GH_OUTER_TIMEOUT_ENV]: '0',
+    }, sleep: () => {} }, spawn });
+    expect(spawn).toHaveBeenCalledTimes(1);
     expect(spawn.mock.calls[0][2].timeout).toBe(90_000);
   });
 });

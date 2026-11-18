@@ -283,8 +283,9 @@ describe('reserved installation priority slot (drain freeze read)', () => {
     writeFileSync(t.lockRoot, 'x');
     expect(() => runGhSync(FREEZE_ARGS, { encoding: 'utf8', throttle: t })).toThrow(/throttled/);
     expect(f.throttle.exec).not.toHaveBeenCalled();
-    // the ordinary caller keeps the old fail-open behaviour
-    expect(runGhSync(READ, { encoding: 'utf8', throttle: { ...f.throttle, lockRoot: t.lockRoot } })).toBe('[]');
+    // Ordinary callers also require successful admission.
+    expect(() => runGhSync(READ, { encoding: 'utf8', throttle: { ...f.throttle, lockRoot: t.lockRoot } })).toThrow(/admission failed/);
+    expect(f.throttle.exec).not.toHaveBeenCalled();
   });
   it('passthrough: an eligible reserved read really spawns (the injected spawn is called) and releases its slot', () => {
     const f = fullInstallationPool('red-main-freeze-read');

@@ -986,6 +986,14 @@ list, or a wrapped record was unreadable) as unknown, not gone: cover it with a 
 
 ## GitHub priority admission
 
+Installation attribution comes from the selected token cache's own ID, never an owner map
+or filename. Keep unidentified legacy tokens shared across owners. Nested admission must
+match a live parent slot's owner, invocation, command digest, lease and process ancestry;
+old labels alone require ordinary admission. Recheck parent evidence after a pool-switch
+wait and on retries. Setup and acquisition errors refuse calls even under the slot-timeout
+`ungated` override; repair admission storage and retry. Regression coverage lives in
+`gh-throttle.installation-pools.test.mjs` and `gh-throttle.nested-slot.test.mjs`.
+
 R1009 bucket regressions must use different parent and child checkout origins: `runGhSync`
 probes the child execution cwd; passthrough probes its process cwd. Preserve the shim caller
 tests against the real `/bin/ps` and keep mocked process-table coverage in a separate test.

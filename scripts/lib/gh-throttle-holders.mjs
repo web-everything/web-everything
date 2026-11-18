@@ -3,8 +3,9 @@ import fs, { readdirSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { URL as NodeURL, fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
-import { readLockEntry, releaseLockDirIf } from '../readiness/file-locks.mjs';
-import { slotPath } from '../readiness/heavy-admission.mjs';
+import { createHash } from 'node:crypto';
+import { readLockEntry, releaseLockDirIf, isLeaseExpired } from '../readiness/file-locks.mjs';
+import { slotPath, ADMISSION_LEASE_MINUTES } from '../readiness/heavy-admission.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { cascadePolicy, logCascadeSources } from './policy-cascade.mjs';
 import { ghCommandWords } from './gh-argv.mjs';
@@ -107,9 +108,10 @@ export function sanitizeGhHolder(h) {
     args: `${op} <redacted>`, parent: sanitizeHolderField(h.parent, 'parent'), ppid: integer(h.ppid, 1),
     heldMs: Number.isFinite(h.heldMs) && h.heldMs >= 0 ? h.heldMs : 0, ...(Number.isFinite(h.timeoutMs) && h.timeoutMs >= 0 ? { timeoutMs: h.timeoutMs } : {}) };
 }
-export function ghHolderMeta({ caller, args, pid = process.pid, ppid = process.ppid, nowMs = Date.now(), timeoutMs }) {
+export function ghHolderMeta({ caller, args, pid = process.pid, ppid = process.ppid, nowMs = Date.now(), timeoutMs, invocation }) {
   return { caller: sanitizeHolderField(caller), op: ghOpLabel(args), args: redactGhArgs(args), pid, ppid,
     parent: sanitizeHolderField(basename(process.argv[1] || ''), 'parent'), acquiredAt: new Date(nowMs).toISOString(),
+    ...(invocation ? { invocation, callHash: createHash('sha256').update(JSON.stringify(args)).digest('hex') } : {}),
     ...(Number.isFinite(timeoutMs) && timeoutMs >= 0 ? { timeoutMs } : {}) };
 }
 // The leaf's own flags are parsed by pflag over the args minus the command words: a value flag consumes
@@ -160,6 +162,45 @@ function alive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
 }
+
+/** A live holder must belong to this call's process ancestry, not an unrelated concurrent caller. */
+function isParentProcess(pid) {
+  if (!alive(pid)) return false;
+  let current = process.pid;
+  const deadline = Date.now() + 2000;
+  for (let depth = 0; depth < 16 && current > 1; depth++) {
+    if (current === pid) return true;
+    if (Date.now() >= deadline) return false;
+    try {
+      current = current === process.pid ? process.ppid : Number(execFileSync('/bin/ps', ['-o', 'ppid=', '-p', String(current)], {
+        encoding: 'utf8', timeout: Math.max(1, deadline - Date.now()), maxBuffer: 1024, stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim());
+    } catch { return false; }
+  }
+  return false;
+}
+
+/** Environment labels are hints; reuse requires the matching, unexpired parent slot on disk. */
+export function readGhParentSlot({ lockRoot, bucket, owner, invocation, args, nowMs, policy }) {
+  if (!invocation || !owner || !(bucket === 'shared' || /^\d+$/.test(bucket ?? ''))) return null;
+  const root = bucket === 'shared' ? lockRoot : join(lockRoot, 'installations', bucket);
+  const callHash = createHash('sha256').update(JSON.stringify(args)).digest('hex');
+  for (let slot = 0; slot <= 50; slot++) {
+    const entry = readLockEntry(root, slotPath(slot));
+    if (entry?.owner !== owner || entry.meta?.invocation !== invocation || entry.meta?.callHash !== callHash) continue;
+    const acquired = Date.parse(entry.meta.acquiredAt);
+    const timeout = entry.meta.timeoutMs;
+    if (!Number.isFinite(acquired) || acquired > nowMs || isLeaseExpired(entry, nowMs, ADMISSION_LEASE_MINUTES)) return null;
+    if (policy.maxHoldSeconds > 0 && timeout !== 0 && nowMs - acquired > Math.max(policy.maxHoldSeconds * 1000, timeout ?? 0) + policy.reapGraceSeconds * 1000) return null;
+    if (!isParentProcess(entry.pid)) return null;
+    // Re-read after the process probe: a released/replaced holder cannot authorize reuse.
+    const current = readLockEntry(root, slotPath(slot));
+    return current?.owner === owner && current.pid === entry.pid && current.meta?.invocation === invocation
+      && current.meta?.callHash === callHash && current.meta?.acquiredAt === entry.meta.acquiredAt && current.heartbeatAt === entry.heartbeatAt
+      ? { owner, bucket, invocation } : null;
+  }
+  return null;
+}
 function holder(slot, entry, nowMs) {
   const m = entry.meta || {};
   const acquired = Date.parse(m.acquiredAt || entry.heartbeatAt);
@@ -208,7 +249,8 @@ export function describeLegacyHolders(holders, ps = (pid) => execFileSync('ps', 
 export function acquireGhHolderSlot({ lockRoot, cap, owner, pid, pollMs, timeoutMs, now, sleep, meta, policy, trySlot, onReap = () => {}, onWait = () => {}, callerLockRoot = lockRoot, excludeOwner = null }) {
   const startedAt = now();
   const safe = sanitizeGhHolder(meta);
-  const slotMeta = { caller: safe.caller, op: safe.op, args: safe.args, parent: safe.parent, pid, ppid: safe.ppid, ...(safe.timeoutMs !== undefined ? { timeoutMs: safe.timeoutMs } : {}) };
+  const slotMeta = { caller: safe.caller, op: safe.op, args: safe.args, parent: safe.parent, pid, ppid: safe.ppid, ...(safe.timeoutMs !== undefined ? { timeoutMs: safe.timeoutMs } : {}),
+    ...(meta.invocation ? { invocation: meta.invocation, callHash: meta.callHash } : {}) };
   const overAge = h => h.timeoutMs !== 0 && h.heldMs > Math.max(policy.maxHoldSeconds * 1000, h.timeoutMs ?? 0) + policy.reapGraceSeconds * 1000;
   for (;;) {
     const nowMs = now();
