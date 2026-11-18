@@ -21,6 +21,7 @@ export const DEFAULT_HOST_MAX_WAIT_MS = 15 * 60 * 1000;
 export const DEFAULT_MIN_MEMORY_HEADROOM_MB = 2048;
 export const DEFAULT_SNAPSHOT_MAX_FRESH_MS = 20000;
 export const DEFAULT_SNAPSHOT_CLOCK_SKEW_MS = 2000;
+export const DEFAULT_MAX_REVIEW_DISPATCH_PER_TICK = 2;
 const pct = (v) => Number.isFinite(v) && v >= 0 && v <= 100;
 const leaves = {
   'host.capacitySignal': ['load', 'WE_HOST_CAPACITY_SIGNAL', (v) => ['load', 'cpu-mem'].includes(v)],
@@ -43,7 +44,7 @@ const leaves = {
   'host.minMemoryHeadroomMb': [DEFAULT_MIN_MEMORY_HEADROOM_MB, 'WE_HOST_MIN_MEMORY_HEADROOM_MB', (v) => Number.isFinite(v) && v > 0],
   // At most this many NEW review sessions per review-daemon tick while the host admits, so memory is re-sampled
   // between waves instead of one tick launching ten 600 MB review jobs at once. Owed reviews stay queued.
-  'host.maxReviewDispatchPerTick': [2, 'WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK', (v) => Number.isSafeInteger(v) && v >= 1],
+  'host.maxReviewDispatchPerTick': [DEFAULT_MAX_REVIEW_DISPATCH_PER_TICK, 'WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK', (v) => Number.isSafeInteger(v) && v >= 1],
   'lanes.transcripts.explicitScan': [true, 'WE_LANE_TRANSCRIPT_EXPLICIT_SCAN', (v) => typeof v === 'boolean'],
   'lanes.gc.schedule': [86400000, 'WE_LANES_GC_SCHEDULE_MS', (v) => Number.isSafeInteger(v) && v >= 60000],
 };

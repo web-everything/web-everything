@@ -164,6 +164,10 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   'scripts/lib/daemon-overlays.mjs', 'scripts/lib/lane-repair.mjs', 'scripts/lib/overlay-adoption.mjs', 'scripts/lib/we-scan-cache.mjs',
   'scripts/readiness/forge-exec-run.mjs', 'scripts/lib/review-shadow-budget.mjs', 'scripts/readiness/reservations.mjs',
   'scripts/readiness/prepare-hold-state.mjs',
+  // Receipt archiving reserves its temp with `wx` and publishes with a no-clobber hard link.
+  'scripts/readiness/forge-receipts-archive.mjs',
+  // Forge deploy reserves record temps with `wx` and serializes writers on a flock deploy lock.
+  'scripts/readiness/forge-deploy.mjs',
   // Found by the hold scan (ci-queue-watch.mjs#withHistoryLock and its finalizer among them).
   'scripts/broadcast-inject.mjs', 'scripts/ci/refresh-timings.mjs', 'scripts/conveyor/ci-queue-watch.mjs',
   'scripts/conveyor/ci-red-recovery-watch.mjs', 'scripts/conveyor/health-watch-job.mjs', 'scripts/conveyor/infra-blocked.mjs',
@@ -207,8 +211,12 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   // review head index (an exclusive create) and the fix-ready record (an exclusive create and a lock file name).
   'scripts/conveyor/soak/breaks/infra-lock-waiter-busy-spins.mjs', 'scripts/lib/review-head-index.mjs',
   'scripts/operations/fix-ready-record.mjs',
+  // Ghost recovery owns an operation lock as well as reserving the shared rerun budget.
+  'scripts/operations/ci-ghost-rerun.mjs',
   // The ETag eviction stamp writer uses an exclusive `wx` create.
-  'scripts/lib/gh-rest-read.mjs']);
+  'scripts/lib/gh-rest-read.mjs',
+  // The freeze last-good cache writer reserves its temp file with an exclusive `wx` create before the rename.
+  'scripts/lib/freeze-last-good.mjs']);
 /** The imported names that take, renew or give up a hold (`withFileLock`, `withAddGuardLock`, `acquireFixDispatchClaim`,
  *  `tryLease`, …). */
 export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|reserve|try)\w*(?:Claim|Lease|Lock|Hold|Slot|Mutex|Reservation)\w*)$/;
@@ -249,6 +257,8 @@ export const LOCK_USERS = Object.freeze([
   'scripts/lib/drain-queue-safety.mjs', 'scripts/lib/drain-red-team-evidence.mjs', 'scripts/lib/fix-slot-borrow.mjs',
   'scripts/lib/gh-throttle-holders.mjs', 'scripts/lib/gh-throttle.mjs', 'scripts/lib/host-load.mjs',
   'scripts/lib/merge-queue-adaptive-batching.mjs', 'scripts/lib/pr-limit.mjs', 'scripts/lib/pr-list-paged.mjs', 'scripts/lib/pr-snapshot.mjs',
+  // Gate refresh takes withFileLock; enqueue reserves the pending-refresh reader lock.
+  'scripts/lib/merge-gate-refresh.mjs', 'scripts/lib/merge-queue-enqueue.mjs',
   'scripts/lib/red-team-carry-machine.mjs', 'scripts/lib/red-team-withheld-publish.mjs',
   // PR #6606: the one host-local red-team check lock (withRedTeamCheckLock over atomic-json-file#withFileLock).
   'scripts/lib/red-team-check-run.mjs',
@@ -284,7 +294,9 @@ export const LOCK_USERS = Object.freeze([
   'scripts/conveyor/pr-stall-reset.mjs',
   // Landed on main since (PR #6381, CI run 43334197514): the live-owner watch IO. The review head index is a hold-scan
   // holder (LOCK_HOLDERS) and so a seed of the scan, never a lock user.
-  'scripts/conveyor/pr-live-owner-watch-io.mjs']);
+  'scripts/conveyor/pr-live-owner-watch-io.mjs',
+  // The timeout-evidence pool probes the throttle with acquireGhSlotSync/releaseGhSlotSync.
+  'scripts/conveyor/timeout-evidence-pool.mjs']);
 // The concurrency words match ANYWHERE in the basename (`forge-slot-markers.mjs`, `lane-worker-without-lease.mjs`), not
 // only at its start (PR #6381 send-back). `**/` needs at least one folder, so each entry has a twin for scripts/ itself.
 // This also protects names holding the word inside another word (`release` holds `lease`): protecting more only ever

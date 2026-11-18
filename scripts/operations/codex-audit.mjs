@@ -99,10 +99,14 @@ export const auditResultIncludes = (result, record) => !!result && (result === r
 
 /** Latest timestamp wins, with later appended records breaking ties; foreign hashes never qualify. Records under a
  * prior question hash qualify only while inside their window; a prior WEAKENED is returned (and so blocks). */
+const FUTURE_SKEW_MS = 5 * 60 * 1000;
+
 export function findAudit(records, { head, base, questionHash, priorQuestionHashes = resolvePriorQuestionHashes(), now = Date.now(), invariantsText }) {
   if (typeof base !== 'string' || typeof head !== 'string' || !SHA.test(base) || !SHA.test(head) || questionHash !== QUESTION_HASH) return null;
   let latest = null, latestOpen = null, prior = null, priorOpen = null, sawCurrent = false;
   const scopedUsable = [];
+  const seq = new Map(); // usable record -> ledger (append) position; the later-written record outranks the earlier
+  let appended = 0;
   for (const record of records) {
     if (record?.head !== head || record.base !== base) continue;
     const isCurrent = record.questionHash === QUESTION_HASH;
@@ -114,11 +118,17 @@ export function findAudit(records, { head, base, questionHash, priorQuestionHash
       ...(Array.isArray(record.findings) ? record.findings : []),
       ...(Array.isArray(record.followUps) ? record.followUps.map(line => `FOLLOW-UP: ${line}`) : []),
     ])) continue;
+    // A self-reported time more than FUTURE_SKEW_MS ahead of now is untrustworthy: unusable (and, for a current-question
+    // record, still blocks the prior fallback above). Among usable records the LATER-WRITTEN (ledger order) one wins, never
+    // the later self-reported timestamp, so a forged far-future pass cannot outrank a subsequently appended WEAKENED.
+    // A future-dated WEAKENED still counts (fail closed): only a future-dated pass is distrusted.
+    if (record.verdict === 'NOT WEAKENED' && Date.parse(record.at) > now + FUTURE_SKEW_MS) continue;
+    seq.set(record, appended++);
     if (record.scope === 'invariants') scopedUsable.push(record);
-    if (isCurrent && record.scope !== 'invariants' && (!latestOpen || Date.parse(record.at) >= Date.parse(latestOpen.at))) latestOpen = record;
-    if (!isCurrent && record.scope !== 'invariants' && (!priorOpen || Date.parse(record.at) >= Date.parse(priorOpen.at))) priorOpen = record;
-    if (isCurrent && (!latest || Date.parse(record.at) >= Date.parse(latest.at))) latest = record;
-    if (!isCurrent && (!prior || Date.parse(record.at) >= Date.parse(prior.at))) prior = record;
+    if (isCurrent && record.scope !== 'invariants') latestOpen = record;
+    if (!isCurrent && record.scope !== 'invariants') priorOpen = record;
+    if (isCurrent) latest = record;
+    else prior = record;
   }
   // Current-question evidence decides first; even an unusable current record blocks the prior fallback.
   const selected = sawCurrent ? latest : prior;
@@ -127,23 +137,24 @@ export function findAudit(records, { head, base, questionHash, priorQuestionHash
   // R973: scoped evidence cannot erase an open WEAKENED, including under an accepted prior question hash.
   // A usable current-question open re-audit still takes precedence over every prior-question open record.
   const open = latestOpen ?? priorOpen;
-  const time = r => Date.parse(r.at);
+  const order = r => seq.get(r);
   const requiredHash = typeof invariantsText === 'string' && invariantsText.trim() && Buffer.byteLength(invariantsText, 'utf8') <= MAX_INVARIANTS_BYTES
     ? createHash('sha256').update(invariantsText).digest('hex') : null;
   const pool = scopedUsable.filter(r => (sawCurrent ? r.questionHash === QUESTION_HASH : r.questionHash !== QUESTION_HASH));
   // A scoped WEAKENED stands until a later open NOT WEAKENED re-audit or a later scoped pass BOUND to the item's
   // invariants supersedes it. An unbound scoped pass is not evidence and never hides a negative.
-  const floor = open?.verdict === 'NOT WEAKENED' ? time(open) : -Infinity;
+  // "Later" is ledger (append) order, never the self-reported timestamp.
+  const floor = open?.verdict === 'NOT WEAKENED' ? order(open) : -Infinity;
   const boundPass = r => r.verdict === 'NOT WEAKENED' && requiredHash !== null && r.invariantsHash === requiredHash;
-  const scopedWeak = pool.filter(r => r.verdict === 'WEAKENED' && time(r) > floor && !pool.some(p => p !== r && boundPass(p) && time(p) >= time(r)))
-    .sort((x, y) => time(x) - time(y));
+  const scopedWeak = pool.filter(r => r.verdict === 'WEAKENED' && order(r) > floor && !pool.some(p => p !== r && boundPass(p) && order(p) > order(r)))
+    .sort((x, y) => order(x) - order(y));
   const blockers = [...(open?.verdict === 'WEAKENED' ? [open] : []), ...scopedWeak];
   if (!blockers.length) return selected;
   if (blockers.length === 1) return blockers[0];
   // Independent negatives (an open WEAKENED and/or several scoped WEAKENED) never hide each other: one blocker carries
   // every disclosure, so a ruling must name all of them. Provenance fields come from every source, never just one.
   const findingsOf = r => (Array.isArray(r.findings) && r.findings.length ? r.findings : ['scoped WEAKENED without disclosed findings']);
-  const lastBlocker = blockers.reduce((x, y) => (time(y) >= time(x) ? y : x));
+  const lastBlocker = blockers.reduce((x, y) => (order(y) >= order(x) ? y : x));
   const merged = { ...lastBlocker, verdict: 'WEAKENED', at: lastBlocker.at,
     questionHash: blockers.find(r => r.questionHash !== QUESTION_HASH)?.questionHash ?? QUESTION_HASH,
     fingerprint: blockers.every(r => r.fingerprint === blockers[0].fingerprint) ? blockers[0].fingerprint : undefined,

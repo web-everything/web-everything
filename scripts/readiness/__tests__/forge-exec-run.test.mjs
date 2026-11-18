@@ -348,6 +348,7 @@ if (process.argv[2] !== 'ci') {
 }
 `,{mode:0o755});
     expect(await runner.run(request)).toMatchObject({code:0,stdout:'é😀',stderr:'é😀'});
+    expect((await runner.telemetry()).recent[0]).not.toHaveProperty('failureTail');
   });
   it('refuses an overlapping run and rechecks its input after the first worker substitutes its assertions', async () => {
     const other = createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin'});
@@ -453,6 +454,31 @@ process.stdout.write('x'.repeat(4*1024*1024+1));
     expect((await runner.run(request)).code).toBe(97);
     expect(await runner.finish(request)).toMatchObject({phase:'install',code:97});
     await expect(stat(join(work,'task-seen'))).rejects.toThrow();
+  });
+  it.each([
+    ['last 20 stderr lines', Array.from({length:30},(_,i)=>`install line ${i+1}`).join('\n')+'\n',
+      Array.from({length:20},(_,i)=>`install line ${i+11}`).join('\n')],
+    ['UTF-8 byte cap keeps newest output', '😀'.repeat(600)+'END\n', '😀'.repeat(127)+'END'],
+    ['control characters removed without redaction', 'old\n\x00\x07\t\x1bsecret=value\x7f\x85\r\n', 'npm ci failed: old\nsecret=value'],
+  ])('publishes install exit 97 failureTail: %s', async (_name,stderr,expected) => {
+    await writeFile(join(root,'bin','npm'),`#!${process.execPath}\nprocess.stderr.write(${JSON.stringify(stderr)}); process.exitCode=1;\n`,{mode:0o755});
+    expect((await runner.run(request)).code).toBe(97);
+    const recent=(await runner.telemetry()).recent[0];
+    expect(recent).toMatchObject({code:97,failureTail:expected});
+    expect(Buffer.byteLength(recent.failureTail)).toBeLessThanOrEqual(512);
+    const receipt=await runner.finish(request);
+    expect(receipt).toMatchObject({phase:'install',code:97});
+    expect(receipt).not.toHaveProperty('failureTail');
+  });
+  it('publishes supervisor exit 254 failureTail', async () => {
+    let calls=0;
+    runner=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',testWorkerExec:async()=>{
+      if(++calls===2) throw new Error('supervisor diagnostic\x00');
+      return {code:0,stdout:'',stderr:''};
+    }});
+    expect((await runner.run(request)).code).toBe(254);
+    expect((await runner.telemetry()).recent[0]).toMatchObject({code:254,failureTail:'supervisor diagnostic'});
+    expect(await runner.finish(request)).toMatchObject({phase:'supervisor',code:254});
   });
   it('does not reuse labels, rejects invalid run names, and consumes prepared state once', async () => {
     const other = await runner.prepare({nonce:request.nonce,label:'abcdef-1'});
@@ -891,7 +917,10 @@ with patch.object(os, 'open', side_effect=local_open), \
     await rm(active,{recursive:true});
     const inactive=runSweepFixture(root);
     expect(inactive.status,inactive.stderr).toBe(0);
-    for(const path of [oldRun,oldReceipt]) await expect(stat(path)).rejects.toThrow();
+    await expect(stat(oldRun)).rejects.toMatchObject({code:'ENOENT'});
+    expect(await readFile(oldReceipt,'utf8')).toBe('old');
+    expect(inactive.summary.counts.receiptFiles).toBe(0);
+    expect(inactive.summary.skips).toContainEqual({consumer:'receipts',reason:expect.stringContaining('forge-receipts-archive.mjs')});
     // Cache retention belongs to forge-cache-prune; the execution sweeper never deletes cache entries.
     expect((await stat(oldCache)).isDirectory()).toBe(true);
     expect((await stat(newCache)).isDirectory()).toBe(true);
@@ -913,8 +942,8 @@ with patch.object(os, 'open', side_effect=local_open), \
         const path=join(root,'receipts',run+'.'+phase),content=JSON.stringify({run,phase,lock:'e'.repeat(64)});
         await writeFile(path,content);await utimes(path,expired,expired);evidence.push([path,content]);
       }
-      // No live record protects these artifacts: uncertain reservation evidence
-      // alone must keep both the legacy run directory and expired telemetry.
+      // Uncertain reservation evidence protects the legacy run directory;
+      // receipt retention belongs to the archiver regardless of reservations.
       const orphan='r-'+'9'.repeat(32),orphanDir=join(root,'runs',orphan),orphanTelemetry=join(root,'receipts',orphan+'.telemetry');
       await mkdir(orphanDir);await writeFile(orphanTelemetry,'orphan evidence');
       for(const path of [orphanDir,orphanTelemetry])await utimes(path,expired,expired);
@@ -929,7 +958,9 @@ fs.readFile=async (path,...args)=>{
 };`:'';
       const result=runSweepFixture(root,{before});
       expect(result.status,result.stderr).toBe(0);
-      expect(result.summary.skips).toEqual(expect.arrayContaining([expect.objectContaining({consumer:'receipts',reason:expect.stringContaining('preserving expired receipts')})]));
+      expect(result.summary.skips).toContainEqual(expect.objectContaining({consumer:'slots',reason:expect.stringContaining('unreadable reservation')}));
+      expect(result.summary.skips).toContainEqual({consumer:'receipts',reason:expect.stringContaining('forge-receipts-archive.mjs')});
+      expect(result.summary.counts.receiptFiles).toBe(0);
       expect(result.summary.refusals).toEqual([]);
       expect((await stat(active)).isDirectory()).toBe(true);
       for(const [path,content] of evidence)expect(await readFile(path,'utf8')).toBe(content);
@@ -937,16 +968,23 @@ fs.readFile=async (path,...args)=>{
       expect(await readFile(orphanTelemetry,'utf8')).toBe('orphan evidence');
       expect(await readFile(join(cache,'dependencies.tar'),'utf8')).toBe('dependency contents');
       // Live records belong to the runner reaper. Once it clears them and the
-      // operator removes the uncertain reservation, retention makes progress.
+      // operator removes the uncertain reservation, execution cleanup makes
+      // progress while telemetry remains available for verified archiving.
       await rm(active,{recursive:true});
       for(const [path] of evidence.filter(([path])=>!path.endsWith('.telemetry')))await rm(path);
       const released=runSweepFixture(root,{before});
       expect(released.status,released.stderr).toBe(0);
-      for(const path of [orphanDir,orphanTelemetry,...evidence.map(([path])=>path)])await expect(stat(path)).rejects.toMatchObject({code:'ENOENT'});
+      await expect(stat(orphanDir)).rejects.toMatchObject({code:'ENOENT'});
+      for(const [path,content] of evidence){
+        if(path.endsWith('.telemetry'))expect(await readFile(path,'utf8')).toBe(content);
+        else await expect(stat(path)).rejects.toMatchObject({code:'ENOENT'});
+      }
+      expect(await readFile(orphanTelemetry,'utf8')).toBe('orphan evidence');
+      expect(released.summary.counts.receiptFiles).toBe(0);
       expect(await readFile(join(cache,'dependencies.tar'),'utf8')).toBe('dependency contents');
     });
   it.each(['held','old with live UID','abandoned without live UID','abandoned with zombie UID','historical without writer protocol'])(
-    'prunes unrelated expired telemetry and receipts, leaving caches alone, with reservation %s',async mode=>{
+    'prunes unrelated expired execution directories while retaining receipts and caches, with reservation %s',async mode=>{
       const run='r-'+ 'a'.repeat(32),other='r-'+ 'b'.repeat(32),lock='c'.repeat(64);
       const slot=join(root,'runs/slot-1'),idle=join(root,'runs/slot-2'),reservation=join(root,'receipts/worker-active-1');
       const proc=join(root,'proc');await mkdir(proc);
@@ -975,7 +1013,9 @@ fs.readFile=async (path,...args)=>{
         expect(result.summary.skips).toContainEqual(expect.objectContaining({reason:'worker UID still has processes'}));
       }
       expect((await stat(writer)).ino).toBe(writerInode);
-      for(const path of [join(idle,other),unrelatedReceipt,unrelatedTelemetry])await expect(stat(path)).rejects.toMatchObject({code:'ENOENT'});
+      await expect(stat(join(idle,other))).rejects.toMatchObject({code:'ENOENT'});
+      for(const path of [unrelatedReceipt,unrelatedTelemetry])expect(await readFile(path,'utf8')).toBe('expired');
+      expect(result.summary.counts.receiptFiles).toBe(0);
       // Cache retention is owned by forge-cache-prune: every cache entry survives the sweep.
       for(const path of [join(root,'cache/unrelated'),join(root,'cache',lock),recent,join(root,'cache/recent')])expect(await stat(path)).toBeDefined();
       // A zombie still has its UID in /proc; the sweeper conservatively keeps

@@ -574,10 +574,10 @@ describe('canonicalAuditEvidence', () => {
     expect(prototypeLoad.canonicalAuditEvidence([auditRecord({ verdict: 'WEAKENED' })], SHA))
       .toEqual({ ok: false, reason: 'weakened' });
   });
-  it.each([false, true])('latest timestamp defeats an older pass regardless of file order (reverse=%s)', reverse => {
-    const records = [auditRecord(), auditRecord({ at: '2026-10-21T12:00:00Z', verdict: 'WEAKENED' })];
-    expect(prototypeLoad.canonicalAuditEvidence(reverse ? records.reverse() : records, SHA))
-      .toEqual({ ok: false, reason: 'weakened' });
+  it('the later-appended record decides, whatever timestamps it reports', () => {
+    const pass = auditRecord(), weak = auditRecord({ at: '2026-10-21T12:00:00Z', verdict: 'WEAKENED' });
+    expect(prototypeLoad.canonicalAuditEvidence([pass, weak], SHA)).toEqual({ ok: false, reason: 'weakened' });
+    expect(prototypeLoad.canonicalAuditEvidence([weak, pass], SHA).ok).toBe(true);
   });
   it('a pass over another base never masks a WEAKENED audit of a different base (fail closed)', () => {
     const later = auditRecord({ at: '2026-10-21T12:00:00Z', base: MERGE });
@@ -2388,7 +2388,7 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
     const PRIOR = 'c'.repeat(64);
     const invariantsText = '- Preserve the guard.\n';
     const invariantsHash = createHash('sha256').update(invariantsText).digest('hex');
-    const opts = { invariantsText, priorQuestionHashes: [{ hash: PRIOR, acceptUntil: '2026-10-30T00:00:00Z' }], now: Date.parse('2026-10-21T00:00:00Z') };
+    const opts = { invariantsText, priorQuestionHashes: [{ hash: PRIOR, acceptUntil: '2026-10-30T00:00:00Z' }], now: Date.parse('2026-10-22T13:00:00Z') };
     const prior = () => old({ questionHash: PRIOR });
     const carry = (...records) => prototypeLoad.canonicalAuditEvidence(records, SHA, () => true, FP, opts);
     it('the carried prior pass alone is a pass (the setting is live in this path)', () => {

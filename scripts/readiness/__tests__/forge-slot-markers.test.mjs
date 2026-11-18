@@ -3,9 +3,10 @@ import {describe, it, expect, afterEach} from 'vitest';
 import {readdirSync, readFileSync, mkdirSync, renameSync, mkdtempSync, writeFileSync, existsSync, rmSync, utimesSync, statSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
+import {EventEmitter} from 'node:events';
 import {lockDirFor} from '../file-locks.mjs';
 import {parseTelemetry, easternTimestamp} from '../forge-exec-run.mjs';
-import {createMarkerReaper, markerContent, blockedSlots, heldTombstone, recordMarkerRun, runVerdict} from '../forge-slot-markers.mjs';
+import {createMarkerReaper, markerContent, blockedSlots, heldTombstone, recordMarkerRun, recordMarkerExit, watchMarkerExit, runVerdict, RUNLESS_DEAD_GRACE_MS} from '../forge-slot-markers.mjs';
 
 const roots = [];
 afterEach(() => { for (const r of roots.splice(0)) rmSync(r, {recursive: true, force: true}); });
@@ -26,6 +27,216 @@ const done = (runId, code = 0) => ({runId, startedAtET: iso(NOW - 700_000), code
 const going = (runId, startedMs = NOW - 700_000) => ({runId, startedAtET: iso(startedMs), code: null});
 const liveness = dead => pid => (dead.includes(pid) ? 'dead' : 'alive');
 const names = root => ['0', '1', '2'].filter(i => existsSync(join(root, `slot-${i}.unconfirmed`)));
+
+describe('R1017 run-less dead-owner recovery', () => {
+  function fixture({minutes = 15, state = 'dead', change = () => {}} = {}) {
+    const root = setup({0: {pid: 111}}), file = join(root, 'slot-0.unconfirmed');
+    // The live failure shape: death before any run id or nonce was recorded.
+    writeFileSync(file, JSON.stringify({v: 1, note: 'remote termination unconfirmed', host: 'forge',
+      owner: 'remote-111-aabbcc', pid: 111, at: NOW - 600_000}));
+    utimesSync(file, (NOW - 600_000) / 1000, (NOW - 600_000) / 1000);
+    const st = statSync(file);
+    writeFileSync(file + '.dead', JSON.stringify({key: `slot-0.unconfirmed:${st.ino}:${st.mtimeMs}`, at: NOW}));
+    let sampledMs = NOW + minutes * 60_000;
+    const ids = Array.from({length: 7}, (_, i) => 'r-' + (i + 1).toString(16).padStart(32, '0'));
+    const telemetry = {sampledAtET: iso(sampledMs), activeRuns: 7, activeRunIds: ids,
+      recent: ids.map(id => going(id, NOW + 60_001))};
+    change(telemetry);
+    const events = [];
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => sampledMs, liveness: () => state,
+      stuckMinSlots: 1, signal: event => events.push(event)});
+    return {file, root, reaper, events, sample: async () => telemetry,
+      sampleAt: ms => { sampledMs = ms; telemetry.sampledAtET = iso(ms); }};
+  }
+  it.each([15, 28])('releases the exact seven-active-run live failure shape at %s minutes', async minutes => {
+    expect(RUNLESS_DEAD_GRACE_MS).toBe(15 * 60_000);
+    const f = fixture({minutes});
+    expect(existsSync(f.file + '.run')).toBe(false);
+    expect(await f.reaper.step(f.sample)).toEqual(['slot-0.unconfirmed']);
+    expect(existsSync(f.file)).toBe(false);
+    expect(existsSync(f.file + '.dead')).toBe(false);
+  });
+  it('accepts a dead-owner request starting after the 15-minute release, even if still active at 28 minutes', async () => {
+    // R1017 explicitly accepts this residual: a dispatched request might start MORE than 15 minutes
+    // after owner death. Release can add one concurrent Forge run until it finishes, within Forge's cap;
+    // no run is killed and the dead owner cannot collect a result. This is not a remote start deadline.
+    const f = fixture();
+    expect(await f.reaper.step(f.sample)).toEqual(['slot-0.unconfirmed']);
+    expect([...blockedSlots(f.root, 1)]).toEqual([]);
+    const telemetry = await f.sample();
+    telemetry.activeRunIds.push(RUN_A);
+    telemetry.activeRuns++;
+    telemetry.recent.push(going(RUN_A, NOW + 16 * 60_000));
+    f.sampleAt(NOW + 28 * 60_000);
+    expect(await f.reaper.step(f.sample)).toEqual([]);
+    expect(existsSync(f.file)).toBe(false);
+    expect(telemetry.recent.find(item => item.runId === RUN_A).code).toBe(null);
+    // First observing the same delayed request at 28 minutes also permits release under the ruling.
+    const late = fixture({minutes: 28, change: t => {
+      t.activeRunIds.push(RUN_A);
+      t.activeRuns++;
+      t.recent.push(going(RUN_A, NOW + 16 * 60_000));
+    }});
+    expect(await late.reaper.step(late.sample)).toEqual(['slot-0.unconfirmed']);
+  });
+  it.each([
+    ['14 minutes', {minutes: 14}],
+    ['possibly live owner', {state: 'unknown'}], ['live owner', {state: 'alive'}],
+    ['active receipt missing', {change: t => { t.recent.pop(); }}],
+    ['unparseable active start', {change: t => { t.recent[0].startedAtET = 'bad'; }}],
+    ['active start inside window', {change: t => { t.recent[0].startedAtET = iso(NOW); }}],
+    ['null-code receipt inside window', {change: t => { t.recent.push(going(RUN_A, NOW)); }}],
+    ['97 receipt inside window', {change: t => { t.recent.push({...going(RUN_A, NOW), code: 97}); }}],
+    ['254 receipt inside window', {change: t => { t.recent.push({...going(RUN_A, NOW), code: 254}); }}],
+    ['missing activeRunIds', {change: t => { delete t.activeRunIds; }}],
+    ['mismatched activeRunIds', {change: t => { t.activeRuns++; }}],
+    ['stale sample', {change: t => { t.sampledAtET = iso(NOW + 15 * 60_000 - 30_001); }}],
+  ])('fails closed on %s', async (_label, options) => {
+    const f = fixture(options);
+    expect(await f.reaper.step(f.sample)).toEqual([]);
+    expect(existsSync(f.file)).toBe(true);
+  });
+  it('requires the persisted death stamp, rather than marker age alone', async () => {
+    const f = fixture();
+    rmSync(f.file + '.dead');
+    expect(await f.reaper.step(f.sample)).toEqual([]);
+    expect(existsSync(f.file)).toBe(true);
+  });
+  it('requires the marker itself to be at least 15 minutes old', async () => {
+    const f = fixture(), st = statSync(f.file);
+    // Preserve the old death stamp for this inode/mtime while the marker's dispatch timestamp is newer.
+    const marker = JSON.parse(readFileSync(f.file, 'utf8'));
+    writeFileSync(f.file, JSON.stringify({...marker, at: NOW + 60_000}));
+    utimesSync(f.file, st.atime, st.mtime);
+    expect(await f.reaper.step(f.sample)).toEqual([]);
+    expect(existsSync(f.file)).toBe(true);
+  });
+  it('fails closed when the marker dispatch timestamp is missing', async () => {
+    const f = fixture(), st = statSync(f.file);
+    const marker = JSON.parse(readFileSync(f.file, 'utf8'));
+    delete marker.at;
+    writeFileSync(f.file, JSON.stringify(marker));
+    utimesSync(f.file, st.atime, st.mtime);
+    expect(await f.reaper.step(f.sample)).toEqual([]);
+    expect(existsSync(f.file)).toBe(true);
+  });
+  it('reports an operator-visible stuck slot when receipts exceed the retained window', async () => {
+    const f = fixture({change: t => {
+      t.activeRunIds = Array.from({length: 51}, (_, i) => 'r-' + (i + 1).toString(16).padStart(32, '0'));
+      t.activeRuns = 51;
+      t.recent = t.activeRunIds.slice(0, 50).map(id => going(id, NOW + 60_001));
+    }});
+    expect(await f.reaper.step(f.sample)).toEqual([]);
+    expect(f.events).toContainEqual(expect.objectContaining({kind: 'stuck-slots'}));
+  });
+});
+
+describe('R1017 marker traceability', () => {
+  const caller = {kind: 'selected', session: 'test-session', ppid: 22, cmd: 'npm'};
+  const tags = {caller, lane: 14, pr: 1017};
+  it('serializes pid, caller, lane and PR while tolerating absent optional fields', async () => {
+    const text = markerContent({owner: 'o', pid: 111, nowMs: NOW - 600_000, host: 'forge', ...tags});
+    expect(JSON.parse(text)).toMatchObject({pid: 111, ...tags});
+    const root = setup({0: {pid: 111}});
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
+    expect(await reaper.step(tel(0))).toEqual(['slot-0.unconfirmed']);
+  });
+  it.each([
+    {caller: null}, {caller: []}, {caller: {ppid: '22'}}, {caller: {ppid: -1}},
+    {caller: {kind: 4}}, {caller: {session: 'bad\ntext'}}, {caller: {unknown: 'x'}},
+    {caller: {cmd: 'npm run'}}, {caller: {cmd: '/bin/npm'}}, {caller: {cmd: 'a'.repeat(41)}},
+    {lane: {}}, {lane: -1}, {lane: ''}, {pr: '1017'}, {pr: 0},
+  ])('treats a malformed present trace field as unreadable: %j', async bad => {
+    const root = setup({0: {pid: 111}}), file = join(root, 'slot-0.unconfirmed');
+    // Raw bytes, not markerContent: the writer now normalises these away; the reader must still refuse them on disk.
+    writeFileSync(file, JSON.stringify({v: 1, note: 'remote termination unconfirmed', host: 'forge', owner: 'o', pid: 111,
+      at: NOW - 600_000, ...bad}) + '\n');
+    utimesSync(file, (NOW - 600_000) / 1000, (NOW - 600_000) / 1000);
+    let probes = 0;
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: () => 'dead'});
+    expect(await reaper.step(async () => { probes++; return await tel(0)(); })).toEqual([]);
+    expect(probes).toBe(0);
+    expect(existsSync(file)).toBe(true);
+  });
+  it.each([
+    [{caller: null}, {}], [{caller: []}, {}], [{caller: {ppid: '22'}}, {}], [{caller: {ppid: -1, kind: 'files'}}, {caller: {kind: 'files'}}],
+    [{caller: {ppid: 1.5}}, {}], [{caller: {kind: 4, ppid: 3}}, {caller: {ppid: 3}}], [{caller: {session: 'bad\ntext'}}, {}],
+    [{caller: {session: ''}}, {}], [{caller: {session: 's'.repeat(201)}}, {}], [{caller: {unknown: 'x', cmd: 'npm'}}, {caller: {cmd: 'npm'}}],
+    [{caller: {cmd: 'npm run'}}, {}], [{caller: {cmd: '/bin/npm'}}, {}], [{caller: {cmd: 'a'.repeat(41)}}, {}],
+    [{lane: {}}, {}], [{lane: -1}, {}], [{lane: ''}, {}], [{pr: '1017'}, {}], [{pr: 0}, {}],
+  ])('the writer omits any tag the reader would reject, so the marker stays readable and reapable: %j', async (bad, kept) => {
+    const root = setup({0: {pid: 111}}), file = join(root, 'slot-0.unconfirmed');
+    writeFileSync(file, markerContent({owner: 'o', pid: 111, nowMs: NOW - 600_000, host: 'forge', ...bad}));
+    utimesSync(file, (NOW - 600_000) / 1000, (NOW - 600_000) / 1000);
+    const written = JSON.parse(readFileSync(file, 'utf8'));
+    expect({caller: written.caller, lane: written.lane, pr: written.pr}).toEqual({caller: undefined, lane: undefined, pr: undefined, ...kept});
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: () => 'dead'});
+    expect(await reaper.step(tel(0))).toEqual(['slot-0.unconfirmed']);
+  });
+  it.each([
+    [{run: 'bogus'}, 'run'], [{run: RUN_A + '\n'}, 'run'], [{host: null}, 'host'], [{owner: 7}, 'owner'],
+    [{pid: 1.5}, 'pid'], [{nowMs: Number.NaN}, 'at'],
+  ])('the writer omits a core field the reader would reject instead of writing an unreadable marker: %j', async (bad, field) => {
+    const root = setup({}), file = join(root, 'slot-0.unconfirmed');
+    writeFileSync(file, markerContent({owner: 'o', pid: 111, nowMs: NOW - 600_000, host: 'forge', ...bad}));
+    utimesSync(file, (NOW - 600_000) / 1000, (NOW - 600_000) / 1000);
+    expect(JSON.parse(readFileSync(file, 'utf8'))).not.toHaveProperty(field);
+    if (field === 'run') { // a dropped run leaves a readable run-less marker, released by the idle-Forge path
+      const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: () => 'dead'});
+      expect(await reaper.step(tel(0))).toEqual(['slot-0.unconfirmed']);
+    }
+  });
+  it.each([0, 1])('releases a dead owner on idle Forge alike for caller.ppid %s (0 = parent outside the PID namespace)', async ppid => {
+    const root = setup({0: {pid: 111}}), file = join(root, 'slot-0.unconfirmed');
+    const caller = {kind: 'files', session: 'fix-7024', ppid, cmd: 'npm'};
+    writeFileSync(file, markerContent({owner: 'o', pid: 111, nowMs: NOW - 600_000, host: 'forge', caller, lane: 0, pr: 7024}));
+    utimesSync(file, (NOW - 600_000) / 1000, (NOW - 600_000) / 1000);
+    expect(JSON.parse(readFileSync(file, 'utf8')).caller).toEqual(caller);
+    const logs = [];
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111]), log: line => logs.push(line)});
+    expect(await reaper.step(tel(0))).toEqual(['slot-0.unconfirmed']);
+    const line = logs.find(text => text.includes('released unconfirmed'));
+    expect(JSON.parse(line.slice(line.indexOf('{'), line.lastIndexOf('}') + 1))).toMatchObject({caller, lane: 0, pr: 7024, pid: 111});
+  });
+  it.each([false, true])('includes per-slot trace and exit evidence in release logs and stuck details (record=%s)', async withExit => {
+    const root = setup({0: {pid: 111}}), file = join(root, 'slot-0.unconfirmed');
+    writeFileSync(file, markerContent({owner: 'o', pid: 111, nowMs: NOW - 600_000, host: 'forge', ...tags}));
+    utimesSync(file, (NOW - 600_000) / 1000, (NOW - 600_000) / 1000);
+    const exit = withExit ? {owner: 'o', code: 143, signal: 'SIGTERM', at: NOW - 300_000} : 'no-exit-record';
+    if (withExit) recordMarkerExit(file, exit);
+    const logs = [], events = [];
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111]),
+      stuckMinSlots: 1, stuckAgeMs: 1, log: line => logs.push(line), signal: event => events.push(event)});
+    expect(await reaper.step(tel(1, undefined, [going(RUN_A, NOW)]))).toEqual([]);
+    expect(events.find(e => e.kind === 'stuck-slots').detail.markers).toContainEqual({name: 'slot-0.unconfirmed', run: null, pid: 111, ...tags, exit});
+    expect(await reaper.step(tel(0))).toEqual(['slot-0.unconfirmed']);
+    const line = logs.find(text => text.includes('released unconfirmed'));
+    const data = JSON.parse(line.slice(line.indexOf('{'), line.lastIndexOf('}') + 1));
+    expect(data).toMatchObject({pid: 111, ...tags, ...(withExit ? {exit} : {})}); // the release line omits an absent exit record; stuck details carry no-exit-record
+    expect(existsSync(file + '.exit')).toBe(false);
+  });
+  it('writes synchronously on client exit and preserves a recorded signal with a fake process', () => {
+    const root = setup({0: {pid: 111}}), file = join(root, 'slot-0.unconfirmed'), client = new EventEmitter();
+    const watcher = watchMarkerExit({files: [file], owner: 'o', clock: () => NOW, client});
+    client.emit('exit', 7);
+    expect(JSON.parse(readFileSync(file + '.exit', 'utf8'))).toEqual({owner: 'o', code: 7, signal: null, at: NOW});
+    expect(statSync(file + '.exit').mode & 0o777).toBe(0o600);
+    watcher.record(143, 'SIGTERM');
+    client.emit('exit', 143);
+    expect(JSON.parse(readFileSync(file + '.exit', 'utf8'))).toEqual({owner: 'o', code: 143, signal: 'SIGTERM', at: NOW});
+    watcher.stop();
+    expect(client.listenerCount('exit')).toBe(0);
+  });
+  it('never throws or writes exit evidence for a successor or unwritable marker', () => {
+    const root = setup({0: {pid: 111}}), file = join(root, 'slot-0.unconfirmed'), client = new EventEmitter();
+    const watcher = watchMarkerExit({files: [file], owner: 'predecessor', clock: () => NOW, client});
+    expect(() => client.emit('exit', 0)).not.toThrow();
+    expect(existsSync(file + '.exit')).toBe(false);
+    rmSync(file);
+    expect(() => client.emit('exit', 1)).not.toThrow();
+    watcher.stop();
+  });
+});
 
 describe('stale remote slot markers (perf10)', () => {
   it.each([97, 254])('does not classify supervisor failure code %s as confirmed cleanup while Forge is active', async code => {
@@ -546,6 +757,116 @@ describe('stale remote slot markers (perf10)', () => {
     const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
     const telemetry = {sampledAtET: iso(NOW + 120_000), activeRuns: 0, ...(recent === undefined ? {} : {recent})};
     expect(await reaper.step(async () => telemetry)).toEqual([]);
+    expect(names(root)).toEqual(['0']);
+  });
+});
+
+// Leaked run-less markers (client died before prepare returned) walled off the cap while Forge was idle: a busy
+// Forge (activeRuns > 0) never proved a run-less marker idle, so only a zero-active sample could release it.
+describe('bounded orphan release of run-less markers', () => {
+  const BOUND = 120 * 60_000, SKEW = 60_000;
+  const unrelated = going(RUN_B, NOW + SKEW + 1);
+  const withIds = (sampledMs, ids, recent = []) => async () => ({sampledAtET: iso(sampledMs), activeRuns: ids.length, activeRunIds: ids, recent});
+  const make = () => {
+    const root = setup({0: {pid: 111}});
+    return {root, reaper: createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])})};
+  };
+  it('releases a dead-owner run-less marker on a busy Forge once any run it could own is older than the run ceiling', async () => {
+    const {root, reaper} = make();
+    expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1_000, [RUN_B], [unrelated]))).toEqual(['slot-0.unconfirmed']);
+    expect(names(root)).toEqual([]);
+  });
+  it('keeps it when the sample is not yet past the run ceiling plus skew after the owner was first seen dead', async () => {
+    const {root, reaper} = make();
+    expect(await reaper.step(withIds(NOW + BOUND + SKEW - 1_000, [RUN_B], [unrelated]))).toEqual([]);
+    expect(names(root)).toEqual(['0']);
+  });
+  it('keeps it when Forge does not list its active run ids (count-only telemetry)', async () => {
+    const {root, reaper} = make();
+    expect(await reaper.step(tel(1, NOW + BOUND + SKEW + 1_000))).toEqual([]);
+    expect(names(root)).toEqual(['0']);
+  });
+  it('keeps it when an unfinished run started inside its possible window is still listed', async () => {
+    const {root, reaper} = make();
+    expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1_000, [RUN_B], [going(RUN_B, NOW + 1_000)]))).toEqual([]);
+    expect(names(root)).toEqual(['0']);
+  });
+  it.each([97, 254])('keeps it when a code-%s receipt (surviving descendants possible) started inside its window', async code => {
+    const {root, reaper} = make();
+    const failure = {...done(RUN_A, code), startedAtET: iso(NOW - 1_000)};
+    expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1_000, [RUN_B], [unrelated, failure]))).toEqual([]);
+    expect(names(root)).toEqual(['0']);
+  });
+  it.each([97, 254].flatMap(code => ['same reaper', 'restarted reaper', 'first observed after eviction'].map(observation => ({code, observation}))))(
+    'retains an active slot after its supervisor-failure receipt is evicted: %j', async ({code, observation}) => {
+      const {root, reaper} = make();
+      const failure = {...done(RUN_A, code), startedAtET: iso(NOW - 1_000)};
+      if (observation !== 'first observed after eviction') {
+        expect(await reaper.step(withIds(NOW + 120_000, [RUN_A], [failure]))).toEqual([]);
+      }
+      const current = observation === 'restarted reaper'
+        ? createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])}) : reaper;
+      const newer = Array.from({length: 50}, (_, i) => ({
+        ...done('r-' + i.toString(16).padStart(32, '0')), startedAtET: iso(NOW + SKEW + 1 + i),
+      }));
+      expect(await current.step(withIds(NOW + BOUND + SKEW + 1, [RUN_A], newer))).toEqual([]);
+      expect([...blockedSlots(root, 1)]).toEqual([0]);
+      // An authoritative idle sample can still settle the run-less marker.
+      expect(await current.step(withIds(NOW + BOUND + SKEW + 2, [], newer))).toEqual(['slot-0.unconfirmed']);
+    });
+  it('never applies to a live owner', async () => {
+    const root = setup({0: {pid: 111}});
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([])});
+    expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1_000, [RUN_B], [unrelated]))).toEqual([]);
+    expect(names(root)).toEqual(['0']);
+  });
+  it.each([-1, 0, 1])('requires the sample strictly past the ceiling plus skew (offset %s ms)', async offset => {
+    const {root, reaper} = make();
+    const released = offset > 0;
+    expect(await reaper.step(withIds(NOW + BOUND + SKEW + offset, [RUN_B], [unrelated]))).toEqual(released ? ['slot-0.unconfirmed'] : []);
+    expect(names(root)).toEqual(released ? [] : ['0']);
+  });
+  it.each([null, [], [RUN_B, RUN_B], ['invalid']])('keeps the marker with invalid authoritative active ids: %j', async activeRunIds => {
+    const {root, reaper} = make();
+    expect(await reaper.step(async () => ({sampledAtET: iso(NOW + BOUND + SKEW + 1), activeRuns: 1, activeRunIds, recent: []}))).toEqual([]);
+    expect(names(root)).toEqual(['0']);
+  });
+  it.each([null, 97, 254].flatMap(code => [NOW - 660_001, NOW - 660_000, NOW + SKEW, NOW + SKEW + 1].map(startedMs => ({code, startedMs}))))(
+    'guards the inclusive receipt window even when the receipt is absent from active ids: %j', async ({code, startedMs}) => {
+      const {root, reaper} = make();
+      const keep = startedMs >= NOW - 660_000 && startedMs <= NOW + SKEW;
+      const recent = [unrelated, {runId: RUN_A, code, startedAtET: iso(startedMs)}];
+      expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1, [RUN_B], recent))).toEqual(keep ? [] : ['slot-0.unconfirmed']);
+      expect(names(root)).toEqual(keep ? ['0'] : []);
+    });
+  it.each([{recent: []}, {recent: [unrelated]}])('keeps it when receipts cannot place every active run outside its window: %j', async ({recent}) => {
+    const {root, reaper} = make();
+    expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1, [RUN_A, RUN_B], recent))).toEqual([]);
+    expect([...blockedSlots(root, 1)]).toEqual([0]);
+  });
+  it.each([null, 0, 97, 254].flatMap(code => [NOW - 660_001, NOW - 660_000, NOW + SKEW, NOW + SKEW + 1].map(startedMs => ({code, startedMs}))))(
+    'requires each active run to be strictly outside the ownership window regardless of receipt code: %j', async ({code, startedMs}) => {
+      const {root, reaper} = make();
+      const keep = startedMs >= NOW - 660_000 && startedMs <= NOW + SKEW;
+      const recent = [unrelated, {runId: RUN_A, code, startedAtET: iso(startedMs)}];
+      expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1, [RUN_A, RUN_B], recent))).toEqual(keep ? [] : ['slot-0.unconfirmed']);
+      expect(names(root)).toEqual(keep ? ['0'] : []);
+    });
+  it('retains and signals a stuck slot when active runs exceed the 50-receipt window', async () => {
+    const root = setup({0: {pid: 111}}), signals = [];
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111]),
+      stuckMinSlots: 1, signal: event => signals.push(event)});
+    const ids = Array.from({length: 51}, (_, i) => 'r-' + i.toString(16).padStart(32, '0'));
+    const recent = ids.slice(0, 50).map(run => going(run, NOW + SKEW + 1));
+    expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1, ids, recent))).toEqual([]);
+    expect([...blockedSlots(root, 1)]).toEqual([0]);
+    expect(signals.some(event => event.kind === 'stuck-slots')).toBe(true);
+  });
+  it.each(['inline', 'sidecar'])('does not apply the bound to a marker with a %s run id', async binding => {
+    const root = setup({0: {pid: 111, run: binding === 'inline' ? RUN_A : undefined}});
+    if (binding === 'sidecar') recordMarkerRun(join(root, 'slot-0.unconfirmed'), {owner: 'o', run: RUN_A});
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
+    expect(await reaper.step(withIds(NOW + BOUND + SKEW + 1, [RUN_A, RUN_B]))).toEqual([]);
     expect(names(root)).toEqual(['0']);
   });
 });

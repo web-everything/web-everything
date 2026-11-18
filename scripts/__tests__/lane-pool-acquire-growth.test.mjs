@@ -25,9 +25,10 @@
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import { sharedRepos, withGhStub } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
-import { writeFileSync, mkdtempSync, rmSync, mkdirSync, chmodSync } from 'node:fs';
+import { writeFileSync, readFileSync, existsSync, mkdtempSync, rmSync, mkdirSync, chmodSync } from 'node:fs';
 import { resolve, join, basename } from 'node:path';
 import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
 
 const SCRIPT = resolve(process.cwd(), 'scripts/lane-pool.mjs');
 
@@ -42,7 +43,7 @@ function runPool(args, extraEnv = {}) {
     encoding: 'utf8',
     timeout: 30_000,
     killSignal: 'SIGKILL',
-    env: withGhStub({ ...process.env, LANE_POOL_NO_RECOVER: '1', LANE_POOL_ROOT: poolRoot, ...extraEnv }),
+    env: withGhStub({ ...process.env, LANE_POOL_NO_RECOVER: '1', LANE_POOL_ROOT: poolRoot, LANE_POOL_ACQUIRE_DEBUG: '1', ...extraEnv }),
   });
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
 }
@@ -122,6 +123,21 @@ afterEach(() => {
 });
 
 describe('lane-pool acquire (#3383) — growth-on-empty, bounded by a per-call cap', () => {
+  it.each(['--cache-ttl-ms=0', '--cache-ttl-ms=1', '--no-cache'])(
+    'default expiry with %s still grows from a completed empty scan', (cacheFlag) => {
+      provision(1);
+      leaseLane(1);
+      const r = runPool(['acquire', ...REPO(), '--session=picker', '--growth-max-new=1', '--no-free-list', cacheFlag], {
+        LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS: '100',
+      });
+      expect(r.code, r.err).toBe(0);
+      expect(r.out.trim()).toMatch(/lane-2$/);
+      expect(r.err).toMatch(/growing by up to 1 new lane/);
+      expect(r.err).not.toContain('capacity is unknown');
+      expect(listLanes([])).toEqual([1, 2]);
+    },
+  );
+
   it('a fully-held pool grows by new lanes and acquire succeeds against one of them, instead of failing', () => {
     provision(1);
     leaseLane(1); // the only lane is held — auto-pick has nothing to choose from
@@ -130,6 +146,9 @@ describe('lane-pool acquire (#3383) — growth-on-empty, bounded by a per-call c
     expect(r.code, r.err).toBe(0);
     expect(r.out.trim()).toMatch(/lane-2$/); // lowest brand-new lane, since lane-1 is held
     expect(r.err).toMatch(/growing by up to 4 new lane/);
+    // Growth happens after the default wait, and must not need a second scan past that deadline.
+    expect(r.err.match(/__SCAN_LOCK_HELD_MS__=/g)).toHaveLength(1);
+    expect(Number(r.err.match(/__ACQUIRE_POLLS__=(\d+)/)?.[1])).toBeGreaterThan(0);
     // Growth cloned up to the default cap (4): lane-1 (held) + lane-2..5 = 5 total, one of which (lane-2) is
     // now also leased by this acquire.
     expect(listLanes([])).toEqual([1, 2, 3, 4, 5]);
@@ -143,6 +162,39 @@ describe('lane-pool acquire (#3383) — growth-on-empty, bounded by a per-call c
     expect(r.code, r.err).toBe(0);
     expect(r.out.trim()).toMatch(/lane-2$/);
     expect(listLanes([])).toEqual([1, 2]); // exactly one new lane grown
+  });
+
+  it.each(['dirty', 'leased'])('skips a newly grown lane that becomes %s before the retry, even with --force', (kind) => {
+    provision(1);
+    leaseLane(1);
+    const lane2 = join(poolRoot, 'growacq', 'lane-2');
+    const lease = JSON.stringify({ session: 'concurrent-holder', acquiredAt: new Date().toISOString(), ttlMinutes: 60 });
+    const target = kind === 'dirty' ? join(lane2, 'file.txt') : join(lane2, '.git', '.lane-lease');
+    const contents = kind === 'dirty' ? 'concurrent work\n' : lease;
+    const preload = join(base, 'growth-race.mjs');
+    // Mutate the real fixture at the handoff boundary, after growth finishes and before acquire retries.
+    // Only IO timing is injected; production eligibility, claiming and reset checks all run normally.
+    writeFileSync(preload, `
+import { writeFileSync } from 'node:fs';
+const write = process.stderr.write.bind(process.stderr);
+let changed = false;
+process.stderr.write = (chunk, ...args) => {
+  if (!changed && String(chunk).includes('grew pool "growacq"')) {
+    changed = true;
+    writeFileSync(${JSON.stringify(target)}, ${JSON.stringify(contents)});
+  }
+  return write(chunk, ...args);
+};
+`);
+    const r = runPool(['acquire', ...REPO(), '--growth-max-new=2', '--session=picker', '--force'], {
+      LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS: '1500',
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} --import=${pathToFileURL(preload).href}`,
+    });
+    expect(r.code, r.err).toBe(0);
+    expect(r.out.trim()).toMatch(/lane-3$/);
+    expect(r.err.match(/__SCAN_LOCK_HELD_MS__=/g)).toHaveLength(1);
+    expect(readFileSync(target, 'utf8')).toBe(contents);
+    if (kind === 'dirty') expect(existsSync(join(lane2, '.git', '.lane-lease'))).toBe(false);
   });
 
   it('LANE_POOL_ACQUIRE_GROWTH_MAX_NEW env overrides the default when --growth-max-new is omitted', () => {
