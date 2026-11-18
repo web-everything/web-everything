@@ -396,6 +396,7 @@ export function runReviewTick({
   refreshScopeBloat = null,
   postRefreshMarker = null,
   acquirableLanes = () => Infinity,
+  recoveryAcquirableLanes = acquirableLanes,
   // verify-admission (2026-10-20) — host-level admission for new review sessions: `() => {admitted, reason,
   // maxPerTick?}`. Not admitted ⇒ nothing is dispatched this tick (every review stays owed: queued, never dropped);
   // admitted ⇒ at most `maxPerTick` new sessions. The default admits everything so pure-function callers are unchanged;
@@ -722,7 +723,13 @@ export function runReviewTick({
   const reservedRecoveryStarts = hostLimit >= 2 && reviews.length ? Math.min(1, hostLimit - 1) : 0;
   const recoverRedTeam = (recoveryStarts) => {
     if (paused || typeof redTeamOnSkip !== 'function') return;
-    const recoveryLanes = Math.max(0, acquirable - occupiedLanes);
+    // Recovery starts need only one lane; ordinary rounds reserve a companion lane too.
+    // A failed recovery-only read must not abort the tick (it runs before ordinary dispatch): read it as 0 lanes.
+    let rawLanes = 0;
+    try { rawLanes = recoveryAcquirableLanes === acquirableLanes ? lanes : recoveryAcquirableLanes({ repo }); }
+    catch (e) { log(`review-daemon: ${repo} recovery lane read failed (${String(e?.message ?? e).split('\n')[0]}); recovery gets 0 lanes this tick`); }
+    const rawAcquirable = Math.max(0, (Array.isArray(rawLanes) ? rawLanes.length : Number(rawLanes)) || 0);
+    const recoveryLanes = Math.max(0, rawAcquirable - occupiedLanes);
     let taken = 0;
     const capacity = { lanes: recoveryLanes, budget: liveReviewBudget, remainingStarts: recoveryStarts,
       startsCeiling: Math.max(0, hostLimit - occupiedLanes - (reviews.length ? 1 : 0)),
@@ -1220,8 +1227,8 @@ export function hasStaleMainRefusal(tickResult) {
 }
 
 /**
- * #3383 bug 3 — the REAL `acquirableLanes` effect: how many lanes are acquirable RIGHT NOW in `repo`'s own
- * pool. Reuses `reconcile-fix-dispatch.mjs`'s own `freeLaneNumbers` — the SAME `lane-pool.mjs list
+ * #3383 bug 3 — the REAL `acquirableLanes` effect: how many review starts fit RIGHT NOW in `repo`'s own
+ * pool, allowing roughly two lanes per round. Reuses `reconcile-fix-dispatch.mjs`'s own `freeLaneNumbers` — the SAME `lane-pool.mjs list
  * --acquirable --json` read `tick-core.mjs`'s IO shell already uses — rather than re-deriving a second copy;
  * `repoProfile(repo).lanePoolRepo` is the exact same derivation `review-dispatch.mjs#planReviewDispatch`
  * already uses to pick which pool a given repo's own review session acquires from. Fail-soft, like
@@ -1235,9 +1242,17 @@ export function defaultAcquirableLaneCount({ repo }) {
   return defaultAcquirableLaneNumbers({ repo }).length;
 }
 
-/** Preserve the tick's fresh scan so sibling jobs acquire distinct lanes without scanning again. */
-export function defaultAcquirableLaneNumbers({ repo }) {
-  return freeLaneNumbers({ lanePoolRepo: repoProfile(repo).lanePoolRepo });
+/** Preserve distinct preferred lanes while leaving one companion lane per review round available.
+ * A round needs roughly two lanes; an unmatched lane cannot fit another round this tick.
+ * Returning no candidates uses the existing typed lane deferral / poolExhaustion path. */
+export function defaultAcquirableLaneNumbers({ repo }, { readLanes = freeLaneNumbers } = {}) {
+  const lanes = readLanes({ lanePoolRepo: repoProfile(repo).lanePoolRepo });
+  return lanes.slice(0, Math.floor(lanes.length / 2));
+}
+
+/** Red-team-only recovery needs one lane per start, so every free lane is available. */
+export function defaultRecoveryLaneNumbers({ repo }, { readLanes = freeLaneNumbers } = {}) {
+  return readLanes({ lanePoolRepo: repoProfile(repo).lanePoolRepo });
 }
 
 /** The lane-pool repo path for `repo` (the same derivation {@link defaultAcquirableLaneCount} uses). */
@@ -1371,7 +1386,8 @@ export function cliReviewTickOpts({ log = console, factCache = null } = {}) {
   const factsProvider = withFactsLabels(createGhProvider());
   return {
     log: line => log.error(line),
-    acquirableLanes: defaultAcquirableLaneNumbers, readPrs: factCache ? opts => defaultReadPrs({ ...opts, factCache }) : defaultReadPrs, readAgents: defaultReadAgents,
+    acquirableLanes: defaultAcquirableLaneNumbers, recoveryAcquirableLanes: defaultRecoveryLaneNumbers,
+    readPrs: factCache ? opts => defaultReadPrs({ ...opts, factCache }) : defaultReadPrs, readAgents: defaultReadAgents,
     hostAdmission: defaultReviewHostAdmission,
     liveReviewBudget: liveReviewRoundBudget(),
     redTeamOnSkip: o => {
@@ -1748,26 +1764,30 @@ export function countLiveReviewRounds(lines, { isScriptFile = null, isOptionPath
   return count;
 }
 
+const REVIEW_CONCURRENCY_PATH = join(dirname(fileURLToPath(import.meta.url)), '../../scripts/settings/review-concurrency.json');
+
 /** EMERGENCY 2026-10-20 — the host-wide cap on live review rounds, from the tool layer
  *  (`scripts/settings/review-concurrency.json`, source logged by the cascade). Counts live `review-job.mjs` /
  *  `review-loop-cli.mjs` processes (a round is one job, or one bare loop). An unreadable `ps` fails closed (no new
  *  review this tick). Revert condition: see the settings file's comment. */
-const DEFAULT_MAX_LIVE_REVIEW_ROUNDS = 8;
 export function liveReviewRoundBudget({ env = process.env, listCommands = () => execFileSync('ps', ['-Aww', '-o', 'pid=,ppid=,command='], { encoding: 'utf8', timeout: 10_000, maxBuffer: 32 * 1024 * 1024 }),
-  toolPath = join(dirname(fileURLToPath(import.meta.url)), '../../scripts/settings/review-concurrency.json') } = {}) {
+  toolPath = REVIEW_CONCURRENCY_PATH, readFile = readFileSync } = {}) {
+  const validMax = v => Number.isSafeInteger(v) && v >= 1 && v <= 16;
+  // Invalid overrides fall back to the committed cap; unreadable/invalid defaults hold all new rounds.
+  let defaultMax = 0;
+  try {
+    const configured = JSON.parse(readFile(REVIEW_CONCURRENCY_PATH, 'utf8')).maxLiveReviewRounds;
+    if (validMax(configured)) defaultMax = configured;
+  } catch { /* fail closed with zero slots */ }
   let tool;
-  try { tool = JSON.parse(readFileSync(toolPath, 'utf8')); } catch { tool = undefined; }
-  // Unreadable settings fail closed to the code default, never to "unlimited".
-  if (tool === undefined) process.stderr.write(`review-daemon: review-concurrency settings unreadable; using code default maxLiveReviewRounds=${DEFAULT_MAX_LIVE_REVIEW_ROUNDS}\n`);
+  try { tool = JSON.parse(readFile(toolPath, 'utf8')); } catch { tool = undefined; }
   const raw = env?.WE_REVIEW_MAX_LIVE_ROUNDS;
   const r = cascadePolicy('reviewConcurrency', tool && { maxLiveReviewRounds: tool.maxLiveReviewRounds }, {
-    env, standard: { maxLiveReviewRounds: DEFAULT_MAX_LIVE_REVIEW_ROUNDS },
+    env, standard: { maxLiveReviewRounds: defaultMax },
     envValues: { maxLiveReviewRounds: typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : undefined },
-    valid: { maxLiveReviewRounds: (v) => v === null || (Number.isSafeInteger(v) && v >= 1) },
+    valid: { maxLiveReviewRounds: validMax },
   });
-  // Unreadable tool settings never mean unlimited, even if a higher layer resolved the cap to null.
-  const max = r.value.maxLiveReviewRounds ?? (tool === undefined ? DEFAULT_MAX_LIVE_REVIEW_ROUNDS : null);
-  if (max == null) return null;
+  const max = r.value.maxLiveReviewRounds;
   const src = r.sources?.maxLiveReviewRounds ?? 'standard';
   let lines;
   try { lines = String(listCommands()).split('\n'); } catch (e) { return { left: 0, reason: `live review rounds unknown (${String(e?.message ?? e).split('\n')[0]}); maxLiveReviewRounds=${max} (${src})` }; }
