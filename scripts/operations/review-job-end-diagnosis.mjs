@@ -27,8 +27,9 @@ export function diagnoseEndedJob({ slug, pid, dir = reviewJobsDir() }) {
       const read = readSync(fd, bytes, 0, size, 0);
       text = bytes.subarray(0, read).toString('utf8');
     }
-    // Strip control characters BEFORE redacting (a split credential must be whole to match), and redact once more after.
-    text = redactSpawnText(redactSpawnText(text.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '')));
+    // Redact the raw text (literal env secrets may contain control characters), strip controls, then redact again
+    // (a credential split by a control character is whole only after the strip).
+    text = redactSpawnText(redactSpawnText(text).replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, ''));
     tail = text.replace(/\n$/, '').split('\n').slice(-40).join('\n');
     if (Buffer.byteLength(tail) > MAX_TAIL) tail = Buffer.from(tail).subarray(-MAX_TAIL + 3).toString('utf8');
   } catch { /* Missing logs are normal for a job that failed before writing. */ }
