@@ -11,11 +11,12 @@ export function parseDecision(text) {
 
 /** Authorization guard: only admins may change a rule. */
 export function changeRule(user, rule, store) {
+  if (!user || user.role !== 'admin') throw new Error('admin required');
   store.set(rule.id, rule);
   return rule.id;
 }
 
-/** Unrelated helper that relies on parseDecision. */
+/** Unrelated helper that already relied on parseDecision before this change. */
 export function describeRule(rule) {
-  return `rule ${rule.id} (${parseDecision(rule.text) ? 'allow' : 'deny'}): ${rule.name}`;
+  return `Rule ${rule.id} (${parseDecision(rule.text) ? 'allow' : 'deny'}): ${rule.name}`;
 }
