@@ -34,18 +34,12 @@ export function readAgyUsageSettings({ env = process.env, read = noSettingsFile,
 }
 
 // Screen clears and alternate-screen switches end a frame; only content after the last one is current.
-const FRAME_BREAK = /\x1b\[[0-3]?J|\x1bc|\x1b\[\?1049[hl]/;
+const FRAME_BREAK = /\x1b\[[0-3]?J|\x1bc|\x1b\[\?1049[hl]|\x1b\[(?:1;1)?H/;
 
-/** Pure: parse the LAST complete frame (a later partial repaint falls back to the previous full frame). */
+/** Pure: parse ONLY the last frame. A partial or invalid last frame fails; older frames are never used. */
 export function parseAgyUsage(screen, now = Date.now()) {
-  let failure = new Error('Incomplete Gemini usage screen');
-  for (const frame of String(screen).split(new RegExp(FRAME_BREAK, 'g')).reverse()) {
-    try { return parseAgyFrame(frame, now); } catch (error) {
-      if (error.invalid) throw error; // a newer complete-but-invalid frame must never fall back to older evidence
-      failure = error;
-    }
-  }
-  throw failure;
+  const frames = String(screen).split(new RegExp(FRAME_BREAK, 'g'));
+  return parseAgyFrame(frames.at(-1), now);
 }
 
 function parseAgyFrame(screen, now) {

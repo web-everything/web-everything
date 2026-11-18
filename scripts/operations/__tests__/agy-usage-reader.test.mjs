@@ -21,8 +21,12 @@ describe('Gemini usage parser', () => {
     const stale = SCREEN.replace('100.00%', '40.00%');
     expect(parseAgyUsage(`${stale}\x1b[2J\x1b[H${SCREEN}`, NOW).seven_day.used_percentage).toBe(0);
   });
-  it('falls back to the previous full frame when a later repaint is partial', () => {
-    expect(parseAgyUsage(`${SCREEN}\x1b[2JGEMINI MODELS\nWeekly Limit Remaining\n`, NOW).seven_day.used_percentage).toBe(0);
+  it('never falls back to an older frame when the last frame is partial', () => {
+    expect(() => parseAgyUsage(`${SCREEN}\x1b[2JGEMINI MODELS\nWeekly Limit Remaining\n`, NOW)).toThrow();
+  });
+  it('treats a cursor-home repaint as a new frame', () => {
+    const fresh = SCREEN.replace('100.00%', '30.00%');
+    expect(parseAgyUsage(`${SCREEN}\x1b[H${fresh}`, NOW).seven_day.used_percentage).toBe(70);
   });
   it('rejects a screen that never completes after a clear', () => {
     expect(() => parseAgyUsage('\x1b[2JGEMINI MODELS\nWeekly Limit Remaining\n', NOW)).toThrow();
