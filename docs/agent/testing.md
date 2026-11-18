@@ -4762,3 +4762,14 @@ Preserve `overlaysBefore` as a veto for omitted live tips: the regression for a 
 retired during planning must reject its omission and preserve HEAD.
 Run this file and `daemon-rebuild-events.test.mjs` through heavy admission. This adoption
 rule does not reset overlay main-sync parking or add retries for parked overlays.
+
+
+External agy review jurors bound silent launches with `review.externalJurors.firstOutputMs`
+(default 120000; 0 disables). A silent kill records `provider-unresponsive` and uses the
+existing quota evidence store's root for a hold across every backend, for `cooldownMs`
+(default 1800000). Advisory skips retain the window and cooldown in their summary;
+mandatory skips and an unmet `minNonClaudeSeats` block on infrastructure. New runs seat
+the fifth juror through `advisorySeats.antigravityReview` (default off), independently of
+probation; a saved run retains its roster. Regressions: `external-juror-liveness.test.mjs`,
+`review-pr.test.mjs`, and `agy-juror-first-output.soak.test.mjs` (the latter uses the soak
+Vitest config). Run only the affected files through heavy-admission.

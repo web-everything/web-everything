@@ -915,7 +915,7 @@ export function createDefaultJudge({
         const reason = `spawn failed — ${String(e?.message ?? e).slice(0, 500)}`;
         logGracefulOutcome(`judge seat crashed, recorded as skipped — ${spawnProviderName}: ${reason}`);
         return e?.telemetry
-          ? judgeOutcome({ summary: `skipped: ${reason}`, findings: [], skipped: { provider: spawnProviderName, reason } }, judgeTelemetryFrom(e.telemetry, effective))
+          ? judgeOutcome({ summary: `skipped: ${reason}`, findings: [], skipped: { provider: spawnProviderName, reason: e.telemetry.quotaState === 'provider-unresponsive' ? 'provider-unresponsive' : reason } }, judgeTelemetryFrom(e.telemetry, effective))
           : skipOutcome(reason, { provider: spawnProviderName, crashed: true });
       }
     }

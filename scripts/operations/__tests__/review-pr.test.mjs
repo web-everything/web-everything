@@ -3547,13 +3547,13 @@ describe('#3383 — the opt-in Antigravity review seat (judgeAntigravityReview)'
     });
 
     // #3383 — the probation default, mirroring both Codex seats' own.
-    it('when the env var is UNSET, defaults to the injected probation check', () => {
-      expect(antigravityReviewFromEnv({}, { isOnProbation: () => true })).toBe(true);
+    it('when the env var is UNSET, defaults off even on probation', () => {
+      expect(antigravityReviewFromEnv({}, { isOnProbation: () => true })).toBe(false);
       expect(antigravityReviewFromEnv({}, { isOnProbation: () => false })).toBe(false);
     });
 
-    it('when the env var is UNSET and no override is injected, calls the REAL default probation check', () => {
-      expect(antigravityReviewFromEnv({})).toBe(defaultAntigravityReviewProbationCheck());
+    it('when the env var is UNSET, uses the shipped off setting', () => {
+      expect(antigravityReviewFromEnv({})).toBe(false);
     });
 
     it('the real default probation check reads the ANTIGRAVITY identity, and today\'s registry declares it on probation', () => {
@@ -3977,7 +3977,7 @@ describe('#4315 operation / I/O restart soak', () => {
         expect(run.pending).toMatchObject({ kind: 'confirm', of: 'human' });
         expect(run.verdict.pendingReferrals).toHaveLength(1);
         expect(run.verdict.verdict).toBe('needs-human');
-        expect(() => assertMandatoryReferralsCleared(state, { repo: 'o/r', pr: 7 })).toThrow(/mandatory referral hold/);
+        expect(() => assertMandatoryReferralsCleared(state, { repo: 'o/r', pr: 7, env: { REVIEW_PR_ANTIGRAVITY_REVIEW: '1' } })).toThrow(/mandatory referral hold/);
         expect(() => advanceWhileRunning(run, { registry, resume: { value: 'accept' } })).toThrow(/ruling required/);
       }
       expect(judge).toHaveBeenCalledTimes(1);
@@ -4038,7 +4038,8 @@ describe('xfkqowg historical ruling replay', () => {
     const sinks = createReviewPrSinks({ labelProvider: provider, postComment: provider.postComment, referralJudge: judge,
       postRedTeamCheckRun: () => ({ ok: true }),
       readPublishHead: () => head, publishGate: () => ({ headSha: head, checks: [] }),
-      mirrorReferral: () => {}, cardReadable: () => true, out: () => {} });
+      mirrorReferral: () => {}, cardReadable: () => true, out: () => {},
+      env: { REVIEW_PR_ANTIGRAVITY_REVIEW: '1' } });
     const first = records[0];
     let run = advanceWhileRunning(startRun({ op: REVIEW_PR_OP, id: runId,
       input: { pr: first?.pr ?? 7, repo: first?.repo ?? 'o/r' }, registry }), { registry });
@@ -4899,16 +4900,14 @@ describe('operator review diversity minimum', () => {
       expect(request.providerName).toBe('codex');
     }
   });
-  it.each([false, true])('reports unavailable Codex answers in the durable write-up (absent=%s)', (absent) => {
+  it.each([false, true])('blocks on infra when required Codex answers are unavailable (absent=%s)', (absent) => {
     const declaration = buildReviewPrOperation({ readPr: stubReader(), seatSettings: absent
       ? { minNonClaudeSeats: 1, preserveSavedRoster: true } : { minNonClaudeSeats: 1 } });
     const read = shapeReadFinding(stubReader()({ pr: 7, repo: 'o/n' }), { pr: 7, repo: 'o/n' });
-    const verdict = declaration.steps.find(s => s.name === 'reduce').step.fn({ input: { lens: 'correctness' }, findings: {
+    expect(() => declaration.steps.find(s => s.name === 'reduce').step.fn({ input: { lens: 'correctness' }, findings: {
       read, judge: CLEAN_ANSWER, judgeSecurity: CLEAN_ANSWER,
       ...(!absent ? { judgeAdvisory: { summary: 'Codex unavailable', findings: [], skipped: { reason: 'quota' } } } : {}),
-    } });
-    expect(verdict.nonClaudeSeats).toBe(0);
-    expect(renderVerdictWriteUp({ read, verdict, answer: 'accept', actor: 'operator' })).toContain('NON-CLAUDE SEAT SHORTFALL: 0/1');
+    } })).toThrow(/blocked-on-infra:.*NON-CLAUDE SEAT SHORTFALL: 0\/1/);
   });
   it('counts a completed Codex seat and seats both Codex lenses for a minimum of two', () => {
     const declaration = buildReviewPrOperation({ readPr: stubReader(), seatSettings: { minNonClaudeSeats: 2 } });
@@ -5001,5 +5000,31 @@ describe('card-only light review', () => {
     const { registry } = registryForCards({ files: ['backlog/1-card.md', 'scripts/code.mjs'] });
     expect(() => advanceWhileRunning(startRun({ op: REVIEW_PR_OP, id: 'card-race', input: BASE_INPUT, registry }), { registry }))
       .toThrow(/card-only light lane/);
+  });
+});
+
+
+describe('provider-unresponsive skips and required seat policy', () => {
+  const skipped = { summary: 'skipped: provider-unresponsive; first-output window 15 ms; cooldown 1000 ms', findings: [], skipped: { reason: 'provider-unresponsive' } };
+  const reduce = (options, overrides = {}) => {
+    const declaration = buildReviewPrOperation({ readPr: stubReader(), antigravityReview: true, minNonClaudeSeats: 1, ...options });
+    const read = shapeReadFinding(stubReader()({ pr: 7, repo: 'o/n' }), { pr: 7, repo: 'o/n' });
+    return declaration.steps.find(s => s.name === 'reduce').step.fn({ input: { lens: 'correctness' }, findings: {
+      read, judge: CLEAN_ANSWER, judgeSecurity: CLEAN_ANSWER, judgeAdvisory: CLEAN_ANSWER,
+      judgeCorrectnessAdvisory: CLEAN_ANSWER, judgeAntigravityReview: skipped, ...overrides,
+    } });
+  };
+  it('proceeds and surfaces the skipped advisory seat when mandatory and diversity requirements are met', () => {
+    const result = reduce({});
+    expect(result.verdict).toBe('accept');
+    expect(result.nonClaudeSeats).toBe(1);
+    expect(result.skippedSeats).toContainEqual({ lens: ANTIGRAVITY_REVIEW_LENS, reason: 'provider-unresponsive' });
+    expect(result.summary).toContain('first-output window 15 ms; cooldown 1000 ms');
+  });
+  it.each(['judge', 'judgeSecurity'])('blocks on infra if mandatory %s was skipped despite clean advisories', step => {
+    expect(() => reduce({}, { [step]: skipped })).toThrow(/blocked-on-infra: mandatory seat/);
+  });
+  it('blocks on infra when skipped advisories leave minNonClaudeSeats unmet', () => {
+    expect(() => reduce({}, { judgeAdvisory: skipped })).toThrow(/blocked-on-infra:.*0\/1/);
   });
 });
