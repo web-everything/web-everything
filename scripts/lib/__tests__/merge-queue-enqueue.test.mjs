@@ -63,7 +63,7 @@ describe('startup-failure stale merge-gate refresh', () => {
     return {
       c: { num: 5006, repo: 'o/r', headRef: 'lane/test', decision: 'skip', state: 'BLOCKED', reason: 'merge state BLOCKED' },
       pr: { headRefOid: HEAD, rowsComplete: true, statusCheckRollup: [green('test'), green('merge-gate')] },
-      requiredChecks: ['test', 'merge-gate'], classifyPr: vi.fn(() => ({ decision: 'merge' })), setting: 'on',
+      rosterSource: 'live', requiredChecks: ['test', 'merge-gate'], classifyPr: vi.fn(() => ({ decision: 'merge' })), setting: 'on',
       readGateRuns: vi.fn(() => [startupRun()]), readVerdict: vi.fn(), readFreeze: vi.fn(), readAcceptance: vi.fn(),
       cloneDir: '/clone', readState: () => ({}), record: vi.fn(), statePath: join(mkdtempSync(join(tmpdir(), 'sg-ledger-')), 'ledger.json'),
       refreshStalePr: vi.fn(async () => ({ ok: true, action: 'rerun', newCommit: HEAD })), ...extra,
@@ -383,6 +383,14 @@ describe('startup-failure stale merge-gate refresh', () => {
     const o = options({ pr: { headRefOid: HEAD, rowsComplete: true, statusCheckRollup: [green('test'), green('merge-gate')].map(row => row.name === name ? { ...row, conclusion: 'FAILURE' } : row) } });
     expect((await handleStaleMergeGate(o)).handled).toBe(false);
     expect(o.readGateRuns).not.toHaveBeenCalled();
+  });
+  it.each([null, 'declared', 'stale-cache'])('refuses an unproven roster source before reading runs: %s', rosterSource => {
+    const o = options({ rosterSource });
+    return handleStaleMergeGate(o).then(result => {
+      expect(result).toEqual({ handled: false });
+      expect(o.readGateRuns).not.toHaveBeenCalled();
+      expect(o.readVerdict).not.toHaveBeenCalled();
+    });
   });
   it('uses the throttled workflow endpoint once with bounded output and time', async () => {
     execFileSyncThrottled.mockClear();

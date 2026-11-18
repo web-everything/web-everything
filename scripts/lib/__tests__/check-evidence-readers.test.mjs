@@ -31,11 +31,11 @@ describe.each(cases)('%s', (_label, rows, state) => {
   });
   it('review timing preserves failures and running reruns in both input orders', () => {
     for (const checks of [rows, [...rows].reverse()]) {
-      const input = { headSha: head, checks, requiredChecks: ['test'], rowsComplete: true };
+      const input = { rosterSource: 'live', headSha: head, checks, requiredChecks: ['test'], rowsComplete: true };
       expect(ciRedOnHead(input)).toBe(state === 'fail');
       expect(fixReadiness(input).ciFailed).toBe(state === 'fail');
       expect(reviewStartGate({ ...input, policy: { ...REVIEW_TIMING_DEFAULTS, startAfter: 'ci-green', startEarly: 'off' } }).allowed).toBe(state === 'pass');
-      expect(fixPushGate({ headSha: head, rowsComplete: true, previousHeadChecks: checks, requiredChecks: ['test'],
+      expect(fixPushGate({ rosterSource: 'live', headSha: head, rowsComplete: true, previousHeadChecks: checks, requiredChecks: ['test'],
         policy: { pushAfterCi: true, pushAfterCiMaxMin: 1 }, firstHeldAt: 0, now: 0 }).action).toBe(state === 'pending' ? 'wait' : 'push');
     }
   });
@@ -50,7 +50,7 @@ describe.each(cases)('%s', (_label, rows, state) => {
     for (const checks of [rows, [...rows].reverse()]) {
       const readGateRuns = vi.fn(() => []);
       await handleStaleMergeGate({ c: { decision: 'skip', state: 'BLOCKED', reason: 'merge state BLOCKED' },
-        pr: pr(checks), requiredChecks: ['test', 'merge-gate'], setting: 'on',
+        rosterSource: 'live', pr: pr(checks), requiredChecks: ['test', 'merge-gate'], setting: 'on',
         classifyPr: () => ({ decision: 'merge' }), readGateRuns });
       expect(readGateRuns).toHaveBeenCalledTimes(state === 'pass' ? 1 : 0);
     }
@@ -91,7 +91,7 @@ it('timing fails closed without roster/head and fix push has an explicit bounded
 });
 
 const joinedGreenInput = {
-  headSha: head, checks: [row('success')], requiredChecks: ['test'],
+  rosterSource: 'live', headSha: head, checks: [row('success')], requiredChecks: ['test'],
   findings: [{ createdAt: '2026-11-18T03:00:00Z' }],
 };
 it('complete green CI plus review findings releases the joined fix immediately', () => {

@@ -17,7 +17,6 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PLATFORM_PREFERENCES_PATH } from './merge-delivery-policy.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
-import { reviewCiGate } from './review-ci-gate.mjs';
 import { resolveRequiredChecks } from './check-state-predicate.mjs';
 import { readMergeGateVerdict } from './merge-gate-hold-class.mjs';
 import { readSharedFreeze } from './red-main-freeze-shared.mjs';
@@ -512,9 +511,9 @@ function readMergeGateRuns({ repo, headSha }) {
   return out.workflow_runs;
 }
 
-function everyOtherRequiredGreen(requiredChecks, pr) {
+function everyOtherRequiredGreen(requiredChecks, pr, rosterSource) {
   const evidence = resolveRequiredChecks({ rows: pr.statusCheckRollup, head: pr.headRefOid, rowsHead: pr.headRefOid,
-    requiredNames: requiredChecks, rosterSource: 'live', rowsComplete: pr.rowsComplete === true && !pr.requiredCheckReadError });
+    requiredNames: requiredChecks, rosterSource, rowsComplete: pr.rowsComplete === true && !pr.requiredCheckReadError });
   return evidence.state !== 'unknown' && Object.entries(evidence.perName).filter(([name]) => name !== 'merge-gate')
     .every(([, r]) => r.state === 'pass' && r.rows.length > 0);
 }
@@ -619,7 +618,7 @@ async function refreshStartupFailure({ c, headSha, classification, setting, stat
 }
 
 /** Post-cascade recovery. All IO is injectable; the original skip remains unless a refresh is handled. */
-export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, classifyOptions = {}, setting, dryRun = false,
+export async function handleStaleMergeGate({ c, pr, requiredChecks, rosterSource = 'live', classifyPr, classifyOptions = {}, setting, dryRun = false,
   readVerdict = readMergeGateVerdict, readFreeze = readSharedFreeze, readAcceptance, acceptance, readGateRuns = readMergeGateRuns,
   writeClaim = path => closeSync(openSync(path, 'wx')), warn = () => {},
   statePath = staleMergeGateRefreshStatePath(), ...refreshOptions } = {}) {
@@ -630,12 +629,16 @@ export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, 
   // The real classifier must also pass its gates AFTER the merge-state arm (body and review holds).
   if (classifyPr({ ...pr, mergeStateStatus: 'CLEAN' }, classifyOptions).decision !== 'merge') return unchanged;
   const headSha = pr.headRefOid;
-  const gate = reviewCiGate({ headSha, requiredChecks, checks: pr.statusCheckRollup, rowsComplete: pr.rowsComplete === true && !pr.requiredCheckReadError });
-  // A startup_failure Merge gate run creates no check-run, so the row can be absent; any other refusal stays refused.
-  // reviewCiGate drops checks implied by others (integration under test), so here EVERY other required row must be present and successful.
-  const onlyGateMissing = gate.affected.length === 1 && gate.affected[0].name === 'merge-gate' && gate.affected[0].reason === 'missing'
-    && everyOtherRequiredGreen(requiredChecks, pr);
-  if ((gate.allowed && everyOtherRequiredGreen(requiredChecks, pr)) || onlyGateMissing) {
+  // Enqueue needs merge-gate evidence; the review-admission adapter deliberately excludes it.
+  const evidence = resolveRequiredChecks({ head: headSha, rowsHead: headSha, requiredNames: requiredChecks,
+    rosterSource, rows: pr.statusCheckRollup, rowsComplete: pr.rowsComplete === true && !pr.requiredCheckReadError });
+  const gate = { allowed: evidence.state === 'pass', unknown: evidence.state === 'unknown',
+    affected: Object.entries(evidence.perName).filter(([, r]) => r.state !== 'pass')
+      .map(([name, r]) => ({ name, reason: r.reasons[0] ?? r.state })) };
+  const onlyGateMissing = !gate.unknown && gate.affected.length === 1
+    && gate.affected[0].name === 'merge-gate' && gate.affected[0].reason === 'missing'
+    && everyOtherRequiredGreen(requiredChecks, pr, rosterSource);
+  if ((gate.allowed && everyOtherRequiredGreen(requiredChecks, pr, rosterSource)) || onlyGateMissing) {
     let classification;
     try { classification = classifyStartupFailureGate({ runs: await readGateRuns({ repo: c.repo, headSha }), headSha }); }
     catch (e) { return { ...unchanged, reason: `merge-gate workflow runs unreadable: ${errText(e)}` }; }
@@ -645,8 +648,7 @@ export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, 
   }
   if (gate.unknown) return unchanged;
   if (gate.affected.length !== 1 || gate.affected[0].name !== 'merge-gate' || gate.affected[0].reason !== 'failure') return unchanged;
-  const run = resolveRequiredChecks({ rows: pr.statusCheckRollup, head: headSha, rowsHead: headSha,
-    requiredNames: requiredChecks, rosterSource: 'live', rowsComplete: true }).perName['merge-gate']?.rows[0];
+  const run = evidence.perName['merge-gate']?.rows[0];
   if (!run || String(run.conclusion).toLowerCase() !== 'failure') return unchanged;
   const ids = /\/actions\/runs\/(\d+)\/job\/(\d+)/.exec(run.detailsUrl ?? run.details_url ?? '');
   const runId = Number(ids?.[1]), jobId = Number(ids?.[2]);

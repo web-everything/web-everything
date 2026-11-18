@@ -9,6 +9,7 @@ import { resetCascadeLogForTest } from '../policy-cascade.mjs';
 const head = 'a'.repeat(40);
 const check = (name, conclusion = 'success', extra = {}) => ({ name, head_sha: head, status: 'completed', conclusion, ...extra });
 const fast = review.fastChecks.we;
+const evidence = { headSha: head, rowsHead: head, rowsComplete: true, rosterSource: 'live' };
 describe('pending-CI start policy', () => {
   it('push preserves a required failure when a higher ID success has no proven rerun lineage', () => {
     const input = { rosterSource: 'live', rowsComplete: true, headSha: head, requiredChecks: ['test'],
@@ -305,50 +306,50 @@ describe('parallel review start and void', () => {
     expect([fastChecksFor(kept, 'web-everything/web-everything'), fastChecksFor(kept, 'frontierui')]).toEqual([['lint'], ['test']]);
   });
   it('voids red-head and superseded reviews while excluding the review-dependent gates', () => {
-    const args = { reviewedHead: head, currentHead: head, checks: [check('integration', 'failure')] };
+    const args = { ...evidence, reviewedHead: head, currentHead: head, requiredChecks: ['integration'], checks: [check('integration', 'failure')] };
     expect(reviewMustVoid(args)).toBe(false);
     expect(reviewMustVoid({ ...args, policy: { ...review, cancelOnCiRed: true } })).toBe(true);
     expect(reviewMustVoid({ ...args, policy: { ...review, cancelOnCiRed: false } })).toBe(false);
     expect(reviewMustVoid({ ...args, currentHead: 'b'.repeat(40), policy: { ...review, cancelOnCiRed: false } })).toBe(true);
-    expect(reviewMustVoid({ ...args, checks: [check('review-gate', 'failure'), check('merge-gate', 'failure')], policy: { ...review, cancelOnCiRed: true } })).toBe(false);
+    expect(reviewMustVoid({ ...args, requiredChecks: ['review-gate'], checks: [check('review-gate', 'failure')], policy: { ...review, cancelOnCiRed: true } })).toBe(false);
   });
   it('cancellation voids only for a healable red: an optional check never voids a finished review', () => {
     const cancel = { ...review, cancelOnCiRed: true };
-    const args = { reviewedHead: head, currentHead: head, policy: cancel, requiredChecks: ['integration'] };
+    const args = { ...evidence, reviewedHead: head, currentHead: head, policy: cancel, requiredChecks: ['integration'] };
     expect(reviewMustVoid({ ...args, checks: [check('CodeQL', 'failure'), check('integration')] })).toBe(false);
     expect(reviewMustVoid({ ...args, checks: [check('integration', 'failure')] })).toBe(true);
-    // Unknown set: the CI-heal rule — soak-replay-gate is never healable, any other red is.
-    expect(reviewMustVoid({ ...args, requiredChecks: null, checks: [check('soak-replay-gate', 'failure')] })).toBe(false);
+    // Unknown roster cannot prove a review remains valid.
+    expect(reviewMustVoid({ ...args, requiredChecks: null, checks: [check('soak-replay-gate', 'failure')] })).toBe(true);
     expect(reviewMustVoid({ ...args, requiredChecks: null, checks: [check('CodeQL', 'failure')] })).toBe(true);
   });
   it.each([
     ['review-gate red', [check('review-gate', 'failure')], false],
-    ['merge-gate red on a review hold', [check('merge-gate', 'failure', { mergeGateReviewHold: { holds: ['review-gate'], jobId: 1 } })], false],
+    ['merge-gate red on a review hold', [check('merge-gate', 'failure', { detailsUrl: 'https://github.com/o/r/actions/runs/1/job/1', mergeGateReviewHold: { holdIds: ['review-acceptance'], jobId: 1, headSha: head } })], false],
     ['plain merge-gate red', [check('merge-gate', 'failure')], true],
   ])('required %s: healable=%s, the same rule the CI heal uses (#5463)', (_name, rows, healable) => {
     const requiredChecks = ['test', 'review-gate', 'merge-gate'];
-    const checks = [...rows, check('test'), ...fast.map(n => check(n))];
-    expect(ciRedOnHead({ headSha: head, checks, requiredChecks })).toBe(healable);
-    expect(fixReadiness({ headSha: head, checks, requiredChecks }).ciFailed).toBe(healable);
+    const checks = [...rows, ...['review-gate', 'merge-gate'].filter(name => !rows.some(r => r.name === name)).map(name => check(name)), check('test'), ...fast.map(n => check(n))];
+    expect(ciRedOnHead({ ...evidence, headSha: head, checks, requiredChecks })).toBe(healable);
+    expect(fixReadiness({ ...evidence, headSha: head, checks, requiredChecks }).ciFailed).toBe(healable);
     for (const startAfter of ['fast-checks', 'push'])
       expect(reviewStartGate({ rosterSource: 'live', rowsComplete: true, headSha: head, repo: 'we', checks, requiredChecks, policy: { ...review, startAfter } }).allowed).toBe(true); // Admission excludes both review-owned names; heal and void retain them.
-    expect(reviewMustVoid({ reviewedHead: head, currentHead: head, checks, requiredChecks, policy: { ...review, cancelOnCiRed: true } })).toBe(healable);
+    expect(reviewMustVoid({ ...evidence, reviewedHead: head, currentHead: head, checks, requiredChecks, policy: { ...review, cancelOnCiRed: true } })).toBe(healable);
   });
   it('a review-dependent gate is never healable red, even when branch protection requires it', () => {
     const requiredChecks = ['test', 'review-gate', 'merge-gate'];
-    const gates = [check('review-gate', 'failure'), check('merge-gate', 'failure', { mergeGateReviewHold: { holds: ['review-gate'], jobId: 1 } }), check('test')];
-    expect(ciRedOnHead({ headSha: head, checks: gates, requiredChecks })).toBe(false);
-    expect(fixReadiness({ headSha: head, checks: gates, requiredChecks }).ciFailed).toBe(false);
+    const gates = [check('review-gate', 'failure'), check('merge-gate', 'failure', { detailsUrl: 'https://github.com/o/r/actions/runs/1/job/1', mergeGateReviewHold: { holdIds: ['review-acceptance'], jobId: 1, headSha: head } }), check('test')];
+    expect(ciRedOnHead({ ...evidence, headSha: head, checks: gates, requiredChecks })).toBe(false);
+    expect(fixReadiness({ ...evidence, headSha: head, checks: gates, requiredChecks }).ciFailed).toBe(false);
     for (const startAfter of ['fast-checks', 'push'])
       expect(reviewStartGate({ rosterSource: 'live', rowsComplete: true, headSha: head, repo: 'we', checks: [...gates, ...fast.map(n => check(n))], requiredChecks,
         policy: { ...review, startAfter } }).allowed).toBe(true);
-    expect(reviewMustVoid({ reviewedHead: head, currentHead: head, checks: gates, requiredChecks, policy: { ...review, cancelOnCiRed: true } })).toBe(false);
+    expect(reviewMustVoid({ ...evidence, reviewedHead: head, currentHead: head, checks: gates, requiredChecks, policy: { ...review, cancelOnCiRed: true } })).toBe(false);
     // A required non-gate red still counts.
-    expect(ciRedOnHead({ headSha: head, checks: [...gates, check('test', 'failure')], requiredChecks })).toBe(true);
+    expect(ciRedOnHead({ ...evidence, headSha: head, checks: [...gates, check('test', 'failure')], requiredChecks })).toBe(true);
   });
   it('the non-healable list covers the CI-truth exclusions the heal path uses', () => {
     for (const name of CI_TRUTH_EXCLUDED_CHECKS) expect(NON_HEALABLE_CHECKS).toContain(name);
-    expect(fixReadiness({ headSha: head, checks: [check('soak-replay-gate', 'failure')] }).ciFailures).toEqual([]);
+    expect(fixReadiness({ ...evidence, headSha: head, checks: [check('soak-replay-gate', 'failure')] }).ciFailures).toEqual([]);
   });
   it.each(['fast-checks', 'push'])('ignores optional red checks under %s but blocks healable required failures', startAfter => {
     const checks = [...fast.map(n => check(n)), check('CodeQL', 'failure')];
@@ -383,16 +384,16 @@ describe('joined fix round', () => {
     expect(joinedFixDecision({ ...args, otherPending: false }).action).toBe('dispatch');
   });
   it('waits symmetrically for CI after findings, uses immutable result timestamps, ignores foreign-head CI', () => {
-    const facts = fixReadiness({ headSha: head, checks: [check('unit', null, { status: 'in_progress' })], findings: [{ body: 'fix', createdAt: new Date(1000).toISOString() }] });
+    const facts = fixReadiness({ ...evidence, requiredChecks: ['unit'], headSha: head, checks: [check('unit', null, { status: 'in_progress' })], findings: [{ body: 'fix', createdAt: new Date(1000).toISOString() }] });
     expect(joinedFixDecision({ ...facts, now: 2000 }).action).toBe('wait');
-    expect(fixReadiness({ headSha: head, checks: [check('unit', 'failure', { head_sha: 'b' })] }).ciFailed).toBe(false);
+    expect(fixReadiness({ ...evidence, requiredChecks: ['unit'], headSha: head, checks: [check('unit', 'failure', { head_sha: 'b' })] }).ciFailed).toBe(false);
     expect(joinedFixDecision({ ...args, firstReadyAt: NaN }).action).toBe('dispatch');
   });
   it('counts only required failures when the required set is known', () => {
     const checks = [check('CodeQL', 'failure'), check('unit')];
-    expect(fixReadiness({ headSha: head, checks, requiredChecks: ['unit'] })).toMatchObject({ ciFailed: false, ciFailures: [] });
-    expect(fixReadiness({ headSha: head, checks: [...checks, check('unit', 'failure')], requiredChecks: ['unit'] }).ciFailures.map(r => r.name)).toEqual(['unit']);
-    expect(fixReadiness({ headSha: head, checks }).ciFailed).toBe(true); // unknown set keeps the old reading
+    expect(fixReadiness({ ...evidence, headSha: head, checks, requiredChecks: ['unit'] })).toMatchObject({ ciFailed: false, ciFailures: [] });
+    expect(fixReadiness({ ...evidence, headSha: head, checks: [...checks, check('unit', 'failure')], requiredChecks: ['unit'] }).ciFailures.map(r => r.name)).toEqual(['unit']);
+    expect(fixReadiness({ ...evidence, headSha: head, checks })).toMatchObject({ ciFailed: false, otherPending: true }); // unknown roster waits
   });
 });
 it('resolves every timing leaf through the cascade, logging sources and rejecting malformed overrides', () => {
@@ -430,10 +431,10 @@ describe('verified early review', () => {
 });
 describe('fix push gate', () => {
   const policy = { ...fix, pushAfterCi: true, pushAfterCiMaxMin: 1 };
-  const args = { previousHeadChecks: [check('test', null, { status: 'in_progress' })], requiredChecks: ['test'], firstHeldAt: 1000, now: 1000, policy };
+  const args = { ...evidence, previousHeadChecks: [check('test', null, { status: 'in_progress' })], requiredChecks: ['test'], firstHeldAt: 1000, now: 1000, policy };
   it('is immediate when off, waits with a fixed deadline when on, and pushes at the bound', () => {
     expect(fixPushGate({ ...args, policy: fix })).toEqual({ action: 'push', reason: 'off' });
-    expect(fixPushGate(args)).toEqual({ action: 'wait', reason: 'ci-pending', deadline: 61000 });
+    expect(fixPushGate({ ...evidence, ...args })).toEqual({ action: 'wait', reason: 'ci-pending', deadline: 61000 });
     expect(fixPushGate({ ...args, now: 61000 })).toMatchObject({ action: 'push', reason: 'bound' });
   });
   it('folds completed required failures and ignores pending optional checks', () => {
@@ -550,7 +551,8 @@ describe('R359 early start shadow (xtxt36v / xrz0ezn)', () => {
   it('waits on healable CI red on the current head', () => {
     expect(shadow({ checks: [check('test', 'failure')] }))
       .toEqual({ wouldStartEarly: false, reason: 'ci-red', mergeAllowed: false });
-    expect(shadow({ checks: [check('test', 'failure', { head_sha: 'b'.repeat(40) }), ...args.checks] }).wouldStartEarly).toBe(true);
+    // Contract rule 2: a foreign-head failure is unreadable (unknown), never dropped, so it fails closed.
+    expect(shadow({ checks: [check('test', 'failure', { head_sha: 'b'.repeat(40) }), ...args.checks] }).wouldStartEarly).toBe(false);
   });
   it.each(['fast-checks', 'ci-green', 'push'])('never changes reviewStartGate under %s', startAfter => {
     for (const checks of [args.checks, [check('test')], [check('test', 'failure')]]) {
@@ -589,4 +591,40 @@ it('verification-marker admission refuses incomplete rows', () => {
       verifyGreen: true, policy: { ...review, startBeforeCi: true }, ...completeness }))
       .toMatchObject({ allowed: false, unknown: true, reason: 'rows-incomplete' });
   }
+});
+
+
+describe('resolver timing cancellation policy', () => {
+  const input = { ...evidence, requiredChecks: ['test'], checks: [check('test', 'cancelled')] };
+  it('counts a required needs-rerun as red and voids only when cancelOnCiRed is enabled', () => {
+    expect(ciRedOnHead(input)).toBe(true);
+    expect(fixReadiness(input)).toMatchObject({ ciFailed: true, ciFailures: [{ name: 'test', conclusion: 'cancelled' }] });
+    expect(reviewMustVoid({ ...input, reviewedHead: head, currentHead: head, policy: { ...review, cancelOnCiRed: true } })).toBe(true);
+    expect(reviewMustVoid({ ...input, reviewedHead: head, currentHead: head, policy: { ...review, cancelOnCiRed: false } })).toBe(false);
+  });
+  it.each(['fast-checks', 'ci-green', 'push'])('cancelled required CI blocks verification-marker admission under %s', startAfter => {
+    expect(reviewStartGate({ ...input, verifyGreen: true,
+      policy: { ...review, fastChecks: ['test'], startAfter, startBeforeCi: true } }))
+      .toMatchObject({ allowed: false, reason: 'ci-red' });
+  });
+  it('an optional cancellation is not red and a cancelled required check keeps push pending until the bound', () => {
+    expect(ciRedOnHead({ ...input, checks: [check('test'), check('optional', 'cancelled')] })).toBe(false);
+    const push = { ...input, previousHeadChecks: input.checks, firstHeldAt: 0, now: 0,
+      policy: { ...fix, pushAfterCi: true, pushAfterCiMaxMin: 1 } };
+    expect(fixPushGate(push)).toMatchObject({ action: 'wait', reason: 'ci-pending' });
+    expect(fixPushGate({ ...push, now: 60000 })).toMatchObject({ action: 'push', reason: 'bound' });
+  });
+  it.each([
+    { rosterSource: undefined }, { rosterSource: 'declared' }, { headSha: null },
+    { rowsHead: 'b'.repeat(40) }, { rowsComplete: undefined }, { rowsComplete: false },
+    { checks: [check('test', 'new-outcome')] }, { checks: null },
+  ])('unknown evidence refuses clearance and uses the bounded push fallback: %j', override => {
+    const args = { ...input, checks: [check('test')], ...override };
+    expect(ciRedOnHead(args)).toBe(true);
+    expect(fixReadiness(args)).toMatchObject({ ciFailed: false, otherPending: true });
+    const push = { ...args, previousHeadChecks: args.checks, firstHeldAt: 0, now: 0,
+      policy: { ...fix, pushAfterCi: true, pushAfterCiMaxMin: 1 } };
+    expect(fixPushGate(push).action).toBe('wait');
+    expect(fixPushGate({ ...push, now: 60000 }).reason).toBe('bound');
+  });
 });

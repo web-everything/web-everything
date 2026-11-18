@@ -1,5 +1,6 @@
 /** Pure review/fixer timing decisions. Inputs always describe one pinned head. */
 import { reviewCiGate, reviewRequiredChecks, isReviewOwnedCheck } from './review-ci-gate.mjs';
+import { resolveRequiredChecks } from './check-state-predicate.mjs';
 import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from './constellation-repos.mjs';
 
@@ -51,18 +52,18 @@ export const isReviewHoldGate = row => {
   const name = row?.name ?? row?.context;
   return name === 'review-gate' || (name === 'merge-gate' && !!row.mergeGateReviewHold);
 };
-/** The CI-heal rule (reconcile-core `splitFailingChecks`): a known required set names the healable checks. */
-const isHealable = (row, requiredChecks) => {
-  const name = row.name ?? row.context;
-  if (isReviewHoldGate(row)) return false;
-  return Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks.includes(name) : !NON_HEALABLE_CHECKS.includes(name);
-};
-/** Is a healable check red on this head? An optional red (CodeQL, with a known required set) is not. */
-export function ciRedOnHead({ headSha, checks, requiredChecks = null } = {}) {
-  if (!headSha) return false;
-  return collapseRollupToLatestPerName(checks).some(row => isHealable(row, requiredChecks)
-    && (!row.head_sha || row.head_sha === headSha)
-    && RED.has(String(row.conclusion ?? row.state ?? '').toLowerCase()));
+/** Required CI evidence: preserve all rows and let the shared resolver prove rerun lineage. */
+function timingEvidence({ headSha, checks, requiredChecks, rowsHead = headSha, rowsComplete = false, rosterSource }) {
+  return resolveRequiredChecks({ head: headSha, rowsHead, rows: checks, requiredNames: requiredChecks, rosterSource, rowsComplete });
+}
+const redEvidence = r => r.state === 'fail' || r.reasons.includes('needs-rerun');
+const healableFailures = evidence => Object.values(evidence.perName)
+  .filter(redEvidence).flatMap(r => r.rows.filter(row => [...RED, 'neutral', 'skipped', 'stale']
+    .includes(String(row.conclusion ?? row.state ?? '').toLowerCase())));
+/** Unknown evidence cannot establish that CI is safe to retain a review. */
+export function ciRedOnHead(args = {}) {
+  const evidence = timingEvidence(args);
+  return evidence.state === 'unknown' || healableFailures(evidence).length > 0;
 }
 /** Diagnostic only, including drafts: a wait retains the existing review gates; never grants merge permission. */
 export function earlyStartShadow({ headSha, checks, requiredChecks, verifyGreen, care, lines, files, kinds,
@@ -108,7 +109,7 @@ export function earlyStartShadow({ headSha, checks, requiredChecks, verifyGreen,
     const rows = collapseRollupToLatestPerName(checks).filter(row => !row.head_sha || row.head_sha === headSha);
     if (!requiredChecks.every(name => rows.some(row => (row.name ?? row.context) === name && readable(row)))) return result('incomplete-checks');
     if (rows.some(row => !readable(row))) return result('incomplete-checks');
-    if (ciRedOnHead({ headSha, checks, requiredChecks })) return result('ci-red');
+    if (ciRedOnHead({ headSha, checks, requiredChecks, rowsComplete: true, rosterSource: 'live' })) return result('ci-red');
   } catch { return result('unreadable-checks'); }
   return result('eligible', true);
 }
@@ -161,8 +162,15 @@ function registeredStartGate({ headSha, checks, requiredChecks, rowsComplete, ro
 }
 
 /** Review-owned checks cannot block the review they await; other CI consumers retain their rules. */
-export const reviewAdmissionCiRed = args => ciRedOnHead({ ...args, checks: Array.isArray(args.checks)
-  ? args.checks.filter(row => !isReviewOwnedCheck(row?.name ?? row?.context)) : args.checks });
+export const reviewAdmissionCiRed = args => {
+  // This is red detection only: PR1's start gates independently validate provenance and completeness.
+  // A missing roster here must still detect observed red without granting admission.
+  const checks = Array.isArray(args.checks) ? args.checks.filter(row => !isReviewOwnedCheck(row?.name ?? row?.context)) : [];
+  const requiredChecks = checkNames(args.requiredChecks) ? reviewRequiredChecks(args.requiredChecks)
+    : [...new Set((checks ?? []).map(row => row?.name ?? row?.context))];
+  const evidence = timingEvidence({ ...args, checks, requiredChecks, rowsComplete: true, rosterSource: 'live' });
+  return healableFailures(evidence).length > 0;
+};
 
 /** Start permission only. Merge/ready decisions must continue using their strict CI gates. */
 export function reviewStartGate({ headSha, checks, requiredChecks, rowsComplete = false, rosterSource, repo, verifyGreen, policy = REVIEW_TIMING_DEFAULTS } = {}) {
@@ -191,7 +199,7 @@ export function reviewStartGate({ headSha, checks, requiredChecks, rowsComplete 
     return { allowed: false, headSha, reason: 'malformed', affected: [] };
   // With a known required set, only its healable failures block review.
   if (Array.isArray(requiredChecks) && requiredChecks.length && reviewAdmissionCiRed({ headSha, checks, requiredChecks }))
-    return { allowed: false, headSha, reason: 'ci-red', affected: policy.startAfter === 'ci-green' ? strict().affected : [] };
+    return { allowed: false, headSha, reason: 'ci-red', affected: policy.startAfter === 'ci-green' || policy.startAfter === 'push' ? strict().affected : [] };
   // Verification adds a prerequisite; it cannot relax resolver evidence or pending CI.
   if (policy.startBeforeCi) {
     if (reviewAdmissionCiRed({ headSha, checks, requiredChecks: checkNames(requiredChecks) ? requiredChecks : null }))
@@ -207,7 +215,7 @@ export function reviewStartGate({ headSha, checks, requiredChecks, rowsComplete 
     if (typeof headSha !== 'string' || !headSha.trim()) return refuse('missing-head');
     // Unknown requirements cannot excuse red CI; use the same heal rule as the verification-marker path.
     if (reviewAdmissionCiRed({ headSha, checks, requiredChecks: checkNames(requiredChecks) ? requiredChecks : null }))
-      return refuse('ci-red');
+      return { ...refuse('ci-red'), affected: strict().affected };
     const gate = registered();
     if (gate.unknown || !gate.allowed && !(gate.affected.length && gate.affected.every(row => row.reason === 'pending'))) return gate;
     return { allowed: true, headSha, reason: 'push', affected: [] };
@@ -216,8 +224,10 @@ export function reviewStartGate({ headSha, checks, requiredChecks, rowsComplete 
   if (policy.startAfter === 'ci-green') return pendingStart(strict());
   return pendingStart(reviewCiGate({ headSha, checks, requiredChecks: prerequisites, rowsComplete, rosterSource: policy.startAfter === 'ci-green' || !fastChecksFor(policy.fastChecks, repo) ? rosterSource : 'live' }));
 }
-export function reviewMustVoid({ reviewedHead, currentHead, checks, requiredChecks = null, policy = REVIEW_TIMING_DEFAULTS } = {}) {
-  return !reviewedHead || reviewedHead !== currentHead || (policy.cancelOnCiRed && ciRedOnHead({ headSha: currentHead, checks, requiredChecks }));
+export function reviewMustVoid({ reviewedHead, currentHead, checks, requiredChecks = null, rowsHead = currentHead,
+  rowsComplete = false, rosterSource, policy = REVIEW_TIMING_DEFAULTS } = {}) {
+  return !reviewedHead || reviewedHead !== currentHead || (policy.cancelOnCiRed
+    && ciRedOnHead({ headSha: currentHead, checks, requiredChecks, rowsHead, rowsComplete, rosterSource }));
 }
 /** Unreadable sizes and binary deltas require full review. Mechanical status must be proved by the caller. */
 export function rereviewMode({ priorHead, head, lines, files, mechanical = false, policy = REVIEW_TIMING_DEFAULTS } = {}) {
@@ -241,43 +251,34 @@ export function joinedFixDecision({ ciFailed = false, reviewFindings = false, fi
 /**
  * PURE: select timestamped head-local readiness facts. findings are validated producer records supplied by caller.
  * With a known required set, only REQUIRED failures count: those are the only ones a CI heal repairs, so an optional
- * red (CodeQL) must not start the joined-fix clock or release a live reviewer's liveness hold. An unknown set falls
- * back to the heal path's own rule (every check but {@link NON_HEALABLE_CHECKS}).
+ * red (CodeQL) must not start the joined-fix clock or release a live reviewer's liveness hold.
+ * Unknown evidence waits for CI; it never fabricates a healable failure.
  */
-export function fixReadiness({ headSha, checks = [], findings = [], reviewPending = false, requiredChecks = null } = {}) {
-  const latest = collapseRollupToLatestPerName(checks).filter(row =>
-    !isReviewHoldGate(row) && (!row.head_sha || row.head_sha === headSha));
-  const failed = latest.filter(row => isHealable(row, requiredChecks)
-    && RED.has(String(row.conclusion ?? row.state ?? '').toLowerCase()));
+export function fixReadiness({ headSha, checks = [], findings = [], reviewPending = false, requiredChecks = null,
+  rowsHead = headSha, rowsComplete = false, rosterSource } = {}) {
+  const evidence = timingEvidence({ headSha, checks, requiredChecks, rowsHead, rowsComplete, rosterSource });
+  const failed = healableFailures(evidence);
   const times = [...failed.map(row => row.completed_at ?? row.completedAt), ...findings.map(row => row.createdAt)]
     .map(t => Date.parse(t)).filter(Number.isFinite);
   return { ciFailed: failed.length > 0, reviewFindings: findings.length > 0,
     firstReadyAt: times.length ? Math.min(...times) : NaN,
-    otherPending: failed.length > 0 ? reviewPending && findings.length === 0
-      : latest.some(row => ['queued', 'in_progress', 'pending', 'waiting', 'requested'].includes(String(row.status ?? row.state).toLowerCase())),
+    otherPending: evidence.state === 'unknown' || (failed.length > 0 ? reviewPending && findings.length === 0
+      : Object.values(evidence.perName).some(r => r.state === 'pending')),
     ciFailures: failed.map(row => ({ name: row.name ?? row.context, conclusion: row.conclusion ?? row.state,
       detailsUrl: row.details_url ?? row.detailsUrl ?? row.targetUrl ?? null })), findings };
 }
 
 /** Unknown or incomplete CI waits until the fixed bound; review holds never delay a fix push. */
-export function fixPushGate({ previousHeadChecks, requiredChecks, firstHeldAt, now, policy = FIX_TIMING_DEFAULTS } = {}) {
+export function fixPushGate({ headSha, rowsHead = headSha, rowsComplete = false, rosterSource, previousHeadChecks, requiredChecks, firstHeldAt, now, policy = FIX_TIMING_DEFAULTS } = {}) {
   if (!policy.pushAfterCi) return { action: 'push', reason: 'off' };
   const maxMin = Number.isSafeInteger(policy.pushAfterCiMaxMin) && policy.pushAfterCiMaxMin >= 0
     ? policy.pushAfterCiMaxMin : FIX_TIMING_DEFAULTS.pushAfterCiMaxMin;
   const deadline = firstHeldAt + maxMin * 60_000;
-  const latest = collapseRollupToLatestPerName(previousHeadChecks);
-  const rows = latest.filter(row => !isReviewHoldGate(row));
-  const required = Array.isArray(requiredChecks) && requiredChecks.length
-    ? requiredChecks.filter(name => name !== 'review-gate' && !latest
-      .some(row => (row.name ?? row.context) === name && isReviewHoldGate(row))) : [];
-  const complete = Array.isArray(previousHeadChecks) && required.length > 0 && required.every(name => {
-    const row = rows.find(row => (row.name ?? row.context) === name);
-    const conclusion = String(row?.conclusion ?? row?.state ?? '').toLowerCase();
-    return row && ['success', 'neutral', 'skipped', ...RED].includes(conclusion)
-      && (row.status === undefined || String(row.status).toLowerCase() === 'completed');
-  });
+  const evidence = timingEvidence({ headSha, checks: previousHeadChecks, requiredChecks, rowsHead, rowsComplete, rosterSource });
+  const complete = evidence.state !== 'unknown' && Object.values(evidence.perName)
+    .every(r => ['pass', 'fail', 'held'].includes(r.state));
   if (complete) return { action: 'push', reason: 'ci-complete',
-    ciFailures: fixReadiness({ checks: rows.map(({ head_sha, ...row }) => row), requiredChecks }).ciFailures };
+    ciFailures: fixReadiness({ headSha, checks: previousHeadChecks, requiredChecks, rowsHead, rowsComplete, rosterSource }).ciFailures };
   if (Number.isFinite(now) && Number.isFinite(deadline) && now >= deadline)
     return { action: 'push', reason: 'bound', deadline };
   return { action: 'wait', reason: 'ci-pending', deadline };
