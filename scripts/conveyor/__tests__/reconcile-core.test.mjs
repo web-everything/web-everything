@@ -176,6 +176,42 @@ describe('same-head referral resume preserves a newer send-back', () => {
     expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'fix' })]);
   });
 
+  it('a later same-head round-cap supersedes a trusted send-back label event', () => {
+    const capped = comment(`<!-- we:red-team-gate pr=6989 rev=${head} outcome=round-cap -->`, '2026-11-18T05:44:00Z');
+    const result = run(['status:sent-back-red-team', 'red-team:blocked'], [attempt, advisory, capped], {
+      number: 6989,
+      headChangedAt: '2026-11-18T04:00:00Z',
+      labelEvents: [{ actor: AUTOMATION, event: 'labeled', label: { name: 'status:sent-back-red-team' }, created_at: sendBack.createdAt }],
+    });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
+  });
+
+  it.each(['round-cap', 'clear', 'card-queued', 'unknown'])('a later same-head %s supersedes a trusted send-back comment', outcome => {
+    const gate = comment(`<!-- we:red-team-gate pr=6989 rev=${head} outcome=${outcome} -->`, '2026-11-18T05:44:00Z');
+    const result = run(['status:sent-back-review'], [attempt, advisory, sendBack, gate], { number: 6989 });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
+  });
+
+  it.each([
+    { name: 'at the same time as round-cap', gateAt: sendBack.createdAt, released: false },
+    { name: 'after round-cap', gateAt: '2026-11-18T05:20:00Z', released: true },
+    { name: 'with unreadable gate chronology', gateAt: 'unknown', released: false },
+  ])('a trusted send-back label event $name respects supersession', ({ gateAt, released }) => {
+    const gate = comment(`<!-- we:red-team-gate pr=6989 rev=${head} outcome=round-cap -->`, gateAt);
+    const result = run(['status:sent-back-red-team', 'red-team:blocked'], [attempt, advisory, gate], {
+      number: 6989,
+      headChangedAt: '2026-11-18T04:00:00Z',
+      labelEvents: [{ actor: AUTOMATION, event: 'labeled', label: { name: 'status:sent-back-red-team' }, created_at: sendBack.createdAt }],
+    });
+    if (released) expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'fix' })]);
+    else {
+      expect(result.dispatch).toEqual([]);
+      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head' }));
+    }
+  });
+
   it('an unpinned automated request cannot release the current-advisory hold', () => {
     const request = { ...sendBack, body: '🔁 review — changes requested\n\nRecorded by orchestrator via console.\n\nFix the missing export.' };
     const result = run([], [attempt, advisory, request]);

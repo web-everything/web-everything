@@ -1519,6 +1519,11 @@ function sendBackAfterFixAttempt(pr) {
   // and require readable review evidence before reopening an already-reviewed head.
   const review = latestHeadReview({ ...pr, comments: comments.map(c => requests.includes(c) ? {} : c) }, { currentHeadOnly: true });
   if (!review) return false;
+  // A gate decision supersedes label events just as it supersedes comment requests.
+  // Unreadable gate chronology cannot prove that a request is newer (NaN fails closed).
+  const latestSupersedingAt = Math.max(review.at,
+    gate && !['sent-back', 'operator-block'].includes(gate.outcome)
+      ? Date.parse(gate.comment.createdAt ?? gate.comment.created_at) : -Infinity);
   if (requests.some(c => {
     const heads = reviewedHeadsOf(c);
     const pinned = heads.some(head => sameHeadSha(head, pr.headRefOid))
@@ -1527,7 +1532,7 @@ function sendBackAfterFixAttempt(pr) {
       && String(c.id ?? c.node_id) === operatorRequest.verdictId;
     return (pinned || sanctionedOperator)
       && comments.indexOf(c) > Math.max(lastIndex, review.index)
-      && Date.parse(c.createdAt ?? c.created_at) > Math.max(lastAt, review.at);
+      && Date.parse(c.createdAt ?? c.created_at) > Math.max(lastAt, latestSupersedingAt);
   })) return true;
   const labels = labelNames(pr.labels);
   const headChangedAt = Date.parse(standDownHeadChangeAt(pr));
@@ -1540,7 +1545,7 @@ function sendBackAfterFixAttempt(pr) {
     return isTrustedMarkerAuthor({ author: actor })
       && labels.includes(label) && ['review:changes', 'status:sent-back-review', 'status:sent-back-red-team'].includes(label)
       && (e.event === 'labeled' || e.event === undefined)
-      && Date.parse(e.created_at ?? e.at ?? e.createdAt) > Math.max(lastAt, review.at, headChangedAt);
+      && Date.parse(e.created_at ?? e.at ?? e.createdAt) > Math.max(lastAt, latestSupersedingAt, headChangedAt);
   });
 }
 
