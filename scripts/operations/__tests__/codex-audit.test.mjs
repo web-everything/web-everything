@@ -296,6 +296,41 @@ describe('R973 scoped record never supersedes an open WEAKENED', () => {
     const only = rec('2026-11-01T11:00:00.000Z', 'NOT WEAKENED', scoped);
     expect(findAudit([only], opts)).toBe(only);
   });
+
+  describe('a newer scoped WEAKENED never hides, and is never hidden by, an older open WEAKENED', () => {
+    const A = 'a.mjs:1 fail-open', B = 'b.mjs:2 invariant broken';
+    const open = rec('2026-11-01T10:00:00.000Z', 'WEAKENED', { findings: [A] });
+    const scopedWeak = rec('2026-11-01T11:00:00.000Z', 'WEAKENED', { ...scoped, findings: [B] });
+    it.each([['open first', [open, scopedWeak]], ['scoped first', [scopedWeak, open]]])('blocks on BOTH findings (%s)', (_name, records) => {
+      const got = findAudit(records, opts);
+      expect(got.verdict).toBe('WEAKENED');
+      // A ruling for only the older findings (or only the newer ones) must not match the returned record.
+      expect(got.findings).toEqual([A, B]);
+      expect(got.findings).not.toEqual([A]);
+      expect(got.findings).not.toEqual([B]);
+    });
+    it('keeps the scoped record identity when no open WEAKENED exists', () => {
+      expect(findAudit([scopedWeak], opts)).toBe(scopedWeak);
+      expect(findAudit([rec('2026-11-01T09:00:00.000Z', 'NOT WEAKENED'), scopedWeak], opts)).toBe(scopedWeak);
+    });
+    it('a later open NOT WEAKENED re-audit leaves the newer scoped WEAKENED as the blocker', () => {
+      const fixed = rec('2026-11-01T10:30:00.000Z', 'NOT WEAKENED');
+      expect(findAudit([open, fixed, scopedWeak], opts)).toBe(scopedWeak);
+    });
+    it('also holds when the open WEAKENED sits under an accepted prior question hash', () => {
+      const PRIOR_HASH = 'd'.repeat(64);
+      const priorOpts = { ...opts, priorQuestionHashes: [{ hash: PRIOR_HASH, acceptUntil: '2026-12-01T00:00:00.000Z' }] };
+      const got = findAudit([{ ...open, questionHash: PRIOR_HASH }, scopedWeak], priorOpts);
+      expect(got.verdict).toBe('WEAKENED');
+      expect(got.findings).toEqual([A, B]);
+    });
+    it.each([undefined, []])('a scoped WEAKENED with findings %j still cannot match a ruling for the open findings alone', findings => {
+      const merged = findAudit([open, { ...scopedWeak, findings }], opts);
+      expect(merged.verdict).toBe('WEAKENED');
+      expect(merged.findings).not.toEqual([A]);
+      expect(merged.findings.slice(0, 1)).toEqual([A]);
+    });
+  });
 });
 
 describe('canonical audit', () => {

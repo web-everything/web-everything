@@ -524,6 +524,21 @@ describe('canonicalAuditEvidence', () => {
         expect(evaluate([{ ...open, ...bad }, scoped], {})).toEqual({ ok: false, reason: 'no-record' });
       }
     });
+    it('a ruling for an older open WEAKENED does not cover a newer scoped WEAKENED with other findings', () => {
+      const A = 'x.mjs:1 guard removed', B = 'y.mjs:2 invariant broken';
+      const openWeak = auditRecord({ base: BASE_A, head: HEAD, at: at('10'), verdict: 'WEAKENED', findings: [A], fingerprint: FP });
+      const scopedWeak = scopedAudit({ base: BASE_A, head: HEAD, at: at('11'), verdict: 'WEAKENED', findings: [B], fingerprint: FP, followUps: [] });
+      const gate = (findings) => ({ ruledWeakened: { findings: [...findings], ruling: 'R396' }, record: { sha: HEAD, fingerprint: FP } });
+      // Ruled for A only, or B only: the combined blocker is not covered either way.
+      for (const ruled of [[A], [B]]) {
+        expect(evaluate([openWeak, scopedWeak], { invariantsText, ruledWeakened: gate(ruled) })).toEqual({ ok: false, reason: 'weakened' });
+        expect(evaluate([scopedWeak, openWeak], { invariantsText, ruledWeakened: gate(ruled) })).toEqual({ ok: false, reason: 'weakened' });
+      }
+      // A ruling that discloses both findings still admits (the exception is explicit, never inferred).
+      expect(evaluate([openWeak, scopedWeak], { invariantsText, ruledWeakened: gate([A, B]) })).toMatchObject({ ok: true });
+      // Baseline: the open WEAKENED alone is admitted by its own ruling.
+      expect(evaluate([openWeak], { ruledWeakened: gate([A]) })).toMatchObject({ ok: true });
+    });
     it('an open WEAKENED on the live head beats a scoped pass', () => {
       expect(evaluate([open, { ...open, at: at('11'), verdict: 'WEAKENED', findings: ['y.mjs:2 broke'] }, scoped], { invariantsText }))
         .toEqual({ ok: false, reason: 'weakened' });
@@ -2414,6 +2429,15 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
         const fixed = (at) => old({ base: C, questionHash: PRIOR, at, findings: [] });
         expect(carry(livePass(), weak(), fixed('2026-10-20T18:00:00Z'), hider()).ok).toBe(true);
         expect(carry(livePass(), fixed('2026-10-20T06:00:00Z'), weak(), hider())).toEqual({ ok: false, reason: 'weakened' });
+      });
+      it('a ruling for the hidden open WEAKENED does not cover a newer prior-question scoped WEAKENED of that base', () => {
+        const scopedWeak = weak({ at: '2026-10-20T13:00:00Z', scope: 'invariants', invariantsHash: 'e'.repeat(64), followUps: [], findings: ['y.mjs:2 invariant broken'] });
+        const gate = (findings) => ({ ruledWeakened: { findings, ruling: 'R396' }, record: { sha: SHA, fingerprint: FP } });
+        const withGate = (findings, ...records) => prototypeLoad.canonicalAuditEvidence(records, SHA, () => true, FP, { ...opts, ruledWeakened: gate(findings) });
+        for (const records of [[livePass(), weak(), scopedWeak, hider()], [hider(), scopedWeak, weak(), livePass()]]) {
+          expect(withGate(['x.mjs:1 guard removed'], ...records)).toEqual({ ok: false, reason: 'weakened' });
+          expect(withGate(['y.mjs:2 invariant broken'], ...records)).toEqual({ ok: false, reason: 'weakened' });
+        }
       });
       it('a newer own covered audit still supersedes it (fresh re-audit)', () => {
         const newer = auditRecord({ head: SHA, at: '2026-10-22T12:00:00Z' });

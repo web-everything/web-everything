@@ -6,7 +6,7 @@
 import { op } from './registry.mjs';
 import { createHash } from 'node:crypto';
 import { compute, effect } from './step-kinds.mjs';
-import { QUESTION_HASH, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes } from './codex-audit.mjs';
+import { QUESTION_HASH, findAudit, auditResultIncludes, isAcceptedQuestionHash, resolvePriorQuestionHashes } from './codex-audit.mjs';
 import { carriesAcross } from '../lib/net-diff-fingerprint.mjs';
 export const PROTOTYPE_LOAD_OP = 'prototype-load';
 export const PROTOTYPE_LOAD_EFFECT = 'prototype-load.apply';
@@ -233,7 +233,9 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   const priorOnly = list.filter((r) => r?.questionHash !== QUESTION_HASH);
   const hiddenWeak = priorOnly.filter((r) => r?.verdict === 'WEAKENED' && typeof r.head === 'string' && carriedHeads.has(r.head) && r.base !== r.head
     && !carried.some((d) => d.record.head === r.head && d.base === r.base)
-    && findAudit(priorOnly, { ...auditOptions, head: r.head, base: r.base, questionHash: QUESTION_HASH, priorQuestionHashes, now }) === r).map((record) => ({ base: record.base, record }));
+    ).map((r) => ({ r, found: findAudit(priorOnly, { ...auditOptions, head: r.head, base: r.base, questionHash: QUESTION_HASH, priorQuestionHashes, now }) }))
+    // A merged open + scoped WEAKENED blocker is judged as ONE record, so a ruling must disclose every finding.
+    .filter(({ r, found }) => auditResultIncludes(found, r)).map(({ r, found }) => ({ base: r.base, record: found }));
   // The latest USABLE open-mode (scope !== 'invariants') record for a head+base, judged by findAudit's own acceptance
   // rules over the FULL list. A scoped record never supersedes it, and an unusable one (bad time, foreign or expired
   // question, unknown verdict, conflicting findings) never counts. When any current-question record exists for the

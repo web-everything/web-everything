@@ -93,6 +93,10 @@ export function isAcceptedQuestionHash(hash, { priorQuestionHashes = [], now = D
   return priorQuestionHashes.some(e => e?.hash === hash && Number.isFinite(Date.parse(e.acceptUntil)) && now <= Date.parse(e.acceptUntil) && recordInWindow(e, at));
 }
 
+const MERGED_FROM = new WeakMap();
+/** True when `result` (from findAudit) is `record` itself or a blocker merged from it (open + scoped WEAKENED). */
+export const auditResultIncludes = (result, record) => !!result && (result === record || !!MERGED_FROM.get(result)?.includes(record));
+
 /** Latest timestamp wins, with later appended records breaking ties; foreign hashes never qualify. Records under a
  * prior question hash qualify only while inside their window; a prior WEAKENED is returned (and so blocks). */
 export function findAudit(records, { head, base, questionHash, priorQuestionHashes = resolvePriorQuestionHashes(), now = Date.now() }) {
@@ -119,8 +123,14 @@ export function findAudit(records, { head, base, questionHash, priorQuestionHash
   // R973: scoped evidence cannot erase an open WEAKENED, including under an accepted prior question hash.
   // A usable current-question open re-audit still takes precedence over every prior-question open record.
   const open = latestOpen ?? priorOpen;
-  if (selected?.scope === 'invariants' && open?.verdict === 'WEAKENED') return open;
-  return selected;
+  if (selected?.scope !== 'invariants' || open?.verdict !== 'WEAKENED') return selected;
+  // A scoped pass leaves the open WEAKENED standing. A scoped WEAKENED is a second, independent negative: neither
+  // record may hide the other, so the blocker carries both disclosures and a ruling must name every finding.
+  if (selected.verdict !== 'WEAKENED') return open;
+  const scopedFindings = Array.isArray(selected.findings) && selected.findings.length ? selected.findings : ['scoped WEAKENED without disclosed findings'];
+  const merged = { ...selected, findings: [...(Array.isArray(open.findings) ? open.findings : []), ...scopedFindings] };
+  MERGED_FROM.set(merged, [open, selected]);
+  return merged;
 }
 
 /** Inject resolveSha, runCodex, appendRecord, now, stdout and stderr for hermetic execution. */
