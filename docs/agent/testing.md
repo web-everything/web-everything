@@ -4441,3 +4441,14 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+## Workflow-scoped check attempts (R37)
+
+The review CI gate, CodeQL failure reader and ci-heal verdict recheck use
+`scripts/lib/check-row-resolver.mjs`: compare timestamps only within an exact
+workflow/check-name pair. Missing timestamps or ties prefer blocking evidence;
+IDs never establish recency. Workflow-less rows share one group per name.
+Fixtures representing independent producers must identify their workflows.
+A merge-gate review-hold annotation cannot outrank ordinary CI failure or pending
+evidence when attempt order is ambiguous. Run the resolver and affected gate tests
+through heavy admission.

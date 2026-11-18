@@ -23,11 +23,11 @@ describe('strict review CI prerequisite', () => {
     }
   });
   it('uses the newest rerun regardless of REST ordering', () => {
-    const old = { ...success('test'), id: 1, conclusion: 'failure' };
-    const fresh = { ...success('test'), id: 2 };
+    const old = { ...success('test'), id: 1, startedAt: '2026-10-28T01:00:00Z', conclusion: 'failure' };
+    const fresh = { ...success('test'), id: 2, startedAt: '2026-10-28T02:00:00Z' };
     for (const rows of [[old, fresh], [fresh, old]]) expect(gate([...rows, success('daemon-soak')]).allowed).toBe(true);
     for (const status of ['in_progress', 'completed']) {
-      expect(gate([{ ...fresh, id: 3, status, conclusion: 'failure' }, fresh, success('daemon-soak')]).allowed).toBe(false);
+      expect(gate([{ ...fresh, id: 3, startedAt: '2026-10-28T03:00:00Z', status, conclusion: 'failure' }, fresh, success('daemon-soak')]).allowed).toBe(false);
     }
   });
   it('never exempts an explicitly required review-gate', () => {
@@ -43,4 +43,25 @@ describe('strict review CI prerequisite', () => {
       expect(reviewCiGate({ headSha, requiredChecks: ['legacy'], checks: [{ context: 'legacy', state }] }))
         .toMatchObject({ allowed: false, affected: [{ name: 'legacy', reason }] });
     });
+});
+
+// R37: display names are shared across independent workflows.
+describe('R37 workflow partitions', () => {
+  it.each(['failure', null])('refuses a separate failing/pending workflow (%s) despite later success', conclusion => {
+    const rows = [
+      { ...success('test'), workflowName: 'security', startedAt: '2026-10-28T01:00:00Z',
+        status: conclusion ? 'completed' : 'in_progress', conclusion },
+      { ...success('test'), workflowName: 'CI', startedAt: '2026-10-28T02:00:00Z' },
+    ];
+    for (const order of [rows, rows.toReversed()]) {
+      expect(gate([...order, success('daemon-soak')]).allowed).toBe(false);
+    }
+  });
+  it.each([undefined, '2026-10-28T01:00:00Z'])('fails closed for missing/tied times (%s), ignoring ids', startedAt => {
+    const rows = [
+      { ...success('test'), id: 1, startedAt, conclusion: 'failure' },
+      { ...success('test'), id: 99, startedAt: '2026-10-28T01:00:00Z' },
+    ];
+    for (const order of [rows, rows.toReversed()]) expect(gate([...order, success('daemon-soak')]).allowed).toBe(false);
+  });
 });

@@ -227,7 +227,7 @@ describe('R10 escalation send-back regressions', () => {
       const evidence = { requiredChecks: ['test'], rollup: [
         { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
         { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
-        { name: 'CodeQL', status: 'COMPLETED', conclusion: 'FAILURE', run_attempt: 1, completedAt: '2026-10-28T12:00:00-04:00' },
+        { name: 'CodeQL', workflowName: 'security', status: 'COMPLETED', conclusion: 'FAILURE', run_attempt: 1, completedAt: '2026-10-28T12:00:00-04:00' },
         { name: 'CodeQL', status: 'COMPLETED', conclusion, run_attempt: 2, completedAt: '2026-10-28T13:00:00-04:00' },
       ] };
       for (const drainBlocksOnCodeQL of [false, true]) {
@@ -255,7 +255,7 @@ describe('requiredCheckStates shared predicate regressions', () => {
       for (const conclusion of ['FAILURE', 'CANCELLED', 'SUCCESS']) {
         const rows = [
           { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: conclusion === 'SUCCESS' ? 'FAILURE' : 'SUCCESS',
-            completedAt: '2026-10-28T01:00:00Z', ...olderMetadata },
+            completedAt: '2026-10-28T01:00:00Z', workflowName: conclusion === 'SUCCESS' ? 'security' : undefined, ...olderMetadata },
           { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion,
             completedAt: '2026-10-28T02:00:00Z', ...newerMetadata },
         ];
@@ -308,7 +308,7 @@ describe('requiredCheckStates shared predicate regressions', () => {
     ]) {
       const rows = [
         { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-28T02:00:00Z', ...olderMetadata },
-        { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T01:00:00Z', ...newerMetadata },
+        { name: 'test', workflowName: 'security', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T01:00:00Z', ...newerMetadata },
       ];
       expect(requiredCheckStates({ requiredChecks: ['test'], rollup: reverse ? rows.toReversed() : rows }))
         .toEqual({ red: ['test'], pending: [], missing: [], green: [] });
@@ -318,7 +318,7 @@ describe('requiredCheckStates shared predicate regressions', () => {
   it.each([false, true])('cross-run completion times and partial check ids cannot hide failure (reverse=%s)', reverse => {
     const rows = [
       { name: 'test', run_id: 100, run_attempt: 2, id: 100, status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-28T02:00:00Z' },
-      { name: 'test', run_id: 200, status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T01:00:00Z' },
+      { name: 'test', workflowName: 'security', run_id: 200, status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T01:00:00Z' },
     ];
     expect(requiredCheckStates({ requiredChecks: ['test'], rollup: reverse ? rows.toReversed() : rows }))
       .toEqual({ red: ['test'], pending: [], missing: [], green: [] });
@@ -363,7 +363,7 @@ describe('requiredCheckStates shared predicate regressions', () => {
 
   it.each([false, true])('CheckRun failure stays red beside an untagged named success (reverse=%s)', reverse => {
     const rows = [
-      { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T01:00:00Z' },
+      { __typename: 'CheckRun', name: 'test', workflowName: 'security', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T01:00:00Z' },
       { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-28T02:00:00Z' },
     ];
     expect(requiredCheckStates({ requiredChecks: ['test'], rollup: reverse ? rows.toReversed() : rows }))
@@ -417,8 +417,8 @@ describe('requiredCheckStates shared predicate regressions', () => {
     for (const kind of ['CheckRun', 'untagged', 'StatusContext']) {
       for (const [, timestamps] of undatedShapes) {
         const rows = [
-          tierRow(kind, { conclusion: dated, completedAt: '2026-10-28T01:00:00Z' }),
-          tierRow(kind, { conclusion: undated, ...timestamps }),
+          tierRow(kind, { workflowName: 'CI', conclusion: dated, completedAt: '2026-10-28T01:00:00Z' }),
+          tierRow(kind, { workflowName: 'security', conclusion: undated, ...timestamps }),
         ];
         for (const pair of [rows, rows.toReversed()]) {
           const evidence = { ...input, requiredChecks: ['test'], rollup: [
@@ -456,7 +456,7 @@ describe('requiredCheckStates shared predicate regressions', () => {
   it.each(['2026-10-28T02:00:00.5Z', '2026-10-27T22:00:00-04:00', '2026-10-28t02:00:00z'])(
     'a zoned ISO timestamp %s cannot hide failure in both input orders', completedAt => {
       const rows = [
-        { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T01:00:00Z' },
+        { name: 'test', workflowName: 'security', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T01:00:00Z' },
         { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt },
       ];
       for (const rollup of [rows, rows.toReversed()]) {
@@ -468,7 +468,7 @@ describe('requiredCheckStates shared predicate regressions', () => {
 
   it('timestamps around the former future-skew bound never discard a failure', () => {
     const now = Date.parse('2026-10-28T12:00:00Z');
-    const failure = { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T11:00:00Z' };
+    const failure = { name: 'test', workflowName: 'security', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T11:00:00Z' };
     for (const completedAt of [
       '2026-10-29T11:59:59Z', '2026-10-29T12:00:00Z', '2026-10-29T12:00:01Z',
     ]) {
@@ -617,7 +617,7 @@ describe('required check verdict recheck', () => {
   it('a newer success cannot hide an old red appearing last in the array', () => {
     const rollup = [
       { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-09T04:00:00Z', completedAt: '2026-10-09T04:01:00Z' },
-      { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-09T02:00:00Z', completedAt: '2026-10-09T02:01:00Z' },
+      { name: 'test', workflowName: 'security', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-09T02:00:00Z', completedAt: '2026-10-09T02:01:00Z' },
     ];
     expect(contradictingChecks({ ...input, rollup, requiredChecks: ['test'] })).toEqual(['test']);
   });
@@ -763,6 +763,26 @@ describe('R272 fail-closed evidence across every row', () => {
       expect(notCiBreakRecordRefusal({ headSha: input.headSha,
         pr: { headRefOid: input.headSha, statusCheckRollup: rollup }, requiredChecks: ['test'] }))
         .toContain('red: CodeQL');
+    }
+  });
+});
+
+describe('R37 latest attempts within workflow partitions', () => {
+  it('keeps a different workflow red despite a later-started success', () => {
+    const rollup = [
+      { name: 'test', workflowName: 'security', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-28T01:00:00Z' },
+      { name: 'test', workflowName: 'CI', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-28T02:00:00Z' },
+    ];
+    for (const rows of [rollup, rollup.toReversed()]) {
+      expect(requiredCheckStates({ rollup: rows, requiredChecks: ['test'] }).red).toEqual(['test']);
+      expect(verdictRecheck.gateOnlyRedStates({ rollup: rows, requiredChecks: ['test'] }).gateOnlyRed).toBe(false);
+    }
+  });
+  it.each([undefined, 'CI'])('accepts a newer successful attempt within workflow %s', workflowName => {
+    const failed = { name: 'test', workflowName, status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-28T01:00:00Z' };
+    const passed = { ...failed, conclusion: 'SUCCESS', startedAt: '2026-10-28T02:00:00Z' };
+    for (const rollup of [[failed, passed], [passed, failed]]) {
+      expect(requiredCheckStates({ rollup, requiredChecks: ['test'] })).toEqual({ red: [], pending: [], missing: [], green: ['test'] });
     }
   });
 });

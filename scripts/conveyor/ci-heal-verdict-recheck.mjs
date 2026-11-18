@@ -26,6 +26,7 @@ import { fileURLToPath } from 'node:url';
 import { withoutImpliedRequiredChecks } from '../lib/required-check-implication.mjs';
 import { classifyCheck, summarize } from '../lib/check-state-predicate.mjs';
 import { CODEQL_CHECK_NAME } from '../lib/codeql-gate.mjs';
+import { resolveCheckRows } from '../lib/check-row-resolver.mjs';
 
 export const CI_HEAL_VERDICT_ENV = 'WE_CI_HEAL_RECHECK_NOT_CI_BREAK';
 export const ciHealVerdictSettingsPath = () => join(dirname(fileURLToPath(import.meta.url)), 'ci-heal-verdict-settings.json');
@@ -102,7 +103,9 @@ export function latestRollupAttempts(rollup) {
 
 /** Adapt GraphQL rollups and legacy statuses without replacing the shared state policy. */
 function checkEvidence(rollup, requiredChecks) {
-  const checks = (Array.isArray(rollup) ? rollup : []).map(normalizeRollupCheck);
+  const checks = resolveCheckRows((Array.isArray(rollup) ? rollup : []).map(normalizeRollupCheck),
+    row => row.name === 'merge-gate' && row.mergeGateReviewHold
+      ? 'green' : classifyCheck({ ...row, required: true }));
   // Only the shared merge-gate hold classifier's annotation proves a review hold.
   // A job/setup failure (or unreadable verdict) must remain ordinary CI evidence.
   const holdGateNames = [REVIEW_GATE_CHECK];

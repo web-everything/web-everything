@@ -15,7 +15,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
+import { resolveCheckRows } from './check-row-resolver.mjs';
 import { redactSecrets } from '../conveyor/ci-heal-mark.mjs';
 
 export const CODEQL_CHECK_NAME = 'CodeQL';
@@ -35,9 +35,10 @@ export function loadDrainGateSettings(path = join(dirname(fileURLToPath(import.m
 export function failedCodeQLCheck(pr) {
   if (pr?.requiredCheckReadError) return null;
   const roll = Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : [];
-  const latest = collapseRollupToLatestPerName(roll).find((c) => (c?.name || c?.context) === CODEQL_CHECK_NAME);
-  if (!latest) return null;
-  return String(latest.conclusion || latest.state || '').toUpperCase() === 'FAILURE' ? latest : null;
+  // This API reports failures only; ambiguous evidence must prefer a known FAILURE.
+  return resolveCheckRows(roll, c => String(c?.conclusion || c?.state || '').toUpperCase() === 'FAILURE'
+    ? 'red' : 'pending').find(c => (c?.name || c?.context) === CODEQL_CHECK_NAME
+    && String(c.conclusion || c.state || '').toUpperCase() === 'FAILURE') ?? null;
 }
 
 /** The numeric check-run id out of a CheckRun `detailsUrl` (`https://github.com/<o>/<r>/runs/<id>`), or `null`. */

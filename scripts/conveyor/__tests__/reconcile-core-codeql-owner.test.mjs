@@ -156,3 +156,18 @@ describe('codeql brief treats annotation text as untrusted data (x8cnbii review)
     expect(o.match(/^```/gm) ?? []).toHaveLength(0);
   });
 });
+
+describe('R37 CodeQL workflow partitions', () => {
+  it('does not let the first successful workflow hide a later failing workflow', () => {
+    const rows = [
+      { name: 'CodeQL', workflowName: 'CI', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-28T01:00:00Z' },
+      { name: 'CodeQL', workflowName: 'security', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-28T02:00:00Z' },
+    ];
+    for (const order of [rows, rows.toReversed()]) expect(failedCodeQLCheck({ statusCheckRollup: order })?.conclusion).toBe('FAILURE');
+  });
+  it('allows a timestamped successful rerun only within the same workflow', () => {
+    const failed = { name: 'CodeQL', workflowName: 'security', conclusion: 'FAILURE', completedAt: '2026-10-28T01:00:00Z' };
+    const passed = { ...failed, conclusion: 'SUCCESS', completedAt: '2026-10-28T02:00:00Z' };
+    for (const rows of [[failed, passed], [passed, failed]]) expect(failedCodeQLCheck({ statusCheckRollup: rows })).toBeNull();
+  });
+});

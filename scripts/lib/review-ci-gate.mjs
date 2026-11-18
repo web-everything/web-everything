@@ -1,5 +1,5 @@
 /** Strict review prerequisite; independent of the general merge/CI reducer. */
-import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
+import { resolveCheckRows } from './check-row-resolver.mjs';
 import { withoutImpliedRequiredChecks } from './required-check-implication.mjs';
 
 /**
@@ -21,9 +21,7 @@ export function reviewCiGate({ headSha, requiredChecks, checks } = {}) {
   if (typeof headSha !== 'string' || !headSha.trim()) return refuse('missing-head');
   if (!Array.isArray(requiredChecks) || !requiredChecks.length
       || requiredChecks.some(name => typeof name !== 'string' || !name.trim())) return refuse('unknown-required-set');
-  const latest = new Map(collapseRollupToLatestPerName(checks).map(row => [row?.name ?? row?.context, statusAsCheckRow(row)]));
-  const affected = [...new Set(withoutImpliedRequiredChecks(requiredChecks, [...latest.values()]))].flatMap(name => {
-    const row = latest.get(name);
+  const reasonFor = row => {
     let reason;
     if (!row) reason = 'missing';
     else if (row.head_sha && row.head_sha !== headSha) reason = 'wrong-head';
@@ -31,6 +29,13 @@ export function reviewCiGate({ headSha, requiredChecks, checks } = {}) {
     else if (['queued', 'in_progress', 'pending', 'waiting', 'requested'].includes(row.status.toLowerCase())) reason = 'pending';
     else if (row.status.toLowerCase() !== 'completed' || typeof row.conclusion !== 'string') reason = 'malformed';
     else if (row.conclusion.toLowerCase() !== 'success') reason = row.conclusion.toLowerCase() || 'malformed';
+    return reason;
+  };
+  const latest = resolveCheckRows((Array.isArray(checks) ? checks : []).map(statusAsCheckRow),
+    row => reasonFor(row) ? 'red' : 'green');
+  const affected = [...new Set(withoutImpliedRequiredChecks(requiredChecks, latest))].flatMap(name => {
+    const rows = latest.filter(row => (row?.name ?? row?.context) === name);
+    const reason = rows.length ? rows.map(reasonFor).find(Boolean) : 'missing';
     return reason ? [{ name, reason }] : [];
   });
   if (affected.length) return refuse(affected.some(row => row.name === 'review-gate')
