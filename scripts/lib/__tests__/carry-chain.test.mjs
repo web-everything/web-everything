@@ -1,10 +1,10 @@
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { proveMixedMechanicalChain } from '../carry-chain.mjs';
-import { MAX_NUMBERING_COMMITS, planNumberingRestamp, restampAfterNumbering, _resetNumberingRestampMemo } from '../numbering-carry.mjs';
+import { numberingGitRunner, proveNumberingWithRunner, MAX_NUMBERING_COMMITS, planNumberingRestamp, restampAfterNumbering, _resetNumberingRestampMemo } from '../numbering-carry.mjs';
 
 const dirs = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); _resetNumberingRestampMemo(); });
@@ -52,15 +52,26 @@ it('proves numbering then clean merge with ordered, SHA-bound hops', () => {
     { kind: 'numbering', from: r.from, to: numbered }, { kind: 'merge', from: numbered, to },
   ] });
 });
-it('caps every delegated Git read at 5 seconds and 8 MiB', () => {
-  const r = repo(); r.number(); const to = r.merge(), calls = [];
+it('caps numbering and merge Git reads in the mixed chain at 5 seconds and their byte limits', () => {
+  const r = repo(); const numbered = r.number(); const to = r.merge(), calls = [];
   const exec = (cmd, args, opts) => {
     calls.push({ cmd, args, opts });
     return execFileSync(cmd, args, opts);
   };
   expect(proveMixedMechanicalChain({ exec, cwd: r.cwd, fromSha: r.from, toSha: to })).toMatchObject({ ok: true });
-  // Exercise both numbering and merge delegates, including net-patch's larger requested bounds.
-  expect(calls.some(({ args }) => args[0] === 'diff-tree')).toBe(true);
+  const run = vi.fn(execFileSync);
+  const runner = numberingGitRunner({ cwd: r.cwd, run });
+  expect(proveNumberingWithRunner({ fromSha: r.from, toSha: numbered }, runner)).toMatchObject({ ok: true });
+  const numberingReads = run.mock.calls;
+  expect(numberingReads.some(([, args]) => args.includes('blob'))).toBe(true);
+  for (const [cmd, args, opts] of numberingReads) {
+    expect(cmd).toBe('git');
+    expect(opts).toMatchObject({ cwd: r.cwd, timeout: 5000,
+      maxBuffer: args.includes('blob') ? 1024 * 1024 : 8 * 1024 * 1024,
+      env: { GIT_NO_LAZY_FETCH: '1', GIT_NO_REPLACE_OBJECTS: '1', GIT_TERMINAL_PROMPT: '0' } });
+    expect(args.slice(0, 6)).toEqual(['-c', 'protocol.allow=never', '-c', 'extensions.partialClone=', '-c', 'remote.origin.promisor=false']);
+  }
+  expect(calls.some(({ args }) => args[0] === 'diff')).toBe(true);
   expect(calls.find(({ args }) => args[0] === 'patch-id')?.opts).toMatchObject({
     timeout: 5000, maxBuffer: 8 * 1024 * 1024,
   });
@@ -163,10 +174,11 @@ it('refuses merge-owned changes even on the normally transient root manifest', (
 });
 
 it('refuses unreadable numbering-hop blobs without fetching or posting', () => {
-  const r = repo(); r.number(); const to = r.merge(), calls = [];
+  const r = repo(); const numbered = r.number(); const to = r.merge(), calls = [];
+  const oid = r.git('rev-parse', `${numbered}:backlog/7474-card.md`);
+  rmSync(join(r.cwd, '.git', 'objects', oid.slice(0, 2), oid.slice(2)));
   const exec = (cmd, args, opts) => {
     calls.push(args);
-    if (args[0] === 'cat-file' && args[1] === 'blob') throw Error('blob unavailable');
     return execFileSync(cmd, args, opts);
   };
   expect(proveMixedMechanicalChain({ exec, cwd: r.cwd, fromSha: r.from, toSha: to })).toMatchObject({ ok: false });
