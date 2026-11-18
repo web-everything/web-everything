@@ -483,6 +483,10 @@ export async function runAgyReviewJuror({ request, laneCwd, model, watch = [], d
     let transcriptText = '';
     if (transcriptFile) {
       try { transcriptText = readFile(transcriptFile); } catch { reasons.push('transcript unreadable — escape check incomplete'); }
+      // Fail closed: a transcript with any non-empty line that is not valid JSON is incomplete escape evidence.
+      if (transcriptText.split('\n').some((line) => { if (!line.trim()) return false; try { JSON.parse(line); return false; } catch { return true; } })) {
+        reasons.push('transcript malformed — escape check incomplete');
+      }
       const calls = stateChangingToolCalls(transcriptText, {
         allowedRoots: [jurorLane, realpathOr(jurorLane)], home, sessionId: outcome?.sessionId,
       });

@@ -123,6 +123,13 @@ describe('shared checkouts correlate changes with every transcript tool update',
     expect(out.status).toBe('voided');
   });
 
+  it.each(['{truncated', 'not json\n{"event":"result"}'])('a malformed transcript voids the run even with no shared change (%j)', async (transcriptText) => {
+    const fx = fixture();
+    const out = await fx.run(undefined, undefined, { transcriptText });
+    expect(out.status).toBe('voided');
+    expect(out.reasons).toContain('transcript malformed — escape check incomplete');
+  });
+
   it('opaque errored parameters alone do not imply a shared change', async () => {
     const fx = fixture();
     const out = await fx.run(undefined, () => [tool('', { status: 'TOOL_ERROR', tool_name: 'run_command', tool_info: { parameters: '{broken' } })]);
