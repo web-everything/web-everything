@@ -206,7 +206,7 @@ describe('setting-driven red-team queue floor', () => {
 
   it('loads defaults 6/10 from the real shipped settings file with no environment overrides', () => {
     expect(loadRedTeamQueueFloor({ env: {} })).toEqual({ minConcurrent: 6, idlePct: 10, reviewStartsPerTick: 6 });
-    expect(redTeamQueue.RED_TEAM_QUEUE_MIN_CONCURRENT_MAX).toBe(12);
+    expect(redTeamQueue.RED_TEAM_QUEUE_MIN_CONCURRENT_MAX).toBe(24);
     expect(redTeamQueue.RED_TEAM_QUEUE_MIN_CONCURRENT_CAP).toBe(6);
   });
 
@@ -1400,7 +1400,7 @@ describe('R878 red-team queue admits up to 4 only within the host ceiling', () =
 
 
 describe('operator-db red-team capacity override', () => {
-  it.each([0, 9, 12])('loads operator minimum %s above env and logs operator-db', minimum => {
+  it.each([0, 9, 16, 24])('loads operator minimum %s above env and logs operator-db', minimum => {
     const dir = mkdtempSync(join(tmpdir(), 'red-team-override-'));
     try {
       const file = join(dir, 'operator-overrides.json');
@@ -1409,9 +1409,9 @@ describe('operator-db red-team capacity override', () => {
       const floor = loadRedTeamQueueFloor({ env: { ...operatorEnv(file), WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '2' }, log });
       expect(floor.minConcurrent).toBe(minimum);
       expect(log.mock.calls.flat().join(' ')).toMatch(/minConcurrent=.*operator-db/);
-      const bound = { lanes: 20, startsCeiling: 10, remainingStarts: 0, budget: { left: 20 } };
+      const bound = { lanes: 30, startsCeiling: 26, remainingStarts: 0, budget: { left: 30 } };
       applyRedTeamQueueFloor(bound, { floor, cpuIdlePct: 100 });
-      expect(redTeamQueueAdmitCount(bound)).toBe(Math.min(minimum, 10));
+      expect(redTeamQueueAdmitCount(bound)).toBe(Math.min(minimum, 26));
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it.each([12, 99])('clamps direct floor input %s to the non-operator cap 6', minimum => {
@@ -1422,7 +1422,7 @@ describe('operator-db red-team capacity override', () => {
   it('oversized operator input disables capacity raises despite a valid looser env value', () => {
     const dir = mkdtempSync(join(tmpdir(), 'red-team-override-'));
     try {
-      const file = join(dir, 'operator-overrides.json'); writeFileSync(file, JSON.stringify({ 'redTeamQueue.minConcurrent': 13 }));
+      const file = join(dir, 'operator-overrides.json'); writeFileSync(file, JSON.stringify({ 'redTeamQueue.minConcurrent': 25 }));
       expect(loadRedTeamQueueFloor({ env: { ...operatorEnv(file), WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '3' } }).minConcurrent).toBe(0);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
@@ -1459,7 +1459,7 @@ it('operator minimum 12 reaches 12 while a copied direct input remains capped at
 
 it.each([
   ['redTeamQueue.minConcurrent', '1'],
-  ['redTeamQueue.minConcurrent', 13],
+  ['redTeamQueue.minConcurrent', 25],
   ['redTeamQueue.unknownCapacity', 1],
   ['redTeamQueue.minConcurrentIdlePct', 0],
 ])('R907 malformed %s=%j disables both red-team capacity raises', (key, value) => {

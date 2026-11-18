@@ -404,7 +404,7 @@ it('review daemon budget never returns uncapped concurrency on corrupt operator 
 describe('R907 malformed review capacity evidence', () => {
   it.each([
     ['wrong type', 'reviewConcurrency.maxLiveReviewRounds', '1'],
-    ['out of range', 'reviewConcurrency.maxLiveReviewRounds', 9],
+    ['out of range', 'reviewConcurrency.maxLiveReviewRounds', 17],
     ['unknown key', 'reviewConcurrency.unknown', 1],
     ['non-allowlisted guard', 'reviewConcurrency.enabled', false],
   ])('%s fails closed for both cascade results and daemon budget', (_label, key, value) => {
