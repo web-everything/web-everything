@@ -652,3 +652,37 @@ describe('real cross-process mutual exclusion (two real child node processes)', 
     expect(intervals[1].start).toBeGreaterThanOrEqual(intervals[0].end);
   }, 30_000);
 });
+
+
+it('a stalled writer cannot overwrite its successor during drain or pass stillHeld after takeover', async () => {
+  for (const stage of ['draining', 'held']) {
+    const lockRoot = mkTmp('dcl-takeover-lockroot-');
+    const clone = mkTmp('dcl-takeover-clone-');
+    const { writerRoot } = cloneLockDirs(clone, lockRoot);
+    const file = join(lockDirFor(writerRoot, '<clone:writer>'), 'lock.json');
+    let clock = 0;
+    let replacement;
+    const takeover = async () => {
+      clock = 11 * 60_000;
+      releaseRead(clone, { owner: 'reader', lockRoot });
+      expect(await acquireWrite(clone, {
+        owner: 'successor', lockRoot, now: () => clock, pid: 222, probe: alwaysAlive,
+      })).toEqual({ ok: true });
+      replacement = readFileSync(file, 'utf8');
+    };
+    if (stage === 'draining') {
+      expect(acquireRead(clone, { owner: 'reader', lockRoot, nowMs: clock, probe: alwaysAlive }).ok).toBe(true);
+    }
+    const callback = vi.fn(async stillHeld => {
+      await takeover();
+      expect(stillHeld()).toBe(false);
+    });
+    const result = await withWriteLock(clone, callback, {
+      owner: 'stalled', lockRoot, now: () => clock, pid: 111, probe: alwaysAlive,
+      waitMs: 15 * 60_000, sleep: takeover, log: vi.fn(),
+    });
+    expect(result).toEqual({ ok: false, reason: 'lock-lost', heldBy: 'successor' });
+    expect(callback).toHaveBeenCalledTimes(stage === 'draining' ? 0 : 1);
+    expect(readFileSync(file, 'utf8')).toBe(replacement);
+  }
+});

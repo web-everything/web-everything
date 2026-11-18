@@ -5742,7 +5742,6 @@ async function runCli() {
         return;
       }
     }
-    defaultBranchByRepo.set(repo, null); // Memoize even an unreadable read; retry on the next pass.
     try {
       const { stdout } = await execFileP('gh', ['repo', 'view', ...(repo ? [repo] : []), '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name'], { encoding: 'utf8' });
       const name = stdout.trim();

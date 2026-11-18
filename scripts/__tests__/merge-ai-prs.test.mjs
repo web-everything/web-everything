@@ -126,7 +126,7 @@ describe('fast-drain round listing snapshot', () => {
     const write = vi.fn();
     const log = vi.fn();
     const result = await readFastDrainRoundListing({ path: 'round.json', repo, onlyPr: '42', now, env: {},
-      read: () => raw, write, listLive: live, readTarget: target, log, lock: async fn => ({ ok: true, value: await fn() }), ...extra });
+      read: () => raw, write, listLive: live, readTarget: target, log, lock: async fn => ({ ok: true, value: await fn(() => true) }), ...extra });
     return { result, live, target, write, log };
   };
   it('uses fresh same-repo rows and still re-reads and reclassifies the moved target', async () => {
@@ -352,4 +352,24 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
 it('shadow policy retains pre-enqueue renaming by default (#6121)', async () => {
   const { resolveCardNumbering } = await import('../lib/policy-cascade.mjs');
   expect(resolveCardNumbering({ env: {}, platform: {} })).toMatchObject({ value: { mode: 'rename-before-enqueue', ledgerAuth: 'none', shadow: true } });
+});
+
+
+it('retries a failed default-branch read on a later call and caches the successful read', async () => {
+  const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
+  const start = source.indexOf('  const resolveDefaultBranch = async (repo) => {');
+  const end = source.indexOf('\n  let [listings]', start);
+  expect(start).toBeGreaterThan(-1);
+  expect(end).toBeGreaterThan(start);
+  const cache = new Map();
+  const read = vi.fn().mockRejectedValueOnce(new Error('transient read failure'))
+    .mockResolvedValueOnce({ stdout: 'trunk\n' });
+  const resolveDefaultBranch = new Function('defaultBranchByRepo', 'execFileP', 'listingSnapshot', 'AS_JSON',
+    `${source.slice(start, end)}; return resolveDefaultBranch;`)(cache, read, null, true);
+  await resolveDefaultBranch('fixture/repo');
+  expect(cache.has('fixture/repo')).toBe(false);
+  await resolveDefaultBranch('fixture/repo');
+  expect(cache.get('fixture/repo')).toBe('trunk');
+  await resolveDefaultBranch('fixture/repo');
+  expect(read).toHaveBeenCalledTimes(2);
 });
