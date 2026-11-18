@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { readPlatformPreferences, resolveCascade } from '../lib/policy-cascade.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readOverlayState } from '../lib/daemon-overlays.mjs';
-import { removeRegistration } from '../daemon-overlay.mjs';
+import { retireRegistration, recoverDrops } from '../daemon-overlay.mjs';
 import { resolveOriginRepository } from './prototype-retire.mjs';
 import { safeRegistrationRef, validSha, TEST_CHECK_APP_ID, testCheckEvidence, testWorkflowBound } from './prototype-load.mjs';
 import { ciGatePlan, urgentLedger, normalizeUrgentRepo } from './urgent-verify-marker.mjs';
@@ -27,7 +27,7 @@ const validateChecks = (data, sha) => {
       || (c.status === 'completed' ? typeof c.conclusion !== 'string' : c.conclusion !== null)))
     throw new Error('unreadable, incomplete or oversized CI checks (maximum 100); repair reader or inspect CI manually');
 };
-export function createSweepDeps({ home = homedir(), io = fs, exec = execFileSync, ghExec = execFileSyncThrottled, remove = removeRegistration, readState = readOverlayState, env = process.env } = {}) {
+export function createSweepDeps({ home = homedir(), io = fs, exec = execFileSync, ghExec = execFileSyncThrottled, retire = retireRegistration, recover = recoverDrops, readState = readOverlayState, env = process.env } = {}) {
   const read = name => {
     const path = urgentLedger(home, name);
     try {
@@ -89,8 +89,12 @@ export function createSweepDeps({ home = homedir(), io = fs, exec = execFileSync
         throw new Error('unreadable origin/main ancestry; inspect overlay graduation manually');
       }
     },
-    remove: r => remove({ root: r.clone, ref: r.registration.ref, expectedTip: r.registration.sha,
-      reason: `urgent-sweep: CI failed or no verdict after 24h for ${r.ref}@${r.sha}`, by: 'urgent-sweep', env }),
+    remove: async (r, expectedEntry) => {
+      const recovery = await recover({ root: r.clone, by: 'urgent-sweep', env });
+      if (!Array.isArray(recovery?.pending) || recovery.pending.length) throw new Error('unsettled overlay drops; run recover-drops for the clone before retrying');
+      return retire({ root: r.clone, ref: r.registration.ref, expectedTip: r.registration.sha,
+        expectedEntry, mode: 'urgent-failed', by: 'urgent-sweep', env });
+    },
     event: r => append('urgent-loads', r), settle: r => append('urgent-sweep-state', r),
     escalate: packet => writeEscalationPacket(packet, { dir: join(home, 'workspace/.operations/escalations'), fs: io }),
   };
@@ -244,8 +248,8 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           }
         }
         if (unload) {
-          const removal = await deps.remove(r);
-          if (!removal || removal.refused || (removal.removed !== true && (!Array.isArray(removal.list) || removal.list.some(e => e.ref === r.registration.ref)))) throw new Error(`overlay removal refused: ${removal?.refused ?? 'unreadable result'}`);
+          const removal = await deps.remove(r, overlay.overlays.find(e => e.ref === r.registration.ref));
+          if (!removal || removal.refused || (removal.retired !== true && (!Array.isArray(removal.list) || removal.list.some(e => e.ref === r.registration.ref)))) throw new Error(`overlay removal refused: ${removal?.refused ?? 'unreadable result'}`);
           const event = { type: 'prototype-load.urgent-unloaded', at: deps.now(), id, ref: r.ref, sha: r.sha, clone: r.clone, registration: r.registration };
           const receipt = { ...event, ...(unloadReason ? { unloadReason } : {}), removedAt: event.at, status: 'unloaded-pending-adoption', unloadEventSent: false, unloadEscalationSent: false };
           await deps.settle(receipt);

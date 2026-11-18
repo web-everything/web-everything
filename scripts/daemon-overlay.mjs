@@ -389,6 +389,14 @@ function writePendingDrops(root, env, pending) {
 const addPending = (root, env, record) => writePendingDrops(root, env, [...readPendingDrops(root, env).filter((p) => p.ref !== record.ref), record]);
 const clearPending = (root, env, ref) => writePendingDrops(root, env, readPendingDrops(root, env).filter((p) => p.ref !== ref));
 
+/** Library entry point shared by recover-drops and automatic unload callers. */
+export async function recoverDrops({ root, env = process.env, by = null, deps = {} }) {
+  return withAddGuardLock(root, env, async () => ({
+    settled: await settlePendingDrops({ root, env, by, deps }),
+    pending: readPendingDrops(root, env), list: readOverlays(root, { env }),
+  }));
+}
+
 /** Settle every drop intent left by an interrupted retire/replace. Call only under the add-guard lock. */
 export async function settlePendingDrops({ root, env = process.env, by = null, deps = {} }) {
   const tip = deps.tip ?? ((r) => remoteTip({ root, ref: r, env }));
@@ -449,13 +457,16 @@ export function removeRegistration({ root, ref, expectedTip, by = null, reason =
  * write. Branch pushes hold no lock, so (c) is checked after removal: a push that landed before the drop is seen and
  * the registration is restored (`tip-moved-restored`). A push after the check is a push to an unregistered ref.
  * Runs under the add-guard lock (no guarded add can interleave) with a durable drop intent (see settlePendingDrops).
+ * Library-only `mode: 'urgent-failed'` permits a failed/expired urgent CI load to withdraw even when
+ * retirement proof says keep. Requires an explicit entry snapshot and exact live tip; all drop guards still apply.
+ * The sweep supplies CI authorization; this mode never supplies operator retirement evidence.
  * `deps` ({prove, tip, afterDrop}) is a test seam; production passes none.
  * Same race class as the rebuild's own auto-drop (`daemon-rebuild/prepare.mjs` removes `in-main`/`pr-merged` decisions by
  * name with no tip re-check at all); this path adds a re-proof, a pre- and post-drop tip check and a durable intent.
  */
 // `actor` is the authenticated lowercase login verified by the explicit withdrawal caller.
 // Automatic retirement callers omit it and cannot produce operator retirement evidence.
-export async function retireRegistration({ root, ref, expectedTip, expectedEntry, by = null, actor, env = process.env, deps = {} }) {
+export async function retireRegistration({ root, ref, expectedTip, expectedEntry, mode = 'retired', by = null, actor, env = process.env, deps = {} }) {
   const prove = deps.prove ?? ((entry) => proveRetirement({ root, entry, env }));
   const tip = deps.tip ?? ((r) => remoteTip({ root, ref: r, env }));
   return withAddGuardLock(root, env, async () => {
@@ -464,9 +475,18 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
     if (state.corrupt) throw new Error(`overlay state file ${overlayFilePath(root, env)} is corrupt — refusing to overwrite it; fix or remove it by hand`);
     const entry = state.overlays.find((o) => o?.ref === ref);
     const refuse = (refused, extra = {}) => ({ retired: false, refused, settled, list: readOverlays(root, { env }), ...extra });
+    if (!['retired', 'urgent-failed'].includes(mode)) return refuse('unknown-retirement-mode');
+    if (mode === 'urgent-failed' && (!expectedEntry || expectedEntry.ref !== ref || !/^[a-f0-9]{40}$/.test(expectedTip ?? ''))) return refuse('urgent-snapshot-required');
     if (!entry) return refuse('not-registered');
     if (expectedEntry !== undefined && !isDeepStrictEqual(registrationIdentity(entry), registrationIdentity(expectedEntry))) return refuse('registration-changed');
-    const proof = prove(entry);
+    let proof = prove(entry);
+    if (proof.action === 'keep' && mode === 'urgent-failed') {
+      // CI failure / expired verdict authorizes withdrawal, not a claim that the work landed.
+      let current;
+      try { current = tip(ref); } catch { /* unreadable evidence refuses below */ }
+      if (current !== expectedTip) return refuse('tip-moved-or-unreadable');
+      proof = { action: 'retire', reason: 'urgent-failed', tip: current, evidence: { urgentUnload: true } };
+    }
     if (proof.action !== 'retire') return refuse('not-proved', { proof });
     if (proof.tip !== expectedTip) return refuse('tip-moved', { proof, tipNow: proof.tip });
     addPending(root, env, { kind: 'retire', ref, entry, tip: expectedTip, ...(proof.evidence?.refGone === true ? { refGone: true } : {}), at: new Date().toISOString() });
@@ -489,7 +509,7 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
     clearPending(root, env, ref);
     if (entry.pinned === true) writeRebuildRequest(root, { by, reason: proof.reason, ref, lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT });
     appendOverlayEvent(root, { kind: 'auto-retired', ref, pr: entry.pr ?? null, by, reason: proof.reason, tip: expectedTip, evidence: proof.evidence,
-      ...(typeof actor === 'string' && actor.trim() && typeof proof.reason === 'string' && proof.reason.trim()
+      ...(mode === 'retired' && typeof actor === 'string' && actor.trim() && typeof proof.reason === 'string' && proof.reason.trim()
         ? { actor, operatorReason: true } : {}) }, { env });
     return { retired: true, refused: null, reason: proof.reason, evidence: proof.evidence, settled, list: readOverlays(root, { env }) };
   });
@@ -966,7 +986,7 @@ async function main() {
     if (output.refused) process.exitCode = 3;
   } else if (cmd === 'recover-drops') {
     // R310: settle drop intents an interrupted retire/replace left behind (see settlePendingDrops).
-    output = { settled: await withAddGuardLock(root, env, () => settlePendingDrops({ root, env, by })), pending: readPendingDrops(root, env), list: readOverlays(root, { env }) };
+    output = await recoverDrops({ root, env, by });
     if (output.pending.length) process.exitCode = 3;
   } else if (cmd === 'remove') {
     output = removeRegistration({ root, ref: flags.ref, by, reason, env });

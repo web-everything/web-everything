@@ -4716,3 +4716,15 @@ and do not prevent adoption checks or the other notification. A failed progress 
 redelivery (event delivery is at least once); escalation IDs stay stable. Legacy `settled-unloaded`
 receipts already followed both notifications; pending/adopted receipts missing progress retry them.
 Named fault-injection tests cover each sink failure and each progress-write interruption.
+
+
+## Urgent sweep guarded withdrawals
+
+Urgent CI failure and expired-verdict unloads use `retireRegistration` with the library-only
+`urgent-failed` mode after `recoverDrops` for the clone. Pass the loaded registration SHA
+(`registration.sha`, which may differ from the source SHA) and the observed full entry snapshot.
+The normal retirement proof still runs; a keep verdict may authorize urgent withdrawal only with
+an exact live tip. Keep regression cases for changed entries, moved/unreadable tips, the lock and
+persisted drop intent at interruption, and recovery confirming or restoring the drop. The mode
+never creates operator retirement evidence. Both CLI `recover-drops` and sweep recovery use the
+same locked library helper; recovery failure must prevent retirement and unload receipts.

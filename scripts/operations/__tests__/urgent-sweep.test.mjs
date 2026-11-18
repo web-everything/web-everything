@@ -16,7 +16,7 @@ function fixture(rows = required.map(n => check(n))) {
   const d = { loads: () => loads, state: () => state, now: () => '2026-11-18T12:00:00Z', required: vi.fn(() => required),
     containsOverlay: vi.fn(() => true), mergedOverlay: vi.fn(() => false),
     overlayState: vi.fn(() => ({ corrupt: false, overlays: loads.map(r => ({ ref: r.registration?.ref })) })),
-    checks: vi.fn(() => ({ total_count: rows.length, check_runs: rows, workflows })), remove: vi.fn(() => ({ removed: true })),
+    checks: vi.fn(() => ({ total_count: rows.length, check_runs: rows, workflows })), remove: vi.fn(() => ({ retired: true })),
     event: vi.fn(e => events.push(e)), settle: vi.fn(e => state.push(e)), escalate: vi.fn() };
   return { d, state, settlements: () => [...new Map(state.filter(r => r.status !== 'sweep-cursor').map(r => [r.id, r])).values()], events, loads, run: () => urgentSweep({}, d) };
 }
@@ -25,7 +25,7 @@ describe('urgent CI sweep', () => {
     const f = fixture([]);
     f.loads[0] = { ...load, at: '2026-11-01T12:00:00Z' };
     expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
-    expect(f.d.remove).toHaveBeenCalledWith(f.loads[0]);
+    expect(f.d.remove).toHaveBeenCalledWith(f.loads[0], { ref: load.registration.ref });
     expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you', evidence: ['urgent load has no CI verdict after 6h'] }));
     expect(f.settlements()[0]).toMatchObject({ status: 'unloaded-pending-adoption', unloadReason: expect.stringContaining('no CI verdict after 24h') });
     await urgentSweep({}, { ...f.d });
@@ -99,7 +99,7 @@ describe('urgent CI sweep', () => {
   it.each(['failure', 'cancelled', 'timed_out'])('unloads required %s and escalates once across repeated passes', async conclusion => {
     const f = fixture([check('test-shard (1)', conclusion), check('test', null, { status: 'in_progress' })]);
     expect(await f.run()).toMatchObject({ ok: true, results: [{ status: 'unloaded-pending-adoption' }] });
-    expect(f.d.remove).toHaveBeenCalledWith(load);
+    expect(f.d.remove).toHaveBeenCalledWith(load, { ref: load.registration.ref });
     expect(f.events).toEqual([expect.objectContaining({ type: 'prototype-load.urgent-unloaded', sha, clone: '/clone', registration: load.registration })]);
     expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you', question: expect.stringContaining('NEEDS-YOU'), status: 'open' }));
     await f.run(); expect(f.d.remove).toHaveBeenCalledTimes(1); expect(f.d.escalate).toHaveBeenCalledTimes(1);
@@ -338,7 +338,7 @@ describe('urgent CI sweep', () => {
     f.d.now = () => '2026-11-25T12:00:00Z';
     f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('test', 'failure')] });
     expect(await urgentSweep({}, { ...f.d })).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
-    expect(f.d.remove).toHaveBeenCalledWith(load);
+    expect(f.d.remove).toHaveBeenCalledWith(load, { ref: load.registration.ref });
     expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you' }));
   });
   it.each(['settled-unloaded', 'unloaded-pending-adoption', 'unloaded-adopted', 'settled-unregistered', 'monitoring-green'])('starts fresh for a reload with a new trackingId after %s', async status => {
@@ -357,7 +357,7 @@ describe('urgent CI sweep', () => {
       greenAt: '2026-11-16T12:00:00Z', at: '2026-11-18T12:00:00Z' });
     f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('smoke', 'failure')] });
     expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
-    expect(f.d.remove).toHaveBeenCalledWith(load);
+    expect(f.d.remove).toHaveBeenCalledWith(load, { ref: load.registration.ref });
   });
   it('rechecks pre-trackingId identity receipts instead of inheriting their settlement', async () => {
     const f = fixture([check('smoke', 'failure')]);
@@ -365,7 +365,7 @@ describe('urgent CI sweep', () => {
     f.state.push({ id, status: 'settled-green', monitoringComplete: true,
       greenAt: '2026-11-16T12:00:00Z', at: '2026-11-18T12:00:00Z' });
     expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
-    expect(f.d.remove).toHaveBeenCalledWith(load);
+    expect(f.d.remove).toHaveBeenCalledWith(load, { ref: load.registration.ref });
   });
   it.each([null, { corrupt: true, overlays: [] }, { corrupt: false, overlays: [{}] }])('keeps unreadable overlay state tracked and escalates (%j)', async overlay => {
     const f = fixture(); f.d.overlayState.mockReturnValue(overlay);
@@ -378,7 +378,7 @@ describe('urgent CI sweep', () => {
     const f = fixture([check('smoke', 'failure', { app: { id: 1 } })]);
     f.d.required.mockImplementation(() => { throw new Error('workflow parse failed'); });
     expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
-    expect(f.d.required).not.toHaveBeenCalled(); expect(f.d.remove).toHaveBeenCalledWith(load);
+    expect(f.d.required).not.toHaveBeenCalled(); expect(f.d.remove).toHaveBeenCalledWith(load, { ref: load.registration.ref });
     expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you' }));
   });
   it('never settles green on unreadable required jobs and retries next pass', async () => {
@@ -421,7 +421,7 @@ describe('urgent CI sweep', () => {
     f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [{ ref: retry.registration.ref }] });
     expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
     expect(f.d.remove).toHaveBeenCalledTimes(1);
-    expect(f.d.remove).toHaveBeenCalledWith(retry);
+    expect(f.d.remove).toHaveBeenCalledWith(retry, { ref: retry.registration.ref });
   });
   it('keeps monitoring a registration-failed intent when its overlay is present and unloads on CI failure', async () => {
     const f = fixture();
@@ -429,7 +429,7 @@ describe('urgent CI sweep', () => {
     expect(await f.run()).toMatchObject({ results: [{ status: 'monitoring-green' }] });
     f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('test', 'failure')] });
     expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
-    expect(f.d.remove).toHaveBeenCalledWith(load);
+    expect(f.d.remove).toHaveBeenCalledWith(load, { ref: load.registration.ref });
   });
   it.each(['corrupt', 'throws'])('keeps a registration-failed intent tracked when the overlay read %s', async kind => {
     const f = fixture([check('test', 'failure')]);
@@ -441,13 +441,13 @@ describe('urgent CI sweep', () => {
     expect(f.d.checks).not.toHaveBeenCalled();
     expect(f.d.escalate).toHaveBeenCalled();
     expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
-    expect(f.d.remove).toHaveBeenCalledWith(load);
+    expect(f.d.remove).toHaveBeenCalledWith(load, { ref: load.registration.ref });
   });
   it.each(['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'])('unloads and raises NEEDS-YOU for completed smoke %s from any app', async conclusion => {
     for (const appId of [15368, 1]) {
       const f = fixture([...required.map(n => check(n)), check('smoke', conclusion, { app: { id: appId } })]);
       expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
-      expect(f.d.remove).toHaveBeenCalledWith(load);
+      expect(f.d.remove).toHaveBeenCalledWith(load, { ref: load.registration.ref });
       expect(f.events).toEqual([expect.objectContaining({ type: 'prototype-load.urgent-unloaded' })]);
       expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you', question: expect.stringContaining('NEEDS-YOU') }));
     }
@@ -458,7 +458,7 @@ describe('urgent CI sweep', () => {
     expect(f.settlements()).toEqual([]); expect(f.d.remove).not.toHaveBeenCalled();
     f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('test', 'failure')] });
     expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
-    expect(f.d.remove).toHaveBeenCalledWith(load);
+    expect(f.d.remove).toHaveBeenCalledWith(load, { ref: load.registration.ref });
     expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you', question: expect.stringContaining('NEEDS-YOU') }));
   });
   it.each([true, false])('rechecks persisted legacy green (checksComplete=%s) and unloads later failure', async checksComplete => {
@@ -467,7 +467,7 @@ describe('urgent CI sweep', () => {
     delete f.settlements()[0].greenAt;
     f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('test', 'failure')] });
     expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
-    expect(f.d.remove).toHaveBeenCalledWith(load);
+    expect(f.d.remove).toHaveBeenCalledWith(load, { ref: load.registration.ref });
   });
   it.each([
     ['unrelated queued check', [...required.map(n => check(n)), check('smoke', null, { status: 'queued' })]],
@@ -499,7 +499,7 @@ describe('urgent CI sweep', () => {
   ])('unloads before escalating %s evidence containing an explicit exact-SHA failure', async (_, data) => {
     const f = fixture(); f.d.checks.mockReturnValue(data);
     expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
-    expect(f.d.remove).toHaveBeenCalledWith(load);
+    expect(f.d.remove).toHaveBeenCalledWith(load, { ref: load.registration.ref });
     expect(f.events).toEqual([expect.objectContaining({ type: 'prototype-load.urgent-unloaded' })]);
     expect(f.settlements()).toEqual([expect.objectContaining({ status: 'unloaded-pending-adoption' })]);
     expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you', question: expect.stringContaining('NEEDS-YOU') }));
@@ -561,7 +561,7 @@ describe('urgent CI sweep', () => {
     const second = await urgentSweep({}, { ...f.d });
     expect(second.results).toHaveLength(32);
     expect(f.d.checks.mock.calls[32][0]).toBe(failing);
-    expect(f.d.remove).toHaveBeenCalledTimes(1); expect(f.d.remove).toHaveBeenCalledWith(failing);
+    expect(f.d.remove).toHaveBeenCalledTimes(1); expect(f.d.remove).toHaveBeenCalledWith(failing, { ref: failing.registration.ref });
     expect(f.settlements()).toEqual([expect.objectContaining({ ref: failing.ref, status: 'unloaded-pending-adoption' })]);
   });
   it('resumes green monitoring without cursor records', async () => {
@@ -610,25 +610,32 @@ describe('production sweep storage and removal guards', () => {
     expect(() => createSweepDeps({ exec }).mergedOverlay(load)).toThrow('unreadable origin/main fetch');
     expect(exec).toHaveBeenCalledTimes(1);
   });
-  it('reads exact-SHA checks through the origin-bound throttled reader and guards the actual overlay tip', () => {
+  it('reads exact-SHA checks and recovers drops before retiring the loaded overlay tip and snapshot', async () => {
     const exec = vi.fn((cmd, args) => args[0] === 'remote' ? load.repo : 'workflow');
     const ghExec = vi.fn((cmd, args) => JSON.stringify(args[0] === 'repo'
       ? { nameWithOwner: 'org/repo', url: load.repo } : args[1].includes('/actions/runs') ? workflows : { total_count: 0, check_runs: [] }));
-    const remove = vi.fn(() => ({ removed: true })), env = {};
+    const retire = vi.fn(() => ({ retired: true })), recover = vi.fn(() => ({ pending: [] })), env = {};
     const io = { readFileSync: p => {
       if (p.endsWith('prototype-load.json')) return JSON.stringify({ testWorkflowPath: '.github/workflows/custom.yml' });
       throw Object.assign(new Error('missing'), { code: 'ENOENT' });
     } };
     const readState = vi.fn(() => ({ corrupt: false, overlays: [{ ref: load.registration.ref }] }));
-    const deps = createSweepDeps({ exec, ghExec, remove, readState, env, io });
+    const deps = createSweepDeps({ exec, ghExec, retire, recover, readState, env, io });
     expect(deps.overlayState(load)).toEqual({ corrupt: false, overlays: [{ ref: load.registration.ref }] });
     expect(readState).toHaveBeenCalledWith(load.clone, { env });
     expect(deps.checks(load)).toEqual({ total_count: 0, check_runs: [], workflows, testWorkflowPath: '.github/workflows/custom.yml' });
     expect(ghExec.mock.calls[2][1]).toEqual(['api', `repos/org/repo/actions/runs?head_sha=${sha}&per_page=100`, '--hostname', 'example.com']);
     expect(ghExec.mock.calls[1][1]).toEqual(['api', `repos/org/repo/commits/${sha}/check-runs?per_page=100&filter=all`, '--hostname', 'example.com']);
     expect(ghExec.mock.calls.every(([, , o]) => o.maxBuffer === 1024 * 1024 && o.timeout === 30000 && o.throttle.caller === 'urgent-sweep')).toBe(true);
-    deps.remove(load);
-    expect(remove).toHaveBeenCalledWith(expect.objectContaining({ root: '/clone', ref: 'lane/repair-m1', expectedTip: load.registration.sha, env }));
+    const entry = { ref: load.registration.ref, addedAt: 'original-load', pinned: true };
+    await deps.remove(load, entry);
+    await deps.remove(load, entry);
+    expect(recover).toHaveBeenCalledTimes(2);
+    expect(recover).toHaveBeenCalledWith({ root: load.clone, by: 'urgent-sweep', env });
+    expect(recover.mock.invocationCallOrder[0]).toBeLessThan(retire.mock.invocationCallOrder[0]);
+    expect(recover.mock.invocationCallOrder[1]).toBeLessThan(retire.mock.invocationCallOrder[1]);
+    expect(retire).toHaveBeenCalledWith({ root: load.clone, ref: load.registration.ref,
+      expectedTip: load.registration.sha, expectedEntry: entry, mode: 'urgent-failed', by: 'urgent-sweep', env });
   });
   it('retrieves failures before the production workflow and required-job readers', async () => {
     const exec = vi.fn((cmd, args) => {
@@ -660,6 +667,21 @@ describe('production sweep storage and removal guards', () => {
     expect(await urgentSweep({}, deps)).toMatchObject({ ok: false, detail: expect.stringContaining('archive') });
     expect(io.readFileSync).not.toHaveBeenCalled();
     expect(io.renameSync).toHaveBeenCalledWith('/home/test/workspace/.operations/escalations/urgent-ledger.json.tmp', '/home/test/workspace/.operations/escalations/urgent-ledger.json');
+  });
+  it.each([undefined, { pending: [{}] }, {}])('refuses removal on incomplete recovery (%j)', async recovery => {
+    const retire = vi.fn(), recover = vi.fn(() => recovery);
+    const deps = createSweepDeps({ retire, recover });
+    await expect(deps.remove(load, { ref: load.registration.ref })).rejects.toThrow('recover-drops');
+    expect(retire).not.toHaveBeenCalled();
+  });
+  it('escalates recovery failures without recording an unload or invoking retire', async () => {
+    const retire = vi.fn(), recover = vi.fn(() => { throw new Error('corrupt drop intent'); });
+    const f = fixture([check('test', 'failure')]);
+    f.d.remove = createSweepDeps({ retire, recover }).remove;
+    expect(await f.run()).toMatchObject({ ok: false, results: [{ status: 'needs-you', detail: 'corrupt drop intent' }] });
+    expect(retire).not.toHaveBeenCalled();
+    expect(f.events).toEqual([]);
+    expect(f.settlements()).toEqual([]);
   });
   it('rejects a moved or unreadable tip before mutation', () => {
     const remove = vi.fn();

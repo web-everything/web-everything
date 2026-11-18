@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { retireRegistration, replaceRegistration, settlePendingDrops, readPendingDrops, inferPrNumber } from '../daemon-overlay.mjs';
+import { retireRegistration, replaceRegistration, settlePendingDrops, readPendingDrops, recoverDrops, inferPrNumber } from '../daemon-overlay.mjs';
 import { addOverlay } from '../lib/daemon-overlays.mjs';
 import { planRebuild } from '../lib/daemon-rebuild.mjs';
 
@@ -276,6 +276,73 @@ describe('daemon-overlay.mjs retire', () => {
       expect(await settlePendingDrops({ root: f.clone, env: f.env, deps: { tip: () => 'f'.repeat(40) } })).toEqual([{ ref: 'lane/done', outcome: 'still-registered' }]);
       expect(f.entry('lane/done')).toMatchObject({ reason: 'newer' });
     });
+  });
+});
+
+describe('guarded urgent-failed unload', () => {
+  async function urgent({ outcome = 'held', snapshot = 'same' } = {}) {
+    const f = fixture();
+    const tip = f.push('lane/urgent', 'urgent.txt', 'unmerged urgent work\n');
+    addOverlay(f.clone, { ref: 'lane/urgent', reason: 'urgent load' }, { env: f.env });
+    const entry = f.entry('lane/urgent');
+    let dropped = false;
+    const args = { root: f.clone, ref: entry.ref, expectedTip: tip,
+      expectedEntry: snapshot === 'missing' ? undefined : snapshot === 'changed' ? { ...entry, addedAt: 'newer' } : entry,
+      mode: 'urgent-failed', env: f.env, deps: {
+        tip: () => {
+          if (dropped && outcome === 'post-drop-moved') return 'f'.repeat(40);
+          if (outcome === 'unreadable') throw new Error('offline');
+          return outcome === 'moved' ? 'f'.repeat(40) : tip;
+        },
+        afterDrop: () => {
+          dropped = true;
+          expect(readPendingDrops(f.clone, f.env)).toMatchObject([{ ref: entry.ref, entry, tip }]);
+          expect(readdirSync(f.env.WE_DAEMON_OVERLAY_DIR).some(n => n.endsWith('.add-guard.lock'))).toBe(true);
+          if (outcome === 'killed') throw new Error('killed');
+        },
+      } };
+    return { f, tip, entry, args };
+  }
+  it('re-proves ordinary retirement then explicitly withdraws unmerged urgent work under lock with durable intent', async () => {
+    const { f, args } = await urgent();
+    expect(await retireRegistration(args)).toMatchObject({ retired: true, reason: 'urgent-failed' });
+    expect(f.list()).toEqual([]);
+    expect(readPendingDrops(f.clone, f.env)).toEqual([]);
+    expect(f.events().at(-1)).toMatchObject({ reason: 'urgent-failed', evidence: { urgentUnload: true } });
+    expect(f.events().at(-1).operatorReason).toBeUndefined();
+  });
+  it.each([{ mode: 'unknown' }, { expectedTip: 'bad' }, { expectedEntry: { ref: 'lane/other' } }])('refuses invalid urgent authorization %j', async override => {
+    const { f, args } = await urgent();
+    expect(await retireRegistration({ ...args, ...override })).toMatchObject({ retired: false,
+      refused: override.mode ? 'unknown-retirement-mode' : 'urgent-snapshot-required' });
+    expect(f.list()).toEqual(['lane/urgent']);
+    expect(readPendingDrops(f.clone, f.env)).toEqual([]);
+  });
+  it.each(['missing', 'changed'])('refuses a %s expected entry before dropping', async snapshot => {
+    const { f, args } = await urgent({ snapshot });
+    expect(await retireRegistration(args)).toMatchObject({ retired: false,
+      refused: snapshot === 'missing' ? 'urgent-snapshot-required' : 'registration-changed' });
+    expect(f.list()).toEqual(['lane/urgent']);
+    expect(readPendingDrops(f.clone, f.env)).toEqual([]);
+  });
+  it.each(['moved', 'unreadable'])('refuses a %s loaded tip before dropping', async outcome => {
+    const { f, args } = await urgent({ outcome });
+    expect(await retireRegistration(args)).toMatchObject({ retired: false, refused: 'tip-moved-or-unreadable' });
+    expect(f.list()).toEqual(['lane/urgent']);
+  });
+  it('restores an urgent unload when its tip moves during the drop', async () => {
+    const { f, args, entry } = await urgent({ outcome: 'post-drop-moved' });
+    expect(await retireRegistration(args)).toMatchObject({ retired: false, refused: 'tip-moved-restored' });
+    expect(f.entry(entry.ref)).toEqual(entry);
+    expect(readPendingDrops(f.clone, f.env)).toEqual([]);
+  });
+  it.each(['held', 'moved', 'unreadable'])('recovers an interrupted urgent drop with a %s tip', async outcome => {
+    const { f, args, tip } = await urgent({ outcome: 'killed' });
+    await expect(retireRegistration(args)).rejects.toThrow('killed');
+    expect(f.list()).toEqual([]);
+    const result = await recoverDrops({ root: f.clone, env: f.env, deps: { tip: () => outcome === 'held' ? tip : outcome === 'moved' ? 'f'.repeat(40) : undefined } });
+    expect(result).toMatchObject({ pending: [], settled: [{ outcome: outcome === 'held' ? 'drop-confirmed' : 'restored' }] });
+    expect(f.list()).toEqual(outcome === 'held' ? [] : ['lane/urgent']);
   });
 });
 
