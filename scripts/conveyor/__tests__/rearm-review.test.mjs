@@ -517,6 +517,8 @@ describe('rearm-review.mjs CLI — the empty-round guard wiring', () => {
     ['fenced', `\`\`\`text\nHead: \`${H0}\`\n\`\`\``],
     ['quoted', `> Example:\nHead: \`${H0}\``],
     ['HTML code', `<pre>\nHead: \`${H0}\`\n</pre>`],
+    ['HTML comment', `<!--\nHead: \`${H0}\`\n-->`],
+    ['unfinished HTML comment', `<!--\nHead: \`${H0}\``],
   ])('a %s Head example cannot prove a same-head repair', (_name, example) => {
     const evidence = { user: BOT, body: `## Fix evidence\n\n${example}` };
     expect(decideEmptyFixRound({ comments: [unclaimed, evidence], liveHead: H0 })).toEqual({ empty: true, since: H0 });

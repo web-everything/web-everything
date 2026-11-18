@@ -313,7 +313,7 @@ export function sendBackNotAddressed(pr, { includeUnattempted = true } = {}) {
         const text = stripQuoted(String(c?.body ?? ''));
         const head = /^ {0,3}Head:[ \t]*`([a-f0-9]{7,40})`[ \t]*$/im.exec(stripComments(text))?.[1];
         return isFixRoundRearmComment(c)
-          || (isFixEvidence(text) && (namesSendBack(text, item) || differentHead(pr.headRefOid, head)))
+          || (isFixEvidence(text) && head && namesSendBack(text, item))
           || text.trimStart().startsWith(ADVISORY_NOTE_MARKER)
           || /^(?:🔁 (?:human )?review — changes requested|✅ review — accepted)/.test(text.trimStart());
       })));

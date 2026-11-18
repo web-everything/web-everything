@@ -236,7 +236,8 @@ export function rearmWindow(comments) {
       standDownIds = [];
       rearmed = false;
     } else if (/^(?:🔓 conveyor fix-end|## Fix evidence)(?:\s|$)/.test(text)) {
-      const evidenceText = stripQuoted(text);
+      // HTML comments, including an unfinished one, cannot supply visible repair metadata.
+      const evidenceText = stripQuoted(text).replace(/<!--[\s\S]*?(?:-->|$)/g, ' ');
       fixEvidenceHead = (text.startsWith('🔓 conveyor fix-end')
         ? /^🔓 conveyor fix-end — fix claim released\r?\n\r?\n`[^`\r\n]+` released the fix claim at `([a-f0-9]{7,40})`\./i.exec(evidenceText)?.[1]
         : /^Head:[ \t]*`([a-f0-9]{7,40})`[ \t]*$/im.exec(evidenceText)?.[1])?.toLowerCase() ?? null;

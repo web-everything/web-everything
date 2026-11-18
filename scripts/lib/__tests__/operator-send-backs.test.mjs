@@ -187,14 +187,18 @@ describe('operator send-backs, PR #5243 replay', () => {
     ['another send-back', '<!-- addresses-operator-send-back: unrelated -->'],
     ['quoted coverage', '> <!-- addresses-operator-send-back: 1001 -->'],
     ['fenced moved head', `\`\`\`\nHead: \`${HEAD}\`\n\`\`\``],
+    ['unrelated moved head', `Head: \`${HEAD}\`\nFixed another issue.`],
+    ['headless marker', '<!-- addresses-operator-send-back: 1001 -->'],
+    ['headless id', 'Addressed send-back 1001.'],
+    ['hidden head with marker', `<!-- addresses-operator-send-back: 1001 -->\n<!--\nHead: \`${HEAD}\`\n-->`],
   ])('unrelated %s fix evidence cannot consume the first repair', (_name, body) => {
     const other = comment('other', 'web-everything', '21:00', `## Fix evidence\n\n${body}`);
     expect(sendBackNotAddressed(fixture({ headRefOid: OLD, comments: [original, other] }))?.items).toHaveLength(1);
   });
   it.each([
-    '<!-- addresses-operator-send-back: 1001 -->',
-    'Addressed send-back 1001.',
-    `Head: \`${HEAD}\``,
+    `<!-- addresses-operator-send-back: 1001 -->\nHead: \`${OLD}\``,
+    `Addressed send-back 1001.\nHead: \`${OLD}\``,
+    `Head: \`${HEAD}\`\n<!-- addresses-operator-send-back: 1001 -->`,
   ])('genuine coverage consumes the initial repair: %s', body => {
     const fixed = comment('fixed', 'web-everything', '21:00', `## Fix evidence\n\n${body}`);
     expect(sendBackNotAddressed(fixture({ headRefOid: OLD, comments: [original, fixed] }))).toBeNull();

@@ -49,9 +49,34 @@ describe('live send-back on the current head owes its first fixer', () => {
     expect(countFindings([sendBack()])).toBe(1);
     const result = run(fresh({ labels }));
     expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'fix', phase: 'bounced',
-      findings: 1,
-      rulingNotAddressed: expect.objectContaining({ source: 'operator-send-back' }) })]);
+      findings: 1, attempts: 0 })]);
+    expect(result.dispatch[0].mode).toBeUndefined(); // Ordinary bounced route, after all ownership guards.
     expect(result.refusals).toEqual([]);
+  });
+  it.each([
+    [0, 'cap-exhausted'],
+    [2, null],
+  ])('a queued send-back preserves CodeQL healing ownership with cap=%s', (ciHealCap, refusal) => {
+    const result = run(fresh({ labels: ['review:accepted'], codeqlFailure: { alerts: [] } }), [], { ciHealCap });
+    if (refusal) {
+      expect(result.dispatch).toEqual([]);
+      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: refusal, cap: 0 }));
+    } else {
+      expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', reason: 'codeql' })]);
+    }
+  });
+  it.each([
+    { labels: ['review:accepted'], kind: null },
+    { labels: [], kind: 'restore-review-label' },
+  ])('a same-head request retains its ordinary owner outside bounced: %j', ({ labels, kind }) => {
+    const result = run(fresh({ labels }));
+    if (kind) {
+      expect(result.dispatch).toEqual([expect.objectContaining({ kind, label: 'review:pending' })]);
+      expect(result.refusals).toEqual([]);
+    } else {
+      expect(result.dispatch).toEqual([]);
+      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'nothing-owed' }));
+    }
   });
   it.each([
     ['empty', ''],

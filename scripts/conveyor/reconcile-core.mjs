@@ -2878,17 +2878,13 @@ export function planReconcile({
     const initialCardBatch = phase === 'bounced' && cardBatchExtract
       && String(pr?.headRefName ?? '').startsWith('lane/card-batch-')
       && !operatorSendBackRuling(pr, [], { includeUnattempted: false });
-    const operatorRuling = operatorSendBackRuling(pr, noticedRungs(pr.comments, pr.headRefOid), {
-      // Initial repairs use the ordinary populations. Keep draft and conflict ownership, and the
-      // existing same-head advisory one-shot path, intact; completed misses still use this retry path.
-      includeUnattempted: !initialCardBatch && ['bounced', 'open', 'queued'].includes(phase) && !pr?.isDraft
-        && pr?.mergeStateStatus !== 'DIRTY' && !withPhase.labels.includes(CONFLICT_LABEL),
-    });
-    // An initial repair cannot pre-empt CI's cap, evidence and rerun-reservation refusals.
-    // Completed misses retain their existing path; red initial repairs fall through to CI ownership.
-    const initialSendBackNeedsCi = operatorRuling && check.state === 'red'
-      && !operatorSendBackRuling(pr, [], { includeUnattempted: false });
-    if (operatorRuling && !initialSendBackNeedsCi && String(pr?.state ?? 'OPEN').toUpperCase() === 'OPEN') {
+    // Reserve this early retry route for completed misses. Initial bounced requests already count
+    // as findings and must reach the ordinary fix route AFTER every CI/MQ/stale-base ownership guard.
+    const operatorRuling = operatorSendBackRuling(pr, noticedRungs(pr.comments, pr.headRefOid), { includeUnattempted: false });
+    const initialBouncedSendBack = phase === 'bounced' && !operatorRuling
+      && operatorSendBackRuling(pr, [], { includeUnattempted: true });
+    const initialSendBackNeedsCi = initialBouncedSendBack && check.state === 'red';
+    if (operatorRuling && String(pr?.state ?? 'OPEN').toUpperCase() === 'OPEN') {
       const attempts = roundAttempts();
       if (attempts >= effectiveRoundCap && !sendBackRound) {
         refuseCapExhausted({ ...withPhase, attempts, cap: effectiveRoundCap, capKind: 'fix',
@@ -3067,7 +3063,7 @@ export function planReconcile({
       continue;
     }
 
-    const sendBack = initialSendBackNeedsCi || initialCardBatch ? null : (phase === 'needs-human' ? operatorSendBackAfterReview(pr) : null)
+    const sendBack = initialBouncedSendBack || initialCardBatch ? null : (phase === 'needs-human' ? operatorSendBackAfterReview(pr) : null)
       ?? ((ciRepairOwed || (phase === 'bounced' && !withPhase.labels.includes(CONFLICT_LABEL)))
         ? operatorSendBackRearm(pr, operatorBudget) : null);
     if (sendBack) {
