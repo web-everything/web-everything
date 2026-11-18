@@ -96,6 +96,19 @@ describe('R1017 run-less dead-owner recovery', () => {
     expect(existsSync(f.file)).toBe(!released);
     if (released) expect(existsSync(join(f.root, 'slot-1.unconfirmed'))).toBe(true);
   });
+  it('retains a run-less marker at 20 minutes when the active run absent from recent is bound only to another host or no host', async () => {
+    const f = fixture({minutes: 20, change: t => {
+      t.activeRuns = 1; t.activeRunIds = [RUN_B]; t.recent = [];
+    }});
+    for (const [index, host] of [[1, 'other'], [2, undefined]]) {
+      const other = join(f.root, `slot-${index}.unconfirmed`);
+      writeFileSync(other, markerContent({owner: 'other', pid: 222, host, nowMs: NOW - 600_000, run: RUN_B}));
+      utimesSync(other, (NOW - 600_000) / 1000, (NOW - 600_000) / 1000);
+    }
+    expect(await f.reaper.step(f.sample)).toEqual([]);
+    expect(existsSync(f.file)).toBe(true);
+    expect(names(f.root)).toEqual(['0', '1', '2']);
+  });
   it.each([
     ['14 minutes', {minutes: 14}],
     ['possibly live owner', {state: 'unknown'}], ['live owner', {state: 'alive'}],

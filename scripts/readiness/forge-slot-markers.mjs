@@ -394,7 +394,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
         try { ({mtimeMs, ino} = fs.statSync(file)); } catch { continue; }
         const marker = readMarker(file), index = Number(m[1]);
         if (marker.unreadable) continue;
-        if (marker.run) boundRuns.add(marker.run);
+        if (marker.run && host !== undefined && marker.host === host) boundRuns.add(marker.run); // only this Forge host's own markers claim runs
         const gone = ownerGone(root, index, file, liveness, selfPid);
         // Only an old marker whose owner is provably gone is "stuck": a live owner is a long-running job, not a leak.
         const trace = {pid: marker.pid, caller: marker.caller ?? null, lane: marker.lane ?? null, pr: marker.pr ?? null, exit: marker.exit ?? 'no-exit-record'};
