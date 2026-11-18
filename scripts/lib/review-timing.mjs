@@ -53,9 +53,7 @@ export const isReviewHoldGate = row => {
 };
 /** The CI-heal rule (reconcile-core `splitFailingChecks`): a known required set names the healable checks. */
 const resolveTimingChecks = (headSha, checks, requiredChecks, rowsComplete = false) => resolveRequiredChecks({
-  head: headSha, rowsHead: headSha, rows: checks, requiredNames: requiredChecks, rosterSource: 'live', rowsComplete,
-  allowImplication: true, // same integration-via-test rule the review CI gate adapter uses
-});
+  head: headSha, rowsHead: headSha, rows: checks, requiredNames: requiredChecks, rosterSource: 'live', rowsComplete,});
 /** Unknown evidence blocks start/continuation just as red CI does; no observed-name roster fallback. */
 export function ciRedOnHead({ headSha, checks, requiredChecks = null } = {}) {
   const result = resolveTimingChecks(headSha, checks, requiredChecks);

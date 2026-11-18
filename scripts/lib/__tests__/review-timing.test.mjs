@@ -29,20 +29,22 @@ describe('pending-CI start policy', () => {
     });
   });
 
-  it.each(['off', 'shadow', 'on'])('a green test aggregate implies integration, but not standards, under startEarly=%s', startEarly => {
+  it.each(['off', 'shadow', 'on'])('a green test aggregate implies nothing: integration without a row stays missing under startEarly=%s', startEarly => {
     const policy = { ...review, startAfter: 'fast-checks', startEarly, fastChecks: ['test', 'integration', 'standards'] };
     const result = reviewStartGate({ rowsComplete: true, headSha: head, requiredChecks: ['test', 'integration'], checks: [check('test')], policy });
-    expect(result.affected).toEqual([{ name: 'standards', reason: 'missing' }]);
+    expect(result.allowed).toBe(false);
+    expect(result.affected).toEqual(expect.arrayContaining([{ name: 'integration', reason: 'missing' }]));
   });
   // Red team on f4ed5360 (#6326): a green LEGACY commit status (`{context, state}`) must imply integration in the
   // registration gate exactly as the strict gate (which normalizes statuses first) already does.
-  describe.each(['ci-green', 'fast-checks', 'push'])('a green legacy status test implies integration under startAfter=%s', startAfter => {
+  describe.each(['ci-green', 'fast-checks', 'push'])('a green legacy status test does not imply integration under startAfter=%s', startAfter => {
     const policy = startEarly => ({ ...review, startAfter, startEarly, fastChecks: ['test', 'integration'] });
     const requiredChecks = ['test', 'integration'];
     it.each([['shadow', 'success'], ['on', 'success'], ['shadow', 'SUCCESS'], ['on', 'SUCCESS']])('startEarly=%s state=%s', (startEarly, state) => {
       const checks = [{ context: 'test', state }];
-      expect(reviewCiGate({ rowsComplete: true, headSha: head, checks, requiredChecks })).toMatchObject({ allowed: true });  // the strict gate already accepts
-      expect(reviewStartGate({ rowsComplete: true, headSha: head, requiredChecks, checks, policy: policy(startEarly) })).toMatchObject({ allowed: true });
+      // Implication is gone from the contract: integration has no row, so it is pending in every gate.
+      expect(reviewCiGate({ rowsComplete: true, headSha: head, checks, requiredChecks }).allowed).toBe(false);
+      expect(reviewStartGate({ rowsComplete: true, headSha: head, requiredChecks, checks, policy: policy(startEarly) }).allowed).toBe(false);
     });
     it.each(['pending', 'failure', 'error'])('a %s legacy status implies nothing', state => {
       const result = reviewStartGate({ rowsComplete: true, headSha: head, requiredChecks, checks: [{ context: 'test', state }], policy: policy('shadow') });
