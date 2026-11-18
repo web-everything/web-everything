@@ -150,7 +150,11 @@ export function createProbationObserver(options) {
 export function ownDaemonId(root, entry, { env = process.env, argv = process.argv, registered } = {}) {
   const roster = registered ?? registeredDaemons(root, { env });
   const rel = relative(root, resolve(root, entry));
-  const service = roster.some(d => d.id === env.XPC_SERVICE_NAME) ? env.XPC_SERVICE_NAME : null;
+  const label = env.XPC_SERVICE_NAME;
+  const explicit = typeof label === 'string' && label !== '' && label !== '0';
+  // An explicit service label that is not a registered daemon is another service: never fall back to argv.
+  if (explicit && !roster.some(d => d.id === label)) return null;
+  const service = explicit ? label : null;
   const matches = roster.filter(d => d.entry === rel && (service ? service === d.id
     : d.args?.length === argv.slice(2).length && d.args.every((a, i) => a === argv[i + 2])));
   return matches.length === 1 ? matches[0].id : null;

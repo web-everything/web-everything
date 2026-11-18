@@ -150,11 +150,15 @@ describe('R986 report-only probation persistence', () => {
     expect(ownDaemonId(root, 'services/y.mjs', { registered: roster, env: { XPC_SERVICE_NAME: 'Y' },
       argv: ['node', join(root, 'services/y.mjs')] })).toBeNull();
   });
-  it('unknown XPC_SERVICE_NAME falls back to an unambiguous argument match', async () => {
+  it('an explicit unregistered XPC_SERVICE_NAME is another service and gets no identity', async () => {
     const { ownDaemonId } = await load();
     const roster = ['X', 'Y'].map(id => ({ id, entry: 'workers/x.mjs', args: [`--pass=${id}`] }));
-    expect(ownDaemonId(root, 'workers/x.mjs', { registered: roster, env: { XPC_SERVICE_NAME: 'unknown' },
-      argv: ['node', join(root, 'workers/x.mjs'), '--pass=X'] })).toBe('X');
+    const argv = ['node', join(root, 'workers/x.mjs'), '--pass=X'];
+    expect(ownDaemonId(root, 'workers/x.mjs', { registered: roster, env: { XPC_SERVICE_NAME: 'unknown' }, argv })).toBeNull();
+    // Terminal-style placeholders ('0', empty, absent) are not a service label: argv matching still applies.
+    for (const label of ['0', '', undefined]) {
+      expect(ownDaemonId(root, 'workers/x.mjs', { registered: roster, env: { XPC_SERVICE_NAME: label }, argv })).toBe('X');
+    }
   });
   it('ambiguous shared-entry identity cannot satisfy an owed proof through persistence', async () => {
     const m = await load();
