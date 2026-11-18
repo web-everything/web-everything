@@ -9,7 +9,7 @@ import { readRedTeamPublicationHold } from '../drain-red-team-evidence.mjs';
 import { historicalCardOnlySkipCandidate, readDrainRedTeamEvidence, recordRedTeamStatus, readRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { reviewedRead, completedSeat, completedComment } from './fixtures/red-team-owed.mjs';
-import { redTeamOwedFor } from '../review-red-team-policy.mjs';
+import { redTeamOwedFor, RED_TEAM_HOLDS } from '../review-red-team-policy.mjs';
 import { pidStartTime } from '../pid-alive.mjs';
 import { readRedTeamCarry, resumeRedTeamCarry } from '../red-team-carry-machine.mjs';
 import { evaluateRedTeamCheckFact, withRedTeamCheckLock } from '../red-team-check-run.mjs';
@@ -182,7 +182,7 @@ describe('status persistence and check publication share one claim', () => {
       expect(readRedTeamStatus(f).sealedBreaks).toEqual([]);
       expect(checks).toHaveLength(1);
       expect(checks[0].status).toBe('in_progress');
-      expect(checks[0].output.summary).toContain(RED_TEAM_NO_RESULT_HOLD_PREFIX);
+      expect(checks[0].output.summary).toContain(RED_TEAM_HOLDS['result-incomplete'].message);
     });
 
     it('a result that owes no publication and has no recorded result keeps its FAILURE', () => {
@@ -214,7 +214,7 @@ describe('status persistence and check publication share one claim', () => {
       expect(hold).toMatch(new RegExp(`^${RED_TEAM_UNSEALED_HOLD_PREFIX}`));
       sealAtFinish(f, { comments: [] })({ repo: f.repo, pr: f.pr, head: f.head });
       expect(redTeamEnqueueHold({ ...finished(f), head: f.head, comments: [], scheduled: true, recorded: true, env: f.env }))
-        .toMatch(new RegExp(`^${RED_TEAM_NO_RESULT_HOLD_PREFIX}`));
+        .toBe(RED_TEAM_HOLDS['result-incomplete'].message);
     });
   });
 

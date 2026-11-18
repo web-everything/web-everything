@@ -2641,7 +2641,9 @@ an initialization cycle through `merge-ai-prs.mjs`. Missing or unscored reads ho
 Only a scored, non-empty, head-bound card-only read with skip enabled, no seat rows and no
 live or queued work proves exemption. A completed pass requires a publishable completed-review
 comment, the scored read, and schema-valid seat rows including a completed seat. Marker-only
-and policy-clear comments never pay execution debt. Carry recursively needs a clear source
+and policy-clear comments never pay execution debt. A recorded execution still owes its
+completed result and seat proof even if the seat rows are missing. Rename sources must be
+an explicit array; missing or non-array metadata makes a scored read unreviewable. Carry recursively needs a clear source
 with the same result id. Route with the fixed hold `kind`/`blocking` table, never message text;
 legacy pending records without a kind get a fresh deadline read. The acceptance and policy
 suites replay persisted evidence, and source mutations pin each admission delegation and

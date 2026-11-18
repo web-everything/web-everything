@@ -16,6 +16,6 @@ export function drainRedTeamDecisionInput({ evidence: raw, comments, head, pr, r
   return { head, read: raw.loopPayload?.findings?.read, seats: raw.seats ?? [], result: hit?.parsed ?? null, carry,
     ok: raw.ok, reason: raw.reason, carryConflict: raw.carryConflict || !!(fromRev && !carry),
     hasBreak: !pendingPublish && !!(disposition.sendBack.length || disposition.held.length), pendingPublish,
-    scheduling: { inFlight: !!raw.inFlight, queued: !!raw.queued, scheduled: !!raw.scheduled,
+    scheduling: { inFlight: !!raw.inFlight, queued: !!raw.queued, scheduled: !!raw.scheduled, recorded: !!raw.recorded,
       skipCardOnly: raw.skipCardOnly ?? readRedTeamProbes({ env }).value.skipCardOnly } };
 }

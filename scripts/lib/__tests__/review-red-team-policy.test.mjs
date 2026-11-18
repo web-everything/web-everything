@@ -27,7 +27,7 @@ describe('redTeamOwedDecision', () => {
       scheduling: { skipCardOnly: true } };
     expect(redTeamOwedDecision(card)).toEqual({ owed: false, cleared: true, reasons: [] });
     expect(redTeamOwedDecision({ ...card, scheduling: { ...card.scheduling, scheduled: true } }).owed).toBe(false);
-    for (const field of ['inFlight', 'queued']) {
+    for (const field of ['inFlight', 'queued', 'recorded']) {
       expect(redTeamOwedDecision({ ...card, scheduling: { ...card.scheduling, [field]: true } }).owed).toBe(true);
     }
     expect(redTeamOwedDecision({ ...card, scheduling: { skipCardOnly: false } }).owed).toBe(true);
@@ -38,6 +38,23 @@ describe('redTeamOwedDecision', () => {
       expect(redTeamReadReviewable(read, head)).toBe(false);
       expect(redTeamOwedDecision({ ...pass(), read }).reasons).toContainEqual(RED_TEAM_HOLDS['unreviewable-read']);
     }
+  });
+  it('recorded execution needs both a publishable completed result and completed valid seat rows', () => {
+    const recorded = { ...pass(), scheduling: { ...pass().scheduling, recorded: true } };
+    expect(redTeamOwedDecision(recorded)).toEqual({ owed: true, cleared: true, reasons: [] });
+    for (const over of [{ result: null, seats: [] }, { result: null }, { seats: [] },
+      { result: { ...recorded.result, completedReview: false } }]) {
+      const decision = redTeamOwedDecision({ ...recorded, ...over });
+      expect(decision).toMatchObject({ owed: true, cleared: false });
+      expect(decision.reasons).toContainEqual(RED_TEAM_HOLDS['result-incomplete']);
+    }
+  });
+  it.each([undefined, null, 'scripts/source.mjs'])('missing or non-array rename sources are unreadable: %j', netRenameSources => {
+    const read = { ...reviewedRead(head, ['backlog/123-card.md']), netRenameSources };
+    expect(redTeamReadReviewable(read, head)).toBe(false);
+    expect(redTeamOwedDecision({ ...pass(), read, seats: [], result: null }).reasons)
+      .toContainEqual(RED_TEAM_HOLDS['unreviewable-read']);
+    expect(redTeamReadReviewable({ ...read, netRenameSources: [] }, head)).toBe(true);
   });
   it('requires source clearance and the same non-null result id for carry', () => {
     const input = { ...pass(), seats: [], carry: { fromRev, proof: pass(fromRev) } };

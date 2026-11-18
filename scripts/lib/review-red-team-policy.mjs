@@ -68,6 +68,7 @@ export const RED_TEAM_HOLDS = Object.freeze(Object.fromEntries(Object.entries({
 /** Empty or unscored reads cannot prove either a pass or a card-only exemption. */
 export function redTeamReadReviewable(read, head) {
   return typeof head === 'string' && !!head && read?.netBasis?.rev === head
+    && Array.isArray(read.netRenameSources)
     && read.diffScored === true && typeof read.diffText === 'string' && !!read.diffText.trim();
 }
 
@@ -86,7 +87,7 @@ export function redTeamOwedDecision({ head, read, seats, result, carry, scheduli
   const validSeats = Array.isArray(seats) && seats.every(row => row?.valid === true);
   if (!validSeats) hold('seat-rows-invalid');
   const exempt = reviewable && validSeats && seats.length === 0 && scheduling.skipCardOnly === true
-    && redTeamCardOnly(read) && !scheduling.inFlight && !scheduling.queued;
+    && redTeamCardOnly(read) && !scheduling.inFlight && !scheduling.queued && !scheduling.recorded;
   let owed = !exempt || reasons.length > 0;
   const completedResult = isPublishableRedTeamResult(result) && result.completedReview === true && result.rev === head;
   let carried = false;
@@ -98,7 +99,7 @@ export function redTeamOwedDecision({ head, read, seats, result, carry, scheduli
     if (!carried) owed = true;
   }
   if (owed && !carried) {
-    if (!result) hold('pass-owed');
+    if (!result) hold(scheduling.recorded ? 'result-incomplete' : 'pass-owed');
     else if (!(completedResult && read?.netBasis?.rev === result.rev && validSeats && seats.some(completedRedTeamSeat))) hold('result-incomplete');
   }
   return { owed, cleared: reasons.length === 0, reasons };

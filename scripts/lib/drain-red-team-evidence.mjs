@@ -677,6 +677,7 @@ export function recordRedTeamStatus(input, options = {}) {
         };
         if (!remoteHold) preHold = setRemoteHold(`${input.status} round publication in progress`);
         let admission;
+        let publicationPending = false;
         let hold = 'red-team evidence unreadable; inspect the PR thread';
         let sendBack = input.sendBack === true;
         let checkStatus = input.status;
@@ -700,6 +701,7 @@ export function recordRedTeamStatus(input, options = {}) {
             const evidence = readDrainRedTeamEvidence({ repo: input.repo, pr: input.pr, head, env: options.env ?? process.env,
               readScorecards: options.readScorecards });
             const { decisionInput } = readDrainRedTeamEvidence({ evidence, repo: input.repo, pr: input.pr, head, comments, env: options.env ?? process.env });
+            publicationPending = !decisionInput.result && persistedOwesPublication(path);
             const { reasons } = redTeamOwedDecision(decisionInput);
             admission = reasons.find(hold => hold.blocking) ?? reasons[0];
             hold = admission?.message ?? null;
@@ -708,7 +710,7 @@ export function recordRedTeamStatus(input, options = {}) {
           // it must not publish FAILURE (R907). It publishes the check as in progress, which still holds merge-gate
           // (fail closed) without naming a break. A confirmed break or unknown evidence keeps its failure.
           if (!sendBack && (admission?.kind === 'pending-publish'
-            || (admission?.kind === 'pass-owed' && persistedOwesPublication(path)))) checkStatus = 'running';
+            || ((admission?.kind === 'pass-owed' || admission?.kind === 'result-incomplete') && publicationPending))) checkStatus = 'running';
         }
         const payload = redTeamCheckRunPayload({ repo: input.repo, pr: input.pr, headSha: head, status: checkStatus, hold, sendBack });
         const post = payload => {

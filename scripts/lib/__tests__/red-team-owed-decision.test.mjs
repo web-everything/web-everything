@@ -3,10 +3,10 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import ts from 'typescript';
-import { recordRedTeamStatus, readDrainRedTeamEvidence, readRecoveryWitness } from '../drain-red-team-evidence.mjs';
+import { recordRedTeamStatus, readDrainRedTeamEvidence, readRecoveryWitness, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
 import { resolveScorecardStorePath } from '../../conveyor/run-scorecard-store.mjs';
-import { redTeamOwedDecision } from '../review-red-team-policy.mjs';
+import { redTeamOwedDecision, redTeamReadReviewable } from '../review-red-team-policy.mjs';
 import { redTeamAdmissionHold } from '../drain-queue-safety.mjs';
 import { failedRedTeamRetry } from '../red-team-run-result.mjs';
 import { reviewedRead, completedSeat, completedComment } from './fixtures/red-team-owed.mjs';
@@ -65,6 +65,28 @@ describe('PR-A v2 acceptance over persisted review, status and scorecard files',
     expect(evidence.ok).toBeUndefined();
     expect(redTeamAdmissionHold({ ...f, ...evidence })).toMatchObject({ kind: 'carry-conflict', blocking: true });
   });
+  it('canonical audit: a finished ran status with a clean seal, no seats and no comment still owes its result', () => {
+    const f = fixture(), loopPayload = readDrainRedTeamEvidence(f).loopPayload;
+    recordRedTeamStatus({ ...f, loopPayload, status: 'finished', result: 'ran' }, { env: f.env });
+    const path = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
+    const status = JSON.parse(readFileSync(path, 'utf8'));
+    writeFileSync(path, JSON.stringify({ ...status, sealedBreaks: [], sealedPosted: [] }));
+    const evidence = readDrainRedTeamEvidence(f);
+    expect(evidence).toMatchObject({ recorded: true, seats: [], status: { status: 'finished', result: 'ran' } });
+    expect(evidence.decisionInput).toMatchObject({ result: null, pendingPublish: false, scheduling: { recorded: true } });
+    expect(redTeamOwedDecision(evidence.decisionInput)).toMatchObject({ owed: true, cleared: false });
+    expect(redTeamAdmissionHold({ ...f, ...evidence })).toMatchObject({ kind: 'result-incomplete', blocking: true });
+  });
+  it('canonical audit: a scored code-to-backlog rename without source metadata is unreadable and owed', () => {
+    const f = fixture({ netRenameSources: undefined,
+      diffText: 'diff --git a/scripts/source.mjs b/backlog/123-card.md\nsimilarity index 100%\nrename from scripts/source.mjs\nrename to backlog/123-card.md\n' });
+    const evidence = readDrainRedTeamEvidence(f), input = evidence.decisionInput;
+    expect(input.read.diffScored).toBe(true);
+    expect(Object.hasOwn(input.read, 'netRenameSources')).toBe(false);
+    expect(redTeamReadReviewable(input.read, f.head)).toBe(false);
+    expect(redTeamOwedDecision(input)).toMatchObject({ owed: true, cleared: false });
+    expect(redTeamAdmissionHold({ ...f, ...evidence })).toMatchObject({ kind: 'unreviewable-read', blocking: true });
+  });
   it('a real completed comment and valid completed seat clear a scored code head', () => {
     const f = fixture({ netChangedFiles: ['scripts/example.mjs'] }, [completedSeat('a'.repeat(40))]);
     f.comments = [completedComment(f.pr, f.head)];
@@ -73,7 +95,7 @@ describe('PR-A v2 acceptance over persisted review, status and scorecard files',
 });
 
 // Parse the actual source: call deletion and prose-based routing must fail independently of runtime fixtures.
-const sources = () => Object.fromEntries(['drain-queue-safety.mjs', 'drain-merge-strategy.mjs']
+const sources = () => Object.fromEntries(['drain-queue-safety.mjs', 'drain-merge-strategy.mjs', 'drain-red-team-input.mjs', 'review-red-team-policy.mjs']
   .map(file => [file, readFileSync(new URL(`../${file}`, import.meta.url), 'utf8')]));
 const parse = (file, text) => ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
 function all(node, predicate) {
@@ -83,6 +105,9 @@ function all(node, predicate) {
 }
 const calls = (node, name) => all(node, n => ts.isCallExpression(n) && n.expression.getText() === name);
 function assertStructure(source) {
+  expect(source['drain-red-team-input.mjs']).toMatch(/recorded: !!raw\.recorded/);
+  expect(source['review-red-team-policy.mjs']).toMatch(/!scheduling\.recorded/);
+  expect(source['review-red-team-policy.mjs']).toMatch(/&& Array\.isArray\(read\.netRenameSources\)/);
   const queue = parse('drain-queue-safety.mjs', source['drain-queue-safety.mjs']);
   const merge = parse('drain-merge-strategy.mjs', source['drain-merge-strategy.mjs']);
   for (const file of [queue, merge]) {
@@ -106,6 +131,9 @@ it('structural: each admission delegates exactly once; holds never branch on inc
   assertStructure(sources());
 });
 it.each([
+  ['recorded normalization deleted', 'drain-red-team-input.mjs', text => text.replace('recorded: !!raw.recorded,', '')],
+  ['recorded exemption guard deleted', 'review-red-team-policy.mjs', text => text.replace(' && !scheduling.recorded', '')],
+  ['rename readability guard deleted', 'review-red-team-policy.mjs', text => text.replace('&& Array.isArray(read.netRenameSources)', '')],
   ['policy delegation deleted', 'drain-queue-safety.mjs', text => text.replace('redTeamOwedDecision(decisionInput)', '({ reasons: [] })')],
   ...[0, 1, 2].map(index => [`merge admission call ${index + 1} deleted`, 'drain-merge-strategy.mjs', text => {
     let seen = 0;

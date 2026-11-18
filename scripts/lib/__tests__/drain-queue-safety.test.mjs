@@ -1605,7 +1605,7 @@ describe('durable head-bound red-team admission', () => {
     expect(hold({ loopPayload, env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' } })).toMatch(/no recorded result/);
     expect(hold({ loopPayload, env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, inFlight: true })).toMatch(/no recorded result/);
     expect(hold({ loopPayload, scheduled: false, inFlight: true })).toMatch(/no recorded result/);
-    expect(hold({ loopPayload, scheduled: false, recorded: true })).toMatch(/no recorded result/);
+    expect(hold({ loopPayload, scheduled: false, recorded: true })).toMatch(/result incomplete/);
     expect(hold({ loopPayload, env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, comments: [clean()] })).toBeNull();
   });
 });
