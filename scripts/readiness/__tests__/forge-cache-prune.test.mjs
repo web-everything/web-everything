@@ -6,6 +6,8 @@ import {spawn, spawnSync} from 'node:child_process';
 import {join} from 'node:path';
 import {resolveSettings, planPrune, scanCache, executePrune, readLiveEvidence} from '../forge-cache-prune.mjs';
 
+vi.mock('node:fs/promises', async importOriginal => ({...await importOriginal()}));
+
 const HOUR = 3_600_000, GiB = 1024 ** 3, now = Date.UTC(2026, 10, 9);
 const hex = c => c.repeat(64), lock = hex('a');
 let tmp, root, receipts;
@@ -670,6 +672,54 @@ describe('live reservation compatibility', () => {
 });
 
 describe('readLiveEvidence', () => {
+  it.each([
+    {scenario: 'newer fieldless running protects the whole lock', runningAge: 1000, protectedLock: true},
+    {scenario: 'no running record allows reclamation', runningAge: null, protectedLock: false},
+    {scenario: 'running older than receipt allows reclamation', runningAge: 2500, protectedLock: false},
+    {scenario: 'receipt wins a timestamp tie with running', runningAge: 2000, protectedLock: false},
+  ])('$scenario', async ({runningAge, protectedLock}) => {
+    const run = `r-${'1'.repeat(32)}`;
+    const files = new Map([
+      [join(receipts, 'worker-active', 'reservation.json'),
+        {value: {run, writerGuard: 1}, mtimeMs: now - 3 * HOUR}],
+      [join(receipts, `${run}.prepared`), {value: record(false), mtimeMs: now - 3000}],
+      [join(receipts, `${run}.receipt`), {value: {v: 1, run, phase: 'test', code: 0,
+        lock, inputDigest: hex('b'), manifestDigest: hex('c')}, mtimeMs: now - 2000}],
+    ]);
+    if (runningAge !== null) files.set(join(receipts, `${run}.running`),
+      {value: {run, owner: 'writer'}, mtimeMs: now - runningAge});
+    const directories = new Set([receipts, join(receipts, 'worker-active')]);
+    const fileAt = path => {
+      const file = files.get(path);
+      if (!file) throw Object.assign(new Error('Missing evidence'), {code: 'ENOENT'});
+      return file;
+    };
+    try {
+      vi.spyOn(fs, 'readdir').mockResolvedValue(['worker-active']);
+      vi.spyOn(fs, 'lstat').mockImplementation(async path => directories.has(path)
+        ? {isDirectory: () => true} : {mtimeMs: fileAt(path).mtimeMs});
+      vi.spyOn(fs, 'open').mockImplementation(async path => {
+        const contents = Buffer.from(JSON.stringify(fileAt(path).value));
+        let position = 0;
+        return {
+          stat: async () => ({isFile: () => true, size: contents.length}),
+          read: async (buffer, offset, length) => {
+            const bytesRead = contents.copy(buffer, offset, position, position + length);
+            position += bytesRead;
+            return {bytesRead};
+          },
+          close: async () => {},
+        };
+      });
+      const live = await readLiveEvidence({receipts, now});
+      expect(live.complete).toBe(true);
+      expect(live.locks).toEqual(new Set(protectedLock ? [lock] : []));
+      if (!protectedLock) expect(live.profiles).toEqual(new Set());
+      const profiles = [entry('b', 30), entry('c', 30), entry('f', 30)];
+      expectDecision(plan(profiles, {live}), protectedLock ? [] : profiles, protectedLock ? profiles : []);
+    } finally { vi.restoreAllMocks(); }
+  });
+
   it('an empty readable receipts directory is complete with no protected profiles', async () => {
     expect(await readLiveEvidence({receipts})).toMatchObject({complete: true, profiles: new Set()});
   });

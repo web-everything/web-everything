@@ -240,8 +240,12 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
       let latestKnown = false;
       // The newest present phase decides even when it carries no profile fields:
       // an older known profile cannot narrow protection for a later unknown one.
-      const latest = ['receipt', 'running', 'prepared'].find(x => records.some(r => r.suffix === x));
-      for (const {suffix, record} of records) {
+      const phaseRank = {prepared: 0, running: 1, receipt: 2};
+      const latest = records.reduce((newest, candidate) => candidate.mtimeMs > newest.mtimeMs
+        || (candidate.mtimeMs === newest.mtimeMs && phaseRank[candidate.suffix] > phaseRank[newest.suffix])
+        ? candidate : newest);
+      for (const evidence of records) {
+        const {suffix, record} = evidence;
         // Validate both fields independently of sibling selection, including on
         // the leaked-reservation path before it can drop profile protection.
         for (const field of ['inputDigest', 'manifestDigest']) {
@@ -260,8 +264,8 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
         if (digest !== undefined && !profileKnown) throw new Error('Invalid reserved profile evidence');
         if (leaked) continue;
         if (profileKnown) profiles.add(`${lock}/dev-v5-${digest}`);
-        // The most advanced phase decides: an earlier known profile must not mask a later unknown one.
-        if (suffix === latest) latestKnown = profileKnown;
+        // The newest record decides: an older known profile must not mask a later unknown one.
+        if (evidence === latest) latestKnown = profileKnown;
       }
       if (leaked) continue;
       // A legacy writer can change profiles without taking a lease. Missing
