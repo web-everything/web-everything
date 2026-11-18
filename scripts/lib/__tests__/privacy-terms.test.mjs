@@ -413,14 +413,29 @@ describe('R972 Windows home paths', () => {
     }
   });
   // PR 7008 self-review: host patterns restarted at every inner dot or dash (quadratic on a long run).
+  // Doubling the input must roughly double the time (linear ≈ 2x, quadratic ≈ 4x). A fixed wall-clock bound flaked on a
+  // loaded CI shard (1508ms vs 1500ms), so compare two sizes back-to-back; the generous absolute cap only catches a hang.
   it('stays linear on long dotted and dashed runs', () => {
-    for (const text of ['1.'.repeat(40000), 'a-'.repeat(40000), 'a.'.repeat(40000) + 'workers', 'fd00:'.repeat(20000),
-      `a::${'.'.repeat(80000)}a`, `a::${'1.'.repeat(40000)}`, `x:${'a:'.repeat(40000)}`]) {
+    const shapes = (n) => ['1.'.repeat(n), 'a-'.repeat(n), 'a.'.repeat(n) + 'workers', 'fd00:'.repeat(n / 2),
+      `a::${'.'.repeat(2 * n)}a`, `a::${'1.'.repeat(n)}`, `x:${'a:'.repeat(n)}`];
+    const timeScan = (text) => {
       const started = performance.now();
       scanText(text);
-      expect(performance.now() - started).toBeLessThan(1500);
-    }
-  });
+      return performance.now() - started;
+    };
+    const small = shapes(20000);
+    shapes(40000).forEach((text, index) => {
+      let ratio = Infinity;
+      let large = 0;
+      for (let attempt = 0; attempt < 3 && ratio >= 3.2; attempt += 1) {
+        const base = timeScan(small[index]);
+        large = timeScan(text);
+        ratio = large / Math.max(base, 20);
+      }
+      expect(ratio).toBeLessThan(3.2);
+      expect(large).toBeLessThan(10000);
+    });
+  }, 60000);
   it('reports every private address on one long line once, with its line number', () => {
     const text = `x\n${'::ffff:10.0.0.1 y '.repeat(2000)}`;
     const hits = scanText(text).filter(hit => hit.pattern === 'private-network-ip');

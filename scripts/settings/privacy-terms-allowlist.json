@@ -2186,6 +2186,102 @@
       "matchSha256": "4dc0b5f3d98ae75cccb488082dcd16461d47fb09f63c8b1d0128ff5eaf93b9e2",
       "lineSha256": "d74e87f968616c030762ab14ef1f1d85dc9e1f3bb9977cf7472b3f560d69fa44",
       "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-network-ip",
+      "matchText": "::ffff:10.0.0.1",
+      "matchSha256": "fa6dbcd9ee860534dedfa96a2476f25ce08089465449ab03482a56d75eec299a",
+      "lineSha256": "132dada843bbcbaaa77119b9cc79320272837a228ce8e8edd75a3ae349905e6d",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-network-ip",
+      "matchText": "::ffff:10.0.0.1",
+      "matchSha256": "fa6dbcd9ee860534dedfa96a2476f25ce08089465449ab03482a56d75eec299a",
+      "lineSha256": "e18b5308557b6451ceaf866578cbb56bd528873931661f6825b030bfa4a16117",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-service-url",
+      "matchText": "my-app.workers.dev",
+      "matchSha256": "299ded47c1d35c7b44b1dce5c9ce0fe0997c0c891cbb9a00d1daeb02e8a65ddb",
+      "lineSha256": "3de15de4ee865135e7328346150959f247958730bf5f2f45a85d61b9e0a2f0ff",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "private-service-url",
+      "matchText": "foo.workers.dev",
+      "matchSha256": "0c89c27f9196f082eade1d678d3432dd6ea4aa317ef0a11b0c9df36c8c1957ef",
+      "lineSha256": "3de15de4ee865135e7328346150959f247958730bf5f2f45a85d61b9e0a2f0ff",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "network-name",
+      "matchText": "tail1234.ts.net",
+      "matchSha256": "998b264c552eb9b67bccd4d06ace631020277cffb480aee41962134648aff04d",
+      "lineSha256": "bff444d66560df1e0161cafaa3785696cc84a447523f65d300f246d7d87a05f6",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/__tests__/privacy-terms.test.mjs",
+      "pattern": "network-name",
+      "matchText": "foo.ts.net",
+      "matchSha256": "640080cfdeac80415a6282f3cad716cfd141b01747a818e15e35859fd937b24f",
+      "lineSha256": "bff444d66560df1e0161cafaa3785696cc84a447523f65d300f246d7d87a05f6",
+      "reason": "R971 detector positive and negative fixtures must quote prohibited terms."
+    },
+    {
+      "path": "scripts/lib/privacy-terms.mjs",
+      "pattern": "private-network-ip",
+      "matchText": "::ffff:10.2.3.4",
+      "matchSha256": "ead3b1e099b1ed5b4a4621295df67d7a09245449146e4ccbc01b469834d43db3",
+      "lineSha256": "a38a0a9d89e3f4770f85b39e90b76b43153b4d5e53d848c895c9273bf27d4393",
+      "reason": "R971 detector doc comment quotes one synthetic address; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-network-ip",
+      "matchText": "::ffff:10.0.0.1",
+      "matchSha256": "fa6dbcd9ee860534dedfa96a2476f25ce08089465449ab03482a56d75eec299a",
+      "lineSha256": "ebe75d68f1b1a0bd2d42022ee670228105aff4baf5d5fdefbda442716de38ffb",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-service-url",
+      "matchText": "my-app.workers.dev",
+      "matchSha256": "299ded47c1d35c7b44b1dce5c9ce0fe0997c0c891cbb9a00d1daeb02e8a65ddb",
+      "lineSha256": "297b89ed9f4852b6a701ee24ca16bccc20fd31d06c59afdfd66e981dc98a89c7",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "private-service-url",
+      "matchText": "foo.workers.dev",
+      "matchSha256": "0c89c27f9196f082eade1d678d3432dd6ea4aa317ef0a11b0c9df36c8c1957ef",
+      "lineSha256": "9d2cef9dea8cf60b3355f9f9088076fd587e559bf126931e1f7b10992eed0496",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "network-name",
+      "matchText": "tail1234.ts.net",
+      "matchSha256": "998b264c552eb9b67bccd4d06ace631020277cffb480aee41962134648aff04d",
+      "lineSha256": "ef7c60f890abec21cb5cace0d21b4b1dcaeacb5dd9e8dbb39b8c038852c0e2e3",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "network-name",
+      "matchText": "foo.ts.net",
+      "matchSha256": "640080cfdeac80415a6282f3cad716cfd141b01747a818e15e35859fd937b24f",
+      "lineSha256": "30526bb6386f1e77cb68e26f39aa26cee5c087f7b369fbc6d579acff3e20eed8",
+      "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
     }
   ]
 }
