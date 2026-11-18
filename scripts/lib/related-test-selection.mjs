@@ -23,6 +23,40 @@
  * the caller injects the file list and a reader.
  */
 
+import { readFileSync } from 'node:fs';
+import { posix } from 'node:path';
+import { cascadePolicy } from './policy-cascade.mjs';
+
+const DEFAULT_SELECTION = { maxTests: 0, maxTestsInCi: 0, staticEdges: { spawnPath: true, alias: true, literalRead: true } };
+/** WE_CI_SELECTION is a JSON selection block. Invalid leaves retain the lower layer. */
+export function loadCiSelection({ env = process.env, readFile = readFileSync, tool, platform, log } = {}) {
+  if (tool === undefined) {
+    try { tool = JSON.parse(readFile(new URL('../settings/ci-selection.json', import.meta.url), 'utf8')).ci.selection; }
+    catch { tool = {}; }
+  }
+  let override = {};
+  try { override = JSON.parse(env.WE_CI_SELECTION || '{}'); } catch { /* defaults */ }
+  const integer = v => Number.isSafeInteger(v) && v >= 0;
+  const bools = v => v && typeof v === 'object' && ['spawnPath', 'alias', 'literalRead'].every(k => typeof v[k] === 'boolean');
+  const resolved = cascadePolicy('ci.selection', tool, { standard: DEFAULT_SELECTION, platform, env,
+    envValues: override && typeof override === 'object' ? override : {},
+    valid: { maxTests: integer, maxTestsInCi: v => v === DEFAULT_SELECTION.maxTestsInCi,
+      staticEdges: bools, 'staticEdges.spawnPath': v => typeof v === 'boolean',
+      'staticEdges.alias': v => typeof v === 'boolean', 'staticEdges.literalRead': v => typeof v === 'boolean' }, ...(log ? { log } : {}) });
+  return resolved.value;
+}
+
+let aliases;
+function repoAliases() {
+  if (!aliases) {
+    try {
+      const text = readFileSync(new URL('../../tsconfig.json', import.meta.url), 'utf8');
+      aliases = JSON.parse(text.replace(/^\s*\/\/.*$/gm, '')).compilerOptions.paths;
+    } catch { aliases = {}; }
+  }
+  return aliases;
+}
+
 // `from '<spec>'` is matched on its own, not anchored to its `import {`: a multi-line import list can hold a comment
 // with a quote or `;` in it. A stray match in a comment or string only ADDS an edge (more tests), never drops one.
 const SPECIFIER_RE = /\bfrom\s*['"]([^'"\n]+)['"]|\bimport\s*\(\s*['"]([^'"\n]+)['"]\s*\)|\bimport\s+['"]([^'"\n]+)['"]|\b(?:require|mock|doMock|unmock|doUnmock|importActual|importMock)\s*\(\s*['"]([^'"\n]+)['"]|\bimport\s*\(\s*`([^`$\n]+)/g;
@@ -73,12 +107,43 @@ export function resolveSpecifier(fromFile, spec, fileSet) {
  * we:scripts/lib/merge-queue-affected.mjs, reads it). Pure.
  * @returns {string[]}
  */
-export function resolvedImportsOf(fromFile, text, fileSet) {
+export function resolvedImportsOf(fromFile, text, fileSet, options = {}) {
+  const { staticEdges = loadCiSelection().staticEdges, aliases = repoAliases() } = options;
   const out = new Set();
   for (const m of String(text ?? '').matchAll(SPECIFIER_RE)) {
     // m[5]: a template-literal dynamic import (`import(\`../x.mjs?v=${n}\`)`): the static prefix up to `${` is the path.
-    const target = resolveSpecifier(fromFile, m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5], fileSet);
+    const spec = m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5];
+    let target = resolveSpecifier(fromFile, spec, fileSet);
+    if (!target && staticEdges.alias) {
+      if (spec.startsWith('we:')) target = resolveSpecifier('_root.mjs', './' + spec.slice(3), fileSet);
+      for (const [pattern, paths] of Object.entries(aliases)) {
+        const [prefix, tail = ''] = pattern.split('*');
+        if (pattern.includes('*') ? !spec.startsWith(prefix) || !spec.endsWith(tail) : spec !== pattern) continue;
+        const part = spec.slice(prefix.length, tail ? -tail.length : undefined);
+        for (const path of paths) target ||= resolveSpecifier('_root.mjs', './' + path.replace('*', part), fileSet);
+        // External sibling aliases retain their textual key. Also match the vendored in-repo counterpart.
+        out.add(spec);
+        if (spec.startsWith('@frontierui/')) target ||= resolveSpecifier('_root.mjs', './' + spec.slice(12), fileSet);
+      }
+      if (spec.startsWith('@frontierui/')) out.add(spec);
+    }
     if (target && target !== fromFile) out.add(target);
+  }
+  // Conservative path scan: when a source spawns or reads, literal paths and join/resolve/URL
+  // expressions anywhere in that source add edges. False positives only widen selection. No evaluation.
+  if ((staticEdges.spawnPath && /\b(?:spawn|execFile|fork)(?:Sync)?\s*\(/.test(text))
+    || (staticEdges.literalRead && /\breadFile(?:Sync)?\s*\(/.test(text))) {
+    const add = path => {
+      for (const candidate of [path, posix.normalize(path), normalizeJoin(fromFile, path)]) {
+        if (candidate && fileSet.has(candidate) && candidate !== fromFile) out.add(candidate);
+      }
+    };
+    for (const m of String(text).matchAll(/['"`]([^'"`\n$]+)['"`]/g)) add(m[1]);
+    for (const m of String(text).matchAll(/\b(?:join|resolve|URL)\s*\(([^;\n]*)/g)) {
+      const parts = [...m[1].matchAll(/['"`]([^'"`\n$]*)['"`]/g)].map(x => x[1]);
+      // Try each literal suffix: an unknown dir may denote the file directory or repo root.
+      for (let i = 0; i < parts.length; i++) for (let end = i + 1; end <= parts.length; end++) add(parts.slice(i, end).join('/'));
+    }
   }
   return [...out];
 }
@@ -116,14 +181,15 @@ export function specifierBasesResolvingTo(path) {
  * file can be an import TARGET, so a test that imports a changed JSON fixture still has its edge.
  * @param {{files: string[], readFile: (path: string) => string}} args
  */
-export function buildReverseImportGraph({ files, readFile }) {
+export function buildReverseImportGraph({ files, readFile, ...options }) {
+  options.staticEdges ??= loadCiSelection().staticEdges;
   const sources = files.filter(isGraphSourceFile);
   const fileSet = new Set(files.filter((f) => !f.startsWith('node_modules/') && !f.includes('/node_modules/')));
   const reverse = new Map();
   for (const file of sources) {
     let text;
     try { text = String(readFile(file)); } catch { continue; }
-    for (const target of resolvedImportsOf(file, text, fileSet)) {
+    for (const target of resolvedImportsOf(file, text, fileSet, options)) {
       if (!reverse.has(target)) reverse.set(target, new Set());
       reverse.get(target).add(file);
     }
@@ -156,7 +222,8 @@ export function testDepths(starts, reverse) {
  *   depth: number|null, maxDepth: number, maxTests: number, tests: string[]|null, droppedCount: number,
  *   directTestCount: number, hubs: {file: string, direct: number, transitive: number}[], reason: string}}
  */
-export function selectRelatedTests({ changedFiles, reverse, maxTests, maxDepth }) {
+export function selectRelatedTests({ changedFiles, reverse, maxTests, maxDepth = 2, env = process.env, settings = loadCiSelection({ env }) }) {
+  maxTests = env.CI || env.GITHUB_ACTIONS ? settings.maxTestsInCi : (maxTests ?? settings.maxTests);
   const changed = [...new Set(changedFiles)];
   const depths = testDepths(changed, reverse);
   const fullCount = new Set([...depths.keys()]).size;
@@ -164,9 +231,9 @@ export function selectRelatedTests({ changedFiles, reverse, maxTests, maxDepth }
     const reach = testDepths([file], reverse);
     return { file, direct: [...reach.values()].filter((d) => d <= 1).length, transitive: reach.size };
   }).filter((h) => h.transitive > 0).sort((a, b) => b.transitive - a.transitive).slice(0, 5);
-  const base = { fullTestCount: fullCount, maxDepth, maxTests, hubs };
+  const base = { fullTestCount: fullCount, maxDepth, maxTests, hubs, reachableTests: [...depths.keys()].sort() };
   if (!(maxTests > 0) || fullCount <= maxTests) {
-    return { ...base, status: 'complete', selectedTestCount: fullCount, depth: null, tests: null, droppedCount: 0,
+    return { ...base, status: 'complete', partial: false, selectedTestCount: fullCount, depth: null, tests: null, droppedCount: 0,
       directTestCount: [...depths.values()].filter((d) => d <= 1).length,
       reason: maxTests > 0 ? `${fullCount} related test(s) ≤ limit ${maxTests} — vitest related, full import depth` : 'limit off — vitest related, full import depth' };
   }
@@ -197,7 +264,7 @@ export function selectRelatedTests({ changedFiles, reverse, maxTests, maxDepth }
   }
   const tests = [...selected].sort();
   const droppedCount = [...depths.keys()].filter((t) => !selected.has(t)).length;
-  return { ...base, status: 'selection-truncated', selectedTestCount: tests.length, depth, tests, droppedCount,
+  return { ...base, status: 'selection-truncated', partial: true, selectedTestCount: tests.length, depth, tests, droppedCount,
     directTestCount: [...depths.values()].filter((d) => d <= 1).length,
     reason: `${fullCount} related test(s) > limit ${maxTests} — ran ${tests.length} within ${depth} import hop(s); ${droppedCount} farther test(s) left to CI` };
 }

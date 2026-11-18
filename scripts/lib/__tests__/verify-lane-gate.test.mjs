@@ -1546,3 +1546,28 @@ describe('related gate routing in a sibling checkout without the WE admission wr
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
+
+
+describe('S1 static selection composition', () => {
+  const gate = (files, env = TODAY) => {
+    const git = fakeGit(['scripts/child.mjs']);
+    return resolveDefaultGate({ env, fileConfig: { relatedMaxTests: 1000, relatedDepth: 2 },
+      runGit: args => args[0] === 'ls-files' && args.includes('--cached') ? Object.keys(files).join('\n') : git(args),
+      readRepoFile: p => files[p] });
+  };
+  it('adds a transitive spawn importer to local related targets without changing its local cap', () => {
+    const files = { 'scripts/child.mjs': '', 'scripts/helper.mjs': "spawn('node', ['scripts/child.mjs'])",
+      'scripts/consumer.test.mjs': "import './helper.mjs'" };
+    const result = gate(files);
+    expect(result.testCommand).toContain("'scripts/consumer.test.mjs'");
+    expect(result.decision.selection).toMatchObject({ partial: false, maxTests: 1000 });
+    expect(gate(files, { ...TODAY, CI: 'true' }).decision.selection).toMatchObject({ partial: false, maxTests: 0 });
+  });
+  it('blocks oversized supplemental static targets with an explicit operator fallback', () => {
+    const files = { 'scripts/child.mjs': '' };
+    for (let i = 0; i < 500; i++) files[`scripts/${'x'.repeat(90)}${i}.test.mjs`] = "readFileSync('scripts/child.mjs')";
+    const result = gate(files);
+    expect(result.decision.reasons.join(' ')).toMatch(/static selection exceeds command bounds.*explicit affected-test/);
+    expect(result.command).toBeNull();
+  });
+});
