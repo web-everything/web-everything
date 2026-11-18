@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { laneGitHardeningEnv } from '../lane-git-hardening.mjs';
+import { laneGitHardeningEnv, laneHistoryProofEnv } from '../lane-git-hardening.mjs';
 
 describe('laneGitHardeningEnv replacement-object isolation', () => {
   it.each([undefined, { credentialPins: false }])('disables replacement objects with options %j', options => {
@@ -41,7 +41,7 @@ describe('laneGitHardeningEnv lane-owned parent metadata', () => {
       writeFileSync(join(lane, '.git', 'info', 'grafts'), `${cardOnly} ${oldHead}\n`);
       // Positive control: without the hardening env the graft really skips the hidden commit.
       expect(git(lane, { ...base, GIT_NO_REPLACE_OBJECTS: '1' }, ['rev-list', '--parents', '-1', cardOnly])).toBe(`${cardOnly} ${oldHead}`);
-      const env = laneGitHardeningEnv(base, options);
+      const env = laneHistoryProofEnv(base, options);
       expect(git(lane, env, ['rev-list', '--parents', '-1', cardOnly])).toBe(`${cardOnly} ${hidden}`);
       expect(git(lane, env, ['rev-list', `${oldHead}..${cardOnly}`]).split('\n')).toEqual([cardOnly, hidden]);
     } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -58,7 +58,14 @@ describe('laneGitHardeningEnv lane-owned parent metadata', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it('pins the graft file even over an inherited one', () => {
-    expect(laneGitHardeningEnv({ GIT_GRAFT_FILE: '/lane/info/grafts' }).GIT_GRAFT_FILE).toBe('/dev/null');
+  it('pins the history-proof graft file even over an inherited one, and keeps the hardening pins', () => {
+    const env = laneHistoryProofEnv({ GIT_GRAFT_FILE: '/lane/info/grafts' });
+    expect(env.GIT_GRAFT_FILE).toBe('/dev/null');
+    expect(env.GIT_NO_REPLACE_OBJECTS).toBe('1');
+    expect(env.GIT_CONFIG_COUNT).toBe(laneGitHardeningEnv({}).GIT_CONFIG_COUNT);
+  });
+
+  it('leaves the shared hardening env graft path alone so health-watch can still detect a lane grafts file', () => {
+    expect(laneGitHardeningEnv({})).not.toHaveProperty('GIT_GRAFT_FILE');
   });
 });

@@ -177,8 +177,6 @@ export function laneGitHardeningEnv(env = process.env, { remoteProbe = false, cr
   const out = { ...env, GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' };
   // Lane-owned replace refs must never substitute the commits used by history and review proofs.
   out.GIT_NO_REPLACE_OBJECTS = '1';
-  // Replace refs off still reads `<git-dir>/info/grafts`, which forges parents the same way; an empty graft file wins.
-  out.GIT_GRAFT_FILE = '/dev/null';
   delete out.GIT_EXTERNAL_DIFF;
   delete out.GIT_ASKPASS;
   delete out.SSH_ASKPASS;
@@ -215,6 +213,19 @@ export function laneGitHardeningEnv(env = process.env, { remoteProbe = false, cr
   });
   out.GIT_CONFIG_COUNT = String(start + pins.length);
   return out;
+}
+
+/**
+ * {@link laneGitHardeningEnv} for a git call that proves a lane's history (parents, ranges, diffs): also points the
+ * graft file at `/dev/null`, since replace refs off still reads `<git-dir>/info/grafts` and a lane-written one forges
+ * parents (PR #7012 self-review). Not part of the shared env: the health-watch fresh-safety probe resolves
+ * `--git-path info/grafts` to DETECT a lane grafts file, and a pinned path would hide it. Pure.
+ * @param {Record<string,string|undefined>} env
+ * @param {Parameters<typeof laneGitHardeningEnv>[1]} [options]
+ * @returns {Record<string,string|undefined>}
+ */
+export function laneHistoryProofEnv(env = process.env, options) {
+  return { ...laneGitHardeningEnv(env, options), GIT_GRAFT_FILE: '/dev/null' };
 }
 
 /** The argv that lists a lane's effective config with each entry's scope, NUL-separated (`scope\0key\nvalue\0…`). Reading

@@ -1765,6 +1765,11 @@ describe('moved card-only skip settlement', () => {
       expect(file).toBe('git');
       expect(options.cwd).toBe(lanePath);
       expect(options.env.GIT_NO_LAZY_FETCH).toBe('1');
+      // A lane info/grafts or commit-graph file must not forge the parents this proof walks (PR #7012 self-review).
+      expect(options.env.GIT_GRAFT_FILE).toBe('/dev/null');
+      expect(options.env.GIT_NO_REPLACE_OBJECTS).toBe('1');
+      const pins = Number(options.env.GIT_CONFIG_COUNT);
+      expect(Array.from({ length: pins }, (_, i) => options.env[`GIT_CONFIG_KEY_${i}`])).toContain('core.commitGraph');
       if (args[0] === 'merge-base') return '';
       if (args[0] === 'rev-list') return `${head} ${fromSha}`;
       if (args[0] === 'diff-tree') return 'backlog/123-card.md\0';
