@@ -225,9 +225,10 @@ export async function rebuildCloneAsJob({
 
   // Adoption always precedes reattach: even a queued/retryable job must yield to a passed build.
   const r = await adopt();
-  if (r?.moved || r?.adopted || readReadyCandidate(root, env)) {
+  // Only a completed adoption short-circuits; a ready record that did not adopt must not suppress job recovery below.
+  if (r?.moved || r?.adopted) {
     housekeeping();
-    return { ...r, ...(r?.reason === 'needs-build' ? { reason: 'ready-pending' } : {}), finishedJobs };
+    return { ...r, finishedJobs };
   }
 
   // 2. A job in flight: reattach (launch / stalled / dead handling) and tick on the current tree.

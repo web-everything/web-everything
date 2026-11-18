@@ -99,6 +99,6 @@ it.each(['before-reattach', 'during-reattach'])('never starts or restarts a job 
   expect(result.reason).toBe('ready-pending');
   expect(readReadyCandidate(root, env)?.adopt.finalSha).toBe('ready');
   expect(store.list().records).toHaveLength(1);
-  expect(reattach).toHaveBeenCalledTimes(phase === 'before-reattach' ? 0 : 1);
+  expect(reattach).toHaveBeenCalledTimes(1); // a non-adopting ready record must not suppress job recovery
   expect(adopt).toHaveBeenCalledTimes(1);
 });
