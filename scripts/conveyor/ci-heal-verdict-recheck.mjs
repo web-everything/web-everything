@@ -24,6 +24,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { withoutImpliedRequiredChecks } from '../lib/required-check-implication.mjs';
+import { reviewCiPrerequisites } from '../lib/review-ci-gate.mjs';
 import { classifyCheck, summarize } from '../lib/check-state-predicate.mjs';
 import { CODEQL_CHECK_NAME } from '../lib/codeql-gate.mjs';
 
@@ -76,8 +77,11 @@ export function ciGreenForEscalation({ rollup, requiredChecks, headSha, rowsHead
   if (rowsComplete !== true || rowsHead !== headSha) return false;
   if (!Array.isArray(requiredChecks) || !requiredChecks.length) return false;
   // Aggregate hydration metadata cannot override a row explicitly bound to another head.
-  const currentRows = (Array.isArray(rollup) ? rollup : [])
-    .filter(row => row?.head_sha == null || row.head_sha === headSha);
+  const rows = Array.isArray(rollup) ? rollup : [];
+  // A required (or implying) row bound to another head is unproven: never let a current-head row imply it away.
+  const { wrongHeads, needed } = reviewCiPrerequisites({ headSha, requiredChecks, checks: rows });
+  if (needed.some(name => wrongHeads.has(name))) return false;
+  const currentRows = rows.filter(row => row?.head_sha == null || row.head_sha === headSha);
   const { red, pending, missing } = requiredCheckStates({ rollup: currentRows, requiredChecks });
   return !red.length && !pending.length && !missing.length;
 }

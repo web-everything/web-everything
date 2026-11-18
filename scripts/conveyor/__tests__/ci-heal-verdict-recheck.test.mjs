@@ -780,6 +780,13 @@ describe('hydrated CI evidence for escalation retirement', () => {
       expect(ciGreenForEscalation({ ...evidence, rollup: [{ ...aggregate, head_sha: 'other' }] })).toBe(false);
     }
   });
+  it('a foreign-head failing required row is not implied away by a current-head aggregate', () => {
+    const evidence = { headSha: input.headSha, rowsHead: input.headSha, rowsComplete: true, requiredChecks: ['integration'] };
+    const test = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: input.headSha };
+    expect(ciGreenForEscalation({ ...evidence, rollup: [test] })).toBe(true);
+    expect(ciGreenForEscalation({ ...evidence, rollup: [test,
+      { name: 'integration', status: 'COMPLETED', conclusion: 'FAILURE', head_sha: 'other' }] })).toBe(false);
+  });
   it.each([
     { rowsComplete: undefined }, { rowsComplete: false }, { rowsHead: undefined }, { rowsHead: 'other' }, { rowsHead: null },
   ])('does not call green rows complete for this head: %j', evidence => {
