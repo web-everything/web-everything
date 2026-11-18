@@ -179,6 +179,10 @@ export async function materializeWorktree({work,root,baseSha,head,manifest,manif
     // Restore only HEAD links represented by projected aliases. Keep the real
     // projected files in work: these entries are index metadata, never checkout.
     const tree=await git(['ls-tree','-r','-z','HEAD'],cloned,undefined,false,true);
+    const linkPrefixes=tree.toString('latin1').split('\0')
+      .filter(record=>/^120000 blob [a-f0-9]+\t/.test(record))
+      .map(record=>record.slice(record.indexOf('\t')+1)+'/');
+    const byPath=new Map(entries.map(entry=>[entry.path.toString('latin1'),entry]));
     let start=0;
     for(let end=0;end<tree.length;end++)if(tree[end]===0) {
       const record=tree.subarray(start,end),tab=record.indexOf(9);start=end+1;
@@ -191,12 +195,25 @@ export async function materializeWorktree({work,root,baseSha,head,manifest,manif
       if(!entries.some(entry=>!entry.tracked&&entry.path.subarray(0,prefix.length).equals(prefix)))continue;
       const target=await git(['cat-file','blob',match[1]],cloned,undefined,true,true);
       if(!target?.length||target[0]===47||target.some(b=>b===0||b===10||b===13))continue;
-      let depth=parts.length-1,escaped=false;
+      const targetParts=parts.slice(0,-1).map(part=>part.toString('latin1'));
+      let escaped=false;
       for(const part of target.toString('latin1').split('/')) {
-        if(part==='..'){if(--depth<0){escaped=true;break;}}
-        else if(part&&part!=='.')depth++;
+        if(part==='..'){if(!targetParts.length){escaped=true;break;}targetParts.pop();}
+        else if(part&&part!=='.')targetParts.push(part);
       }
       if(escaped)continue;
+      const targetPrefix=targetParts.length?targetParts.join('/')+'/':'';
+      const aliasPrefix=prefix.toString('latin1');
+      // The manifest has no link OID: prove the HEAD target still matches the
+      // client's projection in both directions before restoring its index blob.
+      if(entries.some(entry=>!entry.tracked&&entry.path.subarray(0,prefix.length).equals(prefix)
+        &&byPath.get(targetPrefix+entry.path.toString('latin1').slice(aliasPrefix.length))?.sha256!==entry.sha256))continue;
+      if(entries.some(entry=>{
+        const path=entry.path.toString('latin1');
+        if(!path.startsWith(targetPrefix)||linkPrefixes.some(prefix=>path.startsWith(prefix)))return false;
+        const alias=byPath.get(aliasPrefix+path.slice(targetPrefix.length));
+        return !alias||alias.tracked||alias.sha256!==entry.sha256;
+      }))continue;
       index.push(Buffer.from(`120000 ${match[1]}\t`),linkPath,Buffer.from([0]));
     }
     await git(['update-index','-z','--index-info'],cloned,Buffer.concat(index));
