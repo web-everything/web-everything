@@ -1,6 +1,6 @@
 /** @file Real Git resolution and filesystem persistence for audit IO. */
 import { describe, it, expect } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { spawnSync, execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { URL as NodeURL } from 'node:url';
@@ -54,6 +54,43 @@ describe('codex-audit real IO', () => {
       const contents = readFileSync(recordPath, 'utf8');
       expect(contents).toBe(`${JSON.stringify(first)}\n${JSON.stringify(second)}\n`);
       expect(contents.trimEnd().split('\n').map(line => JSON.parse(line))).toEqual([first, second]);
+    });
+  });
+});
+
+
+describe('R1053 base reproduction IO', () => {
+  it('a1 reruns dedupe cards and B1 adds one security needs-you line', async () => {
+    await withRealRepo(async ({ root, tmp }) => {
+      const cardsPath = join(tmp, 'cards.md'), indexPath = join(tmp, 'index.jsonl');
+      const options = { cwd: root, home: join(tmp, 'home'), cardsPath, indexPath };
+      const card = { key: 'x.mjs|X|B1', cardLine: '- [R1053] test security', expedite: true, needsYou: true };
+      expect(createAuditDeps(options).fileCard(card)).toBe(true);
+      const first = readFileSync(cardsPath, 'utf8');
+      expect(first).toContain('[R1053][needs-you]');
+      expect(first).toContain('security pre-existing (B1)');
+      expect(createAuditDeps(options).fileCard(card)).toBe(true);
+      expect(readFileSync(cardsPath, 'utf8')).toBe(first);
+      expect(readFileSync(indexPath, 'utf8').trim().split('\n')).toHaveLength(1);
+    });
+  });
+  it.each(['success', 'timeout', 'malformed', 'add fails'])('removes detached scratch worktree in finally: %s', async kind => {
+    await withRealRepo(async ({ root, tmp, head, git }) => {
+      let dir;
+      const deps = createAuditDeps({ cwd: root, scratchRoot: tmp, spawnSync(command, args, opts) {
+        if (command === process.execPath) {
+          dir = args.find(a => a.startsWith('--dir=')).slice(6);
+          expect(git(['-C', dir, 'rev-parse', 'HEAD']).trim()).toBe(head());
+          if (kind === 'timeout') return { status: null, error: Error('timeout') };
+          return { status: 0, stdout: kind === 'malformed' ? '{}' : JSON.stringify({ exitCode: 0, timedOut: false, lastMessage: 'proof' }) };
+        }
+        if (kind === 'add fails' && args[0] === 'worktree' && args[1] === 'add') return { status: 1 };
+        return spawnSync(command, args, opts);
+      } });
+      if (kind === 'success') expect(await deps.reproOnBase('question', [], head())).toBe('proof');
+      else await expect(deps.reproOnBase('question', [], head())).rejects.toThrow();
+      if (dir) expect(existsSync(dir)).toBe(false);
+      expect(git(['worktree', 'list', '--porcelain'])).not.toContain('audit-base-');
     });
   });
 });

@@ -1,4 +1,6 @@
 /** @file Real Git/Codex and JSONL persistence adapters for the standalone audit. */
+import { cardHash } from './audit-base-repro.mjs';
+import { resolveAuditSettings } from '../lib/audit-settings.mjs';
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
 import * as realFs from 'node:fs';
 import { spawnSync as realSpawnSync } from 'node:child_process';
@@ -49,19 +51,59 @@ function readReport(stdout) {
  */
 export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
   scratchRoot = tmpdir(), fs = realFs, spawnSync = realSpawnSync,
+  cardsPath = join(home, 'workspace/.operations/handoff/cards-to-file.md'),
+  indexPath = join(home, 'workspace/.operations/coordination/pre-existing-findings.jsonl'),
+  settingsOptions = {},
   launcherPath = fileURLToPath(new NodeURL('../codex-direct-task.mjs', import.meta.url)) } = {}) {
   const run = (command, args, timeout, env) => {
     const result = spawnSync(command, args, { cwd, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout, ...(env ? { env } : {}) });
     if (result.error || result.status !== 0) throw new Error('audit subprocess failed or exceeded its bound');
     return result.stdout;
   };
-  return {
+  let settings;
+  const auditSettings = () => {
+    if (!settings) {
+      settings = resolveAuditSettings({ fileRead: fs.readFileSync, ...settingsOptions,
+        log: message => process.stderr.write(`${message}\n`) });
+      for (const name of ['preExistingMode', 'baseRecheckMax']) process.stderr.write(`audit.${name}=${settings.value[name]} source=${settings.sources[name]}\n`);
+    }
+    return settings;
+  };
+  const deps = {
+    preExistingMode: () => auditSettings().value.preExistingMode,
+    baseRecheckMax: () => auditSettings().value.baseRecheckMax,
+    readBaseFile: (path, base) => run('git', ['show', `${base}:${path}`], 30_000),
+    readHeadFile: (path, head) => run('git', ['show', `${head}:${path}`], 30_000),
+    diffText: (base, head) => run('git', ['diff', '-U0', `${base}...${head}`], 30_000),
+    numstatText: (base, head) => run('git', ['diff', '--numstat', `${base}...${head}`], 30_000),
+    async reproOnBase(question, findings, base) {
+      const scratch = fs.mkdtempSync(join(scratchRoot, 'audit-base-'));
+      const worktree = join(scratch, 'tree');
+      try {
+        run('git', ['worktree', 'add', '--detach', worktree, base], 30_000);
+        return await deps.runCodex(question, worktree);
+      } finally {
+        try { run('git', ['worktree', 'remove', '--force', worktree], 30_000); }
+        finally { fs.rmSync(scratch, { recursive: true, force: true }); }
+      }
+    },
+    fileCard({ key, cardLine, expedite, needsYou }) {
+      let rows = '';
+      try { rows = fs.readFileSync(indexPath, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+      if (rows.split('\n').filter(Boolean).map(l => JSON.parse(l)).some(r => r.key === key)) return true;
+      fs.mkdirSync(dirname(cardsPath), { recursive: true });
+      const date = new Date().toLocaleString('en-CA', { timeZone: 'America/New_York', hour12: false });
+      fs.appendFileSync(cardsPath, `${cardLine}\n${expedite && needsYou ? `- [R1053][needs-you] ${date} ET: security pre-existing (B1) ${key}\n` : ''}`, { encoding: 'utf8', mode: 0o600 });
+      fs.mkdirSync(dirname(indexPath), { recursive: true });
+      fs.appendFileSync(indexPath, `${JSON.stringify({ key, cardHash: cardHash(key) })}\n`, { encoding: 'utf8', mode: 0o600 });
+      return true;
+    },
     fingerprint: (base, head) => netDiffFingerprint(cwd, base, head),
     resolveSha: ref => run('git', ['rev-parse', '--verify', `${ref}^{commit}`], 30_000).trim(),
-    runCodex(prompt) {
+    runCodex(prompt, dir = cwd) {
       const scratch = fs.mkdtempSync(join(scratchRoot, 'codex-audit-'));
       try {
-        const indexPath = resolve(cwd, run('git', ['rev-parse', '--git-path', 'index'], 30_000).trim());
+        const indexPath = resolve(dir, run('git', [...(dir === cwd ? [] : ['-C', dir]), 'rev-parse', '--git-path', 'index'], 30_000).trim());
         const scratchIndex = join(scratch, 'index');
         try { fs.copyFileSync(indexPath, scratchIndex); }
         catch (error) {
@@ -71,7 +113,7 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
         const taskFile = join(scratch, 'task.md');
         fs.writeFileSync(taskFile, prompt, { encoding: 'utf8', mode: 0o600 });
         const report = readReport(run(process.execPath, [launcherPath, '--review', '--json',
-          '--gate=none', `--task-file=${taskFile}`, `--dir=${cwd}`], 30 * 60_000,
+          '--gate=none', `--task-file=${taskFile}`, `--dir=${dir}`], 30 * 60_000,
           { ...process.env, GIT_INDEX_FILE: scratchIndex }));
         if (!report || report.exitCode !== 0 || report.timedOut !== false || typeof report.lastMessage !== 'string') {
           throw new Error('Codex failed or returned incomplete evidence');
@@ -90,4 +132,5 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
     stdout: text => process.stdout.write(text),
     stderr: text => process.stderr.write(text),
   };
+  return deps;
 }

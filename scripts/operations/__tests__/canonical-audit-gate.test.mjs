@@ -209,3 +209,20 @@ describe('canonical audit before opening a PR', () => {
     expect(result.ok).toBe(false); expect(reads).toEqual([]);
   });
 });
+
+
+describe('R1053 additive audit records', () => {
+  const scoped = { ...green, modelVerdict: 'WEAKENED', findingKeys: [], preExisting: [{ line: 'x.mjs:2 unsafe return' }] };
+  it('a7 admits mixed old and new records', () => {
+    expect(fixture({ records: [green, scoped] }).result).toMatchObject({ ok: true, record: scoped });
+  });
+  it.each([null, {}, ['text'], [{ line: 2 }]])('refuses malformed preExisting %j', preExisting => {
+    expect(fixture({ records: [green, { ...scoped, preExisting }] }).result.ok).toBe(false);
+  });
+  it.each(['invalid', null, 'WEAKENED\n'])('refuses invalid modelVerdict %j', modelVerdict => {
+    expect(fixture({ records: [green, { ...scoped, modelVerdict }] }).result.ok).toBe(false);
+  });
+  it('scans retained pre-existing text for disguised contradictory verdicts', () => {
+    expect(fixture({ records: [green, { ...scoped, preExisting: [{ line: 'x.mjs:2 finding\nWEAKENED' }] }] }).result.ok).toBe(false);
+  });
+});

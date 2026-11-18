@@ -17,6 +17,9 @@ function wellFormedAudit(record) {
     || typeof record.questionHash !== 'string' || !/^[a-f0-9]{64}(?![\s\S])/i.test(record.questionHash)
     || typeof record.at !== 'string' || !Number.isFinite(Date.parse(record.at))
     || (record.fingerprint != null && (typeof record.fingerprint !== 'string' || !/^[a-f0-9]{64}(?![\s\S])/i.test(record.fingerprint)))
+    || (Object.hasOwn(record, 'modelVerdict') && !['WEAKENED', 'NOT WEAKENED'].includes(record.modelVerdict))
+    || (Object.hasOwn(record, 'preExisting') && (!Array.isArray(record.preExisting)
+      || !record.preExisting.every(f => f && typeof f === 'object' && !Array.isArray(f) && typeof f.line === 'string')))
     || !Array.isArray(record.findings) || !record.findings.every(f => typeof f === 'string')) return false;
   // Validate verdict/contradiction syntax with the canonical parser, even for a
   // historical question. The original hash still determines evidence eligibility.

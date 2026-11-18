@@ -556,3 +556,75 @@ describe('findAudit ordering and clock trust (#7011)', () => {
     expect(find([second, first])).toBe(first);
   });
 });
+
+
+describe('R1053 prove mode', () => {
+  const source = 'function X() {\n  return unsafeValue;\n}\nfunction Y() {\n  return changedValue;\n}';
+  const finding = 'x.mjs:2 unsafe return';
+  const reply = (cls = 'B2', status = 'REPRODUCES', relation = 'SAME') => `#1 ${status} ${relation} CLASS=${cls} BASE=x.mjs:2\nQUOTE: return unsafeValue;`;
+  function proof(answer = reply()) {
+    const f = fixture(`WEAKENED\n${finding}`);
+    Object.assign(f.deps, { preExistingMode: () => 'prove', baseRecheckMax: () => 6,
+      reproOnBase: vi.fn(async () => answer), readBaseFile: () => source, readHeadFile: () => source,
+      diffText: () => 'diff --git a/x.mjs b/x.mjs\n--- a/x.mjs\n+++ b/x.mjs\n@@ -5 +5 @@\n-  return oldValue;\n+  return changedValue;\n',
+      numstatText: () => '1\t1\tx.mjs\n', fileCard: vi.fn(() => true) });
+    return f;
+  }
+  it('a1 clears X while only Y changes and confirms exactly one card before recording', async () => {
+    const f = proof();
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.records[0]).toMatchObject({ modelVerdict: 'WEAKENED', verdict: 'NOT WEAKENED', findings: [],
+      preExisting: [{ line: finding, key: 'x.mjs|X|B2', relation: 'SAME' }] });
+    expect(f.deps.fileCard).toHaveBeenCalledTimes(1);
+    expect(f.output.join('')).toBe('NOT WEAKENED\n');
+  });
+  it('a2 blocks a changed flagged line and records its head symbol key', async () => {
+    const f = proof();
+    f.deps.diffText = () => 'diff --git a/x.mjs b/x.mjs\n--- a/x.mjs\n+++ b/x.mjs\n@@ -2 +2 @@\n-oldValue\n+unsafeValue\n';
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.records[0].findingKeys).toEqual(['x.mjs|X|B2']);
+    expect(f.deps.fileCard).not.toHaveBeenCalled();
+  });
+  it.each(['UNDETERMINED', 'malformed', 'missing', 'quote absent', 'timeout', 'card throws', 'missing dep', 'numstat absent', 'read throws', 'card unconfirmed'])(
+    'a3 fails closed: %s', async kind => {
+      const f = proof();
+      if (kind === 'UNDETERMINED') f.deps.reproOnBase = () => reply('B2', kind);
+      if (kind === 'malformed') f.deps.reproOnBase = () => 'bad';
+      if (kind === 'missing') f.deps.reproOnBase = () => '';
+      if (kind === 'quote absent') f.deps.readBaseFile = () => 'other source';
+      if (kind === 'timeout') f.deps.reproOnBase = () => { throw Error('timeout'); };
+      if (kind === 'card throws') f.deps.fileCard = () => { throw Error('disk'); };
+      if (kind === 'missing dep') delete f.deps.fileCard;
+      if (kind === 'numstat absent') f.deps.numstatText = () => '';
+      if (kind === 'read throws') f.deps.readHeadFile = () => { throw Error('missing'); };
+      if (kind === 'card unconfirmed') f.deps.fileCard = () => false;
+      expect(await main(ARGS, f.deps)).toBe(1);
+      expect(f.records[0]).toMatchObject({ verdict: 'WEAKENED', findings: [finding], preExisting: [] });
+    });
+  it.each([['ABSENT', 'SAME'], ['REPRODUCES', 'WORSENED']])('a4 security %s %s blocks', async (status, relation) => {
+    const f = proof(reply('B1', status, relation));
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.deps.fileCard).not.toHaveBeenCalled();
+  });
+  it('a4 SAME security expedites a card and needs-you', async () => {
+    const f = proof(reply('B1'));
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.deps.fileCard).toHaveBeenCalledWith(expect.objectContaining({ expedite: true, needsYou: true }));
+  });
+  it('a5 findings beyond the bound block for human review', async () => {
+    const f = proof(reply() + '\n' + reply().replace('#1', '#2'));
+    f.deps.runCodex = () => `WEAKENED\n${finding}\n${finding}`;
+    f.deps.baseRecheckMax = () => 1;
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.records[0].findings).toEqual([finding]);
+    expect(f.records[0].preExisting).toHaveLength(1);
+  });
+  it('a6 block mode preserves captured stdout and record bytes', async () => {
+    const golden = JSON.parse(realFs.readFileSync(new NodeURL('./fixtures/codex-audit-block.json', import.meta.url), 'utf8'));
+    const f = proof(); f.deps.preExistingMode = () => 'block';
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.output.join('')).toBe(golden.stdout);
+    expect(JSON.stringify(f.records[0]) + '\n').toBe(golden.record);
+    expect(f.deps.reproOnBase).not.toHaveBeenCalled();
+  });
+});
