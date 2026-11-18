@@ -14,6 +14,8 @@ const safe = (value) => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/
 // Only equal-length backtick runs close an inline span. An unmatched run makes the
 // whole line ambiguous, so retain its original HTML evidence rather than hiding it.
 function outsideInlineCode(line) {
+  // An escaped backtick is not a code delimiter in Markdown; treat such lines as ambiguous.
+  if (line.includes('\\`')) return line;
   let delimiter;
   let start = 0;
   let plain = '';
