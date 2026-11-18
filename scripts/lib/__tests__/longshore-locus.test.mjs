@@ -45,8 +45,8 @@ describe('longshore registry entry', () => {
   });
   it('backlog loader maps longshore: scope to the longshore locus only', () => {
     const b = require('../../../src/_data/backlog.js');
-    expect(b.inferLocusFromScope('longshore:backlog/a.md')).toBe('longshore');
-    expect(b.inferLocusFromScope('longshoreai:backlog/a.md')).toBeNull();
+    expect(b.inferLocusFromScope(['longshore:backlog/a.md'])).toBe('longshore');
+    expect(b.inferLocusFromScope(['longshoreai:backlog/a.md'])).toBeNull();
   });
 });
 
@@ -56,28 +56,18 @@ describe('longshore cites and card refs', () => {
     expect(LOCUS_MARKER_RE.test('see xlongshore2:')).toBe(false);
     expect(LOCUS_MARKER_RE.test('see ops:')).toBe(false);
   });
-  it('longshore: is a cross-repo locus, never errored as dangling', () => {
-    expect(CROSS_REPO_LOCI.has('longshore:')).toBe(true);
+  it('longshore is NOT a cross-repo citation locus yet (no exemption added)', () => {
+    expect(CROSS_REPO_LOCI.has('longshore:')).toBe(false);
     const deps = { fileExists: () => false, lineCount: () => 0 };
     expect(findDanglingLoci('cite longshore:scripts/a/b.mjs:12', deps)).toEqual([]);
     expect(findDanglingLoci('cite we:scripts/a/b.mjs:12', deps).length).toBe(1);
   });
-  it('CARD_REF_RE parses longshore card refs, still rejects junk', () => {
-    expect(CARD_REF_RE.test('longshore:backlog/1234-a.md@pr77')).toBe(true);
-    expect(CARD_REF_RE.test('longshore:backlog/1234-a.md')).toBe(true);
+  it('longshore card refs are NOT accepted for hold release yet (fail closed)', () => {
+    expect(CARD_REF_RE.test('longshore:backlog/1234-a.md@pr77')).toBe(false);
+    expect(CARD_REF_RE.test('longshore:backlog/1234-a.md')).toBe(false);
     expect(CARD_REF_RE.test('we:backlog/1234-a.md@pr77')).toBe(true);
-    for (const bad of ['ops:backlog/1.md', 'longshoreai:backlog/1.md', 'longshore:backlog/../x.md', 'longshore:backlog/a.md@pr0', 'longshore:docs/a.md']) {
-      expect(CARD_REF_RE.test(bad)).toBe(false);
-    }
-  });
-  it('a longshore PR card ref reads from the longshore slug, not WE', () => {
-    const seen = [];
-    const ok = referralCardReadable('longshore:backlog/1234-a.md@pr77', '/nowhere', {
-      readOnPr: (file, pr, o) => { seen.push([file, pr, o]); return '---\nstatus: open\n---\n'; },
-      readMainByBornAs: () => null,
-    });
-    expect(ok).toBe(true);
-    expect(seen[0].slice(0, 2)).toEqual(['1234-a.md', '77']);
-    expect(seen[0][2]?.repo).toBe(SLUG);
+    expect(referralCardReadable('longshore:backlog/1234-a.md@pr77', '/nowhere', {
+      readOnPr: () => '---\nstatus: resolved\n---\n', readMainByBornAs: () => null,
+    })).toBe(false);
   });
 });

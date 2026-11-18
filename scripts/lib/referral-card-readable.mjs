@@ -10,8 +10,8 @@ const CARD_FILE = '[A-Za-z0-9][A-Za-z0-9._-]*\\.md';
 // The PR number is capped at 9 digits and handed to gh as that exact digit string: a longer one would be mangled by
 // `Number()` into exponent notation (`1e+22`), which gh reads as a branch name rather than a PR number.
 const PR_DIGITS = '[1-9]\\d{0,8}';
-export const CARD_REF_RE = new RegExp(`^(?:we|longshore):backlog/${CARD_FILE}(?:@pr${PR_DIGITS})?$`);
-const PR_REF_RE = new RegExp(`^(we|longshore):backlog/(${CARD_FILE})@pr(${PR_DIGITS})$`);
+export const CARD_REF_RE = new RegExp(`^we:backlog/${CARD_FILE}(?:@pr${PR_DIGITS})?$`);
+const PR_REF_RE = new RegExp(`^we:backlog/(${CARD_FILE})@pr(${PR_DIGITS})$`);
 const PR_NUMBER_RE = new RegExp(`^${PR_DIGITS}$`);
 const CARD_REPO = CONSTELLATION_REPOS.we.slug;
 const CARD_BASE = 'main'; // a card only "will land" if its PR targets the branch the backlog is read from
@@ -19,7 +19,7 @@ const hasFrontmatter = text => /^---\r?\n[\s\S]+?\r?\n---\r?\n/.test(text);
 
 /**
  * Default reader for a card on a PR: PR state + head sha, then the file at THAT sha, through gh. Throws on failure
- * so the caller can check the landed card. The caller selects the repo from the validated prefix.
+ * so the caller can check the landed card. Only the repo named by CARD_REPO is ever asked.
  * `pr` is the decimal digit string from the ref; anything else throws before gh is called.
  */
 export function readCardAtPrHead(file, pr, { repo = CARD_REPO, run = execFileSync } = {}) {
@@ -42,15 +42,11 @@ export function referralCardReadable(ref, root = process.cwd(), { readOnPr = rea
   // feature branch): an unreadable PR card stays unreadable unless main itself carries it.
   const onPr = PR_REF_RE.exec(ref);
   if (onPr) {
-    const [, prefix, file, pr] = onPr;
-    const repo = prefix === 'longshore' ? CONSTELLATION_REPOS.longshore.slug : CARD_REPO;
-    try { if (hasFrontmatter(readOnPr(file, pr, { repo }) ?? '')) return true; } catch { /* try the published WE card */ }
-    if (prefix !== 'we') return false;
-    const born = BORN_RE.exec(file)?.[1];
+    try { if (hasFrontmatter(readOnPr(onPr[1], onPr[2]) ?? '')) return true; } catch { /* try the published card */ }
+    const born = BORN_RE.exec(onPr[1])?.[1];
     if (!born) return false;
     try { return hasBornAs(readMainByBornAs(born, root) ?? '', born); } catch { return false; }
   }
-  if (!ref.startsWith('we:')) return false; // no local checkout for longshore cards
   try { return hasFrontmatter(readFileSync(`${root}/${ref.slice(3)}`, 'utf8')); }
   catch { return landedByBornAs(ref, root); }
 }

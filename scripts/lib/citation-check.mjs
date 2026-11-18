@@ -74,7 +74,7 @@ export const HASH_SLUG_OUT_OF_SCOPE_DIRS = [
 // THIS working tree (deterministic); `fui:` / `plateau:` name a sibling repo not in this checkout, so their
 // path/line existence can't be resolved here and must never be errored (#2821 gate 5 scope note).
 export const IN_REPO_LOCUS = 'we:';
-export const CROSS_REPO_LOCI = new Set(['fui:', 'plateau:', 'longshore:']);
+export const CROSS_REPO_LOCI = new Set(['fui:', 'plateau:']);
 
 // A provisional hash-slug id: `x` + exactly 6 lowercase-alnum chars (the born-as id form, e.g. `x9kptqv`).
 // Mirrors the two-form id in check-standards-rules.mjs ITEM_REF_RX (`x[0-9a-z]{6}`).
@@ -426,7 +426,7 @@ export function findDanglingLoci(text, { fileExists, lineCount }) {
   // we:<path>:<line> or we:<path>:<start>-<end>. Path is a run of path chars (no whitespace, no `:` — the
   // `:` after the path is the line separator). Requires at least one `/` so a bare `we:foo:1` word can't
   // masquerade as a locus; matches the repo-locus convention (we:docs/agent/conventions.md).
-  const rx = /\b(we|fui|plateau|longshore):([A-Za-z0-9._\-/]+\/[A-Za-z0-9._\-]+):(\d+)(?:-(\d+))?\b/g;
+  const rx = /\b(we|fui|plateau):([A-Za-z0-9._\-/]+\/[A-Za-z0-9._\-]+):(\d+)(?:-(\d+))?\b/g;
   const seen = new Set();
   for (const m of text.matchAll(rx)) {
     const [, prefix, path, startStr, endStr] = m;
@@ -552,7 +552,7 @@ export function findBlankLineLoci(text, { fileExists, readLines }) {
   const findings = [];
   if (typeof text !== 'string' || text === '') return findings;
   const isInRepoPath = (p) => typeof p === 'string' && p !== '' && !p.startsWith('/') && !p.split('/').includes('..');
-  const rx = /\b(we|fui|plateau|longshore):([A-Za-z0-9._\-/]+\/[A-Za-z0-9._\-]+):(\d+)(?:-(\d+))?\b/g;
+  const rx = /\b(we|fui|plateau):([A-Za-z0-9._\-/]+\/[A-Za-z0-9._\-]+):(\d+)(?:-(\d+))?\b/g;
   const seen = new Set();
   for (const m of text.matchAll(rx)) {
     const [, prefix, path, startStr, endStr] = m;
