@@ -1,3 +1,4 @@
+import { readPlannerRows } from '../lib/red-team-planner-row.mjs';
 import { greenLedgerDir, hasGreenLedger } from '../lib/lane-verify.mjs';
 import { unread } from './dispatch-eligibility.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
@@ -1852,7 +1853,9 @@ export function runReconcilePass({
   };
   const plan = step('plan', () => planReconcile(plannerInput));
   const { prs: _prs, agents: _agents, repo: _repo, now: _now, durableCounts: _counts, ...plannerOptions } = plannerInput;
-  return { ...plan, ...(readOnly ? { enrichedPrs: prs, agentList: agents, agentsIncomplete: Object.hasOwn(agents, 'incomplete'), plannerOptions } : {}), owedTriggers: hydrated.owedTriggers, notes: [...hydrated.notes, ...plan.notes], refusals: [...hydrated.refusals, ...plan.refusals], prs: rawPrs.length, agents: agents.length,
+  const refusals = [...hydrated.refusals, ...plan.refusals];
+  const plannerRows = readPlannerRows({ repo: resolvedRepo, refusals, rawPrs: prs, requiredChecks });
+  return { ...plan, plannerRows, ...(readOnly ? { enrichedPrs: prs, agentList: agents, agentsIncomplete: Object.hasOwn(agents, 'incomplete'), plannerOptions } : {}), owedTriggers: hydrated.owedTriggers, notes: [...hydrated.notes, ...plan.notes], refusals, prs: rawPrs.length, agents: agents.length,
     openPrFiles: rawPrs.map((pr) => ({ pr: pr.number, files: Array.isArray(pr.files) && pr.files.length < 100
       ? pr.files.map((file) => typeof file === 'string' ? file : file.path) : null })),
   };

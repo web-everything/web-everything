@@ -4435,3 +4435,11 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+## Red-team planner row parity
+
+The daemon receives a raw PR snapshot, while reconciliation hydrates checks and annotates
+review-owned merge-gate holds. Preserve the classification from that enriched snapshot in
+`plannerRows`; use `readPlannerRow` / `readPlannerRows` when consuming refusals, retaining
+top-level ownership and the folded `reviewRefusal` separately. The planner-row unit and
+production suites pin refusal parity and propagation through normal and read-only passes.
