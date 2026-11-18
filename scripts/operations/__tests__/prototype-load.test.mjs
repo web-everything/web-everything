@@ -80,7 +80,10 @@ function fixture(options = {}) {
       }
       const e = new Error('missing'); e.code = 'ENOENT'; throw e;
     },
-    mkdirSync() {}, appendFileSync(p, line) { (p === '/home/test/ready' ? readyWrites : records).push({ path: p, ...JSON.parse(line) }); },
+    mkdirSync() {}, appendFileSync(p, line) {
+      options.onAppend?.(p, JSON.parse(line), calls);
+      if (options.urgentWriteFails && p.endsWith('/urgent-loads.jsonl')) throw new Error('urgent ledger unwritable');
+      (p === '/home/test/ready' ? readyWrites : records).push({ path: p, ...JSON.parse(line) }); },
   };
   const fail = (status, stdout = '', stderr = 'failed') => { throw Object.assign(new Error(stderr), { status, stdout, stderr }); };
   const exec = (cmd, args, config) => {
@@ -272,6 +275,34 @@ describe('urgent prototype admission', () => {
   const reason = 'Restore critical daemon operation';
   const marker = { sha: SHA, fuiSha: SHA, fuiRepo: 'https://github.com/frontier-ui/frontierui', suite: 'full', shards: 1, result: 'green', startedAt: new Date(-2000).toISOString(), finishedAt: new Date(-1000).toISOString(), host: 'test-host', repo: 'https://example.com/org/repo', steps: ['install-fui', 'install', 'unit:unit:1/1', 'coverage', 'hostPaths', 'integration', 'standards'] };
   marker.sig = urgentSignature(marker, urgentKey);
+  it('writes the urgent tracking intent before registering the overlay', async () => {
+    const observed = [];
+    const f = fixture({ onAppend: (path, record, calls) => {
+      if (record.type === 'prototype-load.urgent') observed.push({ record, mutations: calls.filter(c => c.cmd === 'node' && c.args[1] === 'add' && !c.args.includes('--check')).length });
+    } });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: true });
+    expect(observed).toEqual([{ record: expect.objectContaining({ trackingId: expect.any(String), clone: expect.any(String), sha: SHA }), mutations: 0 }]);
+    expect(mutations(f, 'add')).toHaveLength(1);
+  });
+  it('refuses registration when the urgent tracking intent cannot be written', async () => {
+    const f = fixture({ urgentWriteFails: true });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, registered: false, error: 'urgent ledger unwritable' });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('appends a registration-failed note for an unsuccessful urgent registration', async () => {
+    const f = fixture({ addFails: true });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, registered: false });
+    const records = f.records.filter(r => r.path.endsWith('/urgent-loads.jsonl'));
+    expect(records).toHaveLength(2);
+    expect(records[1]).toMatchObject({ type: 'prototype-load.urgent-registration-failed', status: 'registration-failed', trackingId: records[0].trackingId });
+  });
+  it('keeps the intent tracked when registration succeeds but admission evidence is incomplete', async () => {
+    const f = fixture({ addRaw: '{}' });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, registered: true, detail: 'admitted-sha-unverified' });
+    expect(f.records.filter(r => r.path.endsWith('/urgent-loads.jsonl'))).toEqual([
+      expect.objectContaining({ type: 'prototype-load.urgent' }),
+    ]);
+  });
   it('logs the urgent event and writes explicit urgent readiness evidence', async () => {
     const f = fixture({ testCheck: async () => null, urgentLedger: JSON.stringify(marker) });
     expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: true });

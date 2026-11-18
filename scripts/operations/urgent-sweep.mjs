@@ -3,11 +3,13 @@ import * as fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
-import { dirname, join, isAbsolute } from 'node:path';
+import { dirname, join, isAbsolute, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { readPlatformPreferences, resolveCascade } from '../lib/policy-cascade.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { removeRegistration } from '../daemon-overlay.mjs';
 import { resolveOriginRepository } from './prototype-retire.mjs';
-import { safeRegistrationRef, validSha, TEST_CHECK_APP_ID } from './prototype-load.mjs';
+import { safeRegistrationRef, validSha, TEST_CHECK_APP_ID, testCheckEvidence, testWorkflowBound } from './prototype-load.mjs';
 import { ciGatePlan, urgentLedger, normalizeUrgentRepo } from './urgent-verify-marker.mjs';
 import { writeEscalationPacket } from './land-advance-escalations.mjs';
 
@@ -38,7 +40,16 @@ export function createSweepDeps({ home = homedir(), io = fs, exec = execFileSync
       if (!origin.repo) throw new Error('unreadable CI repository');
       const result = origin.gh(['api', `repos/${origin.repo}/commits/${r.sha}/check-runs?per_page=100&filter=all`]);
       if (result.code !== 0) throw new Error('unreadable CI checks');
-      return JSON.parse(result.stdout);
+      const data = JSON.parse(result.stdout);
+      // Preserve raw failures even when workflow/config evidence is unavailable.
+      try {
+        const tool = JSON.parse(io.readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../settings/prototype-load.json'), 'utf8'));
+        const platform = readPlatformPreferences({ env: { ...env, HOME: home }, readFile: (p, encoding) => io.readFileSync(p, encoding) });
+        if (platform.errors.length) throw new Error('unreadable prototype-load settings');
+        const config = resolveCascade({ platform: platform.prefs.prototypeLoad, tool }).value;
+        const runs = origin.gh(['api', `repos/${origin.repo}/actions/runs?head_sha=${r.sha}&per_page=100`]);
+        return { ...data, workflows: runs.code === 0 ? JSON.parse(runs.stdout) : null, testWorkflowPath: config.testWorkflowPath };
+      } catch { return { ...data, workflows: null }; }
     },
     remove: r => remove({ root: r.clone, ref: r.registration.ref, expectedTip: r.registration.sha,
       reason: `urgent-sweep: CI failed for ${r.ref}@${r.sha}`, by: 'urgent-sweep', env }),
@@ -53,12 +64,18 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
     createdAt: deps.now(), status: 'open', evidence: [detail], question: fallback, ladder: { next: 'L3 operator' } });
   try {
     const settlements = deps.state();
-    if (settlements.some(r => !/^[a-f0-9]{64}$/.test(r?.id ?? '') || !['settled-green', 'settled-unloaded', 'sweep-cursor'].includes(r.status)))
+    if (settlements.some(r => !/^[a-f0-9]{64}$/.test(r?.id ?? '') || !['monitoring-green', 'settled-green', 'settled-unloaded', 'sweep-cursor'].includes(r.status)))
       throw new Error('unreadable urgent settlement ledger; repair it before sweeping');
-    // Old green receipts did not prove all runs had finished; re-read them once.
+    // Historical green receipts start a fresh monitoring window; they never proved reruns safe.
     const settled = new Set(settlements.filter(r => r.status === 'settled-unloaded'
-      || (r.status === 'settled-green' && r.checksComplete === true)).map(r => r.id));
-    const loads = new Map(deps.loads().filter(r => r.type === 'prototype-load.urgent').map(r => [identity(r), r]));
+      || (r.status === 'settled-green' && r.monitoringComplete === true
+        && Number.isFinite(Date.parse(r.greenAt)) && Date.parse(r.at) - Date.parse(r.greenAt) >= 86400000)).map(r => r.id));
+    const green = new Map(settlements.filter(r => r.status === 'monitoring-green').map(r => [r.id, r.greenAt]));
+    const records = deps.loads();
+    const failed = new Set(records.filter(r => r.type === 'prototype-load.urgent-registration-failed'
+      && typeof r.trackingId === 'string').map(r => r.trackingId));
+    const loads = new Map(records.filter(r => r.type === 'prototype-load.urgent'
+      && !failed.has(r.trackingId)).map(r => [identity(r), r]));
     const entries = [...loads], cursor = settlements.filter(r => r.status === 'sweep-cursor').at(-1)?.id;
     // Use the complete load order so even a cursor load settled last pass remains an anchor.
     // Older ledgers (or an archived cursor load) start at the beginning.
@@ -66,7 +83,7 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
     const batch = [...entries.slice(start), ...entries.slice(0, start)].filter(([id]) => !settled.has(id)).slice(0, 32);
     // Persist before readers/escalations: an unreadable or pending batch must not monopolize later ticks.
     if (batch.length) await deps.settle({ id: batch.at(-1)[0], status: 'sweep-cursor', at: deps.now() });
-    // Two GitHub reads per load, at most 64 per tick. Remaining entries wait for the next orchestrator tick.
+    // Three GitHub reads per load, at most 96 per tick. Remaining entries wait for the next orchestrator tick.
     for (const [id, r] of batch) {
       try {
         if (!validSha(r.sha) || !safeRegistrationRef(r.ref) || !isAbsolute(r.clone ?? '')
@@ -91,11 +108,16 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           await escalate(id, r.ref, `Unloaded ${r.sha}: CI failed. Inspect and repair before reloading.`);
           await deps.settle({ ...event, status: 'settled-unloaded' });
           results.push({ id, status: 'settled-unloaded' });
-        } else if (required.every(n => checks.some(c => c.name === n || c.name.startsWith(`${n} (`)))
+        } else if (testWorkflowBound(testCheckEvidence(data, r.sha), data.workflows, r.sha, data.testWorkflowPath)
+          && required.every(n => checks.some(c => c.name === n || c.name.startsWith(`${n} (`)))
           && checks.every(c => c.status === 'completed' && c.conclusion === 'success')
           && data.check_runs.every(c => c.status === 'completed')) {
-          await deps.settle({ id, ref: r.ref, sha: r.sha, at: deps.now(), status: 'settled-green', checksComplete: true });
-          results.push({ id, status: 'settled-green' });
+          const at = deps.now(), greenAt = green.get(id) ?? at;
+          if (!Number.isFinite(Date.parse(at)) || !Number.isFinite(Date.parse(greenAt))) throw new Error('unreadable green monitoring timestamp');
+          const monitoringComplete = Date.parse(at) - Date.parse(greenAt) >= 86400000;
+          const status = monitoringComplete ? 'settled-green' : 'monitoring-green';
+          if (!green.has(id) || monitoringComplete) await deps.settle({ id, ref: r.ref, sha: r.sha, at, greenAt, status, checksComplete: true, monitoringComplete });
+          results.push({ id, status });
         } else results.push({ id, status: 'pending' });
       } catch (e) {
         await escalate(id, r.ref, String(e.message));

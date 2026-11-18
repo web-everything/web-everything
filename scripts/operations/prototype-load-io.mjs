@@ -805,35 +805,47 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       const movedTip = requireGit('rev-parse', `origin/${out.effectiveRef}`);
       if (movedTip !== out.effectiveSha) return stop('no-ready', { detail: 'sha-moved', tip: movedTip });
       stage = 'register-failed';
-      if (input.replace) {
-        const result = loader('replace', out.clone, out.effectiveRef, [`--replaces=${input.replace}`, `--expected-sha=${out.effectiveSha}`,
-          `--reason=${input.why || `prototype-load: ${input.daemon} ${out.effectiveRef} replaces ${input.replace}`}`, `--by=${env.USER || 'unknown'}`]);
-        out.registration = result;
-        const data = lastJson(result);
-        if (data?.registered === true) out.registered = true;
-        if (result.code !== 0 || data?.replaced !== true) {
-          return stop(out.registered ? 'replace-incomplete' : 'register-failed', { detail: data?.refused || 'replace failed',
-            fallback: `The old registration ${input.replace} was kept. Fix the refusal and rerun.` });
-        }
-        const evidence = data.conflictCheck;
-        if (evidence?.ok !== true || evidence.clean !== true || evidence.candSha !== out.effectiveSha) {
-          return stop('register-failed', { detail: 'admitted-sha-unverified', fallback: 'Inspect the candidate registration and loader evidence before retrying.' });
-        }
-        out.replaced = input.replace;
-      } else if (out.registered !== 'already') {
-        const result = loader('add', out.clone, out.effectiveRef, [`--expected-sha=${out.effectiveSha}`, `--reason=${input.why || `prototype-load: ${input.daemon} ${out.effectiveRef}`}`, `--by=${env.USER || 'unknown'}`]);
-        out.registration = result;
-        if (result.code !== 0) return stop('register-failed');
-        out.registered = true;
-        const evidence = lastJson(result)?.conflictCheck;
-        if (evidence?.ok !== true || evidence.clean !== true || evidence.candSha !== out.effectiveSha) {
-          return stop('register-failed', { detail: 'admitted-sha-unverified', fallback: 'Inspect the candidate registration and loader evidence before retrying; prior registrations were retained.' });
-        }
-      }
-      if (input.urgent) {
+      let urgentIntent;
+      const appendUrgent = record => {
         const file = urgentLedger(env.HOME, 'urgent-loads');
         fs.mkdirSync(dirname(file), { recursive: true });
-        fs.appendFileSync(file, `${JSON.stringify({ at: new Date(now()).toISOString(), type: 'prototype-load.urgent', ref: input.branch, sha: input.sha, clone: out.clone, repo: normalizeUrgentRepo(requireGit('remote', 'get-url', 'origin')), registration: { clone: out.clone, ref: out.effectiveRef, sha: out.effectiveSha }, reason: input.reason, marker: checkRun.marker ?? null })}\n`, { encoding: 'utf8', mode: 0o600 });
+        fs.appendFileSync(file, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 });
+      };
+      if (input.urgent) {
+        urgentIntent = { trackingId: randomUUID(), at: new Date(now()).toISOString(), type: 'prototype-load.urgent', ref: input.branch, sha: input.sha, clone: out.clone, repo: normalizeUrgentRepo(requireGit('remote', 'get-url', 'origin')), registration: { clone: out.clone, ref: out.effectiveRef, sha: out.effectiveSha }, reason: input.reason, marker: checkRun.marker ?? null };
+        // Persist intent before any registration mutation; failure refuses admission.
+        appendUrgent(urgentIntent);
+      }
+      try {
+        if (input.replace) {
+          const result = loader('replace', out.clone, out.effectiveRef, [`--replaces=${input.replace}`, `--expected-sha=${out.effectiveSha}`,
+            `--reason=${input.why || `prototype-load: ${input.daemon} ${out.effectiveRef} replaces ${input.replace}`}`, `--by=${env.USER || 'unknown'}`]);
+          out.registration = result;
+          const data = lastJson(result);
+          if (data?.registered === true) out.registered = true;
+          if (result.code !== 0 || data?.replaced !== true) {
+            return stop(out.registered ? 'replace-incomplete' : 'register-failed', { detail: data?.refused || 'replace failed',
+              fallback: `The old registration ${input.replace} was kept. Fix the refusal and rerun.` });
+          }
+          const evidence = data.conflictCheck;
+          if (evidence?.ok !== true || evidence.clean !== true || evidence.candSha !== out.effectiveSha) {
+            return stop('register-failed', { detail: 'admitted-sha-unverified', fallback: 'Inspect the candidate registration and loader evidence before retrying.' });
+          }
+          out.replaced = input.replace;
+        } else if (out.registered !== 'already') {
+          const result = loader('add', out.clone, out.effectiveRef, [`--expected-sha=${out.effectiveSha}`, `--reason=${input.why || `prototype-load: ${input.daemon} ${out.effectiveRef}`}`, `--by=${env.USER || 'unknown'}`]);
+          out.registration = result;
+          if (result.code !== 0) return stop('register-failed');
+          out.registered = true;
+          const evidence = lastJson(result)?.conflictCheck;
+          if (evidence?.ok !== true || evidence.clean !== true || evidence.candSha !== out.effectiveSha) {
+            return stop('register-failed', { detail: 'admitted-sha-unverified', fallback: 'Inspect the candidate registration and loader evidence before retrying; prior registrations were retained.' });
+          }
+        }
+      } finally {
+        // Partial replacement/admission remains tracked whenever an overlay was registered.
+        if (urgentIntent && !out.registered) appendUrgent({ ...urgentIntent,
+          type: 'prototype-load.urgent-registration-failed', status: 'registration-failed', at: new Date(now()).toISOString() });
       }
       const readyPath = expand(config.readyRecordPath);
       fs.mkdirSync(dirname(readyPath), { recursive: true });

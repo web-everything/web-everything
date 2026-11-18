@@ -6,13 +6,14 @@ import { resolveOperation } from '../run.mjs';
 const sha = 'a'.repeat(40);
 const load = { type: 'prototype-load.urgent', ref: 'lane/repair', sha, repo: 'https://example.com/org/repo', clone: '/clone',
   registration: { clone: '/clone', ref: 'lane/repair-m1', sha: 'b'.repeat(40) } };
+const workflows = { total_count: 1, workflow_runs: [{ check_suite_id: 7, head_sha: sha, path: '.github/workflows/ci.yml' }] };
 const required = ['changes', 'test-shard', 'test'];
 let checkId = 0;
-const check = (name, conclusion = 'success', extra = {}) => ({ id: ++checkId, head_sha: sha, name, app: { id: 15368 }, status: 'completed', conclusion, ...extra });
+const check = (name, conclusion = 'success', extra = {}) => ({ id: ++checkId, head_sha: sha, name, app: { id: 15368 }, check_suite: { id: 7 }, status: 'completed', conclusion, ...extra });
 function fixture(rows = required.map(n => check(n))) {
   const state = [], events = [], loads = [load];
   const d = { loads: () => loads, state: () => state, now: () => '2026-11-18T12:00:00Z', required: vi.fn(() => required),
-    checks: vi.fn(() => ({ total_count: rows.length, check_runs: rows })), remove: vi.fn(() => ({ removed: true })),
+    checks: vi.fn(() => ({ total_count: rows.length, check_runs: rows, workflows })), remove: vi.fn(() => ({ removed: true })),
     event: vi.fn(e => events.push(e)), settle: vi.fn(e => state.push(e)), escalate: vi.fn() };
   return { d, state, settlements: () => state.filter(r => r.status !== 'sweep-cursor'), events, loads, run: () => urgentSweep({}, d) };
 }
@@ -25,9 +26,53 @@ describe('urgent CI sweep', () => {
     expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you', question: expect.stringContaining('NEEDS-YOU'), status: 'open' }));
     await f.run(); expect(f.d.remove).toHaveBeenCalledTimes(1); expect(f.d.escalate).toHaveBeenCalledTimes(1);
   });
-  it('settles all required green only with every check completed and never checks it again', async () => {
-    const f = fixture(); await f.run(); await f.run();
-    expect(f.settlements()[0].status).toBe('settled-green'); expect(f.d.checks).toHaveBeenCalledTimes(1); expect(f.d.remove).not.toHaveBeenCalled();
+  it('rechecks green on every pass until 24 hours after first green, then settles', async () => {
+    const f = fixture(); await f.run();
+    expect(f.settlements()[0].status).toBe('monitoring-green');
+    f.d.now = () => '2026-11-19T11:59:59Z';
+    await f.run(); expect(f.d.checks).toHaveBeenCalledTimes(2);
+    expect(f.settlements()).toHaveLength(1);
+    f.d.now = () => '2026-11-19T12:00:00Z';
+    expect(await f.run()).toMatchObject({ results: [{ status: 'settled-green' }] });
+    await f.run(); expect(f.d.checks).toHaveBeenCalledTimes(3);
+    expect(f.d.remove).not.toHaveBeenCalled();
+  });
+  it('unloads a failing same-SHA rerun within the persisted green monitoring window', async () => {
+    const f = fixture(); await f.run();
+    f.d.now = () => '2026-11-19T11:59:59Z';
+    f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('test', 'failure')] });
+    expect(await urgentSweep({}, { ...f.d })).toMatchObject({ results: [{ status: 'settled-unloaded' }] });
+    expect(f.d.remove).toHaveBeenCalledWith(load);
+    expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you' }));
+  });
+  it.each([
+    ['missing suite', undefined, { check_suite: undefined }],
+    ['foreign workflow', { total_count: 1, workflow_runs: [{ ...workflows.workflow_runs[0], path: '.github/workflows/other.yml' }] }],
+    ['wrong suite', { total_count: 1, workflow_runs: [{ ...workflows.workflow_runs[0], check_suite_id: 8 }] }],
+    ['wrong SHA', { total_count: 1, workflow_runs: [{ ...workflows.workflow_runs[0], head_sha: 'b'.repeat(40) }] }],
+    ['unavailable workflow', null],
+    ['incomplete workflows', { ...workflows, total_count: 2 }],
+    ['oversized workflows', { total_count: 101, workflow_runs: Array.from({ length: 101 }, () => workflows.workflow_runs[0]) }],
+  ])('keeps otherwise green %s evidence unsettled', async (_, runs, extra = {}) => {
+    const f = fixture();
+    f.d.checks.mockReturnValue({ total_count: required.length, check_runs: required.map(n => check(n, 'success', extra)), workflows: runs });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'pending' }] });
+    expect(f.settlements()).toEqual([]); expect(f.d.remove).not.toHaveBeenCalled();
+  });
+  it('binds test to the configured workflow path', async () => {
+    const f = fixture();
+    f.d.checks.mockReturnValue({ total_count: required.length, check_runs: required.map(n => check(n)), workflows,
+      testWorkflowPath: '.github/workflows/custom.yml' });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'pending' }] });
+  });
+  it('ignores a failed registration intent without cancelling a later attempt', async () => {
+    const f = fixture([check('test', 'failure')]);
+    f.loads[0] = { ...load, trackingId: 'failed-attempt' };
+    f.loads.push({ ...f.loads[0], type: 'prototype-load.urgent-registration-failed', status: 'registration-failed' });
+    expect(await f.run()).toMatchObject({ results: [] });
+    expect(f.d.checks).not.toHaveBeenCalled();
+    f.loads.push({ ...load, trackingId: 'retry' });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'settled-unloaded' }] });
   });
   it.each(['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'])('unloads and raises NEEDS-YOU for completed smoke %s from any app', async conclusion => {
     for (const appId of [15368, 1]) {
@@ -47,9 +92,10 @@ describe('urgent CI sweep', () => {
     expect(f.d.remove).toHaveBeenCalledWith(load);
     expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you', question: expect.stringContaining('NEEDS-YOU') }));
   });
-  it('rechecks persisted legacy green without completion evidence and unloads later failure', async () => {
+  it.each([true, false])('rechecks persisted legacy green (checksComplete=%s) and unloads later failure', async checksComplete => {
     const f = fixture(); await f.run();
-    delete f.settlements()[0].checksComplete;
+    Object.assign(f.settlements()[0], { status: 'settled-green', checksComplete });
+    delete f.settlements()[0].greenAt;
     f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('test', 'failure')] });
     expect(await f.run()).toMatchObject({ results: [{ status: 'settled-unloaded' }] });
     expect(f.d.remove).toHaveBeenCalledWith(load);
@@ -102,7 +148,7 @@ describe('urgent CI sweep', () => {
   });
   it('bounds work to 32 loads per pass, deferring remaining loads to the orchestrator', async () => {
     const f = fixture(); f.loads.splice(0, 1, ...Array.from({ length: 33 }, (_, i) => ({ ...load, ref: `lane/ref-${i}` })));
-    await f.run(); expect(f.d.checks).toHaveBeenCalledTimes(32); await f.run(); expect(f.d.checks).toHaveBeenCalledTimes(33);
+    await f.run(); expect(f.d.checks).toHaveBeenCalledTimes(32); await f.run(); expect(f.d.checks).toHaveBeenCalledTimes(64);
   });
   it.each(['pending', 'needs-you'])('persistently %s first 32 loads cannot starve a later CI failure across passes', async status => {
     const f = fixture();
@@ -125,14 +171,14 @@ describe('urgent CI sweep', () => {
     expect(f.d.remove).toHaveBeenCalledTimes(1); expect(f.d.remove).toHaveBeenCalledWith(failing);
     expect(f.settlements()).toEqual([expect.objectContaining({ ref: failing.ref, status: 'settled-unloaded' })]);
   });
-  it('honors complete settlements without cursor records', async () => {
+  it('resumes green monitoring without cursor records', async () => {
     const f = fixture(); await f.run();
     f.state.splice(0, f.state.length, ...f.settlements());
-    await f.run(); expect(f.d.checks).toHaveBeenCalledTimes(1); expect(f.settlements()).toHaveLength(1);
+    await f.run(); expect(f.d.checks).toHaveBeenCalledTimes(2); expect(f.settlements()).toHaveLength(1);
   });
   it('starts at the beginning if the cursor load was archived', async () => {
     const f = fixture(); f.state.push({ id: 'a'.repeat(64), status: 'sweep-cursor' });
-    await f.run(); expect(f.d.checks).toHaveBeenCalledTimes(1); expect(f.settlements()[0].status).toBe('settled-green');
+    await f.run(); expect(f.d.checks).toHaveBeenCalledTimes(1); expect(f.settlements()[0].status).toBe('monitoring-green');
   });
   it('escalates a malformed persisted cursor before reading CI', async () => {
     const f = fixture(); f.state.push({ id: 'bad', status: 'sweep-cursor' });
@@ -147,14 +193,36 @@ describe('production sweep storage and removal guards', () => {
   it('reads exact-SHA checks through the origin-bound throttled reader and guards the actual overlay tip', () => {
     const exec = vi.fn((cmd, args) => args[0] === 'remote' ? load.repo : 'workflow');
     const ghExec = vi.fn((cmd, args) => JSON.stringify(args[0] === 'repo'
-      ? { nameWithOwner: 'org/repo', url: load.repo } : { total_count: 0, check_runs: [] }));
+      ? { nameWithOwner: 'org/repo', url: load.repo } : args[1].includes('/actions/runs') ? workflows : { total_count: 0, check_runs: [] }));
     const remove = vi.fn(() => ({ removed: true })), env = {};
-    const deps = createSweepDeps({ exec, ghExec, remove, env });
-    expect(deps.checks(load)).toEqual({ total_count: 0, check_runs: [] });
+    const io = { readFileSync: p => {
+      if (p.endsWith('prototype-load.json')) return JSON.stringify({ testWorkflowPath: '.github/workflows/custom.yml' });
+      throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+    } };
+    const deps = createSweepDeps({ exec, ghExec, remove, env, io });
+    expect(deps.checks(load)).toEqual({ total_count: 0, check_runs: [], workflows, testWorkflowPath: '.github/workflows/custom.yml' });
+    expect(ghExec.mock.calls[2][1]).toEqual(['api', `repos/org/repo/actions/runs?head_sha=${sha}&per_page=100`, '--hostname', 'example.com']);
     expect(ghExec.mock.calls[1][1]).toEqual(['api', `repos/org/repo/commits/${sha}/check-runs?per_page=100&filter=all`, '--hostname', 'example.com']);
     expect(ghExec.mock.calls.every(([, , o]) => o.maxBuffer === 1024 * 1024 && o.timeout === 30000 && o.throttle.caller === 'urgent-sweep')).toBe(true);
     deps.remove(load);
     expect(remove).toHaveBeenCalledWith(expect.objectContaining({ root: '/clone', ref: 'lane/repair-m1', expectedTip: load.registration.sha, env }));
+  });
+  it('preserves failing checks when the production workflow reader is unavailable', async () => {
+    const exec = vi.fn(() => load.repo);
+    const ghExec = vi.fn((cmd, args) => {
+      if (args[0] === 'repo') return JSON.stringify({ nameWithOwner: 'org/repo', url: load.repo });
+      if (args[1].includes('/actions/runs')) throw new Error('workflow unavailable');
+      return JSON.stringify({ total_count: 1, check_runs: [check('test', 'failure')] });
+    });
+    const io = { readFileSync: p => {
+      if (p.endsWith('prototype-load.json')) return '{}';
+      throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+    } };
+    const data = createSweepDeps({ exec, ghExec, io }).checks(load);
+    expect(data.workflows).toBeNull();
+    const f = fixture(); f.d.checks.mockReturnValue(data);
+    expect(await f.run()).toMatchObject({ results: [{ status: 'settled-unloaded' }] });
+    expect(f.d.escalate).toHaveBeenCalled();
   });
   it('bounds ledgers before reading and uses the shared escalation packet writer', async () => {
     const io = { statSync: () => ({ size: 4 * 1024 * 1024 + 1 }), readFileSync: vi.fn(), mkdirSync: vi.fn(), writeFileSync: vi.fn(), renameSync: vi.fn() };
