@@ -17,7 +17,7 @@ import * as authCache from '../github-app-auth-env.mjs';
 import { defaultCachePath } from '../github-app-auth-env.mjs';
 import { renderGhShimScript } from '../gh-app-shim.mjs';
 import { ghInstallationPools, ghInstallationCap, ghSlotPool, ghHolderMeta, ghHolderPolicy, readGhSlotHolders, ghHoldersSummary, loadGhThrottleSettings } from '../gh-throttle-holders.mjs';
-import { acquireGhSlotSync, releaseGhSlotSync, runGhSync, runGhCliPassthrough, ghThrottleStatus, GH_SLOT_WAIT_TOOL_FILE } from '../gh-throttle.mjs';
+import { acquireGhSlotSync, releaseGhSlotSync, runGhSync, runGhCliPassthrough, ghThrottleStatus, GH_SLOT_WAIT_TOOL_FILE, ghPointsBudgetStatePath } from '../gh-throttle.mjs';
 
 
 let root;
@@ -302,6 +302,11 @@ console.log(result);`;
       expect(nested.throttled).toBeUndefined();
       expect(child).toHaveBeenCalledTimes(1);
       expect(rows('calls.jsonl').find(r => r.outcome === 'call' && r.outer)).toMatchObject({ bucket: '101' });
+    });
+    it('charges the pair\'s points budget ONCE (the parent already paid for this call)', () => {
+      const { nested } = nestedRun({ perCallerMax: 0 });
+      expect(nested).toMatchObject({ status: 0 });
+      expect(JSON.parse(readFileSync(ghPointsBudgetStatePath(root), 'utf8')).spent).toBe(1);
     });
     it('the reverse move (parent admitted to installation 101, child resolves shared) also counts the parent once', () => {
       const { nested, child } = nestedRun({ perCallerMax: 1, parentEnv: appEnv('101'), childBucket: null, parentCap: 20 });

@@ -2402,8 +2402,10 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
     // holder excludes nothing). Only a nested call carries it; a parent on older code publishes none.
     const outerOwner = outer ? (env[GH_OUTER_OWNER_ENV] || process.env[GH_OUTER_OWNER_ENV] || null) : null;
     const acq = gated && !ridesOuter ? failOpenGate('acquire', () => {
-      if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
-      const pointsGate = acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: reserved ? Math.min(acquireTimeoutMs, reservedCapMs) : acquireTimeoutMs, windowMs: pointsWindowMs });
+      // A nested call that moved pools still takes its own SLOT, but the parent already charged this one call's
+      // points and write budget to the same ledger: charging them again would count the pair twice (PR #7018).
+      if (isWrite && !outer) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
+      const pointsGate = outer ? null : acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: reserved ? Math.min(acquireTimeoutMs, reservedCapMs) : acquireTimeoutMs, windowMs: pointsWindowMs });
       // A reserved read FAILS CLOSED if the points budget did not clear inside its own call bound (the freeze then holds).
       if (reserved && pointsGate?.ok === false) return { ok: false, timedOut: true, waitedMs: reservedCapMs };
       return isGhWatch(argv) ? { ok: false } : acquireGhSlotSync({ ...pool, owner, pid, pollMs, timeoutMs: reserved ? Math.max(0, Math.min(slotTimeoutMs, reservedCapMs - (now() - reservedStartMs))) : slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args: argv, pid, nowMs: now(), timeoutMs: ghExecOptions(spawnOpts, argv, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn, excludeOwner: outerOwner });
