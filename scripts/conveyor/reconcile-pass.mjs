@@ -1,3 +1,4 @@
+import { readPlannerRows } from '../lib/red-team-planner-row.mjs';
 import { greenLedgerDir, hasGreenLedger } from '../lib/lane-verify.mjs';
 import { unread } from './dispatch-eligibility.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
@@ -57,6 +58,7 @@ import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { enrichPrsWithStandingRulingGrants } from './standing-ruling-io.mjs';
 import { enrichPrsWithOwedMainRule, resolveRefreshSettings } from '../lib/renamed-pr-refresh.mjs';
 import { excusePrMergeGateHolds, readMergeGateVerdict as defaultReadMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
+import { readReviewChecks } from '../lib/review-ci-gate-io.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { readMainRedPriority } from '../lib/main-red-priority.mjs'; // card xu1nixv
 import { fetchPrCommits } from '../lib/pr-limit.mjs';
@@ -85,7 +87,7 @@ import { codeqlFailureEvidence } from '../lib/codeql-gate.mjs';
 import { makeFixEvidenceReader, checkFixFacts } from '../lib/fix-facts.mjs';
 import { readSharedOpenPrs, sampleContextDeclared } from '../lib/pr-snapshot.mjs';
 import { prSnapshotEnabled, prSnapshotDir } from '../lib/pr-snapshot-store.mjs';
-import { listOpenPrsPagedHydrated, resolvePrListPaging, assertInventoryComplete, parseListOutput, resolveCheckAppsByCommit } from '../lib/pr-list-paged.mjs';
+import { listOpenPrsPagedHydrated, resolvePrListPaging, assertInventoryComplete, parseListOutput, enrichPrRollupEvidence, resolveCheckAppsByCommit } from '../lib/pr-list-paged.mjs';
 import { ghRestGetJson } from '../lib/gh-rest-read.mjs';
 import { isGhThrottled } from '../lib/gh-deferred.mjs';
 import { withListRetry } from '../lib/gh-list-retry.mjs';
@@ -472,6 +474,7 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
     const parsed = parseListOutput(out, { repo });
     // A full page means the inventory may be capped: refuse it rather than plan as if the overflow did not exist.
     if (parsed.length >= PR_LIST_LIMIT) throw Object.assign(new Error(`open-PR list${repo ? ` for ${repo}` : ''} hit the ${PR_LIST_LIMIT} cap — refusing a possibly partial inventory`), { code: 'pr-list-truncated' });
+    enrichPrRollupEvidence({ repo, rows: parsed, exec });
     // `gh pr list` rollups carry no posting app; the planner's external-check exemption needs it (#6926). An unreadable
     // `gh api` answer leaves the app empty (fail closed).
     return resolveCheckAppsByCommit({ repo, rows: parsed, exec });
@@ -1783,7 +1786,7 @@ export function runReconcilePass({
   // one pass over the same PRs. A repo this constellation does not know the gh slug for (`resolvedRepo` stays
   // `null`, `gh` infers from cwd) can return an unavailable empty set. The shared reducer then evaluates
   // observed CI checks, retaining red/pending/unchecked evidence; [] never means an automatic pass.
-  const { checks: requiredChecks } = readRequiredChecks({ repo: resolvedRepo, branch: defaultBranch,
+  const { checks: requiredChecks, source: rosterSource = 'declared' } = readRequiredChecks({ repo: resolvedRepo, branch: defaultBranch,
     ...(readOnly ? { readOnly: true } : {}) });
   // we:backlog/x5uqim1-*.md — attach `requiredCheckCompletedAt`/`aheadByOnMain` to any currently-failing
   // PR and read `main`'s own red windows, so `planReconcile` can tell a `ci-red` PR caused by a red `main` apart
@@ -1804,6 +1807,26 @@ export function runReconcilePass({
       readMergeGateVerdict, readFreeze, mergeGateSetting, env,
     });
   } catch { /* An unreadable verdict must retain the original red checks. */ }
+  // An excused candidacy hold owes review, but its listing rollup is not completeness proof.
+  // Re-read the complete exact-head feed through the existing hydration-reader contract.
+  // Carry the excusal only for the same immutable job; never attest the old listing.
+  holdPrs = holdPrs.map(pr => {
+    const excused = pr.statusCheckRollup?.find(row => row?.mergeGateHoldExcused);
+    if (!excused || reduceCheckState(pr.statusCheckRollup, requiredChecks).state !== 'green') return pr;
+    try {
+      const checkRepo = resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug;
+      // Production review proof includes every attempt and legacy commit statuses as well.
+      const rows = readChecks === defaultReadChecks
+        ? readReviewChecks({ repo: checkRepo, headSha: pr.headRefOid })
+        : readChecks({ repo: checkRepo, sha: pr.headRefOid });
+      if (!Array.isArray(rows) || rows.rowsComplete === false) return pr;
+      return { ...pr, rowsHead: pr.headRefOid, rowsComplete: true,
+        statusCheckRollup: rows.map(row => row?.name === 'merge-gate' && row.id === excused.id
+          && Number.isSafeInteger(row.id) && String(row.status).toLowerCase() === 'completed'
+          && FAILING_CONCLUSIONS.includes(String(row.conclusion).toLowerCase())
+          ? { ...row, conclusion: 'SUCCESS', mergeGateHoldExcused: excused.mergeGateHoldExcused } : row) };
+    } catch { return pr; } // Keep the incomplete listing refused; retry on the next pass.
+  });
   const { prs: redPrs, mainRedWindows, mainLatestCheckRuns } = enrichMainRed(holdPrs, { repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug, defaultBranch, requiredChecks });
   // live incident, PR #2752 (#4034/#2748) — attach `alreadyLandedInMain` to any PR carrying
   // `merge-status:conflicting` whose own content is already, file-by-file, present on `main`. Costs nothing
@@ -1845,7 +1868,7 @@ export function runReconcilePass({
     staleCiRerun: staleCiRerunSetting.value,
     roundCap: resolveRoundCap(env),
     repo: repoKey, prs, agents, durableCounts: durableCountsFrom(prs), now, defaultBranch, mainRedWindows,
-    mainLatestCheckRuns, requiredChecks, mainSha, fixerLadder,
+    mainLatestCheckRuns, requiredChecks, rosterSource, mainSha, fixerLadder,
     ...fixCapSettings(loadFixSettings, env, loadTakeoverBudget),
     ...operatorRulingRoundsSetting(loadOperatorRulingRounds, env),
     ...roundExtensionAnchorSetting(loadRoundExtensionAnchorSetting, env),
@@ -1858,7 +1881,11 @@ export function runReconcilePass({
   };
   const plan = step('plan', () => planReconcile(plannerInput));
   const { prs: _prs, agents: _agents, repo: _repo, now: _now, durableCounts: _counts, ...plannerOptions } = plannerInput;
-  return { ...plan, ...(readOnly ? { enrichedPrs: prs, agentList: agents, agentsIncomplete: Object.hasOwn(agents, 'incomplete'), plannerOptions } : {}), owedTriggers: hydrated.owedTriggers, notes: [...hydrated.notes, ...plan.notes], refusals: [...hydrated.refusals, ...plan.refusals], prs: rawPrs.length, agents: agents.length,
+  // Bind ordinary refusals to their evaluated head; preserve explicitly recorded escalation heads.
+  const refusals = [...hydrated.refusals, ...plan.refusals].map(row =>
+    row.headSha === undefined ? { ...row, headSha: row.headRefOid } : row);
+  const plannerRows = readPlannerRows({ repo: resolvedRepo, refusals, rawPrs: prs, requiredChecks, rosterSource });
+  return { ...plan, plannerRows, plannerRequiredChecks: requiredChecks, plannerRequiredChecksSource: rosterSource, ...(readOnly ? { enrichedPrs: prs, agentList: agents, agentsIncomplete: Object.hasOwn(agents, 'incomplete'), plannerOptions } : {}), owedTriggers: hydrated.owedTriggers, notes: [...hydrated.notes, ...plan.notes], refusals, prs: rawPrs.length, agents: agents.length,
     openPrFiles: rawPrs.map((pr) => ({ pr: pr.number, files: Array.isArray(pr.files) && pr.files.length < 100
       ? pr.files.map((file) => typeof file === 'string' ? file : file.path) : null })),
   };
