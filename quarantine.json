@@ -1,22 +1,5 @@
 {
   "version": 1,
-  "entries": [
-    {
-      "test": "scripts/lib/__tests__/daemon-jobs-runtime.test.mjs",
-      "brokenSha": "0a352384aeb4e89efbe57fbf54c2c7230bab7e00",
-      "owner": "xpbpgkz-daemon-jobs-runtime-forge-process-group",
-      "reason": "4 process-group tests pass local on main but fail on the Forge runner (waitFor timeout); card xpbpgkz; coordinator pre-authorised under R157",
-      "addedAt": 1795015780306,
-      "expiresAt": 1795037380306
-    },
-    {
-      "test": "scripts/conveyor/soak/daemon-soak.soak.test.mjs::50 real daemon ticks: every invariant holds after every tick",
-      "brokenSha": "a9eef80d784768738110e6a51432a4fb6abda05f",
-      "owner": "lane/main-fix-soak-owed-review",
-      "reason": "daemon-soak 50-tick: PR 10 owed review starves past grace 6 (re-added: pruned at 09:43 ET)",
-      "addedAt": 1795015972347,
-      "expiresAt": 1795102372347
-    }
-  ],
+  "entries": [],
   "mode": "quarantine"
 }
