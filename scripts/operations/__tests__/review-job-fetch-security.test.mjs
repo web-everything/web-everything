@@ -255,6 +255,24 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s isolated object handoff',
           expect(config).not.toContain(helper);
           return output;
         }
+        const sshUrl = `git@github.com:${repo}.git`;
+        if (poison === 'url-alias' || poison === 'fetch-mapping') {
+          // A lane remote NAMED like the explicit URL argument: inside the lane, Git resolves that argument
+          // as this remote, so its url / fetch mapping would apply to the review fetch (red-team, PR #7012).
+          git(lane, ['update-ref', 'refs/heads/victim', laneHead]);
+          if (poison === 'url-alias') git(lane, ['config', '--local', `remote.${sshUrl}.url`, 'review-marker::alias']);
+          else {
+            git(lane, ['config', '--local', `remote.${sshUrl}.url`, sshUrl]);
+            git(lane, ['config', '--local', `remote.${sshUrl}.fetch`, `+refs/pull/${pr}/head:refs/heads/victim`]);
+          }
+          // Positive control: in the lane the production argument really resolves to the alias.
+          expect(git(lane, ['ls-remote', '--get-url', sshUrl]).trim()).toBe(poison === 'url-alias' ? 'review-marker::alias' : sshUrl);
+          if (poison === 'url-alias') {
+            expect(() => git(lane, ['-c', 'protocol.review-marker.allow=always', 'ls-remote', sshUrl])).toThrow();
+            expect(existsSync(marker)).toBe(true); rmSync(marker);
+          } else expect(git(lane, ['config', '--get', `remote.${sshUrl}.fetch`]).trim()).toContain('refs/heads/victim');
+          return output;
+        }
         const included = join(root, 'included');
         let target = ['--local'];
         if (poison === 'worktree') {
@@ -326,6 +344,20 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s isolated object handoff',
     expect(f.git(f.lane, ['show', `${f.head}:payload`])).toBe('genuine fixture object\n');
     expect(existsSync(f.marker)).toBe(false);
     expect(existsSync(f.iso())).toBe(false);
+    expect(f.counts()).toEqual({ networkCalls: 1, packCalls: 1, indexCalls: 1 });
+  });
+
+  // The explicit SSH URL is fetched in the config-free repo, so a lane remote named like that URL can
+  // neither redirect the transport nor map the fetched head onto an unrelated lane ref.
+  it.each(['url-alias', 'fetch-mapping'])('a lane remote named like the fetch URL (%s) cannot redirect or remap the fetch', poison => {
+    const f = fixture({ poison });
+    const laneHead = f.git(f.lane, ['rev-parse', 'HEAD']).trim();
+    expect(f.run()).toEqual({ head: f.head });
+    expect(f.git(f.lane, ['rev-parse', '--verify', `${f.head}^{commit}`]).trim()).toBe(f.head);
+    expect(existsSync(f.marker)).toBe(false);
+    expect(f.git(f.lane, ['rev-parse', 'refs/heads/victim']).trim()).toBe(laneHead);
+    expect(f.git(f.lane, ['for-each-ref', '--format=%(refname)']).trim().split('\n').sort())
+      .toEqual(['refs/heads/victim', f.git(f.lane, ['symbolic-ref', 'HEAD']).trim()].sort());
     expect(f.counts()).toEqual({ networkCalls: 1, packCalls: 1, indexCalls: 1 });
   });
 
