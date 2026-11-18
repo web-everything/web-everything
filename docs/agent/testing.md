@@ -4626,3 +4626,10 @@ attempt has not advanced. Reconciliation-only rows never request a run; the next
 a retry or heal from the observed state. Direct retries may reselect once under the per-head lock.
 Keep the expired-reservation/failed-observation regression asserting zero heal dispatches. Missing timestamps and unreadable state remain held.
 Pin historical young-reservation fixtures to their original clock, and test the spent-budget heal path.
+
+Owed-rerun recovery must retain live or unknown same-host requester identities past expiry,
+including while another executor awaits the API. Only proven-dead local owners may release
+after the short stale threshold; legacy/remote owners require the six-hour hard ceiling
+(`WE_TIMEOUT_RERUN_PENDING_HARD_STALE_MS`). Both paths still require bound observation
+with no advanced attempt. Pin dead-owner fixtures explicitly; never infer death from age.
+The mechanical executor uses the shared main-staleness guard and returns refused rows on refusal.

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, hostname } from 'node:os';
+import * as pidHelpers from '../../lib/pid-alive.mjs';
 import { join } from 'node:path';
 import { dispatchTimeoutRetry, readTimeoutHold, runReconcileCiHealDispatch } from '../../operations/ci-heal-pr-dispatch.mjs';
 import { readTimeoutBudget, timeoutKey } from '../timeout-retry-state.mjs';
@@ -11,12 +12,26 @@ const evidence = { eligible: true, repo, pr: 5273, head: 'a'.repeat(40), signatu
   jobs: [{ run: 123, job: 456, attempt: 1 }] };
 const observe = (e, j) => ({ repo, head: e.head, runHead: e.head, open: true, run: j.run, jobRun: j.run,
   job: j.job, attempt: j.attempt, jobAttempt: j.attempt, status: 'completed', conclusion: 'failure' });
+const deadPid = 987654321;
+const realIdentity = pidHelpers.pidIdentity;
+const realStamp = pidHelpers.pidIdentityStamp;
+// Feed the real shared parser bounded ps snapshots; the test host may deny ps entirely.
+const identityExec = (_cmd, args) => {
+  if (Number(args[1]) === deadPid) throw Object.assign(Error('gone'), { status: 1, stderr: '' });
+  if (Number(args[1]) === process.pid) return 'S Wed Oct 14 15:59:00 2026 node test-runner';
+  throw Error('unexpected pid');
+};
+const deadRequester = { pid: deadPid, hostname: hostname() };
 let dir;
-beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'owed-rerun-')); });
-afterEach(() => { rmSync(dir, { recursive: true, force: true }); vi.unstubAllEnvs(); });
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), 'owed-rerun-'));
+  vi.spyOn(pidHelpers, 'pidIdentity').mockImplementation((pid, opts) => realIdentity(pid, { ...opts, exec: identityExec }));
+  vi.spyOn(pidHelpers, 'pidIdentityStamp').mockImplementation(pid => realStamp(pid, identityExec));
+});
+afterEach(() => { rmSync(dir, { recursive: true, force: true }); vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 const path = () => join(dir, `${timeoutKey(evidence)}.json`);
 const seed = (over = {}) => writeFileSync(path(), JSON.stringify({ version: 1, evidence,
-  requests: [{ id: 0, target: evidence.jobs[0], status: 'pending', reservedAt: new Date(t0).toISOString(), ...over }] }));
+  requests: [{ id: 0, target: evidence.jobs[0], status: 'pending', requester: deadRequester, reservedAt: new Date(t0).toISOString(), ...over }] }));
 const state = () => JSON.parse(readFileSync(path(), 'utf8'));
 const plan = budget => planReconcile({ prs: [{ number: evidence.pr, state: 'OPEN', isDraft: true,
   headRefName: 'lane/x', headRefOid: evidence.head, labels: [], mergeStateStatus: 'BLOCKED', comments: [],
@@ -28,7 +43,7 @@ const plan = budget => planReconcile({ prs: [{ number: evidence.pr, state: 'OPEN
   agents: [], requiredChecks: ['test'], now: t0 + 21 * 60_000, mainRedWindows: [], staleCiRerun: 'once-per-head' });
 
 describe('stale pending recovery', () => {
-  it('releases an observed stale pending reservation and selects a fresh request in the same call without burning cap', async () => {
+  it('releases an observed stale dead-pid reservation and selects a fresh request in the same call without burning cap', async () => {
     seed();
     const request = vi.fn(() => ({ status: 'confirmed' }));
     const out = await dispatchTimeoutRetry(evidence, { repo, dir, now: () => t0 + 21 * 60_000, effects: { observe, request } });
@@ -36,6 +51,70 @@ describe('stale pending recovery', () => {
     expect(state().requests).toEqual([expect.objectContaining({ status: 'rejected', released: true, outcome: 'stale pending reservation released' }),
       expect.objectContaining({ status: 'confirmed' })]);
     expect(readTimeoutBudget({ ...evidence, dir })).toMatchObject({ confirmed: 1, rejected: 0, pending: false });
+  });
+  it.each(['live', 'unknown'])('holds a same-host %s requester even past the hard ceiling', async kind => {
+    seed({ requester: { pid: process.pid, hostname: hostname(), ...pidHelpers.pidIdentityStamp(process.pid) } });
+    if (kind === 'unknown') vi.spyOn(pidHelpers, 'pidIdentity').mockReturnValue({ alive: null, reason: 'unreadable' });
+    const now = t0 + 7 * 60 * 60_000;
+    const request = vi.fn();
+    expect(readTimeoutBudget({ ...evidence, dir, now }).pendingStale).toBeUndefined();
+    expect(readTimeoutHold({ ...evidence, dir, now })).not.toBeNull();
+    expect(await dispatchTimeoutRetry(evidence, { repo, dir, now: () => now, effects: { observe, request } }))
+      .toMatchObject({ reason: 'retry-outcome-pending' });
+    expect(request).not.toHaveBeenCalled();
+    expect(state().requests[0].status).toBe('pending');
+  });
+  it('releases a reused pid only after its start identity mismatches', async () => {
+    seed({ requester: { pid: process.pid, hostname: hostname(), runnerStart: 'old start marker' } });
+    const now = t0 + 21 * 60_000;
+    expect(readTimeoutBudget({ ...evidence, dir, now }).pendingStale).toBe(true);
+    await dispatchTimeoutRetry({ ...evidence, reconcilePendingOnly: true }, { repo, dir, now: () => now, effects: { observe } });
+    expect(state().requests[0]).toMatchObject({ status: 'rejected', released: true });
+  });
+  it.each([undefined, { pid: process.pid, hostname: `${hostname()}-remote` }])('legacy/remote requester %j waits until the hard ceiling and observation', async requester => {
+    seed({ requester });
+    const request = vi.fn();
+    for (const age of [21 * 60_000, 6 * 60 * 60_000]) {
+      const now = t0 + age;
+      expect(readTimeoutBudget({ ...evidence, dir, now }).pendingStale).toBeUndefined();
+      expect(await dispatchTimeoutRetry(evidence, { repo, dir, now: () => now, effects: { observe, request } }))
+        .toMatchObject({ reason: 'retry-outcome-pending' });
+    }
+    const now = t0 + 6 * 60 * 60_000 + 1;
+    expect(readTimeoutBudget({ ...evidence, dir, now }).pendingStale).toBe(true);
+    expect(readTimeoutHold({ ...evidence, dir, now })).not.toBeNull();
+    await dispatchTimeoutRetry({ ...evidence, reconcilePendingOnly: true }, { repo, dir, now: () => now,
+      effects: { observe: () => { throw Error('unknown'); }, request } });
+    expect(state().requests[0].status).toBe('pending');
+    await dispatchTimeoutRetry({ ...evidence, reconcilePendingOnly: true }, { repo, dir, now: () => now, effects: { observe, request } });
+    expect(state().requests[0]).toMatchObject({ status: 'rejected', released: true });
+    expect(request).not.toHaveBeenCalled();
+  });
+  it('honors the configured hard ceiling for legacy state', () => {
+    seed({ requester: undefined });
+    vi.stubEnv('WE_TIMEOUT_RERUN_PENDING_HARD_STALE_MS', String(2 * 60 * 60_000));
+    expect(readTimeoutBudget({ ...evidence, dir, now: t0 + 2 * 60 * 60_000 }).pendingStale).toBeUndefined();
+    expect(readTimeoutBudget({ ...evidence, dir, now: t0 + 2 * 60 * 60_000 + 1 }).pendingStale).toBe(true);
+  });
+  it('records requester identity and holds a concurrent request beyond expiry', async () => {
+    let release;
+    const request = vi.fn(() => new Promise(resolve => { release = resolve; }));
+    const first = dispatchTimeoutRetry(evidence, { repo, dir, now: () => t0, effects: { observe, request } });
+    await Promise.resolve();
+    expect(state().requests[0].requester).toMatchObject({ pid: process.pid, hostname: hostname(), runnerStart: expect.any(String) });
+    try {
+      expect(await dispatchTimeoutRetry(evidence, { repo, dir, now: () => t0 + 21 * 60_000, effects: { observe, request } }))
+        .toMatchObject({ reason: 'retry-outcome-pending' });
+      expect(request).toHaveBeenCalledTimes(1);
+    } finally { release({ status: 'confirmed' }); await first; }
+  });
+  it('holds when the observed attempt is missing', async () => {
+    seed();
+    const request = vi.fn();
+    await dispatchTimeoutRetry(evidence, { repo, dir, now: () => t0 + 21 * 60_000,
+      effects: { observe: (e, j) => ({ ...observe(e, j), attempt: undefined }), request } });
+    expect(state().requests[0].status).toBe('pending');
+    expect(request).not.toHaveBeenCalled();
   });
   it('planner retries expired holds then falls through to heal when the real cap is spent', async () => {
     seed();

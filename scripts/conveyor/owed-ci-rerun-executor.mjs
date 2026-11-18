@@ -1,5 +1,7 @@
 /** Fast mechanical executor: no fixer slots or fix-pass budget. */
 import { dispatchTimeoutRetry } from '../operations/ci-heal-pr-dispatch.mjs';
+import { assertMainNotStale } from '../lib/main-staleness.mjs';
+import { REPO_ROOT } from '../operations/dispatch-lane-io.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 
 export function resolveOwedRerunMax(env = process.env) {
@@ -13,7 +15,7 @@ export function resolveOwedRerunMax(env = process.env) {
 }
 
 export async function executeOwedCiReruns({ rows = [], repo, dispatchRetry = dispatchTimeoutRetry,
-  max = resolveOwedRerunMax(), log = () => {},
+  max = resolveOwedRerunMax(), log = () => {}, root = REPO_ROOT, checkStaleness,
 } = {}) {
   const result = { requested: [], refused: [], skippedOverCap: 0 };
   const safeLog = line => { try { log(line); } catch { /* diagnostics only */ } };
@@ -23,6 +25,12 @@ export async function executeOwedCiReruns({ rows = [], repo, dispatchRetry = dis
       .sort((a, b) => Number(a.prNumber) - Number(b.prNumber));
     result.skippedOverCap = Math.max(0, owed.length - cap);
     if (result.skippedOverCap) safeLog(`owed-ci-rerun: ${result.skippedOverCap} over cap ${cap}; still owed next review tick`);
+    try { if (owed.length) assertMainNotStale(root, checkStaleness); }
+    catch (error) {
+      result.refused = owed.map(row => ({ pr: row.prNumber, reason: String(error?.message ?? error) }));
+      result.skippedOverCap = 0;
+      return result;
+    }
     for (const row of owed.slice(0, cap)) {
       const pr = row.prNumber;
       try {

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { executeOwedCiReruns, resolveOwedRerunMax } from '../owed-ci-rerun-executor.mjs';
 import { runReviewTick, buildCliDaemonEffects } from '../../../skills-src/conveyor/review-daemon.mjs';
 vi.mock('../../lib/review-facts.mjs', async original => ({ ...await original(), warmReviewFacts: async () => ({ skipped: 'test' }) }));
+const FRESH = () => ({ fresh: true, behind: 0 });
 const repo = 'web-everything/web-everything';
 const rows = Array.from({ length: 13 }, (_, i) => ({ kind: 'ci-timeout-rerun', prNumber: 20 - i, timeoutRetry: { pr: 20 - i } }));
 afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
@@ -14,15 +15,25 @@ describe('owed rerun executor', () => {
       expect(opts).toEqual({ repo }); expect(active++).toBe(0);
       await Promise.resolve(); calls.push(e.pr); active--; return { status: 'requested' };
     };
-    const out = await executeOwedCiReruns({ rows: [...rows, { kind: 'review' }], repo, dispatchRetry });
+    const out = await executeOwedCiReruns({ rows: [...rows, { kind: 'review' }], repo, dispatchRetry, checkStaleness: FRESH });
     expect(calls).toEqual([8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
     expect(out).toEqual({ requested: calls, refused: [], skippedOverCap: 3 });
   });
   it('continues after thrown and unknown executor results and a throwing logger', async () => {
     const dispatchRetry = vi.fn().mockRejectedValueOnce('lost').mockResolvedValueOnce(undefined).mockResolvedValue({ status: 'requested' });
-    const out = await executeOwedCiReruns({ rows, repo, max: 3, dispatchRetry, log: () => { throw Error('log'); } });
+    const out = await executeOwedCiReruns({ rows, repo, max: 3, dispatchRetry, checkStaleness: FRESH, log: () => { throw Error('log'); } });
     expect(out).toEqual({ requested: [10], refused: [{ pr: 8, reason: 'lost' }, { pr: 9, reason: 'unknown timeout retry result' }], skippedOverCap: 10 });
     await expect(executeOwedCiReruns({ rows: null, log: () => { throw Error('log'); } })).resolves.toEqual({ requested: [], refused: [], skippedOverCap: 0 });
+  });
+  it('refuses every owed row with the shared stale-checkout reason without requesting reruns', async () => {
+    const dispatchRetry = vi.fn();
+    const checkStaleness = vi.fn(() => ({ action: 'warn', behind: 2, dirty: true }));
+    const out = await executeOwedCiReruns({ rows, repo, root: '/test-checkout', checkStaleness, dispatchRetry });
+    expect(checkStaleness).toHaveBeenCalledWith('/test-checkout');
+    expect(dispatchRetry).not.toHaveBeenCalled();
+    expect(out.requested).toEqual([]);
+    expect(out.refused).toHaveLength(rows.length);
+    expect(out.refused.every(row => /behind origin\/main.*refusing/.test(row.reason))).toBe(true);
   });
   it.each([['999', 25], ['0', 1], ['bad', 10], [undefined, 10], ['4', 4]])('bounds environment max %s to %s', (value, expected) => {
     expect(resolveOwedRerunMax({ WE_OWED_RERUN_MAX_PER_PASS: value, WE_POLICY_CASCADE_LOG: '0' })).toBe(expected);

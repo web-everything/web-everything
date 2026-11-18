@@ -44,7 +44,8 @@ import { providerQuotaHold } from '../lib/provider-quota-hold.mjs';
 import { resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 
 import { readFileSync, mkdirSync, readdirSync, existsSync, openSync, fstatSync, readSync, closeSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, hostname } from 'node:os';
+import { pidIdentityStamp } from '../lib/pid-alive.mjs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { timeoutPendingIsStale, timeoutStateDir, timeoutKey, readTimeoutStates, readTimeoutBudget } from '../conveyor/timeout-retry-state.mjs';
@@ -994,7 +995,8 @@ export async function dispatchTimeoutRetry(evidence, {
       const target = evidence.jobs.find((j) => !state.requests.some((r) => r.status === 'confirmed'
         && r.target.run === j.run && r.target.job === j.job && r.target.attempt === j.attempt));
       if (!target) return { waiting: true };
-      reservation = { id: state.requests.length, signature: evidence.signature, target, status: 'pending', reservedAt: new Date(now()).toISOString(), outcome: 'reserved; API outcome unknown' };
+      reservation = { id: state.requests.length, signature: evidence.signature, target, status: 'pending', requester: { pid: process.pid, hostname: hostname(),
+        runnerStart: pidIdentityStamp(process.pid).runnerStart }, reservedAt: new Date(now()).toISOString(), outcome: 'reserved; API outcome unknown' };
       state.requests.push(reservation);
       return { target };
     });
@@ -1023,8 +1025,9 @@ export async function dispatchTimeoutRetry(evidence, {
       && observed.run === target.run && observed.jobRun === target.run && observed.job === target.job;
     if (!bound || !observed.open) { releaseFresh(); return refuse('stale-head-or-job'); }
     if (selected.pending) {
+      if (!Number.isInteger(observed.attempt) || !Number.isInteger(target.attempt)) return refuse('retry-observation-unknown:invalid-attempt');
       if (observed.attempt <= target.attempt) {
-        if (!allowRelease || !timeoutPendingIsStale(selected.pending.reservedAt, now())) return refuse('retry-outcome-pending');
+        if (!allowRelease || !timeoutPendingIsStale(selected.pending, now())) return refuse('retry-outcome-pending');
         timeoutTransaction(path, initial, (state) => {
           const pending = state.requests[selected.pending.id];
           if (pending?.status === 'pending' && pending.reservedAt === selected.pending.reservedAt) {
