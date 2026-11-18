@@ -6,7 +6,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { URL as NodeURL } from 'node:url';
 import { withRealRepo } from './helpers/real-repo.mjs';
-import { cardLine, classifyPreExisting, parseReproAnswer, parseDiffChangedLines } from '../audit-base-repro.mjs';
+import { cardLine, cardHash, classifyPreExisting, parseReproAnswer, parseDiffChangedLines } from '../audit-base-repro.mjs';
 import { createAuditDeps } from '../codex-audit-io.mjs';
 
 describe('codex-audit real IO', () => {
@@ -62,6 +62,46 @@ describe('codex-audit real IO', () => {
 
 
 describe('R1053 base reproduction IO', () => {
+  it.each(['A1', 'B2'].flatMap(cls => ['2026-11-18 12:00:01', '2026-11-18 12:01:00'].map(date => [cls, date])))
+  ('reuses the persisted card and index hash for %s on a retry at %s', async (cls, date) => {
+    await withRealRepo(async ({ root, tmp }) => {
+      const cardsPath = join(tmp, 'cards.md'), indexPath = join(tmp, 'index.jsonl');
+      const options = { cwd: root, cardsPath, indexPath };
+      const fields = { cls, path: 'x.mjs', symbol: 'X', sha10: '1234567890', text: 'finding with 2026-11-18 12:00:00 ET: inside' };
+      const firstLine = cardLine({ ...fields, date: '2026-11-18 12:00:00' });
+      const request = { key: `x.mjs|X|${cls}`, expedite: cls === 'B2', needsYou: cls === 'B2' };
+      const receipt = cls === 'B2' ? { written: true, expedite: true, needsYou: true } : true;
+      expect(createAuditDeps(options).fileCard({ ...request, cardLine: firstLine })).toEqual(receipt);
+      const firstCards = readFileSync(cardsPath, 'utf8');
+      const firstIndex = readFileSync(indexPath, 'utf8');
+      expect(createAuditDeps(options).fileCard({ ...request, cardLine: cardLine({ ...fields, date }) })).toEqual(receipt);
+      expect(readFileSync(cardsPath, 'utf8')).toBe(firstCards);
+      expect(firstCards.split('\n').filter(line => line.startsWith('- [R1053] '))).toEqual([firstLine]);
+      expect(firstCards.split('\n').filter(line => line.includes('[needs-you]'))).toHaveLength(cls === 'B2' ? 1 : 0);
+      expect(readFileSync(indexPath, 'utf8')).toBe(firstIndex);
+      const rows = firstIndex.trim().split('\n').map(line => JSON.parse(line));
+      expect(rows).toHaveLength(1);
+      expect(rows[0].cardLineHash).toBe(cardHash(firstLine));
+    });
+  });
+  it.each(['A1', 'B2'].flatMap(cls => ['text', 'sha10'].map(field => [cls, field])))
+  ('keeps a changed %s finding distinct when %s changes', async (cls, field) => {
+    await withRealRepo(async ({ root, tmp }) => {
+      const cardsPath = join(tmp, 'cards.md'), indexPath = join(tmp, 'index.jsonl');
+      const options = { cwd: root, cardsPath, indexPath };
+      const fields = { cls, path: 'x.mjs', symbol: 'X', sha10: '1234567890', text: 'finding 2026-11-18 12:00:00 ET:' };
+      const request = { key: `x.mjs|X|${cls}`, expedite: cls === 'B2', needsYou: cls === 'B2' };
+      const firstLine = cardLine({ ...fields, date: '2026-11-18 12:00:00' });
+      const nextLine = cardLine({ ...fields, [field]: field === 'text' ? 'finding 2026-11-18 12:01:00 ET:' : 'abcdef1234', date: '2026-11-18 12:01:00' });
+      createAuditDeps(options).fileCard({ ...request, cardLine: firstLine });
+      createAuditDeps(options).fileCard({ ...request, cardLine: nextLine });
+      const lines = readFileSync(cardsPath, 'utf8').split('\n');
+      expect(lines.filter(line => line.startsWith('- [R1053] '))).toEqual([firstLine, nextLine]);
+      expect(lines.filter(line => line.includes('[needs-you]'))).toHaveLength(cls === 'B2' ? 1 : 0);
+      const rows = readFileSync(indexPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(rows.map(row => row.cardLineHash)).toEqual([cardHash(firstLine), cardHash(nextLine)]);
+    });
+  });
   it.each(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7'])('%s persists both lines once and dropped needs-you blocks classification', async cls => {
     await withRealRepo(async ({ root, tmp }) => {
       const cardsPath = join(tmp, 'cards.md'), indexPath = join(tmp, 'index.jsonl');
@@ -146,35 +186,6 @@ describe('R1053 base reproduction IO', () => {
       expect(createAuditDeps(options).fileCard(card)).toEqual({ written: true, expedite: true, needsYou: true });
       expect(readFileSync(cardsPath, 'utf8')).toBe(first);
       expect(readFileSync(indexPath, 'utf8').trim().split('\n')).toHaveLength(1);
-    });
-  });
-  it('a re-run whose card line differs only by its timestamp adds no second card or index row', async () => {
-    await withRealRepo(async ({ root, tmp }) => {
-      const cardsPath = join(tmp, 'cards.md'), indexPath = join(tmp, 'index.jsonl');
-      const options = { cwd: root, home: join(tmp, 'home'), cardsPath, indexPath };
-      const at = t => ({ key: 'x.mjs|X|E1', cardLine: `- [R1053] ${t} ET: pre-existing audit finding (E1) in we:x.mjs#X` });
-      expect(createAuditDeps(options).fileCard(at('10:19:35'))).toBe(true);
-      const first = readFileSync(cardsPath, 'utf8');
-      expect(createAuditDeps(options).fileCard(at('10:19:36'))).toBe(true);
-      expect(readFileSync(cardsPath, 'utf8')).toBe(first);
-      expect(readFileSync(indexPath, 'utf8').trim().split('\n')).toHaveLength(1);
-      writeFileSync(cardsPath, '');
-      expect(createAuditDeps(options).fileCard(at('10:19:37'))).toBe(true);
-      expect(readFileSync(cardsPath, 'utf8').trim().split('\n')).toHaveLength(1);
-    });
-  });
-  it('a re-audit against an advanced base rewrites the card line in place with the new base evidence', async () => {
-    await withRealRepo(async ({ root, tmp }) => {
-      const cardsPath = join(tmp, 'cards.md'), indexPath = join(tmp, 'index.jsonl');
-      const options = { cwd: root, home: join(tmp, 'home'), cardsPath, indexPath };
-      const at = (t, sha) => ({ key: 'x.mjs|X|E1', cardLine: `- [R1053] ${t} ET: pre-existing audit finding (E1) in we:x.mjs#X, reproduces on main ${sha}: x.mjs:2 weak` });
-      expect(createAuditDeps(options).fileCard(at('10:00:00', 'aaaaaaaaaa'))).toBe(true);
-      expect(createAuditDeps(options).fileCard(at('10:05:00', 'bbbbbbbbbb'))).toBe(true);
-      const lines = readFileSync(cardsPath, 'utf8').trim().split('\n');
-      expect(lines).toHaveLength(1);
-      expect(lines[0]).toContain('reproduces on main bbbbbbbbbb');
-      expect(createAuditDeps(options).fileCard(at('10:09:00', 'bbbbbbbbbb'))).toBe(true);
-      expect(readFileSync(cardsPath, 'utf8').trim().split('\n')).toEqual(lines);
     });
   });
   it.each(['success', 'timeout', 'malformed', 'add fails'])('removes detached scratch worktree in finally: %s', async kind => {

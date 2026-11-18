@@ -100,23 +100,13 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
         finally { fs.rmSync(scratch, { recursive: true, force: true }); }
       }
     },
-    fileCard({ key, cardLine: freshCardLine, expedite, needsYou }) {
+    fileCard({ key, cardLine, expedite, needsYou }) {
       const read = path => {
         try { return fs.readFileSync(path, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') throw e; return ''; }
       };
       const rows = read(indexPath).split('\n').filter(Boolean).map(l => JSON.parse(l));
       const prior = rows.findLast(r => r.key === key);
-      let contents = read(cardsPath), lines = contents.split('\n');
-      // The card line carries a timestamp: ignore it when comparing, keep the live line for an unchanged finding and base,
-      // and rewrite that line in place when the base or finding evidence changed (one card per key, never stale evidence).
-      const live = prior && lines.find(actual => cardHash(actual) === prior.cardLineHash);
-      const untimed = line => line.replace(/^(- \[R1053\]) .*? ET:/, '$1 ET:');
-      const cardLine = live && untimed(live) === untimed(freshCardLine) ? live : freshCardLine;
-      if (live && cardLine !== live) {
-        contents = lines.map(actual => (actual === live ? cardLine : actual)).join('\n');
-        fs.writeFileSync(cardsPath, contents, { encoding: 'utf8', mode: 0o600 });
-        lines = contents.split('\n');
-      }
+      const contents = read(cardsPath), lines = contents.split('\n');
       const date = new Date().toLocaleString('en-CA', { timeZone: 'America/New_York', hour12: false });
       const cls = key.split('|').at(-1);
       const security = /^B[1-7]$/.test(cls);
@@ -126,7 +116,10 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
         && line.endsWith(` ET: security pre-existing (${cls}) ${key}`);
       const needsYouLine = expedite && needsYou ? (securityLine(prior?.needsYouLine) && prior.needsYouHash === cardHash(prior.needsYouLine)
         ? prior.needsYouLine : lines.find(securityLine) || `- [R1053][needs-you] ${date} ET: security pre-existing (${cls}) ${key}`) : null;
-      const expected = [cardLine, ...(needsYouLine ? [needsYouLine] : [])];
+      // Only the generated leading date is incidental; retain the complete finding and base SHA.
+      const identity = line => line.replace(/^(- \[R1053\] )\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})? (?=ET:)/, '$1');
+      const persistedCardLine = lines.find(actual => identity(actual) === identity(cardLine)) ?? cardLine;
+      const expected = [persistedCardLine, ...(needsYouLine ? [needsYouLine] : [])];
       const missing = expected.filter(line => !lines.some(actual => cardHash(actual) === cardHash(line)));
       if (missing.length) {
         fs.mkdirSync(dirname(cardsPath), { recursive: true });
@@ -134,7 +127,7 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
       }
       const verified = read(cardsPath).split('\n');
       if (!expected.every(line => verified.some(actual => cardHash(actual) === cardHash(line)))) throw new Error('card persistence verification failed');
-      const row = { key, cardHash: cardHash(key), cardLineHash: cardHash(cardLine),
+      const row = { key, cardHash: cardHash(key), cardLineHash: cardHash(persistedCardLine),
         ...(needsYouLine ? { needsYouLine, needsYouHash: cardHash(needsYouLine) } : {}) };
       if (!missing.length && prior && Object.entries(row).every(([k, v]) => prior[k] === v)) return receipt;
       fs.mkdirSync(dirname(indexPath), { recursive: true });
