@@ -834,8 +834,8 @@ describe('x6n7c2p required checks before review — fresh dispatch boundary', ()
       readChecks: args => {
         reads.push(['checks', args]);
         if (state === 'error') throw new Error('offline');
-        return [{ name: 'test', status: 'completed', conclusion: 'success' },
-          ...(state === 'missing' ? [] : [{ name: 'daemon-soak', status: state === 'pending' ? 'in_progress' : 'completed', conclusion: state === 'red' ? 'failure' : 'success' }])];
+        return Object.defineProperty([{ name: 'test', status: 'completed', conclusion: 'success' },
+          ...(state === 'missing' ? [] : [{ name: 'daemon-soak', status: state === 'pending' ? 'in_progress' : 'completed', conclusion: state === 'red' ? 'failure' : 'success' }])], 'rowsComplete', { value: true });
       },
     });
     const out = dispatchReview({ pr: 3432, repo: 'web-everything/web-everything', root: '/repo', ciGate,

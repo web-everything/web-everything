@@ -146,7 +146,7 @@ export default {
       const sendBack = { id: 'send-back', author: { login: 'chalbert' }, createdAt: SEND_AT,
         body: `🔁 review — changes requested\n\nRecorded by chalbert via console.\n\nAt head \`${HEAD}\`: fix the export.` };
       const pr = {
-        number: 6360, state: 'OPEN', headRefName: 'lane/r618', headRefOid: HEAD,
+        number: 6360, state: 'OPEN', headRefName: 'lane/r618', rowsComplete: true, rowsHead: HEAD, headRefOid: HEAD,
         labels: ['review:human', 'advisory:changes'], mergeStateStatus: 'CLEAN',
         statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }],
         comments: [advisory(), end],

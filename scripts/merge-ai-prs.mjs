@@ -183,7 +183,7 @@ import { autoStrandedSweepPass } from './backlog-stranded-sweep.mjs'; // xvr2o8r
 import { parseEscalationReason } from './review-detail.mjs';
 import { deriveResolutionBasis, graduatedToFromBody, renderResolutionBasisBanner } from './lib/review-render.mjs'; // #2447 — the graduatedTo resolution-basis banner (presentation only; never gates)
 import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, nextLimit } from './lib/pr-snapshot.mjs';
-import { listOpenPrsPagedHydratedComplete as listOpenPrsPagedHydrated, resolvePrListPaging, parseListOutput } from './lib/pr-list-paged.mjs'; // refuses a short inventory (rows < totalCount)
+import { listOpenPrsPagedHydratedComplete as listOpenPrsPagedHydrated, resolvePrListPaging, parseListOutput, enrichPrRollupEvidence } from './lib/pr-list-paged.mjs'; // refuses a short inventory (rows < totalCount)
 import { withListRetry } from './lib/gh-list-retry.mjs'; // 504 incident 2026-11-03 — retry a transient 5xx list with backoff; a persistent failure throws + raises gh-list-failed
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
 import { resolveCardNumbering } from './lib/policy-cascade.mjs';
@@ -1078,7 +1078,8 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
       queueBlocker = `; required-checks-not-successful: ${absent.map(name => `${name} (missing)`).join(', ')}`;
       return false;
     }
-    const gate = reviewCiGate({ headSha: pr.headRefOid || '(listing head)', requiredChecks: queueRequiredChecks, checks: pr.statusCheckRollup || [] });
+    const gate = reviewCiGate({ headSha: pr.headRefOid, rowsHead: pr.rowsHead ?? null,
+      rowsComplete: pr.rowsComplete === true, requiredChecks: queueRequiredChecks, checks: pr.statusCheckRollup || [] });
     if (!gate.allowed) {
       queueBlocker = `; ${gate.reason}${gate.affected.length ? `: ${gate.affected.map(({ name, reason }) => `${name} (${reason})`).join(', ')}` : ''}`;
       return false;
@@ -5104,7 +5105,10 @@ async function runCli() {
       },
     });
   };
-  const resolveListedChecks = (repo, prs) => mapWithConcurrency(prs, resolvedMergePolicy.policy.concurrency.gateReads, (pr) => resolveChecks(repo, pr));
+  const resolveListedChecks = (repo, prs) => {
+    enrichPrRollupEvidence({ repo, rows: prs.filter(pr => pr.rowsComplete !== true || pr.rowsHead !== pr.headRefOid), exec: execFileSyncThrottled });
+    return mapWithConcurrency(prs, resolvedMergePolicy.policy.concurrency.gateReads, (pr) => resolveChecks(repo, pr));
+  };
   const fetchFreshPrForRevalidation = async (repo, num, fields = null) => {
     try {
       const { stdout: raw } = await execFileP('gh', ['pr', 'view', String(num), ...repoFlag(repo),
@@ -5114,6 +5118,7 @@ async function runCli() {
       if (!data || (!fields && data.number !== num)) return null;
       // The nudge's partial response has no identity-bound evidence for state updates.
       if (fields) return data;
+      enrichPrRollupEvidence({ repo, rows: [data], exec: execFileSyncThrottled });
       const pruned = pruneStuckUnknown(stuckUnknownMarks, { prs: [{ ...data, repo: repo || localSlug, num }] });
       updateStuckUnknown(pruned);
       attachLiveFixClaim(data, { claimKey: repoKeyForSlug(repo ?? localSlug), readClaim: readLiveFixClaim });
@@ -5588,6 +5593,7 @@ async function runCli() {
         const { stdout } = await execFileP('gh', ['pr', 'view', String(onlyPr), ...repoFlag(null), '--json',
           'number,headRefOid,labels,statusCheckRollup,state,isDraft,body,baseRefName,reviewDecision,mergeable,mergeStateStatus'], { encoding: 'utf8' });
         const pr = JSON.parse(stdout);
+        enrichPrRollupEvidence({ repo: localSlug, rows: [pr], exec: execFileSyncThrottled });
         // The cache is re-read inside enqueuePrestage, so a concurrently written entry may be unchecked here. Out of
         // scope is not stale: throwing falls back without dropping it (a null read would invalidate it).
         if (!operatorSelects(pr)) throw new Error('PR outside this run\'s --label/--base selection');

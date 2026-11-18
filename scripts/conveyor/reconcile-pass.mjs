@@ -1537,6 +1537,22 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch })
   const stackedPolicy = readStackedPrCheckPolicy();
   for (const pr of prs) {
     const runs = Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup : [];
+    // GraphQL rollups carry no attempt lineage. Re-read duplicate names through
+    // the same validated, exact-head REST producer used by review admission.
+    const names = runs.map(row => row?.name ?? row?.context);
+    if (readChecks === defaultReadChecks && new Set(names).size !== names.length) {
+      const key = `${repo}/${pr.headRefOid}/attempts`;
+      try {
+        if (!cache.has(key)) cache.set(key, readReviewChecks({ repo, headSha: pr.headRefOid }));
+        const rows = cache.get(key);
+        ready.push({ ...pr, statusCheckRollup: rows, rowsHead: pr.headRefOid, rowsComplete: rows.rowsComplete === true });
+      } catch (error) {
+        ready.push({ ...pr, rowsComplete: false });
+        refusals.push({ kind: 'check-read-failed', prNumber: pr.number, headRefOid: pr.headRefOid,
+          why: `rerun evidence unreadable; inspect Actions jobs before retrying review: ${String(error?.message ?? error)}` });
+      }
+      continue;
+    }
     const missing = withoutImpliedRequiredChecks(requiredChecks ?? [], runs).filter(name => !runs.some(run => run?.name === name));
     if (runs.length < 100 && !missing.length) { ready.push(pr); continue; }
     if (stackedPolicy === 'await-base' && isStackedPr(pr, defaultBranch)

@@ -488,6 +488,7 @@ fs.writeFileSync('state.json', JSON.stringify(s));
         const { planReconcile } = await import('../reconcile-core.mjs');
         const commits = [{ messageHeadline: 'heal', authors: [{ name: 'Claude' }] }];
         const plan = planReconcile({ reviewTiming: { startAfter: 'ci-green' }, requiredChecks: ['gate'], prs: [{ ...final, number: 3239, commits,
+          rowsHead: final.headRefOid, rowsComplete: true,
           statusCheckRollup: [{ name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS' }] }] });
         expect(plan.dispatch).toContainEqual(expect.objectContaining({ kind: 'review' }));
         console.info('xe8y12n synthetic completion proof', JSON.stringify({ pushedSha: healHead, content: scenario.file,

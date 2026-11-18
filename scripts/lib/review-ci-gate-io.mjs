@@ -8,6 +8,7 @@ import { getRequiredStatusChecks } from './required-status-checks.mjs';
 import { excuseMergeGateRows, latestFailingMergeGate, loadMergeGateHoldSetting, readMergeGateVerdict as defaultReadMergeGateVerdict } from './merge-gate-hold-class.mjs';
 import { readSharedFreeze } from './red-main-freeze-shared.mjs';
 import { reviewCiGate } from './review-ci-gate.mjs';
+import { ACTIONS_JOB_SLOT } from './check-state-predicate.mjs';
 
 const MAX_STALE_CACHE_AGE_MS = 24 * 60 * 60_000;
 
@@ -20,7 +21,7 @@ export const readReviewHeadAndLabels = ({ repo, pr, run = gh }) => JSON.parse(ru
 function bindReviewReruns(checks, { repo, headSha, run }) {
   const counts = new Map(), jobs = new Map();
   for (const check of checks) counts.set(check?.name, (counts.get(check?.name) ?? 0) + 1);
-  return checks.map(check => {
+  const bound = checks.map(check => {
     // Only the job endpoint can establish workflow identity, never fields in a check feed.
     const { run_id: ignoredRun, run_attempt: ignoredAttempt, ...row } = check;
     if (counts.get(row.name) < 2 || row.app?.slug !== 'github-actions') return row;
@@ -39,6 +40,37 @@ function bindReviewReruns(checks, { repo, headSha, run }) {
       || !positive(job.run_attempt)) return unavailable();
     return { ...row, run_id: job.run_id, run_attempt: job.run_attempt };
   });
+  const attempts = new Map();
+  for (const row of bound) {
+    if (!row.run_id) continue;
+    const key = `${row.run_id}/${row.run_attempt}`;
+    if (!attempts.has(key)) {
+      if (jobs.size + attempts.size >= 20) throw new Error('rerun lineage exceeds 20 job reads; inspect Actions reruns before retrying review');
+      const page = JSON.parse(run(['api',
+        `repos/${repo}/actions/runs/${row.run_id}/attempts/${row.run_attempt}/jobs?per_page=100`]));
+      const list = page?.jobs;
+      // One bounded page proves the whole inventory only when its count agrees.
+      // Larger workflows need operator inspection, never an unbudgeted pagination loop.
+      if (!Array.isArray(list) || !Number.isSafeInteger(page.total_count) || list.length > 100
+        || page.total_count !== list.length || list.some(job => !job || job.run_id !== row.run_id
+          || job.run_attempt !== row.run_attempt || job.head_sha !== headSha)) {
+        throw new Error('rerun job inventory unavailable; inspect Actions jobs before retrying review');
+      }
+      attempts.set(key, list);
+    }
+    const list = attempts.get(key), same = list.filter(job => job.name === row.name);
+    const job = jobs.get(String(/\/job\/(\d+)$/.exec(row.details_url)?.[1]));
+    if (!list.some(entry => entry.id === job.id && entry.name === job.name && entry.check_run_url === job.check_run_url)) {
+      throw new Error('rerun job inventory mismatch; inspect Actions jobs before retrying review');
+    }
+    if (same.length === 1) row[ACTIONS_JOB_SLOT] = row.name;
+  }
+  // A singleton rerun cannot erase an ambiguous matrix name in an earlier attempt.
+  for (const row of bound) {
+    if (row[ACTIONS_JOB_SLOT] && bound.some(other => other.run_id === row.run_id && other.name === row.name
+      && other[ACTIONS_JOB_SLOT] !== row.name)) delete row[ACTIONS_JOB_SLOT];
+  }
+  return bound;
 }
 /**
  * Every check run PLUS every legacy commit status (`{context, state, target_url}`) for the SHA: a required context may be

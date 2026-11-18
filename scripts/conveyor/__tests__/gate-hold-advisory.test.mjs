@@ -16,7 +16,7 @@ const advisory = (head, hour = 9, author = BOT) => ({ author, createdAt: at(hour
 });
 function pr(comments = [advisory(OLD)], overrides = {}) {
   return {
-    number: 4764, headRefName: 'lane/4764', headRefOid: HEAD, baseRefName: 'main', isDraft: false,
+    number: 4764, headRefName: 'lane/4764', rowsComplete: true, rowsHead: HEAD, headRefOid: HEAD, baseRefName: 'main', isDraft: false,
     createdAt: at(0), files: [{ path: 'src/a.mjs' }],
     labels: ['review:changes', 'review:human', 'advisory:accepted', 'review-round:7', 'status:fixing'].map(name => ({ name })),
     statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', headSha: HEAD }],

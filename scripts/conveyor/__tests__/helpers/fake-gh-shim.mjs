@@ -444,9 +444,36 @@ function handleLabelCreate(store, rest) {
 // `gh api` — REST-shaped (snake_case), matched by path against the endpoints this fixture supports.
 // -------------------------------------------------------------------------------------------------------
 
+function commitCheckView(view) {
+  const rows = view.statusCheckRollup ?? [];
+  return { oid: view.headRefOid, statusCheckRollup: { contexts: {
+    totalCount: rows.length, pageInfo: { hasNextPage: rows.length > 100 }, nodes: rows.slice(0, 100),
+  } } };
+}
+
+function actionsJobs(repoState, slug) {
+  return Object.values(repoState.prs ?? {}).flatMap(pr => (pr.checks ?? []).filter(c => c.actions).map(c => ({
+    id: c.actions.jobId, run_id: c.actions.runId, run_attempt: c.actions.attempt,
+    head_sha: resolveDiffOids(repoState, pr).headOid, name: c.name,
+    check_run_url: `https://api.github.com/repos/${slug}/check-runs/${c.actions.checkRunId}`,
+  })));
+}
+
 function handleOpenPrPage(store, rest) {
   const fields = [...flagValues(rest, '-f'), ...flagValues(rest, '-F')];
   const query = fields.find(v => v?.startsWith('query='))?.slice(6);
+  if (query?.startsWith('query($owner:String!,$name:String!){repository(owner:$owner,name:$name){h0:object')) {
+    const value = key => fields.find(v => v.startsWith(`${key}=`))?.slice(key.length + 1);
+    const repo = value('owner') === '{owner}' ? resolveRepoSlug(store, null) : `${value('owner')}/${value('name')}`;
+    const repoState = requireRepo(store, repo), result = {};
+    for (const [, alias, sha] of query.matchAll(/(h\d+):object\(oid:"([a-f0-9]{40})"\)/g)) {
+      const pr = Object.values(repoState.prs ?? {}).find(p => resolveDiffOids(repoState, p).headOid === sha);
+      result[alias] = pr ? commitCheckView(buildPrGraphqlView(repoState, pr, {
+        originPath: repoState.originPath, callerActor: ACTOR, fields: ['headRefOid', 'statusCheckRollup'],
+      })) : null;
+    }
+    return jsonResult({ data: { repository: result } });
+  }
   const countQuery = GH_ARGV.readCommentsTotalCount('owner/repo', 1).find(v => v.startsWith('query=')).slice(6);
   if (query === countQuery) {
     const value = key => fields.find(v => v.startsWith(`${key}=`))?.slice(key.length + 1);
@@ -468,7 +495,7 @@ function handleOpenPrPage(store, rest) {
   const nodes = prs.slice(offset, offset + pageSize).map(pr => {
     const view = buildPrGraphqlView(repoState, pr, { originPath: repoState.originPath, callerActor: ACTOR, fields: PAGED_LIGHT_FIELDS });
     const { labels, statusCheckRollup, ...light } = pickFields(view, PAGED_LIGHT_FIELDS.join(','));
-    return { ...light, labels: { nodes: labels }, commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: statusCheckRollup } } } }] } };
+    return { ...light, labels: { nodes: labels }, commits: { nodes: [{ commit: commitCheckView(view) }] } };
   });
   return jsonResult({ data: { repository: { pullRequests: { nodes, totalCount: prs.length,
     pageInfo: { hasNextPage: offset + nodes.length < prs.length, endCursor: nodes.length ? `fake-pr-page:${offset + nodes.length}` : null } } } } });
@@ -493,6 +520,17 @@ function handleApi(store, rest) {
     if (path === 'graphql') return handleOpenPrPage(store, rest);
 
     let m;
+    if ((m = path.match(/^repos\/([^/]+)\/([^/]+)\/actions\/jobs\/(\d+)$/))) {
+      const slug = `${m[1]}/${m[2]}`;
+      const job = actionsJobs(requireRepo(store, slug), slug).find(job => job.id === Number(m[3]));
+      return job ? jsonResult(job, jq) : { stderr: 'fake-gh: Actions job unavailable\n', exitCode: 1 };
+    }
+    if ((m = path.match(/^repos\/([^/]+)\/([^/]+)\/actions\/runs\/(\d+)\/attempts\/(\d+)\/jobs(?:\?.*)?$/))) {
+      const slug = `${m[1]}/${m[2]}`;
+      const jobs = actionsJobs(requireRepo(store, slug), slug).filter(job => job.run_id === Number(m[3]) && job.run_attempt === Number(m[4]));
+      const page = { total_count: jobs.length, jobs };
+      return jsonResult(hasFlag(rest, '--slurp') ? [page] : page, jq);
+    }
     if ((m = path.match(/^repos\/([^/]+)\/([^/]+)$/))) {
       const slug = `${m[1]}/${m[2]}`;
       const repoState = requireRepo(store, slug);
@@ -571,8 +609,10 @@ function handleApi(store, rest) {
       // Real GitHub always returns a numeric run `id`, and `reconcile-pass.mjs#hydrateChecks` rejects rows without
       // one as malformed — so the simulator numbers each check by its position on the PR (stable per head).
       const runs = (pr.checks ?? []).map((c, index) => ({ c, id: index + 1 })).filter(({ c }) => !checkName || c.name === checkName).map(({ c, id }) => ({
-        id, name: c.name, status: String(c.status).toLowerCase(), conclusion: c.conclusion ? String(c.conclusion).toLowerCase() : null,
+        id: c.actions?.checkRunId ?? id, name: c.name, status: String(c.status).toLowerCase(), conclusion: c.conclusion ? String(c.conclusion).toLowerCase() : null,
         started_at: c.startedAt, completed_at: c.completedAt, head_sha: sha,
+        ...(c.actions ? { app: { slug: 'github-actions' },
+          details_url: `https://github.com/${slug}/actions/runs/${c.actions.runId}/job/${c.actions.jobId}` } : {}),
       }));
       const page = { total_count: runs.length, check_runs: runs };
       // `--paginate --slurp` wraps every page in one array (this fixture answers a single page).

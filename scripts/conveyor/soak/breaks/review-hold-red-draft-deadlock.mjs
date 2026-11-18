@@ -36,7 +36,7 @@ export default {
       row('review-gate', 'failure'),
     ];
     const pr = { number: 5874, state: 'OPEN', isDraft: true, isCrossRepository: false,
-      headRefName: 'lane/review-hold-red-draft', headRefOid: HEAD, baseRefName: 'main',
+      headRefName: 'lane/review-hold-red-draft', rowsComplete: true, rowsHead: HEAD, headRefOid: HEAD, baseRefName: 'main',
       labels: ['review:pending'], comments: [], mergeStateStatus: 'CLEAN' };
     for (const [name, statusCheckRollup, expected] of [
       ['annotated merge-gate and review-gate red', heldRollup(), true],
@@ -81,7 +81,7 @@ export default {
           env: { WE_REVIEW_START_AFTER: 'fast-checks' },
           advisoryCiWaiver: review?.advisoryReview?.ciWaived === true ? { head: review.advisoryReview.head, reason: review.advisoryReview.reason } : null,
           ciGate: args => readReviewCiGate({ ...args, readHead: () => HEAD,
-            readRequired: () => ({ source: 'live', checks: requiredChecks }), readChecks: () => statusCheckRollup }),
+            readRequired: () => ({ source: 'live', checks: requiredChecks }), readChecks: () => Object.assign([...statusCheckRollup], { rowsComplete: true }) }),
           checkoutExists: () => true, checkStaleness: () => ({ fresh: true, behind: 0 }), stackCheck: () => ({ base: null }),
           readCompletion: () => null, resolveSettingsEnv: () => ({}),
           readBrief: () => 'review {{PR}}', mintSessionId: () => 'soak-review-hold-advisory',

@@ -89,6 +89,7 @@ import { markWorkerEnv } from '../operations/session-role.mjs';
 // like any other worker, so it gets the same treatment as every other spawn site.
 import { sanitizeSpawnEnv } from './gh-app-shim.mjs';
 import { quotaHoldRow } from './provider-quota-hold.mjs';
+import { acceptJurorStream } from './accept-juror-stream.mjs';
 
 /**
  * Are these two paths the SAME DIRECTORY? By inode + device, never by comparing the strings.
@@ -693,8 +694,10 @@ function markQuotaFailure(error, text) {
   // Only a parsed CLI failure result is evidence; raw streams may contain incidental logs.
   const holdRow = quotaHoldRow({ provider: 'claude', error: text });
   if (holdRow) {
-    Object.assign(error, { quota: true, holdRow,
-      telemetry: { ...error.telemetry, failureKind: 'provider-quota', failureText: text.slice(0, 500) } });
+    Object.assign(error, { quota: true, holdRow, quotaOnly: false,
+      otherFailures: ['complete stream and process evidence unavailable'],
+      telemetry: { ...error.telemetry, failureKind: 'provider-quota', failureText: text.slice(0, 500),
+        quotaOnly: false, otherFailures: ['complete stream and process evidence unavailable'] } });
   }
   return error;
 }
@@ -714,11 +717,13 @@ function markQuotaFailure(error, text) {
  * @param {string} stdout - the CLI's raw stdout.
  * @param {string} [stderr] - the CLI's stderr, folded into the message when stdout is unparseable.
  * @param {number|null} [budget] - the `--max-budget-usd` this spawn declared, so a budget kill can name it.
+ * @param {object} [processOutcome] - exit code, signal and timeout evidence; required for quotaOnly.
  * @returns {{value: object, sessionId: string, costUsd: number, durationMs: number, numTurns: number,
  *            stopReason: string, usage: object}}
  * @throws {JudgeBudgetError} when the juror was terminated by that ceiling.
  */
-export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
+export function parseJudgeOutcome(stdout, stderr = '', budget = null, processOutcome = {}) {
+  const quotaEvidence = acceptJurorStream(stdout, stderr, processOutcome);
   let parsed;
   try {
     parsed = JSON.parse(String(stdout));
@@ -728,13 +733,13 @@ export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
       try {
         const candidate = JSON.parse(line);
         if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)
-          && ('session_id' in candidate || 'structured_output' in candidate || 'is_error' in candidate || candidate.type === 'result')) {
+          && ('session_id' in candidate || 'structured_output' in candidate || 'is_error' in candidate || candidate.type === 'result' || candidate.type === 'error')) {
           parsed = candidate;
           break;
         }
       } catch { /* stray stdout lines are not result objects */ }
     }
-    if (parsed === undefined) {
+    if (parsed === undefined && !quotaEvidence) {
       const tail = String(stderr).trim().slice(-600);
       const err = new Error(
         `judge-spawn: the juror did not emit parseable JSON on stdout.\n` +
@@ -744,6 +749,14 @@ export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
       err.unparseableStdout = true;
       throw err;
     }
+  }
+
+  if (quotaEvidence && !(parsed?.is_error && parsed.stop_reason === 'tool_use' && budget !== null)) {
+    const error = markQuotaFailure(new Error(`judge-spawn: the juror failed: ${quotaEvidence.text}`), quotaEvidence.text);
+    Object.assign(error, { quotaOnly: quotaEvidence.quotaOnly, otherFailures: quotaEvidence.otherFailures });
+    Object.assign(error.telemetry, { quotaOnly: error.quotaOnly, otherFailures: error.otherFailures,
+      exitCode: processOutcome.code ?? null, signal: processOutcome.signal ?? null });
+    throw error;
   }
 
   if (parsed?.is_error) {
@@ -975,14 +988,18 @@ export async function judgeSpawn({
     // happened, because "hit the bound" and "crashed" are different facts about a review.
     if (timedOut) {
       let outcome = null;
-      try { outcome = parseJudgeOutcome(stdout, stderr, budget); } catch { outcome = null; }
+      try { outcome = parseJudgeOutcome(stdout, stderr, budget, { code, signal, timedOut }); } catch (error) {
+        if (error.quota) throw error;
+        outcome = null;
+      }
       if (!outcome) throw new JudgeTimeoutError({ timeoutMs, wallMs, stdout, stderr });
       return { ...outcome, wallMs, attempts: attempt, failedAttempts, timedOut: true, loadedContextTokens: loadedContextTokens(outcome.usage), argv };
     }
     // `parseJudgeOutcome` throws with the CLI's own words; a non-zero exit with unparseable stdout lands there too.
     let outcome;
     try {
-      outcome = parseJudgeOutcome(stdout, stderr || (code === 0 ? '' : `exit code ${code}`), budget);
+      outcome = parseJudgeOutcome(stdout, stderr || (code === 0 ? '' : `exit code ${code}`), budget,
+        { code, signal, timedOut });
     } catch (error) {
       if (error.unparseableStdout !== true) throw error;
       failedAttempts.push({

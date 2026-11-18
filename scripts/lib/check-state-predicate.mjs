@@ -136,6 +136,11 @@ const evidenceInteger = value => typeof value === 'number'
 const evidenceName = row => row?.name ?? row?.context;
 const evidenceJob = row => /\/actions\/runs\/\d+\/job\/(\d+)/.exec(row?.detailsUrl ?? row?.details_url ?? '')?.[1];
 
+// In-process producer proof only: JSON check feeds and persisted snapshots cannot forge it.
+// The REST reader binds this after exhausting each attempt's job inventory and proving
+// exactly one job has this name. Job IDs themselves change across Actions reruns.
+export const ACTIONS_JOB_SLOT = Symbol('validated-actions-job-slot');
+
 // Completed is a lifecycle marker, not an outcome. Compare only explicit
 // outcome categories, before legacy mapping or hold excusal rewrites evidence.
 const contradictoryEvidence = row => {
@@ -149,9 +154,10 @@ const contradictoryEvidence = row => {
   return new Set(outcomes).size > 1;
 };
 
-// A name/run pair alone cannot identify a matrix job. Prefer the Actions job
-// identity; otherwise require the same check-run identity, never infer lineage.
+// A name/run pair alone cannot identify a matrix job. Accept a name only with
+// producer-bound inventory proof; otherwise require the same job/check identity.
 const evidenceIdentity = row => {
+  if (row?.[ACTIONS_JOB_SLOT] && row[ACTIONS_JOB_SLOT] === evidenceName(row)) return `slot:${row[ACTIONS_JOB_SLOT]}`;
   const job = evidenceInteger(evidenceJob(row));
   if (job !== null) return `job:${job}`;
   const check = evidenceInteger(row?.check_run_id ?? row?.databaseId ?? row?.id);

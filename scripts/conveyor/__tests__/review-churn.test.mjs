@@ -14,7 +14,7 @@ const accept = (head, h) => ({ author: BOT, createdAt: at(h), body: `✅ review 
 const rearm = (h) => ({ author: BOT, createdAt: at(h), body: `${REARM_COMMENT_MARKER}\n\nrepaired` });
 const SET = (o = {}) => ({ sameTree: 'shadow', capMode: 'on', maxLoopsPerPr: 3, ...o });
 const mkPr = (comments, head, churn) => ({
-  number: 7, headRefName: 'lane/x-thing', headRefOid: head, baseRefName: 'main', isDraft: false, createdAt: at(0),
+  number: 7, headRefName: 'lane/x-thing', rowsComplete: true, rowsHead: head, headRefOid: head, baseRefName: 'main', isDraft: false, createdAt: at(0),
   labels: [{ name: 'review:pending' }], files: [{ path: 'src/a.mjs' }],
   statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', headSha: head }],
   comments, ...(churn ? { reviewChurn: churn } : {}),

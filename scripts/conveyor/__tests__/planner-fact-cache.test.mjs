@@ -18,7 +18,7 @@ const START = Date.parse('2026-10-01T00:00:00Z');
 const HOUR = 60 * 60 * 1000;
 const fact = (overrides = {}) => ({
   repo: REPO, number: 5, state: 'OPEN',
-  headRefName: 'lane/fact-cache', headRefOid: 'a'.repeat(40),
+  headRefName: 'lane/fact-cache', rowsComplete: true, rowsHead: 'a'.repeat(40), headRefOid: 'a'.repeat(40),
   baseRefName: 'main', baseSha: 'b'.repeat(40),
   labels: [{ name: 'checking' }, { name: 'automation' }],
   mergeStateStatus: 'CLEAN', comments: [],
@@ -416,6 +416,12 @@ describe('defaultReadPrs shadow wiring contract (round 2)', () => {
     let listing = fact({ labels: [], comments });
     const exec = vi.fn((file, args) => {
       expect(file).toBe('gh');
+      if (args[0] === 'api') {
+        expect(args.slice(0, 2)).toEqual(['api', 'graphql']);
+        return JSON.stringify({ data: { repository: { h0: { oid: listing.headRefOid, statusCheckRollup: { contexts: {
+          nodes: listing.statusCheckRollup.map(row => ({ __typename: 'CheckRun', ...row })), totalCount: listing.statusCheckRollup.length, pageInfo: { hasNextPage: false },
+        } } } } } });
+      }
       expect(args.slice(0, 2)).toEqual(['pr', 'list']);
       return JSON.stringify([listing]);
     });
@@ -438,7 +444,8 @@ describe('defaultReadPrs shadow wiring contract (round 2)', () => {
     f.compare.mockClear();
     const second = f.read();
     expect(second).toEqual(first);
-    expect(f.exec).toHaveBeenCalledTimes(2);
+    expect(f.exec.mock.calls.filter(([, args]) => args[0] === 'pr')).toHaveLength(2);
+    expect(f.exec.mock.calls.filter(([, args]) => args[0] === 'api')).toHaveLength(2);
     expect(f.readCommits).toHaveBeenCalledTimes(2);
     expect(f.readComments).toHaveBeenCalledTimes(2);
     expect(f.lookup.mock.results.some(result => result.type === 'return' && result.value !== null)).toBe(true);

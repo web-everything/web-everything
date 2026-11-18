@@ -33,8 +33,10 @@ export function prestageCi(pr, requiredChecks) {
   if (!Array.isArray(requiredChecks) || !requiredChecks.length || !Array.isArray(pr?.statusCheckRollup)) return 'unknown';
   const rows = pr.statusCheckRollup;
   if (requiredChecks.some(name => !rows.some(row => (row?.name ?? row?.context) === name))) return 'unknown';
-  const g = reviewCiGate({ headSha: pr.headRefOid, requiredChecks, checks: rows });
+  const g = reviewCiGate({ headSha: pr.headRefOid, rowsHead: pr.rowsHead ?? null,
+    rowsComplete: pr.rowsComplete === true, requiredChecks, checks: rows });
   if (g.allowed) return 'green';
+  if (g.unknown) return 'unknown';
   if (g.affected.length && g.affected.every(a => a.reason === 'pending')) return 'pending';
   return 'red';
 }

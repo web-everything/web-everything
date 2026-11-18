@@ -53,7 +53,7 @@ function run({ id = 'review-pr-parked', time = at, failure = false, attempted = 
   return r;
 }
 // `body` / `createdAt` are what `gh pr list` returns; the live release reads them exactly as the gate does.
-const pr = (overrides = {}) => ({ number: 3481, headRefOid: head, headRefName: 'lane/referrals',
+const pr = (overrides = {}) => ({ number: 3481, rowsComplete: true, rowsHead: head, headRefOid: head, headRefName: 'lane/referrals',
   body: '<!-- authored-by-actor: author -->', createdAt: iso(at - 3_600_000),
   labels: [{ name: 'review:human' }], comments: [], mergeStateStatus: 'CLEAN',
   statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }], ...overrides });
@@ -246,7 +246,7 @@ describe('attempted mandatory referrals', () => {
     const r = record();
     r.rulings.push({ id: 'r1', key, reviewerId: r.reviewer.id, lens: 'correctness', result: 'not-real', rationale: 'checked', evidence: ['diff'] });
     const changes = {
-      push: { headRefOid: 'b'.repeat(40) },
+      push: { headRefOid: 'b'.repeat(40), rowsHead: 'b'.repeat(40) },
       ruling: { comments: [comment(renderReferralRecord(r))] },
       'operator reply': { comments: [comment('Please try again; I answered the referral.', at + 1, 'chalbert')] },
       'send-back': { comments: [comment('🔁 review — changes requested\nFix this.')] },

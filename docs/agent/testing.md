@@ -4409,6 +4409,23 @@ yield/correction path for concurrent held runs, including another policy-clear w
 
 ## Red-team gate catch-up regressions
 
+Required-check snapshots must carry `rowsHead` and explicit `rowsComplete` proof
+through drain preparation, queue recovery, and manual landing as well as review.
+Fixture PRs that model a complete read must declare both fields; missing, stale,
+or truncated evidence remains unknown. The fake GitHub service supplies commit
+OIDs, context counts, and pagination flags, including the 100-context boundary.
+
+Actions reruns receive new job IDs. The review reader validates each job against
+its check run, repository, head, and workflow attempt, then exhausts the attempt's
+job inventory before binding a unique job name across attempts. Same-name matrix
+jobs remain independent. Each attempt is limited to 100 jobs with matching count
+proof; the combined job and attempt-inventory lookup budget is 20. Unavailable or
+oversized lineage refuses review with an instruction to inspect
+Actions jobs. The identity proof stays in process: serializing the rows loses it
+and requires a fresh read. `review-ci-completeness.test.mjs` covers rerun success,
+matrix ambiguity, incomplete inventories, and serialization; `fake-gh-state.test.mjs`
+exercises the producer through real subprocesses.
+
 `scripts/lib/red-team-gate-catchup.test.mjs` pins send-back-only retry nomination,
 including sent-back records and round-cap reopening. Card-only plans stay with the
 in-job path, including failed card records. Its co-located path is explicitly included

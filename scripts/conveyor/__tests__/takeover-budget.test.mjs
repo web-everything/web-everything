@@ -47,7 +47,7 @@ const rounds5 = [rearm(1), rearm(2), rearm(3), rearm(4), rearm(5), review(R5, 6,
 
 function pr(head, comments, over = {}) {
   return {
-    number: 7, headRefName: 'lane/x-thing', headRefOid: head, baseRefName: 'main', isDraft: false, createdAt: at(0),
+    number: 7, headRefName: 'lane/x-thing', rowsComplete: true, rowsHead: head, headRefOid: head, baseRefName: 'main', isDraft: false, createdAt: at(0),
     labels: [{ name: 'review:changes' }], files: [{ path: 'src/a.mjs' }],
     statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', headSha: head }],
     comments, ...over,

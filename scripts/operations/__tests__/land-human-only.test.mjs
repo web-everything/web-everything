@@ -22,6 +22,12 @@ import { evaluatePrGates } from '../../lib/merge-gate-ci.mjs';
 import { readDrainAcceptance } from '../../merge-ai-prs.mjs';
 
 const head = 'a'.repeat(40);
+const checkReply = (live, complete = true) => JSON.stringify({ data: { repository: { h0: {
+  oid: live.headRefOid, statusCheckRollup: { contexts: {
+    totalCount: live.statusCheckRollup.length, pageInfo: { hasNextPage: !complete },
+    nodes: live.statusCheckRollup.map(row => ({ __typename: 'CheckRun', ...row })),
+  } },
+} } } });
 const repo = 'o/r';
 
 function read(over = {}) {
@@ -464,13 +470,14 @@ describe('land-human-only — the reader', () => {
     expect(() => planLandHumanOnly(context, input())).toThrow(/change list unreadable/);
   });
 
-  async function runWithCeremony(clearedHead) {
+  async function runWithCeremony(clearedHead, complete = true) {
     const live = { number: 7, state: 'OPEN', isDraft: false, baseRefName: 'main', headRefOid: head,
       body: 'Land the approved workflow update.', title: 'Workflow update', headRefName: 'lane/workflow',
       labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }], commits: [],
       mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', id: 'PR_node',
       statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
     const exec = (_bin, args) => {
+      if (args[0] === 'api' && args[1] === 'graphql') return checkReply(live, complete);
       if (args[0] === 'pr') return JSON.stringify(live);
       if (args[0] === 'repo') return JSON.stringify({ defaultBranchRef: { name: 'main' } });
       if (args.join(' ').includes('isInMergeQueue')) return JSON.stringify({ data: { repository: {
@@ -520,6 +527,12 @@ describe('land-human-only — the reader', () => {
     expect(outcome.stopped).toBe('complete');
     expect(write).toHaveBeenCalledTimes(1);
   });
+  it('refuses an approved ceremony when the exact-head check connection is incomplete', async () => {
+    const { outcome, write } = await runWithCeremony(head, false);
+    expect(outcome.error).not.toBeNull();
+    expect(outcome.run.effects).toEqual([]);
+    expect(write).not.toHaveBeenCalled();
+  });
 
   it('refuses a missing clear-human ceremony with no write effects', async () => {
     const { outcome, write } = await runWithCeremony(null);
@@ -545,6 +558,7 @@ describe('land-human-only — the reader', () => {
       statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
     const exec = (bin, args) => {
       const a = args.join(' ');
+      if (args[0] === 'api' && args[1] === 'graphql') return checkReply(live);
       if (a.startsWith('pr view')) return JSON.stringify(live);
       if (a.startsWith('repo view')) return JSON.stringify({ defaultBranchRef: { name: 'main' } });
       if (a.includes('isInMergeQueue')) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: false, headRefOid: head } } } });

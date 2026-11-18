@@ -97,9 +97,9 @@ export default {
         // Every other required check is derived from the fallback set, so a change to that set cannot leave one
         // of them missing from the rollup (a missing required check reads as not-green, never needs-review).
         w.gh.setChecks('we', pr, [
-          { name: 'test', conclusion: 'FAILURE' }, // stale — superseded below
+          { name: 'test', conclusion: 'FAILURE', actions: { runId: 700, attempt: 1, jobId: 110, checkRunId: 10 } }, // stale — superseded below
           ...FALLBACK_REQUIRED_STATUS_CHECKS.filter((name) => name !== 'test').map((name) => ({ name, conclusion: 'SUCCESS' })),
-          { name: 'test', conclusion: 'SUCCESS' }, // the LATEST run of `test` — this is the one that counts
+          { name: 'test', conclusion: 'SUCCESS', actions: { runId: 700, attempt: 2, jobId: 111, checkRunId: 11 } }, // the LATEST run of `test` — this is the one that counts
         ]);
         return { pr, healSeen: false, reviewSeen: false };
       },

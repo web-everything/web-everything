@@ -474,6 +474,7 @@ export function setChecksPure(repoState, number, checks = []) {
     conclusion: c.conclusion || 'SUCCESS',
     startedAt: c.startedAt || now,
     completedAt: c.completedAt || now,
+    ...(c.actions ? { actions: { ...c.actions } } : {}),
   }));
   return pr;
 }

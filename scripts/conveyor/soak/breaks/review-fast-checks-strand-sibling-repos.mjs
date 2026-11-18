@@ -24,7 +24,7 @@ export default {
     const { CONSTELLATION_REPOS } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/constellation-repos.mjs')).href);
     for (const [repo, published] of [['frontierui', ['test']], ['plateau-app', ['test', 'e2e']]]) {
       const slug = CONSTELLATION_REPOS[repo].slug;
-      const pr = { number: 9, state: 'OPEN', headRefOid: head, headRefName: 'lane/xabc-test',
+      const pr = { number: 9, state: 'OPEN', rowsComplete: true, rowsHead: head, headRefOid: head, headRefName: 'lane/xabc-test',
         labels: [{ name: 'review:pending' }], comments: [], files: [{ path: 'src/example.ts' }],
         statusCheckRollup: published.map(check) };
       const plan = planReconcile({ repo, prs: [pr], requiredChecks: published, now, reviewTiming: REVIEW_TIMING_DEFAULTS });
@@ -32,7 +32,7 @@ export default {
       log?.(`planReconcile ${repo}: ${kinds.join(',') || 'none'}`);
       if (!kinds.includes('review')) violations.push(`${repo}: green required CI but planReconcile dispatched ${kinds.join(',') || 'nothing'}`);
       const gate = readReviewCiGate({ repo: slug, pr: 9, readHead: () => head,
-        readChecks: () => published.map(name => ({ name, status: 'completed', conclusion: 'success', head_sha: head })),
+        readChecks: () => Object.assign(published.map(name => ({ name, status: 'completed', conclusion: 'success', head_sha: head })), { rowsComplete: true }),
         readRequired: () => ({ source: 'declared', checks: published }), policy: REVIEW_TIMING_DEFAULTS });
       log?.(`readReviewCiGate ${slug}: ${gate.allowed ? 'allowed' : gate.reason}`);
       if (!gate.allowed) violations.push(`${slug}: green required CI but readReviewCiGate refused (${gate.reason})`);
