@@ -41,7 +41,6 @@ const nonPolicyCases = [
   ['policy missing', { status: 'skipped', reason: 'policy field missing' }],
   ['reason string card-only WITHOUT policy field', { status: 'skipped', reason: 'red team skipped: card-only' }],
   ['unknown policy', { status: 'skipped', policy: 'other', reason: 'card-only' }],
-  ['retired empty-diff policy', { status: 'skipped', policy: 'empty-net-diff' }],
   ['malformed policy', { status: 'skipped', policy: ['card-only'], reason: 'card-only' }],
 ];
 

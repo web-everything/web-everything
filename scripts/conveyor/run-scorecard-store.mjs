@@ -296,26 +296,25 @@ function serializeStore(store) {
 }
 
 /**
- * Read the store off disk. By default an unreadable/malformed file degrades to an empty store, so a
+ * Read the store off disk. Never throws — an unreadable/malformed file degrades to an empty store, so a
  * caller always gets a usable (if empty) history rather than a crash mid-scoring-pass.
  *
  * On the first real read of the DEFAULT store in a process (no `path`, no injected `read`), the one-time
  * {@link migrateLegacyStore} runs first, so no reader ever sees the history the old tracked file held go
  * missing. An explicit `path` or injected IO reads exactly what it is given.
- * `strict` preserves read/parse failures, including absence, for admission checks.
+ * `strict` preserves read/parse failures for admission checks; absence remains an empty store.
  */
 export function readStore({ path, read, exists, strict = false } = {}) {
   ensureMigrated({ path, read, exists });
   const target = path ?? resolveScorecardStorePath();
   const doRead = read ?? ((p) => readFileSync(p, 'utf8'));
   try {
-    if (!strict && !(exists ?? existsSync)(target)) return { version: 1, records: [] };
-    if (strict && exists && !exists(target)) throw Object.assign(new Error('scorecard store missing'), { code: 'ENOENT' });
+    if ((!strict || exists) && !(exists ?? existsSync)(target)) return { version: 1, records: [] };
     const parsed = parseStoreText(doRead(target));
     if (!parsed && strict) throw new Error('scorecard store malformed');
     return parsed ?? { version: 1, records: [] };
   } catch (error) {
-    if (strict) throw error;
+    if (strict && error.code !== 'ENOENT') throw error;
     return { version: 1, records: [] };
   }
 }

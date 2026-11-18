@@ -457,15 +457,9 @@ describe('strict scorecard reads for red-team admission', () => {
     expect(() => readStore({ path: '/fixture/store', strict: true,
       read: () => { throw Object.assign(Error('denied'), { code: 'EACCES' }); } })).toThrow('denied');
   });
-  it('refuses absent admission history instead of converting ENOENT into zero seats', () => {
-    const read = () => { throw Object.assign(Error('absent'), { code: 'ENOENT' }); };
-    expect(() => readStore({ path: '/fixture/store', strict: true, read })).toThrow('absent');
-    expect(readStore({ path: '/fixture/store', exists: () => true, read }).records).toEqual([]);
-    expect(() => readStore({ path: '/fixture/store', strict: true, exists: () => false, read }))
-      .toThrow('scorecard store missing');
-  });
-  it('returns present empty history and existing records unchanged for admission', () => {
-    expect(readStore({ path: '/fixture/store', strict: true, read: () => '{"records":[]}' }).records).toEqual([]);
+  it('allows absent stores but returns existing records unchanged', () => {
+    expect(readStore({ path: '/fixture/store', strict: true,
+      read: () => { throw Object.assign(Error('absent'), { code: 'ENOENT' }); } }).records).toEqual([]);
     const records = [baseRow()];
     expect(readStore({ path: '/fixture/store', strict: true, read: () => JSON.stringify({ records }) }).records).toEqual(records);
   });

@@ -2610,22 +2610,6 @@ queue listings; include same-head holds, abbreviated legacy Head markers and mis
 
 ## Drain enqueue confirmation
 
-Queue-state fixtures must use the same candidate repository identity when writing and asserting keys:
-an omitted `repo` uses `cwd#<pr>`, while an explicit `repo` uses `<repo>#<pr>`.
-Non-policy skip recovery tests must round-trip the prior verdict and read through the admission file
-and runner guard, asserting one seat and a spent retry even when no seat rows survive. Missing reads,
-mismatched pinned heads and incomplete advisory acceptance must refuse before provider work.
-Empty or unscored diffs still owe a red-team run on an accepted head. Keep the empty-read runner
-and bounded skipped-retry cases in `scripts/operations/__tests__/review-job-red-team-skip.test.mjs`,
-the no-clear/retry cases in `scripts/lib/__tests__/review-red-team-on-skip.test.mjs`, and the
-once-per-head stall notice in `scripts/lib/__tests__/drain-merge-strategy.test.mjs`.
-Review evidence readers must pin one SHA before reading text and paths, and leave both unscored on either
-failure. Keep `review-pr-io.test.mjs`'s deterministic moving-ref regression when changing those readers.
-Admission history must be read strictly: a missing, malformed or unreadable scorecard store is unknown,
-never zero-seat proof. Keep the deterministic reader/planner/queued-admission/runner matrix in
-`scripts/lib/__tests__/strict-scorecard-callers.test.mjs`; positive fixtures must supply a present empty
-store explicitly. Unknown history holds for operator inspection without spending a retry or launching a seat.
-
 Post-accept admission imports the review scheduler’s `redTeamOwedFor` and `redTeamEnabled` over
 the exact repo/PR/head review payload; acceptance labels alone never establish an owed pass.
 An owed pass waits for the trusted red-team result marker for the exact PR and live head. Replay both GraphQL `author.login` and REST `user.login` bot comments, plus untrusted
@@ -4494,3 +4478,20 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+## Finished skipped red-team recovery
+
+Non-policy skips with a pinned, scored, nonempty read may spend one durable retry.
+Keep the admission-file round-trip and spent-budget cases in `review-job-red-team-skip.test.mjs`,
+planner refusals in `review-red-team-on-skip.test.mjs`, and the durable stall notice in
+`drain-merge-strategy.test.mjs`. Empty or unscored reads remain owed and cannot retry or publish
+clearance; `review-red-team.test.mjs` also tests an accepting speculative response against them.
+Inspect the stored read when this guard refuses. Admission validates the store bytes before using
+the existing non-strict scorecard reader; missing, malformed or unreadable history never proves zero
+seats. Keep the reader/planner/queued-admission/runner matrix in `review-job-red-team-skip.test.mjs`.
+Inspect or restore the scorecard store before retrying when history cannot be read.
+Positive recovery and card-only fixtures must include a scored, nonempty read. Scheduled work
+with empty or unscored input stays owed even when its paths are all cards; test its pending label
+and non-policy settlement without changing the read guard's no-call/no-publication assertions.
+Point `WE_SHARED_RUNS_DIR` at `<fixture>/runs`: status and skip markers are siblings of the runs
+directory, so pointing it at the fixture root leaks deduplication state across test cases.

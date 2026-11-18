@@ -51,6 +51,11 @@ export function redTeamCardOnly(read) {
   return isCardOnlyDiff(paths);
 }
 
+/** Empty or unscored input cannot support a review or its publication. */
+export function redTeamReadReviewable(read) {
+  return read?.diffScored === true && typeof read.diffText === 'string' && !!read.diffText.trim();
+}
+
 /**
  * Is a red-team result owed on this head? A pass that started or finished is always owed its result. A card-only
  * head is exempt only while the producer skips it: the skip decision the producer's process recorded with the
@@ -58,6 +63,7 @@ export function redTeamCardOnly(read) {
  */
 export function redTeamOwedOnHead({ read, evidence = {}, skipCardOnly = true } = {}) {
   if (evidence.inFlight || evidence.recorded) return true;
+  if (evidence.scheduled && !redTeamReadReviewable(read)) return true;
   const skip = typeof evidence.skipCardOnly === 'boolean' ? evidence.skipCardOnly : skipCardOnly;
   if (skip && redTeamCardOnly(read)) return false;
   return !!evidence.scheduled;

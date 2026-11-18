@@ -40,7 +40,7 @@ const payload = (verdict, body = 'Claims: adds a guard.') => ({
   runId: 'review-pr-1', stopped: 'complete', verdict: { verdict },
   findings: {
     read: {
-      title: 'fix the thing', body, diffText: 'diff --git a/x.mjs b/x.mjs\n+export const f = (n) => 10 / n;\n',
+      diffScored: true, title: 'fix the thing', body, diffText: 'diff --git a/x.mjs b/x.mjs\n+export const f = (n) => 10 / n;\n',
       netChangedFiles: ['x.mjs'], netBasis: { base: 'b'.repeat(40), rev: REV },
     },
     judge: { findings: [] },
@@ -90,6 +90,37 @@ function fakeIo(over = {}) {
   };
   return { io, calls, rows, trials };
 }
+
+describe('red-team read evidence guard', () => {
+  it('refuses an unscored replay payload before any provider call or publication', async () => {
+    const p = replayPayload({ view: { headRefOid: REV, files: [{ path: 'x.mjs' }] }, diffText: '+code' });
+    const { io, calls, rows } = fakeIo();
+    expect(await runRedTeam({ pr: 5, repo: REPO, loopPayload: p, env: {} }, io))
+      .toMatchObject({ status: 'skipped', reason: expect.stringContaining('no scored nonempty diff') });
+    expect(rows).toEqual([]);
+    expect(calls.some(c => ['seat', 'reserve', 'post'].includes(c[0]))).toBe(false);
+  });
+  it.each([
+    { diffText: '' }, { diffText: ' \n ' }, { diffText: undefined },
+    { diffScored: false }, { diffScored: undefined },
+  ])('an accepting provider cannot publish clearance for an empty or unscored read: %j', async invalid => {
+    const p = payload('accept');
+    const { io, calls, rows } = fakeIo();
+    io.runSeat = async options => { calls.push(['seat', options]); return seatSays([])(options); };
+    const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: p.findings.read, env: {} }, io);
+    expect(pass.status).toBe('speculated');
+    expect(pass.parsed['red-team'].verdict).toBe('accept');
+    Object.assign(p.findings.read, invalid);
+    const input = { pr: 5, repo: REPO, loopPayload: p, pass, env: {} };
+    expect(await completeRedTeam(input, io)).toMatchObject({ status: 'skipped' });
+    expect((await finishSpeculativeRedTeam(input, io)).status)
+      .toBe(Object.hasOwn(invalid, 'diffText') ? 'stale' : 'skipped');
+    expect(await runRedTeam(input, io)).toMatchObject({ status: 'skipped' });
+    expect(rows).toEqual([]);
+    expect(calls.filter(c => c[0] === 'seat')).toHaveLength(1);
+    expect(calls.some(c => c[0] === 'post')).toBe(false);
+  });
+});
 
 describe('failed red-team executions (#6096)', () => {
   it.each(['quota', 'daily cap'])('a failed seat still defers another call under its %s', async limit => {
@@ -503,9 +534,10 @@ describe('x00g3tt — the replay never writes the shared store (PR #2735 review)
     expect(r.delegationTrial).toMatch(/not recorded/);
   });
 
-  it('a replay payload is never recorded, whatever the caller passed', async () => {
+  it('a scored replay payload is never recorded, whatever the caller passed', async () => {
     const { io, rows, trials } = fakeIo();
     const p = replayPayload({ view: { title: 't', body: DELEGATED, headRefOid: REV, files: [] }, diffText: 'diff --git a/x b/x\n+x\n' });
+    p.findings.read.diffScored = true;
     const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: p, env: {}, post: false }, io);
     expect(r.status).toBe('ran');
     expect(rows).toEqual([]);
@@ -760,6 +792,7 @@ describe('repo-grounded red-team re-check and card-only skips', () => {
       diffText: `diff --git a/scripts/x.mjs b/backlog/123-card.md\nsimilarity index 100%\n${kind} from scripts/x.mjs\n${kind} to backlog/123-card.md\n`,
     });
     expect(p.findings.read.netRenameSources).toEqual(['scripts/x.mjs']);
+    p.findings.read.diffScored = true;
     const { io, calls } = fakeIo();
     const result = await runRedTeam({ pr: 5, repo: REPO, loopPayload: p, env: {} }, io);
     expect(result.status).toBe('ran');

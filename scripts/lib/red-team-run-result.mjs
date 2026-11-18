@@ -1,4 +1,4 @@
-import { redTeamOwedFor } from './review-red-team-policy.mjs';
+import { redTeamOwedFor, redTeamReadReviewable } from './review-red-team-policy.mjs';
 /** A successful seat execution can have a failing verdict. Reuse it without another model call. */
 export function completedRedTeamSeat(row) {
   return row?.status === 'ok' && (row.seatStatus === undefined || row.seatStatus === 'ok');
@@ -47,6 +47,6 @@ export function skippedRedTeamRetry(status, proof = {}) {
     && (result?.comment?.status ?? result?.comment) !== 'posted'
     && completedRecorded === false && failedSeatCount === 0
     && typeof status.head === 'string' && /^[a-f0-9]{40}$/i.test(status.head)
-    && read?.netBasis?.rev === status.head && typeof read.diffText === 'string'
+    && read?.netBasis?.rev === status.head && redTeamReadReviewable(read)
     && redTeamOwedFor(status.loopPayload);
 }

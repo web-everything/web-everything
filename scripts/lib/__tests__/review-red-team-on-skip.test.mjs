@@ -3179,10 +3179,10 @@ it('a recovered result check settles the next pass without a recovery seat', () 
 
 
 describe('finished non-policy skip retry', () => {
-  function options({ empty = false, legacyPolicy = false } = {}) {
+  function options({ empty = false, unscored = false, legacyPolicy = false } = {}) {
     const loopPayload = payload();
     Object.assign(loopPayload.findings.read, { diffText: empty ? '' : '+code',
-      netChangedFiles: empty ? [] : ['scripts/example.mjs'], diffScored: false });
+      netChangedFiles: empty ? [] : ['scripts/example.mjs'], diffScored: !unscored });
     const status = { head, status: 'finished', loopPayload,
       result: { status: 'skipped', ...(legacyPolicy ? { policy: 'empty-net-diff' } : {}) } };
     const evidence = { status, loopPayload, recorded: false, seatRecorded: false,
@@ -3192,8 +3192,7 @@ describe('finished non-policy skip retry', () => {
         comments: [{ author: { login: 'web-everything' }, body: `✅ review — accepted\n<!-- reviewed-sha: ${head} -->` }] }] };
   }
   it.each([
-    ['nonempty diff', {}], ['empty diff', { empty: true }],
-    ['retired empty-diff policy', { empty: true, legacyPolicy: true }],
+    ['nonempty diff', {}], ['retired empty-diff policy with a scored diff', { legacyPolicy: true }],
   ])('dispatches one fresh retry for %s and holds when the retry is spent', (_, variant) => {
     const o = options(variant);
     expect(decide(o)).toMatchObject({ action: 'dispatch', mode: 'fresh' });
@@ -3202,6 +3201,10 @@ describe('finished non-policy skip retry', () => {
     expect(decide(o)).toMatchObject({ action: 'skip', why: 'red-team retry already spent; inspect stored evidence' });
   });
   it.each([
+    ['empty diff', o => { o.readStatus().loopPayload.findings.read.diffText = ''; }],
+    ['whitespace diff', o => { o.readStatus().loopPayload.findings.read.diffText = ' \n '; }],
+    ['unscored diff', o => { o.readStatus().loopPayload.findings.read.diffScored = false; }],
+    ['missing score', o => { delete o.readStatus().loopPayload.findings.read.diffScored; }],
     ['missing read', o => { delete o.readStatus().loopPayload.findings.read; }],
     ['mismatched head', o => { o.readStatus().loopPayload.findings.read.netBasis.rev = 'b'.repeat(40); }],
     ['unknown seats', o => { delete o.readEvidence().failedSeatCount; }],
@@ -3209,8 +3212,8 @@ describe('finished non-policy skip retry', () => {
     ['completed seat', o => { o.readEvidence().completedRecorded = true; }],
     ['guard deferral', o => { o.readStatus().result.deferredByGuard = true; }],
     ['cap deferral', o => { o.readStatus().result.deferredByCap = true; }],
-  ])('never clears or retries an empty-diff skip with %s', (_, mutate) => {
-    const o = options({ empty: true }); mutate(o);
+  ])('never clears or retries a skipped review with %s', (_, mutate) => {
+    const o = options(); mutate(o);
     expect(decide(o).action).toBe('skip');
     expect(decide(o)).not.toHaveProperty('settle');
   });

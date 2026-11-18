@@ -45,7 +45,7 @@ const LOOP_PAYLOAD = {
   runId: 'review-pr-1', stopped: 'complete', verdict: { verdict: 'changes' },
   findings: {
     read: {
-      title: 'fix the thing', body: 'Claims: adds a guard.', diffText: 'diff --git a/x b/x\n+1\n',
+      diffScored: true, title: 'fix the thing', body: 'Claims: adds a guard.', diffText: 'diff --git a/x b/x\n+1\n',
       netChangedFiles: ['scripts/lib/ai-pr-authorship.mjs'], netBasis: { base: 'b'.repeat(40), rev: 'a'.repeat(40) },
     },
     judge: { findings: [CLAUDE_FINDING] },

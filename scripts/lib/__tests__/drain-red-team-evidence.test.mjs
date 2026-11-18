@@ -835,7 +835,7 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
   // PR #5482 self-review: the review job and the drain resolve WE_RED_TEAM_SKIP_CARD_ONLY in separate processes.
   it('carries the writer\'s card-only skip decision to the drain, whatever the drain process resolves', () => {
     const f = fixture();
-    const cardOnly = { ...payload(f.head), findings: { read: { netBasis: { rev: f.head }, netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] } } };
+    const cardOnly = { ...payload(f.head), findings: { read: { diffScored: true, diffText: '+card', netBasis: { rev: f.head }, netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] } } };
     const live = { ...f, isAlive: () => true, readPidStart: () => 'start' };
     recordRedTeamStatus({ ...f, loopPayload: cardOnly, status: 'queued' }, { ...f, env: { ...f.env, WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, readPidStart: () => 'start' });
     expect(readDrainRedTeamEvidence(live).skipCardOnly).toBe(false);
@@ -845,7 +845,7 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
   });
   it('holds an owing card-only run until the job records its skip decision', () => {
     const f = fixture();
-    const read = { netBasis: { rev: f.head }, netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] };
+    const read = { diffScored: true, diffText: '+card', netBasis: { rev: f.head }, netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] };
     writeRun({ ...newRunRecord({ id: 'review-pr-5439', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }), verdict: { verdict: 'accept' }, findings: { read } }, f.runsDir);
     expect(readDrainRedTeamEvidence(f).skipCardOnly).toBe(false);
     expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'true' }, comments: [] })).toMatch(/no recorded result/);

@@ -56,7 +56,7 @@ describe('red-team CLI --resume-only', () => {
 });
 
 const pr = 5762, repo = 'web-everything/web-everything', rev = 'a'.repeat(40);
-const read = { netBasis: { rev }, netChangedFiles: ['scripts/example.mjs'], diffText: '+export const example = true;' };
+const read = { diffScored: true, netBasis: { rev }, netChangedFiles: ['scripts/example.mjs'], diffText: '+export const example = true;' };
 const loopPayload = { verdict: { verdict: 'accept' }, findings: { read } };
 const prior = { dispatchKind: 'review-seat', seat: 'red-team', status: 'ok', pr, repo, rev,
   callId: 'stored-call', provider: 'codex', model: 'm', findings: [], foldedVerdict: 'accept' };
