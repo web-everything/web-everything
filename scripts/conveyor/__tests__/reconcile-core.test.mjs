@@ -148,6 +148,15 @@ describe('accepted head with unresolved red-team send-back (PR #7031)', () => {
     expect(out.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', attempts: n, cap: 3, capKind: 'fix' }));
     expect(out.notes).toContainEqual(expect.objectContaining({ kind: 'round-cap-exhausted', parkToHuman: true }));
   });
+  it('shares the exhausted red-team repair cap with a later review:changes bounce', () => {
+    const pr = makePr();
+    pr.labels = lbl('review:changes');
+    pr.comments.push({ body: '🔁 human review — changes requested\n\nFix the confirmed break.' },
+      ...Array.from({ length: 3 }, () => ({ author: AUTOMATION, body: RED_TEAM_FIX_COMMENT_MARKER })));
+    const out = plan(pr, { roundCap: 3 });
+    expect(out.dispatch).toEqual([]);
+    expect(out.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', attempts: 3, cap: 3 }));
+  });
   it('only counts trusted leading round markers, retaining rounds after the head moves', () => {
     const comments = [
       { author: AUTOMATION, body: `${RED_TEAM_FIX_COMMENT_MARKER}\nRepair pushed: ${'b'.repeat(40)}` },

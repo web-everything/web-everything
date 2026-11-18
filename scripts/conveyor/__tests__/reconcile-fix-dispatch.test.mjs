@@ -1,3 +1,6 @@
+import { RED_TEAM_FIX_COMMENT_MARKER, countRedTeamFixComments } from '../red-team-fix-round-count.mjs';
+import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
+import { redTeamGateMarker, liveResultGateState } from '../../lib/red-team-gate.mjs';
 import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
 /**
  * @file scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs — #3438: dispatch the fix agent
@@ -12,7 +15,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import * as ghThrottle from '../../lib/gh-throttle.mjs';
 import {
-  createFixPassPrReader, fetchPrFilesPaginated, replayFixLaunch, withStaleBase, withPlannedContext, dispatchFix, fetchCardScopeAtRef, fetchPrDiffPaths, isDiffTooLargeError, PermanentScopeReadError, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
+  publishRedTeamFixDispatch, createFixPassPrReader, fetchPrFilesPaginated, replayFixLaunch, withStaleBase, withPlannedContext, dispatchFix, fetchCardScopeAtRef, fetchPrDiffPaths, isDiffTooLargeError, PermanentScopeReadError, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
   findResumeCandidate, buildResumePrompt, tryResumeFix, tryResumeRoundFix, filterFixesByInFlightScope, dropTerminalFixClaims, routeFixExecutor,
 } from '../reconcile-fix-dispatch.mjs';
 import { CONFLICT_LABEL } from '../parked-pr-conflict-watch.mjs';
@@ -2483,5 +2486,59 @@ describe('fix pass PR metadata snapshot', () => {
     expect(exec.mock.calls.filter(([, args]) => args[1] === 'view')).toHaveLength(1);
     expect(() => createFixPassPrReader({ exec })(7)).toThrow('unreadable PR');
     expect(exec.mock.calls.filter(([, args]) => args[1] === 'view')).toHaveLength(2);
+  });
+});
+
+
+describe('Claude red-team repair round publication', () => {
+  const head = 'a'.repeat(40);
+  const planned = { pr: 7031, itemNum: '3438', lane: 9, laneRef: 'lane/3438-wire-reconcile-pass',
+    scope: item3438.scope, headRefOid: head, attempts: 0, mode: 'red-team-sent-back',
+    redTeamSentBack: { head, findings: [{ summary: 'Gate break' }] } };
+  const thread = () => {
+    const comments = [{ author: { login: 'web-everything' }, body: renderRedTeamComment({ pr: 7031, rev: head,
+      provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+      findings: [{ summary: 'Gate break', category: 'edge-case', impactIfUnfixed: 'broken',
+        file: 'scripts/example.mjs', line: 1, confirmedByRecheck: true }] }) }];
+    const result = liveResultGateState(comments, 7031, head).resultId;
+    comments.push({ author: { login: 'web-everything' }, body: redTeamGateMarker(7031, head, 'sent-back', result) });
+    return { comments, result };
+  };
+  const options = () => ({ root: '/repo', readBrief: () => REAL_TEMPLATE_STUB,
+    executorDecision: { executor: 'claude' }, wrapFix: false,
+    acquireClaim: () => ({ ok: true }), releaseClaim: vi.fn(), readFixClaim: () => null,
+    ensureSessionCwd: p => p, grantConflictHelper: () => {}, isolateSession: () => ({}),
+    resolveSettingsEnv: () => ({}), postNotice: () => {}, mintSessionId: () => 'sid' });
+
+  it('routes red-team repairs through fresh counted dispatch instead of either resume path', () => {
+    expect(tryResumeFix(planned)).toEqual({ resumed: false, resumeAttempt: null });
+    expect(tryResumeRoundFix({ ...planned, attempts: 1 })).toEqual({ resumed: false, resumeAttempt: null });
+  });
+  it('counts the Claude round before the agent starts, bound to head/result and idempotent per attempt', () => {
+    const { comments, result } = thread();
+    const exec = vi.fn((_cmd, args) => comments.push({ author: { login: 'web-everything' }, body: args.at(-1) }));
+    const publishRedTeamRound = request => publishRedTeamFixDispatch(request, { readComments: () => comments, exec });
+    const spawnAgent = vi.fn(() => {
+      expect(countRedTeamFixComments(comments)).toBe(1);
+      expect(comments.at(-1).body).toContain(`head=${head} result=${result} attempt=1`);
+      return '';
+    });
+    dispatchFix(planned, { ...options(), publishRedTeamRound, spawnAgent });
+    expect(spawnAgent).toHaveBeenCalledOnce();
+    expect(publishRedTeamRound({ repo: 'we', planned })).toBe(false);
+    expect(exec).toHaveBeenCalledOnce();
+    publishRedTeamRound({ repo: 'we', planned: { ...planned, attempts: 1 } });
+    expect(countRedTeamFixComments(comments)).toBe(2);
+    expect(comments.at(-1).body).toContain(RED_TEAM_FIX_COMMENT_MARKER);
+  });
+  it.each(['unread', 'missing gate', 'write failure'])('refuses to launch Claude when marker publication has %s', fault => {
+    const { comments } = thread();
+    const spawnAgent = vi.fn();
+    const publishRedTeamRound = request => publishRedTeamFixDispatch(request, {
+      readComments: () => { if (fault === 'unread') throw Error('incomplete thread'); return fault === 'missing gate' ? [] : comments; },
+      exec: () => { throw Error('write failed'); },
+    });
+    expect(() => dispatchFix(planned, { ...options(), publishRedTeamRound, spawnAgent })).toThrow();
+    expect(spawnAgent).not.toHaveBeenCalled();
   });
 });

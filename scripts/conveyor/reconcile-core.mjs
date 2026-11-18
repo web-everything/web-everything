@@ -1881,7 +1881,7 @@ function sharedRoundAttempts(pr, { durableCount = 0, mechanicalRoundsCountToward
     operatorBudget?.attempts ?? 0,
     realFixRounds.ok ? realFixRounds.real : countRearmComments(pr?.comments),
     countAdvisoryComments(pr?.comments),
-  ) + (mechanicalRoundsCountTowardCap ? countConflictFixComments(pr?.comments) : 0);
+  ) + countRedTeamFixComments(pr?.comments) + (mechanicalRoundsCountTowardCap ? countConflictFixComments(pr?.comments) : 0);
 }
 
 /** A latest open send-back buys a bounded repair opportunity, even after the ordinary cap. */
@@ -2895,7 +2895,7 @@ export function planReconcile({
         && !withPhase.labels.includes('review:changes')) {
       const findings = redTeamSentBackFindings(pr);
       if (findings.length) {
-        const attempts = roundAttempts() + countRedTeamFixComments(pr.comments);
+        const attempts = roundAttempts();
         if (attempts >= effectiveRoundCap) {
           refuseCapExhausted({ ...withPhase, attempts, cap: effectiveRoundCap, capKind: 'fix',
             why: 'red-team send-back remains unresolved on the accepted head; automatic fix rounds exhausted' }, { allowTakeover: false });

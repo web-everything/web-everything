@@ -1,3 +1,6 @@
+import { RED_TEAM_FIX_COMMENT_MARKER } from './red-team-fix-round-count.mjs';
+import { redTeamFact } from './dispatch-eligibility-facts.mjs';
+import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 import { safeAdoptYield } from '../lib/daemon-rebuild/adopt-yield.mjs';
 import { admitMqFailureRoute } from './mq-failure-intake.mjs';
@@ -930,6 +933,8 @@ export function tryResumeFix(planned, {
     cwd, allow: [...conflictHelperAllowRules(root), ...rearmReviewAllowRules(root)],
   }),
 } = {}) {
+  // Red-team repairs need the fresh dispatch's counted marker before any Claude launch.
+  if (planned.mode === 'red-team-sent-back') return { resumed: false, resumeAttempt: null };
   // #x33jgwt multi-repo slice 5 — no repo gate HERE any more: `runReconcileFixDispatch` is the ONE place that
   // decides whether this repo's `fix` capability is on (`docs/agent/platform-decisions.md#conveyor-multi-repo-
   // model` clause 1, "capability, not repo identity"), before this function is ever called. This primitive is
@@ -1139,6 +1144,8 @@ export function tryResumeRoundFix(planned, {
   },
   dryRun = false,
 } = {}) {
+  // Red-team repairs need the fresh dispatch's counted marker before any Claude launch.
+  if (planned.mode === 'red-team-sent-back') return { resumed: false, resumeAttempt: null };
   if (!dryRun) assertNotALaneCheckout(root);
   if (resolveFixSafety().value.resetOnRepeatedFinding) {
     try {
@@ -1409,6 +1416,25 @@ export function writePrivateBorrowedPrompt(slug, text, base = tmpdir()) {
   return file;
 }
 
+/** Count Claude repairs before launch; retries of the same head/result/attempt are idempotent. */
+export function publishRedTeamFixDispatch({ repo, planned }, {
+  readComments = () => readCompletePrComments(planned.pr, { repo: ghRepoSlug(repo) }),
+  exec = execFileSyncThrottled,
+} = {}) {
+  const comments = readComments(); // Complete reader throws on missing evidence; never launch uncounted.
+  const head = planned.headRefOid;
+  const result = redTeamFact(comments, planned.pr, head)?.value;
+  if (result?.state !== 'send-back' || planned.redTeamSentBack?.head !== head
+      || !Number.isSafeInteger(planned.attempts) || planned.attempts < 0) {
+    throw new Error('red-team repair dispatch evidence unreadable; retry with a fresh reconciliation or ask an operator');
+  }
+  const body = `${RED_TEAM_FIX_COMMENT_MARKER}\n\nRed-team repair dispatched: head=${head} result=${result.resultId} attempt=${planned.attempts + 1}`;
+  if (comments.some(c => isTrustedMarkerAuthor(c) && c.body === body)) return false;
+  exec('gh', ['pr', 'comment', String(planned.pr), '--repo', ghRepoSlug(repo), '--body', body],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 1024 * 1024 });
+  return true;
+}
+
 /**
  * we:scripts/conveyor/reconcile-fix-dispatch.mjs#dispatchFix — DISPATCH ONE FRESH FIX AGENT for one planned
  * entry that either isn't a conflict-caused resume candidate, or whose {@link tryResumeFix} attempt did not
@@ -1523,6 +1549,7 @@ export function dispatchFix(planned, {
   // Hermetic under a test runner: a test that wants history injects its own reader.
   readHistoryInputs = ({ repo: r, pr }) => (isUnderTestEnv() ? null : readRoundHistoryInputs({ pr, repoSlug: ghRepoSlug(r), exec: execFileSyncThrottled })),
   postTakeover = postTakeoverMarker,
+  publishRedTeamRound = publishRedTeamFixDispatch,
   // Card xrbu1bp — the fixer ladder, read only when a round reaches `fix.strongerModelFromRound`.
   loadLadder = () => loadFixerLadder(),
   postTakeoverVoidMark = postTakeoverVoid,
@@ -1650,6 +1677,7 @@ export function dispatchFix(planned, {
         unknownTokens, resumed: false, ...(resumeAttempt ? { resumeAttempt } : {}),
       };
     }
+    if (planned.mode === 'red-team-sent-back') publishRedTeamRound({ repo, planned });
     const sessionId = String(mintSessionId());
     // #4174 — THE FIX: this session's cwd is a scratch directory outside `root`, never `root` itself (see
     // `dispatchSessionCwd`'s own header at the io shell for why — the identical bug `createDispatchSinks` had).

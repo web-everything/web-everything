@@ -39,7 +39,9 @@
 confirmed findings on its current head. Use the gate findings supplied in the dispatch context as the ask,
 instead of step 2's latest review comment. Repair, verify, and push to the same PR branch. Skip step 7's
 `rearm-review.mjs`: preserve `review:accepted` and all review labels. Report completion and release the lane
-as usual. The launcher also skips rearm for accepted PRs.
+as usual. The launcher also skips rearm for accepted PRs. Claude dispatch publishes the counted repair-round
+marker before launch (bound to head, gate result, and attempt); fix-run publishes its marker after push.
+Do not publish another round marker yourself.
 
 | Placeholder | What the conveyor fills it with |
 |---|---|
