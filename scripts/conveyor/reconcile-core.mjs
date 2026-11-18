@@ -111,6 +111,7 @@ import { reviewCiGate } from '../lib/review-ci-gate.mjs';
 import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
 import { rulingDisputeText, noticedRungs } from '../lib/ruling-ledger.mjs';
 import { openOperatorSendBacks, operatorSendBackRuling } from '../lib/operator-send-backs.mjs';
+import { liveResultGateState, RED_TEAM_GATE_MARKER, GATE_OUTCOMES } from '../lib/red-team-gate.mjs';
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
 import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
 import { AUTO_POLICY_ACTOR, activeReferrals, readOperatorRulings, readReferralRecords, referralRecordState } from '../lib/jury-core.mjs';
@@ -1629,6 +1630,81 @@ function operatorSendBackAfterReview(pr) {
   return { verdictId: item.id, login: item.login, body: item.fullBody };
 }
 
+/** Actionable list entries only. Review headings, producer metadata and quoted examples grant no repair. */
+function mustFixEntries(body) {
+  const lines = String(body ?? '').replace(/<!--[\s\S]*?(?:-->|$)/g, ' ').split(/\r?\n/);
+  const entries = [];
+  let fence = null;
+  // With a structured findings section, preceding roster/summary lists are metadata.
+  let section = !lines.some(line => /^#{1,6}\s+(?:Findings|Must[ -]fix)(?:\s|\(|:|$)/i.test(line));
+  for (const line of lines) {
+    const fenced = /^\s*(`{3,}|~{3,})/.exec(line);
+    if (fenced) {
+      if (!fence) fence = fenced[1];
+      else if (fenced[1][0] === fence[0] && fenced[1].length >= fence.length) fence = null;
+      continue;
+    }
+    if (fence || /^\s*>/.test(line)) continue;
+    if (/^\s*---\s*$/.test(line)) break; // Producer footer begins here.
+    const heading = /^#{1,6}\s+(.+)$/.exec(line);
+    if (heading) {
+      section = /^(?:Findings|Must[ -]fix)(?:\s|\(|:|$)/i.test(heading[1])
+        && !/\(0\)/.test(heading[1]);
+      continue;
+    }
+    const entry = section && /^(?:[-*+] |\d+[.)] )\s*(.*)$/.exec(line);
+    if (!entry) continue;
+    const text = entry[1].replace(/^\[[ xX]\]\s*/, '').replace(/[*_`]/g, '').trim();
+    if (!text || /^(?:No findings\b|None[.!]?$|Net basis:|Recorded by\b|Recorded through\b|Decision:|Head:|Metadata:)/i.test(text)) continue;
+    entries.push(text);
+  }
+  return entries;
+}
+
+const isFixAttempt = c => isTrustedMarkerAuthor(c) && [FIX_BEGIN_MARKER, FIX_END_MARKER,
+  ADVISORY_FIX_COMMENT_MARKER, CONFLICT_FIX_COMMENT_MARKER].some(marker => commentBody(c)?.trimStart().startsWith(marker));
+
+/**
+ * A review:changes request can reopen a reviewed head after a fixer tried it. Gate records only supersede
+ * requests; they never supply one. Unknown chronology, head coverage or findings keeps the head held for an operator.
+ */
+function sendBackAfterFixAttempt(pr) {
+  const comments = Array.isArray(pr?.comments) ? pr.comments : [];
+  const attempts = comments.map((c, index) => ({ c, index, at: Date.parse(c?.createdAt) })).filter(({ c }) => isFixAttempt(c));
+  if (!attempts.length || attempts.some((a, i) => !Number.isFinite(a.at) || (i && a.at <= attempts[i - 1].at))) return null;
+  const last = attempts.at(-1);
+  const state = liveResultGateState(comments, pr.number, pr.headRefOid, pr.repo, pr.standingRuling);
+  if (state.sendBackOutcome === GATE_OUTCOMES.ROUND_CAP && !state.reopened) return null;
+  const isGate = c => String(commentBody(c) ?? '').trimStart().startsWith(RED_TEAM_GATE_MARKER);
+  const operatorRequests = openOperatorSendBacks(pr);
+  for (let index = comments.length - 1; index > last.index; index -= 1) {
+    const c = comments[index], at = Date.parse(c?.createdAt);
+    if (!isTrustedMarkerAuthor(c)) continue;
+    const operator = operatorRequests.find(item => item.index === index);
+    const changes = isReviewVerdictComment(c) && verdictKind(c) === 'changes';
+    if (!(operator || changes)) continue;
+    // An unreadable newer request must not make an older one look current.
+    if (!Number.isFinite(at) || at <= last.at) return null;
+    const pinned = verdictJudged(c, String(pr.headRefOid ?? '').toLowerCase())
+      || (operator?.head && sameHeadSha(operator.head, pr.headRefOid));
+    if (!pinned || !mustFixEntries(c.body).length) return null;
+    const superseded = comments.slice(index + 1).some(later => {
+      if (!isTrustedMarkerAuthor(later)) return false;
+      if (isGate(later)) {
+        // Ask the canonical reader whether THIS record decides the LIVE result. In particular, a gate
+        // bound to an older same-head result cannot supersede the request. Never infer this from its text.
+        const gate = liveResultGateState(comments.filter(other => !isGate(other) || other === later),
+          pr.number, pr.headRefOid, pr.repo, pr.standingRuling);
+        return gate.outcomes.size > 0;
+      }
+      return isReviewVerdictComment(later) && verdictKind(later) === 'accept'
+        && verdictJudged(later, String(pr.headRefOid ?? '').toLowerCase());
+    });
+    return superseded ? null : c;
+  }
+  return null;
+}
+
 /**
  * Common review decision. Allow the last fix its review at the cap; refuse only above it.
  * Preserve draft, reviewed-head and advisory conversion semantics;
@@ -2865,6 +2941,20 @@ export function planReconcile({
           ? 'draft PR that owns the fix for red main — promoted at once: every other PR is waiting for it (card xu1nixv)'
           : 'draft PR — required checks are green or held only for review; promote it to ready for review (draft-first PRs, '
           + 'operator-approved 2026-09-27) — nothing else is owed this PR until that happens',
+      });
+      continue;
+    }
+
+    // A reviewed head that a fixer already tried stays held until a fresh, pinned, actionable send-back.
+    // This is a repair release only: mechanical conflict owners and all preceding safety refusals keep priority.
+    const comments = Array.isArray(pr?.comments) ? pr.comments : [];
+    const reviewedIndex = comments.findIndex(c => isReviewVerdictComment(c) && verdictJudged(c, pr.headRefOid));
+    const attemptedIndex = comments.findLastIndex(isFixAttempt);
+    if (phase === 'bounced' && !withPhase.labels.includes(CONFLICT_LABEL)
+      && String(pr?.mergeStateStatus ?? '').toUpperCase() !== 'DIRTY'
+      && reviewedIndex >= 0 && attemptedIndex > reviewedIndex && !sendBackAfterFixAttempt(pr)) {
+      refuse('already-reviewed-head', { ...withPhase, headSha: pr.headRefOid,
+        why: 'this reviewed head already had a fixer attempt — an operator grant or a newer pinned send-back with a non-empty must-fix list is required',
       });
       continue;
     }

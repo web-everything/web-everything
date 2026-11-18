@@ -64,6 +64,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { planNoteComment } from '../reconcile-note-comment.mjs';
+import { redTeamMarker, redTeamGateMarker, redTeamResultId, parseRedTeamComment } from '../../lib/red-team-gate.mjs';
 
 // ── fixtures — measured shapes, 2026-08-26 ───────────────────────────────────────────────────────────────────
 const NOW = Date.parse('2026-08-26T17:34:00Z');
@@ -100,6 +101,72 @@ const pr1563 = (over = {}) => ({
   statusCheckRollup: greenRollup,
   comments: [finding()],
   ...over,
+});
+
+describe('post-fixer send-back release (#6945)', () => {
+  const head = 'b'.repeat(40);
+  const comment = (body, minute, author = AUTOMATION) => ({ body, author,
+    id: `comment-${minute}`, createdAt: `2026-08-26T16:${String(minute).padStart(2, '0')}:00Z` });
+  const reviewed = comment(`✅ review — accepted\n\n${buildReviewedShaMarker(head)}`, 1);
+  const attempt = comment(buildFixBeginComment({ who: 'fix-6945', why: 'repair', branch: 'lane/6945', headSha: head, ttlMinutes: 60 }), 2);
+  const release = comment(buildFixEndComment({ who: 'fix-6945', headSha: head }), 3);
+  const request = (body = '### Findings (1)\n- Repair the broken head binding.', minute = 4, author = AUTOMATION) => comment(
+    `🔁 review — changes requested\n\nRecorded by ${author.login} via review-pr.\n\n${body}\n\n${buildReviewedShaMarker(head)}`, minute, author);
+  const result = comment(`${redTeamMarker(6945, head)}\n1. [**confirmed**] (correctness, broken) — Wrong head is released.`, 4);
+  const resultId = redTeamResultId(parseRedTeamComment(result.body));
+  const gate = (outcome, minute, id = resultId) => comment(redTeamGateMarker(6945, head, outcome, id, []), minute);
+  const run = (tail = [], over = {}) => planReconcile({ prs: [pr1563({ number: 6945, headRefOid: head,
+    comments: [reviewed, attempt, release, ...tail], ...over })], agents: [], now: NOW });
+  const held = plan => {
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toMatchObject([{ kind: 'already-reviewed-head' }]);
+  };
+
+  it('#6945: a fresh pinned changes verdict with must-fix entries releases the reviewed head', () => {
+    expect(run([request()]).dispatch).toMatchObject([{ kind: 'fix', prNumber: 6945 }]);
+  });
+  it('a fresh pinned operator send-back with must-fix entries releases the reviewed head', () => {
+    const operator = request(`On head \`${head}\`.\n\n### Must fix\n1. Repair the broken binding.`, 4, { login: 'chalbert' });
+    operator.body = operator.body.replace(buildReviewedShaMarker(head), '');
+    expect(run([operator]).dispatch)
+      .toMatchObject([{ kind: 'fix' }]);
+  });
+  it('round-cap then sent-back with empty grant snapshots stays held even with a fresh request', () => {
+    held(run([result, gate('round-cap', 5), gate('sent-back', 6), request(undefined, 7)]));
+  });
+  it('an operator grant reopens the capped result for a subsequent actionable request', () => {
+    const grant = comment(buildRoundExtensionComment({ repo: 'we', pr: 6945, by: 1, actor: 'chalbert',
+      channel: 'test', reason: 'one directed repair', at: '2026-08-26T16:07:00Z' }), 7, { login: 'chalbert' });
+    expect(run([result, gate('round-cap', 5), gate('sent-back', 6), grant, request(undefined, 8)], { repo: 'we' }).dispatch)
+      .toMatchObject([{ kind: 'fix' }]);
+  });
+  it.each(['### Findings (0)', '_No findings._', '### Findings (0)\n\n_No findings._',
+    '### Findings (1)\n- <!-- metadata only -->',
+    '- Recorded by orchestrator.\n### Findings (0)\n_No findings._',
+    '### Findings (1)\n```text\n- Example only.\n```\n> - Quoted example only.',
+    '---\n- Net basis: `a..b`\n- Recorded by orchestrator.\n- _Recorded through review-pr._',
+  ])('holds a send-back without actionable entries: %s', body => held(run([request(body)])));
+  it.each(['round-cap', 'sent-back', 'no-send-back', 'card-queued'])('a later bound gate decision supersedes the request: %s', outcome => {
+    held(run([result, request(undefined, 5), gate(outcome, 6)]));
+  });
+  it('gate markers alone never create a repair request', () => held(run([result, gate('sent-back', 5)])));
+  it('a gate deciding another result cannot supersede the live request', () => {
+    expect(run([result, request(undefined, 5), gate('round-cap', 6, '0'.repeat(16))]).dispatch).toMatchObject([{ kind: 'fix' }]);
+  });
+  it('a cap for an older same-head result cannot hold the newer result', () => {
+    const newerResult = { ...result, createdAt: '2026-08-26T16:06:00Z', body: result.body.replace('Wrong head is released.', 'A different confirmed break.') };
+    expect(run([result, gate('round-cap', 5), newerResult, request(undefined, 7), gate('round-cap', 8)]).dispatch)
+      .toMatchObject([{ kind: 'fix' }]);
+  });
+  it('a later accept supersedes the request', () => held(run([request(), { ...reviewed, createdAt: '2026-08-26T16:05:00Z' }])));
+  it('a request before the last fixer attempt cannot release', () => held(run([request(undefined, 1)])));
+  it('an unpinned request cannot release', () => held(run([{ ...request(), body: request().body.replace(buildReviewedShaMarker(head), '') }])));
+  it('a request pinned to another head cannot release', () => held(run([{ ...request(), body: request().body.replace(head, 'c'.repeat(40)) }])));
+  it('an untrusted request cannot release', () => held(run([request(undefined, 4, { login: 'stranger' })])));
+  it('unreadable fixer chronology cannot release', () => held(run([request()], { comments: [reviewed, { ...attempt, createdAt: '' }, release, request()] })));
+  it('an unreadable latest request cannot fall back to an older actionable request', () => {
+    held(run([request(), { ...request(undefined, 5), createdAt: '' }]));
+  });
 });
 
 describe('live send-back supersedes stale accepted phase and verdict', () => {
