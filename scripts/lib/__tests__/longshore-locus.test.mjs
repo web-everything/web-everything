@@ -5,6 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
+import { REPO_NAMES } from '../repo-names.mjs';
 import { CONSTELLATION_REPOS, PENDING_REPOS, repoKeyForDir, repoKeyForSlug, siblingKeys, repoSlugTag, repoKeyForSlugTag, canonicalizeSlug } from '../constellation-repos.mjs';
 import { repoProfile, deliveryLocusForScope, repoProfileForLanePath, primaryCheckoutForLanePath } from '../repo-profile.mjs';
 import { planReviewDispatch } from '../../operations/review-dispatch.mjs';
@@ -13,8 +14,7 @@ import { CARD_REF_RE, referralCardReadable } from '../referral-card-readable.mjs
 import { LOCI, LOCUS_NAMES, scanRepoLocusPrefixes } from '../../check-standards-rules.mjs';
 
 const require = createRequire(import.meta.url);
-const settings = JSON.parse(readFileSync('scripts/settings/repo-names.json', 'utf8'));
-const SLUG = `${settings.repos.longshore.owner}/${settings.repos.longshore.name}`;
+const SLUG = `${REPO_NAMES.longshore.owner}/${REPO_NAMES.longshore.name}`;
 
 describe('longshore registry entry', () => {
   it('resolves its slug from the repo-names setting (default longshoreai/longshore)', () => {

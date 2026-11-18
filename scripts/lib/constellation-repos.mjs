@@ -24,7 +24,7 @@
  * `from`-clause the same static scanner follows, which would defeat the split.
  */
 
-import repoNames from '../settings/repo-names.json' with { type: 'json' };
+import { REPO_NAMES } from './repo-names.mjs';
 
 /** The constellation repos, keyed by internal repo KEY. `slug` is the gh `--repo` slug; `path` is the checkout
  *  (empty = the WE primary's own cwd); `dirs` are the directory basenames that checkout is known to occupy —
@@ -39,7 +39,7 @@ export const CONSTELLATION_REPOS = Object.freeze({
 
 // Registered but not swept; moves into CONSTELLATION_REPOS with the S2 capability filter.
 export const PENDING_REPOS = Object.freeze({
-  longshore: { slug: `${repoNames.repos.longshore.owner}/${repoNames.repos.longshore.name}`, slugTag: 'ls', path: '$HOME/workspace/longshore', dirs: ['longshore'] },
+  longshore: { slug: `${REPO_NAMES.longshore.owner}/${REPO_NAMES.longshore.name}`, slugTag: 'ls', path: '$HOME/workspace/longshore', dirs: ['longshore'] },
 });
 
 /**
