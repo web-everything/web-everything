@@ -219,7 +219,7 @@ describe('settings and row evidence', () => {
     expect(readVerdict).not.toHaveBeenCalled();
   });
   it('reads and caches immutable job evidence with throttled gh', () => {
-    const runGh = vi.fn(args => args[1].endsWith('/logs') ? candidacy : JSON.stringify({ head_sha: sha, completed_at: '2026-10-12T11:56:08Z' }));
+    const runGh = vi.fn(args => args.at(-1).endsWith('/logs') ? candidacy : JSON.stringify({ head_sha: sha, completed_at: '2026-10-12T11:56:08Z' }));
     const cache = new Map();
     const options = { repo: 'owner/repo', jobId: 123, prNumber: 4965, runGh, cache };
     expect(readMergeGateVerdict(options)).toMatchObject({ num: 4965, head_sha: sha });
@@ -607,6 +607,24 @@ describe('PR-event candidacy deferral', () => {
 
 
 describe('review-hold annotation (card 273, #5157)', () => {
+  it('reads gh escape-coded job logs and preserves human-review hold annotation (#7037)', () => {
+    const runGh = vi.fn(args => {
+      if (args.at(-1).endsWith('/logs')) {
+        if (!args.includes('--allow-escape-sequences')) throw new Error('API response contains terminal escape sequences');
+        return log4965;
+      }
+      expect(args).toEqual(['api', 'repos/owner/repo/actions/jobs/123']);
+      return JSON.stringify({ head_sha: sha, completed_at: '2026-10-12T11:56:08Z' });
+    });
+    const parsed = readMergeGateVerdict({ repo: 'owner/repo', jobId: 123, prNumber: 4965, runGh, cache: new Map() });
+    expect(parsed).toMatchObject({ num: 4965, head_sha: sha, ok: false });
+    expect(runGh.mock.calls[1][0]).toEqual(['api', '--allow-escape-sequences', 'repos/owner/repo/actions/jobs/123/logs']);
+    expect(excuseMergeGateRows([row], opts({ readVerdict: () => parsed }))).toEqual({
+      excused: false, reviewHold: true, rows: [{ ...row, mergeGateReviewHold: {
+        holds: ['candidate-label', 'producer-certified', 'review-hold-labels', 'review-acceptance', 'test-gaming', 'ledger'], jobId: 123,
+      } }],
+    });
+  });
   it('annotates the latest failing row without making CI green', () => {
     const readVerdict = () => ({ num: 4965, head_sha: sha, ok: false, results: [{ id: 'test-gaming', status: 'hold' }] });
     const out = excuseMergeGateRows([row], opts({ readVerdict }));

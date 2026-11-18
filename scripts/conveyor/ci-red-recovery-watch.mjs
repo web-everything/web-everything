@@ -56,6 +56,7 @@
  * SAME requirement every other conveyor dispatcher in this directory already has, e.g.
  * `we:scripts/operations/dispatch-lane-io.mjs#REPO_ROOT`) — it fetches the lane ref and pushes the rebuilt tip.
  */
+import { ciJobLogApiArgs } from '../lib/gh-ci-log.mjs';
 import { readFixPush } from './fix-push-state.mjs';
 import { resolveHandoffSettings } from '../lib/handoff-settings.mjs';
 import { dirname, join, resolve } from 'node:path';
@@ -454,7 +455,7 @@ export function defaultReadMainFailureSignature({ repo, detailsUrl, failingCheck
     if (!Array.isArray(jobs)) throw new Error('unreadable jobs');
     const found = new Set();
     for (const job of jobs.filter(j => ['failure', 'timed_out'].includes(j.conclusion)).slice(0, 6)) {
-      for (const signature of extractInfraSignatures(exec('gh', ['api', `repos/${repoSlug(repo)}/actions/jobs/${job.id}/logs`], options))) found.add(signature);
+      for (const signature of extractInfraSignatures(exec('gh', ciJobLogApiArgs(`repos/${repoSlug(repo)}/actions/jobs/${job.id}/logs`), options))) found.add(signature);
     }
     return [...found];
   };

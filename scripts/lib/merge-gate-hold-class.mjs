@@ -4,6 +4,7 @@
  * The strict parser mirrors #5013's parsePrResultTable: merge the two when #5013 lands.
  * Deliberately does not import merge-gate-ci or the drain's runtime graph.
  */
+import { ciJobLogApiArgs } from './gh-ci-log.mjs';
 import { readFileSync } from 'node:fs';
 import { HUMAN_REVIEW_HOLD_GATES } from './merge-gate-verdict.mjs';
 import { GATE_IDS } from './merge-gate-inventory.mjs';
@@ -201,7 +202,7 @@ export function readMergeGateVerdict({ repo, jobId, prNumber, runGh = runGhSync,
       const options = { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024,
         stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'merge-gate-verdict', repo } };
       const job = JSON.parse(runGh(['api', path], options));
-      const log = String(runGh(['api', `${path}/logs`], options));
+      const log = String(runGh(ciJobLogApiArgs(`${path}/logs`), options));
       cache.set(key, { job, log });
     }
     const { job, log } = cache.get(key);

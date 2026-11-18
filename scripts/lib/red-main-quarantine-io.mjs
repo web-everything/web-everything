@@ -18,6 +18,7 @@
  *   node scripts/lib/red-main-quarantine-io.mjs prune --actor=<..> --main-green=<true|false|unknown>
  *   node scripts/lib/red-main-quarantine-io.mjs show
  */
+import { ciJobLogApiArgs } from './gh-ci-log.mjs';
 import { execFileSync } from 'node:child_process';
 import { readFileSync, appendFileSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { writeAllSync } from './write-all-sync.mjs'; // a CLI's stdout must be drained before any process.exit
@@ -270,7 +271,7 @@ function readRepeatRuns(mainCiRuns, { state, jobFailures, readJobs, readLog, set
 
 /** One failed job's vitest failures from its log (`gh api …/jobs/<id>/logs`). Throws on an unreadable log. */
 export function readJobFailures(jobId, { exec, repoSlug }) {
-  const text = exec('gh', ['api', `repos/${repoSlug}/actions/jobs/${jobId}/logs`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL' });
+  const text = exec('gh', ciJobLogApiArgs(`repos/${repoSlug}/actions/jobs/${jobId}/logs`), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL' });
   return parseVitestFailures(String(text ?? ''));
 }
 

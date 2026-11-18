@@ -409,9 +409,9 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
 
   const expectExtraRetry = f => {
     const result = f.guard();
-    // Readable aggregate steps need no aggregate logs; the staged readers reuse the shard log.
+    // Readable aggregate steps need no aggregate logs; direct and wrapper transports each read the failed shard.
     const logReads = f.exec.mock.calls.flatMap(([, args]) => args.filter(arg => /\/logs(?:\?|$)/.test(arg)));
-    expect(logReads).toEqual([`repos/${repo}/actions/jobs/31/logs`]);
+    expect(logReads).toEqual([`repos/${repo}/actions/jobs/31/logs`, `repos/${repo}/actions/jobs/31/logs`]);
     expect(result.hold).toBe(false);
     expect(f.log.mock.calls.map(([line]) => line)).toContainEqual(
       expect.stringMatching(/^mq-same-head-retry: #6903 head \w+ — .*exact-test retry 2\/2/));
@@ -608,7 +608,7 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
   it('reads only the failed shard log summary tail, never an aggregator log', () => exactFixture(f => {
     f.guard();
     const reads = f.exec.mock.calls.flatMap(([, args]) => args.filter(arg => /\/logs(?:\?|$)/.test(arg)));
-    expect(reads).toEqual([`repos/${repo}/actions/jobs/31/logs`]);
+    expect(reads).toEqual([`repos/${repo}/actions/jobs/31/logs`, `repos/${repo}/actions/jobs/31/logs`]);
   }));
 
   describe('annotations and final summary (R953 residual: unhandled errors beside the sole failed test)', () => {
