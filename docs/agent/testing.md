@@ -4578,3 +4578,12 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+
+The owed-decision exemption enumerates required positive inputs in
+`RED_TEAM_EXEMPTION_INPUTS`. Test each key with omission and wrong types, and keep the
+structural mutations deleting each predicate and its call. Admission preserves unknown
+queue fields and requires readable, valid settings at every cascade layer. Persisted
+execution outcomes (including unknown terminal outcomes) remain recorded debt; only an
+explicit absent status or a recognized finished no-execution result can prove otherwise.
+A skipped pass needs no execution seal; any retained seal must be explicitly clean.

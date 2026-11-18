@@ -935,7 +935,8 @@ export function historicalCardOnlySkipCandidate(old) {
 /** Normalize one head snapshot for policy. `evidence` supplies an already-read snapshot without another scan. */
 export function readDrainRedTeamEvidence({ evidence, comments, carryHeads = [], ...options } = {}) {
   const raw = evidence ?? readDrainRedTeamSnapshot(options);
-  const snapshot = { ...raw, seats: (raw.seats ?? []).map(row => ({ ...row, valid: validateScorecard(row).ok })) };
+  const snapshot = { ...raw, ...(evidence === undefined && raw.ok === undefined ? { ok: true, carry: raw.carry ?? null } : {}),
+    seats: Array.isArray(raw.seats) ? raw.seats.map(row => ({ ...row, valid: validateScorecard(row).ok && (!Object.hasOwn(row, 'valid') || row.valid === true) })) : raw.seats };
   const readSource = ({ head, comments }) => {
     if (carryHeads.includes(head) || head === options.head) throw Error('carry cycle; inspect run evidence');
     return readDrainRedTeamEvidence({ ...options, head, comments, carryHeads: [...carryHeads, options.head] }).decisionInput;
@@ -1026,8 +1027,10 @@ function readDrainRedTeamSnapshot({ repo, pr, head, env = process.env,
     // Settlement provenance cannot stand in for a panel verdict, even if an older
     // writer retained one. Keep the status intact for recovery's provenance checks.
     const loopPayload = status.loopPayload?.carriedFrom != null ? { ...status.loopPayload, verdict: null } : status.loopPayload;
-    return { status, loopPayload, ...seatEvidence, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
-      ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: ['queued', 'running'].includes(status.status) || ['ran', 'error', 'failed'].includes(resultStatus), recorded: recorded || resultStatus === 'ran' };
+    return { status, loopPayload, ...seatEvidence, inFlight: live && status.status === 'running', queued: live && status.status === 'queued',
+      ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: ['queued', 'running'].includes(status.status) || ['ran', 'error', 'failed'].includes(resultStatus), recorded: recorded || !((['queued', 'running'].includes(status.status) && status.result == null)
+        || (status.status === 'finished' && (resultStatus === 'not-owed' || (resultStatus === 'skipped'
+          && (typeof status.result === 'string' || status.result.policy === 'card-only'))))) };
   }
   const exactHit = latestRun();
   if (exactHit.ok === false) return { ...exactHit, ...seatEvidence };
@@ -1044,7 +1047,7 @@ function readDrainRedTeamSnapshot({ repo, pr, head, env = process.env,
   }
   // An owing run with no job status yet: only the job's process knows its card-only skip decision, so hold the head
   // (skip off) until that status records it. The never-scheduled deadline still applies if no job ever writes one.
-  return { loopPayload, inFlight: false, scheduled: recorded || owes(loopPayload), recorded, ...seatEvidence, ...(owes(loopPayload) ? { skipCardOnly: false } : {}) };
+  return { status: status === undefined ? null : status, loopPayload, inFlight: false, queued: false, scheduled: recorded || owes(loopPayload), recorded, ...seatEvidence, ...(owes(loopPayload) ? { skipCardOnly: false } : {}) };
 }
 
 // R622: unknown run evidence the comment thread can answer. A review run left unfinished (its human confirm never

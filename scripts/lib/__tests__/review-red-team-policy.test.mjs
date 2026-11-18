@@ -2,7 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import { RED_TEAM_HOLDS, redTeamOwedDecision, redTeamReadReviewable } from '../review-red-team-policy.mjs';
 import { parseRedTeamComment } from '../red-team-gate.mjs';
-import { reviewedRead, completedSeat, completedComment } from './fixtures/red-team-owed.mjs';
+import { reviewedRead, completedSeat, completedComment, exemptInput } from './fixtures/red-team-owed.mjs';
 
 const head = 'a'.repeat(40), fromRev = 'b'.repeat(40);
 const pass = (rev = head) => ({ head: rev, read: reviewedRead(rev),
@@ -23,8 +23,7 @@ describe('redTeamOwedDecision', () => {
       .toContainEqual(RED_TEAM_HOLDS['seat-rows-invalid']);
   });
   it('exempts only a reviewable card-only head without seats or live work', () => {
-    const card = { ...pass(), read: reviewedRead(head, ['backlog/123-card.md']), seats: [], result: null,
-      scheduling: { skipCardOnly: true } };
+    const card = exemptInput(head);
     expect(redTeamOwedDecision(card)).toEqual({ owed: false, cleared: true, reasons: [] });
     expect(redTeamOwedDecision({ ...card, scheduling: { ...card.scheduling, scheduled: true } }).owed).toBe(false);
     for (const field of ['inFlight', 'queued', 'recorded']) {

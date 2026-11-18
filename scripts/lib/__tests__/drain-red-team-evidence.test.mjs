@@ -213,7 +213,7 @@ describe('status persistence and check publication share one claim', () => {
         recorded: true, env: f.env });
       expect(hold).toMatch(new RegExp(`^${RED_TEAM_UNSEALED_HOLD_PREFIX}`));
       sealAtFinish(f, { comments: [] })({ repo: f.repo, pr: f.pr, head: f.head });
-      expect(redTeamEnqueueHold({ ...finished(f), head: f.head, comments: [], scheduled: true, recorded: true, env: f.env }))
+      expect(redTeamEnqueueHold({ ...finished(f), seats: [], head: f.head, comments: [], scheduled: true, recorded: true, env: f.env }))
         .toBe(RED_TEAM_HOLDS['result-incomplete'].message);
     });
   });
@@ -530,9 +530,9 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     const f = fixture();
     recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result }, f);
     const evidence = readDrainRedTeamEvidence(f);
-    expect(evidence).toMatchObject({ recorded: false, seatRecorded: false, completedRecorded: false,
+    expect(evidence).toMatchObject({ recorded: true, seatRecorded: false, completedRecorded: false,
       failedSeatCount: 0, inFlight: false, status: { status: 'finished', result } });
-    expect(redTeamEnqueueHold({ ...f, ...evidence, comments: [] })).toMatch(/no recorded result/);
+    expect(redTeamEnqueueHold({ ...f, ...evidence, comments: [] })).toMatch(/result incomplete/);
     expect(evidence.scheduled).toBe(true);
   });
 
@@ -558,7 +558,7 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
           status: { status: 'finished', result: { status: 'skipped', policy: 'card-only' } } });
       } else {
         expect(evidence.carryConflict).toBe(true);
-        expect(evidence.carry).toBeUndefined();
+        expect(evidence.carry).toBeNull();
       }
     });
   it.each(['accept', 'changes'])('a carried %s verdict is never exposed as a live-head panel verdict', verdict => {
@@ -759,7 +759,7 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
   });
 
   it('does not invent an accept when no review run exists', () => {
-    expect(readDrainRedTeamEvidence(fixture())).toEqual({ loopPayload: null, recorded: false, seats: [], decisionInput: expect.objectContaining({ read: undefined, seats: [], result: null }),
+    expect(readDrainRedTeamEvidence(fixture())).toEqual({ status: null, ok: true, carry: null, queued: false, loopPayload: null, recorded: false, seats: [], decisionInput: expect.objectContaining({ read: undefined, seats: [], result: null }),
       seatRecorded: false, completedRecorded: false, failedSeatCount: 0, scheduled: false, inFlight: false });
   });
   it('pins the accepted-label boundary with empty status and run stores', () => {
@@ -772,7 +772,7 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     const run = { ...newRunRecord({ id: 'review-pr-5439', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }), ...payload(f.head) };
     writeRun(run, f.runsDir);
     expect(readDrainRedTeamEvidence(f)).toMatchObject({ scheduled: true, inFlight: false, recorded: false });
-    expect(readDrainRedTeamEvidence(f).queued).toBeUndefined();
+    expect(readDrainRedTeamEvidence(f).queued).toBe(false);
     expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), labels: ['review:accepted'], comments: [] })).toMatch(/no recorded result/);
     // A disabled scheduler or a non-accepting run schedules nothing; the job's finished status supersedes the run.
     expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence({ ...f, env: { ...f.env, WE_REVIEW_RED_TEAM: 'off' } }), comments: [] })).toMatch(/no recorded result/);
@@ -812,7 +812,7 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     // A crashed job leaves a dead writer: still held, but not a live queue entry that blocks the deadline escape.
     const dead = readDrainRedTeamEvidence({ ...f, isAlive: () => false });
     expect(dead).toMatchObject({ scheduled: true, inFlight: false });
-    expect(dead.queued).toBeUndefined();
+    expect(dead.queued).toBe(false);
   });
   // PR #6784 review: the reader and the recovery probe share one existence check, and unknown is never death.
   it.each([
@@ -1034,7 +1034,7 @@ it.each(['non-card read', 'missing read paths', 'non-card rename source', 'skipC
     const hasSeat = ['recorded seat', 'live-head seat'].includes(variant);
     const evidence = readDrainRedTeamEvidence({ ...f, isAlive: () => true, readPidStart: () => null,
       readScorecards: () => hasSeat ? [completedSeat(variant === 'live-head seat' ? f.head : oldHead, { repo: f.repo, pr: f.pr, status: 'error' })] : [] });
-    expect(evidence).toEqual({ loopPayload: null, seats: variant === 'live-head seat' ? [expect.objectContaining({ rev: f.head, valid: true })] : [],
+    expect(evidence).toEqual({ status: null, ok: true, carry: null, queued: false, loopPayload: null, seats: variant === 'live-head seat' ? [expect.objectContaining({ rev: f.head, valid: true })] : [],
       decisionInput: expect.objectContaining({ head: f.head, read: undefined }), recorded: variant === 'live-head seat',
       seatRecorded: variant === 'live-head seat', completedRecorded: false,
       failedSeatCount: variant === 'live-head seat' ? 1 : 0, scheduled: variant === 'live-head seat', inFlight: false });

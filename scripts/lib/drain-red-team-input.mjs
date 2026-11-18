@@ -1,21 +1,47 @@
 /** Admission normalization leaf: loading queue policy must not load the review/recovery IO graph. */
-import { readRedTeamDisposition, redTeamHoldPendingOnly, redTeamResultCommentForHead, readRedTeamProbes } from './red-team-gate.mjs';
+import { readRedTeamDisposition, redTeamHoldPendingOnly, redTeamResultCommentForHead, RED_TEAM_SETTINGS_FILE, resolveRedTeamProbes } from './red-team-gate.mjs';
+
+import { readFileSync } from 'node:fs';
+import { readPlatformPreferences } from './policy-cascade.mjs';
+
+// Unlike the scheduler's permissive fallback, admission needs a readable, valid cascade.
+function admissionSettings({ env, settingsPath, readSettings }) {
+  try {
+    const file = JSON.parse(readSettings(settingsPath, 'utf8'));
+    const { prefs, errors } = readPlatformPreferences({ env, readFile: readSettings });
+    const object = x => x !== null && typeof x === 'object' && !Array.isArray(x);
+    if (!object(file) || (Object.hasOwn(file, 'redTeam') && !object(file.redTeam))
+      || (Object.hasOwn(prefs, 'redTeam') && !object(prefs.redTeam)) || errors.length) return null;
+    const resolved = resolveRedTeamProbes({ file, platform: prefs.redTeam, env });
+    return resolved.invalid.length ? null : resolved.value;
+  } catch { return null; }
+}
 
 export function drainRedTeamDecisionInput({ evidence: raw, comments, head, pr, repo, env = process.env,
-  standingRuling, confirmedBreaks, readSource = raw?.decisionInput?.readSource } = {}) {
+  standingRuling, confirmedBreaks, settingsPath = RED_TEAM_SETTINGS_FILE, readSettings = readFileSync, readSource = raw?.decisionInput?.readSource } = {}) {
   const disposition = readRedTeamDisposition({ comments, pr, head, repo, env, standingRuling, setting: confirmedBreaks });
   const hit = redTeamResultCommentForHead(comments, pr, head);
   const fromRev = hit?.carriedFrom ?? raw.carry?.loopPayload?.carriedFrom;
-  let carry = raw.carry && Object.hasOwn(raw.carry, 'fromRev') ? raw.carry : null;
+  let carry = raw.carry == null ? raw.carry : Object.hasOwn(raw.carry, 'fromRev') ? raw.carry : undefined;
   if (fromRev && !carry) {
     try {
       carry = { fromRev, proof: readSource({ head: fromRev, comments: hit ? comments.slice(0, hit.commentIndex) : [] }) };
     } catch { /* unreadable source is a carry conflict, never payment */ }
   }
+  const settings = admissionSettings({ env, settingsPath, readSettings });
+  const status = raw.status, resultStatus = typeof status?.result === 'string' ? status.result : status?.result?.status;
+  const noExecution = status === null || (status?.head === head && status.status === 'finished'
+    && (resultStatus === 'not-owed' || (resultStatus === 'skipped'
+      && (typeof status.result === 'string' || status.result.policy === 'card-only'))));
+  const sealClear = status === null || (noExecution && ['sealedBreaks', 'sealedPosted'].every(key =>
+    !Object.hasOwn(status, key) || (Array.isArray(status[key]) && status[key].length === 0))
+    && !Object.hasOwn(status, 'storedFindings')
+    && (!Object.hasOwn(status, 'legacyHoldPublished') || status.legacyHoldPublished === false));
   const pendingPublish = redTeamHoldPendingOnly(disposition);
-  return { head, read: raw.loopPayload?.findings?.read, seats: raw.seats ?? [], result: hit?.parsed ?? null, carry,
-    ok: raw.ok, reason: raw.reason, carryConflict: raw.carryConflict || !!(fromRev && !carry),
+  return { head, read: raw.loopPayload?.findings?.read, seats: raw.seats, result: hit?.parsed ?? null, carry,
+    ok: raw.ok, reason: raw.reason, carryConflict: raw.carryConflict !== undefined && raw.carryConflict !== false ? raw.carryConflict : !!(fromRev && !carry),
     hasBreak: !pendingPublish && !!(disposition.sendBack.length || disposition.held.length), pendingPublish,
-    scheduling: { inFlight: !!raw.inFlight, queued: !!raw.queued, scheduled: !!raw.scheduled, recorded: !!raw.recorded,
-      skipCardOnly: raw.skipCardOnly ?? readRedTeamProbes({ env }).value.skipCardOnly } };
+    scheduling: { inFlight: raw.inFlight, queued: raw.queued, scheduled: raw.scheduled, recorded: raw.recorded,
+      execution: noExecution ? 'none' : 'unknown', sealClear, commentsReadable: Array.isArray(comments) && comments.every(comment => typeof comment?.body === 'string'),
+      settingsReadable: settings !== null, skipCardOnly: settings?.skipCardOnly === true && raw.skipCardOnly === true } };
 }

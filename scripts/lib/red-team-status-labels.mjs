@@ -47,7 +47,7 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
     : pendingOnly ? 'red-team:pending'
     : disposition.result ? 'red-team:clear'
       : finished ? finished
-      : redTeamOwedDecision(readDrainRedTeamEvidence({ repo, pr, head, env, comments, standingRuling, evidence }).decisionInput).owed ? 'red-team:pending' : null;
+      : redTeamOwedDecision(readDrainRedTeamEvidence({ repo, pr, head, env, comments, standingRuling, evidence, settingsPath }).decisionInput).owed ? 'red-team:pending' : null;
   const names = labels.map(l => typeof l === 'string' ? l : l?.name);
   // A head PROVEN card-only (readable net files, skip policy on) with no pass in flight, scheduled or recorded bypasses the
   // red-team pass and never gets an outcome, so its stale pending label would stay forever (#6733). Only pending is dropped:

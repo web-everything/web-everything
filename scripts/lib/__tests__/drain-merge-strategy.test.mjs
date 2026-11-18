@@ -12,7 +12,7 @@ import {
 import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
 import { rulesetSuggestion } from '../merge-queue-enqueue.mjs';
 // Load the renderer during collection: its cold import graph must not consume a gate assertion's timeout.
-import { reviewedRead, completedSeat, completedComment } from './fixtures/red-team-owed.mjs';
+import { reviewedRead, completedSeat, completedComment, idleEvidence } from './fixtures/red-team-owed.mjs';
 import { redTeamResultCommentForHead } from '../red-team-gate.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { publishAttention } from '../../operations/needs-you-feed.mjs';
@@ -39,7 +39,7 @@ const DRAIN = 'drain-bot';
 
 function harness({ changedFiles = ['scripts/x.mjs'], strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = process.env, evidence, requestRedTeam, baseTip = () => BASE_TIP, publishNeedsYou, redTeamDeadline, labelProvider, strategyExtra = {} } = {}) {
   // Unrelated queue tests get a proven card-only exemption; accepted-code tests get a scored read.
-  const defaultEvidence = (head = HEAD) => ({ loopPayload: { verdict: labels.includes('review:accepted') ? { verdict: 'accept' } : null,
+  const defaultEvidence = (head = HEAD) => ({ ...idleEvidence(), seats: undefined, loopPayload: { verdict: labels.includes('review:accepted') ? { verdict: 'accept' } : null,
     findings: { read: reviewedRead(head, labels.includes('review:accepted') ? ['scripts/example.mjs'] : ['backlog/fixture.md']) } },
     inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') });
   const admissionEvidence = (raw, key) => {
@@ -50,7 +50,7 @@ function harness({ changedFiles = ['scripts/x.mjs'], strategy = null, dryRun = f
       read: reviewedRead(hit.carriedFrom), seats: [{ ...completedSeat(hit.carriedFrom), valid: true }],
       result: { ...hit.parsed, rev: hit.carriedFrom, completedReview: hit.parsed.completedReview, shapedLines: hit.parsed.shapedLines },
       scheduling: { skipCardOnly: false } } } : null;
-    return Object.assign(Object.defineProperties({}, Object.getOwnPropertyDescriptors(raw ?? {})),
+    return Object.assign(Object.defineProperties(idleEvidence(), Object.getOwnPropertyDescriptors(raw ?? {})),
       { ...(raw?.loopPayload === undefined ? { loopPayload: defaultEvidence(key.head).loopPayload } : {}),
         seats: raw?.seats ?? (hit ? [completedSeat(key.head, { repo: key.repo, pr: key.pr })] : []), carry: raw?.carry ?? carry });
   };
@@ -770,7 +770,7 @@ describe('drain merge strategy — github-merge-queue', () => {
     const bad = harness({ strategy: 'github-merge-queue', ghView: { 1: MERGED } });
     // a transient read error / half-written file: readFile throws something that is not ENOENT
     const s = createDrainMergeStrategy({
-      readRedTeamEvidence: () => ({ seats: [], skipCardOnly: true, loopPayload: { findings: { read: reviewedRead(HEAD, ['backlog/state-fixture.md']) } } }),
+      readRedTeamEvidence: () => ({ ...idleEvidence(), loopPayload: { findings: { read: reviewedRead(HEAD, ['backlog/state-fixture.md']) } } }),
       isLocalRepo: () => true, localSlug: LOCAL, statePath: '/x/state.json', resolved: policyOf('github-merge-queue'),
       cancelObsoleteRuns: () => {}, batching: { gate: () => ({ admit: true }), observe: () => ({}) },
       log: { write: (l) => bad.logs.push(l) }, exec: (c, a) => { bad.calls.push([c, ...a]); throw new Error('no gh call expected'); },
@@ -802,7 +802,7 @@ describe('drain merge strategy — github-merge-queue', () => {
     };
     const logs = [];
     const s = createDrainMergeStrategy({
-      readRedTeamEvidence: () => ({ seats: [], skipCardOnly: true, loopPayload: { findings: { read: reviewedRead(HEAD, ['backlog/state-fixture.md']) } } }),
+      readRedTeamEvidence: () => ({ ...idleEvidence(), loopPayload: { findings: { read: reviewedRead(HEAD, ['backlog/state-fixture.md']) } } }),
       isLocalRepo: () => true, localSlug: LOCAL, statePath: '/x/state.json', resolved: policyOf('github-merge-queue'), exec,
       log: { write: (l) => logs.push(l) },
       readFile: () => { if (broken) return '{"pending": ['; return JSON.stringify(stored); },
@@ -816,7 +816,7 @@ describe('drain merge strategy — github-merge-queue', () => {
     broken = false;
     const exec2 = (cmd, args) => (args.some(a => a.includes('isInMergeQueue')) ? JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: true, headRefOid: HEAD } } } }) : exec(cmd, args));
     const s2 = createDrainMergeStrategy({
-      readRedTeamEvidence: () => ({ seats: [], skipCardOnly: true, loopPayload: { findings: { read: reviewedRead(HEAD, ['backlog/state-fixture.md']) } } }),
+      readRedTeamEvidence: () => ({ ...idleEvidence(), loopPayload: { findings: { read: reviewedRead(HEAD, ['backlog/state-fixture.md']) } } }),
       isLocalRepo: () => true, localSlug: LOCAL, statePath: '/x/state.json', resolved: policyOf('github-merge-queue'), exec: exec2,
       log: { write: (l) => logs.push(l) }, readFile: () => JSON.stringify(stored),
       writeState: (_p, st) => { writes++; stored = JSON.parse(JSON.stringify(st)); },

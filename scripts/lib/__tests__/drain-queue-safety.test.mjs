@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from 'no
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { describe, expect, it, vi } from 'vitest';
-import { reviewedRead, completedSeat } from './fixtures/red-team-owed.mjs';
+import { reviewedRead, completedSeat, idleEvidence } from './fixtures/red-team-owed.mjs';
 import * as queueSafety from '../drain-queue-safety.mjs';
 import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason, decideMqSameHead, readMqTimeline, mqSameHeadGuard, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions, mqSameHeadRefreshStatePath } from '../drain-queue-safety.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
@@ -178,7 +178,7 @@ describe('merge-queue same-head failure admission', () => {
           readDrainRedTeamEvidence: () => {
             stages.push('red-team');
             if (outcome === 'unreadable evidence') throw Error('red-team evidence unreadable');
-            return { scheduled: outcome === 'red-team hold', skipCardOnly: true,
+            return { ...idleEvidence(), scheduled: outcome === 'red-team hold', skipCardOnly: true,
               loopPayload: { findings: { read: reviewedRead(head, ['backlog/refresh-fixture.md']) } }, inFlight: outcome === 'red-team hold' };
           },
           // Exercise all nested standing-ruling read adapters even without a grant in this thread.
@@ -1300,7 +1300,7 @@ const hold = (over = {}) => {
     read: reviewedRead(hit.carriedFrom), seats: [{ ...completedSeat(hit.carriedFrom), valid: true }],
     result: { ...hit.parsed, rev: hit.carriedFrom, completedReview: hit.parsed.completedReview, shapedLines: hit.parsed.shapedLines },
     scheduling: { skipCardOnly: false } } } : null;
-  return redTeamEnqueueHold({ carry, scheduled: over.loopPayload !== null && over.loopPayload?.verdict?.verdict !== 'needs-human', loopPayload: { verdict: { verdict: 'accept' }, findings: { read: reviewedRead(over.head ?? head) } }, seats: over.recorded || over.comments?.length ? [completedSeat(over.head ?? head)] : [], labels: ['review:accepted'], comments: [], pr: 5283, head, env: {}, ...over });
+  return redTeamEnqueueHold({ ...idleEvidence(), carry, scheduled: over.loopPayload !== null && over.loopPayload?.verdict?.verdict !== 'needs-human', loopPayload: { verdict: { verdict: 'accept' }, findings: { read: reviewedRead(over.head ?? head) } }, seats: over.recorded || over.comments?.length ? [completedSeat(over.head ?? head)] : [], labels: ['review:accepted'], comments: [], pr: 5283, head, env: {}, ...over });
 };
 const broken = [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }];
 const gate = (sha, outcome) => ({ ...bot, body: redTeamGateMarker(5283, sha, outcome) });

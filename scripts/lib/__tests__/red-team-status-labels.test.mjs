@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readDrainRedTeamEvidence, recordRedTeamStatus } from '../drain-red-team-evidence.mjs';
 import { planRedTeamStatusLabels, syncRedTeamStatusLabels } from '../red-team-status-labels.mjs';
-import { reviewedRead } from './fixtures/red-team-owed.mjs';
+import { reviewedRead, idleEvidence } from './fixtures/red-team-owed.mjs';
 import { resolveRedTeamProbes } from '../red-team-gate.mjs';
 const head = 'a'.repeat(40);
 const result = (findings = '') => ({ author: { login: 'web-everything' }, body: `<!-- we:red-team-advisory pr=42 rev=${head} -->\n${findings}` });
@@ -48,7 +48,7 @@ describe('head-bound red-team operator labels', () => {
   });
   it('shows a card-only head as pending only when the pass is not skipped or has started', () => {
     const loopPayload = { findings: { read: reviewedRead(head, ['backlog/123-card.md']) } };
-    const plan = (env, evidence) => planRedTeamStatusLabels({ ...input, labels: [], comments: [], env, evidence: { loopPayload, ...evidence } }).add;
+    const plan = (env, evidence) => planRedTeamStatusLabels({ ...input, labels: [], comments: [], env, evidence: { ...idleEvidence(), loopPayload, ...evidence } }).add;
     expect(plan({}, { scheduled: true })).toBeNull();
     expect(plan({ WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, { scheduled: true })).toBe('red-team:pending');
     expect(plan({}, { scheduled: true, inFlight: true })).toBe('red-team:pending');
@@ -146,7 +146,7 @@ describe('stale pending on a card-only current head', () => {
     expect(run(() => { throw Error('gh down'); }).plan.remove).toEqual([]);
     // A throwing head re-check must never let stored card-only evidence drop pending (fail closed, audit probe).
     const recheckThrows = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrFiles: () => ['scripts/x.mjs'], readPrState: () => { throw Error('gh down'); } };
-    const bypassEvidence = { skipCardOnly: true, loopPayload: { findings: { read: reviewedRead(head, ['backlog/1-c.md']) } } };
+    const bypassEvidence = { ...idleEvidence(), loopPayload: { findings: { read: reviewedRead(head, ['backlog/1-c.md']) } } };
     expect(syncRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], evidence: bypassEvidence, live: { headRefOid: head, labels: ['red-team:pending'] }, comments: [], provider: recheckThrows }))
       .toEqual({ add: null, remove: [] });
     expect(recheckThrows.setLabels).not.toHaveBeenCalled();
@@ -172,7 +172,7 @@ it('headFiles path keeps pending when the settings file is unreadable (the defau
 
 describe('card-only head that bypasses the red-team pass loses a stale pending label (#6733)', () => {
   const card = { findings: { read: reviewedRead(head, ['backlog/8182-card.md']) } };
-  const plan = (labels, evidence, env = {}) => planRedTeamStatusLabels({ ...input, labels, comments: [], env, evidence });
+  const plan = (labels, evidence, env = {}) => planRedTeamStatusLabels({ ...input, labels, comments: [], env, evidence: { ...idleEvidence(), ...evidence } });
   it('removes red-team:pending when the head is proven card-only and nothing is owed', () => {
     expect(plan(['red-team:pending'], { loopPayload: card })).toEqual({ add: null, remove: ['red-team:pending'] });
   });
@@ -207,10 +207,10 @@ describe('card-only head that bypasses the red-team pass loses a stale pending l
   it('audit probe: a carry conflict on the evidence keeps pending', () => {
     expect(plan(['red-team:pending'], { loopPayload: card, carryConflict: { reason: 'conflicting carry' } })).toEqual({ add: null, remove: [] });
   });
-  it('audit probe: an unreadable policy file (catch-all default) keeps pending; a readable file or recorded skip removes it', () => {
-    const planWith = (evidence, settingsPath) => planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [], env: {}, evidence, settingsPath });
+  it('audit probe: an unreadable policy file (catch-all default) keeps pending; a readable file permits exemption; recorded skip never overrides an unreadable policy', () => {
+    const planWith = (evidence, settingsPath) => planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [], env: {}, evidence: { ...idleEvidence(), ...evidence }, settingsPath });
     expect(planWith({ loopPayload: card }, '/nonexistent/red-team.json')).toEqual({ add: null, remove: [] });
-    expect(planWith({ loopPayload: card, skipCardOnly: true }, '/nonexistent/red-team.json')).toEqual({ add: null, remove: ['red-team:pending'] });
+    expect(planWith({ loopPayload: card, skipCardOnly: true }, '/nonexistent/red-team.json')).toEqual({ add: null, remove: [] });
     expect(planWith({ loopPayload: card })).toEqual({ add: null, remove: ['red-team:pending'] });
   });
   it('keeps pending when the run evidence is unreadable', () => {

@@ -77,7 +77,7 @@ describe('review-job red-team skip settlement', () => {
       expect(stored.result).toEqual(cardOnly ? { status: 'skipped', policy: 'card-only' } : { status: 'skipped' });
       expect(normalizeRedTeamResult(stored.result)).toEqual({ priorResult: 'skipped', priorComment: undefined });
       expect(redTeamSkipNeedsSettlement(stored)).toBe(cardOnly);
-      expect(readEvidence()).toMatchObject({ loopPayload: f.loopPayload, scheduled: false, recorded: false, inFlight: false, skipCardOnly: true });
+      expect(readEvidence()).toMatchObject({ loopPayload: f.loopPayload, scheduled: false, recorded: !cardOnly, inFlight: false, skipCardOnly: true });
       writeRun({ ...newRunRecord({ id: 'review-pr-skip', op: 'review-pr', input: { repo, pr } }), ...f.loopPayload }, env.WE_SHARED_RUNS_DIR);
       if (!cardOnly) {
         expect(() => production.redTeamStatus({ repo, pr, loopPayload: f.loopPayload, status: 'queued', redTeamMode: 'fresh' })).toThrow('prior pass cannot restart');
@@ -744,7 +744,7 @@ describe('writer skipCardOnly setting on a code PR', () => {
       expect(result.policy).not.toBe('card-only');
       expect(cliAvailable).toHaveBeenCalled();
       const evidence = readDrainRedTeamEvidence({ repo, pr, head, env, list: () => [], readScorecards: () => [] });
-      expect(evidence).toMatchObject({ skipCardOnly: true, scheduled: true, recorded: false, inFlight: false });
+      expect(evidence).toMatchObject({ skipCardOnly: true, scheduled: true, recorded: true, inFlight: false });
       expect(redTeamOwedDecision(evidence.decisionInput).owed).toBe(true);
       expect(planRedTeamStatusLabels({ repo, pr, head, evidence, env, comments: [] }))
         .toEqual({ add: 'red-team:pending', remove: [] });

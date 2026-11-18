@@ -72,9 +72,37 @@ export function redTeamReadReviewable(read, head) {
     && read.diffScored === true && typeof read.diffText === 'string' && !!read.diffText.trim();
 }
 
+/** Every exemption prerequisite is positive proof; missing values never mean idle/empty/clean. */
+export const RED_TEAM_EXEMPTION_INPUTS = Object.freeze({
+  head: x => typeof x.head === 'string' && !!x.head,
+  'read.netBasis.rev': x => x.read?.netBasis?.rev === x.head,
+  'read.diffScored': x => x.read?.diffScored === true,
+  'read.diffText': x => typeof x.read?.diffText === 'string' && !!x.read.diffText.trim(),
+  'read.netChangedFiles': x => Array.isArray(x.read?.netChangedFiles) && x.read.netChangedFiles.length > 0 && redTeamCardOnly(x.read),
+  'read.netRenameSources': x => Array.isArray(x.read?.netRenameSources) && redTeamCardOnly(x.read),
+  seats: x => Array.isArray(x.seats) && x.seats.length === 0,
+  ok: x => x.ok === true,
+  result: x => x.result === null,
+  carry: x => x.carry === null,
+  carryConflict: x => x.carryConflict === false,
+  hasBreak: x => x.hasBreak === false,
+  pendingPublish: x => x.pendingPublish === false,
+  'scheduling.skipCardOnly': x => x.scheduling?.skipCardOnly === true,
+  'scheduling.settingsReadable': x => x.scheduling?.settingsReadable === true,
+  'scheduling.commentsReadable': x => x.scheduling?.commentsReadable === true,
+  'scheduling.sealClear': x => x.scheduling?.sealClear === true,
+  'scheduling.execution': x => x.scheduling?.execution === 'none',
+  'scheduling.recorded': x => x.scheduling?.recorded === false,
+  'scheduling.inFlight': x => x.scheduling?.inFlight === false,
+  'scheduling.queued': x => x.scheduling?.queued === false,
+  // Scheduling intent alone is not live work, but its read must have succeeded.
+  'scheduling.scheduled': x => typeof x.scheduling?.scheduled === 'boolean',
+});
+
 /** One decision for admission, recovery and carry. Inputs are normalized by the evidence reader. */
-export function redTeamOwedDecision({ head, read, seats, result, carry, scheduling = {},
-  ok, reason, carryConflict, hasBreak = false, pendingPublish = false } = {}) {
+export function redTeamOwedDecision(input = {}) {
+  const { head, read, seats, result, carry, scheduling = {},
+    ok, reason, carryConflict, hasBreak = false, pendingPublish = false } = input;
   const reasons = [];
   const hold = kind => reasons.push(RED_TEAM_HOLDS[kind]);
   if (hasBreak) hold('break');
@@ -86,8 +114,7 @@ export function redTeamOwedDecision({ head, read, seats, result, carry, scheduli
   if (!reviewable) hold('unreviewable-read');
   const validSeats = Array.isArray(seats) && seats.every(row => row?.valid === true);
   if (!validSeats) hold('seat-rows-invalid');
-  const exempt = reviewable && validSeats && seats.length === 0 && scheduling.skipCardOnly === true
-    && redTeamCardOnly(read) && !scheduling.inFlight && !scheduling.queued && !scheduling.recorded;
+  const exempt = Object.values(RED_TEAM_EXEMPTION_INPUTS).every(proven => proven(input));
   let owed = !exempt || reasons.length > 0;
   const completedResult = isPublishableRedTeamResult(result) && result.completedReview === true && result.rev === head;
   let carried = false;

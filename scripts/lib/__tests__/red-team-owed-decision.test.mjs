@@ -6,10 +6,10 @@ import ts from 'typescript';
 import { recordRedTeamStatus, readDrainRedTeamEvidence, readRecoveryWitness, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
 import { resolveScorecardStorePath } from '../../conveyor/run-scorecard-store.mjs';
-import { redTeamOwedDecision, redTeamReadReviewable } from '../review-red-team-policy.mjs';
+import { redTeamOwedDecision, redTeamReadReviewable, RED_TEAM_EXEMPTION_INPUTS } from '../review-red-team-policy.mjs';
 import { redTeamAdmissionHold } from '../drain-queue-safety.mjs';
 import { failedRedTeamRetry } from '../red-team-run-result.mjs';
-import { reviewedRead, completedSeat, completedComment } from './fixtures/red-team-owed.mjs';
+import { reviewedRead, completedSeat, completedComment, exemptInput } from './fixtures/red-team-owed.mjs';
 
 const roots = [];
 afterEach(() => roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })));
@@ -62,17 +62,18 @@ describe('PR-A v2 acceptance over persisted review, status and scorecard files',
   });
   it('6: carryConflict blocks even with ok unset', () => {
     const f = fixture(), evidence = { ...readDrainRedTeamEvidence(f), carryConflict: true };
+    delete evidence.ok;
     expect(evidence.ok).toBeUndefined();
     expect(redTeamAdmissionHold({ ...f, ...evidence })).toMatchObject({ kind: 'carry-conflict', blocking: true });
   });
-  it('canonical audit: a finished ran status with a clean seal, no seats and no comment still owes its result', () => {
+  it.each(['ran', 'failed', 'error', 'partial', 'unknown', null, {}, { status: 'unknown' }, { status: 'skipped', policy: 'unknown' }])('canonical audit: finished execution %j with a clean seal, no seats and no comment still owes its result', result => {
     const f = fixture(), loopPayload = readDrainRedTeamEvidence(f).loopPayload;
-    recordRedTeamStatus({ ...f, loopPayload, status: 'finished', result: 'ran' }, { env: f.env });
+    recordRedTeamStatus({ ...f, loopPayload, status: 'finished', result }, { env: f.env });
     const path = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
     const status = JSON.parse(readFileSync(path, 'utf8'));
     writeFileSync(path, JSON.stringify({ ...status, sealedBreaks: [], sealedPosted: [] }));
     const evidence = readDrainRedTeamEvidence(f);
-    expect(evidence).toMatchObject({ recorded: true, seats: [], status: { status: 'finished', result: 'ran' } });
+    expect(evidence).toMatchObject({ recorded: true, seats: [], status: { status: 'finished', result } });
     expect(evidence.decisionInput).toMatchObject({ result: null, pendingPublish: false, scheduling: { recorded: true } });
     expect(redTeamOwedDecision(evidence.decisionInput)).toMatchObject({ owed: true, cleared: false });
     expect(redTeamAdmissionHold({ ...f, ...evidence })).toMatchObject({ kind: 'result-incomplete', blocking: true });
@@ -94,6 +95,85 @@ describe('PR-A v2 acceptance over persisted review, status and scorecard files',
   });
 });
 
+
+it.each(['queued', 'running', 'unknown'])('a recorded failed execution remains debt even with state %s', status => {
+  const f = fixture(), loopPayload = readDrainRedTeamEvidence(f).loopPayload;
+  recordRedTeamStatus({ ...f, loopPayload, status, result: 'failed' }, { env: f.env });
+  const evidence = readDrainRedTeamEvidence(f);
+  expect(evidence.recorded).toBe(true);
+  expect(redTeamOwedDecision(evidence.decisionInput)).toMatchObject({ owed: true, cleared: false });
+});
+
+const exemptionKeys = [
+  'head', 'read.netBasis.rev', 'read.diffScored', 'read.diffText', 'read.netChangedFiles', 'read.netRenameSources',
+  'seats', 'ok', 'result', 'carry', 'carryConflict', 'hasBreak', 'pendingPublish',
+  'scheduling.skipCardOnly', 'scheduling.settingsReadable', 'scheduling.commentsReadable', 'scheduling.sealClear',
+  'scheduling.execution', 'scheduling.recorded', 'scheduling.inFlight', 'scheduling.queued', 'scheduling.scheduled',
+];
+it.each(exemptionKeys)('exemption requires explicit positive input: %s (omitted, null, object, wrong scalar)', key => {
+  const baseline = exemptInput('a'.repeat(40));
+  expect(redTeamOwedDecision(baseline)).toEqual({ owed: false, cleared: true, reasons: [] });
+  for (const value of [undefined, ...(key === 'result' || key === 'carry' ? [false] : [null]), {}, 7]) {
+    const input = structuredClone(baseline), parts = key.split('.'), leaf = parts.pop();
+    const parent = parts.reduce((node, part) => node[part], input);
+    if (value === undefined) delete parent[leaf]; else parent[leaf] = value;
+    expect(redTeamOwedDecision(input).owed, `${key}=${JSON.stringify(value)}`).toBe(true);
+  }
+});
+it.each(['unknown', 'ran', 'failed', 'error', 'partial', 'skipped', 'false'])('unrecognized execution proof %s never exempts', execution => {
+  const input = exemptInput('a'.repeat(40)); input.scheduling.execution = execution;
+  expect(redTeamOwedDecision(input).owed).toBe(true);
+});
+it.each([undefined, null, false, 'true', 'unknown'])('a seat row without valid:true never exempts: %j', valid => {
+  const input = exemptInput('a'.repeat(40)); input.seats = [{ ...completedSeat(input.head), valid }];
+  expect(redTeamOwedDecision(input)).toMatchObject({ owed: true, cleared: false });
+  expect(redTeamOwedDecision(input).reasons.map(h => h.kind)).toContain('seat-rows-invalid');
+});
+it.each(['EACCES', 'missing', 'malformed JSON', 'invalid object', 'invalid setting', 'invalid env', 'unreadable platform', 'invalid platform'])(
+  'canonical audit: %s settings cannot prove the card-only exemption', variant => {
+    const f = fixture(), path = join(f.env.CONVEYOR_STATE_ROOT, 'red-team-settings.json');
+    writeFileSync(path, JSON.stringify({ redTeam: { skipCardOnly: true } }));
+    const options = { ...f, settingsPath: path };
+    expect(redTeamOwedDecision(readDrainRedTeamEvidence(options).decisionInput).owed).toBe(false);
+    if (variant === 'EACCES') options.readSettings = (file, ...args) => {
+      if (file === path) throw Object.assign(Error('permission denied'), { code: 'EACCES' });
+      return readFileSync(file, ...args);
+    };
+    if (variant === 'missing') rmSync(path);
+    if (variant === 'malformed JSON') writeFileSync(path, '{');
+    if (variant === 'invalid object') writeFileSync(path, '[]');
+    if (variant === 'invalid setting') writeFileSync(path, JSON.stringify({ redTeam: { skipCardOnly: 'unknown' } }));
+    if (variant === 'invalid env') options.env = { ...f.env, WE_RED_TEAM_SKIP_CARD_ONLY: 'unknown' };
+    if (variant.endsWith('platform')) {
+      const platform = join(f.env.CONVEYOR_STATE_ROOT, 'platform.json');
+      writeFileSync(platform, variant.startsWith('unreadable') ? '{' : JSON.stringify({ redTeam: { skipCardOnly: 'unknown' } }));
+      options.env = { ...f.env, WE_PLATFORM_PREFERENCES_FILE: platform };
+    }
+    const evidence = readDrainRedTeamEvidence(options);
+    expect(evidence.decisionInput.scheduling.settingsReadable).toBe(false);
+    expect(redTeamOwedDecision(evidence.decisionInput)).toMatchObject({ owed: true, cleared: false });
+    expect(redTeamAdmissionHold({ ...options, ...evidence })).not.toBeNull();
+  });
+it.each([
+  ['status omitted', e => { delete e.status; }],
+  ['unknown state', e => { e.status.status = 'unknown'; }],
+  ['unknown result', e => { e.status.result = 'unknown'; }],
+  ['unknown skip policy', e => { e.status.result.policy = 'unknown'; }],
+  ['invalid seal', e => { e.status.sealedBreaks = 'unknown'; }],
+  ['unposted seal', e => { e.status.sealedPosted = 'unknown'; }],
+  ['unknown recorded', e => { e.recorded = 'false'; }],
+  ['missing seats', e => { delete e.seats; }],
+  ['unknown carry', e => { e.carry = {}; }],
+  ['unknown queued', e => { e.queued = 'false'; }],
+  ['invalid seat flag', e => { e.seats = [{ ...completedSeat(e.decisionInput.head), valid: false }]; }],
+  ['unknown carry conflict', e => { e.carryConflict = null; }],
+])('normalization preserves unproven %s as owed', (_name, corrupt) => {
+  const f = fixture(), evidence = readDrainRedTeamEvidence(f);
+  expect(redTeamOwedDecision(evidence.decisionInput).owed).toBe(false);
+  corrupt(evidence);
+  expect(redTeamOwedDecision(readDrainRedTeamEvidence({ ...f, evidence }).decisionInput).owed).toBe(true);
+});
+
 // Parse the actual source: call deletion and prose-based routing must fail independently of runtime fixtures.
 const sources = () => Object.fromEntries(['drain-queue-safety.mjs', 'drain-merge-strategy.mjs', 'drain-red-team-input.mjs', 'review-red-team-policy.mjs']
   .map(file => [file, readFileSync(new URL(`../${file}`, import.meta.url), 'utf8')]));
@@ -105,8 +185,14 @@ function all(node, predicate) {
 }
 const calls = (node, name) => all(node, n => ts.isCallExpression(n) && n.expression.getText() === name);
 function assertStructure(source) {
-  expect(source['drain-red-team-input.mjs']).toMatch(/recorded: !!raw\.recorded/);
-  expect(source['review-red-team-policy.mjs']).toMatch(/!scheduling\.recorded/);
+  expect(source['drain-red-team-input.mjs']).toMatch(/recorded: raw\.recorded/);
+  const policy = parse('review-red-team-policy.mjs', source['review-red-team-policy.mjs']);
+  const table = all(policy, n => ts.isVariableDeclaration(n) && n.name?.getText() === 'RED_TEAM_EXEMPTION_INPUTS');
+  expect(table).toHaveLength(1);
+  const properties = table[0].initializer.arguments[0].properties;
+  expect(properties.map(p => p.name.text)).toEqual(exemptionKeys);
+  for (const property of properties) expect(property.initializer.getText()).toBe(RED_TEAM_EXEMPTION_INPUTS[property.name.text].toString());
+  expect(policy.text).toContain('Object.values(RED_TEAM_EXEMPTION_INPUTS).every(proven => proven(input))');
   expect(source['review-red-team-policy.mjs']).toMatch(/&& Array\.isArray\(read\.netRenameSources\)/);
   const queue = parse('drain-queue-safety.mjs', source['drain-queue-safety.mjs']);
   const merge = parse('drain-merge-strategy.mjs', source['drain-merge-strategy.mjs']);
@@ -131,8 +217,12 @@ it('structural: each admission delegates exactly once; holds never branch on inc
   assertStructure(sources());
 });
 it.each([
-  ['recorded normalization deleted', 'drain-red-team-input.mjs', text => text.replace('recorded: !!raw.recorded,', '')],
-  ['recorded exemption guard deleted', 'review-red-team-policy.mjs', text => text.replace(' && !scheduling.recorded', '')],
+  ['recorded normalization deleted', 'drain-red-team-input.mjs', text => text.replace('recorded: raw.recorded,', '')],
+  ...exemptionKeys.map(key => [`exemption prerequisite ${key} deleted`, 'review-red-team-policy.mjs', text => {
+    const line = text.split('\n').find(line => line.trimStart().startsWith(`${key.includes('.') ? `'${key}'` : key}: x =>`));
+    return text.replace(line, '');
+  }]),
+  ['exemption table call deleted', 'review-red-team-policy.mjs', text => text.replace('Object.values(RED_TEAM_EXEMPTION_INPUTS).every(proven => proven(input))', 'true')],
   ['rename readability guard deleted', 'review-red-team-policy.mjs', text => text.replace('&& Array.isArray(read.netRenameSources)', '')],
   ['policy delegation deleted', 'drain-queue-safety.mjs', text => text.replace('redTeamOwedDecision(decisionInput)', '({ reasons: [] })')],
   ...[0, 1, 2].map(index => [`merge admission call ${index + 1} deleted`, 'drain-merge-strategy.mjs', text => {
