@@ -1,9 +1,10 @@
 /** @file Real Git/Codex and JSONL persistence adapters for the standalone audit. */
+import { appendChained } from '../lib/audit-ledger-chain.mjs';
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
 import * as realFs from 'node:fs';
 import { spawnSync as realSpawnSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 
 const DEFAULT_RECORD_PATH = '~/workspace/.operations/coordination/audits.jsonl';
@@ -57,18 +58,21 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
       }
     },
     appendRecord(record) {
-      let settings;
-      try { settings = JSON.parse(fs.readFileSync(SETTINGS, 'utf8')); }
-      catch (error) { if (error.code !== 'ENOENT') throw error; settings = {}; }
-      const configured = settings.auditRecordPath ?? DEFAULT_RECORD_PATH;
-      if (typeof configured !== 'string' || !configured.trim()) throw new Error('invalid auditRecordPath');
-      const path = configured.startsWith('~/') ? join(home, configured.slice(2))
-        : configured === '~' ? home : resolve(cwd, configured);
-      fs.mkdirSync(dirname(path), { recursive: true });
-      fs.appendFileSync(path, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 });
+      return appendChained(auditRecordPath({ cwd, home, fs }), record, { fs });
     },
     now: () => new Date().toISOString(),
     stdout: text => process.stdout.write(text),
     stderr: text => process.stderr.write(text),
   };
+}
+
+/** Shared strict path resolution for the writer and the explicit genesis migration. */
+export function auditRecordPath({ cwd = process.cwd(), home = homedir(), fs = realFs } = {}) {
+  let settings;
+  try { settings = JSON.parse(fs.readFileSync(SETTINGS, 'utf8')); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; settings = {}; }
+  const configured = settings.auditRecordPath ?? DEFAULT_RECORD_PATH;
+  if (typeof configured !== 'string' || !configured.trim()) throw new Error('invalid auditRecordPath');
+  return configured.startsWith('~/') ? join(home, configured.slice(2))
+    : configured === '~' ? home : resolve(cwd, configured);
 }

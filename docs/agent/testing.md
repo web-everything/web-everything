@@ -4478,3 +4478,16 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+## Audit ledger writer fixtures (R1047)
+
+Await `createAuditDeps().appendRecord`: it locks and fsyncs before resolving. Before genesis,
+records retain the legacy shape; after genesis, test raw-line hashes and contiguous sequences.
+Exercise `audit-ledger-genesis` through `createGenesisRunner({ path })` with a temporary path;
+never use the coordination ledger in tests. Apply re-reads under the append lock. For an
+unterminated legacy line, the genesis digest includes the newline inserted before genesis.
+
+The writer holds `.lock.reap` through lock acquisition, stale reclamation, append and release.
+The deterministic replacement-interleaving test pauses a competing writer between the stale
+check and PID read. An abandoned coordinator fails closed after bounded retries and requires
+operator inspection/repair; it is never automatically reclaimed.

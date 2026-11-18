@@ -67,6 +67,7 @@ describe('runner freshness policy', () => {
         "adoption-matrix",
         "agent-activity",
         "ai-routing",
+        "audit-ledger-genesis",
         "ci-heal-reset",
         "claim",
         "clear-claim",
@@ -218,7 +219,7 @@ describe('runner freshness policy', () => {
   describe('codex-audit --json', () => {
     const SHA = 'a'.repeat(40), HEAD = 'b'.repeat(40);
     const deps = (answer, out = []) => ({ resolveSha: ref => (ref === HEAD ? HEAD : SHA), runCodex: () => answer,
-      appendRecord: async () => {}, now: () => '2026-11-02T00:00:00Z', stdout: t => out.push(t), stderr: () => {} });
+      fingerprint: () => 'c'.repeat(64), appendRecord: async () => {}, now: () => '2026-11-02T00:00:00Z', stdout: t => out.push(t), stderr: () => {} });
     const run = async (answer, json) => {
       const written = [];
       const auditDeps = { ...deps(answer, written), stderr: t => written.push(t), appendRecord: vi.fn() };

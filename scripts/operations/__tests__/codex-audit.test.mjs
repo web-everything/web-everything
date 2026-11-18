@@ -26,6 +26,7 @@ function fixture(answer = 'NOT WEAKENED') {
   const deps = {
     resolveSha: vi.fn(ref => ref === 'origin/main' ? BASE : HEAD),
     runCodex: vi.fn(async () => answer),
+    fingerprint: vi.fn(async () => 'c'.repeat(64)),
     appendRecord: vi.fn(record => { records.push(record); }),
     now: () => AT,
     stdout: text => output.push(text), stderr: text => errors.push(text),
@@ -74,7 +75,7 @@ describe('canonical audit', () => {
     expect(await main(ARGS, f.deps)).toBe(code);
     expect(f.output.join('')).toBe(`${verdict}\nscripts/example.mjs:12 why\n`);
     expect(f.records).toEqual([{ at: AT, base: BASE, head: HEAD, baseRef: 'origin/main',
-      questionHash: QUESTION_HASH, verdict, findings: ['scripts/example.mjs:12 why'] }]);
+      questionHash: QUESTION_HASH, verdict, findings: ['scripts/example.mjs:12 why'], fingerprint: 'c'.repeat(64) }]);
     expect(f.deps.runCodex.mock.calls[0][0]).toContain(CANONICAL_QUESTION);
     expect(f.deps.runCodex.mock.calls[0][0]).toContain(`git diff ${BASE}...${HEAD}`);
     expect(f.deps.resolveSha.mock.calls).toEqual([['origin/main'], [HEAD]]);
@@ -225,7 +226,8 @@ describe('canonical audit', () => {
 
 function adapter(report = { exitCode: 0, timedOut: false, lastMessage: 'NOT WEAKENED' }, options = {}) {
   const fs = { readFileSync: vi.fn(() => '{}'), mkdtempSync: vi.fn(() => '/scratch/audit-1'),
-    copyFileSync: vi.fn(), writeFileSync: vi.fn(), rmSync: vi.fn(), mkdirSync: vi.fn(), appendFileSync: vi.fn() };
+    copyFileSync: vi.fn(), writeFileSync: vi.fn(), rmSync: vi.fn(), mkdirSync: vi.fn(), appendFileSync: vi.fn(),
+    openSync: vi.fn(path => path), closeSync: vi.fn(), fsyncSync: vi.fn(), unlinkSync: vi.fn() };
   const spawnSync = vi.fn(command => ({ status: 0, stdout: command === 'git' ? '.git/index\n' : JSON.stringify(report) }));
   const deps = createAuditDeps({ cwd: '/repo', home: '/home/test', scratchRoot: '/scratch', fs, spawnSync, ...options });
   return { deps, fs, spawnSync };
@@ -357,24 +359,24 @@ describe('audit IO with injected filesystem and subprocesses', () => {
     expect(f.fs.rmSync).toHaveBeenCalled();
   });
 
-  it.each(['{}', '{"auditRecordPath":"~/custom/audits.jsonl"}'])('expands configured or default record path: %s', settings => {
+  it.each(['{}', '{"auditRecordPath":"~/custom/audits.jsonl"}'])('expands configured or default record path: %s', async settings => {
     const f = adapter();
-    f.fs.readFileSync.mockReturnValue(settings);
-    f.deps.appendRecord({ head: HEAD });
+    f.fs.readFileSync.mockImplementation(path => String(path).endsWith('prototype-load.json') ? settings : Buffer.alloc(0));
+    await f.deps.appendRecord({ head: HEAD });
     const path = settings === '{}' ? '/home/test/workspace/.operations/coordination/audits.jsonl' : '/home/test/custom/audits.jsonl';
     expect(f.fs.appendFileSync).toHaveBeenCalledWith(path, JSON.stringify({ head: HEAD }) + '\n', expect.any(Object));
   });
 
-  it('defaults when the settings file is absent', () => {
+  it('defaults when the settings file is absent', async () => {
     const f = adapter();
     f.fs.readFileSync.mockImplementation(() => { throw Object.assign(new Error('absent'), { code: 'ENOENT' }); });
-    f.deps.appendRecord({ head: HEAD });
+    await f.deps.appendRecord({ head: HEAD });
     expect(f.fs.appendFileSync.mock.calls[0][0]).toBe('/home/test/workspace/.operations/coordination/audits.jsonl');
   });
 
   it.each(['invalid JSON', '{"auditRecordPath":""}', '{"auditRecordPath":42}'])('refuses corrupt settings instead of silently recording elsewhere: %s', settings => {
     const f = adapter();
-    f.fs.readFileSync.mockReturnValue(settings);
+    f.fs.readFileSync.mockImplementation(path => String(path).endsWith('prototype-load.json') ? settings : Buffer.alloc(0));
     expect(() => f.deps.appendRecord({ head: HEAD })).toThrow();
     expect(f.fs.appendFileSync).not.toHaveBeenCalled();
   });
@@ -512,7 +514,7 @@ describe('prior question hashes (AU1 PR-B)', () => {
 });
 
 describe('audit record fingerprint (R503)', () => {
-  it('stores the head net-diff fingerprint when readable and omits it when not', async () => {
+  it('stores the head net-diff fingerprint when readable and refuses a pass when unavailable', async () => {
     const fp = 'c'.repeat(64);
     const f = fixture(); f.deps.fingerprint = vi.fn(async () => fp);
     expect(await main(ARGS, f.deps)).toBe(0);
@@ -520,8 +522,37 @@ describe('audit record fingerprint (R503)', () => {
     expect(f.records[0]).toMatchObject({ head: HEAD, fingerprint: fp });
     for (const bad of [async () => null, async () => { throw new Error('git'); }]) {
       const g = fixture(); g.deps.fingerprint = bad;
-      expect(await main(ARGS, g.deps)).toBe(0);
-      expect(g.records[0]).not.toHaveProperty('fingerprint');
+      expect(await main(ARGS, g.deps)).toBe(3);
+      expect(g.records[0]).toMatchObject({ verdict: 'WEAKENED', fingerprint: null,
+        findings: ['unknown: net-diff fingerprint unavailable'], fingerprintError: expect.any(String) });
+      expect(g.output.join('')).not.toContain('NOT WEAKENED');
     }
+  });
+});
+
+describe('required fingerprint (R1047)', () => {
+  it('retries once and records the successful retry', async () => {
+    const f = fixture();
+    f.deps.fingerprint.mockRejectedValueOnce(new Error('transient'));
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.deps.fingerprint).toHaveBeenCalledTimes(2);
+    expect(f.records[0].fingerprint).toBe('c'.repeat(64));
+    expect(f.records[0]).not.toHaveProperty('fingerprintError');
+  });
+  it.each(['NOT WEAKENED', 'WEAKENED'])('persists %s after both fingerprint attempts fail', async verdict => {
+    const f = fixture(`${verdict}\nx.mjs:1 removed guard`);
+    f.deps.fingerprint.mockRejectedValue(new Error('git unavailable'));
+    expect(await main(ARGS, f.deps)).toBe(verdict === 'WEAKENED' ? 1 : 3);
+    expect(f.deps.fingerprint).toHaveBeenCalledTimes(2);
+    expect(f.records).toHaveLength(1);
+    expect(f.records[0]).toMatchObject({ verdict: 'WEAKENED', fingerprint: null, fingerprintError: 'git unavailable',
+      findings: verdict === 'WEAKENED' ? ['x.mjs:1 removed guard'] : ['unknown: net-diff fingerprint unavailable'] });
+    expect(f.output.join('')).not.toContain('NOT WEAKENED');
+    expect(f.errors.join('')).toContain('human review');
+  });
+  it('fails closed when no fingerprint dependency is provided', async () => {
+    const f = fixture(); delete f.deps.fingerprint;
+    expect(await main(ARGS, f.deps)).toBe(3);
+    expect(f.records[0]).toMatchObject({ fingerprint: null, verdict: 'WEAKENED' });
   });
 });

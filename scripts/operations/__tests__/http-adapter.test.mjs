@@ -145,6 +145,7 @@ describe('codex-audit runner output', () => {
           return (ref === 'origin/main' ? 'a' : 'b').repeat(40);
         },
         runCodex: async () => testCase.answer,
+        fingerprint: async () => 'c'.repeat(64),
         appendRecord: vi.fn(() => { if (testCase.recordError) throw new Error('read-only store'); }),
         now: () => '2026-11-02T12:00:00.000Z',
         stdout: text => process.stdout.write(text), stderr: text => process.stderr.write(text),
@@ -504,6 +505,7 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     'prototype-load': 'prototype-load.mjs',
     // Runs Codex and appends an audit record: effectful, never read-only.
     'codex-audit': 'codex-audit.mjs',
+    'audit-ledger-genesis': 'run.mjs',
     // Card 359 — READ-ONLY: snapshot reads are injected from operator-session-bootstrap-io.mjs.
     'operator-session-bootstrap': 'operator-session-bootstrap.mjs',
     // Card xvz55jf (epic #3931) — READ-ONLY and genuinely so: both steps are `compute`, the declaring module's

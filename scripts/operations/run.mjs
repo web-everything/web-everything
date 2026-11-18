@@ -44,6 +44,7 @@ import { operatorSessionBootstrapOperation, finishBootstrap } from './operator-s
 import { bootstrapPlan } from './operator-session-bootstrap-io.mjs';
 import { createRegistry, op } from './registry.mjs';
 import { compute, effect } from './step-kinds.mjs';
+import { createGenesisRunner } from './audit-ledger-genesis.mjs';
 import { main as codexAuditMain } from './codex-audit.mjs';
 import { manualDaemonPassOperation, MANUAL_DAEMON_PASS_OP } from './manual-daemon-pass.mjs';
 import { createManualDaemonPassSinks } from './manual-daemon-pass-io.mjs';
@@ -616,6 +617,22 @@ export const OPERATIONS = Object.freeze({
   [FREE_SCOPE_OP]: () => ({
     declaration: freeScopeOperation({ collect: collectFreeScope }),
     sinks: {},
+  }),
+  'audit-ledger-genesis': () => ({
+    declaration: op('audit-ledger-genesis', {
+      input: { apply: { type: 'boolean', required: false, default: false } },
+      verdictFrom: 'assess',
+      migrate: effect({ reads: ['input.apply'], effects: ({ input }) => [{
+        type: 'audit-ledger-genesis.run', payload: input, idempotent: true,
+      }] }),
+      assess: compute({ reads: ['findings.migrate'], fn: ({ findings }) => {
+        const entry = findings.migrate?.effects?.[0];
+        if (entry?.status !== 'applied' || !entry.result) throw new Error('audit-ledger-genesis: migration did not complete');
+        return entry.result;
+      } }),
+    }),
+    sinks: { 'audit-ledger-genesis.run': createGenesisRunner() },
+    finish: ({ run, code, lines }) => run?.verdict ? { code, lines: [JSON.stringify(run.verdict)] } : { code, lines },
   }),
   'codex-audit': () => ({
     declaration: op('codex-audit', {

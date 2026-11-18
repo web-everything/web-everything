@@ -106,20 +106,31 @@ export async function main(argv, deps) {
     const verdict = lines.shift();
     if (verdict !== 'NOT WEAKENED' && verdict !== 'WEAKENED') throw new Error('invalid first verdict line');
     if (hasConflictingVerdict(verdict, lines)) throw new Error('conflicting verdict lines');
-    const findings = lines.filter(line => line.trim()).map(clean);
-    const result = { verdict, base, head, questionHash: QUESTION_HASH, findings };
-    // R503: store the head's net-diff fingerprint so the audit carries across a rebase/merge-of-main; unreadable = omitted.
-    let fingerprint = null;
-    try { fingerprint = (await deps.fingerprint?.(base, head)) || null; } catch { fingerprint = null; }
+    let findings = lines.filter(line => line.trim()).map(clean);
+    let fingerprint = null, fingerprintError;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        fingerprint = await deps.fingerprint?.(base, head);
+        if (typeof fingerprint !== 'string' || !HASH_64.test(fingerprint)) throw new Error('net-diff fingerprint unavailable');
+        fingerprintError = undefined;
+        break;
+      } catch (error) { fingerprint = null; fingerprintError = clean(String(error?.message ?? error)); }
+    }
+    const unknown = fingerprint === null && verdict === 'NOT WEAKENED';
+    const recordedVerdict = unknown ? 'WEAKENED' : verdict;
+    if (unknown) findings = ['unknown: net-diff fingerprint unavailable'];
+    const result = { verdict: recordedVerdict, base, head, questionHash: QUESTION_HASH, findings };
     try {
       await deps.appendRecord({ at: deps.now(), base, head, baseRef: flags.base,
-        questionHash: QUESTION_HASH, verdict, findings, ...(fingerprint ? { fingerprint } : {}) });
+        questionHash: QUESTION_HASH, verdict: recordedVerdict, findings, fingerprint,
+        ...(fingerprintError !== undefined ? { fingerprintError } : {}) });
     } catch {
       deps.stderr('Audit record write failed; repair the record path and retry.\n');
       return 3;
     }
-    deps.stdout(flags.json ? `${JSON.stringify(result)}\n` : `${[verdict, ...findings].join('\n')}\n`);
-    return verdict === 'NOT WEAKENED' ? 0 : 1;
+    deps.stdout(flags.json ? `${JSON.stringify(result)}\n` : `${[recordedVerdict, ...findings].join('\n')}\n`);
+    if (fingerprint === null) deps.stderr('Fingerprint unavailable; retry or request human review of the full diff.\n');
+    return unknown ? 3 : verdict === 'NOT WEAKENED' ? 0 : 1;
   } catch {
     (deps?.stderr ?? (text => process.stderr.write(text)))('UNPARSEABLE audit: incomplete or failed evidence; retry or request human review of the full diff.\n');
     return 3;

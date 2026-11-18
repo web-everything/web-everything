@@ -40,7 +40,7 @@ describe('codex-audit real IO', () => {
       const appendRecord = record => execFileSync(process.execPath, ['--input-type=module', '-e', `
         const { createAuditDeps } = await import(process.argv[1]);
         const deps = createAuditDeps({ cwd: process.argv[2], home: process.argv[3] });
-        deps.appendRecord(JSON.parse(process.argv[4]));
+        await deps.appendRecord(JSON.parse(process.argv[4]));
       `, moduleUrl, repo, home, JSON.stringify(record)], { cwd: repo, encoding: 'utf8', timeout: 30_000 });
       const first = { sha: head(), ok: true, message: 'first audit\nwith a newline' };
       const second = { sha: head(), ok: false, message: 'second audit' };
