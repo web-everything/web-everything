@@ -60,14 +60,14 @@ describe('R501 remote success record', () => {
       WE_HEAVY_ADMISSION_HELD: '', WE_FORGE_GATE_DISPATCH: '', WE_HEAVY_ADMISSION_RUN_WAIT_MS: '0',
       WE_VERIFY_REMOTE_REPORT: join(root, 'report.jsonl') })) vi.stubEnv(k, v);
     const resources={cpuUsec:120,memoryPeakBytes:300,throttledUsec:12,nrThrottled:2,oomKills:0};
-    const remoteExec = vi.fn(async () => ({ mode: 'remote', code: 0, receiptId: 'rcpt-1',...(measured?{resources,runMs:25}: {}) }));
+    const remoteExec = vi.fn(async () => ({ mode: 'remote', code: 0, receiptId: 'rcpt-1',...(measured?{resources:{...resources,slotCpus:5},runMs:25}: {}) }));
     await expect(main(['run', `--repo=${root}`, '--', 'npm', 'run', 'test:unit', '--', 'plain.test.mjs'], { remoteExec, readTelemetry: healthy })).rejects.toBe(exited);
     const file = join(pool, '.admission', 'heavy', 'remote-runs.jsonl');
     expect(JSON.parse(readFileSync(file, 'utf8').trim())).toEqual({ ts:expect.any(String),ms:expect.any(Number),receiptId:'rcpt-1',kind:expect.any(String) });
     const usage=join(pool,'.admission','heavy','remote-usage.jsonl');
     expect(existsSync(usage)).toBe(measured);
     if(measured)expect(JSON.parse(readFileSync(usage,'utf8').trim())).toEqual({ts:expect.any(String),kind:expect.any(String),
-      key:'npm run test:unit --',threadsGranted:remoteExec.mock.calls[0][0].slotUnits*8,
+      key:'npm run test:unit --',threadsGranted:5,
       memGranted:remoteExec.mock.calls[0][0].slotUnits*12*1024**3,...resources,runMs:25,code:0,backend:'systemd-scope'});
   });
 });

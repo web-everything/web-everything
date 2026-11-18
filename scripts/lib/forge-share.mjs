@@ -176,11 +176,14 @@ export function probeForgeShare({ lockRoot, settingsFile = DEFAULT_SETTINGS_FILE
 export function recordRemoteUsage({ lockRoot, resources, argv = [], slotUnits = 1, runMs = null, kind = null, code = null, at } = {}) {
   try {
     if (!resources) return;
-    const units = Number.isSafeInteger(slotUnits) && slotUnits > 0 ? slotUnits : 1;
+    const units = slotUnits;
+    // Invalid evidence is never recorded as a guessed grant.
+    if (!Number.isSafeInteger(units) || units < 1 || units > 256) return;
+    if (!Number.isSafeInteger(resources.slotCpus) || resources.slotCpus < 1) return;
     const key = argv.filter(arg => !/[\\/]/.test(arg) && !/\.(?:[cm]?[jt]sx?|json|html|css)$|\.(?:test|spec)(?:\.|$)/i.test(arg)).join(' ').replace(/\s+/g, ' ').trim();
     mkdirSync(lockRoot, { recursive: true });
     appendFileSync(join(lockRoot, 'remote-usage.jsonl'), JSON.stringify({
-      ts: at ?? new Date().toISOString(), kind, key, threadsGranted: units * 8, memGranted: units * 12 * 1024 ** 3,
+      ts: at ?? new Date().toISOString(), kind, key, threadsGranted: resources.slotCpus, memGranted: units * 12 * 1024 ** 3,
       cpuUsec: resources.cpuUsec ?? null, runMs, memoryPeakBytes: resources.memoryPeakBytes ?? null,
       throttledUsec: resources.throttledUsec ?? null, nrThrottled: resources.nrThrottled ?? null,
       oomKills: resources.oomKills ?? null, code, backend: 'systemd-scope',

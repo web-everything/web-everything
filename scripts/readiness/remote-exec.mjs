@@ -1703,8 +1703,8 @@ export function verifyReceipt(text, expected, code, receiptCapabilities) {
       && !/[\x00-\x1f\x7f-\x9f]/.test(receipt.tasksNote));
     return receipt && validTasks && typeof expected?.manifestDigest === 'string' && /^[a-f0-9]{64}$/.test(expected.manifestDigest)
       && Object.keys(receipt).filter(key=>key!=='timings'&&key!=='resources'&&!taskFields.includes(key)).sort().join(',') === (expected.siblingShas ? 'argvDigest,code,inputDigest,lock,manifestDigest,nonce,phase,run,siblingShas,v' : 'argvDigest,code,inputDigest,lock,manifestDigest,nonce,phase,run,v')
-      && (!Object.hasOwn(receipt,'resources') || (receipt.resources && !Array.isArray(receipt.resources)
-        && [resourceKeys.concat('slotCpus').sort().join(','),...(throttleKeys.length ? [resourceKeys.concat(throttleKeys,'slotCpus').sort().join(',')] : [])].includes(Object.keys(receipt.resources).sort().join(','))
+      && (!Object.hasOwn(receipt,'resources') && !throttleKeys.length || (receipt.resources && !Array.isArray(receipt.resources)
+        && [throttleKeys.length ? resourceKeys.concat(throttleKeys,'slotCpus').sort().join(',') : resourceKeys.concat('slotCpus').sort().join(',')].includes(Object.keys(receipt.resources).sort().join(','))
         && resourceKeys.concat(throttleKeys.filter(key=>Object.hasOwn(receipt.resources,key))).every(key=>receipt.resources[key]===null || Number.isSafeInteger(receipt.resources[key])&&receipt.resources[key]>=0)
         && Number.isSafeInteger(receipt.resources.slotCpus)&&receipt.resources.slotCpus>=1))
       && (!Object.hasOwn(receipt,'timings') || (!!receipt.timings && Object.keys(receipt.timings).sort().join(',')==='installMs,runMs' && [receipt.timings.installMs,receipt.timings.runMs].every(ms=>Number.isSafeInteger(ms)&&ms>=0)))

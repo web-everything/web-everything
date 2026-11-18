@@ -3489,7 +3489,11 @@ describe('negotiated throttle resources',()=>{
     {...legacy,throttledUsec:1},{...legacy,nrThrottled:1},{...legacy,throttledUsec:0,nrThrottled:0,extra:1}])
   ('validates exact sets and safe nullable throttle counters %j',resources=>{
     const expected={v:1,nonce:'n',run:'r',inputDigest:'i',argvDigest:'a',lock:'l',manifestDigest:'a'.repeat(64)};
-    const valid=resources===legacy || resources.throttledUsec===null;
+    const valid=resources.throttledUsec===null;
     expect(remoteManifestAPI.verifyReceipt(JSON.stringify({...expected,phase:'test',code:0,resources}),expected,0,{throttle:1})).toBe(valid);
+  });
+  it('rejects missing resources under throttle',()=>{
+    const expected={v:1,nonce:'n',run:'r',inputDigest:'i',argvDigest:'a',lock:'l',manifestDigest:'a'.repeat(64)};
+    expect(remoteManifestAPI.verifyReceipt(JSON.stringify({...expected,phase:'test',code:0}),expected,0,{throttle:1})).toBeFalsy();
   });
 });
