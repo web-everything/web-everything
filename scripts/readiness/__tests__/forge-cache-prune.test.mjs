@@ -80,7 +80,7 @@ async function reserve(run = `r-${'1'.repeat(32)}`, worker = 'worker-active') {
   return run;
 }
 const record = siblings => ({lock, inputDigest: hex('b'), manifestDigest: hex('c'),
-  manifest: siblings ? {siblings: true} : {}});
+  manifest: siblings ? {siblings: {frontierui: {sha: 'd'.repeat(40)}}} : {}});
 
 describe('resolveSettings', () => {
   it('refuses entirely missing bounds and names the first missing variable', () => {
@@ -676,12 +676,14 @@ describe('readLiveEvidence', () => {
     {scenario: 'string siblings', evidence: {siblings: 'true'}},
     {scenario: 'numeric siblings', evidence: {siblings: 1}},
     {scenario: 'null siblings', evidence: {siblings: null}},
+    {scenario: 'object siblings', evidence: {siblings: {frontierui: {sha: 'd'.repeat(40)}}}},
     {scenario: 'string manifest', evidence: {manifest: 'invalid'}},
     {scenario: 'array manifest', evidence: {manifest: []}},
     {scenario: 'string manifest.siblings', evidence: {manifest: {siblings: 'yes'}}},
     {scenario: 'numeric manifest.siblings', evidence: {manifest: {siblings: 1}}},
     {scenario: 'null manifest.siblings', evidence: {manifest: {siblings: null}}},
-    {scenario: 'historical object manifest.siblings', evidence: {manifest: {siblings: {frontierui: {sha: 'd'.repeat(40)}}}}},
+    {scenario: 'runner object manifest.siblings', evidence: {manifest: {siblings: {frontierui: {sha: 'd'.repeat(40)}}}}, resolved: true},
+    {scenario: 'empty object manifest.siblings', evidence: {manifest: {siblings: {}}}, resolved: true},
     {scenario: 'array manifest.siblings', evidence: {manifest: {siblings: []}}},
     {scenario: 'invalid siblingShas despite valid siblings', evidence: {siblings: true, siblingShas: {}}},
     {scenario: 'invalid siblings despite valid manifest', evidence: {siblings: 'true', manifest: {siblings: true}}},
@@ -717,6 +719,18 @@ describe('readLiveEvidence', () => {
   });
 
   const siblingSelectionCases = [
+    {scenario: 'runner object manifest.siblings selects precise manifestDigest profile',
+      evidence: record(true), digest: 'c'},
+    {scenario: 'empty object manifest.siblings selects precise manifestDigest profile',
+      evidence: {manifest: {siblings: {}}}, digest: 'c'},
+    ...[null, 'yes', 1, []].map(siblings => ({
+      scenario: `invalid manifest.siblings=${JSON.stringify(siblings)} protects whole lock`,
+      evidence: {manifest: {siblings}}, conflict: true,
+    })),
+    {scenario: 'object manifest.siblings conflicts with record.siblings:false',
+      evidence: {...record(true), siblings: false}, conflict: true},
+    {scenario: 'object manifest.siblings agrees with record.siblings:true',
+      evidence: {...record(true), siblings: true}, digest: 'c'},
     {scenario: 'receipt siblings:false conflicts with valid siblingShas',
       evidence: {siblings: false, siblingShas: {frontierui: 'd'.repeat(40)}}, conflict: true},
     {scenario: 'manifest.siblings:true conflicts with record.siblings:false',
@@ -911,6 +925,7 @@ describe('readLiveEvidence', () => {
     const result = await readLiveEvidence({receipts});
     expect(result.complete).toBe(true);
     expect(result.profiles).toEqual(new Set([`${lock}/dev-v5-${hex(siblings ? 'c' : 'b')}`]));
+    expect(result.locks).toEqual(new Set());
   });
   it('unions numbered and legacy reservations including warm runs, ignoring inactive records', async () => {
     const a = await reserve(), b = await reserve(`warm-${'2'.repeat(32)}`, 'worker-active-2');

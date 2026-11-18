@@ -256,6 +256,9 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
         const manifestPresent = record.manifest !== undefined;
         const manifestKnown = manifestPresent && record.manifest !== null && typeof record.manifest === 'object'
           && Object.getPrototypeOf(record.manifest) === Object.prototype;
+        const manifestSiblings = manifestKnown ? record.manifest.siblings : undefined;
+        const manifestSiblingsObject = manifestSiblings !== null && typeof manifestSiblings === 'object'
+          && Object.getPrototypeOf(manifestSiblings) === Object.prototype;
         // A final receipt has no manifest: its siblingShas say which digest names the profile.
         // The writer omits this field without siblings and otherwise emits a nonempty SHA map.
         const invalidSiblingShas = record.siblingShas !== undefined
@@ -267,12 +270,13 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
         // another selector agrees or the receipt fallback could select a digest.
         const invalidSelector = (record.siblings !== undefined && typeof record.siblings !== 'boolean')
           || (manifestPresent && !manifestKnown)
-          || (manifestKnown && record.manifest.siblings !== undefined && typeof record.manifest.siblings !== 'boolean')
+          || (manifestSiblings !== undefined && typeof manifestSiblings !== 'boolean' && !manifestSiblingsObject)
           || invalidSiblingShas;
         // Explicit signals must agree before any digest can narrow lock protection.
         // An omitted receipt siblingShas is only the fallback, not a contrary signal.
         const siblingSignals = [];
-        if (manifestKnown) siblingSignals.push(record.manifest.siblings === true);
+        // The runner omits siblings for none; any object is truthy in its profile selector.
+        if (manifestKnown) siblingSignals.push(!!manifestSiblings);
         if (typeof record.siblings === 'boolean') siblingSignals.push(record.siblings);
         if (suffix === 'receipt' && record.siblingShas !== undefined && !invalidSiblingShas) siblingSignals.push(true);
         const conflictingSiblings = siblingSignals.some(signal => signal !== siblingSignals[0]);
