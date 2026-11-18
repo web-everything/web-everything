@@ -1,12 +1,22 @@
 /** Shared, non-throwing admission over the existing free-scope snapshot and assessor. */
+import { posix } from 'node:path';
 import { assessFreeScope, qualifyFile, partitionRegistry } from './free-scope.mjs';
 import { collectFreeScope } from './free-scope-io.mjs';
 import { isProseScopeFile } from '../lib/prose-scope-globs.mjs';
 
+/** Collapse `a/../b` segments so a dotted path cannot dodge a claim; a path escaping the repo refuses (fail closed). */
+function normalizeQualified(qualified) {
+  if (!qualified) return qualified;
+  const colon = qualified.indexOf(':');
+  const path = posix.normalize(qualified.slice(colon + 1));
+  if (path === '..' || path.startsWith('../') || path.startsWith('/')) throw new Error(`scope path escapes the repo: ${qualified}`);
+  return `${qualified.slice(0, colon + 1)}${path}`;
+}
+
 export function checkScope({ declaredFiles, excludeAgent, excludeOwner, collect = collectFreeScope, now = Date.now } = {}) {
   try {
     const files = [...new Set((Array.isArray(declaredFiles) ? declaredFiles : declaredFiles.split(','))
-      .map(file => qualifyFile(file)).filter(file => file && !isProseScopeFile(file)))];
+      .map(file => normalizeQualified(qualifyFile(file))).filter(file => file && !isProseScopeFile(file)))];
     if (!files.length) return { ok: true, overlaps: [] };
     const nowMs = typeof now === 'function' ? now() : now;
     const snapshot = collect({ files: files.join(','), now: () => nowMs });

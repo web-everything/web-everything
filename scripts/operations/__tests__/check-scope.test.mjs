@@ -29,6 +29,10 @@ describe('checkScope shared admission', () => {
   it('qualifies scopes and preserves subtree matching from the shared assessor', () => {
     expect(run({ agents: [{ ...agent, files: ['we:scripts/'] }] }).ok).toBe(false);
   });
+  it('normalizes dotted paths and refuses repo-escaping ones', () => {
+    expect(run({ agents: [agent] }, { declaredFiles: ['we:scripts/../scripts/a.mjs'] }).ok).toBe(false);
+    expect(run({}, { declaredFiles: ['we:../outside.mjs'] })).toMatchObject({ ok: false, reason: expect.stringContaining('escapes') });
+  });
   it('excludes only the named owner when supplied', () => {
     expect(run({ agents: [agent] }, { excludeAgent: agent.agent, excludeOwner: 'holder' }).ok).toBe(true);
     expect(run({ agents: [agent] }, { excludeAgent: agent.agent, excludeOwner: 'other' }).ok).toBe(false);
