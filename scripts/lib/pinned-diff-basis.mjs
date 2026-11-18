@@ -13,11 +13,11 @@ export function pinnedGit(exec, args) {
   Object.assign(env, { GIT_NO_REPLACE_OBJECTS: '1', GIT_CONFIG_NOSYSTEM: '1',
     GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_COUNT: '0', GIT_ATTR_NOSYSTEM: '1' });
   const diff = args[0] === 'diff' ? ['--no-textconv', '--no-ext-diff', '--no-renames', '--no-color',
-    '--src-prefix=a/', '--dst-prefix=b/', '--no-relative'] : [];
+    '--src-prefix=a/', '--dst-prefix=b/', '--no-relative', '--submodule=short', '--ignore-submodules=none'] : [];
   // Repo-local diff rendering keys cannot be ignored, so pin every one that changes paths or prefixes.
   const pins = ['core.attributesFile=/dev/null', 'diff.noprefix=false', 'diff.mnemonicPrefix=false',
     'diff.relative=false', 'core.quotepath=false', 'diff.suppressBlankEmpty=false', 'diff.orderFile=/dev/null',
-    'diff.ignoreSubmodules=none', 'diff.external=', 'color.ui=false', 'color.diff=false'].flatMap(c => ['-c', c]);
+    'diff.ignoreSubmodules=none', 'diff.submodule=short', 'diff.external=', 'color.ui=false', 'color.diff=false'].flatMap(c => ['-c', c]);
   return String(exec('git', [...pins, args[0], ...diff, ...args.slice(1)], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000,
     maxBuffer: 64 * 1024 * 1024, env,

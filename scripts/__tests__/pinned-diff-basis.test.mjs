@@ -276,4 +276,22 @@ describe('pinned caller evidence', () => {
     expect(text).not.toContain('\u001b[');
     expect(text).toContain('diff --git a/a.txt b/a.txt');
   });
+  it('repo-local diff.submodule=log cannot render gitlink changes as opaque log text', () => {
+    const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'pinned-submodule-'));
+    dirs.push(dir);
+    const env = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@e.test', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@e.test' };
+    const git = args => execFileSync('git', args, { cwd: dir, encoding: 'utf8', env, stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+    git(['init', '-q']);
+    git(['config', 'diff.submodule', 'log']);
+    writeFileSync(join(dir, 'a.txt'), 'one\n');
+    git(['add', '.']);
+    git(['update-index', '--add', '--cacheinfo', `160000,${'1'.repeat(40)},sub`]);
+    git(['commit', '-q', '-m', 'one']);
+    const first = git(['rev-parse', 'HEAD']);
+    git(['update-index', '--cacheinfo', `160000,${'2'.repeat(40)},sub`]);
+    git(['commit', '-q', '-m', 'two']);
+    const text = pinnedGit((cmd, args, opts) => execFileSync(cmd, args, { ...opts, cwd: dir }), ['diff', '--end-of-options', first, 'HEAD']);
+    expect(text).toContain('-Subproject commit ' + '1'.repeat(40));
+    expect(text).toContain('+Subproject commit ' + '2'.repeat(40));
+  });
 });

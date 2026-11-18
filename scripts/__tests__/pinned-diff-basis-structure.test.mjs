@@ -8,7 +8,7 @@ export function findRefStringSites(source, file) {
   const sites = [];
   const name = node => node && (ts.isIdentifier(node) || ts.isStringLiteral(node)) ? node.text : '';
   const pinned = node => /^(?:basis|pinnedBasis)\.(?:mergeBaseSha|baseSha|headSha)$/.test(node.getText(tree)) ||
-    (file === 'scripts/lib/pinned-diff-basis.mjs' && ['headSha', 'resolvedHead', 'mergeBaseSha', 'baseSha'].includes(name(node)));
+    (file === 'scripts/lib/pinned-diff-basis.mjs' && ['headSha', 'resolvedHead', 'mergeBaseSha', 'baseSha', 'flags'].includes(name(node)));
   const walk = (node, owner = '<module>') => {
     if (ts.isFunctionDeclaration(node) && node.name) owner = node.name.text;
     if (ts.isVariableDeclaration(node) && node.initializer &&
@@ -31,8 +31,10 @@ export function findRefStringSites(source, file) {
         if (!['diff', 'log'].includes(command)) continue;
         if (command === 'log' && !arg.elements.some(e => ['-p', '--patch'].includes(name(e)))) continue;
         const stop = arg.elements.findIndex(e => name(e) === '--');
-        const revisions = arg.elements.slice(1, stop < 0 ? undefined : stop).filter(e =>
-          !ts.isSpreadElement(e) && !(ts.isStringLiteral(e) && e.text.startsWith('-')));
+        // A spread element hides its revisions, so it is inspected as the expression it spreads (never skipped).
+        const revisions = arg.elements.slice(1, stop < 0 ? undefined : stop)
+          .map(e => ts.isSpreadElement(e) ? e.expression : e)
+          .filter(e => !(ts.isStringLiteral(e) && e.text.startsWith('-')));
         if (revisions.some(e => !pinned(e))) bad = true;
       }
       if (bad) sites.push(`${file}:${owner}`);
@@ -51,8 +53,11 @@ function sources(dir = 'scripts') {
   });
 }
 // ALLOWLIST: one file:function entry per existing legacy site (duplicates retain counts).
-// Baseline: 127 existing ref-string sites; delete entries as callers migrate.
+// Baseline: 130 existing ref-string sites (127 + 3 spread-argument sites the stricter scan now sees); delete entries as callers migrate.
 const ALLOWLIST = [
+  "scripts/lib/rebase-drop-manifest.mjs:countFiles",
+  "scripts/lib/build-self-review.mjs:selfReviewDiffArgs",
+  "scripts/conveyor/await-verify-pass.mjs:runGit",
   "scripts/backlog.mjs:observedFilesForResolve",
   "scripts/check-standards.mjs:<module>",
   "scripts/ci-card-only.mjs:main",
@@ -197,6 +202,10 @@ describe('pinned diff basis structural ratchet', () => {
     const source = "function offending() { computeNetDiffSignals({exec, rev: head}); git(['diff', `${remote}/main...${head}`]); git(['log', '-p', ref]); execSync('git diff origin/main...HEAD'); }";
     expect(findRefStringSites(source, 'scripts/synthetic.mjs')).toEqual(Array(4).fill('scripts/synthetic.mjs:offending'));
     expect(findRefStringSites("function safe() { computeNetDiffSignals({exec, basis}); git(['diff', basis.mergeBaseSha, basis.headSha]); }", 'scripts/synthetic.mjs')).toEqual([]);
+  });
+  it('does not let a spread element hide a ref-string revision', () => {
+    const source = "function offending() { git(['diff', ...[untrustedRange]]); git(['diff', ...range]); }";
+    expect(findRefStringSites(source, 'scripts/synthetic.mjs')).toEqual(Array(2).fill('scripts/synthetic.mjs:offending'));
   });
   it('ratchets extra sites even in an already allowlisted function', () => {
     const old = 'function legacy() { computeNetDiffText({rev}); }';
