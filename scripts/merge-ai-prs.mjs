@@ -1352,7 +1352,11 @@ export async function repollUnknownListings({ prsByRepo, read, sleep, recompute,
     await sleep(setting.delayMs);
     await mapWithConcurrency(recomputing, concurrency, async ({ repo, pr }) => {
       const fresh = await read(repo, pr.number);
-      if (fresh?.number === pr.number) Object.assign(pr, fresh);
+      if (fresh?.number === pr.number) {
+        // A new head cannot inherit listing-only evidence (especially files) from the old head.
+        if (fresh.headRefOid !== pr.headRefOid) for (const field of Object.keys(pr)) delete pr[field];
+        Object.assign(pr, fresh);
+      }
     });
     pending = pending.filter(({ pr }) => unknown(pr));
   }

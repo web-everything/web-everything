@@ -15,8 +15,9 @@ import { fileURLToPath } from 'node:url';
 import {
   revalidateForMerge, isTransientUnknownMergeability, resolveUnknownMergeabilityRetry, revalidateWithUnknownRetry,
   UNKNOWN_MERGEABILITY_RETRY, UNKNOWN_MERGEABILITY_RETRY_ENV,
-  repollUnknownListings, UNKNOWN_MERGEABILITY_MAX_RECOMPUTE,
+  repollUnknownListings, UNKNOWN_MERGEABILITY_MAX_RECOMPUTE, buildDrainVerdicts,
 } from '../merge-ai-prs.mjs';
+import { decideDrainWorkflowEditHold } from '../lib/drain-workflow-edit-hold.mjs';
 
 const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'drain-unknown-mergeability-skips-2026-10-09.json'), 'utf8'));
 
@@ -86,6 +87,42 @@ describe('bounded listing mergeability recompute', () => {
     expect(io.log.mock.calls).toEqual([[`mergeable-unknown-recompute ${repo}#4602`]]);
     expect(revalidateForMerge(candidate, opts).decision).toBe('merge');
     expect(io.onPersistentUnknown).not.toHaveBeenCalled();
+  });
+
+  it('discards stale head evidence after recompute moves the head; workflow clearance fails closed', async () => {
+    const candidate = pr({ mergeable: null, files: [{ path: 'src/safe.js', changeType: 'MODIFIED' }] });
+    const fresh = pr({ headRefOid: 'b'.repeat(40) });
+    delete fresh.commits;
+    delete fresh.statusCheckRollup;
+    delete fresh.mergeStateStatus;
+    await run([candidate], { read: async () => fresh });
+    expect(candidate).toEqual(fresh);
+    for (const field of ['files', 'commits', 'statusCheckRollup', 'mergeStateStatus']) {
+      expect(candidate).not.toHaveProperty(field);
+    }
+    expect(revalidateForMerge(candidate, { ...opts, expectedHeadSha: fresh.headRefOid }).decision).toBe('skip');
+    const [verdict] = buildDrainVerdicts({ prsByRepo: new Map([[repo, [candidate]]]), repos: [repo] });
+    expect(verdict.listedHeadSha).toBe(fresh.headRefOid);
+    expect(verdict.listedFiles).toBeNull();
+    expect(verdict.listedFilesComplete).toBe(false);
+    expect(decideDrainWorkflowEditHold({ files: verdict.listedFiles, filesComplete: verdict.listedFilesComplete,
+      headSha: verdict.listedHeadSha, humanClearedSha: HEAD })).toMatchObject({ hold: true, defer: true });
+  });
+
+  it('preserves fresh head-bound fields supplied for the new head', async () => {
+    const candidate = pr({ mergeable: null, files: ['src/old.js'] });
+    const fresh = pr({ headRefOid: 'b'.repeat(40), files: ['.github/workflows/test.yml'],
+      commits: [{ oid: 'b'.repeat(40) }], statusCheckRollup: [] });
+    await run([candidate], { read: async () => fresh });
+    expect(candidate).toEqual(fresh);
+  });
+
+  it('preserves listing-only files when the post-recompute head is unchanged', async () => {
+    const files = [{ path: 'src/safe.js', changeType: 'MODIFIED' }];
+    const candidate = pr({ mergeable: null, files });
+    await run([candidate]);
+    expect(candidate.headRefOid).toBe(HEAD);
+    expect(candidate.files).toBe(files);
   });
 
   it.each([null, 'UNKNOWN'])('persistent %j stays refused and reported after one recompute and bounded retries', async mergeable => {
