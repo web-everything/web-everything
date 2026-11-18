@@ -353,8 +353,9 @@ export function notCiBreakRecordRefusal({ headSha, pr, requiredChecks }) {
   const head = String(headSha ?? '').trim().toLowerCase();
   const prHead = String(pr?.headRefOid ?? '').trim().toLowerCase();
   if (!head || !prHead || !(prHead.startsWith(head) || head.startsWith(prHead))) return null;
-  if (!Array.isArray(requiredChecks) || !requiredChecks.length) return null;
   const u = unsettledRequiredChecks({ headSha: prHead, rowsHead: pr?.rowsHead, rowsComplete: pr?.rowsComplete === true, rollup: pr?.statusCheckRollup, requiredChecks });
+  if (u.red.includes('check-evidence'))
+    return `Cannot prove every required check green (check-evidence unknown${requiredChecks?.length ? `; required: ${requiredChecks.join(', ')}` : ''}); restore the required-check roster and inspect complete checks on the current head before retrying.`;
   const parts = [];
   if (u.pending.length) parts.push(`still running: ${u.pending.join(', ')}`);
   if (u.missing.length) parts.push(`not started: ${u.missing.join(', ')}`);

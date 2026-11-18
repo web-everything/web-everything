@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getRequiredStatusChecks } from '../required-status-checks.mjs';
 import { readReviewCiGate as readGate, readReviewHead, readReviewChecks, formatReviewCiSkip } from '../review-ci-gate-io.mjs';
+// Hermetic readers attest that these fixtures contain every page, as readReviewChecks does.
+const complete = rows => Object.defineProperty(rows, 'rowsComplete', { value: true });
 const readReviewCiGate = o => readGate({ policy: { startAfter: 'ci-green' }, ...o });
 it('push requires both fast prerequisites, and discovers required checks for repos with no fast set', () => {
   const sha = 'a'.repeat(40);
@@ -11,11 +13,11 @@ it('push requires both fast prerequisites, and discovers required checks for rep
   const io = { repo: 'other/product', pr: 1, readHead: () => sha,
     readRequired: vi.fn(() => ({ source: 'live', checks: ['test', 'standards'] })) };
   const policy = { startAfter: 'push', fastChecks: ['standards', 'test'] };
-  expect(readGate({ ...io, policy, readChecks: () => [row('unrelated')] }))
+  expect(readGate({ ...io, policy, readChecks: () => complete([row('unrelated')]) }))
     .toMatchObject({ allowed: false, reason: 'ci-not-registered', affected: [
       { name: 'standards', reason: 'missing' }, { name: 'test', reason: 'missing' }] });
-  expect(readGate({ ...io, policy, readChecks: () => [row('standards'), row('test')] })).toMatchObject({ allowed: true });
-  expect(readGate({ ...io, policy: { startAfter: 'push' }, readChecks: () => [row('test')] }))
+  expect(readGate({ ...io, policy, readChecks: () => complete([row('standards'), row('test')]) })).toMatchObject({ allowed: true });
+  expect(readGate({ ...io, policy: { startAfter: 'push' }, readChecks: () => complete([row('test')]) }))
     .toMatchObject({ allowed: false, reason: 'ci-not-registered', affected: [{ name: 'standards', reason: 'missing' }] });
   expect(io.readRequired).toHaveBeenCalledWith({ repo: io.repo, ttlMs: 0 });
 });
@@ -23,7 +25,7 @@ it('logs the shadow opportunity through injected IO and pins early permission to
   const sha = 'a'.repeat(40), log = vi.fn();
   const io = { repo: 'other/product', pr: 12, readHead: () => sha,
     readRequired: () => ({ source: 'live', checks: ['test'] }),
-    readChecks: () => [{ name: 'test', head_sha: sha, status: 'in_progress', conclusion: null }],
+    readChecks: () => complete([{ name: 'test', head_sha: sha, status: 'in_progress', conclusion: null }]),
     policy: { startAfter: 'ci-green', startEarly: 'shadow' }, log };
   expect(readGate(io)).toMatchObject({ allowed: false, wouldStartEarly: true, headSha: sha });
   expect(log).toHaveBeenCalledWith(`review-early-start: would start early on ${sha} (pending: test=pending)`);
@@ -42,7 +44,7 @@ it.each(['fast-checks', 'push'])('uses required CI ownership under %s and report
   expect(readGate(args)).toMatchObject({ allowed: true, startAfter });
   expect(readGate({ ...args, readRequired: () => { throw Error('protection unavailable'); } }))
     .toMatchObject({ allowed: startAfter !== 'push', ...(startAfter === 'push' ? { reason: 'ci-red' } : {}), startAfter, source: 'timing-policy' });
-  expect(readGate({ ...args, readChecks: () => [...args.readChecks(), { name: 'test', status: 'completed', conclusion: 'failure' }] }))
+  expect(readGate({ ...args, readChecks: () => complete([...args.readChecks(), { name: 'test', status: 'completed', conclusion: 'failure' }]) }))
     .toMatchObject({ allowed: false, reason: 'ci-red', startAfter });
   expect(readGate({ ...args, readHead: () => null })).toMatchObject({ allowed: false, startAfter });
   expect(readGate({ ...args, readChecks: () => { throw Error('offline'); } })).toMatchObject({ allowed: false, reason: 'unreadable-ci', startAfter });
@@ -56,17 +58,17 @@ it.each(['throws', 'fallback', 'empty', 'untrusted'])('push CI discovery %s neve
   };
   const io = { repo: 'other/product', pr: 7, policy: { startAfter: 'push', startEarly: 'shadow' },
     readHead: () => headSha, readRequired,
-    readChecks: () => [{ name: 'test', head_sha: headSha, status: 'completed', conclusion: 'failure' }] };
+    readChecks: () => complete([{ name: 'test', head_sha: headSha, status: 'completed', conclusion: 'failure' }]) };
   expect(readGate(io)).toMatchObject({ allowed: false, headSha, reason: 'ci-red' });
 });
 it('push waits for any registered CI and the pending bypass ignores unrelated rows without logging', () => {
   const io = { repo: 'other/product', pr: 7, readHead: () => headSha,
     readRequired: () => ({ source: 'live', checks: ['test'] }), log: vi.fn() };
-  expect(readGate({ ...io, policy: { startAfter: 'push' }, readChecks: () => [] }))
+  expect(readGate({ ...io, policy: { startAfter: 'push' }, readChecks: () => complete([]) }))
     .toMatchObject({ allowed: false, reason: 'ci-not-registered' });
   for (const startEarly of ['on', 'shadow']) {
     expect(readGate({ ...io, policy: { startAfter: 'ci-green', startEarly },
-      readChecks: () => [{ name: 'unrelated', head_sha: headSha, status: 'completed', conclusion: 'success' }] }))
+      readChecks: () => complete([{ name: 'unrelated', head_sha: headSha, status: 'completed', conclusion: 'success' }]) }))
       .toMatchObject({ allowed: false });
   }
   expect(io.log).not.toHaveBeenCalled();
@@ -74,7 +76,7 @@ it('push waits for any registered CI and the pending bypass ignores unrelated ro
 function fixture(over = {}) {
   return { policy: { startAfter: 'ci-green' }, repo: 'other/product', pr: 3432, readHead: vi.fn(() => headSha),
     readRequired: vi.fn(() => ({ source: 'live', checks: ['custom'] })),
-    readChecks: vi.fn(() => [{ name: 'custom', status: 'completed', conclusion: 'success' }]), ...over };
+    readChecks: vi.fn(() => complete([{ name: 'custom', status: 'completed', conclusion: 'success' }])), ...over };
 }
 describe('fresh review CI IO', () => {
   it('reads repo, fresh required set and exact SHA, then verifies the head again', () => {
@@ -110,7 +112,7 @@ describe('fresh review CI IO', () => {
     expect(readReviewCiGate(fixture({ readHead: vi.fn().mockReturnValueOnce(headSha).mockReturnValueOnce('b'.repeat(40)) }))).toMatchObject({ allowed: false, reason: 'head-changed', headSha });
   });
   it.each([[], [{ name: 'custom', status: 'in_progress' }], [{ name: 'custom', status: 'completed', conclusion: 'failure' }]])('refuses fresh missing/pending/red despite an earlier green plan', checks => {
-    expect(readReviewCiGate(fixture({ readChecks: () => checks })).allowed).toBe(false);
+    expect(readReviewCiGate(fixture({ readChecks: () => complete(checks) })).allowed).toBe(false);
   });
 });
 
@@ -120,9 +122,9 @@ it.each([198, 199])('replays Plateau PR #%s with protection unavailable and test
     const readRequired = args => getRequiredStatusChecks({ ...args, cachePath: join(dir, 'cache.json'),
       readChecks: () => { throw new Error('Resource not accessible by integration (HTTP 403)'); } });
     const checks = ['test', 'e2e'].map(name => ({ name, status: 'completed', conclusion: 'success' }));
-    const io = fixture({ repo: 'plateauapp/plateau-app', pr, readRequired, readChecks: () => checks });
+    const io = fixture({ repo: 'plateauapp/plateau-app', pr, readRequired, readChecks: () => complete(checks) });
     expect(readReviewCiGate(io)).toMatchObject({ allowed: true, source: 'declared', headSha });
-    expect(readReviewCiGate({ ...io, readChecks: () => checks.slice(0, 1) })).toMatchObject({ allowed: false, source: 'declared' });
+    expect(readReviewCiGate({ ...io, readChecks: () => complete(checks.slice(0, 1)) })).toMatchObject({ allowed: false, source: 'declared' });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -160,7 +162,7 @@ it.each([
       { name: 'test', status: at < testDone ? 'in_progress' : 'completed', conclusion: at < testDone ? null : 'success' },
       ...(at < soakStarted ? [] : [{ name: 'daemon-soak', status: 'completed', conclusion: 'failure' }])];
     const out = readReviewCiGate({ repo: 'web-everything/web-everything', pr: 3432, readHead: () => sha,
-      readRequired: () => ({ source: 'live', checks: ['test', 'smoke', 'daemon-soak'] }), readChecks: () => checks });
+      readRequired: () => ({ source: 'live', checks: ['test', 'smoke', 'daemon-soak'] }), readChecks: () => complete(checks) });
     expect(out.allowed).toBe(false);
     expect(out.affected).toContainEqual({ name: 'daemon-soak', reason: at < soakStarted ? 'missing' : 'failure' });
   }
@@ -182,11 +184,11 @@ it.each([
     const io = fixture({ repo,
       readRequired: args => getRequiredStatusChecks({ ...args, cachePath, now: 1000 + age,
         readChecks: () => { throw new Error(message); } }),
-      readChecks: () => names.map(name => ({ name, status: 'completed', conclusion: 'success' })),
+      readChecks: () => complete(names.map(name => ({ name, status: 'completed', conclusion: 'success' }))),
     });
     expect(readReviewCiGate(io)).toMatchObject({ allowed, source });
     if (allowed) {
-      expect(readReviewCiGate({ ...io, readChecks: () => [] }).allowed).toBe(false);
+      expect(readReviewCiGate({ ...io, readChecks: () => complete([]) }).allowed).toBe(false);
     }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -219,7 +221,7 @@ describe('formatReviewCiSkip — the real error behind unreadable-ci is logged (
 it('fast-check dispatch reads all head checks without waiting for branch-protection discovery', () => {
   const readRequired = vi.fn(() => { throw Error('protection unavailable'); });
   const io = fixture({ policy: { startAfter: 'fast-checks', fastChecks: ['standards', 'test-shard (1)'] }, readRequired,
-    readChecks: () => ['standards', 'test-shard (1)'].map(name => ({ name, head_sha: headSha, status: 'completed', conclusion: 'success' })) });
+    readChecks: () => complete(['standards', 'test-shard (1)'].map(name => ({ name, head_sha: headSha, status: 'completed', conclusion: 'success' }))) });
   expect(readGate(io)).toMatchObject({ allowed: true, headSha, source: 'timing-policy' });
   expect(readRequired).not.toHaveBeenCalled();
 });
@@ -228,23 +230,23 @@ it('a repo without its own fast checks waits on its trusted required set', () =>
   const policy = { startAfter: 'fast-checks', fastChecks: { we: ['standards', 'test-shard (1)'] } };
   const green = name => ({ name, head_sha: headSha, status: 'completed', conclusion: 'success' });
   const io = fixture({ policy, repo: 'frontier-ui/frontierui', readRequired: vi.fn(() => ({ source: 'declared', checks: ['test'] })),
-    readChecks: () => [green('test')] });
+    readChecks: () => complete([green('test')]) });
   expect(readGate(io)).toMatchObject({ allowed: true, headSha, source: 'declared' });
-  expect(readGate({ ...io, readChecks: () => [{ ...green('test'), status: 'in_progress', conclusion: null }] }))
+  expect(readGate({ ...io, readChecks: () => complete([{ ...green('test'), status: 'in_progress', conclusion: null }]) }))
     .toMatchObject({ allowed: false, reason: 'required-checks-not-successful' });
   expect(readGate({ ...io, readRequired: () => ({ source: 'fallback', checks: ['test'] }) }))
     .toMatchObject({ allowed: false, reason: 'untrusted-required-set' });
   expect(readGate({ ...io, readRequired: () => { throw Error('offline'); } })).toMatchObject({ allowed: false, reason: 'unreadable-ci' });
   // WE keeps its fast checks and never waits on discovery.
   const we = fixture({ policy, repo: 'web-everything/web-everything', readRequired: vi.fn(),
-    readChecks: () => ['standards', 'test-shard (1)'].map(green) });
+    readChecks: () => complete(['standards', 'test-shard (1)'].map(green)) });
   expect(readGate(we)).toMatchObject({ allowed: true, source: 'timing-policy' });
   expect(we.readRequired).not.toHaveBeenCalled();
 });
 
 it('publish-time gate reads the exact head marker only when enabled', () => {
   const readVerifyGreen = vi.fn(({ sha }) => sha === headSha);
-  const args = { repo: 'other/product', pr: 7, readHead: () => headSha, readChecks: () => [],
+  const args = { repo: 'other/product', pr: 7, readHead: () => headSha, readChecks: () => complete([]),
     readRequired: () => ({ source: 'live', checks: ['test'] }), readVerifyGreen,
     policy: { startAfter: 'ci-green', startBeforeCi: true } };
   expect(readGate(args)).toMatchObject({ allowed: true, reason: 'verify-marker' });
@@ -254,4 +256,13 @@ it('publish-time gate reads the exact head marker only when enabled', () => {
   readVerifyGreen.mockClear();
   expect(readGate({ ...args, policy: { startAfter: 'ci-green' } }).allowed).toBe(false);
   expect(readVerifyGreen).not.toHaveBeenCalled();
+});
+
+it.each([false, undefined])('refuses incomplete injected check pages (%s) without logging early start', rowsComplete => {
+  const log = vi.fn();
+  const checks = Object.defineProperty([{ name: 'custom', status: 'completed', conclusion: 'success' }],
+    'rowsComplete', { value: rowsComplete });
+  const result = readGate(fixture({ readChecks: () => checks, log }));
+  expect(result).toMatchObject({ allowed: false, unknown: true, reason: 'rows-incomplete' });
+  expect(log).not.toHaveBeenCalled();
 });

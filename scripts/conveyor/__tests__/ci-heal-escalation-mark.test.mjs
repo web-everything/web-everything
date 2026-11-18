@@ -342,13 +342,22 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
     const statusCheckRollup = fixture.requiredChecks.map((name) => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' }));
     expect(refusal({ pr: { ...fixture, statusCheckRollup } })).toBeNull();
   });
-  it('does not judge a different head or unknown required set', () => {
+  it('does not judge a different head', () => {
     expect(refusal({ headSha: 'abcdef0123456789' })).toBeNull();
-    expect(refusal({ requiredChecks: [] })).toBeNull();
   });
 
   const recordOptions = () => ({ pr: 4535, repo: fixture.repo, headSha: head, outcome: 'not-a-ci-break', settings,
     readPr: vi.fn(() => fixture), readRequired: vi.fn(async () => ({ checks: fixture.requiredChecks })) });
+
+  it.each([[[]], [undefined], [null]])('refuses an unavailable roster (%j) without using observed names', async requiredChecks => {
+    for (const conclusion of ['FAILURE', 'SUCCESS']) {
+      const pr = { ...fixture, statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion }] };
+      expect(refusal({ pr, requiredChecks })).toContain('check-evidence');
+      const result = await checkNotCiBreakRecordable({ ...recordOptions(), readPr: () => pr,
+        readRequired: () => ({ checks: requiredChecks, source: 'fallback' }) });
+      expect(result.refusal).toContain('check-evidence');
+    }
+  });
 
   it.each([
     ['not-a-ci-break', checkNotCiBreakRecordable],

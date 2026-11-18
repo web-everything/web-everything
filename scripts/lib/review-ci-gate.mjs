@@ -12,5 +12,5 @@ export function reviewCiGate({ headSha, requiredChecks, checks, rowsHead = headS
     : result.reasons.includes('rows-incomplete') ? 'rows-incomplete'
     : result.state === 'pass' ? 'required-checks-successful'
     : affected.some(r => r.name === 'review-gate') ? 'required-review-gate-conflict' : 'required-checks-not-successful';
-  return { allowed: result.state === 'pass', headSha: headSha ?? null, reason, affected };
+  return { allowed: result.state === 'pass', ...(result.state === 'unknown' ? { unknown: true } : {}), headSha: headSha ?? null, reason, affected };
 }

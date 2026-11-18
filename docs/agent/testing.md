@@ -4545,6 +4545,14 @@ carry no proof and fail closed. Never infer completeness from row count or succe
 `review-ci-completeness.test.mjs` exercises the real reader-to-start-gate path with multiple
 pages, a hidden failure, incomplete arrays, and unreadable later-page evidence.
 
+Reconcile re-reads an excused candidacy hold through the complete exact-head review reader
+before scheduling its review. The injected hydration reader keeps its complete-feed contract;
+an explicit `rowsComplete: false` refuses proof. Carry an excusal only for the same immutable
+job, preserve observed real CI failures, and reuse the already-read hold verdict. The
+`merge-gate-hold-class.test.mjs` planner cases cover unreadable/incomplete feeds, foreign heads,
+pending checks and replacement jobs. Recording refusals retain the required-check names even
+when incomplete evidence also blocks the verdict; an unavailable roster still refuses recording.
+
 
 REST check-run rows omit workflow run/attempt fields. For duplicate GitHub Actions check
 names, `readReviewChecks` reads the Actions jobs and validates each job ID, workflow run,

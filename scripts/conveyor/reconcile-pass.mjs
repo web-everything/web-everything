@@ -57,6 +57,7 @@ import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { enrichPrsWithStandingRulingGrants } from './standing-ruling-io.mjs';
 import { enrichPrsWithOwedMainRule, resolveRefreshSettings } from '../lib/renamed-pr-refresh.mjs';
 import { excusePrMergeGateHolds, readMergeGateVerdict as defaultReadMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
+import { readReviewChecks } from '../lib/review-ci-gate-io.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { readMainRedPriority } from '../lib/main-red-priority.mjs'; // card xu1nixv
 import { fetchPrCommits } from '../lib/pr-limit.mjs';
@@ -1804,6 +1805,26 @@ export function runReconcilePass({
       readMergeGateVerdict, readFreeze, mergeGateSetting, env,
     });
   } catch { /* An unreadable verdict must retain the original red checks. */ }
+  // An excused candidacy hold owes review, but its listing rollup is not completeness proof.
+  // Re-read the complete exact-head feed through the existing hydration-reader contract.
+  // Carry the excusal only for the same immutable job; never attest the old listing.
+  holdPrs = holdPrs.map(pr => {
+    const excused = pr.statusCheckRollup?.find(row => row?.mergeGateHoldExcused);
+    if (!excused || reduceCheckState(pr.statusCheckRollup, requiredChecks).state !== 'green') return pr;
+    try {
+      const checkRepo = resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug;
+      // Production review proof includes every attempt and legacy commit statuses as well.
+      const rows = readChecks === defaultReadChecks
+        ? readReviewChecks({ repo: checkRepo, headSha: pr.headRefOid })
+        : readChecks({ repo: checkRepo, sha: pr.headRefOid });
+      if (!Array.isArray(rows) || rows.rowsComplete === false) return pr;
+      return { ...pr, rowsHead: pr.headRefOid, rowsComplete: true,
+        statusCheckRollup: rows.map(row => row?.name === 'merge-gate' && row.id === excused.id
+          && Number.isSafeInteger(row.id) && String(row.status).toLowerCase() === 'completed'
+          && FAILING_CONCLUSIONS.includes(String(row.conclusion).toLowerCase())
+          ? { ...row, conclusion: 'SUCCESS', mergeGateHoldExcused: excused.mergeGateHoldExcused } : row) };
+    } catch { return pr; } // Keep the incomplete listing refused; retry on the next pass.
+  });
   const { prs: redPrs, mainRedWindows, mainLatestCheckRuns } = enrichMainRed(holdPrs, { repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug, defaultBranch, requiredChecks });
   // live incident, PR #2752 (#4034/#2748) — attach `alreadyLandedInMain` to any PR carrying
   // `merge-status:conflicting` whose own content is already, file-by-file, present on `main`. Costs nothing

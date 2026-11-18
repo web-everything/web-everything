@@ -52,8 +52,8 @@ describe('strict review CI prerequisite', () => {
 describe('review CI completeness evidence', () => {
   it('refuses missing or false completeness with successful rows and names the fallback', () => {
     const evidence = { headSha, requiredChecks: ['test'], checks: [success('test')] };
-    expect(reviewCiGate(evidence)).toMatchObject({ allowed: false, reason: 'rows-incomplete' });
-    expect(reviewCiGate({ ...evidence, rowsComplete: false })).toMatchObject({ allowed: false, reason: 'rows-incomplete' });
+    expect(reviewCiGate(evidence)).toMatchObject({ allowed: false, unknown: true, reason: 'rows-incomplete' });
+    expect(reviewCiGate({ ...evidence, rowsComplete: false })).toMatchObject({ allowed: false, unknown: true, reason: 'rows-incomplete' });
     // Retry with exhausted pagination or explicit reads of every required name.
     expect(reviewCiGate({ ...evidence, rowsComplete: true }).allowed).toBe(true);
   });

@@ -136,7 +136,7 @@ function readableEarlyChecks(checks, headSha) {
 /** Pending is the only relaxation: every prerequisite needs its own readable row on this head. */
 function registeredStartGate({ headSha, checks, requiredChecks, rowsComplete }) {
   const strict = reviewCiGate({ headSha, checks, requiredChecks, rowsComplete });
-  if (!checkNames(requiredChecks) || typeof headSha !== 'string' || !headSha.trim()) return strict;
+  if (strict.unknown || !checkNames(requiredChecks) || typeof headSha !== 'string' || !headSha.trim()) return strict;
   const latest = new Map(collapseRollupToLatestPerName(checks).map(row => [row?.name ?? row?.context, row]));
   // Same implication rule as the strict gate: a green aggregate (test) proves a split-out job (integration). The
   // strict gate reads a legacy commit status (`{context, state}`) as a check row first, so a green STATUS aggregate
@@ -181,6 +181,7 @@ export function reviewStartGate({ headSha, checks, requiredChecks, rowsComplete 
   const prerequisites = policy.startAfter === 'ci-green' ? requiredChecks : fastChecksFor(policy.fastChecks, repo) ?? requiredChecks;
   const registered = () => registeredStartGate({ headSha, checks, requiredChecks: prerequisites, rowsComplete });
   const pendingStart = gate => {
+    if (gate.unknown) return gate;
     const mode = policy.startEarly ?? REVIEW_TIMING_DEFAULTS.startEarly;
     if (!['shadow', 'on'].includes(mode)) return gate;
     if (!gate.allowed && ciRedOnHead({ headSha, checks, requiredChecks })) return { ...gate, reason: 'ci-red' };
@@ -206,7 +207,7 @@ export function reviewStartGate({ headSha, checks, requiredChecks, rowsComplete 
     if (ciRedOnHead({ headSha, checks, requiredChecks: checkNames(requiredChecks) ? requiredChecks : null }))
       return refuse('ci-red');
     const gate = registered();
-    if (!gate.allowed && !(gate.affected.length && gate.affected.every(row => row.reason === 'pending'))) return gate;
+    if (gate.unknown || !gate.allowed && !(gate.affected.length && gate.affected.every(row => row.reason === 'pending'))) return gate;
     return { allowed: true, headSha, reason: 'push', affected: [] };
   }
   if (!policy.startBeforeCi && policy.startAfter === 'ci-green') return pendingStart(strict());

@@ -247,6 +247,16 @@ describe('reconcile planner and fresh promotion', () => {
     expect(after.dispatch.some(d => d.kind === 'review')).toBe(true);
   });
   it('promotes a candidacy-held draft', () => expect(plan({ draft: true }).dispatch.some(d => d.kind === 'promote-draft')).toBe(true));
+  it.each([
+    () => { throw Error('unreadable feed'); },
+    () => Object.assign([row, green], { rowsComplete: false }),
+    () => [row, { ...green, status: 'IN_PROGRESS', conclusion: null }],
+    () => [row, { ...green, head_sha: 'b'.repeat(40) }],
+    () => [{ ...row, id: 124 }, green],
+    () => [{ ...row, status: 'IN_PROGRESS', conclusion: null }, green],
+  ])('does not dispatch candidacy-held review without complete current-head green evidence', readChecks => {
+    expect(plan({ readChecks }).dispatch.some(d => d.kind === 'review')).toBe(false);
+  });
   it.each([{ testRed: true }, { readVerdict: () => ({ error: 'missing' }) }])('keeps real CI failure red (#5020) or unreadable verdict', args => expect(plan(args).dispatch.some(d => d.kind === 'ci-heal')).toBe(true));
   it('does not read freeze for candidacy', () => { const readFreeze = vi.fn(); plan({ readFreeze }); expect(readFreeze).not.toHaveBeenCalled(); });
   it.each([[candidacy, 'green'], [log4965, 'red']])('fresh head read classifies verdict as %s', (log, state) => {
