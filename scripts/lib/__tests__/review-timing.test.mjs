@@ -618,3 +618,9 @@ it('a failed review-gate named as a fast prerequisite blocks push-mode admission
     policy: { ...review, startAfter: 'push', startEarly: 'off', fastChecks: { we: ['review-gate'] } } });
   expect(gate.allowed).toBe(false);
 });
+
+it('a stale required check keeps the fix push waiting (not CI-complete); cancelled is finished', () => {
+  const base = { headSha: head, firstHeldAt: 0, now: 0, requiredChecks: ['test', 'unit'], policy: { pushAfterCi: true, pushAfterCiMaxMin: 1 } };
+  expect(fixPushGate({ ...base, previousHeadChecks: [check('test'), check('unit', 'stale')] }).action).toBe('wait');
+  expect(fixPushGate({ ...base, previousHeadChecks: [check('test'), check('unit', 'cancelled')] }).action).toBe('push');
+});

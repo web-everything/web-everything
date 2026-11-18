@@ -18,20 +18,31 @@ export const readReviewHeadAndLabels = ({ repo, pr, run = gh }) => JSON.parse(ru
  * published through either, and a reader of check runs alone would call a green commit-status context missing.
  * The combined-status endpoint already reports only the latest state per context.
  */
-export const readReviewChecks = ({ repo, headSha, run = gh }) => Object.defineProperties([
-  ...JSON.parse(run([
-    'api', '--paginate', '--slurp', `repos/${repo}/commits/${headSha}/check-runs?per_page=100&filter=all`,
-  ])).flatMap(page => {
-    if (!Array.isArray(page.check_runs)) throw new Error('unreadable check runs');
-    return page.check_runs;
-  }),
-  ...JSON.parse(run([
-    'api', '--paginate', '--slurp', `repos/${repo}/commits/${headSha}/status?per_page=100`,
-  ])).flatMap(page => {
-    if (!Array.isArray(page.statuses)) throw new Error('unreadable commit statuses');
-    return page.statuses.map(({ context, state, target_url }) => ({ context, state, target_url }));
-  }),
-], { rowsHead: { value: headSha }, rowsComplete: { value: true } });
+export const readReviewChecks = ({ repo, headSha, run = gh }) => {
+  let rowsComplete = /^[a-f0-9]{40}$/i.test(headSha ?? '');
+  const rows = [];
+  for (const [feed, key] of [['check-runs', 'check_runs'], ['status', 'statuses']]) {
+    const pages = JSON.parse(run(['api', '--paginate', '--slurp',
+      `repos/${repo}/commits/${headSha}/${feed}?per_page=100${feed === 'check-runs' ? '&filter=all' : ''}`]));
+    if (!Array.isArray(pages) || !pages.length) rowsComplete = false;
+    let seen = 0, total = 0;
+    for (const page of pages) {
+      if (!Array.isArray(page?.[key])) throw new Error(`unreadable ${feed === 'status' ? 'commit statuses' : 'check runs'}`);
+      const batch = page[key];
+      seen += batch.length;
+      if (!Number.isSafeInteger(page.total_count) || page.total_count < 0
+        || batch.length > 100 || page.truncated || page.error || page.errors
+        || (page.sha !== undefined && page.sha !== headSha)) rowsComplete = false;
+      total = Math.max(total, page.total_count ?? 0);
+      for (const row of batch) {
+        if ((row?.head_sha ?? row?.sha ?? headSha) !== headSha) rowsComplete = false;
+        rows.push(feed === 'status' && row ? { context: row.context, state: row.state, target_url: row.target_url } : row);
+      }
+    }
+    if (seen < total) rowsComplete = false;
+  }
+  return Object.defineProperties(rows, { rowsHead: { value: headSha }, rowsComplete: { value: rowsComplete } });
+};
 
 export function readReviewCiGate({ repo, pr, readHead, readLabels,
   readHeadAndLabels = readReviewHeadAndLabels,
