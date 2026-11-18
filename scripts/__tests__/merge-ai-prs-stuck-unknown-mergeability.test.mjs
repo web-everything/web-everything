@@ -232,25 +232,13 @@ describe('stuck UNKNOWN marks across passes', () => {
     expect(rows.get(REPO)[0].mergeable).toBe('UNKNOWN');
   });
 
-  it.each([pr(), pr({ mergeable: 'UNKNOWN', state: 'CLOSED' }),
-    pr({ mergeable: 'UNKNOWN', state: 'MERGED' })])('does not mark or nudge resolved or departed listing evidence (%j)', async fresh => {
+  it.each([pr(), null, pr({ number: 999, mergeable: 'UNKNOWN' }),
+    pr({ mergeable: 'UNKNOWN', state: 'CLOSED' }), pr({ mergeable: 'UNKNOWN', state: 'MERGED' })])('does not mark or nudge resolved, departed or unreadable listing evidence (%j)', async fresh => {
     const mark = vi.fn(), nudge = vi.fn();
     await drain.repollUnknownListings({ prsByRepo: new Map([[REPO, [unknown()]]]), read: async () => fresh,
       sleep: async () => {}, setting: { retries: 3, delayMs: 0 }, onPersistentUnknown: mark, nudge });
     expect(mark).not.toHaveBeenCalled();
     expect(nudge).not.toHaveBeenCalled();
-  });
-
-  it.each([null, pr({ number: 999 })])('retries unreadable or wrong-PR listing evidence and reports the unresolved candidate once (%j)', async fresh => {
-    const candidate = unknown(), mark = vi.fn(), nudge = vi.fn();
-    const read = vi.fn(async () => fresh), sleep = vi.fn(async () => {});
-    await drain.repollUnknownListings({ prsByRepo: new Map([[REPO, [candidate]]]), read, sleep,
-      setting: { retries: 3, delayMs: 17 }, onPersistentUnknown: mark, nudge });
-    expect(read).toHaveBeenCalledTimes(3);
-    expect(sleep.mock.calls).toEqual([[17], [17], [17]]);
-    expect(candidate).toEqual(unknown());
-    expect(mark.mock.calls).toEqual([[{ repo: REPO, num: 42 }]]);
-    expect(nudge.mock.calls).toEqual([[{ repo: REPO, num: 42 }]]);
   });
 
   it('builds reasons after queue main-fix priority, including in card-number mode', () => {

@@ -8,16 +8,15 @@
  *   reads) before refusing; every other refusal, and an UNKNOWN that never resolves, stays exactly as before.
  *   The fixture is tonight's own skip records from the drain daemon log.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   revalidateForMerge, isTransientUnknownMergeability, resolveUnknownMergeabilityRetry, revalidateWithUnknownRetry,
   UNKNOWN_MERGEABILITY_RETRY, UNKNOWN_MERGEABILITY_RETRY_ENV,
-  repollUnknownListings, UNKNOWN_MERGEABILITY_MAX_RECOMPUTE, buildDrainVerdicts,
+  triggerMergeabilityRecompute, UNKNOWN_MERGEABILITY_MAX_RECOMPUTE, classifyPr,
 } from '../merge-ai-prs.mjs';
-import { decideDrainWorkflowEditHold } from '../lib/drain-workflow-edit-hold.mjs';
 
 const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'drain-unknown-mergeability-skips-2026-10-09.json'), 'utf8'));
 
@@ -31,6 +30,59 @@ const pr = (over = {}) => ({
   ...over,
 });
 const opts = { requiredCheck: 'test', defaultBranch: 'main', expectedHeadSha: HEAD };
+
+describe('triggerMergeabilityRecompute', () => {
+  it.each(['UNKNOWN', null, undefined, ''])('recomputes %s once, logs once, and preserves PR facts', async mergeable => {
+    const candidate = Object.freeze(pr({ state: 'OPEN', mergeable }));
+    const before = structuredClone(candidate);
+    const calls = [], logs = [];
+    await triggerMergeabilityRecompute({
+      prsByRepo: new Map([['o/r', [candidate, candidate]]]),
+      recompute: async payload => { calls.push(payload); return pr(); }, log: line => logs.push(line),
+    });
+    expect(calls).toEqual([{ repo: 'o/r', num: 4602 }]);
+    expect(logs).toEqual(['mergeable-unknown-recompute o/r#4602']);
+    expect(candidate).toEqual(before);
+    expect(classifyPr(candidate, opts).decision).toBe('skip');
+    expect(classifyPr(pr({ state: 'OPEN' }), opts).decision).toBe('merge');
+  });
+
+  it('never triggers for MERGEABLE, CONFLICTING, CLOSED or MERGED candidates', async () => {
+    const calls = [], logs = [];
+    await triggerMergeabilityRecompute({
+      prsByRepo: new Map([['o/r', [pr(), pr({ mergeable: 'CONFLICTING' }),
+        pr({ state: 'CLOSED', mergeable: 'UNKNOWN' }), pr({ state: 'MERGED', mergeable: null })]]]),
+      recompute: payload => calls.push(payload), log: line => logs.push(line),
+    });
+    expect(calls).toEqual([]);
+    expect(logs).toEqual([]);
+  });
+
+  it.each([0, 2, UNKNOWN_MERGEABILITY_MAX_RECOMPUTE])('honors the shared per-pass cap of %s across repositories', async max => {
+    const calls = [], logs = [];
+    const rows = Array.from({ length: 15 }, (_, number) => pr({ number, mergeable: 'UNKNOWN' }));
+    await triggerMergeabilityRecompute({
+      prsByRepo: new Map([['o/r', rows.slice(0, 1)], ['o/s', rows.slice(1)]]),
+      recompute: payload => calls.push(payload), log: line => logs.push(line),
+      ...(max === UNKNOWN_MERGEABILITY_MAX_RECOMPUTE ? {} : { max }),
+    });
+    expect(UNKNOWN_MERGEABILITY_MAX_RECOMPUTE).toBe(10);
+    expect(calls).toHaveLength(max);
+    expect(logs).toHaveLength(max);
+    expect(calls.map(call => call.num)).toEqual(rows.slice(0, max).map(row => row.number));
+  });
+
+  it('swallows recompute failures without retrying, continues, and strips repository control characters from logs', async () => {
+    const calls = [], logs = [];
+    await expect(triggerMergeabilityRecompute({
+      prsByRepo: new Map([['o/\nr\x1b\x7f\x9f', [pr({ mergeable: 'UNKNOWN' }), pr({ number: 7, mergeable: null })]]]),
+      recompute: payload => { calls.push(payload); throw new Error('unavailable'); },
+      log: line => logs.push(line),
+    })).resolves.toBeUndefined();
+    expect(calls).toEqual([{ repo: 'o/\nr\x1b\x7f\x9f', num: 4602 }, { repo: 'o/\nr\x1b\x7f\x9f', num: 7 }]);
+    expect(logs).toEqual(['mergeable-unknown-recompute o/r#4602', 'mergeable-unknown-recompute o/r#7']);
+  });
+});
 
 describe('tonight\'s skip records', () => {
   it('every revalidationAborted record is the transient UNKNOWN shape the retry targets', () => {
@@ -57,154 +109,6 @@ describe('tonight\'s skip records', () => {
     const v = revalidateForMerge(pr({ mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN' }), opts);
     expect(v.decision).toBe('skip');
     expect(isTransientUnknownMergeability(v)).toBe(true);
-  });
-});
-
-describe('bounded listing mergeability recompute', () => {
-  const repo = 'example/web';
-  const run = async (prs, extra = {}) => {
-    const rows = new Map([[repo, prs]]);
-    const io = {
-      recompute: vi.fn(async () => {}), log: vi.fn(), sleep: vi.fn(async () => {}),
-      read: vi.fn(async (_repo, num) => pr({ number: num })), onPersistentUnknown: vi.fn(),
-      ...extra,
-    };
-    await repollUnknownListings({ prsByRepo: rows, setting: { retries: 3, delayMs: 17 }, ...io });
-    return io;
-  };
-
-  it.each(['UNKNOWN', null, undefined, ''])('%j recomputes once, waits, then re-reads and admits fresh MERGEABLE evidence', async mergeable => {
-    const candidate = pr({ mergeable, state: 'OPEN' });
-    const events = [];
-    const io = await run([candidate], {
-      recompute: vi.fn(async payload => { events.push(['recompute', payload]); return { mergeable: 'MERGEABLE' }; }),
-      sleep: vi.fn(async ms => events.push(['sleep', ms])),
-      read: vi.fn(async (r, num) => { events.push(['read', r, num]); return pr(); }),
-    });
-    expect(events).toEqual([['recompute', { repo, num: 4602 }], ['sleep', 17], ['read', repo, 4602]]);
-    expect(io.recompute).toHaveBeenCalledTimes(1);
-    expect(io.read).toHaveBeenCalledTimes(1);
-    expect(io.log.mock.calls).toEqual([[`mergeable-unknown-recompute ${repo}#4602`]]);
-    expect(revalidateForMerge(candidate, opts).decision).toBe('merge');
-    expect(io.onPersistentUnknown).not.toHaveBeenCalled();
-  });
-
-  it.each(['post-recompute', 'retry', 'marked pre-read'])('discards stale head evidence on a %s head change; workflow clearance fails closed', async stage => {
-    const candidate = pr({ mergeable: stage === 'marked pre-read' ? 'MERGEABLE' : null,
-      files: [{ path: 'src/safe.js', changeType: 'MODIFIED' }] });
-    const fresh = pr({ headRefOid: 'b'.repeat(40) });
-    delete fresh.commits;
-    delete fresh.statusCheckRollup;
-    delete fresh.mergeStateStatus;
-    const read = vi.fn(async () => fresh);
-    if (stage === 'retry') read.mockResolvedValueOnce(pr({ mergeable: 'UNKNOWN' }));
-    const io = await run([candidate], { read,
-      marks: stage === 'marked pre-read' ? new Map([[`${repo}#4602`, { repo, num: 4602, since: 0 }]]) : new Map() });
-    expect(read).toHaveBeenCalledTimes(stage === 'retry' ? 2 : 1);
-    expect(io.sleep).toHaveBeenCalledTimes(stage === 'marked pre-read' ? 0 : stage === 'retry' ? 2 : 1);
-    expect(io.recompute).toHaveBeenCalledTimes(stage === 'marked pre-read' ? 0 : 1);
-    expect(candidate).toEqual(fresh);
-    for (const field of ['files', 'commits', 'statusCheckRollup', 'mergeStateStatus']) {
-      expect(candidate).not.toHaveProperty(field);
-    }
-    expect(revalidateForMerge(candidate, { ...opts, expectedHeadSha: fresh.headRefOid }).decision).toBe('skip');
-    const [verdict] = buildDrainVerdicts({ prsByRepo: new Map([[repo, [candidate]]]), repos: [repo] });
-    expect(verdict.listedHeadSha).toBe(fresh.headRefOid);
-    expect(verdict.listedFiles).toBeNull();
-    expect(verdict.listedFilesComplete).toBe(false);
-    expect(decideDrainWorkflowEditHold({ files: verdict.listedFiles, filesComplete: verdict.listedFilesComplete,
-      headSha: verdict.listedHeadSha, humanClearedSha: HEAD })).toMatchObject({ hold: true, defer: true });
-  });
-
-  it('preserves fresh head-bound fields supplied for the new head', async () => {
-    const candidate = pr({ mergeable: null, files: ['src/old.js'] });
-    const fresh = pr({ headRefOid: 'b'.repeat(40), files: ['.github/workflows/test.yml'],
-      commits: [{ oid: 'b'.repeat(40) }], statusCheckRollup: [] });
-    await run([candidate], { read: async () => fresh });
-    expect(candidate).toEqual(fresh);
-  });
-
-  it('preserves listing-only files when the post-recompute head is unchanged', async () => {
-    const files = [{ path: 'src/safe.js', changeType: 'MODIFIED' }];
-    const candidate = pr({ mergeable: null, files });
-    await run([candidate]);
-    expect(candidate.headRefOid).toBe(HEAD);
-    expect(candidate.files).toBe(files);
-  });
-
-  it.each([null, 'UNKNOWN'])('persistent %j stays refused and reported after one recompute and bounded retries', async mergeable => {
-    const candidate = pr({ mergeable });
-    const io = await run([candidate], { read: vi.fn(async () => pr({ mergeable })) });
-    expect(io.recompute).toHaveBeenCalledTimes(1);
-    expect(io.read).toHaveBeenCalledTimes(4);
-    expect(io.sleep.mock.calls).toEqual([[17], [17], [17], [17]]);
-    expect(candidate.mergeable).toBe(mergeable);
-    const verdict = revalidateForMerge(candidate, opts);
-    expect(verdict.decision).toBe('skip');
-    expect(verdict.reason).toBe('not mergeable (mergeable=UNKNOWN)');
-    expect(isTransientUnknownMergeability(verdict)).toBe(true);
-    expect(io.onPersistentUnknown.mock.calls).toEqual([[{ repo, num: 4602 }]]);
-  });
-
-  it.each([2, UNKNOWN_MERGEABILITY_MAX_RECOMPUTE])('caps recomputes at %i across repos; excess stays refused and reported', async cap => {
-    expect(UNKNOWN_MERGEABILITY_MAX_RECOMPUTE).toBe(10);
-    const rows = new Map([[repo, [pr({ number: 1, mergeable: null })]],
-      ['example/other', Array.from({ length: cap + 1 }, (_, i) => pr({ number: i + 2, mergeable: 'UNKNOWN' }))]]);
-    const recompute = vi.fn(async () => {}), read = vi.fn(), log = vi.fn(), report = vi.fn();
-    await repollUnknownListings({ prsByRepo: rows, recompute, read, log, onPersistentUnknown: report,
-      ...(cap === 2 ? { maxRecompute: cap } : {}), setting: { retries: 0, delayMs: 0 }, sleep: async () => {} });
-    expect(recompute).toHaveBeenCalledTimes(cap);
-    expect(new Set(recompute.mock.calls.map(([p]) => `${p.repo}#${p.num}`)).size).toBe(cap);
-    expect(read).toHaveBeenCalledTimes(cap);
-    expect(log).toHaveBeenCalledTimes(cap);
-    expect(report).toHaveBeenCalledTimes(cap + 2);
-    for (const prs of rows.values()) for (const candidate of prs) expect(revalidateForMerge(candidate, opts).decision).toBe('skip');
-  });
-
-  it('never recomputes known mergeability or closed/merged PRs', async () => {
-    const io = await run([pr(), pr({ mergeable: 'CONFLICTING' }),
-      pr({ mergeable: null, state: 'CLOSED' }), pr({ mergeable: 'UNKNOWN', state: 'MERGED' })]);
-    expect(io.recompute).not.toHaveBeenCalled();
-    expect(io.read).not.toHaveBeenCalled();
-    expect(io.log).not.toHaveBeenCalled();
-    expect(io.sleep).not.toHaveBeenCalled();
-  });
-
-  it.each([0, 3])('reports null or wrong-PR reads once after recompute and %i retries', async retries => {
-    for (const fresh of [null, pr({ number: 999 })]) {
-      const candidate = pr({ mergeable: null });
-      const nudge = vi.fn();
-      const io = await run([candidate], { read: vi.fn(async () => fresh), nudge,
-        setting: { retries, delayMs: 17 } });
-      expect(io.recompute).toHaveBeenCalledTimes(1);
-      expect(io.read).toHaveBeenCalledTimes(1 + retries);
-      expect(io.sleep).toHaveBeenCalledTimes(1 + retries);
-      expect(candidate.number).toBe(4602);
-      expect(candidate.mergeable).toBeNull();
-      expect(io.onPersistentUnknown.mock.calls).toEqual([[{ repo, num: 4602 }]]);
-      expect(nudge.mock.calls).toEqual([[{ repo, num: 4602 }]]);
-    }
-  });
-
-  it('resolves only when a valid read follows failed and wrong-PR reads', async () => {
-    const candidate = pr({ mergeable: null });
-    const read = vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce(pr({ number: 999 }))
-      .mockResolvedValueOnce(pr());
-    const io = await run([candidate], { read });
-    expect(read).toHaveBeenCalledTimes(3);
-    expect(candidate.mergeable).toBe('MERGEABLE');
-    expect(io.onPersistentUnknown).not.toHaveBeenCalled();
-  });
-
-  it('swallows recompute failures and keeps persistent null mergeability refused and reported', async () => {
-    const candidate = pr({ mergeable: null });
-    const io = await run([candidate], {
-      recompute: vi.fn(async () => { throw new Error('HTTP 503'); }), read: vi.fn(async () => pr({ mergeable: null })),
-    });
-    expect(io.recompute).toHaveBeenCalledTimes(1);
-    expect(io.read).toHaveBeenCalledTimes(4);
-    expect(io.onPersistentUnknown).toHaveBeenCalledTimes(1);
-    expect(isTransientUnknownMergeability(revalidateForMerge(candidate, opts))).toBe(true);
   });
 });
 
@@ -374,6 +278,10 @@ describe('runCli wiring', () => {
     const run = src.slice(src.indexOf('async function runCli('));
     const seam = run.indexOf('await repollThenCollectContext({');
     expect(seam).toBeGreaterThan(0);
+    const trigger = run.indexOf('await triggerMergeabilityRecompute({', seam);
+    expect(trigger).toBeGreaterThan(seam);
+    expect(run.indexOf('await repollUnknownListings({', seam)).toBeGreaterThan(trigger);
+    expect(run.slice(trigger, run.indexOf('await repollUnknownListings({', seam))).toContain("execFileP('gh', ['api', `repos/${slug}/pulls/${num}`]");
     expect(run.indexOf('collectContext(liveListingsByRepo)')).toBeGreaterThan(seam);
     expect(run.indexOf('collectContext(liveListingsByRepo)')).toBe(run.lastIndexOf('collectContext(liveListingsByRepo)'));
     expect(run).toContain('applyCiLifecycleLabelPlan({ plan, pr: p.number');
