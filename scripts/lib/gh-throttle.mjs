@@ -1871,8 +1871,8 @@ function sanitizeJobLog(args, result, encoding) {
   const codec = encoding && encoding !== 'buffer' ? encoding : 'latin1';
   const text = Buffer.isBuffer(result) ? result.toString(codec) : result;
   const clean = text
-    .replace(/\u001b\[[0-?]*[ -\/]*[@-~]/g, '');
-  // Fail closed: only CSI colour markup is understood; OSC/hyperlink/lone ESC could hide verdict rows from parsers.
+    .replace(/\u001b\[[0-9;]*m/g, '');
+  // Fail closed: only SGR colour markup (ESC[...m) is understood; OSC/hyperlink/lone ESC could hide verdict rows from parsers.
   if (clean.includes('\u001b')) throw new Error('job log contains unsupported terminal escape sequences');
   return Buffer.isBuffer(result) ? Buffer.from(clean, codec) : clean;
 }

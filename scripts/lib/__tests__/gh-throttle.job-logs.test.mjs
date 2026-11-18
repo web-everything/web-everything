@@ -32,7 +32,7 @@ describe('job-log escape-sequence permission', () => {
     expect(runGhSync(['api', 'repos/o/r/actions/jobs/123'], opts)).toBe(output);
   });
 
-  it.each(['\u001b]0;title\u0007', '\u001b]8;;https://x\u001b\\', '\u001b'])('fails closed on non-CSI escapes (%j)', esc => {
+  it.each(['\u001b[2J', '\u001b[1A', '\u001b]0;title\u0007', '\u001b]8;;https://x\u001b\\', '\u001b'])('fails closed on non-CSI escapes (%j)', esc => {
     const root = mkdtempSync(join(tmpdir(), 'gh-job-logs-')); roots.push(root);
     expect(() => runGhSync(['api', 'repos/o/r/actions/jobs/123/logs'], { encoding: 'utf8', throttle: {
       env: {}, lockRoot: root, logPath: join(root, 'calls.jsonl'), personalRoute: false, exec: () => `a\n${esc}  fail-closed codeql\n`,
