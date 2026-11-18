@@ -780,8 +780,7 @@ export async function acquireWrite(root, opts = {}) {
     noteRefusal(startMs, yieldTo.owner, true);
     return { ok: false, reason: 'reader-priority', heldBy: yieldTo.owner, starved: yieldTo.count };
   }
-  const currentWriter = readLockEntry(writerRoot, WRITER_KEY);
-  const writerReserve = reserve(writerRoot, WRITER_KEY, owner, startMs, startIso, pid, probe(currentWriter), leaseMinutes);
+  const writerReserve = reserve(writerRoot, WRITER_KEY, owner, startMs, startIso, pid, probe, leaseMinutes);
   if (!writerReserve.ok) {
     return { ok: false, reason: 'concurrent-mover', heldBy: writerReserve.heldBy };
   }
@@ -890,9 +889,10 @@ export async function withReadLock(root, fn, opts = {}) {
 /**
  * Run `fn` while holding the WRITE lock on `root` (see {@link acquireWrite} for the wait/timeout semantics).
  * Same heartbeat-while-held / always-release-in-finally shape as {@link withReadLock}.
+ * The callback receives `stillHeld()` to fence publication after asynchronous work.
  * @template T
  * @param {string} root
- * @param {() => (T|Promise<T>)} fn
+ * @param {(stillHeld: () => boolean) => (T|Promise<T>)} fn
  * @param {object} [opts]  same shape as {@link acquireWrite}
  * @returns {Promise<{ok:true, value:T}|{ok:false, reason:string, heldBy:string|null}>}
  */
@@ -927,7 +927,10 @@ export async function withWriteLock(root, fn, opts = {}) {
   try {
     if (!stillOurs()) loseLock();
     if (lost) return { ok: false, reason: 'lock-lost', heldBy: readLockEntry(writerRoot, WRITER_KEY)?.owner ?? null };
-    const value = await fn();
+    const value = await fn(() => {
+      if (!stillOurs()) loseLock();
+      return !lost;
+    });
     if (!stillOurs()) loseLock();
     if (lost) return { ok: false, reason: 'lock-lost', heldBy: readLockEntry(writerRoot, WRITER_KEY)?.owner ?? null };
     return { ok: true, value };

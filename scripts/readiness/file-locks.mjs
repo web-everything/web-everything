@@ -77,7 +77,7 @@ export function parseLockEntry(text) {
   // `meta` (#2458) is opaque owner-supplied metadata (e.g. a drain lease's repo scope). Preserve it verbatim
   // when present and a plain object; a lock with no meta parses exactly as before (no `meta` key added).
   const meta = raw.meta && typeof raw.meta === 'object' && !Array.isArray(raw.meta) ? raw.meta : null;
-  return { owner: String(raw.owner), path: raw.path != null ? String(raw.path) : null, pid, heartbeatAt: String(raw.heartbeatAt), ...(meta ? { meta } : {}) };
+  return { owner: String(raw.owner), path: raw.path != null ? String(raw.path) : null, pid, heartbeatAt: String(raw.heartbeatAt), ...(meta ? { meta } : {}), ...(raw.token != null ? { token: raw.token } : {}) };
 }
 
 /** Age in ms of an ISO timestamp vs `nowMs`; Infinity when unparseable (⇒ treated as expired/stale). */
@@ -302,7 +302,8 @@ export function releaseLockDir(lockRoot, path) {
 export function releaseLockDirIf(lockRoot, path, expected) {
   const dir = lockDirFor(lockRoot, path);
   const matchesExpected = (found) => (expected
-    ? !!found && found.owner === expected.owner && (expected.heartbeatAt == null || found.heartbeatAt === expected.heartbeatAt)
+    ? !!found && found.owner === expected.owner && found.token === expected.token
+      && (expected.heartbeatAt == null || found.heartbeatAt === expected.heartbeatAt)
     : found === null);
   // Cheap pre-check: a lock that is plainly not the one judged is never moved at all, so the rename window below
   // opens only when the lock looks like the expected one.

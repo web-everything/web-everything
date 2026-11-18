@@ -558,6 +558,26 @@ describe('acquireWrite waiting on readers', () => {
   });
 });
 
+it('does not reclaim a live replacement installed between the liveness probe and reclaim', async () => {
+  for (const replacementOwner of ['writer-c', 'writer-a']) {
+    const lockRoot = mkTmp('dcl-replaced-lockroot-');
+    const clone = mkTmp('dcl-replaced-clone-');
+    expect(await acquireWrite(clone, { owner: 'writer-a', lockRoot, probe: alwaysAlive })).toEqual({ ok: true });
+    const { writerRoot } = cloneLockDirs(clone, lockRoot);
+    const file = join(lockDirFor(writerRoot, '<clone:writer>'), 'lock.json');
+    const replacement = { ...JSON.parse(readFileSync(file, 'utf8')), owner: replacementOwner, token: 'replacement-token' };
+    const probe = vi.fn(entry => {
+      if (entry?.owner !== 'writer-a') return 'alive';
+      writeFileSync(file, JSON.stringify(replacement));
+      return 'dead';
+    });
+    expect(await acquireWrite(clone, { owner: 'writer-b', lockRoot, probe }))
+      .toMatchObject({ ok: false, reason: 'concurrent-mover', heldBy: replacementOwner });
+    expect(probe).toHaveBeenCalled();
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual(replacement);
+  }
+});
+
 describe('defaultProbePidLiveness', () => {
   it('reports unknown for a different host', () => {
     expect(defaultProbePidLiveness({ owner: 'some-other-host:99999', pid: 99999 })).toBe('unknown');

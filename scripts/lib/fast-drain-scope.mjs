@@ -184,12 +184,15 @@ export async function readFastDrainRoundListing({ path, repo, onlyPr, env = proc
   const clock = () => now ?? Date.now();
   const ttl = roundSnapshotTtl(env);
   const hasBranch = snap => !requireDefaultBranch || (typeof snap?.defaultBranch === 'string' && !!snap.defaultBranch.trim());
-  const populate = async ({ liveOnly = false } = {}) => {
+  const populate = async ({ liveOnly = false, stillHeld } = {}) => {
     const snap = liveOnly ? null : readFastDrainRoundSnapshot({ path, repo, env, now: clock(), read });
     if (snap && hasBranch(snap)) return { ...snap, hit: true };
     const rows = snap?.rows ?? await listLive();
     const branch = await defaultBranch();
     if (requireDefaultBranch && !hasBranch({ defaultBranch: branch })) throw new Error('round listing default branch unreadable — retry next pass');
+    if (!liveOnly && (typeof stillHeld !== 'function' || !stillHeld())) {
+      throw new Error('round listing lock unavailable (lock-lost) — retry next pass');
+    }
     try { if (!liveOnly) write(path, { repo, writtenAt: snap?.writtenAt ?? clock(), rows, defaultBranch: branch }); }
     catch { /* Unwritable cache costs a live listing next time; it never authorizes a cached target. */ }
     return { rows, defaultBranch: branch, hit: !!snap };
@@ -201,7 +204,7 @@ export async function readFastDrainRoundListing({ path, repo, onlyPr, env = proc
   else {
     let entered = false;
     let locked;
-    try { locked = await lock(() => { entered = true; return populate(); }); }
+    try { locked = await lock(stillHeld => { entered = true; return populate({ stillHeld }); }); }
     catch (error) {
       if (entered) throw error; // The live reader failed: propagate it, never retry it as a cache error.
       throw new Error('round listing lock unreadable — retry next pass', { cause: error });

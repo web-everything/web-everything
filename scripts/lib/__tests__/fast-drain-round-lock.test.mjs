@@ -111,6 +111,22 @@ it('reclaims a stale writer lease before doing one live listing', async () => {
   expect(listLive).toHaveBeenCalledOnce();
 });
 
+it('a stale writer whose lease was reclaimed does not publish over its successor snapshot', async () => {
+  const path = setup();
+  vi.useFakeTimers({ toFake: ['Date'] });
+  const successorRows = [row(), row(43)];
+  const write = vi.fn();
+  await expect(readFastDrainRoundListing({ ...options(path), write,
+    listLive: async () => {
+      vi.setSystemTime(Date.now() + 11 * 60_000);
+      await readFastDrainRoundListing({ ...options(path), listLive: async () => successorRows });
+      return [row()];
+    },
+  })).rejects.toThrow('lock-lost');
+  expect(write).not.toHaveBeenCalled();
+  expect(readFastDrainRoundSnapshot({ path, repo, env: {} }).rows).toEqual(successorRows);
+});
+
 it('reclaims a dead same-host writer without waiting out its lease', async () => {
   const path = setup();
   const holder = { owner: `${hostname()}:2147483647`, pid: 2147483647, lockRoot: `${path}.locks` };
