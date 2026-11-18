@@ -5813,11 +5813,16 @@ async function runCli() {
         const missing = [...queue.inQueue].filter(number => !listedNumbers.has(number));
         const queuedRows = await __t.timeAsync('listing.eviction', () => mapWithConcurrency(missing,
           resolvedMergePolicy.policy.concurrency.gateReads, async number => {
-            const pr = await listing.readTarget(number);
-            if (!pr || Number(pr.number) !== number || !Array.isArray(pr.labels)) throw new Error(`queued PR #${number} unreadable`);
-            return pr;
+            try {
+              const pr = await listing.readTarget(number);
+              if (!pr || Number(pr.number) !== number || !Array.isArray(pr.labels)) throw new Error(`queued PR #${number} unreadable`);
+              return pr;
+            } catch {
+              process.stderr.write(`  ⚠ merge-queue dequeue sweep for ${repoTag(listing.repo) || 'cwd'}: queued PR #${number} unreadable — skipped; retried next pass\n`);
+              return null;
+            }
           }));
-        rows = [...rows, ...queuedRows];
+        rows = [...rows, ...queuedRows.filter(Boolean)];
       }
       mergeStrategy.dequeueSendBacks(rows, listing.repo);
     } catch (e) {

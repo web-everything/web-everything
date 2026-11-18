@@ -4446,7 +4446,9 @@ row is replaced wholesale by a live read, so checks/body from an old head never 
 The writer stores the resolved default branch with the rows; readers reuse it in process. A
 historical snapshot missing the branch is upgraded under the same lock without listing again.
 
-Waiters retry while the writer owns a live heartbeat lease, including beyond 180 seconds.
+Waiters retry while the writer owns a live heartbeat lease, including beyond 180 seconds,
+up to an overall 600-second default deadline. At expiry they log an exact live-listing fallback
+without publishing over the writer's shared snapshot.
 The shared clone-lock primitive reclaims a dead PID or stale lease; the next writer refreshes
 the snapshot. Lock IO failures defer to the next pass with an explicit error rather than
 launching independent live listings.
@@ -4459,12 +4461,14 @@ its hydrated heavy-field cache/shared host seed; cached fields require a matchin
 for live sibling discovery. Eviction reuses live context rows, or re-lists when reconcile is off.
 Snapshot-mode eviction also reads live queue membership and fetches queued PRs absent from
 those rows, so a send-back beyond `OPEN_PR_LIST_LIMIT` is still dequeued. Unreadable membership
-or missing-PR evidence skips mutations and logs a retry-next-pass warning. The named cap and
+skips mutations and logs a retry-next-pass warning. An unreadable missing queued PR is
+individually skipped and logged; other readable PRs still undergo eviction. The named cap and
 unreadable-evidence regressions in `merge-ai-prs.test.mjs` exercise these paths.
 Enqueue's mutating path retains a final LIVE target head and required-check verification. A moved
 head, red/missing check, unreadable target or unknown required set retains the hold.
 
 `fast-drain-round-lock.test.mjs` covers concurrent single-flight, a waiter past the old deadline,
+exact live fallback at the overall deadline despite a heartbeating writer,
 stale-writer takeover, lock failure, historical branch upgrade, branch failure, TTL bounds,
 oversized/incomplete/foreign evidence, target head invalidation, snapshot exclusion from live context, and
 final live evidence winning over a cached green row on the actual `enqueuePr` mutation path.

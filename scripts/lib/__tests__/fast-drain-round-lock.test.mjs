@@ -52,7 +52,7 @@ it('waits beyond 180 seconds for an alive writer and consumes its snapshot witho
   expect(await acquireWrite(root, holder)).toEqual({ ok: true });
   const sleep = vi.fn(async ms => {
     vi.setSystemTime(Date.now() + ms);
-    // Release only after the historical deadline. No timer-based live fallback is authorized.
+    // Release after the historical deadline, within the generous overall bound.
     if (Date.now() - start === 181_000) { save(path); releaseWrite(root, holder); }
     if (Date.now() - start > 181_000) throw new Error('waiter did not adopt released writer');
   });
@@ -63,6 +63,40 @@ it('waits beyond 180 seconds for an alive writer and consumes its snapshot witho
     })).toEqual([row()]);
     expect(sleep).toHaveBeenCalledTimes(181);
     expect(listLive).not.toHaveBeenCalled();
+  } finally { releaseWrite(root, holder); }
+});
+
+it('falls back to exact live rows at the default 600-second deadline while the writer keeps heartbeating', async () => {
+  const path = setup();
+  const root = join(path, '..');
+  const holder = { owner: 'heartbeating-holder', lockRoot: `${path}.locks` };
+  vi.useFakeTimers({ toFake: ['Date'] });
+  const start = Date.now();
+  expect(await acquireWrite(root, holder)).toEqual({ ok: true });
+  const sleep = vi.fn(async ms => {
+    vi.setSystemTime(Date.now() + ms);
+    expect(await acquireWrite(root, holder)).toEqual({ ok: true });
+    // Even a fresh snapshot at expiry must not substitute for the exact live fallback.
+    if (Date.now() - start === 600_000) save(path, [row(99)]);
+    if (Date.now() - start > 600_000) throw Error('overall lock deadline exceeded');
+  });
+  const listLive = vi.fn(async () => [row(), row(43)]);
+  const write = vi.fn();
+  const log = vi.fn();
+  const defaultBranch = vi.fn(async () => 'main');
+  try {
+    expect(await readFastDrainRoundListing({ ...options(path), listLive, write, log,
+      defaultBranch, requireDefaultBranch: true,
+      lock: fn => withFastDrainRoundLock(path, fn, { owner: 'waiter', sleep }),
+    })).toEqual([row(), row(43)]);
+    expect(Date.now() - start).toBe(600_000);
+    expect(listLive).toHaveBeenCalledOnce();
+    expect(defaultBranch).toHaveBeenCalledOnce();
+    expect(write).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('deadline expired — falling back to exact live listing'));
+    expect(readFastDrainRoundSnapshot({ path, repo, env: {} }).rows).toEqual([row(99)]);
+    expect(await withFastDrainRoundLock(path, () => { throw Error('holder lock stolen'); }, { waitMs: 0 }))
+      .toMatchObject({ ok: false, reason: 'round-lock-deadline' });
   } finally { releaseWrite(root, holder); }
 });
 

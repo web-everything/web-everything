@@ -223,7 +223,7 @@ describe('round listing freshness at the CLI boundary', () => {
     expect(buildLiveListingsByRepo([{ repo: 'fixture/repo', rows: [{ number: 42 }], listing: 'snapshot' }]).has('fixture/repo')).toBe(false);
   });
 
-  const run = (listing, { sendBack, reconcile = true, omitSibling = false, failListing = false, snapshotAgeMs = 0, cappedListing = false, failQueue = false, failQueuedRead = false } = {}) => {
+  const run = (listing, { sendBack, reconcile = true, omitSibling = false, failListing = false, snapshotAgeMs = 0, cappedListing = false, failQueue = false, failQueuedRead = false, unreadableQueuedSibling = false } = {}) => {
     const dir = mkdtempSync(join(tmpdir(), 'drain-round-cli-'));
     try {
       const row = (number, item, blockedBy = []) => ({ number, title: `PR ${number}`, state: 'OPEN',
@@ -255,6 +255,7 @@ const rows = JSON.parse(fs.readFileSync(process.env.ROWS_FILE, 'utf8'));
 let out = [];
 if (a[0] === 'repo') out = 'main';
 else if (a[0] === 'pr' && a[1] === 'view') {
+  if (process.env.UNREADABLE_QUEUED_SIBLING === '1' && a[2] === '44') { fs.writeSync(2, 'fixture queued PR unreadable'); process.exit(1); }
   if ((process.env.FAIL_LISTING === '1' || process.env.FAIL_QUEUED_READ === '1') && a[2] === '43') { fs.writeSync(2, 'fixture queued PR unreadable'); process.exit(1); }
   out = { ...rows.find(r => r.number === Number(a[2])), commits: [] };
 }
@@ -267,7 +268,7 @@ else if (a[0] === 'api' && a[1] === 'graphql') {
     out = { data: { repository: { pullRequest: { isInMergeQueue: !fs.existsSync(process.env.QUEUE_REMOVED) } } } };
   } else if (q.includes('mergeQueue(branch:')) {
     if (process.env.FAIL_QUEUE === '1') { fs.writeSync(2, 'fixture queue unreadable'); process.exit(1); }
-    out = { data: { repository: { mergeQueue: { entries: { nodes: fs.existsSync(process.env.QUEUE_REMOVED) ? [] : [{ pullRequest: { id: 'PR_43', number: 43 } }], pageInfo: { hasNextPage: false } } } } } };
+    out = { data: { repository: { mergeQueue: { entries: { nodes: fs.existsSync(process.env.QUEUE_REMOVED) ? [] : [{ pullRequest: { id: 'PR_43', number: 43 } }, ...(process.env.UNREADABLE_QUEUED_SIBLING === '1' ? [{ pullRequest: { id: 'PR_44', number: 44 } }] : [])], pageInfo: { hasNextPage: false } } } } } };
   } else {
     if (process.env.FAIL_LISTING === '1') { fs.writeSync(2, 'fixture live listing unavailable'); process.exit(1); }
     const local = a.some(v => v.includes('repository(owner:"fixture",name:"repo")'));
@@ -294,6 +295,7 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
           ...(sendBack ? { WE_MERGE_DELIVERY_SETTINGS_FILE: join(dir, 'merge-settings.json') } : {}),
           QUEUE_REMOVED: join(dir, 'queue-removed'), FAIL_LISTING: failListing ? '1' : '0', CAPPED_LISTING: cappedListing ? '1' : '0',
           FAIL_QUEUE: failQueue ? '1' : '0', FAIL_QUEUED_READ: failQueuedRead ? '1' : '0',
+          UNREADABLE_QUEUED_SIBLING: unreadableQueuedSibling ? '1' : '0',
           ...(cappedListing ? { WE_PR_LIST_PAGE_SIZE: '100' } : {}) },
       });
       expect(result.status, result.stderr).toBe(0);
@@ -373,6 +375,15 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
     const { calls, stderr } = run('live', { sendBack: 'red-team:blocked' });
     expect(stderr).not.toContain('served-from-snapshot');
     expect(calls.filter(a => a.some(v => v.includes('dequeuePullRequest')))).toHaveLength(1);
+  });
+  it.each([true, false])('skips an unreadable missing queued PR while evicting a live listed send-back (reconcile=%s)', reconcile => {
+    const { calls, stderr } = run('snapshot', { sendBack: 'review:changes', reconcile,
+      unreadableQueuedSibling: true });
+    expect(calls.some(a => a[0] === 'pr' && a[1] === 'view' && a[2] === '44')).toBe(true);
+    expect(stderr).toContain('queued PR #44 unreadable — skipped; retried next pass');
+    expect(calls.filter(a => a.some(v => v.includes('dequeuePullRequest')))).toHaveLength(1);
+    expect(calls.filter(a => a[0] === 'pr' && a[1] === 'comment' && a[2] === '43')).toHaveLength(1);
+    expect(calls.some(a => a[0] === 'pr' && a[1] === 'comment' && a[2] === '44')).toBe(false);
   });
   it.each([true, false])('retries unreadable eviction evidence without stale mutations (reconcile=%s)', reconcile => {
     const { calls, stderr } = run('snapshot', { sendBack: 'red-team:blocked', reconcile, failListing: true });
