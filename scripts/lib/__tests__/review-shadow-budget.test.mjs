@@ -69,6 +69,22 @@ describe('daily session cap', () => {
       expect(result.skipped).toBeUndefined();
     } else expect(result.skipped).toBeDefined();
   });
+  it('Carbon shadow off skips before reserving daily budget or launching a fallback', async () => {
+    vi.stubEnv('WE_REVIEW_SEAT_CAP_CARBON_SHADOW', '0');
+    vi.stubEnv('WE_REVIEW_SEAT_CAP_AGY_GEMINI', '5');
+    const reserveSession = vi.fn(), agyJuror = vi.fn();
+    const result = await runSeatWithProvider({ lens: 'correctness', seatProvider: {
+      mode: 'shadow', model: 'gemini-4-carbon-high', fallbackModel: 'opus', dailyCap: 10,
+    } }, {
+      cwd: '.', unwrap: x => x, wrap: value => value,
+      claudeJudge: async () => ({ value: { summary: 'Claude judged', findings: [] } }),
+      reserveSession, agyJuror, appendRow: () => true, log: () => {},
+    });
+    expect(result.summary).toBe('Claude judged');
+    expect(result.shadow).toMatchObject({ status: 'skipped', reasons: ['carbon shadow seat off'] });
+    expect(reserveSession).not.toHaveBeenCalled();
+    expect(agyJuror).not.toHaveBeenCalled();
+  });
   it('refuses admission when the budget store is unavailable', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'shadow-budget-unavailable-'));
     try {

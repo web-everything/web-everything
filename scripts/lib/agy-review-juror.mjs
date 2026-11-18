@@ -390,7 +390,9 @@ export function scrubPaths(text, roots = [], home = homedir()) {
  */
 export function relativizeFindings(findings, roots = []) {
   const prefixes = roots.filter(Boolean).map((r) => `${String(r).replace(/\/+$/, '')}/`);
-  return (Array.isArray(findings) ? findings : []).map((f) => {
+  // Preserve malformed raw evidence for the shadow answer validator; never turn it into a clean accept.
+  if (!Array.isArray(findings)) return findings;
+  return findings.map((f) => {
     if (!f || typeof f.file !== 'string') return f;
     const hit = prefixes.find((p) => f.file.startsWith(p));
     return hit ? { ...f, file: f.file.slice(hit.length) } : f;

@@ -4,6 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { buildShadowRow, compareShadowAnswers, summarizeCarbonPromotion } from '../review-shadow-agreement.mjs';
 import { runAgyReviewJuror, stateChangingToolCalls } from '../agy-review-juror.mjs';
 
 const roots = [];
@@ -52,7 +53,7 @@ function fixture() {
         if (options.spawnError) throw new Error('failed without transcript');
         const t = join(root, 'transcript.jsonl');
         writeFileSync(t, options.transcriptText ?? transcript(steps(cwd)));
-        return { value: { summary: 'review', findings: [] }, sessionId: 'own-id', transcriptFile: t };
+        return { value: options.value ?? { summary: 'review', findings: [] }, servedModel: 'gemini-4-carbon-high', sessionId: 'own-id', transcriptFile: t };
       },
       readFile: (p) => { if (options.unreadableTranscript) throw new Error('unreadable transcript'); return readFileSync(p, 'utf8'); },
       removeDir: (p) => rmSync(p, { recursive: true, force: true }),
@@ -354,5 +355,23 @@ describe('own brain reads extend only the read allowlist', () => {
     expect(stateChangingToolCalls(transcript([tool(join(own, 'escape', 'file.txt'))]), {
       allowedRoots: [fx.lane], home: fx.home, sessionId: 'own-id',
     })).toEqual(['view_file (read outside the juror lane)']);
+  });
+});
+
+describe('raw juror findings remain invalid shadow evidence', () => {
+  it.each([undefined, null, {}, 'bad', [null], ['bad'], [{}], [{ summary: 'defect', file: 42 }], [{ summary: 'defect', line: -1 }]])
+  ('malformed findings %j survive the juror and make the PR invalid', async findings => {
+    const fx = fixture();
+    const value = findings === undefined ? { summary: 'review' } : { summary: 'review', findings };
+    const agyRun = await fx.run(undefined, undefined, { value });
+    expect(agyRun.status).toBe('ok');
+    expect(agyRun.value.findings).toEqual(findings);
+    const claudeAnswer = { summary: 'review', findings: [] };
+    const row = buildShadowRow({ repo: 'o/r', pr: 1, model: 'gemini-4-carbon-high', agyRun,
+      claudeAnswer, agyAnswer: agyRun.value,
+      comparison: compareShadowAnswers({ claude: claudeAnswer, agy: agyRun.value }),
+    });
+    expect(row).toMatchObject({ claudeValid: true, agyValid: false });
+    expect(summarizeCarbonPromotion([row])).toEqual({ agree: 0, disagree: 0, invalid: 1, prs: 1, threshold: 10 });
   });
 });

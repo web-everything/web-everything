@@ -1,11 +1,10 @@
 import { callsUsedToday, callsUsedTodayForProvider, reviewSeatCapUsage } from '../../operations/review-extra-seats.mjs';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { resolveReviewSeatSafeguards, resolveShadowSeatModel, resolveShadowPromotionPrs, resolveShadowPromotionReplaces, SHADOW_AGY_MODEL_ENV } from '../review-seat-settings.mjs';
-import { resolveProviderCap } from '../review-seat-caps.mjs';
+import { CARBON_SHADOW_CAP_ENV, resolveCarbonShadowCap, resolveProviderCap } from '../review-seat-caps.mjs';
 import { assertCrossVendorPanel, settingsFromRoutingPolicy, shadowSeatStatus, seatProviderDirective, loadReviewSeatSettings } from '../review-seat-provider.mjs';
 import { DEFAULT_ROUTING_POLICY, validateRoutingPolicy } from '../dispatch-routing-policy.mjs';
 import { buildShadowRow, compareShadowAnswers, summarizeShadowAgreement, summarizeCarbonPromotion, renderShadowReport } from '../review-shadow-agreement.mjs';
@@ -33,7 +32,10 @@ async function run(runs, extraDirective = {}) {
 const ok = { status: 'ok', sessionId: 'agy', value: { summary: 'agy', findings: [finding] } };
 
 // These legacy Argon trials explicitly opt in to non-Carbon Gemini execution.
-beforeEach(() => vi.stubEnv('WE_REVIEW_SEAT_CAP_AGY_GEMINI', '5'));
+beforeEach(() => {
+  vi.stubEnv('WE_REVIEW_SEAT_CAP_AGY_GEMINI', '5');
+  vi.stubEnv(CARBON_SHADOW_CAP_ENV, '1');
+});
 afterEach(() => vi.unstubAllEnvs());
 
 describe('shadow model cascade', () => {
@@ -89,6 +91,38 @@ describe('Carbon promotion settings and advisory guards', () => {
     expect(resolveProviderCap('agy-gemini', { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '5' })).toBe(5);
     expect(resolveProviderCap('agy-gemini', { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' })).toBe(0);
     expect(resolveProviderCap('agy-gemini', { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '-1' })).toBe(0);
+  });
+  it.each([
+    [undefined, 1], ['0', 0], ['1', 1], ['4', 4], ['-1', 1], ['1.5', 1], ['', 1], ['nope', 1],
+    [String(Number.MAX_SAFE_INTEGER + 1), 1],
+  ])('resolves the independent Carbon shadow cap %j to %i', (value, expected) => {
+    expect(resolveCarbonShadowCap({ [CARBON_SHADOW_CAP_ENV]: value })).toBe(expected);
+    expect(resolveCarbonShadowCap({ WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' })).toBe(1);
+  });
+  it.each(['shadow', 'agy'].flatMap(mode => [true, false].flatMap(carbon =>
+    ['0', '3'].flatMap(geminiCap => ['0', '2'].map(carbonCap => ({ mode, carbon, geminiCap, carbonCap }))))))
+  ('$mode Carbon=$carbon Gemini cap=$geminiCap Carbon shadow cap=$carbonCap uses only its own cap', async ({ mode, carbon, geminiCap, carbonCap }) => {
+    vi.stubEnv('WE_REVIEW_SEAT_CAP_AGY_GEMINI', geminiCap);
+    vi.stubEnv(CARBON_SHADOW_CAP_ENV, carbonCap);
+    const selectedModel = carbon ? 'gemini-4-carbon-high' : model;
+    const carbonShadow = carbon && mode === 'shadow';
+    const enabled = Number(carbonShadow ? carbonCap : geminiCap) > 0;
+    const result = await run([{ ...ok, servedModel: selectedModel }], { mode, model: selectedModel, onEscape: 'skip' });
+    expect(result.models).toEqual(enabled ? [selectedModel] : []);
+    if (!enabled) {
+      const reasons = [carbonShadow ? 'carbon shadow seat off' : mode === 'shadow' ? 'non-carbon gemini seat cap 0' : 'gemini seat cap 0'];
+      expect(mode === 'shadow' ? result.value.shadow : result.value.seatProvider).toMatchObject({ status: 'skipped', reasons });
+    }
+    if (mode === 'shadow') expect(result.value.findings).toEqual(claudeAnswer.findings);
+    if (carbonShadow) expect(result.logs.join(' ')).toContain(`${CARBON_SHADOW_CAP_ENV}=${carbonCap} (env)`);
+  });
+  it.each([undefined, '-1', 'invalid'])('Carbon shadow runs with its default cap when the override is %j and Gemini is off', async value => {
+    vi.stubEnv(CARBON_SHADOW_CAP_ENV, value);
+    vi.stubEnv('WE_REVIEW_SEAT_CAP_AGY_GEMINI', '0');
+    const selectedModel = 'gemini-4-carbon-high';
+    const result = await run([{ ...ok, servedModel: selectedModel }], { model: selectedModel });
+    expect(result.models).toEqual([selectedModel]);
+    expect(result.logs.join(' ')).toContain(`${CARBON_SHADOW_CAP_ENV}=1 (default)`);
   });
   it('skips non-Carbon Gemini shadow at cap zero while Carbon runs', async () => {
     vi.stubEnv('WE_REVIEW_SEAT_CAP_AGY_GEMINI', '0');
@@ -242,11 +276,11 @@ describe('shadow rows', () => {
     for (const side of ['claude', 'agy']) {
       const rows = ['correctness', 'security'].map(lens => makeRow(side === 'claude' ? malformed : valid, side === 'agy' ? malformed : valid, lens));
       expect(rows[0]).toMatchObject({ claudeValid: side !== 'claude', agyValid: side !== 'agy' });
-      expect(summarizeCarbonPromotion(rows).agreeingPrs).toBe(0);
+      expect(summarizeCarbonPromotion(rows)).toMatchObject({ agree: 0, invalid: 1 });
     }
     const validRows = ['correctness', 'security'].map(lens => makeRow(valid, valid, lens));
     expect(validRows[0]).toMatchObject({ claudeValid: true, agyValid: true });
-    expect(summarizeCarbonPromotion(validRows).agreeingPrs).toBe(1);
+    expect(summarizeCarbonPromotion(validRows).agree).toBe(1);
   });
   it('stores only bounded anchors and counts with one-to-one matches', () => {
     const agyAnswer = { findings: Array.from({ length: 35 }, () => ({ ...finding, claim: 'secret', message: 'secret' })) };
@@ -430,71 +464,8 @@ it('persists served-model evidence through the shadow runner for promotion count
   expect(result.rows[0].servedModel).toBe(servedModel);
   const security = await run([{ ...ok, servedModel }], { model: servedModel, seat: 'security' });
   expect(result.rows[0]).toMatchObject({ claudeValid: true, agyValid: true });
-  expect(summarizeCarbonPromotion([...result.rows, ...security.rows]).agreeingPrs).toBe(1);
+  expect(summarizeCarbonPromotion([...result.rows, ...security.rows]).agree).toBe(1);
   const legacy = await run([ok], { model: servedModel });
   expect(legacy.rows[0].servedModel).toBeNull();
-  expect(summarizeCarbonPromotion(legacy.rows)).toMatchObject({ agreeingPrs: 0, comparedPrs: 1 });
-});
-
-it('promotion evidence rejects a PR where Carbon misses a Claude finding', () => {
-  const row = (pr, overlap) => ({ repo: 'r', pr, head: 'head-a', lens: 'correctness', claudeValid: true, agyValid: true, status: 'ok', servedModel: 'gemini-4-carbon-high', verdictAgree: true, overlap });
-  const rows = [row(1, { matched: 1, claudeCount: 2, agyCount: 1, claudeOnly: 1, agyOnly: 0 }), row(2, { matched: 1, claudeCount: 1, agyCount: 2, claudeOnly: 0, agyOnly: 1 }), row(3, { matched: 1, claudeCount: 1, agyCount: 1, claudeOnly: 0, agyOnly: 0 }), row(4, { matched: 1, claudeCount: 1, agyCount: 1, claudeOnly: 0, agyOnly: 0 }), { repo: 'r', pr: 4, status: 'failed', model: 'gemini-4-carbon-high', servedModel: null }];
-  expect(summarizeCarbonPromotion(rows.flatMap(row => [row, { ...row, lens: 'security' }]), { threshold: 10 })).toMatchObject({ agreeingPrs: 1, comparedPrs: 4, reached: false });
-});
-
-describe('Carbon promotion evidence completeness', () => {
-  const row = (lens, head = 'head-a') => buildShadowRow({
-    repo: 'o/r', pr: 1, head, lens, model: 'gemini-4-carbon-high',
-    agyRun: { ...ok, servedModel: 'gemini-4-carbon-high' },
-    claudeAnswer, agyAnswer: ok.value,
-    comparison: compareShadowAnswers({ claude: claudeAnswer, agy: ok.value }),
-  });
-
-  it('does not combine correctness on head A with security on head B', () => {
-    const rows = [row('correctness'), row('security', 'head-b')];
-    expect(summarizeCarbonPromotion(rows, { threshold: 1 }))
-      .toMatchObject({ agreeingPrs: 0, comparedPrs: 1, reached: false });
-    expect(summarizeCarbonPromotion([...rows, row('security')], { threshold: 1 }))
-      .toMatchObject({ agreeingPrs: 1, comparedPrs: 1, reached: true });
-  });
-
-  it.each([undefined, null, '', '   '])('rows without an identified head never qualify: %j', head => {
-    const rows = ['correctness', 'security'].map(lens => ({ ...row(lens), head }));
-    expect(summarizeCarbonPromotion(rows, { threshold: 1 }))
-      .toMatchObject({ agreeingPrs: 0, reached: false });
-  });
-
-  it.each([
-    { status: 'failed' }, { status: 'voided' }, { status: 'skipped' },
-    { agyValid: false }, { servedModel: null }, { overlap: null }, { fellBackTo: 'claude' },
-    { verdictAgree: false },
-  ])('a Carbon row on another head still poisons the whole PR: %j', extra => {
-    const rows = [row('correctness'), row('security'), { ...row('correctness', 'head-b'), ...extra }];
-    expect(summarizeCarbonPromotion(rows, { threshold: 1 }))
-      .toMatchObject({ agreeingPrs: 0, reached: false });
-  });
-
-  it.each(['{malformed', 'null', '[]'])('a malformed row in the file blocks CLI promotion: %s', malformed => {
-    const root = mkdtempSync(join(tmpdir(), 'carbon-incomplete-'));
-    try {
-      mkdirSync(join(root, '.conveyor'));
-      const path = join(root, '.conveyor', 'agy-shadow-agreement.jsonl');
-      const evidence = [row('correctness'), row('security')].map(value => JSON.stringify(value)).join('\n');
-      const options = {
-        env: { ...process.env, CONVEYOR_STATE_ROOT: root, WE_REVIEW_SHADOW_AGY_PROMOTION_PRS: '1' },
-        encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
-      };
-      const script = 'scripts/lib/review-shadow-agreement.mjs';
-      writeFileSync(path, `${evidence}\n`);
-      expect(JSON.parse(execFileSync(process.execPath, [script, '--report', '--json'], options)).carbonPromotion)
-        .toMatchObject({ agreeingPrs: 1, threshold: 10, reached: false });
-      writeFileSync(path, `${evidence}\n${malformed}\n`);
-      expect(JSON.parse(execFileSync(process.execPath, [script, '--report', '--json'], options)).carbonPromotion)
-        .toMatchObject({ agreeingPrs: 1, reached: false, malformedRows: 1 });
-      const report = execFileSync(process.execPath, [script, '--report'], options);
-      expect(report).toContain('not reached');
-      expect(report).toContain('evidence is incomplete: 1 malformed row(s) dropped');
-      expect(report).toContain('repair the evidence store and rerun the report before promotion');
-    } finally { rmSync(root, { recursive: true, force: true }); }
-  });
+  expect(summarizeCarbonPromotion(legacy.rows)).toMatchObject({ agree: 0, invalid: 1, prs: 1 });
 });

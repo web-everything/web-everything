@@ -23,7 +23,7 @@
  */
 import { runAgyReviewJuror, scrubPaths } from '../lib/agy-review-juror.mjs';
 import { appendShadowRow, buildShadowRow, compareShadowAnswers, isQuotaHeldShadow } from '../lib/review-shadow-agreement.mjs';
-import { resolveProviderCap } from '../lib/review-seat-caps.mjs';
+import { CARBON_SHADOW_CAP_ENV, resolveCarbonShadowCap, resolveProviderCap } from '../lib/review-seat-caps.mjs';
 import { reserveShadowSession } from '../lib/review-shadow-budget.mjs';
 import { logReviewSeat } from '../lib/review-seat-provider.mjs';
 
@@ -52,9 +52,20 @@ export async function runSeatWithProvider(request, {
   }
   const model = directive.model;
   const runAgy = async (runModel = model) => {
-    // R1062: only Gemini 4 Carbon may shadow under cap 0; every other Gemini model keeps the seat cap (default 0).
+    // Carbon shadow has its own switch; every other Gemini run keeps the provider cap.
     const carbonShadow = directive.mode === 'shadow' && /carbon/i.test(String(runModel));
-    if (/gemini/i.test(String(runModel)) && !carbonShadow && resolveProviderCap('agy-gemini') <= 0) {
+    if (carbonShadow) {
+      const cap = resolveCarbonShadowCap();
+      const raw = process.env[CARBON_SHADOW_CAP_ENV];
+      const source = raw !== undefined && raw.trim() !== '' && Number.isSafeInteger(Number(raw)) && Number(raw) >= 0 ? 'env' : 'default';
+      logReviewSeat(log, `review-seat: ${CARBON_SHADOW_CAP_ENV}=${cap} (${source})`);
+      if (cap === 0) {
+        const reason = 'carbon shadow seat off';
+        logReviewSeat(log, `review-seat: agy shadow skipped: ${reason}`);
+        return { status: 'skipped', reasons: [reason] };
+      }
+    }
+    if (/gemini|carbon/i.test(String(runModel)) && !carbonShadow && resolveProviderCap('agy-gemini') <= 0) {
       const reason = directive.mode === 'shadow' ? 'non-carbon gemini seat cap 0' : 'gemini seat cap 0';
       logReviewSeat(log, `review-seat: agy ${directive.mode} skipped: ${reason}`);
       return { status: 'skipped', reasons: [reason] };

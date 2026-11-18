@@ -229,86 +229,61 @@ describe('the agreement report (#76a identity, #76b sameAs through the PR table)
   const carbonRow = (extra = {}) => ({ repo: 'o/r', pr: 1, head: 'head-a', model: 'gemini-4-carbon-high', servedModel: 'gemini-4-carbon-high',
     claudeValid: true, agyValid: true, status: 'ok', overlap: { jaccard: 1, matched: 1, claudeCount: 1, agyCount: 1, claudeOnly: 0, agyOnly: 0 }, verdictAgree: true, lens: 'correctness', ...extra });
   const carbonPr = (extra = {}) => [carbonRow(extra), carbonRow({ ...extra, lens: 'security' })];
-  it('ten PRs with correctness alone cannot reach promotion', () => {
+  it('counts ten single-lens PRs without making a promotion decision', () => {
     const rows = Array.from({ length: 10 }, (_, i) => carbonRow({ pr: i + 1 }));
-    expect(summarizeCarbonPromotion(rows)).toEqual({ agreeingPrs: 0, comparedPrs: 10, threshold: 10, reached: false });
-    expect(summarizeCarbonPromotion(rows.flatMap(row => carbonPr({ pr: row.pr })))).toMatchObject({ agreeingPrs: 10, reached: true });
+    expect(summarizeCarbonPromotion(rows)).toEqual({ agree: 10, disagree: 0, invalid: 0, prs: 10, threshold: 10 });
   });
-  it('a disagreeing additional Carbon lens poisons a complete mandatory panel', () => {
-    expect(summarizeCarbonPromotion([...carbonPr(), carbonRow({ lens: 'advisory', verdictAgree: false })]).agreeingPrs).toBe(0);
-  });
-  it('counts each PR once across heads, runs and lenses, requiring every compared Carbon verdict to agree', () => {
-    const rows = [carbonRow(), carbonRow({ lens: 'security' }), carbonRow({ head: 'next', runId: 'next' }),
+  it('counts each PR once across repositories, heads, runs and lenses', () => {
+    const rows = [carbonRow({ head: null }), carbonRow({ head: 'next', lens: 'security' }),
       carbonRow({ pr: 2 }), carbonRow({ pr: 2, verdictAgree: false }),
-      ...carbonPr({ repo: 'other/repo' }), carbonRow({ pr: 3, verdictAgree: 'true' })];
+      carbonRow({ repo: 'other/repo' }), carbonRow({ pr: 3, verdictAgree: 'true' })];
     const before = structuredClone(rows);
-    expect(summarizeCarbonPromotion(rows, { threshold: 2 })).toEqual({ agreeingPrs: 2, comparedPrs: 4, threshold: 2, reached: true });
-    expect(summarizeCarbonPromotion(rows, { threshold: 3 }).reached).toBe(false);
+    expect(summarizeCarbonPromotion(rows, { threshold: 20 })).toEqual({ agree: 2, disagree: 2, invalid: 0, prs: 4, threshold: 20 });
     expect(rows).toEqual(before);
   });
-  it('excludes non-Carbon attempts and missing PR identity without poisoning a valid PR', () => {
-    const ignored = [null, carbonRow({ model: 'gemini-4-argon-high', servedModel: 'gemini-4-argon-high' }),
-      carbonRow({ repo: null }), carbonRow({ pr: null })];
-    expect(summarizeCarbonPromotion(ignored)).toEqual({ agreeingPrs: 0, comparedPrs: 0, threshold: 10, reached: false });
-    expect(summarizeCarbonPromotion([...carbonPr(), ...ignored.map(row => row && { ...row, verdictAgree: false })]).agreeingPrs).toBe(1);
+  it('ignores non-Carbon attempts and rows without a PR identity', () => {
+    const ignored = [null, carbonRow({ model: 'argon', servedModel: 'argon' }), carbonRow({ repo: null }), carbonRow({ pr: null })];
+    expect(summarizeCarbonPromotion(ignored)).toEqual({ agree: 0, disagree: 0, invalid: 0, prs: 0, threshold: 10 });
+    expect(summarizeCarbonPromotion([...carbonPr(), ...ignored])).toMatchObject({ agree: 1, prs: 1 });
   });
   it.each([
-    { claudeValid: undefined },
-    { agyValid: undefined },
-    { claudeValid: false },
-    { agyValid: false },
-    { claudeValid: 'true' },
-    { agyValid: 'true' },
-    { status: 'failed', servedModel: null },
-    { status: 'voided' },
-    { status: 'skipped' },
-    { overlap: null },
-    { servedModel: undefined },
-    { servedModel: 'gemini-4-argon-high' },
-    { fellBackTo: 'routing-model' },
-    { model: 'gemini-4-argon-high', status: 'failed' },
-  ])('incomplete Carbon attempt %j poisons its PR even alongside an agreeing row', extra => {
-    const poisoned = carbonRow(extra);
-    const summary = { agreeingPrs: 0, comparedPrs: 1, threshold: 10, reached: false };
-    expect(summarizeCarbonPromotion([poisoned])).toEqual(summary);
-    expect(summarizeCarbonPromotion([...carbonPr(), poisoned])).toEqual(summary);
-    expect(summarizeCarbonPromotion([poisoned, ...carbonPr()])).toEqual(summary);
-    expect(summarizeCarbonPromotion([...carbonPr(), poisoned, ...carbonPr({ pr: 2 })]))
-      .toEqual({ ...summary, agreeingPrs: 1, comparedPrs: 2 });
+    { claudeValid: undefined }, { agyValid: undefined }, { claudeValid: false }, { agyValid: false },
+    { claudeValid: 'true' }, { agyValid: 'true' }, { status: 'failed' }, { status: 'voided' }, { status: 'skipped' },
+    { overlap: null }, { servedModel: undefined }, { servedModel: '' }, { servedModel: 'unknown' },
+    { servedModel: 'gemini-4-argon-high' }, { fellBackTo: 'routing-model' }, { fallbackFrom: { model: 'other' } },
+    { model: 'argon', status: 'failed' },
+  ])('invalid Carbon evidence overrides agreement and disagreement in either order: %j', extra => {
+    const invalid = carbonRow(extra);
+    const valid = [...carbonPr(), carbonRow({ verdictAgree: false })];
+    const expected = { agree: 0, disagree: 0, invalid: 1, prs: 1, threshold: 10 };
+    expect(summarizeCarbonPromotion([invalid])).toEqual(expected);
+    expect(summarizeCarbonPromotion([...valid, invalid])).toEqual(expected);
+    expect(summarizeCarbonPromotion([invalid, ...valid])).toEqual(expected);
+    expect(summarizeCarbonPromotion([...valid, invalid, carbonRow({ pr: 2 })]))
+      .toEqual({ ...expected, agree: 1, prs: 2 });
   });
-  it.each([
-    { claudeOnly: 1, agyOnly: 0 },
-    { claudeOnly: 0, agyOnly: 1 },
-  ])('requires exact finding agreement: %j disqualifies an otherwise agreeing PR', overlap => {
-    expect(summarizeCarbonPromotion([carbonRow(), carbonRow({ overlap })]))
-      .toMatchObject({ agreeingPrs: 0, comparedPrs: 1 });
+  it.each([false, null, undefined, 'true'])('a verdict other than literal true counts as disagree: %j', verdictAgree => {
+    expect(summarizeCarbonPromotion([...carbonPr(), carbonRow({ verdictAgree })]))
+      .toEqual({ agree: 0, disagree: 1, invalid: 0, prs: 1, threshold: 10 });
   });
-  it('requires real finding overlap or a clean accept as well as verdict agreement', () => {
-    const comparison = (claude, agy) => compareShadowAnswers({ claude: { findings: claude }, agy: { findings: agy } });
-    const a = { file: 'a.mjs', summary: 'first defect', disposition: 'blocker' };
-    const b = { file: 'b.mjs', summary: 'unrelated defect', disposition: 'blocker' };
-    const different = carbonRow(comparison([a], [b]));
-    expect(different.verdictAgree).toBe(true);
-    expect(summarizeCarbonPromotion([different]).agreeingPrs).toBe(0);
-    expect(summarizeCarbonPromotion(carbonPr(comparison([a], [a]))).agreeingPrs).toBe(1);
-    expect(summarizeCarbonPromotion(carbonPr(comparison([], []))).agreeingPrs).toBe(1);
-    expect(summarizeCarbonPromotion([carbonRow({ overlap: {} })]).agreeingPrs).toBe(0);
-    expect(summarizeCarbonPromotion([carbonRow(), different]).agreeingPrs).toBe(0);
+  it('reports verdict agreement regardless of differing finding identities', () => {
+    const comparison = compareShadowAnswers({
+      claude: { findings: [{ file: 'a.mjs', summary: 'first defect', disposition: 'blocker' }] },
+      agy: { findings: [{ file: 'b.mjs', summary: 'another defect', disposition: 'blocker' }] },
+    });
+    expect(comparison.verdictAgree).toBe(true);
+    expect(comparison.overlap.jaccard).toBe(0);
+    expect(summarizeCarbonPromotion([carbonRow(comparison)])).toMatchObject({ agree: 1, invalid: 0 });
   });
-  it.each([undefined, null, '', 'unknown', 'gemini-4-argon-high'])('refuses requested Carbon without served Carbon evidence: %s', servedModel => {
-    expect(summarizeCarbonPromotion([carbonRow({ servedModel })])).toMatchObject({ agreeingPrs: 0, comparedPrs: 1 });
+  it.each([0, -1, 1, 9, 1.5, '10', NaN, Number.MAX_SAFE_INTEGER + 1])('rejects thresholds below ten or invalid/oversized thresholds: %j', threshold => {
+    expect(() => summarizeCarbonPromotion([], { threshold })).toThrow(RangeError);
   });
-  it('refuses invalid and oversized explicit thresholds rather than claiming promotion', () => {
-    for (const threshold of [0, -1, 1.5, '1', NaN, Number.MAX_SAFE_INTEGER + 1]) {
-      expect(() => summarizeCarbonPromotion([], { threshold })).toThrow(/positive safe integer/);
-    }
-  });
-  it('renders reached and not reached with manual promotion and includes the empty report', () => {
-    const rows = carbonPr();
-    const message = 'Carbon vs Claude: 1 of 1 PRs agree; promotion threshold 1 agreeing PRs: reached (promotion is manual; the orchestrator flips it)';
-    expect(renderShadowReport(summarizeShadowAgreement(rows), summarizeCarbonPromotion(rows, { threshold: 1 }))).toContain(message);
+  it('renders counts and the manual promotion threshold, including an empty report', () => {
+    const rows = [carbonRow(), carbonRow({ pr: 2, verdictAgree: false }), carbonRow({ pr: 3, status: 'failed' })];
+    expect(renderShadowReport(summarizeShadowAgreement(rows), summarizeCarbonPromotion(rows))).toContain(
+      'Carbon vs Claude: 1 agree, 1 disagree, 1 invalid of 3 PRs; promotion threshold 10 agreeing PRs (promotion is manual; the orchestrator flips it)');
     expect(renderShadowReport([], summarizeCarbonPromotion([]))).toContain(
-      'Carbon vs Claude: 0 of 0 PRs agree; promotion threshold 10 agreeing PRs: not reached (promotion is manual; the orchestrator flips it)');
+      'Carbon vs Claude: 0 agree, 0 disagree, 0 invalid of 0 PRs; promotion threshold 10 agreeing PRs (promotion is manual; the orchestrator flips it)');
   });
   it('CLI text and JSON report Carbon promotion using the resolved threshold and log its source', () => {
     const root = mkdtempSync(join(tmpdir(), 'carbon-report-'));
@@ -323,10 +298,10 @@ describe('the agreement report (#76a identity, #76b sameAs through the PR table)
       expect(result.stderr).toContain('promotionAgreeingPrs=10 (env)');
       expect(result.stderr).toContain('promotionReplaces=codex (env)');
       const json = JSON.parse(result.stdout);
-      expect(json.carbonPromotion).toEqual({ agreeingPrs: 1, comparedPrs: 1, threshold: 10, reached: false, promotionReplaces: 'codex' });
+      expect(json.carbonPromotion).toEqual({ agree: 1, disagree: 0, invalid: 0, prs: 1, threshold: 10, promotionReplaces: 'codex' });
       expect(json.seats.map(seat => seat.compared)).toEqual([1, 1]);
       const text = execFileSync(process.execPath, [script, '--report'], options);
-      expect(text).toContain('Carbon vs Claude: 1 of 1 PRs agree; promotion threshold 10 agreeing PRs: not reached');
+      expect(text).toContain('Carbon vs Claude: 1 agree, 0 disagree, 0 invalid of 1 PRs; promotion threshold 10 agreeing PRs');
       for (const builder of ['claude', 'codex', 'agy']) expect(text).toContain(`Post-promotion cross-vendor panel for ${builder} builder:`);
       expect(text).toContain('(promotion is manual; the orchestrator flips it)');
       expect(text).toContain('replace one existing codex seat; panel size stays fixed');

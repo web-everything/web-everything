@@ -14,6 +14,13 @@ export const PROVIDER_CAP_ENV = Object.freeze({
   'agy-claude': 'WE_REVIEW_SEAT_CAP_AGY_CLAUDE',
   'agy-gemini': 'WE_REVIEW_SEAT_CAP_AGY_GEMINI',
 });
+/** Independent Carbon shadow seat switch; zero disables only Carbon in shadow mode. */
+export const CARBON_SHADOW_CAP_ENV = 'WE_REVIEW_SEAT_CAP_CARBON_SHADOW';
+export function resolveCarbonShadowCap(env = process.env) {
+  const value = env?.[CARBON_SHADOW_CAP_ENV];
+  const n = value == null || typeof value === 'boolean' || (typeof value === 'string' && value.trim() === '') ? NaN : Number(value);
+  return Number.isSafeInteger(n) && n >= 0 ? n : 1;
+}
 /** The default cap per provider when its own env var (and, for codex only, the legacy shared one) is unset.
  *  Codex's default (80) matches the shared cap the operator had already raised the daemon plist to; agy-claude
  *  keeps its default of 300. Gemini is off by default under the operator ruling of 2026-10-02:
