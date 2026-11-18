@@ -402,7 +402,9 @@ export async function finalizeRebuild({
   let dropsPending = false;
   try { dropsPending = readPendingDrops(root, env).length > 0; } catch { dropsPending = true; }
   const appliedKey = (list) => JSON.stringify((list ?? []).map((a) => [a.ref, a.sha]).sort());
-  if (dropsPending && appliedKey(plan.applied) !== appliedKey(state.adopted?.applied)) {
+  // The health-watch rollback to last-good only reverts HEAD; it never touches registrations, so it is never blocked.
+  const isRollback = lease?.token === 'force-adopt-rollback';
+  if (dropsPending && !isRollback && appliedKey(plan.applied) !== appliedKey(state.adopted?.applied)) {
     alert('drop-pending-unsettled', { target: plan.finalSha });
     return terminal({ moved: false, reason: 'drop-pending-unsettled', plan });
   }

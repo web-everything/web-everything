@@ -281,6 +281,14 @@ describe('finalize during an unsettled drop', () => {
     expect(result.reason).toBe('already-adopted');
     expect(onAdopted).not.toHaveBeenCalled();
   });
+  it('the health-watch rollback to last-good still finalizes while a drop is pending', async () => {
+    stubPrepare(); writePending('pending');
+    const calls = [];
+    const run = args => { calls.push(args); return { status: 0, stdout: args[0] === 'rev-parse' ? headSha : '' }; };
+    const result = await finalizeRebuild({ root, env, run, now: () => 0, plan: { ok: true, finalSha: newSha, mainSha, inputsKey: 'k', applied: [{ ref, sha: sha('9') }] }, prevHead: headSha, lease: { token: 'force-adopt-rollback' } });
+    expect(result.reason).not.toBe('drop-pending-unsettled');
+    expect(calls.some(a => a[0] === 'reset')).toBe(true);
+  });
   it('a recovery build that keeps the applied set unchanged still finalizes', async () => {
     const applied = [{ ref, sha: tip }];
     const { result, calls } = await fin({ applied }, { head: headSha, inputsKey: 'k0', applied });
