@@ -79,27 +79,48 @@ function jwkFinding(bytes) {
   return (octKty&&oct)||(anyKty&&priv);
 }
 
+// Syntax that can yield another supported representation; byte detection precedes this filter.
+function encodedText(text) {
+  return (text.includes('{')&&text.includes('}')&&text.includes('"'))
+    ||(text.includes('[')&&text.includes(']'))
+    ||(text.includes('"')&&text.includes('\\'))
+    ||(text.match(/[\[{]/g)?.length??0)>=64
+    ||/\\x[\da-f]{2}|%[\da-f]{2}|[\da-f]{2}:[\da-f]{2}/i.test(text)
+    ||/[A-Za-z0-9+/_=-]{11}/.test(text.replace(/\s/g,''));
+}
+
 // All representations (including mixed base64 alphabets) converge here, before detection.
-function canonicalize(bytes,emit,tick) {
+function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
   const text=bytes.toString('utf8');
   // JSON token boundaries preserve object scope and decode JSON string escapes once.
   const stack=[];
-  for(const match of text.matchAll(/"(?:\\[\s\S]|[^"\\])*"|\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|[{}\[\]\ufffd]/g)) {
+  const tokens=comments?/"(?:\\[\s\S]|[^"\\])*"|\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|[{}\[\]\ufffd]/g
+    :/"(?:\\[\s\S]|[^"\\])*"|[{}\[\]\ufffd]/g;
+  for(const match of text.matchAll(tokens)) {
     tick();
     const token=match[0];
-    if(token[0]==='/')emit(Buffer.from(token.replace(/^\/\/|^\/\*|\*\/$/g,'')));
+    // A comment body is already unwrapped. URLs inside it are not more comment layers.
+    if(token[0]==='/')emit(Buffer.from(token.replace(/^\/\/|^\/\*|\*\/$/g,'')),{comments:false,utf16,layer:false});
     else if(token[0]==='"') {
       if(token.includes('\\')) {
-        try {emit(Buffer.from(JSON.parse(token)));} catch(error) {if(error===EXHAUSTED)throw error;}
+        try {emit(Buffer.from(JSON.parse(token)));} catch(error) {if(error===EXHAUSTED||error===FINDING)throw error;}
       }
     // Broken UTF-8 outside strings cannot extend a JSON container's scope.
     } else if(token==='\ufffd')stack.length=0;
     else if(token==='{'||token==='[') {
+      // Template delimiters and prose brackets are not nested JSON containers.
+      // Incomplete JSON-shaped nesting still reaches the fail-closed bound.
+      let next=match.index+1;
+      while(next<text.length&&/\s/.test(text[next]))next++;
+      if(!(token==='{'?/^["}/]/:/^[\[\]{"/\d-]|^(?:true|false|null)\b/).test(text.slice(next,next+5))) {
+        stack.length=0;continue;
+      }
       if(stack.length>=64)throw EXHAUSTED;
       stack.push({token,start:match.index});
     } else if(token==='}'||token===']') {
       const open=stack.pop();
-      if(open&&open.token===(token==='}'?'{':'['))emit(Buffer.from(text.slice(open.start,match.index+1)));
+      // This pass already visits everything inside the container; only detect its members.
+      if(open&&open.token===(token==='}'?'{':'['))emit(Buffer.from(text.slice(open.start,match.index+1)),{expand:false});
     }
   }
   // Decimal/signed/0x byte arrays: comments are whitespace, never squeezed into numbers.
@@ -132,17 +153,29 @@ function canonicalize(bytes,emit,tick) {
   }
   for(const match of text.matchAll(/[A-Za-z0-9+/_=-]+/g)) {
     tick();
-    decode(match[0]);
+    // Four phases of the whole whitespace run also cover every individual token.
     if(end>=0&&/^\s+$/.test(text.slice(end,match.index)))run+=match[0];
     else {if(run)decode(run);run=match[0];}
     end=match.index+match[0].length;
   }
   if(run)decode(run);
   // Preserve the existing scanner's UTF-16 reach for structured material, too.
-  if(bytes.includes(0)&&bytes.length>=2) {
-    emit(Buffer.from(bytes.toString('utf16le')));
+  if(utf16&&bytes.includes(0)&&bytes.length>=2) {
+    // Random binary can expand into much larger Unicode views. Continue only
+    // with progress or evidence of another UTF-16 representation, including
+    // encoded material after a non-ASCII prefix and Unicode whitespace.
+    const continues=view=>{
+      if(view.length<bytes.length)return true;
+      if(/(?:[\x01-\x7f]\0){4}|(?:\0[\x01-\x7f]){4}/.test(view.toString('latin1')))return true;
+      if(encodedText(view.toString('utf16le')))return true;
+      const other=Buffer.from(view.subarray(0,view.length-view.length%2)).swap16();
+      return encodedText(other.toString('utf16le'));
+    };
+    const decoded=Buffer.from(bytes.toString('utf16le'));
+    emit(decoded,{utf16:continues(decoded)});
     const whole=Buffer.from(bytes.subarray(0,bytes.length-bytes.length%2)).swap16();
-    emit(Buffer.from(whole.toString('utf16le')));
+    const swapped=Buffer.from(whole.toString('utf16le'));
+    emit(swapped,{utf16:continues(swapped)});
   }
 }
 
@@ -151,22 +184,35 @@ export function keyStructureFinding(buffer) {
   const queue=[],seen=new Set();
   let total=0,steps=0;
   const tick=()=>{if(++steps>LIMITS.steps)throw EXHAUSTED;};
-  const add=(bytes,depth)=>{
+  const add=(bytes,depth,options={})=>{
+    tick();
     if(bytes.length>LIMITS.bytes)throw EXHAUSTED;
-    const identity=bytes.toString('base64');
+    const identity=bytes.toString('base64')+':'+(options.comments!==false)+':'+(options.utf16!==false);
     if(!bytes.length||seen.has(identity))return;
-    if(depth>LIMITS.depth||queue.length>=LIMITS.candidates||(total+=bytes.length)>LIMITS.bytes)throw EXHAUSTED;
-    seen.add(identity);queue.push({bytes,depth});
+    if((total+=bytes.length)>LIMITS.bytes)throw EXHAUSTED;
+    // Every decoded view reaches the byte detectors, including views with no more encodings.
+    if(derFinding(bytes,tick)||jwkFinding(bytes))throw FINDING;
+    if(options.expand===false)return;
+    // The shortest DER structure is eight bytes (already detected above); its
+    // shortest supported text encoding is eleven base64 characters. This bounds
+    // further decoding, never the size of a private member or detected structure.
+    if(bytes.length<11)return;
+    const text=bytes.toString('utf8');
+    // Terminal binary fragments cannot produce another supported representation. Do not
+    // retain/redecode them as candidates, but still scan them above for embedded DER/JWKs.
+    if(!encodedText(text)&&!(options.utf16!==false&&bytes.includes(0)))return;
+    if(depth>LIMITS.depth||queue.length>=LIMITS.candidates)throw EXHAUSTED;
+    seen.add(identity);queue.push({bytes,depth,options});
   };
   try {
     add(buffer,0);
     for(let index=0;index<queue.length;index++) {
-      const {bytes,depth}=queue[index];
-      if(derFinding(bytes,tick)||jwkFinding(bytes))return FINDING;
-      canonicalize(bytes,candidate=>add(candidate,depth+1),tick);
+      const {bytes,depth,options}=queue[index];
+      canonicalize(bytes,(candidate,next={})=>add(candidate,depth+(next.layer===false?0:1),next),tick,options);
     }
     return null;
   } catch(error) {
+    if(error===FINDING)return FINDING;
     if(error===EXHAUSTED)return EXHAUSTED;
     return 'private-key-scan-unreadable-use-local';
   }
