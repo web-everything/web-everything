@@ -77,3 +77,11 @@ it('supersedes only a proven attempt of the same run and job, permutation invari
     expect(reviewCiGate({ headSha, requiredChecks: ['test'], checks: checks.map(row => row === fresh ? { ...row, run_id: 8 } : row) }).allowed).toBe(false);
   }
 });
+
+it.each([null, {}, { status: 'completed', conclusion: 'success' }, { name: 'test', status: 3 }])(
+  'preserves unknown malformed evidence beside a missing review-gate: %j', row => {
+    const result = reviewCiGate({ headSha, requiredChecks: ['review-gate', 'test'], checks: [success('test'), row] });
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain('malformed');
+    expect(result.reason).not.toBe('required-review-gate-conflict');
+  });

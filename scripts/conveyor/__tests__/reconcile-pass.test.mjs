@@ -1439,7 +1439,7 @@ it('xe8y12n real PR read shell enriches the reported missing-family shape from c
 // GitHub runs no CI on a conflicting head, so its required checks can never appear. Hydration used to read the REST
 // feed every tick and refuse `check-read-failed: missing required checks`, for a PR whose owed work (a mechanical
 // re-sync with main) does not require a successful CI result. Absence there is EXPECTED: no read failure;
-// unknown provenance still waits for a trusted snapshot. Other paths still refuse/read as appropriate.
+// a complete head-pinned read proves the absence; unknown provenance still waits for a trusted snapshot.
 describe('conflicting head: missing required checks are expected (#3771)', () => {
   const real = async () => (await import('node:fs')).readFileSync(
     (await import('node:path')).join(process.cwd(), 'scripts/conveyor/__tests__/fixtures/pr-3771-conflicting-no-ci.json'), 'utf8');
@@ -1448,24 +1448,26 @@ describe('conflicting head: missing required checks are expected (#3771)', () =>
     enrichFixClaims: p => p, enrichTimeouts: p => p, enrichReferralHolds: p => p });
   const dispatchOf = (plan) => plan.dispatch.map(d => [d.prNumber, d.kind, d.isConflict ?? null]);
 
-  it('real #3771 data: conflict repair waits for provenance past the join cap without a read', async () => {
+  it('real #3771 data: the conflict repair is planned after the join cap', async () => {
     const { runReconcilePass } = await import('../reconcile-pass.mjs');
-    const readChecks = vi.fn(() => []);
     const pr = await livePr();
-    const options = { ...opts(pr, readChecks), now: Date.parse(pr.createdAt) };
-    const plan = runReconcilePass(options);
-    expect(dispatchOf(plan)).toEqual([]);
-    const wait = plan.refusals.find(r => r.kind === 'fix-join-wait');
-    expect(wait).toMatchObject({ prNumber: 3771, evidenceReason: expect.stringContaining('foreign-head') });
-    const afterCap = runReconcilePass({ ...options, now: options.now + 60 * 60_000 });
-    expect(dispatchOf(afterCap)).toEqual([]);
-    expect(afterCap.refusals).toContainEqual(expect.objectContaining({ kind: 'fix-join-wait',
-      evidenceReason: expect.stringContaining('foreign-head') }));
-    const refreshed = runReconcilePass({ ...options, now: options.now + 60 * 60_000,
-      readPrs: () => [{ ...pr, rowsHead: pr.headRefOid, rowsComplete: true }] });
-    expect(dispatchOf(refreshed)).toEqual([[3771, 'fix', true]]);
+    const readChecks = vi.fn(() => Object.assign([], { rowsHead: pr.headRefOid, rowsComplete: true }));
+    const plan = runReconcilePass({ ...opts(pr, readChecks), now: Math.max(Date.parse(pr.createdAt), ...pr.comments.map(c => Date.parse(c.createdAt))) + 60 * 60_000 });
+    expect(dispatchOf(plan)).toEqual([[3771, 'fix', true]]);
     expect(plan.refusals.filter(r => r.kind === 'check-read-failed')).toEqual([]);
-    expect(readChecks).not.toHaveBeenCalled();
+    expect(readChecks).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['incomplete', () => []],
+    ['foreign head', () => Object.assign([], { rowsHead: 'b'.repeat(40), rowsComplete: true })],
+    ['unreadable', () => { throw new Error('offline'); }],
+  ])('conflict repair still refuses %s evidence after the join cap', async (_, readChecks) => {
+    const { runReconcilePass } = await import('../reconcile-pass.mjs');
+    const pr = await livePr();
+    const plan = runReconcilePass({ ...opts(pr, readChecks), now: Math.max(Date.parse(pr.createdAt), ...pr.comments.map(c => Date.parse(c.createdAt))) + 60 * 60_000 });
+    expect(dispatchOf(plan)).toEqual([]);
+    expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'fix-join-wait', evidenceReason: expect.any(String) }));
   });
 
   it.each([
@@ -1477,7 +1479,7 @@ describe('conflicting head: missing required checks are expected (#3771)', () =>
     const readChecks = vi.fn(() => []);
     const plan = runReconcilePass(opts(await livePr(patch), readChecks));
     expect(plan.refusals.filter(r => r.kind === 'check-read-failed')).toEqual([]);
-    expect(readChecks).not.toHaveBeenCalled();
+    expect(readChecks).toHaveBeenCalledTimes(1);
   });
 
   it('a PR that is NOT conflicting and never started its required checks is owed a re-trigger (no read failure)', async () => {

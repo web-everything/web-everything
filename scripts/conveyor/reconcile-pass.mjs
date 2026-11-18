@@ -1594,15 +1594,8 @@ function hydrateChecks(prs, { repo, requiredChecks, rosterSource, readChecks, de
       ready.push(pr);
       continue;
     }
-    // Live deadlock shape, PR #3771 (2026-10-03): a conflicting head can never grow its required checks, so reading
-    // the REST feed every tick and refusing `check-read-failed` for "missing required checks" is a read that cannot
-    // succeed and a refusal that names no real fault. The conflict repair that PR is owed (a mechanical re-sync
-    // with main) does not consume CI at all. Nothing observed for ANY required name + not truncated = expected
-    // absence: skip the read (it also costs a GitHub call per tick), refuse nothing, keep the empty rollup so the
-    // verdict stays `unchecked` (never green, never red) for every CI-consuming branch. Observed evidence (a
-    // required check that did run before the conflict) still goes through the read below.
+    // Conflicts also need an exhaustive read: an empty pinned feed proves absence, not success.
     const conflicting = isConflictingPr(pr);
-    if (conflicting && runs.length < 100 && missing.length === (requiredChecks ?? []).length) { ready.push(pr); continue; }
     const sha = pr.headRefOid;
     const key = `${repo}/${sha}`;
     if (!cache.has(key)) {

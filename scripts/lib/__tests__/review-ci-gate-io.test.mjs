@@ -139,8 +139,8 @@ it('production read argv is repo/SHA-explicit and fetches every page and rerun',
   expect(readReviewHead({ repo: 'other/product', pr: 3432, run: runHead })).toBe(headSha);
   expect(runHead).toHaveBeenCalledWith(['pr', 'view', '3432', '--repo', 'other/product', '--json', 'headRefOid']);
   const runChecks = vi.fn(argv => JSON.stringify(argv[3].includes('/status?')
-    ? [{ statuses: [{ context: 'legacy', state: 'success', id: 9 }] }, { statuses: [] }]
-    : [{ check_runs: [{ id: 2 }] }, { check_runs: [{ id: 1 }] }]));
+    ? [{ total_count: 1, statuses: [{ context: 'legacy', state: 'success', id: 9 }] }, { total_count: 1, statuses: [] }]
+    : [{ total_count: 2, check_runs: [{ id: 2 }] }, { total_count: 2, check_runs: [{ id: 1 }] }]));
   expect(readReviewChecks({ repo: 'other/product', headSha, run: runChecks })).toMatchObject({ rowsHead: headSha, rowsComplete: true });
   expect(readReviewChecks({ repo: 'other/product', headSha, run: runChecks })).toEqual([{ id: 2 }, { id: 1 }, { context: 'legacy', state: 'success' }]);
   expect(runChecks).toHaveBeenCalledWith(['api', '--paginate', '--slurp', `repos/other/product/commits/${headSha}/check-runs?per_page=100&filter=all`]);
@@ -151,7 +151,7 @@ it('production read argv is repo/SHA-explicit and fetches every page and rerun',
 
 it('admits successful required commit statuses', () => {
   const run = argv => JSON.stringify(argv[3].includes('/status?')
-    ? [{ statuses: [{ context: 'legacy', state: 'success' }] }] : [{ check_runs: [{ name: 'custom', status: 'completed', conclusion: 'success' }] }]);
+    ? [{ total_count: 1, statuses: [{ context: 'legacy', state: 'success' }] }] : [{ total_count: 1, check_runs: [{ name: 'custom', status: 'completed', conclusion: 'success' }] }]);
   expect(readReviewCiGate(fixture({ readRequired: () => ({ source: 'live', checks: ['custom', 'legacy'] }),
     readChecks: ({ repo, headSha }) => readReviewChecks({ repo, headSha, run }) }))).toMatchObject({ allowed: true });
 });
@@ -271,4 +271,28 @@ it.each([
   expect(rawReadGate(fixture({ readChecks: () => Object.assign([
     { name: 'custom', status: 'completed', conclusion: 'success' },
   ], metadata) }))).toMatchObject({ allowed: false, ...metadata });
+});
+
+// Exercise the production fetch rather than attesting injected rows in the fixture wrapper.
+it.each(['check-runs', 'status'])('refuses truncated %s totals despite green required rows', feed => {
+  const run = argv => JSON.stringify(argv[3].includes('/status?')
+    ? [{ total_count: feed === 'status' ? 2 : 1, sha: headSha, statuses: [{ context: 'legacy', state: 'success' }] }]
+    : [{ total_count: feed === 'check-runs' ? 2 : 1, check_runs: [{ name: 'custom', head_sha: headSha, status: 'completed', conclusion: 'success' }] }]);
+  const rows = readReviewChecks({ repo: 'other/product', headSha, run });
+  expect(rows).toMatchObject({ rowsHead: headSha, rowsComplete: false });
+  expect(rawReadGate({ ...fixture(), readChecks: () => rows })).toMatchObject({ allowed: false, rowsComplete: false, reason: 'rows-incomplete' });
+});
+it.each([
+  ['truncated', { truncated: true }], ['error', { error: 'partial response' }],
+  ['foreign status head', { sha: 'b'.repeat(40) }], ['missing total', { total_count: undefined }],
+])('does not attest complete evidence with %s', (_, patch) => {
+  const run = argv => JSON.stringify(argv[3].includes('/status?')
+    ? [{ total_count: 0, statuses: [], ...patch }] : [{ total_count: 0, check_runs: [] }]);
+  expect(readReviewChecks({ repo: 'other/product', headSha, run }).rowsComplete).toBe(false);
+});
+it('does not attest foreign check-run heads or an empty page stream', () => {
+  const run = argv => JSON.stringify(argv[3].includes('/status?') ? [{ total_count: 0, statuses: [] }]
+    : [{ total_count: 1, check_runs: [{ name: 'custom', head_sha: 'b'.repeat(40) }] }]);
+  expect(readReviewChecks({ repo: 'other/product', headSha, run }).rowsComplete).toBe(false);
+  expect(readReviewChecks({ repo: 'other/product', headSha, run: () => '[]' }).rowsComplete).toBe(false);
 });

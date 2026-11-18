@@ -4369,6 +4369,12 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
     await expect(f.publish()).resolves.toEqual({ ok: true });
     expect(f.runNode).toHaveBeenCalledTimes(1);
   });
+  it.each([null, {}, { status: 'completed', conclusion: 'success' }, { name: 'test', status: 3 }])(
+    'refuses publication with malformed evidence and a missing review-gate: %j', async row => {
+      const f = await run([ok('test'), row], { requiredChecks: withReviewGate });
+      await expect(f.publish()).rejects.toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });
+      expect(f.runNode).not.toHaveBeenCalled();
+    });
   it('holds when stale roster provenance arrives even with only verdict-dependent gaps', async () => {
     const f = await run([ok('test')], { requiredChecks: withReviewGate,
       decorate: gate => ({ ...gate, rosterSource: 'stale-cache', source: 'stale-cache', reason: 'unknown-required-set', affected: [] }) });

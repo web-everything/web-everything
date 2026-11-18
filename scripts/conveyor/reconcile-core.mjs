@@ -4101,7 +4101,9 @@ export function planReconcile({
       reviewDispatched: dispatch.some(d => d.prNumber === entry.prNumber && d.kind === 'review') });
     const decision = joinedFixDecision({ ...facts, now, policy: fixTiming });
     // The join cap bounds waiting for a known counterpart, never authorizes unknown evidence.
-    const evidenceReason = ['pass', 'held', 'pending', 'fail'].includes(facts.reason) ? undefined : facts.reason;
+    const knownConflictAbsence = entry.isConflict === true && facts.reason === 'missing'
+      && pr.rowsComplete === true && pr.rowsHead === pr.headRefOid && !pr.rollupIncomplete;
+    const evidenceReason = knownConflictAbsence || ['pass', 'held', 'pending', 'fail'].includes(facts.reason) ? undefined : facts.reason;
     if (evidenceReason || decision.action === 'wait') {
       refusals.push({ ...entry, kind: 'fix-join-wait', deadline: evidenceReason ? undefined : decision.deadline, evidenceReason,
         why: evidenceReason ? `waiting for readable head-pinned CI evidence: ${evidenceReason}; refresh the required-check evidence before dispatch`
