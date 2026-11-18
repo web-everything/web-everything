@@ -715,6 +715,14 @@ describe('R830/R823 reviewed allow-list for tracked key-handling code', () => {
     const head = await put(repo, { 'lib/shim.mjs': hidden }, 'shim');
     expect(await scanBundleRange({ cwd: repo, head, prerequisite: base, exec })).toMatchObject({ path: 'lib/shim.mjs' });
   });
+  it('refuses a UTF-16 token hidden next to a listed encoding finding', async () => {
+    const bytesOf = Buffer.concat([Buffer.from(keyish + '\0'), Buffer.from('ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8', 'utf16le')]);
+    const text = bytesOf.toString('latin1');
+    const { repo, base } = await mk(JSON.stringify({ entries: [{ path: 'lib/shim.mjs', sha256: createHash('sha256').update(bytesOf).digest('hex'), findings: ['pem-header', 'private-key', 'unsupported-text-encoding'] }] }));
+    await fs.mkdir(join(repo, 'lib'), { recursive: true }); await fs.writeFile(join(repo, 'lib/shim.mjs'), bytesOf); git(repo, 'add', '--', 'lib/shim.mjs'); git(repo, ...ident, 'commit', '-q', '-m', 'utf16');
+    expect(text.length).toBeGreaterThan(0);
+    expect(await scanBundleRange({ cwd: repo, head: git(repo, 'rev-parse', 'HEAD'), prerequisite: base, exec })).toMatchObject({ path: 'lib/shim.mjs' });
+  });
   it('ignores an allow-list the range itself adds (only the public base counts)', async () => {
     const { repo, base } = await mk(null);
     await put(repo, { 'scripts/readiness/bundle-scan-allowlist.json': doc('lib/shim.mjs', keyish, ['pem-header', 'private-key']) }, 'self-allow');

@@ -189,11 +189,14 @@ function allowedFindings(allowed, label, content, findings) {
   // mask the remaining checks): anything left over refuses the bundle as before.
   try {
     let text = content.toString('latin1');
-    if (set.has('unsupported-text-encoding')) text = text.replace(/\0/g, ' ');
     for (const name of set) {
       const rule = secretText.find(([, n]) => n === name);
       if (rule) text = text.replace(new RegExp(rule[0].source, rule[0].flags.replace('g', '') + 'g'), ' ');
     }
+    // Byte-preserving mask first: every raw view (latin1, utf8, utf16 either order) of what is left must be clean, so
+    // a NUL-separated (UTF-16) token cannot hide behind a listed encoding finding.
+    if (credentialBufferFinding(Buffer.from(text, 'latin1')) !== null) return false;
+    if (set.has('unsupported-text-encoding')) text = text.replace(/\0/g, ' ');
     return credentialContentFinding(Buffer.from(label), Buffer.from(text, 'utf8')) === null;
   } catch { return false; }
 }
