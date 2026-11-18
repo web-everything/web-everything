@@ -86,11 +86,14 @@ function checkoutFor(key, root) {
 
 /** Attach each session's transcript age. A read that fails leaves `transcriptAgeMs` unset — never a guess. */
 export function withTranscriptAges(agents, { hungInfoFor = readHungInfo, now = Date.now(), thresholdMs = resolveHungThresholdMs() } = {}) {
-  return (Array.isArray(agents) ? agents : []).map((a) => {
+  const aged = (Array.isArray(agents) ? agents : []).map((a) => {
     let ageMs = null;
     try { ageMs = hungInfoFor(a, now, thresholdMs)?.ageMs ?? null; } catch { ageMs = null; }
     return Number.isFinite(ageMs) ? { ...a, transcriptAgeMs: ageMs } : a;
   });
+  // Unreadable worker evidence (the listing's `incomplete` marker) and a non-array listing both survive: never read as a complete empty inventory.
+  if (!Array.isArray(agents) || Object.hasOwn(agents, 'incomplete')) Object.defineProperty(aged, 'incomplete', { value: Array.isArray(agents) ? agents.incomplete : true });
+  return aged;
 }
 
 /**

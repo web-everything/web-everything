@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   prOwnershipOperation, ownerFor, phaseSinceFrom, assessPrOwnership, PR_OWNERSHIP_THRESHOLDS,
 } from '../pr-ownership.mjs';
-import { createPrOwnershipReader, buildPrToCardMap, cardForPr } from '../pr-ownership-io.mjs';
+import { createPrOwnershipReader, buildPrToCardMap, cardForPr, withTranscriptAges } from '../pr-ownership-io.mjs';
 import { createRegistry, isReadOnlyOperation } from '../registry.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { runOperationCli } from '../cli-adapter.mjs';
@@ -234,5 +234,15 @@ describe('pr-ownership — edge cases of the pure pieces', () => {
     ];
     const bound = bindAgents({ number: 7, headRefOid: 'deadbeef' }, agents);
     expect(bound.map((b) => [b.agent.name, b.transcriptAgeMs])).toEqual([['other', null], ['review-7', 5000]]);
+  });
+
+  it('withTranscriptAges keeps unreadable worker evidence: the incomplete marker and a non-array listing never become a complete empty inventory', () => {
+    const hungInfoFor = () => ({ ageMs: 1 });
+    const marked = Object.defineProperty([{ name: 'a' }], 'incomplete', { value: ['unreadable'] });
+    const aged = withTranscriptAges(marked, { hungInfoFor, now: 0, thresholdMs: 1 });
+    expect(aged).toEqual([{ name: 'a', transcriptAgeMs: 1 }]);
+    expect(Object.hasOwn(aged, 'incomplete')).toBe(true);
+    expect(Object.hasOwn(withTranscriptAges(null, { hungInfoFor, now: 0, thresholdMs: 1 }), 'incomplete')).toBe(true);
+    expect(Object.hasOwn(withTranscriptAges([{ name: 'a' }], { hungInfoFor, now: 0, thresholdMs: 1 }), 'incomplete')).toBe(false);
   });
 });
