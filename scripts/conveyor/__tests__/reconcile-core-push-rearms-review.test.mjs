@@ -31,6 +31,17 @@ const held = comments => ({ comments, labels: ['review:human'],
 describe('live send-back on the current head owes its first fixer', () => {
   const fresh = extra => ({ comments: [sendBack()], labels: ['review:changes'], ...extra });
   it.each([
+    ['disabled CI-heal budget', {}, { ciHealCap: 0 }, 'cap-exhausted'],
+    ['disabled CI-heal budget with a directed round at the review cap', {}, { ciHealCap: 0, durableCounts: { 6360: 5 } }, 'cap-exhausted'],
+    ['unreadable timeout evidence', { timeoutRetry: { eligible: false, unknown: true, reason: 'read failed' } }, {}, 'timeout-evidence-unknown'],
+    ['unresolved rerun reservation', { timeoutRetryBudget: { pending: true, reason: 'reservation unreadable' } }, {}, 'ci-heal-escalated'],
+    ['live rerun reservation', { timeoutRetryBudget: { pending: true, pendingSince: '2026-11-05T11:59:59Z' } }, {}, 'ci-timeout-rerun-in-flight'],
+  ])('initial send-back preserves the %s refusal', (_name, extra, options, refusal) => {
+    const result = run(fresh({ statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'failure' }], ...extra }), [], options);
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: refusal }));
+  });
+  it.each([
     ['review:changes'],
     ['review:changes', 'red-team:blocked', 'status:sent-back-red-team'],
     ['review:changes', 'review:accepted', 'status:sent-back-review'],

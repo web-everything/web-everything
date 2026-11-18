@@ -2877,7 +2877,11 @@ export function planReconcile({
       includeUnattempted: ['bounced', 'open', 'queued'].includes(phase) && !pr?.isDraft
         && pr?.mergeStateStatus !== 'DIRTY' && !withPhase.labels.includes(CONFLICT_LABEL),
     });
-    if (operatorRuling && String(pr?.state ?? 'OPEN').toUpperCase() === 'OPEN') {
+    // An initial repair cannot pre-empt CI's cap, evidence and rerun-reservation refusals.
+    // Completed misses retain their existing path; red initial repairs fall through to CI ownership.
+    const initialSendBackNeedsCi = operatorRuling && check.state === 'red'
+      && !operatorSendBackRuling(pr, [], { includeUnattempted: false });
+    if (operatorRuling && !initialSendBackNeedsCi && String(pr?.state ?? 'OPEN').toUpperCase() === 'OPEN') {
       const attempts = roundAttempts();
       if (attempts >= effectiveRoundCap && !sendBackRound) {
         refuseCapExhausted({ ...withPhase, attempts, cap: effectiveRoundCap, capKind: 'fix',
@@ -3010,7 +3014,7 @@ export function planReconcile({
     // At the review-fix cap an unused operator-directed round still belongs to the existing fix path below.
     // Routing it through CI healing would refuse at the cap before that path can carry the allowance.
     const ciRepairOwed = phase === 'ci-red' || (phase === 'needs-human' && check.state === 'red')
-      || (bouncedRealRed && !(sendBackRound && roundAttempts() >= effectiveRoundCap));
+      || (bouncedRealRed && (initialSendBackNeedsCi || !(sendBackRound && roundAttempts() >= effectiveRoundCap)));
     if (!(advisoryReviewOnHumanHandoff === 'on' && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))) && ciRepairOwed && reviewCi.reason === 'required-review-gate-conflict'
         && reviewCi.affected.every(row => row.name === 'review-gate')) {
       refuse('review-ci', { ...withPhase, ci: reviewCi, why: 'required review-gate must succeed before review; resolve the review-dependent required-check configuration' });
@@ -3056,7 +3060,7 @@ export function planReconcile({
       continue;
     }
 
-    const sendBack = (phase === 'needs-human' ? operatorSendBackAfterReview(pr) : null)
+    const sendBack = initialSendBackNeedsCi ? null : (phase === 'needs-human' ? operatorSendBackAfterReview(pr) : null)
       ?? ((ciRepairOwed || (phase === 'bounced' && !withPhase.labels.includes(CONFLICT_LABEL)))
         ? operatorSendBackRearm(pr, operatorBudget) : null);
     if (sendBack) {

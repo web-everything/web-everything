@@ -181,6 +181,24 @@ describe('operator send-backs, PR #5243 replay', () => {
   it('refuses to infer an initial repair from an unreadable live head', () => {
     expect(sendBackNotAddressed(fixture({ headRefOid: 'unknown', comments: [original] }))).toBeNull();
   });
+  it.each([
+    ['headless', 'Fixed an unrelated issue.'],
+    ['same head', `Head: \`${OLD}\`\nFixed an unrelated issue.`],
+    ['another send-back', '<!-- addresses-operator-send-back: unrelated -->'],
+    ['quoted coverage', '> <!-- addresses-operator-send-back: 1001 -->'],
+    ['fenced moved head', `\`\`\`\nHead: \`${HEAD}\`\n\`\`\``],
+  ])('unrelated %s fix evidence cannot consume the first repair', (_name, body) => {
+    const other = comment('other', 'web-everything', '21:00', `## Fix evidence\n\n${body}`);
+    expect(sendBackNotAddressed(fixture({ headRefOid: OLD, comments: [original, other] }))?.items).toHaveLength(1);
+  });
+  it.each([
+    '<!-- addresses-operator-send-back: 1001 -->',
+    'Addressed send-back 1001.',
+    `Head: \`${HEAD}\``,
+  ])('genuine coverage consumes the initial repair: %s', body => {
+    const fixed = comment('fixed', 'web-everything', '21:00', `## Fix evidence\n\n${body}`);
+    expect(sendBackNotAddressed(fixture({ headRefOid: OLD, comments: [original, fixed] }))).toBeNull();
+  });
   it('a trusted completed rearm consumes the initial repair, but a pause wake does not', () => {
     const rearm = comment('rearm', 'web-everything', '21:00', '🔧 conveyor fix — re-armed for re-review');
     expect(sendBackNotAddressed(fixture({ headRefOid: OLD, comments: [original, rearm] }))).toBeNull();

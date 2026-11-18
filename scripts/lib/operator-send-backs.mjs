@@ -100,7 +100,7 @@ const COMMENT_LINE = /^[ \t]*<!--/;
 const columnsOf = prefix => [...prefix].reduce((col, ch) => ch === '\t' ? col + 4 - (col % 4) : col + 1, 0);
 const CLOSE_FENCE = /^([ \t]*)(`{3,}|~{3,})[ \t]*$/;
 const LIST_PREFIX = /[^ \t\u00A0]/;
-function stripQuoted(text) {
+export function stripQuoted(text) {
   const out = [];
   let fence = null, fenceIndent = 0, fenceInList = false, quoting = false;
   // HTML quote and preformatted blocks render as quoted/code text; an unterminated one runs to the end.
@@ -300,10 +300,15 @@ export function sendBackNotAddressed(pr, { includeUnattempted = true } = {}) {
       && String(c?.body ?? '').trimStart().startsWith('🔓 conveyor fix-end'))
     || (includeUnattempted && item.head && shaOf(pr?.headRefOid) && Number.isFinite(Date.parse(item.at))
       && !differentHead(item.head, pr.headRefOid)
-      && !comments.slice(item.index + 1).some(c => isTrustedMarkerAuthor(c)
-        && (isFixRoundRearmComment(c) || isFixEvidence(stripQuoted(String(c?.body ?? '')))
-          || String(c?.body ?? '').trimStart().startsWith(ADVISORY_NOTE_MARKER)
-          || /^(?:🔁 (?:human )?review — changes requested|✅ review — accepted)/.test(String(c?.body ?? '').trimStart())))));
+      && !comments.slice(item.index + 1).some(c => {
+        if (!isTrustedMarkerAuthor(c)) return false;
+        const text = stripQuoted(String(c?.body ?? ''));
+        const head = /^ {0,3}Head:[ \t]*`([a-f0-9]{7,40})`[ \t]*$/im.exec(stripComments(text))?.[1];
+        return isFixRoundRearmComment(c)
+          || (isFixEvidence(text) && (namesSendBack(text, item) || differentHead(pr.headRefOid, head)))
+          || text.trimStart().startsWith(ADVISORY_NOTE_MARKER)
+          || /^(?:🔁 (?:human )?review — changes requested|✅ review — accepted)/.test(text.trimStart());
+      })));
   return items.length ? { head: pr?.headRefOid ?? null, items } : null;
 }
 

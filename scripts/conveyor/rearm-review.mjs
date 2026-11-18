@@ -32,7 +32,7 @@ import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { isHumanOperatorComment } from '../lib/operator-identity.mjs';
 import { parseOperatorAnswer } from './stand-down-answer-core.mjs';
 import { standDownComments } from './stand-down.mjs';
-import { operatorSendBacks } from '../lib/operator-send-backs.mjs';
+import { operatorSendBacks, stripQuoted } from '../lib/operator-send-backs.mjs';
 import { REARM_COMMENT_MARKER, SAME_HEAD_WAKE_TRAILER, isFixRoundRearmComment } from './rearm-round-count.mjs';
 
 // we:scripts/conveyor/rearm-review.mjs — re-export the shared narrowing helper on this module's surface so the
@@ -186,7 +186,7 @@ const CHANGES_VERDICT_HEADING_RE = /^\s*🔁\s+(?:human\s+)?review\s+[—-]\s+ch
  * An exact trusted `rearm-review` answer to the latest stand-down since fix-begin clears the window and
  * reviewed head; later claims still count. An unrelated or nonexistent target grants no exception.
  * Without a claim, an unchanged verdict head still owes a fixer unless trusted fix evidence follows it.
- * Unparseable claims retain the historical claim-window behavior; the CLI refuses unreadable evidence.
+ * An unparseable claim cannot erase the verdict head; the CLI refuses unreadable evidence.
  * @returns {{empty:boolean, since?:string}}
  */
 /** REST uses `user` and numeric `id`; gh uses `author` and the GraphQL ID. Prefer REST's matching `node_id`. */
@@ -202,7 +202,7 @@ function normaliseComment(c) {
  * `changes requested` verdict and returns the claims, the verdict's reviewed head, and the id of the latest stand-down
  * posted AFTER a fix-begin claim (null when none, or after a rearm-review answer already cleared it). Both the guard
  * (`decideEmptyFixRound`) and the answer CLI (`stand-down-answer.mjs`) read it, so the CLI refuses exactly what the
- * guard refuses. `claims` is null when a claim is unparseable (the guard then fails open).
+ * guard refuses. `claims` is null when a claim is unparseable; the verdict head still guards re-arm.
  */
 export function rearmWindow(comments) {
   let claims = [];
@@ -236,14 +236,15 @@ export function rearmWindow(comments) {
       standDownIds = [];
       rearmed = false;
     } else if (/^(?:🔓 conveyor fix-end|## Fix evidence)(?:\s|$)/.test(text)) {
+      const evidenceText = stripQuoted(text);
       fixEvidenceHead = (text.startsWith('🔓 conveyor fix-end')
-        ? /^🔓 conveyor fix-end — fix claim released\r?\n\r?\n`[^`\r\n]+` released the fix claim at `([a-f0-9]{7,40})`\./i.exec(text)?.[1]
-        : /^Head:[ \t]*`([a-f0-9]{7,40})`[ \t]*$/im.exec(text)?.[1])?.toLowerCase() ?? null;
+        ? /^🔓 conveyor fix-end — fix claim released\r?\n\r?\n`[^`\r\n]+` released the fix claim at `([a-f0-9]{7,40})`\./i.exec(evidenceText)?.[1]
+        : /^Head:[ \t]*`([a-f0-9]{7,40})`[ \t]*$/im.exec(evidenceText)?.[1])?.toLowerCase() ?? null;
     } else if (text.startsWith(FIX_BEGIN_FIRST_LINE)) {
       const sha = claimStartSha(body);
-      if (!sha) return { claims: null, reviewedHead: null, standDownIds: [], standDownId: null, rearmed: false };
-      claims.push(sha);
-    } else if (claims.length && standDownComments([c]).length) {
+      if (!sha) claims = null;
+      else claims?.push(sha);
+    } else if (claims?.length && standDownComments([c]).length) {
       if (c.id != null) standDownIds.push(String(c.id));
     }
   }
@@ -254,9 +255,8 @@ export function decideEmptyFixRound({ comments, liveHead } = {}) {
   const live = String(liveHead ?? '').trim().toLowerCase();
   if (!/^[0-9a-f]{7,40}$/.test(live) || !Array.isArray(comments)) return { empty: false };
   const { claims, reviewedHead, fixEvidenceHead } = rearmWindow(comments);
-  if (!claims) return { empty: false };
   const fixedHere = fixEvidenceHead && (live.startsWith(fixEvidenceHead) || fixEvidenceHead.startsWith(live));
-  if (!claims.length) return !fixedHere && reviewedHead
+  if (!claims?.length) return !fixedHere && reviewedHead
     && (live.startsWith(reviewedHead) || reviewedHead.startsWith(live))
     ? { empty: true, since: reviewedHead } : { empty: false };
   // A fix pushed AFTER the verdict by a session whose claim predates it leaves no earlier-head claim in the

@@ -514,6 +514,22 @@ describe('rearm-review.mjs CLI — the empty-round guard wiring', () => {
 
   const unclaimed = { ...verdict, body: `🔁 review — changes requested\n\nRecorded by chalbert via console.\n\nAt head \`${H0}\`: repair the export.`, user: { login: 'chalbert' } };
   it.each([
+    ['fenced', `\`\`\`text\nHead: \`${H0}\`\n\`\`\``],
+    ['quoted', `> Example:\nHead: \`${H0}\``],
+    ['HTML code', `<pre>\nHead: \`${H0}\`\n</pre>`],
+  ])('a %s Head example cannot prove a same-head repair', (_name, example) => {
+    const evidence = { user: BOT, body: `## Fix evidence\n\n${example}` };
+    expect(decideEmptyFixRound({ comments: [unclaimed, evidence], liveHead: H0 })).toEqual({ empty: true, since: H0 });
+  });
+  it('a malformed trusted fix-begin cannot erase the unchanged send-back guard', () => {
+    const malformed = { user: BOT, body: '🔒 conveyor fix-begin — fix claim held\n\n**Branch:** `lane/x`' };
+    expect(decideEmptyFixRound({ comments: [unclaimed, malformed, claim(H0)], liveHead: H0 })).toEqual({ empty: true, since: H0 });
+    const r = run(['6798', '--repo=o/r'], { head: H0, comments: [unclaimed, malformed] });
+    expect(r.status).toBe(1);
+    expect(r.out).toContain('no change made');
+    expect(r.calls.some(c => c[0] === 'pr' && c[1] === 'edit')).toBe(false);
+  });
+  it.each([
     ['missing', []],
     ['forged', [{ author: { login: 'outsider' }, body: `## Fix evidence\nHead: \`${H0}\`` }]],
     ['another head', [{ author: BOT, body: `## Fix evidence\nHead: \`${'b'.repeat(40)}\`` }]],
