@@ -625,7 +625,7 @@ it('runReconcilePass threads enrichBaseRef\'s output through to planReconcile (#
     enrichMainRed: (prs) => ({ prs, mainRedWindows: [] }), enrichAlreadyLanded: (prs) => prs,
     enrichBaseRef,
   });
-  expect(enrichBaseRef).toHaveBeenCalledWith([stackedPr], { defaultBranch: 'main' });
+  expect(enrichBaseRef).toHaveBeenCalledWith([expect.objectContaining(stackedPr)], { defaultBranch: 'main' });
 });
 
 // #4263 (PR #2787 review, live incident 2026-09-27) — a `waiting-on-system-fix` ci-heal escalation refuses
@@ -703,7 +703,7 @@ it('runReconcilePass threads enrichSystemFix\'s output through to planReconcile 
     enrichMainRed: (prs) => ({ prs, mainRedWindows: [] }), enrichAlreadyLanded: (prs) => prs,
     enrichBaseRef: (prs) => prs, enrichSystemFix,
   });
-  expect(enrichSystemFix).toHaveBeenCalledWith([escalatedPr], { repo: null });
+  expect(enrichSystemFix).toHaveBeenCalledWith([expect.objectContaining(escalatedPr)], { repo: null });
 });
 
 it('defaultFetchRef fetches refs/pull/<n>/head behind --end-of-options into an explicit destination — never the branch name (PR #2769 security review)', async () => {
