@@ -1,6 +1,6 @@
 /**
  * @file longshore-locus.test.mjs — backlog-split S1: the `longshore` repo/locus is registered, its slug comes only from
- *   the repo-names setting, it declares NO daemon capabilities, and the widened prefix regexes accept `longshore:` only.
+ *   the repo-names setting, it declares NO daemon capabilities, and citations remain refused by the prefix gate.
  */
 import { describe, expect, it } from 'vitest';
 import { createRequire } from 'node:module';
@@ -9,7 +9,7 @@ import { CONSTELLATION_REPOS, repoKeyForDir, repoKeyForSlug } from '../constella
 import { repoProfile, deliveryLocusForScope } from '../repo-profile.mjs';
 import { CROSS_REPO_LOCI, findDanglingLoci } from '../citation-check.mjs';
 import { CARD_REF_RE, referralCardReadable } from '../referral-card-readable.mjs';
-import { LOCI, LOCUS_NAMES, LOCUS_MARKER_RE } from '../../check-standards-rules.mjs';
+import { LOCI, LOCUS_NAMES, scanRepoLocusPrefixes } from '../../check-standards-rules.mjs';
 
 const require = createRequire(import.meta.url);
 const settings = JSON.parse(readFileSync('scripts/settings/repo-names.json', 'utf8'));
@@ -51,15 +51,16 @@ describe('longshore registry entry', () => {
 });
 
 describe('longshore cites and card refs', () => {
-  it('LOCUS_MARKER_RE accepts longshore: and rejects junk', () => {
-    expect(LOCUS_MARKER_RE.test('see longshore:')).toBe(true);
-    expect(LOCUS_MARKER_RE.test('see xlongshore2:')).toBe(false);
-    expect(LOCUS_MARKER_RE.test('see ops:')).toBe(false);
+  it.each(['longshore', 'xlongshore2', 'ops'])('prefix gate rejects %s citations rather than silently ignoring them', (prefix) => {
+    expect(scanRepoLocusPrefixes([{ file: 'backlog/x.md', content: `cite ${prefix}:scripts/a/b.mjs:12` }]))
+      .toEqual([{ file: 'backlog/x.md', count: 1, sample: 'scripts/a/b.mjs:12' }]);
+  });
+  it.each(['we', 'fui', 'plateau', 'webeverything', 'frontierui', 'plateau-app'])('prefix gate still accepts %s citations', (prefix) => {
+    expect(scanRepoLocusPrefixes([{ file: 'backlog/x.md', content: `cite ${prefix}:scripts/a/b.mjs:12` }])).toEqual([]);
   });
   it('longshore is NOT a cross-repo citation locus yet (no exemption added)', () => {
     expect(CROSS_REPO_LOCI.has('longshore:')).toBe(false);
     const deps = { fileExists: () => false, lineCount: () => 0 };
-    expect(findDanglingLoci('cite longshore:scripts/a/b.mjs:12', deps)).toEqual([]);
     expect(findDanglingLoci('cite we:scripts/a/b.mjs:12', deps).length).toBe(1);
   });
   it('longshore card refs are NOT accepted for hold release yet (fail closed)', () => {

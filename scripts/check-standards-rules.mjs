@@ -2455,7 +2455,7 @@ export const REPO_LOCUS_PREFIX_ENFORCED = true;
 // Longer/prefix-conflicting extensions first + a no-trailing-letter guard so `blocks.json` matches
 // `json` (not `js` + leftover `on`).
 const PATHLIKE_RE = /[\w./-]+\.(?:tsx|ts|json|mjs|cjs|js|md|njk|css|html|yaml|yml)(?![a-z])(?::\d+(?:-\d+)?)?/g;
-export const LOCUS_MARKER_RE = /\b(?:we|fui|plateau|webeverything|frontierui|plateau-app|longshore):$/;
+const LOCUS_MARKER_RE = /\b(?:we|fui|plateau|webeverything|frontierui|plateau-app):$/;
 const EXEMPT_FIELD_RE = /^\s*(?:relatedReport|graduatedTo|crossRef|codifiedIn)\s*:/;
 // #885 false-positive carve-outs (these are NOT repo code-path references): JS-ecosystem product
 // names (`Node.js`/`Next.js`/`Three.js` — a single Capitalized word + `.js`) and bare type-suffix
