@@ -129,10 +129,11 @@ export function summarize(checks = [], {
 const evidenceRank = { pass: 0, held: 1, pending: 2, fail: 3, unknown: 4 };
 const worstEvidence = states => states.reduce((a, b) => evidenceRank[b] > evidenceRank[a] ? b : a, 'pass');
 const sha = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.test(value) ? value.toLowerCase() : null;
-// Canonical positive integers only; unsafe numeric IDs cannot establish ordering.
+// Canonical positive safe integers only, for both numeric and string evidence.
 const evidenceInteger = value => typeof value === 'number'
   ? (Number.isSafeInteger(value) && value > 0 ? BigInt(value) : null)
-  : (typeof value === 'string' && /^[1-9][0-9]*(?![\s\S])/.test(value) ? BigInt(value) : null);
+  : (typeof value === 'string' && /^[1-9][0-9]*(?![\s\S])/.test(value)
+    && Number.isSafeInteger(Number(value)) ? BigInt(value) : null);
 const evidenceName = row => row?.name ?? row?.context;
 const evidenceJob = row => {
   try {
@@ -144,6 +145,8 @@ const evidenceJob = row => {
 
 // Completed is a lifecycle marker, not an outcome. Compare only explicit
 // outcome categories, before legacy mapping or hold excusal rewrites evidence.
+// A present state has its own closed vocabulary, independent of conclusions.
+const knownEvidenceStates = new Set(['success', 'failure', 'error', 'pending', 'expected']);
 const contradictoryEvidence = row => {
   const outcomes = [row?.status, row?.conclusion, row?.state].map(normalize).map(value => {
     if (value === 'error') return 'red';
@@ -190,7 +193,8 @@ export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNa
       else if (['pending', 'expected'].includes(legacy)) status = 'pending';
     }
     let state = 'unknown';
-    if (contradictoryEvidence(row) || typeof name !== 'string' || !name.trim() || !Object.hasOwn(CHECK_STATE_TABLE, status)
+    if ((row != null && Object.hasOwn(row, 'state') && !knownEvidenceStates.has(normalize(row.state)))
+      || contradictoryEvidence(row) || typeof name !== 'string' || !name.trim() || !Object.hasOwn(CHECK_STATE_TABLE, status)
       || (row?.conclusion != null && !Object.hasOwn(CHECK_STATE_TABLE.completed, normalize(row.conclusion)))
       || (status === 'completed' && !Object.hasOwn(CHECK_STATE_TABLE.completed, conclusion) && !legacyError)) why.push('malformed');
     else if (status !== 'completed') { state = 'pending'; why.push('pending'); }
@@ -205,8 +209,9 @@ export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNa
     if (state === 'fail' && name === 'review-gate' && conclusion === 'failure') state = 'held';
     if (state === 'fail' && name === 'merge-gate' && conclusion === 'failure') {
       const candidates = [row.mergeGateReviewHold, row.mergeGateHoldExcused, ...(Array.isArray(holds) ? holds : [])];
-      if (candidates.some(hold => evidenceJob(row) && evidenceInteger(hold?.jobId) === evidenceInteger(evidenceJob(row))
-        && sha(hold?.headSha) === sha(head) && Array.isArray(hold?.holdIds) && hold.holdIds.length
+      const job = evidenceInteger(evidenceJob(row));
+      if (job !== null && candidates.some(hold => evidenceInteger(hold?.jobId) === job
+        && rowHead !== null && sha(hold?.headSha) === rowHead && Array.isArray(hold?.holdIds) && hold.holdIds.length
         && humanReviewOnlyHold([...hold.holdIds].map(id => ({ id, status: 'hold' }))).only)) state = 'held';
     }
     return { row, name, state, reasons: why, rowHead, identity: evidenceIdentity(row), run: evidenceInteger(row?.run_id), attempt: evidenceInteger(row?.run_attempt) };
