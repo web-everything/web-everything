@@ -34,18 +34,25 @@ export function mergeTimingsJson(baseText, oursText, theirsText) {
   } catch { return null; }
 }
 
-// Preserve every base line, union insertions at each base gap, and dedupe added lines.
+// Preserve every base line; match identical cross-side additions one-for-one at each base gap.
 // A non-additive edit is outside this registry contract; leave it for operator resolution.
 function mergeRegistryLines(baseText, oursText, theirsText) {
   const lines = text => text.match(/[^\n]*\n|[^\n]+$/g) || [];
   const base = lines(baseText), gaps = base.map(() => []);
   gaps.push([]);
-  const added = new Set();
-  for (const text of [oursText, theirsText]) {
+  const added = gaps.map(() => new Map());
+  for (const [side, text] of [oursText, theirsText].entries()) {
     let cursor = 0;
     for (const line of lines(text)) {
       if (cursor < base.length && line === base[cursor]) cursor++;
-      else if (!added.has(line)) { gaps[cursor].push(line); added.add(line); }
+      else {
+        const count = added[cursor].get(line) || 0;
+        if (side === 1 && count > 0) added[cursor].set(line, count - 1);
+        else {
+          gaps[cursor].push(line);
+          if (side === 0) added[cursor].set(line, count + 1);
+        }
+      }
     }
     if (cursor !== base.length) return null;
   }
@@ -53,10 +60,9 @@ function mergeRegistryLines(baseText, oursText, theirsText) {
   return /^(?:<{7}|={7}|>{7}|\|{7})/m.test(merged) ? null : merged;
 }
 
-function validateModule(path, importModule = false) {
-  return spawnSync(process.execPath, importModule
-    ? ['--input-type=module', '-e', 'await import(process.argv[1])', pathToFileURL(path).href]
-    : ['--check', path], {
+function validateModule(path) {
+  return spawnSync(process.execPath,
+    ['--input-type=module', '-e', 'await import(process.argv[1])', pathToFileURL(path).href], {
     encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
   }).status === 0;
 }
@@ -82,7 +88,8 @@ export function resolveAdvisoryConflicts({ git, cur, ovSha }) {
     const end = lines.indexOf('');
     if (!FULL_SHA_RE.test(tree) || end < 0) return null;
     const paths = lines.slice(0, end);
-    if (!advisoryOnly(paths)) return null;
+    // Registry unions need real import validation in resolveAdvisoryInWorktree.
+    if (paths.length === 0 || paths.some(path => path !== ADVISORY_MERGE_PATHS[0])) return null;
     const base = git(['merge-base', '--all', cur, ovSha]);
     const baseSha = String(base.stdout ?? '').trim();
     if (base.status !== 0 || !FULL_SHA_RE.test(baseSha)) return null;
@@ -93,9 +100,8 @@ export function resolveAdvisoryConflicts({ git, cur, ovSha }) {
     for (const path of paths) {
       const text = readMerge(git, [baseSha, cur, ovSha], path);
       if (text === null) return null;
-      const blobPath = join(scratch, path.endsWith('.mjs') ? 'registry.mjs' : 'timings.json');
+      const blobPath = join(scratch, 'timings.json');
       writeFileSync(blobPath, text);
-      if (path.endsWith('.mjs') && !validateModule(blobPath)) return null;
       const blob = git(['hash-object', '-w', '--', blobPath]);
       const blobSha = String(blob.stdout ?? '').trim();
       if (blob.status !== 0 || !FULL_SHA_RE.test(blobSha)) return null;
@@ -132,7 +138,7 @@ export function resolveAdvisoryInWorktree({ git, cwd }) {
     try {
       for (const { path, text } of merged) writeFileSync(join(cwd, path), text);
       for (const { path } of merged) {
-        if (path.endsWith('.mjs') && !validateModule(join(cwd, path), true)) return restore();
+        if (path.endsWith('.mjs') && !validateModule(join(cwd, path))) return restore();
       }
       stagingAttempted = true;
       if (git(['add', '--', ...paths]).status !== 0) return restore();

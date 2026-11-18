@@ -21,7 +21,9 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-function fixture({ timingConflict = true, codeConflict = false, duplicate = false, indexConflict = false, indexAddition = "// theirs\n" } = {}) {
+function fixture({ timingConflict = true, codeConflict = false, duplicate = false, indexConflict = false, indexAddition = "// theirs\n",
+  indexOurs = 'export const breaks = [];\n// ours\n// shared\n',
+  indexTheirs = `export const breaks = [];\n${indexAddition}// shared\n` } = {}) {
   const root = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'advisory-merge-'));
   roots.push(root);
   const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
@@ -60,13 +62,13 @@ function fixture({ timingConflict = true, codeConflict = false, duplicate = fals
   ok(['checkout', '-q', '-b', 'ours']);
   if (timingConflict) write(TIMINGS, json(timings({ shared: 1, zeta: 3, ...(duplicate ? { same: 9 } : {}) })));
   if (codeConflict) write('a.mjs', 'export const value = "ours";\n');
-  if (indexConflict) write(INDEX, 'export const breaks = [];\n// ours\n// shared\n');
+  if (indexConflict) write(INDEX, indexOurs);
   write('ours-only.txt', 'keep ours\n');
   const cur = commit('ours');
   ok(['checkout', '-q', '-b', 'theirs', 'base']);
   if (timingConflict) write(TIMINGS, json(timings({ shared: 1, alpha: 2, ...(duplicate ? { same: 4 } : {}) })));
   if (codeConflict) write('a.mjs', 'export const value = "theirs";\n');
-  if (indexConflict) write(INDEX, `export const breaks = [];\n${indexAddition}// shared\n`);
+  if (indexConflict) write(INDEX, indexTheirs);
   write('theirs-only.txt', 'keep theirs\n');
   const ovSha = commit('theirs');
   ok(['checkout', '-q', 'ours']);
@@ -200,22 +202,12 @@ describe('object database advisory resolution', () => {
     expect(snapshot(f)).toEqual(before);
   });
 
-  it.each([false, true])('unions registry comments and imports the result (timings conflict: %s)', async timingConflict => {
+  it.each([false, true])('refuses registry conflicts without a worktree (timings conflict: %s)', async timingConflict => {
     const { resolveAdvisoryConflicts } = await advisory();
     const f = fixture({ timingConflict, indexConflict: true });
     assertConflict(f, timingConflict ? [TIMINGS, INDEX] : [INDEX]);
     const before = snapshot(f);
-    const result = resolveAdvisoryConflicts(f);
-    expect(result?.ok).toBe(true);
-    if (timingConflict) assertTree(f, result);
-    const text = f.ok(['show', `${result.tree}:${INDEX}`]);
-    expect(text).toContain('// ours');
-    expect(text).toContain('// theirs');
-    expect(text.match(/\/\/ shared/g)).toHaveLength(1);
-    const modulePath = join(f.root, 'merged.mjs');
-    writeFileSync(modulePath, text);
-    expect(spawnSync(process.execPath, [modulePath], { timeout: 5000 }).status).toBe(0);
-    rmSync(modulePath);
+    expect(resolveAdvisoryConflicts(f)).toBeNull();
     expect(snapshot(f)).toEqual(before);
   });
 
@@ -224,15 +216,6 @@ describe('object database advisory resolution', () => {
     const f = fixture({ timingConflict: false, indexConflict: true, codeConflict: true });
     assertConflict(f, [INDEX, 'a.mjs']);
     expect(resolveAdvisoryConflicts(f)).toBeNull();
-  });
-
-  it('refuses the entire advisory set when the registry union has invalid syntax', async () => {
-    const { resolveAdvisoryConflicts } = await advisory();
-    const f = fixture({ indexConflict: true, indexAddition: 'export const = ;\n' });
-    assertConflict(f, [TIMINGS, INDEX]);
-    const before = snapshot(f);
-    expect(resolveAdvisoryConflicts(f)).toBeNull();
-    expect(snapshot(f)).toEqual(before);
   });
 
   it('returns null when Git cannot read the merge inputs', async () => {
@@ -257,6 +240,30 @@ describe('resolveAdvisoryInWorktree', () => {
     expect(f.ok(['status', '--porcelain=v1'])).toBe('');
     expect(f.ok(['rev-list', '--parents', '-n', '1', 'HEAD']).split(' ').slice(1)).toEqual([f.cur, f.ovSha]);
     expect(f.git(['rev-parse', '--verify', 'MERGE_HEAD']).status).not.toBe(0);
+  });
+
+  it.each([[2, 0], [0, 2], [2, 1], [1, 2], [2, 3]])(
+    'preserves repeated additions within a branch and consumes cross-side matches one-for-one (ours: %i, theirs: %i)',
+    async (ours, theirs) => {
+      const { resolveAdvisoryInWorktree } = await advisory();
+      const f = fixture({ timingConflict: false, indexConflict: true,
+        indexOurs: `export const breaks = [];\n// ours\n${'// repeated\n'.repeat(ours)}`,
+        indexTheirs: `export const breaks = [];\n// theirs\n${'// repeated\n'.repeat(theirs)}` });
+      expect(f.git(['merge', '--no-edit', f.ovSha]).status).toBe(1);
+      expect(resolveAdvisoryInWorktree({ git: f.git, cwd: f.root })).toBe(true);
+      expect(readFileSync(join(f.root, INDEX), 'utf8')).toBe(
+        `export const breaks = [];\n// ours\n${'// repeated\n'.repeat(ours)}// theirs\n${'// repeated\n'.repeat(Math.max(0, theirs - ours))}`);
+    });
+
+  it('keeps identical additions at different base gaps', async () => {
+    const { resolveAdvisoryInWorktree } = await advisory();
+    const f = fixture({ indexConflict: true,
+      indexOurs: '// repeated\nexport const breaks = [];\n// ours\n',
+      indexTheirs: 'export const breaks = [];\n// theirs\n// repeated\n' });
+    assertConflict(f, [TIMINGS, INDEX]);
+    expect(f.git(['merge', '--no-edit', f.ovSha]).status).toBe(1);
+    expect(resolveAdvisoryInWorktree({ git: f.git, cwd: f.root })).toBe(true);
+    expect(readFileSync(join(f.root, INDEX), 'utf8')).toBe('// repeated\nexport const breaks = [];\n// ours\n// theirs\n// repeated\n');
   });
 
   it.each(['export const = ;\n', "import './missing.mjs';\n", '<<<<<<< ours\n'])('refuses and restores all conflicts when registry validation fails: %s', async indexAddition => {
