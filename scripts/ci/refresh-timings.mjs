@@ -102,9 +102,12 @@ export async function refreshFromDir({ dir, timingsFile = TIMINGS_FILE, repoRoot
     const { classifyTests } = await import('./coverage-reach.mjs');
     // A fixture repo has no vitest coverage config to classify against, so its files all count as covered.
     const split = io.classify ?? (repoRoot === REPO_ROOT ? classifyTests : async (all) => ({ covered: all }));
-    const ratio = staleRatio((await split(files)).covered, all.unit, timings, total);
+    const group = (await split(files)).covered;
+    const ratio = staleRatio(group, all.unit, timings, total);
+    // A stored map that no longer measures the current files is stale regardless of its apparent balance.
+    const storedCoverage = group.filter(file => Number.isFinite(all.unit[file])).length / Math.max(group.length, 1);
     const balance = `stale ratio old-assignment-on-new-timings ${ratio.toFixed(2)}`;
-    if (minStale !== undefined && ratio < minStale) return { ok: true, reason: `${balance}; assignment still balanced.` };
+    if (minStale !== undefined && ratio < minStale && storedCoverage >= 0.8) return { ok: true, reason: `${balance}; assignment still balanced.` };
     const output = formatUpdatedTimings(all, 'unit', timings);
     pending = `${timingsFile}.${randomUUID()}.pending`;
     await write(pending, output, { flag: 'wx' });

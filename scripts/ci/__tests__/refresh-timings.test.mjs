@@ -369,9 +369,17 @@ describe('rolling timing refresh', () => {
 
   it('does not write when the old assignment remains below min-stale, defaulting the window to five', async () => {
     const calls = [];
+    const measured = `${JSON.stringify({ unit: Object.fromEntries(files.map(file => [file, 1])), soak: {} }, null, 1)}\n`;
+    writeFileSync(timingsFile, measured);
     expect(await main(['--min-stale=1.9'], { exec: rollingExec([1000], calls), timingsFile, repoRoot })).toBe(0);
     expect(calls[0].args).toContain('--limit=5');
-    expect(readFileSync(timingsFile, 'utf8')).toBe(original);
+    expect(readFileSync(timingsFile, 'utf8')).toBe(measured);
+  });
+
+  it('refreshes despite min-stale when the stored map no longer measures the current files', async () => {
+    writeFileSync(timingsFile, JSON.stringify({ unit: { 'deleted.test.mjs': 1 }, soak: {} }));
+    expect(await main(['--runs=1', '--min-stale=100'], { exec: rollingExec([1000], []), timingsFile, repoRoot })).toBe(0);
+    expect(Object.keys(JSON.parse(readFileSync(timingsFile, 'utf8')).unit)).not.toContain('deleted.test.mjs');
   });
 
   it('writes when drift meets the threshold', async () => {
