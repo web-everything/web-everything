@@ -8,6 +8,13 @@ import {join, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {parseTelemetry} from '../forge-exec-run.mjs';
 
+it('setup installs two-day tmpfiles retention and a 2G journal cap drop-in',()=>{
+  const source=readFileSync(new URL('../forge-setup.sh',import.meta.url),'utf8');
+  expect(source).toContain("cat > /etc/tmpfiles.d/forge-tmp.conf <<'TMPFILES'\nD /tmp 1777 root root 2d\nTMPFILES");
+  expect(source).toContain("cat > /etc/systemd/journald.conf.d/forge-journal.conf <<'JOURNAL'\n[Journal]\nSystemMaxUse=2G\nJOURNAL");
+  expect(source).toContain('systemctl restart systemd-journald');
+});
+
 it('setup writer records installed bytes atomically, reruns safely, and warns with null SHA outside Git',()=>{
   const source = readFileSync(new URL('../forge-setup.sh',import.meta.url),'utf8');
   const allowed = JSON.parse('['+source.match(/allowed = \{([^\n]+)\}/)[1]+']');

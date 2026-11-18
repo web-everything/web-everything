@@ -78,7 +78,7 @@ export function buildOpenPrPageQuery({ repo, pageSize, after = null }) {
   if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100) throw new TypeError('pageSize must be an integer from 1 to 100');
   const [owner, name] = repo.split('/');
   const cursor = after === null ? '' : `,after:${JSON.stringify(after)}`;
-  return `query{repository(owner:"${owner}",name:"${name}"){pullRequests(states:OPEN,first:${pageSize}${cursor},orderBy:{field:CREATED_AT,direction:DESC}){totalCount pageInfo{hasNextPage endCursor} nodes{number title url isDraft createdAt updatedAt headRefName headRefOid baseRefName isCrossRepository mergeable mergeStateStatus reviewDecision labels(first:100){nodes{id name description color}} commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename ...on CheckRun{name status conclusion startedAt completedAt detailsUrl databaseId checkSuite{app{slug databaseId} workflowRun{workflow{name}}}} ...on StatusContext{context state targetUrl createdAt}}}}}}}}}}}`;
+  return `query{repository(owner:"${owner}",name:"${name}"){pullRequests(states:OPEN,first:${pageSize}${cursor},orderBy:{field:CREATED_AT,direction:DESC}){totalCount pageInfo{hasNextPage endCursor} nodes{number title url isDraft createdAt updatedAt headRefName headRefOid baseRefName isCrossRepository mergeable mergeStateStatus reviewDecision labels(first:100){nodes{id name description color}} commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} totalCount nodes{__typename ...on CheckRun{name status conclusion startedAt completedAt detailsUrl databaseId checkSuite{app{slug databaseId} workflowRun{workflow{name}}}} ...on StatusContext{context state targetUrl createdAt}}}}}}}}}}}`;
 }
 
 const ZERO = '0001-01-01T00:00:00Z';
@@ -221,9 +221,18 @@ export function resolveCheckAppsByCommit({ repo, rows, exec, execOpts = {}, env 
   return rows;
 }
 
-/** PURE: exactly gh pr list --json's labels and flattened statusCheckRollup shape. */
+/** Connection metadata is required; flattened gh rows cannot prove completeness. */
+export function rollupEvidence(commit) {
+  const c = commit?.statusCheckRollup?.contexts;
+  return { rowsHead: typeof commit?.oid === 'string' && SHA_RE.test(commit.oid) ? commit.oid : null,
+    rowsComplete: c?.pageInfo?.hasNextPage === false && Number.isInteger(c?.totalCount) && c.totalCount >= 0
+      && Array.isArray(c?.nodes) && c.nodes.length === c.totalCount
+      && c.nodes.every(n => n && ['CheckRun', 'StatusContext'].includes(n.__typename)) };
+}
+
+/** PURE: exactly gh pr list --json's labels and flattened statusCheckRollup shape, plus evidence metadata. */
 export function mapGraphqlPr(n) {
-  return { number: n.number, title: n.title, url: n.url, isDraft: n.isDraft, createdAt: n.createdAt, updatedAt: n.updatedAt,
+  return { ...rollupEvidence(n.commits?.nodes?.[0]?.commit), number: n.number, title: n.title, url: n.url, isDraft: n.isDraft, createdAt: n.createdAt, updatedAt: n.updatedAt,
     headRefName: n.headRefName, headRefOid: n.headRefOid, baseRefName: n.baseRefName, isCrossRepository: n.isCrossRepository,
     mergeable: n.mergeable, mergeStateStatus: n.mergeStateStatus, reviewDecision: n.reviewDecision ?? '',
     labels: n.labels?.nodes ?? [],

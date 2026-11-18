@@ -156,7 +156,7 @@ export function createWeScanRunner(binPath, { resolveSharedBin } = {}) {
  */
 /**
  * #70d — subcommands the shared build may serve: only those measured NOT slower than their JS fallback. Measured
- * 2026-10-06 on this repo (host load ~15 on 12 cores): secret-scrub 0.9 s vs JS 1.7 s; stdout-flush 0.9 s vs JS
+ * 2026-10-06 on this repo (host load ~15 against the host core count): secret-scrub 0.9 s vs JS 1.7 s; stdout-flush 0.9 s vs JS
  * 1.1 s; citation-check 12.3 s vs JS 1.5 s — so citation-check stays JS unless a checkout built its own binary.
  */
 export const SHARED_SUBCOMMANDS = new Set(['secret-scrub', 'stdout-flush']);

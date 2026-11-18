@@ -11,6 +11,31 @@ const live = (exec) => createMqLiveReader(exec);
 const refusal = (reason) => ({ action: 'refuse', reason });
 const safe = (value) => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
 
+// Allowlist, not a Markdown parser: the only text treated as plain is a bare placeholder token
+// (<name>: no attributes, slash or other characters) inside a balanced single-line inline code span.
+// The token is removed; every other character, including other tag-like text in the span, stays visible
+// to the HTML refusal. Escaped or unmatched backticks are ambiguous; a snapshot with link/reference brackets
+// anywhere gets no exemption at all (see planStampRestore).
+function outsideInlineCode(line) {
+  if (!line.includes('`')) return line;
+  if (line.includes('\\`')) return undefined;
+  let delimiter;
+  let start = 0;
+  let plain = '';
+  for (const run of line.matchAll(/`+/g)) {
+    if (!delimiter) {
+      plain += line.slice(start, run.index);
+      delimiter = run[0];
+      start = run.index + run[0].length;
+    } else if (run[0] === delimiter) {
+      plain += line.slice(start, run.index).replace(/<[a-z][a-z0-9_-]*>/g, ' ') + ' ';
+      start = run.index + run[0].length;
+      delimiter = undefined;
+    }
+  }
+  return delimiter ? undefined : plain + line.slice(start);
+}
+
 /** One bounded request. Truncation is not agreement: operators must investigate the full history. */
 export function readAuthorStampEdits(pr, { repo, exec = execFileSyncThrottled } = {}) {
   const parts = typeof repo === 'string' ? repo.split('/') : [];
@@ -59,13 +84,26 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
     if (/^@@ .* @@/m.test(edit.diff) || /\[-|-\]|\{\+|\+\}/.test(edit.diff)) {
       return refusal('unsupported delta edit snapshot; inspect complete GitHub history manually');
     }
-    if (/<\/?[a-z][^>]*>/i.test(edit.diff)) {
-      return refusal('unsupported HTML edit snapshot; inspect complete GitHub history manually');
-    }
     const markers = [];
+    const htmlLines = [];
+    let ambiguousTicks = false;
+    // Brackets can make a backticked span part of a link target or text across lines: no exemption.
+    const bracketed = /[\[\]]/.test(edit.diff);
     let fence;
     for (const line of edit.diff.split(/\r\n|[\r\n]/)) {
       const delimiter = line.match(/^[ \t]{0,3}(`{3,}|~{3,})(.*)$/);
+      // Never let a multiline comment hide a later standalone stamp. Fenced tags
+      // remain unsupported; only balanced, single-line inline code is exempt.
+      const unclosedComment = [...line.matchAll(/<!--/g)].some((opener) => line.indexOf('-->', opener.index + 4) === -1);
+      if (unclosedComment) {
+        return refusal('unsupported HTML edit snapshot; inspect complete GitHub history manually');
+      }
+      const stripped = fence || delimiter ? line : outsideInlineCode(line);
+      // One ambiguous backtick line may open a multiline span: no inline-code exemption anywhere in the snapshot.
+      if (stripped === undefined) ambiguousTicks = true;
+      // Backticks inside any HTML comment other than a bare stamp marker are not code: disable the exemption.
+      if (line.includes('<!--') && !/^<!--[ \t]*authored-by-actor:[^<>\r\n]*-->[^\S\r\n]*$/.test(line)) ambiguousTicks = true;
+      htmlLines.push(stripped ?? line);
       if (line.includes('authored-by-actor:')) {
         // A stamp is evidence only as a whole, unindented line outside code fences.
         const marker = line.match(/^(<!--[ \t]*authored-by-actor:[^<>\r\n]*-->)[^\S\r\n]*$/)?.[1];
@@ -78,6 +116,20 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
         if (!fence) fence = delimiter[1];
         else if (delimiter[1][0] === fence[0] && delimiter[1].length >= fence.length && !delimiter[2].trim()) fence = undefined;
       }
+    }
+    // Tags can span lines and contain an apparently standalone stamp in an attribute.
+    // Preserve snapshot-wide detection after exempting only validated inline spans.
+    const noExempt = ambiguousTicks || bracketed;
+    // Raw HTML constructs (CDATA, processing instructions, declarations, comments other than a bare stamp
+    // marker) open HTML blocks where backticks are not code: refuse them outright, outside code spans too.
+    const candidate = (noExempt ? edit.diff.split(/\r\n|[\r\n]/) : htmlLines)
+      .filter((l) => !/^<!--[ \t]*authored-by-actor:[^<>\r\n]*-->[^\S\r\n]*$/.test(l)).join('\n');
+    if (/<\/?[a-z][^>]*>/i.test(noExempt ? edit.diff : htmlLines.join('\n')) || /<[!?]/.test(candidate)) {
+      return refusal('unsupported HTML edit snapshot; inspect complete GitHub history manually');
+    }
+    // An unmatched backtick line may open a multiline code span around a marker: not evidence of authorship.
+    if (ambiguousTicks && markers.length) {
+      return refusal('malformed or non-standalone historical stamp; inspect complete GitHub history manually');
     }
     // GitHub lists newest first for equal timestamps: the later position is older.
     if (!oldest || Date.parse(edit.createdAt) <= Date.parse(oldest.createdAt)) {

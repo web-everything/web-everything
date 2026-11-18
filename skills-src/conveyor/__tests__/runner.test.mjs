@@ -704,7 +704,7 @@ describe('one open-PR snapshot per mechanical tick', () => {
     try {
       const run = makeCliMechanicalPasses({ scriptsDir: '/scripts', repo: 'web-everything/web-everything', runPass: runPassWithExec(cp.execFileSync) });
       for (let i = 0; i < ticks; i++) await run({ out: {} });
-      for (const snapshot of snapshots) expect(snapshot).toEqual(fixture);
+      for (const snapshot of snapshots) expect(snapshot).toEqual(fixture.map(pr => ({ ...pr, rowsComplete: false, rowsHead: null })));
       return { calls, files, warnings: stderr.mock.calls.map(([line]) => line) };
     } finally {
       stderr.mockRestore();
