@@ -2,7 +2,7 @@
 import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 import { FINDING_CLASSES, classAction, stricterClass, readFindingClassPolicy, validAlsoClasses } from '../lib/finding-class-policy.mjs';
 import { decodeRecoveryAdmission } from '../lib/drain-red-team-evidence.mjs';
-import { recordRedTeamStatus, readRedTeamStatus, redTeamStatusDir, readRedTeamAdmissionRecords } from '../lib/drain-red-team-evidence.mjs';
+import { recordRedTeamStatus, readRedTeamStatus, redTeamStatusDir } from '../lib/drain-red-team-evidence.mjs';
 import { publishStoredRedTeamResult } from '../lib/red-team-withheld-publish.mjs';
 import { redTeamCheckRunIsEvidence } from '../lib/red-team-check-run.mjs';
 import { normalizeRedTeamResult } from '../lib/review-red-team-on-skip.mjs';
@@ -2169,7 +2169,7 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
     ...base,
     readAiRouting,
     readRecords: ({ strict = false } = {}) => strict
-      ? readRedTeamAdmissionRecords({ env, path: storePath ?? resolveScorecardStorePath(env) }) : base.readRecords(),
+      ? readStore({ path: storePath ?? resolveScorecardStorePath(env), strict: true }).records : base.readRecords(),
     readRedTeamStatus: input => readRedTeamStatus({ ...input, env }),
     readRecoveryComments: readCompleteComments,
     redTeamStatus: input => {

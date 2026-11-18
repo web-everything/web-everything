@@ -1,6 +1,5 @@
 import { redTeamForHead } from './red-team-gate.mjs';
 import { redTeamCardOnly, redTeamReadReviewable } from './review-red-team-policy.mjs';
-import { skippedRedTeamRetry, failedRedTeamRetry } from './red-team-run-result.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { candidateQueueClass } from './merge-queue.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
@@ -499,7 +498,7 @@ export function createDrainMergeStrategy({
         }
         const pages = readThreadPages(c.repo, c.num);
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team admission: unreadable complete comments');
-        // A terminal writer with no runnable recovery must reach the operator even before the deadline.
+        // A finished skip still pending settlement must reach the operator before the deadline.
         const writer = evidence.status;
         const stalled = writer?.status === 'finished' && writer.head === headSha
           && admissionLabels.includes('review:accepted') && admissionLabels.includes('red-team:pending')
@@ -507,15 +506,14 @@ export function createDrainMergeStrategy({
           && !evidence.inFlight && !evidence.queued && !evidence.recorded
           && !(writer.skipCardOnly === true && redTeamReadReviewable(writer.loopPayload?.findings?.read)
             && redTeamCardOnly(writer.loopPayload?.findings?.read))
-          && (writer.retryCount >= 1
-            || (!skippedRedTeamRetry(writer, evidence) && !failedRedTeamRetry(writer, evidence)));
+          && (writer.result === 'skipped' || writer.result?.status === 'skipped');
         if (stalled && publishNote) {
           before.redTeamStallNotices ??= {};
           before.redTeamStallNotices[key] ??= {};
           if (before.redTeamStallNotices[key][headSha] == null) {
             try {
               publishNote({ repo: slugOf(c.repo), pr: Number(c.num), head: headSha,
-                kind: 'red-team-finished-pending', reason: 'finished red-team status has no advancing path; inspect stored evidence',
+                kind: 'red-team-finished-pending', reason: 'finished red-team skip needs settlement; inspect stored evidence',
                 pick: `https://github.com/${slugOf(c.repo)}/pull/${c.num}` });
               before.redTeamStallNotices[key][headSha] = now();
               writeState(statePath, before);

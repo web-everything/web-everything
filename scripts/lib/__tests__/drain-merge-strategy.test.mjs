@@ -782,7 +782,6 @@ describe('drain merge strategy — github-merge-queue', () => {
     const logs = [];
     const s = createDrainMergeStrategy({
       isLocalRepo: () => true, localSlug: LOCAL, statePath: '/x/state.json', resolved: policyOf('github-merge-queue'), exec,
-      readRedTeamEvidence: () => ({ scheduled: false, recorded: false, inFlight: false }),
       log: { write: (l) => logs.push(l) },
       readFile: () => { if (broken) return '{"pending": ['; return JSON.stringify(stored); },
       writeState: (_p, st) => { writes++; stored = JSON.parse(JSON.stringify(st)); },
@@ -796,7 +795,6 @@ describe('drain merge strategy — github-merge-queue', () => {
     const exec2 = (cmd, args) => (args.some(a => a.includes('isInMergeQueue')) ? JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: true, headRefOid: HEAD } } } }) : exec(cmd, args));
     const s2 = createDrainMergeStrategy({
       isLocalRepo: () => true, localSlug: LOCAL, statePath: '/x/state.json', resolved: policyOf('github-merge-queue'), exec: exec2,
-      readRedTeamEvidence: () => ({ scheduled: false, recorded: false, inFlight: false }),
       log: { write: (l) => logs.push(l) }, readFile: () => JSON.stringify(stored),
       writeState: (_p, st) => { writes++; stored = JSON.parse(JSON.stringify(st)); },
     });
@@ -2052,7 +2050,7 @@ describe('drain pre-stage queue admission', () => {
 });
 
 describe('finished pending red-team stall notice', () => {
-  it.each(['spent retry', 'empty card read', 'unscored card read'])
+  it.each(['code read', 'empty card read', 'unscored card read'])
   ('emits one durable notice per repo/pr/head, including after strategy restart (%s)', variant => {
     const notes = [];
     const root = mkdtempSync(join(tmpdir(), 'stall-notices-'));
@@ -2063,10 +2061,9 @@ describe('finished pending red-team stall notice', () => {
       publishNeedsYou: item => notes.push(item),
       evidence: { scheduled: true, recorded: false, seatRecorded: false, failedSeatCount: 0, completedRecorded: false,
         inFlight: false, queued: false, loopPayload: { verdict: { verdict: 'accept' } },
-        status: { head: HEAD, status: 'finished', retryCount: variant === 'spent retry' ? 1 : 0,
-          skipCardOnly: variant !== 'spent retry', loopPayload: { verdict: { verdict: 'accept' }, findings: { read: {
+        status: { head: HEAD, status: 'finished', skipCardOnly: variant !== 'code read', loopPayload: { verdict: { verdict: 'accept' }, findings: { read: {
             diffScored: variant !== 'unscored card read', diffText: variant === 'empty card read' ? '' : '+card',
-            netChangedFiles: ['backlog/5283.md'], netBasis: { rev: HEAD },
+            netChangedFiles: variant === 'code read' ? ['scripts/example.mjs'] : ['backlog/5283.md'], netBasis: { rev: HEAD },
           } } }, result: { status: 'skipped' } } } });
     try {
       const h = make();
