@@ -254,6 +254,17 @@ export function registrationIdentity(entry) {
   return identity;
 }
 
+/** Restore a drop snapshot verbatim without replacing a concurrent registration. Caller holds the add guard. */
+export function restoreOverlayRegistration(root, entry, { env = process.env } = {}) {
+  if (!isSafeBranchName(entry?.ref)) throw new TypeError('unsafe overlay restoration ref');
+  return withListLock(root, env, () => {
+    const list = readOverlaysForWrite(root, env);
+    if (list.some(o => o?.ref === entry.ref)) return 'skipped-reregistered';
+    writeOverlays(root, [...list, entry], { env });
+    return 'restored';
+  });
+}
+
 export function addOverlay(root, {
   ref, pr = null, addedBy = null, reason = null, now, pinned, stackBases, conflictOverride,
 } = {}, { env = process.env, expectedOverlay } = {}) {
@@ -332,20 +343,25 @@ export function recordEdgeResolution(root, ref, {
  * {@link appendOverlayEvent} when the removal should be recorded.
  * @param {string} root
  * @param {string} ref
- * `requireRef`, when supplied, must still be registered under the list mutex, else nothing is removed: a swap that
+ * `requireRef`, when supplied, must still be registered under the list mutex, else nothing is removed.
+ * `expectedRequiredOverlay` also checks its registration identity under that mutex. A swap that
  * retires `ref` for its replacement never leaves the list without both. `expectedOverlay`, when supplied, must still
  * match a present `ref` entry under the same mutex, so a concurrent re-registration is never removed. `stackBases` is
  * left out of that comparison: the rebuild rewrites it on its own ({@link persistStackBases}), which is no re-registration.
- * @param {{env?:NodeJS.ProcessEnv, why?:string, requireRef?:string, expectedOverlay?:object}} [o]
+ * @param {{env?:NodeJS.ProcessEnv, why?:string, requireRef?:string, expectedRequiredOverlay?:object, expectedOverlay?:object}} [o]
  * @returns {{removed:boolean, list:Array<object>}}
  */
-export function removeOverlay(root, ref, { env = process.env, why, requireRef, expectedOverlay } = {}) {
+export function removeOverlay(root, ref, { env = process.env, why, requireRef, expectedRequiredOverlay, expectedOverlay } = {}) {
   void why; // caller bookkeeping only — see JSDoc above.
   return withListLock(root, env, (pause) => {
     const list = readOverlaysForWrite(root, env);
     pause();
     if (requireRef !== undefined && !list.some((o) => o && o.ref === requireRef)) {
       throw new Error('replacement registration unavailable');
+    }
+    if (expectedRequiredOverlay !== undefined && !isDeepStrictEqual(
+      registrationIdentity(list.find(o => o?.ref === requireRef)), registrationIdentity(expectedRequiredOverlay))) {
+      throw new Error('replacement registration changed; refusing removal');
     }
     const idx = list.findIndex((o) => o && o.ref === ref);
     if (expectedOverlay !== undefined && idx !== -1 && !isDeepStrictEqual(registrationIdentity(list[idx]), registrationIdentity(expectedOverlay))) {

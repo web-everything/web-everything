@@ -11,6 +11,9 @@
  *   fresh mkdtemp per fixture via `env`, never `~/.claude/*`.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+// Hermetic open-PR inventory; individual pruning cases override it explicitly.
+vi.mock('../gh-throttle.mjs', async importOriginal => ({ ...await importOriginal(), runGhSync: vi.fn(() => '[]') }));
+import { runGhSync } from '../gh-throttle.mjs';
 import {
   mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync, statSync, existsSync, utimesSync, symlinkSync, lstatSync, chmodSync,
 } from 'node:fs';
@@ -407,6 +410,8 @@ describe('overlay conflict resolution', () => {
 
     it('stops edge discovery for the run when a cached edge cannot be deleted', async () => {
       const f = conflictFixture();
+    // This edge-protocol fixture asserts zero unrelated remote discovery.
+    f.env.WE_OVERLAY_PRUNE = '0';
       seeded(f);
       const run = failing((args) => args[0] === 'update-ref' && args[1] === '-d' && args[2].includes('/edge/'));
       await rebuildClone({
@@ -473,6 +478,8 @@ describe('overlay conflict resolution', () => {
 
   it('fetches edges once, removes stale edges and wakes then clears the conflicting PR', async () => {
     const f = conflictFixture();
+    // This edge-protocol fixture asserts zero unrelated remote discovery.
+    f.env.WE_OVERLAY_PRUNE = '0';
     for (const o of f.overlays) addOverlay(f.cloneDir, o, { env: f.env });
     gitOk(f.cloneDir, ['update-ref', 'refs/remotes/origin/edge/lane/b', f.a]);
     const run = vi.fn(gitRun);
@@ -511,6 +518,8 @@ describe('overlay conflict resolution', () => {
 
   it('honors the disable env in rebuilds and previews without fetching edges', async () => {
     const f = conflictFixture({ replay: true });
+    // This edge-protocol fixture asserts zero unrelated remote discovery.
+    f.env.WE_OVERLAY_PRUNE = '0';
     f.env[OVERLAY_EDGE_RESOLVE_ENV] = '0';
     for (const o of f.overlays) addOverlay(f.cloneDir, o, { env: f.env });
     const run = vi.fn(gitRun);
@@ -539,6 +548,7 @@ const LOCK_OPTS = { waitMs: 2000, pollMs: 20 };
 
 beforeEach(() => {
   tempDirs.length = 0;
+  runGhSync.mockReturnValue('[]');
 });
 
 afterEach(() => {
@@ -723,7 +733,7 @@ describe('rebuildClone', () => {
 
   it('removes an overlay whose PR is MERGED', async () => {
     const { originDir, cloneDir, env } = makeFixture();
-    pushBranch(originDir, 'lane/merged-pr', (dir) => writeFile(dir, 'c.txt', 'hello c\n'));
+    const mergedTip = pushBranch(originDir, 'lane/merged-pr', (dir) => writeFile(dir, 'c.txt', 'hello c\n'));
     addOverlay(cloneDir, { ref: 'lane/merged-pr', pr: 42 }, { env });
 
     const runSmoke = passSmoke();
@@ -731,7 +741,8 @@ describe('rebuildClone', () => {
     const result = await rebuildClone({ root: cloneDir, env, runSmoke, prState, lockOpts: LOCK_OPTS });
 
     expect(readOverlays(cloneDir, { env })).toEqual([]);
-    expect(result.alerts.some((a) => a.kind === 'overlay-auto-dropped' && a.detail?.reason === 'pr-merged')).toBe(true);
+    const events = readFileSync(overlayFilePath(cloneDir, env).replace(/\.json$/, '.events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(events).toContainEqual(expect.objectContaining({ kind: 'overlay-pruned', ref: 'lane/merged-pr', reason: 'pr-merged', tip: mergedTip }));
     expect(existsSync(join(cloneDir, 'c.txt'))).toBe(false);
   });
 
@@ -2057,6 +2068,8 @@ describe('overlay list — concurrent add vs. a rebuild auto-remove (two real pr
 
   it('an add that lands while a rebuild is removing a merged overlay is never lost', async () => {
     const { originDir, cloneDir, env, base } = makeFixture();
+    // Exercise the legacy list-lock interleaving; child processes cannot inherit the inventory mock.
+    env.WE_OVERLAY_PRUNE = '0';
     pushBranch(originDir, 'lane/merged', (dir) => writeFile(dir, 'm.txt', 'm\n'));
     addOverlay(cloneDir, { ref: 'lane/merged', pr: 42 }, { env });
     // The overlay-conflict guard (epic #3383/#4075) now resolves `--ref` for real before registering it — a
@@ -2664,4 +2677,41 @@ describe('starved rebuild wait is bounded (live 2026-10-07: 900s waits starved t
     expect(DEFAULT_STARVED_LOCK_WAIT_MS).toBeLessThanOrEqual(180_000);
     expect(starvationLockWaitMs(60_000, 5, {})).toBeLessThanOrEqual(180_000);
   });
+});
+
+
+it('prepareRebuild prunes a closed overlay while retaining a live-PR overlay', async () => {
+  const f = makeFixture();
+  f.env.WE_OVERLAY_PRUNE = '1';
+  const closed = pushBranch(f.originDir, 'lane/closed', dir => writeFile(dir, 'closed.txt', 'closed\n'));
+  const live = pushBranch(f.originDir, 'lane/live', dir => writeFile(dir, 'live.txt', 'live\n'));
+  addOverlay(f.cloneDir, { ref: 'lane/closed', pr: 70 }, { env: f.env });
+  addOverlay(f.cloneDir, { ref: 'lane/live', pr: 71 }, { env: f.env });
+  runGhSync.mockReturnValue(JSON.stringify([{ number: 71, headRefName: 'lane/live', headRefOid: live }]));
+  const result = await rebuildClone({ root: f.cloneDir, env: f.env, runSmoke: passSmoke(),
+    prState: pr => pr === 70 ? 'CLOSED' : 'OPEN', lockOpts: LOCK_OPTS });
+  expect(readOverlays(f.cloneDir, { env: f.env }).map(o => o.ref)).toEqual(['lane/live']);
+  expect(result.adopted).toBe(true);
+  const events = readFileSync(overlayFilePath(f.cloneDir, f.env).replace(/\.json$/, '.events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  expect(events).toContainEqual(expect.objectContaining({ kind: 'overlay-pruned', ref: 'lane/closed', tip: closed }));
+  expect(events.some(e => e.kind === 'overlay-pruned' && e.ref === 'lane/live')).toBe(false);
+});
+
+
+it('prepareRebuild retains a conflicting overlay carried by the adopted build', async () => {
+  const f = makeFixture();
+  f.env.WE_OVERLAY_PRUNE = '1';
+  const tip = pushBranch(f.originDir, 'lane/adopted', dir => writeFile(dir, 'README.md', 'overlay\n'));
+  addOverlay(f.cloneDir, { ref: 'lane/adopted', pr: 0 }, { env: f.env });
+  const rebuild = () => rebuildClone({ root: f.cloneDir, env: f.env, runSmoke: passSmoke(), prState: () => null, lockOpts: LOCK_OPTS });
+  expect((await rebuild()).adopted).toBe(true);
+  advanceMain(f.originDir, dir => writeFile(dir, 'README.md', 'main conflicts\n'));
+  await rebuild(); await rebuild();
+  const result = await rebuild();
+  expect(readOverlays(f.cloneDir, { env: f.env })).toEqual([expect.objectContaining({ ref: 'lane/adopted' })]);
+  expect(result.reason).toBe('established-overlay-conflict');
+  expect(result.alerts.some(a => a.kind === 'overlay-pruned-adopted')).toBe(false);
+  const eventFile = overlayFilePath(f.cloneDir, f.env).replace(/\.json$/, '.events.jsonl');
+  const events = existsSync(eventFile) ? readFileSync(eventFile, 'utf8').trim().split('\n').map(JSON.parse) : [];
+  expect(events.some(e => e.kind === 'overlay-pruned' && e.tip === tip)).toBe(false);
 });

@@ -24,7 +24,7 @@ afterEach(() => {
 const run = (args, opts = {}) => spawnSync('git',
   ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', ...args],
   { encoding: 'utf8', timeout: 20_000, maxBuffer: 8 * 1024 * 1024, ...opts,
-    env: { ...process.env, ...opts.env } });
+    env: { ...process.env, WE_OVERLAY_PRUNE: '0', ...opts.env } });
 const ok = (cwd, args) => {
   const result = run(args, { cwd });
   if (result.status !== 0) throw new Error(`${args}: ${result.stderr}`);
@@ -59,7 +59,7 @@ function fixture({ reruns } = {}) {
   ok(root, ['remote', 'add', 'origin', origin]);
   ok(root, ['update-ref', 'refs/remotes/origin/main', mainSha]);
   ok(root, ['update-ref', `refs/remotes/origin/${ref}`, oldSha]);
-  const env = { ...process.env, TMPDIR: base, WE_DAEMON_OVERLAY_DIR: join(base, 'overlays'),
+  const env = { ...process.env, WE_OVERLAY_PRUNE: '0', TMPDIR: base, WE_DAEMON_OVERLAY_DIR: join(base, 'overlays'),
     WE_DAEMON_STATE_DIR: join(base, 'state'), WE_DAEMON_EVENTS: join(base, 'daemon-events.jsonl'),
     WE_NEEDS_YOU_FEED: join(base, 'needs-you-events.jsonl'),
     WE_PLATFORM_PREFERENCES_FILE: join(base, 'missing'), WE_DAEMON_OVERLAY_MAIN_SYNC: 'on' };

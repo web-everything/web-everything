@@ -1,4 +1,5 @@
 /** Clean-only main merges into registered overlay tops, isolated from daemon working trees. */
+import { pruneOverlays } from './overlay-prune.mjs';
 import * as fs from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { dirname, join, resolve, isAbsolute } from 'node:path';
@@ -338,6 +339,7 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
   if (!validMode(mode)) throw new Error('invalid overlay main sync mode');
   const result = { started: [], skipped: [], would: [] };
   if (mode === 'off') return result;
+  (deps.pruneOverlays ?? pruneOverlays)({ root, env, dryRun: mode === 'shadow', deps: { countConflicts: false } });
   const run = args => retryGit(git, args, { cwd: root, env }, deps);
   const registrations = readOverlayState(root, { env });
   for (const ref of selectSyncTargets(registrations)) {

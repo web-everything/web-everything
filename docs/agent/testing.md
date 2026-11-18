@@ -4441,3 +4441,56 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+
+## Stale overlay prune
+
+`daemon-rebuild/overlay-prune.mjs` runs after the rebuild fetch and before planning, so ancestry
+and conflict probes use the fetched tips. Ready-only and main-only rebuilds skip it. Main-sync
+runs it before selecting registrations (off skips it; shadow previews only). `overlayPrune.enabled`
+defaults on through the policy cascade; `WE_OVERLAY_PRUNE=0` disables it. The effective setting
+and source are logged. `node scripts/daemon-overlay.mjs prune --clone=<path> --dry-run --json`
+previews the candidates without writing counters, events, registrations, or locks.
+
+Only rebuilds increment the consecutive-conflict counter in `<overlay-file>.prune-state`.
+Counts cap at three, reset on clean/unknown evidence, and disappear when unregistered.
+Sidecar records bind each count to its tip and `registrationIdentity` (excluding the mutable
+`stackBases` cache). Tip/identity changes and legacy ref-only counts reset to zero.
+The third-audit regressions cover both resets, historical sidecars, and cache-only updates.
+Unknown ancestry against any registered overlay or open PR head blocks every prune rule.
+Running-build first-parent overlay merge records and the matching adopted state protect
+all recorded tips of a ref even after it moves, except for confirmed merged PRs.
+Supersession passes `requireRef` and the survivor identity to removal; both are checked
+inside the list mutex while pruning holds the add guard. Missing or re-registered
+survivors retain the ancestor, as exercised by the removal-time race regressions.
+Counter reads use own properties: prototype-named refs such as `constructor` start at zero
+when absent. The named prototype-ref regression checks valid sidecars across repeated runs
+and confirms an unrelated registration can still reach its prune threshold.
+A live PR always retains its overlay; unknown numbered PR state retains it too. Failed or
+incomplete open-PR discovery disables ancestry/conflict pruning. The 1000-head inventory
+bound and the 100-registration per-invocation bound alert for manual registration inspection rather than treating a truncated list as complete.
+Supersession evidence must point directly to a retained overlay or live PR head. A successor
+also selected for pruning cannot justify removing its ancestor; without another retained
+successor, keep the ancestor. The named ancestor/successor regression covers closed, merged,
+and repeated-conflict removal, and the chain regression checks the retained evidence target.
+Pins use the planner’s shared `pinnedStatus`: explicit, mechanism-derived, and unknown-evidence
+pins are retained. The moved `overlay-registration.mjs` guards remain mechanism-protected.
+An overlay whose current tip is carried by the running adopted head is retained for every rule
+except `pr-merged`, including dry-run output; standalone pruning also verifies the adopted head
+against HEAD. Approved `edgeResolution`/`conflictOverride` entries are retained during supersession.
+Confirmed closed/merged PRs can otherwise still be pruned. Corrupt counters or pending drops retain all
+registrations and alert for operator repair/recovery. Pruning takes the existing add-guard fence,
+refuses unsettled drop intents, and uses the rebuild's list-locked removal helper with the observed
+registration identity. `overlay-prune.test.mjs` covers these closed paths with injected IO and no network.
+
+
+### Overlay pruning uses the registration drop protocol
+
+`overlay-prune` shares `overlay-registration.mjs` with the overlay CLI: an add-guard lock,
+a durable drop intent, and current remote tip checks before and after removal. The synchronous
+main-sync kicker uses the guard's no-wait mode and retains registrations on contention. Recover
+interrupted drops with `daemon-overlay recover-drops`; unknown or moved tips restore the full snapshot
+under the list lock, preserving resolution approvals, pin flags, stack bases, and future registration
+fields without replacing a fresh registration.
+Prune tests must retain pinned overlays and unregistered-PR carriers, and check adopted-tip alerts
+at preparation level. Keep the open-PR inventory hermetic rather than disabling pruning across fixtures.
