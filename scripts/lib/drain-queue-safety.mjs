@@ -829,6 +829,8 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
           freezeProven = holds.length === 1
             && /^\S+\s+(?:hold\s{2,}red-main-freeze\s+main is RED \(freeze:|fail-closed\s{2,}red-main-freeze\s+red-main freeze unreadable: main CI run ([1-9][0-9]*) is being re-run \(attempt ([1-9][0-9]*)\) — verdict pending\s*$)/.test(holds[0]);
           freezePending = freezeProven && /fail-closed/.test(holds[0]);
+          // A freeze row that is not the sole proven blocking row is unproven main blame: no main-red fallback.
+          if (!freezeProven && holds.some(line => /\sred-main-freeze\s/.test(line))) blocked = true;
           if (freezeProven && !freezeLogComplete(log, pr, freezePending ? 'fail-closed' : 'hold')) { freezeProven = freezePending = false; blocked = true; }
           if (freezeProven) {
             // Bind the log to the expected merge_group run: workflow "Merge gate", job merge-gate, the merge-group commit.

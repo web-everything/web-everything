@@ -155,6 +155,11 @@ describe('same-head MQ ejection caused by a red-main freeze or cancelled shards 
     expect(f.guard().hold).toBe(true);
   });
 
+  it('holds a second hold next to the freeze even when main was red at removal and is green now (no main-red fallback)', () => {
+    const f = fixture([gate(`${FREEZE}\n2026-11-11T21:02:23Z   hold              required-checks        test red`), shard(1)], redAtRemoval);
+    expect(f.guard().hold).toBe(true);
+  });
+
   it('still holds a merge-gate whose log does not show the freeze hold', () => {
     const f = fixture([gate('not a gate log'), shard(1)], greenAtRemoval);
     expect(f.guard().hold).toBe(true);
