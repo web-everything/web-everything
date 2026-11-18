@@ -192,7 +192,7 @@ describe('abandoned builder draft recovery', () => {
         + '2026-09-30T01:00:11Z failed step\n##[error]AssertionError: Done-when 2\nsummary' },
     // Past even the helper's 16 MiB bound the log is unreadable: the draft keeps the published
     // diagnostic and is still resumed, instead of the throw aborting recovery of every draft.
-    { evidence: 'a whole-job log over the 16 MiB helper bound', metadata: { steps }, expectedError: noDetail,
+    { evidence: 'a whole-job log over the 16 MiB helper bound', metadata: { steps }, expectedError: noDetail, logUnreadable: true,
       log: `2026-09-30T01:00:11Z failed step ##[error]${'x'.repeat(16 * 1024 * 1024)}\n` },
     { evidence: 'missing step metadata', metadata: {}, expectedError: noDetail },
     { evidence: 'published check detail', metadata: {}, summary: 'AssertionError: failed check summary', expectedError: 'AssertionError: failed check summary' },
@@ -205,7 +205,7 @@ describe('abandoned builder draft recovery', () => {
   ];
   // A literal-titled `it(` opener per row (not `it.each`) keeps the merge-gate's test-case counter honest: it
   // only counts string-titled openers, so an `it.each` rewrite of one case reads as a net removal.
-  for (const { evidence, metadata, summary, expectedError, log } of evidenceCases) it(`keeps earlier passing-step errors out of dispatch and comments with ${evidence}`, async () => {
+  for (const { evidence, metadata, summary, expectedError, log, logUnreadable } of evidenceCases) it(`keeps earlier passing-step errors out of dispatch and comments with ${evidence}`, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'builder-draft-'));
     const row = { type: 'conveyor.dispatch-delivery-agent', handle: 'pid:99999', lastSeenLiveAt: candidate.authorLastSeenLiveAt,
       payload: { launchKind: 'build', num: '4502' }, result: { pr: 3033 }, status: 'applied' };
@@ -260,7 +260,9 @@ describe('abandoned builder draft recovery', () => {
       expect(io.gh).toHaveBeenCalledWith(['pr', 'edit', '3033', '--repo', 'web-everything/web-everything', '--add-label', 'blocked:needs-human']);
       expect(io.gh).toHaveBeenCalledWith(['pr', 'comment', '3033', '--repo', 'web-everything/web-everything', '--body', expect.stringContaining(`First error: ${expectedError}`)]);
       expect(io.api).toHaveBeenCalledWith('commits/abc');
-      expect(io.api).toHaveBeenCalledWith('actions/jobs/456');
+      // Step metadata only attributes a readable log; an unreadable one keeps the published diagnostic.
+      if (logUnreadable) expect(io.api).not.toHaveBeenCalledWith('actions/jobs/456');
+      else expect(io.api).toHaveBeenCalledWith('actions/jobs/456');
       expect(io.gh).toHaveBeenCalledWith(['api', '--allow-escape-sequences', 'repos/web-everything/web-everything/actions/jobs/456/logs'],
         expect.objectContaining({ encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024 }));
       expect(io.dispatch).toHaveBeenCalledWith(expect.objectContaining({ failure: { name: 'test-shard (2)', firstError: expectedError } }));

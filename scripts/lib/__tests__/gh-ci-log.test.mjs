@@ -20,7 +20,9 @@ describe('raw CI job log transport', () => {
     const exec = vi.fn(asynchronous ? async () => raw : () => raw);
     const opts = { encoding: 'utf8', timeout: 1000, maxBuffer: 4096 };
     expect(await readCiJobLog({ path, exec, opts })).toEqual({ ok: true, text: raw, filtered: false });
-    expect(exec).toHaveBeenCalledWith('gh', ['api', '--allow-escape-sequences', path], opts);
+    // Caller opts win key by key; the default stdio bound the caller did not name still reaches gh.
+    expect(exec).toHaveBeenCalledWith('gh', ['api', '--allow-escape-sequences', path],
+      { ...opts, stdio: ['ignore', 'pipe', 'pipe'] });
   });
   it.each([false, true])('reads escape-coded logs without stripping bytes (async=%s)', async async => {
     const raw = '\x1b[31mFAIL\x1b[0m\n';
