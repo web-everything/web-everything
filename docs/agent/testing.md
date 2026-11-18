@@ -4605,3 +4605,15 @@ publishing. Keep the real local-remote unpublished-head regression (the remote m
 object), the consumer's separate missing-head fetch, and the failed missing-head refusal.
 Only a missing local commit triggers the bounded second fetch; preserve the verified base's
 FETCH_HEAD with `--no-write-fetch-head` and never retry the base fetch.
+
+Real-drain CLI fixtures must model that pinned boundary too: full head commit IDs,
+Git's leading `-c key=value` options, distinct base/head identities, matching tracking-ref
+and FETCH_HEAD reads, and numstat plus content for the declared PR files. A shim that
+returns empty output for a pinned command correctly causes a hold, not a merge attempt.
+Keep the merge-failure-isolation regression proving an unreadable diff holds only that PR
+while a scored peer lands and the pass exits successfully. Preserve original argv in fixture
+logs so shadow/off comparisons still detect extra GitHub calls.
+
+For long subprocess-heavy selections, pass heavy-admission `--kind=FULL` with a bounded
+`--run-ceiling-ms`: the `files` kind retains its shorter fast-run timeout even when a larger
+run ceiling is supplied (the effective bound is the smaller timeout).
