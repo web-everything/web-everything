@@ -140,22 +140,21 @@ it('inventories every conveyor launch and requires an exiting runtime refusal be
       .filter(f => /^build-dispatch-.*\.mjs$/.test(f)).map(f => `scripts/conveyor/${f}`)];
   let count = 0;
   for (const file of scopedScanFiles(files)) {
-    // dispatch-lane IO admits at `provider(payload)`, before choosing a mechanical or agent
-    // implementation. Its raw exec helpers also serve read-only planner calls and trust retries;
-    // they are implementations of that port, not additional conveyor admission boundaries.
+    // defaultRunNode only reads the tick planner (readTick -> tickCli); it never launches a worker.
+    // defaultSpawnAgent's exec must be guarded independently, including its trust retry.
     const result = scan(readFileSync(`${root}/${file}`, 'utf8'), {
-      delegatedExecHelpers: file === 'scripts/operations/dispatch-lane-io.mjs'
-        ? ['defaultRunNode', 'defaultSpawnAgent'] : [],
+      delegatedExecHelpers: file === 'scripts/operations/dispatch-lane-io.mjs' ? ['defaultRunNode'] : [],
     });
     count += result.sites.length;
     expect(result.bypasses, file).toEqual([]);
   }
   if (!process.env.VERIFY_SCAN_FILES) expect(count).toBeGreaterThan(10);
 });
-it('inventories the provider boundary rather than its generic exec helpers', () => {
+it('exempts only the read-only planner helper and scans the agent exec helper', () => {
   const source = `function defaultRunNode(argv) { return exec(process.execPath, argv); }
     function run(payload) { return provider(payload); }`;
-  const options = { delegatedExecHelpers: ['defaultRunNode', 'defaultSpawnAgent'] };
+  const options = { delegatedExecHelpers: ['defaultRunNode'] };
+  expect(scan(`function defaultSpawnAgent(argv) { return exec('claude', argv); }`, options).bypasses).toHaveLength(1);
   expect(scan(source, options).bypasses).toEqual([{ call: 'provider', line: 2 }]);
   expect(scan(`function run(card, argv) { return exec(process.execPath, argv); }`, options).bypasses).toHaveLength(1);
   expect(scan(`function run(card, argv) { return exec(process.execPath, argv); }`).bypasses).toHaveLength(1);

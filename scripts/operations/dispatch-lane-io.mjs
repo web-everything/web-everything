@@ -1506,7 +1506,7 @@ export function releaseReservedLane(reservation, { run = execFileSync, root = RE
 export function createDispatchSinks({
   root = REPO_ROOT,
   exec = execFileSync,
-  spawnAgent = (argv, opts) => defaultSpawnAgent(argv, opts, { exec }),
+  spawnAgent = (argv, opts, card) => defaultSpawnAgent(argv, opts, { exec, card, readRuntimeSettings }),
   // #3645/#3906 — EVERY REGISTERED KIND'S MODE, read from the environment ONCE, here, at sink-construction
   // time rather than per dispatch, so one tick cannot straddle two modes. Every row defaults to `agent` on main
   // (see `dispatch-provider-registry.mjs`), so an unset environment keeps every kind on `claude --bg`.
@@ -1978,7 +1978,7 @@ export function routeDispatchProvider(request, {
  * @returns {string}
  */
 export function defaultClaudeProvider(request, {
-  spawnAgent = (argv, opts) => defaultSpawnAgent(argv, opts),
+  spawnAgent = (argv, opts, card) => defaultSpawnAgent(argv, opts, { card }),
   // 117 S3b (D7 FINAL) — a fix / ci-heal launched here runs to completion through the detached worker wrapper instead
   // of `claude --bg` (same argv, `-p` + `--json-schema`, a v2 completion record). `false` keeps the old spawn exactly.
   wrapKind = (kind) => WRAPPABLE_LAUNCH_KINDS.includes(kind) && workerWrapperEnabledFor(kind),
@@ -2049,7 +2049,7 @@ export function defaultClaudeProvider(request, {
     // `pid:<wrapper>` is the detached-handle shape the run store and liveness already read (route `detached`).
     return launched.handle || request.sessionId;
   }
-  const stdout = String(spawnAgent(argv, request.spawnEnv ? { cwd: request.cwd, env: request.spawnEnv } : { cwd: request.cwd }) ?? '');
+  const stdout = String(spawnAgent(argv, request.spawnEnv ? { cwd: request.cwd, env: request.spawnEnv } : { cwd: request.cwd }, request) ?? '');
   return parseBackgroundedId(stdout) || request.sessionId;
 }
 
@@ -2076,11 +2076,11 @@ export const WRAPPABLE_LAUNCH_KINDS = Object.freeze(['fix', 'ci-heal']);
  *
  * @param {string[]} argv
  * @param {object} [opts]
- * @param {{exec?: Function, grantTrust?: (dir: string) => void}} [io] - injected ONLY so the opts (and the
+ * @param {{exec?: Function, grantTrust?: (dir: string) => void, card?: object, readRuntimeSettings?: Function}} [io] - admission identity/settings and injected opts (and the
  *   retry) can be asserted.
  * @returns {string}
  */
-export function defaultSpawnAgent(argv, opts = {}, { exec = execFileSync, grantTrust = grantDispatchTrust } = {}) {
+export function defaultSpawnAgent(argv, opts = {}, { exec = execFileSync, grantTrust = grantDispatchTrust, card = {}, readRuntimeSettings } = {}) {
   const execOpts = {
     encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: SPAWN_TIMEOUT_MS, killSignal: 'SIGKILL',
     // #x8mpubm follow-up (live-caught 2026-09-24) — this call inherits `process.env` unless told otherwise,
@@ -2097,12 +2097,28 @@ export function defaultSpawnAgent(argv, opts = {}, { exec = execFileSync, grantT
     // GH_TOKEN env `sanitizeSpawnEnv` returns is what gets marked, so neither guard undoes the other's work.
     env: markWorkerEnv(sanitizeSpawnEnv(opts.env || process.env)),
   };
-  try {
+  const launchAttempt = () => {
+    // Every attempt, including the trust retry, reads fresh admission for the entire group.
+    const runtimeRefused = [];
+    const admission = assertRuntimeAdmitted(card, card.launchKind ?? 'build', { readSettings: readRuntimeSettings });
+    if (!admission.admitted) runtimeRefused.push({ num: String(card.num), kind: card.launchKind ?? 'build', reason: admission.reason });
+    const groupMembers = card.groupMembers ?? [];
+    const allMembersAdmitted = groupMembers.map(member => {
+      const kind = card.launchKind?.startsWith('prepare') ? 'prepare' : 'build';
+      const admission = assertRuntimeAdmitted({ num: member }, kind, { readSettings: readRuntimeSettings });
+      if (!admission.admitted) runtimeRefused.push({ num: String(member), kind, reason: admission.reason });
+      return admission.admitted;
+    }).every(Boolean);
+    if (!admission.admitted) throw notApplied(admission.reason, { outcome: 'runtime-refused', runtimeRefused });
+    if (!allMembersAdmitted) throw notApplied('runtime admission refused group', { outcome: 'runtime-refused', runtimeRefused });
     return exec('claude', argv, execOpts);
+  };
+  try {
+    return launchAttempt();
   } catch (e) {
     if (!opts.cwd || !isTrustRefusal(e)) throw e;
     try { grantTrust(opts.cwd); } catch { /* grantDispatchTrust itself never throws; belt-and-suspenders */ }
-    return exec('claude', argv, execOpts);
+    return launchAttempt();
   }
 }
 

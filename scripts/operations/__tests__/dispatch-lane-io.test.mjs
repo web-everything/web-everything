@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createTickReader, createDispatchSinks, reserveBuildLane, resolveDispatchSettingsEnv, DISPATCH_BASH_TIMEOUT_ENV } from '../dispatch-lane-io.mjs';
+import { createTickReader, createDispatchSinks, defaultSpawnAgent, defaultClaudeProvider, reserveBuildLane, resolveDispatchSettingsEnv, DISPATCH_BASH_TIMEOUT_ENV } from '../dispatch-lane-io.mjs';
 import { spawnPreventionLandingJob } from '../../lib/prevention-landing-job.mjs';
 import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
 import { shapeDispatchRead, DISPATCH_EFFECT } from '../dispatch-lane.mjs';
@@ -239,6 +239,100 @@ describe('x87v3ed — the build launch reserves its lane first', () => {
       await sinks[DISPATCH_EFFECT]({ ...payload, num: '12', launchKind, groupMembers: ['13'] });
       expect(provider).toHaveBeenCalledOnce();
       expect(releaseLane).not.toHaveBeenCalled();
+    });
+  });
+  it('passes the sink settings reader and card identity into the default raw spawn', async () => {
+    const readRuntimeSettings = vi.fn(() => ({ mode: 'only', only: true, ids: ['12'] }));
+    const exec = vi.fn(() => {
+      expect(readRuntimeSettings).toHaveBeenCalledTimes(3);
+      return 'backgrounded · handle-12 · n';
+    });
+    const sinks = baseSinks({ exec, modes: { build: 'agent' }, readRuntimeSettings,
+      reserveLane: () => ({ reserved: true }),
+    });
+    await sinks[DISPATCH_EFFECT]({ ...payload, num: '12' });
+    expect(exec).toHaveBeenCalledOnce();
+  });
+  describe.each(['build', 'prepare-item'])('%s trust retry admission', launchKind => {
+    it.each([
+      ['lead revoked', ['13']], ['member revoked', ['12']], ['all revoked', []],
+      ['settings unreadable', null], ['still admitted', ['12', '13']],
+    ])('%s after the first attempt', async (_name, nextIds) => {
+      let ids = ['12', '13'];
+      const readRuntimeSettings = vi.fn(() => {
+        if (ids === null) throw new Error('unreadable');
+        return { mode: 'only', only: true, ids };
+      });
+      const exec = vi.fn(() => {
+        if (exec.mock.calls.length === 1) {
+          ids = nextIds;
+          throw Object.assign(new Error('trust refusal'), { stderr: 'Workspace not trusted.' });
+        }
+        return 'retry-handle';
+      });
+      const grantTrust = vi.fn();
+      const reservation = { reserved: true, lane: 2, session: 'conveyor-12' };
+      const leases = new Set();
+      const releaseLane = vi.fn(r => leases.delete(r));
+      // Group-capable provider exercises the same guarded spawn helper as the default agent provider.
+      const provider = request => defaultSpawnAgent(['--bg'], { cwd: request.cwd }, {
+        exec, grantTrust, card: request, readRuntimeSettings,
+      });
+      const sinks = baseSinks({ provider, releaseLane, readRuntimeSettings,
+        reserveLane: () => { leases.add(reservation); return reservation; },
+      });
+      const run = { v: 1, id: 'trust-retry', op: 'dispatch-lane', input: { num: '12' },
+        cursor: 2, findings: {}, verdict: null, telemetry: [], pending: { kind: 'effect', stepIndex: 2, step: 'dispatch' },
+        effects: [{ key: 'trust-retry#2#0', stepIndex: 2, index: 0, type: DISPATCH_EFFECT,
+          status: 'declared', dispatch: true, idempotent: false,
+          payload: { ...payload, num: '12', launchKind, groupMembers: ['13'] } }],
+      };
+      const store = createMemoryRunStore();
+      const result = await applyPendingEffects(run, { sinks, store });
+      expect(grantTrust).toHaveBeenCalledTimes(1);
+      expect(grantTrust).toHaveBeenCalledWith('/tmp/scratch');
+      expect(readRuntimeSettings).toHaveBeenCalledTimes(8);
+      const admitted = nextIds?.length === 2;
+      expect(exec).toHaveBeenCalledTimes(admitted ? 2 : 1);
+      if (admitted) {
+        expect(result.error).toBeNull();
+        expect(releaseLane).not.toHaveBeenCalled();
+        expect(leases.size).toBe(1);
+      } else {
+        const refused = ['12', '13'].filter(num => !nextIds?.includes(num)).map(num => ({
+          num, kind: num === '12' ? launchKind : launchKind.startsWith('prepare') ? 'prepare' : 'build',
+          reason: nextIds === null ? 'runtime-malformed' : 'runtime-only',
+        }));
+        expect(result.error).toMatchObject({ notApplied: true, outcome: 'runtime-refused', runtimeRefused: refused });
+        expect(releaseLane).toHaveBeenCalledTimes(1);
+        expect(releaseLane).toHaveBeenCalledWith(reservation);
+        expect(leases.size).toBe(0);
+        expect(result.inFlight).toEqual([]);
+        expect(store.read(run.id).effects[0]).toMatchObject({ status: 'failed', handle: null });
+        expect(inFlightEntries(store.read(run.id))).toMatchObject({ running: [], overdue: [], unknown: [] });
+      }
+    });
+    it('forwards admission identity through the default provider to each raw launch attempt', async () => {
+      let ids = ['12'];
+      const exec = vi.fn(() => {
+        ids = [];
+        throw Object.assign(new Error('trust refusal'), { stderr: 'Workspace not trusted.' });
+      });
+      const releaseLane = vi.fn();
+      const readRuntimeSettings = () => ({ mode: 'only', only: true, ids });
+      const sinks = baseSinks({ exec, releaseLane, readRuntimeSettings,
+        reserveLane: () => ({ reserved: true }),
+        // Exercise defaultClaudeProvider's identity forwarding without touching the real trust file.
+        provider: request => defaultClaudeProvider(request, { wrapKind: () => false,
+          spawnAgent: (argv, opts, card) => defaultSpawnAgent(argv, opts, {
+            exec, card, readRuntimeSettings, grantTrust: () => {},
+          }),
+        }),
+      });
+      await expect(sinks[DISPATCH_EFFECT]({ ...payload, num: '12', launchKind }))
+        .rejects.toMatchObject({ outcome: 'runtime-refused' });
+      expect(exec).toHaveBeenCalledOnce();
+      expect(releaseLane).toHaveBeenCalledOnce();
     });
   });
   it('reserves lane N under the worker\'s own session slug', () => {
