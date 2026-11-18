@@ -1476,6 +1476,7 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
   const sidOf = (argv) => flagValue(argv, '--session-id');
 
   const genericFailure = { type: 'error', error: 'transient failure' };
+  const malformedLine = '{"type":"error","message":"private-juror-content';
   const spendingFailures = [
     ['budget', { type: 'result', is_error: true, stop_reason: 'tool_use', total_cost_usd: 0.596, result: '' }],
     ['quota', { type: 'result', is_error: true, result: "You've hit your weekly limit · resets tomorrow" }],
@@ -1521,6 +1522,50 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
       else expectSpendingFailure(error, kind);
       expect(spawns).toBe(1);
     });
+
+  it.each(spendingFailures.flatMap(([kind, failure]) => ['before', 'after'].map(position => [kind, position, failure])))
+    ('preserves %s metadata and never retries with a malformed line %s', async (kind, position, failure) => {
+      const line = JSON.stringify(failure);
+      const stdout = position === 'before' ? `${malformedLine}\n${line}` : `${line}\n${malformedLine}`;
+      const { fn, calls } = scriptedSpawn([{ stdout, code: 1 }, { stdout: ANSWER_JSON, code: 0 }]);
+      const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID,
+        budget: 0.5, retries: 1, log: () => {}, spawnFn: fn }).catch(e => e);
+      expectSpendingFailure(error, kind);
+      expect(calls).toHaveLength(1);
+    });
+
+  it.each([...spendingFailures, ['malformed-only', null]])
+    ('ranks %s with malformed output against timeout without retrying', async (kind, failure) => {
+      let spawns = 0;
+      const spawnFn = () => {
+        spawns += 1;
+        let close;
+        return {
+          stdout: { on: (event, cb) => { if (event === 'data') cb(`${malformedLine}\n${JSON.stringify(failure)}`); } },
+          stderr: { on: () => {} }, stdin: { on: () => {}, end: () => {} },
+          on: (event, cb) => { if (event === 'close') close = cb; },
+          kill: () => { close(null, 'SIGKILL'); },
+        };
+      };
+      const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID,
+        budget: 0.5, timeoutMs: 5, retries: 1, log: () => {}, spawnFn }).catch(e => e);
+      if (kind === 'malformed-only') expect(error).toBeInstanceOf(JudgeTimeoutError);
+      else expectSpendingFailure(error, kind);
+      expect(spawns).toBe(1);
+    });
+
+  it('retries malformed-only output and retains its redacted failure reason', async () => {
+    const { fn, calls } = scriptedSpawn([
+      { stdout: malformedLine, code: 1 }, { stdout: ANSWER_JSON, code: 0 },
+    ]);
+    const result = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID,
+      retries: 1, log: () => {}, spawnFn: fn });
+    expect(calls).toHaveLength(2);
+    expect(result.attempts).toBe(2);
+    expect(result.value).toEqual({ verdict: 'accept', findings: [] });
+    expect(result.failedAttempts[0].reason).toMatch(/malformed JSON object line.*content redacted/);
+    expect(result.failedAttempts[0].reason).not.toContain('private-juror-content');
+  });
 
   it('retries a generic-only error stream and returns the next successful verdict', async () => {
     const { fn, calls } = scriptedSpawn([

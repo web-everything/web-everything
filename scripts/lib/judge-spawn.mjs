@@ -721,6 +721,7 @@ function markQuotaFailure(error, text) {
  */
 export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
   let parsed;
+  let malformedError;
   const events = [];
   try {
     parsed = JSON.parse(String(stdout));
@@ -740,20 +741,10 @@ export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
           const error = new Error('judge-spawn: the juror did not emit parseable JSON: malformed JSON object line on stdout (content redacted); no verdict.');
           error.unparseableStdout = true;
           error.verdictIntegrity = true;
-          throw error;
+          malformedError ??= error;
         }
         // Plain stdout log lines are not result objects.
       }
-    }
-    if (parsed === undefined) {
-      const tail = String(stderr).trim().slice(-600);
-      const err = new Error(
-        `judge-spawn: the juror did not emit parseable JSON on stdout.\n` +
-        `stdout[0..600]: ${String(stdout).slice(0, 600)}\n` +
-        (tail ? `stderr[-600..]: ${tail}` : 'stderr: <empty>'),
-      );
-      err.unparseableStdout = true;
-      throw err;
     }
   }
 
@@ -765,6 +756,9 @@ export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
     && ((event.stop_reason === 'tool_use' && budget !== null)
       || (typeof event.result === 'string' && quotaHoldRow({ provider: 'claude', error: event.result }))) ? 1 : 0;
   const failure = failures.reduce((worst, event) => priority(event) > priority(worst) ? event : worst, failures[0]);
+  // Inspect the whole stream before choosing a failure. Spending-limit evidence outranks malformed
+  // output; judgeSpawn then ranks either result against its wall-clock timeout before considering retries.
+  if (malformedError && priority(failure) === 0) throw malformedError;
   if (failure) {
     if (failure.is_error) parsed = failure; // Preserve CLI and budget diagnostics below.
     else {
@@ -773,6 +767,17 @@ export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
       error.verdictIntegrity = true;
       throw error;
     }
+  }
+
+  if (parsed === undefined) {
+    const tail = String(stderr).trim().slice(-600);
+    const err = new Error(
+      `judge-spawn: the juror did not emit parseable JSON on stdout.\n` +
+      `stdout[0..600]: ${String(stdout).slice(0, 600)}\n` +
+      (tail ? `stderr[-600..]: ${tail}` : 'stderr: <empty>'),
+    );
+    err.unparseableStdout = true;
+    throw err;
   }
 
   if (parsed?.is_error) {
