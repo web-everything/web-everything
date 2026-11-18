@@ -645,9 +645,9 @@ export function planNeedsHumanVoid({ note, pr, repo, verdictSettings, readRequir
  * card xiqtf7w — the supersede half: per repo, hold (stand down + label) every open PR a merged PR declares it
  * supersedes. Runs BEFORE the fix/ci-heal halves so the hold is on the thread before they plan. Never throws.
  */
-export function runSupersedeAllRepos({ resolveProfile = repoProfile, repos = reposWith('review', resolveProfile), tick = runSupersedeWatch, ...tickOpts } = {}) {
-  return { repos: [...eligibleRepos(repos, 'review', resolveProfile)].map((repo) => {
-    try { return tick({ ...tickOpts, repo }); } catch (e) { return { repo, holds: [], applied: [], error: String(e?.message || e).split('\n')[0] }; }
+export function runSupersedeAllRepos({ resolveProfile = repoProfile, repos = reposWith('fix', resolveProfile), tick = runSupersedeWatch, ...tickOpts } = {}) {
+  return { repos: [...eligibleRepos(repos, 'fix', resolveProfile)].map((repo) => {
+    try { return tick({ ...tickOpts, repo, resolveProfile, forFixDispatch: true }); } catch (e) { return { repo, holds: [], applied: [], error: String(e?.message || e).split('\n')[0] }; }
   }) };
 }
 

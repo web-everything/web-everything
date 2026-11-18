@@ -3814,7 +3814,7 @@ export function resolveRepos({ repos, singleRepo, self: rawSelf, resolveProfile 
   const owner = self && self.includes('/') ? self.split('/')[0] : null;
   if (!owner) return [null]; // can't derive the constellation without an owner → stay single-repo (safe)
   const slugs = CONSTELLATION_REPO_NAMES.map((n) => `${owner}/${n}`);
-  return [...new Set([self, ...slugs.filter((s) => s !== self)])]; // self first (the local clone), then the rest
+  return [...new Set([self, ...slugs.filter((s) => s !== self)])].filter(reviewEnabled); // self first (the local clone), then the rest
 }
 
 /**

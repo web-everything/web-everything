@@ -1497,3 +1497,10 @@ it('filters explicit lander repos and refuses a disabled single-repo drain', () 
   }
   expect(resolveRepos({ self: 'outside/repo', singleRepo: true, resolveProfile })).toEqual([null]);
 });
+
+it('filters review-disabled self and derived repos in the owner-times-names fallback', () => {
+  const resolveProfile = repo => ['acme/fork', 'acme/frontierui'].includes(repo)
+    ? { capabilities: { review: false } } : capabilityProfile(repo);
+  expect(resolveRepos({ self: 'acme/fork', resolveProfile })).toEqual(['acme/web-everything', 'acme/plateau-app']);
+  expect(resolveRepos({ self: 'acme/web-everything', resolveProfile })).toEqual(['acme/web-everything', 'acme/plateau-app']);
+});
