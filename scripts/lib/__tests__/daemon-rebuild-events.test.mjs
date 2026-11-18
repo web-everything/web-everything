@@ -78,6 +78,14 @@ describe('rebuildClone coordination events', () => {
     expectEvent('rebuild-adopted', { sha });
   });
 
+  it('preserves the typed partial-adoption alert alongside the adoption event', async () => {
+    const partial = { kind: 'ready-candidate-adopted-partial', detail: { target: sha, pending: ['lane/pending'] } };
+    const result = { moved: true, adopted: true, reason: 'ready-adopted', head: sha };
+    prepareRebuild.mockReturnValue({ terminal: true, result, alerts: [partial] });
+    expect(await rebuildClone(options)).toEqual({ ...result, alerts: [partial] });
+    expectEvent('rebuild-adopted', { sha });
+  });
+
   it('emits overlay-adopted from the rebuild path when a pending overlay sha is in the clone HEAD', async () => {
     const { execFileSync } = await import('node:child_process');
     const { recordPendingAdoption } = await import('../overlay-adoption.mjs');
