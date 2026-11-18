@@ -32,7 +32,7 @@ import { runScenario, scenario } from '../__tests__/sim/scenario.mjs';
 import { cloneFacts, checkTick, explainNoDispatch, formatTickLine, DEFAULT_BOUNDS, OWED_KIND_DAEMON, sessionMatches } from './invariants.mjs';
 import { seededRandom, stepBehaviours } from './behaviours.mjs';
 import { openChurnPr, seedDefaultFleet } from './fleet.mjs';
-import { advanceMsForRound } from './round-clock.mjs';
+import { createRoundClock } from './round-clock.mjs';
 
 /** In-process daemon kind → its module in the clone (for the daemon's OWN `hasStaleMainRefusal`). */
 const DAEMON_MODULES = Object.freeze({
@@ -160,9 +160,9 @@ export async function runSoak({
   }
 
   const play = [];
-  // `pinRoundClock`: the wall-clock instant the previous round ended (round 0 counts from the first play step).
-  let lastRoundEndAt = null;
-  play.push(() => { lastRoundEndAt = Date.now(); });
+  // `pinRoundClock`: round 0 is timed from the first play step; see `round-clock.mjs`.
+  let roundClock = null;
+  play.push((w) => { roundClock = pinRoundClock ? createRoundClock(w.clock) : null; roundClock?.begin(); });
   for (let round = 0; round < rounds; round += 1) {
     if (mainEvery > 0 && round > 0 && round % mainEvery === 0) {
       play.push((w) => {
@@ -194,11 +194,8 @@ export async function runSoak({
       if (stepped.length) {
         say(`r${String(round).padStart(2, '0')} sessions   ${stepped.map((s) => `${s.session}:${s.kind}${s.error ? `(failed: ${s.error})` : ''}`).join(' ')}`);
       }
-      if (pinRoundClock) {
-        const now = Date.now();
-        w.clock.advance(advanceMsForRound(now - (lastRoundEndAt ?? now)));
-        lastRoundEndAt = Date.now();
-      } else w.clock.advance('3m');
+      if (roundClock) roundClock.endRound();
+      else w.clock.advance('3m');
     });
   }
 

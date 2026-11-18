@@ -9,8 +9,8 @@
  * `deferredForLanes=1` left PR #10 unreviewed in CI; `fix-dispatch` `no-lane` for PR #11 on a loaded host; the CI
  * rerun of the same commit passed).
  *
- * The round now ends at a fixed virtual instant: `advanceMsForRound` takes the 3-minute budget minus the real time the
- * round already used, so round `k` ends at `start + k × 3m` on any host.
+ * The round now ends at a fixed virtual instant: the clock moves by the 3-minute budget minus the real time the round
+ * already used, so round `k` ends at `start + k × 3m` on any host.
  */
 
 /** Virtual milliseconds one soak round occupies. */
@@ -18,11 +18,33 @@ export const ROUND_VIRTUAL_MS = 3 * 60_000;
 
 /**
  * How far to move the sim clock at the end of a round so the round occupied exactly `roundMs` of virtual time.
+ * A round slower than its budget is not rewound; it overruns (advance 0).
  * @param {number} realElapsedMs - wall-clock ms since the previous round ended (the sim clock already advanced by this).
  * @param {number} [roundMs]
- * @returns {number} ms to advance (never negative: a round slower than its budget is not rewound, it just overruns)
+ * @returns {number}
+ * @throws {TypeError} on a non-finite or negative reading — a broken wall clock must fail the soak, not be guessed at.
  */
 export function advanceMsForRound(realElapsedMs, roundMs = ROUND_VIRTUAL_MS) {
-  const elapsed = Number.isFinite(realElapsedMs) && realElapsedMs > 0 ? realElapsedMs : 0;
-  return Math.max(0, roundMs - elapsed);
+  if (!Number.isFinite(realElapsedMs) || realElapsedMs < 0) {
+    throw new TypeError(`round-clock: real elapsed time must be a finite, non-negative number of ms, got ${realElapsedMs}`);
+  }
+  return Math.max(0, roundMs - realElapsedMs);
+}
+
+/**
+ * The per-soak round clock. `begin()` marks the start of round 0; `endRound()` advances the sim clock so the round
+ * occupied exactly {@link ROUND_VIRTUAL_MS} of virtual time and starts timing the next one.
+ * @param {{advance: (ms:number) => unknown}} clock - the world's sim clock handle.
+ * @param {() => number} [now] - wall clock (injectable for tests).
+ */
+export function createRoundClock(clock, now = Date.now) {
+  let roundStartedAt = null;
+  return {
+    begin() { roundStartedAt = now(); },
+    endRound() {
+      if (roundStartedAt === null) throw new Error('round-clock: endRound() before begin()');
+      clock.advance(advanceMsForRound(now() - roundStartedAt));
+      roundStartedAt = now();
+    },
+  };
 }
