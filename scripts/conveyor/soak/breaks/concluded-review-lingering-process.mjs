@@ -37,8 +37,17 @@ export default {
     const carried = { ...broken, body: `<!-- review-verdict-carried from=${'b'.repeat(40)} to=${headRefOid} patch-id=${'c'.repeat(40)} -->\nReview verdict carried across an identical contribution.\n${broken.body}` };
     const degraded = { ...broken, body: broken.body.replace('broken', 'degraded') };
     const card = { ...gate, body: `<!-- we:red-team-gate pr=7099 rev=${headRefOid} outcome=card-queued result=${redTeamResultId(parseRedTeamComment(degraded.body))} -->` };
-    for (const [verdict, expectedReview, expectedStatus, prFields = {}, agentFields = {}, standalone = false, readSeal = () => null] of [
+    for (const [verdict, expectedReview, expectedStatus, prFields = {}, agentFields = {}, standalone = false, readSeal = () => null, recordFields = {}] of [
       [accepted, null, 'ready-to-merge'],
+      [accepted, 'reviewing', 'red-team', { commentsComplete: undefined }],
+      [accepted, 'reviewing', 'red-team', { commentsComplete: false }],
+      [accepted, 'review-stalled', 'red-team', {}, { state: 'blocked' }],
+      [accepted, 'reviewing', 'red-team', {}, {}, false, () => null, null],
+      [accepted, 'reviewing', 'red-team', {}, {}, false, () => null, 'unreadable'],
+      [accepted, null, 'ready-to-merge', {}, {}, false, () => null,
+        { status: 'started', endedAt: null, heartbeatAt: new Date(now - 300_000).toISOString(), timeoutMs: 120_000 }],
+      [accepted, 'reviewing', 'red-team', {}, {}, false, () => null,
+        { status: 'started', endedAt: null, heartbeatAt: new Date(now - 60_000).toISOString(), timeoutMs: 120_000 }],
       [accepted, 'reviewing', 'red-team', {}, {}, false, () => ({ unreadable: true })],
       [accepted, 'reviewing', 'red-team', {}, {}, false, () => { throw new Error('sealed evidence unavailable'); }],
       [accepted, 'reviewing', 'red-team', { comments: [broken] }],
@@ -84,7 +93,7 @@ export default {
         },
       };
       const snapshot = { number: 7099, state: 'OPEN', isDraft: false, baseRefName: 'main',
-        headRefOid, mergeable: 'MERGEABLE', comments,
+        headRefOid, mergeable: 'MERGEABLE', comments, commentsComplete: true,
         statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }], ...prFields };
       provider.readPrState = () => snapshot;
       const result = tagReviewStatus({ pr: 7099, repo: 'we', provider,
@@ -93,6 +102,12 @@ export default {
         ...(standalone ? {} : { prState: snapshot }),
         readConfirmedBreaks: () => ({ value: { ...CONFIRMED_BREAKS_DEFAULTS, findingClasses: {} } }),
         readSealedStatus: readSeal,
+        readReviewRecord: () => {
+          if (recordFields === 'unreadable') throw Error('review record unreadable');
+          return recordFields === null ? null : { session: 'review-7099', pid: 7099,
+            startedAt: new Date(now - 600_000).toISOString(), status: 'done',
+            endedAt: new Date(now - 180_000).toISOString(), ...recordFields };
+        },
         readFixClaim: () => null, planRows: [], requiredChecks: ['test'],
         prStatusSettings: { acceptedRedTeamStatus: 'red-team' }, signalFix: () => {},
       });

@@ -4673,3 +4673,10 @@ queued follow-up cards before clearance. `liveResultGateState` must agree with t
 and allowed gate outcomes. Inject policy and sealed-status readers in fixtures; unreadable
 evidence preserves the reviewing hold. Pass the sealed-status reader through the canonical
 disposition reader so every head in a verdict carry chain is checked.
+
+Clearance additionally requires `commentsComplete === true`; a supplied snapshot alone is no proof.
+Blocked rows stay visible. Working review rows require their own matching process record:
+a recorded finish, a completed live-head verdict, or heartbeat (`heartbeatAt`) older than
+that record's `timeoutMs`. Missing/unreadable records or timestamps preserve the hold; operators
+can inspect the review job and completion records while the tagger retains the visible status.
+Current review-job envelopes have no heartbeat field; `updatedAt` alone is not heartbeat proof.

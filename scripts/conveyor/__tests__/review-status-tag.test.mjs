@@ -104,23 +104,23 @@ describe('deriveReviewStatus', () => {
   // `selfReportedDone: true` onto that exact row before handing it to this function; this pins that
   // `deriveReviewStatus` now honors that upstream fact instead of re-deriving liveness from the stale raw
   // `state` alone (mirroring `reconcile-core.mjs#assessLiveness`'s own `isFinished`).
-  it('null (not stalled): a ci-heal-<pr> session marked selfReportedDone, even though its raw state is still blocked', () => {
+  it('retains a blocked ci-heal row even when marked selfReportedDone', () => {
     expect(deriveReviewStatus({ pr: 2852, agents: [{ name: 'ci-heal-2852', state: 'blocked', selfReportedDone: true }] }))
-      .toBeNull();
+      .toEqual({ role: 'ci-heal', state: 'ci-heal-stalled' });
   });
 
-  it('null (not stalled): the same self-reported-done exclusion applies to a review/fix session, not only ci-heal', () => {
+  it('retains blocked review and fix rows even when marked selfReportedDone', () => {
     expect(deriveReviewStatus({ pr: 1765, agents: [{ name: 'review-1765', state: 'blocked', selfReportedDone: true }] }))
-      .toBeNull();
+      .toEqual({ role: 'review', state: 'review-stalled' });
     expect(deriveReviewStatus({ pr: 1765, agents: [{ name: 'fix-1765', state: 'blocked', selfReportedDone: true }] }))
-      .toBeNull();
+      .toEqual({ role: 'fix', state: 'fix-stalled' });
   });
 
   it('null (not stalled): authExpired / idleFinished are the same upstream-fact exclusion as selfReportedDone', () => {
     expect(deriveReviewStatus({ pr: 1765, agents: [{ name: 'fix-1765', state: 'working', authExpired: true }] }))
       .toBeNull();
     expect(deriveReviewStatus({ pr: 1765, agents: [{ name: 'ci-heal-1765', state: 'blocked', idleFinished: true }] }))
-      .toBeNull();
+      .toEqual({ role: 'ci-heal', state: 'ci-heal-stalled' });
   });
 
   it('a working sibling row for the SAME name still wins over a self-reported-done one, exactly like a done row', () => {
@@ -559,15 +559,58 @@ describe('concluded head review with a lingering process', () => {
   const comment = { author: { login: 'chalbert' }, createdAt: new Date(now - 180_000).toISOString(),
     body: `<!-- we:red-team-advisory pr=7099 rev=${headRefOid} -->\n\nRed team not required on this head: not owed (stored review)` };
   const gate = { author: comment.author, body: `<!-- we:red-team-gate pr=7099 rev=${headRefOid} outcome=no-send-back result=${redTeamResultId(parseRedTeamComment(comment.body))} -->` };
-  const subject = { number: 7099, headRefOid, comments: [gate, comment] };
+  const subject = { number: 7099, headRefOid, commentsComplete: true, comments: [gate, comment] };
   const row = { name: 'review-7099', state: 'working', pid: 12345, startedAt: now - 600_000 };
+  const finished = { session: row.name, pid: row.pid, startedAt: new Date(row.startedAt).toISOString(),
+    status: 'done', endedAt: new Date(now - 120_000).toISOString() };
   const derive = (fields = {}, options = {}) => deriveReviewStatus({ pr: 7099,
-    reviewConcluded: reviewConcluded(accepted, subject), now, agents: [{ ...row, ...fields }], ...options });
+    reviewConcluded: reviewConcluded(accepted, subject), readReviewRecord: () => finished, now, agents: [{ ...row, ...fields }], ...options });
 
+  it.each([undefined, false])('keeps reviews without commentsComplete=true (%j)', commentsComplete => {
+    expect(reviewConcluded(accepted, { ...subject, commentsComplete })).toBe(false);
+    expect(derive({}, { reviewConcluded: reviewConcluded(accepted, { ...subject, commentsComplete }) })?.state).toBe('reviewing');
+  });
+  it('keeps a blocked row even with its finished record and accepted verdict', () => {
+    expect(derive({ state: 'blocked' })?.state).toBe('review-stalled');
+    expect(derive({ state: 'blocked', selfReportedDone: true })?.state).toBe('review-stalled');
+  });
+  it('clears a working row with acceptance and its finished record', () => {
+    expect(derive()).toBeNull();
+  });
+  it('clears a final verdict written for this head in the linked run only', () => {
+    const run = { op: 'review-pr', findings: { read: { netBasis: { rev: headRefOid } } },
+      verdict: { verdict: 'accept' }, stepTimings: [{ step: 'advise', finishedAt: finished.endedAt }] };
+    const readReviewRecord = () => ({ ...finished, status: 'started', endedAt: null, run });
+    expect(derive({}, { readReviewRecord })).toBeNull();
+    run.findings.read.netBasis.rev = 'b'.repeat(40);
+    expect(derive({}, { readReviewRecord })?.state).toBe('reviewing');
+  });
+  it.each([
+    ['stale heartbeat', 120_001, 120_000, null],
+    ['fresh heartbeat', 119_999, 120_000, 'reviewing'],
+    ['timeout boundary', 120_000, 120_000, 'reviewing'],
+    ['missing timeout', 180_000, undefined, 'reviewing'],
+    ['invalid timeout', 180_000, 'bad', 'reviewing'],
+    ['missing heartbeat', undefined, 120_000, 'reviewing'],
+    ['invalid heartbeat', 'bad', 120_000, 'reviewing'],
+  ])('%s requires the run own timeout and heartbeat', (_name, age, timeoutMs, expected) => {
+    const heartbeatAt = typeof age === 'number' ? new Date(now - age).toISOString() : age;
+    const result = derive({}, { readReviewRecord: () => ({ ...finished, status: 'started', endedAt: null, heartbeatAt, timeoutMs }) });
+    expect(result?.state ?? null).toBe(expected);
+  });
+  it.each(['missing', 'unreadable'])('keeps a working row when its record is %s', mode => {
+    expect(derive({}, { readReviewRecord: () => {
+      if (mode === 'unreadable') throw Error('record unreadable');
+      return null;
+    } })?.state).toBe('reviewing');
+  });
+  it.each([{ pid: 999 }, { session: 'review-7105' }, { startedAt: now - 700_000 }])('keeps a row on another run record %j', fields => {
+    expect(derive({}, { readReviewRecord: () => ({ ...finished, ...fields }) })?.state).toBe('reviewing');
+  });
   it('requires both labels in either supported label shape', () => {
-    expect(reviewConcluded(accepted, subject)).toEqual({ createdAt: comment.createdAt });
-    expect(reviewConcluded(accepted.map(name => ({ name })), subject)).toEqual({ createdAt: comment.createdAt });
-    expect(reviewConcluded(accepted, { ...subject, headRefOid: headRefOid.toUpperCase() })).toEqual({ createdAt: comment.createdAt });
+    expect(reviewConcluded(accepted, subject)).toEqual({ createdAt: comment.createdAt, head: headRefOid });
+    expect(reviewConcluded(accepted.map(name => ({ name })), subject)).toEqual({ createdAt: comment.createdAt, head: headRefOid });
+    expect(reviewConcluded(accepted, { ...subject, headRefOid: headRefOid.toUpperCase() })).toEqual({ createdAt: comment.createdAt, head: headRefOid });
   });
   it.each(['review:pending', 'review:changes', 'review:human', 'red-team:pending',
     'red-team:blocked', 'review-status:draft-withdrawn'])('fails closed on %s alongside acceptance', blocker => {
@@ -621,7 +664,7 @@ describe('concluded head review with a lingering process', () => {
   it('allows card-queued gate evidence', () => {
     expect(reviewConcluded(accepted, { ...subject, comments: [
       { ...gate, body: gate.body.replace('outcome=no-send-back', 'outcome=card-queued') }, comment,
-    ] })).toEqual({ createdAt: comment.createdAt });
+    ] })).toEqual({ createdAt: comment.createdAt, head: headRefOid });
   });
   it.each(['> ', 'quoted\n', '```\n'])('keeps reviewing when advisory markers are embedded behind %j', prefix => {
     const evidence = reviewConcluded(accepted, { ...subject, comments: [gate, { ...comment, body: prefix + comment.body }] });
@@ -637,11 +680,11 @@ describe('concluded head review with a lingering process', () => {
   it('ignores embedded and other-PR gates when complete advisory evidence needs no gate', () => {
     for (const body of [`quoted\n${gate.body}`, gate.body.replace('pr=7099', 'pr=7105')]) {
       expect(reviewConcluded(accepted, { ...subject, comments: [{ ...gate, body }, comment] }))
-        .toEqual({ createdAt: comment.createdAt });
+        .toEqual({ createdAt: comment.createdAt, head: headRefOid });
     }
   });
   it('allows complete advisory evidence without any gate record', () => {
-    expect(reviewConcluded(accepted, { ...subject, comments: [comment] })).toEqual({ createdAt: comment.createdAt });
+    expect(reviewConcluded(accepted, { ...subject, comments: [comment] })).toEqual({ createdAt: comment.createdAt, head: headRefOid });
   });
   it.each(['unreadable', 'thrown'])('keeps reviewing when sealed evidence is %s despite clear comments', failure => {
     const reads = [];
@@ -683,7 +726,7 @@ describe('concluded head review with a lingering process', () => {
     expect(reviewConcluded(accepted, { ...subject, comments: [newer, resultGate, comment] })).toBe(false);
     const matching = { ...resultGate, body: resultGate.body.replace(
       redTeamResultId(parseRedTeamComment(comment.body)), redTeamResultId(parseRedTeamComment(newer.body))) };
-    expect(reviewConcluded(accepted, { ...subject, comments: [newer, matching, comment] })).toEqual({ createdAt: newer.createdAt });
+    expect(reviewConcluded(accepted, { ...subject, comments: [newer, matching, comment] })).toEqual({ createdAt: newer.createdAt, head: headRefOid });
   });
   const findingResult = (impact = 'broken') => ({ ...comment,
     createdAt: new Date(now - 150_000).toISOString(),
@@ -707,7 +750,7 @@ describe('concluded head review with a lingering process', () => {
     const degraded = findingResult('degraded');
     const card = { ...gate, body: `<!-- we:red-team-gate pr=7099 rev=${headRefOid} outcome=card-queued result=${redTeamResultId(parseRedTeamComment(degraded.body))} -->` };
     const evidence = reviewConcluded(accepted, { ...subject, comments: [degraded, card] });
-    expect(evidence).toEqual({ createdAt: degraded.createdAt });
+    expect(evidence).toEqual({ createdAt: degraded.createdAt, head: headRefOid });
     expect(derive({}, { reviewConcluded: evidence })).toBeNull();
   });
   it('keeps reviewing for a confirmed degraded finding until its follow-up card is queued', () => {
@@ -726,7 +769,7 @@ describe('concluded head review with a lingering process', () => {
     for (const supplied of [false, true]) {
       const result = tagReviewStatus({ pr: 7099, repo: 'we', agents: [row],
         ...(supplied ? { prState: subject } : {}), currentLabels: [...accepted, 'review-status:reviewing'],
-        readFixClaim: () => null, provider: { readPrState: () => subject, ensureLabel: () => {}, setLabels: () => {} } });
+        readReviewRecord: () => finished, readFixClaim: () => null, provider: { readPrState: () => subject, ensureLabel: () => {}, setLabels: () => {} } });
       expect(result.label).toBe(supplied ? null : 'review-status:reviewing');
     }
   });

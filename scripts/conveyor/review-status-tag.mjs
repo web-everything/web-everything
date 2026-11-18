@@ -42,6 +42,8 @@ import { repoKeyForSlug, ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { tryReadCompletion } from '../operations/completion-store.mjs';
+import { tryReadRun } from '../operations/run-store.mjs';
 import { listAgentsWithReviewJobs } from '../operations/review-job-store.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
@@ -103,7 +105,7 @@ const LIVE_STATES = Object.freeze({ working: 'reviewing', blocked: 'stalled' });
 /** Head-bound acceptance is complete only with an unambiguous red-team clearance. */
 export function reviewConcluded(labels, subject, pr = subject?.number, { readConfirmedBreaks: readPolicy = readConfirmedBreaks, readSealedStatus: readSeal = readSealedStatus, repo = subject?.repo ?? ghRepoSlug('we') } = {}) {
   const head = subject?.headRefOid;
-  if (!Number.isSafeInteger(Number(pr)) || Number(pr) <= 0
+  if (subject?.commentsComplete !== true || !Number.isSafeInteger(Number(pr)) || Number(pr) <= 0
     || !Array.isArray(labels) || typeof head !== 'string' || !/^[a-f0-9]{40}$/i.test(head)) return false;
   const names = Array.from(labels, l => typeof l === 'string' ? l : l?.name);
   if (names.some(name => typeof name !== 'string' || !name)) return false;
@@ -128,7 +130,7 @@ export function reviewConcluded(labels, subject, pr = subject?.number, { readCon
       || [...outcomes, ...state.outcomes].some(outcome => !['card-queued', 'no-send-back'].includes(outcome))
       || (outcomes.size > 0 && state.outcomes.size === 0)) return false;
   } catch { return false; }
-  return { createdAt: evidence.comment.createdAt };
+  return { createdAt: evidence.comment.createdAt, head: head.toLowerCase() };
 }
 
 // Only a verdict posted after this row began can conclude it. Missing timestamps
@@ -138,11 +140,31 @@ function timestampMs(value) {
   return typeof value === 'number' ? value : typeof value === 'string'
     ? (/^\d+$/.test(value.trim()) ? Number(value) : Date.parse(value)) : NaN;
 }
-function concludedReviewRow(row, evidence, now) {
+function readReviewRunRecord(row) {
+  const record = tryReadCompletion(row.name);
+  return record && { ...record, run: record.runId ? tryReadRun(record.runId) : null };
+}
+function concludedReviewRow(row, evidence, now, readRecord) {
   const start = timestampMs(row.startedAt);
   const verdict = timestampMs(evidence?.createdAt);
-  return Number.isFinite(start) && start > 0 && Number.isFinite(verdict) && verdict > start
-    && Number.isFinite(now) && now - verdict >= REVIEW_VERDICT_GRACE_MS;
+  if (row.state !== 'working' || !Number.isFinite(start) || start <= 0 || !Number.isFinite(verdict)
+    || verdict <= start || !Number.isFinite(now) || now - verdict < REVIEW_VERDICT_GRACE_MS) return false;
+  try {
+    const record = readRecord(row);
+    const began = timestampMs(record?.startedAt);
+    if (!record || record.session !== row.name || record.pid !== row.pid || !Number.isInteger(record.pid)
+      || !Number.isFinite(began) || began < start || began >= verdict) return false;
+    const ended = timestampMs(record.endedAt);
+    if (record.status === 'done' && Number.isFinite(ended) && ended >= began && ended <= now) return true;
+    const run = record.run;
+    if (run?.op === 'review-pr' && run.findings?.read?.netBasis?.rev === evidence.head
+      && ['accept', 'changes', 'needs-human'].includes(run.verdict?.verdict)
+      && run.stepTimings?.some(t => t?.step === 'advise' && Number.isFinite(timestampMs(t.finishedAt))
+        && timestampMs(t.finishedAt) >= began && timestampMs(t.finishedAt) <= now)) return true;
+    const heartbeat = timestampMs(record.heartbeatAt);
+    return Number.isFinite(heartbeat) && heartbeat >= began && heartbeat <= now
+      && Number.isSafeInteger(record.timeoutMs) && record.timeoutMs > 0 && now - heartbeat > record.timeoutMs;
+  } catch { return false; }
 }
 
 /**
@@ -159,37 +181,23 @@ function concludedReviewRow(row, evidence, now) {
  * (`we:scripts/conveyor/reconcile-core.mjs#classifyPr`'s `ci-red` phase is its own branch ahead of the
  * `OWED`/`OWED_ELSEWHERE` table), so the ordering is precedence-in-name-only — it never actually shadows a
  * real ci-heal for a PR that also has a stale review/fix session row sitting in `claude agents --json`.
- * @param {{pr:number|string, agents?:Array<{name?:string, state?:string}>, isDraft?:boolean, baseRefName?:string, defaultBranch?:string, mergeConflicted?:boolean, fixClaim?:object|null, escalation?:object|null, reviewConcluded?:{createdAt?:string|number}|false, now?:number}} o
+ * @param {{pr:number|string, agents?:Array<{name?:string, state?:string}>, isDraft?:boolean, baseRefName?:string, defaultBranch?:string, mergeConflicted?:boolean, fixClaim?:object|null, escalation?:object|null, reviewConcluded?:{createdAt?:string|number, head?:string}|false, readReviewRecord?:Function, now?:number}} o
  * @returns {{role:'review'|'fix'|'ci-heal'|'draft', state:'reviewing'|'review-stalled'|'fixing'|'fix-stalled'|'fixing-conflict'|'fixing-conflict-stalled'|'healing-ci'|'ci-heal-stalled'|'awaiting-ci'|'awaiting-base'|'draft-scope-change'|'draft-withdrawn'|'needs-human'}|null}
  */
-export function deriveReviewStatus({ pr, agents = [], repo = 'we', isDraft = false, baseRefName, defaultBranch = 'main', mergeConflicted = false, fixClaim = null, escalation = null, reviewConcluded = false, now = Date.now() } = {}) {
+export function deriveReviewStatus({ pr, agents = [], repo = 'we', isDraft = false, baseRefName, defaultBranch = 'main', mergeConflicted = false, fixClaim = null, escalation = null, reviewConcluded = false, readReviewRecord = readReviewRunRecord, now = Date.now() } = {}) {
   const reviewName = mintSessionSlug({ kind: 'review', id: pr, repo });
   const fixName = mintSessionSlug({ kind: 'fix', id: pr, repo });
   const ciHealName = mintSessionSlug({ kind: 'ci-heal', id: pr, repo });
   const list = Array.isArray(agents) ? agents : [];
-  // Live incident 2026-09-28 (we#2852): `we:scripts/conveyor/reconcile-core.mjs`'s own `markSelfReportedDone`/
-  // `markAuthExpiredSessions`/`markIdleFinishedSessions` already stamp a FINISHED verdict onto these SAME agent
-  // rows (wired in by `we:scripts/conveyor/reconcile-pass.mjs#defaultReadAgents`, which the review daemon feeds
-  // straight into this function via `tagReviewStatus`'s `agents` param) — but this module used to look at
-  // nothing except the raw `claude agents --json` `state`, so a ci-heal session that had genuinely finished
-  // (its own completion record said `done`, its dispatch claim was released) still read as `blocked` here
-  // forever — the CLI never prunes a finished row — and got tagged `ci-heal-stalled`, which
-  // `we:scripts/conveyor/build-dispatch-policy.mjs` then read as a landing freeze on EVERY queued build. A row
-  // bearing any of these three markers is finished — exclude it from `LIVE_STATES` matching regardless of its
-  // raw `state`, mirroring `reconcile-core.mjs#assessLiveness`'s own `isFinished`.
-  //
-  // DELIBERATELY NOT excluding `hung: true` here, unlike `assessLiveness` (which treats `hung` as finished too,
-  // because ITS job is "may I redispatch a fresh session" — a hung session must not block that). This module's
-  // job is the opposite: surfacing to a human that a session may be stuck (the 211-hour permission-block hazard
-  // its own header names) — a transcript that has gone stale with no self-report is exactly that hazard, not
-  // evidence of a clean finish, so it must keep reading as `-stalled`.
+  // Review rows require their own run evidence; blocked rows always remain visible.
   const isFinishedOverride = (a) => a?.selfReportedDone === true || a?.authExpired === true || a?.idleFinished === true;
   // Prefer a `working` match over a `blocked` one for the SAME name (several historical rows can share a
   // name) — a session actually making progress right now is more informative than a stuck sibling. A `done`/
   // other row is simply not a candidate at all — see LIVE_STATES.
   const liveFor = (name) => {
-    const matches = list.filter((a) => a?.name === name && Object.hasOwn(LIVE_STATES, a.state) && !isFinishedOverride(a)
-      && !(name === reviewName && concludedReviewRow(a, reviewConcluded, now)));
+    const matches = list.filter((a) => a?.name === name && Object.hasOwn(LIVE_STATES, a.state)
+      && !(a.state !== 'blocked' && name !== reviewName && isFinishedOverride(a))
+      && !(name === reviewName && concludedReviewRow(a, reviewConcluded, now, readReviewRecord)));
     return matches.find((a) => a.state === 'working') ?? matches[0] ?? null;
   };
   if (escalation?.outcome === 'needs-human') return { role: 'ci-heal', state: 'needs-human' };
@@ -310,6 +318,7 @@ export function tagReviewStatus({
   readRequiredChecks = readCachedRequiredChecks, loadStatusSettings = loadPrStatusSettings,
   readConfirmedBreaks: readBreakPolicy = readConfirmedBreaks,
   readSealedStatus: readSeal = readSealedStatus,
+  readReviewRecord = readReviewRunRecord,
   excuseMergeGate = (pr, { repo }) => excusePrMergeGateHolds([pr], {
     repo, readMergeGateVerdict: args => readMergeGateVerdict({ ...args }), readFreeze: readSharedFreeze,
   })[0],
@@ -319,13 +328,13 @@ export function tagReviewStatus({
   const agents = suppliedAgents ?? listAgents();
   let fixClaim = null;
   try { fixClaim = readFixClaim({ repo: repoKey, pr: Number(pr) }); } catch { fixClaim = null; }
-  // Only the supplied daemon snapshot guarantees complete comments; the standalone read is unpaginated.
+  // Clearance requires an explicit completeness proof from the supplied snapshot.
   // A failed read throws before any label write, preserving an existing human signal.
   const subject = prState ?? provider.readPrState?.(repo, pr);
   const escalation = latestCiHealEscalationForHead(subject?.comments, subject?.headRefOid);
   const currentLabels = suppliedLabels ?? provider.readLabels(repo, pr);
   const status = deriveReviewStatus({ pr, agents, repo: repoKey, isDraft: isDraft ?? subject?.isDraft ?? false,
-    baseRefName: baseRefName ?? subject?.baseRefName, defaultBranch, mergeConflicted, fixClaim, escalation, reviewConcluded: prState != null && reviewConcluded(currentLabels, subject, pr, { readConfirmedBreaks: readBreakPolicy, readSealedStatus: readSeal, repo: ghRepoSlug(repoKey) }) });
+    baseRefName: baseRefName ?? subject?.baseRefName, defaultBranch, mergeConflicted, fixClaim, escalation, readReviewRecord, reviewConcluded: prState != null && reviewConcluded(currentLabels, subject, pr, { readConfirmedBreaks: readBreakPolicy, readSealedStatus: readSeal, repo: ghRepoSlug(repoKey) }) });
   const plan = legacyReviewStatus ? planStatusLabelChange({ status, currentLabels }) : {
     add: null,
     remove: currentLabels.map((l) => typeof l === 'string' ? l : l?.name)
