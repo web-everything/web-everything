@@ -46,13 +46,20 @@ function failedTestNames({ failedAssertions = [], failed = [] } = {}) {
 function testResultNames(result, evidence = {}) {
   const names = failedTestNames(evidence);
   if (!names.length) {
-    for (const match of stripVTControlCharacters(`${withoutDeprecations(result?.stdout)}\n${withoutDeprecations(result?.stderr)}`).matchAll(/^\s*FAIL\s+([^\r\n]+)/gm)) names.push(cleanText(match[1].trim()));
+    names.push(...testOutputFailures(result).names);
   }
   return names;
 }
+function testOutputFailures(result) {
+  const plain = stripVTControlCharacters(`${result?.stdout ?? ''}\n${result?.stderr ?? ''}`);
+  const names = [...plain.matchAll(/^[ \t]*(?:not ok\b(?:[ \t]+\d+)?(?:[ \t]+-)?|FAIL\b|[×✗])[ \t]*([^\r\n]*)/gm)]
+    .map(match => cleanText(match[1].trim())).filter(Boolean);
+  return { red: names.length > 0 || /^\s*(?:not ok\b|FAIL\b|[×✗])/m.test(plain)
+    || /\b[1-9]\d*\s+failed\b/i.test(plain), names };
+}
 function testStderrTail(result, evidence = {}) {
-  const stderr = withoutDeprecations(result?.stderr || result?.error?.message);
-  const combined = `${withoutDeprecations(result?.stdout)}\n${stderr}`;
+  const stderr = stripVTControlCharacters(withoutDeprecations(result?.stderr || result?.error?.message));
+  const combined = `${stripVTControlCharacters(withoutDeprecations(result?.stdout))}\n${stderr}`;
   const names = testResultNames(result, evidence);
   // Preserve stderr-only diagnostics after removing warning lines and sanitizing.
   if (!result?.stdout && !names.length) return cleanText(stderr).slice(-500);
@@ -602,7 +609,7 @@ function testRunCause(result, selected) {
 }
 
 async function syncTestEvidence({ root, scratch, selected, testReport, env, io, runner }) {
-  let result, invocation, cause, interrupted, timeoutRetried = false;
+  let result, invocation, cause, timeoutRetried = false;
   for (let attempt = 1; attempt <= 2; attempt++) {
     const reportPath = attempt === 1 ? testReport : `${testReport}.retry`;
     io.rmSync(reportPath, { force: true }); // Never consume a previous attempt's evidence.
@@ -615,33 +622,35 @@ async function syncTestEvidence({ root, scratch, selected, testReport, env, io, 
     if (remoteUnconfirmed(result)) return { remoteUnconfirmed: true };
     cause = testRunCause(result, selected);
     if (cause.kind === 'exit') { testReport = reportPath; break; }
-    // A partial report cannot authorize publication, but its failures must survive the retry.
-    const partial = { failed: [], failedAssertions: [], byFile: new Map(), cause };
+    cause = { ...cause, attempts: attempt };
+    // Retry only interruptions with no red evidence, including rows outside the selected files.
+    const partial = { failed: [], failedAssertions: [] };
+    let red = testOutputFailures(result).red;
     try {
       if (io.statSync(reportPath).size > 8 * 1024 * 1024) throw new Error('oversized report');
-      const rows = JSON.parse(io.readFileSync(reportPath, 'utf8')).testResults;
-      for (const file of selected) {
-        const matches = rows.filter(row => row?.name === join(io.realpathSync(scratch), file));
-        const assertions = matches.flatMap(row => Array.isArray(row.assertionResults) ? row.assertionResults : []);
-        const red = assertions.filter(a => a?.status === 'failed');
-        if (!matches.some(row => row.status === 'failed') && !red.length) continue;
+      const report = JSON.parse(io.readFileSync(reportPath, 'utf8'));
+      red ||= report.success === false || report.numFailedTests > 0 || report.numFailedTestSuites > 0;
+      const rows = Array.isArray(report.testResults) ? report.testResults : [];
+      for (const row of rows) {
+        const assertions = Array.isArray(row?.assertionResults) ? row.assertionResults : [];
+        const failed = assertions.filter(a => a?.status === 'failed');
+        if (row?.status !== 'failed' && !failed.length) continue;
+        red = true;
+        const file = selected.find(file => row.name === join(io.realpathSync(scratch), file))
+          ?? (typeof row.name === 'string' ? row.name : 'unknown test file');
         partial.failed.push(file);
-        const failedIds = red.map(a => assertionIdentity(file, a));
-        partial.failedAssertions.push(...failedIds);
-        // A failed file without a named failed assertion cannot be cleared by a green retry.
-        partial.byFile.set(file, { total: assertions.length, failedIds: failedIds.length ? failedIds : [null] });
+        partial.failedAssertions.push(...failed.map(a => assertionIdentity(file, a)));
       }
     } catch { /* Missing or malformed reports remain incomplete, with only runner diagnostics. */ }
     const tail = testStderrTail(result, partial);
     const failedTests = testResultNames(result, partial);
-    if (attempt === 1) {
-      interrupted = { ...partial, stderrTail: tail, failedTests };
+    if (attempt === 1 && !red) {
       timeoutRetried = true;
       continue;
     }
     const description = cause.kind === 'timeout' ? `timeout${cause.limitMs === null ? '' : ` ${cause.limitMs}ms`}`
       : `signal ${cause.signal ?? result?.error?.code ?? 'unknown'}`;
-    throw Object.assign(new Error(`tests: run killed (${description}, 2 attempts, ${selected.length} files); operator review required${tail ? `: ${tail}` : ''}`),
+    throw Object.assign(new Error(`tests: run killed (${description}, ${attempt} attempts, ${selected.length} files); operator review required${tail ? `: ${tail}` : ''}`),
       { step: 'tests', stderrTail: tail, cause, failedTests });
   }
   let validatedFailure = false;
@@ -694,10 +703,7 @@ async function syncTestEvidence({ root, scratch, selected, testReport, env, io, 
   if (!commandOk && !(result?.status === 1 && (!result.error || validatedFailure) && complete && failed.length)) {
     output({ ...result, step: 'tests', cause, failedTests }, tail);
   }
-  if (green && interrupted && !rerunCoversFailures(interrupted, { byFile }, interrupted.failed)) {
-    throw testFailure(interrupted);
-  }
-  return { green, failed, complete, failedAssertions, byFile, stderrTail: tail, cause, failedTests, timeoutRetried, interrupted };
+  return { green, failed, complete, failedAssertions, byFile, stderrTail: tail, cause, failedTests, timeoutRetried };
 }
 // A green rerun only clears a failure it actually re-executed. Per previously failed file the rerun must
 // run at least as many assertions as the failing run did (a vanished assertion fails closed), and, when
@@ -868,24 +874,10 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     const { value: reruns, source: rerunsSource } = resolveOverlayFlakeReruns(env);
     for (let offset = 0; offset < tests.length; offset += chunkSize) {
       const chunk = tests.slice(offset, offset + chunkSize);
-      const interruptedFailures = [];
       const check = async (selected, attempt, tree = scratch, runner = deps.testRunner) => {
         const evidence = await syncTestEvidence({
           root, scratch: tree, selected, env, io, runner,
           testReport: join(scratchParent, `tests-${offset / chunkSize}-${attempt}.json`) });
-        if (tree === scratch && !evidence.remoteUnconfirmed) {
-          if (evidence.interrupted?.failed.length) interruptedFailures.push({
-            evidence: evidence.interrupted, remaining: [...evidence.interrupted.failed],
-          });
-          // Interrupted failures survive ordinary-red retries, including later flake reruns. Check
-          // each file when it clears; already-covered files need not appear in narrower later runs.
-          for (const pending of interruptedFailures) {
-            const cleared = pending.remaining.filter(file => !evidence.failed.includes(file) && evidence.byFile.has(file));
-            if ((evidence.green && cleared.length !== pending.remaining.length)
-              || !rerunCoversFailures(pending.evidence, evidence, cleared)) throw testFailure(pending.evidence);
-            pending.remaining = pending.remaining.filter(file => !cleared.includes(file));
-          }
-        }
         if (evidence.green && evidence.timeoutRetried) event(root,
           { kind: 'overlay-main-timeout-retried', ref, files: selected.length }, { env });
         return evidence;

@@ -4741,9 +4741,10 @@ with the structured cause ahead of the cleaned diagnostic tail and asks for oper
 Remote termination unconfirmed remains a skip, including on the retry. Ordinary test failures
 retain the failed-file flake reruns and plain-main comparison. The killed-run soak proves the retry
 by executing an injected killed-once, then green runner; its presence probe uses behavior, not source markers.
-Stop text in stderr cannot classify an ordinary exit (0 or 1) as interrupted. Preserve failed-file
-assertion identities and counts from the first interrupted report: a complete green retry must cover
-those failures with multiplicity, or fail closed with the interruption cause and operator review.
-Carry these obligations through ordinary-red retries and subsequent flake reruns. Validate a file
-when it clears so an interrupted A → ordinary failure B → green B cannot forget A; files already
-covered may be omitted from later reruns that select only the remaining failed files.
+Stop text in stderr cannot classify an ordinary exit (0 or 1) as interrupted. Retry an interrupted
+attempt only when neither stdout nor stderr (ANSI stripped) nor partial JSON contains red evidence.
+TAP `not ok`, Vitest `FAIL`/`×`/`✗`, positive failed summary counts, and failed JSON rows (including
+extra files and unnamed assertions) block immediately with the interruption cause, `attempts: 1`,
+and failing names preserved in the diagnostic tail. A green retry cannot erase an observed failure.
+Keep ordinary flake rerun identity/count coverage checks unchanged. Run `overlay-main-sync-rerun.test.mjs`,
+`daemon-rebuild-overlay-main-sync.test.mjs`, and the killed-run soak through heavy admission.

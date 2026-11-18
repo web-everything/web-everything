@@ -772,6 +772,7 @@ describe('overlay main sync interrupted test runs', () => {
   it.each([
     ['admission timeout', timeout],
     ['status 124', { status: 124, stdout: '', stderr: '' }],
+    ['zero failed count', { status: 124, stdout: 'Tests  0 failed | 3 passed (3)', stderr: '' }],
     ['signal', { status: null, signal: 'SIGTERM', stdout: '', stderr: '' }],
     ['ETIMEDOUT', { status: null, error: { code: 'ETIMEDOUT' } }],
     ['ENOBUFS', { status: null, error: { code: 'ENOBUFS' } }],
@@ -795,97 +796,82 @@ describe('overlay main sync interrupted test runs', () => {
     ]);
   });
 
-  it.each([
-    ['missing failed identity', 'failed', 'renamed'],
-    ['reduced assertion count', 'baseline-failed', 'passed'],
-    ['duplicate failure multiplicity', 'twin-failed', 'baseline-passed'],
-    ['unnamed failed assertion', [{ status: 'failed' }], 'passed'],
-  ])('a killed partial red then green retry fails closed on %s with the original cause', async (_name, before, after) => {
-    const f = fixture({ reruns: 0 });
+  it.each(['stdout', 'stderr'])('interrupted TAP red in %s without JSON fails closed naming the test before a green retry', async stream => {
+    const f = fixture({ reruns: 2 });
+    const name = 'worker refuses unsafe publication';
     f.deps.testRunner = vi.fn(async options => {
-      if (f.deps.testRunner.mock.calls.length === 1) {
-        report(options, before);
-        return timeout;
-      }
-      return report(options, after);
+      if (f.deps.testRunner.mock.calls.length > 1) return report(options);
+      // Production cannot write its JSON report before a killed TAP runner exits successfully.
+      expect(fs.existsSync(options.testReport)).toBe(false);
+      return { ...timeout, [stream]: (stream === 'stderr' ? timeout.stderr : '')
+        + `\x1b[31mnot ok 1 - ${name}\x1b[0m\n` + 'runner footer\n'.repeat(100) };
     });
     f.deps.mainTestRunner = vi.fn();
-    await expect(job(f)).rejects.toMatchObject({ message: `tests: ${failure}`,
-      cause: { kind: 'timeout', status: 124, limitMs: 480000, files: 3 } });
-    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    const cause = { kind: 'timeout', status: 124, limitMs: 480000, files: 3, attempts: 1 };
+    await expect(job(f)).rejects.toMatchObject({ step: 'tests', cause, failedTests: [name],
+      stderrTail: expect.stringContaining(name), message: expect.stringContaining('operator review required') });
+    expect(f.deps.testRunner).toHaveBeenCalledOnce();
     expect(f.deps.mainTestRunner).not.toHaveBeenCalled();
-    expect(f.outcomes.find(e => e.kind === 'overlay-main-sync-failed').detail.cause.kind).toBe('timeout');
+    const detail = f.outcomes.find(e => e.kind === 'overlay-main-sync-failed').detail;
+    expect(detail).toMatchObject({ cause, failedTests: [name], stderrTail: expect.stringContaining(name) });
+    expect(detail.stderrTail).not.toMatch(/\x1b|DeprecationWarning|--trace-deprecation/);
+    expect(detail.stderrTail.length).toBeLessThanOrEqual(500);
     expect(kinds(f)).not.toContain('overlay-main-timeout-retried');
     noPublication(f);
   });
 
-  it('a killed partial red may proceed when the complete retry passes every failed assertion', async () => {
-    const f = fixture({ reruns: 0 });
-    f.deps.testRunner = vi.fn(async options => f.deps.testRunner.mock.calls.length === 1
-      ? (report(options, 'baseline-failed'), timeout) : report(options, 'baseline-passed'));
-    expect(await job(f)).toMatchObject({ pushed: true });
-    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
-    expect(kinds(f)).toContain('overlay-main-timeout-retried');
-  });
-
-  it.each([['A absent', false], ['A passed', true]])(
-    'interrupted A → ordinary failure B → green B with %s enforces interrupted coverage', async (_name, coversA) => {
-    const f = fixture({ reruns: 1 });
-    const assertion = (title, status) => ({ title, status, ancestorTitles: ['worker'] });
-    f.deps.testRunner = vi.fn(async options => {
-      const attempt = f.deps.testRunner.mock.calls.length;
-      if (attempt === 1) return (report(options, [assertion('A', 'failed')]), timeout);
-      if (attempt === 2) return report(options, [assertion('B', 'failed')], 1);
-      return report(options, [...(coversA ? [assertion('A', 'passed')] : []), assertion('B', 'passed')]);
-    });
+  it.each(['stdout', 'stderr'].flatMap(stream => [
+    'FAIL worker refuses unsafe publication', '× worker refuses unsafe publication',
+    '✗ worker refuses unsafe publication', 'Tests  1 failed | 2 passed (3)', 'Test Files  2 failed (2)', 'not ok',
+  ].map(line => [stream, line])))(
+    'interrupted %s red (%s) without JSON prevents retry', async (stream, line) => {
+    const f = fixture({ reruns: 2 });
+    f.deps.testRunner = vi.fn(async () => ({ status: null, signal: 'SIGTERM', stdout: '', stderr: '',
+      [stream]: `\x1b[31m${line}\x1b[0m\n` }));
     f.deps.mainTestRunner = vi.fn();
-    if (coversA) {
-      expect(await job(f)).toMatchObject({ pushed: true });
-      expect(kinds(f)).toContain('overlay-main-flaky-retried');
-    } else {
-      await expect(job(f)).rejects.toMatchObject({ message: `tests: ${failure}`,
-        cause: { kind: 'timeout', status: 124, limitMs: 480000, files: 3 },
-        failedTests: [`${failedFile} > worker > A`] });
-      expect(f.outcomes.find(e => e.kind === 'overlay-main-sync-failed').detail.cause.kind).toBe('timeout');
-      noPublication(f);
-    }
-    expect(f.deps.testRunner).toHaveBeenCalledTimes(3);
-    expect(selectedFiles(f.deps.testRunner.mock.calls[2][0])).toEqual([failedFile]);
+    await expect(job(f)).rejects.toMatchObject({ cause: { kind: 'killed', signal: 'SIGTERM', attempts: 1 },
+      message: expect.stringContaining('operator review required'),
+      stderrTail: expect.stringContaining(line.replace(/^(FAIL|×|✗) /, '')) });
+    expect(f.deps.testRunner).toHaveBeenCalledOnce();
     expect(f.deps.mainTestRunner).not.toHaveBeenCalled();
+    noPublication(f);
   });
 
-  it('an interrupted failure covered before another file clears survives narrower flake reruns', async () => {
-    const f = fixture({ reruns: 1 });
+  it.each([
+    ['named failed assertion', 'failed'],
+    ['multiple failed assertions', 'twin-failed'],
+    ['unnamed failed assertion', [{ status: 'failed' }]],
+    ['failed file only', 'file'],
+    ['failed extra file', 'extra'],
+    ['unsuccessful report', 'success'],
+    ['failed test count', 'numFailedTests'],
+    ['failed suite count', 'numFailedTestSuites'],
+  ])('interrupted partial JSON with %s blocks immediately even if the retry would be green', async (_name, state) => {
+    const f = fixture({ reruns: 2 });
     f.deps.testRunner = vi.fn(async options => {
-      const attempt = f.deps.testRunner.mock.calls.length;
-      if (attempt === 1) return (report(options, 'failed'), timeout);
-      const result = report(options, 'passed', attempt === 2 ? 1 : 0);
-      if (attempt === 2) {
-        const retry = json(options.testReport);
-        retry.testResults.find(row => row.name.endsWith('/worker1.test.mjs')).assertionResults[0].status = 'failed';
-        fs.writeFileSync(options.testReport, JSON.stringify(retry));
-      }
-      return result;
-    });
-    expect(await job(f)).toMatchObject({ pushed: true });
-    expect(f.deps.testRunner).toHaveBeenCalledTimes(3);
-    expect(selectedFiles(f.deps.testRunner.mock.calls[2][0])).toEqual(['worker1.test.mjs']);
-    expect(kinds(f)).toContain('overlay-main-flaky-retried');
-  });
-
-  it('a killed partial report naming only a failed file cannot be cleared by a green retry', async () => {
-    const f = fixture({ reruns: 0 });
-    f.deps.testRunner = vi.fn(async options => {
-      const result = report(options);
-      if (f.deps.testRunner.mock.calls.length !== 1) return result;
+      if (f.deps.testRunner.mock.calls.length > 1) return report(options, 'baseline-passed');
+      report(options, ['file', 'extra', 'success', 'numFailedTests', 'numFailedTestSuites'].includes(state) ? 'passed' : state);
       const partial = json(options.testReport);
-      partial.testResults[0].status = 'failed';
-      partial.testResults[0].assertionResults = [];
+      if (state === 'file') Object.assign(partial.testResults[0], { status: 'failed', assertionResults: [] });
+      if (state === 'extra') partial.testResults.push({ name: join(options.root, 'extra.test.mjs'), status: 'failed' });
+      if (typeof state === 'string' && state.startsWith('numFailed')) partial[state] = 1;
+      if (state === 'success') partial.success = false;
       fs.writeFileSync(options.testReport, JSON.stringify(partial));
       return timeout;
     });
-    await expect(job(f)).rejects.toMatchObject({ message: `tests: ${failure}`, cause: { kind: 'timeout' }, failedTests: [failedFile] });
-    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    f.deps.mainTestRunner = vi.fn();
+    await expect(job(f)).rejects.toMatchObject({ cause: { kind: 'timeout', limitMs: 480000, attempts: 1 },
+      message: expect.stringContaining('operator review required') });
+    expect(f.deps.testRunner).toHaveBeenCalledOnce();
+    expect(f.deps.mainTestRunner).not.toHaveBeenCalled();
+    const detail = f.outcomes.find(e => e.kind === 'overlay-main-sync-failed').detail;
+    if (state === 'failed' || state === 'twin-failed') {
+      expect(detail.failedTests).toEqual([`${failedFile} > worker > worker behaves`]);
+      expect(detail.stderrTail).toContain('worker behaves');
+    }
+    if (state === 'file' || Array.isArray(state)) expect(detail.failedTests).toEqual([failedFile]);
+    if (state === 'extra') expect(detail.failedTests[0]).toContain('extra.test.mjs');
+    expect(kinds(f)).not.toContain('overlay-main-timeout-retried');
     noPublication(f);
   });
 
@@ -916,15 +902,15 @@ describe('overlay main sync interrupted test runs', () => {
   });
 
   it.each([
-    ['timeout', timeout, { kind: 'timeout', status: 124, signal: null, limitMs: 480000, files: 3 }],
+    ['timeout', timeout, { kind: 'timeout', status: 124, signal: null, limitMs: 480000, files: 3, attempts: 2 }],
     ['signal', { status: null, signal: 'SIGKILL', stdout: '', stderr: warnings },
-      { kind: 'killed', status: null, signal: 'SIGKILL', limitMs: null, files: 3 }],
+      { kind: 'killed', status: null, signal: 'SIGKILL', limitMs: null, files: 3, attempts: 2 }],
     ['buffer exhaustion', { status: null, stdout: '', stderr: warnings, error: { code: 'ENOBUFS' } },
-      { kind: 'killed', status: null, signal: null, limitMs: null, files: 3 }],
+      { kind: 'killed', status: null, signal: null, limitMs: null, files: 3, attempts: 2 }],
   ])('fails closed after two interruptions (%s), with cause in the error, event and card', async (_name, killed, cause) => {
     const f = fixture({ reruns: 2 });
     f.deps.testRunner = vi.fn(async options => {
-      report(options, 'failed');
+      report(options, f.deps.testRunner.mock.calls.length === 1 ? 'passed' : 'failed');
       return killed;
     });
     f.deps.mainTestRunner = vi.fn();
