@@ -994,6 +994,15 @@ policy provenance, invalid bounds, a lower generic env cap, and independent inst
 Reserved shared reads must respect each cap independently; only known installation pools
 retain their extra reserved slot. Exercise reserved-slot timing and release against an installation.
 
+Unidentified token caches must stay in the shared pool for every target owner; an owner map
+cannot identify a credential. Exercise the generated shim as well as the resolver. Setup and
+acquisition exceptions must refuse execution even with the ungated slot-timeout override.
+Nested admission requires a live parent holder matching the owner, invocation and pool;
+test missing, forged, released and expired evidence, plus real parent/child execution at cap.
+Older parents without this evidence receive ordinary admission; refresh those callers before
+relying on nested slot reuse. Preserve once-only budget charging and caller accounting when
+a verified child changes pools.
+
 The throttle returns a JSON `deferred-low-budget` result without invoking GitHub when a fresh,
 identity-scoped GraphQL observation crosses the caller's reservation threshold (background 25%,
 normal 10%). CLI status is zero; stderr and the spend report distinguish a skipped pass from success.

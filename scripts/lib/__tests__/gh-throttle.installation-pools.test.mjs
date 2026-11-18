@@ -17,7 +17,7 @@ import * as authCache from '../github-app-auth-env.mjs';
 import { defaultCachePath } from '../github-app-auth-env.mjs';
 import { renderGhShimScript } from '../gh-app-shim.mjs';
 import { ghInstallationPools, ghInstallationCap, ghSlotPool, ghHolderMeta, ghHolderPolicy, readGhSlotHolders, ghHoldersSummary, loadGhThrottleSettings } from '../gh-throttle-holders.mjs';
-import { acquireGhSlotSync, releaseGhSlotSync, runGhSync, runGhCliPassthrough, ghThrottleStatus, GH_SLOT_WAIT_TOOL_FILE, ghPointsBudgetStatePath, ghWriteBudgetStatePath } from '../gh-throttle.mjs';
+import { acquireGhSlotSync, releaseGhSlotSync, runGhSync, runGhCliPassthrough, ghThrottleStatus, GH_SLOT_WAIT_TOOL_FILE, ghPointsBudgetStatePath, ghWriteBudgetStatePath, writeBudgetBlock } from '../gh-throttle.mjs';
 
 
 let root;
@@ -56,6 +56,74 @@ beforeEach(() => {
   vi.spyOn(delivery, 'readDeliveryIdentity').mockReturnValue({ roles: {}, callerRoles: {}, anyConfigured: false });
 });
 afterEach(() => { vi.restoreAllMocks(); rmSync(root, { recursive: true, force: true }); });
+
+describe('admission refuses unverifiable state', () => {
+  it.each(['sync', 'cli'].flatMap(mode => ['setup', 'points', 'write', 'slot'].map(stage => [mode, stage])))('%s refuses %s exceptions even with the ungated timeout override', (mode, stage) => {
+    const execute = vi.fn(ok);
+    const env = { WE_GH_THROTTLE_ON_SLOT_TIMEOUT: 'ungated' };
+    const blockedRoot = join(root, 'not-a-directory');
+    writeFileSync(blockedRoot, 'x');
+    if (stage === 'points') mkdirSync(ghPointsBudgetStatePath(root));
+    if (stage === 'write') mkdirSync(ghWriteBudgetStatePath(root));
+    const originalMkdir = fs.mkdirSync;
+    const mkdir = vi.spyOn(fs, 'mkdirSync').mockImplementation((path, ...options) => {
+      if (stage === 'slot' && path === lockDirFor(root, slotPath(0))) throw new Error('fixture slot setup failure');
+      return originalMkdir(path, ...options);
+    });
+    syncBuiltinESMExports();
+    try {
+      const call = () => invoke(mode, env, execute, { lockRoot: stage === 'setup' ? blockedRoot : root,
+        ...(stage === 'write' ? { args: ['pr', 'comment', '1', '-R', 'example/repo', '--body', 'x'] } : {}) });
+      if (mode === 'sync') expect(call).toThrow(/throttled/);
+      else expect(call()).toMatchObject({ status: 1, throttled: true });
+      expect(execute).not.toHaveBeenCalled();
+    } finally { mkdir.mockRestore(); syncBuiltinESMExports(); }
+  });
+  it.each(['missing', 'forged', 'released', 'wrong-invocation', 'wrong-bucket'])('rejects %s parent evidence on a full pool', kind => {
+    const execute = vi.fn(ok);
+    const parent = 'parent-owner';
+    expect(acquire(null, parent, { meta: { ...ghHolderMeta({ caller: 'parent', args }), inv: 'live-inv' } }).ok).toBe(true);
+    if (kind === 'released') {
+      releaseGhSlotSync({ ...pool(null), owner: parent });
+      expect(acquire(null, 'replacement').ok).toBe(true);
+    }
+    const env = { WE_GH_THROTTLE_OUTER_INV: kind === 'wrong-invocation' ? 'forged-inv' : 'live-inv',
+      WE_GH_THROTTLE_OUTER_BUCKET: kind === 'wrong-bucket' ? '101' : 'shared',
+      WE_GH_THROTTLE_OUTER_OWNER: kind === 'missing' ? undefined : kind === 'forged' ? 'forged-owner' : parent };
+    expect(invoke('cli', env, execute)).toMatchObject({ status: 1, throttled: true });
+    expect(execute).not.toHaveBeenCalled();
+    expect(JSON.parse(readFileSync(ghPointsBudgetStatePath(root), 'utf8')).spent).toBe(1);
+  });
+  it('charges points and write budgets when stale outer labels accompany an admitted call', () => {
+    const execute = vi.fn(ok);
+    const env = { WE_GH_THROTTLE_OUTER_INV: 'stale', WE_GH_THROTTLE_OUTER_BUCKET: 'shared', WE_GH_THROTTLE_OUTER_OWNER: 'gone' };
+    expect(invoke('cli', env, execute, { args: ['pr', 'comment', '1', '-R', 'example/repo', '--body', 'x'] }).status).toBe(0);
+    expect(JSON.parse(readFileSync(ghPointsBudgetStatePath(root), 'utf8')).spent).toBe(1);
+    expect(JSON.parse(readFileSync(ghWriteBudgetStatePath(root), 'utf8')).spent).toBe(1);
+  });
+  it.each(['expired', 'dead', 'malformed'])('does not reuse a %s holder to waive budgets', kind => {
+    const parent = 'old-parent';
+    expect(acquire(null, parent, { now: () => Date.now() - (kind === 'expired' ? 200000 : 0),
+      ...(kind === 'dead' ? { pid: 2147483647 } : {}), meta: { ...ghHolderMeta({ caller: 'parent', args }), inv: 'old-inv' } }).ok).toBe(true);
+    if (kind === 'malformed') writeFileSync(join(lockDirFor(root, slotPath(0)), 'lock.json'), '{');
+    const execute = vi.fn(ok);
+    invoke('cli', { WE_GH_THROTTLE_OUTER_INV: 'old-inv', WE_GH_THROTTLE_OUTER_BUCKET: 'shared', WE_GH_THROTTLE_OUTER_OWNER: parent }, execute);
+    // Reaping may admit a replacement slot; it may never skip this call's budget.
+    expect(JSON.parse(readFileSync(ghPointsBudgetStatePath(root), 'utf8')).spent).toBe(1);
+  });
+  it('a real nested child reuses its live parent slot at cap and charges the pair once', () => {
+    const child = join(root, 'nested-gh.mjs');
+    writeFileSync(child, `#!${process.execPath}\nimport { runGhCliPassthrough } from ${JSON.stringify(new NodeURL('../gh-throttle.mjs', import.meta.url).href)};
+const result = runGhCliPassthrough(process.argv.slice(2), { throttle: { personalRoute: false }, spawn: () => ({ status: 0, stdout: Buffer.from('nested-executed'), stderr: Buffer.alloc(0) }) });
+process.stdout.write(result.stdout); process.stderr.write(result.stderr); process.exitCode = result.status;`);
+    chmodSync(child, 0o755);
+    const env = { PATH: process.env.PATH, HOME: root, ...baseEnv(), WE_GH_THROTTLE_LOCK_ROOT: root,
+      WE_GH_THROTTLE_CAP: '1', WE_GH_THROTTLE_ACQUIRE_TIMEOUT_MS: '0' };
+    expect(runGhSync(args, { env, encoding: 'utf8', throttle: { env, lockRoot: root, cap: 1, personalRoute: false, bin: child } })).toBe('nested-executed');
+    expect(JSON.parse(readFileSync(ghPointsBudgetStatePath(root), 'utf8')).spent).toBe(1);
+    expect(readGhSlotHolders({ lockRoot: root, cap: 1 })).toHaveLength(0);
+  });
+});
 
 describe('installation bucket resolution', () => {
   it('uses known bound installation identities without reading caches', () => {
@@ -217,7 +285,7 @@ console.log(result);`;
   });
   it.each([
     ['101', true],
-    ['202', false],
+    ['202', true],
     // A legacy parent publishes no label; its only pool was the shared one, so 202 still needs its own slot.
     [undefined, true],
   ])('a nested call whose outer was admitted to pool %s is throttled: %s (inner resolves installation 202, which is full)', (outerBucket, throttled) => {
@@ -267,7 +335,7 @@ console.log(result);`;
     expect(full.status).not.toBe(0);
     expect(readGhSlotHolders({ lockRoot: root, cap: 1, includeInstallations: false })).toHaveLength(1);
   });
-  it('forwards the owner-map installation for a legacy cache without an installation id (same pool as the resolver)', () => {
+  it('keeps an unidentified legacy token shared for every mapped owner, including through the generated shim', () => {
     expect(acquire(null, 'shared-holder').ok).toBe(true);
     const cachePath = defaultCachePath();
     writeFileSync(cachePath, JSON.stringify({ v: 2, token: 'ghs_fixture_legacy', expiresAt: new Date(Date.now() + 3600000).toISOString() }));
@@ -281,12 +349,21 @@ console.log(result);`;
       writeFileSync(shim, renderGhShimScript({ realGhPath: executable, cachePath, roleTable: {}, callerRoles: {} }));
     } finally { if (priorControl === undefined) delete process.env.WE_CONTROL_CLONE; else process.env.WE_CONTROL_CLONE = priorControl; }
     const env = { PATH: process.env.PATH, HOME: root, ...baseEnv(),
-      WE_GITHUB_APP_INSTALLATIONS: '{"example":"101"}', WE_GH_THROTTLE_LOCK_ROOT: root,
+      WE_GITHUB_APP_INSTALLATIONS: '{"example":"101","other":"202"}', WE_GH_THROTTLE_LOCK_ROOT: root,
       WE_GH_THROTTLE_CAP: '20', WE_GH_THROTTLE_SHARED_FALLBACK_CAP: '1', WE_GH_THROTTLE_ACQUIRE_TIMEOUT_MS: '0' };
-    expect(resolveGhSlotBucket({ identity: 'default', args, env }).bucket).toBe('101');
-    const actual = execFileSync(process.execPath, [shim, ...args], { env, encoding: 'utf8', timeout: 10000, maxBuffer: 65536 });
-    expect(actual.trim()).toBe('executed');
-    expect(rows('calls.jsonl').find(r => r.outcome === 'call')).toMatchObject({ id: 'app-installation-101' });
+    const actual = spawnSync(process.execPath, [shim, ...args], { env, encoding: 'utf8', timeout: 10000, maxBuffer: 65536 });
+    expect(actual.status).not.toBe(0);
+    expect(actual.stdout).not.toContain('executed');
+    expect(resolveGhSlotBucket({ identity: 'default', args, env }).bucket).toBeNull();
+    expect(resolveGhSlotBucket({ identity: 'default', args: ['pr', 'list', '-R', 'other/repo'], env }).bucket).toBeNull();
+    releaseGhSlotSync({ ...pool(null), owner: 'shared-holder' });
+    writeBudgetBlock(root, 'app', 'graphql', { untilMs: Date.now() + 60000 });
+    for (const owner of ['example', 'other']) {
+      const blocked = spawnSync(process.execPath, [shim, 'pr', 'list', '-R', `${owner}/repo`], { env, encoding: 'utf8', timeout: 10000, maxBuffer: 65536 });
+      expect(blocked.status).not.toBe(0);
+      expect(blocked.stdout).not.toContain('executed');
+    }
+    expect(rows('calls.jsonl').filter(r => r.outcome === 'budget_blocked')).toMatchObject([{ id: 'app' }, { id: 'app' }]);
   });
   // PR #7018 red team: the parent holds a shared slot while its shim-routed child resolves installation 101. The
   // child must not count its own parent against perCallerMax (the parent cannot release until the child returns).

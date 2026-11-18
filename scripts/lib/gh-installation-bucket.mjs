@@ -49,8 +49,11 @@ export function resolveGhInstallation({ env, caller, callerRoles, roles, cachePa
       }
     }
     if (cached) {
+      // An owner map describes the target, not the credential in an old cache.
+      // Unknown token identity must stay shared even when its filename contains an id.
+      if (conservative && !/^\d+$/.test(String(cached.installationId ?? ''))) return { role, misses, reason: 'unknown-installation' };
       if (conservative && cached.installationId != null && String(cached.installationId) !== String(id)) return { role, misses, reason: 'ambiguous' };
-      return { role, name, cached, used, installationId: id, misses, reason: 'shim-cache' };
+      return { role, name, cached, used, installationId: cached.installationId ?? null, misses, reason: 'shim-cache' };
     }
     misses.push(name + ': no fresh token cached');
   }

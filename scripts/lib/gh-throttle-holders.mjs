@@ -192,6 +192,37 @@ export function ghHoldersSummary(holders = []) {
   return holders.map(sanitizeGhHolder).map(h => `${h.bucket ? `[${h.bucket}] ` : ''}${h.caller}(${h.op}, ${Math.round(h.heldMs / 1000)}s)`).join(' ');
 }
 
+/** A label is only a hint: require a matching live invocation in the claimed pool.
+ * Reject unknown/expired evidence and unrelated processes, including after a holder is replaced. */
+export function liveGhOuterSlot({ lockRoot, bucket, owner, inv, nowMs = Date.now(), policy }) {
+  if (!(bucket === 'shared' || /^\d+$/.test(bucket ?? '')) || !owner || !inv) return false;
+  const root = bucket === 'shared' ? lockRoot : join(lockRoot, 'installations', bucket);
+  const isAncestor = target => {
+    let pid = process.pid;
+    for (let depth = 0; depth < 16 && pid > 1; depth++) {
+      if (pid === target) return true;
+      if (pid === process.pid) { pid = process.ppid; continue; }
+      try {
+        pid = Number(execFileSync('/bin/ps', ['-o', 'ppid=', '-p', String(pid)], { encoding: 'utf8', timeout: 200, maxBuffer: 1024 }).trim());
+      } catch { return false; }
+    }
+    return false;
+  };
+  for (let slot = 0; slot < 51; slot++) {
+    const entry = readLockEntry(root, slotPath(slot));
+    if (entry?.owner !== owner || entry.meta?.inv !== inv || !alive(entry.pid)) continue;
+    const acquired = Date.parse(entry.meta.acquiredAt);
+    if (!Number.isFinite(acquired) || acquired > nowMs) return false;
+    const timeoutMs = entry.meta.timeoutMs;
+    if (policy.maxHoldSeconds > 0 && timeoutMs !== 0 && nowMs - acquired > Math.max(policy.maxHoldSeconds * 1000, timeoutMs ?? 0) + policy.reapGraceSeconds * 1000) return false;
+    if (!isAncestor(entry.pid)) return false;
+    // Re-read after probing the process tree; a concurrent release/reap revokes the evidence.
+    const current = readLockEntry(root, slotPath(slot));
+    return current?.owner === owner && current?.meta?.inv === inv && current?.heartbeatAt === entry.heartbeatAt;
+  }
+  return false;
+}
+
 /** A holder from older code has no meta. Only on a timeout (never per poll), name it from the process table:
  *  its own command and its parent's, so the stall report still says who holds the slot. Best-effort. */
 export function describeLegacyHolders(holders, ps = (pid) => execFileSync('ps', ['-o', 'ppid=,command=', '-p', String(pid)], { encoding: 'utf8', timeout: 2000 })) {
@@ -208,7 +239,7 @@ export function describeLegacyHolders(holders, ps = (pid) => execFileSync('ps', 
 export function acquireGhHolderSlot({ lockRoot, cap, owner, pid, pollMs, timeoutMs, now, sleep, meta, policy, trySlot, onReap = () => {}, onWait = () => {}, callerLockRoot = lockRoot, excludeOwner = null }) {
   const startedAt = now();
   const safe = sanitizeGhHolder(meta);
-  const slotMeta = { caller: safe.caller, op: safe.op, args: safe.args, parent: safe.parent, pid, ppid: safe.ppid, ...(safe.timeoutMs !== undefined ? { timeoutMs: safe.timeoutMs } : {}) };
+  const slotMeta = { caller: safe.caller, op: safe.op, args: safe.args, parent: safe.parent, pid, ppid: safe.ppid, ...(safe.timeoutMs !== undefined ? { timeoutMs: safe.timeoutMs } : {}), ...(typeof meta?.inv === 'string' && /^[a-zA-Z0-9-]{1,128}$/.test(meta.inv) ? { inv: meta.inv } : {}) };
   const overAge = h => h.timeoutMs !== 0 && h.heldMs > Math.max(policy.maxHoldSeconds * 1000, h.timeoutMs ?? 0) + policy.reapGraceSeconds * 1000;
   for (;;) {
     const nowMs = now();

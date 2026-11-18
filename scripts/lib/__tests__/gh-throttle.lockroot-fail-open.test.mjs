@@ -4,7 +4,7 @@
  *   gh-throttle.mjs, whose lock root was derived from the CALLER'S cwd — from `/tmp` it became
  *   `/private/.lanes/.admission/gh`, mkdir hit EACCES, and the throttle crashed instead of running `gh`.
  *   Proves: (1) the lock root is cwd-independent (env override, else LANE_POOL_ROOT, else a fixed host path);
- *   (2) any throttle SETUP failure fails OPEN — gh still runs, a warning is emitted, nothing throws;
+ *   (2) throttle SETUP failures refuse execution and emit a warning;
  *   (3) the real CLI, run from a cwd outside any workspace, runs gh (the live repro, with a fake gh binary).
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -48,33 +48,33 @@ function unusableLockRoot() {
   return join(file, '.admission', 'gh');
 }
 
-describe('fail open — a broken throttle never blocks gh', () => {
-  it('runGhCliPassthrough: unusable lock root → gh still runs, output relayed, warning emitted, no throw', () => {
+describe('fail closed — a broken throttle refuses gh admission', () => {
+  it('runGhCliPassthrough: unusable lock root refuses execution and emits a warning', () => {
     const spawn = vi.fn(() => ({ status: 0, stdout: Buffer.from('[{"number":1}]'), stderr: Buffer.alloc(0), error: null }));
     const warn = vi.fn();
     const r = runGhCliPassthrough(['pr', 'list'], { throttle: { lockRoot: unusableLockRoot(), cap: 2, sleep: () => {}, warn }, spawn });
-    expect(spawn).toHaveBeenCalledTimes(1);
-    expect(r.status).toBe(0);
-    expect(r.stdout.toString()).toBe('[{"number":1}]');
+    expect(spawn).not.toHaveBeenCalled();
+    expect(r).toMatchObject({ status: 1, throttled: true });
+    expect(r.stdout.toString()).toBe('');
     expect(warn).toHaveBeenCalledWith('lock-root setup', expect.any(String));
   });
 
-  it('runGhSync: unusable lock root → the exec still runs and its result is returned', () => {
+  it('runGhSync: unusable lock root refuses execution', () => {
     const exec = vi.fn(() => 'ok-out');
     const warn = vi.fn();
-    expect(runGhSync(['api', 'rate_limit'], { throttle: { lockRoot: unusableLockRoot(), cap: 2, sleep: () => {}, exec, warn } })).toBe('ok-out');
-    expect(exec).toHaveBeenCalledTimes(1);
+    expect(() => runGhSync(['api', 'rate_limit'], { throttle: { lockRoot: unusableLockRoot(), cap: 2, sleep: () => {}, exec, warn } })).toThrow(/throttled/);
+    expect(exec).not.toHaveBeenCalled();
     expect(warn).toHaveBeenCalled();
   });
 
-  it('failOpenGate: a throwing step returns the fallback and logs a fail_open line', () => {
+  it('failOpenGate: a throwing admission step refuses the ungated fallback and logs admission_failed', () => {
     const lockRoot = mkdtempSync(join(tmpdir(), 'gh-t-failopen-log-'));
     const logPath = ghThrottleLogPath(lockRoot);
     const warn = vi.fn();
     const out = failOpenGate('acquire', () => { throw new Error('EACCES: permission denied'); }, { fallback: { ok: false }, warn, logPath, op: 'pr list' });
-    expect(out).toEqual({ ok: false });
+    expect(out).toEqual({ ok: false, admissionFailed: true, stage: 'acquire' });
     const line = JSON.parse(readFileSync(logPath, 'utf8').trim());
-    expect(line).toMatchObject({ outcome: 'fail_open', stage: 'acquire', op: 'pr list' });
+    expect(line).toMatchObject({ outcome: 'admission_failed', stage: 'acquire', op: 'pr list' });
   });
 });
 
