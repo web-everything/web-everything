@@ -1,6 +1,22 @@
 # Testing — Three-Tier Strategy
 
+## Review PR fetch isolation (R37)
+
+Review PR transport runs in a fresh temporary bare repository with empty global/system
+config, never in the agent-writable lane. The lane contributes only alternate objects and
+one negotiation ref; a bounded binary pack/index-pack handoff imports the pinned commit.
+`review-job-fetch-security.test.mjs` replants hostile local/worktree/includeIf config after
+the scrub to prove isolation, and checks failed handoffs and moved heads leave the commit absent.
+
 > Authors: APPEND new sections at the END of this file, never right after the title (`.gitattributes` union-merges it, but appending avoids overlapping insertions).
+
+## Review PR transport isolation (R37)
+
+`review-job-fetch-security.test.mjs` replants URL rewrites and transport settings after the lane
+scrub: the network fetch must run in a fresh bare repository with empty global/system config.
+Only object data crosses back through a bounded thin-pack handoff. Keep both review entry points,
+worktree/includeIf config, unborn HEAD, and refused pack/index-pack cases covered; a moved PR head
+must be refused before importing objects. Do not replace this boundary with more config reject rules.
 
 ## Human-only enqueue approval license (R212)
 
@@ -4572,6 +4588,34 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+Review lane setup uses one hardened environment for the config scrub, origin validation and fetch.
+Global and system config point at the same temporary empty file, system config is disabled, and
+inherited indexed config and config-source overrides are removed before applying the hardening
+pins. The empty file is removed on success or failure. Before scrubbing, reject effective
+`fetch.fsck.*`, `transfer.fsck.*`,
+`receive.fsck.*`, and `fsck.*` keys, including worktree and include/includeIf config
+(`git config --includes`, without `--local`): object-checking pins do not override severities or skip lists.
+An unreadable check refuses fetching; only status 1 with empty output proves no matches.
+Lane setup then reuses `scrubRiskyLaneConfig` before fetching, so removing include directives
+cannot hide prohibited fsck settings from the check.
+Retained `origin.uploadpack` and
+`origin.vcs` must never select a command: fetch only the validated repository's explicit SSH URL,
+with the lane-pool transport pins (`protocol.ext.allow=never` and
+`--upload-pack=git-upload-pack`), plus `submodule.recurse=false` and `--no-recurse-submodules`:
+populated submodules retain their own unscrubbed remote helpers. `review-job-fetch-security.test.mjs` uses real local repositories
+and marker-writing helpers, proves the hostile fixtures execute through a remote-name fetch,
+then exercises the production SSH URL without networking and verifies the marker stays absent.
+Any scrub read/removal failure refuses fetching and records an infrastructure failure requiring
+lane inspection/repair. Only the scrubber's intentionally retained exact origin keys are exempt.
+SSH transport failure surfaces directly; there is no HTTPS fallback. The job suites
+cover unreadable/oversized config, inherited global and lane URL rewrites, no fallback, and terminal failure labels.
+
+Operator prototype-load waiver tests live in `scripts/operations/__tests__/ruled-weakened-store.test.mjs`.
+Use an injected HOME and filesystem: the append-only ops store lives under
+`~/workspace/.operations/coordination/ruled-weakened.jsonl`. Tool, platform, then ops entries
+share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
+The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
+`--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
 
 
 ## R986 I1 probation core (production wiring pending)
@@ -4633,3 +4677,37 @@ a subdirectory beside the live `<slug>.json` records so no valid slug can collid
 are usable only for the ended pid; SIGKILL cannot leave a marker. Keep missing/stale
 marker, redaction, bounded-tail and diagnostic-write-failure regressions in the scoped
 review-job and review-daemon suites.
+
+## Fast-drain round listing and live target refresh
+
+Catch-up children share the `--listing-snapshot` round file. Its default TTL is 60 seconds;
+`WE_FAST_DRAIN_LISTING_SNAPSHOT_TTL_SEC` retains the existing override. Publication time starts
+the TTL after the cold listing completes. Rows retain both PR number and head OID; the target
+row is replaced wholesale by a live read, so checks/body from an old head never carry forward.
+The writer stores the resolved default branch with the rows; readers reuse it in process. A
+historical snapshot missing the branch is upgraded under the same lock without listing again.
+
+Waiters retry while the writer owns a live heartbeat lease up to the unchanged overall
+180-second default deadline. At expiry they log an exact live-listing fallback
+without publishing over the writer's shared snapshot.
+The shared clone-lock primitive reclaims a dead PID or stale lease; the next writer refreshes
+the snapshot. Lock IO failures defer to the next pass with an explicit error rather than
+launching independent live listings.
+
+Round rows are candidate evidence only (`complete:false`), including within the 60-second TTL.
+Ordering context always re-lists live pages to discover newly opened blockers and implementation
+siblings, including context-only constellation repos. Candidate repos reuse `readLiveRows` and
+its hydrated heavy-field cache/shared host seed; cached fields require a matching live head and
+`updatedAt`. Default-branch reuse avoids a second branch read without substituting cached rows
+for live sibling discovery. Eviction reuses live context rows, or re-lists when reconcile is off.
+The target always comes from `readTarget` and passes through `resolveListedChecks`, never the
+snapshot's cached target row. Missing target readers throw instead of returning cached rows.
+The existing drain gates and enqueue-time live revalidation run unchanged.
+
+`fast-drain-round-lock.test.mjs` covers concurrent single-flight, a waiter within the 180-second deadline,
+exact live fallback at the overall deadline despite a heartbeating writer,
+stale-writer takeover, lock failure, historical branch upgrade, branch failure, TTL bounds,
+oversized/incomplete/foreign evidence, target head invalidation, snapshot exclusion from live context, and
+a live target replacing a stale cached target with a different head and red check.
+Run it with `fast-drain-scope.test.mjs` and `merge-ai-prs.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
+comparison against daemon observations; fixtures prove IO counts without live GitHub calls.
