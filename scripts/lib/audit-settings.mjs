@@ -293,7 +293,9 @@ export const LOCK_USERS = Object.freeze([
   'scripts/conveyor/pr-stall-reset.mjs',
   // Landed on main since (PR #6381, CI run 43334197514): the live-owner watch IO. The review head index is a hold-scan
   // holder (LOCK_HOLDERS) and so a seed of the scan, never a lock user.
-  'scripts/conveyor/pr-live-owner-watch-io.mjs']);
+  'scripts/conveyor/pr-live-owner-watch-io.mjs',
+  // The timeout-evidence pool probes the throttle with acquireGhSlotSync/releaseGhSlotSync.
+  'scripts/conveyor/timeout-evidence-pool.mjs']);
 // The concurrency words match ANYWHERE in the basename (`forge-slot-markers.mjs`, `lane-worker-without-lease.mjs`), not
 // only at its start (PR #6381 send-back). `**/` needs at least one folder, so each entry has a twin for scripts/ itself.
 // This also protects names holding the word inside another word (`release` holds `lease`): protecting more only ever
