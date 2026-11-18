@@ -1563,7 +1563,6 @@ export function carryStackAccept({ pr, repo, root = REPO_ROOT, env = process.env
 /** CLI-only registration. Returns the callback used when the arc first knows its slug. */
 export function installReviewJobExitHooks({ proc = process, dir = reviewJobsDir() } = {}) {
   let slug;
-  let signalled = false;
   const record = (exitCode, signal) => {
     try {
       if (!slug) return;
@@ -1572,15 +1571,9 @@ export function installReviewJobExitHooks({ proc = process, dir = reviewJobsDir(
       writeFileSync(path, `${JSON.stringify({ pid: proc.pid, exitCode, signal, endedAt: new Date().toISOString() })}\n`);
     } catch { /* Exit diagnostics must never prevent termination. */ }
   };
-  proc.on('exit', code => { if (!signalled) record(code, null); });
-  for (const signal of ['SIGTERM', 'SIGHUP', 'SIGINT']) {
-    const handler = () => {
-      signalled = true;
-      record(null, signal);
-      try { proc.removeListener(signal, handler); proc.kill(proc.pid, signal); } catch { /* best effort */ }
-    };
-    proc.on(signal, handler);
-  }
+  // No signal handlers: installing one would stop a SIGTERM from killing the process during the synchronous arc.
+  // A signal death therefore fires no 'exit' event and leaves no marker, which the daemon reports as such.
+  proc.on('exit', code => record(code, null));
   return value => { if (value) slug = value; };
 }
 

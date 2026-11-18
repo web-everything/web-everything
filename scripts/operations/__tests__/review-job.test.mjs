@@ -581,25 +581,13 @@ describe('CLI exit evidence', () => {
     proc.emit('exit', 7);
     expect(marker()).toEqual({ pid: 123, exitCode: 7, signal: null, endedAt: expect.any(String) });
   });
-  it.each(['SIGTERM', 'SIGHUP', 'SIGINT'])('records %s before removing its handler and re-raising', signal => {
-    const { proc, setSlug } = hooks();
-    setSlug('review-we-42');
-    proc.kill.mockImplementation((pid, sig) => {
-      expect(pid).toBe(123);
-      expect(sig).toBe(signal);
-      expect(proc.listenerCount(signal)).toBe(0);
-      expect(marker()).toMatchObject({ exitCode: null, signal });
-    });
-    proc.emit(signal);
-    expect(proc.kill).toHaveBeenCalledTimes(1);
-    proc.emit('exit', 0);
-    expect(marker().signal).toBe(signal);
+  it.each(['SIGTERM', 'SIGHUP', 'SIGINT'])('installs no %s handler, so a signal still terminates the job', signal => {
+    const { proc } = hooks();
+    expect(proc.listenerCount(signal)).toBe(0);
   });
-  it('never throws on an unwritable marker and still re-raises the signal', () => {
+  it('never throws on an unwritable marker', () => {
     const { proc, setSlug } = hooks();
     setSlug('../invalid');
     expect(() => proc.emit('exit', 1)).not.toThrow();
-    expect(() => proc.emit('SIGTERM')).not.toThrow();
-    expect(proc.kill).toHaveBeenCalledWith(123, 'SIGTERM');
   });
 });
