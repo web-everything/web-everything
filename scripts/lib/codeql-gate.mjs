@@ -37,7 +37,9 @@ export function failedCodeQLCheck(pr) {
   const roll = Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : [];
   // This API reports failures only; ambiguous evidence must prefer a known FAILURE.
   return resolveCheckRows(roll, c => String(c?.conclusion || c?.state || '').toUpperCase() === 'FAILURE'
-    ? 'red' : 'pending').find(c => (c?.name || c?.context) === CODEQL_CHECK_NAME
+    ? 'red' : String(c?.conclusion || c?.state || '').toUpperCase() === 'SUCCESS'
+      && (c?.status == null || String(c.status).toUpperCase() === 'COMPLETED')
+      ? 'green' : 'pending').find(c => (c?.name || c?.context) === CODEQL_CHECK_NAME
     && String(c.conclusion || c.state || '').toUpperCase() === 'FAILURE') ?? null;
 }
 

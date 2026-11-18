@@ -68,14 +68,13 @@ export function resolveCheckRows(rows, classify = stateOf) {
     const latest = ambiguous || times.includes(null)
       ? null : times.reduce((max, time) => Math.max(max, time), 0);
     const candidates = latest === null ? group : group.filter((_, i) => times[i] === latest);
-    // Failure remains evidence until a strictly later completed SUCCESS in the
-    // same identified group. Pending and non-proving conclusions cannot clear it.
-    const failures = group.filter(row => classify(row) === 'red' && !successful(row));
-    const uncleared = failures.filter(failure => latest === null || !group.some(row =>
-      successful(row) && attemptTime(row) > attemptTime(failure)));
-    if (uncleared.length) return uncleared[0];
+    // Red and pending remain evidence until a strictly later completed SUCCESS
+    // in the same identified group also satisfies the caller's green policy.
+    const nonGreen = group.filter(row => ['red', 'pending'].includes(classify(row)));
+    const uncleared = nonGreen.filter(earlier => latest === null || !group.some(row =>
+      successful(row) && classify(row) === 'green' && attemptTime(row) > attemptTime(earlier)));
     const rank = row => ({ green: 0, pending: 1, red: 2 }[classify(row)] ?? 2);
-    return candidates.reduce((worst, row) => rank(row) > rank(worst) ? row : worst);
+    return [...uncleared, ...candidates].reduce((worst, row) => rank(row) > rank(worst) ? row : worst);
   });
 }
 

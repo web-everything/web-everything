@@ -6,6 +6,37 @@ const passed = { ...failed, conclusion: 'success', startedAt: '2026-10-28T02:00:
 
 describe('fail-closed workflow/check attempt resolver', () => {
   it.each([
+    ['CANCELLED', 'SKIPPED'],
+    ['FAILURE', 'NEUTRAL'],
+    ['PENDING', 'SKIPPED'],
+    ['PENDING', 'CANCELLED'],
+    ['FAILURE', 'PENDING'],
+    ['PENDING', 'FAILURE'],
+    ['FAILURE', 'SUCCESS'],
+    ['PENDING', 'SUCCESS'],
+  ])('%s -> %s retains the worst non-green evidence until completed SUCCESS', (before, after) => {
+    const attempt = (base, state) => ({ ...base,
+      status: state === 'PENDING' ? 'IN_PROGRESS' : 'COMPLETED',
+      conclusion: state === 'PENDING' ? null : state });
+    const older = attempt(failed, before);
+    const newer = attempt(passed, after);
+    const expected = after === 'SUCCESS' || after === 'FAILURE' ? newer : older;
+    for (const rows of [[older, newer], [newer, older]]) {
+      const resolved = resolveCheckRows(rows);
+      expect(resolved).toHaveLength(1);
+      // Both attempts are pending in this case; either represents the worst state.
+      expect(after === 'CANCELLED' ? [older, newer] : [expected]).toContainEqual(resolved[0]);
+    }
+  });
+  it('only a SUCCESS classified green by the caller clears earlier pending evidence', () => {
+    const pending = { ...failed, status: 'IN_PROGRESS', conclusion: null };
+    const policy = row => row === pending || row === passed ? 'pending' : 'green';
+    const skipped = { ...passed, conclusion: 'SKIPPED', startedAt: '2026-10-28T03:00:00Z' };
+    for (const rows of [[pending, passed, skipped], [skipped, passed, pending]]) {
+      expect(resolveCheckRows(rows, policy)[0]).not.toBe(skipped);
+    }
+  });
+  it.each([
     id => ({ workflow: { databaseId: id, name: 'CI' } }),
     id => ({ workflow: { id, name: 'CI' } }),
     id => ({ workflow_id: id }),

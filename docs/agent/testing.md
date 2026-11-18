@@ -4451,10 +4451,12 @@ never prove identity. Any unidentified row makes the whole name ambiguous,
 including identified producers with different display names. Missing timestamps
 or ties also prefer red, then pending, then green. Evidence kinds stay separate.
 
-A failure remains unresolved until a strictly later attempt in the same identified
-group completes with conclusion SUCCESS. Pending, skipped, neutral, cancelled and
-stale attempts cannot clear it. `resolveCheckNames` selects the worst remaining
-workflow for consumers requiring a single row per name; never build a last-wins
+A red or pending attempt remains unresolved until a strictly later attempt in the
+same identified group completes with conclusion SUCCESS and satisfies the caller's
+green policy. Pending, skipped, neutral, cancelled and stale attempts cannot clear
+it; select the worst of the uncleared evidence and latest attempts.
+`resolveCheckNames` selects the worst remaining workflow for consumers requiring
+a single row per name; never build a last-wins
 Map from `resolveCheckRows`. `rollup-collapse.mjs` remains a display helper, not a
 required-check verdict reader. Probe the resolver, CodeQL drain and ci-heal gates
 in both input orders through heavy admission.

@@ -14,6 +14,27 @@ const input = { escalation: { outcome: 'not-a-ci-break', headSha: fixture.headRe
   rollup: fixture.statusCheckRollup, requiredChecks: fixture.requiredChecks };
 const green = fixture.requiredChecks.map((name) => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' }));
 
+it.each([
+  ['CANCELLED', 'SKIPPED', 'pending'],
+  ['FAILURE', 'NEUTRAL', 'red'],
+  ['PENDING', 'SKIPPED', 'pending'],
+  ['FAILURE', 'SUCCESS', 'green'],
+])('CI escalation resolves %s -> %s as %s within one workflow', (before, after, state) => {
+  const older = { name: 'test', workflow_id: 1,
+    status: before === 'PENDING' ? 'IN_PROGRESS' : 'COMPLETED',
+    conclusion: before === 'PENDING' ? null : before, startedAt: '2026-10-28T01:00:00Z' };
+  const newer = { ...older, status: 'COMPLETED', conclusion: after, startedAt: '2026-10-28T02:00:00Z' };
+  for (const rollup of [[older, newer], [newer, older]]) {
+    const evidence = { requiredChecks: ['test'], rollup };
+    expect(requiredCheckStates(evidence)).toEqual({
+      red: state === 'red' ? ['test'] : [],
+      pending: state === 'pending' ? ['test'] : [],
+      missing: [], green: state === 'green' ? ['test'] : [],
+    });
+    expect(ciGreenForEscalation(evidence)).toBe(state === 'green');
+  }
+});
+
 describe('R272 shared every-row evidence contract', () => {
   it('retains every original row without mutation in both compatibility exports', () => {
     const older = Object.freeze({ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS',
