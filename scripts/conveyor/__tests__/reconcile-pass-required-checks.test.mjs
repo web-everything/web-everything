@@ -65,3 +65,31 @@ it.each([
     readRequiredChecks: () => ({ checks: [], source: 'unavailable' }) });
   expect(plan.dispatch.filter(row => row.kind === 'promote-draft')).toEqual([]);
 });
+
+
+it.each(['live', 'cache', 'unavailable'])('attaches rosterSource %s after hydration and logs exact evidence coverage once', async source => {
+  const { runReconcilePass } = await import('../reconcile-pass.mjs');
+  const complete = { ...xxPr(), statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+    rowsHead: XX_HEAD, rowsComplete: true };
+  const prs = [complete,
+    { ...complete, number: 2, rowsComplete: false },
+    { ...complete, number: 3, rowsHead: 'b'.repeat(40) },
+    { ...complete, number: 4, rowsComplete: 'true' },
+    { ...complete, number: 5, rowsHead: null, rowsComplete: false, statusCheckRollup: [] }];
+  const readRequiredChecks = vi.fn(() => ({ checks: ['test'], source }));
+  const readChecks = vi.fn(() => [{ id: 1, name: 'test', status: 'completed', conclusion: 'success' }]);
+  let observed;
+  const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    runReconcilePass({ ...xxOptions(), readPrs: () => prs, readRequiredChecks, readChecks,
+      enrichMainRed: rows => { observed = rows; return { prs: rows, mainRedWindows: [] }; } });
+    expect(observed).toHaveLength(5);
+    expect(observed.every(pr => pr.rosterSource === source)).toBe(true);
+    expect(observed[4].statusCheckRollup).toEqual([expect.objectContaining({ name: 'test', status: 'COMPLETED' })]);
+    expect(readRequiredChecks).toHaveBeenCalledTimes(1);
+    expect(readChecks).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls.filter(([line]) => line.startsWith('check-evidence-coverage:'))).toEqual([
+      ['check-evidence-coverage: 1/5 PRs rowsComplete===true && rowsHead===headRefOid'],
+    ]);
+  } finally { log.mockRestore(); }
+});
