@@ -4,6 +4,7 @@ import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { detectOverlayStale, readOverlayStale, readOpenPrHeads, overlayStaleSettings } from '../overlay-prune.mjs';
 import { overlayFilePath, addOverlay } from '../../daemon-overlays.mjs';
+import { finalizeRebuild } from '../adopt.mjs';
 import { prepareRebuild, readOverlayEventLog } from '../prepare.mjs';
 import * as planner from '../plan.mjs';
 import * as detector from '../overlay-prune.mjs';
@@ -242,6 +243,29 @@ it.each(['pending', 'unreadable'])('F1 %s drop intent refuses a build that chang
   const result = await prepareRebuild({ root, env, run: gitRun, now: () => 0, prBaseChain: () => [] });
   expect(result).toMatchObject({ terminal: true, result: { moved: false, reason: 'drop-pending-unsettled' } });
   expect(plan).toHaveBeenCalledTimes(1);
+});
+
+describe('finalize during an unsettled drop', () => {
+  const fin = async (plan, adopted) => {
+    stubPrepare(); writePending('pending');
+    const { writeRebuildState } = await import('../state.mjs');
+    if (adopted) writeRebuildState(root, { adopted }, env);
+    const calls = [];
+    const run = args => { calls.push(args); return { status: 0, stdout: args[0] === 'rev-parse' ? headSha : '' }; };
+    const result = await finalizeRebuild({ root, env, run, now: () => 0, plan: { ok: true, finalSha: newSha, mainSha, inputsKey: 'k', ...plan }, prevHead: headSha, lease: { token: 'lease-1' } });
+    return { result, calls };
+  };
+  it('smoke ran while a drop is pending: finalize refuses to reset HEAD when the applied set changes', async () => {
+    const { result, calls } = await fin({ applied: [{ ref, sha: tip }] });
+    expect(result).toMatchObject({ moved: false, reason: 'drop-pending-unsettled' });
+    expect(calls.some(a => a[0] === 'reset')).toBe(false);
+  });
+  it('a recovery build that keeps the applied set unchanged still finalizes', async () => {
+    const applied = [{ ref, sha: tip }];
+    const { result, calls } = await fin({ applied }, { head: headSha, inputsKey: 'k0', applied });
+    expect(result.reason).not.toBe('drop-pending-unsettled');
+    expect(calls.some(a => a[0] === 'reset')).toBe(true);
+  });
 });
 
 it('a pending drop intent also refuses an unchanged-HEAD plan that would remove a registration', async () => {

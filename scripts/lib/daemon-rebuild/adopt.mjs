@@ -13,6 +13,7 @@ import { releaseBuildLease } from './lease.mjs';
 import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
 import { revokedAppliedTips, tipInMain as gitTipInMain } from './audited-tip.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
+import { readPendingDrops } from '../../daemon-overlay.mjs';
 
 /**
  * PURE: may the ready candidate `ready` be adopted now, instead of smoking `plan`? Returns
@@ -444,6 +445,16 @@ export async function finalizeRebuild({
       alert('untracked-collision', { paths: colliding });
       return terminal({ moved: false, reason: 'untracked-collision', untracked: colliding, plan });
     }
+  }
+
+  // I2: an unsettled drop intent (or an unreadable record) blocks a finalize that changes the applied registration set.
+  // A recovery/rollback that keeps the set unchanged still finalizes.
+  let dropsPending = false;
+  try { dropsPending = readPendingDrops(root, env).length > 0; } catch { dropsPending = true; }
+  const appliedKey = (list) => JSON.stringify((list ?? []).map((a) => [a.ref, a.sha]).sort());
+  if (dropsPending && appliedKey(plan.applied) !== appliedKey(state.adopted?.applied)) {
+    alert('drop-pending-unsettled', { target: plan.finalSha });
+    return terminal({ moved: false, reason: 'drop-pending-unsettled', plan });
   }
 
   // ── The ONE `reset --hard` this module performs — always AFTER a passing smoke, never before. ──────────
