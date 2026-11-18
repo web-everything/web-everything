@@ -8,7 +8,7 @@ import { newRunRecord, readRun, writeRun } from '../../operations/run-store.mjs'
 import { readRedTeamPublicationHold } from '../drain-red-team-evidence.mjs';
 import { historicalCardOnlySkipCandidate, readDrainRedTeamEvidence, recordRedTeamStatus, readRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
-import { reviewedRead, completedSeat, completedComment } from './fixtures/red-team-owed.mjs';
+import { reviewedRead, completedSeat, completedComment, runIdentity } from './fixtures/red-team-owed.mjs';
 import { redTeamOwedFor, RED_TEAM_HOLDS } from '../review-red-team-policy.mjs';
 import { pidStartTime } from '../pid-alive.mjs';
 import { readRedTeamCarry, resumeRedTeamCarry } from '../red-team-carry-machine.mjs';
@@ -28,7 +28,7 @@ function fixture() {
 const cleanResultComment = f => completedComment(f.pr, f.head);
 // Seal at finish (#6535, operator ruling R907): the seat's sealer is the shared publisher in seal-only mode over the
 // exact-head seat row. This one runs it for real over a fixture row and thread.
-const seatRow = (head, findings = []) => ({ rev: head, findings, provider: 'fixture', model: 'fixture', callId: 'c',
+const seatRow = (head, findings = []) => ({ rev: head, findings, provider: 'fixture', model: 'fixture', callId: runIdentity.runId,
   foldedVerdict: findings.some(x => x.confirmedByRecheck) ? 'changes' : 'accept',
   confirmedMissCount: findings.filter(x => x.confirmedByRecheck).length });
 const sealAtFinish = (f, { findings = [], comments = [cleanResultComment(f)], calls = [] } = {}) => key => {
@@ -96,7 +96,7 @@ describe('status persistence and check publication share one claim', () => {
     ['missing ready-to-merge', ['review:accepted']],
   ])('a finished clean red team ignores %s labels but preserves explicit send-back failure', (_name, labels) => {
     const f = fixture(), checks = [];
-    const input = { ...f, loopPayload: payload(f.head), status: 'finished', result: 'ran' };
+    const input = { ...f, ...runIdentity, foldedVerdict: 'accept', loopPayload: payload(f.head), status: 'finished', result: 'ran' };
     const options = { env: f.env, readScorecards: () => [completedSeat(f.head, { repo: f.repo, pr: f.pr })], log: () => {}, sealFinished: sealAtFinish(f),
       comments: [{ author: { login: 'web-everything' }, body:
         completedComment(f.pr, f.head).body }],
@@ -117,7 +117,7 @@ describe('status persistence and check publication share one claim', () => {
     const finishOptions = (f, checks, extra = {}) => ({ env: f.env, readScorecards: () => [completedSeat(f.head, { repo: f.repo, pr: f.pr })], log: () => {}, comments: [cleanResultComment(f)],
       gh: () => JSON.stringify({ headRefOid: f.head, labels: ['ready-to-merge', 'review:accepted'] }),
       postCheckRun: ({ payload: check }) => { checks.push(check); return { ok: true }; }, ...extra });
-    const finished = f => ({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'ran' });
+    const finished = f => ({ ...f, ...runIdentity, foldedVerdict: 'accept', loopPayload: payload(f.head), status: 'finished', result: 'ran' });
 
     it('a clean bare `ran` is sealed under the claim, then its check is written once as success', () => {
       const f = fixture(), checks = [], calls = [];
@@ -167,7 +167,7 @@ describe('status persistence and check publication share one claim', () => {
         readSeatRow: () => seatRow(key.head), publishNeedsYou: () => {} });
       expect(recordRedTeamStatus(finished(f), finishOptions(f, checks, { comments: thread, sealFinished }))).toEqual({ published: true });
       expect(posted).toHaveLength(1);
-      expect(readRedTeamStatus(f)).toMatchObject({ sealedBreaks: [], result: { status: 'ran', comment: 'posted' } });
+      expect(readRedTeamStatus(f)).toMatchObject({ sealedBreaks: [], result: { callId: runIdentity.runId, status: 'ran', comment: 'posted' } });
       expect(checks).toMatchObject([{ status: 'completed', conclusion: 'success' }]);
     });
 
@@ -187,15 +187,15 @@ describe('status persistence and check publication share one claim', () => {
 
     it('a result that owes no publication and has no recorded result keeps its FAILURE', () => {
       const f = fixture(), checks = [];
-      recordRedTeamStatus({ ...finished(f), result: { status: 'ran', comment: 'posted', findings: [] } },
+      recordRedTeamStatus({ ...finished(f), result: { ...runIdentity, status: 'ran', comment: 'posted', findings: [] } },
         finishOptions(f, checks, { comments: [] }));
       expect(checks).toMatchObject([{ status: 'completed', conclusion: 'failure' }]);
     });
 
     it('statusOwesPublication mirrors the publisher\'s needsPublish', () => {
       for (const status of [{ status: 'finished', result: 'ran' }, { status: 'running', result: 'ran' },
-        { status: 'finished', result: { status: 'ran', comment: 'withheld' } }, { status: 'finished', result: { status: 'ran', comment: 'error' } },
-        { status: 'finished', result: { status: 'ran', comment: 'posted' } }, { status: 'finished', result: 'failed' }, null]) {
+        { status: 'finished', result: { ...runIdentity, status: 'ran', comment: 'withheld' } }, { status: 'finished', result: { ...runIdentity, status: 'ran', comment: 'error' } },
+        { status: 'finished', result: { callId: runIdentity.runId, status: 'ran', comment: 'posted' } }, { status: 'finished', result: 'failed' }, null]) {
         expect(statusOwesPublication(status)).toBe(needsPublish(status));
       }
     });
@@ -209,11 +209,11 @@ describe('status persistence and check publication share one claim', () => {
     it('pins the unsealed-hold prefix to the gate\'s own wording', () => {
       const f = fixture();
       recordRedTeamStatus(finished(f), { env: f.env });
-      const hold = redTeamEnqueueHold({ ...finished(f), inFlight: false, queued: false, seats: [completedSeat(f.head)], head: f.head, comments: [cleanResultComment(f)], scheduled: true,
+      const hold = redTeamEnqueueHold({ ...finished(f), status: readRedTeamStatus(f), inFlight: false, queued: false, seats: [completedSeat(f.head)], head: f.head, comments: [cleanResultComment(f)], scheduled: true,
         recorded: true, env: f.env });
       expect(hold).toMatch(new RegExp(`^${RED_TEAM_UNSEALED_HOLD_PREFIX}`));
       sealAtFinish(f, { comments: [] })({ repo: f.repo, pr: f.pr, head: f.head });
-      expect(redTeamEnqueueHold({ ...finished(f), inFlight: false, queued: false, seats: [], head: f.head, comments: [], scheduled: true, recorded: true, env: f.env }))
+      expect(redTeamEnqueueHold({ ...finished(f), status: readRedTeamStatus(f), inFlight: false, queued: false, seats: [], head: f.head, comments: [], scheduled: true, recorded: true, env: f.env }))
         .toBe(RED_TEAM_HOLDS['result-incomplete'].message);
     });
   });
@@ -229,7 +229,7 @@ describe('status persistence and check publication share one claim', () => {
         runs.push({ ...check, id: runs.length + 1, app: { id: appId } });
         return { ok: true };
       } };
-    expect(recordRedTeamStatus({ ...input, result: 'ran' }, options)).toEqual({ published: true });
+    expect(recordRedTeamStatus({ ...input, ...runIdentity, foldedVerdict: 'accept', result: 'ran' }, options)).toEqual({ published: true });
     expect(readRedTeamPublicationHold(f)).toBeNull();
     expect(evaluateRedTeamCheckFact({ repo: f.repo, pr: f.pr, headSha: f.head, appId, checkRuns: runs }).ok).toBe(true);
     const result = recordRedTeamStatus({ ...input, result: 'failed', sendBack: true }, {
@@ -303,7 +303,7 @@ describe('status persistence and check publication share one claim', () => {
         return { ok: true };
       },
     };
-    expect(recordRedTeamStatus({ ...input, status: 'finished', result: 'ran' }, options)).toEqual({ published: true });
+    expect(recordRedTeamStatus({ ...input, ...runIdentity, foldedVerdict: 'accept', status: 'finished', result: 'ran' }, options)).toEqual({ published: true });
     expect(evaluateRedTeamCheckFact({ repo: f.repo, pr: f.pr, headSha: f.head, appId, checkRuns: runs }).ok).toBe(true);
     const result = recordRedTeamStatus({ ...input, status }, options);
     expect(result).toMatchObject({ published: false, reason: expect.stringContaining(`Unpublished ${status} red-team round`) });
@@ -467,7 +467,7 @@ describe('status persistence and check publication share one claim', () => {
       return { ok: true };
     };
     const newerOptions = { env: f.env, gh: () => '', postCheckRun: publish };
-    recordRedTeamStatus({ ...input, status: 'finished', result: 'ran' }, {
+    recordRedTeamStatus({ ...input, ...runIdentity, foldedVerdict: 'accept', status: 'finished', result: 'ran' }, {
       env: f.env, readScorecards: () => [completedSeat(f.head, { repo: f.repo, pr: f.pr })], sealFinished: sealAtFinish(f),
       comments: [{ author: { login: 'web-everything' }, body:
         completedComment(f.pr, f.head).body }],
@@ -916,7 +916,7 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
   });
   it('reads a compact result object like the bare ran string', () => {
     const f = fixture();
-    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: { status: 'ran', foldedVerdict: 'changes', comment: 'withheld' } }, f);
+    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: { ...runIdentity, status: 'ran', foldedVerdict: 'changes', comment: 'withheld' } }, f);
     expect(readDrainRedTeamEvidence({ ...f, isAlive: () => false })).toMatchObject({ scheduled: true, recorded: true });
   });
   it('preserves local liveness when the birth-time probe is unavailable or metadata is legacy', () => {

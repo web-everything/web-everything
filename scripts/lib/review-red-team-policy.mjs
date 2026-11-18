@@ -99,6 +99,7 @@ export const RED_TEAM_EXEMPTION_INPUTS = Object.freeze({
   'scheduling.queued': x => x.scheduling?.queued === false,
   // Scheduling intent alone is not live work, but its read must have succeeded.
   'scheduling.scheduled': x => typeof x.scheduling?.scheduled === 'boolean',
+  runs: x => !!x.runs && ['result', 'comment', 'seats', 'execution', 'verdict', 'carry'].every(key => Array.isArray(x.runs[key]) && x.runs[key].length === 0),
 });
 
 /** These exemption predicates also govern every completed pass, including carried proof. */
@@ -115,6 +116,39 @@ export const RED_TEAM_BREAK_INPUTS = Object.freeze({
   storedVerdict: x => x.storedVerdict === 'changes' && x.breakResolved !== true,
 });
 
+/** The required streams participate in one identity/order comparison, including carried proof. */
+export const RED_TEAM_RUN_INPUTS = Object.freeze(['result', 'comment', 'seats', 'execution', 'verdict', 'carry']);
+export function redTeamRunProof({ runs, carry, breakResolved } = {}) {
+  if (!runs || RED_TEAM_RUN_INPUTS.some(key => !Array.isArray(runs[key]))) return 'evidence-unknown';
+  const records = RED_TEAM_RUN_INPUTS.flatMap(key => runs[key]);
+  if (records.some(row => typeof row?.runId !== 'string' || !row.runId.trim()
+    || !Number.isSafeInteger(row.order) || row.order < 0 || !['complete', 'break', 'changes', 'pending'].includes(row.outcome))) return 'evidence-unknown';
+  // Different runs cannot share an append position; one run cannot change its position between stores.
+  const byRun = new Map(), byOrder = new Map();
+  for (const row of records) {
+    if ((byRun.has(row.runId) && byRun.get(row.runId) !== row.order)
+      || (byOrder.has(row.order) && byOrder.get(row.order) !== row.runId)) return 'evidence-unknown';
+    byRun.set(row.runId, row.order); byOrder.set(row.order, row.runId);
+  }
+  for (const key of RED_TEAM_RUN_INPUTS) for (let i = 1; i < runs[key].length; i++) {
+    if (runs[key][i].order < runs[key][i - 1].order) return 'evidence-unknown';
+  }
+  const candidate = runs.result.at(-1);
+  const latestOrder = records.reduce((latest, row) => Math.max(latest, row.order), -1);
+  if (!candidate) return records.some(row => row.order === latestOrder && ['break', 'changes'].includes(row.outcome)) ? 'break' : 'evidence-unknown';
+  if (records.some(row => row.order >= candidate.order && (row.outcome === 'break'
+    || (row.outcome === 'changes' && !(breakResolved === true && row.order === candidate.order))))) return 'break';
+  if (carry && (carry.proof?.runs?.comment?.at(-1)?.runId !== candidate.runId
+    || carry.proof?.runs?.comment?.at(-1)?.order !== candidate.order)) return 'evidence-unknown';
+  const required = carry ? ['result', 'comment', 'carry'] : ['result', 'comment', 'seats', 'execution', 'verdict'];
+  if (required.some(key => !runs[key].length)) return 'evidence-unknown';
+  if (records.some(row => row.order > candidate.order || (row.order === candidate.order && row.runId !== candidate.runId))
+    || required.some(key => runs[key].at(-1).runId !== candidate.runId
+      || !(runs[key].at(-1).outcome === 'complete'
+        || (breakResolved === true && runs[key].at(-1).outcome === 'changes')))) return 'evidence-unknown';
+  return null;
+}
+
 /** One decision for admission, recovery and carry. Inputs are normalized by the evidence reader. */
 export function redTeamOwedDecision(input = {}) {
   const { head, read, seats, result, carry, scheduling = {},
@@ -128,27 +162,36 @@ export function redTeamOwedDecision(input = {}) {
   const reviewable = redTeamReadReviewable(read, head);
   if (pendingPublish) hold('pending-publish');
   if (!reviewable) hold('unreviewable-read');
-  const validSeats = Array.isArray(seats) && seats.every(row => row?.valid === true);
+  const validSeats = Array.isArray(seats) && Array.from(seats).every(row => row?.valid === true);
   if (!validSeats) hold('seat-rows-invalid');
   const recordedBreak = Object.values(RED_TEAM_BREAK_INPUTS).some(proven => proven(input));
   const exempt = !recordedBreak && Object.values(RED_TEAM_EXEMPTION_INPUTS).every(proven => proven(input));
   let owed = !exempt || reasons.length > 0;
   const completedResult = isPublishableRedTeamResult(result) && result.completedReview === true && result.rev === head;
+  const runHold = !exempt ? redTeamRunProof(input) : null;
   let carried = false;
   if (carry) {
-    carried = completedResult && !!carry.fromRev && carry.fromRev !== head && !!carry.proof
+    const sourceDecision = completedResult && carry.fromRev && carry.fromRev !== head && carry.proof
+      ? redTeamOwedDecision({ ...carry.proof, head: carry.fromRev }) : null;
+    for (const kind of ['break', 'evidence-unknown']) {
+      if (sourceDecision?.reasons.some(hold => hold.kind === kind) && !reasons.some(hold => hold.kind === kind)) hold(kind);
+    }
+    carried = !runHold && completedResult && !!carry.fromRev && carry.fromRev !== head && !!carry.proof
       && !!redTeamResultId(result) && redTeamResultId(result) === redTeamResultId(carry.proof.result)
-      && redTeamOwedDecision({ ...carry.proof, head: carry.fromRev }).cleared;
+      && sourceDecision?.cleared;
     if (!carried && !carryConflict) hold('carry-conflict');
     if (!carried) owed = true;
   }
-  const completedPass = completedResult && reviewable && read.netBasis.rev === result.rev
+  const completedPass = !runHold && completedResult && reviewable && read.netBasis.rev === result.rev
     && validSeats && seats.some(completedRedTeamSeat);
   if (recordedBreak && !completedPass && !carried && !hasBreak) reasons.unshift(RED_TEAM_HOLDS.break);
+  if (runHold && completedResult && reviewable && validSeats && seats.some(completedRedTeamSeat)
+    && !reasons.some(reason => reason.kind === runHold)) hold(runHold);
   if (owed && !carried) {
     if (!result) hold(scheduling.recorded ? 'result-incomplete' : 'pass-owed');
-    else if (!(completedResult && read?.netBasis?.rev === result.rev && validSeats && seats.some(completedRedTeamSeat))) hold('result-incomplete');
+    else if (!completedPass) hold('result-incomplete');
   }
+  if (runHold && !reasons.some(reason => reason.kind === runHold)) hold(runHold);
   for (const [key, kind] of Object.entries(RED_TEAM_CLEARANCE_INPUTS)) {
     if (!RED_TEAM_EXEMPTION_INPUTS[key](input) && !reasons.some(hold => hold.kind === kind)) hold(kind);
   }

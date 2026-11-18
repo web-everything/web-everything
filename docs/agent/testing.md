@@ -4656,6 +4656,19 @@ mutations restore silent invalid/null filters and sparse-array skipping.
 An explicitly supplied malformed snapshot never falls back to a fresh live read;
 it yields unknown evidence. Malformed carry objects cannot disappear into absent
 carry beside completed proof: normalization preserves them as carry conflicts.
+Amendment 3 binds completed admission proof to the latest execution, not merely the
+head. `normalizeRedTeamRuns` retains run identity and append order for comments,
+scorecard rows, execution/status records, stored verdicts and carry. Existing call IDs
+identify executions; scorecard append positions provide their order. Trusted result
+comments stamp that call ID. Never substitute a head SHA or wall-clock time for missing
+identity/order. Historical records without this proof hold for operator inspection.
+`RED_TEAM_RUN_INPUTS` enumerates the streams compared once by `redTeamRunProof`;
+all required streams must end at the same run. Reject missing identities, missing or
+ambiguous/equal positions and non-monotonic streams as `evidence-unknown`. A newer
+failed/error/changes record is a blocking `break`, even beside an older clean result
+and successful seat. Carry rechecks identical source-run proof. The table regression
+covers every stream; mutations remove identity, ordering and delegation checks.
+
 ## Fast-drain round listing and live target refresh
 
 Catch-up children share the `--listing-snapshot` round file. Its default TTL is 60 seconds;

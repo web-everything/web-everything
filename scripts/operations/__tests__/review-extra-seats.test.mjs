@@ -1834,3 +1834,10 @@ else process.exitCode = 1;
     else expect(call()).toEqual({ published: false, reason: 'outage' });
   });
 });
+
+it('amendment 3: direct and withheld result renderers stamp the execution call ID', () => {
+  for (const identity of [{ runId: 'execution-1' }, { callId: 'execution-1' }]) {
+    expect(renderRedTeamComment({ pr: 1, rev: 'a'.repeat(40), findings: [], foldedVerdict: 'accept', ...identity }))
+      .toContain('<!-- we:red-team-run id=execution-1 -->');
+  }
+});

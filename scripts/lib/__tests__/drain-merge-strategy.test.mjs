@@ -13,7 +13,7 @@ import { readDrainQueueSafety } from '../drain-queue-safety.mjs';
 import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
 import { rulesetSuggestion } from '../merge-queue-enqueue.mjs';
 // Load the renderer during collection: its cold import graph must not consume a gate assertion's timeout.
-import { reviewedRead, completedSeat, completedComment, idleEvidence } from './fixtures/red-team-owed.mjs';
+import { reviewedRead, completedSeat, completedComment, idleEvidence, completedExecution, completedRuns, runIdentity } from './fixtures/red-team-owed.mjs';
 import { redTeamResultCommentForHead } from '../red-team-gate.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { publishAttention } from '../../operations/needs-you-feed.mjs';
@@ -47,12 +47,12 @@ function harness({ changedFiles = ['scripts/x.mjs'], strategy = null, dryRun = f
     if (raw == null) return raw;
     if (raw?.readError) throw new Error('evidence unreadable');
     const hit = redTeamResultCommentForHead(liveComments, key.pr, key.head);
-    const carry = hit?.carriedFrom ? { fromRev: hit.carriedFrom, proof: { head: hit.carriedFrom,
+    const carry = hit?.carriedFrom ? { fromRev: hit.carriedFrom, ...runIdentity, proof: { head: hit.carriedFrom, runs: completedRuns(),
       read: reviewedRead(hit.carriedFrom), seats: [{ ...completedSeat(hit.carriedFrom), valid: true }],
       result: { ...hit.parsed, rev: hit.carriedFrom, completedReview: hit.parsed.completedReview, shapedLines: hit.parsed.shapedLines },
       scheduling: { skipCardOnly: false, inFlight: false, queued: false, commentsReadable: true, settingsReadable: true } } } : null;
     return Object.assign(Object.defineProperties(idleEvidence(), Object.getOwnPropertyDescriptors(raw ?? {})),
-      { ...(raw?.loopPayload === undefined ? { loopPayload: defaultEvidence(key.head).loopPayload } : {}),
+      { ...(hit && raw.status == null ? { status: completedExecution(key.head) } : {}), ...(raw?.loopPayload === undefined ? { loopPayload: defaultEvidence(key.head).loopPayload } : {}),
         seats: raw?.seats ?? (hit ? [completedSeat(key.head, { repo: key.repo, pr: key.pr })] : []), carry: raw?.carry ?? carry });
   };
   const calls = [];
@@ -338,7 +338,7 @@ describe('enqueue delegates red-team verdicts to merge-gate', () => {
           'security-reachable-today': 'defer-card', allowSecurityDefer: allowed,
         } }));
         setDeferral(true);
-        const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
+        const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({ runId: runIdentity.runId,
           pr: 5283, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
           findings: [{ summary: 'reachable security break', category: 'security', impactIfUnfixed: 'broken',
             confirmedByRecheck: true, findingClass: 'security-reachable-today', classBasis: 'reachable endpoint' }],
@@ -421,7 +421,7 @@ describe('enqueue delegates red-team verdicts to merge-gate', () => {
           runs.push({ ...payload, id: runs.length + 1, app: { id: appId } });
           return { ok: true };
         } };
-      recordRedTeamStatus({ ...input, status: 'finished', result: 'ran' }, options);
+      recordRedTeamStatus({ ...input, status: 'finished', result: completedExecution(HEAD).result }, options);
       expect(evaluateRedTeamCheckFact({ repo: LOCAL, pr: 5283, headSha: HEAD, appId, checkRuns: runs }).ok).toBe(true);
       expect(readRedTeamPublicationHold(key)).toBeNull();
       const result = recordRedTeamStatus({ ...input, status }, { ...options,
@@ -1107,7 +1107,7 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
     expect(h.calls.some(c => c.includes('--add-label') && c.includes('red-team:clear'))).toBe(true);
   });
   it.each([false, true])('holds a confirmed break before the gate acts (scheduled=%s)', scheduled => {
-    const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
+    const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({ runId: runIdentity.runId,
       pr: 5283, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
       findings: [{ summary: 'unresolved security break', category: 'security', impactIfUnfixed: 'broken', confirmedByRecheck: true }],
     }) }];
@@ -1140,7 +1140,7 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
     const { applyRedTeamGate } = await import('../../operations/red-team-gate-apply.mjs');
     const { buildVerdictComment } = await import('../../review-set-label.mjs');
     const { CONFIRMED_BREAKS_DEFAULTS } = await import('../red-team-gate.mjs');
-    const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
+    const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({ runId: runIdentity.runId,
       pr: 5283, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
       findings: [{ summary: 'known risk', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }],
     }) }];
@@ -1170,7 +1170,7 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
       expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
       expect(syncRedTeamStatusLabels({ repo: LOCAL, pr: 5283, head: HEAD, env,
         live: { headRefOid: HEAD, labels }, comments: thread, provider: labelProvider, standingRuling: null,
-        evidence: { ...idleEvidence(), recorded: true, loopPayload: { findings: { read: reviewedRead(HEAD) } },
+        evidence: { ...idleEvidence(), status: completedExecution(HEAD), recorded: true, loopPayload: { findings: { read: reviewedRead(HEAD) } },
           seats: [completedSeat(HEAD, { repo: LOCAL, pr: 5283 })] },
       })).toEqual({ add: 'red-team:clear', remove: ['red-team:blocked'] });
       expect(labels).toContain('red-team:clear');
@@ -1187,7 +1187,7 @@ describe('post-accept red-team enqueue barrier (#5283)', () => {
   ].flatMap(row => [true, false].map(statusLabels => [...row, statusLabels])))('follows the real gate disposition: %s (impacts=%j, round=%s, enqueued=%s, statusLabels=%s)', async (_name, impacts, round, enqueued, statusLabels) => {
     const { applyRedTeamGate } = await import('../../operations/red-team-gate-apply.mjs');
     const { CONFIRMED_BREAKS_DEFAULTS } = await import('../red-team-gate.mjs');
-    const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
+    const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({ runId: runIdentity.runId,
       pr: 5283, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
       findings: impacts.map((impact, i) => ({ summary: `break ${i}`, category: 'edge-case', impactIfUnfixed: impact, confirmedByRecheck: true })),
     }) }];
@@ -1375,7 +1375,7 @@ describe('red-team wait deadline never merges without a result (redTeam.deadline
     const T = Date.parse('2026-11-06T14:42:13Z');
     const iso = ms => new Date(ms).toISOString();
     const result = { user: { login: 'web-everything[bot]' }, createdAt: iso(T),
-      body: renderRedTeamComment({ pr: 5283, rev: HEAD, findings: [], provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'accept' }) };
+      body: renderRedTeamComment({ runId: runIdentity.runId, pr: 5283, rev: HEAD, findings: [], provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'accept' }) };
     const accept = { user: { login: 'web-everything[bot]' }, createdAt: iso(T + 14 * 60e3),
       body: `Cleared by operator.\n<!-- reviewed-sha: ${HEAD} -->\n<!-- cleared-human: chalbert -->` };
     const unfinished = () => Object.defineProperty({ ok: false, reason: 'review-unfinished' }, 'settleBounds', { enumerable: false, value: {
@@ -1672,7 +1672,7 @@ describe('red-team wait deadline never merges without a result (redTeam.deadline
 
   it('capped run evidence with a confirmed break keeps send-back routing ahead of the deadline path', async () => {
     const { renderRedTeamComment } = await import('../../operations/review-extra-seats.mjs');
-    const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
+    const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({ runId: runIdentity.runId,
       pr: 5283, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
       findings: [{ summary: 'unresolved security break', category: 'security', impactIfUnfixed: 'broken', confirmedByRecheck: true }],
     }) }];
@@ -1690,7 +1690,7 @@ describe('red-team wait deadline never merges without a result (redTeam.deadline
 
   it.each([true, false])('the operator override never waives a confirmed break, even with no run evidence (statusLabels=%s)', async statusLabels => {
     const { renderRedTeamComment } = await import('../../operations/review-extra-seats.mjs');
-    const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
+    const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({ runId: runIdentity.runId,
       pr: 5283, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
       findings: [{ summary: 'unresolved security break', category: 'security', impactIfUnfixed: 'broken', confirmedByRecheck: true }],
     }) }];
@@ -2128,7 +2128,7 @@ describe('drain pre-stage queue admission', () => {
     const prepared = s.prestage(c, HEAD);
     expect(prepared.allowed).toBe(true);
     if (variant === 'break') {
-      comments.push({ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
+      comments.push({ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({ runId: runIdentity.runId,
         pr: 5283, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
         findings: [{ summary: 'new break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }],
       }) });

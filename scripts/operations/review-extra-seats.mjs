@@ -1545,10 +1545,11 @@ const WHITESPACE_RUN = new RegExp('\\s+', 'g');
 const CLASS_UNSAFE = new RegExp('[(),]', 'g');
 
 /** The ONE advisory comment. PURE. Starts with the dedup marker line. */
-export function renderRedTeamComment({ pr, rev, provider, model, findings, recheckStatus, foldedVerdict, findingClasses = readFindingClassPolicy() }) {
+export function renderRedTeamComment({ pr, rev, provider, model, findings, recheckStatus, foldedVerdict, callId, runId = callId, findingClasses = readFindingClassPolicy() }) {
   const confirmed = findings.filter((f) => f.confirmedByRecheck);
   const head = [
     redTeamMarker(pr, rev),
+    ...(typeof runId === 'string' && /^[A-Za-z0-9._:-]+$/.test(runId) ? [`<!-- we:red-team-run id=${runId} -->`] : []),
     `### Post-accept red team — ${findings.length ? `${findings.length} possible break(s), ${confirmed.length} confirmed by Claude's re-check` : 'no break found'}`,
     '',
     `Advisory only: this comment changes no label itself; the red-team gate (setting \`redTeam.confirmedBreaks\`) sends a confirmed broken break back to the fixer. Head \`${String(rev).slice(0, 12)}\` · red team ${provider}/${model}`
@@ -1625,7 +1626,7 @@ async function finishRedTeamEffects({
 
   // ONE advisory comment per head.
   let comment;
-  const body = renderRedTeamComment({ pr, rev, provider, model, findings, recheckStatus, foldedVerdict });
+  const body = renderRedTeamComment({ pr, rev, provider, model, findings, recheckStatus, foldedVerdict, runId: callId });
   // Exclude only the generated PR/head marker line; scrub all remaining comment content.
   if (scrubPublish(body.slice(body.indexOf('\n') + 1)).length) {
     comment = { status: 'withheld', reason: 'the comment failed the secret scrub' };

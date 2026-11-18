@@ -2,10 +2,10 @@
 import { describe, expect, it } from 'vitest';
 import { RED_TEAM_HOLDS, redTeamOwedDecision, redTeamReadReviewable } from '../review-red-team-policy.mjs';
 import { parseRedTeamComment } from '../red-team-gate.mjs';
-import { reviewedRead, completedSeat, completedComment, exemptInput } from './fixtures/red-team-owed.mjs';
+import { reviewedRead, completedSeat, completedComment, exemptInput, completedRuns, runIdentity } from './fixtures/red-team-owed.mjs';
 
 const head = 'a'.repeat(40), fromRev = 'b'.repeat(40);
-const pass = (rev = head) => ({ head: rev, read: reviewedRead(rev),
+const pass = (rev = head) => ({ head: rev, read: reviewedRead(rev), runs: completedRuns(),
   seats: [{ ...completedSeat(rev), valid: true }], result: parseRedTeamComment(completedComment(42, rev).body),
   scheduling: { scheduled: true, inFlight: false, queued: false, skipCardOnly: true, commentsReadable: true, settingsReadable: true } });
 describe('redTeamOwedDecision', () => {
@@ -34,7 +34,7 @@ describe('redTeamOwedDecision', () => {
       if (value === undefined) delete input.scheduling[key]; else input.scheduling[key] = value;
       expect(redTeamOwedDecision(input)).toMatchObject({ owed: true, cleared: false });
       expect(redTeamOwedDecision(input).reasons).toContainEqual(RED_TEAM_HOLDS['pass-owed']);
-      const carried = { ...pass(), seats: [], carry: { fromRev, proof: { ...input, head: fromRev,
+      const carried = { ...pass(), seats: [], carry: { ...runIdentity, fromRev, proof: { ...input, head: fromRev,
         read: reviewedRead(fromRev), result: pass(fromRev).result, seats: pass(fromRev).seats } } };
       expect(redTeamOwedDecision(carried).cleared).toBe(false);
     }
@@ -90,7 +90,7 @@ describe('redTeamOwedDecision', () => {
     expect(redTeamReadReviewable({ ...read, netRenameSources: [] }, head)).toBe(true);
   });
   it('requires source clearance and the same non-null result id for carry', () => {
-    const input = { ...pass(), seats: [], carry: { fromRev, proof: pass(fromRev) } };
+    const input = { ...pass(), runs: { ...completedRuns(), carry: [{ ...runIdentity, outcome: 'complete' }] }, seats: [], carry: { ...runIdentity, fromRev, proof: pass(fromRev) } };
     expect(redTeamOwedDecision(input).cleared).toBe(true);
     expect(redTeamOwedDecision({ ...input, result: { ...input.result, completedReview: false } }).cleared).toBe(false);
     for (const proof of [{ ...pass(fromRev), read: null }, { ...pass(fromRev), seats: [] },
@@ -109,6 +109,52 @@ describe('redTeamOwedDecision', () => {
     expect(redTeamOwedDecision({ ...card, breakResolved: true })).toMatchObject({ owed: false, cleared: true });
     const stillOwed = redTeamOwedDecision({ ...pass(), ...recorded, result: null, breakResolved: true });
     expect(stillOwed.cleared).toBe(false); // Resolution never pays execution debt.
+  });
+  it.each(['comment', 'seats', 'execution', 'verdict', 'carry'])('amendment 3: %s requires the latest shared run identity and determinate append order', key => {
+    const make = () => {
+      const input = pass();
+      if (key === 'carry') {
+        input.seats = [];
+        input.runs.carry = [{ ...runIdentity, outcome: 'complete' }];
+        input.carry = { ...runIdentity, fromRev, proof: pass(fromRev) };
+      }
+      return input;
+    };
+    expect(redTeamOwedDecision(make()).cleared).toBe(true);
+    const newerFailure = make();
+    newerFailure.runs[key].push({ runId: 'newer-failed-run', order: 1, outcome: 'break' });
+    expect(redTeamOwedDecision(newerFailure).reasons).toContainEqual(RED_TEAM_HOLDS.break);
+    for (const corrupt of [row => { delete row.runId; }, row => { delete row.order; },
+      row => { row.order = '0'; }, row => { row.order = -1; }]) {
+      const input = make(); corrupt(input.runs[key][0]);
+      expect(redTeamOwedDecision(input).reasons).toContainEqual(RED_TEAM_HOLDS['evidence-unknown']);
+    }
+    const conflictingId = make(); conflictingId.runs[key][0].runId = 'other-run-same-position';
+    expect(redTeamOwedDecision(conflictingId).reasons).toContainEqual(RED_TEAM_HOLDS['evidence-unknown']);
+    for (const records of [
+      [{ runId: 'other', order: 0, outcome: 'complete' }], // Equal positions cannot name different runs.
+      [{ runId: 'other', order: 1, outcome: 'complete' }, { ...runIdentity, outcome: 'complete' }], // Reversed append order.
+    ]) {
+      const input = make(); input.runs[key].push(...records);
+      expect(redTeamOwedDecision(input).reasons).toContainEqual(RED_TEAM_HOLDS['evidence-unknown']);
+    }
+  });
+  it('carry propagates a newer source failure as break and missing source identity as unknown', () => {
+    const source = pass(fromRev);
+    source.runs.execution.push({ runId: 'newer-failed-run', order: 1, outcome: 'break' });
+    const input = { ...pass(), seats: [], runs: { ...completedRuns(), carry: [{ ...runIdentity, outcome: 'complete' }] },
+      carry: { ...runIdentity, fromRev, proof: source } };
+    expect(redTeamOwedDecision(input).reasons).toContainEqual(RED_TEAM_HOLDS.break);
+    delete source.runs.execution[1].runId;
+    expect(redTeamOwedDecision(input).reasons).toContainEqual(RED_TEAM_HOLDS['evidence-unknown']);
+  });
+  it('explicit resolution releases same-run changes but never a newer changes verdict', () => {
+    const input = { ...pass(), breakResolved: true };
+    input.runs.verdict[0].outcome = 'changes';
+    input.runs.seats[0].outcome = 'changes';
+    expect(redTeamOwedDecision(input).cleared).toBe(true);
+    input.runs.verdict.push({ runId: 'newer-changes-run', order: 1, outcome: 'changes' });
+    expect(redTeamOwedDecision(input).reasons).toContainEqual(RED_TEAM_HOLDS.break);
   });
   it('uses fixed hold kinds with only pending-publish non-blocking; cleared is exactly absence of holds', () => {
     expect(Object.values(RED_TEAM_HOLDS).filter(h => !h.blocking).map(h => h.kind).sort()).toEqual(['pending-publish']);

@@ -5,14 +5,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readDrainRedTeamEvidence, recordRedTeamStatus } from '../drain-red-team-evidence.mjs';
 import { planRedTeamStatusLabels, syncRedTeamStatusLabels } from '../red-team-status-labels.mjs';
-import { reviewedRead, idleEvidence, completedSeat, completedComment } from './fixtures/red-team-owed.mjs';
+import { reviewedRead, idleEvidence, completedSeat, completedComment, completedExecution, runIdentity } from './fixtures/red-team-owed.mjs';
 import { redTeamOwedDecision, RED_TEAM_HOLDS } from '../review-red-team-policy.mjs';
 import { resolveRedTeamProbes } from '../red-team-gate.mjs';
 const head = 'a'.repeat(40);
 const result = (findings = '') => ({ author: { login: 'web-everything' }, body: `<!-- we:red-team-advisory pr=42 rev=${head} -->\n${findings}` });
 const broken = '1. [**confirmed**] (edge-case, broken) `scripts/x.mjs:1` — break';
 const input = { repo: 'o/n', pr: 42, head, env: {}, labels: ['red-team:clear'] };
-const proof = () => ({ ...idleEvidence(), recorded: true, scheduled: true,
+const proof = () => ({ ...idleEvidence(), recorded: true, scheduled: true, status: completedExecution(head),
   loopPayload: { findings: { read: reviewedRead(head) } }, seats: [completedSeat(head, { repo: input.repo })] });
 it('canonical audit: a trusted marker-only comment with recorded in-flight execution and no seat proof cannot clear or remove blocked', () => {
   const plan = planRedTeamStatusLabels({ ...input, labels: ['red-team:blocked', 'red-team:clear'], comments: [result()],
@@ -35,7 +35,7 @@ it('canonical audit: finished stored changes without a published result yields a
 });
 it.each(['missing seats', 'unscored read', 'missing result'])(
   'pre-review: head-matching stored acceptance with %s preserves the normalized break and blocked label', incomplete => {
-    const evidence = { ...proof(), status: { head, status: 'finished', result: { foldedVerdict: 'accept' } } };
+    const evidence = { ...proof(), status: completedExecution(head) };
     const comments = incomplete === 'missing result' ? [] : [completedComment(42, head)];
     if (incomplete === 'missing seats') evidence.seats = [];
     if (incomplete === 'unscored read') evidence.loopPayload.findings.read.diffScored = false;
@@ -47,7 +47,7 @@ it.each(['missing seats', 'unscored read', 'missing result'])(
     expect(planRedTeamStatusLabels(options)).toEqual({ add: null, remove: [] });
   });
 it('stored acceptance resolves a blocked label only through a completed head-bound pass', () => {
-  const evidence = { ...proof(), status: { head, status: 'finished', result: { foldedVerdict: 'accept' } } };
+  const evidence = { ...proof(), status: completedExecution(head) };
   const options = { ...input, labels: ['red-team:blocked'], comments: [completedComment(42, head)], evidence };
   const normalized = readDrainRedTeamEvidence(options).decisionInput;
   expect(normalized.breakResolved).toBe(false); // The stored verdict itself grants no resolution.
