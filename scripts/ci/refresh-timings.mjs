@@ -109,7 +109,7 @@ export async function refreshFromDir({ dir, timingsFile = TIMINGS_FILE, repoRoot
     const obsolete = Object.keys(all.unit).filter(file => !known.has(file)).length;
     const storedCoverage = files.filter(file => Number.isFinite(all.unit[file]) && all.unit[file] >= 0).length / Math.max(files.length, 1);
     const balance = `stale ratio old-assignment-on-new-timings ${ratio.toFixed(2)}`;
-    if (minStale !== undefined && ratio < minStale && storedCoverage === 1 && obsolete === 0 && Object.values(all.unit).every(v => Number.isFinite(v) && v >= 0)) return { ok: true, reason: `${balance}; assignment still balanced.` };
+    if (minStale !== undefined && ratio < minStale && covered === files.length && storedCoverage === 1 && obsolete === 0 && Object.values(all.unit).every(v => Number.isFinite(v) && v >= 0)) return { ok: true, reason: `${balance}; assignment still balanced.` };
     const output = formatUpdatedTimings(all, 'unit', timings);
     pending = `${timingsFile}.${randomUUID()}.pending`;
     await write(pending, output, { flag: 'wx' });

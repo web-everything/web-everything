@@ -394,6 +394,14 @@ describe('rolling timing refresh', () => {
     expect(Object.values(JSON.parse(readFileSync(timingsFile, 'utf8')).unit).every(v => v >= 0)).toBe(true);
   });
 
+  it('does not skip on min-stale when the fresh evidence omits a current file', async () => {
+    const measured = `${JSON.stringify({ unit: Object.fromEntries(files.map(file => [file, 1])), soak: {} }, null, 1)}\n`;
+    writeFileSync(timingsFile, measured);
+    const exec = rollingExec([1000], []);
+    const partial = (cmd, args, options) => { const out = exec(cmd, args, options); if (args[1] === 'download') rmSync(join(args.at(-1), 'timing-unit-10.json')); return out; };
+    expect(await main(['--runs=1', '--min-stale=100'], { exec: partial, timingsFile, repoRoot })).toBe(2);
+  });
+
   it('writes when drift meets the threshold', async () => {
     expect(await main(['--runs=1', '--min-stale=1'], { exec: rollingExec([1000], []), timingsFile, repoRoot })).toBe(0);
     expect(readFileSync(timingsFile, 'utf8')).not.toBe(original);
