@@ -8,7 +8,7 @@ metadata:
 ---
 
 The public WE Eleventy site (#1137, epic #1104 phase 1) is **live + gated** as of 2026-07-02 at
-**`web-everything.nicgilbert.workers.dev`**, with **full auto-deploy on push to `main`**.
+**`web-everything.<account-subdomain>.workers.dev`**, with **full auto-deploy on push to `main`**.
 
 **Platform pivot — deviates from ratified #1135.** #1135 ratified *Cloudflare Pages + Pages Function*,
 but Cloudflare retired the standalone Pages "Connect to Git" flow, so the gate is a **Worker**
@@ -29,7 +29,7 @@ Also: `workers_dev` MUST be a top-level wrangler.toml key — placed after `[ass
 assets table and it's ignored. Always re-verify GET `/` returns the splash after any deploy/config change.
 
 **Other facts not in the repo:**
-- Cloudflare account subdomain permanently **`nicgilbert`** (API won't change it). Account ID `f6629f97f9d6cf92c4be7039557d30d7`.
+- Cloudflare account subdomain permanently **`<account-subdomain>`** (API won't change it). Account ID `<account-id>`.
 - Local creds: gitignored `we:.cloudflare.env` (scoped token needs **Workers Scripts · Edit**; DNS·Edit + Zone·Read for the later domain step).
 - Worker secrets: `GATE_COOKIE_SECRET` (auto-generated random) + `GATE_CODE` (user's, from Dashlane).
 
