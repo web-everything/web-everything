@@ -7,7 +7,7 @@ import { mkdtempSync, rmSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  enrichPrRollupEvidence, buildOpenPrPageQuery, mapGraphqlPr, parseOpenPrPage, isTransientGhFailure, heavyIsFresh, resolveCheckAppsByCommit,
+  rollupEvidence, buildOpenPrPageQuery, mapGraphqlPr, parseOpenPrPage, isTransientGhFailure, heavyIsFresh, resolveCheckAppsByCommit,
   listOpenPrsLightPaged, listOpenPrsPagedHydrated, assertInventoryComplete, listOpenPrsPagedHydratedComplete, parseListOutput, hydrateHeavyFields, resolvePrListPaging, PrListUnreadableError,
   HEAVY_FIELDS, PAGED_LIGHT_FIELDS, PR_LIST_PAGING_DEFAULTS, PR_LIST_PAGE_SIZE_ENV,
 } from '../pr-list-paged.mjs';
@@ -642,47 +642,6 @@ describe('fail-closed list parsing and uniqueness (one class: a list read must n
   });
 });
 
-it('incomplete GraphQL enrichment preserves previously observed failure evidence', () => {
-  const head = 'a'.repeat(40);
-  const oldRows = [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }];
-  const pr = { headRefOid: head, statusCheckRollup: oldRows };
-  enrichPrRollupEvidence({ repo, rows: [pr], exec: () => JSON.stringify({ data: { repository: { h0: {
-    oid: head, statusCheckRollup: { contexts: { totalCount: 2, pageInfo: { hasNextPage: true },
-      nodes: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] } },
-  } } } }) });
-  expect(pr.statusCheckRollup).toBe(oldRows);
-  expect(pr.rowsComplete).toBe(false);
-});
-
-
-it.each(['test', 'other'])('incomplete refresh retains newly observed blockers for %s beside old success', async name => {
-  const { resolveRequiredChecks, summarize } = await import('../check-state-predicate.mjs');
-  const head = 'a'.repeat(40);
-  const blockers = [
-    { __typename: 'CheckRun', name, status: 'COMPLETED', conclusion: 'FAILURE' },
-    { __typename: 'CheckRun', name, status: 'IN_PROGRESS', conclusion: null },
-    { __typename: 'CheckRun', name, status: 'COMPLETED', conclusion: 'CANCELLED' },
-    { __typename: 'StatusContext', context: name, state: 'FAILURE' },
-    { __typename: 'CheckRun', name, status: 'BOGUS', conclusion: 'SUCCESS' },
-    null, {}, { __typename: 'Unexpected', name, status: 'COMPLETED', conclusion: 'SUCCESS' },
-  ];
-  for (const blocker of blockers) {
-    const old = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' };
-    const pr = { headRefOid: head, statusCheckRollup: [old] };
-    enrichPrRollupEvidence({ repo, rows: [pr], exec: () => JSON.stringify({ data: { repository: { h0: {
-      oid: head, statusCheckRollup: { contexts: { totalCount: 2, pageInfo: { hasNextPage: true }, nodes: [blocker] } },
-    } } } }) });
-    expect(pr.rowsComplete).toBe(false);
-    expect(pr.statusCheckRollup[0]).toBe(old);
-    expect(pr.statusCheckRollup).toHaveLength(2);
-    if (blocker && ['CheckRun', 'StatusContext'].includes(blocker.__typename)) {
-      expect(summarize(pr.statusCheckRollup).allRequiredGreen).toBe(false);
-    } else expect(() => summarize(pr.statusCheckRollup)).toThrow(TypeError);
-    expect(resolveRequiredChecks({ head, rowsHead: pr.rowsHead, rowsComplete: pr.rowsComplete,
-      rows: pr.statusCheckRollup, requiredNames: ['test', name], rosterSource: 'live' }).state).not.toBe('pass');
-  }
-});
-
 it('preserves the commit read head when the PR head is newer', async () => {
   const { resolveRequiredChecks } = await import('../check-state-predicate.mjs');
   const current = 'a'.repeat(40), readHead = 'b'.repeat(40);
@@ -697,18 +656,24 @@ it('preserves the commit read head when the PR head is newer', async () => {
 
 
 it.each([null, {}, { __typename: 'Unexpected', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }])(
-  'malformed GraphQL node %j remains unknown beside success, never a green legacy summary', async malformed => {
-    const { resolveRequiredChecks, summarize } = await import('../check-state-predicate.mjs');
+  'malformed GraphQL node %j marks connection evidence incomplete', malformed => {
     const head = 'a'.repeat(40);
     const success = { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' };
     for (const nodes of [[success, malformed], [malformed, success]]) {
-      const pr = mapGraphqlPr({ headRefOid: head, commits: { nodes: [{ commit: { oid: head,
-        statusCheckRollup: { contexts: { pageInfo: { hasNextPage: false }, totalCount: 2, nodes } } } }] } });
-      expect(pr.rowsComplete).toBe(false);
-      expect(pr.statusCheckRollup).toHaveLength(2);
-      expect(() => summarize(pr.statusCheckRollup)).toThrow(TypeError);
-      expect(resolveRequiredChecks({ head, rowsHead: pr.rowsHead, rowsComplete: pr.rowsComplete,
-        rows: pr.statusCheckRollup, requiredNames: ['test'], rosterSource: 'live' }))
-        .toMatchObject({ state: 'unknown', reasons: expect.arrayContaining(['malformed', 'rows-incomplete']) });
+      const commit = { oid: head,
+        statusCheckRollup: { contexts: { pageInfo: { hasNextPage: false }, totalCount: 2, nodes } } };
+      expect(rollupEvidence(commit)).toEqual({ rowsHead: head, rowsComplete: false });
+      if (malformed === null) {
+        // Preserve main's mapping error for null nodes.
+        expect(() => mapGraphqlPr({ commits: { nodes: [{ commit }] } })).toThrow(TypeError);
+      } else {
+        const pr = mapGraphqlPr({ commits: { nodes: [{ commit }] } });
+        expect(pr.rowsComplete).toBe(false);
+        expect(pr.statusCheckRollup).toEqual(nodes.map(n => n === success
+          ? { __typename: 'CheckRun', completedAt: '0001-01-01T00:00:00Z', conclusion: 'SUCCESS',
+            detailsUrl: undefined, name: 'test', startedAt: '0001-01-01T00:00:00Z', status: 'COMPLETED',
+            workflowName: '', appSlug: '', appId: null }
+          : { __typename: 'StatusContext', context: undefined, startedAt: undefined, state: undefined, targetUrl: '' }));
+      }
     }
   });

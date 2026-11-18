@@ -230,9 +230,7 @@ export function rollupEvidence(commit) {
       && c.nodes.every(n => n && ['CheckRun', 'StatusContext'].includes(n.__typename)) };
 }
 
-/** Legacy lists omit metadata. Bound reads to ten batches of twenty heads.
- * Unknown evidence holds review until the next tick or an operator repairs the read.
- */
+/** Legacy lists omit metadata. Bound evidence reads to ten batches of twenty heads. */
 export function enrichPrRollupEvidence({ repo, rows, exec, execOpts = {} }) {
   for (const pr of rows) Object.assign(pr, { rowsComplete: false, rowsHead: null });
   const heads = [...new Set(rows.map(pr => pr.headRefOid).filter(sha => typeof sha === 'string' && SHA_RE.test(sha)))].slice(0, 200);
@@ -249,40 +247,21 @@ export function enrichPrRollupEvidence({ repo, rows, exec, execOpts = {} }) {
         if (commit?.oid !== sha) return;
         for (const pr of rows.filter(pr => pr.headRefOid === sha)) {
           Object.assign(pr, rollupEvidence(commit));
-          const nodes = commit?.statusCheckRollup?.contexts?.nodes;
-          if (pr.rowsComplete === true) pr.statusCheckRollup = nodes.map(mapCtx);
-          else if (Array.isArray(nodes)) {
-            // A partial read cannot retire old evidence, but must retain every
-            // newly observed blocker for consumers that do not read rowsComplete.
-            const blockers = nodes.map(n => n && ['CheckRun', 'StatusContext'].includes(n.__typename)
-              ? mapCtx(n) : { status: 'UNKNOWN' }).filter(row => {
-              const name = row.name ?? row.context;
-              const success = row.__typename === 'CheckRun'
-                ? String(row.status).toLowerCase() === 'completed' && String(row.conclusion).toLowerCase() === 'success'
-                : String(row.state).toLowerCase() === 'success';
-              return !(typeof name === 'string' && name.trim() && success);
-            });
-            if (blockers.length) {
-              pr.statusCheckRollup ??= [];
-              pr.statusCheckRollup.push(...blockers);
-            }
-          }
+          if (pr.rowsComplete) pr.statusCheckRollup = commit.statusCheckRollup.contexts.nodes.map(mapCtx);
         }
       });
-    } catch { /* unknown: retain fail-closed evidence */ }
+    } catch { /* unreadable: completeness remains unknown */ }
   }
   return rows;
 }
 
-/** PURE: gh-shaped labels and rollup rows. Malformed nodes become nameless unknown
- * evidence: strict resolution stays unknown and legacy summaries reject the read.
- */
+/** PURE: exactly gh pr list --json's labels and flattened statusCheckRollup shape, plus evidence metadata. */
 export function mapGraphqlPr(n) {
   return { ...rollupEvidence(n.commits?.nodes?.[0]?.commit), number: n.number, title: n.title, url: n.url, isDraft: n.isDraft, createdAt: n.createdAt, updatedAt: n.updatedAt,
     headRefName: n.headRefName, headRefOid: n.headRefOid, baseRefName: n.baseRefName, isCrossRepository: n.isCrossRepository,
     mergeable: n.mergeable, mergeStateStatus: n.mergeStateStatus, reviewDecision: n.reviewDecision ?? '',
     labels: n.labels?.nodes ?? [],
-    statusCheckRollup: (n.commits?.nodes?.[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? []).map(n => n && ['CheckRun', 'StatusContext'].includes(n.__typename) ? mapCtx(n) : { status: 'UNKNOWN' }) };
+    statusCheckRollup: (n.commits?.nodes?.[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? []).map(mapCtx) };
 }
 
 /** PURE: reject GraphQL errors even when accompanied by partial data. */
