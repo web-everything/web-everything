@@ -1,3 +1,4 @@
+import { assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 /**
  * @file scripts/conveyor/fix-context-pack.mjs
  * @description The CONTEXT PACK every fix / ci-heal brief carries (operator go 2026-10-10; study
@@ -367,6 +368,7 @@ export function extractFailedTests(log, max = 12) {
 /** Put the pack (and the tests rule) in front of the brief, trimming the sections it makes redundant. PURE.
  *  Both settings off → the brief unchanged. */
 export function applyContextPack(brief, { kind = 'fix', settings = CONTEXT_PACK_DEFAULTS, inputs = null, escapeTokens = true } = {}) {
+  assertBriefTaskContent(brief);
   const { contextPack, contextMaxBytes, contextLines, localTests } = settings;
   const testsOnly = () => {
     const t = localTestsSection(localTests, kind);
@@ -448,6 +450,7 @@ export function readCiPackInputs({ repoSlug, pr, exec }) {
  * @param {{kind:'fix'|'ci-heal', repoSlug:string, pr:number, exec:Function, readInputs?:Function, settings?:object, env?:object}} o
  */
 export function briefWithContextPack(brief, { kind = 'fix', repoSlug: slug, repo, toSlug, pr, exec, readInputs, settings, env = process.env } = {}) {
+  assertBriefTaskContent(brief);
   // Hermetic under a test runner: a test that wants the pack injects its settings or its reader.
   if (isUnderTest(env) && !settings && !readInputs) return brief;
   let repoSlug = slug;
