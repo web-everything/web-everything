@@ -409,6 +409,7 @@ describe('empty net diff policy settlement', () => {
     const f = fixture();
     f.io.readStatus = () => ({ head, loopPayload: { findings: { read: { netBasis: { base: 'c'.repeat(40), rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true } } } });
     f.io.gitExec = vi.fn(() => '');
+    f.io.cwd = 'subject-checkout';
     const skip = { status: 'skipped', policy: 'empty-net-diff', reason: 'red team skipped: empty net diff' };
     expect(classifyRedTeamSkip(skip).kind).toBe('policy');
     expect(f.settle(skip).outcome).toBe('policy-clear');
@@ -420,6 +421,17 @@ describe('empty net diff policy settlement', () => {
     expect(f.io.gitExec.mock.calls[0][1]).toEqual(expect.arrayContaining([
       '--no-replace-objects', '--ignore-submodules=none', '--no-ext-diff', '--no-textconv', '--no-renames',
     ]));
+    expect(f.io.gitExec.mock.calls[0][2].cwd).toBe('subject-checkout');
+  });
+  it.each([undefined, null, ''])('holds without an explicit subject cwd (%j) and never probes the process repository', cwd => {
+    const f = fixture();
+    f.io.readStatus = () => ({ head, loopPayload: { findings: { read: { netBasis: { base: 'c'.repeat(40), rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true } } } });
+    f.io.gitExec = vi.fn(() => '');
+    f.io.cwd = cwd;
+    expect(f.settle({ status: 'skipped', policy: 'empty-net-diff' }).outcome).toBe('non-policy');
+    expect(f.io.gitExec).not.toHaveBeenCalled();
+    expect(f.io.postComment).not.toHaveBeenCalled();
+    expect(f.io.publishNeedsYou).toHaveBeenCalled();
   });
 });
 
@@ -446,6 +458,7 @@ it.each(['nonempty after recording', 'probe error', 'oversized probe', 'missing 
   const read = { netBasis: { base, rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true };
   if (kind === 'missing base') delete read.netBasis.base;
   f.io.readStatus = () => ({ head, loopPayload: { findings: { read } } });
+  f.io.cwd = 'subject-checkout';
   f.io.gitExec = vi.fn((_file, args, options) => {
     expect(args).toContain(`${base}..${head}`);
     expect(options.maxBuffer).toBe(1024 * 1024);
@@ -465,6 +478,7 @@ it('R979 refuses an advanced nonempty head between recording and settlement', ()
     netBasis: { base: 'c'.repeat(40), rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true,
   } } } });
   f.io.gitExec = vi.fn(() => 'code.mjs\0');
+  f.io.cwd = 'subject-checkout';
   expect(f.settle({ status: 'skipped', policy: 'empty-net-diff' }, { head: advancedHead, readHead: advancedHead }).outcome).toBe('non-policy');
   expect(f.io.postComment).not.toHaveBeenCalled();
   expect(f.io.publishNeedsYou).toHaveBeenCalled();

@@ -171,7 +171,8 @@ export function settleRedTeamSkip(input = {}) {
       let proven = false;
       try {
         const stored = (io.readStatus ?? readRedTeamStatus)({ repo, pr, head, env: io.env ?? process.env });
-        proven = stored?.head === head && verifyEmptyNetDiff(stored.loopPayload?.findings?.read, head, { exec: io.gitExec, cwd: io.cwd });
+        // The subject checkout must be explicit, as in the planner: an unset cwd would probe the process's own repository.
+        proven = Boolean(io.cwd) && stored?.head === head && verifyEmptyNetDiff(stored.loopPayload?.findings?.read, head, { exec: io.gitExec, cwd: io.cwd });
       } catch { /* unreadable proof retains the operator hold */ }
       if (!proven) classified = { kind: 'non-policy', reason: 'empty net diff not proven for this head; inspect stored evidence' };
     }
