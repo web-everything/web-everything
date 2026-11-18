@@ -271,18 +271,14 @@ describe.skipIf(process.platform === 'win32')('real juror process group cleanup'
           // Match the production supervisor launch without Vitest's import.meta.url rewrite.
           const child = mode === 'direct spawn' ? spawn(command, argv, options)
             : spawn(process.execPath, [resolve('scripts/lib/judge-spawn-supervisor.mjs'),
-              String(process.pid), String(Date.now() + 15000), command, ...argv], options);
+              String(process.pid), String(Date.now() + 15000), command, ...argv],
+            { ...options, stdio: [...options.stdio, 'ipc'] });
           group = child.pid;
           return child;
         },
-      }).catch(error => error);
-      if (mode === 'production supervisor') {
-        expect(outcome).toBeInstanceOf(JudgeTimeoutError);
-        expect(JSON.parse(outcome.partialStdout).structured_output).toEqual({ verdict: 'accept' });
-      } else {
-        expect(outcome.value).toEqual({ verdict: 'accept' });
-        expect(outcome.timedOut).toBe(false);
-      }
+      });
+      expect(outcome.value).toEqual({ verdict: 'accept' });
+      expect(outcome.timedOut).toBe(false);
       expect(connection).toBeDefined();
       await Promise.race([
         closed,
@@ -300,21 +296,23 @@ describe.skipIf(process.platform === 'win32')('real juror process group cleanup'
     }
   }, 25000);
 
-  it('rejects a supervisor deadline kill after a valid verdict with the caller timer disabled', async () => {
+  it.each(['supervisor deadline', 'juror SIGTERM'])('rejects %s after a valid verdict with the caller timer disabled', async (mode) => {
     const dir = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), 'judge-deadline-'));
     const cli = join(dir, 'fake-cli');
     const verdict = JSON.stringify({ is_error: false, stop_reason: 'tool_use',
       structured_output: { verdict: 'accept' } });
     let supervisor;
     try {
-      writeFileSync(cli, `#!${process.execPath}\n` + keepAliveScript({
+      writeFileSync(cli, `#!${process.execPath}\n` + (mode === 'supervisor deadline' ? keepAliveScript({
         anchorPid: process.pid, maxLifetimeMs: 30000,
         prelude: `process.stdout.write(${JSON.stringify(verdict)});`,
-      }), { mode: 0o755 });
+      }) : `process.stdout.write(${JSON.stringify(verdict)},()=>process.kill(process.pid,'SIGTERM'));`),
+      { mode: 0o755 });
       const error = await judgeSpawn({ ...request, cli, timeoutMs: 0,
         spawnFn: (command, argv, options) => {
           supervisor = spawn(process.execPath, [resolve('scripts/lib/judge-spawn-supervisor.mjs'),
-            String(process.pid), String(Date.now() + 1200), command, ...argv], options);
+            String(process.pid), String(Date.now() + 1200), command, ...argv],
+          { ...options, stdio: [...options.stdio, 'ipc'] });
           return supervisor;
         },
       }).catch(error => error);

@@ -26,6 +26,8 @@ setInterval(() => {
 const child = spawn(cli, argv, { stdio: ['inherit', 'pipe', 'pipe'] });
 child.stdout.pipe(process.stdout);
 child.stderr.pipe(process.stderr);
+let jurorExit;
+child.on('exit', (code, signal) => { jurorExit = { code, signal }; });
 child.on('error', (error) => {
   process.stderr.write(`judge-spawn: \`${cli}\` failed to run: ${error.message}\n`);
 });
@@ -36,5 +38,10 @@ child.on('error', (error) => {
 child.on('close', async () => {
   await Promise.all([process.stdout, process.stderr].map(stream =>
     new Promise(resolve => stream.write('', resolve))));
+  // Record the juror's own exit before cleanup kills this supervisor. Flush the
+  // separate status channel so the caller cannot mistake our SIGKILL for its exit.
+  if (jurorExit && process.send) {
+    await new Promise(resolve => process.send({ type: 'juror-exit', ...jurorExit }, resolve));
+  }
   killGroup();
 });

@@ -926,7 +926,8 @@ export async function judgeSpawn({
         // Even a disabled caller timer gets a bounded supervisor lifetime, plus caller-death detection.
         child = spawnFn === nodeSpawn
           ? nodeSpawn(process.execPath, [fileURLToPath(new URL('./judge-spawn-supervisor.mjs', import.meta.url)),
-            String(process.pid), String(startedAt + (timeoutMs > 0 ? timeoutMs : JUDGE_TIMEOUT_MS) + JUDGE_TIMEOUT_GRACE_MS), cli, ...argv], options)
+            String(process.pid), String(startedAt + (timeoutMs > 0 ? timeoutMs : JUDGE_TIMEOUT_MS) + JUDGE_TIMEOUT_GRACE_MS), cli, ...argv],
+          { ...options, stdio: [...options.stdio, 'ipc'] })
           : spawnFn(cli, argv, options);
       } catch (e) {
         reject(new Error(`judge-spawn: could not start \`${cli}\`: ${e.message}`));
@@ -938,6 +939,14 @@ export async function judgeSpawn({
       let grace = null;
       let killed = false;
       let settled = false;
+      let jurorExit;
+      child.on('message', (message) => {
+        if (message?.type === 'juror-exit'
+          && (Number.isInteger(message.code) || message.code === null)
+          && (typeof message.signal === 'string' || message.signal === null)) {
+          jurorExit = { code: message.code, signal: message.signal };
+        }
+      });
       const killGroup = () => {
         if (Number.isInteger(child.pid) && child.pid > 0) {
           try { process.kill(-child.pid, 'SIGKILL'); return; }
@@ -991,7 +1000,10 @@ export async function judgeSpawn({
         cleanup();
         reject(new Error(`judge-spawn: \`${cli}\` failed to run: ${e.message}`));
       });
-      child.on('close', (c, signal) => settle({ stdout: out, stderr: err, code: c, signal, timedOut: killed || signal != null || c === null }));
+      child.on('close', (c, closeSignal) => {
+        const { code, signal } = jurorExit ?? { code: c, signal: closeSignal };
+        settle({ stdout: out, stderr: err, code, signal, timedOut: killed || signal != null || code === null });
+      });
       // The judged material rides stdin — see the header on ARG_MAX and the variadic `--tools`.
       child.stdin?.on('error', () => { /* the child may exit before we finish writing; `close` reports it */ });
       child.stdin?.end(input);

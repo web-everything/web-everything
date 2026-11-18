@@ -4541,6 +4541,10 @@ handler drains both destination streams before killing the whole group, includin
 itself, with the watchdogs still armed. Source closure alone does not prove that
 forwarded writes have drained. The large-output slow-reader regression checks
 stdout and stderr byte for byte under sustained backpressure.
+The supervisor records the juror's `exit` code/signal before cleanup and flushes that
+status over IPC after output drains, before group SIGKILL. The caller classifies the
+juror status rather than the supervisor's cleanup signal; successful verdict delivery
+and a juror's own signal-killed exit both have real-process regressions.
 Direct-child `exit` (or `close` with inherited stdio) cannot prove those pipes are
 closed. Named stdout/stderr regressions keep the caller timeout disabled and
 shorten only the supervisor deadline, then assert group SIGKILL and pipe closure.
