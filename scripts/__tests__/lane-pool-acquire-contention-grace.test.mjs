@@ -9,6 +9,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
+import { emptyCwdsArgs } from './fixtures/empty-lane-cwds.mjs';
 import { buildFreeLaneList, writeFreeLaneListAtomic, resolveFreeLaneListPath } from '../lib/free-lane-list.mjs';
 
 const SCRIPT = resolve('scripts/lane-pool.mjs');
@@ -23,7 +24,7 @@ const writeCache = (cache) => writeFileSync(cachePath(), JSON.stringify(cache) +
 const refreshCache = () => writeCache({ ...readCache(), writtenAt: Date.now() });
 
 function runPool(args, extraEnv = {}) {
-  const r = spawnSync(process.execPath, [SCRIPT, ...args,
+  const r = spawnSync(process.execPath, [...emptyCwdsArgs, SCRIPT, ...args,
     `--origin=${origin}`, `--reference=${reference}`, '--name=contention-grace',
     '--branch=main', '--no-install', '--no-reap', '--no-verdict-memo',
   ], {

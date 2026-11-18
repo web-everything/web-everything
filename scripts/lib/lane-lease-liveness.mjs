@@ -10,7 +10,10 @@ export function journalLiveProcessRefusal(dir, livePids, journal) {
 export function staleTakeoverHasLiveProcesses(dir, { readCwds = readLiveCwds, journal = () => {} } = {}) {
   let cwds;
   try { cwds = readCwds(); } catch { cwds = null; }
-  // Acquire previously took stale leases without any lsof probe, including hermetic mode.
-  // Preserve that fail-open behavior on unreadable lsof; explicit reclaim remains fail-closed.
-  return journalLiveProcessRefusal(dir, cwds === null ? [] : pidsWithCwdIn(cwds, dir), journal);
+  if (cwds == null) {
+    journal(dir, { action: 'reclaim-refused-live-process',
+      reason: 'live process cwd probe unreadable (lsof); restore the probe before retrying takeover' });
+    return true;
+  }
+  return journalLiveProcessRefusal(dir, pidsWithCwdIn(cwds, dir), journal);
 }

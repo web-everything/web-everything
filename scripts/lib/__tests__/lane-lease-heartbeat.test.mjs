@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { renewLaneLease, startLaneLeaseHeartbeat } from '../lane-lease-heartbeat.mjs';
@@ -31,6 +31,28 @@ describe('lane lease renewal', () => {
     expect(renewLaneLease({ cwd: dir, run })).toBe(false);
     expect(renewLaneLease({ cwd: dir, run: () => { throw Error('git'); } })).toBe(false);
     expect(renewLaneLease({ cwd: dir, run: () => ({ status: 1 }) })).toBe(false);
+  });
+
+  it.each(['released', 'session', 'holder', 'acquiredAt', 'renewedAt', 'unreadable'])('aborts renewal and removes the temporary file when the lease is %s before rename', change => {
+    const file = join(dir, '.lane-lease');
+    const lease = { session: 'owner', holder: 'holder', acquiredAt: '2026-01-01T00:00:00.000Z', ttlMinutes: 240 };
+    writeFileSync(file, JSON.stringify(lease));
+    const replacement = change === 'unreadable' ? '{' : JSON.stringify({ ...lease, [change]: 'successor' });
+    const renameSync = vi.fn();
+    expect(renewLaneLease({ cwd: dir, run: () => ({ status: 0, stdout: dir }),
+      fs: {
+        writeFileSync(tmp, body, options) {
+          writeFileSync(tmp, body, options);
+          if (change === 'released') rmSync(file);
+          else writeFileSync(file, replacement);
+        },
+        renameSync, rmSync,
+      },
+    })).toBe(false);
+    expect(renameSync).not.toHaveBeenCalled();
+    if (change === 'released') expect(existsSync(file)).toBe(false);
+    else expect(readFileSync(file, 'utf8')).toBe(replacement);
+    expect(readdirSync(dir).filter(n => n.includes('.tmp-'))).toEqual([]);
   });
 
   it('renews immediately, repeats at the default interval, unrefs and stops idempotently', () => {
@@ -75,10 +97,21 @@ describe('live process takeover refusal with injected liveness reads', () => {
     }));
   });
 
-  it.each([() => [], () => null, () => { throw Error('unreadable'); }])('keeps acquire fail-open when no occupant is observed', readCwds => {
+  it('allows takeover when the injected reader observes no occupant', () => {
     const journal = vi.fn();
-    expect(staleTakeoverHasLiveProcesses(dir, { readCwds, journal })).toBe(false);
+    expect(staleTakeoverHasLiveProcesses(dir, { readCwds: () => [], journal })).toBe(false);
     expect(journal).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['null', () => null], ['throw', () => { throw Error('lsof unavailable'); }],
+  ])('fails closed and journals an unreadable cwd probe: %s', (_, readCwds) => {
+    const journal = vi.fn();
+    expect(staleTakeoverHasLiveProcesses(dir, { readCwds, journal })).toBe(true);
+    expect(journal).toHaveBeenCalledOnce();
+    expect(journal).toHaveBeenCalledWith(dir, {
+      action: 'reclaim-refused-live-process', reason: expect.stringMatching(/probe unreadable.*retrying takeover/),
+    });
   });
 
   it('exposes reclaim process evidence for journaling while preserving its refusal reason', () => {

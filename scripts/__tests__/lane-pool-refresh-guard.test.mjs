@@ -18,6 +18,7 @@ import { spawnSync, execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { emptyCwdsArgs } from './fixtures/empty-lane-cwds.mjs';
 
 const SCRIPT = resolve(process.cwd(), 'scripts/lane-pool.mjs');
 
@@ -26,7 +27,7 @@ function git(args, cwd) {
 }
 
 function runPool(args, extraEnv = {}) {
-  const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', env: withGhStub({ ...process.env, ...extraEnv }) });
+  const r = spawnSync('node', [...emptyCwdsArgs, SCRIPT, ...args], { encoding: 'utf8', env: withGhStub({ ...process.env, ...extraEnv }) });
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
 }
 

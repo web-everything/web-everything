@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync, renameSync, rmSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { join } from 'node:path';
 import { LEASE_FILENAME, renewedLease } from './lane-lease.mjs';
 
@@ -11,7 +12,8 @@ export function renewLaneLease({ cwd, run = (file, args, opts) => spawnSync(file
     if (gd.status !== 0) return false;
     const file = join(String(gd.stdout).trim(), LEASE_FILENAME);
     if (!existsSync(file)) return false;
-    const next = renewedLease(JSON.parse(readFileSync(file, 'utf8')), now().toISOString());
+    const lease = JSON.parse(readFileSync(file, 'utf8'));
+    const next = renewedLease(lease, now().toISOString());
     if (!next) return false;
     // Atomic temp+rename, the same shape as `we:scripts/lane-pool.mjs#writeLeaseAtomic`: a plain overwrite killed
     // between its truncate and its write leaves a torn lease, which every reader treats as NO lease — making this
@@ -19,6 +21,8 @@ export function renewLaneLease({ cwd, run = (file, args, opts) => spawnSync(file
     const tmp = `${file}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
     try {
       fs.writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { flag: 'wx' });
+      // A release, takeover or another renewal since our read invalidates this snapshot.
+      if (!isDeepStrictEqual(JSON.parse(readFileSync(file, 'utf8')), lease)) return false;
       fs.renameSync(tmp, file);
     } finally {
       fs.rmSync(tmp, { force: true });

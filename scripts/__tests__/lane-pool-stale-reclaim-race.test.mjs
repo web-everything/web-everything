@@ -19,6 +19,7 @@ import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { emptyCwdsArgs } from './fixtures/empty-lane-cwds.mjs';
 
 const SCRIPT = resolve(process.cwd(), 'scripts/lane-pool.mjs');
 
@@ -29,7 +30,7 @@ function git(args, cwd) {
 let base, originDir, referenceDir, poolRoot;
 
 function runPool(args, extraEnv = {}) {
-  const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', env: withGhStub({ ...process.env, LANE_POOL_ROOT: poolRoot, ...extraEnv }) });
+  const r = spawnSync('node', [...emptyCwdsArgs, SCRIPT, ...args], { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', env: withGhStub({ ...process.env, LANE_POOL_ROOT: poolRoot, ...extraEnv }) });
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
 }
 
@@ -76,7 +77,7 @@ afterEach(() => {
 describe('#x96v5hl — two concurrent stale-lease reclaimers never both "win"', () => {
   it('the SECOND (paused) reclaimer refuses once the FIRST has already reclaimed the same stale lease', async () => {
     const barrier = join(base, 'reclaim-barrier');
-    const paused = spawn('node', [SCRIPT, 'acquire', '--lane=1', ...REPO(), '--session=reclaimer-A'], {
+    const paused = spawn('node', [...emptyCwdsArgs, SCRIPT, 'acquire', '--lane=1', ...REPO(), '--session=reclaimer-A'], {
       env: withGhStub({ ...process.env, LANE_POOL_ROOT: poolRoot, LANE_POOL_ACQUIRE_RECLAIM_TEST_BARRIER: barrier }),
     });
     let pausedOut = '';
