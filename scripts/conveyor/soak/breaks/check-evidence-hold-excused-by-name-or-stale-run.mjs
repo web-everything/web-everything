@@ -22,7 +22,7 @@ export default {
   id: 'check-evidence-hold-excused-by-name-or-stale-run',
   title: 'a merge-gate hold or check was excused by name or by an unbound/stale run, letting a PR advance',
   card: 'check-evidence-contract stack #7084 (PR2c)',
-  fixedBy: { sha: 'HEAD', where: 'lane/check-evidence-contract-pr2c', paths: [MODULE, 'scripts/conveyor/reconcile-core.mjs', 'scripts/operations/promote-draft-pr-dispatch.mjs'] },
+  fixedBy: { sha: 'e17b7a309a', where: 'lane/check-evidence-contract-pr2c', paths: [MODULE] },
   // Decided by behaviour (a child process runs the scenario against this tree), never by marker strings.
   fixPresent(root) {
     try {
@@ -53,6 +53,7 @@ export default {
       ['stale head annotation', [gateRow({}, hold({ headSha: OTHER }))]],
       ['stale run row on another head', [gateRow({ head_sha: OTHER })]],
       ['cancelled run with hold evidence', [gateRow({ conclusion: 'cancelled' }, hold({ originalConclusion: 'cancelled' }))]],
+      ['cancelled run whose annotation claims an original failure', [gateRow({ conclusion: 'cancelled' })]],
       ['timed-out run with hold evidence', [gateRow({ conclusion: 'timed_out' }, hold({ originalConclusion: 'timed_out' }))]],
       ['failed legacy merge-gate status beside a bound run', [gateRow(), { name: 'merge-gate', state: 'failure' }]],
     ];
