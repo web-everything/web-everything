@@ -2517,6 +2517,28 @@ describe('Claude red-team repair round publication', () => {
     ensureSessionCwd: p => p, grantConflictHelper: () => {}, isolateSession: () => ({}),
     resolveSettingsEnv: () => ({}), postNotice: () => {}, mintSessionId: () => 'sid' });
 
+  it('production row without mode yields a planned Claude repair that receipts before launch after label drift', () => {
+    const { comments } = thread();
+    const pr = { number: 7031, state: 'OPEN', headRefName: planned.laneRef, headRefOid: head, isDraft: false,
+      labels: [{ name: 'review:accepted' }, { name: 'red-team:blocked' }], comments, commentsComplete: true,
+      mergeStateStatus: 'CLEAN', statusCheckRollup: [], files: ['scripts/example.mjs'] };
+    expect(pr).not.toHaveProperty('mode');
+    const { planned: fixes, refusals } = planFixesFromReconcile(
+      planReconcile({ prs: [pr], agents: [], now: Date.now() }).dispatch, findItemStub, () => []);
+    expect(refusals).toEqual([]);
+    expect(fixes).toHaveLength(1);
+    pr.labels = [{ name: 'review:changes' }];
+    const exec = vi.fn((_cmd, args) => comments.push({ author: { login: 'web-everything' }, body: args.at(-1) }));
+    const spawnAgent = vi.fn(() => {
+      expect(countRedTeamFixComments(comments)).toBe(1);
+      return { sessionId: 'sid' };
+    });
+    dispatchFix({ ...fixes[0], lane: 9 }, { ...options(), spawnAgent,
+      publishRedTeamRound: request => publishRedTeamFixDispatch(request, { readComments: () => comments, exec }) });
+    expect(exec).toHaveBeenCalledOnce();
+    expect(spawnAgent).toHaveBeenCalledOnce();
+  });
+
   it.each(['lane/3438-wire-reconcile-pass', 'some-hand-opened-branch'])(
     'carries configured cap 1 from reconcile through planning and refuses a second Claude charge (%s)', headRefName => {
       const { comments } = thread();

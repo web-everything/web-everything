@@ -522,6 +522,18 @@ describe('rearm-review.mjs CLI — the empty-round guard wiring', () => {
   };
   const EMPTY = { head: H0, comments: [verdict, claim(H0)] };
 
+  it('production review:changes PR with no mode hands back a counted red-team launch without charging twice', () => {
+    const comments = repairThread();
+    const state = { number: 7, headRefOid: H0, headRefName: 'lane/7-repair', state: 'OPEN',
+      labels: lbl('review:changes'), comments };
+    expect(state).not.toHaveProperty('mode');
+    const r = run(['7', '--repo=o/r', '--round=red-team', `--expect-head=${H0}`], { head: H0, comments, state });
+    expect(r.status).toBe(0);
+    expect(bodyOf(r)).toContain(RED_TEAM_REARM_COMMENT_MARKER);
+    expect(countRearmComments([{ author: BOT, body: bodyOf(r) }])).toBe(0);
+    expect(countRedTeamFixComments([...comments, { author: BOT, body: bodyOf(r) }])).toBe(1);
+  });
+
   it('the red-team hand-back argv reaches the real pinned CLI without the public CLI target rejection', () => {
     const brief = readFileSync(resolve(dirname(SCRIPT), '../../skills-src/conveyor/fix-agent-brief.md'), 'utf8');
     const command = 'node "{{WE_ROOT}}/scripts/conveyor/rearm-review.mjs" {{PR_NUM}} --repo={{REPO}} --round=red-team --expect-head=<full-pushed-sha>';

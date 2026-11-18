@@ -42,7 +42,7 @@ import { fileURLToPath } from 'node:url';
 import { REPO_ROOT } from './detached-dispatch.mjs';
 // Imported FROM the leaf, never the other way round (see `fix.mjs#FIX_RUN_EXECUTORS`): this file's top-level `await`
 // below deadlocks if `dispatch-providers/fix.mjs` imports it back.
-import { FIX_RUN_EXECUTORS } from './dispatch-providers/fix.mjs';
+import { FIX_RUN_EXECUTORS, validatePlannedRepairMode } from './dispatch-providers/fix.mjs';
 import { PR_BASE_MERGE_TARGET, recordBorrowOutcome, recordRoutedOutcome, consecutiveUnproductiveOnHead, ROUTED_CODEX_MAX_UNPRODUCTIVE } from '../lib/fix-slot-borrow.mjs';
 import { appendFixLoopRow, isInfraFixRunOutcome, FIX_RUN_OUTCOME } from '../conveyor/fix-loop-ledger.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
@@ -111,6 +111,9 @@ export function parseFixRunArgv(argv = []) {
   for (const a of Array.isArray(argv) ? argv : []) {
     if (typeof a !== 'string' || !a.startsWith('--')) continue;
     const eq = a.indexOf('=');
+    if (a.slice(2, eq === -1 ? undefined : eq) === 'planned-repair-mode' && Object.hasOwn(flags, 'planned-repair-mode')) {
+      throw new TypeError('fix-run: duplicate --planned-repair-mode; reconcile again');
+    }
     if (eq === -1) flags[a.slice(2)] = 'true';
     else flags[a.slice(2, eq)] = a.slice(eq + 1);
   }
@@ -122,6 +125,7 @@ export function parseFixRunArgv(argv = []) {
   const repairKind = flags['repair-kind'] === undefined ? 'fix' : String(flags['repair-kind']).trim();
   if (!['fix', 'ci-heal'].includes(repairKind)) throw new TypeError(`fix-run: invalid --repair-kind=${repairKind} (supported: fix|ci-heal)`);
   return {
+    plannedRepairMode: validatePlannedRepairMode(flags['planned-repair-mode'] ?? 'ordinary'),
     redTeamRoundCap: flags['red-team-round-cap'] === undefined ? undefined : Number(flags['red-team-round-cap']),
     repairKind, launchId: opt('launch-id') ?? randomUUID(), pr: String(flags.pr).trim(), sessionSlug: String(flags.session).trim(), ref: String(flags.ref).trim(),
     promptFile: String(flags['prompt-file']).trim(),
@@ -397,9 +401,9 @@ const cap = (t, n) => (String(t ?? '').length > n ? `${String(t).slice(0, n)}\n[
  * was omitted" and committed nothing, 4 launches in a row). Throws when there is no changes-requested / advisory
  * comment: launching an agent with nothing to fix is a failure, not a no-change.
  */
-export function renderPrContext(json) {
+export function renderPrContext(json, { plannedRepairMode } = {}) {
   const pr = typeof json === 'string' ? JSON.parse(json) : json;
-  if (hasRedTeamSentBackLabels(pr)) {
+  if (plannedRepairMode === 'red-team-sent-back' || hasRedTeamSentBackLabels(pr)) {
     const findings = redTeamSentBackFindings(pr);
     if (!findings.length) throw new LauncherError('no-finding: no trusted current-head red-team send-back');
     return '## Red-team sent-back findings (authoritative ask)\nRepair and push the same branch; hand the new head back as review:pending for independent re-review.\n'
@@ -733,7 +737,7 @@ export async function runFixCli(argv = [], {
     const brief = assertBriefTaskContent(readPrompt(launch.promptFile));
     // The launcher has the network, the agent does not: fetch the reviewer's finding here and hand it over in the brief.
     const prHead = JSON.parse(run('gh', ['pr', 'view', pr, '--json', 'title,body,baseRefName,mergeable,headRefOid,labels', ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot }) || '{}');
-    let redTeamRepair = false;
+    const redTeamRepair = launch.plannedRepairMode === 'red-team-sent-back';
     prHeadSha = prHead.headRefOid ?? null;
     const mergeConflictingBase = !launch.mergeOnto && prHead.mergeable === 'CONFLICTING';
     const mergeOnto = mergeConflictingBase ? PR_BASE_MERGE_TARGET : launch.mergeOnto;
@@ -762,18 +766,18 @@ export async function runFixCli(argv = [], {
     if (hasRedTeamFixLaunch(comments, launch.launchId)) {
       throw new LauncherError('launch already spent; a new dispatch is required');
     }
+    // The plan owns accounting. Publish before context rendering or execution, including
+    // when the accepted/blocked labels have already changed to review:changes.
+    if (redTeamRepair) await chargeRedTeamLaunch();
+    else if (hasRedTeamSentBackLabels(prHead)
+      && redTeamSentBackFindings({ ...prHead, number: Number(pr), comments, commentsComplete: true }).length > 0) {
+      throw new LauncherError('red-team repair requires --planned-repair-mode=red-team-sent-back; reconcile again');
+    }
     if (launch.repairKind === 'ci-heal') {
-      if (hasRedTeamSentBackLabels(prHead)) {
-        redTeamRepair = redTeamSentBackFindings({ ...prHead, number: Number(pr), comments, commentsComplete: true }).length > 0;
-        if (redTeamRepair) await chargeRedTeamLaunch();
-      }
       const inputs = await readCiHeal({ repo: launch.repo, pr, run: (cmd, args, opts) => run(cmd, args, { cwd: weRoot, ...opts }) });
       if (!inputs.checks?.length) throw new LauncherError(`no-ci-failure: PR #${pr} has no failing check to heal`);
       prContext = renderCiHealContext(inputs);
     } else {
-      redTeamRepair = hasRedTeamSentBackLabels(prHead)
-        && redTeamSentBackFindings({ ...prHead, number: Number(pr), comments, commentsComplete: true }).length > 0;
-      if (redTeamRepair) await chargeRedTeamLaunch();
       openSendBacks = openOperatorSendBacks({ comments, headRefOid: prHeadSha });
       const safety = resolveFixSafety();
       for (const k of ['alertAtRoundCap', 'resetOnRepeatedFinding']) write(`policy · fix.${k}=${safety.value[k]} (${safety.sources[k]})\n`);
@@ -783,9 +787,9 @@ export async function runFixCli(argv = [], {
         withMessageFile(body, file => run('gh', ['pr', 'comment', pr, ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot }));
         throw new LauncherError('repeated finding: operator scope-baseline required');
       }
-      prContext = target && !hasRedTeamSentBackLabels(prHead) && !comments.some(c => CHANGES_COMMENT_RE.test(c.body ?? ''))
+      prContext = target && !redTeamRepair && !hasRedTeamSentBackLabels(prHead) && !comments.some(c => CHANGES_COMMENT_RE.test(c.body ?? ''))
         ? `## PR CONTEXT (fetched by the launcher)\nTitle: ${prHead.title ?? ''}\n${prHead.body ?? ''}\n\n`
-        : renderPrContext({ ...prHead, number: Number(pr), comments, commentsComplete: true });
+        : renderPrContext({ ...prHead, number: Number(pr), comments, commentsComplete: true }, { plannedRepairMode: launch.plannedRepairMode });
     }
     // Wait before the repair so failures from the previous head can join the same agent run and push.
     // The push boundary below reuses this deadline rather than starting a second wait budget.

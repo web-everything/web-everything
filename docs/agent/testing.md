@@ -4587,18 +4587,27 @@ failed/no-change/executor-fallback replay refusal and fresh-launch assertions in
 ### Tick red-team durable floor admission
 
 `tick-core.test.mjs` drives the tick comment-read seam through the shared complete
-reader, then plans with an empty post-restart attempt tally. Red-team hand-backs
+reader, then plans with an empty post-restart attempt tally. Repair candidates
 defer with a retry note on read failure, page-cap exhaustion, count mismatch or an
 unset floor; complete reads at zero/below/at cap preserve admission accounting.
-Keep ordinary modes fail-open on the same read failure. Persistent deferral asks
-the operator to inspect the full thread; the next tick reads fresh evidence.
+Read every repair candidate completely, including `review:changes` and `red-team:blocked`:
+a failed or truncated read cannot rule out red-team history beyond the visible prefix.
+Record an explicit unknown floor (`null`) on read failure so admission defers even after
+labels change. CI-only floors remain best effort. Persistent deferral asks the operator
+to inspect the full thread; the next tick reads fresh evidence. Keep the ten-page bound
+and the shared 128-call tick budget, including CI-only reads.
 
 ## Red-team repair charge transaction
 
-Carry reconcile mode through `shapePrs` and test the resulting row through `planFixSpawns`;
-a hand-built planner row does not prove restart floor admission. Borrowed launch IDs hash the
+Start tick tests with production `gh pr list` rows through `shapePrs`, without `mode`;
+that field exists only on planned dispatches, never on production PR discovery rows.
+Borrowed launch IDs hash the
 planned repository, PR, head, gate result and charged attempt count. Test replay through
 `fixDetachedProvider` into `runFixCli`, with a mutable trusted thread and executor spy.
+Carry the planned red-team accounting mode on validated `--planned-repair-mode` argv.
+Receipt publication and hand-back selection follow that plan even if labels changed to
+`review:changes` before the first launcher read. Test failed and no-change executions,
+receipt-before-executor ordering, and replay refusal under those changed labels.
 Both receipt writers serialize fresh complete-thread reads, shared-round counting and publication
 under the same per-repository/PR charge lock in the shared coordination root. A busy or unreadable
 lock refuses admission; after a crashed writer an operator must inspect the full thread and remove

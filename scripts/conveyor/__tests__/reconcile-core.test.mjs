@@ -106,9 +106,12 @@ describe('accepted head with unresolved red-team send-back (PR #7031)', () => {
   };
   const plan = (pr, extra = {}) => planReconcile({ prs: [pr], agents: [], now: NOW, ...extra });
 
-  it('real reconcile row survives shapePrs and defers a repair after restart with an unreadable floor', () => {
-    const prs = shapePrs(plan(makePr()).dispatch);
-    expect(prs[0]).toMatchObject({ mode: 'red-team-sent-back', prNumber: 7031, state: 'OPEN' });
+  it('production gh pr list row without mode defers a repair after restart with an unreadable floor', () => {
+    const pr = makePr();
+    expect(pr).not.toHaveProperty('mode');
+    const prs = shapePrs([pr]);
+    expect(prs[0]).not.toHaveProperty('mode');
+    expect(prs[0]).toMatchObject({ prNumber: 7031, state: 'OPEN' });
     const floors = readTickCommentFloors({ prs,
       readCompleteComments: () => { throw Error('unreadable'); },
       readComments: () => { throw Error('wrong reader'); } });

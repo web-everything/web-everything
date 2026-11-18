@@ -399,6 +399,10 @@ function hasReviewChanges(prRow) {
   return Array.isArray(prRow?.labels) && prRow.labels.includes(REVIEW_CHANGES_LABEL);
 }
 
+function hasRedTeamBlock(prRow) {
+  return labelSet(prRow?.labels).has('red-team:blocked');
+}
+
 /** Lowercased label-name set for a `state.prs` row (labels are plain strings out of `shapePrs`; tolerate `{name}`). */
 function labelSet(labels) {
   return new Set(
@@ -789,16 +793,17 @@ export function planFixSpawns({ prs = [], launchedNums = [], liveFixGuards = [],
   const notes = [];
 
   for (const p of Array.isArray(prs) ? prs : []) {
-    if (!p || !isOpenPr(p) || (!hasReviewChanges(p) && p.mode !== 'red-team-sent-back')) continue;
+    if (!p || !isOpenPr(p) || (!hasReviewChanges(p) && !hasRedTeamBlock(p))) continue;
     if (!launched.has(normNum(p.num))) continue; // only PRs THIS conveyor launched
     const pr = Number(p.prNumber);
     if (!pr) continue;
     if (guardedPrs.has(pr)) continue; // a fix agent for this PR is already live
-    // Red-team rounds must survive a restart: unknown evidence is never a zero floor.
-    if (p.mode === 'red-team-sent-back' && (!Object.hasOwn(durable, pr)
+    // The IO seam records null on any unreadable repair thread, including review:changes
+    // with red-team history. Unknown evidence is never a zero floor after restart.
+    if ((hasRedTeamBlock(p) || Object.hasOwn(durable, pr)) && (!Object.hasOwn(durable, pr)
       || !Number.isSafeInteger(durable[pr]) || durable[pr] < 0)) {
       notes.push({ kind: 'fix-floor-unavailable', num: p.num, pr,
-        text: `PR #${pr} red-team fix deferred: complete comment round floor unavailable; retry next tick (inspect full thread if persistent)` });
+        text: `PR #${pr} fix deferred: complete comment round floor unavailable; retry next tick (inspect full thread if persistent)` });
       continue;
     }
     // The DURABLE re-arm-comment count is the restart-surviving floor; the in-session tally the within-session
@@ -956,28 +961,30 @@ export function ciHealFloorFromComments(comments, { policy = resolveCiHealBudget
   return { count: chargeable, refunded };
 }
 
-/** IO seam: only red-team hand-backs require a proven complete comment thread.
- * A failed read leaves its floor absent; planFixSpawns defers that PR and retries next tick.
- * Other modes retain their best-effort floors. Readers are injected by the CLI shell.
+/** IO seam: production PR rows have labels, never a planned repair mode. Read every repair
+ * thread completely: even review:changes may hide red-team receipts beyond its first page.
+ * A failed read records an explicit unknown floor (null), never an absent/zero floor.
+ * planFixSpawns defers unknown floors and retries next tick. CI-only floors stay best effort.
  */
 export function readTickCommentFloors({ prs = [], readComments, readCompleteComments } = {}) {
   const prRearmCounts = {};
   const prCiHealCounts = {};
   const prCiHealRefunds = {};
   for (const p of Array.isArray(prs) ? prs : []) {
-    const wantsRearm = p?.prNumber && Array.isArray(p.labels) && p.labels.includes('review:changes');
+    const wantsRearm = p?.prNumber && (hasReviewChanges(p) || hasRedTeamBlock(p));
     const wantsCiHeal = p?.prNumber && isCiHealTarget(p);
     if (!wantsRearm && !wantsCiHeal) continue;
+    if (wantsRearm) prRearmCounts[p.prNumber] = null;
     try {
-      const comments = p.mode === 'red-team-sent-back' ? readCompleteComments(p) : readComments(p);
-      if (p.mode === 'red-team-sent-back' && !Array.isArray(comments)) throw Error('missing comment thread');
+      const comments = wantsRearm ? readCompleteComments(p) : readComments(p);
+      if (wantsRearm && !Array.isArray(comments)) throw Error('missing comment thread');
       if (wantsRearm) prRearmCounts[p.prNumber] = countFixRoundComments(comments);
       if (wantsCiHeal) {
         const floor = ciHealFloorFromComments(comments);
         prCiHealCounts[p.prNumber] = floor.count;
         prCiHealRefunds[p.prNumber] = floor.refunded;
       }
-    } catch { /* Absent floor blocks red-team fixes only; other modes remain fail-open. */ }
+    } catch { /* Unknown repair floors defer; CI-only floors remain best effort. */ }
   }
   return { prRearmCounts, prCiHealCounts, prCiHealRefunds };
 }
@@ -2214,9 +2221,9 @@ async function main(argv) {
     }
   } catch { /* leave the floor unset — the in-session TTL still guards */ }
 
-  // Red-team hand-backs require complete, count-proven evidence. Bound pagination to
+  // Every repair may have red-team history. Require complete, count-proven evidence. Bound pagination to
   // ten pages per PR and share 128 calls across these reads for the tick. Exhaustion
-  // leaves the floor unset: defer with an operator-visible note and retry next tick.
+  // leaves the floor unknown: defer with an operator-visible note and retry next tick.
   const { readCompletePrComments } = await import('./pr-comments-complete.mjs');
   let completeCommentCalls = 0;
   const completeCommentGh = args => {
@@ -2231,12 +2238,11 @@ async function main(argv) {
       repo: repoProfile(flags.repo ?? 'we')?.slug ?? flags.repo,
       gh: completeCommentGh, maxPages: 10,
     }),
-    // Preserve the existing best-effort read and fail-open behavior for other modes.
+    // CI-only reads share the same tick budget as complete repair reads.
     readComments: p => {
       const args = ['pr', 'view', String(p.prNumber), '--json', 'comments'];
       if (typeof flags.repo === 'string') args.push(`--repo=${flags.repo}`);
-      return JSON.parse(time('prCommentReadsMs', () => execFileSync('gh', args,
-        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' })))?.comments;
+      return completeCommentGh(args)?.comments;
     },
   });
 

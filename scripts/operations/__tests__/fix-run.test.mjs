@@ -124,6 +124,13 @@ describe('a codex borrow launches through fix-run with the filled brief', () => 
 
 describe('runFixCli', () => {
   const argv = ['--pr=7', '--session=fix-7', '--ref=lane/7-x', '--prompt-file=/p.md', '--provider=codex', '--repo=o/r', '--lane-repo=/w'];
+  const redTeamArgv = [...argv, '--planned-repair-mode=red-team-sent-back'];
+  it.each(['', 'unknown', 'red-team', 'red-team-sent-back\nordinary'])('refuses invalid planned mode %j before execution', mode => {
+    expect(() => parseFixRunArgv([...argv, `--planned-repair-mode=${mode}`])).toThrow('--planned-repair-mode');
+  });
+  it('refuses duplicate planned mode flags rather than allowing a later downgrade', () => {
+    expect(() => parseFixRunArgv([...redTeamArgv, '--planned-repair-mode=ordinary'])).toThrow('duplicate --planned-repair-mode');
+  });
   const mk = (heads) => {
     const initialHead = heads.shift();
     let laneHead = initialHead;
@@ -170,7 +177,7 @@ describe('runFixCli', () => {
       }
       return cmd === 'gh' && args.includes('view') ? JSON.stringify(pr) : result;
     };
-    const result = await runFixCli(argv, { ...m.io, run, readComments: async () => pr.comments });
+    const result = await runFixCli(redTeamArgv, { ...m.io, run, readComments: async () => pr.comments });
     expect(result.code).toBe(0);
     expect(result.result).toContain('re-armed review:pending');
     expect(m.calls.filter(c => c.includes('push'))).toHaveLength(1);
@@ -197,6 +204,18 @@ describe('runFixCli', () => {
     expect(writeErr.mock.calls.flat().join('')).toContain('no-finding');
     expect(m.spawn).not.toHaveBeenCalled();
     expect(m.calls.some(c => c.includes('acquire') || c.includes('push') || c.includes('comment'))).toBe(false);
+  });
+  it.each(['fix', 'ci-heal'])('refuses a legacy %s launch missing the planned red-team mode instead of inferring a charge from labels', async repairKind => {
+    const pr = acceptedRedTeamPr(), m = mk([pr.headRefOid]);
+    const writeErr = vi.fn();
+    const run = (cmd, args, opts) => cmd === 'gh' && args.includes('view') ? JSON.stringify(pr) : m.run(cmd, args, opts);
+    expect((await runFixCli([...argv, `--repair-kind=${repairKind}`], {
+      ...m.io, run, writeErr, readComments: async () => pr.comments,
+    })).code).toBe(1);
+    expect(writeErr).toHaveBeenCalledWith(expect.stringContaining('requires --planned-repair-mode=red-team-sent-back; reconcile again'));
+    expect(m.spawn).not.toHaveBeenCalled();
+    expect(m.calls.some(c => c.includes('acquire') || c.includes('push') || c.includes('comment'))).toBe(false);
+    expect(countRedTeamFixComments(pr.comments)).toBe(0);
   });
   it.each(['fix', 'ci-heal'])('refuses %s before execution when the spent-launch thread cannot be read', async repairKind => {
     const m = mk(['a'.repeat(40)]);
@@ -258,6 +277,61 @@ describe('runFixCli', () => {
     expect(writeErr).toHaveBeenCalledWith(expect.stringContaining('cap exhausted'));
     expect(m.spawn).not.toHaveBeenCalled();
     expect(m.calls.some(c => c.includes('acquire') || c.includes('comment') || c.includes('push'))).toBe(false);
+    expect(countRedTeamFixComments(pr.comments)).toBe(1);
+  });
+
+  it.each(['failed', 'no-change'])('production PR without mode carries planned red-team accounting through a borrowed launch after labels drift (%s)', async outcome => {
+    const pr = { ...acceptedRedTeamPr(), state: 'OPEN', headRefName: 'lane/7-x', isDraft: false,
+      mergeStateStatus: 'CLEAN', statusCheckRollup: [], files: ['scripts/example.mjs'] };
+    expect(pr).not.toHaveProperty('mode');
+    const { planned, refusals } = planFixesFromReconcile(
+      planReconcile({ prs: [pr], agents: [], now: Date.now(), roundCap: 3 }).dispatch,
+      () => ({ num: '7', scope: ['we:scripts/example.mjs'] }), () => []);
+    expect(refusals).toEqual([]);
+    expect(planned).toHaveLength(1);
+    expect(planned[0].mode).toBe('red-team-sent-back');
+    // Change labels BEFORE even the first launcher read, keeping the trusted gate thread.
+    pr.labels = [{ name: 'review:changes' }];
+    pr.comments.push({ body: '🔁 review — changes requested\nA later ordinary finding' });
+    const m = mk([pr.headRefOid, pr.headRefOid]);
+    const run = (cmd, args, opts) => {
+      if (cmd === 'gh' && args.includes('view')) return JSON.stringify(pr);
+      if (cmd === 'gh' && args.includes('comment')) {
+        expect(m.spawn).not.toHaveBeenCalled();
+        pr.comments.push({ author: { login: 'web-everything' }, body: readFileSync(args.at(-1), 'utf8') });
+      }
+      return m.run(cmd, args, opts);
+    };
+    m.spawn.mockImplementation(async request => {
+      expect(countRedTeamFixComments(pr.comments)).toBe(1);
+      expect(request.prompt).toContain('Gate break to repair');
+      if (outcome === 'failed') throw Error('executor failed after receipt');
+    });
+    let launched;
+    let launchArgv;
+    dispatchFix({ ...planned[0], lane: 2 }, {
+      root: '/repo', repo: 'we', borrowed: { executor: 'codex', reason: 'borrowed-build-slot' },
+      readFixClaim: () => null, acquireClaim: () => ({ ok: true }), releaseClaim: () => {}, stampRunner: () => {},
+      postNotice: () => {}, readBrief: () => 'brief {{PR_NUM}} {{LANE_REF}}',
+      writeBorrowedPrompt: () => '/brief.md', checkoutExists: () => true, readPackageJson: () => ({ scripts: {} }),
+      spawnBorrowed: request => fixDetachedProvider(request, {
+        readDeliveryAgentMarker: () => null, logPathFor: () => '/logs/fix-7',
+        spawnDetached: args => {
+          launchArgv = args.slice(1);
+          expect(parseFixRunArgv(launchArgv).plannedRepairMode).toBe('red-team-sent-back');
+          launched = runFixCli(launchArgv, { ...m.io, run, readComments: async () => pr.comments });
+          return { pid: 99 };
+        },
+      }),
+    });
+    expect((await launched).code).toBe(outcome === 'failed' ? 1 : 0);
+    expect(m.spawn).toHaveBeenCalledOnce();
+    expect(countRedTeamFixComments(pr.comments)).toBe(1);
+    expect(m.calls.some(c => c.includes('push'))).toBe(false);
+    const writeErr = vi.fn();
+    expect((await runFixCli(launchArgv, { ...m.io, run, writeErr, readComments: async () => pr.comments })).code).toBe(1);
+    expect(writeErr).toHaveBeenCalledWith(expect.stringContaining('launch already spent'));
+    expect(m.spawn).toHaveBeenCalledOnce();
     expect(countRedTeamFixComments(pr.comments)).toBe(1);
   });
 
@@ -347,7 +421,7 @@ describe('runFixCli', () => {
     });
     const writeErr = vi.fn();
     const run = (cmd, args, opts) => cmd === 'gh' && args.includes('view') ? JSON.stringify(pr) : m.run(cmd, args, opts);
-    expect((await runFixCli([...argv, '--red-team-round-cap=3'], { ...m.io, run, readComments, writeErr })).code).toBe(1);
+    expect((await runFixCli([...redTeamArgv, '--red-team-round-cap=3'], { ...m.io, run, readComments, writeErr })).code).toBe(1);
     expect(readComments).toHaveBeenCalledTimes(2);
     expect(writeErr).toHaveBeenCalledWith(expect.stringContaining('cap exhausted'));
     expect(m.spawn).not.toHaveBeenCalled();
@@ -374,7 +448,7 @@ describe('runFixCli', () => {
     const run = (cmd, args, opts) => cmd === 'gh' && args.includes('view')
       ? JSON.stringify(pr) : m.run(cmd, args, opts);
     const writeErr = vi.fn();
-    expect((await runFixCli([...argv, `--launch-id=${launchId}`], {
+    expect((await runFixCli([...redTeamArgv, `--launch-id=${launchId}`], {
       ...m.io, run, writeErr, readComments: async () => pr.comments,
     })).code).toBe(1);
     expect(m.spawn).not.toHaveBeenCalled();
@@ -401,7 +475,7 @@ describe('runFixCli', () => {
       }
     });
     const spawnCodex = vi.fn().mockRejectedValueOnce(Error('executor unavailable')).mockResolvedValueOnce({});
-    const launchArgv = [...argv, '--launch-id=same-launch'];
+    const launchArgv = [...redTeamArgv, '--launch-id=same-launch'];
     const io = { ...m.io, run, spawnCodex, readComments: async () => pr.comments };
     expect((await runFixCli(launchArgv, io)).code).toBe(kind === 'failed' ? 1 : 0);
     expect(countRedTeamFixComments(pr.comments)).toBe(1);
@@ -428,7 +502,7 @@ describe('runFixCli', () => {
     expect(countRedTeamFixComments(pr.comments)).toBe(1);
     pr.labels = acceptedRedTeamPr().labels;
     // A new dispatch on the same head and gate result still consumes a new round.
-    expect((await runFixCli([...argv, '--launch-id=new-launch'], io)).code).toBe(0);
+    expect((await runFixCli([...redTeamArgv, '--launch-id=new-launch'], io)).code).toBe(0);
     expect(m.spawn).toHaveBeenCalledTimes(1);
     expect(countRedTeamFixComments(pr.comments)).toBe(2);
   });
@@ -446,7 +520,7 @@ describe('runFixCli', () => {
         return cmd === 'gh' && args.includes('view') ? JSON.stringify(pr) : result;
       };
       m.spawn.mockRejectedValue(Error('agent crashed'));
-      expect((await runFixCli([...argv, `--launch-id=${launchId}`], {
+      expect((await runFixCli([...redTeamArgv, `--launch-id=${launchId}`], {
         ...m.io, run, readComments: async () => pr.comments,
       })).code).toBe(1);
       expect(m.calls.some(c => c.includes('push'))).toBe(false);
@@ -489,7 +563,7 @@ describe('runFixCli', () => {
       if (args[0] === '/we/scripts/conveyor/rearm-review.mjs') throw new Error('nothing to re-arm');
       return cmd === 'gh' && args.includes('view') ? JSON.stringify(pr) : result;
     };
-    const result = await runFixCli(argv, { ...m.io, run, readComments: async () => pr.comments });
+    const result = await runFixCli(redTeamArgv, { ...m.io, run, readComments: async () => pr.comments });
     expect(result.code).toBe(1);
     expect(m.owed.sha).toBe('b'.repeat(40));
     expect(m.pendingRearm.clear).not.toHaveBeenCalled();
@@ -502,7 +576,7 @@ describe('runFixCli', () => {
       if (cmd === 'gh' && args.includes('comment')) throw new Error('comment unavailable');
       return cmd === 'gh' && args.includes('view') ? JSON.stringify(pr) : result;
     };
-    const result = await runFixCli(argv, { ...m.io, run, readComments: async () => pr.comments });
+    const result = await runFixCli(redTeamArgv, { ...m.io, run, readComments: async () => pr.comments });
     expect(result.code).toBe(1);
     expect(m.owed.sha).toBe(null);
     expect(m.spawn).not.toHaveBeenCalled();

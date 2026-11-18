@@ -13,7 +13,7 @@
  *   • WATCHER ARMING (one per conveyor-launched open PR), IDLE-STOP, the exit-code router, and the whole
  *     {@link planTick} composition — including the free-lane exclusion shared across builds and prepares.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   retireBuildGuards,
   filterLaunches,
@@ -51,6 +51,7 @@ import {
 import { readCompletePrComments } from '../pr-comments-complete.mjs';
 import { countFixRoundComments, REARM_COMMENT_MARKER, SAME_HEAD_WAKE_TRAILER } from '../rearm-round-count.mjs';
 import { RED_TEAM_FIX_COMMENT_MARKER, RED_TEAM_REARM_COMMENT_MARKER, countRedTeamFixComments } from '../red-team-fix-round-count.mjs';
+import { shapePrs } from '../../readiness/conveyor-state.mjs';
 import { buildCiHealComment, CI_HEAL_ROUND_CAP } from '../ci-heal-mark.mjs';
 import { buildFixBeginComment, buildFixEndComment } from '../fix-procedure.mjs';
 import { buildRebaseOntoMainComment } from '../main-red-recovery.mjs';
@@ -493,7 +494,9 @@ describe('planFixSpawns — in-flight test + retry cap across bounce cycles (SKI
   });
 
   describe('red-team-sent-back complete durable floor admission', () => {
-    const pr = { ...changesPr(99, 40), mode: 'red-team-sent-back' };
+    // Production gh pr list row, projected by the real state shaper; no planned mode.
+    const [pr] = shapePrs([{ number: 99, headRefName: 'lane/40-repair', state: 'OPEN',
+      labels: [{ name: 'review:changes' }] }]);
     const plan = floors => planFixSpawns({ prs: [pr], launchedNums: [40], fixAttempts: {},
       ...floors, retryCap: 3, availableLanes: [5], tick: 0 });
     const read = gh => readTickCommentFloors({ prs: [pr],
@@ -505,7 +508,7 @@ describe('planFixSpawns — in-flight test + retry cap across bounce cycles (SKI
 
     it('comment-read failure after restart defers without a spawn, guard, lane or attempt; next tick retries', () => {
       const floors = read(() => { throw Error('comment read failed'); });
-      expect(floors.prRearmCounts).toEqual({});
+      expect(floors.prRearmCounts).toEqual({ 99: null });
       const r = plan(floors);
       expect(r).toMatchObject({ spawns: [], newGuards: [], consumedLanes: [], fixAttempts: {} });
       expect(r.notes).toEqual([expect.objectContaining({ kind: 'fix-floor-unavailable', pr: 99,
@@ -517,14 +520,14 @@ describe('planFixSpawns — in-flight test + retry cap across bounce cycles (SKI
       let calls = 0;
       const floors = read(() => Array.from({ length: 100 }, (_, i) => comment(calls++ * 100 + i)));
       expect(calls).toBe(1000);
-      expect(floors.prRearmCounts).toEqual({});
+      expect(floors.prRearmCounts).toEqual({ 99: null });
       expect(plan(floors).notes[0].kind).toBe('fix-floor-unavailable');
       expect(plan(floors).spawns).toEqual([]);
     });
 
     it('a short REST read with a mismatching total count defers', () => {
       const floors = read(args => args[1] === 'graphql' ? countProof(3) : []);
-      expect(floors.prRearmCounts).toEqual({});
+      expect(floors.prRearmCounts).toEqual({ 99: null });
       expect(plan(floors).spawns).toEqual([]);
     });
 
@@ -538,16 +541,41 @@ describe('planFixSpawns — in-flight test + retry cap across bounce cycles (SKI
       const floors = read(args => args[1] === 'graphql' ? countProof(spent) : Array.from({ length: spent }, (_, i) => comment(i)));
       expect(floors.prRearmCounts).toEqual({ 99: spent });
       const r = plan(floors);
-      expect(r.spawns).toEqual(spent < 3 ? [{ pr: 99, num: 40, lane: 5 }] : []);
+      expect(r.spawns).toEqual(spent < 3 ? [{ pr: 99, num: '40', lane: 5 }] : []);
       if (spent === 3) expect(r.notes[0]).toMatchObject({ kind: 'fix-exhausted', attempts: 3 });
     });
 
-    it.each([undefined, 'ordinary'])('other mode %s retains fail-open behavior on comment failure', mode => {
-      const ordinary = { ...pr, mode };
-      const floors = readTickCommentFloors({ prs: [ordinary], readComments: () => { throw Error('read failed'); },
-        readCompleteComments: () => { throw Error('must not be called'); } });
-      expect(planFixSpawns({ prs: [ordinary], launchedNums: [40], fixAttempts: {}, ...floors,
-        retryCap: 3, availableLanes: [5] }).spawns).toEqual([{ pr: 99, num: 40, lane: 5 }]);
+    it.each([RED_TEAM_FIX_COMMENT_MARKER, RED_TEAM_REARM_COMMENT_MARKER])('review:changes after a red-team %s restores the complete history without a mode field', marker => {
+      expect(pr).not.toHaveProperty('mode');
+      const floors = read(args => args[1] === 'graphql' ? countProof(3)
+        : Array.from({ length: 3 }, (_, i) => ({ ...comment(i), body: marker })));
+      expect(floors.prRearmCounts).toEqual({ 99: 3 });
+      expect(plan(floors).notes[0]).toMatchObject({ kind: 'fix-exhausted', attempts: 3 });
+      expect(plan(floors).spawns).toEqual([]);
+    });
+
+    it('review:changes with receipts only beyond the first 100 comments exhausts the durable cap after restart', () => {
+      const comments = Array.from({ length: 103 }, (_, i) => ({ ...comment(i),
+        body: i < 100 ? 'Ordinary conversation' : RED_TEAM_FIX_COMMENT_MARKER }));
+      const floors = read(args => args[1] === 'graphql' ? countProof(103)
+        : comments.slice(args.some(a => a.endsWith('&page=2')) ? 100 : 0, args.some(a => a.endsWith('&page=2')) ? 200 : 100));
+      expect(floors.prRearmCounts).toEqual({ 99: 3 });
+      expect(plan(floors)).toMatchObject({ spawns: [], notes: [expect.objectContaining({ kind: 'fix-exhausted', attempts: 3 })] });
+    });
+
+    it('red-team:blocked without review:changes or mode also requires a complete floor', () => {
+      const blocked = { ...pr, labels: ['review:accepted', 'red-team:blocked'] };
+      const readCompleteComments = vi.fn(() => { throw Error('unreadable'); });
+      const floors = readTickCommentFloors({ prs: [blocked], readCompleteComments });
+      expect(readCompleteComments).toHaveBeenCalledWith(blocked);
+      expect(planFixSpawns({ prs: [blocked], launchedNums: [40], ...floors, availableLanes: [5] }))
+        .toMatchObject({ spawns: [], notes: [expect.objectContaining({ kind: 'fix-floor-unavailable' })] });
+    });
+
+    it('ordinary review:changes also defers an unreadable thread because hidden red-team history cannot be ruled out', () => {
+      const floors = read(() => { throw Error('unreadable'); });
+      expect(floors.prRearmCounts).toEqual({ 99: null });
+      expect(plan(floors).spawns).toEqual([]);
     });
   });
 
