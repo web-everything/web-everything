@@ -1,11 +1,13 @@
-/** Narrow, fail-closed resolution of advisory timing data; never resolves source conflicts. */
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+/** Narrow, fail-closed resolution of append-only advisory registries; never resolves source conflicts. */
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { isDeepStrictEqual } from 'node:util';
+import { spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import { FULL_SHA_RE } from './shared.mjs';
 
-export const ADVISORY_MERGE_PATHS = Object.freeze(['scripts/ci/test-timings.json']);
+export const ADVISORY_MERGE_PATHS = Object.freeze(['scripts/ci/test-timings.json', 'scripts/conveyor/soak/breaks/index.mjs']);
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 
 /** Union object entries, conservatively retaining the larger numeric observation. */
@@ -32,10 +34,38 @@ export function mergeTimingsJson(baseText, oursText, theirsText) {
   } catch { return null; }
 }
 
+// Preserve every base line, union insertions at each base gap, and dedupe added lines.
+// A non-additive edit is outside this registry contract; leave it for operator resolution.
+function mergeRegistryLines(baseText, oursText, theirsText) {
+  const lines = text => text.match(/[^\n]*\n|[^\n]+$/g) || [];
+  const base = lines(baseText), gaps = base.map(() => []);
+  gaps.push([]);
+  const added = new Set();
+  for (const text of [oursText, theirsText]) {
+    let cursor = 0;
+    for (const line of lines(text)) {
+      if (cursor < base.length && line === base[cursor]) cursor++;
+      else if (!added.has(line)) { gaps[cursor].push(line); added.add(line); }
+    }
+    if (cursor !== base.length) return null;
+  }
+  const merged = gaps.map((gap, i) => gap.join('') + (base[i] || '')).join('');
+  return /^(?:<{7}|={7}|>{7}|\|{7})/m.test(merged) ? null : merged;
+}
+
+function validateModule(path, importModule = false) {
+  return spawnSync(process.execPath, importModule
+    ? ['--input-type=module', '-e', 'await import(process.argv[1])', pathToFileURL(path).href]
+    : ['--check', path], {
+    encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
+  }).status === 0;
+}
+
 function readMerge(git, revisions, path) {
   const inputs = revisions.map(revision => git(['show', `${revision}:${path}`]));
   if (inputs.some(result => result.status !== 0)) return null;
-  return mergeTimingsJson(...inputs.map(result => String(result.stdout)));
+  return (path === ADVISORY_MERGE_PATHS[0] ? mergeTimingsJson : mergeRegistryLines)(
+    ...inputs.map(result => String(result.stdout)));
 }
 
 const advisoryOnly = paths => paths.length > 0 && paths.every(path => ADVISORY_MERGE_PATHS.includes(path));
@@ -56,18 +86,21 @@ export function resolveAdvisoryConflicts({ git, cur, ovSha }) {
     const base = git(['merge-base', '--all', cur, ovSha]);
     const baseSha = String(base.stdout ?? '').trim();
     if (base.status !== 0 || !FULL_SHA_RE.test(baseSha)) return null;
-    const text = readMerge(git, [baseSha, cur, ovSha], paths[0]);
-    if (text === null) return null;
     // A private index permits adopting the clean merge-tree entries without touching the real index.
     scratch = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'we-advisory-merge-'));
-    const blobPath = join(scratch, 'timings.json');
-    writeFileSync(blobPath, text);
-    const blob = git(['hash-object', '-w', '--', blobPath]);
-    const blobSha = String(blob.stdout ?? '').trim();
-    if (blob.status !== 0 || !FULL_SHA_RE.test(blobSha)) return null;
     const options = { env: { GIT_INDEX_FILE: join(scratch, 'index') } };
     if (git(['read-tree', tree], options).status !== 0) return null;
-    if (git(['update-index', '--add', '--cacheinfo', '100644', blobSha, paths[0]], options).status !== 0) return null;
+    for (const path of paths) {
+      const text = readMerge(git, [baseSha, cur, ovSha], path);
+      if (text === null) return null;
+      const blobPath = join(scratch, path.endsWith('.mjs') ? 'registry.mjs' : 'timings.json');
+      writeFileSync(blobPath, text);
+      if (path.endsWith('.mjs') && !validateModule(blobPath)) return null;
+      const blob = git(['hash-object', '-w', '--', blobPath]);
+      const blobSha = String(blob.stdout ?? '').trim();
+      if (blob.status !== 0 || !FULL_SHA_RE.test(blobSha)) return null;
+      if (git(['update-index', '--add', '--cacheinfo', '100644', blobSha, path], options).status !== 0) return null;
+    }
     const written = git(['write-tree'], options);
     const mergedTree = String(written.stdout ?? '').trim();
     return written.status === 0 && FULL_SHA_RE.test(mergedTree)
@@ -85,11 +118,23 @@ export function resolveAdvisoryInWorktree({ git, cwd }) {
     if (!advisoryOnly(paths)) return false;
     const mergeHead = git(['rev-parse', '--verify', 'MERGE_HEAD']);
     if (mergeHead.status !== 0 || !FULL_SHA_RE.test(String(mergeHead.stdout ?? '').trim())) return false;
-    const text = readMerge(git, [':1', ':2', ':3'], paths[0]);
-    if (text === null) return false;
-    const restore = () => { try { git(['checkout', '-m', '--', ...paths]); } catch { /* caller aborts the merge */ } return false; };
+    const merged = paths.map(path => ({ path, text: readMerge(git, [':1', ':2', ':3'], path),
+      original: readFileSync(join(cwd, path)) }));
+    if (merged.some(({ text }) => text === null)) return false;
+    let stagingAttempted = false;
+    const restore = () => {
+      if (stagingAttempted) {
+        try { git(['checkout', '-m', '--', ...paths]); } catch { /* caller aborts the merge */ }
+      }
+      for (const { path, original } of merged) writeFileSync(join(cwd, path), original);
+      return false;
+    };
     try {
-      writeFileSync(join(cwd, paths[0]), text);
+      for (const { path, text } of merged) writeFileSync(join(cwd, path), text);
+      for (const { path } of merged) {
+        if (path.endsWith('.mjs') && !validateModule(join(cwd, path), true)) return restore();
+      }
+      stagingAttempted = true;
       if (git(['add', '--', ...paths]).status !== 0) return restore();
       const remaining = git(['diff', '--name-only', '-z', '--diff-filter=U']);
       if (remaining.status !== 0 || String(remaining.stdout ?? '') !== '') return restore();
