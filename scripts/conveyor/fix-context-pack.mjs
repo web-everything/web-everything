@@ -1,7 +1,8 @@
 import { assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 import { readCiJobLog } from '../lib/gh-ci-log.mjs';
 import { stripVTControlCharacters } from 'node:util';
-import { boundedCiLogTail } from '../lib/ci-log-evidence.mjs';
+import { boundedCiLogTail, extractFailedTests } from '../lib/ci-log-evidence.mjs';
+export { extractFailedTests } from '../lib/ci-log-evidence.mjs';
 import { fenceUntrusted, FENCED_DATA_RULE } from '../lib/mandate-fence.mjs';
 /**
  * @file scripts/conveyor/fix-context-pack.mjs
@@ -349,17 +350,6 @@ export function renderCiPack({ checks = [], failedTests = [], logTail = '', filt
   if (fl) parts.push(fl);
   if (tests) parts.push(tests);
   return clip(parts.join('\n\n'), maxBytes);
-}
-
-/** The failing test lines a vitest / node log names (FAIL rows, ×/✗ rows), de-duplicated. PURE. */
-export function extractFailedTests(log, max = 12) {
-  const out = [];
-  for (const raw of stripVTControlCharacters(String(log ?? '')).split('\n')) {
-    const l = raw.replace(/^.*?\d{4}-\d\d-\d\dT[\d:.]+Z\s?/, '').trim();
-    if (/^(FAIL|❯ .*\.test\.|×|✗|✕)\s/.test(l) && !out.includes(l)) out.push(l.slice(0, 240));
-    if (out.length >= max) break;
-  }
-  return out;
 }
 
 // ---------------------------------------------------------------------------------------------------------------

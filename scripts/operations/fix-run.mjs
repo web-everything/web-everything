@@ -427,7 +427,12 @@ export async function readCiHealInputs({ repo, pr, run = sh, readLog = readCiJob
     try {
       if (!slug) slug = String(await run('gh', ['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'])).trim();
       const result = await readLog({ repo: slug, jobId: id, exec: run, opts: { maxBuffer: BLOB_MAX_BYTES } });
-      if (result.ok) { log = boundedCiLogTail(cleanCiLog(result.text)); filtered = result.filtered === true; }
+      if (result.ok) {
+        // Extract diagnostics from the whole log before staging drops older cleanup context.
+        // The renderer reapplies the same helper at its smaller prompt budget.
+        log = boundedCiLogTail(cleanCiLog(result.text));
+        filtered = result.filtered === true;
+      }
     } catch { /* one inaccessible job must not refuse the repair */ }
     jobs.push({ name: check.name, detailsUrl: check.detailsUrl, log, filtered });
   }
