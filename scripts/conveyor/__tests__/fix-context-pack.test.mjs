@@ -103,6 +103,40 @@ describe('CI context pack whole-job reads', () => {
     expect(readCiPackInputs({ repoSlug: 'o/r', pr: 7, exec: reader(true) }))
       .toEqual({ checks: [{ name: check.name, link: check.link }], failedTests: [], logTail: '', filtered: false, files: FILES });
   });
+  it('reserves the final failure before early diagnostics at 100 and 1000 bytes (live PR #7028)', () => {
+    const text = 'Error: ' + 'x'.repeat(300) + '\n' + 'cleanup\n'.repeat(450) + 'Error: deployment denied';
+    for (const maxBytes of [100, 1000]) {
+      const tail = boundedCiLogTail(text, { maxBytes });
+      expect(Buffer.byteLength(tail)).toBeLessThanOrEqual(maxBytes);
+      expect(tail).toContain('deployment denied');
+    }
+    const pack = renderCiPack({ checks: [check], logTail: boundedCiLogTail(text), maxBytes: 1000 });
+    expect(Buffer.byteLength(pack)).toBeLessThanOrEqual(1000);
+    expect(pack).toContain('deployment denied');
+  });
+  it('honours every byte budget from 20 through 2000 and retains a final diagnostic when it fits', () => {
+    const notice = '… [log tail truncated; inspect the full job log for earlier context]\n';
+    for (const finalLine of ['Error: deployment denied', 'Error: deployment denied\n', 'Error: ' + 'é😀'.repeat(50) + ' deployment denied']) {
+      const text = 'Error: ' + 'x'.repeat(300) + '\n' + 'cleanup\n'.repeat(450) + finalLine;
+      for (let maxBytes = 20; maxBytes <= 2000; maxBytes++) {
+        const tail = boundedCiLogTail(text, { maxBytes });
+        expect(Buffer.byteLength(tail), `budget ${maxBytes}`).toBeLessThanOrEqual(maxBytes);
+        expect(tail).not.toContain('\uFFFD');
+        if (maxBytes >= Buffer.byteLength(notice + 'deployment denied\n')) expect(tail).toContain('deployment denied');
+        if (maxBytes >= Buffer.byteLength(notice + finalLine)) expect(tail).toContain(finalLine);
+      }
+    }
+  });
+  it('returns only a UTF-8-safe notice prefix when the notice exhausts the budget', () => {
+    const notice = '… [log tail truncated; inspect the full job log for earlier context]\n';
+    const text = 'Error: ' + 'x'.repeat(300) + '\nError: deployment denied';
+    for (let maxBytes = 0; maxBytes <= Buffer.byteLength(notice); maxBytes++) {
+      const tail = boundedCiLogTail(text, { maxBytes });
+      expect(Buffer.byteLength(tail)).toBeLessThanOrEqual(maxBytes);
+      expect(notice.startsWith(tail)).toBe(true);
+      expect(tail).not.toContain('\uFFFD');
+    }
+  });
 });
 const sampleInputs = () => {
   const { findings, advisory } = extractFindings(COMMENTS);

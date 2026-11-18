@@ -28,18 +28,33 @@ export function extractFailedTests(log, max = 12, { includeErrors = false, maxBy
 }
 
 /** Context only: retain full-log diagnostics BEFORE a UTF-8-safe tail, within both bounds.
- * The excerpt uses at most 40 lines / 8 KB and half the byte budget, leaving room for the tail.
+ * Reserve the notice and tail first; diagnostics use only the remaining bytes (at most 40 lines / 8 KB).
  * Reapplying a smaller bound preserves diagnostics through staging and prompt rendering. */
 export function boundedCiLogTail(text, { maxLines = 400, maxBytes = 16_000 } = {}) {
   const clean = stripVTControlCharacters(String(text ?? ''));
   const lines = clean.split('\n');
-  const note = maxLines > 1 && maxBytes >= 100
+  const note = maxLines > 1
     ? '… [log tail truncated; inspect the full job log for earlier context]\n' : '';
   const truncated = lines.length > maxLines || Buffer.byteLength(clean) > maxBytes;
   if (!truncated) return clean;
   if (maxLines <= 0 || maxBytes <= 0) return '';
+  const noteBuffer = Buffer.from(note);
+  if (maxBytes <= noteBuffer.length) {
+    let end = maxBytes;
+    while (end > 0 && (noteBuffer[end] & 0xc0) === 0x80) end--;
+    return noteBuffer.subarray(0, end).toString('utf8');
+  }
+  const available = maxBytes - noteBuffer.length;
+  const lastContentIndex = lines.findLastIndex(line => line.trim());
+  const lastLine = lines[lastContentIndex] ?? '';
+  const finalFailureBytes = extractFailedTests(lastLine, 1, { includeErrors: true }).length
+    ? Buffer.byteLength(lines.slice(lastContentIndex).join('\n')) : 0;
+  // Keep at least half the remaining budget for context, expanding it to fit a final
+  // failure line. An oversized failure keeps its end; ordinary cleanup still leaves
+  // space for earlier diagnostics even when its final line is oversized.
+  const tailReserve = Math.min(available, Math.max(Math.ceil(available / 2), finalFailureBytes));
   const excerpt = extractFailedTests(clean, Math.min(40, Math.max(0, maxLines - 2)), {
-    includeErrors: true, maxBytes: Math.min(8000, Math.floor(maxBytes / 2)) - 1,
+    includeErrors: true, maxBytes: Math.min(8000, available - tailReserve) - 1,
   });
   const prefix = (excerpt.length ? excerpt.join('\n') + '\n' : '') + note;
   const tail = Buffer.from(lines.slice(-Math.max(1, maxLines - excerpt.length - (note ? 1 : 0))).join('\n'));
