@@ -197,6 +197,25 @@ describe('abandoned builder draft recovery', () => {
     { evidence: 'invalid failed-step time', metadata: { steps: [steps[0], { ...steps[1], started_at: 'invalid' }] }, expectedError: noDetail },
     { evidence: 'reversed failed-step times', metadata: { steps: [steps[0], { ...steps[1], completed_at: steps[1].started_at, started_at: steps[1].completed_at }] }, expectedError: noDetail },
     { evidence: 'overlapping passing step', metadata: { steps: [{ ...steps[0], completed_at: steps[1].completed_at }, steps[1]] }, expectedError: noDetail },
+    // Step times have SECOND resolution, log stamps are fractional: each step owns [start, completed_at + 1s).
+    // A line inside the shared boundary second is ambiguous (both steps own it), so it never wins attribution.
+    { evidence: 'a fractional passing-step line inside the shared boundary second',
+      metadata: { steps: [
+        { conclusion: 'success', started_at: '2026-09-30T01:00:00Z', completed_at: '2026-09-30T01:00:10Z' },
+        { conclusion: 'failure', started_at: '2026-09-30T01:00:10Z', completed_at: '2026-09-30T01:00:20Z' },
+      ] },
+      expectedError: '2026-09-30T01:00:15.1234567Z Error: deployment denied',
+      log: '2026-09-30T01:00:10.2500000Z FAIL passing-step-fixture.test.mjs\n'
+        + '2026-09-30T01:00:15.1234567Z Error: deployment denied' },
+    // The failed step's own exit line lands fractionally after its whole-second completed_at.
+    { evidence: 'a failed-step error stamped after its whole-second completion',
+      metadata: { steps: [
+        { conclusion: 'success', started_at: '2026-09-30T01:00:00Z', completed_at: '2026-09-30T01:00:05Z' },
+        { conclusion: 'failure', started_at: '2026-09-30T01:00:06Z', completed_at: '2026-09-30T01:00:10Z' },
+      ] },
+      expectedError: '2026-09-30T01:00:10.6000000Z ##[error]Process completed with exit code 1.',
+      log: '2026-09-30T01:00:01.5000000Z passing step\n'
+        + '2026-09-30T01:00:10.6000000Z ##[error]Process completed with exit code 1.' },
   ];
   // A literal-titled `it(` opener per row (not `it.each`) keeps the merge-gate's test-case counter honest: it
   // only counts string-titled openers, so an `it.each` rewrite of one case reads as a net removal.

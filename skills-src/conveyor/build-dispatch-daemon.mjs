@@ -2562,12 +2562,16 @@ function firstFailedStepError(job, log) {
     conclusion: step?.conclusion, start: Date.parse(step?.started_at), end: Date.parse(step?.completed_at),
   }));
   if (intervals.some(({ start, end }) => !Number.isFinite(start) || !Number.isFinite(end) || start > end)) return '';
+  // Step times have SECOND resolution while log stamps are fractional: a step owns the half-open range
+  // [start, completed_at + 1s). A line inside a shared boundary second is then owned by both neighbours,
+  // so it is ambiguous and never attributed to the failed step alone.
+  for (const interval of intervals) interval.end += 1000;
   let failedStep = false;
   for (const line of stripVTControlCharacters(log).split('\n')) {
     const timestamp = /^\uFEFF?(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d))(?=\s|$)/.exec(line);
     if (timestamp) {
       const at = Date.parse(timestamp[1]);
-      const owners = intervals.filter(({ start, end }) => start <= at && at <= end);
+      const owners = intervals.filter(({ start, end }) => start <= at && at < end);
       failedStep = owners.length > 0 && owners.every(step => step.conclusion === 'failure');
     }
     // Untimestamped continuations inherit the preceding timestamp's ownership.
