@@ -12,15 +12,11 @@ const ALLOWLIST_FILES = new Set([
 const isExemptionPath = path => ALLOWLIST_FILES.has(path)
   || path.split('/').some(segment => ['__tests__', 'tests', 'test', 'fixtures', '__fixtures__', 'golden-corpus'].includes(segment));
 // PR 7008: a zlib header is only a two-byte checksum, so ordinary text can carry one ("x ", "hb", "H,").
-// Real compressed bytes contain control bytes; text has none beyond tab, LF and CR. UTF-8 text is read as code
-// points (its continuation bytes overlap C1); single-byte text must also avoid C1 (0x80-0x9f).
-const TEXT_CONTROL = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/;
-const isPlainText = (input) => {
-  try {
-    if (!TEXT_CONTROL.test(new TextDecoder('utf-8', { fatal: true }).decode(input))) return true;
-  } catch { /* not UTF-8: try single-byte text below */ }
-  return !TEXT_CONTROL.test(input.toString('latin1'));
-};
+// Text holds no C0 control bytes beyond tab, LF, VT, FF, CR and ESC (colour codes, page breaks); compressed
+// bytes hold the others within a few dozen bytes. C1 and high bytes are left alone: UTF-8, latin1 and cp1252
+// text all use them. A byte test, so the text's encoding never matters.
+const BINARY_CONTROL = /[\x00-\x08\x0e-\x1a\x1c-\x1f]/;
+const isPlainText = (input) => !BINARY_CONTROL.test(input.toString('latin1'));
 
 // R972: every file is decoded in all six views; no encoding or density heuristic may omit one.
 export function decodePrivacyContent(content, { onCompressionError = () => {} } = {}) {
@@ -31,9 +27,9 @@ export function decodePrivacyContent(content, { onCompressionError = () => {} } 
   const buffers = [bytes];
   // R972: inspect every nested layer, sharing one inflated-size budget across the chain.
   let inflatedSize = 0;
-  const expand = (input, depth) => {
-    const gzip = input[0] === 0x1f && input[1] === 0x8b;
-    const zlib = input.length >= 2 && (input[0] & 15) === 8 && (input[0] >> 4) <= 7
+  const expand = (input, depth, rawOnly = false) => {
+    const gzip = !rawOnly && input[0] === 0x1f && input[1] === 0x8b;
+    const zlib = !rawOnly && input.length >= 2 && (input[0] & 15) === 8 && (input[0] >> 4) <= 7
       && ((input[0] << 8) + input[1]) % 31 === 0;
     if ((gzip || zlib) && depth >= 8) { onCompressionError(); return; }
     const remaining = 32 * 1024 * 1024 - inflatedSize;
@@ -60,22 +56,30 @@ export function decodePrivacyContent(content, { onCompressionError = () => {} } 
         }
       };
       let recovered = null;
+      let truncated = false;
       try {
         let low = 1;
         let high = input.length;
         while (low <= high) {
           const mid = (low + high) >> 1;
           const output = decodes(mid);
-          if (output) { recovered = output; low = mid + 1; } else high = mid - 1;
+          if (output) { recovered = output; truncated = mid === input.length; low = mid + 1; } else high = mid - 1;
         }
       } catch { onCompressionError(); return; }
-      // A damaged gzip stream, or a zlib-header candidate that is not plain text, is still uninspectable
-      // compression. Plain text whose first two bytes happen to form a zlib checksum is just text.
-      if (gzip || !isPlainText(input)) onCompressionError();
-      if (!recovered?.length || recovered.length > remaining) return;
-      inflatedSize += recovered.length;
-      buffers.push(recovered);
-      expand(recovered, depth + 1);
+      // Still uninspectable compression: a damaged gzip stream (its magic is unambiguous), a zlib-header
+      // candidate holding binary control bytes, or a stream cut short (every byte parsed, the end missing).
+      // A header asking for a preset dictionary (FDICT, bit 5 of the second byte) is cut short in any text under
+      // six bytes ("x = 1"), and no reader inflates it without that dictionary, so text with it is just text.
+      // Longer text whose first two bytes happen to form a zlib checksum fails on a data error and is text too.
+      const presetDictionary = zlib && (input[1] & 0x20) !== 0;
+      if (gzip || !isPlainText(input) || (truncated && !presetDictionary)) onCompressionError();
+      if (recovered?.length && recovered.length <= remaining) {
+        inflatedSize += recovered.length;
+        buffers.push(recovered);
+        expand(recovered, depth + 1);
+      }
+      // Raw deflate has no header, so its first two bytes can form a zlib checksum too: probe it as well.
+      expand(input, depth, true);
       return;
     }
     if (depth >= 8 || inflated.length > remaining) { onCompressionError(); return; }
@@ -285,33 +289,73 @@ function decodeBase64Text(token) {
 }
 
 // PR 7008: base64 is routinely wrapped (MIME 76, PEM 64, any width), so a value split across lines must be
-// decoded whole. A run is two or more base64 segments joined by a line break: a real one (LF or CRLF) or a
-// JSON-escaped one (\n, \r\n), with optional spaces or tabs around it. The look-behind starts a run only at a
-// token start, so each character begins at most one attempt and the scan stays linear.
-const WRAP_SEPARATOR = String.raw`[ \t]*(?:\r?\n|\\r\\n|\\n)[ \t]*`;
+// decoded whole. A run is two or more base64 segments joined by one or more line breaks:
+//   - a real break (LF, CRLF, lone CR, U+2028, U+2029) or a JSON-escaped one (\n, \r\n, \r);
+//   - optional spaces or tabs around it, blank lines in between;
+//   - an optional comment or quote prefix on the next line (#, ;, >, *, %, !, or // or -- followed by a space,
+//     since a bare // or -- can begin base64 data).
+// The look-behind starts a run only at a token start (after "=" too, as in KEY=<base64>), so each character
+// begins at most one attempt; every alternative in a separator consumes a break, so the scan stays linear.
+const LINE_BREAK = String.raw`(?:\r\n|[\r\n  ]|\\r\\n|\\[nr])`;
+const LINE_PREFIX = String.raw`(?:[#;>*%!]+[ \t]*|(?://|--)[ \t]+)`;
+const WRAP_SEPARATOR = String.raw`[ \t]*(?:${LINE_BREAK}[ \t]*${LINE_PREFIX}?)+`;
 const WRAPPED_BASE64 = new RegExp(
-  String.raw`(?<![A-Za-z0-9+/_=-])[A-Za-z0-9+/_-]{4,}(?:${WRAP_SEPARATOR}[A-Za-z0-9+/_-]+)+={0,2}`, 'g');
+  String.raw`(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]+(?:${WRAP_SEPARATOR}[A-Za-z0-9+/_-]+)+={0,2}`, 'g');
 
-/** PR 7008 — one wrapped run with its base64 block decoded, or null. A word line next to the block joins the run
- *  (a PEM "-----BEGIN CERTIFICATE-----" header, a label above it, an "-----END" line below an unpadded block),
- *  so up to two edge segments on each side may be left as they are: at most nine linear decodes per run. The
- *  decoded text sits on the block's first line and the block's line breaks are kept, so line numbers still
- *  name their source lines. */
+/** PR 7008 — one wrapped run with each base64 block in it decoded, or null.
+ *  A wrapped block is a stretch of full-width lines (one shared length), plus the line before it (a partial
+ *  first line, e.g. after KEY=) and the line after it (the shorter last line). Words next to the block (a PEM
+ *  "-----BEGIN …-----" header, labels, an "-----END" line) join the run too.
+ *  The run's segments are split into equal-width stretches, largest first (width × lines), so the real block
+ *  claims its edge lines before a stray word can. Each stretch tries the four ways of keeping or leaving its
+ *  two unclaimed edge lines, longest first: at most four linear decodes per stretch, and the stretches
+ *  partition the run. Decoded text sits on the block's first line and the block's LF line breaks are kept
+ *  (the scan splits lines on LF), so line numbers still name their source lines. */
 function decodeWrappedRun(run) {
   const separators = [...run.matchAll(new RegExp(WRAP_SEPARATOR, 'g'))];
   const starts = [0, ...separators.map(match => match.index + match[0].length)];
   const ends = [...separators.map(match => match.index), run.length];
-  const last = starts.length - 1;
-  for (const first of [0, 1, 2]) {
-    for (const end of [last, last - 1, last - 2]) {
-      if (end - first < 1) continue;
-      const block = run.slice(starts[first], ends[end]);
+  const count = starts.length;
+  const padding = run.match(/=*$/)[0].length;
+  // A trailing "==" is padding, not part of the last line's width.
+  const width = index => ends[index] - starts[index] - (index === count - 1 ? padding : 0);
+  const stretches = [];
+  for (let index = 0; index < count;) {
+    let stop = index + 1;
+    while (stop < count && width(stop) === width(index)) stop += 1;
+    stretches.push({ index, stop, size: width(index) * (stop - index) });
+    index = stop;
+  }
+  stretches.sort((a, b) => b.size - a.size || a.index - b.index);
+  const claimed = new Uint8Array(count);
+  const blocks = [];
+  for (const stretch of stretches) {
+    // An earlier block may have claimed this stretch's end lines as its own edge lines: use what is left.
+    let index = stretch.index;
+    let stop = stretch.stop;
+    while (index < stop && claimed[index]) index += 1;
+    while (stop > index && claimed[stop - 1]) stop -= 1;
+    if (index === stop) continue;
+    const free = at => at >= 0 && at < count && !claimed[at];
+    for (const [first, last] of [[index - 1, stop], [index, stop], [index - 1, stop - 1], [index, stop - 1]]) {
+      if (last - first < 1 || !free(first) || !free(last)) continue;
+      const block = run.slice(starts[first], ends[last]);
       const decoded = decodeBase64Text(block.replace(new RegExp(WRAP_SEPARATOR, 'g'), ''));
       if (decoded === null) continue;
-      return run.slice(0, starts[first]) + decoded + '\n'.repeat((block.match(/\n/g) ?? []).length) + run.slice(ends[end]);
+      claimed.fill(1, first, last + 1);
+      blocks.push({ first, last, text: decoded + '\n'.repeat((block.match(/\n/g) ?? []).length) });
+      break;
     }
   }
-  return null;
+  if (!blocks.length) return null;
+  blocks.sort((a, b) => a.first - b.first);
+  let cursor = 0;
+  const pieces = [];
+  for (const { first, last, text } of blocks) {
+    pieces.push(run.slice(cursor, starts[first]), text);
+    cursor = ends[last];
+  }
+  return pieces.join('') + run.slice(cursor);
 }
 
 /** PR 7008 — the text with each wrapped base64 run decoded, or null when no run decodes. */
@@ -375,7 +419,10 @@ export function scanText(content, options = {}) {
     // PR 7008: base64 wrapped across lines, decoded whole; lines still map to (and are exempted by) raw lines.
     const unwrapped = unwrapBase64(raw);
     if (unwrapped !== null) {
-      const unwrappedLines = unwrapped.split('\n').map((text, index) => ({ lineText: rawLines[index], views: privacyLineViews(text) }));
+      // The whole unwrapped text is scanned once; per-line decodings are rebuilt only for the lines the unwrap
+      // changed (an unchanged line's decodings were scanned above), keeping this view's cost near one scan.
+      const unwrappedLines = unwrapped.split('\n').map((text, index) => ({ lineText: rawLines[index],
+        views: text === rawLines[index] ? [''] : privacyLineViews(text) }));
       const unwrappedVariants = unwrappedLines.reduce((max, line) => Math.max(max, line.views.length), 0);
       scans.push({ view: unwrapped, sourceLines: rawLines.map((lineText, index) => ({ line: index + 1, lineText })) },
         ...Array.from({ length: unwrappedVariants }, (_, variant) => normalizedView(unwrappedLines, variant)));

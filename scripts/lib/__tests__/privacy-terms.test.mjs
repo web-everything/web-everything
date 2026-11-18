@@ -867,7 +867,7 @@ describe('PR 7008 compression headers and wrapped base64', () => {
     decodePrivacyContent(bytes, { onCompressionError });
     return onCompressionError.mock.calls.length > 0;
   };
-  it.each(['x marks the spot\n', 'x = 1;\nexport default x;\n', 'x?y:z', 'x^2 + y^2', 'x} done', 'hC is a label\n',
+  it.each(['x marks the spot\n', 'x = 1;\nexport default x;\n', 'x?y:z', 'x = 1', 'x ', 'x^2 + y^2', 'x} done', 'hC is a label\n',
     'hb ordinary text', 'H, then a list', 'x — naïve café\n'])('treats ordinary text with a zlib-like header as text: %j', text => {
     expect(zlibHeader(text)).toBe(true);
     expect(compressionFlagged(Buffer.from(text))).toBe(false);
@@ -876,6 +876,25 @@ describe('PR 7008 compression headers and wrapped base64', () => {
   it('treats latin1 text with a zlib-like header as text', () => {
     const bytes = Buffer.from('x café crème\n', 'latin1');
     expect(compressionFlagged(bytes)).toBe(false);
+  });
+  // Self-review: colour codes, page breaks and C1 bytes are text too.
+  it.each([['ANSI colour', Buffer.from('x = 1\n\x1b[31mred\x1b[0m\n')], ['form feed', Buffer.from('x marks\n\x0c\nnext page\n')],
+    ['vertical tab', Buffer.from('x marks\x0bthe spot\n')], ['cp1252 ellipsis', Buffer.from([0x78, 0x20, 0x77, 0x61, 0x69, 0x74, 0x85, 0x0a])],
+    ['UTF-8 next-line', Buffer.from('x wait\u0085\n')]])('treats text with %s and a zlib-like header as text', (_name, bytes) => {
+    expect(compressionFlagged(bytes)).toBe(false);
+  });
+  it('still fails closed on a zlib header cut short, even when its bytes look like text', () => {
+    expect(compressionFlagged(Buffer.from('x^'))).toBe(true);
+  });
+  // Self-review: raw deflate has no header, so its first two bytes can form a zlib checksum; it is still inflated.
+  it('inflates raw deflate whose first two bytes form a zlib checksum', () => {
+    const data = Buffer.from(`hidden ${HOME}/projects data`);
+    expect(data.length).toBe(32);
+    // A non-final stored block (first byte 0x78: stored type, padding bits set), LEN 32, NLEN, data, then an
+    // empty final fixed-Huffman block.
+    const raw = Buffer.concat([Buffer.from([0x78, 0x20, 0x00, 0xdf, 0xff]), data, Buffer.from([0x03, 0x00])]);
+    expect(zlibHeader(raw.toString('latin1'))).toBe(true);
+    expect(decodePrivacyContent(raw)).toHaveLength(12);
   });
   it('still scans private text after a zlib-like text header', () => {
     expect(scanText(`x marks ${HOME}/projects\n`)).toContainEqual({ pattern: 'home-path', line: 1, match: HOME });
@@ -913,6 +932,29 @@ describe('PR 7008 compression headers and wrapped base64', () => {
     ['label lines on both sides', 'Summary\nPayload\n' + wrapped(70) + '\nTrailer\nDone'],
   ])('decodes line-wrapped base64 as one value: %s', (_name, text) => {
     expect(scanText(text)).toContainEqual(expect.objectContaining({ pattern: 'home-path', match: HOME }));
+  });
+  // Self-review variants: the private text is split at character 8, so no single line decodes on its own.
+  const split = (cuts, separator = '\n', prefix = '') => {
+    const encoded = Buffer.from(`${HOME}/projects/secret-repo-name and more`).toString('base64');
+    const parts = [];
+    let at = 0;
+    for (const cut of [...cuts, encoded.length]) { parts.push(prefix + encoded.slice(at, cut)); at = cut; }
+    return parts.join(separator);
+  };
+  it.each([
+    ['after KEY=', 'KEY=' + split([8, 40])], ['after key: ', 'key: ' + split([8, 40])],
+    ['short first line', split([3, 40])],
+    ['three label lines above', 'One\nTwo\nThree\n' + split([8, 40])],
+    ['# comment prefix', split([8, 40], '\n', '# ')], ['// comment prefix', split([8, 40], '\n', '// ')],
+    ['> quote prefix', split([8, 40], '\n', '> ')], ['* block-comment prefix', split([8, 40], '\n', ' * ')],
+    ['lone CR line ends', split([8, 40], '\r')], ['U+2028 separators', split([8, 40], ' ')],
+    ['a blank line between parts', split([8, 40], '\n\n')], ['JSON \\r escapes', `"${split([8, 40], '\\r')}"`],
+  ])('decodes wrapped base64 %s', (_name, text) => {
+    expect(scanText(text)).toContainEqual(expect.objectContaining({ pattern: 'home-path', match: HOME }));
+  });
+  it('keeps line numbers on blank-line and CR-only wrapped blocks', () => {
+    expect(scanText('intro\n' + split([8, 40], '\n\n'))).toContainEqual({ pattern: 'home-path', line: 2, match: HOME });
+    expect(scanText('intro\n' + split([8, 40], '\r') + '\nlast')).toContainEqual({ pattern: 'home-path', line: 2, match: HOME });
   });
   it.each([['\\n'], ['\\r\\n']])('decodes base64 wrapped with JSON %s escapes', escape => {
     const text = `{"pem": "${wrapped(76, escape)}"}`;
