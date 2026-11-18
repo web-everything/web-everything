@@ -641,7 +641,7 @@ describe('the held claim blocks every dispatch on a red intermediate head', () =
     expect(plan.refusals.some((r) => r.prNumber === 4115 && /fix-claimed/.test(JSON.stringify(r)))).toBe(true);
     // a green intermediate head with review owed: review is planned unclaimed, refused claimed
     const owed = redPr({ labels: [{ name: 'review:pending' }], statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] });
-    const { fixClaim, ...unclaimed } = owed;
+    const { fixClaim, ...unclaimed } = { ...owed, rowsHead: SHA, rowsComplete: true, rosterSource: 'live' };
     expect(fixClaim).toBeTruthy();
     expect(planReconcile({ repo: 'we', prs: [unclaimed], agents: [], requiredChecks: ['test'], now: T0 + 900_000 }).dispatch.map((d) => d.kind)).toContain('review');
     expect(planReconcile({ repo: 'we', prs: [owed], agents: [], requiredChecks: ['test'], now: T0 + 900_000 }).dispatch).toEqual([]);
