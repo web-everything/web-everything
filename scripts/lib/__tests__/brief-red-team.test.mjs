@@ -8,6 +8,10 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { isBriefRedTeamTouchSet, readPrepFile, readBriefRedTeamPolicy, redTeamBrief, renderRedTeamSection } from '../brief-red-team.mjs';
 
+import { NO_PROMPT_COMMAND_RULES } from '../no-prompt-command-rules.mjs';
+import { judgeSpawn } from '../judge-spawn.mjs';
+vi.mock('../judge-spawn.mjs', () => ({ judgeSpawn: vi.fn(async () => ({ value: { classes: [] } })) }));
+
 const GUARD = ['we:scripts/lib/red-team-gate.mjs'];
 const PLAIN = ['we:scripts/lib/format-date.mjs'];
 const policy = (over = {}) => ({ enabled: true, timeoutMs: 50, maxClasses: 3, ...over });
@@ -59,6 +63,22 @@ describe('redTeamBrief', () => {
     const run = vi.fn();
     expect(await redTeamBrief({ files: GUARD, prep: '  ', policy: policy(), run })).toMatchObject({ status: 'skipped' });
     expect(run).not.toHaveBeenCalled();
+  });
+  it.each(['', ' ', '\r\n', ' \t\r\n'])('refuses blank prep and acceptance %j before adding the red-team mandate', async task => {
+    const run = vi.fn();
+    expect(await redTeamBrief({ files: GUARD, prep: task, acceptance: task, policy: policy(), run }))
+      .toMatchObject({ status: 'skipped', reason: 'no prep or acceptance text' });
+    expect(run).not.toHaveBeenCalled();
+  });
+  it('accepts non-empty prep and adds the trusted block exactly once on the real judge route', async () => {
+    judgeSpawn.mockClear();
+    const result = await redTeamBrief({ files: GUARD, prep: 'Probe the changed guard.', policy: policy({ timeoutMs: 1000 }) });
+    expect(result.status).toBe('ok');
+    expect(judgeSpawn).toHaveBeenCalledOnce();
+    const [{ mandate, input }] = judgeSpawn.mock.calls[0];
+    expect(mandate.startsWith(`${NO_PROMPT_COMMAND_RULES}\n\n`)).toBe(true);
+    expect(mandate.split(NO_PROMPT_COMMAND_RULES)).toHaveLength(2);
+    expect(input).toContain('Probe the changed guard.');
   });
   it('returns attack classes, each with a test, capped at maxClasses', async () => {
     const run = async () => ({ classes: [...ok.classes, ...ok.classes] });

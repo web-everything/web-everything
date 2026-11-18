@@ -2239,6 +2239,16 @@ telemetry sample taken after the failure; a bounded probe that stalls or returns
 keeps exit 124 and the marker. Telemetry confirms termination, never a verified remote success.
 Regressions live in `forge-slot-markers-per-run.test.mjs` and `heavy-admission-remote.test.mjs`.
 
+After a run timeout, allow 30 seconds for cancellation (`WE_HEAVY_TIMEOUT_CANCEL_WAIT_MS`,
+validated as a nonnegative integer and capped at 90 seconds), probing fresh per-run telemetry
+about every two seconds while also waiting for the executor. R989 accepts a late receipt-verified
+`mode: 'remote'` answer with an integer code 0–254 only inside this cancel wait and only when
+its string `run` strictly matches the non-null execution run recorded by `onRun` for this dispatch;
+return its exit code (including failures), record it, and release the slot and both marker files.
+Missing/mismatched run IDs, invalid codes, executor rejection and other ambiguous answers must
+not stop telemetry probes. A client signal still wins. Only confirmed cancellation
+or fresh `finished` telemetry permits local fallback; deadline expiry
+keeps exit 124 and both marker files.
 ### Forge warm bases and delta snapshots
 
 The Mac client and public-base warmer share `forge-exec-manifest.mjs`: path bytes,
@@ -4404,6 +4414,12 @@ automatic discovery and explicit resume behind both guards and both retry budget
 Exercise pending CI after timing settings change, revoked clearance, green completion,
 and budget exhaustion after that intervening failure. Unknown pending outcomes remain
 non-replayable; CI-held provenance does not establish that a write was never applied.
+
+## Drain freeze read recovery
+
+The named failed-cache-replacement regression seeds a clear, observes a live freeze while replacement fails, then forces a transient read before TTL expiry. Failed writes remove old evidence and block reuse in-process even when removal fails; only a successful cache write restores eligibility.
+
+`freeze-last-good.test.mjs` exercises transient-read retries and persistent successful reads with an injected clock, sleep and temporary cache path. Reused evidence must keep its original fetch timestamp: rewriting it during reuse would let an outage extend a cached clear indefinitely. Expired, future-dated, corrupt or missing evidence holds the line. Permanent errors never reuse the cache. `freeze-unreadable-hold` retains the `red-main-hold` skip kind and `redMainHold` flag so pass-level admission and PR-comment suppression still apply. Run these tests through heavy admission.
 
 ## Bounded red-team probe fairness
 

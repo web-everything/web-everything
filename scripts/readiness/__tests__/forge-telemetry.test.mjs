@@ -1,5 +1,7 @@
 // @vitest-environment node
 import {describe, it, expect} from 'vitest';
+import {execFile} from 'node:child_process';
+import {readForgeTelemetry} from '../forge-telemetry.mjs';
 import {parseTelemetry, formatTelemetry, stableActiveRunIds} from '../forge-exec-run.mjs';
 
 const A = 'r-' + 'a'.repeat(32), B = 'r-' + 'b'.repeat(32);
@@ -85,5 +87,25 @@ describe('S0 deploy telemetry schema', () => {
     expect(formatTelemetry({...value,deploy:{draining:true}})).toBe(legacy);
     expect(formatTelemetry({...value,deploy:{...deploy,forgeSetSha:null}})).toBe(legacy);
     expect(formatTelemetry({...value,deploy})).toBe(legacy+'\ndeploy '+deploy.forgeSetSha);
+  });
+});
+
+describe('Forge telemetry cancellation', () => {
+  it('passes the polling signal to the executor and aborting kills its child and rejects', async () => {
+    const controller = new AbortController();
+    let child, exited;
+    const pending = readForgeTelemetry({signal: controller.signal, exec: (file, args, options, callback) => {
+      expect(file).toBe('ssh');
+      expect(options.signal).toBe(controller.signal);
+      // Exercise execFile cancellation with a local child instead of contacting Forge.
+      child = execFile(process.execPath, ['-e', 'process.stdin.resume()'], options, callback);
+      exited = new Promise(resolve => child.once('exit', resolve));
+      return child;
+    }});
+    const rejected = expect(pending).rejects.toThrow('forge-unreachable');
+    controller.abort();
+    await rejected;
+    expect(child.killed).toBe(true);
+    await exited;
   });
 });
