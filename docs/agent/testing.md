@@ -2916,6 +2916,8 @@ also has a real Node-child probe in `worker-wrapper.test.mjs`. Run these suites 
 
 ## Referral re-checks on the live head
 
+Unpromoted Carbon must retain prior unresolved referrals through both the mandatory-referral sink and the acceptance gate, like an unset Gemini cap. Keep default-path fixtures alongside promoted variants and assert that no settlement or audited retirement was written.
+
 `review.recheckCarriedReferrals` and `review.autoPolicyRespectsNotReal` default true in
 `scripts/review-settings.json`, with standard → platform → tool → environment resolution and source diagnostics.
 Historical referrals persist a `recheck` provenance marker and go through the existing mandatory review against the pinned live net diff;

@@ -2921,15 +2921,30 @@ describe('#4315 durable referral effects', () => {
     expect(mandatoryReferralState(h.state.comments, { head: 'b'.repeat(40) }).blocked).toEqual(result === 'block' ? [old.referrals[0].key] : []);
   });
 
-  it('R1062: flag on with the Gemini cap unset does not seat Carbon; persisted referrals remain pending', () => {
-    const env = { REVIEW_PR_ANTIGRAVITY_REVIEW: '1' };
+  it.each([
+    {},
+    { REVIEW_PR_ANTIGRAVITY_REVIEW: '1' },
+    { REVIEW_PR_ANTIGRAVITY_REVIEW: '1', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '40' },
+  ])('unpromoted Carbon keeps prior referrals pending through the sink and acceptance gate (%j)', async env => {
     const h = harness({ env });
-    seedReferrals(h, Array(2).fill('judgeAntigravityReview'), h.state.headRefOid);
-    // R1062: the default unpromoted Carbon is unseated. That alone does not rewrite durable records;
-    // their referrals stay pending until the referral sink explicitly persists an audited retirement.
+    const old = seedReferrals(h, ['judgeAntigravityReview'], h.state.headRefOid);
     expect(antigravityReviewFromEnv(env)).toBe(false);
-    expect(mandatoryReferralState(h.state.comments, { head: h.state.headRefOid }).pending).toHaveLength(2);
+    const result = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(result.pending).toEqual([old.referrals[0].key]);
+    expect(result.records.every(r => !r.dropped && !r.rulings.length)).toBe(true);
+    expect(mandatoryReferralState(h.state.comments, { head: h.state.headRefOid }).pending).toEqual(result.pending);
+    expect(() => assertMandatoryReferralsCleared(h.state, { repo: 'o/r', pr: 7, env, readRuns: () => [] }))
+      .toThrow(/mandatory referral hold/);
     expect(h.judge).not.toHaveBeenCalled();
+    expect(h.ledger).toEqual([]);
+  });
+
+  it('flag on with the Gemini cap left unset keeps the seat\'s referrals pending', async () => {
+    const h = harness({ failure: 'judge', env: { REVIEW_PR_ANTIGRAVITY_REVIEW: '1' } });
+    seedReferrals(h, Array(2).fill('judgeAntigravityReview'));
+    const result = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(result.pending).toHaveLength(2);
+    expect(result.records.every(r => !r.dropped)).toBe(true);
   });
 
   it('a promoted seat with the Gemini cap left unset keeps its persisted referrals pending', async () => {
@@ -2955,6 +2970,8 @@ describe('#4315 durable referral effects', () => {
 
   it.each([
     [{ REVIEW_PR_ANTIGRAVITY_REVIEW: '0', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '40' }, 1],
+    [{ REVIEW_PR_ANTIGRAVITY_REVIEW: '1', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' }, 1],
+    [{ REVIEW_PR_ANTIGRAVITY_REVIEW: '1', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '40' }, 5],
     [{ REVIEW_PR_ANTIGRAVITY_REVIEW: '1', WE_REVIEW_SHADOW_AGY_PROMOTED: 'true', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' }, 1],
     [{ REVIEW_PR_ANTIGRAVITY_REVIEW: '0', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' }, 1],
     [{ REVIEW_PR_ANTIGRAVITY_REVIEW: '1', WE_REVIEW_SHADOW_AGY_PROMOTED: 'true', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '40' }, 5],

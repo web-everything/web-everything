@@ -3946,10 +3946,11 @@ describe('#4315 incident-shaped mandatory referral', () => {
 // Real declaration + real I/O bindings with an isolated forge and independent judge transport.
 // No filesystem authority is shared between restarts; only the PR comments survive.
 describe('#4315 operation / I/O restart soak', () => {
-  it.each(['judge', 'judgeSecurity', 'judgeAdvisory', 'judgeCorrectnessAdvisory', 'judgeAntigravityReview'])(
-    '%s cannot bypass a missing mandatory ruling (25 restarts)', async seat => {
-      // R1062: use the same promoted seat policy for durable writes and the landing guard.
-      const env = { REVIEW_PR_ANTIGRAVITY_REVIEW: '1', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '40', WE_REVIEW_SHADOW_AGY_PROMOTED: 'true' };
+  it.each(['judge', 'judgeSecurity', 'judgeAdvisory', 'judgeCorrectnessAdvisory', 'judgeAntigravityReview']
+    .flatMap(seat => [undefined, 'true'].map(promoted => [seat, promoted])))(
+    '%s cannot bypass a missing mandatory ruling (25 restarts, promotion=%s)', async (seat, promoted) => {
+      const env = { REVIEW_PR_ANTIGRAVITY_REVIEW: '1', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '40',
+        ...(promoted ? { WE_REVIEW_SHADOW_AGY_PROMOTED: promoted } : {}) };
       const source = { summary: 'confirmed off-scope defect', file: 'outside-diff.mjs', verdict: 'CONFIRMED',
         impactIfUnfixed: 'broken', outcome: 'fixed', prevention: 'captured #7', disposition: 'nit' };
       const { registry } = registryFor({ netRev: PINNED_HEAD }, { codexAdvisory: true, correctnessAdvisory: true, antigravityReview: true });
