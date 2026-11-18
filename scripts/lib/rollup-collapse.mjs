@@ -53,13 +53,13 @@ export function rollupRowKind(c) {
  * pr-status.mjs#reduceCheckState` all fold every entry — collapse to the latest entry per name FIRST, then fold.
  *
  * Within a name: take the FIRST non-empty tier of `CheckRun` → untagged → `StatusContext` ({@link
- * rollupRowKind}), then the LATEST entry in that tier ({@link latestOf}). Pure. Order of the returned rows is
- * NOT the input order — one row per distinct source/name, in first-seen order.
+ * rollupRowKind}), then remove only proven superseded attempts in that tier. Pure. Order of the returned rows is
+ * NOT the input order — source/name groups are returned in first-seen order.
  * Workflow and check-suite identities partition same-named jobs: a run in one
  * workflow/suite cannot supersede evidence from another. Without source metadata,
- * the default retains the historical per-name grouping. Evidence guards must use
- * `preserveUnknownJobs`: unknown sources or unordered attempts then pass through
- * separately, so unreadable evidence cannot be hidden by another row.
+ * the default retains per-name grouping and selects a blocking row if attempts
+ * cannot be ordered. `preserveUnknownJobs` passes unknown sources and all
+ * non-superseded attempts through separately for per-row evidence guards.
  *
  * A row with NEITHER `name` NOR `context` (unreachable off a real `gh pr view --json statusCheckRollup` — every
  * live row carries one or the other) is passed through UNCOLLAPSED, one output row per such input row: there is
@@ -89,18 +89,10 @@ export function collapseRollupToLatestPerName(rollup, { preserveUnknownJobs = fa
   }
   const out = [];
   for (const matches of byName.values()) {
-    if (preserveUnknownJobs && !matches.every(c => Number.isSafeInteger(Number(c?.id)) && Number(c.id) > 0)) {
-      const timestamps = matches.map(c => Date.parse(c?.completedAt ?? c?.completed_at));
-      // Valid timestamps alone do not prove which tied attempt supersedes which.
-      if (!timestamps.every(time => time > Date.parse('2000-01-01T00:00:00Z'))
-        || new Set(timestamps).size !== timestamps.length) {
-        out.push(...matches);
-        continue;
-      }
-    }
     const tier = (k) => matches.filter((c) => rollupRowKind(c) === k);
     const pool = [tier('CheckRun'), tier('untagged'), matches].find((t) => t.length);
-    out.push(latestOf(pool));
+    const current = latestAttemptsOf(pool);
+    out.push(...(preserveUnknownJobs ? current : [blockingRowOf(current)]));
   }
   return out;
 }
@@ -174,42 +166,52 @@ export function mergeRequiredCheckRuns(pr, requiredCheck, stdout) {
 }
 
 /**
- * The latest run among several runs of ONE check. PR #2894 review (CONFIRMED live): the two feeds this module
- * serves disagree on order — `gh pr view --json statusCheckRollup` is oldest→newest (creation order,
- * #xkfv491), but the REST `commits/<sha>/check-runs` feed (`we:scripts/operations/pr-status-io.mjs#checksArgv`)
- * is NEWEST-first, so a positional "last wins" silently kept the OLDEST run there. When EVERY run carries a
- * numeric run `id` (REST rows do — `checksArgv` selects it; GitHub run ids are monotonic by creation), the
- * highest id wins regardless of order. Otherwise (the rollup, which carries no id) the last entry wins, as
- * before. Timestamps are deliberately NOT used: the rollup reports a queued run's `startedAt` as the zero date,
- * which would rank the newest run oldest.
- * @param {Array<object>} runs non-empty
- * @returns {object}
+ * Only a strictly later attempt of the same job supersedes a row. Order workflow
+ * runs first (never by check/job IDs), then attempts within the current run:
+ * attempt counters reset for each workflow run. Without run identity metadata,
+ * retain the attempt/timestamp fallback. Missing or invalid run identity cannot
+ * borrow a known run's attempt ordering; that evidence stays in force.
  */
-function latestOf(runs) {
-  const ids = runs.map((c) => Number(c?.id));
-  if (!ids.every((id) => Number.isSafeInteger(id) && id > 0)) return latestByTime(runs);
-  return runs[ids.indexOf(Math.max(...ids))];
+function latestAttemptsOf(runs) {
+  const workflowRun = c => c?.workflowRun ?? c?.checkSuite?.workflowRun
+    ?? c?.check_suite?.workflow_run;
+  const positive = value => {
+    const n = typeof value === 'number' || (typeof value === 'string' && /^\d+$/.test(value))
+      ? Number(value) : NaN;
+    return Number.isSafeInteger(n) && n > 0 ? n : null;
+  };
+  const timestamp = value => {
+    const time = Date.parse(value);
+    return Number.isFinite(time) && time > Date.parse('2000-01-01T00:00:00Z') ? time : null;
+  };
+  const started = c => timestamp(c?.startedAt ?? c?.started_at);
+  const completed = c => c?.status && String(c.status).toUpperCase() !== 'COMPLETED'
+    ? null : timestamp(c?.completedAt ?? c?.completed_at);
+  const attempt = c => c?.run_attempt ?? c?.runAttempt
+    ?? workflowRun(c)?.run_attempt ?? workflowRun(c)?.runAttempt;
+  const runId = c => workflowRun(c)?.id ?? c?.run_id ?? c?.runId;
+  const latestBy = (rows, rank) => {
+    const ranks = rows.map(rank);
+    const latest = ranks.reduce((max, value) => value === null ? max : Math.max(max, value), -Infinity);
+    return rows.filter((_c, i) => ranks[i] === null || ranks[i] === latest);
+  };
+  // Compare the same timestamp field across rows. A completion after another
+  // job's start does not prove a later execution; unfinished rows stay in force
+  // unless comparable starts (or explicit run/attempt metadata) supersede them.
+  // Malformed explicit attempts prevent a timestamp from silently overriding them.
+  const withinRun = rows => latestBy(rows, rows.some(c => attempt(c) != null)
+    ? c => positive(attempt(c)) : rows.every(c => started(c) !== null) ? started : completed);
+  if (!runs.some(c => runId(c) != null)) return withinRun(runs);
+
+  const currentRun = latestBy(runs, c => positive(runId(c)));
+  const currentAttempts = new Set(withinRun(currentRun.filter(c => positive(runId(c)) !== null)));
+  return currentRun.filter(c => positive(runId(c)) === null || currentAttempts.has(c));
 }
 
-/**
- * No ids (the rollup): the rollup is NOT reliably oldest→newest (live 2026-10-07, PR #4290: `soak-replay-gate`
- * listed FAILURE@17:27 BEFORE its superseded SUCCESS@17:13, so "last wins" read stale green — the fix daemon saw
- * no red check and owed no ci-heal, while the review dispatch gate, reading REST by run id, saw the real red).
- * A run still in flight (no real `completedAt` — absent or the zero date) is the newest; otherwise the greatest
- * `completedAt` wins, ties broken by position (later wins). Any run with no usable timestamp at all keeps the
- * old positional rule for the whole group.
- */
-function latestByTime(runs) {
-  const stamp = (c) => {
-    const done = Date.parse(c?.completedAt ?? c?.completed_at);
-    if (Number.isFinite(done) && done > Date.parse('2000-01-01T00:00:00Z')) return done;
-    const status = String(c?.status ?? '').toUpperCase();
-    if (status && status !== 'COMPLETED') return Infinity; // queued / in progress: the newest run
-    return null;
-  };
-  const stamps = runs.map(stamp);
-  if (stamps.some((s) => s === null)) return runs[runs.length - 1];
-  let best = 0;
-  for (let i = 1; i < runs.length; i++) if (stamps[i] >= stamps[best]) best = i;
-  return runs[best];
+/** Scalar consumers must never see success while unordered blocking evidence remains. */
+function blockingRowOf(rows) {
+  return rows.find(isFailedCheckRow)
+    || rows.find(c => (c?.status && String(c.status).toUpperCase() !== 'COMPLETED')
+      || !['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(String(c?.conclusion || c?.state || '').toUpperCase()))
+    || rows[0];
 }

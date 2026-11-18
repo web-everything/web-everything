@@ -4485,3 +4485,28 @@ in both orders (including absent source metadata), requiring CI heal, recovery
 and escalation to remain available. The promotion fixture also refuses that
 shape; the job-identity fixture covers successful reruns. Unreadable causes retain
 the normal CI repair/escalation path as the operator-visible fallback.
+
+
+## Same-job rollup attempts and merge-gate hold isolation
+
+Check IDs identify jobs, not rerun attempts. Rollup collapse orders same-job rows by
+workflow run ID first, then `run_attempt`/`runAttempt` within that run, then
+`completedAt`/`startedAt` (including REST snake-case fields). Compare start times
+when all rows have usable starts; otherwise compare completion times only and
+retain unfinished rows. A completion time must never be compared with another
+execution's start time to prove supersession. Attempt counters reset
+for each workflow run: a newer run at attempt 1 supersedes an older run at attempt 2.
+Without run metadata, keep the attempt/timestamp fallback; when run metadata is
+present, rows with missing or unreadable run identity remain in force rather than
+borrowing another run's attempt ordering. Tied, missing or unreadable evidence never
+supersedes a blocker; scalar readers retain a blocking row and per-row evidence
+guards retain every non-superseded row. A genuine later attempt can clear an older
+failure. When ordering is unavailable, acquire readable rerun evidence before
+treating the job as green. Workflow/suite partitions remain independent.
+
+`rollup-collapse-job-identity.test.mjs` pins unordered failure/pending/unreadable
+rows and real reruns through collapse, required-check lookup and CI reduction.
+`merge-gate-hold-class.test.mjs` pins excusing only the exact head-bound row whose
+verdict was read: every other merge-gate row remains, including independent CI
+failures. A successful first workflow must not hide a failure in another. Run
+these and affected reader fixtures through heavy admission.

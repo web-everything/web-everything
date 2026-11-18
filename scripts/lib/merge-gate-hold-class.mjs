@@ -113,11 +113,11 @@ export function classifyMergeGateHold({ results, prLabels, freeze, verdictComple
   return { excused, kind, holds, others, why: candidate ? 'current candidate must pass merge-gate' : excused ? 'only candidacy or cleared shared-freeze holds' : 'real or absent blocking evidence' };
 }
 
-/** Latest failing completed run only; success/pending supersedes all older failures. */
+/** Find a completed failure among current job partitions; another workflow cannot hide it. */
 export function latestFailingMergeGate(rows) {
-  const row = collapseRollupToLatestPerName(rows).find(r => r.name === 'merge-gate');
-  return row && String(row.status).toLowerCase() === 'completed'
-    && FAILING_CONCLUSIONS.includes(String(row.conclusion).toLowerCase()) ? row : null;
+  return collapseRollupToLatestPerName(rows).find(row => row.name === 'merge-gate'
+    && String(row.status).toLowerCase() === 'completed'
+    && FAILING_CONCLUSIONS.includes(String(row.conclusion).toLowerCase())) ?? null;
 }
 
 /** Pure except injected readers. A lazy freeze reader lets an entire pass share one fresh read. */
@@ -149,7 +149,7 @@ export function excuseMergeGateRows(rows, { prNumber, headSha, labels, readVerdi
     }
     const replacement = { ...row, conclusion: row.conclusion === row.conclusion.toLowerCase() ? 'success' : 'SUCCESS',
       mergeGateHoldExcused: { kind: classification.kind, holds: classification.holds, jobId } };
-    return { rows: rows.filter(r => r.name !== 'merge-gate' || r === row).map(r => r === row ? replacement : r), excused: true };
+    return { rows: rows.map(r => r === row ? replacement : r), excused: true };
   } catch { return unchanged; }
 }
 

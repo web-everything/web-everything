@@ -4,9 +4,10 @@ import { formatPrResult } from '../merge-gate-ci.mjs';
 import { runDraftPromotionStep } from '../../conveyor/draft-promotion-loop.mjs';
 import { readReviewCiGate, readReviewHeadAndLabels } from '../review-ci-gate-io.mjs';
 import { describe, it, expect, vi } from 'vitest';
-import { parsePrResultTable, classifyMergeGateHold, excuseMergeGateRows, resolveMergeGateHoldSetting, readMergeGateVerdict } from '../merge-gate-hold-class.mjs';
+import { parsePrResultTable, classifyMergeGateHold, excuseMergeGateRows, latestFailingMergeGate, resolveMergeGateHoldSetting, readMergeGateVerdict } from '../merge-gate-hold-class.mjs';
 import { runReconcilePass } from '../../conveyor/reconcile-pass.mjs';
 import { defaultReadHeadCheckState } from '../../operations/promote-draft-pr-dispatch.mjs';
+import { reduceCheckState } from '../../operations/pr-status.mjs';
 
 const log4965 = `2026-10-12T09:49:30.3934630Z #4965: HOLD
 2026-10-12T09:49:30.3936795Z   hold              candidate-label        no "ready-to-merge" label — the drain never considers it
@@ -58,6 +59,34 @@ describe('hold classification', () => {
   });
 });
 describe('settings and row evidence', () => {
+  it('audit regression: excusing review candidacy preserves an independent failed ci merge-gate', () => {
+    const review = { ...row, workflowName: 'review' };
+    const ci = { ...row, id: 100, workflowName: 'ci' };
+    const readVerdict = vi.fn(() => verdict());
+    const out = excuseMergeGateRows([review, ci, green], opts({ readVerdict }));
+    expect(readVerdict).toHaveBeenCalledTimes(1);
+    expect(readVerdict).toHaveBeenCalledWith({ jobId: review.id, prNumber: 4965 });
+    expect(out.excused).toBe(true);
+    expect(out.rows).toEqual([
+      { ...review, conclusion: 'SUCCESS', mergeGateHoldExcused: expect.objectContaining({ jobId: review.id }) },
+      ci, green,
+    ]);
+    expect(reduceCheckState(out.rows, ['merge-gate', 'test']).state).toBe('red');
+    expect(latestFailingMergeGate(out.rows)).toBe(ci);
+  });
+
+  it.each(['SUCCESS', null])('a %s merge-gate in another workflow does not hide the row whose verdict is read', conclusion => {
+    const other = { ...row, id: 100, workflowName: 'ci', conclusion,
+      status: conclusion ? 'COMPLETED' : 'IN_PROGRESS' };
+    const review = { ...row, workflowName: 'review' };
+    const readVerdict = vi.fn(() => verdict());
+    expect(latestFailingMergeGate([other, review])).toBe(review);
+    const out = excuseMergeGateRows([other, review], opts({ readVerdict }));
+    expect(readVerdict).toHaveBeenCalledWith({ jobId: review.id, prNumber: 4965 });
+    expect(out.rows[0]).toBe(other);
+    expect(out.rows[1]).toMatchObject({ conclusion: 'SUCCESS', mergeGateHoldExcused: { jobId: review.id } });
+  });
+
   it('resolves all layers and fails closed on any invalid layer', () => {
     expect(resolveMergeGateHoldSetting({ platform: {}, repo: {}, env: {} })).toEqual({ value: 'on', source: 'standard' });
     expect(resolveMergeGateHoldSetting({ platform: {}, repo: {}, env: { MERGE_GATE_CANDIDACY_HOLD_IS_NOT_CI_FAILURE: 'off' } })).toEqual({ value: 'off', source: 'env' });
@@ -67,13 +96,15 @@ describe('settings and row evidence', () => {
   it.each([{ setting: { value: 'off' } }, { readVerdict: () => ({ error: 'no log' }) }, { headSha: 'b'.repeat(40) }, { prNumber: 5000 }, { readVerdict: () => { throw Error('read failed'); } }])('preserves red on missing authority %j', extra => expect(excuseMergeGateRows([row], opts(extra)).rows).toEqual([row]));
   it('replaces only latest merge-gate and retains other red checks', () => {
     const badTest = { ...green, conclusion: 'FAILURE' };
-    const out = excuseMergeGateRows([{ ...row, id: 122 }, row, badTest], opts());
-    expect(out.rows).toEqual([{ ...row, conclusion: 'SUCCESS', mergeGateHoldExcused: { kind: 'candidacy', holds: expect.any(Array), jobId: 123 } }, badTest]);
+    const older = { ...row, id: 122, run_attempt: 1 };
+    const latest = { ...row, run_attempt: 2 };
+    const out = excuseMergeGateRows([older, latest, badTest], opts());
+    expect(out.rows).toEqual([older, { ...latest, conclusion: 'SUCCESS', mergeGateHoldExcused: { kind: 'candidacy', holds: expect.any(Array), jobId: 123 } }, badTest]);
     expect(excuseMergeGateRows([{ ...row, status: 'completed', conclusion: 'failure' }], opts()).rows[0].conclusion).toBe('success');
   });
   it('never reads a superseded failure', () => {
     const readVerdict = vi.fn();
-    excuseMergeGateRows([row, { ...row, id: 124, conclusion: 'SUCCESS' }], opts({ readVerdict }));
+    excuseMergeGateRows([{ ...row, run_attempt: 1 }, { ...row, id: 124, run_attempt: 2, conclusion: 'SUCCESS' }], opts({ readVerdict }));
     expect(readVerdict).not.toHaveBeenCalled();
   });
   it('reads and caches immutable job evidence with throttled gh', () => {
