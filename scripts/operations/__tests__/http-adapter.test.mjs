@@ -404,6 +404,7 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // Compute-only inspection; the routing reader is injected by run.mjs.
     [AI_ROUTING_OP]: 'ai-routing.mjs',
     'manual-daemon-pass': 'manual-daemon-pass.mjs',
+    'red-team-enqueue': 'red-team-enqueue.mjs',
     'health-respond': 'health-respond.mjs',
     [REVIEW_PR_OP]: 'review-pr.mjs',
     [SUGGEST_NEXT_OP]: 'suggest-next.mjs',

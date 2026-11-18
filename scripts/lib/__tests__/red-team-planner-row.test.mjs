@@ -140,3 +140,11 @@ describe('normal-path parity with the pre-extraction decisions', () => {
       .toMatchObject({ kind: row.kind, scopeBloat });
   });
 });
+
+
+it('classifies a pending review-gate owner without making pending CI successful', () => {
+  const result = readPlannerRow({ repo, pr, refusals: [refusal('review-ci')], requiredChecks: ['review-gate'],
+    rawPrs: [rawPr([check('review-gate', null, { status: 'in_progress' })])] });
+  expect(result.reviewOwnedChecks).toMatchObject({ reviewOwned: ['review-gate'], onlyRed: false,
+    ci: { allowed: false, affected: [{ name: 'review-gate', reason: 'pending' }] } });
+});

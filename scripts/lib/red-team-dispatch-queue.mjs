@@ -1,4 +1,4 @@
-import { readPlannerRows } from './red-team-planner-row.mjs';
+import { readPlannerRows, redTeamNominationRefusal } from './red-team-planner-row.mjs';
 import { failClosedCapacity } from './operator-override-reader.mjs';
 import { readOperatorPolicy } from './policy-cascade.mjs';
 import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
@@ -303,8 +303,10 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
   floor, readCpuIdlePct, readSkipCardOnly = () => readRedTeamProbes().value.skipCardOnly, readNetFiles = args => isUnderTest() ? { ok: false } : readBacklogOnlyNetFiles(args), ...rest }) {
   const candidates = [], cardOnlyCandidates = [];
   const plannerRows = readPlannerRows({ repo, plan, rawPrs });
+  const candidate = row => !redTeamNominationRefusal(plannerRows.find(r => r.refusal === row),
+    rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber)), plannerRows);
   for (const { refusal: row } of plannerRows) {
-    if (row.kind !== 'already-reviewed-head') continue;
+    if (!candidate(row)) continue;
     const head = row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid;
     if (!isRealHead(head)) continue;
     const number = Number(row.prNumber), key = `${repo}#${number}@${head}`;
@@ -360,10 +362,10 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
     const refusals = [...kept.filter(row => !bypassed.has(Number(row.prNumber))), ...kept.filter(row => bypassed.has(Number(row.prNumber)))];
     // Replace admitted candidate slots in FIFO order while preserving unrelated rows and metadata.
     const queuedRows = admitted.flatMap(entry => refusals.filter(row =>
-      row.kind === 'already-reviewed-head' && Number(row.prNumber) === entry.pr));
+      candidate(row) && Number(row.prNumber) === entry.pr));
     let index = 0;
     const options = { repo, plan: { ...plan, refusals: refusals.map(row =>
-      row.kind === 'already-reviewed-head' && allowed.has(Number(row.prNumber)) ? queuedRows[index++] : row) },
+      candidate(row) && allowed.has(Number(row.prNumber)) ? queuedRows[index++] : row) },
     rawPrs: held.size ? rawPrs?.filter(pr => !held.has(Number(pr.number))) : rawPrs, capacity, log, ...rest };
     const finish = result => {
       queue.settle(repo, result);
