@@ -12,6 +12,7 @@ import { openOperatorSendBacks } from '../../lib/operator-send-backs.mjs';
 import { dispatchFix, writePrivateBorrowedPrompt, withPlannedContext } from '../../conveyor/reconcile-fix-dispatch.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
 import { redTeamGateMarker, liveResultGateState } from '../../lib/red-team-gate.mjs';
+import { RED_TEAM_FIX_COMMENT_MARKER, countRedTeamFixComments } from '../../conveyor/red-team-fix-round-count.mjs';
 import { buildFixEndComment } from '../../conveyor/fix-procedure.mjs';
 import { resolveFixBorrowSettings } from '../../lib/dispatch-throttle.mjs';
 import { fixDetachedProvider, fixLauncherAvailable, FIX_RUN_SCRIPT, FIX_RUN_EXECUTORS, FIX_RUN_CONFINEMENT } from '../dispatch-providers/fix.mjs';
@@ -150,8 +151,13 @@ describe('runFixCli', () => {
     vi.stubEnv('WE_FIX_REARM_NOTHING_TO_REARM', 'fail');
     const m = mk(['a'.repeat(40), 'b'.repeat(40)]);
     const pr = acceptedRedTeamPr();
+    const posted = [];
     const run = (cmd, args, opts) => {
       const result = m.run(cmd, args, opts);
+      if (cmd === 'gh' && args.includes('comment') && args.includes('--body-file')) {
+        expect(m.calls.some(c => c.includes('push'))).toBe(true);
+        posted.push({ author: { login: 'web-everything' }, body: readFileSync(args.at(-1), 'utf8') });
+      }
       return cmd === 'gh' && args.includes('view') ? JSON.stringify(pr) : result;
     };
     const result = await runFixCli(argv, { ...m.io, run, readComments: async () => pr.comments });
@@ -161,6 +167,45 @@ describe('runFixCli', () => {
     expect(m.calls.find(c => c.includes('push'))).toContain('HEAD:refs/heads/lane/7-x');
     expect(m.calls.flat().some(a => String(a).endsWith('rearm-review.mjs'))).toBe(false);
     expect(m.spawn.mock.calls[0][0].prompt).toContain('Gate break to repair');
+    expect(countRedTeamFixComments(posted)).toBe(1);
+    expect(posted.find(c => c.body.startsWith(RED_TEAM_FIX_COMMENT_MARKER)).body).toContain('b'.repeat(40));
+  });
+  it.each(['ordinary accepted', 'review:changes', 'stale gate', 'unread gate'])(
+    '%s PR still rearms and reports re-armed review:pending', async kind => {
+      const m = mk(['a'.repeat(40), 'b'.repeat(40)]);
+      const pr = acceptedRedTeamPr();
+      if (kind === 'ordinary accepted') pr.labels = ['review:accepted'];
+      if (kind === 'review:changes') pr.labels.push('review:changes');
+      if (kind === 'stale gate') pr.comments = pr.comments.map(c => ({ ...c, body: c.body.replaceAll('a'.repeat(40), 'c'.repeat(40)) }));
+      if (kind === 'unread gate') pr.comments = [];
+      pr.comments.push({ body: '🔁 review — changes requested\nFIX THE THING' });
+      const run = (cmd, args, opts) => {
+        const result = m.run(cmd, args, opts);
+        return cmd === 'gh' && args.includes('view') ? JSON.stringify(pr) : result;
+      };
+      // Invalid gate evidence on a blocked accepted fix fails closed during context rendering.
+      // CI heals have their own context and must still rearm when that evidence is absent/stale.
+      const ciHeal = ['stale gate', 'unread gate'].includes(kind);
+      const result = await runFixCli([...argv, ...(ciHeal ? ['--repair-kind=ci-heal'] : [])], {
+        ...m.io, run, readComments: async () => pr.comments,
+        readCiHeal: async () => ({ checks: [{ name: 'gate', state: 'FAILURE', log: 'failed' }] }),
+      });
+      expect(result.code).toBe(0);
+      expect(result.result).toContain('re-armed review:pending');
+      expect(m.calls.flat().some(a => String(a).endsWith('rearm-review.mjs'))).toBe(true);
+    });
+  it('fails the hand-back and retains pending debt if the counted red-team round cannot be posted', async () => {
+    const m = mk(['a'.repeat(40), 'b'.repeat(40)]);
+    const pr = acceptedRedTeamPr();
+    const run = (cmd, args, opts) => {
+      const result = m.run(cmd, args, opts);
+      if (cmd === 'gh' && args.includes('comment')) throw new Error('comment unavailable');
+      return cmd === 'gh' && args.includes('view') ? JSON.stringify(pr) : result;
+    };
+    const result = await runFixCli(argv, { ...m.io, run, readComments: async () => pr.comments });
+    expect(result.code).toBe(1);
+    expect(m.owed.sha).toBe('b'.repeat(40));
+    expect(m.pendingRearm.clear).not.toHaveBeenCalled();
   });
   it.each([false, true])('pushAfterCi=%s waits with injected time and folds failures before the agent', async enabled => {
     const m = mk(['a'.repeat(40), 'b'.repeat(40)]);

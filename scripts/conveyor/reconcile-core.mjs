@@ -134,6 +134,7 @@ import { isForeignCompletionSessionId, sanitizeDeniedCommand } from '../operatio
 import { NEGOTIATION_ROUND_CAP } from '../lib/jury-core.mjs';
 import { resolveRoundCap } from '../lib/round-cap.mjs';
 import { countRearmComments, REARM_COMMENT_MARKER } from './rearm-review.mjs';
+import { countRedTeamFixComments } from './red-team-fix-round-count.mjs';
 import { isFixRoundRearmComment } from './rearm-round-count.mjs';
 import { NOTE_COMMENT_MARKER } from './reconcile-note-comment.mjs';
 // #3383 — see this module's own REFUSAL 3 note below, and `advisory-round-count.mjs`'s header for the
@@ -2894,12 +2895,12 @@ export function planReconcile({
         && !withPhase.labels.includes('review:changes')) {
       const findings = redTeamSentBackFindings(pr);
       if (findings.length) {
-        const attempts = roundAttempts();
+        const attempts = roundAttempts() + countRedTeamFixComments(pr.comments);
         if (attempts >= effectiveRoundCap) {
           refuseCapExhausted({ ...withPhase, attempts, cap: effectiveRoundCap, capKind: 'fix',
             why: 'red-team send-back remains unresolved on the accepted head; automatic fix rounds exhausted' }, { allowTakeover: false });
         } else {
-          dispatch.push({ ...base, ...withPhase, kind: 'fix', mode: 'red-team-sent-back', findings: findings.length,
+          dispatch.push({ ...base, ...withPhase, kind: 'fix', mode: 'red-team-sent-back', findings: findings.length, attempts,
             redTeamSentBack: { head: pr.headRefOid, findings },
             why: 'confirmed red-team send-back remains unresolved on this accepted head; repair and push the same branch without rearming' });
         }

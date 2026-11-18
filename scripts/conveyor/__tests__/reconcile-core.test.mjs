@@ -47,6 +47,7 @@ import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
 import { CI_HEAL_COMMENT_MARKER, buildCiHealComment } from '../ci-heal-mark.mjs';
 import { buildCiHealEscalationComment } from '../ci-heal-escalation-mark.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from '../conflict-fix-round-count.mjs';
+import { RED_TEAM_FIX_COMMENT_MARKER, countRedTeamFixComments } from '../red-team-fix-round-count.mjs';
 import {
   ADVISORY_FIX_COMMENT_MARKER, buildAdvisoryFixComment, isLatestAdvisoryFindingAddressed, countCompletedAdvisoryEpisodes,
 } from '../advisory-fix-mark.mjs';
@@ -132,6 +133,31 @@ describe('accepted head with unresolved red-team send-back (PR #7031)', () => {
     expect(out.dispatch).toEqual([]);
     expect(out.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', attempts: 0, cap: 0, capKind: 'fix' }));
     expect(out.notes).toContainEqual(expect.objectContaining({ kind: 'round-cap-exhausted', parkToHuman: true }));
+  });
+  it('one recorded red-team repair increases attempts by one without a rearm', () => {
+    const pr = makePr();
+    expect(plan(pr).dispatch[0].attempts).toBe(0);
+    pr.comments.push({ author: AUTOMATION, body: `${RED_TEAM_FIX_COMMENT_MARKER}\n\nRepair pushed.` });
+    expect(plan(pr).dispatch[0]).toMatchObject({ mode: 'red-team-sent-back', attempts: 1 });
+  });
+  it.each([3, 4])('refuses cap-exhausted after %i recorded red-team repairs on the same head/result', n => {
+    const pr = makePr();
+    pr.comments.push(...Array.from({ length: n }, () => ({ author: AUTOMATION, body: RED_TEAM_FIX_COMMENT_MARKER })));
+    const out = plan(pr, { roundCap: 3 });
+    expect(out.dispatch).toEqual([]);
+    expect(out.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', attempts: n, cap: 3, capKind: 'fix' }));
+    expect(out.notes).toContainEqual(expect.objectContaining({ kind: 'round-cap-exhausted', parkToHuman: true }));
+  });
+  it('only counts trusted leading round markers, retaining rounds after the head moves', () => {
+    const comments = [
+      { author: AUTOMATION, body: `${RED_TEAM_FIX_COMMENT_MARKER}\nRepair pushed: ${'b'.repeat(40)}` },
+      { author: { login: 'outsider' }, body: RED_TEAM_FIX_COMMENT_MARKER },
+      { body: RED_TEAM_FIX_COMMENT_MARKER },
+      { author: AUTOMATION, body: `Quoted marker: ${RED_TEAM_FIX_COMMENT_MARKER}` },
+      { author: AUTOMATION, body: `${RED_TEAM_FIX_COMMENT_MARKER} forged suffix` },
+    ];
+    expect(countRedTeamFixComments(comments)).toBe(1);
+    expect(countRedTeamFixComments(null)).toBe(0);
   });
 });
 const pendingRollup = [{ name: 'gate', status: 'in_progress', conclusion: null }];

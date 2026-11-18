@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 import { redTeamSentBackFindings } from '../conveyor/dispatch-eligibility-facts.mjs';
+import { RED_TEAM_FIX_COMMENT_MARKER } from '../conveyor/red-team-fix-round-count.mjs';
 import { buildStandDownComment } from '../conveyor/stand-down.mjs';
 import { repeatedFindingPlan, applyScopeReset, resolveFixSafety } from '../conveyor/repeated-finding-reset.mjs';
 /**
@@ -381,6 +382,10 @@ function withMessageFile(message, action) {
 }
 
 const CHANGES_COMMENT_RE = /changes requested|THIS IS AN ADVISORY REVIEW/i;
+const hasRedTeamSentBackLabels = pr => {
+  const labels = (pr?.labels ?? []).map(l => typeof l === 'string' ? l : l?.name);
+  return labels.includes('review:accepted') && labels.includes('red-team:blocked') && !labels.includes('review:changes');
+};
 const cap = (t, n) => (String(t ?? '').length > n ? `${String(t).slice(0, n)}\n[... truncated ...]` : String(t ?? ''));
 
 /**
@@ -391,8 +396,7 @@ const cap = (t, n) => (String(t ?? '').length > n ? `${String(t).slice(0, n)}\n[
  */
 export function renderPrContext(json) {
   const pr = typeof json === 'string' ? JSON.parse(json) : json;
-  const labels = (pr?.labels ?? []).map(l => typeof l === 'string' ? l : l?.name);
-  if (labels.includes('review:accepted') && labels.includes('red-team:blocked') && !labels.includes('review:changes')) {
+  if (hasRedTeamSentBackLabels(pr)) {
     const findings = redTeamSentBackFindings(pr);
     if (!findings.length) throw new LauncherError('no-finding: no trusted current-head red-team send-back');
     return '## Red-team sent-back findings (authoritative ask)\nRepair and push the same branch; preserve review:accepted. Never rearm review.\n'
@@ -726,7 +730,7 @@ export async function runFixCli(argv = [], {
     const brief = assertBriefTaskContent(readPrompt(launch.promptFile));
     // The launcher has the network, the agent does not: fetch the reviewer's finding here and hand it over in the brief.
     const prHead = JSON.parse(run('gh', ['pr', 'view', pr, '--json', 'title,body,baseRefName,mergeable,headRefOid,labels', ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot }) || '{}');
-    const accepted = (prHead.labels ?? []).some(l => (typeof l === 'string' ? l : l?.name) === 'review:accepted');
+    let preserveAccepted = false;
     prHeadSha = prHead.headRefOid ?? null;
     const mergeConflictingBase = !launch.mergeOnto && prHead.mergeable === 'CONFLICTING';
     const mergeOnto = mergeConflictingBase ? PR_BASE_MERGE_TARGET : launch.mergeOnto;
@@ -738,11 +742,17 @@ export async function runFixCli(argv = [], {
     let openSendBacks = [];
     let repeatPlan = { action: 'patch' };
     if (launch.repairKind === 'ci-heal') {
+      if (hasRedTeamSentBackLabels(prHead)) {
+        const comments = await readComments(pr, { repo: launch.repo });
+        preserveAccepted = redTeamSentBackFindings({ ...prHead, number: Number(pr), comments, commentsComplete: true }).length > 0;
+      }
       const inputs = await readCiHeal({ repo: launch.repo, pr, run: (cmd, args, opts) => run(cmd, args, { cwd: weRoot, ...opts }) });
       if (!inputs.checks?.length) throw new LauncherError(`no-ci-failure: PR #${pr} has no failing check to heal`);
       prContext = renderCiHealContext(inputs);
     } else {
       const comments = await readComments(pr, { repo: launch.repo });
+      preserveAccepted = hasRedTeamSentBackLabels(prHead)
+        && redTeamSentBackFindings({ ...prHead, number: Number(pr), comments, commentsComplete: true }).length > 0;
       openSendBacks = openOperatorSendBacks({ comments, headRefOid: prHeadSha });
       const safety = resolveFixSafety();
       for (const k of ['alertAtRoundCap', 'resetOnRepeatedFinding']) write(`policy · fix.${k}=${safety.value[k]} (${safety.sources[k]})\n`);
@@ -825,7 +835,7 @@ export async function runFixCli(argv = [], {
     if (risky.length) throw new LauncherError(`lane git config defines command/credential/remote-rewrite keys (${risky.join(', ')}); refusing to run in it`);
     before = checkLane(prHeadSha).laneHead;
     const rearmReview = () => {
-      if (accepted) {
+      if (preserveAccepted) {
         write(`fix-run: PR #${pr} re-arm skipped — preserving review:accepted\n`);
         return;
       }
@@ -841,6 +851,11 @@ export async function runFixCli(argv = [], {
       }
     };
     const rearm = head => {
+      if (preserveAccepted) {
+        // Publication is required before clearing the pending hand-back: this path never posts a rearm marker.
+        withMessageFile(`${RED_TEAM_FIX_COMMENT_MARKER}\n\nRed-team send-back repair pushed: ${head}. Preserved review:accepted.\n`,
+          file => run('gh', ['pr', 'comment', pr, ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot }));
+      }
       // Best effort: the push already landed, and a label hiccup must never stop the re-arm (the CI-lifecycle label pass relabels it).
       try { markFixPushAwaitingCi({ repo: launch.repo, pr, head }, { run: (cmd, args) => run(cmd, args, { cwd: weRoot }), recordPush }); }
       catch (e) { writeErr(`fix-run: PR #${pr} CI hand-off failed, re-arming anyway: ${String(e?.message ?? e).split('\n')[0]}\n`); }
@@ -1216,7 +1231,7 @@ export async function runFixCli(argv = [], {
       await postEvidence(after);
       rearm(after);
       pendingRearm.clear(launch.repo, pr);
-      result = `PR #${pr} (pushed ${after.slice(0, 9)}, ${accepted ? 'preserved review:accepted' : 're-armed review:pending'})`;
+      result = `PR #${pr} (pushed ${after.slice(0, 9)}, ${preserveAccepted ? 'preserved review:accepted' : 're-armed review:pending'})`;
       outcome = FIX_RUN_OUTCOME.PUSHED; reason = finalMessage || `pushed ${after.slice(0, 9)}`;
     }
     write(`fix-run: PR #${pr} finished - ${result}\n`);
