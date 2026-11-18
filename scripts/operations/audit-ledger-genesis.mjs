@@ -17,14 +17,3 @@ export function createGenesisRunner({ fs = realFs, path } = {}) {
       applied: appended !== null };
   };
 }
-
-/** Recovery path (orchestrator-only, logged with actor and reason): anchors the current bytes under a new genesis. */
-export function createResealRunner({ fs = realFs, path } = {}) {
-  return async ({ apply = false, actor, reason } = {}) => {
-    if (typeof actor !== 'string' || !actor.trim() || typeof reason !== 'string' || !reason.trim()) throw new Error('audit-ledger-reseal requires actor and reason');
-    const ledgerPath = path ?? auditRecordPath({ fs }), raw = readLedger(ledgerPath, fs);
-    const preview = buildGenesis(raw, { reseal: true });
-    const appended = apply ? await appendChained(ledgerPath, { kind: 'genesis', reseal: true, actor, reason }, { fs }) : null;
-    return { actor, reason, legacyCount: (appended ?? preview).legacyCount, legacyDigest: (appended ?? preview).legacyDigest, applied: appended !== null };
-  };
-}

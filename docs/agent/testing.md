@@ -4495,5 +4495,5 @@ operator inspection/repair; it is never automatically reclaimed.
 Tamper handling: unchained post-genesis lines (stale writers) are skipped for linking and never
 wedge the writer. A rewritten chained record or legacy bytes, a rollback below `audits.hwm.json`,
 or a missing sidecar after genesis refuses the append (`LEDGER_TAMPER`, exit 3), writes the record to
-`audits.quarantine.jsonl`, and is recovered only by the `audit-ledger-reseal` op (actor and reason
-logged in the new genesis). Test it with `createResealRunner({ path })` on a temporary path.
+`audits.quarantine.jsonl`, and is recovered only by the orchestrator-run reseal script kept outside the repo
+(`appendChained` with `{ kind: 'genesis', reseal: true, actor, reason }`).

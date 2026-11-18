@@ -59,8 +59,8 @@ function assertHighWater(path, raw, lines, parsed, fs) {
   try { hwm = JSON.parse(fs.readFileSync(hwmPath(path), 'utf8')); }
   catch (error) {
     if (error.code === 'ENOENT' && g === -1) return -1;
-    throw tamper(error.code === 'ENOENT' ? 'Audit ledger high-water mark missing after genesis; run audit-ledger-reseal after review.'
-      : 'Audit ledger high-water mark unreadable; run audit-ledger-reseal after review.');
+    throw tamper(error.code === 'ENOENT' ? 'Audit ledger high-water mark missing after genesis; orchestrator reseal required.'
+      : 'Audit ledger high-water mark unreadable; orchestrator reseal required.');
   }
   const broken = () => { throw tamper(`Audit ledger chain broken, rollback detected (high-water seq ${hwm?.seq}); refusing to append.`); };
   if (g === -1) broken();
