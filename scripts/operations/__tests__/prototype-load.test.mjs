@@ -539,6 +539,16 @@ describe('canonicalAuditEvidence', () => {
       // Baseline: the open WEAKENED alone is admitted by its own ruling.
       expect(evaluate([openWeak], { ruledWeakened: gate([A]) })).toMatchObject({ ok: true });
     });
+    it('a later scoped pass with a stale hash never admits over an earlier bound scoped WEAKENED', () => {
+      const n = auditRecord({ base: BASE_A, head: HEAD, at: at('09'), fingerprint: FP });
+      const bound = scopedAudit({ base: BASE_A, head: HEAD, at: at('10'), verdict: 'WEAKENED', findings: ['y.mjs:2 invariant broken'], fingerprint: FP, followUps: [] });
+      const stale = scopedAudit({ base: BASE_A, head: HEAD, at: at('11'), invariantsHash: '0'.repeat(64), fingerprint: FP, followUps: [] });
+      expect(evaluate([n, bound, stale], { invariantsText })).toEqual({ ok: false, reason: 'weakened' });
+      expect(evaluate([stale, bound, n], { invariantsText })).toEqual({ ok: false, reason: 'weakened' });
+      // Once a pass bound to the same invariants follows it, the scoped WEAKENED is superseded.
+      const fixedPass = scopedAudit({ base: BASE_A, head: HEAD, at: at('11'), fingerprint: FP, followUps: [] });
+      expect(evaluate([n, bound, fixedPass], { invariantsText })).toMatchObject({ ok: true, record: fixedPass });
+    });
     it('an open WEAKENED on the live head beats a scoped pass', () => {
       expect(evaluate([open, { ...open, at: at('11'), verdict: 'WEAKENED', findings: ['y.mjs:2 broke'] }, scoped], { invariantsText }))
         .toEqual({ ok: false, reason: 'weakened' });

@@ -324,6 +324,50 @@ describe('R973 scoped record never supersedes an open WEAKENED', () => {
       expect(got.verdict).toBe('WEAKENED');
       expect(got.findings).toEqual([A, B]);
     });
+    describe('a scoped WEAKENED is not hidden by a later scoped record or by another scoped WEAKENED', () => {
+      const invariantsText = '- Keep the guard.\n';
+      const hash = createHash('sha256').update(invariantsText).digest('hex');
+      const withHash = { ...scoped, invariantsHash: hash };
+      const N = rec('2026-11-01T09:00:00.000Z', 'NOT WEAKENED');
+      const scopedB = rec('2026-11-01T10:00:00.000Z', 'WEAKENED', { ...withHash, findings: [B] });
+      const staleC = rec('2026-11-01T11:00:00.000Z', 'NOT WEAKENED', { ...scoped, invariantsHash: 'f'.repeat(64) });
+      const boundC = rec('2026-11-01T11:00:00.000Z', 'NOT WEAKENED', withHash);
+      it('a later scoped pass with a stale hash, or with no bound invariants at all, never supersedes it', () => {
+        for (const records of [[N, scopedB, staleC], [staleC, scopedB, N], [N, scopedB, boundC]]) {
+          expect(findAudit(records, { ...opts, invariantsText: records.includes(boundC) ? undefined : invariantsText })).toBe(scopedB);
+        }
+      });
+      it('a later scoped pass bound to the item invariants does supersede it', () => {
+        expect(findAudit([N, scopedB, boundC], { ...opts, invariantsText })).toBe(boundC);
+        expect(findAudit([boundC, scopedB, N], { ...opts, invariantsText })).toBe(boundC);
+      });
+      it('a later open NOT WEAKENED re-audit supersedes it', () => {
+        const reaudit = rec('2026-11-01T12:00:00.000Z', 'NOT WEAKENED');
+        expect(findAudit([N, scopedB, staleC, reaudit], { ...opts, invariantsText })).toBe(reaudit);
+      });
+      it('a stale scoped pass over an open WEAKENED plus a scoped WEAKENED blocks on both', () => {
+        const got = findAudit([rec('2026-11-01T08:00:00.000Z', 'WEAKENED', { findings: [A] }), scopedB, staleC], { ...opts, invariantsText });
+        expect(got.findings).toEqual([A, B]);
+      });
+      it('two scoped WEAKENED records plus an open one are all disclosed, oldest first', () => {
+        const B1 = rec('2026-11-01T10:10:00.000Z', 'WEAKENED', { ...withHash, findings: ['c.mjs:3 older scoped'] });
+        const openW = rec('2026-11-01T08:00:00.000Z', 'WEAKENED', { findings: [A] });
+        for (const records of [[openW, B1, scopedB], [scopedB, openW, B1]]) {
+          const got = findAudit(records, { ...opts, invariantsText });
+          expect(got.findings).toEqual([A, B, 'c.mjs:3 older scoped']);
+          expect(got.at).toBe(B1.at);
+        }
+      });
+      it('the merged blocker takes its provenance from every source', () => {
+        const PRIOR_HASH = 'd'.repeat(64);
+        const priorOpts = { ...opts, priorQuestionHashes: [{ hash: PRIOR_HASH, acceptUntil: '2026-12-01T00:00:00.000Z' }] };
+        const later = rec('2026-11-01T12:00:00.000Z', 'WEAKENED', { findings: [A], questionHash: PRIOR_HASH, fingerprint: 'e'.repeat(64) });
+        const got = findAudit([scopedB, later], priorOpts);
+        expect(got.at).toBe(later.at);
+        expect(got.questionHash).toBe(PRIOR_HASH);
+        expect(got.fingerprint).toBeUndefined();
+      });
+    });
     it.each([undefined, []])('a scoped WEAKENED with findings %j still cannot match a ruling for the open findings alone', findings => {
       const merged = findAudit([open, { ...scopedWeak, findings }], opts);
       expect(merged.verdict).toBe('WEAKENED');
