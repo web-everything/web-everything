@@ -140,6 +140,16 @@ describe('pre-existing classification', () => {
     expect(classify({ protectedPaths: ['lib/x.mjs'] })[0].blocking).toBe(true);
     expect(classify({ protectedPaths: undefined })[0].blocking).toBe(true);
   });
+  it('a removed guard in the finding symbol blocks although no head line was added', () => {
+    const hdr = 'diff --git a/lib/x.mjs b/lib/x.mjs\n--- a/lib/x.mjs\n+++ b/lib/x.mjs\n';
+    const guard = parseDiffChangedLines(`${hdr}@@ -1 +0,0 @@\n-  requireAuth();\n`, '0\t1\tlib/x.mjs\n');
+    expect(guard.complete).toBe(true);
+    expect(classify({ changedLines: guard })[0].blocking).toBe(true);
+    const baseLine = parseDiffChangedLines(`${hdr}@@ -2 +1,0 @@\n-  return unsafe();\n`, '0\t1\tlib/x.mjs\n');
+    expect(classify({ changedLines: baseLine })[0].blocking).toBe(true);
+    const otherFn = parseDiffChangedLines(`${hdr}@@ -5 +4,0 @@\n-  return old();\n`, '0\t1\tlib/x.mjs\n');
+    expect(classify({ changedLines: otherFn })[0].blocking).toBe(false);
+  });
   it('a2 flagged changed head line blocks before carding', () => {
     const cardWritten = vi.fn();
     expect(classify({ changedLines: Object.assign(new Map([['lib/x.mjs', new Set([2])]]), { complete: true }), cardWritten })[0].blocking).toBe(true);

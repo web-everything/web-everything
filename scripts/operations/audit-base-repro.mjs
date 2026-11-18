@@ -84,6 +84,13 @@ export function classifyPreExisting({ findings, answers, baseSha, headSha, readB
       const range = symbolRangeAt(source, base.line), quoteEnd = base.line + quoteLines - 1;
       if (symbol === '<top>' ? range !== null || base.line < location.line - 3 || quoteEnd > location.line + 3
         : !range || range.symbol !== symbol || base.line < range.start || quoteEnd > range.end) return block('base quote outside the finding symbol');
+      // Removed lines leave no head line: any hunk touching the finding's symbol (either side) or its base line is a change.
+      const headRange = symbolRangeAt(finding?.sourceText, location.line);
+      const [hs, he] = headRange ? [headRange.start - 1, headRange.end] : [location.line - 3, location.line + 3];
+      const [bs, be] = range ? [range.start, range.end] : [base.line - 3, quoteEnd + 3];
+      const inside = (set, lo, hi) => [...(set ?? [])].some(n => n >= lo && n <= hi);
+      if (changedLines.removed?.get(base.path)?.has(base.line) || inside(changedLines.removed?.get(base.path), bs, be)
+        || inside(changedLines.deletedAt?.get(location.file), hs, he) || inside(changed, hs, he)) return block('head or base symbol touched by the diff');
       const key = findingKey({ file: location.file, symbol, class: a.class });
       if (cardWritten(key) !== true) return block('card not written');
       return { blocking: false, preExisting: { line: text, key, base: { sha: baseSha, ...base, quote: a.quote },
@@ -95,7 +102,7 @@ export function classifyPreExisting({ findings, answers, baseSha, headSha, readB
 
 /** Parse added head ranges, including additions replacing removed lines; deletions add no head lines. */
 export function parseDiffChangedLines(diffU0Text, numstatText) {
-  const files = new Map(), seen = new Map(); let file = null, newLeft = 0, oldLeft = 0, headLine = 0, bad = false;
+  const files = new Map(), seen = new Map(); files.removed = new Map(); files.deletedAt = new Map(); let file = null, newLeft = 0, oldLeft = 0, headLine = 0, bad = false;
   const endHunk = () => { if (newLeft > 0 || oldLeft > 0) bad = true; newLeft = oldLeft = 0; };
   for (const line of String(diffU0Text).split('\n')) {
     if (oldLeft > 0 && line.startsWith('-')) { oldLeft--; continue; }
@@ -105,12 +112,15 @@ export function parseDiffChangedLines(diffU0Text, numstatText) {
       try { file = findingKey({ file: line.slice(6), class: 'B1' }).split('|')[0]; files.set(file, files.get(file) || new Set()); }
       catch { file = null; bad = true; }
     }
-    const hunk = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
+    const hunk = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
     if (hunk) {
       endHunk();
-      const del = Number(hunk[1] ?? 1), add = Number(hunk[3] ?? 1);
+      const del = Number(hunk[2] ?? 1), add = Number(hunk[4] ?? 1);
       if (!file) { bad = true; continue; }
-      headLine = Number(hunk[2]); oldLeft = del; newLeft = add;
+      headLine = Number(hunk[3]); oldLeft = del; newLeft = add;
+      const mark = (map, n) => map.set(file, (map.get(file) || new Set()).add(n));
+      for (let n = 0; n < del; n++) mark(files.removed, Number(hunk[1]) + n);
+      if (del > 0 && add === 0) mark(files.deletedAt, headLine);
       const t = seen.get(file) || [0, 0]; seen.set(file, [t[0] + add, t[1] + del]);
     }
   }
