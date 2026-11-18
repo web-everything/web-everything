@@ -211,7 +211,7 @@ describe('settings and row evidence', () => {
   it('replaces only latest merge-gate and retains other red checks', () => {
     const badTest = { ...green, conclusion: 'FAILURE' };
     const out = excuseMergeGateRows([{ ...row, id: 122 }, row, badTest], opts());
-    expect(out.rows).toEqual([{ ...row, conclusion: 'SUCCESS', mergeGateHoldExcused: { kind: 'candidacy', holds: expect.any(Array), holdIds: expect.any(Array), headSha: sha, jobId: 123 } }, badTest]);
+    expect(out.rows).toEqual([{ ...row, conclusion: 'SUCCESS', mergeGateHoldExcused: { kind: 'candidacy', holds: expect.any(Array), holdIds: expect.any(Array), headSha: sha, jobId: 123, originalConclusion: 'failure' } }, badTest]);
     expect(excuseMergeGateRows([{ ...row, status: 'completed', conclusion: 'failure' }], opts()).rows[0].conclusion).toBe('success');
   });
   it('never reads a superseded failure', () => {
@@ -455,6 +455,11 @@ describe('fresh review CI merge-gate holds', () => {
       expect(gate({ readMergeGateVerdict: () => ({ error: 'unavailable' }), readChecks: () => [annotated, { context: 'legacy', state: 'success' }] }).allowed).toBe(false);
     }
   });
+  it.each(['cancelled', 'timed_out', 'startup_failure'])('a %s merge-gate with hold evidence is not excused (needs a rerun)', conclusion => {
+    const annotated = { ...rest, conclusion, mergeGateReviewHold: { holdIds: ['review-acceptance'], headSha: sha, jobId: 123, originalConclusion: conclusion } };
+    expect(gate({ readMergeGateVerdict: () => ({ error: 'unavailable' }),
+      readChecks: () => [annotated, { context: 'legacy', state: 'success' }] }).allowed).toBe(false);
+  });
   it('does not excuse a legacy merge-gate status', () => {
     const readMergeGateVerdict = vi.fn(() => verdict());
     expect(gate({ readChecks: () => [{ context: 'merge-gate', state: 'failure' },
@@ -654,7 +659,7 @@ describe('review-hold annotation (card 273, #5157)', () => {
   it('annotates the latest failing row without making CI green', () => {
     const readVerdict = () => ({ num: 4965, head_sha: sha, ok: false, results: [{ id: 'test-gaming', status: 'hold' }] });
     const out = excuseMergeGateRows([row], opts({ readVerdict }));
-    expect(out).toEqual({ excused: false, reviewHold: true, rows: [{ ...row, mergeGateReviewHold: { holds: ['test-gaming'], holdIds: ['test-gaming'], headSha: sha, jobId: 123 } }] });
+    expect(out).toEqual({ excused: false, reviewHold: true, rows: [{ ...row, mergeGateReviewHold: { holds: ['test-gaming'], holdIds: ['test-gaming'], headSha: sha, jobId: 123, originalConclusion: 'failure' } }] });
     expect(excuseMergeGateRows([row], opts({ readVerdict, setting: 'off' }))).toEqual({ rows: [row], excused: false });
     const pr = { number: 4965, headRefOid: sha, labels: ['review:human'], statusCheckRollup: [row] };
     expect(excusePrMergeGateHolds([pr], { mergeGateSetting: 'on', readMergeGateVerdict: readVerdict })[0].statusCheckRollup).toEqual(out.rows);

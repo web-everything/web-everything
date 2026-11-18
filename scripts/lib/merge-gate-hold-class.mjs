@@ -24,6 +24,8 @@ export function boundMergeGateReviewHold(row, { headSha, labels } = {}) {
     && !labels.some(label => (typeof label === 'string' ? label : label.name) === 'ready-to-merge')
     && Number.isSafeInteger(jobId) && jobId > 0
     && [row.mergeGateHoldExcused, row.mergeGateReviewHold].some(annotation => {
+      // Only a plain failure is excusable: a cancelled/timed-out run needs a rerun, never a hold excuse.
+      if (String(annotation?.originalConclusion ?? row.conclusion).toLowerCase() !== 'failure') return false;
       if (annotation?.jobId !== jobId || typeof annotation.headSha !== 'string'
         || annotation.headSha.toLowerCase() !== headSha.toLowerCase()
         || !Array.isArray(annotation.holdIds) || !annotation.holdIds.length) return false;
@@ -230,14 +232,16 @@ export function excuseMergeGateRows(rows, { prNumber, headSha, labels, readVerdi
       const holds = verdict.results?.filter(blocking) ?? [];
       // Card 273, #5157: annotation rides on candidacyHoldIsNotCiFailure; off never annotates.
       if (holds.length && holds.every(r => r.status === 'hold' && HUMAN_REVIEW_HOLD_GATES.includes(r.id))) {
-        const replacement = { ...row, mergeGateReviewHold: { holds: holds.map(r => r.id), holdIds: holds.map(r => r.id), headSha: verdict.head_sha, jobId } };
+        const replacement = { ...row, mergeGateReviewHold: { holds: holds.map(r => r.id), holdIds: holds.map(r => r.id), headSha: verdict.head_sha, jobId,
+          originalConclusion: String(row.conclusion).toLowerCase() } };
         return { rows: rows.map(r => r === row ? replacement : r), excused: false, reviewHold: true };
       }
       return unchanged;
     }
     const replacement = { ...row, conclusion: row.conclusion === row.conclusion.toLowerCase() ? 'success' : 'SUCCESS',
       mergeGateHoldExcused: { kind: classification.kind, holds: classification.holds,
-        holdIds: classification.holds.map(r => r.id), headSha: verdict.head_sha, jobId } };
+        holdIds: classification.holds.map(r => r.id), headSha: verdict.head_sha, jobId,
+        originalConclusion: String(row.conclusion).toLowerCase() } };
     return { rows: rows.filter(r => r.name !== 'merge-gate' || r === row).map(r => r === row ? replacement : r), excused: true };
   } catch { return unchanged; }
 }
