@@ -2865,9 +2865,10 @@ export function planReconcile({
     const promotionEvidence = pr?.isDraft ? requiredCheckEvidence(pr, requiredChecks) : null;
     if (pr?.isDraft && promotionEvidence.state === 'unknown') {
       refuse('draft', { ...withPhase, ...earlyStartShadowFields(pr, requiredChecks), why: `draft checks cannot be verified: ${promotionEvidence.reasons.join(', ')} — refresh complete head-bound checks and the required roster before promotion` });
-      continue;
-    }
-    if (pr?.isDraft && (['pass', 'held'].includes(promotionEvidence.state) || mainFixPriority)) {
+      // An observed red still owes repair planning; the join guard below waits visibly
+      // for complete head-bound evidence before it can dispatch that repair.
+      if (withPhase.check !== 'red') continue;
+    } else if (pr?.isDraft && (['pass', 'held'].includes(promotionEvidence.state) || mainFixPriority)) {
       if (labelNames(pr.labels).includes('review-status:draft-withdrawn')) {
         refuse('draft', { ...withPhase, why: 'draft PR is withdrawn — explicit release is required before promotion' });
         continue;
