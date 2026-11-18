@@ -1,5 +1,5 @@
 /** Pure PR classification: report-only, no actions, no GitHub writes. */
-export const DEFAULTS = Object.freeze({ noWorkerMin: 20, staleClaimMin: 60, readyStalledMin: 90, readySettleMin: 15, humanWaitMin: 60, gateRedStalledMin: 30 });
+export const DEFAULTS = Object.freeze({ noWorkerMin: 20, staleClaimMin: 60, readyStalledMin: 90, readySettleMin: 15, humanWaitMin: 60, gateRedStalledMin: 30, stickyLabelMin: 60 });
 export const OWED_KINDS = Object.freeze(['review-changes', 'red-team-blocked', 'ci-red', 'conflicting', 'sent-back']);
 const finite = (value) => typeof value === 'number' && Number.isFinite(value);
 export const human = (labels) => labels.includes('review:human') || labels.some((l) => ['status:stood-down', 'review-status:stood-down'].includes(l));
@@ -41,6 +41,9 @@ export function classifyPr(snapshot, opts = {}) {
   if (!snapshot.inMergeQueue && owed.length && !human(labels) && !worker && old(settings.noWorkerMin)) add('no-worker', 'owed work without a live worker', minutes, { owed });
   if (!snapshot.isDraft && human(labels) && (owed.length || labels.some((l) => ['status:stood-down', 'review-status:stood-down'].includes(l))) && old(settings.humanWaitMin)) add('human-wait', 'human-owned PR waiting on the operator');
   if (!snapshot.inMergeQueue && snapshot.ciFailing && !worker && old(settings.gateRedStalledMin) && !reports.some((r) => r.rule === 'no-worker')) add('gate-red-stalled', 'required check red without a live worker');
+  if (!snapshot.isDraft && !snapshot.inMergeQueue && !human(labels) && snapshot.requiredGreen === true
+    && labels.some((label) => ['status:ci-red', 'review-status:ci-heal-stalled', 'review-status:needs-human'].includes(label))
+    && old(settings.stickyLabelMin)) add('sticky-label', 'stale ci-red/escalation label with green required checks');
   const stale = claims.find((c) => finite(c.claimedAtMs) && nowMs - c.claimedAtMs >= settings.staleClaimMin * 60000
     && ((finite(snapshot.headChangedAtMs) && snapshot.headChangedAtMs <= c.claimedAtMs)
       || (typeof snapshot.headSha === 'string' && snapshot.headSha === c.headShaAtClaim)));

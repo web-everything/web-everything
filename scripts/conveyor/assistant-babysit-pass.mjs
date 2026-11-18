@@ -69,10 +69,38 @@ function loadClaims(io, coordDir) {
 const matchesRepo = (claim, repo) => [repo, repo.split('/')[1], ...(repo === 'web-everything/web-everything' ? ['we'] : [])].includes(claim.repo);
 const cell = (value) => String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').replace(/\|/g, '\\|');
 
-export function runTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plateau/assistant'), nowMs = Date.now(),
+class GithubUnavailable extends Error {}
+const githubUnavailable = (error) => /HTTP 5\d\d|Gateway Timeout|Bad Gateway|Service Unavailable|ETIMEDOUT|ECONNRESET/i
+  .test([error.message, error.stderr, error.stdout, error.code].join(' '));
+
+export function runTick(options = {}) {
+  try { return observeTick(options); }
+  catch (error) {
+    if (!(error instanceof GithubUnavailable)) throw error;
+    const { io = fs, outDir = join(homedir(), '.plateau/assistant'), nowMs = Date.now(), backoffMs = 300000 } = options;
+    const summary = { type: 'tick-skipped', at: new Date(nowMs).toISOString(), reason: 'github-5xx', backoffMs };
+    io.appendFileSync(join(outDir, 'reports.jsonl'), `${JSON.stringify(summary)}\n`);
+    return { summary };
+  }
+}
+
+/** Process-local counters; skipped ticks never advance validTicks. */
+export function createTickRunner({ interval = 300000, ...options } = {}) {
+  let skippedTicks = 0;
+  let validTicks = 0;
+  return () => {
+    const backoffMs = Math.min(interval * 2 ** Math.min(skippedTicks, 53), 15 * 60000);
+    const result = runTick({ ...options, validTicks: validTicks + 1, backoffMs });
+    if (result.summary.type === 'tick-skipped') skippedTicks++;
+    else { skippedTicks = 0; validTicks++; }
+    return { ...result, delayMs: skippedTicks ? backoffMs : interval };
+  };
+}
+
+function observeTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plateau/assistant'), nowMs = Date.now(),
   exec = execFileSync, io = fs, env = process.env,
   coordDir = env.WE_COORDINATION_ROOT || join(homedir(), 'workspace/.operations/coordination'),
-  whyCli, maxDetail = 25, maxWhy = 6, stderr = (line) => process.stderr.write(line) } = {}) {
+  validTicks = 1, whyCli, maxDetail = 25, maxWhy = 6, stderr = (line) => process.stderr.write(line) } = {}) {
   if (!Number.isInteger(maxDetail) || maxDetail < 0) throw new Error('max-detail must be a nonnegative integer');
   if (!Number.isInteger(maxWhy) || maxWhy < 0) throw new Error('max-why must be a nonnegative integer');
   io.mkdirSync(outDir, { recursive: true });
@@ -88,6 +116,7 @@ export function runTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plat
   state.lastDetailAt ??= {};
   state.requiredChecks ??= {};
   state.whyCache ??= {};
+  state.conflictCache ??= {};
   state.actions ??= {};
   state.escalations ??= {};
   let mode;
@@ -103,7 +132,13 @@ export function runTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plat
   };
   const { claims, badClaims } = loadClaims(io, coordDir);
   const whyPath = whyCli === undefined ? findWhy(io) : whyCli;
-  const gh = (args) => exec('gh', args, { encoding: 'utf8', timeout: 60000, maxBuffer: 32 * 1024 * 1024, env: { ...env, GH_CALLER: 'wev-assistant' } });
+  const gh = (args) => {
+    try { return exec('gh', args, { encoding: 'utf8', timeout: 60000, maxBuffer: 32 * 1024 * 1024, env: { ...env, GH_CALLER: 'wev-assistant' } }); }
+    catch (error) {
+      if (githubUnavailable(error)) throw new GithubUnavailable('github-5xx');
+      throw error;
+    }
+  };
   const at = new Date(nowMs).toISOString();
   const summary = { type: 'tick', at, repos, open: 0, owing: 0, reports: 0, wouldAct: 0, escalated: 0, badClaims: badClaims.length, skipped: 0, whySkipped: 0, truncated: false, repoSummaries: [] };
   // Named local evidence problems do not depend on the PR list or detail budget.
@@ -139,13 +174,13 @@ export function runTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plat
       try {
         const value = JSON.parse(gh(['api', `repos/${repo}/branches/main/protection/required_status_checks`, '--jq', '[.contexts[], (.checks[]?.context)]']));
         if (valid(value)) names.push(...value);
-      } catch { /* Still read the additive ruleset requirements. */ }
+      } catch (error) { if (error instanceof GithubUnavailable) throw error; /* Still read the additive ruleset requirements. */ }
       try {
         const rules = JSON.parse(gh(['api', `repos/${repo}/rules/branches/main`]));
         const value = rules.filter((rule) => rule.type === 'required_status_checks')
           .flatMap((rule) => rule.parameters.required_status_checks.map((check) => check.context));
         if (valid(value)) names.push(...value);
-      } catch { /* Explicit fallback below keeps the missing evidence visible. */ }
+      } catch (error) { if (error instanceof GithubUnavailable) throw error; /* Explicit fallback below keeps the missing evidence visible. */ }
       // Version 2 caches the union; older classic-only caches must be refreshed.
       required = state.requiredChecks[repo] = { version: 2, at: nowMs, names: names.length ? [...new Set(names)] : null };
     }
@@ -162,16 +197,21 @@ export function runTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plat
         || !/^[a-f0-9]+$/i.test(pr.headRefOid ?? '')) throw new Error('Incomplete PR evidence');
       const labels = pr.labels.map((label) => typeof label === 'string' ? label : label.name);
       if (labels.some((label) => typeof label !== 'string')) throw new Error('Incomplete label evidence');
-      const failedChecks = pr.statusCheckRollup.filter((check) => requiredNames === null || requiredNames.has(check.name ?? check.context)).filter((check) => ['FAILURE', 'TIMED_OUT', 'CANCELLED', 'ERROR', 'STARTUP_FAILURE'].includes(String(check.conclusion || check.state).toUpperCase()))
+      const requiredRollup = pr.statusCheckRollup.filter((check) => requiredNames === null || requiredNames.has(check.name ?? check.context));
+      const requiredGreen = requiredNames !== null && requiredRollup.length > 0
+        && [...requiredNames].every((name) => requiredRollup.some((check) => (check.name ?? check.context) === name))
+        && requiredRollup.every((check) => (!check.status || check.status === 'COMPLETED')
+          && ['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(String(check.conclusion || check.state).toUpperCase()));
+      const failedChecks = requiredRollup.filter((check) => ['FAILURE', 'TIMED_OUT', 'CANCELLED', 'ERROR', 'STARTUP_FAILURE'].includes(String(check.conclusion || check.state).toUpperCase()))
         .map((check) => ({ name: check.name ?? check.context, conclusion: String(check.conclusion || check.state).toUpperCase(),
           runId: /\/actions\/runs\/(\d+)(?:[/?#]|$)/.exec(check.detailsUrl ?? '')?.[1] ?? null }));
       const snapshot = { repo, number: pr.number, inMergeQueue: queueFallback ? pr.mergeStateStatus === 'QUEUED' && (pr.autoMergeRequest != null || labels.includes('status:ready-to-merge')) : pr.isInMergeQueue, labels, isDraft: pr.isDraft, mergeable: pr.mergeable, mergeStateStatus: pr.mergeStateStatus, failedChecks,
-        headSha: pr.headRefOid, nowMs, ciFailing: failedChecks.length > 0,
+        headSha: pr.headRefOid, nowMs, requiredGreen, ciFailing: failedChecks.length > 0,
         claims: claims.filter((claim) => claim.pr === pr.number && matchesRepo(claim, repo)) };
       const { owed } = classifyPr(snapshot);
       if (owed.length) summary.owing++;
       const needsDetail = owed.length || snapshot.ciFailing || labels.some((l) => ['status:stood-down', 'review-status:stood-down'].includes(l)) || snapshot.mergeStateStatus === 'BEHIND' || labels.includes('ready-to-merge') || snapshot.claims.length
-        || labels.some((label) => ['status:fixing', 'review-status:fixing'].includes(label));
+        || labels.some((label) => ['status:fixing', 'review-status:fixing', 'status:ci-red', 'review-status:ci-heal-stalled', 'review-status:needs-human'].includes(label));
       if (needsDetail) {
         const detailKey = JSON.stringify([repo, pr.number]);
         const lastDetailAt = Number.isFinite(state.lastDetailAt[detailKey]) ? state.lastDetailAt[detailKey] : -Infinity;
@@ -201,6 +241,35 @@ export function runTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plat
     snapshot.headChangedAtMs = state.heads[snapshot.headSha];
     observed.push({ snapshot, current: classifyPr(snapshot).reports });
     state.lastDetailAt[detailKey] = nowMs;
+  }
+  // Finish all GitHub reads before appending any decisions or reports.
+  let conflictReads = 0;
+  for (const { snapshot } of observed) {
+    if (snapshot.isDraft || human(snapshot.labels) || snapshot.mergeable !== 'CONFLICTING') continue;
+    const key = `${snapshot.repo}#${snapshot.number}@${snapshot.headSha}`;
+    let cached = state.conflictCache[key];
+    if (!cached) {
+      cached = { files: [], note: 'conflict detail cap reached; operator inspection required' };
+      if (conflictReads < 5) {
+        conflictReads++;
+        try {
+          const comparison = JSON.parse(gh(['api', `repos/${snapshot.repo}/compare/main...${snapshot.headSha}`, '--jq', '{base:.merge_base_commit.sha,files:[.files[].filename]}']));
+          if (!/^[a-f0-9]+$/i.test(comparison.base ?? '') || !Array.isArray(comparison.files)
+            || !comparison.files.every((file) => typeof file === 'string')) throw new Error('Incomplete conflict comparison');
+          const mainFiles = JSON.parse(gh(['api', `repos/${snapshot.repo}/compare/${comparison.base}...main`, '--jq', '[.files[].filename]']));
+          if (!Array.isArray(mainFiles) || !mainFiles.every((file) => typeof file === 'string')) throw new Error('Incomplete conflict comparison');
+          const changed = new Set(mainFiles);
+          const files = [...new Set(comparison.files)].filter((file) => changed.has(file));
+          cached = { files: files.slice(0, 20), ...(files.length > 20 ? { note: 'conflict files limited to 20; operator inspection required' } : {}) };
+          state.conflictCache[key] = cached;
+        } catch (error) {
+          if (error instanceof GithubUnavailable) throw error;
+          cached = { files: [], note: `conflict files unavailable; operator inspection required: ${cell(error.message)}` };
+        }
+      }
+    }
+    snapshot.conflictFiles = cached.files;
+    snapshot.conflictNote = cached.note;
   }
   const whyKey = (snapshot) => `${snapshot.repo}#${snapshot.number}@${snapshot.headSha}`;
   const cacheAt = (snapshot) => Number.isFinite(state.whyCache[whyKey(snapshot)]?.at) ? state.whyCache[whyKey(snapshot)].at : -Infinity;
@@ -248,9 +317,9 @@ export function runTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plat
           }
         }
         for (const escalation of result.escalations) {
-          const key = JSON.stringify([repo, snapshot.number, snapshot.headSha, report.rule]);
+          const key = JSON.stringify([repo, snapshot.number, snapshot.headSha, report?.rule ?? 'conflict']);
           if (Number.isFinite(state.escalations[key]) && nowMs - state.escalations[key] < 60 * 60000) continue;
-          const decision = { ...escalation, at, rule: report.rule };
+          const decision = { ...escalation, at, rule: report?.rule ?? 'conflict' };
           if (append('actions.jsonl', decision)) {
             state.escalations[key] = nowMs;
             decisions.push(decision);
@@ -271,7 +340,7 @@ export function runTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plat
   const rows = reports.slice(0, 50).map((r) => `| ${[`${r.repo}#${r.pr}`, r.rule, r.minutes === null ? '' : Math.floor(r.minutes), r.owner, r.reason, r.fixLogLine].map(cell).join(' | ')} |`);
   const truncation = summary.truncated ? ' — TRUNCATED: some open PRs not seen' : '';
   const problems = badClaims.length ? `\n\nMalformed claims (up to 10 shown; inspect claim files):\n${badClaims.slice(0, 10).map((claim) => `- ${cell(claim.path)}: ${cell(claim.problem)}`).join('\n')}` : '';
-  io.writeFileSync(join(outDir, 'digest.md'), `# Assistant digest — ${at}${truncation}\n\nOpen: ${summary.open}; owing: ${summary.owing}; reports: ${summary.reports}; badClaims: ${summary.badClaims}; skipped: ${summary.skipped}; whySkipped: ${summary.whySkipped}.${problems}\n${warnings.map(cell).join('\n')}\n\nPRs without why detail need operator inspection or a higher --max-why. Skipped PRs need operator inspection or a higher --max-detail; table limited to 50 current reports.${summary.truncated ? '\n\nTruncated repositories need operator inspection of the full open PR list: ' + summary.repoSummaries.filter((r) => r.truncated).map((r) => cell(r.repo)).join(', ') + '.' : ''}\n\n| PR | rule | min | owner | reason | fix-log |\n| --- | --- | --- | --- | --- | --- |\n${rows.join('\n')}\n\n## Would act (shadow)\n\nUp to 30 new decisions; inspect actions.jsonl for the full log.\n${decisions.slice(0, 30).map((d) => `- ${cell(d.repo)}#${d.pr}: ${cell(d.action ?? d.type)} — ${cell(d.reason)}`).join('\n')}\n`);
+  io.writeFileSync(join(outDir, 'digest.md'), `# Assistant digest — ${at}${truncation}\n\nvalidTicks: ${validTicks}; Open: ${summary.open}; owing: ${summary.owing}; reports: ${summary.reports}; badClaims: ${summary.badClaims}; skipped: ${summary.skipped}; whySkipped: ${summary.whySkipped}.${problems}\n${warnings.map(cell).join('\n')}\n\nPRs without why detail need operator inspection or a higher --max-why. Skipped PRs need operator inspection or a higher --max-detail; table limited to 50 current reports.${summary.truncated ? '\n\nTruncated repositories need operator inspection of the full open PR list: ' + summary.repoSummaries.filter((r) => r.truncated).map((r) => cell(r.repo)).join(', ') + '.' : ''}\n\n| PR | rule | min | owner | reason | fix-log |\n| --- | --- | --- | --- | --- | --- |\n${rows.join('\n')}\n\n## Would act (shadow)\n\nUp to 30 new decisions; inspect actions.jsonl for the full log.\n${decisions.slice(0, 30).map((d) => `- ${cell(d.repo)}#${d.pr}: ${cell(d.action ?? d.type)} — ${cell(d.reason)}${d.files?.length ? ' — files: ' + d.files.map(cell).join(', ') : ''}${d.note ? ' — ' + cell(d.note) : ''}`).join('\n')}\n`);
   io.writeFileSync(join(outDir, 'state.json'), JSON.stringify(state, null, 2));
   return { summary, reports, badClaims };
 }
@@ -293,13 +362,15 @@ async function main(argv) {
   }
   if (!Number.isFinite(interval) || interval <= 0 || interval > 2147483647) throw new Error('Invalid interval-ms');
   if (options.repos?.some((repo) => !/^[\w.-]+\/[\w.-]+$/.test(repo))) throw new Error('Invalid repo slug');
+  const run = createTickRunner({ ...options, interval });
   const tick = () => {
-    try { runTick(options); }
+    let delay = interval;
+    try { delay = run().delayMs; }
     catch (error) {
       process.stderr.write(`assistant tick failed: ${cell(error.message)}\n`);
       if (!loop) process.exitCode = 1;
     }
-    if (loop) setTimeout(tick, interval);
+    if (loop) setTimeout(tick, delay);
   };
   tick();
 }

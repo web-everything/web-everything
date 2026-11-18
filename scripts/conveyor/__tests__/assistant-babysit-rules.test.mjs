@@ -22,7 +22,7 @@ describe('owed kinds', () => {
 
   it('exports stable kinds and thresholds', () => {
     expect(OWED_KINDS).toEqual(['review-changes', 'red-team-blocked', 'ci-red', 'conflicting', 'sent-back']);
-    expect(DEFAULTS).toEqual({ noWorkerMin: 20, staleClaimMin: 60, readyStalledMin: 90, readySettleMin: 15, humanWaitMin: 60, gateRedStalledMin: 30 });
+    expect(DEFAULTS).toEqual({ noWorkerMin: 20, staleClaimMin: 60, readyStalledMin: 90, readySettleMin: 15, humanWaitMin: 60, gateRedStalledMin: 30, stickyLabelMin: 60 });
   });
   it('accumulates kinds and drafts owe nothing', () => {
     const patch = { labels: ['review:changes', 'red-team:blocked', 'status:ci-red', 'status:sent-back-review'], ciFailing: true, mergeable: 'CONFLICTING' };
@@ -158,4 +158,27 @@ describe('next actor', () => {
     [{}, 'operator'],
   ])('derives %j => %s', (patch, owner) => expect(nextActor({ ...base, ...patch })).toBe(owner));
   it('prefers supplied why owner', () => expect(nextActor(base, { owner: 'queue operator', waitingFor: 'capacity' })).toBe('queue operator'));
+});
+
+
+describe('sticky labels', () => {
+  it.each([
+    ['ci red', { labels: ['status:ci-red'] }, true],
+    ['heal stalled', { labels: ['review-status:ci-heal-stalled'] }, true],
+    ['needs human', { labels: ['review-status:needs-human'] }, true],
+    ['draft', { isDraft: true }, false],
+    ['queue', { inMergeQueue: true }, false],
+    ['human owned', { labels: ['status:ci-red', 'review:human'] }, false],
+    ['closed ownership', { labels: ['status:ci-red', 'status:stood-down'] }, false],
+    ['missing green evidence', { requiredGreen: undefined }, false],
+    ['red or pending', { requiredGreen: false }, false],
+    ['no label', { labels: [] }, false],
+    ['before threshold', { headChangedAtMs: nowMs - 60 * 60000 + 1 }, false],
+    ['at threshold', { headChangedAtMs: nowMs - 60 * 60000 }, true],
+    ['unknown age', { headChangedAtMs: undefined, labelChangedAtMs: undefined }, false],
+  ])('%s => sticky %s', (_, patch, present) => {
+    const reports = classify({ labels: ['status:ci-red'], requiredGreen: true, ...patch }).reports;
+    expect(reports.some((r) => r.rule === 'sticky-label')).toBe(present);
+    if (present) expect(reports.find((r) => r.rule === 'sticky-label').reason).toBe('stale ci-red/escalation label with green required checks');
+  });
 });

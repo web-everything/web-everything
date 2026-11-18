@@ -5,7 +5,7 @@ import { decideActions, actionKey } from '../assistant-babysit-actions.mjs';
 const snapshot = { repo: 'org/repo', number: 2, headSha: 'abc', nowMs: 120 * 60000,
   isDraft: false, labels: ['review:changes'], mergeable: 'MERGEABLE', claims: [] };
 const report = { rule: 'no-worker', reason: 'owed work without a live worker' };
-const ctx = { minutes: 20, why: { fixLogLine: 'fix: skipped at cap' } };
+const ctx = { minutes: 20, why: { owner: 'fix daemon', fixLogLine: 'fix: skipped at cap' } };
 const decide = (patch = {}, context = ctx, r = report) => decideActions({ ...snapshot, ...patch }, r, context);
 
 describe('shadow action decisions', () => {
@@ -14,19 +14,16 @@ describe('shadow action decisions', () => {
       argv: ['node', 'scripts/operations/run.mjs', 'rearm', '--pr=2', '--repo=org/repo'], reason: 'fix work refused or skipped' }]);
     expect(decide().escalations).toEqual([]);
   });
-  it.each(['review:changes', 'red-team:blocked', 'status:sent-back-review', 'status:sent-back-red-team'])('rearms owed %s from suggestedOp', (label) => {
-    expect(decide({ labels: [label] }, { minutes: 20, why: { suggestedOp: 'run rearm' } }).actions[0].type).toBe('rearm');
+  it.each(['review:changes', 'red-team:blocked', 'status:sent-back-review', 'status:sent-back-red-team'])('rearms owed %s from waitingFor', (label) => {
+    expect(decide({ labels: [label] }, { minutes: 20, why: { owner: 'fix daemon', waitingFor: 'refused at cap' } }).actions[0].type).toBe('rearm');
   });
   it.each([
     [{}, { ...ctx, minutes: 19.99 }], [{}, { ...ctx, minutes: null }], [{}, { minutes: 20, why: {} }],
     [{ labels: ['status:ci-red'], ciFailing: true }, ctx],
     [{ claims: [{ kind: 'fixing', claimedAtMs: 0, heartbeatAtMs: snapshot.nowMs, ttlMinutes: 10 }] }, ctx],
   ])('does not rearm without qualifying evidence %j', (patch, context) => expect(decide(patch, context).actions).toEqual([]));
-  it('expired fixer and live ci-heal do not count as a live fixer', () => {
-    for (const claim of [{ kind: 'fix', claimedAtMs: 0, heartbeatAtMs: 0, ttlMinutes: 10 },
-      { kind: 'ci-heal', claimedAtMs: 0, heartbeatAtMs: snapshot.nowMs, ttlMinutes: 10 }]) {
-      expect(decide({ claims: [claim] }).actions[0].type).toBe('rearm');
-    }
+  it.each([['expired fixer', 'fix', 0, true], ['live ci-heal', 'ci-heal', snapshot.nowMs, false]])('%s rearm => %s', (_, kind, heartbeatAtMs, allowed) => {
+    expect(decide({ claims: [{ kind, claimedAtMs: 0, heartbeatAtMs, ttlMinutes: 10 }] }).actions.some((a) => a.type === 'rearm')).toBe(allowed);
   });
   it.each(['main is red', 'failing on main', 'behind main'])('updates a branch for %s', (fixLogLine) => {
     const result = decide({ ciFailing: true }, { why: { fixLogLine } });
@@ -72,5 +69,34 @@ describe('shadow action decisions', () => {
     expect(context).toEqual(before);
     expect(source).toEqual(snapshot);
     expect(decide({ headSha: 'def' }, context).actions).toHaveLength(1);
+  });
+});
+
+
+describe('live owner and sticky decisions', () => {
+  it.each([
+    ['plain refusal', 'fix daemon', 'fix: refused at cap', '', true],
+    ['serializing refusal', 'fix daemon', 'fix: refused, serializing work', '', false],
+    ['session owner', 'fix daemon (session)', 'fix: refused', '', false],
+    ['operator', 'operator', 'fix: refused', '', false],
+    ['missing owner', undefined, 'fix: refused', '', false],
+    ['suggested op only', 'fix daemon', 'fix: idle', '', false],
+    ['waiting refusal', 'fix daemon', 'fix: idle', 'skipped at cap', true],
+    ...['scope-overlap', 'priority-shadow', 'waiting 2', 'retrying next pass', 'in progress', 'queued', 'take-over', 'takeover']
+      .map((text) => [text, 'fix daemon', 'fix: refused at cap', text, false]),
+  ])('%s rearm => %s with exact escalation evidence', (_, owner, fixLogLine, waitingFor, allowed) => {
+    const result = decide({}, { minutes: 20, why: { owner, fixLogLine, waitingFor, suggestedOp: 'rearm' } });
+    expect(result.actions.some((a) => a.type === 'rearm')).toBe(allowed);
+    if (!allowed) expect(result.escalations[0].logLine).toBe(fixLogLine);
+  });
+  it.each(['MERGEABLE', 'CONFLICTING'])('sticky %s updates or escalates conflict', (mergeable) => {
+    const result = decide({ mergeable, labels: ['status:ci-red'], conflictFiles: ['shared.mjs'] }, {}, { rule: 'sticky-label' });
+    if (mergeable === 'CONFLICTING') {
+      expect(result.actions).toEqual([]);
+      expect(result.escalations).toEqual([expect.objectContaining({ type: 'escalate', reason: 'conflict: branch cannot be updated automatically', files: ['shared.mjs'], logLine: '' })]);
+    } else {
+      expect(result.actions).toEqual([expect.objectContaining({ type: 'update-branch', argv: ['gh', 'api', '-X', 'PUT', 'repos/org/repo/pulls/2/update-branch'], reason: 'a new head clears per-head escalations' })]);
+      expect(actionKey(result.actions[0])).toBe('org/repo#2@abc:update-branch');
+    }
   });
 });

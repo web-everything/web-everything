@@ -1,7 +1,7 @@
 /** Hermetic IO fixtures: report-only, no actions, no GitHub writes. */
 import { describe, it, expect } from 'vitest';
 import { join } from 'node:path';
-import { runTick, DEFAULT_CLAIM_TTL_MIN } from '../assistant-babysit-pass.mjs';
+import { runTick, createTickRunner, DEFAULT_CLAIM_TTL_MIN } from '../assistant-babysit-pass.mjs';
 
 const nowMs = Date.parse('2026-01-01T12:00:00Z');
 const old = '2026-01-01T10:00:00Z';
@@ -51,6 +51,14 @@ function fixture() {
       expect(args).toContain('--paginate');
       expect(args).toContain('--slurp');
       return JSON.stringify(world.eventPages ?? [world.events]);
+    }
+    if (args[1].includes('/compare/main...')) {
+      if (world.compareError) throw world.compareError;
+      return JSON.stringify(world.comparison ?? { base: 'def', files: ['shared.mjs', 'branch.mjs'] });
+    }
+    if (args[1].includes('/compare/def...main')) {
+      if (world.mainError) throw world.mainError;
+      return JSON.stringify(world.mainFiles ?? ['shared.mjs', 'main.mjs']);
     }
     if (args[1].includes('/commits/')) return world.commitDate;
     throw new Error('Unexpected command');
@@ -538,11 +546,11 @@ describe('report-only tick', () => {
     w.prs[0].statusCheckRollup = [{ context: 'checks', state }];
     expect(w.tick({ whyCli: null }).reports[0].owner).toBe('ci-heal');
   });
-  it('does not request details or why for nonowing, nonready PRs', () => {
+  it('reads sticky label age even without required green evidence', () => {
     const w = fixture();
     w.prs[0].labels = [{ name: 'status:ci-red' }];
     expect(w.tick().reports).toEqual([]);
-    expect(w.calls).toHaveLength(3);
+    expect(w.calls).toHaveLength(5);
   });
 
   it.each([
@@ -576,14 +584,15 @@ describe('shadow action log', () => {
     expect(w.tick().reports).toEqual([]);
     expect(w.calls.some((c) => c.command === 'node')).toBe(true);
   });
-  it('uses why suggestedOp for rearm without a matching log line', () => {
+  it('escalates why suggestedOp without bare owner and refusal evidence', () => {
     const w = fixture();
     w.why.verdict.suggestedOp = 'rearm';
-    expect(w.tick().summary.wouldAct).toBe(1);
+    expect(w.tick().summary).toMatchObject({ wouldAct: 0, escalated: 1 });
   });
   const actionLog = (w) => (w.files.get(join('output', 'actions.jsonl')) ?? '').trim().split('\n').filter(Boolean).map(JSON.parse);
   const rearming = () => {
     const w = fixture();
+    w.why.verdict.owner = 'fix daemon';
     w.why.verdict.sections[0].lines = ['fix: refused at cap'];
     return w;
   };
@@ -695,5 +704,136 @@ describe('shadow action log', () => {
     expect(section.split('\n').filter((line) => line.startsWith('- '))).toHaveLength(30);
     expect(section).toContain('inspect actions.jsonl for the full log');
     expect(actionLog(w)).toHaveLength(31);
+  });
+});
+
+
+const decisions = (w) => (w.files.get(join('output', 'actions.jsonl')) ?? '').trim().split('\n').filter(Boolean).map(JSON.parse);
+describe('required green sticky labels', () => {
+  it.each([
+    ['green required only', [{ name: 'checks', conclusion: 'SUCCESS' }], ['checks'], true],
+    ['optional red ignored', [{ name: 'checks', conclusion: 'SUCCESS' }, { name: 'optional', conclusion: 'FAILURE' }], ['checks'], true],
+    ['status context', [{ context: 'checks', state: 'SUCCESS' }], ['checks'], true],
+    ['pending required', [{ name: 'checks', status: 'IN_PROGRESS', conclusion: '' }], ['checks'], false],
+    ['red required', [{ name: 'checks', conclusion: 'FAILURE' }], ['checks'], false],
+    ['missing required result', [{ name: 'checks', conclusion: 'SUCCESS' }], ['checks', 'infra'], false],
+    ['no required result', [], ['checks'], false],
+    ['unknown check', [{ name: 'checks', conclusion: 'UNKNOWN' }], ['checks'], false],
+    ['unknown requirements', [{ name: 'checks', conclusion: 'SUCCESS' }], [], false],
+  ])('%s sticky => %s', (_, rollup, required, sticky) => {
+    const w = fixture();
+    w.required = required;
+    w.prs[0].labels = [{ name: 'review-status:ci-heal-stalled' }];
+    w.prs[0].statusCheckRollup = rollup;
+    expect(w.tick().reports.some((r) => r.rule === 'sticky-label')).toBe(sticky);
+    expect(decisions(w).some((d) => d.action === 'update-branch')).toBe(sticky);
+  });
+});
+
+describe('conflict file evidence', () => {
+  it.each([
+    ['intersection', {}, ['shared.mjs'], undefined],
+    ['first compare failure', { compareError: new Error('denied') }, [], 'unavailable'],
+    ['second compare failure', { mainError: new Error('denied') }, [], 'unavailable'],
+    ['incomplete compare', { comparison: { files: [] } }, [], 'unavailable'],
+    ['oversized intersection', { comparison: { base: 'def', files: Array.from({ length: 23 }, (_, i) => `file-${i}`) }, mainFiles: Array.from({ length: 23 }, (_, i) => `file-${i}`) }, Array.from({ length: 20 }, (_, i) => `file-${i}`), 'limited to 20'],
+  ])('%s escalates with bounded names and visible fallback', (_, patch, files, note) => {
+    const w = fixture();
+    Object.assign(w, patch);
+    w.prs[0].mergeable = 'CONFLICTING';
+    w.prs[0].mergeStateStatus = 'BEHIND';
+    w.tick();
+    const escalation = decisions(w)[0];
+    expect(escalation).toMatchObject({ type: 'escalate', reason: 'conflict: branch cannot be updated automatically', files });
+    expect(decisions(w).some((d) => d.action === 'update-branch')).toBe(false);
+    const digest = w.files.get(join('output', 'digest.md'));
+    for (const file of files) expect(digest).toContain(file);
+    if (note) { expect(escalation.note).toContain(note); expect(digest).toContain(note); }
+    const reads = w.calls.filter((c) => c.args[1]?.includes('/compare/'));
+    expect(reads[0].args).toEqual(['api', 'repos/web-everything/web-everything/compare/main...abc', '--jq', '{base:.merge_base_commit.sha,files:[.files[].filename]}']);
+    if (reads[1]) expect(reads[1].args).toEqual(['api', 'repos/web-everything/web-everything/compare/def...main', '--jq', '[.files[].filename]']);
+  });
+  it('caps conflicts at five per tick and caches per repo, PR and head with operator fallback', () => {
+    const w = fixture();
+    w.prs = Array.from({ length: 6 }, (_, i) => ({ ...w.prs[0], number: i + 1, mergeable: 'CONFLICTING' }));
+    w.tick();
+    expect(w.calls.filter((c) => c.args[1]?.includes('/compare/'))).toHaveLength(10);
+    expect(decisions(w).find((d) => d.pr === 6).note).toContain('cap reached; operator inspection required');
+    w.calls.length = 0;
+    w.tick();
+    expect(w.calls.filter((c) => c.args[1]?.includes('/compare/'))).toHaveLength(2);
+    w.prs[0].headRefOid = 'fed';
+    w.calls.length = 0;
+    w.tick();
+    expect(w.calls.filter((c) => c.args[1]?.includes('/compare/'))).toHaveLength(2);
+  });
+  it.each(['review:human', 'status:stood-down'])('does not compare human-owned %s', (label) => {
+    const w = fixture();
+    w.prs[0].mergeable = 'CONFLICTING';
+    w.prs[0].labels.push({ name: label });
+    w.tick();
+    expect(w.calls.some((c) => c.args[1]?.includes('/compare/'))).toBe(false);
+  });
+  it('escalates fresh conflicts without an aged report', () => {
+    const w = fixture();
+    w.prs[0].mergeable = 'CONFLICTING';
+    w.commitDate = new Date(nowMs).toISOString();
+    expect(w.tick().summary).toMatchObject({ reports: 0, escalated: 1 });
+    expect(decisions(w)[0].rule).toBe('conflict');
+  });
+});
+
+describe('GitHub backoff', () => {
+  it.each(['HTTP 504', 'HTTP 500', 'Gateway Timeout', 'Bad Gateway', 'Service Unavailable', 'ETIMEDOUT', 'ECONNRESET'])('skips %s without changing digest or state', (text) => {
+    const w = fixture();
+    w.files.set(join('output', 'digest.md'), 'previous digest');
+    w.files.set(join('output', 'state.json'), '{}');
+    const result = w.tick({ exec: () => { throw Object.assign(new Error('gh failed'), { stderr: text }); } });
+    expect(result.summary).toEqual({ type: 'tick-skipped', at: new Date(nowMs).toISOString(), reason: 'github-5xx', backoffMs: 300000 });
+    expect(w.log()).toEqual([result.summary]);
+    expect(w.files.get(join('output', 'digest.md'))).toBe('previous digest');
+    expect(w.files.get(join('output', 'state.json'))).toBe('{}');
+    expect(decisions(w)).toEqual([]);
+  });
+  it.each(['protection', 'ruleset', 'events', 'head', 'compare', 'main compare'])('aborts %s failure including optional reads before any output', (stage) => {
+    const w = fixture();
+    w.prs[0].mergeable = 'CONFLICTING';
+    const paths = { protection: '/protection/', ruleset: '/rules/', events: '/events?', head: '/commits/', compare: '/compare/main...', 'main compare': '/compare/def...' };
+    const exec = (command, args, options) => {
+      if (command === 'gh' && args[1]?.includes(paths[stage])) throw new Error('HTTP 504');
+      return w.exec(command, args, options);
+    };
+    expect(w.tick({ exec }).summary.type).toBe('tick-skipped');
+    expect(w.log().map((line) => line.type)).toEqual(['tick-skipped']);
+    expect(w.files.has(join('output', 'state.json'))).toBe(false);
+    expect(w.files.has(join('output', 'digest.md'))).toBe(false);
+    expect(decisions(w)).toEqual([]);
+  });
+  it('discards an earlier PR decision when a later conflict read fails', () => {
+    const w = fixture();
+    w.prs[0].mergeStateStatus = 'BEHIND';
+    w.prs.push({ ...w.prs[0], number: 2, mergeable: 'CONFLICTING' });
+    w.compareError = new Error('HTTP 504');
+    expect(w.tick().summary.type).toBe('tick-skipped');
+    expect(w.log().map((line) => line.type)).toEqual(['tick-skipped']);
+    expect(decisions(w)).toEqual([]);
+    expect(w.files.has(join('output', 'state.json'))).toBe(false);
+    expect(w.files.has(join('output', 'digest.md'))).toBe(false);
+  });
+  it.each([150000, 300000])('backs off with interval %i, caps at fifteen minutes and resets on success', (interval) => {
+    const w = fixture();
+    let fail = true;
+    const run = createTickRunner({ interval, repos: ['org/repo'], outDir: 'output', nowMs, io: w.io, whyCli: null,
+      exec: (...args) => { if (fail) throw new Error('HTTP 504'); return w.exec(...args); } });
+    const expected = [0, 1, 2, 3].map((k) => Math.min(interval * 2 ** k, 900000));
+    expect([run().delayMs, run().delayMs, run().delayMs, run().delayMs]).toEqual(expected);
+    fail = false;
+    expect(run().delayMs).toBe(interval);
+    expect(w.files.get(join('output', 'digest.md'))).toContain('validTicks: 1');
+    expect(run().delayMs).toBe(interval);
+    expect(w.files.get(join('output', 'digest.md'))).toContain('validTicks: 2');
+    fail = true;
+    expect(run().delayMs).toBe(expected[0]);
+    expect(w.log().filter((l) => l.type === 'tick')).toHaveLength(2);
   });
 });
