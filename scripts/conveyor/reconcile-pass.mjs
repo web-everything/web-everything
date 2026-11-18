@@ -1612,7 +1612,8 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch })
     const known = runs.length && ['red', 'pending'].includes(reduceCheckState(runs, requiredChecks).state) ? runs : null;
     // A refused or never-started read leaves a rollup that may miss a live run (past the page limit, or unread):
     // flag it so a mechanical re-run, which GitHub rejects against a live run, holds instead of guessing.
-    ready.push({ ...pr, statusCheckRollup: (refused || neverStarted) && known ? known : result.error ? [] : result.rows,
+    // The rows are no longer the GraphQL rollup the evidence describes, so it must not read as complete.
+    ready.push({ ...pr, rowsComplete: false, rowsHead: null, statusCheckRollup: (refused || neverStarted) && known ? known : result.error ? [] : result.rows,
       ...((refused || neverStarted) ? { rollupIncomplete: true } : {}) });
   }
   return { prs: ready, refusals, notes, owedTriggers };

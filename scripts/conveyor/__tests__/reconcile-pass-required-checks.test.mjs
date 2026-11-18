@@ -93,3 +93,17 @@ it.each(['live', 'cache', 'unavailable'])('attaches rosterSource %s after hydrat
     ]);
   } finally { log.mockRestore(); }
 });
+
+it('hydration that replaces the rollup rows clears the evidence completeness claim', async () => {
+  const { runReconcilePass } = await import('../reconcile-pass.mjs');
+  const stale = { ...xxPr(), statusCheckRollup: [], rowsHead: XX_HEAD, rowsComplete: true };
+  let observed;
+  const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    runReconcilePass({ ...xxOptions(), readPrs: () => [stale], readRequiredChecks: () => ({ checks: ['test'], source: 'live' }),
+      readChecks: () => [{ id: 1, name: 'test', status: 'completed', conclusion: 'success' }],
+      enrichMainRed: rows => { observed = rows; return { prs: rows, mainRedWindows: [] }; } });
+    expect(observed[0]).toMatchObject({ rowsComplete: false, rowsHead: null });
+    expect(log.mock.calls.map(([l]) => l)).toContain('check-evidence-coverage: 0/1 PRs rowsComplete===true && rowsHead===headRefOid');
+  } finally { log.mockRestore(); }
+});
