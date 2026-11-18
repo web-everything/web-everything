@@ -174,7 +174,7 @@ describe('R593 bundle ingest on the runner', () => {
     expect(staged).toMatch(/^100644 [0-9a-f]+ 0\talias\/new\.md$/m);
     expect(staged).not.toMatch(/^120000 [0-9a-f]+ 0\talias$/m);
   });
-  it.each([['transitive', true], ['missing-nested-alias', false]])('compares projections of nested HEAD links in the reverse alias check (%s)', async (_name, complete) => {
+  it.each([['transitive', true, false], ['missing-nested-alias', false, false], ['executable-bit-mismatch', true, true]])('compares projections of nested HEAD links and modes in the alias checks (%s)', async (_name, complete, modeDiffers) => {
     // HEAD: `alias -> src`, `src/nested -> ../inner`, tracked src/keep.md, inner/extra.md.
     // The client retargeted `alias` (to new-src, same keep.md bytes) without committing.
     // Its manifest then lacks `alias/nested/extra.md`, so alias is unproven; a client
@@ -190,7 +190,8 @@ describe('R593 bundle ingest on the runner', () => {
     for (const [path, content, tracked] of files) {
       await fs.mkdir(join(work, path, '..'), { recursive: true });
       await fs.writeFile(join(work, path), content);
-      entries.push({ path: Buffer.from(path), sha256: hash(content), executable: false, tracked });
+      // Same bytes, but the projected alias claims the executable bit its source lacks.
+      entries.push({ path: Buffer.from(path), sha256: hash(content), executable: modeDiffers && path === 'alias/keep.md', tracked });
       if (tracked) { await fs.mkdir(join(lane, path, '..'), { recursive: true }); await fs.writeFile(join(lane, path), content); git(lane, 'add', '--', path); }
     }
     git(lane, ...ident, 'commit', '-qm', 'HEAD nested links');
@@ -204,7 +205,7 @@ describe('R593 bundle ingest on the runner', () => {
       bundle: { mode: 'none', maxMainAgeMs: 600000 } });
     const staged = git(work, 'ls-files', '--stage');
     expect(staged).toMatch(new RegExp(`^120000 ${nestedOid} 0\\tsrc/nested$`, 'm'));
-    if (complete) expect(staged).toMatch(new RegExp(`^120000 ${aliasOid} 0\\talias$`, 'm'));
+    if (complete && !modeDiffers) expect(staged).toMatch(new RegExp(`^120000 ${aliasOid} 0\\talias$`, 'm'));
     else expect(staged).not.toMatch(/^120000 [0-9a-f]+ 0\talias$/m);
   });
   it('fetches a verified incremental bundle into a per-run clone and checks out the exact tip', async () => {

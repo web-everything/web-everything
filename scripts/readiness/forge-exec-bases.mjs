@@ -207,7 +207,7 @@ export async function materializeWorktree({work,root,baseSha,head,manifest,manif
       // The manifest has no link OID: prove the HEAD target still matches the
       // client's projection in both directions before restoring its index blob.
       if(entries.some(entry=>!entry.tracked&&entry.path.subarray(0,prefix.length).equals(prefix)
-        &&byPath.get(targetPrefix+entry.path.toString('latin1').slice(aliasPrefix.length))?.sha256!==entry.sha256))continue;
+        &&!sameProjection(byPath.get(targetPrefix+entry.path.toString('latin1').slice(aliasPrefix.length)),entry)))continue;
       // Every target entry counts, including projections of nested HEAD links:
       // the client projects links transitively, so a missing nested alias means the
       // client's link no longer reaches this content. Unproven stays unrestored.
@@ -215,7 +215,7 @@ export async function materializeWorktree({work,root,baseSha,head,manifest,manif
         const path=entry.path.toString('latin1');
         if(!path.startsWith(targetPrefix))return false;
         const alias=byPath.get(aliasPrefix+path.slice(targetPrefix.length));
-        return !alias||alias.tracked||alias.sha256!==entry.sha256;
+        return !alias||alias.tracked||!sameProjection(entry,alias);
       }))continue;
       index.push(Buffer.from(`120000 ${match[1]}\t`),linkPath,Buffer.from([0]));
     }
@@ -228,6 +228,10 @@ export async function materializeWorktree({work,root,baseSha,head,manifest,manif
     if(error.code==='diff-coverage-base-unavailable')throw error;
     throw Object.assign(new Error('Git HEAD unavailable; use local fallback: '+error.message,{cause:error}),{code:'git-head-unavailable'});
   } finally {await fs.rm(pending,{recursive:true,force:true});}
+}
+// A projected alias copies bytes and mode from its source; equal bytes alone are not a match.
+function sameProjection(source,alias) {
+  return source!==undefined&&source.sha256===alias.sha256&&source.executable===alias.executable;
 }
 function validReady(ready,sha) {
   return ready && ready.sha===sha
