@@ -803,7 +803,7 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
       'rejects a fake CLI that prints a valid verdict then exits by %s', async (termination) => {
         const stdout = JSON.stringify(ANSWER);
         const script = `process.stdout.write(${JSON.stringify(stdout)}, () => {
-          ${termination === 'timeout' ? 'setInterval(() => {}, 1000);' : "process.kill(process.pid, 'SIGTERM');"}
+          ${termination === 'timeout' ? 'setInterval(() => {}, 1000);' : "process.kill(process.pid, 'SIGTERM');"} // keepalive-helper-ok: fixture hangs until the timeout under test kills it
         });`;
         let child;
         const err = await judgeSpawn({
