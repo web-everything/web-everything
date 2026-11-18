@@ -3,6 +3,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import * as nodeFs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -30,7 +31,24 @@ function harness({ owners, self = HOST_A }) {
   const children = [];
   const procSignals = new EventEmitter();
   let i = 0;
+  const files = new Map();
+  const directories = new Set();
+  const missing = () => Object.assign(new Error('missing'), { code: 'ENOENT' });
   const deps = {
+    markerPath: 'state/daemon-cleanup.json',
+    markerFs: {
+      mkdirSync(path, options) {
+        if (!options?.recursive && directories.has(path)) throw Object.assign(new Error('exists'), { code: 'EEXIST' });
+        directories.add(path);
+      },
+      rmdirSync(path) { if (!directories.delete(path)) throw missing(); },
+      readFileSync(path) { if (!files.has(path)) throw missing(); return files.get(path); },
+      writeFileSync(path, value, options) {
+        if (options?.flag === 'wx' && files.has(path)) throw Object.assign(new Error('exists'), { code: 'EEXIST' });
+        files.set(path, value);
+      },
+      unlinkSync(path) { if (!files.delete(path)) throw missing(); },
+    },
     thisHost: self,
     log: (line) => logs.push(line),
     sleep: async (ms) => { sleeps.push(ms); },
@@ -55,7 +73,7 @@ function harness({ owners, self = HOST_A }) {
     watchSleep: () => new Promise(() => {}),
     maxPolls: 50,
   };
-  return { deps, logs, sleeps, spawns, children, procSignals, polls: () => i };
+  return { deps, logs, sleeps, spawns, children, procSignals, files, polls: () => i };
 }
 
 describe('parseGateArgs', () => {
@@ -339,6 +357,142 @@ describe('wrapper shutdown', () => {
   });
 });
 
+describe('persistent cleanup marker', () => {
+  it('permits exactly one spawn when wrappers overlap between stale-group probe and marker unlink', async () => {
+    const owners = [{ host: HOST_A, version: 'file' }];
+    const first = harness({ owners });
+    const second = harness({ owners });
+    second.deps.markerFs = first.deps.markerFs;
+    first.files.set(first.deps.markerPath, '{"pgid":999,"time":1}');
+    const parsed = { cmd: 'd', args: [] };
+    let competing;
+    const killGroup = first.deps.killGroup;
+    first.deps.killGroup = (pid, signal) => {
+      if (pid === 999 && signal === 0) {
+        // Both wrappers would consume the same stale evidence without the lock.
+        competing = runGate(parsed, second.deps);
+        throw Object.assign(new Error('gone'), { code: 'ESRCH' });
+      }
+      return killGroup(pid, signal);
+    };
+    const run = runGate(parsed, first.deps);
+    await new Promise(setImmediate);
+    expect(await competing).toBe(1);
+    expect(second.logs[0]).toContain('cleanup lock');
+    expect(second.logs[0]).toContain('refusing to spawn, operator cleanup required');
+    expect(first.spawns.length + second.spawns.length).toBe(1);
+    expect(JSON.parse(first.files.get(first.deps.markerPath)).pgid).toBe(first.children[0].pid);
+    first.children[0].emit('exit', 0, null);
+    expect(await run).toBe(0);
+    // Normal completion releases the lock for a subsequent wrapper.
+    const next = runGate(parsed, second.deps);
+    await new Promise(setImmediate);
+    expect(second.spawns).toHaveLength(1);
+    second.children[0].emit('exit', 0, null);
+    expect(await next).toBe(0);
+  });
+
+  it.each(['EEXIST', 'EACCES'])('refuses spawning and preserves evidence when cleanup lock acquisition fails with %s', async (code) => {
+    const h = harness({ owners: [{ host: HOST_A, version: 'file' }] });
+    const saved = '{"pgid":999,"time":1}';
+    h.files.set(h.deps.markerPath, saved);
+    const mkdir = h.deps.markerFs.mkdirSync;
+    h.deps.markerFs.mkdirSync = (path, options) => {
+      if (!options?.recursive) throw Object.assign(new Error('lock unavailable'), { code });
+      mkdir(path, options);
+    };
+    const unlink = vi.spyOn(h.deps.markerFs, 'unlinkSync');
+    const unlock = vi.spyOn(h.deps.markerFs, 'rmdirSync');
+    expect(await runGate({ cmd: 'd', args: [] }, h.deps)).toBe(1);
+    expect(h.spawns).toHaveLength(0);
+    expect(h.files.get(h.deps.markerPath)).toBe(saved);
+    expect(unlink).not.toHaveBeenCalled();
+    expect(unlock).not.toHaveBeenCalled();
+    expect(h.logs[0]).toContain(`cleanup lock ${h.deps.markerPath}.lock`);
+    expect(h.logs[0]).toContain('refusing to spawn, operator cleanup required');
+  });
+
+  it.each(['alive', 'EPERM'])('blocks a fresh wrapper after unconfirmed %s death, then clears only on ESRCH', async (state) => {
+    const dir = mkdtempSync(join(tmpdir(), 'host-gate-marker-'));
+    const markerPath = join(dir, 'cleanup.json');
+    const parsed = { cmd: 'd', args: [] };
+    const fresh = () => {
+      const h = harness({ owners: [{ host: HOST_A, version: 'file' }] });
+      Object.assign(h.deps, { markerPath, markerFs: nodeFs });
+      return h;
+    };
+    const probe = (pid, signal) => {
+      expect(pid).toBe(1000);
+      expect(signal).toBe(0);
+      if (state === 'EPERM') throw Object.assign(new Error('denied'), { code: 'EPERM' });
+      return true;
+    };
+    try {
+      const first = fresh();
+      const killGroup = first.deps.killGroup;
+      first.deps.killGroup = (pid, signal) => signal === 0 ? probe(pid, signal) : killGroup(pid, signal);
+      const run = runGate(parsed, first.deps);
+      await new Promise(setImmediate);
+      first.children[0].emit('exit', 0, null);
+      expect(await run).toBe(1);
+      const saved = readFileSync(markerPath, 'utf8');
+      expect(JSON.parse(saved)).toEqual({ pgid: 1000, time: expect.any(Number) });
+
+      const second = fresh();
+      second.deps.killGroup = vi.fn(probe);
+      expect(await runGate(parsed, second.deps)).toBe(1);
+      expect(second.deps.killGroup).toHaveBeenCalledTimes(1);
+      expect(second.deps.killGroup).toHaveBeenCalledWith(1000, 0);
+      expect(second.spawns).toHaveLength(0);
+      expect(second.polls()).toBe(0);
+      expect(second.logs[0]).toContain('refusing to spawn, operator cleanup required');
+      expect(readFileSync(markerPath, 'utf8')).toBe(saved);
+
+      const third = fresh(); // Default harness probe reports ESRCH.
+      const recovered = runGate(parsed, third.deps);
+      await new Promise(setImmediate);
+      expect(third.spawns).toHaveLength(1);
+      third.children[0].emit('exit', 0, null);
+      expect(await recovered).toBe(0);
+      expect(existsSync(markerPath)).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each(['{', '{}', '{"pgid":null,"time":1}', '{"pgid":-1,"time":1}', '{"pgid":1000}', '{"pgid":1000,"time":"yesterday"}'])(
+    'refuses malformed or incomplete persisted evidence: %s', async (raw) => {
+      const h = harness({ owners: [{ host: HOST_A, version: 'file' }] });
+      h.files.set(h.deps.markerPath, raw);
+      expect(await runGate({ cmd: 'd', args: [] }, h.deps)).toBe(1);
+      expect(h.spawns).toHaveLength(0);
+      expect(h.files.get(h.deps.markerPath)).toBe(raw);
+      expect(h.logs[0]).toContain('operator cleanup required');
+    },
+  );
+
+  it.each(['readFileSync', 'writeFileSync', 'unlinkSync'])('refuses spawning when marker %s fails', async (operation) => {
+    const h = harness({ owners: [{ host: HOST_A, version: 'file' }] });
+    if (operation === 'unlinkSync') h.files.set(h.deps.markerPath, '{"pgid":1000,"time":1}');
+    h.deps.markerFs[operation] = () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); };
+    expect(await runGate({ cmd: 'd', args: [] }, h.deps)).toBe(1);
+    expect(h.spawns).toHaveLength(0);
+    expect(h.logs.at(-1)).toContain('refusing to spawn, operator cleanup required');
+  });
+
+  it('retains blocking incomplete evidence if recording the spawned pgid fails and death is unconfirmed', async () => {
+    const h = harness({ owners: [{ host: HOST_A, version: 'file' }] });
+    const write = h.deps.markerFs.writeFileSync;
+    h.deps.markerFs.writeFileSync = (path, value, options) => {
+      if (!options) throw new Error('write failed');
+      write(path, value, options);
+    };
+    h.deps.killGroup = () => true;
+    expect(await runGate({ cmd: 'd', args: [] }, h.deps)).toBe(1);
+    expect(JSON.parse(h.files.get(h.deps.markerPath)).pgid).toBeNull();
+    expect(await runGate({ cmd: 'd', args: [] }, h.deps)).toBe(1);
+    expect(h.spawns).toHaveLength(1);
+  });
+});
+
 describe('runGate while the daemon runs', () => {
   const tick = () => new Promise((r) => setTimeout(r, 5));
   function watched(owners) {
@@ -614,9 +768,12 @@ describe('A3 ownership is read remotely on every poll; no cache is trusted or wr
     expect(rig.h.spawns).toHaveLength(0); // the raw cache entry is not a valid owner result either
   });
 
-  it('A3 the gate module has no cache or file-write path of its own', () => {
+  it('A3 the ownership poll has no cache or file IO; persistent state is only for cleanup', () => {
     const cli = readFileSync(fileURLToPath(new URL('../daemon-host-gate.mjs', import.meta.url)), 'utf8');
-    expect(cli).not.toMatch(/cache|writeFile|appendFile|createWriteStream|renameSync|mkdirSync|readFileSync|openSync|copyFile/i);
+    expect(cli).not.toMatch(/cache/i);
+    const poll = cli.slice(cli.indexOf('async function pollRole'), cli.indexOf('/** Watch a running child'));
+    expect(poll).not.toMatch(/writeFile|appendFile|createWriteStream|renameSync|mkdirSync|readFileSync|openSync|copyFile/i);
+    expect(poll).toContain('await resolveHostRole({ thisHost, source })');
   });
 });
 
@@ -635,7 +792,7 @@ describe('production CLI boundary', () => {
   it('always uses the default ownership source and contains no local owner bypass', () => {
     const cli = readFileSync(script, 'utf8');
     expect(cli).toContain('process.exit(await runGate(parsed));');
-    expect(cli).not.toMatch(/WE_DAEMON_HOST_(?:OWNER_FILE|GATE_TEST_ONLY)|makeFileOwnerReader|readFileSync/);
+    expect(cli).not.toMatch(/WE_DAEMON_HOST_(?:OWNER_FILE|GATE_TEST_ONLY)|makeFileOwnerReader/);
   });
 
   it('exits 2 with usage when the command is missing', () => {
@@ -692,6 +849,7 @@ describe('real daemon process group', () => {
           ? { cmd: '/bin/sh', args: ['-c', '"$1" -e "$2" "$3" & wait', 'host-gate-test', process.execPath, worker, ready] }
           : { cmd: process.execPath, args: ['-e', leader, worker, ready] };
         run = runGate(parsed, {
+          markerPath: join(dir, 'cleanup.json'),
           thisHost: HOST_A, source: { readOwner: async () => ({ host: owner, version: 'file' }) },
           processSignals: procSignals, log: (line) => logs.push(line), maxPolls: 1, killGraceMs: 30,
           // Exercise the full probe budget without a 30-second fixture wait.

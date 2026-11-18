@@ -13,7 +13,11 @@
  * Any non-active poll also revokes a running daemon immediately.
  */
 import { spawn as nodeSpawn } from 'node:child_process';
+import * as nodeFs from 'node:fs';
 import { realpathSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { homedir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as timerSleep } from 'node:timers/promises';
 import { getThisHost, resolveHostRole } from '../lib/daemon-host-guard.mjs';
@@ -37,7 +41,51 @@ const describeOwner = (reason) => {
   return 'unreadable';
 };
 
-function startChild({ cmd, args }, { spawn, killGroup, processSignals, sleep, killGraceMs, log }) {
+// Stable across wrapper restarts and checkouts, separate for each daemon command.
+function defaultMarkerPath(parsed) {
+  const key = createHash('sha256').update(JSON.stringify([parsed.cmd, parsed.args])).digest('hex');
+  return join(homedir(), '.web-everything', 'daemon-host-gate', `${key}.json`);
+}
+
+function cleanupMarker(markerPath, fs, killGroup) {
+  return {
+    lock() {
+      fs.mkdirSync(dirname(markerPath), { recursive: true });
+      // Hold through reservation, spawning and cleanup. Never reclaim a lock
+      // automatically: a crashed holder needs operator inspection, not a race.
+      fs.mkdirSync(`${markerPath}.lock`, { mode: 0o700 });
+    },
+    unlock() { fs.rmdirSync(`${markerPath}.lock`); },
+    check() {
+      let raw;
+      try { raw = fs.readFileSync(markerPath, 'utf8'); }
+      catch (error) { if (error?.code === 'ENOENT') return; throw error; }
+      const marker = JSON.parse(raw);
+      if (!Number.isSafeInteger(marker?.pgid) || marker.pgid <= 0
+          || !Number.isSafeInteger(marker.time) || marker.time < 0) {
+        throw new Error('invalid or incomplete cleanup marker');
+      }
+      try { killGroup(marker.pgid, 0); }
+      catch (error) {
+        if (error?.code !== 'ESRCH') throw error;
+        fs.unlinkSync(markerPath);
+        return;
+      }
+      throw new Error(`process group ${marker.pgid} from ${marker.time} is not confirmed dead`);
+    },
+    claim() {
+      fs.mkdirSync(dirname(markerPath), { recursive: true });
+      // Reserve before spawning: failed writes/crashes must leave blocking evidence.
+      fs.writeFileSync(markerPath, JSON.stringify({ pgid: null, time: Date.now() }), { flag: 'wx', mode: 0o600 });
+    },
+    track(pgid) {
+      fs.writeFileSync(markerPath, JSON.stringify({ pgid, time: Date.now() }));
+    },
+    clear() { fs.unlinkSync(markerPath); },
+  };
+}
+
+function startChild({ cmd, args }, { spawn, killGroup, processSignals, sleep, killGraceMs, log, marker }) {
   let child;
   let finish;
   let ended = false;
@@ -93,9 +141,10 @@ function startChild({ cmd, args }, { spawn, killGroup, processSignals, sleep, ki
     for (const [sig, fn] of handlers) processSignals.removeListener(sig, fn);
     processSignals.removeListener('exit', onExit);
     void confirmGroupDeath().then((dead) => {
+      if (dead) marker.clear();
       cleanupFailed = !dead;
       finish(dead ? code : 1);
-    }, () => {
+    }).catch(() => {
       cleanupFailed = true;
       log(`host-gate: process group death confirmation failed; exiting 1, operator cleanup required`);
       finish(1);
@@ -106,6 +155,7 @@ function startChild({ cmd, args }, { spawn, killGroup, processSignals, sleep, ki
     // A failed spawn has no exit event; errors on a live child must not release it.
     child.on('error', () => { if (!child.pid) end(127); });
     child.on('exit', (code, signal) => end(signal ? 128 + (SIGNUM[signal] ?? 15) : (code ?? 1)));
+    if (child.pid) marker.track(child.pid);
   } catch { end(127); }
   return { done, stop, get cleanupFailed() { return cleanupFailed; } };
 }
@@ -145,6 +195,10 @@ async function watchChild(child, ctx) {
  * (SIGTERM, then SIGKILL after killGraceMs) and returns the gate to standby.
  * A leader exit also kills any remaining group members before releasing the gate.
  * Release requires ESRCH from a group probe; unconfirmed death exits 1 after 30 s.
+ * The persistent marker blocks restarts until ESRCH; invalid/unreadable state
+ * requires operator inspection of the marker and process group before removal.
+ * A sibling .lock directory serializes wrappers for their entire lifetime;
+ * an abandoned lock also requires operator inspection before removal.
  */
 export async function runGate(parsed, deps = {}) {
   const {
@@ -158,7 +212,15 @@ export async function runGate(parsed, deps = {}) {
     processSignals = process,
     maxPolls = Infinity,
     killGraceMs = 30_000,
+    markerPath = defaultMarkerPath(parsed),
+    markerFs = nodeFs,
   } = deps;
+  const marker = cleanupMarker(markerPath, markerFs, killGroup);
+  try { marker.lock(); }
+  catch (error) {
+    log(`host-gate: cleanup lock ${markerPath}.lock: ${error.message}; refusing to spawn, operator cleanup required`);
+    return 1;
+  }
   let shutdownCode = null;
   const shutdown = new AbortController();
   const handlers = SIGNALS.map((sig) => {
@@ -170,6 +232,11 @@ export async function runGate(parsed, deps = {}) {
     return [sig, fn];
   });
   try {
+    try { marker.check(); }
+    catch (error) {
+      log(`host-gate: cleanup marker ${markerPath}: ${error.message}; refusing to spawn, operator cleanup required`);
+      return 1;
+    }
     for (let poll = 0; poll < maxPolls; poll += 1) {
       if (shutdownCode !== null) return shutdownCode;
       const { active, owner } = await pollRole(thisHost, source);
@@ -183,7 +250,12 @@ export async function runGate(parsed, deps = {}) {
       }
       log(`host-gate: active owner=${owner} self=${thisHost}`);
       if (shutdownCode !== null) return shutdownCode;
-      const child = startChild(parsed, { spawn, killGroup, processSignals, sleep, killGraceMs, log });
+      try { marker.claim(); }
+      catch (error) {
+        log(`host-gate: cannot reserve cleanup marker ${markerPath}: ${error.message}; refusing to spawn, operator cleanup required`);
+        return 1;
+      }
+      const child = startChild(parsed, { spawn, killGroup, processSignals, sleep, killGraceMs, log, marker });
       const code = await watchChild(child, { thisHost, source, watchSleep, sleep, killGraceMs, log });
       // Revocation discards the exit code, but must not discard wrapper shutdown.
       if (shutdownCode !== null) return await child.done;
@@ -192,6 +264,11 @@ export async function runGate(parsed, deps = {}) {
     return shutdownCode ?? 75;
   } finally {
     for (const [sig, fn] of handlers) processSignals.removeListener(sig, fn);
+    try { marker.unlock(); }
+    catch (error) {
+      log(`host-gate: cannot release cleanup lock ${markerPath}.lock: ${error.message}; exiting 1, operator cleanup required`);
+      return 1;
+    }
   }
 }
 
