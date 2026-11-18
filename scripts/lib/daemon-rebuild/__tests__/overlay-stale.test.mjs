@@ -271,6 +271,16 @@ describe('finalize during an unsettled drop', () => {
     expect(result).toMatchObject({ moved: false, reason: 'drop-pending-unsettled' });
     expect(calls.some(a => a[0] === 'reset')).toBe(false);
   });
+  it('onAdopted (which can drop registrations) is skipped while a drop is pending', async () => {
+    const applied = [{ ref, sha: tip }], onAdopted = vi.fn();
+    stubPrepare(); writePending('pending');
+    const { writeRebuildState } = await import('../state.mjs');
+    writeRebuildState(root, { adopted: { head: headSha, inputsKey: 'k0', applied } }, env);
+    const run = args => ({ status: 0, stdout: args[0] === 'rev-parse' ? newSha : '' });
+    const result = await finalizeRebuild({ root, env, run, now: () => 0, plan: { ok: true, finalSha: newSha, mainSha, inputsKey: 'k', applied }, prevHead: headSha, lease: { token: 'l' }, onAdopted });
+    expect(result.reason).toBe('already-adopted');
+    expect(onAdopted).not.toHaveBeenCalled();
+  });
   it('a recovery build that keeps the applied set unchanged still finalizes', async () => {
     const applied = [{ ref, sha: tip }];
     const { result, calls } = await fin({ applied }, { head: headSha, inputsKey: 'k0', applied });

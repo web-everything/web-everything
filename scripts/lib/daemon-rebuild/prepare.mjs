@@ -506,7 +506,9 @@ export async function prepareRebuild({
     if (d.pr != null && (d.action === 'apply' || d.action === 'remove') && !d.pinned) clearOverlayConflictWake(env, d.pr);
     if (d.action === 'remove') {
       const proof = d.reason === 'pr-merged' ? prMergedDropEvidence({ git, ref: d.ref, mainSha: plan.mainSha }) : {};
-      removeOverlay(root, d.ref, { env, why: d.reason });
+      // Bind the removal to the registration the plan judged: a re-registration after planning is not removed.
+      try { removeOverlay(root, d.ref, { env, why: d.reason, expectedOverlay: overlaysBefore.find((o) => o.ref === d.ref) }); }
+      catch (error) { alert('overlay-removal-refused', { ref: d.ref, error: String(error.message) }); continue; }
       appendOverlayEvent(root, { kind: 'auto-dropped', ref: d.ref, pr: d.pr, reason: d.reason, ...proof }, { env });
       alert('overlay-auto-dropped', { ref: d.ref, reason: d.reason });
     } else if (d.action === 'drop') {

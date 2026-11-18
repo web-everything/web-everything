@@ -387,7 +387,11 @@ export async function finalizeRebuild({
     // fix-rebuild-finalize — an adopted build leaves nothing passed-but-unadopted behind.
     if (result.adopted) clearReadyCandidate(root, stEnv);
     // x5wbsbc — runs INSIDE this write-lock hold, only on an adoption (e.g. drop the overlay a fallback proved bad).
-    if (result.adopted && typeof onAdopted === 'function') {
+    // onAdopted can drop registrations (e.g. a fallback's bad overlay): never while a drop intent is unsettled.
+    let pendingDrops = false;
+    try { pendingDrops = readPendingDrops(root, env).length > 0; } catch { pendingDrops = true; }
+    if (result.adopted && typeof onAdopted === 'function' && pendingDrops) alert('on-adopted-skipped-drop-pending', {});
+    if (result.adopted && typeof onAdopted === 'function' && !pendingDrops) {
       try { onAdopted({ alert }); } catch (e) { alert('on-adopted-failed', { error: String(e?.message || e) }); }
     }
     return { ...result, alerts: alertsList };
