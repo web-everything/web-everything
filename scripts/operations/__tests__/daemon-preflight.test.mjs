@@ -277,6 +277,51 @@ describe('preflight CLI IO hooks', () => {
     }).trim());
   });
 
+  it('readHead ignores inherited repo-redirecting GIT_* variables and answers for the given directory', () => {
+    const root = mkdtempSync(join(tmpdir(), 'preflight-gitenv-'));
+    try {
+      const repo = join(root, 'R');
+      mkdirSync(join(repo, 'scripts'), { recursive: true });
+      const git = (...args) => execFileSync('git', ['-C', repo, ...args], {
+        encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024,
+        env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' },
+      }).trim();
+      git('init', '-q');
+      git('commit', '-q', '--allow-empty', '-m', 'init');
+      const head = git('rev-parse', 'HEAD');
+      // Each redirecting variable alone must not make a plain subdirectory pass as a checkout root.
+      for (const [key, value] of [['GIT_DIR', join(repo, '.git')], ['GIT_WORK_TREE', repo], ['GIT_COMMON_DIR', join(repo, '.git')],
+        ['GIT_INDEX_FILE', join(repo, '.git', 'index')], ['GIT_OBJECT_DIRECTORY', join(repo, '.git', 'objects')],
+        ['GIT_ALTERNATE_OBJECT_DIRECTORIES', join(repo, '.git', 'objects')], ['GIT_NAMESPACE', 'x'], ['GIT_PREFIX', 'scripts/']]) {
+        const io = cliIO({ ...process.env, [key]: value });
+        expect(() => io.readHead(join(repo, 'scripts')), key).toThrow('not a git checkout root');
+        expect(io.readHead(repo), key).toBe(head);
+      }
+      const io = cliIO({ ...process.env, GIT_DIR: join(repo, '.git'), GIT_WORK_TREE: repo });
+      expect(() => io.readHead(join(repo, 'scripts'))).toThrow('not a git checkout root');
+      expect(io.readHead(repo)).toBe(head);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('readHead hands git an env without repo-redirecting variables but keeps PATH and HOME', () => {
+    const root = mkdtempSync(join(tmpdir(), 'preflight-gitenv-fake-'));
+    try {
+      const envs = [];
+      const redirecting = { GIT_DIR: 'a', GIT_WORK_TREE: 'b', GIT_COMMON_DIR: 'c', GIT_INDEX_FILE: 'd', GIT_OBJECT_DIRECTORY: 'e',
+        GIT_ALTERNATE_OBJECT_DIRECTORIES: 'f', GIT_NAMESPACE: 'g', GIT_PREFIX: 'h', GIT_CEILING_DIRECTORIES: 'i' };
+      const io = cliIO({ ...ENV, PATH: '/bin', HOME: '/home/x', ...redirecting }, { execFileSync: (...args) => {
+        envs.push(args[2].env);
+        return args[1].at(-1) === '--show-toplevel' ? root : SHA;
+      } });
+      expect(io.readHead(root)).toBe(SHA);
+      expect(envs).toHaveLength(2);
+      for (const env of envs) {
+        for (const key of Object.keys(redirecting)) expect(env, key).not.toHaveProperty(key);
+        expect(env).toMatchObject({ PATH: '/bin', HOME: '/home/x' });
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('cliIO rejects unknown option keys instead of silently ignoring spies', () => {
     for (const key of ['readCache', 'writeCache', 'invalidateCache', 'execFileSyncc']) {
       expect(() => cliIO({}, { [key]: () => {} })).toThrow(`unknown cliIO option: ${key}`);

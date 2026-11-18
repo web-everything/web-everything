@@ -130,8 +130,11 @@ export function cliIO(env = process.env, options = {}) {
     statFile: (path) => statSync(path).isFile(),
     cloneDirs: () => cloneRoots(env.WE_WORKSPACE_ROOT || dirname(checkout), { env }),
     readHead: (dir) => {
+      // Inherited GIT_* (GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR, GIT_INDEX_FILE, GIT_CONFIG_*, ...) can redirect
+      // discovery so `-C dir` answers for another repo; strip them all for git only (HOME, PATH etc. are kept).
+      const gitEnv = Object.fromEntries(Object.entries(env).filter(([key]) => !/^GIT_/i.test(key)));
       const git = (...args) => exec('git', ['-C', dir, ...args], {
-        env, encoding: 'utf8', timeout: 15_000, maxBuffer: MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'],
+        env: gitEnv, encoding: 'utf8', timeout: 15_000, maxBuffer: MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'],
       }).trim();
       // A plain directory inside another checkout must not pass via the parent repo's HEAD.
       if (realpathSync(git('rev-parse', '--show-toplevel')) !== realpathSync(dir)) throw new Error('not a git checkout root');
