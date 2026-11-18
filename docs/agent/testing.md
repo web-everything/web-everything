@@ -4672,7 +4672,10 @@ require operator repair or manual unloading. Settlement identity includes the lo
 starts fresh. Check failures are handled before required-job/workflow parsing; unreadable green evidence
 stays tracked. Green loads are checked every pass while their clone/ref remains in the shared overlay
 store, including historical time-complete receipts. Only confirmed absence ends monitoring; corrupt
-overlay state escalates and stays tracked. Keep these paths in `urgent-sweep.test.mjs`.
+overlay state escalates and stays tracked. A failed registration command can leave a persisted overlay:
+the loader writes a registration-failed note only after the shared overlay reader proves clone/ref
+absence, and the sweep honors that note only after confirming absence again. Present or unreadable
+registrations retain monitoring. Keep these paths in `prototype-load.test.mjs` and `urgent-sweep.test.mjs`.
 
 The CI mirror also pins each run step's directory, environment, shell, condition and error policy,
 and refuses job run defaults, environments and containers. A context change requires updating the

@@ -338,10 +338,35 @@ describe('urgent CI sweep', () => {
     const f = fixture([check('test', 'failure')]);
     f.loads[0] = { ...load, trackingId: 'failed-attempt' };
     f.loads.push({ ...f.loads[0], type: 'prototype-load.urgent-registration-failed', status: 'registration-failed' });
+    f.d.overlayState.mockReturnValueOnce({ corrupt: false, overlays: [] });
     expect(await f.run()).toMatchObject({ results: [] });
     expect(f.d.checks).not.toHaveBeenCalled();
-    f.loads.push({ ...load, trackingId: 'retry' });
+    const retry = { ...load, trackingId: 'retry', registration: { ...load.registration, ref: 'lane/retry' } };
+    f.loads.push(retry);
+    f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [{ ref: retry.registration.ref }] });
     expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+    expect(f.d.remove).toHaveBeenCalledWith(retry);
+  });
+  it('keeps monitoring a registration-failed intent when its overlay is present and unloads on CI failure', async () => {
+    const f = fixture();
+    f.loads.push({ ...load, type: 'prototype-load.urgent-registration-failed', status: 'registration-failed' });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'monitoring-green' }] });
+    f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('test', 'failure')] });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledWith(load);
+  });
+  it.each(['corrupt', 'throws'])('keeps a registration-failed intent tracked when the overlay read %s', async kind => {
+    const f = fixture([check('test', 'failure')]);
+    f.loads.push({ ...load, type: 'prototype-load.urgent-registration-failed', status: 'registration-failed' });
+    if (kind === 'throws') f.d.overlayState.mockImplementationOnce(() => { throw new Error('store unreadable'); });
+    else f.d.overlayState.mockReturnValueOnce({ corrupt: true, overlays: [] });
+    expect(await f.run()).toMatchObject({ ok: false, results: [{ status: 'needs-you' }], fallback: expect.stringContaining('manually') });
+    expect(f.settlements()).toEqual([]);
+    expect(f.d.checks).not.toHaveBeenCalled();
+    expect(f.d.escalate).toHaveBeenCalled();
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledWith(load);
   });
   it.each(['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'])('unloads and raises NEEDS-YOU for completed smoke %s from any app', async conclusion => {
     for (const appId of [15368, 1]) {

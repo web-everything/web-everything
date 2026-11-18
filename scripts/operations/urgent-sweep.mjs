@@ -134,8 +134,7 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
     const records = deps.loads();
     const failed = new Set(records.filter(r => r.type === 'prototype-load.urgent-registration-failed'
       && typeof r.trackingId === 'string').map(r => r.trackingId));
-    const loads = new Map(records.filter(r => r.type === 'prototype-load.urgent'
-      && !failed.has(r.trackingId)).map(r => [identity(r), r]));
+    const loads = new Map(records.filter(r => r.type === 'prototype-load.urgent').map(r => [identity(r), r]));
     const entries = [...loads], cursor = settlements.filter(r => r.status === 'sweep-cursor').at(-1)?.id;
     // Use the complete load order so even a cursor load settled last pass remains an anchor.
     // Older ledgers (or an archived cursor load) start at the beginning.
@@ -165,6 +164,8 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           || overlay.overlays.some(e => !safeRegistrationRef(e?.ref)))
           throw new Error('unreadable overlay state; repair store or inspect registration manually');
         const registered = overlay.overlays.some(e => e.ref === r.registration.ref);
+        // A failed command may have persisted its overlay before failing to append its event.
+        if (failed.has(r.trackingId) && !registered && !pending) continue;
         if (pending) {
           const removedAt = pending.removedAt ?? pending.at, now = Date.parse(deps.now());
           if (!Number.isFinite(Date.parse(removedAt)) || !Number.isFinite(now) || now < Date.parse(removedAt))

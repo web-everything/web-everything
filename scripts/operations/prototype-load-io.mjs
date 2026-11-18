@@ -235,6 +235,7 @@ export function loadRuledWeakened({ platform, tool, fs, env, warn = console.warn
   return merged;
 }
 export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, combinedTest, cloneKey: keyForClone = cloneKey,
+  readState = readOverlayState,
   retirePlanner = defaultRetirePlanner, fingerprint = null, testCheck = null, readUrgentKey = () => fs.readFileSync(urgentKeyPath(env.HOME)), dispatchSmoke = null, realDispatchSmoke = runRealDispatchSmoke, removeRegistration = null,
   resolveOperatorIdentity: operatorIdentity = resolveOperatorIdentity }) {
   const expand = (p) => p.startsWith('~/') ? join(env.HOME, p.slice(2)) : p;
@@ -843,9 +844,18 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           }
         }
       } finally {
-        // Partial replacement/admission remains tracked whenever an overlay was registered.
-        if (urgentIntent && !out.registered) appendUrgent({ ...urgentIntent,
-          type: 'prototype-load.urgent-registration-failed', status: 'registration-failed', at: new Date(now()).toISOString() });
+        // The command can fail after persisting the registration (for example, on event append).
+        // Cancel tracking only with readable evidence that this clone/ref is absent.
+        if (urgentIntent && !out.registered) {
+          let absent = false;
+          try {
+            const state = await readState(out.clone, { env: childEnv });
+            absent = state?.corrupt === false && Array.isArray(state.overlays)
+              && state.overlays.every(e => safeRegistrationRef(e?.ref) && e.ref !== out.effectiveRef);
+          } catch { /* Unknown state keeps the persisted urgent intent monitored. */ }
+          if (absent) appendUrgent({ ...urgentIntent,
+            type: 'prototype-load.urgent-registration-failed', status: 'registration-failed', at: new Date(now()).toISOString() });
+        }
       }
       const readyPath = expand(config.readyRecordPath);
       fs.mkdirSync(dirname(readyPath), { recursive: true });

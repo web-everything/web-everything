@@ -136,7 +136,10 @@ function fixture(options = {}) {
         }
         return clean ? data : fail(3, data);
       }
-      if (action === 'add' && options.addFails) return fail(1);
+      if (action === 'add' && options.addFails) {
+        if (options.persistBeforeAddFailure) admitted.push({ ref });
+        return fail(1);
+      }
       if (action === 'add') {
         if (options.advanceDuringAdd) remoteTip = TREE;
         const expected = args.find((a) => a.startsWith('--expected-sha='))?.slice(15);
@@ -263,6 +266,7 @@ function fixture(options = {}) {
   // Retirement has its own real-git suite (prototype-retire.test.mjs); here it is injected like combinedTest.
   const retirePlanner = vi.fn((input) => options.retirePlan ? options.retirePlan(input) : []);
   const load = createPrototypeLoader({ exec, fs, env, retirePlanner, readUrgentKey: () => { if (options.missingUrgentKey) throw new Error('missing'); return urgentKey; },
+    readState: options.readState ?? (() => ({ corrupt: false, overlays: [...registrations.values(), ...admitted] })),
     // defaultTestCheck leaves the seam unset so the production check-run reader (gh api + workflow binding) runs.
     testCheck: options.defaultTestCheck ? undefined : options.testCheck ?? (async ({ sha }) => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: 15368 })),
     dispatchSmoke: options.dispatchSmoke, removeRegistration: options.removeRegistration, ...(options.fingerprint ? { fingerprint: options.fingerprint } : {}), ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone({ ...settings, auditRecordPath: '~/canonical-audits.jsonl', ...options.settings }), now: () => clock,
@@ -289,12 +293,37 @@ describe('urgent prototype admission', () => {
     expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, registered: false, error: 'urgent ledger unwritable' });
     expect(mutations(f, 'add')).toHaveLength(0);
   });
-  it('appends a registration-failed note for an unsuccessful urgent registration', async () => {
+  it('appends a registration-failed note only when the failed registration is proven absent', async () => {
     const f = fixture({ addFails: true });
     expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, registered: false });
     const records = f.records.filter(r => r.path.endsWith('/urgent-loads.jsonl'));
     expect(records).toHaveLength(2);
     expect(records[1]).toMatchObject({ type: 'prototype-load.urgent-registration-failed', status: 'registration-failed', trackingId: records[0].trackingId });
+  });
+  it.each([
+    ['present', { corrupt: false, overlays: [{ ref: BASE.branch }] }],
+    ['corrupt', { corrupt: true, overlays: [] }],
+    ['missing state', null],
+    ['incomplete state', { corrupt: false }],
+    ['malformed registration', { corrupt: false, overlays: [{}] }],
+    ['read failure', new Error('store unreadable')],
+  ])('keeps an unsuccessful urgent registration tracked when overlay state is %s', async (_, state) => {
+    const readState = vi.fn(() => { if (state instanceof Error) throw state; return state; });
+    const f = fixture({ addFails: true, readState });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, registered: false });
+    expect(readState).toHaveBeenCalledWith(expect.any(String), { env: expect.objectContaining({ HOME: '/home/test' }) });
+    expect(readState.mock.calls[0][0]).toBe(f.records.find(r => r.type === 'prototype-load.urgent').registration.clone);
+    expect(f.records.filter(r => r.path.endsWith('/urgent-loads.jsonl'))).toEqual([
+      expect.objectContaining({ type: 'prototype-load.urgent' }),
+    ]);
+  });
+  it('keeps tracking when the registration command persists the overlay before failing', async () => {
+    const f = fixture({ addFails: true, persistBeforeAddFailure: true });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, registered: false });
+    expect(f.admitted).toEqual([{ ref: BASE.branch }]);
+    expect(f.records.filter(r => r.path.endsWith('/urgent-loads.jsonl'))).toEqual([
+      expect.objectContaining({ type: 'prototype-load.urgent' }),
+    ]);
   });
   it('keeps the intent tracked when registration succeeds but admission evidence is incomplete', async () => {
     const f = fixture({ addRaw: '{}' });
