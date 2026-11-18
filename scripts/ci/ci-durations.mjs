@@ -2,7 +2,7 @@
 /**
  * @file ci-durations.mjs — recent CI execution and runner-wait percentiles (seconds).
  * Usage: node scripts/ci/ci-durations.mjs [--workflow=ci.yml] [--branch=main] [--limit=10] [--json]
- * Read-only: one run list, at most ten job views and ten jobs API reads (21 calls),
+ * Read-only: one run list, at most ten job views and ten jobs API reads (21 logical calls; the gh throttle may add its own retries, which are not counted),
  * through gh-throttle without a shell. Each API read is capped at 100 jobs; larger
  * runs require manual inspection of paginated API evidence rather than a partial summary.
  * Run duration uses updatedAt as the completion proxy supplied by gh run list. Job duration
@@ -98,6 +98,11 @@ export function collectDurations(options, exec = execFileSyncThrottled) {
         throw new Error('Invalid or duplicate API job ID; inspect jobs API evidence and retry');
       }
       byId.set(job.id, job);
+    }
+    // Every finished REST job must appear in the CLI view; a truncated view must not yield a quiet partial summary.
+    const viewIds = new Set(view.jobs.map(job => job.databaseId));
+    if (api.jobs.some(job => job.status === 'completed' && job.conclusion !== 'skipped' && !viewIds.has(job.id))) {
+      throw new Error('Job views are missing completed jobs from the jobs API; retry or inspect the run');
     }
     const jobs = view.jobs.map(job => {
       if (job.status !== 'completed' || job.conclusion === 'skipped' || seconds(job.startedAt, job.completedAt) === null) return job;

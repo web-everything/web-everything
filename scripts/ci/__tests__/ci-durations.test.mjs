@@ -41,6 +41,12 @@ describe('ci-durations', () => {
     expect(summarizeDurations([]).runs.duration.count).toBe(0);
   });
 
+  it('refuses a truncated job view that omits a completed jobs-API job', () => {
+    const truncated = vi.fn((_file, args) => JSON.stringify(args[1] === 'list' ? [list[0]] : args[1] === 'view' ? { jobs: [] }
+      : { total_count: 1, jobs: [{ id: 7, status: 'completed', conclusion: 'success', created_at: '2026-01-01T00:00:00Z' }] }));
+    expect(() => collectDurations(parseArgs([]), truncated)).toThrow(/missing completed jobs/);
+  });
+
   it('caps oversized limits at ten and refuses unknown, empty and invalid options', () => {
     expect(parseArgs([])).toEqual({ workflow: 'ci.yml', branch: 'main', limit: 10, json: false });
     expect(parseArgs(['--limit=999', '--workflow=other.yml', '--branch=topic', '--json'])).toEqual({ workflow: 'other.yml', branch: 'topic', limit: 10, json: true });
@@ -79,7 +85,7 @@ describe('ci-durations', () => {
     expect(report.jobs.integration.wait).toEqual({ count: 2, p50: 20, p90: 28 });
     // Join by ID, even when API order differs from CLI order.
     const data = structuredClone(transport);
-    data.apiJobs['1'].jobs.unshift({ ...data.apiJobs['1'].jobs[0], id: 999, created_at: '2026-11-01T00:00:00Z' });
+    data.apiJobs['1'].jobs.unshift({ ...data.apiJobs['1'].jobs[0], id: 999, status: 'queued', created_at: '2026-11-01T00:00:00Z' });
     data.apiJobs['1'].total_count = 2;
     expect(collectDurations(parseArgs([]), fake(data)).jobs.integration.wait).toEqual(report.jobs.integration.wait);
   });
