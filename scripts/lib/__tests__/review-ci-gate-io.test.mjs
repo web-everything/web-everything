@@ -86,16 +86,16 @@ describe('fresh review CI IO', () => {
     expect(io.readChecks).toHaveBeenCalledWith({ repo: io.repo, headSha });
     expect(io.readRequired).toHaveBeenCalledWith({ repo: io.repo, ttlMs: 0 });
   });
-  it.each(['live', 'cache', 'declared'])('allows trusted source %s with green required checks', source => {
+  it.each(['live', 'cache'])('allows trusted source %s with green required checks', source => {
     expect(readReviewCiGate(fixture({ readRequired: () => ({ source, checks: ['custom'] }) })))
       .toMatchObject({ allowed: true, source });
   });
-  it.each(['fallback', 'unavailable', undefined])('refuses untrusted source %s', source => {
+  it.each(['fallback', 'unavailable'])('refuses untrusted source %s', source => {
     expect(readReviewCiGate(fixture({ readRequired: () => ({ source, checks: ['custom'] }) }))).toMatchObject({ allowed: false, reason: 'untrusted-required-set' });
   });
-  it.each([0, 60_000, 24 * 60 * 60_000])('allows stale cache aged %s ms and reports its age', cacheAgeMs => {
+  it.each([0, 60_000, 24 * 60 * 60_000])('refuses stale-cache provenance aged %s ms and reports its age', cacheAgeMs => {
     const result = readReviewCiGate(fixture({ readRequired: () => ({ source: 'stale-cache', checks: ['custom'], cacheAgeMs }) }));
-    expect(result).toMatchObject({ allowed: true, source: 'stale-cache', cacheAgeMs });
+    expect(result).toMatchObject({ allowed: false, unknown: true, source: 'stale-cache', cacheAgeMs });
     expect(result.reason).toContain(`cache-age-ms=${cacheAgeMs}`);
   });
   it.each([undefined, NaN, Infinity, -1, '1000', 24 * 60 * 60_000 + 1, 2 * 24 * 60 * 60_000])('refuses stale cache with invalid or expired age %s', cacheAgeMs => {
@@ -116,14 +116,14 @@ describe('fresh review CI IO', () => {
   });
 });
 
-it.each([198, 199])('replays Plateau PR #%s with protection unavailable and test/e2e green', pr => {
+it.each([198, 199])('refuses declared-only provenance for Plateau PR #%s even with test/e2e green', pr => {
   const dir = mkdtempSync(join(tmpdir(), 'we-review-ci-declared-'));
   try {
     const readRequired = args => getRequiredStatusChecks({ ...args, cachePath: join(dir, 'cache.json'),
       readChecks: () => { throw new Error('Resource not accessible by integration (HTTP 403)'); } });
     const checks = ['test', 'e2e'].map(name => ({ name, status: 'completed', conclusion: 'success' }));
     const io = fixture({ repo: 'plateauapp/plateau-app', pr, readRequired, readChecks: () => complete(checks) });
-    expect(readReviewCiGate(io)).toMatchObject({ allowed: true, source: 'declared', headSha });
+    expect(readReviewCiGate(io)).toMatchObject({ allowed: false, unknown: true, source: 'declared', headSha });
     expect(readReviewCiGate({ ...io, readChecks: () => complete(checks.slice(0, 1)) })).toMatchObject({ allowed: false, source: 'declared' });
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -169,10 +169,10 @@ it.each([
 });
 
 it.each([
-  // A denial past TTL no longer replaces the seeded live entry with the declared set (#4708): stale-cache wins.
-  ['Resource not accessible by integration (HTTP 403)', 60_000, true, 'stale-cache'],
-  ['offline', 60_000, true, 'stale-cache'],
-  ['offline', 24 * 60 * 60_000, true, 'stale-cache'],
+  // Rule 1: stale-cache evidence stays unknown even when the cached roster is recent.
+  ['Resource not accessible by integration (HTTP 403)', 60_000, false, 'stale-cache'],
+  ['offline', 60_000, false, 'stale-cache'],
+  ['offline', 24 * 60 * 60_000, false, 'stale-cache'],
   ['offline', 2 * 24 * 60 * 60_000, false, 'stale-cache'],
 ])('replays WE protection failure %s with cache age %s', (message, age, allowed, source) => {
   const dir = mkdtempSync(join(tmpdir(), 'we-review-ci-cache-'));
@@ -231,9 +231,10 @@ it('a repo without its own fast checks waits on its trusted required set', () =>
   const green = name => ({ name, head_sha: headSha, status: 'completed', conclusion: 'success' });
   const io = fixture({ policy, repo: 'frontier-ui/frontierui', readRequired: vi.fn(() => ({ source: 'declared', checks: ['test'] })),
     readChecks: () => complete([green('test')]) });
-  expect(readGate(io)).toMatchObject({ allowed: true, headSha, source: 'declared' });
+  // Rule 1: a declared roster cannot establish strict CI evidence.
+  expect(readGate(io)).toMatchObject({ allowed: false, unknown: true, headSha, source: 'declared', reason: 'unknown-required-set' });
   expect(readGate({ ...io, readChecks: () => complete([{ ...green('test'), status: 'in_progress', conclusion: null }]) }))
-    .toMatchObject({ allowed: false, reason: 'required-checks-not-successful' });
+    .toMatchObject({ allowed: false, unknown: true, reason: 'unknown-required-set' });
   expect(readGate({ ...io, readRequired: () => ({ source: 'fallback', checks: ['test'] }) }))
     .toMatchObject({ allowed: false, reason: 'untrusted-required-set' });
   expect(readGate({ ...io, readRequired: () => { throw Error('offline'); } })).toMatchObject({ allowed: false, reason: 'unreadable-ci' });
@@ -246,15 +247,20 @@ it('a repo without its own fast checks waits on its trusted required set', () =>
 
 it('publish-time gate reads the exact head marker only when enabled', () => {
   const readVerifyGreen = vi.fn(({ sha }) => sha === headSha);
-  const args = { repo: 'other/product', pr: 7, readHead: () => headSha, readChecks: () => complete([]),
+  const args = { repo: 'other/product', pr: 7, readHead: () => headSha,
+    readChecks: () => complete([{ name: 'test', status: 'completed', conclusion: 'success' }]),
     readRequired: () => ({ source: 'live', checks: ['test'] }), readVerifyGreen,
     policy: { startAfter: 'ci-green', startBeforeCi: true } };
   expect(readGate(args)).toMatchObject({ allowed: true, reason: 'verify-marker' });
+  // Verification cannot upgrade absent, malformed or queued CI evidence.
+  for (const checks of [[], [{ name: 'test' }], [{ name: 'test', status: 'queued', conclusion: null }]]) {
+    expect(readGate({ ...args, readChecks: () => complete(checks) }).allowed).toBe(false);
+  }
   expect(readVerifyGreen).toHaveBeenCalledWith(expect.objectContaining({ sha: headSha }));
   expect(readGate({ ...args, readVerifyGreen: () => false }).allowed).toBe(false);
   expect(readGate({ ...args, readVerifyGreen: () => { throw Error('unreadable'); } }).allowed).toBe(false);
   readVerifyGreen.mockClear();
-  expect(readGate({ ...args, policy: { startAfter: 'ci-green' } }).allowed).toBe(false);
+  expect(readGate({ ...args, policy: { startAfter: 'ci-green' } }).allowed).toBe(true); // Successful CI also passes when verification is disabled.
   expect(readVerifyGreen).not.toHaveBeenCalled();
 });
 
@@ -278,4 +284,38 @@ it.each([false, undefined])('refuses incomplete injected check pages (%s) withou
   const result = readGate(fixture({ readChecks: () => checks, log }));
   expect(result).toMatchObject({ allowed: false, unknown: true, reason: 'rows-incomplete' });
   expect(log).not.toHaveBeenCalled();
+});
+
+// Rule 1: lookup provenance must survive IO and timing unchanged.
+it.each(['live', 'cache', 'declared', 'stale-cache', undefined])('strict IO preserves roster provenance %s', source => {
+  const result = readReviewCiGate(fixture({ readRequired: () => ({ source, checks: ['custom'], cacheAgeMs: 0 }) }));
+  expect(result).toMatchObject({ source, allowed: ['live', 'cache'].includes(source) });
+  if (!['live', 'cache'].includes(source)) expect(result).toMatchObject({ unknown: true, reason: expect.stringContaining('unknown-required-set') });
+});
+
+it.each(['ci-green', 'fast-checks', 'push'])('#7037 review admission via IO ignores review-owned rows under %s', startAfter => {
+  const rows = ['cancelled', 'cancelled', 'failure'].map(conclusion => ({ name: 'review-gate', head_sha: headSha, status: 'completed', conclusion }))
+    .concat({ name: 'merge-gate', head_sha: headSha, status: 'completed', conclusion: 'failure' });
+  const io = fixture({ pr: 7037, policy: { startAfter, startEarly: 'shadow', fastChecks: ['test', 'review-gate', 'merge-gate'] },
+    readRequired: () => ({ source: 'live', checks: ['test', 'review-gate', 'merge-gate'] }) });
+  expect(readGate({ ...io, readChecks: () => complete([...rows, { name: 'test', head_sha: headSha, status: 'completed', conclusion: 'success' }]) }))
+    .toMatchObject({ allowed: true, affected: [] });
+  expect(readGate({ ...io, readChecks: () => complete([...rows, { name: 'test', head_sha: headSha, status: 'completed', conclusion: 'failure' }]) }))
+    .toMatchObject({ allowed: false });
+});
+
+it('review reader ignores duplicate review-owned lineage while retaining complete real CI', () => {
+  const rows = ['cancelled', 'cancelled', 'failure'].map((conclusion, id) => ({
+    name: 'review-gate', id: id + 1, app: { slug: 'github-actions' }, head_sha: headSha, status: 'completed', conclusion,
+  })).concat({ name: 'merge-gate', head_sha: headSha, status: 'completed', conclusion: 'failure' },
+    { name: 'test', head_sha: headSha, status: 'completed', conclusion: 'success' });
+  const run = vi.fn(argv => {
+    if (argv[3]?.includes('/check-runs?')) return JSON.stringify([{ check_runs: rows }]);
+    if (argv[3]?.includes('/status?')) return JSON.stringify([{ statuses: [] }]);
+    throw Error('unexpected job-lineage read');
+  });
+  const checks = readReviewChecks({ repo: 'other/product', headSha, run });
+  expect(readReviewCiGate(fixture({ readRequired: () => ({ source: 'live', checks: ['test', 'review-gate', 'merge-gate'] }),
+    readChecks: () => checks }))).toMatchObject({ allowed: true, rowsComplete: true });
+  expect(run).toHaveBeenCalledTimes(2);
 });

@@ -615,6 +615,16 @@ describe('required check evidence contract (PR1 acceptance)', () => {
     expect(resolve([{ name: 'test', conclusion: 'success' }])).toMatchObject({ state: 'unknown',
       perName: { test: { reasons: ['malformed'] } } });
   });
+  it.each(['queued', 'in_progress', 'waiting', 'requested', 'pending', 'completed'])('unknown conclusion is malformed for status %s', status => {
+    expect(resolve([{ name: 'test', status, conclusion: 'BOGUS' }])).toMatchObject({ state: 'unknown',
+      perName: { test: { state: 'unknown', reasons: ['malformed'] } } });
+  });
+  it.each(['queued', 'in_progress', 'waiting', 'requested', 'pending'])('known pending status %s needs no conclusion', status => {
+    for (const conclusion of [undefined, null]) {
+      expect(resolve([{ name: 'test', status, conclusion }])).toMatchObject({ state: 'pending',
+        perName: { test: { state: 'pending', reasons: ['pending'] } } });
+    }
+  });
   it.each(['failure', 'error', 'pending', 'expected'])('StatusContext contradictory state %s is malformed, never success', state => {
     const contradictory = { __typename: 'StatusContext', context: 'test', status: 'completed', conclusion: 'success', state };
     expect(resolve([contradictory])).toMatchObject({ state: 'unknown',
@@ -638,13 +648,13 @@ describe('required check evidence contract (PR1 acceptance)', () => {
     expect(resolve([{ __typename, name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', state: 'SuCcEsS' }]))
       .toMatchObject({ state: 'pass', perName: { test: { state: 'pass', reasons: [] } } });
   });
-  it('2: integration implication requires zero integration rows and all test groups passing', () => {
-    const requiredNames = ['test', 'integration'], allowImplication = true;
-    expect(resolve([row()], { requiredNames, allowImplication }).perName.integration).toMatchObject({ state: 'pass', via: 'test' });
+  it('2: absent integration stays pending even when test passes', () => {
+    const requiredNames = ['test', 'integration'];
+    expect(resolve([row()], { requiredNames }).perName.integration).toMatchObject({ state: 'pending', reasons: ['missing'] });
     for (const integration of [row('integration', 'success', { head_sha: foreign }), { name: 'integration' }]) {
-      expect(resolve([row(), integration], { requiredNames, allowImplication }).state).not.toBe('pass');
+      expect(resolve([row(), integration], { requiredNames }).state).not.toBe('pass');
     }
-    expect(resolve([row('test', 'success', { run_id: 1 }), row('test', 'failure', { run_id: 2 })], { requiredNames, allowImplication }))
+    expect(resolve([row('test', 'success', { run_id: 1 }), row('test', 'failure', { run_id: 2 })], { requiredNames }))
       .toMatchObject({ state: 'fail', perName: { integration: { state: 'pending' } } });
   });
   it('3: tied evidence is permutation invariant and a stale bound hold cannot excuse another failure', () => {
@@ -747,14 +757,30 @@ describe('required check evidence contract (PR1 acceptance)', () => {
   });
 });
 
-it('Rule 6 implication is opt-in; omitted or false leaves integration absent', () => {
+// Coordinator Rule 6 removal: even persisted opt-in options cannot imply a required name.
+it('removed Rule 6 cannot admit absent integration through an old opt-in option', () => {
   const head = 'a'.repeat(40);
   const evidence = { head, rowsHead: head, rowsComplete: true, rosterSource: 'live',
     requiredNames: ['test', 'integration'], rows: [{ name: 'test', status: 'completed', conclusion: 'success' }] };
-  for (const option of [{}, { allowImplication: false }]) {
+  for (const option of [{}, { allowImplication: false }, { allowImplication: true }]) {
     expect(resolveRequiredChecks({ ...evidence, ...option })).toMatchObject({ state: 'pending',
       perName: { integration: { state: 'pending', rows: [], reasons: ['missing'] } } });
   }
-  expect(resolveRequiredChecks({ ...evidence, allowImplication: true })).toMatchObject({ state: 'pass',
-    perName: { integration: { state: 'pass', via: 'test' } } });
+});
+it.each(['timed_out', 'startup_failure', 'cancelled', 'stale', 'action_required'])('Rule 7 review-gate %s needs rerun, never held', conclusion => {
+  const head = 'a'.repeat(40);
+  expect(resolveRequiredChecks({ head, rowsHead: head, rowsComplete: true, rosterSource: 'live',
+    requiredNames: ['review-gate'], rows: [{ name: 'review-gate', status: 'completed', conclusion }] }))
+    .toMatchObject({ state: 'pending', perName: { 'review-gate': { state: 'pending', reasons: ['needs-rerun'] } } });
+});
+
+it.each(['review-gate', 'merge-gate'])('Rule 7 retains %s for non-admission consumers without holding unsuccessful runs', name => {
+  const head = 'a'.repeat(40), job = { detailsUrl: 'https://github.com/o/r/actions/runs/1/job/7',
+    mergeGateReviewHold: { jobId: 7, headSha: head, holdIds: ['review-acceptance'] } };
+  const resolve = conclusion => resolveRequiredChecks({ head, rowsHead: head, rowsComplete: true, rosterSource: 'live',
+    requiredNames: [name], rows: [{ ...job, name, status: 'completed', conclusion }] });
+  expect(resolve('failure')).toMatchObject({ state: 'held', perName: { [name]: { state: 'held' } } });
+  for (const conclusion of ['timed_out', 'startup_failure', 'cancelled', 'stale', 'action_required']) {
+    expect(resolve(conclusion)).toMatchObject({ state: 'pending', perName: { [name]: { state: 'pending', reasons: ['needs-rerun'] } } });
+  }
 });

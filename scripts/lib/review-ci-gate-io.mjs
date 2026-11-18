@@ -1,13 +1,13 @@
 import { greenLedgerDir, hasGreenLedger } from './lane-verify.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
-import { ciRedOnHead, fastChecksFor, reviewStartGate, reviewUsesRequiredChecks } from './review-timing.mjs';
+import { reviewAdmissionCiRed, fastChecksFor, reviewStartGate, reviewUsesRequiredChecks } from './review-timing.mjs';
 import { resolveTimingPolicy } from './review-timing-settings.mjs';
 /** Fresh repo-explicit review eligibility, with injectable read-only GitHub IO. */
 import { readGh } from './proc-read.mjs';
 import { getRequiredStatusChecks } from './required-status-checks.mjs';
 import { excuseMergeGateRows, latestFailingMergeGate, loadMergeGateHoldSetting, readMergeGateVerdict as defaultReadMergeGateVerdict } from './merge-gate-hold-class.mjs';
 import { readSharedFreeze } from './red-main-freeze-shared.mjs';
-import { reviewCiGate } from './review-ci-gate.mjs';
+import { reviewCiGate, isReviewOwnedCheck } from './review-ci-gate.mjs';
 
 const MAX_STALE_CACHE_AGE_MS = 24 * 60 * 60_000;
 
@@ -23,7 +23,7 @@ function bindReviewReruns(checks, { repo, headSha, run }) {
   return checks.map(check => {
     // Only the job endpoint can establish workflow identity, never fields in a check feed.
     const { run_id: ignoredRun, run_attempt: ignoredAttempt, ...row } = check;
-    if (counts.get(row.name) < 2 || row.app?.slug !== 'github-actions') return row;
+    if (isReviewOwnedCheck(row.name) || counts.get(row.name) < 2 || row.app?.slug !== 'github-actions') return row;
     const unavailable = () => { throw new Error('rerun lineage unavailable; inspect Actions jobs before retrying review'); };
     const match = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/actions\/runs\/([1-9]\d*)\/job\/([1-9]\d*)$/.exec(row.details_url);
     const positive = n => Number.isSafeInteger(n) && n > 0;
@@ -96,7 +96,7 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
       checks = readChecks({ repo, headSha });
       // Early review needs branch-protection discovery only to identify an owner for red CI.
       // Discovery faults retain the fast-check prerequisite, rather than stranding review.
-      if (ciRedOnHead({ headSha, checks })) {
+      if (reviewAdmissionCiRed({ headSha, checks })) {
         try { required = readRequired({ repo, ttlMs: 0 }); } catch { /* Keep timing policy. */ }
       }
     }
@@ -108,7 +108,7 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
     });
     // Repo-declared requirements are code-reviewed policy, not the last-resort fallback.
     const trustedRequired = ['live', 'cache', 'declared', 'timing-policy'].includes(required?.source) || trustedStale;
-    if (needsRequired && !trustedRequired && policy.startAfter !== 'push') {
+    if (needsRequired && !trustedRequired && required?.source != null && policy.startAfter !== 'push') {
       return withSource({ allowed: false, headSha, reason: 'untrusted-required-set' });
     }
     checks ??= readChecks({ repo, headSha });
@@ -127,7 +127,7 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
     } catch { /* Unreadable excusal evidence preserves the original failed checks. */ }
     const requiredChecks = trustedRequired && required.source !== 'timing-policy' ? required.checks : [];
     // A discovery fault or untrusted/empty set cannot excuse healable red in push mode.
-    if (policy.startAfter === 'push' && ciRedOnHead({ headSha, checks,
+    if (policy.startAfter === 'push' && reviewAdmissionCiRed({ headSha, checks,
       requiredChecks: Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks : null }))
       return withSource({ allowed: false, headSha, reason: 'ci-red', affected: [], checks, requiredChecks });
     // `requiredChecks` rides along so a publish-time void judges only healable reds, as review start does.
@@ -136,7 +136,7 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
       try { verifyGreen = readVerifyGreen({ dir: greenLedgerDir({ coordinationRoot: coordinationRoot ?? resolveCoordinationRoot() }), sha: headSha }) === true; }
       catch { /* Unreadable verification waits on CI. */ }
     }
-    const gate = reviewStartGate({ headSha, repo, requiredChecks, checks, rowsComplete, policy, verifyGreen });
+    const gate = reviewStartGate({ headSha, repo, requiredChecks, checks, rowsComplete, rosterSource: needsRequired ? required?.source : 'live', policy, verifyGreen });
     if (gate.earlyStartNote) {
       // console is wrapped by the project's daemon logger; injected loggers keep fixtures hermetic.
       try { log(gate.earlyStartNote.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').slice(0, 2000)); }
