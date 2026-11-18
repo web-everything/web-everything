@@ -186,7 +186,7 @@ import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, next
 import { listOpenPrsPagedHydratedComplete as listOpenPrsPagedHydrated, resolvePrListPaging, parseListOutput } from './lib/pr-list-paged.mjs'; // refuses a short inventory (rows < totalCount)
 import { withListRetry } from './lib/gh-list-retry.mjs'; // 504 incident 2026-11-03 — retry a transient 5xx list with backoff; a persistent failure throws + raises gh-list-failed
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
-import { backfillOpenReviewRuns } from './lib/review-run-index.mjs';
+import { backfillAllReviewRuns, backfillOpenReviewRuns } from './lib/review-run-index.mjs';
 import { resolveRunsDir } from './operations/run-store.mjs';
 import { resolveCardNumbering } from './lib/policy-cascade.mjs';
 import { logQueueNumbering, mainAcceptsBranchNumbering, prepareBranchBeforeEnqueue, finishBranchPreparation, openReservationPr, probeQueuedLand, repairHashOnMain, fallbackMinNext, sweepQueuedHashCards, hashBacklogFiles } from './lib/queue-branch-numbering.mjs';
@@ -5357,6 +5357,7 @@ async function runCli() {
     onListingTruncated: (repo, n) => { if (!AS_JSON) process.stderr.write(`  ⚠️  DEGRADED open-PR listing for ${repoTag(repo) || 'cwd'}: ${n} PRs hit the --limit ${OPEN_PR_LIST_LIMIT} cap — the page MAY be truncated (oldest, longest-held blockers dropped first). The cross-item merge order derived from this listing is NOT trustworthy for the early-land decision this pass (#999/xq985wu F3).\n`); },
   }).then(context => {
     backfillOpenReviewRuns(context, { runsDir: resolveRunsDir(), localSlug });
+    backfillAllReviewRuns({ runsDir: resolveRunsDir() });
     return context;
   });
 

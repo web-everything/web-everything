@@ -2,6 +2,7 @@
 import { execFileSync } from 'node:child_process';
 import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
 import { readFileSync, statSync } from 'node:fs';
+import { readCompleteReviewRunsForPr } from './review-run-index.mjs';
 import { listRunIds, readRun, sharedRunsDir } from '../operations/run-store.mjs';
 import { runBacklogOnlyPrep, readBacklogOnlyNetFiles } from './red-team-backlog-only.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
@@ -424,6 +425,23 @@ export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
   runsDir = runsDirectory(env), list = strictListRuns, read = readRun, stat = statSync } = {}) {
   try {
     if (!isRealHead(head)) return false;
+    try {
+      const ids = readCompleteReviewRunsForPr(runsDir, repo, pr, { list,
+        stat: id => stat(join(runsDir, `${id}.json`)) });
+      if (ids !== null) {
+        const verifiedRead = (id, dir) => {
+          const run = read(id, dir);
+          if (run?.id !== id || run.op !== 'review-pr' || run.input?.repo !== repo
+            || Number(run.input?.pr) !== Number(pr)) throw Error('indexed review subject unreadable');
+          return run;
+        };
+        for (const { run } of reviewRuns({ runsDir, list: () => ids, read: verifiedRead, stat })) {
+          const rev = run.findings?.read?.netBasis?.rev;
+          if (!isRealHead(rev) || rev === head) return false;
+        }
+        return true;
+      }
+    } catch { /* Unverifiable indexed evidence takes the original bounded scan. */ }
     for (const { run } of reviewRuns({ runsDir, list, read, stat })) {
       if (run.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr)) continue;
       const rev = run.findings?.read?.netBasis?.rev;

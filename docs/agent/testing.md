@@ -4683,3 +4683,16 @@ oversized/incomplete/foreign evidence, target head invalidation, snapshot exclus
 a live target replacing a stale cached target with a different head and red check.
 Run it with `fast-drain-scope.test.mjs` and `merge-ai-prs.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
 comparison against daemon observations; fixtures prove IO counts without live GitHub calls.
+
+
+## Negative review-run proofs
+
+`headNeverReviewedFromRuns` may bypass its 400-run scan only through
+`readCompleteReviewRunsForPr`: an all-PR backfill watermark, acknowledged poison
+markers, stat-only listing verification, and no overflow or eviction for that PR.
+The full-backfill cursor lives in the index and parses at most 50 records per drain
+tick by default. Open-PR hint refreshes must preserve that cursor and proof.
+Unverifiable indexed identities return to the original capped scan; they never
+establish absence. Keep bounded resumption, a 3,012-file snapshot, eviction, poison
+races, and capped negative fallbacks in `review-run-index.test.mjs`, alongside the
+existing `redteam-pending-settle` and `review-red-team-on-skip` suites.
