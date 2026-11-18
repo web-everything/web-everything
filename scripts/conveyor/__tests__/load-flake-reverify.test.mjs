@@ -538,3 +538,25 @@ describe('defaultReverifyIo admission decision source (x9xkupj)', () => {
       gate: 'load-flake-reverify', kind: 'load-flake-rearm', oldVerdict: 'hold' }));
   });
 });
+
+it('capability-off refuses saved-fix push but releases the lane and still ends obsolete holds', async () => {
+  const resolveProfile = () => ({ capabilities: { fix: false } });
+  const { io, pr } = fixture();
+  expect(await runLoadFlakeReverify({ resolveProfile }, io)).toMatchObject({ deferred: 'unsupported-repo' });
+  expect(io.push).not.toHaveBeenCalled();
+  expect(io.release).toHaveBeenCalledOnce();
+  io.readPr.mockResolvedValue({ ...pr, state: 'CLOSED' });
+  expect(await runLoadFlakeReverify({ resolveProfile }, io)).toMatchObject({ deferred: 'head-moved' });
+  expect(io.comment.mock.calls.at(-1)[2]).toContain('result=head-moved');
+});
+
+it('capability-off refuses load-flake redispatch before merging or ending its hold', async () => {
+  const { buildLoadFlakeRedispatchComment } = await import('../stand-down.mjs');
+  const { io, pr } = fixture();
+  pr.comments = [comment(buildLoadFlakeRedispatchComment({ head: pr.headRefOid, detail: 'timing' }))];
+  io.mergeMain = vi.fn();
+  const out = await runLoadFlakeReverify({ resolveProfile: () => ({ capabilities: { fix: false } }) }, io);
+  expect(out.redispatched).toEqual([expect.objectContaining({ deferred: 'unsupported-repo' })]);
+  expect(io.mergeMain).not.toHaveBeenCalled();
+  expect(io.comment).not.toHaveBeenCalled();
+});
