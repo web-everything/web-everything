@@ -58,6 +58,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve, join } from 'node:path';
 import { isBlastRadiusPath, isStatutePath, isGateSelfPath } from '../lib/review-escalation.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
+import { buildReverseImportGraph, selectRelatedTests, loadCiSelection, isVitestTestFile } from '../lib/related-test-selection.mjs';
 import { admittedArgv } from './heavy-admission.mjs';
 
 // ── the flag (NOT defaulted — DoD) ───────────────────────────────────────────────────────────────────────────
@@ -337,17 +338,36 @@ export function changedFilesSince({ base = 'origin/main', runGit } = {}) {
  * @param {{base?: string, runGit: (args: string[]) => string, env?: Record<string,string|undefined>}} args
  * @returns {SelectionDecision & {changedFiles: string[]|null}}
  */
-export function selectTests({ base = 'origin/main', runGit, env = process.env } = {}) {
+export function selectTests({ base = 'origin/main', runGit, env = process.env, files, readFile, maxTests, maxDepth } = {}) {
   const flagEnabled = selectionFlagEnabled(env);
   const changedFiles = changedFilesSince({ base, runGit });
   if (changedFiles === null) {
     return {
-      changedFiles: null,
+      changedFiles: null, partial: false,
       ...decideSelection({ changedFiles: [], flagEnabled: false }),
       reasons: ['could not compute the pinned-merge-base diff — full suite (never shrink on an unknown diff)'],
     };
   }
-  return { changedFiles, ...decideSelection({ changedFiles, flagEnabled }) };
+  const decision = { changedFiles, ...decideSelection({ changedFiles, flagEnabled }), partial: false };
+  if (decision.mode === 'shrink' && readFile && !files) return { ...decision, mode: 'full',
+    reasons: ['tracked graph inventory unavailable — full suite'] };
+  if (decision.mode === 'shrink' && files && readFile) {
+    const inventory = new Set(files);
+    const absentTargets = changedFiles.filter(path => !inventory.has(path));
+    if (absentTargets.length) return { ...decision, mode: 'full',
+      reasons: [`changed dependency target(s) absent from tracked inventory (${absentTargets.join(', ')}) — full suite (deleted dependencies cannot be resolved)`] };
+    const settings = loadCiSelection({ env });
+    const reverse = buildReverseImportGraph({ files, readFile, staticEdges: settings.staticEdges });
+    if (reverse.unreadable) return { ...decision, mode: 'full',
+      reasons: [`${reverse.unreadable} unreadable graph source(s) — full suite (incomplete dependency evidence)`] };
+    const selection = selectRelatedTests({ changedFiles, reverse, env, maxTests, maxDepth, settings });
+    if (selection.fullTestCount === 0 && changedFiles.some(path => !isVitestTestFile(path))) return { ...decision, mode: 'full',
+      reasons: ['graph selection yielded zero tests for non-test changed files — full suite'] };
+    return { ...decision, selection, partial: selection.partial,
+      selectedFiles: selection.tests ?? selection.reachableTests,
+      reasons: [...decision.reasons, `${selection.partial ? 'partial: ' : ''}${selection.reason}`] };
+  }
+  return decision;
 }
 
 // ── the LOCAL agent-gate policy (xpnhz4o) — a DIFFERENT, wider shrink than the CI one above ─────────────────
@@ -582,7 +602,12 @@ function vitestRelatedSelectedFiles(changedFiles) {
 function runCli(argv) {
   const flags = parseFlags(argv);
   const base = typeof flags.base === 'string' ? flags.base : 'origin/main';
-  const decision = selectTests({ base, runGit: realGit, env: process.env });
+  let files;
+  if (selectionFlagEnabled(process.env)) {
+    try { files = realGit(['ls-files']).split(/\r?\n/).filter(Boolean); } catch { files = null; }
+  }
+  const decision = selectTests({ base, runGit: realGit, env: process.env, files,
+    readFile: path => readFileSync(join(ROOT, path), 'utf8') });
 
   // --measure: run the shadow compare against a FULL-run vitest json report and record the false-green sample.
   // A false-green = a full-suite FAILURE that falls OUTSIDE what `vitest related` on the diff would have run.
