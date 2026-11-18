@@ -582,3 +582,27 @@ describe('dispatchFix takeover ordering and failure (card xx0055i review round 1
     expect(opts.postTakeoverVoidMark).not.toHaveBeenCalled();
   });
 });
+
+
+describe('conflict-fix pass exemption setting', () => {
+  const resolve = options => resolveFixSettings({ env: {}, platform: {}, read: () => '{}', ...options });
+  it('defaults to three and resolves platform, tool and environment provenance', () => {
+    expect(resolve()).toMatchObject({ conflictFixExemptPerPass: 3, sources: { conflictFixExemptPerPass: 'standard' } });
+    expect(resolve({ platform: { conflictFixExemptPerPass: 2 } })).toMatchObject({ conflictFixExemptPerPass: 2, sources: { conflictFixExemptPerPass: 'platform' } });
+    expect(resolve({ platform: { conflictFixExemptPerPass: 2 }, read: () => '{"fix":{"conflictFixExemptPerPass":1}}' }))
+      .toMatchObject({ conflictFixExemptPerPass: 1, sources: { conflictFixExemptPerPass: 'tool' } });
+    expect(resolve({ env: { WE_CONFLICT_FIX_EXEMPT_PER_PASS: '0' }, read: () => '{"fix":{"conflictFixExemptPerPass":1}}' }))
+      .toMatchObject({ conflictFixExemptPerPass: 0, sources: { conflictFixExemptPerPass: 'env' } });
+  });
+  it.each([-1, 1.5, null, false, [], {}, '', 'bad', '9007199254740992'])('fails closed on invalid bound %j at every layer', bad => {
+    expect(resolve({ platform: { conflictFixExemptPerPass: bad } }).conflictFixExemptPerPass).toBe(0);
+    expect(resolve({ read: () => JSON.stringify({ fix: { conflictFixExemptPerPass: bad } }) }).conflictFixExemptPerPass).toBe(0);
+    expect(resolve({ env: { WE_CONFLICT_FIX_EXEMPT_PER_PASS: bad } }).conflictFixExemptPerPass).toBe(0);
+  });
+  it.each(['not JSON', '{"fix":false}'])('disables exemption for unreadable settings %s', raw => {
+    expect(resolve({ read: () => raw }).conflictFixExemptPerPass).toBe(0);
+  });
+  it('disables exemption on a failed settings read', () => {
+    expect(resolve({ read: () => { throw new Error('EACCES'); } }).conflictFixExemptPerPass).toBe(0);
+  });
+});
