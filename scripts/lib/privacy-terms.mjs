@@ -2,7 +2,7 @@
 // No IO here: the standards caller owns changed-file selection and file reads.
 import { isIP } from 'node:net';
 import { createHash } from 'node:crypto';
-import { gunzipSync, inflateSync, inflateRawSync } from 'node:zlib';
+import { gunzipSync, inflateSync, inflateRawSync, constants as zlibConstants } from 'node:zlib';
 
 const sha256 = text => createHash('sha256').update(text).digest('hex');
 const HASH = /^[a-f0-9]{64}$/;
@@ -11,6 +11,17 @@ const ALLOWLIST_FILES = new Set([
 ]);
 const isExemptionPath = path => ALLOWLIST_FILES.has(path)
   || path.split('/').some(segment => ['__tests__', 'tests', 'test', 'fixtures', '__fixtures__', 'golden-corpus'].includes(segment));
+// PR 7008: a zlib header is only a two-byte checksum, so ordinary text can carry one ("x ", "hb", "H,").
+// Real compressed bytes contain control bytes; text has none beyond tab, LF and CR. UTF-8 text is read as code
+// points (its continuation bytes overlap C1); single-byte text must also avoid C1 (0x80-0x9f).
+const TEXT_CONTROL = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/;
+const isPlainText = (input) => {
+  try {
+    if (!TEXT_CONTROL.test(new TextDecoder('utf-8', { fatal: true }).decode(input))) return true;
+  } catch { /* not UTF-8: try single-byte text below */ }
+  return !TEXT_CONTROL.test(input.toString('latin1'));
+};
+
 // R972: every file is decoded in all six views; no encoding or density heuristic may omit one.
 export function decodePrivacyContent(content, { onCompressionError = () => {} } = {}) {
   if (typeof content !== 'string' && !(content instanceof Uint8Array)) {
@@ -26,13 +37,45 @@ export function decodePrivacyContent(content, { onCompressionError = () => {} } 
       && ((input[0] << 8) + input[1]) % 31 === 0;
     if ((gzip || zlib) && depth >= 8) { onCompressionError(); return; }
     const remaining = 32 * 1024 * 1024 - inflatedSize;
+    const inflate = gzip ? gunzipSync : zlib ? inflateSync : inflateRawSync;
     let inflated;
     try {
-      inflated = (gzip ? gunzipSync : zlib ? inflateSync : inflateRawSync)(input,
-        { maxOutputLength: Math.max(1, remaining) });
+      inflated = inflate(input, { maxOutputLength: Math.max(1, remaining) });
     } catch (error) {
       // Raw deflate has no header: failed probes are plain bytes unless they hit the size cap.
-      if (gzip || zlib || error.code === 'ERR_BUFFER_TOO_LARGE') onCompressionError();
+      if (!(gzip || zlib) || error.code === 'ERR_BUFFER_TOO_LARGE') {
+        if (error.code === 'ERR_BUFFER_TOO_LARGE') onCompressionError();
+        return;
+      }
+      // PR 7008: a truncated or corrupt stream still yields the bytes before the damage; scan them, so a
+      // lenient reader cannot see text this scan skipped. Output only grows with a longer prefix and a data
+      // error stays an error, so a binary search finds the longest decodable prefix in log2(n) inflations.
+      const decodes = (length) => {
+        try {
+          return inflate(input.subarray(0, length),
+            { finishFlush: zlibConstants.Z_SYNC_FLUSH, maxOutputLength: Math.max(1, remaining) });
+        } catch (prefixError) {
+          if (prefixError.code === 'ERR_BUFFER_TOO_LARGE') throw prefixError;
+          return null;
+        }
+      };
+      let recovered = null;
+      try {
+        let low = 1;
+        let high = input.length;
+        while (low <= high) {
+          const mid = (low + high) >> 1;
+          const output = decodes(mid);
+          if (output) { recovered = output; low = mid + 1; } else high = mid - 1;
+        }
+      } catch { onCompressionError(); return; }
+      // A damaged gzip stream, or a zlib-header candidate that is not plain text, is still uninspectable
+      // compression. Plain text whose first two bytes happen to form a zlib checksum is just text.
+      if (gzip || !isPlainText(input)) onCompressionError();
+      if (!recovered?.length || recovered.length > remaining) return;
+      inflatedSize += recovered.length;
+      buffers.push(recovered);
+      expand(recovered, depth + 1);
       return;
     }
     if (depth >= 8 || inflated.length > remaining) { onCompressionError(); return; }
@@ -229,6 +272,60 @@ export function normalizePrivacyLine(line) {
     .replace(/<\/?[a-z][^>]*>/gi, ' ');
 }
 
+// Standard or URL-safe base64 to text, or null when the token is not exact base64 of valid UTF-8.
+function decodeBase64Text(token) {
+  const canonical = token.replace(/-/g, '+').replace(/_/g, '/').replace(/=+$/, '');
+  const bytes = Buffer.from(canonical, 'base64');
+  if (bytes.toString('base64').replace(/=+$/, '') !== canonical) return null;
+  try {
+    const decoded = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    // R984: controls are separators, never a reason to suppress private substrings.
+    return decoded.replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu, ' ');
+  } catch { return null; }
+}
+
+// PR 7008: base64 is routinely wrapped (MIME 76, PEM 64, any width), so a value split across lines must be
+// decoded whole. A run is two or more base64 segments joined by a line break: a real one (LF or CRLF) or a
+// JSON-escaped one (\n, \r\n), with optional spaces or tabs around it. The look-behind starts a run only at a
+// token start, so each character begins at most one attempt and the scan stays linear.
+const WRAP_SEPARATOR = String.raw`[ \t]*(?:\r?\n|\\r\\n|\\n)[ \t]*`;
+const WRAPPED_BASE64 = new RegExp(
+  String.raw`(?<![A-Za-z0-9+/_=-])[A-Za-z0-9+/_-]{4,}(?:${WRAP_SEPARATOR}[A-Za-z0-9+/_-]+)+={0,2}`, 'g');
+
+/** PR 7008 — one wrapped run with its base64 block decoded, or null. A word line next to the block joins the run
+ *  (a PEM "-----BEGIN CERTIFICATE-----" header, a label above it, an "-----END" line below an unpadded block),
+ *  so up to two edge segments on each side may be left as they are: at most nine linear decodes per run. The
+ *  decoded text sits on the block's first line and the block's line breaks are kept, so line numbers still
+ *  name their source lines. */
+function decodeWrappedRun(run) {
+  const separators = [...run.matchAll(new RegExp(WRAP_SEPARATOR, 'g'))];
+  const starts = [0, ...separators.map(match => match.index + match[0].length)];
+  const ends = [...separators.map(match => match.index), run.length];
+  const last = starts.length - 1;
+  for (const first of [0, 1, 2]) {
+    for (const end of [last, last - 1, last - 2]) {
+      if (end - first < 1) continue;
+      const block = run.slice(starts[first], ends[end]);
+      const decoded = decodeBase64Text(block.replace(new RegExp(WRAP_SEPARATOR, 'g'), ''));
+      if (decoded === null) continue;
+      return run.slice(0, starts[first]) + decoded + '\n'.repeat((block.match(/\n/g) ?? []).length) + run.slice(ends[end]);
+    }
+  }
+  return null;
+}
+
+/** PR 7008 — the text with each wrapped base64 run decoded, or null when no run decodes. */
+function unwrapBase64(text) {
+  let changed = false;
+  const view = text.replace(WRAPPED_BASE64, (run) => {
+    const decoded = decodeWrappedRun(run);
+    if (decoded === null) return run;
+    changed = true;
+    return decoded;
+  });
+  return changed ? view : null;
+}
+
 // R972: entity decoding may expand a single source line into several scan lines.
 export function privacyLineViews(line) {
   // R984: single-pass common encodings only; work and decoded output stay linear in input size.
@@ -238,16 +335,7 @@ export function privacyLineViews(line) {
     });
     const json = line.replace(/\\u([0-9a-f]{4})|\\([/\\"bfnrt])/gi, (token, hex, escape) =>
       hex ? String.fromCharCode(parseInt(hex, 16)) : ({ '/': '/', '\\': '\\', '"': '"', b: '\b', f: '\f', n: '\n', r: '\r', t: '\t' }[escape] ?? token));
-    const base64 = line.replace(/[a-z0-9+/_-]{8,}={0,2}/gi, token => {
-      const canonical = token.replace(/-/g, '+').replace(/_/g, '/').replace(/=+$/, '');
-      const bytes = Buffer.from(canonical, 'base64');
-      if (bytes.toString('base64').replace(/=+$/, '') !== canonical) return token;
-      try {
-        const decoded = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-        // R984: controls are separators, never a reason to suppress private substrings.
-        return decoded.replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu, ' ');
-      } catch { return token; }
-    });
+    const base64 = line.replace(/[a-z0-9+/_-]{8,}={0,2}/gi, token => decodeBase64Text(token) ?? token);
     return [percent, json, base64];
   };
   const normalized = normalizePrivacyLine(line);
@@ -280,9 +368,19 @@ export function scanText(content, options = {}) {
     }
   }
   for (const { view, sourceLines } of views.flatMap(raw => {
-    const lines = raw.split('\n').map(lineText => ({ lineText, views: privacyLineViews(lineText) }));
+    const rawLines = raw.split('\n');
+    const lines = rawLines.map(lineText => ({ lineText, views: privacyLineViews(lineText) }));
     const variants = lines.reduce((max, line) => Math.max(max, line.views.length), 0);
-    return [{ view: raw }, ...Array.from({ length: variants }, (_, variant) => normalizedView(lines, variant))];
+    const scans = [{ view: raw }, ...Array.from({ length: variants }, (_, variant) => normalizedView(lines, variant))];
+    // PR 7008: base64 wrapped across lines, decoded whole; lines still map to (and are exempted by) raw lines.
+    const unwrapped = unwrapBase64(raw);
+    if (unwrapped !== null) {
+      const unwrappedLines = unwrapped.split('\n').map((text, index) => ({ lineText: rawLines[index], views: privacyLineViews(text) }));
+      const unwrappedVariants = unwrappedLines.reduce((max, line) => Math.max(max, line.views.length), 0);
+      scans.push({ view: unwrapped, sourceLines: rawLines.map((lineText, index) => ({ line: index + 1, lineText })) },
+        ...Array.from({ length: unwrappedVariants }, (_, variant) => normalizedView(unwrappedLines, variant)));
+    }
+    return scans;
   })) {
     const viewCounts = new Map();
     for (const hit of scanPrivacyView(view, { ...options, sourceLines })) {

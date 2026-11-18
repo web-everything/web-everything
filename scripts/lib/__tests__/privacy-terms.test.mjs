@@ -855,3 +855,91 @@ describe('R971 standards producer', () => {
     }
   });
 });
+
+// PR 7008 round 4: a two-byte zlib header check matches ordinary text, and base64 was decoded one line at a time.
+describe('PR 7008 compression headers and wrapped base64', () => {
+  // Built at run time so this source holds no literal home path for the standards scan.
+  const HOME = ['', 'home', 'alice'].join('/');
+  const zlibHeader = text => (text.charCodeAt(0) & 15) === 8 && text.charCodeAt(0) >> 4 <= 7
+    && ((text.charCodeAt(0) << 8) + text.charCodeAt(1)) % 31 === 0;
+  const compressionFlagged = bytes => {
+    const onCompressionError = vi.fn();
+    decodePrivacyContent(bytes, { onCompressionError });
+    return onCompressionError.mock.calls.length > 0;
+  };
+  it.each(['x marks the spot\n', 'x = 1;\nexport default x;\n', 'x?y:z', 'x^2 + y^2', 'x} done', 'hC is a label\n',
+    'hb ordinary text', 'H, then a list', 'x — naïve café\n'])('treats ordinary text with a zlib-like header as text: %j', text => {
+    expect(zlibHeader(text)).toBe(true);
+    expect(compressionFlagged(Buffer.from(text))).toBe(false);
+    expect(scanText(text).some(hit => hit.pattern === 'uninspectable-compressed')).toBe(false);
+  });
+  it('treats latin1 text with a zlib-like header as text', () => {
+    const bytes = Buffer.from('x café crème\n', 'latin1');
+    expect(compressionFlagged(bytes)).toBe(false);
+  });
+  it('still scans private text after a zlib-like text header', () => {
+    expect(scanText(`x marks ${HOME}/projects\n`)).toContainEqual({ pattern: 'home-path', line: 1, match: HOME });
+  });
+  it('keeps failing closed on binary that carries a gzip or zlib header', () => {
+    for (const bytes of [Buffer.from([120, 156]), Buffer.from([120, 218, 0, 1, 2, 3]), Buffer.from([31, 139, 8, 0])]) {
+      expect(compressionFlagged(bytes)).toBe(true);
+    }
+  });
+  it('recovers the decodable prefix of a truncated or corrupt stream and still fails closed', () => {
+    const payload = `${HOME}/projects ` + 'padding '.repeat(64);
+    for (const compress of [deflateSync, gzipSync]) {
+      const whole = compress(payload);
+      const truncated = whole.subarray(0, whole.length - 12);
+      const corrupt = Buffer.from(whole);
+      corrupt[corrupt.length - 1] ^= 0xff;
+      for (const bytes of [truncated, corrupt]) {
+        expect(compressionFlagged(bytes)).toBe(true);
+        expect(scanText(bytes)).toContainEqual({ pattern: 'home-path', line: 1, match: HOME });
+      }
+    }
+  });
+  // The private text straddles a wrap: "/home/" ends one line and "alice" starts the next.
+  const wrapped = (width, separator = '\n', indent = '') => {
+    const encoded = Buffer.from('a'.repeat(51) + `${HOME}/projects and more text after it`).toString('base64');
+    const lines = [];
+    for (let at = 0; at < encoded.length; at += width) lines.push(indent + encoded.slice(at, at + width));
+    return lines.join(separator);
+  };
+  it.each([
+    ['76-column MIME', wrapped(76)], ['64-column PEM', wrapped(64)], ['70-column, not 4-aligned', wrapped(70)],
+    ['CRLF', wrapped(76, '\r\n')], ['indented YAML block', 'key: |\n' + wrapped(76, '\n', '    ')],
+    ['trailing spaces', wrapped(76, '  \n')],
+    ['PEM armour', '-----BEGIN PRIVATE DATA-----\n' + wrapped(76) + '\n-----END PRIVATE DATA-----\n'],
+    ['label lines on both sides', 'Summary\nPayload\n' + wrapped(70) + '\nTrailer\nDone'],
+  ])('decodes line-wrapped base64 as one value: %s', (_name, text) => {
+    expect(scanText(text)).toContainEqual(expect.objectContaining({ pattern: 'home-path', match: HOME }));
+  });
+  it.each([['\\n'], ['\\r\\n']])('decodes base64 wrapped with JSON %s escapes', escape => {
+    const text = `{"pem": "${wrapped(76, escape)}"}`;
+    expect(scanText(text)).toContainEqual({ pattern: 'home-path', line: 1, match: HOME });
+  });
+  it('reports a wrapped hit on the first line of the base64 run and honours an exact raw-line exemption', () => {
+    const text = 'intro\n' + wrapped(76);
+    const hits = scanText(text).filter(hit => hit.pattern === 'home-path');
+    expect(hits).toContainEqual({ pattern: 'home-path', line: 2, match: HOME });
+    const path = 'scripts/lib/__tests__/fixtures/wrapped.txt';
+    const allowlist = loadAllowlist(JSON.stringify(policy([exactEntry(path, 'home-path', HOME, text.split('\n')[1])])));
+    expect(scanText(text, { path, allowlist }).filter(hit => hit.pattern === 'home-path')).toEqual([]);
+  });
+  it('does not flag ordinary multi-line prose or wrapped base64 of ordinary text', () => {
+    const prose = 'Summary\nThese lines\nhold words\nonly\n';
+    expect(scanText(prose)).toEqual([]);
+    const plain = Buffer.from('ordinary text '.repeat(20)).toString('base64').match(/.{1,76}/g).join('\n');
+    expect(scanText(plain)).toEqual([]);
+  });
+  it('stays linear on long wrapped base64 blocks', () => {
+    const block = n => Buffer.from('x'.repeat(n)).toString('base64').match(/.{1,76}/g).join('\n');
+    const timeScan = text => { const started = performance.now(); scanText(text); return performance.now() - started; };
+    let ratio = Infinity;
+    for (let attempt = 0; attempt < 3 && ratio >= 3.2; attempt += 1) {
+      const base = timeScan(block(150000));
+      ratio = timeScan(block(300000)) / Math.max(base, 20);
+    }
+    expect(ratio).toBeLessThan(3.2);
+  });
+});
