@@ -318,6 +318,15 @@ describe('requiredCheckStates shared predicate regressions', () => {
   it.each([false, true])('cross-run completion times and partial check ids cannot hide failure (reverse=%s)', reverse => {
     const rows = [
       { name: 'test', run_id: 100, run_attempt: 2, id: 100, status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-28T02:00:00Z' },
+      { name: 'test', run_id: 200, status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T01:00:00Z' },
+    ];
+    expect(requiredCheckStates({ requiredChecks: ['test'], rollup: reverse ? rows.toReversed() : rows }))
+      .toEqual({ red: ['test'], pending: [], missing: [], green: [] });
+  });
+
+  it.each([false, true])('workflow-identity cross-run completion times and partial check ids cannot hide failure (reverse=%s)', reverse => {
+    const rows = [
+      { name: 'test', run_id: 100, run_attempt: 2, id: 100, status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-28T02:00:00Z' },
       { name: 'test', workflowName: 'security', run_id: 200, status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T01:00:00Z' },
     ];
     expect(requiredCheckStates({ requiredChecks: ['test'], rollup: reverse ? rows.toReversed() : rows }))
@@ -778,11 +787,18 @@ describe('R37 latest attempts within workflow partitions', () => {
       expect(verdictRecheck.gateOnlyRedStates({ rollup: rows, requiredChecks: ['test'] }).gateOnlyRed).toBe(false);
     }
   });
-  it.each([undefined, 'CI'])('accepts a newer successful attempt within workflow %s', workflowName => {
+  it.each(['CI'])('accepts a newer successful attempt within workflow %s', workflowName => {
     const failed = { name: 'test', workflowName, status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-28T01:00:00Z' };
     const passed = { ...failed, conclusion: 'SUCCESS', startedAt: '2026-10-28T02:00:00Z' };
     for (const rollup of [[failed, passed], [passed, failed]]) {
       expect(requiredCheckStates({ rollup, requiredChecks: ['test'] })).toEqual({ red: [], pending: [], missing: [], green: ['test'] });
     }
   });
+});
+
+it('workflow-less later success keeps the original failure red', () => {
+  const failed = { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-28T01:00:00Z' };
+  const passed = { ...failed, conclusion: 'SUCCESS', startedAt: '2026-10-28T02:00:00Z' };
+  for (const rollup of [[failed, passed], [passed, failed]]) expect(requiredCheckStates({ rollup, requiredChecks: ['test'] }))
+    .toEqual({ red: ['test'], pending: [], missing: [], green: [] });
 });

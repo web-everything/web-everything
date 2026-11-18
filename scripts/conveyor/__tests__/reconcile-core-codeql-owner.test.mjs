@@ -92,8 +92,8 @@ describe('codeql-gate lib', () => {
   });
   it('only the LATEST CodeQL run counts (a superseded failure does not hold)', () => {
     const roll = [
-      { __typename: 'CheckRun', name: 'CodeQL', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-08T01:00:00Z', completedAt: '2026-10-08T01:01:00Z' },
-      { __typename: 'CheckRun', name: 'CodeQL', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-08T02:00:00Z', completedAt: '2026-10-08T02:01:00Z' },
+      { __typename: 'CheckRun', name: 'CodeQL', workflowName: 'security', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-08T01:00:00Z', completedAt: '2026-10-08T01:01:00Z' },
+      { __typename: 'CheckRun', name: 'CodeQL', workflowName: 'security', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-08T02:00:00Z', completedAt: '2026-10-08T02:01:00Z' },
     ];
     expect(failedCodeQLCheck({ statusCheckRollup: roll })).toBeNull();
   });
@@ -166,8 +166,19 @@ describe('R37 CodeQL workflow partitions', () => {
     for (const order of [rows, rows.toReversed()]) expect(failedCodeQLCheck({ statusCheckRollup: order })?.conclusion).toBe('FAILURE');
   });
   it('allows a timestamped successful rerun only within the same workflow', () => {
-    const failed = { name: 'CodeQL', workflowName: 'security', conclusion: 'FAILURE', completedAt: '2026-10-28T01:00:00Z' };
-    const passed = { ...failed, conclusion: 'SUCCESS', completedAt: '2026-10-28T02:00:00Z' };
+    const failed = { name: 'CodeQL', workflowName: 'security', conclusion: 'FAILURE', startedAt: '2026-10-28T01:00:00Z' };
+    const passed = { ...failed, conclusion: 'SUCCESS', startedAt: '2026-10-28T02:00:00Z' };
     for (const rows of [[failed, passed], [passed, failed]]) expect(failedCodeQLCheck({ statusCheckRollup: rows })).toBeNull();
   });
+});
+
+it.each([undefined, 'security'])('CodeQL failure survives later legacy success (workflow=%s)', workflowName => {
+  const failed = { __typename: 'CheckRun', name: 'CodeQL', workflowName, status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-28T01:00:00Z' };
+  const passed = { context: 'CodeQL', state: 'SUCCESS', workflowName, startedAt: '2026-10-28T02:00:00Z' };
+  for (const rows of [[failed, passed], [passed, failed]]) expect(failedCodeQLCheck({ statusCheckRollup: rows })).toBe(failed);
+});
+it('CodeQL failure survives newer REST success without workflow identity', () => {
+  const failed = { name: 'CodeQL', conclusion: 'FAILURE', startedAt: '2026-10-28T01:00:00Z', id: 1 };
+  const passed = { ...failed, conclusion: 'SUCCESS', startedAt: '2026-10-28T02:00:00Z', id: 99 };
+  for (const rows of [[failed, passed], [passed, failed]]) expect(failedCodeQLCheck({ statusCheckRollup: rows })).toBe(failed);
 });
