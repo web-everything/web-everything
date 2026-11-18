@@ -12,7 +12,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runGhCliPassthrough, runGhSync, acquireGhSlotSync, ghThrottleLogPath, GH_OUTER_INV_ENV, GH_OUTER_TIMEOUT_ENV, GH_OUTER_KILL_SIGNAL_ENV } from '../gh-throttle.mjs';
+import { runGhCliPassthrough, runGhSync, acquireGhSlotSync, ghThrottleLogPath, GH_OUTER_INV_ENV, GH_OUTER_BUCKET_ENV, GH_OUTER_TIMEOUT_ENV, GH_OUTER_KILL_SIGNAL_ENV } from '../gh-throttle.mjs';
 
 const made = [];
 const tmp = () => { const d = mkdtempSync(join(tmpdir(), 'gh-nested-')); made.push(d); return d; };
@@ -47,7 +47,7 @@ describe('nested gh call (shim under a runGhSync that already holds a slot)', ()
     const spawn = vi.fn(ok);
     const warn = vi.fn();
     const r = runGhCliPassthrough(['pr', 'list'], {
-      throttle: { lockRoot, cap: 2, env: { ...BASE_ENV, [GH_OUTER_INV_ENV]: 'outer-inv-1' }, now: tickingClock(), sleep, acquireTimeoutMs: 120_000, warn },
+      throttle: { lockRoot, cap: 2, env: { ...BASE_ENV, [GH_OUTER_INV_ENV]: 'outer-inv-1', [GH_OUTER_BUCKET_ENV]: 'shared' }, now: tickingClock(), sleep, acquireTimeoutMs: 120_000, warn },
       spawn,
     });
     expect(r.status).toBe(0);
@@ -55,6 +55,21 @@ describe('nested gh call (shim under a runGhSync that already holds a slot)', ()
     expect(sleep).not.toHaveBeenCalled(); // old code polled the full pool until the 2-minute timeout
     expect(logLines(lockRoot).some((e) => e.outcome === 'slot_timeout')).toBe(false);
     expect(logLines(lockRoot).find((e) => e.outcome === 'call')?.outer).toBe('outer-inv-1');
+  });
+  // A parent on pre-PR code publishes the outer id but no bucket label; its one pool IS the shared pool directory.
+  it('a legacy parent (outer id, no bucket label) still rides its shared slot on a FULL pool', () => {
+    const lockRoot = tmp();
+    fillPool(lockRoot, 2);
+    const sleep = vi.fn();
+    const spawn = vi.fn(ok);
+    const r = runGhCliPassthrough(['pr', 'list'], {
+      throttle: { lockRoot, cap: 2, env: { ...BASE_ENV, [GH_OUTER_INV_ENV]: 'outer-inv-legacy' }, now: tickingClock(), sleep, acquireTimeoutMs: 120_000, warn: vi.fn() },
+      spawn,
+    });
+    expect(r.status).toBe(0);
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+    expect(logLines(lockRoot).some((e) => e.outcome === 'slot_timeout')).toBe(false);
   });
 });
 

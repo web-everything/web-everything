@@ -986,6 +986,14 @@ list, or a wrapped record was unreadable) as unknown, not gone: cover it with a 
 
 ## GitHub priority admission
 
+R1009 bucket regressions must use different parent and child checkout origins: `runGhSync`
+probes the child execution cwd; passthrough probes its process cwd. Preserve the shim caller
+tests against the real `/bin/ps` and keep mocked process-table coverage in a separate test.
+Shared fallback admission is bounded by `min(cap, sharedFallbackCap)` (default 6); test
+policy provenance, invalid bounds, a lower generic env cap, and independent installation pools.
+Reserved shared reads must respect each cap independently; only known installation pools
+retain their extra reserved slot. Exercise reserved-slot timing and release against an installation.
+
 The throttle returns a JSON `deferred-low-budget` result without invoking GitHub when a fresh,
 identity-scoped GraphQL observation crosses the caller's reservation threshold (background 25%,
 normal 10%). CLI status is zero; stderr and the spend report distinguish a skipped pass from success.

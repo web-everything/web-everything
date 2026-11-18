@@ -662,6 +662,32 @@ describe('renderGhShimScript — sets WE_GH_THROTTLE_CALLER on the throttle CLI 
       expect(callerOf(r)).toBe('sh');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, SPAWN_TIMEOUT_MS);
+
+  it('passes a mocked process-table script to the throttle CLI', () => {
+    const { dir, shimPath, env } = setup();
+    try {
+      // Only this test mocks the process table; the live cases above retain the real /bin/ps probe.
+      const preload = join(dir, 'parent-command.cjs');
+      writeFileSync(preload, `const cp = require('node:child_process');
+const original = cp.spawnSync;
+cp.spawnSync = function(file, args, ...rest) {
+  if (file === '/bin/ps' && args?.[0] === '-o' && args[1] === 'command=' && args[2] === '-p' && args[3] === String(process.ppid)) {
+    return { status: 0, stdout: process.env.WE_TEST_PARENT_COMMAND + '\\n', stderr: '' };
+  }
+  return original.call(this, file, args, ...rest);
+};\n`);
+      const r = spawnSync(shimPath, ['pr', 'view', '1'], {
+        encoding: 'utf8',
+        env: { ...env,
+          NODE_OPTIONS: [env.NODE_OPTIONS, '--require=' + JSON.stringify(preload)].filter(Boolean).join(' '),
+          WE_TEST_PARENT_COMMAND: 'node /fixture/scripts/ci-heal-mark.mjs',
+          CLAUDE_CODE_SESSION_ID: 'must-not-win',
+        },
+      });
+      expect(r.status).toBe(0);
+      expect(callerOf(r)).toBe('ci-heal-mark.mjs');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, SPAWN_TIMEOUT_MS);
 });
 
 describe('ensureGhShim — the one real write, best-effort, never throws', () => {
@@ -987,7 +1013,7 @@ process.exitCode = ${mode === 'failure' ? 7 : 0};
         expect(rows).toHaveLength(1);
         expect(rows[0]).toMatchObject({
           transport: 'shim-fallback', fallbackReason: mode === 'import' ? 'missing-import' : 'missing-entry',
-          caller: 'disposable-probe', id: 'app', installationId: '12345', authSource: 'app-cache', resource: 'graphql',
+          caller: 'disposable-probe', id: 'app-installation-12345', installationId: '12345', authSource: 'app-cache', resource: 'graphql',
           cost: mode === 'unknown' ? null : 3, costSource: mode === 'unknown' ? 'unknown' : 'response',
         });
         if (mode === 'nested') {
