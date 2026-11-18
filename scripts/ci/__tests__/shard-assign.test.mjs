@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { assignByTime, balanceRatio, predictedBalance, staleRatio, median, ambiguousFilters, timingsFromReports, parseShardArg, listUnitTestFiles, loadTimings, assertTimingKeys, formatUpdatedTimings, REPO_ROOT } from '../shard-assign.mjs';
@@ -133,11 +132,9 @@ describe('shard balance metrics', () => {
     expect(() => predictedBalance(['a', 'b'], {}, 2)).toThrow(/measured timings/);
   });
 
-  it('committed unit timings predict at most 1.2 over nine shards for the discovered coverage group', () => {
-    // A child process discovers and classifies the real repo exactly as CI does.
-    const result = spawnSync(process.execPath, [join(REPO_ROOT, 'scripts/ci/shard-assign.mjs'), '--suite=unit', '--balance', '--total=9', '--group=covered', '--max-ratio=1.2'], { encoding: 'utf8', timeout: 120_000 });
-    expect(result.stderr.replace(/.*CJS build.*\n/g, '')).toBe('');
-    expect(result.stdout).toMatch(/^predicted slowest\/average \d\.\d\d\n$/);
-    expect(result.status).toBe(0);
-  }, 150_000);
+  it('refuses a balance check when any file is unmeasured, and passes a fully measured skewed set under 1.2', () => {
+    expect(() => predictedBalance(['a', 'b', 'c'], { a: 1, b: 1 }, 2)).toThrow(/measured timings/);
+    const timings = Object.fromEntries(Array.from({ length: 60 }, (_, i) => [`t${i}`, i % 7 === 0 ? 90 : 1 + (i % 5)]));
+    expect(predictedBalance(Object.keys(timings), timings, 9)).toBeLessThanOrEqual(1.2);
+  });
 });

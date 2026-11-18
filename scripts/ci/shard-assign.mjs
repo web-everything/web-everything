@@ -93,8 +93,8 @@ export function predictedBalance(files, timings, total) {
   // Without measurements the median fallback makes every shard look equal; refuse that false pass.
   const measured = files.filter((f) => Number.isFinite(timings[f]) && timings[f] >= 0).length;
   if (files.some((f) => Number.isFinite(timings[f]) && timings[f] < 0)) throw new Error('shard-assign: negative timing in the stored map; regenerate timings');
-  if (!files.length || measured / files.length < 0.8) {
-    throw new Error(`shard-assign: only ${measured}/${files.length} files have measured timings (need 80%; unmeasured files cost the median); refresh timings before trusting a balance check`);
+  if (!files.length || measured < files.length) {
+    throw new Error(`shard-assign: only ${measured}/${files.length} files have measured timings (every file needs one); refresh timings before trusting a balance check`);
   }
   return balanceRatio(assignByTime(files, timings, total), timings);
 }
