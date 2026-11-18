@@ -312,19 +312,6 @@ export function resolveOverlayMainRedExpiryHours(env = process.env, { settingsPa
       && n >= 0 && n <= Number.MAX_SAFE_INTEGER / 3_600_000 } });
   return { value: r.value.mainRedExpiryHours, source: r.sources.mainRedExpiryHours };
 }
-/** Zero disables escalation from an established-overlay hold to a parked registration. */
-export function resolveEstablishedOverlayParkMinutes(env = process.env, { settingsPath = SETTINGS } = {}) {
-  let tool;
-  try { tool = JSON.parse(fs.readFileSync(settingsPath, 'utf8')).overlay; } catch { /* standard */ }
-  const raw = env.WE_DAEMON_ESTABLISHED_OVERLAY_PARK_MINUTES;
-  const r = cascadePolicy('overlay', tool, { env,
-    platform: platformPreference('overlay', { env }) ?? {},
-    standard: { establishedParkMinutes: 30 },
-    envValues: { establishedParkMinutes: typeof raw === 'string' && raw.trim() ? Number(raw) : undefined },
-    valid: { establishedParkMinutes: n => typeof n === 'number' && Number.isFinite(n)
-      && n >= 0 && n <= Number.MAX_SAFE_INTEGER / 60_000 } });
-  return { value: r.value.establishedParkMinutes, source: r.sources.establishedParkMinutes };
-}
 function mainRedKnown(state, ref, main, tip, env, now = () => new Date().toISOString()) {
   if (state.mainRedMain[ref] !== main || state.mainRedTip[ref] !== tip
     || !Object.hasOwn(state.mainRedAt, ref)) return false;

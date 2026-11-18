@@ -30,7 +30,7 @@ import { planRebuild, pinnedStatus } from './plan.mjs';
 import { makeAuditedTipGate, tipInMain } from './audited-tip.mjs';
 import { carriedBeyondMain } from '../../operations/prototype-retire.mjs';
 import * as realAutoRebase from './auto-rebase.mjs';
-import { resolveEstablishedOverlayParkMinutes } from './overlay-main-sync.mjs';
+import { resolveEstablishedOverlayParkMinutes } from './established-park-setting.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
 import { repairCloneRefs, holdsCloneWriteLock, probeBrokenRefs, diagnoseLane } from '../lane-repair.mjs';
 import {
