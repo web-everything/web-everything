@@ -53,13 +53,46 @@ describe('Claude stream diagnostics', () => {
     }
   });
 
-  it('rejects typeless verdicts mixed with stream events or stray stdout', async () => {
-    const legacy = { structured_output: { verdict: 'accept' } };
-    for (const stdout of [jsonl([{ type: 'system' }, legacy]), `warning\n${JSON.stringify(legacy)}\n`]) {
+  it('rejects typeless whole documents and streams without a result event', async () => {
+    const typeless = { structured_output: { verdict: 'accept' } };
+    for (const stdout of [JSON.stringify(typeless), JSON.stringify(typeless, null, 2),
+      jsonl([{ type: 'system' }, typeless]), `warning\n${JSON.stringify(typeless)}\n`,
+      jsonl([{ type: 'system' }, tool('git diff')]),
+      JSON.stringify({ type: 'assistant', ...typeless }, null, 2)]) {
       await expect(judgeSpawn({ ...request, ...fake([], { chunks: [stdout] }), log: () => {} }))
         .rejects.toBeInstanceOf(JudgeUnparseableError);
     }
-    expect(parseJudgeOutcome(JSON.stringify(legacy, null, 2)).value).toEqual(legacy.structured_output);
+  });
+
+  it('preserves legacy JSON result documents, including pretty-printed output', () => {
+    for (const spacing of [undefined, 2]) {
+      expect(parseJudgeOutcome(JSON.stringify(result, null, spacing)).value).toEqual(result.structured_output);
+    }
+  });
+
+  it.each([false, true])('redacts credential tool names and replaces invalid or oversized names (timeout=%s)', async hang => {
+    const names = ['ghp_abcdefghijklmnopqrstuvwxyz1234567890', 'sk-abcdefghijklmnop',
+      'Bash invalid', 'x'.repeat(41), '', null];
+    const events = names.map(name => ({ type: 'assistant', message: {
+      content: [{ type: 'tool_use', name, input: { command: 'git status' } }],
+    } }));
+    const log = vi.fn();
+    const error = await judgeSpawn({ ...request, ...fake(events, { hang }), timeoutMs: 10, log }).catch(e => e);
+    expect(error).toBeInstanceOf(hang ? JudgeTimeoutError : JudgeUnparseableError);
+    expect(error.lastEvents).toEqual(names.map(() => ({ type: 'assistant', tools: ['tool: git status'] })));
+    expect(error.lastToolCall).toBe('tool: git status');
+    const diagnostics = [error.message, JSON.stringify(error.telemetry), JSON.stringify(error.failedAttempts),
+      log.mock.calls.flat().join(' ')].join(' ');
+    for (const name of names.filter(Boolean)) expect(diagnostics).not.toContain(name);
+  });
+
+  it('preserves tool names within the allowed shape and 40-character bound', async () => {
+    const names = ['mcp__tool:read-file.v1', 'x'.repeat(40)];
+    const events = names.map(name => ({ type: 'assistant', message: {
+      content: [{ type: 'tool_use', name, input: {} }],
+    } }));
+    const error = await judgeSpawn({ ...request, ...fake(events), log: () => {} }).catch(e => e);
+    expect(error.lastEvents).toEqual(names.map(name => ({ type: 'assistant', tools: [`${name}: [input redacted]`] })));
   });
 
   it.each([false, true])('never exposes truncated tool-use stdout in diagnostics (timeout=%s)', async (hang) => {
@@ -126,7 +159,7 @@ describe('Claude stream diagnostics', () => {
       lastEvents: Array.from({ length: 80 }, () => ({ type: 'y'.repeat(1000), tools: ['z'.repeat(1000)], raw: 'secret' })) } });
     expect(oversized.lastEvents).toHaveLength(50);
     expect(oversized.lastToolCall).toHaveLength(160);
-    expect(oversized.lastEvents[0]).toEqual({ type: 'y'.repeat(40), tools: ['z'.repeat(160)] });
+    expect(oversized.lastEvents[0]).toEqual({ type: 'other', tools: ['z'.repeat(160)] });
   });
 
   it('falls back to child.kill when the process group cannot be signalled', async () => {

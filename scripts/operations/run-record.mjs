@@ -137,6 +137,8 @@ export function newJobRunRecord({ id, kind, input = {}, codeMode, maxAttempts, c
  */
 const TELEMETRY_NUMBERS = Object.freeze(['costUsd', 'durationMs', 'wallMs', 'numTurns', 'loadedContextTokens', 'exitCode', 'attempts']);
 const TELEMETRY_STRINGS = Object.freeze(['sessionId', 'stopReason', 'lens', 'model', 'effort', 'transcriptFile', 'requestedModel', 'servedModel', 'servedBackend', 'modelEvidence', 'quotaState', 'quotaResetsAt', 'fallbackDecision', 'signal', 'stderrTail', 'failure', 'failureKind', 'failureText', 'lastToolCall']);
+const STREAM_EVENT_TYPES = new Set(['system', 'assistant', 'user', 'result', 'stream_event', 'rate_limit_event',
+  'tool_use', 'tool_result', 'text', 'other']);
 /**
  * Held item 223 — WHY A SEAT FAILED, not only what it cost. `exitCode`, `signal`, `attempts`, `failure` and a
  * `stderrTail` come from `we:scripts/lib/judge-spawn.mjs#JudgeUnparseableError`'s telemetry. Before they were on this
@@ -170,14 +172,14 @@ const TELEMETRY_FLAGS = Object.freeze(['timedOut']);
  */
 export function normalizeJudgeTelemetry({ step = '', stepIndex = null, telemetry = {} } = {}) {
   const src = isPlainObject(telemetry) ? telemetry : {};
-  const row = { step: String(step), stepIndex: Number.isInteger(stepIndex) ? stepIndex : null };
+  const row = { step: redactSpawnText(String(step)), stepIndex: Number.isInteger(stepIndex) ? stepIndex : null };
   for (const k of TELEMETRY_NUMBERS) {
     if (typeof src[k] === 'number' && Number.isFinite(src[k])) row[k] = src[k];
   }
   for (const k of TELEMETRY_STRINGS) {
     if (typeof src[k] === 'string' && src[k]) {
       const max = TELEMETRY_STRING_MAX[k];
-      const text = k === 'lastToolCall' ? redactSpawnText(src[k]) : src[k];
+      const text = redactSpawnText(src[k]);
       row[k] = max ? (k === 'stderrTail' ? text.slice(-max) : text.slice(0, max)) : text;
     }
   }
@@ -186,7 +188,7 @@ export function normalizeJudgeTelemetry({ step = '', stepIndex = null, telemetry
   }
   if (Array.isArray(src.lastEvents)) {
     row.lastEvents = Object.freeze(src.lastEvents.slice(-50).filter(isPlainObject).map(event => Object.freeze({
-      type: typeof event.type === 'string' ? event.type.slice(0, 40) : 'unrecognized',
+      type: STREAM_EVENT_TYPES.has(event.type) ? redactSpawnText(event.type) : 'other',
       ...(event.truncated === true ? { truncated: true } : {}),
       ...(Array.isArray(event.tools) ? { tools: Object.freeze(event.tools.slice(-8)
         .filter(t => typeof t === 'string').map(t => redactSpawnText(t).slice(0, 160))) } : {}),

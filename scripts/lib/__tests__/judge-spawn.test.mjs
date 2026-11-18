@@ -351,7 +351,7 @@ describe('sessionSeed — the ONE injective seed encoding, replacing the ambiguo
 
 describe('parseJudgeOutcome — a validated object, or a throw carrying the SPAWN\'S OWN error', () => {
   const ok = {
-    is_error: false,
+    type: 'result', is_error: false,
     stop_reason: 'tool_use',
     session_id: 'aaaaaaaa-bbbb-8ccc-9ddd-eeeeeeeeeeee',
     total_cost_usd: 0.014,
@@ -380,18 +380,18 @@ describe('parseJudgeOutcome — a validated object, or a throw carrying the SPAW
   });
 
   it('rethrows the CLI\'s own words VERBATIM — this is how the `--bare` trap surfaces', () => {
-    const bare = { is_error: true, result: 'Not logged in · Please run /login' };
+    const bare = { type: 'result', is_error: true, result: 'Not logged in · Please run /login' };
     expect(() => parseJudgeOutcome(JSON.stringify(bare))).toThrow('Not logged in · Please run /login');
   });
 
   it('when `result` is empty, throws the raw parsed object and stderr instead of a useless placeholder (#xn85i4a)', () => {
-    const emptyResult = { is_error: true, result: '', stop_reason: 'end_turn', session_id: 'zzzz' };
+    const emptyResult = { type: 'result', is_error: true, result: '', stop_reason: 'end_turn', session_id: 'zzzz' };
     expect(() => parseJudgeOutcome(JSON.stringify(emptyResult), 'exit code 1'))
       .toThrow(/no result text[\s\S]*end_turn[\s\S]*zzzz[\s\S]*exit code 1/);
   });
 
   it('throws when the enforced shape did not land, naming the stop reason it saw instead', () => {
-    const noShape = { is_error: false, stop_reason: 'end_turn', result: 'here are my thoughts' };
+    const noShape = { type: 'result', is_error: false, stop_reason: 'end_turn', result: 'here are my thoughts' };
     expect(() => parseJudgeOutcome(JSON.stringify(noShape))).toThrow(/structured_output/);
     expect(() => parseJudgeOutcome(JSON.stringify(noShape))).toThrow(/end_turn/);
   });
@@ -440,7 +440,7 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
   }
 
   const okJson = JSON.stringify({
-    is_error: false,
+    type: 'result', is_error: false,
     stop_reason: 'tool_use',
     session_id: 'aaaaaaaa-bbbb-8ccc-9ddd-eeeeeeeeeeee',
     total_cost_usd: 0.02,
@@ -564,7 +564,7 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
   });
 
   it('throws the juror\'s OWN failure text rather than a paraphrase', async () => {
-    const { fn } = fakeSpawn(JSON.stringify({ is_error: true, result: 'Not logged in · Please run /login' }), { code: 1 });
+    const { fn } = fakeSpawn(JSON.stringify({ type: 'result', is_error: true, result: 'Not logged in · Please run /login' }), { code: 1 });
     await expect(judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, spawnFn: fn }))
       .rejects.toThrow('Not logged in · Please run /login');
   });
@@ -576,7 +576,7 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
     "You've hit your weekly limit · resets tomorrow\nmore diagnostics",
   ])
     ('tags quota failure %s without changing its message', async result => {
-      const { fn } = fakeSpawn(JSON.stringify({ is_error: true, result }), { code: 1 });
+      const { fn } = fakeSpawn(JSON.stringify({ type: 'result', is_error: true, result }), { code: 1 });
       const before = Date.now();
       const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, spawnFn: fn })
         .catch(e => e);
@@ -625,7 +625,7 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
     "You've hit your Weekly limit · resets tomorrow",
     "You've hit your weekly limit · Resets tomorrow",
     JSON.stringify("You've hit your weekly limit · resets tomorrow"),
-    JSON.stringify({ is_error: true, result: "You've hit your weekly limit · resets tomorrow" }),
+    JSON.stringify({ type: 'result', is_error: true, result: "You've hit your weekly limit · resets tomorrow" }),
     'HTTP 429 Too Many Requests', '429 Too Many Requests',
     '429 rate_limit_error Rate limit exceeded', 'API Error: 429 rate_limit_error',
     '429 {"type":"error","error":{"type":"rate_limit_error","message":"Rate limit exceeded"}}',
@@ -656,7 +656,7 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
     'RESOURCE_EXHAUSTED: Out of memory', 'TypeError: rate limit is not a function',
     'build log mentions HTTP 429 in a fixture', 'disk quota exceeded',
   ])('leaves non-quota failure %j untagged and countable', async result => {
-    const { fn } = fakeSpawn(JSON.stringify({ is_error: true, result }), { code: 1 });
+    const { fn } = fakeSpawn(JSON.stringify({ type: 'result', is_error: true, result }), { code: 1 });
     const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, spawnFn: fn })
       .catch(e => e);
     expect(error).toBeInstanceOf(Error);
@@ -711,7 +711,7 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
   });
 
   it.each([false, undefined])('requires is_error, even with matching result (is_error: %s)', async is_error => {
-    const { fn } = fakeSpawn(JSON.stringify({ is_error,
+    const { fn } = fakeSpawn(JSON.stringify({ type: 'result', is_error,
       result: "You've hit your weekly limit · resets tomorrow" }), { code: 1 });
     const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE,
       sessionId: SID, spawnFn: fn, retries: 0 }).catch(e => e);
@@ -789,7 +789,7 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
       };
     };
     const ANSWER = {
-      is_error: false,
+      type: 'result', is_error: false,
       stop_reason: 'tool_use',
       session_id: 'aaaaaaaa-bbbb-8ccc-9ddd-eeeeeeeeeeee',
       total_cost_usd: 1.42,
@@ -1275,9 +1275,9 @@ describe('#3187 (a) — end to end, over a fake CLI that ENFORCES the ceiling th
       seen.ceiling = ceiling;
       seen.killed = ceiling !== null && spendUsd > ceiling;
       const stdout = JSON.stringify(seen.killed
-        ? { is_error: true, stop_reason: 'tool_use', result: '', total_cost_usd: spendUsd, session_id: 'kkkk' }
+        ? { type: 'result', is_error: true, stop_reason: 'tool_use', result: '', total_cost_usd: spendUsd, session_id: 'kkkk' }
         : {
-          is_error: false,
+          type: 'result', is_error: false,
           stop_reason: 'tool_use',
           session_id: 'aaaaaaaa-bbbb-8ccc-9ddd-eeeeeeeeeeee',
           total_cost_usd: spendUsd,
@@ -1335,7 +1335,7 @@ describe('#3187 (a) — end to end, over a fake CLI that ENFORCES the ceiling th
 describe('#3187 (b) — a budget-terminated spawn REPORTS THE CEILING, not a bare `tool_use` stop', () => {
   /** The kill shape, as the CLI emits it: an error whose stop reason says nothing about money. */
   const killed = (extra = {}) => JSON.stringify({
-    is_error: true,
+    type: 'result', is_error: true,
     stop_reason: 'tool_use',
     total_cost_usd: 0.596,
     session_id: 'kkkkkkkk-bbbb-8ccc-9ddd-eeeeeeeeeeee',
@@ -1386,7 +1386,7 @@ describe('#3187 (b) — a budget-terminated spawn REPORTS THE CEILING, not a bar
 
   it('does NOT fire on a CONFORMING run, which also stops for `tool_use` (the forced tool call)', () => {
     const conforming = JSON.stringify({
-      is_error: false,
+      type: 'result', is_error: false,
       stop_reason: 'tool_use',
       total_cost_usd: 0.9042,
       session_id: 'aaaa',
@@ -1398,11 +1398,11 @@ describe('#3187 (b) — a budget-terminated spawn REPORTS THE CEILING, not a bar
   });
 
   it('does NOT fire on an is_error with a DIFFERENT stop reason — those keep their existing messages', () => {
-    const bare = JSON.stringify({ is_error: true, result: 'Not logged in · Please run /login' });
+    const bare = JSON.stringify({ type: 'result', is_error: true, result: 'Not logged in · Please run /login' });
     expect(() => parseJudgeOutcome(bare, '', 0.5)).toThrow('Not logged in · Please run /login');
     expect(() => parseJudgeOutcome(bare, '', 0.5)).not.toThrow(JudgeBudgetError);
 
-    const emptyEndTurn = JSON.stringify({ is_error: true, result: '', stop_reason: 'end_turn', session_id: 'zzzz' });
+    const emptyEndTurn = JSON.stringify({ type: 'result', is_error: true, result: '', stop_reason: 'end_turn', session_id: 'zzzz' });
     expect(() => parseJudgeOutcome(emptyEndTurn, 'exit code 1', 0.5)).toThrow(/no result text/);
     expect(() => parseJudgeOutcome(emptyEndTurn, 'exit code 1', 0.5)).not.toThrow(JudgeBudgetError);
   });
@@ -1448,7 +1448,7 @@ function fakeSpawnAtTopLevel(stdout, { code = 0, stderr = '' } = {}) {
  */
 describe('judgeSpawn — an unparseable stdout is retried once with a fresh session id (held item 223)', () => {
   const ANSWER_JSON = JSON.stringify({
-    is_error: false, stop_reason: 'tool_use', session_id: 'aaaaaaaa-bbbb-8ccc-9ddd-eeeeeeeeeeee', total_cost_usd: 0.3,
+    type: 'result', is_error: false, stop_reason: 'tool_use', session_id: 'aaaaaaaa-bbbb-8ccc-9ddd-eeeeeeeeeeee', total_cost_usd: 0.3,
     duration_ms: 40_000, num_turns: 3, usage: { input_tokens: 4 }, structured_output: { verdict: 'accept', findings: [] },
   });
 
@@ -1564,7 +1564,7 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
   });
 
   it('does NOT retry a juror that answered with its own error text (a real failure, not a lost output)', async () => {
-    const { fn, calls } = scriptedSpawn([{ stdout: JSON.stringify({ is_error: true, result: 'Not logged in · Please run /login' }), code: 1 }]);
+    const { fn, calls } = scriptedSpawn([{ stdout: JSON.stringify({ type: 'result', is_error: true, result: 'Not logged in · Please run /login' }), code: 1 }]);
     await expect(judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, retries: 1, log: () => {}, spawnFn: fn }))
       .rejects.toThrow('Not logged in');
     expect(calls).toHaveLength(1);

@@ -38,6 +38,25 @@ describe('validateRunRecord — permanent guard refusal evidence', () => {
 });
 
 describe('normalizeJudgeTelemetry — a failed seat keeps its spawn evidence', () => {
+  it('allowlists event types and redacts every persisted string field before bounding', () => {
+    const secret = 'ghp_abcdefghijklmnopqrstuvwxyz1234567890';
+    const known = ['system', 'assistant', 'user', 'result', 'stream_event', 'rate_limit_event',
+      'tool_use', 'tool_result', 'text', 'other'];
+    const unknown = [secret, 'unknown', 'x'.repeat(1000), null, 42];
+    const fields = ['sessionId', 'stopReason', 'lens', 'model', 'effort', 'transcriptFile', 'requestedModel',
+      'servedModel', 'servedBackend', 'modelEvidence', 'quotaState', 'quotaResetsAt', 'fallbackDecision',
+      'signal', 'stderrTail', 'failure', 'failureKind', 'failureText', 'lastToolCall'];
+    const row = normalizeJudgeTelemetry({ step: secret, telemetry: {
+      ...Object.fromEntries(fields.map(key => [key, secret])),
+      lastEvents: [...known, ...unknown].map(type => ({ type, tools: [secret], text: secret })),
+    } });
+    expect(row.step).toBe('<redacted-token>');
+    for (const key of fields) expect(row[key]).toBe('<redacted-token>');
+    expect(row.lastEvents).toEqual([...known, ...unknown.map(() => 'other')]
+      .map(type => ({ type, tools: ['<redacted-token>'] })));
+    expect(JSON.stringify(row)).not.toContain('ghp_');
+  });
+
   it.each(['', `${'x'.repeat(140)} `])('redacts tool summaries before truncation (prefix %j)', prefix => {
     const secret = 'ghp_abcdefghijklmnopqrstuvwxyz1234567890';
     const summary = `${prefix}Bash: ${secret}`;

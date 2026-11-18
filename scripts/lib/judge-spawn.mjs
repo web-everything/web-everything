@@ -89,6 +89,7 @@ import { markWorkerEnv } from '../operations/session-role.mjs';
 // like any other worker, so it gets the same treatment as every other spawn site.
 import { sanitizeSpawnEnv } from './gh-app-shim.mjs';
 import { quotaHoldRow } from './provider-quota-hold.mjs';
+import { redactSpawnText } from './describe-spawn-failure.mjs';
 
 /**
  * Are these two paths the SAME DIRECTORY? By inode + device, never by comparing the strings.
@@ -249,7 +250,8 @@ const SAFE_COMMAND_WORDS = new Set('git status diff log show rev-parse node npm 
 
 // Keep command structure, never arbitrary arguments, paths, output, or credentials.
 function toolSummary(block) {
-  const name = typeof block.name === 'string' ? block.name.replace(/[^\w:.-]/g, '').slice(0, 60) : '[unknown tool]';
+  const redactedName = redactSpawnText(typeof block.name === 'string' ? block.name : '');
+  const name = /^[A-Za-z0-9_:.-]{1,40}$/.test(redactedName) ? redactedName : 'tool';
   const command = block.input?.command;
   const input = typeof command === 'string'
     ? command.split(/\s+/).slice(0, 12).map(w => SAFE_COMMAND_WORDS.has(w) ? w : '[redacted]').join(' ').slice(0, 120)
@@ -796,7 +798,7 @@ export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
   let parsed;
   try {
     parsed = JSON.parse(String(stdout));
-    if (parsed?.type && parsed.type !== 'result') throw new Error('missing result event');
+    if (parsed?.type !== 'result') throw new Error('missing result event');
   } catch {
     parsed = undefined;
     for (const line of String(stdout).split(/\r?\n/).reverse()) {
