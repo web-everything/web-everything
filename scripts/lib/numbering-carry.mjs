@@ -46,7 +46,7 @@ export const MAX_NUMBERING_FILES = 256;
 export const MAX_NUMBERING_BLOB_BYTES = 1024 * 1024;
 export const MAX_NUMBERING_TOTAL_BYTES = 8 * 1024 * 1024;
 const MAX_GIT_OUTPUT_BYTES = 8 * 1024 * 1024;
-const GIT_TIMEOUT_MS = 5000;
+export const GIT_TIMEOUT_MS = 5000;
 const canonicalNumber = (number) => number.replace(/^0+(?=\d)/, '');
 
 /** PURE: parse exact, unique hash→number pairs; malformed subjects and duplicate drops return null. */
@@ -255,6 +255,9 @@ function readExistingNumbers(git, ref) {
   return numbers;
 }
 
+/** Fatal decoding preserves a BOM and refuses lossy Git text evidence. */
+export const decodeNumberingGitText = bytes => new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+
 /** Internal test seam for bounded local Git reads; the public proof never accepts a runner. */
 export function numberingGitRunner({ cwd, run = execFileSync } = {}) {
   let readFailed = false;
@@ -262,11 +265,13 @@ export function numberingGitRunner({ cwd, run = execFileSync } = {}) {
     GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_GRAFT_FILE: '/nonexistent',
     GIT_TERMINAL_PROMPT: '0' };
   const pins = ['-c', 'protocol.allow=never', '-c', 'extensions.partialClone=', '-c', 'remote.origin.promisor=false'];
-  const gitBytes = (args, maxBuffer = args[0] === 'cat-file' && args[1] === 'blob' ? MAX_NUMBERING_BLOB_BYTES : MAX_GIT_OUTPUT_BYTES) => {
+  const read = (args, options) => {
     try {
+      const { maxBuffer, timeout } = options ?? {};
+      if (!Number.isSafeInteger(maxBuffer) || maxBuffer <= 0 || !Number.isSafeInteger(timeout) || timeout <= 0) throw Error('explicit Git read bounds required');
       const output = run('git', [...pins, ...args], {
         env,
-        encoding: null, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer, timeout: GIT_TIMEOUT_MS,
+        encoding: null, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer, timeout,
         ...(cwd === undefined ? {} : { cwd }),
       }) ?? Buffer.alloc(0);
       if (!Buffer.isBuffer(output)) throw Error('git reader must return raw bytes');
@@ -278,7 +283,24 @@ export function numberingGitRunner({ cwd, run = execFileSync } = {}) {
       throw error;
     }
   };
-  return { gitBytes, pins, get readFailed() { return readFailed; } };
+  let initialized = false;
+  const gitBytes = (args, options) => {
+    if (!initialized) {
+      // Discover every promisor before any object read. Config itself cannot lazy-fetch.
+      let promisors = '';
+      try { promisors = decodeNumberingGitText(read(['config', '--get-regexp', '^remote\\..*\\.promisor'],
+        { maxBuffer: MAX_GIT_OUTPUT_BYTES, timeout: GIT_TIMEOUT_MS })); }
+      catch (error) { if (error?.status !== 1) { readFailed = true; throw error; } }
+      for (const line of promisors.split('\n').filter(Boolean)) {
+        const key = /^(remote\..*\.promisor)\s/.exec(line)?.[1];
+        if (!key) { readFailed = true; throw Error('unreadable promisor config key'); }
+        pins.push('-c', `${key}=false`);
+      }
+      initialized = true;
+    }
+    return read(args, options);
+  };
+  return { gitBytes, get readFailed() { return readFailed; } };
 }
 
 /**
@@ -298,32 +320,22 @@ export function proveNumberingOnlyMove(options = {}) {
   }
 }
 
-function proveNumberingWithRunner({ fromSha, toSha, mainRef = 'origin/main' } = {}, runner) {
+export function proveNumberingWithRunner({ fromSha, toSha, mainRef = 'origin/main' } = {}, runner) {
   try {
     if (!fromSha || !toSha) return refuse('no head');
     if (fromSha === toSha) return refuse('no head move');
     // Fatal decoding makes string equality lossless for valid UTF-8. Preserve a BOM:
     // dropping it would itself conceal a non-numbering byte change.
-    const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
-    const { gitBytes, pins } = runner;
-    const git = (args, maxBuffer) => decoder.decode(gitBytes(args, maxBuffer));
+    const { gitBytes } = runner;
+    const git = args => decodeNumberingGitText(gitBytes(args, { maxBuffer: MAX_GIT_OUTPUT_BYTES, timeout: GIT_TIMEOUT_MS }));
     // Blob content is compared as text only once its text re-encodes to the exact bytes git stored, so no decoding
     // step (a dropped BOM, a replaced byte, a normalisation) can make two different byte sequences compare equal.
     const blobText = (object) => {
-      const bytes = gitBytes(['cat-file', 'blob', object], MAX_NUMBERING_BLOB_BYTES);
-      const text = decoder.decode(bytes);
+      const bytes = gitBytes(['cat-file', 'blob', object], { maxBuffer: MAX_NUMBERING_BLOB_BYTES, timeout: GIT_TIMEOUT_MS });
+      const text = decodeNumberingGitText(bytes);
       if (!Buffer.from(text, 'utf8').equals(bytes)) throw Object.assign(Error('blob text does not round-trip to its bytes'), { code: 'NUMBERING_BYTES_NOT_EXACT' });
       return text;
     };
-    // No matching keys is config's normal status 1; every other config failure refuses the proof.
-    let promisors = '';
-    try { promisors = git(['config', '--get-regexp', '^remote\\..*\\.promisor']); }
-    catch (error) { if (error?.status !== 1) throw error; }
-    for (const line of promisors.split('\n').filter(Boolean)) {
-      const key = /^(remote\..*\.promisor)\s/.exec(line)?.[1];
-      if (!key) throw Error('unreadable promisor config key');
-      pins.push('-c', `${key}=false`);
-    }
     // Missing commits/objects stay missing: the outer boundary returns a retryable refusal.
     git(['cat-file', '-e', `${fromSha}^{commit}`]);
     git(['cat-file', '-e', `${toSha}^{commit}`]);

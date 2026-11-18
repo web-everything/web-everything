@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { proveMixedMechanicalChain } from '../carry-chain.mjs';
-import { numberingGitRunner, MAX_NUMBERING_COMMITS, planNumberingRestamp, restampAfterNumbering, _resetNumberingRestampMemo } from '../numbering-carry.mjs';
+import { numberingGitRunner, proveNumberingWithRunner, MAX_NUMBERING_COMMITS, planNumberingRestamp, restampAfterNumbering, _resetNumberingRestampMemo } from '../numbering-carry.mjs';
 
 const dirs = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); _resetNumberingRestampMemo(); });
@@ -53,31 +53,15 @@ it('proves numbering then clean merge with ordered, SHA-bound hops', () => {
   ] });
 });
 it('caps numbering and merge Git reads in the mixed chain at 5 seconds and their byte limits', () => {
-  const r = repo(); r.number(); const to = r.merge(), calls = [];
+  const r = repo(); const numbered = r.number(); const to = r.merge(), calls = [];
   const exec = (cmd, args, opts) => {
     calls.push({ cmd, args, opts });
     return execFileSync(cmd, args, opts);
   };
-  const trace = join(r.cwd, 'mixed-proof-trace.json');
-  const previous = process.env.GIT_TRACE2_EVENT;
-  process.env.GIT_TRACE2_EVENT = trace;
-  try {
-    expect(proveMixedMechanicalChain({ exec, cwd: r.cwd, fromSha: r.from, toSha: to })).toMatchObject({ ok: true });
-  } finally {
-    if (previous === undefined) delete process.env.GIT_TRACE2_EVENT;
-    else process.env.GIT_TRACE2_EVENT = previous;
-  }
+  expect(proveMixedMechanicalChain({ exec, cwd: r.cwd, fromSha: r.from, toSha: to })).toMatchObject({ ok: true });
   const run = vi.fn(execFileSync);
   const runner = numberingGitRunner({ cwd: r.cwd, run });
-  const commands = readFileSync(trace, 'utf8').trim().split('\n').map(line => JSON.parse(line))
-    .filter(event => event.event === 'start' && event.argv.includes('protocol.allow=never'));
-  // The trace supplies the numbering reads actually used by the mixed chain; replay through its factory spy.
-  for (const { argv } of commands) {
-    const args = argv.slice(1);
-    while (args[0] === '-c') args.splice(0, 2);
-    try { runner.gitBytes(args); }
-    catch (error) { if (!(error.status === 1 && ['grep', 'config'].includes(args[0]))) throw error; }
-  }
+  expect(proveNumberingWithRunner({ fromSha: r.from, toSha: numbered }, runner)).toMatchObject({ ok: true });
   const numberingReads = run.mock.calls;
   expect(numberingReads.some(([, args]) => args.includes('blob'))).toBe(true);
   for (const [cmd, args, opts] of numberingReads) {
