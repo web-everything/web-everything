@@ -527,3 +527,16 @@ it('removes launcher transcript directory after rejected transcript audit', asyn
     { forgedTranscript: '{}' })).toMatchObject({ status: 'voided' });
   expect(existsSync(transcriptDir)).toBe(false);
 });
+
+it('cleans transcript and discards clone edits when the sandbox launcher fails', async () => {
+  const f = fixture();
+  let transcriptDir;
+  const result = await f.run((clone, args) => {
+    transcriptDir = dirname(args.logFile);
+    writeFileSync(join(clone, 'docs/a.md'), 'discarded edit\n');
+  }, { spawnError: true });
+  expect(result).toMatchObject({ status: 'voided', applied: [] });
+  expect(readFileSync(join(f.lane, 'docs/a.md'), 'utf8')).toBe('before\n');
+  expect(existsSync(transcriptDir)).toBe(false);
+  expect(existsSync(f.clone())).toBe(false);
+});

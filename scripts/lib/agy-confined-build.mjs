@@ -8,7 +8,7 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { escapingSymlinks, gitControlFiles, snapshotCheckout, changedControl, changedCheckouts,
   stateChangingToolCalls, READ_ONLY_AGY_TOOLS, scrubPaths, MODULE_REPO_ROOT } from './agy-review-juror.mjs';
 import { buildScratchCloneArgv, summarizeAgyEvents, runAgyDirectExec } from '../gemini-direct-task.mjs';
-import { buildSandboxEnv, buildSandboxProfile, preparePrivateAgyHome, sandboxedSpawnArgv, sandboxSecretPaths } from './agy-sandbox.mjs';
+import { AGY_STATE_WRITE_DIRS, buildSandboxEnv, buildSandboxProfile, sandboxedSpawnArgv, sandboxSecretPaths } from './agy-sandbox.mjs';
 import { readAgyHold, saveAgyHold } from './antigravity-run-evidence.mjs';
 import { resolveCascade, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { isAdmissibleTargetPath } from './agy-fix-admission.mjs';
@@ -80,10 +80,14 @@ export async function defaultSpawnAgy(options) {
     const workspaceDir = canonicalPath(join(homeDir, 'workspace'));
     if ([options.dir, options.laneDir, workspaceDir, join(homeDir, 'workspace')].some(p => profileDir === p || profileDir.startsWith(`${canonicalPath(p)}/`)))
       throw new Error('sandbox profile must be outside clone, lane and workspace');
-    const privateHomeDir = profileDir;
-    preparePrivateAgyHome(homeDir, privateHomeDir, realpathSync(options.dir));
+    // A redirected log root would grant writes beyond the measured real-HOME directory.
+    for (const rel of AGY_STATE_WRITE_DIRS) {
+      const path = join(homeDir, rel);
+      if (canonicalPath(path) !== path)
+        throw new Error('agy log directory is redirected; use another provider or request operator review');
+    }
     const privateTempDir = mkdtempSync(join(profileDir, 'tmp-'));
-    const profile = buildSandboxProfile({ transcriptDir: realpathSync(dirname(options.logFile)), cloneDir: realpathSync(options.dir), homeDir, privateTempDir, privateHomeDir, osTempBase: temp,
+    const profile = buildSandboxProfile({ transcriptDir: realpathSync(dirname(options.logFile)), cloneDir: realpathSync(options.dir), homeDir, privateTempDir,
       laneDir: realpathSync(options.laneDir), workspaceDir, agyBinDir: dirname(cli),
       homebrewPrefix: cli.match(/^(.*)\/(?:Cellar|Caskroom)\//)?.[1],
       workspaceOps: canonicalPath(join(homeDir, 'workspace/.operations')),
@@ -93,7 +97,7 @@ export async function defaultSpawnAgy(options) {
     return await runAgyDirectExec({ ...options, exclusiveLog: true, cli, readHold: readAgyHold, saveHold: saveAgyHold, spawnFn: (bin, args, opts) => {
       const [, ...argv] = sandboxedSpawnArgv(profileFile, [bin, ...args]);
       return spawn('/usr/bin/sandbox-exec', argv, { ...opts,
-        env: buildSandboxEnv(process.env, privateTempDir, privateHomeDir) });
+        env: buildSandboxEnv(process.env, privateTempDir, homeDir) });
     } });
   } finally { rmSync(profileDir, { recursive: true, force: true }); }
 }
@@ -204,7 +208,7 @@ export async function runConfinedAgyBuild({ task, laneDir, scope, kind, size, mo
       GIT_DIR: join(clone, '.git'), GIT_COMMON_DIR: join(clone, '.git'), GIT_WORK_TREE: clone,
       GIT_ALTERNATE_OBJECT_DIRECTORIES: '',
     } });
-    // Launcher-owned sibling of the clone and sandbox HOME/temp; never grant worker writes here.
+    // Launcher-owned sibling of the clone and sandbox temp; never grant worker writes here.
     transcriptDir = realpathSync(mkdtempSync(join(tmpdir(), 'we-agy-transcript-')));
     chmodSync(transcriptDir, 0o700);
     const transcriptFile = join(transcriptDir, 'agy-build.jsonl');

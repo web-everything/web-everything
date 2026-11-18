@@ -4680,45 +4680,38 @@ real-lane and untracked host targets remain unchanged with no worker launched. O
 workers exercise patch admission; they are not evidence of production confinement. Run the focused adapter and
 `operations/__tests__/fix-run.test.mjs` fixtures through the host heavy-admission queue.
 
-Slice B supersedes the production-unavailable note above: macOS builds now launch through
-`/usr/bin/sandbox-exec`, with default-denied writes and explicit clone, private HOME `.gemini` and private
-temporary-directory grants. Network remains allowed. The pure profile builder consumes canonical
-absolute paths; the launcher resolves existing paths and resolves absent secret roots through their
-nearest existing ancestor (unreadable paths and broken symlinks refuse). Writable roots under the
-home workspace, unsafe SBPL characters, unsupported hosts and missing sandbox-exec fail closed;
-use another fix provider or request operator review. Profiles use private temporary directories
-outside clone/lane and mode 0600. Native file tools are permitted; transcript, escape, Git-control
-and scope checks still gate the launcher-owned patch application. No agy Git operations are admitted.
-`agy-sandbox.test.mjs` covers profile grants/denials and unsafe paths; its Darwin-only REAL shell
-probe uses only temporary directories, demonstrates allowed clone writes, rejects outside writes
-with EPERM and checks that the target never appears, and rejects reads from a temporary denied
-directory. Broad read denies cover `/Users`, `/Volumes`, both tmp aliases and the canonical OS
-temp base (`/private/var/folders` on Darwin), before explicit clone/private home/temp and resolved
-binary-directory/Homebrew-prefix grants; secret/workspace denies remain last. Binary grants
-overlapping the home workspace refuse. The REAL probe also rejects sibling-temp reads with EPERM,
-allows clone/private-temp reads, and runs system sh/cat/ls. It never touches real home secrets
-or launches agy. The injected build tests separately
-cover unsupported hosts and missing sandbox-exec without launching a worker. Run these focused
-files and the fix-run fixtures only via the host heavy-admission queue; fake-worker evidence alone
-does not establish confinement. These slice B tests were authored without running them.
+Slice B supersedes the production-unavailable note above: macOS builds launch through
+`/usr/bin/sandbox-exec` using the operator's real HOME login, exactly as the existing agy review seat does.
+The scrubbed environment retains only PATH, USER, LOGNAME, SHELL, LANG, LC_* and TERM;
+HOME is the real home and TMPDIR/TMP/TEMP point to a launcher-created private temp directory.
+No token or settings are copied and no private HOME is created or deleted.
+Writes are default-denied, with exactly the disposable clone, per-run private temp directory,
+`~/.gemini/antigravity-cli/log` (subpath), and `/dev/null`, `/dev/tty`, `/dev/dtracehelper` granted.
+`AGY_STATE_WRITE_DIRS` names exactly the measured log requirement; extend it only with measured evidence.
+The private temp is made outside the clone, lane and home workspace. The transcript directory is
+outside every write grant; the launcher removes only its own temporary directories after the run.
+Redirected log directories refuse with a provider/operator fallback rather than widening write access.
 
-The build profile grants only clone, private per-run temp and the private HOME's `.gemini`
-writes (plus the named devices). The launcher creates that HOME outside workspace/lane/clone,
-writes `.gemini/antigravity-cli/settings.json` containing exactly
-`{ trustedWorkspaces: [clone] }` and copies only agy's own host OAuth token file
-`.gemini/antigravity-cli/antigravity-oauth-token` to the same relative path in the private HOME, both with mode 0600 and exclusive creation. The host login is opened
-with `O_NOFOLLOW`, must be a regular file at most 64KB, and the bounded read must match its stat size.
-Missing, redirected, oversized or otherwise unreadable login refuses with
-`agy login unavailable; use another provider or request operator review`. No host settings keys,
-`config/config.json`, MCP config, `.migrated`, `projects/` or other host config is copied;
-no private `.gemini/config` directory is created. Failure to create
-private settings also refuses with a provider/operator fallback. The launcher removes only its own mkdtemp
-root after the run, including every error path. `HOME` is replaced; `TMPDIR`, `TMP` and `TEMP` point to the private temp.
-Real home `.gemini` receives no read or write allowance. The REAL probe covers private state writes
-and real state write/conversation-read denial. Private-HOME fixtures assert exactly the settings and login files,
-mode 0600, byte-identical login content, no inherited host keys or MCP config, and refusal for missing,
-symlinked, nonregular and oversized login inputs. The REAL launcher probe uses a fake real home,
-checks private login reads and real login denial, and asserts private HOME removal after the run.
+Read denies retain `.ssh`, `.aws`, `.gnupg`, `.config/gh`, `.plateau`, the home workspace and
+`~/workspace/.operations`, including canonical secret targets. There is no home-wide or `/Users`
+read deny, no home read allowlist, and no broad temp/volume read deny. Real-HOME `.gemini`, Keychains
+and `Library/Application Support/antigravity` remain readable for agy's login and state.
+Network remains allowed. Canonical absolute paths, unsafe SBPL characters, writable roots overlapping
+the lane/workspace, unsupported hosts and missing sandbox-exec fail closed; use another provider or
+request operator review. Profiles use private temporary directories and mode 0600. Native file tools
+are permitted; transcript, escape, Git-control and scope checks still gate launcher-owned patch application.
+No agy Git operations are admitted.
+
+`agy-sandbox.test.mjs` asserts the exact grants and scrubbed environment. Its Darwin-only REAL probe
+uses a fake home and temporary directories: clone/temp/log writes succeed; sibling temp, fake-home
+and other `.gemini` writes fail with EPERM; real-HOME login reads succeed and every named secret-root
+read fails with EPERM. It runs system sh/cat/ls without touching real home secrets or launching agy.
+`agy-confined-launcher.test.mjs` checks real HOME preservation, no copied state, private temp cleanup,
+redirected-log refusal, and a REAL fake-home launcher probe for login/log access and other-home write denial.
+The injected build tests separately cover unsupported hosts and missing sandbox-exec without launching a worker.
+The scoped files are agy-sandbox, agy-confined-launcher, agy-confined-build and agy-fix-admission;
+run them only through host heavy-admission. These edits were authored without running tests.
+
 The shared kind-agnostic `isAdmissibleTargetPath` allowlist gates scope admission and every
 tracked/untracked changed path. Only normalized repo-relative documentation (`docs/**` or `.md`/`.mdx`)
 and tests (`**/__tests__/**` or `.test.*`/`.spec.*`) qualify. Refuse `.github/**`, `scripts/settings/**`,
@@ -4743,14 +4736,11 @@ critical-work verdict is recomputed on effective paths (including directory form
 refuse. Refusals record an unproductive outcome so the existing provider chain advances. Terminal transcript fixtures use nested `result.status: SUCCESS`.
 
 
-Threat model (R1062 slice S7, R1049): agy is an UNTRUSTED DIFF PRODUCER. It runs in a throwaway clone with a
-private HOME and a scrubbed environment. Agy's own OAuth token file (`.gemini/antigravity-cli/antigravity-oauth-token`) is placed in that private HOME
-with mode 0600 and deleted after the run, used the same way the review seat uses it. It runs under a sandbox-exec profile that confines
-writes to the clone, its private temp and its private HOME. Shells and tools inside that copy are out of scope:
-the copy can only damage itself. The DIFF BOUNDARY remains the control: we keep ONLY agy's git diff, and our code applies it
-through the shared documentation/test allowlist predicate, intersected with the launch scope (an item scope may only narrow
-it, with criticality re-checked), before the normal review and audit path. Network stays allowed (agy needs its
-API), so the credential is not protected from the worker; this is an accepted operator ruling (R1062).
+Threat model (R1062 slice S7, R1049): agy is an UNTRUSTED DIFF PRODUCER;
+credential exposure equals the existing agy review seat (real HOME login); writes are confined to the disposable clone, a private temp dir and agy's log dir; only the allowed diff (docs and in-scope tests, allowlist) is kept and goes through review; shells and tools inside the clone are out of scope (R1049).
+The shared documentation/test allowlist is intersected with the launch scope (an item scope may only
+narrow it, with criticality re-checked), before the normal review and audit path. Network stays allowed
+for agy's API; credentials are not protected from the worker. This is the accepted operator ruling (R1062).
 Size-1 jobs of any kind are also admitted by R1062; neither is a confinement claim.
 
 The launcher hashes clone Git redirect/configuration controls with filesystem reads before any

@@ -1,15 +1,10 @@
 // @vitest-environment node
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, readFileSync, readSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
-import { buildSandboxEnv, buildSandboxProfile, preparePrivateAgyHome, sandboxedSpawnArgv, sandboxSecretPaths } from '../agy-sandbox.mjs';
-
-vi.mock('node:fs', async importOriginal => {
-  const original = await importOriginal();
-  return { ...original, readSync: vi.fn(original.readSync) };
-});
+import { AGY_STATE_WRITE_DIRS, buildSandboxEnv, buildSandboxProfile, sandboxedSpawnArgv, sandboxSecretPaths } from '../agy-sandbox.mjs';
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -20,16 +15,15 @@ function fixture() {
   const cloneDir = join(homeDir, 'clone');
   const privateTempDir = join(root, 'private-temp');
   const laneDir = join(root, 'lane');
-  const privateHomeDir = join(root, 'private-home');
   const stateDir = join(homeDir, '.gemini/antigravity-cli');
   const workspaceOps = join(homeDir, 'workspace/.operations');
-  for (const p of [cloneDir, privateTempDir, laneDir, join(privateHomeDir, '.gemini/antigravity-cli'), join(stateDir, 'log'), join(stateDir, 'bin'), join(stateDir, 'builtin'), ...sandboxSecretPaths(homeDir), workspaceOps]) mkdirSync(p, { recursive: true });
+  for (const p of [cloneDir, privateTempDir, laneDir, join(stateDir, 'log'), join(stateDir, 'bin'), join(stateDir, 'builtin'), ...sandboxSecretPaths(homeDir), workspaceOps]) mkdirSync(p, { recursive: true });
   writeFileSync(join(homeDir, '.gemini/antigravity-cli/antigravity-oauth-token'), Buffer.from([0, 255, 10, 123, 125]));
-  return { transcriptDir: join(root, 'transcript'), root, homeDir, cloneDir, privateTempDir, privateHomeDir, laneDir, workspaceOps, osTempBase: realpathSync(tmpdir()) };
+  return { transcriptDir: join(root, 'transcript'), root, homeDir, cloneDir, privateTempDir, laneDir, workspaceOps };
 }
 
 describe('pure sandbox profile', () => {
-  it.each(['cloneDir', 'privateTempDir', 'privateHomeDir', 'workspaceOps'])
+  it.each(['cloneDir', 'privateTempDir', 'workspaceOps'])
   ('refuses a transcript directory in %s with operator fallback', key => {
     const f = fixture();
     for (const transcriptDir of [f[key], join(f[key], 'transcript')])
@@ -38,25 +32,14 @@ describe('pure sandbox profile', () => {
   it('refuses missing transcript containment evidence', () => {
     expect(() => buildSandboxProfile({ ...fixture(), transcriptDir: undefined })).toThrow('unsafe sandbox path');
   });
-  it('denies writes by default, grants clone/private state/device writes, and keeps network allowed', () => {
+  it('grants exactly clone, private temp, measured log directory and devices; network remains allowed', () => {
     const f = fixture();
     const profile = buildSandboxProfile(f);
-    const allowIndex = profile.indexOf('(allow file-read*');
-    const tempBase = realpathSync(tmpdir());
-    for (const p of ['/Users', '/Volumes', '/private/tmp', '/tmp', f.homeDir,
-      tempBase === '/private/var/folders' || tempBase.startsWith('/private/var/folders/') ? '/private/var/folders' : tempBase]) {
-      const rule = `(deny file-read* (subpath ${JSON.stringify(p)}))`;
-      expect(profile).toContain(rule);
-      expect(profile.indexOf(rule)).toBeLessThan(allowIndex);
-    }
+    expect(AGY_STATE_WRITE_DIRS).toEqual(['.gemini/antigravity-cli/log']);
     expect(profile).toContain('(deny file-write*)');
     const writeRule = profile.split('\n').find(line => line.startsWith('(allow file-write*'));
-    for (const p of [f.cloneDir, f.privateTempDir, join(f.privateHomeDir, '.gemini')])
-      expect(writeRule).toContain(`(subpath ${JSON.stringify(p)})`);
-    for (const p of ['/dev/null', '/dev/tty', '/dev/dtracehelper']) expect(writeRule).toContain(`(literal "${p}")`);
-    for (const p of [realpathSync(tmpdir()), '/private/var/folders', f.privateHomeDir, f.laneDir])
-      expect(writeRule).not.toContain(`(subpath ${JSON.stringify(p)})`);
-    expect(writeRule).not.toContain(join(f.homeDir, '.gemini'));
+    expect(writeRule).toBe(`(allow file-write* ${[f.cloneDir, f.privateTempDir, join(f.homeDir, '.gemini/antigravity-cli/log')]
+      .map(p => `(subpath ${JSON.stringify(p)})`).join(' ')} (literal "/dev/null") (literal "/dev/tty") (literal "/dev/dtracehelper"))`);
     expect(profile).not.toContain('deny network');
   });
   it('denies reads of every secret root and workspace operations, plus extra denied paths', () => {
@@ -65,42 +48,23 @@ describe('pure sandbox profile', () => {
     mkdirSync(extra);
     const profile = buildSandboxProfile({ ...f, extraDeniedPaths: [extra] });
     const readRule = profile.split('\n').filter(line => line.startsWith('(deny file-read*')).at(-1);
-    expect(profile.indexOf(readRule)).toBeGreaterThan(profile.indexOf('(allow file-read*'));
     expect(profile.trim().endsWith(readRule)).toBe(true);
     for (const p of [...sandboxSecretPaths(f.homeDir), join(f.homeDir, 'workspace'), f.workspaceOps, extra])
       expect(readRule).toContain(`(subpath ${JSON.stringify(p)})`);
   });
-  it('allows private home reads and the resolved binary directory without real state reads', () => {
+  it('keeps real-HOME login, Keychain, application state and binary reads unrestricted', () => {
     const f = fixture();
-    const agyBinDir = join(f.homeDir, 'bin');
-    const rule = buildSandboxProfile({ ...f, agyBinDir }).split('\n').find(s => s.startsWith('(allow file-read*'));
-    for (const p of [f.cloneDir, f.privateTempDir, f.privateHomeDir, agyBinDir])
-      expect(rule).toContain(`(subpath ${JSON.stringify(p)})`);
-    expect(rule).not.toContain(join(f.homeDir, '.gemini'));
-    expect(rule).not.toContain(`(subpath ${JSON.stringify(f.homeDir)})`);
-    expect(rule).not.toContain(`(subpath ${JSON.stringify(join(f.homeDir, '.gemini'))})`);
+    const profile = buildSandboxProfile(f);
+    const readRule = profile.split('\n').find(s => s.startsWith('(deny file-read*'));
+    for (const p of ['/Users', '/Volumes', '/private/tmp', '/tmp', f.homeDir,
+      join(f.homeDir, '.gemini'), join(f.homeDir, 'Library/Keychains'),
+      join(f.homeDir, 'Library/Application Support/antigravity')])
+      expect(readRule).not.toContain(`(subpath ${JSON.stringify(p)})`);
+    expect(profile).not.toContain('(allow file-read*');
   });
-  it.each(['workspace/bin', 'workspace/.operations/bin', '.'])('refuses a binary directory overlapping workspace: %s', p => {
+  it.each(['agyBinDir', 'homebrewPrefix'])('refuses a binary root overlapping workspace: %s', key => {
     const f = fixture();
-    expect(() => buildSandboxProfile({ ...f, agyBinDir: join(f.homeDir, p) })).toThrow('binary overlaps workspace');
-  });
-  it.each(['/Users/another-user/agy/bin', '/Volumes/tools/agy/bin'])('allows an external binary directory %s after broad denies', agyBinDir => {
-    const profile = buildSandboxProfile({ ...fixture(), agyBinDir });
-    const rule = profile.split('\n').find(s => s.startsWith('(allow file-read*'));
-    expect(rule).toContain(`(subpath ${JSON.stringify(agyBinDir)})`);
-  });
-  it('allows a resolved Homebrew prefix under temp, with secret denies still last', () => {
-    const f = fixture();
-    const homebrewPrefix = join(f.root, 'brew');
-    const agyBinDir = join(homebrewPrefix, 'Cellar/agy/1/bin');
-    const profile = buildSandboxProfile({ ...f, agyBinDir, homebrewPrefix });
-    const rule = profile.split('\n').find(s => s.startsWith('(allow file-read*'));
-    for (const p of [homebrewPrefix, agyBinDir]) expect(rule).toContain(`(subpath ${JSON.stringify(p)})`);
-    expect(profile.trim().split('\n').at(-1)).toMatch(/^\(deny file-read\*/);
-  });
-  it('refuses a Homebrew prefix overlapping workspace even if the executable directory is elsewhere', () => {
-    const f = fixture();
-    expect(() => buildSandboxProfile({ ...f, agyBinDir: '/opt/agy/bin', homebrewPrefix: join(f.homeDir, 'workspace/brew') }))
+    expect(() => buildSandboxProfile({ ...f, [key]: join(f.homeDir, 'workspace/bin') }))
       .toThrow('binary overlaps workspace');
   });
   it('scrubs all inherited variables except the allowlist and replaces every temp variable', () => {
@@ -109,10 +73,10 @@ describe('pure sandbox profile', () => {
     const env = buildSandboxEnv({ ...allowed, GH_TOKEN: 'secret', API_KEY: 'secret', AWS_PROFILE: 'secret',
       SSH_AUTH_SOCK: '/agent', GIT_CONFIG_GLOBAL: '/config', NODE_OPTIONS: '--require=host',
       ANTIGRAVITY_QUOTA_DIR: '/host', ANTIGRAVITY_JUDGE_TRANSCRIPT_DIR: '/host',
-      TMPDIR: '/host', TMP: '/host', TEMP: '/host', OTHER: 'secret' }, '/private-temp', '/private-home');
-    expect(env).toEqual({ ...allowed, HOME: '/private-home', TMPDIR: '/private-temp', TMP: '/private-temp', TEMP: '/private-temp' });
+      TMPDIR: '/host', TMP: '/host', TEMP: '/host', OTHER: 'secret' }, '/private-temp', '/real-home');
+    expect(env).toEqual({ ...allowed, HOME: '/real-home', TMPDIR: '/private-temp', TMP: '/private-temp', TEMP: '/private-temp' });
   });
-  it.each(['cloneDir', 'privateTempDir', 'privateHomeDir'])('refuses a writable %s under home/workspace', key => {
+  it.each(['cloneDir', 'privateTempDir'])('refuses a writable %s under home/workspace', key => {
     const f = fixture();
     const p = join(f.homeDir, 'workspace/escape');
     expect(() => buildSandboxProfile({ ...f, [key]: p })).toThrow(/workspace/);
@@ -122,7 +86,7 @@ describe('pure sandbox profile', () => {
     expect(() => buildSandboxProfile({ ...f, workspaceDir: join(f.root, 'workspace-target'),
       privateTempDir: join(f.root, 'workspace-target/cache') })).toThrow('under home/workspace');
   });
-  it.each(['cloneDir', 'privateTempDir', 'privateHomeDir'])('refuses writable %s inside the lane', key => {
+  it.each(['cloneDir', 'privateTempDir'])('refuses writable %s inside the lane', key => {
     const f = fixture();
     expect(() => buildSandboxProfile({ ...f, [key]: join(f.laneDir, 'escape') })).toThrow('lane');
   });
@@ -133,7 +97,7 @@ describe('pure sandbox profile', () => {
   });
   it.each(['"', '\\', '\n', '\r', '\0', '\x7f', '\x85'])('refuses unsafe SBPL path character %j', char => {
     const f = fixture();
-    for (const key of ['cloneDir', 'homeDir', 'workspaceOps', 'privateTempDir', 'privateHomeDir', 'laneDir', 'osTempBase', 'transcriptDir', 'extraDeniedPaths', 'deniedPaths']) {
+    for (const key of ['cloneDir', 'homeDir', 'workspaceOps', 'privateTempDir', 'laneDir', 'transcriptDir', 'extraDeniedPaths', 'deniedPaths']) {
       const p = join(f.root, `unsafe${char}path`);
       expect(() => buildSandboxProfile({ ...f, [key]: key.endsWith('Dirs') || key.endsWith('Paths') ? [p] : p }))
         .toThrow('unsafe sandbox path');
@@ -142,16 +106,14 @@ describe('pure sandbox profile', () => {
   it.each(['relative/path', '/absolute/../noncanonical'])('refuses noncanonical path %s', cloneDir => {
     expect(() => buildSandboxProfile({ ...fixture(), cloneDir })).toThrow('unsafe sandbox path');
   });
-  it('refuses a missing OS temp base rather than dropping its read deny', () => {
-    expect(() => buildSandboxProfile({ ...fixture(), osTempBase: undefined })).toThrow('unsafe sandbox path');
-  });
-  it.each(['cloneDir', 'privateTempDir', 'privateHomeDir', 'agyBinDir'])('refuses real .gemini access through %s', key => {
+  it.each(['cloneDir', 'privateTempDir'])('refuses broader real .gemini writes through %s', key => {
     const f = fixture();
     expect(() => buildSandboxProfile({ ...f, [key]: join(f.homeDir, '.gemini/escape') })).toThrow();
   });
-  it('refuses private home overlapping the clone', () => {
+  it('refuses transcripts inside or containing the real-HOME log grant', () => {
     const f = fixture();
-    expect(() => buildSandboxProfile({ ...f, privateHomeDir: join(f.cloneDir, 'home') })).toThrow();
+    for (const transcriptDir of [f.homeDir, join(f.homeDir, '.gemini/antigravity-cli/log/transcript')])
+      expect(() => buildSandboxProfile({ ...f, transcriptDir })).toThrow(/transcript directory.*operator review/);
   });
   it('wraps argv without shell interpolation', () => {
     expect(sandboxedSpawnArgv('/profile with spaces.sb', ['sh', '-c', 'literal $input']))
@@ -159,104 +121,8 @@ describe('pure sandbox profile', () => {
   });
 });
 
-describe('private agy home settings', () => {
-  it('copies only byte-identical OAuth token and clone-only settings with mode 0600, never config.json or MCP config', () => {
-    const f = fixture();
-    const settings = join(f.homeDir, '.gemini/antigravity-cli/settings.json');
-    const config = join(f.homeDir, '.gemini/config');
-    mkdirSync(config, { recursive: true });
-    writeFileSync(join(config, 'config.json'), 'unused host config secret');
-    writeFileSync(settings, JSON.stringify({ trustedWorkspaces: ['/previous'], apiKey: 'host secret' }));
-    writeFileSync(join(f.homeDir, '.gemini/antigravity-cli/mcp_config.json'), 'host MCP secret');
-    writeFileSync(join(config, 'mcp_config.json'), 'host MCP secret');
-    writeFileSync(join(config, '.migrated'), 'host marker');
-    mkdirSync(join(config, 'projects'));
-    writeFileSync(join(config, 'projects/secret'), 'host project');
-    preparePrivateAgyHome(f.homeDir, f.privateHomeDir, f.cloneDir);
-    expect(readdirSync(f.privateHomeDir)).toEqual(['.gemini']);
-    expect(readdirSync(join(f.privateHomeDir, '.gemini')).sort()).toEqual(['antigravity-cli']);
-    const state = join(f.privateHomeDir, '.gemini/antigravity-cli');
-    expect(readdirSync(state).sort()).toEqual(['antigravity-oauth-token', 'settings.json']);
-    expect(existsSync(join(f.privateHomeDir, '.gemini/config'))).toBe(false);
-    expect(JSON.parse(readFileSync(join(state, 'settings.json'), 'utf8')))
-      .toEqual({ trustedWorkspaces: [f.cloneDir] });
-    expect(readFileSync(join(state, 'antigravity-oauth-token'))).toEqual(readFileSync(join(f.homeDir, '.gemini/antigravity-cli/antigravity-oauth-token')));
-    for (const file of [join(state, 'settings.json'), join(state, 'antigravity-oauth-token')])
-      expect(statSync(file).mode & 0o777).toBe(0o600);
-  });
-  it.each(['missing', 'symlink', 'oversized', 'directory'])(
-    'refuses %s login with operator fallback', kind => {
-      const f = fixture();
-      const login = join(f.homeDir, '.gemini/antigravity-cli/antigravity-oauth-token');
-      rmSync(login);
-      if (kind === 'symlink') {
-        const target = join(f.root, 'login-target');
-        writeFileSync(target, '{}');
-        symlinkSync(target, login);
-      }
-      if (kind === 'oversized') writeFileSync(login, Buffer.alloc(65537));
-      if (kind === 'directory') mkdirSync(login);
-      expect(() => preparePrivateAgyHome(f.homeDir, f.privateHomeDir, f.cloneDir))
-        .toThrow('agy login unavailable; use another provider or request operator review');
-      expect(readdirSync(join(f.privateHomeDir, '.gemini'))).toEqual(['antigravity-cli']);
-    });
-  it('accepts the OAuth token without any host config directory', () => {
-    const f = fixture();
-    expect(existsSync(join(f.homeDir, '.gemini/config'))).toBe(false);
-    preparePrivateAgyHome(f.homeDir, f.privateHomeDir, f.cloneDir);
-    expect(existsSync(join(f.privateHomeDir, '.gemini/config'))).toBe(false);
-  });
-  it('refuses an unreadable OAuth token with operator fallback', () => {
-    const f = fixture();
-    vi.mocked(readSync).mockImplementationOnce(() => { throw new Error('EACCES'); });
-    expect(() => preparePrivateAgyHome(f.homeDir, f.privateHomeDir, f.cloneDir))
-      .toThrow('agy login unavailable; use another provider or request operator review');
-    expect(readdirSync(join(f.privateHomeDir, '.gemini/antigravity-cli'))).toEqual([]);
-  });
-  it('refuses a login read whose size differs from fstat with operator fallback', () => {
-    const f = fixture();
-    vi.mocked(readSync).mockReturnValueOnce(0);
-    expect(() => preparePrivateAgyHome(f.homeDir, f.privateHomeDir, f.cloneDir))
-      .toThrow('agy login unavailable; use another provider or request operator review');
-    expect(existsSync(join(f.privateHomeDir, '.gemini/antigravity-cli/antigravity-oauth-token'))).toBe(false);
-  });
-  it('refuses an existing private login without overwriting it', () => {
-    const f = fixture();
-    const login = join(f.privateHomeDir, '.gemini/antigravity-cli/antigravity-oauth-token');
-    writeFileSync(login, 'existing login');
-    expect(() => preparePrivateAgyHome(f.homeDir, f.privateHomeDir, f.cloneDir))
-      .toThrow('agy login unavailable; use another provider or request operator review');
-    expect(readFileSync(login, 'utf8')).toBe('existing login');
-  });
-  it('accepts a login of exactly 64KB', () => {
-    const f = fixture();
-    const login = Buffer.alloc(65536, 42);
-    writeFileSync(join(f.homeDir, '.gemini/antigravity-cli/antigravity-oauth-token'), login);
-    preparePrivateAgyHome(f.homeDir, f.privateHomeDir, f.cloneDir);
-    expect(readFileSync(join(f.privateHomeDir, '.gemini/antigravity-cli/antigravity-oauth-token'))).toEqual(login);
-  });
-  it.each(['absent', 'malformed', 'oversized', 'symlink'])(
-    'seeds settings without reading host settings (%s)', state => {
-      const f = fixture();
-      const settings = join(f.homeDir, '.gemini/antigravity-cli/settings.json');
-      if (state === 'malformed') writeFileSync(settings, '{');
-      if (state === 'oversized') writeFileSync(settings, Buffer.alloc(65537));
-      if (state === 'symlink') symlinkSync(join(f.root, 'missing'), settings);
-      preparePrivateAgyHome(f.homeDir, f.privateHomeDir, f.cloneDir);
-      expect(JSON.parse(readFileSync(join(f.privateHomeDir, '.gemini/antigravity-cli/settings.json'), 'utf8')))
-        .toEqual({ trustedWorkspaces: [f.cloneDir] });
-    });
-  it('refuses an existing private settings file with operator fallback', () => {
-    const f = fixture();
-    const settings = join(f.privateHomeDir, '.gemini/antigravity-cli/settings.json');
-    writeFileSync(settings, 'existing state');
-    expect(() => preparePrivateAgyHome(f.homeDir, f.privateHomeDir, f.cloneDir)).toThrow('operator review');
-    expect(readFileSync(settings, 'utf8')).toBe('existing state');
-  });
-});
-
 it.skipIf(process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec'))(
-  'REAL sandbox allows clone/private reads and system tools but denies sibling temp and real state reads with EPERM', () => {
+  'REAL sandbox allows clone/temp/log writes and real-HOME login reads, denies outside writes and secret reads with EPERM', () => {
     const f = fixture();
     const denied = join(f.root, 'extra-denied');
     mkdirSync(denied);
@@ -264,7 +130,6 @@ it.skipIf(process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec'))
     mkdirSync(join(f.homeDir, '.gemini/antigravity-cli/conversations'));
     mkdirSync(join(f.homeDir, '.gemini/antigravity-cli/brain'));
     writeFileSync(join(f.homeDir, '.gemini/antigravity-cli/conversations/secret'), 'real conversation');
-    preparePrivateAgyHome(f.homeDir, f.privateHomeDir, f.cloneDir);
     const profileFile = join(f.root, 'profile.sb');
     writeFileSync(profileFile, buildSandboxProfile({ ...f, extraDeniedPaths: [denied] }), { mode: 0o600 });
     const run = (script, ...args) => {
@@ -281,21 +146,8 @@ it.skipIf(process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec'))
     const siblingTemp = realpathSync(mkdtempSync(join(tmpdir(), 'we-agy-sibling-test-')));
     roots.push(siblingTemp);
     const siblingFile = join(siblingTemp, 'other-worker-data');
-    writeFileSync(siblingFile, 'sibling secret');
-    const siblingRead = run('/bin/cat "$1"', siblingFile);
-    expect(siblingRead.error).toBeUndefined();
-    expect(siblingRead.status).not.toBe(0);
-    expect(siblingRead.stderr).toMatch(/EPERM|Operation not permitted/i);
-    expect(siblingRead.stdout).not.toContain('sibling secret');
-    const arbitraryHomeFile = join(f.homeDir, 'unlisted-personal-data');
-    writeFileSync(arbitraryHomeFile, 'private home data');
-    const homeRead = run('/bin/cat "$1"', arbitraryHomeFile);
-    expect(homeRead.error).toBeUndefined();
-    expect(homeRead.status).not.toBe(0);
-    expect(homeRead.stderr).toMatch(/EPERM|Operation not permitted/i);
-    expect(homeRead.stdout).not.toContain('private home data');
     for (const allowed of [join(f.privateTempDir, 'allowed'),
-      join(f.privateHomeDir, '.gemini/antigravity-cli/session'), join(f.privateHomeDir, '.gemini/projects.json')]) {
+      join(f.homeDir, '.gemini/antigravity-cli/log/session')]) {
       expect(run('printf allowed > "$1"', allowed).status, allowed).toBe(0);
       expect(existsSync(allowed)).toBe(true);
       const read = run('/bin/cat "$1"', allowed);
@@ -307,10 +159,10 @@ it.skipIf(process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec'))
     mkdirSync(join(f.homeDir, '.gemini/config'));
     const sibling = join(f.homeDir, '.gemini-like');
     mkdirSync(sibling);
-    for (const outside of [osTempTarget, join(f.root, 'blocked'), join(f.laneDir, 'blocked'),
-      ...['settings.json', 'bin/x', 'builtin/x', 'installation_id', 'sibling', 'settings.json.123.tmp', 'log-sibling', 'log/x', 'conversations/x', 'brain/x', 'conversation_summaries.db', 'conversation_summaries.db-wal', 'conversation_summaries.db-shm', 'conversation_summaries.db-journal', 'jetbox_summaries_proto.pb', 'jetski_state.pbtxt', 'history.jsonl', 'cli.log'].map(p => join(f.homeDir, '.gemini/antigravity-cli', p)),
+    for (const outside of [osTempTarget, siblingFile, join(f.root, 'blocked'), join(f.laneDir, 'blocked'),
+      ...['settings.json', 'bin/x', 'builtin/x', 'installation_id', 'sibling', 'settings.json.123.tmp', 'log-sibling', 'conversations/x', 'brain/x', 'conversation_summaries.db', 'conversation_summaries.db-wal', 'conversation_summaries.db-shm', 'conversation_summaries.db-journal', 'jetbox_summaries_proto.pb', 'jetski_state.pbtxt', 'history.jsonl', 'cli.log'].map(p => join(f.homeDir, '.gemini/antigravity-cli', p)),
       join(sibling, 'blocked'), join(f.homeDir, '.gemini/other-state'),
-      join(f.privateHomeDir, 'blocked'), join(f.homeDir, '.gemini/config/blocked'),
+      join(f.homeDir, 'blocked'), join(f.homeDir, '.gemini/config/blocked'),
       ...['projects.json', 'projects.json.123.tmp', 'projects.json.123.tmp.extra'].map(p => join(f.homeDir, '.gemini', p))]) {
       const write = run('printf blocked > "$1"', outside);
       expect(write.error).toBeUndefined();
@@ -318,23 +170,15 @@ it.skipIf(process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec'))
       expect(write.stderr).toMatch(/EPERM|Operation not permitted/i);
       expect(existsSync(outside)).toBe(false);
     }
-    const privateRead = run('/bin/cat "$1"', join(f.privateHomeDir, '.gemini/projects.json'));
-    expect(privateRead.status).toBe(0);
-    expect(privateRead.stdout).toBe('allowed');
-    const privateLogin = run('/bin/cat "$1"', join(f.privateHomeDir, '.gemini/antigravity-cli/antigravity-oauth-token'));
-    expect(privateLogin.status).toBe(0);
     const realLogin = run('/bin/cat "$1"', join(f.homeDir, '.gemini/antigravity-cli/antigravity-oauth-token'));
-    expect(realLogin.status).not.toBe(0);
-    expect(realLogin.stderr).toMatch(/EPERM|Operation not permitted/i);
-    expect(realLogin.stdout).toBe('');
-    const conversationRead = run('/bin/cat "$1"', join(f.homeDir, '.gemini/antigravity-cli/conversations/secret'));
-    expect(conversationRead.status).not.toBe(0);
-    expect(conversationRead.stderr).toMatch(/EPERM|Operation not permitted/i);
-    expect(conversationRead.stdout).not.toContain('real conversation');
-    const read = run('/bin/cat "$1"', join(denied, 'secret'));
-    expect(read.error).toBeUndefined();
-    expect(read.status).not.toBe(0);
-    expect(read.stderr).toMatch(/EPERM|Operation not permitted/i);
-    expect(read.stdout).not.toContain('fixture secret');
+    expect(realLogin.status).toBe(0);
+    for (const root of [...sandboxSecretPaths(f.homeDir), f.workspaceOps, denied]) {
+      writeFileSync(join(root, 'secret'), 'fixture secret');
+      const read = run('/bin/cat "$1"', join(root, 'secret'));
+      expect(read.error).toBeUndefined();
+      expect(read.status, root).not.toBe(0);
+      expect(read.stderr).toMatch(/EPERM|Operation not permitted/i);
+      expect(read.stdout).not.toContain('fixture secret');
+    }
   },
 );

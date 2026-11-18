@@ -55,7 +55,7 @@ it('production launcher consults persisted quota holds and refuses before sandbo
   expect(spawn).not.toHaveBeenCalled();
 });
 
-it.each(['direct', 'homebrew-symlink'])('production sandbox callback resolves %s grants, records quota and scrubs environment', async installation => {
+it.each(['direct', 'homebrew-symlink', 'missing-login'])('production sandbox callback resolves %s grants, records quota and scrubs environment', async installation => {
   const { options } = fixture();
   const homebrewPrefix = join(host.home, 'brew');
   if (installation === 'homebrew-symlink') {
@@ -66,18 +66,17 @@ it.each(['direct', 'homebrew-symlink'])('production sandbox callback resolves %s
     symlinkSync(target, link);
     options.cli = link;
   }
+  if (installation === 'missing-login') rmSync(join(host.home, '.gemini/antigravity-cli/antigravity-oauth-token'));
   vi.stubEnv('GH_TOKEN', 'must-not-reach-child');
   vi.stubEnv('SSH_AUTH_SOCK', '/host-agent');
-  let privateHome;
+  let privateTemp;
+  let profileDir;
   spawn.mockImplementation((bin, args, opts) => {
-    privateHome = opts.env.HOME;
-    // The private HOME is the launcher's own dir: .gemini (login + settings only), the profile and the private temp.
-    expect(readdirSync(privateHome).filter(n => n !== 'profile.sb' && !n.startsWith('tmp-'))).toEqual(['.gemini']);
-    expect(readdirSync(join(privateHome, '.gemini'))).toEqual(['antigravity-cli']);
-    const privateState = join(privateHome, '.gemini/antigravity-cli');
-    expect(readdirSync(privateState).sort()).toEqual(['antigravity-oauth-token', 'settings.json']);
-    expect(readFileSync(join(privateState, 'antigravity-oauth-token')))
-      .toEqual(readFileSync(join(host.home, '.gemini/antigravity-cli/antigravity-oauth-token')));
+    expect(opts.env.HOME).toBe(host.home);
+    privateTemp = opts.env.TMPDIR;
+    profileDir = dirname(args[1]);
+    expect(readdirSync(profileDir).sort()).toEqual(['profile.sb', privateTemp.slice(profileDir.length + 1)].sort());
+    expect(readFileSync(join(host.home, '.gemini/antigravity-cli/settings.json'), 'utf8')).toBe('{}');
     expect(bin).toBe('/usr/bin/sandbox-exec');
     expect(args).toContain(realpathSync(options.cli));
     const profile = readFileSync(args[1], 'utf8');
@@ -87,12 +86,14 @@ it.each(['direct', 'homebrew-symlink'])('production sandbox callback resolves %s
       expect(transcriptDir === root || transcriptDir.startsWith(`${root}/`)).toBe(false);
     expect(transcriptDir.startsWith(`${opts.env.HOME}/`)).toBe(false);
     expect(transcriptDir.startsWith(`${host.home}/workspace/`)).toBe(false);
-    const readRule = profile.split('\n').find(line => line.startsWith('(allow file-read*'));
-    expect(readRule).toContain(`(subpath ${JSON.stringify(dirname(realpathSync(options.cli)))})`);
-    if (installation === 'homebrew-symlink') expect(readRule).toContain(`(subpath ${JSON.stringify(homebrewPrefix)})`);
+    expect([...writeRule.matchAll(/\(subpath "([^"]+)"\)/g)].map(m => m[1]))
+      .toEqual([realpathSync(options.dir), privateTemp, join(host.home, '.gemini/antigravity-cli/log')]);
+    expect(profile).not.toContain('(allow file-read*');
     expect(opts.env).not.toHaveProperty('GH_TOKEN');
     expect(opts.env).not.toHaveProperty('SSH_AUTH_SOCK');
     expect(opts.env).not.toHaveProperty('ANTIGRAVITY_QUOTA_DIR');
+    for (const root of [options.dir, options.laneDir, join(host.home, 'workspace')])
+      expect(privateTemp === root || privateTemp.startsWith(`${root}/`)).toBe(false);
     expect(opts.env.TMPDIR).toBe(opts.env.TMP);
     expect(opts.env.TMPDIR).toBe(opts.env.TEMP);
     const child = new EventEmitter();
@@ -107,7 +108,9 @@ it.each(['direct', 'homebrew-symlink'])('production sandbox callback resolves %s
   });
   expect(readAgyHold(options.model)).toBeNull();
   expect(await defaultSpawnAgy(options)).toMatchObject({ code: 1, quotaState: 'exhausted' });
-  expect(existsSync(privateHome)).toBe(false);
+  expect(existsSync(host.home)).toBe(true);
+  expect(existsSync(privateTemp)).toBe(false);
+  expect(existsSync(profileDir)).toBe(false);
   expect(readAgyHold(options.model)).toMatchObject({ fallbackDecision: 'skip-quota-hold', heldBackend: 'google' });
   expect(spawn).toHaveBeenCalledOnce();
   expect(await defaultSpawnAgy({ ...options, logFile: join(dirname(options.logFile), 'held.jsonl') })).toMatchObject({ fallbackDecision: 'skip-quota-hold' });
@@ -162,41 +165,47 @@ it('writes confined transcript through the original fd even if the pathname is r
   expect(readFileSync(target, 'utf8')).toBe('unchanged');
 });
 
-it.each(['missing', 'symlink', 'oversized', 'directory'])('refuses %s login and removes private HOME before returning', async kind => {
+it('refuses a redirected log directory with operator fallback and cleans launcher temp', async () => {
   const { root, options } = fixture();
   vi.stubEnv('TMPDIR', root);
-  const login = join(host.home, '.gemini/antigravity-cli/antigravity-oauth-token');
-  rmSync(login);
-  if (kind === 'symlink') symlinkSync(join(host.home, '.gemini/antigravity-cli/settings.json'), login);
-  if (kind === 'oversized') writeFileSync(login, Buffer.alloc(65537));
-  if (kind === 'directory') mkdirSync(login);
-  await expect(defaultSpawnAgy(options)).rejects.toThrow('agy login unavailable; use another provider or request operator review');
+  const redirected = join(root, 'redirected-log');
+  mkdirSync(redirected);
+  symlinkSync(redirected, join(host.home, '.gemini/antigravity-cli/log'));
+  await expect(defaultSpawnAgy(options)).rejects.toThrow('agy log directory is redirected; use another provider or request operator review');
   expect(spawn).not.toHaveBeenCalled();
   expect(readdirSync(root).filter(name => name.startsWith('we-agy-sandbox-'))).toEqual([]);
+  expect(existsSync(host.home)).toBe(true);
 });
 
 it.skipIf(process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec'))(
-  'REAL launcher allows private login, denies fake real-home login, and removes private HOME after run', async () => {
+  'REAL launcher uses real-HOME login, allows log writes, denies other home writes and cleans only private temp', async () => {
     const { options } = fixture();
+    mkdirSync(join(host.home, '.gemini/antigravity-cli/log'));
     const login = join(host.home, '.gemini/antigravity-cli/antigravity-oauth-token');
     writeFileSync(login, 'fixture-login');
     writeFileSync(options.cli, `#!/bin/sh
 /bin/cat "$HOME/.gemini/antigravity-cli/antigravity-oauth-token" || exit 2
-if /bin/cat "$FAKE_REAL_LOGIN"; then exit 3; fi
-printf '\nreal-home-denied\n'
+printf logged > "$HOME/.gemini/antigravity-cli/log/probe" || exit 3
+if (printf blocked > "$HOME/.gemini/other"); then exit 4; fi
+printf '\nother-home-write-denied\n'
 `);
     const actual = await vi.importActual('node:child_process');
-    let privateHome;
+    let privateTemp;
     spawn.mockImplementation((bin, args, opts) => {
-      privateHome = opts.env.HOME;
-      return actual.spawn(bin, args, { ...opts, env: { ...opts.env, FAKE_REAL_LOGIN: login } });
+      expect(opts.env.HOME).toBe(host.home);
+      privateTemp = opts.env.TMPDIR;
+      return actual.spawn(bin, args, opts);
     });
     const result = await defaultSpawnAgy(options);
     expect(result.code).toBe(0);
     expect(result.stdout).toContain('fixture-login');
-    expect(result.stdout).toContain('real-home-denied');
+    expect(result.stdout).toContain('other-home-write-denied');
     expect(result.stderr).toMatch(/EPERM|Operation not permitted/i);
-    expect(privateHome).toBeTruthy();
-    expect(existsSync(privateHome)).toBe(false);
+    expect(readFileSync(join(host.home, '.gemini/antigravity-cli/log/probe'), 'utf8')).toBe('logged');
+    expect(existsSync(join(host.home, '.gemini/other'))).toBe(false);
+    expect(readFileSync(login, 'utf8')).toBe('fixture-login');
+    expect(privateTemp).toBeTruthy();
+    expect(existsSync(privateTemp)).toBe(false);
+    expect(existsSync(host.home)).toBe(true);
   },
 );
