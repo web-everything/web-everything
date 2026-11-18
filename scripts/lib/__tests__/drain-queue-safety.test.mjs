@@ -3,10 +3,11 @@ import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from 'no
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { describe, expect, it, vi } from 'vitest';
+import { reviewedRead, completedSeat } from './fixtures/red-team-owed.mjs';
 import * as queueSafety from '../drain-queue-safety.mjs';
 import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason, decideMqSameHead, readMqTimeline, mqSameHeadGuard, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions, mqSameHeadRefreshStatePath } from '../drain-queue-safety.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
-import { parseRedTeamComment, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../red-team-gate.mjs';
+import { parseRedTeamComment, redTeamGateMarker, redTeamMarker, redTeamResultId, redTeamResultCommentForHead } from '../red-team-gate.mjs';
 import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
 import { buildReviewedShaMarker, buildReviewedDiffMarker, buildClearedHumanMarker, buildClearedFromMarker, parseLatestHumanClearedSha } from '../review-escalation.mjs';
 import { readStandingRuling, readOperatorIssues, headIsCardOnly, headBelongsToPr, readUneditedCommentIds } from '../../conveyor/standing-ruling-io.mjs';
@@ -177,7 +178,8 @@ describe('merge-queue same-head failure admission', () => {
           readDrainRedTeamEvidence: () => {
             stages.push('red-team');
             if (outcome === 'unreadable evidence') throw Error('red-team evidence unreadable');
-            return { scheduled: outcome === 'red-team hold', skipCardOnly: false };
+            return { scheduled: outcome === 'red-team hold', skipCardOnly: true,
+              loopPayload: { findings: { read: reviewedRead(head, ['backlog/refresh-fixture.md']) } }, inFlight: outcome === 'red-team hold' };
           },
           // Exercise all nested standing-ruling read adapters even without a grant in this thread.
           readStandingRuling, readOperatorIssues, headBelongsToPr, readUneditedCommentIds,
@@ -1291,7 +1293,15 @@ describe('merge-queue same-head failure admission', () => {
 });
 const bot = { author: { login: 'web-everything' } };
 const clean = (rev = head, login = 'web-everything', findings = []) => ({ author: { login }, body: renderRedTeamComment({ pr: 5283, rev, findings, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: findings.length ? 'changes' : 'accept' }) });
-const hold = (over = {}) => redTeamEnqueueHold({ scheduled: over.loopPayload !== null && over.loopPayload?.verdict?.verdict !== 'needs-human', loopPayload: { verdict: { verdict: 'accept' } }, labels: ['review:accepted'], comments: [], pr: 5283, head, env: {}, ...over });
+const hold = (over = {}) => {
+  // Gate-action tests supply completed source proof as well as carried comment syntax.
+  const hit = redTeamResultCommentForHead(over.comments, over.pr ?? 5283, over.head ?? head);
+  const carry = hit?.carriedFrom ? { fromRev: hit.carriedFrom, proof: { head: hit.carriedFrom,
+    read: reviewedRead(hit.carriedFrom), seats: [{ ...completedSeat(hit.carriedFrom), valid: true }],
+    result: { ...hit.parsed, rev: hit.carriedFrom, completedReview: hit.parsed.completedReview, shapedLines: hit.parsed.shapedLines },
+    scheduling: { skipCardOnly: false } } } : null;
+  return redTeamEnqueueHold({ carry, scheduled: over.loopPayload !== null && over.loopPayload?.verdict?.verdict !== 'needs-human', loopPayload: { verdict: { verdict: 'accept' }, findings: { read: reviewedRead(over.head ?? head) } }, seats: over.recorded || over.comments?.length ? [completedSeat(over.head ?? head)] : [], labels: ['review:accepted'], comments: [], pr: 5283, head, env: {}, ...over });
+};
 const broken = [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }];
 const gate = (sha, outcome) => ({ ...bot, body: redTeamGateMarker(5283, sha, outcome) });
 // The comment shapes review-set-label renders: `clear-human` (heading first, markers last), `restamp`, plain accept.
@@ -1579,18 +1589,18 @@ describe('durable head-bound red-team admission', () => {
     const findings = [{ ...broken[0], category: 'security', impactIfUnfixed }];
     expect(hold({ comments: [clean(head, 'web-everything', findings)] })).toMatch(/requiring send-back/);
   });
-  it.each(['WE_REVIEW_RED_TEAM', 'WE_REVIEW_EXTRA_SEATS'])('does not owe a pass with %s off', key => {
-    expect(hold({ scheduled: false, env: { [key]: '0' } })).toBeNull();
+  it.each(['WE_REVIEW_RED_TEAM', 'WE_REVIEW_EXTRA_SEATS'])('disabled scheduler does not exempt execution debt: %s', key => {
+    expect(hold({ scheduled: false, env: { [key]: '0' } })).toMatch(/no recorded result/);
     expect(hold({ scheduled: true, env: { [key]: '0' } })).toMatch(/no recorded result/);
   });
   it.each([5439, 5443])('labels alone do not schedule a red team for #%s', pr => {
-    expect(hold({ pr, loopPayload: null, labels: ['review:accepted', 'ready-to-merge'] })).toBeNull();
-    expect(hold({ pr, loopPayload: { verdict: { verdict: 'needs-human' } } })).toBeNull();
+    expect(hold({ pr, loopPayload: null, labels: ['review:accepted', 'ready-to-merge'] })).toMatch(/unreviewable-read/);
+    expect(hold({ pr, loopPayload: { verdict: { verdict: 'needs-human' } } })).toMatch(/unreviewable-read/);
   });
-  it('does not owe a pass without a panel accept', () => expect(hold({ loopPayload: null, labels: ['ready-to-merge'] })).toBeNull());
+  it('holds a missing read even without a panel accept', () => expect(hold({ loopPayload: null, labels: ['ready-to-merge'] })).toMatch(/unreviewable-read/));
   // PR #5482 red team: the card-only exemption ignored WE_RED_TEAM_SKIP_CARD_ONLY=false and a pass already running.
   it('exempts a card-only head only while the producer skips it; a started pass is always awaited', () => {
-    const loopPayload = { verdict: { verdict: 'accept' }, findings: { read: { netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] } } };
+    const loopPayload = { verdict: { verdict: 'accept' }, findings: { read: reviewedRead(head, ['backlog/123-card.md']) } };
     expect(hold({ loopPayload })).toBeNull();
     expect(hold({ loopPayload, env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' } })).toMatch(/no recorded result/);
     expect(hold({ loopPayload, env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, inFlight: true })).toMatch(/no recorded result/);

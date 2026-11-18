@@ -2634,10 +2634,19 @@ queue listings; include same-head holds, abbreviated legacy Head markers and mis
 
 ## Drain enqueue confirmation
 
-Post-accept admission imports the review scheduler’s `redTeamOwedFor` and `redTeamEnabled` over
-the exact repo/PR/head review payload; acceptance labels alone never establish an owed pass.
-An owed pass waits for the trusted red-team result marker for the exact PR and live head. Replay both GraphQL `author.login` and REST `user.login` bot comments, plus untrusted
-lookalikes. Persist red-team pending age and retry time per PR/head in queue state and preserve it
+Post-accept admission uses `redTeamOwedDecision` over the normalized input built by
+`readDrainRedTeamEvidence` using the shared `drain-red-team-input.mjs` normalization leaf.
+The queue imports that leaf rather than the review/recovery IO graph, which otherwise creates
+an initialization cycle through `merge-ai-prs.mjs`. Missing or unscored reads hold even without scheduling evidence.
+Only a scored, non-empty, head-bound card-only read with skip enabled, no seat rows and no
+live or queued work proves exemption. A completed pass requires a publishable completed-review
+comment, the scored read, and schema-valid seat rows including a completed seat. Marker-only
+and policy-clear comments never pay execution debt. Carry recursively needs a clear source
+with the same result id. Route with the fixed hold `kind`/`blocking` table, never message text;
+legacy pending records without a kind get a fresh deadline read. The acceptance and policy
+suites replay persisted evidence, and source mutations pin each admission delegation and
+reject prose-based routing. Replay both GraphQL `author.login` and REST `user.login` bot
+comments, plus untrusted lookalikes. Persist red-team pending age and retry time per PR/head in queue state and preserve it
 through follow-up writes. `drain.redTeamPendingBackoffSec` defaults to 300; a newly observed comment
 can wake the head early. `drain.redTeamPendingMaxMin` defaults to 45; even during backoff, an accepted
 head past that age must log a named health smell and recheck complete comments and run evidence.
@@ -2658,7 +2667,7 @@ until its result arrives; a local pid probe cannot prove a remote process has cr
 cases, plus old records without birth-time metadata and finished records. Also replay acceptance
 with empty status and run stores: labels alone still do not schedule work (#5439/#5443). The
 persisted accepting run must hold admission before the job's first running-status write. Missing
-or pruned run evidence remains the explicit label-only boundary, rather than an invented accept.
+or pruned run evidence cannot prove exemption or a completed pass and holds admission.
 A confirmed send-back finding still holds during the result-comment → gate-label race. Queue
 admission must also read the exact combined comment emitted by verdict carry: gate markers,
 the carried marker and producer prose, then the re-keyed advisory. Test the real review job's

@@ -41,7 +41,7 @@ import { resolveApprovalLicensesEnqueue, proveHumanOnlyLicense } from './human-o
 import { labelSignature } from './drain-prestage.mjs';
 import { readRedTeamGateSource, readRedTeamCheckFact, resolveWeAppId } from './red-team-check-run.mjs';
 import { readRedTeamPublicationHold, readDrainRedTeamEvidence, settleUnknownEvidenceByComment } from './drain-red-team-evidence.mjs';
-import { readDrainQueueSafety, redTeamEnqueueHold, redTeamLabelHoldReason, dequeueSentBack, sendBackReason, queueLabels } from './drain-queue-safety.mjs';
+import { readDrainQueueSafety, redTeamAdmissionHold, redTeamLabelHoldReason, dequeueSentBack, sendBackReason, queueLabels } from './drain-queue-safety.mjs';
 import { readRedTeamDeadlineAction, RED_TEAM_DEADLINE_OVERRIDE } from './red-team-gate.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { isUnderTest } from './under-test.mjs';
@@ -352,9 +352,10 @@ export function createDrainMergeStrategy({
       const comments = pages.flat();
       const standingRuling = grantScopeFor(c, head, comments);
       evidence = settleUnknownEvidenceByComment(evidence, comments, c.num, head, live.reviews);
-      reason = redTeamEnqueueHold({ ...evidence, comments, pr: c.num, head, repo: slugOf(c.repo), env, standingRuling });
+      const hold = redTeamAdmissionHold({ ...evidence, comments, pr: c.num, head, repo: slugOf(c.repo), env, standingRuling });
       // The check owns pending/wait states; confirmed breaks and unknown evidence still fail closed.
-      if (!reason || (!reason.includes('requiring send-back') && evidence.ok !== false)) return null;
+      if (!hold || !hold.blocking) return null;
+      reason = hold.message;
     } catch {
       reason = 'red-team evidence unreadable; hold and inspect run evidence and complete comments';
     }
@@ -434,9 +435,9 @@ export function createDrainMergeStrategy({
         const comments = pages.flat();
         if (checkRunOnly || !safety.value.waitForRedTeamBeforeEnqueue) return { allowed: true, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
         const evidence = settleUnknownEvidenceByComment(readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env }), pages.flat(), c.num, headSha, live.reviews);
-        const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env,
+        const hold = redTeamAdmissionHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env,
           standingRuling: grantScopeFor(c, headSha, pages.flat()) });
-        return { allowed: !reason, reason, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
+        return { allowed: !hold, reason: hold?.message ?? null, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
       } catch { return { allowed: false, reason: 'red-team evidence unreadable' }; }
     },
     enqueue(c, headSha, { comments = null, prepared = null, sameHeadAdmission } = {}) {
@@ -489,7 +490,7 @@ export function createDrainMergeStrategy({
           : Array.isArray(comments) && comments.length > (pending?.commentCount ?? 0);
         // At the deadline recheck evidence and comments even if the normal retry backoff is longer.
         if (!preparedAdmission && sameHead && pending.retryAt > now() && !newComment
-          && !(overdue && pending.reason.includes('no recorded result')
+          && !(overdue && (pending.holdKind == null || pending.holdKind === 'pass-owed')
             && (pending.checkedAt ?? pending.firstPendingAt) < pending.firstPendingAt + (safety.value.redTeamPendingMaxMin ?? 45) * 60_000)) {
           log.write(`  merge-queue: #${c.num} red-team-pending backoff until ${new Date(pending.retryAt).toISOString()} (head and review/comment evidence unchanged)\n`);
           return pendingOutcome(c, pending, true);
@@ -498,7 +499,8 @@ export function createDrainMergeStrategy({
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team admission: unreadable complete comments');
         const standingRuling = grantScopeFor(c, headSha, pages.flat());
         evidence = settleUnknownEvidenceByComment(evidence, pages.flat(), c.num, headSha, live.reviews);
-        const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env, standingRuling });
+        const hold = redTeamAdmissionHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env, standingRuling });
+        const reason = hold?.message;
         try {
           const statusInput = { repo: slugOf(c.repo), pr: c.num, head: headSha, evidence, env, standingRuling,
             live, comments: pages.flat(), provider: statusProvider, log: say };
@@ -523,7 +525,7 @@ export function createDrainMergeStrategy({
           before.redTeamPending ??= {};
           const wait = { headSha, firstPendingAt: sameHead ? pending.firstPendingAt : now(),
             retryAt: now() + (safety.value.redTeamPendingBackoffSec ?? 300) * 1000,
-            commentCount: pages.flat().length, observation, checkedAt: now(), reason,
+            commentCount: pages.flat().length, observation, checkedAt: now(), reason, holdKind: hold.kind,
             ...(sameHead && pending.requestedAt != null ? { requestedAt: pending.requestedAt } : {}),
             ...(sameHead && pending.requestAttemptedAt != null ? { requestAttemptedAt: pending.requestAttemptedAt } : {}),
             ...(sameHead && pending.deadlineHeldAt != null ? { deadlineHeldAt: pending.deadlineHeldAt } : {}),
@@ -536,15 +538,15 @@ export function createDrainMergeStrategy({
           writeState(statePath, before);
           const outcome = pendingOutcome(c, wait);
           // Before the deadline, and for a confirmed break (its own send-back routing), the hold is the whole answer.
-          if (!outcome.healthSmell || reason.includes('requiring send-back')) return outcome;
+          if (!outcome.healthSmell || hold.kind === 'break') return outcome;
           // Past the deadline with NO red-team result on this exact head. The PR stays HELD: it may move only on a
           // result for this head, a proven-identical carry of one, an operator ruling through the red-team ruling path
-          // (all read by redTeamEnqueueHold above), or a card-only diff that owes no pass. Never a timed bypass.
+          // (all read by redTeamAdmissionHold above), or a card-only diff that owes no pass. Never a timed bypass.
           const maxMin = safety.value.redTeamPendingMaxMin ?? 45;
           const source = deadline.sources?.deadlineAction ?? 'standard';
           // Unknown run evidence (`ok:false`, e.g. a capped scan) is never "missing": a run may exist past the cap, so
           // it neither re-requests nor reaches the operator override; it holds below with its reason named.
-          const unknown = evidence.ok === false;
+          const unknown = hold.blocking;
           const missing = !unknown && !evidence.inFlight && !evidence.queued && !evidence.recorded;
           if (missing && deadlineAction === 'requeue-then-hold') {
             // The one re-request for this head gets its own full wait before the operator is asked.
@@ -576,7 +578,7 @@ export function createDrainMergeStrategy({
             const why = missing ? (wait.requestedAt != null ? 'still none after one re-request'
               : wait.requestAttemptedAt != null ? 'the one re-request was not accepted'
               : deadlineAction === 'hold' ? 'redTeam.deadlineAction=hold' : 'no red-team request path')
-              : unknown ? `run evidence unknown (${evidence.reason})` : evidence.inFlight ? 'run still in flight' : evidence.queued ? 'run still queued' : 'run left no usable result';
+              : unknown ? `run evidence unknown (${evidence.reason ?? hold.kind})` : evidence.inFlight ? 'run still in flight' : evidence.queued ? 'run still queued' : 'run left no usable result';
             const heldReason = `held: no red-team result on this head after ${Math.floor((now() - wait.firstPendingAt) / 60_000)} min (${why})`;
             if (wait.deadlineHeldAt == null) {
               wait.deadlineHeldAt = now();

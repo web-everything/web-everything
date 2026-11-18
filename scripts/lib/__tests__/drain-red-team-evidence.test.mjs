@@ -8,6 +8,7 @@ import { newRunRecord, readRun, writeRun } from '../../operations/run-store.mjs'
 import { readRedTeamPublicationHold } from '../drain-red-team-evidence.mjs';
 import { historicalCardOnlySkipCandidate, readDrainRedTeamEvidence, recordRedTeamStatus, readRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
+import { reviewedRead, completedSeat, completedComment } from './fixtures/red-team-owed.mjs';
 import { redTeamOwedFor } from '../review-red-team-policy.mjs';
 import { pidStartTime } from '../pid-alive.mjs';
 import { readRedTeamCarry, resumeRedTeamCarry } from '../red-team-carry-machine.mjs';
@@ -24,8 +25,7 @@ function fixture() {
   return { repo: 'web-everything/web-everything', pr: 5439, head: 'b'.repeat(40), runsDir,
     readScorecards: () => [], env: { WE_SHARED_RUNS_DIR: runsDir } };
 }
-const cleanResultComment = f => ({ author: { login: 'web-everything' }, body:
-  `<!-- we:red-team-advisory pr=${f.pr} rev=${f.head} -->\n### Post-accept red team — no break found` });
+const cleanResultComment = f => completedComment(f.pr, f.head);
 // Seal at finish (#6535, operator ruling R907): the seat's sealer is the shared publisher in seal-only mode over the
 // exact-head seat row. This one runs it for real over a fixture row and thread.
 const seatRow = (head, findings = []) => ({ rev: head, findings, provider: 'fixture', model: 'fixture', callId: 'c',
@@ -37,7 +37,12 @@ const sealAtFinish = (f, { findings = [], comments = [cleanResultComment(f)], ca
     listComments: () => comments, postComment: () => { throw Error('seal at finish never posts'); },
     readSeatRow: () => seatRow(key.head, findings), publishNeedsYou: () => {} });
 };
-const payload = head => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
+const payload = head => ({ verdict: { verdict: 'accept' }, findings: { read: reviewedRead(head) } });
+
+// Additive normalized evidence is asserted alongside every legacy unknown-read snapshot.
+const unknownEvidence = (reason, reader = readDrainRedTeamEvidence) => ({ ok: false, reason,
+  ...(reader === readDrainRedTeamEvidence ? { seats: [], seatRecorded: false, completedRecorded: false, failedSeatCount: 0,
+    decisionInput: expect.objectContaining({ ok: false, reason, seats: [] }) } : {}) });
 
 describe('status persistence and check publication share one claim', () => {
   it.each(['pending', 'running', 'finished'])('under-test %s writes without an injected publisher never call gh or create a publication hold', status => {
@@ -92,9 +97,9 @@ describe('status persistence and check publication share one claim', () => {
   ])('a finished clean red team ignores %s labels but preserves explicit send-back failure', (_name, labels) => {
     const f = fixture(), checks = [];
     const input = { ...f, loopPayload: payload(f.head), status: 'finished', result: 'ran' };
-    const options = { env: f.env, log: () => {}, sealFinished: sealAtFinish(f),
+    const options = { env: f.env, readScorecards: () => [completedSeat(f.head, { repo: f.repo, pr: f.pr })], log: () => {}, sealFinished: sealAtFinish(f),
       comments: [{ author: { login: 'web-everything' }, body:
-        `<!-- we:red-team-advisory pr=${f.pr} rev=${f.head} -->\n### Post-accept red team — no break found` }],
+        completedComment(f.pr, f.head).body }],
       gh: () => JSON.stringify({ headRefOid: f.head, labels }),
       postCheckRun: ({ payload: check }) => { checks.push(check); return { ok: true }; } };
 
@@ -109,7 +114,7 @@ describe('status persistence and check publication share one claim', () => {
   // Operator ruling R907 (#6535): seal at finish. The check is written ONCE, from the sealed result; a bare `ran` result
   // never publishes FAILURE; nothing re-publishes it later.
   describe('seal at finish (R907)', () => {
-    const finishOptions = (f, checks, extra = {}) => ({ env: f.env, log: () => {}, comments: [cleanResultComment(f)],
+    const finishOptions = (f, checks, extra = {}) => ({ env: f.env, readScorecards: () => [completedSeat(f.head, { repo: f.repo, pr: f.pr })], log: () => {}, comments: [cleanResultComment(f)],
       gh: () => JSON.stringify({ headRefOid: f.head, labels: ['ready-to-merge', 'review:accepted'] }),
       postCheckRun: ({ payload: check }) => { checks.push(check); return { ok: true }; }, ...extra });
     const finished = f => ({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'ran' });
@@ -204,7 +209,7 @@ describe('status persistence and check publication share one claim', () => {
     it('pins the unsealed-hold prefix to the gate\'s own wording', () => {
       const f = fixture();
       recordRedTeamStatus(finished(f), { env: f.env });
-      const hold = redTeamEnqueueHold({ ...finished(f), head: f.head, comments: [cleanResultComment(f)], scheduled: true,
+      const hold = redTeamEnqueueHold({ ...finished(f), seats: [completedSeat(f.head)], head: f.head, comments: [cleanResultComment(f)], scheduled: true,
         recorded: true, env: f.env });
       expect(hold).toMatch(new RegExp(`^${RED_TEAM_UNSEALED_HOLD_PREFIX}`));
       sealAtFinish(f, { comments: [] })({ repo: f.repo, pr: f.pr, head: f.head });
@@ -216,9 +221,9 @@ describe('status persistence and check publication share one claim', () => {
   it('successful completion followed by failed publication of a terminal failure keeps the hold and attempts the failure supersede', () => {
     const f = fixture(), appId = 5037855, runs = [], attempts = [];
     const input = { ...f, loopPayload: payload(f.head), status: 'finished' };
-    const options = { env: f.env, log: () => {}, sealFinished: sealAtFinish(f),
+    const options = { env: f.env, readScorecards: () => [completedSeat(f.head, { repo: f.repo, pr: f.pr })], log: () => {}, sealFinished: sealAtFinish(f),
       comments: [{ author: { login: 'web-everything' }, body:
-        `<!-- we:red-team-advisory pr=${f.pr} rev=${f.head} -->\n### Post-accept red team — no break found` }],
+        completedComment(f.pr, f.head).body }],
       gh: () => JSON.stringify({ headRefOid: f.head, labels: ['ready-to-merge', 'review:accepted'] }),
       postCheckRun: ({ payload: check }) => {
         runs.push({ ...check, id: runs.length + 1, app: { id: appId } });
@@ -282,9 +287,9 @@ describe('status persistence and check publication share one claim', () => {
     const f = fixture(), appId = 5037855, runs = [], attempts = [], logs = [];
     const input = { ...f, loopPayload: payload(f.head) };
     const options = {
-      env: f.env, sealFinished: sealAtFinish(f),
+      env: f.env, readScorecards: () => [completedSeat(f.head, { repo: f.repo, pr: f.pr })], sealFinished: sealAtFinish(f),
       comments: [{ author: { login: 'web-everything' }, body:
-        `<!-- we:red-team-advisory pr=${f.pr} rev=${f.head} -->\n### Post-accept red team — no break found` }],
+        completedComment(f.pr, f.head).body }],
       gh: () => JSON.stringify({ headRefOid: f.head, labels: ['ready-to-merge', 'review:accepted'] }),
       log: line => logs.push(JSON.parse(line)),
       postCheckRun: ({ payload: check }) => {
@@ -463,9 +468,9 @@ describe('status persistence and check publication share one claim', () => {
     };
     const newerOptions = { env: f.env, gh: () => '', postCheckRun: publish };
     recordRedTeamStatus({ ...input, status: 'finished', result: 'ran' }, {
-      env: f.env, sealFinished: sealAtFinish(f),
+      env: f.env, readScorecards: () => [completedSeat(f.head, { repo: f.repo, pr: f.pr })], sealFinished: sealAtFinish(f),
       comments: [{ author: { login: 'web-everything' }, body:
-        `<!-- we:red-team-advisory pr=${f.pr} rev=${f.head} -->\n### Post-accept red team — no break found` }],
+        completedComment(f.pr, f.head).body }],
       gh: () => JSON.stringify({ headRefOid: f.head, labels: ['ready-to-merge', 'review:accepted'] }),
       postCheckRun: args => {
         // A is paused after persistence, before its success reaches GitHub. B
@@ -754,14 +759,14 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
   });
 
   it('does not invent an accept when no review run exists', () => {
-    expect(readDrainRedTeamEvidence(fixture())).toEqual({ loopPayload: null, recorded: false,
+    expect(readDrainRedTeamEvidence(fixture())).toEqual({ loopPayload: null, recorded: false, seats: [], decisionInput: expect.objectContaining({ read: undefined, seats: [], result: null }),
       seatRecorded: false, completedRecorded: false, failedSeatCount: 0, scheduled: false, inFlight: false });
   });
   it('pins the accepted-label boundary with empty status and run stores', () => {
     const f = fixture();
     const evidence = readDrainRedTeamEvidence(f);
     // #5439/#5443: an acceptance label alone cannot invent scheduler work that never existed.
-    expect(redTeamEnqueueHold({ ...f, ...evidence, labels: ['review:accepted'], comments: [] })).toBeNull();
+    expect(redTeamEnqueueHold({ ...f, ...evidence, labels: ['review:accepted'], comments: [] })).toMatch(/unreviewable-read/);
     // A persisted accepting verdict holds before the job publishes its first status: the loop applies the labels
     // before the job can write one. It is not a live queue entry, so the never-scheduled deadline still applies.
     const run = { ...newRunRecord({ id: 'review-pr-5439', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }), ...payload(f.head) };
@@ -770,12 +775,12 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     expect(readDrainRedTeamEvidence(f).queued).toBeUndefined();
     expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), labels: ['review:accepted'], comments: [] })).toMatch(/no recorded result/);
     // A disabled scheduler or a non-accepting run schedules nothing; the job's finished status supersedes the run.
-    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence({ ...f, env: { ...f.env, WE_REVIEW_RED_TEAM: 'off' } }), comments: [] })).toBeNull();
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence({ ...f, env: { ...f.env, WE_REVIEW_RED_TEAM: 'off' } }), comments: [] })).toMatch(/no recorded result/);
     writeRun({ ...run, verdict: { verdict: 'changes' } }, f.runsDir);
     expect(readDrainRedTeamEvidence(f).scheduled).toBe(false);
     writeRun(run, f.runsDir);
     recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'skipped' }, f);
-    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toBeNull();
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toMatch(/no recorded result/);
   });
   it('an earlier finished status on the same head never supersedes a newer accepting run', () => {
     const f = fixture();
@@ -783,13 +788,13 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'not-owed' }, f);
     const statusFile = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
     utimesSync(statusFile, new Date(1_000_000), new Date(1_000_000));
-    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toBeNull();
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toMatch(/no recorded result/);
     writeRun({ ...newRunRecord({ id: 'review-pr-2', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }), ...payload(f.head) }, f.runsDir);
     expect(readDrainRedTeamEvidence(f)).toMatchObject({ scheduled: true, inFlight: false });
     expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toMatch(/no recorded result/);
     // The re-review's own later status supersedes the run again.
     recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'skipped' }, f);
-    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toBeNull();
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toMatch(/no recorded result/);
   });
   it('a newer accepting run does not hide a finished but unpublished result on the same head', () => {
     const f = fixture();
@@ -832,22 +837,22 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
   // PR #5482 self-review: the review job and the drain resolve WE_RED_TEAM_SKIP_CARD_ONLY in separate processes.
   it('carries the writer\'s card-only skip decision to the drain, whatever the drain process resolves', () => {
     const f = fixture();
-    const cardOnly = { ...payload(f.head), findings: { read: { netBasis: { rev: f.head }, netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] } } };
+    const cardOnly = { ...payload(f.head), findings: { read: { ...reviewedRead(f.head, ['backlog/123-card.md']) } } };
     const live = { ...f, isAlive: () => true, readPidStart: () => 'start' };
     recordRedTeamStatus({ ...f, loopPayload: cardOnly, status: 'queued' }, { ...f, env: { ...f.env, WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, readPidStart: () => 'start' });
     expect(readDrainRedTeamEvidence(live).skipCardOnly).toBe(false);
     expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(live), comments: [] })).toMatch(/no recorded result/);
     recordRedTeamStatus({ ...f, loopPayload: cardOnly, status: 'queued' }, { ...f, env: { ...f.env, WE_RED_TEAM_SKIP_CARD_ONLY: 'true' }, readPidStart: () => 'start' });
-    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(live), env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, comments: [] })).toBeNull();
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(live), env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, comments: [] })).toMatch(/no recorded result/);
   });
   it('holds an owing card-only run until the job records its skip decision', () => {
     const f = fixture();
-    const read = { netBasis: { rev: f.head }, netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] };
+    const read = { ...reviewedRead(f.head, ['backlog/123-card.md']) };
     writeRun({ ...newRunRecord({ id: 'review-pr-5439', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }), verdict: { verdict: 'accept' }, findings: { read } }, f.runsDir);
     expect(readDrainRedTeamEvidence(f).skipCardOnly).toBe(false);
     expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'true' }, comments: [] })).toMatch(/no recorded result/);
     recordRedTeamStatus({ ...f, loopPayload: { verdict: { verdict: 'accept' }, findings: { read } }, status: 'queued' }, { ...f, env: { ...f.env, WE_RED_TEAM_SKIP_CARD_ONLY: 'true' }, readPidStart: () => 'start' });
-    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence({ ...f, isAlive: () => true, readPidStart: () => 'start' }), comments: [] })).toBeNull();
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence({ ...f, isAlive: () => true, readPidStart: () => 'start' }), comments: [] })).toMatch(/no recorded result/);
   });
   it('does not mistake a reused pid for the original red-team process', () => {
     const f = fixture();
@@ -1028,9 +1033,9 @@ it.each(['non-card read', 'missing read paths', 'non-card rename source', 'skipC
     }
     const hasSeat = ['recorded seat', 'live-head seat'].includes(variant);
     const evidence = readDrainRedTeamEvidence({ ...f, isAlive: () => true, readPidStart: () => null,
-      readScorecards: () => hasSeat ? [{ dispatchKind: 'review-seat', seat: 'red-team', repo: f.repo,
-        pr: f.pr, rev: variant === 'live-head seat' ? f.head : oldHead }] : [] });
-    expect(evidence).toEqual({ loopPayload: null, recorded: variant === 'live-head seat',
+      readScorecards: () => hasSeat ? [completedSeat(variant === 'live-head seat' ? f.head : oldHead, { repo: f.repo, pr: f.pr, status: 'error' })] : [] });
+    expect(evidence).toEqual({ loopPayload: null, seats: variant === 'live-head seat' ? [expect.objectContaining({ rev: f.head, valid: true })] : [],
+      decisionInput: expect.objectContaining({ head: f.head, read: undefined }), recorded: variant === 'live-head seat',
       seatRecorded: variant === 'live-head seat', completedRecorded: false,
       failedSeatCount: variant === 'live-head seat' ? 1 : 0, scheduled: variant === 'live-head seat', inFlight: false });
   });
@@ -1038,7 +1043,7 @@ it.each(['non-card read', 'missing read paths', 'non-card rename source', 'skipC
 it.each([['unparseable', 1, false], ['error', 1, false], ['ok', 0, true]])(
   'counts failed %s seats only for the exact repo/PR/head', (status, failedSeatCount, completedRecorded) => {
     const f = fixture();
-    const row = { dispatchKind: 'review-seat', seat: 'red-team', repo: f.repo, pr: f.pr, rev: f.head, status };
+    const row = completedSeat(f.head, { repo: f.repo, pr: f.pr, status });
     f.readScorecards = () => [row, { ...row, rev: 'a'.repeat(40) }, { ...row, repo: 'another/repo' }];
     expect(readDrainRedTeamEvidence(f)).toMatchObject({ failedSeatCount, completedRecorded, seatRecorded: true });
   });
@@ -1478,7 +1483,7 @@ describe('abandoned and start-less review runs have a defined outcome', () => {
   it.each(both)('%s holds a recent start-less record that may have started after the selected run', (_name, reader) => {
     const f = fixture();
     const { args } = setup(f, a => ({ op: 'review-pr', input: a.input, verdict: null, pending: null, effects: [], findings: {} }), 20_000);
-    expect(reader({ ...args, now: 20_000 + 60_000 })).toEqual({ ok: false, reason: 'run-start-missing' });
+    expect(reader({ ...args, now: 20_000 + 60_000 })).toEqual(unknownEvidence('run-start-missing', reader));
   });
   it.each(both)('%s ignores a run that crashed before its read step once it is abandoned', (_name, reader) => {
     const f = fixture();
@@ -1490,7 +1495,7 @@ describe('abandoned and start-less review runs have a defined outcome', () => {
   it.each(both)('%s holds a newer verdict-less run while it may still be live, then ignores it once abandoned', (_name, reader) => {
     const f = fixture();
     const { accepted, args } = setup(f, a => ({ ...a, verdict: null, ...started(15_000) }), 20_000);
-    expect(reader({ ...args, now: 20_000 + 60_000 })).toEqual({ ok: false, reason: 'review-unfinished' });
+    expect(reader({ ...args, now: 20_000 + 60_000 })).toEqual(unknownEvidence('review-unfinished', reader));
     const result = reader({ ...args, now: 20_000 + HOUR });
     expect(result.ok).not.toBe(false);
     expect(result.newest ?? result.loopPayload).toEqual(accepted);
@@ -1503,8 +1508,8 @@ describe('abandoned and start-less review runs have a defined outcome', () => {
     '%s holds a verdict-bearing newer run with %s as review-unfinished', (_name, _what, reader, work) => {
       const f = fixture();
       const { args } = setup(f, a => ({ ...a, verdict: { verdict: 'accept' }, ...work, ...started(15_000) }), 20_000);
-      expect(reader({ ...args, now: 20_000 + 60_000 })).toEqual({ ok: false, reason: 'review-unfinished' });
-      expect(reader({ ...args, now: 20_000 + 30 * 24 * HOUR })).toEqual({ ok: false, reason: 'review-unfinished' });
+      expect(reader({ ...args, now: 20_000 + 60_000 })).toEqual(unknownEvidence('review-unfinished', reader));
+      expect(reader({ ...args, now: 20_000 + 30 * 24 * HOUR })).toEqual(unknownEvidence('review-unfinished', reader));
     });
   // PR #6584: a refused clearance ends the run (`pending: null`, `outcome: 'refused'`) without applying the label, so it must
   // never read as a finished accept or rejection.
@@ -1514,8 +1519,8 @@ describe('abandoned and start-less review runs have a defined outcome', () => {
     '%s holds a refused %s run as review-unfinished (never completed evidence)', (_name, _what, reader, verdict) => {
       const f = fixture();
       const { args } = setup(f, a => ({ ...a, ...verdict, pending: null, outcome: 'refused', effects: [refusedEffect], ...started(15_000) }), 20_000);
-      expect(reader({ ...args, now: 20_000 + 60_000 })).toEqual({ ok: false, reason: 'review-unfinished' });
-      expect(reader({ ...args, now: 20_000 + 30 * 24 * HOUR })).toEqual({ ok: false, reason: 'review-unfinished' });
+      expect(reader({ ...args, now: 20_000 + 60_000 })).toEqual(unknownEvidence('review-unfinished', reader));
+      expect(reader({ ...args, now: 20_000 + 30 * 24 * HOUR })).toEqual(unknownEvidence('review-unfinished', reader));
     });
   it.each(both)('%s selects the same verdict-bearing newer run once nothing is pending (control)', (_name, reader) => {
     const f = fixture();
@@ -1528,14 +1533,14 @@ describe('abandoned and start-less review runs have a defined outcome', () => {
     const f = fixture();
     for (const waiting of [{ pending: { kind: 'judge' } }, { effects: [{ status: 'pending' }] }, { effects: [{ status: 'in-flight' }] }]) {
       const { args } = setup(f, a => ({ ...a, verdict: null, ...waiting, ...started(15_000) }), 20_000);
-      expect(reader({ ...args, now: 20_000 + 30 * 24 * HOUR })).toEqual({ ok: false, reason: 'review-unfinished' });
+      expect(reader({ ...args, now: 20_000 + 30 * 24 * HOUR })).toEqual(unknownEvidence('review-unfinished', reader));
     }
   });
   it.each(both)('%s never treats a rewound resume the review loop may still finish as abandoned', (_name, reader) => {
     const f = fixture();
     // rewindRunToStep clears verdict and pending but keeps the read start; the loop marks it resumeOf.
     const { args } = setup(f, a => ({ ...a, verdict: null, resumeOf: { attempts: 1 }, ...started(15_000) }), 20_000);
-    expect(reader({ ...args, now: 20_000 + 30 * 24 * HOUR })).toEqual({ ok: false, reason: 'review-unfinished' });
+    expect(reader({ ...args, now: 20_000 + 30 * 24 * HOUR })).toEqual(unknownEvidence('review-unfinished', reader));
   });
   it.each(both)('%s keeps an older stale verdict-less run from blocking a newer finished accept', (_name, reader) => {
     const f = fixture();
@@ -1565,7 +1570,7 @@ describe('review ordering uses persisted run start time', () => {
     ]) {
       const result = reader({ ...f, list: () => ['review-pr-a', 'review-pr-b'], stat: () => ({ mtimeMs: 1 }),
         read: id => id === missing ? { ...base, ...invalidStart } : { ...base, ...started(2000) } });
-      expect(result).toEqual({ ok: false, reason: 'run-start-missing' });
+      expect(result).toEqual(unknownEvidence('run-start-missing', reader));
       expect(redTeamEnqueueHold({ ...f, ...result, comments: [] })).toMatch(/run-start-missing/);
     }
   });
@@ -1734,7 +1739,7 @@ describe('recovery while a quiet review awaits human confirm', () => {
     expect(p.decide()).toMatchObject({ action: 'dispatch', mode: 'fresh', staleRecovery: true, why: 'dead owner recovery' });
     expect(p.decide().escalate).toBeUndefined();
     expect(readFileSync(p.runPath, 'utf8')).toBe(p.before);
-    expect(readDrainRedTeamEvidence({ ...p.f, now })).toEqual({ ok: false, reason: 'review-unfinished' });
+    expect(readDrainRedTeamEvidence({ ...p.f, now })).toEqual(unknownEvidence('review-unfinished'));
   });
 
   it('keeps a live owner held even when the pending review is quiet', () => {

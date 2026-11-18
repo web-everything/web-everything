@@ -3,6 +3,8 @@ import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { redTeamRequired, VERDICTS } from './jury-core.mjs';
 import { ADVISORY_OUTCOMES } from './advisory-labels.mjs';
 import { advisoryLabelOutcome } from './review-advisory-outcome.mjs';
+import { isPublishableRedTeamResult, redTeamResultId } from './red-team-gate.mjs';
+import { completedRedTeamSeat } from './red-team-run-result.mjs';
 
 /** Kill switch: `0` (or `off`/`false`) turns every added seat off. Unset = on. */
 export const EXTRA_SEATS_ENV = 'WE_REVIEW_EXTRA_SEATS';
@@ -51,14 +53,53 @@ export function redTeamCardOnly(read) {
   return isCardOnlyDiff(paths);
 }
 
-/**
- * Is a red-team result owed on this head? A pass that started or finished is always owed its result. A card-only
- * head is exempt only while the producer skips it: the skip decision the producer's process recorded with the
- * head's status (`evidence.skipCardOnly`) wins over `skipCardOnly`, the caller's own resolved setting.
- */
-export function redTeamOwedOnHead({ read, evidence = {}, skipCardOnly = true } = {}) {
-  if (evidence.inFlight || evidence.recorded) return true;
-  const skip = typeof evidence.skipCardOnly === 'boolean' ? evidence.skipCardOnly : skipCardOnly;
-  if (skip && redTeamCardOnly(read)) return false;
-  return !!evidence.scheduled;
+/** Fixed routing: prose is operator output, never a machine discriminator. */
+export const RED_TEAM_HOLDS = Object.freeze(Object.fromEntries(Object.entries({
+  break: [true, 'post-accept red team confirmed a break requiring send-back'],
+  'evidence-unknown': [true, 'post-accept red team evidence unknown; hold and inspect run evidence'],
+  'carry-conflict': [true, 'post-accept red team carry conflicts with head evidence; hold and inspect run evidence'],
+  'unreviewable-read': [true, 'post-accept red team read is unreviewable (unreviewable-read); hold and inspect scored head-bound diff evidence'],
+  'seat-rows-invalid': [true, 'post-accept red team seat rows invalid; hold and inspect scorecard evidence before retrying'],
+  'result-incomplete': [true, 'post-accept red team result incomplete; hold and inspect completed review and seat evidence'],
+  'pending-publish': [false, 'post-accept red team result is not published yet (stored evidence not sealed); hold until the sweep publishes it'],
+  'pass-owed': [false, 'post-accept red team has no recorded result on the live head'],
+}).map(([kind, [blocking, message]]) => [kind, Object.freeze({ kind, blocking, message })])));
+
+/** Empty or unscored reads cannot prove either a pass or a card-only exemption. */
+export function redTeamReadReviewable(read, head) {
+  return typeof head === 'string' && !!head && read?.netBasis?.rev === head
+    && read.diffScored === true && typeof read.diffText === 'string' && !!read.diffText.trim();
+}
+
+/** One decision for admission, recovery and carry. Inputs are normalized by the evidence reader. */
+export function redTeamOwedDecision({ head, read, seats, result, carry, scheduling = {},
+  ok, reason, carryConflict, hasBreak = false, pendingPublish = false } = {}) {
+  const reasons = [];
+  const hold = kind => reasons.push(RED_TEAM_HOLDS[kind]);
+  if (hasBreak) hold('break');
+  if (ok === false) reasons.push({ ...RED_TEAM_HOLDS['evidence-unknown'],
+    message: `post-accept red team evidence unknown (${reason}); hold and inspect run evidence` });
+  if (carryConflict) hold('carry-conflict');
+  const reviewable = redTeamReadReviewable(read, head);
+  if (pendingPublish) hold('pending-publish');
+  if (!reviewable) hold('unreviewable-read');
+  const validSeats = Array.isArray(seats) && seats.every(row => row?.valid === true);
+  if (!validSeats) hold('seat-rows-invalid');
+  const exempt = reviewable && validSeats && seats.length === 0 && scheduling.skipCardOnly === true
+    && redTeamCardOnly(read) && !scheduling.inFlight && !scheduling.queued;
+  let owed = !exempt || reasons.length > 0;
+  const completedResult = isPublishableRedTeamResult(result) && result.completedReview === true && result.rev === head;
+  let carried = false;
+  if (carry) {
+    carried = completedResult && !!carry.fromRev && carry.fromRev !== head && !!carry.proof
+      && !!redTeamResultId(result) && redTeamResultId(result) === redTeamResultId(carry.proof.result)
+      && redTeamOwedDecision({ ...carry.proof, head: carry.fromRev }).cleared;
+    if (!carried && !carryConflict) hold('carry-conflict');
+    if (!carried) owed = true;
+  }
+  if (owed && !carried) {
+    if (!result) hold('pass-owed');
+    else if (!(completedResult && read?.netBasis?.rev === result.rev && validSeats && seats.some(completedRedTeamSeat))) hold('result-incomplete');
+  }
+  return { owed, cleared: reasons.length === 0, reasons };
 }

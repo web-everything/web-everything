@@ -1,8 +1,9 @@
 /** Derived operator labels; head-bound scheduling and recorded dispositions remain authoritative. */
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { readFileSync } from 'node:fs';
-import { redTeamCardOnly, redTeamOwedOnHead } from './review-red-team-policy.mjs';
+import { redTeamCardOnly, redTeamOwedDecision } from './review-red-team-policy.mjs';
 import { RED_TEAM_SETTINGS_FILE, readRedTeamDisposition, readRedTeamProbes, redTeamHoldPendingOnly } from './red-team-gate.mjs';
+import { readDrainRedTeamEvidence } from './drain-red-team-evidence.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 
@@ -46,7 +47,7 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
     : pendingOnly ? 'red-team:pending'
     : disposition.result ? 'red-team:clear'
       : finished ? finished
-      : redTeamOwedOnHead({ read: evidence.loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly }) ? 'red-team:pending' : null;
+      : redTeamOwedDecision(readDrainRedTeamEvidence({ repo, pr, head, env, comments, standingRuling, evidence }).decisionInput).owed ? 'red-team:pending' : null;
   const names = labels.map(l => typeof l === 'string' ? l : l?.name);
   // A head PROVEN card-only (readable net files, skip policy on) with no pass in flight, scheduled or recorded bypasses the
   // red-team pass and never gets an outcome, so its stale pending label would stay forever (#6733). Only pending is dropped:
@@ -68,10 +69,12 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
     // Rename evidence must be present (an array): a missing list could hide a code-to-backlog rename.
     && Array.isArray(evidence.loopPayload?.findings?.read?.netRenameSources)
     && redTeamCardOnly(evidence.loopPayload?.findings?.read);
-  return { add: desired && !names.includes(desired) ? desired : null,
+  return { add: desired && !names.includes(desired)
+      && !(desired === 'red-team:pending' && names.includes('red-team:blocked')) ? desired : null,
     // With nothing owed and no result (`desired` null) a hold label (pending or blocked) must not be dropped on
     // unreadable or missing local evidence: only a recorded outcome replaces it.
     remove: names.filter(l => RED_TEAM_STATUS_LABELS.includes(l) && l !== desired
+      && !(l === 'red-team:blocked' && desired === 'red-team:pending')
       && !(desired === null && (l === 'red-team:blocked' || (l === 'red-team:pending' && !cardOnlyBypass)))) };
 }
 

@@ -1,6 +1,6 @@
 /** Queue admission and removal share this policy and head-bound red-team evidence. */
 import { inspectMqReruns, requestMqReruns } from './drain-mq-flake-rerun.mjs';
-import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
+import { redTeamOwedDecision } from './review-red-team-policy.mjs';
 import { execFileSync } from 'node:child_process';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
 import { mkdirSync, readFileSync } from 'node:fs';
@@ -11,7 +11,7 @@ import { cascadePolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { readSharedFreeze } from './red-main-freeze-shared.mjs';
 import { readSettings } from './settings-files.mjs';
 import { readMergeQueueState } from './merge-queue-enqueue.mjs';
-import { readRedTeamDisposition, readRedTeamProbes, redTeamHoldPendingOnly } from './red-team-gate.mjs';
+import { drainRedTeamDecisionInput } from './drain-red-team-input.mjs';
 import { readQuarantine } from './red-main-quarantine-io.mjs';
 import { activeEntries, parseVitestFailures, QUARANTINE_SAFETY_NET_DEFAULTS } from './red-main-quarantine.mjs';
 
@@ -1209,27 +1209,15 @@ export function sendBackReason(labels) {
   return hold ? `state is ${hold}` : !names.includes('ready-to-merge') ? 'ready-to-merge was removed' : null;
 }
 
-/** Only head-bound scheduled work is owed; acceptance and status labels cannot invent a run. */
-export function postAcceptRedTeamOwed(loopPayload, env = process.env, evidence = {}) {
-  return redTeamOwedOnHead({ read: loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly });
+/** A typed hold keeps routing independent of operator wording. */
+export function redTeamAdmissionHold(input = {}) {
+  const decisionInput = drainRedTeamDecisionInput({ ...input, evidence: input });
+  const { reasons } = redTeamOwedDecision(decisionInput);
+  return reasons.find(hold => hold.blocking) ?? reasons[0] ?? null;
 }
 
-export function redTeamEnqueueHold({ ok, reason, loopPayload, comments, pr, head, repo = null, standingRuling = null, env = process.env, confirmedBreaks, scheduled = false, inFlight = false, recorded = false, skipCardOnly } = {}) {
-  // A recorded break still holds even if the scheduler is now disabled or the payload is unavailable.
-  // `standingRuling`: the verified scope, so an automatic grant counts here exactly as in the gate (PR #5758).
-  const disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks, repo, standingRuling });
-  // A hold that is only "publication pending" (PR #6622) is no break: it still holds, but after the unknown-evidence
-  // reason, so a capped scan is reported as such.
-  const pendingOnly = redTeamHoldPendingOnly(disposition);
-  if (!pendingOnly && (disposition.sendBack.length || disposition.held.length))
-    return 'post-accept red team confirmed a break requiring send-back';
-  // Unknown run evidence holds after the break check, so a capped scan never hides send-back routing; a result
-  // comment cannot release it either.
-  if (ok === false) return `post-accept red team evidence unknown (${reason}); hold and inspect run evidence`;
-  if (pendingOnly) return 'post-accept red team result is not published yet (stored evidence not sealed); hold until the sweep publishes it';
-  if (!postAcceptRedTeamOwed(loopPayload, env, { scheduled, inFlight, recorded, skipCardOnly }) || disposition.result) return null;
-  return 'post-accept red team has no recorded result on the live head';
-}
+/** Compatibility for callers that only display a hold. */
+export const redTeamEnqueueHold = input => redTeamAdmissionHold(input)?.message ?? null;
 
 /** Membership is authoritative both before and after the mutation. A retry after success posts no duplicate. */
 export function dequeueSentBack({ repo, pr, reason, exec = execFileSync, log = () => {} } = {}) {

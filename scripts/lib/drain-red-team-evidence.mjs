@@ -1,7 +1,7 @@
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
 import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher } from './red-team-check-run.mjs';
-import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
+import { drainRedTeamDecisionInput } from './drain-red-team-input.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { runGhSync } from './gh-throttle.mjs';
 import { createHash, randomUUID } from 'node:crypto';
@@ -12,7 +12,7 @@ import { foreignStaleOwnerDead } from './red-team-foreign-host-stale.mjs';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { isRunRecordTerminal, listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operations/run-store.mjs';
 import { createNewestRunFinder, RUN_SCAN_CAPPED } from './stream-filter-runs.mjs';
-import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
+import { readStore, resolveScorecardStorePath, validateScorecard } from '../conveyor/run-scorecard-store.mjs';
 import { pidNamespace, pidStartTime } from './pid-alive.mjs';
 
 /** Three-valued existence shared by the evidence reader and the recovery probe, so they cannot disagree:
@@ -26,7 +26,7 @@ export function pidExistence(pid, kill = (p, s) => process.kill(p, s)) {
     throw Error(`pid existence unknown: ${error?.code ?? 'unreadable'}`);
   }
 }
-import { redTeamEnabled, redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
+import { redTeamEnabled, redTeamOwedFor, redTeamCardOnly, redTeamOwedDecision } from './review-red-team-policy.mjs';
 import { readRedTeamProbes, redTeamForHead, redTeamResultCommentForHead } from './red-team-gate.mjs';
 import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
 import { completedRedTeamSeat } from './red-team-run-result.mjs';
@@ -676,6 +676,7 @@ export function recordRedTeamStatus(input, options = {}) {
           return result;
         };
         if (!remoteHold) preHold = setRemoteHold(`${input.status} round publication in progress`);
+        let admission;
         let hold = 'red-team evidence unreadable; inspect the PR thread';
         let sendBack = input.sendBack === true;
         let checkStatus = input.status;
@@ -696,14 +697,18 @@ export function recordRedTeamStatus(input, options = {}) {
             const live = JSON.parse(gh(['pr', 'view', String(input.pr), '--repo', input.repo, '--json', 'headRefOid,labels'],
               { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
             if (live?.headRefOid !== head || !Array.isArray(live.labels)) throw Error('red-team live head or labels unreadable');
-            hold = redTeamEnqueueHold({ ...input, head, comments, scheduled: true,
-              recorded: input.result === 'ran', env: options.env ?? process.env });
+            const evidence = readDrainRedTeamEvidence({ repo: input.repo, pr: input.pr, head, env: options.env ?? process.env,
+              readScorecards: options.readScorecards });
+            const { decisionInput } = readDrainRedTeamEvidence({ evidence, repo: input.repo, pr: input.pr, head, comments, env: options.env ?? process.env });
+            const { reasons } = redTeamOwedDecision(decisionInput);
+            admission = reasons.find(hold => hold.blocking) ?? reasons[0];
+            hold = admission?.message ?? null;
           } catch { /* unreadable evidence retains the hold */ }
           // A result not yet sealed or not yet posted (the sealer failed, none was given, or its post failed) is no break:
           // it must not publish FAILURE (R907). It publishes the check as in progress, which still holds merge-gate
           // (fail closed) without naming a break. A confirmed break or unknown evidence keeps its failure.
-          if (!sendBack && typeof hold === 'string' && (hold.startsWith(RED_TEAM_UNSEALED_HOLD_PREFIX)
-            || (hold.startsWith(RED_TEAM_NO_RESULT_HOLD_PREFIX) && persistedOwesPublication(path)))) checkStatus = 'running';
+          if (!sendBack && (admission?.kind === 'pending-publish'
+            || (admission?.kind === 'pass-owed' && persistedOwesPublication(path)))) checkStatus = 'running';
         }
         const payload = redTeamCheckRunPayload({ repo: input.repo, pr: input.pr, headSha: head, status: checkStatus, hold, sendBack });
         const post = payload => {
@@ -925,15 +930,28 @@ export function historicalCardOnlySkipCandidate(old) {
     && !old.recorded && !old.inFlight && !old.queued;
 }
 
-/** Absence of a review payload is not an accept. Labels alone never schedule a post-accept pass. */
-export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
+/** Normalize one head snapshot for policy. `evidence` supplies an already-read snapshot without another scan. */
+export function readDrainRedTeamEvidence({ evidence, comments, carryHeads = [], ...options } = {}) {
+  const raw = evidence ?? readDrainRedTeamSnapshot(options);
+  const snapshot = { ...raw, seats: (raw.seats ?? []).map(row => ({ ...row, valid: validateScorecard(row).ok })) };
+  const readSource = ({ head, comments }) => {
+    if (carryHeads.includes(head) || head === options.head) throw Error('carry cycle; inspect run evidence');
+    return readDrainRedTeamEvidence({ ...options, head, comments, carryHeads: [...carryHeads, options.head] }).decisionInput;
+  };
+  const decisionInput = drainRedTeamDecisionInput({ ...options, evidence: snapshot, comments, readSource });
+  // Keep the source reader with its snapshot across object spreads, without persisting an IO capability.
+  Object.defineProperty(decisionInput, 'readSource', { value: readSource });
+  return { ...snapshot, decisionInput };
+}
+
+function readDrainRedTeamSnapshot({ repo, pr, head, env = process.env,
   runsDir = resolveRunsDir(), list = listRunIds, read = readRun, stat = statSync, lookup, scanSettings = { env }, warn, now = Date.now(), isAlive = pidExistence, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime,
-  readScorecards = () => readStore({ path: resolveScorecardStorePath(env) }).records } = {}) {
-  const seats = readScorecards().filter(row => row.dispatchKind === 'review-seat' && row.seat === 'red-team'
+  readScorecards = () => readStore({ path: resolveScorecardStorePath(env), strict: true }).records } = {}) {
+  const seats = readScorecards().filter(row => row?.dispatchKind === 'review-seat' && row.seat === 'red-team'
     && row.repo === repo && Number(row.pr) === Number(pr) && row.rev === head);
   const recorded = seats.length > 0;
-  const seatEvidence = { seatRecorded: recorded, completedRecorded: seats.some(completedRedTeamSeat),
-    failedSeatCount: seats.filter(row => !completedRedTeamSeat(row)).length };
+  const seatEvidence = { seats, seatRecorded: recorded, completedRecorded: seats.some(completedRedTeamSeat),
+    failedSeatCount: seats.every(row => validateScorecard(row).ok) ? seats.filter(row => !completedRedTeamSeat(row)).length : null };
   // The parse cap covers historical and recovery fallbacks too.
   const latestRun = lookup ?? reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, scanSettings, warn, now });
   // The review loop applies the accept labels before the job can write a status, so a persisted accepting run that
@@ -951,7 +969,7 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   const carriedFrom = carry?.loopPayload.carriedFrom ?? status?.loopPayload?.carriedFrom;
   if (carriedFrom) {
     const latestHit = latestRun(false);
-    if (latestHit.ok === false) return latestHit;
+    if (latestHit.ok === false) return { ...latestHit, ...seatEvidence };
     const latest = latestHit.run;
     const laterPanel = latest && latest.findings?.read?.netBasis?.rev !== carriedFrom;
     const ownStatus = status === undefined || (status?.repo === repo && Number(status.pr) === Number(pr) && status.head === head
@@ -972,7 +990,7 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   }
   if (status?.repo === repo && Number(status.pr) === Number(pr) && status.head === head) {
     const latest = latestRun(true, undefined, { writtenAfter: statusAt, newestHead: carriedFrom });
-    if (latest.ok === false) return latest;
+    if (latest.ok === false) return { ...latest, ...seatEvidence };
     // A finished status from an earlier review of this same head never supersedes a newer accepting run (a re-review
     // of an unchanged head labels its accept before its job writes `queued`).
     if (!['queued', 'running'].includes(status.status)) {
@@ -1010,7 +1028,7 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
       ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: ['queued', 'running'].includes(status.status) || ['ran', 'error', 'failed'].includes(resultStatus), recorded: recorded || resultStatus === 'ran' };
   }
   const exactHit = latestRun();
-  if (exactHit.ok === false) return exactHit;
+  if (exactHit.ok === false) return { ...exactHit, ...seatEvidence };
   const loopPayload = exactHit.run;
   if (!loopPayload && !recorded) {
     const olderHit = latestRun(false);
@@ -1079,6 +1097,6 @@ export function settleUnknownEvidenceByComment(evidence, comments, pr, head, rev
   let complete = null;
   try { complete = typeof bounds.completeHeadRead === 'function' ? bounds.completeHeadRead({ pr, head, at }) : null; } catch { /* unreadable: stays held */ }
   if (complete?.complete !== true || complete.blocked !== false) return evidence;
-  return { ok: true, settledByComment: evidence.reason, loopPayload: null, scheduled: false, inFlight: false,
+  return { ...evidence, ok: true, settledByComment: evidence.reason, scheduled: false, inFlight: false,
     queued: false, recorded: true, skipCardOnly: false };
 }

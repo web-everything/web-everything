@@ -9,7 +9,7 @@ import { runReviewJob, createReviewJobIo } from '../review-job.mjs';
 import { readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir } from '../../lib/drain-red-team-evidence.mjs';
 import { normalizeRedTeamResult, planRedTeamOnSkip, redTeamSkipNeedsSettlement, planRedTeamRecovery, abandonStaleRedTeamRun, recoveryProbe } from '../../lib/review-red-team-on-skip.mjs';
 import { newRunRecord, writeRun } from '../run-store.mjs';
-import { redTeamOwedOnHead } from '../../lib/review-red-team-policy.mjs';
+import { redTeamOwedDecision } from '../../lib/review-red-team-policy.mjs';
 import { planRedTeamStatusLabels } from '../../lib/red-team-status-labels.mjs';
 import { redTeamMarker } from '../../lib/red-team-gate.mjs';
 import { speculateRedTeam, runRedTeam } from '../review-extra-seats.mjs';
@@ -745,7 +745,7 @@ describe('writer skipCardOnly setting on a code PR', () => {
       expect(cliAvailable).toHaveBeenCalled();
       const evidence = readDrainRedTeamEvidence({ repo, pr, head, env, list: () => [], readScorecards: () => [] });
       expect(evidence).toMatchObject({ skipCardOnly: true, scheduled: true, recorded: false, inFlight: false });
-      expect(redTeamOwedOnHead({ read: status.loopPayload.findings.read, evidence })).toBe(true);
+      expect(redTeamOwedDecision(evidence.decisionInput).owed).toBe(true);
       expect(planRedTeamStatusLabels({ repo, pr, head, evidence, env, comments: [] }))
         .toEqual({ add: 'red-team:pending', remove: [] });
     } finally { rmSync(root, { recursive: true, force: true }); }

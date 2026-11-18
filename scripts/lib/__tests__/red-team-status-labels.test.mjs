@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readDrainRedTeamEvidence, recordRedTeamStatus } from '../drain-red-team-evidence.mjs';
 import { planRedTeamStatusLabels, syncRedTeamStatusLabels } from '../red-team-status-labels.mjs';
+import { reviewedRead } from './fixtures/red-team-owed.mjs';
 import { resolveRedTeamProbes } from '../red-team-gate.mjs';
 const head = 'a'.repeat(40);
 const result = (findings = '') => ({ author: { login: 'web-everything' }, body: `<!-- we:red-team-advisory pr=42 rev=${head} -->\n${findings}` });
@@ -36,7 +37,7 @@ describe('head-bound red-team operator labels', () => {
   it('drops old-head labels without trusting stale or forged results', () => {
     for (const comments of [[result()], [{ ...result(), author: { login: 'attacker' } }]]) {
       expect(planRedTeamStatusLabels({ ...input, head: 'b'.repeat(40), comments }))
-        .toEqual({ add: null, remove: ['red-team:clear'] });
+        .toEqual({ add: 'red-team:pending', remove: ['red-team:clear'] });
     }
   });
   it('does not publish against a changed head or when disabled', () => {
@@ -46,7 +47,7 @@ describe('head-bound red-team operator labels', () => {
     expect(provider.setLabels).not.toHaveBeenCalled();
   });
   it('shows a card-only head as pending only when the pass is not skipped or has started', () => {
-    const loopPayload = { findings: { read: { netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] } } };
+    const loopPayload = { findings: { read: reviewedRead(head, ['backlog/123-card.md']) } };
     const plan = (env, evidence) => planRedTeamStatusLabels({ ...input, labels: [], comments: [], env, evidence: { loopPayload, ...evidence } }).add;
     expect(plan({}, { scheduled: true })).toBeNull();
     expect(plan({ WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, { scheduled: true })).toBe('red-team:pending');
@@ -145,7 +146,7 @@ describe('stale pending on a card-only current head', () => {
     expect(run(() => { throw Error('gh down'); }).plan.remove).toEqual([]);
     // A throwing head re-check must never let stored card-only evidence drop pending (fail closed, audit probe).
     const recheckThrows = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrFiles: () => ['scripts/x.mjs'], readPrState: () => { throw Error('gh down'); } };
-    const bypassEvidence = { skipCardOnly: true, loopPayload: { findings: { read: { netChangedFiles: ['backlog/1-c.md'], netRenameSources: [], netBasis: { rev: head } } } } };
+    const bypassEvidence = { skipCardOnly: true, loopPayload: { findings: { read: reviewedRead(head, ['backlog/1-c.md']) } } };
     expect(syncRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], evidence: bypassEvidence, live: { headRefOid: head, labels: ['red-team:pending'] }, comments: [], provider: recheckThrows }))
       .toEqual({ add: null, remove: [] });
     expect(recheckThrows.setLabels).not.toHaveBeenCalled();
@@ -170,7 +171,7 @@ it('headFiles path keeps pending when the settings file is unreadable (the defau
 });
 
 describe('card-only head that bypasses the red-team pass loses a stale pending label (#6733)', () => {
-  const card = { findings: { read: { netChangedFiles: ['backlog/8182-card.md'], netRenameSources: [], netBasis: { rev: head } } } };
+  const card = { findings: { read: reviewedRead(head, ['backlog/8182-card.md']) } };
   const plan = (labels, evidence, env = {}) => planRedTeamStatusLabels({ ...input, labels, comments: [], env, evidence });
   it('removes red-team:pending when the head is proven card-only and nothing is owed', () => {
     expect(plan(['red-team:pending'], { loopPayload: card })).toEqual({ add: null, remove: ['red-team:pending'] });
