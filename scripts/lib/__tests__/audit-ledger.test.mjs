@@ -20,7 +20,10 @@ function ledger(records, legacy = '') {
   return { text: legacy + lines.join('\n') + '\n', lines, hwm: { seq: records.length, lineHash: sha256Line(lines.at(-1)) } };
 }
 const options = { head: HEAD, liveFp: FP, now: NOW, priorQuestionHashes: [], covers: () => true };
-const evaluate = (l, extra = {}) => evaluateAudit(l.text, { ...options, hwm: l.hwm, ...extra });
+// Rule 9: each side applies a waiver under its own rules, so the legacy side gets the same waiver as a ruled gate.
+const legacyGate = w => ({ ruledWeakened: { ruling: 'R1047', findings: w.findings }, record: { sha: w.sha, fingerprint: w.fingerprint ?? FP } });
+const withGate = extra => extra.waivers?.length && !extra.ruledWeakened ? { ...extra, ruledWeakened: legacyGate(extra.waivers[0]) } : extra;
+const evaluate = (l, extra = {}) => evaluateAudit(l.text, { ...options, hwm: l.hwm, ...withGate(extra) });
 let root, path;
 beforeEach(() => { root = fs.mkdtempSync(join(tmpdir(), 'audit-evaluator-')); path = join(root, 'audits.jsonl'); });
 afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -41,8 +44,9 @@ describe('R1047 attack table', () => {
   it('H3 related-head higher seq vetoes despite earlier at', () => {
     expect(evaluate(ledger([pass(), weak({ head: OTHER, at: '2026-11-01T00:00:00Z' })])).ok).toBe(false);
   });
-  it('H3b higher seq pass clears despite earlier at', () => {
-    expect(evaluate(ledger([weak({ head: OTHER }), pass({ at: '2026-11-01T00:00:00Z' })])).ok).toBe(true);
+  it('H3b higher seq pass clears when legacy order agrees', () => {
+    expect(evaluate(ledger([weak({ head: OTHER }), pass({ at: '2026-11-17T11:30:00Z' })])).ok).toBe(true);
+    expect(evaluate(ledger([weak({ head: OTHER }), pass({ at: '2026-11-01T00:00:00Z' })])).ok).toBe(false); // legacy (main) veto by timestamp stands
   });
   it('H4 missing fp and failed recomputation is blocking unknown', () => {
     expect(evaluate(ledger([pass(), weak({ head: OTHER, fingerprint: null })]), { resolveFingerprint: () => { throw Error('git failed'); } }).ok).toBe(false);
@@ -89,6 +93,22 @@ describe('R1047 attack table', () => {
     expect(evaluate(ledger([pass(), weak()]), { waivers }).ok).toBe(true);
     expect(evaluate(ledger([pass(), weak(), weak()]), { waivers }).ok).toBe(false);
   });
+  it('rule 9 property: across the fixture matrix v2 never passes where main\'s legacy evaluator refuses', () => {
+    const FP2 = 'e'.repeat(64);
+    const pieces = [pass(), weak(), pass({ head: OTHER }), weak({ head: OTHER }), pass({ head: OTHER, fingerprint: FP2 }), weak({ head: OTHER, fingerprint: FP2 }),
+      pass({ at: '2026-11-17T11:30:00Z' }), weak({ base: OTHER }), pass({ at: '2099-01-01T00:00:00Z' }), weak({ fingerprint: null }), pass({ base: HEAD.toUpperCase() })];
+    const waiverSets = [undefined, [{ sha: HEAD, findings: weak().findings }], [{ sha: HEAD, auditId: 'id-1', findings: weak().findings }]];
+    let evaluated = 0, passed = 0;
+    for (const a of pieces) for (const b of [...pieces, null]) for (const c of [...pieces, null]) for (const waivers of waiverSets) {
+      const records = [a, b, c].filter(Boolean), l = ledger(records);
+      const extra = waivers ? { waivers } : {}, v2 = evaluate(l, extra);
+      const legacy = canonicalAuditEvidence(records, HEAD, () => true, FP, { ...withGate(extra).ruledWeakened ? { ruledWeakened: withGate(extra).ruledWeakened } : {}, now: NOW, priorQuestionHashes: [] });
+      evaluated++;
+      if (v2.ok) { passed++; expect(legacy.ok, JSON.stringify({ records, waivers })).toBe(true); }
+    }
+    expect(evaluated).toBeGreaterThan(4000);
+    expect(passed).toBeGreaterThan(100);
+  });
   it('rule 0: identical commits with differently cased shas are an empty range, never a pass', () => {
     expect(evaluate(ledger([pass({ base: HEAD.toUpperCase() })])).ok).toBe(false);
     expect(evaluate(ledger([pass({ head: HEAD.toUpperCase(), base: HEAD })]), { head: HEAD.toUpperCase() }).ok).toBe(false);
@@ -108,7 +128,7 @@ describe('R1047 attack table', () => {
   it('a pass on another related head never clears a related-head WEAKENED; only the live head does', () => {
     const THIRD = 'e'.repeat(40);
     expect(evaluate(ledger([weak({ head: OTHER }), pass({ head: THIRD })])).ok).toBe(false);
-    expect(evaluate(ledger([weak({ head: OTHER }), pass({ head: THIRD }), pass()])).ok).toBe(true);
+    expect(evaluate(ledger([weak({ head: OTHER }), pass({ head: THIRD }), pass({ at: '2026-11-17T11:30:00Z' })])).ok).toBe(true);
   });
   it('chained records without genesis cannot downgrade to legacy ordering', () => {
     const l = ledger([weak(), pass()]);
@@ -122,7 +142,7 @@ describe('R1047 attack table', () => {
     const text = resealed.join('\n') + '\n';
     const hwm = { seq: 0, lineHash: sha256Line(resealed.at(-1)) };
     const waivers = [{ sha: HEAD, findings: weak().findings }];
-    expect(evaluateAudit(text, { ...options, hwm, waivers }).ok).toBe(false);
+    expect(evaluateAudit(text, { ...options, hwm, ...withGate({ waivers }) }).ok).toBe(false);
   });
   it('a reseal does not promote an unchained pass to trusted legacy evidence', () => {
     const first = ledger([weak()]);

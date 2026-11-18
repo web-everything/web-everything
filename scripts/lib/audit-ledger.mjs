@@ -11,7 +11,7 @@ const chained = r => Number.isSafeInteger(r?.seq) && typeof r.id === 'string' &&
 const fail = reason => ({ ok: false, reason });
 
 /** Arrays are compatibility inputs only; file readers MUST supply raw bytes. */
-export function evaluateAudit(ledgerText, options = {}) {
+function evaluateV2(ledgerText, options = {}) {
   const { head, base, liveFp: suppliedFp, covers = () => true, hwm, hwmPresent = hwm !== undefined,
     now = Date.now(), priorQuestionHashes = resolvePriorQuestionHashes(), questionHash = QUESTION_HASH, lookup = false } = options;
   const raw = Buffer.from(Array.isArray(ledgerText) ? ledgerText.map(r => JSON.stringify(r)).join('\n') : ledgerText);
@@ -94,6 +94,26 @@ export function evaluateAudit(ledgerText, options = {}) {
   const pass = [...passes, ...authorized].filter(e => related(e) && (!ownAny || lower(e.r.head) === lower(head)) && e.r.questionHash === questionHash
     && (base === undefined || lower(e.r.base) === lower(base)) && covered(e.r.base)).sort((a, b) => b.order - a.order)[0];
   return pass ? { ok: true, record: pass.r } : fail(broken ? 'chain-break' : 'no-record');
+}
+
+/** Rule 9: v2 may only ADD blocks. PASS needs v2 AND main's legacy evaluator to pass; a v2 waiver never turns a legacy block into a pass. */
+export function evaluateAudit(ledgerText, options = {}) {
+  const raw = Array.isArray(ledgerText) ? null : Buffer.from(ledgerText);
+  const parsed = raw ? String(raw).split('\n').flatMap(line => { try { return [JSON.parse(line)]; } catch { return []; } }) : ledgerText;
+  const memo = new Map(), covers = b => { if (!memo.has(b)) { try { memo.set(b, !!(options.covers ?? (() => true))(b)); } catch { memo.set(b, false); } } return memo.get(b); };
+  const opts = { ...options, covers };
+  const migrated = parsed.some(r => r?.kind === 'genesis') || options.hwmPresent || options.hwm !== undefined;
+  const res = evaluateV2(ledgerText, opts);
+  if (!res.ok || !migrated) return res; // a ledger that was never migrated IS the legacy evaluation
+  const { head, now = Date.now(), priorQuestionHashes = resolvePriorQuestionHashes() } = options;
+  const records = parsed.filter(r => r?.kind !== 'genesis');
+  if (options.lookup) {
+    const found = legacyFindAudit(records, { head: res.record.head, base: res.record.base, questionHash: QUESTION_HASH, priorQuestionHashes, now });
+    return found?.verdict === 'WEAKENED' ? { ...fail('weakened'), record: found } : res;
+  }
+  const legacy = legacyCanonicalAuditEvidence(records, head, covers, options.liveFp,
+    { ...('ruledWeakened' in options ? { ruledWeakened: options.ruledWeakened } : {}), now, priorQuestionHashes });
+  return legacy.ok ? res : legacy;
 }
 
 /** Single raw-file adapter; unreadable ledger/sidecar is never positive evidence. */
