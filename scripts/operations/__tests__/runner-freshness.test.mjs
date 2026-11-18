@@ -138,6 +138,8 @@ describe('runner freshness policy', () => {
         "telemetry-summary",
         "unpark",
         "update-branch",
+        "urgent-sweep",
+        "urgent-verify",
         "verify",
         "why",
         "worker-capacity",
