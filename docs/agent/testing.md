@@ -4679,7 +4679,7 @@ workers exercise patch admission; they are not evidence of production confinemen
 `operations/__tests__/fix-run.test.mjs` fixtures through the host heavy-admission queue.
 
 Slice B supersedes the production-unavailable note above: macOS builds now launch through
-`/usr/bin/sandbox-exec`, with default-denied writes and explicit clone, agy state/cache and OS
+`/usr/bin/sandbox-exec`, with default-denied writes and explicit clone, private HOME `.gemini` and private
 temporary-directory grants. Network remains allowed. The pure profile builder consumes canonical
 absolute paths; the launcher resolves existing paths and resolves absent secret roots through their
 nearest existing ancestor (unreadable paths and broken symlinks refuse). Writable roots under the
@@ -4695,10 +4695,18 @@ cover unsupported hosts and missing sandbox-exec without launching a worker. Run
 files and the fix-run fixtures only via the host heavy-admission queue; fake-worker evidence alone
 does not establish confinement. These slice B tests were authored without running them.
 
-The build profile grants only clone, private per-run temp, `~/.gemini/antigravity-cli`,
-and `~/.gemini/projects.json` / `projects.json.*.tmp` writes (plus the named devices).
-`TMPDIR`, `TMP` and `TEMP` point to the private temp; OS temp roots and shared `.gemini`
-remain read-only. The REAL probe covers these boundaries. Build transcript admission checks
+The build profile grants only clone, private per-run temp and the private HOME's `.gemini`
+writes (plus the named devices). The launcher creates that HOME outside workspace/lane/clone,
+copies settings with only the clone trusted, and copies config using no-follow regular-file reads
+bounded to 64KB. Directory config permits at most 16 immediate entries: files copied at mode 0600
+and directories recreated empty at mode 0700. Absent config/settings are empty state; redirected,
+malformed, special-file or oversized configuration refuses with a provider/
+operator fallback. The launcher removes only its own mkdtemp root after the run. `HOME` is replaced;
+`TMPDIR`, `TMP` and `TEMP` point to the private temp. Real home `.gemini` receives no read or write
+allowance. The REAL probe covers private state writes and real state write/conversation-read denial.
+Private-config fixtures cover the size boundary, symlinks and invalid evidence. The shared admission
+predicate rechecks every tracked/untracked applied path for protected components at every depth and
+the declared doc/test classification; a single violation voids the whole patch before application. Build transcript admission checks
 every tool update against the native-tool allowlist and clone containment regardless of status;
 errored tools cannot bypass it. The juror's separate error exemption does not apply to builds.
 

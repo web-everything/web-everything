@@ -31,6 +31,10 @@ function fixture() {
   const dir = join(root, 'clone');
   const laneDir = join(root, 'lane');
   for (const p of [dirname(cli), dir, laneDir]) mkdirSync(p, { recursive: true });
+  mkdirSync(join(host.home, '.gemini/antigravity-cli'), { recursive: true });
+  mkdirSync(join(host.home, '.gemini/config/projects'), { recursive: true });
+  writeFileSync(join(host.home, '.gemini/antigravity-cli/settings.json'), '{}', { mode: 0o600 });
+  writeFileSync(join(host.home, '.gemini/config/config.json'), '{}', { mode: 0o600 });
   writeFileSync(cli, '#!/bin/sh\nexit 0\n');
   chmodSync(cli, 0o700);
   vi.stubEnv('ANTIGRAVITY_QUOTA_DIR', join(root, 'quota'));

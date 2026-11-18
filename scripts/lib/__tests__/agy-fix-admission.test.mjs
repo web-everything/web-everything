@@ -24,6 +24,7 @@ describe('repair scope admission', () => {
   });
   it.each(['.git/config', '.GIT/config', '.github/workflows/ci.yml', '.github', 'package.json',
     'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lockb', 'npm-shrinkwrap.json',
+    'docs/.github/workflows/x.yml', 'tests/deep/pnpm-lock.yaml', 'docs/scripts/settings/config.json',
     'scripts/settings/agy-build.json', 'scripts/settings', 'scripts', 'nested/package.json'])
   ('refuses protected scope %s with operator fallback via null admission', path => {
     expect(deriveAgyFixAdmission({ taskKind: 'fix', size: 1, scope: [path] })).toBeNull();

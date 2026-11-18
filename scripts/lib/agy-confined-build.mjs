@@ -1,15 +1,16 @@
 /** R1062/S7: sandbox-exec enforced filesystem confinement plus patch/transcript checks.
  * The launcher alone applies admitted hunks; agy's git operations remain forbidden. */
 import { execFileSync, spawn } from 'node:child_process';
-import { accessSync, constants, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { accessSync, constants, existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { escapingSymlinks, gitControlFiles, snapshotCheckout, changedControl, changedCheckouts,
   stateChangingToolCalls, READ_ONLY_AGY_TOOLS, scrubPaths, MODULE_REPO_ROOT } from './agy-review-juror.mjs';
 import { buildScratchCloneArgv, summarizeAgyEvents, runAgyDirectExec } from '../gemini-direct-task.mjs';
-import { buildSandboxEnv, buildSandboxProfile, sandboxedSpawnArgv, sandboxSecretPaths } from './agy-sandbox.mjs';
+import { buildSandboxEnv, buildSandboxProfile, preparePrivateAgyHome, sandboxedSpawnArgv, sandboxSecretPaths } from './agy-sandbox.mjs';
 import { readAgyHold, saveAgyHold } from './antigravity-run-evidence.mjs';
 import { resolveCascade, formatCascadeSourcesLine } from './policy-cascade.mjs';
+import { isAgyFixPathAllowed } from './agy-fix-admission.mjs';
 import { fenceUntrusted, FENCED_DATA_RULE } from './mandate-fence.mjs';
 
 // The juror's SAFE_GIT is private; keep its pins at every git boundary, including injected exec.
@@ -48,17 +49,15 @@ export async function defaultSpawnAgy(options) {
   const executable = candidates.find(p => { try { accessSync(p, constants.X_OK); return true; } catch { return false; } });
   if (!executable) throw new Error('agy executable unavailable; use another provider or request operator review');
   const cli = realpathSync(executable);
-  const state = join(homeDir, '.gemini/antigravity-cli');
-  if ([state, join(homeDir, '.gemini/projects.json'), join(homeDir, '.gemini/config')].some(p => canonicalPath(p) !== p))
-    throw new Error('redirected agy state; use another provider or request operator review');
-  mkdirSync(state, { recursive: true, mode: 0o700 });
   const profileDir = mkdtempSync(join(temp, 'we-agy-sandbox-'));
   try {
     const workspaceDir = canonicalPath(join(homeDir, 'workspace'));
     if ([options.dir, options.laneDir, workspaceDir, join(homeDir, 'workspace')].some(p => profileDir === p || profileDir.startsWith(`${canonicalPath(p)}/`)))
       throw new Error('sandbox profile must be outside clone, lane and workspace');
+    const privateHomeDir = profileDir;
+    preparePrivateAgyHome(homeDir, privateHomeDir, realpathSync(options.dir));
     const privateTempDir = mkdtempSync(join(profileDir, 'tmp-'));
-    const profile = buildSandboxProfile({ cloneDir: realpathSync(options.dir), homeDir, privateTempDir,
+    const profile = buildSandboxProfile({ cloneDir: realpathSync(options.dir), homeDir, privateTempDir, privateHomeDir,
       laneDir: realpathSync(options.laneDir), workspaceDir, agyBinDir: dirname(cli),
       workspaceOps: canonicalPath(join(homeDir, 'workspace/.operations')),
       deniedPaths: sandboxSecretPaths(homeDir).map(canonicalPath) });
@@ -67,7 +66,7 @@ export async function defaultSpawnAgy(options) {
     return await runAgyDirectExec({ ...options, cli, readHold: readAgyHold, saveHold: saveAgyHold, spawnFn: (bin, args, opts) => {
       const [, ...argv] = sandboxedSpawnArgv(profileFile, [bin, ...args]);
       return spawn('/usr/bin/sandbox-exec', argv, { ...opts,
-        env: buildSandboxEnv(process.env, privateTempDir) });
+        env: buildSandboxEnv(process.env, privateTempDir, privateHomeDir) });
     } });
   } finally { rmSync(profileDir, { recursive: true, force: true }); }
 }
@@ -202,7 +201,7 @@ export async function runConfinedAgyBuild({ task, laneDir, scope, kind, size, mo
     const diffFlags = ['--no-ext-diff', '--no-textconv', '--no-renames'];
     const raw = git(['-C', clone, 'diff', '--raw', '-z', ...diffFlags, startHead]).split('\0');
     const paths = [];
-    const rejectPath = p => !validPath(p) || !inScope(p, scope) || p.split('/').includes('.gitattributes');
+    const rejectPath = p => !isAgyFixPathAllowed(p, kind) || !inScope(p, scope) || p.split('/').includes('.gitattributes');
     for (let i = 0; i < raw.length && raw[i]; i += 2) {
       const match = /^:(\d{6}) (\d{6}) [a-f0-9]+ [a-f0-9]+ ([AMD])$/.exec(raw[i]);
       const p = raw[i + 1];

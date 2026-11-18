@@ -146,6 +146,32 @@ describe('launcher-owned atomic application', () => {
     expect(f.commands.some(a => a.includes('--index'))).toBe(false);
     expect(f.commands.find(a => a.includes('apply'))).toContain('--include=docs/*');
   });
+  it.each([
+    ['test-fix', 'tests', 'tests/package.json'],
+    ['doc-fix', 'docs', 'docs/.github/workflows/x.yml'],
+    ['doc-fix', 'docs', 'docs/deep/pnpm-lock.yaml'],
+    ['test-fix', 'tests', 'tests/deep/bun.lock'],
+    ['doc-fix', 'docs', 'docs/scripts/settings/config.json'],
+    ['doc-fix', 'notes.md', 'notes.md/code.js'],
+    ['test-fix', 'sample.test.ts', 'sample.test.ts/code.js'],
+  ])('voids %s scope %s applying forbidden or misclassified %s atomically', async (kind, scope, path) => {
+    for (const tracked of [false, true]) {
+      const f = fixture();
+      if (tracked) {
+        mkdirSync(dirname(join(f.lane, path)), { recursive: true });
+        writeFileSync(join(f.lane, path), 'before\n');
+        commit(f.lane);
+      }
+      const result = await f.run(dir => {
+        mkdirSync(dirname(join(dir, path)), { recursive: true });
+        writeFileSync(join(dir, path), 'changed\n');
+        if (scope === 'docs') writeFileSync(join(dir, 'docs/a.md'), 'after\n');
+      }, { input: { kind, scope: [scope] } });
+      expect(result).toMatchObject({ status: 'voided', applied: [] });
+      expect(git(f.lane, 'status', '--porcelain')).toBe('');
+      expect(f.commands.some(a => a.includes('apply'))).toBe(false);
+    }
+  });
   it('voids an out-of-scope write and applies NOTHING, including the in-scope hunk', async () => {
     const f = fixture();
     expect((await f.run(dir => {
