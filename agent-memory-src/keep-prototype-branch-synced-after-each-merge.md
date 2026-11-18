@@ -7,7 +7,7 @@ metadata:
 
 **The operator's own instruction (2026-09-03): "we have to keep prototype better up to date after
 each merge."** Epic #3383's prototype checkout (`origin/lane/mechanical-dispatcher`, run from
-`/Users/nicolasgilbert/workspace/wev-scratch-dispatcher-4` or an equivalent live checkout) must be
+`~/workspace/wev-scratch-dispatcher-4` or an equivalent live checkout) must be
 synced against `main` proactively — not left to drift until something breaks.
 
 **Why this is a standing instruction, not a one-off:** it happened TWICE in one overnight session.
