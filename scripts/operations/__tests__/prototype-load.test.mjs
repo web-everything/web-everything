@@ -532,8 +532,11 @@ describe('canonicalAuditEvidence', () => {
       // Ruled for A only, or B only: the combined blocker is not covered either way.
       for (const ruled of [[A], [B]]) {
         expect(evaluate([openWeak, scopedWeak], { invariantsText, ruledWeakened: gate(ruled) })).toEqual({ ok: false, reason: 'weakened' });
-        expect(evaluate([scopedWeak, openWeak], { invariantsText, ruledWeakened: gate(ruled) })).toEqual({ ok: false, reason: 'weakened' });
       }
+      // Ledger order decides, not the self-reported time: an open audit appended AFTER the scoped one is the latest
+      // audit and speaks for the whole change, so only a ruling for ITS findings admits.
+      expect(evaluate([scopedWeak, openWeak], { invariantsText, ruledWeakened: gate([B]) })).toEqual({ ok: false, reason: 'weakened' });
+      expect(evaluate([scopedWeak, openWeak], { invariantsText, ruledWeakened: gate([A]) })).toMatchObject({ ok: true });
       // A ruling that discloses both findings still admits (the exception is explicit, never inferred).
       expect(evaluate([openWeak, scopedWeak], { invariantsText, ruledWeakened: gate([A, B]) })).toMatchObject({ ok: true });
       // Baseline: the open WEAKENED alone is admitted by its own ruling.
@@ -544,7 +547,8 @@ describe('canonicalAuditEvidence', () => {
       const bound = scopedAudit({ base: BASE_A, head: HEAD, at: at('10'), verdict: 'WEAKENED', findings: ['y.mjs:2 invariant broken'], fingerprint: FP, followUps: [] });
       const stale = scopedAudit({ base: BASE_A, head: HEAD, at: at('11'), invariantsHash: '0'.repeat(64), fingerprint: FP, followUps: [] });
       expect(evaluate([n, bound, stale], { invariantsText })).toEqual({ ok: false, reason: 'weakened' });
-      expect(evaluate([stale, bound, n], { invariantsText })).toEqual({ ok: false, reason: 'weakened' });
+      // Ledger order decides: an open NOT WEAKENED re-audit appended after the scoped WEAKENED supersedes it.
+      expect(evaluate([stale, bound, n], { invariantsText })).toMatchObject({ ok: true, record: n });
       // Once a pass bound to the same invariants follows it, the scoped WEAKENED is superseded.
       const fixedPass = scopedAudit({ base: BASE_A, head: HEAD, at: at('11'), fingerprint: FP, followUps: [] });
       expect(evaluate([n, bound, fixedPass], { invariantsText })).toMatchObject({ ok: true, record: fixedPass });

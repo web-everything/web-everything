@@ -301,13 +301,16 @@ describe('R973 scoped record never supersedes an open WEAKENED', () => {
     const A = 'a.mjs:1 fail-open', B = 'b.mjs:2 invariant broken';
     const open = rec('2026-11-01T10:00:00.000Z', 'WEAKENED', { findings: [A] });
     const scopedWeak = rec('2026-11-01T11:00:00.000Z', 'WEAKENED', { ...scoped, findings: [B] });
-    it.each([['open first', [open, scopedWeak]], ['scoped first', [scopedWeak, open]]])('blocks on BOTH findings (%s)', (_name, records) => {
-      const got = findAudit(records, opts);
+    it('blocks on BOTH findings', () => {
+      const got = findAudit([open, scopedWeak], opts);
       expect(got.verdict).toBe('WEAKENED');
       // A ruling for only the older findings (or only the newer ones) must not match the returned record.
       expect(got.findings).toEqual([A, B]);
       expect(got.findings).not.toEqual([A]);
       expect(got.findings).not.toEqual([B]);
+    });
+    it('ledger order decides: an open WEAKENED appended after the scoped one is the latest audit and stands alone', () => {
+      expect(findAudit([scopedWeak, open], opts)).toBe(open);
     });
     it('keeps the scoped record identity when no open WEAKENED exists', () => {
       expect(findAudit([scopedWeak], opts)).toBe(scopedWeak);
@@ -333,13 +336,17 @@ describe('R973 scoped record never supersedes an open WEAKENED', () => {
       const staleC = rec('2026-11-01T11:00:00.000Z', 'NOT WEAKENED', { ...scoped, invariantsHash: 'f'.repeat(64) });
       const boundC = rec('2026-11-01T11:00:00.000Z', 'NOT WEAKENED', withHash);
       it('a later scoped pass with a stale hash, or with no bound invariants at all, never supersedes it', () => {
-        for (const records of [[N, scopedB, staleC], [staleC, scopedB, N], [N, scopedB, boundC]]) {
+        for (const records of [[N, scopedB, staleC], [N, scopedB, boundC]]) {
           expect(findAudit(records, { ...opts, invariantsText: records.includes(boundC) ? undefined : invariantsText })).toBe(scopedB);
         }
       });
       it('a later scoped pass bound to the item invariants does supersede it', () => {
         expect(findAudit([N, scopedB, boundC], { ...opts, invariantsText })).toBe(boundC);
-        expect(findAudit([boundC, scopedB, N], { ...opts, invariantsText })).toBe(boundC);
+      });
+      it('ledger order decides: an open pass appended after the scoped WEAKENED supersedes it, a bound pass appended before does not', () => {
+        expect(findAudit([staleC, scopedB, N], { ...opts, invariantsText })).toBe(N);
+        expect(findAudit([boundC, scopedB, N], { ...opts, invariantsText })).toBe(N);
+        expect(findAudit([boundC, scopedB], { ...opts, invariantsText })).toBe(scopedB);
       });
       it('a later open NOT WEAKENED re-audit supersedes it', () => {
         const reaudit = rec('2026-11-01T12:00:00.000Z', 'NOT WEAKENED');
@@ -349,10 +356,10 @@ describe('R973 scoped record never supersedes an open WEAKENED', () => {
         const got = findAudit([rec('2026-11-01T08:00:00.000Z', 'WEAKENED', { findings: [A] }), scopedB, staleC], { ...opts, invariantsText });
         expect(got.findings).toEqual([A, B]);
       });
-      it('two scoped WEAKENED records plus an open one are all disclosed, oldest first', () => {
+      it('two scoped WEAKENED records plus an open one are all disclosed, in ledger order', () => {
         const B1 = rec('2026-11-01T10:10:00.000Z', 'WEAKENED', { ...withHash, findings: ['c.mjs:3 older scoped'] });
         const openW = rec('2026-11-01T08:00:00.000Z', 'WEAKENED', { findings: [A] });
-        for (const records of [[openW, B1, scopedB], [scopedB, openW, B1]]) {
+        for (const records of [[openW, scopedB, B1], [scopedB, openW, B1]]) {
           const got = findAudit(records, { ...opts, invariantsText });
           expect(got.findings).toEqual([A, B, 'c.mjs:3 older scoped']);
           expect(got.at).toBe(B1.at);
@@ -760,14 +767,16 @@ describe('prior question hashes (AU1 PR-B)', () => {
     const fixed = rec('NOT WEAKENED', { questionHash: QUESTION_HASH, at: '2026-11-02T12:00:00.000Z' });
     const scoped = rec('NOT WEAKENED', { questionHash: QUESTION_HASH, at: '2026-11-04T12:00:00.000Z', scope: 'invariants' });
     expect(find([weak, fixed, scoped], open)).toBe(scoped);
-    expect(find([scoped, fixed, weak], open)).toBe(scoped);
+    // Ledger order decides: with the scoped pass appended first, the later open pass is the latest audit.
+    expect(find([scoped, fixed, weak], open)).toBe(fixed);
   });
   it('a later prior open pass resolves prior open WEAKENED before a scoped pass', () => {
     const weak = rec('WEAKENED', { findings: ['x.mjs:1 gap'] });
     const fixed = rec('NOT WEAKENED', { at: '2026-11-02T12:00:00.000Z' });
     const scoped = rec('NOT WEAKENED', { questionHash: QUESTION_HASH, at: '2026-11-03T12:00:00.000Z', scope: 'invariants' });
     expect(find([weak, fixed, scoped], open)).toBe(scoped);
-    expect(find([scoped, fixed, weak], open)).toBe(scoped);
+    // Ledger order decides: a prior open WEAKENED appended last, after every pass, still blocks.
+    expect(find([scoped, fixed, weak], open)).toBe(weak);
   });
   it('a scoped pass ignores unusable or unrelated prior open WEAKENED records', () => {
     const scoped = rec('NOT WEAKENED', { questionHash: QUESTION_HASH, at: '2026-11-03T12:00:00.000Z', scope: 'invariants' });
