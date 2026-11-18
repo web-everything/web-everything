@@ -2946,6 +2946,7 @@ describe('#4315 durable referral effects', () => {
     [{ REVIEW_PR_ANTIGRAVITY_REVIEW: '1', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' }, 1],
     [{ REVIEW_PR_ANTIGRAVITY_REVIEW: '0', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' }, 1],
     [{ REVIEW_PR_ANTIGRAVITY_REVIEW: '1', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '40' }, 5],
+    [{}, 5], // Shipped probation default keeps every unruled Antigravity referral held.
   ])('replays #3481: config %j leaves %i pending', async (env, count) => {
     const h = harness({ failure: 'judge', env });
     const old = seedReferrals(h, ['judge', ...Array(4).fill('judgeAntigravityReview')]);

@@ -49,7 +49,7 @@ function fixture() {
       spawnJudge: async ({ cwd }) => {
         act(cwd);
         mutated = true;
-        if (options.spawnError) throw new Error('failed without transcript');
+        if (options.spawnError) { const error = new Error('failed without transcript'); error.telemetry = options.telemetry; throw error; }
         const t = join(root, 'transcript.jsonl');
         writeFileSync(t, options.transcriptText ?? transcript(steps(cwd)));
         return { value: { summary: 'review', findings: [] }, sessionId: 'own-id', transcriptFile: t };
@@ -355,4 +355,12 @@ describe('own brain reads extend only the read allowlist', () => {
       allowedRoots: [fx.lane], home: fx.home, sessionId: 'own-id',
     })).toEqual(['view_file (read outside the juror lane)']);
   });
+});
+
+it('preserves first-output failure telemetry for the advisory skip boundary', async () => {
+  const f = fixture();
+  const telemetry = { quotaState: 'provider-unresponsive', fallbackDecision: 'skip-provider-unresponsive', firstOutputMs: 15, cooldownMs: 1000 };
+  const run = await f.run(() => {}, undefined, { spawnError: true, telemetry });
+  expect(run.status).toBe('failed');
+  expect(run.telemetry).toMatchObject(telemetry);
 });
