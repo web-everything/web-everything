@@ -78,7 +78,7 @@
 import { CLAUDE_HELPER_MODEL_DEFAULT, resolveClaudeHelperRoute } from './claude-helper-route.mjs';
 import { spawn as nodeSpawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import Ajv from 'ajv';
+import { compileJurorSchema, JurorSchemaError } from './juror-schema-check.mjs';
 import { fileURLToPath } from 'node:url';
 import { resolve as resolvePath, dirname, join } from 'node:path';
 import { realpathSync, statSync, existsSync, readFileSync } from 'node:fs';
@@ -90,24 +90,6 @@ import { markWorkerEnv } from '../operations/session-role.mjs';
 // like any other worker, so it gets the same treatment as every other spawn site.
 import { sanitizeSpawnEnv } from './gh-app-shim.mjs';
 import { quotaHoldRow } from './provider-quota-hold.mjs';
-
-const judgeSchemas = new Ajv({ strictSchema: true });
-
-// No format validators are installed. Refuse even nested/unused format constraints
-// including constraints in unused definitions that compilation may not visit.
-function assertNoSchemaFormats(schema) {
-  const pending = [schema];
-  const seen = new Set();
-  while (pending.length) {
-    const node = pending.pop();
-    if (!node || typeof node !== 'object' || seen.has(node)) continue;
-    seen.add(node);
-    if (Object.hasOwn(node, 'format')) {
-      throw new Error('judge-spawn: juror schema is unvalidatable: format constraints require unavailable format validators; no verdict.');
-    }
-    for (const child of Object.values(node)) pending.push(child);
-  }
-}
 
 /**
  * Are these two paths the SAME DIRECTORY? By inode + device, never by comparing the strings.
@@ -951,16 +933,15 @@ export async function judgeSpawn({
   }
   const setting = retries === undefined ? resolveUnparseableRetries({ env }) : { value: retries, source: 'caller' };
   retries = setting.value;
-  assertNoSchemaFormats(shape);
   let validate;
   try {
-    validate = judgeSchemas.compile(shape);
-  } catch {
+    validate = compileJurorSchema(shape);
+  } catch (error) {
     // Compiler diagnostics can contain arbitrarily large, untrusted schema text.
     // No child ran: the caller must correct the schema before requesting a verdict.
     throw new JudgeUnparseableError({
       attempt: 0, attempts: 0, stdout: '', stderr: '', wallMs: 0, sessionId: sid, failedAttempts: [],
-      reason: 'judge-spawn: juror schema is unvalidatable: schema compilation failed (details redacted); correct the schema before retrying; no verdict.',
+      reason: `judge-spawn: juror schema is unvalidatable: schema compilation failed (${error instanceof JurorSchemaError ? error.message : 'details redacted'}); correct the schema before retrying; no verdict.`,
     });
   }
   const total = 1 + retries;

@@ -1487,7 +1487,8 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
     const err = await judgeSpawn({ mandate: 'm', input: 'i', shape, sessionId: SID, retries: 0, spawnFn: fn })
       .catch(e => e);
     expect(err).toBeInstanceOf(Error);
-    expect(err.message).toMatch(/schema is unvalidatable: format constraints/);
+    expect(err).toBeInstanceOf(JudgeUnparseableError);
+    expect(err.message).toMatch(/keyword (format|allOf|definitions)/);
     expect(err.message).toContain('no verdict');
     expect(err).not.toHaveProperty('value');
     expect(calls).toHaveLength(0);
@@ -1495,6 +1496,7 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
 
   it.each([
     ['unsupported keyword', { type: 'object', unevaluatedProperties: false }],
+    ['$async', { type: 'object', $async: true }],
     ['invalid keyword value', { type: 'object', properties: { verdict: { type: 'not-a-type' } } }],
     ['oversized unsupported keyword', { type: 'object', ['private-schema-content' + 'x'.repeat(10_000)]: false }],
   ])('refuses %s before spawning with a bounded no-verdict compile error', async (_name, shape) => {
@@ -1568,6 +1570,7 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
   it.each([
     ['empty object', {}, SHAPE, /required/],
     ['missing field', { verdict: 'private-juror-content' }, SHAPE, /required/],
+    ['numeric verdict', { verdict: 123, findings: [] }, SHAPE, /type/],
     ['wrong type', { verdict: 'private-juror-content', findings: 'private-juror-content' }, SHAPE, /type/],
     ['extra property', { verdict: 'private-juror-content', findings: [], extra: true }, SHAPE, /additionalProperties/],
     ['empty object with permissive schema', {}, { type: 'object' }, /nonempty object/],
