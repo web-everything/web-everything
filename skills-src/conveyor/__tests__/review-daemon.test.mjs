@@ -1668,7 +1668,9 @@ describe('review dispatch waiting history', () => {
       readPrs: () => numbers.map(number => ({ number, headRefOid: 'head', labels: ['review:pending'] })),
       readAgents: () => [], dispatch: () => ({ agentId: 'review' }),
       tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
-      acquirableLanes: () => 10, now: () => 100, ...options });
+      acquirableLanes: () => 10, now: () => 100,
+      diagnoseJob: () => ({ exitCode: 1, signal: null, lastErrorLine: 'fatal: job failed' }),
+      writeJobDiagnosis: () => {}, ...options });
   }
 
   it('serves continuously owed higher PRs before newly owed lower PRs, removes cleared ages, and isolates repos', () => {
@@ -1736,8 +1738,9 @@ describe('review dispatch waiting history', () => {
     const tagRound = vi.fn();
     const out = tick(history, [6933, 7012], { now: () => 200, isPidAlive: () => false, log, dispatch, tagRound,
       hostAdmission: () => ({ admitted: true, maxPerTick: 1 }) });
-    expect(out.endedNoVerdict).toEqual([{ prNumber: 7012, reason: 'review-job-ended-no-verdict', jobPid: 42 }]);
-    expect(log).toHaveBeenCalledWith('review-daemon: waiting/repo#7012 review-job-ended-no-verdict (job pid 42) - will retry');
+    expect(out.endedNoVerdict).toEqual([{ prNumber: 7012, reason: 'review-job-ended-no-verdict', jobPid: 42,
+      diagnosis: 'exit=? signal=? last="diagnosis unavailable"' }]);
+    expect(log).toHaveBeenCalledWith('review-daemon: waiting/repo#7012 review-job-ended-no-verdict (job pid 42; exit=? signal=? last="diagnosis unavailable") - will retry');
     expect(dispatch.mock.calls.map(([o]) => o.pr)).toEqual([7012]);
     expect(tagRound).toHaveBeenCalledWith(expect.objectContaining({ pr: 7012, round: 1 }));
     expect(history.firstOwedAt.get('waiting/repo#7012')).toBe(100);
@@ -1745,6 +1748,39 @@ describe('review dispatch waiting history', () => {
     const next = tick(history, [7012], { isPidAlive: () => false, acquirableLanes: () => 0, log });
     expect(next.endedNoVerdict).toBeUndefined();
     expect(log).toHaveBeenCalledTimes(1);
+  });
+
+  it('stores the dispatch slug and diagnoses it before retrying', () => {
+    const history = state();
+    tick(history, [7012], { dispatch: () => ({ jobPid: 42, sessionSlug: 'review-we-7012' }) });
+    expect(history.lastDispatched.get('waiting/repo#7012')).toEqual({ pid: 42, head: 'head', slug: 'review-we-7012' });
+    const diagnoseJob = vi.fn(() => ({ exitCode: null, signal: 'SIGTERM', lastErrorLine: 'stopped', tail: 'stopped', marker: true }));
+    const writeJobDiagnosis = vi.fn();
+    const out = tick(history, [7012], { isPidAlive: () => false, diagnoseJob, writeJobDiagnosis });
+    expect(diagnoseJob).toHaveBeenCalledWith({ slug: 'review-we-7012', pid: 42 });
+    expect(writeJobDiagnosis).toHaveBeenCalledWith({ slug: 'review-we-7012', pid: 42 }, expect.objectContaining({ tail: 'stopped' }));
+    expect(out.endedNoVerdict[0].diagnosis).toBe('exit=? signal=SIGTERM last="stopped"');
+  });
+
+  it('derives the canonical slug for historical dispatch state without a slug', () => {
+    const history = state();
+    history.lastDispatched.set('we#7012', { pid: 42, head: 'head' });
+    const diagnoseJob = vi.fn(() => ({ exitCode: 2, signal: null, lastErrorLine: 'error' }));
+    const out = tick(history, [7012], { repo: 'we', isPidAlive: () => false, diagnoseJob });
+    expect(diagnoseJob).toHaveBeenCalledWith({ slug: 'review-7012', pid: 42 });
+    expect(out.endedNoVerdict[0].diagnosis).toBe('exit=2 signal=? last="error"');
+  });
+
+  it.each(['read', 'write'])('diagnostic %s failure never stops the tick or retry', failure => {
+    const history = state();
+    tick(history, [7012], { dispatch: () => ({ jobPid: 42, sessionSlug: 'review-we-7012' }) });
+    const dispatch = vi.fn(() => ({}));
+    const out = tick(history, [7012], { isPidAlive: () => false, dispatch,
+      ...(failure === 'read' ? { diagnoseJob: () => { throw Error('denied'); } }
+        : { writeJobDiagnosis: () => { throw Error('denied'); } }) });
+    expect(out.endedNoVerdict[0].diagnosis).toBe(failure === 'read'
+      ? 'exit=? signal=? last="diagnosis unavailable"' : 'exit=1 signal=? last="fatal: job failed"');
+    expect(dispatch).toHaveBeenCalledTimes(1);
   });
 
   it.each([
@@ -1770,7 +1806,8 @@ describe('review dispatch waiting history', () => {
     expect(first.endedNoVerdict).toHaveLength(1);
     expect(history.firstOwedAt.get('waiting/repo#7012')).toBe(100);
     const second = tick(history, [7012, 7013], { ...options, now: () => 300 });
-    expect(second.endedNoVerdict).toEqual([{ prNumber: 7012, reason: 'review-job-ended-no-verdict', jobPid: 42 }]);
+    expect(second.endedNoVerdict).toEqual([{ prNumber: 7012, reason: 'review-job-ended-no-verdict', jobPid: 42,
+      diagnosis: 'exit=? signal=? last="diagnosis unavailable"' }]);
     expect(history.firstOwedAt.get('waiting/repo#7012')).toBe(300);
     expect(history.noVerdictCounts.get('waiting/repo#7012')).toEqual({ head: 'head', count: 2 });
     tick(history, [7012, 7013], { ...options, now: () => 400 });

@@ -109,7 +109,7 @@ import { fileURLToPath } from 'node:url';
 
 import { assertNotALaneCheckout, REPO_ROOT, resolveGhShimSettingsEnv } from './dispatch-lane-io.mjs';
 import {
-  decideJobClaim, jobLogPath, pidAlive, readJobRecord, removeJobRecord, reviewJobsDir, writeJobRecord,
+  decideJobClaim, jobLogPath, jobRecordPath, pidAlive, readJobRecord, removeJobRecord, reviewJobsDir, writeJobRecord,
 } from './review-job-store.mjs';
 import { assertMainNotStale, dispatchReview, isReviewCodePath, planReviewDispatch } from './review-dispatch.mjs';
 import { runReport } from './completion-cli.mjs';
@@ -1078,10 +1078,11 @@ function expectedHeadRefusal(expectedHead, input, io) {
 }
 
 function runReviewArc({
-  pr, repo, expectedHead, redTeamOnly = false, redTeamMode = 'fresh', preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid,
+  pr, repo, expectedHead, redTeamOnly = false, redTeamMode = 'fresh', preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid, onSessionSlug,
 } = {}, io, seatsBox = {}) {
   const planned = planReviewDispatch({ pr, repo });
   const slug = planned.sessionSlug;
+  onSessionSlug?.(slug);
   const t0 = io.now();
   const timings = { acquireMs: null, loopMs: null, totalMs: 0 };
   const result = (fields) => ({
@@ -1559,8 +1560,32 @@ export function carryStackAccept({ pr, repo, root = REPO_ROOT, env = process.env
 
 // ── CLI ────────────────────────────────────────────────────────────────────────────────────────────────────────
 
+/** CLI-only registration. Returns the callback used when the arc first knows its slug. */
+export function installReviewJobExitHooks({ proc = process, dir = reviewJobsDir() } = {}) {
+  let slug;
+  let signalled = false;
+  const record = (exitCode, signal) => {
+    try {
+      if (!slug) return;
+      const path = jobRecordPath(slug, dir).replace(/\.json$/, '.exit.json');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(path, `${JSON.stringify({ pid: proc.pid, exitCode, signal, endedAt: new Date().toISOString() })}\n`);
+    } catch { /* Exit diagnostics must never prevent termination. */ }
+  };
+  proc.on('exit', code => { if (!signalled) record(code, null); });
+  for (const signal of ['SIGTERM', 'SIGHUP', 'SIGINT']) {
+    const handler = () => {
+      signalled = true;
+      record(null, signal);
+      try { proc.removeListener(signal, handler); proc.kill(proc.pid, signal); } catch { /* best effort */ }
+    };
+    proc.on(signal, handler);
+  }
+  return value => { if (value) slug = value; };
+}
+
 /** CLI boundary; injected job and rating effects keep recovery guard tests hermetic. */
-export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runReviewJob, rate = rateAndRecordReviewJob } = {}) {
+export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runReviewJob, rate = rateAndRecordReviewJob, trackExit = false } = {}) {
   const [sub, ...rest] = argv;
   const flag = (name) => {
     const hit = rest.find((a) => a.startsWith(`--${name}=`));
@@ -1570,18 +1595,19 @@ export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runRevi
     writeLineSync(2, 'usage: review-job.mjs run --pr=<n> --repo=<owner/repo>');
     process.exitCode = 2;
   } else {
-    // No signal handler: the arc is synchronous, so a handler could not run before the in-flight child returns
-    // anyway. A killed job leaves a record with a dead pid (pruned on the next read) and, at worst, a lease under
-    // its slug, which the lane pool's ghost-lease reaper reclaims (#2748).
+    // Signals can only be handled after a synchronous child returns. SIGKILL is uncatchable and
+    // leaves no exit marker; dead records and ghost leases retain their existing cleanup paths.
+    const onSessionSlug = trackExit ? installReviewJobExitHooks() : undefined;
     try {
       if (rest.some(arg => arg === '--red-team-plan' || arg.startsWith('--red-team-plan='))) throw Error('removed --red-team-plan; recovery is decided by the job');
       const lane = Number(flag('prefer-lane'));
       // Bare legacy flag is fresh-guarded; explicit modes survive detached dispatch.
       const redTeamMode = flag('red-team-only') ?? 'fresh';
       const redTeamOnly = rest.includes('--red-team-only') || flag('red-team-only') !== undefined;
-      const out = runJob({ pr: flag('pr'), repo: flag('repo'), redTeamOnly, redTeamMode,
+      const out = runJob({ pr: flag('pr'), repo: flag('repo'), redTeamOnly, redTeamMode, onSessionSlug,
         ...(flag('expected-head') === undefined ? {} : { expectedHead: flag('expected-head') }),
         preferLane: Number.isInteger(lane) && lane > 0 ? lane : null });
+      onSessionSlug?.(out.sessionSlug);
       writeAllSync(1, `${JSON.stringify(out)}\n`);
       // #4075/run-rating slice 1 — mechanical grading for this now-finished job-mode review, read back from
       // THIS job's own log file (stdout/stderr above were redirected there by `dispatchReviewJob`'s spawn — see
@@ -1598,4 +1624,4 @@ export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runRevi
 }
 
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(THIS_FILE);
-if (IS_CLI) runReviewJobCli();
+if (IS_CLI) runReviewJobCli(process.argv.slice(2), { trackExit: true });

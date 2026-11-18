@@ -106,7 +106,7 @@ export function jobRecordToAgentRow(record) {
  */
 export function listReviewJobAgents({ dir = reviewJobsDir(), isAlive = pidAlive, readOnly = false } = {}) {
   let names;
-  try { names = readdirSync(dir).filter((n) => n.endsWith('.json')); } catch (error) {
+  try { names = readdirSync(dir).filter((n) => n.endsWith('.json') && !n.endsWith('.exit.json') && !n.endsWith('.ended.json')); } catch (error) {
     return error?.code === 'ENOENT' ? [] : incompleteListing('review-jobs-unreadable');
   }
   const rows = [];

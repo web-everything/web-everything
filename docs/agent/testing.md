@@ -4567,3 +4567,11 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+## Review job exit evidence
+
+Review-job diagnostics use `<slug>.exit.json` and `<slug>.ended.json` alongside the live
+`<slug>.json` record. Job listings must exclude these diagnostic sidecars. Exit markers
+are usable only for the ended pid; SIGKILL cannot leave a marker. Keep missing/stale
+marker, redaction, bounded-tail and diagnostic-write-failure regressions in the scoped
+review-job and review-daemon suites.

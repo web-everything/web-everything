@@ -92,6 +92,8 @@ import { recordScopeBloatRefresh, noteScopeBloatMarkerFailure } from '../../scri
 // path reachable. The jurors review-loop-cli spawns are the fresh, independent reviewers either way.
 import { parseEscalationReason } from '../../scripts/review-detail.mjs';
 import { dispatchReviewJob, dispatchReviewByMode } from '../../scripts/operations/review-job.mjs';
+import { reviewSessionSlug } from '../../scripts/conveyor/review-session-slug.mjs';
+import { diagnoseEndedJob, summarizeDiagnosis, writeEndedJobDiagnosis } from '../../scripts/operations/review-job-end-diagnosis.mjs';
 import { hostLoadAdmission } from '../../scripts/lib/host-load.mjs';
 import { pidAlive } from '../../scripts/lib/pid-alive.mjs';
 import { sampleHost } from '../../scripts/lib/host-sample.mjs';
@@ -449,6 +451,8 @@ export function runReviewTick({
   now = Date.now,
   dispatchState = reviewDispatchState,
   isPidAlive = pidAlive,
+  diagnoseJob = diagnoseEndedJob,
+  writeJobDiagnosis = writeEndedJobDiagnosis,
 } = {}) {
   // #x01u7az — runs FIRST and INDEPENDENTLY of `reconcile`'s own plan: it is a plain `gh pr list` + label read
   // over the whole repo, not scoped to whatever this tick's discovery found owed, so a `reconcile` failure
@@ -627,9 +631,17 @@ export function runReviewTick({
       noVerdictCounts.set(key, { head, count });
       // One immediate retry keeps its place; repeated failures yield to waiting peers.
       if (count >= 2) dispatchState.firstOwedAt.set(key, observedAt);
-      endedNoVerdict.push({ prNumber: d.prNumber, reason: 'review-job-ended-no-verdict', jobPid: prior.pid });
+      let diagnosis = 'exit=? signal=? last="diagnosis unavailable"';
+      try {
+        const slug = prior.slug ?? reviewSessionSlug(d.prNumber, repoKeyForSlug(repo));
+        const job = { slug, pid: prior.pid };
+        const detail = diagnoseJob(job);
+        diagnosis = summarizeDiagnosis(detail);
+        writeJobDiagnosis(job, detail);
+      } catch { /* Diagnostics must never interrupt a retry. */ }
+      endedNoVerdict.push({ prNumber: d.prNumber, reason: 'review-job-ended-no-verdict', jobPid: prior.pid, diagnosis });
       dispatchState.lastDispatched.delete(key);
-      try { log(`review-daemon: ${key} review-job-ended-no-verdict (job pid ${prior.pid}) - will retry`); } catch {}
+      try { log(`review-daemon: ${key} review-job-ended-no-verdict (job pid ${prior.pid}; ${diagnosis}) - will retry`); } catch {}
     }
     owedSince.set(Number(d.prNumber), dispatchState.firstOwedAt.get(key));
   }
@@ -792,7 +804,7 @@ export function runReviewTick({
       });
       const head = d.headRefOid ?? d.headSha ?? d.head ?? subject?.headRefOid;
       if (Number.isInteger(result?.jobPid) && result.jobPid > 0 && head) {
-        dispatchState.lastDispatched.set(keyFor(d.prNumber), { pid: result.jobPid, head });
+        dispatchState.lastDispatched.set(keyFor(d.prNumber), { pid: result.jobPid, head, ...(result.sessionSlug ? { slug: result.sessionSlug } : {}) });
       }
       occupiedLanes++;
       if (typeof host.take === 'function') host.take(1);
