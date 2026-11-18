@@ -3,7 +3,8 @@ import { mkdtempSync, readFileSync, writeFileSync, rmSync, mkdirSync } from 'nod
 import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { detectOverlayStale, readOverlayStale, readOpenPrHeads, overlayStaleSettings } from '../overlay-prune.mjs';
-import { overlayFilePath, addOverlay } from '../../daemon-overlays.mjs';
+import { overlayFilePath, addOverlay, removeOverlay, readOverlays } from '../../daemon-overlays.mjs';
+import { withAddGuardLock } from '../../../daemon-overlay.mjs';
 import { finalizeRebuild } from '../adopt.mjs';
 import { prepareRebuild, readOverlayEventLog } from '../prepare.mjs';
 import * as planner from '../plan.mjs';
@@ -281,6 +282,22 @@ describe('finalize during an unsettled drop', () => {
     expect(result.reason).toBe('already-adopted');
     expect(onAdopted).not.toHaveBeenCalled();
   });
+  it('finalize waits for the add-guard lock, then sees the intent a retirement wrote and refuses before reset', async () => {
+    stubPrepare();
+    const calls = [];
+    const run = args => { calls.push(args); return { status: 0, stdout: args[0] === 'rev-parse' ? headSha : '' }; };
+    let release; const held = new Promise(r => { release = r; });
+    const retirement = withAddGuardLock(root, env, async () => { writePending('pending'); await held; });
+    await new Promise(r => setTimeout(r, 150));
+    let done = false;
+    const finalizing = finalizeRebuild({ root, env, run, now: () => 0, plan: { ok: true, finalSha: newSha, mainSha, inputsKey: 'k', applied: [{ ref, sha: tip }] }, prevHead: headSha, lease: { token: 'l' } }).then(r => { done = true; return r; });
+    await new Promise(r => setTimeout(r, 300));
+    expect(done).toBe(false);
+    expect(calls).toHaveLength(0);
+    release(); await retirement;
+    expect(await finalizing).toMatchObject({ moved: false, reason: 'drop-pending-unsettled' });
+    expect(calls.some(a => a[0] === 'reset')).toBe(false);
+  });
   it('the health-watch rollback to last-good still finalizes while a drop is pending', async () => {
     stubPrepare(); writePending('pending');
     const calls = [];
@@ -295,6 +312,20 @@ describe('finalize during an unsettled drop', () => {
     expect(result.reason).not.toBe('drop-pending-unsettled');
     expect(calls.some(a => a[0] === 'reset')).toBe(true);
   });
+});
+
+it('a removal refused because the registration changed after planning stops the build and keeps the new registration', async () => {
+  stubPrepare();
+  addOverlay(root, { ref, pr: 7, reason: 'old' }, { env });
+  vi.spyOn(planner, 'planRebuild').mockImplementation(async () => {
+    removeOverlay(root, ref, { env });
+    await new Promise(r => setTimeout(r, 5));
+    addOverlay(root, { ref, pr: 7, reason: 'newer' }, { env });
+    return { ok: true, finalSha: newSha, mainSha, applied: [], decisions: [{ ref, action: 'remove', reason: 'pr-closed', pr: 7 }], alerts: [] };
+  });
+  const result = await prepareRebuild({ root, env, run: gitRun, now: () => 0, prBaseChain: () => [] });
+  expect(result.result).toMatchObject({ moved: false, reason: 'overlay-removal-refused' });
+  expect(readOverlays(root, { env }).map(o => o.reason)).toEqual(['newer']);
 });
 
 it('a pending drop intent also refuses an unchanged-HEAD plan that would remove a registration', async () => {

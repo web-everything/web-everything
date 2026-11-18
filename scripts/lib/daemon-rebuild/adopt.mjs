@@ -13,7 +13,7 @@ import { releaseBuildLease } from './lease.mjs';
 import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
 import { revokedAppliedTips, tipInMain as gitTipInMain } from './audited-tip.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
-import { readPendingDrops } from '../../daemon-overlay.mjs';
+import { readPendingDrops, withAddGuardLock } from '../../daemon-overlay.mjs';
 
 /**
  * PURE: may the ready candidate `ready` be adopted now, instead of smoking `plan`? Returns
@@ -358,7 +358,13 @@ export function staleAlertDetail(result, state) {
  * this module ever does, and writes `state.adopted`. On a FAILING smoke this is never called at all — `root`
  * was never touched, so {@link rebuildClone} handles that case itself, with no lock and nothing to roll back.
  */
-export async function finalizeRebuild({
+/** I2: the pending-drop check and the HEAD reset must be atomic with retire/replace, which take the add-guard lock
+ *  (and never the clone write lock, so holding both here cannot deadlock). A retirement during finalize waits. */
+export async function finalizeRebuild(options) {
+  return withAddGuardLock(options.root, options.env ?? process.env, () => finalizeRebuildLocked(options));
+}
+
+async function finalizeRebuildLocked({
   root, env, log, run, stateOpts, now, plan, prevHead, lease, onAdopted, auditedTip = null,
 }) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
