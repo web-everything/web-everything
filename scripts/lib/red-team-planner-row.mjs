@@ -15,7 +15,11 @@ export function readPlannerRow({ pr, plan, refusals = plan?.refusals ?? [],
   const refusal = refusals.find(row => row && Object.is(Number(row.prNumber), Number(pr)));
   if (!refusal) return { absent: true };
   const rawPr = rawPrs?.find(row => Object.is(Number(row?.number), Number(pr)));
-  const checks = rawPr?.statusCheckRollup;
+  // Exclude other heads before matching, implication or latest-run selection. Unheaded rollup
+  // rows retain reviewCiGate's existing assumption that they belong to the fetched PR head.
+  const rollup = rawPr?.statusCheckRollup;
+  const checks = Array.isArray(rollup)
+    ? rollup.filter(row => !row?.head_sha || row.head_sha === rawPr?.headRefOid) : rollup;
   const failing = splitFailingChecks(checks, requiredChecks);
   // Ask the existing normal-path classifier separately for each failing required check. In particular,
   // a plain merge-gate (or red-team) failure is not silently promoted to a review-owned hold.
