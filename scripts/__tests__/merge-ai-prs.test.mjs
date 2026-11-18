@@ -137,6 +137,15 @@ describe('routeRebaseBeforeEnqueue — queue freshness owns the bypass', () => {
     expect(enqueue).not.toHaveBeenCalled();
   });
 
+  it('required [test, integration] with only test green does not bypass (no test->integration implication)', () => {
+    const pr = { ...freshPr, statusCheckRollup: [testGreen] };
+    const opts = { hold: true, queueOwnsFreshness: true, requiredCheck: 'test',
+      queueRequiredChecks: ['integration'], rosterSource: 'live', requiredNames: ['test', 'integration'] };
+    expect(retainCheckedQueueHead(pr, opts)).toBe(pr);
+    const both = { ...freshPr, statusCheckRollup: [testGreen, { name: 'integration', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
+    expect(retainCheckedQueueHead(both, opts)).not.toBe(both);
+  });
+
   it.each(incompleteChecks)('fresh bypass and approved-human retention refuse %s after admission', async (_name, statusCheckRollup) => {
     const { verdict } = route();
     expect(verdict.decision).toBe('merge');
@@ -186,8 +195,8 @@ describe('routeRebaseBeforeEnqueue — queue freshness owns the bypass', () => {
 
   it('preserves raw run_attempt supersession instead of collapsing by timestamps', () => {
     const statusCheckRollup = [testGreen,
-      { name: 'smoke', status: 'COMPLETED', conclusion: 'FAILURE', run_id: 1, run_attempt: 1 },
-      { name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS', run_id: 1, run_attempt: 2 }];
+      { name: 'smoke', status: 'COMPLETED', conclusion: 'FAILURE', run_id: 1, run_attempt: 1, detailsUrl: 'https://github.com/o/r/actions/runs/1/job/7' },
+      { name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS', run_id: 1, run_attempt: 2, detailsUrl: 'https://github.com/o/r/actions/runs/1/job/7' }];
     expect(route({ prPatch: { statusCheckRollup } }).operation).toBe(null);
   });
 
