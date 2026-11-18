@@ -115,7 +115,7 @@ export function defaultQueueFile(env = process.env, home = homedir()) {
 export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile = readFileSync,
   writeFile = writeFileSync, rename = renameSync, unlink = unlinkSync, now = Date.now, log = () => {}, maxAttempts = 3, readLivePr = readLiveRedTeamPr } = {}) {
   let entries = [];
-  let live = new Map(), waiting = new Set();
+  let live = new Map(), waiting = new Set(), replanned = new Set();
   let pending = null;
   let stale = false; // true after a failed persist, until a later write succeeds
   const limit = Number.isInteger(maxAttempts) && maxAttempts > 0 ? maxAttempts : 3;
@@ -170,7 +170,8 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
     // Validate incoming PRs too: maintenance may have removed a terminal PR still present in a stale plan.
     // Each PR is read once per reconciliation; the daemon reader shares evidence across the tick.
     reconcile({ readLivePr: read = readLivePr, plannerSkipReplanMinutes = 15, candidates = [] } = {}) {
-      live = new Map(); waiting = new Set();
+      live = new Map(); waiting = new Set(); replanned = new Set();
+      const expired = [];
       const persisted = new Set(entries);
       const subjects = new Map(entries.map(entry => [entry.key, entry]));
       for (const { repo, pr } of candidates) {
@@ -196,10 +197,16 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         }
         if (entry.blocked === 'planner-skip') {
           if (now() - (entry.blockedAt ?? entry.enqueuedAt) >= replanMinutes(plannerSkipReplanMinutes) * 60000) {
-            delete entry.blocked; delete entry.blockedAt;
-            changed(`replan ${entry.key}: planner-skip interval elapsed`);
+            expired.push(entry);
           } // Before expiry, retain the existing bounded fair probes.
         }
+      }
+      // Replans share the worker-free probe budget with still-blocked entries in admit().
+      // Leave the rest blocked and eligible for a later turn, oldest hold first (including legacy state).
+      for (const entry of expired.sort((a, b) => (a.blockedAt ?? a.enqueuedAt) - (b.blockedAt ?? b.enqueuedAt)).slice(0, MAX_PROBES)) {
+        replanned.add(entry.key);
+        delete entry.blocked; delete entry.blockedAt;
+        changed(`replan ${entry.key}: planner-skip interval elapsed`);
       }
       return live;
     },
@@ -231,8 +238,9 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
       // Missing turns get one-time legacy catch-up; newly blocked entries always carry a turn.
       const mine = entries.filter(entry => entry.repo === repo && !waiting.has(entry.key));
       // Disabled probes or an invalid count fail closed; a valid zero count still allows worker-free probes.
+      const probeLimit = Math.max(0, MAX_PROBES - mine.filter(entry => replanned.has(entry.key)).length);
       const selected = mine.filter(entry => NON_RUNNABLE_REASONS.has(entry.blocked) && allowProbes && validCount)
-        .sort((a, b) => (a.lastProbeTurn ?? 0) - (b.lastProbeTurn ?? 0)).slice(0, MAX_PROBES);
+        .sort((a, b) => (a.lastProbeTurn ?? 0) - (b.lastProbeTurn ?? 0)).slice(0, probeLimit);
       const probes = new Set(selected.map(entry => entry.key));
       if (selected.length) {
         advanceProbeTurns(mine, selected);
@@ -292,9 +300,10 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
     admissions.set(repo, result);
     return result;
   };
-  // Stage mutations around the runner so both sync and settlement are rolled back on a thrown run.
+  // Stage all queue mutations, including reconciliation, until the runner succeeds.
   transactions.set(queue, () => {
     const before = copy(entries), previousAdmissions = new Map(admissions);
+    const previousLive = live, previousWaiting = new Set(waiting), previousReplanned = new Set(replanned);
     pending = [];
     return {
       commit() {
@@ -313,6 +322,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
       },
       abort() {
         entries = before;
+        live = previousLive; waiting = previousWaiting; replanned = previousReplanned;
         admissions.clear();
         for (const [repo, admitted] of previousAdmissions) admissions.set(repo, admitted);
         pending = null;
@@ -357,52 +367,52 @@ const readableCapacity = capacity => !!capacity && typeof capacity.lanes === 'nu
 
 export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCapacity, run, log = () => {},
   floor, readCpuIdlePct, readLivePr, readSkipCardOnly = () => readRedTeamProbes().value.skipCardOnly, readNetFiles = args => isUnderTest() ? { ok: false } : readBacklogOnlyNetFiles(args), ...rest }) {
-  const managed = new Set(queue.entries().filter(entry => entry.repo === repo).map(entry => entry.pr));
-  const incoming = (plan?.refusals ?? []).filter(row => row.kind === 'already-reviewed-head'
-    && isRealHead(row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid))
-    .map(row => ({ repo, pr: Number(row.prNumber) }));
-  const liveEvidence = queue.reconcile({ readLivePr, plannerSkipReplanMinutes: floor?.plannerSkipReplanMinutes, candidates: incoming });
-  const candidates = [], cardOnlyCandidates = [];
-  for (const row of plan?.refusals ?? []) {
-    if (row.kind !== 'already-reviewed-head') continue;
-    const head = row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid;
-    if (!isRealHead(head)) continue;
-    const number = Number(row.prNumber), key = `${repo}#${number}@${head}`;
-    let cardOnly = cardOnlyHeads.get(key) === true;
-    if (!cardOnlyHeads.has(key)) {
-      try {
-        const net = readNetFiles({ repo, number, headRefOid: head });
-        cardOnly = net?.ok === true && isCardOnlyDiff(net.files);
-        // Only readable evidence is cached; an unreadable read retries next tick.
-        if (net?.ok === true) {
-          cardOnlyHeads.set(key, cardOnly);
-          // Oldest evidence is re-read on demand after eviction.
-          if (cardOnlyHeads.size > MAX_CARD_ONLY_HEADS) cardOnlyHeads.delete(cardOnlyHeads.keys().next().value);
-        }
-      } catch { /* Unreadable evidence retains normal queue admission. */ }
-    }
-    if (cardOnly) cardOnlyCandidates.push({ pr: number, head });
-    else candidates.push({ pr: number, head });
-  }
-  const capacity = normalizeCapacity(rawCapacity);
-  // Unreadable capacity admits nothing (fail closed), so a card-only PR queues like any other then.
-  // The bypass also needs the live card-only skip policy on (the one the red-team pass itself follows).
-  let skipCardOnly = false;
-  if (cardOnlyCandidates.length) { try { skipCardOnly = readSkipCardOnly() === true; } catch { /* fail closed */ } }
-  const bypassed = new Set();
-  for (const entry of cardOnlyCandidates) {
-    const key = `${repo}#${entry.pr}`, livePr = liveEvidence.get(key);
-    const current = !liveEvidence.has(key) || (livePr?.state === 'OPEN' && livePr.headRefOid === entry.head);
-    if (current && skipCardOnly && readableCapacity(capacity)) { bypassed.add(entry.pr); note(log, `card-only ${repo}#${entry.pr} bypasses red-team queue`); }
-    else candidates.push(entry);
-  }
-  if (floor?.minConcurrent > 0 && typeof readCpuIdlePct === 'function') {
-    let cpuIdlePct;
-    try { cpuIdlePct = readCpuIdlePct(); } catch { /* An unreadable sample leaves capacity unchanged. */ }
-    applyRedTeamQueueFloor(capacity, { floor, cpuIdlePct, log });
-  }
   const transaction = transactions.get(queue)?.();
   try {
+    const managed = new Set(queue.entries().filter(entry => entry.repo === repo).map(entry => entry.pr));
+    const incoming = (plan?.refusals ?? []).filter(row => row.kind === 'already-reviewed-head'
+      && isRealHead(row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid))
+      .map(row => ({ repo, pr: Number(row.prNumber) }));
+    const liveEvidence = queue.reconcile({ readLivePr, plannerSkipReplanMinutes: floor?.plannerSkipReplanMinutes, candidates: incoming });
+    const candidates = [], cardOnlyCandidates = [];
+    for (const row of plan?.refusals ?? []) {
+      if (row.kind !== 'already-reviewed-head') continue;
+      const head = row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid;
+      if (!isRealHead(head)) continue;
+      const number = Number(row.prNumber), key = `${repo}#${number}@${head}`;
+      let cardOnly = cardOnlyHeads.get(key) === true;
+      if (!cardOnlyHeads.has(key)) {
+        try {
+          const net = readNetFiles({ repo, number, headRefOid: head });
+          cardOnly = net?.ok === true && isCardOnlyDiff(net.files);
+          // Only readable evidence is cached; an unreadable read retries next tick.
+          if (net?.ok === true) {
+            cardOnlyHeads.set(key, cardOnly);
+            // Oldest evidence is re-read on demand after eviction.
+            if (cardOnlyHeads.size > MAX_CARD_ONLY_HEADS) cardOnlyHeads.delete(cardOnlyHeads.keys().next().value);
+          }
+        } catch { /* Unreadable evidence retains normal queue admission. */ }
+      }
+      if (cardOnly) cardOnlyCandidates.push({ pr: number, head });
+      else candidates.push({ pr: number, head });
+    }
+    const capacity = normalizeCapacity(rawCapacity);
+    // Unreadable capacity admits nothing (fail closed), so a card-only PR queues like any other then.
+    // The bypass also needs the live card-only skip policy on (the one the red-team pass itself follows).
+    let skipCardOnly = false;
+    if (cardOnlyCandidates.length) { try { skipCardOnly = readSkipCardOnly() === true; } catch { /* fail closed */ } }
+    const bypassed = new Set();
+    for (const entry of cardOnlyCandidates) {
+      const key = `${repo}#${entry.pr}`, livePr = liveEvidence.get(key);
+      const current = !liveEvidence.has(key) || (livePr?.state === 'OPEN' && livePr.headRefOid === entry.head);
+      if (current && skipCardOnly && readableCapacity(capacity)) { bypassed.add(entry.pr); note(log, `card-only ${repo}#${entry.pr} bypasses red-team queue`); }
+      else candidates.push(entry);
+    }
+    if (floor?.minConcurrent > 0 && typeof readCpuIdlePct === 'function') {
+      let cpuIdlePct;
+      try { cpuIdlePct = readCpuIdlePct(); } catch { /* An unreadable sample leaves capacity unchanged. */ }
+      applyRedTeamQueueFloor(capacity, { floor, cpuIdlePct, log });
+    }
     queue.sync(repo, candidates);
     // Exhausted but readable capacity: the runner refuses ("no review capacity left") before any retry is spent,
     // so everything passes through and worker-free settlement (clear/carry/label) is not delayed. Unreadable

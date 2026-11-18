@@ -888,7 +888,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     expect(f.open().entries()).toEqual(before);
   });
 
-  it.each(['sync', 'async'])('runner %s failure rolls back sync mutations, admissions and persisted state', async mode => {
+  it.each(['sync', 'async'])('runner %s failure rolls back reconciliation, sync mutations, admissions and persisted state', async mode => {
     const f = fixture();
     await f.queue.sync(repo, candidates([1, 2, 3]));
     await f.queue.admit(repo, 1);
@@ -896,11 +896,13 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     const persisted = new Map(f.files);
     f.operations.length = 0;
     const error = new Error('runner failed after sync mutations');
-    const options = inputs([2, 3, 4], { capacity: capacity(1) });
+    const options = inputs([2, 3, 4], { capacity: capacity(1),
+      readLivePr: ({ pr }) => ({ state: pr === 1 ? 'MERGED' : 'OPEN', headRefOid: pr === 2 ? head(22) : head(pr) }),
+    });
     const run = vi.fn(() => {
-      // Sync removed PR 1 and appended PR 4 before admission; live head changes reconcile separately.
+      // Reconcile evicted PR 1 and re-keyed PR 2; sync appended PR 4 before admission.
       expect(numbers(f.queue.entries())).toEqual([2, 3, 4]);
-      expect(f.queue.entries()[0]).toMatchObject({ head: head(2), attempts: 0 });
+      expect(f.queue.entries()[0]).toMatchObject({ head: head(22), attempts: 0 });
       if (mode === 'async') return Promise.reject(error);
       throw error;
     });
@@ -1593,6 +1595,36 @@ describe('live red-team queue reconciliation and planner-skip expiry', () => {
     expectedIds = [1, 2];
     tick(f.open());
     expect(f.logs.filter(line => line.includes('replan '))).toHaveLength(1);
+  });
+  it.each([
+    ['zero', capacity(0)],
+    ['exhausted starts', { lanes: 5, remainingStarts: 0, budget: { left: 5 } }],
+    ['exhausted budget', { lanes: 5, remainingStarts: 5, budget: { left: 0 } }],
+  ])('wrapper sends only two of five expired skips to the runner with %s capacity, oldest blockedAt first', (_mode, cap) => {
+    const f = fixture();
+    f.queue.sync(repo, candidates([1, 2, 3, 4, 5]));
+    const at = Date.parse('2026-11-09T12:00:00Z');
+    // Hold age deliberately differs from FIFO, with one legacy entry lacking blockedAt.
+    f.files.set(f.file, JSON.stringify(f.queue.entries().map(entry => ({ ...entry,
+      blocked: 'planner-skip', ...(entry.pr === 3 ? {} : { blockedAt: at + (5 - entry.pr) * 1000 }),
+    }))));
+    f.advance(20 * 60000);
+    const queue = f.open();
+    const run = vi.fn(options => {
+      expect(options.plan.refusals.map(row => row.prNumber)).toEqual([3, 5]);
+      expect(options.rawPrs.map(pr => pr.number)).toEqual([3, 5]);
+      expect(numbers(queue.entries().filter(entry => entry.blocked === 'planner-skip'))).toEqual([1, 2, 4]);
+      return { notStarted: options.plan.refusals.map(row => ({ prNumber: row.prNumber, reason: 'no review capacity left' })) };
+    });
+    runWithRedTeamQueue({ queue, ...inputs([1, 2, 3, 4, 5]), capacity: cap, run });
+    expect(run).toHaveBeenCalledOnce();
+    expect(f.logs.filter(line => line.includes('replan '))).toHaveLength(2);
+    const resumed = f.open();
+    resumed.reconcile();
+    expect(numbers(resumed.entries().filter(entry => entry.blocked === 'planner-skip'))).toEqual([1]);
+    expect(numbers(resumed.admit(repo, 0))).toEqual([]); // The two replans consume this turn's probes.
+    resumed.reconcile();
+    expect(numbers(resumed.entries().filter(entry => entry.blocked === 'planner-skip'))).toEqual([]);
   });
   it('migrates a legacy planner-skip without blockedAt using enqueuedAt and admits it as runnable', () => {
     const f = fixture(); seed(f);
