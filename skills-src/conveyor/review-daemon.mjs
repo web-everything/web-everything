@@ -747,10 +747,15 @@ export function runReviewTick({
   // Compute deferrals after confirmed starts, so skipped attempts neither spend capacity nor leave later
   // eligible PRs outside a preselected batch. Only an actual lane shortfall uses the starvation diagnostic.
   const liveCap = remainingReviewCapacity();
-  const live = liveReviewBudget?.live + (initialReviewCapacity - liveCap);
-  const capReason = Number.isFinite(live)
+  const live = Number.isFinite(liveReviewBudget?.max)
+    ? liveReviewBudget.max - liveCap
+    : liveReviewBudget?.live + (initialReviewCapacity - liveCap);
+  const earlierDispatches = Number.isFinite(liveReviewBudget?.max) && Number.isFinite(liveReviewBudget?.live)
+    ? Math.max(0, liveReviewBudget.max - liveReviewBudget.live - initialReviewCapacity) : 0;
+  let capReason = Number.isFinite(live)
     ? liveReviewBudget?.reason?.replace(/live review rounds \d+ of /, `live review rounds ${live} of `)
     : liveReviewBudget?.reason;
+  if (capReason && earlierDispatches > 0) capReason += `; ${earlierDispatches} seat(s) taken by dispatches earlier in this tick`;
   const hostBound = !paused && (!host.admitted || hostLimit - occupiedLanes <= 0);
   const capBound = !paused && !hostBound && liveCap === 0;
   const deferredTotal = reviews.length - dispatchable.length;
@@ -855,10 +860,11 @@ export const REVIEW_DAEMON_APP_AUTH_OPTS = FLEET_APP_AUTH_OPTS;
  * per-PR, one level up. Every downstream step this daemon already calls (`reconcile-pass.mjs`,
  * `review-dispatch.mjs`, both tag scripts) was already fully repo-generic before this — the daemon's own tick
  * was the only WE-hardcoded link (see `runReviewTick`'s own `repo` fix above, filed the same day this was).
- * @param {{repos?:string[], tick?:Function, authGateOverride?:Function}} [o] - `tick` is injectable (defaults to
+ * @param {{repos?:string[], tick?:Function, authGateOverride?:Function, startIndex?:number}} [o] - `tick` is injectable (defaults to
  *   `runReviewTick`); every other option is forwarded to it for EVERY repo except `repo` itself, which this
  *   loop supplies per-iteration. `authGateOverride` (card x5kagse) is a test-only injection point for
  *   {@link planClaudeAuthDispatchGate}'s own real IO decision — see the block below for when the real one runs.
+ *   `startIndex` pins the first repo; omitted, successive ticks rotate first access to shared capacity.
  * @returns {{repos:Array<{repo:string, result?:object, error?:string}>, reviewsOwed:number,
  *   dispatched:Array<object>, failed:Array<object>, refusals:number, reconcileFailed:Array<{repo:string, error:string}>,
  *   deferredForLanes:number, deferredForAuth:number, authPaused:boolean, authPauseReason:(string|null),
@@ -881,7 +887,10 @@ export function sharedHostBudget(hostAdmission) {
   };
 }
 
-export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runReviewTick, authGateOverride, ...tickOpts } = {}) {
+let reviewRepoRotation = 0;
+
+export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runReviewTick, authGateOverride,
+  startIndex = reviewRepoRotation++, ...tickOpts } = {}) {
   // card x5kagse (epic #4075/#3383) — computed ONCE per tick (the login is a host-global fact, not per-repo),
   // then forwarded into every repo's own `runReviewTick` call below. Real IO runs only for a genuine production
   // tick (`tick` left at its real default) — mirrors `runTickAllRepos`'s own identical rule in
@@ -890,15 +899,23 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
   // `authGateOverride` to test the gate itself.
   const authGate = authGateOverride ? authGateOverride()
     : (tick === runReviewTick ? planClaudeAuthDispatchGate() : { paused: false, reason: null });
-  const perRepoMs = {};
+  const perRepoMs = Object.fromEntries(repos.map(repo => [repo, 0]));
   // verify-admission (audit) — ONE host verdict and ONE dispatch budget per daemon tick, shared by every repo, so
   // the per-tick cap is host-wide (never cap × repos).
   if (typeof tickOpts.hostAdmission === 'function') tickOpts.hostAdmission = sharedHostBudget(tickOpts.hostAdmission);
-  const perRepo = forEachRepo(repos, (repo) => {
+  // Give each repo first access to the shared seats on successive ticks. An injected index pins
+  // execution order for callers/tests without advancing the default round-robin counter.
+  const start = repos.length && Number.isSafeInteger(startIndex)
+    ? ((startIndex % repos.length) + repos.length) % repos.length : 0;
+  const orderedRepos = [...repos.slice(start), ...repos.slice(0, start)];
+  const rotatedResults = forEachRepo(orderedRepos, (repo) => {
     const started = Date.now();
     try { return tick({ ...tickOpts, repo, paused: authGate.paused, pauseReason: authGate.reason }); }
     finally { perRepoMs[repo] = Date.now() - started; }
   });
+  // Preserve the public result (and aggregate) order even when execution starts at another repo.
+  const split = repos.length - start;
+  const perRepo = [...rotatedResults.slice(split), ...rotatedResults.slice(0, split)];
   const dispatched = [];
   const failed = [];
   const notStarted = [];
