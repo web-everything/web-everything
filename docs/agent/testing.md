@@ -4720,6 +4720,17 @@ errored tools cannot bypass it. The juror's separate error exemption does not ap
 ## Confined AgY repair admission
 
 Keep repair routing and `fix-run` fixtures on raw item evidence, through the detached-provider argv
-handoff and real AgY adapter. General build admission allows kind OR size; repair admission requires
-doc/test kind AND size at most 1 AND a repo-relative scope. Refusals record an unproductive outcome
-so the existing provider chain advances. Terminal transcript fixtures use nested `result.status: SUCCESS`.
+handoff and real AgY adapter. Repair admission retains the R1062 size-1 rule for any kind and
+requires a repo-relative scope contained in the launch/routing scope. An out-of-launch item path refuses the whole repair; missing
+launch evidence and empty or oversized scopes advance to the next provider/operator. The shared
+critical-work verdict is recomputed on effective paths (including directory forms); critical scopes
+refuse. Refusals record an unproductive outcome so the existing provider chain advances. Terminal transcript fixtures use nested `result.status: SUCCESS`.
+
+
+Threat model (R1062 slice S7, R1049): agy is an UNTRUSTED DIFF PRODUCER. It runs in a throwaway clone with a
+private HOME and a scrubbed environment (no secrets or credentials), under a sandbox-exec profile that confines
+writes to the clone, its private temp and its private HOME. Shells and tools inside that copy are out of scope:
+the copy can only damage itself. The boundary is the diff: we keep ONLY the git diff, and our code applies it
+through the shared protected-path predicate, intersected with the launch scope (an item scope may only narrow
+it, with criticality re-checked), before the normal review and audit path. Network stays allowed (agy needs its
+API) and size-1 jobs of any kind are admitted by operator ruling R1062; neither is a confinement claim.

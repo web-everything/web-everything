@@ -574,7 +574,7 @@ describe('runFixCli', () => {
   it('records a no-change Argon outcome and resolves its provider', async () => {
     const m = mk(['aaa','aaa']), recordRouted = vi.fn(()=>({}));
     const resolveProvider = vi.fn(m.io.resolveProvider);
-    expect((await runFixCli([...argv.map(a=>a==='--provider=codex'?'--provider=antigravity':a), '--num=7'], {...m.io,resolveProvider,recordRouted,loadFixItem:async()=>({taskKind:'doc-fix',size:1,scope:['we:docs']})})).code).toBe(0);
+    expect((await runFixCli([...argv.map(a=>a==='--provider=codex'?'--provider=antigravity':a), '--scope=we:docs', '--num=7'], {...m.io,resolveProvider,recordRouted,loadFixItem:async()=>({taskKind:'doc-fix',size:1,scope:['we:docs']})})).code).toBe(0);
     expect(resolveProvider).toHaveBeenCalledWith('antigravity');
     expect(recordRouted).toHaveBeenCalledWith(expect.objectContaining({head:'aaa',outcome:'no-change'}));
   });

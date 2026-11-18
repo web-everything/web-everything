@@ -2,24 +2,55 @@
 import { describe, expect, it } from 'vitest';
 import { deriveAgyFixAdmission } from '../agy-fix-admission.mjs';
 
+const admit = item => deriveAgyFixAdmission(item, { scope: item.scope });
+
 describe('repair scope admission', () => {
+  it.each([
+    [['docs/guide.md'], ['docs/agent']],
+    [['docs/guide.md'], ['docs']],
+    [['docs'], ['docs/a.md', 'src/main.ts']],
+    [undefined, ['docs/a.md']],
+    [['docs'], []],
+    [['docs'], ['docs-other/guide.md']],
+    [['docs'], Array(1)],
+    [Array.from({ length: 21 }, (_, i) => `docs/${i}.md`), ['docs/0.md']],
+  ])('refuses widening or missing routing evidence: launch %j item %j', (launchScope, scope) => {
+    expect(deriveAgyFixAdmission({ size: 1, scope }, { scope: launchScope })).toBeNull();
+  });
+  it('admits only item paths contained in a launch entry, normalizing repo prefixes', () => {
+    expect(deriveAgyFixAdmission({ size: 1, scope: ['we:docs/guide.md'] }, { scope: 'we:docs,tests' }))
+      .toEqual({ kind: 'doc-fix', size: 1, scope: ['docs/guide.md'] });
+  });
+  it('admits a test item inside a broader source launch scope', () => {
+    expect(deriveAgyFixAdmission({ taskKind: 'test-fix', size: 1, scope: ['src/__tests__/a.ts'] }, { scope: ['src'] })?.kind)
+      .toBe('test-fix');
+  });
+  it.each(['docs/agent', 'docs/agent/testing.md', 'scripts/hooks', 'scripts/hooks/check.mjs',
+    'scripts/lib/review-policy.mjs', 'scripts/lib/new-policy.mjs', 'scripts/lib/critical-work.mjs',
+    'scripts/settings/agy-build.json', '.github', '.github/CODEOWNERS', 'AGENTS.md'])
+  ('refuses effective critical path %s with next-provider/operator fallback', path => {
+    expect(admit({ size: 1, scope: [path] })).toBeNull();
+  });
+  it('refuses explicit critical metadata even for ordinary scope', () => {
+    expect(admit({ size: 1, scope: ['docs/guide.md'], humanRequired: true })).toBeNull();
+  });
   it.each([
     ['doc-fix', 'scripts/operations/fix-run.mjs'], ['doc-fix', 'src/_data/blocks.json'],
     ['test-fix', 'src'], ['test-fix', 'src/main.ts'], ['test-fix', '__fixtures__/data.json'],
   ])('refuses explicit %s on mismatched scope %s even at size 1', (taskKind, path) => {
-    expect(deriveAgyFixAdmission({ taskKind, size: 1, scope: [path] })).toBeNull();
+    expect(admit({ taskKind, size: 1, scope: [path] })).toBeNull();
   });
   it.each(['notes.md', 'notes.mdx', 'notes.txt', 'notes.rst', 'docs', 'docs/example.mjs', 'backlog/item.md', 'agent-memory-src/topic'])
   ('admits real documentation scope %s', path => {
-    expect(deriveAgyFixAdmission({ taskKind: 'doc-fix', size: 1, scope: [`we:${path}`] }))
+    expect(admit({ taskKind: 'doc-fix', size: 1, scope: [`we:${path}`] }))
       .toEqual({ kind: 'doc-fix', size: 1, scope: [path] });
   });
   it.each(['tests', 'tests/helpers/run.mjs', 'src/__tests__', 'src/__tests__/case.ts', 'src/foo.test.ts', 'src/foo.spec.mjs'])
   ('admits real test scope %s', path => {
-    expect(deriveAgyFixAdmission({ taskKind: 'test-fix', size: 1, scope: [path] })?.kind).toBe('test-fix');
+    expect(admit({ taskKind: 'test-fix', size: 1, scope: [path] })?.kind).toBe('test-fix');
   });
   it.each(['fix', 'feature'])('admits bounded size-1 source scope for %s', taskKind => {
-    expect(deriveAgyFixAdmission({ taskKind, size: 1, scope: ['src/main.ts'] }))
+    expect(admit({ taskKind, size: 1, scope: ['src/main.ts'] }))
       .toEqual({ kind: taskKind, size: 1, scope: ['src/main.ts'] });
   });
   it.each(['.git/config', '.GIT/config', '.github/workflows/ci.yml', '.github', 'package.json',
@@ -27,7 +58,7 @@ describe('repair scope admission', () => {
     'docs/.github/workflows/x.yml', 'tests/deep/pnpm-lock.yaml', 'docs/scripts/settings/config.json',
     'scripts/settings/agy-build.json', 'scripts/settings', 'scripts', 'nested/package.json'])
   ('refuses protected scope %s with operator fallback via null admission', path => {
-    expect(deriveAgyFixAdmission({ taskKind: 'fix', size: 1, scope: [path] })).toBeNull();
+    expect(admit({ taskKind: 'fix', size: 1, scope: [path] })).toBeNull();
   });
   it.each([
     { size: 1, scope: Array.from({ length: 21 }, (_, i) => `docs/${i}.md`) }, { size: 0, scope: ['a.md'] },
@@ -35,11 +66,11 @@ describe('repair scope admission', () => {
     { size: 2, scope: ['a.md'] }, { size: 1, scope: [] }, { size: 1, scope: ['fui:docs'] },
     { size: 1, scope: ['../a.md'] }, { scope: ['a.md'] },
   ])('refuses missing, oversized or unsafe evidence %j', item => {
-    expect(deriveAgyFixAdmission({ taskKind: 'doc-fix', ...item })).toBeNull();
+    expect(admit({ taskKind: 'doc-fix', ...item })).toBeNull();
   });
   it.each([2, 20])('admits %s scope entries independently of size', count => {
     const scope = Array.from({ length: count }, (_, i) => `docs/${i}.md`);
-    expect(deriveAgyFixAdmission({ taskKind: 'doc-fix', size: 1, scope }))
+    expect(admit({ taskKind: 'doc-fix', size: 1, scope }))
       .toEqual({ kind: 'doc-fix', size: 1, scope });
   });
 });

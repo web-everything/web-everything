@@ -531,6 +531,17 @@ describe('fallback chain routing', () => {
     if (executor === 'antigravity') expect(decision.agyAdmission).toEqual({ kind: item.taskKind === 'fix' ? 'doc-fix' : item.taskKind,
       size: 1, scope: item.scope.map(p => p.slice(3)) });
   });
+  it.each(['docs/agent', 'docs/agent/testing.md', 'scripts/hooks/check.mjs', 'scripts/lib/new-policy.mjs'])
+  ('skips Argon when item scope %s widens the launch scope or is critical', path => {
+    const head = 'a'.repeat(40);
+    for (const scope of [['we:docs/guide.md'], [`we:${path}`]]) {
+      expect(routeFixExecutor({ repo: 'we', pr: 42, itemNum: '7', headRefOid: head, scope }, {
+        setting, chain, criticalFor: () => false, launcherAvailable: fixLauncherAvailable,
+        loadFixItems: () => [{ num: '7', taskKind: 'fix', size: 1, scope: [`we:${path}`] }],
+        readRouted: () => ({ 'we#42': Array.from({ length: 3 }, () => ({ head, outcome: 'failed' })) }),
+      }).executor).toBe('claude');
+    }
+  });
   it('skips Argon when the item read fails', () => {
     expect(routeFixExecutor({ pr: 42, itemNum: '7', headRefOid: 'aaa' }, { setting, chain,
       criticalFor: () => false, launcherAvailable: fixLauncherAvailable,
