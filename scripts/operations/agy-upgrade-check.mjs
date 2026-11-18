@@ -1,0 +1,127 @@
+#!/usr/bin/env node
+/** Bounded, operator-scheduled binary maintenance; no daemon is installed here. */
+import { spawn as nodeSpawn } from 'node:child_process';
+import * as fs from 'node:fs';
+import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { randomUUID, createHash } from 'node:crypto';
+import { agyEvidenceDir } from '../lib/antigravity-run-evidence.mjs';
+import { cascadePolicy, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
+import { publishAttention } from './needs-you-feed.mjs';
+
+export function resolveSettings(env = process.env, log = console.error) {
+  const number = key => env[key] === undefined ? undefined : Number(env[key]);
+  const raw = env.WE_AGY_UPGRADE_ENABLED;
+  const settings = cascadePolicy('agyUpgrade', {}, { platform: {}, operatorOverride: {}, env,
+    standard: { enabled: true, minIntervalMinutes: 60, smokeTimeoutMs: 20000 },
+    envValues: { enabled: raw === undefined ? undefined : ['true', '1'].includes(raw) ? true : ['false', '0'].includes(raw) ? false : raw,
+      minIntervalMinutes: number('WE_AGY_UPGRADE_MIN_INTERVAL_MINUTES'), smokeTimeoutMs: number('WE_AGY_UPGRADE_SMOKE_TIMEOUT_MS') },
+    valid: { enabled: v => typeof v === 'boolean',
+      minIntervalMinutes: v => Number.isFinite(v) && v >= 60 && v <= 1440,
+      smokeTimeoutMs: v => Number.isInteger(v) && v > 0 && v <= 20000 } });
+  log(formatCascadeSourcesLine('agyUpgrade', settings));
+  return settings.value;
+}
+
+/** Resolves on the deadline even if the child never emits close after SIGKILL. */
+export function boundedExec(command, args, { timeoutMs, spawn = nodeSpawn,
+  kill = (pid, signal) => process.kill(pid, signal), setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
+  return new Promise(resolveResult => {
+    let child, timer, done = false, stdout = '', bytes = 0;
+    const finish = (result, terminate = false) => {
+      if (done) return;
+      done = true;
+      clearTimer(timer);
+      if (terminate && Number.isInteger(child?.pid) && child.pid > 0) {
+        try { kill(child.pid, 'SIGKILL'); } catch { /* already exited */ }
+      }
+      resolveResult({ stdout, ...result });
+    };
+    try {
+      child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+      timer = setTimer(() => finish({ ok: false, hung: true, reason: 'timeout' }, true), timeoutMs);
+      const collect = (chunk, output) => {
+        bytes += Buffer.byteLength(chunk);
+        if (bytes > 65536) return finish({ ok: false, hung: false, reason: 'output-limit' }, true);
+        if (output && !done) stdout += chunk.toString();
+      };
+      child.stdout.on('data', chunk => collect(chunk, true));
+      child.stderr.on('data', chunk => collect(chunk, false));
+      child.once('error', () => finish({ ok: false, hung: false, reason: 'spawn-error' }, true));
+      child.once('close', code => finish({ ok: code === 0, hung: false, reason: code === 0 ? '' : 'exit-failed' }));
+    } catch { finish({ ok: false, hung: false, reason: 'spawn-error' }, true); }
+  });
+}
+
+export async function smoke({ exec = boundedExec, smokeTimeoutMs = 20000, ...io } = {}) {
+  const result = await exec('agy', ['--version'], { ...io, timeoutMs: smokeTimeoutMs });
+  const version = /\b\d+\.\d+\.\d+(?:[-+][\w.-]+)?\b/.exec(result.stdout ?? '')?.[0] ?? 'unknown';
+  return { ok: result.ok && version !== 'unknown', version, hung: !!result.hung };
+}
+
+function readBounded(io, path) {
+  try {
+    if (io.statSync(path).size > 8192) return null;
+    return JSON.parse(io.readFileSync(path, 'utf8'));
+  } catch { return null; }
+}
+function atomicWrite(io, path, value) {
+  const temp = `${path}.${randomUUID()}.tmp`;
+  try { io.writeFileSync(temp, JSON.stringify(value) + '\n'); io.renameSync(temp, path); }
+  finally { io.rmSync(temp, { force: true }); }
+}
+
+/** All commands, filesystem, clock and attention publication are injectable. */
+export async function runUpgradeCheck({ dir = agyEvidenceDir(), env = process.env, io = fs, now = Date.now,
+  exec = boundedExec, alert = publishAttention, log = console.error } = {}) {
+  const settings = resolveSettings(env, log);
+  if (!settings.enabled) return { status: 'disabled' };
+  io.mkdirSync(dir, { recursive: true });
+  const lock = join(dir, 'upgrade-check.lock');
+  try { io.mkdirSync(lock); } catch (e) { if (e.code === 'EEXIST') return { status: 'locked' }; throw e; }
+  try {
+    const at = now(), cachePath = join(dir, 'upgrade-check.json'), healthPath = join(dir, 'binary-health.json');
+    const cache = readBounded(io, cachePath);
+    const lastRun = typeof cache?.at === 'string' ? Date.parse(cache.at) : NaN;
+    if (Number.isFinite(lastRun) && lastRun <= at && at - lastRun < settings.minIntervalMinutes * 60000)
+      return { status: 'rate-limited' };
+    const state = { at: new Date(at).toISOString(), alerted: Number.isFinite(lastRun) && lastRun <= at
+      && typeof cache?.alerted === 'string' && cache.alerted.length <= 128 ? cache.alerted : '' };
+    atomicWrite(io, cachePath, state);
+    const record = async result => {
+      const reason = result.ok ? '' : result.hung ? 'hung' : 'failed';
+      atomicWrite(io, healthPath, { state: result.ok ? 'ok' : 'dead', at: new Date(now()).toISOString(), version: result.version, reason });
+      if (!result.ok) {
+        const identity = `${result.version}:${reason}`;
+        if (state.alerted !== identity) {
+          await alert({ repo: 'webeverything', pr: 0, head: createHash('sha256').update(identity).digest('hex'), kind: 'agy-binary-dead',
+            reason: `agy ${result.version} ${reason}; seat held for 24h. Inspect binary; run upgrade check again.`,
+            command: 'node scripts/operations/agy-upgrade-check.mjs' });
+          state.alerted = identity;
+          atomicWrite(io, cachePath, state);
+        }
+      }
+    };
+    let result = await smoke({ exec, smokeTimeoutMs: settings.smokeTimeoutMs });
+    await record(result);
+    const outdated = await exec('brew', ['outdated', '--cask', '--json=v2'], { timeoutMs: 60000 });
+    let casks;
+    try { casks = JSON.parse(outdated.stdout).casks; } catch { /* refuse unknown staleness */ }
+    if (!outdated.ok || !Array.isArray(casks)) {
+      log('agy-upgrade: staleness unavailable; no upgrade attempted; operator should inspect brew outdated');
+      return { status: 'staleness-unavailable', ...result };
+    }
+    if (casks.some(cask => cask?.name === 'antigravity-cli' || cask?.token === 'antigravity-cli')) {
+      const upgrade = await exec('brew', ['upgrade', '--cask', 'antigravity-cli'], { timeoutMs: 120000 });
+      result = await smoke({ exec, smokeTimeoutMs: settings.smokeTimeoutMs });
+      await record(result);
+      if (!upgrade.ok) log('agy-upgrade: upgrade failed; operator should inspect brew upgrade --cask antigravity-cli');
+    }
+    return { status: result.ok ? 'ok' : 'dead', ...result };
+  } finally { io.rmdirSync(lock); }
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  runUpgradeCheck().then(result => { console.log(JSON.stringify(result)); process.exitCode = result.ok === false ? 1 : 0; })
+    .catch(error => { console.error(error.message); process.exitCode = 1; });
+}

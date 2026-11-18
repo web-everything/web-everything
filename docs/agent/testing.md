@@ -4580,3 +4580,16 @@ a subdirectory beside the live `<slug>.json` records so no valid slug can collid
 are usable only for the ended pid; SIGKILL cannot leave a marker. Keep missing/stale
 marker, redaction, bounded-tail and diagnostic-write-failure regressions in the scoped
 review-job and review-daemon suites.
+
+
+## Antigravity binary maintenance
+
+`scripts/operations/__tests__/agy-upgrade-check.test.mjs` injects command execution,
+child spawn/kill, time, filesystem and attention publication. No real agy or brew
+runs. Its timeout probes assert exact child PID SIGKILL and completion without a
+close event; output overflow also kills the child. The persisted dead-health
+probe checks both model families, malformed/future/expired records and normal
+quota fallback. Keep the two maintenance JSON files excluded from the legacy
+root quota scan: malformed optional health must not become a quota parse error.
+The run lock serializes scheduled ticks; a killed checker requires operator
+inspection and removal of its leftover lock before maintenance can resume.

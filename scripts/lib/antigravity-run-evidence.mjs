@@ -26,9 +26,17 @@ export function agyRunEvidence({ stdout = '', stderr = '', requestedModel, now =
     fallbackDecision: exhausted ? 'skip-quota-exhausted' : mismatch ? 'skip-backend-mismatch' : modelMismatch ? 'skip-model-mismatch' : 'none' };
 }
 export function readAgyHold(model, { dir = agyEvidenceDir(), now = Date.now() } = {}) {
+  try {
+    const health = JSON.parse(readFileSync(join(dir, 'binary-health.json'), 'utf8'));
+    const at = typeof health?.at === 'string' ? Date.parse(health.at) : NaN;
+    if (health?.state === 'dead' && typeof health.version === 'string' && typeof health.reason === 'string'
+      && at <= now && now - at < 86400000)
+      return { ...health, requestedModel: model || 'default', servedModel: 'unknown', servedBackend: 'unknown',
+        modelEvidence: 'not-launched', fallbackDecision: 'skip-binary-dead' };
+  } catch { /* optional binary health fails open to normal quota behavior */ }
   const readRows = (folder) => {
     try {
-      return readdirSync(folder).filter((name) => name.endsWith('.json'))
+      return readdirSync(folder).filter((name) => name.endsWith('.json') && !['binary-health.json', 'upgrade-check.json'].includes(name))
         .map((name) => JSON.parse(readFileSync(join(folder, name), 'utf8')));
     } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
   };
