@@ -1515,6 +1515,29 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
     }
   };
 
+  it.each(['budget then quota', 'quota then budget'])
+    ('preserves quota hold metadata without retrying for %s', async order => {
+      const budget = spendingFailures[0][1];
+      const quota = spendingFailures[1][1];
+      const events = order === 'budget then quota' ? [budget, quota] : [quota, budget];
+      const stdout = events.map(event => JSON.stringify(event)).join('\n');
+      const { fn, calls } = scriptedSpawn([{ stdout, code: 1 }, { stdout: ANSWER_JSON, code: 0 }]);
+      const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID,
+        budget: 0.5, retries: 1, log: () => {}, spawnFn: fn }).catch(e => e);
+      expectSpendingFailure(error, 'quota');
+      expect(calls).toHaveLength(1);
+    });
+
+  it('keeps JudgeBudgetError and quota hold metadata when one event reports both limits', async () => {
+    const stdout = JSON.stringify({ ...spendingFailures[0][1], result: spendingFailures[1][1].result });
+    const { fn, calls } = scriptedSpawn([{ stdout, code: 1 }, { stdout: ANSWER_JSON, code: 0 }]);
+    const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID,
+      budget: 0.5, retries: 1, log: () => {}, spawnFn: fn }).catch(e => e);
+    expectSpendingFailure(error, 'budget');
+    expectSpendingFailure(error, 'quota');
+    expect(calls).toHaveLength(1);
+  });
+
   it.each(spendingFailures.flatMap(([kind, failure]) => ['before', 'after'].map(position => [kind, position, failure])))
     ('preserves %s metadata and never retries with a generic error %s', async (kind, position, failure) => {
       const events = position === 'before' ? [genericFailure, failure] : [failure, genericFailure];

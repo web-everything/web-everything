@@ -760,8 +760,9 @@ export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
     || [event?.subtype, event?.code, event?.error?.code, event?.error?.type]
       .some(code => ['error_max_budget_usd', 'budget_exceeded', 'budget_exhausted'].includes(code))
     || /\bbudget (?:exhausted|exceeded)\b/i.test(failureText(event));
-  const priority = event => event && (budgetFailure(event)
-    || quotaHoldRow({ provider: 'claude', error: failureText(event) })) ? 1 : 0;
+  const priority = event => !event ? 0
+    : quotaHoldRow({ provider: 'claude', error: failureText(event) }) ? 2
+      : budgetFailure(event) ? 1 : 0;
   const failure = failures.reduce((worst, event) => priority(event) > priority(worst) ? event : worst, failures[0]);
   // Inspect the whole stream before choosing a failure. Spending-limit evidence outranks malformed
   // output; judgeSpawn then ranks either result against its wall-clock timeout before considering retries.
@@ -772,9 +773,9 @@ export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
       // shared quota classifier strict, and retain the declared ceiling and spend.
       const text = failureText(failure);
       if (budgetFailure(failure)) {
-        throw new JudgeBudgetError({ budget,
+        throw markQuotaFailure(new JudgeBudgetError({ budget,
           costUsd: typeof failure.total_cost_usd === 'number' ? failure.total_cost_usd : 0,
-          stopReason: failure.stop_reason ?? '', result: text, stderr });
+          stopReason: failure.stop_reason ?? '', result: text, stderr }), text);
       }
       throw markQuotaFailure(new Error(`judge-spawn: the juror failed: ${text}`), text);
     }
