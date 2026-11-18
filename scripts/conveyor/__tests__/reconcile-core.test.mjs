@@ -4877,5 +4877,6 @@ it('paged fetch evidence remains unknown to the planner even when every fetched 
   expect(fetched.rowsComplete).toBe(false);
   expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
   expect(result.refusals.flatMap(row => [row, row.reviewRefusal])).toContainEqual(expect.objectContaining({
-    kind: 'review-ci', ci: expect.objectContaining({ unknown: true, reason: 'required-review-gate-conflict' }) }));
+    // No review-gate row was observed, so no more specific reason exists: rows-incomplete stays the (fail-closed) reason.
+    kind: 'review-ci', ci: expect.objectContaining({ unknown: true, reason: 'rows-incomplete' }) }));
 });

@@ -566,7 +566,11 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
 
   const note = { kind: 'ci-heal-escalated', outcome: 'not-a-ci-break', headSha: head, prNumber: 4535 };
   const planOptions = () => ({ note, pr: fixture, repo: fixture.repo, verdictSettings: settings,
-    readRequiredChecks: vi.fn(() => fixture.requiredChecks) });
+    readRequiredChecks: vi.fn(() => ({ checks: fixture.requiredChecks, source: 'live' })) });
+  it.each([undefined, 'fallback', 'declared'])('daemon verdict void preserves unavailable roster source %s', source => {
+    expect(planVerdictVoid({ ...planOptions(),
+      readRequiredChecks: () => ({ checks: fixture.requiredChecks, source }) })).toBeNull();
+  });
   it('plans a verdict void from the daemon note and deduplicates a trusted void', () => {
     expect(planVerdictVoid(planOptions())).toMatchObject({ kind: 'ci-heal-verdict-void', alreadyPosted: false, body: voidComment().body });
     expect(planVerdictVoid({ ...planOptions(), pr: { ...fixture, comments: [...fixture.comments, voidComment()] } })).toMatchObject({ alreadyPosted: true });
@@ -612,7 +616,7 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
     it('the notes daemon posts the second void', () => {
       const postComment = vi.fn(() => ({ ok: true }));
       const result = runReconcileNotesAllRepos({ repos: [fixture.repo], verdictSettings: settings,
-        readRequiredChecks: () => fixture.requiredChecks, dryRun: false, postComment,
+        readRequiredChecks: () => ({ checks: fixture.requiredChecks, source: 'live' }), dryRun: false, postComment,
         tick: () => ({ notes: [note], prsByNumber: new Map([[4535, prWith([verdict(1), voidComment(), verdict(2)])]]) }) });
       expect(postComment).toHaveBeenCalledTimes(1);
       expect(result.comments).toEqual([expect.objectContaining({ kind: 'ci-heal-verdict-void', posted: true })]);
@@ -626,7 +630,7 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
   it.each([true, false])('notes daemon plans/posts the void with dryRun=%s', (dryRun) => {
     const postComment = vi.fn(() => ({ ok: true }));
     const result = runReconcileNotesAllRepos({ repos: [fixture.repo], verdictSettings: settings,
-      readRequiredChecks: () => fixture.requiredChecks, dryRun, postComment,
+      readRequiredChecks: () => ({ checks: fixture.requiredChecks, source: 'live' }), dryRun, postComment,
       tick: () => ({ notes: [note], prsByNumber: new Map([[4535, fixture]]) }) });
     expect(result.comments).toEqual([expect.objectContaining({ kind: 'ci-heal-verdict-void', body: voidComment().body, posted: !dryRun, dryRun })]);
     expect(postComment).toHaveBeenCalledTimes(dryRun ? 0 : 1);
@@ -874,7 +878,7 @@ describe('needs-human verdict void', async () => {
     note: { kind: 'ci-heal-escalation-moot', prNumber: 5012, headSha: HEAD, outcome: 'needs-human' },
     repo: 'we', verdictSettings: { voidNeedsHumanWhenCiGreen: true },
     pr: { headRefOid: HEAD, state: 'OPEN', comments, statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] },
-    readRequiredChecks: () => ['test'],
+    readRequiredChecks: () => ({ checks: ['test'], source: 'live' }),
   });
   it('preserves the original not-a-ci-break comment byte for byte', () => {
     expect(buildVoid({ headSha: HEAD, red: ['test'] })).toBe([
@@ -899,6 +903,13 @@ describe('needs-human verdict void', async () => {
     expect(latestCiHealEscalationForHead([escalation('not-a-ci-break'), voidComment()], HEAD, { recheck: true })?.outcome).toBe('not-a-ci-break');
     expect(notCiBreakVerdictVoidState([escalation('not-a-ci-break'), voidComment()], HEAD).voidCount).toBe(0);
     expect(needsHumanVoidState(comments, HEAD)).toEqual({ escalationIndex: 0, voided: true, voidCount: 1 });
+  });
+  it.each([undefined, 'live', 'cache', 'fallback'])('daemon green retirement preserves roster source %s', source => {
+    const o = options();
+    const result = planNeedsHumanVoid({ ...o, pr: { ...o.pr, rowsHead: HEAD, rowsComplete: true },
+      readRequiredChecks: () => ({ checks: ['test'], source }) });
+    if (['live', 'cache'].includes(source)) expect(result).toMatchObject({ alreadyPosted: false });
+    else expect(result).toBeNull();
   });
   it('retains needs-human when the daemon snapshot cannot prove complete CI', () => {
     // Cached rollups carry no pagination proof; no green claim may void a human escalation.

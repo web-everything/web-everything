@@ -4616,3 +4616,16 @@ reader's `source` through escalation recording and reconcile; an omitted source
 is unavailable evidence, never an implicit live roster. Named negative tests in
 `check-state-predicate`, `ci-heal-verdict-recheck`, and `ci-heal-escalation-mark`
 pin these defaults and the recording preflights.
+
+## Review CI refusal ordering
+
+An observed pending or failed required check takes precedence over `rows-incomplete`
+in the review adapter's primary reason. Incompleteness remains in `secondaryReasons`
+and preserves `unknown: true` with `allowed: false`. Missing checks alone do not
+establish an observed blocker. The ordering cases in `review-ci-gate.test.mjs` and
+the producer formatting cases in `review-ci-gate-io.test.mjs` pin these guarantees.
+Retry after exhausting pagination or explicitly reading every required name;
+successful observed names alone cannot establish admission.
+Consumers that decide whether to recheck evidence must inspect `unknown`, rather
+than infer completeness from the primary reason. The facts-first regression in
+`merge-gate-hold-class.test.mjs` requires a live recheck of an incomplete failure.

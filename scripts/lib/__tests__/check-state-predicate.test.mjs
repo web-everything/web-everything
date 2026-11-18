@@ -615,6 +615,29 @@ describe('required check evidence contract (PR1 acceptance)', () => {
     expect(resolve([{ name: 'test', conclusion: 'success' }])).toMatchObject({ state: 'unknown',
       perName: { test: { reasons: ['malformed'] } } });
   });
+  it.each(['failure', 'error', 'pending', 'expected'])('StatusContext contradictory state %s is malformed, never success', state => {
+    const contradictory = { __typename: 'StatusContext', context: 'test', status: 'completed', conclusion: 'success', state };
+    expect(resolve([contradictory])).toMatchObject({ state: 'unknown',
+      perName: { test: { state: 'unknown', reasons: ['malformed'] } } });
+  });
+  it.each([
+    { status: 'in_progress', conclusion: 'success' },
+    { status: 'completed', conclusion: 'success', state: 'failure' },
+    { status: 'completed', conclusion: 'failure', state: 'success' },
+    { status: 'queued', conclusion: 'failure' },
+    { status: 'completed', conclusion: 'neutral', state: 'pending' },
+    { status: 'completed', conclusion: 'skipped', state: 'error' },
+  ])('CheckRun contradictory fields are malformed: %j', fields => {
+    const contradictory = { __typename: 'CheckRun', name: 'test', ...fields };
+    for (const rows of [[contradictory], ...orders([row(), contradictory])]) {
+      expect(resolve(rows)).toMatchObject({ state: 'unknown',
+        perName: { test: { state: 'unknown', reasons: ['malformed'] } } });
+    }
+  });
+  it.each(['StatusContext', 'CheckRun'])('consistent %s fields still pass with case folding', __typename => {
+    expect(resolve([{ __typename, name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', state: 'SuCcEsS' }]))
+      .toMatchObject({ state: 'pass', perName: { test: { state: 'pass', reasons: [] } } });
+  });
   it('2: integration implication requires zero integration rows and all test groups passing', () => {
     const requiredNames = ['test', 'integration'], allowImplication = true;
     expect(resolve([row()], { requiredNames, allowImplication }).perName.integration).toMatchObject({ state: 'pass', via: 'test' });

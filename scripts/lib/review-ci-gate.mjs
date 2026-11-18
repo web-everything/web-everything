@@ -10,8 +10,12 @@ export function reviewCiGate({ headSha, requiredChecks, checks, rowsHead = headS
   const reason = result.reasons.includes('missing-head') ? 'missing-head'
     : result.reasons.includes('roster-unavailable') ? 'unknown-required-set'
     : affected.some(r => r.name === 'review-gate') ? 'required-review-gate-conflict'
+    : Object.values(result.perName).some(r => r.rows.length > 0 && ['pending', 'fail'].includes(r.state)) ? 'required-checks-not-successful'
     : result.reasons.includes('rows-incomplete') ? 'rows-incomplete'
     : result.state === 'pass' ? 'required-checks-successful'
     : 'required-checks-not-successful';
-  return { allowed: result.state === 'pass', ...(result.state === 'unknown' ? { unknown: true } : {}), headSha: headSha ?? null, reason, affected };
+  // Observed blockers explain the refusal first; pagination still prevents admission.
+  const secondaryReasons = reason !== 'rows-incomplete' && result.reasons.includes('rows-incomplete') ? ['rows-incomplete'] : [];
+  return { allowed: result.state === 'pass', ...(result.state === 'unknown' ? { unknown: true } : {}),
+    ...(secondaryReasons.length ? { secondaryReasons } : {}), headSha: headSha ?? null, reason, affected };
 }

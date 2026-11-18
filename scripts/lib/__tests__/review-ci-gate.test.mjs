@@ -50,6 +50,20 @@ describe('strict review CI prerequisite', () => {
 
 
 describe('review CI completeness evidence', () => {
+  it.each([
+    [{ status: 'in_progress' }, 'pending'],
+    [{ status: 'completed', conclusion: 'failure' }, 'failure'],
+  ])('reports observed %s before incomplete rows without admitting review', (fields, reason) => {
+    expect(reviewCiGate({ headSha, requiredChecks: ['daemon-soak'], rowsComplete: false,
+      checks: [{ name: 'daemon-soak', ...fields }] })).toMatchObject({
+      allowed: false, unknown: true, reason: 'required-checks-not-successful',
+      affected: [{ name: 'daemon-soak', reason }], secondaryReasons: ['rows-incomplete'],
+    });
+  });
+  it('does not describe an unobserved missing check as an observed blocker', () => {
+    expect(reviewCiGate({ headSha, requiredChecks: ['daemon-soak'], checks: [], rowsComplete: false }))
+      .toMatchObject({ allowed: false, unknown: true, reason: 'rows-incomplete' });
+  });
   it('refuses missing or false completeness with successful rows and names the fallback', () => {
     const evidence = { headSha, requiredChecks: ['test'], checks: [success('test')] };
     expect(reviewCiGate(evidence)).toMatchObject({ allowed: false, unknown: true, reason: 'rows-incomplete' });

@@ -389,7 +389,7 @@ describe('requiredCheckStates shared predicate regressions', () => {
         expect(contradictingChecks(evidence)).toEqual(unknown ? [] : ['test']);
         expect(ciGreenForEscalation(evidence)).toBe(false);
         expect(verdictRecheck.gateOnlyRedStates(evidence).gateOnlyRed).toBe(false);
-        const pr = { headRefOid: input.headSha, statusCheckRollup: evidence.rollup };
+        const pr = { rowsComplete: true, rowsHead: input.headSha, headRefOid: input.headSha, statusCheckRollup: evidence.rollup };
         expect(notCiBreakRecordRefusal({ rosterSource: 'live', headSha: input.headSha, pr, requiredChecks: ['test'] })).toBeTruthy();
         const options = { headSha: input.headSha, settings: { recheckNotCiBreak: true },
           readPr: async () => pr, readRequired: async () => ({ source: 'live', checks: ['test'] }) };
@@ -436,7 +436,11 @@ describe('requiredCheckStates shared predicate regressions', () => {
           if (expectedBucket === 'missing') expected.missing.push('check-evidence');
           expect(requiredCheckStates(evidence), `${kind} ${dated}/${undated} ${JSON.stringify(timestamps)}`)
             .toEqual(expected);
-          expect(contradictingChecks(evidence)).toEqual(expected.red);
+          // Unknown companion rows cannot erase an independently observed failure.
+          const observedFailure = [dated, undated].some(outcome => kind === 'StatusContext'
+            ? ['FAILURE', 'ERROR'].includes(outcome)
+            : ['FAILURE', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE'].includes(outcome));
+          expect(contradictingChecks(evidence)).toEqual(observedFailure ? ['test'] : []);
           expect(ciGreenForEscalation(evidence)).toBe(bucket === 'green');
           expect(verdictRecheck.gateOnlyRedStates(evidence).gateOnlyRed).toBe(bucket === 'green'); // Only held, with all other checks passed, waits for review.
           const pr = { headRefOid: input.headSha, statusCheckRollup: evidence.rollup };

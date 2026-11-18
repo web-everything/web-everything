@@ -136,6 +136,19 @@ const evidenceInteger = value => typeof value === 'number'
 const evidenceName = row => row?.name ?? row?.context;
 const evidenceJob = row => /\/actions\/runs\/\d+\/job\/(\d+)/.exec(row?.detailsUrl ?? row?.details_url ?? '')?.[1];
 
+// Completed is a lifecycle marker, not an outcome. Compare only explicit
+// outcome categories, before legacy mapping or hold excusal rewrites evidence.
+const contradictoryEvidence = row => {
+  const outcomes = [row?.status, row?.conclusion, row?.state].map(normalize).map(value => {
+    if (value === 'error') return 'red';
+    if (value === 'expected') return 'pending';
+    if (Object.hasOwn(CHECK_STATE_TABLE.completed, value)) return CHECK_STATE_TABLE.completed[value];
+    if (value !== 'completed' && Object.hasOwn(CHECK_STATE_TABLE, value)) return CHECK_STATE_TABLE[value];
+    return null;
+  }).filter(Boolean);
+  return new Set(outcomes).size > 1;
+};
+
 // A name/run pair alone cannot identify a matrix job. Prefer the Actions job
 // identity; otherwise require the same check-run identity, never infer lineage.
 const evidenceIdentity = row => {
@@ -171,7 +184,7 @@ export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNa
       else if (['pending', 'expected'].includes(legacy)) status = 'pending';
     }
     let state = 'unknown';
-    if (typeof name !== 'string' || !name.trim() || !Object.hasOwn(CHECK_STATE_TABLE, status)
+    if (contradictoryEvidence(row) || typeof name !== 'string' || !name.trim() || !Object.hasOwn(CHECK_STATE_TABLE, status)
       || (status === 'completed' && !Object.hasOwn(CHECK_STATE_TABLE.completed, conclusion) && !legacyError)) why.push('malformed');
     else if (status !== 'completed') { state = 'pending'; why.push('pending'); }
     else if (['cancelled', 'stale'].includes(conclusion)) { state = 'pending'; why.push('needs-rerun'); }
