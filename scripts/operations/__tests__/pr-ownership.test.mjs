@@ -34,7 +34,7 @@ const AGENTS = [
 const TRANSCRIPT_AGE_MS = { s1101: 2 * 60_000, s1102: 3 * 60 * 60_000 };
 const PHASE_ENTERED_MIN = { 1101: 10, 1102: 200, 1103: 60, 1104: 4, 1105: 30 };
 
-function reader({ fixDispatchPresent = false } = {}) {
+function reader({ fixDispatchPresent = false, listing = () => AGENTS } = {}) {
   const readTimeline = vi.fn(({ number }) => [
     { event: 'commented', createdAt: ago(1) }, // a comment is not a phase change
     { event: 'labeled', createdAt: ago(PHASE_ENTERED_MIN[number]) },
@@ -66,7 +66,7 @@ function reader({ fixDispatchPresent = false } = {}) {
     enrichScopeBloat: (prs) => prs,
     resolveMainSha: () => null,
   }));
-  const readAgents = vi.fn(() => AGENTS);
+  const readAgents = vi.fn(listing);
   return {
     reconcile, readAgents, readTimeline, run,
     read: createPrOwnershipReader({
@@ -235,6 +235,13 @@ describe('pr-ownership — edge cases of the pure pieces', () => {
     const bound = bindAgents({ number: 7, headRefOid: 'deadbeef' }, agents);
     expect(bound.map((b) => [b.agent.name, b.transcriptAgeMs])).toEqual([['other', null], ['review-7', 5000]]);
   });
+
+  it.each([['null', () => null], ['incomplete-marked', () => Object.defineProperty([], 'incomplete', { value: ['unreadable'] })]])(
+    'an unreadable agents listing (%s) holds the real reconcile pass instead of reading as a complete empty inventory', async (_name, listing) => {
+      const row = (await invoke(reader({ listing }).read)).prs.find((p) => p.number === 1105);
+      // With a readable listing this same PR is a `dispatch review` (see owed-not-dispatched); the hold turns it into a refusal.
+      expect(row.reconcile.verdict).toBe('refusal');
+    });
 
   it('withTranscriptAges keeps unreadable worker evidence: the incomplete marker and a non-array listing never become a complete empty inventory', () => {
     const hungInfoFor = () => ({ ageMs: 1 });

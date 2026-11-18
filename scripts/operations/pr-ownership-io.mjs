@@ -133,7 +133,14 @@ export function createPrOwnershipReader({
     // One listing for every repo, enriched once, with transcript ages attached before any binding happens.
     let agentsOnce = null;
     const sharedAgents = () => {
-      if (!agentsOnce) agentsOnce = withTranscriptAges(enrich(readAgents({})), { hungInfoFor, now: nowMs });
+      if (!agentsOnce) {
+        // Judge the RAW listing before enrich: enrichAgents silently turns a null/non-array into [], which would read as complete.
+        const listed = readAgents({});
+        agentsOnce = withTranscriptAges(enrich(listed), { hungInfoFor, now: nowMs });
+        if ((!Array.isArray(listed) || Object.hasOwn(listed, 'incomplete')) && !Object.hasOwn(agentsOnce, 'incomplete')) {
+          Object.defineProperty(agentsOnce, 'incomplete', { value: Array.isArray(listed) ? listed.incomplete : true });
+        }
+      }
       return agentsOnce;
     };
 
