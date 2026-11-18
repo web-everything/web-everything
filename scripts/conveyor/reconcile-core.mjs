@@ -1,4 +1,5 @@
 import { parseMqFailureRoute } from '../lib/mq-failure-route.mjs';
+import { redTeamFact, redTeamSentBackFindings } from './dispatch-eligibility-facts.mjs';
 import { admitMqFailureRoute } from './mq-failure-intake.mjs';
 import { ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { reviewStartGate, earlyStartShadow, fastChecksFor, REVIEW_TIMING_DEFAULTS, joinedFixDecision, fixReadiness, FIX_TIMING_DEFAULTS } from '../lib/review-timing.mjs';
@@ -133,6 +134,7 @@ import { isForeignCompletionSessionId, sanitizeDeniedCommand } from '../operatio
 import { NEGOTIATION_ROUND_CAP } from '../lib/jury-core.mjs';
 import { resolveRoundCap } from '../lib/round-cap.mjs';
 import { countRearmComments, REARM_COMMENT_MARKER } from './rearm-review.mjs';
+import { countRedTeamFixComments, RED_TEAM_FIX_COMMENT_MARKER, RED_TEAM_REARM_COMMENT_MARKER } from './red-team-fix-round-count.mjs';
 import { isFixRoundRearmComment } from './rearm-round-count.mjs';
 import { NOTE_COMMENT_MARKER } from './reconcile-note-comment.mjs';
 // #3383 — see this module's own REFUSAL 3 note below, and `advisory-round-count.mjs`'s header for the
@@ -394,6 +396,7 @@ export const BOOKKEEPING_MARKERS = Object.freeze([
   // #xkmu3gv — the two new completed-round markers. Neither is a reviewer speaking, so neither may ever count as
   // a finding (`countFindings`) or the pass would read its OWN handback comment as fresh work to fix.
   CONFLICT_FIX_COMMENT_MARKER, ADVISORY_FIX_COMMENT_MARKER,
+  RED_TEAM_FIX_COMMENT_MARKER, RED_TEAM_REARM_COMMENT_MARKER,
   // we:backlog/heal-wait-for-rerun — a ci-heal escalation is this loop's OWN bookkeeping too: a PR whose head
   // has since moved past a ci-red phase but still carries an old escalation comment in its history must not
   // have that comment misread as a fresh reviewer finding.
@@ -1872,14 +1875,14 @@ export function resolveRoundExtensionAnchor({ env = {}, platform = null, repo = 
 }
 
 /** Shared fix/review counter. A sliced thread deliberately omits the unsliceable durableCounts fallback. */
-function sharedRoundAttempts(pr, { durableCount = 0, mechanicalRoundsCountTowardCap = false,
+export function sharedRoundAttempts(pr, { durableCount = 0, mechanicalRoundsCountTowardCap = false,
   realFixRounds = countRealFixRounds(pr), operatorBudget = operatorFixBudget(pr?.comments, 0) } = {}) {
   return Math.max(
     realFixRounds.ok ? realFixRounds.real : Number(durableCount) || 0,
     operatorBudget?.attempts ?? 0,
     realFixRounds.ok ? realFixRounds.real : countRearmComments(pr?.comments),
     countAdvisoryComments(pr?.comments),
-  ) + (mechanicalRoundsCountTowardCap ? countConflictFixComments(pr?.comments) : 0);
+  ) + countRedTeamFixComments(pr?.comments) + (mechanicalRoundsCountTowardCap ? countConflictFixComments(pr?.comments) : 0);
 }
 
 /** A latest open send-back buys a bounded repair opportunity, even after the ordinary cap. */
@@ -2884,6 +2887,29 @@ export function planReconcile({
           why: attempts >= effectiveRoundCap ? sendBackRoundWhy : 'operator send-back not yet addressed after a fixer had its chance' });
       }
       continue;
+    }
+
+    // A later accept on an unchanged head cannot retire the red-team gate's confirmed send-back.
+    // review:changes remains owned by the ordinary bounced path; accepted heads must never be rearmed.
+    if (phase === 'queued' && pr?.state === 'OPEN' && !pr?.isDraft
+        && withPhase.labels.includes('review:accepted') && withPhase.labels.includes('red-team:blocked')
+        && !withPhase.labels.includes('review:changes')) {
+      const findings = redTeamSentBackFindings(pr);
+      if (findings.length) {
+        // Mandatory holds still bind a repair launch: never dispatch past a referral hold or an unreviewable head.
+        if (refuseReferralHold({ pr, refuse, withPhase })) continue;
+        if (refuseUnreviewable({ pr, requiredChecks, refuse, withPhase })) continue;
+        const attempts = roundAttempts();
+        if (attempts >= effectiveRoundCap) {
+          refuseCapExhausted({ ...withPhase, attempts, cap: effectiveRoundCap, capKind: 'fix',
+            why: 'red-team send-back remains unresolved on the accepted head; automatic fix rounds exhausted' }, { allowTakeover: false });
+        } else {
+          dispatch.push({ ...base, ...withPhase, kind: 'fix', mode: 'red-team-sent-back', state: pr.state, findings: findings.length, attempts, roundCap: effectiveRoundCap,
+            redTeamSentBack: { head: pr.headRefOid, findings, resultId: redTeamFact(pr.comments, prNumber, pr.headRefOid)?.value?.resultId },
+            why: 'confirmed red-team send-back remains unresolved on this accepted head; repair and push the same branch without rearming' });
+        }
+        continue;
+      }
     }
 
     // ── `restore-review-label` (LIVE INCIDENT 2026-10-03/04, PR #3830 — an approval-time prevention-card PR) —

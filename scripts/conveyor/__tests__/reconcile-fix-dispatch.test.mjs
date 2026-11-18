@@ -1,3 +1,7 @@
+import { planReconcile } from '../reconcile-core.mjs';
+import { RED_TEAM_FIX_COMMENT_MARKER, countRedTeamFixComments } from '../red-team-fix-round-count.mjs';
+import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
+import { redTeamGateMarker, liveResultGateState } from '../../lib/red-team-gate.mjs';
 import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
 /**
  * @file scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs — #3438: dispatch the fix agent
@@ -8,11 +12,17 @@ import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
  * `we:scripts/operations/__tests__/review-dispatch.test.mjs`'s own style for the sibling operation this file's
  * `dispatchFix` composition was mirrored from.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join as chargeJoin } from 'node:path';
+let chargeRoot;
+beforeEach(() => { chargeRoot = mkdtempSync(chargeJoin(tmpdir(), 'red-team-charge-test-')); vi.stubEnv('WE_COORDINATION_ROOT', chargeRoot); });
+afterEach(() => { rmSync(chargeRoot, { recursive: true, force: true }); vi.unstubAllEnvs(); });
 import { spawnSync } from 'node:child_process';
 import * as ghThrottle from '../../lib/gh-throttle.mjs';
 import {
-  createFixPassPrReader, fetchPrFilesPaginated, replayFixLaunch, withStaleBase, withPlannedContext, dispatchFix, fetchCardScopeAtRef, fetchPrDiffPaths, isDiffTooLargeError, PermanentScopeReadError, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
+  publishRedTeamFixDispatch, createFixPassPrReader, fetchPrFilesPaginated, replayFixLaunch, withStaleBase, withPlannedContext, dispatchFix, fetchCardScopeAtRef, fetchPrDiffPaths, isDiffTooLargeError, PermanentScopeReadError, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
   findResumeCandidate, buildResumePrompt, tryResumeFix, tryResumeRoundFix, filterFixesByInFlightScope, dropTerminalFixClaims, routeFixExecutor,
 } from '../reconcile-fix-dispatch.mjs';
 import { CONFLICT_LABEL } from '../parked-pr-conflict-watch.mjs';
@@ -2155,6 +2165,16 @@ describe('routed Codex fallback', () => {
 
 
 describe('stale-base mechanical fix brief', () => {
+  it.each(['lane/3438-wire-reconcile-pass', 'some-hand-opened-branch'])('preserves red-team gate findings through planning %s', headRefName => {
+    const redTeamSentBack = { head: 'a'.repeat(40), findings: [{ summary: 'Gate break' }] };
+    const { planned, refusals } = planFixesFromReconcile([{
+      kind: 'fix', prNumber: 7031, headRefName, mode: 'red-team-sent-back', redTeamSentBack,
+    }], findItemStub, () => [], () => [], 'we', () => ['src/x.ts']);
+    expect(refusals).toEqual([]);
+    expect(planned).toMatchObject([{ mode: 'red-team-sent-back', redTeamSentBack }]);
+    expect(withPlannedContext('brief', planned[0])).toContain('Gate break');
+    expect(withPlannedContext('brief', planned[0])).toContain('scripts/conveyor/rearm-review.mjs <pr> --repo=<owner/name> --round=red-team --expect-head=<pushed-sha>');
+  });
   const staleBase = { missing: ['standards', 'new-job'], defaultBranch: 'main' };
   it('leaves ordinary prompts alone and spells out the mechanical-only hand-back', () => {
     expect(withStaleBase('brief', null)).toBe('brief');
@@ -2473,5 +2493,152 @@ describe('fix pass PR metadata snapshot', () => {
     expect(exec.mock.calls.filter(([, args]) => args[1] === 'view')).toHaveLength(1);
     expect(() => createFixPassPrReader({ exec })(7)).toThrow('unreadable PR');
     expect(exec.mock.calls.filter(([, args]) => args[1] === 'view')).toHaveLength(2);
+  });
+});
+
+
+describe('Claude red-team repair round publication', () => {
+  const head = 'a'.repeat(40);
+  const planned = { pr: 7031, itemNum: '3438', lane: 9, laneRef: 'lane/3438-wire-reconcile-pass',
+    scope: item3438.scope, headRefOid: head, attempts: 0, mode: 'red-team-sent-back',
+    redTeamSentBack: { head, findings: [{ summary: 'Gate break' }] } };
+  const thread = () => {
+    const comments = [{ author: { login: 'web-everything' }, body: renderRedTeamComment({ pr: 7031, rev: head,
+      provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+      findings: [{ summary: 'Gate break', category: 'edge-case', impactIfUnfixed: 'broken',
+        file: 'scripts/example.mjs', line: 1, confirmedByRecheck: true }] }) }];
+    const result = liveResultGateState(comments, 7031, head).resultId;
+    comments.push({ author: { login: 'web-everything' }, body: redTeamGateMarker(7031, head, 'sent-back', result) });
+    return { comments, result };
+  };
+  const options = () => ({ root: '/repo', readBrief: () => REAL_TEMPLATE_STUB,
+    executorDecision: { executor: 'claude' }, wrapFix: false,
+    acquireClaim: () => ({ ok: true }), releaseClaim: vi.fn(), readFixClaim: () => null,
+    ensureSessionCwd: p => p, grantConflictHelper: () => {}, isolateSession: () => ({}),
+    resolveSettingsEnv: () => ({}), postNotice: () => {}, mintSessionId: () => 'sid' });
+
+  it('production row without mode yields a planned Claude repair that receipts before launch after label drift', () => {
+    const { comments } = thread();
+    const pr = { number: 7031, state: 'OPEN', headRefName: planned.laneRef, headRefOid: head, isDraft: false,
+      labels: [{ name: 'review:accepted' }, { name: 'red-team:blocked' }], comments, commentsComplete: true,
+      mergeStateStatus: 'CLEAN', statusCheckRollup: [], files: ['scripts/example.mjs'] };
+    expect(pr).not.toHaveProperty('mode');
+    const { planned: fixes, refusals } = planFixesFromReconcile(
+      planReconcile({ prs: [pr], agents: [], now: Date.now() }).dispatch, findItemStub, () => []);
+    expect(refusals).toEqual([]);
+    expect(fixes).toHaveLength(1);
+    pr.labels = [{ name: 'review:changes' }];
+    const exec = vi.fn((_cmd, args) => comments.push({ author: { login: 'web-everything' }, body: args.at(-1) }));
+    const spawnAgent = vi.fn(() => {
+      expect(countRedTeamFixComments(comments)).toBe(1);
+      return { sessionId: 'sid' };
+    });
+    dispatchFix({ ...fixes[0], lane: 9 }, { ...options(), spawnAgent,
+      publishRedTeamRound: request => publishRedTeamFixDispatch(request, { readComments: () => comments, exec }) });
+    expect(exec).toHaveBeenCalledOnce();
+    expect(spawnAgent).toHaveBeenCalledOnce();
+  });
+
+  it.each(['lane/3438-wire-reconcile-pass', 'some-hand-opened-branch'])(
+    'carries configured cap 1 from reconcile through planning and refuses a second Claude charge (%s)', headRefName => {
+      const { comments } = thread();
+      const pr = { number: 7031, state: 'OPEN', headRefName, headRefOid: head, isDraft: false,
+        labels: ['review:accepted', 'red-team:blocked'], comments, commentsComplete: true,
+        mergeStateStatus: 'CLEAN', statusCheckRollup: [], files: ['scripts/example.mjs'] };
+      const rows = planReconcile({ prs: [pr], agents: [], roundCap: 1, now: Date.now() }).dispatch;
+      const { planned: fixes, refusals } = planFixesFromReconcile(rows, findItemStub, () => []);
+      expect(refusals).toEqual([]);
+      expect(fixes).toHaveLength(1);
+      expect(fixes[0].roundCap).toBe(1);
+      // Another writer consumes the budget after planning, before this launch's fresh-thread check.
+      const exec = vi.fn((_cmd, args) => comments.push({ author: { login: 'web-everything' }, body: args.at(-1) }));
+      expect(publishRedTeamFixDispatch({ repo: 'we', planned: fixes[0] }, { readComments: () => comments, exec })).toBe(true);
+      const spawnAgent = vi.fn();
+      const io = { ...options(), spawnAgent,
+        publishRedTeamRound: request => publishRedTeamFixDispatch(request, { readComments: () => comments, exec }) };
+      expect(() => dispatchFix({ ...fixes[0], lane: 9, attempts: 1 }, io)).toThrow('cap exhausted');
+      expect(spawnAgent).not.toHaveBeenCalled();
+      expect(exec).toHaveBeenCalledOnce();
+      expect(countRedTeamFixComments(comments)).toBe(1);
+    });
+
+  it('routes red-team repairs through fresh counted dispatch instead of either resume path', () => {
+    expect(tryResumeFix(planned)).toEqual({ resumed: false, resumeAttempt: null });
+    expect(tryResumeRoundFix({ ...planned, attempts: 1 })).toEqual({ resumed: false, resumeAttempt: null });
+  });
+  it.each([false, true])('launches a replayed Claude plan once and charges a new attempt before launch (wrapped=%s)', wrapFix => {
+    const { comments, result } = thread();
+    const exec = vi.fn((_cmd, args) => comments.push({ author: { login: 'web-everything' }, body: args.at(-1) }));
+    const publishRedTeamRound = request => publishRedTeamFixDispatch(request, { readComments: () => comments, exec });
+    let expectedRound = 1;
+    const checkReceipt = () => {
+      expect(countRedTeamFixComments(comments)).toBe(expectedRound);
+      expect(comments.at(-1).body).toContain(`head=${head} result=${result} attempt=${expectedRound}`);
+    };
+    const spawnAgent = vi.fn(() => {
+      checkReceipt();
+      return '';
+    });
+    const launchWrapped = vi.fn(() => {
+      checkReceipt();
+      return { handle: 'pid:99' };
+    });
+    const io = { ...options(), wrapFix, publishRedTeamRound, spawnAgent, launchWrapped };
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      dispatchFix(planned, io);
+      expect(() => dispatchFix(planned, io)).toThrow('launch already spent; new dispatch required');
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('skipping: launch already spent; new dispatch required'));
+    } finally {
+      log.mockRestore();
+    }
+    expect(wrapFix ? launchWrapped : spawnAgent).toHaveBeenCalledOnce();
+    expect(wrapFix ? spawnAgent : launchWrapped).not.toHaveBeenCalled();
+    expect(io.releaseClaim).toHaveBeenCalledOnce();
+    expect(exec).toHaveBeenCalledOnce();
+    expectedRound = 2;
+    dispatchFix({ ...planned, attempts: 1 }, io);
+    expect(wrapFix ? launchWrapped : spawnAgent).toHaveBeenCalledTimes(2);
+    expect(io.releaseClaim).toHaveBeenCalledOnce();
+    expect(exec).toHaveBeenCalledTimes(2);
+    expect(countRedTeamFixComments(comments)).toBe(2);
+    expect(comments.at(-1).body).toContain(RED_TEAM_FIX_COMMENT_MARKER);
+  });
+  it.each([false, true])('a newer gate result cannot replay a spent launch ID; a new ID charges and launches (head moved=%s)', moved => {
+    const { comments, result } = thread();
+    const exec = vi.fn((_cmd, args) => comments.push({ author: { login: 'web-everything' }, body: args.at(-1) }));
+    const spawnAgent = vi.fn(() => '');
+    const io = { ...options(), spawnAgent,
+      publishRedTeamRound: request => publishRedTeamFixDispatch(request, { readComments: () => comments, exec }) };
+    dispatchFix(planned, io);
+    const newer = thread().comments;
+    const nextHead = moved ? 'b'.repeat(40) : head;
+    const nextPlan = { ...planned, headRefOid: nextHead, redTeamSentBack: { ...planned.redTeamSentBack, head: nextHead } };
+    newer[0].body = newer[0].body.replaceAll(head, nextHead).replace('Gate break', 'New gate break');
+    const newResult = liveResultGateState([newer[0]], planned.pr, nextHead).resultId;
+    expect(newResult).not.toBe(result);
+    comments.push(newer[0], { author: { login: 'web-everything' },
+      body: redTeamGateMarker(planned.pr, nextHead, 'sent-back', newResult) });
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(() => dispatchFix(nextPlan, io)).toThrow('launch already spent; new dispatch required');
+    } finally { log.mockRestore(); }
+    expect(spawnAgent).toHaveBeenCalledOnce();
+    expect(exec).toHaveBeenCalledOnce();
+    dispatchFix({ ...nextPlan, attempts: 1 }, io);
+    expect(spawnAgent).toHaveBeenCalledTimes(2);
+    expect(exec).toHaveBeenCalledTimes(2);
+    expect(countRedTeamFixComments(comments)).toBe(2);
+    expect(comments.at(-1).body).toContain(`result=${newResult} attempt=2`);
+  });
+  it.each(['unread', 'missing gate', 'write failure'])('refuses to launch Claude when marker publication has %s', fault => {
+    const { comments } = thread();
+    const spawnAgent = vi.fn();
+    const publishRedTeamRound = request => publishRedTeamFixDispatch(request, {
+      readComments: () => { if (fault === 'unread') throw Error('incomplete thread'); return fault === 'missing gate' ? [] : comments; },
+      exec: () => { throw Error('write failed'); },
+    });
+    expect(() => dispatchFix(planned, { ...options(), publishRedTeamRound, spawnAgent })).toThrow();
+    expect(spawnAgent).not.toHaveBeenCalled();
   });
 });
