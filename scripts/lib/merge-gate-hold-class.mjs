@@ -17,6 +17,8 @@ import { runGhSync } from './gh-throttle.mjs';
 /** Review-start/promotion excusal, bound to this Actions job, head and current labels. */
 export function boundMergeGateReviewHold(row, { headSha, labels } = {}) {
   if (!row || (row.head_sha !== undefined && typeof row.head_sha !== 'string')) return false;
+  // Only a completed run can be excused; an in-progress run reporting a conclusion is contradictory.
+  if (String(row.status).toLowerCase() !== 'completed') return false;
   // Contradictory evidence (a failed run that also reports another state) is never excusable.
   if (row.state !== undefined && String(row.state).toLowerCase() !== 'failure') return false;
   // Anchored to a real GitHub Actions job URL: no foreign origin or extra path prefix can supply the job id.
