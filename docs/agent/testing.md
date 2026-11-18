@@ -2410,6 +2410,16 @@ or the admitted `npm run test:unit -- <file>` / `npm run check:standards` script
 If `run` exits 75 (host busy or queue full), do not loop: re-run it once with `run --wait-ms=540000 -- …`,
 which keeps re-trying admission itself (load gate and slot queue, holding its queue place) and still exits 75
 when the budget runs out. `heavyAdmission.runWaitMs` sets a default budget through the settings cascade.
+
+Runtime admission's spawn inventory checks the dispatch-lane `provider` boundary, where the
+card identity is still available before mechanical/agent routing. Its generic raw exec helpers
+also run read-only planner calls and trust retries; they are not separate conveyor admission
+sites. Keep the provider bypass regression when changing this inventory. Direct daemon exec
+launches remain inventoried. Prepare grouping must report excluded held candidates as well
+as exclude them from the selected group; exercise this with older planner output.
+Draft recovery must restore its prior persisted state if fresh runtime admission refuses
+after the pending-attempt write. The named regression in `build-red-draft-recovery.test.mjs`
+tightens admission during reservation and checks the rollback, no dispatch, and lease release.
 `WE_FULL_SUITE_OK` bypasses only full-suite selection, never admission. Guard tests should
 assert the suggested command verbatim and probe stdin-to-stdout hook wiring; unrelated
 allow-case fixtures must use admitted commands.
@@ -4658,3 +4668,33 @@ oversized/incomplete/foreign evidence, target head invalidation, snapshot exclus
 a live target replacing a stale cached target with a different head and red check.
 Run it with `fast-drain-scope.test.mjs` and `merge-ai-prs.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
 comparison against daemon observations; fixtures prove IO counts without live GitHub calls.
+### Builder runtime-only candidate admission
+
+`build-dispatch-runtime-only.test.mjs` drives the daemon with the real pure tick core and
+also with older planner output. Pass the once-per-tick `buildPriority` snapshot through
+`config.buildPriority`: filter new build/prepare candidates before cost admission, but keep
+the original queues for retiring existing guards. Filter the prepare group pool too: members
+are new work even when their lead is allowed. The runtime top ID obeys the configured prepare concurrency, light concurrency guard,
+and prepare-ahead window; listing it grants no additional capacity. Malformed runtime evidence holds new work and logs the
+operator fallback (repair or remove the runtime file). Lift/no-file output stays unchanged.
+
+Runtime-only build-priority regressions live in `scripts/lib/__tests__/build-priority-runtime.test.mjs`
+and `skills-src/conveyor/__tests__/build-dispatch-runtime-only.test.mjs`. Filter direct card aliases
+before dispatch lane/scope assignment; a listed ancestor lifts priority but does not grant membership.
+Keep `bornAs` and id metadata through queue projections so num-only build/prepare plans retain direct alias membership.
+Runtime-only admission validates `bornAs` with the build-priority settings validator and requires a durable hash: numeric aliases never authorize another card, and a different hash never grants membership. Cover both build and prepare paths.
+
+
+## Runtime admission keeps launch groups whole
+
+At dispatch and resume spawn boundaries, admit the lead and every `groupMembers`
+entry before reserving a lane, writing session settings, or persisting a resume
+attempt/marker. Refuse the whole group with `runtime-refused` evidence naming the
+refused members; never forward an admission-filtered group. Resume wrappers reload
+the original persisted group, and prompts already describe that whole group.
+The spawn inventory must reject member-dropping predicates and require an exiting
+all-members admission check. Keep the grouped-provider capability guard intact.
+`dispatch-lane-io.test.mjs` covers whole-group refusal and unchanged successful
+forwarding; `build-dispatch-orphan-adopt.test.mjs` covers persisted-group refusal
+including admission changing at the final spawn check, with unchanged claims,
+markers and attempt counts.

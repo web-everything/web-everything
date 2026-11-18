@@ -1,3 +1,4 @@
+import { assertRuntimeAdmitted } from '../lib/runtime-admission.mjs';
 import { NO_PROMPT_SESSION_KINDS } from '../lib/no-prompt-command-rules.mjs';
 import { appendBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { applyTestsFirstPolicy } from '../lib/tests-first-policy.mjs';
@@ -1564,7 +1565,7 @@ export function createDispatchSinks({
   // file + `--settings` env, the `claude --bg` spawn env, the worker-wrapper env), instead of this process's own.
   // A read-only dispatcher (health-watch is `observer`) passes `{ ...process.env, WE_GITHUB_APP_ROLE: 'worker' }`
   // for a session that must write; process.env itself is never touched. `null` keeps every path byte-identical.
-  spawnEnv = null,
+  spawnEnv = null, readRuntimeSettings,
 } = {}) {
   return {
     // #4349 — `ctx` (`{key, runId, ...}`, from `effect-executor.mjs#applyPendingEffects`'s per-sink call) was
@@ -1574,6 +1575,19 @@ export function createDispatchSinks({
     // the two new `request` fields below, so this is additive-only.
     [DISPATCH_EFFECT]: async (payload, ctx = {}) => {
       assertNotALaneCheckout(root);
+      const runtimeRefused = [];
+      const admission = assertRuntimeAdmitted(payload, payload?.launchKind ?? 'build', { readSettings: readRuntimeSettings });
+      if (!admission.admitted) runtimeRefused.push({ num: String(payload?.num), kind: payload?.launchKind ?? 'build', reason: admission.reason });
+      const groupMembers = payload?.groupMembers ?? [];
+      const allMembersAdmitted = groupMembers.map(member => {
+        const kind = payload?.launchKind?.startsWith('prepare') ? 'prepare' : 'build';
+        const admission = assertRuntimeAdmitted({ num: member }, kind, { readSettings: readRuntimeSettings });
+        if (!admission.admitted) runtimeRefused.push({ num: String(member), kind, reason: admission.reason });
+        return admission.admitted;
+      }).every(Boolean);
+      if (!admission.admitted) throw notApplied(admission.reason, { outcome: 'runtime-refused', runtimeRefused });
+      if (!allMembersAdmitted) throw notApplied('runtime admission refused group', { outcome: 'runtime-refused', runtimeRefused });
+
       // #3168 — the loudest point in the whole path: right before the agent is actually spawned into the
       // fail-open lane, printed to THIS process's own stderr rather than left to surface only in the eventual
       // agent's own `acquire` stdout (which nobody here is watching). `payload.occupancyWarning` is `null` for

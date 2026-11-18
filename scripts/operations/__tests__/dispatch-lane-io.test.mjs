@@ -147,6 +147,32 @@ describe('x87v3ed — the build launch reserves its lane first', () => {
     resolveLaneGrant: () => ({}), grantLanePermission: () => {}, ensureWorktreeIsolation: () => {},
     ...extra,
   });
+  it.each(['build', 'prepare'])('refuses the whole %s group before any writes when a member is refused', async launchKind => {
+    const provider = vi.fn(async () => 'pid:123');
+    const reserveLane = vi.fn();
+    const ensureSessionCwd = vi.fn();
+    const sinks = baseSinks({ provider, reserveLane, ensureSessionCwd,
+      readRuntimeSettings: () => ({ mode: 'only', only: true, ids: ['12'] }) });
+    await expect(sinks[DISPATCH_EFFECT]({ ...payload, num: '12', launchKind, groupMembers: ['12', '13'] }))
+      .rejects.toMatchObject({ notApplied: true, outcome: 'runtime-refused',
+        runtimeRefused: [{ num: '13', kind: launchKind, reason: 'runtime-only' }] });
+    await expect(sinks[DISPATCH_EFFECT]({ ...payload, num: '13', launchKind, groupMembers: ['12'] }))
+      .rejects.toMatchObject({ notApplied: true });
+    expect(provider).not.toHaveBeenCalled();
+    expect(reserveLane).not.toHaveBeenCalled();
+    expect(ensureSessionCwd).not.toHaveBeenCalled();
+  });
+  it('forwards the fully admitted group and its instructions unchanged', async () => {
+    const provider = vi.fn(async () => 'pid:123');
+    const sinks = baseSinks({ provider, reserveLane: () => ({}),
+      readRuntimeSettings: () => ({ mode: 'only', only: true, ids: ['12', '13'] }) });
+    const groupMembers = ['12', '13'];
+    const prompt = 'Build #12 and #13 together';
+    await sinks[DISPATCH_EFFECT]({ ...payload, num: '12', groupMembers, prompt });
+    expect(provider).toHaveBeenCalledOnce();
+    expect(provider.mock.calls[0][0].groupMembers).toBe(groupMembers);
+    expect(provider.mock.calls[0][0].prompt).toBe(prompt);
+  });
   it('reserves lane N under the worker\'s own session slug', () => {
     const calls = [];
     const r = reserveBuildLane(payload, { enabled: true, run: (cmd, argv, o) => { calls.push({ cmd, argv, env: o.env }); return ''; }, root: '/r' });

@@ -1234,6 +1234,7 @@ function buildQueue() {
   const rows = detailed.map((r) => ({
     num: r.item.num,
     id: r.item.id,
+    ...(r.item.bornAs != null ? { bornAs: r.item.bornAs } : {}),
     title: r.item.title,
     tier: r.tier,
     score: Number(r.score.toFixed(6)),
