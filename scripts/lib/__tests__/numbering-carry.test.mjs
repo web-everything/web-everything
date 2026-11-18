@@ -1,7 +1,7 @@
 /** The #5025 regression: only proven drain numbering can carry a recorded acceptance. */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -789,12 +789,12 @@ describe('proveNumberingOnlyMove (real git)', () => {
     expect(proveNumberingOnlyMove({ exec: execFileSync, cwd: plain.cwd, fromSha: plain.base, toSha: head, mainRef: 'missing' }))
       .toMatchObject({ ok: false, retryable: true });
   });
-  it('refuses unreadable commits without throwing, fetching only once', () => {
+  it('refuses unreadable commits without throwing and without ever fetching through the lane', () => {
     const r = repo();
     const calls = [];
     const exec = (cmd, args, opts) => { calls.push(args); return execFileSync(cmd, args, opts); };
     refused(r.prove('abcdef0123456789abcdef0123456789abcdef0123', exec), /failed|readable/);
-    expect(calls.filter((args) => args[0] === 'fetch')).toHaveLength(1);
+    expect(calls.filter((args) => args[0] === 'fetch')).toHaveLength(0);
   });
   it('proves successive numbering commits and refuses a chain beyond the limit', () => {
     const r = repo();
@@ -819,10 +819,11 @@ describe('proveNumberingOnlyMove (real git)', () => {
     const toSha = r.number();
     refused(proveNumberingOnlyMove({ exec: execFileSync, cwd: r.cwd, fromSha, toSha }), /linear/);
   });
-  it('rechecks after fetching once and passes cwd and the blob buffer limit to every call', () => {
+  it('rechecks after an injected isolated fetch and passes cwd and the blob buffer limit to every call', () => {
     const r = repo();
     const head = r.number();
     const calls = [];
+    const fetched = [];
     let unreadable = true;
     const exec = (cmd, args, opts) => {
       calls.push(args);
@@ -834,15 +835,36 @@ describe('proveNumberingOnlyMove (real git)', () => {
         unreadable = false;
         throw new Error('simulated missing object');
       }
-      if (args[0] === 'fetch') return Buffer.alloc(0);
+      expect(args[0]).not.toBe('fetch');
       return execFileSync(cmd, args, opts);
     };
-    expect(r.prove(head, exec).ok).toBe(true);
-    expect(calls.slice(0, 3)).toEqual([
+    expect(proveNumberingOnlyMove({ exec, cwd: r.cwd, fromSha: r.base, toSha: head, fetchMissing: sha => fetched.push(sha) }).ok).toBe(true);
+    expect(fetched).toEqual([r.base]);
+    expect(calls.slice(0, 2)).toEqual([
       ['cat-file', '-e', `${r.base}^{commit}`],
-      ['fetch', '--no-tags', '-q', 'origin', r.base],
       ['cat-file', '-e', `${r.base}^{commit}`],
     ]);
+  });
+  it('never fetches a missing commit through the lane origin: retained origin helpers cannot run', () => {
+    const r = repo();
+    const head = r.number();
+    const marker = join(r.cwd, 'helper-ran');
+    const helper = join(r.cwd, 'upload-pack-helper');
+    writeFileSync(helper, '#!/bin/sh\nprintf ran > "' + marker + '"\nexit 1\n', { mode: 0o755 });
+    r.git(['config', 'remote.origin.url', 'git@github.com:example/example.git']);
+    r.git(['config', 'remote.origin.uploadpack', helper]);
+    const calls = [];
+    let unreadable = true;
+    const exec = (cmd, args, opts) => {
+      calls.push(args);
+      if (args[0] === 'cat-file' && args[1] === '-e' && unreadable) { unreadable = false; throw new Error('simulated missing object'); }
+      return execFileSync(cmd, args, opts);
+    };
+    const result = proveNumberingOnlyMove({ exec, cwd: r.cwd, fromSha: r.base, toSha: head });
+    refused(result, /failed/);
+    expect(result.retryable).toBe(true);
+    expect(calls.some(args => args[0] === 'fetch')).toBe(false);
+    expect(existsSync(marker)).toBe(false);
   });
   it.each(['rev-list', 'log', 'diff-tree', 'cat-file'])('fails closed on a %s read error', (operation) => {
     const r = repo();

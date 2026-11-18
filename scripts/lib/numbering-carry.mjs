@@ -222,11 +222,14 @@ export function checkNumberingCommit({ subject, parents, changes, extraMap = new
   return { ok: true, pairs: [...map], renames };
 }
 
-/** IO: a missing commit gets one fetch and re-check, with every failure handled by the outer refusal boundary. */
-function ensureReadable(git, sha) {
+/** IO: a missing commit is never fetched through the lane's own remotes (a lane origin.uploadpack/vcs/URL rewrite is
+ *  agent-writable and would run or redirect). Only an injected, isolated `fetchMissing` may fetch; with none, the
+ *  commit stays unreadable and the proof fails closed (retryable). */
+function ensureReadable(git, sha, fetchMissing) {
   try { git(['cat-file', '-e', `${sha}^{commit}`]); }
-  catch {
-    git(['fetch', '--no-tags', '-q', 'origin', sha]);
+  catch (missing) {
+    if (typeof fetchMissing !== 'function') throw Error('commit unreadable in the lane and no isolated fetch is available', { cause: missing });
+    fetchMissing(sha);
     git(['cat-file', '-e', `${sha}^{commit}`]);
   }
 }
@@ -266,10 +269,10 @@ function readExistingNumbers(git, ref) {
 /**
  * IO (read-only git proof, apart from fetching missing objects): verify every new commit is drain numbering
  * in a bounded linear chain on fromSha. No git error escapes this function; grep is optional evidence.
- * @param {{exec:Function,fromSha:string,toSha:string,mainRef?:string,cwd?:string}} o
+ * @param {{exec:Function,fromSha:string,toSha:string,mainRef?:string,cwd?:string,fetchMissing?:(sha:string)=>void}} o
  * @returns {{ok:true,commits:string[],pairs:Array<[string,string]>,reason:string}|{ok:false,reason:string,retryable?:boolean}}
  */
-export function proveNumberingOnlyMove({ exec, fromSha, toSha, mainRef = 'origin/main', cwd } = {}) {
+export function proveNumberingOnlyMove({ exec, fromSha, toSha, mainRef = 'origin/main', cwd, fetchMissing } = {}) {
   try {
     if (typeof exec !== 'function' || !fromSha || !toSha) return refuse('no git reader or head');
     if (fromSha === toSha) return refuse('no head move');
@@ -294,8 +297,8 @@ export function proveNumberingOnlyMove({ exec, fromSha, toSha, mainRef = 'origin
       if (!Buffer.from(text, 'utf8').equals(bytes)) throw Object.assign(Error('blob text does not round-trip to its bytes'), { code: 'NUMBERING_BYTES_NOT_EXACT' });
       return text;
     };
-    ensureReadable(git, fromSha);
-    ensureReadable(git, toSha);
+    ensureReadable(git, fromSha, fetchMissing);
+    ensureReadable(git, toSha, fetchMissing);
     // rev-list prints full shas: compare the chain's first parent against the resolved accepted head, not its spelling.
     fromSha = git(['rev-parse', '--verify', `${fromSha}^{commit}`]).trim();
     const lines = git(['rev-list', `--max-count=${MAX_NUMBERING_COMMITS + 1}`, '--topo-order', '--reverse', '--parents', toSha, `^${fromSha}`]).trim().split('\n').filter(Boolean);
