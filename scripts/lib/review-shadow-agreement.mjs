@@ -157,9 +157,27 @@ export function appendShadowRow(row, { path = resolveShadowAgreementPath(), appe
 
 /** Read every row; a missing file is no rows, a malformed line is skipped. */
 export function readShadowRows({ path = resolveShadowAgreementPath(), read = readFileSync } = {}) {
+  try { return readShadowRowsWithDrops({ path, read }).rows; } catch { return []; }
+}
+
+/** Read promotion evidence with an explicit count of malformed lines. Unreadable stores refuse reporting. */
+export function readShadowRowsWithDrops({ path = resolveShadowAgreementPath(), read = readFileSync } = {}) {
   let text = '';
-  try { text = read(path, 'utf8'); } catch { return []; }
-  return text.split('\n').flatMap((line) => { try { return line.trim() ? [JSON.parse(line)] : []; } catch { return []; } });
+  try { text = read(path, 'utf8'); } catch (error) {
+    if (error.code === 'ENOENT') return { rows: [], malformedRows: 0 };
+    throw error;
+  }
+  const rows = [];
+  let malformedRows = 0;
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const row = JSON.parse(line);
+      if (!row || typeof row !== 'object' || Array.isArray(row)) throw new TypeError('shadow row must be an object');
+      rows.push(row);
+    } catch { malformedRows += 1; }
+  }
+  return { rows, malformedRows };
 }
 
 /**
@@ -199,9 +217,10 @@ export function summarizeShadowAgreement(rows = []) {
   }));
 }
 
-/** Count PRs with unanimous served-Carbon verdict and finding agreement across every head/lens/run. PURE. */
-export function summarizeCarbonPromotion(rows = [], { threshold = 10 } = {}) {
+/** Count unanimously agreeing PRs with every required lens covered on one identified head. PURE. */
+export function summarizeCarbonPromotion(rows = [], { threshold = 10, malformedRows = 0 } = {}) {
   if (!Number.isSafeInteger(threshold) || threshold <= 0) throw new RangeError('promotion threshold must be a positive safe integer');
+  if (!Number.isSafeInteger(malformedRows) || malformedRows < 0) throw new RangeError('malformedRows must be a non-negative safe integer');
   const prs = new Map();
   const isCarbon = (row) => `${row?.servedModel ?? ''} ${row?.model ?? ''}`.toLowerCase().includes('carbon');
   for (const row of rows) {
@@ -214,21 +233,27 @@ export function summarizeCarbonPromotion(rows = [], { threshold = 10 } = {}) {
     // Carbon must match every Claude finding and add none of its own (no Claude-only, no Carbon-only findings).
     const findingsAgree = complete && (row.overlap.claudeOnly ?? row.overlap.claudeCount) === 0
       && (row.overlap.agyOnly ?? row.overlap.agyCount) === 0;
-    const evidence = prs.get(key) ?? { agrees: true, lenses: new Set() };
+    const evidence = prs.get(key) ?? { agrees: true, heads: new Map() };
     evidence.agrees &&= complete && row.verdictAgree === true && findingsAgree;
-    evidence.lenses.add(row.lens);
+    if (typeof row.head === 'string' && row.head.trim()) {
+      const lenses = evidence.heads.get(row.head) ?? new Set();
+      lenses.add(row.lens);
+      evidence.heads.set(row.head, lenses);
+    }
     prs.set(key, evidence);
   }
   const agreeingPrs = [...prs.values()].filter(evidence => evidence.agrees
-    && REQUIRED_PROMOTION_LENSES.every(lens => evidence.lenses.has(lens))).length;
-  return { agreeingPrs, comparedPrs: prs.size, threshold, reached: agreeingPrs >= threshold };
+    && [...evidence.heads.values()].some(lenses => REQUIRED_PROMOTION_LENSES.every(lens => lenses.has(lens)))).length;
+  return { agreeingPrs, comparedPrs: prs.size, threshold, reached: malformedRows === 0 && agreeingPrs >= threshold,
+    ...(malformedRows > 0 ? { malformedRows } : {}) };
 }
 
 /** Advisory report: evaluate a proposed replacement without changing or gating any seat. */
 export function renderShadowReport(summary, carbonPromotion = summarizeCarbonPromotion([]), promotionReplaces = 'claude', settings) {
   const c = carbonPromotion;
   const replacement = `Carbon promotion would replace one existing ${promotionReplaces} seat; panel size stays fixed.`;
-  const promotion = `Carbon vs Claude: ${c.agreeingPrs} of ${c.comparedPrs} PRs agree; promotion threshold ${c.threshold} agreeing PRs: ${c.reached ? 'reached' : 'not reached'} (promotion is manual; the orchestrator flips it)`;
+  const promotion = `Carbon vs Claude: ${c.agreeingPrs} of ${c.comparedPrs} PRs agree; promotion threshold ${c.threshold} agreeing PRs: ${c.reached ? 'reached' : 'not reached'} (promotion is manual; the orchestrator flips it)`
+    + (c.malformedRows > 0 ? `; evidence is incomplete: ${c.malformedRows} malformed row(s) dropped; repair the evidence store and rerun the report before promotion` : '');
   let panel, refusal;
   try {
     settings ??= loadReviewSeatSettings();
@@ -259,11 +284,11 @@ export function renderShadowReport(summary, carbonPromotion = summarizeCarbonPro
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 if (isMain) {
   const args = process.argv.slice(2);
-  const rows = readShadowRows();
+  const { rows, malformedRows } = readShadowRowsWithDrops();
   const summary = summarizeShadowAgreement(rows);
   const setting = resolveShadowPromotionPrs();
   const replaces = resolveShadowPromotionReplaces();
-  const carbonPromotion = { ...summarizeCarbonPromotion(rows, { threshold: setting.value }), promotionReplaces: replaces.value };
+  const carbonPromotion = { ...summarizeCarbonPromotion(rows, { threshold: setting.value, malformedRows }), promotionReplaces: replaces.value };
   process.stderr.write(`review.shadowSeats.antigravity.promotionReplaces=${replaces.value} (${replaces.source})\n`);
   process.stderr.write(`review.shadowSeats.antigravity.promotionAgreeingPrs=${setting.value} (${setting.source})\n`);
   if (args.includes('--json')) process.stdout.write(`${JSON.stringify({ seats: summary, carbonPromotion }, null, 2)}\n`);

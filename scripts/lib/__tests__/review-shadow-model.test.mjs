@@ -1,5 +1,6 @@
 import { callsUsedToday, callsUsedTodayForProvider, reviewSeatCapUsage } from '../../operations/review-extra-seats.mjs';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
@@ -234,7 +235,7 @@ describe('shadow rows', () => {
   ])('malformed raw answer %j is invalid promotion evidence on either side', malformed => {
     const valid = { summary: 'reviewed', findings: [] };
     const makeRow = (claude, agy, lens) => buildShadowRow({
-      repo: 'o/r', pr: 1, lens, model: 'gemini-4-carbon-high',
+      repo: 'o/r', pr: 1, head: 'head-a', lens, model: 'gemini-4-carbon-high',
       agyRun: { ...ok, servedModel: 'gemini-4-carbon-high' }, claudeAnswer: claude, agyAnswer: agy,
       comparison: compareShadowAnswers({ claude, agy }),
     });
@@ -436,7 +437,64 @@ it('persists served-model evidence through the shadow runner for promotion count
 });
 
 it('promotion evidence rejects a PR where Carbon misses a Claude finding', () => {
-  const row = (pr, overlap) => ({ repo: 'r', pr, lens: 'correctness', claudeValid: true, agyValid: true, status: 'ok', servedModel: 'gemini-4-carbon-high', verdictAgree: true, overlap });
+  const row = (pr, overlap) => ({ repo: 'r', pr, head: 'head-a', lens: 'correctness', claudeValid: true, agyValid: true, status: 'ok', servedModel: 'gemini-4-carbon-high', verdictAgree: true, overlap });
   const rows = [row(1, { matched: 1, claudeCount: 2, agyCount: 1, claudeOnly: 1, agyOnly: 0 }), row(2, { matched: 1, claudeCount: 1, agyCount: 2, claudeOnly: 0, agyOnly: 1 }), row(3, { matched: 1, claudeCount: 1, agyCount: 1, claudeOnly: 0, agyOnly: 0 }), row(4, { matched: 1, claudeCount: 1, agyCount: 1, claudeOnly: 0, agyOnly: 0 }), { repo: 'r', pr: 4, status: 'failed', model: 'gemini-4-carbon-high', servedModel: null }];
   expect(summarizeCarbonPromotion(rows.flatMap(row => [row, { ...row, lens: 'security' }]), { threshold: 10 })).toMatchObject({ agreeingPrs: 1, comparedPrs: 4, reached: false });
+});
+
+describe('Carbon promotion evidence completeness', () => {
+  const row = (lens, head = 'head-a') => buildShadowRow({
+    repo: 'o/r', pr: 1, head, lens, model: 'gemini-4-carbon-high',
+    agyRun: { ...ok, servedModel: 'gemini-4-carbon-high' },
+    claudeAnswer, agyAnswer: ok.value,
+    comparison: compareShadowAnswers({ claude: claudeAnswer, agy: ok.value }),
+  });
+
+  it('does not combine correctness on head A with security on head B', () => {
+    const rows = [row('correctness'), row('security', 'head-b')];
+    expect(summarizeCarbonPromotion(rows, { threshold: 1 }))
+      .toMatchObject({ agreeingPrs: 0, comparedPrs: 1, reached: false });
+    expect(summarizeCarbonPromotion([...rows, row('security')], { threshold: 1 }))
+      .toMatchObject({ agreeingPrs: 1, comparedPrs: 1, reached: true });
+  });
+
+  it.each([undefined, null, '', '   '])('rows without an identified head never qualify: %j', head => {
+    const rows = ['correctness', 'security'].map(lens => ({ ...row(lens), head }));
+    expect(summarizeCarbonPromotion(rows, { threshold: 1 }))
+      .toMatchObject({ agreeingPrs: 0, reached: false });
+  });
+
+  it.each([
+    { status: 'failed' }, { status: 'voided' }, { status: 'skipped' },
+    { agyValid: false }, { servedModel: null }, { overlap: null }, { fellBackTo: 'claude' },
+    { verdictAgree: false },
+  ])('a Carbon row on another head still poisons the whole PR: %j', extra => {
+    const rows = [row('correctness'), row('security'), { ...row('correctness', 'head-b'), ...extra }];
+    expect(summarizeCarbonPromotion(rows, { threshold: 1 }))
+      .toMatchObject({ agreeingPrs: 0, reached: false });
+  });
+
+  it.each(['{malformed', 'null', '[]'])('a malformed row in the file blocks CLI promotion: %s', malformed => {
+    const root = mkdtempSync(join(tmpdir(), 'carbon-incomplete-'));
+    try {
+      mkdirSync(join(root, '.conveyor'));
+      const path = join(root, '.conveyor', 'agy-shadow-agreement.jsonl');
+      const evidence = [row('correctness'), row('security')].map(value => JSON.stringify(value)).join('\n');
+      const options = {
+        env: { ...process.env, CONVEYOR_STATE_ROOT: root, WE_REVIEW_SHADOW_AGY_PROMOTION_PRS: '1' },
+        encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+      };
+      const script = 'scripts/lib/review-shadow-agreement.mjs';
+      writeFileSync(path, `${evidence}\n`);
+      expect(JSON.parse(execFileSync(process.execPath, [script, '--report', '--json'], options)).carbonPromotion)
+        .toMatchObject({ agreeingPrs: 1, threshold: 10, reached: false });
+      writeFileSync(path, `${evidence}\n${malformed}\n`);
+      expect(JSON.parse(execFileSync(process.execPath, [script, '--report', '--json'], options)).carbonPromotion)
+        .toMatchObject({ agreeingPrs: 1, reached: false, malformedRows: 1 });
+      const report = execFileSync(process.execPath, [script, '--report'], options);
+      expect(report).toContain('not reached');
+      expect(report).toContain('evidence is incomplete: 1 malformed row(s) dropped');
+      expect(report).toContain('repair the evidence store and rerun the report before promotion');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
 });

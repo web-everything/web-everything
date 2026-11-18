@@ -226,7 +226,7 @@ describe('void-on-escape — the agy juror\'s three escape checks (real git, fak
 });
 
 describe('the agreement report (#76a identity, #76b sameAs through the PR table)', () => {
-  const carbonRow = (extra = {}) => ({ repo: 'o/r', pr: 1, model: 'gemini-4-carbon-high', servedModel: 'gemini-4-carbon-high',
+  const carbonRow = (extra = {}) => ({ repo: 'o/r', pr: 1, head: 'head-a', model: 'gemini-4-carbon-high', servedModel: 'gemini-4-carbon-high',
     claudeValid: true, agyValid: true, status: 'ok', overlap: { jaccard: 1, matched: 1, claudeCount: 1, agyCount: 1, claudeOnly: 0, agyOnly: 0 }, verdictAgree: true, lens: 'correctness', ...extra });
   const carbonPr = (extra = {}) => [carbonRow(extra), carbonRow({ ...extra, lens: 'security' })];
   it('ten PRs with correctness alone cannot reach promotion', () => {
