@@ -455,7 +455,8 @@ const liveDefaultBranchRulesets = () => [
     } }],
   },
 ];
-const rulesetResponse = args => args[1].includes('?') ? JSON.stringify([{ id: 1 }]) : JSON.stringify(protectedRuleset());
+const rulesetResponse = args => args[1] === 'repos/o/r' ? JSON.stringify({ default_branch: 'main' })
+  : args[1].includes('?') ? JSON.stringify([{ id: 1 }]) : JSON.stringify(protectedRuleset());
 
 // A fake `gh` + `git`: the PR read (live head), the pinned git diff of HEAD (NUL-separated paths), the mutation.
 // `--no-renames` means a rename arrives as two paths (old + new), so the fakes list both.
@@ -527,14 +528,65 @@ describe('enqueue live ruleset enforcement', () => {
   });
   it('accepts the exact live default-branch workflow pins and merge-gate integration binding', () => {
     const rulesets = liveDefaultBranchRulesets();
-    expect(verifyEnqueueRulesets(rulesets)).toEqual({ ok: true });
-    expect(attempt(() => rulesets).result).toEqual({ ok: true, entry });
+    expect(verifyEnqueueRulesets({ rulesets, default_branch: 'main' })).toEqual({ ok: true });
+    expect(attempt(() => ({ rulesets, default_branch: 'main' })).result).toEqual({ ok: true, entry });
+  });
+  it.each(['develop', undefined, null, '', {}])('refuses default-branch scope with different or unreadable default_branch %j without mutation', default_branch => {
+    const evidence = { rulesets: liveDefaultBranchRulesets(), default_branch };
+    const reason = default_branch === 'develop' ? 'default_branch is not main' : 'default_branch unreadable';
+    expect(verifyEnqueueRulesets(evidence)).toMatchObject({ ok: false, reason: expect.stringContaining(reason) });
+    const { result, calls } = attempt(() => evidence);
+    expect(result).toMatchObject({ ok: false, held: true, retryable: true, reason: 'ruleset-pin', error: expect.stringContaining(reason) });
+    expect(calls.some(([, args]) => args.includes(`query=${ENQUEUE_MUTATION}`))).toBe(false);
+  });
+  it('refuses array-only default-branch evidence without repository default_branch', () => {
+    expect(verifyEnqueueRulesets(liveDefaultBranchRulesets())).toMatchObject({ ok: false, reason: expect.stringContaining('default_branch unreadable') });
+  });
+  it.each(['refs/heads/main', '~ALL'])('keeps %s scope independent of default-branch selection', scope => {
+    const rs = protectedRuleset();
+    rs.conditions.ref_name.include = [scope];
+    expect(verifyEnqueueRulesets([rs])).toEqual({ ok: true });
+    expect(verifyEnqueueRulesets({ rulesets: [rs], default_branch: 'develop' })).toEqual({ ok: true });
+  });
+  it.each(['develop', 'unreadable', 'missing'])('live default_branch %s holds retryably without mutation', branch => {
+    const calls = [];
+    const fake = execFor({ files: ['a.txt'], calls });
+    const exec = (cmd, args) => {
+      if (cmd === 'gh' && args[0] === 'api' && args[1].startsWith('repos/')) {
+        calls.push([cmd, args]);
+        if (args[1] === 'repos/o/r') {
+          if (branch === 'unreadable') throw Error('offline');
+          return JSON.stringify(branch === 'missing' ? {} : { default_branch: branch });
+        }
+        const rulesets = liveDefaultBranchRulesets();
+        return JSON.stringify(args[1].includes('?') ? rulesets.map(({ id }) => ({ id }))
+          : rulesets.find(rs => String(rs.id) === args[1].split('/').pop()));
+      }
+      return fake(cmd, args);
+    };
+    const result = enqueuePr({ repo: 'o/r', num: 7, headSha: HEAD, cwd: CWD, exec });
+    expect(result).toMatchObject({ ok: false, held: true, retryable: true, reason: 'ruleset-pin',
+      error: expect.stringContaining(branch === 'develop' ? 'default_branch is not main' : 'default_branch unreadable') });
+    expect(calls.some(([, args]) => args.includes(`query=${ENQUEUE_MUTATION}`))).toBe(false);
+  });
+  it('reads repository default_branch fresh on each live read', () => {
+    let default_branch = 'main';
+    const exec = vi.fn((_cmd, args) => {
+      if (args[1] === 'repos/o/r') return JSON.stringify({ default_branch });
+      const rulesets = liveDefaultBranchRulesets();
+      return JSON.stringify(args[1].includes('?') ? rulesets.map(({ id }) => ({ id }))
+        : rulesets.find(rs => String(rs.id) === args[1].split('/').pop()));
+    });
+    expect(verifyEnqueueRulesets(readLiveEnqueueRulesets({ repo: 'o/r', exec }))).toEqual({ ok: true });
+    default_branch = 'develop';
+    expect(verifyEnqueueRulesets(readLiveEnqueueRulesets({ repo: 'o/r', exec }))).toMatchObject({ ok: false, reason: expect.stringContaining('default_branch is not main') });
+    expect(exec.mock.calls.filter(([, args]) => args[1] === 'repos/o/r')).toHaveLength(2);
   });
   it('refuses a wrong merge-gate pin ref in the live default-branch rulesets without mutation', () => {
     const rulesets = liveDefaultBranchRulesets();
     rulesets[0].rules[0].parameters.workflows.find(w => w.path.endsWith('/merge-gate.yml')).ref = 'refs/heads/pr';
-    expect(verifyEnqueueRulesets(rulesets)).toMatchObject({ ok: false });
-    const { result, calls } = attempt(() => rulesets);
+    expect(verifyEnqueueRulesets({ rulesets, default_branch: 'main' })).toMatchObject({ ok: false });
+    const { result, calls } = attempt(() => ({ rulesets, default_branch: 'main' }));
     expect(result).toMatchObject({ ok: false, held: true, retryable: true, reason: 'ruleset-pin' });
     expect(calls.some(([, args]) => args.includes(`query=${ENQUEUE_MUTATION}`))).toBe(false);
   });
@@ -545,8 +597,8 @@ describe('enqueue live ruleset enforcement', () => {
     const workflow = rulesets[0].rules[0].parameters.workflows.find(w => w.path.endsWith('/merge-gate.yml'));
     if (repositoryId === undefined) delete workflow.repository_id;
     else workflow.repository_id = repositoryId;
-    expect(verifyEnqueueRulesets(rulesets)).toMatchObject({ ok: false });
-    const { result, calls } = attempt(() => rulesets);
+    expect(verifyEnqueueRulesets({ rulesets, default_branch: 'main' })).toMatchObject({ ok: false });
+    const { result, calls } = attempt(() => ({ rulesets, default_branch: 'main' }));
     expect(result).toMatchObject({ ok: false, held: true, retryable: true, reason: 'ruleset-pin',
       error: expect.stringContaining('operator must restore active main rulesets before retrying') });
     expect(calls.some(([, args]) => args.includes(`query=${ENQUEUE_MUTATION}`))).toBe(false);
@@ -554,9 +606,9 @@ describe('enqueue live ruleset enforcement', () => {
   it.each([0, 1])('refuses matching pins when the acting integration bypasses enforcement in ruleset %i', index => {
     const rulesets = liveDefaultBranchRulesets();
     rulesets[index].bypass_actors = [{ actor_id: 5037855, actor_type: 'Integration', bypass_mode: 'always' }];
-    expect(verifyEnqueueRulesets(rulesets)).toMatchObject({ ok: false,
+    expect(verifyEnqueueRulesets({ rulesets, default_branch: 'main' })).toMatchObject({ ok: false,
       reason: expect.stringContaining('bypass applicability to the acting identity is not excluded') });
-    const { result, calls } = attempt(() => rulesets);
+    const { result, calls } = attempt(() => ({ rulesets, default_branch: 'main' }));
     expect(result).toMatchObject({ ok: false, held: true, retryable: true, reason: 'ruleset-pin',
       error: expect.stringContaining('operator must restore active main rulesets before retrying') });
     expect(calls.some(([, args]) => args.includes(`query=${ENQUEUE_MUTATION}`))).toBe(false);
@@ -570,16 +622,16 @@ describe('enqueue live ruleset enforcement', () => {
     const rulesets = liveDefaultBranchRulesets();
     if (bypassActors === undefined) delete rulesets[0].bypass_actors;
     else rulesets[0].bypass_actors = bypassActors;
-    expect(verifyEnqueueRulesets(rulesets)).toMatchObject({ ok: false, reason: expect.stringContaining('bypass') });
-    const { result, calls } = attempt(() => rulesets);
+    expect(verifyEnqueueRulesets({ rulesets, default_branch: 'main' })).toMatchObject({ ok: false, reason: expect.stringContaining('bypass') });
+    const { result, calls } = attempt(() => ({ rulesets, default_branch: 'main' }));
     expect(result).toMatchObject({ ok: false, held: true, retryable: true, reason: 'ruleset-pin' });
     expect(calls.some(([, args]) => args.includes(`query=${ENQUEUE_MUTATION}`))).toBe(false);
   });
   it.each([0, 1])('refuses nonempty exclusions on live default-branch ruleset %i without mutation', index => {
     const rulesets = liveDefaultBranchRulesets();
     rulesets[index].conditions.ref_name.exclude = ['refs/heads/other'];
-    expect(verifyEnqueueRulesets(rulesets)).toMatchObject({ ok: false });
-    const { result, calls } = attempt(() => rulesets);
+    expect(verifyEnqueueRulesets({ rulesets, default_branch: 'main' })).toMatchObject({ ok: false });
+    const { result, calls } = attempt(() => ({ rulesets, default_branch: 'main' }));
     expect(result).toMatchObject({ ok: false, held: true, retryable: true, reason: 'ruleset-pin' });
     expect(calls.some(([, args]) => args.includes(`query=${ENQUEUE_MUTATION}`))).toBe(false);
   });
@@ -624,10 +676,10 @@ describe('enqueue live ruleset enforcement', () => {
     if (kind === 'incomplete page') expect(calls.filter(([, a]) => a[1]?.startsWith('repos/'))).toHaveLength(1);
   });
   it('reads every listed detail rather than trusting the list summary', () => {
-    const exec = vi.fn((_cmd, args) => args[1].includes('?') ? '[{"id":1},{"id":2}]' : JSON.stringify({ ...protectedRuleset(), id: Number(args[1].split('/').pop()) }));
-    expect(readLiveEnqueueRulesets({ repo: 'o/r', exec })).toHaveLength(2);
+    const exec = vi.fn((_cmd, args) => args[1] === 'repos/o/r' ? JSON.stringify({ default_branch: 'main' }) : args[1].includes('?') ? '[{"id":1},{"id":2}]' : JSON.stringify({ ...protectedRuleset(), id: Number(args[1].split('/').pop()) }));
+    expect(readLiveEnqueueRulesets({ repo: 'o/r', exec })).toMatchObject({ rulesets: [expect.any(Object), expect.any(Object)], default_branch: 'main' });
     expect(exec.mock.calls.map(([, args]) => args[1])).toEqual([
-      'repos/o/r/rulesets?includes_parents=true&per_page=100', 'repos/o/r/rulesets/1', 'repos/o/r/rulesets/2',
+      'repos/o/r/rulesets?includes_parents=true&per_page=100', 'repos/o/r/rulesets/1', 'repos/o/r/rulesets/2', 'repos/o/r',
     ]);
   });
 });

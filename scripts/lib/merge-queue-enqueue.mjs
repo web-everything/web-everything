@@ -453,28 +453,42 @@ export function readLiveEnqueueRulesets({ repo, exec = execFileSyncThrottled }) 
   }));
   const listed = read(`repos/${repo}/rulesets?includes_parents=true&per_page=100`);
   if (!Array.isArray(listed) || listed.length >= 100) throw new Error('ruleset list incomplete; operator must inspect repository/parent rulesets and reduce below 100 before retrying');
-  return listed.map(row => {
+  const rulesets = listed.map(row => {
     if (!Number.isSafeInteger(row?.id) || row.id < 1) throw new Error('ruleset id unreadable');
     const detail = read(`repos/${repo}/rulesets/${row.id}`);
     if (detail?.id !== row.id) throw new Error('ruleset detail unreadable');
     return detail;
   });
+  let default_branch;
+  try { default_branch = read(`repos/${repo}`)?.default_branch; }
+  catch { throw new Error('repository default_branch unreadable; operator must verify repository default branch before retrying'); }
+  if (typeof default_branch !== 'string' || !default_branch) throw new Error('repository default_branch unreadable; operator must verify repository default branch before retrying');
+  return { rulesets, default_branch };
 }
 
 /** Pure: unknown scope cannot prove main is protected. Expected bindings come from the operator suggestion. */
-export function verifyEnqueueRulesets(rulesets) {
+export function verifyEnqueueRulesets(evidence) {
+  // Array-only callers can still prove explicit main/all scope, never default-branch scope.
+  const { rulesets, default_branch } = Array.isArray(evidence) ? { rulesets: evidence } : evidence ?? {};
   const expected = rulesetSuggestion({});
   const pin = expected.requiredWorkflows.find(w => w.path === '.github/workflows/merge-gate.yml');
   const no = why => ({ ok: false, reason: `missing enforced pin ${pin.path}@${pin.ref} and merge-gate integration ${expected.requiredStatusCheckIntegrationId}: ${why}; operator must restore active main rulesets before retrying` });
-  if (!Array.isArray(rulesets)) return no(`rulesets unreadable${rulesets?.error ? ` (${String(rulesets.error).slice(0, 300)})` : ''}`);
-  let workflow = false, check = false;
+  if (!Array.isArray(rulesets)) return no(`rulesets unreadable${evidence?.error ? ` (${String(evidence.error).slice(0, 300)})` : ''}`);
+  let workflow = false, check = false, defaultScopeReason;
   for (const rs of rulesets) {
     if (!rs || typeof rs !== 'object' || !['active', 'disabled', 'evaluate'].includes(rs.enforcement)) return no('ruleset detail unreadable');
     if (rs.enforcement !== 'active' || rs.target !== 'branch') continue;
     const scope = rs.conditions?.ref_name;
-    // Main is this repository's default branch; explicit main, default, or all branches proves inclusion.
-    if (!Array.isArray(scope?.include) || !Array.isArray(scope?.exclude) || scope.exclude.length
-      || !scope.include.some(ref => ref === pin.ref || ref === '~DEFAULT_BRANCH' || ref === '~ALL')) continue;
+    if (!Array.isArray(scope?.include) || !Array.isArray(scope?.exclude) || scope.exclude.length) continue;
+    const explicitMain = scope.include.some(ref => ref === pin.ref || ref === '~ALL');
+    const defaultScope = scope.include.includes('~DEFAULT_BRANCH');
+    if (!explicitMain && defaultScope && default_branch !== 'main') {
+      defaultScopeReason = typeof default_branch === 'string' && default_branch
+        ? 'repository default_branch is not main; ~DEFAULT_BRANCH does not protect main'
+        : 'repository default_branch unreadable; ~DEFAULT_BRANCH cannot prove main is protected';
+      continue;
+    }
+    if (!explicitMain && !(defaultScope && default_branch === 'main')) continue;
     // No acting-identity evidence is available here, so no configured bypass can be ruled out.
     if (!Array.isArray(rs.bypass_actors)) return no('ruleset bypass actors unreadable');
     if (rs.bypass_actors.length) return no('ruleset bypass applicability to the acting identity is not excluded');
@@ -494,7 +508,7 @@ export function verifyEnqueueRulesets(rulesets) {
       }
     }
   }
-  return workflow && check ? { ok: true } : no('active main workflow repository/path/ref pin or required status-check binding absent');
+  return workflow && check ? { ok: true } : no(defaultScopeReason || 'active main workflow repository/path/ref pin or required status-check binding absent');
 }
 
 function errText(e) {
