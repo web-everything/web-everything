@@ -70,7 +70,8 @@ export async function replay(sourceRoot = ROOT) {
         return '{"ok":true}';
       } }) });
     await sinks[REVIEW_EFFECTS.WRITE_UP]({ bodyFile, body }, { runId });
-    check(!checkBodyFileLocation(staged, bodyFileRoots(cwd, scratch)).ok, 'fixture did not separate checkout/temp roots');
+    // bodyFileRoots also lists a hard-coded /tmp that contains this fixture on Linux, so name only the two roots.
+    check(!checkBodyFileLocation(staged, [cwd, scratch]).ok, 'fixture did not separate checkout/temp roots');
     await sinks[REVIEW_EFFECTS.LABEL](payload, { runId });
     check(calls === 1, 'label CLI was not called exactly once');
     check(copy && !existsSync(copy) && readdirSync(scratch).length === 0, 'private copy leaked');

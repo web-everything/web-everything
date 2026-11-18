@@ -766,7 +766,8 @@ describe('the label sink', () => {
     mkdirSync(cwd); mkdirSync(scratch);
     const staged = reviewBodyPath({ root, runId: CTX.runId, bodyFile: payload.bodyFile });
     // Model distinct checkout/temp roots even though the fixture itself lives in the host temp dir.
-    expect(checkBodyFileLocation(staged, bodyFileRoots(cwd, scratch)).ok).toBe(false);
+    // The CLI also lists a hard-coded /tmp root, which on Linux CI contains this fixture, so name only the two roots.
+    expect(checkBodyFileLocation(staged, [cwd, scratch]).ok).toBe(false);
     let copy;
     const { sinks } = resolveOperation(REVIEW_PR_OP, { cwd,
       sinkFactory: controls => createReviewPrSinks({ root, ...controls, tmpDir: scratch,
