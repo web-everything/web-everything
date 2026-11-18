@@ -28,12 +28,12 @@ describe('gh-throttle wait log', () => {
     recordGhWaitLogEntry(p, { at: 'now', caller: 'c', op: 'pr list', waitMs: 1, durMs: 2, ok: true });
     expect(readFileSync(p, 'utf8')).toBe('x'.repeat(GH_WAITLOG_MAX_BYTES + 1));
   }));
-  it('writes one JSONL line with at/caller/op/waitMs/durMs/ok per throttled call', () => fixture(lockRoot => {
+  it('writes one JSONL line with at/bucket/caller/op/waitMs/durMs/ok per throttled call', () => fixture(lockRoot => {
     runGhSync(['pr', 'list'], { encoding: 'utf8', throttle: base(lockRoot) });
     const [row, ...rest] = lines(lockRoot);
     expect(rest).toEqual([]);
-    expect(Object.keys(row).sort()).toEqual(['at', 'caller', 'durMs', 'ok', 'op', 'waitMs']);
-    expect(row).toMatchObject({ caller: 'drain.mjs', op: 'pr list', ok: true });
+    expect(Object.keys(row).sort()).toEqual(['at', 'bucket', 'caller', 'durMs', 'ok', 'op', 'waitMs']);
+    expect(row).toMatchObject({ bucket: 'shared', caller: 'drain.mjs', op: 'pr list', ok: true });
     expect(typeof row.at).toBe('string');
     expect(row.waitMs).toBeGreaterThanOrEqual(0);
     expect(row.durMs).toBeGreaterThanOrEqual(0);
