@@ -16,7 +16,7 @@ const NOOP_STATUS = () => {};
 describe('review-hold-only red draft promotion', () => {
   const HEAD = 'a'.repeat(40);
   const check = (name, conclusion = 'success', extra = {}) => ({ name, status: 'completed', conclusion, ...extra });
-  const heldRows = () => [check('test'), check('review-gate', 'failure'), check('merge-gate', 'failure', { id: 123 })];
+  const heldRows = () => [check('test'), check('review-gate', 'failure'), check('merge-gate', 'failure', { id: 123, detailsUrl: 'https://github.com/o/r/actions/runs/1/job/123' })];
   const verdict = () => ({ num: 198, head_sha: HEAD, ok: false,
     results: [{ id: 'review-hold-labels', status: 'hold', reason: 'review required' }] });
 
@@ -26,9 +26,9 @@ describe('review-hold-only red draft promotion', () => {
     ['green', [check('test'), check('review-gate'), check('merge-gate')], 'green', false],
     ['another required failure', heldRows().map(row => row.name === 'test' ? check('test', 'failure') : row), 'red', false],
     ['another required check pending', heldRows().map(row => row.name === 'test' ? { ...row, status: 'in_progress', conclusion: null } : row), 'pending', false],
-    ['another required check absent', heldRows().filter(row => row.name !== 'test'), 'red', false],
+    ['another required check absent', heldRows().filter(row => row.name !== 'test'), 'pending', false],
     ['pending', [check('test'), check('merge-gate'), { name: 'review-gate', status: 'in_progress', conclusion: null }], 'pending', false],
-    ['no evidence', [], 'unchecked', false],
+    ['no evidence', [], 'pending', false],
   ])('the fresh reader returns reviewHoldOnly for %s', (_, rows, state, reviewHoldOnly) => {
     const out = defaultReadHeadCheckState({
       repoSlug: 'web-everything/web-everything', sha: HEAD, prNumber: 198,
@@ -290,7 +290,7 @@ describe('runReconcilePromoteDraftDispatch — stale-green re-verification (#281
       });
       expect(ready).not.toHaveBeenCalled();
       expect(result.dispatched).toEqual([]);
-      expect(result.refusals).toEqual([expect.objectContaining({ kind: 'stale-check-refused', checkState: state })]);
+      expect(result.refusals).toEqual([expect.objectContaining({ kind: 'stale-check-refused', checkState: 'unchecked' })]);
     });
 
     it('asks the commit-statuses endpoint for the exact sha and reduces it against the required set', () => {
@@ -299,7 +299,7 @@ describe('runReconcilePromoteDraftDispatch — stale-green re-verification (#281
       const getRequiredChecks = () => ({ checks: ['test'], source: 'live' });
       const out = defaultReadHeadCheckState({ repoSlug: 'web-everything/web-everything', sha: HEAD, runGh, getRequiredChecks });
       expect(out.state).toBe('green');
-      expect(seenArgv[0]).toEqual(expect.arrayContaining(['api', `repos/web-everything/web-everything/commits/${HEAD}/check-runs`]));
+      expect(seenArgv[0]).toEqual(expect.arrayContaining(['api', `repos/web-everything/web-everything/commits/${HEAD}/check-runs?filter=all`]));
     });
 
     it('reads red off a completed-failure run', () => {
@@ -384,20 +384,20 @@ describe('runReconcilePromoteDraftDispatch — stale-green re-verification (#281
 });
 
 it('xxh4zw8 fresh exact-head reader refuses complete cancelled evidence without a ready call', () => {
-  const sha = '4ecb5deb362c81aa28de162db4616bb4c2009347';
+  const sha = '4ecb5deb362c81aa28de162db4616bb4c20093470';
   const required = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'];
   const runs = required.map((name, i) => ({ id: 110460009383 + i, name, status: 'completed', conclusion: name === 'smoke' ? 'cancelled' : 'success' }));
   const ready = vi.fn();
   const runGh = vi.fn(() => runs.map(row => JSON.stringify(row)).join('\n'));
-  const readHeadCheckState = args => defaultReadHeadCheckState({ ...args, runGh, getRequiredChecks: () => ({ checks: required }) });
-  expect(readHeadCheckState({ repoSlug: 'web-everything/web-everything', sha })).toMatchObject({ state: 'red', counts: { total: 4, failed: 1 } });
+  const readHeadCheckState = args => defaultReadHeadCheckState({ ...args, runGh, getRequiredChecks: () => ({ checks: required, source: 'live' }) });
+  expect(readHeadCheckState({ repoSlug: 'web-everything/web-everything', sha })).toMatchObject({ state: 'pending', evidence: { state: 'pending', perName: { smoke: { state: 'pending' } } } });
   const result = runReconcilePromoteDraftDispatch({ root: '/repo', checkStaleness: FRESH, readPrLabels: () => [],
     reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 3336, headRefOid: sha }], refusals: [] }),
     provider: { ready }, readHeadCheckState, clearAwaitingCi: NOOP_STATUS });
   expect(ready).not.toHaveBeenCalled();
   expect(result.dispatched).toEqual([]);
   expect(result.refusals).toHaveLength(1);
-  expect(runGh.mock.calls[0][0]).toContain(`repos/web-everything/web-everything/commits/${sha}/check-runs`);
+  expect(runGh.mock.calls[0][0]).toContain(`repos/web-everything/web-everything/commits/${sha}/check-runs?filter=all`);
 });
 
 
@@ -580,4 +580,76 @@ it('promote-draft: a reconcile that always overruns the budget still handles one
     cursor = result.nextCursor ?? undefined;
   }
   expect(promoted).toEqual([5, 6]);
+});
+
+
+describe('PR2c fresh promotion evidence', () => {
+  const head = 'a'.repeat(40);
+  const hold = { jobId: 7, headSha: head, holdIds: ['review-acceptance'] };
+  const check = (name, conclusion, extra = {}) => ({ name, status: 'completed', conclusion, ...extra });
+  const held = annotation => [check('test', 'success'), check('merge-gate', 'failure', {
+    detailsUrl: 'https://github.com/o/r/actions/runs/1/job/7', mergeGateReviewHold: annotation,
+  })];
+  const execute = (rows, { source = 'live', sha = head, statusRows = [], unreadableStatuses = false } = {}) => {
+    const runGh = vi.fn(argv => argv[2].endsWith('/statuses')
+      ? (unreadableStatuses ? undefined : statusRows.map(row => JSON.stringify(row)).join('\n'))
+      : rows.map(row => JSON.stringify(row)).join('\n'));
+    const readHeadCheckState = args => defaultReadHeadCheckState({ ...args, runGh,
+      getRequiredChecks: () => ({ checks: ['test', 'merge-gate'], source }), mergeGateSetting: { value: 'off' },
+    });
+    const ready = vi.fn();
+    const result = runReconcilePromoteDraftDispatch({ root: '/repo', checkStaleness: FRESH,
+      reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 198, headRefOid: sha }], refusals: [] }),
+      provider: { ready }, readHeadCheckState, readPrLabels: () => [], clearAwaitingCi: NOOP_STATUS,
+    });
+    return { result, ready, runGh };
+  };
+  for (const reverse of [false, true]) {
+    const ordered = rows => reverse ? [...rows].reverse() : rows;
+    it.each([
+      ['mismatched jobId', { ...hold, jobId: 8 }],
+      ['foreign headSha', { ...hold, headSha: 'f'.repeat(40) }],
+      ['non-human holdId', { ...hold, holdIds: ['codeql'] }],
+    ])(`fresh %s cannot promote (reversed=${reverse})`, (_name, annotation) => {
+      const { result, ready } = execute(ordered(held(annotation)));
+      expect(ready).not.toHaveBeenCalled();
+      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'stale-check-refused' }));
+    });
+    it(`fresh properly bound human hold promotes (reversed=${reverse})`, () => {
+      const { result, ready, runGh } = execute(ordered(held(hold)));
+      expect(ready).toHaveBeenCalledExactlyOnceWith(198);
+      expect(result.dispatched).toEqual([{ pr: 198, kind: 'promote-draft' }]);
+      expect(runGh.mock.calls[0][0]).toEqual(expect.arrayContaining(['--paginate',
+        `repos/web-everything/web-everything/commits/${head}/check-runs?filter=all`,
+        '.check_runs[] | {id,name,status,conclusion,head_sha,details_url,completed_at}',
+      ]));
+    });
+    it(`fresh same-name failure and higher-id success refuse promotion (reversed=${reverse})`, () => {
+      const { ready, result } = execute(ordered([check('test', 'failure', { id: 1 }),
+        check('test', 'success', { id: 2 }), check('merge-gate', 'success')]));
+      expect(ready).not.toHaveBeenCalled();
+      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'stale-check-refused', checkState: 'red' }));
+    });
+    it.each([
+      ['fallback roster', { source: 'fallback' }],
+      ['missing roster source', { source: null }],
+      ['missing fetch evidence', { unreadableStatuses: true }],
+      ['missing read head', { sha: null }],
+    ])(`fresh %s cannot promote (reversed=${reverse})`, (_name, options) => {
+      const { ready, result } = execute(ordered(held(hold)), options);
+      expect(ready).not.toHaveBeenCalled();
+      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'stale-check-refused' }));
+    });
+    it(`foreign row heads cannot promote (reversed=${reverse})`, () => {
+      const { ready } = execute(ordered(held(hold).map(row => ({ ...row, head_sha: 'f'.repeat(40) }))));
+      expect(ready).not.toHaveBeenCalled();
+    });
+  }
+  it('conflicting legacy status evidence cannot be hidden by passing check runs', () => {
+    const { ready, result } = execute([check('test', 'success'), check('merge-gate', 'success')], {
+      statusRows: [{ context: 'test', state: 'failure' }],
+    });
+    expect(ready).not.toHaveBeenCalled();
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'stale-check-refused', checkState: 'red' }));
+  });
 });

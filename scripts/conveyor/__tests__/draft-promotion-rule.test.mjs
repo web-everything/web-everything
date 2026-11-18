@@ -20,6 +20,7 @@ const NOW = Date.parse('2026-10-09T08:00:00Z');
 /** What the fresh `gh pr view` returns for a list row `d`: the fields the tick decides on, green on `test`. */
 const viewOf = (d, over = {}) => ({
   number: d.number, state: 'OPEN', isDraft: true, headRefName: d.headRefName, headRefOid: d.headRefOid, baseRefName: 'main',
+  rowsHead: d.headRefOid, rowsComplete: true, rosterSource: 'live',
   labels: d.labels ?? [], comments: [], isCrossRepository: false, mergeStateStatus: 'CLEAN', body: '',
   statusCheckRollup: [{ name: 'test', status: 'completed', conclusion: 'success' }], ...over,
 });

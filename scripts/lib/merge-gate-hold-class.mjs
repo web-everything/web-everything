@@ -180,14 +180,14 @@ export function excuseMergeGateRows(rows, { prNumber, headSha, labels, readVerdi
       const holds = verdict.results?.filter(blocking) ?? [];
       // Card 273, #5157: annotation rides on candidacyHoldIsNotCiFailure; off never annotates.
       if (holds.length && holds.every(r => r.status === 'hold' && HUMAN_REVIEW_HOLD_GATES.includes(r.id))) {
-        const replacement = { ...row, mergeGateReviewHold: { holds: holds.map(r => r.id), jobId } };
+        const replacement = { ...row, mergeGateReviewHold: { holds: holds.map(r => r.id), holdIds: holds.map(r => r.id), jobId, headSha: verdict.head_sha } };
         return { rows: rows.map(r => r === row ? replacement : r), excused: false, reviewHold: true };
       }
       return unchanged;
     }
     const replacement = { ...row, conclusion: row.conclusion === row.conclusion.toLowerCase() ? 'success' : 'SUCCESS',
-      mergeGateHoldExcused: { kind: classification.kind, holds: classification.holds, jobId } };
-    return { rows: rows.filter(r => r.name !== 'merge-gate' || r === row).map(r => r === row ? replacement : r), excused: true };
+      mergeGateHoldExcused: { kind: classification.kind, holds: classification.holds, holdIds: classification.holds, jobId, headSha: verdict.head_sha } };
+    return { rows: rows.map(r => r === row ? replacement : r), excused: true };
   } catch { return unchanged; }
 }
 

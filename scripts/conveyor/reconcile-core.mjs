@@ -127,8 +127,9 @@ const DEFAULT_FIXER_LADDER = Object.freeze({
 });
 import { OPERATOR_ANSWER_MARKER, isOperatorAnswerStandDownSuperseded, latestOperatorAnswer } from './stand-down-answer-core.mjs';
 import { classifyPr } from '../progress-board.mjs';
+import { resolveRequiredChecks } from '../lib/check-state-predicate.mjs';
 import { reduceCheckState, CI_TRUTH_EXCLUDED_CHECKS } from '../operations/pr-status.mjs';
-import { collapseRollupToLatestPerName, FAILED_CHECK_CONCLUSIONS } from '../lib/rollup-collapse.mjs';
+import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { isForeignCompletionSessionId, sanitizeDeniedCommand } from '../operations/completion-record.mjs';
 import { NEGOTIATION_ROUND_CAP } from '../lib/jury-core.mjs';
 import { resolveRoundCap } from '../lib/round-cap.mjs';
@@ -508,26 +509,16 @@ export function splitFailingChecks(rollup, requiredChecks) {
   return out;
 }
 
-/** PURE: every failing required check is a review-owned hold (review-gate, or an annotated merge-gate). */
-export function reviewHoldGatesOnlyRed(rollup, requiredChecks) {
-  if (!Array.isArray(rollup)) return false;
-  const latest = collapseRollupToLatestPerName(rollup);
-  if (latest.some(row => !row || typeof (row.name || row.context) !== 'string')) return false;
-  const failing = splitFailingChecks(latest, requiredChecks).required;
-  const mergeGate = latest.find(row => row?.name === 'merge-gate');
-  return failing.length > 0 && failing.every(name => name === 'review-gate'
-    || (name === 'merge-gate' && Boolean(mergeGate?.mergeGateReviewHold)));
+/** Strict check evidence for this PR's actual read, including its roster provenance. */
+function requiredCheckEvidence(pr, requiredChecks) {
+  const { headSha, ...evidence } = reviewTimingEvidence(pr);
+  return resolveRequiredChecks({ ...evidence, head: headSha, rowsHead: evidence.rowsHead ?? null,
+    rows: pr?.statusCheckRollup, requiredNames: requiredChecks });
 }
 
-/** PURE: required reds are exclusively review-owned holds, with all other required evidence green. */
-export function reviewHoldOnlyRed(rollup, requiredChecks) {
-  if (!reviewHoldGatesOnlyRed(rollup, requiredChecks)) return false;
-  const latest = collapseRollupToLatestPerName(rollup);
-  const failing = splitFailingChecks(latest, requiredChecks).required;
-  // Removing the proven holds must leave complete, readable green CI, never pending or unknown evidence.
-  return reduceCheckState(latest.map(row => failing.includes(row?.name || row?.context)
-    ? { ...row, conclusion: 'success' } : row), requiredChecks).state === 'green'
-    && reduceCheckState(latest, requiredChecks).counts.unreadable === 0;
+/** PURE: at least one bound review hold; every other required check passes. */
+export function reviewHoldOnlyRed(pr, requiredChecks) {
+  return requiredCheckEvidence(pr, requiredChecks).state === 'held';
 }
 
 /**
@@ -1569,10 +1560,7 @@ function timingFacts(pr, { agents = [], repo, requiredChecks = null, reviewDispa
 /** A shared prerequisite for every review emission, including advisory review branches. */
 function reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra = {} }) {
   const ci = reviewStartGate({ ...reviewTimingEvidence(pr), requiredChecks, checks: pr?.statusCheckRollup, verifyGreen: pr?.verifyGreen, policy: pr.reviewTiming });
-  // Excuse only failed conclusions, preserving missing-head, wrong-head and incomplete-evidence refusals.
-  const onlyFailures = ci.reason === 'ci-red' || (ci.affected.length > 0
-    && ci.affected.every(row => FAILED_CHECK_CONCLUSIONS.includes(row.reason.toUpperCase())));
-  const allowed = ci.allowed || (onlyFailures && reviewHoldOnlyRed(pr?.statusCheckRollup, requiredChecks));
+  const allowed = ci.allowed || reviewHoldOnlyRed(pr, requiredChecks);
   if (!allowed) refuse('review-ci', {
     ...withPhase, ...extra, ci, ...earlyStartShadowFields(pr, requiredChecks),
     why: `${ci.reason}: ${ci.affected.map(row => `${row.name}=${row.reason}`).join(', ')}`,
@@ -2860,7 +2848,7 @@ export function planReconcile({
     // of those are the existing branches below, unmodified. Only {@link dispatchReviewRow}'s own gate (not this
     // one) keeps a review from firing for either of those two cases.
     // xu1nixv — the red-main fix PR is promoted at once (it must not sit as a draft while main is red).
-    if (pr?.isDraft && (withPhase.check === 'green' || reviewHoldOnlyRed(pr.statusCheckRollup, requiredChecks) || mainFixPriority)) {
+    if (pr?.isDraft && (['pass', 'held'].includes(requiredCheckEvidence(pr, requiredChecks).state) || mainFixPriority)) {
       if (labelNames(pr.labels).includes('review-status:draft-withdrawn')) {
         refuse('draft', { ...withPhase, why: 'draft PR is withdrawn — explicit release is required before promotion' });
         continue;
@@ -3158,7 +3146,7 @@ export function planReconcile({
     const heldGates = ciRepairOwed ? splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required : [];
     const reviewHoldRed = ciRepairOwed
       && withPhase.labels.some(l => ['review:human', 'review:pending', 'review:changes', 'review:held-mechanical'].includes(l))
-      && reviewHoldGatesOnlyRed(pr?.statusCheckRollup, requiredChecks);
+      && reviewHoldOnlyRed(pr, requiredChecks);
     if (reviewHoldRed) {
       refuse('review-hold-red', { ...withPhase, why: `review daemon owns held gates: ${heldGates.join(', ')}` });
       // An admitted advisory owns a repair next. Keep the existing finding/cap/ruling

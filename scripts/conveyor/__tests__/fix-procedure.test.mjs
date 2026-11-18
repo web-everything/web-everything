@@ -33,7 +33,7 @@ import {
   countTerminalStandDowns, countStandDownComments, parseAltBranch, buildStandDownComment,
   isConcurrentAuthorStandDownBody, LEGACY_CONCURRENT_AUTHOR_CUTOFF,
 } from '../stand-down.mjs';
-import { planReconcile, countUnresolvedStandDowns, CONCURRENT_AUTHOR_QUIET_MS } from '../reconcile-core.mjs';
+import { planReconcile as planReconcileCore, countUnresolvedStandDowns, CONCURRENT_AUTHOR_QUIET_MS } from '../reconcile-core.mjs';
 import { enrichPrsWithFixClaims } from '../reconcile-pass.mjs';
 import { deriveReviewStatus, tagReviewStatus, applyReviewStatus } from '../review-status-tag.mjs';
 import { dispatchFix } from '../reconcile-fix-dispatch.mjs';
@@ -51,6 +51,11 @@ const T0 = Date.parse('2026-09-27T15:00:00.000Z');
 const MIN = 60_000;
 const AUTOMATION = { login: 'web-everything' };
 const BRANCH = 'lane/run-rating-slice1-mechanical-grade';
+// These release/claim replays have a complete live gate read unless explicitly overridden.
+const planReconcile = options => planReconcileCore({ ...options,
+  requiredChecks: options.requiredChecks ?? ['gate'],
+  prs: options.prs?.map(pr => ({ rowsHead: pr.headRefOid, rowsComplete: true, rosterSource: 'live', ...pr })),
+});
 
 /** PR #2811's REAL stand-down comment body, verbatim from the live thread (2026-09-27T15:45:27Z). */
 const LIVE_2811_STAND_DOWN = [

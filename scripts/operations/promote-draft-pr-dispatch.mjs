@@ -57,7 +57,7 @@ import { isTerminalStatus } from '../lib/backlog-status.cjs';
  * threading this function's own already-resolved `repoSlug` through to the provider as an explicit `--repo`
  * — `undefined` for the WE-default path (byte-identical to before), the real slug otherwise.
  */
-import { excuseMergeGateRows, latestFailingMergeGate, loadMergeGateHoldSetting, readMergeGateVerdict as defaultReadMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
+import { excuseMergeGateRows, loadMergeGateHoldSetting, readMergeGateVerdict as defaultReadMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
 import { loadPromotionRequiredChecksSetting, promotionRequiredChecks } from '../lib/promotion-required-checks.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
@@ -67,11 +67,10 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createDraftPromoteProvider } from '../lib/draft-promote-provider.mjs';
 import { runReconcilePass } from '../conveyor/reconcile-pass.mjs';
-import { reviewHoldOnlyRed } from '../conveyor/reconcile-core.mjs';
 import { readPrsFromFile } from '../conveyor/open-pr-fetch.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { checksArgv, parseJsonLines } from './pr-status-io.mjs';
-import { reduceCheckState } from './pr-status.mjs';
+import { resolveRequiredChecks } from '../lib/check-state-predicate.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { applyReviewStatus } from '../conveyor/review-status-tag.mjs';
 import { CLOSE_SUPERSEDED_MARKER } from '../conveyor/stand-down-answer-core.mjs';
@@ -102,30 +101,48 @@ export function isPromoteCodePath(path, { closure = promoteCodeClosure() } = {})
 /**
  * THE FRESH RE-READ (#2811). Asks GitHub's own commit-statuses endpoint for `sha`'s check runs RIGHT NOW —
  * bypassing whatever `statusCheckRollup` the reconcile snapshot carried — and reduces them with the SAME
- * `reduceCheckState`/`getRequiredStatusChecks` truth every other CI-truth reader in this family uses (never a
- * re-derived notion of "green"). Injectable so a test asserts the refusal with no `gh` on PATH.
+ * strict shared resolver, preserving every conflicting row and the provenance of this paginated read.
+ * Injectable so a test asserts the refusal with no `gh` on PATH.
  * @param {{repoSlug:string, sha:string, runGh?:Function, getRequiredChecks?:Function}} o
- * @returns {{state:string, why:string, counts:object, reviewHoldOnly:boolean}}
+ * @returns {{state:string, why:string, evidence:object, reviewHoldOnly:boolean}}
  */
 export function defaultReadHeadCheckState({
   repoSlug, sha, prNumber, runGh = runGhSync, getRequiredChecks = getRequiredStatusChecks,
   readPrLabels = defaultReadPrLabels, readMergeGateVerdict = defaultReadMergeGateVerdict,
   readFreeze = readSharedFreeze, mergeGateSetting, forPromotion = false, absentNotApplicable,
 } = {}) {
-  const requiredChecks = getRequiredChecks({ repo: repoSlug }).checks;
-  const raw = runGh(checksArgv({ repo: repoSlug, sha }), {
+  const roster = getRequiredChecks({ repo: repoSlug });
+  const requiredChecks = roster?.checks;
+  // Own this projection: the strict resolver needs the row's head and Actions job URL.
+  const argv = checksArgv({ repo: repoSlug, sha });
+  argv[2] += '?filter=all';
+  argv[argv.length - 1] = '.check_runs[] | {id,name,status,conclusion,head_sha,details_url,completed_at}';
+  const raw = runGh(argv, {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'pr-status-checks', repo: repoSlug },
   });
-  let rows = parseJsonLines(raw);
+  const statuses = runGh(['api', '--paginate', `repos/${repoSlug}/commits/${sha}/statuses`,
+    '--jq', '.[] | {context,state}'], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'pr-status-checks', repo: repoSlug },
+  });
+  let rows = [...parseJsonLines(raw), ...parseJsonLines(statuses)];
   try {
-    if (latestFailingMergeGate(rows)) {
+    if (rows.some(row => row?.name === 'merge-gate' && String(row.conclusion).toLowerCase() === 'failure')) {
       const setting = mergeGateSetting ?? loadMergeGateHoldSetting();
       if (setting.value === 'on') {
         const labels = readPrLabels({ repoSlug, prNumber, runGh });
-        rows = excuseMergeGateRows(rows, { prNumber, headSha: sha, labels, setting,
-          readVerdict: args => readMergeGateVerdict({ ...args, repo: repoSlug, runGh }),
-          freeze: () => readFreeze(),
-        }).rows;
+        // Annotate each row independently: legacy excusal on the whole rollup can discard failures.
+        rows = rows.map(row => {
+          if (row?.name !== 'merge-gate') return row;
+          const annotated = excuseMergeGateRows([row], { prNumber, headSha: sha, labels, setting,
+            readVerdict: args => readMergeGateVerdict({ ...args, repo: repoSlug, runGh }),
+            freeze: () => readFreeze(),
+          }).rows[0];
+          if (annotated === row) return row;
+          const hold = annotated.mergeGateReviewHold ?? annotated.mergeGateHoldExcused;
+          // A replacement proves the job verdict matched this PR/head. Keep the original conclusion;
+          // only the strict resolver may excuse its human hold, bound to the row's Actions URL.
+          return { ...row, mergeGateReviewHold: hold };
+        });
       }
     }
   } catch { /* Preserve red on unreadable labels, settings or job evidence. */ }
@@ -133,8 +150,12 @@ export function defaultReadHeadCheckState({
   const promotionChecks = forPromotion
     ? promotionRequiredChecks(requiredChecks, rows, absentNotApplicable ?? loadPromotionRequiredChecksSetting().value)
     : requiredChecks;
-  const result = reduceCheckState(rows, promotionChecks);
-  return { ...result, reviewHoldOnly: result.state === 'red' && reviewHoldOnlyRed(rows, promotionChecks) };
+  // --paginate exhausts the SHA-addressed endpoint or throws; never stamp a PR's later head.
+  const result = resolveRequiredChecks({ rows, head: sha, rowsHead: sha,
+    rowsComplete: typeof raw === 'string' && typeof statuses === 'string', requiredNames: promotionChecks, rosterSource: roster?.source });
+  const state = { pass: 'green', held: 'red', fail: 'red', pending: 'pending', unknown: 'unchecked' }[result.state];
+  return { state, why: result.reasons.join(', ') || `required checks: ${result.state}`,
+    evidence: result, reviewHoldOnly: result.state === 'held' };
 }
 
 function validatePrLabels(labels) {

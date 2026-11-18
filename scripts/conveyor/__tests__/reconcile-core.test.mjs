@@ -3662,7 +3662,8 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
   // Shape attached by excuseMergeGateRows: a review hold keeps merge-gate red but annotates its owner.
   const heldRollup = () => [
     check('test'),
-    check('merge-gate', 'failure', { mergeGateReviewHold: { holds: ['review-gate'], jobId: 5874001 } }),
+    check('merge-gate', 'failure', { detailsUrl: 'https://github.com/o/r/actions/runs/7/job/5874001',
+      mergeGateReviewHold: { headSha: pr1563().headRefOid, holdIds: ['review-acceptance'], jobId: 5874001 } }),
     check('review-gate', 'failure'),
   ];
   const reviewOnlyRollup = () => [check('test'), check('merge-gate'), check('review-gate', 'failure')];
@@ -3719,6 +3720,62 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
   });
 });
 
+describe('strict review hold and promotion evidence (PR2c)', () => {
+  const head = pr1563().headRefOid;
+  const requiredChecks = ['test', 'merge-gate'];
+  const hold = { jobId: 7, headSha: head, holdIds: ['review-acceptance'] };
+  const check = (name, conclusion, extra = {}) => ({ name, status: 'completed', conclusion, ...extra });
+  const rows = annotation => [check('test', 'success'), check('merge-gate', 'failure', {
+    detailsUrl: 'https://github.com/o/r/actions/runs/1/job/7', mergeGateReviewHold: annotation,
+  })];
+  const plan = (statusCheckRollup, over = {}) => planReconcile({
+    prs: [pr1563({ labels: lbl('review:pending'), comments: [], statusCheckRollup, ...over })],
+    requiredChecks, agents: [], now: NOW, advisoryReviewOnHumanHandoff: 'on',
+  });
+  const invalidHolds = [
+    ['mismatched jobId', { ...hold, jobId: 8 }],
+    ['foreign headSha', { ...hold, headSha: 'f'.repeat(40) }],
+    ['non-human holdId', { ...hold, holdIds: ['codeql'] }],
+    ['empty holdIds', { ...hold, holdIds: [] }],
+    ['legacy truthy annotation', true],
+  ];
+  for (const reverse of [false, true]) {
+    const ordered = input => reverse ? [...input].reverse() : input;
+    it.each(invalidHolds)(`%s cannot allow advisory review or promote (reversed=${reverse})`, (_name, annotation) => {
+      const input = ordered(rows(annotation));
+      const comments = [{ author: AUTOMATION, body: buildCiHealEscalationComment({
+        headSha: head, outcome: 'not-a-ci-break', reason: 'review hold',
+      }) }];
+      const advisory = plan(input, { comments });
+      expect(advisory.dispatch.some(row => row.kind === 'review')).toBe(false);
+      expect(advisory.refusals).toContainEqual(expect.objectContaining({
+        kind: 'ci-heal-escalated', reviewRefusal: expect.objectContaining({ kind: 'review-ci' }),
+      }));
+      expect(plan(input, { isDraft: true }).dispatch.some(row => row.kind === 'promote-draft')).toBe(false);
+    });
+    it(`a properly bound human hold promotes and allows advisory review (reversed=${reverse})`, () => {
+      const input = ordered(rows(hold));
+      expect(plan(input, { isDraft: true }).dispatch.map(row => row.kind)).toEqual(['promote-draft']);
+      expect(plan(input).dispatch).toContainEqual(expect.objectContaining({ kind: 'review', humanHandoffAdvisory: true }));
+    });
+    it(`same-name failure then higher-id success cannot promote (reversed=${reverse})`, () => {
+      const input = ordered([check('test', 'failure', { id: 1 }), check('test', 'success', { id: 2 }), check('merge-gate', 'success')]);
+      expect(plan(input, { isDraft: true }).dispatch.some(row => row.kind === 'promote-draft')).toBe(false);
+    });
+    it.each([
+      ['incomplete fallback', { rowsComplete: false, rosterSource: 'fallback' }],
+      ['incomplete live', { rowsComplete: false }],
+      ['complete fallback', { rosterSource: 'fallback' }],
+      ['missing read head', { rowsHead: undefined }],
+      ['foreign read head', { rowsHead: 'f'.repeat(40) }],
+    ])(`%s cannot promote green or held evidence (reversed=${reverse})`, (_name, provenance) => {
+      for (const input of [rows(hold), [check('test', 'success'), check('merge-gate', 'success')]]) {
+        expect(plan(ordered(input), { isDraft: true, ...provenance }).dispatch.some(row => row.kind === 'promote-draft')).toBe(false);
+      }
+    });
+  }
+});
+
 describe('fix waiting episode', () => {
   it('ages a PR without an episode marker from its creation, and refuses a capped file snapshot', () => {
     const source = pr1563({ createdAt: '2026-09-29T12:00:00Z',
@@ -3749,7 +3806,7 @@ describe('fix waiting episode', () => {
 
 it('xxh4zw8 complete hydrated cancellation heals while caps, claims and stand-downs retain refusal', () => {
   const requiredChecks = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'];
-  const pr = { number: 3336, isDraft: true, headRefName: 'lane/3336-replay', headRefOid: '4ecb5deb362c81aa28de162db4616bb4c2009347',
+  const pr = { number: 3336, isDraft: true, headRefName: 'lane/3336-replay', headRefOid: '4ecb5deb362c81aa28de162db4616bb4c20093470',
     labels: [], comments: [], statusCheckRollup: requiredChecks.map((name, i) => ({ id: 100 + i, name,
       run_id: 7, run_attempt: 1, detailsUrl: `https://github.com/o/r/actions/runs/7/job/${100 + i}`,
       status: 'COMPLETED', conclusion: name === 'smoke' ? 'CANCELLED' : 'SUCCESS' })) };

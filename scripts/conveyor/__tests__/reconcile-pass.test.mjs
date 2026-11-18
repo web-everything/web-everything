@@ -1076,7 +1076,7 @@ it('xng7q1p immutable GitHub reads feed enrichment → planner without checkout-
 });
 
 const XX_REQUIRED = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'];
-const XX_HEAD = '4ecb5deb362c81aa28de162db4616bb4c2009347';
+const XX_HEAD = '4ecb5deb362c81aa28de162db4616bb4c20093470';
 const completeRows = rows => Object.assign(rows, { rowsHead: XX_HEAD, rowsComplete: true });
 const xxRuns = () => completeRows(XX_REQUIRED.map((name, i) => ({ id: 110460009383 + i, name, status: 'completed',
   conclusion: name === 'smoke' ? 'cancelled' : 'success', completed_at: '2026-10-01T10:00:00Z' })));

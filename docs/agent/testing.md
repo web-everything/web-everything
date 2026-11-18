@@ -4618,3 +4618,11 @@ Review timing fixtures must carry the fetch's `rowsHead`, `rowsComplete` and unc
 The reconcile pass carries the required-roster source unchanged through hydration. Legacy flattened listings begin with `rowsHead: null` and `rowsComplete: false`; successful SHA-pinned pagination replaces those facts, while a refused refresh keeps completeness false. Required `review-gate` holds still refuse review emission and superseded-verdict conversion; they are not healable CI failures.
 
 Joined fixes with unknown CI evidence expose `fix-join-wait.evidenceReason` even past the join cap; refresh or inspect the head-pinned evidence before dispatch. The cap bounds waiting on readable pending CI or review, never missing provenance. Assert continued refusal after the cap and dispatch after a complete refresh. Conflict-only repair may progress after the join cap when an exhaustive head-pinned read proves required checks absent (`missing`); absence never grants CI success or review admission. Conflicts must hydrate rather than skip the evidence read. Hydration validates raw required rows before collapse, so a higher green check ID cannot hide an unreadable row. CodeQL-owner fixtures attest the snapshot provenance while annotation-read failures still owe the heal.
+
+
+## Strict review-hold and promotion evidence
+
+Promotion/held-check fixtures must name a complete read (`rowsComplete: true`), its original
+`rowsHead`, a full head SHA, and a live/cache roster source. Merge-gate holds carry the verified
+job ID, verdict head SHA and `holdIds`; a truthy legacy annotation is insufficient. Hold annotation
+must preserve conflicting rows for `resolveRequiredChecks`, including in reverse-order replays.

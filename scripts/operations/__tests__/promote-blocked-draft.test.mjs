@@ -6,6 +6,7 @@ const HEAD = 'b'.repeat(40);
 const draft = labels => ({
   number: 5839, state: 'OPEN', isDraft: true, isCrossRepository: false,
   headRefName: 'lane/blocked-draft', headRefOid: HEAD, baseRefName: 'main',
+  rowsHead: HEAD, rowsComplete: true, rosterSource: 'live',
   mergeStateStatus: 'CLEAN', labels, comments: [],
   statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }],
 });
