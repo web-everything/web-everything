@@ -36,7 +36,7 @@ import {
   deriveSessionId,
   sessionSeed,
   buildJudgeArgv,
-  parseJudgeOutcome,
+  acceptJurorStream,
   loadedContextTokens,
   judgeSpawn,
   assertLaneCwd,
@@ -51,6 +51,13 @@ import {
   UNPARSEABLE_RETRY_SETTING,
   retrySessionId,
 } from '../judge-spawn.mjs';
+
+function parseJudgeOutcome(stdout, stderr = '', budget = null) {
+  let sessionId;
+  try { sessionId = JSON.parse(stdout).session_id; } catch { sessionId = 's'; }
+  return acceptJurorStream(stdout, { sessionId, schema: { type: 'object' },
+    exit: { code: 0, signal: null, stderr, budget } });
+}
 
 const SHAPE = {
   type: 'object',
@@ -353,7 +360,7 @@ describe('parseJudgeOutcome — a validated object, or a throw carrying the SPAW
   const ok = {
     is_error: false,
     stop_reason: 'tool_use',
-    session_id: 'aaaaaaaa-bbbb-8ccc-9ddd-eeeeeeeeeeee',
+    session_id: SID,
     total_cost_usd: 0.014,
     duration_ms: 2100,
     num_turns: 1,
@@ -368,7 +375,7 @@ describe('parseJudgeOutcome — a validated object, or a throw carrying the SPAW
   });
 
   it('surfaces the spawned session id, so a caller can RECORD which actor judged', () => {
-    expect(parseJudgeOutcome(JSON.stringify(ok)).sessionId).toBe('aaaaaaaa-bbbb-8ccc-9ddd-eeeeeeeeeeee');
+    expect(parseJudgeOutcome(JSON.stringify(ok)).sessionId).toBe(SID);
   });
 
   it('reports cost, duration, turns and the forced-tool stop reason', () => {
@@ -428,7 +435,7 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
       seen.cli = cli; seen.argv = argv; seen.opts = opts;
       const handlers = {};
       const child = {
-        stdout: { on: (e, cb) => { if (e === 'data') setTimeout(() => cb(stdout), 0); } },
+        stdout: { on: (e, cb) => { if (e === 'data') setTimeout(() => cb(stdout === okJson ? JSON.stringify({ ...JSON.parse(stdout), session_id: flagValue(argv, '--session-id') }) : stdout), 0); } },
         stderr: { on: (e, cb) => { if (e === 'data' && stderr) setTimeout(() => cb(stderr), 0); } },
         stdin: { on: () => {}, end: (d) => { seen.stdin = d; } },
         on: (e, cb) => { handlers[e] = cb; if (e === 'close') setTimeout(() => cb(code), 1); },
@@ -442,7 +449,7 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
   const okJson = JSON.stringify({
     is_error: false,
     stop_reason: 'tool_use',
-    session_id: 'aaaaaaaa-bbbb-8ccc-9ddd-eeeeeeeeeeee',
+    session_id: SID,
     total_cost_usd: 0.02,
     duration_ms: 1900,
     num_turns: 1,
@@ -479,7 +486,7 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
   it('returns the spawned session id and the loaded-context total alongside the answer', async () => {
     const { fn } = fakeSpawn(okJson);
     const r = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, runId: 'run-7', lens: 'care', spawnFn: fn });
-    expect(r.sessionId).toBe('aaaaaaaa-bbbb-8ccc-9ddd-eeeeeeeeeeee');
+    expect(r.sessionId).toBe(deriveSessionId(sessionSeed(['run-7', 'care'])));
     expect(r.loadedContextTokens).toBe(1005);
     expect(r.costUsd).toBe(0.02);
     expect(typeof r.wallMs).toBe('number');
@@ -782,7 +789,7 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
     const ANSWER = {
       is_error: false,
       stop_reason: 'tool_use',
-      session_id: 'aaaaaaaa-bbbb-8ccc-9ddd-eeeeeeeeeeee',
+      session_id: SID,
       total_cost_usd: 1.42,
       duration_ms: 899_000,
       num_turns: 31,
@@ -812,14 +819,13 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
           timeoutMs: 1500, retries: 0,
           spawnFn: (_cli, _argv, options) => (child = spawn(process.execPath, ['-e', script], options)),
         }).catch(e => e);
-        expect(err).toBeInstanceOf(termination === 'timeout' ? JudgeTimeoutError : JudgeUnparseableError);
+        expect(err).toBeInstanceOf(JudgeTimeoutError);
         expect(child.signalCode).toBe(termination === 'timeout' ? 'SIGKILL' : 'SIGTERM');
         if (termination === 'timeout') {
           expect(err.partialStdout).toBe(stdout);
         } else {
           expect(err).toMatchObject({ exitCode: null, signal: 'SIGTERM' });
-          expect(err.failedAttempts[0].stdoutBytes).toBe(stdout.length);
-          expect(err.message).toContain('juror process failed');
+          expect(err.partialStdout).toBe(stdout);
         }
       },
     );
@@ -1285,7 +1291,7 @@ describe('#3187 (a) — end to end, over a fake CLI that ENFORCES the ceiling th
         : {
           is_error: false,
           stop_reason: 'tool_use',
-          session_id: 'aaaaaaaa-bbbb-8ccc-9ddd-eeeeeeeeeeee',
+          session_id: flagValue(argv, '--session-id'),
           total_cost_usd: spendUsd,
           duration_ms: 1900,
           num_turns: 4,
@@ -1454,7 +1460,7 @@ function fakeSpawnAtTopLevel(stdout, { code = 0, stderr = '' } = {}) {
  */
 describe('judgeSpawn — an unparseable stdout is retried once with a fresh session id (held item 223)', () => {
   const ANSWER_JSON = JSON.stringify({
-    is_error: false, stop_reason: 'tool_use', session_id: 'aaaaaaaa-bbbb-8ccc-9ddd-eeeeeeeeeeee', total_cost_usd: 0.3,
+    is_error: false, stop_reason: 'tool_use', session_id: SID, total_cost_usd: 0.3,
     duration_ms: 40_000, num_turns: 3, usage: { input_tokens: 4 }, structured_output: { verdict: 'accept', findings: [] },
   });
 
@@ -1465,7 +1471,7 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
       const c = children[Math.min(calls.length, children.length - 1)];
       calls.push({ cli, argv, opts });
       return {
-        stdout: { on: (e, cb) => { if (e === 'data' && c.stdout) setTimeout(() => cb(c.stdout), 0); } },
+        stdout: { on: (e, cb) => { if (e === 'data' && c.stdout) setTimeout(() => cb(c.stdout === ANSWER_JSON ? JSON.stringify({ ...JSON.parse(c.stdout), session_id: flagValue(argv, '--session-id') }) : c.stdout), 0); } },
         stderr: { on: (e, cb) => { if (e === 'data' && c.stderr) setTimeout(() => cb(c.stderr), 0); } },
         stdin: { on: () => {}, end: () => {} },
         on: (e, cb) => { if (e === 'close') setTimeout(() => cb(c.code ?? null, c.signal ?? null), 1); },
@@ -1529,12 +1535,11 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
       expect(calls).toHaveLength(1);
     });
 
-  it('keeps JudgeBudgetError and quota hold metadata when one event reports both limits', async () => {
+  it('prioritizes quota and keeps hold metadata when one event reports both limits', async () => {
     const stdout = JSON.stringify({ ...spendingFailures[0][1], result: spendingFailures[1][1].result });
     const { fn, calls } = scriptedSpawn([{ stdout, code: 1 }, { stdout: ANSWER_JSON, code: 0 }]);
     const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID,
       budget: 0.5, retries: 1, log: () => {}, spawnFn: fn }).catch(e => e);
-    expectSpendingFailure(error, 'budget');
     expectSpendingFailure(error, 'quota');
     expect(calls).toHaveLength(1);
   });
@@ -1747,10 +1752,10 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
     const { fn, calls } = scriptedSpawn([{ stdout: ANSWER_JSON, code, signal }, { stdout: ANSWER_JSON, code: 0 }]);
     const err = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, retries: 2, spawnFn: fn })
       .catch(e => e);
-    expect(err).toBeInstanceOf(JudgeUnparseableError);
-    expect(err).toMatchObject({ exitCode: code, signal, attempts: 1 });
+    expect(err).toBeInstanceOf(code == null || signal ? JudgeTimeoutError : JudgeUnparseableError);
+    expect(err).toMatchObject({ exitCode: code, signal });
     expect(calls).toHaveLength(1);
-    expect(err.message).toContain('juror process failed');
+    expect(err.message).toContain(code == null || signal ? 'JUDGE_TIMEOUT_MS' : 'juror process failed');
   });
 
   it.each(['', 'not json'].flatMap(stdout => [
@@ -1762,26 +1767,26 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
     const { fn, calls } = scriptedSpawn([{ stdout, code, signal }, { stdout: ANSWER_JSON, code: 0 }]);
     const err = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID,
       retries: 1, log: () => {}, spawnFn: fn }).catch(e => e);
-    expect(err).toBeInstanceOf(JudgeUnparseableError);
-    expect(err).toMatchObject({ exitCode: code, signal, attempts: 1 });
-    expect(err.failedAttempts[0].reason).toBe(`juror process failed (exit ${code ?? 'none'}, signal ${signal ?? 'none'})`);
+    expect(err).toBeInstanceOf(code == null || signal ? JudgeTimeoutError : JudgeUnparseableError);
+    expect(err).toMatchObject({ exitCode: code, signal });
+    if (code != null && !signal) expect(err.failedAttempts[0].reason).toBe(`juror process failed (exit ${code}, signal none)`);
     expect(calls).toHaveLength(1);
   });
 
   it('fails immediately after nonzero exit and records bounded failure evidence', async () => {
     const stderr = 'x'.repeat(2000) + 'stderr-tail';
-    const { fn, calls } = scriptedSpawn([{ stdout: ANSWER_JSON, code: 7, signal: 'SIGTERM', stderr }]);
+    const { fn, calls } = scriptedSpawn([{ stdout: ANSWER_JSON, code: 7, signal: null, stderr }]);
     const err = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, retries: 1, log: () => {}, spawnFn: fn })
       .catch(e => e);
     expect(err).toBeInstanceOf(JudgeUnparseableError);
     expect(calls).toHaveLength(1);
-    expect(err).toMatchObject({ exitCode: 7, signal: 'SIGTERM', attempts: 1, stderrTail: stderr.slice(-1000) });
-    expect(err.message).toMatch(/juror process failed \(exit 7, signal SIGTERM\)/);
+    expect(err).toMatchObject({ exitCode: 7, signal: null, attempts: 1, stderrTail: stderr.slice(-1000) });
+    expect(err.message).toMatch(/juror process failed \(exit 7, signal none\)/);
     expect(err.message).not.toContain('stdout[0..600]');
     expect(err.failedAttempts).toHaveLength(1);
     expect(err.failedAttempts[0]).toMatchObject({
-      exitCode: 7, signal: 'SIGTERM', stderrTail: stderr.slice(-1000),
-      reason: 'juror process failed (exit 7, signal SIGTERM)',
+      exitCode: 7, signal: null, stderrTail: stderr.slice(-1000),
+      reason: 'juror process failed (exit 7, signal none)',
     });
     expect(err.message.length).toBeLessThan(1200);
   });

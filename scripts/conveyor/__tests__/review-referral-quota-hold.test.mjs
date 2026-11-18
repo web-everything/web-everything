@@ -6,7 +6,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { reviewRunEvidence, decideSameHeadHold, readReviewRunEvidence,
   REVIEW_EVIDENCE_CACHE_FILE } from '../review-referral-hold.mjs';
 import { isQuotaError } from '../../lib/provider-quota-hold.mjs';
-import { parseJudgeOutcome } from '../../lib/judge-spawn.mjs';
+import { acceptJurorStream } from '../../lib/judge-spawn.mjs';
 import { normalizeJudgeTelemetry } from '../../operations/run-record.mjs';
 
 const repo = 'example/repo';
@@ -207,8 +207,8 @@ describe('incomplete quota evidence after the seat phase', () => {
   it('preserves quota evidence from the judge parser through normalized run telemetry', () => {
     let error;
     try {
-      parseJudgeOutcome(JSON.stringify({ is_error: true,
-        result: "You've hit your weekly limit · resets tomorrow" }));
+      acceptJurorStream(JSON.stringify({ is_error: true,
+        result: "You've hit your weekly limit · resets tomorrow" }), { sessionId: 's', schema: {}, exit: { code: 0, signal: null } });
     } catch (caught) {
       error = caught;
     }

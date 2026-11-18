@@ -55,7 +55,7 @@
  *
  * ARGV CONSTRUCTION IS PURE, AND THAT IS THE TESTABILITY SEAM. `buildJudgeArgv` spawns nothing and touches
  * no environment, so the whole flag contract is unit-testable at zero cost and zero latency; exactly one
- * integration test pays for a real spawn. `parseJudgeOutcome` is likewise pure over the CLI's stdout.
+ * integration test pays for a real spawn. `acceptJurorStream` is likewise pure over the CLI's stdout.
  *
  * WHY STDIN CARRIES THE INPUT. The judged material is a diff and can be large, so it goes on stdin rather
  * than argv — no `ARG_MAX` ceiling, and argv stays a fixed, assertable flag list. It also keeps the
@@ -690,153 +690,106 @@ export function buildJudgeArgv({
   ];
 }
 
-function markQuotaFailure(error, text) {
-  // Only a parsed CLI failure result is evidence; raw streams may contain incidental logs.
-  const holdRow = quotaHoldRow({ provider: 'claude', error: text });
-  if (holdRow) {
-    Object.assign(error, { quota: true, holdRow,
-      telemetry: { ...error.telemetry, failureKind: 'provider-quota', failureText: text.slice(0, 500) } });
-  }
-  return error;
-}
-
-/**
- * THE OTHER PURE HALF: the CLI's stdout, turned into a validated result or a throw.
- *
- * FAILS LOUD AND FAILS WITH THE SPAWN'S OWN WORDS. When the CLI reports an error it carries its own text
- * in `result` (that is how the `--bare` trap surfaces as "Not logged in · Please run /login"), and this
- * function throws exactly that rather than a paraphrase.
- *
- * IT ALSO NAMES THE BUDGET KILL, which is the one failure the CLI's own words do NOT explain (#3187). That
- * needs the ceiling, which is not in stdout — so `budget` is passed in. It is OPTIONAL and defaults to `null`
- * ("no ceiling was declared, or the caller does not know one"), which switches the branch off: with no ceiling
- * there is nothing to have been killed by, and inventing one in the message would be a guess.
- *
- * @param {string} stdout - the CLI's raw stdout.
- * @param {string} [stderr] - the CLI's stderr, folded into the message when stdout is unparseable.
- * @param {number|null} [budget] - the `--max-budget-usd` this spawn declared, so a budget kill can name it.
- * @returns {{value: object, sessionId: string, costUsd: number, durationMs: number, numTurns: number,
- *            stopReason: string, usage: object}}
- * @throws {JudgeBudgetError} when the juror was terminated by that ceiling.
+/** Strict, synchronous acceptance of the complete CLI document or event stream.
+ * `exit` carries process evidence plus optional budget, timing, observation timestamp (`now`) and stderr diagnostics.
+ * Oversized output is terminal: the operator must inspect the full run; no verdict is accepted.
  */
-export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
-  let parsed;
-  let malformedError;
-  const events = [];
-  try {
-    parsed = JSON.parse(String(stdout));
-    events.push(parsed);
-  } catch {
-    for (const line of String(stdout).split(/\r?\n/)) {
-      if (!line.trim()) continue;
-      try {
-        const candidate = JSON.parse(line);
-        events.push(candidate);
-        if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)
-          && ('session_id' in candidate || 'structured_output' in candidate || 'is_error' in candidate || candidate.type === 'result' || candidate.type === 'error')) {
-          parsed = candidate;
-        }
-      } catch {
-        if (line.trimStart().startsWith('{')) {
-          const error = new Error('judge-spawn: the juror did not emit parseable JSON: malformed JSON object line on stdout (content redacted); no verdict.');
-          error.unparseableStdout = true;
-          error.verdictIntegrity = true;
-          malformedError ??= error;
-        }
-        // Plain stdout log lines are not result objects.
+export function acceptJurorStream(stream, { sessionId, schema, exit }) {
+  const stdout = String(stream);
+  const { code, signal, timedOut, budget = null, stderr = '', timeoutMs, wallMs } = exit;
+  // Evaluate status before interpreting output, but retain quota > budget > timeout precedence.
+  const processFailure = timedOut || signal !== null || code == null
+    ? Object.assign(new JudgeTimeoutError({ timeoutMs, wallMs, stdout: '', stderr }), {
+      partialStdout: stdout, exitCode: code ?? null, signal: signal ?? null,
+    })
+    : code !== 0 ? Object.assign(new Error(`juror process failed (exit ${code}, signal none)`), {
+      unparseableStdout: true, verdictIntegrity: true, processFailed: true,
+    }) : null;
+  const fail = message => Object.assign(new Error(message), {
+    unparseableStdout: true, verdictIntegrity: true,
+  });
+  let malformed = false;
+  let events;
+  try { events = [JSON.parse(stdout)]; }
+  catch {
+    events = [];
+    for (const line of stdout.split(/\r?\n/)) {
+      if (!line.trimStart().startsWith('{')) continue;
+      try { events.push(JSON.parse(line)); }
+      catch { malformed = true; }
+    }
+  }
+  let quota;
+  let spending;
+  let failure;
+  let result;
+  let results = 0;
+  for (const event of events) {
+    if (!event || typeof event !== 'object' || Array.isArray(event)) {
+      failure ??= fail('judge-spawn: invalid JSON event; no verdict.');
+      continue;
+    }
+    const isResult = event.type === 'result' || (event.type === undefined
+      && ('structured_output' in event || 'is_error' in event || 'session_id' in event || 'result' in event || 'stop_reason' in event));
+    const bad = event.type === 'error' || event.is_error || event.error
+      || (isResult && 'subtype' in event && event.subtype !== 'success');
+    if (bad) {
+      const texts = [event.result, event.message, event.error, event.error?.message]
+        .filter(text => typeof text === 'string');
+      for (const text of texts) {
+        const holdRow = quotaHoldRow({ provider: 'claude', error: text, now: exit.now ?? 0 });
+        if (holdRow && !quota) quota = Object.assign(new Error(`judge-spawn: the juror failed: ${text}`), {
+          quota: true, holdRow, telemetry: { failureKind: 'provider-quota', failureText: text.slice(0, 500) },
+        });
       }
-    }
-  }
-
-  // A success or generic error cannot erase a spending limit elsewhere in the stream.
-  const failures = events.filter(event => event && typeof event === 'object' && !Array.isArray(event)
-    && (event.type === 'error' || event.is_error
-      || (event.type === 'result' && 'subtype' in event && event.subtype !== 'success')));
-  const failureText = event => [event?.result, event?.message, event?.error, event?.error?.message]
-    .find(text => typeof text === 'string' && quotaHoldRow({ provider: 'claude', error: text }))
-    ?? [event?.result, event?.message, event?.error, event?.error?.message]
-      .find(text => typeof text === 'string') ?? '';
-  const budgetFailure = event => (budget !== null && event?.stop_reason === 'tool_use')
-    || [event?.subtype, event?.code, event?.error?.code, event?.error?.type]
-      .some(code => ['error_max_budget_usd', 'budget_exceeded', 'budget_exhausted'].includes(code))
-    || /\bbudget (?:exhausted|exceeded)\b/i.test(failureText(event));
-  const priority = event => !event ? 0
-    : quotaHoldRow({ provider: 'claude', error: failureText(event) }) ? 2
-      : budgetFailure(event) ? 1 : 0;
-  const failure = failures.reduce((worst, event) => priority(event) > priority(worst) ? event : worst, failures[0]);
-  // Inspect the whole stream before choosing a failure. Spending-limit evidence outranks malformed
-  // output; judgeSpawn then ranks either result against its wall-clock timeout before considering retries.
-  if (malformedError && priority(failure) === 0) throw malformedError;
-  if (failure) {
-    if (priority(failure)) {
-      // A failure envelope is sufficient evidence; is_error is optional. Keep the
-      // shared quota classifier strict, and retain the declared ceiling and spend.
-      const text = failureText(failure);
-      if (budgetFailure(failure)) {
-        throw markQuotaFailure(new JudgeBudgetError({ budget,
-          costUsd: typeof failure.total_cost_usd === 'number' ? failure.total_cost_usd : 0,
-          stopReason: failure.stop_reason ?? '', result: text, stderr }), text);
+      const text = texts[0] ?? '';
+      if ((budget !== null && event.stop_reason === 'tool_use')
+        || [event.subtype, event.code, event.error?.code, event.error?.type]
+          .some(code => ['error_max_budget_usd', 'budget_exceeded', 'budget_exhausted'].includes(code))
+        || texts.some(text => /\bbudget (?:exhausted|exceeded)\b/i.test(text))) {
+        spending ??= new JudgeBudgetError({ budget, costUsd: event.total_cost_usd,
+          stopReason: event.stop_reason, result: text, stderr });
       }
-      throw markQuotaFailure(new Error(`judge-spawn: the juror failed: ${text}`), text);
+      failure ??= event.is_error
+        ? new Error(text ? `judge-spawn: the juror failed: ${text}`
+          : `judge-spawn: the juror failed with no result text. parsed: ${JSON.stringify({ ...event, structured_output: undefined }).slice(0, 600)}\n`
+            + `stderr[-600..]: ${String(stderr).trim().slice(-600) || '<empty>'}`)
+        : fail('judge-spawn: the juror emitted a JSON error event or unsuccessful result (content redacted); no verdict.');
     }
-    if (failure.is_error) parsed = failure; // Preserve CLI diagnostics below.
-    else {
-      const error = new Error('judge-spawn: the juror emitted a JSON error event or unsuccessful result.');
-      error.unparseableStdout = true;
-      error.verdictIntegrity = true;
-      throw error;
+    if (isResult) { results += 1; result ??= event; }
+    else if (results && !['system', 'rate_limit_event', 'rate_limit'].includes(event.type)) {
+      failure ??= fail('judge-spawn: result is not the last meaningful event; no verdict.');
     }
   }
-
-  if (parsed === undefined) {
-    const tail = String(stderr).trim().slice(-600);
-    const err = new Error(
-      `judge-spawn: the juror did not emit parseable JSON on stdout.\n` +
-      `stdout[0..600]: ${String(stdout).slice(0, 600)}\n` +
-      (tail ? `stderr[-600..]: ${tail}` : 'stderr: <empty>'),
-    );
-    err.unparseableStdout = true;
-    throw err;
+  if (quota) throw quota;
+  if (spending) throw spending;
+  if (processFailure) throw processFailure;
+  if (Buffer.byteLength(stdout) > 8 * 1024 * 1024) {
+    throw fail('judge-spawn: stdout exceeds 8MiB; inspect the full run manually; no verdict.');
   }
-
-  if (parsed?.is_error) {
-    if (parsed.result) {
-      // The CLI's OWN error text, verbatim — never reworded.
-      const error = new Error(`judge-spawn: the juror failed: ${parsed.result}`);
-      throw markQuotaFailure(error, parsed.result);
-    }
-    // `result` is empty — the CLI gave no error text at all (reproduced twice in one night, cause
-    // unknown, resolved both times by a blind retry). A bare "<no result text>" placeholder left the
-    // caller nothing to act on, so surface everything else that IS available: the raw parsed object
-    // (stop_reason, subtype, session_id, whatever else the CLI emitted) plus the stderr stream the
-    // caller passed in — including its `exit code N` fallback when the process produced no stderr.
-    const tail = String(stderr).trim().slice(-600);
-    throw new Error(
-      `judge-spawn: the juror failed with no result text. ` +
-      `parsed: ${JSON.stringify({ ...parsed, structured_output: undefined }).slice(0, 600)}\n` +
-      (tail ? `stderr[-600..]: ${tail}` : 'stderr: <empty>'),
-    );
-  }
-
-  const value = parsed?.structured_output;
+  if (malformed) throw fail('judge-spawn: the juror did not emit parseable JSON: malformed JSON object line on stdout (content redacted); no verdict.');
+  if (failure) throw failure;
+  if (!events.length) throw Object.assign(new Error('judge-spawn: the juror did not emit parseable JSON on stdout.\n'
+    + `stdout[0..600]: ${stdout.slice(0, 600)}\nstderr[-600..]: ${String(stderr).trim().slice(-600) || '<empty>'}`), { unparseableStdout: true });
+  if (results !== 1) throw fail('judge-spawn: expected exactly one result event; no verdict.');
+  if ('session_id' in result && result.session_id !== sessionId) throw fail('judge-spawn: result session_id mismatch; no verdict.');
+  let validate;
+  try { validate = compileJurorSchema(schema); }
+  catch (error) { throw fail(`judge-spawn: schema compilation failed (${error instanceof JurorSchemaError ? error.message : 'details redacted'}); correct the schema before retrying; no verdict.`); }
+  const value = result.structured_output;
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    const stopReason = ['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'pause_turn', 'refusal'].includes(parsed?.stop_reason)
-      ? parsed.stop_reason : 'unknown';
-    const error = new Error(`structured_output schema violation: expected an object; no \`structured_output\` object (stop_reason=${stopReason}).`);
-    error.unparseableStdout = true;
-    error.verdictIntegrity = true;
-    throw error;
+    const stopReason = ['end_turn', 'tool_use', 'max_tokens'].includes(result.stop_reason) ? result.stop_reason : 'unknown';
+    throw fail(`structured_output schema violation: expected an object; no structured_output (stop_reason=${stopReason}).`);
   }
-
-  return {
-    value,
-    sessionId: parsed.session_id ?? '',
-    costUsd: typeof parsed.total_cost_usd === 'number' ? parsed.total_cost_usd : 0,
-    durationMs: typeof parsed.duration_ms === 'number' ? parsed.duration_ms : 0,
-    numTurns: typeof parsed.num_turns === 'number' ? parsed.num_turns : 0,
-    stopReason: parsed.stop_reason ?? '',
-    usage: parsed.usage ?? {},
-  };
+  if (!validate(value) || !Object.keys(value).length) {
+    const violation = validate.errors?.[0];
+    throw fail(violation ? `structured_output schema violation at ${violation.schemaPath}: ${violation.message}`
+      : 'structured_output schema violation: expected a nonempty object');
+  }
+  return { value, sessionId: result.session_id ?? sessionId, costUsd: typeof result.total_cost_usd === 'number' ? result.total_cost_usd : 0,
+    durationMs: typeof result.duration_ms === 'number' ? result.duration_ms : 0,
+    numTurns: typeof result.num_turns === 'number' ? result.num_turns : 0,
+    stopReason: result.stop_reason ?? '', usage: result.usage ?? {} };
 }
 
 /**
@@ -860,7 +813,7 @@ export function loadedContextTokens(usage = {}) {
  * THIS SATISFIES THE PROVIDER PORT (`JudgeProvider`, named next to `createDefaultJudge` in
  * `we:scripts/operations/cli-adapter.mjs`, #3370). That port is the stable request/outcome shape a second
  * implementation (#3371) must match; this function is ONE implementation of it, not the port itself — its
- * Claude-specific argv (`buildJudgeArgv`) and stdout parsing (`parseJudgeOutcome`) are exactly what a
+ * Claude-specific argv (`buildJudgeArgv`) and stdout parsing (`acceptJurorStream`) are exactly what a
  * different provider would replace, and nothing here changed to make that true.
  *
  * @param {object} opts
@@ -934,9 +887,8 @@ export async function judgeSpawn({
   }
   const setting = retries === undefined ? resolveUnparseableRetries({ env }) : { value: retries, source: 'caller' };
   retries = setting.value;
-  let validate;
   try {
-    validate = compileJurorSchema(shape);
+    compileJurorSchema(shape);
   } catch (error) {
     // Compiler diagnostics can contain arbitrarily large, untrusted schema text.
     // No child ran: the caller must correct the schema before requesting a verdict.
@@ -1007,33 +959,11 @@ export async function judgeSpawn({
 
     const thisAttemptMs = Date.now() - startedAt;
     wallMs += thisAttemptMs;
-    // Process status is terminal regardless of whether stdout can be parsed. Parse only to
-    // preserve higher-priority quota/budget evidence before applying this failure.
-    const processFailure = timedOut
-      ? new JudgeTimeoutError({ timeoutMs, wallMs, stdout, stderr })
-      : code !== 0 || signal != null
-        ? Object.assign(new Error(`juror process failed (exit ${code ?? 'none'}, signal ${signal ?? 'none'})`), {
-          unparseableStdout: true, verdictIntegrity: true, processFailed: true,
-        })
-        : null;
     let outcome;
     try {
-      outcome = parseJudgeOutcome(stdout, stderr || (code === 0 ? '' : `exit code ${code}`), budget);
-      if (processFailure) throw processFailure;
-      const valid = validate(outcome.value);
-      if (!valid || Object.keys(outcome.value).length === 0) {
-        const violation = validate.errors?.[0];
-        const error = new Error(violation
-          ? `structured_output schema violation at ${violation.schemaPath}: ${violation.message}`
-          : 'structured_output schema violation: expected a nonempty object');
-        error.unparseableStdout = true;
-        error.verdictIntegrity = true;
-        throw error;
-      }
+      outcome = acceptJurorStream(stdout, { sessionId: thisSid, schema: shape,
+        exit: { code, signal: signal ?? null, timedOut, budget, stderr, timeoutMs, wallMs, now: Date.now() } });
     } catch (error) {
-      // Spending limits outrank the wall-clock bound; both outrank generic failures.
-      if (error instanceof JudgeBudgetError || error.quota === true) throw error;
-      if (processFailure) error = processFailure;
       if (error.unparseableStdout !== true) throw error;
       const reason = error.verdictIntegrity ? error.message : null;
       failedAttempts.push({
