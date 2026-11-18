@@ -25,7 +25,7 @@ export async function runPreflight({ thisHost, io, env = process.env, now = Date
   await check('role', async () => {
     const result = await io.resolveRole({ thisHost, now });
     return { ok: ['active', 'standby'].includes(result?.role) && typeof result?.reason === 'string'
-      && result.source !== 'remote-failed' && !['invalid-input', 'owner-unreadable', 'owner-alias-ambiguous'].includes(result.reason),
+      && result.source !== 'remote-failed' && !['invalid-input', 'owner-unreadable', 'owner-alias-ambiguous', 'host-identity-unknown'].includes(result.reason),
     detail: `role=${result?.role} reason=${result?.reason}` };
   });
   for (const tool of ['node', 'claude', 'gh', 'codex']) {

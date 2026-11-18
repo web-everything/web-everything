@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { getThisHost } from '../../lib/daemon-host-guard.mjs';
+import { getLegacyHost, getThisHost } from '../../lib/daemon-host-guard.mjs';
 import { runPreflight, formatPreflight, clean, cliIO, main } from '../daemon-preflight.mjs';
 
 const ME = '11111111-1111-4111-8111-111111111111';
@@ -49,6 +49,26 @@ function fixture(overrides = {}) {
 const run = (io) => runPreflight({ thisHost: ME, io, env: ENV, now: NOW });
 
 describe('daemon preflight read-only checks', () => {
+  it.each([
+    ['ENOENT', () => { throw Object.assign(new Error('scutil unavailable'), { code: 'ENOENT' }); }, 'host-identity-unknown', false],
+    ['successful mismatch', () => 'unrecognized\n', 'owner-is-other-host', true],
+  ])('scutil %s propagates through the resolver, role check and exit code', async (_label, exec, reason, ok) => {
+    const alias = 'legacy-alpha';
+    const legacyOwnerValues = { [alias]: ME };
+    const adapter = cliIO(ENV, {
+      legacyHost: getLegacyHost({ exec, legacyOwnerValues }),
+      source: { readOwner: () => ({ host: alias, version: VERSION, legacyOwnerValues }) },
+    });
+    expect(await adapter.resolveRole({ thisHost: ME })).toEqual({ role: 'standby', reason, source: 'remote' });
+    const { io } = fixture({ resolveRole: adapter.resolveRole });
+    const result = await run(io);
+    expect(result.checks.find(({ name }) => name === 'role')).toEqual({
+      name: 'role', ok, detail: `role=standby reason=${reason}`,
+    });
+    expect(result.ok).toBe(ok);
+    expect(await main({ thisHost: ME, io, env: ENV, now: NOW, log: () => {} })).toBe(ok ? 0 : 1);
+  });
+
   it('every preflight check passes in the specified order through injected IO', async () => {
     const { io, calls } = fixture();
     const result = await run(io);

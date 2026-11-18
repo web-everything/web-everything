@@ -81,18 +81,19 @@ export function getThisHost({ home = homedir(), create = true } = {}) {
   } catch { return ''; }
 }
 
-/** Local name consulted only for deprecated aliases; any failure fails closed (no OS-hostname fallback). */
+/** Local name for deprecated aliases; null means lookup failure, '' a readable mismatch or no bindings. No OS-hostname fallback. */
 export function getLegacyHost({ exec = execFileSync, legacyOwnerValues = NO_BINDINGS,
   timeoutMs = READ_TIMEOUT_MS } = {}) {
   if (!isBindings(legacyOwnerValues) || Object.keys(legacyOwnerValues).length === 0) return '';
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return '';
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return null;
   const timeout = Math.min(READ_TIMEOUT_MS, Math.max(1, Math.floor(timeoutMs)));
   let name;
   try {
     name = String(exec('scutil', ['--get', 'HostName'], {
       encoding: 'utf8', timeout, killSignal: 'SIGKILL', maxBuffer: MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'],
     })).trim();
-  } catch { return ''; }
+  } catch { return null; }
+  if (!name) return null;
   return legacyOwner(name, legacyOwnerValues) ? name : '';
 }
 
@@ -197,11 +198,12 @@ export async function resolveHostRole({ thisHost = getThisHost(), source = creat
     const legacyOwnerValues = result.legacyOwnerValues;
     let localAlias = '';
     if (legacyOwner(result.host, legacyOwnerValues)) {
-      if (legacyHost != null) localAlias = legacyHost;
+      if (legacyHost !== undefined) localAlias = legacyHost;
       else {
         const remaining = Math.max(0, deadline - clock());
-        if (remaining > 0) localAlias = getLegacyHost({ legacyOwnerValues, timeoutMs: remaining });
+        localAlias = remaining > 0 ? getLegacyHost({ legacyOwnerValues, timeoutMs: remaining }) : null;
       }
+      if (localAlias == null) return { ...standby('host-identity-unknown'), source: 'remote' };
     }
     const finished = clock();
     if (!Number.isFinite(started) || !Number.isFinite(finished) || finished < started

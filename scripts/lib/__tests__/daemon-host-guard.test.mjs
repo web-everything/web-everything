@@ -158,7 +158,7 @@ describe('opaque local identity', () => {
       expect(exec).toHaveBeenCalledWith('scutil', ['--get', 'HostName'],
         expect.objectContaining({ timeout: 20 - sourceMs }));
       expect(now - started).toBeLessThanOrEqual(20);
-      expect(decision).toEqual({ role: 'standby', reason: 'owner-unreadable', source: 'remote-failed' });
+      expect(decision).toEqual({ role: 'standby', reason: 'host-identity-unknown', source: 'remote' });
     } finally { exec.mockRestore(); }
   });
 
@@ -170,7 +170,7 @@ describe('opaque local identity', () => {
         timeoutMs: 20, clock: () => now,
       });
       expect(exec).not.toHaveBeenCalled();
-      expect(decision).toEqual({ role: 'standby', reason: 'owner-unreadable', source: 'remote-failed' });
+      expect(decision).toEqual({ role: 'standby', reason: 'host-identity-unknown', source: 'remote' });
     } finally { exec.mockRestore(); }
   });
 
@@ -289,14 +289,40 @@ describe('opaque local identity', () => {
   it('a failing scutil fails closed: no legacy host, no OS-hostname fallback, no activation', async () => {
     const alias = LEGACY_NAMES[0];
     const osHostname = vi.fn(() => alias);
-    for (const failure of [() => { throw new Error('scutil unavailable'); }, () => '', () => '\n']) {
+    for (const failure of [
+      () => { throw Object.assign(new Error('scutil unavailable'), { code: 'ENOENT' }); },
+      () => { throw Object.assign(new Error('scutil timed out'), { code: 'ETIMEDOUT' }); },
+      () => '', () => '\n',
+    ]) {
       // A stray hostname option must not be honoured: the OS name is never consulted.
       const legacyHost = guard.getLegacyHost({ exec: failure, hostname: osHostname, legacyOwnerValues: LEGACY_ALIASES });
-      expect(legacyHost).toBe('');
+      expect(legacyHost).toBeNull();
       expect(await guard.resolveHostRole({ thisHost: ME, legacyHost,
-        source: { readOwner: () => aliasRecord(alias) } })).toMatchObject({ role: 'standby', reason: 'owner-is-other-host' });
+        source: { readOwner: () => aliasRecord(alias) } })).toEqual({ role: 'standby', reason: 'host-identity-unknown', source: 'remote' });
     }
     expect(osHostname).not.toHaveBeenCalled();
+  });
+
+  it('remote resolver refuses a failed scutil lookup without an injected alias', async () => {
+    const exec = vi.spyOn(childProcess, 'execFileSync').mockImplementation(() => {
+      throw Object.assign(new Error('scutil unavailable'), { code: 'ENOENT' });
+    });
+    try {
+      expect(await resolve(() => aliasRecord())).toEqual({ role: 'standby', reason: 'host-identity-unknown', source: 'remote' });
+      expect(exec).toHaveBeenCalledWith('scutil', ['--get', 'HostName'], expect.any(Object));
+    } finally { exec.mockRestore(); }
+  });
+
+  it('a readable non-matching scutil name still identifies another owner', async () => {
+    const legacyHost = guard.getLegacyHost({ exec: () => 'unrecognized\n', legacyOwnerValues: LEGACY_ALIASES });
+    expect(legacyHost).toBe('');
+    expect(await resolve(() => aliasRecord(), { legacyHost })).toEqual({ role: 'standby', reason: 'owner-is-other-host', source: 'remote' });
+  });
+
+  it.each([0, -1, NaN, Infinity])('invalid legacy lookup timeout %s fails closed without executing', (timeoutMs) => {
+    const exec = vi.fn();
+    expect(guard.getLegacyHost({ exec, legacyOwnerValues: LEGACY_ALIASES, timeoutMs })).toBeNull();
+    expect(exec).not.toHaveBeenCalled();
   });
 
   it.each(['', 'legacy-alpha,', 'legacy-alpha\n', 'legacy-alpha\r', 'legacy-alpha\u2028',
@@ -333,6 +359,26 @@ describe('GitHub ownership source', () => {
     body: { type: 'file', encoding: 'base64', content: Buffer.from(text).toString('base64') } });
   const ref = { ok: true, status: 200, body: { object: { type: 'commit', sha: VERSION } } };
   const source = (responses) => guard.createGitHubOwnershipSource({ ghApi: () => responses.shift() });
+
+  it.each([
+    ['a'.repeat(253), true], ['a'.repeat(254), false], ['legacy-alpha-', false], ['legacy-alpha.', false],
+  ])('alias boundary %s is validated as owner and binding key (valid=%s)', async (alias, valid) => {
+    const bindings = guard.getLegacyOwnerValues({ WE_DAEMON_LEGACY_OWNER_VALUES: `${alias}=${ME}` });
+    expect({ ...bindings }).toEqual(valid ? { [alias]: ME } : {});
+    const shared = source([ref, file(`${alias}\n${alias}=${ME}\n`)]);
+    if (valid) {
+      expect(await shared.readOwner()).toEqual(aliasRecord(alias, { [alias]: ME }));
+    } else {
+      await expect(shared.readOwner()).rejects.toThrow('invalid owner ID');
+    }
+    const bindingRecord = await source([ref, file(`legacy-alpha\n${alias}=${ME}\n`)]).readOwner();
+    expect({ ...bindingRecord.legacyOwnerValues }).toEqual(valid ? { [alias]: ME } : {});
+  });
+
+  it('rejects a shared alias owner file with a third extra line', async () => {
+    await expect(source([ref, file(`legacy-alpha\nlegacy-alpha=${ME}\njunk\n`)]).readOwner())
+      .rejects.toThrow('invalid owner record');
+  });
 
   it.each(['\n', '\r\n'])('reads owner and alias bindings from the same pinned file with %j endings', async (newline) => {
     const api = vi.fn().mockResolvedValueOnce(ref)

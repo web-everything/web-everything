@@ -93,6 +93,13 @@ export default {
           }
         }
       }
+      // A failed local host-name lookup must resolve as an explicit unknown that preflight refuses, never owner-is-other-host.
+      const unknown = await guard.resolveHostRole({ thisHost: first, legacyHost: null,
+        source: { readOwner: async () => shared } });
+      if (unknown.reason !== 'host-identity-unknown') violations.push('failed host lookup did not resolve as unknown');
+      const unknownPreflight = await preflight.runPreflight({ thisHost: first, io: { resolveRole: async () => unknown,
+        which: () => true, keyFiles: () => [], cloneDirs: () => [], parsePreferences: () => ({}), sshForge: () => ({ status: 0 }) } });
+      if (unknownPreflight.checks?.find((c) => c.name === 'role')?.ok !== false) violations.push('preflight accepted an unknown host identity');
       owner = null;
       const io = cliIO({ HOME: join(home, 'first') }, { source });
       const lines = [];
