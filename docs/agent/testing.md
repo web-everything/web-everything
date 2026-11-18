@@ -4658,3 +4658,39 @@ oversized/incomplete/foreign evidence, target head invalidation, snapshot exclus
 a live target replacing a stale cached target with a different head and red check.
 Run it with `fast-drain-scope.test.mjs` and `merge-ai-prs.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
 comparison against daemon observations; fixtures prove IO counts without live GitHub calls.
+
+
+## Confined Antigravity build adapter (R1062 / S7 / R37)
+
+`agy-confined-build.test.mjs` uses temporary local Git repositories and injected fake agy
+execution; it never launches agy. Admission requires kind, numeric size and literal repo-relative
+file/directory scope prefixes. Allowed kinds **or** size at/below the bound admit the repair;
+settings must remain readable, with environment overrides above settings above defaults.
+Keep whole-run rejection cases for mixed scope, Git controls, escaping/new symlinks, modes,
+binary/submodule changes, traversal, Git calls, moved HEAD, changed real lane and incomplete
+or rewritten transcripts. The launcher applies the admitted patch without staging or committing.
+Voided/refused builds advance to another provider; oversized requests need operator review or
+an explicit settings change. The broad dispatch availability gate still requires sandboxed
+providers; production execution remains unavailable even for explicitly scoped launches until
+an enforced filesystem boundary confines native file tools. Clone/transcript checks only detect
+escapes afterward and cannot undo damage. The named outside-write refusal test must assert both
+real-lane and untracked host targets remain unchanged with no worker launched. Only injected fake
+workers exercise patch admission; they are not evidence of production confinement. Run the focused adapter and
+`operations/__tests__/fix-run.test.mjs` fixtures through the host heavy-admission queue.
+
+Slice B supersedes the production-unavailable note above: macOS builds now launch through
+`/usr/bin/sandbox-exec`, with default-denied writes and explicit clone, agy state/cache and OS
+temporary-directory grants. Network remains allowed. The pure profile builder consumes canonical
+absolute paths; the launcher resolves existing paths and resolves absent secret roots through their
+nearest existing ancestor (unreadable paths and broken symlinks refuse). Writable roots under the
+home workspace, unsafe SBPL characters, unsupported hosts and missing sandbox-exec fail closed;
+use another fix provider or request operator review. Profiles use private temporary directories
+outside clone/lane and mode 0600. Native file tools are permitted; transcript, escape, Git-control
+and scope checks still gate the launcher-owned patch application. No agy Git operations are admitted.
+`agy-sandbox.test.mjs` covers profile grants/denials and unsafe paths; its Darwin-only REAL shell
+probe uses only temporary directories, demonstrates allowed clone writes, rejects outside writes
+with EPERM and checks that the target never appears, and rejects reads from a temporary denied
+directory. It never touches real home secrets or launches agy. The injected build tests separately
+cover unsupported hosts and missing sandbox-exec without launching a worker. Run these focused
+files and the fix-run fixtures only via the host heavy-admission queue; fake-worker evidence alone
+does not establish confinement. These slice B tests were authored without running them.

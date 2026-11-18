@@ -2099,12 +2099,12 @@ describe('launcher CI inputs, card 5947 (live #5045, 2026-10-13)', () => {
   });
 });
 
-it('fix provider runs an injected Antigravity worker in the existing lane', async () => {
+it('fix provider passes kind, size and scope to the confined Antigravity worker', async () => {
   const {resolveFixProvider} = await import('../fix-run.mjs');
   const provider = await resolveFixProvider('antigravity');
-  const runTask = vi.fn(async ()=>({events:{agentMessages:['earlier response'],finalResponse:'done'}}));
-  expect(await provider.spawn({prompt:'edit',model:'gemini-4-argon-high',effort:'high',sessionSlug:'fix-7'}, {resolveLane:()=>'/lane',runTask})).toMatchObject({finalMessage:'done'});
-  expect(runTask).toHaveBeenCalledWith(expect.objectContaining({task:'edit',dir:'/lane',gate:'none',model:'gemini-4-argon-high',effort:'high'}));
+  const runTask = vi.fn(async ()=>({status:'ok',finalMessage:'done',stdout:'trace'}));
+  expect(await provider.spawn({prompt:'edit',kind:'doc-fix',size:1,scope:['docs'],model:'gemini-4-argon-high',effort:'high',sessionSlug:'fix-7'}, {resolveLane:()=>'/lane',runTask})).toEqual({finalMessage:'done',stdout:'trace'});
+  expect(runTask).toHaveBeenCalledWith({task:'edit',laneDir:'/lane',kind:'doc-fix',size:1,scope:['docs'],model:'gemini-4-argon-high',effort:'high'});
 });
 
 it('every fix executor declares confinement or is unavailable for dispatch', () => {
@@ -2119,21 +2119,40 @@ it('every fix executor declares confinement or is unavailable for dispatch', () 
     }
   }
   expect(fixLauncherAvailable('codex')).toBe(true);
-  expect(fixLauncherAvailable('antigravity')).toBe(false);
+  expect(fixLauncherAvailable('antigravity')).toBe(true);
 });
 
 it('refuses the production Antigravity worker before running untrusted review input', async () => {
   const { resolveFixProvider } = await import('../fix-run.mjs');
   const provider = await resolveFixProvider('antigravity');
   await expect(provider.spawn({ prompt: 'untrusted PR review', sessionSlug: 'fix-7' }, { resolveLane: () => '/missing/lane' }))
-    .rejects.toThrow('confined Antigravity fix adapter is unavailable');
+    .rejects.toThrow('refused');
+});
+
+it('declares sandbox-exec confinement and propagates a host confinement refusal for scoped builds', async () => {
+  const { resolveFixProvider } = await import('../fix-run.mjs');
+  const provider = await resolveFixProvider('antigravity');
+  expect(provider.confinement).toMatchObject({ mode: 'sandboxed', boundary: 'workspace', mechanism: 'sandbox-exec' });
+  expect(fixLauncherAvailable('antigravity')).toBe(true);
+  await expect(provider.spawn({ prompt: 'attempt a write outside the clone', kind: 'doc-fix', size: 1,
+    scope: ['docs'], sessionSlug: 'fix-7' }, { resolveLane: () => '/missing/lane',
+    runTask: async () => ({ status: 'refused', reasons: ['requires macOS sandbox-exec; use another fix provider'] }) }))
+    .rejects.toThrow('requires macOS sandbox-exec');
 });
 
 it.each([{exitCode:1}, {exitCode:null}, {exitCode:0,timedOut:true}])('reports failed Gemini task %j with its final message', async failure => {
   const {resolveFixProvider} = await import('../fix-run.mjs');
   const provider = await resolveFixProvider('antigravity');
-  await expect(provider.spawn({prompt:'edit',sessionSlug:'fix-7'}, {resolveLane:()=>'/lane',runTask:async()=>({...failure,events:{agentMessages:['diagnosis']}})}))
+  await expect(provider.spawn({prompt:'edit',sessionSlug:'fix-7'}, {resolveLane:()=>'/lane',runTask:async()=>({status:'failed',...failure,events:{agentMessages:['diagnosis']}})}))
     .rejects.toMatchObject({finalMessage:'diagnosis'});
+});
+
+it.each(['refused', 'voided', 'failed'])('advances the fix chain when the confined adapter returns %s', async status => {
+  const { resolveFixProvider } = await import('../fix-run.mjs');
+  const provider = await resolveFixProvider('antigravity');
+  await expect(provider.spawn({ prompt: 'edit', kind: 'doc-fix', size: 1, scope: ['docs'], sessionSlug: 'fix-7' },
+    { resolveLane: () => '/lane', runTask: async () => ({ status, applied: [], reasons: ['operator review required'] }) }))
+    .rejects.toThrow(`task ${status}: operator review required`);
 });
 
 describe('acquire launcher diagnostics', () => {
