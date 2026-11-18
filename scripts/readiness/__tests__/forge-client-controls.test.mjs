@@ -16,7 +16,7 @@ import {keepAliveScript} from '../../lib/test-keepalive.mjs';
 
 const roots = [];
 const scratch = () => {const root=mkdtempSync(join(process.env.TMPDIR,'forge-controls-')); roots.push(root); return root;};
-afterEach(() => {vi.useRealTimers(); for(const root of roots.splice(0))rmSync(root,{recursive:true,force:true});});
+afterEach(() => {vi.useRealTimers(); vi.restoreAllMocks(); for(const root of roots.splice(0))rmSync(root,{recursive:true,force:true});});
 const now = Date.parse('2026-10-29T21:40:00-04:00');
 const sample = (ms=now) => ({sampledAtET:runner.easternTimestamp(ms),cores:8,loadPerCore:0.12,memFreePct:96,activeRuns:3,
   recent:[{runId:'r-'+'a'.repeat(32),startedAtET:runner.easternTimestamp(ms-41000),stageMs:{install:1000,run:40000},code:0}]});
@@ -207,7 +207,7 @@ describe('shared command classes', () => {
     writeFileSync(join(bin,'npm'),`#!${process.execPath}\nconst fs=require('node:fs');
 if(process.argv[2]!=='ci')process.exit(91);
 fs.mkdirSync('node_modules/vitest',{recursive:true});fs.writeFileSync('node_modules/vitest/vitest.mjs',${JSON.stringify("import {createRequire} from 'node:module';const require=createRequire(import.meta.url);"+task)});
-${gate?`if(!fs.existsSync(${JSON.stringify(join(root,'release'))})){const watch=fs.watch(${JSON.stringify(root)},()=>{if(fs.existsSync(${JSON.stringify(join(root,'release'))})){watch.close();process.exit(0);}});}`:''}
+${gate?`const release=${JSON.stringify(join(root,'release'))};if(!fs.existsSync(release)){setInterval(()=>{if(fs.existsSync(release))process.exit(0);},20);}`:''}
 `,{mode:0o755});
     let time=now;
     const server=runner.createRunner({testRoot:root,testPath:bin+':/usr/bin:/bin',clock:()=>time});
