@@ -214,9 +214,9 @@ export function refreshOntoMain(laneRef, {
  */
 export function defaultPostRebaseComment(prNumber, {
   exec = execFileSyncThrottled, repo = null, headRefName = null, headSha = null, mainGreen = null, ok = true, action = 'rebased', error = null,
-  attribution = null, attributedWindow = null,
+  attribution = null, attributedWindow = null, commentMarker = null,
 } = {}) {
-  const argv = ['pr', 'comment', String(prNumber), '--body', buildRebaseOntoMainComment({
+  const argv = ['pr', 'comment', String(prNumber), '--body', (commentMarker ? `${commentMarker}\n\n` : '') + buildRebaseOntoMainComment({
     headRefName, headSha, mainGreen, ok, action, error, attribution, attributedWindow,
   })];
   if (repo) argv.push('--repo', repo);

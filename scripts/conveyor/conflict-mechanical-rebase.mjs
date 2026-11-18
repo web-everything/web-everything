@@ -1,4 +1,4 @@
-/** Mechanical conflict refreshes have their own cap, independent of the agent fix queue.
+/** Mechanical conflict refreshes have a per-pass cap and share the durable conflict-fix ceiling.
  * Real code conflicts remain owned by the existing conflict fixer/escalation path. */
 import { readFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -10,13 +10,27 @@ import { REPO_ROOT } from '../operations/dispatch-lane-io.mjs';
 import { handoffHome } from '../operations/handoff-home.mjs';
 import { resolveLanePoolRepoPath } from './lane-pool-health-watch.mjs';
 import { pushRefusal } from './fix-procedure.mjs';
-import { countUnresolvedStandDowns, concurrentAuthorPauseState } from './reconcile-core.mjs';
+import { CONFLICT_FIX_ABSOLUTE_CEILING, countUnresolvedStandDowns, concurrentAuthorPauseState } from './reconcile-core.mjs';
 import { standDownHeadChangeAt, concurrentAuthorPauses } from './stand-down.mjs';
 import { loadFlakeHoldState } from './load-flake-hold.mjs';
 import { answerDisposition, latestOperatorAnswer } from './stand-down-answer-core.mjs';
 import { LIST_COMMENTS_PAGE_SIZE } from './pr-comments-complete.mjs';
 import { defaultReadOpenPrs, defaultReadMainTip, refreshOntoMain, defaultReadIsCrossRepository,
   sameRepoRefusal, reconcileAcceptanceAfterRebase, defaultPostRebaseComment } from './ci-red-recovery-watch.mjs';
+
+import { countConflictFixComments, CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
+import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
+import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
+
+export function defaultReadConflictRebasePr(prNumber, { repo, exec = execFileSyncThrottled } = {}) {
+  try {
+    return JSON.parse(exec('gh', ['pr', 'view', String(prNumber), '--repo', repo, '--json',
+      'number,state,comments,headRefOid,headRefName,baseRefName,labels,mergeable,mergeStateStatus,isCrossRepository'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024,
+      timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+    }));
+  } catch { return null; }
+}
 
 const TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -82,8 +96,25 @@ function claimAttempt(ledger, key, at) {
   return true;
 }
 
+function holdWhy(pr, now) {
+  const commentsReadable = Array.isArray(pr.comments) && pr.comments.length < LIST_COMMENTS_PAGE_SIZE
+    && pr.comments.every(c => typeof c?.body === 'string' && typeof c?.author?.login === 'string');
+  const pause = commentsReadable ? concurrentAuthorPauseState({ ...pr, now: now() }) : null;
+  const loadHold = commentsReadable ? loadFlakeHoldState({ ...pr, now: now() }) : null;
+  const disposition = commentsReadable ? answerDisposition(latestOperatorAnswer(pr.comments)) : null;
+  const invalidPauseTime = commentsReadable && concurrentAuthorPauses(pr.comments)
+    .some(p => !Number.isFinite(Date.parse(p.createdAt ?? '')));
+  return !commentsReadable ? 'comments unreadable or possibly truncated; operator must inspect the full thread before rebasing'
+    : disposition != null ? `operator disposition ${disposition} does not authorize repair; follow the operator ruling`
+    : loadHold?.live ? `fix reserved on ${loadHold.hold.alt.branch}; wait for load-flake alternate-branch verification`
+    : invalidPauseTime ? 'concurrent author pause timestamp unreadable; operator must inspect the thread before rebasing'
+    : countUnresolvedStandDowns(pr.comments, { headRefOid: pr.headRefOid, headChangedAt: standDownHeadChangeAt(pr) }) > 0
+      ? 'unanswered stand-down; record an explicit operator answer with stand-down-answer.mjs'
+      : pause?.held ? pause.why : null;
+}
+
 export function sweepMechanicalConflictRebases({ repo, apply = false, defaultBranch = 'main',
-  readOpenPrs = defaultReadOpenPrs, readMainTip = defaultReadMainTip,
+  readOpenPrs = defaultReadOpenPrs, readPr = defaultReadConflictRebasePr, readMainTip = defaultReadMainTip,
   run = gitRunner, refresh = (laneRef, options) => refreshOntoMain(laneRef, {
     ...options, rebase: args => rebaseDropManifest({ ...args, strict: true, run }),
   }),
@@ -107,21 +138,11 @@ export function sweepMechanicalConflictRebases({ repo, apply = false, defaultBra
   for (const pr of candidates) {
     if (attempts >= maxPerPass) break;
     const row = { prNumber: pr.number, headRefName: pr.headRefName, headSha: pr.headRefOid };
-    const commentsReadable = Array.isArray(pr.comments) && pr.comments.length < LIST_COMMENTS_PAGE_SIZE
-      && pr.comments.every(c => typeof c?.body === 'string' && typeof c?.author?.login === 'string');
-    const pause = commentsReadable ? concurrentAuthorPauseState({ ...pr, now: now() }) : null;
-    const loadHold = commentsReadable ? loadFlakeHoldState({ ...pr, now: now() }) : null;
-    const disposition = commentsReadable ? answerDisposition(latestOperatorAnswer(pr.comments)) : null;
-    const invalidPauseTime = commentsReadable && concurrentAuthorPauses(pr.comments)
-      .some(p => !Number.isFinite(Date.parse(p.createdAt ?? '')));
-    const why = !commentsReadable ? 'comments unreadable or possibly truncated; operator must inspect the full thread before rebasing'
-      : disposition != null ? `operator disposition ${disposition} does not authorize repair; follow the operator ruling`
-      : loadHold?.live ? `fix reserved on ${loadHold.hold.alt.branch}; wait for load-flake alternate-branch verification`
-      : invalidPauseTime ? 'concurrent author pause timestamp unreadable; operator must inspect the thread before rebasing'
-      : countUnresolvedStandDowns(pr.comments, { headRefOid: pr.headRefOid, headChangedAt: standDownHeadChangeAt(pr) }) > 0
-        ? 'unanswered stand-down; record an explicit operator answer with stand-down-answer.mjs'
-        : pause?.held ? pause.why : null;
+    const why = holdWhy(pr, now);
     if (why) { refusals.push({ ...row, kind: 'conflict-rebase-held', why }); continue; }
+    if (countConflictFixComments(pr.comments) >= CONFLICT_FIX_ABSOLUTE_CEILING) {
+      refusals.push({ ...row, kind: 'conflict-rebase-ceiling', why: 'absolute conflict-fix ceiling reached; existing escalation retains human takeover' }); continue;
+    }
     if (!apply) { dispatch.push(row); continue; }
     const held = checkClaim({ repo, branch: pr.headRefName });
     const guard = held || sameRepoRefusal(pr.number, { repo, readIsCrossRepository });
@@ -137,6 +158,23 @@ export function sweepMechanicalConflictRebases({ repo, apply = false, defaultBra
       refusals.push({ ...row, kind: 'conflict-rebase-stale-main',
         why: 'main fetch/verification failed; existing fix path retains ownership' });
       break;
+    }
+    let fresh;
+    try { fresh = readPr(pr.number, { repo }); } catch { fresh = null; }
+    if (!fresh || fresh.number !== pr.number || fresh.headRefOid !== pr.headRefOid
+      || !/^[a-f0-9]{40}$/i.test(fresh.headRefOid ?? '') || fresh.headRefName !== pr.headRefName
+      || !Array.isArray(fresh.labels) || fresh.mergeable !== 'CONFLICTING'
+      || !buildConflictRebaseCandidates([fresh], { defaultBranch }).length) {
+      refusals.push({ ...row, kind: 'conflict-rebase-held', why: 'fresh PR evidence changed or unreadable; existing fix path retains ownership' }); continue;
+    }
+    const freshWhy = holdWhy(fresh, now);
+    const freshGuard = checkClaim({ repo, branch: fresh.headRefName })
+      || sameRepoRefusal(fresh.number, { repo, readIsCrossRepository });
+    if (freshWhy || freshGuard) {
+      refusals.push({ ...row, kind: 'conflict-rebase-held', why: freshWhy ?? freshGuard.message ?? freshGuard.error }); continue;
+    }
+    if (countConflictFixComments(fresh.comments) >= CONFLICT_FIX_ABSOLUTE_CEILING) {
+      refusals.push({ ...row, kind: 'conflict-rebase-ceiling', why: 'absolute conflict-fix ceiling reached; existing escalation retains human takeover' }); continue;
     }
     try {
       if (!(ledger.claim ? ledger.claim(`${pr.number}@${mainSha}`, now())
@@ -155,7 +193,7 @@ export function sweepMechanicalConflictRebases({ repo, apply = false, defaultBra
       action.acceptance = reconcileAcceptance({ repo, root, prNumber: pr.number, newHead: refreshed.newCommit });
     }
     if (!refreshed.ok) refusals.push({ ...row, kind: 'conflict-rebase-not-mechanical', why: refreshed.error ?? refreshed.action });
-    try { postComment(pr.number, { repo, ...row, ...refreshed }); }
+    try { postComment(pr.number, { repo, ...row, ...refreshed, commentMarker: CONFLICT_FIX_COMMENT_MARKER }); }
     catch (e) { refusals.push({ ...row, kind: 'conflict-rebase-comment-failed', why: e.message }); }
   }
   return result;

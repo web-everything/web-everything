@@ -5,27 +5,78 @@ import { join } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { pathToFileURL } from 'node:url';
 import { buildConflictRebaseCandidates, sweepMechanicalConflictRebases, createConflictRebaseLedger,
-  resolveConflictRebaseSettings } from '../conflict-mechanical-rebase.mjs';
+  resolveConflictRebaseSettings, defaultReadConflictRebasePr } from '../conflict-mechanical-rebase.mjs';
 import { STAND_DOWN_MARKER, buildConcurrentAuthorPauseComment, buildLoadFlakeHoldComment,
   buildLoadFlakeResolvedComment } from '../stand-down.mjs';
 import { buildOperatorAnswer } from '../stand-down-answer-core.mjs';
 import { readSettingsChecked } from '../../lib/settings-files.mjs';
 import { runTickAllRepos, buildCliDaemonEffects, runConflictRebaseAllRepos, resolveFixPassBudgets } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
 
+import { CONFLICT_FIX_ABSOLUTE_CEILING } from '../reconcile-core.mjs';
+import { CONFLICT_FIX_COMMENT_MARKER, countConflictFixComments } from '../conflict-fix-round-count.mjs';
+import { defaultPostRebaseComment } from '../ci-red-recovery-watch.mjs';
+
 const sha = 'a'.repeat(40), nextSha = 'b'.repeat(40);
 const pr = (number, extra = {}) => ({ number, state: 'OPEN', baseRefName: 'main', isCrossRepository: false,
-  headRefName: `lane/test-${number}`, headRefOid: 'c'.repeat(40), mergeStateStatus: 'DIRTY', labels: [], comments: [], ...extra });
-const fixture = (extra = {}) => ({ repo: 'web-everything/web-everything', apply: true,
+  headRefName: `lane/test-${number}`, headRefOid: 'c'.repeat(40), mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY', labels: [], comments: [], ...extra });
+const fixture = (extra = {}) => { const opts = { repo: 'web-everything/web-everything', apply: true,
   readOpenPrs: () => [pr(1), pr(2), pr(3)], readMainTip: () => ({ sha }),
   run: vi.fn(() => ({ status: 0, stdout: sha })),
   refresh: vi.fn(() => ({ ok: true, action: 'rebased', newCommit: nextSha })),
   ledger: createConflictRebaseLedger({ env: { WE_UNDER_TEST: '1' } }), maxPerPass: 3,
   now: () => 1000, checkClaim: () => null, readIsCrossRepository: () => false,
-  reconcileAcceptance: vi.fn(() => ({ attempted: false })), postComment: vi.fn(), ...extra });
+  reconcileAcceptance: vi.fn(() => ({ attempted: false })), postComment: vi.fn(), ...extra };
+  opts.readPr ??= number => opts.readOpenPrs().find(p => p.number === number);
+  return opts; };
 
 describe('mechanical conflict rebase', () => {
   const trusted = (body, extra = {}) => ({ body, author: { login: 'web-everything' }, ...extra });
   const stop = trusted(`${STAND_DOWN_MARKER}\nQuestion needing an operator answer.`, { id: 'IC_stop' });
+
+  it.each(['discovery', 'fresh'])('shared absolute ceiling at %s leaves human escalation ownership and no ledger attempt', phase => {
+    const comments = Array.from({ length: CONFLICT_FIX_ABSOLUTE_CEILING + (phase === 'fresh' ? 1 : 0) }, () => trusted(CONFLICT_FIX_COMMENT_MARKER));
+    const opts = fixture({ readOpenPrs: () => [pr(1, { comments: phase === 'discovery' ? comments : [] })],
+      readPr: () => pr(1, { comments }) });
+    expect(sweepMechanicalConflictRebases(opts).refusals).toMatchObject([{ kind: 'conflict-rebase-ceiling', why: expect.stringContaining('human takeover') }]);
+    expect(opts.ledger.read()).toEqual({}); expect(opts.refresh).not.toHaveBeenCalled();
+  });
+
+  it('durable sweep comment uses the shared trusted round counter, preserving the existing rebase marker', () => {
+    const exec = vi.fn();
+    const opts = fixture({ readOpenPrs: () => [pr(1)], postComment: (n, options) => defaultPostRebaseComment(n, { ...options, exec }) });
+    sweepMechanicalConflictRebases(opts);
+    const body = exec.mock.calls[0][1][4];
+    expect(body.startsWith(CONFLICT_FIX_COMMENT_MARKER + '\n')).toBe(true);
+    expect(countConflictFixComments([trusted(body)])).toBe(1);
+  });
+
+  it.each(['head', 'base', 'same-repo', 'clean', 'labels', 'comments', 'stand-down', 'pause', 'load-flake', 'claim', 'read-failed'])(
+    'fresh %s evidence refuses before ledger claim after local verification', change => {
+      let verified = false;
+      const opts = fixture({ readOpenPrs: () => [pr(1)], now: () => Date.parse('2026-11-18T12:01:00Z'),
+        run: (_cmd, args) => { if (args[0] === 'rev-parse') verified = true; return { status: 0, stdout: sha }; },
+        checkClaim: () => verified && change === 'claim' ? { message: 'held' } : null,
+        readPr: () => {
+          expect(verified).toBe(true);
+          if (change === 'read-failed') throw Error('unreadable');
+          const changes = { head: { headRefOid: nextSha }, base: { baseRefName: 'lane/stack' },
+            'same-repo': { isCrossRepository: true }, clean: { mergeable: 'MERGEABLE' }, labels: { labels: null },
+            comments: { comments: null }, 'stand-down': { comments: [stop] },
+            pause: { comments: [trusted(buildConcurrentAuthorPauseComment({ head: pr(1).headRefOid }), { createdAt: '2026-11-18T12:00:00Z' })] },
+            'load-flake': { comments: [trusted(buildLoadFlakeHoldComment({ head: pr(1).headRefOid, alt: 'lane/alt', altSha: nextSha }))] } };
+          return pr(1, changes[change]);
+        } });
+      expect(sweepMechanicalConflictRebases(opts).refusals).toHaveLength(1);
+      expect(opts.ledger.read()).toEqual({}); expect(opts.refresh).not.toHaveBeenCalled();
+    });
+
+  it('single PR reader requests fresh hold evidence and fails closed on read failure', () => {
+    const exec = vi.fn(() => JSON.stringify(pr(1)));
+    expect(defaultReadConflictRebasePr(1, { repo: 'o/r', exec })).toEqual(pr(1));
+    expect(exec.mock.calls[0][1]).toEqual(['pr', 'view', '1', '--repo', 'o/r', '--json',
+      'number,state,comments,headRefOid,headRefName,baseRefName,labels,mergeable,mergeStateStatus,isCrossRepository']);
+    expect(defaultReadConflictRebasePr(1, { repo: 'o/r', exec: () => { throw Error('failed'); } })).toBeNull();
+  });
 
   it.each([true, false])('unanswered stand-down refuses before ledger claim (apply=%s)', apply => {
     const opts = fixture({ apply, readOpenPrs: vi.fn(() => [pr(1, { comments: [stop] })]) });
@@ -199,7 +250,7 @@ describe('mechanical conflict rebase', () => {
       pr(3, { mergeStateStatus: 'UNKNOWN', labels: [{ name: 'merge-status:conflicting' }] }),
       pr(4, { baseRefName: 'lane/stack' }), pr(5, { state: 'CLOSED' }),
       pr(6, { isCrossRepository: true }), pr(7, { isCrossRepository: undefined }),
-      pr(8, { mergeStateStatus: 'CLEAN' })];
+      pr(8, { mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN' })];
     expect(buildConflictRebaseCandidates(rows).map(p => p.number)).toEqual([1, 2, 3]);
     expect(buildConflictRebaseCandidates([pr(4, { baseRefName: 'trunk' })], { defaultBranch: 'trunk' })).toHaveLength(1);
   });
@@ -262,7 +313,7 @@ describe('mechanical conflict rebase', () => {
         let refreshes = 0;
         const result = sweepMechanicalConflictRebases({
           repo: 'web-everything/web-everything', apply: true, maxPerPass: 1, now: () => 1000,
-          readOpenPrs: () => [workerData.pr], readMainTip: () => ({ sha: workerData.sha }),
+          readOpenPrs: () => [workerData.pr], readPr: () => workerData.pr, readMainTip: () => ({ sha: workerData.sha }),
           checkClaim: () => null, readIsCrossRepository: () => false,
           run: () => ({ status: 0, stdout: workerData.sha }),
           ledger: { claim: (...args) => { const won = ledger.claim(...args); claims.push(won); return won; } },

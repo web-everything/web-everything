@@ -67,7 +67,7 @@ function scriptedRun(script) {
   const run = (cmd, args, opts) => {
     calls.push({ cmd, args, env: opts?.env, cwd: opts?.cwd });
     const key = args[0]; // git subcommand
-    const handler = script[key];
+    const handler = script[key] ?? (key === 'rev-parse' && args[1]?.endsWith('^{commit}') ? { stdout: 'a'.repeat(40) } : undefined);
     const res = typeof handler === 'function' ? handler(args, opts) : handler;
     return { status: 0, stdout: '', stderr: '', ...(res || {}) };
   };
@@ -550,6 +550,35 @@ describe('fix evidence is drain-transient', () => {
 
 
 describe('strict mechanical rebase evidence (drain defaults preserved)', () => {
+  it.each([true, false])('strict pins the fetched SHA across a moved tracking ref and uses plain fast-forward push (moved=%s)', moved => {
+    const pinned = 'a'.repeat(40), advanced = 'b'.repeat(40);
+    let tip = pinned;
+    const { run, calls } = scriptedRun({ ...MERGE_TREE_CLEAN, ...RESOLVED_PLUMBING,
+      'rev-parse': args => ({ stdout: args[1].endsWith('^{commit}') ? tip : 'other-tree' }),
+      'merge-tree': () => { if (moved) tip = advanced; return MERGE_TREE_CLEAN['merge-tree']; },
+      push: () => ({ status: tip === pinned ? 0 : 1, stderr: 'non-fast-forward' }),
+    });
+    const result = rebaseDropManifest({ laneRef: 'lane/pinned', strict: true, run });
+    expect(result.action).toBe(moved ? 'error' : 'rebased');
+    expect(calls.slice(0, 3).map(c => c.args)).toEqual([
+      ['fetch', 'origin', 'lane/pinned'], ['rev-parse', 'origin/lane/pinned^{commit}'],
+      ['merge-tree', '--write-tree', 'origin/main', pinned],
+    ]);
+    expect(calls.find(c => c.args[0] === 'commit-tree').args.slice(2, 6)).toEqual(['-p', 'origin/main', '-p', pinned]);
+    expect(calls.filter(c => c.args[0] === 'diff').map(c => c.args.slice(2))).toEqual([
+      [`origin/main...${pinned}`], ['origin/main', 'resolvedTree'.padEnd(40, '0')],
+    ]);
+    expect(calls.find(c => c.args[0] === 'push').args).toEqual(['push', 'origin', `${'newCommitSha'.padEnd(40, '0')}:refs/heads/lane/pinned`]);
+    expect(calls.filter(c => c.args.some(a => a.includes('origin/lane/pinned')))).toHaveLength(1);
+  });
+
+  it.each([{ status: 1, stdout: 'a'.repeat(40) }, { stdout: '' }, { stdout: 'invalid' }])(
+    'strict unreadable pinned tip refuses before merge with human fallback (%#)', evidence => {
+      const { run, calls } = scriptedRun({ 'rev-parse': evidence });
+      expect(rebaseDropManifest({ laneRef: 'lane/unreadable', strict: true, run })).toMatchObject({ action: 'error', reason: expect.stringContaining('human review') });
+      expect(calls.map(c => c.args[0])).toEqual(['fetch', 'rev-parse']);
+    });
+
   it.each([true, false])('failed ls-tree refuses commit/push only in strict mode (strict=%s)', strict => {
     const { run, calls } = scriptedRun({ ...MERGE_TREE_CLEAN, ...RESOLVED_PLUMBING,
       'ls-tree': { status: 1, stdout: '.fix-evidence.md\n', stderr: 'unreadable tree' },
@@ -626,7 +655,7 @@ describe('strict mechanical rebase evidence (drain defaults preserved)', () => {
     expect(manifestConflictDisposition(parsed)).toBe('clean');
     const { run, calls } = scriptedRun({ 'merge-tree': { status: 1, stdout: 'a'.repeat(40) + '\nunknown format' } });
     expect(rebaseDropManifest({ laneRef: 'lane/unknown', run, strict: true }).action).toBe('skip');
-    expect(calls.map(c => c.args[0])).toEqual(['fetch', 'merge-tree']);
+    expect(calls.map(c => c.args[0])).toEqual(['fetch', 'rev-parse', 'merge-tree']);
   });
 
   it.each([[null, 0], [0, null], [NaN, 0], [0, Infinity], [undefined, 3]])('strict unreadable counts %s/%s refuse', (prev, post) => {

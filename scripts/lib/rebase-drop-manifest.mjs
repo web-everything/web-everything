@@ -177,10 +177,18 @@ function rebaseDropManifestCore({
   // bare name fail with "not something we can merge" and the whole auto-rebase is inert. Fetch the lane ref
   // first (so the remote-tracking ref is current), then feed the RESOLVED `<remote>/<laneRef>` to the merge
   // inputs. The PUSH still targets the bare `refs/heads/<laneRef>` (that part was always correct).
-  const mergeRef = readRef || `${remote}/${laneRef}`;
+  let mergeRef = readRef || `${remote}/${laneRef}`;
   if (fetch) {
     const f = run('git', ['fetch', remote, laneRef], { cwd });
     if (f.status !== 0) return { action: 'error', reason: `fetch ${laneRef} failed (${(f.stderr || '').split('\n')[0]})` };
+  }
+
+  if (strict) {
+    const pinned = run('git', ['rev-parse', `${mergeRef}^{commit}`], { cwd });
+    if (pinned.status !== 0 || !/^[a-f0-9]{40}$/i.test(String(pinned.stdout ?? '').trim())) {
+      return { action: 'error', reason: 'lane tip unreadable; use existing fix dispatch or human review' };
+    }
+    mergeRef = String(pinned.stdout).trim();
   }
 
   const mt = run('git', ['merge-tree', '--write-tree', base, mergeRef], { cwd });
