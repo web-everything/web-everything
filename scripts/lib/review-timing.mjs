@@ -249,7 +249,9 @@ export function fixPushGate({ headSha, rowsHead, rowsComplete, rosterSource, pre
   // Held review gates alone are no CI evidence: at least one non-held required check must have finished.
   if (resolved.state !== 'unknown' && Object.values(resolved.perName).some(value => ['pass', 'fail'].includes(value.state))
     && Object.values(resolved.perName).every(value =>
-      value.state !== 'pending' || value.reasons.every(reason => reason === 'needs-rerun')))
+      // A cancelled run is finished (red); a stale one is not, so it keeps waiting as on main.
+      value.state !== 'pending' || (value.reasons.every(reason => reason === 'needs-rerun')
+        && value.rows.every(row => String(row.conclusion ?? row.state ?? '').toLowerCase() !== 'stale'))))
     return { action: 'push', reason: 'ci-complete', ciFailures: fixReadiness(input).ciFailures };
   if (Number.isFinite(now) && Number.isFinite(deadline) && now >= deadline)
     return { action: 'push', reason: 'bound', deadline };
