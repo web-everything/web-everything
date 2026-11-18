@@ -59,9 +59,8 @@ function processFixture(options = {}) {
 }
 
 describe('PTY collection', () => {
-  it('uses home cwd, answers trust, sends Esc then usage and two interrupts without agy settings writes', async () => {
+  it('uses home cwd, sends Esc then usage and two interrupts without agy settings writes', async () => {
     const h = processFixture();
-    h.child.stdout.write('trust this folder');
     await vi.advanceTimersByTimeAsync(3300);
     h.child.stdout.write(SCREEN);
     await vi.advanceTimersByTimeAsync(300);
@@ -70,7 +69,7 @@ describe('PTY collection', () => {
     expect(h.spawnFn).toHaveBeenCalledWith('sh', ['-c', 'cat | script -q /dev/null agy'], {
       cwd: '/trusted-home', detached: true, stdio: ['pipe', 'pipe', 'pipe'],
     });
-    expect(h.writes).toEqual(['\r', '\x1b', '/usage\r', '\x03', '\x03']);
+    expect(h.writes).toEqual(['\x1b', '/usage\r', '\x03', '\x03']);
     expect(h.kill).toHaveBeenCalledWith(-1234, 'SIGKILL');
   });
   it('kills only the explicit child PID on hard timeout when usage never appears', async () => {
@@ -89,6 +88,13 @@ describe('PTY collection', () => {
     expect(h.kill).toHaveBeenCalledTimes(1);
     expect(h.kill).toHaveBeenCalledWith(-1234, "SIGKILL");
   });
+  it('fails closed instead of answering a folder-trust prompt', async () => {
+    const h = processFixture();
+    const assertion = expect(h.promise).rejects.toThrow('trust this folder');
+    h.child.stdout.write('Do you trust this folder?');
+    await assertion;
+    expect(h.writes).toEqual([]);
+  });
   it.each(['error', 'close'])('fails closed on process %s before usage', async event => {
     const h = processFixture();
     const assertion = expect(h.promise).rejects.toThrow();
@@ -96,6 +102,8 @@ describe('PTY collection', () => {
     await assertion;
   });
 });
+
+const complete = at => ({ at: new Date(at).toISOString(), five_hour: { used_percentage: 1, resets_at: 1 }, seven_day: { used_percentage: 1, resets_at: 1 } });
 
 function fileFixture(previous) {
   const io = { readFile: vi.fn(async () => {
@@ -108,12 +116,21 @@ function fileFixture(previous) {
 
 describe('snapshot persistence', () => {
   it('skips a snapshot younger than fifteen minutes without spawning or writing', async () => {
-    const h = fileFixture(JSON.stringify({ at: new Date(NOW - 899999).toISOString() }));
+    const h = fileFixture(JSON.stringify(complete(NOW - 899999)));
     expect(await runAgyUsageReader(h)).toEqual({ skipped: true });
     expect(h.collect).not.toHaveBeenCalled();
     expect(h.io.writeFile).not.toHaveBeenCalled();
   });
-  it.each([undefined, JSON.stringify({ at: new Date(NOW - 900000).toISOString() })])(
+  it.each([
+    JSON.stringify({ at: new Date(NOW + 86400000).toISOString() }),
+    JSON.stringify({ at: new Date(NOW - 1000).toISOString() }),
+    JSON.stringify({ ...complete(NOW + 86400000) }),
+  ])('does not let a future-dated or incomplete previous record suppress collection', async previous => {
+    const h = fileFixture(previous);
+    await runAgyUsageReader(h);
+    expect(h.collect).toHaveBeenCalled();
+  });
+  it.each([undefined, JSON.stringify(complete(NOW - 900000))])(
     'collects missing or expired snapshots, writes private temp file then atomically renames', async previous => {
       const h = fileFixture(previous);
       await runAgyUsageReader(h);
@@ -132,7 +149,7 @@ describe('snapshot persistence', () => {
     expect(h.io.writeFile).not.toHaveBeenCalled();
     expect(h.io.rename).not.toHaveBeenCalled();
   });
-  it.each(['garbage', '{}'])('refuses unreadable previous evidence', async previous => {
+  it.each(['garbage'])('refuses unreadable previous evidence', async previous => {
     const h = fileFixture(previous);
     await expect(runAgyUsageReader(h)).rejects.toThrow();
     expect(h.collect).not.toHaveBeenCalled();

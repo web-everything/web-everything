@@ -41,7 +41,7 @@ export function collectAgyUsage({ home = homedir(), timeoutMs = 45000, spawnFn =
   maxBytes = 1024 * 1024 } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawnFn('sh', ['-c', 'cat | script -q /dev/null agy'], { cwd: home, detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
-    let screen = '', bytes = 0, trusted = false, requested = false, stopping = false, settled = false;
+    let screen = '', bytes = 0, requested = false, stopping = false, settled = false;
     const timers = [];
     const later = (fn, ms) => timers.push(setTimeout(fn, ms));
     const finish = (error, value) => {
@@ -62,9 +62,8 @@ export function collectAgyUsage({ home = homedir(), timeoutMs = 45000, spawnFn =
       bytes += Buffer.byteLength(data);
       if (bytes > maxBytes) return finish(new Error('agy output exceeded bound; inspect agy manually and retry'));
       screen += data.toString();
-      if (!trusted && /trust this folder/i.test(stripVTControlCharacters(screen))) {
-        trusted = true;
-        send('\r');
+      if (/trust this folder/i.test(stripVTControlCharacters(screen))) {
+        return finish(new Error('agy asks to trust this folder; trust it manually once and retry'));
       }
       if (!requested || stopping) return;
       let parsed;
@@ -95,8 +94,10 @@ export async function runAgyUsageReader({ home = homedir(), io = fs, now = Date.
   try {
     const previous = JSON.parse(await io.readFile(target, 'utf8'));
     const at = Date.parse(previous.at);
-    if (!Number.isFinite(at)) throw new Error('Invalid previous agy usage timestamp');
-    if (now() - at < settings.minIntervalMinutes * 60000) return { skipped: true };
+    const valid = w => Number.isFinite(w?.used_percentage) && Number.isFinite(w?.resets_at);
+    // Only a complete, non-future previous record may suppress collection.
+    if (Number.isFinite(at) && at <= now() && valid(previous.five_hour) && valid(previous.seven_day)
+      && now() - at < settings.minIntervalMinutes * 60000) return { skipped: true };
   } catch (error) { if (error.code !== 'ENOENT') throw error; }
   const result = await collect({ home, timeoutMs: settings.timeoutMs, now });
   await io.mkdir(join(home, '.plateau'), { recursive: true });
