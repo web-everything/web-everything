@@ -3364,6 +3364,6 @@ it.each(['nonempty after recording', 'probe failure'])('R979 recovery refuses %s
       completedRecorded: false, failedSeatCount: 0, inFlight: false, queued: false }) });
   expect(result).toMatchObject({ action: 'skip', why: 'empty net diff not proven for this head; inspect stored evidence' });
   expect(gitExec).toHaveBeenCalledTimes(3);
-  expect(gitExec.mock.calls[1][1]).toEqual(['--no-replace-objects', 'merge-base', '--end-of-options', 'origin/main', head]);
+  expect(gitExec.mock.calls[1][1]).toEqual(['--no-replace-objects', 'merge-base', '--all', '--end-of-options', 'origin/main', head]);
   expect(gitExec.mock.calls[2][1]).toContain('diff');
 });

@@ -498,7 +498,8 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
   };
 }
 
-/** Raw, head-scoped evidence only. Never select an older accepting verdict over a newer rejection. */
+/** Raw, head-scoped evidence only. Never select an older accepting verdict over a newer rejection.
+ * Strict store errors (including MissingStoreError) propagate before any zero-seat proof is built. */
 // Match resolveRunsDir's override precedence without migrating runs during a raw read.
 export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir = env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(env),
   list = listRunIds, read = readRun, stat = statSync, scanSettings = { env }, warn, now = Date.now(),
@@ -926,7 +927,8 @@ export function historicalCardOnlySkipCandidate(old, proof = {}) {
     && !old.recorded && !old.inFlight && !old.queued;
 }
 
-/** Absence of a review payload is not an accept. Labels alone never schedule a post-accept pass. */
+/** Absence of a review payload is not an accept. Labels alone never schedule a post-accept pass.
+ * Missing/unreadable scorecards throw: callers must hold, never infer a clear or retry from zero seats. */
 export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env, cwd, gitExec,
   runsDir = resolveRunsDir(), list = listRunIds, read = readRun, stat = statSync, lookup, scanSettings = { env }, warn, now = Date.now(), isAlive = pidExistence, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime,
   readScorecards = () => readStore({ path: resolveScorecardStorePath(env), strict: true }).records } = {}) {

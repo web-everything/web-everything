@@ -81,7 +81,8 @@ export function publishStoredRedTeamResult({ status, listComments, postComment, 
     };
     const legacy = status.result === 'ran';
     let result = status.result;
-    // Throws unless the exact-head seat row is complete and self-consistent.
+    // Throws unless the exact-head seat row is complete and self-consistent. MissingStoreError from
+    // either strict reader reaches holdLegacy too: missing history cannot seal a legacy result clear.
     const recoverLegacy = () => {
       const row = readSeatRow({ repo, pr, head });
       if (!row || row.rev !== head || !Array.isArray(row.findings)

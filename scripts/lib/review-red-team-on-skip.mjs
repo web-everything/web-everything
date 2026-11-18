@@ -780,6 +780,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       // Even a policy-settlement fallback must not turn a spent retry into fresh provider work.
       if (mode === 'fresh' && status?.retryCount >= 1) return skip('red-team retry already spent; inspect stored evidence');
       return dispatchDecision({ action: 'dispatch', mode, why: mode === 'resume' ? 'recorded pass needs its result comment/effects' : 'head never had a red-team pass' });
+    // Includes MissingStoreError from strict witness/drain reads; zero-seat retry proof was never established.
     } catch { return skip('red-team evidence unreadable; inspect stored evidence before retrying'); }
   });
 }

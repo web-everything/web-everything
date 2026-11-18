@@ -312,6 +312,7 @@ export function execReadRaw(file, args, options = {}) {
 
 /** The real effects, each one command. `root` is the checkout the arc runs from (the daemon's clone). */
 export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync, exec = execReadRaw, readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readEvidence = readDrainRedTeamEvidence,
+  // MissingStoreError propagates through witness, quota and queued admission checks; no empty-history fallback.
   readSeatRecords = () => createRedTeamIo({ root, env }).readRecords({ strict: true }),
   readWitness = key => readRecoveryWitness({ ...key, env, readScorecards: readSeatRecords }), recoveryProbe = defaultRecoveryProbe(),
   queueBaseline = () => resolveLiveQueueBaseline({ checkoutRoot: root, env }),

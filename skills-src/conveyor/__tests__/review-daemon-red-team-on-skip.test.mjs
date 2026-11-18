@@ -1,6 +1,7 @@
 import { it, expect, vi, afterAll, beforeEach } from 'vitest';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { runRedTeamOnSkip } from '../../../scripts/lib/review-red-team-on-skip.mjs';
 import { cliReviewTickOpts, defaultReviewHostAdmission, runReviewTick, sharedHostBudget } from '../review-daemon.mjs';
@@ -11,6 +12,7 @@ import * as gateCatchUp from '../../../scripts/lib/red-team-gate-catchup.mjs';
 import * as redTeamRecovery from '../../../scripts/lib/review-red-team-on-skip.mjs';
 import * as repoProfiles from '../../../scripts/lib/repo-profile.mjs';
 import * as hostSample from '../../../scripts/lib/host-sample.mjs';
+import * as policyCascade from '../../../scripts/lib/policy-cascade.mjs';
 import { planReconcile } from '../../../scripts/conveyor/reconcile-core.mjs';
 import { buildReviewedShaMarker } from '../../../scripts/lib/review-escalation.mjs';
 
@@ -194,6 +196,7 @@ it('CLI label repair exception preserves original PRs and still dispatches red-t
 
 it.each(['fresh', 'resume'])('CLI tick options recover an already-reviewed head in %s mode', mode => {
   const repo = 'web-everything/web-everything', head = (mode === 'fresh' ? 'c' : 'd').repeat(40), pr = 5762;
+  vi.spyOn(repoProfiles, 'repoProfile').mockReturnValue({ checkoutPath: 'subject-checkout' });
   const readEvidence = vi.spyOn(redTeamEvidence, 'readDrainRedTeamEvidence').mockReturnValue({
     recorded: mode === 'resume', seatRecorded: mode === 'resume', completedRecorded: mode === 'resume', loopPayload: {
       verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } },
@@ -216,7 +219,7 @@ it.each(['fresh', 'resume'])('CLI tick options recover an already-reviewed head 
       tagRound: vi.fn(), tagStatus: vi.fn(), statusCandidates: () => [],
     });
     expect(out.redTeamOnSkip?.dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode }]);
-    expect(readEvidence).toHaveBeenCalledWith({ repo, pr, head });
+    expect(readEvidence).toHaveBeenCalledWith({ repo, pr, head, env: process.env, cwd: 'subject-checkout', gitExec: execFileSync });
     expect(readStatus).toHaveBeenCalledWith({ repo, pr, head });
     expect(dispatch).toHaveBeenCalledOnce();
     expect(dispatch).toHaveBeenCalledWith({ pr, repo, redTeamOnly: true, redTeamMode: mode });
@@ -245,7 +248,7 @@ it.each(['fresh', 'resume'])('real reconcile recovers a queued accepted head in 
       readStatus: () => mode === 'resume' ? { status: 'finished', result: 'ran' } : null,
       setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map() }),
   });
-  expect(readEvidence).toHaveBeenCalledWith({ repo, pr, head });
+  expect(readEvidence).toHaveBeenCalledWith({ repo, pr, head, env: process.env, cwd: undefined, gitExec: execFileSync });
   expect(out.redTeamOnSkip.dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode }]);
 });
 
@@ -341,6 +344,8 @@ it('a throwing host check blocks recovery-only starts', () => {
 });
 
 it.each([38, 'throws'])('CLI queue uses the shared CPU sample (%s) and preserves lane/budget bounds', idle => {
+  // Pin the policy input as well as the environment floor: an operator DB override outranks env.
+  vi.spyOn(policyCascade, 'readOperatorPolicy').mockReturnValue({ minConcurrent: 2 });
   vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
   vi.spyOn(hostSample, 'sampleHost').mockImplementation(() => {
     if (idle === 'throws') throw new Error('sample unavailable');

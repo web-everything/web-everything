@@ -470,7 +470,7 @@ it.each(['nonempty after recording', 'probe error', 'oversized probe', 'missing 
       '--no-replace-objects', 'rev-parse', '--verify', '--end-of-options', `${base}^{commit}`,
     ], options);
     expect(f.io.gitExec).toHaveBeenNthCalledWith(2, 'git', [
-      '--no-replace-objects', 'merge-base', '--end-of-options', 'origin/main', head,
+      '--no-replace-objects', 'merge-base', '--all', '--end-of-options', 'origin/main', head,
     ], options);
     expect(f.io.gitExec).toHaveBeenNthCalledWith(3, 'git', [
       '--no-replace-objects', 'diff', '--no-ext-diff', '--no-textconv', '--no-renames',

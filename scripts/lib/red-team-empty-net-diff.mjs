@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
+import { MissingStoreError, readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 
 export const EMPTY_NET_DIFF_SKIP = Object.freeze({ status: 'skipped', policy: 'empty-net-diff',
   reason: 'red team skipped: empty net diff' });
@@ -11,7 +11,7 @@ const refused = reason => ({ exempt: false, reason });
 /**
  * The ONLY empty-net-diff exemption decision. Callers must supply the subject checkout and
  * the prior read/skip record, never a boolean claiming the records were readable. Read the actual
- * store without readStore's missing-file fallback. Unknown evidence keeps the red team owed;
+ * store in strict mode, distinguishing missing history from a present-empty store. Unknown evidence keeps the red team owed;
  * operators must inspect stored evidence (including oversized Git output) before retrying.
  */
 export function emptyDiffExemptionEvidence({ repo, pr, head, seatRecord, loopPayload = seatRecord?.loopPayload,
@@ -19,14 +19,11 @@ export function emptyDiffExemptionEvidence({ repo, pr, head, seatRecord, loopPay
   storePath = resolveScorecardStorePath(env), readFile = readFileSync, cwd, exec = execFileSync } = {}) {
   let store;
   try {
-    store = readFile(storePath, 'utf8');
+    store = readStore({ path: storePath, strict: true, read: path => readFile(path, 'utf8') });
   } catch (error) {
-    return refused(error?.code === 'ENOENT' ? 'store-missing' : 'store-unreadable');
+    return refused(error instanceof MissingStoreError ? 'store-missing'
+      : error?.message === 'scorecard store malformed' ? 'store-unparseable' : 'store-unreadable');
   }
-  try {
-    store = JSON.parse(store);
-    if (!store || !Array.isArray(store.records)) return refused('store-unparseable');
-  } catch { return refused('store-unparseable'); }
   if (typeof repo !== 'string' || !repo || !Number.isSafeInteger(Number(pr)) || Number(pr) <= 0
     || !sha(head) || !store.records.some(row => row?.dispatchKind === 'review-seat'
       && typeof row.seat === 'string' && row.seat.length > 0 && row.repo === repo

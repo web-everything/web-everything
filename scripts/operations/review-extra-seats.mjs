@@ -89,7 +89,7 @@ import { renameSourcePaths } from './review-pr.mjs';
 import { EXTRA_SEATS_ENV, RED_TEAM_ENV, extraSeatsEnabled, redTeamEnabled, redTeamOwedFor } from '../lib/review-red-team-policy.mjs';
 export { EXTRA_SEATS_ENV, RED_TEAM_ENV, extraSeatsEnabled, redTeamEnabled, redTeamOwedFor } from '../lib/review-red-team-policy.mjs';
 import { expectationForLens, huntBriefForLens } from '../lib/review-core.mjs';
-import { appendScorecard, readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
+import { appendScorecard, MissingStoreError, readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { scrubPublish } from '../lib/secret-scrub.mjs';
 import { parseDelegationMarker } from '../lib/delegation-marker.mjs';
 import { logDelegationTrial } from '../conveyor/log-delegation-trial.mjs';
@@ -1737,7 +1737,7 @@ function redTeamRecoveryGuard({ pr, repo, head, redTeamMode, redTeamAdmission },
   try {
     records = io.readRecords({ strict: true });
     if (!Array.isArray(records)) throw Error('invalid scorecards');
-  } catch { return refuse('scorecard store unreadable'); }
+  } catch (error) { return refuse(error instanceof MissingStoreError ? 'scorecard store missing' : 'scorecard store unreadable'); }
   try {
     status = io.readRedTeamStatus({ pr, repo, head });
     if (status === undefined) throw Error('missing status evidence');
@@ -1832,8 +1832,9 @@ export async function speculateRedTeam({
     let records = [];
     try { records = io.readRecords({ strict: emptyClaim }); } catch (e) {
       if (resumeOnly) return { status: 'skipped', reason: 'resume-only: scorecard store unreadable — no call launched' };
-      io.log(`red team: could not read the scorecard store (${e.message}) — treating it as empty`);
+      if (emptyClaim && e instanceof MissingStoreError) return { status: 'skipped', reason: 'empty net diff not proven (store-missing) — inspect stored evidence before retrying; no call launched' };
       if (emptyClaim) return { status: 'skipped', reason: 'scorecard store unreadable — inspect stored evidence before retrying; no call launched' };
+      io.log(`red team: could not read the scorecard store (${e.message}) — treating it as empty`);
     }
     const prior = priorRedTeamRow(records, pr, rev, repo);
     if (resumeOnly && !prior) return { status: 'skipped', reason: 'resume-only: no clean prior red-team row — no call launched' };

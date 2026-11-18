@@ -4466,8 +4466,8 @@ diff tests must return a valid matching merge-base and assert the diff call occu
 
 `scripts/lib/red-team-empty-net-diff.mjs#emptyDiffExemptionEvidence` owns the exemption.
 Callers supply the subject repository's checkout explicitly; no cwd means no exemption.
-The function reads the scorecard file directly: `readStore({ strict: true })` still maps
-ENOENT to empty records and cannot establish file existence. A parseable store must
+The function uses `readStore({ strict: true })`, which throws `MissingStoreError` on
+ENOENT and preserves other read/parse failures. A parseable store must
 contain a review-seat row for the same repository, PR and pinned head. Payload shape,
 a historical skip, or an empty record array alone never grants clearance. Every Git
 probe disables replace objects, re-derives the merge-base and verifies the pinned range.
@@ -4479,3 +4479,14 @@ and removes or corrupts one item at a time, asserting the named refusal reason a
 that the intended Git step ran. Keep replacement-aware control probes deterministic
 with increasing commit dates. `review-job-red-team-skip.test.mjs` exercises production
 ENOENT handling through `speculateRedTeam` and proves no provider work starts.
+
+### Strict scorecard caller matrix
+
+`scripts/lib/__tests__/strict-scorecard-callers.test.mjs` keeps one table row per strict
+scorecard read site, including legacy publication, plus the retry, recovery planner and
+review-job consumers of those readers. Each row uses a real temporary store path in both
+missing and present-empty states. Missing history keeps recovery owed, refuses retry and
+exemption evidence, and holds publication for operator inspection. Present-empty history
+retains its previous behavior. `run-scorecard-store.test.mjs` separately pins the typed
+missing error and unchanged non-strict fallback. Run these and the affected red-team
+suites through heavy admission only.

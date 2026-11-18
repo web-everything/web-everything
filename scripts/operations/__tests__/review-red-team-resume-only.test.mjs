@@ -238,11 +238,12 @@ if (args[0] === 'pr' && args[1] === 'view' && args.includes('--json') && args.in
       expect(io.cliAvailable).toHaveBeenCalledOnce();
       expect(io.runSeat).not.toHaveBeenCalled();
     });
-  it('leaves normal full reviews free to resume without recovery readers', async () => {
+  it('lets normal full reviews resume despite unavailable advisory status, without recovery comments', async () => {
     const io = fakeIo('resume', { readRedTeamStatus: vi.fn(() => { throw Error('unavailable'); }),
       readRecoveryComments: vi.fn(() => { throw Error('unavailable'); }) });
     expect(await run(undefined, io)).toMatchObject({ status: 'resumed' });
-    expect(io.readRedTeamStatus).not.toHaveBeenCalled();
+    expect(io.readRedTeamStatus).toHaveBeenCalledOnce();
+    expect(io.readRedTeamStatus).toHaveBeenCalledWith({ repo, pr, head: rev });
     expect(io.readRecoveryComments).not.toHaveBeenCalled();
     noLaunch(io);
   });

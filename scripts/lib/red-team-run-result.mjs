@@ -26,7 +26,9 @@ export function redTeamStatusWithoutRun(row, { originalStatus } = {}) {
 /** One evidenced failed execution may retry. `ran` is the historical failure encoding; new writers use
  * `failed`. Both require exactly one failed seat, no completed seat, and an unspent durable retry.
  */
-export function failedRedTeamRetry(status, { failedSeatCount, completedRecorded } = {}) {
+export function failedRedTeamRetry(status, proof = {}) {
+  if (proof?.ok === false) return false;
+  const { failedSeatCount, completedRecorded } = proof;
   const result = status?.result;
   return (status?.retryCount === undefined || status.retryCount === 0)
     && (skippedRedTeamRetry(status, { failedSeatCount, completedRecorded }) || (status?.status === 'finished' && ['failed', 'ran'].includes(typeof result === 'string' ? result : result?.status)
@@ -35,7 +37,9 @@ export function failedRedTeamRetry(status, { failedSeatCount, completedRecorded 
 }
 
 /** A deterministic non-policy skip launched no seat. Its single fresh retry still spends the durable budget. */
-export function skippedRedTeamRetry(status, { failedSeatCount, completedRecorded } = {}) {
+export function skippedRedTeamRetry(status, proof = {}) {
+  if (proof?.ok === false) return false;
+  const { failedSeatCount, completedRecorded } = proof;
   const result = status?.result;
   const read = status?.loopPayload?.findings?.read;
   return status?.status === 'finished' && (typeof result === 'string' ? result : result?.status) === 'skipped'

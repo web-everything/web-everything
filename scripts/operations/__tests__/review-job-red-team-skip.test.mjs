@@ -1178,7 +1178,7 @@ it('review-extra-seats refuses an empty-net-diff exemption on a missing producti
   const f = newEmptyEvidence();
   rmSync(f.storePath);
   const production = createRedTeamIo({ env: {}, storePath: f.storePath });
-  expect(production.readRecords({ strict: true })).toEqual([]); // The legacy fallback is deliberately still present.
+  expect(() => production.readRecords({ strict: true })).toThrow('scorecard store missing');
   const io = { storePath: f.storePath, readRecords: vi.fn(production.readRecords), now: () => 1000, log: vi.fn(),
     cliAvailable: vi.fn(), reserveCalls: vi.fn(), runSeat: vi.fn(), append: vi.fn(), postComment: vi.fn() };
   const result = await speculateRedTeam({ repo, pr, lanePath: f.root, read: f.read, env: {} }, io);

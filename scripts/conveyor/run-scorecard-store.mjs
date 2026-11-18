@@ -295,26 +295,42 @@ function serializeStore(store) {
   return `${JSON.stringify(out, null, 2)}\n`;
 }
 
+/** Missing history is unknown evidence, never proof that no seat ran. */
+export class MissingStoreError extends Error {
+  constructor(path, cause) {
+    super('scorecard store missing; inspect stored evidence before retrying', { cause });
+    this.name = 'MissingStoreError';
+    this.code = 'SCORECARD_STORE_MISSING';
+    this.path = path;
+  }
+}
+
 /**
- * Read the store off disk. Never throws — an unreadable/malformed file degrades to an empty store, so a
+ * Read the store off disk. Non-strict reads never throw — an unreadable/malformed file degrades to an empty store, so a
  * caller always gets a usable (if empty) history rather than a crash mid-scoring-pass.
  *
  * On the first real read of the DEFAULT store in a process (no `path`, no injected `read`), the one-time
  * {@link migrateLegacyStore} runs first, so no reader ever sees the history the old tracked file held go
  * missing. An explicit `path` or injected IO reads exactly what it is given.
- * `strict` preserves read/parse failures for admission checks; absence remains an empty store.
+ * `strict` preserves read/parse failures for admission checks and throws MissingStoreError on absence.
  */
 export function readStore({ path, read, exists, strict = false } = {}) {
   ensureMigrated({ path, read, exists });
   const target = path ?? resolveScorecardStorePath();
   const doRead = read ?? ((p) => readFileSync(p, 'utf8'));
   try {
-    if ((!strict || exists) && !(exists ?? existsSync)(target)) return { version: 1, records: [] };
+    if ((!strict || exists) && !(exists ?? existsSync)(target)) {
+      if (strict) throw new MissingStoreError(target);
+      return { version: 1, records: [] };
+    }
     const parsed = parseStoreText(doRead(target));
     if (!parsed && strict) throw new Error('scorecard store malformed');
     return parsed ?? { version: 1, records: [] };
   } catch (error) {
-    if (strict && error.code !== 'ENOENT') throw error;
+    if (strict) {
+      if (error.code === 'ENOENT') throw new MissingStoreError(target, error);
+      throw error;
+    }
     return { version: 1, records: [] };
   }
 }
