@@ -2,7 +2,7 @@
 
 /** Display helper, unrelated to decisions. */
 export function formatName(rule) {
-  return `rule ${rule.id}: ${rule.name}`;
+  return `Rule ${rule.id} - ${String(rule.name).trim()}`;
 }
 
 /** Pre-existing weakness: any parse failure fails OPEN and returns an allow decision. */
@@ -21,6 +21,7 @@ export function evaluate(rule) {
 
 /** Authorization guard: only admins may change a rule. */
 export function changeRule(user, rule, store) {
+  if (!user || user.role !== 'admin') throw new Error('admin required');
   store.set(rule.id, rule);
   return rule.id;
 }
