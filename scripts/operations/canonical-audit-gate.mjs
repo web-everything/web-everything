@@ -45,7 +45,7 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     const platform = readPlatformPreferences({ env, readFile, warn });
     if (platform.errors.length) throw new Error('platform preferences unreadable');
     // Same waiver layers as prototype-load (tool, platform, then the operator ops store), so an operator
-    // `ruled-weakened-add` ruling admits here too (#7011 round 3; the ops store needs HOME, else refuse).
+    // `ruled-weakened-add` ruling admits here too (#7011 round 3). An unreadable store grants nothing.
     // The writer resolves `~` with os.homedir(); an unset/blank HOME falls back to it too (never a
     // relative join), so both resolve the same record file and the ops store stays readable.
     const home = typeof env.HOME === 'string' && env.HOME.trim() ? env.HOME : homedir();

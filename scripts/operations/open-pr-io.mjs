@@ -1,4 +1,3 @@
-import { checkCanonicalAuditForOpen } from './canonical-audit-gate.mjs';
 /**
  * @file scripts/operations/open-pr-io.mjs
  * @description THE IO SHELL of the `open-pr` declaration — one spawn of `we:scripts/pr-land.mjs`.
@@ -14,6 +13,7 @@ import { checkCanonicalAuditForOpen } from './canonical-audit-gate.mjs';
  *
  * IMPURE by construction: `child_process`.
  */
+import { checkCanonicalAuditForOpen } from './canonical-audit-gate.mjs';
 import { readMainCard, assertMachineTitle } from './machine-pr-title.mjs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { dirname, isAbsolute, join, sep } from 'node:path';
