@@ -157,6 +157,17 @@ describe('Forge key structure slice 1',()=>{
       blocked(Buffer.concat([prefix,outer]));
     }
   });
+  it.each(['LE','BE'])('blocks embedded UTF-16%s after odd and even binary prefixes',endian=>{
+    const text=JSON.stringify({kty:'oct',k:'a'});
+    const body=Buffer.from(text,'utf16le');
+    if(endian==='BE')body.swap16();
+    for(const prefixLength of [0,1,2,3])for(const suffixLength of [0,1]) {
+      const bytes=Buffer.concat([Buffer.alloc(prefixLength,255),body,Buffer.alloc(suffixLength,255)]);
+      blocked(bytes);
+      blocked(Buffer.from(bytes.toString('hex')));
+      blocked(Buffer.from(bytes.toString('base64')));
+    }
+  });
   it('fails closed on decoding depth and JSON nesting exhaustion',()=>{
     let text=JSON.stringify({kty:'oct',k:'a'});
     for(let depth=0;depth<10;depth++)text=JSON.stringify(text);

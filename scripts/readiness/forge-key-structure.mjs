@@ -171,11 +171,14 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
       const other=Buffer.from(view.subarray(0,view.length-view.length%2)).swap16();
       return encodedText(other.toString('utf16le'));
     };
-    const decoded=Buffer.from(bytes.toString('utf16le'));
-    emit(decoded,{utf16:continues(decoded)});
-    const whole=Buffer.from(bytes.subarray(0,bytes.length-bytes.length%2)).swap16();
-    const swapped=Buffer.from(whole.toString('utf16le'));
-    emit(swapped,{utf16:continues(swapped)});
+    // Embedded UTF-16 can begin at either byte alignment after binary prefixes.
+    for(const offset of [0,1]) {
+      const aligned=bytes.subarray(offset,offset+Math.floor((bytes.length-offset)/2)*2);
+      const decoded=Buffer.from(aligned.toString('utf16le'));
+      emit(decoded,{utf16:continues(decoded)});
+      const swapped=Buffer.from(Buffer.from(aligned).swap16().toString('utf16le'));
+      emit(swapped,{utf16:continues(swapped)});
+    }
   }
 }
 
