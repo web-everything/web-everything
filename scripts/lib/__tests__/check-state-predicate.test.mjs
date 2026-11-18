@@ -765,7 +765,14 @@ describe('required check evidence contract (PR1 acceptance)', () => {
     }
     expect(resolve([failed], { requiredNames: ['merge-gate'], holds: [bound] }).state).toBe('held');
     expect(resolve([{ ...failed, mergeGateReviewHold: bound }], { requiredNames: ['merge-gate'] }).state).toBe('held');
-    expect(resolve([row('review-gate', 'failure')], { requiredNames: ['review-gate'] }).state).toBe('held');
+    // An unannotated legacy review-gate failure is not review-owned: no bound hold evidence, so it stays a failure.
+    expect(resolve([row('review-gate', 'failure')], { requiredNames: ['review-gate'] }).state).toBe('fail');
+    expect(resolve([row('review-gate', 'failure', { detailsUrl: 'https://github.com/o/r/actions/runs/1/job/9' })],
+      { requiredNames: ['review-gate'], holds: [{ jobId: 8, headSha: head, holdIds: ['review-acceptance'] }] }).state).toBe('fail');
+    expect(resolve([row('review-gate', 'failure', { detailsUrl: 'https://github.com/o/r/actions/runs/1/job/9' })],
+      { requiredNames: ['review-gate'], holds: [{ jobId: 9, headSha: head, holdIds: ['review-acceptance'] }] }).state).toBe('held');
+    // A merge-gate run bound to a human-review hold on this head also proves the review-gate failure is review-owned.
+    expect(resolve([failed, row('review-gate', 'failure')], { requiredNames: ['merge-gate', 'review-gate'], holds: [bound] }).state).toBe('held');
   });
   it('8: unavailable, fallback, declared and malformed rosters fail closed without observed-name fallback', () => {
     for (const rosterSource of [undefined, 'unavailable', 'fallback', 'declared']) {
@@ -878,14 +885,14 @@ describe('pre-review evidence regressions', () => {
       }
     }
     // Complete metadata does not make foreign-head success current-head proof either.
-    for (const rows of [[{ ...success, head_sha: foreign }],
-      [{ ...success, head_sha: foreign }, held]]) {
-      expect(resolveRequiredChecks({ ...evidence, rows, requiredNames: rows.map(r => r.name) }).state)
-        .toBe('pending');
-    }
+    expect(resolveRequiredChecks({ ...evidence, rows: [{ ...success, head_sha: foreign }], requiredNames: ['test'] }).state)
+      .toBe('pending');
+    // An unannotated review-gate failure is a real failure, whatever the other rows say.
+    expect(resolveRequiredChecks({ ...evidence, rows: [{ ...success, head_sha: foreign }, held], requiredNames: ['test', 'review-gate'] }).state)
+      .toBe('fail');
     expect(resolveRequiredChecks({ ...evidence, rows: [success] }).state).toBe('pass');
     expect(resolveRequiredChecks({ ...evidence, rows: [success, held],
-      requiredNames: ['test', 'review-gate'] }).state).toBe('held');
+      requiredNames: ['test', 'review-gate'] }).state).toBe('fail');
   });
 });
 
