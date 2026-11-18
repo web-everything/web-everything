@@ -142,6 +142,63 @@ describe('planStampRestore — agreement and author-of-record provenance', () =>
 });
 
 describe('plain snapshot provenance — oldest author snapshot and agreeing ids', () => {
+  it('plans the anonymized #6989 User then Bot snapshots identically with an inline-code placeholder', () => {
+    const marker = buildAuthorActorMarker('00000000-0000-4000-8000-000000000000');
+    const fixture = (placeholder) => {
+      const body = `- \`codex-audit.mjs\` gains \`--invariants-file=${placeholder}\`. In this mode, the audit reads the supplied file.`;
+      return {
+        body, authorLogin: 'app/author-bot',
+        edits: [
+          edit(body, 'operator', '2026-11-17T11:00:00Z', 'User'),
+          edit(`${body}\n\n${marker}`, 'author-bot', '2026-11-17T10:00:00Z', 'Bot'),
+        ],
+      };
+    };
+    const baseline = plan(fixture('invariants.json'));
+    expect(baseline).toMatchObject({ action: 'restore', id: '00000000-0000-4000-8000-000000000000' });
+    const result = plan(fixture('<path>'));
+    expect(result).toEqual(JSON.parse(JSON.stringify(baseline).replaceAll('invariants.json', '<path>')));
+  });
+
+  it.each([
+    ['single backticks', '`<path>`'],
+    ['double backticks containing single backticks', '`` `<path>` ``'],
+    ['multiple spans', '`<path>` then ``<other>``'],
+  ])('ignores tag-like text in balanced inline code with %s', (_name, text) => {
+    expect(plan({ edits: [edit(`${text}\n\n${buildAuthorActorMarker(ID)}`)] }))
+      .toMatchObject({ action: 'restore', id: ID });
+  });
+
+  it.each([
+    ['bare placeholder', '<path>'],
+    ['details tag', '<details>'],
+    ['tag after balanced code', '`example` <path>'],
+    ['unbalanced backtick plus tag', '`<path>'],
+    ['unbalanced backtick after balanced tag span', '`<path>` then `'],
+    ['mismatched backtick runs', '``<path>`'],
+    ['unclosed comment hiding a marker', '<!-- hidden\n'],
+    ['unclosed comment inside inline code', '`<!-- hidden`\n'],
+    ['unclosed second comment', '<!-- closed --> <!-- hidden\n'],
+    ['tag in a backtick fence', '```html\n`<path>`\n```'],
+    ['tag in a tilde fence', '~~~html\n`<path>`\n~~~'],
+  ])('refuses %s with the HTML refusal', (_name, text) => {
+    expect(plan({ edits: [edit(`${text}\n${buildAuthorActorMarker(ID)}`)] })).toEqual({
+      action: 'refuse', reason: 'unsupported HTML edit snapshot; inspect complete GitHub history manually',
+    });
+  });
+
+  it('refuses a standalone-looking stamp inside a multiline HTML attribute without writing', async () => {
+    const diff = `<div\n data-note="\n${buildAuthorActorMarker(ID)}\n">`;
+    const edits = [edit(diff)];
+    const expected = {
+      action: 'refuse', reason: 'unsupported HTML edit snapshot; inspect complete GitHub history manually',
+    };
+    expect(plan({ edits })).toEqual(expected);
+    const seams = io({ readEdits: vi.fn(() => edits) });
+    expect(await restoreAuthorStamp(seams)).toEqual(expected);
+    expect(seams.writeBody).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['word-diff deletion', `[-${buildAuthorActorMarker(ID)}-]`],
     ['word-diff insertion', `{+${buildAuthorActorMarker(ID)}+}`],

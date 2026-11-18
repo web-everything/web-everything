@@ -11,6 +11,25 @@ const live = (exec) => createMqLiveReader(exec);
 const refusal = (reason) => ({ action: 'refuse', reason });
 const safe = (value) => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
 
+// Only equal-length backtick runs close an inline span. An unmatched run makes the
+// whole line ambiguous, so retain its original HTML evidence rather than hiding it.
+function outsideInlineCode(line) {
+  let delimiter;
+  let start = 0;
+  let plain = '';
+  for (const run of line.matchAll(/`+/g)) {
+    if (!delimiter) {
+      plain += line.slice(start, run.index);
+      delimiter = run[0];
+    } else if (run[0] === delimiter) {
+      plain += ' ';
+      start = run.index + run[0].length;
+      delimiter = undefined;
+    }
+  }
+  return delimiter ? line : plain + line.slice(start);
+}
+
 /** One bounded request. Truncation is not agreement: operators must investigate the full history. */
 export function readAuthorStampEdits(pr, { repo, exec = execFileSyncThrottled } = {}) {
   const parts = typeof repo === 'string' ? repo.split('/') : [];
@@ -59,13 +78,18 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
     if (/^@@ .* @@/m.test(edit.diff) || /\[-|-\]|\{\+|\+\}/.test(edit.diff)) {
       return refusal('unsupported delta edit snapshot; inspect complete GitHub history manually');
     }
-    if (/<\/?[a-z][^>]*>/i.test(edit.diff)) {
-      return refusal('unsupported HTML edit snapshot; inspect complete GitHub history manually');
-    }
     const markers = [];
+    const htmlLines = [];
     let fence;
     for (const line of edit.diff.split(/\r\n|[\r\n]/)) {
       const delimiter = line.match(/^[ \t]{0,3}(`{3,}|~{3,})(.*)$/);
+      // Never let a multiline comment hide a later standalone stamp. Fenced tags
+      // remain unsupported; only balanced, single-line inline code is exempt.
+      const unclosedComment = [...line.matchAll(/<!--/g)].some((opener) => line.indexOf('-->', opener.index + 4) === -1);
+      if (unclosedComment) {
+        return refusal('unsupported HTML edit snapshot; inspect complete GitHub history manually');
+      }
+      htmlLines.push(fence || delimiter ? line : outsideInlineCode(line));
       if (line.includes('authored-by-actor:')) {
         // A stamp is evidence only as a whole, unindented line outside code fences.
         const marker = line.match(/^(<!--[ \t]*authored-by-actor:[^<>\r\n]*-->)[^\S\r\n]*$/)?.[1];
@@ -78,6 +102,11 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
         if (!fence) fence = delimiter[1];
         else if (delimiter[1][0] === fence[0] && delimiter[1].length >= fence.length && !delimiter[2].trim()) fence = undefined;
       }
+    }
+    // Tags can span lines and contain an apparently standalone stamp in an attribute.
+    // Preserve snapshot-wide detection after exempting only validated inline spans.
+    if (/<\/?[a-z][^>]*>/i.test(htmlLines.join('\n'))) {
+      return refusal('unsupported HTML edit snapshot; inspect complete GitHub history manually');
     }
     // GitHub lists newest first for equal timestamps: the later position is older.
     if (!oldest || Date.parse(edit.createdAt) <= Date.parse(oldest.createdAt)) {
