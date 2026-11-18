@@ -466,11 +466,7 @@ it('enrichPrsWithAlreadyLandedFacts skips a PR with neither conflict label nor D
   expect(out[0].alreadyLandedInMain).toBeUndefined();
 });
 
-it.each([
-  { labels: [{ name: 'review:changes' }, { name: 'merge-status:conflicting' }] },
-  { labels: [{ name: 'review:changes' }], mergeStateStatus: 'DIRTY' },
-  { labels: [], mergeStateStatus: 'dirty' },
-])('enrichPrsWithAlreadyLandedFacts attaches alreadyLandedInMain with the attributed carrier PR when every change matches (PR #2752\'s real shape), evidence %j', async (conflictEvidence) => {
+async function expectAttachesCarrierPr(conflictEvidence) {
   const { enrichPrsWithAlreadyLandedFacts } = await import('../reconcile-pass.mjs');
   const pr = {
     number: 2752, headRefName: 'lane/4034-critical-work-gate', headRefOid: HEAD_2752,
@@ -495,13 +491,21 @@ it.each([
   expect(out[0].alreadyLandedInMain).toEqual({ carrierPr: 2759 });
   // one pulls lookup per DISTINCT matched commit, never one per file.
   expect(readPulls).toHaveBeenCalledTimes(1);
+}
+
+it('enrichPrsWithAlreadyLandedFacts attaches alreadyLandedInMain with the attributed carrier PR when every change matches (PR #2752\'s real shape)', async () => {
+  await expectAttachesCarrierPr({ labels: [{ name: 'review:changes' }, { name: 'merge-status:conflicting' }] });
 });
 
-it.each([
-  { labels: [{ name: 'merge-status:conflicting' }] },
-  { labels: [], mergeStateStatus: 'DIRTY' },
-  { labels: [], mergeStateStatus: 'dirty' },
-])('enrichPrsWithAlreadyLandedFacts leaves the PR untouched when even one change has no match — never guesses partial containment, evidence %j', async (conflictEvidence) => {
+it('enrichPrsWithAlreadyLandedFacts attaches alreadyLandedInMain on a DIRTY merge state with no conflict label', async () => {
+  await expectAttachesCarrierPr({ labels: [{ name: 'review:changes' }], mergeStateStatus: 'DIRTY' });
+});
+
+it('enrichPrsWithAlreadyLandedFacts reads a lower-case dirty merge state as conflict evidence too', async () => {
+  await expectAttachesCarrierPr({ labels: [], mergeStateStatus: 'dirty' });
+});
+
+async function expectLeavesPartialMatchUntouched(conflictEvidence) {
   const { enrichPrsWithAlreadyLandedFacts } = await import('../reconcile-pass.mjs');
   const pr = {
     number: 2752, headRefName: 'lane/4034-critical-work-gate', headRefOid: HEAD_2752,
@@ -516,13 +520,18 @@ it.each([
     fetchRef: vi.fn(), readMergeBase: () => BASE_2752, readChanges, findMatchingCommit, readPulls: vi.fn(),
   });
   expect(out[0].alreadyLandedInMain).toBeUndefined();
+}
+
+it('enrichPrsWithAlreadyLandedFacts leaves the PR untouched when even one change has no match — never guesses partial containment', async () => {
+  await expectLeavesPartialMatchUntouched({ labels: [{ name: 'merge-status:conflicting' }] });
 });
 
-it.each([
-  { labels: [{ name: 'merge-status:conflicting' }] },
-  { labels: [], mergeStateStatus: 'DIRTY' },
-  { labels: [], mergeStateStatus: 'dirty' },
-])('enrichPrsWithAlreadyLandedFacts never guesses containment with no merge-base, no readable changes, or a non-sha head, evidence %j', async (conflictEvidence) => {
+it('enrichPrsWithAlreadyLandedFacts leaves a DIRTY-state PR untouched on a partial match', async () => {
+  await expectLeavesPartialMatchUntouched({ labels: [], mergeStateStatus: 'DIRTY' });
+  await expectLeavesPartialMatchUntouched({ labels: [], mergeStateStatus: 'dirty' });
+});
+
+async function expectNeverGuessesContainment(conflictEvidence) {
   const { enrichPrsWithAlreadyLandedFacts } = await import('../reconcile-pass.mjs');
   const pr = { number: 2752, headRefOid: HEAD_2752, ...conflictEvidence };
   const readChanges = vi.fn(() => []);
@@ -535,6 +544,15 @@ it.each([
   const hostile = { ...pr, headRefOid: '--output=/x' };
   expect(enrichPrsWithAlreadyLandedFacts([hostile], { fetchRef: vi.fn(), readMergeBase })[0]).toBe(hostile);
   expect(readMergeBase).not.toHaveBeenCalled();
+}
+
+it('enrichPrsWithAlreadyLandedFacts never guesses containment with no merge-base, no readable changes, or a non-sha head', async () => {
+  await expectNeverGuessesContainment({ labels: [{ name: 'merge-status:conflicting' }] });
+});
+
+it('enrichPrsWithAlreadyLandedFacts never guesses containment for a DIRTY-state PR with no merge-base, no readable changes, or a non-sha head', async () => {
+  await expectNeverGuessesContainment({ labels: [], mergeStateStatus: 'DIRTY' });
+  await expectNeverGuessesContainment({ labels: [], mergeStateStatus: 'dirty' });
 });
 
 // #4265 (PR #2797 review, live incident 2026-09-27) — the stacked-base conflict-fix cap's own `currentSha` used
