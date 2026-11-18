@@ -490,7 +490,7 @@ export function classifyStartupFailureGate({ runs, headSha } = {}) {
   for (const run of runs) {
     if (!run || typeof run !== 'object' || Array.isArray(run)) return no('workflow run unreadable');
     if (typeof run.head_sha !== 'string' || typeof run.event !== 'string') return no('workflow run head/event unreadable');
-    if (run.head_sha !== headSha || run.event !== 'pull_request_target') continue;
+    if (run.head_sha !== headSha || run.event !== 'pull_request') continue;
     if (typeof run.path !== 'string') return no('workflow run path unreadable');
     if (run.path.split('@')[0] !== '.github/workflows/merge-gate.yml') continue;
     if (!Number.isSafeInteger(run.id) || run.id <= 0) return no('workflow run id unreadable');
@@ -506,7 +506,7 @@ export function classifyStartupFailureGate({ runs, headSha } = {}) {
 // The per-workflow endpoint lists no startup_failure runs; the repo-wide one does, so filter by path in the classifier.
 function readMergeGateRuns({ repo, headSha }) {
   const out = JSON.parse(execFileSyncThrottled('gh', ['api',
-    `repos/${repo}/actions/runs?head_sha=${encodeURIComponent(headSha)}&event=pull_request_target&per_page=100`],
+    `repos/${repo}/actions/runs?head_sha=${encodeURIComponent(headSha)}&event=pull_request&per_page=100`],
   { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 2 * 1024 * 1024, timeout: 30_000 }));
   if (!Array.isArray(out?.workflow_runs) || !Number.isSafeInteger(out.total_count) || out.total_count !== out.workflow_runs.length) throw new Error('workflow run list incomplete or unreadable');
   return out.workflow_runs;

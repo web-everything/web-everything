@@ -16,7 +16,7 @@ vi.mock('../gh-throttle.mjs', async importOriginal => ({
 
 const HEAD = 'a'.repeat(40);
 
-const startupRun = (extra = {}) => ({ id: 123, head_sha: HEAD, event: 'pull_request_target', path: '.github/workflows/merge-gate.yml', status: 'completed', conclusion: 'startup_failure', ...extra });
+const startupRun = (extra = {}) => ({ id: 123, head_sha: HEAD, event: 'pull_request', path: '.github/workflows/merge-gate.yml', status: 'completed', conclusion: 'startup_failure', ...extra });
 const nonStaleRuns = [
   ['newest success', [startupRun({ conclusion: 'success' })]],
   ['newest failure', [startupRun({ conclusion: 'failure' })]],
@@ -26,7 +26,8 @@ const nonStaleRuns = [
   ['no runs', []],
   ['older startup failure with newer success', [startupRun({ id: 124, conclusion: 'success' }), startupRun()]],
   ['other head', [startupRun({ head_sha: 'b'.repeat(40) })]],
-  ['other event', [startupRun({ event: 'pull_request' })]],
+  ['other event', [startupRun({ event: 'merge_group' })]],
+  ['legacy target run cannot authorize a new-trigger refresh', [startupRun({ event: 'pull_request_target' })]],
 ];
 const unreadableRuns = [
   ['undefined', undefined], ['null', null], ['object', {}], ['string', 'bad JSON'],
@@ -390,7 +391,7 @@ describe('startup-failure stale merge-gate refresh', () => {
     const o = options({ readGateRuns: undefined });
     expect((await handleStaleMergeGate(o)).handled).toBe(true);
     expect(execFileSyncThrottled).toHaveBeenCalledTimes(1);
-    expect(execFileSyncThrottled).toHaveBeenCalledWith('gh', ['api', `repos/o/r/actions/runs?head_sha=${HEAD}&event=pull_request_target&per_page=100`],
+    expect(execFileSyncThrottled).toHaveBeenCalledWith('gh', ['api', `repos/o/r/actions/runs?head_sha=${HEAD}&event=pull_request&per_page=100`],
       { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 2 * 1024 * 1024, timeout: 30_000 });
   });
   it('ignores other workflows\' runs and path-less runs when picking the newest Merge gate run', () => {
@@ -546,6 +547,7 @@ describe('rulesetSuggestion pins the required workflows to main', () => {
 
   it('requires merge-gate.yml, ci.yml and soak-replay-gate.yml from refs/heads/main', () => {
     const byPath = Object.fromEntries(result.requiredWorkflows.map((w) => [w.path, w]));
+    expect(result.requiredWorkflows).toContainEqual({ path: '.github/workflows/merge-gate.yml', ref: 'refs/heads/main' });
     for (const path of ['.github/workflows/merge-gate.yml', '.github/workflows/ci.yml', '.github/workflows/soak-replay-gate.yml']) {
       expect(byPath[path], path).toMatchObject({ ref: 'refs/heads/main' });
     }
@@ -864,7 +866,7 @@ describe('the "merge-gate is expected" enqueue refusal routes to the VERIFIED st
     try {
       expect(await handleRequiredWorkflowsRefusal(o)).toMatchObject({ handled: true });
       expect(transport).toHaveBeenLastCalledWith('gh', ['api',
-        `repos/${slug}/actions/runs?head_sha=${HEAD}&event=pull_request_target&per_page=100`], expect.any(Object));
+        `repos/${slug}/actions/runs?head_sha=${HEAD}&event=pull_request&per_page=100`], expect.any(Object));
       expect(o.refreshStalePr).toHaveBeenCalledWith(expect.objectContaining({ repo: slug, runId: 123 }));
       expect(o.record).toHaveBeenCalledWith(o.staleStatePath, `${slug}#6940`, expect.objectContaining({ fromHead: HEAD }));
       // An explicit slug on the next pass must share the local alias's atomic claim.

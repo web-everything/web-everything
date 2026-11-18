@@ -170,9 +170,9 @@ describe('PR concurrency checker self-tests', () => {
     },
   );
 
-  it('accepts the exact merge-gate exception for pull_request_target', () => {
+  it.each(['pull_request', 'pull_request_target'])('accepts the exact merge-gate exception for %s', event => {
     expect(prConcurrencyViolations(concurrencyFixture(mergeGateGroup, 'true')
-      .replace('pull_request:', 'pull_request_target:'))).toEqual([]);
+      .replace('pull_request:', `${event}:`))).toEqual([]);
   });
 
   it('rejects shared concurrency and false cancellation behind an aliased on', () => {

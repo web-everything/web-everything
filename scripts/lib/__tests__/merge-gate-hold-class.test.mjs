@@ -582,6 +582,19 @@ describe('PR-event candidacy deferral', () => {
     const out = deferCandidacyHoldsOnPrEvent(input, { mergeEvent: 'pull_request', setting: 'on' });
     expect(out.ok).toBe(false); expect(out.blocking).toEqual([row]);
   });
+  it('pull_request candidacy deferral cannot clear a workflow-edit human hold or fail-closed evidence', () => {
+    for (const status of ['hold', 'fail-closed']) {
+      const row = held('review-acceptance', 'human-only: workflow edit at the pinned PR head', status);
+      const input = pending();
+      input.results = input.results.map(result => result.id === row.id ? row : result);
+      input.blocking = input.blocking.map(result => result.id === row.id ? row : result);
+      const out = deferCandidacyHoldsOnPrEvent(input, { mergeEvent: 'pull_request', setting: 'on' });
+      expect(out.ok).toBe(false);
+      expect(out.blocking).toEqual([row]);
+      expect(out.results).toContainEqual(row);
+      expect(rawParse(`main CI (ci.yml@main): green\n${formatPrResult(out)}\nmerge-gate: HOLD — held`, 5011)).toMatchObject({ ok: false, results: out.results });
+    }
+  });
   it('resolves the second key independently across all layers, failing closed', () => {
     const resolve = options => resolveMergeGateHoldSetting({ key, ...options });
     expect(resolve({})).toEqual({ value: 'on', source: 'standard' });

@@ -23,13 +23,13 @@
  * SCRIPTS. The PR's body/labels/diff are read as DATA only, and every git read is pinned to the PR's exact head
  * SHA (`headRefOid`, the event's sha, or for a merge group each PR's sha inside the group) — never to the branch
  * NAME, which can move after the event or name a different ref (`pinnedHeadOf` / `gatherPrFacts`).
- * The PR leg runs on `pull_request_target`, so GitHub reads that run's YAML from main; the `merge_group` leg's YAML
- * comes from the group commit. So (1) the PR-leg run holds any PR whose PINNED change list touches a workflow or
- * action for a HUMAN (`facts.gatePaths` → `workflowEditFact`), and a PR must pass that run to enter the queue;
- * (2) the evaluation refuses to pass unless the RUNNING workflow file is byte-identical to main's
- * (`verifyRunningWorkflow`; fail closed); (3) a YAML edit that never reaches this script (`exit 0`, or a new
- * workflow posting `merge-gate`) is closed by the ruleset's `workflows` pin to refs/heads/main plus the GitHub
- * Actions integration-id restriction (`--print-ruleset`).
+ * The PR leg runs on `pull_request`. The repository ruleset "web-everything main: pinned CI workflows" pins
+ * this required workflow to refs/heads/main (layer 4), closing YAML edits that never reach this script (`exit 0`
+ * or a new workflow posting `merge-gate`), together with the GitHub Actions integration-id restriction.
+ * Layer 1 holds workflow/action edits at the PINNED head for a HUMAN (`facts.gatePaths` → `workflowEditFact`);
+ * layer 2 compares the RUNNING workflow byte-for-byte with main (`verifyRunningWorkflow`; fail closed even
+ * at refs/pull/N/merge); layer 3 refuses enqueue of workflow/action edits outside the human-only clearance.
+ * Main checkout, read-only permissions and fork-head refusal (`pinnedHeadOf`) remain mandatory.
  */
 import { readRedTeamCheckFact, readRedTeamGateSource, readRedTeamPublicationHoldFact, resolveWeAppId } from './lib/red-team-check-run.mjs';
 import { readRedTeamPublicationHold } from './lib/drain-red-team-evidence.mjs';
@@ -497,7 +497,7 @@ export function applyFreezeRecheck(verdict, first, recheck, { mainCi = undefined
  */
 export function mergeEventOfFlags(f, env = process.env) {
   if (f?.['merge-group'] || env?.GITHUB_EVENT_NAME === 'merge_group') return 'merge_group';
-  // `pull_request_target` is how merge-gate.yml runs for a PR (the YAML comes from main): same PR-leg semantics.
+  // `pull_request` is the workflow's PR leg; retain the legacy event alias with identical semantics.
   return env?.GITHUB_EVENT_NAME === 'pull_request' || env?.GITHUB_EVENT_NAME === 'pull_request_target' ? 'pull_request' : null;
 }
 
