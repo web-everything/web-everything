@@ -151,6 +151,12 @@ describe('accepted head with unresolved red-team send-back (PR #7031)', () => {
     expect(out.dispatch).toContainEqual(expect.objectContaining({ kind: 'review', phase: 'needs-review' }));
   });
 
+  it('an active referral hold blocks the red-team repair dispatch', () => {
+    const pr = makePr();
+    pr.referralHold = { head: pr.headRefOid, episode: 'e', count: 2, why: 'review paused: 2 referrals need a ruling' };
+    expect(plan(pr).dispatch.filter(d => d.mode === 'red-team-sent-back')).toEqual([]);
+  });
+
   it('one recorded red-team repair increases attempts by one without a rearm', () => {
     const pr = makePr();
     expect(plan(pr).dispatch[0].attempts).toBe(0);

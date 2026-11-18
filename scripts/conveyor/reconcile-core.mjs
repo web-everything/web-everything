@@ -2895,6 +2895,9 @@ export function planReconcile({
         && !withPhase.labels.includes('review:changes')) {
       const findings = redTeamSentBackFindings(pr);
       if (findings.length) {
+        // Mandatory holds still bind a repair launch: never dispatch past a referral hold or an unreviewable head.
+        if (refuseReferralHold({ pr, refuse, withPhase })) continue;
+        if (refuseUnreviewable({ pr, requiredChecks, refuse, withPhase })) continue;
         const attempts = roundAttempts();
         if (attempts >= effectiveRoundCap) {
           refuseCapExhausted({ ...withPhase, attempts, cap: effectiveRoundCap, capKind: 'fix',
