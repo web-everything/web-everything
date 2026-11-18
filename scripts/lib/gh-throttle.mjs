@@ -181,7 +181,6 @@ import { homedir, constants as osConstants } from 'node:os';
 import { join, resolve, basename, delimiter } from 'node:path';
 import { URL as NodeURL, fileURLToPath, pathToFileURL } from 'node:url';
 import { randomUUID, createHash } from 'node:crypto';
-import { stripVTControlCharacters } from 'node:util';
 
 import { tryAcquireSlot, releaseOwnedSlot, admissionStatus, ADMISSION_LEASE_MINUTES } from '../readiness/heavy-admission.mjs';
 import { reserve, releaseLockDir } from '../readiness/file-locks.mjs';
@@ -1866,13 +1865,15 @@ function isJobLogRead(args) {
     && args.some(arg => typeof arg === 'string' && !arg.startsWith('-') && /\/actions\/jobs\/\d+\/logs$/.test(arg));
 }
 
-/** The gh safety override permits transport only; callers and caches receive plain logs. */
+/** Strip 7-bit terminal escapes without consuming log lines or changing other bytes. */
 function sanitizeJobLog(args, result, encoding) {
   if (!isJobLogRead(args) || !(typeof result === 'string' || Buffer.isBuffer(result))) return result;
-  const codec = encoding && encoding !== 'buffer' ? encoding : 'utf8';
+  const codec = encoding && encoding !== 'buffer' ? encoding : 'latin1';
   const text = Buffer.isBuffer(result) ? result.toString(codec) : result;
-  const withoutOsc = text.replace(/(?:\u001b\]|\u009d)[\s\S]*?(?:\u0007|\u001b\\|\u009c)/g, '');
-  const clean = stripVTControlCharacters(withoutOsc).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '');
+  const clean = text
+    .replace(/\u001b\[[0-?]*[ -\/]*[@-~]/g, '')
+    .replace(/\u001b\][^\u0007\u001b\n]*(?:\u0007|\u001b\\)/g, '')
+    .replace(/\u001b/g, '');
   return Buffer.isBuffer(result) ? Buffer.from(clean, codec) : clean;
 }
 
@@ -1882,7 +1883,7 @@ function sanitizeJobLog(args, result, encoding) {
  * direct `execFileSync('gh', args, opts)` call — `opts` (everything except the separately-namespaced
  * `opts.throttle` bag below) is passed through UNCHANGED, so the return value and the thrown-error shape
  * (`.status`, `.stdout`, `.stderr`, `.message`) are byte-identical to the real binary's,
- * except successful job-log reads have terminal escape/control sequences stripped.
+ * except successful job-log reads have 7-bit terminal escape sequences stripped.
  *
  * @param {string[]} args           the `gh` argv (exactly what `execFileSync('gh', args, opts)` would take)
  * @param {object} [opts]           execFileSync options, passed through verbatim, PLUS:

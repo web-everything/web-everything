@@ -523,7 +523,7 @@ describe('finished CI cache (card 309)', () => {
     expect(finishedCiCacheDir({ HOME: '/test-home', WE_FINISHED_CI_CACHE_DIR: '~/cache' })).toBe('/test-home/cache');
   });
   it('preserves binary output, misses corrupt gzip, and refreshes LRU mtime', () => {
-    const f = fixture(); const cls = classifyFinishedCiRead(log); const bytes = Buffer.from('café ✓\n');
+    const f = fixture(); const cls = classifyFinishedCiRead(log); const bytes = Buffer.from([0, 255, 128, 10]);
     storeFinishedCi(cls, bytes, f.cacheOpts()); f.advance(1000);
     expect(runGhSync(log, { env: f.env, throttle: f.throttle })).toEqual(bytes);
     const path = join(f.env.WE_FINISHED_CI_CACHE_DIR, f.files()[0]);

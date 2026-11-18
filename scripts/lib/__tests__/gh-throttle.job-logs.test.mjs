@@ -14,13 +14,14 @@ describe('job-log escape-sequence permission', () => {
   it.each([
     ['string', 'utf8'], ['string', 'latin1'], ['string', 'utf16le'],
     ['Buffer', undefined], ['Buffer', 'buffer'], ['Buffer', 'latin1'], ['Buffer', 'utf16le'],
-  ])('sanitizes CSI, OSC and C0 controls while preserving %s output (encoding %s)', (type, encoding) => {
+  ])('strips 7-bit CSI, OSC and lone ESC while preserving other controls and %s output (encoding %s)', (type, encoding) => {
     const root = mkdtempSync(join(tmpdir(), 'gh-job-logs-')); roots.push(root);
+    const controls = String.fromCharCode(...Array.from({ length: 32 }, (_, i) => i).filter(i => ![9, 10, 13, 27].includes(i)))
+      + '\u007f\u0080\u009b\u009c\u009d\u00ff';
     const raw = '\u001b[31mhéllo\u001b[0m\u001b]0;hidden title\u0007\u001b]8;;https://example.com\u001b\\link\u001b]8;;\u001b\\'
-      + String.fromCharCode(...Array.from({ length: 32 }, (_, i) => i).filter(i => ![9, 10, 13].includes(i)))
-      + '\tline\r\n';
-    const clean = 'héllolink\tline\r\n';
-    const codec = encoding && encoding !== 'buffer' ? encoding : 'utf8';
+      + controls + '\u001b\tline\r\n';
+    const clean = 'héllolink' + controls + '\tline\r\n';
+    const codec = encoding && encoding !== 'buffer' ? encoding : 'latin1';
     const output = type === 'Buffer' ? Buffer.from(raw, codec) : raw;
     const exec = vi.fn(() => output);
     const opts = { encoding, throttle: { env: {}, lockRoot: root, logPath: join(root, 'calls.jsonl'), personalRoute: false, exec } };
@@ -29,6 +30,36 @@ describe('job-log escape-sequence permission', () => {
     expect(runGhSync(args, opts)).toEqual(expected);
     expect(runGhSync([...args, '--allow-escape-sequences'], opts)).toEqual(expected);
     expect(runGhSync(['api', 'repos/o/r/actions/jobs/123'], opts)).toBe(output);
+  });
+
+  it.each(['', '\u0007', '\u001b\\'])('an unterminated OSC never removes following lines (later terminator %j)', terminator => {
+    const root = mkdtempSync(join(tmpdir(), 'gh-job-logs-')); roots.push(root);
+    const raw = `\u001b]0;unfinished\nblocking evidence\n${terminator}last line\n`;
+    expect(runGhSync(['api', 'repos/o/r/actions/jobs/123/logs'], { encoding: 'utf8', throttle: {
+      env: {}, lockRoot: root, logPath: join(root, 'calls.jsonl'), personalRoute: false, exec: () => raw,
+    } })).toBe(`]0;unfinished\nblocking evidence\n${terminator.replace(/\u001b/g, '')}last line\n`);
+  });
+
+  it.each([undefined, 'buffer'])('preserves binary bytes in job-log output (encoding %s)', encoding => {
+    const root = mkdtempSync(join(tmpdir(), 'gh-job-logs-')); roots.push(root);
+    const bytes = Buffer.from([0, 255, 128, 10]);
+    expect(runGhSync(['api', 'repos/o/r/actions/jobs/123/logs'], { encoding, throttle: {
+      env: {}, lockRoot: root, logPath: join(root, 'calls.jsonl'), personalRoute: false, exec: () => bytes,
+    } })).toEqual(bytes);
+  });
+
+  it('preserves a post-footer fail-closed row after an OSC-looking prefix', () => {
+    const root = mkdtempSync(join(tmpdir(), 'gh-job-logs-')); roots.push(root);
+    const log = ['#7037: HOLD', ...GATE_IDS.map(id =>
+      `  ${(id === 'review-acceptance' ? 'hold' : 'pass').padEnd(17)} ${id.padEnd(22)} fixture`),
+    'merge-gate: HOLD — held', '\u001b]0;unfinished',
+    '  fail-closed       codeql                 blocking evidence', '\u0007'].join('\n');
+    const runGh = (args, opts) => runGhSync(args, { ...opts, throttle: {
+      env: {}, lockRoot: root, logPath: join(root, 'calls.jsonl'), personalRoute: false,
+      exec: () => args.at(-1).endsWith('/logs') ? log : JSON.stringify({ head_sha: 'a'.repeat(40) }),
+    } });
+    const verdict = readMergeGateVerdict({ repo: 'o/r', jobId: 123, prNumber: 7037, cache: new Map(), runGh });
+    expect(verdict.error).toMatch(/after the merge-gate footer/);
   });
 
   it('stores sanitized job logs in the read memo and sanitizes historical raw entries', () => {
@@ -40,12 +71,12 @@ describe('job-log escape-sequence permission', () => {
       lockRoot: join(root, 'locks'), logPath: join(root, 'calls.jsonl'), personalRoute: false, execFileSync: exec,
     } };
     const args = ['api', 'repos/o/r/actions/jobs/123/logs'];
-    expect(runGhSync(args, opts)).toBe('héllo\n');
+    expect(runGhSync(args, opts)).toBe('héllo\u0000\n');
     const path = join(root, readdirSync(root).find(name => name.endsWith('.json')));
     const entry = JSON.parse(readFileSync(path, 'utf8'));
-    expect(entry.stdout).toBe('héllo\n');
+    expect(entry.stdout).toBe('héllo\u0000\n');
     writeFileSync(path, JSON.stringify({ ...entry, stdout: raw }));
-    expect(runGhSync(args, opts)).toBe('héllo\n');
+    expect(runGhSync(args, opts)).toBe('héllo\u0000\n');
     expect(exec).toHaveBeenCalledTimes(1);
   });
 
