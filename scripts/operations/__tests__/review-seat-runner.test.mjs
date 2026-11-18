@@ -257,6 +257,10 @@ describe('the agreement report (#76a identity, #76b sameAs through the PR table)
     const overlap = { jaccard: 0.5, matched: 1, claudeCount: 2, agyCount: 1, claudeOnly: 1, agyOnly: 0 };
     expect(summarizeCarbonPromotion([carbonRow({ overlap })])).toMatchObject({ agree: 0, disagree: 1, invalid: 0 });
   });
+  it('an extra Carbon-only finding is disagreement even with a match and the same verdict', () => {
+    const overlap = { jaccard: 0.5, matched: 1, claudeCount: 1, agyCount: 2, claudeOnly: 0, agyOnly: 1 };
+    expect(summarizeCarbonPromotion([carbonRow({ overlap })])).toMatchObject({ agree: 0, disagree: 1, invalid: 0 });
+  });
   it('counts each PR once across repositories, heads, runs and lenses', () => {
     const rows = [carbonRow({ head: null }), carbonRow({ head: 'next', lens: 'security' }),
       carbonRow({ pr: 2 }), carbonRow({ pr: 2, verdictAgree: false }),
