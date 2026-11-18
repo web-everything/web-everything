@@ -282,27 +282,65 @@ test('unreadable queue fails closed without subprocess IO', async t => {
   assert.equal(f.calls.length, 0);
 });
 
-test('unknown head re-arms once per PR per day', async t => {
+test('unknown head re-arms once per PR per day with matching evidence heads', async t => {
   const f = fixture(t), options = { ...f.options, head: 'unknown-head' };
-  f.trace.head = 'b'.repeat(40); f.why.head = 'c'.repeat(40);
+  f.trace.unavailable = [];
+  f.trace.head = head.toUpperCase();
   await traceStuckPr(options); await traceStuckPr(options);
   await traceStuckPr({ ...options, now: '2026-11-11T12:00:00Z' });
   assert.equal(f.events.length, 2);
+  for (const event of f.events) assert.doesNotMatch(event.detail.note, /INCOMPLETE/);
 });
 
-test('hung reads and hung delivery are bounded and remain queued for retry', async t => {
-  for (const stage of ['read', 'emit']) {
-    const f = fixture(t); t.mock.timers.enable({ apis: ['setTimeout'] });
-    enqueueStuckTrace(f.options);
-    const pending = drainStuckTraces({ ...f.options, ...(stage === 'read'
-      ? { run: () => new Promise(() => {}) } : { emit: () => new Promise(() => {}) }) });
-    await new Promise(resolve => setImmediate(resolve));
-    t.mock.timers.tick(stage === 'read' ? 59_000 : 1000);
-    await pending;
-    assert.equal(queue(f)[key].state, 'queued');
-    assert.equal(queue(f)[key].attempts, 1);
-    t.mock.timers.reset();
+test('unknown or malformed queued heads require matching real evidence SHAs or retry then emit INCOMPLETE head mismatch', async t => {
+  for (const queuedHead of ['unknown-head', 'malformed']) {
+    for (const layer of ['why', 'trace']) for (const invalid of [undefined, null, '', 'unknown-head', 17, 'b'.repeat(40)]) {
+      const f = fixture(t), options = { ...f.options, head: queuedHead };
+      f.trace.unavailable = [];
+      f[layer].head = invalid;
+      enqueueStuckTrace(options);
+      for (const attempt of [1, 2, 3]) {
+        await drainStuckTraces({ ...options, now: Date.parse(now) + (attempt - 1) * 600_000 });
+        assert.equal(f.events.length, attempt < 3 ? 0 : 1);
+        assert.equal(Object.values(queue(f))[0].state, attempt < 3 ? 'queued' : 'done');
+      }
+      assert.match(f.events[0].detail.note, /INCOMPLETE.*head mismatch/);
+    }
   }
+});
+
+test('hung reads are bounded and remain queued for retry', async t => {
+  const f = fixture(t); t.mock.timers.enable({ apis: ['setTimeout'] });
+  enqueueStuckTrace(f.options);
+  const pending = drainStuckTraces({ ...f.options, run: () => new Promise(() => {}) });
+  await new Promise(resolve => setImmediate(resolve));
+  t.mock.timers.tick(59_000);
+  await pending;
+  assert.equal(queue(f)[key].state, 'queued');
+  assert.equal(queue(f)[key].attempts, 1);
+  t.mock.timers.reset();
+});
+
+test('pending emit holds its claim within ten minutes and retries only after the lease', async t => {
+  const f = fixture(t); enqueueStuckTrace(f.options);
+  let emits = 0, settled = false;
+  void drainStuckTraces({ ...f.options, emit: () => { emits++; return new Promise(() => {}); } })
+    .then(() => { settled = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(emits, 1);
+  assert.equal(settled, false);
+  assert.equal(queue(f)[key].claimedAt, now.replace('Z', '.000Z'));
+  assert.equal((await drainStuckTraces({ ...f.options, now: Date.parse(now) + 599_999,
+    emit: () => { emits++; } })).processed, 0);
+  assert.equal(emits, 1);
+  assert.equal(queue(f)[key].attempts, 1);
+  assert.equal(f.calls.length, 2);
+  assert.equal((await drainStuckTraces({ ...f.options, now: Date.parse(now) + 600_000 })).processed, 1);
+  assert.equal(f.events.length, 1);
+  assert.equal(f.events[0].detail.traceKey, key);
+  assert.equal(queue(f)[key].attempts, 2);
+  assert.equal(queue(f)[key].state, 'done');
+  assert.equal(settled, false);
 });
 
 test('digest enqueues every unchanged operator head and drains detached after alerts, never under test', async t => {
@@ -377,8 +415,8 @@ test('watch hook runs only after successful delivery for ready-stuck and pr-no-p
 });
 
 
-test('late sink completion after timeout is found on retry and emits exactly one event', async t => {
-  const f = fixture(t); t.mock.timers.enable({ apis: ['setTimeout'] });
+test('sink completion during the claim lease finishes the drain and never repeats', async t => {
+  const f = fixture(t);
   enqueueStuckTrace(f.options);
   let complete;
   const emit = event => new Promise(resolve => { complete = () => {
@@ -388,17 +426,15 @@ test('late sink completion after timeout is found on retry and emits exactly one
   }; });
   const pending = drainStuckTraces({ ...f.options, emit });
   await new Promise(resolve => setImmediate(resolve));
-  t.mock.timers.tick(1000);
-  await pending;
   assert.equal(queue(f)[key].state, 'queued');
   complete();
+  await pending;
   assert.equal(f.events[0].detail.traceKey, key);
   await drainStuckTraces({ ...f.options, now: Date.parse(now) + 600_000,
     emit: () => { assert.fail('already delivered'); } });
   assert.equal(f.events.length, 1);
   assert.equal(f.calls.length, 2);
   assert.equal(queue(f)[key].state, 'done');
-  t.mock.timers.reset();
 });
 
 test('retry uses only the last 256 KB and leaves unavailable delivery history queued for manual inspection', async t => {

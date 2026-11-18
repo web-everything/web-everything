@@ -7,6 +7,8 @@
  * at two entries (two read-only ops each). Per-head dedupe and a three-attempt
  * cap bound total reads. Failed/crashed attempts stay queued
  * and retry after 10 minutes; delivered heads never repeat. Unknown heads re-arm daily.
+ * Delivery is exactly-once within the 10-minute claim lease; at-least-once only
+ * for a sink hung over 10 minutes. Consumers dedupe by traceKey.
  */
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -114,9 +116,11 @@ export async function drainStuckTraces({ stateDir, max = 2, now = Date.now(), ru
       const selected = Object.entries(saved).filter(([, e]) => e?.state === 'queued'
         && TRACE_TRIGGERS.includes(e.kind) && Number.isFinite(Date.parse(e.enqueuedAt))
         && Number.isInteger(e.attempts) && e.attempts >= 0 && e.attempts < 3
-        && (e.attempts === 0 || (Number.isFinite(Date.parse(e.attemptedAt)) && stamp - Date.parse(e.attemptedAt) >= 600_000)))
+        // Refuse retries within the claim lease, including pre-claimedAt persisted entries.
+        && (e.attempts === 0 || (Number.isFinite(Date.parse(e.claimedAt ?? e.attemptedAt))
+          && stamp - Date.parse(e.claimedAt ?? e.attemptedAt) >= 600_000)))
         .sort((a, b) => Date.parse(a[1].enqueuedAt) - Date.parse(b[1].enqueuedAt)).slice(0, max);
-      for (const [, e] of selected) { e.attempts++; e.attemptedAt = at; }
+      for (const [, e] of selected) { e.attempts++; e.attemptedAt = at; e.claimedAt = at; }
       writeJsonAtomic(file, saved); // Merge legacy completions; persist attempts BEFORE IO, including crashes.
       return selected;
     }, { timeoutMs: 0 });
@@ -166,12 +170,17 @@ async function traceStuckPr({ repo, pr, head, kind, attempts, run, emit, env }) 
       })]);
     } finally { clearTimeout(timer); }
     // A queued head can move while awaiting either operation; stale evidence emits nothing.
+    let headMismatch = false;
     if (/^[a-f0-9]{40}$/i.test(head)) {
       if ([trace?.head, why?.head].some(
         live => typeof live === 'string' && /^[a-f0-9]{40}$/i.test(live) && live.toLowerCase() !== head.toLowerCase()))
         return { posted: false, skipped: 'superseded' };
       if (typeof why?.head !== 'string' || why.head.toLowerCase() !== head.toLowerCase()) why = null;
       if (typeof trace?.head !== 'string' || trace.head.toLowerCase() !== head.toLowerCase()) trace = null;
+    } else if (![why?.head, trace?.head].every(live => typeof live === 'string' && /^[a-f0-9]{40}$/i.test(live))
+      || why.head.toLowerCase() !== trace.head.toLowerCase()) {
+      headMismatch = true;
+      why = trace = null;
     }
     // Retry failed reads without delivering a note that would then be repeated.
     // On the final attempt, deliver one INCOMPLETE note even if a layer is missing.
@@ -191,19 +200,14 @@ async function traceStuckPr({ repo, pr, head, kind, attempts, run, emit, env }) 
       ['unavailable evidence', trace?.unavailable], ['incomplete evidence', trace?.incomplete],
     ];
     const status = !why || !trace || gapsBlock || trace?.unavailable?.length || trace?.incomplete?.length
-      ? 'INCOMPLETE trace: evidence unavailable or incomplete; inspect manually\n' : '';
+      ? `INCOMPLETE trace: ${headMismatch ? 'head mismatch; ' : ''}evidence unavailable or incomplete; inspect manually\n` : '';
     const note = status + fields.map(([name, value]) => `${name}: ${clean(value, name === 'daemon logs + times' ? 700 : 130)}`).join('\n');
     const bounded = Buffer.byteLength(note) > 2900
       ? `${Buffer.from(note).subarray(0, 2800).toString('utf8')}\n[bounded; inspect full why/pr-trace JSON manually]` : note;
-    // Bound the event sink too; a slow filesystem must not wedge the drain.
-    try {
-      const delivered = await Promise.race([
-        Promise.resolve().then(() => emit({ kind: 'stuck-trace', repo, pr,
-          detail: { traceKey: `${repo}#${pr}@${head}`, head: clean(head), trigger: kind, headline, owner, waitingFor, note: bounded } }, { env })),
-        new Promise(resolve => { timer = setTimeout(() => resolve(false), 1000); }),
-      ]);
-      if (delivered === false) throw Error('delivery failed');
-    } finally { clearTimeout(timer); }
+    // Await the append: a pending sink retains its claim until the lease expires.
+    const delivered = await emit({ kind: 'stuck-trace', repo, pr,
+      detail: { traceKey: `${repo}#${pr}@${head}`, head: clean(head), trigger: kind, headline, owner, waitingFor, note: bounded } }, { env });
+    if (delivered === false) throw Error('delivery failed');
     return { posted: true };
   } catch { report(); return { posted: false, skipped: 'incomplete' }; }
 }
