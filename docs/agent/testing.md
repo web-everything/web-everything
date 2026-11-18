@@ -4576,3 +4576,10 @@ wrapper with `--expect-head` and `--round=red-team`; the public label CLI reject
 spent the repair round, even if execution fails. Keep the argv, real CLI parsing,
 shared-cap accounting, and missing/stale conflict-fallback finding cases in
 `fix-run`, `rearm-review`, and `reconcile-core` tests.
+
+A dispatch receipt also spends its launch ID: replay must exit non-zero before any
+repair executor runs, including after failed or no-change repairs. There is no
+crash-restart exemption without proof that execution never started. Recovery uses a
+new dispatch and launch ID, consuming another round under the shared cap. Keep the
+failed/no-change/executor-fallback replay refusal and fresh-launch assertions in
+`fix-run.test.mjs`.

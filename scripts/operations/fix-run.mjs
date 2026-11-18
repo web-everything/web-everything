@@ -742,11 +742,15 @@ export async function runFixCli(argv = [], {
     let prContext;
     let openSendBacks = [];
     let repeatPlan = { action: 'patch' };
-    const chargeRedTeamLaunch = comments => publishRedTeamFixLaunch({
-      comments, pr: Number(pr), head: prHeadSha, attemptId: launch.launchId,
-      publish: body => withMessageFile(body, file => run('gh', ['pr', 'comment', pr,
-        ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot })),
-    });
+    const chargeRedTeamLaunch = comments => {
+      const charged = publishRedTeamFixLaunch({
+        comments, pr: Number(pr), head: prHeadSha, attemptId: launch.launchId,
+        publish: body => withMessageFile(body, file => run('gh', ['pr', 'comment', pr,
+          ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot })),
+      });
+      // A durable receipt spends the launch even if its executor failed or never returned.
+      if (!charged) throw new LauncherError('launch already spent; a new dispatch is required');
+    };
     if (launch.repairKind === 'ci-heal') {
       if (hasRedTeamSentBackLabels(prHead)) {
         const comments = await readComments(pr, { repo: launch.repo });

@@ -223,9 +223,9 @@ describe('runFixCli', () => {
     expect(m.calls.some(c => c.includes('push') || c.includes('comment'))).toBe(false);
     expect(writeErr).toHaveBeenCalledWith(expect.stringContaining('retry with a fresh reconciliation or ask an operator'));
   });
-  it.each(['failed', 'no-change', 'executor fallback'])('charges a %s repair before execution without a push', async kind => {
+  it.each(['failed', 'no-change', 'executor fallback'])('charges a %s repair once, refuses replay, and runs a fresh launch', async kind => {
     const head = 'a'.repeat(40);
-    const m = mk([head, head]);
+    const m = mk([head, head, head]); // Initial head plus unchanged heads for both executed launches.
     const pr = acceptedRedTeamPr();
     const run = (cmd, args, opts) => {
       const result = m.run(cmd, args, opts);
@@ -249,12 +249,25 @@ describe('runFixCli', () => {
     expect(countRedTeamFixComments(pr.comments)).toBe(1);
     expect(m.calls.some(c => c.includes('push'))).toBe(false);
     if (kind === 'executor fallback') expect(spawnCodex).toHaveBeenCalledTimes(2);
-    // Retrying this launch is idempotent, even when it previously failed or changed nothing.
+    // A failed or no-change launch is spent: replay must refuse before any execution.
     m.spawn.mockImplementation(async () => {});
-    await runFixCli(launchArgv, io);
+    m.spawn.mockClear();
+    spawnCodex.mockClear();
+    const writeErr = vi.fn();
+    expect((await runFixCli(launchArgv, { ...io, writeErr })).code).toBe(1);
+    expect(writeErr).toHaveBeenCalledWith(expect.stringContaining('launch already spent; a new dispatch is required'));
+    // Switching repair kinds cannot reuse the spent launch either.
+    writeErr.mockClear();
+    const readCiHeal = vi.fn();
+    expect((await runFixCli([...launchArgv, '--repair-kind=ci-heal'], { ...io, writeErr, readCiHeal })).code).toBe(1);
+    expect(writeErr).toHaveBeenCalledWith(expect.stringContaining('launch already spent; a new dispatch is required'));
+    expect(readCiHeal).not.toHaveBeenCalled();
+    expect(m.spawn).not.toHaveBeenCalled();
+    expect(spawnCodex).not.toHaveBeenCalled();
     expect(countRedTeamFixComments(pr.comments)).toBe(1);
     // A new dispatch on the same head and gate result still consumes a new round.
-    await runFixCli([...argv, '--launch-id=new-launch'], io);
+    expect((await runFixCli([...argv, '--launch-id=new-launch'], io)).code).toBe(0);
+    expect(m.spawn).toHaveBeenCalledTimes(1);
     expect(countRedTeamFixComments(pr.comments)).toBe(2);
   });
   it('refuses cap-exhausted after cap failed launches without any push', async () => {
