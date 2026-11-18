@@ -4657,6 +4657,12 @@ directory resolution, must return the drain context unchanged on exceptions.
 For every bounded-read risk, the test plan must name a regression counting actual read attempts
 or asserting the read range, including the default shared budget across repositories. Inject a
 failure after a successful staged read to prove no partial completeness can be published.
+Both backfills must count payload attempts before calling the reader and retain that count
+outside staging, so aborts, listing churn and failed persistence cannot refund the shared
+50-read drain budget. The `%s backfill preserves payload spend after %s` cases and the
+`an aborted open-PR backfill leaves only the actual remainder after %s` drain cases pin this
+accounting. Unknown spend exhausts the budget; the bounded evidence scan and scan-capped HOLD
+remain the fallback until a later tick can complete discovery.
 Keep the lost-append, poison, complete-hit, churn, cooldown, budget and wiring regressions in `review-run-index.test.mjs`, run alongside `drain-red-team-evidence.test.mjs`
 through heavy admission.
 ## Fast-drain round listing and live target refresh

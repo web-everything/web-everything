@@ -526,6 +526,39 @@ it('unknown listing ids require strict identity and at most 20 reads before fall
   expect(readReviewRunIndex(f.runsDir, f.repo, f.pr, { ...io, list: () => ids.slice(0, 1),
     read: () => { throw Error('unreadable'); } })).toEqual([]);
 });
+it.each(['open', 'full'].flatMap(plane =>
+  ['read', 'read warning', 'persistence', 'listing churn', 'relisting'].map(failure => [plane, failure])))
+('%s backfill preserves payload spend after %s', (plane, failure) => {
+    const backfill = plane === 'open' ? backfillReviewRunIndex : backfillAllReviewRuns;
+    const f = fixture();
+    const records = Array.from({ length: 3 }, (_, i) => ({ ...f.run, id: `review-pr-budget-${i}` }));
+    let reads = 0, lists = 0, warnings = 0;
+    const result = backfill({ ...f, openPrs: new Set([f.pr]), maxParses: 3, maxParsesPerCall: 3,
+      stat: () => ({ mtimeMs: 2000 }),
+      list: () => {
+        if (++lists > 1) {
+          if (failure === 'relisting') throw Error('listing unavailable');
+          if (failure === 'listing churn') return [];
+        }
+        return records.map(record => record.id);
+      },
+      read: id => {
+        reads++;
+        if (reads === 3) {
+          if (failure.startsWith('read')) throw Error('payload unavailable after two successful reads');
+          if (failure === 'persistence') mkdirSync(reviewRunIndexPath(f.runsDir));
+        }
+        return records.find(record => record.id === id);
+      },
+      warn: () => {
+        if (++warnings === 1 && failure === 'read warning') throw Error('warning unavailable');
+      },
+    });
+    expect(reads, failure).toBe(3);
+    expect(result, failure).toEqual({ complete: false, parsed: reads });
+    expect(warnings, failure).toBeGreaterThan(0);
+});
+
 it('unreadable backfill candidate aborts without publishing completeness', () => {
   const f = fixture(), io = window(f);
   const records = [ { ...f.run, id: 'review-pr-a' }, { ...f.run, id: 'review-pr-b' }, { ...f.run, id: 'review-pr-c' } ];

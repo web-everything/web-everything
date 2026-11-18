@@ -227,6 +227,10 @@ export function backfillReviewRunIndex({ runsDir, repo, openPrs, maxParses = 50,
   stat = id => statSync(join(runsDir, `${id}.json`)), now = Date.now,
   warn = message => console.warn(message) } = {}) {
   const path = reviewRunIndexPath(runsDir), statePath = `${path}.backfill`;
+  // Count before entering payload IO so throws (including staging/persistence failures)
+  // cannot refund reads to the drain tick's second backfill.
+  let parsed = 0;
+  const countedRead = id => { parsed++; return read(id); };
   try {
     if (!Number.isSafeInteger(maxParses) || maxParses < 1 || maxParses > 300) throw Error('invalid backfill budget');
     const keys = [...openPrs].map(pr => repo ? keyOf(repo, pr) : pr).filter(Boolean).sort();
@@ -237,9 +241,9 @@ export function backfillReviewRunIndex({ runsDir, repo, openPrs, maxParses = 50,
       try { state = readJson(statePath); } catch { /* start a pass */ }
       const files = listing(runsDir, list, stat);
       if (Buffer.byteLength(JSON.stringify(files)) > MAX_BYTES) throw Error('review index snapshot oversized; inspect omitted runs manually');
-      const staged = stageReviewRuns(state, { path, runsDir, files, read, stat, now, warn, maxParses });
+      const staged = stageReviewRuns(state, { path, runsDir, files, read: countedRead, stat, now, warn, maxParses });
       state = staged.state;
-      const { complete, parsed } = staged;
+      const { complete } = staged;
       if (complete) {
         if (JSON.stringify(files) !== JSON.stringify(listing(runsDir, list, stat))) {
           writeBounded(statePath, state);
@@ -263,7 +267,7 @@ export function backfillReviewRunIndex({ runsDir, repo, openPrs, maxParses = 50,
     }, { timeoutMs: 0 });
   } catch (error) {
     warn(`review run index backfill unavailable: ${error.message}; bounded scan still applies; HOLD on scan-capped and inspect omitted runs`);
-    return { complete: false, parsed: 0 };
+    return { complete: false, parsed };
   }
 }
 
@@ -278,6 +282,8 @@ export function backfillAllReviewRuns({ runsDir, maxParsesPerCall = 50,
     return parsed.record;
   }, now = Date.now, warn = message => console.warn(message) } = {}) {
   const path = reviewRunIndexPath(runsDir);
+  let parsed = 0;
+  const countedRead = id => { parsed++; return read(id); };
   try {
     if (!Number.isSafeInteger(maxParsesPerCall) || maxParsesPerCall < 1 || maxParsesPerCall > 300) throw Error('invalid backfill budget');
     mkdirSync(dirname(path), { recursive: true });
@@ -290,11 +296,11 @@ export function backfillAllReviewRuns({ runsDir, maxParsesPerCall = 50,
         && full.completeness.validationVersion === FULL_VALIDATION_VERSION
         && Number.isFinite(full.completeness.completeThroughMtimeMs)
         && JSON.stringify(full.completeness.files) === JSON.stringify(files)
-        && JSON.stringify(full.completeness.poisons) === JSON.stringify(poisons)) return { complete: true, parsed: 0 };
+        && JSON.stringify(full.completeness.poisons) === JSON.stringify(poisons)) return { complete: true, parsed };
       const staged = stageReviewRuns(full?.backfill, {
-        path, runsDir, files, read, stat, now, warn, maxParses: maxParsesPerCall,
+        path, runsDir, files, read: countedRead, stat, now, warn, maxParses: maxParsesPerCall,
       });
-      const { state, complete, parsed } = staged;
+      const { state, complete } = staged;
       // Keep the cursor as diagnostic metadata; verified identities drive resumption.
       state.after = state.verified.at(-1)?.id ?? '';
       if (complete) {
@@ -319,6 +325,6 @@ export function backfillAllReviewRuns({ runsDir, maxParsesPerCall = 50,
     }, { timeoutMs: 0 });
   } catch (error) {
     warn(`full review run index backfill unavailable: ${error.message}; bounded scan still applies; HOLD on scan-capped and inspect omitted runs`);
-    return { complete: false, parsed: 0 };
+    return { complete: false, parsed };
   }
 }
