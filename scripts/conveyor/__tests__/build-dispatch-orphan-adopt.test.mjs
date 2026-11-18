@@ -327,13 +327,12 @@ describe('checkResumable — TWO safety checks: lane-lease-currency, then foreig
 });
 
 describe('spawnResumeDelivery — PR #2921 review: the resume settles the ORIGINAL run-store row', () => {
-  it('drops refused members before encoding resume argv', () => {
+  it('refuses the whole group before encoding resume argv', () => {
     const spawnDetached = vi.fn(() => ({ pid: 7 }));
     expect(spawnResumeDelivery({ num: '12', lane: 9, sessionSlug: 'group', groupMembers: ['12', '13'] }, {
       readSettings: () => ({ mode: 'only', only: true, ids: ['12'] }), spawnDetached, logPathFor: () => '/dev/null',
-    })).toBe(7);
-    expect(spawnDetached.mock.calls[0][0]).toContain('--group-members=12');
-    expect(spawnDetached.mock.calls[0][0].join(' ')).not.toContain('13');
+    })).toBeNull();
+    expect(spawnDetached).not.toHaveBeenCalled();
   });
   it('recovery forwards every grouped member to the resumed wrapper', () => {
     let argv;
@@ -372,6 +371,34 @@ describe('adoptOrphanedBuildClaims — orchestration over a real claim/resume lo
   const buildRow = ({ num, handle, status = 'in-flight', result = null, lane = 3, sessionSlug = `conveyor-${num}` }) => ({
     runId: 'dispatch-lane-x',
     entry: { key: 'step:1:0', status, handle, result, payload: { num, launchKind: 'build', lane, sessionSlug, scope: [] } },
+  });
+  it.each(['default', 'injected', 'fresh refusal'])('refuses a persisted group without changing claims, markers or attempts (%s)', async mode => {
+    acquireBuildDispatchClaim({ num: '12', pid: 98761, lockRoot });
+    markBuildDispatchResume({ num: '12', pid: 999, runId: 'dispatch-lane-x', rowKey: 'step:1:0', attempts: 1, lockRoot: resumeRoot });
+    const marker = readBuildDispatchResume({ num: '12', lockRoot: resumeRoot });
+    const claims = listBuildDispatchClaims({ lockRoot, ignoreExpiry: true });
+    const row = buildRow({ num: '12', handle: 'pid:74142' });
+    row.entry.payload.groupMembers = ['12', '13'];
+    const originalRow = structuredClone(row);
+    const spawnResume = vi.fn();
+    const markResume = vi.fn();
+    const releaseResumeMarker = vi.fn();
+    let reads = 0;
+    const result = await adoptFixtureClaims({
+      listClaims: () => listBuildDispatchClaims({ lockRoot, ignoreExpiry: true }), isPidAlive: () => false,
+      findRow: () => row, readResumeMarker: () => marker,
+      resolveResumability: () => ({ resumable: true }),
+      readSettings: () => ({ mode: 'only', only: true, ids: mode === 'fresh refusal' && ++reads <= 4 ? ['12', '13'] : ['12'] }),
+      spawnResume: mode === 'injected' ? spawnResume : undefined, markResume, releaseResumeMarker,
+    });
+    expect(result).toEqual([{ num: '12', action: 'runtime-refused', reason: expect.any(String),
+      runtimeRefused: [{ num: '13', kind: 'resume', reason: 'runtime-only' }] }]);
+    expect(spawnResume).not.toHaveBeenCalled();
+    expect(markResume).not.toHaveBeenCalled();
+    expect(releaseResumeMarker).not.toHaveBeenCalled();
+    expect(readBuildDispatchResume({ num: '12', lockRoot: resumeRoot })).toEqual(marker);
+    expect(listBuildDispatchClaims({ lockRoot, ignoreExpiry: true })).toEqual(claims);
+    expect(row).toEqual(originalRow);
   });
   it.each(['absent', 'bound', 'stale'])('fresh spawn-boundary refusal preserves %s resume attempts and markers without a pending write', async marker => {
     acquireBuildDispatchClaim({ num: '4131', scope: [], lockRoot, pid: 1 });

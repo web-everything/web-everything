@@ -465,9 +465,14 @@ export function settleOrphanRow({ runId, key, outcome = 'orphan-released' }, sto
  *  minus a fresh attempt tag (a resume is not a new attempt at building; it continues the one that already
  *  finished). `runId`/`effectKey` name the ORIGINAL dispatch row, so the resumed wrapper settles that row on
  *  exit instead of leaving it in-flight forever (PR #2921 review). Returns the spawned pid. */
-export function spawnResumeDelivery({ num, lane, scope, sessionSlug, runId = null, effectKey = null, groupMembers = [], bornAs }, { spawnDetached = defaultSpawnDetached, logPathFor = deliveryDispatchLogPath, readSettings, beforeSpawn = () => {} } = {}) {
+export function spawnResumeDelivery({ num, lane, scope, sessionSlug, runId = null, effectKey = null, groupMembers = [], bornAs }, { spawnDetached = defaultSpawnDetached, logPathFor = deliveryDispatchLogPath, readSettings, beforeSpawn = () => {}, onRefused = () => {} } = {}) {
   if (!assertRuntimeAdmitted({ num, bornAs }, 'resume', { readSettings }).admitted) return null;
-  groupMembers = groupMembers.filter(member => assertRuntimeAdmitted({ num: member }, 'resume', { readSettings }).admitted);
+  const allMembersAdmitted = groupMembers.map(member => {
+    const admission = assertRuntimeAdmitted({ num: member }, 'resume', { readSettings });
+    if (!admission.admitted) onRefused({ num: String(member), kind: 'resume', reason: admission.reason });
+    return admission.admitted;
+  }).every(Boolean);
+  if (!allMembersAdmitted) return null;
   const argv = [
     String(dispatchProviderEntry('build').runScript),
     `--num=${num}`, `--lane=${lane}`, `--session=${sessionSlug}`, `--scope=${String(scope ?? '')}`, '--resume',
@@ -599,18 +604,26 @@ export async function adoptOrphanedBuildClaims({
       } else if (decision.action === 'resume') {
         const admission = assertRuntimeAdmitted({ num, bornAs: payload.bornAs }, 'resume', { readSettings });
         if (!admission.admitted) { results.push({ num, action: 'runtime-refused', reason: admission.reason }); continue; }
+        const runtimeRefused = [];
+        const groupMembers = payload.groupMembers ?? [];
+        const allMembersAdmitted = groupMembers.map(member => {
+          const admission = assertRuntimeAdmitted({ num: member }, 'resume', { readSettings });
+          if (!admission.admitted) runtimeRefused.push({ num: String(member), kind: 'resume', reason: admission.reason });
+          return admission.admitted;
+        }).every(Boolean);
+        if (!allMembersAdmitted) { results.push({ num, action: 'runtime-refused', reason: 'runtime admission refused group', runtimeRefused }); continue; }
         const binding = { runId: row.runId, rowKey: row.entry?.key, attempts: attempts + 1 };
         const beforeSpawn = () => markResume({ num, pid: null, ...binding });
         let pid;
         try {
           // The real helper admits freshly BEFORE persisting the pending attempt.
           if (spawnResume) beforeSpawn();
-          pid = (spawnResume ?? (o => spawnResumeDelivery(o, { readSettings, beforeSpawn })))({
+          pid = (spawnResume ?? (o => spawnResumeDelivery(o, { readSettings, beforeSpawn, onRefused: refusal => runtimeRefused.push(refusal) })))({
             num, lane: payload.lane, scope: payload.scope, sessionSlug: payload.sessionSlug,
             bornAs: payload.bornAs,
-            runId: row.runId, effectKey: row.entry?.key, groupMembers: payload.groupMembers ?? [],
+            runId: row.runId, effectKey: row.entry?.key, groupMembers,
           });
-          if (pid === null && !spawnResume) { results.push({ num, action: 'runtime-refused', reason: 'runtime admission refused before resume spawn' }); continue; }
+          if (pid === null && !spawnResume) { results.push({ num, action: 'runtime-refused', reason: 'runtime admission refused before resume spawn', ...(runtimeRefused.length ? { runtimeRefused } : {}) }); continue; }
           if (!Number.isInteger(pid) || pid <= 0) throw new Error(`resume spawn for #${num} reported no pid`);
         } catch (e) {
           // Known NOT running — record it so the next pass counts this attempt dead at once, not after a TTL.

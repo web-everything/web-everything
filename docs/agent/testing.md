@@ -4639,3 +4639,18 @@ and `skills-src/conveyor/__tests__/build-dispatch-runtime-only.test.mjs`. Filter
 before dispatch lane/scope assignment; a listed ancestor lifts priority but does not grant membership.
 Keep `bornAs` and id metadata through queue projections so num-only build/prepare plans retain direct alias membership.
 Runtime-only admission validates `bornAs` with the build-priority settings validator and requires a durable hash: numeric aliases never authorize another card, and a different hash never grants membership. Cover both build and prepare paths.
+
+
+## Runtime admission keeps launch groups whole
+
+At dispatch and resume spawn boundaries, admit the lead and every `groupMembers`
+entry before reserving a lane, writing session settings, or persisting a resume
+attempt/marker. Refuse the whole group with `runtime-refused` evidence naming the
+refused members; never forward an admission-filtered group. Resume wrappers reload
+the original persisted group, and prompts already describe that whole group.
+The spawn inventory must reject member-dropping predicates and require an exiting
+all-members admission check. Keep the grouped-provider capability guard intact.
+`dispatch-lane-io.test.mjs` covers whole-group refusal and unchanged successful
+forwarding; `build-dispatch-orphan-adopt.test.mjs` covers persisted-group refusal
+including admission changing at the final spawn check, with unchanged claims,
+markers and attempt counts.
