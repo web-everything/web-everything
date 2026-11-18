@@ -1,6 +1,7 @@
 /**
  * Candidacy HOLDs are review work, not CI repair work. Only head-bound job evidence may
- * excuse a failed merge-gate for a non-candidate; every unreadable fact stays red.
+ * excuse a failed merge-gate for a non-candidate or annotate a review-gate hold;
+ * every unreadable fact stays red.
  * The strict parser mirrors #5013's parsePrResultTable: merge the two when #5013 lands.
  * Deliberately does not import merge-gate-ci or the drain's runtime graph.
  */
@@ -12,6 +13,7 @@ import { FAILING_CONCLUSIONS } from '../operations/pr-status.mjs';
 import { PLATFORM_PREFERENCES_PATH } from './merge-delivery-policy.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { runGhSync } from './gh-throttle.mjs';
+import { REVIEW_HOLD_LABELS } from './review-escalation.mjs';
 
 const statuses = new Set(['pass', 'hold', 'fail-closed', 'queue', 'enqueue', 'skipped-by-policy']);
 const gates = new Set(GATE_IDS);
@@ -169,6 +171,52 @@ export function readMergeGateVerdict({ repo, jobId, prNumber, runGh = runGhSync,
   } catch (e) { return { error: String(e?.message ?? e) }; }
 }
 
+const reviewJobCache = new Map();
+/** Completed job logs are immutable. Cache failures too: at most one read per repo/job. */
+export function readReviewGateLog({ repo, jobId, runGh = runGhSync, cache = reviewJobCache } = {}) {
+  const key = `${repo}/${jobId}`;
+  if (!cache.has(key)) {
+    try {
+      const path = `repos/${repo}/actions/jobs/${jobId}`;
+      const options = { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024,
+        stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'review-gate-hold', repo } };
+      const job = JSON.parse(runGh(['api', path], options));
+      const log = String(runGh(['api', `${path}/logs`], options));
+      cache.set(key, { job, log });
+    } catch (error) { cache.set(key, { error: String(error?.message ?? error) }); }
+  }
+  return cache.get(key);
+}
+
+/** Annotate each failed row independently; another attempt's hold never clears its failure. */
+export function annotateReviewGateRows(rows, { repo, headSha, readLog = readReviewGateLog } = {}) {
+  if (!Array.isArray(rows) || typeof headSha !== 'string' || !headSha || !repo) return rows;
+  const annotated = rows.map(row => {
+    if (row?.name !== 'review-gate' || String(row.status).toLowerCase() !== 'completed'
+      || String(row.conclusion).toLowerCase() !== 'failure') return row;
+    try {
+      const url = new URL(row.detailsUrl ?? row.details_url);
+      const match = /^\/([^/]+\/[^/]+)\/actions\/runs\/\d+\/job\/(\d+)\/?$/.exec(url.pathname);
+      const jobId = Number(match?.[2]);
+      if (url.hostname !== 'github.com' || match?.[1].toLowerCase() !== repo.toLowerCase()
+        || !Number.isSafeInteger(jobId) || jobId <= 0) return row;
+      const evidence = readLog({ repo, jobId });
+      const job = evidence?.job;
+      if (evidence?.error || job?.name !== 'review-gate' || typeof job.head_sha !== 'string'
+        || job.head_sha.toLowerCase() !== headSha.toLowerCase()
+        || String(job.status).toLowerCase() !== 'completed'
+        || String(job.conclusion).toLowerCase() !== 'failure' || typeof evidence.log !== 'string') return row;
+      const holds = evidence.log.split(/\r?\n/).map(line => line.replace(/^\d{4}-\d\d-\d\dT\S+\s/, ''))
+        .filter(line => line.startsWith('check-review-gate '));
+      if (holds.length !== 1) return row;
+      const hold = /^check-review-gate (?:✗ held —|held -) a review hold stands: (.+)$/.exec(holds[0]);
+      if (!hold || !hold[1].split(', ').every(label => REVIEW_HOLD_LABELS.includes(label))) return row;
+      return { ...row, output: { ...row.output, summary: holds[0] } };
+    } catch { return row; }
+  });
+  return annotated.some((row, index) => row !== rows[index]) ? annotated : rows;
+}
+
 const defaultKey = 'candidacyHoldIsNotCiFailure';
 const holdSettings = {
   candidacyHoldIsNotCiFailure: { envKey: 'MERGE_GATE_CANDIDACY_HOLD_IS_NOT_CI_FAILURE', logPrefix: 'merge-gate-hold' },
@@ -226,8 +274,9 @@ export function loadMergeGateHoldSetting({ key = defaultKey, env = process.env, 
   return result;
 }
 
-/** One pass, one lazy shared-freeze read; any PR-specific read failure preserves its original rows. */
-export function excusePrMergeGateHolds(prs, { repo, readMergeGateVerdict: readVerdict = readMergeGateVerdict, readFreeze, mergeGateSetting, env } = {}) {
+/** Shared merge/review evidence enrichment, with one lazy shared-freeze read per pass. */
+export function excusePrMergeGateHolds(prs, { repo, readMergeGateVerdict: readVerdict = readMergeGateVerdict,
+  readReviewGateLog: readLog = readReviewGateLog, readFreeze, mergeGateSetting, env } = {}) {
   try {
     const setting = mergeGateSetting ?? loadMergeGateHoldSetting({ env });
     let freezeRead = false, freeze;
@@ -239,9 +288,10 @@ export function excusePrMergeGateHolds(prs, { repo, readMergeGateVerdict: readVe
       return freeze;
     };
     return prs.map(pr => {
-      const out = excuseMergeGateRows(pr.statusCheckRollup, { prNumber: pr.number, headSha: pr.headRefOid, labels: pr.labels,
+      const rows = annotateReviewGateRows(pr.statusCheckRollup, { repo, headSha: pr.headRefOid, readLog });
+      const out = excuseMergeGateRows(rows, { prNumber: pr.number, headSha: pr.headRefOid, labels: pr.labels,
         readVerdict: args => readVerdict({ ...args, repo }), freeze: lazyFreeze, setting });
-      return out.excused || out.reviewHold ? { ...pr, statusCheckRollup: out.rows } : pr;
+      return out.rows !== pr.statusCheckRollup ? { ...pr, statusCheckRollup: out.rows } : pr;
     });
   } catch { return prs; }
 }

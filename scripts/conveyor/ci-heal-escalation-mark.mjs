@@ -58,7 +58,7 @@ import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { isBudgetRefusal, postPrComment, recordOwedWrite, resolveOwedRepo } from './ci-heal-owed.mjs';
 import { resolveCiHealVerdictSettings, unsettledRequiredChecks, gateOnlyRedStates, waitingOnReview, sameSha } from './ci-heal-verdict-recheck.mjs';
-import { excusePrMergeGateHolds, readMergeGateVerdict as defaultReadMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
+import { excusePrMergeGateHolds, readMergeGateVerdict as defaultReadMergeGateVerdict, readReviewGateLog as defaultReadReviewGateLog } from '../lib/merge-gate-hold-class.mjs';
 import { summarize } from '../lib/check-state-predicate.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
@@ -353,7 +353,7 @@ export function notCiBreakRecordRefusal({ headSha, pr, requiredChecks }) {
   const prHead = String(pr?.headRefOid ?? '').trim().toLowerCase();
   if (!head || !prHead || !(prHead.startsWith(head) || head.startsWith(prHead))) return null;
   if (!Array.isArray(requiredChecks) || !requiredChecks.length) return null;
-  const u = unsettledRequiredChecks({ rollup: pr?.statusCheckRollup, requiredChecks });
+  const u = unsettledRequiredChecks({ rollup: pr?.statusCheckRollup, requiredChecks, labels: pr?.labels });
   const parts = [];
   if (u.pending.length) parts.push(`still running: ${u.pending.join(', ')}`);
   if (u.missing.length) parts.push(`not started: ${u.missing.join(', ')}`);
@@ -370,8 +370,8 @@ export function needsHumanGateOnlyRefusal({ headSha, pr, requiredChecks }) {
   if (!Array.isArray(requiredChecks) || !requiredChecks.length) return null;
   // A cancelled, stale, running, or missing required check may need human help.
   // Gate-only red describes failures, not whether the rest of CI finished green.
-  if (!waitingOnReview({ rollup: pr?.statusCheckRollup, requiredChecks })) return null;
-  const { red } = gateOnlyRedStates({ rollup: pr.statusCheckRollup, requiredChecks });
+  if (!waitingOnReview({ rollup: pr?.statusCheckRollup, requiredChecks, labels: pr?.labels })) return null;
+  const { red } = gateOnlyRedStates({ rollup: pr.statusCheckRollup, requiredChecks, labels: pr.labels });
   return `Refusing needs-human: only ${red.join(', ')} is red on this head. This is not a CI break; ordinary review is owed.`;
 }
 
@@ -474,6 +474,7 @@ function defaultReadPrChecks({ pr, repo }, { runGh = runGhSync } = {}) {
 
 function classifyPrChecks(parsed, { pr, repo }, {
   readMergeGateVerdict = defaultReadMergeGateVerdict,
+  readReviewGateLog = defaultReadReviewGateLog,
   readFreeze = readSharedFreeze, mergeGateSetting,
 } = {}) {
   const { slug } = parsed;
@@ -497,6 +498,7 @@ function classifyPrChecks(parsed, { pr, repo }, {
     ...parsed, number: Number(pr), statusCheckRollup: [row],
   })), {
     repo: repo ?? slug, readMergeGateVerdict: checkedRead(readMergeGateVerdict),
+    readReviewGateLog: checkedRead(readReviewGateLog),
     readFreeze: checkedRead(readFreeze), mergeGateSetting,
   });
   // Keep unknown evidence red and expose failures swallowed by the helper so

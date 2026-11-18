@@ -4450,3 +4450,25 @@ even alongside a proven hold. Named regressions cover unlabeled holds, review-ga
 failure, and completed failure with review:pending; the verdict suite covers both gates'
 negative evidence matrix. The regression also covers recovery candidate hydration, escalation CLI
 classification, and retirement of an already-escalated review-only head without a new needs-you event.
+
+Review-gate `FAILURE` alone is insufficient: checkout, setup-node, and npm ci can also
+fail the job. The pure verdict reader requires that row's own `output.summary` to contain
+the explicit `check-review-gate` hold verdict (fast shell or normal script spelling),
+including a hold label still present on the PR. Missing summaries or labels retain CI
+ownership; continue the normal heal/escalation path and inspect the failed job rather
+than suppressing repair. The shared `excusePrMergeGateHolds` enrichment reads completed
+failed review-gate job logs via the throttled GitHub helper, using the job ID in the
+row's details URL. It verifies the job's head, name, status and conclusion before
+copying an exact, known-label hold line into that row's summary. Immutable evidence
+and read errors are cached by repository/job; unreadable or oversized logs retain
+CI ownership. Reconcile, escalation, recovery and the fresh draft-promotion reader
+all consume this shared enrichment. Promotion regressions use raw summary-less REST
+rows plus injected job logs and assert the ready call or the fail-closed refusal and
+cover both merge-gate hold setting values. Fresh review-gate label reads are
+independent of that merge-gate setting; unreadable or mismatched labels still refuse.
+Tests inject `readReviewGateLog` to cover hold, checkout failure and read failure.
+`waitingOnReview` additionally requires a non-empty required roster and complete green
+evidence for the remaining checks. The verdict and gate-wait suites cover unknown
+rosters, missing/pending required checks, both hold verdicts, setup failures, and
+per-row evidence isolation. Keep historical raw rollup fixtures unchanged: their
+unreadable failure causes must remain red under this rule.

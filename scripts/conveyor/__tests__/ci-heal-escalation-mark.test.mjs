@@ -357,9 +357,10 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
   });
 
   describe('gate-only red and cancelled-check recording regressions', () => {
-    const check = (name, conclusion, extra = {}) => ({ name, status: 'COMPLETED', conclusion, ...extra });
+    const check = (name, conclusion, extra = {}) => ({ name, status: 'COMPLETED', conclusion,
+      ...(name === 'review-gate' ? { output: { summary: 'check-review-gate held - a review hold stands: review:pending' } } : {}), ...extra });
     const gatePr = (statusCheckRollup = [check('test', 'SUCCESS'), check('review-gate', 'FAILURE')]) => ({
-      ...fixture, statusCheckRollup,
+      ...fixture, labels: ['review:pending'], statusCheckRollup,
     });
     const humanRefusal = (overrides = {}) => needsHumanGateOnlyRefusal({
       headSha: head, pr: gatePr(), requiredChecks: ['test'], ...overrides,
@@ -708,6 +709,8 @@ describe('stacked base escalation facts (#4792)', () => {
 describe('needs-human CLI preflight wiring — #6004/#5979', () => {
   it.each([
     ['review-gate', [], 'review'],
+    ['review-gate', [{ name: 'review:pending' }], 'review'],
+    ['review-gate', [{ name: 'review:pending' }], 'job-failure'],
     ['merge-gate', [{ name: 'ready-to-merge' }], 'review'], ['merge-gate', [], 'review'],
     ['merge-gate', [], 'job-failure'], ['merge-gate', [], 'other-head'],
     ['merge-gate', [], 'truncated'], ['merge-gate', [], 'unreadable'],
@@ -735,6 +738,8 @@ const facts = ${JSON.stringify({ number: 6042, labels, headRefOid: HEAD, statusC
     { name: gate, status: 'COMPLETED', conclusion: 'FAILURE', required: false },
   ] : []),
   { name: gate, status: 'COMPLETED', conclusion: 'FAILURE',
+    ...(gate === 'review-gate' && evidence === 'review'
+      ? { output: { summary: 'check-review-gate held - a review hold stands: review:pending' } } : {}),
     ...(gate === 'merge-gate' ? { detailsUrl: 'https://github.com/web-everything/web-everything/actions/runs/100/job/123' } : {}) },
 ] })};
 for (const method of ['execFileSync', 'spawnSync', 'execSync', 'exec', 'execFile', 'spawn']) {
@@ -773,7 +778,7 @@ syncBuiltinESMExports();
           : 'Check rows have conflicting required flags');
         expect(result.stderr).not.toContain('could not re-check');
         expect(result.stderr).not.toContain('could not post');
-      } else if (evidence === 'review') {
+      } else if (evidence === 'review' && (gate === 'merge-gate' || labels.length > 0)) {
         expect(result.stderr).toContain('refusing to record needs-human on PR #6042');
         expect(result.stderr).toContain(gate);
       } else {
@@ -794,7 +799,11 @@ syncBuiltinESMExports();
           ...(evidence === 'unreadable' ? [] : [['api', 'repos/web-everything/web-everything/actions/jobs/123/logs']]),
         ] : []),
       ]);
-      if (['review', 'malformed', 'conflicting-flags'].includes(evidence)) expect(calls).toEqual(reads);
+      if (['malformed', 'conflicting-flags'].includes(evidence)
+        || (evidence === 'review' && (gate === 'merge-gate' || labels.length > 0))) expect(calls).toEqual(reads);
+      else expect(calls.slice(reads.length)).toEqual([
+        expect.objectContaining({ method: 'execFileSync', args: ['gh', expect.arrayContaining(['pr', 'comment', '6042'])] }),
+      ]);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

@@ -10,7 +10,9 @@ import { latestCheckNamed } from '../../lib/rollup-collapse.mjs';
 import { latestAttempts } from '../../lib/check-state-predicate.mjs';
 
 const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/ci-heal-verdict/pr4535-2026-10-09.json'), 'utf8'));
-const input = { escalation: { outcome: 'not-a-ci-break', headSha: fixture.headRefOid }, headSha: fixture.headRefOid,
+const reviewOutput = { summary: 'check-review-gate ✗ held — a review hold stands: review:pending' };
+const heldReview = { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE', output: reviewOutput };
+const input = { labels: ['review:pending'], escalation: { outcome: 'not-a-ci-break', headSha: fixture.headRefOid }, headSha: fixture.headRefOid,
   rollup: fixture.statusCheckRollup, requiredChecks: fixture.requiredChecks };
 const green = fixture.requiredChecks.map((name) => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' }));
 
@@ -50,7 +52,7 @@ describe('operator send-back exact check identity', () => {
       const rows = [
         { ...failed, completedAt: '2026-10-30T10:00:00Z' },
         { name: 'TEST', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-30T10:01:00Z' },
-        { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+        heldReview,
       ];
       for (const rollup of [rows, rows.toReversed()]) {
         const evidence = { ...input, rollup, requiredChecks: ['test'] };
@@ -80,11 +82,11 @@ describe('operator send-back exact check identity', () => {
   it('a distinct CODEQL success cannot hide a drain-blocking CodeQL failure', () => {
     const rollup = [
       { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
-      { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+      heldReview,
       { name: 'CodeQL', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-30T10:00:00Z' },
       { name: 'CODEQL', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-30T10:01:00Z' },
     ];
-    expect(verdictRecheck.gateOnlyRedStates({ rollup, requiredChecks: ['test'],
+    expect(verdictRecheck.gateOnlyRedStates({ labels: ['review:pending'], rollup, requiredChecks: ['test'],
       drainGateSettings: { drainBlocksOnCodeQL: true } })).toEqual({ gateOnlyRed: false, red: ['review-gate', 'CodeQL'] });
   });
 
@@ -152,10 +154,10 @@ describe('R10 escalation send-back regressions', () => {
       ];
       const rollup = [
         { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
-        { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+        heldReview,
         ...(reverse ? scans.toReversed() : scans),
       ];
-      const result = verdictRecheck.gateOnlyRedStates({ requiredChecks, rollup,
+      const result = verdictRecheck.gateOnlyRedStates({ labels: ['review:pending'], requiredChecks, rollup,
         drainGateSettings: { drainBlocksOnCodeQL: true } });
       expect.soft(result.gateOnlyRed).toBe(false);
       expect.soft(result.red).toContain('CodeQL');
@@ -189,11 +191,11 @@ describe('R10 escalation send-back regressions', () => {
     const requiredChecks = ['test'];
     const rollup = [
       { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
-      { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+      heldReview,
       { name: 'CodeQL', status: 'COMPLETED', conclusion: 'FAILURE' },
     ];
-    const result = verdictRecheck.gateOnlyRedStates({ requiredChecks, rollup });
-    expect.soft(verdictRecheck.gateOnlyRedStates({ drainGateSettings: { drainBlocksOnCodeQL: true }, requiredChecks, rollup }).gateOnlyRed).toBe(false);
+    const result = verdictRecheck.gateOnlyRedStates({ labels: ['review:pending'], requiredChecks, rollup });
+    expect.soft(verdictRecheck.gateOnlyRedStates({ labels: ['review:pending'], drainGateSettings: { drainBlocksOnCodeQL: true }, requiredChecks, rollup }).gateOnlyRed).toBe(false);
     expect.soft(result.gateOnlyRed).toBe(false);
     expect.soft(result.red).toContain('CodeQL');
     expect(await checkNeedsHumanEscalable({
@@ -224,9 +226,9 @@ describe('R10 escalation send-back regressions', () => {
 
   it('CodeQL failure is never excused by another attempt or the drain switch', () => {
     for (const conclusion of ['SUCCESS', 'FAILURE', 'CANCELLED']) {
-      const evidence = { requiredChecks: ['test'], rollup: [
+      const evidence = { labels: ['review:pending'], requiredChecks: ['test'], rollup: [
         { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
-        { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+        heldReview,
         { name: 'CodeQL', status: 'COMPLETED', conclusion: 'FAILURE', run_attempt: 1, completedAt: '2026-10-28T12:00:00-04:00' },
         { name: 'CodeQL', status: 'COMPLETED', conclusion, run_attempt: 2, completedAt: '2026-10-28T13:00:00-04:00' },
       ] };
@@ -261,7 +263,7 @@ describe('requiredCheckStates shared predicate regressions', () => {
         ];
         const evidence = { ...input, requiredChecks: ['test'], rollup: [
           ...(reverse ? rows.toReversed() : rows),
-          { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+          heldReview,
         ] };
         const expected = { red: [], pending: [], missing: [], green: [] };
         expected[conclusion === 'CANCELLED' ? 'pending' : 'red'] = ['test'];
@@ -288,7 +290,7 @@ describe('requiredCheckStates shared predicate regressions', () => {
     const rows = [
       { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-28T01:00:00Z' },
       { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T02:00:00Z' },
-      { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+      heldReview,
     ];
     for (const optional of [[], [{ name: 'unrelated-optional', status: 'COMPLETED', conclusion: 'SUCCESS', id: 100, run_attempt: 1 }]]) {
       const rollup = [...(reverse ? rows.toReversed() : rows), ...optional];
@@ -331,7 +333,7 @@ describe('requiredCheckStates shared predicate regressions', () => {
     ];
     const evidence = { ...input, requiredChecks: ['test'], rollup: [
       ...(reverse ? runs.toReversed() : runs),
-      { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+      heldReview,
     ] };
     expect(requiredCheckStates(evidence)).toEqual({ red: ['test'], pending: [], missing: [], green: [] });
     expect(contradictingChecks(evidence)).toEqual(['test']);
@@ -380,7 +382,7 @@ describe('requiredCheckStates shared predicate regressions', () => {
         : kind === 'CheckRun' ? { ...row, __typename: kind } : row);
       for (const pair of [rows, rows.toReversed()]) {
         const evidence = { ...input, requiredChecks: ['test'], rollup: [
-          ...pair, { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+          ...pair, heldReview,
         ] };
         expect(requiredCheckStates(evidence)).toEqual({ red: ['test'], pending: [], missing: [], green: [] });
         expect(contradictingChecks(evidence)).toEqual(['test']);
@@ -422,7 +424,7 @@ describe('requiredCheckStates shared predicate regressions', () => {
         ];
         for (const pair of [rows, rows.toReversed()]) {
           const evidence = { ...input, requiredChecks: ['test'], rollup: [
-            ...pair, { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+            ...pair, heldReview,
           ] };
           const expected = { red: [], pending: [], missing: [], green: [] };
           expected[bucket] = ['test'];
@@ -568,9 +570,75 @@ describe('requiredCheckStates shared predicate regressions', () => {
   });
 });
 
+describe('review wait requires a roster and the review-gate failure cause', () => {
+  const evidence = { requiredChecks: ['test', 'review-gate'], labels: ['review:pending'],
+    rollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }, heldReview] };
+
+  it.each([{ requiredChecks: [] }, { requiredChecks: null }])('unknown required roster $requiredChecks cannot establish a wait even with a proven hold', ({ requiredChecks }) => {
+    expect(verdictRecheck.waitingOnReview({ ...evidence, requiredChecks, rollup: [heldReview] })).toBe(false);
+  });
+
+  it.each([
+    ['missing', []],
+    ['queued', [{ name: 'test', status: 'QUEUED' }]],
+    ['in progress', [{ name: 'test', status: 'IN_PROGRESS' }]],
+    ['cancelled', [{ name: 'test', status: 'COMPLETED', conclusion: 'CANCELLED' }]],
+  ])('%s required check prevents review wait', (_name, rows) => {
+    expect(verdictRecheck.waitingOnReview({ ...evidence, rollup: [...rows, heldReview] })).toBe(false);
+  });
+
+  it.each([
+    ['checkout failure', { summary: 'actions/checkout failed' }],
+    ['node setup failure', { summary: 'actions/setup-node failed' }],
+    ['npm ci failure', { summary: 'npm ci failed' }],
+    ['missing summary', undefined],
+    ['null summary', { summary: null }],
+    ['unreadable summary', { summary: {} }],
+    ['clear verdict', { summary: 'check-review-gate ok - no review hold present' }],
+    ['unmatched label', { summary: 'check-review-gate held - a review hold stands: review:human' }],
+    ['unknown hold', { summary: 'check-review-gate held - a review hold stands: review:unknown' }],
+  ])('%s stays red despite review:pending', (_cause, output) => {
+    const input = { ...evidence, rollup: [evidence.rollup[0], { ...heldReview, output }] };
+    expect(verdictRecheck.waitingOnReview(input)).toBe(false);
+    expect(verdictRecheck.gateOnlyRedStates(input)).toEqual({ gateOnlyRed: false, red: ['review-gate'] });
+    expect(requiredCheckStates(input).red).toEqual(['review-gate']);
+    expect(ciGreenForEscalation(input)).toBe(false);
+  });
+
+  it.each([[undefined], [null], [[]], [['review:accepted']], [['review:human']]])(
+    'hold summary without a matching current hold label %j stays red', labels => {
+      expect(verdictRecheck.waitingOnReview({ ...evidence, labels })).toBe(false);
+      expect(ciGreenForEscalation({ ...evidence, labels })).toBe(false);
+    },
+  );
+
+  it.each(['check-review-gate held -', 'check-review-gate ✗ held —'])(
+    'recognizes the %s workflow verdict with label objects', prefix => {
+      const input = { ...evidence, labels: [{ name: 'review:pending' }], rollup: [
+        evidence.rollup[0], { ...heldReview, output: { summary: `${prefix} a review hold stands: review:pending` } },
+      ] };
+      expect(verdictRecheck.waitingOnReview(input)).toBe(true);
+      expect(ciGreenForEscalation(input)).toBe(true);
+    },
+  );
+
+  it('hold text on another check cannot excuse a review-gate setup failure', () => {
+    expect(verdictRecheck.waitingOnReview({ ...evidence, rollup: [
+      { ...evidence.rollup[0], output: reviewOutput }, { ...heldReview, output: undefined },
+    ] })).toBe(false);
+  });
+
+  it.each([false, true])('every failed review-gate row needs its own hold evidence (reverse=%s)', reverse => {
+    const rows = [heldReview, { ...heldReview, output: { summary: 'npm ci failed' } }];
+    expect(verdictRecheck.waitingOnReview({ ...evidence, rollup: [
+      evidence.rollup[0], ...(reverse ? rows.toReversed() : rows),
+    ] })).toBe(false);
+  });
+});
+
 describe('gateOnlyRedStates', () => {
   describe.each(['review-gate', 'merge-gate'])('%s review-wait evidence', name => {
-    const gate = evidence => ({ name, mergeGateReviewHold: true, ...evidence });
+    const gate = evidence => ({ name, mergeGateReviewHold: true, output: reviewOutput, ...evidence });
 
     it.each([
       ['startup failure', { status: 'COMPLETED', conclusion: 'STARTUP_FAILURE' }],
@@ -588,7 +656,7 @@ describe('gateOnlyRedStates', () => {
       ['unknown status', { status: 'unreadable', conclusion: 'FAILURE' }],
     ])('%s cannot establish gate-only red or review wait, even beside a completed failure', (_label, row) => {
       for (const gateRows of [[gate(row)], [gate({ status: 'COMPLETED', conclusion: 'FAILURE' }), gate(row)]]) {
-        const evidence = { requiredChecks: ['test', name], rollup: [...green, ...gateRows] };
+        const evidence = { labels: ['review:pending'], requiredChecks: ['test', name], rollup: [...green, ...gateRows] };
         expect(verdictRecheck.gateOnlyRedStates(evidence).gateOnlyRed).toBe(false);
         expect(verdictRecheck.waitingOnReview(evidence)).toBe(false);
         expect(ciGreenForEscalation(evidence)).toBe(false);
@@ -596,7 +664,7 @@ describe('gateOnlyRedStates', () => {
     });
 
     it.each(['FAILURE', 'failure'])('completed %s establishes a review wait', conclusion => {
-      const evidence = { requiredChecks: ['test', name], rollup: [
+      const evidence = { labels: ['review:pending'], requiredChecks: ['test', name], rollup: [
         ...green, gate({ status: 'completed', conclusion }),
       ] };
       expect(verdictRecheck.gateOnlyRedStates(evidence).gateOnlyRed).toBe(true);
@@ -614,14 +682,14 @@ describe('gateOnlyRedStates', () => {
 
   it.each(['review-gate', 'merge-gate'])('includes proven review hold %s even when absent from the required roster', name => {
     expect(verdictRecheck.gateOnlyRedStates({ ...input, rollup: [
-      ...green, { name, status: 'COMPLETED', conclusion: 'FAILURE',
+      ...green, { name, status: 'COMPLETED', conclusion: 'FAILURE', output: reviewOutput,
         ...(name === 'merge-gate' ? { mergeGateReviewHold: { holds: ['review-acceptance'], jobId: 123 } } : {}) },
     ] })).toEqual({ gateOnlyRed: true, red: [name] });
   });
 
   it('recognizes both gates red together', () => {
     const result = verdictRecheck.gateOnlyRedStates({ ...input, rollup: [
-      ...green, ...['review-gate', 'merge-gate'].map(name => ({ name, status: 'COMPLETED', conclusion: 'FAILURE',
+      ...green, ...['review-gate', 'merge-gate'].map(name => ({ name, status: 'COMPLETED', conclusion: 'FAILURE', output: reviewOutput,
         ...(name === 'merge-gate' ? { mergeGateReviewHold: { holds: ['review-acceptance'], jobId: 123 } } : {}) })),
     ] });
     expect(result.gateOnlyRed).toBe(true);
@@ -631,7 +699,7 @@ describe('gateOnlyRedStates', () => {
   it('a real required failure alongside a red gate is not gate-only red', () => {
     const result = verdictRecheck.gateOnlyRedStates({ requiredChecks: ['test'], rollup: [
       { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' },
-      { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+      heldReview,
     ] });
     expect(result.gateOnlyRed).toBe(false);
     expect(result.red.toSorted()).toEqual(['review-gate', 'test']);
@@ -649,9 +717,9 @@ describe('required check verdict recheck', () => {
     expect(notCiBreakContradicted(input)).toBe(true);
     expect(requiredCheckStates(input).red).toEqual(['test']);
   });
-  it('review-gate red alone never contradicts', () => {
+  it('historical review-gate FAILURE without cause evidence stays red even with a hold label', () => {
     const rollup = [...fixture.statusCheckRollup.filter((r) => r.name === 'review-gate' && r.conclusion === 'FAILURE'), ...green];
-    expect(contradictingChecks({ ...input, rollup, requiredChecks: [...fixture.requiredChecks, 'review-gate'] })).toEqual([]);
+    expect(contradictingChecks({ ...input, rollup, requiredChecks: [...fixture.requiredChecks, 'review-gate'] })).toEqual(['review-gate']);
   });
   it.each([{ outcome: 'needs-human', headSha: fixture.headRefOid }, { outcome: 'not-a-ci-break', headSha: 'abcdef0123456789' }])('ignores unrelated escalation %j', (escalation) => {
     expect(contradictingChecks({ ...input, escalation })).toEqual([]);
@@ -728,8 +796,8 @@ describe('void needs-human settings and green evidence', () => {
   });
   it('requires a known, settled required set, excluding review-gate', () => {
     const checks = ['test', 'review-gate'];
-    const rollup = [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }, { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' }];
-    expect(ciGreenForEscalation({ rollup, requiredChecks: checks })).toBe(true);
+    const rollup = [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }, heldReview];
+    expect(ciGreenForEscalation({ rollup, requiredChecks: checks, labels: ['review:pending'] })).toBe(true);
     for (const conclusion of ['FAILURE', 'TIMED_OUT']) expect(ciGreenForEscalation({ rollup: [{ ...rollup[0], conclusion }], requiredChecks: checks })).toBe(false);
     expect(ciGreenForEscalation({ rollup: [{ ...rollup[0], status: 'IN_PROGRESS' }], requiredChecks: checks })).toBe(false);
     expect(ciGreenForEscalation({ rollup: [], requiredChecks: checks })).toBe(false);
@@ -746,7 +814,7 @@ describe('R4 metadata regressions across verdict readers', () => {
     ];
     const evidence = { ...input, requiredChecks: ['test'], rollup: [
       ...(reverse ? rows.toReversed() : rows),
-      { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+      heldReview,
     ] };
     expect(requiredCheckStates(evidence)).toEqual({ red: ['test'], pending: [], missing: [], green: [] });
     expect(contradictingChecks(evidence)).toEqual(['test']);
@@ -797,11 +865,11 @@ describe('R272 fail-closed evidence across every row', () => {
       const rows = [
         { name: 'CodeQL', status: 'COMPLETED', conclusion: 'FAILURE', run_attempt: 1 },
         { name: 'CodeQL', status: 'COMPLETED', conclusion: 'SUCCESS', run_attempt: 2 },
-        { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+        heldReview,
         { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
       ];
       const rollup = reverse ? rows.toReversed() : rows;
-      expect(verdictRecheck.gateOnlyRedStates({ rollup, requiredChecks: ['test'],
+      expect(verdictRecheck.gateOnlyRedStates({ labels: ['review:pending'], rollup, requiredChecks: ['test'],
         drainGateSettings: { drainBlocksOnCodeQL } }).gateOnlyRed).toBe(false);
       expect(notCiBreakRecordRefusal({ headSha: input.headSha,
         pr: { headRefOid: input.headSha, statusCheckRollup: rollup }, requiredChecks: ['test'] }))

@@ -7,8 +7,8 @@
  * so with no new push the stale verdict made `reconcile-core.mjs` refuse every heal on that head (`ci-heal-escalated`)
  * for hours, and the notes half told the operator it "needs your decision".
  *
- * `not-a-ci-break` means "every required check is green; only the review gate is red". A required check other than
- * `review-gate` with any failing row on this head contradicts it. Two uses:
+ * `not-a-ci-break` means "every required check is green; only proven review holds are red". Any other required
+ * failure on this head contradicts it, including a review-gate failure whose cause is unreadable. Two uses:
  *   - {@link contradictingChecks}: the daemon voids a contradicted verdict (a void comment, see
  *     `ci-heal-escalation-mark.mjs#CI_HEAL_VERDICT_VOID_MARKER`); the ordinary ci-heal path (caps included) resumes.
  *   - {@link unsettledRequiredChecks}: the escalation CLI refuses to record `not-a-ci-break` while a required check is
@@ -26,6 +26,7 @@ import { fileURLToPath } from 'node:url';
 import { withoutImpliedRequiredChecks } from '../lib/required-check-implication.mjs';
 import { classifyCheck, summarize } from '../lib/check-state-predicate.mjs';
 import { CODEQL_CHECK_NAME } from '../lib/codeql-gate.mjs';
+import { REVIEW_HOLD_LABELS } from '../lib/review-escalation.mjs';
 
 export const CI_HEAL_VERDICT_ENV = 'WE_CI_HEAL_RECHECK_NOT_CI_BREAK';
 export const ciHealVerdictSettingsPath = () => join(dirname(fileURLToPath(import.meta.url)), 'ci-heal-verdict-settings.json');
@@ -72,11 +73,11 @@ export function resolveVoidNeedsHumanWhenCiGreen(env = process.env, {
 }
 
 /** No known required set means no evidence that CI is green. Pure. */
-export function ciGreenForEscalation({ rollup, requiredChecks }) {
+export function ciGreenForEscalation({ rollup, requiredChecks, labels }) {
   if (!Array.isArray(requiredChecks) || !requiredChecks.length) return false;
-  const { red, pending, missing } = requiredCheckStates({ rollup, requiredChecks });
+  const { red, pending, missing } = requiredCheckStates({ rollup, requiredChecks, labels });
   if (red.length || pending.length || missing.length) return false;
-  const { checks, holdGateNames } = checkEvidence(rollup, requiredChecks);
+  const { checks, holdGateNames } = checkEvidence(rollup, requiredChecks, labels);
   return summarize(checks.filter(row => !holdGateNames.includes(row.name)), {
     requiredNames: checks.map(row => row.name).filter(name => !holdGateNames.includes(name)),
   }).allRequiredGreen;
@@ -104,8 +105,22 @@ export function latestRollupAttempts(rollup) {
 }
 
 /** Adapt GraphQL rollups and legacy statuses without replacing the shared state policy. */
-function checkEvidence(rollup, requiredChecks) {
+function checkEvidence(rollup, requiredChecks, labels) {
   const checks = (Array.isArray(rollup) ? rollup : []).map(normalizeRollupCheck);
+  const holdLabels = Array.isArray(labels)
+    ? labels.map(label => typeof label === 'string' ? label : label?.name).filter(label => REVIEW_HOLD_LABELS.includes(label))
+    : [];
+  // No IO here. Both workflow paths print this verdict, but an overall FAILURE
+  // also covers checkout/setup/npm-ci errors. Without this row's own hold
+  // summary and a matching current label, leave the failure as CI work.
+  const reviewHold = row => typeof row.output?.summary === 'string'
+    && row.output.summary.split('\n').some(line => {
+      const match = /^check-review-gate (?:✗ held —|held -) a review hold stands: (.+)$/.exec(line.trim());
+      if (!match) return false;
+      const reported = match[1].split(', ');
+      return reported.every(label => REVIEW_HOLD_LABELS.includes(label))
+        && reported.some(label => holdLabels.includes(label));
+    });
   // Every non-green gate row must be a completed FAILURE. Setup failures,
   // unfinished or unreadable evidence cannot establish a review wait. merge-gate
   // additionally needs the shared classifier's head-bound review-hold annotation.
@@ -115,7 +130,7 @@ function checkEvidence(rollup, requiredChecks) {
       classifyCheck({ ...row, required: true }) === 'green'
       || (typeof row.status === 'string' && lowerState(row.status) === 'completed'
         && typeof row.conclusion === 'string' && lowerState(row.conclusion) === 'failure'
-        && (name === REVIEW_GATE_CHECK || !!row.mergeGateReviewHold)));
+        && (name === REVIEW_GATE_CHECK ? reviewHold(row) : !!row.mergeGateReviewHold)));
   });
   const roster = withoutImpliedRequiredChecks(Array.isArray(requiredChecks) ? requiredChecks : [], checks)
     .filter(name => !holdGateNames.includes(name));
@@ -127,13 +142,13 @@ function checkEvidence(rollup, requiredChecks) {
 }
 
 /**
- * The required checks (minus review-gate and proven merge-gate review holds), judged across every row. PURE.
+ * The required checks minus proven review holds, judged across every row. PURE.
  * An empty/unknown required set judges only observed CodeQL evidence.
  * @returns {{red: string[], pending: string[], missing: string[], green: string[]}}
  */
-export function requiredCheckStates({ rollup, requiredChecks }) {
+export function requiredCheckStates({ rollup, requiredChecks, labels }) {
   const out = { red: [], pending: [], missing: [], green: [] };
-  const { checks, roster } = checkEvidence(rollup, requiredChecks);
+  const { checks, roster } = checkEvidence(rollup, requiredChecks, labels);
   const { redSet, pendingSet } = summarize(checks, { requiredNames: roster });
   const observed = new Set(checks.map(row => row.name));
   for (const name of roster) {
@@ -146,8 +161,8 @@ export function requiredCheckStates({ rollup, requiredChecks }) {
 }
 
 /** Include gates and CodeQL evidence, even outside the required roster. */
-export function gateOnlyRedStates({ rollup, requiredChecks }) {
-  const { checks, roster, holdGateNames } = checkEvidence(rollup, requiredChecks);
+export function gateOnlyRedStates({ rollup, requiredChecks, labels }) {
+  const { checks, roster, holdGateNames } = checkEvidence(rollup, requiredChecks, labels);
   // Review-wait is a claim about the whole rollup, not just branch protection.
   // In particular review-gate and real optional failures must not disappear.
   const requiredNames = [...new Set([...roster, ...checks.map(row => row.name)])];
@@ -156,9 +171,10 @@ export function gateOnlyRedStates({ rollup, requiredChecks }) {
 }
 
 /** Proven review-only failure, with complete green evidence for every other check. */
-export function waitingOnReview({ rollup, requiredChecks }) {
+export function waitingOnReview({ rollup, requiredChecks, labels }) {
+  if (!Array.isArray(requiredChecks) || !requiredChecks.length) return false;
   if (!Array.isArray(rollup) || !rollup.length) return false;
-  const { checks, roster, holdGateNames } = checkEvidence(rollup, requiredChecks);
+  const { checks, roster, holdGateNames } = checkEvidence(rollup, requiredChecks, labels);
   const requiredNames = [...new Set([...roster, ...checks.map(row => row.name)])];
   const { gateOnlyRed, pendingSet } = summarize(checks, { requiredNames, holdGateNames });
   return gateOnlyRed && pendingSet.size === 0;
@@ -169,9 +185,9 @@ export function waitingOnReview({ rollup, requiredChecks }) {
  * @param {{escalation:{outcome?:string, headSha?:string}|null, headSha:string, rollup:Array<object>, requiredChecks:string[]}} o
  * @returns {string[]}
  */
-export function contradictingChecks({ escalation, headSha, rollup, requiredChecks }) {
+export function contradictingChecks({ escalation, headSha, rollup, requiredChecks, labels }) {
   if (escalation?.outcome !== 'not-a-ci-break' || !sameSha(escalation.headSha, headSha)) return [];
-  return requiredCheckStates({ rollup, requiredChecks }).red;
+  return requiredCheckStates({ rollup, requiredChecks, labels }).red;
 }
 
 /** {@link contradictingChecks} as a yes/no. PURE. */
@@ -180,11 +196,11 @@ export function notCiBreakContradicted(o) {
 }
 
 /**
- * Prevention at the source: the required checks (minus `review-gate`) that keep a `not-a-ci-break` verdict from being
+ * Prevention at the source: the required checks (minus proven review holds) that keep a `not-a-ci-break` verdict from being
  * recordable yet — still running, not started, or red. `[]` means they all finished green. PURE.
  * @returns {{pending: string[], missing: string[], red: string[]}}
  */
-export function unsettledRequiredChecks({ rollup, requiredChecks }) {
-  const s = requiredCheckStates({ rollup, requiredChecks });
+export function unsettledRequiredChecks({ rollup, requiredChecks, labels }) {
+  const s = requiredCheckStates({ rollup, requiredChecks, labels });
   return { pending: s.pending, missing: s.missing, red: s.red };
 }

@@ -156,7 +156,7 @@ export function buildCandidates(prs, {
   const out = [];
   for (const pr of Array.isArray(prs) ? prs : []) {
     if (REVIEW_HOLD_LABELS.some(label => hasReviewLabel(pr?.labels, label))
-      && waitingOnReview({ rollup: pr?.statusCheckRollup, requiredChecks: checks })) continue;
+      && waitingOnReview({ rollup: pr?.statusCheckRollup, requiredChecks: checks, labels: pr?.labels })) continue;
     if (!isAnyRequiredCheckFailed(pr, checks)) continue;
     const prNumber = Number(pr?.number);
     if (!Number.isInteger(prNumber) || prNumber <= 0) continue;

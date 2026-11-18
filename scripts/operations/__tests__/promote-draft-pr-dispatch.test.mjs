@@ -15,10 +15,104 @@ const NOOP_STATUS = () => {};
 
 describe('review-hold-only red draft promotion', () => {
   const HEAD = 'a'.repeat(40);
-  const check = (name, conclusion = 'success', extra = {}) => ({ name, status: 'completed', conclusion, ...extra });
+  const check = (name, conclusion = 'success', extra = {}) => ({ name, status: 'completed', conclusion,
+    ...(name === 'review-gate' ? { output: { summary: 'check-review-gate held - a review hold stands: review:pending' } } : {}), ...extra });
   const heldRows = () => [check('test'), check('review-gate', 'failure'), check('merge-gate', 'failure', { id: 123 })];
   const verdict = () => ({ num: 198, head_sha: HEAD, ok: false,
     results: [{ id: 'review-hold-labels', status: 'hold', reason: 'review required' }] });
+
+  function promoteFromRawReviewGate(readReviewGateLog, {
+    setting = 'on', readPrLabels = () => ['review:pending'], mergeGateFailure = false,
+  } = {}) {
+    const repoSlug = 'web-everything/web-everything';
+    // Raw GitHub REST rows have details_url and no output.summary.
+    const rows = [check('test'), check('merge-gate', mergeGateFailure ? 'failure' : 'success', { id: 123 }), {
+      name: 'review-gate', status: 'completed', conclusion: 'failure',
+      details_url: `https://github.com/${repoSlug}/actions/runs/100/job/456`,
+    }];
+    const runGh = vi.fn(() => rows.map(row => JSON.stringify(row)).join('\n'));
+    const ready = vi.fn();
+    const readFreshLabels = vi.fn(readPrLabels);
+    const readMergeGateVerdict = vi.fn(verdict);
+    const readHeadCheckState = vi.fn(args => defaultReadHeadCheckState({ ...args,
+      prNumber: 198, runGh, readReviewGateLog, readPrLabels: readFreshLabels, readMergeGateVerdict,
+      getRequiredChecks: () => ({ checks: ['test', 'merge-gate', 'review-gate'], source: 'live' }),
+      mergeGateSetting: { value: setting },
+    }));
+    const result = runReconcilePromoteDraftDispatch({ root: '/repo', repo: repoSlug,
+      reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 198, headRefOid: HEAD }], refusals: [] }),
+      provider: { ready }, checkStaleness: FRESH, readPrLabels: () => ['review:pending'],
+      readHeadCheckState, clearAwaitingCi: NOOP_STATUS,
+    });
+    return { result, ready, readHeadCheckState, readFreshLabels, readMergeGateVerdict, runGh, rows, repoSlug };
+  }
+
+  const reviewLog = (log = 'check-review-gate held - a review hold stands: review:pending', head = HEAD) => ({
+    job: { name: 'review-gate', head_sha: head, status: 'completed', conclusion: 'failure' },
+    log: `2026-11-17T22:40:00.1234567Z ${log}\n`,
+  });
+
+  it.each(['on', 'off'])('promotes a raw summary-less review-gate failure with verified hold logs and merge-gate holds %s', setting => {
+    const readReviewGateLog = vi.fn(() => reviewLog());
+    const { result, ready, readHeadCheckState, readFreshLabels, runGh, rows, repoSlug } = promoteFromRawReviewGate(readReviewGateLog, { setting });
+    expect(rows[2].output).toBeUndefined();
+    expect(readReviewGateLog).toHaveBeenCalledTimes(1);
+    expect(readReviewGateLog).toHaveBeenCalledWith({ repo: repoSlug, jobId: 456, runGh });
+    expect(readFreshLabels).toHaveBeenCalledTimes(1);
+    expect(readFreshLabels).toHaveBeenCalledWith({ repoSlug, prNumber: 198, runGh });
+    expect(readHeadCheckState).toHaveReturnedWith(expect.objectContaining({ state: 'red', reviewHoldOnly: true }));
+    expect(ready).toHaveBeenCalledTimes(1);
+    expect(ready).toHaveBeenCalledWith(198);
+    expect(result.dispatched).toEqual([{ pr: 198, kind: 'promote-draft' }]);
+    expect(result.refusals).toEqual([]);
+  });
+
+  it.each(['on', 'off'])('refuses a proven review-gate hold when current labels are unreadable and merge-gate holds are %s', setting => {
+    const { result, ready, readHeadCheckState } = promoteFromRawReviewGate(() => reviewLog(), {
+      setting, readPrLabels: () => { throw new Error('labels unreadable'); },
+    });
+    expect(readHeadCheckState).toHaveReturnedWith(expect.objectContaining({ state: 'red', reviewHoldOnly: false }));
+    expect(ready).not.toHaveBeenCalled();
+    expect(result.dispatched).toEqual([]);
+    expect(result.refusals).toEqual([expect.objectContaining({ pr: 198, kind: 'stale-check-refused' })]);
+  });
+
+  it.each(['on', 'off'])('requires a current matching review label with merge-gate holds %s', setting => {
+    const { result, ready } = promoteFromRawReviewGate(() => reviewLog(), {
+      setting, readPrLabels: () => ['review:changes'],
+    });
+    expect(ready).not.toHaveBeenCalled();
+    expect(result.dispatched).toEqual([]);
+    expect(result.refusals).toEqual([expect.objectContaining({ pr: 198, kind: 'stale-check-refused' })]);
+  });
+
+  it('keeps a failed merge-gate unexcused when its setting is off beside a proven review-gate hold', () => {
+    const { result, ready, readFreshLabels, readMergeGateVerdict } = promoteFromRawReviewGate(() => reviewLog(), {
+      setting: 'off', mergeGateFailure: true,
+    });
+    expect(readFreshLabels).toHaveBeenCalledTimes(1);
+    expect(readMergeGateVerdict).not.toHaveBeenCalled();
+    expect(ready).not.toHaveBeenCalled();
+    expect(result.dispatched).toEqual([]);
+    expect(result.refusals).toEqual([expect.objectContaining({ pr: 198, kind: 'stale-check-refused' })]);
+  });
+
+  it.each([
+    ['checkout failure', () => reviewLog('checkout: repository not found')],
+    ['unreadable log', () => ({ error: 'HTTP 403' })],
+    ['throwing reader', () => { throw new Error('log unavailable'); }],
+    ['wrong head', () => reviewLog(undefined, 'b'.repeat(40))],
+  ])('refuses fresh promotion from a raw review-gate row with %s evidence', (_cause, reader) => {
+    const readReviewGateLog = vi.fn(reader);
+    const { result, ready, readHeadCheckState } = promoteFromRawReviewGate(readReviewGateLog);
+    expect(readReviewGateLog).toHaveBeenCalledTimes(1);
+    expect(readHeadCheckState).toHaveReturnedWith(expect.objectContaining({ state: 'red', reviewHoldOnly: false }));
+    expect(ready).not.toHaveBeenCalled();
+    expect(result.dispatched).toEqual([]);
+    expect(result.refusals).toEqual([expect.objectContaining({
+      pr: 198, kind: 'stale-check-refused', checkState: 'red', headSha: HEAD,
+    })]);
+  });
 
   it.each([
     ['annotated merge-gate and review-gate red', heldRows(), 'red', true],
@@ -46,6 +140,22 @@ describe('review-hold-only red draft promotion', () => {
       runGh: () => heldRows().map(row => JSON.stringify(row)).join('\n'),
       getRequiredChecks: () => ({ checks: ['test', 'merge-gate', 'review-gate'], source: 'live' }),
       readPrLabels: () => ['review:pending'], readMergeGateVerdict: () => ({ error: 'unreadable' }),
+      mergeGateSetting: { value: 'on' },
+    });
+    expect(out).toMatchObject({ state: 'red', reviewHoldOnly: false });
+  });
+
+  it.each([
+    ['unreadable cause', undefined, ['review:pending']],
+    ['setup failure', { summary: 'npm ci failed' }, ['review:pending']],
+    ['no hold label', { summary: 'check-review-gate held - a review hold stands: review:pending' }, []],
+  ])('the fresh promotion reader keeps review-gate red for %s', (_cause, output, labels) => {
+    const rows = [check('test'), check('merge-gate'), check('review-gate', 'failure', { output })];
+    const out = defaultReadHeadCheckState({
+      repoSlug: 'web-everything/web-everything', sha: HEAD, prNumber: 198,
+      runGh: () => rows.map(row => JSON.stringify(row)).join('\n'),
+      getRequiredChecks: () => ({ checks: ['test', 'merge-gate', 'review-gate'], source: 'live' }),
+      readPrLabels: () => labels, readMergeGateVerdict: () => { throw new Error('no failing merge-gate to read'); },
       mergeGateSetting: { value: 'on' },
     });
     expect(out).toMatchObject({ state: 'red', reviewHoldOnly: false });

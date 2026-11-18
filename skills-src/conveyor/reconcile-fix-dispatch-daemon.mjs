@@ -585,17 +585,17 @@ export const MAX_VERDICT_VOIDS_PER_HEAD = 3;
  */
 export function planVerdictVoid({ note, pr, repo, verdictSettings, readRequiredChecks }) {
   if (!verdictSettings?.recheckNotCiBreak || note?.kind !== 'ci-heal-escalated' || note?.outcome !== 'not-a-ci-break' || !pr) return null;
-  // Cheap pre-filter first: with no failing run other than review-gate on the PR at all, nothing can contradict the
-  // verdict, so the required-check set is never read.
+  // Cheap pre-filter first: proven review holds cannot contradict the verdict,
+  // so the required-check set is only read for other failures or unknown causes.
   const anyRed = contradictingChecks({
-    escalation: { outcome: note.outcome, headSha: note.headSha }, headSha: pr.headRefOid, rollup: pr.statusCheckRollup,
+    escalation: { outcome: note.outcome, headSha: note.headSha }, headSha: pr.headRefOid, rollup: pr.statusCheckRollup, labels: pr.labels,
     requiredChecks: [...new Set((pr.statusCheckRollup ?? []).map((r) => r?.name ?? r?.context).filter(Boolean))],
   });
   if (!anyRed.length) return null;
   let requiredChecks = [];
   try { requiredChecks = readRequiredChecks({ repo }) ?? []; } catch { return null; }
   const red = contradictingChecks({
-    escalation: { outcome: note.outcome, headSha: note.headSha }, headSha: pr.headRefOid, rollup: pr.statusCheckRollup, requiredChecks,
+    escalation: { outcome: note.outcome, headSha: note.headSha }, headSha: pr.headRefOid, rollup: pr.statusCheckRollup, requiredChecks, labels: pr.labels,
   });
   if (!red.length) return null;
   const head = String(note.headSha).toLowerCase();
@@ -629,7 +629,7 @@ export function planNeedsHumanVoid({ note, pr, repo, verdictSettings, readRequir
   if (voidCount >= MAX_VERDICT_VOIDS_PER_HEAD) return null;
   let requiredChecks;
   try { requiredChecks = readRequiredChecks({ repo }); } catch { return null; }
-  if (!ciGreenForEscalation({ rollup: pr.statusCheckRollup, requiredChecks })) return null;
+  if (!ciGreenForEscalation({ rollup: pr.statusCheckRollup, requiredChecks, labels: pr.labels })) return null;
   return { ...row, alreadyPosted: false,
     body: buildCiHealVerdictVoidComment({ headSha: head, voids: 'needs-human', cause: 'required-ci-green' }) };
 }

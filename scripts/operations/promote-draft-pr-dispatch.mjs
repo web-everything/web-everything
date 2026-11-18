@@ -57,7 +57,7 @@ import { isTerminalStatus } from '../lib/backlog-status.cjs';
  * threading this function's own already-resolved `repoSlug` through to the provider as an explicit `--repo`
  * — `undefined` for the WE-default path (byte-identical to before), the real slug otherwise.
  */
-import { excuseMergeGateRows, latestFailingMergeGate, loadMergeGateHoldSetting, readMergeGateVerdict as defaultReadMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
+import { annotateReviewGateRows, excuseMergeGateRows, latestFailingMergeGate, loadMergeGateHoldSetting, readMergeGateVerdict as defaultReadMergeGateVerdict, readReviewGateLog as defaultReadReviewGateLog } from '../lib/merge-gate-hold-class.mjs';
 import { loadPromotionRequiredChecksSetting, promotionRequiredChecks } from '../lib/promotion-required-checks.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
@@ -110,6 +110,7 @@ export function isPromoteCodePath(path, { closure = promoteCodeClosure() } = {})
 export function defaultReadHeadCheckState({
   repoSlug, sha, prNumber, runGh = runGhSync, getRequiredChecks = getRequiredStatusChecks,
   readPrLabels = defaultReadPrLabels, readMergeGateVerdict = defaultReadMergeGateVerdict,
+  readReviewGateLog = defaultReadReviewGateLog,
   readFreeze = readSharedFreeze, mergeGateSetting, forPromotion = false, absentNotApplicable,
 } = {}) {
   const requiredChecks = getRequiredChecks({ repo: repoSlug }).checks;
@@ -117,11 +118,20 @@ export function defaultReadHeadCheckState({
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'pr-status-checks', repo: repoSlug },
   });
   let rows = parseJsonLines(raw);
+  // REST check rows carry the job URL, but no hold summary. Acquire the same
+  // head-bound log evidence as reconcile before judging a fresh promotion.
+  rows = annotateReviewGateRows(rows, { repo: repoSlug, headSha: sha,
+    readLog: args => readReviewGateLog({ ...args, runGh }),
+  });
+  let labels;
   try {
+    const reviewGateFailed = rows.some(row => row.name === 'review-gate' && row.conclusion?.toLowerCase() === 'failure');
+    // Current review labels are evidence even when merge-gate exceptions are off.
+    if (reviewGateFailed) labels = readPrLabels({ repoSlug, prNumber, runGh });
     if (latestFailingMergeGate(rows)) {
       const setting = mergeGateSetting ?? loadMergeGateHoldSetting();
       if (setting.value === 'on') {
-        const labels = readPrLabels({ repoSlug, prNumber, runGh });
+        if (!reviewGateFailed) labels = readPrLabels({ repoSlug, prNumber, runGh });
         rows = excuseMergeGateRows(rows, { prNumber, headSha: sha, labels, setting,
           readVerdict: args => readMergeGateVerdict({ ...args, repo: repoSlug, runGh }),
           freeze: () => readFreeze(),
@@ -134,7 +144,7 @@ export function defaultReadHeadCheckState({
     ? promotionRequiredChecks(requiredChecks, rows, absentNotApplicable ?? loadPromotionRequiredChecksSetting().value)
     : requiredChecks;
   const result = reduceCheckState(rows, promotionChecks);
-  return { ...result, reviewHoldOnly: result.state === 'red' && reviewHoldOnlyRed(rows, promotionChecks) };
+  return { ...result, reviewHoldOnly: result.state === 'red' && reviewHoldOnlyRed(rows, promotionChecks, labels) };
 }
 
 function validatePrLabels(labels) {

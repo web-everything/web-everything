@@ -3541,7 +3541,8 @@ describe('draft-first PRs — reconcile-core.mjs (operator-approved 2026-09-27)'
 
 describe('review-hold-only required reds do not deadlock draft promotion or review', () => {
   const requiredChecks = ['test', 'merge-gate', 'review-gate'];
-  const check = (name, conclusion = 'success', extra = {}) => ({ name, status: 'completed', conclusion, ...extra });
+  const check = (name, conclusion = 'success', extra = {}) => ({ name, status: 'completed', conclusion,
+    ...(name === 'review-gate' ? { output: { summary: 'check-review-gate held - a review hold stands: review:pending' } } : {}), ...extra });
   // Shape attached by excuseMergeGateRows: a review hold keeps merge-gate red but annotates its owner.
   const heldRollup = () => [
     check('test'),
@@ -4246,7 +4247,8 @@ describe('green-head needs-human retirement (#5012)', () => {
   const pr = { number: 5012, state: 'OPEN', headRefOid: head, mergeStateStatus: 'BLOCKED',
     labels: [{ name: 'review:pending' }], comments: [{ author: { login: 'web-everything' },
       body: buildCiHealEscalationComment({ headSha: head, outcome: 'needs-human' }) }],
-    statusCheckRollup: requiredChecks.map(name => ({ name, status: 'COMPLETED', conclusion: name === 'review-gate' ? 'FAILURE' : 'SUCCESS' })),
+    statusCheckRollup: requiredChecks.map(name => ({ name, status: 'COMPLETED', conclusion: name === 'review-gate' ? 'FAILURE' : 'SUCCESS',
+      ...(name === 'review-gate' ? { output: { summary: 'check-review-gate held - a review hold stands: review:pending' } } : {}) })),
   };
   const plan = (row = pr, on = true) => planReconcileCore({ prs: [row], requiredChecks, verdictSettings: { voidNeedsHumanWhenCiGreen: on } });
   it('emits one moot note outside ci-red without changing dispatch/refusals', () => {
