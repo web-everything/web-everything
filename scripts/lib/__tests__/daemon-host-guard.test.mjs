@@ -334,13 +334,24 @@ describe('GitHub ownership source', () => {
       const { bin, marker } = stubGh(30);
       const errors = [];
       const started = Date.now();
-      const decision = await guard.resolveHostRole({ thisHost: ME, source: syncSource(bin, errors), timeoutMs: 300 });
+      const decision = await guard.resolveHostRole({ thisHost: ME, source: syncSource(bin, errors), timeoutMs: 1500 });
       expect(Date.now() - started).toBeLessThan(5000);
       // The stub really ran and was killed by its own timeout (not a fast spawn failure).
       expect(statSync(marker).isFile()).toBe(true);
       expect(errors).toHaveLength(1);
       expect(errors[0]).toMatchObject({ code: 'ETIMEDOUT' });
       expect(decision).toMatchObject({ role: 'standby', reason: 'owner-unreadable', source: 'remote-failed' });
+    });
+
+    it('a killed, timed-out or overflowed child never yields an HTTP status from its partial output', () => {
+      const partial = '{"message":"Not Found","status": "404"}';
+      for (const failure of [{ code: 'ETIMEDOUT' }, { code: 'ENOBUFS' }, { signal: 'SIGKILL' }]) {
+        const run = guard.runGhApi('fixture', { execFile: () => { throw Object.assign(new Error('killed'), failure, { stdout: partial, stderr: 'gh: HTTP 404' }); } });
+        expect(run).toEqual({ ok: false, status: null });
+      }
+      // A genuine non-zero exit (no kill) still reports its status, so a real 404 stays distinguishable.
+      expect(guard.runGhApi('fixture', { execFile: () => { throw Object.assign(new Error('exit 1'), { stderr: 'gh: Not Found (HTTP 404)' }); } }))
+        .toMatchObject({ ok: false, status: 404 });
     });
 
     it('runGhApi caps the child timeout at the caller deadline and kills with SIGKILL', () => {

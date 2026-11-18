@@ -117,6 +117,8 @@ export function runGhApi(path, { execFile = execFileSync, timeoutMs = READ_TIMEO
     });
     return { ok: true, status: 200, body: JSON.parse(output) };
   } catch (error) {
+    // A killed, timed-out or overflowed child leaves only partial output: never read an HTTP status out of it.
+    if (error?.code === 'ETIMEDOUT' || error?.code === 'ENOBUFS' || error?.signal) return { ok: false, status: null };
     const message = String(error?.stderr ?? '') + '\n' + String(error?.stdout ?? '') + '\n' + String(error?.message ?? error);
     const status = /(?:HTTP\s+|["']?status["']?\s*:\s*)(\d{3})\b/i.exec(message);
     return { ok: false, status: status ? Number(status[1]) : null };
