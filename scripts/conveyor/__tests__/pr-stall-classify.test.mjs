@@ -109,6 +109,19 @@ describe('every state x every verdict', () => {
 });
 
 describe('known drain waits explain what releases them', () => {
+  it.each([0, CLASSIFY_DEFAULTS.unknownMergeabilityDeadlineMs / 60_000 + 1, 10_000])('batching deferral is a known drain-owned wait without a deadline (age %s minutes)', (ageMinutes) => {
+    const result = at('drain-skip:batching-deferred', { row: { actor: 'drain', ageMinutes } });
+    expect(result).toMatchObject({
+      action: 'drain-skip:batching-deferred',
+      reason: 'drain is batching; deferred to a later pass',
+    });
+  });
+  it('batching deferral fails closed on a contradictory operator owner', () => {
+    expect(at('drain-skip:batching-deferred', { row: { actor: 'operator' } })).toMatchObject({
+      lane: 'operator', action: 'unclassified',
+      reason: 'fail-closed: actor "operator" does not fit drain-skip:batching-deferred',
+    });
+  });
   it('same-head merge-queue failure is held until the head changes', () => {
     const result = at('drain-skip:mq-same-head-failed', { row: { actor: 'drain' } });
     expect(result.reason).not.toContain('unknown waiting state');

@@ -51,7 +51,9 @@ export async function main(args,{read=readForgeTelemetry,write=text=>process.std
   }
   if(!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host))throw new Error('Invalid host');
   const value=parseTelemetry(JSON.stringify(await read({host})));
-  write((json?JSON.stringify(value):formatTelemetry(value,host))+'\n');
+  const last=value.recent.find(r=>r.code!==null);
+  const tail=last?.failureTail?.replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g,'');
+  write((json?JSON.stringify(value):formatTelemetry(value,host)+(tail?`\nfailureTail:\n${tail}`:''))+'\n');
 }
 const cliPath = (()=>{try{return realpathSync(process.argv[1]);}catch{return '';}})();
 if(process.argv[1] && cliPath===realpathSync(fileURLToPath(import.meta.url))) {
