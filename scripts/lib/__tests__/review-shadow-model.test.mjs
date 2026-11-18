@@ -572,6 +572,10 @@ describe('resolveShadowPromoted fails closed on an unreadable or malformed tool 
     'a %s tool file refuses promotion even when the platform layer says true', (_n, readFile) => {
       expect(resolveShadowPromoted({ env: {}, readFile, platform, log: () => {} })).toMatchObject({ value: false });
     });
+  it.each([['null', { shadowSeats: { antigravity: null } }], ['array', { shadowSeats: [] }], ['string', { shadowSeats: 'x' }],
+    ['non-object root', []]])('a malformed ancestor (%s) refuses promotion even when the platform layer says true', (_n, tool) => {
+    expect(resolveShadowPromoted({ env: {}, readFile: () => JSON.stringify(tool), platform, log: () => {} })).toMatchObject({ value: false });
+  });
   it('an absent tool file lets the platform layer speak', () => {
     const readFile = () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }); };
     expect(resolveShadowPromoted({ env: {}, readFile, platform, log: () => {} })).toMatchObject({ value: true });

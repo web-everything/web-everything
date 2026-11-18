@@ -225,6 +225,15 @@ export function resolveShadowPromoted({ env = process.env, file = REVIEW_SETTING
       return { value: false, source: 'refused' };
     }
   }
+  // Malformed ANCESTORS of the promoted key (shadowSeats / shadowSeats.antigravity present but not an object) refuse too.
+  const isObject = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+  const parentsOk = !isObject(tool) ? false
+    : (tool.shadowSeats === undefined || (isObject(tool.shadowSeats)
+      && (tool.shadowSeats.antigravity === undefined || isObject(tool.shadowSeats.antigravity))));
+  if (!parentsOk) {
+    log('review.shadowSeats.antigravity: promoted=false (tool review.json shadowSeats is malformed; promotion refused)');
+    return { value: false, source: 'refused' };
+  }
   // A present malformed override refuses promotion at its own layer rather than exposing a lower true.
   const project = value => value === undefined ? {} : { promoted: value === true };
   const envPromoted = env.WE_REVIEW_SHADOW_AGY_PROMOTED;
