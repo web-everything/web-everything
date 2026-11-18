@@ -2692,7 +2692,8 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
     const job = /\/job\/(\d+)/.exec(failed.details_url ?? '')?.[1];
     if (job && !annotations.some(a => a.annotation_level === 'failure')) {
       const result = readCiJobLog({ repo, jobId: job,
-        exec: (_command, args) => gh(args) });
+        // Forward the helper's exec options: without its maxBuffer a log over Node's 1 MiB default is ENOBUFS.
+        exec: (_command, args, opts) => gh(args, opts) });
       if (!result.ok) throw new Error(result.reason);
       let metadata;
       try { metadata = api(`actions/jobs/${job}`); } catch { /* Preserve the published diagnostic. */ }

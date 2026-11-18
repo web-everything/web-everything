@@ -186,6 +186,10 @@ describe('abandoned builder draft recovery', () => {
       metadata: { steps: [...steps, { conclusion: 'success', started_at: '2026-09-30T01:00:20Z', completed_at: '2026-09-30T01:00:29Z' }] },
       expectedError: noDetail,
       log: '2026-09-30T01:00:11Z failed step\n\x1b[32m2026-09-30T01:00:21Z passing step\x1b[0m\nError: Passing-step error context' },
+    // A whole-job log past Node's 1 MiB default buffer stays readable: the helper's maxBuffer reaches gh.
+    { evidence: 'a whole-job log over the 1 MiB default buffer', metadata: { steps }, expectedError: '##[error]AssertionError: Done-when 2',
+      log: `2026-09-30T01:00:01Z passing step ${'x'.repeat(2_200_000)}\n`
+        + '2026-09-30T01:00:11Z failed step\n##[error]AssertionError: Done-when 2\nsummary' },
     { evidence: 'missing step metadata', metadata: {}, expectedError: noDetail },
     { evidence: 'published check detail', metadata: {}, summary: 'AssertionError: failed check summary', expectedError: 'AssertionError: failed check summary' },
     { evidence: 'malformed step metadata', metadata: { steps: [null, steps[1]] }, expectedError: noDetail },
@@ -220,8 +224,15 @@ describe('abandoned builder draft recovery', () => {
           { id: 2, name: 'test-shard (2)', conclusion: 'failure', output: { summary }, details_url: 'https://github.com/web-everything/web-everything/actions/runs/123/job/456' },
         ] };
       }),
-      paged: vi.fn(() => []), gh: vi.fn(() => log ?? ('2026-09-30T01:00:01Z ##[error]Passing-step error context\n'
-        + '2026-09-30T01:00:11Z failed step\n##[error]AssertionError: Done-when 2\nsummary')),
+      paged: vi.fn(() => []), gh: vi.fn((ghArgs, opts) => {
+        const text = log ?? ('2026-09-30T01:00:01Z ##[error]Passing-step error context\n'
+          + '2026-09-30T01:00:11Z failed step\n##[error]AssertionError: Done-when 2\nsummary');
+        // Emulate execFileSync: output past maxBuffer (Node default 1 MiB) fails with ENOBUFS.
+        if (ghArgs[0] === 'api' && Buffer.byteLength(text) > (opts?.maxBuffer ?? 1024 * 1024)) {
+          throw Object.assign(new Error('spawnSync gh ENOBUFS'), { code: 'ENOBUFS' });
+        }
+        return text;
+      }),
       freeLanes: () => [8], reserve: () => ({ ok: true }), release: vi.fn(),
       dispatch: vi.fn(async () => ({ agentId: 'pid:321' })),
     };
@@ -246,7 +257,8 @@ describe('abandoned builder draft recovery', () => {
       expect(io.gh).toHaveBeenCalledWith(['pr', 'comment', '3033', '--repo', 'web-everything/web-everything', '--body', expect.stringContaining(`First error: ${expectedError}`)]);
       expect(io.api).toHaveBeenCalledWith('commits/abc');
       expect(io.api).toHaveBeenCalledWith('actions/jobs/456');
-      expect(io.gh).toHaveBeenCalledWith(['api', '--allow-escape-sequences', 'repos/web-everything/web-everything/actions/jobs/456/logs']);
+      expect(io.gh).toHaveBeenCalledWith(['api', '--allow-escape-sequences', 'repos/web-everything/web-everything/actions/jobs/456/logs'],
+        expect.objectContaining({ encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024 }));
       expect(io.dispatch).toHaveBeenCalledWith(expect.objectContaining({ failure: { name: 'test-shard (2)', firstError: expectedError } }));
       for (const [args] of io.gh.mock.calls.filter(([args]) => args[0] === 'pr' && args[1] === 'comment')) {
         expect(args.at(-1)).not.toContain('Passing-step error context');

@@ -32,6 +32,17 @@ describe('raw CI job log transport', () => {
     expect(await readCiJobLog({ repo: 'o/r', jobId: 42, exec })).toEqual({ ok: true, text: raw, filtered: false });
     expect(ciJobLogApiArgs(path)).toEqual(['api', '--allow-escape-sequences', path]);
   });
+  it('keeps the default timeout, encoding and stdio bounds when a caller overrides only maxBuffer', () => {
+    const exec = vi.fn(() => 'log');
+    expect(readCiJobLog({ path, exec, opts: { maxBuffer: 64 * 1024 * 1024 } })).toEqual({ ok: true, text: 'log', filtered: false });
+    expect(exec).toHaveBeenCalledWith('gh', ciJobLogApiArgs(path),
+      { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
+  });
+  it('passes a 16 MiB maxBuffer by default so a multi-megabyte whole-job log is not ENOBUFS', () => {
+    const exec = vi.fn(() => 'log');
+    readCiJobLog({ path, exec });
+    expect(exec.mock.calls[0][2]).toMatchObject({ maxBuffer: 16 * 1024 * 1024, timeout: 30_000 });
+  });
   it.each([false, true])('fails closed with a typed unreadable result (async=%s)', async async => {
     const exec = async ? async () => { throw new Error('HTTP 404'); } : () => { throw new Error('HTTP 404'); };
     expect(await readCiJobLog({ path, exec })).toEqual({ ok: false, reason: 'log-unreadable', detail: 'HTTP 404' });
