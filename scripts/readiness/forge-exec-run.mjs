@@ -1338,7 +1338,7 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
       // contents, so a warm archive represents the same install inputs. Earlier
       // profiles lack this binding (v3 also allowed an unkeyed shrinkwrap).
       const profile=join(cache,request.lock,'dev-v5-'+(request.manifest.siblings ? request.manifestDigest : request.inputDigest));
-      const installEnv={PATH:path,HOME:join(work,'.forge-home'),LANG:'C',CI:'true',NODE_ENV:'development'};
+      const installEnv={PATH:path,HOME:join(work,'.forge-home'),LANG:'C',CI:'true',NODE_ENV:'development',TMPDIR:join(work,'.forge-tmp')};
         // These parents are inaccessible to forge-exec; reject symlinked cache state.
         await mkdir(join(cache,request.lock),{mode:0o700}).catch(e=>{if(e.code!=='EEXIST') throw e;});
         await directory(join(cache,request.lock),true,operator);
@@ -1418,8 +1418,9 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
           const entries=decodeManifest(manifest).entries;
           await copyLeaves(source,work,entries);
           await verifyManifest(work,manifest,digestManifest(manifest));
-          await handoff(worker,work,{recursive:true});
           const request={lock:await digestLock(work),inputDigest:await digestInput(work),manifest,manifestDigest:digestManifest(manifest)};
+          await mkdir(join(work,'.forge-tmp'),{mode:0o700});
+          await handoff(worker,work,{recursive:true});
           const signature=await registryInstallSignature(work,request),parent=join(cache,request.lock),profile=join(parent,'dev-v5-'+request.inputDigest);
           const index=signature?join(parent,'.warm-inputs-'+signature):null;
           if(!await reuseWarmProfile(signature,request)) {
@@ -1626,6 +1627,9 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
       const telemetryTimer=setInterval(update,5000);
       telemetryTimer.unref();
       try {
+        // Generated only after snapshot validation; finish removes it with the run container.
+        await mkdir(join(work,'.forge-tmp'),{mode:0o700});
+        await handoff(worker,join(work,'.forge-tmp'),{workerParent:true});
         result=await installDependencies(request,work,command);
         installMs=Math.max(0,Math.round(clock()-installAt));
         phase='test';
@@ -1633,7 +1637,7 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
         await update();
         if(telemetryError)throw telemetryError;
         await assertContained(work,request.argv);
-        const executionEnv={PATH:path,HOME:join(work,'.forge-home'),...request.env};
+        const executionEnv={PATH:path,HOME:join(work,'.forge-home'),...request.env,TMPDIR:join(work,'.forge-tmp')};
         if(Object.hasOwn(executionEnv,'VERIFY_SCAN_FILES'))
           executionEnv.VERIFY_SCAN_FILES=normalizeScanFilesValue(executionEnv.VERIFY_SCAN_FILES);
         // Anchor the report in the work dir so a config root cannot redirect it; re-check links after the run.

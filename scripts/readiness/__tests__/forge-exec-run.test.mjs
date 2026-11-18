@@ -42,6 +42,8 @@ beforeEach(async () => {
   await writeFile(join(bin,'npm'), `#!/bin/bash
 if [ "$1" = ci ]; then
   printf '%s\n' "$*|$NODE_ENV|$HOME" >> '${root}/install.log'
+  printf '%s' "$TMPDIR" > '${root}/install-tmpdir'
+  touch "$TMPDIR/install-temp"
   if [ -f fail-install ]; then echo INJECTED_INSTALL_FAILURE >&2; exit 1; fi
   mkdir -p node_modules packages/deep/node_modules
   echo dev > node_modules/vitest
@@ -55,6 +57,8 @@ node -e 'process.stdout.write(JSON.stringify(process.argv.slice(1)))' "$@" > arg
 printf '%s\n' "$*|$NODE_ENV" > task-seen
 echo forged > .exit-code
 printf '%s' "$VERIFY_SCAN_FILES" > scan-files-seen
+printf '%s' "$TMPDIR" > '${root}/execution-tmpdir'
+touch "$TMPDIR/execution-temp"
 echo '{"phase":"test","code":0}' > receipt.json
 exit 3
 `, {mode:0o755});
@@ -438,6 +442,23 @@ process.stdout.write('x'.repeat(4*1024*1024+1));
     await expect(stat(join(root,'runs',request.run))).rejects.toThrow();
     await expect(runner.finish(request)).rejects.toThrow();
     expect(await readdir(join(root,'receipts'))).toEqual(['.worker-active.writer',request.run+'.consumed',request.run+'.telemetry','telemetry.json']);
+  });
+  it('confines install and execution temp files to private run work storage and removes them on finish', async () => {
+    const temp=join(work,'.forge-tmp');
+    expect((await runner.run(request)).code).toBe(3);
+    expect(await readFile(join(root,'install-tmpdir'),'utf8')).toBe(temp);
+    expect(await readFile(join(root,'execution-tmpdir'),'utf8')).toBe(temp);
+    expect((await stat(temp)).mode & 0o777).toBe(0o700);
+    expect((await stat(temp)).uid).toBe((await stat(work)).uid);
+    expect(await readdir(temp)).toEqual(['execution-temp','install-temp']);
+    expect(await runner.finish(request)).toMatchObject({phase:'test',code:3});
+    await expect(stat(temp)).rejects.toMatchObject({code:'ENOENT'});
+  });
+  it('refuses request.env TMPDIR=/tmp before install or execution without weakening the environment allowlist', async () => {
+    await expect(runner.run({...request,env:{...request.env,TMPDIR:'/tmp'}})).rejects.toThrow();
+    await expect(readFile(join(root,'install-tmpdir'))).rejects.toMatchObject({code:'ENOENT'});
+    await expect(readFile(join(root,'execution-tmpdir'))).rejects.toMatchObject({code:'ENOENT'});
+    expect(await runner.finish(request)).toBeNull();
   });
   it('rejects input and lock changes before install and accepts odd filenames literally', async () => {
     for (const name of ['#file',';file',"quote'`$()",'--option','é\u2028fixture','tab\tfile','trailing ']) await writeFile(join(work,name),name);
