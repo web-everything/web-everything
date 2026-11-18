@@ -387,7 +387,7 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
         const notCi = await checkNotCiBreakRecordable({ ...recordOptions(), ...readers });
         expect(human.refusal !== null).toBe(required === 'SUCCESS' && state === 'FAILURE');
         expect(notCi.refusal !== null).toBe(required !== 'SUCCESS'
-          || (gate === 'merge-gate' && ['IN_PROGRESS', 'MISSING'].includes(state)));
+          || ['IN_PROGRESS', 'MISSING'].includes(state));
       },
     );
 

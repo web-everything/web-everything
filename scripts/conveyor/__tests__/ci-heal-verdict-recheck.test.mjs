@@ -569,6 +569,49 @@ describe('requiredCheckStates shared predicate regressions', () => {
 });
 
 describe('gateOnlyRedStates', () => {
+  describe.each(['review-gate', 'merge-gate'])('%s review-wait evidence', name => {
+    const gate = evidence => ({ name, mergeGateReviewHold: true, ...evidence });
+
+    it.each([
+      ['startup failure', { status: 'COMPLETED', conclusion: 'STARTUP_FAILURE' }],
+      ['cancelled', { status: 'COMPLETED', conclusion: 'CANCELLED' }],
+      ['timed out', { status: 'COMPLETED', conclusion: 'TIMED_OUT' }],
+      ['action required', { status: 'COMPLETED', conclusion: 'ACTION_REQUIRED' }],
+      ['missing conclusion', { status: 'COMPLETED' }],
+      ['null conclusion', { status: 'COMPLETED', conclusion: null }],
+      ['unreadable conclusion', { status: 'COMPLETED', conclusion: {} }],
+      ['array conclusion', { status: 'COMPLETED', conclusion: ['FAILURE'] }],
+      ['missing status', { conclusion: 'FAILURE' }],
+      ['array status', { status: ['COMPLETED'], conclusion: 'FAILURE' }],
+      ['in progress', { status: 'IN_PROGRESS', conclusion: 'FAILURE' }],
+      ['queued', { status: 'QUEUED' }],
+      ['unknown status', { status: 'unreadable', conclusion: 'FAILURE' }],
+    ])('%s cannot establish gate-only red or review wait, even beside a completed failure', (_label, row) => {
+      for (const gateRows of [[gate(row)], [gate({ status: 'COMPLETED', conclusion: 'FAILURE' }), gate(row)]]) {
+        const evidence = { requiredChecks: ['test', name], rollup: [...green, ...gateRows] };
+        expect(verdictRecheck.gateOnlyRedStates(evidence).gateOnlyRed).toBe(false);
+        expect(verdictRecheck.waitingOnReview(evidence)).toBe(false);
+        expect(ciGreenForEscalation(evidence)).toBe(false);
+      }
+    });
+
+    it.each(['FAILURE', 'failure'])('completed %s establishes a review wait', conclusion => {
+      const evidence = { requiredChecks: ['test', name], rollup: [
+        ...green, gate({ status: 'completed', conclusion }),
+      ] };
+      expect(verdictRecheck.gateOnlyRedStates(evidence).gateOnlyRed).toBe(true);
+      expect(verdictRecheck.waitingOnReview(evidence)).toBe(true);
+    });
+  });
+
+  it('a completed merge-gate failure without a proven review-hold annotation remains CI work', () => {
+    const evidence = { requiredChecks: ['test', 'merge-gate'], rollup: [
+      ...green, { name: 'merge-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+    ] };
+    expect(verdictRecheck.gateOnlyRedStates(evidence).gateOnlyRed).toBe(false);
+    expect(verdictRecheck.waitingOnReview(evidence)).toBe(false);
+  });
+
   it.each(['review-gate', 'merge-gate'])('includes proven review hold %s even when absent from the required roster', name => {
     expect(verdictRecheck.gateOnlyRedStates({ ...input, rollup: [
       ...green, { name, status: 'COMPLETED', conclusion: 'FAILURE',

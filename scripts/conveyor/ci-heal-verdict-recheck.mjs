@@ -106,14 +106,17 @@ export function latestRollupAttempts(rollup) {
 /** Adapt GraphQL rollups and legacy statuses without replacing the shared state policy. */
 function checkEvidence(rollup, requiredChecks) {
   const checks = (Array.isArray(rollup) ? rollup : []).map(normalizeRollupCheck);
-  // Only the shared merge-gate hold classifier's annotation proves a review hold.
-  // A job/setup failure (or unreadable verdict) must remain ordinary CI evidence.
-  const holdGateNames = [REVIEW_GATE_CHECK];
-  const mergeGates = checks.filter(row => row.name === 'merge-gate');
-  if (mergeGates.length && mergeGates.every(row =>
-    classifyCheck({ ...row, required: true }) === 'green' || row.mergeGateReviewHold)) {
-    holdGateNames.push('merge-gate');
-  }
+  // Every non-green gate row must be a completed FAILURE. Setup failures,
+  // unfinished or unreadable evidence cannot establish a review wait. merge-gate
+  // additionally needs the shared classifier's head-bound review-hold annotation.
+  const holdGateNames = [REVIEW_GATE_CHECK, 'merge-gate'].filter(name => {
+    const rows = checks.filter(row => row.name === name);
+    return rows.length > 0 && rows.every(row =>
+      classifyCheck({ ...row, required: true }) === 'green'
+      || (typeof row.status === 'string' && lowerState(row.status) === 'completed'
+        && typeof row.conclusion === 'string' && lowerState(row.conclusion) === 'failure'
+        && (name === REVIEW_GATE_CHECK || !!row.mergeGateReviewHold)));
+  });
   const roster = withoutImpliedRequiredChecks(Array.isArray(requiredChecks) ? requiredChecks : [], checks)
     .filter(name => !holdGateNames.includes(name));
   // CodeQL evidence is never excused by a drain setting or an optional roster.

@@ -188,7 +188,7 @@ import {
 // second derivation): `parseReviewedSha` recovers the head an ACCEPT-shaped verdict (`accepted`/`clear-human`/
 // `restamp`) covered. See {@link planReconcile}'s ONE-REVIEW-PER-HEAD refusal for why this pass needs it too.
 import {
-  parseReviewedSha, headEverHumanCleared, planConvertSupersededVerdict, targetedCheckQuestion, findAcceptVerdictComment, REVIEW_LABELS,
+  parseReviewedSha, headEverHumanCleared, planConvertSupersededVerdict, targetedCheckQuestion, findAcceptVerdictComment, REVIEW_LABELS, REVIEW_HOLD_LABELS,
 } from '../lib/review-escalation.mjs';
 import { loadExternalCheckApps, isExternalAppCheck } from './external-check-apps.mjs';
 // live incident, web-everything/web-everything PR #2752 (#4034/#2748) — a PR whose own content is ALREADY on `main`,
@@ -3130,6 +3130,7 @@ export function planReconcile({
     }
 
     const reviewHoldRed = !pr.codeqlFailure
+      && withPhase.labels.some(label => REVIEW_HOLD_LABELS.includes(label))
       && waitingOnReview({ rollup: collapseRollupToLatestPerName(pr?.statusCheckRollup), requiredChecks });
     if (reviewHoldRed) {
       refuse('review-hold-red', { ...withPhase, ciClassification: 'waiting-on-review', owner: 'review/orchestrator',

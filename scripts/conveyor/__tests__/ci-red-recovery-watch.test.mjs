@@ -660,6 +660,7 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
     const refresh = vi.fn(() => ({ ok: true, action: 'rebased' }));
     sweepCiRedRecovery({
       repo: 'frontier-ui/frontierui', readOpenPrs, readMainRuns, readAheadBy, readComments, refresh,
+      readAttributedRequiredChecks: () => ['test'],
       postComment: vi.fn(), apply: true,
     });
     expect(refresh).toHaveBeenCalledWith('lane/xdzl6mb', expect.objectContaining({

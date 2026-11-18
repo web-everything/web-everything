@@ -84,7 +84,7 @@ import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { countTrustedLeadingMarker } from '../lib/marker-authorship.mjs';
 import { latestRequiredCheck, isRequiredCheckFailed, collapseRollupToLatestPerName, CI_LIFECYCLE_LABELS, restampAcceptance } from '../merge-ai-prs.mjs';
-import { REVIEW_LABELS, hasReviewLabel } from '../lib/review-escalation.mjs';
+import { REVIEW_LABELS, REVIEW_HOLD_LABELS, hasReviewLabel } from '../lib/review-escalation.mjs';
 import { spawnCiHealRearm } from './ci-heal-mark.mjs';
 import {
   extractInfraSignatures, runIdFromDetailsUrl, isMainRecoveredForCheck, currentMainGreen, resolveRecoveryCaps, markerFreeText, computeMainRedWindows, planMainRedRebases, DEFAULT_MAIN_WORKFLOW_NAME, DEFAULT_REQUIRED_CHECK,
@@ -155,7 +155,8 @@ export function buildCandidates(prs, {
   const checks = requiredCheck ? [requiredCheck] : requiredChecks;
   const out = [];
   for (const pr of Array.isArray(prs) ? prs : []) {
-    if (waitingOnReview({ rollup: pr?.statusCheckRollup, requiredChecks: checks })) continue;
+    if (REVIEW_HOLD_LABELS.some(label => hasReviewLabel(pr?.labels, label))
+      && waitingOnReview({ rollup: pr?.statusCheckRollup, requiredChecks: checks })) continue;
     if (!isAnyRequiredCheckFailed(pr, checks)) continue;
     const prNumber = Number(pr?.number);
     if (!Number.isInteger(prNumber) || prNumber <= 0) continue;

@@ -4440,7 +4440,13 @@ The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true
 
 `gate-wait-not-ci-fail.test.mjs` uses node:test and head-bound merge-gate job-log fixtures.
 Run it through heavy-admission with `node --test`. Workflow-edit human-only acceptance
-remains red and carries review ownership; review-gate may be outside branch protection,
-and a proven hold does not require a review label. Other red or unreadable checks retain
-CI ownership. The regression also covers recovery candidate hydration, escalation CLI
+remains red and carries review ownership; review-gate may be outside branch protection.
+Suppressing CI repair or recovery requires an observed `review:human`, `review:pending`,
+`review:changes`, or `review:held-mechanical` label. The shared evidence predicate requires
+every non-green gate row to have completed with `FAILURE` (case-insensitive); merge-gate
+also requires its head-bound `mergeGateReviewHold` annotation. Startup failures, cancelled,
+timed-out, action-required, unfinished, missing or unreadable evidence retain CI ownership,
+even alongside a proven hold. Named regressions cover unlabeled holds, review-gate startup
+failure, and completed failure with review:pending; the verdict suite covers both gates'
+negative evidence matrix. The regression also covers recovery candidate hydration, escalation CLI
 classification, and retirement of an already-escalated review-only head without a new needs-you event.

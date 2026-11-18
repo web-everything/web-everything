@@ -44,7 +44,7 @@ const escalable = pr => checkNeedsHumanEscalable({ pr: pr.number, headSha: HEAD,
   settings, readPr: () => pr, readRequired: () => ({ checks: requiredChecks }) });
 
 test('approval-wait only -> waiting-on-review, gate stays red, no heal or escalation', async () => {
-  for (const labels of [['review:pending'], ['review:human'], ['review:changes'], []]) {
+  for (const labels of [['review:pending'], ['review:human'], ['review:changes'], ['review:held-mechanical']]) {
     const pr = classified({ labels });
     assert.equal(pr.statusCheckRollup[1].conclusion, 'FAILURE');
     assert.deepEqual(pr.statusCheckRollup[1].mergeGateReviewHold.holds, ['review-acceptance']);
@@ -56,6 +56,37 @@ test('approval-wait only -> waiting-on-review, gate stays red, no heal or escala
     assert.ok((await escalable(pr)).refusal);
     assert.deepEqual(buildCandidates([pr], { requiredChecks, readAheadBy: () => 0 }), []);
   }
+});
+
+test('no review hold label -> heals and remains a recovery candidate despite proven gate holds', () => {
+  for (const labels of [[], ['review:accepted'], ['review:awaiting-advisory']]) {
+    const pr = classified({ labels });
+    assert.equal(waitingOnReview({ rollup: pr.statusCheckRollup, requiredChecks }), true);
+    const result = plan(pr);
+    assert.ok(result.dispatch.some(row => row.kind === 'ci-heal'));
+    assert.equal(result.refusals.some(row => row.ciClassification === 'waiting-on-review'), false);
+    assert.equal(buildCandidates([pr], { requiredChecks, readAheadBy: () => 0 }).length, 1);
+  }
+});
+
+test('review-gate STARTUP_FAILURE -> stays red, heals and remains a recovery candidate with review:pending', () => {
+  const pr = classified();
+  pr.statusCheckRollup[2].conclusion = 'STARTUP_FAILURE';
+  assert.equal(waitingOnReview({ rollup: pr.statusCheckRollup, requiredChecks }), false);
+  const result = plan(pr);
+  assert.ok(result.dispatch.some(row => row.kind === 'ci-heal'));
+  assert.equal(result.refusals.some(row => row.ciClassification === 'waiting-on-review'), false);
+  assert.equal(buildCandidates([pr], { requiredChecks, readAheadBy: () => 0 }).length, 1);
+});
+
+test('review-gate completed FAILURE with review:pending -> waiting-on-review', () => {
+  const pr = classified();
+  pr.statusCheckRollup[1] = check('merge-gate');
+  assert.equal(waitingOnReview({ rollup: pr.statusCheckRollup, requiredChecks }), true);
+  const result = plan(pr);
+  assert.equal(result.dispatch.some(row => row.kind === 'ci-heal'), false);
+  assert.ok(result.refusals.some(row => row.ciClassification === 'waiting-on-review'));
+  assert.deepEqual(buildCandidates([pr], { requiredChecks, readAheadBy: () => 0 }), []);
 });
 
 test('approval-wait plus a real red test -> heal and escalation remain available', async () => {
