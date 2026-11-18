@@ -7,7 +7,7 @@ import { mkdtempSync, rmSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  buildOpenPrPageQuery, mapGraphqlPr, parseOpenPrPage, isTransientGhFailure, heavyIsFresh, resolveCheckAppsByCommit,
+  enrichPrRollupEvidence, buildOpenPrPageQuery, mapGraphqlPr, parseOpenPrPage, isTransientGhFailure, heavyIsFresh, resolveCheckAppsByCommit,
   listOpenPrsLightPaged, listOpenPrsPagedHydrated, assertInventoryComplete, listOpenPrsPagedHydratedComplete, parseListOutput, hydrateHeavyFields, resolvePrListPaging, PrListUnreadableError,
   HEAVY_FIELDS, PAGED_LIGHT_FIELDS, PR_LIST_PAGING_DEFAULTS, PR_LIST_PAGE_SIZE_ENV,
 } from '../pr-list-paged.mjs';
@@ -640,4 +640,29 @@ describe('fail-closed list parsing and uniqueness (one class: a list read must n
     expect(parseListOutput('[]', { repo: 'owner/name' })).toEqual([]);
     expect(parseListOutput(Buffer.from('[{"number":1}]'), { repo: 'owner/name' })).toEqual([{ number: 1 }]);
   });
+});
+
+it('incomplete GraphQL enrichment preserves previously observed failure evidence', () => {
+  const head = 'a'.repeat(40);
+  const oldRows = [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }];
+  const pr = { headRefOid: head, statusCheckRollup: oldRows };
+  enrichPrRollupEvidence({ repo, rows: [pr], exec: () => JSON.stringify({ data: { repository: { h0: {
+    oid: head, statusCheckRollup: { contexts: { totalCount: 2, pageInfo: { hasNextPage: true },
+      nodes: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] } },
+  } } } }) });
+  expect(pr.statusCheckRollup).toBe(oldRows);
+  expect(pr.rowsComplete).toBe(false);
+});
+
+
+it('preserves the commit read head when the PR head is newer', async () => {
+  const { resolveRequiredChecks } = await import('../check-state-predicate.mjs');
+  const current = 'a'.repeat(40), readHead = 'b'.repeat(40);
+  const pr = mapGraphqlPr({ headRefOid: current, commits: { nodes: [{ commit: { oid: readHead,
+    statusCheckRollup: { contexts: { pageInfo: { hasNextPage: false }, totalCount: 1,
+      nodes: [{ __typename: 'StatusContext', context: 'test', state: 'SUCCESS' }] } } } }] } });
+  expect(pr).toMatchObject({ headRefOid: current, rowsHead: readHead, rowsComplete: true });
+  expect(resolveRequiredChecks({ head: pr.headRefOid, rowsHead: pr.rowsHead, rowsComplete: pr.rowsComplete,
+    rows: pr.statusCheckRollup, requiredNames: ['test'], rosterSource: 'live' }))
+    .toMatchObject({ state: 'unknown', reasons: ['foreign-head'] });
 });

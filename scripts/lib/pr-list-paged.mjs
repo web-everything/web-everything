@@ -250,7 +250,7 @@ export function enrichPrRollupEvidence({ repo, rows, exec, execOpts = {} }) {
         for (const pr of rows.filter(pr => pr.headRefOid === sha)) {
           Object.assign(pr, rollupEvidence(commit));
           const nodes = commit?.statusCheckRollup?.contexts?.nodes;
-          if (Array.isArray(nodes) && nodes.every(n => n && ['CheckRun', 'StatusContext'].includes(n.__typename))) pr.statusCheckRollup = nodes.map(mapCtx);
+          if (pr.rowsComplete === true) pr.statusCheckRollup = nodes.map(mapCtx);
         }
       });
     } catch { /* unknown: retain fail-closed evidence */ }

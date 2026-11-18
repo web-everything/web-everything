@@ -3465,11 +3465,8 @@ The real-host cases require permission to execute `ps` and read the boot UUID on
 a sandbox denying either operation produces unknown and cannot certify those cases.
 ## Optional early review and delayed fix push
 
-`review.startBeforeCi` requires both successful resolver evidence for the policy's CI prerequisites
-and `hasGreenLedger` evidence for the exact head. A marker never upgrades missing, malformed,
-pending, incomplete, foreign-head or untrusted-roster evidence, even with `startEarly: on`.
-Keep the named `verification only adds a requirement and never upgrades resolver evidence under %s`
-regression across push, fast-checks and ci-green, including a green-CI/false-marker denial. Keep ledger IO in the reconcile/publish shells and skip it when disabled. The existing
+`review.startBeforeCi` admits an early review only with `hasGreenLedger` evidence for the exact
+head. Keep ledger IO in the reconcile/publish shells and skip it when disabled. The existing
 red-main hold runs before CI-heal caps; test it with a PR behind main (`aheadByOnMain > 0`),
 since a PR already containing main has its own failure. `fix.pushAfterCi` waits before the
 agent so completed CI failures enter that same repair's fenced context. Its push boundary uses
@@ -4572,97 +4569,17 @@ The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
 
 
-## Required-check row completeness (PR1)
+## Required-check evidence contract (PR1)
 
-`resolveRequiredChecks` requires `rowsComplete === true`: all-success rows from a capped
-rollup can hide a newer failure. Missing or false completeness produces `unknown` with
-`rows-incomplete`; observing every required name alone is insufficient. Retry by exhausting
-pagination or explicitly fetching every required name, then supply the completeness proof.
-The PR1 acceptance tests numbered 10 and 11 cover incomplete rows and the rule that neutral
-and skipped conclusions fail unless the exact name is in `optionalNames`.
+`resolveRequiredChecks` ships without production callers. Its acceptance tests build
+job/head-bound hold annotations inline; no caller or hold-classifier change is required.
+Every required name needs its own evidence, a live/cache roster, an exact head and
+`rowsComplete: true`. Missing or false completeness returns `unknown`; neutral/skipped
+conclusions fail unless the exact name is in `optionalNames`.
 
-Both `reviewCiGate` and the CI-heal evidence adapter default completeness to false. Bare
-`statusCheckRollup` callers (merge listing, reconcile, drain prestage, merge enqueue, human
-landing and escalation recording) cannot attest completeness. `readReviewChecks` exhausts
-REST pagination for check runs and commit statuses, then marks its array with non-enumerable
-`rowsComplete: true`. `readReviewCiGate` captures that proof before hold excusal replaces the
-array and forwards it through `reviewStartGate`. Bare arrays and serialized historical rows
-carry no proof and fail closed. Never infer completeness from row count or successful names.
-`review-ci-completeness.test.mjs` exercises the real reader-to-start-gate path with multiple
-pages, a hidden failure, incomplete arrays, and unreadable later-page evidence.
-
-Reconcile re-reads an excused candidacy hold through the complete exact-head review reader
-before scheduling its review. The injected hydration reader keeps its complete-feed contract;
-an explicit `rowsComplete: false` refuses proof. Carry an excusal only for the same immutable
-job, preserve observed real CI failures, and reuse the already-read hold verdict. The
-`merge-gate-hold-class.test.mjs` planner cases cover unreadable/incomplete feeds, foreign heads,
-pending checks and replacement jobs. Recording refusals retain the required-check names even
-when incomplete evidence also blocks the verdict; an unavailable roster still refuses recording.
-
-
-REST check-run rows omit workflow run/attempt fields. For duplicate GitHub Actions check
-names, `readReviewChecks` reads the Actions jobs and validates each job ID, workflow run,
-head, exact name, and check-run URL before supplying `run_id`/`run_attempt` to the resolver.
-A check ID, suite ID, timestamp, or URL alone never proves attempt ordering. Job reads are
-cached within the read and capped at 20; missing/mismatched evidence or overflow blocks
-review with an operator-visible request to inspect Actions jobs/reruns before retrying.
-The REST rerun integration cases in `review-ci-completeness.test.mjs` cover successful reruns,
-different runs, invalid lineage, foreign repositories, unavailable jobs, and the read cap.
-
-## Required-check evidence opt-in and provenance (PR1)
-
-`resolveRequiredChecks` requires an own row for every required name. Rule 6 implication
-is removed, including historical `allowImplication: true` options. Review registration
-also requires an own row; a green `test` never proves an absent `integration`.
-CI-heal fixtures that prove green or held evidence must explicitly attest both
-`rowsComplete: true` and `rosterSource: live|cache`. Preserve the required-check
-reader's `source` through escalation recording and reconcile; an omitted source
-is unavailable evidence, never an implicit live roster. Named negative tests in
-`check-state-predicate`, `ci-heal-verdict-recheck`, and `ci-heal-escalation-mark`
-pin these defaults and the recording preflights.
-
-## Review CI refusal ordering
-
-An observed pending or failed required check takes precedence over `rows-incomplete`
-in the review adapter's primary reason. Incompleteness remains in `secondaryReasons`
-and preserves `unknown: true` with `allowed: false`. Missing checks alone do not
-establish an observed blocker. The ordering cases in `review-ci-gate.test.mjs` and
-the producer formatting cases in `review-ci-gate-io.test.mjs` pin these guarantees.
-Retry after exhausting pagination or explicitly reading every required name;
-successful observed names alone cannot establish admission.
-Consumers that decide whether to recheck evidence must inspect `unknown`, rather
-than infer completeness from the primary reason. The facts-first regression in
-`merge-gate-hold-class.test.mjs` requires a live recheck of an incomplete failure.
-
-
-## Review-owned checks and admission (#7037)
-
-Review admission filters `review-gate` and `merge-gate` out of the required roster,
-regardless of their conclusion, and excludes them from admission's red detection.
-They wait on the review being admitted. A validated nonempty roster containing only
-these names may become empty after filtering; the review adapter explicitly allows
-that empty result. Missing/empty input rosters, missing provenance, incomplete reads,
-and foreign read heads still refuse admission. Duplicate review-owned Actions rows
-do not need job-lineage reads because they cannot affect admission.
-Advisory review uses this same gate without a separate hold-binding override. Its
-reconcile cases admit excluded merge-gate rows with invalid bindings while refusing
-failed, pending, malformed or missing real CI and incomplete evidence. Hold binding
-belongs to the other resolver consumers below, not review admission.
-
-Other resolver consumers retain these names. Rule 7 treats only `failure` as eligible
-for a review hold (merge holds still require matching head/job evidence); `timed_out`,
-`startup_failure`, `cancelled`, `stale`, and `action_required` remain pending with
-`needs-rerun`. They cannot establish green CI for escalation retirement.
-The #7037 cases in `review-ci-gate.test.mjs` and `review-ci-gate-io.test.mjs` cover
-cancelled plus failing review-gate rows, a failing merge-gate, green real CI, and
-the negative case of a failing required `test` under each admission timing policy.
-
-
-Reconcile must forward the required-roster reader's source through every internal
-`reviewCiGate` and `reviewStartGate` call, including stale-base diagnosis, advisory
-conversion, and CI-dependent transitions. The planner binds its current `rosterSource`
-to each PR, replacing historical PR metadata; it never substitutes `live` for an
-unknown source. The named reconcile provenance regression covers complete green CI
-under `ci-green` timing with live/cache evidence, unavailable provenance, incomplete
-rows. Its source lint checks every reconcile gate call for explicit
-forwarding, so a new call cannot silently depend on a removed provenance default.
+The fetch tests prove completeness only from matching connection counts, valid nodes
+and `hasNextPage: false`, and preserve the commit read head independently of the PR head.
+Legacy hydration reads at most ten batches of twenty heads. Unreadable, truncated or
+overflow evidence remains incomplete for retry on a later tick or operator inspection;
+an incomplete refresh preserves previously observed failures. Retry by exhausting
+pagination or explicitly reading every required name before attesting completeness.

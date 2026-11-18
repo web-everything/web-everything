@@ -784,3 +784,53 @@ it.each(['review-gate', 'merge-gate'])('Rule 7 retains %s for non-admission cons
     expect(resolve(conclusion)).toMatchObject({ state: 'pending', perName: { [name]: { state: 'pending', reasons: ['needs-rerun'] } } });
   }
 });
+
+
+// PR1 stays dark: pin the evidence guarantees here without changing PR2 callers.
+describe('pre-review evidence regressions', () => {
+  const head = 'a'.repeat(40), foreign = 'b'.repeat(40);
+  const evidence = {
+    head, rowsHead: head, rowsComplete: true, rosterSource: 'live', requiredNames: ['test'],
+  };
+  const row = (name, conclusion, extra = {}) => ({ name, status: 'completed', conclusion, ...extra });
+
+  it('does not discard same-name failures based on job IDs', () => {
+    for (const lineage of [false, true]) {
+      const failed = row('test', 'failure', { id: 7, workflowName: 'build',
+        detailsUrl: 'https://github.com/o/r/actions/runs/10/job/7',
+        ...(lineage ? { run_id: 10, run_attempt: 1 } : {}) });
+      const passed = row('test', 'success', { id: 999, workflowName: 'deploy',
+        detailsUrl: 'https://github.com/o/r/actions/runs/20/job/999',
+        ...(lineage ? { run_id: 20, run_attempt: 2 } : {}) });
+      for (const rows of [[failed, passed], [passed, failed]]) {
+        expect(resolveRequiredChecks({ ...evidence, rows })).toMatchObject({
+          state: 'fail', perName: { test: { state: 'fail', rows: expect.arrayContaining([failed]) } },
+        });
+      }
+    }
+  });
+
+  it('incomplete all-success rollups never resolve to pass or held evidence', () => {
+    // This covers the resolver only; production retirement wiring belongs to PR2.
+    const success = row('test', 'success');
+    const held = row('review-gate', 'failure');
+    for (const invalid of [
+      { rowsComplete: undefined }, { rowsComplete: false },
+      { rowsHead: foreign }, { rosterSource: undefined }, { rosterSource: 'unavailable' },
+    ]) {
+      for (const rows of [[success], [success, held]]) {
+        const requiredNames = rows.map(r => r.name);
+        expect(resolveRequiredChecks({ ...evidence, rows, requiredNames, ...invalid }).state).toBe('unknown');
+      }
+    }
+    // Complete metadata does not make foreign-head success current-head proof either.
+    for (const rows of [[{ ...success, head_sha: foreign }],
+      [{ ...success, head_sha: foreign }, held]]) {
+      expect(resolveRequiredChecks({ ...evidence, rows, requiredNames: rows.map(r => r.name) }).state)
+        .toBe('pending');
+    }
+    expect(resolveRequiredChecks({ ...evidence, rows: [success] }).state).toBe('pass');
+    expect(resolveRequiredChecks({ ...evidence, rows: [success, held],
+      requiredNames: ['test', 'review-gate'] }).state).toBe('held');
+  });
+});
