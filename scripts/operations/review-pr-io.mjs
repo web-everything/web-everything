@@ -342,7 +342,7 @@ export function readPr({
   // Held item 177 — the stack base for this PR (`we:scripts/conveyor/review-stack-base.mjs`), or null. Injectable;
   // the default reads the open PRs and git in this checkout and fails open to null (the main basis, as before).
   // Inert under test unless injected: the default reads `gh` and the network.
-  readStack = isUnderTest() ? () => null : ({ pr: n, cwd: dir }) => readStackBase({ pr: n, root: dir }),
+  readStack = null,
   stackRead = null,
 } = {}) {
   // The net-diff helpers take no `cwd`, so it is baked into the injected `exec` (the drain does the same thing
@@ -354,6 +354,8 @@ export function readPr({
   const stackRun = (args, opts) => String(gitExec('git', args, {
     encoding: 'utf8', timeout: 60e3, maxBuffer: 64 * 1024 * 1024, ...opts,
   }));
+  // The synthetic stack base is built through the SAME replace-object-disabled executor as the diffs it is compared with.
+  const stackReader = readStack || (isUnderTest() ? () => null : ({ pr: n, cwd: dir }) => readStackBase({ pr: n, root: dir, run: stackRun }));
   const stackDiffRead = stackRead || {
     files: o => stackNetFiles({ ...o, run: stackRun }),
     text: o => stackNetDiffText({ ...o, run: stackRun }),
@@ -426,7 +428,7 @@ export function readPr({
   let stackBase = null;
   if (netPaths.scored === true && revSha) {
     let stack = null;
-    try { stack = readStack({ pr, repo, cwd }); } catch { stack = null; }
+    try { stack = stackReader({ pr, repo, cwd }); } catch { stack = null; }
     if (stack && stack.topHead === revSha) {
       try {
         const text = String(stackDiffRead.text({ tree: stack.tree, topHead: revSha, root: cwd }));
