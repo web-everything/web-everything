@@ -4448,12 +4448,15 @@ The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true
 ### Empty-diff base provenance
 
 Empty-net-diff recovery must re-derive the merge-base of `origin/main` and the pinned
-writer head with replacement objects disabled, then require equality with the stored base
-before probing the diff. This matches the review reader's `resolveNetDiffBasis` default
-base ref. A stored base distinct from head can still carry the same tree as head; the
+writer head using `merge-base --all` with replacement objects disabled, then require the
+stored base to belong to that set and an empty diff against every base. The real-Git
+evidence table builds criss-cross merges with two bases: matching only one tree refuses
+with `diff-nonempty-vs-base`; a stored base outside the set refuses with `base-ambiguous`.
+Matching every tree still exempts, as does the single-base control. This uses the review
+reader's `resolveNetDiffBasis` default base ref. A stored base distinct from head can still carry the same tree as head; the
 `base === head` refusal alone does not establish provenance. Preserve real-Git controls
 showing both the poisoned empty range and the legitimate changed range in
-`scripts/lib/__tests__/red-team-empty-net-diff.test.mjs`. Failed, malformed, ambiguous,
+`scripts/lib/__tests__/red-team-empty-net-diff.test.mjs`. Failed, malformed, unmatched,
 or oversized merge-base output retains the existing hold: inspect stored evidence
 and re-run the reader against the legitimate base before retrying clearance. Negative
 diff tests must return a valid matching merge-base and assert the diff call occurs.

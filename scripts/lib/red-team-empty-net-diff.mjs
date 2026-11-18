@@ -55,14 +55,21 @@ export function emptyDiffExemptionEvidence({ repo, pr, head, seatRecord, loopPay
   let base, recomputed;
   try {
     base = git(['rev-parse', '--verify', '--end-of-options', `${read.netBasis.base}^{commit}`]).trim();
-    recomputed = git(['merge-base', '--end-of-options', 'origin/main', head]).trim();
+    recomputed = git(['merge-base', '--all', '--end-of-options', 'origin/main', head]).trim().split('\n');
   } catch { return refused('base-unresolvable'); }
-  if (!sha(base) || !sha(recomputed)) return refused('base-unresolvable');
-  if (base.toLowerCase() === head.toLowerCase() || recomputed.toLowerCase() !== base.toLowerCase())
-    return refused('base-mismatch');
+  if (!sha(base) || !recomputed.every(sha)) return refused('base-unresolvable');
+  base = base.toLowerCase();
+  recomputed = recomputed.map(value => value.toLowerCase());
+  const ambiguous = recomputed.length > 1;
+  if (base === head.toLowerCase() || !recomputed.includes(base))
+    return refused(ambiguous ? 'base-ambiguous' : 'base-mismatch');
   try {
-    if (git(['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--ignore-submodules=none', '--name-only', '-z',
-      '--end-of-options', `${base}..${head}`, '--']) !== '') return refused('diff-nonempty');
+    // Probe the stored base first, then every other valid base: one empty range is insufficient.
+    for (const candidate of [base, ...recomputed.filter(value => value !== base)]) {
+      if (git(['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--ignore-submodules=none', '--name-only', '-z',
+        '--end-of-options', `${candidate}..${head}`, '--']) !== '')
+        return refused(ambiguous ? 'diff-nonempty-vs-base' : 'diff-nonempty');
+    }
   } catch { return refused('diff-unreadable'); }
   return { exempt: true, reason: 'empty-net-diff' };
 }
