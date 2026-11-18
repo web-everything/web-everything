@@ -37,7 +37,7 @@
  * own the `mkdir`/`O_EXCL` boundary and are deliberately tiny so the testable logic stays pure.
  */
 
-import { mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, statSync, renameSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, statSync, renameSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 
@@ -307,11 +307,11 @@ export function releaseLockDirIf(lockRoot, path, expected) {
   // Cheap pre-check: a lock that is plainly not the one judged is never moved at all, so the rename window below
   // opens only when the lock looks like the expected one.
   if (!existsSync(dir)) return false;
-  if (!matchesExpected(readLockEntry(lockRoot, path))) return false;
+  if (!matchesExpected(readLockEntry(lockRoot, path)) || (!expected && !entrylessReclaimable(dir))) return false;
   // The tombstone is a SIBLING of the lock root, never inside it: readers that enumerate `lockRoot` must not count it.
   const tomb = `${lockRoot}.gone-${randomBytes(6).toString('hex')}`;
   try { renameSync(dir, tomb); } catch (e) { if (e && (e.code === 'ENOENT')) return false; throw e; }
-  if (matchesExpected(readEntryInDir(tomb))) { rmSync(tomb, { recursive: true, force: true }); return true; }
+  if (matchesExpected(readEntryInDir(tomb)) && (expected || entrylessReclaimable(tomb))) { rmSync(tomb, { recursive: true, force: true }); return true; }
   // The lock changed hands between the pre-check and the rename: restore it. If someone already re-took the path in
   // that gap, theirs stands and the displaced tombstone is dropped. This is the one window left (a read-to-rename
   // gap, not a lease): a rename cannot be made conditional on content, only re-verified after the fact.
@@ -326,6 +326,30 @@ export const ENTRYLESS_LOCK_DIR_GRACE_MS = 10_000;
 /** Wall-clock age of a lock dir, or null when it does not exist. */
 function lockDirAgeMs(lockRoot, path) {
   try { return Date.now() - statSync(lockDirFor(lockRoot, path)).mtimeMs; } catch { return null; }
+}
+
+// A torn/unreadable entry is not evidence that its writer is gone. Require old metadata
+// and no live PID in any readable file (including partial JSON and heartbeat records).
+function entrylessReclaimable(dir) {
+  const now = Date.now();
+  try {
+    if (now - statSync(dir).mtimeMs <= ENTRYLESS_LOCK_DIR_GRACE_MS) return false;
+    try {
+      if (now - statSync(join(dir, 'lock.json')).mtimeMs <= ENTRYLESS_LOCK_DIR_GRACE_MS) return false;
+    } catch (e) { if (e.code !== 'ENOENT') return false; }
+    for (const file of readdirSync(dir, { withFileTypes: true })) {
+      if (!file.isFile()) continue;
+      let text;
+      try { text = readFileSync(join(dir, file.name), 'utf8'); } catch { continue; }
+      for (const match of text.matchAll(/"pid"\s*:\s*"?(\d+)/g)) {
+        const pid = Number(match[1]);
+        if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+        try { process.kill(pid, 0); return false; }
+        catch (e) { if (e.code !== 'ESRCH') return false; }
+      }
+    }
+    return true;
+  } catch { return false; }
 }
 
 /**
@@ -361,7 +385,7 @@ export function reserve(lockRoot, path, owner, nowMs, nowIso, pid = null, pidLiv
       if (acquireLockDir(lockRoot, path, entry)) return { ok: true, reason: 'free', heldBy: owner };
       return { ok: false, reason: 'held', heldBy: null };
     }
-    if (age < ENTRYLESS_LOCK_DIR_GRACE_MS) return { ok: false, reason: 'initializing', heldBy: null };
+    if (!entrylessReclaimable(lockDirFor(lockRoot, path))) return { ok: false, reason: 'initializing', heldBy: null };
   }
   // `pidLiveness` may be a probe `(entry) => 'dead'|'alive'|'unknown'`, run against THIS read — so the verdict
   // always describes the holder being judged, never one a caller read earlier and lost the lock from (#2668).

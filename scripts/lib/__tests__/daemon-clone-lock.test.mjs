@@ -7,7 +7,7 @@
  *   thing no amount of injected fakes can substitute for).
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, symlinkSync, appendFileSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, symlinkSync, appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir, hostname } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -26,7 +26,7 @@ import {
   resolveWriterPriorityAfter,
 } from '../daemon-clone-lock.mjs';
 
-import { heartbeat } from '../../readiness/file-locks.mjs';
+import { heartbeat, lockDirFor, readLockEntry } from '../../readiness/file-locks.mjs';
 
 const MODULE_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'daemon-clone-lock.mjs');
 
@@ -46,6 +46,39 @@ afterEach(() => {
 
 const alwaysAlive = () => 'alive';
 const alwaysDead = () => 'dead';
+
+it('stops heartbeating and logs loss once without overwriting or releasing a replacement owner/token', async () => {
+  vi.useFakeTimers();
+  try {
+    const checkReplacement = async (replacementOwner) => {
+      const lockRoot = mkTmp('dcl-lost-lockroot-');
+      const clone = mkTmp('dcl-lost-clone-');
+      const { writerRoot } = cloneLockDirs(clone, lockRoot);
+      const file = join(lockDirFor(writerRoot, '<clone:writer>'), 'lock.json');
+      const log = vi.fn();
+      let replacement;
+      const result = await withWriteLock(clone, async () => {
+        const original = readFileSync(file, 'utf8');
+        await vi.advanceTimersByTimeAsync(HEARTBEAT_INTERVAL_MS);
+        expect(readFileSync(file, 'utf8')).toBe(original);
+        expect(readLockEntry(writerRoot, '<clone:writer>').heartbeatAt).toBe(new Date().toISOString());
+        replacement = JSON.stringify({ ...JSON.parse(original), owner: replacementOwner, token: 'replacement-token' });
+        writeFileSync(file, replacement);
+        await vi.advanceTimersByTimeAsync(HEARTBEAT_INTERVAL_MS);
+        expect(readFileSync(file, 'utf8')).toBe(replacement);
+        expect(vi.getTimerCount()).toBe(0);
+        await vi.advanceTimersByTimeAsync(HEARTBEAT_INTERVAL_MS * 2);
+        expect(log).toHaveBeenCalledTimes(1);
+        expect(log).toHaveBeenCalledWith(expect.stringContaining('write lock lost'));
+        return 'must not publish';
+      }, { owner: 'stale-writer', lockRoot, log });
+      expect(result).toEqual({ ok: false, reason: 'lock-lost', heldBy: replacementOwner });
+      expect(readFileSync(file, 'utf8')).toBe(replacement);
+    };
+    await checkReplacement('new-writer');
+    await checkReplacement('stale-writer'); // owner equality alone does not establish ownership
+  } finally { vi.useRealTimers(); }
+});
 
 describe('symmetric reader/writer fairness', () => {
   // Build real reader starvation records, then rotate through three different priority readers.

@@ -52,6 +52,7 @@ import {
   readLockEntry,
   releaseLockDir,
   heartbeat,
+  heartbeatOwn,
   parseLockEntry,
   isLeaseExpired,
   lockIdFor,
@@ -903,16 +904,36 @@ export async function withWriteLock(root, fn, opts = {}) {
   if (!acquired.ok) return acquired;
 
   const { writerRoot } = cloneLockDirs(root, lockRoot);
+  // heartbeatOwn leaves this entry immutable: compare the whole acquisition record, including
+  // any fencing token, rather than accepting a replacement with the same owner string.
+  const entryFile = join(writerRoot, lockIdFor(WRITER_KEY), 'lock.json');
+  const readRecord = () => { try { return readFileSync(entryFile, 'utf8'); } catch { return null; } };
+  const record = readRecord();
+  const stillOurs = () => record !== null && readRecord() === record
+    && readLockEntry(writerRoot, WRITER_KEY)?.owner === owner;
+  let lost = false;
+  const loseLock = () => {
+    if (lost) return;
+    lost = true;
+    clearInterval(timer);
+    (opts.log || console.error)('daemon-clone-lock: write lock lost; result withheld');
+  };
   const timer = setInterval(() => {
-    try { heartbeat(writerRoot, WRITER_KEY, owner, new Date().toISOString(), pid); } catch { /* best-effort */ }
+    try {
+      if (!stillOurs() || !heartbeatOwn(writerRoot, WRITER_KEY, owner, new Date().toISOString()) || !stillOurs()) loseLock();
+    } catch { loseLock(); }
   }, HEARTBEAT_INTERVAL_MS);
   if (typeof timer.unref === 'function') timer.unref();
   try {
+    if (!stillOurs()) loseLock();
+    if (lost) return { ok: false, reason: 'lock-lost', heldBy: readLockEntry(writerRoot, WRITER_KEY)?.owner ?? null };
     const value = await fn();
+    if (!stillOurs()) loseLock();
+    if (lost) return { ok: false, reason: 'lock-lost', heldBy: readLockEntry(writerRoot, WRITER_KEY)?.owner ?? null };
     return { ok: true, value };
   } finally {
     clearInterval(timer);
-    releaseWrite(root, { owner, lockRoot });
+    if (!lost && stillOurs()) releaseWrite(root, { owner, lockRoot });
   }
 }
 

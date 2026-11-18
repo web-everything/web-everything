@@ -311,6 +311,29 @@ describe('reclaim never destroys a lock another owner has taken since', () => {
   beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'we-locks-cas-')); });
   afterEach(() => { rmSync(root, { recursive: true, force: true }); });
 
+  it('holds malformed entries with fresh file/dir mtimes or a readable live PID; reclaims only old entries without live PIDs', () => {
+    const now = Date.now();
+    const old = (now - ENTRYLESS_LOCK_DIR_GRACE_MS - 5000) / 1000;
+    const fresh = now / 1000;
+    const check = (path, { text = '{broken', fileTime = old, dirTime = old, heartbeat = null, held = true } = {}) => {
+      expect(acquireLockDir(root, path, makeLockEntry('writer', path, iso(now)))).toBe(true);
+      const dir = lockDirFor(root, path);
+      const file = join(dir, 'lock.json');
+      writeFileSync(file, text);
+      if (heartbeat) writeFileSync(join(dir, 'hb.partial'), heartbeat);
+      utimesSync(file, fileTime, fileTime);
+      utimesSync(dir, dirTime, dirTime);
+      expect(reserve(root, path, 'contender', now, iso(now)).ok).toBe(!held);
+      if (held) expect(readFileSync(file, 'utf8')).toBe(text);
+      else expect(readLockEntry(root, path).owner).toBe('contender');
+    };
+    check('fresh-file', { fileTime: fresh });
+    check('fresh-dir', { dirTime: fresh });
+    check('partial-live-pid', { text: `{"pid":${process.pid},` });
+    check('heartbeat-live-pid', { heartbeat: JSON.stringify({ pid: process.pid }) });
+    check('old-no-live-pid', { text: '{"pid":999999999,', held: false });
+  });
+
   it('a stalled acquirer (mkdir won, entry not yet written) loses to the owner that reclaimed its dir — and leaves that owner\'s lock intact', () => {
     const stalledEntry = makeLockEntry('A', 'p', iso(T0), 100);
     let reclaim;
