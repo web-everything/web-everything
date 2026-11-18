@@ -896,6 +896,9 @@ const PATH_COLON_LOCATION = /((?:[\w.@~+-]+\/)*[\w@~+-][\w.@~+-]*\.[a-z0-9]{1,8}
 // A scheme can sit anywhere in the token, not only at its start: `fetch(data:...`, `f(a,mailto:`, `url=urn:`,
 // `x||file:` are expressions around a URL. Any scheme-shaped `name:` earlier in the token keeps the whole location.
 const URI_SCHEME_PREFIX = /(?:^|[^a-z0-9+.-])[a-z][a-z0-9+.-]*:/i;
+// An ENCODED delimiter hides the scheme/slash from the literal checks above (`data%3Atext/plain%2Csrc/x.txt:10`,
+// `&#58;`, `&colon;`, `:`, `\x3a`), so any escape sequence in the token before the match marks it a URL too.
+const ENCODED_URI_ESCAPE = /%[0-9a-f]{2}|&#x?[0-9a-f]+;|&colon;|\\(?:u[0-9a-f]{4}|x[0-9a-f]{2})/i;
 const LINE_WORD_LOCATION =/\b(line|L) +\d+(?=$|[ )]|[.,;:](?: |$))/gi;
 // Do not guess where code/quotes end (including unmatched, escaped or Unicode quotes).
 // Conservatively retain word-style locations throughout such a summary; explicit path:line handling is separate.
@@ -921,7 +924,8 @@ export function summaryCanonical(summary, file = '') {
       const tokenStart = text.lastIndexOf(' ', offset) + 1;
       // Slashless URI schemes (`data:`, `mailto:`, `urn:`, `file:`) are URLs too; tolerate leading quote/backtick/paren.
       const urlPrefix = text.slice(tokenStart, offset);
-      if (urlPrefix.includes('//') || URI_SCHEME_PREFIX.test(urlPrefix)) return match;
+      // `urlPrefix + path`: the path match can begin mid-escape (`%` | `2Csrc/x.txt`), so join before testing.
+      if (urlPrefix.includes('//') || URI_SCHEME_PREFIX.test(urlPrefix) || ENCODED_URI_ESCAPE.test(urlPrefix + path)) return match;
       // A slash path needs a source extension and a non-host first segment (`cdn.example.com/x.js:8080` is a URL).
       const repoPath = path.includes('/') && SOURCE_PATH_EXT.test(path) && !/^[^/.]+\.[^/]+\//.test(path);
       return repoPath || (own && path.toLowerCase() === own) ? `${path}#` : match;

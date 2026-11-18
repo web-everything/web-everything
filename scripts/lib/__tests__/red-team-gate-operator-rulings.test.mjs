@@ -932,6 +932,29 @@ describe('summary canonicalization strips only whitespace and line-location toke
         expect(summaryCanonical(at(10), urlFile)).not.toBe(summaryCanonical(at(20), urlFile));
       }
     });
+    it('(e) percent-encoded scheme delimiters keep the payload number (R1012)', () => {
+      for (const prefix of ['data%3Atext/plain%2C', 'data%3atext/plain%2c', 'mailto%3A', 'fetch(data%3Atext/plain%2C',
+        'url=urn%3A', '%64ata:text/plain,', 'data:text%2Fplain,', '%2F%2Fcdn.example.com%2F',
+        'data&#58;text/plain,', 'data&colon;text/plain,', 'data\\u003atext/plain,', 'data\\x3atext/plain,']) {
+        const at = n => `Rejects ${prefix}src/input.txt:${n} payload`;
+        expect(summaryCanonical(at(10), urlFile)).toBe(at(10));
+        expect(summaryCanonical(at(10), urlFile)).not.toBe(summaryCanonical(at(20), urlFile));
+      }
+    });
+    it('(f) holds a carded finding when head B changes an encoded-scheme payload number', () => {
+      const enc = n => `Rejects data%3Atext/plain%2Csrc/input.txt:${n} payload`;
+      const fresh = (head, summary, at) => bot(renderRedTeamComment({ pr: P, rev: head,
+        provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+        findings: [{ ...F(159, 'broken'), file: urlFile, summary }] }), at);
+      const source = fresh(H, enc(10), result.created_at);
+      const next = fresh(N, enc(20), '2026-10-21T21:00:00Z');
+      const id = liveResultGateState([source], P, H).resultId;
+      const comments = [source, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z', id), next];
+      const d = readRedTeamDisposition({ comments, pr: P, head: N, setting: CONFIRMED_BREAKS_DEFAULTS,
+        operatorRulings: { anyState: true }, sealed: null });
+      expect(held(d)).toEqual([1]);
+      expect(d.dispositions.get(1).state).not.toBe('released carded');
+    });
     it('(c) control: a plain src/input.txt:N location still canonicalizes equal', () => {
       const plain = n => `Rejects src/input.txt:${n} payload`;
       expect(summaryCanonical(plain(10), urlFile)).toBe(summaryCanonical(plain(20), urlFile));
