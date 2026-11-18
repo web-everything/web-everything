@@ -135,11 +135,48 @@ fi
   ],
 };
 
-// Exact action references observed in the mirrored jobs of ci.yml. New actions require a mirror review.
-const mirroredActions = new Set([
-  'actions/checkout@v4', 'actions/setup-node@v4', 'actions/create-github-app-token@v2',
-  'actions/upload-artifact@v4', 'actions/download-artifact@v4',
-]);
+// Ordered uses-step signatures observed in ci.yml, independent of the input workflow.
+// Pin the complete with mapping: additions, removals and option changes require a mirror review.
+const siblingActions = [
+  { name: 'Checkout WE', uses: 'actions/checkout@v4', with: { path: 'web-everything', 'fetch-depth': 50 } },
+  { name: 'Mint FUI read token (GitHub App)', uses: 'actions/create-github-app-token@v2', with: {
+    'app-id': '${{ vars.WE_APP_ID }}', 'private-key': '${{ secrets.WE_APP_PRIVATE_KEY }}',
+    owner: 'frontier-ui', repositories: 'frontierui', 'permission-contents': 'read',
+  } },
+  { name: 'Checkout FUI (sibling)', uses: 'actions/checkout@v4', with: {
+    repository: 'frontier-ui/frontierui', token: '${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}', path: 'frontierui',
+  } },
+  { name: undefined, uses: 'actions/setup-node@v4', with: {
+    'node-version': 22, cache: 'npm', 'cache-dependency-path': 'web-everything/package-lock.json\nfrontierui/package-lock.json\n',
+  } },
+];
+const mirroredActions = {
+  changes: [{ name: undefined, uses: 'actions/checkout@v4', with: { 'fetch-depth': 50 } }],
+  standards: siblingActions,
+  integration: siblingActions,
+  'test-shard': [...siblingActions,
+    { name: 'Upload shard coverage', uses: 'actions/upload-artifact@v4', with: {
+      name: 'coverage-shard-${{ matrix.shard }}', path: 'web-everything/coverage/coverage-final.json', 'if-no-files-found': 'error',
+    } },
+    { name: 'Upload shard timings', uses: 'actions/upload-artifact@v4', with: {
+      name: 'timing-unit-${{ matrix.shard }}', path: 'web-everything/coverage/timing-unit-${{ matrix.shard }}.json', 'if-no-files-found': 'ignore',
+    } },
+  ],
+  'coverage-merge': [
+    { name: undefined, uses: 'actions/checkout@v4', with: { path: 'web-everything' } },
+    { name: undefined, uses: 'actions/setup-node@v4', with: {
+      'node-version': 22, cache: 'npm', 'cache-dependency-path': 'web-everything/package-lock.json',
+    } },
+    { name: 'Download shard coverage', uses: 'actions/download-artifact@v4', with: {
+      path: 'web-everything/coverage-shards', pattern: 'coverage-shard-*',
+    } },
+  ],
+  'host-paths': [
+    { name: undefined, uses: 'actions/checkout@v4', with: undefined },
+    { name: undefined, uses: 'actions/setup-node@v4', with: { 'node-version': 22 } },
+  ],
+  test: [],
+};
 
 // Execution contexts observed in ci.yml, pinned independently of the input workflow.
 const fullUnit = "${{ needs.changes.outputs.light != 'true' }}";
@@ -194,9 +231,11 @@ export function ciGatePlan(workflow) {
     const expectedRuns = [...(jobSetupRuns[job] ?? []), ...mirrored].map(runText);
     const allowed = new Set(expectedRuns);
     if (!Array.isArray(steps) || steps.some(s => !s || typeof s !== 'object' || ('run' in s &&
-      (typeof s.run !== 'string' || !allowed.has(runText(s.run)))))
-      || steps.some(s => 'uses' in s && !mirroredActions.has(s.uses)))
+      (typeof s.run !== 'string' || !allowed.has(runText(s.run))))))
       throw new Error(`unreadable-ci-gates: update the urgent verification mirror for ${job} run or uses steps`);
+    const actualActions = steps.filter(s => 'uses' in s).map(s => ({ name: s.name, uses: s.uses, with: s.with }));
+    if (!isDeepStrictEqual(actualActions, mirroredActions[job]))
+      throw new Error(`unreadable-ci-gates: update the urgent verification mirror for ${job} uses steps`);
     // Every accepted command must belong to the local mirror, exactly once.
     const actualRuns = steps.filter(s => 'run' in s).map(s => runText(s.run));
     if (actualRuns.length !== expectedRuns.length || expectedRuns.some(text => actualRuns.filter(run => run === text).length !== 1))

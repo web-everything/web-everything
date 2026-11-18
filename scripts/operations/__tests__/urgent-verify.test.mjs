@@ -181,6 +181,40 @@ describe('CI gate mirroring fails closed', () => {
     });
   });
   const real = yaml.safeLoad(workflow);
+  const mirroredJobs = ['changes', 'test-shard', 'coverage-merge', 'host-paths', 'integration', 'test', 'standards'];
+  it.each(mirroredJobs)('refuses an added download-artifact step in %s', job => {
+    const changed = yaml.safeLoad(workflow);
+    changed.jobs[job].steps.push({ name: 'Additional required artifact', uses: 'actions/download-artifact@v4', with: { name: 'required' } });
+    expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('unreadable-ci-gates: update the urgent verification mirror');
+  });
+  const actionSteps = mirroredJobs.flatMap(job => real.jobs[job].steps.flatMap((step, index) => 'uses' in step ? [[job, index]] : []));
+  it.each(actionSteps)('refuses a removed uses step in %s at %i', (job, index) => {
+    const changed = yaml.safeLoad(workflow);
+    changed.jobs[job].steps.splice(index, 1);
+    expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('unreadable-ci-gates');
+  });
+  it.each(actionSteps)('pins the name, action reference and with options in %s at %i', (job, index) => {
+    for (const mutate of [
+      step => { step.name = 'Changed action name'; },
+      step => { step.uses = 'actions/download-artifact@v4'; },
+      step => { step.with = { ...step.with, unexpected: true }; },
+      step => { step.with = {}; },
+      step => { step.with = Object.fromEntries(Object.keys(step.with ?? {}).map(key => [key, 'changed'])); },
+    ]) {
+      const changed = yaml.safeLoad(workflow), step = changed.jobs[job].steps[index];
+      const before = yaml.safeDump(step);
+      mutate(step);
+      if (yaml.safeDump(step) === before) continue;
+      expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('unreadable-ci-gates');
+    }
+  });
+  it.each(mirroredJobs.filter(job => actionSteps.filter(([name]) => name === job).length > 1))(
+    'refuses reordered uses steps in %s', job => {
+      const changed = yaml.safeLoad(workflow), steps = changed.jobs[job].steps;
+      const [first, second] = actionSteps.filter(([name]) => name === job).map(([, index]) => index);
+      [steps[first], steps[second]] = [steps[second], steps[first]];
+      expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('unreadable-ci-gates');
+    });
   it.each(['test-shard', 'standards', 'coverage-merge', 'host-paths', 'integration'])(
     'refuses extra previously allowlisted commands in %s even with matching context', job => {
       for (const run of ['npm run build:tools', 'npm ci --ignore-scripts', 'npm ci',
