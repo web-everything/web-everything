@@ -20,27 +20,24 @@ export function timeoutRequesterNamespace({ platform = process.platform, readNam
 }
 
 /** Eligibility for observation-based release, never proof that a request was not sent.
- * Local live/unknown identities remain held; legacy and remote owners get a hard-ceiling fallback.
+ * Only proven-dead same-host, same-namespace owners are eligible; all unknown owners remain held.
  */
-export function timeoutPendingIsStale(pending, now = Date.now(), env = process.env) {
+export function timeoutPendingIsStale(pending, now = Date.now(), env = process.env, ownerProbe = {}) {
   const raw = Number(env.WE_TIMEOUT_RERUN_PENDING_STALE_MS);
-  const hard = Number(env.WE_TIMEOUT_RERUN_PENDING_HARD_STALE_MS);
   const policy = cascadePolicy('timeoutRerun', undefined, {
-    env, standard: { pendingStaleMs: 20 * 60_000, pendingHardStaleMs: 6 * 60 * 60_000 },
-    envValues: { pendingStaleMs: Number.isFinite(raw) && raw > 0 ? raw : undefined,
-      pendingHardStaleMs: Number.isFinite(hard) && hard > 0 ? hard : undefined },
-    valid: { pendingStaleMs: v => Number.isFinite(v) && v > 0,
-      pendingHardStaleMs: v => Number.isFinite(v) && v > 0 },
+    env, standard: { pendingStaleMs: 20 * 60_000 },
+    envValues: { pendingStaleMs: Number.isFinite(raw) && raw > 0 ? raw : undefined },
+    valid: { pendingStaleMs: v => Number.isFinite(v) && v > 0 },
   });
   const at = Date.parse(pending?.reservedAt);
   if (!Number.isFinite(at) || now - at <= policy.value.pendingStaleMs) return false;
   const owner = pending.requester;
-  const namespace = timeoutRequesterNamespace();
-  if (!owner || owner.hostname !== hostname() || !namespace || owner.namespace !== namespace
+  const { host = hostname(), namespace = timeoutRequesterNamespace(), identity = pidIdentity } = ownerProbe;
+  if (!owner || owner.hostname !== host || !namespace || owner.namespace !== namespace
       || !Number.isInteger(owner.pid) || owner.pid <= 0) {
-    return now - at > policy.value.pendingHardStaleMs;
+    return false;
   }
-  return pidIdentity(owner.pid, { expectStart: owner.runnerStart, startedBy: at }).alive === false;
+  return identity(owner.pid, { expectStart: owner.runnerStart, startedBy: at }).alive === false;
 }
 
 export const timeoutStateDir = () => join(ghThrottleLockRoot(), 'ci-timeout-reruns');
@@ -58,7 +55,7 @@ export function readTimeoutStates(evidence, dir = timeoutStateDir()) {
   });
 }
 
-export function readTimeoutBudget({ dir, now = Date.now(), ...evidence }) {
+export function readTimeoutBudget({ dir, now = Date.now(), ownerProbe, ...evidence }) {
   try {
     dir ??= timeoutStateDir(); // resolved inside the guard: an unreadable lock root is "unreadable state", never a throw
     const requests = readTimeoutStates(evidence, dir).flatMap((state) => state.requests);
@@ -71,7 +68,7 @@ export function readTimeoutBudget({ dir, now = Date.now(), ...evidence }) {
       rejected: requests.filter((r) => r.status === 'rejected' && !r.released).length,
       // Expiry schedules observation; it never proves an ambiguous request safe to heal.
       pending: pending.length > 0,
-      ...(pending.length && pending.every(r => timeoutPendingIsStale(r, now)) ? { pendingStale: true } : {}),
+      ...(pending.length && pending.every(r => timeoutPendingIsStale(r, now, process.env, ownerProbe)) ? { pendingStale: true } : {}),
       // When the oldest still-pending request was reserved: lets the planner tell a rerun that is simply in
       // flight (hold, no human) from one that has been unresolved too long (escalate).
       ...(requests.some((r) => r.status === 'pending')

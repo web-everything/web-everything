@@ -972,7 +972,7 @@ export async function flushTimeoutFollowups({ root = REPO_ROOT, repo, dir = time
  * budget. It reconciles only on an observed newer run attempt for the SAME repository and head.
  */
 export async function dispatchTimeoutRetry(evidence, {
-  root = REPO_ROOT, repo, dir = timeoutStateDir(), effects = timeoutGithubEffects(), fileFollowup, now = Date.now,
+  root = REPO_ROOT, repo, dir = timeoutStateDir(), effects = timeoutGithubEffects(), fileFollowup, now = Date.now, ownerProbe,
 } = {}) {
   const refuse = (reason, extra = {}) => ({ status: 'refused', reason, ...extra });
   if (!evidence?.eligible || evidence.repo !== repo || !evidence.head || !evidence.signature
@@ -1028,7 +1028,8 @@ export async function dispatchTimeoutRetry(evidence, {
     if (selected.pending) {
       if (!Number.isInteger(observed.attempt) || !Number.isInteger(target.attempt)) return refuse('retry-observation-unknown:invalid-attempt');
       if (observed.attempt <= target.attempt) {
-        if (!allowRelease || !timeoutPendingIsStale(selected.pending, now())) return refuse('retry-outcome-pending');
+        if (observed.attempt !== target.attempt || observed.jobAttempt !== target.attempt || observed.status !== 'completed'
+            || !allowRelease || !timeoutPendingIsStale(selected.pending, now(), process.env, ownerProbe)) return refuse('retry-outcome-pending');
         timeoutTransaction(path, initial, (state) => {
           const pending = state.requests[selected.pending.id];
           if (pending?.status === 'pending' && pending.reservedAt === selected.pending.reservedAt) {
