@@ -40,7 +40,7 @@ export function freezeProbation({ adoptionId, sha, provenGood, adoptedAt, regist
 function validState(p) {
   return object(p) && p.version === 2 && nameOK(p.adoptionId) && shaOK(p.sha)
     && Number.isFinite(dateMs(p.adoptedAt)) && Array.isArray(p.owed)
-    && p.owed.every(nameOK) && new Set(p.owed).size === p.owed.length && object(p.records);
+    && Array.from(p.owed).every(nameOK) && new Set(Array.from(p.owed)).size === p.owed.length && object(p.records);
 }
 
 function validProof(p, daemonId, evidence, now) {

@@ -49,6 +49,12 @@ describe('R986 I1 frozen owed set and per-daemon proofs (pure core)', () => {
     expect(() => freezeProbation({ ...options, registered: new Array(1) })).toThrow();
   });
 
+  it('a sparse owed array in persisted state fails closed, never pass', async () => {
+    const { freezeProbation, evaluateProbation } = await core();
+    const p = freezeProbation(options);
+    expect(evaluateProbation({ ...p, owed: new Array(1) }, now)).toMatchObject({ action: 'pending' });
+  });
+
   it('empty owed set promotes immediately with no boot or tick evidence', async () => {
     const { freezeProbation, evaluateProbation } = await core();
     const p = freezeProbation({ ...options, readClosure: () => closure(GOOD) });
