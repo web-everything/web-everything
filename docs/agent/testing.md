@@ -4567,3 +4567,12 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+
+## Full-evidence red-team merge admission
+
+`red-team-owed-decision.test.mjs` pins delegation per function with TypeScript AST checks;
+add decision modules to its site table as they migrate. Each call has a removal mutation.
+Merge-admission fixtures need a scored, nonempty read even when nothing was scheduled.
+Keep status and carry reads alongside the selected payload: historical policy-clear comments
+cannot clear an unreviewable read. The merge-strategy probe uses real status and carry files.

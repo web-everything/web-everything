@@ -51,6 +51,43 @@ export function redTeamCardOnly(read) {
   return isCardOnlyDiff(paths);
 }
 
+/** Admission consumes all evidence: a selected read or an old policy-clear cannot hide current debt. */
+export function redTeamOwedDecision({ fullEvidence = {} } = {}) {
+  const e = fullEvidence ?? {};
+  const status = e.liveStatus ?? e.status ?? e.rawWriter?.parsed ?? e.rawWriter;
+  const payload = e.loopPayload ?? e.storedReview?.newest ?? e.newest ?? e.carry?.loopPayload ?? status?.loopPayload;
+  const read = e.read ?? payload?.findings?.read;
+  const reads = [read];
+  if (Object.hasOwn(e, 'read')) reads.push(e.read);
+  if (e.carry != null) reads.push(e.carry.loopPayload?.findings?.read);
+  for (const source of [e, e.status, e.liveStatus, e.rawWriter?.parsed, e.rawWriter, e.carry]) {
+    if (source && Object.hasOwn(source, 'loopPayload') && (source !== e || source.loopPayload != null))
+      reads.push(source.loopPayload?.findings?.read);
+  }
+  for (const source of [e.storedReview, e]) {
+    if (source && Object.hasOwn(source, 'newest')) reads.push(source.newest?.findings?.read);
+  }
+  const readReviewable = reads.every(r => r?.diffScored === true
+    && typeof r.diffText === 'string' && !!r.diffText.trim());
+  const unknown = e.ok === false || !!e.carryConflict;
+  const result = status?.result;
+  const prior = typeof result === 'string' ? result : result?.status;
+  const executing = !!(e.inFlight || e.recorded || e.seatRecorded || e.completedRecorded
+    || e.cleanRecorded || e.seats?.length || ['ran', 'resumed'].includes(prior));
+  const skip = e.skipCardOnly ?? status?.skipCardOnly ?? e.defaultSkipCardOnly ?? true;
+  const exempt = skip === true && redTeamCardOnly(read);
+  const debt = executing || (!exempt && !!(e.scheduled || e.queued
+    || ['queued', 'running'].includes(status?.status) || (prior === 'skipped' && redTeamOwedFor(payload))));
+  const historicalResult = e.disposition?.result ?? e.historicalResult;
+  // A real recorded result pays execution debt; a policy exemption can only confirm that no pass is owed.
+  const recordedResult = !!historicalResult && historicalResult.policyClear !== true;
+  const owed = !readReviewable || unknown || (debt && !recordedResult);
+  const cleared = !owed && !!historicalResult;
+  const reason = !readReviewable ? 'unreviewable-read' : unknown ? 'evidence-unknown'
+    : owed ? 'pass-owed' : recordedResult ? 'recorded-result' : exempt ? 'card-only-exempt' : 'no-pass-owed';
+  return { owed, cleared, readReviewable, reason };
+}
+
 /**
  * Is a red-team result owed on this head? A pass that started or finished is always owed its result. A card-only
  * head is exempt only while the producer skips it: the skip decision the producer's process recorded with the

@@ -37,7 +37,7 @@ const sealAtFinish = (f, { findings = [], comments = [cleanResultComment(f)], ca
     listComments: () => comments, postComment: () => { throw Error('seal at finish never posts'); },
     readSeatRow: () => seatRow(key.head, findings), publishNeedsYou: () => {} });
 };
-const payload = head => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
+const payload = head => ({ verdict: { verdict: 'accept' }, findings: { read: { diffScored: true, diffText: '+change', netChangedFiles: ['scripts/x.mjs'], netBasis: { rev: head } } } });
 
 describe('status persistence and check publication share one claim', () => {
   it.each(['pending', 'running', 'finished'])('under-test %s writes without an injected publisher never call gh or create a publication hold', status => {
@@ -553,7 +553,7 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
           status: { status: 'finished', result: { status: 'skipped', policy: 'card-only' } } });
       } else {
         expect(evidence.carryConflict).toBe(true);
-        expect(evidence.carry).toBeUndefined();
+        expect(evidence.carry).toEqual(readRedTeamCarry(f));
       }
     });
   it.each(['accept', 'changes'])('a carried %s verdict is never exposed as a live-head panel verdict', verdict => {
@@ -754,14 +754,14 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
   });
 
   it('does not invent an accept when no review run exists', () => {
-    expect(readDrainRedTeamEvidence(fixture())).toEqual({ loopPayload: null, recorded: false,
+    expect(readDrainRedTeamEvidence(fixture())).toEqual({ loopPayload: null, recorded: false, seats: [],
       seatRecorded: false, completedRecorded: false, failedSeatCount: 0, scheduled: false, inFlight: false });
   });
   it('pins the accepted-label boundary with empty status and run stores', () => {
     const f = fixture();
     const evidence = readDrainRedTeamEvidence(f);
     // #5439/#5443: an acceptance label alone cannot invent scheduler work that never existed.
-    expect(redTeamEnqueueHold({ ...f, ...evidence, labels: ['review:accepted'], comments: [] })).toBeNull();
+    expect(redTeamEnqueueHold({ ...f, ...evidence, labels: ['review:accepted'], comments: [] })).toMatch(/unreviewable-read/);
     // A persisted accepting verdict holds before the job publishes its first status: the loop applies the labels
     // before the job can write one. It is not a live queue entry, so the never-scheduled deadline still applies.
     const run = { ...newRunRecord({ id: 'review-pr-5439', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }), ...payload(f.head) };
@@ -774,7 +774,7 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     writeRun({ ...run, verdict: { verdict: 'changes' } }, f.runsDir);
     expect(readDrainRedTeamEvidence(f).scheduled).toBe(false);
     writeRun(run, f.runsDir);
-    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'skipped' }, f);
+    recordRedTeamStatus({ ...f, loopPayload: { ...payload(f.head), findings: { read: { ...payload(f.head).findings.read, netChangedFiles: ['backlog/123-card.md'] } } }, status: 'finished', result: 'skipped' }, f);
     expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toBeNull();
   });
   it('an earlier finished status on the same head never supersedes a newer accepting run', () => {
@@ -788,7 +788,7 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     expect(readDrainRedTeamEvidence(f)).toMatchObject({ scheduled: true, inFlight: false });
     expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toMatch(/no recorded result/);
     // The re-review's own later status supersedes the run again.
-    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'skipped' }, f);
+    recordRedTeamStatus({ ...f, loopPayload: { ...payload(f.head), findings: { read: { ...payload(f.head).findings.read, netChangedFiles: ['backlog/123-card.md'] } } }, status: 'finished', result: 'skipped' }, f);
     expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toBeNull();
   });
   it('a newer accepting run does not hide a finished but unpublished result on the same head', () => {
@@ -832,7 +832,7 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
   // PR #5482 self-review: the review job and the drain resolve WE_RED_TEAM_SKIP_CARD_ONLY in separate processes.
   it('carries the writer\'s card-only skip decision to the drain, whatever the drain process resolves', () => {
     const f = fixture();
-    const cardOnly = { ...payload(f.head), findings: { read: { netBasis: { rev: f.head }, netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] } } };
+    const cardOnly = { ...payload(f.head), findings: { read: { diffScored: true, diffText: '+card', netBasis: { rev: f.head }, netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] } } };
     const live = { ...f, isAlive: () => true, readPidStart: () => 'start' };
     recordRedTeamStatus({ ...f, loopPayload: cardOnly, status: 'queued' }, { ...f, env: { ...f.env, WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, readPidStart: () => 'start' });
     expect(readDrainRedTeamEvidence(live).skipCardOnly).toBe(false);
@@ -842,7 +842,7 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
   });
   it('holds an owing card-only run until the job records its skip decision', () => {
     const f = fixture();
-    const read = { netBasis: { rev: f.head }, netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] };
+    const read = { diffScored: true, diffText: '+card', netBasis: { rev: f.head }, netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] };
     writeRun({ ...newRunRecord({ id: 'review-pr-5439', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }), verdict: { verdict: 'accept' }, findings: { read } }, f.runsDir);
     expect(readDrainRedTeamEvidence(f).skipCardOnly).toBe(false);
     expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'true' }, comments: [] })).toMatch(/no recorded result/);
@@ -1031,6 +1031,7 @@ it.each(['non-card read', 'missing read paths', 'non-card rename source', 'skipC
       readScorecards: () => hasSeat ? [{ dispatchKind: 'review-seat', seat: 'red-team', repo: f.repo,
         pr: f.pr, rev: variant === 'live-head seat' ? f.head : oldHead }] : [] });
     expect(evidence).toEqual({ loopPayload: null, recorded: variant === 'live-head seat',
+      seats: variant === 'live-head seat' ? [{ dispatchKind: 'review-seat', seat: 'red-team', repo: f.repo, pr: f.pr, rev: f.head }] : [],
       seatRecorded: variant === 'live-head seat', completedRecorded: false,
       failedSeatCount: variant === 'live-head seat' ? 1 : 0, scheduled: variant === 'live-head seat', inFlight: false });
   });
@@ -1734,7 +1735,7 @@ describe('recovery while a quiet review awaits human confirm', () => {
     expect(p.decide()).toMatchObject({ action: 'dispatch', mode: 'fresh', staleRecovery: true, why: 'dead owner recovery' });
     expect(p.decide().escalate).toBeUndefined();
     expect(readFileSync(p.runPath, 'utf8')).toBe(p.before);
-    expect(readDrainRedTeamEvidence({ ...p.f, now })).toEqual({ ok: false, reason: 'review-unfinished' });
+    expect(readDrainRedTeamEvidence({ ...p.f, now })).toEqual({ ok: false, reason: 'review-unfinished', status: readRedTeamStatus(p.f) });
   });
 
   it('keeps a live owner held even when the pending review is quiet', () => {

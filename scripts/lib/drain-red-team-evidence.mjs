@@ -932,7 +932,7 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   const seats = readScorecards().filter(row => row.dispatchKind === 'review-seat' && row.seat === 'red-team'
     && row.repo === repo && Number(row.pr) === Number(pr) && row.rev === head);
   const recorded = seats.length > 0;
-  const seatEvidence = { seatRecorded: recorded, completedRecorded: seats.some(completedRedTeamSeat),
+  const seatEvidence = { seats, seatRecorded: recorded, completedRecorded: seats.some(completedRedTeamSeat),
     failedSeatCount: seats.filter(row => !completedRedTeamSeat(row)).length };
   // The parse cap covers historical and recovery fallbacks too.
   const latestRun = lookup ?? reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, scanSettings, warn, now });
@@ -948,10 +948,11 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   // Every path below checks its own scan query first, so unknown evidence always holds; a carried
   // head needs only the any-head query, and a head with a status only runs written after it.
   const carry = readRedTeamCarry({ repo, pr, head, env });
+  const sources = { ...(status ? { status } : {}), ...(carry ? { carry } : {}), ...(seats.length ? seatEvidence : {}) };
   const carriedFrom = carry?.loopPayload.carriedFrom ?? status?.loopPayload?.carriedFrom;
   if (carriedFrom) {
     const latestHit = latestRun(false);
-    if (latestHit.ok === false) return latestHit;
+    if (latestHit.ok === false) return Object.assign(latestHit, sources);
     const latest = latestHit.run;
     const laterPanel = latest && latest.findings?.read?.netBasis?.rev !== carriedFrom;
     const ownStatus = status === undefined || (status?.repo === repo && Number(status.pr) === Number(pr) && status.head === head
@@ -959,28 +960,26 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
       && status.status === 'finished'
       && (status.result === 'skipped' || (status.result?.status === 'skipped' && status.result.policy === 'card-only')));
     if (laterPanel || (carry && !ownStatus) || recorded) {
-      return { loopPayload: latest, status, carryConflict: true, inFlight: false,
+      return { ...sources, loopPayload: latest, status, carryConflict: true, inFlight: false,
         recorded, ...seatEvidence, scheduled: false };
     }
     if (carry) {
       // The journal survives a crash before the compatibility status exists. Never invent an accept.
       const projected = { repo, pr, head, loopPayload: carry.loopPayload, status: 'finished',
         result: { status: 'skipped', policy: 'card-only' }, skipCardOnly: true };
-      return { carry, status: projected, loopPayload: carry.loopPayload, inFlight: false,
+      return { ...sources, ...(status ? { liveStatus: status } : {}), carry, status: projected, loopPayload: carry.loopPayload, inFlight: false,
         recorded: false, ...seatEvidence, scheduled: false, skipCardOnly: true };
     }
   }
   if (status?.repo === repo && Number(status.pr) === Number(pr) && status.head === head) {
     const latest = latestRun(true, undefined, { writtenAfter: statusAt, newestHead: carriedFrom });
-    if (latest.ok === false) return latest;
+    if (latest.ok === false) return Object.assign(latest, sources);
     // A finished status from an earlier review of this same head never supersedes a newer accepting run (a re-review
     // of an unchanged head labels its accept before its job writes `queued`).
     if (!['queued', 'running'].includes(status.status)) {
       if (latest.at > statusAt && owes(latest.run)) {
-        // A finished result that was never published still reaches the recovery path: a re-review of the same head must not
-        // strand it behind a pass that may never come (#5759, #5762).
-        const unpublished = status.status === 'finished' && ['withheld', 'error'].includes(status.result?.comment);
-        return { loopPayload: latest.run, inFlight: false, scheduled: true, recorded, ...seatEvidence, skipCardOnly: false, ...(unpublished ? { status } : {}) };
+        // Keep the prior status even beside a newer accept: admission must see its read and unpublished results.
+        return { ...sources, loopPayload: latest.run, inFlight: false, scheduled: true, recorded, ...seatEvidence, skipCardOnly: false };
       }
     }
     // A local pid probe says nothing about another host or namespace: keep that pass held for its result.
@@ -1006,11 +1005,11 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     // Settlement provenance cannot stand in for a panel verdict, even if an older
     // writer retained one. Keep the status intact for recovery's provenance checks.
     const loopPayload = status.loopPayload?.carriedFrom != null ? { ...status.loopPayload, verdict: null } : status.loopPayload;
-    return { status, loopPayload, ...seatEvidence, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
+    return { ...sources, status, loopPayload, ...seatEvidence, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
       ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: ['queued', 'running'].includes(status.status) || ['ran', 'error', 'failed'].includes(resultStatus), recorded: recorded || resultStatus === 'ran' };
   }
   const exactHit = latestRun();
-  if (exactHit.ok === false) return exactHit;
+  if (exactHit.ok === false) return Object.assign(exactHit, sources);
   const loopPayload = exactHit.run;
   if (!loopPayload && !recorded) {
     const olderHit = latestRun(false);
@@ -1024,7 +1023,7 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   }
   // An owing run with no job status yet: only the job's process knows its card-only skip decision, so hold the head
   // (skip off) until that status records it. The never-scheduled deadline still applies if no job ever writes one.
-  return { loopPayload, inFlight: false, scheduled: recorded || owes(loopPayload), recorded, ...seatEvidence, ...(owes(loopPayload) ? { skipCardOnly: false } : {}) };
+  return { ...sources, loopPayload, inFlight: false, scheduled: recorded || owes(loopPayload), recorded, ...seatEvidence, ...(owes(loopPayload) ? { skipCardOnly: false } : {}) };
 }
 
 // R622: unknown run evidence the comment thread can answer. A review run left unfinished (its human confirm never
@@ -1079,6 +1078,6 @@ export function settleUnknownEvidenceByComment(evidence, comments, pr, head, rev
   let complete = null;
   try { complete = typeof bounds.completeHeadRead === 'function' ? bounds.completeHeadRead({ pr, head, at }) : null; } catch { /* unreadable: stays held */ }
   if (complete?.complete !== true || complete.blocked !== false) return evidence;
-  return { ok: true, settledByComment: evidence.reason, loopPayload: null, scheduled: false, inFlight: false,
+  return { ...evidence, ok: true, settledByComment: evidence.reason, scheduled: false, inFlight: false,
     queued: false, recorded: true, skipCardOnly: false };
 }

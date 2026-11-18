@@ -1,6 +1,6 @@
 /** Queue admission and removal share this policy and head-bound red-team evidence. */
 import { inspectMqReruns, requestMqReruns } from './drain-mq-flake-rerun.mjs';
-import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
+import { redTeamOwedDecision } from './review-red-team-policy.mjs';
 import { execFileSync } from 'node:child_process';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
 import { mkdirSync, readFileSync } from 'node:fs';
@@ -1209,12 +1209,14 @@ export function sendBackReason(labels) {
   return hold ? `state is ${hold}` : !names.includes('ready-to-merge') ? 'ready-to-merge was removed' : null;
 }
 
-/** Only head-bound scheduled work is owed; acceptance and status labels cannot invent a run. */
+/** Keep the compatibility boolean entry while passing every evidence source to admission policy. */
 export function postAcceptRedTeamOwed(loopPayload, env = process.env, evidence = {}) {
-  return redTeamOwedOnHead({ read: loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly });
+  return redTeamOwedDecision({ fullEvidence: { ...evidence, loopPayload,
+    defaultSkipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly } }).owed;
 }
 
-export function redTeamEnqueueHold({ ok, reason, loopPayload, comments, pr, head, repo = null, standingRuling = null, env = process.env, confirmedBreaks, scheduled = false, inFlight = false, recorded = false, skipCardOnly } = {}) {
+export function redTeamEnqueueHold(fullEvidence = {}) {
+  const { ok, reason, comments, pr, head, repo = null, standingRuling = null, env = process.env, confirmedBreaks } = fullEvidence;
   // A recorded break still holds even if the scheduler is now disabled or the payload is unavailable.
   // `standingRuling`: the verified scope, so an automatic grant counts here exactly as in the gate (PR #5758).
   const disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks, repo, standingRuling });
@@ -1227,8 +1229,11 @@ export function redTeamEnqueueHold({ ok, reason, loopPayload, comments, pr, head
   // comment cannot release it either.
   if (ok === false) return `post-accept red team evidence unknown (${reason}); hold and inspect run evidence`;
   if (pendingOnly) return 'post-accept red team result is not published yet (stored evidence not sealed); hold until the sweep publishes it';
-  if (!postAcceptRedTeamOwed(loopPayload, env, { scheduled, inFlight, recorded, skipCardOnly }) || disposition.result) return null;
-  return 'post-accept red team has no recorded result on the live head';
+  const decision = redTeamOwedDecision({ fullEvidence: { ...fullEvidence, disposition,
+    defaultSkipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly } });
+  if (!decision.owed) return null;
+  return 'post-accept red team has no recorded result on the live head'
+    + (decision.reason === 'unreviewable-read' ? ' (unreviewable-read); hold and inspect run evidence' : '');
 }
 
 /** Membership is authoritative both before and after the mutation. A retry after success posts no duplicate. */

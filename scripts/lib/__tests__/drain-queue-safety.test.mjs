@@ -177,7 +177,7 @@ describe('merge-queue same-head failure admission', () => {
           readDrainRedTeamEvidence: () => {
             stages.push('red-team');
             if (outcome === 'unreadable evidence') throw Error('red-team evidence unreadable');
-            return { scheduled: outcome === 'red-team hold', skipCardOnly: false };
+            return { read: { diffScored: true, diffText: '+change' }, scheduled: outcome === 'red-team hold', skipCardOnly: false };
           },
           // Exercise all nested standing-ruling read adapters even without a grant in this thread.
           readStandingRuling, readOperatorIssues, headBelongsToPr, readUneditedCommentIds,
@@ -1291,7 +1291,7 @@ describe('merge-queue same-head failure admission', () => {
 });
 const bot = { author: { login: 'web-everything' } };
 const clean = (rev = head, login = 'web-everything', findings = []) => ({ author: { login }, body: renderRedTeamComment({ pr: 5283, rev, findings, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: findings.length ? 'changes' : 'accept' }) });
-const hold = (over = {}) => redTeamEnqueueHold({ scheduled: over.loopPayload !== null && over.loopPayload?.verdict?.verdict !== 'needs-human', loopPayload: { verdict: { verdict: 'accept' } }, labels: ['review:accepted'], comments: [], pr: 5283, head, env: {}, ...over });
+const hold = (over = {}) => redTeamEnqueueHold({ scheduled: over.loopPayload !== null && over.loopPayload?.verdict?.verdict !== 'needs-human', loopPayload: { verdict: { verdict: 'accept' }, findings: { read: { diffScored: true, diffText: '+change' } } }, labels: ['review:accepted'], comments: [], pr: 5283, head, env: {}, ...over });
 const broken = [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }];
 const gate = (sha, outcome) => ({ ...bot, body: redTeamGateMarker(5283, sha, outcome) });
 // The comment shapes review-set-label renders: `clear-human` (heading first, markers last), `restamp`, plain accept.
@@ -1584,13 +1584,13 @@ describe('durable head-bound red-team admission', () => {
     expect(hold({ scheduled: true, env: { [key]: '0' } })).toMatch(/no recorded result/);
   });
   it.each([5439, 5443])('labels alone do not schedule a red team for #%s', pr => {
-    expect(hold({ pr, loopPayload: null, labels: ['review:accepted', 'ready-to-merge'] })).toBeNull();
-    expect(hold({ pr, loopPayload: { verdict: { verdict: 'needs-human' } } })).toBeNull();
+    expect(hold({ pr, loopPayload: null, labels: ['review:accepted', 'ready-to-merge'] })).toMatch(/unreviewable-read/);
+    expect(hold({ pr, loopPayload: { verdict: { verdict: 'needs-human' }, findings: { read: { diffScored: true, diffText: '+change' } } } })).toBeNull();
   });
-  it('does not owe a pass without a panel accept', () => expect(hold({ loopPayload: null, labels: ['ready-to-merge'] })).toBeNull());
+  it('holds an absent read even without a panel accept', () => expect(hold({ loopPayload: null, labels: ['ready-to-merge'] })).toMatch(/unreviewable-read/));
   // PR #5482 red team: the card-only exemption ignored WE_RED_TEAM_SKIP_CARD_ONLY=false and a pass already running.
   it('exempts a card-only head only while the producer skips it; a started pass is always awaited', () => {
-    const loopPayload = { verdict: { verdict: 'accept' }, findings: { read: { netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] } } };
+    const loopPayload = { verdict: { verdict: 'accept' }, findings: { read: { diffScored: true, diffText: '+card', netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] } } };
     expect(hold({ loopPayload })).toBeNull();
     expect(hold({ loopPayload, env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' } })).toMatch(/no recorded result/);
     expect(hold({ loopPayload, env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, inFlight: true })).toMatch(/no recorded result/);

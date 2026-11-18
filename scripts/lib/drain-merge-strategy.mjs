@@ -354,7 +354,7 @@ export function createDrainMergeStrategy({
       evidence = settleUnknownEvidenceByComment(evidence, comments, c.num, head, live.reviews);
       reason = redTeamEnqueueHold({ ...evidence, comments, pr: c.num, head, repo: slugOf(c.repo), env, standingRuling });
       // The check owns pending/wait states; confirmed breaks and unknown evidence still fail closed.
-      if (!reason || (!reason.includes('requiring send-back') && evidence.ok !== false)) return null;
+      if (!reason || (!reason.includes('requiring send-back') && !reason.includes('unreviewable-read') && evidence.ok !== false)) return null;
     } catch {
       reason = 'red-team evidence unreadable; hold and inspect run evidence and complete comments';
     }
