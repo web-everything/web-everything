@@ -6,6 +6,9 @@ import {createHash} from 'node:crypto';
 import {planPrune, readLiveEvidence, resolveSettings} from '../forge-cache-prune.mjs';
 import {createRunner, digestArgv, digestInput, manifestWire} from '../forge-exec-run.mjs';
 
+// Copy native exports so individual filesystem methods can be replaced in memory fixtures.
+vi.mock('node:fs/promises', async original => ({...await original()}));
+
 const HOUR = 3_600_000, GiB = 1024 ** 3, now = Date.UTC(2026, 10, 15);
 const MAX_RUNTIME = 3 * 1_740_000 + 15 * 60 * 1000;
 const hex = c => c.repeat(64), lock = hex('a');
@@ -53,6 +56,80 @@ function expectRefused(live, reason) {
   expect(live.refused).toMatch(/preserving cache/);
 }
 
+// Exercise the real bounded evidence reader against an in-memory filesystem.
+async function memoryEvidence(phases, age = 3 * HOUR) {
+  const run = `r-${'1'.repeat(32)}`, worker = join(receipts, 'worker-active');
+  const files = new Map([
+    [join(worker, 'reservation.json'), {value: {run, writerGuard: 1}, mtimeMs: now - age}],
+    ...Object.entries(phases).map(([suffix, value], index) =>
+      [join(receipts, `${run}.${suffix}`), {value, mtimeMs: now - 1000 + index}]),
+  ]);
+  const info = path => {
+    const file = files.get(path), isDirectory = path === receipts || path === worker;
+    if (!file && !isDirectory) throw Object.assign(new Error('Missing fixture file'), {code: 'ENOENT'});
+    return {isDirectory: () => isDirectory, isFile: () => !!file,
+      size: file ? Buffer.byteLength(JSON.stringify(file.value)) : 0, mtimeMs: file?.mtimeMs};
+  };
+  const mocks = [
+    vi.spyOn(fs, 'lstat').mockImplementation(async path => info(path)),
+    vi.spyOn(fs, 'readdir').mockImplementation(async path => {
+      expect(path).toBe(receipts);
+      return ['worker-active', ...Object.keys(phases).map(suffix => `${run}.${suffix}`)];
+    }),
+    vi.spyOn(fs, 'open').mockImplementation(async path => {
+      info(path);
+      const bytes = Buffer.from(JSON.stringify(files.get(path).value));
+      let position = 0;
+      return {stat: async () => info(path), close: async () => {},
+        read: async (buffer, offset, length) => {
+          const bytesRead = bytes.copy(buffer, offset, position, position + length);
+          position += bytesRead;
+          return {bytesRead};
+        }};
+    }),
+  ];
+  try { return await readLiveEvidence({receipts, now}); }
+  finally { mocks.forEach(mock => mock.mockRestore()); }
+}
+
+describe('operator live-case evidence regressions', () => {
+  const run = `r-${'1'.repeat(32)}`;
+  it.each([false, true])('protects a three-hour leased running profile with a fieldless final receipt, siblings=%s', async siblings => {
+    const live = await memoryEvidence({running: {...running(run), ...record(siblings)},
+      receipt: {v: 1, run, phase: 'test', code: 0}});
+    expect(live.complete).toBe(true);
+    expect(live.locks).toEqual(new Set([lock]));
+    const entries = [entry(inputDigest), entry(manifestDigest)], result = plan(entries, live);
+    expect(result.refused).toBeUndefined();
+    expect(result.prune).toEqual([]);
+    expect(result.keep).toEqual(entries.map(e => ({...e, reason: 'Protected by live reservation'})));
+  });
+  it.each(['lock', 'inputDigest', 'manifestDigest'])('requires the final receipt itself to carry %s', async field => {
+    const live = await memoryEvidence({running: {...running(run), ...record(false)},
+      receipt: {...receipt(false), run, [field]: undefined}});
+    expect(live.complete).toBe(true);
+    expect(plan([entry(inputDigest)], live).prune).toEqual([]);
+  });
+  it.each([false, true])('reclaims a three-hour leased reservation with complete final proof, siblings=%s', async siblings => {
+    const live = await memoryEvidence({running: {...running(run), ...record(siblings)},
+      receipt: {...receipt(siblings), run}});
+    expect(live).toMatchObject({complete: true, profiles: new Set(), locks: new Set()});
+    const active = entry(siblings ? manifestDigest : inputDigest), result = plan([active], live);
+    expect(result.refused).toBeUndefined();
+    expect(result.prune).toEqual([{...active, reason: 'Expired age'}]);
+  });
+  it.each(['running', 'receipt'])('preserves other profiles under the lock when a newer %s is fieldless', async suffix => {
+    const live = await memoryEvidence({prepared: record(false),
+      [suffix]: suffix === 'running' ? running(run) : {v: 1, run, phase: 'test', code: 0}});
+    expect(live.complete).toBe(true);
+    expect(live.locks).toEqual(new Set([lock]));
+    const other = entry(hex('d')), result = plan([other], live);
+    expect(result.refused).toBeUndefined();
+    expect(result.prune).toEqual([]);
+    expect(result.keep).toEqual([{...other, reason: 'Protected by live reservation'}]);
+  });
+});
+
 describe('reserved running records with lock evidence in another phase', () => {
   it.each([false, true])('uses a real receipt with siblingShas present=%s for precise age pruning', async siblings => {
     const run = await reserve();
@@ -67,15 +144,16 @@ describe('reserved running records with lock evidence in another phase', () => {
     expect(result.prune.map(e => e.name).sort()).toEqual(others.map(e => e.name).sort());
     expect(result.keep).toEqual([{...active, reason: 'Protected by live reservation'}]);
   });
-  it('protects a live profile when only the prepared record carries the lock and manifest', async () => {
+  it('protects the whole lock when running carries no profile after a prepared record', async () => {
     const run = await reserve();
     await json(join(receipts, `${run}.running`), running(run));
     await json(join(receipts, `${run}.prepared`), record(false));
     const live = await readLiveEvidence({receipts, now});
-    expectPrecise(live, inputDigest);
-    const active = entry(inputDigest), result = plan([active], live);
+    expect(live.complete).toBe(true);
+    expect(live.locks).toEqual(new Set([lock]));
+    const entries = [entry(inputDigest), entry(hex('d'))], result = plan(entries, live);
     expect(result.prune).toEqual([]);
-    expect(result.keep).toEqual([{...active, reason: 'Protected by live reservation'}]);
+    expect(result.keep).toEqual(entries.map(e => ({...e, reason: 'Protected by live reservation'})));
   });
   it.each([
     {manifestDigest},
@@ -125,10 +203,10 @@ describe('reserved running records with lock evidence in another phase', () => {
 });
 
 describe('leaked reservation lifetime', () => {
-  it.each([false, true])('ignores an expired reservation with a final receipt (receipt has lock=%s)', async hasLock => {
+  it('ignores an expired reservation with a complete final receipt', async () => {
     const run = await reserve(undefined, undefined, now - MAX_RUNTIME - 1000);
     await json(join(receipts, `${run}.running`), running(run));
-    await json(join(receipts, `${run}.receipt`), hasLock ? {...receipt(false), run} : {v: 1, run, phase: 'test', code: 0});
+    await json(join(receipts, `${run}.receipt`), {...receipt(false), run});
     const live = await readLiveEvidence({receipts, now});
     expect(live).toMatchObject({complete: true, profiles: new Set(), locks: new Set()});
     expect(plan([entry(inputDigest)], live).prune).toEqual([{...entry(inputDigest), reason: 'Expired age'}]);

@@ -231,14 +231,16 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
       const leaked = writerGuard === 1 && finalReceipt?.v === 1 && finalReceipt.run === run
         && typeof finalReceipt.phase === 'string' && finalReceipt.phase.trim() !== '' && finalReceipt.phase.length <= 64
         && Number.isInteger(finalReceipt.code) && finalReceipt.code >= 0 && finalReceipt.code <= 255
+        && typeof finalReceipt.lock === 'string' && HEX.test(finalReceipt.lock)
+        && typeof finalReceipt.inputDigest === 'string' && HEX.test(finalReceipt.inputDigest)
+        && typeof finalReceipt.manifestDigest === 'string' && HEX.test(finalReceipt.manifestDigest)
         && final.mtimeMs <= now && records.every(r => r.mtimeMs <= final.mtimeMs)
         && now - (await fs.lstat(reservationFile)).mtimeMs >= MAX_RUNTIME_MS;
       if (lock === undefined && !leaked) throw new Error('Invalid reserved lock evidence');
       let latestKnown = false;
-      // A record carrying no profile field at all (the legacy `.running` shape) says nothing about
-      // profiles; every record that does carry some must be known for it to count as latest.
-      const carries = r => ['manifest', 'siblings', 'manifestDigest', 'inputDigest', 'siblingShas'].some(k => r.record[k] !== undefined);
-      const latest = ['receipt', 'running', 'prepared'].find(x => records.some(r => r.suffix === x && carries(r)));
+      // The newest present phase decides even when it carries no profile fields:
+      // an older known profile cannot narrow protection for a later unknown one.
+      const latest = ['receipt', 'running', 'prepared'].find(x => records.some(r => r.suffix === x));
       for (const {suffix, record} of records) {
         // Validate both fields independently of sibling selection, including on
         // the leaked-reservation path before it can drop profile protection.
