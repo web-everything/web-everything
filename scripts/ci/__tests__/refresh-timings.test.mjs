@@ -398,8 +398,9 @@ describe('rolling timing refresh', () => {
     const measured = `${JSON.stringify({ unit: Object.fromEntries(files.map(file => [file, 1])), soak: {} }, null, 1)}\n`;
     writeFileSync(timingsFile, measured);
     const exec = rollingExec([1000], []);
-    const partial = (cmd, args, options) => { const out = exec(cmd, args, options); if (args[1] === 'download') rmSync(join(args.at(-1), 'timing-unit-10.json')); return out; };
-    expect(await main(['--runs=1', '--min-stale=100'], { exec: partial, timingsFile, repoRoot })).toBe(2);
+    const partial = (cmd, args, options) => { const out = exec(cmd, args, options); if (args[1] === 'download') writeFileSync(join(args.at(-1), 'timing-unit-10.json'), JSON.stringify({ testResults: [] })); return out; };
+    expect(await main(['--runs=1', '--min-stale=100'], { exec: partial, timingsFile, repoRoot })).toBe(0);
+    expect(readFileSync(timingsFile, 'utf8')).not.toBe(measured);
   });
 
   it('writes when drift meets the threshold', async () => {
