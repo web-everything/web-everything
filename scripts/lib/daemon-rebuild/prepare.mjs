@@ -30,6 +30,7 @@ import { planRebuild } from './plan.mjs';
 import { makeAuditedTipGate, tipInMain } from './audited-tip.mjs';
 import { carriedBeyondMain } from '../../operations/prototype-retire.mjs';
 import * as realAutoRebase from './auto-rebase.mjs';
+import { resolveEstablishedOverlayParkMinutes } from './overlay-main-sync.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
 import { repairCloneRefs, holdsCloneWriteLock, probeBrokenRefs, diagnoseLane } from '../lane-repair.mjs';
 import {
@@ -385,6 +386,13 @@ export async function prepareRebuild({
   // (`state.pinnedNotified`: ref → the new tip last reported) is pruned only after a complete plan.
   const pinnedBefore = state.pinnedNotified && typeof state.pinnedNotified === 'object' ? state.pinnedNotified : {};
   const pinnedNow = Object.create(null);
+  // Keep park notices across rebuild retries and adoption, using the same once-per-record store.
+  // A changed tip or withdrawn registration prunes its notice so the new tip gets a fresh hold.
+  for (const o of overlaysBefore) {
+    const tip = plan.establishedLost?.find(l => l.ref === o.ref)?.sha
+      ?? plan.decisions?.find(d => d.ref === o.ref)?.sha;
+    if (tip && pinnedBefore[o.ref] === `established-overlay-parked:${tip}`) pinnedNow[o.ref] = pinnedBefore[o.ref];
+  }
   // A refusal can stop before visiting other pins. Keep their notices and persist any new ones
   // already emitted, even though this plan will not be adopted.
   if (!plan.ok) Object.assign(pinnedNow, pinnedBefore);
@@ -447,7 +455,7 @@ export async function prepareRebuild({
   // (and every stacked overlay above them) now conflict with main. Building without them would smoke-pass and be
   // adopted, silently dropping live hotfixes. Instead HOLD on the last-good build (dispatch continues from it via
   // x5wbsbc; `daemon-held-on-last-good` raises needs-you after 15 min) and leave the overlay list untouched, until the
-  // lost overlays are rebased onto main (or retired). Nothing is applied from this plan.
+  // lost overlays are rebased onto main (or retired), or the bounded hold expires and parks them.
   // A lost overlay whose current tip this build still contains is live through its carrier — e.g. a mechanism-pinned
   // original (never set aside as stack-contained) beside its registered auto-rebase repair. Holding on it would keep
   // the repair from ever being adopted. Only a tip the running build already carries qualifies: a changed tip says
@@ -466,21 +474,46 @@ export async function prepareRebuild({
       try { detail.autoRebase = { ...await autoRebase.kickAutoRebase({ root, env, lost }), source: setting.source }; }
       catch { detail.autoRebase = { started: [], skipped: lost.map(l => l.ref), source: setting.source }; }
     }
-    alert('established-overlay-hold', detail);
-    if (state.adopted?.head && state.adopted.head === prevHead) {
-      state.held = {
-        since: state.held?.since ?? nowIso(),
-        reason: 'established-overlay-conflict',
-        failed: `${lost.map((l) => l.ref).join(', ')}: conflict with main`,
-        details: [],
-        lastGood: prevHead,
-        target: null,
-        mainSha: plan.mainSha ?? null,
-        updatedAt: nowIso(),
-      };
+    const park = resolveEstablishedOverlayParkMinutes(env);
+    const unparked = lost.filter(l => pinnedNow[l.ref] !== `established-overlay-parked:${l.sha}`);
+    // Old persisted holds have no lost snapshot: the adopted tips supply the migration evidence.
+    // Missing tip/time evidence starts a fresh clock rather than authorizing an immediate omission.
+    const heldTips = state.held?.lost ?? state.adopted?.applied;
+    const sameHold = state.held?.reason === 'established-overlay-conflict'
+      && Array.isArray(heldTips) && unparked.every(l => l.sha && heldTips.some(t => t.ref === l.ref && t.sha === l.sha));
+    const sinceMs = sameHold ? Date.parse(state.held.since) : NaN;
+    const since = Number.isFinite(sinceMs) && sinceMs <= nowMs() ? state.held.since : nowIso();
+    const expired = sameHold && Number.isFinite(sinceMs) && nowMs() - sinceMs > park.value * 60_000;
+    if (park.value > 0 && (unparked.length === 0 || expired)) {
+      for (const l of unparked) {
+        const parked = { ...l, reason: 'established-overlay-parked', need: 'needs-you',
+          since, parkMinutes: park.value, source: park.source,
+          message: 'Hold expired; building without this overlay. Registration retained; rebase onto main to rejoin.' };
+        appendOverlayEvent(root, { kind: 'established-overlay-parked', ...parked }, { env });
+        alert('established-overlay-parked', parked);
+        pinnedNow[l.ref] = `established-overlay-parked:${l.sha}`;
+      }
+      state.pinnedNotified = pinnedNow;
+      state.held = null;
       writeState();
+    } else {
+      alert('established-overlay-hold', detail);
+      if (state.adopted?.head && state.adopted.head === prevHead) {
+        state.held = {
+          since,
+          reason: 'established-overlay-conflict',
+          lost: unparked.map(({ ref, sha }) => ({ ref, sha })),
+          failed: `${lost.map((l) => l.ref).join(', ')}: conflict with main`,
+          details: [],
+          lastGood: prevHead,
+          target: null,
+          mainSha: plan.mainSha ?? null,
+          updatedAt: nowIso(),
+        };
+        writeState();
+      }
+      return terminal({ moved: false, reason: 'established-overlay-conflict', detail });
     }
-    return terminal({ moved: false, reason: 'established-overlay-conflict', detail });
   }
   for (const d of plan.decisions) {
     if (d.pr != null && (d.action === 'apply' || d.action === 'remove') && !d.pinned) clearOverlayConflictWake(env, d.pr);
