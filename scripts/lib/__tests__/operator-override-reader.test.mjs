@@ -50,7 +50,7 @@ describe('lock-free operator override reader', () => {
   it('rejects oversized capacity values and invalidates their whole policy', () => {
     writeFileSync(file, JSON.stringify({
       'resourceGate.fixCap.floor': 2,
-      'resourceGate.fixCap.ceiling': 13,
+      'resourceGate.fixCap.ceiling': 25,
       'host.maxReviewDispatchPerTick': 3,
     }));
     expect(readOperatorOverrides({ file, log: () => {} })).toEqual({
