@@ -242,18 +242,26 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
         try {
           data = await deps.checks(r);
           anyFailure = Array.isArray(data?.check_runs) && data.check_runs.some(c => failedCheck(c, r.sha));
-          try { validateChecks(data, r.sha); } catch (e) { evidenceError = e; }
+          validateChecks(data, r.sha);
+          // Like testCheckEvidence, reruns supersede only their own suite. Check IDs
+          // increase across workflow run attempts; keep distinct job/shard names apart.
+          const latestByCheck = new Map();
+          for (const c of data.check_runs) {
+            const key = JSON.stringify([c.app.id, c.check_suite?.id, c.name]);
+            if (!latestByCheck.has(key) || c.id > latestByCheck.get(key).id) latestByCheck.set(key, c);
+          }
+          const latestChecks = [...latestByCheck.values()];
+          anyFailure = latestChecks.some(c => failedCheck(c, r.sha));
           const required = await deps.required(r, data?.testWorkflowPath);
           if (!Array.isArray(required) || !required.includes('test') || required.some(n => typeof n !== 'string' || !n))
             throw new Error('unreadable required CI jobs');
-          const checks = (Array.isArray(data?.check_runs) ? data.check_runs : []).filter(c =>
+          const checks = latestChecks.filter(c =>
             c?.app?.id === TEST_CHECK_APP_ID && c.head_sha === r.sha && typeof c.name === 'string'
             && Number.isSafeInteger(c.id) && Number.isSafeInteger(c.check_suite?.id)
             && required.some(n => c.name === n || c.name.startsWith(`${n} (`))
             && testWorkflowBound({ suiteIds: [c.check_suite.id] }, data.workflows, r.sha, data.testWorkflowPath));
           boundFailure = checks.find(c => failedCheck(c, r.sha));
           unload = Boolean(boundFailure);
-          if (evidenceError) throw evidenceError;
           if (!unload) {
             requiredSucceeded = !anyFailure && testWorkflowBound(testCheckEvidence(data, r.sha), data.workflows, r.sha, data.testWorkflowPath)
               && required.every(n => checks.some(c => c.name === n || c.name.startsWith(`${n} (`)))
@@ -283,7 +291,9 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           if (unload) unloadReason = `Unloaded ${r.sha}: urgent load has no CI verdict after 24h. Inspect and repair before reloading.`;
         }
         if (anyFailure && !unload) {
-          const detail = `CI failed on ${r.sha} outside the bound test closure. Inspect CI or unload manually.`;
+          const detail = evidenceError
+            ? `Unreadable CI evidence with a possible failure on ${r.sha}. Inspect CI or unload manually.`
+            : `CI failed on ${r.sha} outside the bound test closure. Inspect CI or unload manually.`;
           if (!failureEscalated.has(id)) {
             await escalate(`${id}-ci-failed`, r.ref, detail);
             await deps.settle({ id, ref: r.ref, sha: r.sha, at: deps.now(), status: 'monitoring-ci', failureEscalated: true });

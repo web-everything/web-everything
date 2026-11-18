@@ -4794,7 +4794,7 @@ The urgent sweep reads all check-runs (maximum 100, exact count and unique IDs r
 green only after every run completes and all required runs succeed. Pending unrelated runs keep the
 load eligible for later failure detection. Legacy green settlements without `checksComplete: true`
 are rechecked; incomplete or oversized evidence escalates to NEEDS-YOU for manual inspection.
-An explicit completed failure for the exact SHA unloads first even when the remaining evidence is malformed, incomplete or oversized.
+Malformed, incomplete, oversized or duplicate-ID evidence never authorizes CI-failure unloading, even with a possible bound failure. Escalate that possible failure once per tracking ID and keep monitoring; the 24h verdict expiry still unloads.
 
 Urgent verification mirrors CI coverage artifacts under ignored `coverage-shards/`; clear this directory before a run and copy each covered shard before the next overwrites its report. Receipts require the runner-owned private HMAC key and the loading checkout’s normalized origin. A completed failing CI gate always refuses urgent loading; old unsigned receipts require a fresh verification or passing CI.
 
@@ -4821,7 +4821,7 @@ failures in any check-run on the SHA, regardless of job or app, open a once-per-
 require operator repair or manual unloading. Settlement identity includes the load tracking ID, so a reload
 starts fresh. Check failures authorize removal only for the GitHub Actions app and jobs in the configured
 `test` needs closure, with each suite bound to that workflow run on the exact SHA. Validate complete,
-bounded check pages before acting; malformed pages may still unload on an explicit bound failure.
+bounded check pages before acting. Select only the latest check ID per app, check name and suite (including workflow rerun attempts), as in `testCheckEvidence`; a newer success supersedes its own older failure, while another suite or shard cannot.
 Unrelated app/workflow/job failures never authorize removal or green monitoring; they remain tracked
 with a durable failure-escalation receipt. The 24h verdict expiry still permits unloading.
 Unknown workflow or required-job
