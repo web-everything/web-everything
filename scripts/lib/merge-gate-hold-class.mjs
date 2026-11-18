@@ -1,5 +1,5 @@
 /**
- * Candidacy HOLDs are review work, not CI repair work. Only head-bound job evidence may
+ * Candidacy and proved workflow-protection HOLDs are review work, not CI repair work. Only head-bound job evidence may
  * excuse a failed merge-gate for a non-candidate; every unreadable fact stays red.
  * The strict parser mirrors #5013's parsePrResultTable: merge the two when #5013 lands.
  * Deliberately does not import merge-gate-ci or the drain's runtime graph.
@@ -174,6 +174,18 @@ export function excuseMergeGateRows(rows, { prNumber, headSha, labels, readVerdi
     const verdict = readVerdict({ jobId, prNumber });
     if (verdict?.error || verdict?.num !== prNumber || !verdict?.head_sha
       || verdict.head_sha.toLowerCase() !== headSha.toLowerCase() || verdict.ok !== false) return unchanged;
+    // A workflow self-protection failure is review-owned only with job/step proof from the reader.
+    // Keep the failed conclusion: this annotation grants review admission, never merge clearance.
+    if (verdict.workflowEditProtection === true) {
+      const holds = verdict.results?.filter(blocking);
+      if (!Array.isArray(labels) || labels.some(l => typeof (typeof l === 'string' ? l : l?.name) !== 'string')
+        || !holds || holds.some(r => r.status !== 'hold'
+          || !(HUMAN_REVIEW_HOLD_GATES.includes(r.id) || isCandidacyHold(r)))) return unchanged;
+      const replacement = { ...row, mergeGateReviewHold: {
+        holds: [...holds.map(r => r.id), 'workflow-edit-protection'], jobId,
+      } };
+      return { rows: rows.map(r => r === row ? replacement : r), excused: false, reviewHold: true };
+    }
     const currentFreeze = verdict.results?.some(manualFreeze) && typeof freeze === 'function' ? freeze() : freeze;
     const classification = classifyMergeGateHold({ results: verdict.results, prLabels: labels, freeze: currentFreeze, verdictCompletedAt: verdict.completed_at, mainCiGreen: verdict.mainCiGreen });
     if (!classification.excused) {
@@ -191,6 +203,35 @@ export function excuseMergeGateRows(rows, { prNumber, headSha, labels, readVerdi
   } catch { return unchanged; }
 }
 
+// Exact producer diagnostic only: an unreadable workflow comparison is still a real failure.
+const workflowMismatch = "running workflow (\\.github/workflows/[A-Za-z0-9._-]+\\.ya?ml) at [0-9a-f]{9} differs from [A-Za-z0-9._/-]+'s — a PR may not change the gate that judges it";
+function parseWorkflowProtection(job, log, prNumber) {
+  const lines = String(log).split(/\r?\n/).map(l => l.replace(/^\d{4}-\d\d-\d\dT\S+\s/, ''));
+  const diagnostics = lines.filter(l => l.startsWith('merge-gate: workflow self-check'));
+  const diagnostic = new RegExp(`^merge-gate: workflow self-check — FAIL: (${workflowMismatch})$`).exec(diagnostics[0] ?? '');
+  const table = parsePrResultTable(log, prNumber);
+  const tableWorkflowHold = !table.error && table.results.some(r => r.id === 'review-acceptance'
+    && r.status === 'hold' && /^human-only: the diff at [0-9a-f]{9} touches \.github\/(?:workflows|actions)\//.test(r.reason));
+  if ((!diagnostic || diagnostics.length !== 1) && !tableWorkflowHold) return null;
+  const summaries = lines.filter(l => /^merge-gate: (?:PASS|HOLD)/.test(l));
+  const footer = `merge-gate: HOLD — workflow self-check failed — fail closed: ${diagnostic?.[1]}; `;
+  if (!tableWorkflowHold && (summaries.length !== 1 || !['held', 'all pass'].some(end => summaries[0] === footer + end))) return null;
+  // The evaluator must be the sole failed step in the gate's own completed job.
+  const steps = job.steps;
+  if (job.name !== 'merge-gate' || job.status !== 'completed' || job.conclusion !== 'failure'
+    || !Array.isArray(steps) || !steps.length
+    || steps.some(s => s.status !== 'completed' || !['success', 'failure', 'skipped'].includes(s.conclusion))) return { error: 'unreadable workflow-protection job' };
+  const failed = steps.filter(s => s.conclusion === 'failure');
+  if (failed.length !== 1 || failed[0].name !== "Evaluate the drain's merge gates"
+    || steps.filter(s => s.name === failed[0].name).length !== 1) return { error: 'workflow-protection evaluator is not the sole failed step' };
+  if (tableWorkflowHold) return { ...table, workflowEditProtection: true };
+  const normalized = lines.filter(l => l !== diagnostics[0]).map(l => l === summaries[0]
+    ? `merge-gate: ${l.endsWith('; held') ? 'HOLD — held' : 'PASS — all pass'}` : l).join('\n');
+  const parsed = parsePrResultTable(normalized, prNumber);
+  if (parsed.error) return null;
+  return { ...parsed, ok: false, workflowEditProtection: true };
+}
+
 const jobCache = new Map();
 /** Immutable job log + job head/completion metadata, cached by repository/job (never PR). */
 export function readMergeGateVerdict({ repo, jobId, prNumber, runGh = runGhSync, cache = jobCache } = {}) {
@@ -205,7 +246,7 @@ export function readMergeGateVerdict({ repo, jobId, prNumber, runGh = runGhSync,
       cache.set(key, { job, log });
     }
     const { job, log } = cache.get(key);
-    return { ...parsePrResultTable(log, prNumber), head_sha: job.head_sha, completed_at: job.completed_at };
+    return { ...(parseWorkflowProtection(job, log, prNumber) ?? parsePrResultTable(log, prNumber)), head_sha: job.head_sha, completed_at: job.completed_at };
   } catch (e) { return { error: String(e?.message ?? e) }; }
 }
 

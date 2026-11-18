@@ -4748,15 +4748,6 @@ oversized/incomplete/foreign evidence, target head invalidation, snapshot exclus
 a live target replacing a stale cached target with a different head and red check.
 Run it with `fast-drain-scope.test.mjs` and `merge-ai-prs.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
 comparison against daemon observations; fixtures prove IO counts without live GitHub calls.
-
-## Review admission gates and CI truth
-
-Only the reconcile planner excludes failing `merge-gate`/`review-gate` rows and their required names
-for ready PRs carrying `review:pending`. Shared CI reducers, review timing and draft promotion retain
-their strict evidence semantics. Reconcile tests exercise unannotated failures alongside passing
-real CI, and separately fail `test`, `smoke`, and `daemon-soak` to retain ci-heal ownership.
-Keep missing, pending, malformed, wrong-head and unreadable real CI refusal cases, plus unchanged
-draft-promotion refusal for an unannotated merge-gate failure. The soak break probes behavior.
 ## Ready-candidate adoption during overlay churn
 
 `daemon-rebuild-ready.test.mjs` exercises adoption with real Git ancestry: newly registered
@@ -4771,3 +4762,12 @@ Preserve `overlaysBefore` as a veto for omitted live tips: the regression for a 
 retired during planning must reject its omission and preserve HEAD.
 Run this file and `daemon-rebuild-events.test.mjs` through heavy admission. This adoption
 rule does not reset overlay main-sync parking or add retries for parked overlays.
+
+
+## Workflow-protection review admission
+
+The `required-admission-gates-deadlock-review` soak probes the hold classifier and unchanged
+planner together using a rollup with `detailsUrl` and no check id. Workflow protection needs
+head-bound job evidence and the failed evaluation step; unreadable evidence, another failed
+step, and real CI failures retain CI ownership. Keep fix detection behavioural, including
+negative cases, rather than matching planner source text.

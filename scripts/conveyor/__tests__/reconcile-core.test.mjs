@@ -1,3 +1,5 @@
+import { HEAD, workflowRow, workflowEvidence } from '../soak/fixtures/workflow-edit-protection.mjs';
+import { excusePrMergeGateHolds, readMergeGateVerdict } from '../../lib/merge-gate-hold-class.mjs';
 /**
  * @file scripts/conveyor/__tests__/reconcile-core.test.mjs
  * @description Pins the resident reconcile pass (WE #3296) — the dispatch and, mostly, its FOUR REFUSALS.
@@ -3695,12 +3697,12 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
     ['annotated merge-gate and review-gate red', heldRollup],
   ])('hands a non-draft with %s to the review daemon instead of the review-ci config-conflict refusal', (_, rollup) => {
     const result = plan({ isDraft: false, statusCheckRollup: rollup() });
-    expect(result.dispatch).toContainEqual(expect.objectContaining({ kind: 'review', prNumber: 1563 }));
-    expect(result.refusals).toEqual([expect.objectContaining({ kind: 'no-findings' })]);
+    expect(result.refusals.map(row => row.kind)).toEqual(['review-hold-red']);
     expect(result.refusals.filter(row => row.kind === 'review-ci' || row.reviewRefusal?.kind === 'review-ci')).toEqual([]);
   });
 
   it.each([
+    ['unannotated red merge-gate', () => [check('test'), check('merge-gate', 'failure'), check('review-gate', 'failure')]],
     ['another required red check', () => heldRollup().map(row => row.name === 'test' ? check('test', 'failure') : row)],
   ])('reviewChecksAllow still refuses a non-draft with %s even after not-a-ci-break escalation', (_, rollup) => {
     const result = plan({ isDraft: false, statusCheckRollup: rollup(), comments: [{ author: AUTOMATION,
@@ -3970,11 +3972,11 @@ it.each([[], [finding()]])('x6n7c2p required checks before review — fail close
     expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci' }));
   }
 });
-it('required review-gate alone refuses unknown real CI without healing review completion', () => {
+it('required review-gate conflict refuses without repeatedly healing review completion', () => {
   const plan = planReconcile({ requiredChecks: ['review-gate'], agents: [], now: NOW,
     prs: [pr1563({ labels: lbl('review:pending'), statusCheckRollup: [{ name: 'review-gate', status: 'completed', conclusion: 'failure' }] })] });
   expect(plan.dispatch).toEqual([]);
-  expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'review-ci', ci: expect.objectContaining({ reason: 'unknown-required-set' }) })]);
+  expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'review-ci', ci: expect.objectContaining({ reason: 'required-review-gate-conflict' }) })]);
 });
 describe('required review-gate conflict is scoped to the review it gates', () => {
   const failed = name => ({ name, status: 'completed', conclusion: 'failure' });
@@ -4814,63 +4816,18 @@ describe('R359 early start shadow refusal diagnostics (xtxt36v / xrz0ezn)', () =
   });
 });
 
-describe('unannotated admission gates cannot deadlock review', () => {
-  const requiredChecks = ['test', 'smoke', 'daemon-soak', 'merge-gate', 'review-gate'];
-  const row = (name, conclusion = 'success') => ({ name, status: 'completed', conclusion });
-  const checks = requiredChecks.map(name => row(name, name.endsWith('-gate') ? 'failure' : 'success'));
-  const plan = (statusCheckRollup = checks) => planReconcile({ requiredChecks, now: NOW, agents: [],
-    prs: [pr1563({ labels: lbl('review:pending'), comments: [], statusCheckRollup })] });
-  it('admits review with required merge-gate and review-gate red', () => {
-    expect(plan().dispatch).toEqual([expect.objectContaining({ kind: 'review' })]);
-    expect(plan().refusals).toEqual([expect.objectContaining({ kind: 'no-findings' })]);
+
+it('admits PR 7106 workflow-edit protection on review:pending without a ci-heal', () => {
+  const evidence = workflowEvidence();
+  const prs = excusePrMergeGateHolds([pr1563({ number: 7106, headRefOid: HEAD,
+    labels: lbl('review:pending'), comments: [], statusCheckRollup: [workflowRow,
+      { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] })], {
+    repo: 'owner/repo', mergeGateSetting: 'on',
+    readMergeGateVerdict: args => readMergeGateVerdict({ ...args, cache: new Map(),
+      runGh: argv => argv[1].endsWith('/logs') ? evidence.log : JSON.stringify(evidence.job) }),
   });
-  it('still admits review after a head-bound not-a-ci-break escalation for plain merge-gate red', () => {
-    const result = planReconcile({ requiredChecks, now: NOW, agents: [], prs: [pr1563({
-      labels: lbl('review:pending'), statusCheckRollup: checks, comments: [{ author: AUTOMATION,
-        body: buildCiHealEscalationComment({ headSha: pr1563().headRefOid, outcome: 'not-a-ci-break', reason: 'review hold' }) }],
-    })] });
-    expect(result.dispatch).toContainEqual(expect.objectContaining({ kind: 'review' }));
-    expect(result.dispatch.some(r => r.kind === 'ci-heal')).toBe(false);
-  });
-  it.each([null, undefined, []])('refuses review with unreadable rollup %j', evidence => {
-    const result = plan(evidence === undefined ? null : evidence);
-    expect(result.dispatch.some(r => r.kind === 'review')).toBe(false);
-    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci' }));
-  });
-  it('aborts planning on a nameless real CI row rather than admitting review', () => {
-    expect(() => plan([...checks, null])).toThrow('Check rows must have a non-empty string name or context');
-  });
-  it.each(['missing', 'pending', 'malformed'])('does not excuse %s merge-gate evidence', mode => {
-    const result = plan(checks.flatMap(r => r.name !== 'merge-gate' ? [r] : mode === 'missing' ? []
-      : [{ ...r, ...(mode === 'pending' ? { status: 'in_progress', conclusion: null } : { conclusion: 'unknown' }) }]));
-    expect(result.dispatch.some(r => r.kind === 'review')).toBe(false);
-    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci' }));
-  });
-  it.each(['merge-gate', 'review-gate'])('refuses review for a failed %s on a different head', name => {
-    const result = plan(checks.map(r => r.name === name ? { ...r, head_sha: 'b'.repeat(40) } : r));
-    expect(result.dispatch.some(r => r.kind === 'review')).toBe(false);
-  });
-  it.each(['merge-gate', 'review-gate'])('admits review for a failed %s on the current head', name => {
-    const result = plan(checks.map(r => r.name === name ? { ...r, head_sha: pr1563().headRefOid } : r));
-    expect(result.dispatch).toContainEqual(expect.objectContaining({ kind: 'review' }));
-  });
-  it.each(['merge-gate', 'review-gate'].flatMap(name => ['status', 'conclusion'].flatMap(field =>
-    [null, 1, true, [field === 'status' ? 'completed' : 'failure'],
-      { toString: () => field === 'status' ? 'completed' : 'failure' }].map(value => [name, field, value]))))(
-    'refuses review for %s with non-string %s (%j)', (name, field, value) => {
-      const result = plan(checks.map(r => r.name === name ? { ...r, [field]: value } : r));
-      expect(result.dispatch.some(r => r.kind === 'review')).toBe(false);
-    });
-  it.each(['test', 'smoke', 'daemon-soak'])('owes ci-heal when required %s fails alongside gates', name => {
-    const result = plan(checks.map(r => r.name === name ? row(name, 'failure') : r));
-    expect(result.dispatch).toContainEqual(expect.objectContaining({ kind: 'ci-heal' }));
-    expect(result.dispatch.some(r => r.kind === 'review')).toBe(false);
-  });
-  it.each(['missing', 'pending', 'malformed', 'wrong-head'])('refuses review with %s real CI evidence', mode => {
-    const result = plan(checks.flatMap(r => r.name !== 'smoke' ? [r] : mode === 'missing' ? [] : [{ ...r,
-      ...(mode === 'pending' ? { status: 'in_progress', conclusion: null } : mode === 'malformed'
-        ? { conclusion: 'unknown' } : { head_sha: 'b'.repeat(40) }) }]));
-    expect(result.dispatch.some(r => r.kind === 'review')).toBe(false);
-    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci' }));
-  });
+  const plan = planReconcile({ prs, requiredChecks: ['test', 'merge-gate'], now: NOW, agents: [],
+    advisoryReviewOnHumanHandoff: 'on' });
+  expect(plan.dispatch).toContainEqual(expect.objectContaining({ kind: 'review', prNumber: 7106 }));
+  expect(plan.dispatch.some(d => d.kind === 'ci-heal')).toBe(false);
 });

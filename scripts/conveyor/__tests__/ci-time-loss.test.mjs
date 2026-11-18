@@ -8,17 +8,6 @@ it.each(['review:pending', 'review:changes', 'review:human', 'review:held-mechan
   const plan = planReconcile({ prs: [pr], agents: [], advisoryReviewOnHumanHandoff: 'off', requiredChecks: ['review-gate'] });
   expect(plan.dispatch.some(d => d.kind === 'ci-heal')).toBe(false);
 });
-it('retains the raw review-gate hold after admission filtering when ci:failed still owes CI repair', () => {
-  // This completed current-head gate is filtered from admission CI. With no
-  // remaining checks, ci:failed still classifies the PR as ci-red (repair owed).
-  const pr = { number: 5439, headRefOid: head, state: 'OPEN', mergeStateStatus: 'CLEAN',
-    labels: [{ name: 'review:pending' }, { name: 'ci:failed' }], comments: [],
-    statusCheckRollup: [{ name: 'review-gate', head_sha: head, status: 'COMPLETED', conclusion: 'FAILURE' }] };
-  const plan = planReconcile({ prs: [pr], agents: [], advisoryReviewOnHumanHandoff: 'off', requiredChecks: ['review-gate'] });
-  expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'review-hold-red', phase: 'ci-red',
-    why: 'review daemon owns held gates: review-gate' }));
-  expect(plan.dispatch).toEqual([]);
-});
 it('gives cancelled shards one automatic rerun rather than the six infra retries', () => {
   const pr = { number: 5439, headRefOid: head, statusCheckRollup: [{ name: 'test-shard (1)', conclusion: 'cancelled', detailsUrl: 'https://github.com/owner/repo/actions/runs/1' }] };
   const [out] = enrichPrsWithTimeoutEvidence([pr], { repo: 'owner/repo', readBudget: () => ({ confirmed: 0, rejected: 0 }),
