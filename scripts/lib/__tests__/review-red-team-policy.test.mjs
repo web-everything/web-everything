@@ -59,11 +59,19 @@ describe('redTeamOwedDecision', () => {
   it('exempts only a reviewable card-only head without seats or live work', () => {
     const card = exemptInput(head);
     expect(redTeamOwedDecision(card)).toEqual({ owed: false, cleared: true, reasons: [] });
-    expect(redTeamOwedDecision({ ...card, scheduling: { ...card.scheduling, scheduled: true } }).owed).toBe(false);
-    for (const field of ['inFlight', 'queued', 'recorded']) {
+    for (const field of ['scheduled', 'inFlight', 'queued', 'recorded']) {
       expect(redTeamOwedDecision({ ...card, scheduling: { ...card.scheduling, [field]: true } }).owed).toBe(true);
     }
     expect(redTeamOwedDecision({ ...card, scheduling: { skipCardOnly: false } }).owed).toBe(true);
+  });
+  it.each(['scheduled', 'inFlight', 'queued'].flatMap(key =>
+    [false, true, undefined, null, 'false', 0].map(value => [key, value])))
+  ('card-only exemption requires explicit false scheduling: %s=%j', (key, value) => {
+    const input = exemptInput(head);
+    if (value === undefined) delete input.scheduling[key]; else input.scheduling[key] = value;
+    const decision = redTeamOwedDecision(input);
+    expect(decision).toMatchObject({ owed: value !== false, cleared: value === false });
+    if (value !== false) expect(decision.reasons).toContainEqual(RED_TEAM_HOLDS['pass-owed']);
   });
   it('rejects missing, empty, unscored and foreign-head reads', () => {
     for (const read of [undefined, { ...reviewedRead(head), diffText: '  ' },

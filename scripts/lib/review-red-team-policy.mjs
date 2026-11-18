@@ -97,8 +97,7 @@ export const RED_TEAM_EXEMPTION_INPUTS = Object.freeze({
   'scheduling.recorded': x => x.scheduling?.recorded === false,
   'scheduling.inFlight': x => x.scheduling?.inFlight === false,
   'scheduling.queued': x => x.scheduling?.queued === false,
-  // Scheduling intent alone is not live work, but its read must have succeeded.
-  'scheduling.scheduled': x => typeof x.scheduling?.scheduled === 'boolean',
+  'scheduling.scheduled': x => x.scheduling?.scheduled === false,
   runs: x => !!x.runs && ['result', 'comment', 'seats', 'execution', 'verdict', 'carry'].every(key => Array.isArray(x.runs[key]) && x.runs[key].length === 0),
 });
 

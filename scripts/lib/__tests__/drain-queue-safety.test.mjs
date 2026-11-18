@@ -1601,7 +1601,8 @@ describe('durable head-bound red-team admission', () => {
   // PR #5482 red team: the card-only exemption ignored WE_RED_TEAM_SKIP_CARD_ONLY=false and a pass already running.
   it('exempts a card-only head only while the producer skips it; a started pass is always awaited', () => {
     const loopPayload = { verdict: { verdict: 'accept' }, findings: { read: reviewedRead(head, ['backlog/123-card.md']) } };
-    expect(hold({ loopPayload })).toBeNull();
+    expect(hold({ loopPayload, scheduled: false })).toBeNull();
+    expect(hold({ loopPayload, scheduled: true })).toMatch(/no recorded result/);
     expect(hold({ loopPayload, env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' } })).toMatch(/no recorded result/);
     expect(hold({ loopPayload, env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, inFlight: true })).toMatch(/no recorded result/);
     expect(hold({ loopPayload, scheduled: false, inFlight: true })).toMatch(/no recorded result/);

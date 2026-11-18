@@ -2643,7 +2643,8 @@ Post-accept admission uses `redTeamOwedDecision` over the normalized input built
 The queue imports that leaf rather than the review/recovery IO graph, which otherwise creates
 an initialization cycle through `merge-ai-prs.mjs`. Missing or unscored reads hold even without scheduling evidence.
 Only a scored, non-empty, head-bound card-only read with skip enabled, no seat rows and no
-live or queued work proves exemption. A completed pass requires a publishable completed-review
+scheduled, live or queued work proves exemption; all three scheduling flags must be explicitly false.
+A completed pass requires a publishable completed-review
 comment, the scored read, and schema-valid seat rows including a completed seat. Marker-only
 and policy-clear comments never pay execution debt. A recorded execution still owes its
 completed result and seat proof even if the seat rows are missing. Rename sources must be

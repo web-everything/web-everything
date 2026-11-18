@@ -333,6 +333,8 @@ function assertStructure(source) {
   const properties = table[0].initializer.arguments[0].properties;
   expect(properties.map(p => p.name.text)).toEqual(exemptionKeys);
   for (const property of properties) expect(property.initializer.getText()).toBe(RED_TEAM_EXEMPTION_INPUTS[property.name.text].toString());
+  expect(properties.find(p => p.name.text === 'scheduling.scheduled').initializer.getText())
+    .toBe('x => x.scheduling?.scheduled === false');
   expect(policy.text).toContain('Object.values(RED_TEAM_EXEMPTION_INPUTS).every(proven => proven(input))');
   expect(source['review-red-team-policy.mjs']).toMatch(/&& Array\.isArray\(read\.netRenameSources\)/);
   const clearance = all(policy, n => ts.isVariableDeclaration(n) && n.name?.getText() === 'RED_TEAM_CLEARANCE_INPUTS');
@@ -428,6 +430,9 @@ it('structural: each admission delegates exactly once; holds never branch on inc
   assertStructure(sources());
 });
 it.each([
+  ['scheduled exemption guard loosened', 'review-red-team-policy.mjs', text => text.replace(
+    "'scheduling.scheduled': x => x.scheduling?.scheduled === false",
+    "'scheduling.scheduled': x => typeof x.scheduling?.scheduled === 'boolean'")],
   ['refresh labels omitted', 'merge-ai-prs.mjs', text => text.replace('redTeamEnqueueHold({ ...evidence, repo, pr: c.num, head: sha, comments, labels: live.labels,', 'redTeamEnqueueHold({ ...evidence, repo, pr: c.num, head: sha, comments,')],
   ['refresh setting bypass restored', 'merge-ai-prs.mjs', text => text.replace('if (redTeamEnqueueHold({ ...evidence, repo, pr: c.num, head: sha, comments, labels:', 'if (safety.value.waitForRedTeamBeforeEnqueue && redTeamEnqueueHold({ ...evidence, repo, pr: c.num, head: sha, comments, labels:')],
   ['publication labels omitted', 'drain-red-team-evidence.mjs', text => text.replace('comments, labels: live.labels,', 'comments,')],

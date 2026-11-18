@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 import { planRedTeamStatusLabels } from '../red-team-status-labels.mjs';
-import { reviewedRead, idleEvidence } from './fixtures/red-team-owed.mjs';
+import { reviewedRead, idleEvidence, completedComment, completedExecution, completedSeat } from './fixtures/red-team-owed.mjs';
 import { redTeamForHead } from '../red-team-gate.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { syncResultOnHeadLabels } from '../red-team-result-label-sync.mjs';
@@ -33,6 +33,26 @@ function fixture() {
 }
 
 describe('syncResultOnHeadLabels', () => {
+  it.each(['untrusted marker', 'older-head result', 'unresolved blocked label'])(
+    'preserves the pre-PR %s guard through the real evidence decision', guard => {
+      const input = fixture();
+      const rev = guard === 'older-head result' ? olderHead : head;
+      input.rawPrs[0].comments = [completedComment(pr, rev)];
+      if (guard === 'untrusted marker') input.rawPrs[0].comments[0].author.login = 'untrusted-contributor';
+      if (guard === 'unresolved blocked label') {
+        input.rawPrs[0].labels = ['bug', 'red-team:blocked'];
+        input.rawPrs[0].comments = [];
+      }
+      const before = structuredClone(input.rawPrs);
+      expect(redTeamForHead(input.rawPrs[0].comments, pr, head)).toBeNull();
+      if (guard === 'older-head result') expect(redTeamForHead(input.rawPrs[0].comments, pr, olderHead)).toMatchObject({ rev: olderHead });
+      input.sync = args => planRedTeamStatusLabels({ ...args, labels: input.rawPrs[0].labels, comments: input.rawPrs[0].comments,
+        evidence: { ...idleEvidence(), recorded: true, status: completedExecution(head),
+          loopPayload: { findings: { read: reviewedRead(head) } }, seats: [completedSeat(head, { repo, pr })] } });
+      const outcome = syncResultOnHeadLabels(input);
+      expect(outcome).toEqual({ rawPrs: before, applied: [], errors: [] });
+      expect(input.sealStored).not.toHaveBeenCalled();
+    });
   it.each(['sealed', 'skipped'])('seals an unsealed trusted same-head result (%s) before syncing clear labels without posting', status => {
     const input = fixture();
     input.readSeal.mockReturnValue({ unsealed: true });

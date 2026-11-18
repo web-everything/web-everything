@@ -96,7 +96,7 @@ describe('head-bound red-team operator labels', () => {
   it('shows a card-only head as pending only when the pass is not skipped or has started', () => {
     const loopPayload = { findings: { read: reviewedRead(head, ['backlog/123-card.md']) } };
     const plan = (env, evidence) => planRedTeamStatusLabels({ ...input, labels: [], comments: [], env, evidence: { ...idleEvidence(), loopPayload, ...evidence } }).add;
-    expect(plan({}, { scheduled: true })).toBe('red-team:clear');
+    expect(plan({}, { scheduled: true })).toBe('red-team:pending');
     expect(plan({ WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, { scheduled: true })).toBe('red-team:pending');
     expect(plan({}, { scheduled: true, inFlight: true })).toBe('red-team:pending');
   });
@@ -226,7 +226,15 @@ describe('card-only head that bypasses the red-team pass loses a stale pending l
   it('never removes red-team:blocked on a card-only head', () => {
     expect(plan(['red-team:blocked'], { loopPayload: card })).toEqual({ add: null, remove: [] });
   });
-  it.each([['inFlight'], ['recorded']])('keeps pending while a pass is %s', key => {
+  it('canonical audit: scheduled card-only work without a result stays owed and retains pending', () => {
+    const evidence = { ...idleEvidence(), scheduled: true, loopPayload: card };
+    const normalized = readDrainRedTeamEvidence({ ...input, labels: ['red-team:pending'], comments: [], evidence }).decisionInput;
+    const decision = redTeamOwedDecision(normalized);
+    expect(decision).toMatchObject({ owed: true, cleared: false });
+    expect(decision.reasons).toContainEqual(RED_TEAM_HOLDS['pass-owed']);
+    expect(plan(['red-team:pending'], evidence)).toEqual({ add: null, remove: [] });
+  });
+  it.each([['inFlight'], ['scheduled'], ['recorded'], ['queued']])('keeps pending while a pass is %s', key => {
     expect(plan(['red-team:pending'], { loopPayload: card, [key]: true })).toEqual({ add: null, remove: [] });
   });
   it('keeps pending when the card-only skip policy is off (evidence or env)', () => {

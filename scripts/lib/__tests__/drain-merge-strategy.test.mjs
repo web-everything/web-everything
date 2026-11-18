@@ -1081,11 +1081,12 @@ describe('merge-ai-prs hook wiring', () => {
 
 
 describe('post-accept red-team enqueue barrier (#5283)', () => {
-  it.each([['card-only', { scheduled: true, inFlight: false, recorded: false,
+  it.each([['scheduled card-only', { scheduled: true, inFlight: false, recorded: false,
     loopPayload: { findings: { read: reviewedRead(HEAD, ['backlog/123-card.md']) } } }],
-    ['unscheduled card-only', { scheduled: false, inFlight: false, recorded: false, loopPayload: { findings: { read: reviewedRead(HEAD, ['backlog/fixture.md']) } } }]])('%s enqueues without an owed pass', (_name, evidence) => {
+    ['unscheduled card-only', { scheduled: false, inFlight: false, recorded: false, loopPayload: { findings: { read: reviewedRead(HEAD, ['backlog/fixture.md']) } } }]])('%s enqueues only without scheduled debt', (_name, evidence) => {
     const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], evidence });
-    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: true });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: !evidence.scheduled });
+    if (evidence.scheduled) expect(h.state().redTeamPending['cwd#5283']).toBeDefined();
   });
   it('a scheduled in-flight pass holds admission and writes pending through the label provider', () => {
     const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'],
@@ -1572,14 +1573,14 @@ describe('red-team wait deadline never merges without a result (redTeam.deadline
     expect(after.s.enqueue({ num: 5283 }, HEAD, { comments: [carried] })).toMatchObject({ enqueued: true });
   });
 
-  it('a card-only diff (red team off for that class) is unaffected even with an old pending record past the deadline', () => {
+  it.each([false, true])('card-only exemption past the deadline requires no scheduled pass (scheduled=%s)', scheduled => {
     const initial = { pending: [], followedUp: [], redTeamPending: { 'cwd#5283': { headSha: HEAD, firstPendingAt: 0, retryAt: 0, commentCount: 0,
       reason: 'post-accept red team has no recorded result on the live head', deadlineHeldAt: 1, notifiedAt: 1 } } };
     const notes = [];
     const h = harness({ strategy: 'github-merge-queue', labels: ACCEPTED, initial, now: () => 10 * 60 * 60_000, publishNeedsYou: item => notes.push(item),
-      evidence: { scheduled: true, inFlight: false, recorded: false, loopPayload: { findings: { read: reviewedRead(HEAD, ['backlog/123-card.md']) } } } });
-    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: true });
-    expect(notes).toHaveLength(0);
+      evidence: { scheduled, inFlight: false, recorded: false, loopPayload: { findings: { read: reviewedRead(HEAD, ['backlog/123-card.md']) } } } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: !scheduled });
+    if (!scheduled) expect(notes).toHaveLength(0);
   });
 
   it('deadlineAction=hold publishes the note without re-requesting', () => {
