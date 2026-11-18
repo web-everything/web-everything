@@ -10,6 +10,7 @@ import { historicalCardOnlySkipCandidate, readDrainRedTeamEvidence, recordRedTea
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { redTeamOwedFor } from '../review-red-team-policy.mjs';
 import { pidStartTime } from '../pid-alive.mjs';
+import { reviewRunIndexPath } from '../review-run-index.mjs';
 import { readRedTeamCarry, resumeRedTeamCarry } from '../red-team-carry-machine.mjs';
 import { evaluateRedTeamCheckFact, withRedTeamCheckLock } from '../red-team-check-run.mjs';
 import { publishStoredRedTeamResult, needsPublish } from '../red-team-withheld-publish.mjs';
@@ -1826,6 +1827,7 @@ describe('recovery while a quiet review awaits human confirm', () => {
 
   it('holds as review-unfinished with an unread scan boundary', () => {
     const p = parked();
+    rmSync(reviewRunIndexPath(p.f.runsDir)); // explicitly exercise the legacy capped fallback
     const result = readRecoveryWitness({ ...p.f, now,
       scanSettings: { file: { runs: { scan: { maxParses: 1 } } }, env: {} }, warn: () => {},
       list: () => [p.run.id, 'review-pr-unread'], read: () => p.run,
