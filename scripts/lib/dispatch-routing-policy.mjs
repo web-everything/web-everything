@@ -7,11 +7,11 @@ const CATALOG = Object.freeze({
   claude: ['claude-haiku-5-5', 'claude-sonnet-5-5', 'claude-opus-5-5'],
   codex: ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra'],
   // Historical ids remain valid for persisted runs; aliases select the current family.
-  antigravity: ['claude-sonnet-5-5-high', 'claude-sonnet-5-5-medium', 'claude-sonnet-5-5-low', 'claude-sonnet-5-5', 'claude-sonnet-4-6', 'claude-opus-4-6-thinking', 'gemini-3.8-flash-high', 'gemini-3.8-flash', 'gemini-3.1-pro', 'gemini-4-argon-high', 'gemini-4-carbon-high', 'gemini-4-carbon-medium', 'gemini-4-carbon-low'],
+  antigravity: ['claude-sonnet-5-5-high', 'claude-sonnet-5-5-medium', 'claude-sonnet-5-5-low', 'claude-sonnet-5-5', 'claude-sonnet-4-6', 'claude-opus-4-6-thinking', 'gemini-3.8-flash-high', 'gemini-3.8-flash', 'gemini-3.1-pro', 'gemini-4-argon-high', 'gemini-4-carbon-high'],
   // Card 84 — agy 1.3.0 serves the 5.5 family with the effort baked into the id (`agy models`, 2026-10-06).
   'agy-claude': ['claude-sonnet-5-5', 'claude-sonnet-4-6', 'claude-opus-4-6-thinking', 'claude-opus-5-5-high', 'claude-opus-5-5-medium', 'claude-opus-5-5-low',
     'claude-sonnet-5-5-high', 'claude-sonnet-5-5-medium', 'claude-sonnet-5-5-low'],
-  'agy-gemini': ['gemini-3.8-flash-high', 'gemini-3.8-flash', 'gemini-3.1-pro', 'gemini-4-argon-high', 'gemini-4-carbon-high', 'gemini-4-carbon-medium', 'gemini-4-carbon-low'],
+  'agy-gemini': ['gemini-3.8-flash-high', 'gemini-3.8-flash', 'gemini-3.1-pro', 'gemini-4-argon-high', 'gemini-4-carbon-high'],
 });
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const fail = message => { throw new TypeError(`routing policy: ${message}`); };
