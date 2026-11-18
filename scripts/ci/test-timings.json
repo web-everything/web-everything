@@ -1711,7 +1711,6 @@
   "wrapper-conformance/__tests__/runner.test.ts": 0.01
  },
  "soak": {
-  "scripts/conveyor/soak/breaks/superseded-omits-retired-merged-overlay.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/review-seat-starved-by-repo-order.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/review-daemon-budget-lists-real-processes.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/live-changes-stale-accepted-phase.soak.test.mjs": 2,
@@ -2026,6 +2025,7 @@
   "scripts/conveyor/soak/breaks/task-owner-dies-before-stop.soak.test.mjs": 0.18,
   "scripts/conveyor/soak/breaks/verdict-ledger-slow-push-race-refused.soak.test.mjs": 17.78,
   "scripts/conveyor/soak/breaks/ready-candidate-long-tick.soak.test.mjs": 1,
-  "scripts/conveyor/soak/breaks/timings-advisory-merge.soak.test.mjs": 2
+  "scripts/conveyor/soak/breaks/timings-advisory-merge.soak.test.mjs": 2,
+  "scripts/conveyor/soak/breaks/superseded-omits-retired-merged-overlay.soak.test.mjs": 2
  }
 }
