@@ -27,7 +27,7 @@ import {
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
-import { readPendingDrops } from '../../daemon-overlay.mjs';
+import { readPendingDrops, withAddGuardLock } from '../../daemon-overlay.mjs';
 import { detectOverlayStale } from './overlay-prune.mjs';
 import { makeAuditedTipGate, tipInMain } from './audited-tip.mjs';
 import { carriedBeyondMain } from '../../operations/prototype-retire.mjs';
@@ -507,11 +507,19 @@ export async function prepareRebuild({
     if (d.action === 'remove') {
       const proof = d.reason === 'pr-merged' ? prMergedDropEvidence({ git, ref: d.ref, mainSha: plan.mainSha }) : {};
       // Bind the removal to the registration the plan judged: a re-registration after planning is not removed.
-      try { removeOverlay(root, d.ref, { env, why: d.reason, expectedOverlay: overlaysBefore.find((o) => o.ref === d.ref) }); }
-      catch (error) { // a refused removal stops this build; the next tick replans from the current registrations
+      // The pending-drop check and the removal are atomic under the add-guard lock retire/replace use (I2).
+      let refused = null;
+      try {
+        refused = await withAddGuardLock(root, env, () => {
+          if (dropPendingNow()) return 'drop-pending-unsettled';
+          removeOverlay(root, d.ref, { env, why: d.reason, expectedOverlay: overlaysBefore.find((o) => o.ref === d.ref) });
+          return null;
+        });
+      } catch (error) { // a refused removal stops this build; the next tick replans from the current registrations
         alert('overlay-removal-refused', { ref: d.ref, error: String(error.message) });
         return terminal({ moved: false, reason: 'overlay-removal-refused', plan });
       }
+      if (refused) return terminal({ moved: false, reason: refused, plan });
       appendOverlayEvent(root, { kind: 'auto-dropped', ref: d.ref, pr: d.pr, reason: d.reason, ...proof }, { env });
       alert('overlay-auto-dropped', { ref: d.ref, reason: d.reason });
     } else if (d.action === 'drop') {
