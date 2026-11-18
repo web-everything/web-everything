@@ -21,6 +21,35 @@ const proof = (pid = 101, daemonId = 'worker') => ({
 const now = ADOPTED_AT + 2;
 
 describe('R986 I1 frozen owed set and per-daemon proofs (pure core)', () => {
+  describe.each(['shared wrapper', 'shared files', 'independent results'])('%s closure reads', reuse => {
+    it.each(['blob', 'membership', 'incomplete', 'empty', 'invalid blob', 'unchanged'])(
+      'preserves the proven-good evidence before the adopted read: %s', async variant => {
+        const { freezeProbation, evaluateProbation } = await core();
+        const shared = { complete: true, files: {} };
+        const p = freezeProbation({ ...options, registered: [{ id: 'worker' }], readClosure(_, sha) {
+          const before = sha === GOOD;
+          const files = reuse === 'independent results' ? {} : shared.files;
+          delete files['worker.mjs'];
+          delete files['old.mjs'];
+          if (!(before && variant === 'empty')) {
+            const path = before && variant === 'membership' ? 'old.mjs' : 'worker.mjs';
+            files[path] = before && variant === 'invalid blob' ? 'invalid'
+              : variant === 'blob' ? sha : GOOD;
+          }
+          const complete = !(before && variant === 'incomplete');
+          if (reuse === 'shared wrapper') {
+            shared.complete = complete;
+            return shared;
+          }
+          return { complete, files };
+        } });
+        expect(evaluateProbation(p, now)).toEqual(variant === 'unchanged'
+          ? { action: 'pass' } : { action: 'pending', owed: ['worker'] });
+        expect(p.owed).toEqual(variant === 'unchanged' ? [] : ['worker']);
+      },
+    );
+  });
+
   it('healthy unaffected sibling ticking does NOT promote the unproven changed daemon', async () => {
     const { freezeProbation, recordProof, evaluateProbation } = await core();
     const p = freezeProbation(options);

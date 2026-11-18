@@ -11,19 +11,24 @@ const readArray = (a, map = v => v) => { const n = a.length; return Array.from({
 const exactKeys = (value, keys) => object(value) && Object.keys(value).length === keys.length
   && keys.every(key => Object.hasOwn(value, key));
 
-function knownClosure(value) {
-  return object(value) && value.complete === true && object(value.files)
-    && Object.keys(value.files).length > 0 && Object.values(value.files).every(shaOK);
+function snapshotClosure(value) {
+  if (!object(value)) return null;
+  const { complete, files } = value;
+  if (complete !== true || !object(files)) return null;
+  const copy = { ...files };
+  return Object.keys(copy).length > 0 && Object.values(copy).every(shaOK) ? copy : null;
 }
 
 function closureDiffers(daemon, from, to, readClosure) {
   if (!shaOK(from)) return true;
   try {
-    const before = readClosure(daemon, from), after = readClosure(daemon, to);
-    if (!knownClosure(before) || !knownClosure(after)) return true;
-    const paths = Object.keys(before.files);
-    return paths.length !== Object.keys(after.files).length
-      || paths.some(path => !Object.hasOwn(after.files, path) || before.files[path] !== after.files[path]);
+    // The reader may reuse its wrapper or files map; capture each result before the next read.
+    const before = snapshotClosure(readClosure(daemon, from));
+    const after = snapshotClosure(readClosure(daemon, to));
+    if (!before || !after) return true;
+    const paths = Object.keys(before);
+    return paths.length !== Object.keys(after).length
+      || paths.some(path => !Object.hasOwn(after, path) || before[path] !== after[path]);
   } catch { return true; }
 }
 

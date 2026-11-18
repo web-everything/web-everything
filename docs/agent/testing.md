@@ -4581,6 +4581,8 @@ probation service. At adoption, `freezeProbation` takes the complete registered 
 for one clone and `readClosure(daemon, sha)` snapshots at proven-good and adopted heads.
 A snapshot is `{ complete: true, files: { repoRelativePath: gitBlobId } }`; include
 all imported files. Unknown, incomplete, empty or unreadable snapshots owe proof.
+The core copies and validates each closure's files before the next `readClosure` call;
+readers may reuse their result object or files map without changing earlier evidence.
 An unknown or ambiguous roster refuses adoption: the operator must recover the roster.
 `owed` stays fixed for this adoption. `recordProof` stores independent daemon records;
 boot and completed tick evidence must name that daemon, agree on its PID and adopted
