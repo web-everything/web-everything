@@ -8,6 +8,8 @@ import { proveNumberingOnlyMove, numberingGitRunner } from '../numbering-carry.m
 import { proveHumanOnlyLicense, proveHumanOnlyLicenseWithRunner, resolveApprovalLicensesEnqueue } from '../human-only-enqueue-license.mjs';
 
 const roots = [];
+const rawChange = path => `:100644 100644 ${'a'.repeat(40)} ${'b'.repeat(40)} M\0${path}\0`;
+const removeTreeEntryTabs = entry => entry.replaceAll('\t', '');
 // Config discovery also sees the command-line origin pin and appends its discovered override.
 const GIT_PINS = ['-c', 'protocol.allow=never', '-c', 'extensions.partialClone=',
   '-c', 'remote.origin.promisor=false', '-c', 'remote.origin.promisor=false'];
@@ -30,6 +32,18 @@ function fixture() {
   };
   return { cwd, git, write, commit, approved, comments, exec, prove, setHead: sha => { head = sha; }, setLabels: v => { labels = v; } };
 }
+
+describe('missing-tab tree fixture', () => {
+  it.each([
+    ['', ''],
+    ['README.md', 'README.md'],
+    ['header\tREADME.md\0', 'headerREADME.md\0'],
+    ['header\tREAD\tME.md\0', 'headerREADME.md\0'],
+    ['header\tREADME.md\0header\tother.md\0', 'headerREADME.md\0headerother.md\0'],
+  ])('removes every tab while preserving other bytes: %j', (entry, expected) => {
+    expect(removeTreeEntryTabs(entry)).toBe(expected);
+  });
+});
 
 describe('human-only enqueue license', () => {
   it('licenses the exact trusted approved current head', () => {
@@ -302,6 +316,93 @@ describe('human-only enqueue license', () => {
       args: [...GIT_PINS, '-c', 'core.precomposeUnicode=false', '-c', 'core.quotePath=false', 'ls-tree', '-r', '-z', '--full-tree', ref],
       opts: expect.objectContaining({ cwd: r.cwd, timeout: 5000, maxBuffer: 8 * 1024 * 1024 }),
     })));
+  });
+  it.each(['head', 'main'].flatMap(ref => ['unreadable', 'oversized', 'non-UTF8', 'malformed', 'truncated',
+    'duplicate', 'wrong type', 'missing tab', 'empty path', 'unknown mode', 'unicode path', 'control path'].map(failure => [ref, failure])))(
+    'refuses %s complete-tree evidence that is %s and names the operator fallback', (ref, failure) => {
+    const r = fixture();
+    r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
+    const main = r.commit('main docs'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
+    r.git(['checkout', '-qb', 'pr', r.approved]); r.git(['commit', '--allow-empty', '-qm', 'retain approved tree']);
+    r.git(['merge', '--no-ff', '-m', 'merge main', main]);
+    const head = r.git(['rev-parse', 'HEAD']); r.setHead(head);
+    let injected = false;
+    expect(r.prove({ run: (cmd, args, opts) => {
+      if (cmd === 'git' && args.includes('ls-tree') && args.at(-1) === (ref === 'head' ? head : main)) {
+        injected = true;
+        if (failure === 'unreadable') throw Error('tree unavailable');
+        if (failure === 'oversized') return Buffer.alloc(8 * 1024 * 1024 + 1);
+        if (failure === 'non-UTF8') return Buffer.from([0xff]);
+        if (failure === 'malformed') return Buffer.from('unreadable\0');
+        const entry = `100644 blob ${'a'.repeat(40)}\tREADME.md\0`;
+        if (failure === 'truncated') return Buffer.from(entry.slice(0, -1));
+        if (failure === 'duplicate') return Buffer.from(entry.repeat(2));
+        if (failure === 'wrong type') return Buffer.from(entry.replace('blob', 'commit'));
+        if (failure === 'missing tab') return Buffer.from(removeTreeEntryTabs(entry));
+        if (failure === 'empty path') return Buffer.from(entry.replace('README.md', ''));
+        if (failure === 'unknown mode') return Buffer.from(entry.replace('100644', '170000'));
+        if (failure === 'unicode path') return Buffer.from(entry.replace('README.md', 'caf\u00e9.md'));
+        if (failure === 'control path') return Buffer.from(entry.replace('README.md', 'bad\u0085.md'));
+      }
+      return execFileSync(cmd, args, opts);
+    } })).toMatchObject({ licensed: false, reason: 'approval or git evidence unreadable or oversized; operator must re-approve the current head or queue it' });
+    expect(injected).toBe(true);
+  });
+  it.each(['A', 'M', 'D'])('requires a deletion record for a path absent from both complete trees: %s', status => {
+    const r = fixture();
+    r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
+    const main = r.commit('main docs'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
+    r.git(['checkout', '-qb', 'pr', r.approved]); r.git(['commit', '--allow-empty', '-qm', 'retain approved tree']);
+    r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
+    const oldMode = status === 'A' ? '000000' : '100644';
+    const newMode = status === 'D' ? '000000' : '100644';
+    const oldId = (status === 'A' ? '0' : 'a').repeat(40);
+    const newId = (status === 'D' ? '0' : 'b').repeat(40);
+    let injected = false;
+    const result = r.prove({ run: (cmd, args, opts) => {
+      if (cmd === 'git' && args.includes('diff-tree')) {
+        injected = true;
+        return Buffer.from(`:${oldMode} ${newMode} ${oldId} ${newId} ${status}\0missing.md\0`);
+      }
+      return execFileSync(cmd, args, opts);
+    } });
+    expect(injected).toBe(true);
+    expect(result).toMatchObject(status === 'D' ? { licensed: true, tier: 'mechanical' }
+      : { licensed: false, reason: 'successor changes an unapproved path differing from main; operator must re-approve the current head or queue it' });
+  });
+  it.each([
+    ['missing terminator', rawChange('docs.md').slice(0, -1), 'successor diff incomplete'],
+    ['missing path', rawChange('docs.md').split('\0')[0] + '\0', 'successor diff incomplete'],
+    ['malformed header', 'unreadable\0docs.md\0', 'successor tree evidence unreadable'],
+    ['unknown mode', rawChange('docs.md').replace('100644', '170000'), 'successor tree evidence unreadable'],
+    ['empty path', rawChange(''), 'successor path unreadable'],
+  ])('refuses incomplete or unreadable raw tree evidence: %s', (_name, output, reason) => {
+    const r = fixture();
+    r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
+    const main = r.commit('main docs'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
+    r.git(['checkout', '-qb', 'pr', r.approved]); r.write('ordinary.md', 'author docs'); r.commit('author docs');
+    r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
+    let injected = false;
+    expect(r.prove({ run: (cmd, args, opts) => {
+      if (cmd === 'git' && args.includes('diff-tree')) {
+        injected = true;
+        return Buffer.from(output);
+      }
+      return execFileSync(cmd, args, opts);
+    } }))
+      .toMatchObject({ licensed: false, reason: `${reason}; operator must re-approve the current head or queue it` });
+    expect(injected).toBe(true);
+  });
+  it('refuses oversized git evidence and directs the operator to re-approve or queue', () => {
+    const r = fixture();
+    r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
+    const main = r.commit('main docs'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
+    r.git(['checkout', '-qb', 'pr', r.approved]); r.write('ordinary.md', 'author docs'); r.commit('author docs');
+    r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
+    expect(r.prove({ run: (cmd, args, opts) => {
+      if (cmd === 'git' && args.includes('diff-tree')) return Buffer.alloc(8 * 1024 * 1024 + 1);
+      return execFileSync(cmd, args, opts);
+    } })).toMatchObject({ licensed: false, reason: 'approval or git evidence unreadable or oversized; operator must re-approve the current head or queue it' });
   });
   it.each(['head', 'main'].flatMap(ref => ['missing', 'corrupt'].map(failure => [ref, failure])))(
     'refuses %s tree objects that are %s and names the operator fallback', (ref, failure) => {
