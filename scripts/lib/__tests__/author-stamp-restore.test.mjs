@@ -191,6 +191,13 @@ describe('plain snapshot provenance — oldest author snapshot and agreeing ids'
     });
   });
 
+  it('refuses a marker inside a multiline inline code span', () => {
+    expect(plan({ edits: [edit(`\`\n${buildAuthorActorMarker(ID)}\n\``)] })).toEqual({
+      action: 'refuse',
+      reason: 'malformed or non-standalone historical stamp; inspect complete GitHub history manually',
+    });
+  });
+
   it('refuses a standalone-looking stamp inside a multiline HTML attribute without writing', async () => {
     const diff = `<div\n data-note="\n${buildAuthorActorMarker(ID)}\n">`;
     const edits = [edit(diff)];

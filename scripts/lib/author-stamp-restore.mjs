@@ -120,6 +120,10 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
     if (/<\/?[a-z][^>]*>/i.test(ambiguousTicks ? edit.diff : htmlLines.join('\n')) || /<[!?]/.test(candidate)) {
       return refusal('unsupported HTML edit snapshot; inspect complete GitHub history manually');
     }
+    // An unmatched backtick line may open a multiline code span around a marker: not evidence of authorship.
+    if (ambiguousTicks && markers.length) {
+      return refusal('malformed or non-standalone historical stamp; inspect complete GitHub history manually');
+    }
     // GitHub lists newest first for equal timestamps: the later position is older.
     if (!oldest || Date.parse(edit.createdAt) <= Date.parse(oldest.createdAt)) {
       oldest = edit;
