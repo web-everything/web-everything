@@ -3,17 +3,20 @@ import { randomBytes } from 'node:crypto';
 import * as realFs from 'node:fs';
 import { spawnSync as realSpawn } from 'node:child_process';
 import { hostname, homedir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
 import { ciUnitPlan, ciGatePlan, urgentLedger, urgentKeyPath, urgentSignature, normalizeUrgentRepo } from './urgent-verify-marker.mjs';
 
-export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = realFs, spawnSync = realSpawn } = {}) {
-  const run = (cmd, args) => {
-    const r = spawnSync(cmd, args, { cwd, encoding: 'utf8', timeout: 4 * 60 * 60_000, maxBuffer: 16 * 1024 * 1024 });
+export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = realFs, spawnSync = realSpawn, env = process.env } = {}) {
+  const childEnv = Object.fromEntries(['PATH', 'HOME', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'CI', 'SHELL', 'USER']
+    .filter(k => typeof env[k] === 'string' && !env[k].includes(urgentKeyPath(home))).map(k => [k, env[k]]));
+  const fui = resolve(cwd, '../frontierui');
+  const run = (cmd, args, dir = cwd) => {
+    const r = spawnSync(cmd, args, { cwd: dir, env: childEnv, encoding: 'utf8', timeout: 4 * 60 * 60_000, maxBuffer: 16 * 1024 * 1024 });
     if (r.error || r.status !== 0) throw new Error('urgent-verify subprocess failed or admission unavailable; inspect output and retry after capacity is available');
     return r.stdout;
   };
   let gates;
-  const heavy = args => run(process.execPath, ['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=60000', '--', ...args]);
+  const heavy = (args, dir = cwd) => run(process.execPath, [dir === cwd ? 'scripts/readiness/heavy-admission.mjs' : join(cwd, 'scripts/readiness/heavy-admission.mjs'), 'run', '--wait-ms=60000', '--', ...args], dir);
   return { repo: () => normalizeUrgentRepo(run('git', ['remote', 'get-url', 'origin'])),
     readKey: () => {
       const path = urgentKeyPath(home);
@@ -30,6 +33,18 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
       fs.rmSync(join(cwd, 'coverage-shards'), { recursive: true, force: true });
       return ciUnitPlan(workflow);
     },
+    verifyFui: () => {
+      if (run('git', ['status', '--porcelain', '--untracked-files=all'], fui) !== '') throw new Error('FUI sibling must exist and be clean');
+      run('git', ['fetch', 'origin'], fui);
+      let tip;
+      try { tip = run('git', ['rev-parse', '--verify', 'origin/HEAD^{commit}'], fui).trim(); }
+      catch { tip = run('git', ['rev-parse', '--verify', 'origin/main^{commit}'], fui).trim(); }
+      const head = run('git', ['rev-parse', 'HEAD'], fui).trim();
+      if (!/^[a-f0-9]{40}$/i.test(head) || head !== tip) throw new Error('FUI sibling must match fetched origin default branch');
+      return head;
+    },
+    'install-fui': () => { for (const command of gates.installFui) heavy(command, fui); },
+    install: () => heavy(gates.install),
     shard: ({ group, shard }) => {
       let files = [];
       if (group) {
@@ -70,17 +85,19 @@ export async function urgentVerify({ sha }, deps = createUrgentDeps()) {
   try {
     if (typeof sha !== 'string' || !/^[a-f0-9]{40}$/i.test(sha) || !deps.clean() || deps.head() !== sha)
       return { ok: false, detail: 'clean-checkout-at-sha-required', fallback };
-    const plan = deps.plan(), startedAt = deps.now(), repo = deps.repo(), key = deps.readKey(), steps = [];
+    const plan = deps.plan(), startedAt = deps.now(), repo = deps.repo(), steps = [];
     if (!repo) throw new Error('unreadable origin remote');
-    let result = 'green';
+    let result = 'green', fuiSha;
     // Stop on failure, including queue exhaustion: no admission polling or retry loop.
     try {
+      fuiSha = await deps.verifyFui();
+      for (const step of ['install-fui', 'install']) { steps.push(step); await deps[step](); }
       for (const shard of plan) { steps.push(`unit:${shard.group ?? 'unit'}:${shard.shard}`); await deps.shard(shard); }
       for (const step of ['coverage', 'hostPaths', 'integration', 'standards']) { steps.push(step); await deps[step](); }
       if (!deps.clean() || deps.head() !== sha) throw new Error('checkout changed');
     } catch { result = 'red'; }
-    const marker = { sha, suite: 'full', shards: plan.length, result, startedAt, finishedAt: deps.now(), host: deps.host, repo, steps };
-    marker.sig = urgentSignature(marker, key);
+    const marker = { sha, suite: 'full', shards: plan.length, result, startedAt, finishedAt: deps.now(), host: deps.host, repo, steps, fuiSha };
+    marker.sig = urgentSignature(marker, deps.readKey());
     deps.append(marker);
     return { ok: result === 'green', marker, ...(result === 'red' ? { fallback } : {}) };
   } catch (e) { return { ok: false, detail: String(e.message), fallback }; }

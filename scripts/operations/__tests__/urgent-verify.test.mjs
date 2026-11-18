@@ -9,8 +9,8 @@ import { parseOperationArgv } from '../cli-adapter.mjs';
 const sha = 'a'.repeat(40), now = Date.parse('2026-11-18T12:00:00Z');
 const key = Buffer.alloc(32, 7);
 const sign = m => ({ ...m, sig: urgentSignature(m, key) });
-const expectedSteps = [...Array.from({ length: 10 }, (_, i) => `unit:unit:${i + 1}/10`), 'coverage', 'hostPaths', 'integration', 'standards'];
-const marker = sign( { sha, suite: 'full', shards: 10, result: 'green', startedAt: new Date(now - 2000).toISOString(), finishedAt: new Date(now - 1000).toISOString(), host: 'host', repo: 'https://example.com/org/repo', steps: expectedSteps });
+const expectedSteps = ['install-fui', 'install', ...Array.from({ length: 10 }, (_, i) => `unit:unit:${i + 1}/10`), 'coverage', 'hostPaths', 'integration', 'standards'];
+const marker = sign( { sha, fuiSha: sha, suite: 'full', shards: 10, result: 'green', startedAt: new Date(now - 2000).toISOString(), finishedAt: new Date(now - 1000).toISOString(), host: 'host', repo: 'https://example.com/org/repo', steps: expectedSteps });
 const check = (m = marker, input = {}) => urgentMarker({ urgent: true, reason: 'Urgent daemon repair', sha, shards: 10, expectedSteps, now, repo: marker.repo, readKey: () => key, ledger: JSON.stringify(m), ...input });
 
 describe('urgent marker', () => {
@@ -20,6 +20,7 @@ describe('urgent marker', () => {
     ['scoped suite', { suite: 'scoped' }], ['red result', { result: 'red' }],
     ['stale', { finishedAt: new Date(now - 7200001).toISOString() }],
     ['future', { finishedAt: new Date(now + 300001).toISOString() }],
+    ['legacy receipt without FUI SHA', { fuiSha: undefined }], ['short FUI SHA', { fuiSha: 'abc' }],
     ['wrong shard count', { shards: 9 }], ['missing host', { host: '' }],
     ['non-string host', { host: 42 }], ['invalid finish', { finishedAt: 'invalid' }],
     ['invalid start', { startedAt: null }], ['reversed times', { startedAt: marker.finishedAt }],
@@ -42,7 +43,7 @@ describe('urgent marker', () => {
   it('refuses an unreadable expected step list', () => expect(check(marker, { expectedSteps: undefined }).ok).toBe(false));
   it.each([undefined, '0'.repeat(64), 'bad'])('refuses forged signature %s', sig => expect(check({ ...marker, sig }).ok).toBe(false));
   it('signature covers every evidence field', () => {
-    for (const field of ['sha', 'suite', 'shards', 'result', 'startedAt', 'finishedAt', 'host', 'repo', 'steps'])
+    for (const field of ['sha', 'suite', 'shards', 'result', 'startedAt', 'finishedAt', 'host', 'repo', 'steps', 'fuiSha'])
       expect(urgentSignature({ ...marker, [field]: 'tampered' }, key)).not.toBe(marker.sig);
   });
   it('later red for same sha supersedes green, regardless of its timestamp', () => {
@@ -55,20 +56,20 @@ describe('urgent marker', () => {
 
 function fixture() {
   let tick = now - 1000;
-  return { repo: () => marker.repo, readKey: () => key, host: 'host', now: () => new Date(tick += 1000).toISOString(), clean: vi.fn(() => true), head: vi.fn(() => sha),
+  return { verifyFui: vi.fn(() => sha), 'install-fui': vi.fn(), install: vi.fn(), repo: () => marker.repo, readKey: () => key, host: 'host', now: () => new Date(tick += 1000).toISOString(), clean: vi.fn(() => true), head: vi.fn(() => sha),
     plan: () => [{ shard: '1/2' }, { shard: '2/2' }], shard: vi.fn(), standards: vi.fn(), coverage: vi.fn(), hostPaths: vi.fn(), integration: vi.fn(), append: vi.fn() };
 }
 describe('urgent verifier', () => {
   it('records green only after all shards sequentially and standards', async () => {
     const d = fixture(), order = [];
     d.shard = async s => { order.push(s.shard); await Promise.resolve(); order.push('done'); };
-    for (const step of ['coverage', 'hostPaths', 'integration', 'standards']) d[step] = () => order.push(step);
+    for (const step of ['install-fui', 'install', 'coverage', 'hostPaths', 'integration', 'standards']) d[step] = () => order.push(step);
     expect(await urgentVerify({ sha, result: 'red' }, d)).toMatchObject({ ok: true });
-    expect(order).toEqual(['1/2', 'done', '2/2', 'done', 'coverage', 'hostPaths', 'integration', 'standards']);
+    expect(order).toEqual(['install-fui', 'install', '1/2', 'done', '2/2', 'done', 'coverage', 'hostPaths', 'integration', 'standards']);
     expect(d.append).toHaveBeenCalledTimes(1);
-    expect(d.append).toHaveBeenCalledWith(expect.objectContaining({ sha, suite: 'full', result: 'green', shards: 2, host: 'host', repo: marker.repo, steps: ['unit:unit:1/2', 'unit:unit:2/2', 'coverage', 'hostPaths', 'integration', 'standards'], sig: expect.stringMatching(/^[a-f0-9]{64}$/) }));
+    expect(d.append).toHaveBeenCalledWith(expect.objectContaining({ sha, suite: 'full', result: 'green', shards: 2, host: 'host', repo: marker.repo, steps: ['install-fui', 'install', 'unit:unit:1/2', 'unit:unit:2/2', 'coverage', 'hostPaths', 'integration', 'standards'], sig: expect.stringMatching(/^[a-f0-9]{64}$/) }));
   });
-  it.each(['shard', 'coverage', 'hostPaths', 'integration', 'standards'])('records red when %s fails', async stage => {
+  it.each(['install-fui', 'install', 'shard', 'coverage', 'hostPaths', 'integration', 'standards'])('records red when %s fails', async stage => {
     const d = fixture(); d[stage] = vi.fn(() => { throw new Error('failed'); });
     expect(await urgentVerify({ sha, result: 'green' }, d)).toMatchObject({ ok: false, marker: { result: 'red' } });
     expect(d.append).toHaveBeenCalledTimes(1);
@@ -108,18 +109,24 @@ describe('real adapter contract with injected filesystem and subprocesses', () =
     const packageText = readFileSync('package.json', 'utf8');
     const fs = { readFileSync: vi.fn(p => p.endsWith('.key') ? key : p.endsWith('package.json') ? packageText : workflow), mkdirSync: vi.fn(), appendFileSync: vi.fn(), writeFileSync: vi.fn(), rmSync: vi.fn(), copyFileSync: vi.fn() };
     const spawnSync = vi.fn((cmd, args) => ({ status: 0, stdout: args[0] === 'status' ? '' : args[0] === 'rev-parse' ? sha : args[0] === 'remote' ? `${marker.repo}.git/\n` : args[0]?.includes('shard-assign') ? 'scripts/example.test.mjs\n' : '' }));
-    const d = createUrgentDeps({ cwd: '/repo', home: '/home/test', fs, spawnSync });
+    const d = createUrgentDeps({ cwd: '/repo', home: '/home/test', fs, spawnSync,
+      env: { PATH: '/bin', HOME: '/home/test', URGENT_KEY: urgentKeyPath('/home/test'), NODE_OPTIONS: urgentKeyPath('/home/test') } });
     expect((await urgentVerify({ sha }, d)).ok).toBe(true);
-    const heavy = spawnSync.mock.calls.filter(([, args]) => args[0] === 'scripts/readiness/heavy-admission.mjs');
-    expect(heavy).toHaveLength(14);
+    const heavy = spawnSync.mock.calls.filter(([, args]) => args[0].endsWith('scripts/readiness/heavy-admission.mjs'));
+    expect(heavy).toHaveLength(17);
+    expect(heavy.slice(0, 3).map(([, a, o]) => [a.slice(4), o.cwd])).toEqual([
+      [['npm', 'ci'], '/frontierui'], [['npm', 'run', 'build:tools'], '/frontierui'], [['npm', 'ci'], '/repo']]);
+    expect(spawnSync.mock.calls.every(([, , o]) => !JSON.stringify(o.env).includes(urgentKeyPath('/home/test')) && !Object.keys(o.env).some(k => k.startsWith('URGENT_')))).toBe(true);
+    const keyReadOrder = fs.readFileSync.mock.invocationCallOrder[fs.readFileSync.mock.calls.findIndex(([p]) => p.endsWith('.key'))];
+    expect(keyReadOrder).toBeGreaterThan(spawnSync.mock.invocationCallOrder.at(-1));
     expect(heavy.every(([, args, opts]) => args.includes('--wait-ms=60000') && opts.maxBuffer > 0 && opts.timeout > 0)).toBe(true);
-    expect(heavy.slice(0, 10).every(([, args]) => args.includes('vitest') && args.includes('scripts/example.test.mjs'))).toBe(true);
+    expect(heavy.slice(3, 13).every(([, args]) => args.includes('vitest') && args.includes('scripts/example.test.mjs'))).toBe(true);
     const coverageArgs = JSON.parse(packageText).scripts['test:coverage:shard'].split(' -- ')[1].split(' ');
-    expect(heavy[0][1].slice(4, -1)).toEqual(coverageArgs);
-    expect(heavy[10][1].slice(4)).toEqual(['npm', 'run', 'coverage:merge', '--', 'coverage-shards', '--threshold=80', '--expect=9']);
-    expect(heavy[11][1].slice(4)).toEqual(['node', 'scripts/lint-host-paths.mjs']);
-    expect(heavy[12][1].slice(4)).toEqual(['npm', 'run', 'test:integration:vitest', '--']);
-    expect(heavy[13][1]).toContain('check:standards');
+    expect(heavy[3][1].slice(4, -1)).toEqual(coverageArgs);
+    expect(heavy[13][1].slice(4)).toEqual(['npm', 'run', 'coverage:merge', '--', 'coverage-shards', '--threshold=80', '--expect=9']);
+    expect(heavy[14][1].slice(4)).toEqual(['node', 'scripts/lint-host-paths.mjs']);
+    expect(heavy[15][1].slice(4)).toEqual(['npm', 'run', 'test:integration:vitest', '--']);
+    expect(heavy[16][1]).toContain('check:standards');
     expect(fs.copyFileSync.mock.calls).toEqual(Array.from({ length: 9 }, (_, i) => ['/repo/coverage/coverage-final.json', `/repo/coverage-shards/coverage-shard-${i + 1}/coverage-final.json`]));
     expect(fs.rmSync).toHaveBeenCalledWith('/repo/coverage-shards', { recursive: true, force: true });
     expect(fs.writeFileSync).toHaveBeenCalledWith(urgentKeyPath('/home/test'), expect.any(Buffer), { flag: 'wx', mode: 0o600 });
@@ -148,7 +155,7 @@ describe('real adapter contract with injected filesystem and subprocesses', () =
 describe('CI gate mirroring fails closed', () => {
   const workflow = readFileSync('.github/workflows/ci.yml', 'utf8');
   it('accepts every run and uses step in the real CI workflow', () => {
-    expect(ciGatePlan(workflow)).toEqual({
+    expect(ciGatePlan(workflow)).toMatchObject({
       coverage: ['npm', 'run', 'coverage:merge', '--', 'coverage-shards', '--threshold=80', '--expect=9'],
       hostPaths: ['node', 'scripts/lint-host-paths.mjs'],
       integration: ['npm', 'run', 'test:integration:vitest'],
@@ -206,4 +213,38 @@ describe('CI gate mirroring fails closed', () => {
     expect(fs.writeFileSync.mock.calls[0][2]).toEqual({ flag: 'wx', mode: 0o600 });
   });
   it('normalizes trailing origin whitespace and git suffix', () => expect(normalizeUrgentRepo(' https://example.com/org/repo.git/\n')).toBe(marker.repo));
+});
+
+ describe('required dependency closure and clean FUI', () => {
+  const workflow = readFileSync('.github/workflows/ci.yml', 'utf8');
+  it.each(['test', 'changes'])('refuses an unknown needed job in %s', job => {
+    const doc = yaml.safeLoad(workflow); doc.jobs.unknown = { steps: [] };
+    const needs = doc.jobs[job].needs ?? []; doc.jobs[job].needs = [...(Array.isArray(needs) ? needs : [needs]), 'unknown'];
+    expect(() => ciGatePlan(yaml.safeDump(doc))).toThrow('unreadable-ci-gates');
+  });
+  it('refuses even a known setup run added to test itself', () => {
+    const doc = yaml.safeLoad(workflow); doc.jobs.test.steps.push({ run: 'npm ci' });
+    expect(() => ciGatePlan(yaml.safeDump(doc))).toThrow('unreadable-ci-gates');
+  });
+  it.each(['command', 'directory', 'order'])('refuses changed install %s', kind => {
+    const doc = yaml.safeLoad(workflow), steps = doc.jobs.standards.steps;
+    const fui = steps.find(s => s.name === 'Install + build FUI tools');
+    if (kind === 'command') fui.run = 'npm ci --ignore-scripts';
+    if (kind === 'directory') fui['working-directory'] = 'wrong';
+    if (kind === 'order') steps.push(steps.splice(steps.indexOf(fui), 1)[0]);
+    expect(() => ciGatePlan(yaml.safeDump(doc))).toThrow('unreadable-ci-gates');
+  });
+  it.each(['missing', 'dirty', 'stale', 'fetch failed'])('refuses %s sibling before any install or suite', async kind => {
+    const spawnSync = vi.fn((cmd, args, opts) => ({ status: opts.cwd === '/frontierui' && (kind === 'missing' || (kind === 'fetch failed' && args[0] === 'fetch')) ? 1 : 0,
+      stdout: args[0] === 'status' ? (opts.cwd === '/frontierui' && kind === 'dirty' ? '?? untracked' : '')
+        : args[0] === 'remote' ? marker.repo : kind === 'stale' && args.includes('origin/HEAD^{commit}') ? 'b'.repeat(40) : sha }));
+    const fs = { readFileSync: p => p.endsWith('.key') ? key : workflow, rmSync: vi.fn(), mkdirSync: vi.fn(), writeFileSync: vi.fn(), appendFileSync: vi.fn() };
+    expect((await urgentVerify({ sha }, createUrgentDeps({ cwd: '/repo', fs, spawnSync }))).ok).toBe(false);
+    expect(spawnSync.mock.calls.some(([, args]) => args[0].includes('heavy-admission'))).toBe(false);
+  });
+  it('falls back to fetched origin/main when origin/HEAD is unavailable', () => {
+    const calls = [];
+    const d = createUrgentDeps({ spawnSync: (cmd, args) => { calls.push(args); return { status: args.includes('origin/HEAD^{commit}') ? 1 : 0, stdout: args[0] === 'status' ? '' : sha }; } });
+    expect(d.verifyFui()).toBe(sha); expect(calls.some(a => a.includes('origin/main^{commit}'))).toBe(true);
+  });
 });

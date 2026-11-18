@@ -4626,7 +4626,7 @@ green/red receipts to `~/workspace/.operations/coordination/urgent-full-green.js
 
 `prototype-load --urgent --reason=<at least 10 characters>` prefers passing CI, otherwise requires
 the latest exact-SHA receipt to be full, green, current-shard-count and at most two hours old.
-Its signed steps must exactly match the current CI unit plan in order, followed by coverage,
+Its signed steps must start with `install-fui`, `install`, then match the current CI unit plan in order, followed by coverage,
 hostPaths, integration and standards. Before selecting or binding a test suite, any completed
 exact-SHA check-run with failure, cancelled, timed_out, action_required or startup_failure vetoes
 urgent loading. An unreadable raw check-runs response still requires the signed receipt.
@@ -4640,7 +4640,21 @@ later-red supersession, event logging and the unchanged non-urgent CI gate. Run 
 Urgent verification mirrors CI coverage artifacts under ignored `coverage-shards/`; clear this directory before a run and copy each covered shard before the next overwrites its report. Receipts require the runner-owned private HMAC key and the loading checkout’s normalized origin. A completed failing CI gate always refuses urgent loading; old unsigned receipts require a fresh verification or passing CI.
 
 The urgent gate mirror pins every `run` text in `test-shard`, `coverage-merge`, `host-paths`,
-`integration`, `test` and `standards`, with an explicit setup-command allowlist. When CI adds
+`integration`, `test`, `standards` and `changes`, with an explicit setup-command allowlist outside `test`/`changes`. When CI adds
 validation, update the mirror before issuing local receipts; unknown run steps refuse with
 `unreadable-ci-gates`. Keep the real-workflow acceptance and per-job unknown-step regressions
 in `urgent-verify.test.mjs`.
+
+
+Urgent verification derives the required CI job closure from `test.needs`, including transitive
+dependencies; unknown jobs or changed install commands require a mirror update or passing CI.
+It verifies the clean FUI sibling against its fetched default branch, then admits FUI install/build
+and checkout install before suites. Signed receipts include `fuiSha` and both install steps; older
+receipts require fresh verification. Child environments are allowlisted and the signing key is read
+only after the suite pipeline stops. `urgent-sweep` is one bounded pass (32 loads, 100 checks per SHA);
+the orchestrator schedules it. Its durable settlement ledger prevents repeat handling and stores a
+`sweep-cursor` before each batch so pending or unreadable loads cannot starve later entries.
+Cursor records never settle a load; older ledgers without a cursor start at the beginning. Required CI
+failures remove the recorded clone/ref with a tip guard and open a NEEDS-YOU escalation through
+`land-advance-escalations`; unreadable/oversized evidence and legacy records without registrations
+require operator repair or manual unloading. Keep these paths in `urgent-sweep.test.mjs`.

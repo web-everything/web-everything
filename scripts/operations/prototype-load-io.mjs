@@ -596,16 +596,11 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           ledger = fs.readFileSync(urgentLedger(env.HOME), 'utf8');
           const plan = ciUnitPlan(fs.readFileSync(join(repo, '.github/workflows/ci.yml'), 'utf8'));
           shards = plan.length;
-          expectedSteps = [...plan.map(s => `unit:${s.group ?? 'unit'}:${s.shard}`), 'coverage', 'hostPaths', 'integration', 'standards'];
+          expectedSteps = ['install-fui', 'install', ...plan.map(s => `unit:${s.group ?? 'unit'}:${s.shard}`), 'coverage', 'hostPaths', 'integration', 'standards'];
         } catch { /* Missing or unreadable evidence fails closed below. */ }
         const urgent = urgentMarker({ ...input, ledger, shards, expectedSteps, repo: origin, readKey: readUrgentKey, now: now() });
         if (!urgent.ok) return stop('no-ready', urgent);
         checkRun = urgent.evidence;
-      }
-      if (input.urgent) {
-        const file = urgentLedger(env.HOME, 'urgent-loads');
-        fs.mkdirSync(dirname(file), { recursive: true });
-        fs.appendFileSync(file, `${JSON.stringify({ at: new Date(now()).toISOString(), type: 'prototype-load.urgent', ref: input.branch, sha: input.sha, reason: input.reason, marker: checkRun.marker ?? null })}\n`, { encoding: 'utf8', mode: 0o600 });
       }
       const canonical = out.canonicalAudit.record;
       // R503: with only same-sha evidence no live fingerprint is computed (liveFp is null), yet the record we append
@@ -834,6 +829,11 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         if (evidence?.ok !== true || evidence.clean !== true || evidence.candSha !== out.effectiveSha) {
           return stop('register-failed', { detail: 'admitted-sha-unverified', fallback: 'Inspect the candidate registration and loader evidence before retrying; prior registrations were retained.' });
         }
+      }
+      if (input.urgent) {
+        const file = urgentLedger(env.HOME, 'urgent-loads');
+        fs.mkdirSync(dirname(file), { recursive: true });
+        fs.appendFileSync(file, `${JSON.stringify({ at: new Date(now()).toISOString(), type: 'prototype-load.urgent', ref: input.branch, sha: input.sha, clone: out.clone, repo: normalizeUrgentRepo(requireGit('remote', 'get-url', 'origin')), registration: { clone: out.clone, ref: out.effectiveRef, sha: out.effectiveSha }, reason: input.reason, marker: checkRun.marker ?? null })}\n`, { encoding: 'utf8', mode: 0o600 });
       }
       const readyPath = expand(config.readyRecordPath);
       fs.mkdirSync(dirname(readyPath), { recursive: true });

@@ -416,7 +416,7 @@ export async function settlePendingDrops({ root, env = process.env, by = null, d
 
 /** Register-only removal requires a concrete pre-read snapshot. An absent ref never reaches the
  * mutation helper, so a registration arriving after that snapshot cannot be removed unguarded. */
-export function removeRegistration({ root, ref, by = null, reason = null, env = process.env, deps = {} }) {
+export function removeRegistration({ root, ref, expectedTip, by = null, reason = null, env = process.env, deps = {} }) {
   const state = (deps.readState ?? readOverlayState)(root, { env });
   if (state.corrupt) throw new Error('overlay state is corrupt — refusing removal');
   const entry = state.overlays.find((o) => o.ref === ref);
@@ -427,7 +427,17 @@ export function removeRegistration({ root, ref, by = null, reason = null, env = 
     try { tip = (deps.tip ?? ((r) => remoteTip({ root, ref: r, env })))(ref) ?? null; }
     catch { /* Unknown tip leaves a removal record without retirement proof. */ }
   }
+  if (expectedTip !== undefined && (!/^[a-f0-9]{40}$/i.test(expectedTip) || tip !== expectedTip))
+    return { removed: false, refused: 'tip-moved-or-unreadable', list: state.overlays };
   const result = (deps.remove ?? removeOverlay)(root, ref, { env, why: reason || 'operator', expectedOverlay: entry });
+  if (result.removed && expectedTip !== undefined) {
+    let after;
+    try { after = (deps.tip ?? ((r) => remoteTip({ root, ref: r, env })))(ref); } catch { /* restore below */ }
+    if (after !== expectedTip) {
+      (deps.restore ?? restoreRegistration)(root, entry, env);
+      return { removed: false, refused: 'tip-moved-restored' };
+    }
+  }
   if (result.removed && entry.pinned === true) writeRebuildRequest(root, { by, reason: reason || 'operator', ref, lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT });
   if (result.removed) appendOverlayEvent(root, { kind: 'removed', ref, by, reason, tip }, { env });
   return result;

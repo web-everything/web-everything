@@ -5,7 +5,7 @@ export const urgentKeyPath = home => `${home}/workspace/.operations/state/urgent
 export const normalizeUrgentRepo = url => String(url ?? '').trim().replace(/\/+$/, '').replace(/\.git$/, '');
 export function urgentSignature(record, key) {
   if (!Buffer.isBuffer(key) || key.length !== 32) throw new Error('unreadable urgent key');
-  const fields = ['sha', 'suite', 'shards', 'result', 'startedAt', 'finishedAt', 'host', 'repo', 'steps'];
+  const fields = ['sha', 'suite', 'shards', 'result', 'startedAt', 'finishedAt', 'host', 'repo', 'steps', 'fuiSha'];
   return createHmac('sha256', key).update(JSON.stringify(Object.fromEntries(fields.map(k => [k, record[k]])))).digest('hex');
 }
 export const urgentLedger = (home, name = 'urgent-full-green') => `${home}/workspace/.operations/coordination/${name}.jsonl`;
@@ -41,6 +41,7 @@ const runText = run => run.split('\n').map(line => line.trim()).filter(line => l
 const setupRuns = ['sh scripts/ci/fetch-main-history.sh', 'npm ci', 'npm ci --ignore-scripts',
   'npm run build:tools', 'npm ci\nnpm run build:tools'];
 const mirroredRuns = {
+  changes: ["FRESH_MAIN_SHA=\"\"\nif [ \"$EVENT_NAME\" = \"merge_group\" ]; then\n  BASE_SHA=\"$MG_BASE_SHA\"\nfi\nif [ \"$BASE_REF\" = \"main\" ]; then\n  if sh scripts/ci/fetch-main-history.sh; then\n    FRESH_MAIN_SHA=$(git rev-parse --verify --end-of-options 'refs/remotes/origin/main^{commit}') || FRESH_MAIN_SHA=\"\"\n  else\n    echo \"ci-card-only: main fetch failed; full suite\" >&2\n  fi\nfi\nnode scripts/ci-card-only.mjs --event=\"$EVENT_NAME\" --base=\"$BASE_SHA\" --base-ref=\"$BASE_REF\" --fresh-main-sha=\"$FRESH_MAIN_SHA\" --head=HEAD >> \"$GITHUB_OUTPUT\""],
   'test-shard': [
     "echo \"Card-only change; no unit tests required by the changes classifier.\"",
     `
@@ -130,12 +131,32 @@ const mirroredActions = new Set([
   'actions/upload-artifact@v4', 'actions/download-artifact@v4',
 ]);
 
+/** Required closure is workflow-owned; an unfamiliar dependency refuses urgent loading. */
+export function ciRequiredJobs(workflow) {
+  const jobs = yaml.safeLoad(workflow)?.jobs, seen = new Set(), visiting = new Set();
+  const visit = name => {
+    if (visiting.has(name) || !jobs?.[name] || (name !== 'test' && !Object.hasOwn(mirroredRuns, name)))
+      throw new Error('unreadable-ci-gates: unknown or cyclic required job');
+    if (seen.has(name)) return;
+    visiting.add(name);
+    const needs = jobs[name].needs ?? [];
+    const list = typeof needs === 'string' ? [needs] : needs;
+    if (!Array.isArray(list) || list.some(n => typeof n !== 'string')) throw new Error('unreadable-ci-gates');
+    for (const n of list) visit(n);
+    visiting.delete(name); seen.add(name);
+  };
+  visit('test');
+  return [...seen];
+}
+
 /** Mirror only the known CI command and artifact layout; changes require an operator update. */
 export function ciGatePlan(workflow) {
   const jobs = yaml.safeLoad(workflow)?.jobs, plan = ciUnitPlan(workflow);
-  for (const [job, mirrored] of Object.entries(mirroredRuns)) {
+  const requiredJobs = ciRequiredJobs(workflow);
+  for (const job of requiredJobs) {
+    const mirrored = mirroredRuns[job];
     const steps = jobs?.[job]?.steps;
-    const allowed = new Set([...setupRuns, ...mirrored].map(runText));
+    const allowed = new Set([...(job === 'test' || job === 'changes' ? [] : setupRuns), ...mirrored].map(runText));
     if (!Array.isArray(steps) || steps.some(s => !s || typeof s !== 'object' || ('run' in s &&
       (typeof s.run !== 'string' || !allowed.has(runText(s.run)))))
       || steps.some(s => 'uses' in s && !mirroredActions.has(s.uses)))
@@ -160,7 +181,13 @@ export function ciGatePlan(workflow) {
     || !upload.if?.includes(`matrix.shard != ${plan.length}`)
     || download.uses !== 'actions/download-artifact@v4' || download.with?.path !== 'web-everything/coverage-shards'
     || download.with?.pattern !== 'coverage-shard-*' || download.with?.['merge-multiple'] === true) throw new Error('unreadable-ci-gates');
-  return { coverage: merge.split(' '), hostPaths: host.split(' '), integration: integration.split(' -- $(')[0].split(' ') };
+  for (const job of ['standards', 'test-shard', 'integration']) {
+    const fui = step(job, 'Install + build FUI tools'), install = step(job, 'Install');
+    if (runText(fui.run ?? '') !== 'npm ci\nnpm run build:tools' || fui['working-directory'] !== 'frontierui'
+      || runText(install.run ?? '') !== 'npm ci' || install['working-directory'] !== 'web-everything'
+      || jobs[job].steps.indexOf(fui) >= jobs[job].steps.indexOf(install)) throw new Error('unreadable-ci-gates: install layout');
+  }
+  return { requiredJobs, installFui: [['npm', 'ci'], ['npm', 'run', 'build:tools']], install: ['npm', 'ci'], coverage: merge.split(' '), hostPaths: host.split(' '), integration: integration.split(' -- $(')[0].split(' ') };
 }
 
 export function urgentMarker({ urgent, reason, sha, ledger, shards, expectedSteps, now, repo, readKey }) {
@@ -175,8 +202,8 @@ export function urgentMarker({ urgent, reason, sha, ledger, shards, expectedStep
       || marker.shards !== shards || !Number.isFinite(now) || !Number.isFinite(finished) || !(started < finished)
       || now - finished > 2 * 60 * 60_000 || finished - now > 5 * 60_000
       || typeof marker.host !== 'string' || !marker.host.trim()) return no('no-urgent-marker');
-    if (!repo || marker.repo !== repo || !Array.isArray(marker.steps)
-      || !Array.isArray(expectedSteps) || expectedSteps.length !== shards + 4
+    if (!fullSha(marker.fuiSha) || !repo || marker.repo !== repo || !Array.isArray(marker.steps)
+      || !Array.isArray(expectedSteps) || expectedSteps.length !== shards + 6
       || marker.steps.length !== expectedSteps.length || !expectedSteps.every((step, i) => marker.steps[i] === step)
       || !/^[a-f0-9]{64}$/.test(marker.sig ?? '')
       || !timingSafeEqual(Buffer.from(marker.sig, 'hex'), Buffer.from(urgentSignature(marker, readKey()), 'hex'))) return no('no-urgent-marker');

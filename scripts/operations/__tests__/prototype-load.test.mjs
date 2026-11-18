@@ -270,13 +270,13 @@ function fixture(options = {}) {
 const mutations = (f, action) => f.calls.filter((c) => c.cmd === 'node' && c.args[1] === action && !c.args.includes('--check'));
 describe('urgent prototype admission', () => {
   const reason = 'Restore critical daemon operation';
-  const marker = { sha: SHA, suite: 'full', shards: 1, result: 'green', startedAt: new Date(-2000).toISOString(), finishedAt: new Date(-1000).toISOString(), host: 'test-host', repo: 'https://example.com/org/repo', steps: ['unit:unit:1/1', 'coverage', 'hostPaths', 'integration', 'standards'] };
+  const marker = { sha: SHA, fuiSha: SHA, suite: 'full', shards: 1, result: 'green', startedAt: new Date(-2000).toISOString(), finishedAt: new Date(-1000).toISOString(), host: 'test-host', repo: 'https://example.com/org/repo', steps: ['install-fui', 'install', 'unit:unit:1/1', 'coverage', 'hostPaths', 'integration', 'standards'] };
   marker.sig = urgentSignature(marker, urgentKey);
   it('logs the urgent event and writes explicit urgent readiness evidence', async () => {
     const f = fixture({ testCheck: async () => null, urgentLedger: JSON.stringify(marker) });
     expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: true });
     expect(f.readyWrites.at(-1)).toMatchObject({ tests: 'green', testCheck: { source: 'urgent-local-full', marker, reason } });
-    expect(f.records).toContainEqual(expect.objectContaining({ type: 'prototype-load.urgent', ref: BASE.branch, sha: SHA, reason, marker }));
+    expect(f.records).toContainEqual(expect.objectContaining({ type: 'prototype-load.urgent', clone: expect.any(String), registration: expect.objectContaining({ clone: expect.any(String), ref: expect.any(String), sha: SHA }), ref: BASE.branch, sha: SHA, reason, marker }));
   });
   it.each(['ledger', 'workflow'])('refuses unreadable %s with an operator fallback', async (missing) => {
     const f = fixture({ testCheck: async () => null, ...(missing === 'workflow' ? { urgentLedger: JSON.stringify(marker), urgentWorkflow: 'broken' } : {}) });
@@ -3228,7 +3228,7 @@ describe('default test check-run reader (production wiring)', () => {
     expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
   };
   const urgentReceipt = () => {
-    const marker = { sha: SHA, suite: 'full', shards: 1, result: 'green', startedAt: new Date(-2000).toISOString(), finishedAt: new Date(-1000).toISOString(), host: 'test-host', repo: `https://github.com/${REPO_SLUG}`, steps: ['unit:unit:1/1', 'coverage', 'hostPaths', 'integration', 'standards'] };
+    const marker = { sha: SHA, fuiSha: SHA, suite: 'full', shards: 1, result: 'green', startedAt: new Date(-2000).toISOString(), finishedAt: new Date(-1000).toISOString(), host: 'test-host', repo: `https://github.com/${REPO_SLUG}`, steps: ['install-fui', 'install', 'unit:unit:1/1', 'coverage', 'hostPaths', 'integration', 'standards'] };
     return JSON.stringify({ ...marker, sig: urgentSignature(marker, urgentKey) });
   };
   it.each(['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'])(
